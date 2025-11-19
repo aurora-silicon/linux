@@ -1262,6 +1262,7 @@ int nhi_probe(struct tb_nhi *nhi)
 		 * activated. Do a proper shutdown.
 		 */
 		tb_domain_put(tb);
+		wait_for_completion(&nhi->domain_released);
 		nhi_shutdown(nhi);
 		return res;
 	}
