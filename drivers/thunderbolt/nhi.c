@@ -82,7 +82,7 @@ static void ring_interrupt_active(struct tb_ring *ring, bool active)
 	u32 old, new;
 
 	if (ring->irq > 0) {
-		u32 step, shift, ivr, misc;
+		u32 step, shift, ivr, misc, itr;
 		void __iomem *ivr_base;
 		int auto_clear_bit;
 		int index;
@@ -120,6 +120,12 @@ static void ring_interrupt_active(struct tb_ring *ring, bool active)
 		if (active)
 			ivr |= ring->vector << shift;
 		iowrite32(ivr, ivr_base + step);
+
+		/* Throttling is specified in 256ns increments */
+		itr = DIV_ROUND_UP(ring->interval_nsec, 256);
+		itr &= REG_INT_THROTTLING_RATE_INTERVAL_MASK;
+		iowrite32(itr, ring->nhi->iobase + REG_INT_THROTTLING_RATE +
+			  ring->vector * 4);
 	}
 
 	old = ioread32(ring->nhi->iobase + reg);
@@ -859,6 +865,26 @@ void tb_ring_free(struct tb_ring *ring)
 EXPORT_SYMBOL_GPL(tb_ring_free);
 
 /**
+ * tb_ring_throttling() - Configure throttling for ring interrupt
+ * @ring: Ring to configure
+ * @interval_nsec: Interval counter for moderation (in ns), %0 disables
+ *
+ * Enables or disables ring interrupt throttling. The ring must be
+ * stopped for this to be called. Granularity is 256 ns.
+ *
+ * Return: %0 on success, negative errno otherwise.
+ */
+int tb_ring_throttling(struct tb_ring *ring, unsigned int interval_nsec)
+{
+	guard(spinlock_irqsave)(&ring->lock);
+	if (WARN_ON_ONCE(ring->running))
+		return -EBUSY;
+	ring->interval_nsec = interval_nsec;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(tb_ring_throttling);
+
+/**
  * nhi_mailbox_cmd() - Send a command through NHI mailbox
  * @nhi: Pointer to the NHI structure
  * @cmd: Command to send
@@ -1033,22 +1059,6 @@ static int nhi_poweroff_noirq(struct device *dev)
 	return __nhi_suspend_noirq(dev, wakeup);
 }
 
-void nhi_enable_int_throttling(struct tb_nhi *nhi)
-{
-	/* Throttling is specified in 256ns increments */
-	u32 throttle = DIV_ROUND_UP(128 * NSEC_PER_USEC, 256);
-	unsigned int i;
-
-	/*
-	 * Configure interrupt throttling for all vectors even if we
-	 * only use few.
-	 */
-	for (i = 0; i < MSIX_MAX_VECS; i++) {
-		u32 reg = REG_INT_THROTTLING_RATE + i * 4;
-		iowrite32(throttle, nhi->iobase + reg);
-	}
-}
-
 static int nhi_resume_noirq(struct device *dev)
 {
 	struct tb *tb = dev_get_drvdata(dev);
@@ -1062,13 +1072,10 @@ static int nhi_resume_noirq(struct device *dev)
 	 */
 	if ((nhi->ops->is_present && !nhi->ops->is_present(nhi))) {
 		nhi->going_away = true;
-	} else {
-		if (nhi->ops && nhi->ops->resume_noirq) {
-			ret = nhi->ops->resume_noirq(nhi);
-			if (ret)
-				return ret;
-		}
-		nhi_enable_int_throttling(tb->nhi);
+	} else if (nhi->ops && nhi->ops->resume_noirq) {
+		ret = nhi->ops->resume_noirq(nhi);
+		if (ret)
+			return ret;
 	}
 
 	return tb_domain_resume_noirq(tb);
@@ -1126,7 +1133,6 @@ static int nhi_runtime_resume(struct device *dev)
 			return ret;
 	}
 
-	nhi_enable_int_throttling(nhi);
 	return tb_domain_runtime_resume(tb);
 }
 
@@ -1226,7 +1232,6 @@ int nhi_probe(struct tb_nhi *nhi)
 
 	/* In case someone left them on. */
 	nhi_disable_interrupts(nhi);
-	nhi_enable_int_throttling(nhi);
 
 	if (nhi->ops && nhi->ops->init_interrupts) {
 		res = nhi->ops->init_interrupts(nhi);
