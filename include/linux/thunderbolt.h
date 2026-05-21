@@ -483,14 +483,13 @@ static inline struct tb_xdomain *tb_service_parent(struct tb_service *svc)
  * struct tb_nhi - thunderbolt native host interface
  * @lock: Must be held during ring creation/destruction. Is acquired by
  *	  interrupt_work when dispatching interrupts to individual rings.
- * @pdev: Pointer to the PCI device
+ * @dev: Device associated with this NHI instance
  * @ops: NHI specific optional ops
  * @ring_layout: Layout of the ring registers inside @iobase. If not set
  *		 the default layout from the USB4 specification is used.
  * @iobase: MMIO space of the NHI
  * @tx_rings: All Tx rings available on this host controller
  * @rx_rings: All Rx rings available on this host controller
- * @msix_ida: Used to allocate MSI-X vectors for rings
  * @going_away: The host controller device is about to disappear so when
  *		this flag is set, avoid touching the hardware anymore.
  * @iommu_dma_protection: An IOMMU will isolate external-facing ports.
@@ -501,13 +500,12 @@ static inline struct tb_xdomain *tb_service_parent(struct tb_service *svc)
  */
 struct tb_nhi {
 	spinlock_t lock;
-	struct pci_dev *pdev;
+	struct device *dev;
 	const struct tb_nhi_ops *ops;
 	const struct tb_nhi_ring_layout *ring_layout;
 	void __iomem *iobase;
 	struct tb_ring **tx_rings;
 	struct tb_ring **rx_rings;
-	struct ida msix_ida;
 	bool going_away;
 	bool iommu_dma_protection;
 	struct work_struct interrupt_work;
@@ -687,7 +685,7 @@ void tb_ring_poll_complete(struct tb_ring *ring);
  */
 static inline struct device *tb_ring_dma_device(struct tb_ring *ring)
 {
-	return &ring->nhi->pdev->dev;
+	return ring->nhi->dev;
 }
 
 bool usb4_usb3_port_match(struct device *usb4_port_dev,
