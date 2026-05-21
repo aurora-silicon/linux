@@ -29,6 +29,14 @@ enum nhi_mailbox_cmd {
 
 int nhi_mailbox_cmd(struct tb_nhi *nhi, enum nhi_mailbox_cmd cmd, u32 data);
 enum nhi_fw_mode nhi_mailbox_mode(struct tb_nhi *nhi);
+void nhi_enable_int_throttling(struct tb_nhi *nhi);
+void nhi_disable_interrupts(struct tb_nhi *nhi);
+void nhi_interrupt_work(struct work_struct *work);
+irqreturn_t nhi_msi(int irq, void *data);
+irqreturn_t ring_msix(int irq, void *data);
+int nhi_probe(struct tb_nhi *nhi);
+void nhi_shutdown(struct tb_nhi *nhi);
+extern const struct dev_pm_ops nhi_pm_ops;
 
 /**
  * struct tb_nhi_ring_layout - Layout of the ring registers in the NHI MMIO space
@@ -90,14 +98,6 @@ struct tb_nhi_ops {
 	int (*init_interrupts)(struct tb_nhi *nhi);
 };
 
-extern const struct tb_nhi_ops icl_nhi_ops;
-
-/* Host interface quirks */
-#define QUIRK_AUTO_CLEAR_INT	BIT(0)
-#define QUIRK_E2E		BIT(1)
-#define QUIRK_NO_DMA_PORT	BIT(2)
-#define QUIRK_NO_USB3_BW_ALLOC	BIT(3)
-
 /*
  * PCI IDs used in this driver from Win Ridge forward. There is no
  * need for the PCI quirk anymore as we will use ICM also on Apple
@@ -147,5 +147,18 @@ extern const struct tb_nhi_ops icl_nhi_ops;
 #define PCI_DEVICE_ID_INTEL_PTL_P_NHI1			0xe434
 
 #define PCI_CLASS_SERIAL_USB_USB4			0x0c0340
+
+/* Host interface quirks */
+#define QUIRK_AUTO_CLEAR_INT	BIT(0)
+#define QUIRK_E2E		BIT(1)
+#define QUIRK_NO_DMA_PORT	BIT(2)
+#define QUIRK_NO_USB3_BW_ALLOC	BIT(3)
+
+/*
+ * Minimal number of vectors when we use MSI-X. Two for control channel
+ * Rx/Tx and the rest four are for cross domain DMA paths.
+ */
+#define MSIX_MIN_VECS		6
+#define MSIX_MAX_VECS		16
 
 #endif
