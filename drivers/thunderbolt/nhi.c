@@ -1246,6 +1246,8 @@ int nhi_probe(struct tb_nhi *nhi)
 			return res;
 	}
 
+	init_completion(&nhi->domain_released);
+
 	tb = nhi_select_cm(nhi);
 	if (!tb)
 		return dev_err_probe(dev, -ENODEV,
