@@ -604,7 +604,7 @@ static int apple_cio_start(struct apple_cio *acio)
 {
 	struct device_link *link;
 	int i, ret;
-	u32 state;
+	u32 state, val;
 
 	lockdep_assert_held(&acio->lock);
 
@@ -629,8 +629,16 @@ static int apple_cio_start(struct apple_cio *acio)
 		goto remove_links;
 	}
 
-	/* Start and wait for the co-processor to boot */
-	writel(APPLE_CIO_M3_CTRL_START, acio->rc_base + APPLE_CIO_M3_CTRL);
+	/*
+	 * Start and wait for the co-processor to boot.
+	 *
+	 * iBoot can leave other bits of this register set (0x3 has been observed
+	 * on t6020 before the kernel touches it). The
+	 * remaining fields are undocumented, so preserve them rather than clearing
+	 * them with a bare store.
+	 */
+	val = readl(acio->rc_base + APPLE_CIO_M3_CTRL);
+	writel(val | APPLE_CIO_M3_CTRL_START, acio->rc_base + APPLE_CIO_M3_CTRL);
 	acio->rtk = apple_rtkit_init(acio->dev, acio, NULL, 0, &apple_cio_rtkit_ops);
 	if (IS_ERR(acio->rtk)) {
 		ret = PTR_ERR(acio->rtk);
