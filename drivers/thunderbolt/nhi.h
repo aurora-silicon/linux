@@ -38,6 +38,15 @@ enum nhi_fw_mode nhi_mailbox_mode(struct tb_nhi *nhi);
  * @runtime_suspend: NHI specific runtime_suspend hook
  * @runtime_resume: NHI specific runtime_resume hook
  * @shutdown: NHI specific shutdown
+ * @pre_nvm_auth: hook to run before Thunderbolt 3 NVM authentication
+ * @post_nvm_auth: hook to run after Thunderbolt 3 NVM authentication
+ * @request_ring_irq: NHI specific interrupt retrieval hook
+ * @release_ring_irq: NHI specific interrupt release hook
+ * @ring_interrupt_active: NHI specific hook to activate/deactivate the
+ *			   interrupt of a single ring. If not set the
+ *			   standard USB4 NHI registers are used.
+ * @is_present: Whether the device is currently present on the parent bus
+ * @init_interrupts: NHI specific interrupt initialization hook
  */
 struct tb_nhi_ops {
 	int (*init)(struct tb_nhi *nhi);
@@ -46,6 +55,13 @@ struct tb_nhi_ops {
 	int (*runtime_suspend)(struct tb_nhi *nhi);
 	int (*runtime_resume)(struct tb_nhi *nhi);
 	void (*shutdown)(struct tb_nhi *nhi);
+	void (*pre_nvm_auth)(struct tb_nhi *nhi);
+	void (*post_nvm_auth)(struct tb_nhi *nhi);
+	int (*request_ring_irq)(struct tb_ring *ring, bool no_suspend);
+	void (*release_ring_irq)(struct tb_ring *ring);
+	void (*ring_interrupt_active)(struct tb_ring *ring, bool active);
+	bool (*is_present)(struct tb_nhi *nhi);
+	int (*init_interrupts)(struct tb_nhi *nhi);
 };
 
 extern const struct tb_nhi_ops icl_nhi_ops;
