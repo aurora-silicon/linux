@@ -612,7 +612,7 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 			tbt_data.cable_mode |= TBT_CABLE_OPTICAL;
 		if (st->data_status & TPS_DATA_STATUS_ACTIVE_LINK_TRAIN)
 			tbt_data.cable_mode |= TBT_CABLE_LINK_TRAINING;
-		if (st->data_status & TPS_DATA_STATUS_ACTIVE_CABLE)
+		if (st->data_status & CD321X_DATA_STATUS_ACTIVE_CABLE)
 			tbt_data.cable_mode |= TBT_CABLE_ACTIVE_PASSIVE;
 		tbt_data.device_mode = TBT_MODE |
 			(u32)le16_to_cpu(st->intel_vid_status.device_mode) << 16;
