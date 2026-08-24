@@ -518,7 +518,7 @@
 			reg = <0xa80000 0x4000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ DIE_NO 1387 IRQ_TYPE_LEVEL_HIGH>;
-			#iommu-cells = <1>;
+			#iommu-cells = <5>;
 		};
 
 		DIE_NODE(usb4_0_nhi): nhi@f00000 {
@@ -561,8 +561,8 @@
 				"rxring3", "rxring4", "rxring5",
 				"rxring6", "rxring7", "rxring8",
 				"rxring9", "rxring10", "rxring11";
-			iommus = <&DIE_NODE(usb4_0_dart) 1>,
-				 <&DIE_NODE(usb4_0_dart) 2>;
+			iommus = <&DIE_NODE(usb4_0_dart) 1 0x100 0x0 0x10 0x0>,
+				 <&DIE_NODE(usb4_0_dart) 2 0x100 0x0 0x10 0x0>;
 			/* To be filled by the loader */
 			apple,thunderbolt-drom = [00];
 		};
@@ -671,7 +671,7 @@
 			reg = <0xa80000 0x4000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ DIE_NO 1435 IRQ_TYPE_LEVEL_HIGH>;
-			#iommu-cells = <1>;
+			#iommu-cells = <5>;
 		};
 
 		DIE_NODE(usb4_1_nhi): nhi@f00000 {
@@ -714,8 +714,8 @@
 				"rxring3", "rxring4", "rxring5",
 				"rxring6", "rxring7", "rxring8",
 				"rxring9", "rxring10", "rxring11";
-			iommus = <&DIE_NODE(usb4_1_dart) 1>,
-				 <&DIE_NODE(usb4_1_dart) 2>;
+			iommus = <&DIE_NODE(usb4_1_dart) 1 0x100 0x0 0x10 0x0>,
+				 <&DIE_NODE(usb4_1_dart) 2 0x100 0x0 0x10 0x0>;
 			/* To be filled by the loader */
 			apple,thunderbolt-drom = [00];
 		};
@@ -824,7 +824,7 @@
 			reg = <0xa80000 0x4000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ DIE_NO 1483 IRQ_TYPE_LEVEL_HIGH>;
-			#iommu-cells = <1>;
+			#iommu-cells = <5>;
 		};
 
 		DIE_NODE(usb4_2_nhi): nhi@f00000 {
@@ -867,8 +867,8 @@
 				"rxring3", "rxring4", "rxring5",
 				"rxring6", "rxring7", "rxring8",
 				"rxring9", "rxring10", "rxring11";
-			iommus = <&DIE_NODE(usb4_2_dart) 1>,
-				 <&DIE_NODE(usb4_2_dart) 2>;
+			iommus = <&DIE_NODE(usb4_2_dart) 1 0x100 0x0 0x10 0x0>,
+				 <&DIE_NODE(usb4_2_dart) 2 0x100 0x0 0x10 0x0>;
 			/* To be filled by the loader */
 			apple,thunderbolt-drom = [00];
 		};
@@ -977,7 +977,7 @@
 			reg = <0xa80000 0x4000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ DIE_NO 1531 IRQ_TYPE_LEVEL_HIGH>;
-			#iommu-cells = <1>;
+			#iommu-cells = <5>;
 		};
 
 		DIE_NODE(usb4_3_nhi): nhi@f00000 {
@@ -1020,8 +1020,8 @@
 				"rxring3", "rxring4", "rxring5",
 				"rxring6", "rxring7", "rxring8",
 				"rxring9", "rxring10", "rxring11";
-			iommus = <&DIE_NODE(usb4_3_dart) 1>,
-				 <&DIE_NODE(usb4_3_dart) 2>;
+			iommus = <&DIE_NODE(usb4_3_dart) 1 0x100 0x0 0x10 0x0>,
+				 <&DIE_NODE(usb4_3_dart) 2 0x100 0x0 0x10 0x0>;
 			/* To be filled by the loader */
 			apple,thunderbolt-drom = [00];
 		};
