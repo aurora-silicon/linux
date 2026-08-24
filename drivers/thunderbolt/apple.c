@@ -212,6 +212,17 @@ static int apple_nhi_probe_irqs(struct apple_nhi *anhi)
 		dev_err(anhi->dev, "Invalid number of interrupts: %d must be even\n", n_irqs);
 		return -EINVAL;
 	}
+	/*
+	 * TX ring n is addressed as bit n and RX ring n as bit n + n_rings of the 32 bit
+	 * IRQ status and enable registers, so both halves have to fit into a single
+	 * register. hop_count is only checked against n_rings later on, and both come
+	 * from firmware, so bound this before anything shifts by the derived index.
+	 */
+	if (n_irqs > 32) {
+		dev_err(anhi->dev, "Invalid number of interrupts: %d exceeds 32 status bits\n",
+			n_irqs);
+		return -EINVAL;
+	}
 	anhi->n_rings = n_irqs / 2;
 
 	anhi->rx_irqs = devm_kcalloc(anhi->dev, anhi->n_rings, sizeof(*anhi->rx_irqs), GFP_KERNEL);
