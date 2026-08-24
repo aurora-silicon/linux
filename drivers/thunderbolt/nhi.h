@@ -96,6 +96,7 @@ extern const struct tb_nhi_ops icl_nhi_ops;
 #define QUIRK_AUTO_CLEAR_INT	BIT(0)
 #define QUIRK_E2E		BIT(1)
 #define QUIRK_NO_DMA_PORT	BIT(2)
+#define QUIRK_NO_USB3_BW_ALLOC	BIT(3)
 
 /*
  * PCI IDs used in this driver from Win Ridge forward. There is no
