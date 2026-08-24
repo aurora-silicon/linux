@@ -485,6 +485,8 @@ static inline struct tb_xdomain *tb_service_parent(struct tb_service *svc)
  *	  interrupt_work when dispatching interrupts to individual rings.
  * @pdev: Pointer to the PCI device
  * @ops: NHI specific optional ops
+ * @ring_layout: Layout of the ring registers inside @iobase. If not set
+ *		 the default layout from the USB4 specification is used.
  * @iobase: MMIO space of the NHI
  * @tx_rings: All Tx rings available on this host controller
  * @rx_rings: All Rx rings available on this host controller
@@ -501,6 +503,7 @@ struct tb_nhi {
 	spinlock_t lock;
 	struct pci_dev *pdev;
 	const struct tb_nhi_ops *ops;
+	const struct tb_nhi_ring_layout *ring_layout;
 	void __iomem *iobase;
 	struct tb_ring **tx_rings;
 	struct tb_ring **rx_rings;
