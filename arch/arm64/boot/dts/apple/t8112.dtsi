@@ -1238,6 +1238,12 @@
 			power-domains = <&ps_pmp>, <&ps_pms_sram>;
 		};
 
+		cio_reset: reset-controller@23b790000 {
+			compatible = "apple,t8112-cio-reset", "apple,t8103-cio-reset";
+			reg = <0x2 0x3b790000 0x0 0x8000>;
+			#reset-cells = <1>;
+		};
+
 		pinctrl_ap: pinctrl@23c100000 {
 			compatible = "apple,t8112-pinctrl", "apple,pinctrl";
 			reg = <0x2 0x3c100000 0x0 0x100000>;
