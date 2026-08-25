@@ -1587,6 +1587,7 @@
 					<&ps_atc0_cio_usb>;
 
 			thunderbolt-switch;
+			apple,pcie-tunnel = <&usb4_0_pcie_tunnel>;
 
 			pinctrl-0 = <&acio0_pins>;
 			pinctrl-names = "default";
@@ -1646,6 +1647,73 @@
 				iommus = <&usb4_0_dart 1>;
 				/* To be filled by the loader */
 				apple,thunderbolt-drom = [00];
+			};
+		};
+
+		usb4_0_pcie_tunnel: usb4-pcie-tunnel-0 {
+			#address-cells = <2>;
+			#size-cells = <2>;
+			ranges;
+
+			apciec0_dart: iommu@3a1008000 {
+				compatible = "apple,t8103-dart";
+				reg = <0x3 0xa1008000 0x0 0x4000>;
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 771 IRQ_TYPE_LEVEL_HIGH>;
+				#iommu-cells = <1>;
+			};
+
+			apciec0: pcie@3b0000000 {
+				compatible = "apple,t8103-pciec";
+				device_type = "pci";
+
+				reg = <0x3 0xb0000000 0x0 0x10000000>,
+					<0x3 0xa0000000 0x0 0x4000>,
+					<0x3 0xa1000000 0x0 0x8000>,
+					<0x3 0xa0004000 0x0 0x4000>,
+					<0x3 0xa0200000 0x0 0x4000>,
+					<0x3 0xa1010000 0x0 0x4000>,
+					<0x3 0xa100c000 0x0 0x4000>;
+				reg-names = "config", "rc", "port0", "common",
+					    "fabric", "debug", "intr2axi";
+
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 770 IRQ_TYPE_LEVEL_HIGH>;
+
+				msi-controller;
+				msi-parent = <&apciec0>;
+				msi-ranges = <&aic AIC_IRQ 738 IRQ_TYPE_EDGE_RISING 32>;
+
+				iommu-map = <0x0 &apciec0_dart 0x0 0x40>;
+				iommu-map-mask = <0x3f>;
+
+				bus-range = <0x0 0x7f>;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges = <0x43000000 0x4 0x0
+					  0x4 0x0 0x0 0x80000000>,
+					 <0x02000000 0x0 0x80000000
+					  0x4 0x80000000 0x0 0x40000000>,
+					 <0x42000000 0x0 0xc0000000
+					  0x4 0xc0000000 0x0 0x40000000>;
+
+				apciec0_port: pci@0,0 {
+					device_type = "pci";
+					reg = <0x0 0x0 0x0 0x0 0x0>;
+					external-facing;
+
+					#address-cells = <3>;
+					#size-cells = <2>;
+					ranges;
+
+					interrupt-controller;
+					#interrupt-cells = <1>;
+					interrupt-map-mask = <0 0 0 7>;
+					interrupt-map = <0 0 0 1 &apciec0_port 0 0 0 0>,
+							<0 0 0 2 &apciec0_port 0 0 0 1>,
+							<0 0 0 3 &apciec0_port 0 0 0 2>,
+							<0 0 0 4 &apciec0_port 0 0 0 3>;
+				};
 			};
 		};
 
@@ -1736,6 +1804,7 @@
 					<&ps_atc1_cio_usb>;
 
 			thunderbolt-switch;
+			apple,pcie-tunnel = <&usb4_1_pcie_tunnel>;
 
 			pinctrl-0 = <&acio1_pins>;
 			pinctrl-names = "default";
@@ -1795,6 +1864,73 @@
 				iommus = <&usb4_1_dart 1>;
 				/* To be filled by the loader */
 				apple,thunderbolt-drom = [00];
+			};
+		};
+
+		usb4_1_pcie_tunnel: usb4-pcie-tunnel-1 {
+			#address-cells = <2>;
+			#size-cells = <2>;
+			ranges;
+
+			apciec1_dart: iommu@521008000 {
+				compatible = "apple,t8103-dart";
+				reg = <0x5 0x21008000 0x0 0x4000>;
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 851 IRQ_TYPE_LEVEL_HIGH>;
+				#iommu-cells = <1>;
+			};
+
+			apciec1: pcie@530000000 {
+				compatible = "apple,t8103-pciec";
+				device_type = "pci";
+
+				reg = <0x5 0x30000000 0x0 0x10000000>,
+					<0x5 0x20000000 0x0 0x4000>,
+					<0x5 0x21000000 0x0 0x8000>,
+					<0x5 0x20004000 0x0 0x4000>,
+					<0x5 0x20200000 0x0 0x4000>,
+					<0x5 0x21010000 0x0 0x4000>,
+					<0x5 0x2100c000 0x0 0x4000>;
+				reg-names = "config", "rc", "port0", "common",
+					    "fabric", "debug", "intr2axi";
+
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 850 IRQ_TYPE_LEVEL_HIGH>;
+
+				msi-controller;
+				msi-parent = <&apciec1>;
+				msi-ranges = <&aic AIC_IRQ 818 IRQ_TYPE_EDGE_RISING 32>;
+
+				iommu-map = <0x0 &apciec1_dart 0x0 0x40>;
+				iommu-map-mask = <0x3f>;
+
+				bus-range = <0x0 0x7f>;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges = <0x43000000 0x5 0x80000000
+					  0x5 0x80000000 0x0 0x80000000>,
+					 <0x02000000 0x0 0x00100000
+					  0x6 0x00100000 0x0 0x3ff00000>,
+					 <0x42000000 0x0 0x40000000
+					  0x6 0x40000000 0x0 0x40000000>;
+
+				apciec1_port: pci@0,0 {
+					device_type = "pci";
+					reg = <0x0 0x0 0x0 0x0 0x0>;
+					external-facing;
+
+					#address-cells = <3>;
+					#size-cells = <2>;
+					ranges;
+
+					interrupt-controller;
+					#interrupt-cells = <1>;
+					interrupt-map-mask = <0 0 0 7>;
+					interrupt-map = <0 0 0 1 &apciec1_port 0 0 0 0>,
+							<0 0 0 2 &apciec1_port 0 0 0 1>,
+							<0 0 0 3 &apciec1_port 0 0 0 2>,
+							<0 0 0 4 &apciec1_port 0 0 0 3>;
+				};
 			};
 		};
 
