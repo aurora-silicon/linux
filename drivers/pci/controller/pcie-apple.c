@@ -185,7 +185,7 @@ static const struct hw_info t602x_hw = {
 	.max_rid2sid		= 512,
 };
 
-static const struct hw_info t6000_pciec_hw = {
+static const struct hw_info t8103_pciec_hw = {
 	.port_msiaddr		= PORT_MSIADDR,
 	.port_perst		= PORT_PERST,
 	.port_rid2sid		= PORT_RID2SID,
@@ -1167,7 +1167,8 @@ static void apple_pcie_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_pcie_of_match[] = {
-	{ .compatible = "apple,t6000-pciec",	.data = &t6000_pciec_hw },
+	{ .compatible = "apple,t8103-pciec",	.data = &t8103_pciec_hw },
+	{ .compatible = "apple,t6000-pciec",	.data = &t8103_pciec_hw },
 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,pcie",		.data = &t8103_hw },
 	{ }
