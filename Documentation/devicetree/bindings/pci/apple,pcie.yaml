@@ -21,6 +21,10 @@ description: |
   separate from the port registers. In that case, there is one PHY
   register range per port register range.
 
+  The PCIe-C variant connects a single root port to a USB4 router instead of
+  a physical PCIe link. It has no external PHY or PERST# GPIO and follows the
+  router's cable-controlled power lifetime.
+
   All root ports share a single ECAM space, but separate GPIOs are
   used to take the PCI devices on those ports out of reset.  Therefore
   the standard "reset-gpios" and "max-link-speed" properties appear on
@@ -45,6 +49,11 @@ properties:
           - const: apple,t8122-pcie
           - const: apple,t6020-pcie
       - const: apple,t6020-pcie
+      - const: apple,t8103-pciec
+      - items:
+          - const: apple,t8112-pciec
+          - const: apple,t8103-pciec
+      - const: apple,t6000-pciec
 
   reg:
     minItems: 3
@@ -141,6 +150,27 @@ allOf:
       properties:
         reg-names:
           minItems: 10
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8103-pciec
+              - apple,t6000-pciec
+    then:
+      properties:
+        reg:
+          minItems: 7
+          maxItems: 7
+        interrupts:
+          maxItems: 1
+        ranges:
+          minItems: 3
+          maxItems: 3
+    else:
+      properties:
+        ranges:
+          maxItems: 2
 
 examples:
   - |
