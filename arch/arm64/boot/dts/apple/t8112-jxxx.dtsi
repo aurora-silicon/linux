@@ -14,6 +14,7 @@
 		atcphy0 = &atcphy0;
 		atcphy1 = &atcphy1;
 		dcp = &dcp;
+		dcpext = &dcpext;
 		disp0 = &display;
 		disp0_piodma = &disp0_piodma;
 		usb4-0-acio = &usb4_0_acio;
@@ -69,6 +70,9 @@
 			compatible = "usb-c-connector";
 			power-role = "dual";
 			data-role = "dual";
+#ifndef T8112_TYPEC_DCP
+			displayport = <&dcpext>;
+#endif
 
 			ports {
 				#address-cells = <1>;
@@ -92,6 +96,15 @@
 						remote-endpoint = <&usb4_0_acio_tbt>;
 					};
 				};
+
+#ifndef T8112_TYPEC_DCP
+				port@3 {
+					reg = <3>;
+					typec0_dcp: endpoint {
+						remote-endpoint = <&dcpext_typec0>;
+					};
+				};
+#endif
 			};
 		};
 	};
@@ -108,8 +121,7 @@
 			power-role = "dual";
 			data-role = "dual";
 
-#ifdef ENABLE_DCPEXT_TYPEC
-			/* hacks */
+#ifndef T8112_TYPEC_DCP
 			displayport = <&dcpext>;
 #endif
 
@@ -135,15 +147,17 @@
 						remote-endpoint = <&usb4_1_acio_tbt>;
 					};
 				};
+
+#ifndef T8112_TYPEC_DCP
+				port@3 {
+					reg = <3>;
+					typec1_dcp: endpoint {
+						remote-endpoint = <&dcpext_typec1>;
+					};
+				};
+#endif
 			};
 		};
-	};
-};
-
-#ifdef ENABLE_DCPEXT_TYPEC
-/ {
-	aliases {
-		dcpext = &dcpext;
 	};
 };
 
@@ -163,32 +177,62 @@
 	status = "okay";
 };
 
+#ifndef T8112_TYPEC_DCP
 &dcpext {
 	status = "okay";
-	apple,connector-type = "DP";
+	apple,connector-type = "USB-C";
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>;
+	phy-names = "typec0", "typec1";
+	mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>;
+	mux-control-names = "typec0", "typec1";
+	apple,typec-mux-indices = <2 2>;
+	apple,typec-dptx-phys = <0 1>;
 
-	/* hacks */
-	apple,dptx-phy = <1>;
-	phys = <&atcphy1 PHY_TYPE_DP>;
-	phy-names = "dp-phy";
-	mux-controls = <&atcphy1_xbar 0>;
-	mux-control-names = "dp-xbar";
-	mux-index = <2>;
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+
+			port {
+				dcpext_typec0: endpoint {
+					remote-endpoint = <&typec0_dcp>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+
+			port {
+				dcpext_typec1: endpoint {
+					remote-endpoint = <&typec1_dcp>;
+				};
+			};
+		};
+	};
 };
+#endif
 
 /* remove once m1n1 enables sio nodes after setup */
 &sio {
-        status = "okay";
+	status = "okay";
 };
 
 &dpaudio1 {
 	status = "okay";
 };
 
+&ps_atc0_common {
+	apple,always-on; /* Needs to stay on for DP-alt suspend/resume */
+};
+
 &ps_atc1_common {
 	apple,always-on; /* Needs to stay on for DP-alt suspend/resume */
 };
-#endif
 
 /* USB controllers */
 &dwc3_0 {
