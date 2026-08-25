@@ -466,6 +466,7 @@
 	};
 	*/
 
+#ifdef APPLE_T600X_NON_ULTRA
 	DIE_NODE(usb4_0_mbox): mailbox@701100000 {
 		compatible = "apple,t6000-m3-mailbox",
 			"apple,m3-mailbox-v2";
@@ -557,6 +558,7 @@
 			apple,thunderbolt-drom = [00];
 		};
 	};
+#endif
 
 	DIE_NODE(dwc3_0): usb@702280000 {
 		compatible = "apple,t6000-dwc3", "apple,t8103-dwc3";
@@ -619,6 +621,7 @@
 		status = "disabled";
 	};
 
+#ifdef APPLE_T600X_NON_ULTRA
 	DIE_NODE(usb4_1_mbox): mailbox@b01100000 {
 		compatible = "apple,t6000-m3-mailbox",
 			"apple,m3-mailbox-v2";
@@ -710,6 +713,7 @@
 			apple,thunderbolt-drom = [00];
 		};
 	};
+#endif
 
 	DIE_NODE(dwc3_1): usb@b02280000 {
 		compatible = "apple,t6000-dwc3", "apple,t8103-dwc3";
@@ -772,6 +776,7 @@
 		status = "disabled";
 	};
 
+#ifdef APPLE_T600X_NON_ULTRA
 	DIE_NODE(usb4_2_mbox): mailbox@f01100000 {
 		compatible = "apple,t6000-m3-mailbox",
 			"apple,m3-mailbox-v2";
@@ -863,6 +868,7 @@
 			apple,thunderbolt-drom = [00];
 		};
 	};
+#endif
 
 	DIE_NODE(dwc3_2): usb@f02280000 {
 		compatible = "apple,t6000-dwc3", "apple,t8103-dwc3";
@@ -925,6 +931,7 @@
 		status = "disabled";
 	};
 
+#ifdef APPLE_T600X_NON_ULTRA
 	DIE_NODE(usb4_3_mbox): mailbox@1301100000 {
 		compatible = "apple,t6000-m3-mailbox",
 			"apple,m3-mailbox-v2";
@@ -1016,6 +1023,7 @@
 			apple,thunderbolt-drom = [00];
 		};
 	};
+#endif
 
 	DIE_NODE(dwc3_3): usb@1302280000 {
 		compatible = "apple,t6000-dwc3", "apple,t8103-dwc3";
