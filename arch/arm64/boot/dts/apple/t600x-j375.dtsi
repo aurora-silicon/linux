@@ -35,12 +35,20 @@
 #if defined(APPLE_T600X_NON_ULTRA) || defined(APPLE_T602X_NON_ULTRA)
 		usb4-0-acio = &usb4_0_acio;
 		usb4-0-nhi = &usb4_0_nhi;
+		usb4-0-pcie-adapter = &usb4_0_acio;
+		usb4-0-pcie = &apciec0;
 		usb4-1-acio = &usb4_1_acio;
 		usb4-1-nhi = &usb4_1_nhi;
+		usb4-1-pcie-adapter = &usb4_1_acio;
+		usb4-1-pcie = &apciec1;
 		usb4-2-acio = &usb4_2_acio;
 		usb4-2-nhi = &usb4_2_nhi;
+		usb4-2-pcie-adapter = &usb4_2_acio;
+		usb4-2-pcie = &apciec2;
 		usb4-3-acio = &usb4_3_acio;
 		usb4-3-nhi = &usb4_3_nhi;
+		usb4-3-pcie-adapter = &usb4_3_acio;
+		usb4-3-pcie = &apciec3;
 #endif
 		wifi0 = &wifi0;
 	};

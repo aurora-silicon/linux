@@ -23,8 +23,12 @@
 		atcphy1 = &atcphy1;
 		usb4-0-acio = &usb4_0_acio;
 		usb4-0-nhi = &usb4_0_nhi;
+		usb4-0-pcie-adapter = &usb4_0_acio;
+		usb4-0-pcie = &apciec0;
 		usb4-1-acio = &usb4_1_acio;
 		usb4-1-nhi = &usb4_1_nhi;
+		usb4-1-pcie-adapter = &usb4_1_acio;
+		usb4-1-pcie = &apciec1;
 	};
 
 	chosen {
