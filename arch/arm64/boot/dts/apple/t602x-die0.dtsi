@@ -393,6 +393,167 @@
 		status = "disabled";
 	};
 
+	dispext0_dart: iommu@289304000 {
+		compatible = "apple,t6020-dart", "apple,t8110-dart";
+		reg = <0x2 0x89304000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 950 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext0_cpu0>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "disabled";
+	};
+
+	dcpext0_dart: iommu@28930c000 {
+		compatible = "apple,t6020-dart", "apple,t8110-dart";
+		reg = <0x2 0x8930c000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 950 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext0_cpu0>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "disabled";
+	};
+
+	dcpext0_mbox: mailbox@289c08000 {
+		compatible = "apple,t6020-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0x89c08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 971 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 972 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 973 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 974 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+			"recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_dispext0_cpu0>;
+		resets = <&ps_dispext0_cpu0>;
+		status = "disabled";
+	};
+
+	dcpext0: dcp@289c00000 {
+		compatible = "apple,t6020-dcpext", "apple,dcpext";
+		mboxes = <&dcpext0_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcpext0_dart 5>;
+		reg = <0x2 0x89c00000 0x0 0x4000>,
+			<0x2 0x88000000 0x0 0x4000000>,
+			<0x2 0x89320000 0x0 0x4000>,
+			<0x2 0x89344000 0x0 0x4000>,
+			<0x2 0x89800000 0x0 0x800000>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
+		apple,bw-scratch = <&pmgr_dcp 0 4 0x1210>;
+		apple,iomfb-surfaces = <1 1 0 1>;
+		power-domains = <&ps_dispext0_cpu0>;
+		resets = <&ps_dispext0_cpu0>;
+		clocks = <&clk_dispext0>;
+		apple,dcp-index = <1>;
+		#address-cells = <2>;
+		#size-cells = <2>;
+		status = "disabled";
+
+		piodma {
+			iommus = <&dispext0_dart 4>;
+		};
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dcpext0_audio: endpoint {
+					remote-endpoint = <&dpaudio1_dcp>;
+				};
+			};
+		};
+	};
+
+	dispext1_dart: iommu@315304000 {
+		compatible = "apple,t6020-dart", "apple,t8110-dart";
+		reg = <0x3 0x15304000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 986 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext1_cpu0>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "disabled";
+	};
+
+	dcpext1_dart: iommu@31530c000 {
+		compatible = "apple,t6020-dart", "apple,t8110-dart";
+		reg = <0x3 0x1530c000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 986 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext1_cpu0>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "disabled";
+	};
+
+	dcpext1_mbox: mailbox@315c08000 {
+		compatible = "apple,t6020-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x15c08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1007 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1008 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1009 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1010 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+			"recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_dispext1_cpu0>;
+		resets = <&ps_dispext1_cpu0>;
+		status = "disabled";
+	};
+
+	dcpext1: dcp@315c00000 {
+		compatible = "apple,t6020-dcpext", "apple,dcpext";
+		mboxes = <&dcpext1_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcpext1_dart 5>;
+		reg = <0x3 0x15c00000 0x0 0x4000>,
+			<0x3 0x14000000 0x0 0x4000000>,
+			<0x3 0x15320000 0x0 0x4000>,
+			<0x3 0x15344000 0x0 0x4000>,
+			<0x3 0x15800000 0x0 0x800000>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
+		apple,bw-scratch = <&pmgr_dcp 0 4 0x1218>;
+		apple,iomfb-surfaces = <1 1 0 1>;
+		power-domains = <&ps_dispext1_cpu0>;
+		resets = <&ps_dispext1_cpu0>;
+		clocks = <&clk_dispext1>;
+		apple,dcp-index = <2>;
+		#address-cells = <2>;
+		#size-cells = <2>;
+		status = "disabled";
+
+		piodma {
+			iommus = <&dispext1_dart 4>;
+		};
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dcpext1_audio: endpoint {
+					remote-endpoint = <&dpaudio2_dcp>;
+				};
+			};
+		};
+	};
+
+	sio_dart: iommu@39b008000 {
+		compatible = "apple,t6020-dart", "apple,t8110-dart";
+		reg = <0x3 0x9b008000 0x0 0x8000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1231 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		power-domains = <&ps_sio_cpu>;
+	};
+
 	aop_dart: iommu@2a6808000 {
 		compatible = "apple,t6020-dart", "apple,t8110-dart";
 		reg = <0x2 0xa6808000 0x0 0x4000>;
@@ -693,6 +854,32 @@
 		#mbox-cells = <0>;
 	};
 
+	sio_mbox: mailbox@39bc08000 {
+		compatible = "apple,t6020-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x9bc08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1248 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1249 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1250 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1251 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+			"recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_sio_cpu>;
+	};
+
+	sio: sio@39bc00000 {
+		compatible = "apple,t6020-sio", "apple,sio";
+		reg = <0x3 0x9bc00000 0x0 0x8000>;
+		dma-channels = <128>;
+		#dma-cells = <1>;
+		mboxes = <&sio_mbox>;
+		iommus = <&sio_dart 0>;
+		power-domains = <&ps_sio_cpu>;
+		resets = <&ps_sio_cpu>;
+		status = "disabled";
+	};
+
 	fpwm0: pwm@39b030000 {
 		compatible = "apple,t6020-fpwm", "apple,s5l-fpwm";
 		reg = <0x3 0x9b030000 0x0 0x4000>;
@@ -911,10 +1098,55 @@
 		ports {
 			#address-cells = <1>;
 			#size-cells = <0>;
+
 			port@0 {
 				reg = <0>;
 				dpaudio0_dcp: endpoint {
 					remote-endpoint = <&dcp_audio>;
+				};
+			};
+		};
+	};
+
+	dpaudio1: audio-controller@39b540000 {
+		compatible = "apple,t6020-dpaudio", "apple,dpaudio";
+		reg = <0x3 0x9b540000 0x0 0x4000>;
+		dmas = <&sio 0x66>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa1>;
+		reset-domains = <&ps_dpa1>;
+		status = "disabled";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio1_dcp: endpoint {
+					remote-endpoint = <&dcpext0_audio>;
+				};
+			};
+		};
+	};
+
+	dpaudio2: audio-controller@39b580000 {
+		compatible = "apple,t6020-dpaudio", "apple,dpaudio";
+		reg = <0x3 0x9b580000 0x0 0x4000>;
+		dmas = <&sio 0x68>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa2>;
+		reset-domains = <&ps_dpa2>;
+		status = "disabled";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio2_dcp: endpoint {
+					remote-endpoint = <&dcpext1_audio>;
 				};
 			};
 		};

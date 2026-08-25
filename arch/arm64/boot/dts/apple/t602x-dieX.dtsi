@@ -504,6 +504,7 @@
 				<&DIE_NODE(ps_atc0_cio_usb)>;
 
 		thunderbolt-switch;
+		apple,pcie-tunnel = <&DIE_NODE(usb4_0_pcie_tunnel)>;
 
 		pinctrl-0 = <&DIE_NODE(acio0_pins)>;
 		pinctrl-names = "default";
@@ -565,6 +566,74 @@
 				 <&DIE_NODE(usb4_0_dart) 2 0x100 0x0 0x10 0x0>;
 			/* To be filled by the loader */
 			apple,thunderbolt-drom = [00];
+		};
+	};
+
+	DIE_NODE(usb4_0_pcie_tunnel): usb4-pcie-tunnel-0 {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		DIE_NODE(apciec0_dart): iommu@721008000 {
+			compatible = "apple,t8110-dart";
+			reg = <0x7 0x21008000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ DIE_NO 1265 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+		};
+
+		DIE_NODE(apciec0): pcie@730000000 {
+			compatible = "apple,t6000-pciec";
+			device_type = "pci";
+
+			reg = <0x7 0x30000000 0x0 0x10000000>,
+				<0x7 0x20000000 0x0 0x4000>,
+				<0x7 0x21000000 0x0 0x8000>,
+				<0x7 0x20004000 0x0 0x4000>,
+				<0x7 0x20200000 0x0 0x4000>,
+				<0x7 0x21010000 0x0 0x4000>,
+				<0x7 0x2100c000 0x0 0x4000>;
+			reg-names = "config", "rc", "port0", "common",
+				    "fabric", "debug", "intr2axi";
+
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ DIE_NO 1264 IRQ_TYPE_LEVEL_HIGH>;
+
+			msi-controller;
+			msi-parent = <&DIE_NODE(apciec0)>;
+			msi-ranges = <&aic AIC_IRQ DIE_NO 1833
+				      IRQ_TYPE_EDGE_RISING 32>;
+
+			iommu-map = <0x0 &DIE_NODE(apciec0_dart) 0x0 0x40>;
+			iommu-map-mask = <0x3f>;
+
+			bus-range = <0x0 0x7f>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x43000000 0x8 0x0
+				  0x8 0x0 0x2 0x0>,
+				 <0x02000000 0x0 0x00100000
+				  0xa 0x00100000 0x0 0x3ff00000>,
+				 <0x42000000 0x0 0x40000000
+				  0xa 0x40000000 0x0 0x40000000>;
+
+			DIE_NODE(apciec0_port): pci@0,0 {
+				device_type = "pci";
+				reg = <0x0 0x0 0x0 0x0 0x0>;
+				external-facing;
+
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+
+				interrupt-controller;
+				#interrupt-cells = <1>;
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &DIE_NODE(apciec0_port) 0 0 0 0>,
+						<0 0 0 2 &DIE_NODE(apciec0_port) 0 0 0 1>,
+						<0 0 0 3 &DIE_NODE(apciec0_port) 0 0 0 2>,
+						<0 0 0 4 &DIE_NODE(apciec0_port) 0 0 0 3>;
+			};
 		};
 	};
 
@@ -657,6 +726,7 @@
 				<&DIE_NODE(ps_atc1_cio_usb)>;
 
 		thunderbolt-switch;
+		apple,pcie-tunnel = <&DIE_NODE(usb4_1_pcie_tunnel)>;
 
 		pinctrl-0 = <&DIE_NODE(acio1_pins)>;
 		pinctrl-names = "default";
@@ -718,6 +788,74 @@
 				 <&DIE_NODE(usb4_1_dart) 2 0x100 0x0 0x10 0x0>;
 			/* To be filled by the loader */
 			apple,thunderbolt-drom = [00];
+		};
+	};
+
+	DIE_NODE(usb4_1_pcie_tunnel): usb4-pcie-tunnel-1 {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		DIE_NODE(apciec1_dart): iommu@b21008000 {
+			compatible = "apple,t8110-dart";
+			reg = <0xb 0x21008000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ DIE_NO 1283 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+		};
+
+		DIE_NODE(apciec1): pcie@b30000000 {
+			compatible = "apple,t6000-pciec";
+			device_type = "pci";
+
+			reg = <0xb 0x30000000 0x0 0x10000000>,
+				<0xb 0x20000000 0x0 0x4000>,
+				<0xb 0x21000000 0x0 0x8000>,
+				<0xb 0x20004000 0x0 0x4000>,
+				<0xb 0x20200000 0x0 0x4000>,
+				<0xb 0x21010000 0x0 0x4000>,
+				<0xb 0x2100c000 0x0 0x4000>;
+			reg-names = "config", "rc", "port0", "common",
+				    "fabric", "debug", "intr2axi";
+
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ DIE_NO 1282 IRQ_TYPE_LEVEL_HIGH>;
+
+			msi-controller;
+			msi-parent = <&DIE_NODE(apciec1)>;
+			msi-ranges = <&aic AIC_IRQ DIE_NO 1865
+				      IRQ_TYPE_EDGE_RISING 32>;
+
+			iommu-map = <0x0 &DIE_NODE(apciec1_dart) 0x0 0x40>;
+			iommu-map-mask = <0x3f>;
+
+			bus-range = <0x0 0x7f>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x43000000 0x8 0x0
+				  0xc 0x0 0x2 0x0>,
+				 <0x02000000 0x0 0x00100000
+				  0xe 0x00100000 0x0 0x3ff00000>,
+				 <0x42000000 0x0 0x40000000
+				  0xe 0x40000000 0x0 0x40000000>;
+
+			DIE_NODE(apciec1_port): pci@0,0 {
+				device_type = "pci";
+				reg = <0x0 0x0 0x0 0x0 0x0>;
+				external-facing;
+
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+
+				interrupt-controller;
+				#interrupt-cells = <1>;
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &DIE_NODE(apciec1_port) 0 0 0 0>,
+						<0 0 0 2 &DIE_NODE(apciec1_port) 0 0 0 1>,
+						<0 0 0 3 &DIE_NODE(apciec1_port) 0 0 0 2>,
+						<0 0 0 4 &DIE_NODE(apciec1_port) 0 0 0 3>;
+			};
 		};
 	};
 
@@ -810,6 +948,7 @@
 				<&DIE_NODE(ps_atc2_cio_usb)>;
 
 		thunderbolt-switch;
+		apple,pcie-tunnel = <&DIE_NODE(usb4_2_pcie_tunnel)>;
 
 		pinctrl-0 = <&DIE_NODE(acio2_pins)>;
 		pinctrl-names = "default";
@@ -871,6 +1010,74 @@
 				 <&DIE_NODE(usb4_2_dart) 2 0x100 0x0 0x10 0x0>;
 			/* To be filled by the loader */
 			apple,thunderbolt-drom = [00];
+		};
+	};
+
+	DIE_NODE(usb4_2_pcie_tunnel): usb4-pcie-tunnel-2 {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		DIE_NODE(apciec2_dart): iommu@f21008000 {
+			compatible = "apple,t8110-dart";
+			reg = <0xf 0x21008000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ DIE_NO 1301 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+		};
+
+		DIE_NODE(apciec2): pcie@f30000000 {
+			compatible = "apple,t6000-pciec";
+			device_type = "pci";
+
+			reg = <0xf 0x30000000 0x0 0x10000000>,
+				<0xf 0x20000000 0x0 0x4000>,
+				<0xf 0x21000000 0x0 0x8000>,
+				<0xf 0x20004000 0x0 0x4000>,
+				<0xf 0x20200000 0x0 0x4000>,
+				<0xf 0x21010000 0x0 0x4000>,
+				<0xf 0x2100c000 0x0 0x4000>;
+			reg-names = "config", "rc", "port0", "common",
+				    "fabric", "debug", "intr2axi";
+
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ DIE_NO 1300 IRQ_TYPE_LEVEL_HIGH>;
+
+			msi-controller;
+			msi-parent = <&DIE_NODE(apciec2)>;
+			msi-ranges = <&aic AIC_IRQ DIE_NO 1897
+				      IRQ_TYPE_EDGE_RISING 32>;
+
+			iommu-map = <0x0 &DIE_NODE(apciec2_dart) 0x0 0x40>;
+			iommu-map-mask = <0x3f>;
+
+			bus-range = <0x0 0x7f>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x43000000 0x8 0x0
+				  0x10 0x0 0x2 0x0>,
+				 <0x02000000 0x0 0x00100000
+				  0x12 0x00100000 0x0 0x3ff00000>,
+				 <0x42000000 0x0 0x40000000
+				  0x12 0x40000000 0x0 0x40000000>;
+
+			DIE_NODE(apciec2_port): pci@0,0 {
+				device_type = "pci";
+				reg = <0x0 0x0 0x0 0x0 0x0>;
+				external-facing;
+
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+
+				interrupt-controller;
+				#interrupt-cells = <1>;
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &DIE_NODE(apciec2_port) 0 0 0 0>,
+						<0 0 0 2 &DIE_NODE(apciec2_port) 0 0 0 1>,
+						<0 0 0 3 &DIE_NODE(apciec2_port) 0 0 0 2>,
+						<0 0 0 4 &DIE_NODE(apciec2_port) 0 0 0 3>;
+			};
 		};
 	};
 
