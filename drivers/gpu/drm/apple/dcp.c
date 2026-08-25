@@ -58,6 +58,150 @@ static bool unstable_edid = true;
 module_param(unstable_edid, bool, 0644);
 MODULE_PARM_DESC(unstable_edid, "Enable unstable EDID retrival support");
 
+static bool dcp_typec_route_is_dp(const struct typec_mux_state *state)
+{
+	return state->alt && state->alt->svid == USB_TYPEC_DP_SID &&
+	       (state->mode == TYPEC_DP_STATE_C ||
+		state->mode == TYPEC_DP_STATE_D ||
+		state->mode == TYPEC_DP_STATE_E);
+}
+
+static int dcp_typec_route_set(struct typec_mux_dev *mux,
+			       struct typec_mux_state *state)
+{
+	struct apple_dcp_typec_route *route = typec_mux_get_drvdata(mux);
+	struct apple_dcp *dcp = route->dcp;
+	int ret = 0;
+
+	guard(mutex)(&dcp->typec_route_lock);
+
+	if (!dcp_typec_route_is_dp(state)) {
+		if (!route->selected)
+			return 0;
+
+		ret = mux_control_deselect(route->xbar);
+		route->selected = false;
+		if (dcp->active_typec_route == route)
+			dcp->active_typec_route = NULL;
+		return ret;
+	}
+
+	if (route->selected)
+		return 0;
+
+	if (dcp->active_typec_route) {
+		dev_warn(dcp->dev, "DP route is already in use by another Type-C port\n");
+		return -EBUSY;
+	}
+
+	ret = mux_control_select(route->xbar, route->mux_index);
+	if (ret)
+		return ret;
+
+	dcp->phy = route->phy;
+	dcp->dptx_phy = route->dptx_phy;
+	dcp->active_typec_route = route;
+	route->selected = true;
+
+	dev_info(dcp->dev, "Routed DCP output to Type-C DPTX PHY %u\n",
+		 route->dptx_phy);
+	return 0;
+}
+
+static void dcp_typec_route_unregister(void *data)
+{
+	struct apple_dcp_typec_route *route = data;
+	struct apple_dcp *dcp = route->dcp;
+
+	guard(mutex)(&dcp->typec_route_lock);
+	if (route->selected) {
+		mux_control_deselect(route->xbar);
+		route->selected = false;
+		if (dcp->active_typec_route == route)
+			dcp->active_typec_route = NULL;
+	}
+	typec_mux_unregister(route->typec_mux);
+}
+
+static int dcp_register_typec_routes(struct apple_dcp *dcp)
+{
+	struct device_node *routes __free(device_node) =
+		of_get_child_by_name(dcp->dev->of_node, "typec-routes");
+	struct device *dev = dcp->dev;
+	u32 route_index;
+	int ret;
+
+	if (!routes)
+		return 0;
+
+	for_each_available_child_of_node_scoped(routes, route_np) {
+		struct apple_dcp_typec_route *route;
+		struct typec_mux_desc desc = {};
+		const char *name;
+
+		if (dcp->nr_typec_routes == DCP_MAX_TYPEC_ROUTES)
+			return dev_err_probe(dev, -E2BIG, "Too many Type-C display routes\n");
+
+		ret = of_property_read_u32(route_np, "reg", &route_index);
+		if (ret)
+			return dev_err_probe(dev, ret, "%pOF: missing route index\n", route_np);
+		if (route_index >= DCP_MAX_TYPEC_ROUTES)
+			return dev_err_probe(dev, -EINVAL, "%pOF: invalid route index %u\n",
+					     route_np, route_index);
+
+		name = devm_kasprintf(dev, GFP_KERNEL, "typec%u", route_index);
+		if (!name)
+			return -ENOMEM;
+
+		route = &dcp->typec_routes[dcp->nr_typec_routes];
+		route->dcp = dcp;
+		route->phy = devm_phy_get(dev, name);
+		if (IS_ERR(route->phy))
+			return dev_err_probe(dev, PTR_ERR(route->phy),
+					     "%pOF: failed to get DP PHY\n", route_np);
+
+		route->xbar = devm_mux_control_get(dev, name);
+		if (IS_ERR(route->xbar))
+			return dev_err_probe(dev, PTR_ERR(route->xbar),
+					     "%pOF: failed to get display crossbar\n", route_np);
+
+		ret = of_property_read_u32_index(dev->of_node, "apple,typec-mux-indices",
+						 route_index, &route->mux_index);
+		if (ret)
+			return dev_err_probe(dev, ret, "%pOF: missing crossbar state\n",
+					     route_np);
+
+		ret = of_property_read_u32_index(dev->of_node, "apple,typec-dptx-phys",
+						 route_index, &route->dptx_phy);
+		if (ret)
+			return dev_err_probe(dev, ret, "%pOF: missing DPTX PHY index\n",
+					     route_np);
+
+		desc.fwnode = of_fwnode_handle(route_np);
+		desc.set = dcp_typec_route_set;
+		desc.name = name;
+		desc.drvdata = route;
+		route->typec_mux = typec_mux_register(dev, &desc);
+		if (IS_ERR(route->typec_mux))
+			return dev_err_probe(dev, PTR_ERR(route->typec_mux),
+					     "%pOF: failed to register Type-C route\n", route_np);
+
+		ret = devm_add_action_or_reset(dev, dcp_typec_route_unregister, route);
+		if (ret)
+			return ret;
+
+		if (!dcp->phy)
+			dcp->phy = route->phy;
+		dcp->nr_typec_routes++;
+	}
+
+	if (!dcp->nr_typec_routes)
+		return dev_err_probe(dev, -EINVAL, "Type-C route container is empty\n");
+
+	dcp->phy_managed_by_typec = true;
+	return 0;
+}
+
 /* copied and simplified from drm_vblank.c */
 static void send_vblank_event(struct drm_device *dev,
 		struct drm_pending_vblank_event *e,
@@ -1156,7 +1300,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	enum dcp_firmware_version fw_compat;
 	struct device *dev = &pdev->dev;
 	struct apple_dcp *dcp;
-	int surf, num_surfs;
+	int ret, surf, num_surfs;
 	u32 surf_en;
 	u32 mux_index;
 
@@ -1179,6 +1323,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	dcp->fw_compat = fw_compat;
 	dcp->dev = dev;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+	mutex_init(&dcp->typec_route_lock);
 
 	platform_set_drvdata(pdev, dcp);
 
@@ -1187,6 +1332,10 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		dev_err(dev, "Failed to get dp-phy: %ld\n", PTR_ERR(dcp->phy));
 		return PTR_ERR(dcp->phy);
 	}
+
+	ret = dcp_register_typec_routes(dcp);
+	if (ret)
+		return ret;
 
 	bitmap_zero(dcp->iomfb_surfaces, DCP_MAX_PLANES);
 	if (!of_property_present(dev->of_node, "apple,iomfb-surfaces"))
@@ -1283,6 +1432,8 @@ static int dcp_platform_probe(struct platform_device *pdev)
 				};
 				int ret = typec_mux_set(dcp->typec_mux, &state);
 				dev_info(dev, "typec_mux_set() returned: %d\n", ret);
+				if (!ret)
+					dcp->phy_managed_by_typec = true;
 			} else {
 				dev_info(dev, "fwnode_typec_mux_get() returned: %ld\n",
 						IS_ERR(dcp->typec_mux) ? PTR_ERR(dcp->typec_mux) : 0);

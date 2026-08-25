@@ -478,9 +478,8 @@ dptxport_call_activate(struct apple_epic_service *service,
 	struct dptx_port *dptx = service->cookie;
 	const struct apple_dcp *dcp = service->ep->dcp;
 
-	// TODO: hack, use phy_set_mode to select the correct DCP(EXT) input
-	// for standalone phy (i.e. not atc phy).
-	if (!dcp->typec_mux)
+	/* Standalone PHYs need DCP input selection here. Type-C owns ATC PHY mode. */
+	if (!dcp->phy_managed_by_typec)
 		phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP, dcp->index);
 
 	memcpy(reply, data, min(reply_size, data_size));
@@ -496,9 +495,10 @@ dptxport_call_deactivate(struct apple_epic_service *service,
 		       void *reply, size_t reply_size)
 {
 	struct dptx_port *dptx = service->cookie;
+	const struct apple_dcp *dcp = service->ep->dcp;
 
-	/* deactivate phy */
-	phy_set_mode_ext(dptx->atcphy, PHY_MODE_INVALID, 0);
+	if (!dcp->phy_managed_by_typec)
+		phy_set_mode_ext(dptx->atcphy, PHY_MODE_INVALID, 0);
 
 	memcpy(reply, data, min(reply_size, data_size));
 	if (reply_size >= 4)

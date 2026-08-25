@@ -21,9 +21,20 @@
 #include "epic/dpavservep.h"
 
 #define DCP_MAX_PLANES 4
+#define DCP_MAX_TYPEC_ROUTES 4
 
 struct apple_dcp;
 struct apple_dcp_afkep;
+
+struct apple_dcp_typec_route {
+	struct apple_dcp *dcp;
+	struct phy *phy;
+	struct mux_control *xbar;
+	struct typec_mux_dev *typec_mux;
+	u32 dptx_phy;
+	u32 mux_index;
+	bool selected;
+};
 
 struct dcpav_service_epic;
 
@@ -256,6 +267,11 @@ struct apple_dcp {
 	struct phy *phy;
 	struct mux_control *xbar;
 	struct typec_mux *typec_mux;
+	struct apple_dcp_typec_route typec_routes[DCP_MAX_TYPEC_ROUTES];
+	struct apple_dcp_typec_route *active_typec_route;
+	struct mutex typec_route_lock; /* serializes Type-C route ownership */
+	u32 nr_typec_routes;
+	bool phy_managed_by_typec;
 
 	struct gpio_desc *hdmi_hpd;
 	struct gpio_desc *hdmi_pwren;
