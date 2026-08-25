@@ -20,6 +20,8 @@
 # define GPU_REPEAT(x) <x x x x>
 #endif
 
+#define APPLE_T600X_NON_ULTRA
+
 #include "t600x-common.dtsi"
 
 / {
@@ -45,6 +47,7 @@
 &{/soc} {
 	#include "t600x-die0.dtsi"
 	#include "t600x-dieX.dtsi"
+	#include "t600x-pciec.dtsi"
 	#include "t600x-nvme.dtsi"
 };
 

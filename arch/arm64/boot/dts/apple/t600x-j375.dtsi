@@ -20,10 +20,13 @@
 		bluetooth0 = &bluetooth0;
 		#ifndef NO_DCP
 		dcp = &dcp;
+#ifdef APPLE_T600X_NON_ULTRA
+		dcpext1 = &dcpext1;
+#endif
 		disp0 = &display;
 		disp0_piodma = &disp0_piodma;
 		#endif
-#ifdef ENABLE_DCPEXT_TYPEC
+#if defined(ENABLE_DCPEXT_TYPEC) && !defined(APPLE_T600X_NON_ULTRA)
 		dcpext1 = &dcpext1;
 #endif
 		ethernet0 = &ethernet0;
@@ -69,6 +72,138 @@
 &dcp {
 	apple,connector-type = "HDMI-A";
 };
+
+#ifdef APPLE_T600X_NON_ULTRA
+&display {
+	iommus = <&disp0_dart 0>, <&dispext1_dart 0>;
+};
+
+&dispext1_dart {
+	status = "okay";
+};
+
+&dcpext1_dart {
+	status = "okay";
+};
+
+&dcpext1_mbox {
+	status = "okay";
+};
+
+&dcpext1 {
+	status = "okay";
+	apple,connector-type = "USB-C";
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>,
+	       <&atcphy2 PHY_TYPE_DP>, <&atcphy3 PHY_TYPE_DP>;
+	phy-names = "typec0", "typec1", "typec2", "typec3";
+	mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>,
+		       <&atcphy2_xbar 0>, <&atcphy3_xbar 0>;
+	mux-control-names = "typec0", "typec1", "typec2", "typec3";
+	apple,typec-mux-indices = <2 2 2 2>;
+	apple,typec-dptx-phys = <0 1 2 3>;
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+
+			port {
+				dcpext1_typec0: endpoint {
+					remote-endpoint = <&typec0_dcp>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+
+			port {
+				dcpext1_typec1: endpoint {
+					remote-endpoint = <&typec1_dcp>;
+				};
+			};
+		};
+
+		route@2 {
+			reg = <2>;
+			mode-switch;
+
+			port {
+				dcpext1_typec2: endpoint {
+					remote-endpoint = <&typec2_dcp>;
+				};
+			};
+		};
+
+		route@3 {
+			reg = <3>;
+			mode-switch;
+
+			port {
+				dcpext1_typec3: endpoint {
+					remote-endpoint = <&typec3_dcp>;
+				};
+			};
+		};
+	};
+};
+
+&dpaudio2 {
+	status = "okay";
+};
+
+&atcphy0_xbar {
+	status = "okay";
+};
+
+&atcphy1_xbar {
+	status = "okay";
+};
+
+&atcphy2_xbar {
+	status = "okay";
+};
+
+&atcphy3_xbar {
+	status = "okay";
+};
+
+&ps_atc0_common {
+	apple,always-on;
+};
+
+&ps_atc1_common {
+	apple,always-on;
+};
+
+&ps_atc2_common {
+	apple,always-on;
+};
+
+&ps_atc3_common {
+	apple,always-on;
+};
+
+&usb4_0_acio {
+	apple,pcie-tunnel = <&usb4_0_pcie_tunnel>;
+};
+
+&usb4_1_acio {
+	apple,pcie-tunnel = <&usb4_1_pcie_tunnel>;
+};
+
+&usb4_2_acio {
+	apple,pcie-tunnel = <&usb4_2_pcie_tunnel>;
+};
+
+&usb4_3_acio {
+	apple,pcie-tunnel = <&usb4_3_pcie_tunnel>;
+};
+#endif
 
 /* remove once m1n1 enables sio nodes after setup */
 &sio {
@@ -122,7 +257,7 @@
 			power-role = "dual";
 			data-role = "dual";
 
-#ifdef ENABLE_DCPEXT_TYPEC
+#if defined(ENABLE_DCPEXT_TYPEC) && !defined(APPLE_T600X_NON_ULTRA)
 			/* hacks */
 			displayport = <&dcpext1>;
 #endif
@@ -211,7 +346,7 @@
 	};
 };
 
-#ifdef ENABLE_DCPEXT_TYPEC
+#if defined(ENABLE_DCPEXT_TYPEC) && !defined(APPLE_T600X_NON_ULTRA)
 &display {
 	iommus = <&disp0_dart 0>, <&dispext1_dart 0>;
 };
@@ -251,6 +386,60 @@
 
 &ps_atc1_common {
 	apple,always-on; /* Needs to stay on for DP-alt suspend/resume */
+};
+#endif
+
+#ifdef APPLE_T600X_NON_ULTRA
+&typec0 {
+	displayport = <&dcpext1>;
+
+	ports {
+		port@3 {
+			reg = <3>;
+			typec0_dcp: endpoint {
+				remote-endpoint = <&dcpext1_typec0>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	displayport = <&dcpext1>;
+
+	ports {
+		port@3 {
+			reg = <3>;
+			typec1_dcp: endpoint {
+				remote-endpoint = <&dcpext1_typec1>;
+			};
+		};
+	};
+};
+
+&typec2 {
+	displayport = <&dcpext1>;
+
+	ports {
+		port@3 {
+			reg = <3>;
+			typec2_dcp: endpoint {
+				remote-endpoint = <&dcpext1_typec2>;
+			};
+		};
+	};
+};
+
+&typec3 {
+	displayport = <&dcpext1>;
+
+	ports {
+		port@3 {
+			reg = <3>;
+			typec3_dcp: endpoint {
+				remote-endpoint = <&dcpext1_typec3>;
+			};
+		};
+	};
 };
 #endif
 
