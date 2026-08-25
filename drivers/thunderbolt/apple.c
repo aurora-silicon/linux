@@ -111,6 +111,7 @@
 struct apple_cio {
 	struct device *dev;
 	struct device_node *np;
+	struct device_node *pcie_tunnel_np;
 	struct apple_rtkit *rtk;
 
 	void __iomem *rc_base;
@@ -133,6 +134,11 @@ struct apple_cio {
 
 	struct typec_thunderbolt_switch_dev *tbt_switch;
 };
+
+static void apple_cio_of_node_put(void *data)
+{
+	of_node_put(data);
+}
 
 struct apple_nhi {
 	struct device *dev;
@@ -694,6 +700,23 @@ static int apple_cio_start(struct apple_cio *acio)
 		goto err_depopulate;
 	}
 
+	/*
+	 * The PCIe-C root complex is outside the ACIO MMIO window but shares
+	 * its cable-controlled power lifetime. Instantiate it only after the
+	 * router and NHI are live; parenting it to ACIO makes depopulation tear
+	 * it down before the co-processor and power domains disappear.
+	 */
+	if (acio->pcie_tunnel_np) {
+		ret = of_platform_populate(acio->pcie_tunnel_np, NULL, NULL,
+					   acio->dev);
+		if (ret) {
+			dev_err(acio->dev,
+				"failed to populate tunneled PCIe controller: %d\n",
+				ret);
+			goto err_depopulate;
+		}
+	}
+
 	acio->current_cable_info = acio->target_cable_info;
 	return 0;
 
@@ -806,6 +829,14 @@ static int apple_cio_probe(struct platform_device *pdev)
 	init_completion(&acio->nhi_boot_completion);
 	acio->dev = &pdev->dev;
 	acio->np = dev->of_node;
+	acio->pcie_tunnel_np =
+		of_parse_phandle(dev->of_node, "apple,pcie-tunnel", 0);
+	if (acio->pcie_tunnel_np) {
+		ret = devm_add_action_or_reset(dev, apple_cio_of_node_put,
+					       acio->pcie_tunnel_np);
+		if (ret)
+			return ret;
+	}
 
 	acio->sram_res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "sram");
 	if (!acio->sram_res)
