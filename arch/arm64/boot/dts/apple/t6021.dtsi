@@ -23,6 +23,8 @@
 # define GPU_DIE_REPEAT(x) <x>
 #endif
 
+#define APPLE_T602X_NON_ULTRA
+
 #include "t602x-common.dtsi"
 
 / {

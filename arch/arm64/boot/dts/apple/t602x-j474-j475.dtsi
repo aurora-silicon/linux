@@ -21,6 +21,196 @@
 	power-domains = <&ps_dispext0_cpu0>, <&ps_dptx_phy_ps>;
 };
 
+#ifdef APPLE_T602X_NON_ULTRA
+/ {
+	aliases {
+		dcpext1 = &dcpext1;
+	};
+};
+
+&display {
+	iommus = <&dispext0_dart 0>, <&dispext1_dart 0>;
+};
+
+&dispext1_dart {
+	status = "okay";
+};
+
+&dcpext1_dart {
+	status = "okay";
+};
+
+&dcpext1_mbox {
+	status = "okay";
+};
+
+&dcpext1 {
+	status = "okay";
+	apple,connector-type = "USB-C";
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>,
+	       <&atcphy2 PHY_TYPE_DP>, <&atcphy3 PHY_TYPE_DP>;
+	phy-names = "typec0", "typec1", "typec2", "typec3";
+	mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>,
+		       <&atcphy2_xbar 0>, <&atcphy3_xbar 0>;
+	mux-control-names = "typec0", "typec1", "typec2", "typec3";
+	apple,typec-mux-indices = <2 2 2 2>;
+	apple,typec-dptx-phys = <0 1 2 3>;
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+
+			port {
+				dcpext1_typec0: endpoint {
+					remote-endpoint = <&typec0_dcp>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+
+			port {
+				dcpext1_typec1: endpoint {
+					remote-endpoint = <&typec1_dcp>;
+				};
+			};
+		};
+
+		route@2 {
+			reg = <2>;
+			mode-switch;
+
+			port {
+				dcpext1_typec2: endpoint {
+					remote-endpoint = <&typec2_dcp>;
+				};
+			};
+		};
+
+		route@3 {
+			reg = <3>;
+			mode-switch;
+
+			port {
+				dcpext1_typec3: endpoint {
+					remote-endpoint = <&typec3_dcp>;
+				};
+			};
+		};
+	};
+};
+
+&typec0 {
+	displayport = <&dcpext1>;
+
+	ports {
+		port@3 {
+			reg = <3>;
+			typec0_dcp: endpoint {
+				remote-endpoint = <&dcpext1_typec0>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	displayport = <&dcpext1>;
+
+	ports {
+		port@3 {
+			reg = <3>;
+			typec1_dcp: endpoint {
+				remote-endpoint = <&dcpext1_typec1>;
+			};
+		};
+	};
+};
+
+&typec2 {
+	displayport = <&dcpext1>;
+
+	ports {
+		port@3 {
+			reg = <3>;
+			typec2_dcp: endpoint {
+				remote-endpoint = <&dcpext1_typec2>;
+			};
+		};
+	};
+};
+
+&typec3 {
+	displayport = <&dcpext1>;
+
+	ports {
+		port@3 {
+			reg = <3>;
+			typec3_dcp: endpoint {
+				remote-endpoint = <&dcpext1_typec3>;
+			};
+		};
+	};
+};
+
+&dpaudio2 {
+	status = "okay";
+};
+
+&atcphy0_xbar {
+	status = "okay";
+};
+
+&atcphy1_xbar {
+	status = "okay";
+};
+
+&atcphy2_xbar {
+	status = "okay";
+};
+
+&atcphy3_xbar {
+	status = "okay";
+};
+
+&ps_atc0_common {
+	apple,always-on;
+};
+
+&ps_atc1_common {
+	apple,always-on;
+};
+
+&ps_atc2_common {
+	apple,always-on;
+};
+
+&ps_atc3_common {
+	apple,always-on;
+};
+
+&usb4_0_acio {
+	apple,pcie-tunnel = <&usb4_0_pcie_tunnel>;
+};
+
+&usb4_1_acio {
+	apple,pcie-tunnel = <&usb4_1_pcie_tunnel>;
+};
+
+&usb4_2_acio {
+	apple,pcie-tunnel = <&usb4_2_pcie_tunnel>;
+};
+
+&usb4_3_acio {
+	apple,pcie-tunnel = <&usb4_3_pcie_tunnel>;
+};
+#endif
+
 &hpm0 {
 	interrupts = <44 IRQ_TYPE_LEVEL_LOW>;
 };
