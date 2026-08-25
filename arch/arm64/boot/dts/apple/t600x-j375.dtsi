@@ -32,6 +32,7 @@
 		ethernet0 = &ethernet0;
 		serial0 = &serial0;
 		sio = &sio;
+#if defined(APPLE_T600X_NON_ULTRA) || defined(APPLE_T602X_NON_ULTRA)
 		usb4-0-acio = &usb4_0_acio;
 		usb4-0-nhi = &usb4_0_nhi;
 		usb4-1-acio = &usb4_1_acio;
@@ -40,6 +41,7 @@
 		usb4-2-nhi = &usb4_2_nhi;
 		usb4-3-acio = &usb4_3_acio;
 		usb4-3-nhi = &usb4_3_nhi;
+#endif
 		wifi0 = &wifi0;
 	};
 
@@ -733,6 +735,7 @@
 	status = "okay";
 };
 
+#if defined(APPLE_T600X_NON_ULTRA) || defined(APPLE_T602X_NON_ULTRA)
 &typec0 {
 	ports {
 		port@2 {
@@ -861,6 +864,7 @@
 		/* 6: DP1 */
 	};
 };
+#endif
 
 #include "spi1-nvram.dtsi"
 
