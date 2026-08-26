@@ -1406,7 +1406,16 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		if (IS_ERR(dcp->dp2hdmi_pwren))
 			return PTR_ERR(dcp->dp2hdmi_pwren);
 
-		ret = of_property_read_u32(dev->of_node, "mux-index", &mux_index);
+		/*
+		 * Firmware or an inherited board DTS may leave the legacy mux-index
+		 * property on external DCP nodes. Multi-route USB-C DCPs select their
+		 * crossbar through the per-port routes registered above and do not
+		 * have a single "dp-xbar" mux. Treat mux-index only as the legacy
+		 * single-route binding; otherwise one stale property prevents every
+		 * Type-C controller from probing while they wait for the DCP routes.
+		 */
+		ret = dcp->nr_typec_routes ? -ENODATA :
+			of_property_read_u32(dev->of_node, "mux-index", &mux_index);
 		if (!ret) {
 			dcp->xbar = devm_mux_control_get(dev, "dp-xbar");
 			if (IS_ERR(dcp->xbar)) {
