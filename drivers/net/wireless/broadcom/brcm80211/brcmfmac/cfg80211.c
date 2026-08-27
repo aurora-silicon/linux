@@ -725,27 +725,33 @@ done:
  */
 int brcmf_awdl_del_vif(struct wiphy *wiphy, struct wireless_dev *wdev)
 {
-	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
 	struct brcmf_cfg80211_vif *vif = container_of(wdev,
 						      struct brcmf_cfg80211_vif,
 						      wdev);
 	struct brcmf_if *ifp = vif->ifp;
 	int err;
 
-	brcmf_cfg80211_arm_vif_event(cfg, vif);
-	err = brcmf_fil_bsscfg_data_set(ifp, "interface_remove", NULL, 0);
-	if (err) {
-		brcmf_cfg80211_arm_vif_event(cfg, NULL);
-		return err;
-	}
+	/* Asymmetric with the rest of brcmfmac on purpose, for the same reason
+	 * brcmf_awdl_add_vif() does not call brcmf_net_attach(): nl80211 calls
+	 * vendor commands holding the wiphy mutex and NOT the RTNL
+	 * (NL80211_CMD_VENDOR sets NEED_WIPHY without NO_WIPHY_MTX). Tearing
+	 * the netdev down here reaches cfg80211_close_dependents(), which
+	 * asserts the RTNL, and then deadlocks the whole netdev layer against
+	 * any concurrent RTNL holder. Do NOT call brcmf_remove_interface() or
+	 * arm the vif event from this context.
+	 *
+	 * Just ask the firmware to drop the BSS and return. The BRCMF_E_IF_DEL
+	 * event lands in brcmf_fweh_event_worker(), which is a plain work item
+	 * holding neither lock, and brcmf_fweh_handle_if_event() removes the
+	 * interface from there.
+	 */
+	err = brcmf_fil_iovar_data_set(ifp, "interface_remove", NULL, 0);
+	if (err)
+		err = brcmf_fil_bsscfg_data_set(ifp, "interface_remove", NULL, 0);
+	if (err)
+		bphy_err(ifp->drvr, "interface_remove failed %d\n", err);
 
-	err = brcmf_cfg80211_wait_vif_event(cfg, BRCMF_E_IF_DEL,
-					    BRCMF_VIF_EVENT_TIMEOUT);
-	brcmf_cfg80211_arm_vif_event(cfg, NULL);
-	if (!err)
-		return -EIO;
-
-	return 0;
+	return err;
 }
 
 static
