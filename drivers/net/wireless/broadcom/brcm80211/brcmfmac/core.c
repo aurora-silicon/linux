@@ -632,6 +632,55 @@ static int brcmf_netdev_open(struct net_device *ndev)
 	return 0;
 }
 
+/* AWDL interfaces are not STAs. brcmf_netdev_open() runs the standard station
+ * bring-up -- a toe_ol query, brcmf_cfg80211_up(), then the multicast and
+ * promisc configuration driven by ndo_set_rx_mode -- and issuing those against
+ * an AWDL bsscfg stops the firmware answering dcmds at all: every subsequent
+ * command times out and only a brcmfmac reload recovers it. Bring the netdev
+ * up without touching firmware, and deliberately omit ndo_set_rx_mode so the
+ * multicast worker never runs for these interfaces.
+ */
+static int brcmf_netdev_open_awdl(struct net_device *ndev)
+{
+	struct brcmf_if *ifp = netdev_priv(ndev);
+	struct brcmf_pub *drvr = ifp->drvr;
+	struct brcmf_bus *bus_if = drvr->bus_if;
+
+	brcmf_dbg(TRACE, "Enter, bsscfgidx=%d (AWDL)\n", ifp->bsscfgidx);
+
+	if (bus_if->state != BRCMF_BUS_UP) {
+		bphy_err(drvr, "failed bus is not ready\n");
+		return -EAGAIN;
+	}
+
+	atomic_set(&ifp->pend_8021x_cnt, 0);
+
+	/* Carrier stays off until AWDL is actually running. */
+	netif_carrier_off(ndev);
+	return 0;
+}
+
+static int brcmf_netdev_stop_awdl(struct net_device *ndev)
+{
+	struct brcmf_if *ifp = netdev_priv(ndev);
+
+	brcmf_dbg(TRACE, "Enter, bsscfgidx=%d (AWDL)\n", ifp->bsscfgidx);
+
+	/* No brcmf_cfg80211_down(): this vif was never brought up through
+	 * cfg80211, and tearing down the STA state would hit the same
+	 * unresponsive-firmware path as the bring-up.
+	 */
+	brcmf_net_setcarrier(ifp, false);
+	return 0;
+}
+
+static const struct net_device_ops brcmf_netdev_ops_awdl = {
+	.ndo_open = brcmf_netdev_open_awdl,
+	.ndo_stop = brcmf_netdev_stop_awdl,
+	.ndo_start_xmit = brcmf_netdev_start_xmit,
+	.ndo_set_mac_address = brcmf_netdev_set_mac_address,
+};
+
 static const struct net_device_ops brcmf_netdev_ops_pri = {
 	.ndo_open = brcmf_netdev_open,
 	.ndo_stop = brcmf_netdev_stop,
@@ -651,7 +700,8 @@ int brcmf_net_attach(struct brcmf_if *ifp, bool locked)
 	ndev = ifp->ndev;
 
 	/* set appropriate operations */
-	ndev->netdev_ops = &brcmf_netdev_ops_pri;
+	ndev->netdev_ops = ifp->is_awdl ? &brcmf_netdev_ops_awdl
+					: &brcmf_netdev_ops_pri;
 
 	ndev->needed_headroom += drvr->hdrlen;
 	ndev->ethtool_ops = &brcmf_ethtool_ops;
