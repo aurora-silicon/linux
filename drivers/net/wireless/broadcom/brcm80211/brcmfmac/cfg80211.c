@@ -698,6 +698,8 @@ void brcmf_cfg80211_awdl_attach_pending(struct brcmf_if *ifp)
 		goto done;
 	}
 
+	/* Must be set before brcmf_net_attach(), which picks netdev_ops. */
+	ifp->is_awdl = true;
 	strscpy(ifp->ndev->name, cfg->awdl_ifname, sizeof(ifp->ndev->name));
 	err = brcmf_net_attach(ifp, false);
 	if (err) {
