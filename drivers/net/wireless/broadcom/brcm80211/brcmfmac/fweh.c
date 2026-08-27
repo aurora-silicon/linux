@@ -183,6 +183,13 @@ static void brcmf_fweh_handle_if_event(struct brcmf_pub *drvr,
 	brcmf_fweh_call_event_handler(drvr, ifp, emsg->event_code, emsg,
 				      data);
 
+	/* The handler above establishes the vif <-> ifp linkage. Only then can
+	 * the AWDL netdev be registered, and only from here: this worker holds
+	 * no locks, unlike the vendor command that requested the interface.
+	 */
+	if (ifp && ifevent->action == BRCMF_E_IF_ADD)
+		brcmf_cfg80211_awdl_attach_pending(ifp);
+
 	if (ifp && ifevent->action == BRCMF_E_IF_DEL) {
 		bool armed = brcmf_cfg80211_vif_event_armed(drvr->config);
 

@@ -605,6 +605,147 @@ brcmf_cfg80211_update_proto_addr_mode(struct wireless_dev *wdev)
  *
  * Return: pointer to new vif on success, ERR_PTR(-errno) if not
  */
+/**
+ * brcmf_awdl_add_vif() - create an AWDL interface and give it a netdev.
+ *
+ * @wiphy: wiphy device of the new interface.
+ * @name: name of the new interface.
+ *
+ * AWDL is Apple Wireless Direct Link, the link layer AirDrop and AirPlay run
+ * over. BCM4387 firmware implements it and accepts BRCMF_INTERFACE_TYPE_AWDL
+ * through interface_create, but there is no nl80211 interface type for it, so
+ * this cannot go through add_virtual_intf(). It is driven from the vendor
+ * command instead.
+ *
+ * The vif is allocated as NL80211_IFTYPE_STATION because cfg80211 needs some
+ * valid type for its bookkeeping; the firmware side is what actually decides
+ * the interface behaviour, from the iftype passed to interface_create.
+ *
+ * Return: pointer to the new vif on success, ERR_PTR(-errno) on failure.
+ */
+int brcmf_awdl_add_vif(struct wiphy *wiphy, const char *name)
+{
+	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
+	struct brcmf_if *ifp = netdev_priv(cfg_to_ndev(cfg));
+	struct brcmf_cfg80211_vif *vif;
+	int err;
+
+	if (brcmf_cfg80211_vif_event_armed(cfg) || cfg->awdl_pending)
+		return -EBUSY;
+
+	vif = brcmf_alloc_vif(cfg, NL80211_IFTYPE_STATION);
+	if (IS_ERR(vif))
+		return PTR_ERR(vif);
+
+	/* Arm before asking firmware: the BRCMF_E_IF event is what links the
+	 * brcmf_if to this vif (brcmf_notify_vif_event() bails with -EBADF if
+	 * nothing is armed, leaving ndev->ieee80211_ptr unset).
+	 */
+	brcmf_cfg80211_arm_vif_event(cfg, vif);
+
+	/* Pass NULL rather than a derived address. Supplying a MAC address
+	 * at interface_create time kills the firmware control channel about
+	 * two seconds after create, so the address is set afterwards via
+	 * cur_etheraddr instead.
+	 *
+	 */
+	strscpy(cfg->awdl_ifname, name, sizeof(cfg->awdl_ifname));
+	cfg->awdl_pending = true;
+
+	err = brcmf_cfg80211_request_awdl_if(ifp, NULL);
+	if (err) {
+		cfg->awdl_pending = false;
+		brcmf_cfg80211_arm_vif_event(cfg, NULL);
+		brcmf_free_vif(vif);
+		return err;
+	}
+
+	/* Deliberately do NOT wait for the interface here, and do NOT attach
+	 * the netdev. nl80211 calls vendor commands holding the wiphy mutex
+	 * (NL80211_CMD_VENDOR sets NEED_WIPHY without NO_WIPHY_MTX), and
+	 * register_netdev() re-enters that mutex via the netdev notifier
+	 * chain -> cfg80211_netdev_notifier_call(). Doing it here self-
+	 * deadlocks and wedges the RTNL for the whole system. The attach is
+	 * done from brcmf_cfg80211_awdl_attach_pending(), which the fweh
+	 * event worker calls while holding no locks at all.
+	 */
+	return 0;
+}
+
+/**
+ * brcmf_cfg80211_awdl_attach_pending() - finish AWDL interface creation.
+ *
+ * @ifp: interface the firmware just reported via BRCMF_E_IF_ADD.
+ *
+ * Called from the fweh event worker (brcmf_fweh_handle_if_event()), which
+ * runs on the system workqueue holding neither the RTNL nor the wiphy mutex.
+ * That is the only context in which register_netdev() is safe for an
+ * interface created outside cfg80211's own add_virtual_intf() path.
+ */
+void brcmf_cfg80211_awdl_attach_pending(struct brcmf_if *ifp)
+{
+	struct brcmf_cfg80211_info *cfg = ifp->drvr->config;
+	struct brcmf_cfg80211_vif *vif;
+	int err;
+
+	if (!cfg || !cfg->awdl_pending)
+		return;
+	cfg->awdl_pending = false;
+	vif = ifp->vif;
+
+	if (!ifp->ndev || !vif) {
+		bphy_err(ifp->drvr, "AWDL if event without netdev/vif\n");
+		goto done;
+	}
+
+	strscpy(ifp->ndev->name, cfg->awdl_ifname, sizeof(ifp->ndev->name));
+	err = brcmf_net_attach(ifp, false);
+	if (err) {
+		bphy_err(ifp->drvr, "registering AWDL netdevice failed\n");
+		free_netdev(ifp->ndev);
+		brcmf_free_vif(vif);
+		goto done;
+	}
+
+	brcmf_info("AWDL interface %s created (bsscfgidx %d)\n",
+		   ifp->ndev->name, ifp->bsscfgidx);
+done:
+	brcmf_cfg80211_arm_vif_event(cfg, NULL);
+}
+
+/**
+ * brcmf_awdl_del_vif() - tear down an interface made by brcmf_awdl_add_vif().
+ *
+ * @wiphy: wiphy device of the interface.
+ * @wdev: wireless device to remove.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+int brcmf_awdl_del_vif(struct wiphy *wiphy, struct wireless_dev *wdev)
+{
+	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
+	struct brcmf_cfg80211_vif *vif = container_of(wdev,
+						      struct brcmf_cfg80211_vif,
+						      wdev);
+	struct brcmf_if *ifp = vif->ifp;
+	int err;
+
+	brcmf_cfg80211_arm_vif_event(cfg, vif);
+	err = brcmf_fil_bsscfg_data_set(ifp, "interface_remove", NULL, 0);
+	if (err) {
+		brcmf_cfg80211_arm_vif_event(cfg, NULL);
+		return err;
+	}
+
+	err = brcmf_cfg80211_wait_vif_event(cfg, BRCMF_E_IF_DEL,
+					    BRCMF_VIF_EVENT_TIMEOUT);
+	brcmf_cfg80211_arm_vif_event(cfg, NULL);
+	if (!err)
+		return -EIO;
+
+	return 0;
+}
+
 static
 struct wireless_dev *brcmf_apsta_add_vif(struct wiphy *wiphy, const char *name,
 					 struct vif_params *params,

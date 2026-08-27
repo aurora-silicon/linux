@@ -104,6 +104,46 @@ exit:
 	return ret;
 }
 
+#define BRCMF_AWDL_IFNAME	"awdl0"
+
+static int brcmf_cfg80211_vndr_cmds_awdl_handler(struct wiphy *wiphy,
+						 struct wireless_dev *wdev,
+						 const void *data, int len)
+{
+	struct net_device *ndev;
+	struct wireless_dev *awdl_wdev;
+	u32 op;
+
+	if (len < sizeof(op))
+		return -EINVAL;
+	op = *(const u32 *)data;
+
+	switch (op) {
+	case BRCMF_VNDR_AWDL_OP_CREATE:
+		ndev = dev_get_by_name(wiphy_net(wiphy), BRCMF_AWDL_IFNAME);
+		if (ndev) {
+			dev_put(ndev);
+			return -EEXIST;
+		}
+		/* Asynchronous: returns as soon as firmware has been asked.
+		 * The netdev appears once the fweh worker registers it, so
+		 * userspace must wait for awdl0 rather than assume it exists.
+		 */
+		return brcmf_awdl_add_vif(wiphy, BRCMF_AWDL_IFNAME);
+	case BRCMF_VNDR_AWDL_OP_DESTROY:
+		ndev = dev_get_by_name(wiphy_net(wiphy), BRCMF_AWDL_IFNAME);
+		if (!ndev)
+			return -ENODEV;
+		awdl_wdev = ndev->ieee80211_ptr;
+		dev_put(ndev);
+		if (!awdl_wdev)
+			return -ENODEV;
+		return brcmf_awdl_del_vif(wiphy, awdl_wdev);
+	default:
+		return -EINVAL;
+	}
+}
+
 const struct wiphy_vendor_command brcmf_vendor_cmds[] = {
 	{
 		{
@@ -114,5 +154,15 @@ const struct wiphy_vendor_command brcmf_vendor_cmds[] = {
 			 WIPHY_VENDOR_CMD_NEED_NETDEV,
 		.policy = VENDOR_CMD_RAW_DATA,
 		.doit = brcmf_cfg80211_vndr_cmds_dcmd_handler
+	},
+	{
+		{
+			.vendor_id = BROADCOM_OUI,
+			.subcmd = BRCMF_VNDR_CMDS_AWDL
+		},
+		.flags = WIPHY_VENDOR_CMD_NEED_WDEV |
+			 WIPHY_VENDOR_CMD_NEED_NETDEV,
+		.policy = VENDOR_CMD_RAW_DATA,
+		.doit = brcmf_cfg80211_vndr_cmds_awdl_handler
 	},
 };
