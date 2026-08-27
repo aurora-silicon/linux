@@ -52,7 +52,7 @@
 enum brcmf_interface_type {
 	BRCMF_INTERFACE_TYPE_STA = 0,
 	BRCMF_INTERFACE_TYPE_AP = 1,
-	/* The missing number here is deliberate */
+	BRCMF_INTERFACE_TYPE_AWDL = 2,
 	BRCMF_INTERFACE_TYPE_NAN = 3,
 	BRCMF_INTERFACE_TYPE_P2P_GO = 4,
 	BRCMF_INTERFACE_TYPE_P2P_GC = 5,
@@ -237,6 +237,12 @@ static int brcmf_cfg80211_request_if(struct brcmf_if *ifp,
 int brcmf_cfg80211_request_sta_if(struct brcmf_if *ifp, u8 *macaddr)
 {
 	return brcmf_cfg80211_request_if(ifp, BRCMF_INTERFACE_TYPE_STA,
+					 macaddr);
+}
+
+int brcmf_cfg80211_request_awdl_if(struct brcmf_if *ifp, u8 *macaddr)
+{
+	return brcmf_cfg80211_request_if(ifp, BRCMF_INTERFACE_TYPE_AWDL,
 					 macaddr);
 }
 
