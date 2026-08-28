@@ -502,7 +502,8 @@
 
 		power-domains = <&DIE_NODE(ps_atc0_cio)>,
 				<&DIE_NODE(ps_atc0_cio_pcie)>,
-				<&DIE_NODE(ps_atc0_cio_usb)>;
+				<&DIE_NODE(ps_atc0_cio_usb)>,
+				<&DIE_NODE(ps_atc0_pcie)>;
 
 		thunderbolt-switch;
 		apple,pcie-tunnel = <&DIE_NODE(usb4_0_pcie_tunnel)>;
@@ -581,6 +582,8 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ DIE_NO 1265 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
+			apple,dma-range = <0x0 0x80000000 0x0 0x80000000>;
+			apple,dma-offset = <0x100 0x0>;
 		};
 
 		DIE_NODE(apciec0): pcie@730000000 {
@@ -591,14 +594,13 @@
 				<0x7 0x20000000 0x0 0x4000>,
 				<0x7 0x21000000 0x0 0x8000>,
 				<0x7 0x20004000 0x0 0x4000>,
-				<0x7 0x20200000 0x0 0x4000>,
-				<0x7 0x21010000 0x0 0x4000>,
-				<0x7 0x2100c000 0x0 0x4000>;
-			reg-names = "config", "rc", "port0", "common",
-				    "fabric", "debug", "intr2axi";
+				<0x7 0x20200000 0x0 0x4000>;
+			reg-names = "config", "rc", "port0", "fabric",
+				    "debug";
 
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ DIE_NO 1264 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&DIE_NODE(ps_atc0_pcie)>;
 
 			msi-controller;
 			msi-parent = <&DIE_NODE(apciec0)>;
@@ -726,7 +728,8 @@
 
 		power-domains = <&DIE_NODE(ps_atc1_cio)>,
 				<&DIE_NODE(ps_atc1_cio_pcie)>,
-				<&DIE_NODE(ps_atc1_cio_usb)>;
+				<&DIE_NODE(ps_atc1_cio_usb)>,
+				<&DIE_NODE(ps_atc1_pcie)>;
 
 		thunderbolt-switch;
 		apple,pcie-tunnel = <&DIE_NODE(usb4_1_pcie_tunnel)>;
@@ -805,6 +808,8 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ DIE_NO 1283 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
+			apple,dma-range = <0x0 0x80000000 0x0 0x80000000>;
+			apple,dma-offset = <0x100 0x0>;
 		};
 
 		DIE_NODE(apciec1): pcie@b30000000 {
@@ -815,14 +820,13 @@
 				<0xb 0x20000000 0x0 0x4000>,
 				<0xb 0x21000000 0x0 0x8000>,
 				<0xb 0x20004000 0x0 0x4000>,
-				<0xb 0x20200000 0x0 0x4000>,
-				<0xb 0x21010000 0x0 0x4000>,
-				<0xb 0x2100c000 0x0 0x4000>;
-			reg-names = "config", "rc", "port0", "common",
-				    "fabric", "debug", "intr2axi";
+				<0xb 0x20200000 0x0 0x4000>;
+			reg-names = "config", "rc", "port0", "fabric",
+				    "debug";
 
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ DIE_NO 1282 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&DIE_NODE(ps_atc1_pcie)>;
 
 			msi-controller;
 			msi-parent = <&DIE_NODE(apciec1)>;
@@ -950,7 +954,8 @@
 
 		power-domains = <&DIE_NODE(ps_atc2_cio)>,
 				<&DIE_NODE(ps_atc2_cio_pcie)>,
-				<&DIE_NODE(ps_atc2_cio_usb)>;
+				<&DIE_NODE(ps_atc2_cio_usb)>,
+				<&DIE_NODE(ps_atc2_pcie)>;
 
 		thunderbolt-switch;
 		apple,pcie-tunnel = <&DIE_NODE(usb4_2_pcie_tunnel)>;
@@ -1029,6 +1034,8 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ DIE_NO 1301 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
+			apple,dma-range = <0x0 0x80000000 0x0 0x80000000>;
+			apple,dma-offset = <0x100 0x0>;
 		};
 
 		DIE_NODE(apciec2): pcie@f30000000 {
@@ -1039,14 +1046,13 @@
 				<0xf 0x20000000 0x0 0x4000>,
 				<0xf 0x21000000 0x0 0x8000>,
 				<0xf 0x20004000 0x0 0x4000>,
-				<0xf 0x20200000 0x0 0x4000>,
-				<0xf 0x21010000 0x0 0x4000>,
-				<0xf 0x2100c000 0x0 0x4000>;
-			reg-names = "config", "rc", "port0", "common",
-				    "fabric", "debug", "intr2axi";
+				<0xf 0x20200000 0x0 0x4000>;
+			reg-names = "config", "rc", "port0", "fabric",
+				    "debug";
 
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ DIE_NO 1300 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&DIE_NODE(ps_atc2_pcie)>;
 
 			msi-controller;
 			msi-parent = <&DIE_NODE(apciec2)>;
@@ -1252,6 +1258,8 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ DIE_NO 1319 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
+			apple,dma-range = <0x0 0x80000000 0x0 0x80000000>;
+			apple,dma-offset = <0x100 0x0>;
 		};
 
 		DIE_NODE(apciec3): pcie@1330000000 {
@@ -1262,14 +1270,13 @@
 				<0x13 0x20000000 0x0 0x4000>,
 				<0x13 0x21000000 0x0 0x8000>,
 				<0x13 0x20004000 0x0 0x4000>,
-				<0x13 0x20200000 0x0 0x4000>,
-				<0x13 0x21010000 0x0 0x4000>,
-				<0x13 0x2100c000 0x0 0x4000>;
-			reg-names = "config", "rc", "port0", "common",
-				    "fabric", "debug", "intr2axi";
+				<0x13 0x20200000 0x0 0x4000>;
+			reg-names = "config", "rc", "port0", "fabric",
+				    "debug";
 
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ DIE_NO 1318 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&DIE_NODE(ps_atc3_pcie)>;
 
 			msi-controller;
 			msi-parent = <&DIE_NODE(apciec3)>;

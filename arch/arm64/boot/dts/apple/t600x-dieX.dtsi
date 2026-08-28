@@ -492,7 +492,8 @@
 
 		power-domains = <&DIE_NODE(ps_atc0_cio)>,
 				<&DIE_NODE(ps_atc0_cio_pcie)>,
-				<&DIE_NODE(ps_atc0_cio_usb)>;
+				<&DIE_NODE(ps_atc0_cio_usb)>,
+				<&DIE_NODE(ps_atc0_pcie)>;
 
 		thunderbolt-switch;
 
@@ -647,7 +648,8 @@
 
 		power-domains = <&DIE_NODE(ps_atc1_cio)>,
 				<&DIE_NODE(ps_atc1_cio_pcie)>,
-				<&DIE_NODE(ps_atc1_cio_usb)>;
+				<&DIE_NODE(ps_atc1_cio_usb)>,
+				<&DIE_NODE(ps_atc1_pcie)>;
 
 		thunderbolt-switch;
 
@@ -802,7 +804,8 @@
 
 		power-domains = <&DIE_NODE(ps_atc2_cio)>,
 				<&DIE_NODE(ps_atc2_cio_pcie)>,
-				<&DIE_NODE(ps_atc2_cio_usb)>;
+				<&DIE_NODE(ps_atc2_cio_usb)>,
+				<&DIE_NODE(ps_atc2_pcie)>;
 
 		thunderbolt-switch;
 

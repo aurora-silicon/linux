@@ -11,7 +11,7 @@
 		ranges;
 
 		apciec0_dart: iommu@721008000 {
-			compatible = "apple,t6000-dart";
+			compatible = "apple,t8110-dart";
 			reg = <0x7 0x21008000 0x0 0x4000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 0 1198 IRQ_TYPE_LEVEL_HIGH>;
@@ -29,11 +29,12 @@
 				<0x7 0x20200000 0x0 0x4000>,
 				<0x7 0x21010000 0x0 0x4000>,
 				<0x7 0x2100c000 0x0 0x4000>;
-			reg-names = "config", "rc", "port0", "common",
-				    "fabric", "debug", "intr2axi";
+			reg-names = "config", "rc", "port0", "fabric",
+				    "debug", "ltssm", "intr2axi";
 
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 0 1197 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc0_pcie>;
 
 			msi-controller;
 			msi-parent = <&apciec0>;
@@ -78,7 +79,7 @@
 		ranges;
 
 		apciec1_dart: iommu@b21008000 {
-			compatible = "apple,t6000-dart";
+			compatible = "apple,t8110-dart";
 			reg = <0xb 0x21008000 0x0 0x4000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 0 1215 IRQ_TYPE_LEVEL_HIGH>;
@@ -96,11 +97,12 @@
 				<0xb 0x20200000 0x0 0x4000>,
 				<0xb 0x21010000 0x0 0x4000>,
 				<0xb 0x2100c000 0x0 0x4000>;
-			reg-names = "config", "rc", "port0", "common",
-				    "fabric", "debug", "intr2axi";
+			reg-names = "config", "rc", "port0", "fabric",
+				    "debug", "ltssm", "intr2axi";
 
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 0 1214 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc1_pcie>;
 
 			msi-controller;
 			msi-parent = <&apciec1>;
@@ -145,7 +147,7 @@
 		ranges;
 
 		apciec2_dart: iommu@f21008000 {
-			compatible = "apple,t6000-dart";
+			compatible = "apple,t8110-dart";
 			reg = <0xf 0x21008000 0x0 0x4000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 0 1232 IRQ_TYPE_LEVEL_HIGH>;
@@ -163,11 +165,12 @@
 				<0xf 0x20200000 0x0 0x4000>,
 				<0xf 0x21010000 0x0 0x4000>,
 				<0xf 0x2100c000 0x0 0x4000>;
-			reg-names = "config", "rc", "port0", "common",
-				    "fabric", "debug", "intr2axi";
+			reg-names = "config", "rc", "port0", "fabric",
+				    "debug", "ltssm", "intr2axi";
 
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 0 1231 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc2_pcie>;
 
 			msi-controller;
 			msi-parent = <&apciec2>;
@@ -212,7 +215,7 @@
 		ranges;
 
 		apciec3_dart: iommu@1321008000 {
-			compatible = "apple,t6000-dart";
+			compatible = "apple,t8110-dart";
 			reg = <0x13 0x21008000 0x0 0x4000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 0 1249 IRQ_TYPE_LEVEL_HIGH>;
@@ -230,11 +233,12 @@
 				<0x13 0x20200000 0x0 0x4000>,
 				<0x13 0x21010000 0x0 0x4000>,
 				<0x13 0x2100c000 0x0 0x4000>;
-			reg-names = "config", "rc", "port0", "common",
-				    "fabric", "debug", "intr2axi";
+			reg-names = "config", "rc", "port0", "fabric",
+				    "debug", "ltssm", "intr2axi";
 
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 0 1248 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc3_pcie>;
 
 			msi-controller;
 			msi-parent = <&apciec3>;

@@ -1849,7 +1849,8 @@
 
 			power-domains = <&ps_atc0_cio>,
 					<&ps_atc0_cio_pcie>,
-					<&ps_atc0_cio_usb>;
+					<&ps_atc0_cio_usb>,
+					<&ps_atc0_pcie>;
 
 			thunderbolt-switch;
 			apple,pcie-tunnel = <&usb4_0_pcie_tunnel>;
@@ -1940,11 +1941,12 @@
 					<0x3 0xa0200000 0x0 0x4000>,
 					<0x3 0xa1010000 0x0 0x4000>,
 					<0x3 0xa100c000 0x0 0x4000>;
-				reg-names = "config", "rc", "port0", "common",
-					    "fabric", "debug", "intr2axi";
+				reg-names = "config", "rc", "port0", "fabric",
+					    "debug", "ltssm", "intr2axi";
 
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 1024 IRQ_TYPE_LEVEL_HIGH>;
+				power-domains = <&ps_atc0_pcie>;
 
 				msi-controller;
 				msi-parent = <&apciec0>;
@@ -2067,7 +2069,8 @@
 
 			power-domains = <&ps_atc1_cio>,
 					<&ps_atc1_cio_pcie>,
-					<&ps_atc1_cio_usb>;
+					<&ps_atc1_cio_usb>,
+					<&ps_atc1_pcie>;
 
 			thunderbolt-switch;
 			apple,pcie-tunnel = <&usb4_1_pcie_tunnel>;
@@ -2158,11 +2161,12 @@
 					<0x5 0x20200000 0x0 0x4000>,
 					<0x5 0x21010000 0x0 0x4000>,
 					<0x5 0x2100c000 0x0 0x4000>;
-				reg-names = "config", "rc", "port0", "common",
-					    "fabric", "debug", "intr2axi";
+				reg-names = "config", "rc", "port0", "fabric",
+					    "debug", "ltssm", "intr2axi";
 
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 1105 IRQ_TYPE_LEVEL_HIGH>;
+				power-domains = <&ps_atc1_pcie>;
 
 				msi-controller;
 				msi-parent = <&apciec1>;
