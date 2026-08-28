@@ -60,7 +60,11 @@ properties:
 
   power-domains:
     minItems: 3
-    maxItems: 3
+    maxItems: 4
+    description: |
+      The first three domains power the ACIO co-processor complex. When
+      apple,pcie-tunnel is present, the fourth domain powers its PCIe-C
+      controller and is enabled only after the USB4 PCIe tunnel is active.
 
   thunderbolt-switch: true
 
@@ -162,7 +166,8 @@ examples:
             mboxes = <&usb4_1_mbox>;
             power-domains = <&ps_atc1_cio>,
                             <&ps_atc1_cio_pcie>,
-                            <&ps_atc1_cio_usb>;
+                            <&ps_atc1_cio_usb>,
+                            <&ps_atc1_pcie>;
             resets = <&cio_reset 1>;
             thunderbolt-switch;
             pinctrl-0 = <&acio1_pins>;

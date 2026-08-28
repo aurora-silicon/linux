@@ -54,6 +54,33 @@ properties:
   power-domains:
     maxItems: 1
 
+  apple,dma-range:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 2
+    maxItems: 2
+    description: >
+      Inclusive device-visible DMA aperture, encoded as a start address and
+      size. The IOMMU DMA allocator restricts mappings to this range.
+
+  apple,dma-offset:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    description: >
+      Offset added to device-visible DMA addresses when indexing the DART page
+      tables. This models host bridges which alias a low PCI bus aperture into
+      a high DART translation window.
+
+  apple,tunable:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset
+        - description: Mask to be applied to the register value
+        - description: Bits to be set after applying the mask
+    description: >
+      List of (register offset, mask, value) tuples copied from Apple's Device
+      Tree by the bootloader and required to initialize dynamically powered
+      DART instances.
+
 required:
   - compatible
   - reg

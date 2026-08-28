@@ -160,8 +160,24 @@ allOf:
     then:
       properties:
         reg:
-          minItems: 7
+          minItems: 5
           maxItems: 7
+        reg-names:
+          oneOf:
+            - items:
+                - const: config
+                - const: rc
+                - const: port0
+                - const: fabric
+                - const: debug
+            - items:
+                - const: config
+                - const: rc
+                - const: port0
+                - const: fabric
+                - const: debug
+                - const: ltssm
+                - const: intr2axi
         interrupts:
           maxItems: 1
         ranges:
