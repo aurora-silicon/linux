@@ -30,6 +30,11 @@ properties:
           - apple,t6000-dart
       - items:
           - enum:
+              - apple,t6000-dart
+              - apple,t8112-dart
+          - const: apple,t8110-dart
+      - items:
+          - enum:
               - apple,t6020-dart
               - apple,t8122-dart
           - const: apple,t8110-dart
@@ -46,10 +51,11 @@ properties:
       Optional since not all IOMMUs are attached to a clock gate.
 
   '#iommu-cells':
-    const: 1
+    enum: [1, 5]
     description:
-      Has to be one. The single cell describes the stream id emitted by
-      a master to the IOMMU.
+      Usually one cell describing the stream id emitted by a master. The
+      T6020 NHI DART uses five cells to describe a stream range and its
+      device-visible DMA window.
 
   power-domains:
     maxItems: 1
@@ -86,6 +92,21 @@ required:
   - reg
   - '#iommu-cells'
   - interrupts
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6020-dart
+    then:
+      properties:
+        '#iommu-cells':
+          enum: [1, 5]
+    else:
+      properties:
+        '#iommu-cells':
+          const: 1
 
 additionalProperties: false
 

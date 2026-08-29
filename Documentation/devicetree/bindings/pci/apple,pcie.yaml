@@ -61,21 +61,11 @@ properties:
 
   reg-names:
     minItems: 3
-    items:
-      - const: config
-      - const: rc
-      - const: port0
-      - const: port1
-      - const: port2
-      - const: port3
-      - const: phy0
-      - const: phy1
-      - const: phy2
-      - const: phy3
+    maxItems: 10
 
   ranges:
     minItems: 2
-    maxItems: 2
+    maxItems: 3
 
   interrupts:
     description:
@@ -94,6 +84,8 @@ properties:
   power-domains:
     maxItems: 1
 
+  dma-coherent: true
+
 patternProperties:
   "^pci@":
     $ref: /schemas/pci/pci-bus.yaml#
@@ -108,12 +100,15 @@ patternProperties:
         description: Optional GPIO to power on the device
         maxItems: 1
 
+      interrupt-controller: true
+
     required:
-      - reset-gpios
       - interrupt-controller
       - "#interrupt-cells"
       - interrupt-map-mask
       - interrupt-map
+
+    unevaluatedProperties: false
 
 required:
   - compatible
@@ -185,8 +180,25 @@ allOf:
           maxItems: 3
     else:
       properties:
+        reg-names:
+          minItems: 3
+          items:
+            - const: config
+            - const: rc
+            - const: port0
+            - const: port1
+            - const: port2
+            - const: port3
+            - const: phy0
+            - const: phy1
+            - const: phy2
+            - const: phy3
         ranges:
           maxItems: 2
+      patternProperties:
+        "^pci@":
+          required:
+            - reset-gpios
 
 examples:
   - |

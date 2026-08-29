@@ -68,6 +68,12 @@ properties:
 
   thunderbolt-switch: true
 
+  apple,pcie-tunnel:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      PCIe-C tunnel container populated after the USB4 router has enabled its
+      PCIe adapter.
+
   apple,tunable-rc:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
     items:
