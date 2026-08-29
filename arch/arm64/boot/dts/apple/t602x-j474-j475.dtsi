@@ -107,8 +107,6 @@
 };
 
 &typec0 {
-	displayport = <&dcpext1>;
-
 	ports {
 		port@3 {
 			reg = <3>;
@@ -120,7 +118,12 @@
 };
 
 &typec1 {
-	displayport = <&dcpext1>;
+	/*
+	 * t600x-j375.dtsi guards this on APPLE_T600X_NON_ULTRA, which only
+	 * t6001.dtsi defines, so the legacy phandle survives on t602x.  The
+	 * typec-routes provider owns hotplug notification here.
+	 */
+	/delete-property/ displayport;
 
 	ports {
 		port@3 {
@@ -133,8 +136,6 @@
 };
 
 &typec2 {
-	displayport = <&dcpext1>;
-
 	ports {
 		port@3 {
 			reg = <3>;
@@ -146,8 +147,6 @@
 };
 
 &typec3 {
-	displayport = <&dcpext1>;
-
 	ports {
 		port@3 {
 			reg = <3>;

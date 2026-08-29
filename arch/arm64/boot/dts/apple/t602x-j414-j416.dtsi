@@ -68,12 +68,16 @@
 	hdmi-hpd-gpios = <&pinctrl_aop 25 GPIO_ACTIVE_HIGH>;
 	hdmi-pwren-gpios = <&smc_gpio 23 GPIO_ACTIVE_HIGH>;
 	dp2hdmi-pwren-gpios = <&smc_gpio 6 GPIO_ACTIVE_HIGH>;
-	phys = <&atcphy3 PHY_TYPE_DP>;
-	phy-names = "dp-phy";
-	mux-controls = <&atcphy3_xbar 0>;
-	mux-control-names = "dp-xbar";
+	phys = <&atcphy3 PHY_TYPE_DP>, <&atcphy0 PHY_TYPE_DP>,
+	       <&atcphy1 PHY_TYPE_DP>, <&atcphy2 PHY_TYPE_DP>;
+	phy-names = "dp-phy", "typec0", "typec1", "typec2";
+	mux-controls = <&atcphy3_xbar 0>, <&atcphy0_xbar 0>,
+		       <&atcphy1_xbar 0>, <&atcphy2_xbar 0>;
+	mux-control-names = "dp-xbar", "typec0", "typec1", "typec2";
 	mux-index = <0>;
 	apple,dptx-phy = <3>;
+	apple,typec-mux-indices = <0 0 0>;
+	apple,typec-dptx-phys = <0 1 2>;
 
 	ports {
 		#address-cells = <1>;
@@ -83,6 +87,44 @@
 			reg = <1>;
 			dcpext0_dpout: endpoint {
 				remote-endpoint = <&atcphy3_dp>;
+			};
+		};
+	};
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+
+			port {
+				dcpext0_typec0: endpoint {
+					remote-endpoint = <&typec0_dcpext0>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+
+			port {
+				dcpext0_typec1: endpoint {
+					remote-endpoint = <&typec1_dcpext0>;
+				};
+			};
+		};
+
+		route@2 {
+			reg = <2>;
+			mode-switch;
+
+			port {
+				dcpext0_typec2: endpoint {
+					remote-endpoint = <&typec2_dcpext0>;
+				};
 			};
 		};
 	};
@@ -101,6 +143,7 @@
 };
 
 &dcpext1 {
+	/delete-property/ mux-index;
 	status = "okay";
 	apple,connector-type = "USB-C";
 	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>,
@@ -152,39 +195,61 @@
 };
 
 &typec0 {
-	displayport = <&dcpext1>;
-
 	ports {
 		port@3 {
 			reg = <3>;
-			typec0_dcp: endpoint {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec0_dcp: endpoint@0 {
+				reg = <0>;
 				remote-endpoint = <&dcpext1_typec0>;
+			};
+
+			typec0_dcpext0: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext0_typec0>;
 			};
 		};
 	};
 };
 
 &typec1 {
-	displayport = <&dcpext1>;
-
+	/delete-property/ displayport;
 	ports {
 		port@3 {
 			reg = <3>;
-			typec1_dcp: endpoint {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec1_dcp: endpoint@0 {
+				reg = <0>;
 				remote-endpoint = <&dcpext1_typec1>;
+			};
+
+			typec1_dcpext0: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext0_typec1>;
 			};
 		};
 	};
 };
 
 &typec2 {
-	displayport = <&dcpext1>;
-
 	ports {
 		port@3 {
 			reg = <3>;
-			typec2_dcp: endpoint {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec2_dcp: endpoint@0 {
+				reg = <0>;
 				remote-endpoint = <&dcpext1_typec2>;
+			};
+
+			typec2_dcpext0: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext0_typec2>;
 			};
 		};
 	};

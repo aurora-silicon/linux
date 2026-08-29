@@ -80,7 +80,6 @@
 			compatible = "usb-c-connector";
 			power-role = "dual";
 			data-role = "dual";
-			displayport = <&dcpext>;
 
 			ports {
 				#address-cells = <1>;
@@ -126,7 +125,6 @@
 				compatible = "usb-c-connector";
 				power-role = "dual";
 				data-role = "dual";
-			displayport = <&dcpext>;
 
 			ports {
 				#address-cells = <1>;

@@ -74,10 +74,6 @@
 			compatible = "usb-c-connector";
 			power-role = "dual";
 			data-role = "dual";
-#ifndef T8112_TYPEC_DCP
-			displayport = <&dcpext>;
-#endif
-
 			ports {
 				#address-cells = <1>;
 				#size-cells = <0>;
@@ -124,10 +120,6 @@
 			compatible = "usb-c-connector";
 			power-role = "dual";
 			data-role = "dual";
-
-#ifndef T8112_TYPEC_DCP
-			displayport = <&dcpext>;
-#endif
 
 			ports {
 				#address-cells = <1>;

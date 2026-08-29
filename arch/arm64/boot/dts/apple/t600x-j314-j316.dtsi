@@ -138,6 +138,7 @@
 			};
 		};
 	};
+
 };
 
 #ifdef APPLE_T600X_NON_ULTRA
@@ -581,12 +582,14 @@
 
 #ifdef APPLE_T600X_NON_ULTRA
 &typec0 {
-	displayport = <&dcpext1>;
-
 	ports {
 		port@3 {
 			reg = <3>;
-			typec0_dcp: endpoint {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec0_dcp: endpoint@0 {
+				reg = <0>;
 				remote-endpoint = <&dcpext1_typec0>;
 			};
 		};
@@ -594,12 +597,14 @@
 };
 
 &typec1 {
-	displayport = <&dcpext1>;
-
 	ports {
 		port@3 {
 			reg = <3>;
-			typec1_dcp: endpoint {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec1_dcp: endpoint@0 {
+				reg = <0>;
 				remote-endpoint = <&dcpext1_typec1>;
 			};
 		};
@@ -607,12 +612,14 @@
 };
 
 &typec2 {
-	displayport = <&dcpext1>;
-
 	ports {
 		port@3 {
 			reg = <3>;
-			typec2_dcp: endpoint {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec2_dcp: endpoint@0 {
+				reg = <0>;
 				remote-endpoint = <&dcpext1_typec2>;
 			};
 		};

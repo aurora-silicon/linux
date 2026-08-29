@@ -118,8 +118,6 @@
 };
 
 &typec0 {
-	displayport = <&dcp>;
-
 	ports {
 		port@3 {
 			reg = <3>;
@@ -131,8 +129,6 @@
 };
 
 &typec1 {
-	displayport = <&dcp>;
-
 	ports {
 		port@3 {
 			reg = <3>;
