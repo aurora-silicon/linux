@@ -45,20 +45,6 @@
 #define DART_PCIEC_ADDR_WIDTH 42
 #define DART_PCIEC_STREAMS 64
 
-/*
- * Temporary bring-up gate for the cable-powered DART behind PCIe-C.  The
- * normal storage, display and USB4 DARTs never consult this parameter.
- */
-static unsigned int apple_dart_debug_stage;
-module_param_named(debug_stage, apple_dart_debug_stage, uint, 0644);
-MODULE_PARM_DESC(debug_stage,
-		 "Stop tunneled PCIe-C DART setup after the selected debug phase");
-
-static unsigned int apple_dart_trace_delay_ms;
-module_param_named(tunnel_trace_delay_ms, apple_dart_trace_delay_ms, uint, 0644);
-MODULE_PARM_DESC(tunnel_trace_delay_ms,
-		 "Delay after PCIe-C DART trace boundaries (0 disables tracing)");
-
 /* Common registers */
 
 #define DART_PARAMS1 0x00
@@ -246,6 +232,7 @@ struct apple_dart {
 	u32 four_level : 1;
 	u32 locked : 1;
 	u32 tunneled : 1;
+	u32 power_retained : 1;
 	struct apple_tunable *tunables;
 
 	dma_addr_t dma_min;
@@ -308,17 +295,6 @@ static void apple_dart_apply_tunables(struct apple_dart *dart)
 			apple_dart_writel(dart, value,
 					   dart->tunables->values[i].offset);
 	}
-}
-
-static void apple_dart_tunnel_trace(struct apple_dart *dart,
-				    unsigned int step, const char *operation)
-{
-	if (!dart->tunneled || !READ_ONCE(apple_dart_trace_delay_ms))
-		return;
-
-	dev_info(dart->dev, "PCIe-C DART trace %u armed: %s\n",
-		 step, operation);
-	msleep(READ_ONCE(apple_dart_trace_delay_ms));
 }
 
 /*
@@ -647,131 +623,22 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
 	bitmap_set(stream_map.sidmap, 0, dart->num_streams);
 
-	apple_dart_tunnel_trace(dart, 20, "disable DMA for every stream");
 	apple_dart_hw_disable_dma(&stream_map);
-	apple_dart_tunnel_trace(dart, 21, "clear every stream TTBR");
 	apple_dart_hw_clear_all_ttbrs(&stream_map);
 
 	/* enable all streams globally since TCR is used to control isolation */
-	apple_dart_tunnel_trace(dart, 22, "enable all streams globally");
 	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
 		apple_dart_writel(dart, U32_MAX,
 				   dart->hw->enable_streams + 4 * i);
 
 	/* clear any pending errors before the interrupt is unmasked */
-	apple_dart_tunnel_trace(dart, 23, "read and clear DART error status");
 	apple_dart_writel(dart, apple_dart_readl(dart, dart->hw->error),
 			   dart->hw->error);
 
-	apple_dart_tunnel_trace(dart, 24, "clear T8110 error mask");
 	if (dart->hw->type == DART_T8110)
 		apple_dart_writel(dart, 0, DART_T8110_ERROR_MASK);
 
-	apple_dart_tunnel_trace(dart, 25, "invalidate every stream TLB");
 	return dart->hw->invalidate_tlb(&stream_map);
-}
-
-static int apple_dart_debug_reset(struct apple_dart *dart)
-{
-	struct apple_dart_stream_map stream_map;
-	u32 value;
-	int i, sid;
-
-	if (dart->hw->type != DART_T8110 || apple_dart_debug_stage < 30)
-		return 0;
-
-	stream_map.dart = dart;
-	bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
-	set_bit(0, stream_map.sidmap);
-
-	apple_dart_writel(dart, U32_MAX, dart->hw->enable_streams);
-	dev_info(dart->dev,
-		 "PCIe-C DART reset stage 30: stream word 0 enabled\n");
-	if (apple_dart_debug_stage == 30)
-		return -EAGAIN;
-
-	for (i = 1; i < BITS_TO_U32(dart->num_streams); i++)
-		apple_dart_writel(dart, U32_MAX,
-				   dart->hw->enable_streams + 4 * i);
-	dev_info(dart->dev,
-		 "PCIe-C DART reset stage 31: all stream words enabled\n");
-	if (apple_dart_debug_stage == 31)
-		return -EAGAIN;
-
-	value = apple_dart_readl(dart, DART_TCR(dart, 0));
-	dev_info(dart->dev,
-		 "PCIe-C DART reset stage 32: SID0 TCR initial value=%#x\n",
-		 value);
-	if (apple_dart_debug_stage == 32)
-		return -EAGAIN;
-
-	apple_dart_writel(dart, dart->hw->tcr_disabled,
-			   DART_TCR(dart, 0));
-	dev_info(dart->dev,
-		 "PCIe-C DART reset stage 33: SID0 TCR disabled\n");
-	if (apple_dart_debug_stage == 33)
-		return -EAGAIN;
-
-	value = apple_dart_readl(dart, DART_TCR(dart, 0));
-	dev_info(dart->dev,
-		 "PCIe-C DART reset stage 34: SID0 TCR readback=%#x\n",
-		 value);
-	if (apple_dart_debug_stage == 34)
-		return -EAGAIN;
-
-	for (sid = 1; sid < dart->num_streams; sid++)
-		apple_dart_writel(dart, dart->hw->tcr_disabled,
-				   DART_TCR(dart, sid));
-	dev_info(dart->dev,
-		 "PCIe-C DART reset stage 35: all %u TCRs disabled\n",
-		 dart->num_streams);
-	if (apple_dart_debug_stage == 35)
-		return -EAGAIN;
-
-	apple_dart_writel(dart, 0, DART_TTBR(dart, 0, 0));
-	dev_info(dart->dev,
-		 "PCIe-C DART reset stage 36: SID0 TTBR0 cleared\n");
-	if (apple_dart_debug_stage == 36)
-		return -EAGAIN;
-
-	value = apple_dart_readl(dart, DART_TTBR(dart, 0, 0));
-	dev_info(dart->dev,
-		 "PCIe-C DART reset stage 37: SID0 TTBR0 readback=%#x\n",
-		 value);
-	if (apple_dart_debug_stage == 37)
-		return -EAGAIN;
-
-	for (sid = 1; sid < dart->num_streams; sid++)
-		for (i = 0; i < dart->hw->ttbr_count; i++)
-			apple_dart_writel(dart, 0,
-					   DART_TTBR(dart, sid, i));
-	dev_info(dart->dev,
-		 "PCIe-C DART reset stage 38: all TTBRs cleared\n");
-	if (apple_dart_debug_stage == 38)
-		return -EAGAIN;
-
-	value = apple_dart_readl(dart, dart->hw->error);
-	dev_info(dart->dev,
-		 "PCIe-C DART reset stage 39: error status=%#x\n", value);
-	if (apple_dart_debug_stage == 39)
-		return -EAGAIN;
-
-	apple_dart_writel(dart, value, dart->hw->error);
-	dev_info(dart->dev,
-		 "PCIe-C DART reset stage 40: error status cleared\n");
-	if (apple_dart_debug_stage == 40)
-		return -EAGAIN;
-
-	apple_dart_writel(dart, 0, DART_T8110_ERROR_MASK);
-	dev_info(dart->dev,
-		 "PCIe-C DART reset stage 41: error mask cleared\n");
-	if (apple_dart_debug_stage == 41)
-		return -EAGAIN;
-
-	i = dart->hw->invalidate_tlb(&stream_map);
-	dev_info(dart->dev,
-		 "PCIe-C DART reset stage 42: SID0 TLB flush returned %d\n", i);
-	return i ?: -EAGAIN;
 }
 
 static void apple_dart_domain_flush_tlb(struct apple_dart_domain *domain)
@@ -1569,22 +1436,14 @@ static int apple_dart_probe(struct platform_device *pdev)
 {
 	int ret;
 	u32 dart_params[4];
+	struct device_node *pd_np;
 	struct resource *res;
 	struct apple_dart *dart;
 	struct device *dev = &pdev->dev;
 	u64 dma_range[2];
-	bool debug_stop = false;
 	bool tunneled = dev->of_node->parent &&
 			 of_node_name_prefix(dev->of_node->parent,
 					     "usb4-pcie-tunnel-");
-
-	if (tunneled) {
-		dev_info(dev, "PCIe-C DART probe entered\n");
-		if (apple_dart_debug_stage == 10) {
-			dev_info(dev, "PCIe-C DART debug stage 10: probe entry\n");
-			return -EAGAIN;
-		}
-	}
 
 	dart = devm_kzalloc(dev, sizeof(*dart), GFP_KERNEL);
 	if (!dart)
@@ -1593,6 +1452,14 @@ static int apple_dart_probe(struct platform_device *pdev)
 	dart->dev = dev;
 	dart->hw = of_device_get_match_data(dev);
 	dart->tunneled = tunneled;
+	if (tunneled) {
+		pd_np = of_parse_phandle(dev->of_node, "power-domains", 0);
+		if (pd_np) {
+			dart->power_retained =
+				of_property_read_bool(pd_np, "apple,always-on");
+			of_node_put(pd_np);
+		}
+	}
 	spin_lock_init(&dart->lock);
 	platform_set_drvdata(pdev, dart);
 
@@ -1613,10 +1480,6 @@ static int apple_dart_probe(struct platform_device *pdev)
 							     &res);
 	if (IS_ERR(dart->regs))
 		return PTR_ERR(dart->regs);
-	if (tunneled && apple_dart_debug_stage == 11) {
-		dev_info(dev, "PCIe-C DART debug stage 11: registers mapped\n");
-		return -EAGAIN;
-	}
 
 	if (resource_size(res) < 0x4000) {
 		dev_err(dev, "MMIO region too small (%pr)\n", res);
@@ -1639,7 +1502,6 @@ static int apple_dart_probe(struct platform_device *pdev)
 		return ret;
 	dart->num_clks = ret;
 
-	apple_dart_tunnel_trace(dart, 10, "enable PCIe-C DART clocks");
 	ret = clk_bulk_prepare_enable(dart->num_clks, dart->clks);
 	if (ret)
 		return ret;
@@ -1651,26 +1513,11 @@ static int apple_dart_probe(struct platform_device *pdev)
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)
 		goto err_clk_disable;
-	if (tunneled && apple_dart_debug_stage == 12) {
-		dev_info(dev,
-			 "PCIe-C DART debug stage 12: power and clocks enabled\n");
-		ret = -EAGAIN;
-		debug_stop = true;
-		goto err_clk_disable;
-	}
 	if (tunneled) {
 		dev_info(dev, "applying %zu firmware PCIe-C DART tunables\n",
 			 dart->tunables->sz);
-		apple_dart_tunnel_trace(dart, 11, "apply firmware DART tunables");
 		apple_dart_apply_tunables(dart);
 		dev_info(dev, "firmware PCIe-C DART tunables applied\n");
-		if (apple_dart_debug_stage == 13) {
-			dev_info(dev,
-				 "PCIe-C DART debug stage 13: firmware tunables applied\n");
-			ret = -EAGAIN;
-			debug_stop = true;
-			goto err_clk_disable;
-		}
 	}
 
 	/*
@@ -1796,75 +1643,28 @@ params_done:
 	 */
 	if (tunneled) {
 		dart->locked = false;
-		dev_info(dev, "PCIe-C DART treating fresh tunnel context as unlocked\n");
 	} else {
 		dart->locked = apple_dart_is_locked(dart);
-	}
-	if (tunneled && apple_dart_debug_stage == 17) {
-		dev_info(dev, "PCIe-C DART debug stage 17: lock=%u\n",
-			 dart->locked);
-		ret = -EAGAIN;
-		debug_stop = true;
-		goto err_clk_disable;
-	}
-	if (!dart->locked && tunneled && apple_dart_debug_stage >= 29) {
-		if (apple_dart_debug_stage == 29) {
-			dev_info(dev,
-				 "PCIe-C DART debug stage 29: reset boundary reached\n");
-			ret = -EAGAIN;
-			debug_stop = true;
-			goto err_clk_disable;
-		}
-		ret = apple_dart_debug_reset(dart);
-		debug_stop = ret == -EAGAIN;
-		goto err_clk_disable;
 	}
 	if (!dart->locked) {
 		ret = apple_dart_hw_reset(dart);
 		if (ret)
 			goto err_clk_disable;
 	}
-	if (tunneled && apple_dart_debug_stage == 18) {
-		dev_info(dev, "PCIe-C DART debug stage 18: reset complete\n");
-		ret = -EAGAIN;
-		debug_stop = true;
-		goto err_clk_disable;
-	}
 
-	apple_dart_tunnel_trace(dart, 30, "register DART fault IRQ");
 	ret = request_irq(dart->irq, apple_dart_irq, IRQF_SHARED,
 			  "apple-dart fault handler", dart);
 	if (ret)
 		goto err_clk_disable;
-	if (tunneled && apple_dart_debug_stage == 19) {
-		dev_info(dev, "PCIe-C DART debug stage 19: IRQ registered\n");
-		ret = -EAGAIN;
-		debug_stop = true;
-		goto err_free_irq;
-	}
 
-	apple_dart_tunnel_trace(dart, 31, "register DART sysfs device");
 	ret = iommu_device_sysfs_add(&dart->iommu, dev, NULL, "apple-dart.%s",
 				     dev_name(&pdev->dev));
 	if (ret)
 		goto err_free_irq;
-	if (tunneled && apple_dart_debug_stage == 20) {
-		dev_info(dev, "PCIe-C DART debug stage 20: sysfs registered\n");
-		ret = -EAGAIN;
-		debug_stop = true;
-		goto err_sysfs_remove;
-	}
 
-	apple_dart_tunnel_trace(dart, 32, "register DART with IOMMU core");
 	ret = iommu_device_register(&dart->iommu, &apple_dart_iommu_ops, dev);
 	if (ret)
 		goto err_sysfs_remove;
-	if (tunneled && apple_dart_debug_stage == 21) {
-		dev_info(dev, "PCIe-C DART debug stage 21: IOMMU registered\n");
-		ret = -EAGAIN;
-		debug_stop = true;
-		goto err_iommu_unregister;
-	}
 
 	pm_runtime_put(dev);
 
@@ -1875,18 +1675,12 @@ params_done:
 		dart->pgsize > PAGE_SIZE, dart->locked, dart->ias, dart->oas);
 	return 0;
 
-err_iommu_unregister:
-	iommu_device_unregister(&dart->iommu);
 err_sysfs_remove:
 	iommu_device_sysfs_remove(&dart->iommu);
 err_free_irq:
 	free_irq(dart->irq, dart);
 err_clk_disable:
-	/* A diagnostic exit must not schedule runtime suspend during teardown. */
-	if (debug_stop)
-		pm_runtime_put_noidle(dev);
-	else
-		pm_runtime_put(dev);
+	pm_runtime_put(dev);
 	clk_bulk_disable_unprepare(dart->num_clks, dart->clks);
 
 	return ret;
@@ -2016,6 +1810,10 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	unsigned int sid, idx;
 
+	/* The tunneled DART has no state to save when its domain stays on. */
+	if (dart->power_retained)
+		return 0;
+
 	/* Locked DARTs can't be restored so skip saving their registers. */
 	if (dart->locked)
 		return 0;
@@ -2037,6 +1835,14 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	unsigned int sid, idx;
 	int ret;
+
+	/*
+	 * PCIe-C DARTs on an apple,always-on domain retain their translation
+	 * state. Resetting one here is both unnecessary and earlier than Apple's
+	 * force-active call at the end of PCIe-C port resume.
+	 */
+	if (dart->power_retained)
+		return 0;
 
 	/* Locked DARTs can't be restored, and they should not need it */
 	if (dart->locked)
