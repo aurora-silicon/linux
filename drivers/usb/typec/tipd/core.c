@@ -543,21 +543,24 @@ static void tps6598x_handle_plug_event(struct tps6598x *tps, u32 status)
 	}
 }
 
-static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status *st)
+static int cd321x_typec_update_mode(struct tps6598x *tps,
+				    struct cd321x_status *st)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+	struct typec_mux_state old_state = cd321x->state;
 	struct typec_thunderbolt_switch_data tbt_switch_data = {
 		.state = TYPEC_THUNDERBOLT_SWITCH_OFF,
 	};
+	int ret = 0;
 
 	if (!(st->data_status & TPS_DATA_STATUS_DATA_CONNECTION)) {
 		if (cd321x->state.mode == TYPEC_STATE_SAFE)
-			return;
+			return 0;
 		cd321x->state.alt = NULL;
 		cd321x->state.mode = TYPEC_STATE_SAFE;
 		cd321x->state.data = NULL;
 		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
-		typec_mux_set(cd321x->mux, &cd321x->state);
+		ret = typec_mux_set(cd321x->mux, &cd321x->state);
 	} else if (st->data_status & TPS_DATA_STATUS_DP_CONNECTION) {
 		struct typec_displayport_data dp_data;
 		unsigned long mode;
@@ -583,12 +586,12 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 			break;
 		default:
 			dev_err(tps->dev, "Invalid DP pin assignment\n");
-			return;
+			return -EINVAL;
 		}
 
 		if (cd321x->state.alt == cd321x->port_altmode_dp &&
 		   cd321x->state.mode == mode) {
-			return;
+			return 0;
 		}
 
 		dp_data.status = le32_to_cpu(st->dp_sid_status.status_rx);
@@ -597,13 +600,13 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		cd321x->state.data = &dp_data;
 		cd321x->state.mode = mode;
 		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
-		typec_mux_set(cd321x->mux, &cd321x->state);
+		ret = typec_mux_set(cd321x->mux, &cd321x->state);
 	} else if (st->data_status & TPS_DATA_STATUS_TBT_CONNECTION) {
 		struct typec_thunderbolt_data tbt_data;
 
 		if (cd321x->state.alt == cd321x->port_altmode_tbt &&
 		   cd321x->state.mode == TYPEC_TBT_MODE)
-			return;
+			return 0;
 
 		tbt_data.cable_mode = TBT_MODE |
 			TBT_SET_CABLE_SPEED(TPS_DATA_STATUS_TBT_CABLE_SPEED(st->data_status)) |
@@ -621,7 +624,9 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		cd321x->state.alt = cd321x->port_altmode_tbt;
 		cd321x->state.mode = TYPEC_TBT_MODE;
 		cd321x->state.data = &tbt_data;
-		typec_mux_set(cd321x->mux, &cd321x->state);
+		ret = typec_mux_set(cd321x->mux, &cd321x->state);
+		if (ret)
+			goto out;
 
 		tbt_switch_data.state = TYPEC_THUNDERBOLT_SWITCH_TBT;
 		tbt_switch_data.tbt = tbt_data;
@@ -633,7 +638,7 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		struct enter_usb_data eusb_data;
 
 		if (cd321x->state.alt == NULL && cd321x->state.mode == TYPEC_MODE_USB4)
-			return;
+			return 0;
 
 		eusb_data.eudo = le32_to_cpu(st->usb4_status.eudo);
 		eusb_data.active_link_training =
@@ -642,7 +647,9 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		cd321x->state.alt = NULL;
 		cd321x->state.data = &eusb_data;
 		cd321x->state.mode = TYPEC_MODE_USB4;
-		typec_mux_set(cd321x->mux, &cd321x->state);
+		ret = typec_mux_set(cd321x->mux, &cd321x->state);
+		if (ret)
+			goto out;
 
 		tbt_switch_data.state = TYPEC_THUNDERBOLT_SWITCH_USB4;
 		tbt_switch_data.usb4 = eusb_data;
@@ -652,16 +659,23 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 	} else {
 		if (cd321x->state.alt == NULL && cd321x->state.mode == TYPEC_STATE_USB)
-			return;
+			return 0;
 		cd321x->state.alt = NULL;
 		cd321x->state.mode = TYPEC_STATE_USB;
 		cd321x->state.data = NULL;
 		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
-		typec_mux_set(cd321x->mux, &cd321x->state);
+		ret = typec_mux_set(cd321x->mux, &cd321x->state);
 	}
 
+out:
 	/* Clear data since it's no longer used after typec_mux_set and points to the stack */
 	cd321x->state.data = NULL;
+	if (ret) {
+		cd321x->state = old_state;
+		dev_warn(tps->dev, "failed to configure Type-C mux: %d\n", ret);
+	}
+
+	return ret;
 }
 
 static void cd321x_update_work(struct work_struct *work)
@@ -689,7 +703,7 @@ static void cd321x_update_work(struct work_struct *work)
 	bool dp_mode_changed = st.data_status_changed &
 		(TPS_DATA_STATUS_DP_CONNECTION |
 		 TPS_DATA_STATUS_DP_PIN_ASSIGNMENT_MASK);
-	bool dp_was_connected = cd321x->state.alt == cd321x->port_altmode_dp;
+	bool dp_route_was_active = cd321x->display_route_active;
 	bool dp_connected = st.data_status & TPS_DATA_STATUS_DP_CONNECTION;
 
 	bool dp_hpd = st.data_status & CD321X_DATA_STATUS_HPD_LEVEL;
@@ -736,14 +750,16 @@ static void cd321x_update_work(struct work_struct *work)
 		usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
 
 	/*
-	 * Every Type-C port references the same external DCP connector.  Do not
-	 * report HPD-low for a port which neither had nor has a DP connection:
-	 * USB4/TBT status changes on such a port would otherwise tear down a DP
-	 * stream carried by a different Type-C port.
+	 * Every Type-C port references the same external DCP connector.  Only the
+	 * port which successfully acquired the shared display route may report a
+	 * disconnect.  A second DP sink can negotiate Alt Mode even though its mux
+	 * request is rejected with -EBUSY; treating that sink as the connector
+	 * owner would tear down the display carried by the first port.
 	 */
 	if (cd321x->connector_fwnode &&
-	    (dp_was_connected || dp_connected) &&
-	    (!dp_hpd || dp_hpd_changed)) {
+	    dp_route_was_active &&
+	    (!new_connected || was_disconnected || !dp_connected || !dp_hpd ||
+	     dp_hpd_changed || dp_mode_changed)) {
 		drm_connector_oob_hotplug_event(cd321x->connector_fwnode, connector_status_disconnected);
 	}
 
@@ -756,10 +772,21 @@ static void cd321x_update_work(struct work_struct *work)
 
 	/* If there was a disconnection, set PHY to off */
 	if (!new_connected || was_disconnected) {
+		struct typec_mux_state old_state = cd321x->state;
+		int ret;
+
 		cd321x->state.alt = NULL;
 		cd321x->state.mode = TYPEC_STATE_SAFE;
 		cd321x->state.data = NULL;
-		typec_set_mode(tps->port, TYPEC_STATE_SAFE);
+		ret = typec_set_mode(tps->port, TYPEC_STATE_SAFE);
+		if (ret) {
+			dev_warn(tps->dev,
+				 "failed to place Type-C mux in safe mode: %d\n",
+				 ret);
+			cd321x->state = old_state;
+		} else {
+			cd321x->display_route_active = false;
+		}
 	}
 
 	/* Update Type-C properties */
@@ -798,12 +825,13 @@ static void cd321x_update_work(struct work_struct *work)
 	}
 
 	/* Update the TypeC MUX/PHY state */
-	cd321x_typec_update_mode(tps, &st);
+	if (!cd321x_typec_update_mode(tps, &st))
+		cd321x->display_route_active = dp_connected;
 
 	/* Launch the USB role switch */
 	usb_role_switch_set_role(tps->role_sw, new_role);
 
-	if (cd321x->connector_fwnode && dp_connected && dp_hpd)
+	if (cd321x->connector_fwnode && cd321x->display_route_active && dp_hpd)
 		drm_connector_oob_hotplug_event(cd321x->connector_fwnode, connector_status_connected);
 
 	power_supply_changed(tps->psy);
