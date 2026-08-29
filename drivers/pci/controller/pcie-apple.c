@@ -732,6 +732,26 @@ static int apple_pcie_tunnel_reinitialize(struct apple_pcie_port *port)
 	apple_pcie_tunnel_reset_hardware(port);
 	apple_pcie_tunnel_apply_tunable(port->base, port->tunable);
 
+	/*
+	 * Keep the port disabled and its downstream reset asserted while the
+	 * root complex is configured.  The enable sequence does this explicitly
+	 * after applying the port tunables; releasing either
+	 * one early occasionally leaves a hot-reconnected USB4 endpoint unable to
+	 * train even though the tunnel itself is already live.
+	 */
+	apple_pcie_port_rmw_clear(port, PORT_APPCLK_EN, PORT_APPCLK);
+	apple_pcie_port_rmw_clear(port, PORT_PERST_OFF,
+				  pcie->hw->port_perst);
+	apple_pcie_tunnel_apply_tunable(pcie->cfg->win, pcie->rc_tunable);
+	apple_pcie_port_rmw_clear(port, PORT_APPCLK_CGDIS, PORT_APPCLK);
+	apple_pcie_port_writel(port, PORT_COUNTER_ENABLE, PORT_COUNTER_CTRL);
+	apple_pcie_port_writel(port, ~0, PORT_INTSTAT);
+	apple_pcie_port_writel(port, ~0, PORT_LINKCMDSTS);
+	apple_pcie_tunnel_writel(pcie->intr2axi_base,
+				 PCIEC_INTR2AXI_ENABLE,
+				 PCIEC_INTR2AXI_CTRL);
+
+	/* Release reset immediately before enabling the configured port. */
 	apple_pcie_port_rmw_set(port, PORT_PERST_OFF,
 				pcie->hw->port_perst);
 	apple_pcie_port_rmw_set(port, PORT_APPCLK_EN, PORT_APPCLK);
@@ -749,11 +769,6 @@ static int apple_pcie_tunnel_reinitialize(struct apple_pcie_port *port)
 		return dev_err_probe(pcie->dev, ret,
 				     "PCIe-C port did not become idle after hot reconnect\n");
 
-	apple_pcie_port_rmw_clear(port, PORT_APPCLK_CGDIS, PORT_APPCLK);
-	apple_pcie_tunnel_apply_tunable(pcie->cfg->win, pcie->rc_tunable);
-	apple_pcie_port_writel(port, PORT_COUNTER_ENABLE, PORT_COUNTER_CTRL);
-	apple_pcie_tunnel_writel(pcie->intr2axi_base, PCIEC_INTR2AXI_ENABLE,
-				   PCIEC_INTR2AXI_CTRL);
 	for (i = 0; i < pcie->hw->max_rid2sid; i++)
 		apple_pcie_rid2sid_write(port, i, 0);
 
