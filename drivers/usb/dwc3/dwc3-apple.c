@@ -301,6 +301,14 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 	}
 
 	appledwc->state = state;
+	/*
+	 * A connected cable leaves the Apple DWC3 core and its PHY as one live,
+	 * stateful unit.  The glue driver tears that unit down explicitly on a
+	 * role change or disconnect.  Do not let generic system PM independently
+	 * power-gate the DWC3 device in between: xHCI then observes a dead core on
+	 * resume and cannot restore the root hubs without a full cable teardown.
+	 */
+	dev_pm_syscore_device(appledwc->dev, true);
 	return 0;
 
 core_exit:
@@ -325,9 +333,11 @@ static int dwc3_apple_exit(struct dwc3_apple *appledwc)
 		/* Nothing to do if we're already off */
 		return 0;
 	case DWC3_APPLE_DEVICE:
+		dev_pm_syscore_device(appledwc->dev, false);
 		dwc3_gadget_exit(&appledwc->dwc);
 		break;
 	case DWC3_APPLE_HOST:
+		dev_pm_syscore_device(appledwc->dev, false);
 		dwc3_host_exit(&appledwc->dwc);
 		break;
 	}
