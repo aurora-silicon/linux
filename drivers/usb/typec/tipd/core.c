@@ -832,12 +832,13 @@ static int cd321x_connect(struct tps6598x *tps, u32 status)
 	cd321x_queue_status(cd321x);
 
 	/*
-	 * Cancel pending work if not already running, then requeue after CD321X_DEBOUNCE_DELAY_MS
-	 * regardless since the work function will check for any plug or altmodes changes since
-	 * its last run anyway.
+	 * Requeue even when the previous update is already running.  A separate
+	 * cancel_delayed_work() and schedule_delayed_work() pair can lose a cable
+	 * event in that window because the latter sees the running work as busy.
+	 * The worker consumes every accumulated status change on its next pass.
 	 */
-	cancel_delayed_work(&cd321x->update_work);
-	schedule_delayed_work(&cd321x->update_work, msecs_to_jiffies(CD321X_DEBOUNCE_DELAY_MS));
+	mod_delayed_work(system_wq, &cd321x->update_work,
+			 msecs_to_jiffies(CD321X_DEBOUNCE_DELAY_MS));
 
 	return 0;
 }
