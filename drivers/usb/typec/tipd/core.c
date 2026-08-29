@@ -686,6 +686,11 @@ static void cd321x_update_work(struct work_struct *work)
 
 	bool usb_connection = st.data_status &
 			      (TPS_DATA_STATUS_USB2_CONNECTION | TPS_DATA_STATUS_USB3_CONNECTION);
+	bool dp_mode_changed = st.data_status_changed &
+		(TPS_DATA_STATUS_DP_CONNECTION |
+		 TPS_DATA_STATUS_DP_PIN_ASSIGNMENT_MASK);
+	bool dp_was_connected = cd321x->state.alt == cd321x->port_altmode_dp;
+	bool dp_connected = st.data_status & TPS_DATA_STATUS_DP_CONNECTION;
 
 	bool dp_hpd = st.data_status & CD321X_DATA_STATUS_HPD_LEVEL;
 	bool dp_hpd_changed = st.data_status_changed & CD321X_DATA_STATUS_HPD_LEVEL;
@@ -714,11 +719,31 @@ static void cd321x_update_work(struct work_struct *work)
 		 (is_pd && memcmp(&st.partner_identity,
 				  &cd321x->cur_partner_identity, sizeof(struct usb_pd_identity))));
 
-	/* If we are switching from an active role, transition to USB_ROLE_NONE first */
-	if (old_role != USB_ROLE_NONE && (new_role != old_role || was_disconnected))
+	/*
+	 * ACIO carries the tunneled PCIe reset handshake over the still-live
+	 * Type-C data path. Close a disappearing USB4/TBT session before dropping
+	 * the USB role; otherwise the role transition tears down the ATC lanes and
+	 * PCIe-C cannot quiesce its hierarchy before NHI removal.
+	 */
+	if ((!new_connected || was_disconnected) &&
+	    cd321x->state.mode != TYPEC_STATE_SAFE)
+		typec_thunderbolt_switch_set(cd321x->tbt_switch,
+					     &tbt_switch_data);
+
+	/* If we are switching from an active role, transition to USB_ROLE_NONE. */
+	if (old_role != USB_ROLE_NONE &&
+	    (new_role != old_role || was_disconnected || dp_mode_changed))
 		usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
 
-	if (cd321x->connector_fwnode && (!dp_hpd || dp_hpd_changed)) {
+	/*
+	 * Every Type-C port references the same external DCP connector.  Do not
+	 * report HPD-low for a port which neither had nor has a DP connection:
+	 * USB4/TBT status changes on such a port would otherwise tear down a DP
+	 * stream carried by a different Type-C port.
+	 */
+	if (cd321x->connector_fwnode &&
+	    (dp_was_connected || dp_connected) &&
+	    (!dp_hpd || dp_hpd_changed)) {
 		drm_connector_oob_hotplug_event(cd321x->connector_fwnode, connector_status_disconnected);
 	}
 
@@ -731,7 +756,6 @@ static void cd321x_update_work(struct work_struct *work)
 
 	/* If there was a disconnection, set PHY to off */
 	if (!new_connected || was_disconnected) {
-		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 		cd321x->state.alt = NULL;
 		cd321x->state.mode = TYPEC_STATE_SAFE;
 		cd321x->state.data = NULL;
@@ -779,7 +803,7 @@ static void cd321x_update_work(struct work_struct *work)
 	/* Launch the USB role switch */
 	usb_role_switch_set_role(tps->role_sw, new_role);
 
-	if (cd321x->connector_fwnode && dp_hpd)
+	if (cd321x->connector_fwnode && dp_connected && dp_hpd)
 		drm_connector_oob_hotplug_event(cd321x->connector_fwnode, connector_status_connected);
 
 	power_supply_changed(tps->psy);
@@ -1698,8 +1722,29 @@ tps25750_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 static void cd321x_remove(struct tps6598x *tps)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+	struct typec_thunderbolt_switch_data tbt_switch_data = {
+		.state = TYPEC_THUNDERBOLT_SWITCH_OFF,
+	};
+	int ret;
 
 	cancel_delayed_work_sync(&cd321x->update_work);
+
+	/*
+	 * Driver teardown must close the same hardware sessions as a physical
+	 * disconnect.  Otherwise ACIO retains the old USB4 cable state while a
+	 * reprobe enters a new session, which its firmware treats as an invalid
+	 * live-to-live transition and resolves by resetting the SoC.
+	 *
+	 * Close ACIO first while the ATC lanes can still carry PCIe-C's tunneled
+	 * reset handshake, then drop the USB role after NHI and PCIe-C teardown.
+	 */
+	ret = typec_thunderbolt_switch_set(cd321x->tbt_switch,
+					   &tbt_switch_data);
+	if (ret)
+		dev_warn(tps->dev,
+			 "failed to close Thunderbolt/USB4 session on remove: %d\n",
+			 ret);
+	usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
 }
 
 int tipd_init(struct tps6598x *tps)
