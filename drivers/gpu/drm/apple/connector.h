@@ -15,6 +15,7 @@ struct apple_connector;
 #include "dcp-internal.h"
 
 void dcp_hotplug(struct work_struct *work);
+void dcp_retrain_oob(struct apple_connector *connector);
 
 struct apple_connector {
 	struct drm_connector base;

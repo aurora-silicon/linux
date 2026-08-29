@@ -254,6 +254,23 @@ static int dcp_retrain_active_crtc(struct apple_connector *connector)
 	return ret;
 }
 
+void dcp_retrain_oob(struct apple_connector *connector)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(connector->dcp);
+
+	if (!READ_ONCE(connector->connected) || !READ_ONCE(dcp->valid_mode))
+		return;
+
+	/*
+	 * Bringing up another high-speed Type-C route can disturb an active DPTX
+	 * stream without changing its HPD state.  Invalidate the IOMFB mode and
+	 * use the normal hotplug worker to replay the active CRTC from process
+	 * context; sending a synthetic disconnect would tear down the connector.
+	 */
+	WRITE_ONCE(dcp->valid_mode, false);
+	schedule_work(&connector->hotplug_wq);
+}
+
 void dcp_hotplug(struct work_struct *work)
 {
 	struct apple_connector *connector;

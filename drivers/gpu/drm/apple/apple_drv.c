@@ -93,6 +93,8 @@ static void apple_connector_oob_hotplug(struct drm_connector *connector,
 		dcp_dptx_connect_oob(apple_connector->dcp, 0);
 	else if (status == connector_status_disconnected)
 		dcp_dptx_disconnect_oob(apple_connector->dcp, 0);
+	else if (status == connector_status_unknown)
+		dcp_retrain_oob(apple_connector);
 	else
 		dev_err(&apple_connector->dcp->dev, "unexpected connector status"
 			":0x%x in oob_hotplug event\n", (u32)status);

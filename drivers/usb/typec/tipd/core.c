@@ -718,6 +718,9 @@ static void cd321x_update_work(struct work_struct *work)
 		 TPS_DATA_STATUS_DP_PIN_ASSIGNMENT_MASK);
 	bool dp_route_was_active = cd321x->display_route_active;
 	bool dp_connected = st.data_status & TPS_DATA_STATUS_DP_CONNECTION;
+	bool usb4_started =
+		(st.data_status_changed & CD321X_DATA_STATUS_USB4_CONNECTION) &&
+		(st.data_status & CD321X_DATA_STATUS_USB4_CONNECTION);
 
 	bool dp_hpd = st.data_status & CD321X_DATA_STATUS_HPD_LEVEL;
 	bool dp_hpd_changed = st.data_status_changed & CD321X_DATA_STATUS_HPD_LEVEL;
@@ -846,6 +849,16 @@ static void cd321x_update_work(struct work_struct *work)
 
 	if (cd321x->connector_fwnode && cd321x->display_route_active && dp_hpd)
 		drm_connector_oob_hotplug_event(cd321x->connector_fwnode, connector_status_connected);
+
+	/*
+	 * Apple routes all Type-C ports through shared high-speed display fabric.
+	 * Starting USB4 on one port can interrupt a DP stream on another without
+	 * changing that display's HPD state.  Ask the display driver to retrain the
+	 * still-connected route after ACIO and the USB role are live.
+	 */
+	if (cd321x->connector_fwnode && usb4_started && !dp_connected)
+		drm_connector_oob_hotplug_event(cd321x->connector_fwnode,
+						connector_status_unknown);
 
 	power_supply_changed(tps->psy);
 }
