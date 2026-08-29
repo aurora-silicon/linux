@@ -62,6 +62,7 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
+#include <linux/pci-apple.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
@@ -141,6 +142,7 @@ struct apple_cio {
 	u32 target_cable_info;
 	struct completion nhi_boot_completion;
 	int nhi_boot_status;
+	struct platform_device *nhi_pdev;
 
 	struct typec_thunderbolt_switch_dev *tbt_switch;
 	/* Serializes PCIe-C population with cable teardown. */
@@ -149,37 +151,6 @@ struct apple_cio {
 	bool pcie_tunnel_requested;
 	bool pcie_tunnel_populated;
 };
-
-/*
- * Temporary hardware bring-up gate. A non-zero value stops ACIO startup after
- * the corresponding phase so each power/reset/MMIO transition can be tested
- * independently on new SoCs without advancing into the next phase.
- */
-static unsigned int apple_cio_debug_stage;
-module_param_named(debug_stage, apple_cio_debug_stage, uint, 0644);
-MODULE_PARM_DESC(debug_stage, "Stop ACIO startup after the selected debug phase");
-
-static unsigned int apple_cio_pcie_tunnel_trace_delay_ms;
-module_param_named(pcie_tunnel_trace_delay_ms,
-		   apple_cio_pcie_tunnel_trace_delay_ms, uint, 0644);
-MODULE_PARM_DESC(pcie_tunnel_trace_delay_ms,
-		 "Delay before PCIe-C child population so its trace reaches persistent storage");
-
-static bool apple_cio_pcie_intr2axi_prearmed;
-module_param_named(pcie_intr2axi_prearmed,
-		   apple_cio_pcie_intr2axi_prearmed, bool, 0644);
-MODULE_PARM_DESC(pcie_intr2axi_prearmed,
-		 "Diagnostic: consume a live userspace Intr2AXI pulse instead of pulsing again");
-
-static bool apple_cio_defer_start;
-module_param_named(defer_start, apple_cio_defer_start, bool, 0644);
-MODULE_PARM_DESC(defer_start,
-		 "Hold a detected USB4/TBT cable until ACIO is started through sysfs");
-
-static int apple_cio_power_domain_limit = -1;
-module_param_named(power_domain_limit, apple_cio_power_domain_limit, int, 0644);
-MODULE_PARM_DESC(power_domain_limit,
-		 "Enable this many traced ACIO power domains before returning (-1 = all)");
 
 static void apple_cio_of_node_put(void *data)
 {
@@ -520,28 +491,14 @@ static int apple_cio_populate_pcie_tunnel(struct apple_cio *acio)
 	 * enabled both tunnel adapters and before either child can touch DART MMIO.
 	 * The bit self-clears after opening the bridge.
 	 */
-	if (READ_ONCE(apple_cio_pcie_intr2axi_prearmed)) {
-		WRITE_ONCE(apple_cio_pcie_intr2axi_prearmed, false);
-		dev_info(acio->dev,
-			 "PCIe-C Intr2AXI bridge accepted from live diagnostic handoff\n");
-	} else {
-		writel(APPLE_CIO_PCIEC_INTR2AXI_ENABLE,
-		       acio->pcie_intr2axi_base + APPLE_CIO_PCIEC_INTR2AXI_CTRL);
-		/* Complete the pulse without reading the transient register. */
-		mb();
-		dev_info(acio->dev, "PCIe-C Intr2AXI bridge enabled\n");
-	}
-	if (apple_cio_debug_stage == 12) {
-		dev_info(acio->dev,
-			 "ACIO debug stage 12: Intr2AXI pulsed; tunnel children held\n");
-		return -EAGAIN;
-	}
+	writel(APPLE_CIO_PCIEC_INTR2AXI_ENABLE,
+	       acio->pcie_intr2axi_base + APPLE_CIO_PCIEC_INTR2AXI_CTRL);
+	/* Complete the pulse without reading the transient register. */
+	mb();
+	dev_info(acio->dev, "PCIe-C Intr2AXI bridge enabled\n");
 
 	dev_info(acio->dev,
 		 "PCIe-C live handoff accepted; populating tunnel children\n");
-	if (READ_ONCE(apple_cio_pcie_tunnel_trace_delay_ms))
-		msleep(READ_ONCE(apple_cio_pcie_tunnel_trace_delay_ms));
-
 	return of_platform_populate(acio->pcie_tunnel_np, NULL, NULL,
 				    acio->dev);
 }
@@ -561,12 +518,6 @@ static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 	if (acio->pd_list->num_pds < 4 || !acio->pd_list->pd_links[3])
 		return dev_err_probe(acio->dev, -ENODEV,
 				     "pre-ACIO PCIe-C initialization is not active\n");
-
-	if (apple_cio_debug_stage == 11) {
-		dev_info(acio->dev,
-			 "ACIO debug stage 11: PCIe tunnel adapters held for manual population\n");
-		return 0;
-	}
 
 	ret = apple_cio_populate_pcie_tunnel(acio);
 	if (ret)
@@ -598,73 +549,6 @@ static void apple_cio_pcie_tunnel_work(struct work_struct *work)
 		dev_err(acio->dev, "deferred PCIe-C activation failed: %d\n", ret);
 }
 
-static int apple_cio_start(struct apple_cio *acio);
-
-static ssize_t acio_start_store(struct device *dev,
-				struct device_attribute *attr,
-				const char *buf, size_t count)
-{
-	struct apple_cio *acio = dev_get_drvdata(dev);
-	int ret;
-
-	if (!sysfs_streq(buf, "1"))
-		return -EINVAL;
-
-	ret = mutex_lock_interruptible(&acio->lock);
-	if (ret)
-		return ret;
-
-	if (acio->current_cable_info) {
-		ret = -EALREADY;
-		goto out_unlock;
-	}
-	if (!acio->target_cable_info) {
-		ret = -ENODEV;
-		goto out_unlock;
-	}
-
-	dev_info(acio->dev,
-		 "starting deferred ACIO cable transition %#x\n",
-		 acio->target_cable_info);
-	ret = apple_cio_start(acio);
-
-out_unlock:
-	mutex_unlock(&acio->lock);
-	return ret ?: count;
-}
-static DEVICE_ATTR_WO(acio_start);
-
-static ssize_t pcie_tunnel_populate_store(struct device *dev,
-					  struct device_attribute *attr,
-					  const char *buf, size_t count)
-{
-	struct apple_cio *acio = dev_get_drvdata(dev);
-	int ret;
-
-	if (!sysfs_streq(buf, "1"))
-		return -EINVAL;
-
-	ret = mutex_lock_interruptible(&acio->pcie_tunnel_lock);
-	if (ret)
-		return ret;
-
-	ret = apple_cio_activate_pcie_tunnel_locked(acio);
-	mutex_unlock(&acio->pcie_tunnel_lock);
-
-	return ret ?: count;
-}
-static DEVICE_ATTR_WO(pcie_tunnel_populate);
-
-static struct attribute *apple_cio_attrs[] = {
-	&dev_attr_acio_start.attr,
-	&dev_attr_pcie_tunnel_populate.attr,
-	NULL,
-};
-
-static const struct attribute_group apple_cio_group = {
-	.attrs = apple_cio_attrs,
-};
-
 static int apple_nhi_pci_tunnel_pre_activate(struct tb_nhi *nhi)
 {
 	struct apple_nhi *anhi = nhi_to_anhi(nhi);
@@ -682,21 +566,15 @@ static int apple_nhi_pci_tunnel_post_activate(struct tb_nhi *nhi)
 {
 	struct apple_nhi *anhi = nhi_to_anhi(nhi);
 	struct apple_cio *acio = anhi->acio;
-	int ret;
 
 	/*
-	 * This is the Linux equivalent of Apple's startUsingTunnel() boundary.
-	 * Only now can releaseResetFlow() clear the tunneled PERST state before
-	 * the root port enables LTSSM.
+	 * This is the boundary at which the tunnel becomes usable.
+	 * The USB4 configuration writes are asynchronous, so return to the
+	 * Thunderbolt core before probing PCIe-C. The worker then waits on the
+	 * hardware reset state without blocking completion of the tunnel paths.
 	 */
-	mutex_lock(&acio->pcie_tunnel_lock);
-	ret = apple_cio_activate_pcie_tunnel_locked(acio);
-	mutex_unlock(&acio->pcie_tunnel_lock);
-
-	/* Stage 12 intentionally leaves the active tunnel paths in place. */
-	if (ret == -EAGAIN && apple_cio_debug_stage == 12)
-		return 0;
-	return ret;
+	mod_delayed_work(system_wq, &acio->pcie_tunnel_work, 0);
+	return 0;
 }
 
 static const struct tb_nhi_ops apple_nhi_ops = {
@@ -852,6 +730,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
 
 	mutex_unlock(&anhi->tb->lock);
 
+	WRITE_ONCE(acio->nhi_pdev, pdev);
 	acio->nhi_boot_status = 0;
 	complete(&acio->nhi_boot_completion);
 	return 0;
@@ -869,9 +748,69 @@ static void apple_nhi_remove(struct platform_device *pdev)
 {
 	struct apple_nhi *anhi = platform_get_drvdata(pdev);
 
+	WRITE_ONCE(anhi->acio->nhi_pdev, NULL);
 	tb_domain_remove(anhi->tb);
 	wait_for_completion(&anhi->nhi.domain_released);
 }
+
+/*
+ * The Apple platform driver owns the NHI allocation and keeps an
+ * apple_nhi pointer in driver data. The generic NHI PM callbacks cannot be
+ * installed here because they expect driver data to contain struct tb.
+ */
+static int apple_nhi_suspend_noirq(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	return tb_domain_suspend_noirq(anhi->tb);
+}
+
+static int apple_nhi_resume_noirq(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	return tb_domain_resume_noirq(anhi->tb);
+}
+
+static int apple_nhi_freeze_noirq(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	return tb_domain_freeze_noirq(anhi->tb);
+}
+
+static int apple_nhi_thaw_noirq(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	return tb_domain_thaw_noirq(anhi->tb);
+}
+
+static int apple_nhi_suspend(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	return tb_domain_suspend(anhi->tb);
+}
+
+static void apple_nhi_complete(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	tb_domain_complete(anhi->tb);
+}
+
+static const struct dev_pm_ops apple_nhi_pm_ops = {
+	.suspend = apple_nhi_suspend,
+	.suspend_noirq = apple_nhi_suspend_noirq,
+	.resume_noirq = apple_nhi_resume_noirq,
+	.freeze_noirq = apple_nhi_freeze_noirq,
+	.thaw_noirq = apple_nhi_thaw_noirq,
+	.restore_noirq = apple_nhi_resume_noirq,
+	.poweroff = apple_nhi_suspend,
+	.poweroff_noirq = apple_nhi_suspend_noirq,
+	.complete = apple_nhi_complete,
+};
 
 static const struct of_device_id apple_nhi_match[] = {
 	{
@@ -885,13 +824,34 @@ static struct platform_driver apple_nhi_driver = {
 	.driver = {
 		.name = "thunderbolt-apple-nhi",
 		.of_match_table = apple_nhi_match,
+		.pm = &apple_nhi_pm_ops,
 	},
 	.probe = apple_nhi_probe,
 	.remove = apple_nhi_remove,
 };
 
+static struct platform_device *apple_cio_find_pcie_tunnel(struct apple_cio *acio)
+{
+	struct platform_device *pdev = NULL;
+
+	if (!acio->pcie_tunnel_np || !acio->pcie_tunnel_populated)
+		return NULL;
+
+	for_each_available_child_of_node_scoped(acio->pcie_tunnel_np, child) {
+		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
+		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+			continue;
+
+		pdev = of_find_device_by_node(child);
+		break;
+	}
+
+	return pdev;
+}
+
 static void apple_cio_stop(struct apple_cio *acio)
 {
+	struct platform_device *nhi_pdev, *pcie_pdev;
 	int ret, i;
 
 	lockdep_assert_held(&acio->lock);
@@ -904,6 +864,35 @@ static void apple_cio_stop(struct apple_cio *acio)
 	WRITE_ONCE(acio->pcie_tunnel_requested, false);
 	cancel_delayed_work_sync(&acio->pcie_tunnel_work);
 	mutex_lock(&acio->pcie_tunnel_lock);
+
+	/*
+	 * The PCIe-C tunnel reset handshake is carried by the NHI. Quiesce the
+	 * remote PCI hierarchy and acknowledge tunneled PERST before removing
+	 * that control plane. PCIe-C and its DART stay bound until the general
+	 * child depopulation below.
+	 */
+	pcie_pdev = apple_cio_find_pcie_tunnel(acio);
+	if (pcie_pdev) {
+		ret = apple_pcie_tunnel_quiesce(&pcie_pdev->dev);
+		if (ret)
+			dev_warn(acio->dev,
+				 "failed to quiesce PCIe-C before NHI shutdown: %d\n",
+				 ret);
+		put_device(&pcie_pdev->dev);
+	}
+
+	/*
+	 * The NHI is the tunnel control plane. Stop it while the tunneled PCIe
+	 * host and DART are still accessible, before depopulation tears down the
+	 * data plane. Otherwise tb_domain_remove() walks the USB4 topology after
+	 * PCIe-C has already reset its port and can wedge waiting on dead control
+	 * traffic. The remaining children are still removed in reverse creation
+	 * order below.
+	 */
+	nhi_pdev = READ_ONCE(acio->nhi_pdev);
+	if (nhi_pdev)
+		of_platform_device_destroy(&nhi_pdev->dev, NULL);
+
 	of_platform_depopulate(acio->dev);
 	acio->pcie_tunnel_populated = false;
 	mutex_unlock(&acio->pcie_tunnel_lock);
@@ -920,6 +909,7 @@ static void apple_cio_stop(struct apple_cio *acio)
 		if (acio->pd_list->pd_links[i])
 			device_link_del(acio->pd_list->pd_links[i]);
 		acio->pd_list->pd_links[i] = NULL;
+		dev_pm_syscore_device(acio->pd_list->pd_devs[i], false);
 	}
 
 	acio->current_cable_info = 0;
@@ -935,17 +925,6 @@ static int apple_cio_start(struct apple_cio *acio)
 
 	/* Create device links to the power domains in order to power them on */
 	for (i = 0; i < acio->pd_list->num_pds; i++) {
-		if (READ_ONCE(apple_cio_power_domain_limit) >= 0) {
-			dev_emerg(acio->dev,
-				  "ACIO power-domain access %d armed: enable %s\n",
-				  i + 1, dev_name(acio->pd_list->pd_devs[i]));
-			if (i >= READ_ONCE(apple_cio_power_domain_limit)) {
-				ret = -EAGAIN;
-				goto remove_links;
-			}
-			dev_emerg(acio->dev,
-				  "ACIO power-domain access %d executing\n", i + 1);
-		}
 		link = device_link_add(acio->dev, acio->pd_list->pd_devs[i],
 				       DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME | DL_FLAG_RPM_ACTIVE);
 		if (!link) {
@@ -953,20 +932,14 @@ static int apple_cio_start(struct apple_cio *acio)
 			goto remove_links;
 		}
 		acio->pd_list->pd_links[i] = link;
-		if (READ_ONCE(apple_cio_power_domain_limit) >= 0)
-			dev_emerg(acio->dev,
-				  "ACIO power-domain access %d completed\n", i + 1);
-		dev_info(acio->dev,
-			 "ACIO power domain %d (%s): runtime %s, usage %d\n",
-			 i, dev_name(acio->pd_list->pd_devs[i]),
-			 pm_runtime_active(acio->pd_list->pd_devs[i]) ?
-							"active" : "inactive",
-			 atomic_read(&acio->pd_list->pd_devs[i]->power.usage_count));
-	}
-	if (apple_cio_debug_stage == 1) {
-		dev_info(acio->dev, "ACIO debug stage 1: power domains enabled\n");
-		ret = -EAGAIN;
-		goto remove_links;
+		/*
+		 * ACIO owns these domains explicitly for the lifetime of the cable
+		 * connection.  The virtual genpd devices must not independently
+		 * cycle them during system sleep: doing so destroys the live M3 and
+		 * NHI state behind the still-bound child devices.  Cable teardown
+		 * removes the runtime-active links and gives system PM ownership back.
+		 */
+		dev_pm_syscore_device(acio->pd_list->pd_devs[i], true);
 	}
 
 	/*
@@ -976,11 +949,6 @@ static int apple_cio_start(struct apple_cio *acio)
 	ret = reset_control_deassert(acio->reset);
 	if (ret) {
 		dev_err(acio->dev, "ACIO block failed to start: %d\n", ret);
-		goto remove_links;
-	}
-	if (apple_cio_debug_stage == 2) {
-		dev_info(acio->dev, "ACIO debug stage 2: reset deasserted\n");
-		ret = -EAGAIN;
 		goto remove_links;
 	}
 
@@ -993,38 +961,18 @@ static int apple_cio_start(struct apple_cio *acio)
 	 * them with a bare store.
 	 */
 	val = readl(acio->rc_base + APPLE_CIO_M3_CTRL);
-	if (apple_cio_debug_stage == 3) {
-		dev_info(acio->dev, "ACIO debug stage 3: M3 control read as %#x\n", val);
-		ret = -EAGAIN;
-		goto remove_links;
-	}
 	writel(val | APPLE_CIO_M3_CTRL_START, acio->rc_base + APPLE_CIO_M3_CTRL);
-	if (apple_cio_debug_stage == 4) {
-		dev_info(acio->dev, "ACIO debug stage 4: M3 start requested\n");
-		ret = -EAGAIN;
-		goto remove_links;
-	}
 	acio->rtk = apple_rtkit_init(acio->dev, acio, NULL, 0, &apple_cio_rtkit_ops);
 	if (IS_ERR(acio->rtk)) {
 		ret = PTR_ERR(acio->rtk);
 		dev_err(acio->dev, "Failed to initialize RTKit: %d\n", ret);
 		goto remove_links;
 	}
-	if (apple_cio_debug_stage == 5) {
-		dev_info(acio->dev, "ACIO debug stage 5: RTKit initialized\n");
-		ret = -EAGAIN;
-		goto err_free_rtkit;
-	}
 
 	ret = apple_rtkit_boot(acio->rtk);
 	if (ret) {
 		dev_err(acio->dev, "M3 RTKit failed to boot: %d\n", ret);
 		goto err_free_rtkit;
-	}
-	if (apple_cio_debug_stage == 6) {
-		dev_info(acio->dev, "ACIO debug stage 6: RTKit booted\n");
-		ret = -EAGAIN;
-		goto err_shutdown_rtkit;
 	}
 
 	ret = readl_poll_timeout(acio->rc_base + APPLE_CIO_M3_STAT, state,
@@ -1033,18 +981,8 @@ static int apple_cio_start(struct apple_cio *acio)
 		dev_err(acio->dev, "M3 firmware failed to get ready: %d\n", ret);
 		goto err_shutdown_rtkit;
 	}
-	if (apple_cio_debug_stage == 7) {
-		dev_info(acio->dev, "ACIO debug stage 7: M3 ready state %#x\n", state);
-		ret = -EAGAIN;
-		goto err_shutdown_rtkit;
-	}
 
 	apple_tunable_apply(acio->rc_base, acio->rc_tunable);
-	if (apple_cio_debug_stage == 8) {
-		dev_info(acio->dev, "ACIO debug stage 8: RC tunables applied\n");
-		ret = -EAGAIN;
-		goto err_shutdown_rtkit;
-	}
 
 	/*
 	 * Bring up devices which are part of ACIO and are now accessible by the main SoC
@@ -1056,11 +994,6 @@ static int apple_cio_start(struct apple_cio *acio)
 		dev_err(acio->dev, "failed to populate children: %d\n", ret);
 		goto err_depopulate;
 	}
-	if (apple_cio_debug_stage == 9) {
-		dev_info(acio->dev, "ACIO debug stage 9: child devices populated\n");
-		ret = -EAGAIN;
-		goto err_depopulate;
-	}
 
 	if (!wait_for_completion_timeout(&acio->nhi_boot_completion,
 					 msecs_to_jiffies(APPLE_CIO_NHI_BOOT_TIMEOUT_MS))) {
@@ -1070,11 +1003,6 @@ static int apple_cio_start(struct apple_cio *acio)
 	}
 	if (acio->nhi_boot_status) {
 		ret = acio->nhi_boot_status;
-		goto err_depopulate;
-	}
-	if (apple_cio_debug_stage == 10) {
-		dev_info(acio->dev, "ACIO debug stage 10: NHI is ready\n");
-		ret = -EAGAIN;
 		goto err_depopulate;
 	}
 
@@ -1094,6 +1022,7 @@ remove_links:
 		if (acio->pd_list->pd_links[i])
 			device_link_del(acio->pd_list->pd_links[i]);
 		acio->pd_list->pd_links[i] = NULL;
+		dev_pm_syscore_device(acio->pd_list->pd_devs[i], false);
 	}
 	return ret;
 }
@@ -1166,13 +1095,6 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 	 * Bring up or power down the ACIO complex
 	 * current_cable_info will be updated in the start/stop functions
 	 */
-	if (acio->target_cable_info && READ_ONCE(apple_cio_defer_start)) {
-		dev_info(acio->dev,
-			 "USB4/TBT cable transition %#x held for controlled ACIO start\n",
-			 acio->target_cable_info);
-		return 0;
-	}
-
 	if (acio->target_cable_info)
 		return apple_cio_start(acio);
 
@@ -1267,10 +1189,6 @@ static int apple_cio_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret, "Unable to attach PM domains\n");
 	else if (ret < 3)
 		return dev_err_probe(dev, -EINVAL, "Not enough PM domains\n");
-
-	ret = devm_device_add_group(dev, &apple_cio_group);
-	if (ret)
-		return ret;
 
 	/* And finally register the OOB notification for Thunderbolt/USB4 cables */
 	struct typec_thunderbolt_switch_desc desc = {

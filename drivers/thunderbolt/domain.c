@@ -545,6 +545,7 @@ int tb_domain_suspend_noirq(struct tb *tb)
 
 	return ret;
 }
+EXPORT_SYMBOL_NS_GPL(tb_domain_suspend_noirq, "USB4");
 
 /**
  * tb_domain_resume_noirq() - Resume a domain
@@ -567,11 +568,13 @@ int tb_domain_resume_noirq(struct tb *tb)
 
 	return ret;
 }
+EXPORT_SYMBOL_NS_GPL(tb_domain_resume_noirq, "USB4");
 
 int tb_domain_suspend(struct tb *tb)
 {
 	return tb->cm_ops->suspend ? tb->cm_ops->suspend(tb) : 0;
 }
+EXPORT_SYMBOL_NS_GPL(tb_domain_suspend, "USB4");
 
 int tb_domain_freeze_noirq(struct tb *tb)
 {
@@ -586,6 +589,7 @@ int tb_domain_freeze_noirq(struct tb *tb)
 
 	return ret;
 }
+EXPORT_SYMBOL_NS_GPL(tb_domain_freeze_noirq, "USB4");
 
 int tb_domain_thaw_noirq(struct tb *tb)
 {
@@ -599,12 +603,14 @@ int tb_domain_thaw_noirq(struct tb *tb)
 
 	return ret;
 }
+EXPORT_SYMBOL_NS_GPL(tb_domain_thaw_noirq, "USB4");
 
 void tb_domain_complete(struct tb *tb)
 {
 	if (tb->cm_ops->complete)
 		tb->cm_ops->complete(tb);
 }
+EXPORT_SYMBOL_NS_GPL(tb_domain_complete, "USB4");
 
 int tb_domain_runtime_suspend(struct tb *tb)
 {
