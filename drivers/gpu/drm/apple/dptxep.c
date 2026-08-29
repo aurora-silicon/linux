@@ -69,6 +69,10 @@ struct dptxport_apcall_drive_settings {
 	__le32 unk7;
 };
 
+struct dptxport_apcall_set_tiled {
+	__le32 retcode;
+};
+
 int dptxport_validate_connection(struct apple_epic_service *service, u8 core,
 				 u8 atc, u8 die)
 {
@@ -98,11 +102,11 @@ int dptxport_validate_connection(struct apple_epic_service *service, u8 core,
 }
 
 int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
-		     u8 die)
+		     u8 die, bool supports_hpd)
 {
 	struct dptx_port *dptx = service->cookie;
 	struct dcpdptx_connection_cmd cmd, resp;
-	u32 unk_field = 0x0; // seen as 0x100 under some conditions
+	u32 unk_field = supports_hpd ? DCPDPTX_REMOTE_PORT_SUPPORTS_HPD : 0;
 	int ret;
 	u32 target = FIELD_PREP(DCPDPTX_REMOTE_PORT_CORE, core) |
 		     FIELD_PREP(DCPDPTX_REMOTE_PORT_ATC, atc) |
@@ -151,7 +155,7 @@ int dptxport_set_hpd(struct apple_epic_service *service, bool hpd)
 			       sizeof(resp), 12);
 	if (ret)
 		return ret;
-	if (le32_to_cpu(resp.unk) != 1)
+	if (le32_to_cpu(resp.unk) != hpd)
 		return -EINVAL;
 	return 0;
 }
@@ -446,13 +450,14 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 static int dptxport_call_get_supports_hpd(struct apple_epic_service *service,
 					  void *reply_, size_t reply_size)
 {
+	struct apple_dcp *dcp = service->ep->dcp;
 	struct dptxport_apcall_get_support *reply = reply_;
 
 	if (reply_size < sizeof(*reply))
 		return -EINVAL;
 
 	reply->retcode = cpu_to_le32(0);
-	reply->supported = cpu_to_le32(0);
+	reply->supported = cpu_to_le32(dcp->connector_type == DRM_MODE_CONNECTOR_USB);
 	return 0;
 }
 
@@ -467,6 +472,18 @@ dptxport_call_get_supports_downspread(struct apple_epic_service *service,
 
 	reply->retcode = cpu_to_le32(0);
 	reply->supported = cpu_to_le32(0);
+	return 0;
+}
+
+static int dptxport_call_set_tiled_display_hint(void *reply_,
+						 size_t reply_size)
+{
+	struct dptxport_apcall_set_tiled *reply = reply_;
+
+	if (reply_size < sizeof(*reply))
+		return -EINVAL;
+
+	reply->retcode = cpu_to_le32(1);
 	return 0;
 }
 
@@ -541,6 +558,9 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	case DPTX_APCALL_GET_MAX_DRIVE_SETTINGS:
 		return dptxport_call_get_max_drive_settings(service, reply,
 							    reply_size);
+	case DPTX_APCALL_SET_TILED_DISPLAY_HINTS:
+		memcpy(reply, data, min(reply_size, data_size));
+		return dptxport_call_set_tiled_display_hint(reply, reply_size);
 	case DPTX_APCALL_GET_DRIVE_SETTINGS:
 		return dptxport_call_get_drive_settings(service, data, data_size,
 							reply, reply_size);

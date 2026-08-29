@@ -36,6 +36,7 @@ enum dptx_apcall {
 #define DCPDPTX_REMOTE_PORT_ATC GENMASK(7, 4)
 #define DCPDPTX_REMOTE_PORT_DIE GENMASK(11, 8)
 #define DCPDPTX_REMOTE_PORT_CONNECTED BIT(15)
+#define DCPDPTX_REMOTE_PORT_SUPPORTS_HPD BIT(8)
 
 enum dptx_link_rate {
 	LINK_RATE_RBR = 0x06,
@@ -63,7 +64,7 @@ struct dptx_port {
 int dptxport_validate_connection(struct apple_epic_service *service, u8 core,
 				 u8 atc, u8 die);
 int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
-		     u8 die);
+		     u8 die, bool supports_hpd);
 int dptxport_request_display(struct apple_epic_service *service);
 int dptxport_release_display(struct apple_epic_service *service);
 int dptxport_set_hpd(struct apple_epic_service *service, bool hpd);

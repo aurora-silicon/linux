@@ -500,6 +500,8 @@ int dcp_get_connector_type(struct platform_device *pdev)
 }
 
 #define DPTX_CONNECT_TIMEOUT msecs_to_jiffies(2000)
+#define DPTX_RECONNECT_DELAY msecs_to_jiffies(1000)
+#define DPTX_RECONNECT_RETRIES 5
 
 static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 {
@@ -523,19 +525,57 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 
 	reinit_completion(&dcp->dptxport[port].linkcfg_completion);
 	dcp->dptxport[port].atcphy = dcp->phy;
-	dptxport_connect(dcp->dptxport[port].service, 0, dcp->dptx_phy, dcp->dptx_die);
-	dptxport_request_display(dcp->dptxport[port].service);
+	ret = dptxport_validate_connection(dcp->dptxport[port].service, 0,
+					   dcp->dptx_phy, dcp->dptx_die);
+	if (ret) {
+		dev_err(dcp->dev,
+			"dcp_dptx_connect: failed to validate DPTX target %u:%u: %d\n",
+			dcp->dptx_die, dcp->dptx_phy, ret);
+		goto out_unlock;
+	}
+
+	ret = dptxport_connect(dcp->dptxport[port].service, 0,
+			       dcp->dptx_phy, dcp->dptx_die,
+			       dcp->connector_type == DRM_MODE_CONNECTOR_USB);
+	if (ret) {
+		dev_err(dcp->dev,
+			"dcp_dptx_connect: failed to connect DPTX target %u:%u: %d\n",
+			dcp->dptx_die, dcp->dptx_phy, ret);
+		goto out_unlock;
+	}
+
+	ret = dptxport_request_display(dcp->dptxport[port].service);
+	if (ret) {
+		dev_err(dcp->dev,
+			"dcp_dptx_connect: failed to request display: %d\n",
+			ret);
+		goto out_release;
+	}
 	dcp->dptxport[port].connected = true;
+	if (dcp->connector_type == DRM_MODE_CONNECTOR_USB) {
+		ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
+		if (ret) {
+			dev_err(dcp->dev,
+				"dcp_dptx_connect: failed to assert Type-C HPD: %d\n",
+				ret);
+			dcp->dptxport[port].connected = false;
+			goto out_release;
+		}
+	}
 
 	mutex_unlock(&dcp->hpd_mutex);
 	ret = wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
 				    DPTX_CONNECT_TIMEOUT);
-	if (ret < 0)
-		dev_warn(dcp->dev, "dcp_dptx_connect: port %d link complete failed:%d\n",
-			 port, ret);
-	else
-		dev_dbg(dcp->dev, "dcp_dptx_connect: waited %d ms for link\n",
-			jiffies_to_msecs(DPTX_CONNECT_TIMEOUT - ret));
+	if (!ret) {
+		dev_err(dcp->dev,
+			"dcp_dptx_connect: timed out waiting for port %u link configuration\n",
+			port);
+		ret = -ETIMEDOUT;
+		goto out_disconnect;
+	}
+
+	dev_dbg(dcp->dev, "dcp_dptx_connect: waited %d ms for link\n",
+		jiffies_to_msecs(DPTX_CONNECT_TIMEOUT - ret));
 
 	usleep_range(5, 10);
 
@@ -547,9 +587,41 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 
 	return 0;
 
+out_disconnect:
+	mutex_lock(&dcp->hpd_mutex);
+	dcp->dptxport[port].connected = false;
+out_release:
+	dptxport_release_display(dcp->dptxport[port].service);
+
 out_unlock:
 	mutex_unlock(&dcp->hpd_mutex);
 	return ret;
+}
+
+static void dcp_typec_reconnect_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp =
+		container_of(to_delayed_work(work), struct apple_dcp,
+			     typec_reconnect_wq);
+	int ret;
+
+	if (!READ_ONCE(dcp->typec_cable_connected))
+		return;
+
+	ret = dcp_dptx_connect(dcp, 0);
+	if (!ret) {
+		dcp->typec_reconnect_tries = 0;
+		return;
+	}
+
+	if (++dcp->typec_reconnect_tries < DPTX_RECONNECT_RETRIES) {
+		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq,
+				 DPTX_RECONNECT_DELAY);
+		return;
+	}
+
+	dev_err(dcp->dev, "Type-C DPTX reconnect failed after %u retries: %d\n",
+		dcp->typec_reconnect_tries, ret);
 }
 
 static void disconnected_hpd_event(struct apple_connector *con)
@@ -577,12 +649,30 @@ static int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
-	return dcp_dptx_connect(dcp, port);
+	int ret;
+
+	if (dcp->connector_type == DRM_MODE_CONNECTOR_USB) {
+		WRITE_ONCE(dcp->typec_cable_connected, true);
+		dcp->typec_reconnect_tries = 0;
+		cancel_delayed_work(&dcp->typec_reconnect_wq);
+	}
+
+	ret = dcp_dptx_connect(dcp, port);
+	if (ret && dcp->connector_type == DRM_MODE_CONNECTOR_USB)
+		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq,
+				 DPTX_RECONNECT_DELAY);
+
+	return ret;
 }
 
 int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (dcp->connector_type == DRM_MODE_CONNECTOR_USB) {
+		WRITE_ONCE(dcp->typec_cable_connected, false);
+		cancel_delayed_work(&dcp->typec_reconnect_wq);
+	}
 
 	disconnected_hpd_event(dcp->connector);
 
@@ -793,6 +883,7 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 void dcp_poweron(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	int ret;
 
 	if (dcp->hdmi_hpd) {
 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
@@ -800,6 +891,20 @@ void dcp_poweron(struct platform_device *pdev)
 
 		if (connected)
 			dcp_dptx_connect(dcp, 0);
+	} else if (dcp->connector_type == DRM_MODE_CONNECTOR_USB &&
+		   READ_ONCE(dcp->typec_cable_connected)) {
+		/*
+		 * A Type-C CRTC disable releases its DPTX session.  Re-establish
+		 * that session synchronously before powering IOMFB back on, so the
+		 * following modeset cannot race the delayed reconnect worker.
+		 */
+		cancel_delayed_work(&dcp->typec_reconnect_wq);
+		dcp->typec_reconnect_tries = 0;
+		ret = dcp_dptx_connect(dcp, 0);
+		if (ret)
+			mod_delayed_work(system_freezable_wq,
+					 &dcp->typec_reconnect_wq,
+					 DPTX_RECONNECT_DELAY);
 	}
 
 	switch (dcp->fw_compat) {
@@ -821,6 +926,7 @@ void dcp_poweron(struct platform_device *pdev)
 void dcp_poweroff(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	int ret;
 
 	if (dcp->avep)
 		av_service_disconnect(dcp);
@@ -832,6 +938,33 @@ void dcp_poweroff(struct platform_device *pdev)
 		if (!connected) {
 			disconnected_hpd_event(dcp->connector);
 			dcp_dptx_disconnect(dcp, 0);
+		}
+	} else if (dcp->connector_type == DRM_MODE_CONNECTOR_USB &&
+		   dcp->dptxport[0].enabled && dcp->dptxport[0].connected) {
+		/*
+		 * Unlike a physical DP/HDMI HPD, the Type-C HPD exposed by the
+		 * DPTX service belongs to this power-on session.  Release it when
+		 * the CRTC powers down so the next enable performs the same orderly
+		 * connect/request/HPD sequence as a fresh cable connection.
+		 */
+		ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
+		if (ret)
+			dev_warn(dcp->dev,
+				 "failed to deassert Type-C DPTX HPD: %d\n", ret);
+		dcp_dptx_disconnect(dcp, 0);
+
+		/*
+		 * DCP tears down its synthetic HPD when the CRTC powers off, but
+		 * the Type-C controller does not necessarily emit another cable
+		 * connect edge.  Recreate the DPTX session while the physical cable
+		 * remains present.  A freezable workqueue keeps this out of the
+		 * suspend path; if suspend wins the race, reconnect after thaw.
+		 */
+		if (READ_ONCE(dcp->typec_cable_connected)) {
+			dcp->typec_reconnect_tries = 0;
+			mod_delayed_work(system_freezable_wq,
+					 &dcp->typec_reconnect_wq,
+					 DPTX_RECONNECT_DELAY);
 		}
 	}
 }
@@ -1284,6 +1417,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		cancel_work_sync(&dcp->bl_register_wq);
 		cancel_work_sync(&dcp->bl_update_wq);
 	}
+	cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 	cancel_work_sync(&dcp->vblank_wq);
 
 	devm_clk_put(dev, dcp->clk);
@@ -1324,6 +1458,8 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	dcp->dev = dev;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
 	mutex_init(&dcp->typec_route_lock);
+	INIT_DELAYED_WORK(&dcp->typec_reconnect_wq,
+			  dcp_typec_reconnect_work);
 
 	platform_set_drvdata(pdev, dcp);
 

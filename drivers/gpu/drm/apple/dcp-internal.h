@@ -272,6 +272,9 @@ struct apple_dcp {
 	struct mutex typec_route_lock; /* serializes Type-C route ownership */
 	u32 nr_typec_routes;
 	bool phy_managed_by_typec;
+	bool typec_cable_connected;
+	struct delayed_work typec_reconnect_wq;
+	u32 typec_reconnect_tries;
 
 	struct gpio_desc *hdmi_hpd;
 	struct gpio_desc *hdmi_pwren;

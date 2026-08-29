@@ -89,8 +89,6 @@ static void apple_connector_oob_hotplug(struct drm_connector *connector,
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
 
-	printk("#### oob_hotplug status:0x%x ####\n", (u32)status);
-
 	if (status == connector_status_connected)
 		dcp_dptx_connect_oob(apple_connector->dcp, 0);
 	else if (status == connector_status_disconnected)
@@ -326,6 +324,9 @@ static int apple_probe_per_dcp(struct device *dev,
 
 	ret = drm_connector_init(drm, &connector->base, &apple_connector_funcs,
 				 dcp_get_connector_type(dcp));
+	if (ret)
+		return ret;
+	ret = drm_connector_attach_vrr_capable_property(&connector->base);
 	if (ret)
 		return ret;
 
