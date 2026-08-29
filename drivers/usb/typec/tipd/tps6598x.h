@@ -369,6 +369,8 @@ struct cd321x {
 
 	struct typec_mux *mux;
 	struct typec_mux_state state;
+	u32 dp_status;
+	u32 dp_conf;
 	struct typec_thunderbolt_switch *tbt_switch;
 	bool display_route_active;
 

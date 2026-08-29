@@ -589,18 +589,28 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 			return -EINVAL;
 		}
 
-		if (cd321x->state.alt == cd321x->port_altmode_dp &&
-		   cd321x->state.mode == mode) {
-			return 0;
-		}
-
 		dp_data.status = le32_to_cpu(st->dp_sid_status.status_rx);
 		dp_data.conf = le32_to_cpu(st->dp_sid_status.configure);
+		if (st->data_status & CD321X_DATA_STATUS_HPD_LEVEL)
+			dp_data.status |= DP_STATUS_HPD_STATE;
+		else
+			dp_data.status &= ~DP_STATUS_HPD_STATE;
+
+		if (cd321x->state.alt == cd321x->port_altmode_dp &&
+		    cd321x->state.mode == mode &&
+		    cd321x->dp_status == dp_data.status &&
+		    cd321x->dp_conf == dp_data.conf)
+			return 0;
+
 		cd321x->state.alt = cd321x->port_altmode_dp;
 		cd321x->state.data = &dp_data;
 		cd321x->state.mode = mode;
 		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 		ret = typec_mux_set(cd321x->mux, &cd321x->state);
+		if (!ret) {
+			cd321x->dp_status = dp_data.status;
+			cd321x->dp_conf = dp_data.conf;
+		}
 	} else if (st->data_status & TPS_DATA_STATUS_TBT_CONNECTION) {
 		struct typec_thunderbolt_data tbt_data;
 
@@ -673,6 +683,9 @@ out:
 	if (ret) {
 		cd321x->state = old_state;
 		dev_warn(tps->dev, "failed to configure Type-C mux: %d\n", ret);
+	} else if (cd321x->state.alt != cd321x->port_altmode_dp) {
+		cd321x->dp_status = 0;
+		cd321x->dp_conf = 0;
 	}
 
 	return ret;
