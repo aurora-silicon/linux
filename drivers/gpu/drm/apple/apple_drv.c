@@ -236,8 +236,14 @@ static const struct drm_mode_config_helper_funcs apple_mode_config_helpers = {
 
 static void appledrm_connector_cleanup(struct drm_connector *connector)
 {
+	struct apple_connector *apple_connector = to_apple_connector(connector);
+
 	drm_connector_cleanup(connector);
-	kfree(to_apple_connector(connector));
+	kfree(apple_connector->color_elements.data);
+	kfree(apple_connector->timing_elements.data);
+	kfree(apple_connector->display_attributes.data);
+	kfree(apple_connector->transport.data);
+	kfree(apple_connector);
 }
 
 static const struct drm_connector_funcs apple_connector_funcs = {

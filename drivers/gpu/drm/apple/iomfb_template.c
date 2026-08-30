@@ -516,7 +516,7 @@ static u8 dcpep_cb_prop_start(struct apple_dcp *dcp, u32 *length)
 	}
 
 	dcp->chunks.length = *length;
-	dcp->chunks.data = devm_kzalloc(dcp->dev, *length, GFP_KERNEL);
+	dcp->chunks.data = kzalloc(*length, GFP_KERNEL);
 
 	if (!dcp->chunks.data) {
 		dev_warn(dcp->dev, "failed to allocate chunks\n");
