@@ -1021,9 +1021,17 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 		return;
 
 	if (dcp->during_modeset) {
+		/*
+		 * Remember it rather than dropping it.  Resume re-runs the
+		 * modeset and the firmware reports the display back while that
+		 * is still in flight; discarding it leaves the connector marked
+		 * disconnected forever, with no further event to correct it.
+		 */
 		dev_info(dcp->dev,
-			 "cb_hotplug() ignored during modeset connected:%llu\n",
+			 "cb_hotplug() deferred during modeset connected:%llu\n",
 			 *connected);
+		dcp->pending_hotplug = true;
+		dcp->pending_hotplug_connected = !!(*connected);
 		return;
 	}
 
@@ -1257,6 +1265,24 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 
 	kref_put(&cookie->refcount, release_wait_cookie);
 	dcp->during_modeset = false;
+
+	if (dcp->pending_hotplug) {
+		bool connected = dcp->pending_hotplug_connected;
+		struct apple_connector *connector = dcp->connector;
+
+		dcp->pending_hotplug = false;
+		dev_info(dcp->dev, "replaying deferred hotplug connected:%d\n",
+			 connected);
+
+		if (!connected)
+			dcp->valid_mode = false;
+
+		if (connector && connector->connected != connected) {
+			connector->connected = connected;
+			dcp->valid_mode = false;
+			schedule_work(&connector->hotplug_wq);
+		}
+	}
 	dev_info(dcp->dev, "set_digital_out_mode finished:%d\n", ret);
 
 	if (ret == 0) {

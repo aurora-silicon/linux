@@ -423,7 +423,6 @@ int dcp_get_modes(struct drm_connector *connector)
 
 		drm_mode_probed_add(connector, mode);
 	}
-
 	if (dcp->nr_modes && dcp->dcpavserv.enabled &&
 	    !apple_connector->drm_edid) {
 		const struct drm_edid *edid;
@@ -532,8 +531,12 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 	 * arriving between the reconnect callback and the required modeset
 	 * would otherwise leave an unsignalled flip event in front of the
 	 * recovery commit.  Modesets set valid_mode before reaching flush.
+	 *
+	 * The same applies while a connector is still disconnected: resume
+	 * re-runs the modeset, which marks the mode valid again, before the
+	 * firmware has reported the display back.
 	 */
-	if (!dcp->valid_mode) {
+	if (!dcp->valid_mode || !dcp->connector || !dcp->connector->connected) {
 		schedule_work(&dcp->vblank_wq);
 		return;
 	}
