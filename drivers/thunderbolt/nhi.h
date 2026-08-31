@@ -99,6 +99,7 @@ struct tb_nhi_ops {
 	void (*ring_configure)(struct tb_ring *ring, u32 flags, u32 e2e_flags);
 	int (*pci_tunnel_pre_activate)(struct tb_nhi *nhi);
 	int (*pci_tunnel_post_activate)(struct tb_nhi *nhi);
+	int (*pci_tunnel_deactivate)(struct tb_nhi *nhi);
 	bool (*is_present)(struct tb_nhi *nhi);
 	int (*init_interrupts)(struct tb_nhi *nhi);
 };

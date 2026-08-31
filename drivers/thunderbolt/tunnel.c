@@ -342,9 +342,28 @@ static int tb_pci_post_activate(struct tb_tunnel *tunnel)
 	return 0;
 }
 
+static int tb_pci_deactivate(struct tb_tunnel *tunnel)
+{
+	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
+
+	if (ops && ops->pci_tunnel_deactivate)
+		return ops->pci_tunnel_deactivate(tunnel->tb->nhi);
+	return 0;
+}
+
 static int tb_pci_activate(struct tb_tunnel *tunnel, bool activate)
 {
 	int res;
+
+	/*
+	 * Let the host drop its view of the tunnel before the paths go, while
+	 * what is behind it can still be reached.
+	 */
+	if (!activate) {
+		res = tb_pci_deactivate(tunnel);
+		if (res)
+			return res;
+	}
 
 	if (activate) {
 		res = tb_pci_set_ext_encapsulation(tunnel, activate);
