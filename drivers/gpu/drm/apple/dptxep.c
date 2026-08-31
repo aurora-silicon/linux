@@ -457,7 +457,7 @@ static int dptxport_call_get_supports_hpd(struct apple_epic_service *service,
 		return -EINVAL;
 
 	reply->retcode = cpu_to_le32(0);
-	reply->supported = cpu_to_le32(dcp->connector_type == DRM_MODE_CONNECTOR_USB);
+	reply->supported = cpu_to_le32(dcp_is_typec_output(dcp));
 	return 0;
 }
 
@@ -558,6 +558,15 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	case DPTX_APCALL_GET_MAX_DRIVE_SETTINGS:
 		return dptxport_call_get_max_drive_settings(service, reply,
 							    reply_size);
+	case DPTX_APCALL_DEVICE_NOT_RESPONDING:
+	case DPTX_APCALL_DEVICE_BUSY_TIMEOUT:
+	case DPTX_APCALL_DEVICE_NOT_STARTED:
+		dev_warn(service->ep->dcp->dev,
+			 "DPTXPort: firmware reports link fault %u on target %u:%u\n",
+			 idx, service->ep->dcp->dptx_die,
+			 service->ep->dcp->dptx_phy);
+		memcpy(reply, data, min(reply_size, data_size));
+		return 0;
 	case DPTX_APCALL_SET_TILED_DISPLAY_HINTS:
 		memcpy(reply, data, min(reply_size, data_size));
 		return dptxport_call_set_tiled_display_hint(reply, reply_size);

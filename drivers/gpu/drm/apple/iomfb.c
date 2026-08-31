@@ -402,11 +402,16 @@ int dcp_get_modes(struct drm_connector *connector)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
 	struct platform_device *pdev = apple_connector->dcp;
-	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	struct apple_dcp *dcp;
 
 	struct drm_device *dev = connector->dev;
 	struct drm_display_mode *mode;
 	int i;
+
+	/* A Type-C port has no pipeline while the fabric is moving it. */
+	if (!pdev)
+		return 0;
+	dcp = platform_get_drvdata(pdev);
 
 	for (i = 0; i < dcp->nr_modes; ++i) {
 		mode = drm_mode_duplicate(dev, &dcp->modes[i].mode);
@@ -457,7 +462,11 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
 	struct platform_device *pdev = apple_connector->dcp;
-	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	struct apple_dcp *dcp;
+
+	if (!pdev)
+		return MODE_ERROR;
+	dcp = platform_get_drvdata(pdev);
 
 	return lookup_mode(dcp, mode) ? MODE_OK : MODE_BAD;
 }

@@ -7,6 +7,7 @@
 #include <linux/backlight.h>
 #include <linux/device.h>
 #include <linux/ioport.h>
+#include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/mux/consumer.h>
 #include <linux/phy/phy.h>
@@ -25,9 +26,12 @@
 
 struct apple_dcp;
 struct apple_dcp_afkep;
+struct apple_dcp_typec_port;
 
 struct apple_dcp_typec_route {
 	struct apple_dcp *dcp;
+	struct apple_dcp_typec_port *port;
+	struct list_head port_link;
 	struct phy *phy;
 	struct mux_control *xbar;
 	struct typec_mux_dev *typec_mux;
@@ -35,6 +39,8 @@ struct apple_dcp_typec_route {
 	u32 mux_index;
 	bool selected;
 };
+
+bool dcp_is_typec_output(struct apple_dcp *dcp);
 
 struct dcpav_service_epic;
 
@@ -194,11 +200,16 @@ struct apple_dcp {
 	/* swap id of the last completed swap */
 	u32 last_swap_id;
 	ktime_t swap_start;
+	u64 swap_submit_timestamp;
 
 	/* Current display mode */
 	bool during_modeset;
+	/* hotplug reported while a modeset was in flight, applied afterwards */
+	bool pending_hotplug;
+	bool pending_hotplug_connected;
 	bool valid_mode;
 	bool use_timestamps;
+	bool vrr_enabled;
 	struct dcp_set_digital_out_mode_req mode;
 
 	/* completion for active turning true */
@@ -222,6 +233,7 @@ struct apple_dcp {
 
 	/* Attributes of the connector */
 	int connector_type;
+	int fixed_connector_type;
 
 	/* Attributes of the connected display */
 	int width_mm, height_mm;
@@ -265,15 +277,16 @@ struct apple_dcp {
 
 	/* these fields are output port specific */
 	struct phy *phy;
+	struct phy *fixed_phy;
 	struct mux_control *xbar;
 	struct typec_mux *typec_mux;
 	struct apple_dcp_typec_route typec_routes[DCP_MAX_TYPEC_ROUTES];
 	struct apple_dcp_typec_route *active_typec_route;
-	struct mutex typec_route_lock; /* serializes Type-C route ownership */
 	u32 nr_typec_routes;
 	bool phy_managed_by_typec;
 	bool typec_cable_connected;
 	struct delayed_work typec_reconnect_wq;
+	struct delayed_work typec_fabric_retrain_wq;
 	u32 typec_reconnect_tries;
 
 	struct gpio_desc *hdmi_hpd;
@@ -284,6 +297,11 @@ struct apple_dcp {
 
 	u32 dptx_phy;
 	u32 dptx_die;
+	u32 fixed_dptx_phy;
+	u32 fixed_mux_index;
+	bool fixed_route_selected;
+	struct apple_connector *fixed_connector;
+	struct apple_connector *typec_connector;
 	int hdmi_hpd_irq;
 };
 
