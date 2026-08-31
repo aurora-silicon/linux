@@ -1851,8 +1851,21 @@ int apple_pcie_tunnel_quiesce(struct device *dev)
 	 */
 	pci_lock_rescan_remove();
 	if (!pcie->bus_stopped) {
+		struct pci_dev *pdev, *tmp;
+
 		pci_walk_bus(bridge->bus, pci_dev_set_disconnected, NULL);
-		pci_stop_root_bus(bridge->bus);
+
+		/*
+		 * Remove rather than merely stop. Stopping unbinds the drivers
+		 * but leaves the pci_dev objects behind, and a later rescan
+		 * then finds stale devices instead of enumerating fresh ones:
+		 * the endpoint returns with an unbalanced runtime-PM count and
+		 * its driver fails to probe.
+		 */
+		list_for_each_entry_safe(pdev, tmp, &bridge->bus->devices,
+					 bus_list)
+			pci_stop_and_remove_bus_device(pdev);
+
 		pcie->bus_stopped = true;
 	}
 
@@ -1873,6 +1886,45 @@ int apple_pcie_tunnel_quiesce(struct device *dev)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_pcie_tunnel_quiesce);
+
+/*
+ * Bring the tunneled host back after apple_pcie_tunnel_quiesce(). The ports
+ * need the restart that resume performs, and the hierarchy below them has to be
+ * enumerated again because quiescing removed it.
+ */
+int apple_pcie_tunnel_restore(struct device *dev)
+{
+	struct pci_host_bridge *bridge = dev_get_drvdata(dev);
+	struct apple_pcie *pcie;
+	struct apple_pcie_port *port;
+	int ret = 0;
+
+	if (!bridge || !bridge->bus)
+		return -ENODEV;
+
+	pcie = pci_host_bridge_priv(bridge);
+	if (!pcie->hw->tunneled)
+		return -EINVAL;
+	if (!pcie->bus_stopped)
+		return 0;
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		int err = apple_pcie_tunnel_start(port);
+
+		if (err && !ret)
+			ret = err;
+	}
+
+	pci_lock_rescan_remove();
+	pci_rescan_bus(bridge->bus);
+	pcie->bus_stopped = false;
+	pci_unlock_rescan_remove();
+
+	dev_info(dev, "PCIe-C hierarchy restored after tunnel activation\n");
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pcie_tunnel_restore);
 
 static void apple_pcie_remove(struct platform_device *pdev)
 {

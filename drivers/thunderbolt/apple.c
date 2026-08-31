@@ -481,6 +481,8 @@ static void apple_nhi_ring_configure(struct tb_ring *ring, u32 flags, u32 e2e_fl
 	writel(flags | e2e_flags, options);
 }
 
+static struct platform_device *apple_cio_find_pcie_tunnel(struct apple_cio *acio);
+
 static int apple_cio_populate_pcie_tunnel(struct apple_cio *acio)
 {
 	/*
@@ -509,8 +511,27 @@ static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 
 	lockdep_assert_held(&acio->pcie_tunnel_lock);
 
-	if (!acio->pcie_tunnel_np || acio->pcie_tunnel_populated)
+	if (!acio->pcie_tunnel_np)
 		return 0;
+
+	/*
+	 * The host survives a tunnel teardown, quiesced with its hierarchy
+	 * removed. Bring that one back rather than populating a second.
+	 */
+	if (acio->pcie_tunnel_populated) {
+		struct platform_device *pcie_pdev;
+
+		pcie_pdev = apple_cio_find_pcie_tunnel(acio);
+		if (pcie_pdev) {
+			ret = apple_pcie_tunnel_restore(&pcie_pdev->dev);
+			if (ret)
+				dev_warn(acio->dev,
+					 "failed to restore PCIe-C after tunnel activation: %d\n",
+					 ret);
+			put_device(&pcie_pdev->dev);
+		}
+		return 0;
+	}
 	if (!acio->pcie_tunnel_preinitialized)
 		return dev_err_probe(acio->dev, -ENODEV,
 				     "PCIe-C requires a successful m1n1 preinit handoff\n");
@@ -549,6 +570,41 @@ static void apple_cio_pcie_tunnel_work(struct work_struct *work)
 		dev_err(acio->dev, "deferred PCIe-C activation failed: %d\n", ret);
 }
 
+static int apple_nhi_pci_tunnel_deactivate(struct tb_nhi *nhi)
+{
+	struct apple_nhi *anhi = nhi_to_anhi(nhi);
+	struct apple_cio *acio = anhi->acio;
+	struct platform_device *pcie_pdev;
+	int ret;
+
+	/*
+	 * The tunnel is going away while the router and NHI stay up, so nothing
+	 * else tears the tunneled PCI hierarchy down. Left alone the endpoint
+	 * keeps its driver bound with no data path underneath it: every access
+	 * blocks until the function driver's own timeout fires, and the host has
+	 * nothing to enumerate onto when the tunnel comes back.
+	 */
+	mutex_lock(&acio->pcie_tunnel_lock);
+	if (!acio->pcie_tunnel_populated) {
+		mutex_unlock(&acio->pcie_tunnel_lock);
+		return 0;
+	}
+
+	pcie_pdev = apple_cio_find_pcie_tunnel(acio);
+	if (pcie_pdev) {
+		ret = apple_pcie_tunnel_quiesce(&pcie_pdev->dev);
+		if (ret)
+			dev_warn(acio->dev,
+				 "failed to quiesce PCIe-C on tunnel teardown: %d\n",
+				 ret);
+		put_device(&pcie_pdev->dev);
+	}
+
+	mutex_unlock(&acio->pcie_tunnel_lock);
+
+	return 0;
+}
+
 static int apple_nhi_pci_tunnel_pre_activate(struct tb_nhi *nhi)
 {
 	struct apple_nhi *anhi = nhi_to_anhi(nhi);
@@ -585,6 +641,7 @@ static const struct tb_nhi_ops apple_nhi_ops = {
 	.ring_configure = apple_nhi_ring_configure,
 	.pci_tunnel_pre_activate = apple_nhi_pci_tunnel_pre_activate,
 	.pci_tunnel_post_activate = apple_nhi_pci_tunnel_post_activate,
+	.pci_tunnel_deactivate = apple_nhi_pci_tunnel_deactivate,
 };
 
 static const struct tb_nhi_ring_layout apple_nhi_ring_layout = {
