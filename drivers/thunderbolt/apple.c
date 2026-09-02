@@ -1122,7 +1122,7 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 		acio->target_cable_info = TB_VSE_CAP_APPLE_CABLE_INFO_PRESENT;
 		if (FIELD_GET(EUDO_CABLE_TYPE_MASK, data->usb4.eudo) != EUDO_CABLE_TYPE_PASSIVE)
 			acio->target_cable_info |= TB_VSE_CAP_APPLE_CABLE_INFO_ACTIVE_CABLE;
-		if (FIELD_GET(EUDO_CABLE_SPEED_MASK, data->usb4.eudo) == EUDO_CABLE_SPEED_USB4_GEN3)
+		if (FIELD_GET(EUDO_CABLE_SPEED_MASK, data->usb4.eudo) >= EUDO_CABLE_SPEED_USB4_GEN3)
 			acio->target_cable_info |= TB_VSE_CAP_APPLE_CABLE_INFO_20_GBPS;
 		if (data->orientation == TYPEC_ORIENTATION_REVERSE)
 			acio->target_cable_info |= TB_VSE_CAP_APPLE_CABLE_INFO_ORIENTATION_REVERSE;
