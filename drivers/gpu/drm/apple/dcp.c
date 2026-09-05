@@ -656,6 +656,7 @@ static int dcp_register_typec_routes(struct apple_dcp *dcp)
 	return 0;
 }
 
+
 /* copied and simplified from drm_vblank.c */
 static void send_vblank_event(struct drm_device *dev,
 		struct drm_pending_vblank_event *e,

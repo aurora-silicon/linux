@@ -263,6 +263,27 @@ TRACE_EVENT(iomfb_swap_submit,
 		      __entry->swap_id)
 );
 
+TRACE_EVENT(iomfb_vrr_timestamps,
+	    TP_PROTO(struct apple_dcp *dcp, bool enabled, u64 timestamp,
+		     u64 submit_timestamp),
+	    TP_ARGS(dcp, enabled, timestamp, submit_timestamp),
+	    TP_STRUCT__entry(
+			     __field(u64, dcp)
+			     __field(bool, enabled)
+			     __field(u64, timestamp)
+			     __field(u64, submit_timestamp)
+	    ),
+	    TP_fast_assign(
+			   __entry->dcp = (u64)dcp;
+			   __entry->enabled = enabled;
+			   __entry->timestamp = timestamp;
+			   __entry->submit_timestamp = submit_timestamp;
+	    ),
+	    TP_printk("dcp=%llx, enabled=%u, timestamp=%llu, previous=%llu",
+		      __entry->dcp, __entry->enabled, __entry->timestamp,
+		      __entry->submit_timestamp)
+);
+
 TRACE_EVENT(iomfb_swap_complete,
 	    TP_PROTO(struct apple_dcp *dcp, u32 swap_id),
 	    TP_ARGS(dcp, swap_id),

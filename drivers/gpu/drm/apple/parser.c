@@ -443,7 +443,7 @@ static u32 calculate_clock(struct dimension *horiz, struct dimension *vert)
 
 static int parse_mode(struct dcp_parse_ctx *handle,
 		      struct dcp_display_mode *out, s64 *score, int width_mm,
-		      int height_mm, unsigned notch_height)
+		      int height_mm, unsigned notch_height, bool internal)
 {
 	int ret = 0;
 	struct iterator it;
@@ -515,20 +515,21 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		return -EINVAL;
 
 	/*
-	* HACK:
-	* Mark the 120 Hz mode on j314/j316 (identified by resolution) as vrr.
-	* We still do not know how to drive VRR but at least seetinng timestamps
-	* in the the swap_surface message to non-zero values drives the display
-	* at 120 fps.
-	*/
-	if (vert.precise_sync_rate >> 16 == 120 &&
-	    ((horiz.active == 3024 && vert.active == 1964) ||
-	     (horiz.active == 3456 && vert.active == 2234)))
+	 * An internal ProMotion panel carries no EDID or DisplayID, so DCP
+	 * reports no adaptive-sync range for it. Assume the ProMotion floor of
+	 * 24 Hz up to whatever rate the mode itself advertises.
+	 */
+	if (internal && vert.precise_sync_rate >> 16 == 120) {
+		out->min_vrr = 24 << 16;
+		out->max_vrr = vert.precise_sync_rate;
 		out->vrr = true;
+	}
 
-	if (min_vrr && max_vrr) {
+	/* Refresh rates are reported by DCP as 16.16 fixed-point Hz. */
+	if (min_vrr && max_vrr > min_vrr) {
 		out->min_vrr = min_vrr;
 		out->max_vrr = max_vrr;
+		out->vrr = true;
 	}
 
 	vert.active -= notch_height;
@@ -568,7 +569,8 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 
 struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 					 unsigned int *count, int width_mm,
-					 int height_mm, unsigned notch_height)
+					 int height_mm, unsigned notch_height,
+					 bool internal)
 {
 	struct iterator it;
 	int ret;
@@ -590,7 +592,8 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 
 	for (; it.idx < it.len; ++it.idx) {
 		mode = &modes[*count];
-		ret = parse_mode(it.handle, mode, &score, width_mm, height_mm, notch_height);
+		ret = parse_mode(it.handle, mode, &score, width_mm, height_mm,
+				 notch_height, internal);
 
 		/* Errors for a single mode are recoverable -- just skip it. */
 		if (ret)

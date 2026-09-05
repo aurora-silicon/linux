@@ -406,6 +406,8 @@ int dcp_get_modes(struct drm_connector *connector)
 
 	struct drm_device *dev = connector->dev;
 	struct drm_display_mode *mode;
+	u16 min_vfreq = 0, max_vfreq = 0;
+	bool vrr_capable = false;
 	int i;
 
 	/* A Type-C port has no pipeline while the fabric is moving it. */
@@ -414,6 +416,16 @@ int dcp_get_modes(struct drm_connector *connector)
 	dcp = platform_get_drvdata(pdev);
 
 	for (i = 0; i < dcp->nr_modes; ++i) {
+		if (dcp->modes[i].vrr) {
+			u16 lo = dcp->modes[i].min_vrr >> 16;
+			u16 hi = dcp->modes[i].max_vrr >> 16;
+
+			if (!min_vfreq || lo < min_vfreq)
+				min_vfreq = lo;
+			if (hi > max_vfreq)
+				max_vfreq = hi;
+		}
+		vrr_capable |= dcp->modes[i].vrr;
 		mode = drm_mode_duplicate(dev, &dcp->modes[i].mode);
 
 		if (!mode) {
@@ -423,6 +435,8 @@ int dcp_get_modes(struct drm_connector *connector)
 
 		drm_mode_probed_add(connector, mode);
 	}
+	drm_connector_set_vrr_capable_property(connector, vrr_capable);
+
 	if (dcp->nr_modes && dcp->dcpavserv.enabled &&
 	    !apple_connector->drm_edid) {
 		const struct drm_edid *edid;
@@ -436,6 +450,18 @@ int dcp_get_modes(struct drm_connector *connector)
 	}
 	if (dcp->nr_modes && apple_connector->drm_edid)
 		drm_edid_connector_update(connector, apple_connector->drm_edid);
+
+	/*
+	 * An internal panel has no EDID, so nothing fills in the refresh range
+	 * that userspace needs before it will drive VRR. Supply the range DCP
+	 * reported for the mode. This has to follow the EDID update, which
+	 * resets display_info.
+	 */
+	if (vrr_capable && max_vfreq &&
+	    !connector->display_info.monitor_range.max_vfreq) {
+		connector->display_info.monitor_range.min_vfreq = min_vfreq;
+		connector->display_info.monitor_range.max_vfreq = max_vfreq;
+	}
 
 	return dcp->nr_modes;
 }
