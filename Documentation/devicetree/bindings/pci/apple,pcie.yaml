@@ -21,6 +21,10 @@ description: |
   separate from the port registers. In that case, there is one PHY
   register range per port register range.
 
+  The PCIe-C variant connects a single root port to a USB4 router instead of
+  a physical PCIe link. It has no external PHY or PERST# GPIO and follows the
+  router's cable-controlled power lifetime.
+
   All root ports share a single ECAM space, but separate GPIOs are
   used to take the PCI devices on those ports out of reset.  Therefore
   the standard "reset-gpios" and "max-link-speed" properties appear on
@@ -45,6 +49,11 @@ properties:
           - const: apple,t8122-pcie
           - const: apple,t6020-pcie
       - const: apple,t6020-pcie
+      - const: apple,t8103-pciec
+      - items:
+          - const: apple,t8112-pciec
+          - const: apple,t8103-pciec
+      - const: apple,t6000-pciec
 
   reg:
     minItems: 3
@@ -52,21 +61,11 @@ properties:
 
   reg-names:
     minItems: 3
-    items:
-      - const: config
-      - const: rc
-      - const: port0
-      - const: port1
-      - const: port2
-      - const: port3
-      - const: phy0
-      - const: phy1
-      - const: phy2
-      - const: phy3
+    maxItems: 10
 
   ranges:
     minItems: 2
-    maxItems: 2
+    maxItems: 3
 
   interrupts:
     description:
@@ -85,6 +84,8 @@ properties:
   power-domains:
     maxItems: 1
 
+  dma-coherent: true
+
 patternProperties:
   "^pci@":
     $ref: /schemas/pci/pci-bus.yaml#
@@ -99,12 +100,15 @@ patternProperties:
         description: Optional GPIO to power on the device
         maxItems: 1
 
+      interrupt-controller: true
+
     required:
-      - reset-gpios
       - interrupt-controller
       - "#interrupt-cells"
       - interrupt-map-mask
       - interrupt-map
+
+    unevaluatedProperties: false
 
 required:
   - compatible
@@ -141,6 +145,60 @@ allOf:
       properties:
         reg-names:
           minItems: 10
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8103-pciec
+              - apple,t6000-pciec
+    then:
+      properties:
+        reg:
+          minItems: 5
+          maxItems: 7
+        reg-names:
+          oneOf:
+            - items:
+                - const: config
+                - const: rc
+                - const: port0
+                - const: fabric
+                - const: debug
+            - items:
+                - const: config
+                - const: rc
+                - const: port0
+                - const: fabric
+                - const: debug
+                - const: ltssm
+                - const: intr2axi
+        interrupts:
+          maxItems: 1
+        ranges:
+          minItems: 3
+          maxItems: 3
+    else:
+      properties:
+        reg-names:
+          minItems: 3
+          items:
+            - const: config
+            - const: rc
+            - const: port0
+            - const: port1
+            - const: port2
+            - const: port3
+            - const: phy0
+            - const: phy1
+            - const: phy2
+            - const: phy3
+        ranges:
+          maxItems: 2
+      patternProperties:
+        "^pci@":
+          required:
+            - reset-gpios
 
 examples:
   - |

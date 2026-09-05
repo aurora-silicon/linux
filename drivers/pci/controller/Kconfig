@@ -46,6 +46,7 @@ config PCIE_APPLE
 	depends on OF
 	depends on PCI_MSI
 	depends on PAGE_SIZE_16KB || COMPILE_TEST
+	select APPLE_TUNABLE
 	select PCI_HOST_COMMON
 	select IRQ_MSI_LIB
 	help

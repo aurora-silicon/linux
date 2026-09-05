@@ -1222,11 +1222,17 @@ static int atcphy_configure_pipehandler_usb4(struct apple_atcphy *atcphy)
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXVALID);
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXDETECT);
 
+	/*
+	 * The lock is best-effort here: the LOCK_PIPE_IF handshake is clocked by the
+	 * DWC3 PIPE clock, which is not running once the lanes are routed to the USB4
+	 * controller, so the ACK legitimately never asserts. The handshake is
+	 * advisory in this path, and atcphy_configure_pipehandler_dummy() below
+	 * already relies on the same warn-and-continue behaviour. Only the USB3 host
+	 * BIST sequence genuinely needs the PIPE quiesced and keeps the lock fatal.
+	 */
 	ret = atcphy_pipehandler_lock(atcphy);
-	if (ret) {
-		dev_err(atcphy->dev, "Failed to lock pipehandler\n");
-		return ret;
-	}
+	if (ret)
+		dev_warn(atcphy->dev, "Failed to lock pipehandler\n");
 
 	/* Configure PIPE mux to the USB4/Thunderbolt controller */
 	atcphy_pipehandler_set_mux(atcphy, PIPEHANDLER_MUX_CTRL_DATA_USB4,

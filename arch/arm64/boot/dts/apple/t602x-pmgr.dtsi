@@ -362,6 +362,9 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = DIE_LABEL(atc0_pcie);
+#ifdef APPLE_T602X_NON_ULTRA
+		apple,always-on;
+#endif
 		power-domains = <&DIE_NODE(ps_atc0_common)>;
 	};
 
@@ -380,6 +383,9 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = DIE_LABEL(atc1_pcie);
+#ifdef APPLE_T602X_NON_ULTRA
+		apple,always-on;
+#endif
 		power-domains = <&DIE_NODE(ps_atc1_common)>;
 	};
 
@@ -398,6 +404,9 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = DIE_LABEL(atc2_pcie);
+#ifdef APPLE_T602X_NON_ULTRA
+		apple,always-on;
+#endif
 		power-domains = <&DIE_NODE(ps_atc2_common)>;
 	};
 
@@ -416,6 +425,9 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = DIE_LABEL(atc3_pcie);
+#ifdef APPLE_T602X_NON_ULTRA
+		apple,always-on;
+#endif
 		power-domains = <&DIE_NODE(ps_atc3_common)>;
 	};
 

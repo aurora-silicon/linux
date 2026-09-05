@@ -53,15 +53,19 @@
 
 #include <linux/bitfield.h>
 #include <linux/completion.h>
+#include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/of_platform.h>
+#include <linux/pci-apple.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
 #include <linux/reset.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/tunable.h>
@@ -70,6 +74,7 @@
 #include <linux/usb/pd.h>
 #include <linux/usb/typec_mux.h>
 #include <linux/usb/typec_tbt.h>
+#include <linux/workqueue.h>
 
 #include "nhi.h"
 #include "tb.h"
@@ -97,6 +102,10 @@
 #define APPLE_CIO_SRAM_IOVA_BASE 0x10000000
 
 #define APPLE_CIO_NHI_BOOT_TIMEOUT_MS 10000
+#define APPLE_CIO_PCIEC_READY_DELAY_MS 300
+
+#define APPLE_CIO_PCIEC_INTR2AXI_CTRL 0x80
+#define APPLE_CIO_PCIEC_INTR2AXI_ENABLE BIT(0)
 
 #define TB_VSE_CAP_APPLE 0x00
 #define TB_VSE_CAP_APPLE_CABLE_INFO 0x01
@@ -111,6 +120,9 @@
 struct apple_cio {
 	struct device *dev;
 	struct device_node *np;
+	struct device_node *pcie_tunnel_np;
+	bool pcie_tunnel_preinitialized;
+	void __iomem *pcie_intr2axi_base;
 	struct apple_rtkit *rtk;
 
 	void __iomem *rc_base;
@@ -130,9 +142,86 @@ struct apple_cio {
 	u32 target_cable_info;
 	struct completion nhi_boot_completion;
 	int nhi_boot_status;
+	struct platform_device *nhi_pdev;
 
 	struct typec_thunderbolt_switch_dev *tbt_switch;
+	/* Serializes PCIe-C population with cable teardown. */
+	struct mutex pcie_tunnel_lock;
+	struct delayed_work pcie_tunnel_work;
+	bool pcie_tunnel_requested;
+	bool pcie_tunnel_populated;
 };
+
+static void apple_cio_of_node_put(void *data)
+{
+	of_node_put(data);
+}
+
+static bool
+apple_cio_pcie_tunnel_is_preinitialized(struct device_node *parent)
+{
+	for_each_available_child_of_node_scoped(parent, child) {
+		u32 status;
+
+		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
+		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+			continue;
+
+		return !of_property_read_u32(child,
+					     "apple,pciec-preinit-status",
+					     &status) && status == 1;
+	}
+
+	return false;
+}
+
+static void apple_cio_iounmap(void *data)
+{
+	iounmap((__force void __iomem *)data);
+}
+
+static int apple_cio_map_pcie_intr2axi(struct apple_cio *acio)
+{
+	struct resource res;
+	int index, ret;
+
+	for_each_available_child_of_node_scoped(acio->pcie_tunnel_np, child) {
+		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
+		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+			continue;
+
+		index = of_property_match_string(child, "reg-names", "intr2axi");
+		if (index < 0)
+			return index;
+
+		ret = of_address_to_resource(child, index, &res);
+		if (ret)
+			return ret;
+
+		/*
+		 * Intr2AXI controls PCIe configuration transaction forwarding and
+		 * must therefore use non-posted Device-nGnRnE accesses.  A regular
+		 * ioremap() is Device-nGnRE on arm64 and can leave this pulse pending
+		 * until the following DART access, which raises an asynchronous SError.
+		 *
+		 * Do not reserve the resource here: the PCIe-C child owns the same DT
+		 * aperture and will claim it when the tunnel children are populated.
+		 */
+		acio->pcie_intr2axi_base =
+			ioremap_np(res.start, resource_size(&res));
+		if (!acio->pcie_intr2axi_base)
+			return -ENOMEM;
+
+		ret = devm_add_action_or_reset(acio->dev, apple_cio_iounmap,
+					       (__force void *)acio->pcie_intr2axi_base);
+		if (ret)
+			return ret;
+
+		return 0;
+	}
+
+	return -ENODEV;
+}
 
 struct apple_nhi {
 	struct device *dev;
@@ -210,6 +299,17 @@ static int apple_nhi_probe_irqs(struct apple_nhi *anhi)
 	}
 	if (n_irqs % 2) {
 		dev_err(anhi->dev, "Invalid number of interrupts: %d must be even\n", n_irqs);
+		return -EINVAL;
+	}
+	/*
+	 * TX ring n is addressed as bit n and RX ring n as bit n + n_rings of the 32 bit
+	 * IRQ status and enable registers, so both halves have to fit into a single
+	 * register. hop_count is only checked against n_rings later on, and both come
+	 * from firmware, so bound this before anything shifts by the derived index.
+	 */
+	if (n_irqs > 32) {
+		dev_err(anhi->dev, "Invalid number of interrupts: %d exceeds 32 status bits\n",
+			n_irqs);
 		return -EINVAL;
 	}
 	anhi->n_rings = n_irqs / 2;
@@ -381,12 +481,167 @@ static void apple_nhi_ring_configure(struct tb_ring *ring, u32 flags, u32 e2e_fl
 	writel(flags | e2e_flags, options);
 }
 
+static struct platform_device *apple_cio_find_pcie_tunnel(struct apple_cio *acio);
+
+static int apple_cio_populate_pcie_tunnel(struct apple_cio *acio)
+{
+	/*
+	 * PCIe-C was cold-initialized by m1n1 before the ACIO M3 started, but
+	 * enabling ACIO's cable-powered PCIe domain closes the Intr2AXI bridge
+	 * again. The port enable sequence pulses this register immediately
+	 * before forcing its DART active. Do the same after ACIO has
+	 * enabled both tunnel adapters and before either child can touch DART MMIO.
+	 * The bit self-clears after opening the bridge.
+	 */
+	writel(APPLE_CIO_PCIEC_INTR2AXI_ENABLE,
+	       acio->pcie_intr2axi_base + APPLE_CIO_PCIEC_INTR2AXI_CTRL);
+	/* Complete the pulse without reading the transient register. */
+	mb();
+	dev_info(acio->dev, "PCIe-C Intr2AXI bridge enabled\n");
+
+	dev_info(acio->dev,
+		 "PCIe-C live handoff accepted; populating tunnel children\n");
+	return of_platform_populate(acio->pcie_tunnel_np, NULL, NULL,
+				    acio->dev);
+}
+
+static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
+{
+	int ret;
+
+	lockdep_assert_held(&acio->pcie_tunnel_lock);
+
+	if (!acio->pcie_tunnel_np)
+		return 0;
+
+	/*
+	 * The host survives a tunnel teardown, quiesced with its hierarchy
+	 * removed. Bring that one back rather than populating a second.
+	 */
+	if (acio->pcie_tunnel_populated) {
+		struct platform_device *pcie_pdev;
+
+		pcie_pdev = apple_cio_find_pcie_tunnel(acio);
+		if (pcie_pdev) {
+			ret = apple_pcie_tunnel_restore(&pcie_pdev->dev);
+			if (ret)
+				dev_warn(acio->dev,
+					 "failed to restore PCIe-C after tunnel activation: %d\n",
+					 ret);
+			put_device(&pcie_pdev->dev);
+		}
+		return 0;
+	}
+	if (!acio->pcie_tunnel_preinitialized)
+		return dev_err_probe(acio->dev, -ENODEV,
+				     "PCIe-C requires a successful m1n1 preinit handoff\n");
+
+	if (acio->pd_list->num_pds < 4 || !acio->pd_list->pd_links[3])
+		return dev_err_probe(acio->dev, -ENODEV,
+				     "pre-ACIO PCIe-C initialization is not active\n");
+
+	ret = apple_cio_populate_pcie_tunnel(acio);
+	if (ret)
+		return dev_err_probe(acio->dev, ret,
+				     "failed to populate tunneled PCIe controller\n");
+
+	acio->pcie_tunnel_populated = true;
+	dev_info(acio->dev,
+		 "PCIe-C populated after USB4 PCIe tunnel adapter enable\n");
+	return 0;
+}
+
+static void apple_cio_pcie_tunnel_work(struct work_struct *work)
+{
+	struct apple_cio *acio =
+		container_of(to_delayed_work(work), struct apple_cio,
+			     pcie_tunnel_work);
+	int ret;
+
+	mutex_lock(&acio->pcie_tunnel_lock);
+	if (!READ_ONCE(acio->pcie_tunnel_requested)) {
+		mutex_unlock(&acio->pcie_tunnel_lock);
+		return;
+	}
+
+	ret = apple_cio_activate_pcie_tunnel_locked(acio);
+	mutex_unlock(&acio->pcie_tunnel_lock);
+	if (ret && ret != -EAGAIN)
+		dev_err(acio->dev, "deferred PCIe-C activation failed: %d\n", ret);
+}
+
+static int apple_nhi_pci_tunnel_deactivate(struct tb_nhi *nhi)
+{
+	struct apple_nhi *anhi = nhi_to_anhi(nhi);
+	struct apple_cio *acio = anhi->acio;
+	struct platform_device *pcie_pdev;
+	int ret;
+
+	/*
+	 * The tunnel is going away while the router and NHI stay up, so nothing
+	 * else tears the tunneled PCI hierarchy down. Left alone the endpoint
+	 * keeps its driver bound with no data path underneath it: every access
+	 * blocks until the function driver's own timeout fires, and the host has
+	 * nothing to enumerate onto when the tunnel comes back.
+	 */
+	mutex_lock(&acio->pcie_tunnel_lock);
+	if (!acio->pcie_tunnel_populated) {
+		mutex_unlock(&acio->pcie_tunnel_lock);
+		return 0;
+	}
+
+	pcie_pdev = apple_cio_find_pcie_tunnel(acio);
+	if (pcie_pdev) {
+		ret = apple_pcie_tunnel_quiesce(&pcie_pdev->dev);
+		if (ret)
+			dev_warn(acio->dev,
+				 "failed to quiesce PCIe-C on tunnel teardown: %d\n",
+				 ret);
+		put_device(&pcie_pdev->dev);
+	}
+
+	mutex_unlock(&acio->pcie_tunnel_lock);
+
+	return 0;
+}
+
+static int apple_nhi_pci_tunnel_pre_activate(struct tb_nhi *nhi)
+{
+	struct apple_nhi *anhi = nhi_to_anhi(nhi);
+	struct apple_cio *acio = anhi->acio;
+
+	/*
+	 * Remember that the PCIe tunnel reached activation. PCIe-C must not be
+	 * populated here: the tunnel paths and both adapters are still disabled.
+	 */
+	WRITE_ONCE(acio->pcie_tunnel_requested, true);
+	return 0;
+}
+
+static int apple_nhi_pci_tunnel_post_activate(struct tb_nhi *nhi)
+{
+	struct apple_nhi *anhi = nhi_to_anhi(nhi);
+	struct apple_cio *acio = anhi->acio;
+
+	/*
+	 * This is the boundary at which the tunnel becomes usable.
+	 * The USB4 configuration writes are asynchronous, so return to the
+	 * Thunderbolt core before probing PCIe-C. The worker then waits on the
+	 * hardware reset state without blocking completion of the tunnel paths.
+	 */
+	mod_delayed_work(system_wq, &acio->pcie_tunnel_work, 0);
+	return 0;
+}
+
 static const struct tb_nhi_ops apple_nhi_ops = {
 	.request_ring_irq = apple_nhi_request_irq,
 	.release_ring_irq = apple_nhi_release_irq,
 	.ring_interrupt_active = apple_nhi_ring_interrupt_active,
 	.ring_interrupt_mask = apple_nhi_ring_interrupt_mask,
 	.ring_configure = apple_nhi_ring_configure,
+	.pci_tunnel_pre_activate = apple_nhi_pci_tunnel_pre_activate,
+	.pci_tunnel_post_activate = apple_nhi_pci_tunnel_post_activate,
+	.pci_tunnel_deactivate = apple_nhi_pci_tunnel_deactivate,
 };
 
 static const struct tb_nhi_ring_layout apple_nhi_ring_layout = {
@@ -532,6 +787,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
 
 	mutex_unlock(&anhi->tb->lock);
 
+	WRITE_ONCE(acio->nhi_pdev, pdev);
 	acio->nhi_boot_status = 0;
 	complete(&acio->nhi_boot_completion);
 	return 0;
@@ -549,9 +805,69 @@ static void apple_nhi_remove(struct platform_device *pdev)
 {
 	struct apple_nhi *anhi = platform_get_drvdata(pdev);
 
+	WRITE_ONCE(anhi->acio->nhi_pdev, NULL);
 	tb_domain_remove(anhi->tb);
 	wait_for_completion(&anhi->nhi.domain_released);
 }
+
+/*
+ * The Apple platform driver owns the NHI allocation and keeps an
+ * apple_nhi pointer in driver data. The generic NHI PM callbacks cannot be
+ * installed here because they expect driver data to contain struct tb.
+ */
+static int apple_nhi_suspend_noirq(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	return tb_domain_suspend_noirq(anhi->tb);
+}
+
+static int apple_nhi_resume_noirq(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	return tb_domain_resume_noirq(anhi->tb);
+}
+
+static int apple_nhi_freeze_noirq(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	return tb_domain_freeze_noirq(anhi->tb);
+}
+
+static int apple_nhi_thaw_noirq(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	return tb_domain_thaw_noirq(anhi->tb);
+}
+
+static int apple_nhi_suspend(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	return tb_domain_suspend(anhi->tb);
+}
+
+static void apple_nhi_complete(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	tb_domain_complete(anhi->tb);
+}
+
+static const struct dev_pm_ops apple_nhi_pm_ops = {
+	.suspend = apple_nhi_suspend,
+	.suspend_noirq = apple_nhi_suspend_noirq,
+	.resume_noirq = apple_nhi_resume_noirq,
+	.freeze_noirq = apple_nhi_freeze_noirq,
+	.thaw_noirq = apple_nhi_thaw_noirq,
+	.restore_noirq = apple_nhi_resume_noirq,
+	.poweroff = apple_nhi_suspend,
+	.poweroff_noirq = apple_nhi_suspend_noirq,
+	.complete = apple_nhi_complete,
+};
 
 static const struct of_device_id apple_nhi_match[] = {
 	{
@@ -565,13 +881,34 @@ static struct platform_driver apple_nhi_driver = {
 	.driver = {
 		.name = "thunderbolt-apple-nhi",
 		.of_match_table = apple_nhi_match,
+		.pm = &apple_nhi_pm_ops,
 	},
 	.probe = apple_nhi_probe,
 	.remove = apple_nhi_remove,
 };
 
+static struct platform_device *apple_cio_find_pcie_tunnel(struct apple_cio *acio)
+{
+	struct platform_device *pdev = NULL;
+
+	if (!acio->pcie_tunnel_np || !acio->pcie_tunnel_populated)
+		return NULL;
+
+	for_each_available_child_of_node_scoped(acio->pcie_tunnel_np, child) {
+		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
+		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+			continue;
+
+		pdev = of_find_device_by_node(child);
+		break;
+	}
+
+	return pdev;
+}
+
 static void apple_cio_stop(struct apple_cio *acio)
 {
+	struct platform_device *nhi_pdev, *pcie_pdev;
 	int ret, i;
 
 	lockdep_assert_held(&acio->lock);
@@ -581,7 +918,41 @@ static void apple_cio_stop(struct apple_cio *acio)
 	 * After we shut down the ACIO co-processor we will no longer be able to access
 	 * the MMIO space of these so make sure nothing tries to do just that.
 	 */
+	WRITE_ONCE(acio->pcie_tunnel_requested, false);
+	cancel_delayed_work_sync(&acio->pcie_tunnel_work);
+	mutex_lock(&acio->pcie_tunnel_lock);
+
+	/*
+	 * The PCIe-C tunnel reset handshake is carried by the NHI. Quiesce the
+	 * remote PCI hierarchy and acknowledge tunneled PERST before removing
+	 * that control plane. PCIe-C and its DART stay bound until the general
+	 * child depopulation below.
+	 */
+	pcie_pdev = apple_cio_find_pcie_tunnel(acio);
+	if (pcie_pdev) {
+		ret = apple_pcie_tunnel_quiesce(&pcie_pdev->dev);
+		if (ret)
+			dev_warn(acio->dev,
+				 "failed to quiesce PCIe-C before NHI shutdown: %d\n",
+				 ret);
+		put_device(&pcie_pdev->dev);
+	}
+
+	/*
+	 * The NHI is the tunnel control plane. Stop it while the tunneled PCIe
+	 * host and DART are still accessible, before depopulation tears down the
+	 * data plane. Otherwise tb_domain_remove() walks the USB4 topology after
+	 * PCIe-C has already reset its port and can wedge waiting on dead control
+	 * traffic. The remaining children are still removed in reverse creation
+	 * order below.
+	 */
+	nhi_pdev = READ_ONCE(acio->nhi_pdev);
+	if (nhi_pdev)
+		of_platform_device_destroy(&nhi_pdev->dev, NULL);
+
 	of_platform_depopulate(acio->dev);
+	acio->pcie_tunnel_populated = false;
+	mutex_unlock(&acio->pcie_tunnel_lock);
 
 	/* Try to shut down and power off the co-processor gracefully */
 	ret = apple_rtkit_poweroff(acio->rtk);
@@ -595,6 +966,7 @@ static void apple_cio_stop(struct apple_cio *acio)
 		if (acio->pd_list->pd_links[i])
 			device_link_del(acio->pd_list->pd_links[i]);
 		acio->pd_list->pd_links[i] = NULL;
+		dev_pm_syscore_device(acio->pd_list->pd_devs[i], false);
 	}
 
 	acio->current_cable_info = 0;
@@ -604,7 +976,7 @@ static int apple_cio_start(struct apple_cio *acio)
 {
 	struct device_link *link;
 	int i, ret;
-	u32 state;
+	u32 state, val;
 
 	lockdep_assert_held(&acio->lock);
 
@@ -617,6 +989,14 @@ static int apple_cio_start(struct apple_cio *acio)
 			goto remove_links;
 		}
 		acio->pd_list->pd_links[i] = link;
+		/*
+		 * ACIO owns these domains explicitly for the lifetime of the cable
+		 * connection.  The virtual genpd devices must not independently
+		 * cycle them during system sleep: doing so destroys the live M3 and
+		 * NHI state behind the still-bound child devices.  Cable teardown
+		 * removes the runtime-active links and gives system PM ownership back.
+		 */
+		dev_pm_syscore_device(acio->pd_list->pd_devs[i], true);
 	}
 
 	/*
@@ -629,8 +1009,16 @@ static int apple_cio_start(struct apple_cio *acio)
 		goto remove_links;
 	}
 
-	/* Start and wait for the co-processor to boot */
-	writel(APPLE_CIO_M3_CTRL_START, acio->rc_base + APPLE_CIO_M3_CTRL);
+	/*
+	 * Start and wait for the co-processor to boot.
+	 *
+	 * iBoot can leave other bits of this register set (0x3 has been observed
+	 * on t6020 before the kernel touches it). The
+	 * remaining fields are undocumented, so preserve them rather than clearing
+	 * them with a bare store.
+	 */
+	val = readl(acio->rc_base + APPLE_CIO_M3_CTRL);
+	writel(val | APPLE_CIO_M3_CTRL_START, acio->rc_base + APPLE_CIO_M3_CTRL);
 	acio->rtk = apple_rtkit_init(acio->dev, acio, NULL, 0, &apple_cio_rtkit_ops);
 	if (IS_ERR(acio->rtk)) {
 		ret = PTR_ERR(acio->rtk);
@@ -691,6 +1079,7 @@ remove_links:
 		if (acio->pd_list->pd_links[i])
 			device_link_del(acio->pd_list->pd_links[i]);
 		acio->pd_list->pd_links[i] = NULL;
+		dev_pm_syscore_device(acio->pd_list->pd_devs[i], false);
 	}
 	return ret;
 }
@@ -733,7 +1122,7 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 		acio->target_cable_info = TB_VSE_CAP_APPLE_CABLE_INFO_PRESENT;
 		if (FIELD_GET(EUDO_CABLE_TYPE_MASK, data->usb4.eudo) != EUDO_CABLE_TYPE_PASSIVE)
 			acio->target_cable_info |= TB_VSE_CAP_APPLE_CABLE_INFO_ACTIVE_CABLE;
-		if (FIELD_GET(EUDO_CABLE_SPEED_MASK, data->usb4.eudo) == EUDO_CABLE_SPEED_USB4_GEN3)
+		if (FIELD_GET(EUDO_CABLE_SPEED_MASK, data->usb4.eudo) >= EUDO_CABLE_SPEED_USB4_GEN3)
 			acio->target_cable_info |= TB_VSE_CAP_APPLE_CABLE_INFO_20_GBPS;
 		if (data->orientation == TYPEC_ORIENTATION_REVERSE)
 			acio->target_cable_info |= TB_VSE_CAP_APPLE_CABLE_INFO_ORIENTATION_REVERSE;
@@ -784,9 +1173,35 @@ static int apple_cio_probe(struct platform_device *pdev)
 	ret = devm_mutex_init(dev, &acio->lock);
 	if (ret)
 		return ret;
+	ret = devm_mutex_init(dev, &acio->pcie_tunnel_lock);
+	if (ret)
+		return ret;
+	INIT_DELAYED_WORK(&acio->pcie_tunnel_work,
+			  apple_cio_pcie_tunnel_work);
 	init_completion(&acio->nhi_boot_completion);
 	acio->dev = &pdev->dev;
 	acio->np = dev->of_node;
+	acio->pcie_tunnel_np =
+		of_parse_phandle(dev->of_node, "apple,pcie-tunnel", 0);
+	if (acio->pcie_tunnel_np) {
+		ret = devm_add_action_or_reset(dev, apple_cio_of_node_put,
+					       acio->pcie_tunnel_np);
+		if (ret)
+			return ret;
+
+		acio->pcie_tunnel_preinitialized =
+			apple_cio_pcie_tunnel_is_preinitialized(
+				acio->pcie_tunnel_np);
+		if (!acio->pcie_tunnel_preinitialized) {
+			dev_warn(dev,
+				 "PCIe-C tunnel disabled: m1n1 handoff is not initialized\n");
+		} else {
+			ret = apple_cio_map_pcie_intr2axi(acio);
+			if (ret)
+				return dev_err_probe(dev, ret,
+						     "failed to map PCIe-C Intr2AXI registers\n");
+		}
+	}
 
 	acio->sram_res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "sram");
 	if (!acio->sram_res)
@@ -851,6 +1266,7 @@ static void apple_cio_remove(struct platform_device *pdev)
 	struct apple_cio *acio = platform_get_drvdata(pdev);
 
 	typec_thunderbolt_switch_unregister(acio->tbt_switch);
+	cancel_delayed_work_sync(&acio->pcie_tunnel_work);
 
 	guard(mutex)(&acio->lock);
 	if (acio->current_cable_info)

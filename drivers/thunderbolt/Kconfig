@@ -65,6 +65,7 @@ config USB4_APPLE_SOC
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on OF && APPLE_RTKIT
 	depends on TYPEC
+	depends on PCIE_APPLE
 	select APPLE_TUNABLE
 	help
 	  Say Y here to add support for the USB4 and Thunderbolt host

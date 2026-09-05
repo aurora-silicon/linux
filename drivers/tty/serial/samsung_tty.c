@@ -132,6 +132,7 @@ struct s3c24xx_uart_dma {
 struct s3c24xx_uart_port {
 	unsigned char			rx_enabled;
 	unsigned char			tx_enabled;
+	bool				system_sleep_skipped;
 	unsigned int			pm_level;
 	unsigned long			baudclk_rate;
 	unsigned int			min_dma_size;
@@ -2091,6 +2092,16 @@ static void s3c24xx_serial_remove(struct platform_device *dev)
 static int __maybe_unused s3c24xx_serial_suspend(struct device *dev)
 {
 	struct uart_port *port = s3c24xx_dev_to_port(dev);
+	struct s3c24xx_uart_port *ourport = to_ourport(port);
+
+	/*
+	 * Runtime PM has already quiesced the port and removed its clocks.  Do
+	 * not run the serial-core system-sleep path against an Apple S5L UART
+	 * whose PMGR domain is therefore inaccessible.
+	 */
+	ourport->system_sleep_skipped = pm_runtime_suspended(dev);
+	if (ourport->system_sleep_skipped)
+		return 0;
 
 	if (!console_suspend_enabled && uart_console(port))
 		device_set_wakeup_path(dev);
@@ -2105,6 +2116,11 @@ static int __maybe_unused s3c24xx_serial_resume(struct device *dev)
 {
 	struct uart_port *port = s3c24xx_dev_to_port(dev);
 	struct s3c24xx_uart_port *ourport = to_ourport(port);
+
+	if (ourport->system_sleep_skipped) {
+		ourport->system_sleep_skipped = false;
+		return 0;
+	}
 
 	if (port) {
 		clk_prepare_enable(ourport->clk);
@@ -2125,6 +2141,9 @@ static int __maybe_unused s3c24xx_serial_resume_noirq(struct device *dev)
 {
 	struct uart_port *port = s3c24xx_dev_to_port(dev);
 	struct s3c24xx_uart_port *ourport = to_ourport(port);
+
+	if (ourport->system_sleep_skipped)
+		return 0;
 
 	if (port) {
 		/* restore IRQ mask */

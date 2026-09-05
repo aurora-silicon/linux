@@ -76,6 +76,10 @@ struct tb_nhi_ring_layout {
  * @ring_configure: NHI specific hook to program the ring options registers
  *		    and enable the ring with the given flags. If not set
  *		    the standard USB4 NHI registers are used.
+ * @pci_tunnel_pre_activate: NHI specific hook run after a PCIe tunnel has
+ *			   been allocated but before its paths and adapters are enabled
+ * @pci_tunnel_post_activate: NHI specific hook run after a PCIe tunnel's
+ *			    paths and adapters have been enabled
  * @is_present: Whether the device is currently present on the parent bus
  * @init_interrupts: NHI specific interrupt initialization hook
  */
@@ -93,6 +97,9 @@ struct tb_nhi_ops {
 	void (*ring_interrupt_active)(struct tb_ring *ring, bool active);
 	void (*ring_interrupt_mask)(struct tb_ring *ring, bool mask);
 	void (*ring_configure)(struct tb_ring *ring, u32 flags, u32 e2e_flags);
+	int (*pci_tunnel_pre_activate)(struct tb_nhi *nhi);
+	int (*pci_tunnel_post_activate)(struct tb_nhi *nhi);
+	int (*pci_tunnel_deactivate)(struct tb_nhi *nhi);
 	bool (*is_present)(struct tb_nhi *nhi);
 	int (*init_interrupts)(struct tb_nhi *nhi);
 };

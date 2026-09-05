@@ -15,12 +15,32 @@ struct apple_connector;
 #include "dcp-internal.h"
 
 void dcp_hotplug(struct work_struct *work);
+void dcp_retrain_oob(struct apple_connector *connector);
 
+/*
+ * How many DCP pipelines may offer a route to one Type-C port.  The Type-C mux
+ * class caps the mode-switch providers per connector (TYPEC_MUX_MAX_DEVS) and
+ * the ATC PHY already claims one of those slots, so this is generous.
+ */
 struct apple_connector {
 	struct drm_connector base;
 	bool connected;
 
+	/* The pipeline currently driving this connector, NULL if unrouted. */
 	struct platform_device *dcp;
+
+	/*
+	 * A Type-C connector is a physical port rather than a fixed pipeline,
+	 * and it has one encoder covering every pipeline that can drive it.
+	 * One encoder per pipeline would describe the same hardware, but
+	 * userspace takes the CRTCs a connector can use to be what all of its
+	 * encoders have in common, and single-pipeline encoders have nothing
+	 * in common.
+	 */
+	struct drm_encoder *port_encoder;
+
+	/* the CRTCs of every pipeline that can drive the port */
+	u32 candidate_crtcs;
 
 	const struct drm_edid *drm_edid;
 

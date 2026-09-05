@@ -16,11 +16,14 @@
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 
+#include <drm/drm_atomic_helper.h>
+#include <drm/drm_drv.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem_dma_helper.h>
+#include <drm/drm_modeset_lock.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
@@ -231,10 +234,48 @@ void dcp_ack(struct apple_dcp *dcp, enum dcp_context_id context)
  * waits for vblank (a DCP callback). That means we deadlock if we call from
  * the RTKit thread! Instead, move the call to another thread via a workqueue.
  */
+static int dcp_retrain_active_crtc(struct apple_connector *connector)
+{
+	struct drm_device *dev = connector->base.dev;
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_crtc *crtc;
+	int ret;
+
+	DRM_MODESET_LOCK_ALL_BEGIN(dev, ctx, 0, ret);
+
+	crtc = connector->base.state ? connector->base.state->crtc : NULL;
+	if (crtc && crtc->state && crtc->state->active)
+		ret = drm_atomic_helper_reset_crtc(crtc, &ctx);
+	else
+		ret = 0;
+
+	DRM_MODESET_LOCK_ALL_END(dev, ctx, ret);
+
+	return ret;
+}
+
+void dcp_retrain_oob(struct apple_connector *connector)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(connector->dcp);
+
+	if (!READ_ONCE(connector->connected) || !READ_ONCE(dcp->valid_mode))
+		return;
+
+	/*
+	 * Bringing up another high-speed Type-C route can disturb an active DPTX
+	 * stream without changing its HPD state.  Invalidate the IOMFB mode and
+	 * use the normal hotplug worker to replay the active CRTC from process
+	 * context; sending a synthetic disconnect would tear down the connector.
+	 */
+	WRITE_ONCE(dcp->valid_mode, false);
+	schedule_work(&connector->hotplug_wq);
+}
+
 void dcp_hotplug(struct work_struct *work)
 {
 	struct apple_connector *connector;
 	struct apple_dcp *dcp;
+	int ret;
 
 	connector = container_of(work, struct apple_connector, hotplug_wq);
 
@@ -252,9 +293,23 @@ void dcp_hotplug(struct work_struct *work)
 	 * display modes from atomic_flush, so userspace needs to trigger a
 	 * flush, or the CRTC gets no signal.
 	 */
-	if (connector->base.state && !dcp->valid_mode && connector->connected)
+	if (connector->base.state && !dcp->valid_mode && connector->connected) {
 		drm_connector_set_link_status_property(&connector->base,
 						       DRM_MODE_LINK_STATUS_BAD);
+
+		/*
+		 * A short Type-C route interruption can leave the DRM CRTC active
+		 * while DCP has discarded its display mode.  Userspace is then free
+		 * to keep submitting plane-only commits, none of which retrains the
+		 * link.  Re-apply the active CRTC state once the DPTX link-config
+		 * callback has completed.
+		 */
+		ret = dcp_retrain_active_crtc(connector);
+		if (ret)
+			dev_warn(dcp->dev,
+				 "failed to retrain active CRTC after hotplug: %d\n",
+				 ret);
+	}
 
 	drm_kms_helper_connector_hotplug_event(&connector->base);
 }
@@ -347,11 +402,16 @@ int dcp_get_modes(struct drm_connector *connector)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
 	struct platform_device *pdev = apple_connector->dcp;
-	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	struct apple_dcp *dcp;
 
 	struct drm_device *dev = connector->dev;
 	struct drm_display_mode *mode;
 	int i;
+
+	/* A Type-C port has no pipeline while the fabric is moving it. */
+	if (!pdev)
+		return 0;
+	dcp = platform_get_drvdata(pdev);
 
 	for (i = 0; i < dcp->nr_modes; ++i) {
 		mode = drm_mode_duplicate(dev, &dcp->modes[i].mode);
@@ -363,7 +423,6 @@ int dcp_get_modes(struct drm_connector *connector)
 
 		drm_mode_probed_add(connector, mode);
 	}
-
 	if (dcp->nr_modes && dcp->dcpavserv.enabled &&
 	    !apple_connector->drm_edid) {
 		const struct drm_edid *edid;
@@ -402,7 +461,11 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
 	struct platform_device *pdev = apple_connector->dcp;
-	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	struct apple_dcp *dcp;
+
+	if (!pdev)
+		return MODE_ERROR;
+	dcp = platform_get_drvdata(pdev);
 
 	return lookup_mode(dcp, mode) ? MODE_OK : MODE_BAD;
 }
@@ -462,6 +525,21 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 {
 	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	/*
+	 * DCP does not complete swaps after a link loss.  A plane-only commit
+	 * arriving between the reconnect callback and the required modeset
+	 * would otherwise leave an unsignalled flip event in front of the
+	 * recovery commit.  Modesets set valid_mode before reaching flush.
+	 *
+	 * The same applies while a connector is still disconnected: resume
+	 * re-runs the modeset, which marks the mode valid again, before the
+	 * firmware has reported the display back.
+	 */
+	if (!dcp->valid_mode || !dcp->connector || !dcp->connector->connected) {
+		schedule_work(&dcp->vblank_wq);
+		return;
+	}
 
 	if (dcp_channel_busy(&dcp->ch_cmd))
 	{

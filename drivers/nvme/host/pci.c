@@ -10,6 +10,7 @@
 #include <linux/blk-mq-dma.h>
 #include <linux/blk-integrity.h>
 #include <linux/dmi.h>
+#include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -727,8 +728,12 @@ static inline void nvme_write_sq_db(struct nvme_queue *nvmeq, bool write_sq)
 	}
 
 	if (nvme_dbbuf_update_and_check_event(nvmeq->sq_tail,
-			nvmeq->dbbuf_sq_db, nvmeq->dbbuf_sq_ei))
+			nvmeq->dbbuf_sq_db, nvmeq->dbbuf_sq_ei)) {
 		writel(nvmeq->sq_tail, nvmeq->q_db);
+		if (pci_resource_flags(to_pci_dev(nvmeq->dev->dev), 0) &
+		    IORESOURCE_MEM_NONPOSTED)
+			readl(nvmeq->dev->bar + NVME_REG_CSTS);
+	}
 	nvmeq->last_sq_tail = nvmeq->sq_tail;
 }
 
@@ -1548,8 +1553,12 @@ static inline void nvme_ring_cq_doorbell(struct nvme_queue *nvmeq)
 	u16 head = nvmeq->cq_head;
 
 	if (nvme_dbbuf_update_and_check_event(head, nvmeq->dbbuf_cq_db,
-					      nvmeq->dbbuf_cq_ei))
+					      nvmeq->dbbuf_cq_ei)) {
 		writel(head, nvmeq->q_db + nvmeq->dev->db_stride);
+		if (pci_resource_flags(to_pci_dev(nvmeq->dev->dev), 0) &
+		    IORESOURCE_MEM_NONPOSTED)
+			readl(nvmeq->dev->bar + NVME_REG_CSTS);
+	}
 }
 
 static inline struct blk_mq_tags *nvme_queue_tagset(struct nvme_queue *nvmeq)
@@ -1631,6 +1640,21 @@ static irqreturn_t nvme_irq(int irq, void *data)
 {
 	struct nvme_queue *nvmeq = data;
 	DEFINE_IO_COMP_BATCH(iob);
+	unsigned int retry;
+
+	/*
+	 * PCIe-C can deliver the tunneled MSI before the preceding completion
+	 * write is visible to the CPU. Wait briefly for the CQ phase update on
+	 * BARs marked non-posted by the Apple host controller.
+	 */
+	if (pci_resource_flags(to_pci_dev(nvmeq->dev->dev), 0) &
+	    IORESOURCE_MEM_NONPOSTED) {
+		for (retry = 0; retry < 1000 && !nvme_cqe_pending(nvmeq);
+		     retry++) {
+			udelay(1);
+			dma_rmb();
+		}
+	}
 
 	if (nvme_poll_cq(nvmeq, &iob)) {
 		if (!rq_list_empty(&iob.req_list))
@@ -2318,7 +2342,10 @@ static int nvme_remap_bar(struct nvme_dev *dev, unsigned long size)
 		return -ENOMEM;
 	if (dev->bar)
 		iounmap(dev->bar);
-	dev->bar = ioremap(pci_resource_start(pdev, 0), size);
+	if (pci_resource_flags(pdev, 0) & IORESOURCE_MEM_NONPOSTED)
+		dev->bar = ioremap_np(pci_resource_start(pdev, 0), size);
+	else
+		dev->bar = ioremap(pci_resource_start(pdev, 0), size);
 	if (!dev->bar) {
 		dev->bar_mapped_size = 0;
 		return -ENOMEM;

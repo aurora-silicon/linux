@@ -864,6 +864,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "atc0_pcie";
+		apple,always-on;
 		power-domains = <&ps_atc0_common>;
 	};
 
@@ -908,6 +909,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "atc1_pcie";
+		apple,always-on;
 		power-domains = <&ps_atc1_common>;
 	};
 

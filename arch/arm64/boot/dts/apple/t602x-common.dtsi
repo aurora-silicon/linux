@@ -557,7 +557,7 @@
 	clk_disp0: clock-disp0 {
 		compatible = "fixed-clock";
 		#clock-cells = <0>;
-		clock-frequency = <257142848>; /* TODO: check */
+		clock-frequency = <257142848>;
 		clock-output-names = "clk_disp0";
 	};
 
@@ -568,7 +568,7 @@
 		clock-output-names = "clk_dispext0";
 	};
 
-	clk_dispext0_die1: clock-dispext0_die1 {
+	clk_dispext0_die1: clock-dispext0-die1 {
 		compatible = "fixed-clock";
 		#clock-cells = <0>;
 		clock-frequency = <0>;
@@ -582,7 +582,7 @@
 		clock-output-names = "clk_dispext1";
 	};
 
-	clk_dispext1_die1: clock-dispext1_die1 {
+	clk_dispext1_die1: clock-dispext1-die1 {
 		compatible = "fixed-clock";
 		#clock-cells = <0>;
 		clock-frequency = <0>;
