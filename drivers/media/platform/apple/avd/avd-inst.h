@@ -7,11 +7,6 @@
 
 #include "avd.h"
 
-/* i have no clue what this is */
-#define INST_DMA1 0 /* (0x14 << 16 | 0x14) */
-#define INST_DMA2 0 /* (0x4000000 | INST_DMA1) */
-#define INST_DMA3 0 /* (0x07 << 16 | 0x07) */
-
 #define AVD_OP_EXEC			FIELD_PREP(GENMASK(31, 24), 0x2b)
 #define AVD_OP_EXEC_FIFO_MASK(v)	FIELD_PREP(GENMASK(3, 0), v)
 #define AVD_OP_EXEC_FIFO_IDX(v)		FIELD_PREP(GENMASK(7, 4), v)
@@ -22,7 +17,8 @@
 
 #define AVD_OP_HDR			FIELD_PREP(GENMASK(31, 20), 0x2db)
 #define AVD_OP_HDR_CONST		FIELD_PREP(GENMASK(10, 0), 0x2e0)
-#define AVD_OP_HDR_FLAG0		FIELD_PREP(BIT(12), 1)
+/* decompress pixel data */
+#define AVD_OP_HDR_FLAG_DECOMP(v)	FIELD_PREP(BIT(12), !!(v))
 #define AVD_OP_HDR_FLAG_INTRA(v)	FIELD_PREP(BIT(13), !!(v))
 #define AVD_OP_HDR_FLAG_PIPE_STATE(v)	FIELD_PREP(BIT(19), !!(v))
 
@@ -172,7 +168,7 @@ static inline void push_address(struct avd_dev *avd, struct avd_ctx *ctx,
 		push(avd, ctx, (u32)(addr >> 32));
 	}
 }
-static inline void push_rvra(struct avd_dev *avd, struct avd_ctx *ctx,
+static inline void push_comp(struct avd_dev *avd, struct avd_ctx *ctx,
 		dma_addr_t addr, u32 offsets[4])
 {
 	if (avd->variant->quirks & AVD_QUIRK_LSR) {

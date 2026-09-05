@@ -36,6 +36,9 @@
 #define VP_SLOT_NONE		255
 #define INST_FIFO_SLOT_NONE	255
 
+/* AVD needs most addresses to be aligned to 256 */
+#define AVD_ALIGN	256
+
 
 struct avd_ctx;
 struct avd_dev;
@@ -53,6 +56,11 @@ struct avd_run {
 		struct vb2_v4l2_buffer *src; /* OUTPUT coded */
 		struct vb2_v4l2_buffer *dst; /* CAPTURE decoded */
 	} bufs;
+
+	dma_addr_t coded_in;
+	dma_addr_t y_out;
+	dma_addr_t uv_out;
+	dma_addr_t comp_out;
 };
 
 struct avd_ctrl_desc {
@@ -81,6 +89,7 @@ struct avd_av1_decoded_buffer_info {
 	u32 order_hints[V4L2_AV1_TOTAL_REFS_PER_FRAME];
 	u8 ref_frame_idx[V4L2_AV1_REFS_PER_FRAME];
 	bool intrabc;
+	size_t priv_tlb_size;
 };
 
 struct avd_hevc_decoded_buffer_info {
@@ -89,17 +98,19 @@ struct avd_hevc_decoded_buffer_info {
 };
 
 
-struct avd_rvra {
-	u32 offsets[4]; /* sizes or offsets */
+struct avd_comp {
 	u32 size;
+	/* offset to start of compressed data */
+	size_t start_offset;
+	/* relative offsets to start */
+	u32 offsets[4];
 };
 
-/* TODO: change and use this */
 struct avd_decoded_buffer {
 	/* Must be the first field in this struct. */
 	struct v4l2_m2m_buffer base;
 
-	struct avd_rvra rvra;
+	struct avd_comp comp;
 
 	union {
 		struct avd_vp9_decoded_buffer_info vp9;
@@ -114,6 +125,7 @@ vb2_to_avd_decoded_buf(struct vb2_buffer *buf)
 {
 	return container_of(buf, struct avd_decoded_buffer, base.vb.vb2_buf);
 }
+
 struct avd_decoded_buffer *
 avd_get_ref_buf(struct avd_ctx *ctx, struct vb2_v4l2_buffer *dst, u64 timestamp);
 
@@ -209,13 +221,13 @@ struct avd_ctx {
 	const struct avd_coded_fmt_desc *coded_fmt_desc;
 	struct v4l2_ctrl_handler ctrl_hdl;
 	enum avd_image_fmt image_fmt;
+	bool decomp;
 
 	struct delayed_work watchdog_work;
 
 	void *priv;
 
-	/* reference VRA (video resolution adaptation) scaler buffer. */
-	struct avd_rvra rvra;
+	struct avd_comp comp;
 
 	u8 fifo_idx;
 	u8 vp_slot;
@@ -258,7 +270,7 @@ static inline u32 fmt_width(struct avd_ctx *ctx)
 	return ctx->coded_fmt.fmt.pix_mp.width;
 }
 
-void fill_rvra(struct avd_rvra *rvra, enum avd_image_fmt image_fmt,
+void fill_comp(struct avd_comp *comp, enum avd_image_fmt image_fmt,
 		u32 width, u32 height);
 int alloc_slots(struct avd_dev *avd, struct avd_ctx *ctx, enum avd_codec codec);
 

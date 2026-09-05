@@ -182,26 +182,19 @@
 #define AV1_REF_SCALE_X(v)	FIELD_PREP(GENMASK(31, 16), v)
 #define AV1_REF_SCALE_Y(v)	FIELD_PREP(GENMASK(15, 0), v)
 
-/* not sure what this is? mv data or something? */
-#define AVD_AV1_REF_BUF_SIZE	0xf000
+#define AVD_CDFS_SIZE	(sizeof(struct avd_av1_cdfs))
 
-#define AVD_AV1_CDFS_OFFSET(dst_len)		((dst_len) - sizeof(struct avd_av1_cdfs))
-
-#define AVD_AV1_REF_OFFSET(dst_len) \
-	(AVD_AV1_CDFS_OFFSET(dst_len) - AVD_AV1_REF_BUF_SIZE)
-#define AVD_AV1_RVRA_OFFSET(dst_len, rvra_size) \
-	(AVD_AV1_CDFS_OFFSET(dst_len) - (rvra_size))
+#define AVD_AV1_TLB_OFFSET(dst, tlb) \
+	((dst) - ALIGN(tlb, AVD_ALIGN))
+#define AVD_AV1_CDFS_OFFSET(dst, tlb) \
+	(AVD_AV1_TLB_OFFSET(dst, tlb) - ALIGN(AVD_CDFS_SIZE, AVD_ALIGN))
 
 struct avd_av1_run {
 	struct avd_run base;
 
 	struct {
-		dma_addr_t y;
-		dma_addr_t uv;
-		dma_addr_t sl;
-		dma_addr_t rvra;
 		dma_addr_t probs_out;
-		dma_addr_t mv; /* no sure */
+		dma_addr_t priv_tlb;
 	} addresses;
 
 	const struct v4l2_ctrl_av1_sequence *seq;
@@ -215,10 +208,14 @@ struct avd_av1_ctx {
 	struct {
 		struct avd_buf inst;
 		struct avd_buf pipe_state;
-		struct avd_buf const_unk[12];
-		struct avd_buf ref;
+		struct avd_buf unk[2];
 		struct avd_buf probs;
 	} bufs;
+	struct {
+		struct avd_buf tile_col[4];
+		struct avd_buf tile_row[4];
+		struct avd_buf ref;
+	} scratch;
 };
 
 /*
@@ -331,7 +328,7 @@ static void set_refs(struct avd_ctx *ctx, struct avd_av1_run *run)
 	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
 
 	push(0, "ref_cnst0");
-	pusha(av1_ctx->bufs.ref.addr, "unk_ref_buf", 0);
+	pusha(av1_ctx->scratch.ref.addr, "unk_ref_buf", 0);
 
 	for (i = 0; i < 4; i++)
 		push(0, "ref_cnst1");
@@ -347,8 +344,7 @@ static void set_refs(struct avd_ctx *ctx, struct avd_av1_run *run)
 					[frame->ref_frame_idx[i]]);
 		}
 		addr = vb2_dma_contig_plane_dma_addr(&ref->base.vb.vb2_buf, 0) +
-		       AVD_AV1_RVRA_OFFSET(ref->base.vb.planes[0].length,
-					   ref->rvra.size);
+		       ref->comp.start_offset;
 
 		if (!intrabc) {
 			int shift =
@@ -406,7 +402,7 @@ static void set_refs(struct avd_ctx *ctx, struct avd_av1_run *run)
 		push(AV1_REF_SCALE_X(x_scale) | AV1_REF_SCALE_Y(y_scale),
 		     "ref_scale");
 
-		push_rvra(avd, ctx, addr, ref->rvra.offsets);
+		push_comp(avd, ctx, addr, ref->comp.offsets);
 	}
 }
 
@@ -621,7 +617,7 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 		     AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision == 4) |
 		     AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx),
 	     "vp_start");
-	push(AVD_OP_HDR | AVD_OP_HDR_FLAG0 |
+	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(ctx->decomp) |
 		     AVD_OP_HDR_FLAG_INTRA(intra_only && !intrabc) |
 		     AVD_OP_HDR_CONST | AVD_OP_HDR_FLAG_PIPE_STATE(1),
 	     "op_hdr");
@@ -793,13 +789,13 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 	pusha(run->addresses.probs_out, "probs_out", 0);
 	pusha(av1_ctx->bufs.probs.addr, "probs", 1);
 
-	pusha(av1_ctx->bufs.const_unk[0].addr, "const_buf", 0);
+	pusha(av1_ctx->scratch.tile_col[0].addr, "col", 0);
 
 	/* TODO */
 	pusha((dma_addr_t)0, "", 0);
 	pusha((dma_addr_t)0, "", 1);
 
-	pusha(run->addresses.mv, "cur_ref_addr", 0);
+	pusha(run->addresses.priv_tlb, "cur_ref_addr", 0);
 
 	for (i = 0; i < 3; i++) {
 		if (selected_refs[i] < V4L2_AV1_REF_LAST_FRAME) {
@@ -810,10 +806,12 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 			ref = avd_get_ref_buf(
 				ctx, &dst->base.vb,
 				frame->reference_frame_ts[ref_idx]);
-			ref_addr = vb2_dma_contig_plane_dma_addr(
-					   &ref->base.vb.vb2_buf, 0) +
-				   AVD_AV1_REF_OFFSET(
-					   ref->base.vb.planes[0].length);
+			ref_addr =
+				vb2_dma_contig_plane_dma_addr(
+					&ref->base.vb.vb2_buf, 0) +
+				AVD_AV1_TLB_OFFSET(
+					ref->base.vb.vb2_buf.planes[0].length,
+					ref->av1.priv_tlb_size);
 
 			pusha(ref_addr, "ref", ref_idx);
 		}
@@ -917,20 +915,30 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 	push(0, "");
 	push(0, "");
 	pusha(av1_ctx->bufs.pipe_state.addr, "pipe_state", 0);
-	for (i = 0; i < 10; i++)
-		pusha(av1_ctx->bufs.const_unk[i + 2].addr, "const_unk", i + 2);
+	pusha(av1_ctx->scratch.tile_col[1].addr, "col", 1);
+	pusha(av1_ctx->scratch.tile_col[2].addr, "col", 2);
+	pusha(av1_ctx->scratch.tile_col[3].addr, "col", 3);
+
+	pusha(av1_ctx->scratch.tile_row[0].addr, "row", 0);
+	pusha(av1_ctx->scratch.tile_row[1].addr, "row", 1);
+	pusha(0, "unk", 0);
+	pusha(av1_ctx->bufs.unk[0].addr, "unk", 0);
+	pusha(av1_ctx->scratch.tile_row[2].addr, "row", 2);
+	pusha(av1_ctx->bufs.unk[1].addr, "unk", 1);
+	pusha(av1_ctx->scratch.tile_row[3].addr, "row", 3);
 
 	push(0, "mark_section");
 
-	push_rvra(avd, ctx, run->addresses.rvra, ctx->rvra.offsets);
+	push_comp(avd, ctx, run->base.comp_out, ctx->comp.offsets);
 
 	push(0, "");
 	push(0, "mark_section");
 
+	/* ignored if decomp is disabled */
 	bytesperline = ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
-	pusha(run->addresses.y, "y", 0);
+	pusha(run->base.y_out, "y", 0);
 	push(bytesperline, "bytesperline_y");
-	pusha(run->addresses.uv, "uv", 0);
+	pusha(run->base.uv_out, "uv", 0);
 	push(bytesperline, "bytesperline_uv");
 
 	push(0, "mark_section");
@@ -967,11 +975,11 @@ static void set_tiles(struct avd_ctx *ctx, struct avd_av1_run *run)
 
 			push(AVD_OP_CODED_DATA |
 				     AVD_OP_CODED_DATA_ADDR(
-					     (run->addresses.sl +
+					     (run->base.coded_in +
 					      tile_group->tile_offset) >>
 					     32),
 			     "tile_start");
-			push((u32)((run->addresses.sl +
+			push((u32)((run->base.coded_in +
 				    tile_group->tile_offset) &
 				   0xffffffff),
 			     "tile_addr");
@@ -1039,7 +1047,8 @@ static void avd_av1_set_prob(struct avd_ctx *ctx, struct avd_av1_run *run)
 		memcpy(av1_ctx->bufs.probs.cpu,
 		       vb2_plane_vaddr(&ref->base.vb.vb2_buf, 0) +
 			       AVD_AV1_CDFS_OFFSET(
-				       ref->base.vb.vb2_buf.planes[0].length),
+				       ref->base.vb.vb2_buf.planes[0].length,
+				       ref->av1.priv_tlb_size),
 		       sizeof(struct avd_av1_cdfs));
 	}
 
@@ -1048,9 +1057,18 @@ static void avd_av1_set_prob(struct avd_ctx *ctx, struct avd_av1_run *run)
 	 * enabled
 	 */
 	memcpy(vb2_plane_vaddr(&dst->base.vb.vb2_buf, 0) +
-		       AVD_AV1_CDFS_OFFSET(
-			       dst->base.vb.vb2_buf.planes[0].length),
+		       AVD_AV1_CDFS_OFFSET(dst->base.vb.vb2_buf.planes[0].length,
+					   dst->av1.priv_tlb_size),
 	       av1_ctx->bufs.probs.cpu, sizeof(struct avd_av1_cdfs));
+}
+
+static int avd_priv_tlb_size(int h, int w)
+{
+	/*
+	 * in reality its dependent on quality
+	 * 64 with lower quality
+	 */
+	return ALIGN(w, 128) * ALIGN(h, 128) / 16;
 }
 
 static void update_dec_buf_info(struct avd_decoded_buffer *buf,
@@ -1065,6 +1083,10 @@ static void update_dec_buf_info(struct avd_decoded_buffer *buf,
 	buf->av1.frame_type = frame->frame_type;
 	buf->av1.intrabc = frame->flags & V4L2_AV1_FRAME_FLAG_ALLOW_INTRABC;
 
+	buf->av1.priv_tlb_size =
+		avd_priv_tlb_size(frame->frame_width_minus_1 + 1,
+				  frame->frame_height_minus_1 + 1);
+
 	for (i = 0; i < V4L2_AV1_TOTAL_REFS_PER_FRAME; i++)
 		buf->av1.order_hints[i] = frame->order_hints[i];
 
@@ -1075,7 +1097,7 @@ static void update_dec_buf_info(struct avd_decoded_buffer *buf,
 static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 {
 	struct v4l2_ctrl *ctrl;
-	u32 dst_len;
+	int dst_len, tlb_len;
 
 	avd_run_preamble(ctx, &run->base);
 
@@ -1101,26 +1123,113 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 		return -EINVAL;
 	run->grain = ctrl->p_cur.p;
 
-	run->addresses.sl =
-		vb2_dma_contig_plane_dma_addr(&run->base.bufs.src->vb2_buf, 0);
-
 	dst_len = run->base.bufs.dst->vb2_buf.planes[0].length;
+	tlb_len = avd_priv_tlb_size(run->frame->frame_width_minus_1 + 1,
+				    run->frame->frame_height_minus_1 + 1);
 
-	run->addresses.y =
-		vb2_dma_contig_plane_dma_addr(&run->base.bufs.dst->vb2_buf, 0);
-
-	run->addresses.uv =
-		run->addresses.y +
-		ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline *
-			ALIGN(ctx->decoded_fmt.fmt.pix_mp.height, 16);
-
-	run->addresses.rvra =
-		run->addresses.y + AVD_AV1_RVRA_OFFSET(dst_len, ctx->rvra.size);
-
-	run->addresses.mv = run->addresses.y + AVD_AV1_REF_OFFSET(dst_len);
+	run->addresses.priv_tlb =
+		run->base.y_out + AVD_AV1_TLB_OFFSET(dst_len, tlb_len);
 
 	run->addresses.probs_out =
-		run->addresses.y + AVD_AV1_CDFS_OFFSET(dst_len);
+		run->base.y_out + AVD_AV1_CDFS_OFFSET(dst_len, tlb_len);
+	return 0;
+}
+
+static int avd_av1_alloc_scratch(struct avd_ctx *ctx, struct avd_av1_run *run)
+{
+	struct avd_dev *avd = ctx->dev;
+	struct avd_av1_ctx *av1_ctx = ctx->priv;
+	const struct v4l2_ctrl_av1_frame *frame = run->frame;
+	const struct v4l2_ctrl_av1_sequence *seq = run->seq;
+	const struct v4l2_av1_tile_info *tile_info = &frame->tile_info;
+	int ret, max_sb_col = 0, max_sb_row = 0, i, sb_cols = 0, sb;
+	int sb_shift =
+		seq->flags & V4L2_AV1_SEQUENCE_FLAG_USE_128X128_SUPERBLOCK ? 1 :
+									     0;
+	int w = frame->frame_width_minus_1 + 1;
+	int bit_depth = seq->bit_depth;
+
+	for (i = 0; i < tile_info->tile_cols; i++) {
+		sb = tile_info->width_in_sbs_minus_1[i] + 1;
+		max_sb_col = sb > max_sb_col ? sb : max_sb_col;
+		sb_cols += ALIGN((sb << sb_shift) * 44, 128);
+	}
+
+	max_sb_col <<= sb_shift;
+
+	ret = avd_buf_alloc(avd, &av1_ctx->scratch.ref, max_sb_col * 80);
+	if (ret)
+		return ret;
+
+	/* first frame this is always much smaller */
+	ret = avd_buf_alloc(avd, &av1_ctx->scratch.tile_col[0],
+			    (max_sb_col * 400));
+	if (ret)
+		return ret;
+
+	/* first frame this is always 0 */
+	ret = avd_buf_alloc(avd, &av1_ctx->scratch.tile_col[3], sb_cols);
+	if (ret)
+		return ret;
+
+	/* i think this is the metadata buffer to the one below */
+	ret = avd_buf_alloc(avd, &av1_ctx->scratch.tile_col[1],
+			    (max_sb_col * bit_depth * 22));
+	if (ret)
+		return ret;
+
+	ret = avd_buf_alloc(avd, &av1_ctx->scratch.tile_col[2],
+			    ALIGN(ALIGN(w, 8) * bit_depth * 2 +
+					  tile_info->tile_cols * bit_depth * 16,
+				  128));
+	if (ret)
+		return ret;
+
+	/* this is not a mistake, but im not sure why */
+	if (tile_info->tile_cols > 1) {
+		for (i = 0; i < tile_info->tile_rows; i++) {
+			sb = tile_info->height_in_sbs_minus_1[i] + 1;
+			max_sb_row = sb > max_sb_row ? sb : max_sb_row;
+		}
+
+		max_sb_row = max_sb_row << sb_shift;
+
+		/*
+		 * metadata buffer maybe? At least for row[0], they all seem to have
+		 * some kinda alignment to 24 so could be for them all
+		 */
+		ret = avd_buf_alloc(avd, &av1_ctx->scratch.tile_row[1],
+				    (max_sb_row * 72));
+		if (ret)
+			return ret;
+
+		/*
+		 * they all share the pattern of max_sb_row * something where
+		 * something is a block of luma and chroma aligned to
+		 * something. Depending on the height, the last
+		 * (or second last??) block has a different size from the
+		 * rest.
+		 *
+		 * I counted blocks as luma or chroma with padding until it
+		 * changes to the other
+		 */
+		ret = avd_buf_alloc(avd, &av1_ctx->scratch.tile_row[0],
+				    (max_sb_row * 72 + 1) * 2 * bit_depth);
+		if (ret)
+			return ret;
+
+		ret = avd_buf_alloc(avd, &av1_ctx->scratch.tile_row[2],
+				    max_sb_row * bit_depth * (53 + 52));
+		if (ret)
+			return ret;
+
+		ret = avd_buf_alloc(
+			avd, &av1_ctx->scratch.tile_row[3],
+			max_sb_row * bit_depth *
+				(192 + 96 + (bit_depth > 8 ? 12 : 0)));
+		if (ret)
+			return ret;
+	}
 
 	return 0;
 }
@@ -1146,6 +1255,7 @@ static int avd_av1_run(struct avd_ctx *ctx)
 		dev_err(avd->dev, "no free slots: %d", ret);
 		return ret;
 	}
+
 	dst = vb2_to_avd_decoded_buf(&run.base.bufs.dst->vb2_buf);
 	update_dec_buf_info(dst, run.seq, run.frame);
 
@@ -1155,6 +1265,7 @@ static int avd_av1_run(struct avd_ctx *ctx)
 				       ctx->fifo_idx, ctx->vp_slot);
 
 	avd_av1_set_prob(ctx, &run);
+	avd_av1_alloc_scratch(ctx, &run);
 
 	set_header(ctx, &run);
 	set_tiles(ctx, &run);
@@ -1164,11 +1275,26 @@ static int avd_av1_run(struct avd_ctx *ctx)
 	return 0;
 }
 
+static void avd_av1_dealloc_scratch(struct avd_ctx *ctx)
+{
+	struct avd_dev *avd = ctx->dev;
+	struct avd_av1_ctx *av1_ctx = ctx->priv;
+	int i;
+
+	for (i = 0; i < 4; i++)
+		avd_buf_free(avd, &av1_ctx->scratch.tile_col[i]);
+
+	for (i = 0; i < 4; i++)
+		avd_buf_free(avd, &av1_ctx->scratch.tile_row[i]);
+
+	avd_buf_free(avd, &av1_ctx->scratch.ref);
+}
+
 static int avd_av1_alloc_bufs(struct avd_ctx *ctx)
 {
 	struct avd_dev *avd = ctx->dev;
 	struct avd_av1_ctx *av1_ctx = ctx->priv;
-	int ret, i;
+	int ret;
 
 	ret = avd_buf_alloc(avd, &av1_ctx->bufs.inst, fifo_size());
 	if (ret)
@@ -1179,21 +1305,18 @@ static int avd_av1_alloc_bufs(struct avd_ctx *ctx)
 	if (ret)
 		return ret;
 
-	ret = avd_buf_alloc(avd, &av1_ctx->bufs.ref, 0x10000);
-	if (ret)
-		return ret;
-
 	ret = avd_buf_alloc(avd, &av1_ctx->bufs.probs,
 			    sizeof(struct avd_av1_cdfs));
 	if (ret)
 		return ret;
 
-	for (i = 0; i < 12; i++) {
-		ret = avd_buf_alloc(avd, &av1_ctx->bufs.const_unk[i],
-				    0x10000 * 4);
-		if (ret)
-			return ret;
-	}
+	ret = avd_buf_alloc(avd, &av1_ctx->bufs.unk[0], 1024);
+	if (ret)
+		return ret;
+
+	ret = avd_buf_alloc(avd, &av1_ctx->bufs.unk[1], 1024);
+	if (ret)
+		return ret;
 
 	return 0;
 }
@@ -1225,13 +1348,14 @@ static void avd_av1_stop(struct avd_ctx *ctx)
 	struct avd_av1_ctx *av1_ctx = ctx->priv;
 	struct avd_dev *avd = ctx->dev;
 
+	avd_av1_dealloc_scratch(ctx);
+
 	avd_buf_free(avd, &av1_ctx->bufs.pipe_state);
 	avd_buf_free(avd, &av1_ctx->bufs.inst);
-	avd_buf_free(avd, &av1_ctx->bufs.ref);
 	avd_buf_free(avd, &av1_ctx->bufs.probs);
 
-	for (int i = 0; i < 12; i++)
-		avd_buf_free(avd, &av1_ctx->bufs.const_unk[i]);
+	for (int i = 0; i < 2; i++)
+		avd_buf_free(avd, &av1_ctx->bufs.unk[i]);
 
 	kfree(av1_ctx);
 }
@@ -1298,8 +1422,27 @@ static void avd_av1_submit(struct avd_ctx *ctx)
 static void avd_av1_adjust_decoded_fmt(struct avd_ctx *ctx,
 				       struct v4l2_pix_format_mplane *pix_mp)
 {
-	pix_mp->plane_fmt[0].sizeimage += sizeof(struct avd_av1_cdfs);
-	pix_mp->plane_fmt[0].sizeimage += AVD_AV1_REF_BUF_SIZE;
+	pix_mp->plane_fmt[0].sizeimage += ALIGN(AVD_CDFS_SIZE, AVD_ALIGN);
+	pix_mp->plane_fmt[0].sizeimage += ALIGN(
+		avd_priv_tlb_size(pix_mp->width, pix_mp->height), AVD_ALIGN);
+}
+
+static int avd_av1_validate_sequence(struct avd_ctx *ctx,
+				     struct v4l2_ctrl_av1_sequence *seq)
+{
+	if (seq->flags & V4L2_AV1_SEQUENCE_FLAG_MONO_CHROME)
+		return -EINVAL; /* 4:0:0 (not supported?) */
+
+	return 0;
+}
+
+static int avd_av1_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
+{
+	if (ctrl->id == V4L2_CID_STATELESS_AV1_SEQUENCE)
+		return avd_av1_validate_sequence(ctx,
+						 ctrl->p_new.p_av1_sequence);
+	/* width should also be > 8 */
+	return 0;
 }
 
 const struct avd_coded_fmt_ops avd_av1_fmt_ops = {
@@ -1308,5 +1451,6 @@ const struct avd_coded_fmt_ops avd_av1_fmt_ops = {
 	.stop = avd_av1_stop,
 	.run = avd_av1_run,
 	.submit = avd_av1_submit,
+	.try_ctrl = avd_av1_try_ctrl,
 	.get_image_fmt = avd_av1_get_image_fmt,
 };
