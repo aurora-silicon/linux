@@ -210,10 +210,10 @@
 #define TPS_DATA_STATUS_DP_PIN_ASSIGNMENT(x) \
 	TPS_FIELD_GET(TPS_DATA_STATUS_DP_PIN_ASSIGNMENT_MASK, (x))
 #define TPS_DATA_STATUS_TBT_CABLE_SPEED_MASK   GENMASK(27, 25)
-#define TPS_DATA_STATUS_TBT_CABLE_SPEED \
+#define TPS_DATA_STATUS_TBT_CABLE_SPEED(x) \
 	TPS_FIELD_GET(TPS_DATA_STATUS_TBT_CABLE_SPEED_MASK, (x))
 #define TPS_DATA_STATUS_TBT_CABLE_GEN_MASK     GENMASK(29, 28)
-#define TPS_DATA_STATUS_TBT_CABLE_GEN \
+#define TPS_DATA_STATUS_TBT_CABLE_GEN(x) \
 	TPS_FIELD_GET(TPS_DATA_STATUS_TBT_CABLE_GEN_MASK, (x))
 
 /* Map data status to DP spec assignments */
@@ -342,7 +342,6 @@ struct tps6598x_intel_vid_status_reg {
 	__le32 attention_vdo;
 	__le16 enter_vdo;
 	__le16 device_mode;
-	__le16 cable_mode;
 } __packed;
 
 struct cd321x_status {
@@ -369,6 +368,7 @@ struct cd321x {
 
 	struct typec_mux *mux;
 	struct typec_mux_state state;
+	struct typec_thunderbolt_switch *tbt_switch;
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;

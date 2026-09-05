@@ -29,6 +29,31 @@ enum nhi_mailbox_cmd {
 
 int nhi_mailbox_cmd(struct tb_nhi *nhi, enum nhi_mailbox_cmd cmd, u32 data);
 enum nhi_fw_mode nhi_mailbox_mode(struct tb_nhi *nhi);
+void nhi_disable_interrupts(struct tb_nhi *nhi);
+void nhi_interrupt_work(struct work_struct *work);
+irqreturn_t nhi_msi(int irq, void *data);
+irqreturn_t ring_msix(int irq, void *data);
+int nhi_probe(struct tb_nhi *nhi);
+void nhi_shutdown(struct tb_nhi *nhi);
+extern const struct dev_pm_ops nhi_pm_ops;
+
+/**
+ * struct tb_nhi_ring_layout - Layout of the ring registers in the NHI MMIO space
+ * @tx_desc_base: Offset of the descriptor registers of the first TX ring
+ * @rx_desc_base: Offset of the descriptor registers of the first RX ring
+ * @desc_stride: Stride between the descriptor registers of neighboring rings
+ * @tx_options_base: Offset of the options registers of the first TX ring
+ * @rx_options_base: Offset of the options registers of the first RX ring
+ * @options_stride: Stride between the options registers of neighboring rings
+ */
+struct tb_nhi_ring_layout {
+	u32 tx_desc_base;
+	u32 rx_desc_base;
+	u32 desc_stride;
+	u32 tx_options_base;
+	u32 rx_options_base;
+	u32 options_stride;
+};
 
 /**
  * struct tb_nhi_ops - NHI specific optional operations
@@ -38,6 +63,21 @@ enum nhi_fw_mode nhi_mailbox_mode(struct tb_nhi *nhi);
  * @runtime_suspend: NHI specific runtime_suspend hook
  * @runtime_resume: NHI specific runtime_resume hook
  * @shutdown: NHI specific shutdown
+ * @pre_nvm_auth: hook to run before Thunderbolt 3 NVM authentication
+ * @post_nvm_auth: hook to run after Thunderbolt 3 NVM authentication
+ * @request_ring_irq: NHI specific interrupt retrieval hook
+ * @release_ring_irq: NHI specific interrupt release hook
+ * @ring_interrupt_active: NHI specific hook to activate/deactivate the
+ *			   interrupt of a single ring. If not set the
+ *			   standard USB4 NHI registers are used.
+ * @ring_interrupt_mask: NHI specific hook to mask/unmask the interrupt of a
+ *			 single ring. If not set the standard USB4 NHI
+ *			 registers are used.
+ * @ring_configure: NHI specific hook to program the ring options registers
+ *		    and enable the ring with the given flags. If not set
+ *		    the standard USB4 NHI registers are used.
+ * @is_present: Whether the device is currently present on the parent bus
+ * @init_interrupts: NHI specific interrupt initialization hook
  */
 struct tb_nhi_ops {
 	int (*init)(struct tb_nhi *nhi);
@@ -46,9 +86,16 @@ struct tb_nhi_ops {
 	int (*runtime_suspend)(struct tb_nhi *nhi);
 	int (*runtime_resume)(struct tb_nhi *nhi);
 	void (*shutdown)(struct tb_nhi *nhi);
+	void (*pre_nvm_auth)(struct tb_nhi *nhi);
+	void (*post_nvm_auth)(struct tb_nhi *nhi);
+	int (*request_ring_irq)(struct tb_ring *ring, bool no_suspend);
+	void (*release_ring_irq)(struct tb_ring *ring);
+	void (*ring_interrupt_active)(struct tb_ring *ring, bool active);
+	void (*ring_interrupt_mask)(struct tb_ring *ring, bool mask);
+	void (*ring_configure)(struct tb_ring *ring, u32 flags, u32 e2e_flags);
+	bool (*is_present)(struct tb_nhi *nhi);
+	int (*init_interrupts)(struct tb_nhi *nhi);
 };
-
-extern const struct tb_nhi_ops icl_nhi_ops;
 
 /*
  * PCI IDs used in this driver from Win Ridge forward. There is no
@@ -99,5 +146,18 @@ extern const struct tb_nhi_ops icl_nhi_ops;
 #define PCI_DEVICE_ID_INTEL_PTL_P_NHI1			0xe434
 
 #define PCI_CLASS_SERIAL_USB_USB4			0x0c0340
+
+/* Host interface quirks */
+#define QUIRK_AUTO_CLEAR_INT	BIT(0)
+#define QUIRK_E2E		BIT(1)
+#define QUIRK_NO_DMA_PORT	BIT(2)
+#define QUIRK_NO_USB3_BW_ALLOC	BIT(3)
+
+/*
+ * Minimal number of vectors when we use MSI-X. Two for control channel
+ * Rx/Tx and the rest four are for cross domain DMA paths.
+ */
+#define MSIX_MIN_VECS		6
+#define MSIX_MAX_VECS		16
 
 #endif
