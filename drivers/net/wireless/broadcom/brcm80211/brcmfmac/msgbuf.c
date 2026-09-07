@@ -932,6 +932,7 @@ brcmf_msgbuf_process_txstatus(struct brcmf_msgbuf *msgbuf, void *buf)
 	u32 idx;
 	struct sk_buff *skb;
 	u16 flowid;
+	u8 ring_ifidx;
 
 	tx_status = (struct msgbuf_tx_status *)buf;
 	idx = le32_to_cpu(tx_status->msg.request_id) - 1;
@@ -942,6 +943,13 @@ brcmf_msgbuf_process_txstatus(struct brcmf_msgbuf *msgbuf, void *buf)
 	if (!skb)
 		return;
 
+	if (flowid >= msgbuf->max_flowrings) {
+		bphy_err(msgbuf->drvr, "txstatus for flowring %u out of range\n",
+			 flowid);
+		brcmu_pkt_buf_free_skb(skb);
+		return;
+	}
+
 	set_bit(flowid, msgbuf->txstatus_done_map);
 	commonring = msgbuf->flowrings[flowid];
 	atomic_dec(&commonring->outstanding_tx);
@@ -951,11 +959,18 @@ brcmf_msgbuf_process_txstatus(struct brcmf_msgbuf *msgbuf, void *buf)
 	 * the frame, not on what the firmware echoes: repeated runs
 	 * logged nothing for 1227 awdl0 frames each, and a completion
 	 * echoed under ifidx 0 would have been invisible to both filters.
+	 *
+	 * The ring may already be gone: brcmf_msgbuf_delete_flowring() gives up
+	 * on outstanding frames after ~75 ms and the firmware completes them
+	 * (0x0006 EXPIRED) after the ring was freed -- awdl0's VO multicast
+	 * never completes while the ring is open (observed as a NULL deref
+	 * here on `awdl-if destroy`). The skb and its pktid are unaffected.
 	 */
-	if (brcmf_flowring_ifidx_get(msgbuf->flow, flowid) &&
-	    __ratelimit(&brcmf_awdl_txs_rs))
+	ring_ifidx = msgbuf->flow->rings[flowid] ?
+		     brcmf_flowring_ifidx_get(msgbuf->flow, flowid) : 0;
+	if (ring_ifidx && __ratelimit(&brcmf_awdl_txs_rs))
 		pr_info("brcmfmac: awdl txstatus ring_ifidx=%u msg_ifidx=%u awdl=%d flow=%u status=%d tx_status=0x%04x meta=%u dst=%pM\n",
-			brcmf_flowring_ifidx_get(msgbuf->flow, flowid),
+			ring_ifidx,
 			tx_status->msg.ifidx, ifp ? ifp->is_awdl : -1, flowid,
 			(int)(s16)le16_to_cpu(tx_status->compl_hdr.status),
 			le16_to_cpu(tx_status->tx_status),
