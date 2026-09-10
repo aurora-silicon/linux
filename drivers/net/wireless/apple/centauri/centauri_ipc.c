@@ -3,10 +3,12 @@
  * Wire layout source: AppleCentauriCommon/scripts/alpha_wifi_scan.py v259.
  * Polling and bounded bootstrap rings are deliberate bring-up restrictions.
  */
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/list.h>
+#include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/sizes.h>
 #include <linux/unaligned.h>
@@ -79,6 +81,40 @@ static int ftab_entry(const void *image, size_t size, const char tag[4],
 	return -ENOENT;
 }
 
+/* The native secondary FTAB reserves a bounded "cras" region. Capture it
+ * after a firmware abort; these private diagnostics may contain device data.
+ */
+static ssize_t firmware_crash_read(struct file *file, char __user *buffer,
+				   size_t count, loff_t *pos)
+{
+	struct centauri *c = file->private_data;
+	struct cen_buffer *secondary;
+	u32 offset, length;
+	ssize_t ret;
+
+	mutex_lock(&c->boot_lock);
+	if (!c->ipc || !c->ipc->secondary) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+	secondary = c->ipc->secondary;
+	ret = ftab_entry(secondary->cpu, secondary->size, "cras", &offset, &length, false);
+	if (ret)
+		goto unlock;
+	dma_rmb();
+	ret = simple_read_from_buffer(buffer, count, pos, secondary->cpu + offset, length);
+unlock:
+	mutex_unlock(&c->boot_lock);
+	return ret;
+}
+
+static const struct file_operations firmware_crash_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = firmware_crash_read,
+	.llseek = default_llseek,
+};
+
 static int secondary_init(struct centauri *c)
 {
 	u32 offset, length, count, i, required;
@@ -112,6 +148,7 @@ static int secondary_init(struct centauri *c)
 	pci_write_config_dword(c->pdev, 0xf8c, upper_32_bits(c->ipc->secondary->dma));
 	pci_write_config_dword(c->pdev, 0xf90, required);
 	dev_info(&c->pdev->dev, "secondary memory: seed=%u required=%u\n", length, required);
+	debugfs_create_file("firmware_crash", 0400, c->debug, c, &firmware_crash_fops);
 	return 0;
 }
 
