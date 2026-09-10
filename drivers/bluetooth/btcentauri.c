@@ -9,6 +9,8 @@
  */
 #include <linux/debugfs.h>
 #include <linux/delay.h>
+#include <linux/etherdevice.h>
+#include <linux/hex.h>
 #include <linux/dma-mapping.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
@@ -54,6 +56,10 @@ MODULE_PARM_DESC(arm_auxiliary_rings, "Diagnostic: arm remaining native Beta res
 static bool native_startup;
 module_param(native_startup, bool, 0444);
 MODULE_PARM_DESC(native_startup, "Diagnostic: program a temporary address, InitDone and random seed before the first HCI reset");
+
+static char *native_bdaddr;
+module_param(native_bdaddr, charp, 0400);
+MODULE_PARM_DESC(native_bdaddr, "Optional stable diagnostic address in XX:XX:XX:XX:XX:XX order; does not provision the factory address");
 
 static bool enable_acl;
 module_param(enable_acl, bool, 0444);
@@ -657,14 +663,20 @@ static int cen_hci_setup(struct hci_dev *hdev)
 
 	/* Native PROXIMA initialization starts with these three commands, then
 	 * HCI Reset. The core calls setup before its ordinary reset/init sequence.
-	 * Address provisioning is still diagnostic: use a temporary locally
-	 * administered address, in native WriteBdAddr display/network byte order.
+	 * Address provisioning is still diagnostic. A saved test identity permits
+	 * bond reuse; otherwise generate a temporary locally administered address.
+	 * Native WriteBdAddr takes display/network byte order in either case.
 	 */
-	ret = get_random_bytes_wait(address, sizeof(address));
+	if (native_bdaddr && (!mac_pton(native_bdaddr, address) ||
+	    is_zero_ether_addr(address) || is_broadcast_ether_addr(address)))
+		return -EINVAL;
+	ret = get_random_bytes_wait(seed, sizeof(seed));
 	if (ret)
 		return ret;
-	address[0] = (address[0] & 0xfc) | 0x02;
-	get_random_bytes(seed, sizeof(seed));
+	if (!native_bdaddr) {
+		get_random_bytes(address, sizeof(address));
+		address[0] = (address[0] & 0xfc) | 0x02;
+	}
 	memset(init_done, 0xff, sizeof(init_done));
 	ret = cen_vendor_command(hdev, 0xfc06, address, sizeof(address));
 	if (ret)
@@ -683,7 +695,8 @@ out:
 		bt_dev_err(hdev, "Native startup stopped after %u commands: %d",
 			   bt->native_startup_steps, ret);
 	else
-		bt_dev_info(hdev, "Native startup accepted; temporary diagnostic address in use");
+		bt_dev_info(hdev, "Native startup accepted; %s diagnostic address in use",
+			    native_bdaddr ? "configured" : "temporary");
 	return ret;
 }
 
