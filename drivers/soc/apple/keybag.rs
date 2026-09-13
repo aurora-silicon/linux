@@ -24,7 +24,6 @@ impl Slot {
             Slot::Identity => KEYBAG_PATH,
         }
     }
-
 }
 
 const MAGIC: [u8; 16] = *b"APPLE-SEP-KBAG01";
@@ -133,7 +132,7 @@ fn checksum_input(
     wrapped: &[u8],
     uuid: &[u8; UUID_LEN],
     secret: &[u8],
-) -> Result<KVec<u8>> {
+) -> Result<crate::Secret> {
     let mut v = KVec::new();
     v.extend_from_slice(&VERSION.to_le_bytes(), GFP_KERNEL)?;
     v.extend_from_slice(&state.to_le_bytes(), GFP_KERNEL)?;
@@ -142,7 +141,7 @@ fn checksum_input(
     v.extend_from_slice(uuid, GFP_KERNEL)?;
     v.extend_from_slice(wrapped, GFP_KERNEL)?;
     v.extend_from_slice(secret, GFP_KERNEL)?;
-    Ok(v)
+    Ok(crate::Secret(v))
 }
 
 /// Absent only when the file is missing; every other unreadable state errors —

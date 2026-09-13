@@ -88,14 +88,8 @@ struct KernelOps {
         usize,
         *mut KernelKey,
     ) -> c_int,
-    new_file_key: unsafe extern "C" fn(
-        *mut c_void,
-        *const u8,
-        u32,
-        u64,
-        u16,
-        *mut KernelNewFileKey,
-    ) -> c_int,
+    new_file_key:
+        unsafe extern "C" fn(*mut c_void, *const u8, u32, u64, u16, *mut KernelNewFileKey) -> c_int,
 }
 
 extern "C" {
@@ -221,7 +215,7 @@ impl SepData {
             .map_or(*apfs_uuid, |entry| entry.bag_uuid)
     }
 
-    fn record_fv_volume(&self, apfs_uuid: &[u8; 16], bag_uuid: &[u8; 16]) -> Result<()> {
+    fn retain_fv_volume(&self, apfs_uuid: &[u8; 16], bag_uuid: &[u8; 16]) -> Result<bool> {
         let mut volumes = self.fv_volumes.lock();
         if let Some(entry) = volumes
             .iter_mut()
@@ -231,7 +225,7 @@ impl SepData {
                 return Err(EINVAL);
             }
             entry.refs = entry.refs.checked_add(1).ok_or(EOVERFLOW)?;
-            return Ok(());
+            return Ok(false);
         }
         if volumes.len() >= FV_MAX_VOLUME_MAPS {
             return Err(ENOSPC);
@@ -244,10 +238,22 @@ impl SepData {
             },
             GFP_KERNEL,
         )?;
-        Ok(())
+        Ok(true)
     }
 
-    fn unrecord_fv_volume(&self, apfs_uuid: &[u8; 16], bag_uuid: &[u8; 16]) -> Result<()> {
+    fn fv_volume_is_last(&self, apfs_uuid: &[u8; 16], bag_uuid: &[u8; 16]) -> Result<bool> {
+        let volumes = self.fv_volumes.lock();
+        let entry = volumes
+            .iter()
+            .find(|entry| entry.apfs_uuid == *apfs_uuid)
+            .ok_or(ENOENT)?;
+        if entry.bag_uuid != *bag_uuid {
+            return Err(EINVAL);
+        }
+        Ok(entry.refs == 1)
+    }
+
+    fn release_fv_volume(&self, apfs_uuid: &[u8; 16], bag_uuid: &[u8; 16]) -> Result<()> {
         let mut volumes = self.fv_volumes.lock();
         let index = volumes
             .iter()
@@ -291,7 +297,11 @@ impl SepData {
             .ok_or(EIO)?;
         if out.reply.status != 0 {
             let status: i32 = out.reply.status.into();
-            dev_err!(self.dev, "fv: GET_BLOB_STATE failed with status {}\n", status);
+            dev_err!(
+                self.dev,
+                "fv: GET_BLOB_STATE failed with status {}\n",
+                status
+            );
             return Err(EACCES);
         }
         let body = self
@@ -597,11 +607,7 @@ impl SepData {
         })
     }
 
-    fn new_file_key(
-        &self,
-        volume_uuid: &[u8; 16],
-        protection_class: u32,
-    ) -> Result<NewFileKey> {
+    fn new_file_key(&self, volume_uuid: &[u8; 16], protection_class: u32) -> Result<NewFileKey> {
         self.fv_ready()?;
         let class = Self::pfk_class(protection_class)?;
         let out = self
@@ -712,17 +718,15 @@ impl SepData {
     ) -> Result<()> {
         self.fv_ready()?;
         let bag_uuid = self.fv_blob_uuid(volume_uuid, volume_key)?;
-        let request = self.sks_req_load_class_keys(
-            volume_uuid,
-            secret,
-            unlock_record,
-            volume_key,
-        )?;
-        self.record_fv_volume(volume_uuid, &bag_uuid)?;
+        let request =
+            self.sks_req_load_class_keys(volume_uuid, secret, unlock_record, volume_key)?;
+        if !self.retain_fv_volume(volume_uuid, &bag_uuid)? {
+            return Ok(());
+        }
         let out = match self.sks_send(Ok(request)) {
             Some(out) => out,
             None => {
-                let _ = self.unrecord_fv_volume(volume_uuid, &bag_uuid);
+                let _ = self.release_fv_volume(volume_uuid, &bag_uuid);
                 return Err(EIO);
             }
         };
@@ -733,21 +737,21 @@ impl SepData {
                 "fv: LOAD_CLASS_KEYS failed with status {}\n",
                 status
             );
-            let _ = self.unrecord_fv_volume(volume_uuid, &bag_uuid);
+            let _ = self.release_fv_volume(volume_uuid, &bag_uuid);
             return Err(EACCES);
         }
         let body = match self.sks_report_response(crate::sks::SKS_SET_PROTECTION_NAME, &out) {
             Some(body) => body,
             None => {
                 self.rollback_class_keys(volume_uuid, volume_key);
-                let _ = self.unrecord_fv_volume(volume_uuid, &bag_uuid);
+                let _ = self.release_fv_volume(volume_uuid, &bag_uuid);
                 return Err(EMSGSIZE);
             }
         };
         let mut fields = proto::FieldCursor::new(body);
         if fields.i32() != Some(0) || fields.blob().is_none() {
             self.rollback_class_keys(volume_uuid, volume_key);
-            let _ = self.unrecord_fv_volume(volume_uuid, &bag_uuid);
+            let _ = self.release_fv_volume(volume_uuid, &bag_uuid);
             return Err(EMSGSIZE);
         }
         let apfs_hi = u64::from_be_bytes(volume_uuid[..8].try_into().unwrap());
@@ -800,63 +804,119 @@ impl SepData {
     fn unload_class_keys(&self, volume_uuid: &[u8; 16], volume_key: &[u8]) -> Result<()> {
         self.fv_ready()?;
         let bag_uuid = self.fv_blob_uuid(volume_uuid, volume_key)?;
-        let out = self
-            .sks_send(self.sks_req_unload_class_keys(volume_uuid, volume_key))
-            .ok_or(EIO)?;
-        if out.reply.status != 0 {
-            return Err(EACCES);
+        if !self.fv_volume_is_last(volume_uuid, &bag_uuid)? {
+            return self.release_fv_volume(volume_uuid, &bag_uuid);
         }
-        let body = self
-            .sks_report_response(crate::sks::SKS_SET_PROTECTION_NAME, &out)
-            .ok_or(EMSGSIZE)?;
-        let mut fields = proto::FieldCursor::new(body);
-        if fields.i32() != Some(0) || fields.blob().is_none() {
-            return Err(EMSGSIZE);
-        }
-        self.unrecord_fv_volume(volume_uuid, &bag_uuid)
+        let result = (|| {
+            let out = self
+                .sks_send(self.sks_req_unload_class_keys(volume_uuid, volume_key))
+                .ok_or(EIO)?;
+            if out.reply.status != 0 {
+                return Err(EACCES);
+            }
+            let body = self
+                .sks_report_response(crate::sks::SKS_SET_PROTECTION_NAME, &out)
+                .ok_or(EMSGSIZE)?;
+            let mut fields = proto::FieldCursor::new(body);
+            if fields.i32() != Some(0) || fields.blob().is_none() {
+                return Err(EMSGSIZE);
+            }
+            Ok(())
+        })();
+        let release = self.release_fv_volume(volume_uuid, &bag_uuid);
+        result.and(release)
     }
 }
 
+/// Borrow a C input buffer as a slice, rejecting null/empty/oversized inputs.
+///
+/// # Safety
+///
+/// When `ptr` is non-null and `len` is in `1..=max`, `ptr` must be valid for
+/// reads of `len` bytes and that region must stay live and unmutated for the
+/// whole of `'a`. The caller must pick `'a` so the returned slice cannot
+/// outlive the underlying buffer.
 unsafe fn input<'a>(ptr: *const u8, len: usize, max: usize) -> Result<&'a [u8]> {
     if ptr.is_null() || len == 0 || len > max {
         return Err(EINVAL);
     }
-    // SAFETY: the C API requires `ptr` to remain readable for `len` bytes for
-    // the duration of the callback, and the callback does not retain it.
+    // SAFETY: `ptr` is non-null and `len` is in `1..=max` here, so by this
+    // function's contract the region is valid for reads of `len` bytes and
+    // stays live for `'a`.
     Ok(unsafe { core::slice::from_raw_parts(ptr, len) })
 }
 
+/// Borrow an optional C input buffer, treating a zero length as empty.
+///
+/// # Safety
+///
+/// Same obligations as [`input`]: when `len` is non-zero, `ptr` must be valid
+/// for reads of `len` bytes and stay live for `'a`.
 unsafe fn optional_input<'a>(ptr: *const u8, len: usize, max: usize) -> Result<&'a [u8]> {
     if len == 0 {
         return Ok(&[]);
     }
+    // SAFETY: `len` is non-zero here; this function's contract is identical to
+    // `input`'s, so the caller already guarantees `ptr`/`len` are valid.
     unsafe { input(ptr, len, max) }
 }
 
+/// Borrow a C output slot for one key.
+///
+/// # Safety
+///
+/// When `ptr` is non-null it must be aligned, point to a live and writable
+/// `KernelKey`, and grant exclusive access for the whole of `'a` (no other
+/// alias may touch it while the returned reference lives).
 unsafe fn output<'a>(ptr: *mut KernelKey) -> Result<&'a mut KernelKey> {
     if ptr.is_null() {
         return Err(EINVAL);
     }
-    // SAFETY: the C API provides exclusive writable storage for one key.
+    // SAFETY: `ptr` is non-null here, so by this function's contract it is an
+    // aligned, exclusively-owned, writable `KernelKey` that outlives `'a`.
     Ok(unsafe { &mut *ptr })
 }
 
+/// Borrow a C output slot for one new-file-key result.
+///
+/// # Safety
+///
+/// When `ptr` is non-null it must be aligned, point to a live and writable
+/// `KernelNewFileKey`, and grant exclusive access for the whole of `'a`.
 unsafe fn new_file_output<'a>(ptr: *mut KernelNewFileKey) -> Result<&'a mut KernelNewFileKey> {
     if ptr.is_null() {
         return Err(EINVAL);
     }
-    // SAFETY: the C API provides exclusive writable storage for one result.
+    // SAFETY: `ptr` is non-null here, so by this function's contract it is an
+    // aligned, exclusively-owned, writable `KernelNewFileKey` that outlives
+    // `'a`.
     Ok(unsafe { &mut *ptr })
 }
 
+/// Recover the driver state from a registered callback context pointer.
+///
+/// # Safety
+///
+/// When `context` is non-null it must be the pointer passed to
+/// `sep_fv_register_v2` — a `*const SepData` taken from a live `Arc<SepData>` —
+/// and must still be registered, so the `SepData` is alive and only shared
+/// (never uniquely) borrowed for the whole of `'a`.
 unsafe fn sep<'a>(context: *mut c_void) -> Result<&'a SepData> {
     if context.is_null() {
         return Err(ENODEV);
     }
-    // SAFETY: registration keeps `SepData` alive until all callbacks finish.
+    // SAFETY: `context` is non-null here, so by this function's contract it
+    // points to a live `SepData` that stays valid and shared for `'a`.
     Ok(unsafe { &*context.cast::<SepData>() })
 }
 
+/// # Safety
+///
+/// Invoked only through the registered `sep_fv_ops` dispatch (which holds the
+/// registration lock): `context` is the pointer passed to `sep_fv_register_v2`
+/// and is still registered; `wrapped`/`wrapped_len` describe a buffer readable
+/// for the duration of the call (or are null/0); and `key` points to aligned,
+/// exclusively-owned, writable storage for one `KernelKey`.
 unsafe extern "C" fn kernel_unwrap_media_key(
     context: *mut c_void,
     wrapped: *const u8,
@@ -865,18 +925,32 @@ unsafe extern "C" fn kernel_unwrap_media_key(
     key: *mut KernelKey,
 ) -> c_int {
     let result: Result<()> = (|| {
+        // SAFETY: per this function's contract `context` is the still-registered
+        // `SepData` pointer, alive for the duration of the call.
         let this = unsafe { sep(context)? };
+        // SAFETY: per this function's contract `wrapped`/`wrapped_len` describe a
+        // buffer readable for the call; the borrow does not outlive it.
         let wrapped = unsafe { input(wrapped, wrapped_len, WRAPPED_KEY_LEN)? };
         let wrapped: &[u8; WRAPPED_KEY_LEN] = wrapped.try_into().map_err(|_| EINVAL)?;
+        // SAFETY: per this function's contract `key` is exclusive writable
+        // storage for one `KernelKey`, valid for the duration of the call.
         let key = unsafe { output(key)? };
         let unwrapped = this.unwrap_media_key_from_class(wrapped, protection_class)?;
         key.opaque.copy_from_slice(&unwrapped.opaque);
         key.iv.copy_from_slice(&unwrapped.iv_key);
         Ok(())
     })();
-    result.map_or_else(|error| error.to_errno(), |_| 0)
+    result.map_or_else(|error| error.to_errno(), |()| 0)
 }
 
+/// # Safety
+///
+/// Invoked only through the registered `sep_fv_ops` dispatch (which holds the
+/// registration lock): `context` is the pointer passed to `sep_fv_register_v2`
+/// and is still registered; each `*const u8`/length pair describes a buffer
+/// readable for the duration of the call (the optional `secret`/`unlock_record`
+/// may be null with a zero length); and `key` points to aligned,
+/// exclusively-owned, writable storage for one `KernelKey`.
 unsafe extern "C" fn kernel_unwrap_volume_key(
     context: *mut c_void,
     secret: *const u8,
@@ -888,20 +962,38 @@ unsafe extern "C" fn kernel_unwrap_volume_key(
     key: *mut KernelKey,
 ) -> c_int {
     let result: Result<()> = (|| {
+        // SAFETY: per this function's contract `context` is the still-registered
+        // `SepData` pointer, alive for the duration of the call.
         let this = unsafe { sep(context)? };
+        // SAFETY: per this function's contract `secret`/`secret_len` describe a
+        // buffer readable for the call, or are null/0.
         let secret = unsafe { optional_input(secret, secret_len, SECRET_MAX_LEN)? };
+        // SAFETY: per this function's contract `unlock_record`/`unlock_record_len`
+        // describe a buffer readable for the call, or are null/0.
         let unlock_record =
             unsafe { optional_input(unlock_record, unlock_record_len, RECORD_MAX_LEN)? };
+        // SAFETY: per this function's contract `volume_key`/`volume_key_len`
+        // describe a buffer readable for the call.
         let volume_key = unsafe { input(volume_key, volume_key_len, RECORD_MAX_LEN)? };
+        // SAFETY: per this function's contract `key` is exclusive writable
+        // storage for one `KernelKey`, valid for the duration of the call.
         let key = unsafe { output(key)? };
         let unwrapped = this.unwrap_vek(secret, unlock_record, volume_key)?;
         key.opaque.copy_from_slice(&unwrapped.opaque);
         key.iv.fill(0);
         Ok(())
     })();
-    result.map_or_else(|error| error.to_errno(), |_| 0)
+    result.map_or_else(|error| error.to_errno(), |()| 0)
 }
 
+/// # Safety
+///
+/// Invoked only through the registered `sep_fv_ops` dispatch (which holds the
+/// registration lock): `context` is the pointer passed to `sep_fv_register_v2`
+/// and is still registered; `volume_uuid` points to 16 readable bytes; and each
+/// other `*const u8`/length pair describes a buffer readable for the duration
+/// of the call (the optional `secret`/`unlock_record` may be null with a zero
+/// length).
 unsafe extern "C" fn kernel_load_class_keys(
     context: *mut c_void,
     volume_uuid: *const u8,
@@ -913,18 +1005,35 @@ unsafe extern "C" fn kernel_load_class_keys(
     volume_key_len: usize,
 ) -> c_int {
     let result: Result<()> = (|| {
+        // SAFETY: per this function's contract `context` is the still-registered
+        // `SepData` pointer, alive for the duration of the call.
         let this = unsafe { sep(context)? };
+        // SAFETY: per this function's contract `volume_uuid` points to 16
+        // readable bytes for the duration of the call.
         let volume_uuid = unsafe { input(volume_uuid, 16, 16)? };
         let volume_uuid: &[u8; 16] = volume_uuid.try_into().map_err(|_| EINVAL)?;
+        // SAFETY: per this function's contract `secret`/`secret_len` describe a
+        // buffer readable for the call, or are null/0.
         let secret = unsafe { optional_input(secret, secret_len, SECRET_MAX_LEN)? };
+        // SAFETY: per this function's contract `unlock_record`/`unlock_record_len`
+        // describe a buffer readable for the call, or are null/0.
         let unlock_record =
             unsafe { optional_input(unlock_record, unlock_record_len, RECORD_MAX_LEN)? };
+        // SAFETY: per this function's contract `volume_key`/`volume_key_len`
+        // describe a buffer readable for the call.
         let volume_key = unsafe { input(volume_key, volume_key_len, RECORD_MAX_LEN)? };
         this.load_class_keys(volume_uuid, secret, unlock_record, volume_key)
     })();
-    result.map_or_else(|error| error.to_errno(), |_| 0)
+    result.map_or_else(|error| error.to_errno(), |()| 0)
 }
 
+/// # Safety
+///
+/// Invoked only through the registered `sep_fv_ops` dispatch (which holds the
+/// registration lock): `context` is the pointer passed to `sep_fv_register_v2`
+/// and is still registered; `volume_uuid` points to 16 readable bytes; and
+/// `volume_key`/`volume_key_len` describe a buffer readable for the duration of
+/// the call.
 unsafe extern "C" fn kernel_unload_class_keys(
     context: *mut c_void,
     volume_uuid: *const u8,
@@ -932,15 +1041,29 @@ unsafe extern "C" fn kernel_unload_class_keys(
     volume_key_len: usize,
 ) -> c_int {
     let result: Result<()> = (|| {
+        // SAFETY: per this function's contract `context` is the still-registered
+        // `SepData` pointer, alive for the duration of the call.
         let this = unsafe { sep(context)? };
+        // SAFETY: per this function's contract `volume_uuid` points to 16
+        // readable bytes for the duration of the call.
         let volume_uuid = unsafe { input(volume_uuid, 16, 16)? };
         let volume_uuid: &[u8; 16] = volume_uuid.try_into().map_err(|_| EINVAL)?;
+        // SAFETY: per this function's contract `volume_key`/`volume_key_len`
+        // describe a buffer readable for the call.
         let volume_key = unsafe { input(volume_key, volume_key_len, RECORD_MAX_LEN)? };
         this.unload_class_keys(volume_uuid, volume_key)
     })();
-    result.map_or_else(|error| error.to_errno(), |_| 0)
+    result.map_or_else(|error| error.to_errno(), |()| 0)
 }
 
+/// # Safety
+///
+/// Invoked only through the registered `sep_fv_ops` dispatch (which holds the
+/// registration lock): `context` is the pointer passed to `sep_fv_register_v2`
+/// and is still registered; `volume_uuid` points to 16 readable bytes; each
+/// `wrapped_*`/length pair describes a buffer readable for the duration of the
+/// call; and `key` points to aligned, exclusively-owned, writable storage for
+/// one `KernelKey`.
 unsafe extern "C" fn kernel_unwrap_file_key(
     context: *mut c_void,
     volume_uuid: *const u8,
@@ -952,11 +1075,21 @@ unsafe extern "C" fn kernel_unwrap_file_key(
     key: *mut KernelKey,
 ) -> c_int {
     let result: Result<()> = (|| {
+        // SAFETY: per this function's contract `context` is the still-registered
+        // `SepData` pointer, alive for the duration of the call.
         let this = unsafe { sep(context)? };
+        // SAFETY: per this function's contract `volume_uuid` points to 16
+        // readable bytes for the duration of the call.
         let volume_uuid = unsafe { input(volume_uuid, 16, 16)? };
         let volume_uuid: &[u8; 16] = volume_uuid.try_into().map_err(|_| EINVAL)?;
+        // SAFETY: per this function's contract `wrapped_ekwk`/`wrapped_ekwk_len`
+        // describe a buffer readable for the call.
         let wrapped_ekwk = unsafe { input(wrapped_ekwk, wrapped_ekwk_len, FILE_KEY_MAX_LEN)? };
+        // SAFETY: per this function's contract `wrapped_ek`/`wrapped_ek_len`
+        // describe a buffer readable for the call.
         let wrapped_ek = unsafe { input(wrapped_ek, wrapped_ek_len, FILE_KEY_MAX_LEN)? };
+        // SAFETY: per this function's contract `key` is exclusive writable
+        // storage for one `KernelKey`, valid for the duration of the call.
         let key = unsafe { output(key)? };
         let unwrapped =
             this.unwrap_file_key(volume_uuid, protection_class, wrapped_ekwk, wrapped_ek)?;
@@ -964,9 +1097,16 @@ unsafe extern "C" fn kernel_unwrap_file_key(
         key.iv.copy_from_slice(&unwrapped.iv_key);
         Ok(())
     })();
-    result.map_or_else(|error| error.to_errno(), |_| 0)
+    result.map_or_else(|error| error.to_errno(), |()| 0)
 }
 
+/// # Safety
+///
+/// Invoked only through the registered `sep_fv_ops` dispatch (which holds the
+/// registration lock): `context` is the pointer passed to `sep_fv_register_v2`
+/// and is still registered; `volume_uuid` points to 16 readable bytes; and
+/// `key` points to aligned, exclusively-owned, writable storage for one
+/// `KernelNewFileKey`.
 unsafe extern "C" fn kernel_new_file_key(
     context: *mut c_void,
     volume_uuid: *const u8,
@@ -976,9 +1116,15 @@ unsafe extern "C" fn kernel_new_file_key(
     key: *mut KernelNewFileKey,
 ) -> c_int {
     let result: Result<()> = (|| {
+        // SAFETY: per this function's contract `context` is the still-registered
+        // `SepData` pointer, alive for the duration of the call.
         let this = unsafe { sep(context)? };
+        // SAFETY: per this function's contract `volume_uuid` points to 16
+        // readable bytes for the duration of the call.
         let volume_uuid = unsafe { input(volume_uuid, 16, 16)? };
         let volume_uuid: &[u8; 16] = volume_uuid.try_into().map_err(|_| EINVAL)?;
+        // SAFETY: per this function's contract `key` is exclusive writable
+        // storage for one `KernelNewFileKey`, valid for the duration of the call.
         let key = unsafe { new_file_output(key)? };
         if crypto_id == 0 || key_revision == 0 {
             return Err(EINVAL);
@@ -992,5 +1138,5 @@ unsafe extern "C" fn kernel_new_file_key(
         key.wrapped_ek_len = generated.wrapped_ek_len;
         Ok(())
     })();
-    result.map_or_else(|error| error.to_errno(), |_| 0)
+    result.map_or_else(|error| error.to_errno(), |()| 0)
 }
