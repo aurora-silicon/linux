@@ -671,6 +671,54 @@ static void avd_h264_run_preamble(struct avd_ctx *ctx, struct avd_h264_run *run)
 	run->addresses.mv_color = run->base.y_out + (dst_len - mv_color_len);
 }
 
+/*
+ * Check that every reference in the slice's ref lists points at a DPB entry
+ * that is VALID. stream_refs() only pushes a reference header (and its RVRA
+ * addresses) for VALID entries and the slice command indexes those by DPB
+ * index, so a reference to any other entry makes the VP dereference an
+ * uninitialised reference slot: that ends in a DART translation fault, a
+ * frame that never completes and a watchdog reset of the VP, which also
+ * disturbs the other contexts. It happens whenever a client starts decoding
+ * on a non-IDR frame (joining a live RTSP stream mid-GOP): ffmpeg's
+ * v4l2request hwaccel leaves the index of a missing reference at 0 and the
+ * DPB is empty. Refuse such slices before anything is pushed; the client gets
+ * the capture buffer back with V4L2_BUF_FLAG_ERROR, as for corrupt input.
+ */
+static bool avd_h264_refs_valid(const struct avd_h264_run *run)
+{
+	const struct v4l2_ctrl_h264_slice_params *sl = run->slice_params;
+	const struct v4l2_h264_dpb_entry *dpb = run->decode_params->dpb;
+	const struct v4l2_h264_reference *lists[2] = {
+		sl->ref_pic_list0, sl->ref_pic_list1
+	};
+	u32 num[2] = {
+		sl->num_ref_idx_l0_active_minus1 + 1,
+		sl->num_ref_idx_l1_active_minus1 + 1
+	};
+	int nlists;
+
+	if (sl->slice_type == V4L2_H264_SLICE_TYPE_P)
+		nlists = 1;
+	else if (sl->slice_type == V4L2_H264_SLICE_TYPE_B)
+		nlists = 2;
+	else
+		return true;
+
+	for (int l = 0; l < nlists; l++) {
+		if (num[l] > V4L2_H264_REF_LIST_LEN)
+			return false;
+		for (u32 i = 0; i < num[l]; i++) {
+			u8 idx = lists[l][i].index;
+
+			if (idx >= V4L2_H264_NUM_DPB_ENTRIES ||
+			    !(dpb[idx].flags & V4L2_H264_DPB_ENTRY_FLAG_VALID))
+				return false;
+		}
+	}
+
+	return true;
+}
+
 static int avd_h264_run(struct avd_ctx *ctx)
 {
 	struct avd_h264_ctx *h264_ctx = ctx->priv;
@@ -708,6 +756,12 @@ static int avd_h264_run(struct avd_ctx *ctx)
 				    h264_ctx->reflists.b1);
 
 	avd_run_postamble(ctx, &run.base);
+
+	if (!avd_h264_refs_valid(&run)) {
+		dev_dbg_ratelimited(ctx->dev->dev,
+				    "slice references an invalid DPB entry, dropping frame\n");
+		return -EINVAL;
+	}
 
 	if (is_new_frame(run.slice_params)) {
 		ret = avd_init_job(ctx, AVD_CODEC_H264, MAX_SLICES);
