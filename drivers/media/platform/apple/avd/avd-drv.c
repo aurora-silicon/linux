@@ -320,6 +320,7 @@ static int avd_queue_init(void *priv, struct vb2_queue *src_vq,
 	src_vq->lock = &ctx->dev->vdev_lock;
 	src_vq->dev = ctx->dev->v4l2_dev.dev;
 	src_vq->supports_requests = true;
+	src_vq->allow_cache_hints = true;
 
 	ret = vb2_queue_init(src_vq);
 	if (ret)
@@ -336,6 +337,7 @@ static int avd_queue_init(void *priv, struct vb2_queue *src_vq,
 	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	dst_vq->lock = &ctx->dev->vdev_lock;
 	dst_vq->dev = ctx->dev->v4l2_dev.dev;
+	dst_vq->allow_cache_hints = true;
 
 	return vb2_queue_init(dst_vq);
 }
