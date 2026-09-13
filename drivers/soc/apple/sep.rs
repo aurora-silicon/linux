@@ -579,6 +579,8 @@ struct SepData {
     ool_sks: Mutex<Option<OolPair>>,
 
     #[pin]
+    sks_exchange_lock: Mutex<()>,
+    #[pin]
     sks_probe: Mutex<SksProbe>,
     #[pin]
     sks_wq: CondVar,
@@ -762,6 +764,7 @@ impl SepData {
                 ool_xarm <- new_mutex!(Some(ool_xarm)),
                 ool_sbio <- new_mutex!(Some(ool_sbio)),
                 ool_sks <- new_mutex!(Some(ool_sks)),
+                sks_exchange_lock <- new_mutex!(()),
                 sks_probe <- new_mutex!(SksProbe::new()),
                 sks_wq <- new_condvar!("SepData::sks_wq"),
                 ool_scrd <- new_mutex!(Some(ool_scrd)),

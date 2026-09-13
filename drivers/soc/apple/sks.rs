@@ -4,9 +4,9 @@
 //! framing, DER-imaged request builders, and lock-state control.
 
 use super::*;
+use crate::proto::*;
 use kernel::prelude::*;
 use kernel::soc::apple::mailbox::Message;
-use crate::proto::*;
 
 struct KeybagCreateIntent<'a> {
     dev: &'a device::Device,
@@ -20,7 +20,11 @@ impl<'a> KeybagCreateIntent<'a> {
             dev_err!(dev, "sks: cannot persist keybag-create intent: {:?}\n", e);
             return None;
         }
-        Some(Self { dev, slot, sent: false })
+        Some(Self {
+            dev,
+            slot,
+            sent: false,
+        })
     }
 
     fn sending(&mut self) {
@@ -32,7 +36,11 @@ impl Drop for KeybagCreateIntent<'_> {
     fn drop(&mut self) {
         if !self.sent {
             if let Err(e) = keybag::mark_refused(self.slot) {
-                dev_err!(self.dev, "sks: cannot mark unsent keybag create retryable: {:?}\n", e);
+                dev_err!(
+                    self.dev,
+                    "sks: cannot mark unsent keybag create retryable: {:?}\n",
+                    e
+                );
             }
         }
     }
@@ -59,7 +67,12 @@ impl SepData {
             if let Some(a) = matched {
                 let _ = self.sks_zero_buffers();
                 self.sks_wedged.store(0, Relaxed);
-                dev_warn!(self.dev, "sks: late answer to {} after {} ms; wedge lifted\n", a.label, a.waited_ms);
+                dev_warn!(
+                    self.dev,
+                    "sks: late answer to {} after {} ms; wedge lifted\n",
+                    a.label,
+                    a.waited_ms
+                );
             }
         }
     }
@@ -134,6 +147,7 @@ impl SepData {
         floor_ms: time::Msecs,
         condemn: bool,
     ) -> Option<SksOutcome> {
+        let _exchange = self.sks_exchange_lock.lock();
         if !self.ool_registered(&self.ool_sks) {
             return None;
         }
@@ -206,7 +220,12 @@ impl SepData {
             if condemn {
                 self.sks_wedged.store(1, Relaxed);
             }
-            dev_err!(self.dev, "sks: {} got no reply after {} ms\n", label, waited_ms);
+            dev_err!(
+                self.dev,
+                "sks: {} got no reply after {} ms\n",
+                label,
+                waited_ms
+            );
             return None;
         };
 
@@ -220,8 +239,7 @@ impl SepData {
             }
         }
 
-        // The correlated reply means the enclave has finished with both OOL
-        // buffers. Keep only the private response copy returned to the caller.
+        // The correlated reply means the enclave has finished with both OOL buffers.
         let _ = self.sks_zero_buffers();
 
         Some(SksOutcome { reply, response })
@@ -299,7 +317,10 @@ impl SepData {
     }
 
     /// `0x05` unload the source handle.
-    pub(crate) fn sks_req_unload_keybag(&self, handle: crate::sks::KeyBagHandle) -> Result<SksRequest> {
+    pub(crate) fn sks_req_unload_keybag(
+        &self,
+        handle: crate::sks::KeyBagHandle,
+    ) -> Result<SksRequest> {
         let mut body = image::Body::new();
         body.put_u32(0)?;
         body.put_u64(crate::sks::SKS_CLIENT_ID)?;
@@ -315,7 +336,10 @@ impl SepData {
     }
 
     /// `0x06` UUID read, against the special handle.
-    pub(crate) fn sks_req_copy_uuid_special(&self, special: crate::sks::SpecialHandle) -> Result<SksRequest> {
+    pub(crate) fn sks_req_copy_uuid_special(
+        &self,
+        special: crate::sks::SpecialHandle,
+    ) -> Result<SksRequest> {
         let op = crate::sks::sks_copy_keybag_uuid();
         let mut body = image::Body::new();
         body.put_u32(0)?;
@@ -340,7 +364,8 @@ impl SepData {
         body.put_u64(SKS_LOCK_STATE_FLAGS)?;
         let img = image::build_request(image::Version::V1, self.sks_timestamp_us(), &body)?;
         let len = self.sks_image_len(&img)?;
-        let msg = crate::sks::encode_sks_change_lock_state(self.sks_next_seq(), len).ok_or(EINVAL)?;
+        let msg =
+            crate::sks::encode_sks_change_lock_state(self.sks_next_seq(), len).ok_or(EINVAL)?;
         Ok(SksRequest {
             name: crate::sks::SKS_LOCK_STATE_NAME,
             msg,
@@ -418,7 +443,11 @@ impl SepData {
         let img = image::build_request(image::Version::V1, self.sks_timestamp_us(), &body)?;
         let len = self.sks_image_len(&img)?;
         let msg = crate::sks::encode_sks_create(self.sks_next_seq(), len).ok_or(EINVAL)?;
-        Ok(SksRequest { name: crate::sks::SKS_CREATE_NAME, msg, img })
+        Ok(SksRequest {
+            name: crate::sks::SKS_CREATE_NAME,
+            msg,
+            img,
+        })
     }
 
     pub(crate) fn sks_provision_identity_keybag(&self) -> bool {
@@ -426,7 +455,11 @@ impl SepData {
             Ok(keybag::State::Present(_)) => return true,
             Ok(keybag::State::Absent(proof)) => proof,
             Err(e) => {
-                dev_err!(self.dev, "sks: identity keybag state is ambiguous: {:?}\n", e);
+                dev_err!(
+                    self.dev,
+                    "sks: identity keybag state is ambiguous: {:?}\n",
+                    e
+                );
                 return false;
             }
         };
@@ -452,7 +485,11 @@ impl SepData {
         let request = match self.sks_req_create_identity_keybag(&secret, &uuid, proof) {
             Ok(request) => request,
             Err(e) => {
-                dev_err!(self.dev, "sks: cannot build identity keybag request: {:?}\n", e);
+                dev_err!(
+                    self.dev,
+                    "sks: cannot build identity keybag request: {:?}\n",
+                    e
+                );
                 return false;
             }
         };
@@ -464,7 +501,12 @@ impl SepData {
             return false;
         };
         if out.reply.status != 0 || body.len() < 12 {
-            dev_err!(self.dev, "sks: CREATE_KEYBAG failed: mailbox {}, body {} bytes\n", out.reply.status, body.len());
+            dev_err!(
+                self.dev,
+                "sks: CREATE_KEYBAG failed: mailbox {}, body {} bytes\n",
+                out.reply.status,
+                body.len()
+            );
             return false;
         }
         let variant = u32::from_le_bytes(body[0..4].try_into().unwrap());
@@ -472,8 +514,14 @@ impl SepData {
         let Some((_fv_data, end)) = image::read_blob(body, 8) else {
             return false;
         };
-        if variant != crate::sks::SKS_CREATE_VARIANT_IDENTITY || raw_handle < 0 || end != body.len() {
-            dev_err!(self.dev, "sks: invalid CREATE_KEYBAG reply: variant {}, handle {}\n", variant, raw_handle);
+        if variant != crate::sks::SKS_CREATE_VARIANT_IDENTITY || raw_handle < 0 || end != body.len()
+        {
+            dev_err!(
+                self.dev,
+                "sks: invalid CREATE_KEYBAG reply: variant {}, handle {}\n",
+                variant,
+                raw_handle
+            );
             return false;
         }
         let handle = crate::sks::KeyBagHandle::from_create_reply(raw_handle);
@@ -502,7 +550,11 @@ impl SepData {
         }
     }
 
-    pub(crate) fn sks_designate_user_keybag(&self, handle: crate::sks::KeyBagHandle, secret: &[u8]) {
+    pub(crate) fn sks_designate_user_keybag(
+        &self,
+        handle: crate::sks::KeyBagHandle,
+        secret: &[u8],
+    ) {
         let Some(user) = crate::sks::DesignateUser::new(SBIO_PROBE_USER_ID) else {
             return;
         };
@@ -510,12 +562,13 @@ impl SepData {
         let designation = crate::sks::Designation::new(handle, user);
 
         let Some(out) = self.sks_send(self.sks_req_designate(&designation, secret)) else {
-            dev_warn!(self.dev, "sks: DESIGNATE_KEYBAG did not complete; enrolment will refuse\n");
+            dev_warn!(
+                self.dev,
+                "sks: DESIGNATE_KEYBAG did not complete; enrolment will refuse\n"
+            );
             return;
         };
-        let Some(body) =
-            self.sks_report_response(crate::sks::SKS_DESIGNATE_NAME, &out)
-        else {
+        let Some(body) = self.sks_report_response(crate::sks::SKS_DESIGNATE_NAME, &out) else {
             return;
         };
 
@@ -529,17 +582,10 @@ impl SepData {
 
         self.keybag_designated.store(true, Relaxed);
 
-        self.sks_remember_enrolment_material(
-            designation.user().special_handle(),
-            secret,
-        );
+        self.sks_remember_enrolment_material(designation.user().special_handle(), secret);
     }
 
-    fn sks_remember_enrolment_material(
-        &self,
-        special: crate::sks::SpecialHandle,
-        secret: &[u8],
-    ) {
+    fn sks_remember_enrolment_material(&self, special: crate::sks::SpecialHandle, secret: &[u8]) {
         let mut copy = KVec::new();
         if copy.extend_from_slice(secret, GFP_KERNEL).is_err() {
             return;
@@ -569,7 +615,8 @@ impl SepData {
         body.put_u64(SKS_LOCK_STATE_FLAGS)?;
         let img = image::build_request(image::Version::V1, self.sks_timestamp_us(), &body)?;
         let len = self.sks_image_len(&img)?;
-        let msg = crate::sks::encode_sks_change_lock_state(self.sks_next_seq(), len).ok_or(EINVAL)?;
+        let msg =
+            crate::sks::encode_sks_change_lock_state(self.sks_next_seq(), len).ok_or(EINVAL)?;
         Ok(SksRequest {
             name: crate::sks::SKS_LOCK_STATE_NAME,
             msg,
@@ -616,11 +663,20 @@ impl SepData {
 
     pub(crate) fn sks_health_check(&self, why: &CStr) -> Option<Healthy> {
         let Some(out) = self.sks_send(self.sks_req_get_capabilities()) else {
-            dev_err!(self.dev, "sks: health check ({}) got no reply; endpoint gone for this boot\n", why);
+            dev_err!(
+                self.dev,
+                "sks: health check ({}) got no reply; endpoint gone for this boot\n",
+                why
+            );
             return None;
         };
         if out.reply.status != 0 {
-            dev_err!(self.dev, "sks: health check ({}) returned status {}\n", why, out.reply.status);
+            dev_err!(
+                self.dev,
+                "sks: health check ({}) returned status {}\n",
+                why,
+                out.reply.status
+            );
             return None;
         }
         Some(Healthy(()))
@@ -633,7 +689,11 @@ impl SepData {
         let request = match self.sks_req_load_keybag(stored.wrapped()) {
             Ok(request) => request,
             Err(e) => {
-                dev_err!(self.dev, "sks: could not build LOAD_KEYBAG request: {:?}\n", e);
+                dev_err!(
+                    self.dev,
+                    "sks: could not build LOAD_KEYBAG request: {:?}\n",
+                    e
+                );
                 return None;
             }
         };
@@ -650,7 +710,10 @@ impl SepData {
         let body = match self.sks_report_response(crate::sks::SKS_LOAD_NAME, &out) {
             Some(body) => body,
             None => {
-                dev_warn!(self.dev, "sks: LOAD_KEYBAG reply image was empty or malformed\n");
+                dev_warn!(
+                    self.dev,
+                    "sks: LOAD_KEYBAG reply image was empty or malformed\n"
+                );
                 return None;
             }
         };
@@ -664,13 +727,23 @@ impl SepData {
             return None;
         }
         if body.len() != SKS_LOAD_REPLY_LEN {
-            dev_warn!(self.dev, "sks: LOAD_KEYBAG returned {} bytes, expected {}\n", body.len(), SKS_LOAD_REPLY_LEN);
+            dev_warn!(
+                self.dev,
+                "sks: LOAD_KEYBAG returned {} bytes, expected {}\n",
+                body.len(),
+                SKS_LOAD_REPLY_LEN
+            );
             return None;
         }
         let status = i32::from_le_bytes([body[0], body[1], body[2], body[3]]);
         let handle = i32::from_le_bytes([body[4], body[5], body[6], body[7]]);
         if status != 0 || handle < 0 {
-            dev_warn!(self.dev, "sks: LOAD_KEYBAG operation status {}, handle {}\n", status, handle);
+            dev_warn!(
+                self.dev,
+                "sks: LOAD_KEYBAG operation status {}, handle {}\n",
+                status,
+                handle
+            );
             return None;
         }
         let handle = crate::sks::KeyBagHandle::from_load_reply(handle);
@@ -769,7 +842,11 @@ impl SepData {
             return false;
         }
         if let Err(e) = self.enable_sks() {
-            dev_err!(self.dev, "sks: could not register out-of-line buffers ({:?})\n", e);
+            dev_err!(
+                self.dev,
+                "sks: could not register out-of-line buffers ({:?})\n",
+                e
+            );
             return false;
         }
         true
@@ -938,7 +1015,6 @@ static_assert!(SKS_CLIENT_ID == 0x4c49_4e55_5853_4b53);
 pub(crate) struct KeyBagHandle(i32);
 
 impl KeyBagHandle {
-
     pub(crate) const fn from_create_reply(v: i32) -> KeyBagHandle {
         KeyBagHandle(v)
     }
@@ -1088,7 +1164,11 @@ pub(crate) fn encode_sks_load(seq: Sequence, len: ImageLen) -> Option<Message> {
 }
 
 pub(crate) fn encode_sks_create(seq: Sequence, len: ImageLen) -> Option<Message> {
-    Some(encode_sks_raw(OP_SKS_CREATE_KEYBAG, seq.value(), len.value()))
+    Some(encode_sks_raw(
+        OP_SKS_CREATE_KEYBAG,
+        seq.value(),
+        len.value(),
+    ))
 }
 
 pub(crate) fn encode_sks_change_lock_state(seq: Sequence, len: ImageLen) -> Option<Message> {
