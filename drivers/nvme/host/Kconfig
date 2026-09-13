@@ -127,6 +127,7 @@ config NVME_APPLE
 	depends on OF && BLOCK
 	depends on APPLE_RTKIT && APPLE_SART
 	depends on ARCH_APPLE || COMPILE_TEST
+	select BLK_INLINE_ENCRYPTION
 	select NVME_CORE
 	help
 	  This provides support for the NVMe controller embedded in Apple SoCs

@@ -4174,6 +4174,11 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, struct nvme_ns_info *info)
 	ns->ctrl = ctrl;
 	kref_init(&ns->kref);
 
+#ifdef CONFIG_BLK_INLINE_ENCRYPTION
+	if (ctrl->crypto_profile)
+		blk_crypto_register(ctrl->crypto_profile, ns->queue);
+#endif
+
 	if (nvme_init_ns_head(ns, info))
 		goto out_cleanup_disk;
 

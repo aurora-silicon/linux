@@ -86,7 +86,15 @@ const MAX_WRAPPED: usize = crate::store::MAX_VALUE;
 
 /// Proof the host holds no bag; create takes one by value, so it is unreachable
 /// without it and unrepeatable with it.
-pub(crate) struct NoStoredKeyBag;
+pub(crate) struct NoStoredKeyBag {
+    slot: Slot,
+}
+
+impl NoStoredKeyBag {
+    pub(crate) fn slot(&self) -> Slot {
+        self.slot
+    }
+}
 
 pub(crate) struct StoredKeyBag {
     wrapped: KVec<u8>,
@@ -143,7 +151,7 @@ pub(crate) fn read(slot: Slot) -> Result<State> {
     let file = match shim::StoreFile::open_readonly(slot.path()) {
         Ok(f) => f,
         Err(e) if e == ENOENT => {
-            return Ok(State::Absent(NoStoredKeyBag));
+            return Ok(State::Absent(NoStoredKeyBag { slot }));
         }
         Err(e) => return Err(e),
     };
@@ -174,7 +182,7 @@ pub(crate) fn read(slot: Slot) -> Result<State> {
         head[OFF_STATE + 3],
     ]);
     if state == STATE_REFUSED {
-        return Ok(State::Absent(NoStoredKeyBag));
+        return Ok(State::Absent(NoStoredKeyBag { slot }));
     }
     let Some(provenance) = UuidProvenance::from_state(state) else {
         // Intent or unknown state: a bag may exist unnamed; creating again would
@@ -231,6 +239,32 @@ pub(crate) fn read(slot: Slot) -> Result<State> {
         secret,
         provenance,
     }))
+}
+
+pub(crate) fn write_intent(slot: Slot) -> Result<()> {
+    write_record(slot, 0, &[], &[0; UUID_LEN], &[])
+}
+
+pub(crate) fn mark_refused(slot: Slot) -> Result<()> {
+    write_record(slot, STATE_REFUSED, &[], &[0; UUID_LEN], &[])
+}
+
+pub(crate) fn write_bag_uuid(
+    slot: Slot,
+    wrapped: &[u8],
+    uuid: &[u8; UUID_LEN],
+    secret: &[u8],
+) -> Result<()> {
+    if wrapped.is_empty() || wrapped.len() > MAX_WRAPPED || secret.len() > MAX_WRAPPED {
+        return Err(EINVAL);
+    }
+    write_record(
+        slot,
+        UuidProvenance::ReadBackFromBag.state(),
+        wrapped,
+        uuid,
+        secret,
+    )
 }
 
 /// Replaces only the wrapped blob. The enclave ratchets bag material while a bag

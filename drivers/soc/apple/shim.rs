@@ -12,21 +12,18 @@ extern "C" {
     fn sep_store_open_block(path: *const c_char, writable: c_int) -> *mut c_void;
     fn sep_store_close(handle: *mut c_void);
     fn sep_store_size(handle: *mut c_void) -> i64;
-    fn sep_store_read(handle: *mut c_void, off: i64, buf: *mut c_void, len: usize)
-        -> c_long;
-    fn sep_store_write(
-        handle: *mut c_void,
-        off: i64,
-        buf: *const c_void,
-        len: usize,
-    ) -> c_long;
+    fn sep_store_read(handle: *mut c_void, off: i64, buf: *mut c_void, len: usize) -> c_long;
+    fn sep_store_write(handle: *mut c_void, off: i64, buf: *const c_void, len: usize) -> c_long;
     fn sep_store_sync(handle: *mut c_void) -> c_int;
     fn sep_random_bytes(buf: *mut c_void, len: usize) -> c_int;
 }
 
 pub(crate) fn random_bytes(buf: &mut [u8]) -> Result<()> {
-    // SAFETY: `buf` is writable for exactly `buf.len()` bytes.
-    kernel::error::to_result(unsafe { sep_random_bytes(buf.as_mut_ptr().cast(), buf.len()) })
+    // SAFETY: `buf.as_mut_ptr()` is valid for writes of `buf.len()` bytes for
+    // the duration of the call, and `sep_random_bytes` writes exactly that many
+    // bytes (via `get_random_bytes`) and retains no reference to the buffer.
+    let ret = unsafe { sep_random_bytes(buf.as_mut_ptr().cast(), buf.len()) };
+    kernel::error::to_result(ret)
 }
 
 /// Backing-store file handle.
@@ -197,9 +194,6 @@ extern "C" {
     fn sep_bio_capable_admin() -> c_int;
     fn sep_bio_monotonic_ns() -> u64;
     fn sep_bio_boottime_ns() -> u64;
-}
-
-extern "C" {
 }
 
 pub(crate) fn capable_admin() -> bool {

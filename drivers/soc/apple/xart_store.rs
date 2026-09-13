@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 // Copyright 2026 Dj
-// Copyright 2026 Aurora Silicon
 
-//! Apple's device-wide xART gigalocker record store.
+//! Device-wide xART gigalocker record store.
 //!
 //! The APFS locator exposes the existing `.gl` file as a block device.  This
 //! module implements the record validation, duplicate repair, lookup and
-//! copy-on-write ordering used by AppleSEPManager.  It never creates storage
+//! copy-on-write ordering the SEP requires.  It never creates storage
 //! and it can be opened read-only for safe inspection and bring-up.
 
 use crate::shim;
@@ -141,7 +140,7 @@ impl Store {
             slots,
             revision: 0,
             // Discovery is always read-only. Do not arm even repair writes
-            // until the required Apple root records have validated.
+            // until the required root records have validated.
             writes_enabled: false,
             valid_records: 0,
             malformed_records: 0,
@@ -150,7 +149,7 @@ impl Store {
         };
         store.scan()?;
         // Serving an empty or unrelated 6 MiB mapping is the failure mode that
-        // originally desynchronised SEP from macOS. This Linux driver is never
+        // originally desynchronised SEP's anti-replay state. This Linux driver is never
         // the authority that provisions a blank device-wide store. Require
         // both existing root families before any mailbox registration can run.
         if store.find(&Key::root(1)).is_none() || store.find(&Key::root(2)).is_none() {
@@ -205,8 +204,8 @@ impl Store {
 
             if let Some(old) = self.find(&key) {
                 self.duplicate_records += 1;
-                // Equal revisions keep the later physical slot, matching the
-                // forward scan in AppleSEPManager's fixup pass.
+                // Equal revisions keep the later physical slot: the forward
+                // scan resolves a tie to the last writer.
                 if revision >= self.slots[old].revision {
                     self.slots[old] = Slot::FREE;
                     self.slots[idx] = candidate;
@@ -221,7 +220,7 @@ impl Store {
     }
 
     /// Removes malformed records and duplicate losers only after the mapping
-    /// has passed its complete read-only scan and both Apple roots exist.
+    /// has passed its complete read-only scan and both root records exist.
     fn repair_disk(&mut self) -> Result<()> {
         let mut header = KVec::with_capacity(DELETE_SIZE, GFP_KERNEL)?;
         header.resize(DELETE_SIZE, 0, GFP_KERNEL)?;
@@ -313,8 +312,7 @@ impl Store {
         }
 
         let old = self.find(key);
-        // Apple skips the first free slot when creating a new key, but uses the
-        // first free slot for replacement.
+        // A new key skips the first free slot; a replacement reuses it.
         let fresh = self.find_free(usize::from(old.is_none())).ok_or(ENOSPC)?;
         let revision = self.revision.checked_add(1).ok_or(EINVAL)?;
         let crc = crc32_ieee(value);
@@ -343,7 +341,7 @@ impl Store {
         self.revision = revision;
 
         if let Some(old) = old {
-            self.delete_slot(old)?;
+            let _ = self.delete_slot(old);
             self.slots[old] = Slot::FREE;
         }
         self.valid_records = self.slots.iter().filter(|slot| slot.used).count();
@@ -362,7 +360,7 @@ impl Store {
         }
         self.delete_slot(idx)?;
         self.slots[idx] = Slot::FREE;
-        self.valid_records -= 1;
+        self.valid_records = self.slots.iter().filter(|slot| slot.used).count();
         Ok(true)
     }
 

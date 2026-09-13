@@ -183,11 +183,12 @@ EXPORT_SYMBOL_GPL(unregister_trusted_key_source);
 
 enum {
 	Opt_err,
-	Opt_new, Opt_load, Opt_update,
+	Opt_new, Opt_import, Opt_load, Opt_update,
 };
 
 static const match_table_t key_tokens = {
 	{Opt_new, "new"},
+	{Opt_import, "import"},
 	{Opt_load, "load"},
 	{Opt_update, "update"},
 	{Opt_err, NULL}
@@ -223,6 +224,19 @@ static int datablob_parse(char **datablob, struct trusted_key_payload *p)
 			return -EINVAL;
 		p->key_len = keylen;
 		ret = Opt_new;
+		break;
+	case Opt_import:
+		c = strsep(datablob, " \t");
+		if (!c || strlen(c) % 2)
+			return -EINVAL;
+		keylen = strlen(c) / 2;
+		if (keylen < MIN_KEY_SIZE || keylen > MAX_KEY_SIZE)
+			return -EINVAL;
+		ret = hex2bin(p->key, c, keylen);
+		if (ret < 0)
+			return -EINVAL;
+		p->key_len = keylen;
+		ret = Opt_import;
 		break;
 	case Opt_load:
 		/* first argument is sealed blob */
@@ -325,6 +339,11 @@ static int trusted_instantiate(struct key *key,
 			goto out;
 		}
 
+		ret = static_call(trusted_key_seal)(payload, datablob);
+		if (ret < 0)
+			pr_info("key_seal failed (%d)\n", ret);
+		break;
+	case Opt_import:
 		ret = static_call(trusted_key_seal)(payload, datablob);
 		if (ret < 0)
 			pr_info("key_seal failed (%d)\n", ret);

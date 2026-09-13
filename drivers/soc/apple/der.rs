@@ -140,8 +140,11 @@ pub(crate) fn refkey_find<'a>(set_blob: &'a [u8], key: &[u8]) -> Option<&'a [u8]
         if key_tag != TAG_UTF8 {
             return None;
         }
-        let (_val_tag, _value, after_val) = take_tlv(after_key)?;
         if this_key == key {
+            let (_val_tag, _value, after_val) = take_tlv(after_key)?;
+            if !after_val.is_empty() {
+                return None;
+            }
             return Some(&after_key[..after_key.len() - after_val.len()]);
         }
         body = next;
@@ -155,4 +158,3 @@ pub(crate) fn octet_string_body(tlv: &[u8]) -> Option<&[u8]> {
         _ => None,
     }
 }
-

@@ -3,12 +3,40 @@
 //! SEP key store (SKS, endpoint `0x12`): key-bag and key-management request/reply
 //! framing, DER-imaged request builders, and lock-state control.
 
-#![allow(dead_code)]
-
 use super::*;
 use kernel::prelude::*;
 use kernel::soc::apple::mailbox::Message;
 use crate::proto::*;
+
+struct KeybagCreateIntent<'a> {
+    dev: &'a device::Device,
+    slot: keybag::Slot,
+    sent: bool,
+}
+
+impl<'a> KeybagCreateIntent<'a> {
+    fn new(dev: &'a device::Device, slot: keybag::Slot) -> Option<Self> {
+        if let Err(e) = keybag::write_intent(slot) {
+            dev_err!(dev, "sks: cannot persist keybag-create intent: {:?}\n", e);
+            return None;
+        }
+        Some(Self { dev, slot, sent: false })
+    }
+
+    fn sending(&mut self) {
+        self.sent = true;
+    }
+}
+
+impl Drop for KeybagCreateIntent<'_> {
+    fn drop(&mut self) {
+        if !self.sent {
+            if let Err(e) = keybag::mark_refused(self.slot) {
+                dev_err!(self.dev, "sks: cannot mark unsent keybag create retryable: {:?}\n", e);
+            }
+        }
+    }
+}
 
 impl SepData {
     pub(crate) fn on_sks(&self, msg: Message) {
@@ -30,6 +58,7 @@ impl SepData {
                 .copied();
             drop(probe);
             if let Some(a) = matched {
+                let _ = self.sks_zero_buffers();
                 self.sks_wedged.store(0, Relaxed);
                 dev_warn!(self.dev, "sks: late answer to {} after {} ms; wedge lifted\n", a.label, a.waited_ms);
             }
@@ -130,6 +159,7 @@ impl SepData {
         self.sks_arm(label);
         if self.send(msg).is_err() {
             self.sks_disarm();
+            let _ = self.sks_zero_buffers();
             return None;
         }
         let started_ns = crate::shim::boottime_ns();
@@ -190,6 +220,10 @@ impl SepData {
                 response = Secret(bytes);
             }
         }
+
+        // The correlated reply means the enclave has finished with both OOL
+        // buffers. Keep only the private response copy returned to the caller.
+        let _ = self.sks_zero_buffers();
 
         Some(SksOutcome { reply, response })
     }
@@ -325,6 +359,15 @@ impl SepData {
         self.sks_seal(&op, &body)
     }
 
+    fn sks_req_copy_keybag(&self, handle: crate::sks::KeyBagHandle) -> Result<SksRequest> {
+        let op = crate::sks::sks_copy_keybag();
+        let mut body = image::Body::new();
+        body.put_u32(0)?;
+        body.put_u64(crate::sks::SKS_CLIENT_ID)?;
+        body.put_i32(handle.value())?;
+        self.sks_seal(&op, &body)
+    }
+
     /// `0x02` copy the designated biometric identity bag.
     fn sks_req_copy_keybag_special(&self, handle: crate::sks::SpecialHandle) -> Result<SksRequest> {
         let op = crate::sks::sks_copy_keybag();
@@ -350,6 +393,107 @@ impl SepData {
             msg,
             img,
         })
+    }
+
+    fn sks_req_create_identity_keybag(
+        &self,
+        secret: &[u8],
+        uuid: &[u8; crate::sks::SKS_IDENTITY_UUID_LEN],
+        proof: keybag::NoStoredKeyBag,
+    ) -> Result<SksRequest> {
+        if proof.slot() != keybag::Slot::Identity {
+            return Err(EINVAL);
+        }
+        let mut body = image::Body::new();
+        body.put_u32(crate::sks::SKS_CREATE_VARIANT_IDENTITY)?;
+        body.put_u64(crate::sks::SKS_CLIENT_ID)?;
+        body.put_u32(crate::sks::CreateFlags::none().value())?;
+        body.put_i32(crate::sks::SpecialHandle::first_identity().value())?;
+        body.put_blob(secret)?;
+        body.put_blob(&[])?;
+        body.put_blob(uuid)?;
+        body.put_blob(&[])?;
+        body.put_u64(0)?;
+        body.put_u64(0)?;
+        body.put_blob(&[])?;
+        let img = image::build_request(image::Version::V1, self.sks_timestamp_us(), &body)?;
+        let len = self.sks_image_len(&img)?;
+        let msg = crate::sks::encode_sks_create(self.sks_next_seq(), len).ok_or(EINVAL)?;
+        Ok(SksRequest { name: crate::sks::SKS_CREATE_NAME, msg, img })
+    }
+
+    pub(crate) fn sks_provision_identity_keybag(&self) -> bool {
+        let proof = match keybag::read(keybag::Slot::Identity) {
+            Ok(keybag::State::Present(_)) => return true,
+            Ok(keybag::State::Absent(proof)) => proof,
+            Err(e) => {
+                dev_err!(self.dev, "sks: identity keybag state is ambiguous: {:?}\n", e);
+                return false;
+            }
+        };
+        let slot = proof.slot();
+        let mut intent = match KeybagCreateIntent::new(&self.dev, slot) {
+            Some(intent) => intent,
+            None => return false,
+        };
+        let mut secret_bytes = KVec::new();
+        if secret_bytes.resize(SKS_SECRET_LEN, 0, GFP_KERNEL).is_err()
+            || shim::random_bytes(&mut secret_bytes).is_err()
+        {
+            return false;
+        }
+        let secret = Secret(secret_bytes);
+        let mut uuid = [0u8; crate::sks::SKS_IDENTITY_UUID_LEN];
+        if shim::random_bytes(&mut uuid).is_err() {
+            return false;
+        }
+        uuid[6] = (uuid[6] & 0x0f) | 0x40;
+        uuid[8] = (uuid[8] & 0x3f) | 0x80;
+
+        let request = match self.sks_req_create_identity_keybag(&secret, &uuid, proof) {
+            Ok(request) => request,
+            Err(e) => {
+                dev_err!(self.dev, "sks: cannot build identity keybag request: {:?}\n", e);
+                return false;
+            }
+        };
+        intent.sending();
+        let Some(out) = self.sks_exchange(request.name, request.msg, &request.img) else {
+            return false;
+        };
+        let Some(body) = self.sks_report_response(crate::sks::SKS_CREATE_NAME, &out) else {
+            return false;
+        };
+        if out.reply.status != 0 || body.len() < 12 {
+            dev_err!(self.dev, "sks: CREATE_KEYBAG failed: mailbox {}, body {} bytes\n", out.reply.status, body.len());
+            return false;
+        }
+        let variant = u32::from_le_bytes(body[0..4].try_into().unwrap());
+        let raw_handle = i32::from_le_bytes(body[4..8].try_into().unwrap());
+        let Some((_fv_data, end)) = image::read_blob(body, 8) else {
+            return false;
+        };
+        if variant != crate::sks::SKS_CREATE_VARIANT_IDENTITY || raw_handle < 0 || end != body.len() {
+            dev_err!(self.dev, "sks: invalid CREATE_KEYBAG reply: variant {}, handle {}\n", variant, raw_handle);
+            return false;
+        }
+        let handle = crate::sks::KeyBagHandle::from_create_reply(raw_handle);
+        let Some(bag_uuid) = self.sks_read_uuid(handle) else {
+            return false;
+        };
+        let Some(out) = self.sks_send(self.sks_req_copy_keybag(handle)) else {
+            return false;
+        };
+        let Some(wrapped) = self.wrapped_from_copy_reply(&out, c"new identity keybag") else {
+            return false;
+        };
+        if let Err(e) = keybag::write_bag_uuid(slot, &wrapped, &bag_uuid, &secret) {
+            dev_err!(self.dev, "sks: cannot commit identity keybag: {:?}\n", e);
+            return false;
+        }
+        let _ = self.sks_send(self.sks_req_unload_keybag(handle));
+        dev_info!(self.dev, "sks: identity keybag provisioned\n");
+        true
     }
 
     pub(crate) fn sks_send(&self, req: Result<SksRequest>) -> Option<SksOutcome> {
@@ -499,16 +643,21 @@ impl SepData {
             return None;
         }
         if body.len() != SKS_LOAD_REPLY_LEN {
+            dev_warn!(self.dev, "sks: LOAD_KEYBAG returned {} bytes, expected {}\n", body.len(), SKS_LOAD_REPLY_LEN);
             return None;
         }
         let status = i32::from_le_bytes([body[0], body[1], body[2], body[3]]);
         let handle = i32::from_le_bytes([body[4], body[5], body[6], body[7]]);
         if status != 0 || handle < 0 {
+            dev_warn!(self.dev, "sks: LOAD_KEYBAG operation status {}, handle {}\n", status, handle);
             return None;
         }
         let handle = crate::sks::KeyBagHandle::from_load_reply(handle);
 
-        let uuid = self.sks_read_uuid(handle)?;
+        let Some(uuid) = self.sks_read_uuid(handle) else {
+            dev_warn!(self.dev, "sks: loaded keybag has no readable UUID\n");
+            return None;
+        };
 
         if uuid == *stored.uuid() {
             Some((handle, uuid))
@@ -636,11 +785,7 @@ impl SepData {
     }
 }
 
-const SKS_SELECTOR_MAX: u8 = 0x5f;
-
 pub(crate) const SKS_REPLY_BIT: u8 = 0x80;
-
-const OP_SKS_REWRAP_FORBIDDEN: u8 = 0x0f;
 
 pub(crate) struct SksOp {
     opcode: u8,
@@ -656,47 +801,57 @@ impl SksOp {
     }
 }
 
-const OP_SKS_DEVICE_STATE: u8 = 0x19;
-pub(crate) fn sks_get_device_state() -> SksOp {
-    SksOp {
-        opcode: OP_SKS_DEVICE_STATE,
-        name: c"GET_DEVICE_STATE",
-    }
-}
-
-const OP_SKS_GET_CONFIGURATION: u8 = 0x23;
-
-const OP_SKS_SET_CONFIGURATION: u8 = 0x24;
-static_assert!(OP_SKS_SET_CONFIGURATION != OP_SKS_GET_CONFIGURATION);
+const OP_SKS_UNWRAP_PFK: u8 = 0x09;
+pub(crate) const SKS_UNWRAP_PFK_NAME: &CStr = c"UNWRAP_PFK";
 
 const OP_SKS_NEW_PFK: u8 = 0x10;
-static_assert!(OP_SKS_NEW_PFK != 0x0f);
-static_assert!(OP_SKS_NEW_PFK != 0x09);
+pub(crate) const SKS_NEW_PFK_NAME: &CStr = c"NEW_PFK";
 
-// FileVault seal order: 0x42 KEK, then 0x40 VEK, then 0x41 install; 0x47 clear forbidden
-pub(crate) const OP_SKS_FV_NEW_VEK: u8 = 0x40;
-pub(crate) const OP_SKS_FV_UNWRAP_VEK: u8 = 0x41;
-pub(crate) const OP_SKS_FV_NEW_KEK: u8 = 0x42;
+const OP_SKS_UNWRAP_MEDIA_KEY: u8 = 0x32;
+pub(crate) const SKS_UNWRAP_MEDIA_KEY_NAME: &CStr = c"UNWRAP_MEDIA_KEY";
 
-const OP_SKS_GENERIC_OPERATION: u8 = 0x1a;
+const OP_SKS_UNWRAP_VEK: u8 = 0x41;
+pub(crate) const SKS_UNWRAP_VEK_NAME: &CStr = c"FV_UNWRAP_VEK";
+
+const OP_SKS_SET_PROTECTION: u8 = 0x47;
+pub(crate) const SKS_SET_PROTECTION_NAME: &CStr = c"FV_SET_PROTECTION";
+
+const OP_SKS_GET_BLOB_STATE: u8 = 0x48;
+pub(crate) const SKS_GET_BLOB_STATE_NAME: &CStr = c"FV_GET_BLOB_STATE";
+
 const OP_SKS_PERFORM_OPERATION: u8 = 0x22;
-const OP_SKS_IDENTITY_OPERATION: u8 = 0x51;
 pub(crate) const SKS_PERFORM_OP_NAME: &CStr = c"PERFORM_OPERATION";
-static_assert!(OP_SKS_PERFORM_OPERATION != OP_SKS_GET_CONFIGURATION);
-static_assert!(OP_SKS_PERFORM_OPERATION != OP_SKS_SET_CONFIGURATION);
 
 pub(crate) fn encode_sks_perform_operation(seq: Sequence, len: ImageLen) -> Option<Message> {
     let msg = encode_sks_raw(OP_SKS_PERFORM_OPERATION, seq.value(), len.value());
     Some(msg)
 }
 
-pub(crate) fn encode_sks_fv(selector: u8, seq: Sequence, len: ImageLen) -> Option<Message> {
-    let msg = encode_sks_raw(selector, seq.value(), len.value());
+pub(crate) fn encode_sks_unwrap_media_key(seq: Sequence, len: ImageLen) -> Option<Message> {
+    let msg = encode_sks_raw(OP_SKS_UNWRAP_MEDIA_KEY, seq.value(), len.value());
     Some(msg)
 }
-const OP_SKS_LAST_USER_OPERATION: u8 = 0x53;
-static_assert!(OP_SKS_LAST_USER_OPERATION != 0x56);
 
+pub(crate) fn encode_sks_unwrap_vek(seq: Sequence, len: ImageLen) -> Option<Message> {
+    let msg = encode_sks_raw(OP_SKS_UNWRAP_VEK, seq.value(), len.value());
+    Some(msg)
+}
+
+pub(crate) fn encode_sks_unwrap_pfk(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_UNWRAP_PFK, seq.value(), len.value())
+}
+
+pub(crate) fn encode_sks_new_pfk(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_NEW_PFK, seq.value(), len.value())
+}
+
+pub(crate) fn encode_sks_set_protection(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_SET_PROTECTION, seq.value(), len.value())
+}
+
+pub(crate) fn encode_sks_get_blob_state(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_GET_BLOB_STATE, seq.value(), len.value())
+}
 const OP_SKS_CAPABILITIES: u8 = 0x4d;
 pub(crate) fn sks_get_capabilities() -> SksOp {
     SksOp {
@@ -722,6 +877,21 @@ pub(crate) fn sks_copy_keybag() -> SksOp {
 }
 
 const OP_SKS_CREATE_KEYBAG: u8 = 0x01;
+pub(crate) const SKS_CREATE_NAME: &CStr = c"CREATE_KEYBAG";
+pub(crate) const SKS_CREATE_VARIANT_IDENTITY: u32 = 5;
+pub(crate) const SKS_IDENTITY_UUID_LEN: usize = 16;
+
+pub(crate) struct CreateFlags(u32);
+
+impl CreateFlags {
+    pub(crate) const fn none() -> Self {
+        Self(0)
+    }
+
+    pub(crate) const fn value(&self) -> u32 {
+        self.0
+    }
+}
 
 const OP_SKS_LOAD_KEYBAG: u8 = 0x03;
 
@@ -730,32 +900,6 @@ pub(crate) const SKS_LOAD_NAME: &CStr = c"LOAD_KEYBAG";
 const OP_SKS_CHANGE_LOCK_STATE: u8 = 0x04;
 
 pub(crate) const SKS_LOCK_STATE_NAME: &CStr = c"CHANGE_LOCK_STATE";
-
-const OP_SKS_TOKEN_CREATE: u8 = 0x1c;
-
-pub(crate) const SKS_TOKEN_CREATE_NAME: &CStr = c"AUTH_TOKEN_CREATE";
-
-const OP_SKS_TOKEN_VERIFY: u8 = 0x1d;
-
-static_assert!(OP_SKS_TOKEN_VERIFY == OP_SKS_TOKEN_CREATE + 1);
-
-#[derive(Clone, Copy)]
-pub(crate) struct NewDeviceState(i32);
-
-impl NewDeviceState {
-    pub(crate) const UNLOCKED: NewDeviceState = NewDeviceState(0);
-
-    pub(crate) const fn value(&self) -> i32 {
-        self.0
-    }
-}
-static_assert!(NewDeviceState::UNLOCKED.value() == 0);
-
-const OP_SKS_DEVICE_STATE_TRANSITION: u8 = 0x18;
-static_assert!(OP_SKS_DEVICE_STATE_TRANSITION + 1 == 0x19);
-
-pub(crate) const SKS_DEVICE_STATE_REPLY_LEN: usize = 20;
-static_assert!(SKS_DEVICE_STATE_REPLY_LEN == 4 + 8 + 8);
 
 const OP_SKS_VERIFY_SECRET: u8 = 0x21;
 pub(crate) const SKS_VERIFY_SECRET_NAME: &CStr = c"VERIFY_SECRET";
@@ -766,24 +910,17 @@ pub(crate) fn encode_sks_verify_secret(seq: Sequence, len: ImageLen) -> Option<M
     Some(msg)
 }
 
-pub(crate) const SKS_VERIFY_SECRET_REPLY_LEN: usize = 12;
-static_assert!(SKS_VERIFY_SECRET_REPLY_LEN == 4 + 8);
-
-const SKS_SELECTOR_BITS: u8 = 0x7f;
-
-static_assert!(SKS_SELECTOR_MAX <= SKS_SELECTOR_BITS);
-
 pub(crate) const SKS_CLIENT_ID: u64 = u64::from_be_bytes(*b"LINUXSKS");
 static_assert!(SKS_CLIENT_ID == 0x4c49_4e55_5853_4b53);
-
-pub(crate) const SKS_CLIENT_ID_SEALING: u64 = u64::from_be_bytes(*b"LINUXSLS");
-static_assert!(SKS_CLIENT_ID_SEALING == 0x4c49_4e55_5853_4c53);
-static_assert!(SKS_CLIENT_ID_SEALING != SKS_CLIENT_ID);
 
 #[derive(Clone, Copy)]
 pub(crate) struct KeyBagHandle(i32);
 
 impl KeyBagHandle {
+
+    pub(crate) const fn from_create_reply(v: i32) -> KeyBagHandle {
+        KeyBagHandle(v)
+    }
 
     pub(crate) const fn from_load_reply(v: i32) -> KeyBagHandle {
         KeyBagHandle(v)
@@ -797,20 +934,7 @@ impl KeyBagHandle {
 const OP_SKS_DESIGNATE_KEYBAG: u8 = 0x0d;
 
 pub(crate) const SKS_DESIGNATE_VARIANT: u32 = 1;
-
-pub(crate) const SKS_DESIGNATE_VARIANT_GENERIC: u32 = 0;
-
 static_assert!(SKS_DESIGNATE_VARIANT == 1);
-static_assert!(SKS_DESIGNATE_VARIANT_GENERIC == 0);
-static_assert!(SKS_DESIGNATE_VARIANT != SKS_DESIGNATE_VARIANT_GENERIC);
-
-pub(crate) const SKS_CREATE_VARIANT_IDENTITY: u32 = 5;
-static_assert!(SKS_CREATE_VARIANT_IDENTITY != 1);
-
-pub(crate) const SKS_IDENTITY_UUID_LEN: usize = 16;
-static_assert!(SKS_IDENTITY_UUID_LEN == crate::sbio::IDENTITY_UUID_LEN);
-
-pub(crate) const SKS_IDENTITY_USER_ID: i32 = 1000;
 
 pub(crate) const SKS_DESIGNATE_USER_MIN: i32 = 10;
 static_assert!(SKS_DESIGNATE_USER_MIN > 0);
@@ -836,46 +960,16 @@ impl DesignateUser {
 pub(crate) struct SpecialHandle(i32);
 
 impl SpecialHandle {
-}
+    pub(crate) const fn first_identity() -> SpecialHandle {
+        SpecialHandle(-1)
+    }
 
-impl SpecialHandle {
     pub(crate) const fn value(&self) -> i32 {
         self.0
     }
 }
 
 pub(crate) const SKS_AUTH_TOKEN_LEN: usize = 16;
-
-pub(crate) struct AuthToken([u8; SKS_AUTH_TOKEN_LEN]);
-
-impl AuthToken {
-    pub(crate) fn from_reply(body: &[u8]) -> Option<AuthToken> {
-        if body.len() < 8 {
-            return None;
-        }
-        let status = i32::from_le_bytes([body[0], body[1], body[2], body[3]]);
-        if status != 0 {
-            return None;
-        }
-        let len = u32::from_le_bytes([body[4], body[5], body[6], body[7]]) as usize;
-        if len != SKS_AUTH_TOKEN_LEN || body.len() < 8 + len {
-            return None;
-        }
-        let mut out = [0u8; SKS_AUTH_TOKEN_LEN];
-        out.copy_from_slice(&body[8..8 + len]);
-        Some(AuthToken(out))
-    }
-
-}
-
-impl Drop for AuthToken {
-    fn drop(&mut self) {
-        for b in self.0.iter_mut() {
-            // SAFETY: a valid, uniquely borrowed byte; volatile so the wipe is not elided.
-            unsafe { core::ptr::write_volatile(b, 0) };
-        }
-    }
-}
 
 pub(crate) struct Designation {
     source: KeyBagHandle,
@@ -899,43 +993,7 @@ impl Designation {
 pub(crate) const SKS_DESIGNATE_REPLY_LEN: usize = 4;
 
 pub(crate) const SKS_DESIGNATE_FLAGS: u64 = 0;
-pub(crate) const SKS_DESIGNATE_FLAGS_DEVICE_KEYBAG: u64 = 0x100;
 static_assert!(SKS_DESIGNATE_FLAGS == 0);
-static_assert!(SKS_DESIGNATE_FLAGS != SKS_DESIGNATE_FLAGS_DEVICE_KEYBAG);
-
-// keybag_flags sits at +0x64 in a 0x01 body
-pub(crate) struct CreateFlags(u32);
-
-pub(crate) const SKS_KEYBAG_FLAG_MAX: u32 = 0xff;
-static_assert!((SKS_KEYBAG_FLAG_MAX as u64) < SKS_DESIGNATE_FLAGS_DEVICE_KEYBAG);
-
-impl CreateFlags {
-    pub(crate) const fn new(bits: u32) -> Option<CreateFlags> {
-        if bits <= SKS_KEYBAG_FLAG_MAX {
-            Some(CreateFlags(bits))
-        } else {
-            None
-        }
-    }
-
-    pub(crate) const fn none() -> CreateFlags {
-        CreateFlags(0)
-    }
-
-    pub(crate) const fn value(&self) -> u32 {
-        self.0
-    }
-}
-
-static_assert!(CreateFlags::new(SKS_DESIGNATE_FLAGS_DEVICE_KEYBAG as u32).is_none());
-static_assert!(CreateFlags::new(0x100).is_none());
-static_assert!(CreateFlags::new(0x101).is_none());
-static_assert!(CreateFlags::new(0x1ff).is_none());
-static_assert!(CreateFlags::new(u32::MAX).is_none());
-static_assert!(CreateFlags::new(0x80).is_some());
-static_assert!(CreateFlags::none().value() == 0);
-
-// device keybag = 0x0d with a u64 flags of 0x100 at +0x78
 
 pub(crate) fn encode_sks_designate(seq: Sequence, len: ImageLen) -> Option<Message> {
     let msg = encode_sks_raw(OP_SKS_DESIGNATE_KEYBAG, seq.value(), len.value());
@@ -943,55 +1001,6 @@ pub(crate) fn encode_sks_designate(seq: Sequence, len: ImageLen) -> Option<Messa
 }
 
 pub(crate) const SKS_DESIGNATE_NAME: &CStr = c"DESIGNATE_KEYBAG";
-
-const OP_SKS_WRAP: u8 = 0x08;
-const OP_SKS_UNWRAP: u8 = 0x45;
-
-// 0x08/0x45 carry no keybag-handle field
-
-const OP_SKS_CHANGE_SECRET: u8 = 0x07;
-const OP_SKS_DRAIN_BACKUP_KEYS: u8 = 0x17;
-const OP_SKS_ESCROW_ENABLE: u8 = 0x29;
-const OP_SKS_ESCROW_CREATE: u8 = 0x13;
-const OP_SKS_ESCROW_PERSIST: u8 = 0x2b;
-// 0x13 reply is status only, no handle
-
-const OP_SKS_PUBLIC_BACKUP_HANDLE: u8 = 0x2d;
-const OP_SKS_UNLOAD_PUBLIC_BACKUP: u8 = 0x2e;
-
-static_assert!(SKS_DESIGNATE_FLAGS_DEVICE_KEYBAG == 0x100);
-static_assert!(SKS_DESIGNATE_FLAGS != SKS_DESIGNATE_FLAGS_DEVICE_KEYBAG);
-
-const OP_SKS_MAKE_BACKUP_BAG: u8 = 0x11;
-const OP_SKS_SET_BACKUP_BAG: u8 = 0x0e;
-const OP_SKS_BACKUP_WRAP: u8 = 0x54;
-const OP_SKS_BACKUP_UNWRAP: u8 = 0x55;
-
-pub(crate) const SKS_SET_BACKUP_NAME: &CStr = c"SET_BACKUP_BAG";
-
-pub(crate) fn encode_sks_set_backup_bag(seq: Sequence, len: ImageLen) -> Option<Message> {
-    let msg = encode_sks_raw(OP_SKS_SET_BACKUP_BAG, seq.value(), len.value());
-    Some(msg)
-}
-
-const OP_SKS_SET_ENV: u8 = 0x2a;
-
-pub(crate) const SKS_CLIENT_ID_ALT: u64 = u64::from_be_bytes(*b"LINUXSKT");
-static_assert!(SKS_CLIENT_ID_ALT != SKS_CLIENT_ID);
-static_assert!(SKS_CLIENT_ID_ALT != SKS_CLIENT_ID_SEALING);
-const fn client_id_byte_distance(a: u64, b: u64) -> u32 {
-    let (x, y) = (a.to_be_bytes(), b.to_be_bytes());
-    let mut differing = 0;
-    let mut i = 0;
-    while i < 8 {
-        if x[i] != y[i] {
-            differing += 1;
-        }
-        i += 1;
-    }
-    differing
-}
-static_assert!(client_id_byte_distance(SKS_CLIENT_ID, SKS_CLIENT_ID_ALT) == 1);
 
 const OP_SKS_UNLOAD_KEYBAG: u8 = 0x05;
 pub(crate) const SKS_UNLOAD_NAME: &CStr = c"UNLOAD_KEYBAG";
@@ -1016,29 +1025,8 @@ impl Sequence {
     }
 }
 
-pub(crate) const SEQ_SPACE: usize = 64;
-
-pub(crate) const SEQ_FIRST_REUSE: u8 = 32;
-
 static_assert!(Sequence::from_counter(0).value() != Sequence::from_counter(1).value());
-static_assert!(
-    Sequence::from_counter(0).value() == Sequence::from_counter(SEQ_FIRST_REUSE).value()
-);
-static_assert!(SEQ_SPACE == 64);
-
-const fn every_sequence_is_above_the_selector_range() -> bool {
-    let mut n = 0u8;
-    loop {
-        if Sequence::from_counter(n).value() <= SKS_SELECTOR_MAX {
-            return false;
-        }
-        if n == 0xff {
-            return true;
-        }
-        n += 1;
-    }
-}
-static_assert!(every_sequence_is_above_the_selector_range());
+static_assert!(Sequence::from_counter(0).value() == Sequence::from_counter(32).value());
 
 #[derive(Clone, Copy)]
 pub(crate) struct ImageLen(u16);
@@ -1078,13 +1066,12 @@ pub(crate) fn encode_sks_load(seq: Sequence, len: ImageLen) -> Option<Message> {
     Some(msg)
 }
 
-pub(crate) fn encode_sks_change_lock_state(seq: Sequence, len: ImageLen) -> Option<Message> {
-    let msg = encode_sks_raw(OP_SKS_CHANGE_LOCK_STATE, seq.value(), len.value());
-    Some(msg)
+pub(crate) fn encode_sks_create(seq: Sequence, len: ImageLen) -> Option<Message> {
+    Some(encode_sks_raw(OP_SKS_CREATE_KEYBAG, seq.value(), len.value()))
 }
 
-pub(crate) fn encode_sks_token_create(seq: Sequence, len: ImageLen) -> Option<Message> {
-    let msg = encode_sks_raw(OP_SKS_TOKEN_CREATE, seq.value(), len.value());
+pub(crate) fn encode_sks_change_lock_state(seq: Sequence, len: ImageLen) -> Option<Message> {
+    let msg = encode_sks_raw(OP_SKS_CHANGE_LOCK_STATE, seq.value(), len.value());
     Some(msg)
 }
 
@@ -1092,7 +1079,6 @@ pub(crate) struct SksReply {
     pub(crate) selector: u8,
     pub(crate) seq: u8,
     pub(crate) status: i8,
-    pub(crate) flags: u16,
     pub(crate) response_size: u16,
 }
 
@@ -1102,14 +1088,6 @@ pub(crate) fn decode_sks(msg: &Message) -> SksReply {
         selector: b[1] & !SKS_REPLY_BIT,
         seq: b[2],
         status: b[3] as i8,
-        flags: u16::from_le_bytes([b[4], b[5]]),
         response_size: u16::from_le_bytes([b[6], b[7]]),
     }
 }
-
-pub(crate) const SKS_STATUS_MALFORMED: i8 = -13;
-static_assert!(SKS_STATUS_MALFORMED as u8 == 0xf3);
-
-pub(crate) const SKS_STATUS_REFUSED: i8 = -19;
-static_assert!(SKS_STATUS_REFUSED != SKS_STATUS_MALFORMED);
-static_assert!(SKS_STATUS_REFUSED != 0);

@@ -3,8 +3,6 @@
 
 //! The SEP wire protocol, reverse-engineered: opcode tables, request encoders
 //! and reply decoders.
-#![allow(dead_code)]
-
 use kernel::prelude::*;
 use kernel::soc::apple::mailbox::Message;
 
@@ -14,7 +12,6 @@ pub(crate) const EP_SHMEM: u8 = 0xFE;
 pub(crate) const EP_BOOT: u8 = 0xFF;
 pub(crate) const EP_XARM: u8 = 0x13;
 pub(crate) const EP_SBIO: u8 = 0x08;
-pub(crate) const EP_XARS: u8 = 0x10;
 pub(crate) const EP_SCRD: u8 = 0x0a;
 pub(crate) const EP_SKS: u8 = 0x12;
 
@@ -106,8 +103,6 @@ pub(crate) fn fourcc(msg: &Message) -> Fourcc {
 
 pub(crate) const CONTROL_REPLY_TYPE: u8 = 0x01;
 
-pub(crate) const TAG_UNSOLICITED: u8 = 0x00;
-
 pub(crate) const TAG_ENTROPY: u8 = 0xE7;
 
 pub(crate) const CONTROL_TIMEOUT_MS: u32 = 2000;
@@ -115,7 +110,7 @@ pub(crate) const CONTROL_TIMEOUT_MS: u32 = 2000;
 pub(crate) const TAG_POOL_FIRST: u8 = 0x01;
 pub(crate) const TAG_POOL_LAST: u8 = 0x7e;
 
-static_assert!(TAG_POOL_FIRST > TAG_UNSOLICITED);
+static_assert!(TAG_POOL_FIRST > 0);
 static_assert!(TAG_POOL_LAST < TAG_ENTROPY);
 
 pub(crate) struct ControlOp {
@@ -209,24 +204,6 @@ fn op_ool(ty: u8, endpoint: u8, data: u32, name: &'static CStr) -> ControlOp {
     }
 }
 
-const OP_DMA_RING_PAGES: u8 = 0x19;
-const OP_DMA_RING_ADDR: u8 = 0x1a;
-
-pub(crate) const DMA_RING_PAGES: u32 = 4;
-
-pub(crate) fn op_dma_ring_pages(endpoint: u8, pages: u32) -> ControlOp {
-    op_ool(OP_DMA_RING_PAGES, endpoint, pages, c"RING_PAGES")
-}
-
-pub(crate) fn op_dma_ring_addr(endpoint: u8, iova: u64) -> ControlOp {
-    op_ool(
-        OP_DMA_RING_ADDR,
-        endpoint,
-        (iova >> IOVA_SHIFT) as u32,
-        c"RING_ADDR",
-    )
-}
-
 pub(crate) fn op_ool_inbound_size(endpoint: u8, len: u32) -> ControlOp {
     op_ool(OP_OOL_INBOUND_SIZE, endpoint, len, c"OOL_IN_SIZE")
 }
@@ -277,7 +254,11 @@ impl<'a> FieldCursor<'a> {
         let end = len_end.checked_add(len)?;
         let bytes = self.body.get(len_end..end)?;
         let pad = len.wrapping_neg() % 4;
-        self.at = end.checked_add(pad)?;
+        let next = end.checked_add(pad)?;
+        if self.body.get(end..next)?.iter().any(|byte| *byte != 0) {
+            return None;
+        }
+        self.at = next;
         Some(bytes)
     }
 }
@@ -286,7 +267,6 @@ impl<'a> FieldCursor<'a> {
 pub(crate) struct ControlReply {
     pub(crate) tag: u8,
     pub(crate) data_lo: u32,
-    pub(crate) msg1: u32,
 }
 
 impl ControlReply {
@@ -295,7 +275,6 @@ impl ControlReply {
         ControlReply {
             tag: f.tag,
             data_lo: f.data_lo,
-            msg1: msg.msg1,
         }
     }
 }

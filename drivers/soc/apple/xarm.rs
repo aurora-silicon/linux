@@ -1,18 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 // Copyright 2026 Dj
 
-//! The persistent-state service, `xarm`, endpoint `0x13`.
-
-#![allow(dead_code)]
-
-use crate::xarm::{XarmReply as Reply, XarmRequest as Request};
-use kernel::soc::apple::mailbox::Message;
 use crate::store::crc16_ccitt_false;
+use crate::xarm::{XarmReply as Reply, XarmRequest as Request};
 use crate::xart_store::{Key, Store, MAX_VALUE};
 use kernel::prelude::*;
+use kernel::soc::apple::mailbox::Message;
 
 pub(crate) use crate::proto::EP_XARM;
-pub(crate) use crate::proto::EP_XARS;
 
 const OP_ROOT_READ: u8 = 0x00;
 const OP_ROOT_WRITE: u8 = 0x01;
@@ -63,20 +58,6 @@ pub(crate) fn is_silent(opcode: u8) -> bool {
 
 pub(crate) fn needs_buffers(opcode: u8) -> bool {
     opcode != OP_QUERY_PROTECTED
-}
-
-pub(crate) fn opcode_name(opcode: u8) -> &'static CStr {
-    match opcode {
-        OP_ROOT_READ => c"ROOT_READ",
-        OP_ROOT_WRITE => c"ROOT_WRITE",
-        OP_SESSION_READ => c"SESSION_READ",
-        OP_SESSION_WRITE => c"SESSION_WRITE",
-        OP_SESSION_DELETE => c"SESSION_DELETE",
-        OP_QUERY_PROTECTED => c"QUERY_PROTECTED",
-        OP_GET_OS_UUID => c"GET_OS_UUID",
-        OP_NOTIFY_DISABLE_FIRST..=OP_NOTIFY_DISABLE_LAST => c"NOTIFY_DISABLE",
-        _ => c"UNKNOWN",
-    }
 }
 
 fn root_key(args: &[u8; 3]) -> Key {
@@ -290,11 +271,6 @@ pub(crate) fn service(
     }
 }
 
-pub(crate) fn make_uuid_v4(bytes: &mut [u8; 16]) {
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-}
-
 pub(crate) struct XarmRequest {
     pub(crate) tag: u8,
     pub(crate) opcode: u8,
@@ -337,24 +313,3 @@ pub(crate) fn encode_xarm_reply(reply: &XarmReply) -> Message {
 }
 
 static_assert!(EP_XARM == 0x13);
-
-const OP_XARS_SETUP_OS_SESSION: u8 = 0x08;
-
-const OP_XARS_FETCH_KNOWN_SESSIONS: u8 = 0x04;
-
-pub(crate) struct XarsReply {
-    pub(crate) tag: u8,
-    pub(crate) status: u8,
-}
-
-pub(crate) fn decode_xars_reply(msg: &Message) -> XarsReply {
-    let b = msg.msg0.to_le_bytes();
-    XarsReply {
-        tag: b[1],
-        status: b[2],
-    }
-}
-
-static_assert!(EP_XARS == 0x10);
-static_assert!(OP_XARS_SETUP_OS_SESSION == 0x08);
-static_assert!(OP_XARS_FETCH_KNOWN_SESSIONS == 0x04);

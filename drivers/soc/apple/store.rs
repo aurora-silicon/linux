@@ -24,10 +24,6 @@ pub(crate) struct Key {
 }
 
 impl Key {
-    pub(crate) const fn new(kind: u8, uuid: [u8; 16]) -> Key {
-        Key { kind, uuid }
-    }
-
     pub(crate) const fn root(kind: u8) -> Key {
         Key {
             kind,
@@ -60,14 +56,7 @@ impl Slot {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Intent {
     None,
-    Write {
-        slot: u16,
-        kind: u8,
-    },
-    Delete {
-        slot: u16,
-        kind: u8,
-    },
+    Write { slot: u16, kind: u8 },
 }
 
 const SB_MAGIC: usize = 0;
@@ -83,7 +72,6 @@ const SLOT_ENTRY_SIZE: usize = 24;
 
 const INTENT_NONE: u8 = 0;
 const INTENT_WRITE: u8 = 1;
-const INTENT_DELETE: u8 = 2;
 
 // Not internally locked; the caller holds a mutex around all access.
 pub(crate) struct Store {
@@ -195,7 +183,6 @@ impl Store {
         let (ikind, islot, itype) = match intent {
             Intent::None => (INTENT_NONE, 0u16, 0u8),
             Intent::Write { slot, kind } => (INTENT_WRITE, slot, kind),
-            Intent::Delete { slot, kind } => (INTENT_DELETE, slot, kind),
         };
         sb[SB_INTENT_KIND] = ikind;
         sb[SB_INTENT_SLOT..SB_INTENT_SLOT + 2].copy_from_slice(&islot.to_le_bytes());
@@ -277,27 +264,6 @@ impl Store {
         self.generation = self.generation.wrapping_add(1);
         self.commit()
     }
-
-    pub(crate) fn delete(&mut self, key: &Key) -> Result<bool> {
-        if !(0xf0..=0xf5).contains(&key.kind) {
-            return Err(EINVAL);
-        }
-        let Some(idx) = self.find(key) else {
-            return Ok(false);
-        };
-
-        self.write_superblock(Intent::Delete {
-            slot: idx as u16,
-            kind: key.kind,
-        })?;
-        self.file.sync()?;
-
-        self.slots[idx] = Slot::FREE;
-        self.generation = self.generation.wrapping_add(1);
-        self.commit()?;
-        Ok(true)
-    }
-
 }
 
 pub(crate) const fn crc16_ccitt_false(data: &[u8]) -> u16 {

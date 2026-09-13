@@ -3,12 +3,10 @@
 
 //! SEP credential endpoint (SCRD, EP 0x0a) wire protocol.
 
-#![allow(dead_code)]
-
-use kernel::prelude::*;
-use kernel::soc::apple::mailbox::Message;
 use crate::proto::*;
 use crate::sks::SKS_AUTH_TOKEN_LEN;
+use kernel::prelude::*;
+use kernel::soc::apple::mailbox::Message;
 
 pub(crate) const SCRD_ACM_HANDLE_LEN: usize = SKS_AUTH_TOKEN_LEN;
 
@@ -24,8 +22,6 @@ const SCRD_CMD_VERIFY_POLICY: u8 = 0x03;
 const SCRD_INIT_LOG_LEVEL: u8 = 0x28;
 
 const SCRD_POLICY_TOUCHID_ENROLLMENT: &[u8] = b"TouchIdEnrollment";
-
-pub(crate) const SCRD_CONTEXT_CREATE_REPLY_LEN: usize = SCRD_ACM_HANDLE_LEN + 1 + 4;
 
 const SCRD_MAX_LOGICAL: usize = 64;
 static_assert!(

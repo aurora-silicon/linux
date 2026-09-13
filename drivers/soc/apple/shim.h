@@ -18,6 +18,11 @@
 
 #include <linux/types.h>
 
+struct apple_sep_fv_new_file_key;
+
+void sep_cancel_work_sync(void *work);
+void sep_cancel_delayed_work_sync(void *work);
+
 /* -- hwrng_shim.c ------------------------------------------------------- */
 
 void *sep_hwrng_alloc(void);
@@ -48,6 +53,8 @@ int sep_sha256(const void *a, size_t alen, const void *b, size_t blen,
 
 /* -- crypto_shim.c ------------------------------------------------------ */
 
+int sep_random_bytes(void *buf, size_t len);
+
 /* HMAC-SHA256 over one message, 32 bytes out. */
 int sep_hmac_sha256(const void *key, size_t keylen,
 			   const void *data, size_t datalen, u8 *out);
@@ -61,12 +68,40 @@ int sep_gcm(int encrypt, const void *key, size_t keylen,
 		   const void *iv, size_t ivlen, size_t aadlen,
 		   void *buf, size_t buflen, size_t datalen);
 
-/*
- * Fill `buf` from the kernel CSPRNG, seeded, or fail. For key-bag secrets only;
- * anything measuring the enclave's own entropy (0x59 device-key probe,
- * /dev/hwrng) stays on SEP.
- */
-int sep_random_bytes(void *buf, size_t len);
+/* -- fv_shim.c -------------------------------------------------------- */
+
+struct apple_sep_fv_key;
+
+struct sep_fv_ops {
+	int (*unwrap_media_key)(void *context, const u8 *wrapped,
+				size_t wrapped_len, u32 protection_class,
+				struct apple_sep_fv_key *key);
+	int (*unwrap_volume_key)(void *context, const u8 *secret,
+				 size_t secret_len, const u8 *unlock_record,
+				 size_t unlock_record_len, const u8 *volume_key,
+				 size_t volume_key_len,
+				 struct apple_sep_fv_key *key);
+	int (*load_class_keys)(void *context, const u8 volume_uuid[16],
+			       const u8 *secret,
+			       size_t secret_len, const u8 *unlock_record,
+			       size_t unlock_record_len, const u8 *volume_key,
+			       size_t volume_key_len);
+	int (*unload_class_keys)(void *context, const u8 volume_uuid[16],
+				 const u8 *volume_key,
+				 size_t volume_key_len);
+	int (*unwrap_file_key)(void *context, const u8 volume_uuid[16],
+			       u32 protection_class, const u8 *wrapped_ekwk,
+			       size_t wrapped_ekwk_len, const u8 *wrapped_ek,
+			       size_t wrapped_ek_len,
+			       struct apple_sep_fv_key *key);
+	int (*new_file_key)(void *context, const u8 volume_uuid[16],
+			    u32 protection_class, u64 crypto_id,
+			    u16 key_revision,
+			    struct apple_sep_fv_new_file_key *key);
+};
+
+int sep_fv_register_v2(void *context, const struct sep_fv_ops *ops);
+void sep_fv_unregister_v2(void *context);
 
 /* -- p256_shim.c ------------------------------------------------------- */
 

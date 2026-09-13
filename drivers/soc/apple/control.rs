@@ -28,8 +28,6 @@ impl Slot {
 
 struct EntropySink {
     value: Option<u32>,
-    msg1: u32,
-    unclaimed: u32,
     busy: bool,
 }
 
@@ -44,11 +42,7 @@ pub(crate) struct ControlState {
     next_tag: u8,
     retired: [u64; 4],
     retired_count: u32,
-    // SEP-initiated messages (type != 0x01).
-    unsolicited: u32,
     entropy: EntropySink,
-    // After the persistent-state exchange the SEP parks this endpoint; refuse rather than time out.
-    closed: bool,
 }
 
 impl ControlState {
@@ -58,14 +52,10 @@ impl ControlState {
             next_tag: proto::TAG_POOL_FIRST,
             retired: [0; 4],
             retired_count: 0,
-            unsolicited: 0,
             entropy: EntropySink {
                 value: None,
-                msg1: 0,
-                unclaimed: 0,
                 busy: false,
             },
-            closed: false,
         }
     }
 
@@ -80,14 +70,20 @@ impl ControlState {
         }
     }
 
+    fn reclaim_retired(&mut self, tag: u8) -> bool {
+        if !self.is_retired(tag) {
+            return false;
+        }
+        self.retired[(tag >> 6) as usize] &= !(1u64 << (tag & 0x3f));
+        self.retired_count -= 1;
+        true
+    }
+
     fn tag_in_flight(&self, tag: u8) -> bool {
         self.slots.iter().any(|s| s.used && s.tag == tag)
     }
 
     pub(crate) fn alloc(&mut self) -> Result<(usize, u8)> {
-        if self.closed {
-            return Err(EPIPE);
-        }
         let idx = self.slots.iter().position(|s| !s.used).ok_or(EBUSY)?;
 
         for _ in 0..POOL_LEN {
@@ -132,11 +128,7 @@ impl ControlState {
     pub(crate) fn deliver(&mut self, reply: proto::ControlReply) -> Delivery {
         // The reserved entropy tag is claimed first, outstanding request or not.
         if reply.tag == proto::TAG_ENTROPY {
-            if self.entropy.value.is_some() {
-                self.entropy.unclaimed = self.entropy.unclaimed.wrapping_add(1);
-            }
             self.entropy.value = Some(reply.data_lo);
-            self.entropy.msg1 = reply.msg1;
             return Delivery::Entropy;
         }
 
@@ -149,31 +141,25 @@ impl ControlState {
             return Delivery::Matched;
         }
 
+        if self.reclaim_retired(reply.tag) {
+            return Delivery::Unmatched;
+        }
+
         // No match: drop it, never hand it to another waiter.
         Delivery::Unmatched
     }
 
-    pub(crate) fn note_unsolicited(&mut self) -> u32 {
-        self.unsolicited = self.unsolicited.wrapping_add(1);
-        self.unsolicited
-    }
-
     pub(crate) fn entropy_begin(&mut self) -> Result<()> {
-        if self.closed {
-            return Err(EPIPE);
-        }
         if self.entropy.busy {
             return Err(EBUSY);
         }
         self.entropy.busy = true;
-        if self.entropy.value.take().is_some() {
-            self.entropy.unclaimed = self.entropy.unclaimed.wrapping_add(1);
-        }
+        self.entropy.value = None;
         Ok(())
     }
 
-    pub(crate) fn entropy_take(&mut self) -> Option<(u32, u32)> {
-        self.entropy.value.take().map(|v| (v, self.entropy.msg1))
+    pub(crate) fn entropy_take(&mut self) -> Option<u32> {
+        self.entropy.value.take()
     }
 
     pub(crate) fn entropy_end(&mut self) {

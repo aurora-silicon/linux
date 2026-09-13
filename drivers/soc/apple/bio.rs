@@ -705,6 +705,7 @@ fn verify_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
             nonce: request.nonce,
             terminal: Some(VerifyOutcome::NoMatch),
         };
+        ctx.session.unseen = true;
         return Ok(Handled {
             ret: 0,
             wake: true,
@@ -853,9 +854,7 @@ fn delete(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
 
     // `0x57` takes one `identity_v1_t` (signed user id + 16-byte UUID).
     let Some(identity) = ctx.index.identity_v1_for(&request.uuid, ENROL_USER_ID) else {
-        pr_warn!(
-            "sep_bio: DELETE of a held identity could not be expressed as an identity_v1_t\n"
-        );
+        pr_warn!("sep_bio: DELETE of a held identity could not be expressed as an identity_v1_t\n");
         return Err(ENOENT);
     };
 
@@ -873,9 +872,7 @@ fn delete_all(ctx: &mut Context<'_>) -> Result<Handled> {
     require_admin()?;
 
     if ctx.index.total() == 0 {
-        pr_info!(
-            "sep_bio: DELETE_ALL on empty index; reporting success (nothing to delete)\n"
-        );
+        pr_info!("sep_bio: DELETE_ALL on empty index; reporting success (nothing to delete)\n");
         return ok();
     }
 

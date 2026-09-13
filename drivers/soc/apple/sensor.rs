@@ -111,14 +111,10 @@ static_assert!(STATUS_AT + STATUS_LEN == STATUS_XFER_LEN);
 // Offsets index the 16-byte status, not the 23-byte transfer.
 const STATUS_STATE: usize = STATUS_AT + 7;
 const STATUS_COUNT: usize = STATUS_AT + 12;
-const STATUS_STATE_TRANSFER_REL: usize = 7;
-const STATUS_COUNT_TRANSFER_REL: usize = 12;
 
 static_assert!(STATUS_STATE == 14);
 static_assert!(STATUS_COUNT == 19);
 static_assert!(STATUS_COUNT + 4 == STATUS_XFER_LEN);
-static_assert!(STATUS_STATE != STATUS_STATE_TRANSFER_REL);
-static_assert!(STATUS_COUNT != STATUS_COUNT_TRANSFER_REL);
 static_assert!(STATUS_STATE >= STATUS_AT && STATUS_STATE < STATUS_AT + STATUS_LEN);
 static_assert!(STATUS_COUNT >= STATUS_AT && STATUS_COUNT + 4 <= STATUS_AT + STATUS_LEN);
 
@@ -251,11 +247,10 @@ fn send_framed(frame_type: u8, payload: &[u8]) -> Result<()> {
     check(unsafe { sep_sensor_xfer_tx(frame.as_ptr().cast(), total) })
 }
 
-const ENCRYPTED_DECLARED_MAX: usize = 0x12c;
 const ENCRYPTED_OVERHEAD: usize = FRAME_HEADER + CRC_LEN;
 static_assert!(ENCRYPTED_OVERHEAD == 9);
 const ENCRYPTED_TRANSFER_MAX: usize = 0x12b;
-static_assert!(ENCRYPTED_TRANSFER_MAX < ENCRYPTED_DECLARED_MAX);
+static_assert!(ENCRYPTED_TRANSFER_MAX < 0x12c);
 
 pub(crate) struct Geometry {
     declared: usize,
@@ -293,14 +288,14 @@ impl Geometry {
     }
 }
 
-static_assert!(Geometry::MODULE_CHALLENGE.declared < ENCRYPTED_DECLARED_MAX);
+static_assert!(Geometry::MODULE_CHALLENGE.declared < 0x12c);
 static_assert!(Geometry::MODULE_CHALLENGE.declared > ENCRYPTED_OVERHEAD);
 static_assert!(Geometry::MODULE_CHALLENGE.transfer >= Geometry::MODULE_CHALLENGE.declared);
 static_assert!(Geometry::MODULE_CHALLENGE.transfer <= ENCRYPTED_TRANSFER_MAX);
 static_assert!(Geometry::MODULE_CHALLENGE.payload_capacity() == 0x40);
-static_assert!(Geometry::COVERAGE.declared < ENCRYPTED_DECLARED_MAX);
-static_assert!(Geometry::OPERATION.declared < ENCRYPTED_DECLARED_MAX);
-static_assert!(Geometry::TRANSPARENT.declared < ENCRYPTED_DECLARED_MAX);
+static_assert!(Geometry::COVERAGE.declared < 0x12c);
+static_assert!(Geometry::OPERATION.declared < 0x12c);
+static_assert!(Geometry::TRANSPARENT.declared < 0x12c);
 static_assert!(Geometry::COVERAGE.declared > ENCRYPTED_OVERHEAD);
 static_assert!(Geometry::OPERATION.declared > ENCRYPTED_OVERHEAD);
 static_assert!(Geometry::TRANSPARENT.declared > ENCRYPTED_OVERHEAD);

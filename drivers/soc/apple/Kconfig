@@ -97,6 +97,9 @@ config APPLE_AOP
 
 	  Say 'y' here if you have an Apple laptop.
 
+config APPLE_SEP_FV_INTERFACE
+	bool
+
 config APPLE_SEP
 	tristate "Apple SEP (Secure Enclave Processor)"
 	depends on ARCH_APPLE
@@ -109,6 +112,7 @@ config APPLE_SEP
 	select CRYPTO_AES
 	select CRYPTO_GCM
 	select CRYPTO_ECDH
+	select APPLE_SEP_FV_INTERFACE
 	help
 	  Driver for the Apple SEP (Secure Enclave Processor) on Apple silicon.
 	  It drives the Touch ID fingerprint sensor over a /dev/sep-bio character

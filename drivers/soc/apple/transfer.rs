@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 // Copyright 2026 Dj
 
-//! The generic transfer layer.
-
 use kernel::prelude::*;
 
 pub(crate) const MARKER_FIRST: u8 = 0xFC;
@@ -140,7 +138,6 @@ struct Active {
 }
 
 pub(crate) struct Completed {
-    pub(crate) opcode: u32,
     pub(crate) status: DeviceStatus,
     pub(crate) payload: KVec<u8>,
 }
@@ -169,10 +166,10 @@ pub(crate) enum Progress {
     Complete,
     /// A stray chunk, dropped without touching transfer state — distinct from
     /// `Failed`, which kills the transfer.
-    Ignored(&'static CStr),
+    Ignored,
     Grant,
-    Notification { tag: u8, opcode: u32 },
-    Failed(&'static CStr),
+    Notification,
+    Failed,
 }
 
 pub(crate) struct Reassembly {
@@ -206,10 +203,6 @@ impl Reassembly {
         Ok(())
     }
 
-    pub(crate) fn awaiting(&self) -> Option<u32> {
-        self.active.as_ref().map(|a| a.opcode)
-    }
-
     pub(crate) fn begin_send(&mut self, opcode: u32) {
         self.sending = Some(opcode);
         self.grants = 0;
@@ -237,9 +230,8 @@ impl Reassembly {
     }
 
     pub(crate) fn abort_with(&mut self, status: DeviceStatus) {
-        if let Some(active) = self.active.take() {
+        if self.active.take().is_some() {
             self.done = Some(Completed {
-                opcode: active.opcode,
                 status,
                 payload: KVec::new(),
             });
@@ -252,10 +244,7 @@ impl Reassembly {
 
     pub(crate) fn on_chunk(&mut self, marker: u8, packet: &Packet, payload: &[u8]) -> Progress {
         if marker < MARKER_FIRST {
-            return Progress::Notification {
-                tag: marker,
-                opcode: packet.opcode,
-            };
+            return Progress::Notification;
         }
 
         // 0xFE is flow control for the request being sent, answered from `sending`.
@@ -266,12 +255,12 @@ impl Reassembly {
                     self.grants = self.grants.saturating_add(1);
                     Progress::Grant
                 }
-                None => Progress::Ignored(c"a 0xFE arrived with nothing being sent"),
+                None => Progress::Ignored,
             };
         }
 
         let Some(active_opcode) = self.active.as_ref().map(|a| a.opcode) else {
-            return Progress::Ignored(c"no transfer outstanding");
+            return Progress::Ignored;
         };
 
         // Checked before the opcode test below, deliberately.
@@ -287,34 +276,34 @@ impl Reassembly {
 
         // The device echoes the opcode on a data chunk.
         if packet.opcode != active_opcode {
-            return Progress::Ignored(c"chunk belongs to a different opcode");
+            return Progress::Ignored;
         }
 
         if packet.version != VERSION {
             self.fail();
-            return Progress::Failed(c"header version is not 1");
+            return Progress::Failed;
         }
         if packet.chunk as usize != payload.len() {
             self.fail();
-            return Progress::Failed(c"chunk length disagrees with the payload taken");
+            return Progress::Failed;
         }
         if packet.total > MAX_TRANSACTION {
             self.fail();
-            return Progress::Failed(c"total length exceeds the maximum transaction size");
+            return Progress::Failed;
         }
 
         match marker {
             MARKER_FIRST => {
                 let Some(active) = self.active.as_ref() else {
-                    return Progress::Ignored(c"transfer vanished");
+                    return Progress::Ignored;
                 };
                 if !active.payload.is_empty() {
                     self.fail();
-                    return Progress::Failed(c"second first-chunk for one transfer");
+                    return Progress::Failed;
                 }
                 if packet.offset != 0 {
                     self.fail();
-                    return Progress::Failed(c"first chunk is not at offset zero");
+                    return Progress::Failed;
                 }
                 if let Some(active) = self.active.as_mut() {
                     active.total = packet.total;
@@ -322,25 +311,25 @@ impl Reassembly {
             }
             MARKER_NEXT => {
                 let Some(active) = self.active.as_ref() else {
-                    return Progress::Ignored(c"transfer vanished");
+                    return Progress::Ignored;
                 };
                 if packet.offset as usize != active.payload.len() {
                     self.fail();
-                    return Progress::Failed(c"continuation chunk is not at the expected offset");
+                    return Progress::Failed;
                 }
                 if packet.total != active.total {
                     self.fail();
-                    return Progress::Failed(c"continuation chunk changed the total length");
+                    return Progress::Failed;
                 }
             }
             _ => {
                 self.fail();
-                return Progress::Failed(c"unexpected marker at or above 0xFC");
+                return Progress::Failed;
             }
         }
 
         let Some(active) = self.active.as_mut() else {
-            return Progress::Ignored(c"transfer vanished");
+            return Progress::Ignored;
         };
 
         if packet.err != 0 {
@@ -356,7 +345,7 @@ impl Reassembly {
             .is_err()
         {
             self.fail();
-            return Progress::Failed(c"out of memory reassembling");
+            return Progress::Failed;
         }
 
         let received = active.payload.len() as u32;
@@ -378,12 +367,7 @@ impl Reassembly {
     }
 
     fn finish(&mut self, status: DeviceStatus, payload: KVec<u8>) {
-        let opcode = self.active.as_ref().map_or(0, |a| a.opcode);
         self.active = None;
-        self.done = Some(Completed {
-            opcode,
-            status,
-            payload,
-        });
+        self.done = Some(Completed { status, payload });
     }
 }

@@ -48,21 +48,11 @@ pub(crate) fn sha256(bytes: &[u8]) -> Result<[u8; SHA256_LEN]> {
 
 const OFF_VERSION: usize = 0x10;
 const OFF_TIMESTAMP: usize = 0x14;
-const OFF_FLAGS: usize = 0x1c;
-const OFF_RESERVED: usize = 0x20;
-const OFF_PROC_ID: usize = 0x28;
-const OFF_PID: usize = 0x30;
-const OFF_CDHASH: usize = 0x34;
 const OFF_TRAILER: usize = 0x48;
 
 static_assert!(OFF_VERSION == DIGEST_OFF + DIGEST_LEN);
 static_assert!(OFF_TIMESTAMP == OFF_VERSION + 4);
-static_assert!(OFF_FLAGS == OFF_TIMESTAMP + 8);
-static_assert!(OFF_RESERVED == OFF_FLAGS + 4);
-static_assert!(OFF_PROC_ID == OFF_RESERVED + 8);
-static_assert!(OFF_PID == OFF_PROC_ID + 8);
-static_assert!(OFF_CDHASH == OFF_PID + 4);
-static_assert!(OFF_TRAILER == OFF_CDHASH + 20);
+static_assert!(OFF_TRAILER == OFF_TIMESTAMP + 8 + 4 + 8 + 8 + 4 + 20);
 static_assert!(OFF_TRAILER + 8 == HEADER_SIZE as usize);
 static_assert!(HEADER_WIRE == 4 + HEADER_SIZE as usize);
 
@@ -87,6 +77,14 @@ impl Version {
 
 pub(crate) struct Body {
     bytes: KVec<u8>,
+}
+
+pub(crate) fn wipe(bytes: &mut [u8]) {
+    for byte in bytes {
+        // SAFETY: `byte` is uniquely borrowed and valid. A volatile write keeps
+        // the compiler from eliding destruction of request secrets.
+        unsafe { core::ptr::write_volatile(byte, 0) };
+    }
 }
 
 impl Body {
@@ -125,6 +123,12 @@ impl Body {
     }
 }
 
+impl Drop for Body {
+    fn drop(&mut self) {
+        wipe(&mut self.bytes);
+    }
+}
+
 const fn pad_of(len: usize) -> usize {
     len.wrapping_neg() % 4
 }
@@ -148,12 +152,19 @@ impl RequestImage {
     }
 }
 
+impl Drop for RequestImage {
+    fn drop(&mut self) {
+        wipe(&mut self.bytes);
+    }
+}
+
 pub(crate) fn build_request(
     version: Version,
     timestamp_us: u64,
     body: &Body,
 ) -> Result<RequestImage> {
-    let mut bytes = KVec::new();
+    let mut image = RequestImage { bytes: KVec::new() };
+    let bytes = &mut image.bytes;
     bytes.extend_from_slice(&HEADER_SIZE.to_le_bytes(), GFP_KERNEL)?;
 
     let header_at = bytes.len();
@@ -164,8 +175,8 @@ pub(crate) fn build_request(
     let put = |bytes: &mut KVec<u8>, off: usize, src: &[u8]| {
         bytes[header_at + off..header_at + off + src.len()].copy_from_slice(src);
     };
-    put(&mut bytes, OFF_VERSION, &version.wire().to_le_bytes());
-    put(&mut bytes, OFF_TIMESTAMP, &timestamp_us.to_le_bytes());
+    put(bytes, OFF_VERSION, &version.wire().to_le_bytes());
+    put(bytes, OFF_TIMESTAMP, &timestamp_us.to_le_bytes());
     // Flags, reserved, proc_id, pid, cdhash and trailer stay zero; the enclave accepts that.
 
     bytes.extend_from_slice(body.as_slice(), GFP_KERNEL)?;
@@ -195,7 +206,7 @@ pub(crate) fn build_request(
     bytes[header_at + DIGEST_OFF..header_at + DIGEST_OFF + DIGEST_LEN]
         .copy_from_slice(&digest[..DIGEST_LEN]);
 
-    Ok(RequestImage { bytes })
+    Ok(image)
 }
 
 pub(crate) struct ResponseImage<'a> {
@@ -232,7 +243,11 @@ pub(crate) fn read_blob(body: &[u8], off: usize) -> Option<(&[u8], usize)> {
     if body.len() < end {
         return None;
     }
-    Some((&body[len_end..end], end + pad_of(len)))
+    let next = end.checked_add(pad_of(len))?;
+    if body.get(end..next)?.iter().any(|byte| *byte != 0) {
+        return None;
+    }
+    Some((&body[len_end..end], next))
 }
 
 pub(crate) fn operation_status(body: &[u8]) -> Option<i32> {

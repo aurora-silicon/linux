@@ -7,16 +7,25 @@
 #include <linux/string.h>
 #include <linux/scatterlist.h>
 #include <linux/crypto.h>
+#include <linux/random.h>
 #include <crypto/hash.h>
 #include <crypto/sha2.h>
 #include <crypto/aead.h>
 #include <crypto/aes.h>
-#include <linux/random.h>
-#include <linux/sched.h>
 
 #include "shim.h"
 
 #define SEP_GCM_TAG_LEN 16
+
+int sep_random_bytes(void *buf, size_t len)
+{
+	int ret = wait_for_random_bytes();
+
+	if (ret)
+		return ret;
+	get_random_bytes(buf, len);
+	return 0;
+}
 
 /*
  * AES-GCM with a 16-byte (non-96-bit) IV, over the raw AES block cipher. The
@@ -174,21 +183,6 @@ static int sep_gcm16(int encrypt, const void *key, size_t keylen,
 	return rc;
 }
 
-/*
- * Fills `buf` from the kernel CSPRNG, waiting for the seed first so it never
- * returns unseeded bytes. Host-side entropy for key-bag secrets the host must
- * reproduce; anything measuring the enclave's own entropy stays on SEP.
- */
-int sep_random_bytes(void *buf, size_t len)
-{
-	int ret = wait_for_random_bytes();
-
-	if (ret)
-		return ret;
-	get_random_bytes(buf, len);
-	return 0;
-}
-
 /* HMAC-SHA256 over one message; writes 32 bytes to `out`, untouched on error. */
 int sep_hmac_sha256(const void *key, size_t keylen,
 			   const void *data, size_t datalen, u8 *out)
@@ -242,7 +236,6 @@ int sep_gcm(int encrypt, const void *key, size_t keylen,
 	    (ivlen != 12 && ivlen != 16) || ivlen > sizeof(ivcopy))
 		return -EINVAL;
 
-	/* The whole AAD-plus-payload-plus-tag extent must be inside the buffer. */
 	if (aadlen + datalen + SEP_GCM_TAG_LEN < aadlen ||
 	    aadlen + datalen + SEP_GCM_TAG_LEN > buflen)
 		return -EINVAL;

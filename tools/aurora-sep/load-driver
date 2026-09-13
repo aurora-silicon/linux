@@ -1,0 +1,40 @@
+#!/bin/sh
+set -eu
+
+keybag=/var/lib/aurora-sep-keybag.bin
+refkey=/var/lib/aurora-sep-refkey.bin
+
+modprobe apple_sep xart_writes=1 provision_keybag=1
+
+work=$(mktemp -d /run/aurora-sep-load.XXXXXX)
+cleanup() {
+    case "$work" in
+        /run/aurora-sep-load.*) rm -rf -- "$work" ;;
+    esac
+}
+trap cleanup EXIT HUP INT TERM
+
+keyctl new_session aurora-sep-load >/dev/null
+attempts=300
+verified=false
+while [ "$attempts" -gt 0 ]; do
+    key_id=$(printf 'new 32' | keyctl padd trusted aurora-sep-check @s 2>/dev/null || true)
+    if [ -n "$key_id" ]; then
+        if keyctl pipe "$key_id" >"$work/sealed"; then
+            { printf 'load '; tr -d '\n\r ' <"$work/sealed"; } >"$work/load"
+            loaded_id=$(keyctl padd trusted aurora-sep-load-check @s <"$work/load" 2>/dev/null || true)
+            if [ -n "$loaded_id" ]; then
+                keyctl revoke "$loaded_id" >/dev/null 2>&1 || true
+                verified=true
+            fi
+        fi
+        keyctl revoke "$key_id" >/dev/null 2>&1 || true
+    fi
+    [ "$verified" = true ] && break
+    sleep 0.1
+    attempts=$((attempts - 1))
+done
+
+[ "$verified" = true ] || exit 1
+[ -s "$keybag" ] || exit 1
+[ -s "$refkey" ] || exit 1

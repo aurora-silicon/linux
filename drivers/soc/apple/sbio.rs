@@ -3,8 +3,6 @@
 //! Touch ID: the biometric endpoint (SBIO) and its `/dev/sep-bio` interface.
 //! The enclave matches; no biometric image ever crosses to userspace.
 
-#![allow(dead_code)]
-
 use super::*;
 use kernel::prelude::*;
 use kernel::soc::apple::mailbox::Message;
@@ -107,12 +105,10 @@ impl SepData {
     }
 
     fn stash_enrol_identity(&self, record: &[u8]) {
-        let mut found: KVec<([u8; bio::UUID_LEN], u32)> = KVec::new();
-        crate::sbio::enrol_identity_candidates(record, SBIO_PROBE_USER_ID, |at, uuid| {
-            let _ = found.push((uuid, at as u32), GFP_KERNEL);
+        let mut found: KVec<[u8; bio::UUID_LEN]> = KVec::new();
+        crate::sbio::enrol_identity_candidates(record, SBIO_PROBE_USER_ID, |_at, uuid| {
+            let _ = found.push(uuid, GFP_KERNEL);
         });
-        for (_uuid, _at) in found.iter() {
-        }
         *self.enrol_identity_candidates.lock() = found;
     }
 
@@ -120,27 +116,31 @@ impl SepData {
         let candidates = core::mem::take(&mut *self.enrol_identity_candidates.lock());
         let listed = self.enclave_identities_for(SBIO_PROBE_USER_ID)?;
 
-        let mut confirmed: KVec<([u8; bio::UUID_LEN], u32)> = KVec::new();
-        for (uuid, at) in candidates.iter() {
-            if listed.iter().any(|u| u == uuid) && !confirmed.iter().any(|(u, _)| u == uuid) {
-                if confirmed.push((*uuid, *at), GFP_KERNEL).is_err() {
+        let mut confirmed: KVec<[u8; bio::UUID_LEN]> = KVec::new();
+        for uuid in candidates.iter() {
+            if listed.iter().any(|u| u == uuid) && !confirmed.iter().any(|u| u == uuid) {
+                if confirmed.push(*uuid, GFP_KERNEL).is_err() {
                     break;
                 }
             }
         }
 
-        match confirmed.len() {
-            1 => {
-                let (uuid, _at) = confirmed[0];
-                Some(uuid)
-            }
-            0 => {
-                None
-            }
-            _ => {
-                None
-            }
+        if confirmed.len() == 1 {
+            return Some(confirmed[0]);
         }
+
+        let index = self.bio_index.lock();
+        let mut new_identity = None;
+        for uuid in listed.iter() {
+            if index.contains_uuid(uuid) {
+                continue;
+            }
+            if new_identity.is_some() {
+                return None;
+            }
+            new_identity = Some(*uuid);
+        }
+        new_identity
     }
 
     fn reconcile_identities(&self) {
@@ -166,9 +166,6 @@ impl SepData {
             let index = self.bio_index.lock();
             index.total()
         };
-        for _uuid in listed.iter() {
-        }
-
         if dropped.is_empty() && held == listed.len() {
             return;
         }
@@ -475,7 +472,7 @@ impl SepData {
             crate::sbio::ComponentAction::AlreadyActive => {
                 RestoreOutcome::AlreadyActive
             }
-            crate::sbio::ComponentAction::Unsupported(_) => {
+            crate::sbio::ComponentAction::Unsupported => {
                 RestoreOutcome::Failed
             }
             crate::sbio::ComponentAction::Load => {
@@ -750,27 +747,78 @@ impl SepData {
         }
     }
 
-    // ordering: the catacomb restore must complete before the sensor is woken
+    fn bring_sensor_online(&self) -> bool {
+        let Some(mut patch) = self.wake_sensor() else {
+            return false;
+        };
+
+        if !self.sensor_calibrated.load(Relaxed) {
+            if !self.calibrate_sensor() {
+                return false;
+            }
+            self.sensor_calibrated.store(true, Relaxed);
+            let Some(reloaded_patch) = self.wake_sensor() else {
+                return false;
+            };
+            patch = reloaded_patch;
+        }
+
+        self.complete_bringup(patch)
+    }
+
     pub(crate) fn run_bringup(&self) {
         if self.bringup_started.xchg(true, Relaxed) {
             return;
         }
-        if let Err(e) = self.enable_sbio() {
-            dev_err!(self.dev, "bringup: could not enable the biometric transport ({:?}); Touch ID is unavailable this boot\n", e);
-            return;
-        }
         if let Err(e) = self.enable_sks() {
             dev_warn!(self.dev, "bringup: could not enable the key store ({:?}); keybag and ref-key operations are unavailable\n", e);
+            return;
         }
-        if let Ok(keybag::State::Present(stored)) = keybag::read(keybag::Slot::Identity) {
-            if let Some((handle, uuid)) = self.sks_recover(&stored) {
-                self.sks_designate_user_keybag(handle, stored.secret());
-                self.sks_machine_refkey(handle, stored.secret());
-                let prepared = self.cold_match_continue(handle, uuid);
-                self.ensure_restored_after(prepared);
+        if *module_parameters::provision_keybag.value() != 0 {
+            if *module_parameters::xart_writes.value() == 0 {
+                dev_err!(self.dev, "bringup: provision_keybag=1 requires xart_writes=1\n");
+                return;
+            }
+            if !self.sks_provision_identity_keybag() {
+                dev_err!(self.dev, "bringup: identity-keybag provisioning failed; no retry this boot\n");
+                return;
             }
         }
+    }
+
+    fn activate_touchid(&self) -> Result<()> {
+        if self.touchid_started.load(Relaxed) {
+            return Ok(());
+        }
+
+        let mut store = store::Store::open()?;
+        let index = bio::IdentityIndex::load(&mut store)?;
+        *self.host_store.lock() = Some(store);
+        *self.bio_index.lock() = index;
+
+        self.attach_sensor();
+        self.enable_sbio()?;
+        let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
+            return Err(ENOENT);
+        };
+        let (handle, uuid) = self.sks_recover(&stored).ok_or(EIO)?;
+        self.sks_designate_user_keybag(handle, stored.secret());
+        self.sks_machine_refkey(handle, stored.secret());
+        let prepared = self.cold_match_continue(handle, uuid);
+        self.ensure_restored_after(prepared);
         self.attach_bringup();
+        self.touchid_started.store(true, Relaxed);
+        Ok(())
+    }
+
+    // Touch ID starts from the caller's real-root namespace. SEP can therefore
+    // unlock root in initramfs without pinning biometric persistence to tmpfs.
+    fn prepare_bio_open(&self) -> Result<()> {
+        if let Err(e) = self.activate_touchid() {
+            dev_err!(self.dev, "Touch ID activation failed: {:?}\n", e);
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub(crate) fn run_verify(&self) {
@@ -796,31 +844,8 @@ impl SepData {
 
         self.settle_before_capture();
 
-        let Some(patch) = self.wake_sensor() else {
-            self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR), token_bytes);
-            let _ = sensor::idle();
-            return;
-        };
-
-        // enclave refuses a capture from an uncalibrated sensor (0x65 answers 1)
-        let already_calibrated = self.sensor_calibrated.load(Relaxed);
-        self.sensor_calibrated.store(true, Relaxed);
-        let patch = if already_calibrated {
-            patch
-        } else {
-            if !self.calibrate_sensor() {
-                self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR), token_bytes);
-                let _ = sensor::idle();
-                return;
-            }
-            let Some(patch) = self.wake_sensor() else {
-                self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR), token_bytes);
-                let _ = sensor::idle();
-                return;
-            };
-            patch
-        };
-        if !self.complete_bringup(patch) {
+        // The enclave refuses a capture from an uncalibrated sensor (0x65 answers 1).
+        if !self.bring_sensor_online() {
             self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR), token_bytes);
             let _ = sensor::idle();
             return;
@@ -953,31 +978,7 @@ impl SepData {
     }
 
     pub(crate) fn run_enrolment(&self) {
-        let Some(patch) = self.wake_sensor() else {
-            self.finish_enrolment(Err(ENROL_STATUS_SENSOR));
-            let _ = sensor::idle();
-            return;
-        };
-
-        let already_calibrated = self.sensor_calibrated.load(Relaxed);
-        self.sensor_calibrated.store(true, Relaxed);
-        let patch = if already_calibrated {
-            patch
-        } else {
-            if !self.calibrate_sensor() {
-                self.finish_enrolment(Err(ENROL_STATUS_SENSOR));
-                let _ = sensor::idle();
-                return;
-            }
-            let Some(patch) = self.wake_sensor() else {
-                self.finish_enrolment(Err(ENROL_STATUS_SENSOR));
-                let _ = sensor::idle();
-                return;
-            };
-            patch
-        };
-
-        if !self.complete_bringup(patch) {
+        if !self.bring_sensor_online() {
             self.finish_enrolment(Err(ENROL_STATUS_SENSOR));
             let _ = sensor::idle();
             return;
@@ -1703,15 +1704,6 @@ impl SepData {
             }
         };
 
-        let _repeated_header = {
-            let mut bytes = [0u8; transfer::HEADER_LEN];
-            bytes.copy_from_slice(&header[..transfer::HEADER_LEN]);
-            let mut last = self.sbio_last_header.lock();
-            let same = last.as_ref().is_some_and(|prev| *prev == bytes);
-            *last = Some(bytes);
-            same
-        };
-
         let chunk = packet.chunk as usize;
         let payload = if chunk == 0 {
             KVec::new()
@@ -1738,14 +1730,12 @@ impl SepData {
                 // 0xFE requests the peer's next packet and acks the final one; nothing to send
                 self.sbio_wq.notify_all();
             }
-            transfer::Progress::Ignored(_why) => {},
+            transfer::Progress::Ignored => {},
             transfer::Progress::Grant => {
                 self.sbio_wq.notify_all();
             }
-            transfer::Progress::Notification { tag: _tag, opcode: _opcode } => {
-                let _ = self.sbio_rx.lock().awaiting();
-            }
-            transfer::Progress::Failed(_why) => {
+            transfer::Progress::Notification => {},
+            transfer::Progress::Failed => {
                 self.sbio_wq.notify_all();
             }
         }
@@ -1805,7 +1795,6 @@ impl SepData {
         let mut guard = self.sbio_rx.lock();
         loop {
             if let Some(done) = guard.take_done() {
-                let _ = done.opcode;
                 return Ok(done);
             }
             if remaining == 0 {
@@ -1947,7 +1936,14 @@ impl SepData {
     }
 
     pub(crate) fn bio_open(&self) -> Result<()> {
-        bio::open(&mut self.bio_session.lock())
+        let mut session = self.bio_session.lock();
+        bio::open(&mut session)?;
+        drop(session);
+        if let Err(e) = self.prepare_bio_open() {
+            bio::release(&mut self.bio_session.lock());
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub(crate) fn bio_release(&self) {
@@ -2125,8 +2121,6 @@ impl SepData {
             return false;
         }
 
-        // unlock/0x18 is the destructive-template path (bag stays designated, locked)
-        self.cold_prepared.store(true, Relaxed);
         true
     }
 
@@ -2273,8 +2267,6 @@ impl SbioOp {
 
 pub(crate) const SBIO_PROTOCOL_GENERATION: u32 = 1;
 
-const OP_SBIO_INIT_COMMS: u16 = 0x73;
-
 const OP_SBIO_REGISTER_SENSOR: u16 = 0x80;
 pub(crate) fn sbio_register_sensor(id: &crate::sensor::Identifier) -> SbioOp {
     SbioOp {
@@ -2284,8 +2276,6 @@ pub(crate) fn sbio_register_sensor(id: &crate::sensor::Identifier) -> SbioOp {
         name: c"REGISTER_SENSOR",
     }
 }
-
-const OP_SBIO_SEND_SERIAL: u16 = 0x48;
 
 pub(crate) const SBIO_SIGNAL_QUALITY: u32 = 0;
 
@@ -2413,10 +2403,7 @@ pub(crate) fn sbio_protected_config(id: UserId) -> SbioOp {
 
 const OP_SBIO_BEGIN_ENROL: u16 = 0x03;
 
-// type 0 (ACM context) survives a reboot; type 1 (SKS token) does not
 pub(crate) const BE_AUTH_TYPE_ACM_CONTEXT: u32 = 0;
-pub(crate) const BE_AUTH_TYPE_SKS_TOKEN: u32 = 1;
-static_assert!(BE_AUTH_TYPE_ACM_CONTEXT != BE_AUTH_TYPE_SKS_TOKEN);
 
 pub(crate) const SBIO_BEGIN_ENROL_LEN: usize = 0x44;
 static_assert!(SBIO_BEGIN_ENROL_LEN <= SBIO_MAX_PAYLOAD);
@@ -2426,22 +2413,7 @@ const BE_USER_ID: usize = 4;
 const BE_AUTH_TYPE: usize = 8;
 const BE_TOKEN_LEN: usize = 12;
 const BE_TOKEN: usize = 16;
-const BE_SELECTOR: usize = 48;
-static_assert!(BE_TOKEN + SKS_AUTH_TOKEN_LEN <= BE_SELECTOR);
-const BE_SELECTOR_LEN: usize = 20;
-static_assert!(BE_SELECTOR + BE_SELECTOR_LEN == SBIO_BEGIN_ENROL_LEN);
-
-pub(crate) const SBIO_BEGIN_ENROL_COPIED: usize = match SBIO_PROTOCOL_GENERATION {
-    1 => 0x30,
-    6 => SBIO_BEGIN_ENROL_LEN,
-    _ => 0,
-};
-static_assert!(SBIO_BEGIN_ENROL_COPIED != 0);
-static_assert!(SBIO_BEGIN_ENROL_COPIED <= SBIO_BEGIN_ENROL_LEN);
-
-const BE_SELECTOR_IN_RECORD: bool = SBIO_BEGIN_ENROL_COPIED >= BE_SELECTOR + BE_SELECTOR_LEN;
-
-static_assert!(!BE_SELECTOR_IN_RECORD);
+static_assert!(BE_TOKEN + SKS_AUTH_TOKEN_LEN <= SBIO_BEGIN_ENROL_LEN);
 
 pub(crate) fn sbio_begin_enrol(
     user: UserId,
@@ -2540,14 +2512,10 @@ pub(crate) fn sbio_match_policy() -> SbioOp {
 
 pub(crate) const SBIO_ENROL_RESULT_LEN: usize = 0xc98;
 
-const ER_STATUS: usize = 0x000;
-const ER_ERROR: usize = 0x002;
 const ER_PROGRESS: usize = 0x004;
 const ER_HAS_TEMPLATE: usize = 0x006;
 const ER_COMPLETE: usize = 0xbfe;
 
-static_assert!(ER_STATUS + 2 <= SBIO_ENROL_RESULT_LEN);
-static_assert!(ER_ERROR + 2 <= SBIO_ENROL_RESULT_LEN);
 static_assert!(ER_PROGRESS < SBIO_ENROL_RESULT_LEN);
 static_assert!(ER_HAS_TEMPLATE + 4 <= SBIO_ENROL_RESULT_LEN);
 static_assert!(ER_COMPLETE + 4 <= SBIO_ENROL_RESULT_LEN);
@@ -2645,9 +2613,6 @@ static_assert!(SBIO_SAVED_USER_ID_AT + 4 <= SBIO_SAVED_MIN);
 
 pub(crate) const SBIO_SAVE_SELECTOR_LEN: usize = 24;
 const SS_USER_ID: usize = 0;
-const SS_DEVICE: usize = 4;
-const SS_DEVICE_LEN: usize = 20;
-static_assert!(SS_DEVICE + SS_DEVICE_LEN == SBIO_SAVE_SELECTOR_LEN);
 static_assert!(SBIO_SAVE_SELECTOR_LEN <= SBIO_MAX_PAYLOAD);
 
 pub(crate) struct SaveSelector([u8; SBIO_SAVE_SELECTOR_LEN]);
@@ -2689,10 +2654,6 @@ impl<'a> ComponentStates<'a> {
         self.0.len() / COMPONENT_PAIR_LEN
     }
 
-    pub(crate) fn trailing(&self) -> usize {
-        self.0.len() % COMPONENT_PAIR_LEN
-    }
-
     pub(crate) fn pair(&self, i: usize) -> Option<(i32, u32)> {
         let at = i.checked_mul(COMPONENT_PAIR_LEN)?;
         let bytes = self.0.get(at..at + COMPONENT_PAIR_LEN)?;
@@ -2713,7 +2674,7 @@ impl<'a> ComponentStates<'a> {
 pub(crate) enum ComponentAction {
     AlreadyActive,
     Load,
-    Unsupported(u32),
+    Unsupported,
 }
 
 pub(crate) fn component_action(state: u32) -> ComponentAction {
@@ -2722,7 +2683,7 @@ pub(crate) fn component_action(state: u32) -> ComponentAction {
     } else if state & COMPONENT_STATE_COLD != 0 {
         ComponentAction::Load
     } else {
-        ComponentAction::Unsupported(state)
+        ComponentAction::Unsupported
     }
 }
 
@@ -2825,10 +2786,6 @@ pub(crate) fn sbio_list_identities() -> SbioOp {
     }
 }
 
-const OP_SBIO_GROUP_STATE: u16 = 0x79;
-
-const OP_SBIO_LIST_IDENTITIES_SCOPED: u16 = 0x6e;
-
 pub(crate) struct IdentityRecords<'a>(&'a [u8]);
 
 impl<'a> IdentityRecords<'a> {
@@ -2921,18 +2878,12 @@ pub(crate) const SBIO_MATCH_RESULT_LEN: usize = 0xca2;
 
 const MR_USER_ID: usize = 0x000;
 const MR_IDENTITY: usize = 0x004;
-const MR_CANDIDATES: usize = 0x014;
 const MR_FLAGS: usize = 0xc8a;
-const MR_SECOND_IDENTITY_UNUSED: usize = 0xc8e;
-static_assert!(MR_IDENTITY != MR_SECOND_IDENTITY_UNUSED);
+const MR_FLAG_MATCH: u32 = 1;
 static_assert!(MR_USER_ID + 4 <= SBIO_MATCH_RESULT_LEN);
 static_assert!(MR_IDENTITY + IDENTITY_UUID_LEN <= SBIO_MATCH_RESULT_LEN);
-static_assert!(MR_CANDIDATES + 4 <= SBIO_MATCH_RESULT_LEN);
 static_assert!(MR_FLAGS + 4 <= SBIO_MATCH_RESULT_LEN);
-static_assert!(MR_SECOND_IDENTITY_UNUSED + IDENTITY_UUID_LEN <= SBIO_MATCH_RESULT_LEN);
 static_assert!(MR_IDENTITY == MR_USER_ID + 4);
-static_assert!(MR_IDENTITY + IDENTITY_UUID_LEN == MR_CANDIDATES);
-static_assert!(MR_FLAGS > MR_USER_ID + 4);
 static_assert!(SBIO_MATCH_RESULT_LEN != SBIO_ENROL_RESULT_LEN);
 
 pub(crate) const IDENTITY_UUID_LEN: usize = 16;
@@ -2965,6 +2916,7 @@ impl IdentityV1 {
 pub(crate) struct MatchResult {
     user_id: i32,
     identity: [u8; IDENTITY_UUID_LEN],
+    flags: u32,
 }
 
 impl MatchResult {
@@ -2982,6 +2934,7 @@ impl MatchResult {
                 bytes[MR_USER_ID + 3],
             ]),
             identity,
+            flags: u32::from_le_bytes(bytes[MR_FLAGS..MR_FLAGS + 4].try_into().ok()?),
         })
     }
 
@@ -2990,7 +2943,7 @@ impl MatchResult {
     }
 
     pub(crate) fn matches(&self, user: UserId) -> bool {
-        self.user_id == user.value()
+        self.flags & MR_FLAG_MATCH != 0 && self.user_id == user.value()
     }
 
 }
@@ -3035,16 +2988,6 @@ pub(crate) fn sbio_register_sensor_serial(serial: &crate::sensor::SensorSerial) 
     }
 }
 
-const OP_SBIO_ENUMERATE: u16 = 0x7c;
-pub(crate) const fn sbio_enumerate() -> SbioOp {
-    SbioOp {
-        opcode: OP_SBIO_ENUMERATE,
-        payload: [0; SBIO_MAX_PAYLOAD],
-        payload_len: 0,
-        name: c"ENUMERATE",
-    }
-}
-
 const OP_SBIO_DIAGNOSTICS: u16 = 0x63;
 pub(crate) const fn sbio_diagnostics() -> SbioOp {
     SbioOp {
@@ -3054,12 +2997,6 @@ pub(crate) const fn sbio_diagnostics() -> SbioOp {
         name: c"DIAGNOSTICS",
     }
 }
-
-const SURVEY_ENUMERATE: SbioOp = sbio_enumerate();
-const SURVEY_DIAGNOSTICS: SbioOp = sbio_diagnostics();
-
-static_assert!(SURVEY_ENUMERATE.payload_len == 0);
-static_assert!(SURVEY_DIAGNOSTICS.payload_len == 0);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ImagePurpose {
@@ -3217,16 +3154,10 @@ pub(crate) fn sbio_enrolment_result() -> SbioOp {
 }
 
 pub(crate) const ASSESS_MIN_LEN: usize = 0x89;
-pub(crate) const ASSESS_ERROR: usize = 0x00;
 pub(crate) const ASSESS_USABLE_MATCH: usize = 0x06;
 pub(crate) const ASSESS_USABLE_ENROL: usize = 0x07;
-pub(crate) const ASSESS_FEEDBACK: usize = 0x0e;
-pub(crate) const ASSESS_DIRTY: usize = 0x51;
 
-static_assert!(ASSESS_ERROR + 2 <= ASSESS_MIN_LEN);
 static_assert!(ASSESS_USABLE_MATCH < ASSESS_USABLE_ENROL);
-static_assert!(ASSESS_FEEDBACK + 4 <= ASSESS_MIN_LEN);
-static_assert!(ASSESS_DIRTY < ASSESS_MIN_LEN);
 
 pub(crate) const SBIO_SESSION_SHARE_LEN: usize = 40;
 
@@ -3301,7 +3232,7 @@ const fn encode_sbio(opcode: u16, marker: u8, seq: u16) -> Message {
     }
 }
 
-static_assert!(encode_sbio(OP_SBIO_INIT_COMMS, transfer::MARKER_FIRST, 0).msg0 == 0x0000_0073_fc08);
+static_assert!(encode_sbio(0x73, transfer::MARKER_FIRST, 0).msg0 == 0x0000_0073_fc08);
 
 pub(crate) fn encode_sbio_raw(opcode: u16, seq: u16) -> Option<Message> {
     Some(encode_sbio(opcode, transfer::MARKER_FIRST, seq))

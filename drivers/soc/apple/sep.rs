@@ -93,8 +93,6 @@ const ENDPOINTS_BEFORE_EXCHANGE: usize = 7;
 
 const OOL_SIZE_XARM: usize = 0x8000;
 
-const OOL_SIZE_XARS: usize = 0x8000;
-
 const OOL_SIZE_SBIO: usize = 0x4000;
 
 const OOL_SIZE_SCRD: usize = 0x4000;
@@ -103,10 +101,8 @@ const SBIO_TIMEOUT_MS: time::Msecs = 5000;
 
 const SKS_ALLOC: usize = 0x8000;
 
-
+const SKS_SECRET_LEN: usize = 32;
 const SKS_MAX_CAPTURE: usize = 8;
-
-const XARS_MAX_CAPTURE: usize = 8;
 
 const SCRD_MAX_CAPTURE: usize = 8;
 
@@ -153,10 +149,12 @@ const PROTECTED_DATA_AVAILABLE: bool = true;
 
 const RNG_MAX_WORDS_PER_READ: usize = 16;
 
-const SECMODE_UNKNOWN: u32 = u32::MAX;
+extern "C" {
+    fn sep_cancel_work_sync(work: *mut c_void);
+    fn sep_cancel_delayed_work_sync(work: *mut c_void);
+}
 
 const MAX_ENDPOINTS: usize = 64;
-
 
 #[derive(Clone, Copy)]
 struct Endpoint {
@@ -199,8 +197,6 @@ fn sks_declared_sizes() -> (usize, usize) {
     (0x8000, 0x4000)
 }
 
-const SKS_MALFORMED: i8 = crate::sks::SKS_STATUS_MALFORMED;
-
 struct Hex<'a>(&'a [u8]);
 
 impl kernel::fmt::Display for Hex<'_> {
@@ -218,28 +214,22 @@ impl kernel::fmt::Display for Hex<'_> {
     }
 }
 
-const SKS_SECRET_LEN: usize = 32;
-static_assert!(SKS_SECRET_LEN % 4 == 0);
-
 const SKS_LOCK_STATE_VARIANT: u32 = 1;
 
 #[derive(Clone, Copy)]
 enum LockState {
     Unlocked,
-    Locked,
 }
 
 impl LockState {
     const fn wire(self) -> i32 {
         match self {
             LockState::Unlocked => 0,
-            LockState::Locked => 1,
         }
     }
 }
 
 static_assert!(LockState::Unlocked.wire() == 0);
-static_assert!(LockState::Locked.wire() == 1);
 
 const SKS_LOCK_STATE_FLAGS: u64 = 0;
 
@@ -403,128 +393,14 @@ const ENROL_IDLE_TIMEOUT_MS: u32 = 2000;
 const PATCH_POLL_MS: u32 = 20;
 const PATCH_POLL_ATTEMPTS: u32 = 250;
 
-const SEAL_VECTOR: &[u8] = b"apple-sep seal round trip v1";
-
-const SEAL_STATUS_SHAPE: i8 = SKS_MALFORMED;
-
-const SEAL_STATUS_NAMES_NOTHING: i8 = -11;
-
-const SEAL_STATUS_WRONG_KIND: i8 = -12;
-
-const SEAL_STATUS_MISSING_PREREQUISITE: i8 = -3;
-static_assert!(SEAL_STATUS_MISSING_PREREQUISITE != SEAL_STATUS_WRONG_KIND);
-static_assert!(SEAL_STATUS_MISSING_PREREQUISITE != SEAL_STATUS_NAMES_NOTHING);
-
-const SEAL_STATUS_BACKUP_WRAP: i8 = -14;
-
-static_assert!(SEAL_STATUS_WRONG_KIND != SEAL_STATUS_NAMES_NOTHING);
-static_assert!(SEAL_STATUS_WRONG_KIND != SEAL_STATUS_SHAPE);
-static_assert!(SEAL_STATUS_BACKUP_WRAP != SEAL_STATUS_WRONG_KIND);
-static_assert!(SEAL_STATUS_BACKUP_WRAP != SEAL_STATUS_SHAPE);
-
-const SKS_WRAP_OVERHEAD: usize = 256;
-
-const SKS_WRAP_PRODUCTION_CAPACITY: u32 = SEAL_VECTOR.len() as u32 + SKS_WRAP_OVERHEAD as u32;
-
-const SKS_CAPACITY_MAP: [u32; 23] = [
-    128, 192, 255, 256, 257, 258, 300, 320, 384, 512, 513, 640, 768, 1023, 1024, 1025, 1026, 1280,
-    1536, 2048, 2049, 3072, 4096,
-];
-
-const fn capacity_map_ascends() -> bool {
-    let mut i = 1;
-    while i < SKS_CAPACITY_MAP.len() {
-        if SKS_CAPACITY_MAP[i - 1] >= SKS_CAPACITY_MAP[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-static_assert!(capacity_map_ascends());
-static_assert!(SKS_CAPACITY_MAP[0] > 0);
-static_assert!(SKS_CAPACITY_MAP[5] < SKS_WRAP_PRODUCTION_CAPACITY);
-static_assert!(SKS_WRAP_PRODUCTION_CAPACITY < SKS_CAPACITY_MAP[6]);
-static_assert!(SKS_CAPACITY_MAP[2] + 1 == SKS_CAPACITY_MAP[3]);
-static_assert!(SKS_CAPACITY_MAP[13] + 1 == SKS_CAPACITY_MAP[14]);
-
 const CALIBRATION_FIRMWARE: &CStr = c"apple/mesa_calibration.bin";
 
-const SKS_CONFIG_MASKS: [u32; 17] = [
-    0xffff_ffff,
-    0x1,
-    0x3,
-    0x5,
-    0x9,
-    0x11,
-    0x21,
-    0x41,
-    0x81,
-    0x101,
-    0x201,
-    0x401,
-    0x801,
-    0x1001,
-    0x2001,
-    0x4001,
-    0x8001,
-];
-
-const fn config_masks_are_single_bit_probes() -> bool {
-    if SKS_CONFIG_MASKS[0] != u32::MAX || SKS_CONFIG_MASKS[1] != 1 {
-        return false;
-    }
-    let mut i = 2;
-    while i < SKS_CONFIG_MASKS.len() {
-        let m = SKS_CONFIG_MASKS[i];
-        if m & 1 != 1 || (m & !1u32).count_ones() != 1 {
-            return false;
-        }
-        if i > 2 && SKS_CONFIG_MASKS[i - 1] >= m {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-static_assert!(config_masks_are_single_bit_probes());
-
-const CONFIG_STAGE_NONE: u32 = 0;
 const SBIO_PROBE_USER_ID: i32 = 1000;
 static_assert!(SBIO_PROBE_USER_ID >= crate::sks::SKS_DESIGNATE_USER_MIN);
 static_assert!(SBIO_PROBE_USER_ID == bio::ENROL_USER_ID);
 static_assert!(SBIO_PROBE_USER_ID > 0);
-static_assert!(SBIO_PROBE_USER_ID == crate::sks::SKS_IDENTITY_USER_ID);
 
 const SKS_LOAD_REPLY_LEN: usize = 8;
-
-// StoreType: the u32 at +0x60 of the create body
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct StoreType(u32);
-
-const STORE_TYPE_MAX: u32 = 8;
-
-impl StoreType {
-    const IDENTITY: StoreType = StoreType(0);
-    const SEALING: StoreType = StoreType(1);
-
-    const fn new(value: u32) -> Option<StoreType> {
-        if value <= STORE_TYPE_MAX {
-            Some(StoreType(value))
-        } else {
-            None
-        }
-    }
-
-    const fn wire(self) -> u32 {
-        self.0
-    }
-}
-
-static_assert!(StoreType::IDENTITY.wire() == 0);
-static_assert!(StoreType::SEALING.wire() == 1);
-static_assert!(StoreType::new(STORE_TYPE_MAX).is_some());
-static_assert!(StoreType::new(STORE_TYPE_MAX + 1).is_none());
 
 #[derive(Clone, Copy)]
 
@@ -560,12 +436,7 @@ impl core::ops::Deref for Secret {
 
 impl Drop for Secret {
     fn drop(&mut self) {
-        for b in self.0.iter_mut() {
-            // SAFETY: `b` is a valid, uniquely borrowed byte for this write, and
-            // a volatile store is what stops the compiler discarding a wipe of
-            // memory nothing reads afterwards.
-            unsafe { core::ptr::write_volatile(b, 0) };
-        }
+        image::wipe(&mut self.0);
     }
 }
 
@@ -595,20 +466,6 @@ impl SksProbe {
             unsolicited: 0,
             abandoned: [None; SKS_MAX_ABANDONED],
             abandoned_next: 0,
-        }
-    }
-}
-
-struct XarsProbe {
-    active: bool,
-    captured: KVec<Message>,
-}
-
-impl XarsProbe {
-    fn new() -> Self {
-        XarsProbe {
-            active: false,
-            captured: KVec::new(),
         }
     }
 }
@@ -699,8 +556,6 @@ struct SepData {
     #[pin]
     control_wq: CondVar,
 
-    security_mode: Atomic<u32>,
-
     sks_wedged: Atomic<u32>,
 
     sks_seq: Atomic<u32>,
@@ -715,9 +570,6 @@ struct SepData {
     ool_sbio: Mutex<Option<OolPair>>,
 
     #[pin]
-    sbio_last_header: Mutex<Option<[u8; transfer::HEADER_LEN]>>,
-
-    #[pin]
     dma_ring: Mutex<Option<shmem::ShMem>>,
 
     #[pin]
@@ -730,8 +582,6 @@ struct SepData {
 
     templates_restored: Atomic<bool>,
 
-    restore_attempted: Atomic<bool>,
-
     sensor_calibrated: Atomic<bool>,
 
     enrol_open: Atomic<bool>,
@@ -740,23 +590,16 @@ struct SepData {
     enrol_material: Mutex<Option<EnrolMaterial>>,
 
     #[pin]
-    enrol_identity_candidates: Mutex<KVec<([u8; bio::UUID_LEN], u32)>>,
+    enrol_identity_candidates: Mutex<KVec<[u8; bio::UUID_LEN]>>,
 
     last_capture_end_ns: Atomic<u64>,
 
     device_view_synced: Atomic<bool>,
 
-    backup_bag_other: Atomic<u32>,
-
-    borrowed_sealing_handle: Atomic<i32>,
-    sealing_designations: Atomic<u32>,
-    config_stage: Atomic<u32>,
-    config_writes_sent: Atomic<u32>,
-
     keybag_designated: Atomic<bool>,
 
-    cold_prepared: Atomic<bool>,
     bringup_started: Atomic<bool>,
+    touchid_started: Atomic<bool>,
 
     bringup: Atomic<u32>,
 
@@ -767,13 +610,6 @@ struct SepData {
     sks_probe: Mutex<SksProbe>,
     #[pin]
     sks_wq: CondVar,
-
-    #[pin]
-    ool_xars: Mutex<Option<OolPair>>,
-    #[pin]
-    xars_probe: Mutex<XarsProbe>,
-    #[pin]
-    xars_wq: CondVar,
 
     #[pin]
     ool_scrd: Mutex<Option<OolPair>>,
@@ -808,6 +644,9 @@ struct SepData {
     #[pin]
     machine_refkey: Mutex<Option<MachineRefKey>>,
 
+    #[pin]
+    fv_volumes: Mutex<KVec<fv::VolumeMap>>,
+
     rng_shutdown: Atomic<bool>,
 
     rng_failures: Atomic<u64>,
@@ -819,6 +658,8 @@ struct SepData {
     settle_idle_ticks: Atomic<u64>,
 
     registered: Atomic<bool>,
+
+    shutting_down: Atomic<bool>,
 
     #[pin]
     rx_work: Work<SepData>,
@@ -872,12 +713,6 @@ impl SepData {
         )?;
         let sks_declared = sks_declared_sizes();
         let ool_sks = Self::alloc_ool(dev, proto::EP_SKS, SKS_ALLOC, sks_declared)?;
-        let ool_xars = Self::alloc_ool(
-            dev,
-            xarm::EP_XARS,
-            OOL_SIZE_XARS,
-            (OOL_SIZE_XARS, OOL_SIZE_XARS),
-        )?;
         let ool_scrd = Self::alloc_ool(
             dev,
             proto::EP_SCRD,
@@ -937,36 +772,25 @@ impl SepData {
                 endpoints <- new_mutex!(EndpointTable::new()),
                 control <- new_mutex!(control::ControlState::new()),
                 control_wq <- new_condvar!("SepData::control_wq"),
-                security_mode: Atomic::new(SECMODE_UNKNOWN),
                 sks_seq: Atomic::new(0),
                 sks_wedged: Atomic::new(0),
                 bringup: Atomic::new(BRINGUP_FRESH),
                 keybag_designated: Atomic::new(false),
-                cold_prepared: Atomic::new(false),
                 bringup_started: Atomic::new(false),
+                touchid_started: Atomic::new(false),
                 enrol_open: Atomic::new(false),
                 sensor_calibrated: Atomic::new(false),
                 templates_restored: Atomic::new(false),
-                restore_attempted: Atomic::new(false),
                 enrol_material <- new_mutex!(None),
                 enrol_identity_candidates <- new_mutex!(KVec::new()),
                 last_capture_end_ns: Atomic::new(0),
                 device_view_synced: Atomic::new(false),
-                backup_bag_other: Atomic::new(0),
-                borrowed_sealing_handle: Atomic::new(0),
-                sealing_designations: Atomic::new(0),
-                config_writes_sent: Atomic::new(0),
-                config_stage: Atomic::new(CONFIG_STAGE_NONE),
                 phase: Atomic::new(PHASE_ATTACH),
                 ool_xarm <- new_mutex!(Some(ool_xarm)),
                 ool_sbio <- new_mutex!(Some(ool_sbio)),
-                sbio_last_header <- new_mutex!(None::<[u8; transfer::HEADER_LEN]>),
                 ool_sks <- new_mutex!(Some(ool_sks)),
                 sks_probe <- new_mutex!(SksProbe::new()),
                 sks_wq <- new_condvar!("SepData::sks_wq"),
-                ool_xars <- new_mutex!(Some(ool_xars)),
-                xars_probe <- new_mutex!(XarsProbe::new()),
-                xars_wq <- new_condvar!("SepData::xars_wq"),
                 ool_scrd <- new_mutex!(Some(ool_scrd)),
                 scrd_probe <- new_mutex!(ScrdProbe::new()),
                 scrd_wq <- new_condvar!("SepData::scrd_wq"),
@@ -983,6 +807,7 @@ impl SepData {
                 xarm <- new_mutex!(XarmState::new()),
                 rng <- new_mutex!(None),
                 machine_refkey <- new_mutex!(None),
+                fv_volumes <- new_mutex!(KVec::new()),
                 rng_shutdown: Atomic::new(false),
                 rng_failures: Atomic::new(0),
                 rx: rxring::RxRing::new(),
@@ -990,6 +815,7 @@ impl SepData {
                 settle_mark: Atomic::new(0),
                 settle_idle_ticks: Atomic::new(0),
                 registered: Atomic::new(false),
+                shutting_down: Atomic::new(false),
                 rx_work <- new_work!("SepData::rx_work"),
                 enrol_work <- new_work!("SepData::enrol_work"),
                 verify_work <- new_work!("SepData::verify_work"),
@@ -1100,7 +926,7 @@ impl SepData {
         let mut remaining = time::msecs_to_jiffies(op.timeout_ms());
         let mut guard = self.control.lock();
         let result = loop {
-            if let Some((value, _msg1)) = guard.entropy_take() {
+            if let Some(value) = guard.entropy_take() {
                 break Ok(value);
             }
             if self.rng_shutdown.load(Relaxed) {
@@ -1128,13 +954,7 @@ impl SepData {
             let _ = self.control_request(&proto::op_nop(param));
         }
 
-        match self.control_request(&proto::op_security_mode()) {
-            Ok(Some(reply)) => {
-                self.security_mode.store(reply.data_lo, Relaxed);
-            }
-            Ok(None) => {}
-            Err(_) => {}
-        }
+        let _ = self.control_request(&proto::op_security_mode());
 
         let mut words = [0u32; 4];
         let mut got = 0;
@@ -1257,40 +1077,30 @@ impl SepData {
         store.as_mut().map(f)
     }
 
-    // pre-generate: an entropy draw on the drain path would deadlock on its own reply
     fn prepare_os_uuid(&self) {
-        let key = store::Key::root(0xf0);
-
-        let existing = match self.with_host_store(|store| store.read(&key)) {
-            Some(result) => result,
-            None => return,
-        };
-
-        if let Ok(Some(value)) = existing {
-            if value.len() == 16 {
-                let mut uuid = [0u8; 16];
-                uuid.copy_from_slice(&value);
-                self.xarm.lock().os_uuid = Some(uuid);
-                return;
-            }
-        }
-
-        let mut uuid = [0u8; 16];
-        if shim::random_bytes(&mut uuid).is_err() {
+        let hi = *module_parameters::os_uuid_hi.value();
+        let lo = *module_parameters::os_uuid_lo.value();
+        if hi != 0 || lo != 0 {
+            let mut uuid = [0u8; 16];
+            uuid[..8].copy_from_slice(&hi.to_be_bytes());
+            uuid[8..].copy_from_slice(&lo.to_be_bytes());
+            self.xarm.lock().os_uuid = Some(uuid);
+            dev_info!(
+                self.dev,
+                "xART: using explicit OS UUID {:016x}-{:016x}\n",
+                hi,
+                lo
+            );
             return;
         }
-        xarm::make_uuid_v4(&mut uuid);
 
-        match self.with_host_store(|store| store.write(&key, &uuid)) {
-            Some(Ok(())) => {}
-            Some(Err(_)) => {
-                return;
-            }
-            None => {
-                return;
-            }
+        if let Some(uuid) = dt::preboot_uuid() {
+            self.xarm.lock().os_uuid = Some(uuid);
+            dev_info!(self.dev, "xART: using /chosen/apfs-preboot-uuid\n");
+        } else {
+            self.xarm.lock().os_uuid = None;
+            dev_warn!(self.dev, "xART: /chosen/apfs-preboot-uuid is unavailable\n");
         }
-        self.xarm.lock().os_uuid = Some(uuid);
     }
 
     fn on_xarm(&self, msg: Message) {
@@ -1453,18 +1263,6 @@ impl SepData {
         reply.args[0] = u8::from(PROTECTED_DATA_AVAILABLE);
         self.xarm.lock().serviced += 1;
         self.send_xarm_reply(&reply);
-    }
-
-
-    fn on_xars(&self, msg: Message) {
-        let mut probe = self.xars_probe.lock();
-        if probe.active {
-            if probe.captured.len() < XARS_MAX_CAPTURE {
-                let _ = probe.captured.push(msg, GFP_KERNEL);
-            }
-            drop(probe);
-            self.xars_wq.notify_all();
-        }
     }
 
 
@@ -1783,6 +1581,9 @@ impl SepData {
 
 
     fn arm_settle(this: &Arc<SepData>) {
+        if this.shutting_down.load(Relaxed) {
+            return;
+        }
         let delay = time::msecs_to_jiffies(SETTLE_MS);
         let _ = workqueue::system()
             .enqueue_delayed::<Arc<SepData>, SETTLE_WORK_ID>(this.clone(), delay);
@@ -1889,9 +1690,6 @@ impl SepData {
 
             proto::EP_SKS => self.on_sks(msg),
 
-            // xars: only 0x08 and 0x04 are sent; other opcodes are destructive
-            xarm::EP_XARS => self.on_xars(msg),
-
             proto::EP_SCRD => self.on_scrd(msg),
 
             proto::EP_BOOT => dev_warn!(
@@ -1909,7 +1707,6 @@ impl SepData {
 
     fn on_control(&self, msg: Message, f: proto::Fields) {
         if f.ty != proto::CONTROL_REPLY_TYPE {
-            self.control.lock().note_unsolicited();
             return;
         }
 
@@ -1963,8 +1760,9 @@ impl SepData {
 
 
     fn remove(&self) {
-        // first: resets the keyring static calls before freeing, so no keyctl op hits freed data
+        self.shutting_down.store(true, Relaxed);
         trusted::unregister();
+        self.unregister_fv_kernel();
 
         let dev = self.bio_dev.lock().take();
         if dev.is_some() {
@@ -1976,17 +1774,35 @@ impl SepData {
 
         self.rng_shutdown.store(true, Relaxed);
         self.control_wq.notify_all();
+        self.sbio_wq.notify_all();
+        self.sks_wq.notify_all();
+        self.scrd_wq.notify_all();
         if let Some(mut handle) = self.rng.lock().take() {
             handle.unregister();
         }
 
-        // stop the mailbox last: no callbacks after this
         *self.mbox.lock() = None;
+
+        // SAFETY: all four pointers refer to pinned work fields in `self`.
+        // Shutdown blocks requeueing, and the mailbox can no longer add work.
+        unsafe {
+            sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.rx_work)).cast());
+            sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.enrol_work)).cast());
+            sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.verify_work)).cast());
+            sep_cancel_delayed_work_sync(
+                DelayedWork::raw_as_work(core::ptr::addr_of!(self.settle_work)).cast(),
+            );
+        }
 
         let _ = self.store.lock().take();
         let _ = self.host_store.lock().take();
 
-        for slot in [&self.ool_xarm, &self.ool_sbio, &self.ool_sks] {
+        for slot in [
+            &self.ool_xarm,
+            &self.ool_sbio,
+            &self.ool_sks,
+            &self.ool_scrd,
+        ] {
             if let Some(buffers) = slot.lock().take() {
                 if buffers.registered {
                     core::mem::forget(buffers);
@@ -2086,6 +1902,9 @@ impl MailCallback for SepData {
     type Data = Arc<SepData>;
 
     fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, msg: Message) {
+        if data.shutting_down.load(Relaxed) {
+            return;
+        }
         if !data.rx.push(msg) && data.rx.dropped() == 1 {
             dev_err!(
                 data.dev,
@@ -2103,6 +1922,9 @@ impl WorkItem for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
+        if this.shutting_down.load(Relaxed) {
+            return;
+        }
         if this.drain() > 0 {
             SepData::arm_settle(&this);
         }
@@ -2113,6 +1935,9 @@ impl WorkItem<SETTLE_WORK_ID> for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
+        if this.shutting_down.load(Relaxed) {
+            return;
+        }
         SepData::settle_tick(&this);
     }
 }
@@ -2121,6 +1946,9 @@ impl WorkItem<ENROL_WORK_ID> for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
+        if this.shutting_down.load(Relaxed) {
+            return;
+        }
         this.run_enrolment();
     }
 }
@@ -2129,6 +1957,9 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
+        if this.shutting_down.load(Relaxed) {
+            return;
+        }
         this.run_verify();
     }
 }
@@ -2149,6 +1980,12 @@ impl platform::Driver for SepDriver {
         _info: Option<&()>,
     ) -> impl PinInit<Self, Error> {
         let dev: &device::Device<device::Core> = pdev.as_ref();
+        if *module_parameters::provision_keybag.value() != 0
+            && *module_parameters::xart_writes.value() == 0
+        {
+            dev_err!(dev, "provision_keybag=1 requires xart_writes=1\n");
+            return Err(EINVAL);
+        }
         let sep_node = dt::DtNode::of_device(dev).ok_or(ENODEV)?;
 
         if dt::registration_already_sent(&sep_node) {
@@ -2174,7 +2011,9 @@ impl platform::Driver for SepDriver {
 
         data.attach(&sep_node)?;
 
-        data.attach_sensor();
+        if let Err(e) = data.register_fv_kernel() {
+            dev_err!(dev, "could not register the FileVault kernel API: {:?}\n", e);
+        }
 
         if let Err(e) = trusted::register(data.clone()) {
             dev_warn!(data.dev, "trusted-keys: registration failed ({:?})\n", e);
@@ -2226,6 +2065,18 @@ module! {
         xart_writes: u8 {
             default: 0,
             description: "Allow writes to the validated shared xART mapping",
+        },
+        provision_keybag: u8 {
+            default: 0,
+            description: "Create the Linux identity keybag when none exists; requires xart_writes=1",
+        },
+        os_uuid_hi: u64 {
+            default: 0,
+            description: "High 64 bits of an explicit xART OS UUID",
+        },
+        os_uuid_lo: u64 {
+            default: 0,
+            description: "Low 64 bits of an explicit xART OS UUID",
         },
     },
 }

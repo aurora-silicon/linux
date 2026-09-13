@@ -24,6 +24,8 @@ const DMA_RANGE_PROP: &CStr = c"apple,dma-range";
 const DMA_RANGE_CELLS: [u32; 4] = [0, 0, 1, 0];
 
 const REGISTERED_PROP: &CStr = c"apple,sep-shmem-registered-iova";
+const CHOSEN_PATH: &CStr = c"/chosen";
+const PREBOOT_UUID_PROP: &CStr = c"apfs-preboot-uuid";
 
 pub(crate) struct DtNode(*mut bindings::device_node);
 
@@ -149,6 +151,35 @@ fn queue_status_okay(cs: *mut bindings::of_changeset, node: &DtNode) -> Result<(
 
 pub(crate) fn sep_node() -> Option<DtNode> {
     DtNode::find_compatible(SEP_COMPATIBLE)
+}
+
+pub(crate) fn preboot_uuid() -> Option<[u8; 16]> {
+    // SAFETY: the path is NUL-terminated; a non-NULL result owns one node
+    // reference, which `DtNode` releases.
+    let raw = unsafe {
+        bindings::of_find_node_opts_by_path(CHOSEN_PATH.as_char_ptr(), core::ptr::null_mut())
+    };
+    let chosen = (!raw.is_null()).then_some(DtNode(raw))?;
+    let mut text = core::ptr::null();
+    // SAFETY: `chosen` is live, the property name is NUL-terminated, and
+    // `text` is a valid output pointer.
+    if unsafe {
+        bindings::of_property_read_string(
+            chosen.as_ptr(),
+            PREBOOT_UUID_PROP.as_char_ptr(),
+            &mut text,
+        )
+    } != 0
+    {
+        return None;
+    }
+
+    let mut uuid = bindings::uuid_t { b: [0; 16] };
+    // SAFETY: the property is NUL-terminated and `uuid` is a valid output.
+    if unsafe { bindings::uuid_parse(text, &mut uuid) } != 0 || uuid.b.iter().all(|&b| b == 0) {
+        return None;
+    }
+    Some(uuid.b)
 }
 
 pub(crate) fn enable_sep_and_dart() -> Result<()> {
@@ -393,7 +424,7 @@ pub(crate) fn enable_spi_sensor(base: u64, cs: u32) -> Result<()> {
     }
 
     pr_info!(
-        "apple_sep: creating the sensor node (absent from Linux's tree; Apple has it at /arm-io/spi2/mesa)\n"
+        "apple_sep: creating the sensor node (absent from Linux's tree; the firmware exposes it at /arm-io/spi2/mesa)\n"
     );
 
     with_changeset(|cs_handle| {
