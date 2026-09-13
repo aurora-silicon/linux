@@ -14,6 +14,7 @@
 #include <linux/blkdev.h>
 #include <linux/err.h>
 #include <linux/fs.h>
+#include <linux/fs_struct.h>
 #include <linux/sched.h>
 #include <linux/types.h>
 
@@ -24,14 +25,20 @@ static struct file *open_as_kernel(const char *path, int flags, umode_t mode)
 	const struct cred *old;
 	struct cred *kern;
 	struct file *f;
+	struct path root;
 
 	kern = prepare_kernel_cred(&init_task);
 	if (!kern)
 		return ERR_PTR(-ENOMEM);
 
+	task_lock(&init_task);
+	get_fs_root(init_task.fs, &root);
+	task_unlock(&init_task);
+
 	old = override_creds(kern);
-	f = filp_open(path, flags, mode);
+	f = file_open_root(&root, path, flags, mode);
 	put_cred(revert_creds(old));
+	path_put(&root);
 
 	return f;
 }
@@ -88,7 +95,6 @@ void sep_store_close(void *handle)
 		filp_close((struct file *)handle, NULL);
 }
 
-/* Current length in bytes, or a negative errno. */
 long long sep_store_size(void *handle)
 {
 	struct file *f = handle;
@@ -98,7 +104,6 @@ long long sep_store_size(void *handle)
 	return i_size_read(file_inode(f));
 }
 
-/* Returns bytes read, 0 at end of file, or a negative errno. */
 long sep_store_read(void *handle, long long off, void *buf, size_t len)
 {
 	struct file *f = handle;
@@ -107,7 +112,6 @@ long sep_store_read(void *handle, long long off, void *buf, size_t len)
 	return kernel_read(f, buf, len, &pos);
 }
 
-/* Returns bytes written, or a negative errno. */
 long sep_store_write(void *handle, long long off, const void *buf,
 			    size_t len)
 {
@@ -117,7 +121,6 @@ long sep_store_write(void *handle, long long off, const void *buf,
 	return kernel_write(f, buf, len, &pos);
 }
 
-/* Flushes data and metadata to durable storage. */
 int sep_store_sync(void *handle)
 {
 	return vfs_fsync((struct file *)handle, 0);
