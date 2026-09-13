@@ -731,6 +731,7 @@ static int avd_h264_run(struct avd_ctx *ctx)
 		dev_err_ratelimited(ctx->dev->dev,
 				    "slice_num > %d, stream was rejected!",
 				    MAX_SLICES);
+		avd_run_postamble(ctx, &run.base);
 		return -EINVAL;
 	}
 
@@ -739,8 +740,10 @@ static int avd_h264_run(struct avd_ctx *ctx)
 	const u8 *data = vb2_plane_vaddr(&src->vb2_buf, 0);
 	h264_ctx->active_slice = &h264_ctx->slices[h264_ctx->slice_num];
 	ret = avd_buf_alloc(ctx->dev, h264_ctx->active_slice, payload_len);
-	if (ret)
+	if (ret) {
+		avd_run_postamble(ctx, &run.base);
 		return ret;
+	}
 	memcpy(h264_ctx->active_slice->cpu, data, payload_len);
 	h264_ctx->slice_num++;
 
@@ -792,9 +795,11 @@ static void avd_h264_done(struct avd_ctx *ctx, struct vb2_v4l2_buffer *src_buf,
 	struct avd_h264_ctx *h264_ctx = ctx->priv;
 	int i;
 
-	if (!(src_buf->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF))
+	if (!(src_buf->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF)) {
 		for (i = 0; i < h264_ctx->slice_num; i++)
 			avd_buf_free(avd, &h264_ctx->slices[i]);
+		h264_ctx->slice_num = 0;
+	}
 }
 
 static enum avd_image_fmt avd_h264_get_image_fmt(struct avd_ctx *ctx,
