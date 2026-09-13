@@ -137,7 +137,7 @@ int avd_init_job(struct avd_ctx *ctx, enum avd_codec codec, size_t segments)
 
 	job->codec = codec;
 	job->num = 0;
-	job->segments = kzalloc(sizeof(*job->segments) * segments, GFP_KERNEL);
+	job->segments = kvcalloc(segments, sizeof(*job->segments), GFP_KERNEL);
 	if (!job->segments)
 		ret = -ENOMEM;
 	return ret;
@@ -185,7 +185,7 @@ int avd_submit_job(struct avd_ctx *ctx)
 		       reg);
 	}
 
-	kfree(sub->segments);
+	kvfree(sub->segments);
 	sub->segments = NULL;
 	return 0;
 }
