@@ -2878,11 +2878,8 @@ pub(crate) const SBIO_MATCH_RESULT_LEN: usize = 0xca2;
 
 const MR_USER_ID: usize = 0x000;
 const MR_IDENTITY: usize = 0x004;
-const MR_FLAGS: usize = 0xc8a;
-const MR_FLAG_MATCH: u32 = 1;
 static_assert!(MR_USER_ID + 4 <= SBIO_MATCH_RESULT_LEN);
 static_assert!(MR_IDENTITY + IDENTITY_UUID_LEN <= SBIO_MATCH_RESULT_LEN);
-static_assert!(MR_FLAGS + 4 <= SBIO_MATCH_RESULT_LEN);
 static_assert!(MR_IDENTITY == MR_USER_ID + 4);
 static_assert!(SBIO_MATCH_RESULT_LEN != SBIO_ENROL_RESULT_LEN);
 
@@ -2916,7 +2913,6 @@ impl IdentityV1 {
 pub(crate) struct MatchResult {
     user_id: i32,
     identity: [u8; IDENTITY_UUID_LEN],
-    flags: u32,
 }
 
 impl MatchResult {
@@ -2934,7 +2930,6 @@ impl MatchResult {
                 bytes[MR_USER_ID + 3],
             ]),
             identity,
-            flags: u32::from_le_bytes(bytes[MR_FLAGS..MR_FLAGS + 4].try_into().ok()?),
         })
     }
 
@@ -2943,9 +2938,8 @@ impl MatchResult {
     }
 
     pub(crate) fn matches(&self, user: UserId) -> bool {
-        self.flags & MR_FLAG_MATCH != 0 && self.user_id == user.value()
+        self.user_id == user.value()
     }
-
 }
 
 const OP_SBIO_IMAGE_CLEANUP: u16 = 0x22;
