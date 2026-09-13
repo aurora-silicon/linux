@@ -784,24 +784,59 @@ impl SepData {
                 return;
             }
         }
+        if let Err(e) = self.register_bio() {
+            dev_err!(
+                self.dev,
+                "bringup: could not publish /dev/{} after SKS became ready: {:?}\n",
+                bio::DEVICE_NAME,
+                e
+            );
+        }
     }
 
     fn activate_touchid(&self) -> Result<()> {
         if self.touchid_started.load(Relaxed) {
             return Ok(());
         }
+        if self.touchid_failed.load(Relaxed) {
+            return Err(EIO);
+        }
 
-        let mut store = store::Store::open()?;
-        let index = bio::IdentityIndex::load(&mut store)?;
+        let mut store = store::Store::open().map_err(|e| {
+            dev_err!(self.dev, "Touch ID: opening the host state failed: {:?}\n", e);
+            e
+        })?;
+        let index = bio::IdentityIndex::load(&mut store).map_err(|e| {
+            dev_err!(self.dev, "Touch ID: loading the host identity index failed: {:?}\n", e);
+            e
+        })?;
         *self.host_store.lock() = Some(store);
         *self.bio_index.lock() = index;
 
         self.attach_sensor();
-        self.enable_sbio()?;
-        let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
-            return Err(ENOENT);
+        self.enable_sbio().map_err(|e| {
+            dev_err!(self.dev, "Touch ID: registering the biometric buffers failed: {:?}\n", e);
+            e
+        })?;
+        let stored = match keybag::read(keybag::Slot::Identity) {
+            Ok(keybag::State::Present(stored)) => stored,
+            Ok(keybag::State::Absent(_)) => {
+                dev_err!(self.dev, "Touch ID: no persisted identity keybag exists\n");
+                return Err(ENOENT);
+            }
+            Err(e) => {
+                dev_err!(self.dev, "Touch ID: reading the persisted identity keybag failed: {:?}\n", e);
+                return Err(e);
+            }
         };
-        let (handle, uuid) = self.sks_recover(&stored).ok_or(EIO)?;
+        if !self.sks_ready() {
+            dev_err!(self.dev, "Touch ID: the key-store endpoint is unavailable\n");
+            return Err(ENODEV);
+        }
+        let (handle, uuid) = self.sks_recover(&stored).ok_or_else(|| {
+            dev_err!(self.dev, "Touch ID: the persisted identity keybag did not recover\n");
+            EIO
+        })?;
         self.sks_designate_user_keybag(handle, stored.secret());
         self.sks_machine_refkey(handle, stored.secret());
         let prepared = self.cold_match_continue(handle, uuid);
@@ -811,11 +846,14 @@ impl SepData {
         Ok(())
     }
 
-    // Touch ID starts from the caller's real-root namespace. SEP can therefore
-    // unlock root in initramfs without pinning biometric persistence to tmpfs.
     fn prepare_bio_open(&self) -> Result<()> {
         if let Err(e) = self.activate_touchid() {
-            dev_err!(self.dev, "Touch ID activation failed: {:?}\n", e);
+            self.touchid_failed.store(true, Relaxed);
+            dev_err!(
+                self.dev,
+                "Touch ID activation failed: {:?}; refusing retries this boot because a partial keybag load is not safely repeatable\n",
+                e
+            );
             return Err(e);
         }
         Ok(())

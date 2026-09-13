@@ -631,8 +631,30 @@ impl SepData {
         &self,
         stored: &keybag::StoredKeyBag,
     ) -> Option<(crate::sks::KeyBagHandle, [u8; keybag::UUID_LEN])> {
-        let out = self.sks_send(self.sks_req_load_keybag(stored.wrapped()))?;
-        let body = self.sks_report_response(crate::sks::SKS_LOAD_NAME, &out)?;
+        let request = match self.sks_req_load_keybag(stored.wrapped()) {
+            Ok(request) => request,
+            Err(e) => {
+                dev_err!(self.dev, "sks: could not build LOAD_KEYBAG request: {:?}\n", e);
+                return None;
+            }
+        };
+        let out = self.sks_exchange(request.name, request.msg, &request.img)?;
+
+        dev_info!(
+            self.dev,
+            "sks: LOAD_KEYBAG reply mailbox status {}, response size {}, copied {} bytes\n",
+            out.reply.status,
+            out.reply.response_size,
+            out.response.len()
+        );
+
+        let body = match self.sks_report_response(crate::sks::SKS_LOAD_NAME, &out) {
+            Some(body) => body,
+            None => {
+                dev_warn!(self.dev, "sks: LOAD_KEYBAG reply image was empty or malformed\n");
+                return None;
+            }
+        };
 
         if out.reply.status != 0 {
             dev_warn!(
@@ -656,6 +678,7 @@ impl SepData {
 
         let Some(uuid) = self.sks_read_uuid(handle) else {
             dev_warn!(self.dev, "sks: loaded keybag has no readable UUID\n");
+            let _ = self.sks_send(self.sks_req_unload_keybag(handle));
             return None;
         };
 
@@ -668,6 +691,7 @@ impl SepData {
                 Hex(stored.uuid()),
                 Hex(&uuid)
             );
+            let _ = self.sks_send(self.sks_req_unload_keybag(handle));
             None
         }
     }

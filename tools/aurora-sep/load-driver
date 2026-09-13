@@ -38,3 +38,10 @@ done
 [ "$verified" = true ] || exit 1
 [ -s "$keybag" ] || exit 1
 [ -s "$refkey" ] || exit 1
+
+attempts=300
+while [ "$attempts" -gt 0 ] && [ ! -c /dev/sep-bio ]; do
+    sleep 0.1
+    attempts=$((attempts - 1))
+done
+[ -c /dev/sep-bio ] || exit 1

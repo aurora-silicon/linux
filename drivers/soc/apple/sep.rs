@@ -600,6 +600,7 @@ struct SepData {
 
     bringup_started: Atomic<bool>,
     touchid_started: Atomic<bool>,
+    touchid_failed: Atomic<bool>,
 
     bringup: Atomic<u32>,
 
@@ -778,6 +779,7 @@ impl SepData {
                 keybag_designated: Atomic::new(false),
                 bringup_started: Atomic::new(false),
                 touchid_started: Atomic::new(false),
+                touchid_failed: Atomic::new(false),
                 enrol_open: Atomic::new(false),
                 sensor_calibrated: Atomic::new(false),
                 templates_restored: Atomic::new(false),
@@ -1999,15 +2001,6 @@ impl platform::Driver for SepDriver {
         let data = SepData::new(pdev)?;
 
         *data.mbox.lock() = Some(Mailbox::new_byname(dev, c"mbox", data.clone())?);
-
-        if let Err(e) = data.register_bio() {
-            dev_err!(
-                dev,
-                "could not register /dev/{}: {:?}\n",
-                bio::DEVICE_NAME,
-                e
-            );
-        }
 
         data.attach(&sep_node)?;
 
