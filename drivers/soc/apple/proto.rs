@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 // Copyright 2026 Dj
 
-//! The SEP wire protocol, reverse-engineered: opcode tables, request encoders
-//! and reply decoders.
 use kernel::prelude::*;
 use kernel::soc::apple::mailbox::Message;
 
@@ -77,28 +75,6 @@ pub(crate) fn shmem_registration(iova: u64, size: usize) -> Result<Message> {
         msg0: encode_registration_msg0(iova, size),
         msg1: 0,
     })
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Fourcc(pub(crate) [u8; 4]);
-
-impl Fourcc {
-    pub(crate) const ZERO: Fourcc = Fourcc([0; 4]);
-}
-
-impl kernel::fmt::Display for Fourcc {
-    fn fmt(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
-        use core::fmt::Write;
-        for c in self.0 {
-            let c = if (0x20..0x7f).contains(&c) { c } else { b'.' };
-            f.write_char(c as char)?;
-        }
-        Ok(())
-    }
-}
-
-pub(crate) fn fourcc(msg: &Message) -> Fourcc {
-    Fourcc(((msg.msg0 >> MSG_DATA_SHIFT) as u32).to_be_bytes())
 }
 
 pub(crate) const CONTROL_REPLY_TYPE: u8 = 0x01;

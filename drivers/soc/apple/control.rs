@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 // Copyright 2026 Dj
 
-//! Control-endpoint bookkeeping: the in-flight request table, the tag
-//! allocator, and the reserved-tag entropy sink.
-
 use crate::proto;
 use kernel::prelude::*;
 
@@ -165,5 +162,4 @@ impl ControlState {
     pub(crate) fn entropy_end(&mut self) {
         self.entropy.busy = false;
     }
-
 }

@@ -159,26 +159,12 @@ const MAX_ENDPOINTS: usize = 64;
 #[derive(Clone, Copy)]
 struct Endpoint {
     id: u8,
-    fourcc: proto::Fourcc,
-    have_descriptor: bool,
-    have_config: bool,
-    descriptor_msg0: u64,
-    descriptor_msg1: u32,
-    config_msg0: u64,
-    config_msg1: u32,
 }
 
 impl Endpoint {
     fn new(id: u8) -> Self {
         Endpoint {
             id,
-            fourcc: proto::Fourcc::ZERO,
-            have_descriptor: false,
-            have_config: false,
-            descriptor_msg0: 0,
-            descriptor_msg1: 0,
-            config_msg0: 0,
-            config_msg1: 0,
         }
     }
 }
@@ -451,8 +437,6 @@ struct Abandoned {
 struct SksProbe {
     active: bool,
     captured: KVec<Message>,
-    label: Option<&'static CStr>,
-    unsolicited: u32,
     abandoned: [Option<Abandoned>; SKS_MAX_ABANDONED],
     abandoned_next: usize,
 }
@@ -462,8 +446,6 @@ impl SksProbe {
         SksProbe {
             active: false,
             captured: KVec::new(),
-            label: None,
-            unsolicited: 0,
             abandoned: [None; SKS_MAX_ABANDONED],
             abandoned_next: 0,
         }
@@ -486,8 +468,6 @@ impl ScrdProbe {
 
 struct XarmState {
     deferred_query: Option<u8>,
-    serviced: u32,
-    refused: u32,
     os_uuid: Option<[u8; 16]>,
 }
 
@@ -495,8 +475,6 @@ impl XarmState {
     fn new() -> Self {
         XarmState {
             deferred_query: None,
-            serviced: 0,
-            refused: 0,
             os_uuid: None,
         }
     }
@@ -504,18 +482,12 @@ impl XarmState {
 
 struct EndpointTable {
     eps: KVec<Endpoint>,
-    discovery_msgs: u32,
-    unknown_types: u32,
-    dirty: bool,
 }
 
 impl EndpointTable {
     fn new() -> Self {
         EndpointTable {
             eps: KVec::new(),
-            discovery_msgs: 0,
-            unknown_types: 0,
-            dirty: false,
         }
     }
 
@@ -527,7 +499,6 @@ impl EndpointTable {
             return Err(ENOSPC);
         }
         self.eps.push(Endpoint::new(id), GFP_KERNEL)?;
-        self.dirty = true;
         Ok(self.eps.len() - 1)
     }
 }
@@ -1109,7 +1080,6 @@ impl SepData {
         let req = crate::xarm::decode_xarm(&msg);
 
         if xarm::is_silent(req.opcode) {
-            self.xarm.lock().serviced += 1;
             return;
         }
 
@@ -1121,9 +1091,6 @@ impl SepData {
                 return;
             }
 
-            let mut state = self.xarm.lock();
-            state.refused += 1;
-            drop(state);
             self.fail_xarm(req.tag);
             return;
         }
@@ -1178,8 +1145,6 @@ impl SepData {
                 return;
             }
         }
-
-        self.xarm.lock().serviced += 1;
 
         self.send_xarm_reply(&done.reply);
     }
@@ -1263,7 +1228,6 @@ impl SepData {
             args: [0; 3],
         };
         reply.args[0] = u8::from(PROTECTED_DATA_AVAILABLE);
-        self.xarm.lock().serviced += 1;
         self.send_xarm_reply(&reply);
     }
 
@@ -1724,39 +1688,13 @@ impl SepData {
         }
     }
 
-    fn on_discovery(&self, msg: Message, f: proto::Fields) {
+    fn on_discovery(&self, _msg: Message, f: proto::Fields) {
         let mut table = self.endpoints.lock();
-        table.discovery_msgs += 1;
-
-        let id = f.param;
-
-        let idx = match table.slot(id) {
-            Ok(i) => i,
-            Err(_) => {
-                return;
-            }
-        };
-
         match f.ty {
-            proto::DISCOVER_TYPE_DESCRIPTOR => {
-                let cc = proto::fourcc(&msg);
-                let e = &mut table.eps[idx];
-                e.have_descriptor = true;
-                e.descriptor_msg0 = msg.msg0;
-                e.descriptor_msg1 = msg.msg1;
-                e.fourcc = cc;
-                table.dirty = true;
+            proto::DISCOVER_TYPE_DESCRIPTOR | proto::DISCOVER_TYPE_CONFIG => {
+                let _ = table.slot(f.param);
             }
-            proto::DISCOVER_TYPE_CONFIG => {
-                let e = &mut table.eps[idx];
-                e.have_config = true;
-                e.config_msg0 = msg.msg0;
-                e.config_msg1 = msg.msg1;
-                table.dirty = true;
-            }
-            _ => {
-                table.unknown_types += 1;
-            }
+            _ => {}
         }
     }
 

@@ -49,7 +49,6 @@ impl SepData {
             drop(probe);
             self.sks_wq.notify_all();
         } else {
-            probe.unsolicited = probe.unsolicited.wrapping_add(1);
             let matched = probe
                 .abandoned
                 .iter()
@@ -156,7 +155,7 @@ impl SepData {
         } else {
             sized_ms
         };
-        self.sks_arm(label);
+        self.sks_arm();
         if self.send(msg).is_err() {
             self.sks_disarm();
             let _ = self.sks_zero_buffers();
@@ -776,17 +775,15 @@ impl SepData {
         true
     }
 
-    fn sks_arm(&self, label: &'static CStr) {
+    fn sks_arm(&self) {
         let mut probe = self.sks_probe.lock();
         probe.captured.clear();
-        probe.label = Some(label);
         probe.active = true;
     }
 
     fn sks_disarm(&self) -> KVec<Message> {
         let mut probe = self.sks_probe.lock();
         probe.active = false;
-        probe.label = None;
         core::mem::take(&mut probe.captured)
     }
 
