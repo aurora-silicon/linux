@@ -65,6 +65,13 @@ impl DtNode {
         (!np.is_null()).then_some(DtNode(np))
     }
 
+    fn parent(&self) -> Option<DtNode> {
+        // SAFETY: `self.0` is a valid node per the type invariant; `of_get_parent`
+        // takes a reference on what it returns and returns NULL at the root.
+        let np = unsafe { bindings::of_get_parent(self.0) };
+        (!np.is_null()).then_some(DtNode(np))
+    }
+
     fn as_ptr(&self) -> *mut bindings::device_node {
         self.0
     }
@@ -82,7 +89,6 @@ impl DtNode {
         };
         !p.is_null()
     }
-
 }
 
 impl Drop for DtNode {
@@ -392,6 +398,33 @@ unsafe fn add_u32(
 }
 
 pub(crate) fn enable_spi_sensor(base: u64, cs: u32) -> Result<()> {
+    // A machine that describes the sensor in its own device tree (compatible
+    // apple,mesa-fingerprint) is handled machine-agnostically: enable that node
+    // and its SPI controller wherever they sit, with the power/IRQ GPIOs coming
+    // from the node itself. Only when no such node exists do we fall back to
+    // creating one at the caller's fixed controller address.
+    if let Some(sensor) = DtNode::find_compatible(SENSOR_COMPATIBLE) {
+        let controller = sensor.parent().ok_or_else(|| {
+            pr_err!("apple_sep: sensor node has no parent SPI controller\n");
+            ENODEV
+        })?;
+        pr_info!(
+            "apple_sep: sensor node present in the device tree; enabling it and its SPI bus\n"
+        );
+        return with_changeset(|cs_handle| {
+            let mut queued = false;
+            if !controller.is_available() {
+                queue_status_okay(cs_handle, &controller)?;
+                queued = true;
+            }
+            if !sensor.is_available() {
+                queue_status_okay(cs_handle, &sensor)?;
+                queued = true;
+            }
+            Ok(queued)
+        });
+    }
+
     let controller = node_at_address(base).ok_or_else(|| {
         pr_err!(
             "apple_sep: no device-tree node with reg base 0x{:x}; the sensor's SPI bus is not in this tree\n",
