@@ -18,12 +18,7 @@ extern "C" {
     fn sep_sensor_power(on: c_int) -> c_int;
     fn sep_sensor_xfer(tx: *const c_void, rx: *mut c_void, len: usize) -> c_int;
     fn sep_sensor_xfer_tx(tx: *const c_void, len: usize) -> c_int;
-    fn sep_sensor_xfer2(
-        tx: *const c_void,
-        tx_len: usize,
-        rx: *mut c_void,
-        rx_len: usize,
-    ) -> c_int;
+    fn sep_sensor_xfer2(tx: *const c_void, tx_len: usize, rx: *mut c_void, rx_len: usize) -> c_int;
 }
 
 // Spi2.
@@ -89,7 +84,8 @@ impl PowerSource {
 pub(crate) const POWER_ON_READ_DELAYS_MS: [u32; 4] = [0, 3, 10, 50];
 
 pub(crate) const STATUS_IDENTIFIER: usize = 12;
-pub(crate) const EXPECTED_IDENTIFIER: u16 = 0x3352;
+// Known Mesa sensor revisions: 0x3352 through M4, 0x335e on newer parts.
+pub(crate) const KNOWN_IDENTIFIERS: [u16; 2] = [0x3352, 0x335e];
 static_assert!(STATUS_IDENTIFIER + 2 <= STATUS_LEN);
 
 const CMD_LEN: usize = 7;
@@ -613,9 +609,7 @@ pub(crate) fn status() -> Result<Status> {
     let mut rx = [0u8; STATUS_XFER_LEN];
 
     // SAFETY: both buffers are `STATUS_XFER_LEN` bytes and live across the call.
-    check(unsafe {
-        sep_sensor_xfer(tx.as_ptr().cast(), rx.as_mut_ptr().cast(), STATUS_XFER_LEN)
-    })?;
+    check(unsafe { sep_sensor_xfer(tx.as_ptr().cast(), rx.as_mut_ptr().cast(), STATUS_XFER_LEN) })?;
 
     let mut raw = [0u8; STATUS_LEN];
     raw.copy_from_slice(&rx[STATUS_AT..STATUS_AT + STATUS_LEN]);
@@ -638,7 +632,6 @@ impl Capture {
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.0
     }
-
 }
 
 impl Drop for Capture {

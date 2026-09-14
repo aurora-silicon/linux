@@ -4,10 +4,10 @@
 //! The enclave matches; no biometric image ever crosses to userspace.
 
 use super::*;
-use kernel::prelude::*;
-use kernel::soc::apple::mailbox::Message;
 use crate::proto::*;
 use crate::sks::SKS_AUTH_TOKEN_LEN;
+use kernel::prelude::*;
+use kernel::soc::apple::mailbox::Message;
 
 impl SepData {
     fn sbio_expect_ok(&self, op: &crate::sbio::SbioOp) -> Option<KVec<u8>> {
@@ -31,15 +31,9 @@ impl SepData {
 
         match err as u16 {
             crate::sbio::SBIO_STATUS_OK => SbioOutcome::Ok(done.payload),
-            crate::sbio::SBIO_STATUS_PREREQUISITE => {
-                SbioOutcome::PrerequisiteMissing
-            }
-            crate::sbio::SBIO_STATUS_16 => {
-                SbioOutcome::Status16
-            }
-            _ => {
-                SbioOutcome::Other
-            }
+            crate::sbio::SBIO_STATUS_PREREQUISITE => SbioOutcome::PrerequisiteMissing,
+            crate::sbio::SBIO_STATUS_16 => SbioOutcome::Status16,
+            _ => SbioOutcome::Other,
         }
     }
 
@@ -58,15 +52,9 @@ impl SepData {
         );
 
         let policy_ok = match self.sbio_call(&crate::sbio::sbio_match_policy()) {
-            SbioOutcome::Ok(policy) if policy.len() == crate::sbio::SBIO_MATCH_POLICY_LEN => {
-                true
-            }
-            SbioOutcome::Ok(_) => {
-                false
-            }
-            _ => {
-                false
-            }
+            SbioOutcome::Ok(policy) if policy.len() == crate::sbio::SBIO_MATCH_POLICY_LEN => true,
+            SbioOutcome::Ok(_) => false,
+            _ => false,
         };
 
         synced && policy_ok
@@ -101,7 +89,9 @@ impl SepData {
             );
         }
 
-        kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(ENROL_REPOSITION_MS)));
+        kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(
+            ENROL_REPOSITION_MS,
+        )));
     }
 
     fn stash_enrol_identity(&self, record: &[u8]) {
@@ -290,7 +280,11 @@ impl SepData {
         true
     }
 
-    fn open_fresh_context(&self, user: crate::sbio::UserId, proof: &crate::sbio::NoExistingCatacomb) -> bool {
+    fn open_fresh_context(
+        &self,
+        user: crate::sbio::UserId,
+        proof: &crate::sbio::NoExistingCatacomb,
+    ) -> bool {
         let system = crate::sbio::sbio_select_context(crate::sbio::ContextScope::SYSTEM, proof);
         if self.sbio_expect_ok(&system).is_none() {
             return false;
@@ -313,7 +307,8 @@ impl SepData {
             }
         }
 
-        let per_user = crate::sbio::sbio_select_context(crate::sbio::ContextScope::user(user), proof);
+        let per_user =
+            crate::sbio::sbio_select_context(crate::sbio::ContextScope::user(user), proof);
         if self.sbio_expect_ok(&per_user).is_none() {
             return false;
         }
@@ -365,7 +360,8 @@ impl SepData {
             );
             return None;
         };
-        let op = crate::sbio::sbio_begin_enrol(user, crate::sbio::BE_AUTH_TYPE_ACM_CONTEXT, &acm_handle);
+        let op =
+            crate::sbio::sbio_begin_enrol(user, crate::sbio::BE_AUTH_TYPE_ACM_CONTEXT, &acm_handle);
 
         match self.sbio_call(&op) {
             SbioOutcome::Ok(_payload) => {
@@ -375,9 +371,7 @@ impl SepData {
                     armed: true,
                 })
             }
-            _ => {
-                None
-            }
+            _ => None,
         }
     }
 
@@ -469,12 +463,8 @@ impl SepData {
             return RestoreOutcome::Failed;
         };
         match crate::sbio::component_action(state) {
-            crate::sbio::ComponentAction::AlreadyActive => {
-                RestoreOutcome::AlreadyActive
-            }
-            crate::sbio::ComponentAction::Unsupported => {
-                RestoreOutcome::Failed
-            }
+            crate::sbio::ComponentAction::AlreadyActive => RestoreOutcome::AlreadyActive,
+            crate::sbio::ComponentAction::Unsupported => RestoreOutcome::Failed,
             crate::sbio::ComponentAction::Load => {
                 let Some(blob) = self.read_stored(kind, what) else {
                     return RestoreOutcome::NoStoredFile;
@@ -499,13 +489,15 @@ impl SepData {
                         self.confirm_active(id, what, LoadAnswer::StatusZero)
                     }
                     Ok(done)
-                        if done.status.answered() == Some(crate::sbio::SBIO_STATUS_COLD_TRANSITION)
+                        if done.status.answered()
+                            == Some(crate::sbio::SBIO_STATUS_COLD_TRANSITION)
                             && cold_ok =>
                     {
                         self.confirm_active(id, what, LoadAnswer::ColdTransition)
                     }
                     Ok(done)
-                        if done.status.answered() == Some(crate::sbio::SBIO_STATUS_COLD_TRANSITION) =>
+                        if done.status.answered()
+                            == Some(crate::sbio::SBIO_STATUS_COLD_TRANSITION) =>
                     {
                         RestoreOutcome::Failed
                     }
@@ -516,9 +508,7 @@ impl SepData {
                     {
                         self.confirm_active(id, what, LoadAnswer::AlreadyActive)
                     }
-                    _ => {
-                        RestoreOutcome::Failed
-                    }
+                    _ => RestoreOutcome::Failed,
                 }
             }
         }
@@ -540,15 +530,9 @@ impl SepData {
             Some(state) if state & crate::sbio::COMPONENT_STATE_ACTIVE != 0 => {
                 RestoreOutcome::Restored
             }
-            Some(state) if state & crate::sbio::COMPONENT_STATE_COLD != 0 => {
-                RestoreOutcome::Failed
-            }
-            Some(_) => {
-                RestoreOutcome::Failed
-            }
-            None => {
-                RestoreOutcome::Failed
-            }
+            Some(state) if state & crate::sbio::COMPONENT_STATE_COLD != 0 => RestoreOutcome::Failed,
+            Some(_) => RestoreOutcome::Failed,
+            None => RestoreOutcome::Failed,
         }
     }
 
@@ -560,9 +544,7 @@ impl SepData {
             return RestoreOutcome::Failed;
         };
         match self.sbio_transfer_raw(request.opcode(), request.name(), request.payload()) {
-            Ok(done) if done.status.is_ok() => {
-                RestoreOutcome::Restored
-            }
+            Ok(done) if done.status.is_ok() => RestoreOutcome::Restored,
             Ok(done)
                 if matches!(
                     done.status,
@@ -571,12 +553,8 @@ impl SepData {
             {
                 RestoreOutcome::EmptyTolerated
             }
-            Ok(_) => {
-                RestoreOutcome::Failed
-            }
-            Err(_) => {
-                RestoreOutcome::Failed
-            }
+            Ok(_) => RestoreOutcome::Failed,
+            Err(_) => RestoreOutcome::Failed,
         }
     }
 
@@ -589,9 +567,7 @@ impl SepData {
         match self.with_host_store(|store| store.read(&store::Key::root(kind))) {
             Some(Ok(Some(blob))) => Some(blob),
             Some(Ok(None)) => None,
-            Some(Err(_)) => {
-                None
-            }
+            Some(Err(_)) => None,
             None => None,
         }
     }
@@ -626,7 +602,6 @@ impl SepData {
     }
 
     fn save_after_match(&self, user: crate::sbio::UserId) -> bool {
-
         if !self.save_lockout() {
             dev_err!(
                 self.dev,
@@ -706,13 +681,11 @@ impl SepData {
         if blob.is_empty() {
             return false;
         }
-        match self.with_host_store(|store| store.write(&store::Key::root(PRIVATE_TYPE_LOCKOUT), &blob)) {
-            Some(Ok(())) => {
-                true
-            }
-            Some(Err(_)) => {
-                false
-            }
+        match self
+            .with_host_store(|store| store.write(&store::Key::root(PRIVATE_TYPE_LOCKOUT), &blob))
+        {
+            Some(Ok(())) => true,
+            Some(Err(_)) => false,
             None => false,
         }
     }
@@ -776,11 +749,17 @@ impl SepData {
         }
         if *module_parameters::provision_keybag.value() != 0 {
             if *module_parameters::xart_writes.value() == 0 {
-                dev_err!(self.dev, "bringup: provision_keybag=1 requires xart_writes=1\n");
+                dev_err!(
+                    self.dev,
+                    "bringup: provision_keybag=1 requires xart_writes=1\n"
+                );
                 return;
             }
             if !self.sks_provision_identity_keybag() {
-                dev_err!(self.dev, "bringup: identity-keybag provisioning failed; no retry this boot\n");
+                dev_err!(
+                    self.dev,
+                    "bringup: identity-keybag provisioning failed; no retry this boot\n"
+                );
                 return;
             }
         }
@@ -802,21 +781,30 @@ impl SepData {
             return Err(EIO);
         }
 
-        let mut store = store::Store::open().map_err(|e| {
-            dev_err!(self.dev, "Touch ID: opening the host state failed: {:?}\n", e);
-            e
+        let mut store = store::Store::open().inspect_err(|e| {
+            dev_err!(
+                self.dev,
+                "Touch ID: opening the host state failed: {:?}\n",
+                e
+            );
         })?;
-        let index = bio::IdentityIndex::load(&mut store).map_err(|e| {
-            dev_err!(self.dev, "Touch ID: loading the host identity index failed: {:?}\n", e);
-            e
+        let index = bio::IdentityIndex::load(&mut store).inspect_err(|e| {
+            dev_err!(
+                self.dev,
+                "Touch ID: loading the host identity index failed: {:?}\n",
+                e
+            );
         })?;
         *self.host_store.lock() = Some(store);
         *self.bio_index.lock() = index;
 
         self.attach_sensor();
-        self.enable_sbio().map_err(|e| {
-            dev_err!(self.dev, "Touch ID: registering the biometric buffers failed: {:?}\n", e);
-            e
+        self.enable_sbio().inspect_err(|e| {
+            dev_err!(
+                self.dev,
+                "Touch ID: registering the biometric buffers failed: {:?}\n",
+                e
+            );
         })?;
         let stored = match keybag::read(keybag::Slot::Identity) {
             Ok(keybag::State::Present(stored)) => stored,
@@ -825,16 +813,26 @@ impl SepData {
                 return Err(ENOENT);
             }
             Err(e) => {
-                dev_err!(self.dev, "Touch ID: reading the persisted identity keybag failed: {:?}\n", e);
+                dev_err!(
+                    self.dev,
+                    "Touch ID: reading the persisted identity keybag failed: {:?}\n",
+                    e
+                );
                 return Err(e);
             }
         };
         if !self.sks_ready() {
-            dev_err!(self.dev, "Touch ID: the key-store endpoint is unavailable\n");
+            dev_err!(
+                self.dev,
+                "Touch ID: the key-store endpoint is unavailable\n"
+            );
             return Err(ENODEV);
         }
         let (handle, uuid) = self.sks_recover(&stored).ok_or_else(|| {
-            dev_err!(self.dev, "Touch ID: the persisted identity keybag did not recover\n");
+            dev_err!(
+                self.dev,
+                "Touch ID: the persisted identity keybag did not recover\n"
+            );
             EIO
         })?;
         self.sks_designate_user_keybag(handle, stored.secret());
@@ -1121,7 +1119,10 @@ impl SepData {
         let stage = self.bringup.load(Relaxed);
 
         if stage >= BRINGUP_ESTABLISHED {
-            if self.sbio_expect_ok(&crate::sbio::sbio_clear_state()).is_none() {
+            if self
+                .sbio_expect_ok(&crate::sbio::sbio_clear_state())
+                .is_none()
+            {
                 return false;
             }
         }
@@ -1151,9 +1152,7 @@ impl SepData {
                 self.bringup.store(BRINGUP_ESTABLISHED, Relaxed);
                 true
             }
-            _ => {
-                false
-            }
+            _ => false,
         }
     }
 
@@ -1184,7 +1183,7 @@ impl SepData {
             }
 
             if let sensor::Offset12::Identifier(id) = st.offset12() {
-                if id != 0 && id != sensor::EXPECTED_IDENTIFIER {
+                if id != 0 && !sensor::KNOWN_IDENTIFIERS.contains(&id) {
                     return None;
                 }
             }
@@ -1283,14 +1282,16 @@ impl SepData {
     }
 
     fn complete_bringup(&self, patch: PatchLoaded) -> bool {
-
         let Some(params) = self.apply_sensor_parameters() else {
             return false;
         };
 
         let op = crate::sbio::sbio_complete_init(patch, params);
         if self.sbio_expect_ok(&op).is_none() {
-            dev_err!(self.dev, "sensor: 0x01 COMPLETE_INIT failed — status above\n");
+            dev_err!(
+                self.dev,
+                "sensor: 0x01 COMPLETE_INIT failed — status above\n"
+            );
             return false;
         }
 
@@ -1368,12 +1369,8 @@ impl SepData {
 
         let relayed = blob.len();
         match sensor::send_encrypted_parameters(&blob, geom) {
-            Ok(()) => {
-                Some(relayed)
-            }
-            Err(sensor::ParamsError::Empty) => {
-                None
-            }
+            Ok(()) => Some(relayed),
+            Err(sensor::ParamsError::Empty) => None,
             Err(sensor::ParamsError::TooLong(n, capacity)) => {
                 dev_err!(
                     self.dev,
@@ -1385,14 +1382,11 @@ impl SepData {
                 );
                 None
             }
-            Err(sensor::ParamsError::Transfer(_e)) => {
-                None
-            }
+            Err(sensor::ParamsError::Transfer(_e)) => None,
         }
     }
 
     fn establish_session(&self) -> bool {
-
         let share = match self.sbio_call(&crate::sbio::sbio_request_session_share()) {
             SbioOutcome::Ok(sh) => sh,
             SbioOutcome::Status16 => {
@@ -1426,20 +1420,13 @@ impl SepData {
         };
 
         match self.sbio_transfer(&crate::sbio::sbio_commit_session_share(&reply)) {
-            Ok(done) if done.status.is_ok() => {
-                true
-            }
-            Ok(_) => {
-                false
-            }
-            Err(_) => {
-                false
-            }
+            Ok(done) if done.status.is_ok() => true,
+            Ok(_) => false,
+            Err(_) => false,
         }
     }
 
     fn init_sequence_counter(&self) -> bool {
-
         let challenge = match self.sbio_call(&crate::sbio::sbio_request_challenge()) {
             SbioOutcome::Ok(c) => c,
             SbioOutcome::PrerequisiteMissing => {
@@ -1478,15 +1465,9 @@ impl SepData {
         };
 
         match self.sbio_transfer(&crate::sbio::sbio_commit_challenge(&reply)) {
-            Ok(done) if done.status.is_ok() => {
-                true
-            }
-            Ok(_) => {
-                false
-            }
-            Err(_) => {
-                false
-            }
+            Ok(done) if done.status.is_ok() => true,
+            Ok(_) => false,
+            Err(_) => false,
         }
     }
 
@@ -1538,7 +1519,6 @@ impl SepData {
                 }
             };
             if st.patch_ack() == sensor::PATCH_ACCEPTED {
-
                 if let Ok(after) = sensor::status() {
                     if after.state == sensor::STATE_NEEDS_PATCH {
                         return None;
@@ -1584,7 +1564,10 @@ impl SepData {
 
         let capture = match sensor::read_capture(available) {
             Ok(c) => c,
-            Err(sensor::CaptureError::Checksum { advertised: _advertised, computed: _computed }) => {
+            Err(sensor::CaptureError::Checksum {
+                advertised: _advertised,
+                computed: _computed,
+            }) => {
                 return ImageOutcome::Retry;
             }
             Err(sensor::CaptureError::Length(_n)) => {
@@ -1768,11 +1751,11 @@ impl SepData {
                 // 0xFE requests the peer's next packet and acks the final one; nothing to send
                 self.sbio_wq.notify_all();
             }
-            transfer::Progress::Ignored => {},
+            transfer::Progress::Ignored => {}
             transfer::Progress::Grant => {
                 self.sbio_wq.notify_all();
             }
-            transfer::Progress::Notification => {},
+            transfer::Progress::Notification => {}
             transfer::Progress::Failed => {
                 self.sbio_wq.notify_all();
             }
@@ -2070,9 +2053,10 @@ impl SepData {
 
     fn bio_attest(&self, arg: usize) -> Result<bio::Handled> {
         let user = kernel::uaccess::UserPtr::from_addr(arg);
-        let req: bio::Attest = kernel::uaccess::UserSlice::new(user, core::mem::size_of::<bio::Attest>())
-            .reader()
-            .read()?;
+        let req: bio::Attest =
+            kernel::uaccess::UserSlice::new(user, core::mem::size_of::<bio::Attest>())
+                .reader()
+                .read()?;
         let (sig, pubk) = self.refkey_attest_sign(&req.challenge)?;
         if sig.len() > bio::ATTEST_SIG_MAX || pubk.len() != bio::ATTEST_PUB_LEN {
             return Err(EIO);
@@ -2146,7 +2130,7 @@ impl SepData {
             .sks_send(self.sks_req_copy_uuid_special(special))
             .and_then(|out| self.sks_uuid_from_reply(&out));
         match uuid_ok {
-            Some(got) if got == uuid => {},
+            Some(got) if got == uuid => {}
             Some(_) => {
                 return false;
             }
@@ -2172,7 +2156,11 @@ impl SepData {
         Ok(())
     }
 
-    pub(crate) fn wrapped_from_copy_reply(&self, out: &SksOutcome, _from: &CStr) -> Option<KVec<u8>> {
+    pub(crate) fn wrapped_from_copy_reply(
+        &self,
+        out: &SksOutcome,
+        _from: &CStr,
+    ) -> Option<KVec<u8>> {
         let body = self.sks_report_response(c"COPY_KEYBAG", out)?;
         if out.reply.status != 0 || image::operation_status(body).unwrap_or(-1) != 0 {
             return None;
@@ -3050,7 +3038,6 @@ impl ImagePurpose {
             ImagePurpose::Matching => 0x09,
         }
     }
-
 }
 
 static_assert!(ImagePurpose::Enrolment.offset() != ImagePurpose::Matching.offset());
