@@ -70,6 +70,17 @@ static void sep_acquire_power(struct spi_device *spi)
 	}
 	sep_power = NULL;
 
+	/*
+	 * The fallback below is the j414s power line; a sibling board's sensor sits
+	 * on a different pin, so only j414s may use it. Every other machine must
+	 * describe the power GPIO in its device node (the gpiod_get_index path).
+	 */
+	if (!of_machine_is_compatible("apple,j414s")) {
+		dev_warn(&spi->dev,
+			 "sep sensor: no power GPIO in the device node; describe gpios in DT\n");
+		return;
+	}
+
 	np = of_find_node_by_path(SEP_SENSOR_GPIO_NODE);
 	if (!np) {
 		dev_warn(&spi->dev,
