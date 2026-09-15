@@ -1250,13 +1250,25 @@ static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	struct v4l2_ctrl *ctrl;
 	u32 dst_len, mv_color_len;
 
+	if (!v4l2_ctrl_find(&ctx->ctrl_hdl,
+			    V4L2_CID_STATELESS_HEVC_ENTRY_POINT_OFFSETS))
+		return -EINVAL;
+
+	/*
+	 * Apply the request's controls before reading them. Until then the
+	 * element counts of the dynamic arrays belong to the previous request
+	 * (elems) or to whoever set controls last (new_elems), and setting a
+	 * larger array can move their storage.
+	 */
+	avd_run_preamble(ctx, &run->base);
+
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
 			      V4L2_CID_STATELESS_HEVC_DECODE_PARAMS);
 	run->decode = ctrl ? ctrl->p_cur.p : NULL;
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
 			      V4L2_CID_STATELESS_HEVC_SLICE_PARAMS);
 	run->sl = ctrl ? ctrl->p_cur.p : NULL;
-	run->num_slices = ctrl ? ctrl->new_elems : 0;
+	run->num_slices = ctrl ? ctrl->elems : 0;
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_SPS);
 	run->sps = ctrl ? ctrl->p_cur.p : NULL;
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_PPS);
@@ -1267,12 +1279,8 @@ static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
 
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
 			      V4L2_CID_STATELESS_HEVC_ENTRY_POINT_OFFSETS);
-	run->entry_point_offsets = ctrl ? ctrl->p_cur.p : NULL;
-	if (!run->entry_point_offsets)
-		return -EINVAL;
-	run->num_entry_point_offsets = ctrl ? ctrl->new_elems : 0;
-
-	avd_run_preamble(ctx, &run->base);
+	run->entry_point_offsets = ctrl->p_cur.p;
+	run->num_entry_point_offsets = ctrl->elems;
 
 	dst_len = run->base.bufs.dst->vb2_buf.planes[0].length;
 
