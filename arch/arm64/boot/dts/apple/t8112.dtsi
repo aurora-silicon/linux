@@ -888,6 +888,20 @@
 			status = "disabled";
 		};
 
+		spi2: spi@235108000 {
+			compatible = "apple,t8112-spi", "apple,spi";
+			reg = <0x2 0x35108000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 750 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>;
+			pinctrl-0 = <&spi2_pins>;
+			pinctrl-names = "default";
+			power-domains = <&ps_spi2>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
 		spi3: spi@23510c000 {
 			compatible = "apple,t8112-spi", "apple,spi";
 			reg = <0x2 0x3510c000 0x0 0x4000>;
@@ -1289,6 +1303,13 @@
 					<APPLE_PINMUX(47, 1)>,
 					<APPLE_PINMUX(48, 1)>,
 					<APPLE_PINMUX(49, 1)>;
+			};
+
+			spi2_pins: spi2-pins {
+				/* Three signal pads; SPI2 uses the controller's native chip select. */
+				pinmux = <APPLE_PINMUX(64, 1)>,
+					<APPLE_PINMUX(65, 1)>,
+					<APPLE_PINMUX(66, 1)>;
 			};
 
 			spi3_pins: spi3-pins {
