@@ -1015,6 +1015,12 @@ static int avd_hevc_validate_sps(struct avd_ctx *ctx,
 	if (sps->pic_width_in_luma_samples > ctx->coded_fmt.fmt.pix_mp.width ||
 	    sps->pic_height_in_luma_samples > ctx->coded_fmt.fmt.pix_mp.height)
 		return -EINVAL;
+	if (sps->bit_depth_luma_minus8 != sps->bit_depth_chroma_minus8)
+		/* Luma and chroma bit depth mismatch: the firmware faults (H0 error) */
+		return -EINVAL;
+	if (sps->chroma_format_idc != 1)
+		/* Only 4:2:0 has a capture format */
+		return -EINVAL;
 
 	return 0;
 }
