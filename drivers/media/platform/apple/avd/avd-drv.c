@@ -56,9 +56,11 @@ void fill_comp(struct avd_comp *comp, enum avd_image_fmt image_fmt, u32 width,
 
 	/* y has 32x32 tiles and 32 bytes of metadata per tile */
 	calc_tile_meta(width, height, bit_depth, 32, 32, &y, &y_meta);
-	/* uv has 16x16 tiles and 8 bytes of metadata per tile */
-	calc_tile_meta(width / 2, height / 2, bit_depth * 2, 16, 8, &uv,
-		       &uv_meta);
+	/* uv has 16x16 tiles and 8 bytes of metadata per tile; 4:2:2 chroma is full height */
+	calc_tile_meta(width / 2,
+		       (image_fmt == AVD_IMG_FMT_422_8BIT ||
+			image_fmt == AVD_IMG_FMT_422_10BIT) ? height : height / 2,
+		       bit_depth * 2, 16, 8, &uv, &uv_meta);
 
 	/* output like DCP driver expects */
 	comp->offsets[0] = y;
