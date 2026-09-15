@@ -908,6 +908,10 @@ static void avd_stop_streaming(struct vb2_queue *q)
 
 		if (desc->ops->stop)
 			desc->ops->stop(ctx);
+
+		/* Drop a job table left over from a frame that never finished. */
+		kvfree(ctx->job.segments);
+		ctx->job.segments = NULL;
 	}
 
 	avd_queue_cleanup(q, VB2_BUF_STATE_ERROR);

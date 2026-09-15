@@ -139,6 +139,8 @@ int avd_init_job(struct avd_ctx *ctx, enum avd_codec codec, size_t segments)
 
 	job->codec = codec;
 	job->num = 0;
+	/* A table that was built but never submitted still belongs to us. */
+	kvfree(job->segments);
 	job->segments = kvcalloc(segments, sizeof(*job->segments), GFP_KERNEL);
 	if (!job->segments)
 		ret = -ENOMEM;
@@ -510,6 +512,7 @@ static int avd_release(struct file *filp)
 	v4l2_ctrl_handler_free(&ctx->ctrl_hdl);
 	v4l2_fh_exit(&ctx->fh);
 	avd_buf_free(ctx->dev, &ctx->inst);
+	kvfree(ctx->job.segments);
 	kfree(ctx);
 
 	return 0;
