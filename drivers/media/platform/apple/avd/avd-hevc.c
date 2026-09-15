@@ -819,7 +819,7 @@ struct sl_ctx {
 };
 
 /* TODO */
-static void stream_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
+static int stream_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
 {
 	const struct v4l2_ctrl_hevc_sps *sps = run->sps;
 	const struct v4l2_ctrl_hevc_pps *pps = run->pps;
@@ -860,12 +860,12 @@ static void stream_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
 		to = tiles_enabled ? sl->num_entry_point_offsets + 1 : 1;
 		if (tiles_enabled &&
 		    sl->num_entry_point_offsets + entry_point_idx >
-			    run->num_entry_point_offsets + 1) {
+			    run->num_entry_point_offsets) {
 			dev_err(ctx->dev->dev,
-				"to few entry points! has: %d, needs > %d",
+				"too few entry points: has %d, needs %d",
 				run->num_entry_point_offsets,
 				sl->num_entry_point_offsets + entry_point_idx);
-			return;
+			return -EINVAL;
 		}
 		for (i = 0; i < to; i++) {
 			first_segment = i == 0;
@@ -966,6 +966,8 @@ static void stream_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	}
 
 	hevc_ctx->submit_num = pos;
+
+	return 0;
 }
 
 static void update_dec_buf_info(struct avd_decoded_buffer *buf,
@@ -1313,7 +1315,7 @@ static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
 
 static int avd_hevc_run(struct avd_ctx *ctx)
 {
-	struct avd_hevc_run run;
+	struct avd_hevc_run run = {};
 	struct avd_decoded_buffer *dst;
 	int ret;
 
@@ -1326,22 +1328,27 @@ static int avd_hevc_run(struct avd_ctx *ctx)
 
 	ret = avd_hevc_compute_tiles(ctx, &run);
 	if (ret)
-		goto done;
+		goto complete;
 
 	ret = avd_hevc_alloc_scratch(ctx, &run);
 	if (ret)
-		goto done;
+		goto complete;
 
 	ret = avd_init_job(ctx, AVD_CODEC_HEVC,
 			   run.num_slices + run.num_entry_point_offsets + 1);
 	if (ret)
-		goto done;
+		goto complete;
 
 	set_header(ctx, &run);
-	stream_slices(ctx, &run);
+	ret = stream_slices(ctx, &run);
 	avd_run_postamble(ctx, &run.base);
+	if (!ret)
+		ret = avd_submit_job(ctx);
+	goto done;
 
-	ret = avd_submit_job(ctx);
+complete:
+	/* The request was applied; complete it on every way out. */
+	avd_run_postamble(ctx, &run.base);
 done:
 	kfree(run.tile_info.ctb_addr_rs_to_ts);
 	kfree(run.tile_info.tile_ids);
