@@ -1253,10 +1253,11 @@ static void avd_hevc_stop(struct avd_ctx *ctx)
 
 static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
 {
-	struct v4l2_ctrl *ctrl;
+	struct v4l2_ctrl *ctrl, *sl, *ep;
 	u32 dst_len, mv_color_len;
 
-	if (!v4l2_ctrl_find(&ctx->ctrl_hdl,
+	if (!v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_SLICE_PARAMS) ||
+	    !v4l2_ctrl_find(&ctx->ctrl_hdl,
 			    V4L2_CID_STATELESS_HEVC_ENTRY_POINT_OFFSETS))
 		return -EINVAL;
 
@@ -1271,10 +1272,6 @@ static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
 			      V4L2_CID_STATELESS_HEVC_DECODE_PARAMS);
 	run->decode = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_HEVC_SLICE_PARAMS);
-	run->sl = ctrl ? ctrl->p_cur.p : NULL;
-	run->num_slices = ctrl ? ctrl->elems : 0;
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_SPS);
 	run->sps = ctrl ? ctrl->p_cur.p : NULL;
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_PPS);
@@ -1283,10 +1280,28 @@ static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
 			      V4L2_CID_STATELESS_HEVC_SCALING_MATRIX);
 	run->scaling_matrix = ctrl ? ctrl->p_cur.p : NULL;
 
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_HEVC_ENTRY_POINT_OFFSETS);
-	run->entry_point_offsets = ctrl->p_cur.p;
-	run->num_entry_point_offsets = ctrl->elems;
+	sl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_SLICE_PARAMS);
+	ep = v4l2_ctrl_find(&ctx->ctrl_hdl,
+			    V4L2_CID_STATELESS_HEVC_ENTRY_POINT_OFFSETS);
+
+	/*
+	 * Setting a larger dynamic array on a queued request reallocates the
+	 * array's storage, which this run would otherwise keep using. Copy what
+	 * the run needs while holding the control lock.
+	 */
+	v4l2_ctrl_lock(sl);
+	run->num_slices = sl->elems;
+	run->sl = kmemdup(sl->p_cur.p, sl->elems * sl->elem_size, GFP_KERNEL);
+	run->num_entry_point_offsets = ep->elems;
+	run->entry_point_offsets =
+		kmemdup(ep->p_cur.p, ep->elems * ep->elem_size, GFP_KERNEL);
+	v4l2_ctrl_unlock(sl);
+	if (!run->sl || !run->entry_point_offsets) {
+		kfree(run->sl);
+		kfree(run->entry_point_offsets);
+		avd_run_postamble(ctx, &run->base);
+		return -ENOMEM;
+	}
 
 	dst_len = run->base.bufs.dst->vb2_buf.planes[0].length;
 
@@ -1330,6 +1345,8 @@ static int avd_hevc_run(struct avd_ctx *ctx)
 done:
 	kfree(run.tile_info.ctb_addr_rs_to_ts);
 	kfree(run.tile_info.tile_ids);
+	kfree(run.sl);
+	kfree(run.entry_point_offsets);
 	return ret;
 }
 
