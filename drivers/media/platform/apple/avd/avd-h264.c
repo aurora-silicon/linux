@@ -809,8 +809,15 @@ static void avd_h264_done(struct avd_ctx *ctx, struct vb2_v4l2_buffer *src_buf,
 			u8 *y = vb2_plane_vaddr(&dst_buf->vb2_buf, 0);
 			size_t luma = (size_t)pix->plane_fmt[0].bytesperline * pix->height;
 
-			if (y)
+			if (y && ctx->image_fmt == AVD_IMG_FMT_420_10BIT) {
+				/* P010: 16-bit little-endian samples, 512 << 6 */
+				for (size_t i = 0; i + 1 < luma / 2; i += 2) {
+					y[luma + i] = 0x00;
+					y[luma + i + 1] = 0x80;
+				}
+			} else if (y) {
 				memset(y + luma, 0x80, luma / 2);
+			}
 		}
 	}
 }
