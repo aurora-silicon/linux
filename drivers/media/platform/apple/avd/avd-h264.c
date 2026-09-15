@@ -579,6 +579,12 @@ static int avd_h264_validate_sps(struct avd_ctx *ctx,
 	if (sps->bit_depth_luma_minus8 != sps->bit_depth_chroma_minus8)
 		/* Luma and chroma bit depth mismatch */
 		return -EINVAL;
+	if (sps->bit_depth_luma_minus8 != 0 && sps->bit_depth_luma_minus8 != 2)
+		/* Only 8 and 10 bit have capture formats */
+		return -EINVAL;
+	if (sps->chroma_format_idc == 2 && sps->bit_depth_luma_minus8 == 2)
+		/* 4:2:2 10 bit would need P210; P010 is too small for its chroma */
+		return -EINVAL;
 	if (!(sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY))
 		/* no interlaced support */
 		return -EINVAL;
