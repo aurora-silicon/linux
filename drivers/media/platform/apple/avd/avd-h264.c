@@ -53,6 +53,7 @@ struct avd_h264_run {
 
 /* state */
 struct avd_h264_ctx {
+	bool monochrome;
 	struct avd_h264_reflists {
 		struct v4l2_h264_reference p[V4L2_H264_REF_LIST_LEN];
 		struct v4l2_h264_reference b0[V4L2_H264_REF_LIST_LEN];
@@ -746,6 +747,7 @@ static int avd_h264_run(struct avd_ctx *ctx)
 	}
 	memcpy(h264_ctx->active_slice->cpu, data, payload_len);
 	h264_ctx->slice_num++;
+	h264_ctx->monochrome = run.sps->chroma_format_idc == 0;
 
 	/* Build the P/B{0,1} ref lists. */
 	v4l2_h264_init_reflist_builder(&reflist_builder, run.decode_params,
@@ -799,6 +801,16 @@ static void avd_h264_done(struct avd_ctx *ctx, struct vb2_v4l2_buffer *src_buf,
 		for (i = 0; i < h264_ctx->slice_num; i++)
 			avd_buf_free(avd, &h264_ctx->slices[i]);
 		h264_ctx->slice_num = 0;
+
+		/* 4:0:0 has no chroma to decode; the picture is grey */
+		if (h264_ctx->monochrome && dst_buf && result == VB2_BUF_STATE_DONE) {
+			const struct v4l2_pix_format_mplane *pix = &ctx->decoded_fmt.fmt.pix_mp;
+			u8 *y = vb2_plane_vaddr(&dst_buf->vb2_buf, 0);
+			size_t luma = (size_t)pix->plane_fmt[0].bytesperline * pix->height;
+
+			if (y)
+				memset(y + luma, 0x80, luma / 2);
+		}
 	}
 }
 
