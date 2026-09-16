@@ -54,6 +54,15 @@ properties:
   power-domains:
     maxItems: 1
 
+  apple,dma-range:
+    description: |
+      The DART's IOVA aperture as one 64-bit base address followed by one
+      64-bit size.  Present when the device only translates IOVAs inside a
+      limited range, for example the SEP which only accepts IOVAs below 4 GiB.
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 4
+    maxItems: 4
+
 required:
   - compatible
   - reg
