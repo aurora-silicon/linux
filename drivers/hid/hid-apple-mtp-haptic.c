@@ -66,7 +66,7 @@ static int apple_actuator_probe(struct hid_device *haptic_hdev, const struct hid
 		return ret;
 	}
 
-	ret = hid_hw_start(haptic_hdev, 0);
+	ret = hid_hw_start(haptic_hdev, HID_CONNECT_HIDRAW);
 	if (ret) {
 		hid_err(haptic_hdev, "hw start failed\n");
 		return ret;
@@ -77,7 +77,7 @@ static int apple_actuator_probe(struct hid_device *haptic_hdev, const struct hid
 
 static bool actuator_match(struct hid_device *hdev, bool ignore_special_drivers)
 {
-	return (strcmp(hdev->name, "Apple MTP actuator") == 0);
+	return apple_taptic_is_actuator(hdev);
 }
 
 static void actuator_remove(struct hid_device *haptic_hdev)
@@ -88,6 +88,8 @@ static void actuator_remove(struct hid_device *haptic_hdev)
 
 static const struct hid_device_id apple_haptic_devices[] = {
 	{ HID_DEVICE(BUS_HOST, HID_GROUP_ANY, HOST_VENDOR_ID_APPLE,
+		     HID_ANY_ID), .driver_data = 0 },
+	{ HID_DEVICE(BUS_SPI, HID_GROUP_ANY, SPI_VENDOR_ID_APPLE,
 		     HID_ANY_ID), .driver_data = 0 },
 	{ }
 };
