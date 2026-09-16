@@ -55,6 +55,27 @@ static bool report_undeciphered;
 module_param(report_undeciphered, bool, 0644);
 MODULE_PARM_DESC(report_undeciphered, "Report undeciphered multi-touch state field using a MSC_RAW event");
 
+/*
+ * Waveform shaping, writable at runtime and applied on the next effect
+ * upload. Zero means "use the per-transport default": the MTP machines keep
+ * the values their firmware was tuned with, the SPI actuator in a J313 needs
+ * a much softer, weaker waveform. The SPI numbers were judged by feel there.
+ */
+static u8 haptic_softness;
+module_param(haptic_softness, byte, 0644);
+MODULE_PARM_DESC(haptic_softness, "softness of the press and release waveforms, 1-255 (0: 0xf0 on SPI, 0x90 on MTP)");
+
+static u8 haptic_deep_softness;
+module_param(haptic_deep_softness, byte, 0644);
+MODULE_PARM_DESC(haptic_deep_softness, "softness of the deep-click waveform, 1-255 (0: 0xd0 on SPI, 0x90 on MTP)");
+
+static u8 haptic_strength;
+module_param(haptic_strength, byte, 0644);
+MODULE_PARM_DESC(haptic_strength, "strength at 100% intensity for press and release, 1-255 (0: 0x28 on SPI, 0xff on MTP)");
+
+static u8 haptic_deep_strength;
+module_param(haptic_deep_strength, byte, 0644);
+MODULE_PARM_DESC(haptic_deep_strength, "strength at 100% intensity for a deep click, 1-255 (0: 0xff on SPI, 0xff on MTP)");
 #define TRACKPAD2_2021_BT_VERSION 0x110
 #define TRACKPAD_2024_BT_VERSION 0x314
 
@@ -1479,6 +1500,40 @@ static void magicmouse_battery_timer_tick(struct timer_list *t)
 }
 
 #if IS_REACHABLE(CONFIG_HID_APPLE_MTP_HAPTIC)
+static bool magicmouse_effect_is_deep(const struct ff_effect *effect)
+{
+	return effect->u.haptic.hid_usage ==
+	       (APPLE_HP_WAVEFORMDEEPCLICK & HID_USAGE);
+}
+
+static u8 magicmouse_haptic_softness(struct hid_device *hdev,
+				     const struct ff_effect *effect)
+{
+	bool deep = magicmouse_effect_is_deep(effect);
+	u8 configured = deep ? haptic_deep_softness : haptic_softness;
+
+	if (configured)
+		return configured;
+	if (hdev->bus != BUS_SPI)
+		return 0x90;
+
+	return deep ? 0xd0 : 0xf0;
+}
+
+static u8 magicmouse_haptic_strength(struct hid_device *hdev,
+				     const struct ff_effect *effect)
+{
+	bool deep = magicmouse_effect_is_deep(effect);
+	u8 configured = deep ? haptic_deep_strength : haptic_strength;
+
+	if (configured)
+		return configured;
+	if (hdev->bus != BUS_SPI)
+		return 0xff;
+
+	return deep ? 0xff : 0x28;
+}
+
 static int apple_upload_effects(struct input_dev *trackpad_idev,
 				struct ff_effect *effect, struct ff_effect *old)
 {
@@ -1504,9 +1559,10 @@ static int apple_upload_effects(struct input_dev *trackpad_idev,
 	msc->haptic_effects[effect->id].taptic_hdev = actuator;
 	msc->haptic_effects[effect->id].effect_type = (effect->u.haptic.hid_usage) & HID_USAGE;
 	msc->haptic_effects[effect->id].strength =
-		(min(100, (effect->u.haptic.intensity)) * 255) / 100;
-	msc->haptic_effects[effect->id].softness = 0x90;
-	/* A future extension could add configurability to softness. */
+		(min(100, (effect->u.haptic.intensity)) *
+		 magicmouse_haptic_strength(trackpad_hdev, effect)) / 100;
+	msc->haptic_effects[effect->id].softness =
+		magicmouse_haptic_softness(trackpad_hdev, effect);
 
 	/* The actuator may have been rebound or reset since the last upload. */
 	ret = magicmouse_switch_mode(trackpad_idev, HID_HAPTIC_MODE_HOST);
