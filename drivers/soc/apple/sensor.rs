@@ -19,6 +19,20 @@ extern "C" {
     fn sep_sensor_xfer(tx: *const c_void, rx: *mut c_void, len: usize) -> c_int;
     fn sep_sensor_xfer_tx(tx: *const c_void, len: usize) -> c_int;
     fn sep_sensor_xfer2(tx: *const c_void, tx_len: usize, rx: *mut c_void, rx_len: usize) -> c_int;
+    fn sep_sensor_firmware_name() -> *const c_char;
+}
+
+/// The calibration blob's name from the board description, or `None` when the
+/// sensor node has no `firmware-name` property (the caller then uses a default).
+pub(crate) fn firmware_name() -> Option<&'static CStr> {
+    // SAFETY: the shim returns NULL or a pointer to a NUL-terminated string
+    // owned by the device property and valid for the device's lifetime.
+    let ptr = unsafe { sep_sensor_firmware_name() };
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: a non-NULL return is a valid NUL-terminated C string.
+    Some(unsafe { CStr::from_char_ptr(ptr) })
 }
 
 // Spi2.

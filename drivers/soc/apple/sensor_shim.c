@@ -322,6 +322,22 @@ int sep_sensor_power_line(void)
 	return desc_to_gpio(sep_power);
 }
 
+/*
+ * The per-device calibration blob name, as the board description gives it in
+ * the sensor node's "firmware-name" property. NULL when absent, so the caller
+ * can fall back to a default.
+ */
+const char *sep_sensor_firmware_name(void)
+{
+	const char *name = NULL;
+
+	if (!sep_spi)
+		return NULL;
+	if (device_property_read_string(&sep_spi->dev, "firmware-name", &name))
+		return NULL;
+	return name;
+}
+
 /* Powers the sensor on/off, holding the hardware settling delay. */
 int sep_sensor_power(int on)
 {

@@ -1217,13 +1217,16 @@ impl SepData {
     }
 
     fn calibrate_sensor(&self) -> bool {
-        let blob = match kernel::firmware::Firmware::request(CALIBRATION_FIRMWARE, &self.dev) {
+        // The blob is per-device factory data, so its name is board data: take
+        // it from the sensor node's firmware-name, falling back to the default.
+        let name = sensor::firmware_name().unwrap_or(CALIBRATION_FIRMWARE);
+        let blob = match kernel::firmware::Firmware::request(name, &self.dev) {
             Ok(fw) => CalibrationBlob::new(fw),
             Err(e) => {
                 dev_err!(
                     self.dev,
                     "sensor: calibration blob {} could not be loaded ({:?}); per-device factory data, cannot be synthesised, stopping\n",
-                    CALIBRATION_FIRMWARE,
+                    name,
                     e
                 );
                 return false;
