@@ -836,8 +836,13 @@ impl SepData {
         if !self.endpoint_present(proto::EP_SKS) {
             dev_err!(
                 self.dev,
-                "sks: endpoint 0x{:02x} (key store) was not advertised on this boot; keybag and ref-key operations cannot run\n",
-                proto::EP_SKS
+                "sks: endpoint 0x{:02x} (key store) not advertised; {} EPs up (control={} xarm={} sbio={} scrd={}); keybag/ref-key cannot run\n",
+                proto::EP_SKS,
+                self.endpoint_count(),
+                self.endpoint_present(proto::EP_CONTROL) as u8,
+                self.endpoint_present(proto::EP_XARM) as u8,
+                self.endpoint_present(proto::EP_SBIO) as u8,
+                self.endpoint_present(proto::EP_SCRD) as u8,
             );
             return false;
         }
@@ -849,6 +854,12 @@ impl SepData {
             );
             return false;
         }
+        dev_info!(
+            self.dev,
+            "sks: endpoint 0x{:02x} (key store) up; {} EPs; out-of-line buffers registered\n",
+            proto::EP_SKS,
+            self.endpoint_count()
+        );
         true
     }
 
