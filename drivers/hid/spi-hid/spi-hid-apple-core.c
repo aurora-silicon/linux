@@ -362,15 +362,12 @@ static int apple_ll_raw_request(struct hid_device *hdev,
 		return idev->reply_len;
 
 	case HID_REQ_SET_REPORT:
-		if (buf[0] != reportnum)
+		if (!len || buf[0] != reportnum)
 			return -EINVAL;
-		if (reportnum != idev->id) {
-			dev_warn(&spihid->spidev->dev,
-				 "device:%u reportnum:"
-				 "%hhu mismatch",
-				 idev->id, reportnum);
-			return -EINVAL;
-		}
+		/*
+		 * The report number is not the interface id: the keyboard's LED
+		 * report is 1 on interface 1, the actuator's is 0x21 on 3.
+		 */
 		return spihid_apple_request(spihid, idev->id, 0x52, reportnum, 0x00, 2, buf, len);
 	default:
 		return -EIO;
@@ -385,11 +382,13 @@ static int apple_ll_output_report(struct hid_device *hdev, __u8 *buf,
 	if (!spihid)
 		return -1;
 
-	dev_dbg(&spihid->spidev->dev,
-		"apple_ll_output_report: device:%u len:%zu:",
-		idev->id, len);
-	// second idev->id should maybe be buf[0]?
-	return spihid_apple_request(spihid, idev->id, 0x51, idev->id, 0x00, 0, buf, len);
+	if (!len)
+		return -EINVAL;
+
+	dev_dbg(&spihid->spidev->dev, "device:%u report:%u len:%zu",
+		idev->id, buf[0], len);
+	/* The request carries the report number, not the interface id. */
+	return spihid_apple_request(spihid, idev->id, 0x51, buf[0], 0x00, 0, buf, len);
 }
 
 static struct hid_ll_driver apple_hid_ll = {
