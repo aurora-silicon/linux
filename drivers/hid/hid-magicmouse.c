@@ -1285,7 +1285,7 @@ static int match_actuator(struct device *dev, const void *data)
 
 	hdev = to_hid_device(dev);
 
-	return !strcmp(hdev->name, "Apple MTP actuator");
+	return apple_taptic_is_actuator(hdev);
 }
 
 static struct hid_device *magicmouse_get_actuator(struct magicmouse_sc *msc)
@@ -1674,11 +1674,12 @@ static int magicmouse_init_haptics(struct magicmouse_sc *msc, struct hid_device 
 		return 0;
 
 	/*
-	 * Only the internal trackpads have an actuator. It is a separate HID
-	 * device that may be registered after the trackpad, so it is resolved
-	 * lazily when the first effect is uploaded.
+	 * Only the internal trackpads have an actuator: the MTP ones on
+	 * BUS_HOST and the SPI ones, whose firmware exposes it as a separate
+	 * "Actuator" interface. It may be registered after the trackpad, so
+	 * it is resolved lazily on the first effect upload.
 	 */
-	if (trackpad_hdev->bus != BUS_HOST ||
+	if ((trackpad_hdev->bus != BUS_HOST && trackpad_hdev->bus != BUS_SPI) ||
 	    trackpad_hdev->type != HID_TYPE_SPI_MOUSE)
 		return 0;
 
