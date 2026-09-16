@@ -21,6 +21,15 @@ pub(crate) const MSG_TYPE_SHIFT: u32 = 16;
 pub(crate) const MSG_PARAM_SHIFT: u32 = 24;
 pub(crate) const MSG_DATA_SHIFT: u32 = 32;
 
+// Boot-endpoint (EP_BOOT) message types for the cold-boot handshake: send TZ0,
+// then hand over the firmware image (IMG4) and the shared-memory table.
+pub(crate) const MSG_BOOT_TZ0: u64 = 0x5;
+pub(crate) const MSG_BOOT_IMG4: u64 = 0x6;
+pub(crate) const MSG_SET_SHMEM: u64 = 0x18;
+pub(crate) const MSG_BOOT_TZ0_ACK1: u64 = 0x69;
+pub(crate) const MSG_BOOT_TZ0_ACK2: u64 = 0xd2;
+pub(crate) const MSG_BOOT_IMG4_ACK: u64 = 0x6a;
+
 // 4 KiB units even though CPU pages are 16 KiB
 pub(crate) const IOVA_SHIFT: u32 = 12;
 

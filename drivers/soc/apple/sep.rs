@@ -35,6 +35,7 @@ mod xarm;
 mod xart_store;
 
 use kernel::{
+    bindings,
     device,
     dma,
     driver,
@@ -510,11 +511,20 @@ struct MachineRefKey {
     pub_raw: KVec<u8>,
 }
 
+/// One mapped firmware reserved region, unmapped exactly once in `remove()`.
+struct FirmwareMap {
+    size: usize,
+    iova: u64,
+}
+
 #[pin_data]
 struct SepData {
     dev: ARef<device::Device>,
 
     profile: &'static profile::PlatformProfile,
+
+    #[pin]
+    fw_map: Mutex<Option<FirmwareMap>>,
 
     #[pin]
     mbox: Mutex<Option<Mailbox<SepData>>>,
@@ -747,6 +757,7 @@ impl SepData {
             try_pin_init!(SepData {
                 dev: ARef::<device::Device>::from(dev),
                 profile,
+                fw_map <- new_mutex!(None),
                 mbox <- new_mutex!(None),
                 shmem <- new_mutex!(Some(buf)),
                 endpoints <- new_mutex!(EndpointTable::new()),
@@ -807,7 +818,17 @@ impl SepData {
         )
     }
 
+    /// Bring the shared-memory table to the SEP using the profile's bootstrap.
     fn attach(&self, sep_node: &dt::DtNode) -> Result<()> {
+        match self.profile.bootstrap {
+            profile::Bootstrap::WarmRegister => self.attach_warm(sep_node),
+            profile::Bootstrap::Boot => self.attach_m1(),
+        }
+    }
+
+    /// Warm attach: the firmware left a running SEP, so one registration message
+    /// hands it the shared-memory table.
+    fn attach_warm(&self, sep_node: &dt::DtNode) -> Result<()> {
         let (iova, size) = {
             let guard = self.shmem.lock();
             let buf = guard.as_ref().ok_or(EINVAL)?;
@@ -835,6 +856,137 @@ impl SepData {
 
         // no ack on 0xFE; success is the discovery burst on 0xFD
         Ok(())
+    }
+
+    /// Cold boot: send TZ0 and let the boot-endpoint acknowledgements drive the
+    /// firmware and shared-memory handoff.
+    fn attach_m1(&self) -> Result<()> {
+        let msg = Message {
+            msg0: u64::from(proto::EP_BOOT) | (proto::MSG_BOOT_TZ0 << proto::MSG_TYPE_SHIFT),
+            msg1: 0,
+        };
+        self.send(msg)
+    }
+
+    /// Handle a message from the boot endpoint during the cold-boot handshake.
+    fn on_boot(&self, msg: Message) {
+        let ty = (msg.msg0 >> proto::MSG_TYPE_SHIFT) & 0xff;
+        match ty {
+            proto::MSG_BOOT_TZ0_ACK1 => {
+                dev_info!(self.dev, "boot: first TZ0 acknowledgement\n");
+            }
+            proto::MSG_BOOT_TZ0_ACK2 => {
+                dev_info!(
+                    self.dev,
+                    "boot: TZ0 accepted; handing over firmware and shared memory\n"
+                );
+                if let Err(e) = self.load_firmware_and_shmem() {
+                    dev_err!(
+                        self.dev,
+                        "boot: firmware/shared-memory handoff failed ({:?})\n",
+                        e
+                    );
+                }
+            }
+            proto::MSG_BOOT_IMG4_ACK => {
+                dev_info!(
+                    self.dev,
+                    "boot: IMG4 acknowledged; the SEP owns the shared-memory table\n"
+                );
+                self.registered.store(true, Relaxed);
+            }
+            _ => {
+                dev_warn!(
+                    self.dev,
+                    "boot: unknown message type {} (msg0 {:#018x})\n",
+                    ty,
+                    msg.msg0
+                );
+            }
+        }
+    }
+
+    /// Map the firmware reserved region once and hand the SEP the firmware
+    /// address (IMG4) and the shared-memory table (SET_SHMEM).
+    fn load_firmware_and_shmem(&self) -> Result<()> {
+        if self.shutting_down.load(Relaxed) {
+            return Err(ENODEV);
+        }
+
+        let (phys, size) = dt::reserved_region(&self.dev, self.profile.firmware_region)?;
+
+        // Hold the mapping lock across the teardown re-check, the map and the
+        // store: `remove()` takes the same lock, so a mapping either exists
+        // before removal and is unmapped by it, or is refused here.
+        let mut fw_map = self.fw_map.lock();
+        if fw_map.is_some() {
+            // One-shot per boot: a second acknowledgement cannot remap it.
+            return Ok(());
+        }
+        if self.shutting_down.load(Relaxed) {
+            return Err(ENODEV);
+        }
+        // SAFETY: `self.dev` is live; the reserved region is owned by the
+        // firmware handoff and the mapping is retained until `remove()`.
+        let iova = unsafe {
+            let mapped = bindings::dma_map_resource(
+                self.dev.as_raw(),
+                phys,
+                size,
+                bindings::dma_data_direction_DMA_TO_DEVICE,
+                0,
+            );
+            if bindings::dma_mapping_error(self.dev.as_raw(), mapped) != 0 {
+                return Err(ENOMEM);
+            }
+            mapped
+        };
+        *fw_map = Some(FirmwareMap { size, iova });
+        drop(fw_map);
+
+        let msg = Message {
+            msg0: u64::from(proto::EP_BOOT)
+                | (proto::MSG_BOOT_IMG4 << proto::MSG_TYPE_SHIFT)
+                | ((iova >> proto::IOVA_SHIFT) << proto::MSG_DATA_SHIFT),
+            msg1: 0,
+        };
+        self.send(msg)?;
+
+        let shm = {
+            let guard = self.shmem.lock();
+            let buf = guard.as_ref().ok_or(EINVAL)?;
+            buf.dma_handle()
+        };
+        let msg = Message {
+            msg0: u64::from(proto::EP_SHMEM)
+                | (proto::MSG_SET_SHMEM << proto::MSG_TYPE_SHIFT)
+                | ((shm >> proto::IOVA_SHIFT) << proto::MSG_DATA_SHIFT),
+            msg1: 0,
+        };
+        // The peer may know the address even if this send fails ambiguously, so
+        // the buffer stays retained: `remove()` must never free shared memory
+        // the SEP was handed.
+        self.registered.store(true, Relaxed);
+        self.send(msg)?;
+        Ok(())
+    }
+
+    /// Release the firmware mapping if one is live. Called by `remove()` so a
+    /// mapping created by a racing boot message cannot outlive the driver.
+    fn release_firmware_mapping(&self) {
+        if let Some(mapped) = self.fw_map.lock().take() {
+            // SAFETY: created by `dma_map_resource` with these exact parameters
+            // and unmapped exactly once.
+            unsafe {
+                bindings::dma_unmap_resource(
+                    self.dev.as_raw(),
+                    mapped.iova,
+                    mapped.size,
+                    bindings::dma_data_direction_DMA_TO_DEVICE,
+                    0,
+                );
+            }
+        }
     }
 
     fn send(&self, msg: Message) -> Result<()> {
@@ -1667,14 +1819,7 @@ impl SepData {
 
             proto::EP_SCRD => self.on_scrd(msg),
 
-            proto::EP_BOOT => dev_warn!(
-                self.dev,
-                "unexpected message from boot endpoint 0xff: type 0x{:02x} param 0x{:02x} msg0 {:#018x} msg1 {:#010x}\n",
-                f.ty,
-                f.param,
-                msg.msg0,
-                msg.msg1
-            ),
+            proto::EP_BOOT => self.on_boot(msg),
 
             _ep => {},
         }
@@ -1710,6 +1855,7 @@ impl SepData {
 
     fn remove(&self) {
         self.shutting_down.store(true, Relaxed);
+        self.release_firmware_mapping();
         trusted::unregister();
         self.unregister_fv_kernel();
 
@@ -1986,7 +2132,16 @@ struct SepModule {
 impl kernel::InPlaceModule for SepModule {
     fn init(module: &'static ThisModule) -> impl PinInit<Self, Error> {
         try_pin_init!(Self {
-            _dt: dt::enable_sep_and_dart()?,
+            // The warm-attach target enables the SEP and its DART with a runtime
+            // changeset; the cold-boot target describes them statically (its DART
+            // is enabled before probe), so no changeset runs there.
+            _dt: {
+                if let Ok(p) = profile::detect() {
+                    if matches!(p.bootstrap, profile::Bootstrap::WarmRegister) {
+                        dt::enable_sep_and_dart()?;
+                    }
+                }
+            },
 
             _driver <- driver::Registration::new(
                 <Self as kernel::ModuleMetadata>::NAME,

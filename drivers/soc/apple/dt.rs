@@ -469,3 +469,39 @@ pub(crate) fn enable_spi_sensor(base: u64, cs: u32) -> Result<()> {
         Ok(true)
     })
 }
+
+/// Resolve a reserved-memory region by name on the SEP node's device.
+///
+/// The cold-boot path needs this: the firmware image is handed over in a
+/// bootloader-injected `sepfw` region.
+pub(crate) fn reserved_region(dev: &kernel::device::Device, name: &CStr) -> Result<(u64, usize)> {
+    // SAFETY: `dev` is valid and its `of_node` is either NULL or a live node
+    // the device holds a reference to.
+    let np = unsafe { (*dev.as_raw()).of_node };
+    if np.is_null() {
+        return Err(ENODEV);
+    }
+
+    // SAFETY: `struct resource` is plain integers with no pointer state, so an
+    // all-zero value is valid.
+    let mut res: bindings::resource = unsafe { core::mem::zeroed() };
+    // SAFETY: `np` is a live node, `name` is NUL-terminated and `res` is a
+    // valid out-parameter.
+    let ret = unsafe {
+        bindings::of_reserved_mem_region_to_resource_byname(np, name.as_char_ptr(), &mut res)
+    };
+    to_result(ret).map_err(|e| {
+        pr_err!(
+            "apple_sep: reserved-memory region '{}' is unavailable ({:?})\n",
+            name,
+            e
+        );
+        e
+    })?;
+
+    let size = res.end.wrapping_sub(res.start).wrapping_add(1);
+    if size == 0 || size > usize::MAX as u64 {
+        return Err(EINVAL);
+    }
+    Ok((res.start, size as usize))
+}
