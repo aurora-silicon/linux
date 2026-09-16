@@ -17,6 +17,7 @@ mod fv;
 mod hwrng;
 mod image;
 mod keybag;
+mod profile;
 mod proto;
 mod refkey;
 mod refkey_seal;
@@ -513,6 +514,8 @@ struct MachineRefKey {
 struct SepData {
     dev: ARef<device::Device>,
 
+    profile: &'static profile::PlatformProfile,
+
     #[pin]
     mbox: Mutex<Option<Mailbox<SepData>>>,
 
@@ -668,8 +671,10 @@ unsafe impl Sync for SepData {}
 
 impl SepData {
     fn new(pdev: &platform::Device<device::Core>) -> Result<Arc<SepData>> {
-        let built = shmem::build(pdev)?;
+        let profile = profile::detect()?;
+        let built = shmem::build(pdev, profile.shmem_capacity, profile.shmem_first_item)?;
         let dev: &device::Device<device::Core> = pdev.as_ref();
+        dev_info!(dev, "SEP platform profile: {}\n", profile.name);
 
         let buf = built.buf;
 
@@ -741,6 +746,7 @@ impl SepData {
         Arc::pin_init(
             try_pin_init!(SepData {
                 dev: ARef::<device::Device>::from(dev),
+                profile,
                 mbox <- new_mutex!(None),
                 shmem <- new_mutex!(Some(buf)),
                 endpoints <- new_mutex!(EndpointTable::new()),

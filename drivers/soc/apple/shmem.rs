@@ -6,8 +6,6 @@ use kernel::dma;
 use kernel::platform;
 use kernel::prelude::*;
 
-pub(crate) const SHMEM_SIZE: usize = 0x40000;
-
 const ENTRY_SIZE: usize = 16;
 const ENTRY_OFF_FOURCC: usize = 0;
 const ENTRY_OFF_SIZE: usize = 4;
@@ -21,8 +19,8 @@ const CINP_MIN_SIZE: usize = 0x8000;
 
 const CINP_PAYLOAD: [u8; 1] = [0];
 
-// Wire byte order, not byte-reversed; llun is the terminator spelling.
-const FOURCC_CINP: &[u8; 4] = b"CINP";
+// Wire byte order, not byte-reversed; llun is the terminator spelling. The
+// first item's fourcc is per-SoC and comes from the platform profile.
 const FOURCC_OPLA: &[u8; 4] = b"OPLA";
 const FOURCC_IPIS: &[u8; 4] = b"IPIS";
 const FOURCC_TERM: &[u8; 4] = b"llun";
@@ -68,7 +66,7 @@ const fn align_up(v: usize, a: usize) -> usize {
 
 fn write_at(buf: &mut ShMem, off: usize, src: &[u8]) -> Result<()> {
     let end = off.checked_add(src.len()).ok_or(EINVAL)?;
-    if end > SHMEM_SIZE {
+    if end > buf.len() {
         return Err(EINVAL);
     }
     // SAFETY: runs in probe before the SEP is told the buffer exists, and probe
@@ -131,9 +129,11 @@ fn verify_layout(
     opla: &Region,
     ipis: &Region,
     used: usize,
+    capacity: usize,
+    first_item: &[u8; 4],
 ) -> Result<()> {
     let regions = [
-        (FOURCC_CINP, cinp),
+        (first_item, cinp),
         (FOURCC_OPLA, opla),
         (FOURCC_IPIS, ipis),
     ];
@@ -143,7 +143,7 @@ fn verify_layout(
             || r.offset % PAYLOAD_ALIGN != 0
             || r.size % PAYLOAD_ALIGN != 0
             || r.size < r.payload_len + 4
-            || r.end() > SHMEM_SIZE;
+            || r.end() > capacity;
         if bad {
             dev_err!(
                 dev,
@@ -181,14 +181,18 @@ fn verify_layout(
         return Err(EINVAL);
     }
 
-    if 4 * ENTRY_SIZE > PAYLOAD_BASE || used > SHMEM_SIZE {
+    if 4 * ENTRY_SIZE > PAYLOAD_BASE || used > capacity {
         return Err(ENOSPC);
     }
 
     Ok(())
 }
 
-pub(crate) fn build(pdev: &platform::Device<device::Core>) -> Result<Shmem> {
+pub(crate) fn build(
+    pdev: &platform::Device<device::Core>,
+    capacity: usize,
+    first_item: &[u8; 4],
+) -> Result<Shmem> {
     let dev: &device::Device<device::Core> = pdev.as_ref();
 
     // Read manifests before allocating: a CINP-only registration would burn the one-shot and fault.
@@ -200,9 +204,9 @@ pub(crate) fn build(pdev: &platform::Device<device::Core>) -> Result<Shmem> {
     let ipis = Region::place(opla.end(), ipis_blob.len(), 0);
     let used = ipis.end();
 
-    verify_layout(dev, &cinp, &opla, &ipis, used)?;
+    verify_layout(dev, &cinp, &opla, &ipis, used, capacity, first_item)?;
 
-    let mut buf = dma::Coherent::<u8>::zeroed_slice(dev, SHMEM_SIZE, GFP_KERNEL)?;
+    let mut buf = dma::Coherent::<u8>::zeroed_slice(dev, capacity, GFP_KERNEL)?;
 
     // Payloads before entries: a failure leaves an all-zero table, not a valid-looking one.
     write_at(
@@ -226,7 +230,7 @@ pub(crate) fn build(pdev: &platform::Device<device::Core>) -> Result<Shmem> {
     )?;
     write_at(&mut buf, ipis.offset + 4, &ipis_blob)?;
 
-    write_entry(&mut buf, 0, FOURCC_CINP, cinp.size, cinp.offset)?;
+    write_entry(&mut buf, 0, first_item, cinp.size, cinp.offset)?;
     write_entry(&mut buf, 1, FOURCC_OPLA, opla.size, opla.offset)?;
     write_entry(&mut buf, 2, FOURCC_IPIS, ipis.size, ipis.offset)?;
     write_entry(&mut buf, 3, FOURCC_TERM, 0, 0)?;
