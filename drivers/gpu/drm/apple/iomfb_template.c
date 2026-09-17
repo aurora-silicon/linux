@@ -936,7 +936,26 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	swap_id = cookie->swap_id;
 	kref_put(&cookie->refcount, release_swap_cookie);
 	if (ret <= 0) {
-		dcp->crashed = true;
+		/*
+		 * A Type-C display that has already been unplugged is gone
+		 * before this clear swap reaches the firmware, which then
+		 * swallows it -- "swap_submit_dcp: swallowed swap ID %u as
+		 * fControllerPowerState is 0" -- so the completion misses its
+		 * window.  That is the ordinary unplug, not a crash, so do not
+		 * latch ->crashed: dcp_crtc_atomic_check() rejects every later
+		 * commit on this CRTC once it is set, and the output stays
+		 * dark until reboot even though the next plug trains the link
+		 * and reads a full mode list.  A real firmware crash still
+		 * arrives through dcp_rtk_crashed().
+		 *
+		 * Keep returning here.  Carrying on into iomfb_abort_swaps_dcp()
+		 * and setPowerState(0) for a display that is already gone was
+		 * tried and is worse: the following dptx HPD deassert then
+		 * fails with -110 and the next plug borrows the route but never
+		 * asserts HPD, so the display does not come back at all.
+		 */
+		dev_warn(dcp->dev,
+			 "poweroff: clear swap did not complete in 50 ms\n");
 		return;
 	}
 
