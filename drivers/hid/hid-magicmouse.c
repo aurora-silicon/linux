@@ -1617,11 +1617,33 @@ static bool magicmouse_haptic_click(struct magicmouse_sc *msc, u32 pressure,
 
 	return msc->haptic_button_down;
 }
+
+/*
+ * The actuator leaves system sleep in device-controlled mode whatever it was
+ * in before: the transport resumes the keyboard and the trackpad, not the
+ * actuator, and nothing reports the change. A cached host-controlled mode then
+ * makes the next press skip the switch and play a pulse while the firmware is
+ * playing its own, which is felt as two clicks. Forget it instead; the next
+ * press takes the mode again if it needs it.
+ */
+static void magicmouse_haptic_forget_mode(struct magicmouse_sc *msc)
+{
+	if (!msc->haptics)
+		return;
+
+	msc->haptics->mode = HID_HAPTIC_MODE_DEVICE;
+	msc->haptic_button_down = false;
+	msc->haptic_deep_fired = false;
+}
 #else
 static bool magicmouse_haptic_click(struct magicmouse_sc *msc, u32 pressure,
 				    bool firmware_button)
 {
 	return firmware_button;
+}
+
+static void magicmouse_haptic_forget_mode(struct magicmouse_sc *msc)
+{
 }
 #endif
 
@@ -2274,6 +2296,9 @@ static int magicmouse_reset_resume(struct hid_device *hdev)
 	 */
 	if (msc && (hdev->type == HID_TYPE_USBMOUSE || hdev->bus == BUS_SPI))
 		schedule_delayed_work(&msc->work, msecs_to_jiffies(500));
+
+	if (msc)
+		magicmouse_haptic_forget_mode(msc);
 
 	return 0;
 }
