@@ -428,11 +428,16 @@ impl SepData {
         if proof.slot() != keybag::Slot::Identity {
             return Err(EINVAL);
         }
+        // The strict (T8103) and lenient (T6020) enclaves encode the identity
+        // bag differently; the per-SoC profile carries the correct field values
+        // so the proven T6020 path is unchanged while T8103 gets the bag type in
+        // the third word (see profile::KeybagCreate).
+        let enc = &self.profile.keybag_create;
         let mut body = image::Body::new();
-        body.put_u32(crate::sks::SKS_CREATE_VARIANT_IDENTITY)?;
+        body.put_u32(enc.variant)?;
         body.put_u64(crate::sks::SKS_CLIENT_ID)?;
-        body.put_u32(crate::sks::CreateFlags::none().value())?;
-        body.put_i32(crate::sks::SpecialHandle::first_identity().value())?;
+        body.put_u32(enc.bag_type)?;
+        body.put_i32(enc.arg)?;
         body.put_blob(secret)?;
         body.put_blob(&[])?;
         body.put_blob(uuid)?;
@@ -514,7 +519,7 @@ impl SepData {
         let Some((_fv_data, end)) = image::read_blob(body, 8) else {
             return false;
         };
-        if variant != crate::sks::SKS_CREATE_VARIANT_IDENTITY || raw_handle < 0 || end != body.len()
+        if variant != self.profile.keybag_create.variant || raw_handle < 0 || end != body.len()
         {
             dev_err!(
                 self.dev,
@@ -987,20 +992,7 @@ pub(crate) fn sks_copy_keybag() -> SksOp {
 
 const OP_SKS_CREATE_KEYBAG: u8 = 0x01;
 pub(crate) const SKS_CREATE_NAME: &CStr = c"CREATE_KEYBAG";
-pub(crate) const SKS_CREATE_VARIANT_IDENTITY: u32 = 5;
 pub(crate) const SKS_IDENTITY_UUID_LEN: usize = 16;
-
-pub(crate) struct CreateFlags(u32);
-
-impl CreateFlags {
-    pub(crate) const fn none() -> Self {
-        Self(0)
-    }
-
-    pub(crate) const fn value(&self) -> u32 {
-        self.0
-    }
-}
 
 const OP_SKS_LOAD_KEYBAG: u8 = 0x03;
 
@@ -1068,10 +1060,6 @@ impl DesignateUser {
 pub(crate) struct SpecialHandle(i32);
 
 impl SpecialHandle {
-    pub(crate) const fn first_identity() -> SpecialHandle {
-        SpecialHandle(-1)
-    }
-
     pub(crate) const fn value(&self) -> i32 {
         self.0
     }

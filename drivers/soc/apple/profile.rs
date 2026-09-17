@@ -86,6 +86,21 @@ pub(crate) struct SensorProfile {
     pub(crate) capture_qualified: bool,
 }
 
+/// Identity keybag `CREATE_KEYBAG` field encoding. The strict T8103 enclave
+/// reads the request's first word as the bag type and rejects the value the
+/// lenient T6020 enclave accepts there; macOS carries the type in the third
+/// word instead. Kept per-SoC so the strict path is correct without disturbing
+/// the proven T6020 encoding (hardware-verified for enrol, match, and reboot).
+pub(crate) struct KeybagCreate {
+    /// First word: request variant, echoed back in the reply.
+    pub(crate) variant: u32,
+    /// Third word: bag type. Identity is `0x20000` on the strict path; `0` on
+    /// T6020, which distinguishes the bag by the variant word instead.
+    pub(crate) bag_type: u32,
+    /// Fourth word: create argument / parent handle.
+    pub(crate) arg: i32,
+}
+
 pub(crate) struct PlatformProfile {
     pub(crate) name: &'static str,
     /// Capacity of the boot shared-memory window. The layout is still checked
@@ -102,6 +117,8 @@ pub(crate) struct PlatformProfile {
     pub(crate) dart_range_required: bool,
     /// Reserved-memory region holding the SEP firmware image (cold-boot path).
     pub(crate) firmware_region: &'static CStr,
+    /// Identity keybag CREATE_KEYBAG field encoding (per-SoC; see [`KeybagCreate`]).
+    pub(crate) keybag_create: KeybagCreate,
 }
 
 const T8103: PlatformProfile = PlatformProfile {
@@ -122,6 +139,12 @@ const T8103: PlatformProfile = PlatformProfile {
     },
     dart_range_required: false,
     firmware_region: c"sepfw",
+    // Strict enclave: the type goes in the third word; the first word is 0.
+    keybag_create: KeybagCreate {
+        variant: 0,
+        bag_type: 0x20000,
+        arg: 0,
+    },
 };
 
 const T6020: PlatformProfile = PlatformProfile {
@@ -142,6 +165,12 @@ const T6020: PlatformProfile = PlatformProfile {
     },
     dart_range_required: true,
     firmware_region: c"sepfw",
+    // Proven encoding: the lenient enclave takes the variant in the first word.
+    keybag_create: KeybagCreate {
+        variant: 5,
+        bag_type: 0,
+        arg: -1,
+    },
 };
 
 static_assert!(T8103.shmem_capacity == 0x30000);
