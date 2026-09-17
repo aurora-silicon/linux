@@ -11,11 +11,8 @@
 use crate::shim;
 use kernel::prelude::*;
 
-pub(crate) const STORE_PATH: &CStr = c"/dev/mapper/sep-xart-gigalocker";
-
 /// The raw-extent owner opens this whole partition (the iBoot system container,
-/// where the gigalocker lives) and serves the window at the configured sector.
-/// It replaces the userspace APFS parser + device-mapper mapping.
+/// where the gigalocker lives) and serves the gigalocker window directly.
 pub(crate) const OWNER_PATH: &CStr = c"/dev/disk/by-partlabel/iBootSystemContainer";
 
 const BLOCK_SIZE: usize = 0x1000;
@@ -24,15 +21,25 @@ const HEADER_SIZE: usize = 0x22;
 const DELETE_SIZE: usize = BLOCK_SIZE;
 /// Size of the APFS raw extent located on the target machine.
 ///
-/// The logical store is always exactly this many bytes. The device-mapper
-/// mapping is exactly this size; the raw-extent owner opens a larger container
-/// and serves only the [`STORE_SIZE`] window at its configured base, so a wrong
-/// base cannot read past the extent. A wrong window in either mode fails closed:
+/// The logical store is always exactly this many bytes. The raw-extent owner
+/// opens a larger container and serves only the [`STORE_SIZE`] window at its
+/// located base, so a wrong base cannot read past the extent. A wrong window
+/// still fails closed:
 /// the two root records will not validate and `open_based` returns `ENODATA`
 /// rather than serving SEP an unrelated store. A machine with a different extent
 /// size must pass that size through an explicit, reviewed interface.
 const STORE_SIZE: u64 = 0x600000;
 const MAX_SLOTS: usize = 4096;
+
+/// Sequential read window for the automatic gigalocker search (64 KiB — small
+/// enough for a reliable kernel allocation, large enough to keep the scan of
+/// the container to a modest number of reads).
+const SCAN_CHUNK: usize = 1 << 16;
+/// Upper bound on candidate bases confirmed during the automatic search, so a
+/// container full of coincidental root-shaped headers cannot spin the scan. The
+/// real store's roots sit within the first slots, so it is found long before
+/// this; exceeding it falls back rather than looping.
+const MAX_LOCATE_ATTEMPTS: u32 = 64;
 
 pub(crate) const MAX_VALUE: usize = 0x8000;
 
@@ -87,9 +94,8 @@ impl Slot {
 
 pub(crate) struct Store {
     file: shim::StoreFile,
-    /// Byte offset of the first slot within the opened block device. Zero for
-    /// the device-mapper mapping (which starts at the gigalocker); non-zero for
-    /// the raw-extent owner, which opens the whole container and points here.
+    /// Byte offset of the gigalocker window within the opened container: the
+    /// located extent's offset (an explicit start-sector override sets it).
     base: u64,
     slots: KVec<Slot>,
     revision: u64,
@@ -122,19 +128,131 @@ fn valid_key(key: &Key) -> bool {
 }
 
 impl Store {
-    pub(crate) fn open(writes_enabled: bool) -> Result<Store> {
-        Self::open_based(STORE_PATH, writes_enabled, 0)
+    /// Opens the store as the in-kernel raw-extent owner: it opens the iBoot
+    /// system container directly and serves only the gigalocker extent, with no
+    /// external helper and no hand-supplied sector.
+    ///
+    /// `start_sector == 0` (the default) *locates the gigalocker automatically*
+    /// inside the container by its CRC-checked root records; a non-zero
+    /// `start_sector` is an explicit override for the rare case the scan should
+    /// be skipped.
+    pub(crate) fn open_owner(writes_enabled: bool, start_sector: u64) -> Result<Store> {
+        if start_sector != 0 {
+            return Self::open_based(OWNER_PATH, writes_enabled, start_sector << 9);
+        }
+        Self::open_located(writes_enabled)
     }
 
-    /// Opens the store, selecting the device-mapper mapping (`start_sector == 0`)
-    /// or the in-kernel raw-extent owner. The owner opens the whole iBoot system
-    /// container and treats the [`STORE_SIZE`] window at `start_sector` as the
-    /// gigalocker, reproducing the mapper's bytes without a userspace parser.
-    pub(crate) fn open_owner(writes_enabled: bool, start_sector: u64) -> Result<Store> {
-        if start_sector == 0 {
-            return Self::open(writes_enabled);
+    /// Locates the gigalocker inside the iBoot system container with no external
+    /// help. The container is read sequentially and searched, at block-aligned
+    /// offsets, for a root record's signature — a `1` or `2` key kind with an
+    /// all-zero UUID, the shape of [`Key::root`]. Each base implied by such a hit
+    /// is probed read-only with the full CRC-checked [`open_based`]; because a
+    /// base shifted a few slots off the true origin still keeps both roots in its
+    /// window (passing the two-root test while dropping records that fall
+    /// outside), the base is pinned by the candidate that recovers the MOST live
+    /// records — the exact discriminator, since only the true origin captures the
+    /// whole set and container noise never forges a CRC-valid record. Repair is
+    /// never armed during discovery; only the pinned base is re-opened writable.
+    /// Bounded by [`MAX_LOCATE_ATTEMPTS`] probes; returns `ENODATA` if not found.
+    fn open_located(writes_enabled: bool) -> Result<Store> {
+        // The container is a writable block device; the block layer only grants
+        // a read-only handle to a read-only device, so scan it through a writable
+        // handle. This does not arm any write — discovery never mutates the
+        // container (see open_based_ext, called below with arm_writes == false).
+        let probe = shim::StoreFile::open_block(OWNER_PATH, true)?;
+        let size = probe.size()?;
+        if size < STORE_SIZE {
+            return Err(ENODATA);
         }
-        Self::open_based(OWNER_PATH, writes_enabled, start_sector << 9)
+
+        let mut buf: KVec<u8> = KVec::new();
+        buf.resize(SCAN_CHUNK, 0, GFP_KERNEL)?;
+        let mut attempts: u32 = 0;
+        let mut off: u64 = 0;
+
+        while off + HEADER_SIZE as u64 <= size {
+            let want = core::cmp::min(SCAN_CHUNK as u64, size - off) as usize;
+            probe.read_exact(off, &mut buf[..want])?;
+
+            let mut p = 0usize;
+            while p + HEADER_SIZE <= want {
+                let kind = buf[p + KEY_KIND];
+                let uuid_zero = buf[p + KEY_UUID..p + KEY_UUID + 16].iter().all(|&b| b == 0);
+                if (kind == 1 || kind == 2) && uuid_zero {
+                    // A root signature anchors the gigalocker: the true base is
+                    // this hit minus a whole number of slots (slots and blocks are
+                    // both 0x1000-aligned, so every candidate stays block-aligned).
+                    // The two-root test alone does NOT pin the base — a base
+                    // shifted off the true origin by a few slots still keeps both
+                    // roots inside its 6 MiB window, so it passes yet silently
+                    // drops the live records that fall outside the shifted window.
+                    // Probe every candidate READ-ONLY (writes_enabled forced false,
+                    // so repair never fires at an unconfirmed base) and pin the one
+                    // that recovers the MOST live records: only the true origin
+                    // captures the whole record set, and container noise never
+                    // forges a CRC-valid record, so max live records is exact.
+                    let hit = off + p as u64;
+                    let mut best: Option<(usize, usize, u64)> = None; // (valid, malformed, base)
+                    let mut k: u64 = 0;
+                    while k as usize <= MAX_SLOTS {
+                        let step = k * SLOT_SIZE as u64;
+                        if step > hit {
+                            break;
+                        }
+                        let base = hit - step;
+                        k += 1;
+                        if base + STORE_SIZE > size {
+                            continue;
+                        }
+                        attempts += 1;
+                        if attempts > MAX_LOCATE_ATTEMPTS {
+                            break;
+                        }
+                        if let Ok(store) = Self::open_based_ext(OWNER_PATH, true, false, base) {
+                            let cand = (store.valid_records, store.malformed_records, base);
+                            let better = match best {
+                                None => true,
+                                // More live records wins; ties break to fewer
+                                // malformed, then to the HIGHER base. An up-shift
+                                // drops the lowest occupied slots (and any root
+                                // there, which fails the two-root test), so it
+                                // never ties on live count; the only bases that
+                                // can tie are down-shifts, which are all lower
+                                // than the true origin — so the highest surviving
+                                // candidate is the true origin.
+                                Some(b) => {
+                                    cand.0 > b.0
+                                        || (cand.0 == b.0 && cand.1 < b.1)
+                                        || (cand.0 == b.0 && cand.1 == b.1 && cand.2 > b.2)
+                                }
+                            };
+                            if better {
+                                best = Some(cand);
+                            }
+                        }
+                    }
+                    // The gigalocker is unique, so the first hit that confirms any
+                    // base has pinned it. Re-open the winner through a writable
+                    // handle and arm repair per `writes_enabled` — repair runs
+                    // now, and only at this confirmed origin.
+                    if let Some((_, _, base)) = best {
+                        return Self::open_based_ext(OWNER_PATH, true, writes_enabled, base);
+                    }
+                    if attempts > MAX_LOCATE_ATTEMPTS {
+                        return Err(ENODATA);
+                    }
+                }
+                p += BLOCK_SIZE;
+            }
+
+            if want < SCAN_CHUNK {
+                break;
+            }
+            // Overlap one block so a signature on the boundary is not missed.
+            off += (SCAN_CHUNK - BLOCK_SIZE) as u64;
+        }
+        Err(ENODATA)
     }
 
     /// Opens a caller-selected block mapping at offset zero.
@@ -151,8 +269,29 @@ impl Store {
     /// `base`. The window must be block-aligned and fit within the device; the
     /// logical store is always exactly [`STORE_SIZE`], so a larger backing
     /// device (the raw container) serves only its gigalocker extent.
+    ///
+    /// The block handle's writability equals `writes_enabled`, and repair runs
+    /// when writes are enabled. For the raw-extent owner, discovery instead
+    /// needs a writable handle (the block layer only grants a read-only handle
+    /// to a read-only device, and the container is writable) *without* arming
+    /// repair at an unconfirmed base — see [`open_based_ext`].
     fn open_based(path: &CStr, writes_enabled: bool, base: u64) -> Result<Store> {
-        let file = shim::StoreFile::open_block(path, writes_enabled)?;
+        Self::open_based_ext(path, writes_enabled, writes_enabled, base)
+    }
+
+    /// As [`open_based`], but with the block-handle writability (`dev_writable`)
+    /// decoupled from whether repair writes are armed (`arm_writes`). Discovery
+    /// of the raw-extent owner opens the writable container with
+    /// `dev_writable == true` yet `arm_writes == false`, so a candidate base is
+    /// fully scanned and CRC-validated without a single write landing at an
+    /// origin that has not yet been confirmed as the true gigalocker.
+    fn open_based_ext(
+        path: &CStr,
+        dev_writable: bool,
+        arm_writes: bool,
+        base: u64,
+    ) -> Result<Store> {
+        let file = shim::StoreFile::open_block(path, dev_writable)?;
         let size = file.size()?;
         if base % BLOCK_SIZE as u64 != 0 || STORE_SIZE % BLOCK_SIZE as u64 != 0 {
             return Err(EINVAL);
@@ -191,8 +330,8 @@ impl Store {
         if store.find(&Key::root(1)).is_none() || store.find(&Key::root(2)).is_none() {
             return Err(ENODATA);
         }
-        store.writes_enabled = writes_enabled;
-        if writes_enabled {
+        store.writes_enabled = arm_writes;
+        if arm_writes {
             store.repair_disk()?;
         }
         Ok(store)
@@ -398,6 +537,12 @@ impl Store {
         self.slots[idx] = Slot::FREE;
         self.valid_records = self.slots.iter().filter(|slot| slot.used).count();
         Ok(true)
+    }
+
+    /// Byte offset of the served gigalocker window within the opened container:
+    /// the located extent's offset (an explicit start-sector override sets it).
+    pub(crate) fn base(&self) -> u64 {
+        self.base
     }
 
     pub(crate) fn summary(&self) -> (usize, usize, u64, usize, usize, usize, bool) {

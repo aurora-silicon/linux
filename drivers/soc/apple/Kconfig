@@ -119,10 +119,10 @@ config APPLE_SEP
 	  device (enrol and match), exposes the SEP hardware RNG, and registers a
 	  SEP-backed trusted key source so keyctl can seal keys to the enclave.
 
-	  The driver requires the existing machine-wide xART gigalocker at
-	  /dev/mapper/sep-xart-gigalocker. It validates the complete store and both
-	  root records before registering with SEP. Writes remain disabled unless
-	  the xart_writes module parameter is set and the mapping is writable.
+	  The driver reads the existing machine-wide xART gigalocker directly from
+	  the iBoot system container, locating it by its root records. It validates
+	  the complete store and both root records before registering with SEP.
+	  Writes remain disabled unless the xart_writes module parameter is set.
 
 	  Say Y here if you have an Apple silicon Mac.
 

@@ -716,9 +716,11 @@ impl SepData {
             Ok(store) => {
                 let (slots, records, revision, malformed, duplicates, repaired, writable) =
                     store.summary();
+                let base = store.base();
                 dev_info!(
                     dev,
-                    "xART: {} slots, {} live records, max revision {}, {} malformed, {} duplicate, {} repaired; writes {}\n",
+                    "xART: in-kernel raw-extent owner (base {:#x}); {} slots, {} live records, max revision {}, {} malformed, {} duplicate, {} repaired; writes {}\n",
+                    base,
                     slots,
                     records,
                     revision,
@@ -732,8 +734,7 @@ impl SepData {
             Err(e) => {
                 dev_err!(
                     dev,
-                    "shared xART mapping '{}' is unavailable or invalid: {:?}\n",
-                    xart_store::STORE_PATH,
+                    "xART gigalocker in the iBoot container is unavailable or invalid: {:?}\n",
                     e
                 );
                 return Err(e);
@@ -2160,11 +2161,11 @@ module! {
     params: {
         xart_writes: u8 {
             default: 0,
-            description: "Allow writes to the validated shared xART mapping",
+            description: "Allow writes to the validated shared xART store",
         },
         xart_start_sector: u64 {
             default: 0,
-            description: "First 512-byte sector of the xART gigalocker extent within the iBoot system container. Non-zero selects the in-kernel raw-extent owner (no userspace mapper); zero uses the device-mapper mapping at /dev/mapper/sep-xart-gigalocker",
+            description: "Explicit 512-byte start sector of the xART gigalocker extent within the iBoot system container. Zero (default) locates the gigalocker automatically in the container by its root records; a non-zero value overrides the search. Either way the driver opens the container directly",
         },
         provision_keybag: u8 {
             default: 0,
