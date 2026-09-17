@@ -72,6 +72,21 @@ static int apple_actuator_probe(struct hid_device *haptic_hdev, const struct hid
 		return ret;
 	}
 
+	/*
+	 * The actuator keeps its mode across a warm reboot, and every user of
+	 * it starts out believing it is device-controlled. One left in
+	 * host-controlled mode by a previous boot is silent: its firmware plays
+	 * nothing, and the host that was driving it is gone. Assert the state
+	 * the drivers assume rather than inheriting the last one. A failure
+	 * here is not fatal; it only means the actuator keeps whatever mode it
+	 * had, which is what would have happened anyway.
+	 */
+	ret = apple_taptic_switch_modes(haptic_hdev, false);
+	if (ret)
+		hid_warn(haptic_hdev,
+			 "cannot return the actuator to device-controlled mode (%d)\n",
+			 ret);
+
 	return 0;
 }
 
