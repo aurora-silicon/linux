@@ -1565,17 +1565,30 @@ static void magicmouse_release_worker(struct work_struct *ws)
 static bool magicmouse_haptic_click(struct magicmouse_sc *msc, u32 pressure,
 				    bool firmware_button)
 {
+	bool host_mode;
+
 	if (!msc->haptics || !msc->haptics->wq)
 		return firmware_button;
 
-	if (!haptic_press) {
-		/* Hand the actuator back and report its button again. */
-		if (msc->haptics->mode == HID_HAPTIC_MODE_HOST) {
-			msc->haptic_button_down = false;
-			queue_work(msc->haptics->wq, &msc->haptic_release_work);
-		}
+	host_mode = msc->haptics->mode == HID_HAPTIC_MODE_HOST;
+
+	if (!haptic_press && !host_mode) {
+		/* The firmware owns the actuator and reports the button. */
+		msc->haptic_button_down = false;
+		msc->haptic_deep_fired = false;
 		return firmware_button;
 	}
+
+	/*
+	 * Host-controlled mode without host-driven feedback means userspace
+	 * uploaded an effect and owns the waveform. Ask for the actuator back,
+	 * but keep deriving the button until it is: the firmware reports no
+	 * button while it does not hold the actuator, and the mode cannot be
+	 * released while an effect is loaded, so trusting it here would leave
+	 * the pad unable to click until every effect is erased.
+	 */
+	if (!haptic_press)
+		queue_work(msc->haptics->wq, &msc->haptic_release_work);
 
 	if (!msc->haptic_button_down && pressure >= haptic_press_threshold) {
 		msc->haptic_button_down = true;
