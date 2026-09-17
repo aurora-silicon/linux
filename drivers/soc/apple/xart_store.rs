@@ -13,17 +13,24 @@ use kernel::prelude::*;
 
 pub(crate) const STORE_PATH: &CStr = c"/dev/mapper/sep-xart-gigalocker";
 
+/// The raw-extent owner opens this whole partition (the iBoot system container,
+/// where the gigalocker lives) and serves the window at the configured sector.
+/// It replaces the userspace APFS parser + device-mapper mapping.
+pub(crate) const OWNER_PATH: &CStr = c"/dev/disk/by-partlabel/iBootSystemContainer";
+
 const BLOCK_SIZE: usize = 0x1000;
 const SLOT_SIZE: usize = 0x9000;
 const HEADER_SIZE: usize = 0x22;
 const DELETE_SIZE: usize = BLOCK_SIZE;
 /// Size of the APFS raw extent located on the target machine.
 ///
-/// Accepting a larger block device would make a bad device-mapper table a
-/// corruption hazard. Accepting a smaller one could silently truncate the
-/// slot grid. A future locator for a machine with a different extent size must
-/// pass that size through an explicit, reviewed interface instead of weakening
-/// this check.
+/// The logical store is always exactly this many bytes. The device-mapper
+/// mapping is exactly this size; the raw-extent owner opens a larger container
+/// and serves only the [`STORE_SIZE`] window at its configured base, so a wrong
+/// base cannot read past the extent. A wrong window in either mode fails closed:
+/// the two root records will not validate and `open_based` returns `ENODATA`
+/// rather than serving SEP an unrelated store. A machine with a different extent
+/// size must pass that size through an explicit, reviewed interface.
 const STORE_SIZE: u64 = 0x600000;
 const MAX_SLOTS: usize = 4096;
 
@@ -80,6 +87,10 @@ impl Slot {
 
 pub(crate) struct Store {
     file: shim::StoreFile,
+    /// Byte offset of the first slot within the opened block device. Zero for
+    /// the device-mapper mapping (which starts at the gigalocker); non-zero for
+    /// the raw-extent owner, which opens the whole container and points here.
+    base: u64,
     slots: KVec<Slot>,
     revision: u64,
     writes_enabled: bool,
@@ -112,21 +123,45 @@ fn valid_key(key: &Key) -> bool {
 
 impl Store {
     pub(crate) fn open(writes_enabled: bool) -> Result<Store> {
-        Self::open_at(STORE_PATH, writes_enabled)
+        Self::open_based(STORE_PATH, writes_enabled, 0)
     }
 
-    /// Opens a caller-selected block mapping.
+    /// Opens the store, selecting the device-mapper mapping (`start_sector == 0`)
+    /// or the in-kernel raw-extent owner. The owner opens the whole iBoot system
+    /// container and treats the [`STORE_SIZE`] window at `start_sector` as the
+    /// gigalocker, reproducing the mapper's bytes without a userspace parser.
+    pub(crate) fn open_owner(writes_enabled: bool, start_sector: u64) -> Result<Store> {
+        if start_sector == 0 {
+            return Self::open(writes_enabled);
+        }
+        Self::open_based(OWNER_PATH, writes_enabled, start_sector << 9)
+    }
+
+    /// Opens a caller-selected block mapping at offset zero.
     ///
-    /// Production always uses [`STORE_PATH`]. The separate xART self-test
-    /// module uses this entry point with its fixed loop-only mapper name, so it
-    /// can execute the real parser and write ordering without enabling SEP.
+    /// The separate xART self-test module uses this entry point with its fixed
+    /// loop-only mapper name, so it can execute the real parser and write
+    /// ordering without enabling SEP.
+    #[allow(dead_code)]
     pub(crate) fn open_at(path: &CStr, writes_enabled: bool) -> Result<Store> {
+        Self::open_based(path, writes_enabled, 0)
+    }
+
+    /// Opens `path` and serves the [`STORE_SIZE`] window starting at byte
+    /// `base`. The window must be block-aligned and fit within the device; the
+    /// logical store is always exactly [`STORE_SIZE`], so a larger backing
+    /// device (the raw container) serves only its gigalocker extent.
+    fn open_based(path: &CStr, writes_enabled: bool, base: u64) -> Result<Store> {
         let file = shim::StoreFile::open_block(path, writes_enabled)?;
         let size = file.size()?;
-        if size != STORE_SIZE || size % BLOCK_SIZE as u64 != 0 {
+        if base % BLOCK_SIZE as u64 != 0 || STORE_SIZE % BLOCK_SIZE as u64 != 0 {
             return Err(EINVAL);
         }
-        let count = (size / SLOT_SIZE as u64) as usize;
+        let end = base.checked_add(STORE_SIZE).ok_or(EINVAL)?;
+        if end > size {
+            return Err(EINVAL);
+        }
+        let count = (STORE_SIZE / SLOT_SIZE as u64) as usize;
         if count == 0 || count > MAX_SLOTS {
             return Err(EINVAL);
         }
@@ -137,6 +172,7 @@ impl Store {
         }
         let mut store = Store {
             file,
+            base,
             slots,
             revision: 0,
             // Discovery is always read-only. Do not arm even repair writes
@@ -172,7 +208,7 @@ impl Store {
 
         for idx in 0..self.slots.len() {
             self.file
-                .read_block_exact(Self::slot_offset(idx), &mut raw)?;
+                .read_block_exact(self.base + Self::slot_offset(idx), &mut raw)?;
             let kind = raw[KEY_KIND];
             if kind == 0 {
                 continue;
@@ -230,7 +266,7 @@ impl Store {
                 continue;
             }
             self.file
-                .read_block_exact(Self::slot_offset(idx), &mut header)?;
+                .read_block_exact(self.base + Self::slot_offset(idx), &mut header)?;
             if header[KEY_KIND] != 0 {
                 self.delete_slot(idx)?;
                 self.repaired_records += 1;
@@ -265,7 +301,7 @@ impl Store {
         let mut zero = KVec::with_capacity(DELETE_SIZE, GFP_KERNEL)?;
         zero.resize(DELETE_SIZE, 0, GFP_KERNEL)?;
         self.file
-            .write_block_exact(Self::slot_offset(slot), &zero)?;
+            .write_block_exact(self.base + Self::slot_offset(slot), &zero)?;
         self.file.sync()
     }
 
@@ -280,7 +316,7 @@ impl Store {
         let mut raw = KVec::with_capacity(SLOT_SIZE, GFP_KERNEL)?;
         raw.resize(SLOT_SIZE, 0, GFP_KERNEL)?;
         self.file
-            .read_block_exact(Self::slot_offset(idx), &mut raw)?;
+            .read_block_exact(self.base + Self::slot_offset(idx), &mut raw)?;
 
         let mut uuid = [0u8; 16];
         uuid.copy_from_slice(&raw[KEY_UUID..KEY_UUID + 16]);
@@ -329,7 +365,7 @@ impl Store {
         // The new record becomes authoritative only after its complete slot is
         // durable.  The old record is then removed and flushed separately.
         self.file
-            .write_block_exact(Self::slot_offset(fresh), &raw)?;
+            .write_block_exact(self.base + Self::slot_offset(fresh), &raw)?;
         self.file.sync()?;
         self.slots[fresh] = Slot {
             used: true,

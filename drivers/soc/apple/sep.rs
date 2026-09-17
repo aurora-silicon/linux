@@ -711,7 +711,8 @@ impl SepData {
         let dma_ring = dma::Coherent::<u8>::zeroed_slice(dev, DMA_RING_SIZE, GFP_KERNEL)?;
 
         let xart_writes = *module_parameters::xart_writes.value() != 0;
-        let store = match xart_store::Store::open(xart_writes) {
+        let xart_start = *module_parameters::xart_start_sector.value();
+        let store = match xart_store::Store::open_owner(xart_writes, xart_start) {
             Ok(store) => {
                 let (slots, records, revision, malformed, duplicates, repaired, writable) =
                     store.summary();
@@ -2160,6 +2161,10 @@ module! {
         xart_writes: u8 {
             default: 0,
             description: "Allow writes to the validated shared xART mapping",
+        },
+        xart_start_sector: u64 {
+            default: 0,
+            description: "First 512-byte sector of the xART gigalocker extent within the iBoot system container. Non-zero selects the in-kernel raw-extent owner (no userspace mapper); zero uses the device-mapper mapping at /dev/mapper/sep-xart-gigalocker",
         },
         provision_keybag: u8 {
             default: 0,
