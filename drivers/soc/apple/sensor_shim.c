@@ -433,14 +433,14 @@ int sep_sensor_irq_setup(void)
 
 	init_completion(&sep_drdy_done);
 	/*
-	 * Edge-triggered, both edges: the data-ready line idles low, so a level
-	 * trigger would storm continuously. An edge fires once per data-ready
-	 * transition regardless of the line's asserted polarity, so the capture
-	 * loop actually waits; a missed edge only costs one status poll.
+	 * Edge-triggered on the rising edge only. The line idles low, so a level
+	 * trigger storms and both-edges fires again on the deassert -- a spurious
+	 * wake that, mid-enrolment, spins the capture loop. The data-ready assert
+	 * is the low->high edge; the capture loop's status read gates the frame,
+	 * and a missed edge only costs one status poll.
 	 */
 	rc = request_threaded_irq(irq, NULL, sep_drdy_isr,
-				  IRQF_ONESHOT | IRQF_TRIGGER_RISING |
-					  IRQF_TRIGGER_FALLING,
+				  IRQF_ONESHOT | IRQF_TRIGGER_RISING,
 				  "apple-mesa-drdy", sep_spi);
 	if (rc) {
 		if (sep_drdy) {

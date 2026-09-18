@@ -366,6 +366,11 @@ const ENROL_MAX_CAPTURES: u32 = 12;
 
 const ENROL_POLL_MS: u32 = 2;
 
+// Interrupt-driven capture blocks on the data-ready line rather than polling
+// SPI status. This is the maximum a single wait blocks before re-reading status
+// as a backstop; the interrupt wakes it far sooner when a frame is ready.
+const ENROL_IRQ_WAIT_MS: u32 = 250;
+
 const ENROL_CAPTURE_TIMEOUT_MS: u32 = 60_000;
 const ENROL_POLL_ATTEMPTS: u32 = ENROL_CAPTURE_TIMEOUT_MS / ENROL_POLL_MS;
 static_assert!(ENROL_POLL_ATTEMPTS * ENROL_POLL_MS == ENROL_CAPTURE_TIMEOUT_MS);
@@ -2184,10 +2189,6 @@ module! {
         os_uuid_lo: u64 {
             default: 0,
             description: "Low 64 bits of an explicit xART OS UUID",
-        },
-        capture_irq: u8 {
-            default: 0,
-            description: "Wake the capture loop from the sensor's data-ready interrupt instead of polling SPI status (experimental; 0 = poll, the default). The interrupt only accelerates the loop -- status is still read over SPI to gate each frame -- and is set up once while the sensor is idle, never toggled mid-capture.",
         },
     },
 }
