@@ -19,6 +19,10 @@ extern "C" {
     fn sep_sensor_xfer(tx: *const c_void, rx: *mut c_void, len: usize) -> c_int;
     fn sep_sensor_xfer_tx(tx: *const c_void, len: usize) -> c_int;
     fn sep_sensor_xfer2(tx: *const c_void, tx_len: usize, rx: *mut c_void, rx_len: usize) -> c_int;
+    fn sep_sensor_irq_setup() -> c_int;
+    fn sep_sensor_irq_available() -> c_int;
+    fn sep_sensor_irq_arm();
+    fn sep_sensor_irq_wait(timeout_ms: c_uint) -> c_int;
     fn sep_sensor_firmware_name() -> *const c_char;
 }
 
@@ -220,6 +224,31 @@ pub(crate) fn power_source() -> PowerSource {
 pub(crate) fn power(on: bool) -> bool {
     // SAFETY: the shim holds the descriptor and applies its delays.
     unsafe { sep_sensor_power(if on { 1 } else { 0 }) == 0 }
+}
+
+/// Sets up the data-ready interrupt once, while the sensor is idle. Returns
+/// true when an interrupt is available for interrupt-driven capture.
+pub(crate) fn irq_setup() -> bool {
+    // SAFETY: no arguments; idempotent, falls back to -errno when unavailable.
+    unsafe { sep_sensor_irq_setup() == 0 }
+}
+
+pub(crate) fn irq_available() -> bool {
+    // SAFETY: reads one int.
+    unsafe { sep_sensor_irq_available() != 0 }
+}
+
+/// Clears any stale data-ready signal before a capture.
+pub(crate) fn irq_arm() {
+    // SAFETY: no arguments; a no-op when no IRQ is configured.
+    unsafe { sep_sensor_irq_arm() }
+}
+
+/// Waits up to `timeout_ms` for the data-ready line to assert. Returns true if
+/// it fired, false on timeout or when no interrupt is configured.
+pub(crate) fn irq_wait(timeout_ms: c_uint) -> bool {
+    // SAFETY: no pointers; the shim owns the completion and the IRQ line.
+    unsafe { sep_sensor_irq_wait(timeout_ms) == 0 }
 }
 
 fn command(cmd: &[u8; CMD_LEN]) -> Result<()> {

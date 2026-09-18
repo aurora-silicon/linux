@@ -736,7 +736,21 @@ impl SepData {
             patch = reloaded_patch;
         }
 
-        self.complete_bringup(patch)
+        let ok = self.complete_bringup(patch);
+        // The sensor is patched and idle here -- the only safe moment to
+        // configure the data-ready interrupt, which is then left alone for the
+        // driver's life. Opt-in; the poll path is unchanged when off.
+        if ok && *module_parameters::capture_irq.value() != 0 && !sensor::irq_available() {
+            if sensor::irq_setup() {
+                dev_info!(self.dev, "sensor: interrupt-driven capture enabled\n");
+            } else {
+                dev_warn!(
+                    self.dev,
+                    "sensor: data-ready interrupt unavailable; capture stays on SPI polling\n"
+                );
+            }
+        }
+        ok
     }
 
     pub(crate) fn run_bringup(&self) {
@@ -1651,6 +1665,14 @@ impl SepData {
         let mut previous: Option<[u8; sensor::STATUS_LEN]> = None;
         let mut armed_reported = false;
 
+        // Interrupt-driven capture only replaces the fixed inter-poll sleep with
+        // a data-ready wait; the SPI status read below still gates every frame,
+        // so a missed or spurious interrupt costs at most one poll interval.
+        let use_irq = *module_parameters::capture_irq.value() != 0 && sensor::irq_available();
+        if use_irq {
+            sensor::irq_arm();
+        }
+
         for attempt in 0..ENROL_POLL_ATTEMPTS {
             if !bio::capture_is_live(&self.bio_session.lock()) {
                 return CaptureWait::Abandon;
@@ -1693,7 +1715,14 @@ impl SepData {
                 return CaptureWait::Ready(count);
             }
 
-            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(ENROL_POLL_MS)));
+            if use_irq {
+                // Wake the instant the sensor asserts data-ready, or after the
+                // same interval on timeout; then re-arm for the next frame.
+                let _ = sensor::irq_wait(ENROL_POLL_MS);
+                sensor::irq_arm();
+            } else {
+                kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(ENROL_POLL_MS)));
+            }
         }
         let _ = sensor::status();
         CaptureWait::Timeout

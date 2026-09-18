@@ -128,6 +128,17 @@ int sep_sensor_xfer(const void *tx, void *rx, size_t len);
 int sep_sensor_xfer_tx(const void *tx, size_t len);
 int sep_sensor_xfer2(const void *tx, size_t tx_len, void *rx, size_t rx_len);
 
+/*
+ * Optional data-ready interrupt for interrupt-driven capture. Set up once while
+ * the sensor is idle (never toggled per capture), then armed and waited on to
+ * wake the capture loop the instant a frame is ready instead of polling.
+ */
+int sep_sensor_irq_setup(void);
+void sep_sensor_irq_teardown(void);
+int sep_sensor_irq_available(void);
+void sep_sensor_irq_arm(void);
+int sep_sensor_irq_wait(unsigned int timeout_ms);
+
 /* -- bio_shim.c --------------------------------------------------------- */
 
 void *sep_bio_register(const char *name, unsigned short mode, void *ctx,

@@ -2185,5 +2185,9 @@ module! {
             default: 0,
             description: "Low 64 bits of an explicit xART OS UUID",
         },
+        capture_irq: u8 {
+            default: 0,
+            description: "Wake the capture loop from the sensor's data-ready interrupt instead of polling SPI status (experimental; 0 = poll, the default). The interrupt only accelerates the loop -- status is still read over SPI to gate each frame -- and is set up once while the sensor is idle, never toggled mid-capture.",
+        },
     },
 }

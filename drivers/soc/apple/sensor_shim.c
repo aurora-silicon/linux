@@ -3,11 +3,13 @@
 /* Fingerprint sensor SPI shim: moves bytes over the bus and toggles power. */
 
 #include <linux/build_bug.h>
+#include <linux/completion.h>
 #include <linux/device.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/gpio/driver.h>
 #include <linux/gpio/machine.h>
+#include <linux/interrupt.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/slab.h>
@@ -50,6 +52,16 @@ static bool sep_registered;
 #define SEP_POWER_CHIP_LINE		2
 
 static int sep_power_source;
+
+/*
+ * Data-ready line for interrupt-driven capture. On j414s it is the pin adjacent
+ * to the power line (122) on the same controller; other boards describe it as
+ * the SPI node's interrupt, which the SPI core resolves into spi->irq.
+ */
+#define SEP_SENSOR_DRDY_LINE	121
+static struct gpio_desc *sep_drdy;	/* set only when we own the gpiochip line (j414s) */
+static int sep_drdy_irq = -1;
+static DECLARE_COMPLETION(sep_drdy_done);
 
 /*
  * Takes the power line as an output driven low: the power cycle begins with an
@@ -227,6 +239,7 @@ static int sep_sensor_probe(struct spi_device *spi)
 
 static void sep_sensor_remove(struct spi_device *spi)
 {
+	sep_sensor_irq_teardown();
 	sep_release_power();
 	sep_spi = NULL;
 }
@@ -349,6 +362,137 @@ int sep_sensor_power(int on)
 		msleep(SEP_SENSOR_ON_DELAY_MS);
 	else
 		msleep(SEP_SENSOR_OFF_DELAY_MS);
+	return 0;
+}
+
+/*
+ * Threaded data-ready handler. IRQF_ONESHOT keeps the line masked while this
+ * runs, so a level-asserted line cannot storm the CPU; it only wakes the
+ * capture loop, which still confirms the sensor state over SPI before reading.
+ */
+static irqreturn_t sep_drdy_isr(int irq, void *dev_id)
+{
+	complete(&sep_drdy_done);
+	return IRQ_HANDLED;
+}
+
+/*
+ * Set up the data-ready interrupt once, while the sensor is idle. It is left
+ * configured and enabled for the driver's lifetime -- never toggled per capture
+ * -- because reconfiguring this line mid-capture is what drops the sensor's
+ * firmware patch. Returns 0 when an interrupt is available, -errno otherwise
+ * (the caller then falls back to polling).
+ */
+int sep_sensor_irq_setup(void)
+{
+	struct device_node *np;
+	struct gpio_device *gdev;
+	struct gpio_chip *gc;
+	int irq, rc;
+
+	if (!sep_spi)
+		return -ENODEV;
+	if (sep_drdy_irq >= 0)
+		return 0;
+
+	if (sep_spi->irq > 0) {
+		/* A board that describes the data-ready line as the SPI node's
+		 * interrupt gets it resolved by the SPI core. */
+		irq = sep_spi->irq;
+	} else if (of_machine_is_compatible("apple,j414s")) {
+		np = of_find_node_by_path(SEP_SENSOR_GPIO_NODE);
+		if (!np)
+			return -ENODEV;
+		gdev = gpio_device_find_by_fwnode(of_fwnode_handle(np));
+		of_node_put(np);
+		if (!gdev)
+			return -ENODEV;
+		gc = gpio_device_get_chip(gdev);
+		if (!gc) {
+			gpio_device_put(gdev);
+			return -ENODEV;
+		}
+		sep_drdy = gpiochip_request_own_desc(gc, SEP_SENSOR_DRDY_LINE,
+						     "apple-mesa-drdy",
+						     GPIO_LOOKUP_FLAGS_DEFAULT,
+						     GPIOD_IN);
+		gpio_device_put(gdev);
+		if (IS_ERR(sep_drdy)) {
+			sep_drdy = NULL;
+			return -ENODEV;
+		}
+		irq = gpiod_to_irq(sep_drdy);
+		if (irq < 0) {
+			gpiochip_free_own_desc(sep_drdy);
+			sep_drdy = NULL;
+			return irq;
+		}
+	} else {
+		return -ENODEV;
+	}
+
+	init_completion(&sep_drdy_done);
+	/*
+	 * Edge-triggered, both edges: the data-ready line idles low, so a level
+	 * trigger would storm continuously. An edge fires once per data-ready
+	 * transition regardless of the line's asserted polarity, so the capture
+	 * loop actually waits; a missed edge only costs one status poll.
+	 */
+	rc = request_threaded_irq(irq, NULL, sep_drdy_isr,
+				  IRQF_ONESHOT | IRQF_TRIGGER_RISING |
+					  IRQF_TRIGGER_FALLING,
+				  "apple-mesa-drdy", sep_spi);
+	if (rc) {
+		if (sep_drdy) {
+			gpiochip_free_own_desc(sep_drdy);
+			sep_drdy = NULL;
+		}
+		return rc;
+	}
+	sep_drdy_irq = irq;
+	dev_info(&sep_spi->dev,
+		 "sep sensor: data-ready IRQ %d configured for interrupt capture\n",
+		 irq);
+	return 0;
+}
+
+void sep_sensor_irq_teardown(void)
+{
+	if (sep_drdy_irq >= 0) {
+		free_irq(sep_drdy_irq, sep_spi);
+		sep_drdy_irq = -1;
+	}
+	if (sep_drdy) {
+		gpiochip_free_own_desc(sep_drdy);
+		sep_drdy = NULL;
+	}
+}
+
+int sep_sensor_irq_available(void)
+{
+	return sep_drdy_irq >= 0;
+}
+
+/* Clear any stale signal before a capture so the next wait reflects a fresh
+ * data-ready edge, not a leftover from the previous frame. */
+void sep_sensor_irq_arm(void)
+{
+	if (sep_drdy_irq >= 0)
+		reinit_completion(&sep_drdy_done);
+}
+
+/*
+ * Wait for the data-ready line to assert, up to timeout_ms. 0 = fired,
+ * -ETIMEDOUT = no signal (the caller re-polls status over SPI regardless, so a
+ * missed interrupt only costs one poll interval), -ENODEV = no interrupt.
+ */
+int sep_sensor_irq_wait(unsigned int timeout_ms)
+{
+	if (sep_drdy_irq < 0)
+		return -ENODEV;
+	if (wait_for_completion_timeout(&sep_drdy_done,
+					msecs_to_jiffies(timeout_ms)) == 0)
+		return -ETIMEDOUT;
 	return 0;
 }
 
