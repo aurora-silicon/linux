@@ -1080,6 +1080,12 @@ impl SepData {
                 }
                 ImageOutcome::Retry => {
                     counter = counter.saturating_add(1);
+                    // The capture did not take (partial/unusable contact). Nudge
+                    // the person to hold still and press again rather than
+                    // silently re-capturing with no feedback.
+                    if bio::enrol_guide(&mut self.bio_session.lock(), bio::Guidance::HoldStill) {
+                        self.bio_wake();
+                    }
                 }
                 ImageOutcome::NoFinger => {
                     break Some(Err(ENROL_STATUS_TIMEOUT));
