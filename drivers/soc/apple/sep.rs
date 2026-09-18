@@ -91,8 +91,6 @@ const PHASE_ATTACH: u32 = 0;
 const PHASE_EXCHANGE: u32 = 1;
 const PHASE_READY: u32 = 2;
 
-const ENDPOINTS_BEFORE_EXCHANGE: usize = 7;
-
 const OOL_SIZE_XARM: usize = 0x8000;
 
 const OOL_SIZE_SBIO: usize = 0x4000;
@@ -1781,8 +1779,16 @@ impl SepData {
             return;
         }
 
-        let endpoints = this.endpoint_count();
-        if endpoints <= ENDPOINTS_BEFORE_EXCHANGE {
+        // The endpoint ladder climbs 7 -> 11 (sbio, scrd) -> 12 (the key
+        // store, EP 0x12). The SEP can advertise the key store a beat after it
+        // falls briefly quiet following scrd, so treating any count past the
+        // pre-exchange baseline as "done" races that last step and strands the
+        // boot at 11 endpoints with no key store. Wait through quiescence until
+        // the key store itself is advertised, bounded by the same
+        // EXCHANGE_TIMEOUT_MS. A boot that already has it exits immediately, so
+        // healthy boots are unaffected; this also drops the hardcoded endpoint
+        // count, which is not portable across SoCs.
+        if !this.endpoint_present(proto::EP_SKS) {
             let ticks = this.settle_idle_ticks.load(Relaxed).wrapping_add(1);
             this.settle_idle_ticks.store(ticks, Relaxed);
             if ticks.saturating_mul(u64::from(SETTLE_MS)) < u64::from(EXCHANGE_TIMEOUT_MS) {
