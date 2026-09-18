@@ -117,6 +117,7 @@ static bool dcp_typec_route_available(struct apple_dcp_typec_route *route)
 
 static int dcp_typec_route_activate(struct apple_dcp_typec_route *route);
 static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route);
+static int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port);
 
 /*
  * Pipelines are ranked by CRTC index so the fabric's choice is a pure function
@@ -138,6 +139,13 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route)
 {
 	struct apple_dcp *dcp = route->dcp;
 	int ret;
+
+	/*
+	 * The fixed output's HPD handler leaves disconnects to DCP, so the port
+	 * can still be marked connected to a display that is gone. Release it
+	 * (a no-op otherwise), or connecting the borrowed route returns early.
+	 */
+	dcp_dptx_disconnect(dcp, 0);
 
 	if (dcp->fixed_route_selected) {
 		ret = mux_control_deselect(dcp->xbar);
