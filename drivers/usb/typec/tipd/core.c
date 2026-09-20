@@ -561,6 +561,62 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		cd321x->state.data = NULL;
 		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 		ret = typec_mux_set(cd321x->mux, &cd321x->state);
+	} else if (st->data_status & CD321X_DATA_STATUS_USB4_CONNECTION) {
+		struct enter_usb_data eusb_data;
+
+		if (cd321x->state.alt == NULL && cd321x->state.mode == TYPEC_MODE_USB4)
+			return 0;
+
+		eusb_data.eudo = le32_to_cpu(st->usb4_status.eudo);
+		eusb_data.active_link_training =
+			!!(st->data_status & TPS_DATA_STATUS_ACTIVE_LINK_TRAIN);
+
+		cd321x->state.alt = NULL;
+		cd321x->state.data = &eusb_data;
+		cd321x->state.mode = TYPEC_MODE_USB4;
+		ret = typec_mux_set(cd321x->mux, &cd321x->state);
+		if (ret)
+			goto out;
+
+		tbt_switch_data.state = TYPEC_THUNDERBOLT_SWITCH_USB4;
+		tbt_switch_data.usb4 = eusb_data;
+		tbt_switch_data.orientation = TPS_STATUS_TO_UPSIDE_DOWN(st->status) ?
+						      TYPEC_ORIENTATION_REVERSE :
+						      TYPEC_ORIENTATION_NORMAL;
+		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
+	} else if (st->data_status & TPS_DATA_STATUS_TBT_CONNECTION) {
+		struct typec_thunderbolt_data tbt_data;
+
+		if (cd321x->state.alt == cd321x->port_altmode_tbt &&
+		    cd321x->state.mode == TYPEC_TBT_MODE)
+			return 0;
+
+		tbt_data.cable_mode = TBT_MODE |
+			TBT_SET_CABLE_SPEED(TPS_DATA_STATUS_TBT_CABLE_SPEED(st->data_status)) |
+			TBT_SET_CABLE_ROUNDED(TPS_DATA_STATUS_TBT_CABLE_GEN(st->data_status));
+		if (st->data_status & TPS_DATA_STATUS_OPTICAL_CABLE)
+			tbt_data.cable_mode |= TBT_CABLE_OPTICAL;
+		if (st->data_status & TPS_DATA_STATUS_ACTIVE_LINK_TRAIN)
+			tbt_data.cable_mode |= TBT_CABLE_LINK_TRAINING;
+		if (st->data_status & CD321X_DATA_STATUS_ACTIVE_CABLE)
+			tbt_data.cable_mode |= TBT_CABLE_ACTIVE_PASSIVE;
+		tbt_data.device_mode = TBT_MODE |
+			(u32)le16_to_cpu(st->intel_vid_status.device_mode) << 16;
+		tbt_data.enter_vdo =
+			(u32)le16_to_cpu(st->intel_vid_status.enter_vdo) << 16;
+		cd321x->state.alt = cd321x->port_altmode_tbt;
+		cd321x->state.mode = TYPEC_TBT_MODE;
+		cd321x->state.data = &tbt_data;
+		ret = typec_mux_set(cd321x->mux, &cd321x->state);
+		if (ret)
+			goto out;
+
+		tbt_switch_data.state = TYPEC_THUNDERBOLT_SWITCH_TBT;
+		tbt_switch_data.tbt = tbt_data;
+		tbt_switch_data.orientation = TPS_STATUS_TO_UPSIDE_DOWN(st->status) ?
+						      TYPEC_ORIENTATION_REVERSE :
+						      TYPEC_ORIENTATION_NORMAL;
+		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 	} else if (st->data_status & TPS_DATA_STATUS_DP_CONNECTION) {
 		struct typec_displayport_data dp_data;
 		unsigned long mode;
@@ -611,62 +667,6 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 			cd321x->dp_status = dp_data.status;
 			cd321x->dp_conf = dp_data.conf;
 		}
-	} else if (st->data_status & TPS_DATA_STATUS_TBT_CONNECTION) {
-		struct typec_thunderbolt_data tbt_data;
-
-		if (cd321x->state.alt == cd321x->port_altmode_tbt &&
-		   cd321x->state.mode == TYPEC_TBT_MODE)
-			return 0;
-
-		tbt_data.cable_mode = TBT_MODE |
-			TBT_SET_CABLE_SPEED(TPS_DATA_STATUS_TBT_CABLE_SPEED(st->data_status)) |
-			TBT_SET_CABLE_ROUNDED(TPS_DATA_STATUS_TBT_CABLE_GEN(st->data_status));
-		if (st->data_status & TPS_DATA_STATUS_OPTICAL_CABLE)
-			tbt_data.cable_mode |= TBT_CABLE_OPTICAL;
-		if (st->data_status & TPS_DATA_STATUS_ACTIVE_LINK_TRAIN)
-			tbt_data.cable_mode |= TBT_CABLE_LINK_TRAINING;
-		if (st->data_status & CD321X_DATA_STATUS_ACTIVE_CABLE)
-			tbt_data.cable_mode |= TBT_CABLE_ACTIVE_PASSIVE;
-		tbt_data.device_mode = TBT_MODE |
-			(u32)le16_to_cpu(st->intel_vid_status.device_mode) << 16;
-		tbt_data.enter_vdo =
-			(u32)le16_to_cpu(st->intel_vid_status.enter_vdo) << 16;
-		cd321x->state.alt = cd321x->port_altmode_tbt;
-		cd321x->state.mode = TYPEC_TBT_MODE;
-		cd321x->state.data = &tbt_data;
-		ret = typec_mux_set(cd321x->mux, &cd321x->state);
-		if (ret)
-			goto out;
-
-		tbt_switch_data.state = TYPEC_THUNDERBOLT_SWITCH_TBT;
-		tbt_switch_data.tbt = tbt_data;
-		tbt_switch_data.orientation = TPS_STATUS_TO_UPSIDE_DOWN(st->status) ?
-						      TYPEC_ORIENTATION_REVERSE :
-						      TYPEC_ORIENTATION_NORMAL;
-		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
-	} else if (st->data_status & CD321X_DATA_STATUS_USB4_CONNECTION) {
-		struct enter_usb_data eusb_data;
-
-		if (cd321x->state.alt == NULL && cd321x->state.mode == TYPEC_MODE_USB4)
-			return 0;
-
-		eusb_data.eudo = le32_to_cpu(st->usb4_status.eudo);
-		eusb_data.active_link_training =
-			!!(st->data_status & TPS_DATA_STATUS_ACTIVE_LINK_TRAIN);
-
-		cd321x->state.alt = NULL;
-		cd321x->state.data = &eusb_data;
-		cd321x->state.mode = TYPEC_MODE_USB4;
-		ret = typec_mux_set(cd321x->mux, &cd321x->state);
-		if (ret)
-			goto out;
-
-		tbt_switch_data.state = TYPEC_THUNDERBOLT_SWITCH_USB4;
-		tbt_switch_data.usb4 = eusb_data;
-		tbt_switch_data.orientation = TPS_STATUS_TO_UPSIDE_DOWN(st->status) ?
-						      TYPEC_ORIENTATION_REVERSE :
-						      TYPEC_ORIENTATION_NORMAL;
-		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 	} else {
 		if (cd321x->state.alt == NULL && cd321x->state.mode == TYPEC_STATE_USB)
 			return 0;
