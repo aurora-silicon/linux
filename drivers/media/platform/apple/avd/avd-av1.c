@@ -1358,6 +1358,7 @@ static void avd_av1_stop(struct avd_ctx *ctx)
 	struct avd_av1_ctx *av1_ctx = ctx->priv;
 	struct avd_dev *avd = ctx->dev;
 
+	avd_buf_free(avd, &av1_ctx->bufs.above_info);
 	avd_buf_free(avd, &av1_ctx->bufs.rf_above_info);
 	avd_buf_free(avd, &av1_ctx->bufs.az_above);
 	avd_buf_free(avd, &av1_ctx->bufs.ip_above);
