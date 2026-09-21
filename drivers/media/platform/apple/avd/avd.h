@@ -17,6 +17,7 @@
 #include <linux/platform_device.h>
 #include <linux/firmware.h>
 #include <linux/iommu.h>
+#include <linux/spinlock.h>
 
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
@@ -186,6 +187,14 @@ struct avd_variant {
 	unsigned int quirks;
 };
 
+/* Lifecycle of the one m2m job the device runs at a time. */
+enum avd_job_state {
+	AVD_JOB_IDLE,
+	AVD_JOB_RUNNING,	/* inside avd_device_run() */
+	AVD_JOB_SUBMITTED,	/* handed to the hardware, watchdog armed */
+	AVD_JOB_FINISHING,	/* claimed by the IRQ handler or the watchdog */
+};
+
 struct avd_dev {
 	struct device *dev;
 	struct v4l2_device v4l2_dev;
@@ -204,6 +213,15 @@ struct avd_dev {
 	struct iommu_domain *empty_domain;
 
 	struct mutex vdev_lock;
+
+	/* The current job; see avd_device_run(). Protected by job_lock. */
+	spinlock_t job_lock;
+	enum avd_job_state job_state;
+	struct avd_ctx *job_ctx;
+	u64 job_seq;
+	bool job_end_sent;
+	bool job_pending;
+	enum vb2_buffer_state job_pending_result;
 
 	struct reset_control *rstc;
 
@@ -240,6 +258,8 @@ struct avd_ctx {
 	bool decomp;
 
 	struct delayed_work watchdog_work;
+	/* job_seq of the job watchdog_work was armed for */
+	u64 wd_seq;
 
 	void *priv;
 

@@ -925,6 +925,17 @@ const struct vb2_ops avd_queue_ops = {
 
 void avd_job_finish_no_pm(struct avd_ctx *ctx, enum vb2_buffer_state result)
 {
+	struct avd_dev *avd = ctx->dev;
+	unsigned long flags;
+
+	spin_lock_irqsave(&avd->job_lock, flags);
+	if (avd->job_ctx == ctx) {
+		avd->job_state = AVD_JOB_IDLE;
+		avd->job_ctx = NULL;
+		avd->job_pending = false;
+	}
+	spin_unlock_irqrestore(&avd->job_lock, flags);
+
 	if (ctx->coded_fmt_desc->ops->done) {
 		struct vb2_v4l2_buffer *src_buf, *dst_buf;
 
