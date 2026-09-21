@@ -361,6 +361,13 @@ static void avd_device_run(void *priv)
 	if (WARN_ON(!desc))
 		return;
 
+	/*
+	 * IRQ completion cannot wait for an already running watchdog. Drain it
+	 * here, before reusing wd_seq, so an old callback cannot time out this
+	 * context's next job. device_run is sleepable; hold no job_lock here.
+	 */
+	cancel_delayed_work_sync(&ctx->watchdog_work);
+
 	ret = pm_runtime_resume_and_get(avd->dev);
 	if (ret < 0) {
 		avd_job_finish_no_pm(ctx, VB2_BUF_STATE_ERROR);
