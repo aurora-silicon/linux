@@ -5,8 +5,9 @@
 //!
 //! The APFS locator exposes the existing `.gl` file as a block device.  This
 //! module implements the record validation, duplicate repair, lookup and
-//! copy-on-write ordering the SEP requires.  It never creates storage
-//! and it can be opened read-only for safe inspection and bring-up.
+//! copy-on-write ordering the SEP requires. It never creates storage.
+//! The raw block owner is restricted to read-only until APFS metadata can
+//! establish the current physical extent of the `.gl` file.
 
 use crate::shim;
 use kernel::prelude::*;
@@ -132,13 +133,22 @@ impl Store {
     /// system container directly and serves only the gigalocker extent, with no
     /// external helper and no hand-supplied sector.
     ///
-    /// `start_sector == 0` (the default) *locates the gigalocker automatically*
-    /// inside the container by its CRC-checked root records; a non-zero
-    /// `start_sector` is an explicit override for the rare case the scan should
-    /// be skipped.
+    /// `start_sector == 0` (the default) searches for CRC-checked root records;
+    /// a non-zero sector skips the search. Neither method proves that the
+    /// window belongs to the current APFS `.gl` file, so writes are refused.
     pub(crate) fn open_owner(writes_enabled: bool, start_sector: u64) -> Result<Store> {
+        // A CRC-valid record signature does not establish the APFS file's
+        // physical extent. Once both roots move away from slot zero, several
+        // shifted windows pass the two-root test, and a shifted window can
+        // extend into APFS-owned blocks. Never write through this raw owner
+        // until the mapping has been checked against APFS file metadata.
+        // An explicit sector is not proof of ownership either.
+        if writes_enabled {
+            return Err(ENOTSUPP);
+        }
         if start_sector != 0 {
-            return Self::open_based(OWNER_PATH, writes_enabled, start_sector << 9);
+            let base = start_sector.checked_mul(512).ok_or(EINVAL)?;
+            return Self::open_based(OWNER_PATH, false, base);
         }
         Self::open_located(writes_enabled)
     }
@@ -150,10 +160,9 @@ impl Store {
     /// is probed read-only with the full CRC-checked [`open_based`]; because a
     /// base shifted a few slots off the true origin still keeps both roots in its
     /// window (passing the two-root test while dropping records that fall
-    /// outside), the base is pinned by the candidate that recovers the MOST live
-    /// records — the exact discriminator, since only the true origin captures the
-    /// whole set and container noise never forges a CRC-valid record. Repair is
-    /// never armed during discovery; only the pinned base is re-opened writable.
+    /// outside), the candidate with the most live records is used for read-only
+    /// diagnostics. This heuristic cannot establish the APFS file's origin or
+    /// prove it is safe to write. Repair is never armed during discovery.
     /// Bounded by [`MAX_LOCATE_ATTEMPTS`] probes; returns `ENODATA` if not found.
     fn open_located(writes_enabled: bool) -> Result<Store> {
         // The container is a writable block device; the block layer only grants
@@ -187,11 +196,9 @@ impl Store {
                     // shifted off the true origin by a few slots still keeps both
                     // roots inside its 6 MiB window, so it passes yet silently
                     // drops the live records that fall outside the shifted window.
-                    // Probe every candidate READ-ONLY (writes_enabled forced false,
-                    // so repair never fires at an unconfirmed base) and pin the one
-                    // that recovers the MOST live records: only the true origin
-                    // captures the whole record set, and container noise never
-                    // forges a CRC-valid record, so max live records is exact.
+                    // Probe candidates without writes and prefer the largest
+                    // recovered record set for diagnostics. An equally valid
+                    // shifted window is possible; this is not an APFS lookup.
                     let hit = off + p as u64;
                     let mut best: Option<(usize, usize, u64)> = None; // (valid, malformed, base)
                     let mut k: u64 = 0;
@@ -214,13 +221,9 @@ impl Store {
                             let better = match best {
                                 None => true,
                                 // More live records wins; ties break to fewer
-                                // malformed, then to the HIGHER base. An up-shift
-                                // drops the lowest occupied slots (and any root
-                                // there, which fails the two-root test), so it
-                                // never ties on live count; the only bases that
-                                // can tie are down-shifts, which are all lower
-                                // than the true origin — so the highest surviving
-                                // candidate is the true origin.
+                                // malformed, then to the higher base. The tie
+                                // rule is a heuristic and may choose an
+                                // up-shifted base when both roots moved.
                                 Some(b) => {
                                     cand.0 > b.0
                                         || (cand.0 == b.0 && cand.1 < b.1)
@@ -232,10 +235,8 @@ impl Store {
                             }
                         }
                     }
-                    // The gigalocker is unique, so the first hit that confirms any
-                    // base has pinned it. Re-open the winner through a writable
-                    // handle and arm repair per `writes_enabled` — repair runs
-                    // now, and only at this confirmed origin.
+                    // Re-open the diagnostic candidate. open_owner refuses
+                    // writes, including automatic repair, on raw APFS extents.
                     if let Some((_, _, base)) = best {
                         return Self::open_based_ext(OWNER_PATH, true, writes_enabled, base);
                     }
