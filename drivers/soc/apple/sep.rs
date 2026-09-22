@@ -38,6 +38,7 @@ use kernel::{
     bindings,
     device,
     dma,
+    dma::Device as _,
     driver,
     new_mutex,
     of,
@@ -2095,6 +2096,13 @@ impl platform::Driver for SepDriver {
             return Err(EINVAL);
         }
         let sep_node = dt::DtNode::of_device(dev).ok_or(ENODEV)?;
+
+        // J700's SEP DART window starts above 4 GiB. Leave the proven masks
+        // on older platforms unchanged for the M1/M2 regression run.
+        if profile::detect()?.wide_dma_mask {
+            // SAFETY: probe has not allocated DMA memory for this device yet.
+            unsafe { pdev.dma_set_mask_and_coherent(dma::DmaMask::new::<42>())? };
+        }
 
         if dt::registration_already_sent(&sep_node) {
             dev_err!(
