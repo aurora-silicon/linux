@@ -1291,8 +1291,10 @@ static int avd_av1_run(struct avd_ctx *ctx)
 			   run.frame->tile_info.tile_cols *
 					   run.frame->tile_info.tile_rows +
 				   1);
-	if (ret)
+	if (ret) {
+		avd_run_postamble(ctx, &run.base);
 		return ret;
+	}
 
 	dst = vb2_to_avd_decoded_buf(&run.base.bufs.dst->vb2_buf);
 	update_dec_buf_info(dst, run.seq, run.frame);

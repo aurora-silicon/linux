@@ -784,8 +784,10 @@ static int avd_vp9_run(struct avd_ctx *ctx)
 		(1 << run.decode_params->tile_rows_log2) *
 				(1 << run.decode_params->tile_cols_log2) +
 			1);
-	if (ret)
+	if (ret) {
+		avd_run_postamble(ctx, &run.base);
 		return ret;
+	}
 
 	init_probs(ctx, &run);
 
