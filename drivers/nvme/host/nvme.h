@@ -354,6 +354,9 @@ struct nvme_ctrl {
 	int numa_node;
 	struct blk_mq_tag_set *tagset;
 	struct blk_mq_tag_set *admin_tagset;
+#ifdef CONFIG_BLK_INLINE_ENCRYPTION
+	struct blk_crypto_profile *crypto_profile;
+#endif
 	struct list_head namespaces;
 	struct mutex namespaces_lock;
 	struct srcu_struct srcu;

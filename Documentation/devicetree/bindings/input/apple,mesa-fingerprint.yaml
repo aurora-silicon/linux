@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/input/apple,mesa-fingerprint.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple Mesa fingerprint sensor
+
+maintainers:
+  - Chromatischer <dominik@hildania.de>
+
+description: |
+  Fingerprint sensor on an SPI bus of an Apple SoC, normally owned by the
+  Secure Enclave Processor.  The chip-select setup and hold delays have to be
+  produced by the controller, so the device must use the native chip select of
+  its parent controller and not a GPIO one.
+
+  The SPI mode is not given a default here because the boards that carry this
+  sensor have not been observed to agree on one, so each board description has
+  to state the mode it needs.
+
+allOf:
+  - $ref: /schemas/spi/spi-peripheral-props.yaml#
+
+properties:
+  compatible:
+    const: apple,mesa-fingerprint
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+    description: Data-ready line from the sensor.
+
+  enable-gpios:
+    maxItems: 1
+    description: Power line to the sensor, asserted to power it up.
+
+  firmware-name:
+    maxItems: 1
+    description:
+      Calibration blob for this sensor.  It is per-device factory data written
+      at manufacture, so it is neither redistributable nor derivable from the
+      compatible; the board description has to name it.
+
+  spi-cpha: true
+
+  spi-cpol: true
+
+required:
+  - compatible
+  - reg
+  - enable-gpios
+  - firmware-name
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+
+    spi {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        fingerprint@0 {
+            compatible = "apple,mesa-fingerprint";
+            reg = <0>;
+            spi-max-frequency = <8000000>;
+            spi-cpha;
+            spi-cs-setup-delay-ns = <20>;
+            spi-cs-hold-delay-ns = <20>;
+            enable-gpios = <&pinctrl_ap 108 GPIO_ACTIVE_HIGH>;
+            firmware-name = "apple/mesacal-j313.bin";
+        };
+    };

@@ -65,8 +65,9 @@ properties:
     minItems: 2
     maxItems: 2
     description: >
-      Inclusive device-visible DMA aperture, encoded as a start address and
-      size. The IOMMU DMA allocator restricts mappings to this range.
+      Device-visible DMA aperture, encoded as a 64-bit start address and a
+      64-bit size. The IOMMU DMA allocator restricts mappings to this range;
+      the SEP, for example, only accepts IOVAs below 4 GiB.
 
   apple,dma-offset:
     $ref: /schemas/types.yaml#/definitions/uint64

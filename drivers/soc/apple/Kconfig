@@ -83,6 +83,7 @@ config RUST_APPLE_RTKIT
 	depends on PM
 	depends on RUST
 	select APPLE_RTKIT
+	select RUST_APPLE_MAILBOX
 
 config APPLE_AOP
 	tristate "Apple \"Always-on\" Processor"
@@ -96,18 +97,34 @@ config APPLE_AOP
 
 	  Say 'y' here if you have an Apple laptop.
 
-config APPLE_SEP
-	tristate "Apple Secure Element Processor"
-	depends on ARCH_APPLE || COMPILE_TEST
-	depends on PM
-	depends on RUST
-	select RUST_APPLE_RTKIT
-	select RUST_APPLE_MAILBOX
-	help
-	  A security co-processor persent on Apple SoCs, controlling transparent
-	  disk encryption, secure boot, HDCP, biometric auth and probably more.
+config APPLE_SEP_FV_INTERFACE
+	bool
 
-	  Say 'y' here if you have an Apple SoC.
+config APPLE_SEP
+	tristate "Apple SEP (Secure Enclave Processor)"
+	depends on ARCH_APPLE
+	depends on RUST
+	depends on HW_RANDOM
+	depends on TRUSTED_KEYS
+	depends on CRYPTO
+	select CRYPTO_HMAC
+	select CRYPTO_SHA256
+	select CRYPTO_AES
+	select CRYPTO_GCM
+	select CRYPTO_ECDH
+	select APPLE_SEP_FV_INTERFACE
+	help
+	  Driver for the Apple SEP (Secure Enclave Processor) on Apple silicon.
+	  It drives the Touch ID fingerprint sensor over a /dev/sep-bio character
+	  device (enrol and match), exposes the SEP hardware RNG, and registers a
+	  SEP-backed trusted key source so keyctl can seal keys to the enclave.
+
+	  The driver reads the existing machine-wide xART gigalocker directly from
+	  the iBoot system container, locating it by its root records. It validates
+	  the complete store and both root records before registering with SEP.
+	  Writes remain disabled unless the xart_writes module parameter is set.
+
+	  Say Y here if you have an Apple silicon Mac.
 
 config APPLE_PMP
 	tristate "Apple Power Management Processor"

@@ -83,6 +83,9 @@ struct trusted_key_source {
 
 extern struct key_type key_type_trusted;
 
+int register_trusted_key_source(struct trusted_key_source *src);
+void unregister_trusted_key_source(struct trusted_key_source *src);
+
 #define TRUSTED_DEBUG 0
 
 #if TRUSTED_DEBUG
