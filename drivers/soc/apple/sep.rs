@@ -32,6 +32,7 @@ mod store;
 mod transfer;
 mod trusted;
 mod xarm;
+mod xart_apfs;
 mod xart_store;
 
 use kernel::{
@@ -726,7 +727,7 @@ impl SepData {
                 let base = store.base();
                 dev_info!(
                     dev,
-                    "xART: in-kernel raw-extent owner (base {:#x}); {} slots, {} live records, max revision {}, {} malformed, {} duplicate, {} repaired; writes {}\n",
+                    "xART: APFS-resolved read-only .gl extent (base {:#x}); {} slots, {} live records, max revision {}, {} malformed, {} duplicate, {} repaired; writes {}\n",
                     base,
                     slots,
                     records,
@@ -2095,7 +2096,7 @@ impl platform::Driver for SepDriver {
         if *module_parameters::xart_writes.value() != 0 {
             dev_err!(
                 dev,
-                "raw APFS xART writes are blocked until the .gl extent and update protocol are validated\n"
+                "raw APFS xART writes are blocked until the .gl update protocol and ownership invariants are validated\n"
             );
             return Err(ENOTSUPP);
         }
@@ -2190,11 +2191,11 @@ module! {
     params: {
         xart_writes: u8 {
             default: 0,
-            description: "Request shared xART writes (refused by the raw APFS owner until its extent is verified)",
+            description: "Request shared xART writes (refused until the macOS update protocol is verified)",
         },
         xart_start_sector: u64 {
             default: 0,
-            description: "Explicit 512-byte start sector of the xART gigalocker extent within the iBoot system container. Zero (default) locates the gigalocker automatically in the container by its root records; a non-zero value overrides the search. Either way the driver opens the container directly",
+            description: "Expected 512-byte start sector of the APFS .gl extent in the iBoot container. Zero accepts the APFS result; nonzero must match it and cannot override it",
         },
         provision_keybag: u8 {
             default: 0,
