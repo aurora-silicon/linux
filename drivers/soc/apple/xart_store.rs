@@ -3,11 +3,10 @@
 
 //! Device-wide xART gigalocker record store.
 //!
-//! The APFS locator exposes the existing `.gl` file as a block device.  This
-//! module implements the record validation, duplicate repair, lookup and
-//! copy-on-write ordering the SEP requires. It never creates storage.
-//! The raw block owner is restricted to read-only until APFS metadata can
-//! establish the current physical extent of the `.gl` file.
+//! The APFS locator identifies the existing `.gl` file's physical extent.
+//! This module validates records and serves SEP reads from that extent. It
+//! never creates storage. Raw writes remain blocked until the record update
+//! protocol and APFS ownership rules are verified against macOS.
 
 use crate::shim;
 use kernel::prelude::*;
@@ -20,27 +19,10 @@ const BLOCK_SIZE: usize = 0x1000;
 const SLOT_SIZE: usize = 0x9000;
 const HEADER_SIZE: usize = 0x22;
 const DELETE_SIZE: usize = BLOCK_SIZE;
-/// Size of the APFS raw extent located on the target machine.
-///
-/// The logical store is always exactly this many bytes. The raw-extent owner
-/// opens a larger container and serves only the [`STORE_SIZE`] window at its
-/// located base, so a wrong base cannot read past the extent. A wrong window
-/// still fails closed:
-/// the two root records will not validate and `open_based` returns `ENODATA`
-/// rather than serving SEP an unrelated store. A machine with a different extent
-/// size must pass that size through an explicit, reviewed interface.
+/// The current `.gl` format occupies one contiguous six-MiB APFS file extent.
+/// Unsupported layouts fail closed in `xart_apfs::locate`.
 const STORE_SIZE: u64 = 0x600000;
 const MAX_SLOTS: usize = 4096;
-
-/// Sequential read window for the automatic gigalocker search (64 KiB — small
-/// enough for a reliable kernel allocation, large enough to keep the scan of
-/// the container to a modest number of reads).
-const SCAN_CHUNK: usize = 1 << 16;
-/// Upper bound on candidate bases confirmed during the automatic search, so a
-/// container full of coincidental root-shaped headers cannot spin the scan. The
-/// real store's roots sit within the first slots, so it is found long before
-/// this; exceeding it falls back rather than looping.
-const MAX_LOCATE_ATTEMPTS: u32 = 64;
 
 pub(crate) const MAX_VALUE: usize = 0x8000;
 
@@ -95,8 +77,7 @@ impl Slot {
 
 pub(crate) struct Store {
     file: shim::StoreFile,
-    /// Byte offset of the gigalocker window within the opened container: the
-    /// located extent's offset (an explicit start-sector override sets it).
+    /// Byte offset of the APFS-resolved gigalocker extent in the container.
     base: u64,
     slots: KVec<Slot>,
     revision: u64,
@@ -129,131 +110,23 @@ fn valid_key(key: &Key) -> bool {
 }
 
 impl Store {
-    /// Opens the store as the in-kernel raw-extent owner: it opens the iBoot
-    /// system container directly and serves only the gigalocker extent, with no
-    /// external helper and no hand-supplied sector.
-    ///
-    /// `start_sector == 0` (the default) searches for CRC-checked root records;
-    /// a non-zero sector skips the search. Neither method proves that the
-    /// window belongs to the current APFS `.gl` file, so writes are refused.
+    /// Opens the iBoot system container read-only, resolves `.gl` through APFS
+    /// metadata, then validates the record store at exactly that extent.
+    /// A nonzero start sector is an assertion against the APFS result, never
+    /// an override of it. Neither lookup nor record validation authorizes
+    /// raw writes: macOS's update protocol is still unverified.
     pub(crate) fn open_owner(writes_enabled: bool, start_sector: u64) -> Result<Store> {
-        // A CRC-valid record signature does not establish the APFS file's
-        // physical extent. Once both roots move away from slot zero, several
-        // shifted windows pass the two-root test, and a shifted window can
-        // extend into APFS-owned blocks. Never write through this raw owner
-        // until the mapping has been checked against APFS file metadata.
-        // An explicit sector is not proof of ownership either.
         if writes_enabled {
             return Err(ENOTSUPP);
         }
+        let file = shim::StoreFile::open_block(OWNER_PATH, false)?;
+        let base = crate::xart_apfs::locate(&file)?;
         if start_sector != 0 {
-            let base = start_sector.checked_mul(512).ok_or(EINVAL)?;
-            return Self::open_based(OWNER_PATH, false, base);
-        }
-        Self::open_located(writes_enabled)
-    }
-
-    /// Locates the gigalocker inside the iBoot system container with no external
-    /// help. The container is read sequentially and searched, at block-aligned
-    /// offsets, for a root record's signature — a `1` or `2` key kind with an
-    /// all-zero UUID, the shape of [`Key::root`]. Each base implied by such a hit
-    /// is probed read-only with the full CRC-checked [`open_based`]; because a
-    /// base shifted a few slots off the true origin still keeps both roots in its
-    /// window (passing the two-root test while dropping records that fall
-    /// outside), the candidate with the most live records is used for read-only
-    /// diagnostics. This heuristic cannot establish the APFS file's origin or
-    /// prove it is safe to write. Repair is never armed during discovery.
-    /// Bounded by [`MAX_LOCATE_ATTEMPTS`] probes; returns `ENODATA` if not found.
-    fn open_located(writes_enabled: bool) -> Result<Store> {
-        // The container is a writable block device; the block layer only grants
-        // a read-only handle to a read-only device, so scan it through a writable
-        // handle. This does not arm any write — discovery never mutates the
-        // container (see open_based_ext, called below with arm_writes == false).
-        let probe = shim::StoreFile::open_block(OWNER_PATH, true)?;
-        let size = probe.size()?;
-        if size < STORE_SIZE {
-            return Err(ENODATA);
-        }
-
-        let mut buf: KVec<u8> = KVec::new();
-        buf.resize(SCAN_CHUNK, 0, GFP_KERNEL)?;
-        let mut attempts: u32 = 0;
-        let mut off: u64 = 0;
-
-        while off + HEADER_SIZE as u64 <= size {
-            let want = core::cmp::min(SCAN_CHUNK as u64, size - off) as usize;
-            probe.read_exact(off, &mut buf[..want])?;
-
-            let mut p = 0usize;
-            while p + HEADER_SIZE <= want {
-                let kind = buf[p + KEY_KIND];
-                let uuid_zero = buf[p + KEY_UUID..p + KEY_UUID + 16].iter().all(|&b| b == 0);
-                if (kind == 1 || kind == 2) && uuid_zero {
-                    // A root signature anchors the gigalocker: the true base is
-                    // this hit minus a whole number of slots (slots and blocks are
-                    // both 0x1000-aligned, so every candidate stays block-aligned).
-                    // The two-root test alone does NOT pin the base — a base
-                    // shifted off the true origin by a few slots still keeps both
-                    // roots inside its 6 MiB window, so it passes yet silently
-                    // drops the live records that fall outside the shifted window.
-                    // Probe candidates without writes and prefer the largest
-                    // recovered record set for diagnostics. An equally valid
-                    // shifted window is possible; this is not an APFS lookup.
-                    let hit = off + p as u64;
-                    let mut best: Option<(usize, usize, u64)> = None; // (valid, malformed, base)
-                    let mut k: u64 = 0;
-                    while k as usize <= MAX_SLOTS {
-                        let step = k * SLOT_SIZE as u64;
-                        if step > hit {
-                            break;
-                        }
-                        let base = hit - step;
-                        k += 1;
-                        if base + STORE_SIZE > size {
-                            continue;
-                        }
-                        attempts += 1;
-                        if attempts > MAX_LOCATE_ATTEMPTS {
-                            break;
-                        }
-                        if let Ok(store) = Self::open_based_ext(OWNER_PATH, true, false, base) {
-                            let cand = (store.valid_records, store.malformed_records, base);
-                            let better = match best {
-                                None => true,
-                                // More live records wins; ties break to fewer
-                                // malformed, then to the higher base. The tie
-                                // rule is a heuristic and may choose an
-                                // up-shifted base when both roots moved.
-                                Some(b) => {
-                                    cand.0 > b.0
-                                        || (cand.0 == b.0 && cand.1 < b.1)
-                                        || (cand.0 == b.0 && cand.1 == b.1 && cand.2 > b.2)
-                                }
-                            };
-                            if better {
-                                best = Some(cand);
-                            }
-                        }
-                    }
-                    // Re-open the diagnostic candidate. open_owner refuses
-                    // writes, including automatic repair, on raw APFS extents.
-                    if let Some((_, _, base)) = best {
-                        return Self::open_based_ext(OWNER_PATH, true, writes_enabled, base);
-                    }
-                    if attempts > MAX_LOCATE_ATTEMPTS {
-                        return Err(ENODATA);
-                    }
-                }
-                p += BLOCK_SIZE;
+            if start_sector.checked_mul(512).ok_or(EINVAL)? != base {
+                return Err(EINVAL);
             }
-
-            if want < SCAN_CHUNK {
-                break;
-            }
-            // Overlap one block so a signature on the boundary is not missed.
-            off += (SCAN_CHUNK - BLOCK_SIZE) as u64;
         }
-        Err(ENODATA)
+        Self::open_file(file, false, base)
     }
 
     /// Opens a caller-selected block mapping at offset zero.
@@ -272,27 +145,15 @@ impl Store {
     /// device (the raw container) serves only its gigalocker extent.
     ///
     /// The block handle's writability equals `writes_enabled`, and repair runs
-    /// when writes are enabled. For the raw-extent owner, discovery instead
-    /// needs a writable handle (the block layer only grants a read-only handle
-    /// to a read-only device, and the container is writable) *without* arming
-    /// repair at an unconfirmed base — see [`open_based_ext`].
+    /// when writes are enabled. The APFS owner is always read-only.
     fn open_based(path: &CStr, writes_enabled: bool, base: u64) -> Result<Store> {
-        Self::open_based_ext(path, writes_enabled, writes_enabled, base)
+        let file = shim::StoreFile::open_block(path, writes_enabled)?;
+        Self::open_file(file, writes_enabled, base)
     }
 
-    /// As [`open_based`], but with the block-handle writability (`dev_writable`)
-    /// decoupled from whether repair writes are armed (`arm_writes`). Discovery
-    /// of the raw-extent owner opens the writable container with
-    /// `dev_writable == true` yet `arm_writes == false`, so a candidate base is
-    /// fully scanned and CRC-validated without a single write landing at an
-    /// origin that has not yet been confirmed as the true gigalocker.
-    fn open_based_ext(
-        path: &CStr,
-        dev_writable: bool,
-        arm_writes: bool,
-        base: u64,
-    ) -> Result<Store> {
-        let file = shim::StoreFile::open_block(path, dev_writable)?;
+    /// Complete record validation using the same read-only handle with which
+    /// APFS ownership was resolved, avoiding a close/reopen window.
+    fn open_file(file: shim::StoreFile, arm_writes: bool, base: u64) -> Result<Store> {
         let size = file.size()?;
         if base % BLOCK_SIZE as u64 != 0 || STORE_SIZE % BLOCK_SIZE as u64 != 0 {
             return Err(EINVAL);
@@ -540,8 +401,7 @@ impl Store {
         Ok(true)
     }
 
-    /// Byte offset of the served gigalocker window within the opened container:
-    /// the located extent's offset (an explicit start-sector override sets it).
+    /// Byte offset of the APFS-resolved gigalocker extent in the container.
     pub(crate) fn base(&self) -> u64 {
         self.base
     }

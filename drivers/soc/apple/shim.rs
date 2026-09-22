@@ -75,8 +75,8 @@ impl StoreFile {
     }
 
     pub(crate) fn open_block(path: &CStr, writable: bool) -> Result<StoreFile> {
-        // SAFETY: `path` is NUL-terminated; the shim accepts only a block
-        // device whose global read-only state matches `writable`.
+        // SAFETY: `path` is NUL-terminated; the shim opens read-only unless
+        // explicitly asked to write, and rejects writes to a read-only device.
         let handle = unsafe { sep_store_open_block(path.as_char_ptr(), c_int::from(writable)) };
         if handle.is_null() {
             return Err(ENODEV);

@@ -82,7 +82,7 @@ void *sep_store_open_block(const char *path, int writable)
 	if (IS_ERR(f))
 		return NULL;
 	if (!S_ISBLK(file_inode(f)->i_mode) ||
-	    bdev_read_only(file_bdev(f)) == !!writable) {
+	    (writable && bdev_read_only(file_bdev(f)))) {
 		filp_close(f, NULL);
 		return NULL;
 	}
