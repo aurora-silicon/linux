@@ -890,22 +890,31 @@ static int avd_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct avd_ctx *ctx = vb2_get_drv_priv(q);
 	const struct avd_coded_fmt_desc *desc;
+	struct vb2_v4l2_buffer *vbuf;
 	int ret;
 
 	if (V4L2_TYPE_IS_CAPTURE(q->type))
 		return 0;
 
 	desc = ctx->coded_fmt_desc;
-	if (WARN_ON(!desc))
-		return -EINVAL;
+	if (WARN_ON(!desc)) {
+		ret = -EINVAL;
+		goto err_return_buffers;
+	}
 
 	if (desc->ops->start) {
 		ret = desc->ops->start(ctx);
 		if (ret)
-			return ret;
+			goto err_return_buffers;
 	}
 
 	return 0;
+
+err_return_buffers:
+	/* Keep requests queued for a later STREAMON retry. */
+	while ((vbuf = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx)))
+		v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_QUEUED);
+	return ret;
 }
 
 static void avd_queue_cleanup(struct vb2_queue *vq, u32 state)
