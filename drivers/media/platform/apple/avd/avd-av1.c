@@ -1296,11 +1296,16 @@ static int avd_av1_run(struct avd_ctx *ctx)
 		return ret;
 	}
 
+	ret = avd_av1_alloc_work_bufs(ctx, &run);
+	if (ret) {
+		avd_run_postamble(ctx, &run.base);
+		return ret;
+	}
+
 	dst = vb2_to_avd_decoded_buf(&run.base.bufs.dst->vb2_buf);
 	update_dec_buf_info(dst, run.seq, run.frame);
 
 	avd_av1_set_prob(ctx, &run);
-	avd_av1_alloc_work_bufs(ctx, &run);
 
 	set_header(ctx, &run);
 	set_tiles(ctx, &run);
