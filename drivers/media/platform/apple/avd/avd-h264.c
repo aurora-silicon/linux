@@ -592,6 +592,30 @@ static int avd_h264_validate_sps(struct avd_ctx *ctx,
 	return 0;
 }
 
+static void avd_h264_stop(struct avd_ctx *ctx)
+{
+	struct avd_h264_ctx *h264_ctx = ctx->priv;
+	struct avd_dev *dev = ctx->dev;
+	int i;
+
+	if (!h264_ctx)
+		return;
+
+	avd_buf_free(dev, &h264_ctx->bufs.pipe_state);
+	avd_buf_free(dev, &h264_ctx->bufs.inst);
+	avd_buf_free(dev, &h264_ctx->bufs.above_info);
+	avd_buf_free(dev, &h264_ctx->bufs.lf_above_info);
+	avd_buf_free(dev, &h264_ctx->bufs.lf_above);
+	avd_buf_free(dev, &h264_ctx->bufs.ip_above);
+	avd_buf_free(dev, &h264_ctx->bufs.mv_above_info);
+
+	for (i = 0; i < h264_ctx->slice_num; i++)
+		avd_buf_free(dev, &h264_ctx->slices[i]);
+
+	kfree(h264_ctx);
+	ctx->priv = NULL;
+}
+
 static int avd_h264_start(struct avd_ctx *ctx)
 {
 	struct avd_h264_ctx *h264_ctx;
@@ -619,32 +643,8 @@ static int avd_h264_start(struct avd_ctx *ctx)
 	return 0;
 
 err_free_ctx:
-	kfree(h264_ctx);
-	ctx->priv = NULL;
+	avd_h264_stop(ctx);
 	return ret;
-}
-
-static void avd_h264_stop(struct avd_ctx *ctx)
-{
-	struct avd_h264_ctx *h264_ctx = ctx->priv;
-	struct avd_dev *dev = ctx->dev;
-	int i;
-
-	if (!h264_ctx)
-		return;
-
-	avd_buf_free(dev, &h264_ctx->bufs.pipe_state);
-	avd_buf_free(dev, &h264_ctx->bufs.inst);
-	avd_buf_free(dev, &h264_ctx->bufs.above_info);
-	avd_buf_free(dev, &h264_ctx->bufs.lf_above_info);
-	avd_buf_free(dev, &h264_ctx->bufs.lf_above);
-	avd_buf_free(dev, &h264_ctx->bufs.ip_above);
-	avd_buf_free(dev, &h264_ctx->bufs.mv_above_info);
-
-	for (i = 0; i < h264_ctx->slice_num; i++)
-		avd_buf_free(dev, &h264_ctx->slices[i]);
-
-	kfree(h264_ctx);
 }
 
 static void avd_h264_run_preamble(struct avd_ctx *ctx, struct avd_h264_run *run)

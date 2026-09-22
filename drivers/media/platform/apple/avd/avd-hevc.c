@@ -1047,6 +1047,29 @@ static int avd_hevc_alloc_bufs(struct avd_ctx *ctx)
 	return 0;
 }
 
+static void avd_hevc_stop(struct avd_ctx *ctx)
+{
+	struct avd_hevc_ctx *hevc_ctx = ctx->priv;
+	struct avd_dev *avd = ctx->dev;
+
+	if (!hevc_ctx)
+		return;
+
+	avd_buf_free(avd, &hevc_ctx->bufs.pipe_state);
+	avd_buf_free(avd, &hevc_ctx->bufs.inst);
+	avd_buf_free(avd, &hevc_ctx->bufs.mv_above_info);
+	avd_buf_free(avd, &hevc_ctx->bufs.az_above);
+	avd_buf_free(avd, &hevc_ctx->bufs.ip_above);
+	avd_buf_free(avd, &hevc_ctx->bufs.lf_above);
+	avd_buf_free(avd, &hevc_ctx->bufs.lf_above_info);
+	avd_buf_free(avd, &hevc_ctx->bufs.lf_left);
+	avd_buf_free(avd, &hevc_ctx->bufs.lf_left_info);
+	avd_buf_free(avd, &hevc_ctx->bufs.sw_left);
+
+	kfree(hevc_ctx);
+	ctx->priv = NULL;
+}
+
 static int avd_hevc_start(struct avd_ctx *ctx)
 {
 	struct avd_hevc_ctx *hevc_ctx;
@@ -1064,8 +1087,7 @@ static int avd_hevc_start(struct avd_ctx *ctx)
 	return 0;
 
 err_free_ctx:
-	kfree(hevc_ctx);
-	ctx->priv = NULL;
+	avd_hevc_stop(ctx);
 	return ret;
 }
 
@@ -1232,28 +1254,6 @@ static int avd_hevc_compute_tiles(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	}
 
 	return 0;
-}
-
-static void avd_hevc_stop(struct avd_ctx *ctx)
-{
-	struct avd_hevc_ctx *hevc_ctx = ctx->priv;
-	struct avd_dev *avd = ctx->dev;
-
-	if (!hevc_ctx)
-		return;
-
-	avd_buf_free(avd, &hevc_ctx->bufs.pipe_state);
-	avd_buf_free(avd, &hevc_ctx->bufs.inst);
-	avd_buf_free(avd, &hevc_ctx->bufs.mv_above_info);
-	avd_buf_free(avd, &hevc_ctx->bufs.az_above);
-	avd_buf_free(avd, &hevc_ctx->bufs.ip_above);
-	avd_buf_free(avd, &hevc_ctx->bufs.lf_above);
-	avd_buf_free(avd, &hevc_ctx->bufs.lf_above_info);
-	avd_buf_free(avd, &hevc_ctx->bufs.lf_left);
-	avd_buf_free(avd, &hevc_ctx->bufs.lf_left_info);
-	avd_buf_free(avd, &hevc_ctx->bufs.sw_left);
-
-	kfree(hevc_ctx);
 }
 
 static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)

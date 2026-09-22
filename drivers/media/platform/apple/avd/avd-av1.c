@@ -1333,28 +1333,6 @@ static int avd_av1_alloc_bufs(struct avd_ctx *ctx)
 	return 0;
 }
 
-static int avd_av1_start(struct avd_ctx *ctx)
-{
-	struct avd_av1_ctx *av1_ctx;
-	int ret;
-
-	av1_ctx = kzalloc(sizeof(*av1_ctx), GFP_KERNEL);
-	if (!av1_ctx)
-		return -ENOMEM;
-
-	ctx->priv = av1_ctx;
-	ret = avd_av1_alloc_bufs(ctx);
-	if (ret)
-		goto err_free_ctx;
-
-	return 0;
-
-err_free_ctx:
-	kfree(av1_ctx);
-	ctx->priv = NULL;
-	return ret;
-}
-
 static void avd_av1_stop(struct avd_ctx *ctx)
 {
 	struct avd_av1_ctx *av1_ctx = ctx->priv;
@@ -1379,6 +1357,28 @@ static void avd_av1_stop(struct avd_ctx *ctx)
 	avd_buf_free(avd, &av1_ctx->bufs.probs);
 
 	kfree(av1_ctx);
+	ctx->priv = NULL;
+}
+
+static int avd_av1_start(struct avd_ctx *ctx)
+{
+	struct avd_av1_ctx *av1_ctx;
+	int ret;
+
+	av1_ctx = kzalloc(sizeof(*av1_ctx), GFP_KERNEL);
+	if (!av1_ctx)
+		return -ENOMEM;
+
+	ctx->priv = av1_ctx;
+	ret = avd_av1_alloc_bufs(ctx);
+	if (ret)
+		goto err_free_ctx;
+
+	return 0;
+
+err_free_ctx:
+	avd_av1_stop(ctx);
+	return ret;
 }
 
 static enum avd_image_fmt avd_av1_get_image_fmt(struct avd_ctx *ctx,

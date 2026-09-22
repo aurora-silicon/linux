@@ -981,30 +981,6 @@ avd_init_v4l2_vp9_count_tbl(struct avd_ctx *ctx)
 				}
 }
 
-static int avd_vp9_start(struct avd_ctx *ctx)
-{
-	struct avd_vp9_ctx *vp9_ctx;
-	int ret;
-
-	vp9_ctx = kzalloc(sizeof(*vp9_ctx), GFP_KERNEL);
-	if (!vp9_ctx)
-		return -ENOMEM;
-
-	ctx->priv = vp9_ctx;
-	ret = avd_vp9_alloc_bufs(ctx);
-	if (ret)
-		goto err_free_ctx;
-
-	avd_init_v4l2_vp9_count_tbl(ctx);
-
-	return 0;
-
-err_free_ctx:
-	kfree(vp9_ctx);
-	ctx->priv = NULL;
-	return ret;
-}
-
 static void avd_vp9_stop(struct avd_ctx *ctx)
 {
 	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
@@ -1024,6 +1000,30 @@ static void avd_vp9_stop(struct avd_ctx *ctx)
 	avd_buf_free(avd, &vp9_ctx->bufs.lf_left);
 
 	kfree(vp9_ctx);
+	ctx->priv = NULL;
+}
+
+static int avd_vp9_start(struct avd_ctx *ctx)
+{
+	struct avd_vp9_ctx *vp9_ctx;
+	int ret;
+
+	vp9_ctx = kzalloc(sizeof(*vp9_ctx), GFP_KERNEL);
+	if (!vp9_ctx)
+		return -ENOMEM;
+
+	ctx->priv = vp9_ctx;
+	ret = avd_vp9_alloc_bufs(ctx);
+	if (ret)
+		goto err_free_ctx;
+
+	avd_init_v4l2_vp9_count_tbl(ctx);
+
+	return 0;
+
+err_free_ctx:
+	avd_vp9_stop(ctx);
+	return ret;
 }
 
 static enum avd_image_fmt avd_vp9_get_image_fmt(struct avd_ctx *ctx,
