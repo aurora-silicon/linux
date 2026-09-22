@@ -1205,6 +1205,11 @@ impl SepData {
 
             if let sensor::Offset12::Identifier(id) = st.offset12() {
                 if id != 0 && !sensor::KNOWN_IDENTIFIERS.contains(&id) {
+                    dev_err!(
+                        self.dev,
+                        "sensor: unknown Mesa identifier {:#06x} at status offset 12; not registering it with the enclave\n",
+                        id
+                    );
                     return None;
                 }
             }

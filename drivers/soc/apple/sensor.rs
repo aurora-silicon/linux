@@ -79,6 +79,8 @@ pub(crate) enum PowerSource {
     None,
     NodeProperty,
     ChipLine,
+    /// Rails switched by the SMC on J700.
+    SmcRails,
 }
 
 impl PowerSource {
@@ -86,6 +88,7 @@ impl PowerSource {
         match v {
             1 => PowerSource::NodeProperty,
             2 => PowerSource::ChipLine,
+            3 => PowerSource::SmcRails,
             _ => PowerSource::None,
         }
     }
@@ -95,6 +98,7 @@ impl PowerSource {
             PowerSource::None => c"none — no power line was taken",
             PowerSource::NodeProperty => c"the sensor node's own gpios property",
             PowerSource::ChipLine => c"/soc/pinctrl@39b028000 line 122, taken by device-tree node",
+            PowerSource::SmcRails => c"the sensor node's SMC-switched rails (apple,smc-power-key)",
         }
     }
 }
@@ -102,8 +106,8 @@ impl PowerSource {
 pub(crate) const POWER_ON_READ_DELAYS_MS: [u32; 4] = [0, 3, 10, 50];
 
 pub(crate) const STATUS_IDENTIFIER: usize = 12;
-// Known Mesa sensor revisions: 0x3352 through M4, 0x335e on newer parts.
-pub(crate) const KNOWN_IDENTIFIERS: [u16; 2] = [0x3352, 0x335e];
+// Known Mesa sensor revisions, including the J700's 0x3356.
+pub(crate) const KNOWN_IDENTIFIERS: [u16; 3] = [0x3352, 0x3356, 0x335e];
 static_assert!(STATUS_IDENTIFIER + 2 <= STATUS_LEN);
 
 const CMD_LEN: usize = 7;

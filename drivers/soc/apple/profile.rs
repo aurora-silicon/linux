@@ -8,12 +8,14 @@
 //! here once. The driver reads addresses from the device tree, never scans for
 //! them, and never patches properties at runtime.
 //!
-//! Two bring-up targets are modelled:
+//! Three bring-up targets are modelled:
 //!
 //! * `T8103` / J313 (MacBook Air, M1): the host boots the SEP with the boot
 //!   endpoint handshake over a 0x30000 shared-memory window.
 //! * `T6020` / J414s (MacBook Pro 14", M2 Pro): the driver does the warm
 //!   single-message registration over a 0x40000 window.
+//! * `T8140` / J700 (MacBook Neo, A18 Pro): iBoot boots sepOS before the AP
+//!   OS, so the driver uses the warm registration path.
 
 // The boot handshake, identity source, sensor and DART fields are consumed by
 // the boot-endpoint, identity and sensor-transport paths.
@@ -115,6 +117,8 @@ pub(crate) struct PlatformProfile {
     /// Require a static `apple,dma-range` on the SEP DART. The T6020 SEP only
     /// accepts IOVAs below 4 GiB; T8103 works with the stock DART aperture.
     pub(crate) dart_range_required: bool,
+    /// Whether the SEP DART IOVA window needs a DMA mask wider than 32 bits.
+    pub(crate) wide_dma_mask: bool,
     /// Reserved-memory region holding the SEP firmware image (cold-boot path).
     pub(crate) firmware_region: &'static CStr,
     /// Identity keybag CREATE_KEYBAG field encoding (per-SoC; see [`KeybagCreate`]).
@@ -138,6 +142,7 @@ const T8103: PlatformProfile = PlatformProfile {
         capture_qualified: false,
     },
     dart_range_required: false,
+    wide_dma_mask: false,
     firmware_region: c"sepfw",
     // Strict enclave: the type goes in the third word; the first word is 0.
     keybag_create: KeybagCreate {
@@ -164,6 +169,7 @@ const T6020: PlatformProfile = PlatformProfile {
         capture_qualified: false,
     },
     dart_range_required: true,
+    wide_dma_mask: false,
     firmware_region: c"sepfw",
     // Proven encoding: the lenient enclave takes the variant in the first word.
     keybag_create: KeybagCreate {
@@ -173,10 +179,43 @@ const T6020: PlatformProfile = PlatformProfile {
     },
 };
 
+/// MacBook Neo. The J700 ADT records a pre-booted SEP, a spi2 Mesa sensor
+/// (0x3356), and a SEP DART aperture above 4 GiB. These values describe that
+/// board; device-tree nodes remain authoritative for addresses and resources.
+const T8140: PlatformProfile = PlatformProfile {
+    name: "T8140/J700",
+    shmem_capacity: 0x4_0000,
+    shmem_first_item: b"CINP",
+    bootstrap: Bootstrap::WarmRegister,
+    identity: IdentitySource::Chosen,
+    sensor: SensorProfile {
+        controller_base: 0x3_8510_8000,
+        chip_select: 0,
+        max_hz: 8_000_000,
+        cs_setup_ns: 20,
+        cs_hold_ns: 20,
+        mode: SpiMode::Mode2,
+        expected_id: 0x3356,
+        capture_qualified: false,
+    },
+    dart_range_required: true,
+    wide_dma_mask: true,
+    firmware_region: c"sepfw",
+    // J700 hardware refused the strict encoding and accepted this T6020 form
+    // (linux-aurora commit 18165cf1de, 2026-09-19).
+    keybag_create: KeybagCreate {
+        variant: 5,
+        bag_type: 0,
+        arg: -1,
+    },
+};
+
 static_assert!(T8103.shmem_capacity == 0x30000);
 static_assert!(T6020.shmem_capacity == 0x40000);
+static_assert!(T8140.shmem_capacity == 0x40000);
 static_assert!(T8103.sensor.controller_base == 0x235108000);
 static_assert!(T6020.sensor.controller_base == 0x39b108000);
+static_assert!(T8140.sensor.controller_base == 0x385108000);
 static_assert!(T8103.sensor.expected_id == T6020.sensor.expected_id);
 
 /// Whether the machine root declares `compatible`.
@@ -215,6 +254,9 @@ pub(crate) fn detect() -> Result<&'static PlatformProfile> {
     }
     if machine_has(b"apple,t6020") {
         return Ok(&T6020);
+    }
+    if machine_has(b"apple,t8140") {
+        return Ok(&T8140);
     }
     Err(ENODEV)
 }
