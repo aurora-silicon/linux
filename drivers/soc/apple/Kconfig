@@ -123,7 +123,8 @@ config APPLE_SEP
 	  The driver reads the existing machine-wide xART gigalocker directly from
 	  the iBoot system container, locating it by its root records. It validates
 	  the complete store and both root records before registering with SEP.
-	  Writes remain disabled unless the xart_writes module parameter is set.
+	  Raw APFS xART writes are refused until the extent and update protocol
+	  can be verified; the module parameter cannot override this safety gate.
 
 	  Say Y here if you have an Apple silicon Mac.
 
