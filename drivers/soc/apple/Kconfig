@@ -107,6 +107,7 @@ config APPLE_SEP
 	depends on HW_RANDOM
 	depends on TRUSTED_KEYS
 	depends on CRYPTO
+	depends on MFD_MACSMC || !MFD_MACSMC
 	select CRYPTO_HMAC
 	select CRYPTO_SHA256
 	select CRYPTO_AES
