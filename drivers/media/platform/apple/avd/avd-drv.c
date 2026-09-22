@@ -73,10 +73,8 @@ void fill_comp(struct avd_comp *comp, enum avd_image_fmt image_fmt, u32 width,
 
 int avd_buf_alloc(struct avd_dev *avd, struct avd_buf *buf, size_t size)
 {
-	if (!buf->cpu && size < buf->size)
-		return 0;
-	else if (buf->cpu)
-		avd_buf_free(avd, buf);
+	/* Keep size equal to the payload length used by the H.264 slice path. */
+	avd_buf_free(avd, buf);
 
 	if (size <= 0)
 		return -ENOMEM;
@@ -84,7 +82,11 @@ int avd_buf_alloc(struct avd_dev *avd, struct avd_buf *buf, size_t size)
 	buf->size = size;
 	buf->cpu =
 		dma_alloc_coherent(avd->dev, buf->size, &buf->addr, GFP_KERNEL);
-	return buf->cpu ? 0 : -ENOMEM;
+	if (!buf->cpu) {
+		memset(buf, 0, sizeof(*buf));
+		return -ENOMEM;
+	}
+	return 0;
 }
 
 void avd_buf_free(struct avd_dev *avd, struct avd_buf *buf)
