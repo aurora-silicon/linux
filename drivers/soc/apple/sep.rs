@@ -86,7 +86,10 @@ const VERIFY_WORK_ID: u64 = 3;
 static_assert!(VERIFY_WORK_ID != ENROL_WORK_ID && VERIFY_WORK_ID != SETTLE_WORK_ID);
 static_assert!(VERIFY_WORK_ID != 0);
 
-const EXCHANGE_TIMEOUT_MS: time::Msecs = 15000;
+// J700 traces show the key-store endpoint arriving around 43 s after boot,
+// well after the first infrastructure endpoints. The wait exits promptly on
+// other machines when their key store becomes ready.
+const EXCHANGE_TIMEOUT_MS: time::Msecs = 90000;
 
 const PHASE_ATTACH: u32 = 0;
 const PHASE_EXCHANGE: u32 = 1;
