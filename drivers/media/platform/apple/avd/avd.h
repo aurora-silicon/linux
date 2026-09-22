@@ -115,6 +115,9 @@ struct avd_decoded_buffer {
 	struct v4l2_m2m_buffer base;
 
 	struct avd_comp comp;
+	/* Pending CPU fill, retained with the buffer until dequeue. */
+	size_t grey_chroma_offset;
+	bool grey_chroma_10bit;
 
 	union {
 		struct avd_vp9_decoded_buffer_info vp9;

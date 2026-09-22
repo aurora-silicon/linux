@@ -812,18 +812,14 @@ static void avd_h264_done(struct avd_ctx *ctx, struct vb2_v4l2_buffer *src_buf,
 		/* 4:0:0 has no chroma to decode; the picture is grey */
 		if (h264_ctx->monochrome && dst_buf && result == VB2_BUF_STATE_DONE) {
 			const struct v4l2_pix_format_mplane *pix = &ctx->decoded_fmt.fmt.pix_mp;
-			u8 *y = vb2_plane_vaddr(&dst_buf->vb2_buf, 0);
-			size_t luma = (size_t)pix->plane_fmt[0].bytesperline * pix->height;
+			struct avd_decoded_buffer *dst =
+				vb2_to_avd_decoded_buf(&dst_buf->vb2_buf);
 
-			if (y && ctx->image_fmt == AVD_IMG_FMT_420_10BIT) {
-				/* P010: 16-bit little-endian samples, 512 << 6 */
-				for (size_t i = 0; i + 1 < luma / 2; i += 2) {
-					y[luma + i] = 0x00;
-					y[luma + i + 1] = 0x80;
-				}
-			} else if (y) {
-				memset(y + luma, 0x80, luma / 2);
-			}
+			/* vb2 must return cache ownership before the CPU writes. */
+			dst->grey_chroma_offset =
+				(size_t)pix->plane_fmt[0].bytesperline * pix->height;
+			dst->grey_chroma_10bit =
+				ctx->image_fmt == AVD_IMG_FMT_420_10BIT;
 		}
 	}
 }

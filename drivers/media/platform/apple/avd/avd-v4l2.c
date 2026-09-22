@@ -823,11 +823,44 @@ static int avd_buf_prepare(struct vb2_buffer *vb)
 	 * (for OUTPUT buffers, if userspace passes 0 bytesused, v4l2-core sets
 	 * it to buffer length).
 	 */
-	if (V4L2_TYPE_IS_CAPTURE(vq->type))
+	if (V4L2_TYPE_IS_CAPTURE(vq->type)) {
+		vb2_to_avd_decoded_buf(vb)->grey_chroma_offset = 0;
 		vb2_set_plane_payload(vb, 0,
 				      f->fmt.pix_mp.plane_fmt[0].sizeimage);
+	}
 
 	return 0;
+}
+
+static void avd_buf_finish(struct vb2_buffer *vb)
+{
+	struct avd_decoded_buffer *buf;
+	size_t luma;
+	u8 *y;
+
+	if (!V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type))
+		return;
+
+	buf = vb2_to_avd_decoded_buf(vb);
+	luma = buf->grey_chroma_offset;
+	buf->grey_chroma_offset = 0;
+	if (!luma || vb->state != VB2_BUF_STATE_DONE)
+		return;
+
+	/* VB2 has synchronized the capture buffer for CPU access. */
+	y = vb2_plane_vaddr(vb, 0);
+	if (!y)
+		return;
+
+	if (buf->grey_chroma_10bit) {
+		/* P010: 16-bit little-endian samples, 512 << 6. */
+		for (size_t i = 0; i + 1 < luma / 2; i += 2) {
+			y[luma + i] = 0x00;
+			y[luma + i + 1] = 0x80;
+		}
+	} else {
+		memset(y + luma, 0x80, luma / 2);
+	}
 }
 
 static void avd_buf_queue(struct vb2_buffer *vb)
@@ -920,6 +953,7 @@ static void avd_stop_streaming(struct vb2_queue *q)
 const struct vb2_ops avd_queue_ops = {
 	.queue_setup = avd_queue_setup,
 	.buf_prepare = avd_buf_prepare,
+	.buf_finish = avd_buf_finish,
 	.buf_queue = avd_buf_queue,
 	.buf_out_validate = avd_buf_out_validate,
 	.buf_request_complete = avd_buf_request_complete,
