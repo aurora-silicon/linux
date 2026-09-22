@@ -37,6 +37,19 @@ properties:
     maxItems: 1
     description: Power line to the sensor, asserted to power it up.
 
+  apple,smc-power-key:
+    $ref: /schemas/types.yaml#/definitions/string
+    description:
+      Four-character SMC key used by boards with SMC-switched sensor rails.
+      The rail operation is an eight-byte little-endian pair of an on/off
+      value and a rail selector word.
+
+  apple,smc-power-rails:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 4
+    description: Rail selector words, in power-on order.
+
   firmware-name:
     maxItems: 1
     description:
@@ -51,8 +64,14 @@ properties:
 required:
   - compatible
   - reg
-  - enable-gpios
   - firmware-name
+
+oneOf:
+  - required:
+      - enable-gpios
+  - required:
+      - apple,smc-power-key
+      - apple,smc-power-rails
 
 unevaluatedProperties: false
 

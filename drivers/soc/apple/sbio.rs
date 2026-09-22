@@ -249,12 +249,14 @@ impl SepData {
 
         let bound = sensor::is_bound();
         self.sensor_present.store(bound, Relaxed);
-        if bound && sensor::power_line().is_none() {
+        if bound && sensor::power_source() == sensor::PowerSource::None {
             dev_warn!(
                 self.dev,
                 "sensor: no power line ({}); an unpowered sensor answers sixteen zero bytes like a dead bus\n",
                 sensor::power_source().name()
             );
+        } else if bound {
+            dev_info!(self.dev, "sensor: power via {}\n", sensor::power_source().name());
         }
     }
 
