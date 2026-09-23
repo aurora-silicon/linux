@@ -24,6 +24,7 @@
 #include <linux/iopoll.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
+#include <linux/soc/apple/dart.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_iommu.h>
@@ -233,6 +234,7 @@ struct apple_dart {
 	u32 locked : 1;
 	u32 tunneled : 1;
 	u32 power_retained : 1;
+	u32 commands_gated : 1;
 	struct apple_tunable *tunables;
 
 	dma_addr_t dma_min;
@@ -1714,11 +1716,42 @@ err_clk_disable:
 	return ret;
 }
 
+void apple_dart_quiesce_commands(struct device *dev)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+
+	if (dart)
+		dart->commands_gated = true;
+}
+EXPORT_SYMBOL_GPL(apple_dart_quiesce_commands);
+
+void apple_dart_resume_commands(struct device *dev)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+	int ret;
+
+	if (!dart || !dart->commands_gated)
+		return;
+
+	dart->commands_gated = false;
+	ret = pm_runtime_get_sync(dev);
+	if (ret < 0)
+		pm_runtime_put_noidle(dev);
+	else
+		pm_runtime_put(dev);
+}
+EXPORT_SYMBOL_GPL(apple_dart_resume_commands);
+
 static void apple_dart_remove(struct platform_device *pdev)
 {
 	struct apple_dart *dart = platform_get_drvdata(pdev);
 
-	if (!dart->locked)
+	/*
+	 * Cable removal gates the port clock before this device is removed.
+	 * A command issued then never completes. The next probe resets the
+	 * block after that clock is running again.
+	 */
+	if (!dart->locked && !dart->commands_gated)
 		apple_dart_hw_reset(dart);
 
 	free_irq(dart->irq, dart);
@@ -1869,7 +1902,7 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	 * state. Resetting one here is both unnecessary and earlier than Apple's
 	 * force-active call at the end of PCIe-C port resume.
 	 */
-	if (dart->power_retained)
+	if (dart->power_retained || dart->commands_gated)
 		return 0;
 
 	/* Locked DARTs can't be restored, and they should not need it */

@@ -33,6 +33,7 @@
 #include <linux/of_platform.h>
 #include <linux/pci-apple.h>
 #include <linux/pci-ecam.h>
+#include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/tunable.h>
 
 #include "../pci.h"
@@ -1051,11 +1052,20 @@ static int apple_pcie_tunnel_stop(struct apple_pcie_port *port)
 	ret = read_poll_timeout_atomic(apple_pcie_port_readl, stat,
 				       stat & PORT_TUNSTAT_PERST_ACK_PEND,
 				       1000, 1000000, false, port, PORT_TUNSTAT);
-	if (ret)
-		dev_warn(pcie->dev, "port %pOF tunnel reset acknowledgment timed out\n",
+	if (ret) {
+		dev_warn(pcie->dev,
+			 "port %pOF tunnel reset acknowledgment timed out\n",
 			 port->np);
-	if (ret && !err)
-		err = ret;
+		/*
+		 * The local port is already down. A removed cable cannot
+		 * finish the router handshake, and reporting that as a
+		 * quiesce failure makes the follow-up call skip this port
+		 * and claim success.
+		 */
+		if (err || (apple_pcie_port_readl(port, PORT_STATUS) &
+			    PORT_STATUS_READY))
+			err = ret;
+	}
 	apple_pcie_port_rmw_clear(port, PORT_TUNCTRL_PERST_ACK_REQ,
 				  PORT_TUNCTRL);
 	port->started = false;
@@ -1995,6 +2005,34 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	return 0;
 }
 
+typedef void (*apple_pcie_dart_fn)(struct device *dev);
+
+static void apple_pcie_walk_tunnel_darts(struct apple_pcie *pcie, apple_pcie_dart_fn fn)
+{
+	struct device_node *parent, *child;
+	struct platform_device *pdev;
+
+	parent = of_get_parent(pcie->dev->of_node);
+	if (!parent)
+		return;
+
+	for_each_available_child_of_node(parent, child) {
+		if (!of_device_is_compatible(child, "apple,t8103-dart") &&
+		    !of_device_is_compatible(child, "apple,t8103-usb4-dart") &&
+		    !of_device_is_compatible(child, "apple,t8110-dart") &&
+		    !of_device_is_compatible(child, "apple,t6000-dart"))
+			continue;
+
+		pdev = of_find_device_by_node(child);
+		if (pdev) {
+			fn(&pdev->dev);
+			put_device(&pdev->dev);
+		}
+	}
+
+	of_node_put(parent);
+}
+
 int apple_pcie_tunnel_quiesce(struct device *dev)
 {
 	struct pci_host_bridge *bridge = dev_get_drvdata(dev);
@@ -2034,6 +2072,12 @@ int apple_pcie_tunnel_quiesce(struct device *dev)
 
 		pcie->bus_stopped = true;
 	}
+
+	/*
+	 * Removing the IOMMU later resumes it and issues a command. Gate
+	 * those commands before APPCLK goes away with the port.
+	 */
+	apple_pcie_walk_tunnel_darts(pcie, apple_dart_quiesce_commands);
 
 	list_for_each_entry(port, &pcie->ports, entry) {
 		int err;
@@ -2079,6 +2123,9 @@ int apple_pcie_tunnel_restore(struct device *dev)
 
 		if (err && !ret)
 			ret = err;
+		if (!err)
+			apple_pcie_walk_tunnel_darts(pcie,
+							apple_dart_resume_commands);
 	}
 
 	pci_lock_rescan_remove();
