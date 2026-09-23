@@ -1488,9 +1488,22 @@ static int apple_dart_probe(struct platform_device *pdev)
 	if (tunneled) {
 		dart->tunables = devm_apple_tunable_parse(dev, dev->of_node,
 							  "apple,tunable", res);
-		if (IS_ERR(dart->tunables))
-			return dev_err_probe(dev, PTR_ERR(dart->tunables),
-					     "failed to parse PCIe-C DART tunables\n");
+		if (IS_ERR(dart->tunables)) {
+			/*
+			 * T8110 publishes tunables and the driver requires them.
+			 * A t8103 PCIe-C DART may omit them. Its values include
+			 * the configuration lock, which has to be written after
+			 * the translation context is programmed, so leave them
+			 * off until that ordering exists.
+			 */
+			if (PTR_ERR(dart->tunables) == -ENOENT &&
+			    dart->hw->type != DART_T8110) {
+				dart->tunables = NULL;
+			} else {
+				return dev_err_probe(dev, PTR_ERR(dart->tunables),
+						     "failed to parse PCIe-C DART tunables\n");
+			}
+		}
 	}
 
 	dart->irq = platform_get_irq(pdev, 0);
@@ -1513,7 +1526,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)
 		goto err_clk_disable;
-	if (tunneled) {
+	if (tunneled && dart->tunables) {
 		dev_info(dev, "applying %zu firmware PCIe-C DART tunables\n",
 			 dart->tunables->sz);
 		apple_dart_apply_tunables(dart);
@@ -1529,12 +1542,27 @@ static int apple_dart_probe(struct platform_device *pdev)
 	 * 64 SIDs.  Use that description before making any DART MMIO access.
 	 */
 	if (tunneled) {
-		dart->pgsize = 1 << DART_PCIEC_PAGE_SHIFT;
-		dart->supports_bypass = true;
-		dart->ias = DART_PCIEC_ADDR_WIDTH;
-		dart->oas = DART_PCIEC_ADDR_WIDTH;
-		dart->num_streams = DART_PCIEC_STREAMS;
-		dart->four_level = true;
+		/*
+		 * PARAMS is not safe to read on a tunneled DART. T8110 is
+		 * 16 KiB pages, 42-bit addresses, 64 streams and four levels.
+		 * A T8020 PCIe-C DART is 16 KiB pages, a 32-bit IOVA, a 36-bit
+		 * PA and as many streams as its register block describes.
+		 */
+		if (dart->hw->type == DART_T8110) {
+			dart->pgsize = 1 << DART_PCIEC_PAGE_SHIFT;
+			dart->supports_bypass = true;
+			dart->ias = DART_PCIEC_ADDR_WIDTH;
+			dart->oas = DART_PCIEC_ADDR_WIDTH;
+			dart->num_streams = DART_PCIEC_STREAMS;
+			dart->four_level = true;
+		} else {
+			dart->pgsize = 1 << DART_PCIEC_PAGE_SHIFT;
+			dart->supports_bypass = false;
+			dart->ias = 32;
+			dart->oas = dart->hw->oas;
+			dart->num_streams = dart->hw->max_sid_count;
+			dart->four_level = false;
+		}
 		dev_info(dev,
 			 "PCIe-C DART using fixed topology: pagesize %#x, %u streams, AS %u -> %u\n",
 			 dart->pgsize, dart->num_streams, dart->ias, dart->oas);

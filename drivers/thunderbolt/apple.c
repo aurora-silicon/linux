@@ -130,6 +130,8 @@ struct apple_cio {
 	void __iomem *rc_base;
 	struct resource *rc_res;
 	struct apple_tunable *rc_tunable;
+	void __iomem *pcie_adapter_base;
+	struct apple_tunable *pcie_adapter_tunable;
 
 	struct resource *sram_res;
 	void __iomem *sram_base;
@@ -407,9 +409,11 @@ apple_cio_pcie_tunnel_is_preinitialized(struct device_node *parent)
 		    !of_device_is_compatible(child, "apple,t6000-pciec"))
 			continue;
 
-		return !of_property_read_u32(child,
-					     "apple,pciec-preinit-status",
-					     &status) && status == 1;
+		if (!of_property_read_u32(child, "apple,pciec-preinit-status",
+					  &status) && status == 1)
+			return true;
+		/* t8103 brings the port up itself. */
+		return of_property_read_bool(child, "apple,pciec-kernel-init");
 	}
 
 	return false;
@@ -432,7 +436,7 @@ static int apple_cio_map_pcie_intr2axi(struct apple_cio *acio)
 
 		index = of_property_match_string(child, "reg-names", "intr2axi");
 		if (index < 0)
-			return index;
+			return 0;
 
 		ret = of_address_to_resource(child, index, &res);
 		if (ret)
@@ -726,6 +730,8 @@ static struct platform_device *apple_cio_find_pcie_tunnel(struct apple_cio *acio
 
 static int apple_cio_populate_pcie_tunnel(struct apple_cio *acio)
 {
+	int ret;
+
 	/*
 	 * PCIe-C was cold-initialized by m1n1 before the ACIO M3 started, but
 	 * enabling ACIO's cable-powered PCIe domain closes the Intr2AXI bridge
@@ -734,14 +740,24 @@ static int apple_cio_populate_pcie_tunnel(struct apple_cio *acio)
 	 * enabled both tunnel adapters and before either child can touch DART MMIO.
 	 * The bit self-clears after opening the bridge.
 	 */
-	writel(APPLE_CIO_PCIEC_INTR2AXI_ENABLE,
-	       acio->pcie_intr2axi_base + APPLE_CIO_PCIEC_INTR2AXI_CTRL);
-	/* Complete the pulse without reading the transient register. */
-	mb();
-	dev_info(acio->dev, "PCIe-C Intr2AXI bridge enabled\n");
+	if (acio->pcie_intr2axi_base) {
+		writel(APPLE_CIO_PCIEC_INTR2AXI_ENABLE,
+		       acio->pcie_intr2axi_base + APPLE_CIO_PCIEC_INTR2AXI_CTRL);
+		/* Complete the pulse without reading the transient register. */
+		mb();
+		dev_info(acio->dev, "PCIe-C Intr2AXI bridge enabled\n");
+	}
 
-	dev_info(acio->dev,
-		 "PCIe-C live handoff accepted; populating tunnel children\n");
+	/*
+	 * The DART is the first child and probes as soon as it is created.
+	 * Its command engine stays busy until this port clock is running, so
+	 * finish cold init before either child is populated.
+	 */
+	ret = apple_pcie_tunnel_prepare(acio->dev, acio->pcie_tunnel_np);
+	if (ret)
+		return ret;
+
+	dev_info(acio->dev, "PCIe-C populating tunnel children\n");
 	return of_platform_populate(acio->pcie_tunnel_np, NULL, NULL,
 				    acio->dev);
 }
@@ -1337,6 +1353,11 @@ static int apple_cio_start(struct apple_cio *acio)
 	}
 
 	apple_tunable_apply(acio->rc_base, acio->rc_tunable);
+	if (acio->pcie_adapter_base && acio->pcie_adapter_tunable) {
+		dev_info(acio->dev, "applying PCIe adapter tunable\n");
+		apple_tunable_apply(acio->pcie_adapter_base,
+				    acio->pcie_adapter_tunable);
+	}
 
 	/*
 	 * Bring up devices which are part of ACIO and are now accessible by the main SoC
@@ -1515,6 +1536,32 @@ static int apple_cio_probe(struct platform_device *pdev)
 		devm_apple_tunable_parse(dev, acio->np, "apple,tunable-rc", acio->rc_res);
 	if (IS_ERR(acio->rc_tunable))
 		return dev_err_probe(dev, PTR_ERR(acio->rc_tunable), "Unable to load rc tunable\n");
+
+	{
+		struct resource *adapter;
+
+		adapter = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+						       "pcie-adapter");
+		if (adapter) {
+			adapter->flags |= IORESOURCE_MEM_NONPOSTED;
+			acio->pcie_adapter_base = devm_ioremap_resource(dev, adapter);
+			if (IS_ERR(acio->pcie_adapter_base))
+				return dev_err_probe(dev, PTR_ERR(acio->pcie_adapter_base),
+						     "Unable to map PCIe adapter regs\n");
+			acio->pcie_adapter_tunable =
+				devm_apple_tunable_parse(dev, acio->np,
+							 "apple,tunable-pcie-adapter",
+							 adapter);
+			if (IS_ERR(acio->pcie_adapter_tunable)) {
+				if (PTR_ERR(acio->pcie_adapter_tunable) == -ENOENT)
+					acio->pcie_adapter_tunable = NULL;
+				else
+					return dev_err_probe(dev,
+							PTR_ERR(acio->pcie_adapter_tunable),
+							"Unable to load PCIe adapter tunable\n");
+			}
+		}
+	}
 
 	acio->reset = devm_reset_control_get_exclusive(dev, NULL);
 	if (IS_ERR(acio->reset))
