@@ -29,6 +29,7 @@
 #include <linux/usb/typec_mux.h>
 #include <linux/workqueue.h>
 
+#include <drm/drm_edid.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
@@ -1383,6 +1384,76 @@ out_unlock:
 	return ret;
 }
 
+static bool dcp_edid_is_placeholder(const struct drm_edid *drm_edid)
+{
+	const u8 *raw = (const u8 *)drm_edid_raw(drm_edid);
+	static const u8 name[] = "Non-PnP";
+	unsigned int i;
+
+	if (!raw)
+		return false;
+
+	/* EDID contains interior NUL bytes, so this cannot use strnstr(). */
+	for (i = 0; i + sizeof(name) - 1 <= sizeof(struct edid); i++) {
+		if (!memcmp(raw + i, name, sizeof(name) - 1))
+			return true;
+	}
+
+	return false;
+}
+
+void dcp_retry_placeholder_edid(struct apple_dcp *dcp,
+				const struct drm_edid *drm_edid)
+{
+	if (!dcp_is_typec_output(dcp) || dcp->placeholder_retried)
+		return;
+	if (!dcp_edid_is_placeholder(drm_edid))
+		return;
+
+	dcp->placeholder_retried = true;
+	schedule_delayed_work(&dcp->placeholder_edid_wq, msecs_to_jiffies(300));
+}
+
+static void dcp_placeholder_edid_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp =
+		container_of(to_delayed_work(work), struct apple_dcp,
+			     placeholder_edid_wq);
+	struct apple_epic_service *service;
+	int ret;
+
+	if (!READ_ONCE(dcp->typec_cable_connected))
+		return;
+
+	mutex_lock(&dcp->hpd_mutex);
+	service = dcp->dptxport[0].connected ? dcp->dptxport[0].service : NULL;
+	mutex_unlock(&dcp->hpd_mutex);
+	if (!service)
+		return;
+
+	/*
+	 * Some adapters answer the first connection with a 1024x768
+	 * placeholder and publish the panel EDID only after HPD drops
+	 * and returns. One pulse; a second placeholder is left alone.
+	 */
+	ret = dptxport_set_hpd(service, false);
+	if (ret) {
+		dev_info(dcp->dev, "placeholder EDID: HPD drop failed: %d\n",
+			 ret);
+		return;
+	}
+
+	msleep(1000);
+
+	if (!READ_ONCE(dcp->typec_cable_connected))
+		return;
+
+	ret = dptxport_set_hpd(service, true);
+	if (ret)
+		dev_info(dcp->dev, "placeholder EDID: HPD assert failed: %d\n",
+			 ret);
+}
+
 static void dcp_typec_reconnect_work(struct work_struct *work)
 {
 	struct apple_dcp *dcp =
@@ -1441,7 +1512,9 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 	if (dcp_is_typec_output(dcp)) {
 		WRITE_ONCE(dcp->typec_cable_connected, true);
 		dcp->typec_reconnect_tries = 0;
+		dcp->placeholder_retried = false;
 		cancel_delayed_work(&dcp->typec_reconnect_wq);
+		cancel_delayed_work(&dcp->placeholder_edid_wq);
 	}
 
 	ret = dcp_dptx_connect(dcp, port);
@@ -1459,6 +1532,7 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 	if (dcp_is_typec_output(dcp)) {
 		WRITE_ONCE(dcp->typec_cable_connected, false);
 		cancel_delayed_work(&dcp->typec_reconnect_wq);
+		cancel_delayed_work(&dcp->placeholder_edid_wq);
 	}
 
 	disconnected_hpd_event(dcp->connector);
@@ -2218,6 +2292,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		cancel_work_sync(&dcp->bl_update_wq);
 	}
 	cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+	cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 	cancel_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
 	cancel_work_sync(&dcp->vblank_wq);
 
@@ -2272,6 +2347,8 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	dcp->fixed_dptx_phy = dcp->dptx_phy;
 	INIT_DELAYED_WORK(&dcp->typec_reconnect_wq,
 			  dcp_typec_reconnect_work);
+	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq,
+			  dcp_placeholder_edid_work);
 	INIT_DELAYED_WORK(&dcp->typec_fabric_retrain_wq,
 			  dcp_typec_retrain_work);
 

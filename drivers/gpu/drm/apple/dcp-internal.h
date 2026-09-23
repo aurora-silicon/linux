@@ -47,6 +47,8 @@ struct apple_dcp_typec_route {
 };
 
 bool dcp_is_typec_output(struct apple_dcp *dcp);
+void dcp_retry_placeholder_edid(struct apple_dcp *dcp,
+				const struct drm_edid *drm_edid);
 
 struct dcpav_service_epic;
 
@@ -214,6 +216,9 @@ struct apple_dcp {
 	bool pending_hotplug;
 	bool pending_hotplug_connected;
 	bool valid_mode;
+	/* One HPD pulse after a placeholder EDID, per Type-C connection. */
+	bool placeholder_retried;
+	struct delayed_work placeholder_edid_wq;
 	bool use_timestamps;
 	bool vrr_enabled;
 	struct dcp_set_digital_out_mode_req mode;

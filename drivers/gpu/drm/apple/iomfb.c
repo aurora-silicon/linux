@@ -448,8 +448,10 @@ int dcp_get_modes(struct drm_connector *connector)
 			apple_connector->drm_edid = edid;
 		}
 	}
-	if (dcp->nr_modes && apple_connector->drm_edid)
+	if (dcp->nr_modes && apple_connector->drm_edid) {
 		drm_edid_connector_update(connector, apple_connector->drm_edid);
+		dcp_retry_placeholder_edid(dcp, apple_connector->drm_edid);
+	}
 
 	/*
 	 * An internal panel has no EDID, so nothing fills in the refresh range
