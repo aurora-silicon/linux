@@ -1085,13 +1085,24 @@ static int macaudio_probe(struct snd_soc_card *card)
 	dev_dbg(card->dev, "%s!\n", __func__);
 
 	ret = snd_soc_card_jack_new_pins(card, "Headphone Jack",
-			SND_JACK_HEADSET | SND_JACK_HEADPHONE,
+			SND_JACK_HEADSET | SND_JACK_HEADPHONE |
+			SND_JACK_BTN_0 | SND_JACK_BTN_1 |
+			SND_JACK_BTN_2 | SND_JACK_BTN_3,
 			&ma->jack, macaudio_jack_pins,
 			ARRAY_SIZE(macaudio_jack_pins));
 	if (ret < 0) {
 		dev_err(card->dev, "jack creation failed: %d\n", ret);
 		return ret;
 	}
+
+	/*
+	 * Apple remotes use BTN_0..2; CS42L83's analogue fallback can also
+	 * report BTN_3 for the fourth button of other headsets.
+	 */
+	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_0, KEY_PLAYPAUSE);
+	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_1, KEY_VOLUMEUP);
+	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_2, KEY_VOLUMEDOWN);
+	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_3, KEY_VOICECOMMAND);
 
 	return ret;
 }
