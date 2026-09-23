@@ -1129,6 +1129,20 @@ tb_port_path_direction_downstream(const struct tb_port *src,
 	return src->sw->config.depth < dst->sw->config.depth;
 }
 
+/*
+ * DP IN adapter of an Apple silicon host router (its NHI glue wants DP tunnel
+ * notifications). These need a few extra steps compared to other hosts.
+ */
+static inline bool tb_port_is_apple_host_dpin(const struct tb_port *port)
+{
+	const struct tb *tb = port->sw->tb;
+
+	/* the KUnit tests build switches without a domain */
+	if (!tb || !tb->nhi || tb_route(port->sw) || !tb_port_is_dpin(port))
+		return false;
+	return tb->nhi->ops && tb->nhi->ops->dp_tunnel_changed;
+}
+
 static inline bool tb_port_use_credit_allocation(const struct tb_port *port)
 {
 	return tb_port_is_null(port) && port->sw->credit_allocation;
