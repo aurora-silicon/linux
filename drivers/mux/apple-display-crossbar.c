@@ -17,6 +17,7 @@
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
+#include <linux/soc/apple/dp-tunnel.h>
 
 /*
  * T602x register interface is cleary different so most of the names below are
@@ -230,6 +231,19 @@ static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
 	return ret;
 }
 
+/* Warn if the clock gates of an output did not release. Diagnostic only. */
+static void apple_dpxbar_check_gates(struct apple_dpxbar *dpxbar, unsigned int index,
+				     u32 dispext_bit, u32 atc_bit)
+{
+	u32 wr = readl(dpxbar->regs + FIFO_WR_N_CLK_EN_STAT);
+	u32 rd = readl(dpxbar->regs + FIFO_RD_N_CLK_EN_STAT);
+	u32 out = readl(dpxbar->regs + OUT_N_CLK_EN_STAT);
+
+	if ((wr & dispext_bit) || (rd & dispext_bit) || (out & atc_bit))
+		dev_warn(dpxbar->dev, "%s: clock gates still set (%08x %08x %08x)\n",
+			 apple_dpxbar_names[index], wr, rd, out);
+}
+
 static int apple_dpxbar_set(struct mux_control *mux, int state)
 {
 	struct apple_dpxbar *dpxbar = mux_chip_priv(mux->chip);
@@ -329,6 +343,9 @@ static int apple_dpxbar_set(struct mux_control *mux, int state)
 		dpxbar_clear32(dpxbar, FIFO_WR_N_CLK_EN, dispext_bit);
 		dpxbar_clear32(dpxbar, FIFO_RD_N_CLK_EN, dispext_bit);
 		dpxbar_clear32(dpxbar, OUT_N_CLK_EN, atc_bit);
+		/* let the gates release before enabling the clocks behind them */
+		udelay(1);
+		apple_dpxbar_check_gates(dpxbar, index, dispext_bit, atc_bit);
 		dpxbar_set32(dpxbar, FIFO_WR_UNK_EN, dispext_bit);
 		dpxbar_set32(dpxbar, FIFO_RD_UNK_EN, dispext_bit_en);
 		dpxbar_set32(dpxbar, OUT_UNK_EN, atc_bit);
@@ -364,6 +381,110 @@ static int apple_dpxbar_set(struct mux_control *mux, int state)
 
 	return ret;
 }
+
+static const struct mux_control_ops apple_dpxbar_ops;
+
+static const u32 apple_dpxbar_atc_bits[MUX_MAX] = { ATC_DPPHY, ATC_DPIN0, ATC_DPIN1 };
+
+/*
+ * The output's current selection; dpxbar->lock held. The caller keeps the
+ * output selected (holds the mux) around the link helpers.
+ */
+static int apple_dpxbar_link_bits(struct apple_dpxbar *dpxbar, unsigned int index,
+				  u32 *dispext_bit, u32 *atc_bit)
+{
+	int state;
+
+	lockdep_assert_held(&dpxbar->lock);
+	state = dpxbar->selected_dispext[index];
+	if (state < 0)
+		return -ENODEV;
+	*dispext_bit = 1 << state;
+	*atc_bit = apple_dpxbar_atc_bits[index];
+	return 0;
+}
+
+static struct apple_dpxbar *apple_dpxbar_from_mux(struct mux_control *mux,
+						  unsigned int *index)
+{
+	if (mux->chip->ops != &apple_dpxbar_ops)
+		return NULL;
+	*index = mux_control_get_index(mux);
+	if (*index >= MUX_MAX)
+		return NULL;
+	return mux_chip_priv(mux->chip);
+}
+
+int apple_dpxbar_link_down(struct mux_control *mux)
+{
+	struct apple_dpxbar *dpxbar;
+	u32 dispext_bit, atc_bit;
+	unsigned long flags;
+	unsigned int index;
+	int ret;
+
+	dpxbar = apple_dpxbar_from_mux(mux, &index);
+	if (!dpxbar)
+		return -EINVAL;
+
+	spin_lock_irqsave(&dpxbar->lock, flags);
+	ret = apple_dpxbar_link_bits(dpxbar, index, &dispext_bit, &atc_bit);
+	if (!ret) {
+		dpxbar_clear32(dpxbar, CROSSBAR_DISPEXT_EN, dispext_bit);
+		dpxbar_clear32(dpxbar, FIFO_WR_DPTX_CLK_EN, dispext_bit);
+		dpxbar_clear32(dpxbar, FIFO_RD_PCLK1_EN, dispext_bit);
+		dpxbar_clear32(dpxbar, OUT_PCLK1_EN, atc_bit);
+		udelay(1);
+		dpxbar_set32(dpxbar, FIFO_WR_N_CLK_EN, dispext_bit);
+		dpxbar_set32(dpxbar, FIFO_RD_N_CLK_EN, dispext_bit);
+		dpxbar_set32(dpxbar, OUT_N_CLK_EN, atc_bit);
+	}
+	spin_unlock_irqrestore(&dpxbar->lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_dpxbar_link_down);
+
+int apple_dpxbar_link_up(struct mux_control *mux)
+{
+	struct apple_dpxbar *dpxbar;
+	u32 dispext_bit, atc_bit;
+	unsigned long flags;
+	unsigned int index;
+	int ret;
+
+	dpxbar = apple_dpxbar_from_mux(mux, &index);
+	if (!dpxbar)
+		return -EINVAL;
+
+	spin_lock_irqsave(&dpxbar->lock, flags);
+	ret = apple_dpxbar_link_bits(dpxbar, index, &dispext_bit, &atc_bit);
+	if (!ret) {
+		dpxbar_clear32(dpxbar, FIFO_WR_N_CLK_EN, dispext_bit);
+		dpxbar_clear32(dpxbar, FIFO_RD_N_CLK_EN, dispext_bit);
+		dpxbar_clear32(dpxbar, OUT_N_CLK_EN, atc_bit);
+		udelay(1);
+		apple_dpxbar_check_gates(dpxbar, index, dispext_bit, atc_bit);
+		dpxbar_set32(dpxbar, FIFO_WR_DPTX_CLK_EN, dispext_bit);
+		dpxbar_set32(dpxbar, FIFO_RD_PCLK1_EN, dispext_bit);
+		dpxbar_set32(dpxbar, OUT_PCLK1_EN, atc_bit);
+		dpxbar_set32(dpxbar, CROSSBAR_ATC_EN, atc_bit);
+		dpxbar_set32(dpxbar, CROSSBAR_DISPEXT_EN, dispext_bit);
+		dpxbar_clear32(dpxbar, FIFO_RD_PCLK1_EN, dispext_bit);
+		udelay(10);
+		dpxbar_set32(dpxbar, FIFO_RD_PCLK1_EN, dispext_bit);
+	}
+	spin_unlock_irqrestore(&dpxbar->lock, flags);
+	if (ret)
+		return ret;
+
+	dev_dbg(dpxbar->dev, "link up: ATC_EN=%08x STAT WR=%08x RD=%08x OUT=%08x\n",
+		readl(dpxbar->regs + CROSSBAR_ATC_EN),
+		readl(dpxbar->regs + FIFO_WR_DPTX_CLK_EN_STAT),
+		readl(dpxbar->regs + FIFO_RD_PCLK1_EN_STAT),
+		readl(dpxbar->regs + OUT_PCLK1_EN_STAT));
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_dpxbar_link_up);
 
 static const struct mux_control_ops apple_dpxbar_ops = {
 	.set = apple_dpxbar_set,
