@@ -24,6 +24,20 @@
 #include <sound/soc-component.h>
 #include <sound/soc-dai.h>
 
+/* Restored in this order; the interrupt masks must come last. */
+enum cs42l83_remote_saved_reg {
+	CS42L83_REMOTE_SAVED_HSBIAS_SC_AUTOCTL,
+	CS42L83_REMOTE_SAVED_WAKE_CTL,
+	CS42L83_REMOTE_SAVED_MISC_DET_CTL,
+	CS42L83_REMOTE_SAVED_MIC_DET_CTL1,
+	CS42L83_REMOTE_SAVED_MIC_DET_CTL2,
+	CS42L83_REMOTE_SAVED_HS_BIAS_CTL,
+	CS42L83_REMOTE_SAVED_HSDET_CTL2,
+	CS42L83_REMOTE_SAVED_DET_INT1_MASK,
+	CS42L83_REMOTE_SAVED_DET_INT2_MASK,
+	CS42L83_REMOTE_NUM_SAVED_REGS,
+};
+
 struct  cs42l42_private {
 	struct regmap *regmap;
 	struct device *dev;
@@ -51,6 +65,8 @@ struct  cs42l42_private {
 	u8 hs_bias_ramp_time;
 	u8 hs_bias_sense_en;
 	u8 stream_use;
+	bool remote_active;
+	unsigned int remote_saved[CS42L83_REMOTE_NUM_SAVED_REGS];
 	bool hp_adc_up_pending;
 	bool suspended;
 	bool sdw_waiting_first_unattach;
