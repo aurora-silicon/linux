@@ -69,6 +69,14 @@ void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port);
 int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port);
 
+struct apple_dcp;
+struct phy;
+/* Thunderbolt DP tunnels, called from the DPTX endpoint */
+int dcp_tunnel_crossbar_up(struct apple_dcp *dcp);
+int dcp_tunnel_crossbar_down(struct apple_dcp *dcp);
+int dcp_tunnel_set_rate(struct apple_dcp *dcp, struct phy *phy, u32 link_rate);
+int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, bool active);
+
 int iomfb_start_rtkit(struct apple_dcp *dcp);
 void iomfb_shutdown(struct apple_dcp *dcp);
 /* rtkit message handler for IOMFB messages */

@@ -38,6 +38,12 @@ struct apple_dcp_typec_route {
 	u32 dptx_phy;
 	u32 mux_index;
 	bool selected;
+	/* crossbar output actually selected: xbar (dpphy) or a Thunderbolt dpin */
+	unsigned int tunnel_dpin;
+	struct mux_control *active_xbar;
+	bool tunnel;
+	/* tunnel: crossbar brought up (at DidChangeLinkConfiguration) */
+	bool xbar_up;
 };
 
 bool dcp_is_typec_output(struct apple_dcp *dcp);
@@ -285,6 +291,20 @@ struct apple_dcp {
 	u32 nr_typec_routes;
 	bool phy_managed_by_typec;
 	bool typec_cable_connected;
+	/* DPTX feeds a Thunderbolt DP IN adapter, not the Type-C PHY lanes */
+	bool dptx_tunnel;
+	/* DFP port in the DPTX target: 0 = dpphy, 1 = dpin0, 2 = dpin1 */
+	u8 dptx_dfp_port;
+	/* wakes/sleeps the Thunderbolt DP IN adapter from DCP Activate/Deactivate */
+	int (*tb_dpin_set_active)(void *ctx, bool active);
+	void *tb_dpin_ctx;
+	/*
+	 * Serializes the Thunderbolt DP IN callback and tunnel crossbar state
+	 * between DCP apcalls and tunnel teardown; never held while waiting
+	 * for DCP.
+	 */
+	struct mutex tb_lock;
+	bool tb_clock_ok;
 	struct delayed_work typec_reconnect_wq;
 	struct delayed_work typec_fabric_retrain_wq;
 	u32 typec_reconnect_tries;

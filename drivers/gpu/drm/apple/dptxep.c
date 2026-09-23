@@ -86,8 +86,11 @@ int dptxport_validate_connection(struct apple_epic_service *service, u8 core,
 
 	trace_dptxport_validate_connection(dptx, core, atc, die);
 
+	/* attributes: role (0 = direct PHY, 1 = Thunderbolt DP IN) | supportsHPD << 8 */
+	u32 attrs = 0x100 | (service->ep->dcp->dptx_tunnel ? 1 : 0);
+
 	cmd.target = cpu_to_le32(target);
-	cmd.unk = cpu_to_le32(0x100);
+	cmd.unk = cpu_to_le32(attrs);
 	ret = afk_service_call(service, 0, 12, &cmd, sizeof(cmd), 40, &resp,
 			       sizeof(resp), 40);
 	if (ret)
@@ -95,8 +98,14 @@ int dptxport_validate_connection(struct apple_epic_service *service, u8 core,
 
 	if (le32_to_cpu(resp.target) != target)
 		return -EINVAL;
-	if (le32_to_cpu(resp.unk) != 0x100)
-		return -EINVAL;
+	if (le32_to_cpu(resp.unk) != attrs) {
+		/* only the Thunderbolt DP IN role is allowed to differ */
+		if (!service->ep->dcp->dptx_tunnel)
+			return -EINVAL;
+		dev_dbg(service->ep->dcp->dev,
+			"validate_connection: attrs reply 0x%x (sent 0x%x)\n",
+			le32_to_cpu(resp.unk), attrs);
+	}
 
 	return 0;
 }
@@ -106,7 +115,8 @@ int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
 {
 	struct dptx_port *dptx = service->cookie;
 	struct dcpdptx_connection_cmd cmd, resp;
-	u32 unk_field = supports_hpd ? DCPDPTX_REMOTE_PORT_SUPPORTS_HPD : 0;
+	u32 unk_field = (supports_hpd ? DCPDPTX_REMOTE_PORT_SUPPORTS_HPD : 0) |
+			(service->ep->dcp->dptx_tunnel ? 1 : 0);
 	int ret;
 	u32 target = FIELD_PREP(DCPDPTX_REMOTE_PORT_CORE, core) |
 		     FIELD_PREP(DCPDPTX_REMOTE_PORT_ATC, atc) |
@@ -429,7 +439,17 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 		dptx->phy_ops.dp.link_rate = phy_link_rate;
 		dptx->phy_ops.dp.set_rate = 1;
 
-		if (dptx->atcphy) {
+		if (dptx->atcphy && service->ep->dcp->dptx_tunnel) {
+			/*
+			 * Thunderbolt DP IN: no lane setup, but the ATC must
+			 * provide the tunnel pixel clock for this rate. A
+			 * failure is logged and keeps the crossbar down (see
+			 * dcp_tunnel_crossbar_up()), so no stream is started
+			 * without a clock.
+			 */
+			dcp_tunnel_set_rate(service->ep->dcp, dptx->atcphy,
+					    link_rate);
+		} else if (dptx->atcphy) {
 			ret = phy_configure(dptx->atcphy, &dptx->phy_ops);
 			if (ret)
 				return ret;
@@ -499,6 +519,9 @@ dptxport_call_activate(struct apple_epic_service *service,
 	if (!dcp->phy_managed_by_typec)
 		phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP, dcp->index);
 
+	if (dcp->dptx_tunnel)
+		dcp_tunnel_dpin_activate(service->ep->dcp, true);
+
 	memcpy(reply, data, min(reply_size, data_size));
 	if (reply_size >= 4)
 		memset(reply, 0, 4);
@@ -517,6 +540,9 @@ dptxport_call_deactivate(struct apple_epic_service *service,
 	if (!dcp->phy_managed_by_typec)
 		phy_set_mode_ext(dptx->atcphy, PHY_MODE_INVALID, 0);
 
+	if (dcp->dptx_tunnel)
+		dcp_tunnel_dpin_activate(service->ep->dcp, false);
+
 	memcpy(reply, data, min(reply_size, data_size));
 	if (reply_size >= 4)
 		memset(reply, 0, 4);
@@ -529,13 +555,21 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 			 size_t reply_size)
 {
 	struct dptx_port *dptx = service->cookie;
+	int ret;
+
 	trace_dptxport_apcall(dptx, idx, data_size);
 
 	switch (idx) {
 	case DPTX_APCALL_WILL_CHANGE_LINKG_CONFIG:
+		/* re-link on an established tunnel: take the crossbar connection down first */
+		if (service->ep->dcp->dptx_tunnel && dptx->link_rate)
+			dcp_tunnel_crossbar_down(service->ep->dcp);
 		return dptxport_call_will_change_link_config(service);
 	case DPTX_APCALL_DID_CHANGE_LINK_CONFIG:
-		return dptxport_call_did_change_link_config(service);
+		ret = dptxport_call_did_change_link_config(service);
+		if (!ret && service->ep->dcp->dptx_tunnel && dptx->link_rate)
+			dcp_tunnel_crossbar_up(service->ep->dcp);
+		return ret;
 	case DPTX_APCALL_GET_MAX_LINK_RATE:
 		return dptxport_call_get_max_link_rate(service, reply,
 						       reply_size);
