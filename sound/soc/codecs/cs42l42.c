@@ -1666,8 +1666,12 @@ irqreturn_t cs42l42_irq_thread(int irq, void *data)
 	unsigned int current_plug_status;
 	unsigned int current_button_status;
 	unsigned int i;
+	int ret;
 
-	pm_runtime_get_sync(cs42l42->dev);
+	/* The I2C transport never enables runtime PM; treat it as powered. */
+	ret = pm_runtime_get_active(cs42l42->dev, RPM_TRANSPARENT);
+	if (ret < 0)
+		return IRQ_NONE;
 	mutex_lock(&cs42l42->irq_lock);
 	if (cs42l42->suspended || !cs42l42->init_done) {
 		mutex_unlock(&cs42l42->irq_lock);
@@ -1677,10 +1681,14 @@ irqreturn_t cs42l42_irq_thread(int irq, void *data)
 
 	/* Read sticky registers to clear interrupt */
 	for (i = 0; i < ARRAY_SIZE(stickies); i++) {
-		regmap_read(cs42l42->regmap, irq_params_table[i].status_addr,
-				&(stickies[i]));
-		regmap_read(cs42l42->regmap, irq_params_table[i].mask_addr,
-				&(masks[i]));
+		ret = regmap_read(cs42l42->regmap, irq_params_table[i].status_addr,
+				  &stickies[i]);
+		if (ret)
+			goto out_error;
+		ret = regmap_read(cs42l42->regmap, irq_params_table[i].mask_addr,
+				  &masks[i]);
+		if (ret)
+			goto out_error;
 		stickies[i] = stickies[i] & (~masks[i]) &
 				irq_params_table[i].mask;
 	}
@@ -1777,6 +1785,12 @@ irqreturn_t cs42l42_irq_thread(int irq, void *data)
 	pm_runtime_put_autosuspend(cs42l42->dev);
 
 	return IRQ_HANDLED;
+
+out_error:
+	mutex_unlock(&cs42l42->irq_lock);
+	pm_runtime_put_autosuspend(cs42l42->dev);
+	dev_err_ratelimited(cs42l42->dev, "Failed to read jack interrupt state: %d\n", ret);
+	return IRQ_NONE;
 }
 EXPORT_SYMBOL_NS_GPL(cs42l42_irq_thread, "SND_SOC_CS42L42_CORE");
 
