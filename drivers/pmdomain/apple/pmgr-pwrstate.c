@@ -8,6 +8,7 @@
 #include <linux/bitops.h>
 #include <linux/bitfield.h>
 #include <linux/err.h>
+#include <linux/init.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
@@ -50,6 +51,19 @@ struct apple_pmgr_ps {
 	bool externally_clocked;
 };
 
+/*
+ * Preserve inherited power state during platform qualification. Runtime
+ * consumer transitions still use genpd; this is not a replacement for
+ * describing the platform's complete power dependencies.
+ */
+static bool apple_pmgr_no_auto_enable_on_probe;
+
+static int __init apple_pmgr_no_auto_probe_param(char *value)
+{
+	return kstrtobool(value, &apple_pmgr_no_auto_enable_on_probe);
+}
+early_param("apple_pmgr.no_auto_probe", apple_pmgr_no_auto_probe_param);
+
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
 #define rcdev_to_apple_pmgr_ps(_rcdev) container_of(_rcdev, struct apple_pmgr_ps, rcdev)
 
@@ -65,11 +79,12 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 
 	/* Resets are synchronous, and only work if the device is powered and clocked. */
 	if (reg & APPLE_PMGR_RESET && pstate != APPLE_PMGR_PS_ACTIVE)
-		dev_err(ps->dev, "PS %s: powering off with RESET active\n",
+		dev_err_ratelimited(ps->dev, "PS %s: powering off with RESET active\n",
 			genpd->name);
 
 	if (pstate != APPLE_PMGR_PS_ACTIVE && (ps->force_disable || ps->force_reset)) {
-		u32 reg_pre = reg & ~(APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS);
+		u32 reg_pre = reg & ~(APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS |
+				      APPLE_PMGR_BUSY);
 
 		if (ps->force_disable)
 			reg_pre |= APPLE_PMGR_DEV_DISABLE;
@@ -85,12 +100,14 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 			APPLE_PMGR_PS_SET_TIMEOUT);
 
 		if (ret < 0)
-			dev_err(ps->dev, "PS %s: Failed to set reset/disable bits (now: 0x%x)\n",
+			dev_err_ratelimited(ps->dev, "PS %s: Failed to set reset/disable bits (now: 0x%x)\n",
 				genpd->name, reg);
 	}
 
+	/* Do not replay the hardware-owned BUSY bit in this whole-word write. */
 	reg &= ~(APPLE_PMGR_DEV_DISABLE | APPLE_PMGR_PS_RESET |
-		 APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS | APPLE_PMGR_PS_TARGET);
+		 APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS | APPLE_PMGR_BUSY |
+		 APPLE_PMGR_PS_TARGET);
 	reg |= FIELD_PREP(APPLE_PMGR_PS_TARGET, pstate);
 
 	dev_dbg(ps->dev, "PS %s: pwrstate = 0x%x: 0x%x\n", genpd->name, pstate, reg);
@@ -114,8 +131,8 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	}
 
 	if (ret < 0)
-		dev_err(ps->dev, "PS %s: Failed to reach power state 0x%x (now: 0x%x)\n",
-			genpd->name, pstate, reg);
+		dev_err_ratelimited(ps->dev, "PS %s: Failed to reach power state 0x%x (requested 0x%x, now: 0x%x)\n",
+			genpd->name, pstate, reg, cur);
 
 	if (auto_enable) {
 		/* Not all devices implement this; this is a no-op where not implemented. */
@@ -158,7 +175,8 @@ static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned 
 	spin_lock_irqsave(&ps->genpd.slock, flags);
 
 	if (ps->genpd.status == GENPD_STATE_OFF)
-		dev_err(ps->dev, "PS 0x%x: asserting RESET while powered down\n", ps->offset);
+		dev_err_ratelimited(ps->dev,
+			"PS 0x%x: asserting RESET while powered down\n", ps->offset);
 
 	dev_dbg(ps->dev, "PS 0x%x: assert reset\n", ps->offset);
 	/* Quiesce device before asserting reset */
@@ -184,7 +202,8 @@ static int apple_pmgr_reset_deassert(struct reset_controller_dev *rcdev, unsigne
 	regmap_update_bits(ps->regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_DEV_DISABLE, 0);
 
 	if (ps->genpd.status == GENPD_STATE_OFF)
-		dev_err(ps->dev, "PS 0x%x: RESET was deasserted while powered down\n", ps->offset);
+		dev_err_ratelimited(ps->dev,
+			"PS 0x%x: RESET was deasserted while powered down\n", ps->offset);
 
 	spin_unlock_irqrestore(&ps->genpd.slock, flags);
 
@@ -292,8 +311,8 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		ps->genpd.flags |= GENPD_FLAG_DEFER_OFF | GENPD_FLAG_ACTIVE_WAKEUP;
 	}
 
-	/* Turn on auto-PM if the domain is already on */
-	if (active)
+	/* Turn on auto-PM unless inherited state is being preserved. */
+	if (active && !apple_pmgr_no_auto_enable_on_probe)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
 				   APPLE_PMGR_AUTO_ENABLE);
 
@@ -361,11 +380,18 @@ static const struct of_device_id apple_pmgr_ps_of_match[] = {
 
 MODULE_DEVICE_TABLE(of, apple_pmgr_ps_of_match);
 
+static void apple_pmgr_ps_sync_state(struct device *dev)
+{
+	if (!apple_pmgr_no_auto_enable_on_probe)
+		of_genpd_sync_state(dev->of_node);
+}
+
 static struct platform_driver apple_pmgr_ps_driver = {
 	.probe = apple_pmgr_ps_probe,
 	.driver = {
 		.name = "apple-pmgr-pwrstate",
 		.of_match_table = apple_pmgr_ps_of_match,
+		.sync_state = apple_pmgr_ps_sync_state,
 	},
 };
 
