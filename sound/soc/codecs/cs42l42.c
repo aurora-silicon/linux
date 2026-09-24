@@ -790,8 +790,13 @@ static int cs42l42_asp_config(struct snd_soc_component *component,
 {
 	u32 fsync = sclk / sample_rate;
 
-	/* Set up the LRCLK */
-	if (((fsync * sample_rate) != sclk) || ((fsync % 2) != 0)) {
+	/*
+	 * Set up the LRCLK.  An odd number of SCLKs per frame is accepted:
+	 * the T8140 AOP runs the CS42L83 jack link at 125 SCLKs per 48 kHz
+	 * frame (6 MHz), with the pulse width rounded down to 62 SCLKs as
+	 * the native driver programs it.
+	 */
+	if ((fsync * sample_rate) != sclk) {
 		dev_err(component->dev,
 			"Unsupported sclk %d/sample rate %d\n",
 			sclk,
@@ -828,6 +833,7 @@ static int cs42l42_asp_config(struct snd_soc_component *component,
 static int cs42l42_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 {
 	struct snd_soc_component *component = codec_dai->component;
+	struct cs42l42_private *cs42l42 = snd_soc_component_get_drvdata(component);
 	u32 asp_cfg_val = 0;
 
 	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
@@ -858,6 +864,34 @@ static int cs42l42_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 					      CS42L42_ASP_5050_MASK |
 					      (CS42L42_ASP_FSD_1_0 <<
 						CS42L42_ASP_FSD_SHIFT));
+		cs42l42->dsp_a = false;
+		break;
+	case SND_SOC_DAIFMT_DSP_A:
+		/*
+		 * Pulse mode, frame starts on the rising edge of LRCLK; the
+		 * channels sit back to back (hw_params places channel 2 at the
+		 * slot width).  The T8140 AOP runs the CS42L83 jack link this
+		 * way: a 125-SCLK frame pulse with two 32-bit slots.
+		 *
+		 * The data follows the frame pulse by half an SCLK, not the
+		 * whole one DSP-A nominally implies.  With FSD = 1.0 the codec
+		 * sampled every slot one bit late: the sample arrived doubled
+		 * and everything above half scale wrapped -- measured on the
+		 * J700 jack through a line-in (60 Hz sines: THD -60 dB up to
+		 * -12 dBFS, then the fundamental fell and THD reached +6 dB
+		 * from -6 dBFS up, 1800 discontinuities in three seconds), which
+		 * the listener heard as static riding on the bass at high
+		 * volume.  FSD = 0.5 gives THD -60 dB all the way to -1 dBFS.
+		 */
+		snd_soc_component_update_bits(component,
+					      CS42L42_ASP_FRM_CFG,
+					      CS42L42_ASP_STP_MASK |
+					      CS42L42_ASP_5050_MASK |
+					      CS42L42_ASP_FSD_MASK,
+					      CS42L42_ASP_STP_MASK |
+					      (CS42L42_ASP_FSD_0_5 <<
+						CS42L42_ASP_FSD_SHIFT));
+		cs42l42->dsp_a = true;
 		break;
 	default:
 		return -EINVAL;
@@ -878,6 +912,15 @@ static int cs42l42_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 		asp_cfg_val |= CS42L42_ASP_LCPOL_INV << CS42L42_ASP_LCPOL_SHIFT;
 		break;
 	}
+
+	/*
+	 * DSP-A on the T8140 AOP link: the receiving serializer samples SDOUT
+	 * on the edge the codec would drive it, so drive SDOUT on the other
+	 * edge (the SCPOL field has one bit per direction: bit 0 SDIN, bit 1
+	 * SDOUT).
+	 */
+	if (cs42l42->dsp_a)
+		asp_cfg_val &= ~(BIT(1) << CS42L42_ASP_SCPOL_SHIFT);
 
 	snd_soc_component_update_bits(component, CS42L42_ASP_CLK_CFG, CS42L42_ASP_MODE_MASK |
 								      CS42L42_ASP_SCPOL_MASK |
@@ -940,10 +983,24 @@ static int cs42l42_pcm_hw_params(struct snd_pcm_substream *substream,
 
 	switch (substream->stream) {
 	case SNDRV_PCM_STREAM_CAPTURE:
-		/* channel 2 on high LRCLK */
-		val = CS42L42_ASP_TX_CH2_AP_MASK |
-		      (width << CS42L42_ASP_TX_CH2_RES_SHIFT) |
-		      (width << CS42L42_ASP_TX_CH1_RES_SHIFT);
+		if (cs42l42->dsp_a) {
+			/* Both channels in the frame phase, channel 2 one slot in */
+			unsigned int start = params_physical_width(params);
+
+			val = (width << CS42L42_ASP_TX_CH2_RES_SHIFT) |
+			      (width << CS42L42_ASP_TX_CH1_RES_SHIFT);
+			snd_soc_component_write(component, CS42L42_ASP_TX_CH1_BIT_MSB, 0);
+			snd_soc_component_write(component, CS42L42_ASP_TX_CH1_BIT_LSB, 0);
+			snd_soc_component_write(component, CS42L42_ASP_TX_CH2_BIT_MSB,
+						(start >> 8) & 0xff);
+			snd_soc_component_write(component, CS42L42_ASP_TX_CH2_BIT_LSB,
+						start & 0xff);
+		} else {
+			/* channel 2 on high LRCLK */
+			val = CS42L42_ASP_TX_CH2_AP_MASK |
+			      (width << CS42L42_ASP_TX_CH2_RES_SHIFT) |
+			      (width << CS42L42_ASP_TX_CH1_RES_SHIFT);
+		}
 
 		snd_soc_component_update_bits(component, CS42L42_ASP_TX_CH_AP_RES,
 				CS42L42_ASP_TX_CH1_AP_MASK | CS42L42_ASP_TX_CH2_AP_MASK |
@@ -955,11 +1012,36 @@ static int cs42l42_pcm_hw_params(struct snd_pcm_substream *substream,
 		snd_soc_component_update_bits(component, CS42L42_ASP_RX_DAI0_CH1_AP_RES,
 							 CS42L42_ASP_RX_CH_AP_MASK |
 							 CS42L42_ASP_RX_CH_RES_MASK, val);
-		/* Channel 2 on high LRCLK */
-		val |= CS42L42_ASP_RX_CH_AP_HI << CS42L42_ASP_RX_CH_AP_SHIFT;
-		snd_soc_component_update_bits(component, CS42L42_ASP_RX_DAI0_CH2_AP_RES,
-							 CS42L42_ASP_RX_CH_AP_MASK |
-							 CS42L42_ASP_RX_CH_RES_MASK, val);
+		if (cs42l42->dsp_a) {
+			/*
+			 * Channel 2 follows channel 1 in the same phase, one
+			 * slot (the physical sample width) after the frame
+			 * start.
+			 */
+			unsigned int start = params_physical_width(params);
+
+			snd_soc_component_update_bits(component,
+						      CS42L42_ASP_RX_DAI0_CH2_AP_RES,
+						      CS42L42_ASP_RX_CH_AP_MASK |
+						      CS42L42_ASP_RX_CH_RES_MASK, val);
+			snd_soc_component_write(component,
+						CS42L42_ASP_RX_DAI0_CH1_BIT_MSB, 0);
+			snd_soc_component_write(component,
+						CS42L42_ASP_RX_DAI0_CH1_BIT_LSB, 0);
+			snd_soc_component_write(component,
+						CS42L42_ASP_RX_DAI0_CH2_BIT_MSB,
+						(start >> 8) & 0xff);
+			snd_soc_component_write(component,
+						CS42L42_ASP_RX_DAI0_CH2_BIT_LSB,
+						start & 0xff);
+		} else {
+			/* Channel 2 on high LRCLK */
+			val |= CS42L42_ASP_RX_CH_AP_HI << CS42L42_ASP_RX_CH_AP_SHIFT;
+			snd_soc_component_update_bits(component,
+						      CS42L42_ASP_RX_DAI0_CH2_AP_RES,
+						      CS42L42_ASP_RX_CH_AP_MASK |
+						      CS42L42_ASP_RX_CH_RES_MASK, val);
+		}
 
 		/* Channel B comes from the last active channel */
 		snd_soc_component_update_bits(component, CS42L42_SP_RX_CH_SEL,
