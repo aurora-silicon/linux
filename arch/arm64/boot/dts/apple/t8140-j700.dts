@@ -10,6 +10,7 @@
 /dts-v1/;
 
 #include "t8140.dtsi"
+#include <dt-bindings/spmi/spmi.h>
 
 / {
 	compatible = "apple,j700", "apple,t8140", "apple,arm-platform";
@@ -163,12 +164,63 @@
 	status = "okay";
 };
 
+/* Baku's legacy scratchpad starts at the own-device ADT's 0xf700.
+ * The cell offsets and bitfields follow the existing Apple SMC boot-state
+ * layout. The shutdown flag is needed for power-off rather than reboot.
+ */
+&{/soc} {
+	nub_spmi0: spmi@308714000 {
+		compatible = "apple,t8140-spmi", "apple,t8103-spmi";
+		reg = <0x3 0x08714000 0x0 0x100>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		#interrupt-cells = <2>;
+		interrupt-controller;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 487 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_nub_spmi0>;
+
+		pmic@e {
+			compatible = "apple,baku-pmic", "apple,spmi-nvmem";
+			reg = <0xe SPMI_USID>;
+
+			nvmem-layout {
+				compatible = "fixed-layout";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				boot_stage: boot-stage@f701 {
+					reg = <0xf701 0x1>;
+				};
+
+				boot_error_count: boot-error-count@f702,0 {
+					reg = <0xf702 0x1>;
+					bits = <0 4>;
+				};
+
+				panic_count: panic-count@f702,4 {
+					reg = <0xf702 0x1>;
+					bits = <4 4>;
+				};
+
+				shutdown_flag: shutdown-flag@f70f,3 {
+					reg = <0xf70f 0x1>;
+					bits = <3 1>;
+				};
+			};
+		};
+	};
+};
+
 &smc {
 	status = "okay";
 
-	/* The SMC reboot path supports optional PMU NVMEM cells. */
 	reboot {
 		compatible = "apple,smc-reboot";
+		nvmem-cells = <&shutdown_flag>, <&boot_stage>,
+			      <&boot_error_count>, <&panic_count>;
+		nvmem-cell-names = "shutdown_flag", "boot_stage",
+				   "boot_error_count", "panic_count";
 	};
 
 	hwmon {

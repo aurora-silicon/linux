@@ -747,13 +747,13 @@
 		 * and child-device writes before a board DTS enables it.
 		 */
 		cpufreq_e: cpufreq@210e20000 {
-			compatible = "apple,t8140-cluster-cpufreq", "apple,cluster-cpufreq";
+			compatible = "apple,t8140-cluster-cpufreq";
 			reg = <0x2 0x10e20000 0x0 0x1000>;
 			#performance-domain-cells = <0>;
 		};
 
 		cpufreq_p: cpufreq@211e20000 {
-			compatible = "apple,t8140-cluster-cpufreq", "apple,cluster-cpufreq";
+			compatible = "apple,t8140-cluster-cpufreq";
 			reg = <0x2 0x11e20000 0x0 0x1000>;
 			#performance-domain-cells = <0>;
 		};

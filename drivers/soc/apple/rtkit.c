@@ -271,73 +271,76 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 					    struct apple_rtkit_shmem *buffer,
 					    u8 ep, u64 msg)
 {
+	struct apple_rtkit_shmem request = {};
 	u64 reply;
 	int err;
 
-	/* The different size vs. IOVA shifts look odd but are indeed correct this way */
+	/* The different size vs. IOVA shifts are part of the wire format. */
 	if (ep == APPLE_RTKIT_EP_OSLOG) {
-		buffer->size = FIELD_GET(APPLE_RTKIT_OSLOG_SIZE, msg);
-		buffer->iova = FIELD_GET(APPLE_RTKIT_OSLOG_IOVA, msg) << 12;
+		request.size = FIELD_GET(APPLE_RTKIT_OSLOG_SIZE, msg);
+		request.iova = FIELD_GET(APPLE_RTKIT_OSLOG_IOVA, msg) << 12;
 	} else {
-		buffer->size = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_SIZE, msg) << 12;
-		buffer->iova = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_IOVA, msg);
+		request.size = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_SIZE, msg) << 12;
+		request.iova = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_IOVA, msg);
 	}
-
-	buffer->buffer = NULL;
-	buffer->iomem = NULL;
-	buffer->is_mapped = false;
-
-	dev_dbg(rtk->dev, "RTKit: buffer request for 0x%zx bytes at %pad\n",
-		buffer->size, &buffer->iova);
-
-	if (buffer->iova && !rtk->ops->shmem_setup) {
+	if (!request.size) {
 		err = -EINVAL;
 		goto error;
 	}
 
+	/* A repeated request cannot retire a buffer that firmware may still use.
+	 * Re-send the existing allocation reply, or reuse an identical mapping.
+	 * A changed request requires a separately confirmed firmware shutdown.
+	 */
+	if (buffer->size) {
+		if (request.size != buffer->size ||
+		    (request.iova != buffer->iova &&
+		     (request.iova || buffer->is_mapped))) {
+			err = -EBUSY;
+			goto error;
+		}
+		goto reply;
+	}
+
+	dev_dbg(rtk->dev, "RTKit: buffer request for 0x%zx bytes at %pad\n",
+		request.size, &request.iova);
+	if (request.iova && !rtk->ops->shmem_setup) {
+		err = -EINVAL;
+		goto error;
+	}
 	if (rtk->ops->shmem_setup) {
-		err = rtk->ops->shmem_setup(rtk->cookie, buffer);
+		err = rtk->ops->shmem_setup(rtk->cookie, &request);
 		if (err)
 			goto error;
 	} else {
-		buffer->buffer = dma_alloc_coherent(rtk->dev, buffer->size,
-						    &buffer->iova, GFP_KERNEL);
-		if (!buffer->buffer) {
+		request.buffer = dma_alloc_coherent(rtk->dev, request.size,
+						    &request.iova, GFP_KERNEL);
+		if (!request.buffer) {
 			err = -ENOMEM;
 			goto error;
 		}
 	}
+	*buffer = request;
 
+reply:
 	if (!buffer->is_mapped) {
-		/* oslog uses different fields and needs a shifted IOVA instead of size */
 		if (ep == APPLE_RTKIT_EP_OSLOG) {
 			reply = FIELD_PREP(APPLE_RTKIT_OSLOG_TYPE,
 					   APPLE_RTKIT_OSLOG_BUFFER_REQUEST);
 			reply |= FIELD_PREP(APPLE_RTKIT_OSLOG_SIZE, buffer->size);
-			reply |= FIELD_PREP(APPLE_RTKIT_OSLOG_IOVA,
-					    buffer->iova >> 12);
+			reply |= FIELD_PREP(APPLE_RTKIT_OSLOG_IOVA, buffer->iova >> 12);
 		} else {
-			reply = FIELD_PREP(APPLE_RTKIT_SYSLOG_TYPE,
-					   APPLE_RTKIT_BUFFER_REQUEST);
-			reply |= FIELD_PREP(APPLE_RTKIT_BUFFER_REQUEST_SIZE,
-					    buffer->size >> 12);
-			reply |= FIELD_PREP(APPLE_RTKIT_BUFFER_REQUEST_IOVA,
-					    buffer->iova);
+			reply = FIELD_PREP(APPLE_RTKIT_SYSLOG_TYPE, APPLE_RTKIT_BUFFER_REQUEST);
+			reply |= FIELD_PREP(APPLE_RTKIT_BUFFER_REQUEST_SIZE, buffer->size >> 12);
+			reply |= FIELD_PREP(APPLE_RTKIT_BUFFER_REQUEST_IOVA, buffer->iova);
 		}
 		apple_rtkit_send_message(rtk, ep, reply, NULL, false);
 	}
-
 	return 0;
 
 error:
 	dev_err(rtk->dev, "RTKit: failed buffer request for 0x%zx bytes (%d)\n",
-		buffer->size, err);
-
-	buffer->buffer = NULL;
-	buffer->iomem = NULL;
-	buffer->iova = 0;
-	buffer->size = 0;
-	buffer->is_mapped = false;
+		request.size, err);
 	return err;
 }
 
@@ -357,16 +360,24 @@ static void apple_rtkit_free_buffer(struct apple_rtkit *rtk,
 	bfr->iova = 0;
 	bfr->size = 0;
 	bfr->is_mapped = false;
+	bfr->needs_dma_sync = false;
+	bfr->private = NULL;
 }
 
 static void apple_rtkit_memcpy(struct apple_rtkit *rtk, void *dst,
 			       struct apple_rtkit_shmem *bfr, size_t offset,
 			       size_t len)
 {
+	if (bfr->needs_dma_sync)
+		dma_sync_single_range_for_cpu(rtk->dev, bfr->iova, offset, len,
+					      DMA_FROM_DEVICE);
 	if (bfr->iomem)
 		memcpy_fromio(dst, bfr->iomem + offset, len);
 	else
 		memcpy(dst, bfr->buffer + offset, len);
+	if (bfr->needs_dma_sync)
+		dma_sync_single_range_for_device(rtk->dev, bfr->iova, offset, len,
+						 DMA_FROM_DEVICE);
 }
 
 static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
@@ -431,14 +442,19 @@ static void apple_rtkit_ioreport_rx(struct apple_rtkit *rtk, u64 msg)
 
 static void apple_rtkit_syslog_rx_init(struct apple_rtkit *rtk, u64 msg)
 {
-	rtk->syslog_n_entries = FIELD_GET(APPLE_RTKIT_SYSLOG_N_ENTRIES, msg);
-	rtk->syslog_msg_size = FIELD_GET(APPLE_RTKIT_SYSLOG_MSG_SIZE, msg);
+	size_t entries = FIELD_GET(APPLE_RTKIT_SYSLOG_N_ENTRIES, msg);
+	size_t size = FIELD_GET(APPLE_RTKIT_SYSLOG_MSG_SIZE, msg);
+	char *buffer = NULL;
 
-	rtk->syslog_msg_buffer = kzalloc(rtk->syslog_msg_size, GFP_KERNEL);
-
-	dev_dbg(rtk->dev,
-		"RTKit: syslog initialized: entries: %zd, msg_size: %zd\n",
-		rtk->syslog_n_entries, rtk->syslog_msg_size);
+	if (entries && size)
+		buffer = kzalloc(size, GFP_KERNEL);
+	/* The ordered RX worker is the sole user of this host-only buffer. */
+	kfree(rtk->syslog_msg_buffer);
+	rtk->syslog_msg_buffer = buffer;
+	rtk->syslog_n_entries = entries;
+	rtk->syslog_msg_size = size;
+	dev_dbg(rtk->dev, "RTKit: syslog initialized: entries: %zd, msg_size: %zd\n",
+		entries, size);
 }
 
 static bool should_crop_syslog_char(char c)
@@ -471,7 +487,9 @@ static void apple_rtkit_syslog_rx_log(struct apple_rtkit *rtk, u64 msg)
 			"RTKit: received syslog message but no syslog_buffer.buffer or syslog_buffer.iomem\n");
 		goto done;
 	}
-	if (idx > rtk->syslog_n_entries) {
+	if (!rtk->syslog_msg_size || entry_size < rtk->syslog_msg_size ||
+	    idx >= rtk->syslog_n_entries ||
+	    idx >= rtk->syslog_buffer.size / entry_size) {
 		dev_warn(rtk->dev, "RTKit: syslog index %d out of range\n",
 			 idx);
 		goto done;

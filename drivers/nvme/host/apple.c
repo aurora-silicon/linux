@@ -25,6 +25,8 @@
 #include <linux/jiffies.h>
 #include <linux/kref.h>
 #include <linux/mempool.h>
+#include <linux/mm.h>
+#include <linux/overflow.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pm_runtime.h>
@@ -87,10 +89,6 @@
  */
 #define NVME_MAX_KB_SZ 4096
 #define NVME_MAX_SEGS  127
-
-#define APPLE_NVME_INHERITED_RTKIT_RANGES_PROP \
-	"apple,inherited-rtkit-buffer-ranges"
-#define APPLE_NVME_MAX_INHERITED_RTKIT_RANGES 8
 
 /*
  * This controller comes with an embedded IOMMU known as NVMMU.
@@ -213,6 +211,7 @@ struct apple_nvme {
 	struct apple_rtkit *rtk;
 	struct reset_control *reset;
 	bool owns_rtkit;
+	bool inherited_rtkit;
 
 	struct dma_pool *prp_page_pool;
 	struct dma_pool *prp_small_pool;
@@ -342,35 +341,48 @@ static void apple_nvme_rtkit_crashed(void *cookie, const void *crashlog, size_t 
 static bool apple_nvme_in_inherited_rtkit_range(struct apple_nvme *anv,
 						 struct apple_rtkit_shmem *bfr)
 {
-	u64 ranges[APPLE_NVME_MAX_INHERITED_RTKIT_RANGES * 2];
-	int count;
+	phys_addr_t last;
+	unsigned long pfn, last_pfn;
 
-	count = of_property_count_u64_elems(anv->dev->of_node,
-					    APPLE_NVME_INHERITED_RTKIT_RANGES_PROP);
-	if (count < 2 || count > ARRAY_SIZE(ranges) || count % 2)
+	if (!anv->inherited_rtkit || !bfr->size ||
+	    check_add_overflow((phys_addr_t)bfr->iova,
+			       (phys_addr_t)bfr->size - 1, &last) ||
+	    !IS_ALIGNED(bfr->iova, dma_get_cache_alignment()) ||
+	    !IS_ALIGNED(bfr->size, dma_get_cache_alignment()) ||
+	    !apple_sart_is_inherited_region(anv->sart, bfr->iova, bfr->size))
 		return false;
-	if (of_property_read_u64_array(anv->dev->of_node,
-				       APPLE_NVME_INHERITED_RTKIT_RANGES_PROP,
-				       ranges, count))
+
+	/* A range property or a partial System RAM intersection does not prove
+	 * ownership. Every page must be reserved and present in the linear map.
+	 * Native m1n1 reserves the predecessor's inherited allocation prefix.
+	 * RAM excluded by a resident EL2 stage needs a separate cache contract.
+	 */
+	if (region_intersects(bfr->iova, bfr->size, IORESOURCE_SYSTEM_RAM,
+			      IORES_DESC_NONE) != REGION_INTERSECTS)
 		return false;
+	last_pfn = PHYS_PFN(last);
+	for (pfn = PHYS_PFN(bfr->iova); pfn <= last_pfn; pfn++) {
+		struct page *page;
 
-	for (int i = 0; i < count; i += 2) {
-		u64 start = ranges[i];
-		u64 size = ranges[i + 1];
-
-		if (bfr->iova >= start && bfr->size <= size &&
-		    bfr->iova - start <= size - bfr->size)
-			return true;
+		if (!pfn_valid(pfn))
+			return false;
+		page = pfn_to_page(pfn);
+		if (!PageReserved(page) || PageHighMem(page) ||
+		    !virt_addr_valid(page_to_virt(page)))
+			return false;
 	}
-
-	return false;
+	return true;
 }
+
+/* A retained DMA mapping must also retain its device context. */
+struct apple_nvme_rtkit_mapping {
+	struct device *dev;
+};
 
 static int apple_nvme_sart_dma_setup(void *cookie,
 				     struct apple_rtkit_shmem *bfr)
 {
 	struct apple_nvme *anv = cookie;
-	bool inherited_shared;
 	int ret;
 
 	if (READ_ONCE(anv->quarantined) || READ_ONCE(anv->removing))
@@ -378,53 +390,60 @@ static int apple_nvme_sart_dma_setup(void *cookie,
 	if (!bfr->size)
 		return -EINVAL;
 	if (bfr->iova) {
-		/*
-		 * A live post-M4 handoff retains the RTKit buffers allocated by
-		 * Stage 1.  Their identity IOVAs remain SART-authorized and the
-		 * firmware requests that the new owner map, rather than replace,
-		 * them.  Never accept this path for an ordinary Linux-owned session.
-		 *
-		 * A resident Stage 1 may deliberately live outside the RAM exposed
-		 * to its Linux guest.  Such a buffer is safe to retain only when the
-		 * resident owner explicitly grants its exact SART range in the DT and
-		 * maps that range into the guest.  Retained post-M4 firmware does not
-		 * reliably resume admin I/O after this buffer is replaced.
-		 */
-		if (!anv->owns_rtkit)
-			return -EINVAL;
+		struct apple_nvme_rtkit_mapping *mapping;
+		dma_addr_t dma;
+		void *buffer;
 
-		inherited_shared = apple_nvme_in_inherited_rtkit_range(anv, bfr);
-		if (region_intersects(bfr->iova, bfr->size,
-				      IORESOURCE_SYSTEM_RAM, IORES_DESC_NONE) ==
-			    REGION_INTERSECTS ||
-		    inherited_shared) {
-			bfr->buffer = memremap(bfr->iova, bfr->size, MEMREMAP_WB);
-			if (!bfr->buffer)
-				return -ENOMEM;
-			bfr->is_mapped = true;
-			bfr->private = anv;
-			if (inherited_shared)
-				dev_info(anv->dev,
-					 "mapping resident-EL2 inherited RTKit buffer: %pad+0x%zx\n",
-					 &bfr->iova, bfr->size);
-			return 0;
+		if (!apple_nvme_in_inherited_rtkit_range(anv, bfr))
+			return -EINVAL;
+		mapping = kzalloc_obj(*mapping);
+		if (!mapping)
+			return -ENOMEM;
+		buffer = memremap(bfr->iova, bfr->size, MEMREMAP_WB);
+		if (!buffer) {
+			kfree(mapping);
+			return -ENOMEM;
 		}
 
-		return -EINVAL;
+		/* Firmware keeps the old identity IOVA. A bounce/remapped address
+		 * cannot replace it. Skip synchronization until that is verified,
+		 * and never copy a rejected bounce buffer over the live data.
+		 */
+		dma = dma_map_single_attrs(anv->dev, buffer, bfr->size,
+					   DMA_FROM_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
+		if (dma_mapping_error(anv->dev, dma)) {
+			ret = -ENOMEM;
+			goto unmap_buffer;
+		}
+		if (dma != bfr->iova) {
+			dma_unmap_single_attrs(anv->dev, dma, bfr->size,
+					       DMA_FROM_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
+			ret = -EINVAL;
+			goto unmap_buffer;
+		}
+		dma_sync_single_for_device(anv->dev, dma, bfr->size, DMA_FROM_DEVICE);
+		mapping->dev = get_device(anv->dev);
+		bfr->buffer = buffer;
+		bfr->is_mapped = true;
+		bfr->needs_dma_sync = true;
+		bfr->private = mapping;
+		return 0;
+
+unmap_buffer:
+		memunmap(buffer);
+		kfree(mapping);
+		return ret;
 	}
 
-	bfr->buffer =
-		dma_alloc_coherent(anv->dev, bfr->size, &bfr->iova, GFP_KERNEL);
+	bfr->buffer = dma_alloc_coherent(anv->dev, bfr->size, &bfr->iova, GFP_KERNEL);
 	if (!bfr->buffer)
 		return -ENOMEM;
-
 	ret = apple_sart_add_allowed_region(anv->sart, bfr->iova, bfr->size);
 	if (ret) {
 		dma_free_coherent(anv->dev, bfr->size, bfr->buffer, bfr->iova);
 		bfr->buffer = NULL;
-		return -ENOMEM;
+		return ret;
 	}
-
 	return 0;
 }
 
@@ -432,12 +451,15 @@ static void apple_nvme_sart_dma_destroy(void *cookie,
 					struct apple_rtkit_shmem *bfr)
 {
 	struct apple_nvme *anv = cookie;
+	struct apple_nvme_rtkit_mapping *mapping = bfr->private;
 
-	if (bfr->private == anv) {
+	if (mapping) {
+		dma_unmap_single(mapping->dev, bfr->iova, bfr->size, DMA_FROM_DEVICE);
 		memunmap(bfr->buffer);
+		put_device(mapping->dev);
+		kfree(mapping);
 		return;
 	}
-
 	apple_sart_remove_allowed_region(anv->sart, bfr->iova, bfr->size);
 	dma_free_coherent(anv->dev, bfr->size, bfr->buffer, bfr->iova);
 }
@@ -2259,6 +2281,8 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	 * traffic can race the later reset work and be dropped as undiscovered.
 	 */
 	inherited_rtkit = apple_nvme_can_adopt_rtkit(anv);
+	/* Publish admission before the initializer enables mailbox RX. */
+	anv->inherited_rtkit = inherited_rtkit;
 	if (anv->hw->needs_ioq_registers)
 		dev_info(dev, "post-M4 firmware handoff: CC=%#x CSTS=%#x adopt=%d\n",
 			 readl(anv->mmio_nvme + NVME_REG_CC),

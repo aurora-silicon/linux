@@ -18,6 +18,7 @@ properties:
   compatible:
     items:
       - enum:
+          - apple,baku-pmic
           - apple,maverick-pmic
           - apple,sera-pmic
           - apple,stowe-pmic

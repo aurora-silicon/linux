@@ -22,6 +22,8 @@
  * @size:      Size of the shared memory buffer.
  * @iova:      Device VA of shared memory buffer.
  * @is_mapped: Shared memory buffer is managed by the co-processor.
+ * @needs_dma_sync: Provider mapped this RAM with DMA_FROM_DEVICE on the RTKit
+ *                 device. Synchronize cache ownership around CPU reads.
  * @private:   Private data pointer for the parent driver.
  */
 
@@ -31,6 +33,7 @@ struct apple_rtkit_shmem {
 	size_t size;
 	dma_addr_t iova;
 	bool is_mapped;
+	bool needs_dma_sync;
 	void *private;
 };
 
@@ -46,11 +49,12 @@ struct apple_rtkit_shmem {
  *                 should return true if it handled the message. If it
  *                 returns false, the message will be passed on to the
  *                 worker thread.
- * @shmem_setup:   Setup shared memory buffer. If bfr.is_iomem is true the
- *                 buffer is managed by the co-processor and needs to be mapped.
- *                 Otherwise the buffer is managed by Linux and needs to be
- *                 allocated. If not specified dma_alloc_coherent is used.
- *                 Called in process context.
+ * @shmem_setup:   Setup shared memory buffer. A nonzero input iova requests a
+ *                 firmware-owned mapping; validate ownership before mapping.
+ *                 Otherwise allocate a Linux-owned buffer. On failure undo any
+ *                 partial setup. Do not retain the temporary descriptor pointer.
+ *                 If not specified dma_alloc_coherent is used. Called in process
+ *                 context.
  * @shmem_destroy: Undo the shared memory buffer setup in shmem_setup. If not
  *                 specified dma_free_coherent is used. Called in process
  *                 context.
