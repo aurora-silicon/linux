@@ -39,6 +39,9 @@ properties:
               - apple,t6031-admac
           - const: apple,t8122-admac
       - const: apple,t8122-admac
+      - items:
+          - const: apple,t8140-admac
+          - const: apple,admac
 
   reg:
     maxItems: 1
@@ -64,6 +67,15 @@ properties:
   iommus:
     minItems: 1
     maxItems: 2
+
+  apple,dma-range:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 2
+    maxItems: 2
+    description:
+      Host DMA allocation window as a base and nonzero size. T8140 ADMAC
+      instances share firmware-owned AOP DART roots and use windows assigned
+      to their own streams. If absent, the DART allocation aperture applies.
 
   power-domains:
     maxItems: 1
