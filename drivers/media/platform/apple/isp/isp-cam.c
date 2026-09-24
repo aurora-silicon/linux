@@ -2,6 +2,7 @@
 /* Copyright 2023 Eileen Yoon <eyn@gmx.com> */
 
 #include <linux/firmware.h>
+#include <linux/unaligned.h>
 
 #include "isp-cam.h"
 #include "isp-cmd.h"
@@ -15,6 +16,8 @@ struct isp_setfile {
 	u32 magic;
 	const char *path;
 	size_t size;
+	/* Zero means that the entire transfer must be present in the file. */
+	size_t file_size;
 };
 
 // clang-format off
@@ -44,6 +47,12 @@ static const struct isp_setfile isp_setfiles[] = {
 	[ISP_IMX514_2820_04] = {0x514, 0x28200405, "apple/isp_2820_04XX.dat", 0xa198},
 	[ISP_IMX558_1921_01] = {0x558, 0x19210106, "apple/isp_1921_01XX.dat", 0xad40},
 	[ISP_IMX558_1922_02] = {0x558, 0x19220201, "apple/isp_1922_02XX.dat", 0xad40},
+	/*
+	 * Header version 0x21, the only layout the macOS 26 H17 firmware
+	 * parses; 0xcba6 bytes on disk, loaded zero-padded to the 0xcbc0 the
+	 * kext passes.
+	 */
+	[ISP_IMX558_1925_03] = {0x558, 0x19250306, "apple/isp_1925_03XX.dat", 0xcbc0, 0xcba6},
 	[ISP_IMX603_7920_01] = {0x603, 0x79200109, "apple/isp_7920_01XX.dat", 0xad2c},
 	[ISP_IMX603_7920_02] = {0x603, 0x79200205, "apple/isp_7920_02XX.dat", 0xad2c},
 	[ISP_IMX603_7921_01] = {0x603, 0x79210104, "apple/isp_7921_01XX.dat", 0xad90},
@@ -114,7 +123,12 @@ static int isp_ch_get_sensor_id(struct apple_isp *isp, u32 ch)
 		id = ISP_IMX514_2820_01;
 		break;
 	case 0x558:
-		id = ISP_IMX558_1921_01;
+		/*
+		 * The H17 (t8140) firmware faults in FlowLSC200 on the header
+		 * version 0x20 files; it needs isp_1925_03XX.dat.
+		 */
+		id = isp->hw->gen == ISP_GEN_T8140 ? ISP_IMX558_1925_03 :
+						      ISP_IMX558_1921_01;
 		break;
 	case 0x603:
 		id = ISP_IMX603_7920_01;
@@ -166,29 +180,6 @@ static int isp_ch_get_sensor_id(struct apple_isp *isp, u32 ch)
 	return err;
 }
 
-static int isp_ch_get_camera_preset(struct apple_isp *isp, u32 ch, u32 ps)
-{
-	int err = 0;
-
-	struct cmd_ch_camera_config *args; /* Too big to allocate on stack */
-	args = kzalloc(sizeof(*args), GFP_KERNEL);
-	if (!args)
-		return -ENOMEM;
-
-	err = isp_cmd_ch_camera_config_get(isp, ch, ps, args);
-	if (err)
-		goto exit;
-
-	pr_info("apple-isp: ps: CISP_CMD_CH_CAMERA_CONFIG_GET: %d\n", ps);
-	print_hex_dump(KERN_INFO, "apple-isp: ps: ", DUMP_PREFIX_NONE, 32, 4,
-		       args, sizeof(*args), false);
-
-exit:
-	kfree(args);
-
-	return err;
-}
-
 static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
 {
 	struct isp_format *fmt = isp_get_format(isp, ch);
@@ -203,27 +194,19 @@ static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
 	if (err)
 		goto exit;
 
-	dev_info(isp->dev, "found sensor %x %s on ch %d\n", args->version,
-		 args->module_sn, ch);
+	dev_dbg(isp->dev, "found sensor %x on channel %d\n", args->version, ch);
 
 	fmt->version = args->version;
-
-	pr_info("apple-isp: ch: CISP_CMD_CH_INFO_GET: %d\n", ch);
-	print_hex_dump(KERN_INFO, "apple-isp: ch: ", DUMP_PREFIX_NONE, 32, 4,
-		       args, sizeof(*args), false);
-
-	for (u32 ps = 0; ps < args->num_presets; ps++) {
-		isp_ch_get_camera_preset(isp, ch, ps);
-	}
 
 	err = isp_ch_get_sensor_id(isp, ch);
 	if (err ||
 	    (fmt->id != ISP_IMX248_1820_01 && fmt->id != ISP_IMX558_1921_01 &&
-	     fmt->id != ISP_IMX364_8720_01)) {
+	     fmt->id != ISP_IMX558_1925_03 && fmt->id != ISP_IMX364_8720_01)) {
 		dev_err(isp->dev,
 			"ch %d: unsupported sensor. Please file a bug report with hardware info & dmesg trace.\n",
 			ch);
-		return -ENODEV;
+		err = -ENODEV;
+		goto exit;
 	}
 
 exit:
@@ -242,10 +225,6 @@ static int isp_detect_camera(struct apple_isp *isp)
 	err = isp_cmd_config_get(isp, &args);
 	if (err)
 		return err;
-
-	pr_info("apple-isp: CISP_CMD_CONFIG_GET: \n");
-	print_hex_dump(KERN_INFO, "apple-isp: ", DUMP_PREFIX_NONE, 32, 4, &args,
-		       sizeof(args), false);
 
 	if (!args.num_channels) {
 		dev_err(isp->dev, "did not detect any channels\n");
@@ -291,6 +270,13 @@ int apple_isp_detect_camera(struct apple_isp *isp)
 
 	err = isp_detect_camera(isp);
 
+	if (isp->fw_persistent) {
+		/* the firmware stays up; the channel is configured at first use */
+		if (err)
+			apple_isp_firmware_halt(isp);
+		return err;
+	}
+
 	isp_cmd_flicker_sensor_set(isp, 0);
 
 	isp_cmd_ch_stop(isp, 0);
@@ -305,6 +291,7 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 {
 	struct isp_format *fmt = isp_get_format(isp, ch);
 	const struct isp_setfile *setfile = &isp_setfiles[fmt->id];
+	size_t file_size = setfile->file_size ?: setfile->size;
 	const struct firmware *fw;
 	u32 magic;
 	int err;
@@ -316,21 +303,30 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 		return err;
 	}
 
-	if (fw->size < setfile->size) {
+	if (file_size < sizeof(magic) || file_size > setfile->size ||
+	    fw->size < file_size) {
 		dev_err(isp->dev, "setfile too small (0x%zx/0x%zx)\n", fw->size,
-			setfile->size);
+			file_size);
 		release_firmware(fw);
 		return -EINVAL;
 	}
 
-	magic = be32_to_cpup((__be32 *)fw->data);
+	magic = get_unaligned_be32(fw->data);
 	if (magic != setfile->magic) {
 		dev_err(isp->dev, "setfile '%s' corrupted?\n", setfile->path);
 		release_firmware(fw);
 		return -EINVAL;
 	}
 
-	memcpy(isp->data_surf->virt, (void *)fw->data, setfile->size);
+	if (!isp->data_surf || !isp->data_surf->virt ||
+	    setfile->size > isp->data_surf->size) {
+		release_firmware(fw);
+		return -ENOSPC;
+	}
+
+	/* Ignore any on-disk padding: the transfer tail is always zero. */
+	memset(isp->data_surf->virt, 0, setfile->size);
+	memcpy(isp->data_surf->virt, fw->data, file_size);
 	release_firmware(fw);
 
 	return isp_cmd_ch_set_file_load(isp, ch, isp->data_surf->iova,
@@ -456,8 +452,152 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
 	return 0;
 }
 
+/*
+ * t8140 / H17 firmware: the channel configuration in the order the native
+ * J700 host replayed from macOS 25G83 (ASAHI-PARITY-IMX558-2026-09-16).
+ * Deltas from isp_ch_configure_capture(): no AE_FD_SCENE_METERING_CONFIG_SET
+ * (crashes this firmware), the rendered pool geometry is published,
+ * LOCAL_RAW_BUFFER_ENABLE is mandatory (the sensor feeds the ISP-local raw
+ * path; without it the firmware waits for a host RAW pool) and the stream
+ * ends with MASTER_SLAVE_SYNC_MODE_SET(0).
+ */
+static int isp_ch_configure_capture_t8140(struct apple_isp *isp, u32 ch)
+{
+	struct isp_format *fmt = isp_get_format(isp, ch);
+	int err;
+
+	isp_cmd_flicker_sensor_set(isp, 0);
+
+	err = isp_ch_load_setfile(isp, ch);
+	if (err) {
+		dev_err(isp->dev, "warning: calibration data not loaded: %d\n",
+			err);
+		if (err == -EINTR)
+			return err;
+	}
+
+	if (isp->hw->lpdp) {
+		err = isp_cmd_ch_lpdp_hs_receiver_tuning_set(isp, ch, 1, 15);
+		if (err)
+			return err;
+	}
+
+	err = isp_cmd_ch_sbs_enable(isp, ch, 1);
+	if (err)
+		return err;
+
+	err = isp_cmd_ch_camera_config_select(isp, ch, fmt->preset->index);
+	if (err)
+		return err;
+
+	err = isp_cmd_ch_buffer_recycle_mode_set(
+		isp, ch, CISP_BUFFER_RECYCLE_MODE_EMPTY_ONLY);
+	if (err)
+		return err;
+
+	err = isp_cmd_ch_buffer_recycle_start(isp, ch);
+	if (err)
+		return err;
+
+	err = isp_cmd_ch_crop_set(isp, ch, fmt->preset->crop_offset.x,
+				  fmt->preset->crop_offset.y,
+				  fmt->preset->crop_size.x,
+				  fmt->preset->crop_size.y);
+	if (err)
+		return err;
+
+	err = isp_cmd_ch_output_config_set(isp, ch, fmt->preset->output_dim.x,
+					   fmt->preset->output_dim.y,
+					   fmt->strides, CISP_COLORSPACE_REC709,
+					   CISP_OUTPUT_FORMAT_YUV_2PLANE);
+	if (err)
+		return err;
+
+	err = isp_cmd_ch_ae_frame_rate_max_set(isp, ch, ISP_FRAME_RATE_DEN);
+	if (err)
+		return err;
+
+	err = isp_cmd_ch_ae_frame_rate_min_set(isp, ch, ISP_FRAME_RATE_DEN2);
+	if (err)
+		return err;
+
+	err = isp_cmd_ch_buffer_pool_config_set(isp, ch, CISP_POOL_TYPE_META);
+	if (err)
+		return err;
+
+	err = isp_cmd_ch_buffer_pool_config_set(isp, ch,
+						CISP_POOL_TYPE_META_CAPTURE);
+	if (err)
+		return err;
+
+	err = isp_cmd_ch_buffer_pool_config_set_rendered(
+		isp, ch, ISP_MAX_BUFFERS, fmt->plane_size[0], fmt->strides[0],
+		fmt->plane_size[1], fmt->strides[1]);
+	if (err)
+		return err;
+
+	err = isp_cmd_ch_local_raw_buffer_enable(isp, ch, 1);
+	if (err)
+		return err;
+
+	err = isp_cmd_ch_preview_stream_set(isp, ch, 1);
+	if (err)
+		return err;
+
+	err = isp_cmd_ch_cnr_start(isp, ch);
+	if (err)
+		return err;
+
+	err = isp_cmd_ch_mbnr_enable(isp, ch, 0, ISP_MBNR_MODE_ENABLE, 1);
+	if (err)
+		return err;
+
+	err = isp_cmd_apple_ch_ae_metering_mode_set(isp, ch, 3);
+	if (err)
+		return err;
+
+	err = isp_cmd_ch_ae_stability_set(isp, ch, 32);
+	if (err)
+		return err;
+
+	err = isp_cmd_ch_ae_stability_to_stable_set(isp, ch, 20);
+	if (err)
+		return err;
+
+	err = isp_cmd_ch_sif_pixel_format_set(isp, ch);
+	if (err)
+		return err;
+
+	err = isp_cmd_apple_ch_temporal_filter_start(isp, ch, isp->temporal_filter);
+	if (err)
+		return err;
+
+	err = isp_cmd_apple_ch_motion_history_start(isp, ch);
+	if (err)
+		return err;
+
+	err = isp_cmd_apple_ch_temporal_filter_enable(isp, ch);
+	if (err)
+		return err;
+
+	err = isp_cmd_ch_master_slave_sync_mode_set(isp, ch, 0);
+	if (err)
+		return err;
+
+	return 0;
+}
+
 static int isp_configure_capture(struct apple_isp *isp)
 {
+	/*
+	 * Resident firmware (t8140): CH_STOP drops the channel's fusion/raw
+	 * configuration (a bare CH_START afterwards asserts in
+	 * CDSControllerH8 "fusionType == RAW_FUSION_TYPE"), so the channel is
+	 * configured again for every stream.
+	 */
+	if (isp->hw->gen == ISP_GEN_T8140)
+		return isp_ch_configure_capture_t8140(isp, isp->current_ch);
+
 	return isp_ch_configure_capture(isp, isp->current_ch);
 }
 
@@ -488,11 +628,21 @@ void apple_isp_stop_camera(struct apple_isp *isp)
 
 int apple_isp_start_capture(struct apple_isp *isp)
 {
-	return isp_cmd_ch_start(isp, 0); // TODO channel mask
+	int err;
+
+	/* t8140: the ISP watchdog must be kicked from before CH_START */
+	apple_isp_wdt_start(isp);
+
+	err = isp_cmd_ch_start(isp, 0); // TODO channel mask
+	if (err)
+		apple_isp_wdt_stop(isp);
+
+	return err;
 }
 
 void apple_isp_stop_capture(struct apple_isp *isp)
 {
 	isp_cmd_ch_stop(isp, 0); // TODO channel mask
 	isp_cmd_ch_buffer_return(isp, isp->current_ch);
+	apple_isp_wdt_stop(isp);
 }

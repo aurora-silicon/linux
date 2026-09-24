@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright 2023 Eileen Yoon <eyn@gmx.com> */
 
+#include <linux/module.h>
+
 #include "isp-iommu.h"
 #include "isp-ipc.h"
 #include "isp-regs.h"
@@ -112,7 +114,7 @@ static int chan_handle_once(struct apple_isp *isp, struct isp_channel *chan)
 
 	err = chan->ops->handle(isp, chan);
 	if (err < 0) {
-		dev_err(isp->dev, "%s: handler failed: %d)\n", chan->name, err);
+		dev_err_ratelimited(isp->dev, "%s: handler failed: %d)\n", chan->name, err);
 		return err;
 	}
 
@@ -160,7 +162,8 @@ static inline bool chan_tx_done(struct apple_isp *isp, struct isp_channel *chan)
 	dma_rmb();
 
 	chan_read_msg(isp, chan, &chan->rsp);
-	if ((chan->rsp.arg0) == (chan->req.arg0 | ISP_IPC_FLAG_ACK)) {
+	if (isp_fw_iova(isp, chan->rsp.arg0) ==
+	    isp_fw_iova(isp, chan->req.arg0 | ISP_IPC_FLAG_ACK)) {
 		chan_update_cursor(chan);
 		return true;
 	}
@@ -194,25 +197,30 @@ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
 	return 0;
 }
 
+static bool fwlog;
+module_param(fwlog, bool, 0644);
+MODULE_PARM_DESC(fwlog, "Enable bounded ISP firmware terminal logging (debugging only)");
+
 int ipc_tm_handle(struct apple_isp *isp, struct isp_channel *chan)
 {
 	struct isp_message *rsp = &chan->rsp;
-
-#ifdef APPLE_ISP_DEBUG
 	struct isp_message *req = &chan->req;
 	char buf[512];
-	dma_addr_t iova = req->arg0 & ~ISP_IPC_FLAG_TERMINAL_ACK;
+	dma_addr_t iova = isp_fw_iova(isp, req->arg0 & ~ISP_IPC_FLAG_TERMINAL_ACK);
 	u32 size = req->arg1;
-	if (iova && size && size < sizeof(buf) &&
-	    isp->log_surf) {
+
+	if (fwlog && iova && size &&
+	    size < sizeof(buf) && isp->log_surf) {
 		void *p = apple_isp_translate(isp, isp->log_surf, iova, size);
 		if (p) {
 			size = min_t(u32, size, 512);
 			memcpy(buf, p, size);
-			isp_dbg(isp, "ISPASC: %.*s", size, buf);
+			while (size && (buf[size - 1] == '\n' || buf[size - 1] == '\r' ||
+					buf[size - 1] == '\0'))
+				size--;
+			dev_info_ratelimited(isp->dev, "ISPASC: %.*s\n", size, buf);
 		}
 	}
-#endif
 
 	rsp->arg0 = ISP_IPC_FLAG_ACK;
 	rsp->arg1 = 0x0;
