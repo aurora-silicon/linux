@@ -2611,6 +2611,8 @@ F:	include/linux/soc/apple/*
 F:	include/uapi/drm/asahi_drm.h
 F:	net/bluetooth/brcm.c
 F:	net/bluetooth/brcm.h
+F:	rust/kernel/iio/common/aop_sensors.rs
+F:	rust/kernel/soc/apple/*
 
 ARM/ARTPEC MACHINE SUPPORT
 M:	Jesper Nilsson <jesper.nilsson@axis.com>
