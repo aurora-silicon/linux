@@ -81,7 +81,32 @@ properties:
 
       The SART address filter is documented in iommu/apple,sart.yaml.
 
+  apple,rtkit-handoff:
+    $ref: /schemas/types.yaml#/definitions/string
+    const: nvme-disabled-v1
+    description: |
+      Runtime bootloader assertion for T8140. The producer owns a healthy,
+      negotiated RTKit session with both AP and IOP power on, has stopped all
+      controller DMA with CC.EN and CSTS.RDY clear, and retains the firmware,
+      SART mappings and every shared allocation. All retained RAM must be
+      covered by ordinary FDT memory reservations (not no-map). The consumer
+      must verify the running IOP, boot status, absence of CSTS.CFS and stopped
+      controller before adopting the session, then validate each borrowed
+      buffer against reserved RAM and the protected SART regions. This
+      property must be generated from live ownership, never stored in a
+      static board device tree or inferred solely from persistent registers.
+
 allOf:
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              const: apple,t8140-nvme-ans2
+    then:
+      properties:
+        apple,rtkit-handoff: false
+
   - if:
       properties:
         compatible:

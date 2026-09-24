@@ -188,6 +188,9 @@ struct apple_nvme {
 	struct device *dev;
 	struct kref ref;
 	struct mutex disable_lock;
+	spinlock_t event_lock;
+	bool reset_ready;
+	bool handoff_disabled;
 	struct list_head quarantine_node;
 	resource_size_t controller_start;
 	bool quarantined;
@@ -300,14 +303,42 @@ static void apple_nvme_put_resource_owner(void *data)
 
 static bool apple_nvme_can_adopt_rtkit(struct apple_nvme *anv)
 {
-	/* CPU_RUN and BOOT_STATUS survive an inactive firmware session. */
-	return anv->hw->needs_ioq_registers &&
-		(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
-		 APPLE_ANS_COPROC_CPU_CONTROL_RUN) &&
-		readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS) ==
-		 APPLE_ANS_BOOT_STATUS_OK &&
-		(readl(anv->mmio_nvme + NVME_REG_CC) & NVME_CC_ENABLE) &&
-		(readl(anv->mmio_nvme + NVME_REG_CSTS) & NVME_CSTS_RDY);
+	u32 cc, csts;
+
+	if (!anv->hw->needs_ioq_registers ||
+	    !(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
+	      APPLE_ANS_COPROC_CPU_CONTROL_RUN) ||
+	    readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS) != APPLE_ANS_BOOT_STATUS_OK)
+		return false;
+	cc = readl(anv->mmio_nvme + NVME_REG_CC);
+	csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
+	if (csts & NVME_CSTS_CFS)
+		return false;
+
+	/* CPU_RUN/BOOT_STATUS alone survive inactive sessions. A disabled
+	 * controller requires the producer's explicit live-session contract.
+	 * Borrowed buffers still require reserved RAM and protected SART ranges.
+	 */
+	if (anv->handoff_disabled)
+		return !(cc & NVME_CC_ENABLE) && !(csts & NVME_CSTS_RDY);
+	return (cc & NVME_CC_ENABLE) && (csts & NVME_CSTS_RDY);
+}
+
+static int apple_nvme_read_handoff(struct apple_nvme *anv)
+{
+	static const char expected[] = "nvme-disabled-v1";
+	const char *value;
+	int len;
+
+	value = of_get_property(anv->dev->of_node, "apple,rtkit-handoff", &len);
+	if (!value)
+		return of_property_present(anv->dev->of_node, "apple,rtkit-handoff") ?
+			-EINVAL : 0;
+	if (!of_device_is_compatible(anv->dev->of_node, "apple,t8140-nvme-ans2") ||
+	    len != sizeof(expected) || memcmp(value, expected, sizeof(expected)))
+		return -EINVAL;
+	anv->handoff_disabled = true;
+	return apple_nvme_can_adopt_rtkit(anv) ? 0 : -EIO;
 }
 
 static inline struct apple_nvme *queue_to_apple_nvme(struct apple_nvme_queue *q)
@@ -328,14 +359,32 @@ static unsigned int apple_nvme_queue_depth(struct apple_nvme_queue *q)
 	return anv->hw->max_queue_depth;
 }
 
+static void apple_nvme_set_reset_ready(struct apple_nvme *anv, bool ready)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&anv->event_lock, flags);
+	anv->reset_ready = ready;
+	spin_unlock_irqrestore(&anv->event_lock, flags);
+}
+
 static void apple_nvme_rtkit_crashed(void *cookie, const void *crashlog, size_t crashlog_size)
 {
 	struct apple_nvme *anv = cookie;
+	unsigned long flags;
 
 	if (READ_ONCE(anv->quarantined) || READ_ONCE(anv->removing))
 		return;
 	dev_warn(anv->dev, "RTKit crashed; unable to recover without a reboot");
-	nvme_reset_ctrl(&anv->ctrl);
+	/* RX may run inside RTKit initialization, before ctrl/admin_q exist.
+	 * Probe's initial reset observes RTKit's latched crash state. Serialize
+	 * callback scheduling with closing this gate before work cancellation.
+	 */
+	spin_lock_irqsave(&anv->event_lock, flags);
+	if (anv->reset_ready && !READ_ONCE(anv->quarantined) &&
+	    !READ_ONCE(anv->removing))
+		nvme_reset_ctrl(&anv->ctrl);
+	spin_unlock_irqrestore(&anv->event_lock, flags);
 }
 
 static bool apple_nvme_in_inherited_rtkit_range(struct apple_nvme *anv,
@@ -1212,6 +1261,7 @@ static void apple_nvme_quarantine(struct apple_nvme *anv, int error)
 
 	/* Called under disable_lock after both dispatch queues are quiesced. */
 	WRITE_ONCE(anv->quarantined, true);
+	apple_nvme_set_reset_ready(anv, false);
 	disable_irq(anv->irq);
 	for (i = 0; i < anv->pd_count && anv->pd_count > 1; i++)
 		pm_runtime_get_noresume(anv->pd_dev[i]);
@@ -2089,6 +2139,7 @@ static void apple_nvme_free_rtkit(void *data)
 {
 	struct apple_nvme *anv = data;
 
+	apple_nvme_set_reset_ready(anv, false);
 	guard(mutex)(&anv->disable_lock);
 	if (anv->hw->needs_ioq_registers)
 		apple_rtkit_free_retaining_buffers(anv->rtk);
@@ -2125,6 +2176,8 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	struct resource *resource;
 	struct apple_nvme *anv, *held;
 	bool inherited_rtkit;
+	unsigned long quirks = NVME_QUIRK_SKIP_CID_GEN | NVME_QUIRK_IDENTIFY_CNS |
+			       NVME_QUIRK_ADMIN_PAGE_ALIGN;
 	int ret;
 
 	resource = platform_get_resource_byname(pdev, IORESOURCE_MEM, "nvme");
@@ -2146,6 +2199,7 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	anv->dev = get_device(dev);
 	kref_init(&anv->ref);
 	mutex_init(&anv->disable_lock);
+	spin_lock_init(&anv->event_lock);
 	INIT_LIST_HEAD(&anv->quarantine_node);
 	anv->controller_start = resource->start;
 	ret = devm_add_action_or_reset(dev, apple_nvme_put_resource_owner, anv);
@@ -2199,6 +2253,12 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		}
 	} else {
 		anv->mmio_nvmmu = anv->mmio_nvme;
+	}
+
+	ret = apple_nvme_read_handoff(anv);
+	if (ret) {
+		dev_err_probe(dev, ret, "Invalid live firmware handoff\n");
+		goto put_dev;
 	}
 
 	if (anv->hw->has_lsq_nvmmu) {
@@ -2318,9 +2378,13 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		anv->crypto_profile.dev = dev;
 	}
 
-	ret = nvme_init_ctrl(&anv->ctrl, anv->dev, &nvme_ctrl_ops,
-			     NVME_QUIRK_SKIP_CID_GEN | NVME_QUIRK_IDENTIFY_CNS |
-			     NVME_QUIRK_ADMIN_PAGE_ALIGN);
+	/* T8140 completed an fsynced overwrite that reverted after abrupt reset.
+	 * Explicit flushes persisted the preceding data. Use the block layer's
+	 * post-write flush sequence instead of relying on native FUA here.
+	 */
+	if (of_device_is_compatible(dev->of_node, "apple,t8140-nvme-ans2"))
+		quirks |= NVME_QUIRK_BROKEN_FUA;
+	ret = nvme_init_ctrl(&anv->ctrl, anv->dev, &nvme_ctrl_ops, quirks);
 	if (ret) {
 		dev_err_probe(dev, ret, "Failed to initialize nvme_ctrl");
 		goto put_dev;
@@ -2371,6 +2435,7 @@ static int apple_nvme_probe(struct platform_device *pdev)
 	 */
 	if (anv->hw->needs_ioq_registers)
 		__module_get(THIS_MODULE);
+	apple_nvme_set_reset_ready(anv, true);
 	nvme_reset_ctrl(&anv->ctrl);
 	async_schedule(apple_nvme_async_probe, anv);
 
@@ -2389,6 +2454,7 @@ static void apple_nvme_remove(struct platform_device *pdev)
 	struct apple_nvme *anv = platform_get_drvdata(pdev);
 
 	WRITE_ONCE(anv->removing, true);
+	apple_nvme_set_reset_ready(anv, false);
 	nvme_change_ctrl_state(&anv->ctrl, NVME_CTRL_DELETING);
 	if (anv->hw->needs_ioq_registers && apple_nvme_disable(anv, true))
 		return;
@@ -2425,6 +2491,7 @@ static void apple_nvme_shutdown(struct platform_device *pdev)
 	struct apple_nvme *anv = platform_get_drvdata(pdev);
 
 	WRITE_ONCE(anv->removing, true);
+	apple_nvme_set_reset_ready(anv, false);
 	flush_delayed_work(&anv->flush_dwork);
 	if (apple_nvme_disable(anv, true))
 		return;

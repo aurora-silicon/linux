@@ -208,8 +208,12 @@ static int apple_mbox_poll_locked(struct apple_mbox *mbox)
 {
 	struct apple_mbox_msg msg;
 	int ret = 0;
+	u32 mbox_ctrl;
 
-	u32 mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
+	/* A stopped receiver may still have firmware traffic in its FIFO. */
+	if (!mbox->rx)
+		return 0;
+	mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
 
 	while (!(mbox_ctrl & mbox->hw->control_empty)) {
 		msg.msg0 = readq_relaxed(mbox->regs + mbox->hw->i2a_recv0);

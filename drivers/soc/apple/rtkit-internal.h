@@ -39,6 +39,7 @@ struct apple_rtkit {
 	unsigned int iop_power_state;
 	unsigned int ap_power_state;
 	bool crashed;
+	bool shutting_down;
 
 	DECLARE_BITMAP(endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 
@@ -50,6 +51,8 @@ struct apple_rtkit {
 	char *syslog_msg_buffer;
 	size_t syslog_n_entries;
 	size_t syslog_msg_size;
+	/* The predecessor's INIT geometry has not been observed by this owner. */
+	bool syslog_inherited;
 
 	struct workqueue_struct *wq;
 };
