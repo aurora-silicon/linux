@@ -26,6 +26,11 @@ properties:
       The I2C address of the CS42L42.
     maxItems: 1
 
+  '#sound-dai-cells':
+    const: 0
+
+  sound-name-prefix: true
+
   VP-supply:
     description:
       VP power supply.

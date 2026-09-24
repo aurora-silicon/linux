@@ -7,6 +7,7 @@
 
 #include <linux/bits.h>
 #include <linux/bitfield.h>
+#include <linux/dma-mapping.h>
 #include <linux/device.h>
 #include <linux/init.h>
 #include <linux/module.h>
@@ -51,15 +52,28 @@
 #define REG_TX_SRAM_SIZE	0x0094
 #define REG_RX_SRAM_SIZE	0x0098
 
-#define REG_CHAN_CTL(ch)	(0x8000 + (ch) * 0x200)
+/*
+ * Per-channel control blocks.  Up to t8122 every channel (TX and RX
+ * interleaved as raw channel numbers) has a block at 0x8000 + ch * 0x200.
+ * The t8140 "evolved" ADMAC keeps the TX blocks at 0x8000 + tx * 0x200 and
+ * moves the RX blocks to 0xc000 + rx * 0x200 (measured on J700: the
+ * headphone channel base-ns TX2 answers at +0x8400, not +0x8800).  The
+ * descriptor/report FIFO ports and the start/stop bits are unchanged.
+ */
+#define REG_CHAN_BASE_LEGACY(ch)	(0x8000 + (ch) * 0x200)
+#define REG_CHAN_BASE_EVOLVED(ch)	(((ch) & 1 ? 0xc000 : 0x8000) + ((ch) / 2) * 0x200)
+#define REG_CHAN_BASE(ad, ch)		((ad)->evolved_layout ? \
+					 REG_CHAN_BASE_EVOLVED(ch) : REG_CHAN_BASE_LEGACY(ch))
+
+#define REG_CHAN_CTL(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x00)
 #define REG_CHAN_CTL_RST_RINGS	BIT(0)
 
-#define REG_DESC_RING(ch)	(0x8070 + (ch) * 0x200)
-#define REG_REPORT_RING(ch)	(0x8074 + (ch) * 0x200)
+#define REG_DESC_RING(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x70)
+#define REG_REPORT_RING(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x74)
 
-#define REG_RESIDUE(ch)		(0x8064 + (ch) * 0x200)
+#define REG_RESIDUE(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x64)
 
-#define REG_BUS_WIDTH(ch)	(0x8040 + (ch) * 0x200)
+#define REG_BUS_WIDTH(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x40)
 
 #define BUS_WIDTH_WORD_SIZE	GENMASK(3, 0)
 #define BUS_WIDTH_FRAME_SIZE	GENMASK(7, 4)
@@ -69,11 +83,11 @@
 #define BUS_WIDTH_FRAME_2_WORDS	0x10
 #define BUS_WIDTH_FRAME_4_WORDS	0x20
 
-#define REG_CHAN_SRAM_CARVEOUT(ch)	(0x8050 + (ch) * 0x200)
+#define REG_CHAN_SRAM_CARVEOUT(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x50)
 #define CHAN_SRAM_CARVEOUT_SIZE		GENMASK(31, 16)
 #define CHAN_SRAM_CARVEOUT_BASE		GENMASK(15, 0)
 
-#define REG_CHAN_FIFOCTL(ch)	(0x8054 + (ch) * 0x200)
+#define REG_CHAN_FIFOCTL(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x54)
 #define CHAN_FIFOCTL_LIMIT	GENMASK(31, 16)
 #define CHAN_FIFOCTL_THRESHOLD	GENMASK(15, 0)
 
@@ -83,8 +97,8 @@
 #define REG_TX_INTSTATE(idx)		(0x0030 + (idx) * 4)
 #define REG_RX_INTSTATE(idx)		(0x0040 + (idx) * 4)
 #define REG_GLOBAL_INTSTATE(idx)	(0x0050 + (idx) * 4)
-#define REG_CHAN_INTSTATUS(ch, idx)	(0x8010 + (ch) * 0x200 + (idx) * 4)
-#define REG_CHAN_INTMASK(ch, idx)	(0x8020 + (ch) * 0x200 + (idx) * 4)
+#define REG_CHAN_INTSTATUS(ad, ch, idx)	(REG_CHAN_BASE(ad, ch) + 0x10 + (idx) * 4)
+#define REG_CHAN_INTMASK(ad, ch, idx)	(REG_CHAN_BASE(ad, ch) + 0x20 + (idx) * 4)
 
 struct admac_data;
 struct admac_tx;
@@ -132,6 +146,7 @@ struct admac_data {
 	struct admac_sram txcache, rxcache;
 
 	bool set_unk28;
+	bool evolved_layout;
 	int irq;
 	int irq_index;
 	int nchannels;
@@ -154,6 +169,7 @@ struct admac_tx {
 
 struct admac_hw {
 	bool set_unk28;
+	bool evolved_layout;
 };
 
 static int admac_alloc_sram_carveout(struct admac_data *ad,
@@ -325,7 +341,7 @@ static void admac_cyclic_write_desc(struct admac_data *ad, int channo,
 	int i;
 
 	for (i = 0; i < 4; i++) {
-		if (readl_relaxed(ad->base + REG_DESC_RING(channo)) & RING_FULL)
+		if (readl_relaxed(ad->base + REG_DESC_RING(ad, channo)) & RING_FULL)
 			break;
 		admac_cyclic_write_one_desc(ad, channo, tx);
 	}
@@ -359,10 +375,10 @@ static u32 admac_cyclic_read_residue(struct admac_data *ad, int channo,
 	int nreports;
 	size_t pos;
 
-	ring1 =    readl_relaxed(ad->base + REG_REPORT_RING(channo));
-	residue1 = readl_relaxed(ad->base + REG_RESIDUE(channo));
-	ring2 =    readl_relaxed(ad->base + REG_REPORT_RING(channo));
-	residue2 = readl_relaxed(ad->base + REG_RESIDUE(channo));
+	ring1 =    readl_relaxed(ad->base + REG_REPORT_RING(ad, channo));
+	residue1 = readl_relaxed(ad->base + REG_RESIDUE(ad, channo));
+	ring2 =    readl_relaxed(ad->base + REG_REPORT_RING(ad, channo));
+	residue2 = readl_relaxed(ad->base + REG_RESIDUE(ad, channo));
 
 	if (residue2 > residue1) {
 		/*
@@ -423,9 +439,9 @@ static void admac_start_chan(struct admac_chan *adchan)
 	u32 startbit = 1 << (adchan->no / 2);
 
 	writel_relaxed(STATUS_DESC_DONE | STATUS_ERR,
-		       ad->base + REG_CHAN_INTSTATUS(adchan->no, ad->irq_index));
+		       ad->base + REG_CHAN_INTSTATUS(ad, adchan->no, ad->irq_index));
 	writel_relaxed(STATUS_DESC_DONE | STATUS_ERR,
-		       ad->base + REG_CHAN_INTMASK(adchan->no, ad->irq_index));
+		       ad->base + REG_CHAN_INTMASK(ad, adchan->no, ad->irq_index));
 
 	switch (admac_chan_direction(adchan->no)) {
 	case DMA_MEM_TO_DEV:
@@ -463,8 +479,8 @@ static void admac_reset_rings(struct admac_chan *adchan)
 	struct admac_data *ad = adchan->host;
 
 	writel_relaxed(REG_CHAN_CTL_RST_RINGS,
-		       ad->base + REG_CHAN_CTL(adchan->no));
-	writel_relaxed(0, ad->base + REG_CHAN_CTL(adchan->no));
+		       ad->base + REG_CHAN_CTL(ad, adchan->no));
+	writel_relaxed(0, ad->base + REG_CHAN_CTL(ad, adchan->no));
 }
 
 static void admac_start_current_tx(struct admac_chan *adchan)
@@ -473,7 +489,7 @@ static void admac_start_current_tx(struct admac_chan *adchan)
 	int ch = adchan->no;
 
 	admac_reset_rings(adchan);
-	writel_relaxed(0, ad->base + REG_CHAN_CTL(ch));
+	writel_relaxed(0, ad->base + REG_CHAN_CTL(ad, ch));
 
 	admac_cyclic_write_one_desc(ad, ch, adchan->current_tx);
 	admac_start_chan(adchan);
@@ -573,7 +589,7 @@ static int admac_alloc_chan_resources(struct dma_chan *chan)
 		return ret;
 
 	writel_relaxed(adchan->carveout,
-		       ad->base + REG_CHAN_SRAM_CARVEOUT(adchan->no));
+		       ad->base + REG_CHAN_SRAM_CARVEOUT(ad, adchan->no));
 	return 0;
 }
 
@@ -613,7 +629,7 @@ static int admac_drain_reports(struct admac_data *ad, int channo)
 	for (count = 0; count < 4; count++) {
 		u32 countval_hi, countval_lo, unk1, flags;
 
-		if (readl_relaxed(ad->base + REG_REPORT_RING(channo)) & RING_EMPTY)
+		if (readl_relaxed(ad->base + REG_REPORT_RING(ad, channo)) & RING_EMPTY)
 			break;
 
 		countval_lo = readl_relaxed(ad->base + REG_REPORT_READ(channo));
@@ -632,21 +648,21 @@ static void admac_handle_status_err(struct admac_data *ad, int channo)
 {
 	bool handled = false;
 
-	if (readl_relaxed(ad->base + REG_DESC_RING(channo)) & RING_ERR) {
-		writel_relaxed(RING_ERR, ad->base + REG_DESC_RING(channo));
+	if (readl_relaxed(ad->base + REG_DESC_RING(ad, channo)) & RING_ERR) {
+		writel_relaxed(RING_ERR, ad->base + REG_DESC_RING(ad, channo));
 		dev_err_ratelimited(ad->dev, "ch%d descriptor ring error\n", channo);
 		handled = true;
 	}
 
-	if (readl_relaxed(ad->base + REG_REPORT_RING(channo)) & RING_ERR) {
-		writel_relaxed(RING_ERR, ad->base + REG_REPORT_RING(channo));
+	if (readl_relaxed(ad->base + REG_REPORT_RING(ad, channo)) & RING_ERR) {
+		writel_relaxed(RING_ERR, ad->base + REG_REPORT_RING(ad, channo));
 		dev_err_ratelimited(ad->dev, "ch%d report ring error\n", channo);
 		handled = true;
 	}
 
 	if (unlikely(!handled)) {
 		dev_err(ad->dev, "ch%d unknown error, masking errors as cause of IRQs\n", channo);
-		admac_modify(ad, REG_CHAN_INTMASK(channo, ad->irq_index),
+		admac_modify(ad, REG_CHAN_INTMASK(ad, channo, ad->irq_index),
 			     STATUS_ERR, 0);
 	}
 }
@@ -658,7 +674,7 @@ static void admac_handle_status_desc_done(struct admac_data *ad, int channo)
 	int nreports;
 
 	writel_relaxed(STATUS_DESC_DONE,
-		       ad->base + REG_CHAN_INTSTATUS(channo, ad->irq_index));
+		       ad->base + REG_CHAN_INTSTATUS(ad, channo, ad->irq_index));
 
 	spin_lock_irqsave(&adchan->lock, flags);
 	nreports = admac_drain_reports(ad, channo);
@@ -678,7 +694,7 @@ static void admac_handle_status_desc_done(struct admac_data *ad, int channo)
 
 static void admac_handle_chan_int(struct admac_data *ad, int no)
 {
-	u32 cause = readl_relaxed(ad->base + REG_CHAN_INTSTATUS(no, ad->irq_index));
+	u32 cause = readl_relaxed(ad->base + REG_CHAN_INTSTATUS(ad, no, ad->irq_index));
 
 	if (cause & STATUS_ERR)
 		admac_handle_status_err(ad, no);
@@ -753,7 +769,7 @@ static int admac_device_config(struct dma_chan *chan,
 	struct admac_data *ad = adchan->host;
 	bool is_tx = admac_chan_direction(adchan->no) == DMA_MEM_TO_DEV;
 	int wordsize = 0;
-	u32 bus_width = readl_relaxed(ad->base + REG_BUS_WIDTH(adchan->no)) &
+	u32 bus_width = readl_relaxed(ad->base + REG_BUS_WIDTH(ad, adchan->no)) &
 		~(BUS_WIDTH_WORD_SIZE | BUS_WIDTH_FRAME_SIZE);
 
 	if (ad->set_unk28) {
@@ -798,7 +814,7 @@ static int admac_device_config(struct dma_chan *chan,
 		return -EINVAL;
 	}
 
-	writel_relaxed(bus_width, ad->base + REG_BUS_WIDTH(adchan->no));
+	writel_relaxed(bus_width, ad->base + REG_BUS_WIDTH(ad, adchan->no));
 
 	/*
 	 * By FIFOCTL_LIMIT we seem to set the maximal number of bytes allowed to be
@@ -809,7 +825,7 @@ static int admac_device_config(struct dma_chan *chan,
 	 */
 	writel_relaxed(FIELD_PREP(CHAN_FIFOCTL_LIMIT, 0x30 * wordsize)
 		       | FIELD_PREP(CHAN_FIFOCTL_THRESHOLD, 0x18 * wordsize),
-		       ad->base + REG_CHAN_FIFOCTL(adchan->no));
+		       ad->base + REG_CHAN_FIFOCTL(ad, adchan->no));
 
 	return 0;
 }
@@ -832,6 +848,15 @@ static int admac_probe(struct platform_device *pdev)
 	if (!hw)
 		return -EINVAL;
 
+	/*
+	 * Descriptors carry 64-bit addresses; the t8140 dart-aop streams put
+	 * the audio windows above 4 GiB (apple,dma-range), so the default
+	 * 32-bit coherent mask would leave the PCM buffers unallocatable.
+	 */
+	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(42));
+	if (err)
+		return dev_err_probe(&pdev->dev, err, "Failed to set DMA mask\n");
+
 	ad = devm_kzalloc(&pdev->dev, struct_size(ad, channels, nchannels), GFP_KERNEL);
 	if (!ad)
 		return -ENOMEM;
@@ -840,6 +865,7 @@ static int admac_probe(struct platform_device *pdev)
 	ad->dev = &pdev->dev;
 	ad->nchannels = nchannels;
 	ad->set_unk28 = hw->set_unk28;
+	ad->evolved_layout = hw->evolved_layout;
 	mutex_init(&ad->cache_alloc_lock);
 
 	/*
@@ -962,7 +988,13 @@ static const struct admac_hw admac_t8122_hw = {
 	.set_unk28 = true,
 };
 
+static const struct admac_hw admac_t8140_hw = {
+	.set_unk28 = true,
+	.evolved_layout = true,
+};
+
 static const struct of_device_id admac_of_match[] = {
+	{ .compatible = "apple,t8140-admac", .data = &admac_t8140_hw },
 	{ .compatible = "apple,t8122-admac", .data = &admac_t8122_hw },
 	{ .compatible = "apple,t8103-admac", .data = &admac_t8013_hw },
 	{ .compatible = "apple,admac", .data = &admac_t8013_hw },

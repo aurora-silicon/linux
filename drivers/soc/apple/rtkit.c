@@ -705,17 +705,21 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					  dev_name(rtk->dev));
 	if (!rtk->wq) {
 		ret = -ENOMEM;
-		goto free_rtk;
+		goto stop_mbox;
 	}
 
 	ret = apple_mbox_start(rtk->mbox);
 	if (ret)
-		goto destroy_wq;
+		goto stop_mbox;
 
 	return rtk;
 
-destroy_wq:
-	destroy_workqueue(rtk->wq);
+stop_mbox:
+	apple_mbox_stop(rtk->mbox);
+	if (rtk->wq)
+		destroy_workqueue(rtk->wq);
+	rtk->mbox->rx = NULL;
+	rtk->mbox->cookie = NULL;
 free_rtk:
 	kfree(rtk);
 	return ERR_PTR(ret);
@@ -945,6 +949,8 @@ void apple_rtkit_free(struct apple_rtkit *rtk)
 {
 	apple_mbox_stop(rtk->mbox);
 	destroy_workqueue(rtk->wq);
+	rtk->mbox->rx = NULL;
+	rtk->mbox->cookie = NULL;
 
 	apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
@@ -955,6 +961,24 @@ void apple_rtkit_free(struct apple_rtkit *rtk)
 	kfree(rtk);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_free);
+
+void apple_rtkit_free_retaining_buffers(struct apple_rtkit *rtk)
+{
+	/* No callback or worker may retain the consumer's context after return. */
+	apple_mbox_stop(rtk->mbox);
+	destroy_workqueue(rtk->wq);
+	rtk->mbox->rx = NULL;
+	rtk->mbox->cookie = NULL;
+
+	/*
+	 * A failed shutdown provides no guarantee that firmware stopped DMA.
+	 * Retain shared buffers, including custom allocation contexts, rather
+	 * than returning their storage to an allocator while it may be live.
+	 */
+	kfree(rtk->syslog_msg_buffer);
+	kfree(rtk);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_free_retaining_buffers);
 
 static void apple_rtkit_free_wrapper(void *data)
 {
