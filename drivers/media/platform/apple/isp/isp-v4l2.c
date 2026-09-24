@@ -2,6 +2,7 @@
 /* Copyright 2023 Eileen Yoon <eyn@gmx.com> */
 
 #include <linux/module.h>
+#include <linux/limits.h>
 
 #include <media/media-device.h>
 #include <media/v4l2-common.h>
@@ -40,49 +41,56 @@ struct isp_buflist {
 	u64 type;
 	u64 num_buffers;
 	struct isp_buflist_buffer buffers[];
-};
+} __packed;
+static_assert(sizeof(struct isp_buflist) == 0x10);
 
 int ipc_bt_handle(struct apple_isp *isp, struct isp_channel *chan)
 {
 	struct isp_message *req = &chan->req, *rsp = &chan->rsp;
 	struct isp_buffer *tmp, *buf;
 	struct isp_buflist *bl;
-	u32 count;
+	u64 count;
 	int err = 0;
 
-	/* printk("H2T: 0x%llx 0x%llx 0x%llx\n", (long long)req->arg0,
-	       (long long)req->arg1, (long long)req->arg2); */
-
-	if (req->arg1 < sizeof(struct isp_buflist)) {
-		dev_err(isp->dev, "%s: Bad length 0x%llx\n", chan->name,
+	if (req->arg1 < sizeof(struct isp_buflist) || req->arg1 > SIZE_MAX) {
+		dev_err_ratelimited(isp->dev, "%s: Bad length 0x%llx\n", chan->name,
 			req->arg1);
 		return -EIO;
 	}
 
-	bl = apple_isp_translate(isp, isp->bt_surf, req->arg0, req->arg1);
+	bl = apple_isp_translate(isp, isp->bt_surf, isp_fw_iova(isp, req->arg0),
+				 req->arg1);
+	if (!bl)
+		return -EIO;
 
 	count = bl->num_buffers;
-	if (count > (req->arg1 - sizeof(struct isp_buffer)) /
+	if (count > (req->arg1 - sizeof(*bl)) /
 			    sizeof(struct isp_buflist_buffer)) {
-		dev_err(isp->dev, "%s: Bad length 0x%llx\n", chan->name,
+		dev_err_ratelimited(isp->dev, "%s: Bad length 0x%llx\n", chan->name,
 			req->arg1);
 		return -EIO;
 	}
 
 	spin_lock(&isp->buf_lock);
-	for (int i = 0; i < count; i++) {
+	for (u64 i = 0; i < count; i++) {
 		struct isp_buflist_buffer *bufd = &bl->buffers[i];
-
-		/* printk("Return: 0x%llx (%d)\n", bufd->iovas[0],
-		       bufd->pool_type); */
 
 		if (bufd->pool_type == 0) {
 			for (int j = 0; j < ARRAY_SIZE(isp->meta_surfs); j++) {
 				struct isp_surf *meta = isp->meta_surfs[j];
-				if ((u32)bufd->iovas[0] == (u32)meta->iova) {
+
+				if (meta && (u32)bufd->iovas[0] == (u32)meta->iova) {
 					WARN_ON(!meta->submitted);
 					meta->submitted = false;
 				}
+			}
+		} else if (bufd->pool_type == ISP_POOL_TYPE_CAPMETA_SUBMIT &&
+			   isp->hw->gen == ISP_GEN_T8140) {
+			for (int j = 0; j < ARRAY_SIZE(isp->capmeta_surfs); j++) {
+				struct isp_surf *meta = isp->capmeta_surfs[j];
+
+				if (meta && (u32)bufd->iovas[0] == (u32)meta->iova)
+					meta->submitted = false;
 			}
 		} else {
 			list_for_each_entry_safe_reverse(
@@ -115,7 +123,12 @@ int ipc_bt_handle(struct apple_isp *isp, struct isp_channel *chan)
 	return err;
 }
 
-static int isp_submit_buffers(struct apple_isp *isp)
+/*
+ * t8140: the macOS H17 receiver queues the META pool before CH_START and the
+ * capture-meta and rendered pools right after it (the native J700 host kept
+ * that order for every proven stream).  pre_start selects the first half.
+ */
+static int isp_submit_buffers(struct apple_isp *isp, bool pre_start)
 {
 	struct isp_format *fmt = isp_get_current_format(isp);
 	struct isp_channel *chan = isp->chan_bh;
@@ -123,10 +136,28 @@ static int isp_submit_buffers(struct apple_isp *isp)
 	struct isp_buffer *buf, *tmp;
 	unsigned long flags;
 	size_t offset;
+	size_t command_size;
+	unsigned int num_rendered = 0;
 	int err;
+	bool split = isp->hw->gen == ISP_GEN_T8140;
 
-	struct isp_buflist *bl = isp->cmd_virt;
-	struct isp_buflist_buffer *bufd = &bl->buffers[0];
+	struct isp_buflist *bl;
+	struct isp_buflist_buffer *bufd;
+
+	/* Space for all metadata pools and at most one rendered pool. */
+	command_size = max_t(size_t, ISP_IPC_BUFEXC_STAT_SIZE,
+			     sizeof(*bl) + sizeof(*bufd) *
+			     (ARRAY_SIZE(isp->meta_surfs) +
+			      ARRAY_SIZE(isp->capmeta_surfs) + ISP_MAX_BUFFERS));
+	bl = apple_isp_ipc_translate(isp, isp->cmd_iova, command_size);
+	if (!bl || (void *)bl != isp->cmd_virt)
+		return -EIO;
+	if (!fmt->num_planes || fmt->num_planes > ISP_MAX_PLANES)
+		return -EINVAL;
+
+	/* Include unused planes, reserved words and the minimum IPC span. */
+	memset(bl, 0, command_size);
+	bufd = &bl->buffers[0];
 
 	bl->type = 1;
 	bl->num_buffers = 0;
@@ -135,11 +166,8 @@ static int isp_submit_buffers(struct apple_isp *isp)
 	for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++) {
 		struct isp_surf *meta = isp->meta_surfs[i];
 
-		if (meta->submitted)
+		if (!meta || meta->submitted)
 			continue;
-
-		/* printk("Submit: 0x%llx .. 0x%llx (meta)\n", meta->iova,
-		       meta->iova + meta->size); */
 
 		bufd->num_planes = 1;
 		bufd->pool_type = 0;
@@ -151,8 +179,28 @@ static int isp_submit_buffers(struct apple_isp *isp)
 		meta->submitted = true;
 	}
 
-	while ((buf = list_first_entry_or_null(&isp->bufs_pending,
-					       struct isp_buffer, link))) {
+	if (split && pre_start)
+		goto send;
+
+	for (int i = 0; split && i < ARRAY_SIZE(isp->capmeta_surfs); i++) {
+		struct isp_surf *meta = isp->capmeta_surfs[i];
+
+		if (!meta || meta->submitted)
+			continue;
+
+		bufd->num_planes = 1;
+		bufd->pool_type = ISP_POOL_TYPE_CAPMETA_SUBMIT;
+		bufd->iovas[0] = meta->iova;
+		bufd->flags[0] = 0x40000000;
+		bufd++;
+		bl->num_buffers++;
+
+		meta->submitted = true;
+	}
+
+	while (num_rendered < ISP_MAX_BUFFERS &&
+	       (buf = list_first_entry_or_null(&isp->bufs_pending,
+					    struct isp_buffer, link))) {
 		memset(bufd, 0, sizeof(*bufd));
 
 		bufd->num_planes = fmt->num_planes;
@@ -164,12 +212,9 @@ static int isp_submit_buffers(struct apple_isp *isp)
 			bufd->flags[j] = 0x40000000;
 			offset += fmt->plane_size[j];
 		}
-
-		/* printk("Submit: 0x%llx .. 0x%llx (render)\n",
-		       buf->surfs[0].iova,
-		       buf->surfs[0].iova + buf->surfs[0].size); */
 		bufd++;
 		bl->num_buffers++;
+		num_rendered++;
 
 		/*
 		 * Queue the buffer as submitted and release the lock for now.
@@ -179,6 +224,7 @@ static int isp_submit_buffers(struct apple_isp *isp)
 		list_move_tail(&buf->link, &isp->bufs_submitted);
 	}
 
+send:
 	spin_unlock_irqrestore(&isp->buf_lock, flags);
 
 	req->arg0 = isp->cmd_iova;
@@ -210,9 +256,15 @@ static int isp_submit_buffers(struct apple_isp *isp)
 			}
 			for (int j = 0; j < ARRAY_SIZE(isp->meta_surfs); j++) {
 				struct isp_surf *meta = isp->meta_surfs[j];
-				if (bufd->iovas[0] == meta->iova) {
+
+				if (meta && bufd->iovas[0] == meta->iova)
 					meta->submitted = false;
-				}
+			}
+			for (int j = 0; split && j < ARRAY_SIZE(isp->capmeta_surfs); j++) {
+				struct isp_surf *meta = isp->capmeta_surfs[j];
+
+				if (meta && bufd->iovas[0] == meta->iova)
+					meta->submitted = false;
 			}
 		}
 
@@ -334,7 +386,7 @@ static void isp_vb2_buf_queue(struct vb2_buffer *vb)
 	spin_unlock_irqrestore(&isp->buf_lock, flags);
 
 	if (test_bit(ISP_STATE_STREAMING, &isp->state) && !empty)
-		isp_submit_buffers(isp);
+		isp_submit_buffers(isp, false);
 }
 
 static int apple_isp_start_streaming(struct apple_isp *isp)
@@ -347,7 +399,16 @@ static int apple_isp_start_streaming(struct apple_isp *isp)
 		goto release_buffers;
 	}
 
-	err = isp_submit_buffers(isp);
+	if (isp->hw->gen == ISP_GEN_T8140) {
+		/* Channel pools are reconfigured; the firmware stays resident. */
+		for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++)
+			isp->meta_surfs[i]->submitted = false;
+		for (int i = 0; i < ARRAY_SIZE(isp->capmeta_surfs); i++)
+			if (isp->capmeta_surfs[i])
+				isp->capmeta_surfs[i]->submitted = false;
+	}
+
+	err = isp_submit_buffers(isp, true);
 	if (err) {
 		dev_err(isp->dev, "failed to send initial batch: %d\n", err);
 		goto stop_camera;
@@ -357,6 +418,15 @@ static int apple_isp_start_streaming(struct apple_isp *isp)
 	if (err) {
 		dev_err(isp->dev, "failed to start capture: %d\n", err);
 		goto stop_camera;
+	}
+
+	if (isp->hw->gen == ISP_GEN_T8140) {
+		err = isp_submit_buffers(isp, false);
+		if (err) {
+			dev_err(isp->dev, "failed to send the post-start batch: %d\n", err);
+			apple_isp_stop_capture(isp);
+			goto stop_camera;
+		}
 	}
 
 	set_bit(ISP_STATE_STREAMING, &isp->state);
@@ -818,6 +888,17 @@ int apple_isp_setup_video(struct apple_isp *isp)
 		}
 	}
 
+	for (int i = 0; isp->hw->capture_meta_size &&
+			i < ARRAY_SIZE(isp->capmeta_surfs); i++) {
+		isp->capmeta_surfs[i] =
+			isp_alloc_surface_vmap(isp, isp->hw->capture_meta_size);
+		if (!isp->capmeta_surfs[i]) {
+			isp_err(isp, "failed to alloc capture meta surface\n");
+			err = -ENOMEM;
+			goto surf_cleanup;
+		}
+	}
+
 	media_device_init(&isp->mdev);
 	isp->v4l2_dev.mdev = &isp->mdev;
 	isp->mdev.ops = &isp_media_device_ops;
@@ -841,7 +922,7 @@ int apple_isp_setup_video(struct apple_isp *isp)
 
 	vbq->drv_priv = isp;
 	vbq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	vbq->io_modes = VB2_MMAP;
+	vbq->io_modes = VB2_MMAP | VB2_DMABUF;
 	vbq->dev = isp->dev;
 	vbq->ops = &isp_vb2_ops;
 	vbq->mem_ops = &vb2_dma_sg_memops;
@@ -867,6 +948,7 @@ int apple_isp_setup_video(struct apple_isp *isp)
 	vdev->vfl_dir = VFL_DIR_RX;
 	vdev->release = video_device_release_empty;
 	vdev->lock = &isp->video_lock;
+	vdev->entity.flags |= MEDIA_ENT_FL_DEFAULT;
 	strscpy(vdev->name, APPLE_ISP_DEVICE_NAME, sizeof(vdev->name));
 	video_set_drvdata(vdev, isp);
 
@@ -885,6 +967,11 @@ media_unregister:
 media_cleanup:
 	media_device_cleanup(&isp->mdev);
 surf_cleanup:
+	for (int i = 0; i < ARRAY_SIZE(isp->capmeta_surfs); i++) {
+		if (isp->capmeta_surfs[i])
+			isp_free_surface(isp, isp->capmeta_surfs[i]);
+		isp->capmeta_surfs[i] = NULL;
+	}
 	for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++) {
 		if (isp->meta_surfs[i])
 			isp_free_surface(isp, isp->meta_surfs[i]);
@@ -900,6 +987,11 @@ void apple_isp_remove_video(struct apple_isp *isp)
 	v4l2_device_unregister(&isp->v4l2_dev);
 	media_device_unregister(&isp->mdev);
 	media_device_cleanup(&isp->mdev);
+	for (int i = 0; i < ARRAY_SIZE(isp->capmeta_surfs); i++) {
+		if (isp->capmeta_surfs[i])
+			isp_free_surface(isp, isp->capmeta_surfs[i]);
+		isp->capmeta_surfs[i] = NULL;
+	}
 	for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++) {
 		if (isp->meta_surfs[i])
 			isp_free_surface(isp, isp->meta_surfs[i]);

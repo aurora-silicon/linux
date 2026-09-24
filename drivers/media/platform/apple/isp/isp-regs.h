@@ -23,11 +23,51 @@
 #define ISP_COPROC_IRQ_MASK_4  0x1400a10
 #define ISP_COPROC_IRQ_MASK_5  0x1400a14
 
+/*
+ * t8140 / ISP17a (J700).  Offsets from the macOS 25G83 AppleH16CamIn MMIO
+ * trace replayed by the native m1n1 host (artifacts/j700-camera-20260910,
+ * post-reference511 native-2026-09-16 runs).
+ */
+#define ISP_COPROC_CONTROL_T8140    0x1600044
+#define ISP_COPROC_STATUS_T8140     0x1600040
+#define ISP_COPROC_FABRIC_0_T8140   0x748
+#define ISP_COPROC_FABRIC_1_T8140   0x848
+#define ISP_COPROC_FABRIC_2_T8140   0x948
+#define ISP_COPROC_FABRIC_3_T8140   0xa50
+#define ISP_COPROC_IRQ_MASK_0_T8140 0x1600a00
+#define ISP_COPROC_IRQ_MASK_1_T8140 0x1600a04
+#define ISP_COPROC_IRQ_MASK_2_T8140 0x1600a08
+#define ISP_COPROC_IRQ_MASK_3_T8140 0x1600a0c
+#define ISP_COPROC_RESET_ACK_0_T8140 0x1600818
+#define ISP_COPROC_RESET_ACK_1_T8140 0x160081c
+
 #define ISP_MBOX_IRQ_INTERRUPT    0x00
 #define ISP_MBOX_IRQ_ENABLE       0x04
 #define ISP_MBOX_IRQ_ENABLE_T6031 0x08
 #define ISP_MBOX2_IRQ_DOORBELL    0x00
 #define ISP_MBOX2_IRQ_ACK         0x0c
+
+/*
+ * t8140: doorbell/ack live at mbox+0x410 (apple_isp_hw.mbox2_offset) and two
+ * more enable words plus a steering write accompany IRQ_ENABLE (+0x8).
+ */
+#define ISP_MBOX_IRQ_ENABLE_T8140   0x08
+#define ISP_MBOX_IRQ_ENABLE1_T8140  0x18
+#define ISP_MBOX_IRQ_ENABLE2_T8140  0x38
+#define ISP_MBOX_IRQ_STEER_T8140    0x73c
+#define ISP_MBOX_IRQ_ENABLE1_T8140_VAL 0x70000000
+#define ISP_MBOX_IRQ_ENABLE2_T8140_VAL 0x700000
+#define ISP_MBOX_IRQ_STEER_T8140_VAL   0x8
+
+/*
+ * EIC "mmio-wd-isp" window: kicked at 30 Hz while the sensor streams, or the
+ * H17 firmware masks every frame with its diagnostic fill.
+ */
+#define ISP_WDT_KICK       0x00
+#define ISP_WDT_RELOAD     0x08
+#define ISP_WDT_CLEAR      0x0c
+#define ISP_WDT_RELOAD_VAL 0x244140
+#define ISP_WDT_PERIOD_NS  (NSEC_PER_SEC / 30)
 
 #define ISP_GPIO_0	       0x00
 #define ISP_GPIO_1	       0x04

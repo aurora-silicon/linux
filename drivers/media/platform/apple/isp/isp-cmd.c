@@ -120,6 +120,18 @@ int isp_cmd_set_isp_pmu_base(struct apple_isp *isp, u64 pmu_base)
 	return CISP_SEND_IN(isp, args);
 }
 
+int isp_cmd_set_dsid_clr_multi_bc_reg_base(struct apple_isp *isp,
+					   u64 dsid_clr_base, u32 dsid_clr_range)
+{
+	struct cmd_set_dsid_clr_multi_bc_reg_base args = {
+		.opcode = CISP_OPCODE(CISP_CMD_SET_DSID_CLR_MULTI_BC_REG_BASE),
+		.count = 1,
+		.dsid_clr_range = dsid_clr_range,
+		.dsid_clr_base = dsid_clr_base,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
 int isp_cmd_set_dsid_clr_req_base2(struct apple_isp *isp, u64 dsid_clr_base0,
 				   u64 dsid_clr_base1, u64 dsid_clr_base2,
 				   u64 dsid_clr_base3, u32 dsid_clr_range0,
@@ -220,6 +232,20 @@ int isp_cmd_ch_info_get(struct apple_isp *isp, u32 chan,
 {
 	args->opcode = CISP_OPCODE(CISP_CMD_CH_INFO_GET);
 	args->chan = chan;
+	if (isp->hw->gen == ISP_GEN_T8140) {
+		struct cmd_ch_info_t8140 *big;
+		int err;
+
+		big = kzalloc_obj(*big);
+		if (!big)
+			return -ENOMEM;
+		big->info = *args;
+		err = CISP_SEND_OUT(isp, big);
+		if (!err)
+			*args = big->info;
+		kfree(big);
+		return err;
+	}
 	return CISP_SEND_OUT(isp, args);
 }
 
@@ -262,13 +288,19 @@ int isp_cmd_ch_buffer_return(struct apple_isp *isp, u32 chan)
 int isp_cmd_ch_set_file_load(struct apple_isp *isp, u32 chan, u64 addr,
 			     u32 size)
 {
-	if (isp->fw_compat >= ISP_FIRMWARE_V_13_5) {
+	/*
+	 * The H17 kext (H16CamInChannel::SendSetfileToFirmware) uses the
+	 * 64-bit form with an 0x18-byte reply (in 0x18 / out 0x18).
+	 */
+	if (isp->fw_compat >= ISP_FIRMWARE_V_13_5 || isp->hw->gen == ISP_GEN_T8140) {
 		struct cmd_ch_set_file_load64 args = {
 			.opcode = CISP_OPCODE(CISP_CMD_CH_SET_FILE_LOAD),
 			.chan = chan,
 			.addr = addr,
 			.size = size,
 		};
+		if (isp->hw->gen == ISP_GEN_T8140)
+			return CISP_SEND_INOUT(isp, args);
 		return CISP_SEND_IN(isp, args);
 	} else {
 		struct cmd_ch_set_file_load args = {
@@ -287,6 +319,28 @@ int isp_cmd_ch_sbs_enable(struct apple_isp *isp, u32 chan, u32 enable)
 		.opcode = CISP_OPCODE(CISP_CMD_CH_SBS_ENABLE),
 		.chan = chan,
 		.enable = enable,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
+int isp_cmd_ch_local_raw_buffer_enable(struct apple_isp *isp, u32 chan,
+				       u16 enable)
+{
+	struct cmd_ch_local_raw_buffer_enable args = {
+		.opcode = CISP_OPCODE(CISP_CMD_CH_LOCAL_RAW_BUFFER_ENABLE),
+		.chan = chan,
+		.enable = enable,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
+int isp_cmd_ch_master_slave_sync_mode_set(struct apple_isp *isp, u32 chan,
+					  u32 mode)
+{
+	struct cmd_ch_master_slave_sync_mode_set args = {
+		.opcode = CISP_OPCODE(CISP_CMD_CH_MASTER_SLAVE_SYNC_MODE_SET),
+		.chan = chan,
+		.mode = mode,
 	};
 	return CISP_SEND_IN(isp, args);
 }
@@ -402,17 +456,50 @@ int isp_cmd_ch_buffer_recycle_start(struct apple_isp *isp, u32 chan)
 
 int isp_cmd_ch_buffer_pool_config_set(struct apple_isp *isp, u32 chan, u16 type)
 {
+	u32 size = isp->hw->meta_size;
+
+	/* H17 keeps a distinct capture-metadata record size (CH_INFO_GET +0x78) */
+	if (type == CISP_POOL_TYPE_META_CAPTURE && isp->hw->capture_meta_size)
+		size = isp->hw->capture_meta_size;
+
 	struct cmd_ch_buffer_pool_config_set args = {
 		.opcode = CISP_OPCODE(CISP_CMD_CH_BUFFER_POOL_CONFIG_SET),
 		.chan = chan,
 		.type = type,
 		.count = ISP_MAX_BUFFERS,
-		.meta_size0 = isp->hw->meta_size,
-		.meta_size1 = isp->hw->meta_size,
+		.meta_size0 = size,
+		.meta_size1 = size,
 		.unk0 = 0,
 		.unk1 = 0,
 		.unk2 = 0,
 		.data_blocks = 1,
+		.compress = 0,
+	};
+	return CISP_SEND_INOUT(isp, args);
+}
+
+/*
+ * The macOS H17 receiver publishes the rendered (output) pool geometry too:
+ * plane sizes/strides in the meta-size slots and the first two "zero" words,
+ * two data blocks.  Not sent by the t8103..t8122 path.
+ */
+int isp_cmd_ch_buffer_pool_config_set_rendered(struct apple_isp *isp, u32 chan,
+					       u16 count, u32 plane0_size,
+					       u32 stride0, u32 plane1_size,
+					       u32 stride1)
+{
+	struct cmd_ch_buffer_pool_config_set args = {
+		.opcode = CISP_OPCODE(CISP_CMD_CH_BUFFER_POOL_CONFIG_SET),
+		.chan = chan,
+		.type = CISP_POOL_TYPE_RENDERED,
+		.count = count,
+		.meta_size0 = plane0_size,
+		.meta_size1 = stride0,
+		.unk0 = 0,
+		.unk1 = 0,
+		.unk2 = 0,
+		.zero = { plane1_size, stride1 },
+		.data_blocks = 2,
 		.compress = 0,
 	};
 	return CISP_SEND_INOUT(isp, args);

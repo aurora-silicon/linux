@@ -4,6 +4,7 @@
 #ifndef __ISP_DRV_H__
 #define __ISP_DRV_H__
 
+#include <linux/hrtimer.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/types.h>
@@ -24,14 +25,30 @@
 #define ISP_META_SIZE_T8103  0x4640
 #define ISP_META_SIZE_T8112  0x4840
 #define ISP_META_SIZE_T6031  0x4a40
+#define ISP_META_SIZE_T8140  0x4d00
+/* H17 (t8140) capture-metadata pool entry (CH_INFO_GET +0x78) */
+#define ISP_CAPTURE_META_SIZE_T8140 0x29fc0
 
 /* used to limit the user space buffers to the buffer_pool_config */
 #define ISP_MAX_BUFFERS 16
+
+/*
+ * MMIO windows the firmware reaches through its DART (the DAPF slices of the
+ * ADT dart-isp node), mapped 1:1 in the ISP domain as the native host did.
+ */
+struct isp_identity_window {
+	u64 base;
+	u64 size;
+};
+/* t8140: capture-metadata pool entries the H17 receiver keeps queued */
+#define ISP_CAPMETA_BUFFERS 8
+#define ISP_POOL_TYPE_CAPMETA_SUBMIT 2
 
 enum isp_generation {
 	ISP_GEN_T8103,
 	ISP_GEN_T8112,
 	ISP_GEN_T6031,
+	ISP_GEN_T8140,
 };
 
 enum isp_firmware_version {
@@ -125,6 +142,18 @@ struct apple_isp_hw {
 	u32 meta_size;
 	bool scl1;
 	bool lpdp;
+
+	/*
+	 * t8140 (ISP17a / H17 firmware): the doorbell/ack block is inside the
+	 * "mbox" window (mbox2_offset), the ASC control register moved, the
+	 * firmware takes the 0x290-byte H16 boot descriptor and the EIC's ISP
+	 * watchdog window must be petted by the host while streaming.
+	 */
+	u32 mbox2_offset;
+	u32 asc_control;
+	u32 capture_meta_size;
+	const struct isp_identity_window *identity;
+	int num_identity;
 };
 
 enum isp_sensor_id {
@@ -153,6 +182,7 @@ enum isp_sensor_id {
 	ISP_IMX514_2820_04,
 	ISP_IMX558_1921_01,
 	ISP_IMX558_1922_02,
+	ISP_IMX558_1925_03,
 	ISP_IMX603_7920_01,
 	ISP_IMX603_7920_02,
 	ISP_IMX603_7921_01,
@@ -220,15 +250,32 @@ struct apple_isp {
 	void __iomem *mbox;
 	void __iomem *gpio;
 	void __iomem *mbox2;
+	void __iomem *wdt;
+	struct hrtimer wdt_timer;
+	bool wdt_running;
 
 	struct iommu_domain *domain;
 	unsigned long shift;
+	/*
+	 * Firmware-reported IOVAs carry the DART vm-base (bit 40 on t8140)
+	 * while our tables live at the low addresses: mask before comparing
+	 * or translating anything the firmware hands back.
+	 */
+	u64 fw_iova_mask;
 	struct drm_mm iovad; /* TODO iova.c can't allocate bottom-up */
 	struct mutex iovad_lock;
 
 	struct isp_firmware {
 		u64 heap_top;
 	} fw;
+	/*
+	 * t8140: the H17 firmware does not come back from a warm restart
+	 * (no first handshake after suspend + ASC reset), so it is booted once
+	 * at probe and kept running until the driver goes away; every stream
+	 * re-configures its channel.
+	 */
+	bool fw_persistent;
+	bool fw_booted;
 
 	struct isp_surf *ipc_surf;
 	struct isp_surf *extra_surf;
@@ -236,6 +283,7 @@ struct apple_isp {
 	struct isp_surf *log_surf;
 	struct isp_surf *bt_surf;
 	struct isp_surf *meta_surfs[ISP_MAX_BUFFERS];
+	struct isp_surf *capmeta_surfs[ISP_CAPMETA_BUFFERS];
 	struct list_head gc;
 	struct workqueue_struct *wq;
 
@@ -288,6 +336,7 @@ enum {
 #define isp_err(isp, fmt, ...) \
 	dev_err((isp)->dev, "[%s] " fmt, __func__, ##__VA_ARGS__)
 
+#define isp_fw_iova(isp, x)	    ((x) & (isp)->fw_iova_mask)
 #define isp_get_format(isp, ch)	    (&(isp)->fmts[(ch)])
 #define isp_get_current_format(isp) (isp_get_format(isp, isp->current_ch))
 
