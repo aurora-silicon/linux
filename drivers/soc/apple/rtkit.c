@@ -663,9 +663,30 @@ int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_start_ep);
 
-struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
+static void apple_rtkit_mark_running(struct apple_rtkit *rtk)
+{
+	static const u8 system_endpoints[] = {
+		APPLE_RTKIT_EP_CRASHLOG,
+		APPLE_RTKIT_EP_SYSLOG,
+		APPLE_RTKIT_EP_DEBUG,
+		APPLE_RTKIT_EP_IOREPORT,
+		APPLE_RTKIT_EP_OSLOG,
+		APPLE_RTKIT_EP_TRACEKIT,
+	};
+	int i;
+
+	/* The previous owner already completed and acknowledged this EPMAP. */
+	for (i = 0; i < ARRAY_SIZE(system_endpoints); i++)
+		set_bit(system_endpoints[i], rtk->endpoints);
+
+	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_ON;
+	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_ON;
+}
+
+static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 					    const char *mbox_name, int mbox_idx,
-					    const struct apple_rtkit_ops *ops)
+					    const struct apple_rtkit_ops *ops,
+					    bool adopted)
 {
 	struct apple_rtkit *rtk;
 	int ret;
@@ -708,6 +729,10 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 		goto stop_mbox;
 	}
 
+	/* Inherited system traffic may arrive as soon as mailbox RX is armed. */
+	if (adopted)
+		apple_rtkit_mark_running(rtk);
+
 	ret = apple_mbox_start(rtk->mbox);
 	if (ret)
 		goto stop_mbox;
@@ -724,7 +749,22 @@ free_rtk:
 	kfree(rtk);
 	return ERR_PTR(ret);
 }
+
+struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
+					    const char *mbox_name, int mbox_idx,
+					    const struct apple_rtkit_ops *ops)
+{
+	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, false);
+}
 EXPORT_SYMBOL_GPL(apple_rtkit_init);
+
+struct apple_rtkit *apple_rtkit_init_adopted(struct device *dev, void *cookie,
+					    const char *mbox_name, int mbox_idx,
+					    const struct apple_rtkit_ops *ops)
+{
+	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted);
 
 static int apple_rtkit_wait_for_completion(struct completion *c)
 {
@@ -842,6 +882,16 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 	return apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_boot);
+
+int apple_rtkit_adopt_running(struct apple_rtkit *rtk)
+{
+	if (rtk->crashed)
+		return -EINVAL;
+
+	apple_rtkit_mark_running(rtk);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_adopt_running);
 
 int apple_rtkit_shutdown(struct apple_rtkit *rtk)
 {
@@ -1003,6 +1053,25 @@ struct apple_rtkit *devm_apple_rtkit_init(struct device *dev, void *cookie,
 	return rtk;
 }
 EXPORT_SYMBOL_GPL(devm_apple_rtkit_init);
+
+struct apple_rtkit *devm_apple_rtkit_init_adopted(
+	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
+	const struct apple_rtkit_ops *ops)
+{
+	struct apple_rtkit *rtk;
+	int ret;
+
+	rtk = apple_rtkit_init_adopted(dev, cookie, mbox_name, mbox_idx, ops);
+	if (IS_ERR(rtk))
+		return rtk;
+
+	ret = devm_add_action_or_reset(dev, apple_rtkit_free_wrapper, rtk);
+	if (ret)
+		return ERR_PTR(ret);
+
+	return rtk;
+}
+EXPORT_SYMBOL_GPL(devm_apple_rtkit_init_adopted);
 
 void devm_apple_rtkit_free(struct device *dev, struct apple_rtkit *rtk)
 {

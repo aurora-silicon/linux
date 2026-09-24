@@ -78,6 +78,11 @@ struct apple_rtkit;
 struct apple_rtkit *devm_apple_rtkit_init(struct device *dev, void *cookie,
 					  const char *mbox_name, int mbox_idx,
 					  const struct apple_rtkit_ops *ops);
+
+/* Prime system endpoints before receiving a verified inherited session. */
+struct apple_rtkit *devm_apple_rtkit_init_adopted(
+	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
+	const struct apple_rtkit_ops *ops);
 /*
  * Frees internal RTKit state allocated by devm_apple_rtkit_init().
  *
@@ -99,6 +104,10 @@ void devm_apple_rtkit_free(struct device *dev, struct apple_rtkit *rtk);
 struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					  const char *mbox_name, int mbox_idx,
 					  const struct apple_rtkit_ops *ops);
+
+struct apple_rtkit *apple_rtkit_init_adopted(
+	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
+	const struct apple_rtkit_ops *ops);
 
 /*
  * Free an instance of apple_rtkit.
@@ -128,6 +137,9 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk);
  * co-processor has been started.
  */
 int apple_rtkit_boot(struct apple_rtkit *rtk);
+
+/* Caller must verify device-specific running/ready indicators first. */
+int apple_rtkit_adopt_running(struct apple_rtkit *rtk);
 
 /*
  * Quiesce the co-processor.
