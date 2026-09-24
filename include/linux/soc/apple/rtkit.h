@@ -61,6 +61,8 @@ struct apple_rtkit_ops {
 	bool (*recv_message_early)(void *cookie, u8 endpoint, u64 message);
 	int (*shmem_setup)(void *cookie, struct apple_rtkit_shmem *bfr);
 	void (*shmem_destroy)(void *cookie, struct apple_rtkit_shmem *bfr);
+	/* Zero preserves normal highest-supported protocol negotiation. */
+	u16 protocol_version;
 };
 
 struct apple_rtkit;
@@ -79,7 +81,9 @@ struct apple_rtkit *devm_apple_rtkit_init(struct device *dev, void *cookie,
 					  const char *mbox_name, int mbox_idx,
 					  const struct apple_rtkit_ops *ops);
 
-/* Prime system endpoints before receiving a verified inherited session. */
+/* Prime system endpoints before receiving a verified inherited session.
+ * No HELLO is negotiated here, so ops->protocol_version must be zero.
+ */
 struct apple_rtkit *devm_apple_rtkit_init_adopted(
 	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
 	const struct apple_rtkit_ops *ops);

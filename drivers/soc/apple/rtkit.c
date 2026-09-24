@@ -123,6 +123,9 @@ static void apple_rtkit_management_rx_hello(struct apple_rtkit *rtk, u64 msg)
 	int max_ver = FIELD_GET(APPLE_RTKIT_MGMT_HELLO_MAXVER, msg);
 	int want_ver = min(APPLE_RTKIT_MAX_SUPPORTED_VERSION, max_ver);
 
+	if (rtk->ops->protocol_version)
+		want_ver = rtk->ops->protocol_version;
+
 	dev_dbg(rtk->dev, "RTKit: Min ver %d, max ver %d\n", min_ver, max_ver);
 
 	if (min_ver > APPLE_RTKIT_MAX_SUPPORTED_VERSION) {
@@ -134,6 +137,12 @@ static void apple_rtkit_management_rx_hello(struct apple_rtkit *rtk, u64 msg)
 	if (max_ver < APPLE_RTKIT_MIN_SUPPORTED_VERSION) {
 		dev_err(rtk->dev, "RTKit: Firmware max version %d is too old\n",
 			max_ver);
+		goto abort_boot;
+	}
+
+	if (want_ver < min_ver || want_ver > max_ver) {
+		dev_err(rtk->dev, "RTKit: required protocol %d outside remote range %d..%d\n",
+			want_ver, min_ver, max_ver);
 		goto abort_boot;
 	}
 
@@ -691,7 +700,11 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	struct apple_rtkit *rtk;
 	int ret;
 
-	if (!ops)
+	if (!ops || (adopted && ops->protocol_version))
+		return ERR_PTR(-EINVAL);
+	if (ops->protocol_version &&
+	    (ops->protocol_version < APPLE_RTKIT_MIN_SUPPORTED_VERSION ||
+	     ops->protocol_version > APPLE_RTKIT_MAX_SUPPORTED_VERSION))
 		return ERR_PTR(-EINVAL);
 
 	rtk = kzalloc_obj(*rtk);

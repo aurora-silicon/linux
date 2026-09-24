@@ -200,6 +200,7 @@ unsafe extern "C" fn shmem_destroy_callback<T: Operations>(
 
 impl<T: Operations> RtKit<T> {
     const VTABLE: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
+        protocol_version: 0,
         crashed: Some(crashed_callback::<T>),
         recv_message: Some(recv_message_callback::<T>),
         recv_message_early: Some(recv_message_early_callback::<T>),

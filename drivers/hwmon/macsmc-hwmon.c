@@ -22,16 +22,25 @@
 
 #include <linux/bitfield.h>
 #include <linux/hwmon.h>
+#include <linux/jiffies.h>
 #include <linux/math64.h>
 #include <linux/mfd/macsmc.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/soc/apple/smc-thermal.h>
 
 #define MAX_LABEL_LENGTH	32
 
 /* Temperature, voltage, current, power, fan(s) */
 #define NUM_SENSOR_TYPES	5
+
+/*
+ * The J700 CPU thermal policy samples a fixed set of die temperatures, which
+ * must therefore be the first temperature channels; any further channels are
+ * only reported to userspace and never feed the policy.
+ */
+#define APPLE_SMC_CPU_POLICY_SENSORS	6
 
 #define FLT_EXP_BIAS	127
 #define FLT_EXP_MASK	GENMASK(30, 23)
@@ -86,6 +95,11 @@ struct macsmc_hwmon {
 	struct macsmc_hwmon_sensors curr;
 	struct macsmc_hwmon_sensors power;
 	struct macsmc_hwmon_fans fan;
+	bool cpu_thermal_policy;
+	struct mutex thermal_cache_lock;
+	long thermal_cache[APPLE_SMC_CPU_POLICY_SENSORS];
+	unsigned long thermal_cache_time;
+	int thermal_cache_error;
 };
 
 static int macsmc_hwmon_read_label(struct device *dev,
@@ -151,31 +165,42 @@ static int macsmc_hwmon_read_f32_scaled(struct apple_smc *smc, smc_key key,
 	if (ret < 0)
 		return ret;
 
-	val = ((u64)((fval & FLT_MANT_MASK) | BIT(23)));
-	exp = ((fval >> 23) & 0xff) - FLT_EXP_BIAS - FLT_MANT_BIAS;
+	exp = FIELD_GET(FLT_EXP_MASK, fval);
+	/* NaN and infinity are unavailable readings, not extreme temperatures. */
+	if (exp == 0xff)
+		return -ENODATA;
+
+	val = fval & FLT_MANT_MASK;
+	if (exp)
+		val |= BIT(23);
+	else
+		exp = 1; /* Zero and subnormal values have no implicit leading one. */
+	exp -= FLT_EXP_BIAS + FLT_MANT_BIAS;
 
 	/* We never have negatively scaled SMC floats */
 	val *= scale;
 
 	if (exp > 63)
-		val = U64_MAX;
+		return -ERANGE;
 	else if (exp < -63)
 		val = 0;
 	else if (exp < 0)
 		val >>= -exp;
 	else if (exp != 0 && (val & ~((1ULL << (64 - exp)) - 1))) /* overflow */
-		val = U64_MAX;
+		return -ERANGE;
 	else
 		val <<= exp;
 
 	if (fval & FLT_SIGN_MASK) {
 		if (val > (u64)LONG_MAX + 1)
+			return -ERANGE;
+		if (val == (u64)LONG_MAX + 1)
 			*p = LONG_MIN;
 		else
 			*p = -(long)val;
 	} else {
 		if (val > (u64)LONG_MAX)
-			*p = LONG_MAX;
+			return -ERANGE;
 		else
 			*p = (long)val;
 	}
@@ -348,6 +373,17 @@ static int macsmc_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 
 	switch (type) {
 	case hwmon_temp:
+		if (hwmon->cpu_thermal_policy && channel < APPLE_SMC_CPU_POLICY_SENSORS) {
+			guard(mutex)(&hwmon->thermal_cache_lock);
+
+			if (hwmon->thermal_cache_error)
+				return hwmon->thermal_cache_error;
+			if (time_after_eq(jiffies, hwmon->thermal_cache_time +
+					  msecs_to_jiffies(APPLE_SMC_THERMAL_MAX_AGE_MS)))
+				return -ETIMEDOUT;
+			*val = hwmon->thermal_cache[channel];
+			return 0;
+		}
 		ret = macsmc_hwmon_read_key(hwmon->smc,
 					    &hwmon->temp.sensors[channel], 1000, val);
 		break;
@@ -771,6 +807,70 @@ static int macsmc_hwmon_create_infos(struct macsmc_hwmon *hwmon)
 	return 0;
 }
 
+static int macsmc_hwmon_cpu_sample(void *ctx, int *temp)
+{
+	struct macsmc_hwmon *hwmon = ctx;
+	unsigned long start = jiffies;
+	long values[APPLE_SMC_CPU_POLICY_SENSORS], maximum = LONG_MIN;
+	unsigned int i;
+	int ret = 0;
+
+	for (i = 0; i < ARRAY_SIZE(values); i++) {
+		ret = macsmc_hwmon_read_key(hwmon->smc, &hwmon->temp.sensors[i], 1000, &values[i]);
+		if (ret)
+			break;
+		if (values[i] < INT_MIN || values[i] > INT_MAX) {
+			ret = -ERANGE;
+			break;
+		}
+		maximum = max(maximum, values[i]);
+	}
+	if (!ret && time_after_eq(jiffies, start + msecs_to_jiffies(APPLE_SMC_THERMAL_MAX_AGE_MS)))
+		ret = -ETIMEDOUT;
+	guard(mutex)(&hwmon->thermal_cache_lock);
+	hwmon->thermal_cache_error = ret;
+	if (!ret) {
+		memcpy(hwmon->thermal_cache, values, sizeof(values));
+		hwmon->thermal_cache_time = start;
+		*temp = maximum;
+	}
+	return ret;
+}
+
+static int macsmc_hwmon_cpu_policy(struct macsmc_hwmon *hwmon)
+{
+	static const smc_key keys[] = {
+		SMC_KEY(Te05), SMC_KEY(Te0S), SMC_KEY(Tp01),
+		SMC_KEY(Tp05), SMC_KEY(Tp09), SMC_KEY(Tp0D),
+	};
+	unsigned int i, j, seen = 0;
+
+	static_assert(ARRAY_SIZE(keys) == APPLE_SMC_CPU_POLICY_SENSORS);
+
+	if (!of_property_read_bool(hwmon->dev->of_node, "apple,cpu-thermal-policy"))
+		return 0;
+	if (!of_machine_is_compatible("apple,j700") || hwmon->temp.count < ARRAY_SIZE(keys))
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(keys); i++) {
+		struct macsmc_hwmon_sensor *sensor = &hwmon->temp.sensors[i];
+
+		if (sensor->info.type_code != __SMC_KEY('f', 'l', 't', ' ') ||
+		    sensor->info.size != 4 || !(sensor->info.flags & APPLE_SMC_READABLE) ||
+		    (sensor->info.flags & APPLE_SMC_FUNCTION))
+			return -EINVAL;
+		for (j = 0; j < ARRAY_SIZE(keys); j++)
+			if (sensor->macsmc_key == keys[j])
+				break;
+		if (j == ARRAY_SIZE(keys) || seen & BIT(j))
+			return -EINVAL;
+		seen |= BIT(j);
+	}
+	mutex_init(&hwmon->thermal_cache_lock);
+	hwmon->thermal_cache_error = -ENODATA;
+	hwmon->cpu_thermal_policy = true;
+	return devm_apple_smc_thermal_register(hwmon->dev, macsmc_hwmon_cpu_sample, hwmon);
+}
+
 static int macsmc_hwmon_probe(struct platform_device *pdev)
 {
 	struct apple_smc *smc = dev_get_drvdata(pdev->dev.parent);
@@ -810,6 +910,9 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 	ret = macsmc_hwmon_create_infos(hwmon);
 	if (ret)
 		return ret;
+	ret = macsmc_hwmon_cpu_policy(hwmon);
+	if (ret)
+		return dev_err_probe(hwmon->dev, ret, "CPU thermal provider setup failed\n");
 
 	hwmon->chip_info.ops = &macsmc_hwmon_ops;
 	hwmon->chip_info.info =

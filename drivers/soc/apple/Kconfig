@@ -111,6 +111,51 @@ config APPLE_SEP
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_PMP_V2
+	bool "Apple T8140 stopped-epoch PMP-v2 owner (J700)"
+	depends on ARM64 && APPLE_MAILBOX=y && APPLE_RTKIT=y
+	depends on IOMMU_IO_PGTABLE_DART
+	depends on PM_GENERIC_DOMAINS
+	depends on !KEXEC_CORE
+	select CRYPTO_LIB_SHA256
+	help
+	  Native passive owner for the stopped, iBoot-preloaded T8140 PMP of
+	  the J700. It owns the PMP DART translation instance (SID0 only, with
+	  the own-ADT address-filter table) as a private DART2 page table and
+	  starts the RTKit12 registry endpoint. Probe only validates; startup is
+	  a one-shot debugfs operation unless the thermal policy is selected.
+	  Shared-memory quiescence and suspend are not qualified, so this cannot
+	  be unloaded and retains buffers after an epoch failure. This option
+	  does not by itself authorize higher CPU frequencies.
+	  Kexec, including crash kexec, is incompatible with the retained live
+	  DMA epoch: no firmware drain or safe replacement-kernel handoff exists.
+
+config APPLE_PMP_V2_THERMAL
+	bool "Apple J700 PMP fast CPU thermal policy"
+	depends on APPLE_PMP_V2 && ARM_APPLE_SOC_CPUFREQ=y && APPLE_SMC_CPU_THERMAL=y
+	help
+	  One-shot automatic startup with boot-wide minimum caps, exact resident
+	  firmware identity (25F84 or 25G83 T8140 PMP builds) and a standard
+	  step_wise cpufreq cooling zone over the PMP die-temperature samples at
+	  25 ms. Sensor errors retain minimum caps; three advancing valid readings
+	  permit recovery after cooling has engaged if already hot. The
+	  independent SMC policy becomes the 105 C backup while this policy runs
+	  and, with pmp_v2.startup_fallback (default on), remains the throttle
+	  if this policy never starts.
+	  This awake policy requires idle=nop. Its driver allows s2idle, but
+	  platform suspend qualification is separate. Kexec is unsupported.
+
+config APPLE_PMP_V2_KUNIT_TEST
+	tristate "KUnit tests for the passive Apple PMP-v2 protocol" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	select CRYPTO_LIB_SHA256
+	default KUNIT_ALL_TESTS
+	help
+	  Validate the native passive registry, allocation ownership core and
+	  firmware identity matching with synthetic buffers. This never starts a
+	  coprocessor or changes CPU clocks.
+
+
 config APPLE_PMP
 	tristate "Apple Power Management Processor"
 	depends on ARCH_APPLE || COMPILE_TEST

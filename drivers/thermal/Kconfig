@@ -17,6 +17,21 @@ menuconfig THERMAL
 
 if THERMAL
 
+config APPLE_SMC_CPU_THERMAL
+	bool "Apple J700 SMC CPU thermal policy"
+	depends on ARCH_APPLE && ARM_APPLE_SOC_CPUFREQ=y && SENSORS_MACSMC_HWMON=y
+	select CPU_THERMAL
+	select THERMAL_GOV_STEP_WISE
+	help
+	  Couple J700 higher CPU states to the selected SMC die-temperature
+	  channels and standard cpufreq cooling devices,
+	  over the six explicitly selected SMC readings. Start at minimum CPU
+	  frequencies until telemetry and cooling are ready; retain minimum
+	  caps on sensor errors, stale sampling or disabled-zone mode. This
+	  is a Linux operating policy, not an Apple emergency threshold.
+	  Keep firmware protection and the existing low-state fallback intact.
+
+
 config THERMAL_NETLINK
 	bool "Thermal netlink management"
 	depends on NET
