@@ -12,6 +12,19 @@ config SND_SOC_APPLE_AOP_AUDIO
 	  co-processor on ARM Macs. This includes the built-in microphone on those
 	  machines.
 
+config SND_SOC_APPLE_T8140_AOP_AUDIO
+	tristate "T8140 AOP audio driver"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on RUST
+	select APPLE_AOP
+	select SND_DMAENGINE_PCM
+	help
+	  This option enables an ASoC driver for the audio paths owned by the
+	  AOP co-processor on T8140 machines: the low-power microphone and the
+	  high-quality microphone array as capture devices, and back-end DAIs
+	  for the headphone jack and the internal speaker, which are linked
+	  into a card by the macaudio driver.
+
 config SND_SOC_APPLE_MCA
 	tristate "Apple Silicon MCA driver"
 	depends on ARCH_APPLE || COMPILE_TEST
