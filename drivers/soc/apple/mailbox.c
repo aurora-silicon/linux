@@ -47,6 +47,14 @@
 #define APPLE_ASC_MBOX_I2A_RECV0 0x830
 #define APPLE_ASC_MBOX_I2A_RECV1 0x838
 
+/* T8140 AOP setup-port FIFO/control offsets. */
+#define APPLE_T8140_AOP_SETUP_A2I_CONTROL 0x000
+#define APPLE_T8140_AOP_SETUP_I2A_CONTROL 0x004
+#define APPLE_T8140_AOP_SETUP_A2I_SEND0   0x180
+#define APPLE_T8140_AOP_SETUP_A2I_SEND1   0x188
+#define APPLE_T8140_AOP_SETUP_I2A_RECV0   0x1b0
+#define APPLE_T8140_AOP_SETUP_I2A_RECV1   0x1b8
+
 #define APPLE_T8015_MBOX_A2I_CONTROL	0x108
 #define APPLE_T8015_MBOX_I2A_CONTROL	0x10c
 
@@ -81,6 +89,8 @@
 #define APPLE_MBOX_TX_TIMEOUT 500
 
 struct apple_mbox_hw {
+	bool ap_initializes_mailboxes;
+
 	unsigned int control_full;
 	unsigned int control_empty;
 
@@ -137,17 +147,26 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 			writel_relaxed(mbox->hw->irq_bit_send_empty,
 				       mbox->regs + mbox->hw->irq_ack);
 		}
-		enable_irq(mbox->irq_send_empty);
 		reinit_completion(&mbox->tx_empty);
+		if (!mbox->tx_irq_unmasked) {
+			mbox->tx_irq_unmasked = true;
+			enable_irq(mbox->irq_send_empty);
+		}
 		spin_unlock_irqrestore(&mbox->tx_lock, flags);
 
 		t = wait_for_completion_interruptible_timeout(
 			&mbox->tx_empty,
 			msecs_to_jiffies(APPLE_MBOX_TX_TIMEOUT));
-		if (t < 0)
-			return t;
-		else if (t == 0)
-			return -ETIMEDOUT;
+		if (t <= 0) {
+			/* A late IRQ may already have masked this under tx_lock. */
+			spin_lock_irqsave(&mbox->tx_lock, flags);
+			if (mbox->tx_irq_unmasked) {
+				disable_irq_nosync(mbox->irq_send_empty);
+				mbox->tx_irq_unmasked = false;
+			}
+			spin_unlock_irqrestore(&mbox->tx_lock, flags);
+			return t < 0 ? t : -ETIMEDOUT;
+		}
 
 		spin_lock_irqsave(&mbox->tx_lock, flags);
 		mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->a2i_control);
@@ -175,7 +194,10 @@ static irqreturn_t apple_mbox_send_empty_irq(int irq, void *data)
 	 * it at the main controller again.
 	 */
 	spin_lock(&mbox->tx_lock);
-	disable_irq_nosync(mbox->irq_send_empty);
+	if (mbox->tx_irq_unmasked) {
+		disable_irq_nosync(mbox->irq_send_empty);
+		mbox->tx_irq_unmasked = false;
+	}
 	complete(&mbox->tx_empty);
 	spin_unlock(&mbox->tx_lock);
 
@@ -242,6 +264,7 @@ EXPORT_SYMBOL(apple_mbox_poll);
 
 int apple_mbox_start(struct apple_mbox *mbox)
 {
+	u32 control;
 	int ret;
 
 	if (mbox->active)
@@ -250,6 +273,12 @@ int apple_mbox_start(struct apple_mbox *mbox)
 	ret = pm_runtime_resume_and_get(mbox->dev);
 	if (ret)
 		return ret;
+
+	if (mbox->hw->ap_initializes_mailboxes) {
+		/* The primary T8140 outbox requires its enable bit before use. */
+		control = readl(mbox->regs + mbox->hw->i2a_control);
+		writel(control | BIT(0), mbox->regs + mbox->hw->i2a_control);
+	}
 
 	/*
 	 * Only some variants of this mailbox HW provide interrupt control
@@ -337,6 +366,7 @@ static int apple_mbox_probe(struct platform_device *pdev)
 	char *irqname;
 	struct apple_mbox *mbox;
 	struct device *dev = &pdev->dev;
+	struct resource *res;
 
 	mbox = devm_kzalloc(dev, sizeof(*mbox), GFP_KERNEL);
 	if (!mbox)
@@ -346,6 +376,10 @@ static int apple_mbox_probe(struct platform_device *pdev)
 	mbox->hw = of_device_get_match_data(dev);
 	if (!mbox->hw)
 		return -EINVAL;
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res || resource_size(res) < mbox->hw->i2a_recv1 + sizeof(u64))
+		return dev_err_probe(dev, -EINVAL, "mailbox register window is too small\n");
 
 	mbox->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(mbox->regs))
@@ -422,6 +456,38 @@ static const struct apple_mbox_hw apple_mbox_asc_hw = {
 	.has_irq_controls = false,
 };
 
+static const struct apple_mbox_hw apple_mbox_t8140_asc_hw = {
+	.ap_initializes_mailboxes = true,
+
+	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
+	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,
+
+	.a2i_control = APPLE_ASC_MBOX_A2I_CONTROL,
+	.a2i_send0 = APPLE_ASC_MBOX_A2I_SEND0,
+	.a2i_send1 = APPLE_ASC_MBOX_A2I_SEND1,
+
+	.i2a_control = APPLE_ASC_MBOX_I2A_CONTROL,
+	.i2a_recv0 = APPLE_ASC_MBOX_I2A_RECV0,
+	.i2a_recv1 = APPLE_ASC_MBOX_I2A_RECV1,
+
+	.has_irq_controls = false,
+};
+
+static const struct apple_mbox_hw apple_mbox_t8140_aop_setup_hw = {
+	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
+	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,
+
+	.a2i_control = APPLE_T8140_AOP_SETUP_A2I_CONTROL,
+	.a2i_send0 = APPLE_T8140_AOP_SETUP_A2I_SEND0,
+	.a2i_send1 = APPLE_T8140_AOP_SETUP_A2I_SEND1,
+
+	.i2a_control = APPLE_T8140_AOP_SETUP_I2A_CONTROL,
+	.i2a_recv0 = APPLE_T8140_AOP_SETUP_I2A_RECV0,
+	.i2a_recv1 = APPLE_T8140_AOP_SETUP_I2A_RECV1,
+
+	.has_irq_controls = false,
+};
+
 static const struct apple_mbox_hw apple_mbox_m3_hw = {
 	.control_full = APPLE_M3_MBOX_CONTROL_FULL,
 	.control_empty = APPLE_M3_MBOX_CONTROL_EMPTY,
@@ -442,6 +508,8 @@ static const struct apple_mbox_hw apple_mbox_m3_hw = {
 };
 
 static const struct of_device_id apple_mbox_of_match[] = {
+	{ .compatible = "apple,t8140-asc-mailbox", .data = &apple_mbox_t8140_asc_hw },
+	{ .compatible = "apple,t8140-aop-setup-mailbox", .data = &apple_mbox_t8140_aop_setup_hw },
 	{ .compatible = "apple,asc-mailbox-v4", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t8015-asc-mailbox", .data = &apple_mbox_t8015_hw },
 	{ .compatible = "apple,m3-mailbox-v2", .data = &apple_mbox_m3_hw },
