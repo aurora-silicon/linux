@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/serial/apple,dockchannel-uart.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple DockChannel UART
+
+maintainers:
+  - Yureka Lilian <yureka@cyberchaos.dev>
+
+description: |
+  Apple SoCs provide UART-compatible byte streams over DockChannel. Each
+  channel uses separate data and FIFO-configuration windows and shares an
+  interrupt-controller window with the other DockChannel functions.
+
+allOf:
+  - $ref: serial.yaml#
+
+properties:
+  compatible:
+    const: apple,dockchannel-uart
+
+  reg:
+    items:
+      - description: Channel data registers
+      - description: Channel FIFO configuration registers
+      - description: DockChannel interrupt registers
+
+  reg-names:
+    items:
+      - const: data
+      - const: config
+      - const: irq
+
+  interrupts:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        serial@30812c000 {
+            compatible = "apple,dockchannel-uart";
+            reg = <0x3 0x0812c000 0x0 0x4000>,
+                  <0x3 0x08128000 0x0 0x4000>,
+                  <0x3 0x0810c000 0x0 0x4000>;
+            reg-names = "data", "config", "irq";
+            interrupts = <AIC_IRQ 470 IRQ_TYPE_LEVEL_HIGH>;
+        };
+    };
+
+...
