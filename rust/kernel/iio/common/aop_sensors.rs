@@ -12,14 +12,59 @@ use kernel::{
     bindings,
     device,
     prelude::*,
-    soc::apple::aop::FakehidListener,
+    soc::apple::aop::{EPICService, FakehidListener, AOP},
     sync::{
         aref::ARef,
+        atomic::{Atomic, Relaxed},
         Arc, //
     },
     types::ForeignOwnable,
     ThisModule, //
 };
+
+/// Owns one sensor child's fake-HID subscription.
+///
+/// Declare this before resources used by the listener so failed construction
+/// and normal field drop remove the subscription first. The child calls
+/// [`Self::unregister`] from `unbind` while those resources are still live.
+pub struct FakehidRegistration {
+    aop: Arc<dyn AOP>,
+    service: EPICService,
+    registered: Atomic<bool>,
+}
+
+impl FakehidRegistration {
+    /// Register a listener, leaving no owned subscription on failure.
+    pub fn new(
+        aop: Arc<dyn AOP>,
+        service: EPICService,
+        listener: Arc<dyn FakehidListener>,
+    ) -> Result<Self> {
+        aop.add_fakehid_listener(service, listener)?;
+        Ok(Self {
+            aop,
+            service,
+            registered: Atomic::new(true),
+        })
+    }
+
+    /// Remove the subscription before releasing the child's IIO resources.
+    ///
+    /// AOP removal takes the same mutex as report dispatch and therefore
+    /// waits for an in-flight callback. Driver-core serializes this child's
+    /// unbind and drop; a subsequent drop is an idempotent fallback.
+    pub fn unregister(&self) {
+        if self.registered.xchg(false, Relaxed) {
+            self.aop.remove_fakehid_listener(&self.service);
+        }
+    }
+}
+
+impl Drop for FakehidRegistration {
+    fn drop(&mut self) {
+        self.unregister();
+    }
+}
 
 /// TODO: add documentation
 pub trait MessageProcessor {
@@ -135,6 +180,9 @@ impl<T: MessageProcessor + 'static> IIORegistration<T> {
             _p: PhantomData,
         };
         this.dev = unsafe { bindings::iio_device_alloc(data.dev.as_raw(), 0) };
+        if this.dev.is_null() {
+            return Err(ENOMEM);
+        }
         unsafe {
             (*this.dev).priv_ = data.clone().into_foreign().cast();
             (*this.dev).name = name.as_ptr() as _;
