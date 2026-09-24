@@ -1,0 +1,147 @@
+# SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,t8140-pmp-v2.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8140 preloaded PMP-v2 coprocessor
+
+maintainers:
+  - Eryk Wieliczko <eryk@wieliczko.ninja>
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description: |
+  Native stopped-epoch owner of the preloaded T8140 PMP. A running processor
+  without a transferred session cannot be adopted. The board description
+  forwards the actual resident segment metadata and own nub data (on the J700
+  they are generated from the machine's ADT); none is a firmware image to be
+  loaded. The owner also owns stream 0 of the PMP's retained t8110-model DART
+  translation instance and its associated address filter: other streams,
+  TRAD tunables and protection state are retained, never reset. The bootloader
+  must leave PMP stopped with no valid SID0 root. Firmware quiescence and
+  higher CPU frequency admission are separate from the passive registry
+  endpoint; the optional thermal policy is a Linux operating policy.
+
+properties:
+  compatible:
+    const: apple,t8140-pmp-v2
+
+  reg:
+    items:
+      - description: CPU control register resource, disjoint from the mailbox
+      - description: Resident firmware SRAM resource
+      - description: PMP DART TRAD translation instance
+      - description: PMP DART FPAD address filter instance
+
+  reg-names:
+    items:
+      - const: control
+      - const: firmware
+      - const: dart
+      - const: apf
+
+  interrupts:
+    maxItems: 1
+    description: The PMP DART fault interrupt (exclusive).
+
+  interrupt-names:
+    items:
+      - const: dart
+
+  mboxes:
+    maxItems: 1
+
+  power-domains:
+    minItems: 2
+    maxItems: 2
+
+  power-domain-names:
+    items:
+      - const: pmp
+      - const: sram
+
+  apple,metadata-version:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    const: 1
+    description: Set only after complete metadata forwarding.
+
+  apple,resident-segments:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 32
+    maxItems: 2048
+    description: |
+      Original little-endian 32-byte ADT tuples. Each contains physical,
+      processor virtual, device address (three u64), byte size and flags
+      (two u32). Raw flags bit 0 is inverse writable; bit 1 skips mapping.
+
+  apple,patchbay-values:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 20
+    maxItems: 20
+    description: |
+      Bootloader-derived numeric key/value pairs in order BDID, DVID, DCAP,
+      DCHD, PMC_, PMCV, PMCB, PMCX, CVAR, PMCM. Own ADT inputs supply these
+      values, except the explicit normal non-development PMCM default.
+      These do not include a fast-die override or permit inserting a key.
+
+  apple,dma-range:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 2
+    maxItems: 2
+    description: Start and size of the own-device mapper IOVA aperture.
+
+  apple,apf-instance:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 48
+    maxItems: 48
+    description: Exact own ADT dart-pmp instance/resource association records.
+
+  apple,apf-capacity:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    const: 32
+    description: Own ADT filter slot capacity for the admitted instance.
+
+  apple,apf-table:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 1404
+    maxItems: 1404
+    description: |
+      Exact 27 own ADT 52-byte APF records (dapf-instance-0). Each contains
+      little-endian 64-bit start/end, eight little-endian 32-bit SID bitmap
+      words and four descriptor bytes. The native profile admits a qualified
+      table hash; these bytes are not permission to initialize unowned SID2
+      rows.
+
+  apple,dart-tunables:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 216
+    maxItems: 216
+    description: |
+      Exact nine own ADT 24-byte tunables (dart-tunables-instance-0). Each
+      contains little-endian 32-bit offset/access width and 64-bit mask/value.
+      Used for read-only validation of retained TRAD state, not for writes.
+
+  firmware-data:
+    type: object
+    description: |
+      Exact own PMP nub property bytes. These provide presence-based boot
+      classification and optional exact-name registry defaults.
+    additionalProperties: true
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - interrupt-names
+  - mboxes
+  - power-domains
+  - power-domain-names
+  - apple,dma-range
+  - apple,apf-instance
+  - apple,apf-capacity
+  - apple,apf-table
+  - apple,dart-tunables
+  - firmware-data
+
+additionalProperties: false

@@ -6,9 +6,11 @@
 #include <linux/cpu.h>
 #include <linux/irqflags.h>
 
+#include <asm/apple-idle.h>
 #include <asm/barrier.h>
 #include <asm/cpuidle.h>
 #include <asm/cpufeature.h>
+#include <asm/fpsimd.h>
 #include <asm/sysreg.h>
 
 enum {
@@ -50,6 +52,16 @@ void __cpuidle cpu_do_idle(void)
 	arm_cpuidle_save_irq_context(&context);
 
 	if (likely(idle == ARM64_IDLE_WFI)) {
+		if (apple_needs_wait_save()) {
+			/*
+			 * WFI also loses FPSIMD state on T8140 secondaries.
+			 * Invalidate the lazy CPU owner so userspace reloads it
+			 * even when the same task resumes on the same CPU.
+			 */
+			fpsimd_save_and_flush_cpu_state();
+			apple_cpu_wfi();
+			goto restore_context;
+		}
 		dsb(sy);
 		wfi();
 	} else if (idle == ARM64_IDLE_YIELD) {
@@ -57,6 +69,7 @@ void __cpuidle cpu_do_idle(void)
 		asm volatile("yield" ::: "memory");
 	}
 
+restore_context:
 	arm_cpuidle_restore_irq_context(&context);
 }
 
