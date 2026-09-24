@@ -9,6 +9,7 @@ ARM64 Architecture
 
     acpi_object_usage
     amu
+    apple-neo-av
     arm-acpi
     arm-cca
     asymmetric-32bit
