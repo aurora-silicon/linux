@@ -7,7 +7,9 @@
 use kernel::{
     bindings, c_str,
     device::Core,
-    iio::common::aop_sensors::{AopSensorData, IIORegistration, MessageProcessor},
+    iio::common::aop_sensors::{
+        AopSensorData, FakehidRegistration, IIORegistration, MessageProcessor,
+    },
     module_platform_driver, of, platform,
     prelude::*,
     soc::apple::aop::{EPICService, AOP},
@@ -19,12 +21,15 @@ struct MsgProc;
 
 impl MessageProcessor for MsgProc {
     fn process(&self, message: &[u8]) -> u32 {
-        message[1] as u32
+        message.get(1).copied().unwrap_or(0) as u32
     }
 }
 
-#[repr(transparent)]
-struct IIOAopLasDriver(IIORegistration<MsgProc>);
+struct IIOAopLasDriver {
+    // Field order also removes the callback before IIO teardown on rollback.
+    listener: FakehidRegistration,
+    _iio: IIORegistration<MsgProc>,
+}
 
 kernel::of_device_table!(
     OF_TABLE,
@@ -40,24 +45,44 @@ impl platform::Driver for IIOAopLasDriver {
 
     fn probe(pdev: &platform::Device<Core>, _info: Option<&()>) -> impl PinInit<Self, Error> {
         let dev = pdev.as_ref();
-        let parent = dev.parent().unwrap();
-        // SAFETY: our parent is AOP, and AopDriver is repr(transparent) for Arc<dyn Aop>
-        let adata_ptr = unsafe { Pin::<KBox<Arc<dyn AOP>>>::borrow(parent.get_drvdata()) };
+        let parent = dev.parent().ok_or(ENODEV)?;
+        let parent_data = parent.get_drvdata::<core::ffi::c_void>();
+        if parent_data.is_null() {
+            return Err(ENODEV);
+        }
+        // SAFETY: AOP owns this child and synchronously releases its driver
+        // before parent driver data can be freed. Driver-core serializes an
+        // active child probe against that release; clone the live parent Arc.
+        let adata_ptr = unsafe { Pin::<KBox<Arc<dyn AOP>>>::borrow(parent_data) };
         let adata = (&*adata_ptr).clone();
-        // SAFETY: AOP sets the platform data correctly
-        let service = unsafe { *((*dev.as_raw()).platform_data as *const EPICService) };
+        // SAFETY: the child device is live; AOP supplied its service record.
+        let service_ptr = unsafe { (*dev.as_raw()).platform_data as *const EPICService };
+        if service_ptr.is_null() {
+            return Err(ENODEV);
+        }
+        // SAFETY: the service record lives with this registered child device.
+        let service = unsafe { *service_ptr };
 
         let ty = bindings::BINDINGS_IIO_ANGL;
         let data = AopSensorData::new(dev.into(), ty, MsgProc)?;
-        adata.add_fakehid_listener(service, data.clone())?;
         let info_mask = 1 << bindings::BINDINGS_IIO_CHAN_INFO_RAW;
-        Ok(IIOAopLasDriver(IIORegistration::<MsgProc>::new(
-            data,
+        // Registration failures occur before any callback can reach MsgProc.
+        let iio = IIORegistration::<MsgProc>::new(
+            data.clone(),
             c"aop-sensors-las",
             ty,
             info_mask,
             &THIS_MODULE,
-        )?))
+        )?;
+        let listener = FakehidRegistration::new(adata, service, data)?;
+        Ok(IIOAopLasDriver {
+            listener,
+            _iio: iio,
+        })
+    }
+
+    fn unbind(_dev: &platform::Device<Core>, this: Pin<&Self>) {
+        this.listener.unregister();
     }
 }
 
