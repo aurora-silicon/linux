@@ -813,6 +813,19 @@ impl SndSocT8140AopData {
         self.service_startup(&self.spkr, &self.spkr_domain_refs())
     }
 
+    /// A PCM underrun stops DMA without closing the back-end. Retire its
+    /// previous firmware run during prepare so the next trigger queues a
+    /// fresh pwrd and unmute after DMA has restarted.
+    fn spkr_prepare(&self) -> Result<()> {
+        if self.spkr.running.load(Relaxed) == 0 {
+            return Ok(());
+        }
+        self.spkr_set_mute(true)?;
+        self.service_set_power(&self.spkr, SPKR_POWER_STATE_PW0)?;
+        self.spkr.running.store(0, Relaxed);
+        Ok(())
+    }
+
     /// Speaker stream start, from the system workqueue right after trigger
     /// START: the DMA must be running before pwrd starts the LEAP consuming
     /// (issued from prepare, before the DMA, the wire stays silent), then the
@@ -1935,7 +1948,13 @@ unsafe extern "C" fn spkr_dai_prepare(
 ) -> i32 {
     // SAFETY: the substream is live for the duration of the op.
     if unsafe { substream_is_playback(substream) } {
-        return 0;
+        // SAFETY: this component's stable context owns the queued start.
+        let drv = unsafe { component_context((*dai).component) };
+        drv.flush_spkr_start();
+        return match drv.data.spkr_prepare() {
+            Ok(()) => 0,
+            Err(e) => e.to_errno(),
+        };
     }
     // SAFETY: ASoC calls DAI ops with a DAI of our registered component.
     let data = unsafe { dai_data(dai) };
@@ -1992,16 +2011,7 @@ unsafe extern "C" fn spkr_dai_shutdown(
         drv.data.sense_shutdown();
         return;
     }
-    drv.data.spkr_want_run.store(0, Relaxed);
-    if let Some(work) = drv.spkr_start.as_ref() {
-        // A start still queued or running must finish before the mute/pw0.
-        // SAFETY: the work item lives in the stable component context; flushing waits for a queued
-        // `spkr_go`.
-        unsafe {
-            let raw = workqueue::Work::raw_get(&work.work);
-            bindings::flush_work(raw);
-        }
-    }
+    drv.flush_spkr_start();
     drv.data.spkr_shutdown();
 }
 
@@ -2258,6 +2268,20 @@ struct AsocContext {
 const _: () = assert!(mem::offset_of!(AsocContext, component) == 0);
 
 impl AsocContext {
+    /// Called from sleeping prepare/shutdown paths while ALSA serializes
+    /// this stream. A previously queued start must finish before mute/pw0.
+    fn flush_spkr_start(&self) {
+        self.data.spkr_want_run.store(0, Relaxed);
+        if let Some(work) = self.spkr_start.as_ref() {
+            // SAFETY: the context retains the work item until this flush
+            // completes; no stream trigger races ALSA prepare/shutdown.
+            unsafe {
+                let raw = workqueue::Work::raw_get(&work.work);
+                bindings::flush_work(raw);
+            }
+        }
+    }
+
     fn new(data: Arc<SndSocT8140AopData>) -> Result<KBox<Self>> {
         let spkr_data = data.clone();
         let hpai_data = data.clone();
