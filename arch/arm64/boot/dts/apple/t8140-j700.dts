@@ -1,0 +1,150 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple MacBook Neo
+ *
+ * target-type: J700
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t8140.dtsi"
+
+/ {
+	compatible = "apple,j700", "apple,t8140", "apple,arm-platform";
+	model = "Apple MacBook Neo";
+
+	aliases {
+		serial0 = &serial0;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		stdout-path = "serial0";
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* To be filled by loader */
+			/* Format properties will be added by loader */
+			status = "disabled";
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		/* To be filled by loader */
+	};
+
+	memory@10000000000 {
+		device_type = "memory";
+		reg = <0x100 0 0x2 0>; /* To be filled by loader */
+	};
+};
+
+#include "isp-imx558.dtsi"
+
+&serial0 {
+	status = "okay";
+};
+
+&pinctrl_ap {
+	status = "okay";
+};
+
+&i2c0 {
+	status = "okay";
+
+	jack_codec: codec@48 {
+		compatible = "cirrus,cs42l83";
+		reg = <0x48>;
+		reset-gpios = <&pinctrl_ap 103 GPIO_ACTIVE_HIGH>;
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <104 IRQ_TYPE_LEVEL_LOW>;
+		#sound-dai-cells = <0>;
+		cirrus,ts-inv = <1>;
+		sound-name-prefix = "Jack";
+	};
+};
+
+&isp {
+	apple,platform-id = <0x70>;
+	apple,temporal-filter = <1>;
+};
+
+&aop_dart {
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+&aop_setup_mbox {
+	status = "okay";
+};
+
+&aop {
+	status = "okay";
+};
+
+&aop_audio {
+	apple,chassis-name = "J700";
+	apple,machine-kind = "MacBook Neo";
+};
+
+&admac_leap_ns {
+	status = "okay";
+};
+
+&admac_base_ns {
+	status = "okay";
+};
+
+&admac_leap_s {
+	status = "okay";
+};
+
+/ {
+	speaker_amp: audio-amplifier {
+		compatible = "maxim,max98360a";
+		sdmode-gpios = <&pinctrl_ap 105 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Speaker";
+	};
+	sound {
+		compatible = "apple,j700-macaudio", "apple,macaudio";
+		model = "MacBook Neo J700";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&aop_audio 0>;
+			};
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+
+
+		dai-link@1 {
+			reg = <1>;
+			link-name = "Speaker";
+
+			cpu {
+				sound-dai = <&aop_audio 4>;
+			};
+			codec {
+				sound-dai = <&speaker_amp>;
+			};
+		};
+	};
+};

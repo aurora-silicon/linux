@@ -1,0 +1,339 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Power states used by the T8140 audio/ISP test topology.
+ * Copyright The Asahi Linux Contributors
+ */
+
+&pmgr {
+	ps_aic: power-controller@110 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x110 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aic";
+		apple,always-on;
+	};
+
+	ps_gpio: power-controller@120 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x120 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "gpio";
+	};
+
+	ps_isp_sys: power-controller@268 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x268 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_sys";
+	};
+
+	ps_i2c0: power-controller@2c8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2c8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c0";
+	};
+
+	/*
+	 * ISP-local power domains (live J700 ADT: ISP_CPU .. ISP_CVM, "no-ps"
+	 * entries in the main PMGR block).  As on t8112, the dependency tree is
+	 * left to the ISP driver, which sequences them in the ADT parent-first
+	 * order (ISP_SYS -> ISP_CPU -> cores, ISP_SYS -> ISP_FE -> ...).  The
+	 * unnamed slot at 0x4020 is the ISP_DPRX domain that the macOS 25G83
+	 * power trace enables between ISP_FE and ISP_SECURE.  Plain power
+	 * gating only: a local domain parked with DEV_DISABLE (the t8112
+	 * apple,force-disable pattern) never reached ACTIVE again on J700
+	 * (isp_cpu_core0 stuck at ACTUAL=0 on the second firmware boot).
+	 */
+	ps_isp_cpu: power-controller@4000 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cpu";
+	};
+
+	ps_isp_cpu_core0: power-controller@4008 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4008 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cpu_core0";
+	};
+
+	ps_isp_cpu_core1: power-controller@4010 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4010 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cpu_core1";
+	};
+
+	ps_isp_fe: power-controller@4018 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4018 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_fe";
+	};
+
+	ps_isp_dprx: power-controller@4020 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4020 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_dprx";
+	};
+
+	ps_isp_secure: power-controller@4028 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4028 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_secure";
+	};
+
+	ps_isp_sts0: power-controller@4030 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4030 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_sts0";
+	};
+
+	ps_isp_sts1: power-controller@4038 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4038 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_sts1";
+	};
+
+	ps_isp_pearl: power-controller@4040 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4040 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_pearl";
+	};
+
+	ps_isp_be: power-controller@4048 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4048 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_be";
+	};
+
+	ps_isp_clr: power-controller@4050 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4050 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_clr";
+	};
+
+	ps_isp_cvd: power-controller@4058 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4058 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cvd";
+	};
+
+	ps_isp_cvm: power-controller@4060 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4060 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cvm";
+	};
+};
+
+&pmgr_mini {
+	/*
+	 * AOP and audio-fabric power domains (live J700 ADT /arm-io/pmgr entries
+	 * flagged "no-ps", register slots in this block at 0x4000+).  Parents are
+	 * the ADT parents.  These are the domains the m1n1 speaker proof enabled
+	 * parent-first: aop_filter, audio_a, audio_fr, audio_p, audio_leap_mca,
+	 * audio_leap_a, audio_leap_c, audio_leap_ns_a, audio_leap_tx0.  The AOP
+	 * firmware is iBoot-loaded and running at Linux boot, so the AOP domains
+	 * iBoot leaves on are always-on (measured 2026-09-16: aop2_cpu,
+	 * aop2_piodma, aop_he_nrcs0/1, aop_i2cm3 and aop_spi1 are off at boot
+	 * and the HE NRCS pair refuses to power up, so those stay unmanaged).
+	 * The audio fabric parents (audio_a, audio_fr, audio_p, audio_leap_a,
+	 * audio_leap_c) are on at boot and the AOP firmware relies on them: a
+	 * runtime-PM cycle of audio_leap_mca that let genpd switch audio_p off
+	 * left the firmware unable to answer lpai power requests (hb33,
+	 * 2026-09-16), so they are always-on; only the leaves (audio_leap_tx0,
+	 * audio_leap_mca, audio_leap_ns_a, ...) are runtime-managed.
+	 */
+	ps_aop_filter: power-controller@4000 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_filter";
+		apple,always-on;
+	};
+
+	ps_aop_base: power-controller@4010 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4010 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_base";
+		power-domains = <&ps_aop_filter>;
+		apple,always-on;
+	};
+
+	ps_aop_fr: power-controller@4018 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4018 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_fr";
+		power-domains = <&ps_aop_filter>;
+		apple,always-on;
+	};
+
+	ps_audio_a: power-controller@4020 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4020 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_a";
+		/* AOP-owned audio fabric: on at boot, the firmware expects it to stay on */
+		apple,always-on;
+		power-domains = <&ps_aop_filter>;
+	};
+
+	ps_aop_cpu: power-controller@4098 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4098 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_cpu";
+		power-domains = <&ps_aop_base>, <&ps_aop_fr>;
+		apple,always-on;
+	};
+
+	ps_audio_fr: power-controller@40a8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x40a8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_fr";
+		/* AOP-owned audio fabric: on at boot, the firmware expects it to stay on */
+		apple,always-on;
+		power-domains = <&ps_audio_a>;
+	};
+
+	ps_audio_p: power-controller@40d0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x40d0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_p";
+		/* AOP-owned audio fabric: on at boot, the firmware expects it to stay on */
+		apple,always-on;
+		power-domains = <&ps_audio_fr>;
+	};
+
+	ps_audio_leap_a: power-controller@40d8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x40d8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_leap_a";
+		/* AOP-owned audio fabric: on at boot, the firmware expects it to stay on */
+		apple,always-on;
+		power-domains = <&ps_audio_fr>;
+	};
+
+	ps_audio_base_ns_a: power-controller@40f0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x40f0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_base_ns_a";
+		power-domains = <&ps_audio_p>;
+	};
+
+	ps_audio_leap_mca: power-controller@40f8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x40f8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_leap_mca";
+		power-domains = <&ps_audio_p>;
+	};
+
+	ps_audio_mca0_m: power-controller@4100 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4100 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_mca0_m";
+		power-domains = <&ps_audio_p>;
+	};
+
+	ps_audio_mca1_m: power-controller@4108 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4108 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_mca1_m";
+		power-domains = <&ps_audio_p>;
+	};
+
+	ps_audio_leap_c: power-controller@4130 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4130 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_leap_c";
+		/* AOP-owned audio fabric: on at boot, the firmware expects it to stay on */
+		apple,always-on;
+		power-domains = <&ps_audio_leap_a>;
+	};
+
+	ps_audio_leap_s_a: power-controller@4138 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4138 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_leap_s_a";
+		power-domains = <&ps_audio_leap_c>;
+	};
+
+	ps_audio_leap_ns_a: power-controller@4140 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4140 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_leap_ns_a";
+		power-domains = <&ps_audio_leap_c>;
+	};
+
+	ps_audio_leap_rx0: power-controller@4148 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4148 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_leap_rx0";
+		power-domains = <&ps_audio_leap_c>;
+	};
+
+	ps_audio_leap_tx0: power-controller@4170 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4170 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_leap_tx0";
+		power-domains = <&ps_audio_leap_c>;
+	};
+};
