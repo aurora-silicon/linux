@@ -24,6 +24,7 @@ properties:
               - apple,t6031-pinctrl
               - apple,t8122-pinctrl
               - apple,t8132-pinctrl
+              - apple,t8140-pinctrl
           - const: apple,t8103-pinctrl
       - items:
           # Do not add additional SoC to this list.
@@ -55,6 +56,15 @@ properties:
   apple,npins:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: The number of pins in this GPIO controller.
+
+  apple,no-regcache:
+    type: boolean
+    description:
+      The register block contains slots that cannot be safely read during
+      bulk cache initialization. Access is uncached and restricted to valid
+      GPIO registers, excluding gpio-reserved-ranges.
+
+  gpio-reserved-ranges: true
 
   interrupts:
     description: One interrupt for each of the (up to 7) interrupt
