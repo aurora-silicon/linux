@@ -11,6 +11,8 @@
 
 #include <linux/thunderbolt.h>
 
+struct tb_port;
+
 enum nhi_fw_mode {
 	NHI_FW_SAFE_MODE,
 	NHI_FW_AUTH_MODE,
@@ -80,6 +82,11 @@ struct tb_nhi_ring_layout {
  *			   been allocated but before its paths and adapters are enabled
  * @pci_tunnel_post_activate: NHI specific hook run after a PCIe tunnel's
  *			    paths and adapters have been enabled
+ * @dp_tunnel_pre_activate: NHI specific hook run after DP hops are programmed
+ *			    and before VE/AE. USB4 DPTX Discovery belongs here.
+ * @dp_tunnel_post_activate: NHI specific hook run after a DP tunnel's
+ *			     adapters have VE/AE enabled
+ * @dp_tunnel_deactivate: NHI specific hook run when a DP tunnel is torn down
  * @is_present: Whether the device is currently present on the parent bus
  * @init_interrupts: NHI specific interrupt initialization hook
  */
@@ -100,6 +107,12 @@ struct tb_nhi_ops {
 	int (*pci_tunnel_pre_activate)(struct tb_nhi *nhi);
 	int (*pci_tunnel_post_activate)(struct tb_nhi *nhi);
 	int (*pci_tunnel_deactivate)(struct tb_nhi *nhi);
+	int (*dp_tunnel_pre_activate)(struct tb_nhi *nhi, struct tb_port *in,
+				      struct tb_port *out);
+	int (*dp_tunnel_post_activate)(struct tb_nhi *nhi, struct tb_port *in,
+				       struct tb_port *out);
+	void (*dp_tunnel_deactivate)(struct tb_nhi *nhi, struct tb_port *in,
+				     struct tb_port *out);
 	bool (*is_present)(struct tb_nhi *nhi);
 	int (*init_interrupts)(struct tb_nhi *nhi);
 };
