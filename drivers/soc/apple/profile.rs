@@ -8,10 +8,12 @@
 //! here once. The driver reads addresses from the device tree, never scans for
 //! them, and never patches properties at runtime.
 //!
-//! Two bring-up targets are modelled:
+//! Three bring-up targets are modelled:
 //!
 //! * `T8103` / J313 (MacBook Air, M1): the host boots the SEP with the boot
 //!   endpoint handshake over a 0x30000 shared-memory window.
+//! * `T6000` / J316s (MacBook Pro 16", M1 Pro): the T8103 boot handshake, with
+//!   the sensor on the T6020 SPI2 address.
 //! * `T6020` / J414s (MacBook Pro 14", M2 Pro): the driver does the warm
 //!   single-message registration over a 0x40000 window.
 
@@ -173,11 +175,44 @@ const T6020: PlatformProfile = PlatformProfile {
     },
 };
 
+/// M1 Pro (J316s). The M1 family cold-boots its SEP like T8103, so the boot
+/// path, shared-memory geometry and strict keybag encoding follow T8103. The
+/// sensor sits on SPI2 at the T6020 address, in the mode T6020 verified: the
+/// J313, J316s and J414s platform device trees describe the same sensor
+/// (id 0x3352) identically.
+const T6000: PlatformProfile = PlatformProfile {
+    name: "T6000/J316s",
+    shmem_capacity: 0x3_0000,
+    shmem_first_item: b"CNIP",
+    bootstrap: Bootstrap::Boot,
+    identity: IdentitySource::Chosen,
+    sensor: SensorProfile {
+        controller_base: 0x3_9b10_8000,
+        chip_select: 0,
+        max_hz: 8_000_000,
+        cs_setup_ns: 20,
+        cs_hold_ns: 20,
+        mode: SpiMode::Mode2,
+        expected_id: 0x3352,
+        capture_qualified: false,
+    },
+    dart_range_required: false,
+    firmware_region: c"sepfw",
+    keybag_create: KeybagCreate {
+        variant: 0,
+        bag_type: 0x20000,
+        arg: 0,
+    },
+};
+
 static_assert!(T8103.shmem_capacity == 0x30000);
 static_assert!(T6020.shmem_capacity == 0x40000);
+static_assert!(T6000.shmem_capacity == T8103.shmem_capacity);
 static_assert!(T8103.sensor.controller_base == 0x235108000);
 static_assert!(T6020.sensor.controller_base == 0x39b108000);
+static_assert!(T6000.sensor.controller_base == T6020.sensor.controller_base);
 static_assert!(T8103.sensor.expected_id == T6020.sensor.expected_id);
+static_assert!(T6000.sensor.expected_id == T6020.sensor.expected_id);
 
 /// Whether the machine root declares `compatible`.
 ///
@@ -215,6 +250,9 @@ pub(crate) fn detect() -> Result<&'static PlatformProfile> {
     }
     if machine_has(b"apple,t6020") {
         return Ok(&T6020);
+    }
+    if machine_has(b"apple,t6000") {
+        return Ok(&T6000);
     }
     Err(ENODEV)
 }
