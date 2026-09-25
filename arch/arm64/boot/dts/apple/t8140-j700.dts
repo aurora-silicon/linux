@@ -97,6 +97,10 @@
 	status = "okay";
 };
 
+&aop_als {
+	firmware-name = "apple/j700-aop-als-cal.bin";
+};
+
 &aop_audio {
 	apple,chassis-name = "J700";
 	apple,machine-kind = "MacBook Neo";

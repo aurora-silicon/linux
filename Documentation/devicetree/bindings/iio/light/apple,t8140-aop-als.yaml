@@ -15,6 +15,12 @@ description:
   application-processor MMIO or interrupt resource. Machine calibration is
   supplied separately through the firmware loader, not inline in this node.
 
+  The AOP firmware does not start the sensor until the application processor
+  has handed it the sensor's calibration over the AOP's setup-port mailbox.
+  The calibration is an 80-byte message that is specific to the machine and
+  is not part of the operating system; the machine's own firmware sends the
+  same message to the AOP.
+
 select:
   properties:
     compatible:
@@ -28,6 +34,13 @@ properties:
     items:
       - const: apple,t8140-aop-als
       - const: apple,aop-als
+
+  firmware-name:
+    maxItems: 1
+    description:
+      Name of the file that holds the sensor's 80-byte setup-port calibration
+      message, to be loaded through the firmware loader and passed to the AOP
+      unchanged. Without it the sensor stays unstarted and reports nothing.
 
 required:
   - compatible

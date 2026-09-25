@@ -8,24 +8,52 @@ use kernel::{
     bindings, c_str,
     device::Core,
     firmware::Firmware,
-    iio::common::aop_sensors::{AopSensorData, IIORegistration, MessageProcessor},
+    iio::common::aop_sensors::{AopSensorData, IIORegistration, MessageProcessor, MICRO},
     module_platform_driver, of, platform,
     prelude::*,
-    soc::apple::aop::{EPICService, AOP},
-    sync::Arc,
-    types::ForeignOwnable,
+    soc::apple::aop::{EPICService, FakehidRegistration, AOP},
 };
 
 const EPIC_SUBTYPE_GET_AOP_PROPERTY: u16 = 0xa;
 const EPIC_SUBTYPE_SET_ALS_PROPERTY: u16 = 0x4;
+
+/* ALS properties. */
+const ALS_PROP_INTERVAL: u32 = 0x00;
+const ALS_PROP_CALIBRATION: u32 = 0x0b;
+const ALS_PROP_BATCH_INTERVAL: u32 = 0x16;
+const ALS_PROP_RAW_INTERVAL: u32 = 0x5c;
+const ALS_PROP_VERBOSITY: u32 = 0xe1;
+
+/*
+ * The CT817 starts reporting on the zero to non-zero transition of its
+ * report interval, and it accepts that transition only once its batch and
+ * raw interval properties have been written. Despite their names these two
+ * are not intervals; they are the values the sensor is configured with on
+ * the T8140. The sensor answers every one of these writes with a
+ * not-permitted status and applies them regardless, so the status is only
+ * logged.
+ */
+const ALS_BATCH_INTERVAL: u32 = 1;
+const ALS_RAW_INTERVAL: u32 = 0;
+const ALS_VERBOSITY: u32 = 6;
+/// The reporting interval in microseconds.
+const ALS_INTERVAL_US: u32 = 200000;
 const LUX_OFFSET_CT720: usize = 0x1d;
 const LUX_OFFSET_VD6286: usize = 0x28;
+/*
+ * The CT817 sends a 32-byte report: two raw channel floats at +0x08 and
+ * +0x0c and the lux float at +0x1c, one byte below the CT720's, so the two
+ * parts do not share a layout.
+ */
+const LUX_OFFSET_CT817: usize = 0x1c;
 
 fn get_lux_offset(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Result<usize> {
     let name = get_aop_property(aop, svc, 0xf, 16)?.1;
     match name.as_slice() {
         b"Redbird\0" => Ok(LUX_OFFSET_VD6286),
         b"FireFish2\0" => Ok(LUX_OFFSET_CT720),
+        // The T8140 AOP reports the part number rather than a code name.
+        b"CT817\0" => Ok(LUX_OFFSET_CT817),
         _ => {
             dev_warn!(
                 dev.as_ref(),
@@ -37,12 +65,46 @@ fn get_lux_offset(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> R
     }
 }
 
-fn enable_als(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Result<()> {
-    let fw = Firmware::request(c_str!("apple/aop-als-cal.bin"), dev.as_ref())?;
-    set_als_property(aop, svc, 0xb, fw.data())?;
-    set_als_property(aop, svc, 0, &200000u32.to_le_bytes())?;
+fn enable_als(
+    aop: &dyn AOP,
+    dev: &platform::Device,
+    svc: &EPICService,
+    offset: usize,
+) -> Result<()> {
+    if offset != LUX_OFFSET_CT817 {
+        let fw = Firmware::request(c_str!("apple/aop-als-cal.bin"), dev.as_ref())?;
+        set_als_property(aop, svc, ALS_PROP_CALIBRATION, fw.data())?;
+        set_als_property(aop, svc, ALS_PROP_INTERVAL, &ALS_INTERVAL_US.to_le_bytes())?;
+        return Ok(());
+    }
 
-    Ok(())
+    // The CT817 gets its calibration from the AOP driver over the setup port,
+    // not as an ALS property. Only the transport can fail here; the sensor's
+    // status words are logged, see the property comments above. Do not fetch
+    // the HID report descriptor (subtype 0x01) on this endpoint: the AOP never
+    // answers it, and do not write the MODE (0xd7) or 0xe4 properties: either
+    // wedges the AOP for the rest of the boot.
+    let set = |tag: u32, val: u32, what: &str| -> Result<()> {
+        let status = set_als_property(aop, svc, tag, &val.to_le_bytes())?;
+        dev_dbg!(
+            dev.as_ref(),
+            "{} = {:#x}: status {:#x}\n",
+            what,
+            val,
+            status
+        );
+        Ok(())
+    };
+    set(ALS_PROP_VERBOSITY, ALS_VERBOSITY, "verbosity")?;
+    set(
+        ALS_PROP_BATCH_INTERVAL,
+        ALS_BATCH_INTERVAL,
+        "batch interval",
+    )?;
+    set(ALS_PROP_RAW_INTERVAL, ALS_RAW_INTERVAL, "raw interval")?;
+    // The interval is zero at probe, so this is the transition that arms the
+    // sensor.
+    set(ALS_PROP_INTERVAL, ALS_INTERVAL_US, "interval")
 }
 
 fn get_aop_property(
@@ -65,39 +127,46 @@ fn set_als_property(aop: &dyn AOP, svc: &EPICService, tag: u32, data: &[u8]) -> 
     aop.epic_call(svc, EPIC_SUBTYPE_SET_ALS_PROPERTY, &buf)
 }
 
-fn f32_to_u32(f: u32) -> u32 {
-    if f & 0x80000000 != 0 {
-        return 0;
+/// Converts the bits of an IEEE 754 single to microlux, rounding down.
+/// Negative values clamp to zero; NaN and the infinities carry no reading.
+/// Values beyond `MAX_MICRO` saturate when they are stored.
+fn f32_to_micro(f: u32) -> Option<u64> {
+    let exp = ((f >> 23) & 0xff) as i32;
+    if exp == 0xff {
+        return None;
     }
-    let exp = ((f & 0x7f800000) >> 23) as i32 - 127;
-    if exp < 0 {
-        return 0;
+    if f & 0x8000_0000 != 0 || exp == 0 {
+        return Some(0);
     }
-    if exp == 128 && f & 0x7fffff != 0 {
-        return 0;
-    }
-    let mant = f & 0x7fffff | 0x800000;
-    if exp <= 23 {
-        return mant >> (23 - exp);
-    }
-    if exp >= 32 {
-        return u32::MAX;
-    }
-    mant << (exp - 23)
+    // The value is mant * 2^shift; scaled to microlux it is below 2^44
+    // before the shift, so a left shift of up to 19 cannot overflow.
+    let mant = u64::from(f & 0x7f_ffff | 0x80_0000) * MICRO;
+    let shift = exp - 127 - 23;
+    Some(if shift >= 20 {
+        u64::MAX
+    } else if shift >= 0 {
+        mant << shift
+    } else if shift <= -64 {
+        0
+    } else {
+        mant >> -shift
+    })
 }
 
 struct MsgProc(usize);
 
 impl MessageProcessor for MsgProc {
-    fn process(&self, message: &[u8]) -> u32 {
-        let offset = self.0;
-        let raw = u32::from_le_bytes(message[offset..offset + 4].try_into().unwrap());
-        f32_to_u32(raw)
+    fn process(&self, message: &[u8]) -> Option<u64> {
+        let raw = message.get(self.0..self.0 + 4)?;
+        f32_to_micro(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
     }
 }
 
-#[repr(transparent)]
-struct IIOAopAlsDriver(IIORegistration<MsgProc>);
+struct IIOAopAlsDriver {
+    /// Declared first: the subscription ends before the IIO device goes.
+    listener: FakehidRegistration,
+    _iio: IIORegistration<MsgProc>,
+}
 
 kernel::of_device_table!(
     OF_TABLE,
@@ -113,25 +182,33 @@ impl platform::Driver for IIOAopAlsDriver {
 
     fn probe(pdev: &platform::Device<Core>, _info: Option<&()>) -> impl PinInit<Self, Error> {
         let dev = pdev.as_ref();
-        let parent = dev.parent().unwrap();
-        // SAFETY: our parent is AOP, and AopDriver is repr(transparent) for Arc<dyn Aop>
-        let adata_ptr = unsafe { Pin::<KBox<Arc<dyn AOP>>>::borrow(parent.get_drvdata()) };
-        let adata = (&*adata_ptr).clone();
-        // SAFETY: AOP sets the platform data correctly
-        let service = unsafe { *((*dev.as_raw()).platform_data as *const EPICService) };
+        // SAFETY: This driver binds only to the service devices the AOP core
+        // registers, and `pdev` is being probed.
+        let adata = unsafe { <dyn AOP>::from_child(dev) }?;
+        // SAFETY: `dev` is a valid device; the AOP core attached its service
+        // record as the platform data of every service device it registers.
+        let service = unsafe { (*dev.as_raw()).platform_data.cast::<EPICService>() };
+        if service.is_null() {
+            return Err(ENODEV);
+        }
+        // SAFETY: The record lives as long as the device it is attached to.
+        let service = unsafe { *service };
         let ty = bindings::BINDINGS_IIO_LIGHT;
         let offset = get_lux_offset(adata.as_ref(), pdev, &service)?;
         let data = AopSensorData::new(dev.into(), ty, MsgProc(offset))?;
-        adata.add_fakehid_listener(service, data.clone())?;
-        enable_als(adata.as_ref(), pdev, &service)?;
+        let listener = FakehidRegistration::new(adata.clone(), service, data.clone())?;
+        enable_als(adata.as_ref(), pdev, &service, offset)?;
         let info_mask = 1 << bindings::BINDINGS_IIO_CHAN_INFO_PROCESSED;
-        Ok(IIOAopAlsDriver(IIORegistration::<MsgProc>::new(
-            data,
-            c"aop-sensors-als",
-            ty,
-            info_mask,
-            &THIS_MODULE,
-        )?))
+        let iio =
+            IIORegistration::<MsgProc>::new(data, c"aop-sensors-als", ty, info_mask, &THIS_MODULE)?;
+        Ok(IIOAopAlsDriver {
+            listener,
+            _iio: iio,
+        })
+    }
+
+    fn unbind(_dev: &platform::Device<Core>, this: Pin<&Self>) {
+        this.listener.unregister();
     }
 }
 
