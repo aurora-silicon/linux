@@ -755,6 +755,8 @@ impl WorkItem for AopServiceRegisterWork {
     type Pointer = Pin<KBox<AopServiceRegisterWork>>;
 
     fn run(this: Pin<KBox<AopServiceRegisterWork>>) {
+        // Held until the device has been registered: the registration takes
+        // its own reference on the node only then.
         let fwnode = this
             .data
             .dev
@@ -769,12 +771,16 @@ impl WorkItem for AopServiceRegisterWork {
             data: &this.service as *const EPICService as *const _,
             size_data: mem::size_of::<EPICService>(),
             dma_mask: 0,
-            fwnode: fwnode.map(|x| x.as_raw()).unwrap_or(ptr::null_mut()),
+            fwnode: fwnode
+                .as_ref()
+                .map(|x| x.as_raw())
+                .unwrap_or(ptr::null_mut()),
             swnode: ptr::null_mut(),
             properties: ptr::null_mut(),
             of_node_reused: false,
         };
         let pdev = unsafe { from_err_ptr(bindings::platform_device_register_full(&info)) };
+        drop(fwnode);
         match pdev {
             Err(e) => {
                 dev_err!(
