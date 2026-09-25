@@ -428,6 +428,18 @@ struct tb_regs_port_header {
 #define ADP_DP_CS_2_ESTIMATED_BW_SHIFT		24
 #define ADP_DP_CS_3				0x03
 #define ADP_DP_CS_3_HPDC			BIT(9)
+/*
+ * Apple silicon host DP IN adapter: pulsing this tells the adapter to
+ * propagate HPD to ADP_DP_CS_2_HPD. Ported from aurora-silicon/linux#8
+ * (t8103, hardware-tested).
+ */
+#define ADP_DP_CS_3_HPD_PROPAGATE		BIT(10)
+/*
+ * Apple silicon host: hold the DP OUT (hub-side) adapter's own link
+ * training off while a tunnel is up -- the host's DPTX trains the sink
+ * through the tunnel itself. Same source as HPD_PROPAGATE above.
+ */
+#define ADP_DP_CS_3_NO_AUTO_LT			BIT(8)
 #define DP_LOCAL_CAP				0x04
 #define DP_REMOTE_CAP				0x05
 /* For DP IN adapter */
@@ -470,6 +482,11 @@ struct tb_regs_port_header {
 #define ADP_DP_CS_8				0x08
 #define ADP_DP_CS_8_DPME			BIT(30)
 #define ADP_DP_CS_8_DR				BIT(31)
+#define ADP_DP_CS_13				0x0d
+/* USB4 CM Guide 5.4.1.4: DPTX Discovery Mode. Bit position not in that
+ * guide; bit 0 is the enable-style field used on other DP CS words.
+ */
+#define ADP_DP_CS_13_DPTX_DISCOVERY_MODE	BIT(0)
 
 /* PCIe adapter registers */
 #define ADP_PCIE_CS_0				0x00

@@ -493,6 +493,13 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 static struct dcp_read_edt_data_resp
 dcpep_cb_read_edt_data(struct apple_dcp *dcp, struct dcp_read_edt_data_req *req)
 {
+	/* Observe boot-property requests without inventing firmware timings. */
+	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_eDP)
+		dev_info(dcp->dev,
+			 "read_edt_data key=%.*s count=%u default0=%#x ret=0\n",
+			 (int)sizeof(req->key), req->key, req->count,
+			 req->value[0]);
+
 	return (struct dcp_read_edt_data_resp){
 		.value[0] = req->value[0],
 		.ret = 0,
@@ -602,6 +609,12 @@ static u8 dcpep_cb_prop_end(struct apple_dcp *dcp,
 			    struct dcp_set_dcpav_prop_end_req *req)
 {
 	u8 resp = dcpep_process_chunks(dcp, req);
+
+	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_eDP)
+		dev_info(dcp->dev,
+			 "DCP property key=%.*s bytes=%zu accepted=%u nr_modes=%u\n",
+			 (int)sizeof(req->key), req->key, dcp->chunks.length,
+			 resp, dcp->nr_modes);
 
 	/* move chunked data to connector to provide it via debugfs */
 	dcp_connector_update_dict(dcp->connector, req->key, &dcp->chunks);
@@ -1029,6 +1042,13 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 	 */
 	if (dcp->main_display)
 		return;
+	/*
+	 * Report firmware hotplug independently of the USB4 PHY experiment.
+	 * Reassigning lpdptxphy blanked eDP even with these callbacks ignored;
+	 * suppressing connector notifications does not protect the panel.
+	 * Mode probing still uses this DCP's firmware modes, and mode_valid
+	 * rejects modes absent from that list. Do not synthesize a mode here.
+	 */
 
 	/*
 	 * Deasserting synthetic Type-C HPD for DPMS is not a cable unplug.
@@ -1056,8 +1076,8 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 		return;
 	}
 
-	dev_info(dcp->dev, "cb_hotplug() connected:%llu, valid_mode:%d\n",
-		 *connected, dcp->valid_mode);
+	dev_info(dcp->dev, "cb_hotplug() connected:%llu, valid_mode:%d nr_modes:%u\n",
+		 *connected, dcp->valid_mode, dcp->nr_modes);
 
 	/* Hotplug invalidates mode. DRM doesn't always handle this. */
 	if (!(*connected)) {

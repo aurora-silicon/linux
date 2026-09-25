@@ -11,6 +11,7 @@
 
 #include "t6021.dtsi"
 #include "t602x-j414-j416.dtsi"
+#include "t6021-display2.dtsi"
 
 / {
 	compatible = "apple,j416c", "apple,t6021", "apple,arm-platform";

@@ -1,0 +1,308 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Extra external display controllers (dcpext2 / dcpext3) for M2 Max laptops.
+ *
+ * The M2 Max die has four external DCPs; the base support wires only dcpext0
+ * (HDMI + Type-C) and dcpext1 (Type-C). This adds dcpext2 and dcpext3 as
+ * further Type-C route candidates so all three Type-C ports (plus HDMI) can
+ * drive a display at once. M2 Pro (t6020) has only two external DCPs, so this
+ * is included by the t6021 (Max) laptop boards only.
+ *
+ * Requires MAX_DARTS_PER_DEVICE >= 5 in drivers/iommu/apple-dart.c: the
+ * display-subsystem lists one scanout DART (SID 0) per DCP, and dcpext2/3
+ * push that list past the stock cap of 3.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/ {
+	aliases {
+		dcpext2 = &dcpext2;
+		dcpext3 = &dcpext3;
+	};
+
+	clk_dispext2: clock-dispext2 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <0>;
+		clock-output-names = "clk_dispext2";
+	};
+
+	clk_dispext3: clock-dispext3 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <0>;
+		clock-output-names = "clk_dispext3";
+	};
+};
+
+&{/soc} {
+
+	dispext2_dart: iommu@48d304000 {
+		compatible = "apple,t6020-dart", "apple,t8110-dart";
+		reg = <0x4 0x8d304000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1022 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext2_cpu0>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "okay";
+	};
+
+	dcpext2_dart: iommu@48d30c000 {
+		compatible = "apple,t6020-dart", "apple,t8110-dart";
+		reg = <0x4 0x8d30c000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1022 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext2_cpu0>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "okay";
+	};
+
+	dcpext2_mbox: mbox@48dc08000 {
+		compatible = "apple,t6020-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x4 0x8dc08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1043 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1044 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1045 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1046 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+			"recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_dispext2_cpu0>;
+		resets = <&ps_dispext2_cpu0>;
+		status = "okay";
+	};
+
+	dcpext2: dcp@48dc00000 {
+		compatible = "apple,t6020-dcpext", "apple,dcpext";
+		mboxes = <&dcpext2_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcpext2_dart 5>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
+		reg = <0x4 0x8dc00000 0x0 0x4000>,
+			<0x4 0x8c000000 0x0 0x4000000>,
+			<0x4 0x8d320000 0x0 0x4000>,
+			<0x4 0x8d344000 0x0 0x4000>,
+			<0x4 0x8d800000 0x0 0x800000>;
+		apple,bw-scratch = <&pmgr_dcp 0 4 0x1220>;
+		apple,iomfb-surfaces = <1 1 0 1>;
+		power-domains = <&ps_dispext2_cpu0>;
+		resets = <&ps_dispext2_cpu0>;
+		clocks = <&clk_dispext2>;
+		apple,dcp-index = <3>;
+		status = "okay";
+		apple,connector-type = "USB-C";
+		apple,dptx-phy = <1>;
+		phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>,
+		       <&atcphy2 PHY_TYPE_DP>;
+		phy-names = "typec0", "typec1", "typec2";
+		mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>,
+			       <&atcphy2_xbar 0>;
+		mux-control-names = "typec0", "typec1", "typec2";
+		apple,typec-mux-indices = <4 4 4>;
+		apple,typec-dptx-phys = <0 1 2>;
+		#address-cells = <2>;
+		#size-cells = <2>;
+
+		piodma {
+			iommus = <&dispext2_dart 4>;
+		};
+
+		typec-routes {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			route@0 {
+				reg = <0>;
+				mode-switch;
+				port {
+					dcpext2_typec0: endpoint {
+						remote-endpoint = <&typec0_dcpext2>;
+					};
+				};
+			};
+
+			route@1 {
+				reg = <1>;
+				mode-switch;
+				port {
+					dcpext2_typec1: endpoint {
+						remote-endpoint = <&typec1_dcpext2>;
+					};
+				};
+			};
+
+			route@2 {
+				reg = <2>;
+				mode-switch;
+				port {
+					dcpext2_typec2: endpoint {
+						remote-endpoint = <&typec2_dcpext2>;
+					};
+				};
+			};
+		};
+	};
+
+	dispext3_dart: iommu@50d304000 {
+		compatible = "apple,t6020-dart", "apple,t8110-dart";
+		reg = <0x5 0x0d304000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1058 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext3_cpu0>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "okay";
+	};
+
+	dcpext3_dart: iommu@50d30c000 {
+		compatible = "apple,t6020-dart", "apple,t8110-dart";
+		reg = <0x5 0x0d30c000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1058 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext3_cpu0>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "okay";
+	};
+
+	dcpext3_mbox: mbox@50dc08000 {
+		compatible = "apple,t6020-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x5 0x0dc08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1079 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1080 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1081 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1082 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+			"recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_dispext3_cpu0>;
+		resets = <&ps_dispext3_cpu0>;
+		status = "okay";
+	};
+
+	dcpext3: dcp@50dc00000 {
+		compatible = "apple,t6020-dcpext", "apple,dcpext";
+		mboxes = <&dcpext3_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcpext3_dart 5>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
+		reg = <0x5 0x0dc00000 0x0 0x4000>,
+			<0x5 0x0c000000 0x0 0x4000000>,
+			<0x5 0x0d320000 0x0 0x4000>,
+			<0x5 0x0d344000 0x0 0x4000>,
+			<0x5 0x0d800000 0x0 0x800000>;
+		apple,bw-scratch = <&pmgr_dcp 0 4 0x1228>;
+		apple,iomfb-surfaces = <1 1 0 1>;
+		power-domains = <&ps_dispext3_cpu0>;
+		resets = <&ps_dispext3_cpu0>;
+		clocks = <&clk_dispext3>;
+		apple,dcp-index = <4>;
+		status = "okay";
+		apple,connector-type = "USB-C";
+		apple,dptx-phy = <1>;
+		phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>,
+		       <&atcphy2 PHY_TYPE_DP>;
+		phy-names = "typec0", "typec1", "typec2";
+		mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>,
+			       <&atcphy2_xbar 0>;
+		mux-control-names = "typec0", "typec1", "typec2";
+		apple,typec-mux-indices = <6 6 6>;
+		apple,typec-dptx-phys = <0 1 2>;
+		#address-cells = <2>;
+		#size-cells = <2>;
+
+		piodma {
+			iommus = <&dispext3_dart 4>;
+		};
+
+		typec-routes {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			route@0 {
+				reg = <0>;
+				mode-switch;
+				port {
+					dcpext3_typec0: endpoint {
+						remote-endpoint = <&typec0_dcpext3>;
+					};
+				};
+			};
+
+			route@1 {
+				reg = <1>;
+				mode-switch;
+				port {
+					dcpext3_typec1: endpoint {
+						remote-endpoint = <&typec1_dcpext3>;
+					};
+				};
+			};
+
+			route@2 {
+				reg = <2>;
+				mode-switch;
+				port {
+					dcpext3_typec2: endpoint {
+						remote-endpoint = <&typec2_dcpext3>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&display {
+	iommus = <&disp0_dart 0>, <&dispext0_dart 0>, <&dispext1_dart 0>,
+		 <&dispext2_dart 0>, <&dispext3_dart 0>;
+};
+
+&typec0 {
+	ports {
+		port@3 {
+			typec0_dcpext2: endpoint@2 {
+				reg = <2>;
+				remote-endpoint = <&dcpext2_typec0>;
+			};
+			typec0_dcpext3: endpoint@3 {
+				reg = <3>;
+				remote-endpoint = <&dcpext3_typec0>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		port@3 {
+			typec1_dcpext2: endpoint@2 {
+				reg = <2>;
+				remote-endpoint = <&dcpext2_typec1>;
+			};
+			typec1_dcpext3: endpoint@3 {
+				reg = <3>;
+				remote-endpoint = <&dcpext3_typec1>;
+			};
+		};
+	};
+};
+
+&typec2 {
+	ports {
+		port@3 {
+			typec2_dcpext2: endpoint@2 {
+				reg = <2>;
+				remote-endpoint = <&dcpext2_typec2>;
+			};
+			typec2_dcpext3: endpoint@3 {
+				reg = <3>;
+				remote-endpoint = <&dcpext3_typec2>;
+			};
+		};
+	};
+};

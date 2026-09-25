@@ -198,7 +198,15 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 int afk_send_command(struct apple_epic_service *service, u8 type,
 		     const void *payload, size_t payload_len, void *output,
 		     size_t output_len, u32 *retcode);
+int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
+			     const void *payload, size_t payload_len,
+			     void *output, size_t output_len, u32 *retcode,
+			     unsigned int timeout_ms);
 int afk_service_call(struct apple_epic_service *service, u16 group, u32 command,
 		     const void *data, size_t data_len, size_t data_pad,
 		     void *output, size_t output_len, size_t output_pad);
+int afk_service_call_timeout(struct apple_epic_service *service, u16 group,
+			     u32 command, const void *data, size_t data_len,
+			     size_t data_pad, void *output, size_t output_len,
+			     size_t output_pad, unsigned int timeout_ms);
 #endif
