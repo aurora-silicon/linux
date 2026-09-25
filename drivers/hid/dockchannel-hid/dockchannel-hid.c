@@ -165,6 +165,7 @@ struct dchid_iface {
 	struct gpio_desc *gpio;
 	char gpio_name[MAX_GPIO_NAME];
 	int gpio_id;
+	bool gpio_announced;
 
 	struct mutex out_mutex;
 	u32 out_flags;
@@ -477,6 +478,7 @@ done:
 static int dchid_request_gpio(struct dchid_iface *iface)
 {
 	char prop_name[MAX_GPIO_NAME + 16];
+	int ret;
 
 	if (iface->gpio)
 		return 0;
@@ -488,10 +490,12 @@ static int dchid_request_gpio(struct dchid_iface *iface)
 
 	iface->gpio = devm_gpiod_get_index(iface->dchid->dev, prop_name, 0, GPIOD_OUT_LOW);
 
-	if (IS_ERR_OR_NULL(iface->gpio)) {
-		dev_err(iface->dchid->dev, "Failed to request GPIO %s-gpios\n", prop_name);
+	if (IS_ERR(iface->gpio)) {
+		ret = PTR_ERR(iface->gpio);
 		iface->gpio = NULL;
-		return -1;
+		dev_err(iface->dchid->dev, "Failed to request GPIO %s-gpios: %d\n",
+			prop_name, ret);
+		return ret;
 	}
 
 	return 0;
@@ -518,7 +522,7 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		goto err;
 
 	/* If we need a GPIO, make sure we have it. */
-	if (iface->gpio_id) {
+	if (iface->gpio_announced) {
 		ret = dchid_request_gpio(iface);
 		if (ret < 0)
 			goto err;
@@ -849,7 +853,7 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 				break;
 			}
 
-			if (iface->gpio_id) {
+			if (iface->gpio_announced) {
 				dev_err(dchid->dev,
 					"Cannot request more than one GPIO per interface!\n");
 				break;
@@ -857,6 +861,7 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 
 			strscpy(iface->gpio_name, req->name, MAX_GPIO_NAME);
 			iface->gpio_id = req->id;
+			iface->gpio_announced = true;
 			break;
 		}
 
@@ -912,6 +917,12 @@ static void dchid_handle_gpio(struct dockchannel_hid *dchid, void *data, size_t 
 
 	if (cmd->iface >= MAX_INTERFACES || !(iface = dchid->ifaces[cmd->iface])) {
 		dev_err(dchid->dev, "Got GPIO command for bad inteface %d\n", cmd->iface);
+		goto err;
+	}
+
+	if (!iface->gpio_announced) {
+		dev_err(dchid->dev, "Got GPIO command for %s, which announced no GPIO\n",
+			iface->name);
 		goto err;
 	}
 
