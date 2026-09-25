@@ -24,6 +24,7 @@ use kernel::{
         DmaMask, //
     },
     error::from_err_ptr,
+    fmt,
     io::{
         mem::IoMem,
         Io,
@@ -273,6 +274,8 @@ struct AFKEndpoint {
     rxbuf: Option<AFKRingBuffer>,
     seq: u16,
     calls: [Option<CallSlot>; AOP_MAX_CALLS],
+    /// Messages this endpoint could not handle, for throttling their logging.
+    dropped: u32,
 }
 
 impl AFKEndpoint {
@@ -285,6 +288,7 @@ impl AFKEndpoint {
             rxbuf: None,
             seq: 0,
             calls: [const { None }; AOP_MAX_CALLS],
+            dropped: 0,
         }
     }
 
@@ -524,16 +528,30 @@ impl AFKEndpoint {
             }
             msg_buf.resize(qeh.size as usize, 0, GFP_KERNEL)?;
             self.memcpy_from_iomem(base + rptr + QEH_SIZE, &mut msg_buf)?;
-            let Some((header, msg)) = EPICHeaderFields::decode(&msg_buf) else {
-                dev_err!(
-                    client.dev,
-                    "Short EPIC message ({} bytes) on ep {}",
-                    msg_buf.len(),
-                    self.index
-                );
-                return Err(EIO);
-            };
-            self.handle_ipc(client, qeh, &header, msg)?;
+            // A message the endpoint cannot handle is skipped. The ring
+            // position is still good, and not advancing past the entry would
+            // read it again on every doorbell and stall the endpoint for good.
+            match EPICHeaderFields::decode(&msg_buf) {
+                None => {
+                    self.drop_message(&client.dev, fmt!("short message ({} bytes)", msg_buf.len()))
+                }
+                Some((header, msg)) => {
+                    if let Err(e) = self.handle_ipc(client, qeh, &header, msg) {
+                        let channel = qeh.channel;
+                        self.drop_message(
+                            &client.dev,
+                            fmt!(
+                                "category {:#x} subtype {:#x} tag {} on channel {}: {:?}",
+                                header.category,
+                                header.subtype,
+                                header.tag,
+                                channel,
+                                e
+                            ),
+                        );
+                    }
+                }
+            }
             rptr = align_up(rptr + QEH_SIZE + qeh.size as usize, block_size) % buf_size;
             mem_sync();
             self.iomem_write32(buf_offset + block_size, rptr as u32)?;
@@ -542,6 +560,23 @@ impl AFKEndpoint {
         }
         Ok(())
     }
+    /// Counts a message the endpoint could not handle and logs it. The log
+    /// is throttled to the powers of two of the count, so that a stream of
+    /// such messages cannot flood it.
+    fn drop_message(&mut self, dev: &device::Device, why: fmt::Arguments<'_>) {
+        self.dropped = self.dropped.saturating_add(1);
+        if self.dropped.is_power_of_two() {
+            dev_warn!(
+                dev,
+                "Endpoint {:#04x} dropped a message: {} ({} so far)",
+                self.index,
+                why,
+                self.dropped
+            );
+        }
+    }
+    /// Dispatches one message. An error means the message was not handled;
+    /// the caller logs it and skips the message.
     fn handle_ipc(
         &mut self,
         client: ArcBorrow<'_, AopData>,
@@ -553,13 +588,7 @@ impl AFKEndpoint {
         if ehdr.category == EPIC_CATEGORY_REPORT {
             if subtype == EPIC_SUBTYPE_STD_SERVICE {
                 if data.len() < EPIC_ANNOUNCE_LEN {
-                    dev_err!(
-                        client.dev,
-                        "Short service announcement ({} bytes) on endpoint {}",
-                        data.len(),
-                        self.index
-                    );
-                    return Err(EIO);
+                    return Err(EMSGSIZE);
                 }
                 let name = &data[..EPIC_ANNOUNCE_NAME_LEN];
                 let name = &name[..name.iter().position(|x| *x == 0).unwrap_or(name.len())];
@@ -567,38 +596,20 @@ impl AFKEndpoint {
                 return Into::<Arc<_>>::into(client).register_service(self, chan, name);
             } else if subtype == EPIC_SUBTYPE_FAKEHID_REPORT {
                 return client.process_fakehid_report(self, qhdr.channel, data);
-            } else {
-                dev_err!(
-                    client.dev,
-                    "Unexpected EPIC report subtype {:x} on endpoint {}",
-                    subtype,
-                    self.index
-                );
-                return Err(EIO);
             }
+            return Err(EINVAL);
         } else if ehdr.category == EPIC_CATEGORY_REPLY {
             if subtype == EPIC_SUBTYPE_RETCODE_PAYLOAD
                 || subtype == EPIC_SUBTYPE_RETCODE
                 || subtype == EPIC_SUBTYPE_STRING
             {
                 if data.len() < mem::size_of::<u32>() {
-                    dev_err!(
-                        client.dev,
-                        "Retcode data too short on endpoint {}",
-                        self.index
-                    );
-                    return Err(EIO);
+                    return Err(EMSGSIZE);
                 }
                 let retcode = le_u32(data, 0);
                 let tag = ehdr.tag as usize;
                 if tag == 0 || tag > self.calls.len() {
-                    dev_err!(
-                        client.dev,
-                        "Got a retcode with invalid tag {:?} on endpoint {}",
-                        tag,
-                        self.index
-                    );
-                    return Err(EIO);
+                    return Err(EINVAL);
                 }
                 let (future, ret) = match self.calls[tag - 1].take() {
                     Some(CallSlot::Pending(future, ret)) => (future, ret),
@@ -613,15 +624,8 @@ impl AFKEndpoint {
                         );
                         return Ok(());
                     }
-                    None => {
-                        dev_err!(
-                            client.dev,
-                            "Got a retcode with no call in flight (tag {}) on endpoint {}",
-                            tag,
-                            self.index
-                        );
-                        return Err(EIO);
-                    }
+                    // A reply with no call in flight.
+                    None => return Err(ENOENT),
                 };
                 let extra_data = ret.map(|mut ret| {
                     let len = cmp::min(data.len() - 4, ret.len());
@@ -635,23 +639,10 @@ impl AFKEndpoint {
                 });
 
                 return Ok(());
-            } else {
-                dev_err!(
-                    client.dev,
-                    "Unexpected EPIC reply subtype {:x} on endpoint {}",
-                    subtype,
-                    self.index
-                );
-                return Err(EIO);
             }
+            return Err(EINVAL);
         }
-        dev_err!(
-            client.dev,
-            "Unexpected EPIC category {:x} on endpoint {}",
-            ehdr.category,
-            self.index
-        );
-        Err(EIO)
+        Err(EINVAL)
     }
     /// Writes one entry into the transmit ring and returns the doorbell
     /// message that announces it. Nothing is visible to the firmware until
