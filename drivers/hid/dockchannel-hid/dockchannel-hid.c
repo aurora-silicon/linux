@@ -1119,7 +1119,7 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 
 	work = kzalloc(sizeof(*work) + hdr.length, GFP_KERNEL);
 	if (!work)
-		return;
+		goto done;
 
 	work->hdr = hdr;
 	work->iface = iface;
