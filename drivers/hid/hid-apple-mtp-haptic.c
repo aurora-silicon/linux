@@ -66,7 +66,12 @@ static int apple_actuator_probe(struct hid_device *haptic_hdev, const struct hid
 		return ret;
 	}
 
-	ret = hid_hw_start(haptic_hdev, HID_CONNECT_HIDRAW);
+	/*
+	 * The actuator has no input collection and does not need hidraw.
+	 * Claim it for the driver itself so systems with HIDRAW disabled can
+	 * still issue the output and feature reports used for haptics.
+	 */
+	ret = hid_hw_start(haptic_hdev, HID_CONNECT_DRIVER);
 	if (ret) {
 		hid_err(haptic_hdev, "hw start failed\n");
 		return ret;
