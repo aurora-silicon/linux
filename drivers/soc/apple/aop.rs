@@ -17,7 +17,7 @@ use kernel::{
     bindings,
     c_str,
     device,
-    device::Core,
+    device::{Bound, Core},
     dma::{
         Coherent,
         Device,
@@ -46,6 +46,7 @@ use kernel::{
         EPICService,
         FakehidListener,
         ReportListener,
+        SourceRing,
         AOP, //
     },
     soc::apple::mailbox,
@@ -167,6 +168,11 @@ const SETUP_REPLY_TIMEOUT_MS: u32 = 5000;
 /// The ambient light sensor's setup-port endpoint. The firmware does not
 /// start the sensor until its calibration has been sent here.
 const SETUP_ALS_EP: u8 = 0x21;
+/// The low-power microphone's setup-port endpoint, which takes the source
+/// ring binding: a 24-byte request of this operation code, the ring's IOVA
+/// and its size.
+const SETUP_SOURCE_EP: u8 = 0x20;
+const SETUP_SET_SOURCE_BUFFER: u64 = 0x6b80_3ce4_92bd_9547;
 /// The calibration is an 80-byte message: a 64-bit operation code, a 64-bit
 /// body length of 56, and 64 bytes of data that are sent as captured (the
 /// last eight lie beyond the stated body length).
@@ -915,6 +921,14 @@ struct ReportListenerEntry {
     listener: Arc<dyn ReportListener>,
 }
 
+/// The source ring and whether the firmware is known to have taken it.
+struct SourceRingBinding {
+    ring: Arc<SourceRing>,
+    /// The bind request completed. Until then the firmware may or may not
+    /// hold the ring, so it is neither freed nor bound again.
+    confirmed: bool,
+}
+
 /// One of the setup port's service endpoints, once it has its buffers: a
 /// host-to-AOP message page and an AOP-to-host reply window in the arena.
 #[derive(Clone, Copy)]
@@ -1170,6 +1184,8 @@ struct AopData {
     #[pin]
     report_listeners: Mutex<KVec<ReportListenerEntry>>,
     #[pin]
+    source_ring: Mutex<Option<SourceRingBinding>>,
+    #[pin]
     subdevices: Mutex<KVec<ChildDevice>>,
 }
 
@@ -1299,6 +1315,7 @@ impl AopData {
                     ep_shutdown <- pin_init::pin_init_array_from_fn(|_| FutureValue::pin_init()),
                     hid_listeners <- new_mutex!(KVec::new()),
                     report_listeners <- new_mutex!(KVec::new()),
+                    source_ring <- new_mutex!(None),
                     subdevices <- new_mutex!(KVec::new()),
                 }
             ),
@@ -1488,6 +1505,9 @@ impl AopData {
         if let Some(arena) = self.setup.lock().arena.take() {
             mem::forget(arena);
         }
+        if let Some(binding) = self.source_ring.lock().take() {
+            mem::forget(binding);
+        }
     }
 }
 
@@ -1631,6 +1651,36 @@ impl AOP for AopData {
         }
         false
     }
+    fn source_ring(&self, dev: &device::Device<Bound>, size: usize) -> Result<Arc<SourceRing>> {
+        if self.setup_queue.is_none() || self.transport_closing.load(Acquire) {
+            return Err(ENODEV);
+        }
+        let mut guard = self.source_ring.lock();
+        if let Some(binding) = guard.as_ref() {
+            if !binding.confirmed {
+                return Err(EIO);
+            }
+            if binding.ring.size() < size {
+                return Err(EBUSY);
+            }
+            return Ok(binding.ring.clone());
+        }
+        let buf = Coherent::<u8>::zeroed_slice(dev, size, GFP_KERNEL)?;
+        let ring = Arc::new(SourceRing::new(buf), GFP_KERNEL)?;
+        let iova = ring.iova;
+        // The binding is recorded before the firmware learns the address:
+        // whatever the request's outcome, the ring is kept and not bound
+        // again, since even a timeout may mean the firmware took it.
+        *guard = Some(SourceRingBinding {
+            ring: ring.clone(),
+            confirmed: false,
+        });
+        self.setup_bind_source(iova, size as u64)?;
+        if let Some(binding) = &mut *guard {
+            binding.confirmed = true;
+        }
+        Ok(ring)
+    }
     /// Takes the AOP down: from unbind, from a failed probe, or as a fallback
     /// from Drop. Only the first call does anything.
     fn remove(&self) {
@@ -1705,6 +1755,10 @@ impl AOP for AopData {
         }
         let arena = self.setup.lock().arena.take();
         drop(arena);
+        // The ring is DMA of the audio child; free it while the child is
+        // still registered and keeps its IOMMU domain.
+        let source = self.source_ring.lock().take();
+        drop(source);
         for child in children {
             child.unregister();
         }
@@ -1988,6 +2042,20 @@ impl AopData {
         let status = unsafe { rx.read_volatile() };
         st.send(ep, SETUP_REQUEST_DONE)?;
         Ok(status)
+    }
+
+    /// Binds the source ring to the firmware: one bind per boot.
+    fn setup_bind_source(&self, iova: u64, size: u64) -> Result<()> {
+        let mut req = [0u8; 24];
+        req[..8].copy_from_slice(&SETUP_SET_SOURCE_BUFFER.to_le_bytes());
+        req[8..16].copy_from_slice(&iova.to_le_bytes());
+        req[16..].copy_from_slice(&size.to_le_bytes());
+        let status = self.setup_request(SETUP_SOURCE_EP, &req, &[SETUP_REPLY_READY])?;
+        if status != 0 {
+            dev_err!(self.dev, "source ring bind rejected (status {:#x})", status);
+            return Err(EIO);
+        }
+        Ok(())
     }
 
     /// Sends the ambient light sensor its calibration, named by the ALS

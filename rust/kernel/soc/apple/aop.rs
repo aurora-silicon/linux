@@ -3,7 +3,8 @@
 //! Common code for AOP endpoint drivers
 
 use kernel::{
-    device::Device,
+    device::{Bound, Device},
+    dma::Coherent,
     prelude::*,
     sync::{
         atomic::{Atomic, Relaxed},
@@ -45,6 +46,51 @@ pub trait ReportListener: Send + Sync {
     fn process_report(&self, subtype: u16, data: &[u8]) -> Result<()>;
 }
 
+/// The T8140 low-power microphone source ring: a buffer the AOP firmware produces audio frames
+/// into, mapped through the audio child's IOMMU stream.
+///
+/// The firmware accepts one ring per boot (a second binding is answered with
+/// 0x2000000000000009), so the AOP core owns the allocation and hands the same ring to every
+/// probe of the audio driver.
+pub struct SourceRing {
+    buf: Coherent<[u8]>,
+    /// The IOVA the firmware produces into.
+    pub iova: u64,
+}
+
+impl SourceRing {
+    /// Wraps a coherent allocation as the source ring.
+    pub fn new(buf: Coherent<[u8]>) -> Self {
+        let iova = buf.dma_handle();
+        Self { buf, iova }
+    }
+
+    /// Size of the ring in bytes.
+    pub fn size(&self) -> usize {
+        self.buf.size()
+    }
+
+    /// Copies `dst.len()` bytes from offset `offset` of the ring into `dst`.
+    ///
+    /// The firmware writes the ring while it runs, so the copy is only meaningful for a span the
+    /// firmware has published through its producer report and has not yet reused; the caller
+    /// keeps within it and treats the data as untrusted.
+    pub fn read(&self, offset: usize, dst: &mut [u8]) -> Result<()> {
+        let end = offset.checked_add(dst.len()).ok_or(EINVAL)?;
+        if end > self.buf.size() {
+            return Err(EINVAL);
+        }
+        // SAFETY: `offset + dst.len()` does not exceed the allocation, so the source pointer and
+        // the copy stay inside it; `dst` is a distinct allocation. By the protocol above the
+        // firmware does not write the span while it is copied.
+        unsafe {
+            let src = self.buf.as_ptr().cast::<u8>().add(offset);
+            core::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len());
+        }
+        Ok(())
+    }
+}
+
 /// AOP communications manager.
 pub trait AOP: Send + Sync {
     /// Calls a method on a specified service
@@ -79,6 +125,12 @@ pub trait AOP: Send + Sync {
     /// Removes the report listener for the specified service and subtype. Returns once no
     /// callback into the listener is running any more.
     fn remove_report_listener(&self, svc: &EPICService, subtype: u16) -> bool;
+    /// The T8140 low-power microphone source ring: `size` bytes allocated on and mapped through
+    /// `dev`, the audio child, and bound to the firmware over the setup port on first use, then
+    /// shared for the rest of the AOP's lifetime. Fails with `ENODEV` on firmware without a setup
+    /// port, with `EBUSY` when the bound ring is smaller than `size`, and with `EIO` after a
+    /// binding whose outcome is unknown.
+    fn source_ring(&self, dev: &Device<Bound>, size: usize) -> Result<Arc<SourceRing>>;
     /// Internal method to detach the device.
     fn remove(&self);
 }
