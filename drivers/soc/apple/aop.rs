@@ -27,6 +27,7 @@ use kernel::{
         from_err_ptr,
         to_result, //
     },
+    firmware::Firmware,
     fmt,
     io::{
         mem::IoMem,
@@ -48,6 +49,7 @@ use kernel::{
     },
     soc::apple::mailbox,
     soc::apple::rtkit,
+    str::CString,
     sync::{
         aref::ARef,
         atomic::{
@@ -150,6 +152,26 @@ const SETUP_BUFFER_ENTRY_SIZE: usize = 16;
 /// them have theirs.
 const SETUP_ENDPOINTS: [u8; 5] = [0x20, 0x21, 0x23, 0x30, 0x32];
 const SETUP_BOOT_TIMEOUT_MS: u32 = 15000;
+// A request to a service endpoint: the payload goes into the endpoint's
+// message page, (3 << 60) | length announces it, the firmware answers with a
+// result word after writing a status byte at the start of the reply window,
+// and 4 << 60 releases the request.
+const SETUP_REQUEST_TYPE: u64 = 3 << 60;
+const SETUP_REQUEST_DONE: u64 = 4 << 60;
+/// The result word of a completed request.
+const SETUP_REPLY_READY: u64 = 0x2000000000000001;
+/// The result word the ALS calibration is answered with instead.
+const SETUP_REPLY_READY_ALT: u64 = 0x2000000000000004;
+const SETUP_REPLY_TIMEOUT_MS: u32 = 5000;
+/// The ambient light sensor's setup-port endpoint. The firmware does not
+/// start the sensor until its calibration has been sent here.
+const SETUP_ALS_EP: u8 = 0x21;
+/// The calibration is an 80-byte message: a 64-bit operation code, a 64-bit
+/// body length of 56, and 64 bytes of data that are sent as captured (the
+/// last eight lie beyond the stated body length).
+const ALS_CALIBRATION_LEN: usize = 80;
+const ALS_CALIBRATION_OPERATION: u64 = 0x0746_b8d6_6515_2e31;
+const ALS_CALIBRATION_BODY_LEN: u64 = 56;
 
 fn align_up(v: usize, a: usize) -> usize {
     (v + a - 1) & !(a - 1)
@@ -171,6 +193,11 @@ fn le_u16(b: &[u8], off: usize) -> u16 {
 /// Reads the little-endian `u32` at `off`; `b` must hold it.
 fn le_u32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+}
+
+/// Reads the little-endian `u64` at `off`; `b` must hold it.
+fn le_u64(b: &[u8], off: usize) -> u64 {
+    u64::from(le_u32(b, off)) | u64::from(le_u32(b, off + 4)) << 32
 }
 
 #[inline(always)]
@@ -878,10 +905,18 @@ struct ListenerEntry {
     listener: Arc<dyn FakehidListener>,
 }
 
-/// One of the setup port's service endpoints, once it has its buffers.
+/// One of the setup port's service endpoints, once it has its buffers: a
+/// host-to-AOP message page and an AOP-to-host reply window in the arena.
 #[derive(Clone, Copy)]
 struct SetupEndpoint {
     ep: u8,
+    tx_iova: u64,
+    rx_iova: u64,
+    /// A request is outstanding; the endpoint takes one at a time.
+    busy: bool,
+    /// The outstanding request timed out. The endpoint stays busy until the
+    /// reply arrives, so that it cannot be taken for a later request's.
+    abandoned: bool,
     /// The last word received on the endpoint that was not a buffer request.
     reply: Option<u64>,
 }
@@ -924,6 +959,25 @@ impl SetupState {
 
     fn arena_iova(&self) -> Result<u64> {
         Ok(self.arena.as_ref().ok_or(ENXIO)?.dma_handle())
+    }
+
+    /// Returns a pointer to `len` bytes at `off` in the arena after checking
+    /// that they lie inside it.
+    fn arena_ptr(&self, off: usize, len: usize) -> Result<*mut u8> {
+        let arena = self.arena.as_ref().ok_or(ENXIO)?;
+        let end = off.checked_add(len).ok_or(EINVAL)?;
+        if end > arena.size() {
+            return Err(EINVAL);
+        }
+        // SAFETY: `off + len` does not exceed the size of the allocation, so
+        // the offset pointer stays inside it.
+        Ok(unsafe { arena.as_mut_ptr().cast::<u8>().add(off) })
+    }
+
+    /// The offset of an endpoint buffer in the arena.
+    fn arena_offset(&self, iova: u64) -> Result<usize> {
+        let off = iova.checked_sub(self.arena_iova()?).ok_or(EINVAL)?;
+        usize::try_from(off).map_err(|_| EINVAL)
     }
 
     /// Boot is complete once the AP power state is on and every service
@@ -1696,6 +1750,19 @@ impl AopData {
             return self.setup_endpoint_request(st, ep, word);
         }
         if let Some(endpoint) = st.endpoint_mut(ep) {
+            if endpoint.abandoned {
+                // The late reply to a request that timed out; the endpoint
+                // takes requests again.
+                dev_warn!(
+                    self.dev,
+                    "setup port: late reply {:#x} on endpoint {:#x}",
+                    word,
+                    ep
+                );
+                endpoint.abandoned = false;
+                endpoint.busy = false;
+                return Ok(());
+            }
             endpoint.reply = Some(word);
             return Ok(());
         }
@@ -1731,7 +1798,14 @@ impl AopData {
         st.send(ep, SETUP_BUFFER_REQUEST_ACK)?;
         st.send(ep, SetupState::shared_descriptor(tx_iova, 1, true))?;
         st.send(ep, SetupState::shared_descriptor(rx_iova, rx_pages, false))?;
-        st.endpoints[slot] = Some(SetupEndpoint { ep, reply: None });
+        st.endpoints[slot] = Some(SetupEndpoint {
+            ep,
+            tx_iova,
+            rx_iova,
+            busy: false,
+            abandoned: false,
+            reply: None,
+        });
         dev_dbg!(
             self.dev,
             "setup port: endpoint {:#x} tx {:#x} rx {:#x} ({} pages)",
@@ -1768,6 +1842,148 @@ impl AopData {
                 | CondVarTimeoutResult::Signal { jiffies } => left = jiffies,
             }
         }
+    }
+
+    /// Sends `payload` as a request on setup-port endpoint `ep`, waits for
+    /// the firmware's result word, and returns the status byte the firmware
+    /// wrote to the reply window if the result is one of `accepted`. An
+    /// endpoint takes one request at a time (EBUSY otherwise). After a
+    /// timeout the endpoint stays busy until the late reply arrives.
+    fn setup_request(&self, ep: u8, payload: &[u8], accepted: &[u64]) -> Result<u8> {
+        if payload.len() > SETUP_PAGE {
+            return Err(EMSGSIZE);
+        }
+        let mut st = self.setup.lock();
+        let endpoint = st.endpoint_mut(ep).ok_or(ENXIO)?;
+        if endpoint.busy {
+            return Err(EBUSY);
+        }
+        endpoint.busy = true;
+        endpoint.reply = None;
+        let (tx_iova, rx_iova) = (endpoint.tx_iova, endpoint.rx_iova);
+        let ret = self.setup_request_locked(&mut st, ep, tx_iova, rx_iova, payload, accepted);
+        if let Some(endpoint) = st.endpoint_mut(ep) {
+            if ret == Err(ETIMEDOUT) {
+                endpoint.abandoned = true;
+            } else {
+                endpoint.busy = false;
+            }
+        }
+        ret
+    }
+
+    fn setup_request_locked(
+        &self,
+        st: &mut MutexGuard<'_, SetupState>,
+        ep: u8,
+        tx_iova: u64,
+        rx_iova: u64,
+        payload: &[u8],
+        accepted: &[u64],
+    ) -> Result<u8> {
+        let tx_off = st.arena_offset(tx_iova)?;
+        let rx_off = st.arena_offset(rx_iova)?;
+        let tx = st.arena_ptr(tx_off, payload.len())?;
+        // SAFETY: `tx` is valid for `payload.len()` bytes of the arena, and
+        // the message page is the host's until the request word below is
+        // sent; the endpoint is busy, so nothing else writes it.
+        unsafe { ptr::copy_nonoverlapping(payload.as_ptr(), tx, payload.len()) };
+        mem_sync();
+        st.send(ep, SETUP_REQUEST_TYPE | payload.len() as u64)?;
+        let replied = |st: &SetupState| {
+            st.endpoints
+                .iter()
+                .flatten()
+                .any(|e| e.ep == ep && e.reply.is_some())
+        };
+        if let Err(e) = self.setup_wait(st, SETUP_REPLY_TIMEOUT_MS, replied) {
+            dev_err!(
+                self.dev,
+                "setup port: no reply to the request on endpoint {:#x}: {:?}",
+                ep,
+                e
+            );
+            return Err(e);
+        }
+        let reply = st
+            .endpoint_mut(ep)
+            .and_then(|e| e.reply.take())
+            .ok_or(EIO)?;
+        if !accepted.contains(&reply) {
+            dev_err!(
+                self.dev,
+                "setup port: request on endpoint {:#x} answered with {:#x}",
+                ep,
+                reply
+            );
+            return Err(EIO);
+        }
+        mem_sync();
+        let rx = st.arena_ptr(rx_off, 1)?;
+        // SAFETY: `rx` is valid for one byte of the arena. The firmware wrote
+        // the status before it sent the reply and does not touch the window
+        // again until the next request.
+        let status = unsafe { rx.read_volatile() };
+        st.send(ep, SETUP_REQUEST_DONE)?;
+        Ok(status)
+    }
+
+    /// Sends the ambient light sensor its calibration, named by the ALS
+    /// node's firmware-name, before the AFK endpoints start. Without it the
+    /// sensor answers property reads and accepts its reporting interval but
+    /// never reports; the trusted side does not start it. A missing file is
+    /// not an error: the AOP's other services work without it.
+    fn setup_als_calibration(&self) -> Result<()> {
+        let Some(name) = self
+            .dev
+            .fwnode()
+            .and_then(|node| node.get_child_by_name(c_str!("als")))
+            .and_then(|als| {
+                als.property_read::<CString>(c_str!("firmware-name"))
+                    .optional()
+            })
+        else {
+            dev_info!(
+                self.dev,
+                "no ALS calibration named in the device tree; the sensor stays off"
+            );
+            return Ok(());
+        };
+        let calibration = match Firmware::request_nowarn(&name, &self.dev) {
+            Ok(calibration) => calibration,
+            Err(e) => {
+                dev_warn!(
+                    self.dev,
+                    "ALS calibration {:?} not available ({:?}); the sensor stays off",
+                    &*name,
+                    e
+                );
+                return Ok(());
+            }
+        };
+        let data = calibration.data();
+        if data.len() != ALS_CALIBRATION_LEN
+            || le_u64(data, 0) != ALS_CALIBRATION_OPERATION
+            || le_u64(data, 8) != ALS_CALIBRATION_BODY_LEN
+        {
+            dev_err!(
+                self.dev,
+                "ALS calibration {:?} is not an {}-byte calibration message",
+                &*name,
+                ALS_CALIBRATION_LEN
+            );
+            return Err(EINVAL);
+        }
+        let status = self.setup_request(
+            SETUP_ALS_EP,
+            data,
+            &[SETUP_REPLY_READY, SETUP_REPLY_READY_ALT],
+        )?;
+        if status != 0 {
+            dev_err!(self.dev, "ALS calibration rejected (status {:#x})", status);
+            return Err(EIO);
+        }
+        Ok(())
     }
 
     /// After the RTKit side has reached AP power on: requests the setup
@@ -1984,6 +2200,11 @@ impl platform::Driver for AopDriver {
             // then the AFK endpoints.
             data.wake()?;
             data.setup_finish_boot()?;
+            // Before any client reaches the ALS service: a failure here costs
+            // the sensor, not the AOP.
+            if let Err(e) = data.setup_als_calibration() {
+                dev_warn!(pdev.as_ref(), "ALS calibration failed ({:?})", e);
+            }
             data.start_afk()?;
         } else {
             data.start()?;
