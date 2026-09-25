@@ -424,6 +424,13 @@ static int dchid_get_firmware(struct dchid_iface *iface, void **firmware, size_t
 	if (ret)
 		return ret;
 
+	if (fw->size < sizeof(*hdr)) {
+		dev_warn(iface->dchid->dev, "%s: firmware too short for its header\n",
+			 fw_name);
+		ret = -EINVAL;
+		goto done;
+	}
+
 	hdr = (struct fw_header *)fw->data;
 
 	if (hdr->magic != FW_MAGIC || hdr->version != FW_VER ||
