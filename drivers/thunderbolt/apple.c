@@ -108,6 +108,9 @@
 #define APPLE_CIO_NHI_BOOT_TIMEOUT_MS 10000
 #define APPLE_CIO_PCIEC_READY_DELAY_MS 300
 
+#define APPLE_CIO_START_RETRIES 5
+#define APPLE_CIO_START_RETRY_DELAY_MS 100
+
 #define APPLE_CIO_PCIEC_INTR2AXI_CTRL 0x80
 #define APPLE_CIO_PCIEC_INTR2AXI_ENABLE BIT(0)
 
@@ -1527,9 +1530,28 @@ static int apple_cio_start(struct apple_cio *acio)
 
 	/*
 	 * After the power domains are on we need to signal and wait for the ACIO block
-	 * to actually start before we can bring up the co-processor.
+	 * to actually start before we can bring up the co-processor. This is a request/ack
+	 * handshake with the M3/PMGR firmware (reset_control_deassert() polls a shared
+	 * "busy" bit with a 100ms budget), not a self-clearing hardware flop -- there is
+	 * no .assert op to fall back on if it fails. Immediately after a system
+	 * suspend/resume cycle this firmware handshake can be slower to answer than
+	 * usual (observed once on this hardware, resuming with a cable that was already
+	 * connected before suspend, in the middle of the wider resume storm every other
+	 * coprocessor on the SoC is also going through) -- retry a bounded number of
+	 * times with backoff before giving up, rather than failing on the very first
+	 * 100ms window.
 	 */
-	ret = reset_control_deassert(acio->reset);
+	for (i = 0; i < APPLE_CIO_START_RETRIES; i++) {
+		ret = reset_control_deassert(acio->reset);
+		if (!ret)
+			break;
+		if (i + 1 < APPLE_CIO_START_RETRIES) {
+			dev_warn(acio->dev,
+				 "ACIO block failed to start (attempt %d/%d): %d, retrying\n",
+				 i + 1, APPLE_CIO_START_RETRIES, ret);
+			msleep(APPLE_CIO_START_RETRY_DELAY_MS);
+		}
+	}
 	if (ret) {
 		dev_err(acio->dev, "ACIO block failed to start: %d\n", ret);
 		goto remove_links;
