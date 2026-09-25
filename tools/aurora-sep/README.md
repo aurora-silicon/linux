@@ -13,9 +13,24 @@ systemctl enable aurora-sep.service
 ```
 
 The kernel driver locates the xART gigalocker itself inside the iBoot System
-Container (`modprobe apple_sep xart_writes=1 provision_keybag=1`, with no
-`xart_start_sector`): it opens the container directly and serves only the
-gigalocker extent, needing no external helper and no hand-supplied sector.
+Container. The service loads it with xART writes off. Before enabling writes,
+boot once read-only and check the located base in `dmesg`:
+
+```sh
+journalctl -k -b | grep 'in-kernel raw-extent owner'
+```
+
+Then pin that base and enable writes in `/etc/modprobe.d/aurora-sep.conf`.
+`xart_start_sector` is the base divided by 512, and `provision_keybag=1` is
+needed only on the boot that creates the keybag:
+
+```
+options apple_sep xart_writes=1 xart_start_sector=<base / 512> provision_keybag=1
+```
+
+Module options go in `modprobe.d` rather than on a `modprobe` command line, so
+they apply however the module is loaded. The SEP attach is one-shot per boot:
+a load with the wrong options cannot be redone without a reboot.
 
 For fingerprint support, apply
 `patches/libfprint-1.94.100-apple-sep.patch` to libfprint 1.94.100, build and

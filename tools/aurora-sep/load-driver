@@ -4,7 +4,31 @@ set -eu
 keybag=/var/lib/aurora-sep-keybag.bin
 refkey=/var/lib/aurora-sep-refkey.bin
 
-modprobe apple_sep xart_writes=1 provision_keybag=1
+# Module options live in /etc/modprobe.d/aurora-sep.conf, not on this command
+# line, so the same options apply whether this service or a manual modprobe
+# loads the module. The SEP attach is one-shot per boot, so a load with the
+# wrong options cannot be redone without a reboot.
+#
+# Writes to the iBoot System Container are opt-in. Boot read-only first, check
+# the "xART: in-kernel raw-extent owner (base 0x...)" line in dmesg, and
+# only then write, with the base pinned explicitly:
+#
+#   options apple_sep xart_writes=1 xart_start_sector=<base / 512>
+#
+# Add provision_keybag=1 for the one boot that creates the keybag.
+conf=/etc/modprobe.d/aurora-sep.conf
+
+modprobe apple_sep
+
+if ! grep -Eqs '^[[:space:]]*options[[:space:]]+apple_sep[[:space:]].*\bxart_writes=1\b' "$conf"; then
+    echo "apple_sep loaded with xART writes off; keybag checks skipped" >&2
+    exit 0
+fi
+
+if ! grep -Eqs '\bxart_start_sector=[1-9][0-9]*\b' "$conf"; then
+    echo "$conf enables xart_writes without an explicit xart_start_sector" >&2
+    exit 1
+fi
 
 work=$(mktemp -d /run/aurora-sep-load.XXXXXX)
 cleanup() {
