@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
-/* Power states used by the T8140 audio/ISP test topology.
+/*
+ * PMGR Power domains for the Apple T8140 "A18 Pro" SoC
+ *
  * Copyright The Asahi Linux Contributors
  */
 
@@ -21,6 +23,14 @@
 		label = "gpio";
 	};
 
+	ps_apcie_gp: power-controller@258 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x258 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_gp";
+	};
+
 	ps_isp_sys: power-controller@268 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x268 4>;
@@ -29,12 +39,75 @@
 		label = "isp_sys";
 	};
 
+	ps_ans: power-controller@278 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x278 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ans";
+		apple,always-on; /* handed over running, cannot be reset */
+	};
+
+	ps_apcie_sys_gp: power-controller@2a0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_sys_gp";
+		power-domains = <&ps_apcie_gp>;
+	};
+
 	ps_i2c0: power-controller@2c8 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x2c8 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "i2c0";
+	};
+
+	ps_apcie_st: power-controller@310 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x310 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_st";
+		power-domains = <&ps_ans>;
+	};
+
+	ps_apcie_sys_st: power-controller@3a0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_sys_st";
+		power-domains = <&ps_ans>, <&ps_apcie_st>;
+	};
+
+	ps_apcie_phy_sw: power-controller@3c0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3c0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_phy_sw";
+		power-domains = <&ps_apcie_sys_st>, <&ps_apcie_sys_gp>;
+	};
+
+	ps_pmp: power-controller@3d0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3d0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pmp";
+		apple,always-on;
+	};
+
+	ps_pms_sram: power-controller@3d8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3d8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pms_sram";
+		apple,always-on;
 	};
 
 	/*
@@ -154,6 +227,15 @@
 };
 
 &pmgr_mini {
+	ps_nub_spmi0: power-controller@58 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x58 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "nub_spmi0";
+		apple,always-on;
+	};
+
 	/*
 	 * AOP and audio-fabric power domains (live J700 ADT /arm-io/pmgr entries
 	 * flagged "no-ps", register slots in this block at 0x4000+).  Parents are
@@ -335,5 +417,23 @@
 		#reset-cells = <0>;
 		label = "audio_leap_tx0";
 		power-domains = <&ps_audio_leap_c>;
+	};
+
+	ps_smc_i2cm1: power-controller@8030 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8030 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "smc_i2cm1";
+		apple,always-on; /* used by the SMC firmware */
+	};
+
+	ps_smc_i2cm2: power-controller@8038 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8038 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "smc_i2cm2";
+		apple,always-on; /* used by the SMC firmware */
 	};
 };

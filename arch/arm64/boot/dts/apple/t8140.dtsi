@@ -9,6 +9,7 @@
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/pinctrl/apple.h>
+#include <dt-bindings/spmi/spmi.h>
 
 / {
 	compatible = "apple,t8140", "apple,arm-platform";
@@ -47,58 +48,81 @@
 		};
 
 		cpu_e0: cpu@0 {
-			compatible = "apple,sawtooth";
+			compatible = "apple,tahiti-e";
 			device_type = "cpu";
 			reg = <0x0 0x0>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			i-cache-size = <0x20000>;
+			d-cache-size = <0x10000>;
+			operating-points-v2 = <&ecluster_opp>;
+			performance-domains = <&cpufreq_e>;
 		};
 
 		cpu_e1: cpu@1 {
-			compatible = "apple,sawtooth";
+			compatible = "apple,tahiti-e";
 			device_type = "cpu";
 			reg = <0x0 0x1>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			i-cache-size = <0x20000>;
+			d-cache-size = <0x10000>;
+			operating-points-v2 = <&ecluster_opp>;
+			performance-domains = <&cpufreq_e>;
 		};
 
-
 		cpu_e2: cpu@2 {
-			compatible = "apple,sawtooth";
+			compatible = "apple,tahiti-e";
 			device_type = "cpu";
 			reg = <0x0 0x2>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			i-cache-size = <0x20000>;
+			d-cache-size = <0x10000>;
+			operating-points-v2 = <&ecluster_opp>;
+			performance-domains = <&cpufreq_e>;
 		};
 
 		cpu_e3: cpu@3 {
-			compatible = "apple,sawtooth";
+			compatible = "apple,tahiti-e";
 			device_type = "cpu";
 			reg = <0x0 0x3>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			i-cache-size = <0x20000>;
+			d-cache-size = <0x10000>;
+			operating-points-v2 = <&ecluster_opp>;
+			performance-domains = <&cpufreq_e>;
 		};
 
 		cpu_p0: cpu@10100 {
-			compatible = "apple,everest";
+			compatible = "apple,tahiti-p";
 			device_type = "cpu";
 			reg = <0x0 0x10100>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_1>;
+			i-cache-size = <0x30000>;
+			d-cache-size = <0x20000>;
+			operating-points-v2 = <&pcluster_opp>;
+			performance-domains = <&cpufreq_p>;
 		};
 
 		cpu_p1: cpu@10101 {
-			compatible = "apple,everest";
+			compatible = "apple,tahiti-p";
 			device_type = "cpu";
 			reg = <0x0 0x10101>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_1>;
+			i-cache-size = <0x30000>;
+			d-cache-size = <0x20000>;
+			operating-points-v2 = <&pcluster_opp>;
+			performance-domains = <&cpufreq_p>;
 		};
 
 		l2_cache_0: l2-cache-0 {
@@ -113,6 +137,116 @@
 			cache-level = <2>;
 			cache-unified;
 			cache-size = <0x1000000>;
+		};
+	};
+
+	/*
+	 * DVFS states from the ADT: voltage-states1-sram for the E cluster,
+	 * voltage-states5-sram for the P cluster. opp-level is the hardware
+	 * P-state. Transition latencies have not been measured, so there is
+	 * no clock-latency-ns.
+	 */
+	ecluster_opp: opp-table-0 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp01 {
+			opp-hz = /bits/ 64 <816000000>;
+			opp-level = <1>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <1140000000>;
+			opp-level = <2>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <1464000000>;
+			opp-level = <3>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <1788000000>;
+			opp-level = <4>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <2112000000>;
+			opp-level = <5>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <2424000000>;
+			opp-level = <6>;
+		};
+	};
+
+	pcluster_opp: opp-table-1 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp01 {
+			opp-hz = /bits/ 64 <744000000>;
+			opp-level = <1>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <1260000000>;
+			opp-level = <2>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <1620000000>;
+			opp-level = <3>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <1944000000>;
+			opp-level = <4>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <2196000000>;
+			opp-level = <5>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <2472000000>;
+			opp-level = <6>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <2688000000>;
+			opp-level = <7>;
+		};
+		opp08 {
+			opp-hz = /bits/ 64 <2916000000>;
+			opp-level = <8>;
+		};
+		opp09 {
+			opp-hz = /bits/ 64 <3144000000>;
+			opp-level = <9>;
+		};
+		opp10 {
+			opp-hz = /bits/ 64 <3336000000>;
+			opp-level = <10>;
+		};
+		opp11 {
+			opp-hz = /bits/ 64 <3504000000>;
+			opp-level = <11>;
+		};
+		opp12 {
+			opp-hz = /bits/ 64 <3648000000>;
+			opp-level = <12>;
+		};
+		opp13 {
+			opp-hz = /bits/ 64 <3756000000>;
+			opp-level = <13>;
+		};
+		opp14 {
+			opp-hz = /bits/ 64 <3864000000>;
+			opp-level = <14>;
+		};
+		opp15 {
+			opp-hz = /bits/ 64 <3924000000>;
+			opp-level = <15>;
+		};
+		opp16 {
+			opp-hz = /bits/ 64 <3972000000>;
+			opp-level = <16>;
+		};
+		opp17 {
+			opp-hz = /bits/ 64 <4044000000>;
+			opp-level = <17>;
 		};
 	};
 
@@ -140,6 +274,18 @@
 
 		nonposted-mmio;
 		ranges;
+
+		cpufreq_e: cpufreq@210e20000 {
+			compatible = "apple,t8140-cluster-cpufreq";
+			reg = <0x2 0x10e20000 0x0 0x1000>;
+			#performance-domain-cells = <0>;
+		};
+
+		cpufreq_p: cpufreq@211e20000 {
+			compatible = "apple,t8140-cluster-cpufreq";
+			reg = <0x2 0x11e20000 0x0 0x1000>;
+			#performance-domain-cells = <0>;
+		};
 
 		pmgr: power-management@300700000 {
 			compatible = "apple,t8140-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
@@ -173,6 +319,172 @@
 			clocks = <&clkref>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 507 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		nub_spmi0: spmi@308714000 {
+			compatible = "apple,t8140-spmi", "apple,t8103-spmi";
+			reg = <0x3 0x08714000 0x0 0x100>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+			#interrupt-cells = <2>;
+			interrupt-controller;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 487 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_nub_spmi0>;
+
+			pmic@e {
+				compatible = "apple,baku-pmic", "apple,spmi-nvmem";
+				reg = <0xe SPMI_USID>;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					boot_stage: boot-stage@f701 {
+						reg = <0xf701 0x1>;
+					};
+
+					boot_error_count: boot-error-count@f702,0 {
+						reg = <0xf702 0x1>;
+						bits = <0 4>;
+					};
+
+					panic_count: panic-count@f702,4 {
+						reg = <0xf702 0x1>;
+						bits = <4 4>;
+					};
+
+					shutdown_flag: shutdown-flag@f70f,3 {
+						reg = <0xf70f 0x1>;
+						bits = <3 1>;
+					};
+				};
+			};
+		};
+
+		smc: smc@30c600000 {
+			compatible = "apple,t8140-smc", "apple,t8103-smc";
+			reg = <0x3 0x0c600000 0x0 0x4000>,
+			      <0x3 0x0de00000 0x0 0x100000>;
+			reg-names = "smc", "sram";
+			mboxes = <&smc_mbox>;
+			status = "disabled";
+
+			smc_gpio: gpio {
+				compatible = "apple,smc-gpio";
+				gpio-controller;
+				#gpio-cells = <2>;
+			};
+
+			smc_hwmon: hwmon {
+				compatible = "apple,smc-hwmon";
+
+				/*
+				 * CPU cluster die temperatures. Keep these
+				 * first: the J700 CPU thermal policy reads
+				 * the first six temperature channels.
+				 */
+				temperature-Te05 {
+					apple,key-id = "Te05";
+					label = "E-cluster Temperature 1";
+				};
+
+				temperature-Te0S {
+					apple,key-id = "Te0S";
+					label = "E-cluster Temperature 2";
+				};
+
+				temperature-Tp01 {
+					apple,key-id = "Tp01";
+					label = "P-cluster Temperature 1";
+				};
+
+				temperature-Tp05 {
+					apple,key-id = "Tp05";
+					label = "P-cluster Temperature 2";
+				};
+
+				temperature-Tp09 {
+					apple,key-id = "Tp09";
+					label = "P-cluster Temperature 3";
+				};
+
+				temperature-Tp0D {
+					apple,key-id = "Tp0D";
+					label = "P-cluster Temperature 4";
+				};
+			};
+
+			smc_reboot: reboot {
+				compatible = "apple,smc-reboot";
+				nvmem-cells = <&shutdown_flag>, <&boot_stage>,
+					      <&boot_error_count>, <&panic_count>;
+				nvmem-cell-names = "shutdown_flag", "boot_stage",
+						   "boot_error_count", "panic_count";
+			};
+		};
+
+		smc_mbox: mailbox@30c608000 {
+			compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x3 0x0c608000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 581 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 582 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 583 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 584 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
+		ans_mbox: mailbox@389608000 {
+			compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x3 0x89608000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1007 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1008 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1009 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1010 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			power-domains = <&ps_ans>;
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
+		sart: iommu@38dc50000 {
+			compatible = "apple,t8140-sart", "apple,t6000-sart";
+			reg = <0x3 0x8dc50000 0x0 0x10000>;
+			power-domains = <&ps_ans>;
+			status = "disabled";
+		};
+
+		nvme: nvme@3cdcc0000 {
+			compatible = "apple,t8140-nvme-ans2", "apple,t8132-nvme-ans2";
+			/*
+			 * The ADT sizes the controller window at 0x10000, but the
+			 * linear submission queue registers at +0x24908..+0x24910
+			 * sit in the same non-secure alias.
+			 */
+			reg = <0x3 0xcdcc0000 0x0 0x30000>,
+			      <0x3 0x89600000 0x0 0x4000>,
+			      <0x3 0x8dcc0000 0x0 0x60000>;
+			reg-names = "nvme", "ans", "nvmmu";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1039 IRQ_TYPE_LEVEL_HIGH>;
+			mboxes = <&ans_mbox>;
+			apple,sart = <&sart>;
+			/*
+			 * With apcie_phy off the ANS PCIe link falls to L1 idle
+			 * and the firmware reports a link timeout.
+			 */
+			power-domains = <&ps_ans>, <&ps_apcie_sys_st>,
+					<&ps_apcie_phy_sw>;
+			power-domain-names = "ans", "apcie0", "apcie_phy";
+			resets = <&ps_ans>;
+			status = "disabled";
 		};
 	};
 };
