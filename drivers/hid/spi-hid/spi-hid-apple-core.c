@@ -35,12 +35,14 @@
 
 #define SPIHID_MAX_INPUT_REPORT_SIZE 0x800
 
-/* support only keyboard, trackpad and management dev for now */
-#define SPIHID_MAX_DEVICES 3
+/* management, keyboard, trackpad and the trackpad's actuator */
+#define SPIHID_MIN_DEVICES 3
+#define SPIHID_MAX_DEVICES 4
 
 #define SPIHID_DEVICE_ID_MNGT 0x0
 #define SPIHID_DEVICE_ID_KBD 0x1
 #define SPIHID_DEVICE_ID_TP 0x2
+#define SPIHID_DEVICE_ID_AUX 0x3
 #define SPIHID_DEVICE_ID_INFO 0xd0
 
 #define SPIHID_READ_PACKET 0x20
@@ -86,6 +88,7 @@ struct spihid_apple {
 	struct spihid_interface mngt;
 	struct spihid_interface kbd;
 	struct spihid_interface tp;
+	struct spihid_interface aux;
 
 	wait_queue_head_t wait;
 	struct mutex tx_lock; //< protects against concurrent SPI writes
@@ -279,6 +282,8 @@ static struct spihid_apple *spihid_get_data(struct spihid_interface *idev)
 		return container_of(idev, struct spihid_apple, kbd);
 	case SPIHID_DEVICE_ID_TP:
 		return container_of(idev, struct spihid_apple, tp);
+	case SPIHID_DEVICE_ID_AUX:
+		return container_of(idev, struct spihid_apple, aux);
 	default:
 		return NULL;
 	}
@@ -357,15 +362,12 @@ static int apple_ll_raw_request(struct hid_device *hdev,
 		return idev->reply_len;
 
 	case HID_REQ_SET_REPORT:
-		if (buf[0] != reportnum)
+		if (!len || buf[0] != reportnum)
 			return -EINVAL;
-		if (reportnum != idev->id) {
-			dev_warn(&spihid->spidev->dev,
-				 "device:%u reportnum:"
-				 "%hhu mismatch",
-				 idev->id, reportnum);
-			return -EINVAL;
-		}
+		/*
+		 * The report number is not the interface id: the keyboard's LED
+		 * report is 1 on interface 1, the actuator's is 0x21 on 3.
+		 */
 		return spihid_apple_request(spihid, idev->id, 0x52, reportnum, 0x00, 2, buf, len);
 	default:
 		return -EIO;
@@ -380,11 +382,13 @@ static int apple_ll_output_report(struct hid_device *hdev, __u8 *buf,
 	if (!spihid)
 		return -1;
 
-	dev_dbg(&spihid->spidev->dev,
-		"apple_ll_output_report: device:%u len:%zu:",
-		idev->id, len);
-	// second idev->id should maybe be buf[0]?
-	return spihid_apple_request(spihid, idev->id, 0x51, idev->id, 0x00, 0, buf, len);
+	if (!len)
+		return -EINVAL;
+
+	dev_dbg(&spihid->spidev->dev, "device:%u report:%u len:%zu",
+		idev->id, buf[0], len);
+	/* The request carries the report number, not the interface id. */
+	return spihid_apple_request(spihid, idev->id, 0x51, buf[0], 0x00, 0, buf, len);
 }
 
 static struct hid_ll_driver apple_hid_ll = {
@@ -408,6 +412,8 @@ static struct spihid_interface *spihid_get_iface(struct spihid_apple *spihid,
 		return &spihid->kbd;
 	case SPIHID_DEVICE_ID_TP:
 		return &spihid->tp;
+	case SPIHID_DEVICE_ID_AUX:
+		return &spihid->aux;
 	default:
 		return NULL;
 	}
@@ -494,18 +500,17 @@ static bool spihid_process_device_info(struct spihid_apple *spihid, u32 iface,
 
 		num_devices = __le16_to_cpu(info->num_devices);
 
-		if (num_devices < SPIHID_MAX_DEVICES) {
+		if (num_devices < SPIHID_MIN_DEVICES) {
 			dev_err(dev,
-				"Device info reports %u devices, expecting at least 3",
-				num_devices);
+				"Device info reports %u devices, expecting at least %u",
+				num_devices, SPIHID_MIN_DEVICES);
 			return false;
 		}
 		spihid->num_devices = num_devices;
 
 		if (spihid->num_devices > SPIHID_MAX_DEVICES) {
-			dev_info(
-				dev,
-				"limiting the number of devices to mngt, kbd and mouse");
+			dev_info(dev, "limiting the number of devices to %u",
+				 SPIHID_MAX_DEVICES);
 			spihid->num_devices = SPIHID_MAX_DEVICES;
 		}
 
@@ -592,8 +597,12 @@ static bool spihid_process_iface_info(struct spihid_apple *spihid, u32 num,
 			iface->name[name_len] = '\0';
 		}
 
-		dev_dbg(&spihid->spidev->dev, "Info for %s, country code: 0x%x",
-			iface->name, iface->country);
+		dev_dbg(&spihid->spidev->dev,
+			"iface %u: name '%s', country 0x%x, in %u out %u ctrl %u",
+			num, iface->name, iface->country,
+			iface->max_input_report_len,
+			iface->max_output_report_len,
+			iface->max_control_report_len);
 
 		wake_up_interruptible(&spihid->wait);
 	}
@@ -1004,9 +1013,10 @@ int spihid_apple_core_probe(struct spi_device *spi, struct spihid_apple_ops *ops
 
 	spihid->kbd.hid_desc = devm_kmalloc(dev, SPIHID_DESC_MAX, GFP_KERNEL);
 	spihid->tp.hid_desc = devm_kmalloc(dev, SPIHID_DESC_MAX, GFP_KERNEL);
+	spihid->aux.hid_desc = devm_kmalloc(dev, SPIHID_DESC_MAX, GFP_KERNEL);
 
 	if (!spihid->report.buf || !spihid->kbd.hid_desc ||
-	    !spihid->tp.hid_desc)
+	    !spihid->tp.hid_desc || !spihid->aux.hid_desc)
 		return -ENOMEM;
 
 	init_waitqueue_head(&spihid->wait);
@@ -1081,6 +1091,7 @@ void spihid_apple_core_remove(struct spi_device *spi)
 
 	/* destroy input devices */
 
+	spihid_destroy_hid_device(&spihid->aux);
 	spihid_destroy_hid_device(&spihid->tp);
 	spihid_destroy_hid_device(&spihid->kbd);
 
