@@ -16,6 +16,7 @@
 	model = "Apple MacBook Neo";
 
 	aliases {
+		keyboard = &keyboard;
 		serial0 = &serial0;
 	};
 
@@ -180,6 +181,39 @@
 
 &nvme {
 	status = "okay";
+};
+
+&mtp {
+	status = "okay";
+};
+
+&mtp_mbox {
+	status = "okay";
+};
+
+&mtp_dart {
+	status = "okay";
+};
+
+&mtp_dockchannel {
+	status = "okay";
+};
+
+&mtp_hid {
+	apple,no-stm;
+	/* SMC pcIO output 19; level 1 asserts the reset */
+	apple,afe-reset-gpios = <&smc_gpio 19 GPIO_ACTIVE_HIGH>;
+
+	multi-touch {
+		compatible = "apple,j700-multitouch";
+		firmware-name = "apple/tpmtfw-j700.bin";
+		apple,power-method = <2>;
+	};
+
+	keyboard: keyboard {
+		hid-country-code = <0>;
+		apple,keyboard-layout-id = <0>;
+	};
 };
 
 #include "hwmon-common.dtsi"
