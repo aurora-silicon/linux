@@ -2154,7 +2154,11 @@ impl SepData {
                 self.dev,
                 "matching unavailable this boot: restore did not complete, enclave holds no template (every match refused 0x1). Not the sensor or the finger; on-disk enrolments intact\n"
             );
-            return;
+            // On 13.5 the identity session is unlocked on every activation,
+            // template or not, as identity_load plus AKSIdentityUnlockSession.
+            if self.profile.key_store == profile::KeyStore::Variant5 {
+                return;
+            }
         }
 
         if self.keybag_designated.load(Relaxed) {
@@ -2166,6 +2170,9 @@ impl SepData {
                     });
                 }
             }
+        }
+        if !restored {
+            return;
         }
 
         // enclave's match arm asserts a non-empty ACM context (<= 32 bytes)

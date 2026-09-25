@@ -463,6 +463,9 @@ impl SepData {
         healthy: Healthy,
     ) -> Result<SksRequest> {
         let Healthy(()) = healthy;
+        if self.profile.key_store != profile::KeyStore::Variant5 {
+            return self.sks_req_device_state_unlock(special, secret);
+        }
         let mut body = image::Body::new();
         body.put_u32(SKS_LOCK_STATE_VARIANT)?;
         body.put_u64(crate::sks::SKS_CLIENT_ID)?;
@@ -476,6 +479,36 @@ impl SepData {
             crate::sks::encode_sks_change_lock_state(self.sks_next_seq(), len).ok_or(EINVAL)?;
         Ok(SksRequest {
             name: crate::sks::SKS_LOCK_STATE_NAME,
+            msg,
+            img,
+        })
+    }
+
+    /// `0x18` device-state transition to unlocked, the 13.5 identity-session
+    /// unlock. `AKSIdentityUnlockSession` (user-client selector 0x7b) reaches
+    /// `unlock_the_device(client, h, secret, 5)` (0xfffffe000993cee0, called at
+    /// 0x…15a4), which sends `device_state_transition` with state 0 and flags 0
+    /// (0x…cf04-cf0c) through `__ipc_device_state_transition`
+    /// (0xfffffe0009958204): struct version 0 only (0x…200c), u64 client, u32
+    /// handle, u32 state, u64 flags, blob secret. The reply is the version word
+    /// and two u64.
+    fn sks_req_device_state_unlock(
+        &self,
+        special: crate::sks::SpecialHandle,
+        secret: &[u8],
+    ) -> Result<SksRequest> {
+        let mut body = image::Body::new();
+        body.put_u32(0)?;
+        body.put_u64(crate::sks::SKS_CLIENT_ID)?;
+        body.put_i32(special.value())?;
+        body.put_i32(LockState::Unlocked.wire())?;
+        body.put_u64(0)?;
+        body.put_blob(secret)?;
+        let img = image::build_request(self.sks_ipc_version(), self.sks_timestamp_us(), &body)?;
+        let len = self.sks_image_len(&img)?;
+        let msg = crate::sks::encode_sks_device_state_transition(self.sks_next_seq(), len);
+        Ok(SksRequest {
+            name: crate::sks::SKS_DEVICE_STATE_NAME,
             msg,
             img,
         })
@@ -1173,6 +1206,13 @@ pub(crate) const SKS_LOAD_NAME: &CStr = c"LOAD_KEYBAG";
 const OP_SKS_CHANGE_LOCK_STATE: u8 = 0x04;
 
 pub(crate) const SKS_LOCK_STATE_NAME: &CStr = c"CHANGE_LOCK_STATE";
+
+const OP_SKS_DEVICE_STATE_TRANSITION: u8 = 0x18;
+pub(crate) const SKS_DEVICE_STATE_NAME: &CStr = c"DEVICE_STATE_TRANSITION";
+
+pub(crate) fn encode_sks_device_state_transition(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_DEVICE_STATE_TRANSITION, seq.value(), len.value())
+}
 
 const OP_SKS_VERIFY_SECRET: u8 = 0x21;
 pub(crate) const SKS_VERIFY_SECRET_NAME: &CStr = c"VERIFY_SECRET";
