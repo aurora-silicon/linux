@@ -16,6 +16,8 @@
 	model = "Apple MacBook Neo";
 
 	aliases {
+		atcphy0 = &atcphy0;
+		keyboard = &keyboard;
 		serial0 = &serial0;
 	};
 
@@ -180,6 +182,182 @@
 
 &nvme {
 	status = "okay";
+};
+
+&mtp {
+	status = "okay";
+};
+
+&mtp_mbox {
+	status = "okay";
+};
+
+&mtp_dart {
+	status = "okay";
+};
+
+&mtp_dockchannel {
+	status = "okay";
+};
+
+&mtp_hid {
+	apple,no-stm;
+	/* SMC pcIO output 19; level 1 asserts the reset */
+	apple,afe-reset-gpios = <&smc_gpio 19 GPIO_ACTIVE_HIGH>;
+
+	multi-touch {
+		compatible = "apple,j700-multitouch";
+		firmware-name = "apple/tpmtfw-j700.bin";
+		apple,power-method = <2>;
+	};
+
+	keyboard: keyboard {
+		hid-country-code = <0>;
+		apple,keyboard-layout-id = <0>;
+	};
+};
+
+/* USB PD controllers, on the nub SPMI A0 bus */
+&nub_spmi_a0 {
+	status = "okay";
+
+	hpm1: usb-pd@a {
+		compatible = "apple,sn201202x";
+		reg = <0xa SPMI_USID>;
+		interrupts = <37 IRQ_TYPE_EDGE_RISING>,
+			     <39 IRQ_TYPE_EDGE_RISING>,
+			     <43 IRQ_TYPE_EDGE_RISING>,
+			     <45 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec1: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left-front";
+			power-role = "dual";
+			data-role = "host";
+
+			/* USB 2.0 only, through the fixed hub */
+			port {
+				typec1_connector_hs: endpoint {
+					remote-endpoint = <&hub_front>;
+				};
+			};
+		};
+	};
+
+	hpm0: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+		interrupts = <11 IRQ_TYPE_EDGE_RISING>,
+			     <13 IRQ_TYPE_EDGE_RISING>,
+			     <17 IRQ_TYPE_EDGE_RISING>,
+			     <19 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec0: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left-back";
+			power-role = "dual";
+			data-role = "host";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+
+					typec0_connector_hs: endpoint {
+						remote-endpoint = <&hub_rear>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+
+					typec0_connector_ss: endpoint {
+						remote-endpoint = <&atcphy0_typec_lanes>;
+					};
+				};
+			};
+		};
+	};
+};
+
+/*
+ * The controller's USB 2.0 pairs go to a VIA VL122 two-port hub on the
+ * board (USB ID 2109:2122) whose downstream ports serve the two Type-C
+ * connectors; only the back connector also has SuperSpeed lanes, wired
+ * straight to the PHY. The controller is therefore always a host.
+ */
+&dwc3_0 {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	hub@1 {
+		compatible = "usb2109,2122";
+		reg = <1>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@1 {
+				reg = <1>;
+
+				hub_front: endpoint {
+					remote-endpoint = <&typec1_connector_hs>;
+				};
+			};
+
+			port@2 {
+				reg = <2>;
+
+				hub_rear: endpoint {
+					remote-endpoint = <&typec0_connector_hs>;
+				};
+			};
+		};
+	};
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@1 {
+			reg = <1>;
+
+			dwc3_0_ss: endpoint {
+				remote-endpoint = <&atcphy0_usb3>;
+			};
+		};
+	};
+};
+
+&atcphy0 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+
+			atcphy0_typec_lanes: endpoint {
+				remote-endpoint = <&typec0_connector_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+
+			atcphy0_usb3: endpoint {
+				remote-endpoint = <&dwc3_0_ss>;
+			};
+		};
+	};
 };
 
 #include "hwmon-common.dtsi"
