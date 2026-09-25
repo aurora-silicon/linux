@@ -34,43 +34,56 @@ struct isp_buflist_buffer {
 	u32 tag;
 	u32 pad;
 } __packed;
-static_assert(sizeof(struct isp_buflist_buffer) == 0x40);
+static_assert(sizeof(struct isp_buflist_buffer) == ISP_BUFLIST_DESC_SIZE);
 
 struct isp_buflist {
 	u64 type;
 	u64 num_buffers;
 	struct isp_buflist_buffer buffers[];
-};
+} __packed;
+static_assert(sizeof(struct isp_buflist) == ISP_BUFLIST_HDR_SIZE);
+/* the firmware reads at least ISP_IPC_BUFEXC_STAT_SIZE bytes of a batch */
+static_assert(ISP_CMD_AREA_SIZE(0) >= ISP_IPC_BUFEXC_STAT_SIZE);
+
+/*
+ * Buffer list tag of capture metadata buffers. The pool itself is set up
+ * as CISP_POOL_TYPE_META_CAPTURE; why the tags differ is not known.
+ */
+#define ISP_BUFLIST_POOL_CAPTURE_META 2
 
 int ipc_bt_handle(struct apple_isp *isp, struct isp_channel *chan)
 {
 	struct isp_message *req = &chan->req, *rsp = &chan->rsp;
 	struct isp_buffer *tmp, *buf;
 	struct isp_buflist *bl;
-	u32 count;
+	u64 count;
 	int err = 0;
 
 	/* printk("H2T: 0x%llx 0x%llx 0x%llx\n", (long long)req->arg0,
 	       (long long)req->arg1, (long long)req->arg2); */
 
-	if (req->arg1 < sizeof(struct isp_buflist)) {
-		dev_err(isp->dev, "%s: Bad length 0x%llx\n", chan->name,
-			req->arg1);
+	if (!isp->bt_surf || req->arg1 < sizeof(*bl) ||
+	    req->arg1 > isp->bt_surf->size) {
+		dev_err_ratelimited(isp->dev, "%s: Bad length 0x%llx\n",
+				    chan->name, req->arg1);
 		return -EIO;
 	}
 
-	bl = apple_isp_translate(isp, isp->bt_surf, req->arg0, req->arg1);
+	bl = apple_isp_translate(isp, isp->bt_surf, isp_fw_iova(isp, req->arg0),
+				 req->arg1);
+	if (!bl)
+		return -EIO;
 
 	count = bl->num_buffers;
-	if (count > (req->arg1 - sizeof(struct isp_buffer)) /
+	if (count > (req->arg1 - sizeof(*bl)) /
 			    sizeof(struct isp_buflist_buffer)) {
-		dev_err(isp->dev, "%s: Bad length 0x%llx\n", chan->name,
-			req->arg1);
+		dev_err_ratelimited(isp->dev, "%s: Bad length 0x%llx\n",
+				    chan->name, req->arg1);
 		return -EIO;
 	}
 
 	spin_lock(&isp->buf_lock);
-	for (int i = 0; i < count; i++) {
+	for (u64 i = 0; i < count; i++) {
 		struct isp_buflist_buffer *bufd = &bl->buffers[i];
 
 		/* printk("Return: 0x%llx (%d)\n", bufd->iovas[0],
@@ -83,6 +96,14 @@ int ipc_bt_handle(struct apple_isp *isp, struct isp_channel *chan)
 					WARN_ON(!meta->submitted);
 					meta->submitted = false;
 				}
+			}
+		} else if (bufd->pool_type == ISP_BUFLIST_POOL_CAPTURE_META &&
+			   isp_num_capmeta(isp)) {
+			for (int j = 0; j < isp_num_capmeta(isp); j++) {
+				struct isp_surf *meta = isp->capmeta_surfs[j];
+
+				if (meta && (u32)bufd->iovas[0] == (u32)meta->iova)
+					meta->submitted = false;
 			}
 		} else {
 			list_for_each_entry_safe_reverse(
@@ -115,12 +136,18 @@ int ipc_bt_handle(struct apple_isp *isp, struct isp_channel *chan)
 	return err;
 }
 
-static int isp_submit_buffers(struct apple_isp *isp)
+/*
+ * With a capture metadata pool, the firmware takes the metadata buffers
+ * before CH_START and the capture metadata and capture buffers after it,
+ * so the batch before the start (@pre_start) has only the former.
+ */
+static int isp_submit_buffers(struct apple_isp *isp, bool pre_start)
 {
 	struct isp_format *fmt = isp_get_current_format(isp);
 	struct isp_channel *chan = isp->chan_bh;
 	struct isp_message *req = &chan->req;
 	struct isp_buffer *buf, *tmp;
+	unsigned int num_rendered = 0;
 	unsigned long flags;
 	size_t offset;
 	int err;
@@ -128,8 +155,9 @@ static int isp_submit_buffers(struct apple_isp *isp)
 	struct isp_buflist *bl = isp->cmd_virt;
 	struct isp_buflist_buffer *bufd = &bl->buffers[0];
 
+	/* Clear what earlier commands and batches left in the reserved fields. */
+	memset(bl, 0, ISP_CMD_AREA_SIZE(isp_num_capmeta(isp)));
 	bl->type = 1;
-	bl->num_buffers = 0;
 
 	spin_lock_irqsave(&isp->buf_lock, flags);
 	for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++) {
@@ -151,10 +179,29 @@ static int isp_submit_buffers(struct apple_isp *isp)
 		meta->submitted = true;
 	}
 
-	while ((buf = list_first_entry_or_null(&isp->bufs_pending,
-					       struct isp_buffer, link))) {
-		memset(bufd, 0, sizeof(*bufd));
+	if (isp_num_capmeta(isp) && pre_start)
+		goto send;
 
+	for (int i = 0; i < isp_num_capmeta(isp); i++) {
+		struct isp_surf *meta = isp->capmeta_surfs[i];
+
+		if (meta->submitted)
+			continue;
+
+		bufd->num_planes = 1;
+		bufd->pool_type = ISP_BUFLIST_POOL_CAPTURE_META;
+		bufd->iovas[0] = meta->iova;
+		bufd->flags[0] = 0x40000000;
+		bufd++;
+		bl->num_buffers++;
+
+		meta->submitted = true;
+	}
+
+	/* One rendered pool per batch; the rest stays pending for the next. */
+	while (num_rendered < ISP_MAX_BUFFERS &&
+	       (buf = list_first_entry_or_null(&isp->bufs_pending,
+					       struct isp_buffer, link))) {
 		bufd->num_planes = fmt->num_planes;
 		bufd->pool_type = isp->hw->scl1 ? CISP_POOL_TYPE_RENDERED_SCL1 :
 						  CISP_POOL_TYPE_RENDERED;
@@ -170,6 +217,7 @@ static int isp_submit_buffers(struct apple_isp *isp)
 		       buf->surfs[0].iova + buf->surfs[0].size); */
 		bufd++;
 		bl->num_buffers++;
+		num_rendered++;
 
 		/*
 		 * Queue the buffer as submitted and release the lock for now.
@@ -179,6 +227,7 @@ static int isp_submit_buffers(struct apple_isp *isp)
 		list_move_tail(&buf->link, &isp->bufs_submitted);
 	}
 
+send:
 	spin_unlock_irqrestore(&isp->buf_lock, flags);
 
 	req->arg0 = isp->cmd_iova;
@@ -213,6 +262,12 @@ static int isp_submit_buffers(struct apple_isp *isp)
 				if (bufd->iovas[0] == meta->iova) {
 					meta->submitted = false;
 				}
+			}
+			for (int j = 0; j < isp_num_capmeta(isp); j++) {
+				struct isp_surf *meta = isp->capmeta_surfs[j];
+
+				if (bufd->iovas[0] == meta->iova)
+					meta->submitted = false;
 			}
 		}
 
@@ -334,20 +389,35 @@ static void isp_vb2_buf_queue(struct vb2_buffer *vb)
 	spin_unlock_irqrestore(&isp->buf_lock, flags);
 
 	if (test_bit(ISP_STATE_STREAMING, &isp->state) && !empty)
-		isp_submit_buffers(isp);
+		isp_submit_buffers(isp, false);
 }
 
 static int apple_isp_start_streaming(struct apple_isp *isp)
 {
+	unsigned long flags;
 	int err;
 
 	err = apple_isp_start_camera(isp);
 	if (err) {
 		dev_err(isp->dev, "failed to start camera: %d\n", err);
-		goto release_buffers;
+		return err;
 	}
 
-	err = isp_submit_buffers(isp);
+	/*
+	 * Resident firmware was not restarted, but the channel's pools are
+	 * configured again for every stream. Metadata buffers still marked
+	 * as submitted to the previous pools would never reach the new ones.
+	 */
+	if (isp->hw->resident_fw) {
+		spin_lock_irqsave(&isp->buf_lock, flags);
+		for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++)
+			isp->meta_surfs[i]->submitted = false;
+		for (int i = 0; i < isp_num_capmeta(isp); i++)
+			isp->capmeta_surfs[i]->submitted = false;
+		spin_unlock_irqrestore(&isp->buf_lock, flags);
+	}
+
+	err = isp_submit_buffers(isp, true);
 	if (err) {
 		dev_err(isp->dev, "failed to send initial batch: %d\n", err);
 		goto stop_camera;
@@ -359,20 +429,31 @@ static int apple_isp_start_streaming(struct apple_isp *isp)
 		goto stop_camera;
 	}
 
+	if (isp_num_capmeta(isp)) {
+		err = isp_submit_buffers(isp, false);
+		if (err) {
+			dev_err(isp->dev, "failed to send the capture batch: %d\n",
+				err);
+			apple_isp_stop_capture(isp);
+			goto stop_camera;
+		}
+	}
+
 	set_bit(ISP_STATE_STREAMING, &isp->state);
 
 	return 0;
 
 stop_camera:
 	apple_isp_stop_camera(isp);
-release_buffers:
-	isp_vb2_release_buffers(isp, VB2_BUF_STATE_QUEUED);
 	return err;
 }
 
 static void apple_isp_stop_streaming(struct apple_isp *isp)
 {
-	clear_bit(ISP_STATE_STREAMING, &isp->state);
+	/* Not running if restarting it after system sleep failed. */
+	if (!test_and_clear_bit(ISP_STATE_STREAMING, &isp->state))
+		return;
+
 	apple_isp_stop_capture(isp);
 	apple_isp_stop_camera(isp);
 }
@@ -380,10 +461,15 @@ static void apple_isp_stop_streaming(struct apple_isp *isp)
 static int isp_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct apple_isp *isp = vb2_get_drv_priv(q);
+	int err;
 
 	isp->sequence = 0;
 
-	return apple_isp_start_streaming(isp);
+	err = apple_isp_start_streaming(isp);
+	if (err)
+		isp_vb2_release_buffers(isp, VB2_BUF_STATE_QUEUED);
+
+	return err;
 }
 
 static void isp_vb2_stop_streaming(struct vb2_queue *q)
@@ -396,25 +482,49 @@ static void isp_vb2_stop_streaming(struct vb2_queue *q)
 
 int apple_isp_video_suspend(struct apple_isp *isp)
 {
-	/* Swap into STATE_SLEEPING as isp_vb2_buf_queue() submits on
-	 * STATE_STREAMING.
+	unsigned long flags;
+
+	mutex_lock(&isp->video_lock);
+
+	/*
+	 * Stop the stream but keep its buffers queued to the driver. First
+	 * move the buffers given to the firmware to the pending list, so that
+	 * the buffer return for the stop does not complete them; they are
+	 * submitted again when the stream restarts on resume.
+	 * isp_vb2_buf_queue() does not submit while the stream is stopped.
 	 */
 	if (test_bit(ISP_STATE_STREAMING, &isp->state)) {
-		/* Signal buffers to be recycled for clean shutdown */
-		isp_vb2_release_buffers(isp, VB2_BUF_STATE_QUEUED);
+		spin_lock_irqsave(&isp->buf_lock, flags);
+		list_splice_init(&isp->bufs_submitted, &isp->bufs_pending);
+		spin_unlock_irqrestore(&isp->buf_lock, flags);
+
 		apple_isp_stop_streaming(isp);
 		set_bit(ISP_STATE_SLEEPING, &isp->state);
 	}
+
+	mutex_unlock(&isp->video_lock);
 
 	return 0;
 }
 
 int apple_isp_video_resume(struct apple_isp *isp)
 {
-	if (test_bit(ISP_STATE_SLEEPING, &isp->state)) {
-		clear_bit(ISP_STATE_SLEEPING, &isp->state);
-		apple_isp_start_streaming(isp);
+	int err;
+
+	mutex_lock(&isp->video_lock);
+
+	if (test_and_clear_bit(ISP_STATE_SLEEPING, &isp->state)) {
+		err = apple_isp_start_streaming(isp);
+		if (err) {
+			dev_err(isp->dev,
+				"failed to restart streaming after resume: %d\n",
+				err);
+			isp_vb2_release_buffers(isp, VB2_BUF_STATE_ERROR);
+			vb2_queue_error(&isp->vbq);
+		}
 	}
+
+	mutex_unlock(&isp->video_lock);
 
 	return 0;
 }
@@ -795,6 +905,21 @@ static const struct media_device_ops isp_media_device_ops = {
 	.link_notify = v4l2_pipeline_link_notify,
 };
 
+static void isp_free_meta_surfaces(struct apple_isp *isp)
+{
+	for (int i = 0; i < ARRAY_SIZE(isp->capmeta_surfs); i++) {
+		if (isp->capmeta_surfs[i])
+			isp_free_surface(isp, isp->capmeta_surfs[i]);
+		isp->capmeta_surfs[i] = NULL;
+	}
+
+	for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++) {
+		if (isp->meta_surfs[i])
+			isp_free_surface(isp, isp->meta_surfs[i]);
+		isp->meta_surfs[i] = NULL;
+	}
+}
+
 int apple_isp_setup_video(struct apple_isp *isp)
 {
 	struct video_device *vdev = &isp->vdev;
@@ -813,6 +938,17 @@ int apple_isp_setup_video(struct apple_isp *isp)
 			isp_alloc_surface_vmap(isp, isp->hw->meta_size);
 		if (!isp->meta_surfs[i]) {
 			isp_err(isp, "failed to alloc meta surface\n");
+			err = -ENOMEM;
+			goto surf_cleanup;
+		}
+	}
+
+	/* Only the firmware reads and writes these, so they need no vmap. */
+	for (int i = 0; i < isp_num_capmeta(isp); i++) {
+		isp->capmeta_surfs[i] =
+			isp_alloc_surface(isp, isp->hw->capture_meta_size);
+		if (!isp->capmeta_surfs[i]) {
+			isp_err(isp, "failed to alloc capture meta surface\n");
 			err = -ENOMEM;
 			goto surf_cleanup;
 		}
@@ -885,11 +1021,7 @@ media_unregister:
 media_cleanup:
 	media_device_cleanup(&isp->mdev);
 surf_cleanup:
-	for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++) {
-		if (isp->meta_surfs[i])
-			isp_free_surface(isp, isp->meta_surfs[i]);
-		isp->meta_surfs[i] = NULL;
-	}
+	isp_free_meta_surfaces(isp);
 
 	return err;
 }
@@ -900,9 +1032,10 @@ void apple_isp_remove_video(struct apple_isp *isp)
 	v4l2_device_unregister(&isp->v4l2_dev);
 	media_device_unregister(&isp->mdev);
 	media_device_cleanup(&isp->mdev);
-	for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++) {
-		if (isp->meta_surfs[i])
-			isp_free_surface(isp, isp->meta_surfs[i]);
-		isp->meta_surfs[i] = NULL;
-	}
+}
+
+/* After apple_isp_remove_video() and with the firmware stopped */
+void apple_isp_free_video(struct apple_isp *isp)
+{
+	isp_free_meta_surfaces(isp);
 }

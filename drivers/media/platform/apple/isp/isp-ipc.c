@@ -7,6 +7,8 @@
 #include "isp-fw.h"
 
 #define ISP_IPC_FLAG_TERMINAL_ACK	0x3
+/* longer firmware log lines are cut */
+#define ISP_IPC_TERMINAL_MAX_LEN	512
 #define ISP_IPC_BUFEXC_STAT_META_OFFSET 0x10
 
 struct isp_sm_deferred_work {
@@ -112,7 +114,8 @@ static int chan_handle_once(struct apple_isp *isp, struct isp_channel *chan)
 
 	err = chan->ops->handle(isp, chan);
 	if (err < 0) {
-		dev_err(isp->dev, "%s: handler failed: %d)\n", chan->name, err);
+		dev_err_ratelimited(isp->dev, "%s: handler failed: %d\n",
+				    chan->name, err);
 		return err;
 	}
 
@@ -160,7 +163,8 @@ static inline bool chan_tx_done(struct apple_isp *isp, struct isp_channel *chan)
 	dma_rmb();
 
 	chan_read_msg(isp, chan, &chan->rsp);
-	if ((chan->rsp.arg0) == (chan->req.arg0 | ISP_IPC_FLAG_ACK)) {
+	if (isp_fw_iova(isp, chan->rsp.arg0) ==
+	    isp_fw_iova(isp, chan->req.arg0 | ISP_IPC_FLAG_ACK)) {
 		chan_update_cursor(chan);
 		return true;
 	}
@@ -196,23 +200,18 @@ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
 
 int ipc_tm_handle(struct apple_isp *isp, struct isp_channel *chan)
 {
-	struct isp_message *rsp = &chan->rsp;
+	struct isp_message *req = &chan->req, *rsp = &chan->rsp;
+	dma_addr_t iova =
+		isp_fw_iova(isp, req->arg0 & ~ISP_IPC_FLAG_TERMINAL_ACK);
+	size_t size = min_t(u64, req->arg1, ISP_IPC_TERMINAL_MAX_LEN);
+	const char *line;
 
-#ifdef APPLE_ISP_DEBUG
-	struct isp_message *req = &chan->req;
-	char buf[512];
-	dma_addr_t iova = req->arg0 & ~ISP_IPC_FLAG_TERMINAL_ACK;
-	u32 size = req->arg1;
-	if (iova && size && size < sizeof(buf) &&
-	    isp->log_surf) {
-		void *p = apple_isp_translate(isp, isp->log_surf, iova, size);
-		if (p) {
-			size = min_t(u32, size, 512);
-			memcpy(buf, p, size);
-			isp_dbg(isp, "ISPASC: %.*s", size, buf);
-		}
+	/* Firmware log output, available through dynamic debug */
+	if (iova && size && isp->log_surf) {
+		line = apple_isp_translate(isp, isp->log_surf, iova, size);
+		if (line)
+			dev_dbg(isp->dev, "ISPASC: %.*s", (int)size, line);
 	}
-#endif
 
 	rsp->arg0 = ISP_IPC_FLAG_ACK;
 	rsp->arg1 = 0x0;
@@ -231,8 +230,9 @@ int ipc_sm_handle(struct apple_isp *isp, struct isp_channel *chan)
 
 		surf = isp_alloc_surface_gc(isp, req->arg1);
 		if (!surf) {
-			isp_err(isp, "failed to alloc requested size 0x%llx\n",
-				req->arg1);
+			dev_err_ratelimited(isp->dev,
+					    "failed to alloc requested size 0x%llx\n",
+					    req->arg1);
 			return -ENOMEM;
 		}
 		surf->type = req->arg2;

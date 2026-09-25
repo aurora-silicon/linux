@@ -41,6 +41,7 @@
 #define CISP_CMD_CH_LOCAL_RAW_BUFFER_ENABLE		     0x0125
 #define CISP_CMD_CH_META_DATA_ENABLE			     0x0126
 #define CISP_CMD_CH_CAMERA_MIPI_FREQUENCY_TOTAL_GET	     0x0133
+#define CISP_CMD_CH_MASTER_SLAVE_SYNC_MODE_SET		     0x0138
 #define CISP_CMD_CH_SBS_ENABLE				     0x013b
 #define CISP_CMD_CH_LSC_POLYNOMIAL_COEFF_GET		     0x0142
 #define CISP_CMD_CH_SET_META_DATA_REQUIRED		     0x014f
@@ -86,6 +87,7 @@
 #define CISP_CMD_IPC_ENDPOINT_UNSET2			     0x300d
 #define CISP_CMD_SET_DSID_CLR_REG_BASE2			     0x3204
 #define CISP_CMD_SET_DSID_CLR_REG_BASE			     0x3205
+#define CISP_CMD_SET_DSID_CLR_MULTI_BC_REG_BASE		     0x3206
 #define CISP_CMD_APPLE_CH_AE_METERING_MODE_SET		     0x8206
 #define CISP_CMD_APPLE_CH_AE_FD_SCENE_METERING_CONFIG_SET    0x820e
 #define CISP_CMD_APPLE_CH_AE_FLICKER_FREQ_UPDATE_CURRENT_SET 0x8212
@@ -195,6 +197,16 @@ struct cmd_set_dsid_clr_req_base {
 } __packed;
 static_assert(sizeof(struct cmd_set_dsid_clr_req_base) == 0x14);
 
+/* H17: a count of broadcast-clear windows and the first window */
+struct cmd_set_dsid_clr_multi_bc_reg_base {
+	u64 opcode;
+	u8 count;
+	u8 pad_9[3];
+	u32 dsid_clr_range;
+	u64 dsid_clr_base;
+} __packed;
+static_assert(sizeof(struct cmd_set_dsid_clr_multi_bc_reg_base) == 0x18);
+
 struct cmd_pmp_ctrl_set {
 	u64 opcode;
 	u64 clock_scratch;
@@ -247,6 +259,8 @@ int isp_cmd_trace_enable(struct apple_isp *isp, u32 enable);
 int isp_cmd_config_get(struct apple_isp *isp, struct cmd_config_get *args);
 int isp_cmd_set_isp_pmu_base(struct apple_isp *isp, u64 pmu_base);
 int isp_cmd_set_dsid_clr_req_base(struct apple_isp *isp, u64 dsid_clr_base,
+				  u32 dsid_clr_range);
+int isp_cmd_set_dsid_clr_multi_bc(struct apple_isp *isp, u64 dsid_clr_base,
 				  u32 dsid_clr_range);
 int isp_cmd_set_dsid_clr_req_base2(struct apple_isp *isp, u64 dsid_clr_base0,
 				   u64 dsid_clr_base1, u64 dsid_clr_base2,
@@ -326,6 +340,17 @@ struct cmd_ch_info {
 } __packed;
 static_assert(sizeof(struct cmd_ch_info) == 0x118);
 
+/*
+ * The H17 firmware exchanges a 0x190-byte CH_INFO_GET record whose first
+ * 0x118 bytes match struct cmd_ch_info; there unk_68 is the size of the
+ * per-frame metadata record and unk_78 that of the capture metadata.
+ */
+struct cmd_ch_info_h17 {
+	struct cmd_ch_info info;
+	u32 unk_118[0x1e];
+} __packed;
+static_assert(sizeof(struct cmd_ch_info_h17) == 0x190);
+
 struct cmd_ch_camera_config {
 	u64 opcode;
 	u32 chan;
@@ -385,6 +410,21 @@ struct cmd_ch_sbs_enable {
 	u32 enable;
 } __packed;
 static_assert(sizeof(struct cmd_ch_sbs_enable) == 0x10);
+
+struct cmd_ch_local_raw_buffer_enable {
+	u64 opcode;
+	u32 chan;
+	u16 enable;
+	u16 pad_e;
+} __packed;
+static_assert(sizeof(struct cmd_ch_local_raw_buffer_enable) == 0x10);
+
+struct cmd_ch_master_slave_sync_mode_set {
+	u64 opcode;
+	u32 chan;
+	u32 mode;
+} __packed;
+static_assert(sizeof(struct cmd_ch_master_slave_sync_mode_set) == 0x10);
 
 struct cmd_ch_crop_set {
 	u64 opcode;
@@ -471,8 +511,6 @@ int isp_cmd_ch_start(struct apple_isp *isp, u32 chan);
 int isp_cmd_ch_stop(struct apple_isp *isp, u32 chan);
 int isp_cmd_ch_info_get(struct apple_isp *isp, u32 chan,
 			struct cmd_ch_info *args);
-int isp_cmd_ch_camera_config_get(struct apple_isp *isp, u32 chan, u32 preset,
-				 struct cmd_ch_camera_config *args);
 int isp_cmd_ch_camera_config_current_get(struct apple_isp *isp, u32 chan,
 					 struct cmd_ch_camera_config *args);
 int isp_cmd_ch_camera_config_select(struct apple_isp *isp, u32 chan,
@@ -481,6 +519,10 @@ int isp_cmd_ch_set_file_load(struct apple_isp *isp, u32 chan, u64 addr,
 			     u32 size);
 int isp_cmd_ch_buffer_return(struct apple_isp *isp, u32 chan);
 int isp_cmd_ch_sbs_enable(struct apple_isp *isp, u32 chan, u32 enable);
+int isp_cmd_ch_local_raw_buffer_enable(struct apple_isp *isp, u32 chan,
+				       u16 enable);
+int isp_cmd_ch_master_slave_sync_mode_set(struct apple_isp *isp, u32 chan,
+					  u32 mode);
 int isp_cmd_ch_crop_set(struct apple_isp *isp, u32 chan, u32 x1, u32 y1, u32 x2,
 			u32 y2);
 int isp_cmd_ch_output_config_set(struct apple_isp *isp, u32 chan, u32 width,
@@ -531,6 +573,29 @@ struct cmd_ch_buffer_pool_config_set {
 } __packed;
 static_assert(sizeof(struct cmd_ch_buffer_pool_config_set) == 0x9c);
 
+/*
+ * The H17 firmware takes the output geometry with the rendered pool: the
+ * plane sizes and strides in the places of the metadata sizes and the
+ * first two reserved words.
+ */
+struct cmd_ch_buffer_pool_config_set_rendered {
+	u64 opcode;
+	u32 chan;
+	u16 type;
+	u16 count;
+	u32 plane0_size;
+	u32 plane0_stride;
+	u64 unk0;
+	u64 unk1;
+	u64 unk2;
+	u32 plane1_size;
+	u32 plane1_stride;
+	u32 zero[0x17];
+	u32 data_blocks;
+	u32 compress;
+} __packed;
+static_assert(sizeof(struct cmd_ch_buffer_pool_config_set_rendered) == 0x9c);
+
 struct cmd_ch_buffer_pool_return {
 	u64 opcode;
 	u32 chan;
@@ -542,6 +607,11 @@ int isp_cmd_ch_buffer_recycle_mode_set(struct apple_isp *isp, u32 chan,
 int isp_cmd_ch_buffer_recycle_start(struct apple_isp *isp, u32 chan);
 int isp_cmd_ch_buffer_pool_config_set(struct apple_isp *isp, u32 chan,
 				      u16 type);
+int isp_cmd_ch_buffer_pool_config_set_rendered(struct apple_isp *isp, u32 chan,
+					       u16 count, u32 plane0_size,
+					       u32 plane0_stride,
+					       u32 plane1_size,
+					       u32 plane1_stride);
 int isp_cmd_ch_buffer_pool_config_get(struct apple_isp *isp, u32 chan,
 				      u16 type);
 int isp_cmd_ch_buffer_pool_return(struct apple_isp *isp, u32 chan);

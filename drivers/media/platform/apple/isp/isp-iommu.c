@@ -101,7 +101,7 @@ static void isp_surf_iommu_unmap(struct apple_isp *isp, struct isp_surf *surf)
 
 static int isp_surf_iommu_map(struct apple_isp *isp, struct isp_surf *surf)
 {
-	unsigned long size;
+	ssize_t mapped;
 	int err;
 
 	err = sg_alloc_table_from_pages(&surf->sgt, surf->pages,
@@ -112,13 +112,15 @@ static int isp_surf_iommu_map(struct apple_isp *isp, struct isp_surf *surf)
 		return err;
 	}
 
-	size = iommu_map_sgtable(isp->domain, surf->iova, &surf->sgt,
-				 IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE);
-	if (size < surf->size) {
+	mapped = iommu_map_sgtable(isp->domain, surf->iova, &surf->sgt,
+				   IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE);
+	if (mapped < 0 || (u64)mapped < surf->size) {
 		dev_err(isp->dev, "failed to iommu_map sgt to iova %pad\n",
 			&surf->iova);
+		if (mapped > 0)
+			iommu_unmap(isp->domain, surf->iova, mapped);
 		sg_free_table(&surf->sgt);
-		return -ENXIO;
+		return mapped < 0 ? mapped : -ENXIO;
 	}
 
 	return 0;
@@ -136,9 +138,21 @@ static void __isp_surf_init(struct apple_isp *isp, struct isp_surf *surf,
 
 struct isp_surf *__isp_alloc_surface(struct apple_isp *isp, u64 size, bool gc)
 {
+	struct isp_surf *surf;
 	int err;
 
-	struct isp_surf *surf = kzalloc(sizeof(struct isp_surf), GFP_KERNEL);
+	/*
+	 * The firmware chooses the size of the extra heap and of SHAREDMALLOC
+	 * surfaces. Nothing larger than the IOVA range can be mapped, and the
+	 * bound also keeps the page count within 32 bits.
+	 */
+	if (!size || size > isp->iova_size) {
+		dev_err_ratelimited(isp->dev, "invalid surface size 0x%llx\n",
+				    size);
+		return NULL;
+	}
+
+	surf = kzalloc(sizeof(*surf), GFP_KERNEL);
 	if (!surf)
 		return NULL;
 
@@ -233,11 +247,13 @@ int apple_isp_iommu_map_sgt(struct apple_isp *isp, struct isp_surf *surf,
 
 	mapped = iommu_map_sgtable(isp->domain, surf->iova, sgt,
 				   IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE);
-	if (mapped < surf->size) {
+	if (mapped < 0 || (u64)mapped < surf->size) {
 		dev_err(isp->dev, "failed to iommu_map sgt to iova %pad\n",
 			&surf->iova);
+		if (mapped > 0)
+			iommu_unmap(isp->domain, surf->iova, mapped);
 		isp_surf_unreserve_iova(isp, surf);
-		return -ENXIO;
+		return mapped < 0 ? mapped : -ENXIO;
 	}
 	surf->size = mapped;
 

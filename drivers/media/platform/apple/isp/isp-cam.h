@@ -18,4 +18,7 @@ void apple_isp_stop_camera(struct apple_isp *isp);
 int apple_isp_start_capture(struct apple_isp *isp);
 void apple_isp_stop_capture(struct apple_isp *isp);
 
+void apple_isp_wdt_init(struct apple_isp *isp);
+void apple_isp_wdt_stop(struct apple_isp *isp);
+
 #endif /* __ISP_CAM_H__ */

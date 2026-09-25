@@ -11,6 +11,7 @@ void apple_isp_free_firmware_surface(struct apple_isp *isp);
 
 int apple_isp_firmware_boot(struct apple_isp *isp);
 void apple_isp_firmware_shutdown(struct apple_isp *isp);
+void apple_isp_firmware_halt(struct apple_isp *isp);
 
 void *apple_isp_translate(struct apple_isp *isp, struct isp_surf *surf,
 			  dma_addr_t iova, size_t size);

@@ -10,6 +10,9 @@
 #define ISP_IPC_CHAN_TYPE_REPLY	    1
 #define ISP_IPC_CHAN_TYPE_REPORT    2
 
+/* each channel owns one bit of the 32-bit doorbell register */
+#define ISP_IPC_MAX_CHANNELS	    32
+
 #define ISP_IPC_BUFEXC_STAT_SIZE    0x280
 #define ISP_IPC_BUFEXC_FLAG_RENDER  0x10000000
 #define ISP_IPC_BUFEXC_FLAG_COMMAND 0x30000000
