@@ -90,6 +90,11 @@ impl SepData {
     pub(crate) fn sks_machine_refkey(&self, handle: crate::sks::KeyBagHandle, secret: &[u8]) {
         const MACHINE_REFKEY_PATH: &CStr = c"/var/lib/aurora-sep-refkey.bin";
 
+        // No 13.5 code unlocks an identity source handle or makes a ref-key
+        // with it; identity_load is exactly 0x03, 0x0d, 0x05 there.
+        if self.profile.key_store != crate::profile::KeyStore::Variant5 {
+            return;
+        }
         if self.machine_refkey.lock().is_some() {
             return;
         }
@@ -135,6 +140,9 @@ impl SepData {
     }
 
     fn ensure_machine_refkey(&self) -> Result<()> {
+        if self.profile.key_store != crate::profile::KeyStore::Variant5 {
+            return Err(ENODEV);
+        }
         if self.machine_refkey.lock().is_some() {
             return Ok(());
         }

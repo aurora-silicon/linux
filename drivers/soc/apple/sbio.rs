@@ -2187,6 +2187,11 @@ impl SepData {
             return false;
         };
         let special = user.special_handle();
+        // identity_load ends with the source unload (0xfffffe000994bad4);
+        // 13.5 sends nothing between its 0x0d and that unload.
+        if self.profile.key_store != profile::KeyStore::Variant5 {
+            return self.sks_send(self.sks_req_unload_keybag(source)).is_some();
+        }
         self.log_identity_count(c"before the cold-match preparation");
 
         let uuid_ok = self

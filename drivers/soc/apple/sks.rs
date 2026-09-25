@@ -387,16 +387,32 @@ impl SepData {
         true
     }
 
-    /// `0x0d` designate.
+    /// The designate struct version, which the reply echoes. 13.5's
+    /// `_code_ipc_make_system_keybag` (0xfffffe000995fd8c) takes version 0
+    /// only (0x…fe78).
+    fn sks_designate_variant(&self) -> u32 {
+        match self.profile.key_store {
+            profile::KeyStore::Sepos13 { .. } => crate::sks::SKS_DESIGNATE_VERSION_13,
+            profile::KeyStore::Variant5 => crate::sks::SKS_DESIGNATE_VARIANT,
+        }
+    }
+
+    /// `0x0d` designate. On 13.5 this is `identity_load`'s make-system-keybag
+    /// (0xfffffe000994ba48-ba5c): source handle, session, an empty blob and
+    /// nothing after it.
     fn sks_req_designate(&self, d: &crate::sks::Designation, secret: &[u8]) -> Result<SksRequest> {
         let mut body = image::Body::new();
-        body.put_u32(crate::sks::SKS_DESIGNATE_VARIANT)?;
+        body.put_u32(self.sks_designate_variant())?;
         body.put_u64(crate::sks::SKS_CLIENT_ID)?;
         body.put_i32(d.source().value())?;
         body.put_i32(d.user().special_handle().value())?;
-        body.put_blob(secret)?;
-        // Flags is a u64, not u32; a u32 leaves the body short -> enclave answers -13.
-        body.put_u64(crate::sks::SKS_DESIGNATE_FLAGS)?;
+        if self.profile.key_store == profile::KeyStore::Variant5 {
+            body.put_blob(secret)?;
+            // Flags is a u64, not u32; a u32 leaves the body short -> enclave answers -13.
+            body.put_u64(crate::sks::SKS_DESIGNATE_FLAGS)?;
+        } else {
+            body.put_blob(&[])?;
+        }
 
         let img = image::build_request(self.sks_ipc_version(), self.sks_timestamp_us(), &body)?;
         let len = self.sks_image_len(&img)?;
@@ -702,7 +718,7 @@ impl SepData {
             return;
         }
         let variant = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
-        if variant != crate::sks::SKS_DESIGNATE_VARIANT {
+        if variant != self.sks_designate_variant() {
             return;
         }
 
@@ -824,7 +840,13 @@ impl SepData {
         &self,
         stored: &keybag::StoredKeyBag,
     ) -> Option<(crate::sks::KeyBagHandle, [u8; keybag::UUID_LEN])> {
-        let request = match self.sks_req_load_keybag(stored.wrapped()) {
+        // 13.5 keeps the identity bag in the enclave: identity_open
+        // (0xfffffe000994b0e4) loads it by its 16-byte UUID (0x…b11c-b124).
+        let key = match self.profile.key_store {
+            profile::KeyStore::Sepos13 { .. } => &stored.uuid()[..],
+            profile::KeyStore::Variant5 => stored.wrapped(),
+        };
+        let request = match self.sks_req_load_keybag(key) {
             Ok(request) => request,
             Err(e) => {
                 dev_err!(
@@ -885,6 +907,12 @@ impl SepData {
             return None;
         }
         let handle = crate::sks::KeyBagHandle::from_load_reply(handle);
+
+        // identity_load sends 0x0d straight after the load (0x…ba5c) and
+        // reads no UUID back.
+        if self.profile.key_store != profile::KeyStore::Variant5 {
+            return Some((handle, *stored.uuid()));
+        }
 
         let Some(uuid) = self.sks_read_uuid(handle) else {
             dev_warn!(self.dev, "sks: loaded keybag has no readable UUID\n");
@@ -1179,6 +1207,7 @@ const OP_SKS_DESIGNATE_KEYBAG: u8 = 0x0d;
 
 pub(crate) const SKS_DESIGNATE_VARIANT: u32 = 1;
 static_assert!(SKS_DESIGNATE_VARIANT == 1);
+pub(crate) const SKS_DESIGNATE_VERSION_13: u32 = 0;
 
 pub(crate) const SKS_DESIGNATE_USER_MIN: i32 = 10;
 static_assert!(SKS_DESIGNATE_USER_MIN > 0);
