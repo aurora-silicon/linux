@@ -9,7 +9,7 @@ use core::{
     arch::asm,
     cmp,
     mem,
-    ptr,
+    ptr::{self, NonNull},
     slice, //
 };
 
@@ -45,6 +45,11 @@ use kernel::{
     soc::apple::rtkit,
     sync::{
         aref::ARef,
+        atomic::{
+            Acquire,
+            Atomic,
+            Release, //
+        },
         Arc,
         ArcBorrow,
         CondVar,
@@ -52,9 +57,9 @@ use kernel::{
     },
     types::ForeignOwnable,
     workqueue::{
-        self,
         impl_has_work,
         new_work,
+        OwnedQueue,
         Work,
         WorkItem, //
     }, //
@@ -237,8 +242,6 @@ struct AFKEndpoint {
     calls: [Option<Arc<FutureValue<CallResult>>>; AOP_MAX_CALLS],
     call_returns: [Option<KVec<u8>>; AOP_MAX_CALLS],
 }
-
-unsafe impl Send for AFKEndpoint {}
 
 impl AFKEndpoint {
     fn new(index: u8) -> AFKEndpoint {
@@ -704,9 +707,33 @@ struct ListenerEntry {
     listener: Arc<dyn FakehidListener>,
 }
 
+/// A service platform device registered by this driver. It is unregistered
+/// explicitly by [`AopData::remove`]; nothing else touches the pointer.
+struct ChildDevice(NonNull<bindings::platform_device>);
+
+// SAFETY: The only operation on the pointer is `platform_device_unregister()`,
+// which may be called from any thread.
+unsafe impl Send for ChildDevice {}
+
+impl ChildDevice {
+    fn unregister(self) {
+        // SAFETY: The pointer came from a successful
+        // `platform_device_register_full()` and is unregistered exactly once,
+        // here, because this consumes `self`.
+        unsafe { bindings::platform_device_unregister(self.0.as_ptr()) };
+    }
+}
+
 #[pin_data]
 struct AopData {
     dev: ARef<device::Device>,
+    /// Runs the service registrations one at a time; drained on removal.
+    registration_queue: OwnedQueue,
+    /// Serializes queueing a registration with the start of removal, so that
+    /// nothing is queued once the queue drains. Never held across a drain.
+    #[pin]
+    registration_gate: Mutex<()>,
+    removing: Atomic<bool>,
     #[pin]
     rtkit: Mutex<Option<rtkit::RtKit<AopData>>>,
     #[pin]
@@ -716,11 +743,8 @@ struct AopData {
     #[pin]
     hid_listeners: Mutex<KVec<ListenerEntry>>,
     #[pin]
-    subdevices: Mutex<KVec<*mut bindings::platform_device>>,
+    subdevices: Mutex<KVec<ChildDevice>>,
 }
-
-unsafe impl Send for AopData {}
-unsafe impl Sync for AopData {}
 
 #[pin_data]
 struct AopServiceRegisterWork {
@@ -779,9 +803,24 @@ impl WorkItem for AopServiceRegisterWork {
             properties: ptr::null_mut(),
             of_node_reused: false,
         };
+        // The slot is reserved before the device exists, so that a device
+        // that was registered is always tracked and gets unregistered. The
+        // child's probe runs inside the registration and calls back into the
+        // transport, but nothing on that path takes this lock.
+        let mut subdevices = this.data.subdevices.lock();
+        if subdevices.reserve(1, GFP_KERNEL).is_err() {
+            dev_err!(
+                this.data.dev,
+                "Failed to allocate the device slot for service {:?}",
+                this.name
+            );
+            return;
+        }
+        // SAFETY: `info` is a valid, fully initialized `platform_device_info`
+        // whose pointers outlive the call.
         let pdev = unsafe { from_err_ptr(bindings::platform_device_register_full(&info)) };
         drop(fwnode);
-        match pdev {
+        match pdev.and_then(|pdev| NonNull::new(pdev).ok_or(EINVAL)) {
             Err(e) => {
                 dev_err!(
                     this.data.dev,
@@ -791,9 +830,10 @@ impl WorkItem for AopServiceRegisterWork {
                 );
             }
             Ok(pdev) => {
-                let res = this.data.subdevices.lock().push(pdev, GFP_KERNEL);
-                if res.is_err() {
-                    dev_err!(this.data.dev, "Failed to store subdevice");
+                if let Err(child) = subdevices.push_within_capacity(ChildDevice(pdev)) {
+                    // Cannot happen after the reservation above; never leave
+                    // a registered device untracked.
+                    child.0.unregister();
                 }
             }
         }
@@ -802,10 +842,14 @@ impl WorkItem for AopServiceRegisterWork {
 
 impl AopData {
     fn new(dev: &platform::Device<Core>) -> Result<Arc<AopData>> {
+        let registration_queue = OwnedQueue::new_ordered(c_str!("apple-aop"))?;
         Arc::pin_init(
             pin_init!(
                 AopData {
                     dev: dev.as_ref().into(),
+                    registration_queue,
+                    registration_gate <- new_mutex!(()),
+                    removing: Atomic::new(false),
                     rtkit <- new_mutex!(None),
                     endpoints <- pin_init::pin_init_array_from_fn(|i| {
                         new_mutex!(AFKEndpoint::new(AFK_ENDPOINT_START + i as u8))
@@ -855,9 +899,16 @@ impl AopData {
                 return Ok(());
             }
         };
-        // probe can call back into us, run it with locks dropped.
-        let work = AopServiceRegisterWork::new(dev_name, self, svc)?;
-        workqueue::system().enqueue(work);
+        // The child's probe calls back into the transport, so it runs from a
+        // work item with the endpoint lock dropped. The gate orders queueing
+        // it against removal, which drains the queue after setting the flag.
+        let gate = self.registration_gate.lock();
+        if self.removing.load(Acquire) {
+            return Ok(());
+        }
+        let work = AopServiceRegisterWork::new(dev_name, self.clone(), svc)?;
+        self.registration_queue.enqueue(work);
+        drop(gate);
         Ok(())
     }
 
@@ -983,15 +1034,20 @@ impl AOP for AopData {
         false
     }
     fn remove(&self) {
+        {
+            let _gate = self.registration_gate.lock();
+            self.removing.store(true, Release);
+        }
+        // No registration is queued after this point, so once the queue is
+        // empty the list of children is complete.
+        self.registration_queue.drain();
         if let Err(e) = self.stop() {
             dev_err!(self.dev, "Failed to stop AOP {:?}", e);
         }
         *self.rtkit.lock() = None;
-        let guard = self.subdevices.lock();
-        for pdev in &*guard {
-            unsafe {
-                bindings::platform_device_unregister(*pdev);
-            }
+        let children = mem::replace(&mut *self.subdevices.lock(), KVec::new());
+        for child in children {
+            child.unregister();
         }
     }
 }
