@@ -13,6 +13,7 @@
 #include <linux/mutex.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/reset.h>
 
 #include "glue.h"
@@ -74,12 +75,15 @@
  * a host whatever happens at the connectors and never sees a role change: it is brought up in
  * DWC3_APPLE_HOST at probe and stays there. The Type-C port controllers only drive the PHY's
  * Type-C mux for the SuperSpeed lanes, and the PHY follows those mode changes on its own.
+ * Across system sleep such a controller goes through DWC3_APPLE_SUSPENDED: the core is exited
+ * and initialised again around the sleep while xhci stays registered, see dwc3_apple_suspend().
  */
 enum dwc3_apple_state {
 	DWC3_APPLE_PROBE_PENDING, /* Before first cable connection, dwc3_core_probe not called */
 	DWC3_APPLE_NO_CABLE, /* No cable connected, dwc3 suspended after dwc3_core_exit */
 	DWC3_APPLE_HOST, /* Cable connected, dwc3 in host mode */
 	DWC3_APPLE_DEVICE, /* Cable connected, dwc3 in device mode */
+	DWC3_APPLE_SUSPENDED, /* Fixed-hub host asleep: core exited, xhci still registered */
 };
 
 /**
@@ -239,6 +243,7 @@ static int dwc3_apple_core_init(struct dwc3_apple *appledwc)
 			dev_err(appledwc->dev, "Failed to probe DWC3 Core, err=%d\n", ret);
 		break;
 	case DWC3_APPLE_NO_CABLE:
+	case DWC3_APPLE_SUSPENDED:
 		ret = dwc3_core_init(&appledwc->dwc);
 		if (ret)
 			dev_err(appledwc->dev, "Failed to initialize DWC3 Core, err=%d\n", ret);
@@ -371,8 +376,11 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 	 * role change or disconnect.  Do not let generic system PM independently
 	 * power-gate the DWC3 device in between: xHCI then observes a dead core on
 	 * resume and cannot restore the root hubs without a full cable teardown.
+	 * A fixed-hub controller is never torn down by a role change and has
+	 * sleep callbacks of its own instead, see dwc3_apple_suspend().
 	 */
-	dev_pm_syscore_device(appledwc->dev, true);
+	if (!appledwc->fixed_hub)
+		dev_pm_syscore_device(appledwc->dev, true);
 	return 0;
 
 core_exit:
@@ -396,13 +404,20 @@ static int dwc3_apple_exit(struct dwc3_apple *appledwc)
 		/* Nothing to do if we're already off */
 		return 0;
 	case DWC3_APPLE_DEVICE:
-		dev_pm_syscore_device(appledwc->dev, false);
+		if (!appledwc->fixed_hub)
+			dev_pm_syscore_device(appledwc->dev, false);
 		dwc3_gadget_exit(&appledwc->dwc);
 		break;
 	case DWC3_APPLE_HOST:
-		dev_pm_syscore_device(appledwc->dev, false);
+		if (!appledwc->fixed_hub)
+			dev_pm_syscore_device(appledwc->dev, false);
 		dwc3_host_exit(&appledwc->dwc);
 		break;
+	case DWC3_APPLE_SUSPENDED:
+		/* The core is exited and the reset asserted already, see dwc3_apple_suspend() */
+		dwc3_host_exit(&appledwc->dwc);
+		appledwc->state = DWC3_APPLE_NO_CABLE;
+		return 0;
 	}
 
 	/*
@@ -481,6 +496,7 @@ static enum usb_role dwc3_usb_role_switch_get(struct usb_role_switch *sw)
 
 	switch (appledwc->state) {
 	case DWC3_APPLE_HOST:
+	case DWC3_APPLE_SUSPENDED:
 		return USB_ROLE_HOST;
 	case DWC3_APPLE_DEVICE:
 		return USB_ROLE_DEVICE;
@@ -621,12 +637,84 @@ static const struct of_device_id dwc3_apple_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, dwc3_apple_of_match);
 
+/*
+ * System sleep of a fixed-hub controller.
+ *
+ * A controller with a role switch is a syscore device while a cable is connected, see
+ * dwc3_apple_init(). A fixed-hub controller is always up, and its core does not keep its state
+ * across s2idle, so it gets what dwc3_suspend_common() and dwc3_resume_common() give a host:
+ * the core is exited on the way down and initialised again on the way up. The xhci child stays
+ * registered throughout. It suspends before this device and resumes after it, and then resets
+ * the re-initialised controller. Adding or removing the child from inside a PM callback is not
+ * an option, since that re-enters the PM core's device list.
+ *
+ * No wakeup path is offered: the interrupt controller implements no irq_set_wake, so no
+ * interrupt on this SoC can be armed to end s2idle, and a remote-wakeup capable USB device
+ * could not end it either. Once that changes, the wake IRQ belongs on the xhci device
+ * (dev_pm_set_wake_irq()) and a keep-powered branch like dwc3_suspend_common()'s belongs here.
+ */
+static int dwc3_apple_suspend(struct device *dev)
+{
+	struct dwc3 *dwc = dev_get_drvdata(dev);
+	struct dwc3_apple *appledwc;
+	int ret;
+
+	if (!dwc)
+		return 0;
+	appledwc = to_dwc3_apple(dwc);
+
+	guard(mutex)(&appledwc->lock);
+
+	if (!appledwc->fixed_hub || appledwc->state != DWC3_APPLE_HOST)
+		return 0;
+
+	/* SUSPHY has to be enabled for the PHY to power down properly, as in dwc3_apple_exit() */
+	dwc3_enable_susphy(&appledwc->dwc, true);
+	dwc3_core_exit(&appledwc->dwc);
+	appledwc->state = DWC3_APPLE_SUSPENDED;
+
+	ret = reset_control_assert(appledwc->reset);
+	if (ret)
+		dev_err(appledwc->dev, "Failed to assert reset, err=%d\n", ret);
+
+	return ret;
+}
+
+static int dwc3_apple_resume(struct device *dev)
+{
+	struct dwc3 *dwc = dev_get_drvdata(dev);
+	struct dwc3_apple *appledwc;
+	int ret;
+
+	if (!dwc)
+		return 0;
+	appledwc = to_dwc3_apple(dwc);
+
+	guard(mutex)(&appledwc->lock);
+
+	if (appledwc->state != DWC3_APPLE_SUSPENDED)
+		return 0;
+
+	/* A failure leaves the controller in DWC3_APPLE_SUSPENDED, which remove() can tear down */
+	ret = dwc3_apple_core_start(appledwc, DWC3_APPLE_HOST);
+	if (ret)
+		return ret;
+
+	dwc3_apple_set_role(appledwc, DWC3_APPLE_HOST);
+	appledwc->state = DWC3_APPLE_HOST;
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(dwc3_apple_pm_ops, dwc3_apple_suspend, dwc3_apple_resume);
+
 static struct platform_driver dwc3_apple_driver = {
 	.probe		= dwc3_apple_probe,
 	.remove		= dwc3_apple_remove,
 	.driver		= {
 		.name	= "dwc3-apple",
 		.of_match_table	= dwc3_apple_of_match,
+		.pm	= pm_sleep_ptr(&dwc3_apple_pm_ops),
 	},
 };
 
