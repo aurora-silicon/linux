@@ -478,8 +478,8 @@ apple_dart_hw_map_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx)
 
 		l1_tbl = devm_memremap(dart->dev, phys, dart->pgsize,
 				       MEMREMAP_WB);
-		if (!l1_tbl)
-			return -ENOMEM;
+		if (IS_ERR(l1_tbl))
+			return PTR_ERR(l1_tbl);
 
 		dart->locked_ttbr[sid][idx] = l1_tbl;
 	}
