@@ -588,6 +588,11 @@ Kernel parameters
 	arm64.nosve	[ARM64] Unconditionally disable Scalable Vector
 			Extension support
 
+	arm64.nowfxt	[ARM64,EARLY] Disable WFxT feature detection and
+			advertisement to userspace. The kernel will not select
+			WFET or WFIT instructions based on this feature.
+			This does not disable the ordinary WFE or WFI hints.
+
 	ataflop=	[HW,M68k]
 
 	atarimouse=	[HW,MOUSE] Atari Mouse
