@@ -48,68 +48,79 @@
 		};
 
 		cpu_e0: cpu@0 {
-			compatible = "apple,sawtooth";
+			compatible = "apple,tahiti-e";
 			device_type = "cpu";
 			reg = <0x0 0x0>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			i-cache-size = <0x20000>;
+			d-cache-size = <0x10000>;
 			operating-points-v2 = <&ecluster_opp>;
 			performance-domains = <&cpufreq_e>;
 		};
 
 		cpu_e1: cpu@1 {
-			compatible = "apple,sawtooth";
+			compatible = "apple,tahiti-e";
 			device_type = "cpu";
 			reg = <0x0 0x1>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			i-cache-size = <0x20000>;
+			d-cache-size = <0x10000>;
 			operating-points-v2 = <&ecluster_opp>;
 			performance-domains = <&cpufreq_e>;
 		};
 
-
 		cpu_e2: cpu@2 {
-			compatible = "apple,sawtooth";
+			compatible = "apple,tahiti-e";
 			device_type = "cpu";
 			reg = <0x0 0x2>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			i-cache-size = <0x20000>;
+			d-cache-size = <0x10000>;
 			operating-points-v2 = <&ecluster_opp>;
 			performance-domains = <&cpufreq_e>;
 		};
 
 		cpu_e3: cpu@3 {
-			compatible = "apple,sawtooth";
+			compatible = "apple,tahiti-e";
 			device_type = "cpu";
 			reg = <0x0 0x3>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			i-cache-size = <0x20000>;
+			d-cache-size = <0x10000>;
 			operating-points-v2 = <&ecluster_opp>;
 			performance-domains = <&cpufreq_e>;
 		};
 
 		cpu_p0: cpu@10100 {
-			compatible = "apple,everest";
+			compatible = "apple,tahiti-p";
 			device_type = "cpu";
 			reg = <0x0 0x10100>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_1>;
+			i-cache-size = <0x30000>;
+			d-cache-size = <0x20000>;
 			operating-points-v2 = <&pcluster_opp>;
 			performance-domains = <&cpufreq_p>;
 		};
 
 		cpu_p1: cpu@10101 {
-			compatible = "apple,everest";
+			compatible = "apple,tahiti-p";
 			device_type = "cpu";
 			reg = <0x0 0x10101>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_1>;
+			i-cache-size = <0x30000>;
+			d-cache-size = <0x20000>;
 			operating-points-v2 = <&pcluster_opp>;
 			performance-domains = <&cpufreq_p>;
 		};
