@@ -1978,6 +1978,7 @@ F:	Documentation/devicetree/bindings/soc/apple/apple,dockchannel.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,rtk-helper-asc4.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,t8140-aop.yaml
 F:	Documentation/devicetree/bindings/sound/apple,t8140-aop-audio.yaml
+F:	Documentation/devicetree/bindings/usb/vialab,vl122.yaml
 F:	Documentation/hid/apple-j700-multitouch.rst
 F:	arch/arm64/boot/dts/apple/t8140*
 F:	arch/arm64/include/asm/apple-idle.h
