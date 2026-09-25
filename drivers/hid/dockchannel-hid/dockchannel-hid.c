@@ -151,7 +151,7 @@ struct dchid_iface {
 
 	int index;
 	const char *name;
-	const struct device_node *of_node;
+	struct device_node *of_node;
 
 	uint8_t tx_seq;
 	bool deferred;
@@ -181,6 +181,7 @@ struct dockchannel_hid {
 	struct device *dev;
 	struct dockchannel *dc;
 	struct device_link *helper_link;
+	bool stopping;
 
 	bool id_ready;
 	struct dchid_stm_id device_id;
@@ -212,6 +213,9 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 {
 	struct device_node *of_node = NULL;
 	struct dchid_iface *iface;
+
+	if (READ_ONCE(dchid->stopping))
+		return NULL;
 
 	if (index >= MAX_INTERFACES) {
 		dev_err(dchid->dev, "Interface index %d out of range\n", index);
@@ -572,6 +576,9 @@ static int dchid_open(struct hid_device *hdev)
 	struct dchid_iface *iface = hdev->driver_data;
 	int ret;
 
+	if (READ_ONCE(iface->dchid->stopping))
+		return -ESHUTDOWN;
+
 	if (!completion_done(&iface->ready)) {
 		ret = dchid_start_interface(iface);
 		if (ret < 0)
@@ -621,6 +628,9 @@ static int dchid_raw_request(struct hid_device *hdev,
 {
 	struct dchid_iface *iface = hdev->driver_data;
 
+	if (READ_ONCE(iface->dchid->stopping))
+		return -ESHUTDOWN;
+
 	switch (reqtype) {
 	case HID_REQ_GET_REPORT:
 		buf[0] = reportnum;
@@ -649,6 +659,9 @@ static void dchid_create_interface_work(struct work_struct *ws)
 	struct dockchannel_hid *dchid = iface->dchid;
 	struct hid_device *hid;
 	int ret;
+
+	if (READ_ONCE(dchid->stopping))
+		return;
 
 	if (iface->hid) {
 		dev_warn(dchid->dev, "Interface %s already created!\n",
@@ -715,6 +728,8 @@ static void dchid_create_interface_work(struct work_struct *ws)
 
 static int dchid_create_interface(struct dchid_iface *iface)
 {
+	if (READ_ONCE(iface->dchid->stopping))
+		return -ESHUTDOWN;
 	if (iface->creating)
 		return -EBUSY;
 
@@ -983,6 +998,9 @@ static void dchid_packet_work(struct work_struct *ws)
 	u8 *payload = work->data + sizeof(*shdr);
 	int type;
 
+	if (READ_ONCE(dchid->stopping))
+		goto out;
+
 	if (work->hdr.length < sizeof(*shdr)) {
 		dev_err(dchid->dev, "Short packet (%u bytes) for iface %d\n",
 			work->hdr.length, work->hdr.iface);
@@ -1077,6 +1095,9 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 	struct dchid_iface *iface;
 	u32 checksum;
 
+	if (READ_ONCE(dchid->stopping))
+		return;
+
 	if (dockchannel_recv(dchid->dc, &hdr, sizeof(hdr)) != sizeof(hdr)) {
 		dev_err(dchid->dev, "Read failed (header)\n");
 		return;
@@ -1138,7 +1159,9 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 	queue_work(iface->wq, &work->work);
 
 done:
-	dockchannel_await(dchid->dc, dchid_handle_packet, dchid, sizeof(struct dchid_hdr));
+	if (!READ_ONCE(dchid->stopping))
+		dockchannel_await(dchid->dc, dchid_handle_packet, dchid,
+				  sizeof(struct dchid_hdr));
 }
 
 static int dockchannel_hid_probe(struct platform_device *pdev)
@@ -1234,6 +1257,7 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	}
 
 	dev_info(dchid->dev, "Initialized, awaiting packets\n");
+	platform_set_drvdata(pdev, dchid);
 	dockchannel_await(dchid->dc, dchid_handle_packet, dchid, sizeof(struct dchid_hdr));
 
 	return 0;
@@ -1241,7 +1265,32 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 
 static void dockchannel_hid_remove(struct platform_device *pdev)
 {
-	BUG_ON(1);
+	struct dockchannel_hid *dchid = platform_get_drvdata(pdev);
+	int i;
+
+	/*
+	 * Stop the receive path first: no new packets, no new work, and a
+	 * receive callback that is still running does not re-arm itself.
+	 */
+	WRITE_ONCE(dchid->stopping, true);
+	dockchannel_await(dchid->dc, NULL, NULL, 0);
+
+	/* Packet work can still queue interface creation; drain it first. */
+	for (i = 0; i < MAX_INTERFACES; i++) {
+		if (dchid->ifaces[i])
+			destroy_workqueue(dchid->ifaces[i]->wq);
+	}
+	destroy_workqueue(dchid->new_iface_wq);
+
+	for (i = 0; i < MAX_INTERFACES; i++) {
+		struct dchid_iface *iface = dchid->ifaces[i];
+
+		if (!iface)
+			continue;
+		if (iface->hid)
+			hid_destroy_device(iface->hid);
+		of_node_put(iface->of_node);
+	}
 }
 
 static const struct of_device_id dockchannel_hid_of_match[] = {
@@ -1255,6 +1304,8 @@ static struct platform_driver dockchannel_hid_driver = {
 	.driver = {
 		.name = "dockchannel-hid",
 		.of_match_table = dockchannel_hid_of_match,
+		/* The coprocessor announces its interfaces only once per boot. */
+		.suppress_bind_attrs = true,
 	},
 	.probe = dockchannel_hid_probe,
 	.remove = dockchannel_hid_remove,

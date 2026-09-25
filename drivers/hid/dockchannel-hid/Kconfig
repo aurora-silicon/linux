@@ -10,4 +10,8 @@ config HID_DOCKCHANNEL
 	  The keyboard and touchpad are HID based devices connected via the
 	  proprietary DockChannel interface.
 
+	  The MTP coprocessor announces the keyboard and touchpad only when
+	  it boots, so the driver cannot be unbound and rebound, or built as
+	  a module and reloaded, without losing both until the next boot.
+
 endmenu
