@@ -1965,6 +1965,19 @@ L:	linux-hwmon@vger.kernel.org
 S:	Odd fixes
 F:	drivers/hwmon/applesmc.c
 
+APPLE T8140 SOC AND J700 (MACBOOK NEO) SUPPORT
+M:	Ryan Murray <ryan@aurorasilicon.org>
+W:	https://aurora-silicon.github.io
+S:	Maintained
+F:	Documentation/devicetree/bindings/iio/light/apple,t8140-aop-als.yaml
+F:	Documentation/devicetree/bindings/media/apple,t8140-isp.yaml
+F:	Documentation/devicetree/bindings/reserved-memory/apple,asc-mem.yaml
+F:	Documentation/devicetree/bindings/serial/apple,dockchannel-uart.yaml
+F:	Documentation/devicetree/bindings/soc/apple/apple,t8140-aop.yaml
+F:	Documentation/devicetree/bindings/sound/apple,t8140-aop-audio.yaml
+F:	arch/arm64/boot/dts/apple/t8140*
+F:	drivers/tty/serial/apple_dockchannel*
+
 APPLETALK NETWORK LAYER
 L:	netdev@vger.kernel.org
 S:	Odd fixes
