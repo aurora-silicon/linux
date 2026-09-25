@@ -65,6 +65,7 @@ struct  cs42l42_private {
 	u8 hs_bias_ramp_time;
 	u8 hs_bias_sense_en;
 	u8 stream_use;
+	unsigned int dai_format;
 	bool remote_active;
 	unsigned int remote_saved[CS42L83_REMOTE_NUM_SAVED_REGS];
 	bool hp_adc_up_pending;
