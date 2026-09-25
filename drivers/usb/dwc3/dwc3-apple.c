@@ -68,6 +68,12 @@
  * in DWC3_APPLE_PROBE_PENDING.
  * Once a cable is connected we then keep track of the controller mode here by transitioning to
  * DWC3_APPLE_HOST or DWC3_APPLE_DEVICE.
+ *
+ * Some boards do not wire the controller's USB2 pairs to a connector but to a fixed USB2 hub on
+ * the board, whose downstream ports serve the Type-C connectors (Apple J700). Such a controller is
+ * a host whatever happens at the connectors and never sees a role change: it is brought up in
+ * DWC3_APPLE_HOST at probe and stays there. The Type-C port controllers only drive the PHY's
+ * Type-C mux for the SuperSpeed lanes, and the PHY follows those mode changes on its own.
  */
 enum dwc3_apple_state {
 	DWC3_APPLE_PROBE_PENDING, /* Before first cable connection, dwc3_core_probe not called */
@@ -86,6 +92,7 @@ enum dwc3_apple_state {
  * @usb2_phy: USB2 PHY, configured before the core is brought up
  * @usb3_phy: USB3 PHY, configured after the core is brought up
  * @role_sw: USB role switch
+ * @fixed_hub: A fixed hub sits on the controller's USB2 port, the controller stays in host mode
  * @lock: Mutex for synchronizing access
  * @state: Current state of the controller, see documentation for the enum for details
  */
@@ -100,6 +107,7 @@ struct dwc3_apple {
 	struct phy *usb2_phy;
 	struct phy *usb3_phy;
 	struct usb_role_switch *role_sw;
+	bool fixed_hub;
 
 	struct mutex lock;
 
@@ -402,6 +410,10 @@ static int dwc3_usb_role_switch_set(struct usb_role_switch *sw, enum usb_role ro
 
 	guard(mutex)(&appledwc->lock);
 
+	/* A controller behind a fixed hub is a host regardless of the connectors */
+	if (appledwc->fixed_hub)
+		return 0;
+
 	/*
 	 * Skip role switches if appledwc is already in the desired state. The
 	 * USB-C port controller on M2 and M1/M2 Pro/Max/Ultra devices issues
@@ -477,6 +489,14 @@ static int dwc3_apple_setup_role_switch(struct dwc3_apple *appledwc)
 	return 0;
 }
 
+static bool dwc3_apple_has_fixed_hub(struct device *dev)
+{
+	struct device_node *hub __free(device_node) =
+		of_get_available_child_by_name(dev->of_node, "hub");
+
+	return hub;
+}
+
 static int dwc3_apple_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -488,6 +508,7 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	appledwc->dev = &pdev->dev;
+	appledwc->fixed_hub = dwc3_apple_has_fixed_hub(dev);
 	mutex_init(&appledwc->lock);
 
 	appledwc->reset = devm_reset_control_get_exclusive(dev, NULL);
@@ -533,6 +554,24 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	ret = dwc3_apple_setup_role_switch(appledwc);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "Failed to setup role switch\n");
+
+	if (!appledwc->fixed_hub)
+		return 0;
+
+	/*
+	 * The hub is the controller's permanent USB2 peer, and the PHY has kept
+	 * its USB2 path up for it since its own probe, so there is nothing to
+	 * wait for: bring the host up now.
+	 */
+	scoped_guard(mutex, &appledwc->lock)
+		ret = dwc3_apple_init(appledwc, DWC3_APPLE_HOST);
+	if (ret) {
+		/* dwc3_apple_init() has already undone the core initialisation */
+		if (appledwc->state != DWC3_APPLE_PROBE_PENDING)
+			dwc3_core_remove(&appledwc->dwc);
+		usb_role_switch_unregister(appledwc->role_sw);
+		return dev_err_probe(dev, ret, "Failed to start host mode\n");
+	}
 
 	return 0;
 }
