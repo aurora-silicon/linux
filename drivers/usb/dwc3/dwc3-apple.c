@@ -253,7 +253,11 @@ static int dwc3_apple_core_init(struct dwc3_apple *appledwc)
 	return ret;
 }
 
-static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
+/*
+ * Bring the core up for the given role: configure the USB2 PHY, release the reset and probe
+ * (on the first call) or initialise the core.
+ */
+static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
 {
 	int ret, ret_reset;
 
@@ -289,8 +293,12 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 	}
 
 	ret = dwc3_apple_core_init(appledwc);
-	if (ret)
-		goto reset_assert;
+	if (ret) {
+		ret_reset = reset_control_assert(appledwc->reset);
+		if (ret_reset)
+			dev_warn(appledwc->dev, "Failed to assert reset, err=%d\n", ret_reset);
+		return ret;
+	}
 
 	/*
 	 * Now that the core is initialized and already went through dwc3_core_soft_reset we can
@@ -298,38 +306,51 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 	 */
 	dwc3_apple_setup_cio(appledwc);
 
+	return 0;
+}
+
+/* Select the role in the core and route the USB3 PHY, before xhci or the gadget is started */
+static void dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
+{
+	bool host = state == DWC3_APPLE_HOST;
+	int ret;
+
+	lockdep_assert_held(&appledwc->lock);
+
+	appledwc->dwc.dr_mode = host ? USB_DR_MODE_HOST : USB_DR_MODE_PERIPHERAL;
+	dwc3_apple_set_ptrcap(appledwc, host ? DWC3_GCTL_PRTCAP_HOST : DWC3_GCTL_PRTCAP_DEVICE);
+	/*
+	 * This platform requires SUSPHY to be enabled here already in order to properly
+	 * configure the PHY and switch dwc3's PIPE interface to USB3 PHY. The USB2 PHY
+	 * has already been configured to the correct mode earlier.
+	 */
+	dwc3_enable_susphy(&appledwc->dwc, true);
+	ret = phy_set_mode(appledwc->usb3_phy, host ? PHY_MODE_USB_HOST : PHY_MODE_USB_DEVICE);
+	if (ret)
+		dev_warn(appledwc->dev, "USB3 PHY setup failed, USB2 only, err=%d\n", ret);
+}
+
+static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
+{
+	int ret, ret_reset;
+
+	lockdep_assert_held(&appledwc->lock);
+
+	ret = dwc3_apple_core_start(appledwc, state);
+	if (ret)
+		return ret;
+
+	dwc3_apple_set_role(appledwc, state);
+
 	switch (state) {
 	case DWC3_APPLE_HOST:
-		appledwc->dwc.dr_mode = USB_DR_MODE_HOST;
-		dwc3_apple_set_ptrcap(appledwc, DWC3_GCTL_PRTCAP_HOST);
-		/*
-		 * This platform requires SUSPHY to be enabled here already in order to properly
-		 * configure the PHY and switch dwc3's PIPE interface to USB3 PHY. The USB2 PHY
-		 * has already been configured to the correct mode earlier.
-		 */
-		dwc3_enable_susphy(&appledwc->dwc, true);
-		ret = phy_set_mode(appledwc->usb3_phy, PHY_MODE_USB_HOST);
-		if (ret)
-			dev_warn(appledwc->dev, "USB3 PHY setup failed, USB2 only, err=%d\n", ret);
 		ret = dwc3_host_init(&appledwc->dwc);
 		if (ret) {
 			dev_err(appledwc->dev, "Failed to initialize host, ret=%d\n", ret);
 			goto core_exit;
 		}
-
 		break;
 	case DWC3_APPLE_DEVICE:
-		appledwc->dwc.dr_mode = USB_DR_MODE_PERIPHERAL;
-		dwc3_apple_set_ptrcap(appledwc, DWC3_GCTL_PRTCAP_DEVICE);
-		/*
-		 * This platform requires SUSPHY to be enabled here already in order to properly
-		 * configure the PHY and switch dwc3's PIPE interface to USB3 PHY. The USB2 PHY
-		 * has already been configured to the correct mode earlier.
-		 */
-		dwc3_enable_susphy(&appledwc->dwc, true);
-		ret = phy_set_mode(appledwc->usb3_phy, PHY_MODE_USB_DEVICE);
-		if (ret)
-			dev_warn(appledwc->dev, "USB3 PHY setup failed, USB2 only, err=%d\n", ret);
 		ret = dwc3_gadget_init(&appledwc->dwc);
 		if (ret) {
 			dev_err(appledwc->dev, "Failed to initialize gadget, ret=%d\n", ret);
@@ -356,7 +377,6 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 
 core_exit:
 	dwc3_core_exit(&appledwc->dwc);
-reset_assert:
 	ret_reset = reset_control_assert(appledwc->reset);
 	if (ret_reset)
 		dev_warn(appledwc->dev, "Failed to assert reset, err=%d\n", ret_reset);
