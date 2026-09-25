@@ -1473,6 +1473,16 @@ static int macaudio_slk_lock(struct snd_kcontrol *kcontrol, struct snd_ctl_file 
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 
 	mutex_lock(&ma->volume_lock_mutex);
+
+	/*
+	 * A lease belongs to the owner that pinged for it. Whatever the
+	 * previous owner had left must not unlock the volume for a new one
+	 * before it has pinged itself.
+	 */
+	cancel_delayed_work(&ma->lock_timeout_work);
+	ma->speaker_lock_remain = 0;
+	ma->speaker_lock_timeout = 0;
+
 	ma->speaker_lock_owner = owner;
 	macaudio_vlimit_update(ma);
 
@@ -1495,7 +1505,9 @@ static void macaudio_slk_unlock(struct snd_kcontrol *kcontrol)
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 
 	mutex_lock(&ma->volume_lock_mutex);
+	cancel_delayed_work(&ma->lock_timeout_work);
 	ma->speaker_lock_owner = NULL;
+	ma->speaker_lock_remain = 0;
 	ma->speaker_lock_timeout = 0;
 	macaudio_vlimit_update(ma);
 	mutex_unlock(&ma->volume_lock_mutex);
