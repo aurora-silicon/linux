@@ -31,6 +31,21 @@
 	};
 };
 
+&dcp {
+	panel: panel {
+		compatible = "apple,panel-j613", "apple,panel";
+		/*
+		 * 2560x1664 at 224 ppi; 181 mm high without the 64 notch rows,
+		 * as on the J413.
+		 */
+		width-mm = <290>;
+		height-mm = <189>;
+		adj-height-mm = <181>;
+		/* The backlight's maximum: 525 nits. */
+		apple,max-brightness = <525>;
+	};
+};
+
 &wifi0 {
 	brcm,board-type = "apple,dnieper";
 };
