@@ -100,6 +100,12 @@ struct coord {
 	u32 y;
 };
 
+/* MMIO window the firmware accesses at its physical address */
+struct isp_mmio_window {
+	u64 base;
+	u64 size;
+};
+
 struct isp_preset {
 	u32 index;
 	struct coord input_dim;
@@ -145,6 +151,10 @@ struct apple_isp_hw {
 	bool mbox_irq_route;
 	/* coprocessor control register, 0 for ISP_COPROC_CONTROL */
 	u32 coproc_control;
+
+	/* windows mapped 1:1 for the firmware */
+	const struct isp_mmio_window *fw_mmio;
+	unsigned int num_fw_mmio;
 };
 
 enum isp_sensor_id {

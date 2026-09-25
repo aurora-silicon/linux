@@ -79,6 +79,56 @@ static int apple_isp_attach_genpd(struct apple_isp *isp)
 	return 0;
 }
 
+static void apple_isp_unmap_fw_mmio(struct apple_isp *isp, unsigned int count)
+{
+	for (unsigned int i = 0; i < count; i++)
+		iommu_unmap(isp->domain, isp->hw->fw_mmio[i].base,
+			    isp->hw->fw_mmio[i].size);
+}
+
+/*
+ * Some firmware accesses registers of other blocks, such as the PMGR
+ * scratch registers named in PMP_CTRL_SET, through its DART at their
+ * physical addresses. Map those windows 1:1.
+ */
+static int apple_isp_map_fw_mmio(struct apple_isp *isp)
+{
+	u64 start = isp->fw.heap_top, end = start + isp->iova_size;
+
+	for (unsigned int i = 0; i < isp->hw->num_fw_mmio; i++) {
+		const struct isp_mmio_window *w = &isp->hw->fw_mmio[i];
+		int err;
+
+		/* Keep them out of the range the surfaces come from. */
+		if (w->base < end && w->base + w->size > start) {
+			dev_err(isp->dev,
+				"MMIO window 0x%llx+0x%llx overlaps the IOVA range\n",
+				w->base, w->size);
+			err = -EINVAL;
+		} else {
+			/*
+			 * Cacheable: with the no-cache attribute, the ISP took
+			 * an SError on its first write to the PMP scratch
+			 * register when streaming started.
+			 */
+			err = iommu_map(isp->domain, w->base, w->base, w->size,
+					IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE,
+					GFP_KERNEL);
+			if (err)
+				dev_err(isp->dev,
+					"failed to map MMIO window 0x%llx+0x%llx: %d\n",
+					w->base, w->size, err);
+		}
+
+		if (err) {
+			apple_isp_unmap_fw_mmio(isp, i);
+			return err;
+		}
+	}
+
+	return 0;
+}
+
 static int apple_isp_init_iommu(struct apple_isp *isp)
 {
 	struct device *dev = isp->dev;
@@ -132,11 +182,18 @@ static int apple_isp_init_iommu(struct apple_isp *isp)
 	isp->iova_size = vm_size - (heap_base & 0xffffffff);
 	drm_mm_init(&isp->iovad, isp->fw.heap_top, isp->iova_size);
 
+	err = apple_isp_map_fw_mmio(isp);
+	if (err) {
+		drm_mm_takedown(&isp->iovad);
+		return err;
+	}
+
 	return 0;
 }
 
 static void apple_isp_free_iommu(struct apple_isp *isp)
 {
+	apple_isp_unmap_fw_mmio(isp, isp->hw->num_fw_mmio);
 	drm_mm_takedown(&isp->iovad);
 }
 
