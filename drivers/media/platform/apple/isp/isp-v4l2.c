@@ -353,7 +353,7 @@ static int apple_isp_start_streaming(struct apple_isp *isp)
 	err = apple_isp_start_camera(isp);
 	if (err) {
 		dev_err(isp->dev, "failed to start camera: %d\n", err);
-		goto release_buffers;
+		return err;
 	}
 
 	err = isp_submit_buffers(isp);
@@ -374,14 +374,15 @@ static int apple_isp_start_streaming(struct apple_isp *isp)
 
 stop_camera:
 	apple_isp_stop_camera(isp);
-release_buffers:
-	isp_vb2_release_buffers(isp, VB2_BUF_STATE_QUEUED);
 	return err;
 }
 
 static void apple_isp_stop_streaming(struct apple_isp *isp)
 {
-	clear_bit(ISP_STATE_STREAMING, &isp->state);
+	/* Not running if restarting it after system sleep failed. */
+	if (!test_and_clear_bit(ISP_STATE_STREAMING, &isp->state))
+		return;
+
 	apple_isp_stop_capture(isp);
 	apple_isp_stop_camera(isp);
 }
@@ -389,10 +390,15 @@ static void apple_isp_stop_streaming(struct apple_isp *isp)
 static int isp_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct apple_isp *isp = vb2_get_drv_priv(q);
+	int err;
 
 	isp->sequence = 0;
 
-	return apple_isp_start_streaming(isp);
+	err = apple_isp_start_streaming(isp);
+	if (err)
+		isp_vb2_release_buffers(isp, VB2_BUF_STATE_QUEUED);
+
+	return err;
 }
 
 static void isp_vb2_stop_streaming(struct vb2_queue *q)
@@ -405,25 +411,49 @@ static void isp_vb2_stop_streaming(struct vb2_queue *q)
 
 int apple_isp_video_suspend(struct apple_isp *isp)
 {
-	/* Swap into STATE_SLEEPING as isp_vb2_buf_queue() submits on
-	 * STATE_STREAMING.
+	unsigned long flags;
+
+	mutex_lock(&isp->video_lock);
+
+	/*
+	 * Stop the stream but keep its buffers queued to the driver. First
+	 * move the buffers given to the firmware to the pending list, so that
+	 * the buffer return for the stop does not complete them; they are
+	 * submitted again when the stream restarts on resume.
+	 * isp_vb2_buf_queue() does not submit while the stream is stopped.
 	 */
 	if (test_bit(ISP_STATE_STREAMING, &isp->state)) {
-		/* Signal buffers to be recycled for clean shutdown */
-		isp_vb2_release_buffers(isp, VB2_BUF_STATE_QUEUED);
+		spin_lock_irqsave(&isp->buf_lock, flags);
+		list_splice_init(&isp->bufs_submitted, &isp->bufs_pending);
+		spin_unlock_irqrestore(&isp->buf_lock, flags);
+
 		apple_isp_stop_streaming(isp);
 		set_bit(ISP_STATE_SLEEPING, &isp->state);
 	}
+
+	mutex_unlock(&isp->video_lock);
 
 	return 0;
 }
 
 int apple_isp_video_resume(struct apple_isp *isp)
 {
-	if (test_bit(ISP_STATE_SLEEPING, &isp->state)) {
-		clear_bit(ISP_STATE_SLEEPING, &isp->state);
-		apple_isp_start_streaming(isp);
+	int err;
+
+	mutex_lock(&isp->video_lock);
+
+	if (test_and_clear_bit(ISP_STATE_SLEEPING, &isp->state)) {
+		err = apple_isp_start_streaming(isp);
+		if (err) {
+			dev_err(isp->dev,
+				"failed to restart streaming after resume: %d\n",
+				err);
+			isp_vb2_release_buffers(isp, VB2_BUF_STATE_ERROR);
+			vb2_queue_error(&isp->vbq);
+		}
 	}
+
+	mutex_unlock(&isp->video_lock);
 
 	return 0;
 }
