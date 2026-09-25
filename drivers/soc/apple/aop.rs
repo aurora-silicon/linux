@@ -465,7 +465,7 @@ impl AFKEndpoint {
                 }
                 let retcode = u32::from_ne_bytes(data[..4].try_into().unwrap());
                 let tag = ehdr.tag as usize;
-                if tag == 0 || tag - 1 > self.calls.len() || self.calls[tag - 1].is_none() {
+                if tag == 0 || tag > self.calls.len() || self.calls[tag - 1].is_none() {
                     dev_err!(
                         client.dev,
                         "Got a retcode with invalid tag {:?} on endpoint {}",
