@@ -376,12 +376,31 @@ static void macaudio_vlimit_timeout_work(struct work_struct *wrk)
 {
         struct macaudio_snd_data *ma = container_of(to_delayed_work(wrk),
 						    struct macaudio_snd_data, lock_timeout_work);
+	ktime_t now, left;
 
 	mutex_lock(&ma->volume_lock_mutex);
+
+	/*
+	 * A ping or a disabled timeout can have cancelled this work after it
+	 * had already started running; neither must expire the lease.
+	 */
+	if (!ma->speaker_lock_timeout_enabled || !ma->speaker_lock_owner ||
+	    ma->speaker_lock_remain <= 0)
+		goto out;
+
+	/* A ping renewed the lease while this work was already running */
+	now = ktime_get();
+	if (ktime_before(now, ma->speaker_lock_timeout)) {
+		left = ktime_sub(ma->speaker_lock_timeout, now);
+		schedule_delayed_work(&ma->lock_timeout_work,
+				      usecs_to_jiffies(ktime_to_us(left)));
+		goto out;
+	}
 
 	ma->speaker_lock_remain = 0;
 	macaudio_vlimit_update(ma);
 
+out:
 	mutex_unlock(&ma->volume_lock_mutex);
 }
 
