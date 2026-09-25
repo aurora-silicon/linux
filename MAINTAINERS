@@ -1985,6 +1985,7 @@ F:	drivers/tty/serial/apple_dockchannel*
 F:	include/linux/soc/apple/smc-thermal.h
 F:	rust/kernel/iio/common/aop_sensors.rs
 F:	rust/kernel/soc/apple/aop.rs
+F:	sound/soc/apple/t8140_aop_audio.rs
 
 APPLETALK NETWORK LAYER
 L:	netdev@vger.kernel.org

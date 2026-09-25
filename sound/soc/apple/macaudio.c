@@ -23,6 +23,7 @@
 /* #define DEBUG */
 
 #include <linux/module.h>
+#include <linux/atomic.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <sound/core.h>
@@ -56,6 +57,8 @@
 #define MACAUDIO_MAX_BCLK_FREQ	24576000
 
 #define SPEAKER_MAGIC_VALUE (s32)0xdec1be15
+/* Primary, Secondary and Speaker Sense */
+#define MACAUDIO_NUM_FE_LINKS	3
 /* milliseconds */
 #define SPEAKER_LOCK_TIMEOUT 250
 
@@ -64,6 +67,11 @@ enum macaudio_amp_type {
 	AMP_TAS5770,
 	AMP_SN012776,
 	AMP_SSM3515,
+	/*
+	 * A fixed-gain amplifier with no controls of its own; the volume is
+	 * a software gain the CPU DAI applies before the samples reach it.
+	 */
+	AMP_MAX98360A,
 };
 
 enum macaudio_spkr_config {
@@ -81,12 +89,32 @@ struct macaudio_platform_cfg {
 	bool stereo;
 	int amp_gain;
 	int safe_vol;
+	/*
+	 * The speaker codec's output widget, "OUT" (the TAS and SSM
+	 * amplifiers) unless set.
+	 */
+	const char *spk_out_widget;
+	/*
+	 * Software-gain amplifier: the CPU DAI whose front-end converts the
+	 * speaker samples through the volume control at copy time.
+	 */
+	const char *sw_gain_dai;
+	/*
+	 * A CPU component other than the MCA: its front-end DAI names in
+	 * place of "mca-pcm-N", the DAI format its serial links run (the
+	 * default MACAUDIO_DAI_FMT when 0) and the primary front-end's
+	 * bclk ratio when the link's frame length is not ours to choose.
+	 */
+	const char *fe_dai_names[MACAUDIO_NUM_FE_LINKS];
+	unsigned int dai_fmt;
+	unsigned int primary_bclk_ratio;
 };
 
 static const char *volume_control_names[] = {
 	[AMP_TAS5770] = "* Speaker Playback Volume",
 	[AMP_SN012776] = "* Speaker Volume",
 	[AMP_SSM3515] = "* DAC Playback Volume",
+	[AMP_MAX98360A] = "* Speaker Playback Volume",
 };
 
 #define SN012776_0DB 201
@@ -97,6 +125,10 @@ static const char *volume_control_names[] = {
 
 #define SSM3515_0DB (255 - 64) /* +24dB max, steps of 3/8 dB */
 #define SSM3515_DB(x) (SSM3515_0DB + (8 * (x) / 3))
+
+/* Software gain of the CPU DAI: 0.5 dB steps, 127 = the amplifier's full scale */
+#define MAX98360A_0DB 127
+#define MAX98360A_DB(x) (MAX98360A_0DB + 2 * (x))
 
 struct ma_codec_idle {
 	int idle_mode;
@@ -118,6 +150,8 @@ struct macaudio_snd_data {
 		/* frontend props */
 		unsigned int bclk_ratio;
 		bool is_sense;
+		/* the front-end that applies the software speaker gain */
+		bool sw_gain;
 
 		/* backend props */
 		bool is_speakers;
@@ -141,6 +175,16 @@ struct macaudio_snd_data {
 	struct delayed_work lock_timeout_work;
 	struct work_struct lock_update_work;
 
+	/*
+	 * Software-gain amplifier: a lower gain cannot change samples that
+	 * were converted before it was set, so every lock event bumps the
+	 * epoch and stops the front-end stream; it is refused until it has
+	 * been prepared (and its buffer cleared) under the new epoch.
+	 */
+	atomic_t sw_gain_lock_epoch;
+	atomic_t sw_gain_prepared_epoch;
+	atomic_t sw_gain_limit_failed;
+	struct work_struct sw_gain_stop_work;
 };
 
 static int please_blow_up_my_speakers;
@@ -162,6 +206,11 @@ SND_SOC_DAILINK_DEFS(sense,
 	DAILINK_COMP_ARRAY(COMP_DUMMY()), // CODEC
 	DAILINK_COMP_ARRAY(COMP_EMPTY()));
 
+/*
+ * The front-ends are triggered before their back-ends (the default order,
+ * made explicit here): macaudio_fe_trigger() runs first of all on START,
+ * so a start it refuses leaves the DMA and the back-ends untouched.
+ */
 static struct snd_soc_dai_link macaudio_fe_links[] = {
 	{
 		.name = "Primary",
@@ -171,6 +220,7 @@ static struct snd_soc_dai_link macaudio_fe_links[] = {
 		.dpcm_merged_chan = 1,
 		.dpcm_merged_format = 1,
 		.dai_fmt = MACAUDIO_DAI_FMT,
+		.trigger = { SND_SOC_DPCM_TRIGGER_PRE, SND_SOC_DPCM_TRIGGER_PRE },
 		SND_SOC_DAILINK_REG(primary),
 	},
 	{
@@ -182,6 +232,7 @@ static struct snd_soc_dai_link macaudio_fe_links[] = {
 		.dpcm_merged_format = 1,
 		.dai_fmt = MACAUDIO_DAI_FMT,
 		.playback_only = 1,
+		.trigger = { SND_SOC_DPCM_TRIGGER_PRE, SND_SOC_DPCM_TRIGGER_PRE },
 		SND_SOC_DAILINK_REG(secondary),
 	},
 	{
@@ -196,6 +247,8 @@ static struct snd_soc_dai_link macaudio_fe_links[] = {
 		SND_SOC_DAILINK_REG(sense),
 	},
 };
+
+static_assert(ARRAY_SIZE(macaudio_fe_links) == MACAUDIO_NUM_FE_LINKS);
 
 static struct macaudio_link_props macaudio_fe_link_props[] = {
 	{
@@ -260,12 +313,24 @@ static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 		else
 			max = SSM3515_DB(ma->cfg->safe_vol);
 		break;
+	case AMP_MAX98360A:
+		if (unlock)
+			max = MAX98360A_0DB;
+		else
+			max = MAX98360A_DB(ma->cfg->safe_vol);
+		break;
 	}
 
 	ret = snd_soc_limit_volume(&ma->card, name, max);
 	if (ret < 0)
 		dev_err(ma->card.dev, "Failed to %slock volume %s: %d\n",
 			unlock ? "un" : "", name, ret);
+	/*
+	 * With a software gain the limit is the whole protection: refuse to
+	 * play rather than run the amplifier at full scale unlimited.
+	 */
+	if (ma->cfg->amp == AMP_MAX98360A)
+		atomic_set(&ma->sw_gain_limit_failed, ret < 0);
 }
 
 static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
@@ -314,6 +379,11 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 		}
 
 		macaudio_vlimit_unlock(ma, unlock);
+		if (!unlock && ma->cfg->amp == AMP_MAX98360A) {
+			/* Samples already converted at the old gain must not play */
+			atomic_inc(&ma->sw_gain_lock_epoch);
+			schedule_work(&ma->sw_gain_stop_work);
+		}
 		ma->speaker_volume_unlocked = unlock;
 		snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
 			       &ma->speaker_lock_kctl->id);
@@ -376,12 +446,31 @@ static void macaudio_vlimit_timeout_work(struct work_struct *wrk)
 {
         struct macaudio_snd_data *ma = container_of(to_delayed_work(wrk),
 						    struct macaudio_snd_data, lock_timeout_work);
+	ktime_t now, left;
 
 	mutex_lock(&ma->volume_lock_mutex);
+
+	/*
+	 * A ping or a disabled timeout can have cancelled this work after it
+	 * had already started running; neither must expire the lease.
+	 */
+	if (!ma->speaker_lock_timeout_enabled || !ma->speaker_lock_owner ||
+	    ma->speaker_lock_remain <= 0)
+		goto out;
+
+	/* A ping renewed the lease while this work was already running */
+	now = ktime_get();
+	if (ktime_before(now, ma->speaker_lock_timeout)) {
+		left = ktime_sub(ma->speaker_lock_timeout, now);
+		schedule_delayed_work(&ma->lock_timeout_work,
+				      usecs_to_jiffies(ktime_to_us(left)));
+		goto out;
+	}
 
 	ma->speaker_lock_remain = 0;
 	macaudio_vlimit_update(ma);
 
+out:
 	mutex_unlock(&ma->volume_lock_mutex);
 }
 
@@ -394,6 +483,49 @@ static void macaudio_vlimit_update_work(struct work_struct *wrk)
 		macaudio_vlimit_enable_timeout(ma);
 	else
 		macaudio_vlimit_disable_timeout(ma);
+}
+
+static bool macaudio_sw_gain_pcm(struct snd_pcm_substream *substream)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(rtd->card);
+	struct macaudio_link_props *props = &ma->link_props[rtd->dai_link->id];
+
+	return props->sw_gain && substream->stream == SNDRV_PCM_STREAM_PLAYBACK;
+}
+
+static void macaudio_sw_gain_stop_work(struct work_struct *work)
+{
+	struct macaudio_snd_data *ma = container_of(work, struct macaudio_snd_data,
+						  sw_gain_stop_work);
+	struct snd_soc_pcm_runtime *rtd;
+	struct snd_pcm_substream *substream;
+	unsigned long flags;
+
+	/* No volume or control lock may be held while taking the stream lock */
+	for_each_card_rtds(&ma->card, rtd) {
+		if (!rtd->pcm)
+			continue;
+		substream = rtd->pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
+		if (!substream || !macaudio_sw_gain_pcm(substream))
+			continue;
+		snd_pcm_stream_lock_irqsave(substream, flags);
+		if (substream->runtime &&
+		    atomic_read(&ma->sw_gain_prepared_epoch) !=
+				atomic_read(&ma->sw_gain_lock_epoch)) {
+			switch (substream->runtime->state) {
+			case SNDRV_PCM_STATE_PREPARED:
+			case SNDRV_PCM_STATE_RUNNING:
+			case SNDRV_PCM_STATE_DRAINING:
+			case SNDRV_PCM_STATE_PAUSED:
+				snd_pcm_stop(substream, SNDRV_PCM_STATE_XRUN);
+				break;
+			default:
+				break;
+			}
+		}
+		snd_pcm_stream_unlock_irqrestore(substream, flags);
+	}
 }
 
 static int macaudio_copy_link(struct device *dev, struct snd_soc_dai_link *target,
@@ -448,7 +580,7 @@ static int macaudio_parse_of_be_dai_link(struct macaudio_snd_data *ma,
 
 	link->no_pcm = 1;
 
-	link->dai_fmt = MACAUDIO_DAI_FMT;
+	link->dai_fmt = ma->cfg->dai_fmt ?: MACAUDIO_DAI_FMT;
 
 	link->num_codecs = ncodecs_per_be;
 	link->codecs = devm_kcalloc(dev, ncodecs_per_be,
@@ -575,6 +707,15 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 			goto err_free;
 
 		memcpy(link_props, &macaudio_fe_link_props[i], sizeof(struct macaudio_link_props));
+		if (ma->cfg->fe_dai_names[i])
+			link->cpus[0].dai_name = ma->cfg->fe_dai_names[i];
+		if (ma->cfg->dai_fmt && !link_props->is_sense)
+			link->dai_fmt = ma->cfg->dai_fmt;
+		if (i == 0 && ma->cfg->primary_bclk_ratio)
+			link_props->bclk_ratio = ma->cfg->primary_bclk_ratio;
+		if (ma->cfg->sw_gain_dai)
+			link_props->sw_gain = !strcmp(link->cpus[0].dai_name,
+						      ma->cfg->sw_gain_dai);
 		link++; link_props++;
 	}
 
@@ -958,10 +1099,57 @@ static int macaudio_be_trigger(struct snd_pcm_substream *substream, int cmd)
 	return 0;
 }
 
+static int macaudio_fe_prepare(struct snd_pcm_substream *substream)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(rtd->card);
+
+	if (!macaudio_sw_gain_pcm(substream))
+		return 0;
+
+	if (atomic_read(&ma->sw_gain_limit_failed))
+		return -EIO;
+	/* The CPU DAI's prepare clears the old samples out of the buffer next */
+	atomic_set(&ma->sw_gain_prepared_epoch,
+		   atomic_read(&ma->sw_gain_lock_epoch));
+	return 0;
+}
+
+/*
+ * Runs before the CPU DAI and the back-ends are triggered (see the
+ * front-end links): a lock event since prepare means the buffer holds
+ * samples converted at the old gain, so the start is refused and the
+ * stream has to be prepared again.
+ */
+static int macaudio_fe_trigger(struct snd_pcm_substream *substream, int cmd)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(rtd->card);
+
+	if (!macaudio_sw_gain_pcm(substream))
+		return 0;
+
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+	case SNDRV_PCM_TRIGGER_RESUME:
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		if (atomic_read(&ma->sw_gain_limit_failed) ||
+		    atomic_read(&ma->sw_gain_prepared_epoch) !=
+				atomic_read(&ma->sw_gain_lock_epoch))
+			return -EPIPE;
+		break;
+	default:
+		break;
+	}
+	return 0;
+}
+
 static const struct snd_soc_ops macaudio_fe_ops = {
 	.startup	= macaudio_fe_startup,
 	.shutdown	= macaudio_dpcm_shutdown,
 	.hw_params	= macaudio_fe_hw_params,
+	.prepare	= macaudio_fe_prepare,
+	.trigger	= macaudio_fe_trigger,
 };
 
 static const struct snd_soc_ops macaudio_be_ops = {
@@ -992,9 +1180,11 @@ static int macaudio_be_assign_tdm(struct snd_soc_pcm_runtime *rtd)
 
 		/*
 		 * Headphones get a pass on -ENOTSUPP (see the comment
-		 * around bclk_ratio value for primary FE).
+		 * around bclk_ratio value for primary FE), as does an
+		 * amplifier without a TDM interface behind a software gain.
 		 */
-		if (ret == -ENOTSUPP && props->is_headphones)
+		if (ret == -ENOTSUPP &&
+		    (props->is_headphones || ma->cfg->amp == AMP_MAX98360A))
 			return 0;
 
 		return ret;
@@ -1133,8 +1323,8 @@ static int macaudio_add_backend_dai_route(struct snd_soc_card *card, struct snd_
 		r->sink = "Headset Capture";
 	}
 
-	/* If speakers, add sense capture path */
-	if (is_speakers) {
+	/* If speakers, add sense capture path (a playback-only CPU DAI has none) */
+	if (is_speakers && dai->stream[SNDRV_PCM_STREAM_CAPTURE].widget) {
 		r = &routes[nroutes++];
 		r->source = dai->stream[SNDRV_PCM_STREAM_CAPTURE].widget->name;
 		r->sink = "Speaker Sense Capture";
@@ -1150,6 +1340,7 @@ static int macaudio_add_backend_dai_route(struct snd_soc_card *card, struct snd_
 static int macaudio_add_pin_routes(struct snd_soc_card *card, struct snd_soc_component *component,
 				   bool is_speakers)
 {
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 	struct snd_soc_dapm_route routes[2];
 	struct snd_soc_dapm_route *r;
 	int nroutes = 0;
@@ -1160,10 +1351,12 @@ static int macaudio_add_pin_routes(struct snd_soc_card *card, struct snd_soc_com
 
 	/* Connect the far ends of CODECs to pins */
 	if (is_speakers) {
+		const char *out = ma->cfg->spk_out_widget ?: "OUT";
+
 		r = &routes[nroutes++];
-		r->source = "OUT";
+		r->source = out;
 		if (component->name_prefix) {
-			snprintf(buf, sizeof(buf) - 1, "%s OUT", component->name_prefix);
+			snprintf(buf, sizeof(buf) - 1, "%s %s", component->name_prefix, out);
 			r->source = buf;
 		}
 		r->sink = "Speaker";
@@ -1290,6 +1483,9 @@ static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, b
 			CHECK_CONCAT(snd_soc_deactivate_kctl, "DAC Analog Gain Select", 0);
 
 		/* TODO: HPF, needs new call to set */
+		break;
+	case AMP_MAX98360A:
+		/* No controls of its own; the gain sits on the CPU DAI */
 		break;
 	default:
 		return -EINVAL;
@@ -1423,19 +1619,22 @@ static int macaudio_slk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 
-	if (!ma->speaker_lock_owner)
-		return -EPERM;
-
 	if (uvalue->value.integer.value[0] != SPEAKER_MAGIC_VALUE)
 		return -EINVAL;
+
+	mutex_lock(&ma->volume_lock_mutex);
+
+	if (!ma->speaker_lock_owner) {
+		mutex_unlock(&ma->volume_lock_mutex);
+		return -EPERM;
+	}
 
 	/* Serves as a notification that the lock was lost at some point */
 	if (ma->speaker_volume_was_locked) {
 		ma->speaker_volume_was_locked = false;
+		mutex_unlock(&ma->volume_lock_mutex);
 		return -ETIMEDOUT;
 	}
-
-	mutex_lock(&ma->volume_lock_mutex);
 
 	cancel_delayed_work(&ma->lock_timeout_work);
 
@@ -1470,6 +1669,16 @@ static int macaudio_slk_lock(struct snd_kcontrol *kcontrol, struct snd_ctl_file 
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 
 	mutex_lock(&ma->volume_lock_mutex);
+
+	/*
+	 * A lease belongs to the owner that pinged for it. Whatever the
+	 * previous owner had left must not unlock the volume for a new one
+	 * before it has pinged itself.
+	 */
+	cancel_delayed_work(&ma->lock_timeout_work);
+	ma->speaker_lock_remain = 0;
+	ma->speaker_lock_timeout = 0;
+
 	ma->speaker_lock_owner = owner;
 	macaudio_vlimit_update(ma);
 
@@ -1491,9 +1700,13 @@ static void macaudio_slk_unlock(struct snd_kcontrol *kcontrol)
 	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 
+	mutex_lock(&ma->volume_lock_mutex);
+	cancel_delayed_work(&ma->lock_timeout_work);
 	ma->speaker_lock_owner = NULL;
+	ma->speaker_lock_remain = 0;
 	ma->speaker_lock_timeout = 0;
 	macaudio_vlimit_update(ma);
+	mutex_unlock(&ma->volume_lock_mutex);
 }
 
 /*
@@ -1565,6 +1778,31 @@ struct macaudio_platform_cfg macaudio_j293_cfg = {
 
 struct macaudio_platform_cfg macaudio_j313_cfg = {
 	true,	AMP_TAS5770,	SPKR_1W,	true,	10,	-20,
+};
+
+/*
+ * J700 (T8140, MacBook Neo): the AOP firmware owns the audio fabric, so the
+ * CPU component is the T8140 AOP audio driver rather than the MCA. The jack
+ * is a CS42L83 on the AOP's "cout" back-end, which the firmware runs as a
+ * 125-SCLK pulse frame at 48 kHz (6 MHz) with two 32-bit slots, data
+ * launched on the rising SCLK edge: DSP_A with an inverted bit clock. The
+ * speakers are one MAX98360A per channel on the "spkr" back-end, with no
+ * sense lines and no amplifier controls; the volume is the CPU DAI's
+ * software gain, which the lock holds 20 dB down until a protection daemon
+ * takes it. The daemon models the speaker from the SpeakerTap, a digital
+ * tap of the words the amplifier receives.
+ */
+struct macaudio_platform_cfg macaudio_j700_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_MAX98360A,
+	.speakers = SPKR_1W,
+	.stereo = true,
+	.safe_vol = -20,
+	.spk_out_widget = "Speaker",
+	.sw_gain_dai = "j700-pcm-1",
+	.fe_dai_names = { "j700-pcm-0", "j700-pcm-1", "j700-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
+	.primary_bclk_ratio = 125,
 };
 
 struct macaudio_platform_cfg macaudio_j314_cfg = {
@@ -1654,6 +1892,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j575    AID33   sn012776    15      1x 1W    Compat: apple,j375-macaudio */
 	/* j613    AID20   sn012776    15      2x 1W+1T Compat: apple,j413-macaudio */
 	/* j615    AID21   sn012776    15      2x 2W+1T Compat: apple,j415-macaudio */
+	/* j700    AID44   max98360a   -       2x 1W    (AOP-fed, software gain) */
+	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
 	/* Fallback, jack only */
 	{ .compatible = "apple,macaudio"},
 	{ }
@@ -1728,15 +1968,26 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 
 	INIT_WORK(&data->lock_update_work, macaudio_vlimit_update_work);
 	INIT_DELAYED_WORK(&data->lock_timeout_work, macaudio_vlimit_timeout_work);
+	INIT_WORK(&data->sw_gain_stop_work, macaudio_sw_gain_stop_work);
+	atomic_set(&data->sw_gain_lock_epoch, 0);
+	atomic_set(&data->sw_gain_prepared_epoch, -1);
+	atomic_set(&data->sw_gain_limit_failed, 0);
 
-	return devm_snd_soc_register_card(dev, card);
+	return snd_soc_register_card(card);
 }
 
 static void macaudio_snd_platform_remove(struct platform_device *pdev)
 {
 	struct macaudio_snd_data *ma = dev_get_drvdata(&pdev->dev);
 
+	/*
+	 * Unregister first: a back-end trigger queues lock_update_work, which
+	 * arms lock_timeout_work, and neither may run once the card is gone.
+	 */
+	snd_soc_unregister_card(&ma->card);
+	cancel_work_sync(&ma->lock_update_work);
 	cancel_delayed_work_sync(&ma->lock_timeout_work);
+	cancel_work_sync(&ma->sw_gain_stop_work);
 }
 
 static struct platform_driver macaudio_snd_driver = {
