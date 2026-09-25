@@ -2,6 +2,7 @@
 /* Copyright 2023 Eileen Yoon <eyn@gmx.com> */
 
 #include <linux/firmware.h>
+#include <linux/unaligned.h>
 
 #include "isp-cam.h"
 #include "isp-cmd.h"
@@ -274,28 +275,33 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 	u32 magic;
 	int err;
 
-	err = request_firmware(&fw, setfile->path, isp->dev);
+	if (WARN_ON_ONCE(setfile->size > isp->data_surf->size))
+		return -ENOSPC;
+
+	err = firmware_request_nowarn(&fw, setfile->path, isp->dev);
 	if (err) {
-		dev_err(isp->dev, "failed to request setfile '%s': %d\n",
-			setfile->path, err);
+		dev_warn_once(isp->dev,
+			      "setfile '%s' not loaded (%d), streaming without calibration\n",
+			      setfile->path, err);
 		return err;
 	}
 
 	if (fw->size < setfile->size) {
-		dev_err(isp->dev, "setfile too small (0x%zx/0x%zx)\n", fw->size,
-			setfile->size);
+		dev_err(isp->dev, "setfile '%s' too small (0x%zx/0x%zx)\n",
+			setfile->path, fw->size, setfile->size);
 		release_firmware(fw);
 		return -EINVAL;
 	}
 
-	magic = be32_to_cpup((__be32 *)fw->data);
+	magic = get_unaligned_be32(fw->data);
 	if (magic != setfile->magic) {
-		dev_err(isp->dev, "setfile '%s' corrupted?\n", setfile->path);
+		dev_err(isp->dev, "setfile '%s' has magic 0x%08x, expected 0x%08x\n",
+			setfile->path, magic, setfile->magic);
 		release_firmware(fw);
 		return -EINVAL;
 	}
 
-	memcpy(isp->data_surf->virt, (void *)fw->data, setfile->size);
+	memcpy(isp->data_surf->virt, fw->data, setfile->size);
 	release_firmware(fw);
 
 	return isp_cmd_ch_set_file_load(isp, ch, isp->data_surf->iova,
@@ -309,16 +315,13 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
 
 	isp_cmd_flicker_sensor_set(isp, 0);
 
-	/* The setfile isn't requisite but then we don't get calibration */
+	/*
+	 * The setfile isn't requisite but then we don't get calibration. If
+	 * loading it was interrupted by a signal, give up on the stream.
+	 */
 	err = isp_ch_load_setfile(isp, ch);
-	if (err) {
-		dev_err(isp->dev, "warning: calibration data not loaded: %d\n",
-			err);
-
-		/* If this failed due to a signal, propagate */
-		if (err == -EINTR)
-			return err;
-	}
+	if (err == -EINTR)
+		return err;
 
 	if (isp->hw->lpdp) {
 		err = isp_cmd_ch_lpdp_hs_receiver_tuning_set(isp, ch, 1, 15);
