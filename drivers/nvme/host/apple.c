@@ -1142,6 +1142,22 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	if (!(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
 		APPLE_ANS_COPROC_CPU_CONTROL_RUN)) {
 
+		if (anv->hw->needs_ioq_registers) {
+			/*
+			 * Post-M4 ANS cannot be reset through PMGR: the reset
+			 * assert raises an SError. A previous boot stage that
+			 * stopped the coprocessor cleanly leaves its firmware
+			 * resident, so mirror the qualified U-Boot handoff:
+			 * set RUN and run a fresh RTKit boot handshake.
+			 */
+			dev_dbg(anv->dev,
+				"post-M4 firmware handoff: restarting stopped ANS without reset\n");
+			writel(APPLE_ANS_COPROC_CPU_CONTROL_RUN,
+			       anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
+			ret = apple_rtkit_boot(anv->rtk);
+			goto booted;
+		}
+
 		ret = reset_control_assert(anv->reset);
 		if (ret)
 			goto out;
@@ -1162,6 +1178,7 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		ret = apple_rtkit_wake(anv->rtk);
 	}
 
+booted:
 	if (ret) {
 		dev_err(anv->dev, "ANS did not boot");
 		goto out;
