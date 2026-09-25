@@ -126,7 +126,12 @@ impl Device {
         }
         let selector=sgx.try_read64(0xd800)?;
         let mut fault=0;
-        for bank in [0,1] {sgx.try_write64(bank,0xd800)?;fault|=sgx.try_read64(0xd8c0)?;}
+        // One fault bank (selected through 0xd800) per GPU cluster: banks 0 and 1 on the
+        // two-cluster T6030, bank 0 alone on the single-cluster T8122. Never select a bank past
+        // the SoC's clusters.
+        for bank in 0..u64::from(self.soc.clusters) {
+            sgx.try_write64(bank,0xd800)?;fault|=sgx.try_read64(0xd8c0)?;
+        }
         sgx.try_write64(selector,0xd800)?;
         if fault!=0 {return Err(EIO);} Ok(())
     }
