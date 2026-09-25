@@ -66,24 +66,29 @@ pub(crate) const T6030_IO_MAPPINGS: [IoMapping; 15] = [
 ];
 
 /// The T8122 firmware IO mappings of the runtime backend, in the same form: the blocks of
-/// `hw::t8122`, each with the total size of its instances and the size of one. The AIC timer
-/// entry is the T6030 one, the same register on every SoC. Before writing them,
-/// `fill_io_mappings` checks every entry against the runtime's IO maps of the SoC, which T8122
-/// does not have yet (`m3_soc::T8122.iomaps`).
+/// `hw::t8122`, with the exact register, total size and element size the G15G firmware takes in
+/// each slot. The AIC timer entry is the T6030 one, the same register on every SoC.
+/// `fill_io_mappings` checks every entry against the runtime's IO maps of the SoC
+/// ([`T8122_IOMAPS`]) before writing it.
 pub(crate) const T8122_IO_MAPPINGS: [IoMapping; 12] = [
     (0, 0x2_90d0_0000, 0x10_4000, 0x10_4000, true), // Fender
     (1, 0x2_0e10_1000, 1, 1, false),                // AIC timer
-    (2, 0x2_d101_4000, 0x4000, 0x4000, true),       // AIC software interrupts
+    (2, 0x2_d101_4048, 1, 1, true),                 // AIC software interrupt register
     (3, 0x2_9000_0000, 0x2_0000, 0x2_0000, true),   // RGX
     (9, 0x2_90e0_8000, 0x8000, 0x8000, true),       // metrology sensors
     (10, 0x2_90d0_d000, 0x1000, 0x1000, true),      // GM GIFAF registers
-    (11, 0x2_2000_0000, 0xb_0000, 0x5_8000, true),  // memory cache, two instances
+    (11, 0x2_2000_0000, 0xa_a000, 0x5_5000, true),  // memory cache, two instances
     (18, 0x2_d03d_0000, 0x1000, 0x1000, true),      // telemetry dashboard
     (19, 0x2_d03c_0000, 0x2000, 0x2000, false),     // telemetry dashboard (read)
-    (25, 0x3_1145_c000, 0x4000, 0x4000, true),      // ANE doorbell
+    (25, 0x3_1145_c000, 1, 1, true),                // ANE doorbell
     (26, 0x2_d028_0000, 0x8000, 0x8000, false),     // PMS metrology sensors
     (29, 0x2_90e1_c000, 0x4000, 0x4000, false),     // GPU clock generator
 ];
+
+/// The T8122 runtime's IO maps (`m3_soc::T8122.iomaps`): its IO mappings, laid out as the T6030
+/// ones are.
+pub(crate) static T8122_IOMAPS: [storage::IoMap; 12] =
+    storage::pack_iomaps(&T8122_IO_MAPPINGS, storage::IOMAP_BASE);
 
 /// Whether every entry of `mappings` is a whole number of elements in the HwConfig block of the
 /// same slot, with the same writability: the check `fill_io_mappings` makes when it builds the
