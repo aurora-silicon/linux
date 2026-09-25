@@ -698,6 +698,60 @@ static const struct apple_isp_hw apple_isp_hw_t6031 = {
 	.meta_size = ISP_META_SIZE_T6031,
 };
 
+/*
+ * Registers the T8140 firmware accesses at their physical addresses: the
+ * bootloader's DART address filter ranges for the ISP, rounded out to
+ * 16 KiB pages.
+ */
+static const struct isp_mmio_window apple_isp_fw_mmio_t8140[] = {
+	{ 0x220004000, 0x14000 },	/* DSID broadcast-clear windows */
+	{ 0x220044000, 0x14000 },
+	{ 0x220084000, 0x14000 },
+	{ 0x2200c4000, 0x14000 },
+	{ 0x220104000, 0x14000 },
+	{ 0x3003c0000, 0x28000 },	/* PMGR, with the PMP clock scratch */
+	{ 0x300704000, 0x4000 },	/* PMGR, ISP power states */
+	{ 0x300730000, 0x4000 },
+	{ 0x300e3c000, 0x4000 },
+	{ 0x302824000, 0x4000 },	/* PMP bandwidth scratch */
+	{ 0x31062c000, 0x20000 },
+	{ 0x401660000, 0x4000 },
+};
+
+static const struct apple_isp_hw apple_isp_hw_t8140 = {
+	.gen = ISP_GEN_T8140,
+	.fw_abi = ISP_FW_ABI_H17,
+	.pmu_base = 0x0,
+
+	.dsid_count = 1,
+	.dsid_clr_base0 = 0x220114000,
+	.dsid_clr_range0 = 0x2fc,
+
+	.clock_scratch = 0x3003d0ca0,
+	.clock_base = 0x0,
+	.clock_bit = 0x0,
+	.clock_size = 0x8,
+	.bandwidth_scratch = 0x302824000,
+	.bandwidth_base = 0x0,
+	.bandwidth_bit = 0x0,
+	.bandwidth_size = 0x8,
+	.mbox_irq_enable = ISP_MBOX_IRQ_ENABLE_T6031,
+
+	.scl1 = false,
+	.lpdp = true,
+	.meta_size = ISP_META_SIZE_T8140,
+
+	.fw_iova_mask = GENMASK_ULL(35, 0),
+	.mbox2_offset = 0x410,
+	.mbox_irq_route = true,
+	.coproc_control = ISP_COPROC_CONTROL_T8140,
+	.fw_mmio = apple_isp_fw_mmio_t8140,
+	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t8140),
+	.boot_mode = 1,
+	.capture_meta_size = ISP_CAPTURE_META_SIZE_T8140,
+	.resident_fw = true,
+};
+
 static const struct of_device_id apple_isp_of_match[] = {
 	{ .compatible = "apple,t8103-isp", .data = &apple_isp_hw_t8103 },
 	{ .compatible = "apple,t8112-isp", .data = &apple_isp_hw_t8112 },
@@ -706,6 +760,7 @@ static const struct of_device_id apple_isp_of_match[] = {
 	{ .compatible = "apple,t6020-isp", .data = &apple_isp_hw_t6020 },
 	{ .compatible = "apple,t6030-isp", .data = &apple_isp_hw_t6030 },
 	{ .compatible = "apple,t6031-isp", .data = &apple_isp_hw_t6031 },
+	{ .compatible = "apple,t8140-isp", .data = &apple_isp_hw_t8140 },
 	{},
 };
 MODULE_DEVICE_TABLE(of, apple_isp_of_match);

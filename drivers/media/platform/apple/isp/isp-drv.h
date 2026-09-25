@@ -24,6 +24,8 @@
 #define ISP_META_SIZE_T8103  0x4640
 #define ISP_META_SIZE_T8112  0x4840
 #define ISP_META_SIZE_T6031  0x4a40
+#define ISP_META_SIZE_T8140  0x4d00
+#define ISP_CAPTURE_META_SIZE_T8140 0x29fc0
 
 /* used to limit the user space buffers to the buffer_pool_config */
 #define ISP_MAX_BUFFERS 16
