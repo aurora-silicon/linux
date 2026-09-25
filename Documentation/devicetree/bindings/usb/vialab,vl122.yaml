@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/usb/vialab,vl122.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: VIA Labs VL122 USB 2.0 hub controller
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description:
+  The VL122 is a two-port USB 2.0 hub controller. Apple's J700 has one
+  permanently attached to the USB 2.0 root port of a Type-C USB controller,
+  with the two downstream ports wired to the high-speed pairs of the two
+  Type-C connectors.
+
+allOf:
+  - $ref: usb-hub.yaml#
+
+properties:
+  compatible:
+    enum:
+      - usb2109,2122
+
+  reg: true
+
+  ports:
+    $ref: /schemas/graph.yaml#/properties/ports
+    description: The two downstream facing ports.
+
+    properties:
+      port@1:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: Downstream port 1.
+
+      port@2:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: Downstream port 2.
+
+required:
+  - compatible
+  - reg
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    usb {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        hub@1 {
+            compatible = "usb2109,2122";
+            reg = <1>;
+
+            ports {
+                #address-cells = <1>;
+                #size-cells = <0>;
+
+                port@1 {
+                    reg = <1>;
+
+                    hub_front: endpoint {
+                        remote-endpoint = <&typec1_connector_hs>;
+                    };
+                };
+
+                port@2 {
+                    reg = <2>;
+
+                    hub_rear: endpoint {
+                        remote-endpoint = <&typec0_connector_hs>;
+                    };
+                };
+            };
+        };
+    };

@@ -26,8 +26,30 @@ description: >
   below by our bootloader m1n1 are required. Without these only USB2 operation
   is possible.
 
+  The T8140 variant has no USB4/Thunderbolt controller behind it and carries a
+  second eUSB2 PHY register bank whose per-device defaults are also provided by
+  the bootloader.
+
 allOf:
   - $ref: /schemas/usb/usb-switch.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8140-atcphy
+    then:
+      properties:
+        reg:
+          minItems: 6
+        reg-names:
+          minItems: 6
+    else:
+      properties:
+        reg:
+          maxItems: 5
+        reg-names:
+          maxItems: 5
+        apple,tunable-usb2phy-reg-dflt: false
 
 $defs:
   apple,tunable:
@@ -55,22 +77,27 @@ properties:
               - apple,t8112-atcphy
           - const: apple,t8103-atcphy
       - const: apple,t8103-atcphy
+      - const: apple,t8140-atcphy
 
   reg:
+    minItems: 5
     items:
       - description: Common controls for all PHYs (USB2/3/4, DisplayPort, TBT)
       - description: DisplayPort Alternate Mode PHY specific controls
       - description: Type-C PHY AXI to Apple Fabric interconnect controls
       - description: USB2 PHY specific controls
       - description: USB3 PIPE interface controls
+      - description: Secondary eUSB2 PHY register bank (T8140)
 
   reg-names:
+    minItems: 5
     items:
       - const: core
       - const: lpdptx
       - const: axi2af
       - const: usb2phy
       - const: pipehandler
+      - const: usb2phy-reg
 
   "#phy-cells":
     const: 1
@@ -151,6 +178,13 @@ properties:
       Note that lane here refers to a USB RX and TX pair re-used for DisplayPort
       and not to an individual DisplayPort differential lane.
 
+  apple,tunable-usb2phy-reg-dflt:
+    $ref: "#/$defs/apple,tunable"
+    description: >
+      Per-device defaults for the secondary eUSB2 PHY register bank of the
+      T8140, copied from Apple's Device Tree by the bootloader. Unlike the
+      other tunables these are applied to the usb2phy-reg region.
+
 required:
   - compatible
   - reg
@@ -216,6 +250,47 @@ examples:
 
           endpoint {
             remote-endpoint = <&acio_tbt_out>;
+          };
+        };
+      };
+    };
+
+  - |
+    phy@b000000 {
+      compatible = "apple,t8140-atcphy";
+      reg = <0x0b000000 0x4c000>,
+            <0x0b050000 0x4000>,
+            <0x08000000 0x8000>,
+            <0x0aa90000 0x4000>,
+            <0x0aa84000 0x4000>,
+            <0x0a300000 0x4000>;
+      reg-names = "core", "lpdptx", "axi2af", "usb2phy",
+                  "pipehandler", "usb2phy-reg";
+
+      #phy-cells = <1>;
+      #reset-cells = <0>;
+
+      orientation-switch;
+      mode-switch;
+      power-domains = <&ps_atc0_usb>;
+
+      ports {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        port@0 {
+          reg = <0>;
+
+          endpoint {
+            remote-endpoint = <&typec0_connector_ss>;
+          };
+        };
+
+        port@1 {
+          reg = <1>;
+
+          endpoint {
+            remote-endpoint = <&dwc3_0_ss>;
           };
         };
       };
