@@ -138,6 +138,9 @@ impl<T: MessageProcessor + 'static> IIORegistration<T> {
             _p: PhantomData,
         };
         this.dev = unsafe { bindings::iio_device_alloc(data.dev.as_raw(), 0) };
+        if this.dev.is_null() {
+            return Err(ENOMEM);
+        }
         unsafe {
             (*this.dev).priv_ = data.clone().into_foreign().cast();
             (*this.dev).name = name.as_ptr() as _;
