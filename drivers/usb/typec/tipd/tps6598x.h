@@ -292,6 +292,7 @@ struct tipd_data {
 	bool (*read_data_status)(struct tps6598x *tps);
 	int (*reset)(struct tps6598x *tps);
 	int (*connect)(struct tps6598x *tps, u32 status);
+	void (*resume_reverify)(struct tps6598x *tps);
 };
 
 struct tps6598x {
@@ -317,6 +318,8 @@ struct tps6598x {
 	u32 data_status;
 	u16 pwr_status;
 	struct delayed_work	wq_poll;
+
+	struct notifier_block pm_nb;
 
 	const struct tipd_data *data;
 };
