@@ -105,6 +105,8 @@ const QE_MAGIC2: u32 = from_fourcc(b" POA");
 /// Bound on the wait for the reply to an EPIC call. The firmware can stop
 /// answering, and a caller must not be left in D state forever.
 const EPIC_CALL_TIMEOUT_MS: u32 = 5000;
+/// Bound on the wait for an endpoint's shutdown acknowledgment.
+const AFK_SHUTDOWN_TIMEOUT_MS: u32 = 5000;
 
 fn align_up(v: usize, a: usize) -> usize {
     (v + a - 1) & !(a - 1)
@@ -215,13 +217,6 @@ impl<T> FutureValue<T> {
         *self.val.lock() = Some(val);
         self.completion.notify_all();
     }
-    fn wait(&self) -> T {
-        let mut ret_guard = self.val.lock();
-        while ret_guard.is_none() {
-            self.completion.wait(&mut ret_guard);
-        }
-        ret_guard.take().unwrap()
-    }
     /// Waits at most `timeout_ms` for the value; `None` if it did not arrive.
     ///
     /// The wait is uninterruptible: a firmware transaction must not be
@@ -268,6 +263,8 @@ enum CallSlot {
 
 struct AFKEndpoint {
     index: u8,
+    /// The AFK handshake was started; only such endpoints are shut down.
+    started: bool,
     iomem: Option<Coherent<[u8]>>,
     txbuf: Option<AFKRingBuffer>,
     rxbuf: Option<AFKRingBuffer>,
@@ -279,6 +276,7 @@ impl AFKEndpoint {
     fn new(index: u8) -> AFKEndpoint {
         AFKEndpoint {
             index,
+            started: false,
             iomem: None,
             txbuf: None,
             rxbuf: None,
@@ -343,7 +341,7 @@ impl AFKEndpoint {
                 self.recv_rb(client)?;
             }
             AFK_OPC_SHUTDOWN_ACK => {
-                client.shutdown_complete();
+                client.shutdown_complete(self.index);
             }
             _ => dev_err!(
                 client.dev,
@@ -796,7 +794,7 @@ struct AopData {
     #[pin]
     endpoints: [Mutex<AFKEndpoint>; AFK_ENDPOINT_COUNT as usize],
     #[pin]
-    ep_shutdown: FutureValue<()>,
+    ep_shutdown: [FutureValue<()>; AFK_ENDPOINT_COUNT as usize],
     #[pin]
     hid_listeners: Mutex<KVec<ListenerEntry>>,
     #[pin]
@@ -911,7 +909,7 @@ impl AopData {
                     endpoints <- pin_init::pin_init_array_from_fn(|i| {
                         new_mutex!(AFKEndpoint::new(AFK_ENDPOINT_START + i as u8))
                     }),
-                    ep_shutdown <- FutureValue::pin_init(),
+                    ep_shutdown <- pin_init::pin_init_array_from_fn(|_| FutureValue::pin_init()),
                     hid_listeners <- new_mutex!(KVec::new()),
                     subdevices <- new_mutex!(KVec::new()),
                 }
@@ -922,19 +920,20 @@ impl AopData {
     fn start(&self) -> Result<()> {
         {
             let mut guard = self.rtkit.lock();
-            let mut rtk = guard.as_mut().as_pin_mut().unwrap();
+            let mut rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
             rtk.as_mut().wake()?;
         }
-        for ep in 0..AFK_ENDPOINT_COUNT {
-            let rtk_ep_num = AFK_ENDPOINT_START + ep;
+        for ep in 0..AFK_ENDPOINT_COUNT as usize {
+            let rtk_ep_num = AFK_ENDPOINT_START + ep as u8;
             let mut guard = self.rtkit.lock();
-            let mut rtk = guard.as_mut().as_pin_mut().unwrap();
+            let mut rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
             if !rtk.as_mut().has_endpoint(rtk_ep_num) {
                 continue;
             }
             rtk.as_mut().start_endpoint(rtk_ep_num)?;
-            let ep_guard = self.endpoints[ep as usize].lock();
+            let mut ep_guard = self.endpoints[ep].lock();
             ep_guard.start(rtk.as_mut())?;
+            ep_guard.started = true;
         }
         Ok(())
     }
@@ -979,26 +978,45 @@ impl AopData {
         Ok(())
     }
 
-    fn shutdown_complete(&self) {
-        self.ep_shutdown.complete(());
+    fn shutdown_complete(&self, endpoint: u8) {
+        if let Some(index) = afk_endpoint_index(endpoint) {
+            self.ep_shutdown[index].complete(());
+        }
     }
 
+    /// Shuts down every started endpoint, waiting a bounded time for each
+    /// acknowledgment. Returns the first error but still tries the rest.
     fn stop(&self) -> Result<()> {
-        for ep in 0..AFK_ENDPOINT_COUNT {
+        let mut ret = Ok(());
+        for ep in 0..AFK_ENDPOINT_COUNT as usize {
             {
-                let rtk_ep_num = AFK_ENDPOINT_START + ep;
                 let mut guard = self.rtkit.lock();
-                let mut rtk = guard.as_mut().as_pin_mut().unwrap();
-                if !rtk.as_mut().has_endpoint(rtk_ep_num) {
+                let mut rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
+                let mut ep_guard = self.endpoints[ep].lock();
+                if !ep_guard.started {
                     continue;
                 }
-                let ep_guard = self.endpoints[ep as usize].lock();
-                ep_guard.stop(rtk.as_mut())?;
+                // Whatever happens below, the endpoint is not started again.
+                ep_guard.started = false;
+                self.ep_shutdown[ep].reset();
+                if let Err(e) = ep_guard.stop(rtk.as_mut()) {
+                    ret = ret.and(Err(e));
+                    continue;
+                }
             }
-            self.ep_shutdown.wait();
-            self.ep_shutdown.reset();
+            if self.ep_shutdown[ep]
+                .wait_timeout(AFK_SHUTDOWN_TIMEOUT_MS)
+                .is_none()
+            {
+                dev_warn!(
+                    self.dev,
+                    "Endpoint {:#04x} did not acknowledge its shutdown",
+                    AFK_ENDPOINT_START + ep as u8
+                );
+                ret = ret.and(Err(ETIMEDOUT));
+            }
         }
-        Ok(())
+        ret
     }
 
     fn patch_bootargs(
