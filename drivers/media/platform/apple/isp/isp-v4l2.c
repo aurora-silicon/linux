@@ -34,13 +34,16 @@ struct isp_buflist_buffer {
 	u32 tag;
 	u32 pad;
 } __packed;
-static_assert(sizeof(struct isp_buflist_buffer) == 0x40);
+static_assert(sizeof(struct isp_buflist_buffer) == ISP_BUFLIST_DESC_SIZE);
 
 struct isp_buflist {
 	u64 type;
 	u64 num_buffers;
 	struct isp_buflist_buffer buffers[];
-};
+} __packed;
+static_assert(sizeof(struct isp_buflist) == ISP_BUFLIST_HDR_SIZE);
+/* the firmware reads at least ISP_IPC_BUFEXC_STAT_SIZE bytes of a batch */
+static_assert(ISP_CMD_AREA_SIZE >= ISP_IPC_BUFEXC_STAT_SIZE);
 
 int ipc_bt_handle(struct apple_isp *isp, struct isp_channel *chan)
 {
@@ -124,6 +127,7 @@ static int isp_submit_buffers(struct apple_isp *isp)
 	struct isp_channel *chan = isp->chan_bh;
 	struct isp_message *req = &chan->req;
 	struct isp_buffer *buf, *tmp;
+	unsigned int num_rendered = 0;
 	unsigned long flags;
 	size_t offset;
 	int err;
@@ -131,8 +135,9 @@ static int isp_submit_buffers(struct apple_isp *isp)
 	struct isp_buflist *bl = isp->cmd_virt;
 	struct isp_buflist_buffer *bufd = &bl->buffers[0];
 
+	/* Clear what earlier commands and batches left in the reserved fields. */
+	memset(bl, 0, ISP_CMD_AREA_SIZE);
 	bl->type = 1;
-	bl->num_buffers = 0;
 
 	spin_lock_irqsave(&isp->buf_lock, flags);
 	for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++) {
@@ -154,10 +159,10 @@ static int isp_submit_buffers(struct apple_isp *isp)
 		meta->submitted = true;
 	}
 
-	while ((buf = list_first_entry_or_null(&isp->bufs_pending,
+	/* One rendered pool per batch; the rest stays pending for the next. */
+	while (num_rendered < ISP_MAX_BUFFERS &&
+	       (buf = list_first_entry_or_null(&isp->bufs_pending,
 					       struct isp_buffer, link))) {
-		memset(bufd, 0, sizeof(*bufd));
-
 		bufd->num_planes = fmt->num_planes;
 		bufd->pool_type = isp->hw->scl1 ? CISP_POOL_TYPE_RENDERED_SCL1 :
 						  CISP_POOL_TYPE_RENDERED;
@@ -173,6 +178,7 @@ static int isp_submit_buffers(struct apple_isp *isp)
 		       buf->surfs[0].iova + buf->surfs[0].size); */
 		bufd++;
 		bl->num_buffers++;
+		num_rendered++;
 
 		/*
 		 * Queue the buffer as submitted and release the lock for now.

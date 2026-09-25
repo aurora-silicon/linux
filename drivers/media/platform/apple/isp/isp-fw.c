@@ -393,8 +393,8 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 	/*
 	 * The firmware picks the offset of the boot arguments in the IPC
 	 * surface, and the command area follows them. Both have to lie
-	 * inside the surface; the command area must hold the 0x280 bytes the
-	 * firmware reads for a buffer batch, more than any command needs.
+	 * inside the surface, and the command area must hold the largest
+	 * buffer batch, which is more than any command needs.
 	 */
 	args_virt = NULL;
 	cmd_virt = NULL;
@@ -404,7 +404,7 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 		args_virt = apple_isp_ipc_translate(isp, args_iova,
 						    sizeof(args));
 		cmd_virt = apple_isp_ipc_translate(isp, cmd_iova,
-						   ISP_IPC_BUFEXC_STAT_SIZE);
+						   ISP_CMD_AREA_SIZE);
 	}
 	if (!args_virt || !cmd_virt) {
 		dev_err(isp->dev, "invalid boot arguments offset 0x%x\n",
