@@ -194,7 +194,8 @@ impl DrmGpu for Backend {
     fn new_queue(&self, vm: mmu::Vm, _ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
         _ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>, priority: u32,
         usc_exec_base: u64) -> Result<KBox<dyn queue::Queue>> {
-        Ok(KBox::new(crate::m3_submit::Queue::new(self.shared.clone(),self.scheduler.clone(),vm,priority,usc_exec_base)?,GFP_KERNEL)?)
+        Ok(KBox::new(crate::m3_submit::Queue::new(self.shared.clone(),self.scheduler.clone(),vm,priority,usc_exec_base,
+            self.soc.features.fragment_dependency)?,GFP_KERNEL)?)
     }
     fn map_timestamp_buffer(&self, bo: gem::ObjectRef, range: Range<usize>) -> Result<mmu::KernelMapping> {
         self.shared.lock().as_ref().ok_or(ENODEV)?.map_timestamp(bo,range)

@@ -114,15 +114,19 @@ impl agx_uapi::GpuAddressSpace for AddressSpace<'_> {
 pub(crate) struct Queue {
     entity:sched::Entity<Job>,_scheduler:Arc<sched::Scheduler<Job>>,
     shared:Shared,vm:mmu::Vm,usc:u64,fences:FenceContexts,
+    /// Whether the SoC advertises early tiling (`m3_soc::Features::fragment_dependency`).
+    early_tiling:bool,
 }
 impl Queue {
-    pub(crate) fn new(shared:Shared,scheduler:Arc<sched::Scheduler<Job>>,vm:mmu::Vm,priority:u32,usc:u64)->Result<Self> {
+    pub(crate) fn new(shared:Shared,scheduler:Arc<sched::Scheduler<Job>>,vm:mmu::Vm,priority:u32,usc:u64,
+        early_tiling:bool)->Result<Self> {
         agx_uapi::QueueUscWindow{base:usc,user_start:0x4000,user_end:(1u64<<42)-0x8000}.validate().map_err(|_|EINVAL)?;
         // file.rs passes REALTIME - UAPI priority: 3 is UAPI LOW, 0 is UAPI REALTIME.
         let priority=match priority {3=>sched::Priority::Low,2=>sched::Priority::Normal,
             1=>sched::Priority::High,0=>sched::Priority::Kernel,_=>return Err(EINVAL)};
         Ok(Self {entity:sched::Entity::new(&scheduler,priority)?,_scheduler:scheduler,
-            shared,vm,usc,fences:FenceContexts::new(1,c_str!("asahi_m3_queue"),kernel::static_lock_class!())?})
+            shared,vm,usc,fences:FenceContexts::new(1,c_str!("asahi_m3_queue"),kernel::static_lock_class!())?,
+            early_tiling})
     }
 }
 impl queue::Queue for Queue {
@@ -132,7 +136,7 @@ impl queue::Queue for Queue {
         let mut parser=agx_uapi::UapiCommandParser::new(raw);let mut commands=KVec::new();let mut timestamps=KVec::new();let mut flushes=KVec::new();let mut visibility=KVec::new();
         while let Some(command)=parser.next_hardware().map_err(|_|EINVAL)? {
             if let agx_uapi::ParsedHardwareCommand::Render{payload,vertex_attachments,fragment_attachments,..}=command {
-                if let Err(e)=validate_render(payload,self.usc,&AddressSpace(&self.vm)) {
+                if let Err(e)=validate_render(payload,self.usc,&AddressSpace(&self.vm),self.early_tiling) {
                     pr_err!("M3 render rejected {:?}: flags={:#x} size={}x{} layers={} samples={} utile={}x{} sample_size={} depth={:#x} stencil={:#x} zls={:#x} samplers={} heap={:#x}\n",e,payload.flags,payload.width,payload.height,payload.layers,payload.samples,payload.utile_width,payload.utile_height,payload.sample_size,payload.depth.base,payload.stencil.base,payload.zls_control,payload.sampler_count,payload.sampler_heap);
                     return Err(e);
                 }
@@ -204,11 +208,13 @@ fn encode_attachments(vm: &mmu::Vm, list: &agx_uapi::UapiAttachmentList)
     Ok(out)
 }
 
-fn validate_render(r: agx_uapi::UapiRenderCommand, usc: u64, space: &AddressSpace<'_>) -> Result {
+fn validate_render(r: agx_uapi::UapiRenderCommand, usc: u64, space: &AddressSpace<'_>,
+    early_tiling: bool) -> Result {
     use agx_uapi::{GpuAddressSpace, GpuAccess};
     if r.sample_size % 8 != 0 {return Err(ENOTSUPP);}
     let empty = agx_uapi::UapiHelperProgram { binary:0, config:0, data:0 };
-    let stage_scope=if *crate::module_parameters::m3_early_tiling.value()!=0 {1<<5} else {0};
+    // Early tiling (render flag bit 5) only where it is advertised.
+    let stage_scope=if early_tiling && *crate::module_parameters::m3_early_tiling.value()!=0 {1<<5} else {0};
     if r.flags & !(2|16|(1<<18)|stage_scope) != 0 || !matches!(r.samples, 1 | 2 | 4)
         || r.sampler_count != 0 || r.sampler_heap != 0
         || r.vertex_helper != empty || r.fragment_helper != empty
