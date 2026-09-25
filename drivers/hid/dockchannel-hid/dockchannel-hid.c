@@ -19,6 +19,7 @@
 #include <linux/unaligned.h>
 #include <linux/of.h>
 #include "../hid-ids.h"
+#include "dockchannel-hid-protocol.h"
 
 #define COMMAND_TIMEOUT_MS 1000
 #define START_TIMEOUT_MS 2000
@@ -74,7 +75,6 @@ struct dchid_init_hdr {
 #define INIT_TERMINATOR		2
 #define INIT_PRODUCT_NAME	7
 
-#define CMD_RESET_INTERFACE 0x40
 #define CMD_SEND_FIRMWARE 0x95
 #define CMD_ENABLE_INTERFACE 0xb4
 #define CMD_ACK_GPIO_CMD 0xa1
@@ -176,6 +176,7 @@ struct dchid_iface {
 	struct completion out_complete;
 
 	u32 keyboard_layout_id;
+	u32 power_method;
 };
 
 struct dockchannel_hid {
@@ -183,6 +184,9 @@ struct dockchannel_hid {
 	struct dockchannel *dc;
 	struct device_link *helper_link;
 	bool stopping;
+
+	/* Held from probe on when the multi-touch interface uses power method 2 */
+	struct gpio_desc *afe_reset;
 
 	bool id_ready;
 	struct dchid_stm_id device_id;
@@ -212,6 +216,7 @@ static DEVICE_ATTR_RO(apple_layout_id);
 static struct dchid_iface *
 dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 {
+	u32 power_method = DCHID_POWER_METHOD_1;
 	struct device_node *of_node = NULL;
 	struct dchid_iface *iface;
 
@@ -233,6 +238,19 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 			dev_warn(dchid->dev, "No OF node for subdevice %s, ignoring.", name);
 			return NULL;
 		}
+
+		of_property_read_u32(of_node, "apple,power-method", &power_method);
+		if (power_method != DCHID_POWER_METHOD_1 &&
+		    power_method != DCHID_POWER_METHOD_2) {
+			dev_err(dchid->dev, "Unsupported power method %u for %s\n",
+				power_method, name);
+			goto err_put_node;
+		}
+		if (power_method == DCHID_POWER_METHOD_2 && !dchid->afe_reset) {
+			dev_err(dchid->dev, "Power method 2 for %s needs the AFE reset line\n",
+				name);
+			goto err_put_node;
+		}
 	}
 
 	iface = devm_kzalloc(dchid->dev, sizeof(struct dchid_iface), GFP_KERNEL);
@@ -245,6 +263,7 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 		goto err_put_node;
 	iface->dchid = dchid;
 	iface->of_node = of_node;
+	iface->power_method = power_method;
 	iface->out_report = -1;
 	init_completion(&iface->out_complete);
 	init_completion(&iface->ready);
@@ -384,9 +403,37 @@ static int dchid_enable_interface(struct dchid_iface *iface)
 
 static int dchid_reset_interface(struct dchid_iface *iface, int state)
 {
-	u8 msg[] = { CMD_RESET_INTERFACE, 1, iface->index, state };
+	u8 msg[DCHID_PM1_CMD_SIZE];
 
+	dchid_pm1_command(iface->index, state, msg);
 	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
+}
+
+/*
+ * Power method 2: announce the transition, drive the AFE reset line to the
+ * new state and confirm the transition. The reset is asserted for a power-off
+ * and held for 50 ms, and released for a power-on.
+ */
+static int dchid_pm2_set_power(struct dchid_iface *iface, u8 state)
+{
+	struct dockchannel_hid *dchid = iface->dchid;
+	u8 msg[DCHID_PM2_CMD_SIZE];
+	int ret;
+
+	dchid_pm2_command(iface->index, state, false, msg);
+	ret = dchid_comm_cmd(dchid, msg, sizeof(msg));
+	if (ret < 0)
+		return ret;
+
+	ret = gpiod_set_value_cansleep(dchid->afe_reset,
+				       state == DCHID_POWER_STATE_OFF);
+	if (ret < 0)
+		return ret;
+	if (state == DCHID_POWER_STATE_OFF)
+		fsleep(50 * USEC_PER_MSEC);
+
+	dchid_pm2_command(iface->index, state, true, msg);
+	return dchid_comm_cmd(dchid, msg, sizeof(msg));
 }
 
 static int dchid_send_firmware(struct dchid_iface *iface, void *firmware, size_t size)
@@ -486,6 +533,13 @@ static int dchid_request_gpio(struct dchid_iface *iface)
 	dev_info(iface->dchid->dev, "Requesting GPIO %s#%d: %s\n",
 		 iface->name, iface->gpio_id, iface->gpio_name);
 
+	/* A power method 2 interface holds its reset line from probe on. */
+	if (iface->power_method == DCHID_POWER_METHOD_2 &&
+	    !strcmp(iface->gpio_name, "afe-reset")) {
+		iface->gpio = iface->dchid->afe_reset;
+		return 0;
+	}
+
 	snprintf(prop_name, sizeof(prop_name), "apple,%s", iface->gpio_name);
 
 	iface->gpio = devm_gpiod_get_index(iface->dchid->dev, prop_name, 0, GPIOD_OUT_LOW);
@@ -541,8 +595,17 @@ static int dchid_start_interface(struct dchid_iface *iface)
 
 		/* After loading firmware, multi-touch needs a reset */
 		dev_info(iface->dchid->dev, "Resetting %s\n", iface->name);
-		dchid_reset_interface(iface, 0);
-		dchid_reset_interface(iface, 2);
+		if (iface->power_method == DCHID_POWER_METHOD_2) {
+			ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_OFF);
+			if (ret < 0)
+				goto err;
+			ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_ON);
+			if (ret < 0)
+				goto err;
+		} else {
+			dchid_reset_interface(iface, DCHID_POWER_STATE_OFF);
+			dchid_reset_interface(iface, DCHID_POWER_STATE_ON);
+		}
 	}
 
 	return 0;
@@ -1220,6 +1283,28 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 			} else {
 				gpiod_put(gpio);
 			}
+		}
+	}
+
+	/*
+	 * With power method 2 the host drives the multi-touch AFE reset line
+	 * during every power transition, so the line must be there before the
+	 * coprocessor announces the interface. Request it now, while a
+	 * -EPROBE_DEFER can still be honoured, and leave its level alone until
+	 * the first transition has been announced.
+	 */
+	child = of_get_child_by_name(dev->of_node, "multi-touch");
+	if (child) {
+		u32 power_method = DCHID_POWER_METHOD_1;
+
+		of_property_read_u32(child, "apple,power-method", &power_method);
+		of_node_put(child);
+		if (power_method == DCHID_POWER_METHOD_2) {
+			dchid->afe_reset = devm_gpiod_get(dev, "apple,afe-reset",
+							  GPIOD_ASIS);
+			if (IS_ERR(dchid->afe_reset))
+				return dev_err_probe(dev, PTR_ERR(dchid->afe_reset),
+						     "Failed to request the AFE reset line\n");
 		}
 	}
 

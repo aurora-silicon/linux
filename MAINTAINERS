@@ -1981,6 +1981,7 @@ F:	Documentation/devicetree/bindings/sound/apple,t8140-aop-audio.yaml
 F:	arch/arm64/boot/dts/apple/t8140*
 F:	arch/arm64/include/asm/apple-idle.h
 F:	arch/arm64/kernel/idle-apple.S
+F:	drivers/hid/dockchannel-hid/dockchannel-hid-protocol*
 F:	drivers/iio/common/aop_sensors/
 F:	drivers/soc/apple/aop.rs
 F:	drivers/thermal/apple-smc-cpu-thermal.c
