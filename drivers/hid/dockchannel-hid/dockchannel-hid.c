@@ -210,6 +210,7 @@ static DEVICE_ATTR_RO(apple_layout_id);
 static struct dchid_iface *
 dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 {
+	struct device_node *of_node = NULL;
 	struct dchid_iface *iface;
 
 	if (index >= MAX_INTERFACES) {
@@ -220,35 +221,39 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 	if (dchid->ifaces[index])
 		return dchid->ifaces[index];
 
+	/* Comm is not a HID subdevice */
+	if (strcmp(name, "comm")) {
+		of_node = of_get_child_by_name(dchid->dev->of_node, name);
+		if (!of_node) {
+			dev_warn(dchid->dev, "No OF node for subdevice %s, ignoring.", name);
+			return NULL;
+		}
+	}
+
 	iface = devm_kzalloc(dchid->dev, sizeof(struct dchid_iface), GFP_KERNEL);
 	if (!iface)
-		return NULL;
+		goto err_put_node;
 
 	iface->index = index;
 	iface->name = devm_kstrdup(dchid->dev, name, GFP_KERNEL);
+	if (!iface->name)
+		goto err_put_node;
 	iface->dchid = dchid;
-	iface->out_report= -1;
+	iface->of_node = of_node;
+	iface->out_report = -1;
 	init_completion(&iface->out_complete);
 	init_completion(&iface->ready);
 	mutex_init(&iface->out_mutex);
 	iface->wq = alloc_ordered_workqueue("dchid-%s", WQ_MEM_RECLAIM, iface->name);
 	if (!iface->wq)
-		return NULL;
-
-	/* Comm is not a HID subdevice */
-	if (!strcmp(name, "comm")) {
-		dchid->ifaces[index] = iface;
-		return iface;
-	}
-
-	iface->of_node = of_get_child_by_name(dchid->dev->of_node, name);
-	if (!iface->of_node) {
-		dev_warn(dchid->dev, "No OF node for subdevice %s, ignoring.", name);
-		return NULL;
-	}
+		goto err_put_node;
 
 	dchid->ifaces[index] = iface;
 	return iface;
+
+err_put_node:
+	of_node_put(of_node);
+	return NULL;
 }
 
 static u32 dchid_checksum(void *p, size_t length)
@@ -1220,6 +1225,7 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	dchid->comm = dchid_get_interface(dchid, IFACE_COMM, "comm");
 	if (!dchid->comm) {
 		dev_err(dchid->dev, "Failed to initialize comm interface");
+		destroy_workqueue(dchid->new_iface_wq);
 		return -EIO;
 	}
 
