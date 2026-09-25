@@ -5,6 +5,7 @@
 
 #include <asm/io.h>
 #include <linux/delay.h>
+#include <linux/overflow.h>
 #include <linux/pm_runtime.h>
 #include <linux/types.h>
 
@@ -370,8 +371,8 @@ static void isp_firmware_shutdown_stage2(struct apple_isp *isp)
 static int isp_firmware_boot_stage2(struct apple_isp *isp)
 {
 	struct isp_firmware_bootargs args;
-	dma_addr_t args_iova;
-	void *args_virt;
+	dma_addr_t args_iova, cmd_iova;
+	void *args_virt, *cmd_virt;
 	int err, retries;
 
 	u32 num_ipc_chans = isp_gpio_read32(isp, ISP_GPIO_0);
@@ -388,16 +389,36 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 		dev_warn(isp->dev, "unexpected channel count (%d)\n",
 			 num_ipc_chans);
 
+	/*
+	 * The firmware picks the offset of the boot arguments in the IPC
+	 * surface, and the command area follows them. Both have to lie
+	 * inside the surface; the command area must hold the 0x280 bytes the
+	 * firmware reads for a buffer batch, more than any command needs.
+	 */
+	args_virt = NULL;
+	cmd_virt = NULL;
+	if (!check_add_overflow(isp->ipc_surf->iova, (u64)args_offset + 0x40,
+				&args_iova) &&
+	    !check_add_overflow(args_iova, sizeof(args) + 0x40, &cmd_iova)) {
+		args_virt = apple_isp_ipc_translate(isp, args_iova,
+						    sizeof(args));
+		cmd_virt = apple_isp_ipc_translate(isp, cmd_iova,
+						   ISP_IPC_BUFEXC_STAT_SIZE);
+	}
+	if (!args_virt || !cmd_virt) {
+		dev_err(isp->dev, "invalid boot arguments offset 0x%x\n",
+			args_offset);
+		return -EIO;
+	}
+
 	isp->extra_surf = isp_alloc_surface_vmap(isp, extra_size);
 	if (!isp->extra_surf) {
 		isp_err(isp, "failed to alloc surface for extra heap\n");
 		return -ENOMEM;
 	}
 
-	args_iova = isp->ipc_surf->iova + args_offset + 0x40;
-	args_virt = isp->ipc_surf->virt + args_offset + 0x40;
-	isp->cmd_iova = args_iova + sizeof(args) + 0x40;
-	isp->cmd_virt = args_virt + sizeof(args) + 0x40;
+	isp->cmd_iova = cmd_iova;
+	isp->cmd_virt = cmd_virt;
 
 	memset(&args, 0, sizeof(args));
 	args.ipc_iova = isp->ipc_surf->iova;
