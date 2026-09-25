@@ -22,6 +22,10 @@
  * @size:      Size of the shared memory buffer.
  * @iova:      Device VA of shared memory buffer.
  * @is_mapped: Shared memory buffer is managed by the co-processor.
+ * @needs_dma_sync: The buffer is a streaming DMA mapping of normal RAM made by
+ *                  the parent driver's shmem_setup, with @iova as its DMA
+ *                  handle. RTKit synchronizes it for the CPU before reading.
+ *                  Never set this for coherent allocations or for iomem.
  * @private:   Private data pointer for the parent driver.
  */
 
@@ -31,6 +35,7 @@ struct apple_rtkit_shmem {
 	size_t size;
 	dma_addr_t iova;
 	bool is_mapped;
+	bool needs_dma_sync;
 	void *private;
 };
 

@@ -364,16 +364,26 @@ static void apple_rtkit_free_buffer(struct apple_rtkit *rtk,
 	bfr->iova = 0;
 	bfr->size = 0;
 	bfr->is_mapped = false;
+	bfr->needs_dma_sync = false;
+	bfr->private = NULL;
 }
 
 static void apple_rtkit_memcpy(struct apple_rtkit *rtk, void *dst,
 			       struct apple_rtkit_shmem *bfr, size_t offset,
 			       size_t len)
 {
+	bool sync = bfr->needs_dma_sync && !WARN_ON_ONCE(bfr->iomem);
+
+	if (sync)
+		dma_sync_single_range_for_cpu(rtk->dev, bfr->iova, offset, len,
+					      DMA_FROM_DEVICE);
 	if (bfr->iomem)
 		memcpy_fromio(dst, bfr->iomem + offset, len);
 	else
 		memcpy(dst, bfr->buffer + offset, len);
+	if (sync)
+		dma_sync_single_range_for_device(rtk->dev, bfr->iova, offset,
+						 len, DMA_FROM_DEVICE);
 }
 
 static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
