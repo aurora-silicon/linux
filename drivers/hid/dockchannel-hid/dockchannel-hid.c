@@ -781,11 +781,15 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 	struct dchid_init_hdr *hdr = data;
 	struct dchid_iface *iface;
 	struct dchid_init_block_hdr *blk;
+	char name[sizeof(hdr->name) + 1];
 
 	if (length < sizeof(*hdr))
 		return;
 
-	iface = dchid_get_interface(dchid, hdr->iface, hdr->name);
+	/* The name field is not necessarily NUL-terminated. */
+	memcpy(name, hdr->name, sizeof(hdr->name));
+	name[sizeof(hdr->name)] = '\0';
+	iface = dchid_get_interface(dchid, hdr->iface, name);
 	if (!iface)
 		return;
 
