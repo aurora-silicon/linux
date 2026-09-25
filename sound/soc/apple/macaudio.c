@@ -1423,19 +1423,22 @@ static int macaudio_slk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 
-	if (!ma->speaker_lock_owner)
-		return -EPERM;
-
 	if (uvalue->value.integer.value[0] != SPEAKER_MAGIC_VALUE)
 		return -EINVAL;
+
+	mutex_lock(&ma->volume_lock_mutex);
+
+	if (!ma->speaker_lock_owner) {
+		mutex_unlock(&ma->volume_lock_mutex);
+		return -EPERM;
+	}
 
 	/* Serves as a notification that the lock was lost at some point */
 	if (ma->speaker_volume_was_locked) {
 		ma->speaker_volume_was_locked = false;
+		mutex_unlock(&ma->volume_lock_mutex);
 		return -ETIMEDOUT;
 	}
-
-	mutex_lock(&ma->volume_lock_mutex);
 
 	cancel_delayed_work(&ma->lock_timeout_work);
 
@@ -1491,9 +1494,11 @@ static void macaudio_slk_unlock(struct snd_kcontrol *kcontrol)
 	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 
+	mutex_lock(&ma->volume_lock_mutex);
 	ma->speaker_lock_owner = NULL;
 	ma->speaker_lock_timeout = 0;
 	macaudio_vlimit_update(ma);
+	mutex_unlock(&ma->volume_lock_mutex);
 }
 
 /*
