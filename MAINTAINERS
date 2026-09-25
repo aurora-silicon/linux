@@ -1970,6 +1970,7 @@ M:	Ryan Murray <ryan@aurorasilicon.org>
 W:	https://aurora-silicon.github.io
 S:	Maintained
 F:	Documentation/devicetree/bindings/iio/light/apple,t8140-aop-als.yaml
+F:	Documentation/devicetree/bindings/input/apple,dockchannel-hid.yaml
 F:	Documentation/devicetree/bindings/media/apple,t8140-isp.yaml
 F:	Documentation/devicetree/bindings/reserved-memory/apple,asc-mem.yaml
 F:	Documentation/devicetree/bindings/serial/apple,dockchannel-uart.yaml
