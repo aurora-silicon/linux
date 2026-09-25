@@ -217,6 +217,82 @@
 				};
 			};
 		};
+
+		smc: smc@30c600000 {
+			compatible = "apple,t8140-smc", "apple,t8103-smc";
+			reg = <0x3 0x0c600000 0x0 0x4000>,
+			      <0x3 0x0de00000 0x0 0x100000>;
+			reg-names = "smc", "sram";
+			mboxes = <&smc_mbox>;
+			status = "disabled";
+
+			smc_gpio: gpio {
+				compatible = "apple,smc-gpio";
+				gpio-controller;
+				#gpio-cells = <2>;
+			};
+
+			smc_hwmon: hwmon {
+				compatible = "apple,smc-hwmon";
+
+				/*
+				 * CPU cluster die temperatures. Keep these
+				 * first: the J700 CPU thermal policy reads
+				 * the first six temperature channels.
+				 */
+				temperature-Te05 {
+					apple,key-id = "Te05";
+					label = "E-cluster Temperature 1";
+				};
+
+				temperature-Te0S {
+					apple,key-id = "Te0S";
+					label = "E-cluster Temperature 2";
+				};
+
+				temperature-Tp01 {
+					apple,key-id = "Tp01";
+					label = "P-cluster Temperature 1";
+				};
+
+				temperature-Tp05 {
+					apple,key-id = "Tp05";
+					label = "P-cluster Temperature 2";
+				};
+
+				temperature-Tp09 {
+					apple,key-id = "Tp09";
+					label = "P-cluster Temperature 3";
+				};
+
+				temperature-Tp0D {
+					apple,key-id = "Tp0D";
+					label = "P-cluster Temperature 4";
+				};
+			};
+
+			smc_reboot: reboot {
+				compatible = "apple,smc-reboot";
+				nvmem-cells = <&shutdown_flag>, <&boot_stage>,
+					      <&boot_error_count>, <&panic_count>;
+				nvmem-cell-names = "shutdown_flag", "boot_stage",
+						   "boot_error_count", "panic_count";
+			};
+		};
+
+		smc_mbox: mailbox@30c608000 {
+			compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x3 0x0c608000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 581 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 582 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 583 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 584 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
 	};
 };
 
