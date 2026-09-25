@@ -109,6 +109,8 @@ const SCRD_MAX_CAPTURE: usize = 8;
 const SCRD_TIMEOUT_MS: time::Msecs = 2000;
 
 const SKS_TIMEOUT_MS: time::Msecs = 2000;
+/// The 13.5 kext's per-try key-store wait.
+const SKS_TIMEOUT_13_MS: time::Msecs = 6000;
 
 const SKS_TIMEOUT_PER_KIB_MS: time::Msecs = 6000;
 

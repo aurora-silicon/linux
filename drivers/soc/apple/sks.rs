@@ -164,6 +164,15 @@ impl SepData {
         }
 
         let sized_ms = sks_timeout_for(img.len());
+        // The 13.5 key store is waited on as sep_deliver_msg_gated does:
+        // getAdjustedTimeout(0x1770), 6000 ms per wait (0xfffffe0009945a14).
+        // On a j313 a CREATE took
+        // 1.6 s and a COPY 1.66 s, close enough to the 2 s base that a slow
+        // one would be abandoned mid-way through its xART writes.
+        let floor_ms = match self.profile.key_store {
+            profile::KeyStore::Sepos13 { .. } if floor_ms < SKS_TIMEOUT_13_MS => SKS_TIMEOUT_13_MS,
+            _ => floor_ms,
+        };
         let timeout_ms = if sized_ms < floor_ms {
             floor_ms
         } else {
