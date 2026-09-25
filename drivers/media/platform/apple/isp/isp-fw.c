@@ -10,6 +10,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/types.h>
 
+#include "isp-cam.h"
 #include "isp-cmd.h"
 #include "isp-fw.h"
 #include "isp-iommu.h"
@@ -934,9 +935,29 @@ static void isp_firmware_shutdown(struct apple_isp *isp)
 	isp_collect_gc_surface(isp);
 }
 
+/*
+ * Resident firmware (hw->resident_fw) is loaded by the bootloader and
+ * does not start again once it has been stopped: after CISP_CMD_SUSPEND,
+ * a coprocessor reset and a power cycle of its domains it never completes
+ * the first handshake. It is booted once, at probe, and runs until the
+ * driver is unbound, probe fails or the system goes to sleep; after that
+ * the device stays unusable until the next system boot.
+ */
 int apple_isp_firmware_boot(struct apple_isp *isp)
 {
 	int err;
+
+	switch (isp->fw_state) {
+	case ISP_FW_OFF:
+		break;
+	case ISP_FW_RUNNING:
+		/* Resident firmware keeps running between streams. */
+		return 0;
+	case ISP_FW_DEAD:
+		dev_err_ratelimited(isp->dev,
+				    "firmware was stopped and cannot be restarted before the next boot\n");
+		return -EIO;
+	}
 
 	/* Needs to be power cycled for IOMMU to behave correctly */
 	err = pm_runtime_resume_and_get(isp->dev);
@@ -949,14 +970,35 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 	if (err) {
 		dev_err(isp->dev, "failed to boot firmware: %d\n", err);
 		pm_runtime_put_sync(isp->dev);
+		if (isp->hw->resident_fw)
+			isp->fw_state = ISP_FW_DEAD;
 		return err;
 	}
+
+	isp->fw_state = ISP_FW_RUNNING;
 
 	return 0;
 }
 
+/* The end of a stream or of the camera detection at probe */
 void apple_isp_firmware_shutdown(struct apple_isp *isp)
 {
+	if (isp->hw->resident_fw)
+		return;
+
+	apple_isp_firmware_halt(isp);
+}
+
+/* Stop the firmware; resident firmware cannot be started again. */
+void apple_isp_firmware_halt(struct apple_isp *isp)
+{
+	/* Only a capture services the watchdog, but be sure. */
+	apple_isp_wdt_stop(isp);
+
+	if (isp->fw_state != ISP_FW_RUNNING)
+		return;
+
 	isp_firmware_shutdown(isp);
 	pm_runtime_put_sync(isp->dev);
+	isp->fw_state = isp->hw->resident_fw ? ISP_FW_DEAD : ISP_FW_OFF;
 }

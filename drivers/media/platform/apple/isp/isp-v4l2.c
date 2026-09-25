@@ -394,12 +394,27 @@ static void isp_vb2_buf_queue(struct vb2_buffer *vb)
 
 static int apple_isp_start_streaming(struct apple_isp *isp)
 {
+	unsigned long flags;
 	int err;
 
 	err = apple_isp_start_camera(isp);
 	if (err) {
 		dev_err(isp->dev, "failed to start camera: %d\n", err);
 		return err;
+	}
+
+	/*
+	 * Resident firmware was not restarted, but the channel's pools are
+	 * configured again for every stream. Metadata buffers still marked
+	 * as submitted to the previous pools would never reach the new ones.
+	 */
+	if (isp->hw->resident_fw) {
+		spin_lock_irqsave(&isp->buf_lock, flags);
+		for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++)
+			isp->meta_surfs[i]->submitted = false;
+		for (int i = 0; i < isp_num_capmeta(isp); i++)
+			isp->capmeta_surfs[i]->submitted = false;
+		spin_unlock_irqrestore(&isp->buf_lock, flags);
 	}
 
 	err = isp_submit_buffers(isp, true);
@@ -1017,5 +1032,10 @@ void apple_isp_remove_video(struct apple_isp *isp)
 	v4l2_device_unregister(&isp->v4l2_dev);
 	media_device_unregister(&isp->mdev);
 	media_device_cleanup(&isp->mdev);
+}
+
+/* After apple_isp_remove_video() and with the firmware stopped */
+void apple_isp_free_video(struct apple_isp *isp)
+{
 	isp_free_meta_surfaces(isp);
 }

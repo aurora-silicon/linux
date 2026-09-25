@@ -60,6 +60,13 @@ enum isp_fw_abi {
 	ISP_FW_ABI_H17,
 };
 
+enum isp_fw_state {
+	ISP_FW_OFF,
+	ISP_FW_RUNNING,
+	/* resident firmware that stopped: it cannot be started again */
+	ISP_FW_DEAD,
+};
+
 enum isp_firmware_version {
 	ISP_FIRMWARE_V_UNKNOWN,
 	ISP_FIRMWARE_V_12_3,
@@ -178,6 +185,12 @@ struct apple_isp_hw {
 
 	/* size of a capture metadata buffer, 0 for no such pool */
 	u32 capture_meta_size;
+
+	/*
+	 * The firmware can be started only once per system boot, so it is
+	 * started at probe and kept running while the driver is bound.
+	 */
+	bool resident_fw;
 };
 
 enum isp_sensor_id {
@@ -288,6 +301,8 @@ struct apple_isp {
 	struct isp_firmware {
 		u64 heap_top;
 	} fw;
+	/* changes under video_lock once the video device is registered */
+	enum isp_fw_state fw_state;
 
 	struct isp_surf *ipc_surf;
 	struct isp_surf *extra_surf;

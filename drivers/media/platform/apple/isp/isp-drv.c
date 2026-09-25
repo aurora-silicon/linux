@@ -498,11 +498,13 @@ static int apple_isp_probe(struct platform_device *pdev)
 	err = apple_isp_setup_video(isp);
 	if (err) {
 		dev_err(dev, "failed to register video device: %d\n", err);
-		goto free_surface;
+		goto halt_firmware;
 	}
 
 	return 0;
 
+halt_firmware:
+	apple_isp_firmware_halt(isp);
 free_surface:
 	pm_runtime_disable(dev);
 	apple_isp_free_firmware_surface(isp);
@@ -520,6 +522,9 @@ static void apple_isp_remove(struct platform_device *pdev)
 	struct apple_isp *isp = platform_get_drvdata(pdev);
 
 	apple_isp_remove_video(isp);
+	/* Stop resident firmware before freeing what it may still use. */
+	apple_isp_firmware_halt(isp);
+	apple_isp_free_video(isp);
 	pm_runtime_disable(isp->dev);
 	apple_isp_free_firmware_surface(isp);
 	apple_isp_free_iommu(isp);
@@ -724,6 +729,19 @@ static __maybe_unused int apple_isp_suspend(struct device *dev)
 	 * before, we (essentially) stop streaming and start streaming again.
 	 */
 	apple_isp_video_suspend(isp);
+
+	/*
+	 * The ISP's power domains go off during system sleep, and resident
+	 * firmware would not survive that. Stop it cleanly instead; resuming
+	 * a stream then fails with an error until the next system boot.
+	 */
+	if (isp->hw->resident_fw) {
+		mutex_lock(&isp->video_lock);
+		if (isp->fw_state == ISP_FW_RUNNING)
+			dev_warn(dev, "stopping the firmware for system sleep, the camera is unavailable until the next boot\n");
+		apple_isp_firmware_halt(isp);
+		mutex_unlock(&isp->video_lock);
+	}
 
 	return 0;
 }
