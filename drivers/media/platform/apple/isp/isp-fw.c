@@ -45,6 +45,11 @@ static inline void isp_gpio_write32(struct apple_isp *isp, u32 reg, u32 val)
 	writel(val, isp->gpio + reg);
 }
 
+static inline u32 isp_coproc_control(struct apple_isp *isp)
+{
+	return isp->hw->coproc_control ?: ISP_COPROC_CONTROL;
+}
+
 /* Wait for the firmware to write @expected to a GPIO word. */
 static int isp_gpio_wait(struct apple_isp *isp, u32 reg, u32 expected)
 {
@@ -202,6 +207,10 @@ static irqreturn_t apple_isp_isr_thread(int irq, void *dev)
 static void isp_disable_irq(struct apple_isp *isp)
 {
 	isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0x0);
+	if (isp->hw->mbox_irq_route) {
+		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE1_T8140, 0x0);
+		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE2_T8140, 0x0);
+	}
 	free_irq(isp->irq, isp);
 	isp_gpio_write32(isp, ISP_GPIO_1, 0xfeedbabe); /* real funny */
 }
@@ -220,6 +229,14 @@ static int isp_enable_irq(struct apple_isp *isp)
 	isp_dbg(isp, "about to enable interrupts...\n");
 
 	isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0xf);
+	if (isp->hw->mbox_irq_route) {
+		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE1_T8140,
+				 ISP_MBOX_IRQ_ENABLE1_T8140_VAL);
+		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE2_T8140,
+				 ISP_MBOX_IRQ_ENABLE2_T8140_VAL);
+		isp_mbox_write32(isp, ISP_MBOX_IRQ_ROUTE_T8140,
+				 ISP_MBOX_IRQ_ROUTE_T8140_VAL);
+	}
 
 	return 0;
 }
@@ -269,7 +286,7 @@ static int isp_reset_coproc(struct apple_isp *isp)
 
 static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
 {
-	isp_coproc_write32(isp, ISP_COPROC_CONTROL, 0x0);
+	isp_coproc_write32(isp, isp_coproc_control(isp), 0x0);
 
 	apple_isp_power_down_domains(isp);
 }
@@ -311,8 +328,8 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 
 	isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0x0);
 
-	isp_coproc_write32(isp, ISP_COPROC_CONTROL, 0x0);
-	isp_coproc_write32(isp, ISP_COPROC_CONTROL, 0x10);
+	isp_coproc_write32(isp, isp_coproc_control(isp), 0x0);
+	isp_coproc_write32(isp, isp_coproc_control(isp), 0x10);
 
 	/* Wait for ISP_GPIO_7 to 0x0 -> 0x8042006 */
 	if (isp_gpio_wait(isp, ISP_GPIO_7, 0x8042006)) {

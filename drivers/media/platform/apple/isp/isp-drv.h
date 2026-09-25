@@ -138,6 +138,13 @@ struct apple_isp_hw {
 
 	/* address bits the ISP DARTs translate, 0 for all */
 	u64 fw_iova_mask;
+
+	/* doorbell block inside "mbox" instead of an "mbox2" window */
+	u32 mbox2_offset;
+	/* further interrupt enable and routing words (ISP17a) */
+	bool mbox_irq_route;
+	/* coprocessor control register, 0 for ISP_COPROC_CONTROL */
+	u32 coproc_control;
 };
 
 enum isp_sensor_id {

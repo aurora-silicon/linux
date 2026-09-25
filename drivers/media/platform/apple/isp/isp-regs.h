@@ -23,11 +23,26 @@
 #define ISP_COPROC_IRQ_MASK_4  0x1400a10
 #define ISP_COPROC_IRQ_MASK_5  0x1400a14
 
+#define ISP_COPROC_CONTROL_T8140 0x1600044
+
 #define ISP_MBOX_IRQ_INTERRUPT    0x00
 #define ISP_MBOX_IRQ_ENABLE       0x04
 #define ISP_MBOX_IRQ_ENABLE_T6031 0x08
 #define ISP_MBOX2_IRQ_DOORBELL    0x00
 #define ISP_MBOX2_IRQ_ACK         0x0c
+#define ISP_MBOX2_SIZE            0x10
+
+/*
+ * ISP17a (T8140) interrupt enable and routing words next to
+ * ISP_MBOX_IRQ_ENABLE_T6031, and the values observed while the firmware
+ * runs.
+ */
+#define ISP_MBOX_IRQ_ENABLE1_T8140     0x18
+#define ISP_MBOX_IRQ_ENABLE2_T8140     0x38
+#define ISP_MBOX_IRQ_ROUTE_T8140       0x73c
+#define ISP_MBOX_IRQ_ENABLE1_T8140_VAL 0x70000000
+#define ISP_MBOX_IRQ_ENABLE2_T8140_VAL 0x700000
+#define ISP_MBOX_IRQ_ROUTE_T8140_VAL   0x8
 
 #define ISP_GPIO_0	       0x00
 #define ISP_GPIO_1	       0x04
