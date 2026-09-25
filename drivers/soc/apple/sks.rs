@@ -520,10 +520,12 @@ impl SepData {
         if proof.slot() != keybag::Slot::Identity {
             return Err(EINVAL);
         }
-        // The strict (T8103) and lenient (T6020) enclaves encode the identity
-        // bag differently; the per-SoC profile carries the correct field values
-        // so the proven T6020 path is unchanged while T8103 gets the bag type in
-        // the third word (see profile::KeybagCreate).
+        // The 13.5 (T8103) and T6020 enclaves encode the identity bag
+        // differently; the per-SoC profile carries the field values (see
+        // profile::KeybagCreate). On 13.5 this is identity_create's
+        // __ipc_create_keybag_v2 (0xfffffe0009955ce0): secret, an empty second
+        // blob and the 16-byte identity UUID, nothing after it; the codec
+        // (_code_ipc_create_keybag 0xfffffe000995de6c) decodes exact-length.
         let enc = &self.profile.keybag_create;
         let mut body = image::Body::new();
         body.put_u32(enc.variant)?;
@@ -533,10 +535,12 @@ impl SepData {
         body.put_blob(secret)?;
         body.put_blob(&[])?;
         body.put_blob(uuid)?;
-        body.put_blob(&[])?;
-        body.put_u64(0)?;
-        body.put_u64(0)?;
-        body.put_blob(&[])?;
+        if self.profile.key_store == profile::KeyStore::Variant5 {
+            body.put_blob(&[])?;
+            body.put_u64(0)?;
+            body.put_u64(0)?;
+            body.put_blob(&[])?;
+        }
         let img = image::build_request(self.sks_ipc_version(), self.sks_timestamp_us(), &body)?;
         let len = self.sks_image_len(&img)?;
         let msg = crate::sks::encode_sks_create(self.sks_next_seq(), len).ok_or(EINVAL)?;
@@ -597,7 +601,13 @@ impl SepData {
         let Some(body) = self.sks_report_response(crate::sks::SKS_CREATE_NAME, &out) else {
             return false;
         };
-        if out.reply.status != 0 || body.len() < 12 {
+        // 13.5 replies with the struct version and the handle alone
+        // (0x…e11c-e12c); the T6020 reply adds a blob.
+        let reply_min = match self.profile.key_store {
+            profile::KeyStore::Sepos13 { .. } => 8,
+            profile::KeyStore::Variant5 => 12,
+        };
+        if out.reply.status != 0 || body.len() < reply_min {
             dev_err!(
                 self.dev,
                 "sks: CREATE_KEYBAG failed: mailbox {}, body {} bytes\n",
@@ -608,8 +618,14 @@ impl SepData {
         }
         let variant = u32::from_le_bytes(body[0..4].try_into().unwrap());
         let raw_handle = i32::from_le_bytes(body[4..8].try_into().unwrap());
-        let Some((_fv_data, end)) = image::read_blob(body, 8) else {
-            return false;
+        let end = match self.profile.key_store {
+            profile::KeyStore::Sepos13 { .. } => 8,
+            profile::KeyStore::Variant5 => {
+                let Some((_fv_data, end)) = image::read_blob(body, 8) else {
+                    return false;
+                };
+                end
+            }
         };
         if variant != self.profile.keybag_create.variant || raw_handle < 0 || end != body.len()
         {
@@ -622,8 +638,17 @@ impl SepData {
             return false;
         }
         let handle = crate::sks::KeyBagHandle::from_create_reply(raw_handle);
-        let Some(bag_uuid) = self.sks_read_uuid(handle) else {
-            return false;
+        // identity_create reads no UUID back: 13.5 names the identity by the
+        // UUID it was created with, and identity_save (0xfffffe000994b1cc) is
+        // just the copy below, then the unload.
+        let bag_uuid = match self.profile.key_store {
+            profile::KeyStore::Sepos13 { .. } => None,
+            profile::KeyStore::Variant5 => {
+                let Some(bag_uuid) = self.sks_read_uuid(handle) else {
+                    return false;
+                };
+                Some(bag_uuid)
+            }
         };
         let Some(out) = self.sks_send(self.sks_req_copy_keybag(handle)) else {
             return false;
@@ -631,7 +656,11 @@ impl SepData {
         let Some(wrapped) = self.wrapped_from_copy_reply(&out, c"new identity keybag") else {
             return false;
         };
-        if let Err(e) = keybag::write_bag_uuid(slot, &wrapped, &bag_uuid, &secret) {
+        let committed = match bag_uuid {
+            Some(bag_uuid) => keybag::write_bag_uuid(slot, &wrapped, &bag_uuid, &secret),
+            None => keybag::write_generated_uuid(slot, &wrapped, &uuid, &secret),
+        };
+        if let Err(e) = committed {
             dev_err!(self.dev, "sks: cannot commit identity keybag: {:?}\n", e);
             return false;
         }

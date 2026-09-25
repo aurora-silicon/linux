@@ -266,6 +266,26 @@ pub(crate) fn write_bag_uuid(
     )
 }
 
+/// Commits a bag named by the host-generated UUID it was created with: the
+/// 13.5 enclave keeps an identity bag itself and loads it by that UUID.
+pub(crate) fn write_generated_uuid(
+    slot: Slot,
+    wrapped: &[u8],
+    uuid: &[u8; UUID_LEN],
+    secret: &[u8],
+) -> Result<()> {
+    if wrapped.is_empty() || wrapped.len() > MAX_WRAPPED || secret.len() > MAX_WRAPPED {
+        return Err(EINVAL);
+    }
+    write_record(
+        slot,
+        UuidProvenance::AsGenerated.state(),
+        wrapped,
+        uuid,
+        secret,
+    )
+}
+
 /// Replaces only the wrapped blob. The enclave ratchets bag material while a bag
 /// is active, so this snapshot must be re-taken at the catacomb-save commit or
 /// the enclave answers a later restore empty.

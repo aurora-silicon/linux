@@ -86,16 +86,16 @@ pub(crate) struct SensorProfile {
     pub(crate) capture_qualified: bool,
 }
 
-/// Identity keybag `CREATE_KEYBAG` field encoding. The strict T8103 enclave
-/// reads the request's first word as the bag type and rejects the value the
-/// lenient T6020 enclave accepts there; macOS carries the type in the third
-/// word instead. Kept per-SoC so the strict path is correct without disturbing
-/// the proven T6020 encoding (hardware-verified for enrol, match, and reboot).
+/// Identity keybag `CREATE_KEYBAG` field encoding. The first word is the
+/// codec's struct version: the 13.5 enclave (T8103) takes versions 0-2 only
+/// and macOS creates an identity with version 2, while the T6020 enclave takes
+/// variant 5. Kept per-SoC so the T8103 path is correct without disturbing the
+/// proven T6020 encoding (hardware-verified for enrol, match, and reboot).
 pub(crate) struct KeybagCreate {
-    /// First word: request variant, echoed back in the reply.
+    /// First word: struct version (request variant), echoed back in the reply.
     pub(crate) variant: u32,
-    /// Third word: bag type. Identity is `0x20000` on the strict path; `0` on
-    /// T6020, which distinguishes the bag by the variant word instead.
+    /// Third word: bag type. Identity is `0x400000` on 13.5; `0` on T6020,
+    /// which distinguishes the bag by the variant word instead.
     pub(crate) bag_type: u32,
     /// Fourth word: create argument / parent handle.
     pub(crate) arg: i32,
@@ -155,11 +155,12 @@ const T8103: PlatformProfile = PlatformProfile {
     },
     dart_range_required: false,
     firmware_region: c"sepfw",
-    // Strict enclave: the type goes in the third word; the first word is 0.
+    // macOS 13.5's AppleKeyStore::identity_create (0xfffffe000994b2d8):
+    // version 2, type 0x400000, parent -1 (it accepts only -1 or <= -10).
     keybag_create: KeybagCreate {
-        variant: 0,
-        bag_type: 0x20000,
-        arg: 0,
+        variant: 2,
+        bag_type: 0x40_0000,
+        arg: -1,
     },
     // The j293 and j313 ADTs both carry `/defaults` `cpx-encryption-mode = 2`.
     key_store: KeyStore::Sepos13 {
