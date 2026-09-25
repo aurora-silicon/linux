@@ -5,6 +5,7 @@
 
 #include <asm/io.h>
 #include <linux/delay.h>
+#include <linux/iopoll.h>
 #include <linux/overflow.h>
 #include <linux/pm_runtime.h>
 #include <linux/types.h>
@@ -16,8 +17,8 @@
 #include "isp-regs.h"
 #include "isp-v4l2.h"
 
-#define ISP_FIRMWARE_MDELAY    1
-#define ISP_FIRMWARE_MAX_TRIES 1000
+#define ISP_FIRMWARE_POLL_US	  1000
+#define ISP_FIRMWARE_TIMEOUT_US	  1000000
 
 #define ISP_FIRMWARE_IPC_SIZE  0x1c000
 #define ISP_FIRMWARE_DATA_SIZE 0x28000
@@ -42,6 +43,16 @@ static inline u32 isp_gpio_read32(struct apple_isp *isp, u32 reg)
 static inline void isp_gpio_write32(struct apple_isp *isp, u32 reg, u32 val)
 {
 	writel(val, isp->gpio + reg);
+}
+
+/* Wait for the firmware to write @expected to a GPIO word. */
+static int isp_gpio_wait(struct apple_isp *isp, u32 reg, u32 expected)
+{
+	u32 val;
+
+	return readl_poll_timeout(isp->gpio + reg, val, val == expected,
+				  ISP_FIRMWARE_POLL_US,
+				  ISP_FIRMWARE_TIMEOUT_US);
 }
 
 static int apple_isp_power_up_domains(struct apple_isp *isp)
@@ -245,19 +256,13 @@ static int isp_reset_coproc(struct apple_isp *isp)
 			break;
 	}
 
-	for (retries = 0; retries < ISP_FIRMWARE_MAX_TRIES; retries++) {
-		status = isp_coproc_read32(isp, ISP_COPROC_STATUS);
-		if (status & ISP_COPROC_IN_WFI) {
-			isp_dbg(isp, "%d: coproc in WFI (status: 0x%x)\n",
-				retries, status);
-			break;
-		}
-		mdelay(ISP_FIRMWARE_MDELAY);
-	}
-	if (retries >= ISP_FIRMWARE_MAX_TRIES) {
+	if (readl_poll_timeout(isp->coproc + ISP_COPROC_STATUS, status,
+			       status & ISP_COPROC_IN_WFI,
+			       ISP_FIRMWARE_POLL_US, ISP_FIRMWARE_TIMEOUT_US)) {
 		isp_err(isp, "coproc NOT in WFI (status: 0x%x)\n", status);
 		return -ENODEV;
 	}
+	isp_dbg(isp, "coproc in WFI (status: 0x%x)\n", status);
 
 	return 0;
 }
@@ -271,7 +276,7 @@ static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
 
 static int isp_firmware_boot_stage1(struct apple_isp *isp)
 {
-	int err, retries;
+	int err;
 	// u32 val;
 
 	err = apple_isp_power_up_domains(isp);
@@ -310,22 +315,13 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 	isp_coproc_write32(isp, ISP_COPROC_CONTROL, 0x10);
 
 	/* Wait for ISP_GPIO_7 to 0x0 -> 0x8042006 */
-	for (retries = 0; retries < ISP_FIRMWARE_MAX_TRIES; retries++) {
-		u32 val = isp_gpio_read32(isp, ISP_GPIO_7);
-		if (val == 0x8042006) {
-			isp_dbg(isp,
-				"got first magic number (0x%x) from firmware\n",
-				val);
-			break;
-		}
-		mdelay(ISP_FIRMWARE_MDELAY);
-	}
-	if (retries >= ISP_FIRMWARE_MAX_TRIES) {
+	if (isp_gpio_wait(isp, ISP_GPIO_7, 0x8042006)) {
 		isp_err(isp,
 			"never received first magic number from firmware\n");
 		err = -ENODEV;
 		goto shutdown;
 	}
+	isp_dbg(isp, "got first magic number from firmware\n");
 
 	return 0;
 
@@ -373,7 +369,7 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 	struct isp_firmware_bootargs args;
 	dma_addr_t args_iova, cmd_iova;
 	void *args_virt, *cmd_virt;
-	int err, retries;
+	int err;
 
 	u32 num_ipc_chans = isp_gpio_read32(isp, ISP_GPIO_0);
 	u32 args_offset = isp_gpio_read32(isp, ISP_GPIO_1);
@@ -446,22 +442,13 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 	/* Wait for ISP_GPIO_7 to 0xf7fbdff9 -> 0x8042006 */
 	isp_gpio_write32(isp, ISP_GPIO_7, 0xf7fbdff9);
 
-	for (retries = 0; retries < ISP_FIRMWARE_MAX_TRIES; retries++) {
-		u32 val = isp_gpio_read32(isp, ISP_GPIO_7);
-		if (val == 0x8042006) {
-			isp_dbg(isp,
-				"got second magic number (0x%x) from firmware\n",
-				val);
-			break;
-		}
-		mdelay(ISP_FIRMWARE_MDELAY);
-	}
-	if (retries >= ISP_FIRMWARE_MAX_TRIES) {
+	if (isp_gpio_wait(isp, ISP_GPIO_7, 0x8042006)) {
 		isp_err(isp,
 			"never received second magic number from firmware\n");
 		err = -ENODEV;
 		goto free_extra;
 	}
+	isp_dbg(isp, "got second magic number from firmware\n");
 
 	return 0;
 
@@ -601,7 +588,7 @@ static void isp_firmware_shutdown_stage3(struct apple_isp *isp)
 
 static int isp_firmware_boot_stage3(struct apple_isp *isp)
 {
-	int err, retries;
+	int err;
 
 	err = isp_fill_channel_info(isp);
 	if (err < 0)
@@ -626,17 +613,7 @@ static int isp_firmware_boot_stage3(struct apple_isp *isp)
 	/* Wait for ISP_GPIO_3 to 0x8042006 -> 0x0 */
 	isp_gpio_write32(isp, ISP_GPIO_3, 0x8042006);
 
-	for (retries = 0; retries < ISP_FIRMWARE_MAX_TRIES; retries++) {
-		u32 val = isp_gpio_read32(isp, ISP_GPIO_3);
-		if (val == 0x0) {
-			isp_dbg(isp,
-				"got third magic number (0x%x) from firmware\n",
-				val);
-			break;
-		}
-		mdelay(ISP_FIRMWARE_MDELAY);
-	}
-	if (retries >= ISP_FIRMWARE_MAX_TRIES) {
+	if (isp_gpio_wait(isp, ISP_GPIO_3, 0x0)) {
 		isp_err(isp,
 			"never received third magic number from firmware\n");
 		isp_free_channel_info(isp);
@@ -650,8 +627,6 @@ static int isp_firmware_boot_stage3(struct apple_isp *isp)
 
 static int isp_stop_command_processor(struct apple_isp *isp)
 {
-	int retries;
-
 #if 0
 	int res = isp_cmd_stop(isp, 0);
 	if (res) {
@@ -673,16 +648,7 @@ static int isp_stop_command_processor(struct apple_isp *isp)
 	}
 #endif
 
-	for (retries = 0; retries < ISP_FIRMWARE_MAX_TRIES; retries++) {
-		u32 val = isp_gpio_read32(isp, ISP_GPIO_0);
-		if (val == 0x8042006) {
-			isp_dbg(isp, "got magic number (0x%x) from firmware\n",
-				val);
-			break;
-		}
-		mdelay(ISP_FIRMWARE_MDELAY);
-	}
-	if (retries >= ISP_FIRMWARE_MAX_TRIES) {
+	if (isp_gpio_wait(isp, ISP_GPIO_0, 0x8042006)) {
 		isp_err(isp, "never received magic number from firmware\n");
 		return -ENODEV;
 	}
