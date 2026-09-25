@@ -12,8 +12,6 @@ use kernel::{
     module_platform_driver, of, platform,
     prelude::*,
     soc::apple::aop::{EPICService, FakehidRegistration, AOP},
-    sync::Arc,
-    types::ForeignOwnable,
 };
 
 const EPIC_SUBTYPE_GET_AOP_PROPERTY: u16 = 0xa;
@@ -116,12 +114,17 @@ impl platform::Driver for IIOAopAlsDriver {
 
     fn probe(pdev: &platform::Device<Core>, _info: Option<&()>) -> impl PinInit<Self, Error> {
         let dev = pdev.as_ref();
-        let parent = dev.parent().unwrap();
-        // SAFETY: our parent is AOP, and AopDriver is repr(transparent) for Arc<dyn Aop>
-        let adata_ptr = unsafe { Pin::<KBox<Arc<dyn AOP>>>::borrow(parent.get_drvdata()) };
-        let adata = (&*adata_ptr).clone();
-        // SAFETY: AOP sets the platform data correctly
-        let service = unsafe { *((*dev.as_raw()).platform_data as *const EPICService) };
+        // SAFETY: This driver binds only to the service devices the AOP core
+        // registers, and `pdev` is being probed.
+        let adata = unsafe { <dyn AOP>::from_child(dev) }?;
+        // SAFETY: `dev` is a valid device; the AOP core attached its service
+        // record as the platform data of every service device it registers.
+        let service = unsafe { (*dev.as_raw()).platform_data.cast::<EPICService>() };
+        if service.is_null() {
+            return Err(ENODEV);
+        }
+        // SAFETY: The record lives as long as the device it is attached to.
+        let service = unsafe { *service };
         let ty = bindings::BINDINGS_IIO_LIGHT;
         let offset = get_lux_offset(adata.as_ref(), pdev, &service)?;
         let data = AopSensorData::new(dev.into(), ty, MsgProc(offset))?;

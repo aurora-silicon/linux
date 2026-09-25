@@ -1234,6 +1234,9 @@ impl rtkit::Operations for AopData {
     }
 }
 
+/// The driver data of the AOP. Children reach the `Arc` through
+/// `AOP::from_child()`, which relies on this being `repr(transparent)` over
+/// it.
 #[repr(transparent)]
 struct AopDriver(Arc<dyn AOP>);
 

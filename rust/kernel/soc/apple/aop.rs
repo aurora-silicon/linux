@@ -3,11 +3,13 @@
 //! Common code for AOP endpoint drivers
 
 use kernel::{
+    device::Device,
     prelude::*,
     sync::{
         atomic::{Atomic, Relaxed},
         Arc, //
     },
+    types::ForeignOwnable,
 };
 
 /// Representation of an "EPIC" service.
@@ -54,6 +56,33 @@ pub trait AOP: Send + Sync {
     fn remove_fakehid_listener(&self, svc: &EPICService) -> bool;
     /// Internal method to detach the device.
     fn remove(&self);
+}
+
+impl dyn AOP {
+    /// Returns the AOP core that registered the service device `child`.
+    ///
+    /// The core registers its service devices from a workqueue while it is still probing, and the
+    /// driver core publishes a driver's data only once its probe has returned, so a child can be
+    /// probed before the core's data exists. This returns `EPROBE_DEFER` in that case; the child's
+    /// probe is retried once the core has bound.
+    ///
+    /// # Safety
+    ///
+    /// `child` must be a platform device that the AOP core driver registered for one of its
+    /// services, and the caller must be probing it or be bound to it. The core unregisters its
+    /// children before it releases its driver data, so that data is valid for the lookup.
+    pub unsafe fn from_child(child: &Device) -> Result<Arc<dyn AOP>> {
+        let parent = child.parent().ok_or(ENODEV)?;
+        let ptr = parent.get_drvdata::<c_void>();
+        if ptr.is_null() {
+            return Err(EPROBE_DEFER);
+        }
+        // SAFETY: By this function's contract `ptr` is the AOP core's driver data: a pinned box
+        // holding the core's driver type, which is `#[repr(transparent)]` over an `Arc<dyn AOP>`,
+        // and it stays valid while `child` is registered.
+        let aop = unsafe { Pin::<KBox<Arc<dyn AOP>>>::borrow(ptr) };
+        Ok((*aop).clone())
+    }
 }
 
 /// A child driver's fake-HID subscription on an AOP service.
