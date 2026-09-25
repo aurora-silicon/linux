@@ -100,6 +100,16 @@ fn align_up(v: usize, a: usize) -> usize {
     (v + a - 1) & !(a - 1)
 }
 
+/// Reads the little-endian `u16` at `off`; `b` must hold it.
+fn le_u16(b: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([b[off], b[off + 1]])
+}
+
+/// Reads the little-endian `u32` at `off`; `b` must hold it.
+fn le_u32(b: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+}
+
 #[inline(always)]
 fn mem_sync() {
     unsafe {
@@ -135,16 +145,36 @@ struct EPICHeader {
     inline_len: u32,
 }
 
-#[repr(C, packed)]
-struct EPICServiceAnnounce {
-    name: [u8; 20],
-    _unk0: u32,
-    retcode: u32,
-    _unk1: u32,
-    channel: u32,
-    _unk2: u32,
-    _unk3: u32,
+/// The EPIC header fields that message dispatch needs.
+struct EPICHeaderFields {
+    category: u8,
+    subtype: u16,
+    tag: u16,
 }
+
+impl EPICHeaderFields {
+    /// Splits `msg` into its decoded header and its payload, or returns `None`
+    /// when `msg` is too short to hold a header.
+    fn decode(msg: &[u8]) -> Option<(EPICHeaderFields, &[u8])> {
+        if msg.len() < mem::size_of::<EPICHeader>() {
+            return None;
+        }
+        let (hdr, data) = msg.split_at(mem::size_of::<EPICHeader>());
+        let fields = EPICHeaderFields {
+            category: hdr[mem::offset_of!(EPICHeader, category)],
+            subtype: le_u16(hdr, mem::offset_of!(EPICHeader, subtype)),
+            tag: le_u16(hdr, mem::offset_of!(EPICHeader, tag)),
+        };
+        Some((fields, data))
+    }
+}
+
+/// A service announcement (report subtype [`EPIC_SUBTYPE_STD_SERVICE`]):
+/// a NUL-padded 32-byte service name followed by the channel the service
+/// answers on. Its trailing 8 bytes are not used here.
+const EPIC_ANNOUNCE_NAME_LEN: usize = 32;
+const EPIC_ANNOUNCE_CHANNEL_OFFSET: usize = 32;
+const EPIC_ANNOUNCE_LEN: usize = 44;
 
 #[pin_data]
 struct FutureValue<T> {
@@ -406,9 +436,16 @@ impl AFKEndpoint {
             }
             msg_buf.resize(qeh.size as usize, 0, GFP_KERNEL)?;
             self.memcpy_from_iomem(base + rptr + QEH_SIZE, &mut msg_buf)?;
-            let (hdr_bytes, msg) = msg_buf.split_at(mem::size_of::<EPICHeader>());
-            let header = unsafe { &*(hdr_bytes.as_ptr() as *const EPICHeader) };
-            self.handle_ipc(client, qeh, header, msg)?;
+            let Some((header, msg)) = EPICHeaderFields::decode(&msg_buf) else {
+                dev_err!(
+                    client.dev,
+                    "Short EPIC message ({} bytes) on ep {}",
+                    msg_buf.len(),
+                    self.index
+                );
+                return Err(EIO);
+            };
+            self.handle_ipc(client, qeh, &header, msg)?;
             rptr = align_up(rptr + QEH_SIZE + qeh.size as usize, block_size) % buf_size;
             mem_sync();
             self.iomem_write32(buf_offset + block_size, rptr as u32)?;
@@ -421,24 +458,25 @@ impl AFKEndpoint {
         &mut self,
         client: ArcBorrow<'_, AopData>,
         qhdr: &QEHeader,
-        ehdr: &EPICHeader,
+        ehdr: &EPICHeaderFields,
         data: &[u8],
     ) -> Result<()> {
         let subtype = ehdr.subtype;
         if ehdr.category == EPIC_CATEGORY_REPORT {
             if subtype == EPIC_SUBTYPE_STD_SERVICE {
-                let announce = unsafe { &*(data.as_ptr() as *const EPICServiceAnnounce) };
-                let chan = announce.channel;
-                let name_len = announce
-                    .name
-                    .iter()
-                    .position(|x| *x == 0)
-                    .unwrap_or(announce.name.len());
-                return Into::<Arc<_>>::into(client).register_service(
-                    self,
-                    chan,
-                    &announce.name[..name_len],
-                );
+                if data.len() < EPIC_ANNOUNCE_LEN {
+                    dev_err!(
+                        client.dev,
+                        "Short service announcement ({} bytes) on endpoint {}",
+                        data.len(),
+                        self.index
+                    );
+                    return Err(EIO);
+                }
+                let name = &data[..EPIC_ANNOUNCE_NAME_LEN];
+                let name = &name[..name.iter().position(|x| *x == 0).unwrap_or(name.len())];
+                let chan = le_u32(data, EPIC_ANNOUNCE_CHANNEL_OFFSET);
+                return Into::<Arc<_>>::into(client).register_service(self, chan, name);
             } else if subtype == EPIC_SUBTYPE_FAKEHID_REPORT {
                 return client.process_fakehid_report(self, qhdr.channel, data);
             } else {
@@ -463,7 +501,7 @@ impl AFKEndpoint {
                     );
                     return Err(EIO);
                 }
-                let retcode = u32::from_ne_bytes(data[..4].try_into().unwrap());
+                let retcode = le_u32(data, 0);
                 let tag = ehdr.tag as usize;
                 if tag == 0 || tag > self.calls.len() || self.calls[tag - 1].is_none() {
                     dev_err!(
