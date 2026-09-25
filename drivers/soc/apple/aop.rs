@@ -169,6 +169,30 @@ struct EPICHeader {
     inline_len: u32,
 }
 
+/// The EPIC header of the T8140 firmware (sub-header version 4): the
+/// sub-header carries a timestamp ahead of the tag, and the reply capacity
+/// of a call goes into `inline_len`. Same size as the version 2 header.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct EPICHeaderV4 {
+    version: u8,
+    seq: u16,
+    _pad0: u8,
+    _unk0: u32,
+    timestamp: u64,
+    // Subheader
+    length: u32,
+    sub_version: u8,
+    category: u8,
+    subtype: u16,
+    sub_timestamp: u64,
+    tag: u16,
+    _unk1: u16,
+    inline_len: u32,
+}
+
+const _: () = assert!(mem::size_of::<EPICHeaderV4>() == mem::size_of::<EPICHeader>());
+
 /// The EPIC header fields that message dispatch needs.
 struct EPICHeaderFields {
     category: u8,
@@ -178,16 +202,22 @@ struct EPICHeaderFields {
 
 impl EPICHeaderFields {
     /// Splits `msg` into its decoded header and its payload, or returns `None`
-    /// when `msg` is too short to hold a header.
+    /// when `msg` is too short to hold a header. The sub-header version in the
+    /// message selects the layout; both layouts share the leading fields.
     fn decode(msg: &[u8]) -> Option<(EPICHeaderFields, &[u8])> {
         if msg.len() < mem::size_of::<EPICHeader>() {
             return None;
         }
         let (hdr, data) = msg.split_at(mem::size_of::<EPICHeader>());
+        let tag_offset = if hdr[mem::offset_of!(EPICHeader, sub_version)] >= 4 {
+            mem::offset_of!(EPICHeaderV4, tag)
+        } else {
+            mem::offset_of!(EPICHeader, tag)
+        };
         let fields = EPICHeaderFields {
             category: hdr[mem::offset_of!(EPICHeader, category)],
             subtype: le_u16(hdr, mem::offset_of!(EPICHeader, subtype)),
-            tag: le_u16(hdr, mem::offset_of!(EPICHeader, tag)),
+            tag: le_u16(hdr, tag_offset),
         };
         Some((fields, data))
     }
@@ -717,23 +747,44 @@ impl AFKEndpoint {
             return Err(EIO);
         };
         let call = Arc::pin_init(FutureValue::pin_init(), GFP_KERNEL)?;
-        let hdr = EPICHeader {
+        let tag = (slot + 1) as u16;
+        let hdr_v2 = EPICHeader {
             version: 2,
             seq: self.seq,
             length: data.len() as u32,
             sub_version: 2,
             category: EPIC_CATEGORY_NOTIFY,
             subtype,
-            tag: (slot + 1) as u16,
+            tag,
             ..EPICHeader::default()
         };
-        // SAFETY: `hdr` is a packed plain-data struct that outlives the slice,
-        // which covers exactly its bytes.
+        // The version 4 firmware wants the reply capacity advertised; a
+        // property read is answered even with zero, other calls may not be.
+        let hdr_v4 = EPICHeaderV4 {
+            version: 2,
+            seq: self.seq,
+            length: data.len() as u32,
+            sub_version: 4,
+            category: EPIC_CATEGORY_NOTIFY,
+            subtype,
+            tag,
+            inline_len: ret.as_ref().map_or(0, |ret| ret.len() as u32),
+            ..EPICHeaderV4::default()
+        };
+        // SAFETY: Both headers are packed plain-data structs that outlive the
+        // slice, which covers exactly the bytes of the one selected.
         let hdr_bytes = unsafe {
-            slice::from_raw_parts(
-                &hdr as *const EPICHeader as *const u8,
-                mem::size_of::<EPICHeader>(),
-            )
+            if client.epic_v4 {
+                slice::from_raw_parts(
+                    ptr::from_ref(&hdr_v4).cast::<u8>(),
+                    mem::size_of::<EPICHeaderV4>(),
+                )
+            } else {
+                slice::from_raw_parts(
+                    ptr::from_ref(&hdr_v2).cast::<u8>(),
+                    mem::size_of::<EPICHeader>(),
+                )
+            }
         };
         let doorbell = self.write_entry(client, channel, EPIC_TYPE_NOTIFY, hdr_bytes, data)?;
         self.seq = self.seq.wrapping_add(1);
@@ -792,6 +843,8 @@ impl ChildDevice {
 #[pin_data]
 struct AopData {
     dev: ARef<device::Device>,
+    /// The firmware speaks EPIC with version 4 sub-headers.
+    epic_v4: bool,
     /// Runs the service registrations one at a time; drained on removal.
     registration_queue: OwnedQueue,
     /// Serializes queueing a registration with the start of removal, so that
@@ -909,12 +962,13 @@ impl WorkItem for AopServiceRegisterWork {
 }
 
 impl AopData {
-    fn new(dev: &platform::Device<Core>) -> Result<Arc<AopData>> {
+    fn new(dev: &platform::Device<Core>, cfg: &AopHwConfig) -> Result<Arc<AopData>> {
         let registration_queue = OwnedQueue::new_ordered(c_str!("apple-aop"))?;
         Arc::pin_init(
             pin_init!(
                 AopData {
                     dev: dev.as_ref().into(),
+                    epic_v4: cfg.epic_v4,
                     registration_queue,
                     registration_gate <- new_mutex!(()),
                     removing: Atomic::new(false),
@@ -1244,27 +1298,33 @@ struct AopHwConfig {
     ec0p: u64,
     alig: u64,
     aopt: u64,
+    /// The firmware speaks EPIC with version 4 sub-headers.
+    epic_v4: bool,
 }
 
 const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
     aopt: 1,
     alig: 128,
+    epic_v4: false,
 };
 const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
     aopt: 0,
     alig: 128,
+    epic_v4: false,
 };
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
     aopt: 0,
     alig: 64,
+    epic_v4: false,
 };
 const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
     aopt: 0,
     alig: 64,
+    epic_v4: false,
 };
 
 kernel::of_device_table!(
@@ -1294,7 +1354,7 @@ impl platform::Driver for AopDriver {
         let aop_mmio = KBox::pin_init(aop_req.iomap_sized::<AOP_MMIO_SIZE>(), GFP_KERNEL)?;
         let asc_req = pdev.io_request_by_index(1).ok_or(EINVAL)?;
         let asc_mmio = KBox::pin_init(asc_req.iomap_sized::<ASC_MMIO_SIZE>(), GFP_KERNEL)?;
-        let data = AopData::new(pdev)?;
+        let data = AopData::new(pdev, cfg)?;
         // Whatever fails below leaves the AOP running and its children
         // registering; the same teardown as unbind's cleans that up.
         let probe_guard = ScopeGuard::new_with_data(data.clone(), |data| data.remove());
