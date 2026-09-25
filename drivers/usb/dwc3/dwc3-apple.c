@@ -171,6 +171,7 @@ static void dwc3_apple_set_ptrcap(struct dwc3_apple *appledwc, u32 mode)
 static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
 {
 	struct dwc3_probe_data probe_data = {};
+	void *group;
 	int ret;
 
 	lockdep_assert_held(&appledwc->lock);
@@ -183,9 +184,30 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
 	probe_data.skip_core_init_mode = true;
 	probe_data.properties = DWC3_DEFAULT_PROPERTIES;
 
+	/*
+	 * This runs from the role switch callback, so a failure leaves the glue
+	 * device bound with everything dwc3_core_probe() acquired through devres
+	 * still attached, the request of the core register region included. The
+	 * next cable event retries dwc3_core_probe() on this struct and would fail
+	 * with -EBUSY on that region. Group the devres of one attempt so that a
+	 * failed attempt can be released.
+	 */
+	group = devres_open_group(appledwc->dev, NULL, GFP_KERNEL);
+	if (!group)
+		return -ENOMEM;
+
 	ret = dwc3_core_probe(&probe_data);
-	if (ret)
+	if (ret) {
+		devres_release_group(appledwc->dev, group);
+		/*
+		 * dwc3_core_probe() initialised the locks, work items and lists of
+		 * the embedded struct dwc3. The retry expects a zeroed struct, as
+		 * on the first attempt.
+		 */
+		memset(&appledwc->dwc, 0, sizeof(appledwc->dwc));
 		return ret;
+	}
+	devres_remove_group(appledwc->dev, group);
 
 	appledwc->state = DWC3_APPLE_NO_CABLE;
 	return 0;
