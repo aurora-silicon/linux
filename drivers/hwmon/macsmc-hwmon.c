@@ -151,31 +151,42 @@ static int macsmc_hwmon_read_f32_scaled(struct apple_smc *smc, smc_key key,
 	if (ret < 0)
 		return ret;
 
-	val = ((u64)((fval & FLT_MANT_MASK) | BIT(23)));
-	exp = ((fval >> 23) & 0xff) - FLT_EXP_BIAS - FLT_MANT_BIAS;
+	exp = FIELD_GET(FLT_EXP_MASK, fval);
+	/* NaN and infinity are unavailable readings, not extreme temperatures. */
+	if (exp == 0xff)
+		return -ENODATA;
+
+	val = fval & FLT_MANT_MASK;
+	if (exp)
+		val |= BIT(23);
+	else
+		exp = 1; /* Zero and subnormal values have no implicit leading one. */
+	exp -= FLT_EXP_BIAS + FLT_MANT_BIAS;
 
 	/* We never have negatively scaled SMC floats */
 	val *= scale;
 
 	if (exp > 63)
-		val = U64_MAX;
+		return -ERANGE;
 	else if (exp < -63)
 		val = 0;
 	else if (exp < 0)
 		val >>= -exp;
 	else if (exp != 0 && (val & ~((1ULL << (64 - exp)) - 1))) /* overflow */
-		val = U64_MAX;
+		return -ERANGE;
 	else
 		val <<= exp;
 
 	if (fval & FLT_SIGN_MASK) {
 		if (val > (u64)LONG_MAX + 1)
+			return -ERANGE;
+		if (val == (u64)LONG_MAX + 1)
 			*p = LONG_MIN;
 		else
 			*p = -(long)val;
 	} else {
 		if (val > (u64)LONG_MAX)
-			*p = LONG_MAX;
+			return -ERANGE;
 		else
 			*p = (long)val;
 	}
