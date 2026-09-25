@@ -1848,11 +1848,19 @@ rtkit_ready:
 		goto out_remove_sq;
 	}
 
+	/*
+	 * nvme_start_ctrl() sends Set Features if the controller reports
+	 * asynchronous events. If that times out, the controller is live and
+	 * recovery_work needs disable_lock to stop it. As in pci.c, a stop
+	 * that lands before nvme_start_ctrl() unquiesces the I/O queues loses
+	 * its quiesce, and requests then fail on the stopped queues until the
+	 * next reset instead of waiting for it.
+	 */
+	if (phase_locked)
+		mutex_unlock(&anv->disable_lock);
 	nvme_start_ctrl(&anv->ctrl);
 
 	dev_dbg(anv->dev, "ANS boot and NVMe init completed.");
-	if (phase_locked)
-		mutex_unlock(&anv->disable_lock);
 	return;
 
 out_remove_sq:
