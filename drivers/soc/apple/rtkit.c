@@ -422,14 +422,26 @@ static void apple_rtkit_ioreport_rx(struct apple_rtkit *rtk, u64 msg)
 
 static void apple_rtkit_syslog_rx_init(struct apple_rtkit *rtk, u64 msg)
 {
-	rtk->syslog_n_entries = FIELD_GET(APPLE_RTKIT_SYSLOG_N_ENTRIES, msg);
-	rtk->syslog_msg_size = FIELD_GET(APPLE_RTKIT_SYSLOG_MSG_SIZE, msg);
+	size_t entries = FIELD_GET(APPLE_RTKIT_SYSLOG_N_ENTRIES, msg);
+	size_t size = FIELD_GET(APPLE_RTKIT_SYSLOG_MSG_SIZE, msg);
+	char *buffer = NULL;
 
-	rtk->syslog_msg_buffer = kzalloc(rtk->syslog_msg_size, GFP_KERNEL);
+	/*
+	 * Firmware may send SYSLOG_INIT again after it restarts. The ordered RX
+	 * worker is the only user of the message buffer, so it can simply be
+	 * replaced here. A zero-sized geometry must not allocate: kzalloc(0)
+	 * returns ZERO_SIZE_PTR, which the log path would then index.
+	 */
+	if (entries && size)
+		buffer = kzalloc(size, GFP_KERNEL);
+	kfree(rtk->syslog_msg_buffer);
+	rtk->syslog_msg_buffer = buffer;
+	rtk->syslog_n_entries = entries;
+	rtk->syslog_msg_size = size;
 
 	dev_dbg(rtk->dev,
 		"RTKit: syslog initialized: entries: %zd, msg_size: %zd\n",
-		rtk->syslog_n_entries, rtk->syslog_msg_size);
+		entries, size);
 }
 
 static bool should_crop_syslog_char(char c)
@@ -445,26 +457,27 @@ static void apple_rtkit_syslog_rx_log(struct apple_rtkit *rtk, u64 msg)
 	int msglen;
 
 	if (!rtk->syslog_msg_buffer) {
-		dev_warn(
+		dev_warn_ratelimited(
 			rtk->dev,
 			"RTKit: received syslog message but no syslog_msg_buffer\n");
 		goto done;
 	}
 	if (!rtk->syslog_buffer.size) {
-		dev_warn(
+		dev_warn_ratelimited(
 			rtk->dev,
 			"RTKit: received syslog message but syslog_buffer.size is zero\n");
 		goto done;
 	}
 	if (!rtk->syslog_buffer.buffer && !rtk->syslog_buffer.iomem) {
-		dev_warn(
+		dev_warn_ratelimited(
 			rtk->dev,
 			"RTKit: received syslog message but no syslog_buffer.buffer or syslog_buffer.iomem\n");
 		goto done;
 	}
-	if (idx > rtk->syslog_n_entries) {
-		dev_warn(rtk->dev, "RTKit: syslog index %d out of range\n",
-			 idx);
+	if (idx >= rtk->syslog_n_entries ||
+	    idx >= rtk->syslog_buffer.size / entry_size) {
+		dev_warn_ratelimited(rtk->dev,
+				     "RTKit: syslog index %d out of range\n", idx);
 		goto done;
 	}
 
