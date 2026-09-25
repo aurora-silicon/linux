@@ -16,14 +16,44 @@ use kernel::{
 
 const EPIC_SUBTYPE_GET_AOP_PROPERTY: u16 = 0xa;
 const EPIC_SUBTYPE_SET_ALS_PROPERTY: u16 = 0x4;
+
+/* ALS properties. */
+const ALS_PROP_INTERVAL: u32 = 0x00;
+const ALS_PROP_CALIBRATION: u32 = 0x0b;
+const ALS_PROP_BATCH_INTERVAL: u32 = 0x16;
+const ALS_PROP_RAW_INTERVAL: u32 = 0x5c;
+const ALS_PROP_VERBOSITY: u32 = 0xe1;
+
+/*
+ * The CT817 starts reporting on the zero to non-zero transition of its
+ * report interval, and it accepts that transition only once its batch and
+ * raw interval properties have been written. Despite their names these two
+ * are not intervals; they are the values the sensor is configured with on
+ * the T8140. The sensor answers every one of these writes with a
+ * not-permitted status and applies them regardless, so the status is only
+ * logged.
+ */
+const ALS_BATCH_INTERVAL: u32 = 1;
+const ALS_RAW_INTERVAL: u32 = 0;
+const ALS_VERBOSITY: u32 = 6;
+/// The reporting interval in microseconds.
+const ALS_INTERVAL_US: u32 = 200000;
 const LUX_OFFSET_CT720: usize = 0x1d;
 const LUX_OFFSET_VD6286: usize = 0x28;
+/*
+ * The CT817 sends a 32-byte report: two raw channel floats at +0x08 and
+ * +0x0c and the lux float at +0x1c, one byte below the CT720's, so the two
+ * parts do not share a layout.
+ */
+const LUX_OFFSET_CT817: usize = 0x1c;
 
 fn get_lux_offset(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Result<usize> {
     let name = get_aop_property(aop, svc, 0xf, 16)?.1;
     match name.as_slice() {
         b"Redbird\0" => Ok(LUX_OFFSET_VD6286),
         b"FireFish2\0" => Ok(LUX_OFFSET_CT720),
+        // The T8140 AOP reports the part number rather than a code name.
+        b"CT817\0" => Ok(LUX_OFFSET_CT817),
         _ => {
             dev_warn!(
                 dev.as_ref(),
@@ -35,12 +65,46 @@ fn get_lux_offset(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> R
     }
 }
 
-fn enable_als(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Result<()> {
-    let fw = Firmware::request(c_str!("apple/aop-als-cal.bin"), dev.as_ref())?;
-    set_als_property(aop, svc, 0xb, fw.data())?;
-    set_als_property(aop, svc, 0, &200000u32.to_le_bytes())?;
+fn enable_als(
+    aop: &dyn AOP,
+    dev: &platform::Device,
+    svc: &EPICService,
+    offset: usize,
+) -> Result<()> {
+    if offset != LUX_OFFSET_CT817 {
+        let fw = Firmware::request(c_str!("apple/aop-als-cal.bin"), dev.as_ref())?;
+        set_als_property(aop, svc, ALS_PROP_CALIBRATION, fw.data())?;
+        set_als_property(aop, svc, ALS_PROP_INTERVAL, &ALS_INTERVAL_US.to_le_bytes())?;
+        return Ok(());
+    }
 
-    Ok(())
+    // The CT817 gets its calibration from the AOP driver over the setup port,
+    // not as an ALS property. Only the transport can fail here; the sensor's
+    // status words are logged, see the property comments above. Do not fetch
+    // the HID report descriptor (subtype 0x01) on this endpoint: the AOP never
+    // answers it, and do not write the MODE (0xd7) or 0xe4 properties: either
+    // wedges the AOP for the rest of the boot.
+    let set = |tag: u32, val: u32, what: &str| -> Result<()> {
+        let status = set_als_property(aop, svc, tag, &val.to_le_bytes())?;
+        dev_dbg!(
+            dev.as_ref(),
+            "{} = {:#x}: status {:#x}\n",
+            what,
+            val,
+            status
+        );
+        Ok(())
+    };
+    set(ALS_PROP_VERBOSITY, ALS_VERBOSITY, "verbosity")?;
+    set(
+        ALS_PROP_BATCH_INTERVAL,
+        ALS_BATCH_INTERVAL,
+        "batch interval",
+    )?;
+    set(ALS_PROP_RAW_INTERVAL, ALS_RAW_INTERVAL, "raw interval")?;
+    // The interval is zero at probe, so this is the transition that arms the
+    // sensor.
+    set(ALS_PROP_INTERVAL, ALS_INTERVAL_US, "interval")
 }
 
 fn get_aop_property(
@@ -133,7 +197,7 @@ impl platform::Driver for IIOAopAlsDriver {
         let offset = get_lux_offset(adata.as_ref(), pdev, &service)?;
         let data = AopSensorData::new(dev.into(), ty, MsgProc(offset))?;
         let listener = FakehidRegistration::new(adata.clone(), service, data.clone())?;
-        enable_als(adata.as_ref(), pdev, &service)?;
+        enable_als(adata.as_ref(), pdev, &service, offset)?;
         let info_mask = 1 << bindings::BINDINGS_IIO_CHAN_INFO_PROCESSED;
         let iio =
             IIORegistration::<MsgProc>::new(data, c"aop-sensors-als", ty, info_mask, &THIS_MODULE)?;
