@@ -35,6 +35,7 @@ properties:
           - const: apple,t7000-cluster-cpufreq
           - const: apple,s5l8960x-cluster-cpufreq
       - const: apple,s5l8960x-cluster-cpufreq
+      - const: apple,t8140-cluster-cpufreq
       - items:
           - const: apple,t6020-cluster-cpufreq
           - const: apple,t8112-cluster-cpufreq
