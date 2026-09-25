@@ -53,6 +53,9 @@ struct sep_bio_info {
   __u32 reserved[3];
 };
 
+/* reserved[0] flags; reserved[1] is a live SEP identity count only when valid. */
+#define SEP_BIO_INFO_LIVE_COUNT_VALID 1u
+
 struct sep_bio_list {
   __u32 count;
   __u32 reserved;

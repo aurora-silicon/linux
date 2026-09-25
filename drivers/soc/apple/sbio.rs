@@ -10,6 +10,24 @@ use kernel::prelude::*;
 use kernel::soc::apple::mailbox::Message;
 
 impl SepData {
+    fn sbio_enrol_step(&self, op: &crate::sbio::SbioOp) -> Option<KVec<u8>> {
+        match self.sbio_call(op) {
+            SbioOutcome::Ok(payload) => Some(payload),
+            SbioOutcome::PrerequisiteMissing => {
+                dev_err!(self.dev, "enrol: {} prerequisite missing (status 0x01)\n", op.name());
+                None
+            }
+            SbioOutcome::Status16 => {
+                dev_err!(self.dev, "enrol: {} refused (status 0x16)\n", op.name());
+                None
+            }
+            SbioOutcome::Other => {
+                dev_err!(self.dev, "enrol: {} got no usable answer\n", op.name());
+                None
+            }
+        }
+    }
+
     fn sbio_expect_ok(&self, op: &crate::sbio::SbioOp) -> Option<KVec<u8>> {
         match self.sbio_call(op) {
             SbioOutcome::Ok(payload) => Some(payload),
@@ -40,8 +58,14 @@ impl SepData {
     fn sbio_relay(&self, relay: &crate::sbio::SbioRelay<'_>) -> Option<KVec<u8>> {
         match self.sbio_transfer_raw(relay.opcode(), relay.name(), relay.payload()) {
             Ok(done) if done.status.is_ok() => Some(done.payload),
-            Ok(_) => None,
-            Err(_) => None,
+            Ok(done) => {
+                dev_err!(self.dev, "enrol: {} relay ({} bytes) refused with status {}\n", relay.name(), relay.payload().len(), done.status);
+                None
+            }
+            Err(e) => {
+                dev_err!(self.dev, "enrol: {} relay ({} bytes) failed ({:?})\n", relay.name(), relay.payload().len(), e);
+                None
+            }
         }
     }
 
@@ -264,6 +288,7 @@ impl SepData {
         let listed = match self.enclave_identities_for(SBIO_PROBE_USER_ID) {
             Some(list) => list.len(),
             None => {
+                dev_warn!(self.dev, "enrol: identity enumeration failed; trying the existing context\n");
                 return self.enrol_into_existing_context(user);
             }
         };
@@ -288,9 +313,16 @@ impl SepData {
         proof: &crate::sbio::NoExistingCatacomb,
     ) -> bool {
         let system = crate::sbio::sbio_select_context(crate::sbio::ContextScope::SYSTEM, proof);
-        if self.sbio_expect_ok(&system).is_none() {
+        if self.sbio_enrol_step(&system).is_none() {
             return false;
         }
+
+        let Some(reply) = self.read_component_states() else {
+            dev_warn!(self.dev, "enrol: could not read component state after system SELECT_CONTEXT\n");
+            return false;
+        };
+        let states = crate::sbio::ComponentStates::new(&reply);
+        let owner_initial_state = states.state_for(crate::sbio::CatacombUser::OWNER.value());
 
         for (who, kind, what) in [
             (
@@ -304,14 +336,52 @@ impl SepData {
                 c"owner catacomb",
             ),
         ] {
+            let Some(state) = states.state_for(who.value()) else {
+                dev_err!(self.dev, "enrol: {} is absent after system SELECT_CONTEXT\n", what);
+                return false;
+            };
+            dev_info!(self.dev, "enrol: after system SELECT_CONTEXT {} state 0x{:x}\n", what, state);
+            if state & crate::sbio::COMPONENT_STATE_ACTIVE == 0 {
+                dev_err!(self.dev, "enrol: {} is not active after system SELECT_CONTEXT\n", what);
+                return false;
+            }
+            // On m2, state 0x3 refused SAVE_CATACOMB with status 0x6. The
+            // 0x04 save-pending bit is also used by the T2 Catacomb protocol;
+            // only persist a fresh component when SEP reports that bit.
+            if state & crate::sbio::COMPONENT_STATE_SAVE_PENDING == 0 {
+                continue;
+            }
             if !self.save_catacomb(who, kind, what) {
+                dev_err!(self.dev, "enrol: could not save {} after selecting the system context\n", what);
+                return false;
+            }
+        }
+
+        // The J414s owner exported successfully from state 0x3 in a bounded
+        // no-finger probe, although an earlier pre-UUID boot saw the master
+        // refuse an early save from the same state. Keep this path opt-in
+        // until a new enrollment and reboot prove that the owner blob belongs
+        // to the new user context.
+        if *module_parameters::j414s_persistent_enrol.value() != 0 {
+            if owner_initial_state == Some(0x3)
+                && !self.save_catacomb(
+                    crate::sbio::CatacombUser::OWNER,
+                    PRIVATE_TYPE_CATACOMB_OWNER,
+                    c"fresh-context owner catacomb (user 501)",
+                )
+            {
+                dev_err!(self.dev, "enrol: opt-in fresh-context owner export failed\n");
+                return false;
+            }
+            if crate::catacomb::read(PRIVATE_TYPE_CATACOMB_OWNER).is_none() {
+                dev_err!(self.dev, "enrol: opt-in fresh context has no owner file\n");
                 return false;
             }
         }
 
         let per_user =
             crate::sbio::sbio_select_context(crate::sbio::ContextScope::user(user), proof);
-        if self.sbio_expect_ok(&per_user).is_none() {
+        if self.sbio_enrol_step(&per_user).is_none() {
             return false;
         }
 
@@ -324,10 +394,11 @@ impl SepData {
 
     fn activate_protected_config(&self, user: crate::sbio::UserId) -> bool {
         let op = crate::sbio::sbio_protected_config(user);
-        let Some(config) = self.sbio_expect_ok(&op) else {
+        let Some(config) = self.sbio_enrol_step(&op) else {
             return false;
         };
         if config.len() != crate::sbio::SBIO_PROTECTED_CONFIG_LEN {
+            dev_err!(self.dev, "enrol: protected configuration has {} bytes, expected {}\n", config.len(), crate::sbio::SBIO_PROTECTED_CONFIG_LEN);
             return false;
         }
         true
@@ -339,19 +410,25 @@ impl SepData {
             let _ = self.sbio_call(&crate::sbio::sbio_cancel_operation());
         }
 
-        let user = crate::sbio::UserId::new(SBIO_PROBE_USER_ID)?;
+        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            dev_err!(self.dev, "enrol: invalid probe user id\n");
+            return None;
+        };
 
         // 0x03 answers -3 until a user key bag is designated
         if !self.keybag_designated.load(Relaxed) {
+            dev_err!(self.dev, "enrol: no user keybag was designated\n");
             return None;
         }
 
         if self.enrol_material.lock().is_none() {
+            dev_err!(self.dev, "enrol: no enrolment material is held\n");
             return None;
         }
 
         // 0x03 answers 0x1 until an enrolment context exists
         if !self.open_enrolment_context(user) {
+            dev_err!(self.dev, "enrol: could not open the enclave enrolment context\n");
             return None;
         }
 
@@ -365,8 +442,8 @@ impl SepData {
         let op =
             crate::sbio::sbio_begin_enrol(user, crate::sbio::BE_AUTH_TYPE_ACM_CONTEXT, &acm_handle);
 
-        match self.sbio_call(&op) {
-            SbioOutcome::Ok(_payload) => {
+        match self.sbio_enrol_step(&op) {
+            Some(_payload) => {
                 self.enrol_open.store(true, Relaxed);
                 Some(OpenEnrolment {
                     sep: self,
@@ -377,6 +454,50 @@ impl SepData {
         }
     }
 
+    fn probe_owner_export(&self) {
+        if *module_parameters::probe_owner_export.value() == 0 {
+            return;
+        }
+        if self.templates_restored.load(Relaxed)
+            || crate::catacomb::read(PRIVATE_TYPE_CATACOMB_OWNER).is_some()
+            || crate::catacomb::read(PRIVATE_TYPE_CATACOMB_MASTER).is_none()
+            || crate::catacomb::read(PRIVATE_TYPE_CATACOMB_USER).is_none()
+        {
+            dev_warn!(self.dev, "owner-probe: preconditions not met; no context selected\n");
+            return;
+        }
+        let Some(identities) = self.enclave_identities_for(SBIO_PROBE_USER_ID) else {
+            dev_warn!(self.dev, "owner-probe: identity count unavailable; no context selected\n");
+            return;
+        };
+        let Some(proof) = crate::sbio::NoExistingCatacomb::from_zero_identities(identities.len()) else {
+            dev_warn!(self.dev, "owner-probe: enclave identity exists; no context selected\n");
+            return;
+        };
+
+        // This is destructive to the enclave's *volatile* current context.
+        // It is opt-in and only reached after proving zero live identities.
+        let system = crate::sbio::sbio_select_context(crate::sbio::ContextScope::SYSTEM, &proof);
+        if self.sbio_expect_ok(&system).is_none() {
+            dev_warn!(self.dev, "owner-probe: system context selection refused\n");
+            return;
+        }
+        let state = self.read_component_states().and_then(|reply| {
+            crate::sbio::ComponentStates::new(&reply)
+                .state_for(crate::sbio::CatacombUser::OWNER.value())
+        });
+        dev_info!(self.dev, "owner-probe: selected owner component state {:?}\n", state);
+        if !matches!(state, Some(value) if value & crate::sbio::COMPONENT_STATE_ACTIVE != 0) {
+            return;
+        }
+        let saved = self.save_catacomb(
+            crate::sbio::CatacombUser::OWNER,
+            PRIVATE_TYPE_CATACOMB_OWNER,
+            c"owner catacomb (user 501) diagnostic",
+        );
+        dev_warn!(self.dev, "owner-probe: owner SAVE_CATACOMB and CONFIRM_SAVE completed {}\n", saved);
+    }
+
     fn restore_all_components(&self) -> bool {
         // 0x6b is re-read before every component, not once up front.
         let user_id = SBIO_PROBE_USER_ID;
@@ -384,27 +505,34 @@ impl SepData {
         let mut missing_files = false;
         let mut user_outcome = RestoreOutcome::NoStoredFile;
 
-        // 0x8002 (cold transition) is a success only on the owner component.
-        for (id, kind, what, cold_ok) in [
+        // A 0x8002 reply is not sufficient evidence of restoration. Re-read
+        // the component state for every load, including the user component.
+        for (id, kind, what) in [
             (
                 crate::sbio::CatacombUser::MASTER.value(),
                 PRIVATE_TYPE_CATACOMB_MASTER,
                 c"master catacomb",
-                false,
             ),
             (
                 crate::sbio::CatacombUser::OWNER.value(),
                 PRIVATE_TYPE_CATACOMB_OWNER,
                 c"owner catacomb",
-                true,
             ),
-            (user_id, PRIVATE_TYPE_CATACOMB_USER, c"user catacomb", false),
+            (user_id, PRIVATE_TYPE_CATACOMB_USER, c"user catacomb"),
         ] {
             let Some(reply) = self.read_component_states() else {
                 return false;
             };
             let states = crate::sbio::ComponentStates::new(&reply);
-            let outcome = self.restore_catacomb(states.state_for(id), id, kind, what, cold_ok);
+            let state = states.state_for(id);
+            let outcome = self.restore_catacomb(state, id, kind, what);
+            dev_info!(
+                self.dev,
+                "sbio: restore {} state {:?} outcome {:?}\n",
+                what,
+                state,
+                outcome
+            );
             match outcome {
                 RestoreOutcome::Restored | RestoreOutcome::AlreadyActive => any = true,
                 RestoreOutcome::NoStoredFile => missing_files = true,
@@ -419,7 +547,9 @@ impl SepData {
             user_outcome,
             RestoreOutcome::Restored | RestoreOutcome::AlreadyActive
         );
-        let lockout = match self.restore_lockout() {
+        let lockout_outcome = self.restore_lockout();
+        dev_info!(self.dev, "sbio: restore lockout outcome {:?}\n", lockout_outcome);
+        let lockout = match lockout_outcome {
             RestoreOutcome::Restored | RestoreOutcome::AlreadyActive => true,
             RestoreOutcome::EmptyTolerated => true,
             RestoreOutcome::NoStoredFile => {
@@ -432,7 +562,7 @@ impl SepData {
         if missing_files {
             dev_warn!(
                 self.dev,
-                "sbio: at least one of four artefacts has no file on disk; if enrolled before the four-artefact save, re-enrol once to write all four\n"
+                "sbio: at least one catacomb/lockout file is absent; match readiness depends on the user restore and device-view proof\n"
             );
         }
 
@@ -459,7 +589,6 @@ impl SepData {
         id: i32,
         kind: u8,
         what: &CStr,
-        cold_ok: bool,
     ) -> RestoreOutcome {
         let Some(state) = state else {
             return RestoreOutcome::Failed;
@@ -492,16 +621,54 @@ impl SepData {
                     }
                     Ok(done)
                         if done.status.answered()
-                            == Some(crate::sbio::SBIO_STATUS_COLD_TRANSITION)
-                            && cold_ok =>
-                    {
-                        self.confirm_active(id, what, LoadAnswer::ColdTransition)
-                    }
-                    Ok(done)
-                        if done.status.answered()
                             == Some(crate::sbio::SBIO_STATUS_COLD_TRANSITION) =>
                     {
-                        RestoreOutcome::Failed
+                        let active = self.confirm_active(id, what, LoadAnswer::ColdTransition);
+                        if id != SBIO_PROBE_USER_ID
+                            || !matches!(&active, RestoreOutcome::Restored)
+                        {
+                            return active;
+                        }
+                        match self.log_identity_count(c"after first user cold-transition load") {
+                            Some(n) if n > 0 => return active,
+                            Some(0) => {}
+                            _ => return RestoreOutcome::Failed,
+                        }
+
+                        // Diagnostic only: one idempotent retry of the same
+                        // host blob, with no context reset or save. An active
+                        // state by itself did not prove a live identity on J414s.
+                        let second = self.sbio_transfer_raw(
+                            request.opcode(), request.name(), request.payload()
+                        );
+                        let answer = match second {
+                            Ok(done) if done.status.is_ok() => LoadAnswer::StatusZero,
+                            Ok(done)
+                                if done.status.answered()
+                                    == Some(crate::sbio::SBIO_STATUS_COLD_TRANSITION) =>
+                            {
+                                LoadAnswer::ColdTransition
+                            }
+                            Ok(done)
+                                if done.status.answered()
+                                    == Some(crate::sbio::SBIO_STATUS_ALREADY_ACTIVE) =>
+                            {
+                                LoadAnswer::AlreadyActive
+                            }
+                            Ok(done) => {
+                                dev_warn!(self.dev, "sbio: second user LOAD_CATACOMB refused with status {}\n", done.status);
+                                return RestoreOutcome::Failed;
+                            }
+                            Err(e) => {
+                                dev_warn!(self.dev, "sbio: second user LOAD_CATACOMB transfer failed ({:?})\n", e);
+                                return RestoreOutcome::Failed;
+                            }
+                        };
+                        let active = self.confirm_active(id, what, answer);
+                        match (active, self.log_identity_count(c"after second user cold-transition load")) {
+                            (RestoreOutcome::Restored, Some(n)) if n > 0 => RestoreOutcome::Restored,
+                            _ => RestoreOutcome::Failed,
+                        }
                     }
                     // 0x101 ALREADY_ACTIVE is a success
                     Ok(done)
@@ -510,7 +677,14 @@ impl SepData {
                     {
                         self.confirm_active(id, what, LoadAnswer::AlreadyActive)
                     }
-                    _ => RestoreOutcome::Failed,
+                    Ok(done) => {
+                        dev_warn!(self.dev, "sbio: {} LOAD_CATACOMB refused with status {}\n", what, done.status);
+                        RestoreOutcome::Failed
+                    }
+                    Err(e) => {
+                        dev_warn!(self.dev, "sbio: {} LOAD_CATACOMB transfer failed ({:?})\n", what, e);
+                        RestoreOutcome::Failed
+                    }
                 }
             }
         }
@@ -528,7 +702,9 @@ impl SepData {
         };
         let states = crate::sbio::ComponentStates::new(&reply);
 
-        match states.state_for(id) {
+        let state = states.state_for(id);
+        dev_info!(self.dev, "sbio: {} LOAD_CATACOMB answered {} with post-load state {:?}\n", what, answer.describe(), state);
+        match state {
             Some(state) if state & crate::sbio::COMPONENT_STATE_ACTIVE != 0 => {
                 RestoreOutcome::Restored
             }
@@ -575,7 +751,14 @@ impl SepData {
     }
 
     fn save_all_components(&self, user: crate::sbio::UserId) -> bool {
-        let mut all = true;
+        if *module_parameters::j414s_persistent_enrol.value() != 0 {
+            return self.save_all_components_user_first(user);
+        }
+        // On m2fix11, a completed enrollment marked both master and user 0x7,
+        // but saving and confirming the user first was followed by master
+        // SAVE_CATACOMB status 0x6. Try the master before the user at this
+        // completion gate; post-match persistence keeps its separate order.
+        // Re-read state before each save and never send an unconditional one.
         for (who, kind, what) in [
             (
                 crate::sbio::CatacombUser::MASTER,
@@ -593,14 +776,94 @@ impl SepData {
                 c"user catacomb",
             ),
         ] {
-            if !self.save_catacomb(who, kind, what) {
-                all = false;
+            let Some(reply) = self.read_component_states() else {
+                dev_err!(self.dev, "enrol: cannot read component state before saving {}\n", what);
+                return false;
+            };
+            let states = crate::sbio::ComponentStates::new(&reply);
+            let Some(state) = states.state_for(who.value()) else {
+                dev_err!(self.dev, "enrol: {} is absent at enrollment completion\n", what);
+                return false;
+            };
+            dev_info!(self.dev, "enrol: completed {} state 0x{:x}\n", what, state);
+            if state & crate::sbio::COMPONENT_STATE_ACTIVE == 0 {
+                dev_err!(self.dev, "enrol: {} is not active at enrollment completion\n", what);
+                return false;
+            }
+            if state & crate::sbio::COMPONENT_STATE_SAVE_PENDING != 0 {
+                if !self.save_catacomb(who, kind, what) {
+                    return false;
+                }
+            } else if who.value() == user.value() {
+                dev_err!(self.dev, "enrol: completed user catacomb is not marked for saving\n");
+                return false;
+            }
+            if (who.value() == user.value()
+                || who.value() == crate::sbio::CatacombUser::MASTER.value())
+                && crate::catacomb::read(kind).is_none()
+            {
+                dev_err!(self.dev, "enrol: {} has no durable host file\n", what);
+                return false;
             }
         }
         if !self.save_lockout() {
-            all = false;
+            dev_err!(self.dev, "enrol: lockout persistence failed\n");
+            return false;
         }
-        all
+        true
+    }
+
+    fn save_all_components_user_first(&self, user: crate::sbio::UserId) -> bool {
+        if crate::catacomb::read(PRIVATE_TYPE_CATACOMB_OWNER).is_none() {
+            dev_err!(self.dev, "enrol: opt-in completion has no owner Catacomb file\n");
+            return false;
+        }
+        // Post-match persistence saves the user before the master because the
+        // user save can change system material. Test that order for a completed
+        // J414s enrollment, without changing the default path on other Macs.
+        for (who, kind, what) in [
+            (
+                crate::sbio::CatacombUser::enrolling(user),
+                PRIVATE_TYPE_CATACOMB_USER,
+                c"opt-in completed user catacomb",
+            ),
+            (
+                crate::sbio::CatacombUser::MASTER,
+                PRIVATE_TYPE_CATACOMB_MASTER,
+                c"opt-in post-user master catacomb",
+            ),
+        ] {
+            let Some(reply) = self.read_component_states() else {
+                dev_err!(self.dev, "enrol: opt-in cannot read state before saving {}\n", what);
+                return false;
+            };
+            let state = crate::sbio::ComponentStates::new(&reply).state_for(who.value());
+            dev_info!(self.dev, "enrol: opt-in {} state {:?}\n", what, state);
+            let Some(state) = state else {
+                return false;
+            };
+            if state & crate::sbio::COMPONENT_STATE_ACTIVE == 0 {
+                return false;
+            }
+            if who.value() == user.value()
+                && state & crate::sbio::COMPONENT_STATE_SAVE_PENDING == 0
+            {
+                dev_err!(self.dev, "enrol: opt-in user catacomb is not save-pending\n");
+                return false;
+            }
+            if !self.save_catacomb(who, kind, what) {
+                return false;
+            }
+            if crate::catacomb::read(kind).is_none() {
+                dev_err!(self.dev, "enrol: opt-in {} has no durable host file\n", what);
+                return false;
+            }
+        }
+        if !self.save_lockout() {
+            dev_err!(self.dev, "enrol: opt-in lockout persistence failed\n");
+            return false;
+        }
+        true
     }
 
     fn save_after_match(&self, user: crate::sbio::UserId) -> bool {
@@ -612,28 +875,45 @@ impl SepData {
             return false;
         }
 
-        if !self.save_catacomb(
-            crate::sbio::CatacombUser::enrolling(user),
-            PRIVATE_TYPE_CATACOMB_USER,
-            c"post-match user catacomb",
-        ) {
-            dev_err!(
-                self.dev,
-                "verify: post-match user-catacomb persistence failed; the next boot may reject the older AP blob\n"
-            );
-            return false;
-        }
-
-        if !self.save_catacomb(
-            crate::sbio::CatacombUser::MASTER,
-            PRIVATE_TYPE_CATACOMB_MASTER,
-            c"post-match system (id -1) material snapshot",
-        ) {
-            dev_err!(
-                self.dev,
-                "verify: post-match system material snapshot failed; next boot may reinstall pre-match material and the user load could cold-transition (0x8002)\n"
-            );
-            return false;
+        // Matching can update a template without making every component
+        // saveable. The user must be considered before the master, and 0x6b
+        // must be re-read after each save because saving the user can change
+        // the master's state. Never claim persistence without host copies.
+        for (who, kind, what) in [
+            (
+                crate::sbio::CatacombUser::enrolling(user),
+                PRIVATE_TYPE_CATACOMB_USER,
+                c"post-match user catacomb",
+            ),
+            (
+                crate::sbio::CatacombUser::MASTER,
+                PRIVATE_TYPE_CATACOMB_MASTER,
+                c"post-match master catacomb",
+            ),
+        ] {
+            let Some(reply) = self.read_component_states() else {
+                dev_err!(self.dev, "verify: cannot read state before saving {}\n", what);
+                return false;
+            };
+            let states = crate::sbio::ComponentStates::new(&reply);
+            let Some(state) = states.state_for(who.value()) else {
+                dev_err!(self.dev, "verify: {} is absent after matching\n", what);
+                return false;
+            };
+            if state & crate::sbio::COMPONENT_STATE_ACTIVE == 0 {
+                dev_err!(self.dev, "verify: {} is not active after matching (state 0x{:x})\n", what, state);
+                return false;
+            }
+            if state & crate::sbio::COMPONENT_STATE_SAVE_PENDING != 0
+                && !self.save_catacomb(who, kind, what)
+            {
+                dev_err!(self.dev, "verify: {} persistence failed\n", what);
+                return false;
+            }
+            if crate::catacomb::read(kind).is_none() {
+                dev_err!(self.dev, "verify: {} has no durable host file\n", what);
+                return false;
+            }
         }
 
         if !self.resnapshot_identity_keybag() {
@@ -647,33 +927,49 @@ impl SepData {
         true
     }
 
-    fn save_catacomb(&self, who: crate::sbio::CatacombUser, kind: u8, _what: &CStr) -> bool {
+    fn save_catacomb(&self, who: crate::sbio::CatacombUser, kind: u8, what: &CStr) -> bool {
         let selector = crate::sbio::SaveSelector::new(who);
 
-        let Some(blob) = self.sbio_expect_ok(&crate::sbio::sbio_save_catacomb(&selector)) else {
-            return false;
+        let save = match self.sbio_transfer(&crate::sbio::sbio_save_catacomb(&selector)) {
+            Ok(done) if done.status.is_ok() => done,
+            Ok(done) => {
+                dev_err!(self.dev, "enrol: {} SAVE_CATACOMB refused with status {}\n", what, done.status);
+                return false;
+            }
+            Err(e) => {
+                dev_err!(self.dev, "enrol: {} SAVE_CATACOMB transfer failed ({:?})\n", what, e);
+                return false;
+            }
         };
+        let blob = save.payload;
         if blob.len() < crate::sbio::SBIO_SAVED_MIN || blob.len() > crate::sbio::SBIO_SAVED_MAX {
+            dev_err!(self.dev, "enrol: {} SAVE_CATACOMB returned invalid length {}\n", what, blob.len());
             return false;
         }
 
         let at = crate::sbio::SBIO_SAVED_USER_ID_AT;
         let carried = i32::from_le_bytes([blob[at], blob[at + 1], blob[at + 2], blob[at + 3]]);
         if carried != who.value() {
+            dev_err!(self.dev, "enrol: {} SAVE_CATACOMB returned user id {}, expected {}\n", what, carried, who.value());
             return false;
         }
 
         if crate::catacomb::write(kind, &blob).is_err() {
+            dev_err!(self.dev, "enrol: {} SAVE_CATACOMB host persistence failed\n", what);
             return false;
         }
 
-        if self
-            .sbio_expect_ok(&crate::sbio::sbio_confirm_save(&selector))
-            .is_none()
-        {
-            return false;
+        match self.sbio_transfer(&crate::sbio::sbio_confirm_save(&selector)) {
+            Ok(done) if done.status.is_ok() => true,
+            Ok(done) => {
+                dev_err!(self.dev, "enrol: {} CONFIRM_SAVE refused with status {}\n", what, done.status);
+                false
+            }
+            Err(e) => {
+                dev_err!(self.dev, "enrol: {} CONFIRM_SAVE transfer failed ({:?})\n", what, e);
+                false
+            }
         }
-        true
     }
 
     fn save_lockout(&self) -> bool {
@@ -855,8 +1151,9 @@ impl SepData {
         self.sks_designate_user_keybag(handle, stored.secret());
         self.sks_machine_refkey(handle, stored.secret());
         let prepared = self.cold_match_continue(handle, uuid);
-        self.ensure_restored_after(prepared);
         self.attach_bringup();
+        self.ensure_restored_after(prepared);
+        self.probe_owner_export();
         self.touchid_started.store(true, Relaxed);
         Ok(())
     }
@@ -878,7 +1175,7 @@ impl SepData {
         if !self.templates_restored.load(Relaxed) {
             dev_err!(
                 self.dev,
-                "verify: refusing before touching the sensor; cold-match prep or restore did not complete, enclave holds no template (every match refused 0x1). A restore failure, not a non-matching finger\n"
+                "verify: refusing before touching the sensor; cold-match prep, restore, or device-view identity proof did not complete. This is not a non-matching finger\n"
             );
             self.finish_verify(
                 bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE),
@@ -1031,6 +1328,8 @@ impl SepData {
     }
 
     pub(crate) fn run_enrolment(&self) {
+        self.enrol_frames_accepted.store(0, Relaxed);
+
         if !self.bring_sensor_online() {
             self.finish_enrolment(Err(ENROL_STATUS_SENSOR));
             let _ = sensor::idle();
@@ -1038,6 +1337,7 @@ impl SepData {
         }
 
         let Some(open) = self.begin_enrolment_on_enclave() else {
+            dev_err!(self.dev, "enrol: the enclave would not start an enrolment; see the preceding step\n");
             self.finish_enrolment(Err(ENROL_STATUS_ENCLAVE));
             let _ = sensor::idle();
             return;
@@ -1045,6 +1345,7 @@ impl SepData {
 
         let mut counter: u32 = 0;
         let mut enrolment_completed = false;
+        let mut enrolment_persisted = false;
         let mut identity: Option<[u8; bio::UUID_LEN]> = None;
 
         let outcome = loop {
@@ -1104,18 +1405,18 @@ impl SepData {
 
             if let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) {
                 if !self.save_all_components(user) {
-                    dev_warn!(
+                    dev_err!(
                         self.dev,
-                        "enrol: enrolment succeeded but at least one of four artefacts was not persisted; works until the next reboot (see which component above)\n"
+                        "enrol: enclave completed but Catacomb persistence failed; not reporting enrollment success\n"
+                    );
+                } else if !self.resnapshot_identity_keybag() {
+                    dev_err!(
+                        self.dev,
+                        "enrol: Catacombs saved but identity-bag snapshot failed; not reporting enrollment success\n"
                     );
                 } else {
                     self.templates_restored.store(true, Relaxed);
-                    if !self.resnapshot_identity_keybag() {
-                        dev_warn!(
-                            self.dev,
-                            "enrol: catacombs saved but post-commit identity-bag snapshot was not; template works this boot but is not reboot-persistent\n"
-                        );
-                    }
+                    enrolment_persisted = true;
                 }
             }
 
@@ -1129,10 +1430,10 @@ impl SepData {
         self.note_capture_end();
 
         if let Some(result) = outcome {
-            let filed = match (result, identity) {
-                (Ok(()), Some(uuid)) => Ok(uuid),
-                (Ok(()), None) => Err(ENROL_STATUS_UNFILED),
-                (Err(status), _) => Err(status),
+            let filed = match (result, identity, enrolment_persisted) {
+                (Ok(()), Some(uuid), true) => Ok(uuid),
+                (Ok(()), _, _) => Err(ENROL_STATUS_UNFILED),
+                (Err(status), _, _) => Err(status),
             };
             self.finish_enrolment(filed);
         }
@@ -1140,14 +1441,17 @@ impl SepData {
 
     fn register_sensor(&self, id: &sensor::Identifier) -> bool {
         let stage = self.bringup.load(Relaxed);
+        dev_info!(self.dev, "sbio: registering sensor at bring-up stage {}\n", stage);
 
         if stage >= BRINGUP_ESTABLISHED {
+            let _ = self.log_identity_count(c"before CLEAR_STATE for sensor re-registration");
             if self
                 .sbio_expect_ok(&crate::sbio::sbio_clear_state())
                 .is_none()
             {
                 return false;
             }
+            let _ = self.log_identity_count(c"after CLEAR_STATE for sensor re-registration");
         }
 
         if stage == BRINGUP_FRESH {
@@ -1173,6 +1477,7 @@ impl SepData {
         match self.sbio_call(&op) {
             SbioOutcome::Ok(_payload) => {
                 self.bringup.store(BRINGUP_ESTABLISHED, Relaxed);
+                let _ = self.log_identity_count(c"after sensor serial registration");
                 true
             }
             _ => false,
@@ -1330,6 +1635,7 @@ impl SepData {
 
         if listed && !self.device_view_synced.xchg(true, Relaxed) {
             let count = self.log_identity_count(c"after device-view synchronisation");
+            dev_info!(self.dev, "sbio: device-view identity count {:?}, restore-ready before proof {}\n", count, self.templates_restored.load(Relaxed));
             match count {
                 Some(0) => {
                     self.templates_restored.store(false, Relaxed);
@@ -1348,9 +1654,12 @@ impl SepData {
                     self.templates_restored.store(false, Relaxed);
                 }
             }
+            dev_info!(self.dev, "sbio: restore-ready after device-view proof {}\n", self.templates_restored.load(Relaxed));
             if self.templates_restored.load(Relaxed) {
                 self.reconcile_identities();
             }
+        } else if !listed {
+            dev_warn!(self.dev, "sbio: device-view synchronisation or match policy unavailable\n");
         }
 
         true
@@ -1613,10 +1922,11 @@ impl SepData {
         };
 
         let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            dev_err!(self.dev, "enrol: invalid user id before image processing\n");
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
         if self
-            .sbio_expect_ok(&crate::sbio::sbio_prepare_image_processing())
+            .sbio_enrol_step(&crate::sbio::sbio_prepare_image_processing())
             .is_none()
         {
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
@@ -1631,7 +1941,7 @@ impl SepData {
             user,
             crate::shim::monotonic_ns(),
         );
-        if self.sbio_expect_ok(&init).is_none() {
+        if self.sbio_enrol_step(&init).is_none() {
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
 
@@ -1641,10 +1951,11 @@ impl SepData {
         }
         drop(capture);
 
-        let Some(assessment) = self.sbio_expect_ok(&crate::sbio::sbio_image_assessment()) else {
+        let Some(assessment) = self.sbio_enrol_step(&crate::sbio::sbio_image_assessment()) else {
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
         if assessment.len() < crate::sbio::ASSESS_MIN_LEN {
+            dev_err!(self.dev, "enrol: image assessment short ({} bytes)\n", assessment.len());
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
         let usable = assessment[crate::sbio::ASSESS_USABLE_ENROL] != 0;
@@ -1652,10 +1963,11 @@ impl SepData {
             return ImageOutcome::Retry;
         }
 
-        let Some(result) = self.sbio_expect_ok(&crate::sbio::sbio_enrolment_result()) else {
+        let Some(result) = self.sbio_enrol_step(&crate::sbio::sbio_enrolment_result()) else {
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
         let Some(parsed) = crate::sbio::EnrolmentResult::parse(&result) else {
+            dev_err!(self.dev, "enrol: malformed enrolment result ({} bytes)\n", result.len());
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
 
@@ -1664,11 +1976,17 @@ impl SepData {
         }
 
         let percent = parsed.progress_percent();
+        // Coverage can stop changing while SEP continues accepting frames.
+        // Count accepted captures so each one remains visible to libfprint.
+        let accepted = self.enrol_frames_accepted.fetch_add(1, Relaxed) + 1;
+        let stage = if parsed.complete() {
+            bio::ENROL_STAGES
+        } else {
+            accepted.min(bio::ENROL_STAGES - 1)
+        };
 
         ImageOutcome::Progress {
-            stage: (percent * bio::ENROL_STAGES)
-                .div_ceil(100)
-                .min(bio::ENROL_STAGES),
+            stage,
             percent,
             complete: parsed.complete(),
             has_template: parsed.has_template(),
@@ -2082,6 +2400,16 @@ impl SepData {
         if cmd == bio::IOC_ATTEST {
             return self.bio_attest(arg);
         }
+        // Query SEP outside the bio session/index locks. A host index can
+        // outlive its SEP identity after a failed cold restore; userspace
+        // must not mistake that index for proof of a live template.
+        let live_identity_count = if cmd == bio::IOC_GET_INFO
+            && self.touchid_started.load(Relaxed)
+        {
+            self.enclave_identity_count()
+        } else {
+            None
+        };
         let handled = {
             let mut session = self.bio_session.lock();
             let index = self.bio_index.lock();
@@ -2089,6 +2417,7 @@ impl SepData {
                 session: &mut session,
                 index: &index,
                 sensor_present: self.sensor_present.load(Relaxed),
+                live_identity_count,
             };
             bio::ioctl(&mut ctx, cmd, arg)?
         };
@@ -2146,32 +2475,42 @@ impl SepData {
         })
     }
 
-    fn ensure_restored_after(&self, _prepared: bool) {
-        let restored = self.restore_all_components();
-        self.templates_restored.store(restored, Relaxed);
-        if !restored {
-            dev_err!(
-                self.dev,
-                "matching unavailable this boot: restore did not complete, enclave holds no template (every match refused 0x1). Not the sensor or the finger; on-disk enrolments intact\n"
-            );
-            return;
-        }
-
+    fn ensure_restored_after(&self, prepared: bool) {
+        // Probe credential ordering without assuming it fixes cold restore.
+        // J414s still answered 0x8002 and listed zero identities with this
+        // credential established, so the identity proof below remains required.
+        let mut unlocked = false;
         if self.keybag_designated.load(Relaxed) {
             if let Some(user) = crate::sks::DesignateUser::new(SBIO_PROBE_USER_ID) {
                 let special = user.special_handle();
                 if let Ok(keybag::State::Present(stored)) = keybag::read(keybag::Slot::Identity) {
-                    let _ = self.sks_step(crate::sks::SKS_LOCK_STATE_NAME, |healthy| {
+                    unlocked = self.sks_step(crate::sks::SKS_LOCK_STATE_NAME, |healthy| {
                         self.sks_req_unlock_special(special, stored.secret(), healthy)
-                    });
+                    }).is_some();
                 }
             }
         }
+        let match_context = crate::sbio::UserId::new(SBIO_PROBE_USER_ID)
+            .map(|user| self.establish_scrd_match_context(user))
+            .unwrap_or(false);
+        dev_info!(self.dev, "sbio: pre-restore special unlock {}, SCRD match context {}\n", unlocked, match_context);
 
-        // enclave's match arm asserts a non-empty ACM context (<= 32 bytes)
-        if let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) {
-            self.establish_scrd_match_context(user);
+        let restored = self.restore_all_components();
+        dev_info!(self.dev, "sbio: cold-match preparation {}, component restore {}\n", prepared, restored);
+        let identities = self.log_identity_count(c"after Catacomb restore with sensor registered");
+        let identity_ready = matches!(identities, Some(n) if n > 0);
+        let ready = prepared && match_context && restored && identity_ready
+            && self.device_view_synced.load(Relaxed) && self.prove_restore();
+        self.templates_restored.store(ready, Relaxed);
+        if !ready {
+            dev_err!(
+                self.dev,
+                "matching unavailable this boot: cold-match preparation, SCRD credential, Catacomb restore, device view, or identity proof did not complete; template state is unproven\n"
+            );
+            return;
         }
+        self.reconcile_identities();
+
     }
 
     fn cold_match_continue(
@@ -2260,13 +2599,22 @@ impl SepData {
         true
     }
 
-    fn log_identity_count(&self, _when: &CStr) -> Option<usize> {
+    fn enclave_identity_count(&self) -> Option<usize> {
         let op = crate::sbio::sbio_list_identities();
         let SbioOutcome::Ok(reply) = self.sbio_call(&op) else {
             return None;
         };
         let records = crate::sbio::IdentityRecords::new(&reply)?;
         Some(records.count())
+    }
+
+    fn log_identity_count(&self, when: &CStr) -> Option<usize> {
+        let Some(count) = self.enclave_identity_count() else {
+            dev_warn!(self.dev, "sbio: identity list unavailable {}\n", when);
+            return None;
+        };
+        dev_info!(self.dev, "sbio: identity count {} {}\n", count, when);
+        Some(count)
     }
 
     fn enclave_lists(&self, uuid: &[u8; bio::UUID_LEN]) -> Option<bool> {
@@ -2728,7 +3076,9 @@ static_assert!(SBIO_STATUS_ALREADY_ACTIVE != SBIO_STATUS_COLD_TRANSITION);
 
 pub(crate) const COMPONENT_STATE_COLD: u32 = 0x1;
 pub(crate) const COMPONENT_STATE_ACTIVE: u32 = 0x2;
+pub(crate) const COMPONENT_STATE_SAVE_PENDING: u32 = 0x4;
 static_assert!(COMPONENT_STATE_COLD != COMPONENT_STATE_ACTIVE);
+static_assert!(COMPONENT_STATE_SAVE_PENDING & (COMPONENT_STATE_COLD | COMPONENT_STATE_ACTIVE) == 0);
 
 pub(crate) const COMPONENT_PAIR_LEN: usize = 8;
 

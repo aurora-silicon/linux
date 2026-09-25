@@ -49,7 +49,9 @@ enum MatchResult {
     NotCompared = 2,
 }
 
-pub(crate) const ENROL_STAGES: u32 = 8;
+// A stage is an accepted capture, not a bucket of SEP's coverage percentage.
+// Leave the final stage for the completed template.
+pub(crate) const ENROL_STAGES: u32 = 16;
 
 const TOKEN_LIFETIME_NS: u64 = 10 * 1_000_000_000;
 
@@ -180,7 +182,7 @@ ioctl_pod! {
 
 const MAGIC: u32 = 0xB1;
 
-const IOC_GET_INFO: u32 = _IOR::<Info>(MAGIC, 0x01);
+pub(crate) const IOC_GET_INFO: u32 = _IOR::<Info>(MAGIC, 0x01);
 const IOC_LIST: u32 = _IOR::<List>(MAGIC, 0x02);
 const IOC_ENROL_START: u32 = _IOW::<EnrolStart>(MAGIC, 0x03);
 const IOC_ENROL_POLL: u32 = _IOR::<EnrolPoll>(MAGIC, 0x04);
@@ -414,6 +416,7 @@ pub(crate) struct Session {
     open: bool,
     op: Op,
     unseen: bool,
+    enrol_stage_unseen: bool,
     token: Option<ResultToken>,
 }
 
@@ -423,6 +426,7 @@ impl Session {
             open: false,
             op: Op::Idle,
             unseen: false,
+            enrol_stage_unseen: false,
             token: None,
         }
     }
@@ -431,6 +435,7 @@ impl Session {
         self.open = false;
         self.op = Op::Idle;
         self.unseen = false;
+        self.enrol_stage_unseen = false;
         self.token = None;
     }
 
@@ -443,6 +448,7 @@ pub(crate) struct Context<'a> {
     pub(crate) session: &'a mut Session,
     pub(crate) index: &'a IdentityIndex,
     pub(crate) sensor_present: bool,
+    pub(crate) live_identity_count: Option<usize>,
 }
 
 pub(crate) struct Handled {
@@ -505,7 +511,14 @@ fn get_info(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         enrolled: ctx.index.total() as u32,
         capacity: MAX_IDENTITIES as u32,
         enroll_stages: ENROL_STAGES,
-        reserved: [0; 3],
+        // reserved[0] is a validity flag. A zero count is only meaningful
+        // when SEP itself successfully answered LIST_IDENTITIES; older
+        // kernels and unavailable SEP contexts leave this flag clear.
+        reserved: [
+            u32::from(ctx.live_identity_count.is_some()),
+            ctx.live_identity_count.unwrap_or(0) as u32,
+            0,
+        ],
     };
     UserSlice::new(user, core::mem::size_of::<Info>())
         .writer()
@@ -557,6 +570,8 @@ fn enrol_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         guidance: Guidance::Place,
         percent: 0,
     };
+    ctx.session.unseen = false;
+    ctx.session.enrol_stage_unseen = false;
     Ok(Handled {
         ret: 0,
         wake: false,
@@ -586,6 +601,7 @@ pub(crate) fn enrol_advance(
             *percent = percent_now;
             *guidance = guide;
             session.unseen = true;
+            session.enrol_stage_unseen = true;
             return true;
         }
     }
@@ -661,7 +677,9 @@ fn enrol_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
             out.progress_percent = *percent;
             match terminal {
                 None => {
-                    out.state = if ctx.session.unseen {
+                    // Guidance also wakes the poller, but it is not an image
+                    // capture or a completed enrollment stage.
+                    out.state = if ctx.session.enrol_stage_unseen {
                         State::Progress
                     } else {
                         State::Pending
@@ -683,6 +701,7 @@ fn enrol_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         .writer()
         .write(&out)?;
     ctx.session.unseen = false;
+    ctx.session.enrol_stage_unseen = false;
     ok()
 }
 

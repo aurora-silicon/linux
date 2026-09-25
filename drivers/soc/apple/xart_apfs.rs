@@ -15,6 +15,8 @@ const ROOT_INFO_SIZE: usize = 40;
 const XART_ROLE: u16 = 0x100;
 const FILE_SIZE: u64 = 0x600000;
 const FS_UNENCRYPTED: u64 = 1;
+const INODE_WAS_CLONED: u64 = 0x10;
+const INODE_WAS_EVER_CLONED: u64 = 0x400;
 const MOD: u64 = 0xffff_ffff;
 
 fn le16(data: &[u8], off: usize) -> Result<u16> {
@@ -209,7 +211,74 @@ fn omap_lookup(
     Ok(paddr)
 }
 
-fn xart_extent(file: &shim::StoreFile, size: u64, vol: &[u8], xid: u64) -> Result<u64> {
+fn is_gigalocker_name(name: &[u8]) -> bool {
+    if name == b".gl" {
+        return true;
+    }
+    if name.len() != 39 || &name[36..] != b".gl" {
+        return false;
+    }
+    name[..36].iter().enumerate().all(|(i, byte)| {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            *byte == b'-'
+        } else {
+            byte.is_ascii_hexdigit()
+        }
+    })
+}
+
+fn validate_write_ownership(
+    file: &shim::StoreFile,
+    size: u64,
+    vol: &[u8],
+    xid: u64,
+    private_id: u64,
+    inode_flags: u64,
+    physical: u64,
+) -> Result<()> {
+    // This is deliberately narrower than general APFS write support. On the
+    // tested J414s the .gl file has one unshared, unsnapshotted extent. Never
+    // raw-write a clone, snapshot, pending revert, or unknown extent layout.
+    if le64(vol, 264)? != FS_UNENCRYPTED
+        || le64(vol, 216)? != 0
+        || le64(vol, 160)? != 0
+        || le64(vol, 168)? != 0
+        || inode_flags & (INODE_WAS_CLONED | INODE_WAS_EVER_CLONED) != 0
+    {
+        return Err(ENOTSUPP);
+    }
+    let tree_paddr = le64(vol, 144)?;
+    let tree = read_object(file, size, tree_paddr)?;
+    if le64(&tree, 8)? != tree_paddr
+        || le64(&tree, 16)? > xid
+        || le32(&tree, 24)? != 0x4000_0002
+        || le32(&tree, 28)? != 0x0f
+        || le16(&tree, 32)? != 3
+        || le16(&tree, 34)? != 0
+        || le32(&tree, 36)? != 1
+    {
+        return Err(ENOTSUPP);
+    }
+    let (key, val) = node_entry(&tree, 0, false)?;
+    if key.len() != 8
+        || val.len() < 20
+        || le64(key, 0)? != ((2u64 << 60) | physical)
+        || le64(val, 0)? != ((1u64 << 60) | (FILE_SIZE / BLOCK as u64))
+        || le64(val, 8)? != private_id
+        || le32(val, 16)? != 1
+    {
+        return Err(ENOTSUPP);
+    }
+    Ok(())
+}
+
+fn xart_extent(
+    file: &shim::StoreFile,
+    size: u64,
+    vol: &[u8],
+    xid: u64,
+    writes_enabled: bool,
+) -> Result<u64> {
     if le64(vol, 264)? & FS_UNENCRYPTED == 0 {
         return Err(ENOTSUPP);
     }
@@ -232,7 +301,7 @@ fn xart_extent(file: &shim::StoreFile, size: u64, vol: &[u8], xid: u64) -> Resul
         if name_len == 0 || 12 + name_len > key.len() || key[12 + name_len - 1] != 0 {
             return Err(EINVAL);
         }
-        if &key[12..12 + name_len - 1] == b".gl" {
+        if is_gigalocker_name(&key[12..12 + name_len - 1]) {
             if gl_file.replace(le64(val, 0)?).is_some() {
                 return Err(ENOTSUPP);
             }
@@ -240,12 +309,14 @@ fn xart_extent(file: &shim::StoreFile, size: u64, vol: &[u8], xid: u64) -> Resul
     }
     let gl_file = gl_file.ok_or(ENODATA)?;
     let mut private_id: Option<u64> = None;
+    let mut inode_flags: Option<u64> = None;
     for i in 0..count {
         let (key, val) = node_entry(&root, i, false)?;
         if key.len() >= 8 && le64(key, 0)? == ((3u64 << 60) | gl_file) {
             if val.len() < 92 || private_id.replace(le64(val, 8)?).is_some() {
                 return Err(EINVAL);
             }
+            inode_flags = Some(le64(val, 48)?);
         }
     }
     let private_id = private_id.ok_or(ENODATA)?;
@@ -265,11 +336,23 @@ fn xart_extent(file: &shim::StoreFile, size: u64, vol: &[u8], xid: u64) -> Resul
             return Err(EINVAL);
         }
     }
-    extent.ok_or(ENODATA)
+    let extent = extent.ok_or(ENODATA)?;
+    if writes_enabled {
+        validate_write_ownership(
+            file,
+            size,
+            vol,
+            xid,
+            private_id,
+            inode_flags.ok_or(ENODATA)?,
+            extent / BLOCK as u64,
+        )?;
+    }
+    Ok(extent)
 }
 
 /// Return the byte offset of the sole contiguous 6 MiB `.gl` file extent.
-pub(crate) fn locate(file: &shim::StoreFile) -> Result<u64> {
+pub(crate) fn locate(file: &shim::StoreFile, writes_enabled: bool) -> Result<u64> {
     let device_size = file.size()?;
     let base = read_object(file, device_size, 0)?;
     if &base[32..36] != b"NXSB" || le32(&base, 36)? != BLOCK as u32 {
@@ -331,7 +414,13 @@ pub(crate) fn locate(file: &shim::StoreFile) -> Result<u64> {
         }
         if le16(&vol, 964)? == XART_ROLE {
             if found
-                .replace(xart_extent(file, size, &vol, le64(&vol, 16)?)?)
+                .replace(xart_extent(
+                    file,
+                    size,
+                    &vol,
+                    le64(&vol, 16)?,
+                    writes_enabled,
+                )?)
                 .is_some()
             {
                 return Err(ENOTSUPP);

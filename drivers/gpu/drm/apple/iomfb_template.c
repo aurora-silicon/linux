@@ -936,7 +936,11 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	swap_id = cookie->swap_id;
 	kref_put(&cookie->refcount, release_swap_cookie);
 	if (ret <= 0) {
-		dcp->crashed = true;
+		/* A disconnected external display can power down before it ACKs this
+		 * clear swap. The deadline alone does not mean RTKit crashed; its
+		 * crash callback owns the fatal flag.
+		 */
+		dev_warn(dcp->dev, "clear swap timed out during power-off\n");
 		return;
 	}
 
@@ -1024,6 +1028,17 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 	 * integrated display. Ignore the hotplug_gated() callbacks there.
 	 */
 	if (dcp->main_display)
+		return;
+
+	/*
+	 * Deasserting synthetic Type-C HPD for DPMS is not a cable unplug.
+	 * Suppress only the disconnect: a real cable can be removed while the
+	 * CRTC is off and reinserted before it is re-enabled. Its connect event
+	 * must reach DRM or the connector stays disconnected indefinitely.
+	 */
+	if (dcp_is_typec_output(dcp) && !(*connected) &&
+	    READ_ONCE(dcp->typec_crtc_off) &&
+	    READ_ONCE(dcp->typec_cable_connected))
 		return;
 
 	if (dcp->during_modeset) {

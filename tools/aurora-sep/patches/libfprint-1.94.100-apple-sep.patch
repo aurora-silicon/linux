@@ -135,10 +135,10 @@ index 0000000..b2d2f43
 +#define AURORA_BIO_ATTEST       _IOWR(AURORA_BIO_IOC_MAGIC, 0x0a, struct aurora_bio_attest)
 diff --git a/libfprint/drivers/aurora/aurora.c b/libfprint/drivers/aurora/aurora.c
 new file mode 100644
-index 0000000..55f3311
+index 0000000..80ace06
 --- /dev/null
 +++ b/libfprint/drivers/aurora/aurora.c
-@@ -0,0 +1,829 @@
+@@ -0,0 +1,837 @@
 +/*
 + * Aurora SEP fingerprint driver
 + *
@@ -170,6 +170,7 @@ index 0000000..55f3311
 +
 +  gint      fd;
 +  guint     watch_id;
++  guint32   enroll_last_reported_stage;
 +
 +  guint8    nonce[AURORA_BIO_NONCE_LEN];
 +  gboolean  nonce_valid;
@@ -516,7 +517,13 @@ index 0000000..55f3311
 +      return G_SOURCE_CONTINUE;
 +
 +    case AURORA_BIO_STATE_PROGRESS:
-+      fpi_device_enroll_progress (device, poll_res.stage, NULL, NULL);
++      /* fprintd calls this "enroll-stage-passed". A guidance wakeup or an
++       * initial stage-zero event must not masquerade as a captured sample. */
++      if (poll_res.stage > self->enroll_last_reported_stage)
++        {
++          self->enroll_last_reported_stage = poll_res.stage;
++          fpi_device_enroll_progress (device, poll_res.stage, NULL, NULL);
++        }
 +      return G_SOURCE_CONTINUE;
 +
 +    case AURORA_BIO_STATE_DONE:
@@ -543,7 +550,7 @@ index 0000000..55f3311
 +      self->watch_id = 0;
 +      fpi_device_enroll_complete (device, NULL,
 +                                  fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
-+                                                            "enrolment failed, enclave status 0x%x",
++                                                            "enrolment failed, driver status 0x%x",
 +                                                            poll_res.status));
 +      return G_SOURCE_REMOVE;
 +    }
@@ -571,6 +578,7 @@ index 0000000..55f3311
 +      return;
 +    }
 +
++  self->enroll_last_reported_stage = 0;
 +  aurora_stop_watch (self);
 +  self->watch_id = g_unix_fd_add (self->fd, G_IO_IN, aurora_enrol_ready, device);
 +}
@@ -1177,3 +1185,13 @@ index ab09dc1..dfa7460 100644
      # Virtual drivers (test-only, optional)
      'virtual_image': { 'virtual': true, 'helper': ['virtual'], 'optional': true },
      'virtual_device': { 'virtual': true, 'helper': ['virtual'], 'optional': true },
+diff --git a/tests/meson.build b/tests/meson.build
+index aad0675..2147ef3 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -295,4 +295,4 @@ else
+-    foreach driver_test: drivers_tests
++    foreach driver_test, args: drivers_tests
+         test(driver_test,
+             sh,
+             args: ['-c', 'exit 77']

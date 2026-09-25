@@ -22,10 +22,23 @@
 		dcp = &dcp;
 		dcpext0 = &dcpext0;
 		dcpext1 = &dcpext1;
+		sep = &sep;
 		disp0 = &display;
 		disp0_piodma = &disp0_piodma;
 		keyboard = &keyboard;
 		sio = &sio;
+		usb4_0_rc = &usb4_0_acio;
+		usb4_0_pcie_adapter = &usb4_0_acio;
+		usb4_0_nhi = &usb4_0_nhi;
+		usb4_0_pcie = &apciec0;
+		usb4_1_rc = &usb4_1_acio;
+		usb4_1_pcie_adapter = &usb4_1_acio;
+		usb4_1_nhi = &usb4_1_nhi;
+		usb4_1_pcie = &apciec1;
+		usb4_2_rc = &usb4_2_acio;
+		usb4_2_pcie_adapter = &usb4_2_acio;
+		usb4_2_nhi = &usb4_2_nhi;
+		usb4_2_pcie = &apciec2;
 	};
 };
 

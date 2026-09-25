@@ -16,6 +16,16 @@ BLOCK = 4096
 MOD = 0xffffffff
 
 
+def is_gigalocker_name(name):
+    if name == b".gl":
+        return True
+    if len(name) != 39 or name[36:] != b".gl":
+        return False
+    return all(byte == ord("-") if i in (8, 13, 18, 23)
+               else byte in b"0123456789abcdefABCDEF"
+               for i, byte in enumerate(name[:36]))
+
+
 def u16(buf, off):
     return struct.unpack_from("<H", buf, off)[0]
 
@@ -136,6 +146,53 @@ def omap_lookup(disk, omap_paddr, oid, max_xid):
     return selected[2:]
 
 
+def validate_extent_references(entries, physical, blocks, private_id):
+    """Require one unshared extent-reference record for the whole .gl mapping."""
+    matches = []
+    for key, val in entries:
+        if len(key) != 8 or len(val) < 20:
+            raise ValueError("unsupported extent-reference record")
+        tagged = u64(key, 0)
+        if tagged >> 60 != 2:
+            raise ValueError("unexpected extent-reference key type")
+        start = tagged & ((1 << 60) - 1)
+        length_and_kind = u64(val, 0)
+        length = length_and_kind & ((1 << 60) - 1)
+        kind = length_and_kind >> 60
+        owner = u64(val, 8)
+        refcount = struct.unpack_from("<i", val, 16)[0]
+        if not length or start + length > (1 << 60):
+            raise ValueError("invalid extent-reference length")
+        if start < physical + blocks and physical < start + length:
+            if (start != physical or length != blocks or kind != 1 or
+                    owner != private_id or refcount != 1):
+                raise ValueError(".gl extent reference is shared or mismatched")
+            matches.append((start, length, kind, owner, refcount))
+    if len(matches) != 1:
+        raise ValueError("expected exactly one unshared .gl extent reference")
+    return matches[0]
+
+
+def inspect_extent_reference(disk, vol, physical, blocks, private_id):
+    snapshots = u64(vol, 216)
+    revert_xid, revert_sblock = u64(vol, 160), u64(vol, 168)
+    print("xart_volume_flags=0x%x snapshot_count=%d revert_xid=%d revert_sblock=%d" %
+          (u64(vol, 264), snapshots, revert_xid, revert_sblock))
+    if snapshots or revert_xid or revert_sblock:
+        raise ValueError("xART volume has snapshot or pending revert state")
+    tree_paddr = u64(vol, 144)
+    tree = disk.read(tree_paddr)
+    if (u64(tree, 8) != tree_paddr or u32(tree, 24) != 0x40000002 or
+            u32(tree, 28) != 0x0f):
+        raise ValueError("unsupported extent-reference tree")
+    level, flags, entries = node_entries(tree)
+    if level or flags & 3 != 3:
+        raise ValueError("multilevel extent-reference tree needs inspection")
+    match = validate_extent_references(entries, physical, blocks, private_id)
+    print("gigalocker_extent_reference_block_length_kind_owner_refcount=%s" %
+          (match,))
+
+
 def inspect(disk):
     base = disk.read(0)
     if base[32:36] != b"NXSB" or u32(base, 36) != BLOCK:
@@ -183,6 +240,7 @@ def inspect(disk):
         if level:
             raise ValueError("multilevel xART FS tree needs further inspection")
         files = []
+        names = []
         for key, val in entries:
             if len(key) < 12 or len(val) < 8:
                 continue
@@ -191,8 +249,10 @@ def inspect(disk):
                 name_len = u32(key, 8) & 0x3ff
                 if name_len and 12 + name_len <= len(key):
                     name = key[12:12 + name_len - 1]
-                    if name == b".gl":
+                    if is_gigalocker_name(name):
                         files.append(u64(val, 0))
+                        names.append(name.decode("ascii"))
+        print("gigalocker_file_names=%s" % names)
         print("gigalocker_file_ids=%s" % files)
         if len(files) != 1:
             raise ValueError("expected exactly one .gl file")
@@ -204,7 +264,6 @@ def inspect(disk):
         private_id, inode_flags = u64(inode, 8), u64(inode, 48)
         print("gigalocker_inode_private_id=%d flags=0x%x links=%d write_generation=%d" %
               (private_id, inode_flags, u32(inode, 56), u32(inode, 64)))
-        print("xart_volume_flags=0x%x snapshot_count=%d" % (u64(vol, 264), u32(disk.read(vol_omap), 36)))
         extents = []
         for key, val in entries:
             if len(key) >= 16 and len(val) >= 24 and u64(key, 0) == ((8 << 60) | private_id):
@@ -218,6 +277,8 @@ def inspect(disk):
         if not extents:
             raise ValueError("no .gl extents")
         if len(extents) == 1 and extents[0][0] == 0 and extents[0][1] == 0x600000:
+            inspect_extent_reference(disk, vol, extents[0][2],
+                                     extents[0][1] // BLOCK, private_id)
             inspect_raw_locator(disk, extents[0][2])
             scan_other_roots(disk, extents[0][2], extents[0][1])
 
