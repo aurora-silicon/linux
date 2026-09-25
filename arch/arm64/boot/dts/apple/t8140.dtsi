@@ -8,6 +8,7 @@
 #include <dt-bindings/interrupt-controller/apple-aic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/phy/phy.h>
 #include <dt-bindings/pinctrl/apple.h>
 #include <dt-bindings/spmi/spmi.h>
 
@@ -363,6 +364,19 @@
 			};
 		};
 
+		nub_spmi_a0: spmi@308908000 {
+			compatible = "apple,t8140-spmi", "apple,t8103-spmi";
+			reg = <0x3 0x08908000 0x0 0x100>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+			#interrupt-cells = <2>;
+			interrupt-controller;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 494 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_nub_spmi_a0>;
+			status = "disabled";
+		};
+
 		smc: smc@30c600000 {
 			compatible = "apple,t8140-smc", "apple,t8103-smc";
 			reg = <0x3 0x0c600000 0x0 0x4000>,
@@ -555,6 +569,66 @@
 					<&ps_apcie_phy_sw>;
 			power-domain-names = "ans", "apcie0", "apcie_phy";
 			resets = <&ps_ans>;
+			status = "disabled";
+		};
+
+		dwc3_0: usb@40a280000 {
+			compatible = "apple,t8140-dwc3", "apple,t8103-dwc3";
+			reg = <0x4 0x0a280000 0x0 0xcd00>,
+			      <0x4 0x0a28cd00 0x0 0x3200>;
+			reg-names = "dwc3-core", "dwc3-apple";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1244 IRQ_TYPE_LEVEL_HIGH>;
+			dr_mode = "otg";
+			usb-role-switch;
+			role-switch-default-mode = "host";
+			iommus = <&dwc3_0_dart_0 0>, <&dwc3_0_dart_1 1>;
+			power-domains = <&ps_atc0_usb>;
+			resets = <&atcphy0>;
+			phys = <&atcphy0 PHY_TYPE_USB2>, <&atcphy0 PHY_TYPE_USB3>;
+			phy-names = "usb2-phy", "usb3-phy";
+			status = "disabled";
+		};
+
+		dwc3_0_dart_0: iommu@40af00000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x4 0x0af00000 0x0 0xc000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1248 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc0_usb>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x00004000 0x0 0xffff0000>;
+			status = "disabled";
+		};
+
+		dwc3_0_dart_1: iommu@40af80000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x4 0x0af80000 0x0 0xc000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1248 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc0_usb>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x00004000 0x0 0xffff0000>;
+			status = "disabled";
+		};
+
+		atcphy0: phy@40b000000 {
+			compatible = "apple,t8140-atcphy";
+			reg = <0x4 0x0b000000 0x0 0x4c000>,
+			      <0x4 0x0b050000 0x0 0x4000>,
+			      <0x4 0x08000000 0x0 0x8000>,
+			      <0x4 0x0aa90000 0x0 0x4000>,
+			      <0x4 0x0aa84000 0x0 0x4000>,
+			      <0x4 0x0a300000 0x0 0x4000>;
+			reg-names = "core", "lpdptx", "axi2af", "usb2phy",
+				    "pipehandler", "usb2phy-reg";
+
+			#phy-cells = <1>;
+			#reset-cells = <0>;
+
+			orientation-switch;
+			mode-switch;
+			power-domains = <&ps_atc0_usb>;
 			status = "disabled";
 		};
 	};
