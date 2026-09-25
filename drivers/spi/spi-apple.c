@@ -545,6 +545,7 @@ static int apple_spi_probe(struct platform_device *pdev)
 	struct apple_spi *spi;
 	int ret, irq;
 	struct spi_controller *ctlr;
+	struct device_node *np;
 
 	ctlr = devm_spi_alloc_host(&pdev->dev, sizeof(struct apple_spi));
 	if (!ctlr)
@@ -577,7 +578,18 @@ static int apple_spi_probe(struct platform_device *pdev)
 	ctlr->bits_per_word_mask = SPI_BPW_RANGE_MASK(1, 32);
 	ctlr->prepare_message = apple_spi_prepare_message;
 	ctlr->set_cs = apple_spi_set_cs;
-	ctlr->set_cs_timing = apple_spi_set_cs_timing;
+	/*
+	 * Only the Mesa fingerprint sensor's bus uses the hardware CS delays.
+	 * The SPI core stops running software CS delays for every device on a
+	 * controller that provides set_cs_timing, so installing it everywhere
+	 * would move the keyboard, NOR flash and others off their working
+	 * timing, and the keyboard's inactive delay has no hardware form.
+	 */
+	np = of_get_compatible_child(pdev->dev.of_node, "apple,mesa-fingerprint");
+	if (np) {
+		ctlr->set_cs_timing = apple_spi_set_cs_timing;
+		of_node_put(np);
+	}
 	ctlr->transfer_one = apple_spi_transfer_one;
 	ctlr->use_gpio_descriptors = true;
 	ctlr->auto_runtime_pm = true;

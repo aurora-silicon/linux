@@ -1732,8 +1732,11 @@ impl SepData {
     fn tick_attach(this: &Arc<SepData>) {
         let now = this.rx_count.load(Relaxed);
 
-        // HW: the SEP takes ~265 ms to answer a registration
-        if now == 0 {
+        // HW: the SEP takes ~265 ms to answer a warm registration, and on the
+        // cold-boot path J316s starts discovery ~370 ms after the IMG4 ack.
+        // The boot acks count as traffic, so wait for the first endpoint, not
+        // the first message, or a quiet gap after IMG4 ends the attach early.
+        if this.endpoint_count() == 0 {
             let ticks = this.settle_idle_ticks.load(Relaxed).wrapping_add(1);
             this.settle_idle_ticks.store(ticks, Relaxed);
             if ticks.saturating_mul(u64::from(SETTLE_MS)) < u64::from(FIRST_RESPONSE_MS) {
@@ -1749,9 +1752,20 @@ impl SepData {
         }
 
         if this.endpoint_count() == 0 {
+            dev_err!(
+                this.dev,
+                "attach: {} messages received but no endpoint advertised; xART and key store cannot run\n",
+                now
+            );
             this.phase.store(PHASE_READY, Relaxed);
             return;
         }
+        dev_info!(
+            this.dev,
+            "attach: {} endpoints advertised in {} messages\n",
+            this.endpoint_count(),
+            now
+        );
 
         this.prepare_os_uuid();
 
@@ -1834,7 +1848,7 @@ impl SepData {
 
             proto::EP_BOOT => self.on_boot(msg),
 
-            _ep => {},
+            ep => dev_info!(self.dev, "rx: unhandled endpoint {:#04x} (msg0 {:#018x})\n", ep, msg.msg0),
         }
     }
 
@@ -1855,13 +1869,21 @@ impl SepData {
         }
     }
 
-    fn on_discovery(&self, _msg: Message, f: proto::Fields) {
+    fn on_discovery(&self, msg: Message, f: proto::Fields) {
         let mut table = self.endpoints.lock();
         match f.ty {
             proto::DISCOVER_TYPE_DESCRIPTOR | proto::DISCOVER_TYPE_CONFIG => {
                 let _ = table.slot(f.param);
+                dev_info!(
+                    self.dev,
+                    "discover: endpoint {:#04x} (type {}, msg0 {:#018x}); {} known\n",
+                    f.param,
+                    f.ty,
+                    msg.msg0,
+                    table.eps.len()
+                );
             }
-            _ => {}
+            ty => dev_info!(self.dev, "discover: other type {} (msg0 {:#018x})\n", ty, msg.msg0),
         }
     }
 

@@ -325,9 +325,12 @@ fn node_at_address(base: u64) -> Option<DtNode> {
         if np.is_null() {
             return None;
         }
-        let node = DtNode(np);
+        // The iterator owns this reference and puts it on the next call, so a
+        // non-matching node must not be dropped here; only the match is handed
+        // back as an owned `DtNode`.
+        let node = core::mem::ManuallyDrop::new(DtNode(np));
         if node.reg_base() == Some(base) {
-            return Some(node);
+            return Some(core::mem::ManuallyDrop::into_inner(node));
         }
     }
 }

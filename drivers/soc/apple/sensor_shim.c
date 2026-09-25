@@ -73,7 +73,7 @@ static void sep_acquire_power(struct spi_device *spi)
 	struct gpio_device *gdev;
 	struct gpio_chip *gc;
 
-	sep_power = gpiod_get_index(&spi->dev, NULL, 0, GPIOD_OUT_LOW);
+	sep_power = gpiod_get_index(&spi->dev, "enable", 0, GPIOD_OUT_LOW);
 	if (!IS_ERR(sep_power)) {
 		sep_power_source = SEP_POWER_NODE_PROPERTY;
 		dev_info(&spi->dev,
@@ -89,7 +89,7 @@ static void sep_acquire_power(struct spi_device *spi)
 	 */
 	if (!of_machine_is_compatible("apple,j414s")) {
 		dev_warn(&spi->dev,
-			 "sep sensor: no power GPIO in the device node; describe gpios in DT\n");
+			 "sep sensor: no power GPIO in the device node; describe enable-gpios in DT\n");
 		return;
 	}
 
