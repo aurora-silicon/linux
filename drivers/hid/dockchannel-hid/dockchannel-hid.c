@@ -812,8 +812,11 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 		case INIT_GPIO_REQUEST: {
 			struct dchid_gpio_request *req = data;
 
-			if (sizeof(*req) > length)
+			if (blk->length < sizeof(*req)) {
+				dev_warn(dchid->dev, "Short GPIO request for %s\n",
+					 iface->name);
 				break;
+			}
 
 			if (iface->gpio_id) {
 				dev_err(dchid->dev,
@@ -832,7 +835,7 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 		case INIT_PRODUCT_NAME: {
 			char *product = data;
 
-			if (product[blk->length - 1] != 0) {
+			if (!blk->length || product[blk->length - 1] != 0) {
 				dev_warn(dchid->dev, "Unterminated product name for %s\n",
 					 iface->name);
 			} else {
@@ -924,6 +927,10 @@ err:
 static void dchid_handle_event(struct dockchannel_hid *dchid, void *data, size_t length)
 {
 	u8 *p = data;
+
+	if (!length)
+		return;
+
 	switch (*p) {
 	case EVENT_INIT:
 		dchid_handle_init(dchid, data, length);
