@@ -101,7 +101,7 @@ static void isp_surf_iommu_unmap(struct apple_isp *isp, struct isp_surf *surf)
 
 static int isp_surf_iommu_map(struct apple_isp *isp, struct isp_surf *surf)
 {
-	unsigned long size;
+	ssize_t mapped;
 	int err;
 
 	err = sg_alloc_table_from_pages(&surf->sgt, surf->pages,
@@ -112,13 +112,15 @@ static int isp_surf_iommu_map(struct apple_isp *isp, struct isp_surf *surf)
 		return err;
 	}
 
-	size = iommu_map_sgtable(isp->domain, surf->iova, &surf->sgt,
-				 IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE);
-	if (size < surf->size) {
+	mapped = iommu_map_sgtable(isp->domain, surf->iova, &surf->sgt,
+				   IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE);
+	if (mapped < 0 || (u64)mapped < surf->size) {
 		dev_err(isp->dev, "failed to iommu_map sgt to iova %pad\n",
 			&surf->iova);
+		if (mapped > 0)
+			iommu_unmap(isp->domain, surf->iova, mapped);
 		sg_free_table(&surf->sgt);
-		return -ENXIO;
+		return mapped < 0 ? mapped : -ENXIO;
 	}
 
 	return 0;
@@ -233,11 +235,13 @@ int apple_isp_iommu_map_sgt(struct apple_isp *isp, struct isp_surf *surf,
 
 	mapped = iommu_map_sgtable(isp->domain, surf->iova, sgt,
 				   IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE);
-	if (mapped < surf->size) {
+	if (mapped < 0 || (u64)mapped < surf->size) {
 		dev_err(isp->dev, "failed to iommu_map sgt to iova %pad\n",
 			&surf->iova);
+		if (mapped > 0)
+			iommu_unmap(isp->domain, surf->iova, mapped);
 		isp_surf_unreserve_iova(isp, surf);
-		return -ENXIO;
+		return mapped < 0 ? mapped : -ENXIO;
 	}
 	surf->size = mapped;
 
