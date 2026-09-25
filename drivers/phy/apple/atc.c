@@ -595,10 +595,24 @@ struct atcphy_mode_configuration {
 	bool set_swap;
 };
 
+/**
+ * struct atcphy_hw - SoC-specific PHY description
+ * @gen: Register programming generation
+ * @aciophy_lane_mode: Lane mode register offset
+ * @aciophy_crossbar: Crossbar register offset
+ * @has_usb4: A USB4/Thunderbolt controller sits behind the PHY
+ * @has_usb2phy_reg: The PHY has the secondary eUSB2 register bank (T8140)
+ * @optional_tunables: The bootloader may leave out the common-a tunables (this
+ *                     generation has none) and the SuperSpeed tunables; USB2
+ *                     still works without the latter
+ */
 struct atcphy_hw {
 	enum atcphy_generation gen;
 	int aciophy_lane_mode;
 	int aciophy_crossbar;
+	bool has_usb4;
+	bool has_usb2phy_reg;
+	bool optional_tunables;
 };
 
 /**
@@ -611,6 +625,9 @@ struct atcphy_hw {
  * @tunables.lane_usb3: USB3 lane-specific tunables
  * @tunables.lane_dp: DisplayPort lane-specific tunables
  * @tunables.lane_usb4: USB4 lane-specific tunables
+ * @tunables.usb2phy_reg_dflt: Defaults for the secondary eUSB2 register bank
+ * @hw: SoC-specific PHY description
+ * @ss_tunables: The complete SuperSpeed tunable set was supplied
  * @mode: Current PHY operating mode
  * @swap_lanes: True if lanes must be swapped due to cable orientation
  * @dp_link_rate: DisplayPort link rate
@@ -619,11 +636,13 @@ struct atcphy_hw {
  * @regs.core: Core registers
  * @regs.axi2af: AXI to Apple Fabric interface registers
  * @regs.usb2phy: USB2 PHY registers
+ * @regs.usb2phy_reg: Secondary eUSB2 register bank (T8140)
  * @regs.pipehandler: USB3 PIPE interface ("pipehandler") registers
  * @regs.lpdptx: DisplayPort registers
  * @res: Resources for memory-mapped registers, used to verify that tunables aren't out of bounds
  * @res.core: Core register resource
  * @res.axi2af: AXI to Apple Fabric interface resource
+ * @res.usb2phy_reg: Secondary eUSB2 register bank resource
  * @phys: PHY instances
  * @phys.usb2: USB2 PHY instance
  * @phys.usb3: USB3 PHY instance
@@ -644,9 +663,11 @@ struct apple_atcphy {
 		struct apple_tunable *lane_usb3[2];
 		struct apple_tunable *lane_dp[2];
 		struct apple_tunable *lane_usb4[2];
+		struct apple_tunable *usb2phy_reg_dflt;
 	} tunables;
 
 	const struct atcphy_hw *hw;
+	bool ss_tunables;
 	enum atcphy_mode mode;
 	int dp_link_rate;
 	bool swap_lanes;
@@ -656,6 +677,7 @@ struct apple_atcphy {
 		void __iomem *core;
 		void __iomem *axi2af;
 		void __iomem *usb2phy;
+		void __iomem *usb2phy_reg;
 		void __iomem *pipehandler;
 		void __iomem *lpdptx;
 	} regs;
@@ -663,6 +685,7 @@ struct apple_atcphy {
 	struct {
 		struct resource *core;
 		struct resource *axi2af;
+		struct resource *usb2phy_reg;
 	} res;
 
 	struct {
@@ -1249,6 +1272,18 @@ static int atcphy_configure_pipehandler_usb4(struct apple_atcphy *atcphy)
 	return 0;
 }
 
+/*
+ * The T8140 DWC3 core does not complete its initialisation against a parked
+ * PIPE unless the dummy PHY behind the mux is enabled as well; selecting the
+ * dummy backend in PIPEHANDLER_MUX_CTRL is not enough. The earlier SoCs come
+ * up and run USB2-only with the bit clear, so they are left alone.
+ */
+static void atcphy_enable_dummy_phy(struct apple_atcphy *atcphy)
+{
+	set32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
+	      PIPEHANDLER_DUMMY_PHY_EN);
+}
+
 static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy)
 {
 	int ret;
@@ -1279,6 +1314,8 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy)
 	       PIPEHANDLER_NATIVE_POWER_DOWN, FIELD_PREP(PIPEHANDLER_NATIVE_POWER_DOWN, 2));
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
 	      PIPEHANDLER_NATIVE_RESET);
+	if (!atcphy->hw->has_usb4)
+		atcphy_enable_dummy_phy(atcphy);
 
 	return 0;
 }
@@ -1313,6 +1350,8 @@ static void atcphy_setup_pipehandler(struct apple_atcphy *atcphy)
 
 	atcphy_pipehandler_set_mux(atcphy, PIPEHANDLER_MUX_CTRL_DATA_DUMMY,
 				   PIPEHANDLER_MUX_CTRL_CLK_DUMMY);
+	if (!atcphy->hw->has_usb4)
+		atcphy_enable_dummy_phy(atcphy);
 }
 
 static void atcphy_configure_lanes(struct apple_atcphy *atcphy, enum atcphy_mode mode)
@@ -1859,8 +1898,23 @@ static void atcphy_usb2_power_on(struct apple_atcphy *atcphy)
 	clear32(atcphy->regs.usb2phy + USB2PHY_MISCTUNE, USB2PHY_MISCTUNE_APBCLK_GATE_OFF);
 	clear32(atcphy->regs.usb2phy + USB2PHY_MISCTUNE, USB2PHY_MISCTUNE_REFCLK_GATE_OFF);
 
+	/*
+	 * Give the eUSB2 repeater behind the T8140 PHY time to settle between the
+	 * reset release and the start of the link. The 5 ms interval is the one
+	 * the T8140 bring-up used; it has not been narrowed down.
+	 */
+	if (atcphy->hw->has_usb2phy_reg)
+		fsleep(5000);
+
 	/* Enable the PHY */
 	writel(USB2PHY_USBCTL_RUN, atcphy->regs.usb2phy + USB2PHY_USBCTL);
+
+	/*
+	 * The T8140 keeps per-device defaults for its secondary eUSB2 register
+	 * bank in the ADT. The power-off path asserts the PHY resets, so apply
+	 * them after every power-on.
+	 */
+	apple_tunable_apply(atcphy->regs.usb2phy_reg, atcphy->tunables.usb2phy_reg_dflt);
 }
 
 static int atcphy_power_on(struct apple_atcphy *atcphy)
@@ -2351,6 +2405,24 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 	if (atcphy->mode == target_mode)
 		return 0;
 
+	switch (target_mode) {
+	case APPLE_ATCPHY_MODE_TBT:
+	case APPLE_ATCPHY_MODE_USB4:
+		if (!atcphy->hw->has_usb4)
+			return -EOPNOTSUPP;
+		fallthrough;
+	case APPLE_ATCPHY_MODE_USB3:
+	case APPLE_ATCPHY_MODE_USB3_DP:
+	case APPLE_ATCPHY_MODE_DP:
+		/* Without the lane tunables the SuperSpeed lanes are not calibrated */
+		if (!atcphy->ss_tunables)
+			return -EOPNOTSUPP;
+		break;
+	case APPLE_ATCPHY_MODE_OFF:
+	case APPLE_ATCPHY_MODE_USB2:
+		break;
+	}
+
 	/*
 	 * If the pipehandler is still/already up here there's a bug somewhere so make sure to
 	 * complain loudly. We can still try to switch modes and hope for the best though,
@@ -2384,6 +2456,7 @@ static int atcphy_probe_mux(struct apple_atcphy *atcphy)
 static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 {
 	size_t tunable_count;
+	bool ss_missing = false;
 	struct {
 		const char *dt_name;
 		struct apple_tunable **tunable;
@@ -2407,14 +2480,46 @@ static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 		tunable_count = ARRAY_SIZE(tunables);
 
 	for (size_t i = 0; i < tunable_count; i++) {
-		*tunables[i].tunable = devm_apple_tunable_parse(
-			atcphy->dev, atcphy->np, tunables[i].dt_name, tunables[i].res);
-		if (IS_ERR(*tunables[i].tunable)) {
-			dev_err(atcphy->dev, "Failed to read tunable %s: %ld\n",
-				tunables[i].dt_name, PTR_ERR(*tunables[i].tunable));
-			return PTR_ERR(*tunables[i].tunable);
+		struct apple_tunable *tunable;
+
+		if (!atcphy->hw->has_usb4 &&
+		    (tunables[i].tunable == &atcphy->tunables.lane_usb4[0] ||
+		     tunables[i].tunable == &atcphy->tunables.lane_usb4[1])) {
+			*tunables[i].tunable = NULL;
+			continue;
 		}
+
+		tunable = devm_apple_tunable_parse(atcphy->dev, atcphy->np, tunables[i].dt_name,
+						   tunables[i].res);
+		if (IS_ERR(tunable)) {
+			if (PTR_ERR(tunable) != -ENOENT || !atcphy->hw->optional_tunables) {
+				dev_err(atcphy->dev, "Failed to read tunable %s: %ld\n",
+					tunables[i].dt_name, PTR_ERR(tunable));
+				return PTR_ERR(tunable);
+			}
+			/* The common-a tunables do not exist on this generation */
+			if (tunables[i].tunable != &atcphy->tunables.common[0])
+				ss_missing = true;
+			tunable = NULL;
+		}
+		*tunables[i].tunable = tunable;
 	}
+
+	if (atcphy->hw->has_usb2phy_reg) {
+		struct apple_tunable *tunable;
+
+		tunable = devm_apple_tunable_parse(atcphy->dev, atcphy->np,
+						   "apple,tunable-usb2phy-reg-dflt",
+						   atcphy->res.usb2phy_reg);
+		if (IS_ERR(tunable))
+			return dev_err_probe(atcphy->dev, PTR_ERR(tunable),
+					     "Failed to read tunable apple,tunable-usb2phy-reg-dflt\n");
+		atcphy->tunables.usb2phy_reg_dflt = tunable;
+	}
+
+	atcphy->ss_tunables = !ss_missing;
+	if (ss_missing)
+		dev_warn(atcphy->dev, "SuperSpeed tunables missing, USB2 only\n");
 
 	return 0;
 }
@@ -2445,6 +2550,17 @@ static int atcphy_map_resources(struct platform_device *pdev, struct apple_atcph
 		*resources[i].addr = addr;
 		if (resources[i].res)
 			*resources[i].res = res;
+	}
+
+	if (atcphy->hw->has_usb2phy_reg) {
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "usb2phy-reg");
+		addr = devm_ioremap_resource(&pdev->dev, res);
+		if (IS_ERR(addr))
+			return dev_err_probe(atcphy->dev, PTR_ERR(addr),
+					     "Unable to map usb2phy-reg regs");
+
+		atcphy->regs.usb2phy_reg = addr;
+		atcphy->res.usb2phy_reg = res;
 	}
 
 	return 0;
@@ -2516,17 +2632,28 @@ static const struct atcphy_hw atcphy_hw_t8103 = {
 	.gen = ATCPHY_GENERATION_T8103,
 	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8103,
 	.aciophy_crossbar = ACIOPHY_CROSSBAR_T8103,
+	.has_usb4 = true,
 };
 
 static const struct atcphy_hw atcphy_hw_t8122 = {
 	.gen = ATCPHY_GENERATION_T8122,
 	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8122,
 	.aciophy_crossbar = ACIOPHY_CROSSBAR_T8122,
+	.has_usb4 = true,
+};
+
+static const struct atcphy_hw atcphy_hw_t8140 = {
+	.gen = ATCPHY_GENERATION_T8122,
+	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8122,
+	.aciophy_crossbar = ACIOPHY_CROSSBAR_T8122,
+	.has_usb2phy_reg = true,
+	.optional_tunables = true,
 };
 
 static const struct of_device_id atcphy_match[] = {
 	{ .compatible = "apple,t8103-atcphy", .data = &atcphy_hw_t8103 },
 	{ .compatible = "apple,t8122-atcphy", .data = &atcphy_hw_t8122 },
+	{ .compatible = "apple,t8140-atcphy", .data = &atcphy_hw_t8140 },
 	{},
 };
 MODULE_DEVICE_TABLE(of, atcphy_match);
