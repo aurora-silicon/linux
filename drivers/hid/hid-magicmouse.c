@@ -712,10 +712,12 @@ struct tp_finger {
 } __attribute__((packed, aligned(2)));
 
 /**
- * struct vendor trackpad report
+ * struct tp_header - vendor trackpad report header
  *
- * @num_fingers:	the number of fingers being reported in @fingers
+ * @unknown:		unknown
+ * @num_fingers:	the number of finger records that follow
  * @buttons:		same as HID buttons
+ * @unknown3:		unknown
  */
 struct tp_header {
 	// HID vendor part, up to 1751 bytes
@@ -726,10 +728,13 @@ struct tp_header {
 };
 
 /**
- * struct standard HID mouse report
+ * struct tp_mouse_report - standard HID mouse report
  *
- * @report_id:		reportid
+ * @report_id:		report ID
  * @buttons:		HID Usage Buttons 3 1-bit reports
+ * @rel_x:		relative X movement
+ * @rel_y:		relative Y movement
+ * @padding:		padding
  */
 struct tp_mouse_report {
 	// HID mouse report
