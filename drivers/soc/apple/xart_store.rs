@@ -5,8 +5,8 @@
 //!
 //! The APFS locator identifies the existing `.gl` file's physical extent.
 //! This module validates records and serves SEP reads from that extent. It
-//! never creates storage. Raw writes remain blocked until the record update
-//! protocol and APFS ownership rules are verified against macOS.
+//! never creates storage. Writes are opt-in and require narrow APFS checks
+//! for an unshared, unsnapshotted extent.
 
 use crate::shim;
 use kernel::prelude::*;
@@ -110,23 +110,20 @@ fn valid_key(key: &Key) -> bool {
 }
 
 impl Store {
-    /// Opens the iBoot system container read-only, resolves `.gl` through APFS
+    /// Opens the iBoot system container, resolves `.gl` through APFS
     /// metadata, then validates the record store at exactly that extent.
     /// A nonzero start sector is an assertion against the APFS result, never
-    /// an override of it. Neither lookup nor record validation authorizes
-    /// raw writes: macOS's update protocol is still unverified.
+    /// an override of it. Writes additionally require a single-owner extent
+    /// with no snapshots or pending revert, checked on the same block handle.
     pub(crate) fn open_owner(writes_enabled: bool, start_sector: u64) -> Result<Store> {
-        if writes_enabled {
-            return Err(ENOTSUPP);
-        }
-        let file = shim::StoreFile::open_block(OWNER_PATH, false)?;
-        let base = crate::xart_apfs::locate(&file)?;
+        let file = shim::StoreFile::open_block(OWNER_PATH, writes_enabled)?;
+        let base = crate::xart_apfs::locate(&file, writes_enabled)?;
         if start_sector != 0 {
             if start_sector.checked_mul(512).ok_or(EINVAL)? != base {
                 return Err(EINVAL);
             }
         }
-        Self::open_file(file, false, base)
+        Self::open_file(file, writes_enabled, base)
     }
 
     /// Opens a caller-selected block mapping at offset zero.
@@ -151,8 +148,8 @@ impl Store {
         Self::open_file(file, writes_enabled, base)
     }
 
-    /// Complete record validation using the same read-only handle with which
-    /// APFS ownership was resolved, avoiding a close/reopen window.
+    /// Complete record validation using the same handle with which APFS
+    /// ownership was resolved, avoiding a close/reopen window.
     fn open_file(file: shim::StoreFile, arm_writes: bool, base: u64) -> Result<Store> {
         let size = file.size()?;
         if base % BLOCK_SIZE as u64 != 0 || STORE_SIZE % BLOCK_SIZE as u64 != 0 {
@@ -191,6 +188,9 @@ impl Store {
         // both existing root families before any mailbox registration can run.
         if store.find(&Key::root(1)).is_none() || store.find(&Key::root(2)).is_none() {
             return Err(ENODATA);
+        }
+        if arm_writes && (store.malformed_records != 0 || store.duplicate_records != 0) {
+            return Err(EIO);
         }
         store.writes_enabled = arm_writes;
         if arm_writes {

@@ -121,10 +121,13 @@ config APPLE_SEP
 	  SEP-backed trusted key source so keyctl can seal keys to the enclave.
 
 	  The driver reads the existing machine-wide xART gigalocker directly from
-	  the iBoot system container, locating it by its root records. It validates
-	  the complete store and both root records before registering with SEP.
-	  Raw APFS xART writes are refused until the extent and update protocol
-	  can be verified; the module parameter cannot override this safety gate.
+	  the iBoot system container, locating its .gl extent through read-only,
+	  checksum-validated APFS metadata. It validates the complete store and
+	  both root records before registering with SEP.
+	  Raw APFS xART writes are disabled by default. An explicit xart_writes
+	  opt-in is accepted only when the driver validates narrow physical
+	  extent ownership invariants; this does not prove all macOS-compatible
+	  update behavior. Keep it off until the target machine has been checked.
 
 	  Say Y here if you have an Apple silicon Mac.
 
