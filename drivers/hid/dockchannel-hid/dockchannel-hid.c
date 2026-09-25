@@ -1053,6 +1053,7 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 
 	if (hdr.iface >= MAX_INTERFACES) {
 		dev_err(dchid->dev, "Bad iface %d\n", hdr.iface);
+		goto done;
 	}
 
 	iface = dchid->ifaces[hdr.iface];
