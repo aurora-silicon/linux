@@ -1576,8 +1576,11 @@
 		usb4_0_acio: cio@381ac0000 {
 			compatible = "apple,t8103-usb4-acio";
 			reg = <0x3 0x81ac0000 0x0 0xc000>,
-				<0x3 0x81080000 0x0 0x20000>;
-			reg-names = "rc", "sram";
+				<0x3 0x81080000 0x0 0x20000>,
+				<0x3 0x81e44000 0x0 0x4000>;
+			reg-names = "rc", "sram", "pcie-adapter";
+			/* PCIe adapter configuration. One record, bits [2:1] at +0x1008. */
+			apple,tunable-pcie-adapter = <0x1008 0x6 0x6>;
 
 			mboxes = <&usb4_0_mbox>;
 			resets = <&cio_reset 0>;
@@ -1657,7 +1660,7 @@
 			ranges;
 
 			apciec0_dart: iommu@3a1008000 {
-				compatible = "apple,t8103-dart";
+				compatible = "apple,t8103-usb4-dart";
 				reg = <0x3 0xa1008000 0x0 0x4000>;
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 771 IRQ_TYPE_LEVEL_HIGH>;
@@ -1674,9 +1677,10 @@
 					<0x3 0xa0004000 0x0 0x4000>,
 					<0x3 0xa0200000 0x0 0x4000>,
 					<0x3 0xa1010000 0x0 0x4000>,
-					<0x3 0xa100c000 0x0 0x4000>;
+					<0x3 0xa0008000 0x0 0x4000>;
 				reg-names = "config", "rc", "port0", "fabric",
-					    "debug", "ltssm", "intr2axi";
+					    "debug", "ltssm", "oe-fabric";
+#include "t8103-pciec-tunables.dtsi"
 
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 770 IRQ_TYPE_LEVEL_HIGH>;
@@ -1703,6 +1707,8 @@
 					device_type = "pci";
 					reg = <0x0 0x0 0x0 0x0 0x0>;
 					external-facing;
+					/* Port configuration. One record at +0x140. */
+					apple,tunable = <0x140 0x1 0x1>;
 
 					#address-cells = <3>;
 					#size-cells = <2>;
@@ -1795,8 +1801,11 @@
 		usb4_1_acio: cio@501ac0000 {
 			compatible = "apple,t8103-usb4-acio";
 			reg = <0x5 0x01ac0000 0x0 0xc000>,
-				<0x5 0x01080000 0x0 0x20000>;
-			reg-names = "rc", "sram";
+				<0x5 0x01080000 0x0 0x20000>,
+				<0x5 0x01e44000 0x0 0x4000>;
+			reg-names = "rc", "sram", "pcie-adapter";
+			/* PCIe adapter configuration. One record, bits [2:1] at +0x1008. */
+			apple,tunable-pcie-adapter = <0x1008 0x6 0x6>;
 
 			mboxes = <&usb4_1_mbox>;
 			resets = <&cio_reset 1>;
@@ -1876,7 +1885,7 @@
 			ranges;
 
 			apciec1_dart: iommu@521008000 {
-				compatible = "apple,t8103-dart";
+				compatible = "apple,t8103-usb4-dart";
 				reg = <0x5 0x21008000 0x0 0x4000>;
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 851 IRQ_TYPE_LEVEL_HIGH>;
@@ -1893,9 +1902,10 @@
 					<0x5 0x20004000 0x0 0x4000>,
 					<0x5 0x20200000 0x0 0x4000>,
 					<0x5 0x21010000 0x0 0x4000>,
-					<0x5 0x2100c000 0x0 0x4000>;
+					<0x5 0x20008000 0x0 0x4000>;
 				reg-names = "config", "rc", "port0", "fabric",
-					    "debug", "ltssm", "intr2axi";
+					    "debug", "ltssm", "oe-fabric";
+#include "t8103-pciec-tunables.dtsi"
 
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 850 IRQ_TYPE_LEVEL_HIGH>;
@@ -1922,6 +1932,8 @@
 					device_type = "pci";
 					reg = <0x0 0x0 0x0 0x0 0x0>;
 					external-facing;
+					/* Port configuration. One record at +0x140. */
+					apple,tunable = <0x140 0x1 0x1>;
 
 					#address-cells = <3>;
 					#size-cells = <2>;

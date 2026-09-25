@@ -7596,6 +7596,15 @@ Kernel parameters
 			See Documentation/admin-guide/mm/transhuge.rst for more
 			details.
 
+	thunderbolt_apple.dp_display=
+			[HW,ARM64]
+			Format: <bool>
+			Drive displays behind Thunderbolt DisplayPort tunnels
+			on Apple silicon (experimental, t8103 only): route a
+			display pipeline to the host router's DP IN adapter
+			whenever the connection manager sets up a DP tunnel.
+			Default: false
+
 	tlbi=		[X86-64]
 			Format: {ipi}
 			ipi: switch to IPI-based TLB flushing

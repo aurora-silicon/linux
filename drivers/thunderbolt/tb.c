@@ -1721,6 +1721,65 @@ static void tb_discover_tunnels(struct tb *tb)
 	}
 }
 
+/*
+ * On some hosts (Apple silicon) the display engine has to be routed to a
+ * DP IN adapter of the host router by hand. Tell the NHI glue when a DP
+ * tunnel starting at one of those adapters comes or goes.
+ */
+static void tb_dp_tunnel_notify(struct tb_tunnel *tunnel, bool active)
+{
+	struct tb_port *in = tunnel->src_port;
+
+	/*
+	 * Only undo what was announced: a tunnel can be released twice (at
+	 * tb_stop() and by a late DPRX failure), the second time after the
+	 * host router is gone.
+	 */
+	if (!active && !tunnel->host_dp_notified)
+		return;
+	if (!tb_tunnel_is_dp(tunnel) || !tb_port_is_apple_host_dpin(in))
+		return;
+	/*
+	 * After both DP adapters are enabled, pulse the DP IN adapter's HPD
+	 * propagation bit for 10 ms and wait up to 2 s for its HPD status, so
+	 * HPD has reached the host before the display side starts. This runs
+	 * under tb->lock; HPD normally follows at once, 2 s is the worst case.
+	 */
+	if (active && in->cap_adap) {
+		int i, hpd = 0;
+		u32 v;
+
+		if (tb_port_read(in, &v, TB_CFG_PORT, in->cap_adap + ADP_DP_CS_3, 1)) {
+			tb_port_warn(in, "cannot read DP adapter state, HPD not pulsed\n");
+		} else {
+			/* HPDC may still be set from a previous tunnel's teardown */
+			v &= ~ADP_DP_CS_3_HPDC;
+			v |= ADP_DP_CS_3_HPD_PROPAGATE;
+			if (tb_port_write(in, &v, TB_CFG_PORT, in->cap_adap + ADP_DP_CS_3, 1)) {
+				tb_port_warn(in, "cannot pulse HPD propagation\n");
+				goto notify;
+			}
+			usleep_range(10000, 11000);
+			v &= ~ADP_DP_CS_3_HPD_PROPAGATE;
+			if (tb_port_write(in, &v, TB_CFG_PORT, in->cap_adap + ADP_DP_CS_3, 1))
+				tb_port_warn(in, "cannot end HPD propagation pulse\n");
+			for (i = 0; i < 200; i++) {
+				hpd = tb_dp_port_hpd_is_active(in);
+				if (hpd)
+					break;
+				usleep_range(10000, 11000);
+			}
+			if (hpd < 0)
+				tb_port_warn(in, "cannot read HPD status: %d\n", hpd);
+			else if (!hpd)
+				tb_port_warn(in, "HPD did not propagate\n");
+		}
+	}
+notify:
+	tunnel->host_dp_notified = active;
+	tunnel->tb->nhi->ops->dp_tunnel_changed(tunnel->tb->nhi, in->port, active);
+}
+
 static void tb_deactivate_and_free_tunnel(struct tb_tunnel *tunnel)
 {
 	struct tb_port *src_port, *dst_port;
@@ -1729,6 +1788,7 @@ static void tb_deactivate_and_free_tunnel(struct tb_tunnel *tunnel)
 	if (!tunnel)
 		return;
 
+	tb_dp_tunnel_notify(tunnel, false);
 	tb_tunnel_deactivate(tunnel);
 	list_del(&tunnel->list);
 
@@ -2044,6 +2104,7 @@ static void tb_tunnel_one_dp(struct tb *tb, struct tb_port *in,
 		goto err_free;
 	}
 
+	tb_dp_tunnel_notify(tunnel, true);
 	return;
 
 err_free:
@@ -2948,6 +3009,9 @@ static void tb_stop(struct tb *tb)
 		 */
 		if (tb_tunnel_is_dma(tunnel))
 			tb_tunnel_deactivate(tunnel);
+		/* the host side of a DP tunnel goes away with us */
+		else if (tb_tunnel_is_dp(tunnel))
+			tb_dp_tunnel_notify(tunnel, false);
 		tb_tunnel_put(tunnel);
 	}
 	tb_switch_remove(tb->root_switch);

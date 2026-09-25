@@ -906,8 +906,13 @@ static int tb_dp_xchg_caps(struct tb_tunnel *tunnel)
 	 * Titan Ridge does not disable AUX timers when it gets
 	 * SET_CONFIG with SET_LTTPR_MODE set. This causes problems with
 	 * DP tunneling.
+	 *
+	 * Not with an Apple host: its DPTX trains the sink through the
+	 * tunnel itself, and the configuration validated on hardware leaves
+	 * the capability alone.
 	 */
-	if (tb_route(out->sw) && tb_switch_is_titan_ridge(out->sw)) {
+	if (tb_route(out->sw) && tb_switch_is_titan_ridge(out->sw) &&
+	    !tb_port_is_apple_host_dpin(in)) {
 		out_dp_cap |= DP_COMMON_CAP_LTTPR_NS;
 		tb_tunnel_dbg(tunnel, "disabling LTTPR\n");
 	}
@@ -1179,7 +1184,32 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 		return ret;
 
 	if (tb_port_is_dpout(tunnel->dst_port)) {
-		ret = tb_dp_port_enable(tunnel->dst_port, active);
+		struct tb_port *out = tunnel->dst_port;
+
+		/*
+		 * With an Apple host the sink link is trained by the host's
+		 * DPTX through the tunnel: keep the DP OUT adapter from
+		 * starting link training on its own, and hand it back once
+		 * the tunnel is gone.
+		 */
+		bool apple = tb_port_is_apple_host_dpin(tunnel->src_port) &&
+			     out->cap_adap;
+		u32 v;
+
+		if (active && apple &&
+		    !tb_port_read(out, &v, TB_CFG_PORT, out->cap_adap + ADP_DP_CS_3, 1)) {
+			v |= ADP_DP_CS_3_NO_AUTO_LT;
+			if (tb_port_write(out, &v, TB_CFG_PORT, out->cap_adap + ADP_DP_CS_3, 1))
+				tb_port_warn(out, "cannot hold off DP link training\n");
+		}
+		ret = tb_dp_port_enable(out, active);
+		/* hand link training back even if the disable failed */
+		if (!active && apple &&
+		    !tb_port_read(out, &v, TB_CFG_PORT, out->cap_adap + ADP_DP_CS_3, 1)) {
+			v &= ~ADP_DP_CS_3_NO_AUTO_LT;
+			if (tb_port_write(out, &v, TB_CFG_PORT, out->cap_adap + ADP_DP_CS_3, 1))
+				tb_port_warn(out, "cannot restore DP link training\n");
+		}
 		if (ret)
 			return ret;
 	}
@@ -1489,6 +1519,12 @@ static int tb_dp_init_video_credits(struct tb_path_hop *hop)
 {
 	struct tb_port *port = hop->in_port;
 	struct tb_switch *sw = port->sw;
+
+	/* Apple host DP IN adapters take 5 NFC credits for the video path. */
+	if (tb_port_is_apple_host_dpin(port)) {
+		hop->nfc_credits = 5;
+		return 0;
+	}
 
 	if (tb_port_use_credit_allocation(port)) {
 		unsigned int nfc_credits;

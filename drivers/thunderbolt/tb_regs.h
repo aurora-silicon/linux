@@ -428,6 +428,9 @@ struct tb_regs_port_header {
 #define ADP_DP_CS_2_ESTIMATED_BW_SHIFT		24
 #define ADP_DP_CS_3				0x03
 #define ADP_DP_CS_3_HPDC			BIT(9)
+/* Apple silicon host routers */
+#define ADP_DP_CS_3_NO_AUTO_LT			BIT(8)	/* DP OUT of the tunnel */
+#define ADP_DP_CS_3_HPD_PROPAGATE		BIT(10)	/* host DP IN */
 #define DP_LOCAL_CAP				0x04
 #define DP_REMOTE_CAP				0x05
 /* For DP IN adapter */

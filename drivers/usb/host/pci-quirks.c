@@ -1224,7 +1224,20 @@ hc_init:
 	if (pdev->vendor == PCI_VENDOR_ID_INTEL)
 		usb_enable_intel_xhci_ports(pdev);
 
-	op_reg_base = base + XHCI_HC_LENGTH(readl(base));
+	/*
+	 * A dead or unprogrammed BAR reads as all-ones. The capability
+	 * length is then 0xff, and the operational-register read below is
+	 * not 4-byte aligned and faults. A real xHCI length is at least
+	 * 0x10 and dword-aligned.
+	 */
+	val = readl(base);
+	if (XHCI_HC_LENGTH(val) < 0x10 || (XHCI_HC_LENGTH(val) & 3)) {
+		dev_warn(&pdev->dev,
+			 "xHCI capability length %#x unusable, skipping handoff\n",
+			 XHCI_HC_LENGTH(val));
+		goto iounmap;
+	}
+	op_reg_base = base + XHCI_HC_LENGTH(val);
 
 	/* Wait for the host controller to be ready before writing any
 	 * operational or runtime registers.  Wait 5 seconds and no more.

@@ -575,7 +575,8 @@ int tb_port_add_nfc_credits(struct tb_port *port, int credits)
 	 * USB4 restricts programming NFC buffers to lane adapters only
 	 * so skip other ports.
 	 */
-	if (tb_switch_is_usb4(port->sw) && !tb_port_is_null(port))
+	if (tb_switch_is_usb4(port->sw) && !tb_port_is_null(port) &&
+	    !tb_port_is_apple_host_dpin(port))
 		return 0;
 
 	nfc_credits = port->config.nfc_credits & ADP_CS_4_NFC_BUFFERS_MASK;

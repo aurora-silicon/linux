@@ -101,6 +101,7 @@ struct tb_nhi_ops {
 	int (*pci_tunnel_post_activate)(struct tb_nhi *nhi);
 	int (*pci_tunnel_deactivate)(struct tb_nhi *nhi);
 	bool (*is_present)(struct tb_nhi *nhi);
+	void (*dp_tunnel_changed)(struct tb_nhi *nhi, u8 in_port, bool active);
 	int (*init_interrupts)(struct tb_nhi *nhi);
 };
 

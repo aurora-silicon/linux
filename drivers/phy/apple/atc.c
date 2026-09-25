@@ -35,6 +35,7 @@
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/reset-controller.h>
+#include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/types.h>
 #include <linux/usb/pd.h>
@@ -86,6 +87,9 @@
 #define AUSPLL_CLKOUT_MASTER_PCLK_DRVR_EN BIT(2)
 #define AUSPLL_CLKOUT_MASTER_PCLK2_DRVR_EN BIT(4)
 #define AUSPLL_CLKOUT_MASTER_REFBUFCLK_DRVR_EN BIT(6)
+#define AUSPLL_CLKOUT_MASTER_DRVR_EN                                         \
+	(AUSPLL_CLKOUT_MASTER_PCLK_DRVR_EN | AUSPLL_CLKOUT_MASTER_PCLK2_DRVR_EN | \
+	 AUSPLL_CLKOUT_MASTER_REFBUFCLK_DRVR_EN)
 
 #define AUSPLL_CLKOUT_DIV 0x2208
 #define AUSPLL_CLKOUT_PLLA_REFBUFCLK_DI GENMASK(20, 16)
@@ -140,8 +144,11 @@
 #define ACIOPHY_CFG0_COMMON_SMALL_OV BIT(3)
 #define ACIOPHY_CFG0_COMMON_CLAMP BIT(4)
 #define ACIOPHY_CFG0_COMMON_CLAMP_OV BIT(5)
+#define ACIOPHY_CFG0_RX_SMALL GENMASK(7, 6)
 #define ACIOPHY_CFG0_RX_SMALL_OV GENMASK(9, 8)
+#define ACIOPHY_CFG0_RX_BIG GENMASK(11, 10)
 #define ACIOPHY_CFG0_RX_BIG_OV GENMASK(13, 12)
+#define ACIOPHY_CFG0_RX_CLAMP GENMASK(15, 14)
 #define ACIOPHY_CFG0_RX_CLAMP_OV GENMASK(17, 16)
 
 #define ACIOPHY_CROSSBAR_T8103 0x4c
@@ -214,8 +221,11 @@ enum atcphy_lane_mode {
 #define ACIOPHY_BIST_MAC_USBPHY_CFG_OV2_LN0_PWR_DOWN_OV 0x20
 
 #define ACIOPHY_SLEEP_CTRL 0x1b0
+#define ACIOPHY_SLEEP_CTRL_TX_BIG GENMASK(1, 0)
 #define ACIOPHY_SLEEP_CTRL_TX_BIG_OV GENMASK(3, 2)
+#define ACIOPHY_SLEEP_CTRL_TX_SMALL GENMASK(5, 4)
 #define ACIOPHY_SLEEP_CTRL_TX_SMALL_OV GENMASK(7, 6)
+#define ACIOPHY_SLEEP_CTRL_TX_CLAMP GENMASK(9, 8)
 #define ACIOPHY_SLEEP_CTRL_TX_CLAMP_OV GENMASK(11, 10)
 
 #define ACIOPHY_PLL_PCTL_FSM_CTRL1 0x1014
@@ -615,6 +625,8 @@ struct atcphy_hw {
  * @swap_lanes: True if lanes must be swapped due to cable orientation
  * @dp_link_rate: DisplayPort link rate
  * @pipehandler_up: True if the PIPE mux ("pipehandler") is set to USB3 or USB4 mode
+ * @tunnel_clock_on: True while the DisplayPort-over-Thunderbolt pixel clock runs
+ * @tunnel_rate: DP link rate code the tunnel pixel clock is set up for
  * @regs: Memory-mapped registers
  * @regs.core: Core registers
  * @regs.axi2af: AXI to Apple Fabric interface registers
@@ -651,6 +663,9 @@ struct apple_atcphy {
 	int dp_link_rate;
 	bool swap_lanes;
 	bool pipehandler_up;
+
+	bool tunnel_clock_on;
+	u8 tunnel_rate;
 
 	struct {
 		void __iomem *core;
@@ -1688,6 +1703,9 @@ static int atcphy_dp_configure(struct apple_atcphy *atcphy, enum atcphy_dp_link_
 	u32 reg;
 
 	guard(mutex)(&atcphy->lock);
+	/* the AUSPLL is in use as the Thunderbolt DP tunnel pixel clock */
+	if (atcphy->tunnel_clock_on)
+		return -EBUSY;
 	mode_cfg = atcphy_get_mode_config(atcphy, atcphy->mode);
 	cfg = &dp_lr_config[lr];
 
@@ -1894,12 +1912,170 @@ static int atcphy_power_on(struct apple_atcphy *atcphy)
 	return 0;
 }
 
+/*
+ * DisplayPort over Thunderbolt/USB4: the host router's DP IN adapter needs a
+ * pixel clock from the ATC's AUSPLL. Ordinary Type-C DP sets it up together
+ * with the lanes; for a tunnel the PHY blocks are woken, DPTX PCLK1 is enabled
+ * with a per-rate selector and the AUSPLL gets a fixed descriptor
+ * ({0,0x21c,8,3,8,7,0,0,0,0,2,1,0,5,5,1,0,1,1,1}, APB commands 0 then 0x2000),
+ * without touching the lane mux. Based on Oliver Lukschander's t6020 tunnel
+ * clock patch (asahi-j416s-display).
+ */
+/*
+ * Stop the tunnel pixel clock: switch the AUSPLL output drivers off and send
+ * APB command 3. TX_DP_CTRL0, the sleep overrides and the
+ * descriptor are left as they are; the next start programs them again.
+ */
+static void atc_tunnel_stop(struct apple_atcphy *atcphy)
+{
+	lockdep_assert_held(&atcphy->lock);
+	if (!atcphy->tunnel_clock_on)
+		return;
+	core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, AUSPLL_CLKOUT_MASTER_DRVR_EN);
+	atcphy_auspll_apb_command(atcphy, 3);
+	atcphy->tunnel_clock_on = false;
+	atcphy->tunnel_rate = 0;
+	dev_dbg(atcphy->dev, "DP tunnel clock stopped\n");
+}
+
+static int atc_tunnel_start(struct apple_atcphy *atcphy, u8 rate)
+{
+	u32 selector, value;
+	int ret;
+
+	lockdep_assert_held(&atcphy->lock);
+	switch (rate) {
+	case 0x06:	/* RBR */
+		selector = 4;
+		break;
+	case 0x0a:	/* HBR */
+		selector = 3;
+		break;
+	case 0x14:	/* HBR2 */
+		selector = 1;
+		break;
+	case 0x1e:	/* HBR3 */
+		selector = 0;
+		break;
+	default:
+		return -EINVAL;
+	}
+	if (atcphy->tunnel_clock_on) {
+		if (atcphy->tunnel_rate == rate)
+			return 0;
+		/*
+		 * Rate change: DCP brackets it with WillChange/DidChange link
+		 * configuration, so the crossbar is already down; reselect PCLK1.
+		 */
+		core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_SELECT,
+			    FIELD_PREP(DPTX_PCLK1_SELECT, selector));
+		atcphy->tunnel_rate = rate;
+		return 0;
+	}
+	/*
+	 * Don't take the PLL from another clock client or an in-flight command.
+	 * Only live PLL outputs or a pending request mean that: the PCLK gates
+	 * in TX_DP_CTRL0 read set when idle and AUSPLL_LOCK stays set after a
+	 * stop, so neither says anything about another client.
+	 */
+	if (readl(atcphy->regs.core + AUSPLL_CLKOUT_MASTER) & AUSPLL_CLKOUT_MASTER_DRVR_EN ||
+	    readl(atcphy->regs.core + AUSPLL_APB_CMD_OVERRIDE) & AUSPLL_APB_CMD_OVERRIDE_REQ)
+		return -EBUSY;
+	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_CMN_SHM_STS_REG0, value,
+				 value & ACIOPHY_CMN_SHM_STS_REG0_CMD_READY, 10, 10000);
+	if (ret)
+		return ret;
+	atcphy->tunnel_clock_on = true;
+	/* the PLL no longer holds a DP alt mode configuration */
+	atcphy->dp_link_rate = -1;
+
+	/*
+	 * The PHY is up in USB4/TBT mode here. These overrides only force the
+	 * already awake blocks to stay awake for the DP clock path; the order
+	 * and the 2 us gaps are the ones this was validated with, the USB4
+	 * link stays up across them.
+	 *
+	 * Common block: override small/big sleep off and release the clamp.
+	 */
+	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_SMALL);
+	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_SMALL_OV);
+	udelay(2);
+	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_BIG);
+	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_BIG_OV);
+	udelay(2);
+	core_clear32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_CLAMP);
+	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_CLAMP_OV);
+	udelay(2);
+	/* same for the TX lanes */
+	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, ACIOPHY_SLEEP_CTRL_TX_SMALL);
+	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, ACIOPHY_SLEEP_CTRL_TX_SMALL_OV);
+	udelay(2);
+	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, ACIOPHY_SLEEP_CTRL_TX_BIG);
+	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, ACIOPHY_SLEEP_CTRL_TX_BIG_OV);
+	udelay(2);
+	core_clear32(atcphy, ACIOPHY_SLEEP_CTRL, ACIOPHY_SLEEP_CTRL_TX_CLAMP);
+	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, ACIOPHY_SLEEP_CTRL_TX_CLAMP_OV);
+	udelay(2);
+	/* and for the RX lanes */
+	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_RX_BIG);
+	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_RX_BIG_OV);
+	udelay(2);
+	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_RX_SMALL);
+	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_RX_SMALL_OV);
+	udelay(2);
+	core_clear32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_RX_CLAMP);
+	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_RX_CLAMP_OV);
+	udelay(2);
+	/* TX_DP_CTRL0: PMA lane reset release, PCLK1 enable + rate selector */
+	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTXPHY_PMA_LANE_RESET_N);
+	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTXPHY_PMA_LANE_RESET_N_OV);
+	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_ENABLE);
+	core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_SELECT,
+		    FIELD_PREP(DPTX_PCLK1_SELECT, selector));
+
+	/* fixed AUSPLL descriptor */
+	core_clear32(atcphy, AUSPLL_FREQ_CFG, AUSPLL_FREQ_REFCLK);
+	core_mask32(atcphy, AUSPLL_FREQ_DESC_A, U32_MAX,
+		    FIELD_PREP(AUSPLL_FD_FREQ_COUNT_TARGET, 0x21c) |
+		    FIELD_PREP(AUSPLL_FD_KI_MAN, 8) | FIELD_PREP(AUSPLL_FD_KI_EXP, 3) |
+		    FIELD_PREP(AUSPLL_FD_KP_MAN, 8) | FIELD_PREP(AUSPLL_FD_KP_EXP, 7));
+	core_clear32(atcphy, AUSPLL_FREQ_DESC_B,
+		     AUSPLL_FD_FBDIVN_FRAC_DEN | AUSPLL_FD_FBDIVN_FRAC_NUM);
+	core_mask32(atcphy, AUSPLL_FREQ_DESC_C,
+		    AUSPLL_FD_SDM_SSC_STEP | AUSPLL_FD_SDM_SSC_EN | AUSPLL_FD_PCLK_DIV_SEL |
+		    AUSPLL_FD_LFSDM_DIV | AUSPLL_FD_LFCLK_CTRL | AUSPLL_FD_VCLK_OP_DIVN |
+		    AUSPLL_FD_VCLK_PRE_DIVN,
+		    FIELD_PREP(AUSPLL_FD_PCLK_DIV_SEL, 5) | FIELD_PREP(AUSPLL_FD_LFSDM_DIV, 1) |
+		    FIELD_PREP(AUSPLL_FD_LFCLK_CTRL, 5) | FIELD_PREP(AUSPLL_FD_VCLK_OP_DIVN, 2) |
+		    AUSPLL_FD_VCLK_PRE_DIVN);
+	core_mask32(atcphy, AUSPLL_CLKOUT_DIV, AUSPLL_CLKOUT_PLLA_REFBUFCLK_DI,
+		    FIELD_PREP(AUSPLL_CLKOUT_PLLA_REFBUFCLK_DI, 1));
+	core_set32(atcphy, AUSPLL_CLKOUT_DTC_VREG, AUSPLL_DTC_VREG_BYPASS);
+	core_set32(atcphy, AUSPLL_BGR, AUSPLL_BGR_CTRL_AVAIL);
+	core_set32(atcphy, AUSPLL_CLKOUT_MASTER, AUSPLL_CLKOUT_MASTER_PCLK_DRVR_EN);
+	core_set32(atcphy, AUSPLL_CLKOUT_MASTER, AUSPLL_CLKOUT_MASTER_PCLK2_DRVR_EN);
+	core_set32(atcphy, AUSPLL_CLKOUT_MASTER, AUSPLL_CLKOUT_MASTER_REFBUFCLK_DRVR_EN);
+	atcphy_auspll_apb_command(atcphy, 0);
+	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_DP_PCLK_STAT, value,
+				 value & ACIOPHY_AUSPLL_LOCK, 10, 10000);
+	if (ret) {
+		dev_err(atcphy->dev, "DP tunnel clock: AUSPLL did not lock\n");
+		atc_tunnel_stop(atcphy);
+		return ret;
+	}
+	atcphy_auspll_apb_command(atcphy, 0x2000);
+	atcphy->tunnel_rate = rate;
+	return 0;
+}
+
 static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 {
 	int ret = 0;
 	u32 reg;
 
 	lockdep_assert_held(&atcphy->lock);
+	/* the mode change below may power the PHY down: stop the tunnel clock first */
+	atc_tunnel_stop(atcphy);
 
 	if (mode == APPLE_ATCPHY_MODE_OFF) {
 		ret = atcphy_power_off(atcphy);
@@ -2143,6 +2319,36 @@ static const struct phy_ops apple_atc_dp_phy_ops = {
 	.validate = atcphy_dpphy_validate,
 	.set_mode = atcphy_dpphy_set_mode,
 };
+
+/*
+ * Called by appledrm when DCP sets the link rate of a DPTX that feeds a
+ * Thunderbolt DP IN adapter (rate is the DP link rate code, 0 = stop).
+ */
+int apple_atc_dp_tunnel_rate(struct phy *phy, u8 rate)
+{
+	struct apple_atcphy *atcphy;
+	int ret;
+
+	if (!phy || phy->ops != &apple_atc_dp_phy_ops)
+		return -EINVAL;
+	atcphy = phy_get_drvdata(phy);
+	/* the fixed PLL descriptor and PCLK1 selectors are for t8103 only */
+	if (!of_machine_is_compatible("apple,t8103"))
+		return -EOPNOTSUPP;
+	guard(mutex)(&atcphy->lock);
+	if (!rate) {
+		atc_tunnel_stop(atcphy);
+		return 0;
+	}
+	if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 && atcphy->mode != APPLE_ATCPHY_MODE_TBT)
+		return -EBUSY;
+	ret = atc_tunnel_start(atcphy, rate);
+	dev_dbg(atcphy->dev, "DP tunnel clock rate 0x%x: %d (TX_DP_CTRL0=%08x PCLK_STAT=%08x)\n",
+		rate, ret, readl(atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0),
+		readl(atcphy->regs.core + ACIOPHY_DP_PCLK_STAT));
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_atc_dp_tunnel_rate);
 
 static struct phy *atcphy_xlate(struct device *dev, const struct of_phandle_args *args)
 {

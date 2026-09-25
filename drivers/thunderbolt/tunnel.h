@@ -64,6 +64,7 @@ enum tb_tunnel_state {
  *	     determine consumed and allocated bandwidth
  * @dprx_started: DPRX negotiation was started (tb_dp_dprx_start() was called for it)
  * @dprx_canceled: Was DPRX capabilities read poll canceled
+ * @host_dp_notified: The NHI glue was told this DP tunnel is up (Apple hosts)
  * @dprx_timeout: If set DPRX capabilities read poll work will timeout after this passes
  * @dprx_work: Worker that is scheduled to poll completion of DPRX capabilities read
  * @callback: Optional callback called when DP tunnel is fully activated
@@ -102,6 +103,7 @@ struct tb_tunnel {
 	bool bw_mode;
 	bool dprx_started;
 	bool dprx_canceled;
+	bool host_dp_notified;
 	ktime_t dprx_timeout;
 	struct delayed_work dprx_work;
 	void (*callback)(struct tb_tunnel *tunnel, void *data);
