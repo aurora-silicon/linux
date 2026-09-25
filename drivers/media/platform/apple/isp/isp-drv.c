@@ -244,6 +244,9 @@ static enum isp_firmware_version isp_read_fw_version(struct device *dev,
 						      ISP_FW_VERSION_MAX_LEN);
 
 	switch (len) {
+	case -EINVAL:
+		/* not provided, see isp_check_firmware_version() */
+		break;
 	case 3:
 		if (ver[0] == 12 && ver[1] == 3 && ver[2] <= 1)
 			return ISP_FIRMWARE_V_12_3;
@@ -280,8 +283,11 @@ static enum isp_firmware_version isp_check_firmware_version(struct device *dev)
 	version = isp_read_fw_version(dev, "apple,firmware-version");
 	compat = isp_read_fw_version(dev, "apple,firmware-compat");
 
-	dev_info(dev, "ISP firmware-compat: %s (FW: %s)\n", isp_fw2str(compat),
-		 isp_fw2str(version));
+	dev_dbg(dev, "ISP firmware-compat: %s (FW: %s)\n", isp_fw2str(compat),
+		isp_fw2str(version));
+
+	if (!of_property_present(dev->of_node, "apple,firmware-compat"))
+		dev_warn(dev, "firmware compatibility version not provided, assuming 12.x\n");
 
 	return compat;
 }
