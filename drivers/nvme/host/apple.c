@@ -196,6 +196,7 @@ struct apple_nvme_hw {
 	bool has_separate_nvmmu;
 	bool needs_ioq_registers;
 	u32 max_queue_depth;
+	unsigned long quirks;
 };
 
 struct apple_nvme {
@@ -2323,7 +2324,7 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 
 	ret = nvme_init_ctrl(&anv->ctrl, anv->dev, &nvme_ctrl_ops,
 			     NVME_QUIRK_SKIP_CID_GEN | NVME_QUIRK_IDENTIFY_CNS |
-			     NVME_QUIRK_ADMIN_PAGE_ALIGN);
+			     NVME_QUIRK_ADMIN_PAGE_ALIGN | anv->hw->quirks);
 	if (ret) {
 		dev_err_probe(dev, ret, "Failed to initialize nvme_ctrl");
 		goto out_detach_genpd;
@@ -2516,10 +2517,24 @@ static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.max_queue_depth = 64,
 };
 
+static const struct apple_nvme_hw apple_nvme_t8140_hw = {
+	.has_lsq_nvmmu = true,
+	.has_separate_nvmmu = true,
+	.needs_ioq_registers = true,
+	.max_queue_depth = 64,
+	/*
+	 * An fsynced overwrite completed and later reverted after an abrupt
+	 * reset; explicit flushes persisted the preceding data. Let the block
+	 * layer follow each FUA write with a flush.
+	 */
+	.quirks = NVME_QUIRK_BROKEN_FUA,
+};
+
 static const struct of_device_id apple_nvme_of_match[] = {
 	{ .compatible = "apple,t8015-nvme-ans2", .data = &apple_nvme_t8015_hw },
 	{ .compatible = "apple,t8103-nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{ .compatible = "apple,t8132-nvme-ans2", .data = &apple_nvme_t8132_hw },
+	{ .compatible = "apple,t8140-nvme-ans2", .data = &apple_nvme_t8140_hw },
 	{ .compatible = "apple,nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{},
 };
