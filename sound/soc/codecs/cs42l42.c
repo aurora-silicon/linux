@@ -788,10 +788,16 @@ EXPORT_SYMBOL_NS_GPL(cs42l42_src_config, "SND_SOC_CS42L42_CORE");
 static int cs42l42_asp_config(struct snd_soc_component *component,
 			      unsigned int sclk, unsigned int sample_rate)
 {
+	struct cs42l42_private *cs42l42 = snd_soc_component_get_drvdata(component);
 	u32 fsync = sclk / sample_rate;
 
-	/* Set up the LRCLK */
-	if (((fsync * sample_rate) != sclk) || ((fsync % 2) != 0)) {
+	/*
+	 * Set up the LRCLK. A 50/50 duty cycle needs an even number of
+	 * SCLKs per frame; a pulse-framed (DSP) link has no such
+	 * constraint and takes a pulse of half the frame, rounded down.
+	 */
+	if ((fsync * sample_rate) != sclk ||
+	    (cs42l42->dai_format != SND_SOC_DAIFMT_DSP_A && (fsync % 2) != 0)) {
 		dev_err(component->dev,
 			"Unsupported sclk %d/sample rate %d\n",
 			sclk,
