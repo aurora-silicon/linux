@@ -43,6 +43,18 @@
 			<APPLE_PINMUX(33, 1)>;
 	};
 
+	/*
+	 * Read back from J316s hardware: iBoot leaves pads 48-50 at function 1
+	 * with the same register values as spi3's signal pads 52-54, and pad 51
+	 * unconfigured. The platform device tree gives spi2's chip select as
+	 * "null", so it uses the controller's native chip select.
+	 */
+	spi2_pins: spi2-pins {
+		pinmux = <APPLE_PINMUX(48, 1)>,
+			<APPLE_PINMUX(49, 1)>,
+			<APPLE_PINMUX(50, 1)>;
+	};
+
 	spi3_pins: spi3-pins {
 		pinmux = <APPLE_PINMUX(52, 1)>,
 			<APPLE_PINMUX(53, 1)>,
