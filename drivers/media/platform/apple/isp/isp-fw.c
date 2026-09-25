@@ -770,11 +770,18 @@ garbage_collect:
 static void isp_firmware_shutdown(struct apple_isp *isp)
 {
 	flush_workqueue(isp->wq);
-	isp_stop_command_processor(isp);
+
+	/*
+	 * Stop the coprocessor before releasing any memory the firmware
+	 * uses, also when it did not acknowledge the suspend request.
+	 */
+	if (isp_stop_command_processor(isp))
+		dev_warn(isp->dev, "firmware did not suspend, stopping it\n");
 	isp_disable_irq(isp);
+	isp_firmware_shutdown_stage1(isp);
+
 	isp_firmware_shutdown_stage3(isp);
 	isp_firmware_shutdown_stage2(isp);
-	isp_firmware_shutdown_stage1(isp);
 	isp_collect_gc_surface(isp);
 }
 
