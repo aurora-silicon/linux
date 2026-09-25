@@ -21,9 +21,12 @@ use kernel::{
     ThisModule, //
 };
 
-/// TODO: add documentation
-pub trait MessageProcessor {
-    /// TODO: add documentation
+/// Decodes one fake-HID report of a sensor into the value the IIO channel exposes.
+///
+/// It is called from the AOP driver's receive worker while the IIO device may be read from
+/// another thread, hence `Send + Sync`.
+pub trait MessageProcessor: Send + Sync {
+    /// Returns the channel value carried by `message`.
     fn process(&self, message: &[u8]) -> u32;
 }
 

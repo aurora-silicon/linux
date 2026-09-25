@@ -14,8 +14,11 @@ pub struct EPICService {
     pub endpoint: u8,
 }
 
-/// Listener for the "HID" events sent by aop
-pub trait FakehidListener {
+/// Listener for the "HID" events sent by aop.
+///
+/// The AOP driver keeps the listener in an [`Arc`] shared with the child driver that registered
+/// it and invokes it from its own RTKit receive worker, so listeners have to be `Send + Sync`.
+pub trait FakehidListener: Send + Sync {
     /// Process the event.
     fn process_fakehid_report(&self, data: &[u8]) -> Result<()>;
 }

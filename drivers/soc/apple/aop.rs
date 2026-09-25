@@ -621,8 +621,6 @@ struct ListenerEntry {
     listener: Arc<dyn FakehidListener>,
 }
 
-unsafe impl Send for ListenerEntry {}
-
 #[pin_data]
 struct AopData {
     dev: ARef<device::Device>,
