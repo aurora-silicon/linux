@@ -14,7 +14,6 @@
 #include <media/videobuf2-core.h>
 #include <media/videobuf2-v4l2.h>
 
-/* #define APPLE_ISP_DEBUG */
 #define APPLE_ISP_DEVICE_NAME "apple-isp"
 #define APPLE_ISP_CARD_NAME "FaceTime HD Camera"
 
@@ -289,13 +288,8 @@ enum {
 	ISP_STATE_SLEEPING,
 };
 
-#ifdef APPLE_ISP_DEBUG
-#define isp_dbg(isp, fmt, ...) \
-	dev_info((isp)->dev, "[%s] " fmt, __func__, ##__VA_ARGS__)
-#else
 #define isp_dbg(isp, fmt, ...) \
 	dev_dbg((isp)->dev, "[%s] " fmt, __func__, ##__VA_ARGS__)
-#endif
 
 #define isp_err(isp, fmt, ...) \
 	dev_err((isp)->dev, "[%s] " fmt, __func__, ##__VA_ARGS__)
