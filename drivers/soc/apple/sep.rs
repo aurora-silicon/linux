@@ -615,8 +615,6 @@ struct SepData {
     #[pin]
     scrd_wq: CondVar,
 
-    sensor_present: Atomic<bool>,
-
     #[pin]
     bio_session: Mutex<bio::Session>,
 
@@ -807,7 +805,6 @@ impl SepData {
                 sbio_rx <- new_mutex!(transfer::Reassembly::new()),
                 sbio_wq <- new_condvar!("SepData::sbio_wq"),
                 sbio_ready: Atomic::new(false),
-                sensor_present: Atomic::new(false),
                 bio_session <- new_mutex!(bio::Session::new()),
                 bio_index <- new_mutex!(bio_index),
                 bio_dev <- new_mutex!(None),

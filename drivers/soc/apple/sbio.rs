@@ -262,7 +262,6 @@ impl SepData {
 
     pub(crate) fn attach_sensor(&self) {
         if let Err(e) = sensor::register_driver() {
-            self.sensor_present.store(false, Relaxed);
             dev_err!(
                 self.dev,
                 "sensor: could not register the SPI driver: {:?}\n",
@@ -272,7 +271,6 @@ impl SepData {
         }
 
         if let Err(e) = dt::enable_spi_sensor(sensor::CONTROLLER_BASE, sensor::CHIP_SELECT) {
-            self.sensor_present.store(false, Relaxed);
             dev_warn!(
                 self.dev,
                 "sensor: could not enable the SPI bus at 0x{:x} or create the sensor node ({:?}); no sensor\n",
@@ -283,7 +281,6 @@ impl SepData {
         }
 
         let bound = sensor::is_bound();
-        self.sensor_present.store(bound, Relaxed);
         if bound && sensor::power_source() == sensor::PowerSource::None {
             dev_warn!(
                 self.dev,
@@ -1011,7 +1008,7 @@ impl SepData {
     }
 
     fn attach_bringup(&self) {
-        if !self.sensor_present.load(Relaxed) {
+        if !sensor::is_bound() {
             dev_warn!(
                 self.dev,
                 "sbio: no sensor bound at attach; catacomb restore ran but capture is unavailable\n"
@@ -2421,13 +2418,16 @@ impl SepData {
         } else {
             None
         };
+        // The SPI probe may have deferred until its SMC power supplier bound.
+        // A saved attach-time snapshot would incorrectly reject later ioctls.
+        let sensor_present = sensor::is_bound();
         let handled = {
             let mut session = self.bio_session.lock();
             let index = self.bio_index.lock();
             let mut ctx = bio::Context {
                 session: &mut session,
                 index: &index,
-                sensor_present: self.sensor_present.load(Relaxed),
+                sensor_present,
                 live_identity_count,
             };
             bio::ioctl(&mut ctx, cmd, arg)?

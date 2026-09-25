@@ -124,6 +124,7 @@ int sep_sensor_cs_timing_mode(void);
 int sep_sensor_power_cycle(void);
 int sep_sensor_power_source(void);
 int sep_sensor_power(int on);
+const char *sep_sensor_firmware_name(void);
 int sep_sensor_xfer(const void *tx, void *rx, size_t len);
 int sep_sensor_xfer_tx(const void *tx, size_t len);
 int sep_sensor_xfer2(const void *tx, size_t tx_len, void *rx, size_t rx_len);
