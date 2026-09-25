@@ -738,6 +738,14 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 				if (!dcp_typec_route_available(candidate))
 					continue;
 				score = dcp_typec_route_score(candidate);
+				/*
+				 * On J414s, leave dcpext0 free for a dock's DP
+				 * tunnel when a direct DP-alt-mode display can use
+				 * the Type-C-only dcpext1 pipeline.
+				 */
+				if (of_machine_is_compatible("apple,j414s") &&
+				    candidate->dcp->fixed_phy)
+					score += 100;
 				if (score < best_score) {
 					best = candidate;
 					best_score = score;
