@@ -457,11 +457,19 @@ impl AFKEndpoint {
             );
             return Err(EIO);
         }
-        // SAFETY: TODO
+        // SAFETY: This runs from the RTKit receive worker. The RTKit handle
+        // is dropped by `AopData::remove()`, which runs from unbind or from a
+        // failed probe while the device is still bound, and no callback runs
+        // once that drop has returned. So the device is bound for as long as
+        // this callback runs.
         let bound_dev = unsafe { dev.as_bound() };
         let iomem = Coherent::<u8>::zeroed_slice(bound_dev, size, GFP_KERNEL)?;
-        rtkit.send_message(self.index, AFK_MSG_GET_BUF_ACK | iomem.dma_handle())?;
+        let iova = iomem.dma_handle();
+        // Own the buffer before its address leaves the host: should the
+        // doorbell fail after the firmware has seen the message, the buffer
+        // must not go back to the allocator while the firmware uses it.
         self.iomem = Some(iomem);
+        rtkit.send_message(self.index, AFK_MSG_GET_BUF_ACK | iova)?;
         Ok(())
     }
 
