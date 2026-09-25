@@ -48,7 +48,7 @@ struct sep_bio_info {
   __u32 version;
   __u32 sensor_present;
   __u32 enrolled;
-  __u32 capacity;
+  __u32 capacity; /* usable slots in this SEP user context, not ABI list size */
   __u32 enroll_stages;
   __u32 reserved[3];
 };
@@ -92,7 +92,7 @@ struct sep_bio_verify_poll {
   __u32 state;
   __u32 result;
   __u32 status;
-  __u32 reserved;
+  __u32 guidance; /* SEP_BIO_GUIDANCE_*; status only, no capture side effect */
   __u8  uuid[SEP_BIO_UUID_LEN];
   __u8  token[SEP_BIO_TOKEN_LEN];  /* single use, bound to the nonce */
   __u64 deadline_ns;      /* CLOCK_MONOTONIC; past this the token is void */

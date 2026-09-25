@@ -38,12 +38,18 @@ impl SepData {
     pub(crate) fn sbio_call(&self, op: &crate::sbio::SbioOp) -> SbioOutcome {
         let done = match self.sbio_transfer(op) {
             Ok(done) => done,
-            Err(_) => {
+            Err(e) => {
+                if op.opcode() == OP_SBIO_BEGIN_ENROL {
+                    dev_err!(self.dev, "enrol: BEGIN_ENROL transfer failed ({:?})\n", e);
+                }
                 return SbioOutcome::Other;
             }
         };
 
         let Some(err) = done.status.answered() else {
+            if op.opcode() == OP_SBIO_BEGIN_ENROL {
+                dev_err!(self.dev, "enrol: BEGIN_ENROL reply had no status: {}\n", done.status);
+            }
             return SbioOutcome::Other;
         };
 
@@ -51,7 +57,12 @@ impl SepData {
             crate::sbio::SBIO_STATUS_OK => SbioOutcome::Ok(done.payload),
             crate::sbio::SBIO_STATUS_PREREQUISITE => SbioOutcome::PrerequisiteMissing,
             crate::sbio::SBIO_STATUS_16 => SbioOutcome::Status16,
-            _ => SbioOutcome::Other,
+            _ => {
+                if op.opcode() == OP_SBIO_BEGIN_ENROL {
+                    dev_err!(self.dev, "enrol: BEGIN_ENROL replied with status 0x{:x}\n", err);
+                }
+                SbioOutcome::Other
+            }
         }
     }
 
@@ -1387,7 +1398,7 @@ impl SepData {
                     // The capture did not take (partial/unusable contact). Nudge
                     // the person to hold still and press again rather than
                     // silently re-capturing with no feedback.
-                    if bio::enrol_guide(&mut self.bio_session.lock(), bio::Guidance::HoldStill) {
+                    if bio::capture_guide(&mut self.bio_session.lock(), bio::Guidance::HoldStill) {
                         self.bio_wake();
                     }
                 }
@@ -2042,7 +2053,7 @@ impl SepData {
                 _ => None,
             };
             if let Some(guide) = guide {
-                if bio::enrol_guide(&mut self.bio_session.lock(), guide) {
+                if bio::capture_guide(&mut self.bio_session.lock(), guide) {
                     self.bio_wake();
                 }
             }
@@ -2403,7 +2414,7 @@ impl SepData {
         // Query SEP outside the bio session/index locks. A host index can
         // outlive its SEP identity after a failed cold restore; userspace
         // must not mistake that index for proof of a live template.
-        let live_identity_count = if cmd == bio::IOC_GET_INFO
+        let live_identity_count = if (cmd == bio::IOC_GET_INFO || cmd == bio::IOC_ENROL_START)
             && self.touchid_started.load(Relaxed)
         {
             self.enclave_identity_count()

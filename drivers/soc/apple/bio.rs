@@ -15,6 +15,9 @@ const LABEL_LEN: usize = 128;
 const NONCE_LEN: usize = 32;
 pub(crate) const TOKEN_LEN: usize = 32;
 const MAX_IDENTITIES: usize = 32;
+// The host index ABI has 32 entries, but this driver uses one SEP user context.
+// Mac Touch ID permits only three fingerprints in a single user context.
+const SEP_USER_CAPACITY: usize = 3;
 
 pub(crate) const DEVICE_NAME: &CStr = c"sep-bio";
 pub(crate) const DEVICE_MODE: u16 = 0o600;
@@ -123,7 +126,7 @@ struct VerifyPoll {
     state: State,
     result: MatchResult,
     status: u32,
-    reserved: u32,
+    guidance: Guidance,
     uuid: [u8; UUID_LEN],
     token: [u8; TOKEN_LEN],
     deadline_ns: u64,
@@ -184,7 +187,7 @@ const MAGIC: u32 = 0xB1;
 
 pub(crate) const IOC_GET_INFO: u32 = _IOR::<Info>(MAGIC, 0x01);
 const IOC_LIST: u32 = _IOR::<List>(MAGIC, 0x02);
-const IOC_ENROL_START: u32 = _IOW::<EnrolStart>(MAGIC, 0x03);
+pub(crate) const IOC_ENROL_START: u32 = _IOW::<EnrolStart>(MAGIC, 0x03);
 const IOC_ENROL_POLL: u32 = _IOR::<EnrolPoll>(MAGIC, 0x04);
 const IOC_VERIFY_START: u32 = _IOW::<VerifyStart>(MAGIC, 0x05);
 const IOC_VERIFY_POLL: u32 = _IOR::<VerifyPoll>(MAGIC, 0x06);
@@ -390,6 +393,7 @@ enum Op {
     Verify {
         nonce: [u8; NONCE_LEN],
         terminal: Option<VerifyOutcome>,
+        guidance: Guidance,
     },
 }
 
@@ -509,7 +513,7 @@ fn get_info(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         version: IFACE_VERSION,
         sensor_present: u32::from(ctx.sensor_present),
         enrolled: ctx.index.total() as u32,
-        capacity: MAX_IDENTITIES as u32,
+        capacity: SEP_USER_CAPACITY as u32,
         enroll_stages: ENROL_STAGES,
         // reserved[0] is a validity flag. A zero count is only meaningful
         // when SEP itself successfully answered LIST_IDENTITIES; older
@@ -559,7 +563,9 @@ fn enrol_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     if !ctx.session.op.may_start() {
         return Err(EBUSY);
     }
-    if ctx.index.total() >= MAX_IDENTITIES {
+    if matches!(ctx.live_identity_count, Some(count) if count >= SEP_USER_CAPACITY)
+        || ctx.index.total() >= MAX_IDENTITIES
+    {
         return Err(ENOSPC);
     }
 
@@ -608,18 +614,30 @@ pub(crate) fn enrol_advance(
     false
 }
 
-pub(crate) fn enrol_guide(session: &mut Session, guide: Guidance) -> bool {
-    if let Op::Enrol {
-        terminal, guidance, ..
-    } = &mut session.op
-    {
-        if terminal.is_none() && *guidance != guide {
-            *guidance = guide;
-            session.unseen = true;
-            return true;
+pub(crate) fn capture_guide(session: &mut Session, guide: Guidance) -> bool {
+    let changed = match &mut session.op {
+        Op::Enrol { terminal, guidance, .. } => {
+            if terminal.is_none() && *guidance != guide {
+                *guidance = guide;
+                true
+            } else {
+                false
+            }
         }
+        Op::Verify { terminal, guidance, .. } => {
+            if terminal.is_none() && *guidance != guide {
+                *guidance = guide;
+                true
+            } else {
+                false
+            }
+        }
+        Op::Idle => false,
+    };
+    if changed {
+        session.unseen = true;
     }
-    false
+    changed
 }
 
 pub(crate) fn enrol_finish(
@@ -723,6 +741,7 @@ fn verify_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         ctx.session.op = Op::Verify {
             nonce: request.nonce,
             terminal: Some(VerifyOutcome::NoMatch),
+            guidance: Guidance::None,
         };
         ctx.session.unseen = true;
         return Ok(Handled {
@@ -739,6 +758,7 @@ fn verify_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     ctx.session.op = Op::Verify {
         nonce: request.nonce,
         terminal: None,
+        guidance: Guidance::Place,
     };
     Ok(Handled {
         ret: 0,
@@ -755,7 +775,7 @@ pub(crate) fn verify_finish(
     outcome: VerifyOutcome,
     token_bytes: [u8; TOKEN_LEN],
 ) -> bool {
-    let Op::Verify { nonce, terminal } = &mut session.op else {
+    let Op::Verify { nonce, terminal, .. } = &mut session.op else {
         return false;
     };
     if terminal.is_some() {
@@ -789,39 +809,42 @@ fn verify_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     match &ctx.session.op {
         Op::Idle => out.state = State::Idle,
         Op::Enrol { .. } => return Err(EBUSY),
-        Op::Verify { nonce, terminal } => match terminal {
-            None => {
-                out.state = if ctx.session.unseen {
-                    State::Progress
-                } else {
-                    State::Pending
-                }
-            }
-            Some(VerifyOutcome::Failed(status)) => {
-                out.state = State::Failed;
-                out.result = MatchResult::NotCompared;
-                out.status = *status;
-            }
-            Some(VerifyOutcome::NoMatch) => {
-                out.state = State::Done;
-                out.result = MatchResult::NoMatch;
-            }
-            Some(VerifyOutcome::Matched(evidence)) => {
-                out.state = State::Done;
-                match ctx.session.token.as_ref() {
-                    Some(token) if token.usable(nonce, &evidence.identity) => {
-                        out.result = MatchResult::Match;
-                        out.uuid = evidence.identity;
-                        out.token = token.bytes;
-                        out.deadline_ns = token.deadline_ns;
-                        consume_token = true;
-                    }
-                    _ => {
-                        out.result = MatchResult::NotCompared;
+        Op::Verify { nonce, terminal, guidance } => {
+            out.guidance = *guidance;
+            match terminal {
+                None => {
+                    out.state = if ctx.session.unseen {
+                        State::Progress
+                    } else {
+                        State::Pending
                     }
                 }
+                Some(VerifyOutcome::Failed(status)) => {
+                    out.state = State::Failed;
+                    out.result = MatchResult::NotCompared;
+                    out.status = *status;
+                }
+                Some(VerifyOutcome::NoMatch) => {
+                    out.state = State::Done;
+                    out.result = MatchResult::NoMatch;
+                }
+                Some(VerifyOutcome::Matched(evidence)) => {
+                    out.state = State::Done;
+                    match ctx.session.token.as_ref() {
+                        Some(token) if token.usable(nonce, &evidence.identity) => {
+                            out.result = MatchResult::Match;
+                            out.uuid = evidence.identity;
+                            out.token = token.bytes;
+                            out.deadline_ns = token.deadline_ns;
+                            consume_token = true;
+                        }
+                        _ => {
+                            out.result = MatchResult::NotCompared;
+                        }
+                    }
+                }
             }
-        },
+        }
     }
 
     UserSlice::new(user, core::mem::size_of::<VerifyPoll>())
