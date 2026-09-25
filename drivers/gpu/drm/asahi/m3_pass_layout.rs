@@ -57,14 +57,32 @@ pub(crate) struct Allocation {
     pub(crate) gpu_alias:Option<u64>,
 }
 #[derive(Debug,PartialEq,Eq)]
-pub(crate) enum Error {Slot,Address}
+pub(crate) enum Error {Slot,Address,Clusters}
+/// GPU clusters of the qualified layout (G15S, two clusters).
+pub(crate) const QUALIFIED_CLUSTERS:u32=2;
+/// Per-cluster sizes of the three tiler preemption buffers: the qualified sizes (2688, 1280,
+/// 128) are two clusters of the T6030 preempt1/2/3 sizes. The start addresses are kept, so
+/// fewer clusters use a prefix of the same page.
+pub(crate) const PREEMPTION_PER_CLUSTER:[usize;3]=[0x540,0x280,0x40];
+// Two clusters give exactly the qualified T6030 sizes.
+const _:()=assert!(PREEMPTION_PER_CLUSTER[0]*2==2688 && PREEMPTION_PER_CLUSTER[1]*2==1280
+    && PREEMPTION_PER_CLUSTER[2]*2==128);
+/// The qualified two-cluster allocation: [`board_allocation`] with [`QUALIFIED_CLUSTERS`].
+#[allow(dead_code)]
+pub(crate) fn allocation(slot:usize,field:Field)->Result<Allocation,Error> {
+    board_allocation(slot,field,QUALIFIED_CLUSTERS)
+}
 /// Preserve all fixed virtual addresses, sizes, permission bits and aliases.
 /// The caller controls allocation order and lifetime; the layout owns no memory.
-pub(crate) fn allocation(slot:usize,field:Field)->Result<Allocation,Error> {
+/// Only the preemption buffers scale with the GPU cluster count (1 or 2); every other
+/// allocation is the qualified two-cluster one.
+pub(crate) fn board_allocation(slot:usize,field:Field,clusters:u32)->Result<Allocation,Error> {
     use Field::*;
     use Space::*;
     use Access::*;
     if slot>=SLOTS {return Err(Error::Slot);}
+    if clusters==0 || clusters>QUALIFIED_CLUSTERS {return Err(Error::Clusters);}
+    let preemption=|i:usize|PREEMPTION_PER_CLUSTER[i]*clusters as usize;
     let (base,stride,size,space,access,alias)=match field {
         FragmentStart=>(0xfffffc20700f3ff8,0x74000,8,Firmware,GpuFirmwareUncachedRw,None),
         FragmentEnd=>(0xfffffc20700fbff8,0x74000,8,Firmware,GpuFirmwareUncachedRw,None),
@@ -75,9 +93,9 @@ pub(crate) fn allocation(slot:usize,field:Field)->Result<Allocation,Error> {
         TilerUserStart=>(0xfffffc2071013ff8,0x20000,8,Firmware,FirmwareUncachedRw,None),
         TilerUserEnd=>(0xfffffc207101bff8,0x20000,8,Firmware,FirmwareUncachedRw,None),
         Auxiliary=>(0x100848a0000,0x98000,131072,ClientGpu,GpuUncachedRw,None),
-        Preemption0=>(0x1006083580,0x118000,2688,ClientGpu,GpuCachedRw,None),
-        Preemption1=>(0x100609bb00,0x118000,1280,ClientGpu,GpuCachedRw,None),
-        Preemption2=>(0x10060b3f80,0x118000,128,ClientGpu,GpuCachedRw,None),
+        Preemption0=>(0x1006083580,0x118000,preemption(0),ClientGpu,GpuCachedRw,None),
+        Preemption1=>(0x100609bb00,0x118000,preemption(1),ClientGpu,GpuCachedRw,None),
+        Preemption2=>(0x10060b3f80,0x118000,preemption(2),ClientGpu,GpuCachedRw,None),
         Tpc=>(0x10060c8000,0x118000,262144,ClientGpu,GpuCachedRw,None),
         Tilemap=>(0x1006118000,0x118000,98304,ClientGpu,GpuCachedRw,None),
         HeapMetadata=>(0x1006143000,0x118000,4096,ClientGpu,GpuCachedRw,None),

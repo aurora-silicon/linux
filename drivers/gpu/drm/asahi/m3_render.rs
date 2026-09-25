@@ -31,6 +31,8 @@ pub(crate) struct Render {
     draw:u64, heads:[u16;2], cached_views:KVec<CachedViews>,
     slot:usize, batch_count:usize, early_count:u32,
     checkpoint:(u64,[u16;2],usize,usize,u32),
+    /// GPU clusters: tiler accelerators (TPC storage) and preemption buffers.
+    clusters:u32,
 }
 // Queue allocations belong to Render, not to a pass. Keep their fixed arenas
 // and firmware/shared mapping permissions from the qualified allocation map.
@@ -57,7 +59,7 @@ const RENDER_QUEUES: [QueueObjects; 2] = [
         scratch: s::FRAGMENT_SCRATCH, tiler: false, uuid: 0x3d0000 },
 ];
 impl Render {
-    pub(crate) fn new(dev:&driver::AsahiDevice,uat:&mmu::Uat,vm:&mmu::Vm,stats:Region)->Result<Self> {
+    pub(crate) fn new(dev:&driver::AsahiDevice,uat:&mmu::Uat,vm:&mmu::Vm,stats:Region,clusters:u32)->Result<Self> {
         let binding=uat.bind(vm)?;
         let mut objects=KVec::new();let mut aliases=KVec::new();
         for index in 0..s::COUNT {
@@ -75,14 +77,14 @@ impl Render {
         let init_bm=Buffer::at_prot(dev,uat.kernel_vm(),None,Some(0xfffffc200062bfe0),
             sync::INIT_BM_SIZE,prot::PROT_FW_SHARED_RW,prot::PROT_GPU_SHARED_RW)?;
         let mut passes=KVec::with_capacity(pass_layout::SLOTS,GFP_KERNEL)?;
-        for slot in 0..pass_layout::SLOTS {passes.push(Pass::new(dev,uat,vm,slot,&mut aliases)?,GFP_KERNEL)?;}
+        for slot in 0..pass_layout::SLOTS {passes.push(Pass::new(dev,uat,vm,slot,clusters,&mut aliases)?,GFP_KERNEL)?;}
         let mut sequence_bytes=KVec::new();
         sequence_bytes.resize(sequence::STORAGE,0u8,GFP_KERNEL)?;
         let mut tiler_bytes=KVec::new();
         tiler_bytes.resize(tiler::SIZE,0u8,GFP_KERNEL)?;
         let mut fragment_bytes=KVec::new();
         fragment_bytes.resize(fragment::SIZE,0u8,GFP_KERNEL)?;
-        let mut job=Self{passes,init_bm,stats,sequence_bytes,tiler_bytes,fragment_bytes,objects,_aliases:aliases,_binding:binding,last_progress_ns:0,draw:0,heads:[0;2],cached_views:KVec::new(),slot:0,batch_count:0,early_count:0,checkpoint:(0,[0;2],0,0,0)};
+        let mut job=Self{passes,init_bm,stats,sequence_bytes,tiler_bytes,fragment_bytes,objects,_aliases:aliases,_binding:binding,last_progress_ns:0,draw:0,heads:[0;2],cached_views:KVec::new(),slot:0,batch_count:0,early_count:0,checkpoint:(0,[0;2],0,0,0),clusters};
         // Lists and the matching manager are built before InitBM publication.
         job.initialize_parameter_buffer()?;
         for pool in &UMA_POOLS { pool.initialize(&mut job.objects)?; }
@@ -216,7 +218,7 @@ impl Render {
         let gpu=|field:P| GpuVa::new(pass.get(field).gpu_va()?).map_err(|_|EINVAL);
         let seq=pass.get(P::TilerSequence);
         let command=pass.get(P::TilerCommand);
-        let g=Self::geometry(r)?;
+        let g=Self::geometry(r,self.clusters)?;
         if g.tpc_bytes>pass.get(P::Tpc).size() as u64
             || g.tilemap_bytes>pass.get(P::Tilemap).size() as u64 {return Err(E2BIG);}
         // The old per-slot register keeps its seed entry, independent of the
@@ -272,11 +274,12 @@ impl Render {
         self.objects[NOTIFIER].u32(state::NOTIFIER_CONTEXT, context)?;
         Ok(())
     }
-    fn geometry(r:agx_uapi::UapiRenderCommand)->Result<crate::agx_render::Geometry> {
+    /// Pass geometry; TPC storage is per tiler accelerator, one per GPU cluster.
+    fn geometry(r:agx_uapi::UapiRenderCommand,clusters:u32)->Result<crate::agx_render::Geometry> {
         use crate::agx_render::{Geometry,Utile};
         let x=if r.utile_width==16 {Utile::Pixels16} else {Utile::Pixels32};
         let y=if r.utile_height==16 {Utile::Pixels16} else {Utile::Pixels32};
-        let mut g=Geometry::new_layered(u32::from(r.width),u32::from(r.height),x,y,2,r.layers).map_err(|_|EINVAL)?;
+        let mut g=Geometry::new_layered(u32::from(r.width),u32::from(r.height),x,y,clusters,r.layers).map_err(|_|EINVAL)?;
         g.set_samples(r.samples).map_err(|_|EINVAL)?;
         Ok(g)
     }
@@ -288,7 +291,7 @@ impl Render {
         let gpu=|field:P| GpuVa::new(pass.get(field).gpu_va()?).map_err(|_|EINVAL);
         let seq=pass.get(P::FragmentSequence);
         let command=pass.get(P::FragmentCommand);
-        let geometry=Self::geometry(r)?;
+        let geometry=Self::geometry(r,self.clusters)?;
         let mask=if r.flags&16!=0 {u64::MAX} else {u32::MAX as u64};
         let program=|p:agx_uapi::UapiProgram|->Result<Program> {Ok(Program {
             address:usc.checked_add(u64::from(p.usc&!63)).ok_or(EOVERFLOW)?,resources:p.resource_spec&mask,
@@ -377,7 +380,7 @@ impl Render {
         // Validate every pass before changing any queue or completion state.
         for &command in commands {
             let crate::m3_submit::Command::Render{command:r,..}=command else {return Err(EINVAL);};
-            Self::geometry(r)?;
+            Self::geometry(r,self.clusters)?;
             crate::agx_render_state::compact(r.vdm_base).map_err(|_|EINVAL)?;
         }
         if !self._binding.matches(vm) {
@@ -393,7 +396,7 @@ impl Render {
                 }
                 for (slot,pass) in self.passes.iter_mut().enumerate() {
                     for field in pass_layout::FIELDS {
-                        let a=pass_layout::allocation(slot,field).map_err(|_|EINVAL)?;
+                        let a=pass_layout::board_allocation(slot,field,self.clusters).map_err(|_|EINVAL)?;
                         if a.space==Space::ClientGpu {views.push((ViewOwner::Pass{slot,field},pass.get_mut(field).map_gpu_view(vm)?),GFP_KERNEL)?;}
                         if a.gpu_alias.is_some() {aliases.push(pass.get_mut(field).map_gpu_view(vm)?,GFP_KERNEL)?;}
                     }
@@ -420,7 +423,7 @@ impl Render {
         // already-grown buffers are reusable on the next submission.
         for (slot,&command) in commands.iter().enumerate() {
             let crate::m3_submit::Command::Render{command:r,..}=command else {return Err(EINVAL);};
-            let g=Self::geometry(r)?;
+            let g=Self::geometry(r,self.clusters)?;
             for (field,base,bytes) in [(P::Tpc,s::TPC_LABEL,g.tpc_bytes),(P::Tilemap,s::TILEMAP_LABEL,g.tilemap_bytes)] {
                 let size=usize::try_from(bytes).map_err(|_|EOVERFLOW)?;
                 if size>self.passes[slot].get(field).size() {
@@ -467,7 +470,7 @@ impl Render {
         if early {self.early_count+=1;}
         // Only reset per-draw objects. Pool allocators, PB lists, queues,
         // notification state and previous stamps retain firmware ownership.
-        self.passes[self.slot].reset(&Self::geometry(r)?)?;
+        self.passes[self.slot].reset(&Self::geometry(r,self.clusters)?)?;
         self.init_bm.fill(0)?; // retain the prior shared InitBM reset before encoding
         self.draw=self.draw.checked_add(1).ok_or(EOVERFLOW)?;
         self.batch_count+=1;
