@@ -22,6 +22,10 @@
  * @size:      Size of the shared memory buffer.
  * @iova:      Device VA of shared memory buffer.
  * @is_mapped: Shared memory buffer is managed by the co-processor.
+ * @needs_dma_sync: The buffer is a streaming DMA mapping of normal RAM made by
+ *                  the parent driver's shmem_setup, with @iova as its DMA
+ *                  handle. RTKit synchronizes it for the CPU before reading.
+ *                  Never set this for coherent allocations or for iomem.
  * @private:   Private data pointer for the parent driver.
  */
 
@@ -31,6 +35,7 @@ struct apple_rtkit_shmem {
 	size_t size;
 	dma_addr_t iova;
 	bool is_mapped;
+	bool needs_dma_sync;
 	void *private;
 };
 
@@ -46,11 +51,13 @@ struct apple_rtkit_shmem {
  *                 should return true if it handled the message. If it
  *                 returns false, the message will be passed on to the
  *                 worker thread.
- * @shmem_setup:   Setup shared memory buffer. If bfr.is_iomem is true the
- *                 buffer is managed by the co-processor and needs to be mapped.
- *                 Otherwise the buffer is managed by Linux and needs to be
- *                 allocated. If not specified dma_alloc_coherent is used.
- *                 Called in process context.
+ * @shmem_setup:   Setup shared memory buffer. A nonzero input iova requests a
+ *                 mapping of firmware-owned memory; validate the ownership
+ *                 before mapping it. Otherwise allocate a Linux-owned buffer.
+ *                 On failure undo any partial setup. Do not retain the
+ *                 descriptor pointer and do not change size: repeated
+ *                 requests are matched against it. If not specified
+ *                 dma_alloc_coherent is used. Called in process context.
  * @shmem_destroy: Undo the shared memory buffer setup in shmem_setup. If not
  *                 specified dma_free_coherent is used. Called in process
  *                 context.
@@ -101,9 +108,34 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					  const struct apple_rtkit_ops *ops);
 
 /*
+ * Initialize an instance for a co-processor that the bootloader left running
+ * and that cannot be reset. No HELLO/EPMAP handshake takes place: the system
+ * endpoints are marked available and syslog records are acknowledged without
+ * being parsed. The caller must verify the device-specific running/ready
+ * indicators before using the instance.
+ */
+struct apple_rtkit *apple_rtkit_init_adopted(struct device *dev, void *cookie,
+					     const char *mbox_name, int mbox_idx,
+					     const struct apple_rtkit_ops *ops);
+
+/*
  * Free an instance of apple_rtkit.
  */
 void apple_rtkit_free(struct apple_rtkit *rtk);
+
+/*
+ * Detach a co-processor that could not be quiesced without releasing its
+ * shared buffers.
+ *
+ * Stops mailbox callbacks and drains the private RTKit workqueue before
+ * freeing the transport state. Firmware-visible mappings and their allocation
+ * contexts are intentionally retained until reboot; shmem_destroy is not
+ * called. The caller must also retain any buffers it supplied independently
+ * and must not treat this as a successful firmware shutdown or as permission
+ * to reprobe. The caller must exclude concurrent users of rtk, as for
+ * apple_rtkit_free().
+ */
+void apple_rtkit_free_retaining_buffers(struct apple_rtkit *rtk);
 
 /*
  * Reinitialize internal structures. Must only be called with the co-processor
@@ -116,6 +148,12 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk);
  * co-processor has been started.
  */
 int apple_rtkit_boot(struct apple_rtkit *rtk);
+
+/*
+ * Mark an instance created with apple_rtkit_init() as running without a
+ * handshake, see apple_rtkit_init_adopted().
+ */
+int apple_rtkit_adopt_running(struct apple_rtkit *rtk);
 
 /*
  * Quiesce the co-processor.
