@@ -10,4 +10,20 @@ config HID_DOCKCHANNEL
 	  The keyboard and touchpad are HID based devices connected via the
 	  proprietary DockChannel interface.
 
+	  The MTP coprocessor announces the keyboard and touchpad only when
+	  it boots, so the driver cannot be unbound and rebound, or built as
+	  a module and reloaded, without losing both until the next boot.
+
+config HID_DOCKCHANNEL_KUNIT_TEST
+	tristate "KUnit tests for the DockChannel HID protocol helpers" if !KUNIT_ALL_TESTS
+	depends on KUNIT && APPLE_DOCKCHANNEL
+	default KUNIT_ALL_TESTS
+	help
+	  Build the KUnit tests for the DockChannel HID protocol helpers,
+	  which check the encoding of the MTP power commands. They need no
+	  Apple hardware. For more information on KUnit and unit tests in
+	  general, refer to Documentation/dev-tools/kunit/.
+
+	  If unsure, say N.
+
 endmenu

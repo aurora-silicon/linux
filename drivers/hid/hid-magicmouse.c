@@ -15,7 +15,9 @@
 #include <linux/hid.h>
 #include <linux/input/mt.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/slab.h>
+#include <linux/unaligned.h>
 #include <linux/workqueue.h>
 
 #include "hid-ids.h"
@@ -143,6 +145,7 @@ struct magicmouse_input_ops {
  * @input: Input device through which we report events.
  * @quirks: Currently unused.
  * @query_dimensions: Whether to query and update dimensions on first open
+ * @mtp_c1fe: Whether the MTP trackpad sends the J700 C1FE report layout.
  * @ntouches: Number of touches in most recent touch report.
  * @scroll_accel: Number of consecutive scroll motions.
  * @scroll_jiffies: Time of last scroll motion.
@@ -158,6 +161,7 @@ struct magicmouse_sc {
 	struct input_dev *input;
 	unsigned long quirks;
 	bool query_dimensions;
+	bool mtp_c1fe;
 
 	int ntouches;
 	int scroll_accel;
@@ -712,10 +716,12 @@ struct tp_finger {
 } __attribute__((packed, aligned(2)));
 
 /**
- * struct vendor trackpad report
+ * struct tp_header - vendor trackpad report header
  *
- * @num_fingers:	the number of fingers being reported in @fingers
+ * @unknown:		unknown
+ * @num_fingers:	the number of finger records that follow
  * @buttons:		same as HID buttons
+ * @unknown3:		unknown
  */
 struct tp_header {
 	// HID vendor part, up to 1751 bytes
@@ -726,10 +732,13 @@ struct tp_header {
 };
 
 /**
- * struct standard HID mouse report
+ * struct tp_mouse_report - standard HID mouse report
  *
- * @report_id:		reportid
+ * @report_id:		report ID
  * @buttons:		HID Usage Buttons 3 1-bit reports
+ * @rel_x:		relative X movement
+ * @rel_y:		relative Y movement
+ * @padding:		padding
  */
 struct tp_mouse_report {
 	// HID mouse report
@@ -739,6 +748,58 @@ struct tp_mouse_report {
 	u8 rel_y;
 	u8 padding[4];
 };
+
+/*
+ * The J700 trackpad (Apple's C1FE controller) sends report 0x75 with a
+ * 32-byte header instead of the 38-byte one above, and an 8-byte trailer
+ * after the contact records. Offsets count from the report ID; multi-byte
+ * fields are little-endian:
+ *
+ *   offset       size    contents
+ *   0            1       report ID, 0x75
+ *   2            1       header length, 32
+ *   3            1       4, meaning unknown
+ *   16           4       contact section length, 30 * N
+ *   20           2       trailer length, 8
+ *   22           1       contact count N
+ *   23           1       bit 0: button pressed
+ *   32           30 * N  contact records, in the struct tp_finger layout
+ *   32 + 30 * N  8       trailer, not decoded
+ *
+ * Only the position fields of a record are known to be meaningful; the
+ * touch area fields are zero on some real contacts, and the controller has
+ * no force sensor.
+ */
+#define MAGICMOUSE_C1FE_REPORT_ID	0x75
+#define MAGICMOUSE_C1FE_HEADER_SIZE	32
+#define MAGICMOUSE_C1FE_TRAILER_SIZE	8
+
+static bool magicmouse_c1fe_report_valid(const u8 *data, int size)
+{
+	const size_t touch_sz = sizeof(struct tp_finger);
+	unsigned int count;
+
+	if (size < MAGICMOUSE_C1FE_HEADER_SIZE ||
+	    data[0] != MAGICMOUSE_C1FE_REPORT_ID ||
+	    data[2] != MAGICMOUSE_C1FE_HEADER_SIZE || data[3] != 4)
+		return false;
+
+	count = data[22];
+	return count <= MAX_CONTACTS &&
+	       get_unaligned_le32(data + 16) == count * touch_sz &&
+	       get_unaligned_le16(data + 20) == MAGICMOUSE_C1FE_TRAILER_SIZE &&
+	       (size_t)size == MAGICMOUSE_C1FE_HEADER_SIZE + count * touch_sz +
+			       MAGICMOUSE_C1FE_TRAILER_SIZE;
+}
+
+static void report_c1fe_finger_data(struct input_dev *input, int slot,
+				    const struct input_mt_pos *pos)
+{
+	input_mt_slot(input, slot);
+	input_mt_report_slot_state(input, MT_TOOL_FINGER, true);
+	input_report_abs(input, ABS_MT_POSITION_X, pos->x);
+	input_report_abs(input, ABS_MT_POSITION_Y, pos->y);
+}
 
 static void report_finger_data(struct input_dev *input, int slot,
 			       const struct input_mt_pos *pos,
@@ -771,7 +832,7 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 	struct tp_finger *f;
 	int i, n;
 	u32 npoints;
-	const size_t hdr_sz = sizeof(struct tp_header);
+	size_t hdr_sz = sizeof(struct tp_header);
 	const size_t touch_sz = sizeof(struct tp_finger);
 	u8 map_contacs[MAX_CONTACTS];
 
@@ -779,12 +840,19 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 	// print_hex_dump_debug("appleft ev: ", DUMP_PREFIX_OFFSET, 16, 1, data,
 	// 		     size, false);
 
-	/* Expect 46 bytes of prefix, and N * 30 bytes of touch data. */
-	if (size < hdr_sz || ((size - hdr_sz) % touch_sz) != 0)
+	if (msc->mtp_c1fe) {
+		if (!magicmouse_c1fe_report_valid(data, size))
+			return 0;
+		hdr_sz = MAGICMOUSE_C1FE_HEADER_SIZE;
+	} else if (size < hdr_sz || ((size - hdr_sz) % touch_sz) != 0) {
+		/* Expect 46 bytes of prefix, and N * 30 bytes of touch data. */
 		return 0;
+	}
 
+	/* The count and button bytes sit at the same offsets in both headers. */
 	tp_hdr = (struct tp_header *)data;
 
+	/* The C1FE trailer is shorter than a record, so this is N there too. */
 	npoints = (size - hdr_sz) / touch_sz;
 	if (npoints < tp_hdr->num_fingers || npoints > MAX_CONTACTS) {
 		hid_warn(hdev,
@@ -797,7 +865,7 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 	n = 0;
 	for (i = 0; i < tp_hdr->num_fingers; i++) {
 		f = (struct tp_finger *)(data + hdr_sz + i * touch_sz);
-		if (le16_to_int(f->touch_major) == 0)
+		if (!msc->mtp_c1fe && le16_to_int(f->touch_major) == 0)
 			continue;
 
 		hid_dbg(hdev, "ev x:%04x y:%04x\n", le16_to_int(f->abs_x),
@@ -813,7 +881,10 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 	for (i = 0; i < n; i++) {
 		int idx = map_contacs[i];
 		f = (struct tp_finger *)(data + hdr_sz + idx * touch_sz);
-		report_finger_data(input, msc->tracking_ids[i], &msc->pos[i], f);
+		if (msc->mtp_c1fe)
+			report_c1fe_finger_data(input, msc->tracking_ids[i], &msc->pos[i]);
+		else
+			report_finger_data(input, msc->tracking_ids[i], &msc->pos[i], f);
 	}
 
 	input_mt_sync_frame(input);
@@ -1065,13 +1136,33 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 
 	mt_flags = INPUT_MT_POINTER | INPUT_MT_DROP_UNUSED | INPUT_MT_TRACK;
 
-	/* finger touch area */
-	input_set_abs_params(input, ABS_MT_TOUCH_MAJOR, 0, 5000, 0, 0);
-	input_set_abs_params(input, ABS_MT_TOUCH_MINOR, 0, 5000, 0, 0);
+	/*
+	 * The C1FE report carries positions and the button only; advertise
+	 * nothing that user space would take for a touch size or a pressure.
+	 */
+	if (!msc->mtp_c1fe) {
+		/* finger touch area */
+		input_set_abs_params(input, ABS_MT_TOUCH_MAJOR, 0, 5000, 0, 0);
+		input_set_abs_params(input, ABS_MT_TOUCH_MINOR, 0, 5000, 0, 0);
 
-	/* finger approach area */
-	input_set_abs_params(input, ABS_MT_WIDTH_MAJOR, 0, 5000, 0, 0);
-	input_set_abs_params(input, ABS_MT_WIDTH_MINOR, 0, 5000, 0, 0);
+		/* finger approach area */
+		input_set_abs_params(input, ABS_MT_WIDTH_MAJOR, 0, 5000, 0, 0);
+		input_set_abs_params(input, ABS_MT_WIDTH_MINOR, 0, 5000, 0, 0);
+
+		input_set_abs_params(input, ABS_MT_PRESSURE, 0, 6000, 0, 0);
+
+		/*
+		 * This makes libinput recognize this as a PressurePad and
+		 * stop trying to use pressure for touch size. Pressure unit
+		 * seems to be ~grams on these touchpads.
+		 */
+		input_abs_set_res(input, ABS_MT_PRESSURE, 1);
+
+		/* finger orientation */
+		input_set_abs_params(input, ABS_MT_ORIENTATION,
+				     -J314_TP_MAX_FINGER_ORIENTATION,
+				     J314_TP_MAX_FINGER_ORIENTATION, 0, 0);
+	}
 
 	/* Note: Touch Y position from the device is inverted relative
 	 * to how pointer motion is reported (and relative to how USB
@@ -1079,19 +1170,6 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 	 * the origin at the same position, and just uses the additive
 	 * inverse of the reported Y.
 	 */
-
-	input_set_abs_params(input, ABS_MT_PRESSURE, 0, 6000, 0, 0);
-
-	/*
-	 * This makes libinput recognize this as a PressurePad and
-	 * stop trying to use pressure for touch size. Pressure unit
-	 * seems to be ~grams on these touchpads.
-	 */
-	input_abs_set_res(input, ABS_MT_PRESSURE, 1);
-
-	/* finger orientation */
-	input_set_abs_params(input, ABS_MT_ORIENTATION, -J314_TP_MAX_FINGER_ORIENTATION,
-			     J314_TP_MAX_FINGER_ORIENTATION, 0, 0);
 
 	/* finger position */
 	input_set_abs_params(input, ABS_MT_POSITION_X, J314_TP_MIN_X, J314_TP_MAX_X,
@@ -1114,6 +1192,18 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 	 * not actually want it.
 	 */
 	__clear_bit(EV_REP, input->evbit);
+
+	if (msc->mtp_c1fe) {
+		/* hid-input may have set these from the report descriptor. */
+		__clear_bit(ABS_MT_PRESSURE, input->absbit);
+		__clear_bit(ABS_PRESSURE, input->absbit);
+		__clear_bit(ABS_MT_TOUCH_MAJOR, input->absbit);
+		__clear_bit(ABS_MT_TOUCH_MINOR, input->absbit);
+		__clear_bit(ABS_MT_WIDTH_MAJOR, input->absbit);
+		__clear_bit(ABS_MT_WIDTH_MINOR, input->absbit);
+		__clear_bit(ABS_MT_ORIENTATION, input->absbit);
+		__clear_bit(ABS_TOOL_WIDTH, input->absbit);
+	}
 
 	error = input_mt_init_slots(input, MAX_CONTACTS, mt_flags);
 	if (error)
@@ -1329,6 +1419,13 @@ static int magicmouse_probe(struct hid_device *hdev,
 	// internal trackpad use a data format use input ops to avoid
 	// conflicts with the report ID.
 	if (id->bus == BUS_HOST) {
+		struct device_node *np;
+
+		/* The J700 trackpad sends a different report layout. */
+		np = of_get_child_by_name(dev_of_node(hdev->dev.parent), "multi-touch");
+		msc->mtp_c1fe = of_device_is_compatible(np, "apple,j700-multitouch");
+		of_node_put(np);
+
 		msc->input_ops.raw_event = magicmouse_raw_event_mtp;
 		msc->input_ops.setup_input = magicmouse_setup_input_mtp;
 	} else if (id->bus == BUS_SPI) {
