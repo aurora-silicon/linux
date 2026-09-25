@@ -65,11 +65,12 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 
 	/* Resets are synchronous, and only work if the device is powered and clocked. */
 	if (reg & APPLE_PMGR_RESET && pstate != APPLE_PMGR_PS_ACTIVE)
-		dev_err(ps->dev, "PS %s: powering off with RESET active\n",
+		dev_err_ratelimited(ps->dev, "PS %s: powering off with RESET active\n",
 			genpd->name);
 
 	if (pstate != APPLE_PMGR_PS_ACTIVE && (ps->force_disable || ps->force_reset)) {
-		u32 reg_pre = reg & ~(APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS);
+		u32 reg_pre = reg & ~(APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS |
+				      APPLE_PMGR_BUSY);
 
 		if (ps->force_disable)
 			reg_pre |= APPLE_PMGR_DEV_DISABLE;
@@ -85,12 +86,14 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 			APPLE_PMGR_PS_SET_TIMEOUT);
 
 		if (ret < 0)
-			dev_err(ps->dev, "PS %s: Failed to set reset/disable bits (now: 0x%x)\n",
+			dev_err_ratelimited(ps->dev, "PS %s: Failed to set reset/disable bits (now: 0x%x)\n",
 				genpd->name, reg);
 	}
 
+	/* Do not replay the hardware-owned BUSY bit in this whole-word write. */
 	reg &= ~(APPLE_PMGR_DEV_DISABLE | APPLE_PMGR_PS_RESET |
-		 APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS | APPLE_PMGR_PS_TARGET);
+		 APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS | APPLE_PMGR_BUSY |
+		 APPLE_PMGR_PS_TARGET);
 	reg |= FIELD_PREP(APPLE_PMGR_PS_TARGET, pstate);
 
 	dev_dbg(ps->dev, "PS %s: pwrstate = 0x%x: 0x%x\n", genpd->name, pstate, reg);
@@ -114,7 +117,7 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	}
 
 	if (ret < 0)
-		dev_err(ps->dev, "PS %s: Failed to reach power state 0x%x (requested 0x%x, now: 0x%x)\n",
+		dev_err_ratelimited(ps->dev, "PS %s: Failed to reach power state 0x%x (requested 0x%x, now: 0x%x)\n",
 			genpd->name, pstate, reg, cur);
 
 	if (auto_enable) {
@@ -158,7 +161,8 @@ static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned 
 	spin_lock_irqsave(&ps->genpd.slock, flags);
 
 	if (ps->genpd.status == GENPD_STATE_OFF)
-		dev_err(ps->dev, "PS 0x%x: asserting RESET while powered down\n", ps->offset);
+		dev_err_ratelimited(ps->dev,
+			"PS 0x%x: asserting RESET while powered down\n", ps->offset);
 
 	dev_dbg(ps->dev, "PS 0x%x: assert reset\n", ps->offset);
 	/* Quiesce device before asserting reset */
@@ -184,7 +188,8 @@ static int apple_pmgr_reset_deassert(struct reset_controller_dev *rcdev, unsigne
 	regmap_update_bits(ps->regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_DEV_DISABLE, 0);
 
 	if (ps->genpd.status == GENPD_STATE_OFF)
-		dev_err(ps->dev, "PS 0x%x: RESET was deasserted while powered down\n", ps->offset);
+		dev_err_ratelimited(ps->dev,
+			"PS 0x%x: RESET was deasserted while powered down\n", ps->offset);
 
 	spin_unlock_irqrestore(&ps->genpd.slock, flags);
 
