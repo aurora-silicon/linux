@@ -55,7 +55,8 @@ use kernel::{
         ArcBorrow,
         CondVar,
         CondVarTimeoutResult,
-        Mutex, //
+        Mutex,
+        MutexGuard, //
     },
     time::msecs_to_jiffies,
     types::{
@@ -638,10 +639,20 @@ impl AFKEndpoint {
                 }
                 let retcode = le_u32(data, 0);
                 let tag = ehdr.tag as usize;
-                if tag == 0 || tag > self.calls.len() {
-                    return Err(EINVAL);
-                }
-                let (future, ret) = match self.calls[tag - 1].take() {
+                let slot = match tag.checked_sub(1) {
+                    Some(slot) if slot < self.calls.len() && self.calls[slot].is_some() => slot,
+                    // The version 4 firmware does not echo the tag. Calls on
+                    // such an endpoint are serialized, and none is started
+                    // while an abandoned one is outstanding, so at most one
+                    // slot is in use and the reply belongs to it.
+                    _ if client.epic_v4 => {
+                        self.calls.iter().position(|c| c.is_some()).ok_or(ENOENT)?
+                    }
+                    _ if tag == 0 || tag > self.calls.len() => return Err(EINVAL),
+                    _ => return Err(ENOENT),
+                };
+                let tag = slot + 1;
+                let (future, ret) = match self.calls[slot].take() {
                     Some(CallSlot::Pending(future, ret)) => (future, ret),
                     Some(CallSlot::Abandoned) => {
                         // The late reply to a call that timed out; its slot
@@ -654,7 +665,6 @@ impl AFKEndpoint {
                         );
                         return Ok(());
                     }
-                    // A reply with no call in flight.
                     None => return Err(ENOENT),
                 };
                 let extra_data = ret.map(|mut ret| {
@@ -738,6 +748,21 @@ impl AFKEndpoint {
         data: &[u8],
         ret: Option<KVec<u8>>,
     ) -> Result<Arc<FutureValue<CallResult>>> {
+        if client.epic_v4
+            && self
+                .calls
+                .iter()
+                .any(|c| matches!(c, Some(CallSlot::Abandoned)))
+        {
+            // Replies carry no tag here: until the reply to the abandoned call
+            // has arrived, a new call's reply could not be told from it.
+            dev_dbg!(
+                client.dev,
+                "Endpoint {:#04x} waits for a late reply, call refused",
+                self.index
+            );
+            return Err(EIO);
+        }
         let Some(slot) = self.calls.iter().position(|c| c.is_none()) else {
             dev_err!(
                 client.dev,
@@ -859,6 +884,10 @@ struct AopData {
     rtkit: Mutex<Option<rtkit::RtKit<AopData>>>,
     #[pin]
     endpoints: [Mutex<AFKEndpoint>; AFK_ENDPOINT_COUNT as usize],
+    /// Version 4 firmware answers without the request tag, so an endpoint
+    /// carries one call at a time: callers queue here for their turn.
+    #[pin]
+    call_turn: [Mutex<()>; AFK_ENDPOINT_COUNT as usize],
     #[pin]
     ep_shutdown: [FutureValue<()>; AFK_ENDPOINT_COUNT as usize],
     #[pin]
@@ -977,6 +1006,7 @@ impl AopData {
                     endpoints <- pin_init::pin_init_array_from_fn(|i| {
                         new_mutex!(AFKEndpoint::new(AFK_ENDPOINT_START + i as u8))
                     }),
+                    call_turn <- pin_init::pin_init_array_from_fn(|_| new_mutex!(())),
                     ep_shutdown <- pin_init::pin_init_array_from_fn(|_| FutureValue::pin_init()),
                     hid_listeners <- new_mutex!(KVec::new()),
                     subdevices <- new_mutex!(KVec::new()),
@@ -1122,6 +1152,13 @@ impl AopData {
 }
 
 impl AopData {
+    /// On firmware whose replies carry no tag, takes the endpoint's turn: the
+    /// guard is held until the reply or the timeout, so that a reply can only
+    /// belong to the one call in flight.
+    fn take_call_turn(&self, ep_idx: usize) -> Option<MutexGuard<'_, ()>> {
+        self.epic_v4.then(|| self.call_turn[ep_idx].lock())
+    }
+
     /// Waits a bounded time for the reply to `call` on endpoint `ep_idx`.
     fn wait_call(
         &self,
@@ -1136,10 +1173,15 @@ impl AopData {
         self.endpoints[ep_idx].lock().abandon_call(&call);
         dev_err!(
             self.dev,
-            "EPIC call {:#x} on channel {} timed out after {} ms",
+            "EPIC call {:#x} on channel {} timed out after {} ms{}",
             subtype,
             svc.channel,
-            EPIC_CALL_TIMEOUT_MS
+            EPIC_CALL_TIMEOUT_MS,
+            if self.epic_v4 {
+                "; the endpoint takes no call until the reply arrives"
+            } else {
+                ""
+            }
         );
         Err(ETIMEDOUT)
     }
@@ -1151,6 +1193,7 @@ impl AOP for AopData {
             return Err(ENODEV);
         }
         let ep_idx = afk_endpoint_index(svc.endpoint).ok_or(EINVAL)?;
+        let _turn = self.take_call_turn(ep_idx);
         let call = {
             let mut rtk_guard = self.rtkit.lock();
             let mut rtk = rtk_guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
@@ -1170,6 +1213,7 @@ impl AOP for AopData {
             return Err(ENODEV);
         }
         let ep_idx = afk_endpoint_index(svc.endpoint).ok_or(EINVAL)?;
+        let _turn = self.take_call_turn(ep_idx);
         let call = {
             let mut rtk_guard = self.rtkit.lock();
             let mut rtk = rtk_guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
