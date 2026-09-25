@@ -281,6 +281,10 @@ static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t si
 		struct dchid_subhdr sub;
 	} __packed h;
 
+	/* Both length fields are 16 bits wide. */
+	if (size > U16_MAX - sizeof(h.sub) - 3)
+		return -EMSGSIZE;
+
 	memset(&h, 0, sizeof(h));
 	h.hdr.hdr_len = sizeof(h.hdr);
 	h.hdr.channel = DCHID_CHANNEL_CMD;
