@@ -326,7 +326,11 @@ static void apple_soc_cpufreq_exit(struct cpufreq_policy *policy)
 	struct apple_cpu_priv *priv = policy->driver_data;
 
 	dev_pm_opp_free_cpufreq_table(priv->cpu_dev, &policy->freq_table);
-	dev_pm_opp_of_cpumask_remove_table(policy->cpus);
+	/*
+	 * The core clears the last CPU from policy->cpus before calling
+	 * ->exit(), so remove the tables of every CPU the policy covered.
+	 */
+	dev_pm_opp_of_cpumask_remove_table(policy->related_cpus);
 	iounmap(priv->reg_base);
 	kfree(priv);
 }
