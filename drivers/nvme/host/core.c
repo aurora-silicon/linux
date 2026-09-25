@@ -2432,6 +2432,8 @@ static int nvme_update_ns_info_block(struct nvme_ns *ns,
 		lim.features |= BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA;
 	else
 		lim.features &= ~(BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA);
+	if (ns->ctrl->quirks & NVME_QUIRK_BROKEN_FUA)
+		lim.features &= ~BLK_FEAT_FUA;
 
 	if (info->is_rotational)
 		lim.features |= BLK_FEAT_ROTATIONAL;
