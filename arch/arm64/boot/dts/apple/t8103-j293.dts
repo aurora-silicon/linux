@@ -95,6 +95,32 @@
 	};
 };
 
+/*
+ * Mesa fingerprint sensor on SPI2. The J293 platform device tree wires it the
+ * same way as J313: controller at 0x235108000, 8 MHz, power on pin 108 with
+ * argument 0x101, and an interrupt on pin 104. The interrupt is left out for
+ * the same reason as on J313; the driver polls.
+ *
+ * Do not add cs-gpios. The sensor needs the controller's native chip select,
+ * otherwise the SPI core skips the hardware CS timing.
+ */
+&spi2 {
+	status = "okay";
+};
+
+&mesa {
+	status = "okay";
+	enable-gpios = <&pinctrl_ap 108 GPIO_ACTIVE_HIGH>;
+	spi-cs-setup-delay-ns = <20>;
+	spi-cs-hold-delay-ns = <20>;
+	/*
+	 * Per-device factory data written at manufacture.  It is not
+	 * redistributable and has to be extracted from the machine's own macOS
+	 * install, so the name only fixes where the driver looks for it.
+	 */
+	firmware-name = "apple/mesacal-j293.bin";
+};
+
 &i2c1 {
 	speaker_left_rear: codec@31 {
 		compatible = "ti,tas5770l", "ti,tas2770";
