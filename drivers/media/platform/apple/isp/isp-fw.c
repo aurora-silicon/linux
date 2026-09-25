@@ -51,11 +51,11 @@ static int apple_isp_power_up_domains(struct apple_isp *isp)
 		return 0;
 
 	for (int i = 1; i < isp->pd_count; i++) {
-		ret = pm_runtime_get_sync(isp->pd_dev[i]);
+		ret = pm_runtime_resume_and_get(isp->pd_dev[i]);
 		if (ret < 0) {
 			dev_err(isp->dev,
 				"Failed to power up power domain %d: %d\n", i, ret);
-			while (--i != 1)
+			while (--i >= 1)
 				pm_runtime_put_sync(isp->pd_dev[i]);
 			return ret;
 		}
