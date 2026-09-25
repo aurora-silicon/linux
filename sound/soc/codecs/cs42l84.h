@@ -106,6 +106,26 @@
 #define CS42L84_MIC_DET_CTL4_LATCH_TO_VP	BIT(1)
 
 #define CS42L84_HS_DET_STATUS2			0x147d
+/*
+ * Bit 0 pulses briefly on a momentary short of the mic/remote line, which is
+ * how a 3-button Apple remote signals its centre (play/pause) button. This
+ * mirrors CS42L42_SHORT_TRUE_MASK / M_SHORT_DET on the CS42L42/CS42L83.
+ * Empirically observed on real hardware (16" MacBook Pro, M1 Pro, J316);
+ * there is no public register reference for CS42L84.
+ */
+#define CS42L84_HS_DET_STATUS2_SHORT_TRUE	BIT(0)
+
+/*
+ * Undocumented, empirically-discovered register that pulses a bit when the
+ * Apple remote's volume buttons are pressed, one bit per direction. Found by
+ * polling raw I2C reads while pressing physical buttons on wired Apple
+ * earbuds. Bit assignment follows the CS42L83 remote convention
+ * (CS42L83_REMOTE_VOLUME_DOWN/UP in cs42l42.c) since CS42L84 is a close
+ * relative of that chip family; not confirmed against a datasheet.
+ */
+#define CS42L84_REMOTE_BUTTON_STATUS1		0x1484
+#define CS42L84_REMOTE_VOLUME_DOWN		BIT(0)
+#define CS42L84_REMOTE_VOLUME_UP		BIT(1)
 
 #define CS42L84_MSM_BLOCK_EN1			0x1800
 #define CS42L84_MSM_BLOCK_EN2			0x1801
@@ -206,5 +226,8 @@
 #define CS42L84_CLOCK_SWITCH_DELAY_US		150
 #define CS42L84_PLL_LOCK_POLL_US		250
 #define CS42L84_PLL_LOCK_TIMEOUT_US		1250
+
+/* Poll interval while a mic-equipped headset is attached, looking for remote button pulses. */
+#define CS42L84_REMOTE_POLL_MS			30
 
 #endif /* __CS42L84_H__ */
