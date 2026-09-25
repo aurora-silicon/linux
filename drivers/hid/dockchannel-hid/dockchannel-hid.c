@@ -235,7 +235,7 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 	if (strcmp(name, "comm")) {
 		of_node = of_get_child_by_name(dchid->dev->of_node, name);
 		if (!of_node) {
-			dev_warn(dchid->dev, "No OF node for subdevice %s, ignoring.", name);
+			dev_dbg(dchid->dev, "No OF node for subdevice %s, ignoring\n", name);
 			return NULL;
 		}
 
@@ -1257,6 +1257,17 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	}
 
 	dchid->dev = dev;
+
+	/*
+	 * The STM interface reports the machine's vendor and product IDs,
+	 * keyboard type and serial number, and the other interfaces wait for
+	 * it. Firmware without an STM interface gets Apple's vendor ID and
+	 * nothing else.
+	 */
+	if (of_property_read_bool(dev->of_node, "apple,no-stm")) {
+		dchid->device_id.vendor_id = HOST_VENDOR_ID_APPLE;
+		dchid->id_ready = true;
+	}
 
 	/*
 	 * First make sure all the GPIOs are available, in cased we need to defer.
