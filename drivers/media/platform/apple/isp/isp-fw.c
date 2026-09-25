@@ -788,6 +788,38 @@ static int isp_stop_command_processor(struct apple_isp *isp)
 	return 0;
 }
 
+/* Pass the PMU base and the DSID broadcast-clear windows. */
+static int isp_set_dsid_clr(struct apple_isp *isp)
+{
+	const struct apple_isp_hw *hw = isp->hw;
+	int err;
+
+	/*
+	 * The H17 firmware takes no PMU base, and its single broadcast-clear
+	 * window in the multi-window form.
+	 */
+	if (hw->fw_abi == ISP_FW_ABI_H17)
+		return isp_cmd_set_dsid_clr_multi_bc(isp, hw->dsid_clr_base0,
+						     hw->dsid_clr_range0);
+
+	err = isp_cmd_set_isp_pmu_base(isp, hw->pmu_base);
+	if (err)
+		return err;
+
+	if (hw->dsid_count == 1)
+		return isp_cmd_set_dsid_clr_req_base(isp, hw->dsid_clr_base0,
+						     hw->dsid_clr_range0);
+
+	return isp_cmd_set_dsid_clr_req_base2(isp, hw->dsid_clr_base0,
+					      hw->dsid_clr_base1,
+					      hw->dsid_clr_base2,
+					      hw->dsid_clr_base3,
+					      hw->dsid_clr_range0,
+					      hw->dsid_clr_range1,
+					      hw->dsid_clr_range2,
+					      hw->dsid_clr_range3);
+}
+
 static int isp_start_command_processor(struct apple_isp *isp)
 {
 	int err;
@@ -796,24 +828,9 @@ static int isp_start_command_processor(struct apple_isp *isp)
 	if (err)
 		return err;
 
-	err = isp_cmd_set_isp_pmu_base(isp, isp->hw->pmu_base);
+	err = isp_set_dsid_clr(isp);
 	if (err)
 		return err;
-
-	if (isp->hw->dsid_count == 1) {
-		err = isp_cmd_set_dsid_clr_req_base(
-			isp, isp->hw->dsid_clr_base0, isp->hw->dsid_clr_range0);
-		if (err)
-			return err;
-	} else {
-		err = isp_cmd_set_dsid_clr_req_base2(
-			isp, isp->hw->dsid_clr_base0, isp->hw->dsid_clr_base1,
-			isp->hw->dsid_clr_base2, isp->hw->dsid_clr_base3,
-			isp->hw->dsid_clr_range0, isp->hw->dsid_clr_range1,
-			isp->hw->dsid_clr_range2, isp->hw->dsid_clr_range3);
-		if (err)
-			return err;
-	}
 
 	if (isp->hw->clock_scratch) {
 		err = isp_cmd_pmp_ctrl_set(

@@ -151,6 +151,18 @@ int isp_cmd_set_dsid_clr_req_base(struct apple_isp *isp, u64 dsid_clr_base,
 	return CISP_SEND_IN(isp, args);
 }
 
+int isp_cmd_set_dsid_clr_multi_bc(struct apple_isp *isp, u64 dsid_clr_base,
+				  u32 dsid_clr_range)
+{
+	struct cmd_set_dsid_clr_multi_bc_reg_base args = {
+		.opcode = CISP_OPCODE(CISP_CMD_SET_DSID_CLR_MULTI_BC_REG_BASE),
+		.count = 1,
+		.dsid_clr_range = dsid_clr_range,
+		.dsid_clr_base = dsid_clr_base,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
 int isp_cmd_pmp_ctrl_set(struct apple_isp *isp, u64 clock_scratch,
 			 u64 clock_base, u8 clock_bit, u8 clock_size,
 			 u64 bandwidth_scratch, u64 bandwidth_base,
@@ -218,9 +230,26 @@ int isp_cmd_flicker_sensor_set(struct apple_isp *isp, u32 mode)
 int isp_cmd_ch_info_get(struct apple_isp *isp, u32 chan,
 			struct cmd_ch_info *args)
 {
+	struct cmd_ch_info_h17 *h17;
+	int err;
+
 	args->opcode = CISP_OPCODE(CISP_CMD_CH_INFO_GET);
 	args->chan = chan;
-	return CISP_SEND_OUT(isp, args);
+	if (isp->hw->fw_abi != ISP_FW_ABI_H17)
+		return CISP_SEND_OUT(isp, args);
+
+	/* Exchange the longer H17 record and keep the common part. */
+	h17 = kzalloc_obj(*h17);
+	if (!h17)
+		return -ENOMEM;
+
+	h17->info = *args;
+	err = CISP_SEND_OUT(isp, h17);
+	if (!err)
+		*args = h17->info;
+	kfree(h17);
+
+	return err;
 }
 
 int isp_cmd_ch_camera_config_current_get(struct apple_isp *isp, u32 chan,
@@ -253,13 +282,21 @@ int isp_cmd_ch_buffer_return(struct apple_isp *isp, u32 chan)
 int isp_cmd_ch_set_file_load(struct apple_isp *isp, u32 chan, u64 addr,
 			     u32 size)
 {
-	if (isp->fw_compat >= ISP_FIRMWARE_V_13_5) {
+	bool h17 = isp->hw->fw_abi == ISP_FW_ABI_H17;
+
+	if (h17 || isp->fw_compat >= ISP_FIRMWARE_V_13_5) {
 		struct cmd_ch_set_file_load64 args = {
 			.opcode = CISP_OPCODE(CISP_CMD_CH_SET_FILE_LOAD),
 			.chan = chan,
 			.addr = addr,
 			.size = size,
 		};
+		/*
+		 * The H17 firmware returns the record; what its reply
+		 * contains is not known, so it is not checked.
+		 */
+		if (h17)
+			return CISP_SEND_INOUT(isp, args);
 		return CISP_SEND_IN(isp, args);
 	} else {
 		struct cmd_ch_set_file_load args = {

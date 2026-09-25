@@ -220,6 +220,15 @@ static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
 
 	dev_dbg(isp->dev, "found sensor %x on ch %d\n", args->version, ch);
 
+	/* The metadata buffers are allocated for the size the driver knows. */
+	if (isp->hw->fw_abi == ISP_FW_ABI_H17 &&
+	    args->unk_68 != isp->hw->meta_size) {
+		dev_err(isp->dev, "metadata size 0x%x, expected 0x%x\n",
+			args->unk_68, isp->hw->meta_size);
+		err = -ENODEV;
+		goto exit;
+	}
+
 	fmt->version = args->version;
 
 	err = isp_ch_get_sensor_id(isp, ch);
