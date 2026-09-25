@@ -313,53 +313,89 @@ impl AFKEndpoint {
         Ok(())
     }
 
+    /// Decodes an InitRX/InitTX message: a ring of `size` bytes at `offset`
+    /// in the shared buffer, laid out as three header blocks (buffer size,
+    /// read pointer, write pointer) followed by `buf_size` bytes of entries.
     fn parse_ring_buf(&self, msg: u64) -> Result<AFKRingBuffer> {
         let msg = msg as usize;
         let size = ((msg >> 16) & 0xFFFF) * AFK_RB_BLOCK_STEP;
         let offset = ((msg >> 32) & 0xFFFF) * AFK_RB_BLOCK_STEP;
+        let iomem_size = self.iomem.as_ref().ok_or(ENXIO)?.size();
         let buf_size = self.iomem_read32(offset)? as usize;
-        let block_size = (size - buf_size) / 3;
+        let block_size = size.checked_sub(buf_size).ok_or(EIO)? / 3;
+        let end = offset.checked_add(size).ok_or(EIO)?;
+        if end > iomem_size || buf_size == 0 || block_size == 0 || !block_size.is_power_of_two() {
+            return Err(EIO);
+        }
         Ok(AFKRingBuffer {
             offset,
             block_size,
             buf_size,
         })
     }
+
+    /// Returns a pointer to `len` bytes at `off` in the shared buffer after
+    /// checking that they lie inside it.
+    fn iomem_ptr(&self, off: usize, len: usize) -> Result<*mut u8> {
+        let iomem = self.iomem.as_ref().ok_or(ENXIO)?;
+        let end = off.checked_add(len).ok_or(EIO)?;
+        if end > iomem.size() {
+            return Err(EIO);
+        }
+        // SAFETY: `off + len` does not exceed the size of the allocation, so
+        // the offset pointer stays inside it.
+        Ok(unsafe { iomem.as_mut_ptr().cast::<u8>().add(off) })
+    }
+
+    /// Writes one of the ring's pointer words. The firmware polls the word
+    /// concurrently, so the write is volatile.
     fn iomem_write32(&mut self, off: usize, data: u32) -> Result<()> {
-        let size = core::mem::size_of::<u32>();
-        let data = data.to_le_bytes();
-        let iomem = &self.iomem.as_mut().ok_or(ENXIO)?;
-        let buf = unsafe { &mut iomem.as_mut()[off..off + size] };
-        buf.copy_from_slice(&data);
+        if off % mem::align_of::<u32>() != 0 {
+            return Err(EIO);
+        }
+        let ptr = self.iomem_ptr(off, mem::size_of::<u32>())?;
+        // SAFETY: `ptr` is valid for four bytes and aligned for a `u32`. A
+        // volatile write is the kernel's WRITE_ONCE() for a word the device
+        // reads at any time.
+        unsafe { ptr.cast::<u32>().write_volatile(data.to_le()) };
         Ok(())
     }
 
+    /// Reads one of the ring's pointer words. The firmware updates the word
+    /// concurrently, so the read is volatile.
     fn iomem_read32(&self, off: usize) -> Result<u32> {
-        let size = core::mem::size_of::<u32>();
-        let iomem = &self.iomem.as_ref().ok_or(ENXIO)?;
-        let buf = unsafe { &iomem.as_ref()[off..off + size] };
-        Ok(u32::from_le_bytes(buf.try_into().unwrap()))
+        if off % mem::align_of::<u32>() != 0 {
+            return Err(EIO);
+        }
+        let ptr = self.iomem_ptr(off, mem::size_of::<u32>())?;
+        // SAFETY: `ptr` is valid for four bytes and aligned for a `u32`. A
+        // volatile read is the kernel's READ_ONCE() for a word the device
+        // writes at any time.
+        Ok(u32::from_le(unsafe { ptr.cast::<u32>().read_volatile() }))
     }
 
+    /// Copies a ring entry out of the shared buffer. Callers only read
+    /// entries between the read and the write pointer, which the firmware
+    /// has finished writing and does not touch again until the read pointer
+    /// passes them.
     fn memcpy_from_iomem(&self, off: usize, target: &mut [u8]) -> Result<()> {
-        let iomem = &self.iomem.as_ref().ok_or(ENXIO)?;
-        // SAFETY:
-        // as_slice() checks that off and target.len() are whithin iomem's limits.
-        unsafe {
-            let src = &iomem.as_ref()[off..off + target.len()];
-            target.copy_from_slice(src);
-        }
+        let src = self.iomem_ptr(off, target.len())?;
+        // SAFETY: `src` is valid for `target.len()` bytes, `target` is a
+        // distinct allocation, and by the ring protocol (see above) the device
+        // does not write the entry while it is copied.
+        unsafe { ptr::copy_nonoverlapping(src, target.as_mut_ptr(), target.len()) };
         Ok(())
     }
 
+    /// Copies a ring entry into the shared buffer. Callers only write between
+    /// the write and the read pointer, which the firmware does not read until
+    /// the write pointer is advanced past the entry.
     fn memcpy_to_iomem(&mut self, off: usize, src: &[u8]) -> Result<()> {
-        let iomem = &self.iomem.as_mut().ok_or(ENXIO)?;
-        // SAFETY:
-        // as_slice_mut() checks that off and src.len() are whithin iomem's limits.
-        unsafe {
-            let target = &mut iomem.as_mut()[off..off + src.len()];
-            target.copy_from_slice(src);
-        }
+        let dst = self.iomem_ptr(off, src.len())?;
+        // SAFETY: `dst` is valid for `src.len()` bytes, `src` is a distinct
+        // allocation, and by the ring protocol (see above) the device does
+        // not access the entry while it is written.
+        unsafe { ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
         Ok(())
     }
 
@@ -418,7 +454,8 @@ impl AFKEndpoint {
                 );
                 return Err(EIO);
             }
-            if qeh.size as usize > (buf_size - rptr - QEH_SIZE) {
+            let room = buf_size.checked_sub(rptr + QEH_SIZE).ok_or(EIO)?;
+            if qeh.size as usize > room {
                 rptr = 0;
                 self.memcpy_from_iomem(base + rptr, &mut qeh_bytes)?;
                 qeh = unsafe { &*(qeh_bytes.as_ptr() as *const QEHeader) };
@@ -588,7 +625,7 @@ impl AFKEndpoint {
             )
         };
         self.memcpy_to_iomem(base + wptr, qeh_bytes)?;
-        if payload_len > buf_size - wptr - QEH_SIZE {
+        if payload_len > buf_size.checked_sub(wptr + QEH_SIZE).ok_or(EIO)? {
             wptr = 0;
             self.memcpy_to_iomem(base + wptr, qeh_bytes)?;
         }
