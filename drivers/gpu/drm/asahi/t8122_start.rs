@@ -15,7 +15,7 @@
 //! | `asahi.t8122_initdata_version` | `0x0c08e21e83800490`, the G15 14.8.3 version | any |
 //! | `asahi.t8122_fender` | `0x104000` (`rule`) | `0x12c000` (`adt`) |
 //! | `asahi.t8122_clkgen` | `e1c`: SGX+0xe1c000, read-only | `e5c`: SGX+0xe5c000, read-only; `none` |
-//! | `asahi.t8122_sgx_setup` | `none` | `t6030`: SGX+0xd14000 = 0x70001 |
+//! | `asahi.t8122_sgx_setup` | `t6030`: SGX+0xd14000 = 0x70001 | `none` |
 //! | `asahi.t8122_unit_mask_a` | `0x700000003` | nonzero, within `0x700000003` |
 //! | `asahi.t8122_unit_mask_b` | `0x7` | nonzero, within `0x7` |
 //! | `asahi.t8122_pstate_cap` | `2` | 1 to 15 (at or above the table's highest state: all of it) |

@@ -344,7 +344,8 @@ pub(crate) static T8122: Soc = Soc {
     iomaps: Some(&crate::m3_adt_config::T8122_IOMAPS),
     // The boot loader's ladder from this machine's ADT (J613: eight voltages, up to 1338 MHz).
     pstates: PstateTable::DeviceTree,
-    sgx_setup: None,
+    // The same SGX setup write as on T6030.
+    sgx_setup: Some((0xd14000, 0x70001)),
     hwdata_b: Some(&T8122_HWDATA_B),
     // Neither is validated on G15G yet; userspace keeps its default ordering and visibility.
     features: Features {
