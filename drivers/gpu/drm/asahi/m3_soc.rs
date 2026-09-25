@@ -12,6 +12,7 @@ use kernel::{device, prelude::*};
 use crate::{
     hw,
     initdata::G15RuntimeHwDataB,
+    m3_compute_layout::RegisterSet,
     m3_board::KnownImage,
     m3_firmware::Layout,
     m3_init_storage::IoMap, //
@@ -148,6 +149,8 @@ pub(crate) struct Soc {
     pub(crate) mtr_masks: Option<MtrMasks>,
     /// The HwData object's placement and mapping, when they are not the fixed allocation's.
     pub(crate) hwdata_object: Option<HwDataObject>,
+    /// The register lists the GPU's firmware expects in compute and render commands.
+    pub(crate) registers: RegisterSet,
 }
 
 impl Soc {
@@ -278,6 +281,7 @@ pub(crate) static T6030: Soc = Soc {
     mtr_masks: None,
     // The fixed allocation, uncached.
     hwdata_object: None,
+    registers: RegisterSet::G15S,
 };
 
 /// T8122 (M3, G15G): one die, one cluster of ten core slots (eight or ten of them active).
@@ -363,6 +367,7 @@ pub(crate) static T8122: Soc = Soc {
         address: T8122_HWDATA_ADDRESS,
         cached: true,
     }),
+    registers: RegisterSet::G15G,
 };
 
 /// The T8122 HwData object's firmware VA: 0x8a80 bytes before the end of the fixed allocation's

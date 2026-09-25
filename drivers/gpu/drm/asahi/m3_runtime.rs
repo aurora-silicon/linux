@@ -266,7 +266,7 @@ impl Runtime {
             let index=found.unwrap_or(inner.jobs.len());
             if found.is_none() {
                 let job=match control {
-                    crate::m3_submit::Command::Compute(c)=>NativeJob::Compute(crate::m3_compute::Compute::new(&inner.drm,&inner.uat,&packet.vm,inner.config.stats_region()?,c)?),
+                    crate::m3_submit::Command::Compute(c)=>NativeJob::Compute(crate::m3_compute::Compute::new(&inner.drm,&inner.uat,&packet.vm,inner.config.stats_region()?,c,inner.device.soc().registers)?),
                     crate::m3_submit::Command::Render{..}=>NativeJob::Render(crate::m3_render::Render::new(&inner.drm,&inner.uat,&packet.vm,inner.config.stats_region()?,inner.device.soc().clusters)?),
                 };
                 inner.jobs.push(job,GFP_KERNEL)?;
