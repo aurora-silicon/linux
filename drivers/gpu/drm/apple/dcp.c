@@ -447,6 +447,14 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 				if (!dcp_typec_route_available(candidate))
 					continue;
 				score = dcp_typec_route_score(candidate);
+				/*
+				 * On the M2 Pro/Max laptops, leave dcpext0 free for
+				 * a dock's DP tunnel when a direct DP-alt-mode
+				 * display can use the Type-C-only dcpext1 pipeline.
+				 */
+				if (apple_dp_tunnel_t602x() &&
+				    candidate->dcp->fixed_phy)
+					score += 100;
 				if (score < best_score) {
 					best = candidate;
 					best_score = score;
