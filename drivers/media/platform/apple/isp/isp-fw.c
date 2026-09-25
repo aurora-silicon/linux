@@ -292,7 +292,7 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 
 	err = isp_reset_coproc(isp);
 	if (err < 0)
-		return err;
+		goto shutdown;
 
 	isp_gpio_write32(isp, ISP_GPIO_0, 0x0);
 	isp_gpio_write32(isp, ISP_GPIO_1, 0x0);
@@ -322,10 +322,15 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 	if (retries >= ISP_FIRMWARE_MAX_TRIES) {
 		isp_err(isp,
 			"never received first magic number from firmware\n");
-		return -ENODEV;
+		err = -ENODEV;
+		goto shutdown;
 	}
 
 	return 0;
+
+shutdown:
+	isp_firmware_shutdown_stage1(isp);
+	return err;
 }
 
 int apple_isp_alloc_firmware_surface(struct apple_isp *isp)
