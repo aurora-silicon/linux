@@ -2,7 +2,13 @@
 
 //! Common code for AOP endpoint drivers
 
-use kernel::{prelude::*, sync::Arc};
+use kernel::{
+    prelude::*,
+    sync::{
+        atomic::{Atomic, Relaxed},
+        Arc, //
+    },
+};
 
 /// Representation of an "EPIC" service.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -36,16 +42,60 @@ pub trait AOP: Send + Sync {
         ret_len: usize,
     ) -> Result<(u32, KVec<u8>)>;
 
-    /// Adds the listener for the specified service
+    /// Adds the listener for the specified service. A service takes one listener at a time;
+    /// a second registration fails with `EBUSY`.
     fn add_fakehid_listener(
         &self,
         svc: EPICService,
         listener: Arc<dyn FakehidListener>,
     ) -> Result<()>;
-    /// Remove the listener for the specified service
+    /// Removes the listener for the specified service. Returns once no callback into the
+    /// listener is running any more.
     fn remove_fakehid_listener(&self, svc: &EPICService) -> bool;
     /// Internal method to detach the device.
     fn remove(&self);
+}
+
+/// A child driver's fake-HID subscription on an AOP service.
+///
+/// The AOP core calls the listener from its receive worker for as long as the subscription
+/// exists, so the child has to end it before it releases anything the listener uses. Call
+/// [`FakehidRegistration::unregister`] from the driver's `unbind`, while those resources are
+/// still alive; dropping the registration unregisters as well, as a fallback for a failed probe.
+pub struct FakehidRegistration {
+    aop: Arc<dyn AOP>,
+    service: EPICService,
+    registered: Atomic<bool>,
+}
+
+impl FakehidRegistration {
+    /// Subscribes `listener` to the fake-HID reports of `service`.
+    pub fn new(
+        aop: Arc<dyn AOP>,
+        service: EPICService,
+        listener: Arc<dyn FakehidListener>,
+    ) -> Result<Self> {
+        aop.add_fakehid_listener(service, listener)?;
+        Ok(Self {
+            aop,
+            service,
+            registered: Atomic::new(true),
+        })
+    }
+
+    /// Ends the subscription. Returns once no callback into the listener is running any more;
+    /// repeated calls do nothing.
+    pub fn unregister(&self) {
+        if self.registered.xchg(false, Relaxed) {
+            self.aop.remove_fakehid_listener(&self.service);
+        }
+    }
+}
+
+impl Drop for FakehidRegistration {
+    fn drop(&mut self) {
+        self.unregister();
+    }
 }
 
 /// Converts a text representation of a FourCC to u32

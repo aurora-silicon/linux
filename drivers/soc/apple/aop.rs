@@ -1143,6 +1143,9 @@ impl AOP for AopData {
         if self.removing.load(Acquire) {
             return Err(ENODEV);
         }
+        if guard.iter().any(|entry| entry.svc == svc) {
+            return Err(EBUSY);
+        }
         Ok(guard.push(ListenerEntry { svc, listener }, GFP_KERNEL)?)
     }
     fn remove_fakehid_listener(&self, svc: &EPICService) -> bool {

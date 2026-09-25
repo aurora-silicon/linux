@@ -11,7 +11,7 @@ use kernel::{
     iio::common::aop_sensors::{AopSensorData, IIORegistration, MessageProcessor},
     module_platform_driver, of, platform,
     prelude::*,
-    soc::apple::aop::{EPICService, AOP},
+    soc::apple::aop::{EPICService, FakehidRegistration, AOP},
     sync::Arc,
     types::ForeignOwnable,
 };
@@ -96,8 +96,11 @@ impl MessageProcessor for MsgProc {
     }
 }
 
-#[repr(transparent)]
-struct IIOAopAlsDriver(IIORegistration<MsgProc>);
+struct IIOAopAlsDriver {
+    /// Declared first: the subscription ends before the IIO device goes.
+    listener: FakehidRegistration,
+    _iio: IIORegistration<MsgProc>,
+}
 
 kernel::of_device_table!(
     OF_TABLE,
@@ -122,16 +125,19 @@ impl platform::Driver for IIOAopAlsDriver {
         let ty = bindings::BINDINGS_IIO_LIGHT;
         let offset = get_lux_offset(adata.as_ref(), pdev, &service)?;
         let data = AopSensorData::new(dev.into(), ty, MsgProc(offset))?;
-        adata.add_fakehid_listener(service, data.clone())?;
+        let listener = FakehidRegistration::new(adata.clone(), service, data.clone())?;
         enable_als(adata.as_ref(), pdev, &service)?;
         let info_mask = 1 << bindings::BINDINGS_IIO_CHAN_INFO_PROCESSED;
-        Ok(IIOAopAlsDriver(IIORegistration::<MsgProc>::new(
-            data,
-            c"aop-sensors-als",
-            ty,
-            info_mask,
-            &THIS_MODULE,
-        )?))
+        let iio =
+            IIORegistration::<MsgProc>::new(data, c"aop-sensors-als", ty, info_mask, &THIS_MODULE)?;
+        Ok(IIOAopAlsDriver {
+            listener,
+            _iio: iio,
+        })
+    }
+
+    fn unbind(_dev: &platform::Device<Core>, this: Pin<&Self>) {
+        this.listener.unregister();
     }
 }
 
