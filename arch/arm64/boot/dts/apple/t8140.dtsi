@@ -1,0 +1,582 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple T8140 "A18 Pro" SoC
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/pinctrl/apple.h>
+
+/ {
+	compatible = "apple,t8140", "apple,arm-platform";
+
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	cpus {
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		cpu-map {
+			cluster0 {
+				core0 {
+					cpu = <&cpu_e0>;
+				};
+				core1 {
+					cpu = <&cpu_e1>;
+				};
+				core2 {
+					cpu = <&cpu_e2>;
+				};
+				core3 {
+					cpu = <&cpu_e3>;
+				};
+			};
+
+			cluster1 {
+				core0 {
+					cpu = <&cpu_p0>;
+				};
+				core1 {
+					cpu = <&cpu_p1>;
+				};
+			};
+		};
+
+		cpu_e0: cpu@0 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x0>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			next-level-cache = <&l2_cache_0>;
+		};
+
+		cpu_e1: cpu@1 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x1>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			next-level-cache = <&l2_cache_0>;
+		};
+
+
+		cpu_e2: cpu@2 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x2>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			next-level-cache = <&l2_cache_0>;
+		};
+
+		cpu_e3: cpu@3 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x3>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			next-level-cache = <&l2_cache_0>;
+		};
+
+		cpu_p0: cpu@10100 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0x0 0x10100>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			next-level-cache = <&l2_cache_1>;
+		};
+
+		cpu_p1: cpu@10101 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0x0 0x10101>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			next-level-cache = <&l2_cache_1>;
+		};
+
+		l2_cache_0: l2-cache-0 {
+			compatible = "cache";
+			cache-level = <2>;
+			cache-unified;
+			cache-size = <0x400000>;
+		};
+
+		l2_cache_1: l2-cache-1 {
+			compatible = "cache";
+			cache-level = <2>;
+			cache-unified;
+			cache-size = <0x1000000>;
+		};
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupt-parent = <&aic>;
+		interrupt-names = "phys", "virt", "hyp-phys", "hyp-virt";
+		interrupts = <AIC_FIQ AIC_TMR_GUEST_PHYS IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_GUEST_VIRT IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_HV_PHYS IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	clkref: clock-ref {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+		clock-output-names = "clkref";
+	};
+
+	soc: soc {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+
+		nonposted-mmio;
+		ranges;
+
+		pmgr: power-management@300700000 {
+			compatible = "apple,t8140-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+			#address-cells = <1>;
+			#size-cells = <1>;
+			reg = <0x3 0x700000 0 0x14000>;
+			/* child nodes are added in t8140-pmgr.dtsi */
+		};
+
+		aic: interrupt-controller@301000000 {
+			compatible = "apple,t8140-aic3", "apple,t8122-aic3";
+			#interrupt-cells = <3>;
+			interrupt-controller;
+			reg = <0x00000003 0x01000000 0x00000000 0x1cc000>,
+			      <0x00000003 0x01040000 0x00000000 0x4000>;
+			reg-names = "core", "event";
+			power-domains = <&ps_aic>;
+		};
+
+		pmgr_mini: power-management@308280000 {
+			compatible = "apple,t8140-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+			#address-cells = <1>;
+			#size-cells = <1>;
+			reg = <0x3 0x8280000 0 0xc000>;
+			/* child nodes are added in t8140-pmgr.dtsi */
+		};
+
+		wdt: watchdog@3082b0000 {
+			compatible = "apple,t8140-wdt", "apple,t8103-wdt";
+			reg = <0x3 0x082b0000 0x0 0x4000>;
+			clocks = <&clkref>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 507 IRQ_TYPE_LEVEL_HIGH>;
+		};
+	};
+};
+
+&soc {
+		pinctrl_ap: pinctrl@31a000000 {
+			compatible = "apple,t8140-pinctrl", "apple,t8103-pinctrl";
+			reg = <0x3 0x1a000000 0x0 0x100000>;
+			power-domains = <&ps_gpio>;
+
+			gpio-controller;
+			#gpio-cells = <2>;
+			gpio-ranges = <&pinctrl_ap 0 0 216>;
+			apple,npins = <216>;
+
+			/* Live J700 ADT /arm-io/gpio0 interrupts (7 groups). */
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 263 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 264 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 265 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 266 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 267 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 268 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 269 IRQ_TYPE_LEVEL_HIGH>;
+			/* ADT no-restore-gpio-pins entries: 50 and 134. */
+			gpio-reserved-ranges = <50 1>, <134 1>;
+			status = "disabled";
+
+			i2c0_pins: i2c0-pins {
+				pinmux = <APPLE_PINMUX(170, 1)>,
+					 <APPLE_PINMUX(171, 1)>;
+			};
+
+		};
+
+		i2c0: i2c@385010000 {
+			compatible = "apple,t8140-i2c", "apple,t8103-i2c";
+			reg = <0x3 0x85010000 0x0 0x4000>;
+			clocks = <&clkref>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1108 IRQ_TYPE_LEVEL_HIGH>;
+			pinctrl-0 = <&i2c0_pins>;
+			pinctrl-names = "default";
+			#address-cells = <1>;
+			#size-cells = <0>;
+			power-domains = <&ps_i2c0>;
+			status = "disabled";
+		};
+
+		serial0: serial@30812c000 {
+			compatible = "apple,dockchannel-uart";
+			reg = <0x3 0x0812c000 0x0 0x4000>,
+			      <0x3 0x08128000 0x0 0x4000>,
+			      <0x3 0x0810c000 0x0 0x4000>;
+			reg-names = "data", "config", "irq";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 470 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		/*
+		 * AOP (always-on processor).  Live J700 ADT /arm-io/aop
+		 * (arm-io child + 0x210000000): reg[2] is the AOP MMIO window,
+		 * reg[0] the ASCWrap v6 block whose mailbox sits at +0x8000.
+		 * ADT interrupts [391, 390, 393, 392] = send-not-empty,
+		 * send-empty, recv-not-empty, recv-empty.  The firmware
+		 * (j700aop, RTKit 12) is iBoot-loaded and left stopped; Linux
+		 * adopts it and never reloads it.
+		 */
+		aop_mbox: mailbox@310608000 {
+			compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x3 0x10608000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 390 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 391 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 392 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 393 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
+		/*
+		 * The AOP "setup port": the second mailbox the J700 AOP firmware
+		 * boots through (ADT /arm-io/aop-exclave-mailbox, absolute
+		 * address 0x35067c000, IRQs [397, 394] = recv-not-empty,
+		 * send-empty).  Register layout measured on hardware:
+		 * A2I control +0x0 (FULL bit 16), I2A control +0x4 (EMPTY bit
+		 * 17), send +0x180/+0x188, recv +0x1b0/+0x1b8.
+		 */
+		aop_setup_mbox: mailbox@35067c000 {
+			compatible = "apple,t8140-aop-setup-mailbox";
+			reg = <0x3 0x5067c000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 394 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 397 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "recv-not-empty";
+			/*
+			 * Setup messages are exchanged through dart-aop stream 1,
+			 * whose inherited root has its 64 GiB slot at the ADT
+			 * vm-base-1 (0x20000000000) free for the host arena.
+			 */
+			iommus = <&aop_dart 1>;
+			apple,dma-range = <0x200 0x0 0x10 0x0>;
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
+		aop_dart: iommu@310fc0000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x3 0x10fc0000 0x0 0xc000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 428 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_aop_base>;
+			/*
+			 * iBoot leaves this DART protected (PROTECT = 0x1e7): every
+			 * stream root is inherited, so each consumer binds exactly
+			 * one stream and the locked-DART path publishes into it.
+			 */
+			status = "disabled";
+		};
+
+		aop: aop@310c00000 {
+			compatible = "apple,t8140-aop";
+			reg = <0x3 0x10c00000 0x0 0x1e0000>,
+			      <0x3 0x10600000 0x0 0x88000>;
+			reg-names = "mmio", "asc";
+			mboxes = <&aop_mbox>, <&aop_setup_mbox>;
+			mbox-names = "mbox", "setup";
+			iommus = <&aop_dart 0>;
+			/*
+			 * Stream 0's inherited root owns the 64 GiB slot at
+			 * 0x10000000000 (the firmware's own mappings); the host's
+			 * AFK buffers go into the next free slot of the ADT
+			 * vm-base-0/vm-size-0 window.
+			 */
+			apple,dma-range = <0x110 0x0 0x10 0x0>;
+			power-domains = <&ps_aop_cpu>;
+			status = "disabled";
+
+			/*
+			 * Low-power microphone: the AOP firmware produces 16 kHz
+			 * stereo S32 frames into a 512 KiB host ring bound through
+			 * dart-aop stream 9 (mapper-admac-base-s, ADT vm-base-9 /
+			 * vm-size-9); no ADMAC.
+			 */
+			/*
+			 * Ambient light sensor.  The AOP firmware announces an
+			 * "als" EPIC service on this machine (the platform device
+			 * appears as als.1.auto and sits unbound without this
+			 * node); the ADT has /arm-io/aop/iop-aop-nub/als with
+			 * als-supports-color = 0, an ALS serial in /product and
+			 * macOS's auto-brightness curve in /exbright.  The driver
+			 * matches on the generic compatible only and requires
+			 * the machine-supplied CT817 setup calibration.
+			 */
+			aop_als: als {
+				compatible = "apple,t8140-aop-als", "apple,aop-als";
+				/* intentionally empty */
+			};
+
+			aop_audio: audio {
+				/* no apple,aop-audio fallback: the t8140 capture path
+				 * (setup-port source ring, 16 kHz) is its own driver
+				 */
+				compatible = "apple,t8140-aop-audio";
+				iommus = <&aop_dart 9>;
+				apple,dma-range = <0x100 0x40000000 0x0 0xffff0000>;
+				/*
+				 * Internal speaker: LEAP TX0 (admac-leap-ns channel 0,
+				 * dart-aop stream 10) fed while the AOP spkr service is
+				 * in pwrd; the LEAP power chain is brought up parent-
+				 * first from tx0 and leap_mca.
+				 */
+				dmas = <&admac_leap_ns 0>, <&admac_base_ns 4>,
+				       <&admac_base_ns 5>, <&admac_base_ns 3>,
+				       <&admac_leap_s 1>;
+				/*
+				 * SpeakerTap is the native base-ns RX1 serial monitor.
+				 * "hpai" is the high-quality microphone array: the ADT
+				 * routes audio-hp-mic to leap-s-adma-rx-0, the machine's
+				 * only iop-audio-s stream.  The AOP attaches and powers
+				 * the array for an ordinary EPIC client, so the host can
+				 * own this channel directly.
+				 *
+				 * Channel 1, not 0: admac_chan_direction() hardwires
+				 * even channels to MEM_TO_DEV and odd to DEV_TO_MEM, so
+				 * the ADT's tx-N is Linux 2N and its rx-N is 2N+1 --
+				 * which is why cout (tx-2) is 4 and cin (rx-2) is 5
+				 * above.  rx-0 is therefore 1; asking for 0 hands back
+				 * a transmit channel, and admac_device_config() then
+				 * rejects the capture slave config with -EINVAL.
+				 */
+				dma-names = "spkr", "cout", "cin", "spkr-tap", "hpai";
+				/*
+				 * 3.5 mm jack: base-ns TX2 (channel 4, dart-aop stream 8)
+				 * into MCA1 while the AOP cout service is in pwrd, the
+				 * headset microphone back from MCA1 on base-ns RX2
+				 * (channel 5) under the cin service; the serializer
+				 * domain audio_mca1_m is the AP's to power.
+				 */
+				/*
+				 * "rx0" is audio_leap_rx0, the exact sibling of
+				 * audio_leap_tx0 that the speaker path holds.  A
+				 * LEAP ADMAC's per-channel SRAM registers only
+				 * answer with its own leaf powered, so the
+				 * microphone array's leap-s RX0 channel needs
+				 * this one the way the speaker's leap-ns TX0
+				 * needs tx0; without it the first write to
+				 * REG_CHAN_SRAM_CARVEOUT takes an asynchronous
+				 * SError and panics the machine.
+				 */
+				power-domains = <&ps_audio_leap_tx0>, <&ps_audio_leap_mca>,
+						<&ps_audio_mca1_m>, <&ps_audio_mca0_m>,
+						<&ps_audio_leap_rx0>;
+				power-domain-names = "tx0", "mca", "mca1", "mca0", "rx0";
+				#sound-dai-cells = <1>;
+			};
+		};
+
+		/*
+		 * The three "evolved" ADMAC instances of the audio fabric
+		 * (live J700 ADT admac-base-ns / admac-leap-ns / admac-leap-s,
+		 * compatible admac,t8140, admac-evolution = 1).  Register
+		 * ranges are the ADT ones; the per-channel control/descriptor/
+		 * report windows differ from t8103 and are described by the
+		 * t8140 driver variant, not by older SoC offsets.  DMA streams:
+		 * dart-aop mapper-admac-base-ns 8, mapper-admac-leap-ns 10,
+		 * mapper-admac-leap-s 11 (exclave-gated under macOS).
+		 */
+		admac_base_ns: dma-controller@313800000 {
+			compatible = "apple,t8140-admac";
+			reg = <0x3 0x13800000 0x0 0x34000>;
+			dma-channels = <13>;
+			interrupts-extended = <&aic AIC_IRQ 449 IRQ_TYPE_LEVEL_HIGH>,
+					      <0>, <0>, <0>;
+			#dma-cells = <1>;
+			iommus = <&aop_dart 8>;
+			/*
+			 * Stream 8's inherited root has its slot 16 (IOVA 1 TiB..
+			 * 1 TiB + 64 GiB) owned by the firmware, and the locked
+			 * publish path never writes into a firmware-owned slot, so
+			 * the AP's window sits in the free slot 17.
+			 */
+			apple,dma-range = <0x110 0x00000000 0x0 0x10000000>;
+			power-domains = <&ps_audio_base_ns_a>;
+			/* no resets: the AOP owns the audio fabric (see admac_leap_ns) */
+			status = "disabled";
+		};
+
+		admac_leap_ns: dma-controller@313300000 {
+			compatible = "apple,t8140-admac";
+			reg = <0x3 0x13300000 0x0 0x34000>;
+			dma-channels = <9>;
+			interrupts-extended = <&aic AIC_IRQ 452 IRQ_TYPE_LEVEL_HIGH>,
+					      <0>, <0>, <0>;
+			#dma-cells = <1>;
+			iommus = <&aop_dart 10>;
+			/* stream 10's inherited root is empty; use the generic window */
+			apple,dma-range = <0x100 0x40000000 0x0 0xffff0000>;
+			power-domains = <&ps_audio_leap_ns_a>;
+			/*
+			 * No resets: the AOP firmware owns the LEAP fabric and a
+			 * second reset pulse (driver reload) wedged the block.
+			 */
+			status = "disabled";
+		};
+
+		/*
+		 * Reached through admac-leap-s-rx-0-proxy (0x353200000), not the
+		 * direct window at 0x313200000.  The direct one answers its base
+		 * registers -- the controller probes and registers all nine
+		 * channels -- but the first write to a per-channel register
+		 * (REG_CHAN_SRAM_CARVEOUT) takes an asynchronous SError, with
+		 * the block powered every way this driver can power it
+		 * (resets dropped, leap-ns leaves, and leap-s's own rx0 leaf all
+		 * tried and eliminated on hardware).  The ADT describes this
+		 * proxy aperture and names admac-leap-s's
+		 * service-exclave_proxy = DMAChannelProxy@admac-leap-s-rx-0-proxy
+		 * precisely because the direct per-channel registers are not the
+		 * non-secure world's to touch.
+		 */
+		admac_leap_s: dma-controller@353200000 {
+			compatible = "apple,t8140-admac";
+			reg = <0x3 0x53200000 0x0 0x34000>;
+			dma-channels = <9>;
+			interrupts-extended = <&aic AIC_IRQ 451 IRQ_TYPE_LEVEL_HIGH>,
+					      <0>, <0>, <0>;
+			#dma-cells = <1>;
+			iommus = <&aop_dart 11>;
+			power-domains = <&ps_audio_leap_s_a>;
+			/*
+			 * No resets, for the same reason as admac_leap_ns: the
+			 * AOP firmware owns the LEAP fabric, and apple-admac
+			 * pulses reset_control_reset() at probe.  Resetting the
+			 * secure LEAP ADMAC out from under the firmware leaves
+			 * its per-channel/SRAM registers dead, and the first
+			 * dma_request_chan() on it then takes an asynchronous
+			 * SError and panics the machine.
+			 */
+			status = "disabled";
+		};
+
+		/*
+		 * ISP (live J700 ADT /arm-io/isp, sensor-type 0x70, H17 "ISP17a"
+		 * firmware, iBoot-loaded).  "coproc" is the ISP block, the IRQ
+		 * block sits at +0x2920000 and the firmware GPIO words at
+		 * +0x2921000 (measured on hardware).  "wdt" is
+		 * the EIC mmio-wd-isp window: on T8140 the host must kick it at
+		 * 30 Hz while streaming or every frame is the diagnostic fill.
+		 * The three dart-isp instances share one SID0 page-table root.
+		 */
+		isp_dart0: iommu@3228c0000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x3 0x228c0000 0x0 0xc000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 341 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_isp_sys>;
+			/*
+			 * 3-level tables (ias <= 36) as iBoot and the native host
+			 * ran them: the ISP fetches at vm-base 0x10000000000 and the
+			 * walk ignores the high bits; 32 GiB keeps the DAPF MMIO
+			 * identity windows (up to 0x401660000) inside the aperture.
+			 */
+			apple,dma-range = <0x0 0x0 0x8 0x0>;
+			/* ADT "remap": streams 1 2 6 7 10 11 are stream 0 */
+			apple,remap-streams = <1 0>, <2 0>, <6 0>, <7 0>,
+					      <10 0>, <11 0>;
+			status = "disabled";
+		};
+
+		isp_dart1: iommu@3228e0000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x3 0x228e0000 0x0 0xc000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 341 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_isp_sys>;
+			/*
+			 * 3-level tables (ias <= 36) as iBoot and the native host
+			 * ran them: the ISP fetches at vm-base 0x10000000000 and the
+			 * walk ignores the high bits; 32 GiB keeps the DAPF MMIO
+			 * identity windows (up to 0x401660000) inside the aperture.
+			 */
+			apple,dma-range = <0x0 0x0 0x8 0x0>;
+			/* ADT "remap": streams 1 2 6 7 10 11 are stream 0 */
+			apple,remap-streams = <1 0>, <2 0>, <6 0>, <7 0>,
+					      <10 0>, <11 0>;
+			status = "disabled";
+		};
+
+		isp_dart2: iommu@322900000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x3 0x22900000 0x0 0xc000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 341 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_isp_sys>;
+			/*
+			 * 3-level tables (ias <= 36) as iBoot and the native host
+			 * ran them: the ISP fetches at vm-base 0x10000000000 and the
+			 * walk ignores the high bits; 32 GiB keeps the DAPF MMIO
+			 * identity windows (up to 0x401660000) inside the aperture.
+			 */
+			apple,dma-range = <0x0 0x0 0x8 0x0>;
+			/* ADT "remap": streams 1 2 6 7 10 11 are stream 0 */
+			apple,remap-streams = <1 0>, <2 0>, <6 0>, <7 0>,
+					      <10 0>, <11 0>;
+			status = "disabled";
+		};
+
+		/*
+		 * ISP17a.  The ADT window is 0x320000000+0x3fe8000; "coproc"
+		 * stops short of the secure route table at +0x1804000 (a read
+		 * takes a sticky SError) and of the IRQ block (+0x2920000,
+		 * "mbox": interrupt/enable words, doorbell/ack at +0x410) and
+		 * the GPIO words (+0x2921000).  "wdt" is the EIC's mmio-wd-isp
+		 * window the host kicks at 30 Hz while streaming.
+		 */
+		isp: isp@320000000 {
+			compatible = "apple,t8140-isp", "apple,isp";
+			iommus = <&isp_dart0 0>, <&isp_dart1 0>, <&isp_dart2 0>;
+			reg-names = "coproc", "mbox", "gpio", "wdt";
+			reg = <0x3 0x20000000 0x0 0x1801000>,
+			      <0x3 0x22920000 0x0 0x1000>,
+			      <0x3 0x22921000 0x0 0x100>,
+			      <0x3 0x63b50000 0x0 0x8000>;
+			interrupt-parent = <&aic>;
+			/* ADT [323 324 325 326 336]; 323 carries the IPC mailbox */
+			interrupts = <AIC_IRQ 323 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_isp_sys>, <&ps_isp_cpu>,
+					<&ps_isp_cpu_core0>, <&ps_isp_cpu_core1>,
+					<&ps_isp_fe>, <&ps_isp_dprx>, <&ps_isp_secure>,
+					<&ps_isp_sts0>, <&ps_isp_sts1>, <&ps_isp_pearl>,
+					<&ps_isp_be>, <&ps_isp_clr>, <&ps_isp_cvd>,
+					<&ps_isp_cvm>;
+			apple,dart-vm-size = <0x0 0xa0000000>;
+			status = "disabled";
+		};
+};
+
+#include "t8140-pmgr.dtsi"
