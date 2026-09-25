@@ -397,6 +397,23 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 		return;
 	}
 
+	if (rtk->crashlog_inherited && !rtk->crashlog_buffer.size) {
+		/*
+		 * The previous owner negotiated the crashlog buffer, so this
+		 * session never learned its geometry. A CRASH message on an
+		 * inherited session is therefore a crash notification, not a
+		 * buffer request, and must not be answered as one.
+		 */
+		dev_err(rtk->dev,
+			"RTKit: adopted co-processor has crashed (crashlog at %#llx, %#llx bytes, not mapped)\n",
+			(u64)FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_IOVA, msg),
+			(u64)FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_SIZE, msg) << 12);
+		rtk->crashed = true;
+		if (rtk->ops->crashed)
+			rtk->ops->crashed(rtk->cookie, NULL, 0);
+		return;
+	}
+
 	if (!rtk->crashlog_buffer.size) {
 		apple_rtkit_common_rx_get_buffer(rtk, &rtk->crashlog_buffer,
 						 APPLE_RTKIT_EP_CRASHLOG, msg);
@@ -741,6 +758,7 @@ static void apple_rtkit_mark_running(struct apple_rtkit *rtk)
 	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_ON;
 	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_ON;
 	rtk->syslog_inherited = true;
+	rtk->crashlog_inherited = true;
 }
 
 static void apple_rtkit_claim_rx(struct apple_rtkit *rtk)
@@ -903,6 +921,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	rtk->syslog_n_entries = 0;
 	rtk->syslog_msg_size = 0;
 	rtk->syslog_inherited = false;
+	rtk->crashlog_inherited = false;
 
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
