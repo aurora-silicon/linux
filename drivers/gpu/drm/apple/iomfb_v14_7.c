@@ -47,7 +47,7 @@
 
 /* The images whose method and callback layouts this file implements. */
 #define DCP_V14_FIRMWARE_UUID	"DDF38191-93B3-324A-BC8F-643006F5AC82"	/* T6030 */
-#define DCP_V14_FIRMWARE_UUID_T8122	"90F849E1-B422-367E-B389-50246F8DEC47"	/* T8122 */
+#define DCP_V14_J613_FIRMWARE_UUID "90F849E1-B422-367E-B389-50246F8DEC47" /* J613 */
 
 #define DCP_V14_CPU_CONTROL	0x44
 #define DCP_V14_CPU_STATUS	0x48
@@ -62,6 +62,60 @@
 /* IOMFB layer of the primary plane. */
 #define DCP_V14_LAYER		0
 #define DCP_V14_BLACK		0xff000000
+
+/*
+ * What differs between the internal panels this file drives. The T6030
+ * record holds the values the file was written and tested with (J514S,
+ * J516S); another board's record enables only what was tested on it, and
+ * anything else fails closed. External processors have no board record.
+ */
+struct dcp_v14_board {
+	/* In log messages. */
+	const char *name;
+	/* The debugfs status file. */
+	const char *debugfs;
+	const char *dcp_compatible;
+	/* The machine compatible; NULL for any machine with this DCP. */
+	const char *machine;
+	/* The firmware image whose layouts were tested on this board. */
+	const char *firmware_uuid;
+	/* Set to <1> by the boot loader on the DCP, display and PIODMA nodes. */
+	const char *handoff;
+	/* Native panel size, notch rows included; 0: any, from the boot framebuffer. */
+	u32 panel_width, panel_height;
+	/* The panel may have a 120 Hz timing besides 60 Hz. */
+	bool promotion;
+};
+
+static const struct dcp_v14_board dcp_v14_board_t6030 = {
+	.name = "T6030",
+	.debugfs = "dcp-t6030",
+	.dcp_compatible = "apple,t6030-dcp",
+	.firmware_uuid = DCP_V14_FIRMWARE_UUID,
+	.handoff = "apple,t6030-handoff",
+	.promotion = true,
+};
+
+/*
+ * J613 (MacBook Air 13", M3): a 2560x1664 panel at 60 Hz only, with 64 notch
+ * rows above the 2560x1600 boot framebuffer.
+ */
+static const struct dcp_v14_board dcp_v14_board_j613 = {
+	.name = "J613",
+	.debugfs = "dcp-j613",
+	.dcp_compatible = "apple,t8122-dcp",
+	.machine = "apple,j613",
+	.firmware_uuid = DCP_V14_J613_FIRMWARE_UUID,
+	.handoff = "apple,t8122-handoff",
+	.panel_width = 2560,
+	.panel_height = 1664,
+	.promotion = false,
+};
+
+static const struct dcp_v14_board *const dcp_v14_boards[] = {
+	&dcp_v14_board_t6030,
+	&dcp_v14_board_j613,
+};
 
 struct dcp_v14_property {
 	u32 service;
@@ -87,6 +141,8 @@ struct dcp_v14_buffer {
 
 struct apple_dcp_v14 {
 	struct device *dev;
+	/* The internal panel's board; NULL on an external processor. */
+	const struct dcp_v14_board *board;
 	/* Cleared on KMS unbind and on removal; the firmware session outlives it. */
 	struct apple_dcp *dcp;
 	struct apple_rtkit *rtk;
@@ -347,8 +403,9 @@ static int dcp_v14_map_piodma(struct apple_dcp_v14 *v14, u32 id)
 		/* The display gate adds an external pipe's piodma with its DART. */
 		node = of_get_child_by_name(v14->dev->of_node, "piodma");
 		if (!node || !of_device_is_available(node) ||
+		    (!v14->external && !v14->board) ||
 		    of_property_read_u32(node, v14->external ? "apple,t6030-dispext-handoff" :
-						 "apple,t6030-handoff", &marker) || marker != 1) {
+						 v14->board->handoff, &marker) || marker != 1) {
 			of_node_put(node);
 			return -ENODEV;
 		}
@@ -1205,7 +1262,7 @@ static void dcp_v14_release(void *data)
 }
 
 /* Read only: bind maps and claims these registers. */
-static int dcp_v14_cpu_running(struct device *dev)
+static int dcp_v14_cpu_running(struct device *dev, const char *name)
 {
 	struct resource *res;
 	void __iomem *coproc;
@@ -1221,53 +1278,90 @@ static int dcp_v14_cpu_running(struct device *dev)
 	iounmap(coproc);
 	if (!(control & APPLE_DCP_COPROC_CPU_CONTROL_RUN))
 		return dev_err_probe(dev, -EBUSY,
-				     "T6030 display not started: the DCP CPU is stopped (%#x); the PMP is not started for it\n",
-				     control);
+				     "%s display not started: the DCP CPU is stopped (%#x); the PMP is not started for it\n",
+				     name, control);
 	return 0;
+}
+
+/*
+ * The board of an internal 14.x DCP node: NULL if the node is not one, an
+ * error if it is but this machine has no board record.
+ */
+const struct dcp_v14_board *iomfb_v14_7_board(struct device *dev)
+{
+	const struct dcp_v14_board *board;
+	bool dcp_known = false;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(dcp_v14_boards); i++) {
+		board = dcp_v14_boards[i];
+		if (!of_device_is_compatible(dev->of_node, board->dcp_compatible))
+			continue;
+		dcp_known = true;
+		if (board->machine && !of_machine_is_compatible(board->machine))
+			continue;
+		return board;
+	}
+	if (dcp_known) {
+		dev_err(dev, "display not started: no board record for this machine\n");
+		return ERR_PTR(-ENODEV);
+	}
+	return NULL;
+}
+
+const char *iomfb_v14_7_board_name(const struct dcp_v14_board *board)
+{
+	return board->name;
 }
 
 int iomfb_v14_7_probe(struct apple_dcp *dcp)
 {
 	struct device *dev = dcp->dev;
 	struct device_node *np = dev->of_node, *entry;
+	const struct dcp_v14_board *board = iomfb_v14_7_board(dev);
 	struct apple_dcp_v14 *v14;
 	const char *uuid = NULL;
 	u32 marker = 0;
 	int ret;
 
+	if (IS_ERR_OR_NULL(board))
+		return -ENODEV;
 	if (of_property_read_string(np, "apple,firmware-uuid", &uuid) ||
-	    (strcmp(uuid, DCP_V14_FIRMWARE_UUID) &&
-	     strcmp(uuid, DCP_V14_FIRMWARE_UUID_T8122)))
+	    strcmp(uuid, board->firmware_uuid))
 		return dev_err_probe(dev, -ENODEV,
-				     "display not started: DCP firmware %s is not supported\n",
-				     uuid ?: "(unknown)");
-	if ((of_property_read_u32(np, "apple,t6030-handoff", &marker) || marker != 1) &&
-	    (of_property_read_u32(np, "apple,t8122-handoff", &marker) || marker != 1))
+				     "%s display not started: DCP firmware %s is not supported\n",
+				     board->name, uuid ?: "(unknown)");
+	if (of_property_read_u32(np, board->handoff, &marker) || marker != 1)
 		return dev_err_probe(dev, -ENODEV,
-				     "display not started: no boot loader display handoff\n");
+				     "%s display not started: no boot loader display handoff\n",
+				     board->name);
 	if (!iommu_get_domain_for_dev(dev))
 		return dev_err_probe(dev, -ENODEV,
-				     "T6030 display not started: the DCP has no DART domain\n");
-	ret = dcp_v14_cpu_running(dev);
+				     "%s display not started: the DCP has no DART domain\n",
+				     board->name);
+	ret = dcp_v14_cpu_running(dev, board->name);
 	if (ret)
 		return ret;
 
 	entry = of_parse_phandle(np, "apple,pmp-report", 0);
 	if (!entry)
 		return dev_err_probe(dev, -ENODEV,
-				     "T6030 display not started: no apple,pmp-report, the PMP is not described\n");
+				     "%s display not started: no apple,pmp-report, the PMP is not described\n",
+				     board->name);
 	ret = apple_pmp_report_wait_ready(entry, DCP_V14_PMP_TIMEOUT);
 	of_node_put(entry);
 	if (ret == -EPROBE_DEFER)
 		return dev_err_probe(dev, ret, "waiting for the PMP report\n");
 	if (ret)
 		return dev_err_probe(dev, ret,
-				     "T6030 display not started: the PMP has not acknowledged the display request; the boot framebuffer stays\n");
+				     "%s display not started: the PMP has not acknowledged the display request; the boot framebuffer stays\n",
+				     board->name);
 
 	v14 = kzalloc_obj(*v14);
 	if (!v14)
 		return -ENOMEM;
 	v14->dev = dev;
+	v14->board = board;
 	v14->dcp = dcp;
 	mutex_init(&v14->lock);
 	init_waitqueue_head(&v14->described_wait);
@@ -1305,6 +1399,15 @@ static int dcp_v14_geometry(struct apple_dcp_v14 *v14)
 		return -EINVAL;
 	v14->panel_width = v14->fb_width;
 	v14->panel_height = v14->fb_height + notch;
+	/* A board with a known panel takes no other. */
+	if (v14->board->panel_width &&
+	    (v14->panel_width != v14->board->panel_width ||
+	     v14->panel_height != v14->board->panel_height)) {
+		dev_err(v14->dev, "boot framebuffer %ux%u with %u notch rows is not the %ux%u %s panel\n",
+			v14->fb_width, v14->fb_height, notch, v14->board->panel_width,
+			v14->board->panel_height, v14->board->name);
+		return -EINVAL;
+	}
 	return 0;
 }
 
@@ -1837,38 +1940,45 @@ int iomfb_v14_7_bind(struct apple_dcp *dcp)
 	struct clk *clk;
 	int ret, n;
 
-	if (!v14)
+	/* Only an internal panel binds here, and it always has a board. */
+	if (!v14 || WARN_ON_ONCE(!v14->board))
 		return -ENODEV;
 	if (v14->rtk || dcp_v14_panel_session)
 		return dev_err_probe(dev, -EBUSY,
-				     "T6030 display not started: an earlier DCP session is kept; reboot to restart the display\n");
+				     "%s display not started: an earlier DCP session is kept; reboot to restart the display\n",
+				     v14->board->name);
 
 	control = readl(dcp->coproc_reg + DCP_V14_CPU_CONTROL);
 	status = readl(dcp->coproc_reg + DCP_V14_CPU_STATUS);
 	dev_info(dev, "DCP CPU control %#x status %#x\n", control, status);
 	if (!(control & APPLE_DCP_COPROC_CPU_CONTROL_RUN))
 		return dev_err_probe(dev, -EBUSY,
-				     "T6030 display not started: the DCP CPU is stopped, and interrupted firmware is never resumed\n");
+				     "%s display not started: the DCP CPU is stopped, and interrupted firmware is never resumed\n",
+				     v14->board->name);
 
 	ret = dcp_v14_geometry(v14);
 	if (ret)
 		return dev_err_probe(dev, ret,
-				     "T6030 display not started: no usable boot framebuffer\n");
+				     "%s display not started: no usable boot framebuffer\n",
+				     v14->board->name);
 	clk = clk_get(dev, NULL);
 	if (IS_ERR(clk))
 		return dev_err_probe(dev, PTR_ERR(clk),
-				     "T6030 display not started: no display clock\n");
+				     "%s display not started: no display clock\n",
+				     v14->board->name);
 	v14->clock_rate = clk_get_rate(clk);
 	clk_put(clk);
 	if (!v14->clock_rate)
 		return dev_err_probe(dev, -EINVAL,
-				     "T6030 display not started: the display clock has no rate\n");
+				     "%s display not started: the display clock has no rate\n",
+				     v14->board->name);
 
 	dcp_v14_link_init(&v14->link, dev, NULL);
 	rtk = apple_rtkit_init(dev, v14, "mbox", 0, &dcp_v14_rtkit_ops);
 	if (IS_ERR(rtk))
 		return dev_err_probe(dev, PTR_ERR(rtk),
-				     "T6030 display not started: RTKit init failed\n");
+				     "%s display not started: RTKit init failed\n",
+				     v14->board->name);
 	/* From here nothing is freed and the module stays loaded. */
 	v14->rtk = rtk;
 	v14->link.rtk = rtk;
@@ -1882,7 +1992,8 @@ int iomfb_v14_7_bind(struct apple_dcp *dcp)
 	if (ret) {
 		v14->failed = true;
 		return dev_err_probe(dev, ret,
-				     "T6030 display not started: the DCP RTKit session did not wake; the boot framebuffer stays\n");
+				     "%s display not started: the DCP RTKit session did not wake; the boot framebuffer stays\n",
+				     v14->board->name);
 	}
 	dev_info(dev, "DCP RTKit session running\n");
 	/* The internal panel uses IOMFB only; dock DPTX belongs to dcpext. */
@@ -2023,14 +2134,15 @@ static int dcp_v14_mode(struct apple_dcp *dcp, struct apple_dcp_v14 *v14)
 			DRM_MODE_ARG(m), m->type & DRM_MODE_TYPE_PREFERRED ? " best" : "");
 		if (m->hdisplay != v14->panel_width ||
 		    m->vdisplay != v14->panel_height - dcp->notch_height ||
-		    (hz != 60 && hz != 120))
+		    (hz != 60 && (hz != 120 || !v14->board->promotion)))
 			continue;
 		if (!best || (m->type & DRM_MODE_TYPE_PREFERRED))
 			best = &modes[i];
 	}
 	if (!best) {
-		dev_err(dcp->dev, "no %ux%u timing at 60 or 120 Hz among %u\n", v14->panel_width,
-			v14->panel_height - dcp->notch_height, count);
+		dev_err(dcp->dev, "no %ux%u timing at 60%s Hz among %u\n", v14->panel_width,
+			v14->panel_height - dcp->notch_height,
+			v14->board->promotion ? " or 120" : "", count);
 		kfree(modes);
 		return -EINVAL;
 	}
@@ -2056,7 +2168,7 @@ int iomfb_v14_7_start(struct apple_dcp *dcp)
 	const char *step;
 	int ret;
 
-	if (!v14 || !v14->rtk || v14->failed || v14->started)
+	if (!v14 || !v14->board || !v14->rtk || v14->failed || v14->started)
 		return -ENODEV;
 
 	step = "DCPLink";
@@ -2085,7 +2197,7 @@ int iomfb_v14_7_start(struct apple_dcp *dcp)
 
 	v14->started = true;
 	/* Never removed, like the session it describes. */
-	debugfs_create_file("dcp-t6030", 0400, NULL, v14, &dcp_v14_status_fops);
+	debugfs_create_file(v14->board->debugfs, 0400, NULL, v14, &dcp_v14_status_fops);
 	dcp->connector->connected = true;
 	dcp_set_dimensions(dcp, dcp_modes_transfer_begin(dcp));
 	dcp_mode_set_valid(&dcp->mode_state, true);
@@ -2095,16 +2207,16 @@ int iomfb_v14_7_start(struct apple_dcp *dcp)
 	mutex_lock(&dcp->modes_lock);
 	selected = dcp->modes[0].mode;
 	mutex_unlock(&dcp->modes_lock);
-	dev_info(dcp->dev, "T6030 display started: %ux%u@%d, %u notch rows %s, %ux%u mm\n",
-		 mode->hdisplay, mode->vdisplay, drm_mode_vrefresh(mode),
+	dev_info(dcp->dev, "%s display started: %ux%u@%d, %u notch rows %s, %ux%u mm\n",
+		 v14->board->name, mode->hdisplay, mode->vdisplay, drm_mode_vrefresh(mode),
 		 dcp->notch_height ?: v14->panel_height - v14->fb_height,
 		 dcp->notch_height ? "hidden" : "shown", mode->width_mm, mode->height_mm);
 	return 0;
 fail:
 	v14->failed = true;
 	dev_err(dcp->dev,
-		"T6030 display not started: %s failed: %d; the boot framebuffer stays (reboot to retry)\n",
-		step, ret);
+		"%s display not started: %s failed: %d; the boot framebuffer stays (reboot to retry)\n",
+		v14->board->name, step, ret);
 	return ret;
 }
 
