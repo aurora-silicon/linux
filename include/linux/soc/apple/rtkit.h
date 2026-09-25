@@ -51,11 +51,13 @@ struct apple_rtkit_shmem {
  *                 should return true if it handled the message. If it
  *                 returns false, the message will be passed on to the
  *                 worker thread.
- * @shmem_setup:   Setup shared memory buffer. If bfr.is_iomem is true the
- *                 buffer is managed by the co-processor and needs to be mapped.
- *                 Otherwise the buffer is managed by Linux and needs to be
- *                 allocated. If not specified dma_alloc_coherent is used.
- *                 Called in process context.
+ * @shmem_setup:   Setup shared memory buffer. A nonzero input iova requests a
+ *                 mapping of firmware-owned memory; validate the ownership
+ *                 before mapping it. Otherwise allocate a Linux-owned buffer.
+ *                 On failure undo any partial setup. Do not retain the
+ *                 descriptor pointer and do not change size: repeated
+ *                 requests are matched against it. If not specified
+ *                 dma_alloc_coherent is used. Called in process context.
  * @shmem_destroy: Undo the shared memory buffer setup in shmem_setup. If not
  *                 specified dma_free_coherent is used. Called in process
  *                 context.
@@ -106,6 +108,17 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					  const struct apple_rtkit_ops *ops);
 
 /*
+ * Initialize an instance for a co-processor that the bootloader left running
+ * and that cannot be reset. No HELLO/EPMAP handshake takes place: the system
+ * endpoints are marked available and syslog records are acknowledged without
+ * being parsed. The caller must verify the device-specific running/ready
+ * indicators before using the instance.
+ */
+struct apple_rtkit *apple_rtkit_init_adopted(struct device *dev, void *cookie,
+					     const char *mbox_name, int mbox_idx,
+					     const struct apple_rtkit_ops *ops);
+
+/*
  * Free an instance of apple_rtkit.
  */
 void apple_rtkit_free(struct apple_rtkit *rtk);
@@ -135,6 +148,12 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk);
  * co-processor has been started.
  */
 int apple_rtkit_boot(struct apple_rtkit *rtk);
+
+/*
+ * Mark an instance created with apple_rtkit_init() as running without a
+ * handshake, see apple_rtkit_init_adopted().
+ */
+int apple_rtkit_adopt_running(struct apple_rtkit *rtk);
 
 /*
  * Quiesce the co-processor.

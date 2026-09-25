@@ -51,6 +51,8 @@ struct apple_rtkit {
 	char *syslog_msg_buffer;
 	size_t syslog_n_entries;
 	size_t syslog_msg_size;
+	/* Session inherited from the bootloader: INIT geometry never observed. */
+	bool syslog_inherited;
 
 	struct workqueue_struct *wq;
 };

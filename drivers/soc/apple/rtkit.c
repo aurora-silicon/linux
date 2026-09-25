@@ -452,6 +452,8 @@ static void apple_rtkit_syslog_rx_init(struct apple_rtkit *rtk, u64 msg)
 	size_t size = FIELD_GET(APPLE_RTKIT_SYSLOG_MSG_SIZE, msg);
 	char *buffer = NULL;
 
+	rtk->syslog_inherited = false;
+
 	/*
 	 * Firmware may send SYSLOG_INIT again after it restarts. The ordered RX
 	 * worker is the only user of the message buffer, so it can simply be
@@ -481,6 +483,14 @@ static void apple_rtkit_syslog_rx_log(struct apple_rtkit *rtk, u64 msg)
 	char log_context[24];
 	size_t entry_size = 0x20 + rtk->syslog_msg_size;
 	int msglen;
+
+	/*
+	 * A session inherited from the bootloader never saw SYSLOG_INIT, so the
+	 * ring cannot be interpreted; the records still have to be acknowledged
+	 * for the co-processor to make progress. A later INIT restores parsing.
+	 */
+	if (rtk->syslog_inherited)
+		goto done;
 
 	if (!rtk->syslog_msg_buffer) {
 		dev_warn_ratelimited(
@@ -709,6 +719,30 @@ int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_start_ep);
 
+static void apple_rtkit_mark_running(struct apple_rtkit *rtk)
+{
+	static const u8 system_endpoints[] = {
+		APPLE_RTKIT_EP_CRASHLOG,
+		APPLE_RTKIT_EP_SYSLOG,
+		APPLE_RTKIT_EP_DEBUG,
+		APPLE_RTKIT_EP_IOREPORT,
+		APPLE_RTKIT_EP_OSLOG,
+		APPLE_RTKIT_EP_TRACEKIT,
+	};
+	int i;
+
+	/*
+	 * The previous owner already completed HELLO and acknowledged this
+	 * EPMAP; the firmware will not repeat either for this session.
+	 */
+	for (i = 0; i < ARRAY_SIZE(system_endpoints); i++)
+		set_bit(system_endpoints[i], rtk->endpoints);
+
+	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_ON;
+	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_ON;
+	rtk->syslog_inherited = true;
+}
+
 static void apple_rtkit_claim_rx(struct apple_rtkit *rtk)
 {
 	struct apple_mbox *mbox = rtk->mbox;
@@ -756,9 +790,10 @@ static void apple_rtkit_release_rx(struct apple_rtkit *rtk)
 	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
 }
 
-struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
-					    const char *mbox_name, int mbox_idx,
-					    const struct apple_rtkit_ops *ops)
+static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
+					      const char *mbox_name, int mbox_idx,
+					      const struct apple_rtkit_ops *ops,
+					      bool adopted)
 {
 	struct apple_rtkit *rtk;
 	int ret;
@@ -798,6 +833,10 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 		goto free_rtk;
 	}
 
+	/* Inherited system traffic may arrive as soon as mailbox RX is armed. */
+	if (adopted)
+		apple_rtkit_mark_running(rtk);
+
 	apple_rtkit_claim_rx(rtk);
 
 	ret = apple_mbox_start(rtk->mbox);
@@ -813,7 +852,22 @@ free_rtk:
 	kfree(rtk);
 	return ERR_PTR(ret);
 }
+
+struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
+					    const char *mbox_name, int mbox_idx,
+					    const struct apple_rtkit_ops *ops)
+{
+	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, false);
+}
 EXPORT_SYMBOL_GPL(apple_rtkit_init);
+
+struct apple_rtkit *apple_rtkit_init_adopted(struct device *dev, void *cookie,
+					     const char *mbox_name, int mbox_idx,
+					     const struct apple_rtkit_ops *ops)
+{
+	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted);
 
 static int apple_rtkit_wait_for_completion(struct completion *c)
 {
@@ -848,6 +902,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	rtk->syslog_msg_buffer = NULL;
 	rtk->syslog_n_entries = 0;
 	rtk->syslog_msg_size = 0;
+	rtk->syslog_inherited = false;
 
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
@@ -944,6 +999,16 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 	return apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_boot);
+
+int apple_rtkit_adopt_running(struct apple_rtkit *rtk)
+{
+	if (rtk->crashed)
+		return -EINVAL;
+
+	apple_rtkit_mark_running(rtk);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_adopt_running);
 
 int apple_rtkit_shutdown(struct apple_rtkit *rtk)
 {
