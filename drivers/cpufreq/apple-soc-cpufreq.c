@@ -62,6 +62,8 @@
 
 struct apple_soc_cpufreq_info {
 	bool has_ps2;
+	bool verify_transition;
+	u64 min_pstate;
 	u64 max_pstate;
 	u64 cur_pstate_mask;
 	u64 cur_pstate_shift;
@@ -73,6 +75,8 @@ struct apple_cpu_priv {
 	struct device *cpu_dev;
 	void __iomem *reg_base;
 	const struct apple_soc_cpufreq_info *info;
+	bool transition_failed;
+	unsigned int expected_pstate;
 };
 
 static struct cpufreq_driver apple_soc_cpufreq_driver;
@@ -104,6 +108,20 @@ static const struct apple_soc_cpufreq_info soc_t8112_info = {
 	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
 };
 
+/*
+ * T8140 uses 5-bit PS1 state IDs starting at 1. The command register reads
+ * back the last accepted request, not a measured frequency; every transition
+ * is verified, see apple_soc_cpufreq_set_target(). Voltage, PLL and firmware
+ * throttling configuration are left as the bootloader set them.
+ */
+static const struct apple_soc_cpufreq_info soc_t8140_info = {
+	.verify_transition = true,
+	.min_pstate = 1,
+	.max_pstate = 31,
+	.ps1_mask = APPLE_DVFS_CMD_PS1,
+	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
+};
+
 static const struct apple_soc_cpufreq_info soc_default_info = {
 	.has_ps2 = false,
 	.max_pstate = 15,
@@ -128,6 +146,10 @@ static const struct of_device_id apple_soc_cpufreq_of_match[] __maybe_unused = {
 	{
 		.compatible = "apple,cluster-cpufreq",
 		.data = &soc_default_info,
+	},
+	{
+		.compatible = "apple,t8140-cluster-cpufreq",
+		.data = &soc_t8140_info,
 	},
 	{}
 };
@@ -175,14 +197,35 @@ static int apple_soc_cpufreq_set_target(struct cpufreq_policy *policy,
 	unsigned int pstate = policy->freq_table[index].driver_data;
 	u64 reg;
 
-	/* Fallback for newer SoCs */
-	if (index > priv->info->max_pstate)
-		index = priv->info->max_pstate;
+	/* OPP level is a hardware ID, not the frequency-table array index. */
+	if (pstate < priv->info->min_pstate || pstate > priv->info->max_pstate)
+		return -EINVAL;
+	if (priv->transition_failed)
+		return -EIO;
 
 	if (readq_poll_timeout_atomic(priv->reg_base + APPLE_DVFS_CMD, reg,
 				      !(reg & APPLE_DVFS_CMD_BUSY), 2,
 				      APPLE_DVFS_TRANSITION_TIMEOUT)) {
+		if (priv->info->verify_transition) {
+			priv->transition_failed = true;
+			dev_err(priv->cpu_dev,
+				"DVFS busy timeout, command=%#llx; stopping requests\n", reg);
+		}
 		return -EIO;
+	}
+
+	if (priv->info->verify_transition) {
+		unsigned int previous = FIELD_GET(APPLE_DVFS_CMD_PS1, reg);
+
+		/* Do not fight an unexpected retained policy owner. */
+		if (previous != priv->expected_pstate) {
+			priv->transition_failed = true;
+			dev_err(priv->cpu_dev, "unexpected DVFS state %u (expected %u); stopping requests\n",
+				previous, priv->expected_pstate);
+			return -EIO;
+		}
+		if (previous == pstate)
+			return 0;
 	}
 
 	reg &= ~priv->info->ps1_mask;
@@ -194,6 +237,20 @@ static int apple_soc_cpufreq_set_target(struct cpufreq_policy *policy,
 	reg |= APPLE_DVFS_CMD_SET;
 
 	writeq_relaxed(reg, priv->reg_base + APPLE_DVFS_CMD);
+
+	if (priv->info->verify_transition &&
+	    readq_poll_timeout_atomic(priv->reg_base + APPLE_DVFS_CMD, reg,
+				      !(reg & APPLE_DVFS_CMD_BUSY) &&
+				      FIELD_GET(APPLE_DVFS_CMD_PS1, reg) == pstate,
+				      2, APPLE_DVFS_TRANSITION_TIMEOUT)) {
+		/* Do not issue another request or guess a rollback after failure. */
+		priv->transition_failed = true;
+		dev_err(priv->cpu_dev,
+			"DVFS completion timeout, command=%#llx; stopping requests\n", reg);
+		return -ETIMEDOUT;
+	}
+	if (priv->info->verify_transition)
+		priv->expected_pstate = pstate;
 
 	return 0;
 }
@@ -222,13 +279,15 @@ static int apple_soc_cpufreq_find_cluster(struct cpufreq_policy *policy,
 		return ret;
 
 	match = of_match_node(apple_soc_cpufreq_of_match, args.np);
-	of_node_put(args.np);
-	if (!match)
+	if (!match || !of_device_is_available(args.np)) {
+		of_node_put(args.np);
 		return -ENODEV;
+	}
 
 	*info = match->data;
 
 	*reg_base = of_iomap(args.np, 0);
+	of_node_put(args.np);
 	if (!*reg_base)
 		return -ENOMEM;
 
@@ -237,6 +296,7 @@ static int apple_soc_cpufreq_find_cluster(struct cpufreq_policy *policy,
 
 static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 {
+	struct cpufreq_frequency_table *p;
 	int ret, i;
 	unsigned int transition_latency;
 	void __iomem *reg_base;
@@ -291,6 +351,33 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 		}
 		freq_table[i].driver_data = dev_pm_opp_get_level(opp);
 		dev_pm_opp_put(opp);
+		if (freq_table[i].driver_data < info->min_pstate ||
+		    freq_table[i].driver_data > info->max_pstate) {
+			ret = -EINVAL;
+			goto out_free_cpufreq_table;
+		}
+	}
+
+	if (info->verify_transition) {
+		u64 cmd;
+		unsigned int state;
+
+		/* Registration must not silently reset an unknown inherited state. */
+		ret = readq_poll_timeout_atomic(reg_base + APPLE_DVFS_CMD, cmd,
+						!(cmd & APPLE_DVFS_CMD_BUSY), 2,
+						APPLE_DVFS_TRANSITION_TIMEOUT);
+		if (ret)
+			goto out_free_cpufreq_table;
+		state = FIELD_GET(APPLE_DVFS_CMD_PS1, cmd);
+		for (i = 0; freq_table[i].frequency != CPUFREQ_TABLE_END; i++)
+			if (freq_table[i].driver_data == state)
+				break;
+		if (freq_table[i].frequency == CPUFREQ_TABLE_END) {
+			ret = -ERANGE;
+			goto out_free_cpufreq_table;
+		}
+		policy->cur = freq_table[i].frequency;
+		priv->expected_pstate = state;
 	}
 
 	priv->cpu_dev = cpu_dev;
@@ -300,13 +387,31 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 	policy->freq_table = freq_table;
 
 	transition_latency = dev_pm_opp_get_max_transition_latency(cpu_dev);
-	if (!transition_latency)
+	if (!transition_latency) {
+		/* Conservative transaction bound, not a measured transition time. */
 		transition_latency = APPLE_DVFS_TRANSITION_TIMEOUT * NSEC_PER_USEC;
+		if (info->verify_transition)
+			transition_latency *= 2;
+	}
 
 	policy->cpuinfo.transition_latency = transition_latency;
 	policy->dvfs_possible_from_any_cpu = true;
-	policy->fast_switch_possible = true;
+	policy->fast_switch_possible = !info->verify_transition;
 	policy->suspend_freq = freq_table[0].frequency;
+	if (info->verify_transition) {
+		/*
+		 * P-states above 2 need a thermal policy that can cap them;
+		 * refuse such a table rather than run it unthrottled.
+		 */
+		cpufreq_for_each_valid_entry(p, policy->freq_table) {
+			if (p->driver_data > 2) {
+				dev_err(cpu_dev, "P-state %u requires a CPU thermal policy\n",
+					p->driver_data);
+				ret = -ENODEV;
+				goto out_free_cpufreq_table;
+			}
+		}
+	}
 
 	return 0;
 
