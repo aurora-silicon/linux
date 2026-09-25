@@ -63,7 +63,8 @@ int ipc_bt_handle(struct apple_isp *isp, struct isp_channel *chan)
 		return -EIO;
 	}
 
-	bl = apple_isp_translate(isp, isp->bt_surf, req->arg0, req->arg1);
+	bl = apple_isp_translate(isp, isp->bt_surf, isp_fw_iova(isp, req->arg0),
+				 req->arg1);
 	if (!bl)
 		return -EIO;
 

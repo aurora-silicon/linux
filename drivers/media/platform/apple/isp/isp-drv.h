@@ -135,6 +135,9 @@ struct apple_isp_hw {
 	u32 meta_size;
 	bool scl1;
 	bool lpdp;
+
+	/* address bits the ISP DARTs translate, 0 for all */
+	u64 fw_iova_mask;
 };
 
 enum isp_sensor_id {
@@ -235,6 +238,7 @@ struct apple_isp {
 	unsigned long shift;
 	struct drm_mm iovad; /* TODO iova.c can't allocate bottom-up */
 	u64 iova_size; /* size of the iovad range */
+	u64 fw_iova_mask; /* see isp_fw_iova() */
 	struct mutex iovad_lock;
 
 	struct isp_firmware {
@@ -294,6 +298,12 @@ enum {
 #define isp_err(isp, fmt, ...) \
 	dev_err((isp)->dev, "[%s] " fmt, __func__, ##__VA_ARGS__)
 
+/*
+ * Addresses from the firmware may carry bits above the ones the DART
+ * translates (the vm-base on T8140); strip them before comparing or
+ * translating.
+ */
+#define isp_fw_iova(isp, x)	    ((x) & (isp)->fw_iova_mask)
 #define isp_get_format(isp, ch)	    (&(isp)->fmts[(ch)])
 #define isp_get_current_format(isp) (isp_get_format(isp, isp->current_ch))
 

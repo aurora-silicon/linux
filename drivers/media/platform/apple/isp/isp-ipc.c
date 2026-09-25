@@ -163,7 +163,8 @@ static inline bool chan_tx_done(struct apple_isp *isp, struct isp_channel *chan)
 	dma_rmb();
 
 	chan_read_msg(isp, chan, &chan->rsp);
-	if ((chan->rsp.arg0) == (chan->req.arg0 | ISP_IPC_FLAG_ACK)) {
+	if (isp_fw_iova(isp, chan->rsp.arg0) ==
+	    isp_fw_iova(isp, chan->req.arg0 | ISP_IPC_FLAG_ACK)) {
 		chan_update_cursor(chan);
 		return true;
 	}
@@ -200,7 +201,8 @@ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
 int ipc_tm_handle(struct apple_isp *isp, struct isp_channel *chan)
 {
 	struct isp_message *req = &chan->req, *rsp = &chan->rsp;
-	dma_addr_t iova = req->arg0 & ~ISP_IPC_FLAG_TERMINAL_ACK;
+	dma_addr_t iova =
+		isp_fw_iova(isp, req->arg0 & ~ISP_IPC_FLAG_TERMINAL_ACK);
 	size_t size = min_t(u64, req->arg1, ISP_IPC_TERMINAL_MAX_LEN);
 	const char *line;
 

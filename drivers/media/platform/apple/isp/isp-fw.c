@@ -489,7 +489,7 @@ static int isp_fill_channel_info(struct apple_isp *isp)
 	u64 table_iova = isp_gpio_read32(isp, ISP_GPIO_0) |
 			 ((u64)isp_gpio_read32(isp, ISP_GPIO_1)) << 32;
 	void *table_virt = apple_isp_ipc_translate(
-		isp, table_iova,
+		isp, isp_fw_iova(isp, table_iova),
 		array_size(sizeof(struct isp_chan_desc), isp->num_ipc_chans));
 	int err = -EIO;
 
@@ -525,7 +525,7 @@ static int isp_fill_channel_info(struct apple_isp *isp)
 		chan->src = desc.src;
 		chan->num = desc.num;
 		chan->size = (u64)desc.num * ISP_IPC_MESSAGE_SIZE;
-		chan->iova = desc.iova;
+		chan->iova = isp_fw_iova(isp, desc.iova);
 		chan->cursor = 0;
 		mutex_init(&chan->lock);
 

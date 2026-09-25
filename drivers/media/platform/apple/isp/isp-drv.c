@@ -95,6 +95,7 @@ static int apple_isp_init_iommu(struct apple_isp *isp)
 	if (!isp->domain)
 		return -ENODEV;
 	isp->shift = __ffs(isp->domain->pgsize_bitmap);
+	isp->fw_iova_mask = isp->hw->fw_iova_mask ?: U64_MAX;
 
 	idx = of_property_match_string(dev->of_node, "memory-region-names",
 				       "heap");
