@@ -43,7 +43,13 @@ struct isp_buflist {
 } __packed;
 static_assert(sizeof(struct isp_buflist) == ISP_BUFLIST_HDR_SIZE);
 /* the firmware reads at least ISP_IPC_BUFEXC_STAT_SIZE bytes of a batch */
-static_assert(ISP_CMD_AREA_SIZE >= ISP_IPC_BUFEXC_STAT_SIZE);
+static_assert(ISP_CMD_AREA_SIZE(0) >= ISP_IPC_BUFEXC_STAT_SIZE);
+
+/*
+ * Buffer list tag of capture metadata buffers. The pool itself is set up
+ * as CISP_POOL_TYPE_META_CAPTURE; why the tags differ is not known.
+ */
+#define ISP_BUFLIST_POOL_CAPTURE_META 2
 
 int ipc_bt_handle(struct apple_isp *isp, struct isp_channel *chan)
 {
@@ -91,6 +97,14 @@ int ipc_bt_handle(struct apple_isp *isp, struct isp_channel *chan)
 					meta->submitted = false;
 				}
 			}
+		} else if (bufd->pool_type == ISP_BUFLIST_POOL_CAPTURE_META &&
+			   isp_num_capmeta(isp)) {
+			for (int j = 0; j < isp_num_capmeta(isp); j++) {
+				struct isp_surf *meta = isp->capmeta_surfs[j];
+
+				if (meta && (u32)bufd->iovas[0] == (u32)meta->iova)
+					meta->submitted = false;
+			}
 		} else {
 			list_for_each_entry_safe_reverse(
 				buf, tmp, &isp->bufs_submitted, link) {
@@ -122,7 +136,12 @@ int ipc_bt_handle(struct apple_isp *isp, struct isp_channel *chan)
 	return err;
 }
 
-static int isp_submit_buffers(struct apple_isp *isp)
+/*
+ * With a capture metadata pool, the firmware takes the metadata buffers
+ * before CH_START and the capture metadata and capture buffers after it,
+ * so the batch before the start (@pre_start) has only the former.
+ */
+static int isp_submit_buffers(struct apple_isp *isp, bool pre_start)
 {
 	struct isp_format *fmt = isp_get_current_format(isp);
 	struct isp_channel *chan = isp->chan_bh;
@@ -137,7 +156,7 @@ static int isp_submit_buffers(struct apple_isp *isp)
 	struct isp_buflist_buffer *bufd = &bl->buffers[0];
 
 	/* Clear what earlier commands and batches left in the reserved fields. */
-	memset(bl, 0, ISP_CMD_AREA_SIZE);
+	memset(bl, 0, ISP_CMD_AREA_SIZE(isp_num_capmeta(isp)));
 	bl->type = 1;
 
 	spin_lock_irqsave(&isp->buf_lock, flags);
@@ -152,6 +171,25 @@ static int isp_submit_buffers(struct apple_isp *isp)
 
 		bufd->num_planes = 1;
 		bufd->pool_type = 0;
+		bufd->iovas[0] = meta->iova;
+		bufd->flags[0] = 0x40000000;
+		bufd++;
+		bl->num_buffers++;
+
+		meta->submitted = true;
+	}
+
+	if (isp_num_capmeta(isp) && pre_start)
+		goto send;
+
+	for (int i = 0; i < isp_num_capmeta(isp); i++) {
+		struct isp_surf *meta = isp->capmeta_surfs[i];
+
+		if (meta->submitted)
+			continue;
+
+		bufd->num_planes = 1;
+		bufd->pool_type = ISP_BUFLIST_POOL_CAPTURE_META;
 		bufd->iovas[0] = meta->iova;
 		bufd->flags[0] = 0x40000000;
 		bufd++;
@@ -189,6 +227,7 @@ static int isp_submit_buffers(struct apple_isp *isp)
 		list_move_tail(&buf->link, &isp->bufs_submitted);
 	}
 
+send:
 	spin_unlock_irqrestore(&isp->buf_lock, flags);
 
 	req->arg0 = isp->cmd_iova;
@@ -223,6 +262,12 @@ static int isp_submit_buffers(struct apple_isp *isp)
 				if (bufd->iovas[0] == meta->iova) {
 					meta->submitted = false;
 				}
+			}
+			for (int j = 0; j < isp_num_capmeta(isp); j++) {
+				struct isp_surf *meta = isp->capmeta_surfs[j];
+
+				if (bufd->iovas[0] == meta->iova)
+					meta->submitted = false;
 			}
 		}
 
@@ -344,7 +389,7 @@ static void isp_vb2_buf_queue(struct vb2_buffer *vb)
 	spin_unlock_irqrestore(&isp->buf_lock, flags);
 
 	if (test_bit(ISP_STATE_STREAMING, &isp->state) && !empty)
-		isp_submit_buffers(isp);
+		isp_submit_buffers(isp, false);
 }
 
 static int apple_isp_start_streaming(struct apple_isp *isp)
@@ -357,7 +402,7 @@ static int apple_isp_start_streaming(struct apple_isp *isp)
 		return err;
 	}
 
-	err = isp_submit_buffers(isp);
+	err = isp_submit_buffers(isp, true);
 	if (err) {
 		dev_err(isp->dev, "failed to send initial batch: %d\n", err);
 		goto stop_camera;
@@ -367,6 +412,16 @@ static int apple_isp_start_streaming(struct apple_isp *isp)
 	if (err) {
 		dev_err(isp->dev, "failed to start capture: %d\n", err);
 		goto stop_camera;
+	}
+
+	if (isp_num_capmeta(isp)) {
+		err = isp_submit_buffers(isp, false);
+		if (err) {
+			dev_err(isp->dev, "failed to send the capture batch: %d\n",
+				err);
+			apple_isp_stop_capture(isp);
+			goto stop_camera;
+		}
 	}
 
 	set_bit(ISP_STATE_STREAMING, &isp->state);
@@ -835,6 +890,21 @@ static const struct media_device_ops isp_media_device_ops = {
 	.link_notify = v4l2_pipeline_link_notify,
 };
 
+static void isp_free_meta_surfaces(struct apple_isp *isp)
+{
+	for (int i = 0; i < ARRAY_SIZE(isp->capmeta_surfs); i++) {
+		if (isp->capmeta_surfs[i])
+			isp_free_surface(isp, isp->capmeta_surfs[i]);
+		isp->capmeta_surfs[i] = NULL;
+	}
+
+	for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++) {
+		if (isp->meta_surfs[i])
+			isp_free_surface(isp, isp->meta_surfs[i]);
+		isp->meta_surfs[i] = NULL;
+	}
+}
+
 int apple_isp_setup_video(struct apple_isp *isp)
 {
 	struct video_device *vdev = &isp->vdev;
@@ -853,6 +923,17 @@ int apple_isp_setup_video(struct apple_isp *isp)
 			isp_alloc_surface_vmap(isp, isp->hw->meta_size);
 		if (!isp->meta_surfs[i]) {
 			isp_err(isp, "failed to alloc meta surface\n");
+			err = -ENOMEM;
+			goto surf_cleanup;
+		}
+	}
+
+	/* Only the firmware reads and writes these, so they need no vmap. */
+	for (int i = 0; i < isp_num_capmeta(isp); i++) {
+		isp->capmeta_surfs[i] =
+			isp_alloc_surface(isp, isp->hw->capture_meta_size);
+		if (!isp->capmeta_surfs[i]) {
+			isp_err(isp, "failed to alloc capture meta surface\n");
 			err = -ENOMEM;
 			goto surf_cleanup;
 		}
@@ -925,11 +1006,7 @@ media_unregister:
 media_cleanup:
 	media_device_cleanup(&isp->mdev);
 surf_cleanup:
-	for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++) {
-		if (isp->meta_surfs[i])
-			isp_free_surface(isp, isp->meta_surfs[i]);
-		isp->meta_surfs[i] = NULL;
-	}
+	isp_free_meta_surfaces(isp);
 
 	return err;
 }
@@ -940,9 +1017,5 @@ void apple_isp_remove_video(struct apple_isp *isp)
 	v4l2_device_unregister(&isp->v4l2_dev);
 	media_device_unregister(&isp->mdev);
 	media_device_cleanup(&isp->mdev);
-	for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++) {
-		if (isp->meta_surfs[i])
-			isp_free_surface(isp, isp->meta_surfs[i]);
-		isp->meta_surfs[i] = NULL;
-	}
+	isp_free_meta_surfaces(isp);
 }

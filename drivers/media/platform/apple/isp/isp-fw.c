@@ -500,6 +500,7 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 	bool h16 = isp->hw->fw_abi == ISP_FW_ABI_H17;
 	size_t args_size = h16 ? sizeof(struct isp_firmware_bootargs_h16) :
 				 sizeof(struct isp_firmware_bootargs);
+	size_t cmd_size = ISP_CMD_AREA_SIZE(isp_num_capmeta(isp));
 	dma_addr_t args_iova, cmd_iova;
 	void *args_virt, *cmd_virt;
 	int err;
@@ -540,8 +541,7 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 				&args_iova) &&
 	    !check_add_overflow(args_iova, args_size + 0x40, &cmd_iova)) {
 		args_virt = apple_isp_ipc_translate(isp, args_iova, args_size);
-		cmd_virt = apple_isp_ipc_translate(isp, cmd_iova,
-						   ISP_CMD_AREA_SIZE);
+		cmd_virt = apple_isp_ipc_translate(isp, cmd_iova, cmd_size);
 	}
 	if (!args_virt || !cmd_virt) {
 		dev_err(isp->dev, "invalid boot arguments offset 0x%x\n",

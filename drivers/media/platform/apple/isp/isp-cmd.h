@@ -343,7 +343,7 @@ static_assert(sizeof(struct cmd_ch_info) == 0x118);
 /*
  * The H17 firmware exchanges a 0x190-byte CH_INFO_GET record whose first
  * 0x118 bytes match struct cmd_ch_info; there unk_68 is the size of the
- * per-frame metadata record.
+ * per-frame metadata record and unk_78 that of the capture metadata.
  */
 struct cmd_ch_info_h17 {
 	struct cmd_ch_info info;
