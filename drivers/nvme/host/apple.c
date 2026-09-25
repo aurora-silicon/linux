@@ -42,6 +42,8 @@
 #define APPLE_ANS_ACQ_DB  0x1004
 #define APPLE_ANS_IOCQ_DB 0x100c
 
+#define APPLE_ANS_IOSQ_REGISTER      0x1200
+#define APPLE_ANS_IOCQ_REGISTER      0x1208
 #define APPLE_ANS_MAX_PEND_CMDS_CTRL 0x1210
 
 #define APPLE_ANS_BOOT_STATUS	 0x1300
@@ -184,6 +186,9 @@ struct apple_nvme_iod {
 
 struct apple_nvme_hw {
 	bool has_lsq_nvmmu;
+	bool has_queue_count;
+	bool has_separate_nvmmu;
+	bool needs_ioq_registers;
 	u32 max_queue_depth;
 };
 
@@ -192,6 +197,7 @@ struct apple_nvme {
 
 	void __iomem *mmio_coproc;
 	void __iomem *mmio_nvme;
+	void __iomem *mmio_nvmmu;
 	const struct apple_nvme_hw *hw;
 
 	struct device **pd_dev;
@@ -226,6 +232,21 @@ struct apple_nvme {
 	unsigned long last_flush;
 	struct delayed_work flush_dwork;
 };
+
+static inline void apple_nvme_writeq(struct apple_nvme *anv, u64 value,
+				     void __iomem *addr)
+{
+	/*
+	 * Post-M4 ANS consumes the queue and NVMMU TCB base addresses as paired
+	 * 32-bit registers. Match the access sequence used by Apple firmware,
+	 * m1n1, and U-Boot; older ANS generations retain their native 64-bit
+	 * access.
+	 */
+	if (anv->hw->needs_ioq_registers)
+		lo_hi_writeq(value, addr);
+	else
+		writeq(value, addr);
+}
 
 unsigned int flush_interval = 1000;
 module_param(flush_interval, uint, 0644);
@@ -310,8 +331,8 @@ static void apple_nvmmu_inval(struct apple_nvme_queue *q, unsigned int tag)
 {
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
 
-	writel(tag, anv->mmio_nvme + APPLE_NVMMU_TCB_INVAL);
-	if (readl(anv->mmio_nvme + APPLE_NVMMU_TCB_STAT))
+	writel(tag, anv->mmio_nvmmu + APPLE_NVMMU_TCB_INVAL);
+	if (readl(anv->mmio_nvmmu + APPLE_NVMMU_TCB_STAT))
 		dev_warn_ratelimited(anv->dev,
 				     "NVMMU TCB invalidation failed\n");
 }
@@ -916,7 +937,13 @@ static void apple_nvme_disable(struct apple_nvme *anv, bool shutdown)
 	nvme_quiesce_io_queues(&anv->ctrl);
 
 	if (!dead) {
-		if (apple_nvme_queue_enabled(&anv->ioq)) {
+		/*
+		 * Post-M4 firmware rejects Delete SQ and Delete CQ with BAD_CMD.
+		 * Its I/O queues are registered through the dedicated IOSQ/IOCQ
+		 * registers and are torn down by the controller disable below.
+		 */
+		if (apple_nvme_queue_enabled(&anv->ioq) &&
+		    !anv->hw->needs_ioq_registers) {
 			apple_nvme_remove_sq(anv);
 			apple_nvme_remove_cq(anv);
 		}
@@ -1076,7 +1103,7 @@ static void apple_nvme_reset_work(struct work_struct *work)
 {
 	unsigned int nr_io_queues = 1;
 	int ret;
-	u32 boot_status, aqa;
+	u32 boot_status, aqa, ioqa, ioqa_depth;
 	struct apple_nvme *anv =
 		container_of(work, struct apple_nvme, ctrl.reset_work);
 	enum nvme_ctrl_state state = nvme_ctrl_state(&anv->ctrl);
@@ -1168,30 +1195,58 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		 */
 		writel(APPLE_ANS_LINEAR_SQ_EN,
 			anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL);
+		if (anv->hw->needs_ioq_registers) {
+			u32 lsq_ctrl = readl(anv->mmio_nvme +
+					     APPLE_ANS_LINEAR_SQ_CTRL);
 
-		/* Allow as many pending command as possible for both queues */
-		writel(anv->hw->max_queue_depth
-			| (anv->hw->max_queue_depth << 16), anv->mmio_nvme
-			+ APPLE_ANS_MAX_PEND_CMDS_CTRL);
+			if (!(lsq_ctrl & APPLE_ANS_LINEAR_SQ_EN)) {
+				dev_err(anv->dev,
+					"failed to enable linear submission queues: LSQ_CTRL=0x%08x\n",
+					lsq_ctrl);
+				ret = -EIO;
+				goto out;
+			}
+		}
+
+		/*
+		 * The legacy register takes queue entry counts. On post-M4
+		 * controllers the same offset is IOQA and both fields contain the
+		 * zero-based queue size, like NVMe AQA. Programming 64 for a
+		 * 64-entry queue makes ANS treat it as 65 entries and reject CQ head
+		 * 63 once the host wraps through the queue.
+		 */
+		ioqa_depth = anv->hw->max_queue_depth;
+		if (anv->hw->needs_ioq_registers)
+			ioqa_depth--;
+		ioqa = ioqa_depth | (ioqa_depth << 16);
+		writel(ioqa, anv->mmio_nvme + APPLE_ANS_MAX_PEND_CMDS_CTRL);
+		if (anv->hw->needs_ioq_registers &&
+		    readl(anv->mmio_nvme + APPLE_ANS_MAX_PEND_CMDS_CTRL) != ioqa) {
+			dev_err(anv->dev, "failed to program I/O queue aperture\n");
+			ret = -EIO;
+			goto out;
+		}
 
 		/* Setup the NVMMU for the maximum admin and IO queue depth */
 		writel(anv->hw->max_queue_depth - 1,
-			anv->mmio_nvme + APPLE_NVMMU_NUM_TCBS);
+			anv->mmio_nvmmu + APPLE_NVMMU_NUM_TCBS);
 	}
 
 	/* Setup the admin queue */
 	aqa = APPLE_NVME_AQ_DEPTH - 1;
 	aqa |= aqa << 16;
 	writel(aqa, anv->mmio_nvme + NVME_REG_AQA);
-	writeq(anv->adminq.sq_dma_addr, anv->mmio_nvme + NVME_REG_ASQ);
-	writeq(anv->adminq.cq_dma_addr, anv->mmio_nvme + NVME_REG_ACQ);
+	apple_nvme_writeq(anv, anv->adminq.sq_dma_addr,
+			  anv->mmio_nvme + NVME_REG_ASQ);
+	apple_nvme_writeq(anv, anv->adminq.cq_dma_addr,
+			  anv->mmio_nvme + NVME_REG_ACQ);
 
 	if (anv->hw->has_lsq_nvmmu) {
 		/* Setup NVMMU for both queues */
-		writeq(anv->adminq.tcb_dma_addr,
-			anv->mmio_nvme + APPLE_NVMMU_ASQ_TCB_BASE);
-		writeq(anv->ioq.tcb_dma_addr,
-			anv->mmio_nvme + APPLE_NVMMU_IOSQ_TCB_BASE);
+		apple_nvme_writeq(anv, anv->adminq.tcb_dma_addr,
+				  anv->mmio_nvmmu + APPLE_NVMMU_ASQ_TCB_BASE);
+		apple_nvme_writeq(anv, anv->ioq.tcb_dma_addr,
+				  anv->mmio_nvmmu + APPLE_NVMMU_IOSQ_TCB_BASE);
 	}
 
 	anv->ctrl.sqsize =
@@ -1228,13 +1283,26 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		goto out_remove_cq;
 
 	apple_nvme_init_queue(&anv->ioq);
+	if (anv->hw->needs_ioq_registers) {
+		/*
+		 * Post-M4 firmware also takes the I/O queue addresses through
+		 * dedicated registers. Without them it crashes and its crash log
+		 * reports null I/O SQ and CQ addresses.
+		 */
+		apple_nvme_writeq(anv, anv->ioq.cq_dma_addr,
+				  anv->mmio_nvme + APPLE_ANS_IOCQ_REGISTER);
+		apple_nvme_writeq(anv, anv->ioq.sq_dma_addr,
+				  anv->mmio_nvme + APPLE_ANS_IOSQ_REGISTER);
+	}
 	nr_io_queues = 1;
-	ret = nvme_set_queue_count(&anv->ctrl, &nr_io_queues);
-	if (ret)
-		goto out_remove_sq;
-	if (nr_io_queues != 1) {
-		ret = -ENXIO;
-		goto out_remove_sq;
+	if (anv->hw->has_queue_count) {
+		ret = nvme_set_queue_count(&anv->ctrl, &nr_io_queues);
+		if (ret)
+			goto out_remove_sq;
+		if (nr_io_queues != 1) {
+			ret = -ENXIO;
+			goto out_remove_sq;
+		}
 	}
 
 	anv->ctrl.queue_count = nr_io_queues + 1;
@@ -1257,9 +1325,11 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	return;
 
 out_remove_sq:
-	apple_nvme_remove_sq(anv);
+	if (!anv->hw->needs_ioq_registers)
+		apple_nvme_remove_sq(anv);
 out_remove_cq:
-	apple_nvme_remove_cq(anv);
+	if (!anv->hw->needs_ioq_registers)
+		apple_nvme_remove_cq(anv);
 out:
 	dev_warn(anv->ctrl.device, "Reset failure status: %d\n", ret);
 	nvme_change_ctrl_state(&anv->ctrl, NVME_CTRL_DELETING);
@@ -1559,6 +1629,16 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		ret = PTR_ERR(anv->mmio_nvme);
 		goto put_dev;
 	}
+	if (anv->hw->has_separate_nvmmu) {
+		anv->mmio_nvmmu =
+			devm_platform_ioremap_resource_byname(pdev, "nvmmu");
+		if (IS_ERR(anv->mmio_nvmmu)) {
+			ret = PTR_ERR(anv->mmio_nvmmu);
+			goto put_dev;
+		}
+	} else {
+		anv->mmio_nvmmu = anv->mmio_nvme;
+	}
 
 	if (anv->hw->has_lsq_nvmmu) {
 		anv->adminq.sq_db = anv->mmio_nvme + APPLE_ANS_LINEAR_ASQ_DB;
@@ -1769,17 +1849,27 @@ static DEFINE_SIMPLE_DEV_PM_OPS(apple_nvme_pm_ops, apple_nvme_suspend,
 
 static const struct apple_nvme_hw apple_nvme_t8015_hw = {
 	.has_lsq_nvmmu = false,
+	.has_queue_count = true,
 	.max_queue_depth = 16,
 };
 
 static const struct apple_nvme_hw apple_nvme_t8103_hw = {
 	.has_lsq_nvmmu = true,
+	.has_queue_count = true,
+	.max_queue_depth = 64,
+};
+
+static const struct apple_nvme_hw apple_nvme_t8132_hw = {
+	.has_lsq_nvmmu = true,
+	.has_separate_nvmmu = true,
+	.needs_ioq_registers = true,
 	.max_queue_depth = 64,
 };
 
 static const struct of_device_id apple_nvme_of_match[] = {
 	{ .compatible = "apple,t8015-nvme-ans2", .data = &apple_nvme_t8015_hw },
 	{ .compatible = "apple,t8103-nvme-ans2", .data = &apple_nvme_t8103_hw },
+	{ .compatible = "apple,t8132-nvme-ans2", .data = &apple_nvme_t8132_hw },
 	{ .compatible = "apple,nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{},
 };
