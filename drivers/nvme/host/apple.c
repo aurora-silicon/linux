@@ -1305,7 +1305,19 @@ static void apple_nvme_recovery_work(struct work_struct *work)
 	 */
 	if (READ_ONCE(anv->quarantined) || READ_ONCE(anv->removing))
 		goto done;
-	ret = apple_nvme_disable(anv, false);
+	mutex_lock(&anv->disable_lock);
+	ret = apple_nvme_disable_locked(anv, false);
+	/*
+	 * Without restart, this stop aborts an initialization, and no reset
+	 * follows. The requests it cancelled have been requeued; let them
+	 * reach the stopped queues and fail, so that reset_work does not wait
+	 * for them forever.
+	 */
+	if (!ret && !restart) {
+		nvme_unquiesce_io_queues(&anv->ctrl);
+		nvme_unquiesce_admin_queue(&anv->ctrl);
+	}
+	mutex_unlock(&anv->disable_lock);
 	if (ret)
 		goto done;
 	clear_bit(APPLE_NVME_RECOVERY_PENDING, &anv->recovery_flags);
@@ -1484,6 +1496,19 @@ static void apple_nvme_init_queue(struct apple_nvme_queue *q)
 			* sizeof(struct apple_nvmmu_tcb));
 	memset(q->cqes, 0, depth * sizeof(struct nvme_completion));
 	apple_nvme_enable_queue(q);
+}
+
+/*
+ * Wait for the requests that entered before a post-M4 reset. Give up once
+ * the reset has been aborted, whose failure path stops the controller, or
+ * the controller has been quarantined, which keeps its requests.
+ */
+static void apple_nvme_wait_freeze(struct apple_nvme *anv)
+{
+	while (!nvme_wait_freeze_timeout(&anv->ctrl, NVME_IO_TIMEOUT)) {
+		if (READ_ONCE(anv->abort_reset) || READ_ONCE(anv->quarantined))
+			return;
+	}
 }
 
 static void apple_nvme_reset_work(struct work_struct *work)
@@ -1793,7 +1818,26 @@ rtkit_ready:
 	anv->ctrl.queue_count = nr_io_queues + 1;
 
 	nvme_unquiesce_io_queues(&anv->ctrl);
-	nvme_wait_freeze(&anv->ctrl);
+	if (phase_locked) {
+		/*
+		 * Do not hold disable_lock while waiting for the requests that
+		 * entered before the reset: if one of them times out, stopping
+		 * the controller needs the lock. That stop fails the requests,
+		 * unless it quarantines the controller, which
+		 * apple_nvme_wait_freeze() gives up on.
+		 */
+		mutex_unlock(&anv->disable_lock);
+		apple_nvme_wait_freeze(anv);
+		mutex_lock(&anv->disable_lock);
+		if (READ_ONCE(anv->quarantined) || READ_ONCE(anv->removing) ||
+		    READ_ONCE(anv->abort_reset)) {
+			nvme_unfreeze(&anv->ctrl);
+			ret = -ECANCELED;
+			goto out;
+		}
+	} else {
+		nvme_wait_freeze(&anv->ctrl);
+	}
 	blk_mq_update_nr_hw_queues(&anv->tagset, 1);
 	nvme_unfreeze(&anv->ctrl);
 
@@ -1804,11 +1848,19 @@ rtkit_ready:
 		goto out_remove_sq;
 	}
 
+	/*
+	 * nvme_start_ctrl() sends Set Features if the controller reports
+	 * asynchronous events. If that times out, the controller is live and
+	 * recovery_work needs disable_lock to stop it. As in pci.c, a stop
+	 * that lands before nvme_start_ctrl() unquiesces the I/O queues loses
+	 * its quiesce, and requests then fail on the stopped queues until the
+	 * next reset instead of waiting for it.
+	 */
+	if (phase_locked)
+		mutex_unlock(&anv->disable_lock);
 	nvme_start_ctrl(&anv->ctrl);
 
 	dev_dbg(anv->dev, "ANS boot and NVMe init completed.");
-	if (phase_locked)
-		mutex_unlock(&anv->disable_lock);
 	return;
 
 out_remove_sq:
