@@ -17,6 +17,7 @@ Human Interface Devices (HID)
    uhid
 
    hid-alps
+   apple-j700-multitouch
    intel-ish-hid
    intel-thc-hid
    amd-sfh-hid
