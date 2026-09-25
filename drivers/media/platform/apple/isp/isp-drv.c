@@ -440,6 +440,17 @@ static int apple_isp_probe(struct platform_device *pdev)
 		}
 	}
 
+	/* Capture watchdog, where the ISP gates its frames on one */
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "wdt");
+	if (res) {
+		isp->wdt = devm_ioremap_resource(dev, res);
+		if (IS_ERR(isp->wdt)) {
+			err = PTR_ERR(isp->wdt);
+			goto detach_genpd;
+		}
+		apple_isp_wdt_init(isp);
+	}
+
 	isp->irq = platform_get_irq(pdev, 0);
 	if (isp->irq < 0) {
 		err = isp->irq;

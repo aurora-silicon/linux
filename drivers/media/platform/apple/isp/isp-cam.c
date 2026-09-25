@@ -8,6 +8,7 @@
 #include "isp-cmd.h"
 #include "isp-fw.h"
 #include "isp-iommu.h"
+#include "isp-regs.h"
 
 #define ISP_MAX_PRESETS 32
 
@@ -568,13 +569,77 @@ void apple_isp_stop_camera(struct apple_isp *isp)
 	apple_isp_firmware_shutdown(isp);
 }
 
+/*
+ * Capture watchdog. While it is not serviced, the ISP firmware replaces
+ * every frame with a flat fill. macOS services it only while its
+ * camera-in-use indicator is shown, which makes it a privacy interlock.
+ * That indicator is drawn by the display pipeline for secure firmware
+ * that Linux does not run, so the driver services the watchdog whenever
+ * it captures, with the register sequence and rate observed on macOS.
+ */
+static void apple_isp_wdt_kick(struct apple_isp *isp)
+{
+	writel(0, isp->wdt + ISP_WDT_CLEAR);
+	writel(ISP_WDT_RELOAD_VAL, isp->wdt + ISP_WDT_RELOAD);
+	writel(1, isp->wdt + ISP_WDT_KICK);
+}
+
+static enum hrtimer_restart apple_isp_wdt_timer(struct hrtimer *timer)
+{
+	struct apple_isp *isp = container_of(timer, struct apple_isp,
+					     wdt_timer);
+
+	apple_isp_wdt_kick(isp);
+	hrtimer_forward_now(timer, ns_to_ktime(ISP_WDT_PERIOD_NS));
+
+	return HRTIMER_RESTART;
+}
+
+void apple_isp_wdt_init(struct apple_isp *isp)
+{
+	hrtimer_setup(&isp->wdt_timer, apple_isp_wdt_timer, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL);
+}
+
+static void apple_isp_wdt_start(struct apple_isp *isp)
+{
+	if (!isp->wdt || isp->wdt_running)
+		return;
+
+	isp->wdt_running = true;
+	apple_isp_wdt_kick(isp);
+	hrtimer_start(&isp->wdt_timer, ns_to_ktime(ISP_WDT_PERIOD_NS),
+		      HRTIMER_MODE_REL);
+}
+
+void apple_isp_wdt_stop(struct apple_isp *isp)
+{
+	if (!isp->wdt_running)
+		return;
+
+	hrtimer_cancel(&isp->wdt_timer);
+	isp->wdt_running = false;
+}
+
 int apple_isp_start_capture(struct apple_isp *isp)
 {
-	return isp_cmd_ch_start(isp, 0); // TODO channel mask
+	int err;
+
+	/* Serviced from before the channel starts... */
+	apple_isp_wdt_start(isp);
+
+	err = isp_cmd_ch_start(isp, 0); // TODO channel mask
+	if (err)
+		apple_isp_wdt_stop(isp);
+
+	return err;
 }
 
 void apple_isp_stop_capture(struct apple_isp *isp)
 {
 	isp_cmd_ch_stop(isp, 0); // TODO channel mask
 	isp_cmd_ch_buffer_return(isp, isp->current_ch);
+
+	/* ... until its buffers are back. */
+	apple_isp_wdt_stop(isp);
 }

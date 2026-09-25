@@ -4,6 +4,7 @@
 #ifndef __ISP_DRV_H__
 #define __ISP_DRV_H__
 
+#include <linux/hrtimer.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/types.h>
@@ -273,6 +274,9 @@ struct apple_isp {
 	void __iomem *mbox;
 	void __iomem *gpio;
 	void __iomem *mbox2;
+	void __iomem *wdt;
+	struct hrtimer wdt_timer;
+	bool wdt_running;
 
 	struct iommu_domain *domain;
 	unsigned long shift;

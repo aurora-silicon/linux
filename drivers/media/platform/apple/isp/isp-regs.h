@@ -59,6 +59,13 @@
 #define ISP_MBOX_IRQ_ENABLE2_T8140_VAL 0x700000
 #define ISP_MBOX_IRQ_ROUTE_T8140_VAL   0x8
 
+/* capture watchdog ("wdt") */
+#define ISP_WDT_KICK	   0x00
+#define ISP_WDT_RELOAD	   0x08
+#define ISP_WDT_CLEAR	   0x0c
+#define ISP_WDT_RELOAD_VAL 0x244140
+#define ISP_WDT_PERIOD_NS  (NSEC_PER_SEC / 30)
+
 #define ISP_GPIO_0	       0x00
 #define ISP_GPIO_1	       0x04
 #define ISP_GPIO_2	       0x08
