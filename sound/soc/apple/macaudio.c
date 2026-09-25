@@ -57,6 +57,8 @@
 #define MACAUDIO_MAX_BCLK_FREQ	24576000
 
 #define SPEAKER_MAGIC_VALUE (s32)0xdec1be15
+/* Primary, Secondary and Speaker Sense */
+#define MACAUDIO_NUM_FE_LINKS	3
 /* milliseconds */
 #define SPEAKER_LOCK_TIMEOUT 250
 
@@ -97,6 +99,15 @@ struct macaudio_platform_cfg {
 	 * speaker samples through the volume control at copy time.
 	 */
 	const char *sw_gain_dai;
+	/*
+	 * A CPU component other than the MCA: its front-end DAI names in
+	 * place of "mca-pcm-N", the DAI format its serial links run (the
+	 * default MACAUDIO_DAI_FMT when 0) and the primary front-end's
+	 * bclk ratio when the link's frame length is not ours to choose.
+	 */
+	const char *fe_dai_names[MACAUDIO_NUM_FE_LINKS];
+	unsigned int dai_fmt;
+	unsigned int primary_bclk_ratio;
 };
 
 static const char *volume_control_names[] = {
@@ -236,6 +247,8 @@ static struct snd_soc_dai_link macaudio_fe_links[] = {
 		SND_SOC_DAILINK_REG(sense),
 	},
 };
+
+static_assert(ARRAY_SIZE(macaudio_fe_links) == MACAUDIO_NUM_FE_LINKS);
 
 static struct macaudio_link_props macaudio_fe_link_props[] = {
 	{
@@ -567,7 +580,7 @@ static int macaudio_parse_of_be_dai_link(struct macaudio_snd_data *ma,
 
 	link->no_pcm = 1;
 
-	link->dai_fmt = MACAUDIO_DAI_FMT;
+	link->dai_fmt = ma->cfg->dai_fmt ?: MACAUDIO_DAI_FMT;
 
 	link->num_codecs = ncodecs_per_be;
 	link->codecs = devm_kcalloc(dev, ncodecs_per_be,
@@ -694,6 +707,12 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 			goto err_free;
 
 		memcpy(link_props, &macaudio_fe_link_props[i], sizeof(struct macaudio_link_props));
+		if (ma->cfg->fe_dai_names[i])
+			link->cpus[0].dai_name = ma->cfg->fe_dai_names[i];
+		if (ma->cfg->dai_fmt && !link_props->is_sense)
+			link->dai_fmt = ma->cfg->dai_fmt;
+		if (i == 0 && ma->cfg->primary_bclk_ratio)
+			link_props->bclk_ratio = ma->cfg->primary_bclk_ratio;
 		if (ma->cfg->sw_gain_dai)
 			link_props->sw_gain = !strcmp(link->cpus[0].dai_name,
 						      ma->cfg->sw_gain_dai);
@@ -1761,6 +1780,31 @@ struct macaudio_platform_cfg macaudio_j313_cfg = {
 	true,	AMP_TAS5770,	SPKR_1W,	true,	10,	-20,
 };
 
+/*
+ * J700 (T8140, MacBook Neo): the AOP firmware owns the audio fabric, so the
+ * CPU component is the T8140 AOP audio driver rather than the MCA. The jack
+ * is a CS42L83 on the AOP's "cout" back-end, which the firmware runs as a
+ * 125-SCLK pulse frame at 48 kHz (6 MHz) with two 32-bit slots, data
+ * launched on the rising SCLK edge: DSP_A with an inverted bit clock. The
+ * speakers are one MAX98360A per channel on the "spkr" back-end, with no
+ * sense lines and no amplifier controls; the volume is the CPU DAI's
+ * software gain, which the lock holds 20 dB down until a protection daemon
+ * takes it. The daemon models the speaker from the SpeakerTap, a digital
+ * tap of the words the amplifier receives.
+ */
+struct macaudio_platform_cfg macaudio_j700_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_MAX98360A,
+	.speakers = SPKR_1W,
+	.stereo = true,
+	.safe_vol = -20,
+	.spk_out_widget = "Speaker",
+	.sw_gain_dai = "j700-pcm-1",
+	.fe_dai_names = { "j700-pcm-0", "j700-pcm-1", "j700-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
+	.primary_bclk_ratio = 125,
+};
+
 struct macaudio_platform_cfg macaudio_j314_cfg = {
 	true,	AMP_SN012776,	SPKR_2W1T,	true,	15,	-20,
 };
@@ -1848,6 +1892,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j575    AID33   sn012776    15      1x 1W    Compat: apple,j375-macaudio */
 	/* j613    AID20   sn012776    15      2x 1W+1T Compat: apple,j413-macaudio */
 	/* j615    AID21   sn012776    15      2x 2W+1T Compat: apple,j415-macaudio */
+	/* j700    AID44   max98360a   -       2x 1W    (AOP-fed, software gain) */
+	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
 	/* Fallback, jack only */
 	{ .compatible = "apple,macaudio"},
 	{ }
