@@ -54,6 +54,8 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			operating-points-v2 = <&ecluster_opp>;
+			performance-domains = <&cpufreq_e>;
 		};
 
 		cpu_e1: cpu@1 {
@@ -63,6 +65,8 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			operating-points-v2 = <&ecluster_opp>;
+			performance-domains = <&cpufreq_e>;
 		};
 
 
@@ -73,6 +77,8 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			operating-points-v2 = <&ecluster_opp>;
+			performance-domains = <&cpufreq_e>;
 		};
 
 		cpu_e3: cpu@3 {
@@ -82,6 +88,8 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			operating-points-v2 = <&ecluster_opp>;
+			performance-domains = <&cpufreq_e>;
 		};
 
 		cpu_p0: cpu@10100 {
@@ -91,6 +99,8 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_1>;
+			operating-points-v2 = <&pcluster_opp>;
+			performance-domains = <&cpufreq_p>;
 		};
 
 		cpu_p1: cpu@10101 {
@@ -100,6 +110,8 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_1>;
+			operating-points-v2 = <&pcluster_opp>;
+			performance-domains = <&cpufreq_p>;
 		};
 
 		l2_cache_0: l2-cache-0 {
@@ -114,6 +126,116 @@
 			cache-level = <2>;
 			cache-unified;
 			cache-size = <0x1000000>;
+		};
+	};
+
+	/*
+	 * DVFS states from the ADT: voltage-states1-sram for the E cluster,
+	 * voltage-states5-sram for the P cluster. opp-level is the hardware
+	 * P-state. Transition latencies have not been measured, so there is
+	 * no clock-latency-ns.
+	 */
+	ecluster_opp: opp-table-0 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp01 {
+			opp-hz = /bits/ 64 <816000000>;
+			opp-level = <1>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <1140000000>;
+			opp-level = <2>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <1464000000>;
+			opp-level = <3>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <1788000000>;
+			opp-level = <4>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <2112000000>;
+			opp-level = <5>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <2424000000>;
+			opp-level = <6>;
+		};
+	};
+
+	pcluster_opp: opp-table-1 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp01 {
+			opp-hz = /bits/ 64 <744000000>;
+			opp-level = <1>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <1260000000>;
+			opp-level = <2>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <1620000000>;
+			opp-level = <3>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <1944000000>;
+			opp-level = <4>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <2196000000>;
+			opp-level = <5>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <2472000000>;
+			opp-level = <6>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <2688000000>;
+			opp-level = <7>;
+		};
+		opp08 {
+			opp-hz = /bits/ 64 <2916000000>;
+			opp-level = <8>;
+		};
+		opp09 {
+			opp-hz = /bits/ 64 <3144000000>;
+			opp-level = <9>;
+		};
+		opp10 {
+			opp-hz = /bits/ 64 <3336000000>;
+			opp-level = <10>;
+		};
+		opp11 {
+			opp-hz = /bits/ 64 <3504000000>;
+			opp-level = <11>;
+		};
+		opp12 {
+			opp-hz = /bits/ 64 <3648000000>;
+			opp-level = <12>;
+		};
+		opp13 {
+			opp-hz = /bits/ 64 <3756000000>;
+			opp-level = <13>;
+		};
+		opp14 {
+			opp-hz = /bits/ 64 <3864000000>;
+			opp-level = <14>;
+		};
+		opp15 {
+			opp-hz = /bits/ 64 <3924000000>;
+			opp-level = <15>;
+		};
+		opp16 {
+			opp-hz = /bits/ 64 <3972000000>;
+			opp-level = <16>;
+		};
+		opp17 {
+			opp-hz = /bits/ 64 <4044000000>;
+			opp-level = <17>;
 		};
 	};
 
@@ -141,6 +263,18 @@
 
 		nonposted-mmio;
 		ranges;
+
+		cpufreq_e: cpufreq@210e20000 {
+			compatible = "apple,t8140-cluster-cpufreq";
+			reg = <0x2 0x10e20000 0x0 0x1000>;
+			#performance-domain-cells = <0>;
+		};
+
+		cpufreq_p: cpufreq@211e20000 {
+			compatible = "apple,t8140-cluster-cpufreq";
+			reg = <0x2 0x11e20000 0x0 0x1000>;
+			#performance-domain-cells = <0>;
+		};
 
 		pmgr: power-management@300700000 {
 			compatible = "apple,t8140-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
