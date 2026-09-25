@@ -10,6 +10,7 @@
 #include <linux/slab.h>
 #include <linux/errno.h>
 #include <linux/delay.h>
+#include <linux/of.h>
 #include <linux/pm_runtime.h>
 #include <linux/platform_data/x86/apple.h>
 
@@ -1953,17 +1954,10 @@ static void tb_dp_tunnel_active(struct tb_tunnel *tunnel, void *data)
 		 * happens either because there is no graphics driver
 		 * loaded or not all DP cables where connected to the
 		 * discrete router.
-		 *
-		 * In both cases we remove the DP IN adapter from the
-		 * available resources as it is not usable. This will
-		 * also tear down the tunnel and try to re-use the
-		 * released DP OUT.
-		 *
-		 * It will be added back only if there is hotplug for
-		 * the DP IN again.
 		 */
 		tb_tunnel_warn(tunnel, "not active, tearing down\n");
-		tb_dp_resource_unavailable(tb, in, "DPRX negotiation failed");
+		tb_dp_resource_unavailable(tb, in,
+					   "DPRX negotiation failed");
 	}
 	mutex_unlock(&tb->lock);
 
@@ -2884,6 +2878,8 @@ static void tb_handle_notification(struct tb *tb, u64 route,
 	case TB_CFG_ERROR_PCIE_WAKE:
 	case TB_CFG_ERROR_DP_CON_CHANGE:
 	case TB_CFG_ERROR_DPTX_DISCOVERY:
+		tb_info(tb, "DPTX discovery notification route=%llx port=%u\n",
+			route, error->port);
 		if (tb_cfg_ack_notification(tb->ctl, route, error))
 			tb_warn(tb, "could not ack notification on %llx\n",
 				route);
