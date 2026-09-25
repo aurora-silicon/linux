@@ -47,22 +47,25 @@ int ipc_bt_handle(struct apple_isp *isp, struct isp_channel *chan)
 	struct isp_message *req = &chan->req, *rsp = &chan->rsp;
 	struct isp_buffer *tmp, *buf;
 	struct isp_buflist *bl;
-	u32 count;
+	u64 count;
 	int err = 0;
 
 	/* printk("H2T: 0x%llx 0x%llx 0x%llx\n", (long long)req->arg0,
 	       (long long)req->arg1, (long long)req->arg2); */
 
-	if (req->arg1 < sizeof(struct isp_buflist)) {
+	if (!isp->bt_surf || req->arg1 < sizeof(*bl) ||
+	    req->arg1 > isp->bt_surf->size) {
 		dev_err(isp->dev, "%s: Bad length 0x%llx\n", chan->name,
 			req->arg1);
 		return -EIO;
 	}
 
 	bl = apple_isp_translate(isp, isp->bt_surf, req->arg0, req->arg1);
+	if (!bl)
+		return -EIO;
 
 	count = bl->num_buffers;
-	if (count > (req->arg1 - sizeof(struct isp_buffer)) /
+	if (count > (req->arg1 - sizeof(*bl)) /
 			    sizeof(struct isp_buflist_buffer)) {
 		dev_err(isp->dev, "%s: Bad length 0x%llx\n", chan->name,
 			req->arg1);
@@ -70,7 +73,7 @@ int ipc_bt_handle(struct apple_isp *isp, struct isp_channel *chan)
 	}
 
 	spin_lock(&isp->buf_lock);
-	for (int i = 0; i < count; i++) {
+	for (u64 i = 0; i < count; i++) {
 		struct isp_buflist_buffer *bufd = &bl->buffers[i];
 
 		/* printk("Return: 0x%llx (%d)\n", bufd->iovas[0],
