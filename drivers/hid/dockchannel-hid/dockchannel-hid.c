@@ -953,14 +953,22 @@ static void dchid_packet_work(struct work_struct *ws)
 	struct dchid_work *work = container_of(ws, struct dchid_work, work);
 	struct dchid_subhdr *shdr = (void *)work->data;
 	struct dockchannel_hid *dchid = work->iface->dchid;
-	int type = FIELD_GET(FLAGS_GROUP, shdr->flags);
 	u8 *payload = work->data + sizeof(*shdr);
+	int type;
+
+	if (work->hdr.length < sizeof(*shdr)) {
+		dev_err(dchid->dev, "Short packet (%u bytes) for iface %d\n",
+			work->hdr.length, work->hdr.iface);
+		goto out;
+	}
 
 	if (shdr->length + sizeof(*shdr) > work->hdr.length) {
 		dev_err(dchid->dev, "Bad sub header length (%hu > %zu)\n",
 			shdr->length, work->hdr.length - sizeof(*shdr));
-		return;
+		goto out;
 	}
+
+	type = FIELD_GET(FLAGS_GROUP, shdr->flags);
 
 	switch (type) {
 	case HID_INPUT_REPORT:
@@ -974,6 +982,7 @@ static void dchid_packet_work(struct work_struct *ws)
 		break;
 	}
 
+out:
 	kfree(work);
 }
 
@@ -982,6 +991,11 @@ static void dchid_handle_ack(struct dchid_iface *iface, struct dchid_hdr *hdr, v
 	struct dchid_subhdr *shdr = (void *)data;
 	u8 *payload = data + sizeof(*shdr);
 
+	if (hdr->length < sizeof(*shdr)) {
+		dev_err(iface->dchid->dev, "Short ACK packet (%u bytes)\n",
+			hdr->length);
+		return;
+	}
 	if (shdr->length + sizeof(*shdr) > hdr->length) {
 		dev_err(iface->dchid->dev, "Bad sub header length (%hu > %zu)\n",
 			shdr->length, hdr->length - sizeof(*shdr));
