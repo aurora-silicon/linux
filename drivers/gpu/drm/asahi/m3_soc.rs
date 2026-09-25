@@ -217,6 +217,17 @@ pub(crate) static T6030_HWDATA_B: G15RuntimeHwDataB = G15RuntimeHwDataB {
     unk_1818: 1,
 };
 
+/// The HwDataB configuration words and unit masks of the T8122 runtime InitData: T6030's, except
+/// for four words the G15G firmware takes with other values (+0xa2c, the chip revision's major
+/// number; +0xb20, the core slots; +0x17b8; +0x1818). The unit masks are T6030's.
+pub(crate) static T8122_HWDATA_B: G15RuntimeHwDataB = G15RuntimeHwDataB {
+    unk_454: 2,
+    unk_b20: 0x0a,
+    unk_17b8: 4,
+    unk_1818: 0xffff_ffff,
+    ..T6030_HWDATA_B
+};
+
 /// Every SoC the M3 runtime has a table for.
 pub(crate) static SOCS: [&Soc; 2] = [&T6030, &T8122];
 
@@ -334,7 +345,7 @@ pub(crate) static T8122: Soc = Soc {
     // The boot loader's ladder from this machine's ADT (J613: eight voltages, up to 1338 MHz).
     pstates: PstateTable::DeviceTree,
     sgx_setup: None,
-    hwdata_b: None,
+    hwdata_b: Some(&T8122_HWDATA_B),
     // Neither is validated on G15G yet; userspace keeps its default ordering and visibility.
     features: Features {
         compute_wide_visibility: false,

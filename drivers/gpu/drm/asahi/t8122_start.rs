@@ -16,8 +16,8 @@
 //! | `asahi.t8122_fender` | `0x104000` (`rule`) | `0x12c000` (`adt`) |
 //! | `asahi.t8122_clkgen` | `e1c`: SGX+0xe1c000, read-only | `e5c`: SGX+0xe5c000, read-only; `none` |
 //! | `asahi.t8122_sgx_setup` | `none` | `t6030`: SGX+0xd14000 = 0x70001 |
-//! | `asahi.t8122_unit_mask_a` | `0x700000001` | nonzero, within `0x700000001` |
-//! | `asahi.t8122_unit_mask_b` | `0x3` | nonzero, within `0x7` |
+//! | `asahi.t8122_unit_mask_a` | `0x700000003` | nonzero, within `0x700000003` |
+//! | `asahi.t8122_unit_mask_b` | `0x7` | nonzero, within `0x7` |
 //! | `asahi.t8122_pstate_cap` | `2` | 1 to 15 (at or above the table's highest state: all of it) |
 //!
 //! The other HwDataB words, the runtime allocation layout and the fixed control words are the
@@ -34,7 +34,7 @@ use crate::{
     initdata::G15RuntimeHwDataB,
     m3_adt_config::T8122_IO_MAPPINGS,
     m3_init_storage::{self as storage, IoMap},
-    m3_soc::{IoMapping, Soc, T6030_HWDATA_B},
+    m3_soc::{IoMapping, Soc, T8122_HWDATA_B},
     pgtable::{prot, Prot},
     t8122_knobs::{
         self as knobs, ClockGen, Start, Values, CLOCK_GEN_E1C, CLOCK_GEN_E5C, FENDER_ADT,
@@ -50,13 +50,6 @@ const CLOCK_GEN: usize = 11;
 /// The HwDataB slot of the GPU clock generator.
 const CLOCK_GEN_SLOT: usize = 29;
 
-/// The runtime HwDataB words of the experiment: T6030's, with the default unit masks of
-/// `t8122_knobs`. The unit masks uploaded are the parameters' ([`Experiment::unit_masks`]).
-pub(crate) static T8122_HWDATA_B: G15RuntimeHwDataB = G15RuntimeHwDataB {
-    unit_mask_a: knobs::UNIT_MASK_A,
-    unit_mask_b: knobs::UNIT_MASK_B,
-    ..T6030_HWDATA_B
-};
 
 /// The firmware IO mappings with the Fender window `fender` and the clock generator at
 /// SGX + `clock_gen`.
@@ -133,9 +126,11 @@ const _: () = {
         assert!(maps_cover(&IO_MAPPINGS[i], &IOMAPS[i]));
         i += 1;
     }
-    // The unit-mask limits are T6030's masks, less the second cluster's bit of mask A.
-    assert!(T6030_HWDATA_B.unit_mask_a == knobs::UNIT_MASK_A_LIMIT | 0x2);
-    assert!(T6030_HWDATA_B.unit_mask_b as u64 == knobs::UNIT_MASK_B_LIMIT);
+    // The default unit masks are the T8122 table's, and the limits allow them.
+    assert!(T8122_HWDATA_B.unit_mask_a == knobs::UNIT_MASK_A);
+    assert!(T8122_HWDATA_B.unit_mask_b == knobs::UNIT_MASK_B);
+    assert!(knobs::UNIT_MASK_A & !knobs::UNIT_MASK_A_LIMIT == 0);
+    assert!(knobs::UNIT_MASK_B as u64 & !knobs::UNIT_MASK_B_LIMIT == 0);
     assert!(offset_of!(raw::HwDataBG15V14_8_3, unit_mask_a) == 0x17c0);
     assert!(offset_of!(raw::HwDataBG15V14_8_3, unit_mask_b) == 0x17c8);
     // An armed start skips `require_complete`, so the experiment stands in for exactly the two
@@ -201,7 +196,8 @@ impl Experiment {
         }
     }
 
-    /// The runtime HwDataB words. The unit masks are written over them ([`Self::unit_masks`]).
+    /// The runtime HwDataB words: the T8122 table's. The unit masks are written over them
+    /// ([`Self::unit_masks`]).
     pub(crate) fn hwdata_b(&self) -> &'static G15RuntimeHwDataB {
         &T8122_HWDATA_B
     }
