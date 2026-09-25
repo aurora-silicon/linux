@@ -286,7 +286,8 @@ static inline void apple_nvme_writeq(struct apple_nvme *anv, u64 value,
 
 unsigned int flush_interval = 1000;
 module_param(flush_interval, uint, 0644);
-MODULE_PARM_DESC(flush_interval, "Grace period in msecs between flushes");
+MODULE_PARM_DESC(flush_interval,
+		 "Grace period in msecs between flushes (ignored on post-M4 ANS)");
 
 static_assert(sizeof(struct nvme_command) == 64);
 static_assert(sizeof(struct apple_nvmmu_tcb) == 128);
@@ -1028,7 +1029,13 @@ static int apple_nvme_remove_sq(struct apple_nvme *anv)
 static bool apple_nvme_delayed_flush(struct apple_nvme *anv, struct nvme_ns *ns,
 				     struct request *req)
 {
-	if (!anv->flush_interval || req_op(req) != REQ_OP_FLUSH)
+	/*
+	 * A flush completion is a persistence boundary for the filesystem.
+	 * Post-M4 internal-root storage must submit it to the controller and
+	 * wait for its completion, even when the legacy grace period is set.
+	 */
+	if (anv->hw->needs_ioq_registers ||
+	    !anv->flush_interval || req_op(req) != REQ_OP_FLUSH)
 		return false;
 	if (delayed_work_pending(&anv->flush_dwork))
 		return true;
