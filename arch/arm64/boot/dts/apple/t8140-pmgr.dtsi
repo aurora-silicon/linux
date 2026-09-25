@@ -110,6 +110,32 @@
 		apple,always-on;
 	};
 
+	ps_atc0_usb_aon: power-controller@3e0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3e0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0_usb_aon";
+	};
+
+	ps_atc0_common: power-controller@3e8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3e8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0_common";
+		power-domains = <&ps_atc0_usb_aon>;
+	};
+
+	ps_atc0_usb: power-controller@3f0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3f0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0_usb";
+		power-domains = <&ps_atc0_common>;
+	};
+
 	/*
 	 * ISP-local power domains (live J700 ADT: ISP_CPU .. ISP_CVM, "no-ps"
 	 * entries in the main PMGR block).  As on t8112, the dependency tree is
@@ -233,6 +259,15 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "nub_spmi0";
+		apple,always-on;
+	};
+
+	ps_nub_spmi_a0: power-controller@68 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x68 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "nub_spmi_a0";
 		apple,always-on;
 	};
 
