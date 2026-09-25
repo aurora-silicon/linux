@@ -1041,10 +1041,20 @@ static void dchid_handle_ack(struct dchid_iface *iface, struct dchid_hdr *hdr, v
 		return;
 	}
 
-	if (iface->resp_buf && iface->resp_size)
-		memcpy(iface->resp_buf, payload + 1, min((size_t)shdr->length - 1, iface->resp_size));
+	/*
+	 * Report the response length as the bytes actually delivered, so that
+	 * a caller with a small buffer is not told about bytes that were never
+	 * copied. The report ID byte counts as delivered.
+	 */
+	if (iface->resp_buf && iface->resp_size) {
+		size_t copied = min((size_t)shdr->length - 1, iface->resp_size);
 
-	iface->resp_size = shdr->length;
+		memcpy(iface->resp_buf, payload + 1, copied);
+		iface->resp_size = copied + 1;
+	} else {
+		iface->resp_size = shdr->length;
+	}
+
 	iface->out_report = -1;
 	iface->retcode = shdr->retcode;
 	complete(&iface->out_complete);
