@@ -24,6 +24,11 @@
 		#size-cells = <2>;
 		ranges;
 		stdout-path = "serial0";
+		/*
+		 * Temporary: the secondary cores lose state in WFIT and the
+		 * kernel does not yet stop using WFxT on T8140 by itself.
+		 */
+		bootargs = "arm64.nowfxt";
 
 		framebuffer0: framebuffer@0 {
 			compatible = "apple,simple-framebuffer", "simple-framebuffer";
@@ -147,3 +152,31 @@
 		};
 	};
 };
+
+&smc {
+	status = "okay";
+};
+
+&smc_hwmon {
+	/* interim J700 CPU thermal policy over the CPU die channels */
+	apple,cpu-thermal-policy;
+};
+
+&smc_mbox {
+	status = "okay";
+};
+
+&ans_mbox {
+	status = "okay";
+};
+
+&sart {
+	status = "okay";
+};
+
+&nvme {
+	status = "okay";
+};
+
+#include "hwmon-common.dtsi"
+#include "hwmon-laptop.dtsi"
