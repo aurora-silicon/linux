@@ -380,8 +380,9 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 	u32 extra_size = isp_gpio_read32(isp, ISP_GPIO_3);
 	isp->num_ipc_chans = num_ipc_chans;
 
-	if (!isp->num_ipc_chans) {
-		dev_err(isp->dev, "No IPC channels found\n");
+	if (!num_ipc_chans || num_ipc_chans > ISP_IPC_MAX_CHANNELS) {
+		dev_err(isp->dev, "invalid IPC channel count %u\n",
+			num_ipc_chans);
 		return -ENODEV;
 	}
 
@@ -481,6 +482,9 @@ static inline struct isp_channel *isp_get_chan_index(struct apple_isp *isp,
 
 static void isp_free_channel_info(struct apple_isp *isp)
 {
+	if (!isp->ipc_chans)
+		return;
+
 	for (int i = 0; i < isp->num_ipc_chans; i++) {
 		struct isp_channel *chan = isp->ipc_chans[i];
 		if (!chan)
@@ -499,7 +503,8 @@ static int isp_fill_channel_info(struct apple_isp *isp)
 			 ((u64)isp_gpio_read32(isp, ISP_GPIO_1)) << 32;
 	void *table_virt = apple_isp_ipc_translate(
 		isp, table_iova,
-		sizeof(struct isp_chan_desc) * isp->num_ipc_chans);
+		array_size(sizeof(struct isp_chan_desc), isp->num_ipc_chans));
+	int err = -EIO;
 
 	if (!table_virt) {
 		dev_err(isp->dev, "Failed to find channel table\n");
@@ -509,40 +514,54 @@ static int isp_fill_channel_info(struct apple_isp *isp)
 	isp->ipc_chans = kcalloc(isp->num_ipc_chans,
 				 sizeof(struct isp_channel *), GFP_KERNEL);
 	if (!isp->ipc_chans)
-		goto out;
+		return -ENOMEM;
 
 	for (int i = 0; i < isp->num_ipc_chans; i++) {
 		struct isp_chan_desc desc;
 		void *desc_virt = table_virt + (i * sizeof(desc));
 		struct isp_channel *chan =
 			kzalloc(sizeof(struct isp_channel), GFP_KERNEL);
-		if (!chan)
+		if (!chan) {
+			err = -ENOMEM;
 			goto out;
+		}
 		isp->ipc_chans[i] = chan;
 
 		memcpy(&desc, desc_virt, sizeof(desc));
-		chan->name = kstrdup(desc.name, GFP_KERNEL);
-		chan->type = desc.type;
-		chan->src = desc.src;
-		chan->doorbell = 1 << chan->src;
-		chan->num = desc.num;
-		chan->size = desc.num * ISP_IPC_MESSAGE_SIZE;
-		chan->iova = desc.iova;
-		chan->virt =
-			apple_isp_ipc_translate(isp, desc.iova, chan->size);
-		chan->cursor = 0;
-		mutex_init(&chan->lock);
-
-		if (!chan->virt) {
-			dev_err(isp->dev, "Failed to find channel buffer\n");
+		/* The firmware does not have to NUL-terminate the name. */
+		chan->name = kstrndup(desc.name, sizeof(desc.name), GFP_KERNEL);
+		if (!chan->name) {
+			err = -ENOMEM;
 			goto out;
 		}
+		chan->type = desc.type;
+		chan->src = desc.src;
+		chan->num = desc.num;
+		chan->size = (u64)desc.num * ISP_IPC_MESSAGE_SIZE;
+		chan->iova = desc.iova;
+		chan->cursor = 0;
+		mutex_init(&chan->lock);
 
 		if ((chan->type != ISP_IPC_CHAN_TYPE_COMMAND) &&
 		    (chan->type != ISP_IPC_CHAN_TYPE_REPLY) &&
 		    (chan->type != ISP_IPC_CHAN_TYPE_REPORT)) {
 			isp_err(isp, "invalid ipc chan type (%d)\n",
 				chan->type);
+			goto out;
+		}
+
+		/* Each channel has its own doorbell bit and at least one slot. */
+		if (chan->src >= ISP_IPC_MAX_CHANNELS || !chan->num) {
+			isp_err(isp, "invalid ipc chan %s (src %u, num %u)\n",
+				chan->name, chan->src, chan->num);
+			goto out;
+		}
+		chan->doorbell = BIT(chan->src);
+
+		chan->virt =
+			apple_isp_ipc_translate(isp, chan->iova, chan->size);
+		if (!chan->virt) {
+			dev_err(isp->dev, "Failed to find channel buffer\n");
 			goto out;
 		}
 
@@ -572,7 +591,7 @@ static int isp_fill_channel_info(struct apple_isp *isp)
 	return 0;
 out:
 	isp_free_channel_info(isp);
-	return -ENOMEM;
+	return err;
 }
 
 static void isp_firmware_shutdown_stage3(struct apple_isp *isp)
