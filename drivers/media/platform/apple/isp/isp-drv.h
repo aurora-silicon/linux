@@ -224,6 +224,7 @@ struct apple_isp {
 	struct iommu_domain *domain;
 	unsigned long shift;
 	struct drm_mm iovad; /* TODO iova.c can't allocate bottom-up */
+	u64 iova_size; /* size of the iovad range */
 	struct mutex iovad_lock;
 
 	struct isp_firmware {

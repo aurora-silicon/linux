@@ -128,8 +128,8 @@ static int apple_isp_init_iommu(struct apple_isp *isp)
 	}
 
 	// FIXME: refactor this, maybe use regular iova stuff?
-	drm_mm_init(&isp->iovad, isp->fw.heap_top,
-		    vm_size - (heap_base & 0xffffffff));
+	isp->iova_size = vm_size - (heap_base & 0xffffffff);
+	drm_mm_init(&isp->iovad, isp->fw.heap_top, isp->iova_size);
 
 	return 0;
 }

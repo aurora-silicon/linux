@@ -138,9 +138,20 @@ static void __isp_surf_init(struct apple_isp *isp, struct isp_surf *surf,
 
 struct isp_surf *__isp_alloc_surface(struct apple_isp *isp, u64 size, bool gc)
 {
+	struct isp_surf *surf;
 	int err;
 
-	struct isp_surf *surf = kzalloc(sizeof(struct isp_surf), GFP_KERNEL);
+	/*
+	 * The firmware chooses the size of the extra heap and of SHAREDMALLOC
+	 * surfaces. Nothing larger than the IOVA range can be mapped, and the
+	 * bound also keeps the page count within 32 bits.
+	 */
+	if (!size || size > isp->iova_size) {
+		dev_err(isp->dev, "invalid surface size 0x%llx\n", size);
+		return NULL;
+	}
+
+	surf = kzalloc(sizeof(*surf), GFP_KERNEL);
 	if (!surf)
 		return NULL;
 
