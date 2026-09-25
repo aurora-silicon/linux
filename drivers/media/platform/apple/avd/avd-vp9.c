@@ -14,9 +14,7 @@
  *	Alpha Lin <Alpha.Lin@rock-chips.com>
  */
 
-#include "linux/v4l2-controls.h"
 #include <linux/unaligned.h>
-#include <linux/delay.h>
 
 #include <media/v4l2-vp9.h>
 #include <media/videobuf2-dma-contig.h>
@@ -39,9 +37,39 @@
 #define VP9_LF_MODE0(v)	FIELD_PREP(GENMASK(13, 7), v)
 #define VP9_LF_MODE1(v)	FIELD_PREP(GENMASK(6, 0), v)
 
-#define VP9_FEAT_LVL_ALT_Q(v)	FIELD_PREP(GENMASK(21, 12), v)
+#define VP9_FEAT_LVL_ALT_Q_EN(v)	FIELD_PREP(BIT(21), !!(v))
+#define VP9_FEAT_LVL_ALT_Q(v)		FIELD_PREP(GENMASK(20, 12), v)
+#define VP9_FEAT_LVL_ALT_L_EN(v)	FIELD_PREP(BIT(11), !!(v))
+#define VP9_FEAT_LVL_ALT_L(v)		FIELD_PREP(GENMASK(10, 4), v)
+#define VP9_FEAT_LVL_REF_FRAME_EN(v)	FIELD_PREP(BIT(3), !!(v))
+#define VP9_FEAT_LVL_REF_FRAME(v)	FIELD_PREP(GENMASK(2, 1), v)
+#define VP9_FEAT_LVL_SKIP_EN(v)		FIELD_PREP(BIT(0), !!(v))
+#define VP9_FEAT_LVL_SKIP(v)
+
+#define VP9_REF_SEL_LAST(v)	FIELD_PREP(GENMASK(2, 0), v)
+#define VP9_REF_BIAS_LAST(v)	FIELD_PREP(BIT(3), !!(v))
+#define VP9_REF_SEL_GOLDEN(v)	FIELD_PREP(GENMASK(6, 4), v)
+#define VP9_REF_BIAS_GOLDEN(v)	FIELD_PREP(BIT(7), !!(v))
+#define VP9_REF_SEL_ALT(v)	FIELD_PREP(GENMASK(10, 8), v)
+#define VP9_REF_BIAS_ALT(v)	FIELD_PREP(BIT(11), !!(v))
+#define VP9_REFERENCE_MODE(v)	FIELD_PREP(GENMASK(13, 12), v)
+#define VP9_PARALLEL_DEC(v)	FIELD_PREP(BIT(14), !!(v))
+#define VP9_REFRESH_CTX(v)	FIELD_PREP(BIT(15), !!(v))
+#define VP9_INTERP_FILTER(v)	FIELD_PREP(GENMASK(18, 16), v)
+#define VP9_HIGH_PREC_MV(v)	FIELD_PREP(BIT(19), !!(v))
+#define VP9_ERR_RES(v)		FIELD_PREP(BIT(20), !!(v))
+#define VP9_HAS_REF(v)		FIELD_PREP(BIT(21), !!(v))
+#define VP9_SEG_ABS(v)		FIELD_PREP(BIT(22), !!(v))
+#define VP9_SEG_UDATA_TEMP(v)	FIELD_PREP(BIT(23), !!(v))
+#define VP9_SEG_UPDATE_MAP(v)	FIELD_PREP(BIT(24), !!(v))
+#define VP9_SEG_ENABLED(v)	FIELD_PREP(BIT(25), !!(v))
+#define VP9_SEG_RESET(v)	FIELD_PREP(BIT(26), !!(v))
 
 #define VP9_MAX_TILE_COLS	(1 << 4)
+#define VP9_REF_SCALE_SHIFT	14
+#define VP9_LAST_FRAME		1
+#define VP9_GOLDEN_FRAME	2
+#define VP9_ALTREF_FRAME	3
 
 struct avd_vp9_seg_probs {
 	u8 tree_probs[7];
@@ -149,13 +177,13 @@ struct avd_vp9_ctx {
 	struct v4l2_vp9_frame_context frame_context[4];
 	struct avd_vp9_bufs {
 		struct avd_buf inst;
-		/* only affect tiles */
-		struct avd_buf tiles[3];
-		/* just a guess (this name exists in tunables) */
+		struct avd_buf az_left;
 		struct avd_buf above_info;
-		/* if above is true, state and color are left */
-		struct avd_buf state;
-		struct avd_buf color[2];
+		struct avd_buf ip_above;
+		struct avd_buf lf_above;
+		struct avd_buf lf_left_info;
+		struct avd_buf lf_left;
+		struct avd_buf color;
 		struct avd_buf seg;
 		struct avd_buf pipe_state;
 		struct avd_buf counts;
@@ -169,9 +197,9 @@ struct avd_vp9_ctx {
 static void set_refs(struct avd_ctx *ctx, struct avd_vp9_run *run)
 {
 	const struct v4l2_ctrl_vp9_frame *frame = run->decode_params;
-	struct avd_dev *avd = ctx->dev;
 	struct avd_decoded_buffer *dst, *ref_buf[4];
 	dma_addr_t addr;
+	int xscale, yscale;
 
 	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
 
@@ -189,63 +217,89 @@ static void set_refs(struct avd_ctx *ctx, struct avd_vp9_run *run)
 			       &ref_buf[i]->base.vb.vb2_buf, 0) +
 		       ref_buf[i]->comp.start_offset;
 
-		/* TODO */
 		push(AVD_REF_FLAG_CONST, "hdr_9c_ref_100");
 		push(AVD_HDR_HEIGHT(ref_buf[i]->vp9.height - 1) |
 			     AVD_HDR_WIDTH(ref_buf[i]->vp9.width - 1),
 		     "hdr_70_ref_height_width");
-		push(0x40004000, "hdr_7c_ref_align");
 
-		push_comp(avd, ctx, addr, ref_buf[i]->comp.offsets);
+		xscale = (ref_buf[i]->vp9.width << VP9_REF_SCALE_SHIFT) /
+			 dst->vp9.width;
+		yscale = (ref_buf[i]->vp9.height << VP9_REF_SCALE_SHIFT) /
+			 dst->vp9.height;
+		push(AVD_HDR_HEIGHT(xscale) | AVD_HDR_WIDTH(yscale),
+		     "ref_scale");
+
+		push_comp(ctx, addr, ref_buf[i]->comp.offsets);
 	}
 }
 
-/* TODO */
 static u32 make_flags1(struct avd_ctx *ctx, struct avd_vp9_run *run)
 {
 	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
 	const struct v4l2_ctrl_vp9_frame *frame = run->decode_params;
-	bool has_ref = boolify(
+	struct avd_decoded_buffer *dst, *last, *golden, *alt;
+
+	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
+	last = avd_get_ref_buf(ctx, &dst->base.vb, frame->last_frame_ts);
+	golden = avd_get_ref_buf(ctx, &dst->base.vb, frame->golden_frame_ts);
+	alt = avd_get_ref_buf(ctx, &dst->base.vb, frame->alt_frame_ts);
+
+	/*
+	 * i have only seen V4L2_VP9_SIGN_BIAS_ALT, im simply guessing the
+	 * same applies for last and golden
+	 */
+	u32 flags = VP9_REF_SEL_LAST(VP9_LAST_FRAME);
+	flags |= VP9_REF_BIAS_LAST(frame->ref_frame_sign_bias &
+				   V4L2_VP9_SIGN_BIAS_LAST);
+	flags |= VP9_REF_SEL_GOLDEN(golden == last ? VP9_LAST_FRAME :
+						     VP9_GOLDEN_FRAME);
+	flags |= VP9_REF_BIAS_GOLDEN(frame->ref_frame_sign_bias &
+				     V4L2_VP9_SIGN_BIAS_GOLDEN);
+	flags |= VP9_REF_SEL_ALT(alt != golden ? VP9_ALTREF_FRAME :
+				 alt != last   ? VP9_GOLDEN_FRAME :
+						 VP9_LAST_FRAME);
+	flags |= VP9_REF_BIAS_ALT(frame->ref_frame_sign_bias &
+				  V4L2_VP9_SIGN_BIAS_ALT);
+
+	flags |= VP9_REFERENCE_MODE(frame->reference_mode);
+
+	flags |= VP9_PARALLEL_DEC(frame->flags &
+				  V4L2_VP9_FRAME_FLAG_PARALLEL_DEC_MODE);
+	flags |= VP9_REFRESH_CTX(frame->flags &
+				 V4L2_VP9_FRAME_FLAG_REFRESH_FRAME_CTX);
+	flags |= VP9_INTERP_FILTER(frame->interpolation_filter);
+	flags |= VP9_HIGH_PREC_MV(frame->flags &
+				  V4L2_VP9_FRAME_FLAG_ALLOW_HIGH_PREC_MV);
+
+	flags |=
+		VP9_ERR_RES(frame->flags & V4L2_VP9_FRAME_FLAG_ERROR_RESILIENT);
+
+	flags |= VP9_SEG_ABS(frame->seg.flags &
+			     V4L2_VP9_SEGMENTATION_FLAG_ABS_OR_DELTA_UPDATE);
+	flags |= VP9_SEG_UDATA_TEMP(
+		frame->seg.flags & V4L2_VP9_SEGMENTATION_FLAG_UPDATE_DATA &&
+		frame->seg.flags & V4L2_VP9_SEGMENTATION_FLAG_TEMPORAL_UPDATE);
+	flags |= VP9_SEG_UPDATE_MAP(frame->seg.flags &
+				    V4L2_VP9_SEGMENTATION_FLAG_UPDATE_MAP);
+	flags |= VP9_SEG_ENABLED(frame->seg.flags &
+				 V4L2_VP9_SEGMENTATION_FLAG_ENABLED);
+
+	flags |= VP9_HAS_REF(
+		!(frame->flags & V4L2_VP9_FRAME_FLAG_ERROR_RESILIENT) &&
+		!(frame->flags & V4L2_VP9_FRAME_FLAG_KEY_FRAME) &&
 		vp9_ctx->last.valid &&
-		!(vp9_ctx->last.flags & V4L2_VP9_FRAME_FLAG_KEY_FRAME) &&
-		vp9_ctx->last.flags & V4L2_VP9_FRAME_FLAG_SHOW_FRAME);
+		vp9_ctx->last.flags & V4L2_VP9_FRAME_FLAG_SHOW_FRAME &&
+		!(vp9_ctx->last.flags & V4L2_VP9_FRAME_FLAG_KEY_FRAME));
 
-	u32 flags =
-		BIT(0) |
-		boolify(frame->flags & V4L2_VP9_FRAME_FLAG_PARALLEL_DEC_MODE)
-			<< 14 |
-		!boolify(frame->flags & V4L2_VP9_FRAME_FLAG_ERROR_RESILIENT)
-			<< 15 |
-		boolify(frame->flags & V4L2_VP9_FRAME_FLAG_ALLOW_HIGH_PREC_MV)
-			<< 19;
+	flags |= VP9_SEG_RESET(
+		frame->seg.flags & V4L2_VP9_SEGMENTATION_FLAG_ENABLED &&
+		(frame->flags & V4L2_VP9_FRAME_FLAG_KEY_FRAME ||
+		 (vp9_ctx->last.valid &&
+		  !(vp9_ctx->last.seg.flags &
+		    V4L2_VP9_SEGMENTATION_FLAG_ENABLED) &&
+		  vp9_ctx->last.flags & (V4L2_VP9_FRAME_FLAG_KEY_FRAME |
+					 V4L2_VP9_FRAME_FLAG_INTRA_ONLY))));
 
-	if (!(frame->flags & V4L2_VP9_FRAME_FLAG_KEY_FRAME)) {
-		flags |= frame->interpolation_filter << 16;
-		if (!(frame->flags & V4L2_VP9_FRAME_FLAG_ERROR_RESILIENT))
-			flags |= has_ref << 21;
-		else
-			flags |= BIT(20);
-	}
-
-	flags |= frame->ref_frame_sign_bias << 7;
-	/* this seems wrong */
-	flags |= !(frame->golden_frame_ts == 0) << 10;
-	flags |= !(frame->ref_frame_sign_bias == 0) << 11;
-
-	flags |= frame->reference_mode << 12;
-
-	flags |= !!(frame->seg.flags & V4L2_VP9_SEGMENTATION_FLAG_UPDATE_MAP)
-			 << 24 |
-		 !!(frame->seg.flags & V4L2_VP9_SEGMENTATION_FLAG_ENABLED)
-			 << 25;
-	/* what?? */
-	if (frame->seg.flags & V4L2_VP9_SEGMENTATION_FLAG_UPDATE_DATA) {
-		if (frame->seg.flags &
-		    V4L2_VP9_SEGMENTATION_FLAG_TEMPORAL_UPDATE)
-			flags |= BIT(23);
-		else if (!vp9_ctx->last.valid)
-			flags |= BIT(26);
-	}
 	return flags;
 }
 
@@ -254,19 +308,30 @@ static u32 seg_features(struct avd_ctx *ctx, struct avd_vp9_run *run,
 {
 	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
 	const struct v4l2_vp9_segmentation *seg = &vp9_ctx->cur.seg;
-	s16 feature_val = 0;
+	u32 feature_val = 0;
 	int feature_id = 0;
-	u32 enabled = 0;
 
 	feature_id = V4L2_VP9_SEG_LVL_ALT_Q;
-	if (v4l2_vp9_seg_feat_enabled(seg->feature_enabled, feature_id, segid))
-		feature_val = seg->feature_data[segid][feature_id];
+	feature_val |= VP9_FEAT_LVL_ALT_Q_EN(v4l2_vp9_seg_feat_enabled(
+		seg->feature_enabled, feature_id, segid));
+	feature_val |= VP9_FEAT_LVL_ALT_Q(seg->feature_data[segid][feature_id]);
+
+	feature_id = V4L2_VP9_SEG_LVL_ALT_L;
+	feature_val |= VP9_FEAT_LVL_ALT_L_EN(v4l2_vp9_seg_feat_enabled(
+		seg->feature_enabled, feature_id, segid));
+	feature_val |= VP9_FEAT_LVL_ALT_L(seg->feature_data[segid][feature_id]);
+
+	feature_id = V4L2_VP9_SEG_LVL_REF_FRAME;
+	feature_val |= VP9_FEAT_LVL_REF_FRAME_EN(v4l2_vp9_seg_feat_enabled(
+		seg->feature_enabled, feature_id, segid));
+	feature_val |=
+		VP9_FEAT_LVL_REF_FRAME(seg->feature_data[segid][feature_id]);
 
 	feature_id = V4L2_VP9_SEG_LVL_SKIP;
-	if (v4l2_vp9_seg_feat_enabled(seg->feature_enabled, feature_id, segid))
-		enabled |= 1;
+	feature_val |= VP9_FEAT_LVL_SKIP_EN(v4l2_vp9_seg_feat_enabled(
+		seg->feature_enabled, feature_id, segid));
 
-	return VP9_FEAT_LVL_ALT_Q(feature_val) | enabled;
+	return feature_val;
 }
 
 static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
@@ -280,14 +345,6 @@ static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
 
 	bool intra_only = !!(frame->flags & (V4L2_VP9_FRAME_FLAG_KEY_FRAME |
 					     V4L2_VP9_FRAME_FLAG_INTRA_ONLY));
-
-	push(AVD_OP_EXEC |
-		     AVD_OP_EXEC_FLAG_START_REV3(avd->variant->revision == 3) |
-		     AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision == 4) |
-		     (avd->variant->revision == 3 ? AVD_OP_EXEC_REV3_VP9_MASK :
-						    0) |
-		     AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx),
-	     "inst_fifo_start");
 
 	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(ctx->decomp) |
 		     AVD_OP_HDR_FLAG_INTRA(intra_only) | AVD_OP_HDR_CONST |
@@ -324,18 +381,13 @@ static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	push(0, "");
 	push(0, "");
 
-	pusha(vp9_ctx->bufs.counts.addr, "frame_counts_addr", 0);
-	pusha(vp9_ctx->bufs.probs.addr, "hdr_104_probs_addr_lsb8", 0);
-
-	/* always used */
-	pusha(vp9_ctx->bufs.state.addr, "hdr_118_pps0_tile_addr_lsb8", 0);
-
-	/* read / write segment buffers */
-	pusha(vp9_ctx->bufs.seg.addr, "hdr_108_pps1_tile_addr_lsb8", 1);
-	pusha(vp9_ctx->bufs.seg.addr, "hdr_108_pps1_tile_addr_lsb8", 2);
-	/* ping pong buffers, not on intra frames (how apple uses them) */
-	pusha(vp9_ctx->bufs.above_info.addr, "hdr_110_pps2_tile_addr_lsb8", 3);
-	pusha(vp9_ctx->bufs.above_info.addr, "hdr_110_pps2_tile_addr_lsb8", 4);
+	pusha(vp9_ctx->bufs.counts.addr, "counts", 0);
+	pusha(vp9_ctx->bufs.probs.addr, "probs", 0);
+	pusha(vp9_ctx->bufs.above_info.addr, "above_info", 0);
+	pusha(vp9_ctx->bufs.seg.addr, "seg", 1);
+	pusha(vp9_ctx->bufs.seg.addr, "seg", 2);
+	pusha(vp9_ctx->bufs.color.addr, "color", 3);
+	pusha(vp9_ctx->bufs.color.addr, "color", 4);
 
 	push(VP9_Q_IDX(frame->quant.base_q_idx) |
 		     VP9_Q_DC_Y(frame->quant.delta_q_y_dc) |
@@ -369,23 +421,19 @@ static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	if (!(avd->variant->quirks & AVD_QUIRK_NO_PIPE_STATE))
 		pusha(vp9_ctx->bufs.pipe_state.addr, "pipe_state", 0);
 
-	pusha(vp9_ctx->bufs.color[0].addr, "hdr_e8_sps0_tile_addr_lsb8", 0);
-	pusha(vp9_ctx->bufs.color[1].addr, "hdr_e8_sps0_tile_addr_lsb8", 0);
-
+	pusha(vp9_ctx->bufs.ip_above.addr, "ip_above", 0);
+	pusha(vp9_ctx->bufs.lf_above.addr, "lf_above", 0);
+	/* no lf_above_info? */
 	pusha((u64)0, "hdr_e8_sps0_tile_addr_lsb8", 0);
-
-	/* not fatal */
-	pusha(vp9_ctx->bufs.tiles[0].addr, "hdr_e8_sps0_tile_addr_lsb8", 0);
-	pusha(vp9_ctx->bufs.tiles[1].addr, "hdr_e8_sps0_tile_addr_lsb8", 0);
-	/* fatal if missing / wrong */
-	pusha(vp9_ctx->bufs.tiles[2].addr, "hdr_e8_sps0_tile_addr_lsb8", 0);
+	pusha(vp9_ctx->bufs.lf_left.addr, "lf_left", 0);
+	pusha(vp9_ctx->bufs.lf_left_info.addr, "lf_left_info", 0);
+	pusha(vp9_ctx->bufs.az_left.addr, "az_left", 0);
 
 	push(0, "");
 
-	push_comp(avd, ctx, run->base.comp_out, ctx->comp.offsets);
+	push_comp(ctx, run->base.comp_out, ctx->comp.offsets);
 
-	/* confusing */
-	pusha((u64)0, "hdr_f4_sps1_tile_addr_lsb8", 2);
+	pusha((u64)0, "packed_fmt_scratch", 0);
 
 	bytesperline = ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
 	if (avd->variant->quirks & AVD_QUIRK_LSR)
@@ -407,11 +455,9 @@ static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
 static void set_tiles(struct avd_ctx *ctx, struct avd_vp9_run *run)
 {
 	const struct v4l2_ctrl_vp9_frame *frame = run->decode_params;
-	struct avd_dev *avd = ctx->dev;
 	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
 	struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
 	const u8 *data = vb2_plane_vaddr(&src->vb2_buf, 0);
-	bool is_last;
 
 	u32 offset =
 		frame->uncompressed_header_size + frame->compressed_header_size;
@@ -426,8 +472,7 @@ static void set_tiles(struct avd_ctx *ctx, struct avd_vp9_run *run)
 
 	for (int row = 0; row < num_tile_rows; row++)
 		for (int col = 0; col < num_tile_cols; col++) {
-			is_last = row == num_tile_rows - 1 &&
-				  col == num_tile_cols - 1;
+			ctx->job.num++;
 			if (row == num_tile_rows - 1 &&
 			    col == num_tile_cols - 1) {
 				tile_size = size;
@@ -459,11 +504,7 @@ static void set_tiles(struct avd_ctx *ctx, struct avd_vp9_run *run)
 				     AVD_SL_DIM_END_X(((col + 1) * sb_64_cols) /
 							      num_tile_cols - 1),
 			     "til_ac0_tile_dims");
-			push(AVD_OP_EXEC | AVD_OP_EXEC_FLAG_END(is_last) |
-				     (avd->variant->revision == 3 ?
-					      AVD_OP_EXEC_REV3_VP9_MASK :
-					      0),
-			     "cm3_cmd_inst_fifo_end");
+
 			offset += tile_size;
 			size -= tile_size;
 			vp9_ctx->submit_num++;
@@ -642,46 +683,42 @@ static int avd_vp9_alloc_bufs(struct avd_ctx *ctx)
 	if (ret)
 		return ret;
 
-	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.above_info,
+	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.color,
 			    DIV_ROUND_UP(w, 16) * DIV_ROUND_UP(h, 64) * 144);
 	if (ret)
 		return ret;
 
-	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.color[0],
+	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.ip_above,
 			    DIV_ROUND_UP(w, 16) * 4 * bit_depth +
 				    (VP9_MAX_TILE_COLS - 1) * 128);
 	if (ret)
 		return ret;
-	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.color[1],
+	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.lf_above,
 			    DIV_ROUND_UP(w, 8) * 16 * bit_depth);
 	if (ret)
 		return ret;
 
-	/*
-	 * randomly needs more space when resizing?
-	 * maybe it does not need it?
-	 */
 	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.seg, DIV_ROUND_UP(w, 8) * 24);
 	if (ret)
 		return ret;
 
-	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.tiles[0],
+	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.lf_left,
 			    DIV_ROUND_UP(h, 8) * 16 * bit_depth);
 	if (ret)
 		return ret;
 
-	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.tiles[1],
+	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.lf_left_info,
 			    DIV_ROUND_UP(h, 64) * 16);
 	if (ret)
 		return ret;
 
-	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.tiles[2],
+	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.az_left,
 			    bit_depth * 36 * DIV_ROUND_UP(h, 8) +
 				    bit_depth * 18 * DIV_ROUND_UP(h, 16));
 	if (ret)
 		return ret;
 
-	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.state,
+	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.above_info,
 			    DIV_ROUND_UP(w, 64) * 288 +
 				    (VP9_MAX_TILE_COLS - 1) * 128);
 	if (ret)
@@ -731,13 +768,22 @@ static int avd_vp9_run_preamble(struct avd_ctx *ctx, struct avd_vp9_run *run)
 
 static int avd_vp9_run(struct avd_ctx *ctx)
 {
-	struct avd_dev *avd = ctx->dev;
 	struct avd_vp9_run run;
 	struct avd_vp9_ctx *vp9_ctx;
 	struct avd_decoded_buffer *dst;
 	int ret;
 
 	ret = avd_vp9_run_preamble(ctx, &run);
+	if (ret) {
+		avd_run_postamble(ctx, &run.base);
+		return ret;
+	}
+
+	ret = avd_init_job(
+		ctx, AVD_CODEC_VP9,
+		(1 << run.decode_params->tile_rows_log2) *
+				(1 << run.decode_params->tile_cols_log2) +
+			1);
 	if (ret) {
 		avd_run_postamble(ctx, &run.base);
 		return ret;
@@ -750,24 +796,12 @@ static int avd_vp9_run(struct avd_ctx *ctx)
 	update_dec_buf_info(dst, run.decode_params);
 	update_ctx_cur_info(vp9_ctx, dst, run.decode_params);
 
-	ret = alloc_slots(avd, ctx, AVD_CODEC_VP9);
-	if (ret) {
-		dev_err(avd->dev, "no free slots: %d", ret);
-		return ret;
-	}
-
-	schedule_delayed_work(&ctx->watchdog_work, msecs_to_jiffies(2000));
-
-	avd->variant->configure_stream(avd, vp9_ctx->bufs.inst.addr,
-				       ctx->fifo_idx, ctx->vp_slot);
-
 	set_header(ctx, &run);
-
 	vp9_ctx->submit_num = 0;
 	set_tiles(ctx, &run);
 	avd_run_postamble(ctx, &run.base);
 
-	return 0;
+	return avd_submit_job(ctx);
 }
 
 #define copy_tx_and_skip(p1, p2)                                    \
@@ -947,6 +981,28 @@ avd_init_v4l2_vp9_count_tbl(struct avd_ctx *ctx)
 				}
 }
 
+static void avd_vp9_stop(struct avd_ctx *ctx)
+{
+	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
+	struct avd_dev *avd = ctx->dev;
+
+	avd_buf_free(avd, &vp9_ctx->bufs.pipe_state);
+	avd_buf_free(avd, &vp9_ctx->bufs.inst);
+	avd_buf_free(avd, &vp9_ctx->bufs.probs);
+	avd_buf_free(avd, &vp9_ctx->bufs.counts);
+	avd_buf_free(avd, &vp9_ctx->bufs.seg);
+	avd_buf_free(avd, &vp9_ctx->bufs.color);
+	avd_buf_free(avd, &vp9_ctx->bufs.ip_above);
+	avd_buf_free(avd, &vp9_ctx->bufs.lf_above);
+	avd_buf_free(avd, &vp9_ctx->bufs.above_info);
+	avd_buf_free(avd, &vp9_ctx->bufs.az_left);
+	avd_buf_free(avd, &vp9_ctx->bufs.lf_left_info);
+	avd_buf_free(avd, &vp9_ctx->bufs.lf_left);
+
+	kfree(vp9_ctx);
+	ctx->priv = NULL;
+}
+
 static int avd_vp9_start(struct avd_ctx *ctx)
 {
 	struct avd_vp9_ctx *vp9_ctx;
@@ -966,29 +1022,8 @@ static int avd_vp9_start(struct avd_ctx *ctx)
 	return 0;
 
 err_free_ctx:
-	kfree(vp9_ctx);
-	ctx->priv = NULL;
+	avd_vp9_stop(ctx);
 	return ret;
-}
-
-static void avd_vp9_stop(struct avd_ctx *ctx)
-{
-	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
-	struct avd_dev *avd = ctx->dev;
-
-	avd_buf_free(avd, &vp9_ctx->bufs.pipe_state);
-	avd_buf_free(avd, &vp9_ctx->bufs.inst);
-	avd_buf_free(avd, &vp9_ctx->bufs.probs);
-	avd_buf_free(avd, &vp9_ctx->bufs.counts);
-	avd_buf_free(avd, &vp9_ctx->bufs.seg);
-	avd_buf_free(avd, &vp9_ctx->bufs.above_info);
-	avd_buf_free(avd, &vp9_ctx->bufs.color[0]);
-	avd_buf_free(avd, &vp9_ctx->bufs.color[1]);
-	avd_buf_free(avd, &vp9_ctx->bufs.state);
-	for (int i = 0; i < 3; i++)
-		avd_buf_free(avd, &vp9_ctx->bufs.tiles[i]);
-
-	kfree(vp9_ctx);
 }
 
 static enum avd_image_fmt avd_vp9_get_image_fmt(struct avd_ctx *ctx,
@@ -1018,15 +1053,22 @@ static void avd_vp9_submit(struct avd_ctx *ctx)
 {
 	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
 	struct avd_dev *avd = ctx->dev;
-	u32 submit_mask = ctx->dev->variant->revision == 3 ? 0xfff000 : 0;
+	u32 submit_mask = ctx->dev->variant->revision == 3 ?
+				  AVD_OP_EXEC_REV3_VP9_MASK :
+				  0;
 
-	writel(0x2b000000 | submit_mask |
-		       (avd->variant->revision == 3 ? 0x100 : 0x200) |
-		       (ctx->fifo_idx << 4) | avd->variant->fifo_slots,
+	writel(AVD_OP_EXEC | submit_mask |
+		       AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision ==
+						   4) |
+		       AVD_OP_EXEC_FLAG_START_REV3(avd->variant->revision ==
+						   3) |
+		       AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
+		       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),
 	       avd->ctrl + avd->variant->submit_offset);
 	for (int i = 0; i < vp9_ctx->submit_num - 1; i++)
-		writel(0x2b000000 | submit_mask | (ctx->fifo_idx << 4) |
-			       avd->variant->fifo_slots,
+		writel(AVD_OP_EXEC | submit_mask |
+			       AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
+			       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),
 		       avd->ctrl + avd->variant->submit_offset);
 }
 
