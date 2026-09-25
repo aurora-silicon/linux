@@ -14,7 +14,12 @@ use kernel::{
     soc::apple::aop::FakehidListener,
     sync::{
         aref::ARef,
-        atomic::{Atomic, Relaxed},
+        atomic::{
+            Acquire,
+            Atomic,
+            Relaxed,
+            Release, //
+        },
         Arc, //
     },
     types::ForeignOwnable,
@@ -44,6 +49,8 @@ pub struct AopSensorData<T: MessageProcessor> {
     ty: u32,
     /// The latest reading in micro-units, at most [`MAX_MICRO`].
     value: Atomic<u64>,
+    /// Whether a reading has arrived at all; until then reads return `ENODATA`.
+    valid: Atomic<bool>,
     msg_proc: T,
 }
 
@@ -55,6 +62,7 @@ impl<T: MessageProcessor> AopSensorData<T> {
                 dev,
                 ty,
                 value: Atomic::new(0),
+                valid: Atomic::new(false),
                 msg_proc,
             },
             GFP_KERNEL,
@@ -67,6 +75,8 @@ impl<T: MessageProcessor> FakehidListener for AopSensorData<T> {
         // A report without a reading leaves the last reading in place.
         if let Some(value) = self.msg_proc.process(data) {
             self.value.store(value.min(MAX_MICRO), Relaxed);
+            // Publishes the reading above to readers that see `valid`.
+            self.valid.store(true, Release);
         }
         Ok(())
     }
@@ -88,6 +98,11 @@ unsafe extern "C" fn aop_read_raw<T: MessageProcessor + 'static>(
     let ty = unsafe { (*chan).type_ };
     if data.ty != ty {
         return EINVAL.to_errno();
+    }
+    // A sensor that has not reported yet, for instance because it lacks its
+    // calibration, has no reading rather than a reading of zero.
+    if !data.valid.load(Acquire) {
+        return ENODATA.to_errno();
     }
     let micro = data.value.load(Relaxed);
     // Both parts fit an `i32` because stored readings never exceed `MAX_MICRO`.
