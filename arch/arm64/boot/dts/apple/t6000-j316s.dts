@@ -15,6 +15,41 @@
 / {
 	compatible = "apple,j316s", "apple,t6000", "apple,arm-platform";
 	model = "Apple MacBook Pro (16-inch, M1 Pro, 2021)";
+
+	aliases {
+		sep = &sep;
+	};
+};
+
+/*
+ * m1n1 keys off the sep alias to add the sepfw region and the boot
+ * manifests the driver needs to cold-boot SEPOS.
+ */
+&sep {
+	status = "okay";
+};
+
+/*
+ * From the J316s platform device tree (/arm-io/spi2/mesa): the power line
+ * is gpio0 pin 196 (function-mesa_pwr, active high) and the data-ready line
+ * is pin 195. J414s's lines, 122 and 121, read the same way from its tree.
+ */
+&spi2 {
+	status = "okay";
+};
+
+&mesa {
+	status = "okay";
+	enable-gpios = <&pinctrl_ap 196 GPIO_ACTIVE_HIGH>;
+	interrupt-parent = <&pinctrl_ap>;
+	interrupts = <195 IRQ_TYPE_EDGE_RISING>;
+	spi-cs-setup-delay-ns = <20>;
+	spi-cs-hold-delay-ns = <20>;
+	/*
+	 * Per-device factory data, extracted from this machine's own macOS
+	 * install; it is not redistributable.
+	 */
+	firmware-name = "apple/mesacal-j316s.bin";
 };
 
 &wifi0 {
