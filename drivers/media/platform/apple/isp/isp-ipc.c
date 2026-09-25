@@ -114,7 +114,8 @@ static int chan_handle_once(struct apple_isp *isp, struct isp_channel *chan)
 
 	err = chan->ops->handle(isp, chan);
 	if (err < 0) {
-		dev_err(isp->dev, "%s: handler failed: %d)\n", chan->name, err);
+		dev_err_ratelimited(isp->dev, "%s: handler failed: %d\n",
+				    chan->name, err);
 		return err;
 	}
 
@@ -227,8 +228,9 @@ int ipc_sm_handle(struct apple_isp *isp, struct isp_channel *chan)
 
 		surf = isp_alloc_surface_gc(isp, req->arg1);
 		if (!surf) {
-			isp_err(isp, "failed to alloc requested size 0x%llx\n",
-				req->arg1);
+			dev_err_ratelimited(isp->dev,
+					    "failed to alloc requested size 0x%llx\n",
+					    req->arg1);
 			return -ENOMEM;
 		}
 		surf->type = req->arg2;

@@ -58,8 +58,8 @@ int ipc_bt_handle(struct apple_isp *isp, struct isp_channel *chan)
 
 	if (!isp->bt_surf || req->arg1 < sizeof(*bl) ||
 	    req->arg1 > isp->bt_surf->size) {
-		dev_err(isp->dev, "%s: Bad length 0x%llx\n", chan->name,
-			req->arg1);
+		dev_err_ratelimited(isp->dev, "%s: Bad length 0x%llx\n",
+				    chan->name, req->arg1);
 		return -EIO;
 	}
 
@@ -70,8 +70,8 @@ int ipc_bt_handle(struct apple_isp *isp, struct isp_channel *chan)
 	count = bl->num_buffers;
 	if (count > (req->arg1 - sizeof(*bl)) /
 			    sizeof(struct isp_buflist_buffer)) {
-		dev_err(isp->dev, "%s: Bad length 0x%llx\n", chan->name,
-			req->arg1);
+		dev_err_ratelimited(isp->dev, "%s: Bad length 0x%llx\n",
+				    chan->name, req->arg1);
 		return -EIO;
 	}
 

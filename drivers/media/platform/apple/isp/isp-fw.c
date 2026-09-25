@@ -100,24 +100,24 @@ void *apple_isp_translate(struct apple_isp *isp, struct isp_surf *surf,
 {
 	dma_addr_t end = iova + size;
 	if (!surf) {
-		dev_err(isp->dev,
-			"Failed to translate IPC iova 0x%llx (0x%zx): No surface\n",
-			(long long)iova, size);
+		dev_err_ratelimited(isp->dev,
+				    "Failed to translate IPC iova 0x%llx (0x%zx): No surface\n",
+				    (long long)iova, size);
 		return NULL;
 	}
 
 	if (end < iova || iova < surf->iova ||
 	    end > (surf->iova + surf->size)) {
-		dev_err(isp->dev,
-			"Failed to translate IPC iova 0x%llx (0x%zx): Out of bounds\n",
-			(long long)iova, size);
+		dev_err_ratelimited(isp->dev,
+				    "Failed to translate IPC iova 0x%llx (0x%zx): Out of bounds\n",
+				    (long long)iova, size);
 		return NULL;
 	}
 
 	if (!surf->virt) {
-		dev_err(isp->dev,
-			"Failed to translate IPC iova 0x%llx (0x%zx): No VMap\n",
-			(long long)iova, size);
+		dev_err_ratelimited(isp->dev,
+				    "Failed to translate IPC iova 0x%llx (0x%zx): No VMap\n",
+				    (long long)iova, size);
 		return NULL;
 	}
 

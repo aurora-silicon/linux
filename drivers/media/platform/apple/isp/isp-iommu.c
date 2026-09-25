@@ -147,7 +147,8 @@ struct isp_surf *__isp_alloc_surface(struct apple_isp *isp, u64 size, bool gc)
 	 * bound also keeps the page count within 32 bits.
 	 */
 	if (!size || size > isp->iova_size) {
-		dev_err(isp->dev, "invalid surface size 0x%llx\n", size);
+		dev_err_ratelimited(isp->dev, "invalid surface size 0x%llx\n",
+				    size);
 		return NULL;
 	}
 
