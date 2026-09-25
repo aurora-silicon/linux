@@ -1732,8 +1732,11 @@ impl SepData {
     fn tick_attach(this: &Arc<SepData>) {
         let now = this.rx_count.load(Relaxed);
 
-        // HW: the SEP takes ~265 ms to answer a registration
-        if now == 0 {
+        // HW: the SEP takes ~265 ms to answer a warm registration, and on the
+        // cold-boot path J316s starts discovery ~370 ms after the IMG4 ack.
+        // The boot acks count as traffic, so wait for the first endpoint, not
+        // the first message, or a quiet gap after IMG4 ends the attach early.
+        if this.endpoint_count() == 0 {
             let ticks = this.settle_idle_ticks.load(Relaxed).wrapping_add(1);
             this.settle_idle_ticks.store(ticks, Relaxed);
             if ticks.saturating_mul(u64::from(SETTLE_MS)) < u64::from(FIRST_RESPONSE_MS) {
