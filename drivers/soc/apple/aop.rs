@@ -100,6 +100,14 @@ fn align_up(v: usize, a: usize) -> usize {
     (v + a - 1) & !(a - 1)
 }
 
+/// Index into the AFK endpoint tables for RTKit endpoint `ep`, if it is one
+/// of the endpoints this driver drives.
+fn afk_endpoint_index(ep: u8) -> Option<usize> {
+    ep.checked_sub(AFK_ENDPOINT_START)
+        .filter(|i| *i < AFK_ENDPOINT_COUNT)
+        .map(usize::from)
+}
+
 /// Reads the little-endian `u16` at `off`; `b` must hold it.
 fn le_u16(b: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([b[off], b[off + 1]])
@@ -915,11 +923,11 @@ impl AopData {
 
 impl AOP for AopData {
     fn epic_call(&self, svc: &EPICService, subtype: u16, msg_bytes: &[u8]) -> Result<u32> {
-        let ep_idx = svc.endpoint - AFK_ENDPOINT_START;
+        let ep_idx = afk_endpoint_index(svc.endpoint).ok_or(EINVAL)?;
         let call = {
             let mut rtk_guard = self.rtkit.lock();
             let mut rtk = rtk_guard.as_mut().as_pin_mut().unwrap();
-            let mut ep_guard = self.endpoints[ep_idx as usize].lock();
+            let mut ep_guard = self.endpoints[ep_idx].lock();
             ep_guard.epic_notify(self, rtk.as_mut(), svc.channel, subtype, msg_bytes, None)?
         };
         Ok(call.wait().retcode)
@@ -931,11 +939,11 @@ impl AOP for AopData {
         msg_bytes: &[u8],
         ret_len: usize,
     ) -> Result<(u32, KVec<u8>)> {
-        let ep_idx = svc.endpoint - AFK_ENDPOINT_START;
+        let ep_idx = afk_endpoint_index(svc.endpoint).ok_or(EINVAL)?;
         let call = {
             let mut rtk_guard = self.rtkit.lock();
             let mut rtk = rtk_guard.as_mut().as_pin_mut().unwrap();
-            let mut ep_guard = self.endpoints[ep_idx as usize].lock();
+            let mut ep_guard = self.endpoints[ep_idx].lock();
             let mut ret_buf = KVec::new();
             ret_buf.resize(ret_len, 0, GFP_KERNEL)?;
             ep_guard.epic_notify(
@@ -998,9 +1006,18 @@ impl rtkit::Operations for AopData {
     type Buffer = NoBuffer;
 
     fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, ep: u8, msg: u64) {
+        let Some(index) = afk_endpoint_index(ep) else {
+            dev_warn!(
+                data.dev,
+                "Message {:#x} on unexpected endpoint {:#04x}",
+                msg,
+                ep
+            );
+            return;
+        };
         let mut guard = data.rtkit.lock();
         let mut rtk = guard.as_mut().as_pin_mut().unwrap();
-        let mut ep_guard = data.endpoints[(ep - AFK_ENDPOINT_START) as usize].lock();
+        let mut ep_guard = data.endpoints[index].lock();
         let ret = ep_guard.recv_message(data, rtk.as_mut(), msg);
         if let Err(e) = ret {
             dev_err!(data.dev, "Failed to handle rtkit message, error: {:?}", e);
