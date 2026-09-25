@@ -187,6 +187,7 @@ struct apple_cio {
 		unsigned int idx;
 		bool alive; /* tunnel up; cleared before it is torn down */
 		bool handed; /* appledrm has our callback; work only */
+		bool rearm; /* a fresh tunnel needs a fresh DCP route */
 	} dpin[2];
 };
 
@@ -1096,8 +1097,15 @@ static int apple_nhi_dp_tunnel_post_activate(struct tb_nhi *nhi,
 	} else {
 		struct apple_dpin_ctx *c = &anhi->acio->dpin[idx];
 
-		scoped_guard(mutex, &c->lock)
+		/*
+		 * A new tunnel can arrive without the old tunnel's teardown hook
+		 * running on a controller detach. Force the DCP route through a
+		 * down/up cycle instead of treating the old handoff as this one.
+		 */
+		scoped_guard(mutex, &c->lock) {
 			c->alive = true;
+			c->rearm = true;
+		}
 		queue_work(anhi->acio->dp_wq, &c->work);
 	}
 	apple_dp_dump_host_adapters(anhi);
@@ -2041,12 +2049,15 @@ static void apple_dpin_down(struct apple_dpin_ctx *c)
 static void apple_dpin_work_fn(struct work_struct *work)
 {
 	struct apple_dpin_ctx *c = container_of(work, struct apple_dpin_ctx, work);
-	bool want;
+	bool want, rearm;
 	int ret;
 
 	for (;;) {
-		scoped_guard(mutex, &c->lock)
+		scoped_guard(mutex, &c->lock) {
 			want = c->alive;
+			rearm = c->rearm;
+			c->rearm = false;
+		}
 
 		if (!want) {
 			if (c->handed || c->regs) {
@@ -2054,6 +2065,13 @@ static void apple_dpin_work_fn(struct work_struct *work)
 				dev_dbg(c->acio->dev, "dpin%u: DP tunnel down\n", c->idx);
 			}
 			return;
+		}
+		if (rearm && c->handed) {
+			dev_info(c->acio->dev,
+				 "dpin%u: replacing stale display route for new tunnel\n",
+				 c->idx);
+			apple_dpin_down(c);
+			continue;
 		}
 		if (c->handed)
 			return;

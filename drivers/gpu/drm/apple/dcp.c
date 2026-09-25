@@ -561,7 +561,7 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
 			continue;
 		score = dcp_typec_route_score(candidate);
 		/*
-		 * j416s-specific, not in the reference (t8103 has a single
+		 * T6020-specific, not in the reference (t8103 has a single
 		 * dcpext): prefer a pipeline with a fixed output of its own
 		 * (dcpext0) for a Type-C tunnel route. dcpext1 (Type-C only,
 		 * no fixed output of its own) never completes link training
@@ -569,15 +569,15 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
 		 * accepts request_display but never issues another apcall,
 		 * on every attempt, even though the driver-issued connect
 		 * parameters are byte-identical between the two pipelines.
-		 * Nothing in this driver's source explains the difference,
-		 * so this is a firmware-internal decision on the dcpext1
-		 * coprocessor instance, not something fixable here. dcpext0,
-		 * forced onto the same physical port and tunnel, reaches a
-		 * full AUX/DPCD link (DPRX_DONE=1) and a working picture, so
-		 * it is preferred unconditionally for a tunnel route on this
-		 * hardware.
+		 * Nothing in this driver's source explains the difference.
+		 * dcpext0, forced onto the same physical port and tunnel, reaches
+		 * a full AUX/DPCD link (DPRX_DONE=1) and a working picture on
+		 * j416s. J414s uses the same T6020 display topology; its tunnel
+		 * result is tested separately.
 		 */
-		if (!candidate->dcp->fixed_phy)
+		if ((of_machine_is_compatible("apple,j414s") ||
+		     of_machine_is_compatible("apple,j416s")) &&
+		    !candidate->dcp->fixed_phy)
 			score += 100;
 		if (score < best_score) {
 			best = candidate;
