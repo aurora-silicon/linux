@@ -1016,7 +1016,32 @@ struct ChildDevice(NonNull<bindings::platform_device>);
 // which may be called from any thread.
 unsafe impl Send for ChildDevice {}
 
+/// A driver override that no driver matches: keeps a service device from
+/// binding again once its transport is gone but it has to stay registered.
+const RETIRED_DRIVER_OVERRIDE: &CStr = c_str!("apple-aop-retired");
+
+/// Set once a shutdown could not be confirmed. The firmware may still be
+/// running on the retained buffers, so the device is not brought up again
+/// before a reboot.
+static RETIRED: Atomic<bool> = Atomic::new(false);
+
 impl ChildDevice {
+    /// Keeps the child from binding to any driver again; it stays registered.
+    fn retire(&self) {
+        // SAFETY: The device is registered, so its embedded `struct device` is
+        // valid, and the override string is NUL-terminated.
+        let ret = unsafe {
+            bindings::__device_set_driver_override(
+                ptr::addr_of_mut!((*self.0.as_ptr()).dev),
+                RETIRED_DRIVER_OVERRIDE.as_char_ptr(),
+                RETIRED_DRIVER_OVERRIDE.to_bytes().len(),
+            )
+        };
+        // Only an allocation failure; the device is unbound either way and
+        // the retired flag keeps the parent from coming back.
+        let _ = ret;
+    }
+
     /// Unbinds the child's driver while the child stays registered.
     fn release_driver(&self) {
         // SAFETY: The pointer came from a successful
@@ -1048,6 +1073,12 @@ struct AopData {
     removing: Atomic<bool>,
     /// Set when the transport starts closing; no call is started after it.
     transport_closing: Atomic<bool>,
+    /// The co-processor was started; only then is there anything to shut
+    /// down and to retain.
+    cpu_started: Atomic<bool>,
+    /// Shut the co-processor down on removal, and if that cannot be
+    /// confirmed, retain everything it may still DMA to.
+    quiesce_on_unbind: bool,
     /// Runs the setup-port messages in order; only on firmware with a setup
     /// port.
     setup_queue: Option<OwnedQueue>,
@@ -1185,6 +1216,8 @@ impl AopData {
                     registration_gate <- new_mutex!(()),
                     removing: Atomic::new(false),
                     transport_closing: Atomic::new(false),
+                    cpu_started: Atomic::new(false),
+                    quiesce_on_unbind: cfg.quiesce_on_unbind,
                     setup_queue,
                     setup_lost: Atomic::new(false),
                     setup <- new_mutex!(SetupState::new()),
@@ -1340,7 +1373,21 @@ impl AopData {
     fn start_cpu(&self, asc_mmio: &RelaxedMmio<ASC_MMIO_SIZE>) -> Result<()> {
         let val = asc_mmio.read32(CPU_CONTROL);
         asc_mmio.write32(val | CPU_RUN, CPU_CONTROL);
+        self.cpu_started.store(true, Release);
         Ok(())
+    }
+
+    /// Leaks every allocation the firmware may still access. Called when the
+    /// shutdown could not be confirmed; the memory is lost until reboot.
+    fn retain_dma_buffers(&self) {
+        for endpoint in &self.endpoints {
+            if let Some(buffer) = endpoint.lock().iomem.take() {
+                mem::forget(buffer);
+            }
+        }
+        if let Some(arena) = self.setup.lock().arena.take() {
+            mem::forget(arena);
+        }
     }
 }
 
@@ -1477,7 +1524,24 @@ impl AOP for AopData {
         // drop waits for the RTKit receive worker, which takes the same lock.
         // After it, no callback runs and the device may be unbound.
         let rtkit = self.rtkit.lock().take();
-        drop(rtkit);
+        let mut quiesced = true;
+        if let Some(mut rtkit) = rtkit {
+            if self.quiesce_on_unbind && self.cpu_started.load(Acquire) {
+                // The co-processor DMAs into the shared buffers until it has
+                // acknowledged the shutdown. If it does not, nothing it may
+                // still write to can be freed.
+                if let Err(e) = Pin::new(&mut rtkit).shutdown() {
+                    dev_err!(
+                        self.dev,
+                        "AOP shutdown unconfirmed ({:?}); retaining its buffers until reboot",
+                        e
+                    );
+                    rtkit.retain_shared_buffers_on_drop();
+                    quiesced = false;
+                }
+            }
+            drop(rtkit);
+        }
         // Close the setup port: dropping the mailbox stops its interrupt, and
         // draining the queue finishes the messages that were already taken.
         // Neither may happen under the setup lock, which the queue's work
@@ -1486,6 +1550,22 @@ impl AOP for AopData {
         drop(setup_mbox);
         if let Some(queue) = self.setup_queue.as_ref() {
             queue.drain();
+        }
+        if !quiesced {
+            // The children stay registered: their IOMMU domains hold the
+            // mappings the firmware may still use. Keep them from binding
+            // again, and this device from probing again, until a reboot.
+            self.retain_dma_buffers();
+            for child in &children {
+                child.retire();
+            }
+            RETIRED.store(true, Release);
+            dev_err!(
+                self.dev,
+                "keeping {} unbound service devices and their DMA mappings",
+                children.len()
+            );
+            return;
         }
         let arena = self.setup.lock().arena.take();
         drop(arena);
@@ -1755,6 +1835,9 @@ struct AopHwConfig {
     epic_v4: bool,
     /// The firmware boots through a second, "setup", mailbox as well.
     setup_port: bool,
+    /// Shut the co-processor down on unbind and retain its buffers if the
+    /// shutdown cannot be confirmed.
+    quiesce_on_unbind: bool,
 }
 
 const HW_CFG_T8103: AopHwConfig = AopHwConfig {
@@ -1763,6 +1846,7 @@ const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     alig: 128,
     epic_v4: false,
     setup_port: false,
+    quiesce_on_unbind: false,
 };
 const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
@@ -1770,6 +1854,7 @@ const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     alig: 128,
     epic_v4: false,
     setup_port: false,
+    quiesce_on_unbind: false,
 };
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
@@ -1777,6 +1862,7 @@ const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     alig: 64,
     epic_v4: false,
     setup_port: false,
+    quiesce_on_unbind: false,
 };
 const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
@@ -1784,6 +1870,7 @@ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     alig: 64,
     epic_v4: false,
     setup_port: false,
+    quiesce_on_unbind: false,
 };
 
 kernel::of_device_table!(
@@ -1808,6 +1895,13 @@ impl platform::Driver for AopDriver {
         info: Option<&Self::IdInfo>,
     ) -> impl PinInit<Self, Error> {
         let cfg = info.ok_or(ENODEV)?;
+        if RETIRED.load(Acquire) {
+            dev_err!(
+                pdev.as_ref(),
+                "an earlier instance could not be shut down; reboot before probing again"
+            );
+            return Err(ENODEV);
+        }
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::new::<42>())? };
         let aop_req = pdev.io_request_by_index(0).ok_or(EINVAL)?;
         let aop_mmio = KBox::pin_init(aop_req.iomap_sized::<AOP_MMIO_SIZE>(), GFP_KERNEL)?;
