@@ -342,8 +342,8 @@ int apple_isp_alloc_firmware_surface(struct apple_isp *isp)
 		isp_err(isp, "failed to alloc shared surface for ipc\n");
 		return -ENOMEM;
 	}
-	dev_info(isp->dev, "IPC surface iova: 0x%llx\n",
-		 (long long)isp->ipc_surf->iova);
+	dev_dbg(isp->dev, "IPC surface iova: 0x%llx\n",
+		(long long)isp->ipc_surf->iova);
 
 	isp->data_surf = isp_alloc_surface_vmap(isp, ISP_FIRMWARE_DATA_SIZE);
 	if (!isp->data_surf) {
@@ -351,8 +351,8 @@ int apple_isp_alloc_firmware_surface(struct apple_isp *isp)
 		isp_free_surface(isp, isp->ipc_surf);
 		return -ENOMEM;
 	}
-	dev_info(isp->dev, "Data surface iova: 0x%llx\n",
-		 (long long)isp->data_surf->iova);
+	dev_dbg(isp->dev, "Data surface iova: 0x%llx\n",
+		(long long)isp->data_surf->iova);
 
 	return 0;
 }

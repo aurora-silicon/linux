@@ -409,8 +409,6 @@ static int apple_isp_probe(struct platform_device *pdev)
 		goto free_surface;
 	}
 
-	dev_info(dev, "apple-isp probe!\n");
-
 	return 0;
 
 free_surface:

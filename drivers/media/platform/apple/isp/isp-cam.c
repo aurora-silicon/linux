@@ -166,29 +166,6 @@ static int isp_ch_get_sensor_id(struct apple_isp *isp, u32 ch)
 	return err;
 }
 
-static int isp_ch_get_camera_preset(struct apple_isp *isp, u32 ch, u32 ps)
-{
-	int err = 0;
-
-	struct cmd_ch_camera_config *args; /* Too big to allocate on stack */
-	args = kzalloc(sizeof(*args), GFP_KERNEL);
-	if (!args)
-		return -ENOMEM;
-
-	err = isp_cmd_ch_camera_config_get(isp, ch, ps, args);
-	if (err)
-		goto exit;
-
-	pr_info("apple-isp: ps: CISP_CMD_CH_CAMERA_CONFIG_GET: %d\n", ps);
-	print_hex_dump(KERN_INFO, "apple-isp: ps: ", DUMP_PREFIX_NONE, 32, 4,
-		       args, sizeof(*args), false);
-
-exit:
-	kfree(args);
-
-	return err;
-}
-
 static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
 {
 	struct isp_format *fmt = isp_get_format(isp, ch);
@@ -203,18 +180,9 @@ static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
 	if (err)
 		goto exit;
 
-	dev_info(isp->dev, "found sensor %x %s on ch %d\n", args->version,
-		 args->module_sn, ch);
+	dev_dbg(isp->dev, "found sensor %x on ch %d\n", args->version, ch);
 
 	fmt->version = args->version;
-
-	pr_info("apple-isp: ch: CISP_CMD_CH_INFO_GET: %d\n", ch);
-	print_hex_dump(KERN_INFO, "apple-isp: ch: ", DUMP_PREFIX_NONE, 32, 4,
-		       args, sizeof(*args), false);
-
-	for (u32 ps = 0; ps < args->num_presets; ps++) {
-		isp_ch_get_camera_preset(isp, ch, ps);
-	}
 
 	err = isp_ch_get_sensor_id(isp, ch);
 	if (err ||
@@ -243,10 +211,6 @@ static int isp_detect_camera(struct apple_isp *isp)
 	err = isp_cmd_config_get(isp, &args);
 	if (err)
 		return err;
-
-	pr_info("apple-isp: CISP_CMD_CONFIG_GET: \n");
-	print_hex_dump(KERN_INFO, "apple-isp: ", DUMP_PREFIX_NONE, 32, 4, &args,
-		       sizeof(args), false);
 
 	if (!args.num_channels) {
 		dev_err(isp->dev, "did not detect any channels\n");

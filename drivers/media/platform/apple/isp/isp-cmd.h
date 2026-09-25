@@ -471,8 +471,6 @@ int isp_cmd_ch_start(struct apple_isp *isp, u32 chan);
 int isp_cmd_ch_stop(struct apple_isp *isp, u32 chan);
 int isp_cmd_ch_info_get(struct apple_isp *isp, u32 chan,
 			struct cmd_ch_info *args);
-int isp_cmd_ch_camera_config_get(struct apple_isp *isp, u32 chan, u32 preset,
-				 struct cmd_ch_camera_config *args);
 int isp_cmd_ch_camera_config_current_get(struct apple_isp *isp, u32 chan,
 					 struct cmd_ch_camera_config *args);
 int isp_cmd_ch_camera_config_select(struct apple_isp *isp, u32 chan,

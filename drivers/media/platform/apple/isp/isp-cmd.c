@@ -223,15 +223,6 @@ int isp_cmd_ch_info_get(struct apple_isp *isp, u32 chan,
 	return CISP_SEND_OUT(isp, args);
 }
 
-int isp_cmd_ch_camera_config_get(struct apple_isp *isp, u32 chan, u32 preset,
-				 struct cmd_ch_camera_config *args)
-{
-	args->opcode = CISP_OPCODE(CISP_CMD_CH_CAMERA_CONFIG_GET);
-	args->preset = preset;
-	args->chan = chan;
-	return CISP_SEND_OUT(isp, args);
-}
-
 int isp_cmd_ch_camera_config_current_get(struct apple_isp *isp, u32 chan,
 					 struct cmd_ch_camera_config *args)
 {
