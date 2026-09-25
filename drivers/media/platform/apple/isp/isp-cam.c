@@ -223,7 +223,8 @@ static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
 		dev_err(isp->dev,
 			"ch %d: unsupported sensor. Please file a bug report with hardware info & dmesg trace.\n",
 			ch);
-		return -ENODEV;
+		err = -ENODEV;
+		goto exit;
 	}
 
 exit:
