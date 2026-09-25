@@ -97,6 +97,30 @@ config SERIAL_EARLYCON_RISCV_SBI
 	  with "earlycon=sbi" on the kernel command line. The console is
 	  enabled when early_param is processed.
 
+config SERIAL_APPLE_DOCKCHANNEL_EARLYCON
+	bool "Apple DockChannel early console"
+	depends on ARCH_APPLE || COMPILE_TEST
+	select SERIAL_CORE
+	select SERIAL_CORE_CONSOLE
+	select SERIAL_EARLYCON
+	help
+	  Enable an early console on Apple devices whose serial transport is
+	  a DockChannel FIFO. The firmware supplies the configured channel
+	  and the device tree identifies its data registers. This is useful
+	  for diagnosing boot before the normal console driver is available.
+
+config SERIAL_APPLE_DOCKCHANNEL
+	bool "Apple DockChannel UART"
+	depends on ARCH_APPLE || COMPILE_TEST
+	select SERIAL_CORE
+	select SERIAL_CORE_CONSOLE
+	select SERIAL_EARLYCON
+	help
+	  Enable the Apple DockChannel FIFO as a serial console. The driver
+	  provides interrupt-driven receive and transmit support on devices
+	  whose firmware has configured this transport, including T8140.
+	  It can take over from the DockChannel early console during boot.
+
 config SERIAL_SB1250_DUART
 	tristate "BCM1xxx on-chip DUART serial support"
 	depends on SIBYTE_SB1xxx_SOC=y
