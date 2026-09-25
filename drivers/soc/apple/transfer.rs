@@ -140,6 +140,9 @@ struct Active {
 pub(crate) struct Completed {
     pub(crate) status: DeviceStatus,
     pub(crate) payload: KVec<u8>,
+    /// The header of the device's error packet (marker 0xFF), when it sent
+    /// one: logged whole on a refusal, so no field of the reason is lost.
+    pub(crate) error_header: Option<Packet>,
 }
 
 pub(crate) struct Continuation {
@@ -234,6 +237,7 @@ impl Reassembly {
             self.done = Some(Completed {
                 status,
                 payload: KVec::new(),
+                error_header: None,
             });
         }
     }
@@ -271,6 +275,9 @@ impl Reassembly {
                 DeviceStatus::ReportedWithoutStatus
             };
             self.finish(status, KVec::new());
+            if let Some(done) = self.done.as_mut() {
+                done.error_header = Some(*packet);
+            }
             return Progress::Complete;
         }
 
@@ -368,6 +375,10 @@ impl Reassembly {
 
     fn finish(&mut self, status: DeviceStatus, payload: KVec<u8>) {
         self.active = None;
-        self.done = Some(Completed { status, payload });
+        self.done = Some(Completed {
+            status,
+            payload,
+            error_header: None,
+        });
     }
 }

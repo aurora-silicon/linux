@@ -20,10 +20,18 @@ impl SepData {
     pub(crate) fn sbio_call(&self, op: &crate::sbio::SbioOp) -> SbioOutcome {
         let done = match self.sbio_transfer(op) {
             Ok(done) => done,
-            Err(_) => {
+            Err(e) => {
+                dev_warn!(self.dev, "sbio: 0x{:02x} {} not sent or not answered: {:?}\n",
+                    op.opcode(), op.name().to_str().unwrap_or("?"), e);
                 return SbioOutcome::Other;
             }
         };
+
+        // Apple's commandStartEnroll IOLogs the raw status and returns it
+        // (0xfffffe0009737f1c); every non-OK SBIO answer is logged whole.
+        if !done.status.is_ok() {
+            self.log_sbio_refusal(op.opcode(), op.name(), &done);
+        }
 
         let Some(err) = done.status.answered() else {
             return SbioOutcome::Other;
@@ -40,8 +48,27 @@ impl SepData {
     fn sbio_relay(&self, relay: &crate::sbio::SbioRelay<'_>) -> Option<KVec<u8>> {
         match self.sbio_transfer_raw(relay.opcode(), relay.name(), relay.payload()) {
             Ok(done) if done.status.is_ok() => Some(done.payload),
-            Ok(_) => None,
-            Err(_) => None,
+            Ok(done) => {
+                self.log_sbio_refusal(relay.opcode(), relay.name(), &done);
+                None
+            }
+            Err(e) => {
+                dev_warn!(self.dev, "sbio: relay 0x{:02x} {} not sent or not answered: {:?}\n",
+                    relay.opcode(), relay.name().to_str().unwrap_or("?"), e);
+                None
+            }
+        }
+    }
+
+    fn log_sbio_refusal(&self, opcode: u16, name: &CStr, done: &transfer::Completed) {
+        let name = name.to_str().unwrap_or("?");
+        match done.error_header {
+            Some(h) => dev_warn!(
+                self.dev,
+                "sbio: 0x{:02x} {} refused: status {} (error packet: version {} total {} offset {} flags 0x{:x} err 0x{:x} opcode 0x{:x} chunk {})\n",
+                opcode, name, done.status, h.version, h.total, h.offset, h.flags, h.err, h.opcode, h.chunk
+            ),
+            None => dev_warn!(self.dev, "sbio: 0x{:02x} {} refused: status {}\n", opcode, name, done.status),
         }
     }
 
