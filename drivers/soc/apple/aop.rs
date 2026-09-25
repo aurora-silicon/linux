@@ -23,7 +23,10 @@ use kernel::{
         Device,
         DmaMask, //
     },
-    error::from_err_ptr,
+    error::{
+        from_err_ptr,
+        to_result, //
+    },
     fmt,
     io::{
         mem::IoMem,
@@ -43,6 +46,7 @@ use kernel::{
         FakehidListener,
         AOP, //
     },
+    soc::apple::mailbox,
     soc::apple::rtkit,
     sync::{
         aref::ARef,
@@ -112,6 +116,40 @@ const QE_MAGIC2: u32 = from_fourcc(b" POA");
 const EPIC_CALL_TIMEOUT_MS: u32 = 5000;
 /// Bound on the wait for an endpoint's shutdown acknowledgment.
 const AFK_SHUTDOWN_TIMEOUT_MS: u32 = 5000;
+
+// The T8140 AOP boots through a second mailbox, its "setup port", besides the
+// RTKit one. Its management endpoint runs a HELLO / endpoint map / power
+// handshake, after which five service endpoints each request a host-to-AOP
+// message page and an AOP-to-host reply window, which the host hands out of
+// an arena it maps through the setup mailbox's own DART stream. Messages are
+// a 64-bit word plus the endpoint number.
+const SETUP_PAGE: usize = 0x4000;
+/// Five message pages plus the reply windows: the endpoints request either
+/// 0x400 or 0x1000 16-byte reply entries, one or four pages, and the five of
+/// them take eight pages in total.
+const SETUP_ARENA_PAGES: usize = 13;
+const SETUP_MGMT_EP: u8 = 0;
+/// Management message types, in bits 52..60 of the word.
+const SETUP_TYPE_HELLO: u64 = 1;
+const SETUP_TYPE_HELLO_REPLY: u64 = 2;
+const SETUP_TYPE_UNK3: u64 = 3;
+const SETUP_TYPE_UNK3_REPLY: u64 = 4;
+const SETUP_TYPE_PWR_ACK: u64 = 7;
+const SETUP_TYPE_EPMAP: u64 = 8;
+const SETUP_TYPE_AP_PWR: u64 = 0xb;
+const SETUP_HELLO_VERSION: u64 = 0xc000c;
+const SETUP_EPMAP_LAST: u64 = 1 << 51;
+const SETUP_AP_PWR_INIT: u64 = 0x220;
+const SETUP_AP_PWR_ON: u64 = 0x20;
+/// A service endpoint's buffer request: the type in bits 56..64, the number
+/// of reply entries in the low 32 bits.
+const SETUP_BUFFER_REQUEST: u64 = 0x12;
+const SETUP_BUFFER_REQUEST_ACK: u64 = SETUP_BUFFER_REQUEST << 56;
+const SETUP_BUFFER_ENTRY_SIZE: usize = 16;
+/// The service endpoints that request buffers; boot completes once all of
+/// them have theirs.
+const SETUP_ENDPOINTS: [u8; 5] = [0x20, 0x21, 0x23, 0x30, 0x32];
+const SETUP_BOOT_TIMEOUT_MS: u32 = 15000;
 
 fn align_up(v: usize, a: usize) -> usize {
     (v + a - 1) & !(a - 1)
@@ -840,6 +878,136 @@ struct ListenerEntry {
     listener: Arc<dyn FakehidListener>,
 }
 
+/// One of the setup port's service endpoints, once it has its buffers.
+#[derive(Clone, Copy)]
+struct SetupEndpoint {
+    ep: u8,
+    /// The last word received on the endpoint that was not a buffer request.
+    reply: Option<u64>,
+}
+
+struct SetupState {
+    /// `None` until the port is opened and again once it is closed.
+    mbox: Option<mailbox::Mailbox<SetupPortCallback>>,
+    arena: Option<Coherent<[u8]>>,
+    /// The next unassigned page of the arena.
+    next_page: usize,
+    endpoints: [Option<SetupEndpoint>; SETUP_ENDPOINTS.len()],
+    map_done: bool,
+    ap_ready: bool,
+    power_sent: bool,
+    /// The protocol broke down; waiters give up instead of timing out.
+    failed: bool,
+}
+
+impl SetupState {
+    fn new() -> SetupState {
+        SetupState {
+            mbox: None,
+            arena: None,
+            next_page: 0,
+            endpoints: [None; SETUP_ENDPOINTS.len()],
+            map_done: false,
+            ap_ready: false,
+            power_sent: false,
+            failed: false,
+        }
+    }
+
+    fn endpoint_mut(&mut self, ep: u8) -> Option<&mut SetupEndpoint> {
+        self.endpoints.iter_mut().flatten().find(|e| e.ep == ep)
+    }
+
+    fn endpoint_count(&self) -> usize {
+        self.endpoints.iter().flatten().count()
+    }
+
+    fn arena_iova(&self) -> Result<u64> {
+        Ok(self.arena.as_ref().ok_or(ENXIO)?.dma_handle())
+    }
+
+    /// Boot is complete once the AP power state is on and every service
+    /// endpoint has its buffers.
+    fn ready(&self) -> bool {
+        self.ap_ready && self.endpoint_count() == SETUP_ENDPOINTS.len()
+    }
+
+    /// Sends one word to a setup-port endpoint. Callers run in process
+    /// context, so the send may sleep for room in the mailbox FIFO.
+    fn send(&self, ep: u8, word: u64) -> Result<()> {
+        let mbox = self.mbox.as_ref().ok_or(ENXIO)?;
+        mbox.send(
+            mailbox::Message {
+                msg0: word,
+                msg1: u32::from(ep),
+            },
+            false,
+        )
+    }
+
+    /// The word that hands a buffer to the firmware:
+    /// (5 << 60) | (host_to_aop << 54) | (pages << 48) | (iova >> 4).
+    fn shared_descriptor(iova: u64, pages: usize, host_to_aop: bool) -> u64 {
+        (5u64 << 60) | (u64::from(host_to_aop) << 54) | ((pages as u64) << 48) | (iova >> 4)
+    }
+}
+
+struct SetupPortCallback;
+
+impl mailbox::MailCallback for SetupPortCallback {
+    type Data = Arc<AopData>;
+
+    /// Runs in hard IRQ context: hands the message to the ordered setup
+    /// queue, which is all that may be done here. A message that cannot be
+    /// queued is lost, and the protocol state with it.
+    fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, msg: mailbox::Message) {
+        let queued = SetupRxWork::new(data.into(), msg).map(|work| {
+            if let Some(queue) = data.setup_queue.as_ref() {
+                queue.enqueue(work);
+            }
+        });
+        if queued.is_err() {
+            data.setup_lost.store(true, Release);
+            data.setup_cv.notify_all();
+        }
+    }
+}
+
+/// One received setup-port message on its way to the setup queue.
+#[pin_data]
+struct SetupRxWork {
+    data: Arc<AopData>,
+    msg: mailbox::Message,
+    #[pin]
+    work: Work<SetupRxWork>,
+}
+
+impl_has_work! {
+    impl HasWork<Self, 0> for SetupRxWork { self.work }
+}
+
+impl SetupRxWork {
+    /// Allocates atomically: the caller is the mailbox interrupt handler.
+    fn new(data: Arc<AopData>, msg: mailbox::Message) -> Result<Pin<KBox<Self>>> {
+        KBox::pin_init(
+            pin_init!(SetupRxWork {
+                data,
+                msg,
+                work <- new_work!("SetupRxWork::work"),
+            }),
+            GFP_ATOMIC,
+        )
+    }
+}
+
+impl WorkItem for SetupRxWork {
+    type Pointer = Pin<KBox<SetupRxWork>>;
+
+    fn run(this: Pin<KBox<SetupRxWork>>) {
+        this.data.setup_receive(this.msg);
+    }
+}
+
 /// A service platform device registered by this driver. It is unregistered
 /// explicitly by [`AopData::remove`]; nothing else touches the pointer.
 struct ChildDevice(NonNull<bindings::platform_device>);
@@ -880,6 +1048,16 @@ struct AopData {
     removing: Atomic<bool>,
     /// Set when the transport starts closing; no call is started after it.
     transport_closing: Atomic<bool>,
+    /// Runs the setup-port messages in order; only on firmware with a setup
+    /// port.
+    setup_queue: Option<OwnedQueue>,
+    /// A setup-port message could not be queued from the interrupt handler.
+    setup_lost: Atomic<bool>,
+    #[pin]
+    setup: Mutex<SetupState>,
+    /// Signalled after every setup-port message.
+    #[pin]
+    setup_cv: CondVar,
     #[pin]
     rtkit: Mutex<Option<rtkit::RtKit<AopData>>>,
     #[pin]
@@ -993,6 +1171,11 @@ impl WorkItem for AopServiceRegisterWork {
 impl AopData {
     fn new(dev: &platform::Device<Core>, cfg: &AopHwConfig) -> Result<Arc<AopData>> {
         let registration_queue = OwnedQueue::new_ordered(c_str!("apple-aop"))?;
+        let setup_queue = if cfg.setup_port {
+            Some(OwnedQueue::new_ordered(c_str!("apple-aop-setup"))?)
+        } else {
+            None
+        };
         Arc::pin_init(
             pin_init!(
                 AopData {
@@ -1002,6 +1185,10 @@ impl AopData {
                     registration_gate <- new_mutex!(()),
                     removing: Atomic::new(false),
                     transport_closing: Atomic::new(false),
+                    setup_queue,
+                    setup_lost: Atomic::new(false),
+                    setup <- new_mutex!(SetupState::new()),
+                    setup_cv <- new_condvar!(),
                     rtkit <- new_mutex!(None),
                     endpoints <- pin_init::pin_init_array_from_fn(|i| {
                         new_mutex!(AFKEndpoint::new(AFK_ENDPOINT_START + i as u8))
@@ -1016,11 +1203,17 @@ impl AopData {
         )
     }
     fn start(&self) -> Result<()> {
-        {
-            let mut guard = self.rtkit.lock();
-            let mut rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
-            rtk.as_mut().wake()?;
-        }
+        self.wake()?;
+        self.start_afk()
+    }
+    /// Runs the RTKit handshake up to AP power on.
+    fn wake(&self) -> Result<()> {
+        let mut guard = self.rtkit.lock();
+        let mut rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
+        rtk.as_mut().wake()
+    }
+    /// Starts the AFK handshake on every advertised endpoint.
+    fn start_afk(&self) -> Result<()> {
         for ep in 0..AFK_ENDPOINT_COUNT as usize {
             let rtk_ep_num = AFK_ENDPOINT_START + ep as u8;
             let mut guard = self.rtkit.lock();
@@ -1285,9 +1478,225 @@ impl AOP for AopData {
         // After it, no callback runs and the device may be unbound.
         let rtkit = self.rtkit.lock().take();
         drop(rtkit);
+        // Close the setup port: dropping the mailbox stops its interrupt, and
+        // draining the queue finishes the messages that were already taken.
+        // Neither may happen under the setup lock, which the queue's work
+        // takes. The arena is freed while the device is still bound.
+        let setup_mbox = self.setup.lock().mbox.take();
+        drop(setup_mbox);
+        if let Some(queue) = self.setup_queue.as_ref() {
+            queue.drain();
+        }
+        let arena = self.setup.lock().arena.take();
+        drop(arena);
         for child in children {
             child.unregister();
         }
+    }
+}
+
+impl AopData {
+    /// Opens the setup port: the mailbox and the arena its endpoints get
+    /// their buffers from. Done before the co-processor runs, since its
+    /// first message has to be answered.
+    fn setup_open(this: &Arc<AopData>, dev: &device::Device) -> Result<()> {
+        let mbox =
+            mailbox::Mailbox::<SetupPortCallback>::new_byname(dev, c_str!("setup"), this.clone())?;
+        // The arena is DMA of the mailbox provider's device: its node carries
+        // the DART stream the firmware reaches the setup buffers through.
+        let mbox_dev = mbox.device();
+        // SAFETY: `mbox_dev` is a valid device and nothing of ours has DMA in
+        // flight on it yet.
+        unsafe {
+            to_result(bindings::dma_set_mask_and_coherent(
+                mbox_dev.as_raw(),
+                DmaMask::new::<42>().value(),
+            ))?;
+        }
+        // SAFETY: Getting the mailbox added a device link from this device to
+        // the provider, so the provider stays bound for as long as this device
+        // is, and the arena is freed by `remove()` while this device is bound.
+        let bound = unsafe { mbox_dev.as_bound() };
+        let arena =
+            Coherent::<u8>::zeroed_slice(bound, SETUP_ARENA_PAGES * SETUP_PAGE, GFP_KERNEL)?;
+        let mut st = this.setup.lock();
+        st.arena = Some(arena);
+        st.mbox = Some(mbox);
+        Ok(())
+    }
+
+    /// Handles one received setup-port message, in order, on the setup queue.
+    fn setup_receive(&self, msg: mailbox::Message) {
+        let mut st = self.setup.lock();
+        if st.mbox.is_none() {
+            return;
+        }
+        if self.setup_lost.load(Acquire) {
+            st.failed = true;
+        } else {
+            let ep = (msg.msg1 & 0xff) as u8;
+            if let Err(e) = self.setup_handle(&mut st, ep, msg.msg0) {
+                dev_err!(
+                    self.dev,
+                    "setup port: protocol error on endpoint {:#x}, message {:#x}: {:?}",
+                    ep,
+                    msg.msg0,
+                    e
+                );
+                st.failed = true;
+            }
+        }
+        drop(st);
+        self.setup_cv.notify_all();
+    }
+
+    fn setup_handle(&self, st: &mut SetupState, ep: u8, word: u64) -> Result<()> {
+        if ep == SETUP_MGMT_EP {
+            return match (word >> 52) & 0xff {
+                SETUP_TYPE_HELLO => {
+                    if word & 0xffff_ffff != SETUP_HELLO_VERSION {
+                        dev_warn!(
+                            self.dev,
+                            "setup port: HELLO version {:#x}",
+                            word & 0xffff_ffff
+                        );
+                    }
+                    st.send(
+                        SETUP_MGMT_EP,
+                        (SETUP_TYPE_HELLO_REPLY << 52) | SETUP_HELLO_VERSION,
+                    )
+                }
+                SETUP_TYPE_EPMAP => {
+                    // Each fragment of the endpoint map is acknowledged by
+                    // echoing it.
+                    st.send(SETUP_MGMT_EP, word)?;
+                    if word & SETUP_EPMAP_LAST != 0 {
+                        st.map_done = true;
+                    }
+                    Ok(())
+                }
+                SETUP_TYPE_AP_PWR => {
+                    st.ap_ready = (word & 0xffff) == SETUP_AP_PWR_ON;
+                    Ok(())
+                }
+                SETUP_TYPE_UNK3 => st.send(SETUP_MGMT_EP, SETUP_TYPE_UNK3_REPLY << 52),
+                SETUP_TYPE_PWR_ACK => Ok(()),
+                ty => {
+                    dev_warn!(
+                        self.dev,
+                        "setup port: ignoring management message type {:#x} ({:#x})",
+                        ty,
+                        word
+                    );
+                    Ok(())
+                }
+            };
+        }
+        if word >> 56 == SETUP_BUFFER_REQUEST {
+            return self.setup_endpoint_request(st, ep, word);
+        }
+        if let Some(endpoint) = st.endpoint_mut(ep) {
+            endpoint.reply = Some(word);
+            return Ok(());
+        }
+        dev_warn!(
+            self.dev,
+            "setup port: ignoring message {:#x} on endpoint {:#x}",
+            word,
+            ep
+        );
+        Ok(())
+    }
+
+    /// Answers a service endpoint's buffer request with one message page
+    /// and a reply window of the requested number of entries, both taken
+    /// from the arena.
+    fn setup_endpoint_request(&self, st: &mut SetupState, ep: u8, word: u64) -> Result<()> {
+        let requested = (word & 0xffff_ffff) as usize;
+        let slot = SETUP_ENDPOINTS
+            .iter()
+            .position(|e| *e == ep)
+            .ok_or(EINVAL)?;
+        if st.endpoints[slot].is_some() || (requested != 0x400 && requested != 0x1000) {
+            return Err(EINVAL);
+        }
+        let rx_pages = (requested * SETUP_BUFFER_ENTRY_SIZE).div_ceil(SETUP_PAGE);
+        if st.next_page + 1 + rx_pages > SETUP_ARENA_PAGES {
+            return Err(ENOMEM);
+        }
+        let base = st.arena_iova()?;
+        let tx_iova = base + (st.next_page * SETUP_PAGE) as u64;
+        let rx_iova = tx_iova + SETUP_PAGE as u64;
+        st.next_page += 1 + rx_pages;
+        st.send(ep, SETUP_BUFFER_REQUEST_ACK)?;
+        st.send(ep, SetupState::shared_descriptor(tx_iova, 1, true))?;
+        st.send(ep, SetupState::shared_descriptor(rx_iova, rx_pages, false))?;
+        st.endpoints[slot] = Some(SetupEndpoint { ep, reply: None });
+        dev_dbg!(
+            self.dev,
+            "setup port: endpoint {:#x} tx {:#x} rx {:#x} ({} pages)",
+            ep,
+            tx_iova,
+            rx_iova,
+            rx_pages
+        );
+        Ok(())
+    }
+
+    /// Waits, in TASK_UNINTERRUPTIBLE and for at most `timeout_ms`, until
+    /// `done` holds for the setup state. Fails at once when the setup port
+    /// has failed. Spurious wakeups continue the wait with the time left.
+    fn setup_wait(
+        &self,
+        st: &mut MutexGuard<'_, SetupState>,
+        timeout_ms: u32,
+        done: impl Fn(&SetupState) -> bool,
+    ) -> Result<()> {
+        let mut left = msecs_to_jiffies(timeout_ms);
+        loop {
+            if done(st) {
+                return Ok(());
+            }
+            if st.failed || self.setup_lost.load(Acquire) {
+                return Err(EIO);
+            }
+            match self.setup_cv.wait_timeout(st, left) {
+                CondVarTimeoutResult::Timeout => {
+                    return if done(st) { Ok(()) } else { Err(ETIMEDOUT) };
+                }
+                CondVarTimeoutResult::Woken { jiffies }
+                | CondVarTimeoutResult::Signal { jiffies } => left = jiffies,
+            }
+        }
+    }
+
+    /// After the RTKit side has reached AP power on: requests the setup
+    /// port's AP power state and waits for it and for the five endpoint
+    /// buffers.
+    fn setup_finish_boot(&self) -> Result<()> {
+        let mut st = self.setup.lock();
+        if !st.map_done {
+            dev_warn!(
+                self.dev,
+                "setup port: endpoint map incomplete before the AP power request"
+            );
+        }
+        if !st.power_sent {
+            st.send(SETUP_MGMT_EP, (SETUP_TYPE_AP_PWR << 52) | SETUP_AP_PWR_INIT)?;
+            st.power_sent = true;
+        }
+        if let Err(e) = self.setup_wait(&mut st, SETUP_BOOT_TIMEOUT_MS, SetupState::ready) {
+            dev_err!(
+                self.dev,
+                "setup port: boot incomplete (AP power on: {}, endpoints: {}/{}): {:?}",
+                st.ap_ready,
+                st.endpoint_count(),
+                SETUP_ENDPOINTS.len(),
+                e
+            );
+            return Err(e);
+        }
+        Ok(())
     }
 }
 
@@ -1344,6 +1753,8 @@ struct AopHwConfig {
     aopt: u64,
     /// The firmware speaks EPIC with version 4 sub-headers.
     epic_v4: bool,
+    /// The firmware boots through a second, "setup", mailbox as well.
+    setup_port: bool,
 }
 
 const HW_CFG_T8103: AopHwConfig = AopHwConfig {
@@ -1351,24 +1762,28 @@ const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     aopt: 1,
     alig: 128,
     epic_v4: false,
+    setup_port: false,
 };
 const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
     aopt: 0,
     alig: 128,
     epic_v4: false,
+    setup_port: false,
 };
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
     aopt: 0,
     alig: 64,
     epic_v4: false,
+    setup_port: false,
 };
 const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
     aopt: 0,
     alig: 64,
     epic_v4: false,
+    setup_port: false,
 };
 
 kernel::of_device_table!(
@@ -1414,9 +1829,21 @@ impl platform::Driver for AopDriver {
         )?;
         let rtkit = rtkit::RtKit::<AopData>::new(pdev.as_ref(), None, 0, data.clone())?;
         *data.rtkit.lock() = Some(rtkit);
+        if cfg.setup_port {
+            AopData::setup_open(&data, pdev.as_ref())?;
+        }
         let asc_mmio = asc_mmio.access(pdev.as_ref())?.relaxed();
         data.start_cpu(asc_mmio)?;
-        data.start()?;
+        if cfg.setup_port {
+            // The RTKit handshake up to AP power on comes first, then the
+            // setup port's own power state and endpoint buffers, and only
+            // then the AFK endpoints.
+            data.wake()?;
+            data.setup_finish_boot()?;
+            data.start_afk()?;
+        } else {
+            data.start()?;
+        }
         probe_guard.dismiss();
         let data = data as Arc<dyn AOP>;
         Ok(Self(data))
