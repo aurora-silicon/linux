@@ -167,6 +167,43 @@ static int isp_ch_get_sensor_id(struct apple_isp *isp, u32 ch)
 	return err;
 }
 
+/*
+ * The presets come from the device tree. The firmware numbers its own
+ * presets from zero, so a config index at or beyond the count it reports
+ * names a preset it does not have, and selecting it can only fail.
+ */
+static int isp_check_presets(struct apple_isp *isp, u32 num_fw_presets)
+{
+	int num = 0;
+
+	/* Nothing to check against */
+	if (!num_fw_presets)
+		return 0;
+
+	for (int i = 0; i < isp->num_presets; i++) {
+		struct isp_preset *preset = &isp->presets[i];
+
+		if (preset->index >= num_fw_presets) {
+			dev_warn(isp->dev,
+				 "ignoring %ux%u preset: config %u, firmware has %u\n",
+				 preset->output_dim.x, preset->output_dim.y,
+				 preset->index, num_fw_presets);
+			continue;
+		}
+
+		isp->presets[num++] = *preset;
+	}
+
+	if (!num) {
+		dev_err(isp->dev, "no usable sensor presets\n");
+		return -ENODEV;
+	}
+
+	isp->num_presets = num;
+
+	return 0;
+}
+
 static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
 {
 	struct isp_format *fmt = isp_get_format(isp, ch);
@@ -195,6 +232,8 @@ static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
 		err = -ENODEV;
 		goto exit;
 	}
+
+	err = isp_check_presets(isp, args->num_presets);
 
 exit:
 	kfree(args);
