@@ -101,6 +101,20 @@ pub(crate) struct KeybagCreate {
     pub(crate) arg: i32,
 }
 
+/// Which key-store protocol the enclave speaks. It follows the sepOS the
+/// firmware hands the SEP, not the SoC alone: the T8103 stub boots macOS 13.5
+/// (22G74)'s sepOS, whose request shapes are those of the 13.5
+/// `AppleSEPKeyStore`; the T6020 sepOS is newer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyStore {
+    /// macOS 13.5's key store. Before any other request the endpoint is
+    /// initialised as `AppleKeyStore::init_sep_endpoint` does it: `0x4d`, then
+    /// `set_env` carrying the ADT's `/defaults` `cpx-encryption-mode`.
+    Sepos13 { cpx_encryption_mode: u32 },
+    /// The hardware-verified T6020 encoding (variant-5 create).
+    Variant5,
+}
+
 pub(crate) struct PlatformProfile {
     pub(crate) name: &'static str,
     /// Capacity of the boot shared-memory window. The layout is still checked
@@ -119,6 +133,8 @@ pub(crate) struct PlatformProfile {
     pub(crate) firmware_region: &'static CStr,
     /// Identity keybag CREATE_KEYBAG field encoding (per-SoC; see [`KeybagCreate`]).
     pub(crate) keybag_create: KeybagCreate,
+    /// Key-store protocol generation (see [`KeyStore`]).
+    pub(crate) key_store: KeyStore,
 }
 
 const T8103: PlatformProfile = PlatformProfile {
@@ -144,6 +160,10 @@ const T8103: PlatformProfile = PlatformProfile {
         variant: 0,
         bag_type: 0x20000,
         arg: 0,
+    },
+    // The j293 and j313 ADTs both carry `/defaults` `cpx-encryption-mode = 2`.
+    key_store: KeyStore::Sepos13 {
+        cpx_encryption_mode: 2,
     },
 };
 
@@ -171,6 +191,7 @@ const T6020: PlatformProfile = PlatformProfile {
         bag_type: 0,
         arg: -1,
     },
+    key_store: KeyStore::Variant5,
 };
 
 static_assert!(T8103.shmem_capacity == 0x30000);

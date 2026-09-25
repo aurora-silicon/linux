@@ -547,6 +547,12 @@ struct SepData {
 
     sks_seq: Atomic<u32>,
 
+    // IPC header version negotiated by the 13.5 endpoint init; 1 otherwise.
+    sks_header_version: Atomic<u32>,
+
+    // The 13.5 endpoint init (0x4d, set_env) completed.
+    sks_initialized: Atomic<bool>,
+
     // u32, not u8: the kernel's Rust atomics have no u8 AtomicType
     phase: Atomic<u32>,
 
@@ -769,6 +775,8 @@ impl SepData {
                 control <- new_mutex!(control::ControlState::new()),
                 control_wq <- new_condvar!("SepData::control_wq"),
                 sks_seq: Atomic::new(0),
+                sks_header_version: Atomic::new(1),
+                sks_initialized: Atomic::new(false),
                 sks_wedged: Atomic::new(0),
                 bringup: Atomic::new(BRINGUP_FRESH),
                 keybag_designated: Atomic::new(false),
