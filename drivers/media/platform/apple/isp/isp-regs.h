@@ -25,6 +25,21 @@
 
 #define ISP_COPROC_CONTROL_T8140 0x1600044
 
+/*
+ * ISP17a (T8140) reset. The fourth fabric word is at 0xa50, off the 0x100
+ * stride of the other three, in the observed sequence.
+ */
+#define ISP_COPROC_FABRIC_0_T8140    0x748
+#define ISP_COPROC_FABRIC_1_T8140    0x848
+#define ISP_COPROC_FABRIC_2_T8140    0x948
+#define ISP_COPROC_FABRIC_3_T8140    0xa50
+#define ISP_COPROC_IRQ_MASK_0_T8140  0x1600a00
+#define ISP_COPROC_IRQ_MASK_1_T8140  0x1600a04
+#define ISP_COPROC_IRQ_MASK_2_T8140  0x1600a08
+#define ISP_COPROC_IRQ_MASK_3_T8140  0x1600a0c
+#define ISP_COPROC_RESET_ACK_0_T8140 0x1600818
+#define ISP_COPROC_RESET_ACK_1_T8140 0x160081c
+
 #define ISP_MBOX_IRQ_INTERRUPT    0x00
 #define ISP_MBOX_IRQ_ENABLE       0x04
 #define ISP_MBOX_IRQ_ENABLE_T6031 0x08

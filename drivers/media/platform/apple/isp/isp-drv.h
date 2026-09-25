@@ -42,6 +42,17 @@ enum isp_generation {
 	ISP_GEN_T8103,
 	ISP_GEN_T8112,
 	ISP_GEN_T6031,
+	ISP_GEN_T8140,
+};
+
+/*
+ * Firmware interface generation. The existing SoCs pick their command
+ * layouts by apple,firmware-compat; T8140 only runs the H17 firmware, so
+ * its match data selects that interface.
+ */
+enum isp_fw_abi {
+	ISP_FW_ABI_LEGACY,
+	ISP_FW_ABI_H17,
 };
 
 enum isp_firmware_version {
@@ -116,6 +127,7 @@ struct isp_preset {
 
 struct apple_isp_hw {
 	enum isp_generation gen;
+	enum isp_fw_abi fw_abi;
 	u64 pmu_base;
 
 	int dsid_count;
@@ -155,6 +167,9 @@ struct apple_isp_hw {
 	/* windows mapped 1:1 for the firmware */
 	const struct isp_mmio_window *fw_mmio;
 	unsigned int num_fw_mmio;
+
+	/* ISP_GPIO_6 boot mode */
+	u32 boot_mode;
 };
 
 enum isp_sensor_id {

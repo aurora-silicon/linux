@@ -154,6 +154,39 @@ struct isp_firmware_bootargs {
 } __packed;
 static_assert(sizeof(struct isp_firmware_bootargs) == 0x180);
 
+/*
+ * Boot descriptor of the H17 firmware. The values the driver fills in are
+ * the ones this firmware boots with; how they derive from the rest of the
+ * setup is not known.
+ */
+#define ISP_H16_DESCRIPTOR_SIZE		0x200
+#define ISP_H16_SHARED_SIZE		0xee000000ULL
+#define ISP_H16_DESC_NO_OPTICAL_CARD_ID 0xb0
+
+struct isp_firmware_bootargs_h16 {
+	u32 pad_0[2];
+	u64 ipc_iova;
+	u64 shared_base;
+	u64 shared_size;
+	u64 extra_iova;
+	u64 extra_size;
+	u32 platform_id;
+	u32 pad_34;
+	u64 logbuf_addr;
+	u64 logbuf_size;
+	u64 logbuf_entsize;
+	u64 ipc_queue_size;
+	u32 pad_58[4];
+	u32 unk_68;
+	u32 pad_6c;
+	u8 descriptor[ISP_H16_DESCRIPTOR_SIZE];
+	u32 pad_270[8];
+} __packed;
+static_assert(sizeof(struct isp_firmware_bootargs_h16) == 0x290);
+
+/* set in ISP_GPIO_2 by firmware that takes the H16 boot descriptor */
+#define ISP_GPIO2_H16_DESCRIPTOR BIT(1)
+
 struct isp_chan_desc {
 	char name[64];
 	u32 type;
@@ -241,11 +274,53 @@ static int isp_enable_irq(struct apple_isp *isp)
 	return 0;
 }
 
+/*
+ * The ISP17a reset as observed when the firmware boots on T8140. Only the
+ * reset request bit is known to signal completion. The acknowledge words
+ * change between the eight reads, but no condition on them is known, and
+ * the coprocessor status is not polled for WFI on this generation. Which
+ * of the writes, reads and waits are required has not been established.
+ */
+static int isp_reset_coproc_t8140(struct apple_isp *isp)
+{
+	u32 val;
+
+	isp_coproc_write32(isp, ISP_COPROC_EDPRCR, 0x2);
+	if (readl_poll_timeout(isp->coproc + ISP_COPROC_EDPRCR, val,
+			       !(val & 0x2), ISP_FIRMWARE_POLL_US,
+			       100 * USEC_PER_MSEC)) {
+		isp_err(isp, "coprocessor reset request did not clear\n");
+		return -ETIMEDOUT;
+	}
+	msleep(50);
+
+	isp_coproc_write32(isp, ISP_COPROC_FABRIC_0_T8140, 0xffffffff);
+	isp_coproc_write32(isp, ISP_COPROC_FABRIC_1_T8140, 0xffffffff);
+	isp_coproc_write32(isp, ISP_COPROC_FABRIC_2_T8140, 0xffffffff);
+	isp_coproc_write32(isp, ISP_COPROC_FABRIC_3_T8140, 0xffffffff);
+
+	isp_coproc_write32(isp, ISP_COPROC_IRQ_MASK_0_T8140, 0xffffffff);
+	isp_coproc_write32(isp, ISP_COPROC_IRQ_MASK_1_T8140, 0xffffffff);
+	isp_coproc_write32(isp, ISP_COPROC_IRQ_MASK_2_T8140, 0xffffffff);
+	isp_coproc_write32(isp, ISP_COPROC_IRQ_MASK_3_T8140, 0xffffffff);
+
+	for (int i = 0; i < 8; i++) {
+		isp_coproc_read32(isp, ISP_COPROC_RESET_ACK_0_T8140);
+		isp_coproc_read32(isp, ISP_COPROC_RESET_ACK_1_T8140);
+	}
+	msleep(50);
+
+	return 0;
+}
+
 static int isp_reset_coproc(struct apple_isp *isp)
 {
 	int retries;
 	u32 status;
 	u32 val;
+
+	if (isp->hw->gen == ISP_GEN_T8140)
+		return isp_reset_coproc_t8140(isp);
 
 	isp_coproc_write32(isp, ISP_COPROC_EDPRCR, 0x2);
 
@@ -300,8 +375,9 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 	if (err < 0)
 		return err;
 
-
-	isp_gpio_write32(isp, ISP_GPIO_CLOCK_EN, 0x1);
+	/* ISP17a has no clock enable word */
+	if (isp->hw->gen != ISP_GEN_T8140)
+		isp_gpio_write32(isp, ISP_GPIO_CLOCK_EN, 0x1);
 
 #if 0
 	/* This doesn't work well with system sleep */
@@ -323,7 +399,7 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 	isp_gpio_write32(isp, ISP_GPIO_3, 0x0);
 	isp_gpio_write32(isp, ISP_GPIO_4, 0x0);
 	isp_gpio_write32(isp, ISP_GPIO_5, 0x0);
-	isp_gpio_write32(isp, ISP_GPIO_6, 0x0);
+	isp_gpio_write32(isp, ISP_GPIO_6, isp->hw->boot_mode);
 	isp_gpio_write32(isp, ISP_GPIO_7, 0x0);
 
 	isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0x0);
@@ -381,15 +457,56 @@ static void isp_firmware_shutdown_stage2(struct apple_isp *isp)
 	isp_free_surface(isp, isp->extra_surf);
 }
 
-static int isp_firmware_boot_stage2(struct apple_isp *isp)
+static void isp_write_bootargs(struct apple_isp *isp, void *virt,
+			       dma_addr_t iova)
 {
 	struct isp_firmware_bootargs args;
+
+	memset(&args, 0, sizeof(args));
+	args.ipc_iova = isp->ipc_surf->iova;
+	args.ipc_size = isp->ipc_surf->size;
+	args.shared_base = isp->fw.heap_top & 0xffffffff;
+	args.shared_size = 0x10000000UL - args.shared_base;
+	args.extra_iova = isp->extra_surf->iova;
+	args.extra_size = isp->extra_surf->size;
+	args.platform_id = isp->platform_id;
+	args.unk5 = 0x40;
+	args.unk7 = 0x1; // 0?
+	args.unk_iova1 = iova + sizeof(args) - 0xc;
+	args.unk9 = 0x3;
+	memcpy(virt, &args, sizeof(args));
+}
+
+static void isp_write_bootargs_h16(struct apple_isp *isp, void *virt,
+				   u32 args_offset)
+{
+	struct isp_firmware_bootargs_h16 args;
+
+	memset(&args, 0, sizeof(args));
+	args.ipc_iova = isp->ipc_surf->iova;
+	args.shared_base = isp->fw.heap_top & 0xffffffff;
+	args.shared_size = ISP_H16_SHARED_SIZE;
+	args.extra_iova = isp->extra_surf->iova;
+	args.extra_size = isp->extra_surf->size;
+	args.platform_id = isp->platform_id;
+	args.ipc_queue_size = (u64)args_offset + 1;
+	args.unk_68 = 0x40;
+	args.descriptor[ISP_H16_DESC_NO_OPTICAL_CARD_ID] = 1;
+	memcpy(virt, &args, sizeof(args));
+}
+
+static int isp_firmware_boot_stage2(struct apple_isp *isp)
+{
+	bool h16 = isp->hw->fw_abi == ISP_FW_ABI_H17;
+	size_t args_size = h16 ? sizeof(struct isp_firmware_bootargs_h16) :
+				 sizeof(struct isp_firmware_bootargs);
 	dma_addr_t args_iova, cmd_iova;
 	void *args_virt, *cmd_virt;
 	int err;
 
 	u32 num_ipc_chans = isp_gpio_read32(isp, ISP_GPIO_0);
 	u32 args_offset = isp_gpio_read32(isp, ISP_GPIO_1);
+	u32 desc_flags = isp_gpio_read32(isp, ISP_GPIO_2);
 	u32 extra_size = isp_gpio_read32(isp, ISP_GPIO_3);
 	isp->num_ipc_chans = num_ipc_chans;
 
@@ -403,6 +520,14 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 		dev_warn(isp->dev, "unexpected channel count (%d)\n",
 			 num_ipc_chans);
 
+	/* Only hand the H16 descriptor to firmware that asks for it. */
+	if (h16 && !(desc_flags & ISP_GPIO2_H16_DESCRIPTOR)) {
+		dev_err(isp->dev,
+			"firmware did not request the H16 boot descriptor (0x%x)\n",
+			desc_flags);
+		return -ENODEV;
+	}
+
 	/*
 	 * The firmware picks the offset of the boot arguments in the IPC
 	 * surface, and the command area follows them. Both have to lie
@@ -413,9 +538,8 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 	cmd_virt = NULL;
 	if (!check_add_overflow(isp->ipc_surf->iova, (u64)args_offset + 0x40,
 				&args_iova) &&
-	    !check_add_overflow(args_iova, sizeof(args) + 0x40, &cmd_iova)) {
-		args_virt = apple_isp_ipc_translate(isp, args_iova,
-						    sizeof(args));
+	    !check_add_overflow(args_iova, args_size + 0x40, &cmd_iova)) {
+		args_virt = apple_isp_ipc_translate(isp, args_iova, args_size);
 		cmd_virt = apple_isp_ipc_translate(isp, cmd_iova,
 						   ISP_CMD_AREA_SIZE);
 	}
@@ -434,19 +558,10 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 	isp->cmd_iova = cmd_iova;
 	isp->cmd_virt = cmd_virt;
 
-	memset(&args, 0, sizeof(args));
-	args.ipc_iova = isp->ipc_surf->iova;
-	args.ipc_size = isp->ipc_surf->size;
-	args.shared_base = isp->fw.heap_top & 0xffffffff;
-	args.shared_size = 0x10000000UL - args.shared_base;
-	args.extra_iova = isp->extra_surf->iova;
-	args.extra_size = isp->extra_surf->size;
-	args.platform_id = isp->platform_id;
-	args.unk5 = 0x40;
-	args.unk7 = 0x1; // 0?
-	args.unk_iova1 = args_iova + sizeof(args) - 0xc;
-	args.unk9 = 0x3;
-	memcpy(args_virt, &args, sizeof(args));
+	if (h16)
+		isp_write_bootargs_h16(isp, args_virt, args_offset);
+	else
+		isp_write_bootargs(isp, args_virt, args_iova);
 
 	isp_gpio_write32(isp, ISP_GPIO_0, args_iova);
 	/* TODO: handle this via Kconfig depends? hardware is only present on

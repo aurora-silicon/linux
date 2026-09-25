@@ -333,8 +333,10 @@ static enum isp_firmware_version isp_read_fw_version(struct device *dev,
 	return ISP_FIRMWARE_V_UNKNOWN;
 }
 
-static enum isp_firmware_version isp_check_firmware_version(struct device *dev)
+static enum isp_firmware_version
+isp_check_firmware_version(struct apple_isp *isp)
 {
+	struct device *dev = isp->dev;
 	enum isp_firmware_version version, compat;
 
 	/* firmware version is just informative */
@@ -344,7 +346,9 @@ static enum isp_firmware_version isp_check_firmware_version(struct device *dev)
 	dev_dbg(dev, "ISP firmware-compat: %s (FW: %s)\n", isp_fw2str(compat),
 		isp_fw2str(version));
 
-	if (!of_property_present(dev->of_node, "apple,firmware-compat"))
+	/* The H17 interface does not depend on it. */
+	if (isp->hw->fw_abi == ISP_FW_ABI_LEGACY &&
+	    !of_property_present(dev->of_node, "apple,firmware-compat"))
 		dev_warn(dev, "firmware compatibility version not provided, assuming 12.x\n");
 
 	return compat;
@@ -373,7 +377,7 @@ static int apple_isp_probe(struct platform_device *pdev)
 	/* Differences between firmware versions are rather minor so try to work
 	 * with unknown firmware.
 	 */
-	isp->fw_compat = isp_check_firmware_version(dev);
+	isp->fw_compat = isp_check_firmware_version(isp);
 
 	err = of_property_read_u32(dev->of_node, "apple,platform-id",
 				   &isp->platform_id);
