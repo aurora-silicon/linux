@@ -319,6 +319,28 @@ int isp_cmd_ch_sbs_enable(struct apple_isp *isp, u32 chan, u32 enable)
 	return CISP_SEND_IN(isp, args);
 }
 
+int isp_cmd_ch_local_raw_buffer_enable(struct apple_isp *isp, u32 chan,
+				       u16 enable)
+{
+	struct cmd_ch_local_raw_buffer_enable args = {
+		.opcode = CISP_OPCODE(CISP_CMD_CH_LOCAL_RAW_BUFFER_ENABLE),
+		.chan = chan,
+		.enable = enable,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
+int isp_cmd_ch_master_slave_sync_mode_set(struct apple_isp *isp, u32 chan,
+					  u32 mode)
+{
+	struct cmd_ch_master_slave_sync_mode_set args = {
+		.opcode = CISP_OPCODE(CISP_CMD_CH_MASTER_SLAVE_SYNC_MODE_SET),
+		.chan = chan,
+		.mode = mode,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
 int isp_cmd_ch_crop_set(struct apple_isp *isp, u32 chan, u32 x1, u32 y1, u32 x2,
 			u32 y2)
 {
@@ -442,6 +464,26 @@ int isp_cmd_ch_buffer_pool_config_set(struct apple_isp *isp, u32 chan, u16 type)
 		.unk2 = 0,
 		.data_blocks = 1,
 		.compress = 0,
+	};
+	return CISP_SEND_INOUT(isp, args);
+}
+
+int isp_cmd_ch_buffer_pool_config_set_rendered(struct apple_isp *isp, u32 chan,
+					       u16 count, u32 plane0_size,
+					       u32 plane0_stride,
+					       u32 plane1_size,
+					       u32 plane1_stride)
+{
+	struct cmd_ch_buffer_pool_config_set_rendered args = {
+		.opcode = CISP_OPCODE(CISP_CMD_CH_BUFFER_POOL_CONFIG_SET),
+		.chan = chan,
+		.type = CISP_POOL_TYPE_RENDERED,
+		.count = count,
+		.plane0_size = plane0_size,
+		.plane0_stride = plane0_stride,
+		.plane1_size = plane1_size,
+		.plane1_stride = plane1_stride,
+		.data_blocks = 2,
 	};
 	return CISP_SEND_INOUT(isp, args);
 }

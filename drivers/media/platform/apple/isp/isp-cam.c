@@ -16,6 +16,8 @@ struct isp_setfile {
 	u32 magic;
 	const char *path;
 	size_t size;
+	/* bytes present in the file if fewer than size; the rest is zero */
+	size_t file_size;
 };
 
 // clang-format off
@@ -45,6 +47,7 @@ static const struct isp_setfile isp_setfiles[] = {
 	[ISP_IMX514_2820_04] = {0x514, 0x28200405, "apple/isp_2820_04XX.dat", 0xa198},
 	[ISP_IMX558_1921_01] = {0x558, 0x19210106, "apple/isp_1921_01XX.dat", 0xad40},
 	[ISP_IMX558_1922_02] = {0x558, 0x19220201, "apple/isp_1922_02XX.dat", 0xad40},
+	[ISP_IMX558_1925_03] = {0x558, 0x19250306, "apple/isp_1925_03XX.dat", 0xcbc0, 0xcba6},
 	[ISP_IMX603_7920_01] = {0x603, 0x79200109, "apple/isp_7920_01XX.dat", 0xad2c},
 	[ISP_IMX603_7920_02] = {0x603, 0x79200205, "apple/isp_7920_02XX.dat", 0xad2c},
 	[ISP_IMX603_7921_01] = {0x603, 0x79210104, "apple/isp_7921_01XX.dat", 0xad90},
@@ -115,7 +118,11 @@ static int isp_ch_get_sensor_id(struct apple_isp *isp, u32 ch)
 		id = ISP_IMX514_2820_01;
 		break;
 	case 0x558:
-		id = ISP_IMX558_1921_01;
+		/* The H17 firmware only parses header version 0x21 setfiles. */
+		if (isp->hw->fw_abi == ISP_FW_ABI_H17)
+			id = ISP_IMX558_1925_03;
+		else
+			id = ISP_IMX558_1921_01;
 		break;
 	case 0x603:
 		id = ISP_IMX603_7920_01;
@@ -234,7 +241,7 @@ static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
 	err = isp_ch_get_sensor_id(isp, ch);
 	if (err ||
 	    (fmt->id != ISP_IMX248_1820_01 && fmt->id != ISP_IMX558_1921_01 &&
-	     fmt->id != ISP_IMX364_8720_01)) {
+	     fmt->id != ISP_IMX558_1925_03 && fmt->id != ISP_IMX364_8720_01)) {
 		dev_err(isp->dev,
 			"ch %d: unsupported sensor. Please file a bug report with hardware info & dmesg trace.\n",
 			ch);
@@ -319,6 +326,7 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 {
 	struct isp_format *fmt = isp_get_format(isp, ch);
 	const struct isp_setfile *setfile = &isp_setfiles[fmt->id];
+	size_t len = setfile->file_size ?: setfile->size;
 	const struct firmware *fw;
 	u32 magic;
 	int err;
@@ -334,9 +342,9 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 		return err;
 	}
 
-	if (fw->size < setfile->size) {
+	if (fw->size < len) {
 		dev_err(isp->dev, "setfile '%s' too small (0x%zx/0x%zx)\n",
-			setfile->path, fw->size, setfile->size);
+			setfile->path, fw->size, len);
 		release_firmware(fw);
 		return -EINVAL;
 	}
@@ -349,16 +357,55 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 		return -EINVAL;
 	}
 
-	memcpy(isp->data_surf->virt, fw->data, setfile->size);
+	memcpy(isp->data_surf->virt, fw->data, len);
+	memset(isp->data_surf->virt + len, 0, setfile->size - len);
 	release_firmware(fw);
 
 	return isp_cmd_ch_set_file_load(isp, ch, isp->data_surf->iova,
 					setfile->size);
 }
 
+static int isp_ch_configure_frame_rate(struct apple_isp *isp, u32 ch)
+{
+	int err;
+
+	err = isp_cmd_ch_ae_frame_rate_max_set(isp, ch, ISP_FRAME_RATE_DEN);
+	if (err)
+		return err;
+
+	return isp_cmd_ch_ae_frame_rate_min_set(isp, ch, ISP_FRAME_RATE_DEN2);
+}
+
+static int isp_ch_configure_pools(struct apple_isp *isp, u32 ch)
+{
+	struct isp_format *fmt = isp_get_format(isp, ch);
+	int err;
+
+	err = isp_cmd_ch_buffer_pool_config_set(isp, ch, CISP_POOL_TYPE_META);
+	if (err)
+		return err;
+
+	err = isp_cmd_ch_buffer_pool_config_set(isp, ch,
+						CISP_POOL_TYPE_META_CAPTURE);
+	if (err)
+		return err;
+
+	/* The H17 firmware also takes the geometry of the output buffers. */
+	if (isp->hw->fw_abi != ISP_FW_ABI_H17)
+		return 0;
+
+	return isp_cmd_ch_buffer_pool_config_set_rendered(isp, ch,
+							  ISP_MAX_BUFFERS,
+							  fmt->plane_size[0],
+							  fmt->strides[0],
+							  fmt->plane_size[1],
+							  fmt->strides[1]);
+}
+
 static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
 {
 	struct isp_format *fmt = isp_get_format(isp, ch);
+	bool h17 = isp->hw->fw_abi == ISP_FW_ABI_H17;
 	int err;
 
 	isp_cmd_flicker_sensor_set(isp, 0);
@@ -408,6 +455,26 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
 	if (err)
 		return err;
 
+	/*
+	 * The H17 firmware takes the frame rate limits and the buffer pools
+	 * before the preview stream is enabled. It also needs its local raw
+	 * buffers enabled: the sensor data takes the ISP-local raw path, and
+	 * without them the firmware waits for a raw pool from the host.
+	 */
+	if (h17) {
+		err = isp_ch_configure_frame_rate(isp, ch);
+		if (err)
+			return err;
+
+		err = isp_ch_configure_pools(isp, ch);
+		if (err)
+			return err;
+
+		err = isp_cmd_ch_local_raw_buffer_enable(isp, ch, 1);
+		if (err)
+			return err;
+	}
+
 	err = isp_cmd_ch_preview_stream_set(isp, ch, 1);
 	if (err)
 		return err;
@@ -420,9 +487,13 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
 	if (err)
 		return err;
 
-	err = isp_cmd_apple_ch_ae_fd_scene_metering_config_set(isp, ch);
-	if (err)
-		return err;
+	/* The H17 firmware faults on this face-detection metering setup. */
+	if (!h17) {
+		err = isp_cmd_apple_ch_ae_fd_scene_metering_config_set(isp,
+								       ch);
+		if (err)
+			return err;
+	}
 
 	err = isp_cmd_apple_ch_ae_metering_mode_set(isp, ch, 3);
 	if (err)
@@ -440,13 +511,11 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
 	if (err)
 		return err;
 
-	err = isp_cmd_ch_ae_frame_rate_max_set(isp, ch, ISP_FRAME_RATE_DEN);
-	if (err)
-		return err;
-
-	err = isp_cmd_ch_ae_frame_rate_min_set(isp, ch, ISP_FRAME_RATE_DEN2);
-	if (err)
-		return err;
+	if (!h17) {
+		err = isp_ch_configure_frame_rate(isp, ch);
+		if (err)
+			return err;
+	}
 
 	err = isp_cmd_apple_ch_temporal_filter_start(isp, ch, isp->temporal_filter);
 	if (err)
@@ -460,16 +529,10 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
 	if (err)
 		return err;
 
-	err = isp_cmd_ch_buffer_pool_config_set(isp, ch, CISP_POOL_TYPE_META);
-	if (err)
-		return err;
+	if (h17)
+		return isp_cmd_ch_master_slave_sync_mode_set(isp, ch, 0);
 
-	err = isp_cmd_ch_buffer_pool_config_set(isp, ch,
-						CISP_POOL_TYPE_META_CAPTURE);
-	if (err)
-		return err;
-
-	return 0;
+	return isp_ch_configure_pools(isp, ch);
 }
 
 static int isp_configure_capture(struct apple_isp *isp)
