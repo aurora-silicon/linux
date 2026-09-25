@@ -50,4 +50,18 @@ int apple_sart_add_allowed_region(struct apple_sart *sart, phys_addr_t paddr,
 int apple_sart_remove_allowed_region(struct apple_sart *sart, phys_addr_t paddr,
 				     size_t size);
 
+/**
+ * apple_sart_is_inherited_region - test whether a bootloader-protected SART
+ *                                  allow entry covers a physical region
+ * @sart: the SART instance
+ * @paddr: physical start of the region
+ * @size: size of the region in bytes, must be nonzero
+ *
+ * Returns true only when a protected entry (one Linux never writes, including
+ * at shutdown) with the allow flags covers the entire region. This says
+ * nothing about RAM ownership or cache coherency of the region.
+ */
+bool apple_sart_is_inherited_region(struct apple_sart *sart, phys_addr_t paddr,
+				    size_t size);
+
 #endif /* _LINUX_SOC_APPLE_SART_H_ */
