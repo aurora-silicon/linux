@@ -1729,13 +1729,19 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 	INIT_WORK(&data->lock_update_work, macaudio_vlimit_update_work);
 	INIT_DELAYED_WORK(&data->lock_timeout_work, macaudio_vlimit_timeout_work);
 
-	return devm_snd_soc_register_card(dev, card);
+	return snd_soc_register_card(card);
 }
 
 static void macaudio_snd_platform_remove(struct platform_device *pdev)
 {
 	struct macaudio_snd_data *ma = dev_get_drvdata(&pdev->dev);
 
+	/*
+	 * Unregister first: a back-end trigger queues lock_update_work, which
+	 * arms lock_timeout_work, and neither may run once the card is gone.
+	 */
+	snd_soc_unregister_card(&ma->card);
+	cancel_work_sync(&ma->lock_update_work);
 	cancel_delayed_work_sync(&ma->lock_timeout_work);
 }
 
