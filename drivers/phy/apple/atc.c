@@ -633,6 +633,8 @@ struct atcphy_hw {
  *              stays in host mode; the PHY provides USB2 from probe on
  * @typec_mode: Mode the Type-C mux last asked for; a fixed-hub port returns to
  *              it when the PHY is brought back up after a power-off
+ * @host_active: dwc3 has selected host mode on the USB3 PHY; a fixed-hub port
+ *               then routes the PIPE itself on later Type-C mode changes
  * @mode: Current PHY operating mode
  * @swap_lanes: True if lanes must be swapped due to cable orientation
  * @dp_link_rate: DisplayPort link rate
@@ -675,6 +677,7 @@ struct apple_atcphy {
 	bool ss_tunables;
 	bool fixed_usb2;
 	enum atcphy_mode typec_mode;
+	bool host_active;
 	enum atcphy_mode mode;
 	int dp_link_rate;
 	bool swap_lanes;
@@ -2142,6 +2145,7 @@ static int atcphy_usb3_power_off(struct phy *phy)
 	guard(mutex)(&atcphy->lock);
 
 	atcphy_park_pipehandler(atcphy);
+	atcphy->host_active = false;
 
 	if (atcphy->mode != APPLE_ATCPHY_MODE_OFF)
 		atcphy_configure(atcphy, APPLE_ATCPHY_MODE_OFF);
@@ -2155,6 +2159,17 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
 
 	guard(mutex)(&atcphy->lock);
 
+	switch (mode) {
+	case PHY_MODE_USB_HOST:
+		atcphy->host_active = true;
+		break;
+	case PHY_MODE_USB_DEVICE:
+		atcphy->host_active = false;
+		break;
+	default:
+		return -EINVAL;
+	}
+
 	/*
 	 * We may get multiple calls to set_mode (for host mode e.g. at least one from the dwc3 glue
 	 * driver and then another one from the generic xhci code) but must only configure the
@@ -2164,14 +2179,7 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
 	if (atcphy->pipe_state == atcphy_modes[atcphy->mode].pipehandler_state)
 		return 0;
 
-	switch (mode) {
-	case PHY_MODE_USB_HOST:
-		return atcphy_configure_pipehandler(atcphy, true);
-	case PHY_MODE_USB_DEVICE:
-		return atcphy_configure_pipehandler(atcphy, false);
-	default:
-		return -EINVAL;
-	}
+	return atcphy_configure_pipehandler(atcphy, mode == PHY_MODE_USB_HOST);
 }
 
 static const struct phy_ops apple_atc_usb3_phy_ops = {
@@ -2314,6 +2322,7 @@ static int atcphy_dwc3_reset_assert(struct reset_controller_dev *rcdev, unsigned
 
 	_atcphy_dwc3_reset_assert(atcphy);
 	atcphy_park_pipehandler(atcphy);
+	atcphy->host_active = false;
 	atcphy_usb2_power_off(atcphy);
 
 	return 0;
@@ -2400,6 +2409,7 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 {
 	struct apple_atcphy *atcphy = typec_mux_get_drvdata(mux);
 	enum atcphy_mode target_mode;
+	int ret;
 
 	guard(mutex)(&atcphy->lock);
 
@@ -2483,6 +2493,30 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 		break;
 	}
 	atcphy->typec_mode = target_mode;
+
+	if (atcphy->fixed_usb2) {
+		enum atcphy_pipehandler_state pipe_state;
+
+		pipe_state = atcphy_modes[target_mode].pipehandler_state;
+		/*
+		 * The controller of a port behind a fixed hub stays up across mode
+		 * changes, so the PIPE has to follow the mode from here rather than
+		 * from a later set_mode call: park it before the lanes change to a
+		 * mode without a USB3 backend, and route it to the new backend
+		 * afterwards while dwc3 is up in host mode.
+		 */
+		if (pipe_state != ATCPHY_PIPEHANDLER_STATE_USB3)
+			atcphy_park_pipehandler(atcphy);
+
+		ret = atcphy_configure(atcphy, target_mode);
+		if (ret)
+			return ret;
+
+		if (atcphy->host_active && atcphy->pipe_state != pipe_state)
+			ret = atcphy_configure_pipehandler(atcphy, true);
+
+		return ret;
+	}
 
 	/*
 	 * If the pipehandler is still/already up here there's a bug somewhere so make sure to
