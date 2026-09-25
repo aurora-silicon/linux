@@ -222,7 +222,7 @@ static int macsmc_gpio_init_valid_mask(struct gpio_chip *gc,
 			break;
 
 		gpio_nr = macsmc_gpio_nr(key);
-		if (gpio_nr < 0 || gpio_nr > MAX_GPIO) {
+		if (gpio_nr < 0 || gpio_nr >= MAX_GPIO) {
 			dev_err(smcgp->dev, "Bad GPIO key %p4ch\n", &key);
 			continue;
 		}
