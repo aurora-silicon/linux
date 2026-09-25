@@ -1749,9 +1749,20 @@ impl SepData {
         }
 
         if this.endpoint_count() == 0 {
+            dev_err!(
+                this.dev,
+                "attach: {} messages received but no endpoint advertised; xART and key store cannot run\n",
+                now
+            );
             this.phase.store(PHASE_READY, Relaxed);
             return;
         }
+        dev_info!(
+            this.dev,
+            "attach: {} endpoints advertised in {} messages\n",
+            this.endpoint_count(),
+            now
+        );
 
         this.prepare_os_uuid();
 
@@ -1834,7 +1845,7 @@ impl SepData {
 
             proto::EP_BOOT => self.on_boot(msg),
 
-            _ep => {},
+            ep => dev_info!(self.dev, "rx: unhandled endpoint {:#04x} (msg0 {:#018x})\n", ep, msg.msg0),
         }
     }
 
@@ -1855,13 +1866,21 @@ impl SepData {
         }
     }
 
-    fn on_discovery(&self, _msg: Message, f: proto::Fields) {
+    fn on_discovery(&self, msg: Message, f: proto::Fields) {
         let mut table = self.endpoints.lock();
         match f.ty {
             proto::DISCOVER_TYPE_DESCRIPTOR | proto::DISCOVER_TYPE_CONFIG => {
                 let _ = table.slot(f.param);
+                dev_info!(
+                    self.dev,
+                    "discover: endpoint {:#04x} (type {}, msg0 {:#018x}); {} known\n",
+                    f.param,
+                    f.ty,
+                    msg.msg0,
+                    table.eps.len()
+                );
             }
-            _ => {}
+            ty => dev_info!(self.dev, "discover: other type {} (msg0 {:#018x})\n", ty, msg.msg0),
         }
     }
 
