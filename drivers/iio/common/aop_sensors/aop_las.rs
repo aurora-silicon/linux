@@ -7,7 +7,7 @@
 use kernel::{
     bindings, c_str,
     device::Core,
-    iio::common::aop_sensors::{AopSensorData, IIORegistration, MessageProcessor},
+    iio::common::aop_sensors::{AopSensorData, IIORegistration, MessageProcessor, MICRO},
     module_platform_driver, of, platform,
     prelude::*,
     soc::apple::aop::{EPICService, FakehidRegistration, AOP},
@@ -16,8 +16,8 @@ use kernel::{
 struct MsgProc;
 
 impl MessageProcessor for MsgProc {
-    fn process(&self, message: &[u8]) -> u32 {
-        message[1] as u32
+    fn process(&self, message: &[u8]) -> Option<u64> {
+        message.get(1).map(|angle| u64::from(*angle) * MICRO)
     }
 }
 

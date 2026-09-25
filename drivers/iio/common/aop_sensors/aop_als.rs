@@ -8,7 +8,7 @@ use kernel::{
     bindings, c_str,
     device::Core,
     firmware::Firmware,
-    iio::common::aop_sensors::{AopSensorData, IIORegistration, MessageProcessor},
+    iio::common::aop_sensors::{AopSensorData, IIORegistration, MessageProcessor, MICRO},
     module_platform_driver, of, platform,
     prelude::*,
     soc::apple::aop::{EPICService, FakehidRegistration, AOP},
@@ -63,34 +63,38 @@ fn set_als_property(aop: &dyn AOP, svc: &EPICService, tag: u32, data: &[u8]) -> 
     aop.epic_call(svc, EPIC_SUBTYPE_SET_ALS_PROPERTY, &buf)
 }
 
-fn f32_to_u32(f: u32) -> u32 {
-    if f & 0x80000000 != 0 {
-        return 0;
+/// Converts the bits of an IEEE 754 single to microlux, rounding down.
+/// Negative values clamp to zero; NaN and the infinities carry no reading.
+/// Values beyond `MAX_MICRO` saturate when they are stored.
+fn f32_to_micro(f: u32) -> Option<u64> {
+    let exp = ((f >> 23) & 0xff) as i32;
+    if exp == 0xff {
+        return None;
     }
-    let exp = ((f & 0x7f800000) >> 23) as i32 - 127;
-    if exp < 0 {
-        return 0;
+    if f & 0x8000_0000 != 0 || exp == 0 {
+        return Some(0);
     }
-    if exp == 128 && f & 0x7fffff != 0 {
-        return 0;
-    }
-    let mant = f & 0x7fffff | 0x800000;
-    if exp <= 23 {
-        return mant >> (23 - exp);
-    }
-    if exp >= 32 {
-        return u32::MAX;
-    }
-    mant << (exp - 23)
+    // The value is mant * 2^shift; scaled to microlux it is below 2^44
+    // before the shift, so a left shift of up to 19 cannot overflow.
+    let mant = u64::from(f & 0x7f_ffff | 0x80_0000) * MICRO;
+    let shift = exp - 127 - 23;
+    Some(if shift >= 20 {
+        u64::MAX
+    } else if shift >= 0 {
+        mant << shift
+    } else if shift <= -64 {
+        0
+    } else {
+        mant >> -shift
+    })
 }
 
 struct MsgProc(usize);
 
 impl MessageProcessor for MsgProc {
-    fn process(&self, message: &[u8]) -> u32 {
-        let offset = self.0;
-        let raw = u32::from_le_bytes(message[offset..offset + 4].try_into().unwrap());
-        f32_to_u32(raw)
+    fn process(&self, message: &[u8]) -> Option<u64> {
+        let raw = message.get(self.0..self.0 + 4)?;
+        f32_to_micro(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
     }
 }
 
