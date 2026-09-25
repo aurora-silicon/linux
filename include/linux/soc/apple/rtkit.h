@@ -106,6 +106,20 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 void apple_rtkit_free(struct apple_rtkit *rtk);
 
 /*
+ * Detach a co-processor that could not be quiesced without releasing its
+ * shared buffers.
+ *
+ * Stops mailbox callbacks and drains the private RTKit workqueue before
+ * freeing the transport state. Firmware-visible mappings and their allocation
+ * contexts are intentionally retained until reboot; shmem_destroy is not
+ * called. The caller must also retain any buffers it supplied independently
+ * and must not treat this as a successful firmware shutdown or as permission
+ * to reprobe. The caller must exclude concurrent users of rtk, as for
+ * apple_rtkit_free().
+ */
+void apple_rtkit_free_retaining_buffers(struct apple_rtkit *rtk);
+
+/*
  * Reinitialize internal structures. Must only be called with the co-processor
  * is held in reset.
  */
