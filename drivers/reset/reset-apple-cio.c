@@ -20,7 +20,7 @@
  *	t8122	0x62	0x8		BIT(slot)	BIT(16 + slot)
  *	t6000	0	0x1a034		BIT(port)	BIT(16 + port)
  *	t6020	0	0xa02c		BIT(port)	BIT(16 + port)
- *	t6030	0x62	0x8		BIT(slot)	BIT(16 + slot)
+ *	t6030	0x4c	0x8		BIT(slot)	BIT(16 + slot)
  *	t6031	?	0x2028		BIT(port)	BIT(16 + port)
  *	t6041	?	0x2024		BIT(slot)	BIT(16 + slot)
  *	t6050	?	0x20060		BIT(2 * port)	BIT(2 * port + 1)
@@ -29,15 +29,14 @@
  * "port = slot % 4", which the device tree expresses as one controller node
  * per die instead. The others index by slot directly.
  *
- * "regmap" is an ApplePMGR::RegMap enum rather than an address. Only 0 is
- * pinned down, as the PMGR block itself: t8103 resolves to 0x23b784000 and
- * t6020 to the pmgr node plus 0xa02c, both of which match this driver. The
- * non-zero selectors are unresolved, so t8122 and t6030 cannot be wired up
- * yet even though their offset and bit layout are known.
+ * The register-map selector is an index into the PMGR's register windows
+ * rather than an address. 0 is the PMGR block itself: t8103 resolves to
+ * 0x23b784000 and t6020 to the pmgr node plus 0xa02c, both of which match this
+ * driver. On t6030 the selector is 0x4c, which resolves to pmgr reg[34], a
+ * separate 16 KiB page at 0x350780000, so the register is 0x350780008. The
+ * device tree describes that page as its own syscon. t8122 is unresolved.
  *
- * t8132 and t8142 have a different shape again, indexing a per-port table out
- * of a driver-private structure rather than forming an offset, and have not
- * been decoded.
+ * t8132 and t8142 use a different, per-port layout and are not supported.
  *
  * Every implementation polls the busy bits, stores the request, then polls
  * again, with a 192 ms budget. The first poll's result is discarded.
@@ -228,6 +227,10 @@ static const struct of_device_id apple_cio_reset_match[] = {
 	},
 	{
 		.compatible = "apple,t6000-cio-reset",
+		.data = &apple_t6000_cio_reset,
+	},
+	{
+		.compatible = "apple,t6030-cio-reset",
 		.data = &apple_t6000_cio_reset,
 	},
 	{},

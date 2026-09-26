@@ -6,6 +6,8 @@
 
 #include "rtkit-internal.h"
 
+#include <linux/timekeeping.h>
+
 enum {
 	APPLE_RTKIT_PWR_STATE_OFF = 0x00, /* power off, cannot be restarted */
 	APPLE_RTKIT_PWR_STATE_SLEEP = 0x01, /* sleeping, can be restarted */
@@ -99,6 +101,19 @@ bool apple_rtkit_is_crashed(struct apple_rtkit *rtk)
 	return rtk->crashed;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_is_crashed);
+
+/*
+ * Number of messages traced with dev_dbg per RTKit instance (all endpoints, both directions).
+ * apple_rtkit.dyndbg=+p enables this for every RTKit coprocessor (DCP, ANS, SMC, ...), whose
+ * syslog/ioreport/management traffic continues for the life of the system, so every endpoint
+ * is budgeted. The budget is consumed whether or not the dev_dbg site is enabled.
+ */
+#define APPLE_RTKIT_TRACE_BUDGET 512
+
+static bool apple_rtkit_trace_ep(struct apple_rtkit *rtk, u8 ep)
+{
+	return atomic_dec_if_positive(&rtk->trace_budget) >= 0;
+}
 
 static int apple_rtkit_management_send(struct apple_rtkit *rtk, u8 type,
 					u64 msg)
@@ -253,8 +268,8 @@ static void apple_rtkit_management_rx(struct apple_rtkit *rtk, u64 msg)
 	default:
 		dev_warn(
 			rtk->dev,
-			"RTKit: unknown management message: 0x%llx (type: 0x%02x)\n",
-			msg, type);
+			"RTKit: unknown management message: 0x%llx (type: 0x%02x) at %llu ns\n",
+			msg, type, ktime_get_ns());
 	}
 }
 
@@ -467,6 +482,18 @@ static void apple_rtkit_syslog_rx_log(struct apple_rtkit *rtk, u64 msg)
 			 idx);
 		goto done;
 	}
+	/*
+	 * The entry count and message size come from the co-processor and are not checked
+	 * against the buffer size anywhere else. Firmware-provided (mapped) buffers are mapped
+	 * with exactly the requested size, so never read past the end of the buffer.
+	 */
+	if (!rtk->syslog_msg_size ||
+	    (idx + 1) * entry_size > rtk->syslog_buffer.size) {
+		dev_warn(rtk->dev,
+			 "RTKit: syslog entry %d (size 0x%zx) outside the 0x%zx byte buffer\n",
+			 idx, entry_size, rtk->syslog_buffer.size);
+		goto done;
+	}
 
 	apple_rtkit_memcpy(rtk, log_context, &rtk->syslog_buffer,
 			   idx * entry_size + 8, sizeof(log_context));
@@ -548,6 +575,10 @@ static void apple_rtkit_rx_work(struct work_struct *work)
 		apple_rtkit_oslog_rx(rtk, rtk_work->msg);
 		break;
 	case APPLE_RTKIT_APP_ENDPOINT_START ... 0xff:
+		if (apple_rtkit_trace_ep(rtk, rtk_work->ep))
+			dev_dbg(rtk->dev,
+				"RTKit trace: rx work ep 0x%02x msg 0x%016llx at %llu ns\n",
+				rtk_work->ep, rtk_work->msg, ktime_get_ns());
 		if (rtk->ops->recv_message)
 			rtk->ops->recv_message(rtk->cookie, rtk_work->ep,
 					       rtk_work->msg);
@@ -580,6 +611,11 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	 */
 	dma_rmb();
 
+	if (apple_rtkit_trace_ep(rtk, ep))
+		dev_dbg(rtk->dev,
+			"RTKit trace: rx ep 0x%02x msg 0x%016llx at %llu ns\n",
+			ep, msg.msg0, ktime_get_ns());
+
 	if (!test_bit(ep, rtk->endpoints))
 		dev_warn(rtk->dev,
 			 "RTKit: Message to undiscovered endpoint 0x%02x\n",
@@ -608,6 +644,7 @@ int apple_rtkit_send_message(struct apple_rtkit *rtk, u8 ep, u64 message,
 		.msg0 = message,
 		.msg1 = ep,
 	};
+	int ret;
 
 	if (rtk->crashed) {
 		dev_warn(rtk->dev,
@@ -629,7 +666,12 @@ int apple_rtkit_send_message(struct apple_rtkit *rtk, u8 ep, u64 message,
 	 */
 	dma_wmb();
 
-	return apple_mbox_send(rtk->mbox, msg, atomic);
+	ret = apple_mbox_send(rtk->mbox, msg, atomic);
+	if (ret || apple_rtkit_trace_ep(rtk, ep))
+		dev_dbg(rtk->dev,
+			"RTKit trace: tx ep 0x%02x msg 0x%016llx ret %d at %llu ns\n",
+			ep, message, ret, ktime_get_ns());
+	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_send_message);
 
@@ -648,6 +690,7 @@ EXPORT_SYMBOL_GPL(apple_rtkit_has_endpoint);
 int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 {
 	u64 msg;
+	int ret;
 
 	if (!test_bit(endpoint, rtk->endpoints))
 		return -EINVAL;
@@ -657,7 +700,10 @@ int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 
 	msg = FIELD_PREP(APPLE_RTKIT_MGMT_STARTEP_EP, endpoint);
 	msg |= APPLE_RTKIT_MGMT_STARTEP_FLAG;
-	apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_STARTEP, msg);
+	ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_STARTEP, msg);
+	/* The send result is traced but, as before, not returned to the caller. */
+	dev_dbg(rtk->dev, "RTKit trace: start_ep 0x%02x (mgmt 0x%016llx) ret %d at %llu ns\n",
+		endpoint, msg, ret, ktime_get_ns());
 
 	return 0;
 }
@@ -680,6 +726,7 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 	rtk->dev = dev;
 	rtk->cookie = cookie;
 	rtk->ops = ops;
+	atomic_set(&rtk->trace_budget, APPLE_RTKIT_TRACE_BUDGET);
 
 	init_completion(&rtk->epmap_completion);
 	init_completion(&rtk->iop_pwr_ack_completion);

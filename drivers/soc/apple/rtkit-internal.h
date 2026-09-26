@@ -52,6 +52,12 @@ struct apple_rtkit {
 	size_t syslog_msg_size;
 
 	struct workqueue_struct *wq;
+
+	/*
+	 * Debug tracing budget for endpoint messages (all endpoints, both directions), so that
+	 * dev_dbg tracing of bring-up traffic stays bounded on every RTKit coprocessor.
+	 */
+	atomic_t trace_budget;
 };
 
 void apple_rtkit_crashlog_dump(struct apple_rtkit *rtk, u8 *bfr, size_t size);

@@ -35,7 +35,11 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, u8 rate);
  * bring it back up (clock gates and enables) around a link reconfiguration.
  * The mux selection is left alone; link_down() also leaves the ATC output
  * enable set and link_up() re-asserts it. The caller keeps the output
- * selected (holds the mux) around both. t8103-style crossbars only.
+ * selected (holds the mux) around both. Supports t8103-style crossbars and
+ * T602X DP IN outputs. For T602X DP IN, mux_control_try_select() only selects
+ * the route (at DCP Activate); link_up() must then be called after the PHY
+ * pixel clock is running, at DidChangeLinkConfiguration. Deselect takes a
+ * live T602X DP IN link down. The existing T602X dpphy path is separate.
  */
 int apple_dpxbar_link_down(struct mux_control *mux);
 int apple_dpxbar_link_up(struct mux_control *mux);

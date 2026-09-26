@@ -83,8 +83,32 @@
 
 #define APPLE_CIO_M3_CTRL 0x0c
 #define APPLE_CIO_M3_CTRL_START BIT(1)
+#define APPLE_CIO_LSTX_CTRL_LEVEL BIT(0)
+#define APPLE_CIO_LSTX_CTRL_ENABLE BIT(1)
 #define APPLE_CIO_M3_STAT 0xa8
 #define APPLE_CIO_M3_STAT_STATE GENMASK(30, 24)
+#define APPLE_CIO_M3_STAT_STATE_READY 1
+#define APPLE_CIO_M3_STAT_CODE_VALID BIT(31)
+#define APPLE_CIO_M3_STAT_CODE GENMASK(23, 0)
+
+/* MxWrap coprocessor wrapper (t6030 "cpu" region) */
+#define APPLE_MXWRAP_CPU_CTRL 0x28
+#define APPLE_MXWRAP_CPU_CTRL_RUN BIT(4)
+#define APPLE_MXWRAP_CPU_STATUS 0x44
+
+struct apple_cio_hw {
+	bool mxwrap;
+	bool lstx_explicit;
+	bool strict_fw_ready;
+};
+
+static const struct apple_cio_hw apple_cio_t8103_hw = {};
+
+static const struct apple_cio_hw apple_cio_t6030_hw = {
+	.mxwrap = true,
+	.lstx_explicit = true,
+	.strict_fw_ready = true,
+};
 
 #define APPLE_CIO_NHI_HOP_COUNT 0x0
 #define APPLE_CIO_NHI_HOP_COUNT_MASK GENMASK(9, 0)
@@ -122,6 +146,8 @@
 struct apple_cio {
 	struct device *dev;
 	struct device_node *np;
+	const struct apple_cio_hw *hw;
+	void __iomem *cpu_base;
 	struct device_node *pcie_tunnel_np;
 	bool pcie_tunnel_preinitialized;
 	void __iomem *pcie_intr2axi_base;
@@ -191,9 +217,9 @@ struct apple_cio {
 #define APPLE_DPIN_ACK			0x10
 #define APPLE_DPIN_ACK_INACTIVE		BIT(0)
 
-static bool dp_display;
+static bool dp_display = true;
 module_param(dp_display, bool, 0444);
-MODULE_PARM_DESC(dp_display, "Drive displays behind Thunderbolt DP tunnels (experimental, t8103)");
+MODULE_PARM_DESC(dp_display, "Drive displays behind Thunderbolt DP tunnels");
 
 /* DPTX_INACTIVE handshake: request (in)active, wait for the ACK */
 static int apple_dpin_set_active(struct apple_cio *acio, void __iomem *dpin,
@@ -255,6 +281,8 @@ static int apple_dpin_dcp_set_active(void *data, bool active)
 /* appledrm may still be probing when a dock is present at boot: wait up to 30 s */
 #define APPLE_DP_CONNECT_TRIES		60
 #define APPLE_DP_CONNECT_WAIT_MS	500
+/* Explicit external firmware startup can follow userspace initialization. */
+#define APPLE_DP_FIRMWARE_TRIES		240
 
 static int apple_dpin_connect(struct apple_dpin_ctx *c, bool active)
 {
@@ -265,6 +293,13 @@ static int apple_dpin_connect(struct apple_dpin_ctx *c, bool active)
 	int ret;
 
 	for (tries = 1; ; tries++) {
+		/* A down event can arrive during the readiness sleep. */
+		if (active) {
+			scoped_guard(mutex, &c->lock)
+				alive = c->alive;
+			if (!alive)
+				return -ENODEV;
+		}
 		fn = symbol_get(apple_dcp_tb_dp_tunnel);
 		if (fn) {
 			ret = fn(acio->connector_np, c->idx, active,
@@ -277,7 +312,14 @@ static int apple_dpin_connect(struct apple_dpin_ctx *c, bool active)
 				return 0;
 			ret = -ENODEV;
 		}
-		if (!active || ret != -ENODEV || tries >= APPLE_DP_CONNECT_TRIES)
+		/* ENODEV is driver probing; EAGAIN is a registered external
+		 * route whose firmware services have not been published yet.
+		 * Neither has handed a callback or changed the display route.
+		 * Other failures are terminal for this tunnel event.
+		 */
+		if (!active || (ret != -ENODEV && ret != -EAGAIN) ||
+		    tries >= (ret == -EAGAIN ? APPLE_DP_FIRMWARE_TRIES :
+					       APPLE_DP_CONNECT_TRIES))
 			return ret;
 
 		scoped_guard(mutex, &c->lock)
@@ -285,7 +327,7 @@ static int apple_dpin_connect(struct apple_dpin_ctx *c, bool active)
 		if (!alive)
 			return -ENODEV;
 		if (tries == 1)
-			dev_info(acio->dev, "dpin%u: waiting for the display driver\n",
+			dev_info(acio->dev, "dpin%u: waiting for display driver/firmware readiness\n",
 				 c->idx);
 		msleep(APPLE_DP_CONNECT_WAIT_MS);
 	}
@@ -1013,7 +1055,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	 * the connection manager) only where it is enabled and known to work.
 	 */
 	anhi->ops = apple_nhi_ops;
-	if (dp_display && acio->dp_wq && of_machine_is_compatible("apple,t8103"))
+	if (dp_display && acio->dp_wq)
 		anhi->ops.dp_tunnel_changed = apple_nhi_dp_tunnel_changed;
 	anhi->nhi.ops = &anhi->ops;
 	anhi->nhi.ring_layout = &apple_nhi_ring_layout;
@@ -1285,6 +1327,21 @@ static void apple_cio_stop(struct apple_cio *acio)
 	acio->current_cable_info = 0;
 }
 
+/* Only called while the ACIO power domains are on. */
+static void apple_cio_log_state(struct apple_cio *acio, const char *when)
+{
+	if (acio->cpu_base)
+		dev_info(acio->dev, "%s: LSTX 0x%08x, FW state 0x%08x, CPU ctrl 0x%08x, status 0x%08x\n",
+			 when, readl(acio->rc_base + APPLE_CIO_M3_CTRL),
+			 readl(acio->rc_base + APPLE_CIO_M3_STAT),
+			 readl(acio->cpu_base + APPLE_MXWRAP_CPU_CTRL),
+			 readl(acio->cpu_base + APPLE_MXWRAP_CPU_STATUS));
+	else
+		dev_info(acio->dev, "%s: LSTX 0x%08x, FW state 0x%08x\n", when,
+			 readl(acio->rc_base + APPLE_CIO_M3_CTRL),
+			 readl(acio->rc_base + APPLE_CIO_M3_STAT));
+}
+
 static int apple_cio_start(struct apple_cio *acio)
 {
 	struct device_link *link;
@@ -1330,8 +1387,21 @@ static int apple_cio_start(struct apple_cio *acio)
 	 * remaining fields are undocumented, so preserve them rather than clearing
 	 * them with a bare store.
 	 */
-	val = readl(acio->rc_base + APPLE_CIO_M3_CTRL);
-	writel(val | APPLE_CIO_M3_CTRL_START, acio->rc_base + APPLE_CIO_M3_CTRL);
+	if (acio->hw->lstx_explicit) {
+		writel(APPLE_CIO_LSTX_CTRL_ENABLE | APPLE_CIO_LSTX_CTRL_LEVEL,
+		       acio->rc_base + APPLE_CIO_M3_CTRL);
+	} else {
+		val = readl(acio->rc_base + APPLE_CIO_M3_CTRL);
+		writel(val | APPLE_CIO_M3_CTRL_START, acio->rc_base + APPLE_CIO_M3_CTRL);
+	}
+
+	if (acio->hw->mxwrap) {
+		apple_cio_log_state(acio, "before RUN");
+		val = readl(acio->cpu_base + APPLE_MXWRAP_CPU_CTRL);
+		writel(val | APPLE_MXWRAP_CPU_CTRL_RUN,
+		       acio->cpu_base + APPLE_MXWRAP_CPU_CTRL);
+	}
+
 	acio->rtk = apple_rtkit_init(acio->dev, acio, NULL, 0, &apple_cio_rtkit_ops);
 	if (IS_ERR(acio->rtk)) {
 		ret = PTR_ERR(acio->rtk);
@@ -1342,15 +1412,31 @@ static int apple_cio_start(struct apple_cio *acio)
 	ret = apple_rtkit_boot(acio->rtk);
 	if (ret) {
 		dev_err(acio->dev, "M3 RTKit failed to boot: %d\n", ret);
+		apple_cio_log_state(acio, "RTKit boot failed");
 		goto err_free_rtkit;
 	}
 
-	ret = readl_poll_timeout(acio->rc_base + APPLE_CIO_M3_STAT, state,
-				 state & APPLE_CIO_M3_STAT_STATE, 100, 500000);
+	if (acio->hw->strict_fw_ready)
+		ret = readl_poll_timeout(acio->rc_base + APPLE_CIO_M3_STAT, state,
+					 (state & APPLE_CIO_M3_STAT_CODE_VALID) ||
+					 FIELD_GET(APPLE_CIO_M3_STAT_STATE, state) ==
+					 APPLE_CIO_M3_STAT_STATE_READY,
+					 100, 500000);
+	else
+		ret = readl_poll_timeout(acio->rc_base + APPLE_CIO_M3_STAT, state,
+					 state & APPLE_CIO_M3_STAT_STATE, 100, 500000);
+	if (!ret && acio->hw->strict_fw_ready && (state & APPLE_CIO_M3_STAT_CODE_VALID)) {
+		dev_err(acio->dev, "M3 firmware assert, code 0x%06lx (state 0x%08x)\n",
+			FIELD_GET(APPLE_CIO_M3_STAT_CODE, state), state);
+		ret = -EIO;
+	}
 	if (ret < 0) {
 		dev_err(acio->dev, "M3 firmware failed to get ready: %d\n", ret);
+		apple_cio_log_state(acio, "firmware not ready");
 		goto err_shutdown_rtkit;
 	}
+	if (acio->hw->mxwrap)
+		apple_cio_log_state(acio, "firmware ready");
 
 	apple_tunable_apply(acio->rc_base, acio->rc_tunable);
 	if (acio->pcie_adapter_base && acio->pcie_adapter_tunable) {
@@ -1499,6 +1585,22 @@ static int apple_cio_probe(struct platform_device *pdev)
 	init_completion(&acio->nhi_boot_completion);
 	acio->dev = &pdev->dev;
 	acio->np = dev->of_node;
+	acio->hw = of_device_get_match_data(dev);
+	if (!acio->hw)
+		return -EINVAL;
+
+	if (acio->hw->mxwrap) {
+		struct resource *cpu_res;
+
+		cpu_res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "cpu");
+		if (!cpu_res)
+			return dev_err_probe(dev, -EINVAL, "Missing MxWrap cpu region\n");
+		cpu_res->flags |= IORESOURCE_MEM_NONPOSTED;
+		acio->cpu_base = devm_ioremap_resource(dev, cpu_res);
+		if (IS_ERR(acio->cpu_base))
+			return dev_err_probe(dev, PTR_ERR(acio->cpu_base),
+					     "Unable to map MxWrap cpu regs\n");
+	}
 	acio->pcie_tunnel_np =
 		of_parse_phandle(dev->of_node, "apple,pcie-tunnel", 0);
 	if (acio->pcie_tunnel_np) {
@@ -1641,7 +1743,12 @@ static void apple_cio_remove(struct platform_device *pdev)
 
 static const struct of_device_id apple_acio_match[] = {
 	{
+		.compatible = "apple,t6030-usb4-acio",
+		.data = &apple_cio_t6030_hw,
+	},
+	{
 		.compatible = "apple,t8103-usb4-acio",
+		.data = &apple_cio_t8103_hw,
 	},
 	{},
 };
