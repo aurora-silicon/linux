@@ -1246,6 +1246,18 @@ unsafe extern "C" fn hpai_pcm_close(substream: *mut bindings::snd_pcm_substream)
     ret
 }
 
+/// Nothing to arm before the trigger: the dmaengine runtime was set up at
+/// open, and the DMA start followed by the queued firmware run belong to
+/// trigger.  ALSA calls the prepare op unconditionally, so it must exist:
+/// without it the first hpai prepare jumped to address 0.
+///
+/// # Safety
+///
+/// Called by ALSA with a live substream of this card's PCM.
+unsafe extern "C" fn hpai_pcm_prepare(_substream: *mut bindings::snd_pcm_substream) -> i32 {
+    0
+}
+
 /// Trigger, with the ALSA stream lock held: the DMA first, then the
 /// sleeping firmware start queued behind it.
 ///
@@ -2348,7 +2360,7 @@ impl SndSocT8140AopDriver {
     const HPAI_OPS: bindings::snd_pcm_ops = bindings::snd_pcm_ops {
         open: Some(hpai_pcm_open),
         close: Some(hpai_pcm_close),
-        prepare: None,
+        prepare: Some(hpai_pcm_prepare),
         trigger: Some(hpai_pcm_trigger),
         pointer: Some(bindings::snd_dmaengine_pcm_pointer),
         ioctl: None,
