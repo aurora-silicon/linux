@@ -33,6 +33,8 @@ pub(crate) struct Render {
     checkpoint:(u64,[u16;2],usize,usize,u32),
     /// GPU clusters: tiler accelerators (TPC storage) and preemption buffers.
     clusters:u32,
+    /// The register lists of the SoC's GPU (`m3_soc::Soc::registers`).
+    registers:crate::m3_compute_layout::RegisterSet,
 }
 // Queue allocations belong to Render, not to a pass. Keep their fixed arenas
 // and firmware/shared mapping permissions from the qualified allocation map.
@@ -59,7 +61,8 @@ const RENDER_QUEUES: [QueueObjects; 2] = [
         scratch: s::FRAGMENT_SCRATCH, tiler: false, uuid: 0x3d0000 },
 ];
 impl Render {
-    pub(crate) fn new(dev:&driver::AsahiDevice,uat:&mmu::Uat,vm:&mmu::Vm,stats:Region,clusters:u32)->Result<Self> {
+    pub(crate) fn new(dev:&driver::AsahiDevice,uat:&mmu::Uat,vm:&mmu::Vm,stats:Region,clusters:u32,
+        registers:crate::m3_compute_layout::RegisterSet)->Result<Self> {
         let binding=uat.bind(vm)?;
         let mut objects=KVec::new();let mut aliases=KVec::new();
         for index in 0..s::COUNT {
@@ -84,7 +87,7 @@ impl Render {
         tiler_bytes.resize(tiler::SIZE,0u8,GFP_KERNEL)?;
         let mut fragment_bytes=KVec::new();
         fragment_bytes.resize(fragment::SIZE,0u8,GFP_KERNEL)?;
-        let mut job=Self{passes,init_bm,stats,sequence_bytes,tiler_bytes,fragment_bytes,objects,_aliases:aliases,_binding:binding,last_progress_ns:0,draw:0,heads:[0;2],cached_views:KVec::new(),slot:0,batch_count:0,early_count:0,checkpoint:(0,[0;2],0,0,0),clusters};
+        let mut job=Self{passes,init_bm,stats,sequence_bytes,tiler_bytes,fragment_bytes,objects,_aliases:aliases,_binding:binding,last_progress_ns:0,draw:0,heads:[0;2],cached_views:KVec::new(),slot:0,batch_count:0,early_count:0,checkpoint:(0,[0;2],0,0,0),clusters,registers};
         // Lists and the matching manager are built before InitBM publication.
         job.initialize_parameter_buffer()?;
         for pool in &UMA_POOLS { pool.initialize(&mut job.objects)?; }
@@ -226,7 +229,8 @@ impl Render {
         let initial_scene_entry=queue::FirmwareVa::new(self.objects[s::BM_SCENES].va()
             +(self.slot as u64+1)*4).map_err(|_|EINVAL)?;
         let value=tiler::Command {
-            context:self._binding.slot(),notifier:shared(NOTIFIER)?,manager:shared(BUFFER_MANAGER)?,
+            context:self._binding.slot(),register_set:self.registers,
+            notifier:shared(NOTIFIER)?,manager:shared(BUFFER_MANAGER)?,
             scene:fw(P::Scene)?,empty:shared(547)?,gpu_alias:GpuVa::new(command.gpu_va()?).map_err(|_|EINVAL)?,
             sequence:Region::new(seq.va(),seq.size()).map_err(|_|EINVAL)?,pool:shared(UMA_POOLS[0].manager)?,
             scratch:fw(P::TilerScratch)?,stamp:shared(s::TA_STAMP)?,fw_stamp:shared(s::TA_FW_STAMP)?,
@@ -300,7 +304,8 @@ impl Render {
             |(u32::from(r.samples.trailing_zeros() as u8)<<17);
         let tile_mode=0x280|u64::from(r.layers>1)|if r.flags&2!=0 {1<<16}else{0};
         let value=fragment::Command {
-            context:self._binding.slot(),sequence:Region::new(seq.va(),seq.size()).map_err(|_|EINVAL)?,
+            context:self._binding.slot(),register_set:self.registers,
+            sequence:Region::new(seq.va(),seq.size()).map_err(|_|EINVAL)?,
             notifier:shared(NOTIFIER)?,manager:shared(BUFFER_MANAGER)?,scene:fw(P::Scene)?,empty:shared(547)?,
             gpu_alias:GpuVa::new(command.gpu_va()?).map_err(|_|EINVAL)?,tilemap:gpu(P::Tilemap)?,
             heap:gpu(P::HeapMetadata)?,auxiliary:gpu(P::Auxiliary)?,scene_user:gpu(P::SceneUser)?,

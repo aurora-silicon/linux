@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 use crate::{agx_render::Geometry, agx_render_state::{Program,DepthStencil},
-    m3_compute_layout::GpuVa, m3_init_layout::{Error,Region},
+    m3_compute_layout::{GpuVa,RegisterSet}, m3_init_layout::{Error,Region},
     m3_queue_layout::FirmwareVa, m3_render_sequence::fragment};
 pub(crate) const SIZE:usize=0xc73;
 pub(crate) const REGISTERS:usize=fragment::REGISTERS;
+/// The registers G15G does not take; the others keep the G15S order.
+pub(crate) const G15G_OMIT:[u32;4]=[0x160a8,0x160b8,0xa5a9,0xd429];
 pub(crate) const REGISTER_COUNT:usize=79;
 pub(crate) const REGISTER_STRIDE:usize=12;
 pub(crate) const PARAMETERS:usize=0x790;
@@ -45,6 +47,8 @@ pub(crate) struct State {
 }
 pub(crate) struct Command {
     pub(crate) context:u32,
+    /// The register list of the GPU: G15S's, or G15G's without [`G15G_OMIT`].
+    pub(crate) register_set:RegisterSet,
     pub(crate) sequence:Region,
     pub(crate) notifier:FirmwareVa,
     pub(crate) manager:FirmwareVa,
@@ -123,11 +127,14 @@ impl Command {
         bytes[0x56..0x58].copy_from_slice(&((g.x_blocks>>18) as u16).to_le_bytes());
         word(bytes,0x68,s.merge_upper[0]);word(bytes,0x6c,s.merge_upper[1]);
         pointer(bytes,0x78,u64::from(g.tiles));
-        for (n,(register,value)) in values.into_iter().enumerate() {
+        let g15g=self.register_set==RegisterSet::G15G;
+        let mut count=0;
+        for (register,value) in values.into_iter().filter(|(r,_)| !g15g || !G15G_OMIT.contains(r)) {
+            let n=count;count+=1;
             word(bytes,REGISTERS+n*REGISTER_STRIDE,register);pointer(bytes,REGISTERS+n*REGISTER_STRIDE+4,value);
         }
-        bytes[0x788..0x78a].copy_from_slice(&(REGISTER_COUNT as u16).to_le_bytes());
-        bytes[0x78a..0x78c].copy_from_slice(&((REGISTER_COUNT*REGISTER_STRIDE) as u16).to_le_bytes());
+        bytes[0x788..0x78a].copy_from_slice(&(count as u16).to_le_bytes());
+        bytes[0x78a..0x78c].copy_from_slice(&((count*REGISTER_STRIDE) as u16).to_le_bytes());
         // Start3DJobParameters3: mirror records use their actual packed widths.
         for (offset,value) in [(0,s.depth_bias),(0x10,s.scissor),(0x20,s.query),
             (0x168,s.partial_background.resources),(0x170,s.partial_background.address),
