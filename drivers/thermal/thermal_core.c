@@ -1780,6 +1780,48 @@ struct thermal_zone_device *thermal_zone_get_zone_by_name(const char *name)
 }
 EXPORT_SYMBOL_GPL(thermal_zone_get_zone_by_name);
 
+/**
+ * thermal_zone_get_temp_by_name() - sample a uniquely named registered zone
+ * @name: thermal zone name
+ * @temp: destination for the temperature in millidegrees Celsius
+ *
+ * Acquire the zone device reference under the registry lock, as in
+ * thermal_zone_get_by_id(). Removal waits for device references before freeing
+ * the zone. Sampling can therefore sleep without holding thermal_list_lock.
+ * No borrowed thermal-zone pointer escapes to the caller.
+ *
+ * Return: 0 on success, -EINVAL for invalid arguments, -ENODEV for no match,
+ * -EEXIST for duplicate names, or the temperature read error.
+ */
+int thermal_zone_get_temp_by_name(const char *name, int *temp)
+{
+	struct thermal_zone_device *pos, *zone = NULL;
+	int ret;
+
+	if (!name || !temp)
+		return -EINVAL;
+
+	{
+		guard(mutex)(&thermal_list_lock);
+
+		list_for_each_entry(pos, &thermal_tz_list, node) {
+			if (strncasecmp(name, pos->type, THERMAL_NAME_LENGTH))
+				continue;
+			if (zone)
+				return -EEXIST;
+			zone = pos;
+		}
+		if (!zone)
+			return -ENODEV;
+		get_device(&zone->device);
+	}
+
+	ret = thermal_zone_get_temp(zone, temp);
+	put_device(&zone->device);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(thermal_zone_get_temp_by_name);
+
 static void thermal_zone_device_resume(struct work_struct *work)
 {
 	struct thermal_zone_device *tz;
