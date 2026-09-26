@@ -59,6 +59,13 @@ struct dptx_port {
 	u32 lane_count;
 	u32 link_rate, pending_link_rate;
 	u32 drive_settings[2];
+	/*
+	 * Per-boot invocation counters for the validate/connect/request/
+	 * release AFK calls, used together with the caller return address
+	 * logged alongside them to correlate call ordering when diagnosing
+	 * link-training sequencing issues.
+	 */
+	u32 validate_calls, connect_calls, request_calls, release_calls;
 };
 
 int dptxport_validate_connection(struct apple_epic_service *service, u8 core,
@@ -68,4 +75,7 @@ int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
 int dptxport_request_display(struct apple_epic_service *service);
 int dptxport_release_display(struct apple_epic_service *service);
 int dptxport_set_hpd(struct apple_epic_service *service, bool hpd);
+int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
+			     unsigned int timeout_ms);
+
 #endif

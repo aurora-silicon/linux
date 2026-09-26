@@ -37,10 +37,26 @@ struct apple_dcp_typec_route {
 	struct typec_mux_dev *typec_mux;
 	u32 dptx_phy;
 	u32 mux_index;
+	u32 typec_index;
 	bool selected;
+	/* Ported from aurora-silicon/linux#8: this route currently feeds a
+	 * Thunderbolt DP IN adapter rather than the crossbar's dpphy output.
+	 */
+	bool tunnel;
+	/* Which crossbar output is actually selected: route->xbar (dpphy) or
+	 * a Thunderbolt dpin controller computed at tunnel-creation time.
+	 */
+	struct mux_control *active_xbar;
+	/* Which DP IN adapter (0/1) a tunnel on this route is bound to. */
+	unsigned int tunnel_dpin;
+	/* Tunnel only: crossbar connection brought up (at
+	 * DidChangeLinkConfiguration, once the tunnel pixel clock runs).
+	 */
+	bool xbar_up;
 };
 
 bool dcp_is_typec_output(struct apple_dcp *dcp);
+bool dcp_is_usb4_output(struct apple_dcp *dcp);
 
 struct dcpav_service_epic;
 
@@ -288,6 +304,24 @@ struct apple_dcp {
 	struct delayed_work typec_reconnect_wq;
 	struct delayed_work typec_fabric_retrain_wq;
 	u32 typec_reconnect_tries;
+
+	/* Ported from aurora-silicon/linux#8. */
+	/* DPTX feeds a Thunderbolt DP IN adapter, not the Type-C PHY lanes. */
+	bool dptx_tunnel;
+	/* DFP port in the DPTX target: 0 = dpphy, 1 = dpin0, 2 = dpin1. */
+	u8 dptx_dfp_port;
+	/* Wakes/sleeps the Thunderbolt DP IN adapter from DCP Activate/
+	 * Deactivate. Set by apple_dcp_tb_dp_tunnel(), cleared by
+	 * dcp_typec_route_deactivate().
+	 */
+	int (*tb_dpin_set_active)(void *ctx, bool active);
+	void *tb_dpin_ctx;
+	/* Serializes the Thunderbolt DP IN callback and tunnel crossbar state
+	 * between DCP apcalls and tunnel teardown; never held while waiting
+	 * for DCP.
+	 */
+	struct mutex tb_lock;
+	bool tb_clock_ok;
 
 	struct gpio_desc *hdmi_hpd;
 	struct gpio_desc *hdmi_pwren;
