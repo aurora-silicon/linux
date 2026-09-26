@@ -713,14 +713,18 @@ impl SndSocT8140AopData {
         }
     }
 
-    /// Back-end startup: attach the service, power its leaves, `pw0 `.
+    /// Back-end startup: attach the service, `pw0 `, then power its leaves.
+    ///
+    /// The firmware owns the audio fabric and power-gates it (`audio_p` and
+    /// the LEAP domains under it) whenever none of its services is held in
+    /// `pw0 ` or `pwrd`, for instance after a low-power microphone capture.
+    /// Requesting `pw0 ` first brings the fabric back; only then can the
+    /// serializer leaves under it be powered from the AP side, otherwise the
+    /// PMGR reports the parent off and the leaf request never completes.
     fn service_startup(&self, svc: &Service, pds: &[&Option<PowerDomain>]) -> Result<()> {
         self.attach_device(svc.dev_id, svc.name)?;
+        self.service_set_power(svc, SPKR_POWER_STATE_PW0)?;
         self.power_up(svc.name, pds)?;
-        if let Err(e) = self.service_set_power(svc, SPKR_POWER_STATE_PW0) {
-            self.power_down(pds);
-            return Err(e);
-        }
         svc.running.store(false, Relaxed);
         Ok(())
     }
