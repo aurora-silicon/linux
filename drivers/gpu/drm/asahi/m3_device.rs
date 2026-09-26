@@ -120,10 +120,17 @@ impl Device {
     pub(crate) fn soc(&self) -> &'static Soc { self.soc }
 
     pub(crate) fn check_idle(&self)->Result {
+        self.check_idle_parts(true,true)
+    }
+    /// [`Self::check_idle`] with its engine-busy (`busy`) and fault-bank (`faults`) register
+    /// accesses selectable (`asahi.m3_retire_mmio`); with neither it touches no GPU register.
+    pub(crate) fn check_idle_parts(&self,busy:bool,faults:bool)->Result {
+        if !busy && !faults {return Ok(());}
         let sgx=self.sgx.try_access().ok_or(ENODEV)?;
-        if (sgx.try_read64(0xc020)? | sgx.try_read64(0xc120)?) & 1 != 0 {
+        if busy && (sgx.try_read64(0xc020)? | sgx.try_read64(0xc120)?) & 1 != 0 {
             return Err(EBUSY);
         }
+        if !faults {return Ok(());}
         let selector=sgx.try_read64(0xd800)?;
         let mut fault=0;
         // One fault bank (selected through 0xd800) per GPU cluster: banks 0 and 1 on the

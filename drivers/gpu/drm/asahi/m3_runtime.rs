@@ -346,9 +346,15 @@ impl Runtime {
                 if let Some(t)=poll_start {polling_ns+=t.elapsed().as_nanos();polls+=1;}
                 if complete {
                     let retire_start=measure.then(Instant::<Monotonic>::now);
-                    match inner.device.check_idle() {
+                    let retire_mmio=crate::m3_params::retire_mmio(inner.device.soc());
+                    match inner.device.check_idle_parts(
+                        retire_mmio&crate::m3_params::RETIRE_MMIO_BUSY!=0,
+                        retire_mmio&crate::m3_params::RETIRE_MMIO_FAULTS!=0) {
                         Ok(()) if inner.config.pipes_idle()?=>{
-                            if let Err(e)=inner.config.check_pstate(&inner.drm,&inner.device,"after a job") {
+                            let pstate=if retire_mmio&crate::m3_params::RETIRE_MMIO_PSTATE!=0 {
+                                inner.config.check_pstate(&inner.drm,&inner.device,"after a job")
+                            } else {Ok(())};
+                            if let Err(e)=pstate {
                                 inner.state.health.mark_failed();
                                 if crate::t8122_start::is_t8122(inner.device.soc()) {
                                     crate::t8122_start::cap_violated_verdict(inner.drm.as_ref(),e);

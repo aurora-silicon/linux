@@ -120,6 +120,8 @@ pub(crate) struct Soc {
     pub(crate) power_from_boot_loader: bool,
     /// Code the runtime runs after admission that still holds another SoC's values.
     pub(crate) unported: &'static [&'static str],
+    /// The GPU registers read after every job by default (`asahi.m3_retire_mmio` bits).
+    pub(crate) retire_mmio: u64,
 }
 
 impl Soc {
@@ -244,6 +246,8 @@ pub(crate) static T6030: Soc = Soc {
     },
     power_from_boot_loader: false,
     unported: &[],
+    // Engine-busy, fault banks and performance state.
+    retire_mmio: 7,
 };
 
 /// T8122 (M3, G15G): one die, one cluster of ten core slots (eight or ten of them active).
@@ -307,4 +311,6 @@ pub(crate) static T8122: Soc = Soc {
         "T8122 runtime allocation layout and fixed control words",
         "T8122 conservative performance-state ceiling",
     ],
+    // Engine-busy, fault banks and performance state.
+    retire_mmio: 7,
 };
