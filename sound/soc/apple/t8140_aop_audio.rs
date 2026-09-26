@@ -120,6 +120,13 @@ const SPKR_POWER_STATE_PWRD: u32 = from_fourcc(b"pwrd");
 const PD_GET_ATTEMPTS: u32 = 3;
 const PD_GET_RAISED_ATTEMPTS: u32 = 60;
 const PD_GET_RETRY_MS: i64 = 10;
+/// The fabric comes up some tens to hundreds of milliseconds after the
+/// low-power microphone is asked to run (45–200 ms measured at boot); its
+/// first report proves the stream, and so the fabric, is up. Poll for it
+/// before the first leaf request so that request does not time out, and
+/// log, in the PMGR driver.
+const FABRIC_RAISE_POLL_MS: i64 = 5;
+const FABRIC_RAISE_POLLS: u32 = 100;
 
 /// The low-power microphone stream: 16 kHz stereo S32 in a 512 KiB ring
 /// reported every 3,200 frames.
@@ -435,6 +442,8 @@ struct SndSocT8140AopData {
     sequence: Atomic<u32>,
     /// lpai is in `runn`.
     powered: AtomicFlag,
+    /// A low-power microphone report arrived since the last run request.
+    reported: AtomicFlag,
     /// The low-power microphone stream is triggered (set and cleared under
     /// the ALSA stream lock, read by the report path).
     running: AtomicFlag,
@@ -761,26 +770,37 @@ impl SndSocT8140AopData {
         Ok(())
     }
 
-    /// [`Self::power_up`], raising the fabric when the leaves cannot come up.
+    /// [`Self::power_up`] with the fabric raised first.
+    ///
+    /// The fabric may be gated at any open (a low-power capture is enough,
+    /// and a service left in `pw0 ` after its stream does not keep it up),
+    /// and a blind leaf request against it fails noisily in the PMGR
+    /// driver, so always go through the raised path; with the fabric up it
+    /// costs one brief low-power microphone run.
     fn power_up_raising(&self, name: &str, pds: &[&Option<PowerDomain>]) -> Result<()> {
-        match self.power_up(name, pds, PD_GET_ATTEMPTS) {
-            Err(e) if e == ETIMEDOUT => {
-                self.with_fabric_raised(|| self.power_up(name, pds, PD_GET_RAISED_ATTEMPTS))
-            }
-            other => other,
-        }
+        self.with_fabric_raised(|| self.power_up(name, pds, PD_GET_RAISED_ATTEMPTS))
     }
 
     /// Raise the audio fabric the firmware gated. A service's `pw0 ` request
     /// does not do that (measured: `audio_p` stays gated for the whole leaf
     /// retry window), only a running stream does, after which a service in
-    /// `pw0 ` keeps it up. The low-power microphone is attached for the
-    /// firmware's lifetime, so run it briefly around `f` when it is idle.
+    /// `pw0 ` keeps it up only while its stream runs. The low-power
+    /// microphone is attached for the firmware's lifetime, so run it briefly
+    /// around `f` when it is idle, once its first report has arrived.
     fn with_fabric_raised<R>(&self, f: impl FnOnce() -> Result<R>) -> Result<R> {
         if self.powered.load(Relaxed) {
             return f();
         }
+        self.reported.store(false, Relaxed);
         self.set_power(POWER_STATE_RUN)?;
+        let mut polls = 0;
+        while !self.reported.load(Relaxed) && polls < FABRIC_RAISE_POLLS {
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(FABRIC_RAISE_POLL_MS));
+            polls += 1;
+        }
+        if polls == FABRIC_RAISE_POLLS {
+            dev_warn!(self.dev, "lpai: no report while raising the fabric\n");
+        }
         let ret = f();
         if let Err(e) = self.set_power(POWER_STATE_IDLE) {
             dev_warn!(self.dev, "lpai: unable to idle after raising the fabric: {:?}\n", e);
@@ -1028,6 +1048,7 @@ impl ReportListener for SndSocT8140AopData {
             return Ok(());
         };
         let frames = absolute / LPAI_FRAME_BYTES as u64;
+        self.reported.store(true, Relaxed);
         let cursor = le_u64(report, 0x60)?;
         let ring_bytes = self.ring_bytes.load(Relaxed) as usize;
         if ring_bytes == 0 || cursor != absolute % ring_bytes as u64 {
@@ -2703,6 +2724,7 @@ impl platform::Driver for SndSocT8140AopDriver {
                 ring_bytes: Atomic::new(0),
                 sequence: Atomic::new(0),
                 powered: AtomicFlag::new(false),
+                reported: AtomicFlag::new(false),
                 running: AtomicFlag::new(false),
                 hw_ptr_frames: Atomic::new(0),
                 report_warnings: [const { AtomicFlag::new(false) }; 5],
