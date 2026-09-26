@@ -39,6 +39,7 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/xarray.h>
 
 /* sptm2mmio register/doorbell map, shared with x1n1 src/sptm.c. */
 #define X1N1_MMIO_MAGIC		0x000
@@ -114,6 +115,10 @@ struct apple_dart_x1n1_domain {
 	struct apple_dart_x1n1 *dart;
 	DECLARE_BITMAP(sids, DART_X1N1_MAX_STREAMS);
 	struct mutex lock;		/* protects sids / dart binding */
+	/* level-2 leaf tables already attached, keyed by (sid << 40 | block),
+	 * block = dva >> 25. Installing a level-2 table twice is fatal in SPTM,
+	 * so each 32 MiB window is attached at most once. */
+	struct xarray l2_attached;
 };
 
 static struct apple_dart_x1n1_domain *to_x1n1_domain(struct iommu_domain *dom)
@@ -174,6 +179,60 @@ static int apple_dart_x1n1_ensure_init(struct apple_dart_x1n1 *dart)
 	return ret;
 }
 
+/*
+ * Optional in-guest self-test (DT "apple,x1n1-selftest"). Drives the real
+ * batch path — INIT/POWERUP, attach an L2 table + enable for one stream, MAP a
+ * freshly allocated guest page at a DVA, then UNMAP — and logs each batch's
+ * status. Proves the driver's forwarding reaches SPTM from within Linux.
+ */
+static void apple_dart_x1n1_selftest(struct apple_dart_x1n1 *dart)
+{
+	const u32 sid = 1;
+	const u64 dva = 0x10000004000ULL;	/* the IOVA the transport was tested with */
+	unsigned long flags;
+	void *page;
+	phys_addr_t pa;
+	int ret;
+
+	if (apple_dart_x1n1_ensure_init(dart)) {
+		dev_err(dart->dev, "selftest: INIT failed\n");
+		return;
+	}
+
+	page = (void *)__get_free_page(GFP_KERNEL);
+	if (!page)
+		return;
+	pa = virt_to_phys(page);
+
+	spin_lock_irqsave(&dart->batch_lock, flags);
+	/* Install the level-1 root, then the level-2 leaf table for this DVA's
+	 * 32 MiB window (level 2 requires level 1 present), enable the stream,
+	 * then map one page. */
+	dart->batch->count = 4;
+	dart->batch->op[0] = (struct x1n1_op){ .op = X1N1_DART_ATTACH,
+					       .arg = { sid, dva, 1 } };
+	dart->batch->op[1] = (struct x1n1_op){ .op = X1N1_DART_ATTACH,
+					       .arg = { sid, dva, 2 } };
+	dart->batch->op[2] = (struct x1n1_op){ .op = X1N1_DART_ENABLE,
+					       .arg = { sid } };
+	dart->batch->op[3] = (struct x1n1_op){ .op = X1N1_DART_MAP,
+					       .arg = { sid, dva, pa,
+							DART_X1N1_PAGE_SIZE, 3 } };
+	ret = x1n1_ring(dart, X1N1_MMIO_DART_DB + 8 * dart->dart_id);
+	dev_info(dart->dev, "selftest: attach L1+L2+enable+map status %d done %u (dva %#llx pa %pa)\n",
+		 ret, dart->batch->done, dva, &pa);
+
+	dart->batch->count = 1;
+	dart->batch->op[0] = (struct x1n1_op){ .op = X1N1_DART_UNMAP,
+					       .arg = { sid, dva, DART_X1N1_PAGE_SIZE } };
+	ret = x1n1_ring(dart, X1N1_MMIO_DART_DB + 8 * dart->dart_id);
+	dev_info(dart->dev, "selftest: unmap status %d done %u\n",
+		 ret, dart->batch->done);
+	spin_unlock_irqrestore(&dart->batch_lock, flags);
+
+	free_page((unsigned long)page);
+}
+
 static int apple_dart_x1n1_attach_dev(struct iommu_domain *domain,
 				      struct device *dev,
 				      struct iommu_domain *old)
@@ -201,9 +260,10 @@ static int apple_dart_x1n1_attach_dev(struct iommu_domain *domain,
 	}
 	dom->dart = dart;
 
-	/* For each stream: attach a level-2 table (the 32-bit aperture this
-	 * driver advertises needs no level-0/1 root) and enable translation.
-	 * x1n1 owns the tables. Build the ops in one batch. */
+	/* For each stream: install the level-1 root table and enable translation.
+	 * The level-2 leaf tables are attached lazily per 32 MiB window in
+	 * map_pages (installing a level-2 table needs its level-1 parent
+	 * present). x1n1 owns the tables. Build the ops in one batch. */
 	spin_lock_irqsave(&dart->batch_lock, flags);
 	n = 0;
 	for_each_set_bit(sid, master->sids, dart->num_streams) {
@@ -213,7 +273,7 @@ static int apple_dart_x1n1_attach_dev(struct iommu_domain *domain,
 			break;
 		dart->batch->op[n++] = (struct x1n1_op){
 			.op = X1N1_DART_ATTACH,
-			.arg = { sid, 0, 2 },
+			.arg = { sid, 0, 1 },
 		};
 		dart->batch->op[n++] = (struct x1n1_op){
 			.op = X1N1_DART_ENABLE,
@@ -246,11 +306,46 @@ static int apple_dart_x1n1_map_pages(struct iommu_domain *domain,
 		return -ENODEV;
 
 	/*
-	 * Forward the range in per-stream chunks that each stay inside one
-	 * aligned 32 MiB block, matching x1n1's contiguous-map constraint.
-	 * Pack as many MAP ops as fit into a batch, then ring once.
+	 * A MAP needs the block's level-2 leaf table installed first, so first
+	 * attach any not-yet-attached (sid, 32 MiB block) window, then map the
+	 * range in per-stream chunks that each stay inside one aligned 32 MiB
+	 * block (x1n1's contiguous-map constraint), packing MAP ops into a batch
+	 * and ringing once per batch. Both phases hold batch_lock and reuse the
+	 * one batch buffer, so the attaches are fully rung before any MAP ops
+	 * are accumulated in it.
 	 */
 	spin_lock_irqsave(&dart->batch_lock, flags);
+
+	/* Phase 1: attach missing level-2 tables (one op per ring). */
+	for (u64 pos = 0; pos < total; ) {
+		u64 cur_iova = iova + pos;
+		u64 block = cur_iova >> DART_X1N1_BLOCK_SHIFT;
+		size_t block_left = DART_X1N1_BLOCK_SIZE -
+				    (cur_iova & (DART_X1N1_BLOCK_SIZE - 1));
+		unsigned int sid;
+
+		for_each_set_bit(sid, dom->sids, dart->num_streams) {
+			unsigned long key = ((unsigned long)sid << 40) | block;
+
+			if (xa_load(&dom->l2_attached, key))
+				continue;
+			dart->batch->count = 1;
+			dart->batch->op[0] = (struct x1n1_op){
+				.op = X1N1_DART_ATTACH,
+				.arg = { sid, cur_iova, 2 },
+			};
+			if (x1n1_ring(dart, X1N1_MMIO_DART_DB + 8 * dart->dart_id)) {
+				*mapped = 0;
+				spin_unlock_irqrestore(&dart->batch_lock, flags);
+				return -ENOMEM;
+			}
+			xa_store(&dom->l2_attached, key, xa_mk_value(1),
+				 GFP_ATOMIC);
+		}
+		pos += min_t(size_t, total - pos, block_left);
+	}
+
+	/* Phase 2: map the range. */
 	while (done < total) {
 		u32 n = 0;
 		int ret;
@@ -363,7 +458,10 @@ static phys_addr_t apple_dart_x1n1_iova_to_phys(struct iommu_domain *domain,
 
 static void apple_dart_x1n1_domain_free(struct iommu_domain *domain)
 {
-	kfree(to_x1n1_domain(domain));
+	struct apple_dart_x1n1_domain *dom = to_x1n1_domain(domain);
+
+	xa_destroy(&dom->l2_attached);
+	kfree(dom);
 }
 
 static struct iommu_domain *
@@ -376,6 +474,7 @@ apple_dart_x1n1_domain_alloc_paging(struct device *dev)
 		return NULL;
 
 	mutex_init(&dom->lock);
+	xa_init(&dom->l2_attached);
 	dom->domain.pgsize_bitmap = DART_X1N1_PAGE_SIZE;
 	dom->domain.geometry.aperture_start = 0;
 	dom->domain.geometry.aperture_end = DART_X1N1_APERTURE_END;
@@ -534,6 +633,9 @@ static int apple_dart_x1n1_probe(struct platform_device *pdev)
 
 	dev_info(dev, "x1n1 paravirt DART id %u, %u streams (sptm2mmio)\n",
 		 dart->dart_id, dart->num_streams);
+
+	if (of_property_read_bool(dev->of_node, "apple,x1n1-selftest"))
+		apple_dart_x1n1_selftest(dart);
 	return 0;
 
 err_sysfs:
