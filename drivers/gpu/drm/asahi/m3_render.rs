@@ -26,6 +26,7 @@ pub(crate) struct Render {
     // All active mappings above must drop before their ASID binding.
     _binding:mmu::VmBind,
     stats: Region, sequence_bytes: KVec<u8>, tiler_bytes: KVec<u8>, fragment_bytes: KVec<u8>,
+    last_progress_ns:i64,
     draw:u32, heads:[u16;2], cached_views:KVec<CachedViews>,
     slot:usize, batch_count:usize, early_count:u32,
     checkpoint:(u32,[u16;2],usize,usize,u32),
@@ -80,7 +81,7 @@ impl Render {
         tiler_bytes.resize(tiler::SIZE,0u8,GFP_KERNEL)?;
         let mut fragment_bytes=KVec::new();
         fragment_bytes.resize(fragment::SIZE,0u8,GFP_KERNEL)?;
-        let mut job=Self{passes,init_bm,stats,sequence_bytes,tiler_bytes,fragment_bytes,objects,_aliases:aliases,_binding:binding,draw:0,heads:[0;2],cached_views:KVec::new(),slot:0,batch_count:0,early_count:0,checkpoint:(0,[0;2],0,0,0)};
+        let mut job=Self{passes,init_bm,stats,sequence_bytes,tiler_bytes,fragment_bytes,objects,_aliases:aliases,_binding:binding,last_progress_ns:0,draw:0,heads:[0;2],cached_views:KVec::new(),slot:0,batch_count:0,early_count:0,checkpoint:(0,[0;2],0,0,0)};
         // Lists and the matching manager are built before InitBM publication.
         job.initialize_parameter_buffer()?;
         for pool in &UMA_POOLS { pool.initialize(&mut job.objects)?; }
@@ -503,12 +504,16 @@ impl Render {
     /// idle engines and consumed firmware pipes have been checked by Runtime.
     /// The existing TA/fragment descriptors request completion stamp flushes.
     pub(crate) fn progress(&mut self,dev:&driver::AsahiDevice)->Result {
-        // Normal desktops need progress summaries, not a printk and eight
-        // uncached reads per pass. Diagnostic boots retain every retirement.
-        if self.draw != 1 && self.draw % 128 != 0
+        // Keep summaries sparse at high throughput, but emit at least once a
+        // second while completed batches advance. Batched draw counts can skip
+        // multiples of 128; a count-only gate can starve the watchdog observer.
+        let now = <kernel::time::Monotonic as kernel::time::ClockSource>::ktime_get();
+        if self.last_progress_ns != 0 && now - self.last_progress_ns < 1_000_000_000
+            && self.draw != 1 && self.draw % 128 != 0
             && !crate::debug::debug_enabled(crate::debug::DebugFlags::SubmitTiming) {
             return Ok(());
         }
+        self.last_progress_ns = now;
         dev_info!(dev.as_ref(),"M3_RETIRED draw={} ta={:x}/{:x} fragment={:x}/{:x} queues={}/{} read={}/{} idle=1 cache_flush=1 events=2 faults=0 ordered_barrier=1 batch={} early={}\n",
             self.draw,self.objects[s::TA_STAMP].read_u32(0)?,self.objects[s::TA_FW_STAMP].read_u32(0)?,
             self.objects[s::FRAGMENT_STAMP].read_u32(0)?,self.objects[s::FRAGMENT_FW_STAMP].read_u32(0)?,

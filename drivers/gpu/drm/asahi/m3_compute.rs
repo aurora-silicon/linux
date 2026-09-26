@@ -29,6 +29,7 @@ pub(crate) struct Compute {
     _binding: mmu::VmBind,
     stats: Region,
     sequence: u32,
+    last_progress_ns: i64,
     head: u16,
     cached_views: KVec<CachedViews>,
     slot: usize,
@@ -94,7 +95,7 @@ impl Compute {
         // completion of WC TTBAT stores before broadcasting invalidation.
         crate::mem::sync();crate::mem::tlbi_all();crate::mem::sync();
         unsafe {core::arch::asm!("isb",options(nostack,preserves_flags))};
-        Ok(Self {_client_command:client_command.ok_or(EINVAL)?,objects,command_bytes,sequence_bytes,_binding:binding,stats,sequence:1,head:1,cached_views:KVec::new(),slot:0,batch_count:1,checkpoint:(0,0,0)})
+        Ok(Self {_client_command:client_command.ok_or(EINVAL)?,objects,command_bytes,sequence_bytes,_binding:binding,stats,last_progress_ns:0,sequence:1,head:1,cached_views:KVec::new(),slot:0,batch_count:1,checkpoint:(0,0,0)})
     }
     fn encode_command(objects: &mut [Buffer], bytes: &mut [u8], context: u32,
         control: crate::g16_compute::Control, sequence: u32, slot: usize) -> Result {
@@ -279,10 +280,15 @@ impl Compute {
     pub(crate) fn head(&self) -> u16 { self.head }
     pub(crate) fn first(&self) -> bool { self.sequence == self.batch_count as u32 }
     pub(crate) fn progress(&mut self, dev: &driver::AsahiDevice) -> Result {
-        if self.sequence != 1 && self.sequence % 128 != 0
+        // Report real completions by elapsed time as well as sequence count;
+        // batches need not land on a multiple of 128.
+        let now = <kernel::time::Monotonic as kernel::time::ClockSource>::ktime_get();
+        if self.last_progress_ns != 0 && now - self.last_progress_ns < 1_000_000_000
+            && self.sequence != 1 && self.sequence % 128 != 0
             && !crate::debug::debug_enabled(crate::debug::DebugFlags::SubmitTiming) {
             return Ok(());
         }
+        self.last_progress_ns = now;
         dev_info!(dev.as_ref(), "M3_COMPUTE_RETIRED sequence={} context={} stamp={:#x}/{:#x} queue={}/{} head={} idle=1 cache_flush=1\n",
             self.sequence, self._binding.slot(), self.objects[storage::STAMP].read_u32(0)?,
             self.objects[storage::FW_STAMP].read_u32(0)?, self.objects[storage::QUEUE_STATE].read_u32(queue::DONE)?,
