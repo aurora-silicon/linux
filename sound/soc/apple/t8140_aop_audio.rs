@@ -115,6 +115,10 @@ const AUDIO_RET_BUSY: u32 = 0xe00002d5;
 const SPKR_POWER_STATE_PW0: u32 = from_fourcc(b"pw0 ");
 const SPKR_POWER_STATE_PWRD: u32 = from_fourcc(b"pwrd");
 
+/// Leaf power-up retries while the firmware raises the fabric (see `PowerDomain::get`).
+const PD_GET_ATTEMPTS: u32 = 60;
+const PD_GET_RETRY_MS: i64 = 10;
+
 /// The low-power microphone stream: 16 kHz stereo S32 in a 512 KiB ring
 /// reported every 3,200 frames.
 const LPAI_RATE: u32 = 16000;
@@ -325,15 +329,39 @@ impl PowerDomain {
     }
 
     /// Takes a runtime-PM reference and waits for the domain to be on.
+    ///
+    /// The firmware brings the audio fabric back asynchronously after the
+    /// service's `pw0 ` request, so the first leaf request under it can miss
+    /// the PMGR driver's poll window with the parent still coming up. A
+    /// failed resume leaves the virtual domain device in the runtime-PM error
+    /// state, where every later request fails with EINVAL; clear that state
+    /// and retry a bounded number of times before giving up.
     fn get(&self) -> Result<()> {
-        // SAFETY: the domain device stays attached for the lifetime of `self`.
-        let rc = unsafe { bindings::pm_runtime_get_sync(self.dev.as_ptr()) };
-        if rc < 0 {
+        let mut rc = 0;
+        for attempt in 0..PD_GET_ATTEMPTS {
+            // SAFETY: the domain device stays attached for the lifetime of `self`.
+            rc = unsafe { bindings::pm_runtime_get_sync(self.dev.as_ptr()) };
+            if rc >= 0 {
+                return Ok(());
+            }
             // SAFETY: as above; a failed resume still took the usage count.
             unsafe { bindings::pm_runtime_put_noidle(self.dev.as_ptr()) };
-            return Err(Error::from_errno(rc));
+            // SAFETY: as above; the device is suspended from runtime PM's point
+            // of view once the failed resume has been undone. Clearing the
+            // error state also lets a later open try again after a final
+            // failure here.
+            unsafe {
+                bindings::__pm_runtime_set_status(
+                    self.dev.as_ptr(),
+                    bindings::rpm_status_RPM_SUSPENDED as u32,
+                )
+            };
+            if Error::from_errno(rc) != ETIMEDOUT || attempt + 1 == PD_GET_ATTEMPTS {
+                break;
+            }
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(PD_GET_RETRY_MS));
         }
-        Ok(())
+        Err(Error::from_errno(rc))
     }
 
     /// Drops a reference taken by [`Self::get`].
