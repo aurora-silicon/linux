@@ -166,6 +166,399 @@
 &smc_hwmon {
 	/* interim J700 CPU thermal policy over the CPU die channels */
 	apple,cpu-thermal-policy;
+
+	/*
+	 * Reporting-only channels. They follow the six CPU die temperatures
+	 * in t8140.dtsi, which the CPU thermal policy samples by position.
+	 * Every key below is in the J700 SMC's key table as a read-only
+	 * float, reads 10-99 C and moves between samples. The names follow
+	 * the SMC key groups and are not otherwise verified.
+	 */
+	temperature-TH0p {
+		apple,key-id = "TH0p";
+		label = "Storage (NAND)";
+	};
+
+	temperature-TW0p {
+		apple,key-id = "TW0p";
+		label = "Wi-Fi Module";
+	};
+
+	temperature-TUCp {
+		apple,key-id = "TUCp";
+		label = "USB-C Port";
+	};
+
+	temperature-TaTp {
+		apple,key-id = "TaTp";
+		label = "Ambient";
+	};
+
+	temperature-TCMz {
+		apple,key-id = "TCMz";
+		label = "Charger";
+	};
+
+	temperature-Ts0A {
+		apple,key-id = "Ts0A";
+		label = "Chassis 1";
+	};
+
+	temperature-Ts0I {
+		apple,key-id = "Ts0I";
+		label = "Chassis 2";
+	};
+
+	temperature-Ts0M {
+		apple,key-id = "Ts0M";
+		label = "Chassis 3";
+	};
+
+	/* The remaining live temperature keys; placement unknown */
+	temperature-TBLp {
+		apple,key-id = "TBLp";
+		label = "SMC TBLp";
+	};
+
+	temperature-TCMb {
+		apple,key-id = "TCMb";
+		label = "SMC TCMb";
+	};
+
+	temperature-TPD0 {
+		apple,key-id = "TPD0";
+		label = "SMC TPD0";
+	};
+
+	temperature-TPD1 {
+		apple,key-id = "TPD1";
+		label = "SMC TPD1";
+	};
+
+	temperature-TPD2 {
+		apple,key-id = "TPD2";
+		label = "SMC TPD2";
+	};
+
+	temperature-TPD3 {
+		apple,key-id = "TPD3";
+		label = "SMC TPD3";
+	};
+
+	temperature-TPD4 {
+		apple,key-id = "TPD4";
+		label = "SMC TPD4";
+	};
+
+	temperature-TPD5 {
+		apple,key-id = "TPD5";
+		label = "SMC TPD5";
+	};
+
+	temperature-TPD6 {
+		apple,key-id = "TPD6";
+		label = "SMC TPD6";
+	};
+
+	temperature-TR5p {
+		apple,key-id = "TR5p";
+		label = "SMC TR5p";
+	};
+
+	temperature-TRD0 {
+		apple,key-id = "TRD0";
+		label = "SMC TRD0";
+	};
+
+	temperature-TRD1 {
+		apple,key-id = "TRD1";
+		label = "SMC TRD1";
+	};
+
+	temperature-TRD2 {
+		apple,key-id = "TRD2";
+		label = "SMC TRD2";
+	};
+
+	temperature-TRD3 {
+		apple,key-id = "TRD3";
+		label = "SMC TRD3";
+	};
+
+	temperature-TS0p {
+		apple,key-id = "TS0p";
+		label = "SMC TS0p";
+	};
+
+	temperature-TS1p {
+		apple,key-id = "TS1p";
+		label = "SMC TS1p";
+	};
+
+	temperature-TTSp {
+		apple,key-id = "TTSp";
+		label = "SMC TTSp";
+	};
+
+	temperature-TVA0 {
+		apple,key-id = "TVA0";
+		label = "SMC TVA0";
+	};
+
+	temperature-TVA1 {
+		apple,key-id = "TVA1";
+		label = "SMC TVA1";
+	};
+
+	temperature-TVD0 {
+		apple,key-id = "TVD0";
+		label = "SMC TVD0";
+	};
+
+	temperature-TVMR {
+		apple,key-id = "TVMR";
+		label = "SMC TVMR";
+	};
+
+	temperature-TVS0 {
+		apple,key-id = "TVS0";
+		label = "SMC TVS0";
+	};
+
+	temperature-TVS1 {
+		apple,key-id = "TVS1";
+		label = "SMC TVS1";
+	};
+
+	temperature-TVS3 {
+		apple,key-id = "TVS3";
+		label = "SMC TVS3";
+	};
+
+	temperature-TVS4 {
+		apple,key-id = "TVS4";
+		label = "SMC TVS4";
+	};
+
+	temperature-TVmS {
+		apple,key-id = "TVmS";
+		label = "SMC TVmS";
+	};
+
+	temperature-Te04 {
+		apple,key-id = "Te04";
+		label = "SMC Te04";
+	};
+
+	temperature-Te06 {
+		apple,key-id = "Te06";
+		label = "SMC Te06";
+	};
+
+	temperature-Te0R {
+		apple,key-id = "Te0R";
+		label = "SMC Te0R";
+	};
+
+	temperature-Te0T {
+		apple,key-id = "Te0T";
+		label = "SMC Te0T";
+	};
+
+	temperature-Tex0 {
+		apple,key-id = "Tex0";
+		label = "SMC Tex0";
+	};
+
+	temperature-Tex1 {
+		apple,key-id = "Tex1";
+		label = "SMC Tex1";
+	};
+
+	temperature-Tex2 {
+		apple,key-id = "Tex2";
+		label = "SMC Tex2";
+	};
+
+	temperature-Tex3 {
+		apple,key-id = "Tex3";
+		label = "SMC Tex3";
+	};
+
+	temperature-Tp00 {
+		apple,key-id = "Tp00";
+		label = "SMC Tp00";
+	};
+
+	temperature-Tp02 {
+		apple,key-id = "Tp02";
+		label = "SMC Tp02";
+	};
+
+	temperature-Tp04 {
+		apple,key-id = "Tp04";
+		label = "SMC Tp04";
+	};
+
+	temperature-Tp06 {
+		apple,key-id = "Tp06";
+		label = "SMC Tp06";
+	};
+
+	temperature-Tp08 {
+		apple,key-id = "Tp08";
+		label = "SMC Tp08";
+	};
+
+	temperature-Tp0A {
+		apple,key-id = "Tp0A";
+		label = "SMC Tp0A";
+	};
+
+	temperature-Tp0C {
+		apple,key-id = "Tp0C";
+		label = "SMC Tp0C";
+	};
+
+	temperature-Tp0E {
+		apple,key-id = "Tp0E";
+		label = "SMC Tp0E";
+	};
+
+	temperature-Tp0l {
+		apple,key-id = "Tp0l";
+		label = "SMC Tp0l";
+	};
+
+	temperature-Tp0m {
+		apple,key-id = "Tp0m";
+		label = "SMC Tp0m";
+	};
+
+	temperature-Tp0n {
+		apple,key-id = "Tp0n";
+		label = "SMC Tp0n";
+	};
+
+	temperature-Tp0o {
+		apple,key-id = "Tp0o";
+		label = "SMC Tp0o";
+	};
+
+	temperature-Tp0q {
+		apple,key-id = "Tp0q";
+		label = "SMC Tp0q";
+	};
+
+	temperature-Tp0t {
+		apple,key-id = "Tp0t";
+		label = "SMC Tp0t";
+	};
+
+	temperature-Tpx0 {
+		apple,key-id = "Tpx0";
+		label = "SMC Tpx0";
+	};
+
+	temperature-Tpx1 {
+		apple,key-id = "Tpx1";
+		label = "SMC Tpx1";
+	};
+
+	temperature-Tpx2 {
+		apple,key-id = "Tpx2";
+		label = "SMC Tpx2";
+	};
+
+	temperature-Tpx3 {
+		apple,key-id = "Tpx3";
+		label = "SMC Tpx3";
+	};
+
+	temperature-Ts00 {
+		apple,key-id = "Ts00";
+		label = "SMC Ts00";
+	};
+
+	temperature-Ts01 {
+		apple,key-id = "Ts01";
+		label = "SMC Ts01";
+	};
+
+	temperature-Ts02 {
+		apple,key-id = "Ts02";
+		label = "SMC Ts02";
+	};
+
+	temperature-Ts04 {
+		apple,key-id = "Ts04";
+		label = "SMC Ts04";
+	};
+
+	temperature-Ts05 {
+		apple,key-id = "Ts05";
+		label = "SMC Ts05";
+	};
+
+	temperature-Ts06 {
+		apple,key-id = "Ts06";
+		label = "SMC Ts06";
+	};
+
+	temperature-Ts08 {
+		apple,key-id = "Ts08";
+		label = "SMC Ts08";
+	};
+
+	temperature-Ts09 {
+		apple,key-id = "Ts09";
+		label = "SMC Ts09";
+	};
+
+	temperature-Ts0C {
+		apple,key-id = "Ts0C";
+		label = "SMC Ts0C";
+	};
+
+	temperature-Ts0D {
+		apple,key-id = "Ts0D";
+		label = "SMC Ts0D";
+	};
+
+	temperature-Ts0E {
+		apple,key-id = "Ts0E";
+		label = "SMC Ts0E";
+	};
+
+	temperature-Ts0G {
+		apple,key-id = "Ts0G";
+		label = "SMC Ts0G";
+	};
+
+	temperature-Ts0H {
+		apple,key-id = "Ts0H";
+		label = "SMC Ts0H";
+	};
+
+	temperature-Ts0K {
+		apple,key-id = "Ts0K";
+		label = "SMC Ts0K";
+	};
+
+	temperature-Ts0L {
+		apple,key-id = "Ts0L";
+		label = "SMC Ts0L";
+	};
+
+	temperature-Tsx0 {
+		apple,key-id = "Tsx0";
+		label = "SMC Tsx0";
+	};
+
+	temperature-Tsx1 {
+		apple,key-id = "Tsx1";
+		label = "SMC Tsx1";
+	};
 };
 
 &smc_mbox {
