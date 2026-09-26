@@ -11,6 +11,7 @@
 
 #include "t6030.dtsi"
 #include "t603x-j514-j516.dtsi"
+#include "t603x-j514s-j516s-usb4.dtsi"
 
 / {
 	compatible = "apple,j516s", "apple,t6030", "apple,arm-platform";
