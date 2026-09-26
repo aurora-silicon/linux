@@ -335,6 +335,14 @@
 	};
 };
 
+&dwc3_0_dart_0 {
+	status = "okay";
+};
+
+&dwc3_0_dart_1 {
+	status = "okay";
+};
+
 &atcphy0 {
 	status = "okay";
 
