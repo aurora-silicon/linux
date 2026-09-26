@@ -29,7 +29,7 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
  * ATC PHY: start the pixel clock for a DP tunnel at DP link rate code @rate,
  * or stop it (@rate == 0). The PHY must be in Thunderbolt/USB4 mode.
  */
-int apple_atc_dp_tunnel_rate(struct phy *phy, u8 rate);
+int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate);
 
 /*
  * Display crossbar: take the connection of an already selected output down or
@@ -40,6 +40,7 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, u8 rate);
  */
 int apple_dpxbar_link_down(struct mux_control *mux);
 int apple_dpxbar_link_up(struct mux_control *mux);
+int apple_dpxbar_tunnel_select_source(struct mux_control *mux, int state);
 
 /*
  * The M2 Pro and M2 Max laptops. Their shared device tree routes the display

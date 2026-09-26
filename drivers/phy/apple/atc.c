@@ -652,7 +652,9 @@ struct atcphy_hw {
  * @tunnel_attempted: A T602X tunnel clock setup has been attempted
  * @tunnel_saved: T602X PHY registers have been saved for tunnel teardown
  * @tunnel_saved_regs: Original values of the T602X tunnel clock registers
- * @tunnel_rate: DP link rate code the tunnel pixel clock is set up for
+ * @tunnel_rate: DP link rate code the t8103 tunnel pixel clock is set up for
+ * @tunnel_users: T602X DP IN adapters (BIT(dpin)) whose tunnel pixel clock runs
+ * @tunnel_dpin_rate: DP link rate code each T602X DP IN adapter's clock runs at
  * @pipe_state: Backend the PIPE mux ("pipehandler") is routed to
  * @regs: Memory-mapped registers
  * @regs.core: Core registers
@@ -702,6 +704,8 @@ struct apple_atcphy {
 	bool tunnel_attempted, tunnel_saved;
 	u32 tunnel_saved_regs[12];
 	u8 tunnel_rate;
+	u8 tunnel_users;
+	u8 tunnel_dpin_rate[2];
 
 	struct {
 		void __iomem *core;
@@ -2184,7 +2188,8 @@ struct atc_tunnel_saved_reg {
 static const struct atc_tunnel_saved_reg atc_tunnel_regs[] = {
 	{ ACIOPHY_CFG0, 0x0003ffff },
 	{ ACIOPHY_SLEEP_CTRL, 0x00000fff },
-	{ ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, 0x0000207c },
+	{ ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+	  0x0000207c | DPTX_PCLK2_SELECT | DPTX_PCLK2_ENABLE },
 	{ AUSPLL_FREQ_CFG, 0x00000003 },
 	{ AUSPLL_FREQ_DESC_A, 0xffffffff },
 	{ AUSPLL_FREQ_DESC_B, 0x0fffffff },
@@ -2217,6 +2222,9 @@ static void atc_tunnel_restore(struct apple_atcphy *atcphy)
 	int i, ret;
 
 	lockdep_assert_held(&atcphy->lock);
+	atcphy->tunnel_users = 0;
+	atcphy->tunnel_dpin_rate[0] = 0;
+	atcphy->tunnel_dpin_rate[1] = 0;
 	if (!atcphy->tunnel_saved)
 		return;
 	/*
@@ -2224,7 +2232,8 @@ static void atc_tunnel_restore(struct apple_atcphy *atcphy)
 	 * with ACIOPHY_AUSPLL_LOCK still set. Clear the three drivers, then
 	 * power the PLL down with APB command 3, after which the lock drops.
 	 */
-	core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_ENABLE);
+	core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+		     DPTX_PCLK1_ENABLE | DPTX_PCLK2_ENABLE);
 	core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, BIT(2));
 	core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, BIT(4));
 	core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, BIT(6));
@@ -2253,35 +2262,36 @@ static void atc_tunnel_restore(struct apple_atcphy *atcphy)
 	atcphy->tunnel_rate = 0;
 }
 
-static int atc_tunnel_start_t602x(struct apple_atcphy *atcphy, u8 rate)
+static int atc_tunnel_rate_selector(u8 rate)
 {
-	u32 selector, value, gates, outputs, command, status;
+	switch (rate) {
+	case 0x06:
+		return 4;
+	case 0x0a:
+		return 3;
+	case 0x14:
+		return 1;
+	case 0x1e:
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+/*
+ * Bring the T602X tunnel PLL up with its fixed descriptor. The rate is not
+ * part of it: each DP IN adapter selects its own rate on PCLK1 or PCLK2 in
+ * apple_atc_dp_tunnel_rate().
+ */
+static int atc_tunnel_start_t602x(struct apple_atcphy *atcphy)
+{
+	u32 value, gates, outputs, command, status;
 	unsigned int i;
 	int ret;
 
 	lockdep_assert_held(&atcphy->lock);
-	switch (rate) {
-	case 0x06:
-		selector = 4;
-		break;
-	case 0x0a:
-		selector = 3;
-		break;
-	case 0x14:
-		selector = 1;
-		break;
-	case 0x1e:
-		selector = 0;
-		break;
-	default:
-		return -EINVAL;
-	}
-	if (atcphy->tunnel_saved) {
-		if (atcphy->tunnel_rate == rate)
-			return 0;
-		/* A retrain may change rate without first requesting rate zero. */
-		atc_tunnel_restore(atcphy);
-	}
+	if (atcphy->tunnel_saved)
+		return 0;
 	if (atcphy->tunnel_attempted)
 		return -EALREADY;
 	/* Read every guard before deciding, so a refusal records the whole state. */
@@ -2348,9 +2358,6 @@ static int atc_tunnel_start_t602x(struct apple_atcphy *atcphy, u8 rate)
 	udelay(2);
 	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, BIT(2));
 	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, BIT(3));
-	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_ENABLE);
-	core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_SELECT,
-		    FIELD_PREP(DPTX_PCLK1_SELECT, selector));
 
 	/* Program the fixed tunnel clock descriptor. */
 	core_clear32(atcphy, AUSPLL_FREQ_CFG, AUSPLL_FREQ_REFCLK);
@@ -2376,11 +2383,104 @@ static int atc_tunnel_start_t602x(struct apple_atcphy *atcphy, u8 rate)
 	ret = atc_tunnel_command(atcphy, 0x2000);
 	if (ret)
 		goto restore;
-	atcphy->tunnel_rate = rate;
 	return 0;
 restore:
 	atc_tunnel_restore(atcphy);
 	return ret;
+}
+
+/* Stop one T602X DP IN adapter's pixel clock; atcphy->lock held. */
+static void atc_tunnel_stop_t602x(struct apple_atcphy *atcphy, unsigned int dpin)
+{
+	u8 user = BIT(dpin);
+
+	lockdep_assert_held(&atcphy->lock);
+	if (atcphy->tunnel_users & user) {
+		if (dpin == 0) {
+			/*
+			 * DPIN1 still needs the PCLK1 gate. On J414s, clearing
+			 * it stopped DPIN1's video packets even though PCLK2
+			 * remained enabled and locked.
+			 */
+			if (!(atcphy->tunnel_users & BIT(1)))
+				core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+					     DPTX_PCLK1_ENABLE);
+		} else {
+			core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+				     DPTX_PCLK2_ENABLE);
+			if (!(atcphy->tunnel_users & BIT(0)))
+				core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+					     DPTX_PCLK1_ENABLE);
+		}
+	}
+	atcphy->tunnel_users &= ~user;
+	atcphy->tunnel_dpin_rate[dpin] = 0;
+	/*
+	 * Gate the PLL outputs but keep the descriptor across DPMS: the PLL
+	 * keeps its lock with its outputs gated, and the next start re-enables
+	 * them. A mode change still powers it down in atc_tunnel_restore().
+	 */
+	if (!atcphy->tunnel_users && atcphy->tunnel_saved)
+		core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, 0x54);
+}
+
+/* Run one T602X DP IN adapter's pixel clock at @rate; atcphy->lock held. */
+static int atc_tunnel_set_t602x(struct apple_atcphy *atcphy, unsigned int dpin,
+				u8 rate)
+{
+	int selector, ret = 0;
+	u32 value;
+
+	lockdep_assert_held(&atcphy->lock);
+	selector = atc_tunnel_rate_selector(rate);
+	if (selector < 0)
+		return selector;
+	if (atcphy->tunnel_dpin_rate[dpin] == rate)
+		return 0;
+	if (!atcphy->tunnel_users) {
+		if (!atcphy->tunnel_saved) {
+			ret = atc_tunnel_start_t602x(atcphy);
+		} else {
+			/*
+			 * The PLL retains lock after its outputs are gated. Keep
+			 * its descriptor until the USB4 PHY changes mode instead of
+			 * reprogramming a still-locked PLL on every DPMS wake.
+			 */
+			core_set32(atcphy, AUSPLL_CLKOUT_MASTER, 0x54);
+			ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_DP_PCLK_STAT,
+						 value, value & ACIOPHY_AUSPLL_LOCK,
+						 10, 10000);
+			if (ret)
+				core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, 0x54);
+		}
+		if (ret)
+			return ret;
+	}
+	if (dpin == 0) {
+		core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+			    DPTX_PCLK1_SELECT, FIELD_PREP(DPTX_PCLK1_SELECT, selector));
+		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+			   DPTX_PCLK1_ENABLE);
+	} else {
+		/*
+		 * PCLK2 alone does not sustain a DPIN1 stream on J414s. Keep
+		 * PCLK1 gated on as a shared prerequisite; if DPIN0 is inactive,
+		 * select DPIN1's rate for that clock as well.
+		 */
+		if (!(atcphy->tunnel_users & BIT(0)))
+			core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+				    DPTX_PCLK1_SELECT,
+				    FIELD_PREP(DPTX_PCLK1_SELECT, selector));
+		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+			   DPTX_PCLK1_ENABLE);
+		core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+			    DPTX_PCLK2_SELECT, FIELD_PREP(DPTX_PCLK2_SELECT, selector));
+		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+			   DPTX_PCLK2_ENABLE);
+	}
+	atcphy->tunnel_dpin_rate[dpin] = rate;
+	atcphy->tunnel_users |= BIT(dpin);
+	return 0;
 }
 
 static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
@@ -2660,8 +2760,8 @@ static const struct phy_ops apple_atc_dp_phy_ops = {
 };
 
 /*
- * Called by appledrm when DCP sets the link rate of a DPTX that feeds a
- * Thunderbolt DP IN adapter (rate is the DP link rate code, 0 = stop).
+ * Called by appledrm when DCP sets the link rate of a DPTX that feeds
+ * Thunderbolt DP IN adapter @dpin (rate is the DP link rate code, 0 = stop).
  */
 static bool apple_atc_is_typec_core(u64 base)
 {
@@ -2669,12 +2769,12 @@ static bool apple_atc_is_typec_core(u64 base)
 	       base == 0xf03000000ULL;
 }
 
-int apple_atc_dp_tunnel_rate(struct phy *phy, u8 rate)
+int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 {
 	struct apple_atcphy *atcphy;
 	int ret;
 
-	if (!phy || phy->ops != &apple_atc_dp_phy_ops)
+	if (!phy || phy->ops != &apple_atc_dp_phy_ops || dpin > 1)
 		return -EINVAL;
 	atcphy = phy_get_drvdata(phy);
 	/* Keep each supported SoC on its qualified clock sequence. */
@@ -2687,15 +2787,17 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, u8 rate)
 		return -EINVAL;
 	guard(mutex)(&atcphy->lock);
 	if (!rate) {
-		atc_tunnel_stop_t8103(atcphy);
-		atc_tunnel_restore(atcphy);
+		if (of_machine_is_compatible("apple,t8103"))
+			atc_tunnel_stop_t8103(atcphy);
+		else
+			atc_tunnel_stop_t602x(atcphy, dpin);
 		return 0;
 	}
 	if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 && atcphy->mode != APPLE_ATCPHY_MODE_TBT)
 		return -EBUSY;
 	ret = of_machine_is_compatible("apple,t8103") ?
 		atc_tunnel_start_t8103(atcphy, rate) :
-		atc_tunnel_start_t602x(atcphy, rate);
+		atc_tunnel_set_t602x(atcphy, dpin, rate);
 	dev_dbg(atcphy->dev, "DP tunnel clock rate 0x%x: %d (TX_DP_CTRL0=%08x PCLK_STAT=%08x)\n",
 		rate, ret, readl(atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0),
 		readl(atcphy->regs.core + ACIOPHY_DP_PCLK_STAT));

@@ -17,6 +17,7 @@
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
+#include <linux/soc/apple/dp-tunnel.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -423,10 +424,10 @@ static int apple_probe_per_dcp(struct device *dev,
 }
 
 /*
- * Create one connector per physical Type-C port and attach it to every
- * pipeline that can drive it.  Keeping the connector tied to the port rather
- * than to a pipeline is what gives userspace a stable name to hang its
- * per-monitor configuration on.
+ * Create a connector per physical Type-C port and attach it to every
+ * pipeline that can drive it. The M2 Pro/Max laptops append a second
+ * connector per port for a dock's second DP tunnel, preserving primary
+ * connector names.
  */
 static int apple_probe_typec_ports(struct drm_device *drm,
 				   struct platform_device **dcp,
@@ -435,9 +436,15 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 	unsigned int idx, nr_ports = dcp_typec_nr_ports();
 	int i, ret;
 
-	for (idx = 0; idx < nr_ports; idx++) {
+	/* Keep the existing physical-port connector numbers stable. On the
+	 * M2 Pro/Max laptops, append one more connector per port for a second
+	 * USB4 DP tunnel.
+	 */
+	for (idx = 0; idx < nr_ports * (apple_dp_tunnel_t602x() ? 2 : 1); idx++) {
 		struct apple_connector *connector;
 		struct apple_encoder *enc;
+		unsigned int port_idx = idx % nr_ports;
+		bool secondary = idx >= nr_ports;
 		u32 mask = 0;
 
 		connector = kzalloc_obj(*connector);
@@ -466,13 +473,13 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
 
 		for (i = 0; i < num_dcp; i++) {
-			if (dcp_typec_port_has_candidate(idx, dcp[i]))
+			if (dcp_typec_port_has_candidate(port_idx, dcp[i]))
 				mask |= crtc_mask[i];
 		}
 
 		if (!mask) {
 			drm_warn(drm, "Type-C port %u has no display pipeline\n",
-				 idx);
+					 port_idx);
 			return -ENODEV;
 		}
 
@@ -496,7 +503,7 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		connector->port_encoder = &enc->base;
 		connector->candidate_crtcs = mask;
 
-		dcp_typec_port_set_connector(idx, connector);
+		dcp_typec_port_set_connector(port_idx, secondary, connector);
 	}
 
 	return 0;

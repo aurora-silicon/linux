@@ -318,6 +318,8 @@ struct apple_dcp {
 	bool tb_clock_ok;
 	/* CRTC powered off while the Type-C cable stays attached */
 	bool typec_crtc_off;
+	/* IOMFB reports its video interface ready after DPTX link training. */
+	struct completion typec_iomfb_hpd_ready;
 	struct delayed_work typec_reconnect_wq;
 	struct delayed_work typec_fabric_retrain_wq;
 	u32 typec_reconnect_tries;

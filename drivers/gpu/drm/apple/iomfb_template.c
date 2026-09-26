@@ -1063,6 +1063,8 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 		schedule_work(&dcp->vblank_wq);
 		return;
 	}
+	if (dcp_is_typec_output(dcp) && *connected && dcp->nr_modes)
+		complete_all(&dcp->typec_iomfb_hpd_ready);
 
 	action = dcp_mode_hotplug(&dcp->mode_state, !!(*connected),
 				  connector ? &connector->connected : NULL);
