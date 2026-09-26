@@ -562,6 +562,19 @@ impl UatPageTable {
         self.reserved_tables.as_ref().is_some_and(|tables| tables.contains(physical))
     }
 
+    /// Owned M3 user tables are written only by the host under the VM lock.
+    /// Their leaf values do not publish any separately owned CPU data. The
+    /// lock already provides acquire ordering between host writers/readers;
+    /// acquiring every uncached DMA PTE serializes the whole sparse-VA scan.
+    /// Firmware-owned/shared roots retain their existing acquire accesses.
+    fn leaf_read_order(&self) -> Ordering {
+        if self.ttb_owned && self.dma_tables.is_some() {
+            Ordering::Relaxed
+        } else {
+            Ordering::Acquire
+        }
+    }
+
     fn with_table<T>(
         &self,
         physical: PhysicalAddr,
@@ -822,10 +835,11 @@ impl UatPageTable {
             return Err(EINVAL);
         }
 
+        let read_order = self.leaf_read_order();
         let mut occupied = None;
         self.with_pages(iova_range.clone(), false, false, false, |iova, ptes| {
             for (index, pte) in ptes.iter().enumerate() {
-                let value = pte.load(Ordering::Acquire);
+                let value = pte.load(read_order);
                 if value != 0 && occupied.is_none() {
                     occupied = Some((iova + (index * UAT_PGSZ) as u64, value));
                 }
@@ -871,10 +885,11 @@ impl UatPageTable {
         let expected = (iova_range.end - iova_range.start) >> UAT_PGBIT;
         let mut visited = 0u64;
         let mut permitted = true;
+        let read_order = self.leaf_read_order();
         self.with_pages(iova_range, false, false, false, |_, ptes| {
             visited = visited.checked_add(ptes.len() as u64).ok_or(EOVERFLOW)?;
             for pte in ptes {
-                let value = pte.load(Ordering::Acquire);
+                let value = pte.load(read_order);
                 if value & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE
                     || !Prot::from_pte(value).allows_gpu(need_read, need_write)
                 {
@@ -981,10 +996,11 @@ impl UatPageTable {
         let expected = (iova_range.end - iova_range.start) >> UAT_PGBIT;
         let mut visited = 0u64;
         let mut occupied = None;
+        let read_order = self.leaf_read_order();
         self.with_pages(iova_range.clone(), false, false, false, |iova, ptes| {
             visited = visited.checked_add(ptes.len() as u64).ok_or(EOVERFLOW)?;
             for (idx, pte) in ptes.iter().enumerate() {
-                let value = pte.load(Ordering::Acquire);
+                let value = pte.load(read_order);
                 if value != 0 && occupied.is_none() {
                     occupied = Some((iova + (idx * UAT_PGSZ) as u64, value));
                 }
