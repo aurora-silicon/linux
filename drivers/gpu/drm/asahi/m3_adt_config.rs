@@ -251,6 +251,8 @@ pub(crate) struct Contents {
     /// The HwDataB slots whose IO maps the firmware gets read-only, as a bit mask. 0 (every IO
     /// map read-write) except in the T8122 start experiment.
     pub(crate) read_only_slots: u32,
+    /// The HwData object's placement and mapping (`Soc::hwdata_object`).
+    pub(crate) hwdata_object: Option<crate::m3_soc::HwDataObject>,
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
@@ -344,7 +346,7 @@ impl Contents {
             pstates.max_mhz
         );
         let read_only_slots = experiment.map_or(0, |e| e.read_only_slots());
-        Ok(Contents { images, pstates, iomaps, table, read_only_slots })
+        Ok(Contents { images, pstates, iomaps, table, read_only_slots, hwdata_object: soc.hwdata_object })
     }
 
     /// Check the contents before they are uploaded.

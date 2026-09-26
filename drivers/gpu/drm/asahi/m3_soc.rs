@@ -72,6 +72,17 @@ pub(crate) struct MtrMasks {
     pub(crate) alarm: u64,
 }
 
+/// Where the runtime places the HwData object (`m3_init_storage::HARDWARE_DATA`), when it is not
+/// the fixed allocation's address, and how the firmware maps it.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct HwDataObject {
+    /// Firmware VA of the object.
+    pub(crate) address: u64,
+    /// Map the object cacheable for the firmware (its atomic updates need cacheable memory)
+    /// instead of uncached.
+    pub(crate) cached: bool,
+}
+
 /// One firmware IO mapping of the runtime's InitData: HwDataB slot, physical address, total
 /// size, element size, writable.
 pub(crate) type IoMapping = (usize, u64, u32, u32, bool);
@@ -135,6 +146,8 @@ pub(crate) struct Soc {
     pub(crate) retire_mmio: u64,
     /// The MTR sensor masks, when they are not the hardware configuration's.
     pub(crate) mtr_masks: Option<MtrMasks>,
+    /// The HwData object's placement and mapping, when they are not the fixed allocation's.
+    pub(crate) hwdata_object: Option<HwDataObject>,
 }
 
 impl Soc {
@@ -263,6 +276,8 @@ pub(crate) static T6030: Soc = Soc {
     retire_mmio: 7,
     // The hardware configuration's fast-die mask; no alarm mask.
     mtr_masks: None,
+    // The fixed allocation, uncached.
+    hwdata_object: None,
 };
 
 /// T8122 (M3, G15G): one die, one cluster of ten core slots (eight or ten of them active).
@@ -339,4 +354,27 @@ pub(crate) static T8122: Soc = Soc {
         fast_die: 0x4248,
         alarm: 0x4b48,
     }),
+    // The firmware's MTR alarm handler does a 64-bit atomic update of HwDataA +0x4350. The fixed
+    // allocation ends the 0x8a04-byte object at its page end, leaving HwDataA (+0x4580) only
+    // 4-byte aligned, and the update took an alignment fault. Starting the object 0x8a80 bytes
+    // before the same page end puts HwDataA on a 16-byte boundary. Aligned, the update then
+    // faulted as an unsupported atomic on the uncached mapping: map it cacheable.
+    hwdata_object: Some(HwDataObject {
+        address: T8122_HWDATA_ADDRESS,
+        cached: true,
+    }),
+};
+
+/// The T8122 HwData object's firmware VA: 0x8a80 bytes before the end of the fixed allocation's
+/// last page.
+const T8122_HWDATA_ADDRESS: u64 = 0xffff_fc20_4070_4000 - 0x8a80;
+
+// The fixed HwData allocation (`m3_init_storage::allocation`): 0x8a04 bytes ending at the page
+// end 0xfffffc2040704000. The moved object stays inside the same pages, and HwDataA is 16-byte
+// aligned.
+const _: () = {
+    let (fixed, size) = (0xffff_fc20_406f_b5fc_u64, 0x8a04_u64);
+    assert!(T8122_HWDATA_ADDRESS & !0x3fff == fixed & !0x3fff);
+    assert!(T8122_HWDATA_ADDRESS + size <= (fixed + size + 0x3fff) & !0x3fff);
+    assert!((T8122_HWDATA_ADDRESS + crate::m3_adt_config::HWDATA_A as u64) % 16 == 0);
 };
