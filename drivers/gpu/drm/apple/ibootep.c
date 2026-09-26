@@ -136,15 +136,34 @@ static int iboot_parse_modes(const u8 *payload, size_t size, u32 *count)
 	return 0;
 }
 
+/*
+ * 3840x2160 timings the first pattern may use, best first: the reduced-blanking
+ * 59.9966 Hz timing seen through TB3 docks, then the standard 59.94 Hz and 60 Hz
+ * timings that monitors report over faster USB4 links. 59.94 Hz comes before
+ * 60 Hz because firmware can resolve "60 Hz" to a DSC timing on 4K120 monitors,
+ * and DSC output does not yet produce a picture on this path. Returns 0 for
+ * anything else.
+ */
+static int iboot_pattern_timing_rank(const u8 *mode)
+{
+	static const u32 fps[] = { 0x003bff23U, 0x003bf0a8U, 0x003c0000U };
+	u32 i;
+
+	if (get_unaligned_le32(mode + 4) != IBOOT_PATTERN_WIDTH ||
+	    get_unaligned_le32(mode + 8) != IBOOT_PATTERN_HEIGHT)
+		return 0;
+	for (i = 0; i < ARRAY_SIZE(fps); i++)
+		if (get_unaligned_le32(mode + 12) == fps[i])
+			return ARRAY_SIZE(fps) - i;
+	return 0;
+}
+
 static bool iboot_pattern_mode(u32 op, const u8 *mode)
 {
 	if (get_unaligned_le32(mode) != 1)
 		return false;
 	if (op == IBOOT_GET_TIMING_MODES)
-		return get_unaligned_le32(mode + 4) == IBOOT_PATTERN_WIDTH &&
-		       get_unaligned_le32(mode + 8) == IBOOT_PATTERN_HEIGHT &&
-		       /* Observed alternate 4K timing; never fall back to generic CVT. */
-		       get_unaligned_le32(mode + 12) == 0x003bff23U;
+		return iboot_pattern_timing_rank(mode) > 0;
 	if (op == IBOOT_GET_COLOR_MODES)
 		return get_unaligned_le32(mode + 4) == 1 && /* BT.601/709 */
 		       get_unaligned_le32(mode + 8) == 1 && /* SDR */
@@ -254,15 +273,24 @@ static int iboot_log_modes(struct iboot_query *query, u32 op, u8 *reply)
 	for (i = 0; i < count; i++) {
 		const u8 *mode = payload + 4 + i * IBOOT_MODE_SIZE;
 
+		int rank;
+
 		if (!iboot_pattern_mode(op, mode))
 			continue;
 		if (op == IBOOT_GET_TIMING_MODES) {
+			/* Best rank wins; among equals the last, since the monitor's own
+			 * timings follow the firmware's fixed list. */
+			rank = iboot_pattern_timing_rank(mode);
+			if (selected != U32_MAX &&
+			    rank < iboot_pattern_timing_rank(query->timing))
+				continue;
 			memcpy(query->timing, mode, IBOOT_MODE_SIZE);
 			query->timing_valid = true;
-		} else {
-			memcpy(query->color, mode, IBOOT_MODE_SIZE);
-			query->color_valid = true;
+			selected = i;
+			continue;
 		}
+		memcpy(query->color, mode, IBOOT_MODE_SIZE);
+		query->color_valid = true;
 		selected = i;
 		break;
 	}
