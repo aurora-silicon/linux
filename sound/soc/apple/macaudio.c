@@ -502,12 +502,16 @@ static void macaudio_sw_gain_stop_work(struct work_struct *work)
 	struct snd_pcm_substream *substream;
 	unsigned long flags;
 
-	/* No volume or control lock may be held while taking the stream lock */
+	/*
+	 * No volume or control lock may be held while taking the stream lock.
+	 * Pick the links from the runtime being walked: not every playback
+	 * substream on the card carries a runtime as its private data.
+	 */
 	for_each_card_rtds(&ma->card, rtd) {
-		if (!rtd->pcm)
+		if (!rtd->pcm || !ma->link_props[rtd->dai_link->id].sw_gain)
 			continue;
 		substream = rtd->pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
-		if (!substream || !macaudio_sw_gain_pcm(substream))
+		if (!substream)
 			continue;
 		snd_pcm_stream_lock_irqsave(substream, flags);
 		if (substream->runtime &&
