@@ -272,7 +272,6 @@ static int iboot_log_modes(struct iboot_query *query, u32 op, u8 *reply)
 		return ret;
 	for (i = 0; i < count; i++) {
 		const u8 *mode = payload + 4 + i * IBOOT_MODE_SIZE;
-
 		int rank;
 
 		if (!iboot_pattern_mode(op, mode))
@@ -443,6 +442,18 @@ static int iboot_pattern_command(struct iboot_query *query, u32 op,
 	if (!ret)
 		iboot_log_pattern_reply(query->service->ep->dcp->dev, op, reply);
 	return ret;
+}
+
+int ibootep_rearm_pattern(struct apple_dcp *dcp)
+{
+	struct iboot_query *query = iboot_find_query(dcp);
+
+	if (IS_ERR(query))
+		return PTR_ERR(query);
+	if (atomic_read(&query->busy))
+		return -EBUSY;
+	WRITE_ONCE(query->pattern_requested, false);
+	return 0;
 }
 
 int ibootep_present_pattern(struct apple_dcp *dcp, u64 iova, size_t size, u32 stride)

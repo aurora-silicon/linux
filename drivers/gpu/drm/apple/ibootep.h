@@ -18,5 +18,7 @@ int ibootep_query_modes(struct apple_dcp *dcp);
  * including after an error: commands may already have reached firmware.
  */
 int ibootep_present_pattern(struct apple_dcp *dcp, u64 iova, size_t size, u32 stride);
+/* Allow one more pattern request, for the retained buffer after a hotplug bounce. */
+int ibootep_rearm_pattern(struct apple_dcp *dcp);
 
 #endif

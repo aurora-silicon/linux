@@ -35,6 +35,16 @@
 #define SCANOUT_IOVA_BASE (1ULL << 40)
 #define SCANOUT_IOVA_SIZE (1ULL << 36)
 
+/*
+ * Some docks and monitors drop HPD once shortly after the first mode is set and
+ * bring it back within a second or two. Tolerate exactly one such bounce after
+ * the first pattern: hold the retained buffer, wait for the link to return, and
+ * send the pattern commands again. Anything else still latches a terminal error.
+ */
+#define SCANOUT_BOUNCE_GRACE_MS 10000
+#define SCANOUT_REPATTERN_DELAY_MS 1500
+enum { SCANOUT_BOUNCE_NONE, SCANOUT_BOUNCE_PENDING, SCANOUT_BOUNCE_USED };
+
 struct dcpext_scanout {
 	struct apple_dcp *dcp;
 	struct device *firmware_dev;
@@ -57,6 +67,9 @@ struct dcpext_scanout {
 	struct work_struct invalidate_work;
 	bool pattern_ready;
 	atomic_t requested;
+	atomic_t bounce; /* SCANOUT_BOUNCE_* */
+	struct delayed_work bounce_work;
+	struct delayed_work repattern_work;
 	bool stopping;
 	bool published; /* Firmware callbacks may retain this object until reboot. */
 	struct device_attribute attr;
@@ -113,8 +126,71 @@ void dcpext_scanout_invalidate(struct apple_dcp *dcp)
 	struct dcpext_scanout *scanout = smp_load_acquire(&dcp->dcpext_scanout);
 
 	/* Initial unplug remains allowed; only a started scanout owns DMA. */
-	if (scanout && atomic_read(&scanout->requested))
-		scanout_fail(scanout, -ENOLINK);
+	if (!scanout || !atomic_read(&scanout->requested))
+		return;
+	/* The desktop reuses the pattern's retained buffer, so the same restore
+	 * covers a bounce before or after desktop registration. */
+	if (smp_load_acquire(&scanout->pattern_ready)) {
+		int prev = atomic_cmpxchg(&scanout->bounce, SCANOUT_BOUNCE_NONE, SCANOUT_BOUNCE_PENDING);
+
+		if (prev == SCANOUT_BOUNCE_NONE) {
+			dev_info(scanout->firmware_dev, "external link lost after the first pattern; waiting up to %u ms for it to return\n",
+				 SCANOUT_BOUNCE_GRACE_MS);
+			schedule_delayed_work(&scanout->bounce_work, msecs_to_jiffies(SCANOUT_BOUNCE_GRACE_MS));
+			return;
+		}
+		/* Re-routing the returning tunnel disconnects the port once more
+		 * before reconnecting it; that is still the same bounce. */
+		if (prev == SCANOUT_BOUNCE_PENDING)
+			return;
+	}
+	scanout_fail(scanout, -ENOLINK);
+}
+
+static void dcpext_bounce_timeout(struct work_struct *work)
+{
+	struct dcpext_scanout *scanout =
+		container_of(to_delayed_work(work), struct dcpext_scanout, bounce_work);
+
+	if (atomic_cmpxchg(&scanout->bounce, SCANOUT_BOUNCE_PENDING, SCANOUT_BOUNCE_USED) !=
+	    SCANOUT_BOUNCE_PENDING)
+		return;
+	dev_err(scanout->firmware_dev, "external link did not return within %u ms\n", SCANOUT_BOUNCE_GRACE_MS);
+	scanout_fail(scanout, -ENOLINK);
+}
+
+static void dcpext_repattern_work(struct work_struct *work)
+{
+	struct dcpext_scanout *scanout =
+		container_of(to_delayed_work(work), struct dcpext_scanout, repattern_work);
+	int ret;
+
+	if (READ_ONCE(scanout->stopping) || atomic_read(&scanout->terminal_error))
+		return;
+	ret = ibootep_rearm_pattern(scanout->dcp);
+	if (!ret)
+		ret = ibootep_present_pattern(scanout->dcp, scanout->iova, scanout->size, SCANOUT_STRIDE);
+	if (ret) {
+		scanout_fail(scanout, ret);
+		dev_err(scanout->firmware_dev, "external pattern not restored after the link returned: %d; resources retained until reboot\n",
+			ret);
+		return;
+	}
+	dev_info(scanout->firmware_dev, "external pattern restored after one hotplug bounce\n");
+}
+
+/* Caller holds hpd_mutex; the external link has just become ready again. */
+void dcpext_scanout_link_restored(struct apple_dcp *dcp)
+{
+	struct dcpext_scanout *scanout = smp_load_acquire(&dcp->dcpext_scanout);
+
+	if (!scanout || atomic_cmpxchg(&scanout->bounce, SCANOUT_BOUNCE_PENDING, SCANOUT_BOUNCE_USED) !=
+				SCANOUT_BOUNCE_PENDING)
+		return;
+	cancel_delayed_work(&scanout->bounce_work);
+	dev_info(scanout->firmware_dev, "external link returned; sending the pattern commands again\n");
+	queue_delayed_work(system_unbound_wq, &scanout->repattern_work,
+			   msecs_to_jiffies(SCANOUT_REPATTERN_DELAY_MS));
 }
 
 static bool scanout_link_ready(struct dcpext_scanout *scanout)
@@ -527,6 +603,8 @@ static void dcpext_scanout_cleanup(void *data)
 	WRITE_ONCE(scanout->stopping, true);
 	cancel_work_sync(&scanout->desktop_work);
 	cancel_work_sync(&scanout->work);
+	cancel_delayed_work_sync(&scanout->bounce_work);
+	cancel_delayed_work_sync(&scanout->repattern_work);
 	cancel_work_sync(&scanout->invalidate_work);
 	if (atomic_read(&scanout->requested) || READ_ONCE(scanout->published))
 		return; /* Firmware callbacks and possible DMA survive parent cleanup. */
@@ -561,6 +639,9 @@ int dcpext_scanout_register(struct apple_dcp *dcp)
 	atomic_set(&scanout->terminal_error, 0);
 	INIT_WORK(&scanout->invalidate_work, dcpext_invalidate_work);
 	INIT_WORK(&scanout->work, dcpext_pattern_work);
+	atomic_set(&scanout->bounce, SCANOUT_BOUNCE_NONE);
+	INIT_DELAYED_WORK(&scanout->bounce_work, dcpext_bounce_timeout);
+	INIT_DELAYED_WORK(&scanout->repattern_work, dcpext_repattern_work);
 	atomic_set(&scanout->desktop_requested, 0);
 	INIT_WORK(&scanout->desktop_work, dcpext_desktop_work);
 	sysfs_attr_init(&scanout->attr.attr);
