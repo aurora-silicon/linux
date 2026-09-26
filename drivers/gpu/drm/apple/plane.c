@@ -488,3 +488,32 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 
 	return &plane->base;
 }
+
+/* The formats the T6030 (14.x firmware) scanout was qualified with. */
+static const u32 dcp_primary_formats_14_7[] = {
+	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_ARGB8888,
+};
+
+struct drm_plane *apple_plane_init_v14_7(struct drm_device *dev,
+					 unsigned long possible_crtcs,
+					 u32 iomfb_surf,
+					 enum drm_plane_type type)
+{
+	struct apple_plane *plane;
+
+	if (type != DRM_PLANE_TYPE_PRIMARY)
+		return ERR_PTR(-EINVAL);
+
+	plane = drmm_universal_plane_alloc(dev, struct apple_plane, base, possible_crtcs,
+					   &apple_plane_funcs, dcp_primary_formats_14_7,
+					   ARRAY_SIZE(dcp_primary_formats_14_7),
+					   apple_format_modifiers, type, NULL);
+	if (IS_ERR(plane))
+		return ERR_CAST(plane);
+
+	drm_plane_helper_add(&plane->base, &apple_primary_plane_helper_funcs);
+	plane->iomfb_surf = iomfb_surf;
+
+	return &plane->base;
+}
