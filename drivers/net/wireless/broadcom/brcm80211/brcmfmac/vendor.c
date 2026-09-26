@@ -64,14 +64,25 @@ static int brcmf_cfg80211_vndr_cmds_dcmd_handler(struct wiphy *wiphy,
 		*(char *)(dcmd_buf + len)  = '\0';
 	}
 
+	/* Return the firmware's own BCME_* code instead of the -EBADE that
+	 * brcmf_fil_cmd_data() collapses every failure to. Without this a
+	 * probe cannot tell "no such iovar" from "bad argument" from "not
+	 * up", which is most of what a probe needs to know.
+	 */
+	ifp->fwil_fwerr = true;
 	if (cmdhdr->set)
 		ret = brcmf_fil_cmd_data_set(ifp, cmdhdr->cmd, dcmd_buf,
 					     ret_len);
 	else
 		ret = brcmf_fil_cmd_data_get(ifp, cmdhdr->cmd, dcmd_buf,
 					     ret_len);
-	if (ret != 0)
+	ifp->fwil_fwerr = false;
+	if (ret != 0) {
+		brcmf_err("dcmd %u ifidx=%d %s: firmware error %d\n",
+			  cmdhdr->cmd, ifp->ifidx,
+			  cmdhdr->set ? "set" : "get", ret);
 		goto exit;
+	}
 
 	wr_pointer = dcmd_buf;
 	while (ret_len > 0) {
@@ -104,6 +115,46 @@ exit:
 	return ret;
 }
 
+#define BRCMF_AWDL_IFNAME	"awdl0"
+
+static int brcmf_cfg80211_vndr_cmds_awdl_handler(struct wiphy *wiphy,
+						 struct wireless_dev *wdev,
+						 const void *data, int len)
+{
+	struct net_device *ndev;
+	struct wireless_dev *awdl_wdev;
+	u32 op;
+
+	if (len < sizeof(op))
+		return -EINVAL;
+	op = *(const u32 *)data;
+
+	switch (op) {
+	case BRCMF_VNDR_AWDL_OP_CREATE:
+		ndev = dev_get_by_name(wiphy_net(wiphy), BRCMF_AWDL_IFNAME);
+		if (ndev) {
+			dev_put(ndev);
+			return -EEXIST;
+		}
+		/* Asynchronous: returns as soon as firmware has been asked.
+		 * The netdev appears once the fweh worker registers it, so
+		 * userspace must wait for awdl0 rather than assume it exists.
+		 */
+		return brcmf_awdl_add_vif(wiphy, BRCMF_AWDL_IFNAME);
+	case BRCMF_VNDR_AWDL_OP_DESTROY:
+		ndev = dev_get_by_name(wiphy_net(wiphy), BRCMF_AWDL_IFNAME);
+		if (!ndev)
+			return -ENODEV;
+		awdl_wdev = ndev->ieee80211_ptr;
+		dev_put(ndev);
+		if (!awdl_wdev)
+			return -ENODEV;
+		return brcmf_awdl_del_vif(wiphy, awdl_wdev);
+	default:
+		return -EINVAL;
+	}
+}
+
 const struct wiphy_vendor_command brcmf_vendor_cmds[] = {
 	{
 		{
@@ -114,5 +165,15 @@ const struct wiphy_vendor_command brcmf_vendor_cmds[] = {
 			 WIPHY_VENDOR_CMD_NEED_NETDEV,
 		.policy = VENDOR_CMD_RAW_DATA,
 		.doit = brcmf_cfg80211_vndr_cmds_dcmd_handler
+	},
+	{
+		{
+			.vendor_id = BROADCOM_OUI,
+			.subcmd = BRCMF_VNDR_CMDS_AWDL
+		},
+		.flags = WIPHY_VENDOR_CMD_NEED_WDEV |
+			 WIPHY_VENDOR_CMD_NEED_NETDEV,
+		.policy = VENDOR_CMD_RAW_DATA,
+		.doit = brcmf_cfg80211_vndr_cmds_awdl_handler
 	},
 };

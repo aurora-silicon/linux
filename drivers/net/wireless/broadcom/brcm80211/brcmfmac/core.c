@@ -8,6 +8,7 @@
 #include <linux/module.h>
 #include <linux/inetdevice.h>
 #include <linux/property.h>
+#include <linux/unaligned.h>
 #include <net/cfg80211.h>
 #include <net/rtnetlink.h>
 #include <net/addrconf.h>
@@ -37,6 +38,17 @@
 #define	RXS_PBPRES				BIT(2)
 
 #define	D11_PHY_HDR_LEN				6
+
+/* AWDL data frames on the air are 802.3 + LLC/SNAP (OUI 00:17:f2, protocol
+ * 0x0800) + a 4-byte data header, then the real ethertype. The kernel only
+ * speaks Ethernet II, so the driver translates at the awdl0 boundary in
+ * both directions.
+ */
+#define BRCMF_AWDL_ENCAP_LEN			16
+#define BRCMF_AWDL_DATA_MIN_LEN			(ETH_HLEN + BRCMF_AWDL_ENCAP_LEN)
+
+static const u8 brcmf_awdl_snap[] = { 0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2,
+				      0x08, 0x00, 0x03, 0x04 };
 
 struct d11rxhdr_le {
 	__le16 RxFrameSize;
@@ -290,6 +302,55 @@ static bool brcmf_skb_is_iapp(struct sk_buff *skb)
 #endif
 }
 
+/* Unwrap SNAP + AWDL data header into Ethernet II, in place. skb->data is
+ * the 802.3 header. Frames that are not AWDL-encapsulated pass unchanged.
+ */
+static void brcmf_awdl_decap(struct sk_buff *skb)
+{
+	const struct ethhdr *eh = (const struct ethhdr *)skb->data;
+
+	if (skb->len < BRCMF_AWDL_DATA_MIN_LEN ||
+	    ntohs(eh->h_proto) > ETH_DATA_LEN ||
+	    memcmp(skb->data + ETH_HLEN, brcmf_awdl_snap,
+		   sizeof(brcmf_awdl_snap)))
+		return;
+
+	memmove(skb->data + BRCMF_AWDL_ENCAP_LEN, skb->data, 2 * ETH_ALEN);
+	skb_pull(skb, BRCMF_AWDL_ENCAP_LEN);
+}
+
+/* Every received data frame passes through here, on the BCDC and the msgbuf
+ * (PCIe) paths alike, before the kernel classifies it.
+ */
+__be16 brcmf_rx_eth_type_trans(struct brcmf_if *ifp, struct sk_buff *skb)
+{
+	if (ifp->is_awdl)
+		brcmf_awdl_decap(skb);
+	return eth_type_trans(skb, ifp->ndev);
+}
+
+/* Wrap Ethernet II into 802.3 + SNAP + AWDL data header, in place. Frames
+ * already carrying a length field (raw AF_PACKET senders that build the
+ * encapsulation themselves) pass unchanged. Caller guarantees headroom.
+ */
+static void brcmf_awdl_encap(struct brcmf_if *ifp, struct sk_buff *skb)
+{
+	const struct ethhdr *eh = (const struct ethhdr *)skb->data;
+	u8 *hdr;
+
+	if (ntohs(eh->h_proto) < ETH_P_802_3_MIN)
+		return;
+
+	hdr = skb_push(skb, BRCMF_AWDL_ENCAP_LEN);
+	memmove(hdr, hdr + BRCMF_AWDL_ENCAP_LEN, 2 * ETH_ALEN);
+	put_unaligned_be16(skb->len - ETH_HLEN, hdr + 2 * ETH_ALEN);
+	memcpy(hdr + ETH_HLEN, brcmf_awdl_snap, sizeof(brcmf_awdl_snap));
+	put_unaligned_le16(ifp->awdl_tx_seq++,
+			   hdr + ETH_HLEN + sizeof(brcmf_awdl_snap));
+	hdr[ETH_HLEN + sizeof(brcmf_awdl_snap) + 2] = 0;
+	hdr[ETH_HLEN + sizeof(brcmf_awdl_snap) + 3] = 0;
+}
+
 static netdev_tx_t brcmf_netdev_start_xmit(struct sk_buff *skb,
 					   struct net_device *ndev)
 {
@@ -298,6 +359,7 @@ static netdev_tx_t brcmf_netdev_start_xmit(struct sk_buff *skb,
 	struct brcmf_pub *drvr = ifp->drvr;
 	struct ethhdr *eh;
 	int head_delta;
+	unsigned int hdrlen = drvr->hdrlen;
 	unsigned int tx_bytes = skb->len;
 
 	brcmf_dbg(DATA, "Enter, bsscfgidx=%d\n", ifp->bsscfgidx);
@@ -328,9 +390,12 @@ static netdev_tx_t brcmf_netdev_start_xmit(struct sk_buff *skb,
 		goto done;
 	}
 
+	if (ifp->is_awdl)
+		hdrlen += BRCMF_AWDL_ENCAP_LEN;
+
 	/* Make sure there's enough writeable headroom */
-	if (skb_headroom(skb) < drvr->hdrlen || skb_header_cloned(skb)) {
-		head_delta = max_t(int, drvr->hdrlen - skb_headroom(skb), 0);
+	if (skb_headroom(skb) < hdrlen || skb_header_cloned(skb)) {
+		head_delta = max_t(int, hdrlen - skb_headroom(skb), 0);
 
 		brcmf_dbg(INFO, "%s: %s headroom\n", brcmf_ifname(ifp),
 			  head_delta ? "insufficient" : "unmodifiable");
@@ -364,6 +429,9 @@ static netdev_tx_t brcmf_netdev_start_xmit(struct sk_buff *skb,
 
 	/* set pacing shift for packet aggregation */
 	sk_pacing_shift_update(skb->sk, 8);
+
+	if (ifp->is_awdl)
+		brcmf_awdl_encap(ifp, skb);
 
 	ret = brcmf_proto_tx_queue_data(drvr, ifp->ifidx, skb);
 	if (ret < 0)
@@ -495,7 +563,7 @@ static int brcmf_rx_hdrpull(struct brcmf_pub *drvr, struct sk_buff *skb,
 		return -ENODATA;
 	}
 
-	skb->protocol = eth_type_trans(skb, (*ifp)->ndev);
+	skb->protocol = brcmf_rx_eth_type_trans(*ifp, skb);
 	return 0;
 }
 
@@ -632,6 +700,55 @@ static int brcmf_netdev_open(struct net_device *ndev)
 	return 0;
 }
 
+/* AWDL interfaces are not STAs. brcmf_netdev_open() runs the standard station
+ * bring-up -- a toe_ol query, brcmf_cfg80211_up(), then the multicast and
+ * promisc configuration driven by ndo_set_rx_mode -- and issuing those against
+ * an AWDL bsscfg stops the firmware answering dcmds at all: every subsequent
+ * command times out and only a brcmfmac reload recovers it. Bring the netdev
+ * up without touching firmware, and deliberately omit ndo_set_rx_mode so the
+ * multicast worker never runs for these interfaces.
+ */
+static int brcmf_netdev_open_awdl(struct net_device *ndev)
+{
+	struct brcmf_if *ifp = netdev_priv(ndev);
+	struct brcmf_pub *drvr = ifp->drvr;
+	struct brcmf_bus *bus_if = drvr->bus_if;
+
+	brcmf_dbg(TRACE, "Enter, bsscfgidx=%d (AWDL)\n", ifp->bsscfgidx);
+
+	if (bus_if->state != BRCMF_BUS_UP) {
+		bphy_err(drvr, "failed bus is not ready\n");
+		return -EAGAIN;
+	}
+
+	atomic_set(&ifp->pend_8021x_cnt, 0);
+
+	/* Carrier stays off until AWDL is actually running. */
+	netif_carrier_off(ndev);
+	return 0;
+}
+
+static int brcmf_netdev_stop_awdl(struct net_device *ndev)
+{
+	struct brcmf_if *ifp = netdev_priv(ndev);
+
+	brcmf_dbg(TRACE, "Enter, bsscfgidx=%d (AWDL)\n", ifp->bsscfgidx);
+
+	/* No brcmf_cfg80211_down(): this vif was never brought up through
+	 * cfg80211, and tearing down the STA state would hit the same
+	 * unresponsive-firmware path as the bring-up.
+	 */
+	brcmf_net_setcarrier(ifp, false);
+	return 0;
+}
+
+static const struct net_device_ops brcmf_netdev_ops_awdl = {
+	.ndo_open = brcmf_netdev_open_awdl,
+	.ndo_stop = brcmf_netdev_stop_awdl,
+	.ndo_start_xmit = brcmf_netdev_start_xmit,
+	.ndo_set_mac_address = brcmf_netdev_set_mac_address,
+};
+
 static const struct net_device_ops brcmf_netdev_ops_pri = {
 	.ndo_open = brcmf_netdev_open,
 	.ndo_stop = brcmf_netdev_stop,
@@ -651,9 +768,12 @@ int brcmf_net_attach(struct brcmf_if *ifp, bool locked)
 	ndev = ifp->ndev;
 
 	/* set appropriate operations */
-	ndev->netdev_ops = &brcmf_netdev_ops_pri;
+	ndev->netdev_ops = ifp->is_awdl ? &brcmf_netdev_ops_awdl
+					: &brcmf_netdev_ops_pri;
 
 	ndev->needed_headroom += drvr->hdrlen;
+	if (ifp->is_awdl)
+		ndev->needed_headroom += BRCMF_AWDL_ENCAP_LEN;
 	ndev->ethtool_ops = &brcmf_ethtool_ops;
 
 	/* set the mac address & netns */
