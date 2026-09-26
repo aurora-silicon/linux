@@ -744,6 +744,20 @@ fn build_images(
         HWDATA_A + offset_of!(raw::HwDataAG15V14_8_3, init_timestamp),
         &now.to_le_bytes(),
     )?;
+    // The SoC's MTR sensor masks, where its table gives them.
+    if let Some(m) = soc.mtr_masks {
+        type A = raw::HwDataAG15V14_8_3;
+        for at in [offset_of!(A, fast_die0_sensor_mask), offset_of!(A, fast_die0_sensor_mask_2)] {
+            write(&mut hwdata, HWDATA_A + at, &m.fast_die.to_le_bytes())?;
+        }
+        write(&mut hwdata, HWDATA_A + offset_of!(A, fast_die0_sensor_mask_alt), &m.alarm.to_le_bytes())?;
+        dev_info!(
+            dev,
+            "M3: MTR sensor masks: fast-die {:#x}, alarm {:#x}\n",
+            m.fast_die,
+            m.alarm
+        );
+    }
     // On T8122, log and require the two HwDataB words the firmware's power management depends
     // on: it powers the GPU cores up for a job only when +0xa38 and +0xa40 are both nonzero.
     if core::ptr::eq(soc, &crate::m3_soc::T8122) {

@@ -61,6 +61,17 @@ pub(crate) struct Features {
     pub(crate) fragment_dependency: bool,
 }
 
+/// The MTR temperature-sensor masks of the runtime's HwDataA, where the SoC table sets them
+/// instead of the hardware configuration.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct MtrMasks {
+    /// The fast-die sensor mask, in both HwDataA copies (+0x8ac and +0x1288).
+    pub(crate) fast_die: u64,
+    /// The mask the firmware matches an MTR alarm against (HwDataA +0x1a98). An alarm from a
+    /// sensor outside it, or any alarm while it is 0, is fatal to the firmware.
+    pub(crate) alarm: u64,
+}
+
 /// One firmware IO mapping of the runtime's InitData: HwDataB slot, physical address, total
 /// size, element size, writable.
 pub(crate) type IoMapping = (usize, u64, u32, u32, bool);
@@ -122,6 +133,8 @@ pub(crate) struct Soc {
     pub(crate) unported: &'static [&'static str],
     /// The GPU registers read after every job by default (`asahi.m3_retire_mmio` bits).
     pub(crate) retire_mmio: u64,
+    /// The MTR sensor masks, when they are not the hardware configuration's.
+    pub(crate) mtr_masks: Option<MtrMasks>,
 }
 
 impl Soc {
@@ -248,6 +261,8 @@ pub(crate) static T6030: Soc = Soc {
     unported: &[],
     // Engine-busy, fault banks and performance state.
     retire_mmio: 7,
+    // The hardware configuration's fast-die mask; no alarm mask.
+    mtr_masks: None,
 };
 
 /// T8122 (M3, G15G): one die, one cluster of ten core slots (eight or ten of them active).
@@ -316,4 +331,12 @@ pub(crate) static T8122: Soc = Soc {
     // the performance-state read alone does not, and a per-frame readback saw no job retired
     // before its writes were visible.
     retire_mmio: 4,
+    // The fast-die controller's sensors (0x4248, both copies), and every sensor the MTR block
+    // enables as the alarm mask (sensors 3, 6, 8, 9, 11 and 14: 0x4b48, the upper half of the
+    // block's configuration word 0x4b480003). With the second fast-die copy at 0, or an alarm
+    // mask without sensor 8, the firmware stopped on its first MTR alarm.
+    mtr_masks: Some(MtrMasks {
+        fast_die: 0x4248,
+        alarm: 0x4b48,
+    }),
 };
