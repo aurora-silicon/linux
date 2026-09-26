@@ -38,6 +38,8 @@ pub(crate) struct EventInner {
     gpu_stamp: GpuWeakPointer<Stamp>,
     /// GPU pointer to the firmware-internal event stamp
     gpu_fw_stamp: GpuWeakPointer<FwStamp>,
+    /// CPU pointer to the firmware-internal event stamp
+    fw_stamp: *const AtomicU32,
 }
 
 /// SAFETY: The event slots are safe to send across threads.
@@ -57,6 +59,11 @@ impl EventValue {
     /// Returns the `EventValue` that succeeds this one.
     pub(crate) fn next(&self) -> EventValue {
         EventValue(self.0.wrapping_add(0x100))
+    }
+
+    /// The raw 32-bit stamp word (slot in the high byte, increments of 0x100).
+    pub(crate) fn raw(&self) -> u32 {
+        self.0
     }
 
     /// Increments this `EventValue` in place.
@@ -119,6 +126,12 @@ impl EventInner {
         // keeps the GpuObject the stamp is contained within alive.
         EventValue(unsafe { &*self.stamp }.load(Ordering::Acquire))
     }
+
+    /// Firmware-private stamp word. The firmware may write this before the host stamp.
+    pub(crate) fn fw_current(&self) -> u32 {
+        // SAFETY: Same lifetime as `stamp`, set from the fw_stamps array in EventManager::new.
+        unsafe { (*self.fw_stamp).load(Ordering::Acquire) }
+    }
 }
 
 impl slotalloc::SlotItem for EventInner {
@@ -172,6 +185,7 @@ impl EventManager {
                         stamp: &inner.stamps[slot as usize].0,
                         gpu_stamp: inner.stamps.weak_item_pointer(slot as usize),
                         gpu_fw_stamp: inner.fw_stamps.weak_item_pointer(slot as usize),
+                        fw_stamp: &inner.fw_stamps[slot as usize].0,
                     })
                 },
                 c_str!("EventManager::SlotAllocator"),

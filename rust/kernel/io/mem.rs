@@ -187,7 +187,14 @@ impl<const SIZE: usize> ExclusiveIoMem<SIZE> {
         let size = resource.size();
         let name = resource.name().unwrap_or_default();
 
-        let region = resource
+        // Reserve against the global MMIO tree, as request_mem_region() does.
+        // An OF platform resource can be a detached descriptor rather than a
+        // node in that tree. Requesting a child of that descriptor neither
+        // excludes other devices nor pairs with Region's release_mem_region().
+        // SAFETY: iomem_resource is the permanent global MMIO resource root;
+        // request_region serializes mutations through the C resource lock.
+        let root = unsafe { Resource::from_raw(&raw mut bindings::iomem_resource) };
+        let region = root
             .request_region(
                 start,
                 size,
@@ -385,6 +392,22 @@ impl Mem {
     /// hardware backing this memory block.
     pub fn ptr(&self) -> *mut u8 {
         self.ptr.cast().as_ptr()
+    }
+
+    /// Borrow a bounded byte view for APIs which accept an iosys mapping.
+    /// The view retains this mapping's lifetime and uses normal-memory access.
+    pub fn iosys_map(&mut self, offset: usize, size: usize) -> Result<crate::iosys_map::IoSysMapRef<'_, u8>> {
+        if offset.checked_add(size).ok_or(EOVERFLOW)? > self.size {
+            return Err(EINVAL);
+        }
+        // SAFETY: The requested span lies entirely inside the retained mapping.
+        let pointer = unsafe { self.ptr().add(offset) };
+        let raw = crate::iosys_map::RawIoSysMap::from_raw(bindings::iosys_map {
+            is_iomem: false,
+            __bindgen_anon_1: bindings::iosys_map__bindgen_ty_1 { vaddr: pointer.cast() },
+        });
+        // SAFETY: The bounded view cannot outlive this borrowed Mem owner.
+        Ok(unsafe { crate::iosys_map::IoSysMapRef::new(raw, size) })
     }
 
     /// Returns the size of this mapped memory block.

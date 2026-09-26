@@ -126,29 +126,60 @@ pub(crate) enum PipeType {
 #[derive(Debug, Copy, Clone, Default)]
 #[repr(C)]
 pub(crate) struct RunWorkQueueMsg {
+    #[ver(V < V14_8_3)]
     pub(crate) pipe_type: PipeType,
+    #[ver(V >= V14_8_3)]
+    /// 14.x pipe entry (0x18 bytes): host timestamp at encode time. +0x00
+    pub(crate) timestamp: U64,
+    /// +0x08 (G15)
     pub(crate) work_queue: Option<GpuWeakPointer<super::workqueue::QueueInfo::ver>>,
+    #[ver(V < V14_8_3)]
     pub(crate) wptr: u32,
+    #[ver(V < V14_8_3)]
     pub(crate) event_slot: u32,
+    #[ver(V < V14_8_3)]
     pub(crate) is_new: bool,
-    #[ver(V >= V13_2 && G == G14)]
+    #[ver(V >= V13_2 && G == G14 && V < V14_8_3)]
     pub(crate) __pad: Pad<0x2b>,
-    #[ver(V < V13_2 || G != G14)]
+    #[ver((V < V13_2 || G != G14) && V < V14_8_3)]
     pub(crate) __pad: Pad<0x1b>,
+    #[ver(V >= V14_8_3)]
+    /// Command type; 0 on normal submits, the pipe is implied by the ring. +0x10
+    pub(crate) cmd_type: u32,
+    #[ver(V >= V14_8_3)]
+    /// Queue write pointer (u16 now). +0x14
+    pub(crate) wptr: u16,
+    #[ver(V >= V14_8_3)]
+    /// +0x16/+0x17 (names are tentative)
+    pub(crate) event_slot: u8,
+    #[ver(V >= V14_8_3)]
+    pub(crate) is_new: u8,
 }
+
+// the 14.x pipe entry is 0x18 bytes (was 0x30).
+static_assert!(core::mem::size_of::<RunWorkQueueMsgG15V14_8_3>() == 0x18);
+static_assert!(core::mem::offset_of!(RunWorkQueueMsgG15V14_8_3, work_queue) == 0x08);
+static_assert!(core::mem::offset_of!(RunWorkQueueMsgG15V14_8_3, cmd_type) == 0x10);
+static_assert!(core::mem::offset_of!(RunWorkQueueMsgG15V14_8_3, wptr) == 0x14);
+static_assert!(core::mem::offset_of!(RunWorkQueueMsgG15V14_8_3, is_new) == 0x17);
 
 #[versions(AGX)]
 pub(crate) type PipeMsg = RunWorkQueueMsg::ver;
 
 #[versions(AGX)]
 pub(crate) const DEVICECONTROL_SZ: usize = {
-    #[ver(V < V13_2 || G != G14)]
+    #[ver((V < V13_2 || G != G14) && V < V14_8_3)]
     {
         0x2c
     }
-    #[ver(V >= V13_2 && G == G14)]
+    #[ver(V >= V13_2 && G == G14 && V < V14_8_3)]
     {
         0x3c
+    }
+    // 14.x DeviceControl entry is 0x38 bytes: u32 type + 0x34 payload
+    #[ver(V >= V14_8_3)]
+    {
+        0x34
     }
 };
 
@@ -160,21 +191,35 @@ pub(crate) const DEVICECONTROL_SZ: usize = {
 #[repr(C, u32)]
 #[allow(dead_code)]
 pub(crate) enum DeviceControlMsg {
+    #[ver(V < V14_8_3)]
     Unk00(Array<DEVICECONTROL_SZ::ver, u8>),
+    #[ver(V < V14_8_3)]
     Unk01(Array<DEVICECONTROL_SZ::ver, u8>),
+    #[ver(V < V14_8_3)]
     Unk02(Array<DEVICECONTROL_SZ::ver, u8>),
+    #[ver(V < V14_8_3)]
     Unk03(Array<DEVICECONTROL_SZ::ver, u8>),
+    #[ver(V < V14_8_3)]
     Unk04(Array<DEVICECONTROL_SZ::ver, u8>),
+    #[ver(V < V14_8_3)]
     Unk05(Array<DEVICECONTROL_SZ::ver, u8>),
+    #[ver(V < V14_8_3)]
     Unk06(Array<DEVICECONTROL_SZ::ver, u8>),
+    #[ver(V < V14_8_3)]
     Unk07(Array<DEVICECONTROL_SZ::ver, u8>),
+    #[ver(V < V14_8_3)]
     Unk08(Array<DEVICECONTROL_SZ::ver, u8>),
+    #[ver(V < V14_8_3)]
     Unk09(Array<DEVICECONTROL_SZ::ver, u8>),
+    #[ver(V < V14_8_3)]
     Unk0a(Array<DEVICECONTROL_SZ::ver, u8>),
+    #[ver(V < V14_8_3)]
     Unk0b(Array<DEVICECONTROL_SZ::ver, u8>),
+    #[ver(V < V14_8_3)]
     Unk0c(Array<DEVICECONTROL_SZ::ver, u8>),
-    #[ver(V >= V13_3)]
+    #[ver(V >= V13_3 && V < V14_8_3)]
     Unk0d(Array<DEVICECONTROL_SZ::ver, u8>),
+    #[ver(V < V14_8_3)]
     GrowTVBAck {
         unk_4: u32,
         buffer_slot: u32,
@@ -184,23 +229,33 @@ pub(crate) enum DeviceControlMsg {
         halt_count: U64,
         __pad: Pad<{ DEVICECONTROL_SZ::ver - 0x1c }>,
     },
+    #[ver(V < V14_8_3)]
     RecoverChannel {
         pipe_type: u32,
         work_queue: GpuWeakPointer<super::workqueue::QueueInfo::ver>,
         event_value: u32,
         __pad: Pad<{ DEVICECONTROL_SZ::ver - 0x10 }>,
     },
+    #[ver(V < V14_8_3)]
     IdlePowerOff {
         val: u32,
         __pad: Pad<{ DEVICECONTROL_SZ::ver - 0x4 }>,
     },
+    #[ver(V < V14_8_3)]
     Unk10(Array<DEVICECONTROL_SZ::ver, u8>),
+    #[ver(V < V14_8_3)]
     Unk11(Array<DEVICECONTROL_SZ::ver, u8>),
+    #[ver(V < V14_8_3)]
     Unk12(Array<DEVICECONTROL_SZ::ver, u8>),
+    #[ver(V < V14_8_3)]
     Unk13(Array<DEVICECONTROL_SZ::ver, u8>),
+    #[ver(V < V14_8_3)]
     Unk14(Array<DEVICECONTROL_SZ::ver, u8>), // Init?
+    #[ver(V < V14_8_3)]
     Unk15(Array<DEVICECONTROL_SZ::ver, u8>), // Enable something
+    #[ver(V < V14_8_3)]
     Unk16(Array<DEVICECONTROL_SZ::ver, u8>), // Disable something
+    #[ver(V < V14_8_3)]
     DestroyContext {
         unk_4: u32,
         ctx_23: u8,
@@ -221,12 +276,69 @@ pub(crate) enum DeviceControlMsg {
         #[ver(V >= V13_3)]
         __pad2: Pad<{ DEVICECONTROL_SZ::ver - 0x18 }>,
     },
+    #[ver(V < V14_8_3)]
     Unk18(Array<DEVICECONTROL_SZ::ver, u8>),
+    #[ver(V < V14_8_3)]
     Initialize(Pad<DEVICECONTROL_SZ::ver>), // Update RegionC
+    // 14.x (G15) numbering. Only the types drm/asahi uses are listed; their payload layouts are
+    // not known yet.
+    //
+    // DestroyContext, GrowTVBAck and Initialize have no known 14.x equivalent: nothing in the
+    // host-issued set corresponds to the G13 0x00-0x03 "initialise"/context types.
+    // They get otherwise unused type values 0x00-0x02 so the enum stays usable by the common
+    // code, and `DeviceControlChannel::send()` drops them on 14.x instead of sending them.
+    // TODO: release-resource (0x11) is the likely DestroyContext replacement.
+    #[ver(V >= V14_8_3)]
+    DestroyContext {
+        unk_4: u32,
+        ctx_23: u8,
+        unk_c: U32,
+        unk_10: U32,
+        ctx_0: u8,
+        ctx_1: u8,
+        ctx_4: u8,
+        gpu_context: Option<GpuWeakPointer<super::workqueue::GpuContextData>>,
+        __pad2: Pad<{ DEVICECONTROL_SZ::ver - 0x18 }>,
+    } = 0x00,
+    #[ver(V >= V14_8_3)]
+    GrowTVBAck {
+        unk_4: u32,
+        buffer_slot: u32,
+        vm_slot: u32,
+        counter: u32,
+        subpipe: u32,
+        halt_count: U64,
+        __pad: Pad<{ DEVICECONTROL_SZ::ver - 0x1c }>,
+    } = 0x01,
+    #[ver(V >= V14_8_3)]
+    Initialize(Pad<DEVICECONTROL_SZ::ver>) = 0x02,
+    #[ver(V >= V14_8_3)]
+    /// Issued by the host after a ChannelError event.
+    /// TODO: payload layout unverified; the G13 RecoverChannel layout is used.
+    RecoverChannel {
+        pipe_type: u32,
+        work_queue: GpuWeakPointer<super::workqueue::QueueInfo::ver>,
+        event_value: u32,
+        __pad: Pad<{ DEVICECONTROL_SZ::ver - 0x10 }>,
+    } = 0x08,
+    #[ver(V >= V14_8_3)]
+    /// GPU idle power-off request (G13 13.5 used 0x10).
+    /// TODO: payload layout unverified; the G13 `val` layout is used.
+    IdlePowerOff {
+        val: u32,
+        __pad: Pad<{ DEVICECONTROL_SZ::ver - 0x4 }>,
+    } = 0x09,
+    #[ver(V >= V14_8_3)]
+    /// Force a firmware configuration snapshot. The firmware expects exactly this entry to be
+    /// queued before INIT, on every (re)init. 0x38 bytes, u32 0x13 at +0, all-zero payload.
+    ForceConfigSnapshot(Pad<DEVICECONTROL_SZ::ver>) = 0x13,
 }
 
 #[versions(AGX)]
 static_assert!(core::mem::size_of::<DeviceControlMsg::ver>() == 4 + DEVICECONTROL_SZ::ver);
+
+// The 14.x DeviceControl entry is 0x38 bytes (256-entry DRAM ring).
+static_assert!(core::mem::size_of::<DeviceControlMsgG15V14_8_3>() == 0x38);
 
 #[versions(AGX)]
 default_zeroed!(DeviceControlMsg::ver);
@@ -241,6 +353,18 @@ pub(crate) struct FwCtlMsg {
     pub(crate) page_count: u16,
     pub(crate) unk_12: u16,
 }
+
+/// FWCtl ("MemDesc") ring entry of the 14.x firmware: the same fields as `FwCtlMsg`, with the
+/// stride grown from 0x14 to 0x18 bytes.
+#[derive(Copy, Clone, Default, Debug)]
+#[repr(C)]
+pub(crate) struct FwCtlMsgPadded {
+    pub(crate) msg: FwCtlMsg,
+    pub(crate) __pad: u32,
+}
+
+static_assert!(core::mem::size_of::<FwCtlMsg>() == 0x14);
+static_assert!(core::mem::size_of::<FwCtlMsgPadded>() == 0x18);
 
 pub(crate) const EVENT_SZ: usize = 0x34;
 
@@ -291,11 +415,60 @@ static_assert!(core::mem::size_of::<EventMsg>() == 4 + EVENT_SZ);
 
 pub(crate) const EVENT_MAX: u32 = 0x8;
 
+/// Event ring messages of the 14.x (G15) firmware: types 0..15.
+/// Types 1 and 8 keep their G13 layout; type 0 is no longer a fault, faults arrive as type-4
+/// recovery packets.
+#[derive(Debug, Copy, Clone)]
+#[repr(C, u32)]
+#[allow(dead_code)]
+pub(crate) enum EventMsgG15 {
+    /// Firmware controller event
+    ControllerEvent(Array<EVENT_SZ, u8>) = 0x0,
+    Flag {
+        firing: [u32; 4],
+        unk_14: u16,
+    } = 0x1,
+    Unk2(Array<EVENT_SZ, u8>) = 0x2,
+    Unk3(Array<EVENT_SZ, u8>) = 0x3,
+    /// GPU recovery packet; details are read from StatusBlock+0x44a0
+    RecoveryPacket(Array<EVENT_SZ, u8>) = 0x4,
+    Unk5(Array<EVENT_SZ, u8>) = 0x5,
+    Unk6(Array<EVENT_SZ, u8>) = 0x6,
+    /// 0x18-byte payload; assumed to be the G13 `GrowTVB` layout
+    GrowTVB {
+        vm_slot: u32,
+        buffer_slot: u32,
+        counter: u32,
+    } = 0x7,
+    ChannelError {
+        error_type: u32,
+        pipe_type: u32,
+        event_slot: u32,
+        event_value: u32,
+    } = 0x8,
+    Unk9(Array<EVENT_SZ, u8>) = 0x9,
+    Unk10(Array<EVENT_SZ, u8>) = 0xa,
+    /// Performance-control notification
+    Unk11(Array<EVENT_SZ, u8>) = 0xb,
+    Unk12(Array<EVENT_SZ, u8>) = 0xc,
+    Unk13(Array<EVENT_SZ, u8>) = 0xd,
+    /// UMA / dynamic-caching asynchronous grow completion
+    UmaGrowComplete(Array<EVENT_SZ, u8>) = 0xe,
+    /// Performance-controller I/O notification (about 250 per second while the GPU is up)
+    ClpcPerfControl(Array<EVENT_SZ, u8>) = 0xf,
+}
+
+static_assert!(core::mem::size_of::<EventMsgG15>() == 4 + EVENT_SZ);
+
+/// Highest 14.x event type.
+pub(crate) const EVENT_MAX_G15: u32 = 0xf;
+
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub(crate) union RawEventMsg {
     pub(crate) raw: (u32, Array<EVENT_SZ, u8>),
     pub(crate) msg: EventMsg,
+    pub(crate) msg_g15: EventMsgG15,
 }
 
 default_zeroed!(RawEventMsg);

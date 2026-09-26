@@ -45,7 +45,9 @@ impl super::QueueInner::ver {
         flush_stamps: bool,
     ) -> Result {
         let gpu = match (*self.dev)
-            .gpu
+            .gpu()?
+            .legacy_manager()
+            .ok_or(EIO)?
             .as_any()
             .downcast_ref::<gpu::GpuManager::ver>()
         {

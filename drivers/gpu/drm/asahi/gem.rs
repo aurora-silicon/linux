@@ -88,6 +88,19 @@ impl ObjectRef {
         self.gem.vmap()
     }
 
+    /// Borrow the mapping already retained by this object wrapper.
+    ///
+    /// Unlike a fresh GEM `VMapRef`, this borrow does not take the reservation
+    /// lock or change the shmem vmap reference count on every access. The owned
+    /// mapping pins the backing for the entire borrow, including GPU updates
+    /// to shared command state. Callers still provide device memory ordering.
+    pub(crate) fn cached_vmap(&mut self) -> Result<kernel::iosys_map::IoSysMapRef<'_, u8>> {
+        if self.vmap.is_none() {
+            self.vmap = Some(self.gem.owned_vmap()?);
+        }
+        Ok(self.vmap.as_ref().ok_or(EIO)?.get())
+    }
+
     /// Returns the size of an object in bytes
     pub(crate) fn size(&self) -> usize {
         self.gem.size()
@@ -156,13 +169,16 @@ pub(crate) struct AsahiObjConfig {
     kernel: bool,
 }
 
-/// Create a new kernel-owned GEM object.
-pub(crate) fn new_kernel_object(dev: &AsahiDevice, size: usize) -> Result<ObjectRef> {
+fn new_kernel_object_with_cpu_mapping(
+    dev: &AsahiDevice,
+    size: usize,
+    map_wc: bool,
+) -> Result<ObjectRef> {
     let gem = shmem::Object::<AsahiObject>::new(
         dev,
         align(size, mmu::UAT_PGSZ),
         shmem::ObjectConfig::<AsahiObject> {
-            map_wc: false,
+            map_wc,
             parent_resv_obj: None,
         },
         AsahiObjConfig {
@@ -174,6 +190,15 @@ pub(crate) fn new_kernel_object(dev: &AsahiDevice, size: usize) -> Result<Object
 
     mod_pr_debug!("AsahiObject new kernel object id={}\n", gem.id);
     Ok(ObjectRef::new(gem))
+}
+
+/// Create a new kernel-owned GEM object with a write-back CPU mapping.
+pub(crate) fn new_kernel_object(dev: &AsahiDevice, size: usize) -> Result<ObjectRef> {
+    new_kernel_object_with_cpu_mapping(dev, size, false)
+}
+
+pub(crate) fn new_kernel_object_wc(dev: &AsahiDevice, size: usize) -> Result<ObjectRef> {
+    new_kernel_object_with_cpu_mapping(dev, size, true)
 }
 
 /// Create a new user-owned GEM object with the given flags.

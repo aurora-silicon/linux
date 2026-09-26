@@ -175,10 +175,34 @@ impl<T: DriverObject> Object<T> {
         //   `obj` is contained within a drm_gem_shmem_object
         let this = unsafe { container_of!(obj, bindings::drm_gem_shmem_object, base) };
 
+        // Retain the private shmem file across GEM teardown. Releasing its
+        // last reference from a GPU completion worker otherwise queues all
+        // backing-page destruction on the single delayed_fput worker. A
+        // stream of short-lived clients can allocate faster than that worker
+        // reclaims memory, even though their GEM objects have been freed.
+        //
+        // SAFETY: The final GEM reference owns filp until release below.
+        // Imported objects have no private shmem file.
+        let backing = unsafe { (*obj).filp };
+        if !backing.is_null() {
+            // SAFETY: The GEM reference still owns this live file.
+            unsafe { bindings::get_file(backing) };
+        }
+
         // SAFETY:
         // - We're in free_callback - so this function is safe to call.
         // - We won't be using the gem resources on `this` after this call.
         unsafe { bindings::drm_gem_shmem_release(this) };
+
+        if !backing.is_null() {
+            // SAFETY: Consume the reference acquired above, after DMA/page
+            // pins and reservation locks have been released. This file is
+            // the private shmem backing created by drm_gem_object_init, not
+            // an arbitrary filesystem or DRM file. Its eviction cannot wait
+            // for this GPU worker, and GEM release already requires a
+            // sleepable context. Reclaim pages before accepting more work.
+            unsafe { bindings::__fput_sync(backing) };
+        }
 
         // SAFETY:
         // - We verified above that `obj` is valid, which makes `this` valid

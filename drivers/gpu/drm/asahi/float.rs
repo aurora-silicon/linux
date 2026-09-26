@@ -49,6 +49,11 @@ impl F32 {
         F32(u)
     }
 
+    /// The raw 32-bit representation of an F32
+    pub(crate) const fn to_bits(self) -> u32 {
+        self.0
+    }
+
     // Convert a `f32` value into an F32
     //
     // This must ONLY be used in const context. Use the `f32!{}` macro to do it safely.

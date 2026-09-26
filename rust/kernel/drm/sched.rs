@@ -24,6 +24,9 @@ pub enum Status {
     Nominal = bindings::drm_gpu_sched_stat_DRM_GPU_SCHED_STAT_RESET,
     /// Device is no longer available
     NoDevice = bindings::drm_gpu_sched_stat_DRM_GPU_SCHED_STAT_ENODEV,
+    /// The job did not hang: it is still running or has already completed.
+    /// The scheduler puts it back on its pending list and rearms the timeout.
+    NoHang = bindings::drm_gpu_sched_stat_DRM_GPU_SCHED_STAT_NO_HANG,
 }
 
 /// Scheduler priorities

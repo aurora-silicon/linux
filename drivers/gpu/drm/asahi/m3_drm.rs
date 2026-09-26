@@ -1,0 +1,94 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+//! M3 through the common Asahi GEM, GPUVM and render-node frontend.
+use core::ops::Range;
+use kernel::{device::Core, drm, new_mutex, platform, prelude::*, sync::{Arc, Mutex}};
+use crate::{alloc, driver, drm_gpu::{DrmGpu, DrmGpuParams}, gem, gpu, hw, mmu, queue};
+
+pub(crate) type Shared = Arc<Mutex<Option<crate::m3_runtime::Runtime>>>;
+pub(crate) struct Registered {
+    registration: Pin<KBox<Mutex<Option<drm::driver::Registration<driver::AsahiDriver>>>>>,
+    shared: Shared,
+    health: Arc<crate::m3_rtkit::Health>,
+}
+impl Registered {
+    pub(crate) fn start(pdev: &platform::Device<Core>) -> Result<Self> {
+        let resources = crate::m3_resources::from_device(pdev)?;
+        dev_info!(pdev.as_ref(), "M3: resource admission complete\n");
+        let firmware = crate::m3_firmware::identify_loaded(pdev, resources)?;
+        dev_info!(pdev.as_ref(), "M3: firmware identity accepted\n");
+        // InitData source and contents, before any GPU register access.
+        let contents = crate::m3_adt_config::Contents::select(pdev, &firmware)?;
+        let device = crate::m3_device::Device::new(pdev, firmware)?;
+        device.check_drm(pdev)?;
+        let core_mask = device.core_mask();
+        let max_frequency_khz = 1000 * contents.pstates.reported_max_mhz();
+        let mut runtime = crate::m3_runtime::Runtime::new(pdev, device, contents)?;
+        runtime.boot(pdev)?;
+        dev_info!(pdev.as_ref(), "M3: runtime switches: asahi.m3_unlocked_wait={} asahi.m3_timeout_nohang={} resume experiment (asahi.g15_debug bit 56)={}\n",
+            u8::from(crate::m3_params::unlocked_wait()), u8::from(crate::m3_params::timeout_nohang()),
+            u8::from(crate::m3_params::g15_debug(crate::m3_params::G15Debug::M3ResumeAfterFault)));
+        let drm = runtime.drm();
+        let health = runtime.health();
+        let shared = Arc::pin_init(new_mutex!(Some(runtime)), GFP_KERNEL)?;
+        let owner = Self { registration: KBox::pin_init(new_mutex!(None), GFP_KERNEL)?, shared: shared.clone(), health: health.clone() };
+        let scheduler=Arc::new(drm::sched::Scheduler::new(drm.as_ref(),4,8,0,3000,kernel::c_str!("asahi_m3_sched"))?,GFP_KERNEL)?;
+        let backend: Arc<dyn DrmGpu> = Arc::new(Backend { shared, health, scheduler, ids: gpu::SequenceIDs::default(),
+            core_mask, max_frequency_khz }, GFP_KERNEL)?;
+        if !drm.gpu.populate(backend) { return Err(EBUSY); }
+        if crate::m3_board::expose_render_node() {
+            *owner.registration.lock() = Some(drm::driver::Registration::new(&drm, 0)?);
+            dev_info!(pdev.as_ref(), "M3: firmware ready; common DRM GEM/VM frontend registered\n");
+        } else {
+            dev_info!(pdev.as_ref(), "M3: firmware ready; render node not registered on this board (asahi.m3_expose=1 registers it)\n");
+        }
+        Ok(owner)
+    }
+    pub(crate) fn stop(&self) {
+        self.health.mark_failed();
+        drop(self.registration.lock().take());
+        drop(self.shared.lock().take());
+    }
+}
+impl Drop for Registered { fn drop(&mut self) { self.stop(); } }
+struct Backend { shared: Shared, health: Arc<crate::m3_rtkit::Health>, ids: gpu::SequenceIDs,
+    scheduler:Arc<drm::sched::Scheduler<crate::m3_submit::Job>>, core_mask: u32, max_frequency_khz: u32 }
+impl DrmGpu for Backend {
+    fn init(&self) -> Result { if self.is_crashed() { Err(ENODEV) } else { Ok(()) } }
+    fn ids(&self) -> &gpu::SequenceIDs { &self.ids }
+    fn is_crashed(&self) -> bool { !self.health.healthy() }
+    fn update_globals(&self) {}
+    fn service_g16_jobs(&self) {
+        if let Some(runtime)=Option::as_mut(&mut *self.shared.lock()) { runtime.service_events(); }
+    }
+    fn supports_vm_status(&self) -> bool { true }
+    fn supports_scheduled_queues(&self)->bool {true}
+    fn submission_error(&self) -> i32 { if self.is_crashed() { EIO.to_errno() } else { 0 } }
+    fn params(&self) -> Result<DrmGpuParams> {
+        let masks = crate::m3_board::core_masks(self.core_mask);
+        Ok(DrmGpuParams { gpu_generation: hw::GpuGen::G15 as u32,
+            gpu_variant: hw::GpuVariant::S as u32, gpu_revision: hw::GpuRevision::B1 as u32,
+            chip_id: 0x6030, num_dies: 1, num_clusters_total: 2, num_cores_per_cluster: 10,
+            core_masks: masks, max_frequency_khz: self.max_frequency_khz, usc_generation: 3,
+            gpu_hal_generation: hw::GpuHalGeneration::Legacy as u32,
+            max_commands_per_submission: crate::file::MAX_COMMANDS_PER_SUBMISSION })
+    }
+    fn user_range(&self) -> Result<Range<u64>> { Ok(mmu::UAT_PGSZ as u64..0x2ff_ffff_8000) }
+    fn unknown_page(&self) -> Result<u64> { Ok(0x2ff_ffff_8000) }
+    fn base_clock_hz(&self) -> u32 {
+        let value: u64;
+        // SAFETY: read-only architectural counter frequency.
+        unsafe { core::arch::asm!("mrs {x}, CNTFRQ_EL0", x=out(reg) value) };
+        value as u32
+    }
+    fn new_vm(&self, range: Range<u64>) -> Result<mmu::Vm> {
+        Option::as_mut(&mut *self.shared.lock()).ok_or(ENODEV)?.new_vm(self.ids.vm.next(), range)
+    }
+    fn new_queue(&self, vm: mmu::Vm, _ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
+        _ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>, priority: u32,
+        usc_exec_base: u64) -> Result<KBox<dyn queue::Queue>> {
+        Ok(KBox::new(crate::m3_submit::Queue::new(self.shared.clone(),self.scheduler.clone(),vm,priority,usc_exec_base)?,GFP_KERNEL)?)
+    }
+    fn map_timestamp_buffer(&self, bo: gem::ObjectRef, range: Range<usize>) -> Result<mmu::KernelMapping> {
+        self.shared.lock().as_ref().ok_or(ENODEV)?.map_timestamp(bo,range)
+    }
+}
