@@ -356,6 +356,15 @@
 						bits = <4 4>;
 					};
 
+					/*
+					 * Whole seconds, not 32768 Hz ticks as
+					 * on M1/M2. 0xf802 holds the running
+					 * counter itself.
+					 */
+					rtc_offset: rtc-offset@f704 {
+						reg = <0xf704 0x8>;
+					};
+
 					shutdown_flag: shutdown-flag@f70f,3 {
 						reg = <0xf70f 0x1>;
 						bits = <3 1>;
@@ -436,6 +445,13 @@
 					      <&boot_error_count>, <&panic_count>;
 				nvmem-cell-names = "shutdown_flag", "boot_stage",
 						   "boot_error_count", "panic_count";
+			};
+
+			rtc {
+				compatible = "apple,smc-rtc";
+				nvmem-cells = <&rtc_offset>;
+				nvmem-cell-names = "rtc_offset";
+				apple,rtc-offset-seconds;
 			};
 		};
 

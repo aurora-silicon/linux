@@ -166,6 +166,985 @@
 &smc_hwmon {
 	/* interim J700 CPU thermal policy over the CPU die channels */
 	apple,cpu-thermal-policy;
+
+	/*
+	 * Reporting-only channels. They follow the six CPU die temperatures
+	 * in t8140.dtsi, which the CPU thermal policy samples by position.
+	 * Every key below is in the J700 SMC's key table as a read-only
+	 * float, reads 10-99 C and moves between samples. The names follow
+	 * the SMC key groups and are not otherwise verified.
+	 */
+	temperature-TH0p {
+		apple,key-id = "TH0p";
+		label = "Storage (NAND)";
+	};
+
+	temperature-TW0p {
+		apple,key-id = "TW0p";
+		label = "Wi-Fi Module";
+	};
+
+	temperature-TUCp {
+		apple,key-id = "TUCp";
+		label = "USB-C Port";
+	};
+
+	temperature-TaTp {
+		apple,key-id = "TaTp";
+		label = "Ambient";
+	};
+
+	temperature-TCMz {
+		apple,key-id = "TCMz";
+		label = "Charger";
+	};
+
+	temperature-Ts0A {
+		apple,key-id = "Ts0A";
+		label = "Chassis 1";
+	};
+
+	temperature-Ts0I {
+		apple,key-id = "Ts0I";
+		label = "Chassis 2";
+	};
+
+	temperature-Ts0M {
+		apple,key-id = "Ts0M";
+		label = "Chassis 3";
+	};
+
+	/* The remaining live temperature keys; placement unknown */
+	temperature-TBLp {
+		apple,key-id = "TBLp";
+		label = "SMC TBLp";
+	};
+
+	temperature-TCMb {
+		apple,key-id = "TCMb";
+		label = "SMC TCMb";
+	};
+
+	temperature-TPD0 {
+		apple,key-id = "TPD0";
+		label = "SMC TPD0";
+	};
+
+	temperature-TPD1 {
+		apple,key-id = "TPD1";
+		label = "SMC TPD1";
+	};
+
+	temperature-TPD2 {
+		apple,key-id = "TPD2";
+		label = "SMC TPD2";
+	};
+
+	temperature-TPD3 {
+		apple,key-id = "TPD3";
+		label = "SMC TPD3";
+	};
+
+	temperature-TPD4 {
+		apple,key-id = "TPD4";
+		label = "SMC TPD4";
+	};
+
+	temperature-TPD5 {
+		apple,key-id = "TPD5";
+		label = "SMC TPD5";
+	};
+
+	temperature-TPD6 {
+		apple,key-id = "TPD6";
+		label = "SMC TPD6";
+	};
+
+	temperature-TR5p {
+		apple,key-id = "TR5p";
+		label = "SMC TR5p";
+	};
+
+	temperature-TRD0 {
+		apple,key-id = "TRD0";
+		label = "SMC TRD0";
+	};
+
+	temperature-TRD1 {
+		apple,key-id = "TRD1";
+		label = "SMC TRD1";
+	};
+
+	temperature-TRD2 {
+		apple,key-id = "TRD2";
+		label = "SMC TRD2";
+	};
+
+	temperature-TRD3 {
+		apple,key-id = "TRD3";
+		label = "SMC TRD3";
+	};
+
+	temperature-TS0p {
+		apple,key-id = "TS0p";
+		label = "SMC TS0p";
+	};
+
+	temperature-TS1p {
+		apple,key-id = "TS1p";
+		label = "SMC TS1p";
+	};
+
+	temperature-TTSp {
+		apple,key-id = "TTSp";
+		label = "SMC TTSp";
+	};
+
+	temperature-TVA0 {
+		apple,key-id = "TVA0";
+		label = "SMC TVA0";
+	};
+
+	temperature-TVA1 {
+		apple,key-id = "TVA1";
+		label = "SMC TVA1";
+	};
+
+	temperature-TVD0 {
+		apple,key-id = "TVD0";
+		label = "SMC TVD0";
+	};
+
+	temperature-TVMR {
+		apple,key-id = "TVMR";
+		label = "SMC TVMR";
+	};
+
+	temperature-TVS0 {
+		apple,key-id = "TVS0";
+		label = "SMC TVS0";
+	};
+
+	temperature-TVS1 {
+		apple,key-id = "TVS1";
+		label = "SMC TVS1";
+	};
+
+	temperature-TVS3 {
+		apple,key-id = "TVS3";
+		label = "SMC TVS3";
+	};
+
+	temperature-TVS4 {
+		apple,key-id = "TVS4";
+		label = "SMC TVS4";
+	};
+
+	temperature-TVmS {
+		apple,key-id = "TVmS";
+		label = "SMC TVmS";
+	};
+
+	temperature-Te04 {
+		apple,key-id = "Te04";
+		label = "SMC Te04";
+	};
+
+	temperature-Te06 {
+		apple,key-id = "Te06";
+		label = "SMC Te06";
+	};
+
+	temperature-Te0R {
+		apple,key-id = "Te0R";
+		label = "SMC Te0R";
+	};
+
+	temperature-Te0T {
+		apple,key-id = "Te0T";
+		label = "SMC Te0T";
+	};
+
+	temperature-Tex0 {
+		apple,key-id = "Tex0";
+		label = "SMC Tex0";
+	};
+
+	temperature-Tex1 {
+		apple,key-id = "Tex1";
+		label = "SMC Tex1";
+	};
+
+	temperature-Tex2 {
+		apple,key-id = "Tex2";
+		label = "SMC Tex2";
+	};
+
+	temperature-Tex3 {
+		apple,key-id = "Tex3";
+		label = "SMC Tex3";
+	};
+
+	temperature-Tp00 {
+		apple,key-id = "Tp00";
+		label = "SMC Tp00";
+	};
+
+	temperature-Tp02 {
+		apple,key-id = "Tp02";
+		label = "SMC Tp02";
+	};
+
+	temperature-Tp04 {
+		apple,key-id = "Tp04";
+		label = "SMC Tp04";
+	};
+
+	temperature-Tp06 {
+		apple,key-id = "Tp06";
+		label = "SMC Tp06";
+	};
+
+	temperature-Tp08 {
+		apple,key-id = "Tp08";
+		label = "SMC Tp08";
+	};
+
+	temperature-Tp0A {
+		apple,key-id = "Tp0A";
+		label = "SMC Tp0A";
+	};
+
+	temperature-Tp0C {
+		apple,key-id = "Tp0C";
+		label = "SMC Tp0C";
+	};
+
+	temperature-Tp0E {
+		apple,key-id = "Tp0E";
+		label = "SMC Tp0E";
+	};
+
+	temperature-Tp0l {
+		apple,key-id = "Tp0l";
+		label = "SMC Tp0l";
+	};
+
+	temperature-Tp0m {
+		apple,key-id = "Tp0m";
+		label = "SMC Tp0m";
+	};
+
+	temperature-Tp0n {
+		apple,key-id = "Tp0n";
+		label = "SMC Tp0n";
+	};
+
+	temperature-Tp0o {
+		apple,key-id = "Tp0o";
+		label = "SMC Tp0o";
+	};
+
+	temperature-Tp0q {
+		apple,key-id = "Tp0q";
+		label = "SMC Tp0q";
+	};
+
+	temperature-Tp0t {
+		apple,key-id = "Tp0t";
+		label = "SMC Tp0t";
+	};
+
+	temperature-Tpx0 {
+		apple,key-id = "Tpx0";
+		label = "SMC Tpx0";
+	};
+
+	temperature-Tpx1 {
+		apple,key-id = "Tpx1";
+		label = "SMC Tpx1";
+	};
+
+	temperature-Tpx2 {
+		apple,key-id = "Tpx2";
+		label = "SMC Tpx2";
+	};
+
+	temperature-Tpx3 {
+		apple,key-id = "Tpx3";
+		label = "SMC Tpx3";
+	};
+
+	temperature-Ts00 {
+		apple,key-id = "Ts00";
+		label = "SMC Ts00";
+	};
+
+	temperature-Ts01 {
+		apple,key-id = "Ts01";
+		label = "SMC Ts01";
+	};
+
+	temperature-Ts02 {
+		apple,key-id = "Ts02";
+		label = "SMC Ts02";
+	};
+
+	temperature-Ts04 {
+		apple,key-id = "Ts04";
+		label = "SMC Ts04";
+	};
+
+	temperature-Ts05 {
+		apple,key-id = "Ts05";
+		label = "SMC Ts05";
+	};
+
+	temperature-Ts06 {
+		apple,key-id = "Ts06";
+		label = "SMC Ts06";
+	};
+
+	temperature-Ts08 {
+		apple,key-id = "Ts08";
+		label = "SMC Ts08";
+	};
+
+	temperature-Ts09 {
+		apple,key-id = "Ts09";
+		label = "SMC Ts09";
+	};
+
+	temperature-Ts0C {
+		apple,key-id = "Ts0C";
+		label = "SMC Ts0C";
+	};
+
+	temperature-Ts0D {
+		apple,key-id = "Ts0D";
+		label = "SMC Ts0D";
+	};
+
+	temperature-Ts0E {
+		apple,key-id = "Ts0E";
+		label = "SMC Ts0E";
+	};
+
+	temperature-Ts0G {
+		apple,key-id = "Ts0G";
+		label = "SMC Ts0G";
+	};
+
+	temperature-Ts0H {
+		apple,key-id = "Ts0H";
+		label = "SMC Ts0H";
+	};
+
+	temperature-Ts0K {
+		apple,key-id = "Ts0K";
+		label = "SMC Ts0K";
+	};
+
+	temperature-Ts0L {
+		apple,key-id = "Ts0L";
+		label = "SMC Ts0L";
+	};
+
+	temperature-Tsx0 {
+		apple,key-id = "Tsx0";
+		label = "SMC Tsx0";
+	};
+
+	temperature-Tsx1 {
+		apple,key-id = "Tsx1";
+		label = "SMC Tsx1";
+	};
+
+	/*
+	 * Current, power and voltage rails: every other read-only float
+	 * I*, P* and V* key in the J700 SMC's key table. The units follow
+	 * the prefix (amperes, watts, volts); the rails they measure are not
+	 * known, so they carry the raw key. Some read zero while idle.
+	 */
+	current-IBat {
+		apple,key-id = "IBat";
+		label = "SMC IBat";
+	};
+
+	current-IBws {
+		apple,key-id = "IBws";
+		label = "SMC IBws";
+	};
+
+	current-IP0b {
+		apple,key-id = "IP0b";
+		label = "SMC IP0b";
+	};
+
+	current-IP1b {
+		apple,key-id = "IP1b";
+		label = "SMC IP1b";
+	};
+
+	current-IP1l {
+		apple,key-id = "IP1l";
+		label = "SMC IP1l";
+	};
+
+	current-IP2b {
+		apple,key-id = "IP2b";
+		label = "SMC IP2b";
+	};
+
+	current-IP3b {
+		apple,key-id = "IP3b";
+		label = "SMC IP3b";
+	};
+
+	current-IP3l {
+		apple,key-id = "IP3l";
+		label = "SMC IP3l";
+	};
+
+	current-IP4b {
+		apple,key-id = "IP4b";
+		label = "SMC IP4b";
+	};
+
+	current-IP4l {
+		apple,key-id = "IP4l";
+		label = "SMC IP4l";
+	};
+
+	current-IP5b {
+		apple,key-id = "IP5b";
+		label = "SMC IP5b";
+	};
+
+	current-IP5l {
+		apple,key-id = "IP5l";
+		label = "SMC IP5l";
+	};
+
+	current-IP6b {
+		apple,key-id = "IP6b";
+		label = "SMC IP6b";
+	};
+
+	current-IP6l {
+		apple,key-id = "IP6l";
+		label = "SMC IP6l";
+	};
+
+	current-IP7b {
+		apple,key-id = "IP7b";
+		label = "SMC IP7b";
+	};
+
+	current-IP8b {
+		apple,key-id = "IP8b";
+		label = "SMC IP8b";
+	};
+
+	current-IP9l {
+		apple,key-id = "IP9l";
+		label = "SMC IP9l";
+	};
+
+	current-IPMC {
+		apple,key-id = "IPMC";
+		label = "SMC IPMC";
+	};
+
+	current-IPab {
+		apple,key-id = "IPab";
+		label = "SMC IPab";
+	};
+
+	current-IPbb {
+		apple,key-id = "IPbb";
+		label = "SMC IPbb";
+	};
+
+	current-IPbl {
+		apple,key-id = "IPbl";
+		label = "SMC IPbl";
+	};
+
+	current-IPcb {
+		apple,key-id = "IPcb";
+		label = "SMC IPcb";
+	};
+
+	current-IPcl {
+		apple,key-id = "IPcl";
+		label = "SMC IPcl";
+	};
+
+	current-IPdb {
+		apple,key-id = "IPdb";
+		label = "SMC IPdb";
+	};
+
+	current-IPgl {
+		apple,key-id = "IPgl";
+		label = "SMC IPgl";
+	};
+
+	current-IPhl {
+		apple,key-id = "IPhl";
+		label = "SMC IPhl";
+	};
+
+	current-IPil {
+		apple,key-id = "IPil";
+		label = "SMC IPil";
+	};
+
+	current-IR1l {
+		apple,key-id = "IR1l";
+		label = "SMC IR1l";
+	};
+
+	current-IR2l {
+		apple,key-id = "IR2l";
+		label = "SMC IR2l";
+	};
+
+	current-IRil {
+		apple,key-id = "IRil";
+		label = "SMC IRil";
+	};
+
+	current-Ib0f {
+		apple,key-id = "Ib0f";
+		label = "SMC Ib0f";
+	};
+
+	current-Ib1f {
+		apple,key-id = "Ib1f";
+		label = "SMC Ib1f";
+	};
+
+	power-PBat {
+		apple,key-id = "PBat";
+		label = "SMC PBat";
+	};
+
+	power-PBwo {
+		apple,key-id = "PBwo";
+		label = "SMC PBwo";
+	};
+
+	power-PDCP {
+		apple,key-id = "PDCP";
+		label = "SMC PDCP";
+	};
+
+	power-PDTP {
+		apple,key-id = "PDTP";
+		label = "SMC PDTP";
+	};
+
+	power-PP0b {
+		apple,key-id = "PP0b";
+		label = "SMC PP0b";
+	};
+
+	power-PP1b {
+		apple,key-id = "PP1b";
+		label = "SMC PP1b";
+	};
+
+	power-PP1l {
+		apple,key-id = "PP1l";
+		label = "SMC PP1l";
+	};
+
+	power-PP2b {
+		apple,key-id = "PP2b";
+		label = "SMC PP2b";
+	};
+
+	power-PP3b {
+		apple,key-id = "PP3b";
+		label = "SMC PP3b";
+	};
+
+	power-PP3l {
+		apple,key-id = "PP3l";
+		label = "SMC PP3l";
+	};
+
+	power-PP4b {
+		apple,key-id = "PP4b";
+		label = "SMC PP4b";
+	};
+
+	power-PP4l {
+		apple,key-id = "PP4l";
+		label = "SMC PP4l";
+	};
+
+	power-PP5b {
+		apple,key-id = "PP5b";
+		label = "SMC PP5b";
+	};
+
+	power-PP5l {
+		apple,key-id = "PP5l";
+		label = "SMC PP5l";
+	};
+
+	power-PP6b {
+		apple,key-id = "PP6b";
+		label = "SMC PP6b";
+	};
+
+	power-PP6l {
+		apple,key-id = "PP6l";
+		label = "SMC PP6l";
+	};
+
+	power-PP7b {
+		apple,key-id = "PP7b";
+		label = "SMC PP7b";
+	};
+
+	power-PP8b {
+		apple,key-id = "PP8b";
+		label = "SMC PP8b";
+	};
+
+	power-PP9l {
+		apple,key-id = "PP9l";
+		label = "SMC PP9l";
+	};
+
+	power-PPBR {
+		apple,key-id = "PPBR";
+		label = "SMC PPBR";
+	};
+
+	power-PPMC {
+		apple,key-id = "PPMC";
+		label = "SMC PPMC";
+	};
+
+	power-PPSM {
+		apple,key-id = "PPSM";
+		label = "SMC PPSM";
+	};
+
+	power-PPab {
+		apple,key-id = "PPab";
+		label = "SMC PPab";
+	};
+
+	power-PPbb {
+		apple,key-id = "PPbb";
+		label = "SMC PPbb";
+	};
+
+	power-PPbl {
+		apple,key-id = "PPbl";
+		label = "SMC PPbl";
+	};
+
+	power-PPcb {
+		apple,key-id = "PPcb";
+		label = "SMC PPcb";
+	};
+
+	power-PPcl {
+		apple,key-id = "PPcl";
+		label = "SMC PPcl";
+	};
+
+	power-PPdb {
+		apple,key-id = "PPdb";
+		label = "SMC PPdb";
+	};
+
+	power-PPgl {
+		apple,key-id = "PPgl";
+		label = "SMC PPgl";
+	};
+
+	power-PPhl {
+		apple,key-id = "PPhl";
+		label = "SMC PPhl";
+	};
+
+	power-PPil {
+		apple,key-id = "PPil";
+		label = "SMC PPil";
+	};
+
+	power-PR1l {
+		apple,key-id = "PR1l";
+		label = "SMC PR1l";
+	};
+
+	power-PR2l {
+		apple,key-id = "PR2l";
+		label = "SMC PR2l";
+	};
+
+	power-PRil {
+		apple,key-id = "PRil";
+		label = "SMC PRil";
+	};
+
+	power-PZC0 {
+		apple,key-id = "PZC0";
+		label = "SMC PZC0";
+	};
+
+	power-PZC1 {
+		apple,key-id = "PZC1";
+		label = "SMC PZC1";
+	};
+
+	power-PZCB {
+		apple,key-id = "PZCB";
+		label = "SMC PZCB";
+	};
+
+	power-PZCU {
+		apple,key-id = "PZCU";
+		label = "SMC PZCU";
+	};
+
+	power-PZD1 {
+		apple,key-id = "PZD1";
+		label = "SMC PZD1";
+	};
+
+	power-PZT0 {
+		apple,key-id = "PZT0";
+		label = "SMC PZT0";
+	};
+
+	power-Pb0f {
+		apple,key-id = "Pb0f";
+		label = "SMC Pb0f";
+	};
+
+	power-Pb1f {
+		apple,key-id = "Pb1f";
+		label = "SMC Pb1f";
+	};
+
+	power-Pb2f {
+		apple,key-id = "Pb2f";
+		label = "SMC Pb2f";
+	};
+
+	voltage-VBat {
+		apple,key-id = "VBat";
+		label = "SMC VBat";
+	};
+
+	voltage-VP0R {
+		apple,key-id = "VP0R";
+		label = "SMC VP0R";
+	};
+
+	voltage-VP0b {
+		apple,key-id = "VP0b";
+		label = "SMC VP0b";
+	};
+
+	voltage-VP0s {
+		apple,key-id = "VP0s";
+		label = "SMC VP0s";
+	};
+
+	voltage-VP1b {
+		apple,key-id = "VP1b";
+		label = "SMC VP1b";
+	};
+
+	voltage-VP1l {
+		apple,key-id = "VP1l";
+		label = "SMC VP1l";
+	};
+
+	voltage-VP1s {
+		apple,key-id = "VP1s";
+		label = "SMC VP1s";
+	};
+
+	voltage-VP2b {
+		apple,key-id = "VP2b";
+		label = "SMC VP2b";
+	};
+
+	voltage-VP3b {
+		apple,key-id = "VP3b";
+		label = "SMC VP3b";
+	};
+
+	voltage-VP3l {
+		apple,key-id = "VP3l";
+		label = "SMC VP3l";
+	};
+
+	voltage-VP3s {
+		apple,key-id = "VP3s";
+		label = "SMC VP3s";
+	};
+
+	voltage-VP4b {
+		apple,key-id = "VP4b";
+		label = "SMC VP4b";
+	};
+
+	voltage-VP4l {
+		apple,key-id = "VP4l";
+		label = "SMC VP4l";
+	};
+
+	voltage-VP4s {
+		apple,key-id = "VP4s";
+		label = "SMC VP4s";
+	};
+
+	voltage-VP5b {
+		apple,key-id = "VP5b";
+		label = "SMC VP5b";
+	};
+
+	voltage-VP5l {
+		apple,key-id = "VP5l";
+		label = "SMC VP5l";
+	};
+
+	voltage-VP5s {
+		apple,key-id = "VP5s";
+		label = "SMC VP5s";
+	};
+
+	voltage-VP6b {
+		apple,key-id = "VP6b";
+		label = "SMC VP6b";
+	};
+
+	voltage-VP6l {
+		apple,key-id = "VP6l";
+		label = "SMC VP6l";
+	};
+
+	voltage-VP7b {
+		apple,key-id = "VP7b";
+		label = "SMC VP7b";
+	};
+
+	voltage-VP8b {
+		apple,key-id = "VP8b";
+		label = "SMC VP8b";
+	};
+
+	voltage-VP9l {
+		apple,key-id = "VP9l";
+		label = "SMC VP9l";
+	};
+
+	voltage-VPBR {
+		apple,key-id = "VPBR";
+		label = "SMC VPBR";
+	};
+
+	voltage-VPab {
+		apple,key-id = "VPab";
+		label = "SMC VPab";
+	};
+
+	voltage-VPbb {
+		apple,key-id = "VPbb";
+		label = "SMC VPbb";
+	};
+
+	voltage-VPbl {
+		apple,key-id = "VPbl";
+		label = "SMC VPbl";
+	};
+
+	voltage-VPcb {
+		apple,key-id = "VPcb";
+		label = "SMC VPcb";
+	};
+
+	voltage-VPcl {
+		apple,key-id = "VPcl";
+		label = "SMC VPcl";
+	};
+
+	voltage-VPdb {
+		apple,key-id = "VPdb";
+		label = "SMC VPdb";
+	};
+
+	voltage-VPgl {
+		apple,key-id = "VPgl";
+		label = "SMC VPgl";
+	};
+
+	voltage-VPhl {
+		apple,key-id = "VPhl";
+		label = "SMC VPhl";
+	};
+
+	voltage-VPil {
+		apple,key-id = "VPil";
+		label = "SMC VPil";
+	};
+
+	voltage-VR1l {
+		apple,key-id = "VR1l";
+		label = "SMC VR1l";
+	};
+
+	voltage-VR2l {
+		apple,key-id = "VR2l";
+		label = "SMC VR2l";
+	};
+
+	voltage-VR5c {
+		apple,key-id = "VR5c";
+		label = "SMC VR5c";
+	};
+
+	voltage-VRbi {
+		apple,key-id = "VRbi";
+		label = "SMC VRbi";
+	};
+
+	voltage-VRil {
+		apple,key-id = "VRil";
+		label = "SMC VRil";
+	};
+
+	voltage-VRmi {
+		apple,key-id = "VRmi";
+		label = "SMC VRmi";
+	};
+
+	voltage-VRwo {
+		apple,key-id = "VRwo";
+		label = "SMC VRwo";
+	};
+
+	voltage-Vb1f {
+		apple,key-id = "Vb1f";
+		label = "SMC Vb1f";
+	};
+
+	voltage-Vb3f {
+		apple,key-id = "Vb3f";
+		label = "SMC Vb3f";
+	};
 };
 
 &smc_mbox {
