@@ -116,7 +116,9 @@ const SPKR_POWER_STATE_PW0: u32 = from_fourcc(b"pw0 ");
 const SPKR_POWER_STATE_PWRD: u32 = from_fourcc(b"pwrd");
 
 /// Leaf power-up retries while the firmware raises the fabric (see `PowerDomain::get`).
-const PD_GET_ATTEMPTS: u32 = 60;
+/// Blind attempts before the fabric is raised, and attempts while it rises.
+const PD_GET_ATTEMPTS: u32 = 3;
+const PD_GET_RAISED_ATTEMPTS: u32 = 60;
 const PD_GET_RETRY_MS: i64 = 10;
 
 /// The low-power microphone stream: 16 kHz stereo S32 in a 512 KiB ring
@@ -336,9 +338,9 @@ impl PowerDomain {
     /// failed resume leaves the virtual domain device in the runtime-PM error
     /// state, where every later request fails with EINVAL; clear that state
     /// and retry a bounded number of times before giving up.
-    fn get(&self) -> Result<()> {
+    fn get(&self, attempts: u32) -> Result<()> {
         let mut rc = 0;
-        for attempt in 0..PD_GET_ATTEMPTS {
+        for attempt in 0..attempts {
             // SAFETY: the domain device stays attached for the lifetime of `self`.
             rc = unsafe { bindings::pm_runtime_get_sync(self.dev.as_ptr()) };
             if rc >= 0 {
@@ -356,7 +358,7 @@ impl PowerDomain {
                     bindings::rpm_status_RPM_SUSPENDED as u32,
                 )
             };
-            if Error::from_errno(rc) != ETIMEDOUT || attempt + 1 == PD_GET_ATTEMPTS {
+            if Error::from_errno(rc) != ETIMEDOUT || attempt + 1 == attempts {
                 break;
             }
             kernel::time::delay::fsleep(kernel::time::Delta::from_millis(PD_GET_RETRY_MS));
@@ -712,21 +714,23 @@ impl SndSocT8140AopData {
     /// Runtime-power serializer leaves, parents first.  A leaf that fails to
     /// power up fails the stream; recovering a domain from that state is the
     /// power-domain driver's business, not a consumer's.
-    fn power_up(&self, name: &str, pds: &[&Option<PowerDomain>]) -> Result<()> {
+    fn power_up(&self, name: &str, pds: &[&Option<PowerDomain>], attempts: u32) -> Result<()> {
         for (i, slot) in pds.iter().enumerate() {
             let Some(pd) = slot else {
                 dev_err!(self.dev, "{}: power domain not attached\n", name);
                 self.power_down(&pds[..i]);
                 return Err(ENODEV);
             };
-            if let Err(e) = pd.get() {
-                dev_err!(
-                    self.dev,
-                    "{}: power domain {} did not power up: {:?}\n",
-                    name,
-                    pd.name,
-                    e
-                );
+            if let Err(e) = pd.get(attempts) {
+                if e != ETIMEDOUT || attempts > PD_GET_ATTEMPTS {
+                    dev_err!(
+                        self.dev,
+                        "{}: power domain {} did not power up: {:?}\n",
+                        name,
+                        pd.name,
+                        e
+                    );
+                }
                 self.power_down(&pds[..i]);
                 return Err(e);
             }
@@ -752,9 +756,36 @@ impl SndSocT8140AopData {
     fn service_startup(&self, svc: &Service, pds: &[&Option<PowerDomain>]) -> Result<()> {
         self.attach_device(svc.dev_id, svc.name)?;
         self.service_set_power(svc, SPKR_POWER_STATE_PW0)?;
-        self.power_up(svc.name, pds)?;
+        self.power_up_raising(svc.name, pds)?;
         svc.running.store(false, Relaxed);
         Ok(())
+    }
+
+    /// [`Self::power_up`], raising the fabric when the leaves cannot come up.
+    fn power_up_raising(&self, name: &str, pds: &[&Option<PowerDomain>]) -> Result<()> {
+        match self.power_up(name, pds, PD_GET_ATTEMPTS) {
+            Err(e) if e == ETIMEDOUT => {
+                self.with_fabric_raised(|| self.power_up(name, pds, PD_GET_RAISED_ATTEMPTS))
+            }
+            other => other,
+        }
+    }
+
+    /// Raise the audio fabric the firmware gated. A service's `pw0 ` request
+    /// does not do that (measured: `audio_p` stays gated for the whole leaf
+    /// retry window), only a running stream does, after which a service in
+    /// `pw0 ` keeps it up. The low-power microphone is attached for the
+    /// firmware's lifetime, so run it briefly around `f` when it is idle.
+    fn with_fabric_raised<R>(&self, f: impl FnOnce() -> Result<R>) -> Result<R> {
+        if self.powered.load(Relaxed) {
+            return f();
+        }
+        self.set_power(POWER_STATE_RUN)?;
+        let ret = f();
+        if let Err(e) = self.set_power(POWER_STATE_IDLE) {
+            dev_warn!(self.dev, "lpai: unable to idle after raising the fabric: {:?}\n", e);
+        }
+        ret
     }
 
     /// `pwrd`: the firmware starts the serializer clocks and the stream.
@@ -1620,7 +1651,7 @@ unsafe extern "C" fn asoc_pcm_open(
     };
     let leap = fe == FE_SPKR;
     if leap {
-        if let Err(e) = data.power_up(data.spkr.name, &data.spkr_domains()) {
+        if let Err(e) = data.power_up_raising(data.spkr.name, &data.spkr_domains()) {
             return e.to_errno();
         }
     }
