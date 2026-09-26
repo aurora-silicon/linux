@@ -316,6 +316,18 @@ config APPLE_DART
 
 	  Say Y here if you are using an Apple SoC.
 
+config APPLE_DART_X1N1
+	tristate "Apple DART paravirt (x1n1 hypervisor) support"
+	depends on ARCH_APPLE || COMPILE_TEST
+	select IOMMU_API
+	help
+	  Paravirtualised Apple DART for a Linux guest running under the x1n1
+	  hypervisor on hardware SPTM. The guest cannot program the DART
+	  directly, so IOMMU map/unmap/flush are forwarded to SPTM through
+	  x1n1 hypercalls. Bind against "apple,dart-x1n1" device-tree nodes.
+
+	  Say Y here only for a Linux guest hosted by x1n1.
+
 config S390_IOMMU
 	def_bool y if S390 && PCI
 	depends on S390 && PCI
