@@ -1172,8 +1172,7 @@ static ssize_t service_call_write_file(struct file *file, const char __user *use
 			return -ENOMEM;
 	}
 
-	ret = copy_from_user(&call_info, user_buf, sizeof(call_info));
-	if (ret == sizeof(call_info))
+	if (copy_from_user(&call_info, user_buf, sizeof(call_info)))
 		return -EFAULT;
 	user_buf += sizeof(call_info);
 	count -= sizeof(call_info);
@@ -1181,8 +1180,7 @@ static ssize_t service_call_write_file(struct file *file, const char __user *use
 	buf = kmalloc(count, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
-	ret = copy_from_user(buf, user_buf, count);
-	if (ret == count) {
+	if (copy_from_user(buf, user_buf, count)) {
 		kfree(buf);
 		return -EFAULT;
 	}
@@ -1225,6 +1223,11 @@ static ssize_t service_raw_call_write_file(struct file *file, const char __user 
 	u32 retcode;
 	int ret;
 
+	if (!count)
+		return 0;
+	if (count > AFK_DEBUGFS_MAX_REPLY)
+		return -E2BIG;
+
 	if (!srv->debugfs.scratch) {
 		srv->debugfs.scratch = \
 			devm_kzalloc(srv->ep->dcp->dev, AFK_DEBUGFS_MAX_REPLY, GFP_KERNEL);
@@ -1233,8 +1236,7 @@ static ssize_t service_raw_call_write_file(struct file *file, const char __user 
 	}
 
 	memset(srv->debugfs.scratch, 0, AFK_DEBUGFS_MAX_REPLY);
-	ret = copy_from_user(srv->debugfs.scratch, user_buf, count);
-	if (ret == count)
+	if (copy_from_user(srv->debugfs.scratch, user_buf, count))
 		return -EFAULT;
 
 	ret = afk_send_command(srv, EPIC_SUBTYPE_STD_SERVICE, srv->debugfs.scratch, count,
