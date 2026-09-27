@@ -219,6 +219,8 @@ struct apple_dcp {
 	bool valid_mode;
 	/* One HPD pulse after a placeholder EDID, per Type-C connection. */
 	bool placeholder_retried;
+	u64 typec_generation;	/* hpd_mutex: identifies the current connection */
+	u64 placeholder_generation;
 	struct delayed_work placeholder_edid_wq;
 	bool use_timestamps;
 	bool vrr_enabled;

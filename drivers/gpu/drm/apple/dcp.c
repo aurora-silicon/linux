@@ -1294,6 +1294,7 @@ bool dcp_has_typec_routes(struct platform_device *pdev)
 
 static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 {
+	unsigned long timeout;
 	int ret = 0;
 
 	if (!dcp->phy) {
@@ -1365,10 +1366,10 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 	}
 
 	mutex_unlock(&dcp->hpd_mutex);
+	timeout = dcp_is_usb4_output(dcp) && of_machine_is_compatible("apple,j416s") ?
+		  DPTX_TUNNEL_CONNECT_TIMEOUT : DPTX_CONNECT_TIMEOUT;
 	ret = wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
-				    dcp_is_usb4_output(dcp) &&
-				    of_machine_is_compatible("apple,j416s") ?
-				    DPTX_TUNNEL_CONNECT_TIMEOUT : DPTX_CONNECT_TIMEOUT);
+					  timeout);
 	if (!ret) {
 		dev_err(dcp->dev,
 			"dcp_dptx_connect: timed out waiting for port %u link configuration\n",
@@ -1378,7 +1379,7 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 	}
 
 	dev_dbg(dcp->dev, "dcp_dptx_connect: waited %d ms for link\n",
-		jiffies_to_msecs(DPTX_CONNECT_TIMEOUT - ret));
+		jiffies_to_msecs(timeout - ret));
 
 	usleep_range(5, 10);
 
@@ -1422,12 +1423,15 @@ static bool dcp_edid_is_placeholder(const struct drm_edid *drm_edid)
 void dcp_retry_placeholder_edid(struct apple_dcp *dcp,
 				const struct drm_edid *drm_edid)
 {
-	if (!dcp_is_typec_output(dcp) || dcp->placeholder_retried)
+	guard(mutex)(&dcp->hpd_mutex);
+	if (!dcp_is_typec_output(dcp) || !dcp->typec_cable_connected ||
+	    dcp->placeholder_retried)
 		return;
 	if (!dcp_edid_is_placeholder(drm_edid))
 		return;
 
 	dcp->placeholder_retried = true;
+	dcp->placeholder_generation = dcp->typec_generation;
 	schedule_delayed_work(&dcp->placeholder_edid_wq, msecs_to_jiffies(300));
 }
 
@@ -1437,16 +1441,15 @@ static void dcp_placeholder_edid_work(struct work_struct *work)
 		container_of(to_delayed_work(work), struct apple_dcp,
 			     placeholder_edid_wq);
 	struct apple_epic_service *service;
+	u64 generation;
 	int ret;
 
-	if (!READ_ONCE(dcp->typec_cable_connected))
-		return;
-
 	mutex_lock(&dcp->hpd_mutex);
-	service = dcp->dptxport[0].connected ? dcp->dptxport[0].service : NULL;
-	mutex_unlock(&dcp->hpd_mutex);
-	if (!service)
-		return;
+	generation = dcp->placeholder_generation;
+	if (!dcp->typec_cable_connected || !dcp->dptxport[0].connected ||
+	    !dcp->dptxport[0].enabled || generation != dcp->typec_generation)
+		goto out_unlock;
+	service = dcp->dptxport[0].service;
 
 	/*
 	 * Some adapters answer the first connection with a 1024x768
@@ -1457,18 +1460,23 @@ static void dcp_placeholder_edid_work(struct work_struct *work)
 	if (ret) {
 		dev_info(dcp->dev, "placeholder EDID: HPD drop failed: %d\n",
 			 ret);
-		return;
+		goto out_unlock;
 	}
+	mutex_unlock(&dcp->hpd_mutex);
 
 	msleep(1000);
 
-	if (!READ_ONCE(dcp->typec_cable_connected))
-		return;
+	mutex_lock(&dcp->hpd_mutex);
+	if (!dcp->typec_cable_connected || !dcp->dptxport[0].connected ||
+	    generation != dcp->typec_generation)
+		goto out_unlock;
 
 	ret = dptxport_set_hpd(service, true);
 	if (ret)
 		dev_info(dcp->dev, "placeholder EDID: HPD assert failed: %d\n",
 			 ret);
+out_unlock:
+	mutex_unlock(&dcp->hpd_mutex);
 }
 
 static void dcp_typec_reconnect_work(struct work_struct *work)
@@ -1529,11 +1537,13 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 	int ret;
 
 	if (dcp_is_typec_output(dcp)) {
+		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
+		guard(mutex)(&dcp->hpd_mutex);
+		dcp->typec_generation++;
 		WRITE_ONCE(dcp->typec_cable_connected, true);
 		dcp->typec_reconnect_tries = 0;
 		dcp->placeholder_retried = false;
 		cancel_delayed_work(&dcp->typec_reconnect_wq);
-		cancel_delayed_work(&dcp->placeholder_edid_wq);
 	}
 
 	ret = dcp_dptx_connect(dcp, port);
@@ -1549,10 +1559,13 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
 	if (dcp_is_typec_output(dcp)) {
-		WRITE_ONCE(dcp->typec_cable_connected, false);
+		scoped_guard(mutex, &dcp->hpd_mutex) {
+			WRITE_ONCE(dcp->typec_cable_connected, false);
+			dcp->typec_generation++;
+		}
 		WRITE_ONCE(dcp->typec_crtc_off, false);
-		cancel_delayed_work(&dcp->typec_reconnect_wq);
-		cancel_delayed_work(&dcp->placeholder_edid_wq);
+		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 	}
 
 	disconnected_hpd_event(dcp->connector);
@@ -2159,6 +2172,28 @@ static int dcp_connector_type_from_dt(struct device_node *np)
 	return DRM_MODE_CONNECTOR_Unknown;
 }
 
+static void dcp_disable_typec_work(struct apple_dcp *dcp)
+{
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		WRITE_ONCE(dcp->typec_cable_connected, false);
+		dcp->typec_generation++;
+	}
+	/* Block new enqueues as well as draining users of the AFK endpoints. */
+	disable_delayed_work_sync(&dcp->typec_reconnect_wq);
+	disable_delayed_work_sync(&dcp->placeholder_edid_wq);
+	disable_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
+}
+
+static void dcp_enable_typec_work(struct apple_dcp *dcp)
+{
+	enable_delayed_work(&dcp->typec_reconnect_wq);
+	enable_delayed_work(&dcp->placeholder_edid_wq);
+	enable_delayed_work(&dcp->typec_fabric_retrain_wq);
+	/* A cable can be routed before the DRM component binds. */
+	if (READ_ONCE(dcp->typec_cable_connected))
+		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq, 0);
+}
+
 static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 {
 	struct device_node *panel_np;
@@ -2257,6 +2292,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "Failed to boot RTKit: %d\n", ret);
+	dcp_enable_typec_work(dcp);
 	return ret;
 }
 
@@ -2274,6 +2310,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	if (dcp->hdmi_hpd_irq)
 		disable_irq(dcp->hdmi_hpd_irq);
 
+	dcp_disable_typec_work(dcp);
 	typec_mux_put(dcp->typec_mux);
 
 	if (dcp->avep) {
@@ -2315,9 +2352,6 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		cancel_work_sync(&dcp->bl_register_wq);
 		cancel_work_sync(&dcp->bl_update_wq);
 	}
-	cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
-	cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
-	cancel_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
 	cancel_work_sync(&dcp->vblank_wq);
 
 	devm_clk_put(dev, dcp->clk);
@@ -2375,6 +2409,10 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			  dcp_placeholder_edid_work);
 	INIT_DELAYED_WORK(&dcp->typec_fabric_retrain_wq,
 			  dcp_typec_retrain_work);
+	/* Balanced by enable at successful component bind. */
+	disable_delayed_work(&dcp->typec_reconnect_wq);
+	disable_delayed_work(&dcp->placeholder_edid_wq);
+	disable_delayed_work(&dcp->typec_fabric_retrain_wq);
 
 	platform_set_drvdata(pdev, dcp);
 
@@ -2514,14 +2552,6 @@ static void dcp_platform_remove(struct platform_device *pdev)
 
 static void dcp_platform_shutdown(struct platform_device *pdev)
 {
-	struct apple_dcp *dcp = platform_get_drvdata(pdev);
-
-	if (dcp) {
-		WRITE_ONCE(dcp->typec_cable_connected, false);
-		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
-		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
-		cancel_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
-	}
 	component_del(&pdev->dev, &dcp_comp_ops);
 }
 
@@ -2529,10 +2559,7 @@ static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
-	WRITE_ONCE(dcp->typec_cable_connected, false);
-	cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
-	cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
-	cancel_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
+	dcp_disable_typec_work(dcp);
 
 	if (dcp->avep)
 		av_service_disconnect(dcp);
@@ -2558,6 +2585,7 @@ static int dcp_platform_resume(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	dcp_enable_typec_work(dcp);
 	if (dcp->hdmi_hpd_irq)
 		enable_irq(dcp->hdmi_hpd_irq);
 
