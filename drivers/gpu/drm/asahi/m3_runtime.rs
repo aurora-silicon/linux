@@ -149,6 +149,7 @@ impl Runtime {
     pub(crate) fn execute(shared:&crate::m3_drm::Shared,packet:Arc<crate::m3_submit::Packet>)->Result {
         crate::debug::update_debug_flags();
         let unlocked_wait=crate::m3_params::unlocked_wait();
+        let render_batch_size=crate::m3_params::render_batch_size();
         let mut guard=shared.lock();
         let events={
             let inner=&mut *Option::as_mut(&mut *guard).ok_or(ENODEV)?.inner;
@@ -167,10 +168,8 @@ impl Runtime {
         let mut command_index=0;
         while command_index<packet.commands.len() {
             let control=packet.commands[command_index];
-            let limit=(*crate::module_parameters::m3_render_batch_size.value() as usize)
-                .clamp(1,crate::m3_pass_layout::SLOTS);
             let batch_count=if matches!(control,crate::m3_submit::Command::Render{..}) {
-                packet.commands[command_index..].iter().take(limit)
+                packet.commands[command_index..].iter().take(render_batch_size)
                     .take_while(|c|matches!(c,crate::m3_submit::Command::Render{..})).count()
             } else {
                 let limit=(*crate::module_parameters::m3_compute_batch_size.value() as usize)
