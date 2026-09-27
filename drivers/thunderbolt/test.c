@@ -2993,8 +2993,17 @@ struct tb_test_dp_host {
 
 struct tb_test_dprx {
 	struct kunit *test;
+	struct completion worker_passed;
+	struct work_struct marker;
 	unsigned int completions;
 };
+
+static void tb_test_dprx_marker(struct work_struct *work)
+{
+	struct tb_test_dprx *ctx = container_of(work, struct tb_test_dprx, marker);
+
+	complete(&ctx->worker_passed);
+}
 
 static void tb_test_dprx_complete(struct tb_tunnel *tunnel, void *data)
 {
@@ -3005,7 +3014,7 @@ static void tb_test_dprx_complete(struct tb_tunnel *tunnel, void *data)
 	ctx->completions++;
 }
 
-static void tb_test_dp_dprx_cancel(struct kunit *test)
+static void tb_test_dp_dprx_cancel_common(struct kunit *test, bool running)
 {
 	struct tb_test_dprx ctx = { .test = test };
 	struct tb_switch *host, *dev;
@@ -3027,13 +3036,30 @@ static void tb_test_dp_dprx_cancel(struct kunit *test)
 		KUNIT_FAIL(test, "failed to allocate DPRX workqueue");
 		return;
 	}
+	init_completion(&ctx.worker_passed);
+	INIT_WORK(&ctx.marker, tb_test_dprx_marker);
 	mutex_init(&tb->lock);
 	mutex_lock(&tb->lock);
 
 	/* Model a pending poll holding the callback's tunnel reference. */
 	kref_get(&tunnel->kref);
 	tunnel->dprx_started = true;
-	queue_delayed_work(tb->wq, &tunnel->dprx_work, 60 * HZ);
+	queue_delayed_work(tb->wq, &tunnel->dprx_work, running ? 0 : 60 * HZ);
+	if (running) {
+		/*
+		 * The ordered queue runs this marker only after DPRX returns
+		 * without acquiring the mutex that teardown still owns.
+		 */
+		queue_work(tb->wq, &ctx.marker);
+		if (!wait_for_completion_timeout(&ctx.worker_passed, 5 * HZ)) {
+			KUNIT_FAIL(test, "DPRX worker blocked on the domain mutex");
+			/* Let a blocked worker finish before cleaning up the test. */
+			tunnel->dprx_canceled = true;
+			mutex_unlock(&tb->lock);
+			cancel_delayed_work_sync(&tunnel->dprx_work);
+			mutex_lock(&tb->lock);
+		}
+	}
 	tb_dp_tunnel_deactivate_host(tunnel);
 	KUNIT_EXPECT_EQ(test, ctx.completions, 1U);
 	KUNIT_EXPECT_FALSE(test, tunnel->dprx_started);
@@ -3053,6 +3079,16 @@ static void tb_test_dp_dprx_cancel(struct kunit *test)
 	destroy_workqueue(tb->wq);
 	tb_tunnel_put(tunnel);
 	mutex_destroy(&tb->lock);
+}
+
+static void tb_test_dp_dprx_cancel(struct kunit *test)
+{
+	tb_test_dp_dprx_cancel_common(test, false);
+}
+
+static void tb_test_dp_dprx_cancel_running(struct kunit *test)
+{
+	tb_test_dp_dprx_cancel_common(test, true);
 }
 
 static void tb_test_dp_host_disconnect(struct tb_nhi *nhi, struct tb_port *in,
@@ -3146,6 +3182,7 @@ static struct kunit_case tb_test_cases[] = {
 	KUNIT_CASE(tb_test_pci_host_teardown),
 	KUNIT_CASE(tb_test_pci_host_daisy_chain),
 	KUNIT_CASE(tb_test_dp_dprx_cancel),
+	KUNIT_CASE(tb_test_dp_dprx_cancel_running),
 	KUNIT_CASE(tb_test_tunnel_dp_host_credits),
 	KUNIT_CASE(tb_test_dp_host_teardown_once),
 	KUNIT_CASE(tb_test_dp_host_teardown_unannounced),
