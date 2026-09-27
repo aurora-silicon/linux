@@ -888,13 +888,17 @@ static int macsmc_power_probe(struct platform_device *pdev)
 		/* Extended properties usually present */
 		props[nprops++] = POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW;
 		props[nprops++] = POWER_SUPPLY_PROP_TIME_TO_FULL_NOW;
-		props[nprops++] = POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN;
+		if (apple_smc_key_exists(smc, SMC_KEY(BITV)))
+			props[nprops++] = POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN;
 		props[nprops++] = POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN;
 		props[nprops++] = POWER_SUPPLY_PROP_VOLTAGE_MIN;
 		props[nprops++] = POWER_SUPPLY_PROP_VOLTAGE_MAX;
-		props[nprops++] = POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT;
-		props[nprops++] = POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX;
-		props[nprops++] = POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE;
+		if (apple_smc_key_exists(smc, SMC_KEY(B0RC)))
+			props[nprops++] = POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT;
+		if (apple_smc_key_exists(smc, SMC_KEY(B0RI)))
+			props[nprops++] = POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX;
+		if (apple_smc_key_exists(smc, SMC_KEY(B0RV)))
+			props[nprops++] = POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE;
 		props[nprops++] = POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN;
 		props[nprops++] = POWER_SUPPLY_PROP_CHARGE_FULL;
 		props[nprops++] = POWER_SUPPLY_PROP_CHARGE_NOW;

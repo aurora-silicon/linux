@@ -1971,7 +1971,9 @@ static void tb_dp_tunnel_active(struct tb_tunnel *tunnel, void *data)
 	struct tb_port *out = tunnel->dst_port;
 	struct tb *tb = data;
 
-	mutex_lock(&tb->lock);
+	lockdep_assert_held(&tb->lock);
+	if (tunnel->dprx_canceled)
+		goto out;
 	if (tb_tunnel_is_active(tunnel)) {
 		int consumed_up, consumed_down, ret;
 
@@ -2025,8 +2027,7 @@ static void tb_dp_tunnel_active(struct tb_tunnel *tunnel, void *data)
 		tb_tunnel_warn(tunnel, "not active, tearing down\n");
 		tb_dp_resource_unavailable(tb, in, "DPRX negotiation failed");
 	}
-	mutex_unlock(&tb->lock);
-
+out:
 	tb_domain_put(tb);
 }
 
@@ -3010,8 +3011,10 @@ static void tb_stop(struct tb *tb)
 		if (tb_tunnel_is_dma(tunnel))
 			tb_tunnel_deactivate(tunnel);
 		/* the host side of a DP tunnel goes away with us */
-		else if (tb_tunnel_is_dp(tunnel))
+		else if (tb_tunnel_is_dp(tunnel)) {
+			tb_dp_tunnel_cancel_dprx(tunnel);
 			tb_dp_tunnel_notify(tunnel, false);
+		}
 		tb_tunnel_put(tunnel);
 	}
 	tb_switch_remove(tb->root_switch);

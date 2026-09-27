@@ -5,10 +5,19 @@ use kernel::{device::Core, drm, new_mutex, platform, prelude::*, sync::{Arc, Mut
 use crate::{alloc, driver, drm_gpu::{DrmGpu, DrmGpuParams}, gem, gpu, hw, mmu, queue};
 
 pub(crate) type Shared = Arc<Mutex<Option<crate::m3_runtime::Runtime>>>;
+struct ProgressView(Arc<crate::m3_rtkit::Health>);
+impl kernel::debugfs::Writer for ProgressView {
+    fn write(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        let (generation, completed, last_ns, healthy) = self.0.progress_snapshot();
+        writeln!(f, "version=1 generation_ns={} completed={} last_completion_ns={} healthy={}",
+            generation, completed, last_ns, u8::from(healthy))
+    }
+}
 pub(crate) struct Registered {
     registration: Pin<KBox<Mutex<Option<drm::driver::Registration<driver::AsahiDriver>>>>>,
     shared: Shared,
     health: Arc<crate::m3_rtkit::Health>,
+    _progress: Pin<KBox<kernel::debugfs::File<ProgressView>>>,
 }
 impl Registered {
     pub(crate) fn start(pdev: &platform::Device<Core>) -> Result<Self> {
@@ -29,8 +38,13 @@ impl Registered {
             u8::from(crate::m3_params::g15_debug(crate::m3_params::G15Debug::M3ResumeAfterFault)));
         let drm = runtime.drm();
         let health = runtime.health();
+        // Health holds no device references. The read-only file owns an Arc
+        // and is removed with registration; teardown latches failure first.
+        let directory = kernel::debugfs::Dir::new(c"asahi-m3");
+        let progress = KBox::pin_init(directory.read_only_file(c"progress",
+            ProgressView(health.clone())), GFP_KERNEL)?;
         let shared = Arc::pin_init(new_mutex!(Some(runtime)), GFP_KERNEL)?;
-        let owner = Self { registration: KBox::pin_init(new_mutex!(None), GFP_KERNEL)?, shared: shared.clone(), health: health.clone() };
+        let owner = Self { registration: KBox::pin_init(new_mutex!(None), GFP_KERNEL)?, shared: shared.clone(), health: health.clone(), _progress: progress };
         let scheduler=Arc::new(drm::sched::Scheduler::new(drm.as_ref(),4,8,0,3000,kernel::c_str!("asahi_m3_sched"))?,GFP_KERNEL)?;
         let backend: Arc<dyn DrmGpu> = Arc::new(Backend { shared, health, scheduler, ids: gpu::SequenceIDs::default(),
             core_mask, max_frequency_khz }, GFP_KERNEL)?;

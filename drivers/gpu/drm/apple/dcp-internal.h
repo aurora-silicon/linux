@@ -316,6 +316,8 @@ struct apple_dcp {
 	u32 nr_typec_routes;
 	bool phy_managed_by_typec;
 	bool typec_cable_connected;
+	/* CRTC powered off while the Type-C cable stays attached */
+	bool typec_crtc_off;
 	/* DPTX feeds a Thunderbolt DP IN adapter, not the Type-C PHY lanes */
 	bool dptx_tunnel;
 	/* DFP port in the DPTX target: 0 = dpphy, 1 = dpin0, 2 = dpin1 */

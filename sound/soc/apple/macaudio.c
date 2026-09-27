@@ -1104,13 +1104,24 @@ static int macaudio_probe(struct snd_soc_card *card)
 	dev_dbg(card->dev, "%s!\n", __func__);
 
 	ret = snd_soc_card_jack_new_pins(card, "Headphone Jack",
-			SND_JACK_HEADSET | SND_JACK_HEADPHONE,
+			SND_JACK_HEADSET | SND_JACK_HEADPHONE |
+			SND_JACK_BTN_0 | SND_JACK_BTN_1 |
+			SND_JACK_BTN_2 | SND_JACK_BTN_3,
 			&ma->jack, macaudio_jack_pins,
 			ARRAY_SIZE(macaudio_jack_pins));
 	if (ret < 0) {
 		dev_err(card->dev, "jack creation failed: %d\n", ret);
 		return ret;
 	}
+
+	/*
+	 * Apple remotes use BTN_0..2; CS42L83's analogue fallback can also
+	 * report BTN_3 for the fourth button of other headsets.
+	 */
+	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_0, KEY_PLAYPAUSE);
+	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_1, KEY_VOLUMEUP);
+	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_2, KEY_VOLUMEDOWN);
+	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_3, KEY_VOICECOMMAND);
 
 	return ret;
 }
@@ -1481,6 +1492,16 @@ static int macaudio_slk_lock(struct snd_kcontrol *kcontrol, struct snd_ctl_file 
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 
 	mutex_lock(&ma->volume_lock_mutex);
+
+	/*
+	 * A lease belongs to the owner that pinged for it. Whatever the
+	 * previous owner had left must not unlock the volume for a new one
+	 * before it has pinged itself.
+	 */
+	cancel_delayed_work(&ma->lock_timeout_work);
+	ma->speaker_lock_remain = 0;
+	ma->speaker_lock_timeout = 0;
+
 	ma->speaker_lock_owner = owner;
 	macaudio_vlimit_update(ma);
 
@@ -1503,7 +1524,9 @@ static void macaudio_slk_unlock(struct snd_kcontrol *kcontrol)
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 
 	mutex_lock(&ma->volume_lock_mutex);
+	cancel_delayed_work(&ma->lock_timeout_work);
 	ma->speaker_lock_owner = NULL;
+	ma->speaker_lock_remain = 0;
 	ma->speaker_lock_timeout = 0;
 	macaudio_vlimit_update(ma);
 	mutex_unlock(&ma->volume_lock_mutex);
