@@ -2337,6 +2337,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 
 	if (dcp->dcpavservep) {
 		afk_shutdown(dcp->dcpavservep);
+		dpavservep_detach(dcp);
 		dcp->dcpavservep = NULL;
 	}
 
@@ -2398,6 +2399,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	mutex_init(&dcp->hpd_mutex);
 	mutex_init(&dcp->tb_lock);
 	spin_lock_init(&dcp->mode_state.lock);
+	spin_lock_init(&dcp->dcpavserv.lock);
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
 	dcp->fixed_connector_type = dcp_connector_type_from_dt(dev->of_node);
 	dcp->connector_type = dcp->fixed_connector_type;

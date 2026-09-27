@@ -7,7 +7,9 @@
 #ifndef _DRM_APPLE_DCP_AFK_H
 #define _DRM_APPLE_DCP_AFK_H
 
+#include <linux/bitmap.h>
 #include <linux/completion.h>
+#include <linux/spinlock.h>
 #include <linux/kconfig.h>
 #include <linux/types.h>
 
@@ -43,6 +45,8 @@ struct apple_epic_service {
 	DECLARE_BITMAP(cmd_map, MAX_PENDING_CMDS);
 	u8 cmd_tag;
 	spinlock_t lock;
+	/* Pins held by owners and synchronous callers; protected by lock. */
+	unsigned int users;
 
 	u32 channel;
 	bool enabled;
@@ -60,6 +64,8 @@ enum epic_subtype;
 
 struct apple_epic_service_ops {
 	const char name[32];
+	/* All retained pointers must be pinned before enabling slot reuse. */
+	bool reusable;
 
 	void (*init)(struct apple_epic_service *service, const char *name,
 			      const char *class, s64 unit);
@@ -70,6 +76,89 @@ struct apple_epic_service_ops {
 		      const void *data, size_t data_size);
 	void (*teardown)(struct apple_epic_service *service);
 };
+
+static inline struct apple_epic_service *afk_service_get(struct apple_epic_service *service)
+{
+	unsigned long flags;
+	bool available;
+
+	if (!service)
+		return NULL;
+
+	spin_lock_irqsave(&service->lock, flags);
+	available = service->enabled && !service->torndown;
+	if (available)
+		service->users++;
+	spin_unlock_irqrestore(&service->lock, flags);
+
+	return available ? service : NULL;
+}
+
+static inline void afk_service_put(struct apple_epic_service *service)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&service->lock, flags);
+	if (!WARN_ON(!service->users))
+		service->users--;
+	spin_unlock_irqrestore(&service->lock, flags);
+}
+
+static inline void afk_service_disable(struct apple_epic_service *service)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&service->lock, flags);
+	service->enabled = false;
+	spin_unlock_irqrestore(&service->lock, flags);
+}
+
+static inline bool afk_service_matches(struct apple_epic_service *service,
+				       u32 channel)
+{
+	unsigned long flags;
+	bool found;
+
+	spin_lock_irqsave(&service->lock, flags);
+	/* Teardown does not cancel commands or relinquish their DMA. */
+	found = service->channel == channel &&
+		(service->enabled ||
+		 !bitmap_empty(service->cmd_map, MAX_PENDING_CMDS));
+	spin_unlock_irqrestore(&service->lock, flags);
+	return found;
+}
+
+/* The caller holds service->lock. */
+static inline bool afk_service_reclaimable(struct apple_epic_service *service)
+{
+	return !service->ops ||
+		(service->ops->reusable && service->torndown &&
+		 !service->enabled && !service->users &&
+		 bitmap_empty(service->cmd_map, MAX_PENDING_CMDS));
+}
+
+static inline bool
+afk_service_reinit(struct apple_epic_service *service,
+		   struct apple_dcp_afkep *ep,
+		   const struct apple_epic_service_ops *ops, u32 channel)
+{
+	unsigned long flags;
+	bool reusable;
+
+	spin_lock_irqsave(&service->lock, flags);
+	reusable = afk_service_reclaimable(service);
+	if (reusable) {
+		service->enabled = true;
+		service->torndown = false;
+		service->ops = ops;
+		service->ep = ep;
+		service->channel = channel;
+		service->cookie = NULL;
+		/* Keep the command-tag sequence across service generations. */
+	}
+	spin_unlock_irqrestore(&service->lock, flags);
+	return reusable;
+}
 
 struct afk_ringbuffer_header {
 	__le32 bufsz;
@@ -177,6 +266,7 @@ struct apple_dcp_afkep {
 
 	spinlock_t lock;
 	u16 qe_seq;
+	bool stopping; /* lock: no new receive work after shutdown. */
 
 	const struct apple_epic_service_ops *ops;
 	struct apple_epic_service services[AFK_MAX_CHANNEL];

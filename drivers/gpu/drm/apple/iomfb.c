@@ -446,10 +446,10 @@ int dcp_get_modes(struct drm_connector *connector)
 	}
 	drm_connector_set_vrr_capable_property(connector, vrr_capable);
 
-	if (dcp->nr_modes && dcp->dcpavserv.enabled &&
+	if (dcp->nr_modes &&
 	    !apple_connector->drm_edid) {
 		const struct drm_edid *edid;
-		edid = dcpavserv_copy_edid(dcp->dcpavserv.service);
+		edid = dcpavserv_copy_edid(dcp);
 		if (IS_ERR_OR_NULL(edid)) {
 			dev_info(dcp->dev, "copy_edid failed: %pe\n", edid);
 		} else {

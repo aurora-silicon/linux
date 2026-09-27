@@ -37,4 +37,5 @@ config DRM_APPLE_KUNIT_TEST
 	  Test modeset and hotplug state transitions without display hardware,
 	  including link changes that race with a modeset and recovery after
 	  failed modesets. These tests can run on other architectures and do
-	  not require the Apple display driver to be enabled.
+	  not require the Apple display driver to be enabled. Also test service
+	  ownership and pending commands across disconnect and reannouncement.

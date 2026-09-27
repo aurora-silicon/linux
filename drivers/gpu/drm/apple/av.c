@@ -79,7 +79,7 @@ static void av_interface_teardown(struct apple_epic_service *service)
 	struct apple_dcp *dcp = service->ep->dcp;
 	struct audiosrv_data *asrv = dcp->audiosrv;
 
-	service->enabled = false;
+	afk_service_disable(service);
 
 	mutex_lock(&asrv->plug_lock);
 
@@ -351,7 +351,7 @@ void av_service_disconnect(struct apple_dcp *dcp)
 		dev_err(dcp->dev, "error closing audio service: %d\n", ret);
 	}
 	if (service->torndown)
-		service->enabled = false;
+		afk_service_disable(service);
 	asrv->is_open = false;
 }
 
