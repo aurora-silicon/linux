@@ -2852,7 +2852,64 @@ static void tb_test_property_copy(struct kunit *test)
 	tb_property_free_dir(src);
 }
 
+struct tb_test_dp_host {
+	struct tb_nhi nhi;
+	unsigned int disconnects;
+};
+
+static void tb_test_dp_host_disconnect(struct tb_nhi *nhi, struct tb_port *in,
+				       struct tb_port *out)
+{
+	struct tb_test_dp_host *host = container_of(nhi, struct tb_test_dp_host, nhi);
+
+	host->disconnects++;
+}
+
+static void tb_test_dp_host_teardown_once(struct kunit *test)
+{
+	static const struct tb_nhi_ops ops = {
+		.dp_tunnel_deactivate = tb_test_dp_host_disconnect,
+	};
+	struct tb_test_dp_host *host;
+	struct tb_tunnel *tunnel;
+	struct tb *tb;
+
+	host = kunit_kzalloc(test, sizeof(*host), GFP_KERNEL);
+	tunnel = kunit_kzalloc(test, sizeof(*tunnel), GFP_KERNEL);
+	tb = kunit_kzalloc(test, sizeof(*tb), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, host);
+	KUNIT_ASSERT_NOT_NULL(test, tunnel);
+	KUNIT_ASSERT_NOT_NULL(test, tb);
+	host->nhi.ops = &ops;
+	tb->nhi = &host->nhi;
+	tunnel->tb = tb;
+	tunnel->host_dp_activated = true;
+
+	/* Domain removal must release the display even without adapter I/O. */
+	tb_dp_tunnel_deactivate_host(tunnel);
+	KUNIT_EXPECT_EQ(test, host->disconnects, 1U);
+	KUNIT_EXPECT_FALSE(test, tunnel->host_dp_activated);
+
+	/* A late tunnel cleanup must not access the already removed domain. */
+	tunnel->tb = NULL;
+	tb_dp_tunnel_deactivate_host(tunnel);
+	KUNIT_EXPECT_EQ(test, host->disconnects, 1U);
+}
+
+static void tb_test_dp_host_teardown_unannounced(struct kunit *test)
+{
+	struct tb_tunnel *tunnel;
+
+	tunnel = kunit_kzalloc(test, sizeof(*tunnel), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tunnel);
+	/* A failed allocation or a domain-less test has no host state to undo. */
+	tb_dp_tunnel_deactivate_host(tunnel);
+	KUNIT_EXPECT_FALSE(test, tunnel->host_dp_activated);
+}
+
 static struct kunit_case tb_test_cases[] = {
+	KUNIT_CASE(tb_test_dp_host_teardown_once),
+	KUNIT_CASE(tb_test_dp_host_teardown_unannounced),
 	KUNIT_CASE(tb_test_path_basic),
 	KUNIT_CASE(tb_test_path_not_connected_walk),
 	KUNIT_CASE(tb_test_path_single_hop_walk),

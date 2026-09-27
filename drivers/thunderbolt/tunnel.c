@@ -1266,6 +1266,20 @@ static void tb_dp_apple_pulse_hpd(struct tb_port *in)
 		tb_port_info(in, "Apple: HPD propagated\n");
 }
 
+/* Release display-side state while the host router is still accessible. */
+void tb_dp_tunnel_deactivate_host(struct tb_tunnel *tunnel)
+{
+	const struct tb_nhi_ops *ops;
+
+	if (!tunnel->host_dp_activated)
+		return;
+	tunnel->host_dp_activated = false;
+	ops = tunnel->tb->nhi->ops;
+	if (ops && ops->dp_tunnel_deactivate)
+		ops->dp_tunnel_deactivate(tunnel->tb->nhi, tunnel->src_port,
+					  tunnel->dst_port);
+}
+
 static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 {
 	int ret;
@@ -1297,6 +1311,7 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 				return ret;
 		}
 	} else {
+		tb_dp_tunnel_deactivate_host(tunnel);
 		tb_dp_dprx_stop(tunnel);
 		tb_dp_port_hpd_clear(tunnel->src_port);
 		tb_dp_port_set_hops(tunnel->src_port, 0, 0, 0);
@@ -1305,18 +1320,7 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 	}
 
 	ret = tb_dp_port_enable(tunnel->src_port, active);
-	/*
-	 * On deactivate, a departing dst_port already marked unplugged
-	 * makes tb_port_read/write short-circuit to -ENODEV with zero I/O
-	 * (tb.h) -- deterministically, not just on hardware timing. Do not
-	 * let that skip ops->dp_tunnel_deactivate() below: this tunnel.c is
-	 * generic core code, but ops->dp_tunnel_deactivate is what apple.c
-	 * relies on to clear its own apple_dpin_ctx latch -- without it, a
-	 * physical unplug/replug can never re-arm a fresh connect. The caller
-	 * (tb_tunnel_deactivate()) already discards this function's return
-	 * value on the deactivate path, so relaxing it here changes nothing
-	 * any caller observes; the activate (active=true) path is untouched.
-	 */
+	/* A departed adapter must not prevent disabling the remaining adapter. */
 	if (ret && active)
 		return ret;
 
@@ -1363,19 +1367,14 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 		const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
 
 		if (ops && ops->dp_tunnel_post_activate) {
+			/* Also unwind a hook that fails after partial setup. */
+			tunnel->host_dp_activated = true;
 			ret = ops->dp_tunnel_post_activate(tunnel->tb->nhi,
 							   tunnel->src_port,
 							   tunnel->dst_port);
 			if (ret)
 				return ret;
 		}
-	} else {
-		const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
-
-		if (ops && ops->dp_tunnel_deactivate)
-			ops->dp_tunnel_deactivate(tunnel->tb->nhi,
-						  tunnel->src_port,
-						  tunnel->dst_port);
 	}
 
 	return active ? tb_dp_dprx_start(tunnel) : 0;

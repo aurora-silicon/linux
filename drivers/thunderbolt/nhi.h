@@ -86,7 +86,8 @@ struct tb_nhi_ring_layout {
  *			    and before VE/AE. USB4 DPTX Discovery belongs here.
  * @dp_tunnel_post_activate: NHI specific hook run after a DP tunnel's
  *			     adapters have VE/AE enabled
- * @dp_tunnel_deactivate: NHI specific hook run when a DP tunnel is torn down
+ * @dp_tunnel_deactivate: Releases state from an attempted post-activation hook,
+ *			 before adapters are disabled or the host router is removed
  * @is_present: Whether the device is currently present on the parent bus
  * @init_interrupts: NHI specific interrupt initialization hook
  */

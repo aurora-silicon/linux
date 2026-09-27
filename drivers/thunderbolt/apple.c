@@ -1409,22 +1409,16 @@ static void apple_nhi_dp_tunnel_deactivate(struct tb_nhi *nhi,
 	if (READ_ONCE(apple_dpin_anhi) == anhi)
 		WRITE_ONCE(apple_dpin_anhi, NULL);
 
-	/*
-	 * Runs after both adapters are already disabled (tb_dp_activate()'s
-	 * teardown order) -- later than aurora-silicon/linux#8's own
-	 * dp_tunnel_changed(active=false), which fires before deactivation
-	 * while the block is still powered. apple_dpin_dcp_set_active()'s
-	 * own "block may already be off" check (matching the reference
-	 * implementation's identical defensive check) covers this gap; a
-	 * spurious no-op register access here is not a functional blocker,
-	 * only a less clean teardown than the ideal ordering.
-	 */
+	/* Sleep the adapter before tunnel teardown can remove its power. */
 	idx = apple_dpin_index_for_port(anhi, in);
 	if (idx >= 0 && idx <= 1 && anhi->acio && anhi->acio->dp_wq) {
 		struct apple_dpin_ctx *c = &anhi->acio->dpin[idx];
 
-		scoped_guard(mutex, &c->lock)
+		scoped_guard(mutex, &c->lock) {
+			if (c->alive && c->regs)
+				apple_dpin_set_active(c->acio, c->regs, c->idx, false);
 			c->alive = false;
+		}
 		queue_work(anhi->acio->dp_wq, &c->work);
 	}
 	dev_info(anhi->dev, "DP IN tunnel routing: tunnel down\n");
