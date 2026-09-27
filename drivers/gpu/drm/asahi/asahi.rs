@@ -61,6 +61,7 @@ mod g16_firmware;
 #[cfg(CONFIG_DEV_COREDUMP)]
 mod g16_fault;
 mod g16_device;
+mod agx_host_progress;
 mod g16_rtkit;
 mod g16_runtime;
 mod g16_drm;
