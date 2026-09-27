@@ -1637,6 +1637,10 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 	struct apple_pcie_port *port;
 	int idx, err;
 
+	/* Also cover functions discovered by a later hotplug or rescan. */
+	if (pcie->hw->tunneled)
+		pdev->dev_flags |= PCI_DEV_FLAGS_NO_D3;
+
 	/*
 	 * Endpoint BARs share PCIe-C's tunneled, non-posted MMIO fabric. Mark
 	 * them before the function driver maps its BAR so pci_iomap() selects
@@ -2202,6 +2206,7 @@ int apple_pcie_tunnel_restore(struct device *dev)
 
 	pci_lock_rescan_remove();
 	pci_rescan_bus(bridge->bus);
+	pci_walk_bus(bridge->bus, apple_pcie_tunnel_keep_d0, NULL);
 	pcie->bus_stopped = false;
 	pci_unlock_rescan_remove();
 
