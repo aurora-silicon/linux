@@ -7601,6 +7601,14 @@ Kernel parameters
 			See Documentation/admin-guide/mm/transhuge.rst for more
 			details.
 
+	thunderbolt.dp_video_counter=
+			[HW,ARM64]
+			Format: <bool>
+			Enable diagnostic counter 0 on the DP video path's
+			host and downstream ingress hops on the Apple j416s
+			right-hand USB-C route. Read counters through Thunderbolt
+			debugfs. This is a load-time setting. Default: false.
+
 	thunderbolt_apple.dp_display=
 			[HW,ARM64]
 			Format: <bool>
@@ -7609,6 +7617,23 @@ Kernel parameters
 			display pipeline to the host router's DP IN adapter
 			whenever the connection manager sets up a DP tunnel.
 			Default: false
+
+	thunderbolt_apple.dpin_aux=
+			[HW,ARM64]
+			Format: <bool>
+			Pulse the experimental DP IN analog start control on
+			Apple j416s at the next DP tunnel activation. Writes to
+			the module parameter do not access a live controller.
+			Default: false (leave analog registers alone until
+			DPRX negotiation finishes or times out).
+
+	thunderbolt_apple.dpin_mode_value=
+			[HW,ARM64]
+			Format: <uint> (0-15)
+			Experimental DP IN MODE_A/MODE_B value on Apple j416s.
+			Sampled for each adapter activation; values above 15
+			make activation fail. Default: 8. The value is empirical
+			and does not select the negotiated DisplayPort rate.
 
 	tlbi=		[X86-64]
 			Format: {ipi}

@@ -2907,7 +2907,45 @@ static void tb_test_dp_host_teardown_unannounced(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, tunnel->host_dp_activated);
 }
 
+static void tb_test_tunnel_dp_host_credits(struct kunit *test)
+{
+	struct tb_switch *host, *dev;
+	struct tb_tunnel *tunnel;
+	struct tb_nhi *nhi;
+	struct tb *tb;
+
+	host = alloc_host(test);
+	KUNIT_ASSERT_NOT_NULL(test, host);
+	dev = alloc_dev_with_dpin(test, host, 0x3, true);
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	tb = kunit_kzalloc(test, sizeof(*tb), GFP_KERNEL);
+	nhi = kunit_kzalloc(test, sizeof(*nhi), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tb);
+	KUNIT_ASSERT_NOT_NULL(test, nhi);
+	tb->nhi = nhi;
+	host->tb = tb;
+	dev->tb = tb;
+
+	KUNIT_EXPECT_FALSE(test, tb_port_needs_host_dp_credits(&host->ports[5]));
+	/* j416s has no dp_tunnel_changed hook; the quirk must be sufficient. */
+	nhi->quirks = QUIRK_HOST_DP_NFC_CREDITS;
+	KUNIT_EXPECT_TRUE(test, tb_port_needs_host_dp_credits(&host->ports[5]));
+	KUNIT_EXPECT_FALSE(test, tb_port_needs_host_dp_credits(&host->ports[1]));
+	KUNIT_EXPECT_FALSE(test, tb_port_needs_host_dp_credits(&dev->ports[13]));
+
+	dev->ports[14].config.type = TB_TYPE_DP_HDMI_OUT;
+	tunnel = tb_tunnel_alloc_dp(NULL, &host->ports[5], &dev->ports[14],
+				    1, 0, 0, NULL, NULL);
+	KUNIT_ASSERT_NOT_NULL(test, tunnel);
+	KUNIT_EXPECT_EQ(test, tunnel->paths[0]->hops[0].nfc_credits, 5U);
+	tb_tunnel_put(tunnel);
+
+	host->tb = NULL;
+	KUNIT_EXPECT_FALSE(test, tb_port_needs_host_dp_credits(&host->ports[5]));
+}
+
 static struct kunit_case tb_test_cases[] = {
+	KUNIT_CASE(tb_test_tunnel_dp_host_credits),
 	KUNIT_CASE(tb_test_dp_host_teardown_once),
 	KUNIT_CASE(tb_test_dp_host_teardown_unannounced),
 	KUNIT_CASE(tb_test_path_basic),

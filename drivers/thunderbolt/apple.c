@@ -991,17 +991,10 @@ static int apple_nhi_pci_tunnel_post_activate(struct tb_nhi *nhi)
  *     (default). Tests whether consuming +0x18 aborted a handshake.
  * 1 = old pulse +0x00 / fill +0x20 (rollback)
  */
-static int apple_dpin_aux;
-static struct apple_nhi *apple_dpin_anhi;
-
-static int apple_dpin_aux_set(const char *val, const struct kernel_param *kp);
-static const struct kernel_param_ops apple_dpin_aux_ops = {
-	.set = apple_dpin_aux_set,
-	.get = param_get_int,
-};
-module_param_cb(dpin_aux, &apple_dpin_aux_ops, &apple_dpin_aux, 0644);
+static bool apple_dpin_aux;
+module_param_named(dpin_aux, apple_dpin_aux, bool, 0644);
 MODULE_PARM_DESC(dpin_aux,
-		 "Apple DP IN analog: 0=hands-off until timeout, 1=pulse +0x00");
+		 "Apple DP IN analog: pulse +0x00 at the next tunnel activation (default: false)");
 
 static void apple_dp_dump_hop(struct tb_port *port, unsigned int hopid)
 {
@@ -1202,21 +1195,6 @@ static void apple_dp_start_analog(struct apple_nhi *anhi, bool pulse)
 			      "dpin analog after start", false);
 }
 
-static int apple_dpin_aux_set(const char *val, const struct kernel_param *kp)
-{
-	struct apple_nhi *anhi;
-	int v, ret;
-
-	ret = kstrtoint(val, 0, &v);
-	if (ret)
-		return ret;
-	apple_dpin_aux = v;
-	anhi = READ_ONCE(apple_dpin_anhi);
-	if (v >= 1 && anhi)
-		apple_dp_start_analog(anhi, true);
-	return 0;
-}
-
 static int apple_dp_dptx_discover(struct tb_port *in)
 {
 	u32 cs0 = 0;
@@ -1350,7 +1328,9 @@ static int apple_nhi_dp_tunnel_post_activate(struct tb_nhi *nhi,
 	anhi->analog_base = apple_dp_in_analog_base(anhi, in);
 	anhi->dp_aux_polls = 0;
 	anhi->dp_aux_armed = true;
-	WRITE_ONCE(apple_dpin_anhi, anhi);
+	/* The domain lock keeps this optional MMIO access ahead of teardown. */
+	if (READ_ONCE(apple_dpin_aux))
+		apple_dp_start_analog(anhi, true);
 
 	apple_dp_dump_rc(anhi->acio);
 	apple_dp_dump_vse(in->sw);
@@ -1406,8 +1386,6 @@ static void apple_nhi_dp_tunnel_deactivate(struct tb_nhi *nhi,
 
 	anhi->dp_aux_armed = false;
 	cancel_delayed_work(&anhi->dp_aux_work);
-	if (READ_ONCE(apple_dpin_anhi) == anhi)
-		WRITE_ONCE(apple_dpin_anhi, NULL);
 
 	/* Sleep the adapter before tunnel teardown can remove its power. */
 	idx = apple_dpin_index_for_port(anhi, in);
@@ -1559,6 +1537,8 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	anhi->nhi.ring_layout = &apple_nhi_ring_layout;
 	anhi->nhi.iobase = anhi->nhi_base;
 	anhi->nhi.quirks = QUIRK_NO_DMA_PORT | QUIRK_NO_USB3_BW_ALLOC;
+	if (anhi->ops.dp_tunnel_changed || anhi->ops.dp_tunnel_post_activate)
+		anhi->nhi.quirks |= QUIRK_HOST_DP_NFC_CREDITS;
 
 	anhi->nhi.hop_count = readl(anhi->nhi_base + APPLE_CIO_NHI_HOP_COUNT) &
 			      APPLE_CIO_NHI_HOP_COUNT_MASK;
@@ -1655,10 +1635,8 @@ static void apple_nhi_remove(struct platform_device *pdev)
 {
 	struct apple_nhi *anhi = platform_get_drvdata(pdev);
 
-	anhi->dp_aux_armed = false;
-	cancel_delayed_work_sync(&anhi->dp_aux_work);
-	if (READ_ONCE(apple_dpin_anhi) == anhi)
-		WRITE_ONCE(apple_dpin_anhi, NULL);
+	/* Stop racing tunnel activation from rearming work during removal. */
+	disable_delayed_work_sync(&anhi->dp_aux_work);
 	WRITE_ONCE(anhi->acio->nhi_pdev, NULL);
 	tb_domain_remove(anhi->tb);
 	wait_for_completion(&anhi->nhi.domain_released);

@@ -1143,6 +1143,14 @@ static inline bool tb_port_is_apple_host_dpin(const struct tb_port *port)
 	return tb->nhi->ops && tb->nhi->ops->dp_tunnel_changed;
 }
 
+static inline bool tb_port_needs_host_dp_credits(const struct tb_port *port)
+{
+	const struct tb *tb = port->sw->tb;
+
+	return tb && tb->nhi && !tb_route(port->sw) && tb_port_is_dpin(port) &&
+	       (tb->nhi->quirks & QUIRK_HOST_DP_NFC_CREDITS);
+}
+
 static inline bool tb_port_use_credit_allocation(const struct tb_port *port)
 {
 	return tb_port_is_null(port) && port->sw->credit_allocation;

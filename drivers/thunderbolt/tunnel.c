@@ -1687,9 +1687,7 @@ static int tb_dp_init_video_credits(struct tb_path_hop *hop)
 	 * Apple silicon host DP IN adapters take 5 NFC credits for the
 	 * video path -- same source as the HPD/NO_AUTO_LT handling above.
 	 */
-	if (tb_port_is_apple_host_dpin(port) ||
-	    (port->sw->tb && tb_nhi_is_apple(port->sw->tb->nhi) &&
-	     !tb_route(port->sw) && tb_port_is_dpin(port))) {
+	if (tb_port_needs_host_dp_credits(port)) {
 		hop->nfc_credits = 5;
 		return 0;
 	}
