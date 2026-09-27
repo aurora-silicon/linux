@@ -519,7 +519,7 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 	struct epic_hdr *ehdr = (struct epic_hdr *)data;
 	struct epic_sub_hdr *eshdr =
 		(struct epic_sub_hdr *)(data + sizeof(*ehdr));
-	u16 subtype = le16_to_cpu(eshdr->type);
+	u16 subtype;
 	u8 *payload = data + sizeof(*ehdr) + sizeof(*eshdr);
 	size_t payload_size;
 
@@ -529,6 +529,7 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 		return;
 	}
 	payload_size = data_size - sizeof(*ehdr) - sizeof(*eshdr);
+	subtype = le16_to_cpu(eshdr->type);
 
 	trace_afk_recv_handle(ep, channel, type, data_size, ehdr, eshdr);
 
@@ -591,6 +592,7 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 static bool afk_recv(struct apple_dcp_afkep *ep)
 {
 	struct afk_qe *hdr;
+	u8 *data;
 	u32 rptr, wptr;
 	u32 magic, size, channel, type;
 
@@ -645,8 +647,6 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 				 ep->endpoint, magic);
 			return false;
 		}
-
-		ep->rxbfr.hdr->rptr = cpu_to_le32(rptr);
 	}
 
 	if (rptr + size + sizeof(*hdr) > ep->rxbfr.bufsz) {
@@ -658,6 +658,14 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 
 	channel = le32_to_cpu(hdr->channel);
 	type = le32_to_cpu(hdr->type);
+	/*
+	 * Publishing rptr releases this entry to the firmware. Handlers can
+	 * sleep and send replies, so retain a private copy before allowing
+	 * the producer to reuse the ring storage.
+	 */
+	data = kmemdup(hdr->data, size, GFP_KERNEL);
+	if (!data)
+		return false;
 
 	rptr = ALIGN(rptr + sizeof(*hdr) + size, 1 << BLOCK_SHIFT);
 	if (WARN_ON(rptr > ep->rxbfr.bufsz))
@@ -670,14 +678,8 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 	ep->rxbfr.hdr->rptr = cpu_to_le32(rptr);
 	trace_afk_recv_rwptr_post(ep, rptr, wptr);
 
-	/*
-	 * TODO: this is theoretically unsafe since DCP could overwrite data
-	 *       after the read pointer was updated above. Do it anyway since
-	 *       it avoids 2 problems in the DCP tracer:
-	 *       1. the tracer sees replies before the notifies from dcp
-	 *       2. the tracer tries to read buffers after they are unmapped.
-	 */
-	afk_recv_handle(ep, channel, type, hdr->data, size);
+	afk_recv_handle(ep, channel, type, data, size);
+	kfree(data);
 
 	return true;
 }
