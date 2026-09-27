@@ -1257,7 +1257,8 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
 
 	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 
-	needs_modeset = drm_atomic_crtc_needs_modeset(crtc_state) || !dcp->valid_mode;
+	needs_modeset = drm_atomic_crtc_needs_modeset(crtc_state) ||
+			!READ_ONCE(dcp->mode_state.valid);
 	if (!needs_modeset && (!dcp->connector || !dcp->connector->connected)) {
 		/*
 		 * Resume restores the mode before the firmware reports the
@@ -2396,6 +2397,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	 */
 	mutex_init(&dcp->hpd_mutex);
 	mutex_init(&dcp->tb_lock);
+	spin_lock_init(&dcp->mode_state.lock);
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
 	dcp->fixed_connector_type = dcp_connector_type_from_dt(dev->of_node);
 	dcp->connector_type = dcp->fixed_connector_type;

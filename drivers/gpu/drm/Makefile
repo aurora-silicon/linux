@@ -228,6 +228,7 @@ obj-$(CONFIG_DRM_PANFROST) += panfrost/
 obj-$(CONFIG_DRM_PANTHOR) += panthor/
 obj-$(CONFIG_DRM_TYR) += tyr/
 obj-$(CONFIG_DRM_APPLE) += apple/
+obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple/iomfb-state-test.o
 obj-$(CONFIG_DRM_ASPEED_GFX) += aspeed/
 obj-$(CONFIG_DRM_MCDE) += mcde/
 obj-$(CONFIG_DRM_TIDSS) += tidss/

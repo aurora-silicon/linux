@@ -1028,6 +1028,7 @@ void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp)
 static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 {
 	struct apple_connector *connector = dcp->connector;
+	unsigned int action;
 
 	/* DCP issues hotplug_gated callbacks after SetPowerState() calls on
 	 * devices with display (macbooks, imacs). This must not result in
@@ -1053,42 +1054,14 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 	if (!(*connected) && READ_ONCE(dcp->typec_crtc_off) &&
 	    READ_ONCE(dcp->typec_cable_connected)) {
 		dev_dbg(dcp->dev, "cb_hotplug() ignoring unplug of powered-off Type-C output\n");
-		dcp->valid_mode = false;
+		dcp_mode_invalidate(&dcp->mode_state);
 		schedule_work(&dcp->vblank_wq);
 		return;
 	}
 
-	if (dcp->during_modeset) {
-		/*
-		 * Remember it rather than dropping it.  Resume re-runs the
-		 * modeset and the firmware reports the display back while that
-		 * is still in flight; discarding it leaves the connector marked
-		 * disconnected forever, with no further event to correct it.
-		 */
-		dev_info(dcp->dev,
-			 "cb_hotplug() deferred during modeset connected:%llu\n",
-			 *connected);
-		dcp->pending_hotplug = true;
-		dcp->pending_hotplug_connected = !!(*connected);
-		return;
-	}
-
-	dev_info(dcp->dev, "cb_hotplug() connected:%llu, valid_mode:%d nr_modes:%u\n",
-		 *connected, dcp->valid_mode, dcp->nr_modes);
-
-	/* Hotplug invalidates mode. DRM doesn't always handle this. */
-	if (!(*connected)) {
-		dcp->valid_mode = false;
-		/* after unplug swap will not complete until the next
-		 * set_digital_out_mode */
-		schedule_work(&dcp->vblank_wq);
-	}
-
-	if (connector && connector->connected != !!(*connected)) {
-		connector->connected = !!(*connected);
-		dcp->valid_mode = false;
-		schedule_work(&connector->hotplug_wq);
-	}
+	action = dcp_mode_hotplug(&dcp->mode_state, !!(*connected),
+				  connector ? &connector->connected : NULL);
+	dcp_handle_hotplug_actions(dcp, action);
 }
 
 static void
@@ -1220,7 +1193,8 @@ static void do_swap(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	struct dcp_swap_start_req start_req = { 0 };
 
-	if (dcp->connector && dcp->connector->connected)
+	if (READ_ONCE(dcp->mode_state.valid) && dcp->connector &&
+	    READ_ONCE(dcp->connector->connected))
 		dcp_swap_start(dcp, false, &start_req, dcp_swap_started, NULL);
 	else
 		dcp_drm_crtc_vblank(dcp->crtc);
@@ -1318,7 +1292,6 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	/* increase refcount to ensure the receiver has a reference */
 	kref_get(&cookie->refcount);
 
-	dcp->during_modeset = true;
 	dcp->swap_submit_timestamp = 0;
 
 	if (mode->vrr)
@@ -1337,25 +1310,6 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	ret = wait_for_completion_timeout(&cookie->done,
 					  msecs_to_jiffies(8500));
 
-	dcp->during_modeset = false;
-
-	if (dcp->pending_hotplug) {
-		bool connected = dcp->pending_hotplug_connected;
-		struct apple_connector *connector = dcp->connector;
-
-		dcp->pending_hotplug = false;
-		dev_info(dcp->dev, "replaying deferred hotplug connected:%d\n",
-			 connected);
-
-		if (!connected)
-			dcp->valid_mode = false;
-
-		if (connector && connector->connected != connected) {
-			connector->connected = connected;
-			dcp->valid_mode = false;
-			schedule_work(&connector->hotplug_wq);
-		}
-	}
 	dev_info(dcp->dev, "set_digital_out_mode finished:%d\n", ret);
 
 	if (ret == 0) {
@@ -1373,7 +1327,6 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			jiffies_to_msecs(ret));
 	}
 	kref_put(&cookie->refcount, release_wait_cookie);
-	dcp->valid_mode = true;
 	dcp->vrr_enabled = mode->vrr && crtc_state->vrr_enabled;
 
 	return 0;

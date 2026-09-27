@@ -17,6 +17,7 @@
 
 #include "dptxep.h"
 #include "iomfb.h"
+#include "iomfb-state.h"
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
 #include "epic/dpavservep.h"
@@ -212,11 +213,7 @@ struct apple_dcp {
 	u64 swap_submit_timestamp;
 
 	/* Current display mode */
-	bool during_modeset;
-	/* hotplug reported while a modeset was in flight, applied afterwards */
-	bool pending_hotplug;
-	bool pending_hotplug_connected;
-	bool valid_mode;
+	struct dcp_mode_state mode_state;
 	/* One HPD pulse after a placeholder EDID, per Type-C connection. */
 	bool placeholder_retried;
 	u64 typec_generation;	/* hpd_mutex: identifies the current connection */
@@ -336,6 +333,7 @@ struct apple_dcp {
 };
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
+void dcp_handle_hotplug_actions(struct apple_dcp *dcp, unsigned int action);
 
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
