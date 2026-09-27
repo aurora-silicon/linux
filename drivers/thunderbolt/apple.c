@@ -59,6 +59,7 @@
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/string.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_graph.h>
@@ -78,6 +79,7 @@
 #include <linux/usb/typec_tbt.h>
 #include <linux/workqueue.h>
 
+#include "apple-dpin-handshake.h"
 #include "nhi.h"
 #include "tb.h"
 
@@ -106,6 +108,9 @@
 #define APPLE_CIO_NHI_BOOT_TIMEOUT_MS 10000
 #define APPLE_CIO_PCIEC_READY_DELAY_MS 300
 
+#define APPLE_CIO_START_RETRIES 5
+#define APPLE_CIO_START_RETRY_DELAY_MS 100
+
 #define APPLE_CIO_PCIEC_INTR2AXI_CTRL 0x80
 #define APPLE_CIO_PCIEC_INTR2AXI_ENABLE BIT(0)
 
@@ -118,6 +123,11 @@
 #define TB_VSE_CAP_APPLE_CABLE_INFO_20_GBPS BIT(4)
 #define TB_VSE_CAP_APPLE_CABLE_INFO_LEGACY_ADAPTER BIT(9)
 #define TB_VSE_CAP_APPLE_CABLE_INFO_TBT2_3 BIT(10)
+
+static unsigned int dpin_mode_value = 8;
+module_param(dpin_mode_value, uint, 0644);
+MODULE_PARM_DESC(dpin_mode_value,
+		 "DPIN0 MODE_A/MODE_B lab value (0-" __stringify(APPLE_DPIN_MODE_VALUE_MAX) "); read at each activate");
 
 struct apple_cio {
 	struct device *dev;
@@ -188,7 +198,6 @@ struct apple_cio {
 #define APPLE_DPIN_IRQ_ENABLE		0x08
 #define APPLE_DPIN_CTRL			0x0c
 #define APPLE_DPIN_CTRL_INACTIVE	BIT(0)
-#define APPLE_DPIN_ACK			0x10
 #define APPLE_DPIN_ACK_INACTIVE		BIT(0)
 
 static bool dp_display;
@@ -196,7 +205,57 @@ module_param(dp_display, bool, 0444);
 MODULE_PARM_DESC(dp_display, "Drive displays behind Thunderbolt DP tunnels (experimental, t8103)");
 
 /* DPTX_INACTIVE handshake: request (in)active, wait for the ACK */
-static int apple_dpin_set_active(struct apple_cio *acio, void __iomem *dpin,
+struct apple_dpin_poll {
+	void __iomem *base;
+	unsigned long deadline;
+};
+
+static unsigned int apple_dpin_read(void *ctx, unsigned int offset)
+{
+	struct apple_dpin_poll *poll = ctx;
+
+	return readl(poll->base + offset);
+}
+
+static void apple_dpin_write(void *ctx, unsigned int offset, unsigned int value)
+{
+	struct apple_dpin_poll *poll = ctx;
+
+	writel(value, poll->base + offset);
+}
+
+static int apple_dpin_wait(void *ctx)
+{
+	struct apple_dpin_poll *poll = ctx;
+
+	if (time_after_eq(jiffies, poll->deadline))
+		return -ETIMEDOUT;
+	usleep_range(1000, 2000);
+	return 0;
+}
+
+static int apple_dpin_set_active_t602x(struct apple_cio *acio, void __iomem *regs,
+				 unsigned int idx, bool active)
+{
+	struct apple_dpin_poll poll = {
+		.base = regs,
+		.deadline = jiffies + msecs_to_jiffies(1000),
+	};
+	struct apple_dpin_io io = {
+		.read = apple_dpin_read,
+		.write = apple_dpin_write,
+		.wait = apple_dpin_wait,
+		.ctx = &poll,
+	};
+	int ret;
+
+	ret = apple_dpin_handshake(&io, active, dpin_mode_value);
+	dev_info(acio->dev, "dpin%u: %s handshake=%d\n", idx,
+		 active ? "active" : "inactive", ret);
+	return ret;
+}
+
+static int apple_dpin_set_active_t8103(struct apple_cio *acio, void __iomem *dpin,
 				 unsigned int idx, bool active)
 {
 	u32 want = active ? 0 : APPLE_DPIN_ACK_INACTIVE;
@@ -238,6 +297,14 @@ static int apple_dpin_set_active(struct apple_cio *acio, void __iomem *dpin,
 	dev_dbg(acio->dev, "dpin%u: %s (status=%08x)\n", idx,
 		 active ? "active" : "inactive", readl(dpin + APPLE_DPIN_STATUS));
 	return 0;
+}
+
+static int apple_dpin_set_active(struct apple_cio *acio, void __iomem *regs,
+				 unsigned int idx, bool active)
+{
+	if (of_machine_is_compatible("apple,j416s"))
+		return apple_dpin_set_active_t602x(acio, regs, idx, active);
+	return apple_dpin_set_active_t8103(acio, regs, idx, active);
 }
 
 /* Called by appledrm from DCP's Activate/Deactivate calls. */
@@ -316,11 +383,13 @@ static int apple_dpin_up(struct apple_dpin_ctx *c)
 		 * back. Nothing handles these interrupts yet; they are enabled
 		 * as part of bringing the adapter up.
 		 */
-		irq = readl(regs + APPLE_DPIN_IRQ_STATUS);
-		writel(irq, regs + APPLE_DPIN_IRQ_STATUS);
-		if (irq & BIT(0))
-			writel(readl(regs + APPLE_DPIN_STATUS), regs + APPLE_DPIN_STATUS);
-		writel(readl(regs + APPLE_DPIN_IRQ_ENABLE) | 3, regs + APPLE_DPIN_IRQ_ENABLE);
+		if (of_machine_is_compatible("apple,t8103")) {
+			irq = readl(regs + APPLE_DPIN_IRQ_STATUS);
+			writel(irq, regs + APPLE_DPIN_IRQ_STATUS);
+			if (irq & BIT(0))
+				writel(readl(regs + APPLE_DPIN_STATUS), regs + APPLE_DPIN_STATUS);
+			writel(readl(regs + APPLE_DPIN_IRQ_ENABLE) | 3, regs + APPLE_DPIN_IRQ_ENABLE);
+		}
 	}
 
 	ret = apple_dpin_connect(c, true);
@@ -486,6 +555,14 @@ struct apple_nhi {
 	const char **tx_irq_names;
 	const char **rx_irq_names;
 	size_t n_rings;
+
+	/* DP IN analog/AUX: poll adapter CS after the tunnel is up. */
+	struct delayed_work dp_aux_work;
+	u8 dp_in_port;
+	u32 analog_base;
+	u32 dp_in_cs[14];
+	bool dp_aux_armed;
+	unsigned int dp_aux_polls;
 };
 
 #define nhi_to_anhi(nhi_) container_of((nhi_), struct apple_nhi, nhi)
@@ -890,6 +967,469 @@ static int apple_nhi_pci_tunnel_post_activate(struct tb_nhi *nhi)
 	return 0;
 }
 
+#define APPLE_DP_AUX_POLL_MS		500
+#define APPLE_DP_AUX_POLL_MAX		24
+
+/*
+ * apple,tunable-rc programs two analog PHY blocks inside the already-mapped
+ * ACIO RC window (0xc000). They match the two host DP IN adapters (0:5, 0:6).
+ * Dumping 0x00-0xff never saw them. Do not scan unmapped ACIO ranges.
+ */
+#define APPLE_CIO_DPIN0_ANALOG		0x4000
+#define APPLE_CIO_DPIN1_ANALOG		0x8000
+#define APPLE_CIO_DPIN_ANALOG_SIZE	0x80
+#define APPLE_CIO_DPIN_ANALOG_FSM	0x18
+#define APPLE_CIO_DPIN_ANALOG_HOLE	0x20
+#define APPLE_CIO_DPIN_ANALOG_EMPTY	0x80000000
+#define APPLE_CIO_DPIN_ANALOG_HOLE_VAL	0x40
+
+/*
+ * Analog MMIO writes are closed: +0x00 / +0x18 / +0x20 do not stick.
+ * +0x18 is first-read status 0x1017 (read-to-clear).
+ *
+ * 0 = do not touch analog at tunnel-up; dump it only after DPRX timeout
+ *     (default). Tests whether consuming +0x18 aborted a handshake.
+ * 1 = old pulse +0x00 / fill +0x20 (rollback)
+ */
+static int apple_dpin_aux;
+static struct apple_nhi *apple_dpin_anhi;
+
+static int apple_dpin_aux_set(const char *val, const struct kernel_param *kp);
+static const struct kernel_param_ops apple_dpin_aux_ops = {
+	.set = apple_dpin_aux_set,
+	.get = param_get_int,
+};
+module_param_cb(dpin_aux, &apple_dpin_aux_ops, &apple_dpin_aux, 0644);
+MODULE_PARM_DESC(dpin_aux,
+		 "Apple DP IN analog: 0=hands-off until timeout, 1=pulse +0x00");
+
+static void apple_dp_dump_hop(struct tb_port *port, unsigned int hopid)
+{
+	struct tb_regs_hop hop;
+	int ret;
+
+	ret = tb_port_read(port, &hop, TB_CFG_HOPS, 2 * hopid, 2);
+	if (ret) {
+		tb_port_dbg(port, "DP IN hop %u read failed: %d\n", hopid, ret);
+		return;
+	}
+	tb_port_dbg(port,
+		     "DP IN hop %u enable=%u out=%u next=%u credits=%u\n",
+		     hopid, hop.enable, hop.out_port, hop.next_hop,
+		     hop.initial_credits);
+}
+
+
+
+static void apple_dp_dump_adapter(struct tb_port *port, const char *tag)
+{
+	u32 w[17], cs4 = 0xffffffff;
+	int i, ret;
+
+	ret = tb_port_read(port, &w[0], TB_CFG_PORT, port->cap_adap, 1);
+	if (ret || w[0] == 0xffffffff) {
+		tb_port_dbg(port, "%s config space dead ret=%d (not DPRX)\n",
+			     tag, ret);
+		return;
+	}
+	for (i = 1; i <= 16; i++) {
+		ret = tb_port_read(port, &w[i], TB_CFG_PORT,
+				   port->cap_adap + i, 1);
+		if (ret)
+			w[i] = 0xffffffff;
+	}
+	tb_port_read(port, &cs4, TB_CFG_PORT, ADP_CS_4, 1);
+	tb_port_dbg(port,
+		     "%s type=%06x cap=%d CS0=%08x CS1=%08x CS2=%08x CS3=%08x LOCAL=%08x REMOTE=%08x STAT=%08x COMMON=%08x CS8=%08x CS9=%08x CS10=%08x ADP_CS4=%08x VE=%u AE=%u HPD=%u DPRX=%u LCK=%u\n",
+		     tag, port->config.type, port->cap_adap,
+		     w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8],
+		     w[9], w[10], cs4,
+		     !!(w[0] & ADP_DP_CS_0_VE), !!(w[0] & ADP_DP_CS_0_AE),
+		     !!(w[2] & ADP_DP_CS_2_HPD),
+		     !!(w[7] & DP_COMMON_CAP_DPRX_DONE),
+		     !!(cs4 & ADP_CS_4_LCK));
+	tb_port_dbg(port,
+		     "%s CS11=%08x CS12=%08x CS13=%08x CS14=%08x CS15=%08x CS16=%08x disc=%u\n",
+		     tag, w[11], w[12], w[13], w[14], w[15], w[16],
+		     !!(w[13] & ADP_DP_CS_13_DPTX_DISCOVERY_MODE));
+}
+
+static void apple_dp_dump_host_adapters(struct apple_nhi *anhi)
+{
+	struct tb_port *port;
+
+	if (!anhi->tb || !anhi->tb->root_switch)
+		return;
+
+	tb_switch_for_each_port(anhi->tb->root_switch, port) {
+		if (tb_port_is_dpin(port))
+			apple_dp_dump_adapter(port, "host DP IN");
+		else if (tb_port_is_dpout(port))
+			apple_dp_dump_adapter(port, "host DP OUT");
+	}
+}
+
+static void apple_dp_dump_rc_range(struct apple_cio *acio, u32 base, u32 len,
+				   const char *tag, bool skip_zero)
+{
+	char buf[320];
+	int n = 0;
+	u32 off, size;
+
+	if (!acio->rc_base || !acio->rc_res)
+		return;
+	size = resource_size(acio->rc_res);
+	if (base >= size)
+		return;
+	if (base + len > size)
+		len = size - base;
+
+	for (off = 0; off < len; off += 4) {
+		u32 val = readl(acio->rc_base + base + off);
+
+		if (skip_zero && !val)
+			continue;
+		n += scnprintf(buf + n, sizeof(buf) - n, " %03x=%08x", off, val);
+		if (n >= (int)sizeof(buf) - 24) {
+			dev_dbg(acio->dev, "ACIO RC %s 0x%x:%s\n", tag, base, buf);
+			n = 0;
+			buf[0] = '\0';
+		}
+	}
+	if (n)
+		dev_dbg(acio->dev, "ACIO RC %s 0x%x:%s\n", tag, base, buf);
+}
+
+static void apple_dp_dump_rc(struct apple_cio *acio)
+{
+	apple_dp_dump_rc_range(acio, 0, 0x100, "ctrl", true);
+}
+
+static void apple_dp_dump_vse(struct tb_switch *sw)
+{
+	char buf[320];
+	int cap, i, n = 0, ret;
+	u32 w;
+
+	cap = tb_switch_find_vse_cap(sw, TB_VSE_CAP_APPLE);
+	if (cap < 0) {
+		tb_sw_dbg(sw, "Apple VSE cap missing: %d\n", cap);
+		return;
+	}
+	for (i = 0; i < 16; i++) {
+		ret = tb_sw_read(sw, &w, TB_CFG_SWITCH, cap + i, 1);
+		if (ret)
+			w = 0xffffffff;
+		n += scnprintf(buf + n, sizeof(buf) - n, " %02x=%08x", i, w);
+		if (n >= (int)sizeof(buf) - 20) {
+			tb_sw_dbg(sw, "Apple VSE cap=%d:%s\n", cap, buf);
+			n = 0;
+			buf[0] = '\0';
+		}
+	}
+	if (n)
+		tb_sw_dbg(sw, "Apple VSE cap=%d:%s\n", cap, buf);
+}
+
+
+
+static void apple_dp_dump_analog(struct apple_cio *acio, const char *tag)
+{
+	apple_dp_dump_rc_range(acio, APPLE_CIO_DPIN0_ANALOG,
+			      APPLE_CIO_DPIN_ANALOG_SIZE, tag, false);
+	apple_dp_dump_rc_range(acio, APPLE_CIO_DPIN1_ANALOG,
+			      APPLE_CIO_DPIN_ANALOG_SIZE, "dpin1 analog", false);
+}
+
+static u32 apple_dp_in_analog_base(struct apple_nhi *anhi, struct tb_port *in)
+{
+	unsigned int idx = 0;
+	struct tb_port *port;
+
+	if (!anhi->tb || !anhi->tb->root_switch)
+		return APPLE_CIO_DPIN0_ANALOG;
+
+	tb_switch_for_each_port(anhi->tb->root_switch, port) {
+		if (!tb_port_is_dpin(port))
+			continue;
+		if (port == in)
+			return idx ? APPLE_CIO_DPIN1_ANALOG :
+				     APPLE_CIO_DPIN0_ANALOG;
+		idx++;
+	}
+	return APPLE_CIO_DPIN0_ANALOG;
+}
+
+static void apple_dp_start_analog(struct apple_nhi *anhi, bool pulse)
+{
+	struct apple_cio *acio;
+	u32 block, ctrl, hole, fsm;
+
+	if (!anhi || !anhi->acio || !anhi->acio->rc_base)
+		return;
+	acio = anhi->acio;
+	block = anhi->analog_base ?: APPLE_CIO_DPIN0_ANALOG;
+	if (block + APPLE_CIO_DPIN_ANALOG_HOLE + 4 > resource_size(acio->rc_res))
+		return;
+
+	ctrl = readl(acio->rc_base + block);
+	hole = readl(acio->rc_base + block + APPLE_CIO_DPIN_ANALOG_HOLE);
+	fsm = readl(acio->rc_base + block + APPLE_CIO_DPIN_ANALOG_FSM);
+	dev_info(acio->dev,
+		 "DP IN analog +0x00=%08x +0x18=%08x +0x20=%08x pulse=%d\n",
+		 ctrl, fsm, hole, pulse);
+
+	if (!pulse)
+		return;
+
+	/* +0x00 readback is empty status; still pulse start like PCIe-C. */
+	writel(ctrl | BIT(0), acio->rc_base + block);
+	mb();
+	ctrl = readl(acio->rc_base + block);
+
+	if (hole == 0) {
+		writel(APPLE_CIO_DPIN_ANALOG_HOLE_VAL,
+		       acio->rc_base + block + APPLE_CIO_DPIN_ANALOG_HOLE);
+		mb();
+		hole = readl(acio->rc_base + block + APPLE_CIO_DPIN_ANALOG_HOLE);
+	}
+
+	fsm = readl(acio->rc_base + block + APPLE_CIO_DPIN_ANALOG_FSM);
+	dev_info(acio->dev,
+		 "DP IN analog after start +0x00=%08x +0x18=%08x +0x20=%08x\n",
+		 ctrl, fsm, hole);
+	apple_dp_dump_rc_range(acio, block, APPLE_CIO_DPIN_ANALOG_SIZE,
+			      "dpin analog after start", false);
+}
+
+static int apple_dpin_aux_set(const char *val, const struct kernel_param *kp)
+{
+	struct apple_nhi *anhi;
+	int v, ret;
+
+	ret = kstrtoint(val, 0, &v);
+	if (ret)
+		return ret;
+	apple_dpin_aux = v;
+	anhi = READ_ONCE(apple_dpin_anhi);
+	if (v >= 1 && anhi)
+		apple_dp_start_analog(anhi, true);
+	return 0;
+}
+
+static int apple_dp_dptx_discover(struct tb_port *in)
+{
+	u32 cs0 = 0;
+
+	tb_port_read(in, &cs0, TB_CFG_PORT, in->cap_adap + ADP_DP_CS_0, 1);
+	tb_port_warn(in,
+		     "USB4 DPTX Discovery closed (CS13 writable, CS9 static); AE=%u VE=%u\n",
+		     !!(cs0 & ADP_DP_CS_0_AE), !!(cs0 & ADP_DP_CS_0_VE));
+	return 0;
+}
+
+static void apple_dp_aux_work(struct work_struct *work)
+{
+	struct apple_nhi *anhi =
+		container_of(to_delayed_work(work), struct apple_nhi,
+			     dp_aux_work);
+	struct tb_port *port;
+	u32 cs[14];
+	int i, ret;
+	bool changed = false, dprx = false;
+
+	if (!anhi->tb)
+		return;
+
+	mutex_lock(&anhi->tb->lock);
+	if (!anhi->dp_aux_armed || !anhi->tb->root_switch)
+		goto out_unlock;
+
+	port = &anhi->tb->root_switch->ports[anhi->dp_in_port];
+	if (!tb_port_is_dpin(port))
+		goto out_unlock;
+
+	for (i = 0; i <= 13; i++) {
+		ret = tb_port_read(port, &cs[i], TB_CFG_PORT,
+				   port->cap_adap + i, 1);
+		if (ret)
+			cs[i] = 0xffffffff;
+		if (cs[i] != anhi->dp_in_cs[i])
+			changed = true;
+	}
+	if (changed) {
+		memcpy(anhi->dp_in_cs, cs, sizeof(cs));
+		tb_port_dbg(port,
+			     "DP IN CS changed CS0=%08x CS2=%08x CS9=%08x CS13=%08x COMMON=%08x VE=%u AE=%u HPD=%u DPRX=%u disc=%u\n",
+			     cs[0], cs[2], cs[9], cs[13], cs[7],
+			     !!(cs[0] & ADP_DP_CS_0_VE),
+			     !!(cs[0] & ADP_DP_CS_0_AE),
+			     !!(cs[2] & ADP_DP_CS_2_HPD),
+			     !!(cs[7] & DP_COMMON_CAP_DPRX_DONE),
+			     !!(cs[13] & ADP_DP_CS_13_DPTX_DISCOVERY_MODE));
+	}
+	dprx = !!(cs[7] & DP_COMMON_CAP_DPRX_DONE);
+	if (dprx)
+		tb_port_dbg(port, "DP IN DPRX_DONE=1 (ACIO AUX completed)\n");
+
+	anhi->dp_aux_polls++;
+	/*
+	 * Deliberately not dumping or reading the analog block on every
+	 * poll here. +0x18 is an ordinary one-shot, read-to-clear status
+	 * register -- already documented above (APPLE_CIO_DPIN_ANALOG_EMPTY,
+	 * and the comment a few lines up: "+0x18 is first-read status
+	 * 0x1017 (read-to-clear)"), not a stuck error FSM, so polling it
+	 * repeatedly has no diagnostic value and risks consuming a status
+	 * this project's own dpin_aux default-off comment already warns
+	 * could abort a handshake if read too early. A write-1-to-clear
+	 * ack against it has no effect either: 0x80000000 is the
+	 * register's own idle/empty sentinel, not a latched error that
+	 * needs acknowledging. Stick to a single post-mortem dump below,
+	 * after the fact, once polling ends.
+	 */
+	if (!dprx && anhi->dp_aux_polls < APPLE_DP_AUX_POLL_MAX) {
+		mod_delayed_work(system_wq, &anhi->dp_aux_work,
+				 msecs_to_jiffies(APPLE_DP_AUX_POLL_MS));
+	} else if (anhi->acio) {
+		apple_dp_dump_analog(anhi->acio,
+				     dprx ? "dpin0 analog DPRX done" :
+					    "dpin0 analog at timeout");
+	}
+
+out_unlock:
+	mutex_unlock(&anhi->tb->lock);
+}
+
+/*
+ * Which DP IN adapter (0/1) on the host router this port is -- same
+ * counting order as apple_dp_in_analog_base() above, and as
+ * apple_nhi_dp_tunnel_changed()'s port-to-dpin mapping in
+ * aurora-silicon/linux#8.
+ */
+static int apple_dpin_index_for_port(struct apple_nhi *anhi, struct tb_port *in)
+{
+	unsigned int idx = 0;
+	struct tb_port *port;
+
+	if (!anhi->tb || !anhi->tb->root_switch)
+		return -1;
+
+	tb_switch_for_each_port(anhi->tb->root_switch, port) {
+		if (!tb_port_is_dpin(port))
+			continue;
+		if (port == in)
+			return idx;
+		idx++;
+	}
+	return -1;
+}
+
+static int apple_nhi_dp_tunnel_pre_activate(struct tb_nhi *nhi,
+					    struct tb_port *in,
+					    struct tb_port *out)
+{
+	if (tb_port_is_dpin(in))
+		return apple_dp_dptx_discover(in);
+	return 0;
+}
+
+static int apple_nhi_dp_tunnel_post_activate(struct tb_nhi *nhi,
+					     struct tb_port *in,
+					     struct tb_port *out)
+{
+	struct apple_nhi *anhi = nhi_to_anhi(nhi);
+	int i, idx;
+
+	dev_info(anhi->dev,
+		 "DP IN tunnel routing: tunnel %u:%u <-> %u:%u\n",
+		 in->sw->config.depth, in->port,
+		 out ? out->sw->config.depth : 0,
+		 out ? out->port : 0);
+
+	anhi->dp_in_port = in->port;
+	anhi->analog_base = apple_dp_in_analog_base(anhi, in);
+	anhi->dp_aux_polls = 0;
+	anhi->dp_aux_armed = true;
+	WRITE_ONCE(apple_dpin_anhi, anhi);
+
+	apple_dp_dump_rc(anhi->acio);
+	apple_dp_dump_vse(in->sw);
+
+	/*
+	 * Route a real display pipeline to this tunnel, ported from
+	 * aurora-silicon/linux#8 -- the dpin_aux "analog AUX serializer"
+	 * mechanism previously here is confirmed ineffective on this
+	 * hardware, including after everything else in the tunnel-up path
+	 * was independently fixed.
+	 */
+	idx = apple_dpin_index_for_port(anhi, in);
+	if (idx < 0 || idx > 1 || !anhi->acio) {
+		dev_warn(anhi->dev,
+			 "DP IN tunnel: could not map port %u to a dpin index\n",
+			 in->port);
+	} else if (!anhi->acio->connector_np) {
+		dev_warn(anhi->dev,
+			 "DP IN tunnel: no Type-C connector for dpin%d\n", idx);
+	} else if (!anhi->acio->dp_wq) {
+		dev_warn(anhi->dev, "DP IN tunnel: no work queue for dpin%d\n", idx);
+	} else {
+		struct apple_dpin_ctx *c = &anhi->acio->dpin[idx];
+
+		scoped_guard(mutex, &c->lock)
+			c->alive = true;
+		queue_work(anhi->acio->dp_wq, &c->work);
+	}
+	apple_dp_dump_host_adapters(anhi);
+	if (tb_port_is_dpin(in)) {
+		apple_dp_dump_hop(in, 8);
+		apple_dp_dump_hop(in, 9);
+	}
+	if (out && tb_port_is_dpout(out))
+		apple_dp_dump_adapter(out, "hub DP OUT");
+
+	for (i = 0; i <= 13; i++) {
+		if (tb_port_read(in, &anhi->dp_in_cs[i], TB_CFG_PORT,
+				 in->cap_adap + i, 1))
+			anhi->dp_in_cs[i] = 0xffffffff;
+	}
+	mod_delayed_work(system_wq, &anhi->dp_aux_work,
+			 msecs_to_jiffies(APPLE_DP_AUX_POLL_MS));
+	return 0;
+}
+
+static void apple_nhi_dp_tunnel_deactivate(struct tb_nhi *nhi,
+					   struct tb_port *in,
+					   struct tb_port *out)
+{
+	struct apple_nhi *anhi = nhi_to_anhi(nhi);
+	int idx;
+
+	anhi->dp_aux_armed = false;
+	cancel_delayed_work(&anhi->dp_aux_work);
+	if (READ_ONCE(apple_dpin_anhi) == anhi)
+		WRITE_ONCE(apple_dpin_anhi, NULL);
+
+	/*
+	 * Runs after both adapters are already disabled (tb_dp_activate()'s
+	 * teardown order) -- later than aurora-silicon/linux#8's own
+	 * dp_tunnel_changed(active=false), which fires before deactivation
+	 * while the block is still powered. apple_dpin_dcp_set_active()'s
+	 * own "block may already be off" check (matching the reference
+	 * implementation's identical defensive check) covers this gap; a
+	 * spurious no-op register access here is not a functional blocker,
+	 * only a less clean teardown than the ideal ordering.
+	 */
+	idx = apple_dpin_index_for_port(anhi, in);
+	if (idx >= 0 && idx <= 1 && anhi->acio && anhi->acio->dp_wq) {
+		struct apple_dpin_ctx *c = &anhi->acio->dpin[idx];
+
+		scoped_guard(mutex, &c->lock)
+			c->alive = false;
+		queue_work(anhi->acio->dp_wq, &c->work);
+	}
+	dev_info(anhi->dev, "DP IN tunnel routing: tunnel down\n");
+}
+
 static void apple_nhi_dp_tunnel_changed(struct tb_nhi *nhi, u8 in_port,
 					bool active)
 {
@@ -978,6 +1518,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	anhi->dev = &pdev->dev;
 	anhi->np = pdev->dev.of_node;
 	anhi->acio = acio;
+	INIT_DELAYED_WORK(&anhi->dp_aux_work, apple_dp_aux_work);
 	platform_set_drvdata(pdev, anhi);
 
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "nhi");
@@ -1015,6 +1556,11 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	anhi->ops = apple_nhi_ops;
 	if (dp_display && acio->dp_wq && of_machine_is_compatible("apple,t8103"))
 		anhi->ops.dp_tunnel_changed = apple_nhi_dp_tunnel_changed;
+	if (acio->dp_wq && of_machine_is_compatible("apple,j416s")) {
+		anhi->ops.dp_tunnel_pre_activate = apple_nhi_dp_tunnel_pre_activate;
+		anhi->ops.dp_tunnel_post_activate = apple_nhi_dp_tunnel_post_activate;
+		anhi->ops.dp_tunnel_deactivate = apple_nhi_dp_tunnel_deactivate;
+	}
 	anhi->nhi.ops = &anhi->ops;
 	anhi->nhi.ring_layout = &apple_nhi_ring_layout;
 	anhi->nhi.iobase = anhi->nhi_base;
@@ -1115,6 +1661,10 @@ static void apple_nhi_remove(struct platform_device *pdev)
 {
 	struct apple_nhi *anhi = platform_get_drvdata(pdev);
 
+	anhi->dp_aux_armed = false;
+	cancel_delayed_work_sync(&anhi->dp_aux_work);
+	if (READ_ONCE(apple_dpin_anhi) == anhi)
+		WRITE_ONCE(apple_dpin_anhi, NULL);
 	WRITE_ONCE(anhi->acio->nhi_pdev, NULL);
 	tb_domain_remove(anhi->tb);
 	wait_for_completion(&anhi->nhi.domain_released);
@@ -1316,7 +1866,17 @@ static int apple_cio_start(struct apple_cio *acio)
 	 * After the power domains are on we need to signal and wait for the ACIO block
 	 * to actually start before we can bring up the co-processor.
 	 */
-	ret = reset_control_deassert(acio->reset);
+	for (i = 0; i < APPLE_CIO_START_RETRIES; i++) {
+		ret = reset_control_deassert(acio->reset);
+		if (!ret)
+			break;
+		if (i + 1 < APPLE_CIO_START_RETRIES) {
+			dev_warn(acio->dev,
+				 "ACIO block failed to start (attempt %d/%d): %d, retrying\n",
+				 i + 1, APPLE_CIO_START_RETRIES, ret);
+			msleep(APPLE_CIO_START_RETRY_DELAY_MS);
+		}
+	}
 	if (ret) {
 		dev_err(acio->dev, "ACIO block failed to start: %d\n", ret);
 		goto remove_links;

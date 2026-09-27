@@ -35,7 +35,7 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, u8 rate);
  * bring it back up (clock gates and enables) around a link reconfiguration.
  * The mux selection is left alone; link_down() also leaves the ATC output
  * enable set and link_up() re-asserts it. The caller keeps the output
- * selected (holds the mux) around both. t8103-style crossbars only.
+ * selected (holds the mux) around both. Supports t8103 and T602X crossbars.
  */
 int apple_dpxbar_link_down(struct mux_control *mux);
 int apple_dpxbar_link_up(struct mux_control *mux);

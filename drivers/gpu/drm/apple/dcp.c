@@ -90,6 +90,11 @@ bool dcp_is_typec_output(struct apple_dcp *dcp)
 	       dcp->fixed_connector_type == DRM_MODE_CONNECTOR_USB;
 }
 
+bool dcp_is_usb4_output(struct apple_dcp *dcp)
+{
+	return dcp->active_typec_route && dcp->active_typec_route->tunnel;
+}
+
 static bool dcp_typec_route_is_dp(const struct typec_mux_state *state)
 {
 	return state->alt && state->alt->svid == USB_TYPEC_DP_SID &&
@@ -650,6 +655,10 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
 		if (!dcp_typec_route_available(candidate))
 			continue;
 		score = dcp_typec_route_score(candidate);
+		/* j416s dcpext0 completes tunneled link training; prefer it. */
+		if (of_machine_is_compatible("apple,j416s") &&
+		    !candidate->dcp->fixed_phy)
+			score += 100;
 		if (score < best_score) {
 			best = candidate;
 			best_score = score;
@@ -1279,6 +1288,7 @@ bool dcp_has_typec_routes(struct platform_device *pdev)
 }
 
 #define DPTX_CONNECT_TIMEOUT msecs_to_jiffies(2000)
+#define DPTX_TUNNEL_CONNECT_TIMEOUT msecs_to_jiffies(8000)
 #define DPTX_RECONNECT_DELAY msecs_to_jiffies(1000)
 #define DPTX_RECONNECT_RETRIES 5
 
@@ -1339,7 +1349,12 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 	}
 	dcp->dptxport[port].connected = true;
 	if (dcp_is_typec_output(dcp)) {
-		ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
+		if (dcp_is_usb4_output(dcp) &&
+		    of_machine_is_compatible("apple,j416s"))
+			ret = dptxport_set_hpd_timeout(dcp->dptxport[port].service,
+						       true, 8000);
+		else
+			ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
 		if (ret) {
 			dev_err(dcp->dev,
 				"dcp_dptx_connect: failed to assert Type-C HPD: %d\n",
@@ -1351,7 +1366,9 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 
 	mutex_unlock(&dcp->hpd_mutex);
 	ret = wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
-				    DPTX_CONNECT_TIMEOUT);
+				    dcp_is_usb4_output(dcp) &&
+				    of_machine_is_compatible("apple,j416s") ?
+				    DPTX_TUNNEL_CONNECT_TIMEOUT : DPTX_CONNECT_TIMEOUT);
 	if (!ret) {
 		dev_err(dcp->dev,
 			"dcp_dptx_connect: timed out waiting for port %u link configuration\n",
@@ -1470,7 +1487,9 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 		return;
 	}
 
-	if (++dcp->typec_reconnect_tries < DPTX_RECONNECT_RETRIES) {
+	if (++dcp->typec_reconnect_tries <
+	    (dcp_is_usb4_output(dcp) && of_machine_is_compatible("apple,j416s") ?
+	     1 : DPTX_RECONNECT_RETRIES)) {
 		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq,
 				 DPTX_RECONNECT_DELAY);
 		return;
@@ -2490,12 +2509,25 @@ static void dcp_platform_remove(struct platform_device *pdev)
 
 static void dcp_platform_shutdown(struct platform_device *pdev)
 {
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (dcp) {
+		WRITE_ONCE(dcp->typec_cable_connected, false);
+		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
+		cancel_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
+	}
 	component_del(&pdev->dev, &dcp_comp_ops);
 }
 
 static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
+
+	WRITE_ONCE(dcp->typec_cable_connected, false);
+	cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+	cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
+	cancel_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
 
 	if (dcp->avep)
 		av_service_disconnect(dcp);

@@ -22,6 +22,7 @@
 #include <linux/usb/role.h>
 #include <linux/workqueue.h>
 #include <linux/firmware.h>
+#include <linux/suspend.h>
 
 #include "tps6598x.h"
 #include "trace.h"
@@ -561,6 +562,62 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		cd321x->state.data = NULL;
 		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 		ret = typec_mux_set(cd321x->mux, &cd321x->state);
+	} else if (st->data_status & CD321X_DATA_STATUS_USB4_CONNECTION) {
+		struct enter_usb_data eusb_data;
+
+		if (cd321x->state.alt == NULL && cd321x->state.mode == TYPEC_MODE_USB4)
+			return 0;
+
+		eusb_data.eudo = le32_to_cpu(st->usb4_status.eudo);
+		eusb_data.active_link_training =
+			!!(st->data_status & TPS_DATA_STATUS_ACTIVE_LINK_TRAIN);
+
+		cd321x->state.alt = NULL;
+		cd321x->state.data = &eusb_data;
+		cd321x->state.mode = TYPEC_MODE_USB4;
+		ret = typec_mux_set(cd321x->mux, &cd321x->state);
+		if (ret)
+			goto out;
+
+		tbt_switch_data.state = TYPEC_THUNDERBOLT_SWITCH_USB4;
+		tbt_switch_data.usb4 = eusb_data;
+		tbt_switch_data.orientation = TPS_STATUS_TO_UPSIDE_DOWN(st->status) ?
+						      TYPEC_ORIENTATION_REVERSE :
+						      TYPEC_ORIENTATION_NORMAL;
+		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
+	} else if (st->data_status & TPS_DATA_STATUS_TBT_CONNECTION) {
+		struct typec_thunderbolt_data tbt_data;
+
+		if (cd321x->state.alt == cd321x->port_altmode_tbt &&
+		    cd321x->state.mode == TYPEC_TBT_MODE)
+			return 0;
+
+		tbt_data.cable_mode = TBT_MODE |
+			TBT_SET_CABLE_SPEED(TPS_DATA_STATUS_TBT_CABLE_SPEED(st->data_status)) |
+			TBT_SET_CABLE_ROUNDED(TPS_DATA_STATUS_TBT_CABLE_GEN(st->data_status));
+		if (st->data_status & TPS_DATA_STATUS_OPTICAL_CABLE)
+			tbt_data.cable_mode |= TBT_CABLE_OPTICAL;
+		if (st->data_status & TPS_DATA_STATUS_ACTIVE_LINK_TRAIN)
+			tbt_data.cable_mode |= TBT_CABLE_LINK_TRAINING;
+		if (st->data_status & CD321X_DATA_STATUS_ACTIVE_CABLE)
+			tbt_data.cable_mode |= TBT_CABLE_ACTIVE_PASSIVE;
+		tbt_data.device_mode = TBT_MODE |
+			(u32)le16_to_cpu(st->intel_vid_status.device_mode) << 16;
+		tbt_data.enter_vdo =
+			(u32)le16_to_cpu(st->intel_vid_status.enter_vdo) << 16;
+		cd321x->state.alt = cd321x->port_altmode_tbt;
+		cd321x->state.mode = TYPEC_TBT_MODE;
+		cd321x->state.data = &tbt_data;
+		ret = typec_mux_set(cd321x->mux, &cd321x->state);
+		if (ret)
+			goto out;
+
+		tbt_switch_data.state = TYPEC_THUNDERBOLT_SWITCH_TBT;
+		tbt_switch_data.tbt = tbt_data;
+		tbt_switch_data.orientation = TPS_STATUS_TO_UPSIDE_DOWN(st->status) ?
+						      TYPEC_ORIENTATION_REVERSE :
+						      TYPEC_ORIENTATION_NORMAL;
+		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 	} else if (st->data_status & TPS_DATA_STATUS_DP_CONNECTION) {
 		struct typec_displayport_data dp_data;
 		unsigned long mode;
@@ -611,62 +668,6 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 			cd321x->dp_status = dp_data.status;
 			cd321x->dp_conf = dp_data.conf;
 		}
-	} else if (st->data_status & TPS_DATA_STATUS_TBT_CONNECTION) {
-		struct typec_thunderbolt_data tbt_data;
-
-		if (cd321x->state.alt == cd321x->port_altmode_tbt &&
-		   cd321x->state.mode == TYPEC_TBT_MODE)
-			return 0;
-
-		tbt_data.cable_mode = TBT_MODE |
-			TBT_SET_CABLE_SPEED(TPS_DATA_STATUS_TBT_CABLE_SPEED(st->data_status)) |
-			TBT_SET_CABLE_ROUNDED(TPS_DATA_STATUS_TBT_CABLE_GEN(st->data_status));
-		if (st->data_status & TPS_DATA_STATUS_OPTICAL_CABLE)
-			tbt_data.cable_mode |= TBT_CABLE_OPTICAL;
-		if (st->data_status & TPS_DATA_STATUS_ACTIVE_LINK_TRAIN)
-			tbt_data.cable_mode |= TBT_CABLE_LINK_TRAINING;
-		if (st->data_status & CD321X_DATA_STATUS_ACTIVE_CABLE)
-			tbt_data.cable_mode |= TBT_CABLE_ACTIVE_PASSIVE;
-		tbt_data.device_mode = TBT_MODE |
-			(u32)le16_to_cpu(st->intel_vid_status.device_mode) << 16;
-		tbt_data.enter_vdo =
-			(u32)le16_to_cpu(st->intel_vid_status.enter_vdo) << 16;
-		cd321x->state.alt = cd321x->port_altmode_tbt;
-		cd321x->state.mode = TYPEC_TBT_MODE;
-		cd321x->state.data = &tbt_data;
-		ret = typec_mux_set(cd321x->mux, &cd321x->state);
-		if (ret)
-			goto out;
-
-		tbt_switch_data.state = TYPEC_THUNDERBOLT_SWITCH_TBT;
-		tbt_switch_data.tbt = tbt_data;
-		tbt_switch_data.orientation = TPS_STATUS_TO_UPSIDE_DOWN(st->status) ?
-						      TYPEC_ORIENTATION_REVERSE :
-						      TYPEC_ORIENTATION_NORMAL;
-		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
-	} else if (st->data_status & CD321X_DATA_STATUS_USB4_CONNECTION) {
-		struct enter_usb_data eusb_data;
-
-		if (cd321x->state.alt == NULL && cd321x->state.mode == TYPEC_MODE_USB4)
-			return 0;
-
-		eusb_data.eudo = le32_to_cpu(st->usb4_status.eudo);
-		eusb_data.active_link_training =
-			!!(st->data_status & TPS_DATA_STATUS_ACTIVE_LINK_TRAIN);
-
-		cd321x->state.alt = NULL;
-		cd321x->state.data = &eusb_data;
-		cd321x->state.mode = TYPEC_MODE_USB4;
-		ret = typec_mux_set(cd321x->mux, &cd321x->state);
-		if (ret)
-			goto out;
-
-		tbt_switch_data.state = TYPEC_THUNDERBOLT_SWITCH_USB4;
-		tbt_switch_data.usb4 = eusb_data;
-		tbt_switch_data.orientation = TPS_STATUS_TO_UPSIDE_DOWN(st->status) ?
-						      TYPEC_ORIENTATION_REVERSE :
-						      TYPEC_ORIENTATION_NORMAL;
-		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 	} else {
 		if (cd321x->state.alt == NULL && cd321x->state.mode == TYPEC_STATE_USB)
 			return 0;
@@ -900,6 +901,44 @@ static int cd321x_connect(struct tps6598x *tps, u32 status)
 			 msecs_to_jiffies(CD321X_DEBOUNCE_DELAY_MS));
 
 	return 0;
+}
+
+/*
+ * A cable that was already attached before a suspend/resume cycle generates
+ * no fresh attach event on resume: the PD controller's own status hasn't
+ * changed, so cd321x_connect()'s diff against its last cached status sees
+ * nothing different and cd321x_update_work() takes its "nothing to do"
+ * path. Meanwhile thunderbolt-core's own noirq-phase resume handling
+ * (tb_free_invalid_tunnels()) has already torn down any USB4/TBT tunnel
+ * that didn't survive the sleep at the link level -- and nothing else
+ * re-establishes it.
+ *
+ * Reproduce a genuine unplug-then-replug in software instead of inventing
+ * a new code path: call the existing connect() callback once with the
+ * current status but PLUG_PRESENT cleared (a synthetic disconnect), then
+ * again with the real, current status. Both updates land on the same
+ * debounced work item, which coalesces them into a single run with
+ * was_disconnected=true and the correct final state -- exactly the same
+ * teardown-then-bring-up sequence, through the same already-validated
+ * apple_cio_tbt_switch_set() path, that a real physical replug drives.
+ */
+static void cd321x_resume_reverify(struct tps6598x *tps)
+{
+	u32 status;
+
+	if (!tps6598x_read_status(tps, &status))
+		return;
+
+	if (!(status & TPS_STATUS_PLUG_PRESENT))
+		return;
+
+	if (!tps6598x_read_power_status(tps))
+		return;
+	if (!tps->data->read_data_status(tps))
+		return;
+
+	tps->data->connect(tps, status & ~TPS_STATUS_PLUG_PRESENT);
+	tps->data->connect(tps, status);
 }
 
 static irqreturn_t cd321x_interrupt(int irq, void *data)
@@ -1807,6 +1846,8 @@ static void cd321x_remove(struct tps6598x *tps)
 	usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
 }
 
+static int tipd_pm_notify(struct notifier_block *nb, unsigned long action, void *data);
+
 int tipd_init(struct tps6598x *tps)
 {
 	struct fwnode_handle *fwnode;
@@ -1912,6 +1953,11 @@ int tipd_init(struct tps6598x *tps)
 		enable_irq_wake(tps->irq);
 	}
 
+	if (tps->data->resume_reverify) {
+		tps->pm_nb.notifier_call = tipd_pm_notify;
+		register_pm_notifier(&tps->pm_nb);
+	}
+
 	return 0;
 
 err_disconnect:
@@ -1934,6 +1980,9 @@ EXPORT_SYMBOL_GPL(tipd_init);
 
 void tipd_remove(struct tps6598x *tps)
 {
+	if (tps->data->resume_reverify)
+		unregister_pm_notifier(&tps->pm_nb);
+
 	if (!tps->irq)
 		cancel_delayed_work_sync(&tps->wq_poll);
 	else
@@ -2000,6 +2049,33 @@ int tipd_resume(struct tps6598x *tps)
 }
 EXPORT_SYMBOL_GPL(tipd_resume);
 
+/*
+ * tipd_resume() runs as an ordinary device .resume() callback, which can
+ * complete well before the rest of the system -- ACIO/Thunderbolt, DCP,
+ * the crossbar -- has finished its own resume work. Driving the reconnect
+ * from here directly (as originally tried) fires apple_cio_start()'s
+ * M3/PMGR reset-deassert handshake while that firmware is potentially
+ * still busy servicing other subsystems' resume, and can exhaust its
+ * retry budget outright -- confirmed on hardware, see
+ * notes/2026-09-24-0147-typec-resume-reverify.md. A real physical
+ * replug never hits this because a human always does it well after
+ * the whole system has settled.
+ *
+ * PM_POST_SUSPEND is delivered strictly after dpm_resume_end() --
+ * i.e. after every device, including ACIO/Thunderbolt, has completed
+ * its own ordinary resume -- so triggering the reverify from here
+ * instead removes the race without needing any arbitrary delay.
+ */
+static int tipd_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct tps6598x *tps = container_of(nb, struct tps6598x, pm_nb);
+
+	if (action == PM_POST_SUSPEND && tps->data->resume_reverify)
+		tps->data->resume_reverify(tps);
+
+	return NOTIFY_DONE;
+}
+
 const struct tipd_data tipd_cd321x_data = {
 	.irq_handler = cd321x_interrupt,
 	.irq_mask1 = APPLE_CD_REG_INT_POWER_STATUS_UPDATE |
@@ -2017,6 +2093,7 @@ const struct tipd_data tipd_cd321x_data = {
 	.reset = cd321x_reset,
 	.switch_power_state = cd321x_switch_power_state,
 	.connect = cd321x_connect,
+	.resume_reverify = cd321x_resume_reverify,
 };
 EXPORT_SYMBOL_GPL(tipd_cd321x_data);
 
@@ -2075,6 +2152,7 @@ const struct tipd_data tipd_sn201202x_data = {
 	.reset = cd321x_reset,
 	.switch_power_state = cd321x_switch_power_state,
 	.connect = cd321x_connect,
+	.resume_reverify = cd321x_resume_reverify,
 };
 EXPORT_SYMBOL_GPL(tipd_sn201202x_data);
 
