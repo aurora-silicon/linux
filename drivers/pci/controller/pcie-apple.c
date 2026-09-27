@@ -846,17 +846,17 @@ static int apple_pcie_tunnel_cold_init(struct apple_pcie_port *port)
 				       stat & PORT_STATUS_READY,
 				       10, 250000, false, port, PORT_STATUS);
 	if (ret)
-		dev_warn(pcie->dev,
-			 "port %pOF cold init: RUN not set (status %#x)\n",
-			 port->np, apple_pcie_port_readl(port, PORT_STATUS));
+		return dev_err_probe(pcie->dev, ret,
+				     "port %pOF cold init: RUN not set (status %#x)\n",
+				     port->np, stat);
 
 	ret = read_poll_timeout_atomic(apple_pcie_port_readl, stat,
 				       !(stat & PORT_LINKSTS_BUSY),
 				       10, 250000, false, port, PORT_LINKSTS);
 	if (ret)
-		dev_warn(pcie->dev,
-			 "port %pOF cold init: link still busy (status %#x)\n",
-			 port->np, apple_pcie_port_readl(port, PORT_LINKSTS));
+		return dev_err_probe(pcie->dev, ret,
+				     "port %pOF cold init: link still busy (status %#x)\n",
+				     port->np, stat);
 
 	dev_info(pcie->dev,
 		 "port %pOF cold init done, status %#x link %#x tunstat %#x\n",
