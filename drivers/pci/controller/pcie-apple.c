@@ -153,11 +153,9 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 #define PORT_MSIMAP_TARGET	GENMASK(7, 0)
 
 /*
- * The doorbell address is set to 0xfffff000, which by convention
- * matches what MacOS does, and it is possible to use any other
- * address (in the bottom 4GB, as the base register is only 32bit).
- * However, it has to be excluded from the IOVA range, and the DART
- * driver has to know about it.
+ * The doorbell address must be in the bottom 4GB because the base register
+ * is only 32 bits wide. Exclude it from the IOVA range and share the same
+ * configured address with the DART driver.
  */
 #define DOORBELL_ADDR		CONFIG_PCIE_APPLE_MSI_DOORBELL_ADDR
 
@@ -963,8 +961,8 @@ static int apple_pcie_tunnel_start(struct apple_pcie_port *port)
 	if (pcie->power_retained) {
 		/*
 		 * The ATC PCIe domain remains powered on these systems. Replaying
-		 * resetPortHardware() against that live handoff is not a resume
-		 * operation and raises an asynchronous external abort on T6020.
+		 * the cold-init reset table against that retained state raises an
+		 * asynchronous external abort on T6020.
 		 * Re-activating the ACIO PCIe tunnel closes the Intr2AXI aperture,
 		 * just as it does during cold cable activation, so pulse it before
 		 * releasing the retained port reset.
@@ -978,7 +976,7 @@ static int apple_pcie_tunnel_start(struct apple_pcie_port *port)
 	} else {
 		/*
 		 * A genuinely power-gated PCIe-C controller lost its register
-		 * state. Recreate the enablePortHardware() baseline before start.
+		 * state. Recreate the cold-init baseline before start.
 		 */
 		apple_pcie_tunnel_apply_tunable(pcie->debug_base,
 						  pcie->debug_tunable);
@@ -1943,11 +1941,10 @@ static int apple_pcie_tunnel_add_links(struct apple_pcie *pcie)
 	int ret;
 
 	/*
-	 * Apple orders clientDidSleep after disabling the PCIe-C port, and
-	 * clientWillWake before enabling it. NHI and PCIe-C are sibling devices
-	 * under ACIO, so encode that missing edge explicitly: Linux must suspend
-	 * PCIe-C before NHI tears down the router state and resume NHI before the
-	 * host touches its tunneled aperture.
+	 * NHI and PCIe-C are sibling devices under ACIO, so encode their PM
+	 * dependency explicitly. PCIe-C must complete its reset handshake before
+	 * NHI tears down the router state, and NHI must resume before the host
+	 * touches its tunneled aperture.
 	 */
 	for_each_available_child_of_node_scoped(pcie->dev->parent->of_node,
 						 sibling) {
@@ -1968,10 +1965,9 @@ static int apple_pcie_tunnel_add_links(struct apple_pcie *pcie)
 				     "failed to order PCIe-C after NHI resume\n");
 
 	/*
-	 * The DART and PCIe-C host are synthesized as siblings. Apple restores
-	 * port hardware and RID/SID forwarding before forcing the DART active;
-	 * express the same dependency so Linux suspends DART first and resumes
-	 * PCIe-C first.
+	 * The DART and PCIe-C host are synthesized as siblings. Port hardware
+	 * and RID/SID forwarding must be ready before DART access resumes, so
+	 * suspend DART first and resume PCIe-C first.
 	 */
 	for_each_available_child_of_node_scoped(pcie->dev->of_node->parent,
 						 sibling) {

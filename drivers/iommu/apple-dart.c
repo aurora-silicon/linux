@@ -2051,9 +2051,9 @@ static int apple_dart_probe(struct platform_device *pdev)
 	 * The cable-powered T8110 DART does not provide a safely probeable
 	 * parameter block at this point in PCIe tunnel activation.  The SError
 	 * raised by these reads is asynchronous, which made the following trace
-	 * boundary look guilty on different boots.  Apple instead publishes the
-	 * complete immutable topology in ADT: 16 KiB pages, 42-bit addresses and
-	 * 64 SIDs.  Use that description before making any DART MMIO access.
+	 * boundary look guilty on different boots. The device tree supplies the
+	 * immutable topology: 16 KiB pages, 42-bit addresses and 64 SIDs. Use that
+	 * description before making any DART MMIO access.
 	 */
 	if (tunneled) {
 		/*
@@ -2429,8 +2429,8 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 
 	/*
 	 * PCIe-C DARTs on an apple,always-on domain retain their translation
-	 * state. Resetting one here is both unnecessary and earlier than Apple's
-	 * force-active call at the end of PCIe-C port resume.
+	 * state. Resetting one here is unnecessary; DART access must remain
+	 * ordered after PCIe-C port resume.
 	 */
 	if (dart->power_retained || READ_ONCE(dart->commands_gated))
 		return 0;
