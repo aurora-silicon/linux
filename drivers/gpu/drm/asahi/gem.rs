@@ -169,6 +169,16 @@ pub(crate) struct AsahiObjConfig {
     kernel: bool,
 }
 
+/// Validate before rounding: wrapping a user size can create a much smaller
+/// backing than requested (or panic with overflow checks). Kernel callers use
+/// the same boundary so malformed calculated sizes cannot bypass this check.
+fn checked_object_size(size: usize) -> Result<usize> {
+    if size == 0 { return Err(EINVAL); }
+    size.checked_add(mmu::UAT_PGMSK)
+        .map(|rounded| rounded & !mmu::UAT_PGMSK)
+        .ok_or(EOVERFLOW)
+}
+
 fn new_kernel_object_with_cpu_mapping(
     dev: &AsahiDevice,
     size: usize,
@@ -176,7 +186,7 @@ fn new_kernel_object_with_cpu_mapping(
 ) -> Result<ObjectRef> {
     let gem = shmem::Object::<AsahiObject>::new(
         dev,
-        align(size, mmu::UAT_PGSZ),
+        checked_object_size(size)?,
         shmem::ObjectConfig::<AsahiObject> {
             map_wc,
             parent_resv_obj: None,
@@ -215,7 +225,7 @@ pub(crate) fn new_object(
 
     let gem = shmem::Object::<AsahiObject>::new(
         dev,
-        align(size, mmu::UAT_PGSZ),
+        checked_object_size(size)?,
         shmem::ObjectConfig::<AsahiObject> {
             map_wc: flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_WRITEBACK == 0,
             parent_resv_obj: parent_object,
