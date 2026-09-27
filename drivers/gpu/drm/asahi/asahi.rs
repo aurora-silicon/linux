@@ -62,6 +62,7 @@ mod g16_firmware;
 mod g16_fault;
 mod g16_device;
 mod agx_host_progress;
+mod agx_memory_stats;
 mod g16_rtkit;
 mod g16_runtime;
 mod g16_drm;
