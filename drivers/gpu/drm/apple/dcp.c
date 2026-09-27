@@ -67,6 +67,10 @@ struct apple_dcp_typec_port {
 	struct list_head routes;
 	struct device_node *connector_np;
 	struct apple_dcp_typec_route *owner;
+	/* Keep a port on its last DCP while that pipeline remains free. */
+	struct apple_dcp_typec_route *preferred_route;
+	/* Ignore the USB4 fallback immediately following this port's DP teardown. */
+	unsigned long dp_release_deadline;
 	/* DRM connector for this physical port, driven by whichever DCP owns it */
 	struct apple_connector *connector;
 	/* last mux state acted on, to collapse the per-candidate notifications */
@@ -129,10 +133,9 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route);
 static int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port);
 
 /*
- * Pipelines are ranked by CRTC index so the fabric's choice is a pure function
- * of the topology rather than of plug order.  A pipeline whose fixed output is
- * live is not a candidate at all, so a hybrid is only ever ranked here when it
- * is genuinely free.
+ * For a port without a prior owner, rank pipelines by CRTC index. A pipeline
+ * whose fixed output is live is not a candidate at all, so a hybrid is only
+ * ever ranked here when it is genuinely free.
  */
 static unsigned int dcp_typec_route_score(struct apple_dcp_typec_route *route)
 {
@@ -390,6 +393,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 		if (port->owner) {
 			struct apple_dcp *dcp = port->owner->dcp;
 
+			port->preferred_route = port->owner;
 			if (port->hpd || dcp->typec_cable_connected ||
 			    (dcp->typec_connector &&
 			     dcp->typec_connector->connected))
@@ -399,13 +403,24 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 			if (ret)
 				return ret;
 			port->owner = NULL;
+			port->dp_release_deadline = jiffies + msecs_to_jiffies(10000);
 			if (dcp->hdmi_hpd && dcp->active &&
 			    gpiod_get_value_cansleep(dcp->hdmi_hpd))
 				dcp_dptx_connect(dcp, 0);
 		}
 
-		if (state->mode == TYPEC_MODE_USB4)
-			dcp_typec_retrain_active_routes();
+		/*
+		 * A port leaving DP can report SAFE/NONE before falling back to USB4.
+		 * Resetting every other live CRTC for that same cable removal blanks
+		 * unaffected displays. Keep the guard across the Type-C state sequence;
+		 * a later, independent USB4 attach still gets recovery.
+		 */
+		if (state->mode == TYPEC_MODE_USB4) {
+			if (!port->dp_release_deadline ||
+			    time_after_eq(jiffies, port->dp_release_deadline))
+				dcp_typec_retrain_active_routes();
+			port->dp_release_deadline = 0;
+		}
 		port->applied_valid = true;
 		return 0;
 	}
@@ -421,15 +436,21 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	}
 
 	if (!port->owner) {
-		list_for_each_entry(candidate, &port->routes, port_link) {
-			unsigned int score;
+		if (port->preferred_route &&
+		    dcp_typec_route_available(port->preferred_route))
+			best = port->preferred_route;
 
-			if (!dcp_typec_route_available(candidate))
-				continue;
-			score = dcp_typec_route_score(candidate);
-			if (score < best_score) {
-				best = candidate;
-				best_score = score;
+		if (!best) {
+			list_for_each_entry(candidate, &port->routes, port_link) {
+				unsigned int score;
+
+				if (!dcp_typec_route_available(candidate))
+					continue;
+				score = dcp_typec_route_score(candidate);
+				if (score < best_score) {
+					best = candidate;
+					best_score = score;
+				}
 			}
 		}
 
@@ -440,6 +461,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 		if (ret)
 			return ret;
 		port->owner = best;
+		port->dp_release_deadline = 0;
 	}
 
 
@@ -843,6 +865,8 @@ static void dcp_typec_route_unregister(void *data)
 	typec_mux_unregister(route->typec_mux);
 
 	guard(mutex)(&dcp_typec_fabric_lock);
+	if (port->preferred_route == route)
+		port->preferred_route = NULL;
 	if (port->owner == route) {
 		struct apple_dcp *dcp = route->dcp;
 
@@ -1902,8 +1926,12 @@ void dcp_poweroff(struct platform_device *pdev)
 	 * display, so DPMS off never sticks. Cable removal is reported through
 	 * the Type-C mux.
 	 */
-	if (dcp_is_typec_output(dcp) && READ_ONCE(dcp->typec_cable_connected))
-		WRITE_ONCE(dcp->typec_crtc_off, true);
+	if (dcp_is_typec_output(dcp)) {
+		if (READ_ONCE(dcp->typec_cable_connected))
+			WRITE_ONCE(dcp->typec_crtc_off, true);
+		/* dcp_poweron() reconnects the link on DPMS wake. */
+		cancel_delayed_work(&dcp->typec_reconnect_wq);
+	}
 
 	_dcp_poweroff(dcp);
 

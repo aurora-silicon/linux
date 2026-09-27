@@ -950,7 +950,11 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	swap_id = cookie->swap_id;
 	kref_put(&cookie->refcount, release_swap_cookie);
 	if (ret <= 0) {
-		dcp->crashed = true;
+		/* A disconnected external display can power down before it ACKs this
+		 * clear swap. The deadline alone does not mean RTKit crashed; its
+		 * crash callback owns the fatal flag.
+		 */
+		dev_warn(dcp->dev, "clear swap timed out during power-off\n");
 		return;
 	}
 
