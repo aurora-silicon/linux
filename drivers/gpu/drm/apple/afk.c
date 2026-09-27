@@ -920,6 +920,8 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 		wptr = 0;
 	trace_afk_send_rwptr_post(ep, rptr, wptr);
 
+	/* Publish the completed entry before allowing the consumer to read it. */
+	dma_wmb();
 	ep->txbfr.hdr->wptr = cpu_to_le32(wptr);
 	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
 			     FIELD_PREP(SEND_WPTR, wptr));
