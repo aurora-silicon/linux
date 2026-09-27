@@ -159,6 +159,20 @@ int main(void) {
     assert(iboot_build_pattern_request(16,&layer,sizeof(layer)-8,request,sizeof(request),&request_size)==-EINVAL);
     assert(iboot_build_pattern_request(16,&layer,sizeof(layer),request,sizeof(request)-1,&request_size)==-EINVAL);
     assert(iboot_build_pattern_request(2,NULL,1,request,sizeof(request),&request_size)==-EINVAL);
+    /* 14.7 Begin has a 284-byte wrapper claim but returns a 28-byte record. */
+    u32 swap_id;
+    memset(reply,0,sizeof(reply));
+    put32(reply,15); put32(reply+4,284); put32(reply+20,123);
+    assert(!iboot_parse_swap_begin(reply,28,&swap_id) && swap_id==123);
+    for (size_t received=0;received<28;received++)
+        assert(iboot_parse_swap_begin(reply,received,&swap_id)==-EPROTO);
+    assert(iboot_parse_swap_begin(reply,29,&swap_id)==-EPROTO);
+    put32(reply+4,283);
+    assert(iboot_parse_swap_begin(reply,28,&swap_id)==-EPROTO);
+    put32(reply+4,284); put32(reply,14);
+    assert(iboot_parse_swap_begin(reply,28,&swap_id)==-EPROTO);
+    put32(reply,15); put32(reply+4,28);
+    assert(!iboot_parse_swap_begin(reply,28,&swap_id) && swap_id==123);
     puts("PASS: actual iBoot query/pattern helpers, >=13.3 layer bytes, bounds and malformed replies");
 }
 '''

@@ -110,7 +110,8 @@ static int afk_send_command_with_reply_len(struct apple_epic_service *s, u8 type
     if(op==15) {
         returned_id=duplicate_id ? query.last_frame_swap : query.last_frame_swap+1;
         put_unaligned_le32(15,output);
-        put_unaligned_le32(28,(u8 *)output+4);
+        /* The audited 14.7 Begin wrapper says 284; EPIC returns 28 bytes. */
+        put_unaligned_le32(284,(u8 *)output+4);
         put_unaligned_le32(returned_id,(u8 *)output+20);
         *received=short_reply ? 27 : 28;
     } else if(op==16) {

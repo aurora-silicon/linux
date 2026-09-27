@@ -123,6 +123,31 @@ static int iboot_parse_hpd(const u8 *payload, size_t size, bool *hpd,
 	return 0;
 }
 
+static int iboot_parse_swap_begin(const u8 *reply, size_t received, u32 *id)
+{
+	const u8 *payload;
+	size_t size;
+	int ret;
+
+	/* The gated 14.7 firmware writes 284 in this wrapper but returns only
+	 * the 28-byte Begin record through EPIC. Accept that exact mismatch,
+	 * bounded by the actual transport length; never read the absent tail.
+	 */
+	if (received == 28 && get_unaligned_le32(reply) == 15 &&
+	    get_unaligned_le32(reply + 4) == 284) {
+		payload = reply + 8;
+		size = 20;
+	} else {
+		ret = iboot_reply_payload(reply, received, 15, &payload, &size);
+		if (ret)
+			return ret;
+	}
+	if (size < 20)
+		return -EPROTO;
+	*id = get_unaligned_le32(payload + 12);
+	return 0;
+}
+
 static int iboot_parse_modes(const u8 *payload, size_t size, u32 *count)
 {
 	u32 i;
@@ -480,8 +505,7 @@ int ibootep_present_frame(struct apple_dcp *dcp, u64 iova, size_t size, u32 stri
 	struct iboot_swap_layer_v13_3 layer;
 	struct iboot_query *query;
 	__le32 end[3] = {}, wait[4] = {};
-	const u8 *payload;
-	size_t received, payload_size;
+	size_t received;
 	u32 id = 0, step = 15;
 	u8 *reply;
 	int ret;
@@ -509,12 +533,9 @@ int ibootep_present_frame(struct apple_dcp *dcp, u64 iova, size_t size, u32 stri
 	ret = iboot_frame_command(query, step, NULL, 0, reply, &received);
 	if (ret)
 		goto failed;
-	ret = iboot_reply_payload(reply, received, step, &payload, &payload_size);
-	if (ret || payload_size < 20) {
-		ret = -EPROTO;
+	ret = iboot_parse_swap_begin(reply, received, &id);
+	if (ret)
 		goto failed;
-	}
-	id = get_unaligned_le32(payload + 12);
 	if (!id || id == query->last_frame_swap) {
 		ret = -EPROTO;
 		goto failed;
