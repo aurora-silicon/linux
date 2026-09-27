@@ -2219,22 +2219,28 @@ static void atc_tunnel_restore(struct apple_atcphy *atcphy)
 	lockdep_assert_held(&atcphy->lock);
 	if (!atcphy->tunnel_saved)
 		return;
-	/* Stop our output before restoring the unused PLL descriptor. */
+	/*
+	 * Clearing the PLL output drivers alone leaves the AUSPLL running,
+	 * with ACIOPHY_AUSPLL_LOCK still set. Clear the three drivers, then
+	 * power the PLL down with APB command 3, after which the lock drops.
+	 */
 	core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_ENABLE);
-	core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, 0x54);
+	core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, BIT(2));
+	core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, BIT(4));
+	core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, BIT(6));
+	ret = atc_tunnel_command(atcphy, 3);
+	if (ret)
+		dev_warn(atcphy->dev, "USB4 tunnel clock: AUSPLL power-down was not acked\n");
+	/* Then restore the unused PLL descriptor. */
 	for (i = ARRAY_SIZE(atc_tunnel_regs) - 1; i >= 0; i--)
 		core_mask32(atcphy, atc_tunnel_regs[i].reg, atc_tunnel_regs[i].mask,
 			    atcphy->tunnel_saved_regs[i] & atc_tunnel_regs[i].mask);
 	/*
 	 * atc_tunnel_start_t602x()'s preflight refuses to proceed while
-	 * ACIOPHY_AUSPLL_LOCK is still set, to avoid clobbering a PLL a
-	 * concurrent user actually has locked. Immediately after tearing our
-	 * own lock down, that same bit can still read set for a brief window
-	 * before the lock detector catches up -- and DCP firmware retries a
-	 * failed tunnel clock request roughly once a second, which is faster
-	 * than that window on a hot retrain loop. Wait for it to clear here
-	 * so a request coming in right after this returns sees a genuinely
-	 * idle PLL instead of refusing itself forever.
+	 * ACIOPHY_AUSPLL_LOCK is set, to avoid clobbering a PLL a concurrent
+	 * user actually has locked. DCP firmware retries a failed tunnel
+	 * clock request quickly, so confirm the lock has dropped after the
+	 * power-down before a new request can come in.
 	 */
 	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_DP_PCLK_STAT, value,
 				 !(value & ACIOPHY_AUSPLL_LOCK), 10, 10000);
