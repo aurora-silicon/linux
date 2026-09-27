@@ -2287,11 +2287,9 @@ static int atc_tunnel_start_t602x(struct apple_atcphy *atcphy, u8 rate)
 	/*
 	 * Before the first rate request, TX_DP_CTRL0 gate bits read 0xe001:
 	 * the enable gates are set, the byte-clock reset is asserted, and the
-	 * selector and reset-release bits are clear. Native configureDPTunnelMode
-	 * tracks tunnel clients in software rather than through these gates, so
-	 * this exact state is the only additional gate configuration accepted
-	 * here, together with no enabled PLL output, no outstanding command,
-	 * and no lock. Any other gate state is refused.
+	 * selector and reset-release bits are clear. Accept this initial gate
+	 * state only with no enabled PLL output, no outstanding command and
+	 * no lock. Any other active gate state is refused.
 	 */
 	if (outputs & 0x54 || command & AUSPLL_APB_CMD_OVERRIDE_REQ ||
 	    status & ACIOPHY_AUSPLL_LOCK)
@@ -2309,7 +2307,7 @@ static int atc_tunnel_start_t602x(struct apple_atcphy *atcphy, u8 rate)
 		atcphy->tunnel_saved_regs[i] = readl(atcphy->regs.core + atc_tunnel_regs[i].reg);
 	atcphy->tunnel_saved = true;
 
-	/* Native configureDPTunnelMode, first clock client; no lane mux writes. */
+	/* Wake the common clock blocks without changing the lane mux. */
 	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_SMALL);
 	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_SMALL_OV);
 	udelay(2);
@@ -2346,7 +2344,7 @@ static int atc_tunnel_start_t602x(struct apple_atcphy *atcphy, u8 rate)
 	core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_SELECT,
 		    FIELD_PREP(DPTX_PCLK1_SELECT, selector));
 
-	/* Native fixed descriptor at cache VA 0xfffffe0007582418. */
+	/* Program the fixed tunnel clock descriptor. */
 	core_clear32(atcphy, AUSPLL_FREQ_CFG, AUSPLL_FREQ_REFCLK);
 	core_mask32(atcphy, AUSPLL_FREQ_DESC_A, 0xffffffff,
 		    0x21c | (8 << 14) | (3 << 18) | (8 << 22) | (7 << 26));
@@ -2459,11 +2457,6 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 
 	/* Take the USB3 PHY out of reset */
 	core_set32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_PHY_RESET_N);
-	/*
-	 * NOTE: Not what macos does, it takes the phy out of reset right before writing to ACIOPHY_CFG0_COMMON_SMALL
-	 * does lane configuration with phy out of reset, and the poll is right after AUS_COMMON_SHIM_BLK_BIAS_REG
-	 * write. Does not seem to matter, but if something does not work, consider re-ordering things to macos order.
-	 */
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8122) {
 		ret = readl_poll_timeout(atcphy->regs.core + AUS_COMMON_DIG_RCAL1, reg,
 					 (reg & AUS_COMMON_DIG_RCAL1_ALL_CODES_DONE), 10, 100000);

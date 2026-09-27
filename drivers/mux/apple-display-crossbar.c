@@ -261,7 +261,7 @@ static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
 		dpxbar_set32(dpxbar, T602X_FIFO_WR_N_CLK_EN, prev_dispext_bit);
 		dpxbar_set32(dpxbar, T602X_REG_014, 0x4);
 
-		/* Native T602x DPIN0 teardown restores the read reset at +0x24. */
+		/* Restore the selected input's FIFO read reset. */
 		dpxbar_set32(dpxbar, index == MUX_DPIN0 ?
 			    T602X_FIFO_RD_PCLK2_EN : FIFO_RD_PCLK1_EN, atc_bit);
 
