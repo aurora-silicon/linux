@@ -311,6 +311,9 @@ pub(crate) static T8122: Soc = Soc {
         "T8122 runtime allocation layout and fixed control words",
         "T8122 conservative performance-state ceiling",
     ],
-    // Engine-busy, fault banks and performance state.
-    retire_mmio: 7,
+    // The performance state only. On the single-cluster G15G, reading the engine-busy or the
+    // fault-bank registers after every job hangs the SoC within seconds at about 1000 jobs/s;
+    // the performance-state read alone does not, and a per-frame readback saw no job retired
+    // before its writes were visible.
+    retire_mmio: 4,
 };
