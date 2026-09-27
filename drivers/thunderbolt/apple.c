@@ -142,6 +142,7 @@ struct apple_cio {
 	struct device_node *np;
 	struct device_node *pcie_tunnel_np;
 	bool pcie_tunnel_preinitialized;
+	bool pcie_tunnel_kernel_init;
 	void __iomem *pcie_intr2axi_base;
 	struct apple_rtkit *rtk;
 
@@ -196,6 +197,15 @@ static void apple_cio_of_node_put(void *data)
 	of_node_put(data);
 }
 
+static bool apple_cio_pcie_tunnel_kernel_init(struct device_node *parent)
+{
+	for_each_available_child_of_node_scoped(parent, child)
+		if (of_property_read_bool(child, "apple,pciec-kernel-init"))
+			return true;
+
+	return false;
+}
+
 static bool
 apple_cio_pcie_tunnel_is_preinitialized(struct device_node *parent)
 {
@@ -205,6 +215,10 @@ apple_cio_pcie_tunnel_is_preinitialized(struct device_node *parent)
 		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
 		    !of_device_is_compatible(child, "apple,t6000-pciec"))
 			continue;
+
+		/* The PCIe driver cold-initializes these ports itself. */
+		if (of_property_read_bool(child, "apple,pciec-kernel-init"))
+			return true;
 
 		return !of_property_read_u32(child,
 					     "apple,pciec-preinit-status",
@@ -541,12 +555,21 @@ static struct platform_device *apple_cio_find_pcie_tunnel(struct apple_cio *acio
 
 static int apple_cio_populate_pcie_tunnel(struct apple_cio *acio)
 {
+	int ret;
+
+	/* Experimental: don't touch a cold PCIe-C port unless opted in. */
+	if (acio->pcie_tunnel_kernel_init &&
+	    !apple_pcie_tunnel_kernel_init_enabled())
+		return dev_err_probe(acio->dev, -EPERM,
+				     "PCIe-C kernel init disabled (pcie_apple.tunnel_kernel_init=0)\n");
+
 	/*
-	 * PCIe-C was cold-initialized by m1n1 before the ACIO M3 started, but
-	 * enabling ACIO's cable-powered PCIe domain closes the Intr2AXI bridge
-	 * again. The port enable sequence pulses this register immediately
-	 * before forcing its DART active. Do the same after ACIO has
-	 * enabled both tunnel adapters and before either child can touch DART MMIO.
+	 * Enabling ACIO's cable-powered PCIe domain closes the Intr2AXI bridge,
+	 * whether PCIe-C was cold-initialized by m1n1 before the ACIO M3
+	 * started or is still waiting for the kernel to do it. The port enable
+	 * sequence pulses this register immediately before forcing its DART
+	 * active. Do the same after ACIO has enabled both tunnel adapters and
+	 * before either child can touch DART MMIO.
 	 * The bit self-clears after opening the bridge.
 	 */
 	writel(APPLE_CIO_PCIEC_INTR2AXI_ENABLE,
@@ -555,8 +578,16 @@ static int apple_cio_populate_pcie_tunnel(struct apple_cio *acio)
 	mb();
 	dev_info(acio->dev, "PCIe-C Intr2AXI bridge enabled\n");
 
-	dev_info(acio->dev,
-		 "PCIe-C live handoff accepted; populating tunnel children\n");
+	/*
+	 * The DART is the first child and probes as soon as it is created;
+	 * its command engine stays busy until the port clock runs. Cold-init
+	 * "apple,pciec-kernel-init" ports before populating either child.
+	 */
+	ret = apple_pcie_tunnel_prepare(acio->dev, acio->pcie_tunnel_np);
+	if (ret)
+		return ret;
+
+	dev_info(acio->dev, "PCIe-C populating tunnel children\n");
 	return of_platform_populate(acio->pcie_tunnel_np, NULL, NULL,
 				    acio->dev);
 }
@@ -590,7 +621,7 @@ static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 	}
 	if (!acio->pcie_tunnel_preinitialized)
 		return dev_err_probe(acio->dev, -ENODEV,
-				     "PCIe-C requires a successful m1n1 preinit handoff\n");
+				     "PCIe-C needs an m1n1 preinit handoff or apple,pciec-kernel-init\n");
 
 	if (acio->pd_list->num_pds < 4 || !acio->pd_list->pd_links[3])
 		return dev_err_probe(acio->dev, -ENODEV,
@@ -1726,9 +1757,11 @@ static int apple_cio_probe(struct platform_device *pdev)
 		acio->pcie_tunnel_preinitialized =
 			apple_cio_pcie_tunnel_is_preinitialized(
 				acio->pcie_tunnel_np);
+		acio->pcie_tunnel_kernel_init =
+			apple_cio_pcie_tunnel_kernel_init(acio->pcie_tunnel_np);
 		if (!acio->pcie_tunnel_preinitialized) {
 			dev_warn(dev,
-				 "PCIe-C tunnel disabled: m1n1 handoff is not initialized\n");
+				 "PCIe-C tunnel disabled: no m1n1 handoff and no apple,pciec-kernel-init\n");
 		} else {
 			ret = apple_cio_map_pcie_intr2axi(acio);
 			if (ret)
