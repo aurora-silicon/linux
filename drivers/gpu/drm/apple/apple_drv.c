@@ -438,7 +438,8 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 	 * append one more connector per port for a second USB4 DP tunnel.
 	 */
 	for (idx = 0; idx < nr_ports *
-	     (of_machine_is_compatible("apple,j414s") ? 2 : 1); idx++) {
+	     ((of_machine_is_compatible("apple,j414s") ||
+	       of_machine_is_compatible("apple,j416c")) ? 2 : 1); idx++) {
 		struct apple_connector *connector;
 		struct apple_encoder *enc;
 		unsigned int port_idx = idx % nr_ports;

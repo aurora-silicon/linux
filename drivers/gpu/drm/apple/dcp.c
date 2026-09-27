@@ -607,7 +607,8 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
 		 * streams through one dock. Retain J416s' existing preference
 		 * until its second pipeline has been validated separately.
 		 */
-		if (of_machine_is_compatible("apple,j414s")) {
+		if (of_machine_is_compatible("apple,j414s") ||
+		    of_machine_is_compatible("apple,j416c")) {
 			if ((dpin == 0 && !candidate->dcp->fixed_phy) ||
 			    (dpin == 1 && candidate->dcp->fixed_phy))
 				score += 100;
@@ -781,7 +782,8 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 				 * tunnel when a direct DP-alt-mode display can use
 				 * the Type-C-only dcpext1 pipeline.
 				 */
-				if (of_machine_is_compatible("apple,j414s") &&
+				if ((of_machine_is_compatible("apple,j414s") ||
+				     of_machine_is_compatible("apple,j416c")) &&
 				    candidate->dcp->fixed_phy)
 					score += 100;
 				if (score < best_score) {
