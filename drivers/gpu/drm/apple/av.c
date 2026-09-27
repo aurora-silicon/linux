@@ -232,10 +232,10 @@ int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize
 					 elements, maxsize, &size);
 	up_write(&asrv->srv_rwsem);
 
-	if (ret && asrv->warned_get_elements) {
+	if (ret && !asrv->warned_get_elements) {
 		dev_err(dev, "audiosrv: error getting elements: %d\n", ret);
 		asrv->warned_get_elements = true;
-	} else {
+	} else if (!ret) {
 		dev_dbg(dev, "audiosrv: got %zd bytes worth of elements\n", size);
 	}
 
@@ -255,10 +255,10 @@ int dcp_audiosrv_get_product_attrs(struct device *dev, void *attrs, size_t maxsi
 					 maxsize, &size);
 	up_write(&asrv->srv_rwsem);
 
-	if (ret && asrv->warned_get_product_attrs) {
+	if (ret && !asrv->warned_get_product_attrs) {
 		dev_err(dev, "audiosrv: error getting product attributes: %d\n", ret);
 		asrv->warned_get_product_attrs = true;
-	} else {
+	} else if (!ret) {
 		dev_dbg(dev, "audiosrv: got %zd bytes worth of product attributes\n", size);
 	}
 
