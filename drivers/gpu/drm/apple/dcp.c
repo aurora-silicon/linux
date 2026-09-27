@@ -657,7 +657,7 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
 		score = dcp_typec_route_score(candidate);
 		/* j416s dcpext0 completes tunneled link training; prefer it. */
 		if (of_machine_is_compatible("apple,j416s") &&
-		    !candidate->dcp->fixed_phy)
+		    !candidate->dcp->fixed_phy && score < UINT_MAX - 100)
 			score += 100;
 		if (score < best_score) {
 			best = candidate;
