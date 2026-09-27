@@ -43,6 +43,7 @@ config PCIE_APPLE_MSI_DOORBELL_ADDR
 config PCIE_APPLE
 	tristate "Apple PCIe controller"
 	depends on ARCH_APPLE || COMPILE_TEST
+	depends on APPLE_DART || !APPLE_DART
 	depends on OF
 	depends on PCI_MSI
 	depends on PAGE_SIZE_16KB || COMPILE_TEST

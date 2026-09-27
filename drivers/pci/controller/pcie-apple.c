@@ -2119,14 +2119,13 @@ int apple_pcie_tunnel_restore(struct device *dev)
 		return 0;
 
 	list_for_each_entry(port, &pcie->ports, entry) {
-		int err = apple_pcie_tunnel_start(port);
-
-		if (err && !ret)
-			ret = err;
-		if (!err)
-			apple_pcie_walk_tunnel_darts(pcie,
-							apple_dart_resume_commands);
+		if (port->started)
+			continue;
+		ret = apple_pcie_tunnel_start(port);
+		if (ret)
+			return ret;
 	}
+	apple_pcie_walk_tunnel_darts(pcie, apple_dart_resume_commands);
 
 	pci_lock_rescan_remove();
 	pci_rescan_bus(bridge->bus);
