@@ -164,6 +164,8 @@ struct apple_cio {
 	struct delayed_work pcie_tunnel_work;
 	bool pcie_tunnel_requested;
 	bool pcie_tunnel_populated;
+	bool pcie_pm_prepared;
+	bool pcie_quiesce_pending;
 
 	/* Type-C connector this router is wired to, for DP tunnel routing */
 	struct device_node *connector_np;
@@ -841,7 +843,7 @@ static int apple_cio_populate_pcie_tunnel(struct apple_cio *acio)
 
 static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 {
-	int ret;
+	int ret = 0;
 
 	lockdep_assert_held(&acio->pcie_tunnel_lock);
 
@@ -864,7 +866,7 @@ static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 					 ret);
 			put_device(&pcie_pdev->dev);
 		}
-		return 0;
+		return ret;
 	}
 	if (!acio->pcie_tunnel_preinitialized)
 		return dev_err_probe(acio->dev, -ENODEV,
@@ -885,31 +887,50 @@ static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 	return 0;
 }
 
+static int apple_cio_quiesce_pcie_tunnel_locked(struct apple_cio *acio)
+{
+	struct platform_device *pcie_pdev;
+	int ret = 0;
+
+	lockdep_assert_held(&acio->pcie_tunnel_lock);
+	pcie_pdev = apple_cio_find_pcie_tunnel(acio);
+	if (pcie_pdev) {
+		ret = apple_pcie_tunnel_quiesce(&pcie_pdev->dev);
+		put_device(&pcie_pdev->dev);
+	}
+	if (!ret)
+		acio->pcie_quiesce_pending = false;
+	return ret;
+}
+
 static void apple_cio_pcie_tunnel_work(struct work_struct *work)
 {
 	struct apple_cio *acio =
 		container_of(to_delayed_work(work), struct apple_cio,
 			     pcie_tunnel_work);
-	int ret;
+	int ret = 0;
 
 	mutex_lock(&acio->pcie_tunnel_lock);
-	if (!READ_ONCE(acio->pcie_tunnel_requested)) {
-		mutex_unlock(&acio->pcie_tunnel_lock);
-		return;
+	if (acio->pcie_pm_prepared)
+		goto unlock;
+	if (acio->pcie_quiesce_pending) {
+		ret = apple_cio_quiesce_pcie_tunnel_locked(acio);
+		if (ret)
+			goto unlock;
 	}
-
-	ret = apple_cio_activate_pcie_tunnel_locked(acio);
+	if (READ_ONCE(acio->pcie_tunnel_requested))
+		ret = apple_cio_activate_pcie_tunnel_locked(acio);
+unlock:
 	mutex_unlock(&acio->pcie_tunnel_lock);
 	if (ret && ret != -EAGAIN)
-		dev_err(acio->dev, "deferred PCIe-C activation failed: %d\n", ret);
+		dev_err(acio->dev, "deferred PCIe-C transition failed: %d\n", ret);
 }
 
 static int apple_nhi_pci_tunnel_deactivate(struct tb_nhi *nhi)
 {
 	struct apple_nhi *anhi = nhi_to_anhi(nhi);
 	struct apple_cio *acio = anhi->acio;
-	struct platform_device *pcie_pdev;
-	int ret;
+	int ret = 0;
 
 	/*
 	 * The tunnel is going away while the router and NHI stay up, so nothing
@@ -919,37 +940,21 @@ static int apple_nhi_pci_tunnel_deactivate(struct tb_nhi *nhi)
 	 * nothing to enumerate onto when the tunnel comes back.
 	 */
 	mutex_lock(&acio->pcie_tunnel_lock);
-	if (!acio->pcie_tunnel_populated) {
-		mutex_unlock(&acio->pcie_tunnel_lock);
-		return 0;
-	}
-
-	pcie_pdev = apple_cio_find_pcie_tunnel(acio);
-	if (pcie_pdev) {
-		ret = apple_pcie_tunnel_quiesce(&pcie_pdev->dev);
+	WRITE_ONCE(acio->pcie_tunnel_requested, false);
+	cancel_delayed_work(&acio->pcie_tunnel_work);
+	acio->pcie_quiesce_pending = true;
+	/* Endpoint drivers must resume before they can be unbound safely. */
+	if (!acio->pcie_pm_prepared) {
+		ret = apple_cio_quiesce_pcie_tunnel_locked(acio);
 		if (ret)
 			dev_warn(acio->dev,
 				 "failed to quiesce PCIe-C on tunnel teardown: %d\n",
 				 ret);
-		put_device(&pcie_pdev->dev);
 	}
 
 	mutex_unlock(&acio->pcie_tunnel_lock);
 
-	return 0;
-}
-
-static int apple_nhi_pci_tunnel_pre_activate(struct tb_nhi *nhi)
-{
-	struct apple_nhi *anhi = nhi_to_anhi(nhi);
-	struct apple_cio *acio = anhi->acio;
-
-	/*
-	 * Remember that the PCIe tunnel reached activation. PCIe-C must not be
-	 * populated here: the tunnel paths and both adapters are still disabled.
-	 */
-	WRITE_ONCE(acio->pcie_tunnel_requested, true);
-	return 0;
+	return ret;
 }
 
 static int apple_nhi_pci_tunnel_post_activate(struct tb_nhi *nhi)
@@ -963,7 +968,11 @@ static int apple_nhi_pci_tunnel_post_activate(struct tb_nhi *nhi)
 	 * Thunderbolt core before probing PCIe-C. The worker then waits on the
 	 * hardware reset state without blocking completion of the tunnel paths.
 	 */
-	mod_delayed_work(system_wq, &acio->pcie_tunnel_work, 0);
+	mutex_lock(&acio->pcie_tunnel_lock);
+	WRITE_ONCE(acio->pcie_tunnel_requested, true);
+	/* No PCI removal or rescan until system resume has finished. */
+	mod_delayed_work(system_freezable_wq, &acio->pcie_tunnel_work, 0);
+	mutex_unlock(&acio->pcie_tunnel_lock);
 	return 0;
 }
 
@@ -1454,7 +1463,6 @@ static const struct tb_nhi_ops apple_nhi_ops = {
 	.ring_interrupt_active = apple_nhi_ring_interrupt_active,
 	.ring_interrupt_mask = apple_nhi_ring_interrupt_mask,
 	.ring_configure = apple_nhi_ring_configure,
-	.pci_tunnel_pre_activate = apple_nhi_pci_tunnel_pre_activate,
 	.pci_tunnel_post_activate = apple_nhi_pci_tunnel_post_activate,
 	.pci_tunnel_deactivate = apple_nhi_pci_tunnel_deactivate,
 };
@@ -1647,6 +1655,16 @@ static void apple_nhi_remove(struct platform_device *pdev)
  * apple_nhi pointer in driver data. The generic NHI PM callbacks cannot be
  * installed here because they expect driver data to contain struct tb.
  */
+static int apple_nhi_prepare(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+	struct apple_cio *acio = anhi->acio;
+
+	guard(mutex)(&acio->pcie_tunnel_lock);
+	acio->pcie_pm_prepared = true;
+	return 0;
+}
+
 static int apple_nhi_suspend_noirq(struct device *dev)
 {
 	struct apple_nhi *anhi = dev_get_drvdata(dev);
@@ -1685,11 +1703,18 @@ static int apple_nhi_suspend(struct device *dev)
 static void apple_nhi_complete(struct device *dev)
 {
 	struct apple_nhi *anhi = dev_get_drvdata(dev);
+	struct apple_cio *acio = anhi->acio;
 
 	tb_domain_complete(anhi->tb);
+
+	guard(mutex)(&acio->pcie_tunnel_lock);
+	acio->pcie_pm_prepared = false;
+	if (acio->pcie_quiesce_pending || READ_ONCE(acio->pcie_tunnel_requested))
+		mod_delayed_work(system_freezable_wq, &acio->pcie_tunnel_work, 0);
 }
 
 static const struct dev_pm_ops apple_nhi_pm_ops = {
+	.prepare = apple_nhi_prepare,
 	.suspend = apple_nhi_suspend,
 	.suspend_noirq = apple_nhi_suspend_noirq,
 	.resume_noirq = apple_nhi_resume_noirq,
@@ -1787,6 +1812,7 @@ static void apple_cio_stop(struct apple_cio *acio)
 
 	of_platform_depopulate(acio->dev);
 	acio->pcie_tunnel_populated = false;
+	acio->pcie_quiesce_pending = false;
 	mutex_unlock(&acio->pcie_tunnel_lock);
 
 	/* Try to shut down and power off the co-processor gracefully */

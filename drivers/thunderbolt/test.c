@@ -2852,6 +2852,63 @@ static void tb_test_property_copy(struct kunit *test)
 	tb_property_free_dir(src);
 }
 
+struct tb_test_pci_host {
+	struct tb_nhi nhi;
+	unsigned int disconnects;
+	int result;
+};
+
+static int tb_test_pci_host_disconnect(struct tb_nhi *nhi)
+{
+	struct tb_test_pci_host *host = container_of(nhi, struct tb_test_pci_host, nhi);
+
+	host->disconnects++;
+	return host->result;
+}
+
+static void tb_test_pci_host_teardown(struct kunit *test)
+{
+	static const struct tb_nhi_ops ops = {
+		.pci_tunnel_deactivate = tb_test_pci_host_disconnect,
+	};
+	struct tb_test_pci_host *host;
+	struct tb_tunnel *tunnel;
+	struct tb *tb;
+
+	host = kunit_kzalloc(test, sizeof(*host), GFP_KERNEL);
+	tunnel = kunit_kzalloc(test, sizeof(*tunnel), GFP_KERNEL);
+	tb = kunit_kzalloc(test, sizeof(*tb), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, host);
+	KUNIT_ASSERT_NOT_NULL(test, tunnel);
+	KUNIT_ASSERT_NOT_NULL(test, tb);
+	host->nhi.ops = &ops;
+	tb->nhi = &host->nhi;
+	tunnel->tb = tb;
+
+	/* A discovered firmware tunnel does not own Linux's PCIe hierarchy. */
+	KUNIT_EXPECT_EQ(test, tb_pci_tunnel_deactivate_host(tunnel), 0);
+	KUNIT_EXPECT_EQ(test, host->disconnects, 0U);
+
+	/* An activated tunnel must release the hierarchy exactly once. */
+	tunnel->host_pci_activated = true;
+	KUNIT_EXPECT_EQ(test, tb_pci_tunnel_deactivate_host(tunnel), 0);
+	KUNIT_EXPECT_EQ(test, host->disconnects, 1U);
+	KUNIT_EXPECT_FALSE(test, tunnel->host_pci_activated);
+	KUNIT_EXPECT_EQ(test, tb_pci_tunnel_deactivate_host(tunnel), 0);
+	KUNIT_EXPECT_EQ(test, host->disconnects, 1U);
+
+	/* Failed teardown keeps ownership so a later attempt can retry. */
+	tunnel->host_pci_activated = true;
+	host->result = -EIO;
+	KUNIT_EXPECT_EQ(test, tb_pci_tunnel_deactivate_host(tunnel), -EIO);
+	KUNIT_EXPECT_TRUE(test, tunnel->host_pci_activated);
+	KUNIT_EXPECT_EQ(test, host->disconnects, 2U);
+	host->result = 0;
+	KUNIT_EXPECT_EQ(test, tb_pci_tunnel_deactivate_host(tunnel), 0);
+	KUNIT_EXPECT_FALSE(test, tunnel->host_pci_activated);
+	KUNIT_EXPECT_EQ(test, host->disconnects, 3U);
+}
+
 struct tb_test_dp_host {
 	struct tb_nhi nhi;
 	unsigned int disconnects;
@@ -2945,6 +3002,7 @@ static void tb_test_tunnel_dp_host_credits(struct kunit *test)
 }
 
 static struct kunit_case tb_test_cases[] = {
+	KUNIT_CASE(tb_test_pci_host_teardown),
 	KUNIT_CASE(tb_test_tunnel_dp_host_credits),
 	KUNIT_CASE(tb_test_dp_host_teardown_once),
 	KUNIT_CASE(tb_test_dp_host_teardown_unannounced),

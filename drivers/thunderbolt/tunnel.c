@@ -361,18 +361,28 @@ static int tb_pci_post_activate(struct tb_tunnel *tunnel)
 {
 	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
 
-	if (ops && ops->pci_tunnel_post_activate)
+	if (ops && ops->pci_tunnel_post_activate) {
+		/* Also unwind a hook that fails after partial host setup. */
+		tunnel->host_pci_activated = true;
 		return ops->pci_tunnel_post_activate(tunnel->tb->nhi);
+	}
 	return 0;
 }
 
-static int tb_pci_deactivate(struct tb_tunnel *tunnel)
+int tb_pci_tunnel_deactivate_host(struct tb_tunnel *tunnel)
 {
-	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
+	const struct tb_nhi_ops *ops;
+	int ret = 0;
 
+	/* Firmware tunnels discovered during resume do not own host state. */
+	if (!tunnel->host_pci_activated)
+		return 0;
+	ops = tunnel->tb->nhi->ops;
 	if (ops && ops->pci_tunnel_deactivate)
-		return ops->pci_tunnel_deactivate(tunnel->tb->nhi);
-	return 0;
+		ret = ops->pci_tunnel_deactivate(tunnel->tb->nhi);
+	if (!ret)
+		tunnel->host_pci_activated = false;
+	return ret;
 }
 
 static int tb_pci_activate(struct tb_tunnel *tunnel, bool activate)
@@ -384,7 +394,7 @@ static int tb_pci_activate(struct tb_tunnel *tunnel, bool activate)
 	 * what is behind it can still be reached.
 	 */
 	if (!activate) {
-		res = tb_pci_deactivate(tunnel);
+		res = tb_pci_tunnel_deactivate_host(tunnel);
 		if (res)
 			return res;
 	}
