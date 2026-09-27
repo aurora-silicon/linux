@@ -1803,6 +1803,8 @@ static int atcphy_dp_configure(struct apple_atcphy *atcphy, enum atcphy_dp_link_
 		return ret;
 	}
 
+	/* The old rate no longer describes hardware once reprogramming starts. */
+	atcphy->dp_link_rate = -1;
 	core_clear32(atcphy, AUSPLL_FREQ_CFG, AUSPLL_FREQ_REFCLK);
 
 	core_mask32(atcphy, AUSPLL_FREQ_DESC_A, AUSPLL_FD_FREQ_COUNT_TARGET,
