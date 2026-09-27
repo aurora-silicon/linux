@@ -294,7 +294,7 @@ void dcp_hotplug(struct work_struct *work)
 	 * flush, or the CRTC gets no signal.
 	 */
 	if (connector->base.state && !dcp->valid_mode && connector->connected &&
-	    !dcp_is_usb4_output(dcp)) {
+	    !(dcp_is_usb4_output(dcp) && of_machine_is_compatible("apple,j416s"))) {
 		drm_connector_set_link_status_property(&connector->base,
 						       DRM_MODE_LINK_STATUS_BAD);
 

@@ -649,6 +649,9 @@ struct atcphy_hw {
  * @swap_lanes: True if lanes must be swapped due to cable orientation
  * @dp_link_rate: DisplayPort link rate
  * @tunnel_clock_on: True while the DisplayPort-over-Thunderbolt pixel clock runs
+ * @tunnel_attempted: A T602X tunnel clock setup has been attempted
+ * @tunnel_saved: T602X PHY registers have been saved for tunnel teardown
+ * @tunnel_saved_regs: Original values of the T602X tunnel clock registers
  * @tunnel_rate: DP link rate code the tunnel pixel clock is set up for
  * @pipe_state: Backend the PIPE mux ("pipehandler") is routed to
  * @regs: Memory-mapped registers
