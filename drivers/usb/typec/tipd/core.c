@@ -2070,8 +2070,11 @@ static int tipd_pm_notify(struct notifier_block *nb, unsigned long action, void 
 {
 	struct tps6598x *tps = container_of(nb, struct tps6598x, pm_nb);
 
-	if (action == PM_POST_SUSPEND && tps->data->resume_reverify)
+	if (action == PM_POST_SUSPEND && tps->data->resume_reverify) {
+		mutex_lock(&tps->lock);
 		tps->data->resume_reverify(tps);
+		mutex_unlock(&tps->lock);
+	}
 
 	return NOTIFY_DONE;
 }
