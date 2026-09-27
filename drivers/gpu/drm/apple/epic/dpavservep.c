@@ -113,6 +113,7 @@ struct dpavserv_copy_edid_resp {
 	u8 _pad2[8];
 	u8 data[];
 } __packed;
+static_assert(sizeof(struct dpavserv_copy_edid_resp) == 48);
 
 static int parse_report(struct apple_epic_service *service, enum epic_subtype type,
 			 const void *data, size_t data_size)
@@ -185,18 +186,19 @@ static const struct drm_edid *dcpavserv_read_edid(struct apple_epic_service *ser
 {
 	struct dpavserv_copy_edid_cmd cmd;
 	struct dpavserv_copy_edid_resp *resp __free(kfree) = NULL;
+	size_t resp_size = sizeof(*resp) + EDID_BUF_SIZE;
 	int num_blocks;
 	u64 data_size;
 	int ret;
 
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.max_size = cpu_to_le64(EDID_BUF_SIZE);
-	resp = kzalloc(sizeof(*resp) + EDID_BUF_SIZE, GFP_KERNEL);
+	resp = kzalloc(resp_size, GFP_KERNEL);
 	if (!resp)
 		return ERR_PTR(-ENOMEM);
 
 	ret = afk_service_call(service, 1, 7, &cmd, sizeof(cmd), EDID_BUF_SIZE, resp,
-			       sizeof(resp) + EDID_BUF_SIZE, 0);
+			       resp_size, 0);
 	if (ret < 0)
 		return ERR_PTR(ret);
 
@@ -207,7 +209,8 @@ static const struct drm_edid *dcpavserv_read_edid(struct apple_epic_service *ser
 	// 	       16, 1, resp, 192, true);
 
 	data_size = le64_to_cpu(resp->used_size);
-	if (data_size < EDID_LEADING_DATA_SIZE + EDID_BLOCK_SIZE)
+	if (data_size < EDID_LEADING_DATA_SIZE + EDID_BLOCK_SIZE ||
+	    data_size > EDID_BUF_SIZE)
 		return ERR_PTR(-EIO);
 
 	num_blocks = resp->data[EDID_LEADING_DATA_SIZE + EDID_EXT_BLOCK_COUNT_OFFSET];
