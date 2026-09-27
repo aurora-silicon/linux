@@ -782,8 +782,8 @@ static void apple_nhi_ring_configure(struct tb_ring *ring, u32 flags, u32 e2e_fl
 		options += APPLE_CIO_NHI_TXRING_DESC_BASE;
 
 		/*
-		 * All TX rings share what macOS calls a shared buffer with 232 entries. This is how
-		 * macOS splits it up, ring 0 only carries control packets and gets the minimum.
+		 * Partition the 232 shared TX entries: two for control ring 0,
+		 * forty each for rings 1-5, and five each for the remaining rings.
 		 */
 		if (ring->hop == 0)
 			writel(2, options + 4);
@@ -800,8 +800,8 @@ static void apple_nhi_ring_configure(struct tb_ring *ring, u32 flags, u32 e2e_fl
 	}
 
 	/*
-	 * The firmware samples the ring configuration when the valid bit is set and E2E flow
-	 * control never engages when configured afterwards. Write everything at once like macOS.
+	 * The firmware samples E2E flow control when the valid bit is set.
+	 * Program both in the same write.
 	 */
 	writel(flags | e2e_flags, options);
 }
@@ -1317,9 +1317,8 @@ out_unlock:
 
 /*
  * Which DP IN adapter (0/1) on the host router this port is -- same
- * counting order as apple_dp_in_analog_base() above, and as
- * apple_nhi_dp_tunnel_changed()'s port-to-dpin mapping in
- * aurora-silicon/linux#8.
+ * counting order as apple_dp_in_analog_base() above and the port-to-dpin
+ * mapping in apple_nhi_dp_tunnel_changed().
  */
 static int apple_dpin_index_for_port(struct apple_nhi *anhi, struct tb_port *in)
 {
@@ -1372,13 +1371,7 @@ static int apple_nhi_dp_tunnel_post_activate(struct tb_nhi *nhi,
 	apple_dp_dump_rc(anhi->acio);
 	apple_dp_dump_vse(in->sw);
 
-	/*
-	 * Route a real display pipeline to this tunnel, ported from
-	 * aurora-silicon/linux#8 -- the dpin_aux "analog AUX serializer"
-	 * mechanism previously here is confirmed ineffective on this
-	 * hardware, including after everything else in the tunnel-up path
-	 * was independently fixed.
-	 */
+	/* Route the display pipeline through the selected host DP IN adapter. */
 	idx = apple_dpin_index_for_port(anhi, in);
 	if (idx < 0 || idx > 1 || !anhi->acio) {
 		dev_warn(anhi->dev,

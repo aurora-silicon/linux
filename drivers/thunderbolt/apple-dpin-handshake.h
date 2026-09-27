@@ -10,54 +10,13 @@
 #define APPLE_DPIN_HPD_LEVEL (1U << 2)
 #define APPLE_DPIN_INACTIVE 1U
 
-/*
- * Set unconditionally by native AppleCIODPTX::bringConnectionUp on both the
- * HPD and CONTROL registers of this exact DPIN0 block when bringing a
- * connection up (single-lane-group case, which is what this port is). The
- * HPD-register write is additionally gated there on a single/multi-stream
- * check; every topology this driver drives through DPIN0 is a single
- * external monitor (SST), so it is unconditional here too. Neither write
- * clears any other bit (native masks both with 0, a pure OR). Not written
- * on deactivate: native's teardown path was not traced, so this preserves
- * the existing "do not invent resets" behavior there.
- */
+/* Activation sets CONNECTED without clearing unrelated HPD or CONTROL bits. */
 #define APPLE_DPIN_CONNECTED (1U << 1)
 
 /*
- * Two further offsets native AppleCIODPTX::bringConnectionUp writes on
- * this exact DPIN0 block, in between the HPD and CONTROL writes above
- * (native order: HPD, then MODE_B, then MODE_A, then CONTROL). Unlike
- * CONNECTED, the exact values here are NOT confirmed from the native
- * binary: native computes them from a per-connection attributes value
- * (rate class and an unidentified secondary field) that is copied
- * verbatim from this connection's negotiation and is not itself built
- * anywhere in the traced kernel/kext code -- its origin could not be
- * pinned down statically (most likely the separate DCP coprocessor
- * firmware). The value used is therefore an informed, explicitly-labeled
- * estimate, not a confirmed constant, and is passed in by the caller
- * (mode_value below) rather than fixed at compile time, so the bounded
- * formula's one free parameter can be swept across a live connection
- * without reinstalling or rebooting between values:
- *   - bits 4-7 of the field select a rate class using the same RBR=0/
- *     HBR=1/HBR2=2/HBR3=3 ordinal already used elsewhere in this driver
- *     (drivers/thunderbolt/tb_regs.h DP_COMMON_CAP_RATE_*); this link
- *     negotiates HBR2, so 2 -- high confidence, unchanged across the
- *     whole sweep.
- *   - a secondary bit, native-gated on lane_count>=2 (true here: 4) and
- *     on the same "which DPIN0 sub-instance" selector already confirmed
- *     unconditional-0 for this single, non-split port, is set from a
- *     nearby field that other native code also treats as a small,
- *     3-valid-value enumeration (0, 1, or 2) -- this is the weak half of
- *     the formula and the only free parameter, swept across
- *     mode_value = rate_class(2) * lane_count(4) + secondary_bit = 8, 9
- *     (both already tested via separate reboots, each a clean boot with
- *     no picture), or 10.
- *
- * mode_value is bounded to APPLE_DPIN_MODE_VALUE_MAX: this caps both the
- * single bit MODE_A can set (1 << mode_value) and the field width MODE_B
- * ORs in, which is also exactly the range the deactivate path below
- * knows how to clear back to a clean baseline. Raising this bound is a
- * new, reviewable change, not a runtime knob.
+ * The caller supplies the experimental DPIN mode value. Bound it to the
+ * four-bit MODE_B field and the range of one-hot MODE_A bits that teardown
+ * clears, so changing the parameter cannot modify unrelated register bits.
  */
 #define APPLE_DPIN_MODE_A 0x14
 #define APPLE_DPIN_MODE_B 0x1c
@@ -108,16 +67,7 @@ static inline int apple_dpin_handshake(const struct apple_dpin_io *io,
 	} else {
 		unsigned int mode_a, mode_b;
 
-		/*
-		 * Not native teardown behavior (never traced; see the
-		 * CONNECTED comment above) -- this exists solely so a later
-		 * activate on this same boot starts from clean state and is
-		 * a valid isolated test of a different mode_value. Bounded
-		 * to exactly the bits any in-range mode_value write above
-		 * could have set: MODE_B's OR'd field (bits 7..7+MAX's
-		 * width) and MODE_A's cleared-low-byte-plus-one-set-bit
-		 * (bits 0..MAX). Never touches bits outside that range.
-		 */
+		/* Clear only the fields that an in-range mode value can modify. */
 		mode_b = io->read(io->ctx, APPLE_DPIN_MODE_B);
 		if (mode_b != ~0U)
 			io->write(io->ctx, APPLE_DPIN_MODE_B,
@@ -151,13 +101,7 @@ static inline int apple_dpin_handshake(const struct apple_dpin_io *io,
 		if (ret)
 			break;
 	}
-	/*
-	 * Restore only the bits we own (INACTIVE, and CONNECTED now that we
-	 * set it above); do not invent resets on a failed handshake. HPD is
-	 * left as-is here: native's teardown path for it was not traced, so
-	 * no rollback is invented for a register this driver otherwise never
-	 * wrote before this change.
-	 */
+	/* Restore the owned CONTROL bits after a failed handshake. */
 	ack = io->read(io->ctx, APPLE_DPIN_CONTROL);
 	if (ack != ~0U)
 		io->write(io->ctx, APPLE_DPIN_CONTROL,

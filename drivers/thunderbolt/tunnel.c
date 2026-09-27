@@ -1234,16 +1234,9 @@ static void tb_dp_dprx_stop(struct tb_tunnel *tunnel)
 }
 
 /*
- * Apple silicon host DP IN adapter: this adapter has no real physical DP
- * connector wired to it, so nothing ever sets its own ADP_DP_CS_2_HPD --
- * pulse ADP_DP_CS_3_HPD_PROPAGATE to tell it to propagate HPD itself, and
- * wait for it to take, same as aurora-silicon/linux#8's hardware-tested
- * t8103 implementation (three docks, multiple monitors). On the
- * dcpext1/right-port path, the CS0-CS13 registers this pulse is meant to
- * move have been observed to stay completely static across every
- * failure, unlike the working dcpext0/left-port case. Logs and continues
- * either way; a failed pulse is not treated as a fatal tunnel-activation
- * error, matching the reference.
+ * The host DP IN adapter has no physical DP connector. Pulse HPD propagation
+ * after enabling the tunnel and allow time for the adapter to report HPD.
+ * Failure is diagnostic: leave the tunnel available for display recovery.
  */
 static void tb_dp_apple_pulse_hpd(struct tb_port *in)
 {
@@ -1351,8 +1344,7 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 		 * Apple silicon host: the sink link is trained by the
 		 * host's DPTX through the tunnel; keep this DP OUT adapter
 		 * from starting link training on its own, and hand it back
-		 * once the tunnel is gone. Ported from aurora-silicon/
-		 * linux#8.
+		 * once the tunnel is gone.
 		 */
 		if (active && apple_dpin &&
 		    !tb_port_read(out, &v, TB_CFG_PORT, out->cap_adap + ADP_DP_CS_3, 1)) {
@@ -1699,8 +1691,7 @@ static int tb_dp_init_video_credits(struct tb_path_hop *hop)
 	struct tb_switch *sw = port->sw;
 
 	/*
-	 * Apple silicon host DP IN adapters take 5 NFC credits for the
-	 * video path -- same source as the HPD/NO_AUTO_LT handling above.
+	 * Apple silicon host DP IN adapters require five NFC video credits.
 	 */
 	if (tb_port_needs_host_dp_credits(port)) {
 		hop->nfc_credits = 5;

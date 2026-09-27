@@ -430,14 +430,13 @@ struct tb_regs_port_header {
 #define ADP_DP_CS_3_HPDC			BIT(9)
 /*
  * Apple silicon host DP IN adapter: pulsing this tells the adapter to
- * propagate HPD to ADP_DP_CS_2_HPD. Ported from aurora-silicon/linux#8
- * (t8103, hardware-tested).
+ * propagate HPD to ADP_DP_CS_2_HPD.
  */
 #define ADP_DP_CS_3_HPD_PROPAGATE		BIT(10)
 /*
  * Apple silicon host: hold the DP OUT (hub-side) adapter's own link
  * training off while a tunnel is up -- the host's DPTX trains the sink
- * through the tunnel itself. Same source as HPD_PROPAGATE above.
+ * through the tunnel itself.
  */
 #define ADP_DP_CS_3_NO_AUTO_LT			BIT(8)
 #define DP_LOCAL_CAP				0x04
