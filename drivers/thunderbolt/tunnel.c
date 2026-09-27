@@ -2358,14 +2358,41 @@ static int tb_usb3_consumed_bandwidth(struct tb_tunnel *tunnel,
 {
 	struct tb_port *port = tb_upstream_port(tunnel->dst_port->sw);
 	int pcie_weight = tb_acpi_may_tunnel_pcie() ? TB_PCI_WEIGHT : 0;
+	int allocated_up = tunnel->allocated_up;
+	int allocated_down = tunnel->allocated_down;
+	int ret;
+
+	if (tunnel->src_port->sw->no_usb3_bw_alloc) {
+		/*
+		 * Apple's host USB3 adapter cannot acknowledge bandwidth
+		 * allocation requests. Its software-only initial allocation is a
+		 * maximum, not bandwidth actually occupied by USB3. The device
+		 * router's USB3 UP adapter still reports consumed bandwidth; use
+		 * that live value for DP admission without limiting USB3 bulk
+		 * traffic or writing the unsupported host registers.
+		 */
+		ret = usb4_usb3_port_consumed_bandwidth(tunnel->dst_port,
+						    &allocated_up, &allocated_down);
+		if (ret) {
+			/* Preserve the conservative allocation-based estimate when
+			 * a downstream adapter lacks readable consumed counters.
+			 */
+			allocated_up = tunnel->allocated_up;
+			allocated_down = tunnel->allocated_down;
+		} else {
+			/* Leave headroom for new isochronous USB3 transfers. */
+			allocated_up = max(allocated_up, 900);
+			allocated_down = max(allocated_down, 900);
+		}
+	}
 
 	/*
 	 * PCIe tunneling, if enabled, affects the USB3 bandwidth so
 	 * take that into account here.
 	 */
-	*consumed_up = tunnel->allocated_up *
+	*consumed_up = allocated_up *
 		(TB_USB3_WEIGHT + pcie_weight) / TB_USB3_WEIGHT;
-	*consumed_down = tunnel->allocated_down *
+	*consumed_down = allocated_down *
 		(TB_USB3_WEIGHT + pcie_weight) / TB_USB3_WEIGHT;
 
 	if (tb_port_get_link_generation(port) >= 4) {

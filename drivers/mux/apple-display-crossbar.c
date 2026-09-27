@@ -35,6 +35,7 @@
 #define T602X_FIFO_WR_N_CLK_EN 0x004
 #define T602X_FIFO_WR_UNK_EN 0x008
 #define T602X_REG_00C 0x00c
+#define T602X_REG_010 0x010
 #define T602X_REG_014 0x014
 #define T602X_REG_018 0x018
 #define T602X_REG_01C 0x01c
@@ -253,23 +254,27 @@ static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
 
 		dpxbar_clear32(dpxbar, T602X_FIFO_RD_UNK_EN, prev_dispext_bit);
 		dpxbar_clear32(dpxbar, T602X_FIFO_WR_DPTX_CLK_EN, prev_dispext_bit);
-		/* DPIN0 uses the same single-bit source gate on up and down. */
-		dpxbar_clear32(dpxbar, T602X_REG_00C,
-			      index == MUX_DPIN0 ? prev_dispext_bit : prev_dispext_bit_en);
+		dpxbar_clear32(dpxbar,
+			      index == MUX_DPIN1 ? T602X_REG_010 : T602X_REG_00C,
+			      prev_dispext_bit);
 
-		dpxbar_clear32(dpxbar, T602X_REG_01C, atc_bit);
+		dpxbar_clear32(dpxbar,
+			      index == MUX_DPIN1 ? FIFO_RD_PCLK1_EN : T602X_REG_01C,
+			      atc_bit);
 
 		dpxbar_clear32(dpxbar, T602X_FIFO_WR_UNK_EN, prev_dispext_bit);
-		dpxbar_clear32(dpxbar, T602X_REG_018, prev_dispext_bit_en);
+		dpxbar_clear32(dpxbar, T602X_REG_018,
+			      prev_dispext_bit_en *
+			      (index == MUX_DPIN1 ? 3 : 1));
 
-		dpxbar_clear32(dpxbar, T602X_FIFO_RD_N_CLK_EN, atc_bit);
+		dpxbar_clear32(dpxbar, T602X_FIFO_RD_N_CLK_EN,
+			      atc_bit * (index == MUX_DPIN1 ? 3 : 1));
 
 		dpxbar_set32(dpxbar, T602X_FIFO_WR_N_CLK_EN, prev_dispext_bit);
 		dpxbar_set32(dpxbar, T602X_REG_014, 0x4);
 
 		/* Native T602x DPIN0 teardown restores the read reset at +0x24. */
-		dpxbar_set32(dpxbar, index == MUX_DPIN0 ?
-			    T602X_FIFO_RD_PCLK2_EN : FIFO_RD_PCLK1_EN, atc_bit);
+		dpxbar_set32(dpxbar, T602X_FIFO_RD_PCLK2_EN, atc_bit);
 
 		dpxbar_clear32(dpxbar, T602X_REG_034, atc_bit);
 		dpxbar_clear32(dpxbar, CROSSBAR_ATC_EN, atc_bit);
@@ -286,16 +291,37 @@ static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
 		dpxbar_clear32(dpxbar, T602X_FIFO_WR_N_CLK_EN, dispext_bit);
 		dpxbar_clear32(dpxbar, T602X_REG_014, 0x4);
 
+		/* Match the DPIN1 sequence used by link_up(): clear +0x24
+		 * before setting the separate +0x20 field below.
+		 */
 		dpxbar_clear32(dpxbar, T602X_FIFO_RD_PCLK2_EN, atc_bit);
+		if (index == MUX_DPIN1)
+			dpxbar_clear32(dpxbar, FIFO_RD_PCLK1_EN, atc_bit);
 
 		dpxbar_set32(dpxbar, T602X_FIFO_WR_UNK_EN, dispext_bit);
-		dpxbar_set32(dpxbar, T602X_REG_018, dispext_bit_en);
-
-		dpxbar_set32(dpxbar, T602X_FIFO_RD_N_CLK_EN, atc_bit);
+		/* Native T602x encodes DPIN1's role as 3 in both two-bit
+		 * source and sink fields, versus 1 for DPIN0.
+		 */
+		if (index == MUX_DPIN1) {
+			dpxbar_mask32(dpxbar, T602X_REG_018,
+				       dispext_bit_en * 3,
+				       dispext_bit_en * 3);
+			dpxbar_mask32(dpxbar, T602X_FIFO_RD_N_CLK_EN,
+				       atc_bit * 3, atc_bit * 3);
+		} else {
+			dpxbar_set32(dpxbar, T602X_REG_018,
+				     dispext_bit_en);
+			dpxbar_set32(dpxbar, T602X_FIFO_RD_N_CLK_EN,
+				     atc_bit);
+		}
 		dpxbar_set32(dpxbar, T602X_FIFO_WR_DPTX_CLK_EN, dispext_bit);
-		dpxbar_set32(dpxbar, T602X_REG_00C, dispext_bit);
+		dpxbar_set32(dpxbar,
+			     index == MUX_DPIN1 ? T602X_REG_010 : T602X_REG_00C,
+			     dispext_bit);
 
-		dpxbar_set32(dpxbar, T602X_REG_01C, atc_bit);
+		dpxbar_set32(dpxbar,
+			     index == MUX_DPIN1 ? FIFO_RD_PCLK1_EN : T602X_REG_01C,
+			     atc_bit);
 		dpxbar_set32(dpxbar, T602X_REG_034, atc_bit);
 		dpxbar_set32(dpxbar, CROSSBAR_ATC_EN, atc_bit);
 		/*
@@ -467,6 +493,42 @@ static const struct mux_control_ops apple_dpxbar_t602x_ops = {
 };
 
 /*
+ * Select the DCP source for a USB4 DP IN before DCP probes AUX. Do not
+ * enable any FIFO clock or ATC output here: full activation still waits for
+ * DCP's SetLinkRate and the tunnel pixel clock. dispext0 works with the
+ * reset selector value (0); dispext1 needs this explicit preselection.
+ */
+int apple_dpxbar_tunnel_select_source(struct mux_control *mux, int state)
+{
+	struct apple_dpxbar *xbar;
+	unsigned long flags;
+	unsigned int index;
+	int ret = 0;
+
+	if (!mux || mux->chip->ops != &apple_dpxbar_t602x_ops)
+		return -EOPNOTSUPP;
+	index = mux_control_get_index(mux);
+	if (index != MUX_DPIN0 && index != MUX_DPIN1)
+		return -EINVAL;
+	if (state < -1 || state >= 9)
+		return -EINVAL;
+
+	xbar = mux_chip_priv(mux->chip);
+	spin_lock_irqsave(&xbar->lock, flags);
+	if (xbar->selected_dispext[index] >= 0 &&
+	    xbar->selected_dispext[index] != state) {
+		ret = -EBUSY;
+	} else {
+		dpxbar_mask32(xbar, T602X_REG_030, t602x_mux_mask(index),
+			      state < 0 ? 0 : t602x_mux_set(index, state));
+	}
+	spin_unlock_irqrestore(&xbar->lock, flags);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_dpxbar_tunnel_select_source);
+
+/*
  * Bring the clock/FIFO gates up on a mux whose dispext source is already
  * selected, without touching the mux selection itself -- used by
  * dcp_tunnel_crossbar_up() for a mux that dcp_typec_route_activate()
@@ -480,7 +542,7 @@ int apple_dpxbar_link_up(struct mux_control *mux)
 	struct apple_dpxbar *xbar;
 	unsigned int index;
 	unsigned long flags;
-	u32 dispext_bit, atc_bit;
+	u32 dispext_bit, dispext_bit_en, atc_bit;
 	int state, ret = 0;
 
 	if (!mux || mux->chip->ops != &apple_dpxbar_t602x_ops)
@@ -496,31 +558,32 @@ int apple_dpxbar_link_up(struct mux_control *mux)
 		return -ENODEV;
 	}
 	dispext_bit = 1 << state;
+	dispext_bit_en = 1 << (2 * state);
 
 	dpxbar_clear32(xbar, T602X_FIFO_WR_N_CLK_EN, dispext_bit);
 	dpxbar_clear32(xbar, T602X_REG_014, dispext_bit);
-	dpxbar_clear32(xbar, index == MUX_DPIN0 ? T602X_FIFO_RD_PCLK2_EN :
-			     FIFO_RD_PCLK1_EN, atc_bit);
+	dpxbar_clear32(xbar, T602X_FIFO_RD_PCLK2_EN, atc_bit);
 	udelay(1);
 
 	dpxbar_set32(xbar, T602X_FIFO_WR_UNK_EN, dispext_bit);
-	dpxbar_mask32(xbar, T602X_REG_018, GENMASK(5, 4), BIT(4));
-	/*
-	 * The only hardware-verified value for this 2-bit field is dpin0's
-	 * BIT(0), which is both ATC_DPIN0 and MUX_DPIN0's own enum value (1)
-	 * coincidentally overlapping at bit 0 -- so this field's encoding
-	 * for a second index was never independently confirmed on real
-	 * hardware. FIELD_PREP(..., index), matching
-	 * MUX_DPPHY=0/MUX_DPIN0=1/MUX_DPIN1=2, is an inferred generalization
-	 * of that single known-good dpin0 data point, not a value verified
-	 * against dpin1 hardware. If dpin1 misbehaves, this field is a
-	 * prime suspect.
+	if (index == MUX_DPIN1) {
+		dpxbar_mask32(xbar, T602X_REG_018,
+			       dispext_bit_en * 3, dispext_bit_en * 3);
+		dpxbar_mask32(xbar, T602X_FIFO_RD_N_CLK_EN,
+			       atc_bit * 3, atc_bit * 3);
+	} else {
+		dpxbar_set32(xbar, T602X_REG_018, dispext_bit_en);
+	}
+	/* set_t602x() already enabled this output's N clock. In particular,
+	 * do not rewrite the low bits here: DPIN1 would clear DPIN0's clock.
 	 */
-	dpxbar_mask32(xbar, T602X_FIFO_RD_N_CLK_EN, GENMASK(1, 0),
-		      FIELD_PREP(GENMASK(1, 0), index));
 	dpxbar_set32(xbar, T602X_FIFO_WR_DPTX_CLK_EN, dispext_bit);
-	dpxbar_set32(xbar, T602X_REG_00C, dispext_bit);
-	dpxbar_set32(xbar, T602X_REG_01C, atc_bit);
+	dpxbar_set32(xbar,
+		     index == MUX_DPIN1 ? T602X_REG_010 : T602X_REG_00C,
+		     dispext_bit);
+	dpxbar_set32(xbar,
+		     index == MUX_DPIN1 ? FIFO_RD_PCLK1_EN : T602X_REG_01C,
+		     atc_bit);
 	dpxbar_set32(xbar, T602X_REG_034, atc_bit);
 	dpxbar_set32(xbar, CROSSBAR_ATC_EN, atc_bit);
 	dpxbar_set32(xbar, CROSSBAR_DISPEXT_EN, dispext_bit);
@@ -562,11 +625,9 @@ int apple_dpxbar_link_down(struct mux_control *mux)
 		return -ENODEV;
 	}
 	dispext_bit = 1 << state;
-
 	dpxbar_set32(xbar, T602X_FIFO_WR_N_CLK_EN, dispext_bit);
 	dpxbar_set32(xbar, T602X_REG_014, dispext_bit);
-	dpxbar_set32(xbar, index == MUX_DPIN0 ? T602X_FIFO_RD_PCLK2_EN :
-			   FIFO_RD_PCLK1_EN, atc_bit);
+	dpxbar_set32(xbar, T602X_FIFO_RD_PCLK2_EN, atc_bit);
 	spin_unlock_irqrestore(&xbar->lock, flags);
 
 	dev_info(xbar->dev, "%s: crossbar link down (dispext=%d atc=0x%x)\n",

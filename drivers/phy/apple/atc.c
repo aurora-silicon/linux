@@ -35,6 +35,7 @@
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/reset-controller.h>
+#include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/types.h>
 #include <linux/usb/pd.h>
@@ -650,7 +651,8 @@ struct apple_atcphy {
 	enum atcphy_mode mode;
 	int dp_link_rate;
 	bool tunnel_attempted, tunnel_saved;
-	u8 tunnel_rate;
+	u8 tunnel_users;
+	u8 tunnel_dpin_rate[2];
 	u32 tunnel_saved_regs[12];
 	bool swap_lanes;
 	bool pipehandler_up;
@@ -1910,7 +1912,8 @@ struct atc_tunnel_saved_reg {
 static const struct atc_tunnel_saved_reg atc_tunnel_regs[] = {
 	{ ACIOPHY_CFG0, 0x0003ffff },
 	{ ACIOPHY_SLEEP_CTRL, 0x00000fff },
-	{ ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, 0x0000207c },
+	{ ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+	  0x0000207c | DPTX_PCLK2_SELECT | DPTX_PCLK2_ENABLE },
 	{ AUSPLL_FREQ_CFG, 0x00000003 },
 	{ AUSPLL_FREQ_DESC_A, 0xffffffff },
 	{ AUSPLL_FREQ_DESC_B, 0x0fffffff },
@@ -1942,48 +1945,47 @@ static void atc_tunnel_restore(struct apple_atcphy *atcphy)
 	int i;
 
 	lockdep_assert_held(&atcphy->lock);
+	atcphy->tunnel_users = 0;
+	atcphy->tunnel_dpin_rate[0] = 0;
+	atcphy->tunnel_dpin_rate[1] = 0;
 	if (!atcphy->tunnel_saved)
 		return;
 	/* Stop our output before restoring the unused PLL descriptor. */
-	core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_ENABLE);
+	core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+		     DPTX_PCLK1_ENABLE | DPTX_PCLK2_ENABLE);
 	core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, 0x54);
 	for (i = ARRAY_SIZE(atc_tunnel_regs) - 1; i >= 0; i--)
 		core_mask32(atcphy, atc_tunnel_regs[i].reg, atc_tunnel_regs[i].mask,
 			    atcphy->tunnel_saved_regs[i] & atc_tunnel_regs[i].mask);
 	atcphy->tunnel_saved = false;
 	atcphy->tunnel_attempted = false;
-	atcphy->tunnel_rate = 0;
 }
 
-static int atc_tunnel_start(struct apple_atcphy *atcphy, u8 rate)
+static int atc_tunnel_rate_selector(u8 rate)
 {
-	u32 selector, value, gates, outputs, command, status;
+	switch (rate) {
+	case 0x06:
+		return 4;
+	case 0x0a:
+		return 3;
+	case 0x14:
+		return 1;
+	case 0x1e:
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int atc_tunnel_start(struct apple_atcphy *atcphy)
+{
+	u32 value, gates, outputs, command, status;
 	unsigned int i;
 	int ret;
 
 	lockdep_assert_held(&atcphy->lock);
-	switch (rate) {
-	case 0x06:
-		selector = 4;
-		break;
-	case 0x0a:
-		selector = 3;
-		break;
-	case 0x14:
-		selector = 1;
-		break;
-	case 0x1e:
-		selector = 0;
-		break;
-	default:
-		return -EINVAL;
-	}
-	if (atcphy->tunnel_saved) {
-		if (atcphy->tunnel_rate != rate)
-			dev_info(atcphy->dev, "USB4 tunnel clock busy: active rate=0x%x requested=0x%x\n",
-				 atcphy->tunnel_rate, rate);
-		return atcphy->tunnel_rate == rate ? 0 : -EBUSY;
-	}
+	if (atcphy->tunnel_saved)
+		return 0;
 	if (atcphy->tunnel_attempted)
 		return -EALREADY;
 	/* Read every guard before deciding, so a refusal records the whole state. */
@@ -2052,9 +2054,6 @@ static int atc_tunnel_start(struct apple_atcphy *atcphy, u8 rate)
 	udelay(2);
 	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, BIT(2));
 	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, BIT(3));
-	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_ENABLE);
-	core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_SELECT,
-		    FIELD_PREP(DPTX_PCLK1_SELECT, selector));
 
 	/* Native fixed descriptor at cache VA 0xfffffe0007582418. */
 	core_clear32(atcphy, AUSPLL_FREQ_CFG, AUSPLL_FREQ_REFCLK);
@@ -2080,7 +2079,6 @@ static int atc_tunnel_start(struct apple_atcphy *atcphy, u8 rate)
 	ret = atc_tunnel_command(atcphy, 0x2000);
 	if (ret)
 		goto restore;
-	atcphy->tunnel_rate = rate;
 	return 0;
 restore:
 	atc_tunnel_restore(atcphy);
@@ -2340,7 +2338,7 @@ static const struct phy_ops apple_atc_dp_phy_ops = {
 };
 
 /*
- * j416s has one ATC PHY core per Type-C port at 0x703000000 (left),
+ * j414s and j416s have one ATC PHY core per Type-C port at 0x703000000 (left),
  * 0xb03000000 (left), 0xf03000000 (right) -- the same top-byte pattern
  * as the ACIO/DPIN0 and crossbar addresses in drivers/thunderbolt/apple.c
  * and drivers/mux/apple-display-crossbar.c. Originally this only
@@ -2363,29 +2361,106 @@ static bool apple_atc_is_typec_core(u64 base)
  * AUSPLL descriptor/PCLK1 selectors). Also accepts TBT mode, not just
  * USB4: a genuine dock may negotiate either.
  */
-int apple_atc_dp_tunnel_rate(struct phy *phy, u8 rate);
-int apple_atc_dp_tunnel_rate(struct phy *phy, u8 rate)
+int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 {
 	struct apple_atcphy *atcphy;
-	int ret;
+	u32 value;
+	u8 user;
+	int ret, selector;
 
 	if (!phy || phy->ops != &apple_atc_dp_phy_ops ||
-	    !of_machine_is_compatible("apple,j416s"))
+	    (!of_machine_is_compatible("apple,j414s") &&
+	     !of_machine_is_compatible("apple,j416s")))
 		return -EOPNOTSUPP;
 	atcphy = phy_get_drvdata(phy);
 	if (!of_device_is_compatible(atcphy->np, "apple,t6020-atcphy") ||
 	    !apple_atc_is_typec_core(atcphy->res.core->start) ||
 	    resource_size(atcphy->res.core) < 0x7048)
 		return -EINVAL;
+	if (dpin > 1)
+		return -EINVAL;
+	user = BIT(dpin);
 	guard(mutex)(&atcphy->lock);
 	if (!rate) {
-		atc_tunnel_restore(atcphy);
+		if (atcphy->tunnel_users & user) {
+			if (dpin == 0) {
+				/* DPIN1 still needs the PCLK1 gate. On J414s,
+				 * clearing it stopped DPIN1's video packets even
+				 * though PCLK2 remained enabled and locked.
+				 */
+				if (!(atcphy->tunnel_users & BIT(1)))
+					core_clear32(atcphy,
+						ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+						DPTX_PCLK1_ENABLE);
+			} else {
+				core_clear32(atcphy,
+					     ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+					     DPTX_PCLK2_ENABLE);
+				if (!(atcphy->tunnel_users & BIT(0)))
+					core_clear32(atcphy,
+						ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+						DPTX_PCLK1_ENABLE);
+			}
+		}
+		atcphy->tunnel_users &= ~user;
+		atcphy->tunnel_dpin_rate[dpin] = 0;
+		if (!atcphy->tunnel_users && atcphy->tunnel_saved)
+			core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, 0x54);
 		return 0;
 	}
 	if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 &&
 	    atcphy->mode != APPLE_ATCPHY_MODE_TBT)
 		return -EBUSY;
-	ret = atc_tunnel_start(atcphy, rate);
+	selector = atc_tunnel_rate_selector(rate);
+	if (selector < 0)
+		return selector;
+	if (atcphy->tunnel_dpin_rate[dpin] == rate)
+		return 0;
+	if (!atcphy->tunnel_users) {
+		if (!atcphy->tunnel_saved) {
+			ret = atc_tunnel_start(atcphy);
+		} else {
+			/* The PLL retains lock after its outputs are gated. Keep its
+			 * owned descriptor until the USB4 PHY changes mode instead of
+			 * reprogramming a still-locked PLL on every DPMS wake.
+			 */
+			core_set32(atcphy, AUSPLL_CLKOUT_MASTER, 0x54);
+			ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_DP_PCLK_STAT,
+						 value, value & ACIOPHY_AUSPLL_LOCK,
+						 10, 10000);
+			if (ret)
+				core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, 0x54);
+		}
+		if (ret)
+			goto out;
+	}
+	if (dpin == 0) {
+		core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+			    DPTX_PCLK1_SELECT,
+			    FIELD_PREP(DPTX_PCLK1_SELECT, selector));
+		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+			   DPTX_PCLK1_ENABLE);
+	} else {
+		/* PCLK2 alone does not sustain a DPIN1 stream on J414s.
+		 * Keep PCLK1 gated on as a shared prerequisite. If DPIN0 is
+		 * inactive, select DPIN1's rate for that clock as well.
+		 */
+		if (!(atcphy->tunnel_users & BIT(0)))
+			core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+				    DPTX_PCLK1_SELECT,
+				    FIELD_PREP(DPTX_PCLK1_SELECT, selector));
+		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+			   DPTX_PCLK1_ENABLE);
+		core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+			    DPTX_PCLK2_SELECT,
+			    FIELD_PREP(DPTX_PCLK2_SELECT, selector));
+		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+			   DPTX_PCLK2_ENABLE);
+	}
+	atcphy->tunnel_dpin_rate[dpin] = rate;
+	atcphy->tunnel_users |= user;
+	ret = 0;
+out:
 	dev_info(atcphy->dev, "DP tunnel clock: rate=0x%x result=%d\n", rate, ret);
 	return ret;
 }
