@@ -38,8 +38,12 @@ impl Inner {
     fn fail(&mut self, index: usize, vm: &mmu::Vm) {
         self.state.health.mark_failed();
         let events=self.state.event_messages.load(Ordering::Acquire);
-        let _=self.jobs[index].log(&self.drm);
-        let _=self.device.log_engine_state(vm);
+        if let Err(e) = self.jobs[index].log(&self.drm) {
+            dev_err!(self.drm.as_ref(), "M3 job diagnostics failed: {:?}\n", e);
+        }
+        if let Err(e) = self.device.log_engine_state(vm) {
+            dev_err!(self.drm.as_ref(), "M3 engine diagnostics failed: {:?}\n", e);
+        }
         let _=self.config.log_recovery_state(&self.drm,events);
         if crate::m3_params::g15_debug(crate::m3_params::G15Debug::M3ResumeAfterFault) {
             if let Err(e)=self.resume_experiment(index, vm) {
@@ -147,6 +151,20 @@ impl Runtime {
     /// Only the scheduler's run callback calls this, one packet at a time, so
     /// the retained jobs and the batch in flight cannot change while unlocked.
     pub(crate) fn execute(shared:&crate::m3_drm::Shared,packet:Arc<crate::m3_submit::Packet>)->Result {
+        let result = Self::execute_inner(shared, packet);
+        // The scheduler serializes execute calls. Reacquire the runtime lock
+        // before latching any error after publication: retained packets must
+        // not be released by the next submission while DMA may still be active.
+        if result.is_err() {
+            if let Some(runtime) = Option::as_mut(&mut *shared.lock()) {
+                if runtime.inner.gpu_pending {
+                    runtime.inner.state.health.mark_failed();
+                }
+            }
+        }
+        result
+    }
+    fn execute_inner(shared:&crate::m3_drm::Shared,packet:Arc<crate::m3_submit::Packet>)->Result {
         crate::debug::update_debug_flags();
         let unlocked_wait=crate::m3_params::unlocked_wait();
         let render_batch_size=crate::m3_params::render_batch_size();
