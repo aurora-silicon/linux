@@ -5,6 +5,18 @@
 #include <linux/types.h>
 struct apple_dcp;
 
+struct dcpext_frame {
+	void *pixels;
+	size_t size;
+};
+
+bool dcpext_scanout_pageflips(struct apple_dcp *dcp);
+/* begin holds the presentation mutex until end, including on discard.
+ * Callers must hold drm_dev_enter() across the pair to exclude removal.
+ */
+int dcpext_scanout_begin_frame(struct apple_dcp *dcp, struct dcpext_frame *frame);
+int dcpext_scanout_end_frame(struct apple_dcp *dcp, bool present);
+
 /* Register the explicit one-shot diagnostic only after the iBoot service exists. */
 int dcpext_scanout_register(struct apple_dcp *dcp);
 

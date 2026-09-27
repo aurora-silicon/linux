@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-/* Fixed iBoot scanout, with CPU shadow updates. No firmware calls per commit. */
+/* Fixed iBoot mode, CPU shadow updates, optionally synchronized buffer swaps. */
 #include <linux/dma-mapping.h>
+#include <linux/dma-fence.h>
 #include <linux/iosys-map.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -14,9 +15,11 @@
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_probe_helper.h>
+#include <drm/drm_vblank.h>
 #include "dcp.h"
 #include "dcpext_mode.h"
 #include "dcpext_drm.h"
+#include "dcpext_scanout.h"
 
 #define EXT_WIDTH DCPEXT_WIDTH
 #define EXT_HEIGHT DCPEXT_HEIGHT
@@ -31,6 +34,9 @@ struct dcpext_drm {
 	void *pixels;
 	size_t size;
 	u32 stride;
+	struct apple_dcp *dcp;
+	bool pageflips;
+	u8 *row;
 	/* Owned by the retained scanout, never by the detachable parent device. */
 	atomic_t *terminal_error;
 };
@@ -83,6 +89,66 @@ static int ext_plane_check(struct drm_plane *plane, struct drm_atomic_state *sta
 	return 0;
 }
 
+/* A failed copy/firmware transaction must not become a successful fake flip. */
+static void ext_cancel_flip(struct dcpext_drm *ext, struct drm_atomic_state *state, int error)
+{
+	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(state, &ext->crtc);
+	struct drm_pending_vblank_event *event;
+	unsigned long flags;
+
+	if (!cs)
+		return;
+	spin_lock_irqsave(&ext->drm.event_lock, flags);
+	event = cs->event;
+	cs->event = NULL;
+	spin_unlock_irqrestore(&ext->drm.event_lock, flags);
+	if (!event)
+		return;
+	if (event->base.fence) {
+		dma_fence_set_error(event->base.fence, error);
+		dma_fence_signal(event->base.fence);
+	}
+	if (event->base.completion) {
+		complete_all(event->base.completion);
+		if (event->base.completion_release)
+			event->base.completion_release(event->base.completion);
+		event->base.completion = NULL;
+	}
+	drm_event_cancel_free(&ext->drm, &event->base);
+}
+
+static int ext_copy_frame(struct dcpext_drm *ext, struct drm_plane_state *ps)
+{
+	struct drm_shadow_plane_state *shadow = to_drm_shadow_plane_state(ps);
+	struct drm_framebuffer *fb = ps->fb;
+	struct dcpext_frame frame;
+	int x, y, ret;
+
+	ret = dcpext_scanout_begin_frame(ext->dcp, &frame);
+	if (ret)
+		return ret;
+	if (!ext_rect_valid(0, 0, EXT_WIDTH, EXT_HEIGHT, ext->stride, frame.size)) {
+		dcpext_scanout_end_frame(ext->dcp, false);
+		return -EINVAL;
+	}
+	/* The idle buffer contains an older frame, so damage alone is insufficient.
+	 * Copy the complete current framebuffer before publishing its address.
+	 */
+	for (y = 0; y < EXT_HEIGHT; y++) {
+		u8 *dst = frame.pixels + (size_t)y * ext->stride;
+
+		iosys_map_memcpy_from(ext->row, &shadow->data[0],
+				     (size_t)y * fb->pitches[0], EXT_STRIDE);
+		for (x = 0; x < EXT_WIDTH; x++)
+			ext->row[x * 4 + 3] = 0xff;
+		/* Convert in cached memory, then stream to coherent scanout memory.
+		 * Byte stores directly to that mapping make full 4K copies costly.
+		 */
+		memcpy(dst, ext->row, EXT_STRIDE);
+	}
+	return dcpext_scanout_end_frame(ext->dcp, true);
+}
+
 static void ext_plane_update(struct drm_plane *plane, struct drm_atomic_state *state)
 {
 	struct dcpext_drm *ext = container_of(plane->dev, struct dcpext_drm, drm);
@@ -93,15 +159,25 @@ static void ext_plane_update(struct drm_plane *plane, struct drm_atomic_state *s
 	struct drm_gem_object *obj;
 	struct drm_atomic_helper_damage_iter iter;
 	struct drm_rect damage, bounds = DRM_RECT_INIT(0, 0, EXT_WIDTH, EXT_HEIGHT);
-	int idx, x, y;
+	int idx, x, y, ret;
 
-	if (!ps->visible || !fb || atomic_read(ext->terminal_error))
+	if (!ps->visible || !fb)
 		return;
+	ret = atomic_read(ext->terminal_error);
+	if (ret)
+		goto cancel;
 	obj = drm_gem_fb_get_obj(fb, 0);
-	if (drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE))
-		return;
-	if (!drm_dev_enter(plane->dev, &idx))
+	ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
+	if (ret)
+		goto cancel;
+	if (!drm_dev_enter(plane->dev, &idx)) {
+		ret = -ENODEV;
 		goto end_access;
+	}
+	if (ext->pageflips) {
+		ret = ext_copy_frame(ext, ps);
+		goto exit_device;
+	}
 	drm_atomic_helper_damage_iter_init(&iter, old, ps);
 	drm_atomic_for_each_plane_damage(&iter, &damage) {
 		if (!drm_rect_intersect(&damage, &bounds))
@@ -124,22 +200,45 @@ static void ext_plane_update(struct drm_plane *plane, struct drm_atomic_state *s
 		}
 	}
 	dma_wmb();
+exit_device:
 	drm_dev_exit(idx);
 end_access:
 	drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
+cancel:
+	if (ext->pageflips && ret)
+		ext_cancel_flip(ext, state, ret);
 }
 
 static void ext_plane_disable(struct drm_plane *plane, struct drm_atomic_state *state)
 {
 	struct dcpext_drm *ext = container_of(plane->dev, struct dcpext_drm, drm);
 	u32 *dst = ext->pixels;
-	int idx, i;
+	struct dcpext_frame frame;
+	int idx, i, ret;
 
-	if (atomic_read(ext->terminal_error) || !drm_dev_enter(plane->dev, &idx))
+	ret = atomic_read(ext->terminal_error);
+	if (ret || !drm_dev_enter(plane->dev, &idx)) {
+		if (ext->pageflips)
+			ext_cancel_flip(ext, state, ret ? ret : -ENODEV);
 		return;
+	}
+	if (ext->pageflips) {
+		ret = dcpext_scanout_begin_frame(ext->dcp, &frame);
+		if (ret) {
+			ext_cancel_flip(ext, state, ret);
+			goto exit_device;
+		}
+		dst = frame.pixels;
+	}
 	for (i = 0; i < EXT_WIDTH * EXT_HEIGHT; ++i)
 		dst[i] = cpu_to_le32(0xff000000);
 	dma_wmb();
+	if (ext->pageflips) {
+		ret = dcpext_scanout_end_frame(ext->dcp, true);
+		if (ret)
+			ext_cancel_flip(ext, state, ret);
+	}
+exit_device:
 	drm_dev_exit(idx);
 }
 
@@ -247,6 +346,13 @@ int dcpext_drm_register(struct apple_dcp *dcp, void *pixels, size_t size, u32 st
 	ext->size = size;
 	ext->stride = stride;
 	ext->terminal_error = terminal_error;
+	ext->dcp = dcp;
+	ext->pageflips = dcpext_scanout_pageflips(dcp);
+	if (ext->pageflips) {
+		ext->row = drmm_kmalloc(drm, EXT_STRIDE, GFP_KERNEL);
+		if (!ext->row)
+			return -ENOMEM;
+	}
 	ret = drmm_mode_config_init(drm);
 	if (ret)
 		return ret;
@@ -281,8 +387,9 @@ int dcpext_drm_register(struct apple_dcp *dcp, void *pixels, size_t size, u32 st
 	if (ret)
 		return ret;
 	drm_mode_config_reset(drm);
-	/* No vblank IRQ: the atomic helper emits completion events after copies.
-	 * These events do not mean a physical vblank; tearing remains possible.
+	/* No vblank IRQ: the helper timestamps completion in software. In pageflip
+	 * mode the copy/commit also waits for firmware completion before this event;
+	 * the legacy single-buffer mode remains unsynchronized and may tear.
 	 * Deliberately no fbdev/client setup, console takeover, or render node.
 	 */
 	ret = drm_dev_register(drm, 0);
@@ -294,6 +401,7 @@ int dcpext_drm_register(struct apple_dcp *dcp, void *pixels, size_t size, u32 st
 	/* Keep notification work safe even after parent devres teardown. */
 	drm_dev_get(drm);
 	WRITE_ONCE(*retained_drm, drm);
-	dev_info(dcp->dev, "external shadow DRM registered: fixed 3840x2160, CPU copies, no hardware vblank\n");
+	dev_info(dcp->dev, "external shadow DRM registered: fixed 3840x2160, CPU copies, %s\n",
+		 ext->pageflips ? "firmware-completed double-buffer swaps" : "no hardware vblank");
 	return 0;
 }

@@ -7,10 +7,12 @@
 #include <linux/kconfig.h>
 #include <linux/of_platform.h>
 #include <linux/slab.h>
+#include <linux/overflow.h>
 #include <linux/workqueue.h>
 #include <linux/soc/apple/rtkit.h>
 
 #include "afk.h"
+#include "afk_reply.h"
 #include "trace.h"
 
 struct afk_receive_message_work {
@@ -450,6 +452,8 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 
 	service->cmds[idx].done = true;
 	service->cmds[idx].retcode = le32_to_cpu(cmd->retcode);
+	service->cmds[idx].reply_len = le32_to_cpu(cmd->rxlen);
+	service->cmds[idx].reply_len_valid = true;
 	if (service->cmds[idx].free_on_ack) {
 		/* defer freeing until we're no longer in atomic context */
 		rxbuf = service->cmds[idx].rxbuf;
@@ -969,9 +973,9 @@ out:
 	return ret;
 }
 
-int afk_send_command(struct apple_epic_service *service, u8 type,
-		     const void *payload, size_t payload_len, void *output,
-		     size_t output_len, u32 *retcode)
+static int afk_send_command_common(struct apple_epic_service *service, u8 type,
+		const void *payload, size_t payload_len, void *output,
+		size_t output_len, u32 *retcode, size_t *reply_len)
 {
 	struct epic_cmd cmd;
 	void *rxbuf, *txbuf;
@@ -981,6 +985,11 @@ int afk_send_command(struct apple_epic_service *service, u8 type,
 	u16 tag;
 	struct apple_dcp_afkep *ep = service->ep;
 	DECLARE_COMPLETION_ONSTACK(completion);
+
+	if (reply_len)
+		*reply_len = 0;
+	if (payload_len > U32_MAX || output_len > U32_MAX)
+		return -EOVERFLOW;
 
 	rxbuf = dma_alloc_coherent(ep->dcp->dev, output_len, &rxbuf_dma,
 				   GFP_KERNEL);
@@ -1020,6 +1029,8 @@ int afk_send_command(struct apple_epic_service *service, u8 type,
 	service->cmds[idx].txbuf_dma = txbuf_dma;
 	service->cmds[idx].rxlen = output_len;
 	service->cmds[idx].txlen = payload_len;
+	service->cmds[idx].reply_len = 0;
+	service->cmds[idx].reply_len_valid = false;
 	service->cmds[idx].free_on_ack = false;
 	service->cmds[idx].done = false;
 	service->cmds[idx].completion = &completion;
@@ -1070,8 +1081,20 @@ int afk_send_command(struct apple_epic_service *service, u8 type,
 	ret = 0;
 	if (retcode)
 		*retcode = service->cmds[idx].retcode;
-	if (output && output_len)
+	if (reply_len) {
+		ret = afk_reply_size_valid(service->cmds[idx].reply_len_valid,
+			service->cmds[idx].reply_len, output_len, 0);
+		if (ret)
+			goto err_free_cmd;
+		*reply_len = service->cmds[idx].reply_len;
+		dma_rmb();
+		if (output && output_len) {
+			memset(output, 0, output_len);
+			memcpy(output, rxbuf, *reply_len);
+		}
+	} else if (output && output_len) {
 		memcpy(output, rxbuf, output_len);
+	}
 
 err_free_cmd:
 	spin_lock_irqsave(&service->lock, flags);
@@ -1084,17 +1107,43 @@ err_free_rxbuf:
 	return ret;
 }
 
-int afk_service_call(struct apple_epic_service *service, u16 group, u32 command,
+int afk_send_command(struct apple_epic_service *service, u8 type,
+		const void *payload, size_t payload_len, void *output,
+		size_t output_len, u32 *retcode)
+{
+	return afk_send_command_common(service, type, payload, payload_len,
+				       output, output_len, retcode, NULL);
+}
+
+int afk_send_command_with_reply_len(struct apple_epic_service *service, u8 type,
+		const void *payload, size_t payload_len, void *output,
+		size_t output_len, u32 *retcode, size_t *reply_len)
+{
+	if (!reply_len)
+		return -EINVAL;
+	return afk_send_command_common(service, type, payload, payload_len,
+				       output, output_len, retcode, reply_len);
+}
+
+static int afk_service_call_common(struct apple_epic_service *service, u16 group, u32 command,
 		     const void *data, size_t data_len, size_t data_pad,
-		     void *output, size_t output_len, size_t output_pad)
+		     void *output, size_t output_len, size_t output_pad,
+		     size_t *reply_len)
 {
 	struct epic_service_call *call;
 	void *bfr;
-	size_t bfr_len = max(data_len + data_pad, output_len + output_pad) +
-			 sizeof(*call);
+	size_t bfr_len, input_size, output_size, received = 0;
 	int ret;
 	u32 retcode;
 	u32 retlen;
+
+	if (reply_len)
+		*reply_len = 0;
+	if (check_add_overflow(data_len, data_pad, &input_size) ||
+	    check_add_overflow(output_len, output_pad, &output_size) ||
+	    check_add_overflow(max(input_size, output_size), sizeof(*call),
+			       &bfr_len) || bfr_len > U32_MAX)
+		return -EOVERFLOW;
 
 	bfr = kzalloc(bfr_len, GFP_KERNEL);
 	if (!bfr)
@@ -1110,13 +1159,19 @@ int afk_service_call(struct apple_epic_service *service, u16 group, u32 command,
 
 	memcpy(bfr + sizeof(*call), data, data_len);
 
-	ret = afk_send_command(service, EPIC_SUBTYPE_STD_SERVICE, bfr, bfr_len,
-			       bfr, bfr_len, &retcode);
+	ret = afk_send_command_common(service, EPIC_SUBTYPE_STD_SERVICE, bfr, bfr_len,
+			       bfr, bfr_len, &retcode,
+			       reply_len ? &received : NULL);
 	if (ret)
 		goto out;
 	if (retcode) {
 		ret = -EINVAL;
 		goto out;
+	}
+	if (reply_len) {
+		ret = afk_reply_size_valid(true, received, bfr_len, sizeof(*call));
+		if (ret)
+			goto out;
 	}
 	if (le32_to_cpu(call->magic) != EPIC_SERVICE_CALL_MAGIC ||
 	    le16_to_cpu(call->group) != group ||
@@ -1126,6 +1181,13 @@ int afk_service_call(struct apple_epic_service *service, u16 group, u32 command,
 	}
 
 	retlen = le32_to_cpu(call->data_len);
+	if (reply_len) {
+		ret = afk_service_body_size_valid(received, sizeof(*call),
+						 retlen, output_len);
+		if (ret)
+			goto out;
+		*reply_len = retlen;
+	}
 	if (output_len < retlen)
 		retlen = output_len;
 	if (output && output_len) {
@@ -1136,6 +1198,25 @@ int afk_service_call(struct apple_epic_service *service, u16 group, u32 command,
 out:
 	kfree(bfr);
 	return ret;
+}
+
+int afk_service_call(struct apple_epic_service *service, u16 group, u32 command,
+		const void *data, size_t data_len, size_t data_pad,
+		void *output, size_t output_len, size_t output_pad)
+{
+	return afk_service_call_common(service, group, command, data, data_len,
+			data_pad, output, output_len, output_pad, NULL);
+}
+
+int afk_service_call_with_reply_len(struct apple_epic_service *service,
+		u16 group, u32 command, const void *data, size_t data_len,
+		size_t data_pad, void *output, size_t output_len,
+		size_t output_pad, size_t *reply_len)
+{
+	if (!reply_len)
+		return -EINVAL;
+	return afk_service_call_common(service, group, command, data, data_len,
+			data_pad, output, output_len, output_pad, reply_len);
 }
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DEBUG)
