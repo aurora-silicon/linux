@@ -108,6 +108,11 @@ pub(crate) struct Health {
     crashed: AtomicBool,
     mapped: AtomicBool,
     failed: AtomicBool,
+    /// Host-verified retirement state. One serialized runtime writer; no log
+    /// parsing, allocation, MMIO or firmware notification alone can advance it.
+    completed: AtomicU64,
+    last_completion_ns: AtomicU64,
+    generation_ns: u64,
 }
 
 impl Health {
@@ -115,6 +120,22 @@ impl Health {
         self.mapped.load(Ordering::Acquire)
             && !self.crashed.load(Ordering::Acquire)
             && !self.failed()
+    }
+
+    pub(crate) fn record_completion(&self) {
+        let now = <Monotonic as kernel::time::ClockSource>::ktime_get() as u64;
+        // Publish the timestamp before the count. An acquiring observer of a
+        // new count sees that completion's timestamp or a later REAL completion.
+        // A racing writer may expose a newer timestamp with an older count;
+        // readers never renew unless the count advances too.
+        self.last_completion_ns.store(now, Ordering::Release);
+        self.completed.fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn progress_snapshot(&self) -> (u64, u64, u64, bool) {
+        let completed = self.completed.load(Ordering::Acquire);
+        let last_ns = self.last_completion_ns.load(Ordering::Acquire);
+        (self.generation_ns, completed, last_ns, self.healthy())
     }
 
     pub(crate) fn failed(&self) -> bool { self.failed.load(Ordering::Acquire) }
@@ -136,6 +157,9 @@ impl State {
                     crashed: AtomicBool::new(false),
                     mapped: AtomicBool::new(false),
                     failed: AtomicBool::new(false),
+                    completed: AtomicU64::new(0),
+                    last_completion_ns: AtomicU64::new(0),
+                    generation_ns: <Monotonic as kernel::time::ClockSource>::ktime_get() as u64,
                 }, GFP_KERNEL)?,
                 claimed: AtomicBool::new(false),
                 event_messages: AtomicU64::new(0),

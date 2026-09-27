@@ -507,6 +507,9 @@ impl Render {
         // Keep summaries sparse at high throughput, but emit at least once a
         // second while completed batches advance. Batched draw counts can skip
         // multiples of 128; a count-only gate can starve the watchdog observer.
+        if !crate::debug::debug_enabled(crate::debug::DebugFlags::SubmitTiming) {
+            return Ok(());
+        }
         let now = <kernel::time::Monotonic as kernel::time::ClockSource>::ktime_get();
         if self.last_progress_ns != 0 && now - self.last_progress_ns < 1_000_000_000
             && self.draw != 1 && self.draw % 128 != 0

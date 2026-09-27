@@ -270,6 +270,9 @@ impl Runtime {
                     match inner.device.check_idle() {
                         Ok(()) if inner.config.pipes_idle()?=>{
                             if let Err(e)=inner.config.check_pstate(&inner.drm,&inner.device,"after a job") {inner.state.health.mark_failed();return Err(e);}
+                            // Stamps, both queue indices, required events,
+                            // firmware health, engines and pipes are verified.
+                            inner.state.health.record_completion();
                             match &mut inner.jobs[index] {
                                 NativeJob::Compute(j)=>j.progress(&inner.drm)?,
                                 NativeJob::Render(j)=>j.progress(&inner.drm)?,

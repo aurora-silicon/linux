@@ -282,6 +282,9 @@ impl Compute {
     pub(crate) fn progress(&mut self, dev: &driver::AsahiDevice) -> Result {
         // Report real completions by elapsed time as well as sequence count;
         // batches need not land on a multiple of 128.
+        if !crate::debug::debug_enabled(crate::debug::DebugFlags::SubmitTiming) {
+            return Ok(());
+        }
         let now = <kernel::time::Monotonic as kernel::time::ClockSource>::ktime_get();
         if self.last_progress_ns != 0 && now - self.last_progress_ns < 1_000_000_000
             && self.sequence != 1 && self.sequence % 128 != 0
