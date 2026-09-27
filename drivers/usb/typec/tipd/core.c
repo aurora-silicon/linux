@@ -555,7 +555,7 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 	int ret = 0;
 
 	if (!(st->data_status & TPS_DATA_STATUS_DATA_CONNECTION)) {
-		if (cd321x->state.mode == TYPEC_STATE_SAFE)
+		if (cd321x->state_valid && cd321x->state.mode == TYPEC_STATE_SAFE)
 			return 0;
 		cd321x->state.alt = NULL;
 		cd321x->state.mode = TYPEC_STATE_SAFE;
@@ -565,7 +565,8 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 	} else if (st->data_status & CD321X_DATA_STATUS_USB4_CONNECTION) {
 		struct enter_usb_data eusb_data;
 
-		if (cd321x->state.alt == NULL && cd321x->state.mode == TYPEC_MODE_USB4)
+		if (cd321x->state_valid && !cd321x->state.alt &&
+		    cd321x->state.mode == TYPEC_MODE_USB4)
 			return 0;
 
 		eusb_data.eudo = le32_to_cpu(st->usb4_status.eudo);
@@ -584,11 +585,11 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		tbt_switch_data.orientation = TPS_STATUS_TO_UPSIDE_DOWN(st->status) ?
 						      TYPEC_ORIENTATION_REVERSE :
 						      TYPEC_ORIENTATION_NORMAL;
-		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
+		ret = typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 	} else if (st->data_status & TPS_DATA_STATUS_TBT_CONNECTION) {
 		struct typec_thunderbolt_data tbt_data;
 
-		if (cd321x->state.alt == cd321x->port_altmode_tbt &&
+		if (cd321x->state_valid && cd321x->state.alt == cd321x->port_altmode_tbt &&
 		    cd321x->state.mode == TYPEC_TBT_MODE)
 			return 0;
 
@@ -617,7 +618,7 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		tbt_switch_data.orientation = TPS_STATUS_TO_UPSIDE_DOWN(st->status) ?
 						      TYPEC_ORIENTATION_REVERSE :
 						      TYPEC_ORIENTATION_NORMAL;
-		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
+		ret = typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 	} else if (st->data_status & TPS_DATA_STATUS_DP_CONNECTION) {
 		struct typec_displayport_data dp_data;
 		unsigned long mode;
@@ -653,7 +654,7 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		else
 			dp_data.status &= ~DP_STATUS_HPD_STATE;
 
-		if (cd321x->state.alt == cd321x->port_altmode_dp &&
+		if (cd321x->state_valid && cd321x->state.alt == cd321x->port_altmode_dp &&
 		    cd321x->state.mode == mode &&
 		    cd321x->dp_status == dp_data.status &&
 		    cd321x->dp_conf == dp_data.conf)
@@ -669,7 +670,8 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 			cd321x->dp_conf = dp_data.conf;
 		}
 	} else {
-		if (cd321x->state.alt == NULL && cd321x->state.mode == TYPEC_STATE_USB)
+		if (cd321x->state_valid && !cd321x->state.alt &&
+		    cd321x->state.mode == TYPEC_STATE_USB)
 			return 0;
 		cd321x->state.alt = NULL;
 		cd321x->state.mode = TYPEC_STATE_USB;
@@ -681,9 +683,11 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 out:
 	/* Clear data since it's no longer used after typec_mux_set and points to the stack */
 	cd321x->state.data = NULL;
+	cd321x->state_valid = !ret;
 	if (ret) {
+		/* The mux may have changed before the switch failed. */
 		cd321x->state = old_state;
-		dev_warn(tps->dev, "failed to configure Type-C mux: %d\n", ret);
+		dev_warn(tps->dev, "failed to configure Type-C connection: %d\n", ret);
 	} else if (cd321x->state.alt != cd321x->port_altmode_dp) {
 		cd321x->dp_status = 0;
 		cd321x->dp_conf = 0;
@@ -757,7 +761,7 @@ static void cd321x_update_work(struct work_struct *work)
 	 * PCIe-C cannot quiesce its hierarchy before NHI removal.
 	 */
 	if ((!new_connected || was_disconnected) &&
-	    cd321x->state.mode != TYPEC_STATE_SAFE)
+	    (!cd321x->state_valid || cd321x->state.mode != TYPEC_STATE_SAFE))
 		typec_thunderbolt_switch_set(cd321x->tbt_switch,
 					     &tbt_switch_data);
 
@@ -796,6 +800,7 @@ static void cd321x_update_work(struct work_struct *work)
 		cd321x->state.mode = TYPEC_STATE_SAFE;
 		cd321x->state.data = NULL;
 		ret = typec_set_mode(tps->port, TYPEC_STATE_SAFE);
+		cd321x->state_valid = !ret;
 		if (ret) {
 			dev_warn(tps->dev,
 				 "failed to place Type-C mux in safe mode: %d\n",
@@ -1373,7 +1378,7 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	cd321x->state.alt = NULL;
 	cd321x->state.mode = TYPEC_STATE_SAFE;
 	cd321x->state.data = NULL;
-	typec_set_mode(tps->port, TYPEC_STATE_SAFE);
+	cd321x->state_valid = !typec_set_mode(tps->port, TYPEC_STATE_SAFE);
 
 	return 0;
 
