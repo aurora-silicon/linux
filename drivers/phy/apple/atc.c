@@ -1776,7 +1776,7 @@ static int atcphy_auspll_apb_command(struct apple_atcphy *atcphy, u32 command)
 
 	core_clear32(atcphy, AUSPLL_APB_CMD_OVERRIDE, AUSPLL_APB_CMD_OVERRIDE_REQ);
 
-	return 0;
+	return ret;
 }
 
 static int atcphy_dp_configure(struct apple_atcphy *atcphy, enum atcphy_dp_link_rate lr)
@@ -2154,17 +2154,24 @@ static int atc_tunnel_start_t8103(struct apple_atcphy *atcphy, u8 rate)
 	core_set32(atcphy, AUSPLL_CLKOUT_MASTER, AUSPLL_CLKOUT_MASTER_PCLK_DRVR_EN);
 	core_set32(atcphy, AUSPLL_CLKOUT_MASTER, AUSPLL_CLKOUT_MASTER_PCLK2_DRVR_EN);
 	core_set32(atcphy, AUSPLL_CLKOUT_MASTER, AUSPLL_CLKOUT_MASTER_REFBUFCLK_DRVR_EN);
-	atcphy_auspll_apb_command(atcphy, 0);
+	ret = atcphy_auspll_apb_command(atcphy, 0);
+	if (ret)
+		goto err_stop;
 	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_DP_PCLK_STAT, value,
 				 value & ACIOPHY_AUSPLL_LOCK, 10, 10000);
 	if (ret) {
 		dev_err(atcphy->dev, "DP tunnel clock: AUSPLL did not lock\n");
-		atc_tunnel_stop_t8103(atcphy);
-		return ret;
+		goto err_stop;
 	}
-	atcphy_auspll_apb_command(atcphy, 0x2000);
+	ret = atcphy_auspll_apb_command(atcphy, 0x2000);
+	if (ret)
+		goto err_stop;
 	atcphy->tunnel_rate = rate;
 	return 0;
+
+err_stop:
+	atc_tunnel_stop_t8103(atcphy);
+	return ret;
 }
 
 struct atc_tunnel_saved_reg {
