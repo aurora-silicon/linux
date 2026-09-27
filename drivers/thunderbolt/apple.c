@@ -2031,17 +2031,16 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 		return 0;
 
 	/*
-	 * Transitions between different cables without a shutdown inbetween are invalid and can
-	 * only happen when there's a bug inside the Type-C PD driver. If we tried such a
-	 * transition, ACIO would crash and then trigger some watchdog that would reset the entire
-	 * SoC a few seconds later. Shutting down instead only makes the connected device not work
-	 * but we should be able to recover once the next cable is plugged in.
+	 * Changing live cable parameters requires an ACIO shutdown. Report the
+	 * rejected transition so the caller does not cache the new mode as active.
 	 */
 	if (acio->current_cable_info && acio->target_cable_info) {
 		dev_err(acio->dev,
 			"Invalid cable transition from 0x%x to 0x%x, shutting down instead\n",
 			acio->current_cable_info, acio->target_cable_info);
 		acio->target_cable_info = 0;
+		apple_cio_stop(acio);
+		return -EINVAL;
 	}
 
 	/*
