@@ -86,11 +86,16 @@ struct macsmc_power {
 	bool has_ch0i; /* Force discharge (Older firmware) */
 	bool has_ch0c; /* Inhibit charge (Older firmware) */
 	bool has_chte; /* Inhibit charge (Modern firmware) */
-	/*
-	 * Battery critical key is 1 byte and charge key is little endian
-	 * (Modern firmware)
-	 */
+	/* Battery critical key (BCF0) is 1 byte (Modern firmware) */
 	bool fw_ge_27;
+	/*
+	 * Remaining charge key (B0RM) is in native byte order rather than the
+	 * gas gauge's big-endian pass-through. This comes with the 1-byte BCF0
+	 * firmware, but J700 firmware has a native B0RM and a 4-byte BCF0.
+	 */
+	bool b0rm_native;
+	/* Charging with a negative battery current is discharging (J700) */
+	bool status_from_current;
 
 	u8 num_cells;
 	int nominal_voltage_mv;
@@ -200,6 +205,23 @@ static void macsmc_do_dbg(struct macsmc_power *power)
 #undef FD3
 }
 
+/*
+ * The status to report where the SMC flags say the battery is charging. On
+ * J700 a charge-capable adapter can be online while the system draws more
+ * than it supplies, and the battery then drains.
+ */
+static int macsmc_battery_charging_status(struct macsmc_power *power)
+{
+	s16 current_ma;
+
+	if (power->status_from_current &&
+	    !apple_smc_read_s16(power->smc, SMC_KEY(B0AC), &current_ma) &&
+	    current_ma < 0)
+		return POWER_SUPPLY_STATUS_DISCHARGING;
+
+	return POWER_SUPPLY_STATUS_CHARGING;
+}
+
 static int macsmc_battery_get_status(struct macsmc_power *power)
 {
 	u64 nocharge_flags;
@@ -277,11 +299,11 @@ static int macsmc_battery_get_status(struct macsmc_power *power)
 			return POWER_SUPPLY_STATUS_FULL;
 		/* BMS busy shows up as inhibit, but we treat it as charging */
 		else if (nocharge_flags == CHNC_BMS_BUSY && !limited)
-			return POWER_SUPPLY_STATUS_CHARGING;
+			return macsmc_battery_charging_status(power);
 		else if (nocharge_flags)
 			return POWER_SUPPLY_STATUS_NOT_CHARGING;
 		else
-			return POWER_SUPPLY_STATUS_CHARGING;
+			return macsmc_battery_charging_status(power);
 	}
 
 	/* Fallback: System charging flag */
@@ -291,7 +313,7 @@ static int macsmc_battery_get_status(struct macsmc_power *power)
 	if (!flag)
 		return POWER_SUPPLY_STATUS_NOT_CHARGING;
 
-	return POWER_SUPPLY_STATUS_CHARGING;
+	return macsmc_battery_charging_status(power);
 }
 
 static int macsmc_battery_get_charge_behaviour(struct macsmc_power *power)
@@ -421,10 +443,9 @@ static int macsmc_battery_get_capacity_level(struct macsmc_power *power)
 		return POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
 }
 
-static s16 macsmc_swap_b0rm(struct macsmc_power *power, s16 b0rm)
+static u16 macsmc_b0rm_to_mah(struct macsmc_power *power, u16 b0rm)
 {
-	/* B0RM was Big Endian, likely pass through from TI gas gauge */
-	return power->fw_ge_27 ? b0rm : (s16)swab16(b0rm);
+	return power->b0rm_native ? b0rm : swab16(b0rm);
 }
 
 static int macsmc_battery_get_property(struct power_supply *psy,
@@ -521,7 +542,7 @@ static int macsmc_battery_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_NOW:
 		ret = apple_smc_read_u16(power->smc, SMC_KEY(B0RM), &vu16);
-		val->intval = macsmc_swap_b0rm(power, vu16) * 1000;
+		val->intval = macsmc_b0rm_to_mah(power, vu16) * 1000;
 		break;
 	case POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN:
 		ret = apple_smc_read_u16(power->smc, SMC_KEY(B0DC), &vu16);
@@ -533,7 +554,7 @@ static int macsmc_battery_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_ENERGY_NOW:
 		ret = apple_smc_read_u16(power->smc, SMC_KEY(B0RM), &vu16);
-		val->intval = macsmc_swap_b0rm(power, vu16) * power->nominal_voltage_mv;
+		val->intval = macsmc_b0rm_to_mah(power, vu16) * power->nominal_voltage_mv;
 		break;
 	case POWER_SUPPLY_PROP_TEMP:
 		ret = apple_smc_read_u16(power->smc, SMC_KEY(B0AT), &vu16);
@@ -888,13 +909,17 @@ static int macsmc_power_probe(struct platform_device *pdev)
 		/* Extended properties usually present */
 		props[nprops++] = POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW;
 		props[nprops++] = POWER_SUPPLY_PROP_TIME_TO_FULL_NOW;
-		props[nprops++] = POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN;
+		if (apple_smc_key_exists(smc, SMC_KEY(BITV)))
+			props[nprops++] = POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN;
 		props[nprops++] = POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN;
 		props[nprops++] = POWER_SUPPLY_PROP_VOLTAGE_MIN;
 		props[nprops++] = POWER_SUPPLY_PROP_VOLTAGE_MAX;
-		props[nprops++] = POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT;
-		props[nprops++] = POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX;
-		props[nprops++] = POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE;
+		if (apple_smc_key_exists(smc, SMC_KEY(B0RC)))
+			props[nprops++] = POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT;
+		if (apple_smc_key_exists(smc, SMC_KEY(B0RI)))
+			props[nprops++] = POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX;
+		if (apple_smc_key_exists(smc, SMC_KEY(B0RV)))
+			props[nprops++] = POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE;
 		props[nprops++] = POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN;
 		props[nprops++] = POWER_SUPPLY_PROP_CHARGE_FULL;
 		props[nprops++] = POWER_SUPPLY_PROP_CHARGE_NOW;
@@ -924,6 +949,10 @@ static int macsmc_power_probe(struct platform_device *pdev)
 			dev_err(&pdev->dev, "Unexpected BCF0 key size %d\n", info.size);
 			return -EIO;
 		}
+
+		power->b0rm_native = power->fw_ge_27 ||
+				     of_machine_is_compatible("apple,j700");
+		power->status_from_current = of_machine_is_compatible("apple,j700");
 
 		/* Reset "Optimised Battery Charging" flags to default state */
 		if (power->has_chte)

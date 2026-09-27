@@ -17,6 +17,7 @@
 #include <linux/bitfield.h>
 #include <linux/device.h>
 #include <linux/io.h>
+#include <linux/limits.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
@@ -244,6 +245,30 @@ struct apple_sart *devm_apple_sart_get(struct device *dev)
 	return sart;
 }
 EXPORT_SYMBOL_GPL(devm_apple_sart_get);
+
+bool apple_sart_is_inherited_region(struct apple_sart *sart, phys_addr_t paddr,
+				    size_t size)
+{
+	int i;
+
+	if (!size || paddr > PHYS_ADDR_MAX - (size - 1))
+		return false;
+	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++) {
+		phys_addr_t base;
+		size_t length;
+		u8 flags;
+
+		/* Linux never writes protected entries, including during shutdown. */
+		if (!test_bit(i, &sart->protected_entries))
+			continue;
+		sart->ops->get_entry(sart, i, &flags, &base, &length);
+		if (flags == sart->ops->flags_allow && paddr >= base &&
+		    size <= length && paddr - base <= length - size)
+			return true;
+	}
+	return false;
+}
+EXPORT_SYMBOL_GPL(apple_sart_is_inherited_region);
 
 static int sart_set_entry(struct apple_sart *sart, int index, u8 flags,
 			  phys_addr_t paddr, size_t size)

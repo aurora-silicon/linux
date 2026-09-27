@@ -2,7 +2,7 @@
 
 //! Support for Apple ASC Mailbox.
 //!
-//! C header: [`include/linux/soc/apple/mailbox.h`](../../../../include/linux/gpio/driver.h)
+//! C header: [`include/linux/soc/apple/mailbox.h`](../../../../include/linux/soc/apple/mailbox.h)
 
 use crate::{
     bindings,
@@ -72,7 +72,11 @@ impl<T: MailCallback> Mailbox<T> {
         unsafe {
             (*mbox).cookie = ptr;
             (*mbox).rx = Some(mailbox_rx_callback::<T>);
-            to_result(bindings::apple_mbox_start(mbox))?;
+            if let Err(err) = to_result(bindings::apple_mbox_start(mbox)) {
+                (*mbox).rx = None;
+                (*mbox).cookie = core::ptr::null_mut();
+                return Err(err);
+            }
         }
         guard.dismiss();
         Ok(Mailbox {
@@ -80,6 +84,13 @@ impl<T: MailCallback> Mailbox<T> {
             _p: PhantomData,
         })
     }
+    /// The mailbox provider's device (DMA through its own IOMMU stream).
+    pub fn device(&self) -> &device::Device {
+        // SAFETY: `mbox` is a valid pointer for the life of `self` and its
+        // `dev` is the provider's device, which outlives the client.
+        unsafe { device::Device::from_raw((*self.mbox).dev) }
+    }
+
     /// Sends the specified message
     pub fn send(&self, msg: Message, atomic: bool) -> Result<()> {
         // SAFETY: Calling the c function, `mbox` is a valid pointer
@@ -91,8 +102,15 @@ impl<T: MailCallback> Drop for Mailbox<T> {
     fn drop(&mut self) {
         // SAFETY: mbox is a valid pointer
         unsafe { bindings::apple_mbox_stop(self.mbox) };
-        // SAFETY: `cookie` came from `into_foreign`
-        unsafe { T::Data::from_foreign((*self.mbox).cookie.cast()) };
+        // SAFETY: RX is synchronously disabled above, and `cookie` came from
+        // `into_foreign`. Clear the provider-visible callback before freeing
+        // its context so provider removal can never observe a dangling owner.
+        unsafe {
+            let cookie = (*self.mbox).cookie;
+            (*self.mbox).rx = None;
+            (*self.mbox).cookie = core::ptr::null_mut();
+            T::Data::from_foreign(cookie.cast());
+        }
     }
 }
 

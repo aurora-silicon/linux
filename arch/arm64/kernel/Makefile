@@ -37,6 +37,8 @@ obj-y			:= debug-monitors.o entry.o irq.o fpsimd.o		\
 			   cpufeature_impdef.o					\
 			   rsi.o jump_label.o
 
+obj-$(CONFIG_ARCH_APPLE)	+= idle-apple.o
+
 obj-$(CONFIG_COMPAT)			+= sys32.o signal32.o			\
 					   sys_compat.o
 obj-$(CONFIG_COMPAT)			+= sigreturn32.o

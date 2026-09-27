@@ -1,0 +1,246 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/input/apple,dockchannel-hid.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple DockChannel HID transport
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description: |
+  Apple laptops from the M2 generation on connect the built-in keyboard and
+  trackpad to the MTP (multi-touch processor) coprocessor, which exposes them
+  as HID devices over a DockChannel FIFO pair. The coprocessor announces its
+  interfaces by name when it boots. Each interface that the operating system
+  should use has a child node of the same name; announced interfaces without
+  a node are ignored.
+
+  The multi-touch interface may need firmware that the host sends after the
+  coprocessor has booted, followed by a power cycle of the trackpad. Two
+  power methods exist. With power method 1 the coprocessor sequences the
+  trackpad itself and asks the host to pulse a reset line when it needs one.
+  With power method 2 the host announces each power transition to the
+  coprocessor, drives the reset line of the trackpad analog front end (AFE)
+  itself and then confirms the transition.
+
+properties:
+  compatible:
+    const: apple,dockchannel-hid
+
+  reg:
+    minItems: 4
+    maxItems: 4
+    description:
+      Host and remote FIFO configuration and data windows, in the order
+      given by reg-names.
+
+  reg-names:
+    oneOf:
+      - items:
+          - const: config
+          - const: data
+          - const: rmt-config
+          - const: rmt-data
+      - items:
+          - const: rmt-config
+          - const: rmt-data
+          - const: config
+          - const: data
+
+  interrupts:
+    items:
+      - description: Transmit FIFO threshold
+      - description: Receive FIFO threshold
+
+  interrupt-names:
+    items:
+      - const: tx
+      - const: rx
+
+  iommus:
+    maxItems: 1
+
+  apple,fifo-size:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 1
+    description: Capacity in bytes of each DockChannel FIFO.
+
+  apple,helper-cpu:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The RTKit helper node of the coprocessor at the remote end of the FIFO.
+
+  apple,afe-reset-gpios:
+    maxItems: 1
+    description:
+      Reset line of the trackpad analog front end, described with the level
+      that asserts the reset as its active level. With power method 1 the
+      coprocessor asks the host to pulse it. With power method 2 the host
+      asserts it while the multi-touch interface is powered off and releases
+      it when the interface is powered on.
+
+  apple,stm-reset-gpios:
+    maxItems: 1
+    description:
+      Reset line of the STM interface, pulsed on the coprocessor's request.
+
+  apple,no-stm:
+    type: boolean
+    description:
+      The coprocessor firmware has no STM interface. The STM normally reports
+      the machine's USB vendor and product identifiers, keyboard type and
+      serial number before the other interfaces are started; without it the
+      HID devices are registered with the Apple vendor identifier and no
+      product identifier.
+
+  keyboard:
+    type: object
+    additionalProperties: false
+    description: The built-in keyboard.
+
+    properties:
+      hid-country-code:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        maximum: 255
+        description:
+          HID country code of the keyboard, which the coprocessor does not
+          report. The bootloader fills it in from the machine's own device
+          tree.
+
+      apple,keyboard-layout-id:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description:
+          Apple's keyboard layout identifier, exposed to user space through
+          the HID device's apple_layout_id attribute.
+
+  multi-touch:
+    type: object
+    additionalProperties: false
+    description: The built-in trackpad.
+
+    properties:
+      compatible:
+        const: apple,j700-multitouch
+        description:
+          The trackpad sends the report layout of the J700 (MacBook Neo), a
+          32-byte header followed by the contacts and an 8-byte trailer,
+          instead of the 38-byte header layout of the earlier laptops.
+
+      firmware-name:
+        maxItems: 1
+        description:
+          Name of the trackpad firmware that the host sends to the
+          coprocessor when the interface is first opened.
+
+      apple,power-method:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        enum: [1, 2]
+        default: 1
+        description:
+          The power sequencing protocol of the coprocessor firmware, as
+          described above. Power method 2 requires apple,afe-reset-gpios.
+
+  stm:
+    type: object
+    additionalProperties: false
+    description:
+      The system management interface, which reports the machine
+      identifiers.
+
+  actuator:
+    type: object
+    additionalProperties: false
+    description: The trackpad haptic actuator.
+
+  tp_accel:
+    type: object
+    additionalProperties: false
+    description: The trackpad accelerometer.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - interrupt-names
+  - iommus
+  - apple,fifo-size
+  - apple,helper-cpu
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    // MacBook Air (M2, 2022)
+    input@8000 {
+        compatible = "apple,dockchannel-hid";
+        reg = <0x8000 0x4000>,
+              <0xc000 0x4000>,
+              <0x0000 0x4000>,
+              <0x4000 0x4000>;
+        reg-names = "config", "data", "rmt-config", "rmt-data";
+        iommus = <&mtp_dart 1>;
+        interrupts = <2 IRQ_TYPE_LEVEL_HIGH>,
+                     <3 IRQ_TYPE_LEVEL_HIGH>;
+        interrupt-names = "tx", "rx";
+        apple,fifo-size = <0x800>;
+        apple,helper-cpu = <&mtp>;
+        apple,afe-reset-gpios = <&smc_gpio 8 GPIO_ACTIVE_LOW>;
+        apple,stm-reset-gpios = <&smc_gpio 24 GPIO_ACTIVE_LOW>;
+
+        multi-touch {
+            firmware-name = "apple/tpmtfw-j413.bin";
+        };
+
+        keyboard {
+            hid-country-code = <0>;
+            apple,keyboard-layout-id = <0>;
+        };
+
+        stm {
+        };
+
+        actuator {
+        };
+
+        tp_accel {
+        };
+    };
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    // MacBook Neo (J700)
+    input@8000 {
+        compatible = "apple,dockchannel-hid";
+        reg = <0x8000 0x4000>,
+              <0xc000 0x4000>,
+              <0x0000 0x4000>,
+              <0x4000 0x4000>;
+        reg-names = "config", "data", "rmt-config", "rmt-data";
+        iommus = <&mtp_dart 0>;
+        interrupts = <2 IRQ_TYPE_LEVEL_HIGH>,
+                     <3 IRQ_TYPE_LEVEL_HIGH>;
+        interrupt-names = "tx", "rx";
+        apple,fifo-size = <0x800>;
+        apple,helper-cpu = <&mtp>;
+        apple,no-stm;
+        /* SMC pcIO output 19; level 1 asserts the reset */
+        apple,afe-reset-gpios = <&smc_gpio 19 GPIO_ACTIVE_HIGH>;
+
+        multi-touch {
+            compatible = "apple,j700-multitouch";
+            firmware-name = "apple/tpmtfw-j700.bin";
+            apple,power-method = <2>;
+        };
+
+        keyboard {
+            hid-country-code = <0>;
+            apple,keyboard-layout-id = <0>;
+        };
+    };

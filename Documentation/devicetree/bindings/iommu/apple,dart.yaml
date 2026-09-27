@@ -14,7 +14,7 @@ description: |+
   Resolution Table which provides a mandatory layer of address
   translations for various masters.
 
-  Each DART instance is capable of handling up to 16 different streams
+  Depending on the generation, a DART instance handles up to 256 streams
   with individual pagetables and page-level read/write protection flags.
 
   This DART IOMMU also raises interrupts in response to various
@@ -37,6 +37,7 @@ properties:
           - enum:
               - apple,t6020-dart
               - apple,t8122-dart
+              - apple,t8140-dart
           - const: apple,t8110-dart
 
   reg:
@@ -65,8 +66,10 @@ properties:
     minItems: 2
     maxItems: 2
     description: >
-      Inclusive device-visible DMA aperture, encoded as a start address and
-      size. The IOMMU DMA allocator restricts mappings to this range.
+      Device-visible DMA aperture encoded as a base and a nonzero size. The
+      IOMMU DMA allocator restricts mappings to this range; high address bits
+      may select a firmware-visible alias of the translation aperture.
+      A consumer may further specify its own aperture in its binding.
 
   apple,dma-offset:
     $ref: /schemas/types.yaml#/definitions/uint64
@@ -86,6 +89,21 @@ properties:
       List of (register offset, mask, value) tuples copied from Apple's Device
       Tree by the bootloader and required to initialize dynamically powered
       DART instances.
+
+  apple,remap-streams:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    minItems: 1
+    maxItems: 256
+    items:
+      items:
+        - description: Source stream ID, unique within this list.
+          maximum: 255
+        - description: Destination stream ID, which must not itself be remapped.
+          maximum: 15
+    description:
+      T8110 stream remaps. A source uses the destination stream's translation
+      and filtering state without a separate page-table root. Source and
+      destination must differ, and both must exist on the controller.
 
 required:
   - compatible

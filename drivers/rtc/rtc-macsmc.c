@@ -12,6 +12,7 @@
 #include <linux/platform_device.h>
 #include <linux/rtc.h>
 #include <linux/slab.h>
+#include <linux/unaligned.h>
 
 /* 48-bit RTC */
 #define RTC_BYTES 6
@@ -20,12 +21,46 @@
 /* 32768 Hz clock */
 #define RTC_SEC_SHIFT 15
 
+/* Offset kept as a 64-bit little-endian count of whole seconds */
+#define RTC_OFFSET_SECS_BYTES 8
+
 struct macsmc_rtc {
 	struct device *dev;
 	struct apple_smc *smc;
 	struct rtc_device *rtc_dev;
 	struct nvmem_cell *rtc_offset;
+	bool offset_in_seconds;
 };
+
+static int macsmc_rtc_get_time_secs(struct macsmc_rtc *rtc, u64 ctr,
+				    struct rtc_time *tm)
+{
+	void *p_off;
+	size_t len;
+	u64 off;
+
+	p_off = nvmem_cell_read(rtc->rtc_offset, &len);
+	if (IS_ERR(p_off))
+		return PTR_ERR(p_off);
+	if (len < RTC_OFFSET_SECS_BYTES) {
+		kfree(p_off);
+		return -EIO;
+	}
+
+	off = get_unaligned_le64(p_off);
+	kfree(p_off);
+
+	/*
+	 * Nothing has been stored yet: the counter alone is the time since
+	 * the PMU first powered up, not the wall-clock time.
+	 */
+	if (!off)
+		return -EINVAL;
+
+	rtc_time64_to_tm((time64_t)(ctr >> RTC_SEC_SHIFT) + (s64)off, tm);
+
+	return 0;
+}
 
 static int macsmc_rtc_get_time(struct device *dev, struct rtc_time *tm)
 {
@@ -41,6 +76,9 @@ static int macsmc_rtc_get_time(struct device *dev, struct rtc_time *tm)
 		return ret;
 	if (ret != RTC_BYTES)
 		return -EIO;
+
+	if (rtc->offset_in_seconds)
+		return macsmc_rtc_get_time_secs(rtc, ctr, tm);
 
 	p_off = nvmem_cell_read(rtc->rtc_offset, &len);
 	if (IS_ERR(p_off))
@@ -71,6 +109,15 @@ static int macsmc_rtc_set_time(struct device *dev, struct rtc_time *tm)
 		return ret;
 	if (ret != RTC_BYTES)
 		return -EIO;
+
+	if (rtc->offset_in_seconds) {
+		__le64 off_secs;
+
+		/* The counter's fraction of a second carries into the new time */
+		off_secs = cpu_to_le64(rtc_tm_to_time64(tm) - (ctr >> RTC_SEC_SHIFT));
+		ret = nvmem_cell_write(rtc->rtc_offset, &off_secs, sizeof(off_secs));
+		return ret < 0 ? ret : 0;
+	}
 
 	/* This sets the offset such that the set second begins now */
 	off = (rtc_tm_to_time64(tm) << RTC_SEC_SHIFT) - ctr;
@@ -111,9 +158,17 @@ static int macsmc_rtc_probe(struct platform_device *pdev)
 	if (IS_ERR(rtc->rtc_dev))
 		return PTR_ERR(rtc->rtc_dev);
 
+	rtc->offset_in_seconds = of_property_read_bool(pdev->dev.of_node,
+						       "apple,rtc-offset-seconds");
+
 	rtc->rtc_dev->ops = &macsmc_rtc_ops;
-	rtc->rtc_dev->range_min = S64_MIN >> (RTC_SEC_SHIFT + (64 - RTC_BITS));
-	rtc->rtc_dev->range_max = S64_MAX >> (RTC_SEC_SHIFT + (64 - RTC_BITS));
+	if (rtc->offset_in_seconds) {
+		rtc->rtc_dev->range_min = 0;
+		rtc->rtc_dev->range_max = RTC_TIMESTAMP_END_9999;
+	} else {
+		rtc->rtc_dev->range_min = S64_MIN >> (RTC_SEC_SHIFT + (64 - RTC_BITS));
+		rtc->rtc_dev->range_max = S64_MAX >> (RTC_SEC_SHIFT + (64 - RTC_BITS));
+	}
 
 	platform_set_drvdata(pdev, rtc);
 

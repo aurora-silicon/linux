@@ -583,6 +583,10 @@ static const struct usb_device_id usb_quirk_list[] = {
 	/* VLI disk */
 	{ USB_DEVICE(0x2109, 0x0711), .driver_info = USB_QUIRK_NO_LPM },
 
+	/* VIA Labs, Inc. VL122 USB2.0 Hub: claims remote wakeup, never sends it */
+	{ USB_DEVICE(0x2109, 0x2122), .driver_info =
+			USB_QUIRK_IGNORE_REMOTE_WAKEUP },
+
 	/* VIA Labs, Inc. USB2.0 Hub */
 	{ USB_DEVICE(0x2109, 0x2817), .driver_info = USB_QUIRK_NO_LPM },
 

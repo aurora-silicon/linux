@@ -14,3 +14,9 @@ __rust_helper void rust_helper_init_work_with_key(struct work_struct *work,
 	INIT_LIST_HEAD(&work->entry);
 	work->func = func;
 }
+
+__rust_helper struct workqueue_struct *
+rust_helper_alloc_ordered_workqueue(const char *name, unsigned int flags)
+{
+	return alloc_ordered_workqueue("%s", flags, name);
+}

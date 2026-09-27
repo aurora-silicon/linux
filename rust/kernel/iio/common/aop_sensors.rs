@@ -6,7 +6,6 @@
 
 use core::marker::{PhantomData, PhantomPinned};
 use core::ptr;
-use core::sync::atomic::{AtomicU32, Ordering};
 
 use kernel::{
     bindings,
@@ -15,34 +14,55 @@ use kernel::{
     soc::apple::aop::FakehidListener,
     sync::{
         aref::ARef,
+        atomic::{
+            Acquire,
+            Atomic,
+            Relaxed,
+            Release, //
+        },
         Arc, //
     },
     types::ForeignOwnable,
     ThisModule, //
 };
 
-/// TODO: add documentation
-pub trait MessageProcessor {
-    /// TODO: add documentation
-    fn process(&self, message: &[u8]) -> u32;
+/// Micro-units per unit of a channel value.
+pub const MICRO: u64 = 1_000_000;
+
+/// The largest reading that can be stored: both the integer part and the micro part have to fit
+/// the `i32` values IIO reports. Larger readings saturate.
+pub const MAX_MICRO: u64 = i32::MAX as u64 * MICRO + (MICRO - 1);
+
+/// Decodes one fake-HID report of a sensor into the value the IIO channel exposes.
+///
+/// It is called from the AOP driver's receive worker while the IIO device may be read from
+/// another thread, hence `Send + Sync`.
+pub trait MessageProcessor: Send + Sync {
+    /// Returns the reading carried by `message` in micro-units of the channel (millionths of a
+    /// lux, of a degree, ...), or `None` when the message carries no reading.
+    fn process(&self, message: &[u8]) -> Option<u64>;
 }
 
-/// TODO: add documentation
+/// The state shared between a sensor's report listener and its IIO device: the latest reading.
 pub struct AopSensorData<T: MessageProcessor> {
     dev: ARef<device::Device>,
     ty: u32,
-    value: AtomicU32,
+    /// The latest reading in micro-units, at most [`MAX_MICRO`].
+    value: Atomic<u64>,
+    /// Whether a reading has arrived at all; until then reads return `ENODATA`.
+    valid: Atomic<bool>,
     msg_proc: T,
 }
 
 impl<T: MessageProcessor> AopSensorData<T> {
-    /// TODO: add documentation
+    /// Creates the state for one channel of type `ty` whose reports `msg_proc` decodes.
     pub fn new(dev: ARef<device::Device>, ty: u32, msg_proc: T) -> Result<Arc<AopSensorData<T>>> {
         Ok(Arc::new(
             AopSensorData {
                 dev,
                 ty,
-                value: AtomicU32::new(0),
+                value: Atomic::new(0),
+                valid: Atomic::new(false),
                 msg_proc,
             },
             GFP_KERNEL,
@@ -52,34 +72,53 @@ impl<T: MessageProcessor> AopSensorData<T> {
 
 impl<T: MessageProcessor> FakehidListener for AopSensorData<T> {
     fn process_fakehid_report(&self, data: &[u8]) -> Result<()> {
-        self.value
-            .store(self.msg_proc.process(data), Ordering::Relaxed);
+        // A report without a reading leaves the last reading in place.
+        if let Some(value) = self.msg_proc.process(data) {
+            self.value.store(value.min(MAX_MICRO), Relaxed);
+            // Publishes the reading above to readers that see `valid`.
+            self.valid.store(true, Release);
+        }
         Ok(())
     }
 }
 
+/// The `read_raw` callback: processed values are reported with their micro part, raw values as
+/// integers.
 unsafe extern "C" fn aop_read_raw<T: MessageProcessor + 'static>(
     dev: *mut bindings::iio_dev,
     chan: *const bindings::iio_chan_spec,
     val: *mut i32,
-    _: *mut i32,
+    val2: *mut i32,
     mask: isize,
 ) -> i32 {
+    // SAFETY: The IIO core calls this with the device and channel that `IIORegistration::new()`
+    // registered; `priv_` is the `Arc` it stored there.
     let data = unsafe { Arc::<AopSensorData<T>>::borrow((*dev).priv_.cast()) };
+    // SAFETY: `chan` is one of the registered channel specs.
     let ty = unsafe { (*chan).type_ };
-    if mask != bindings::BINDINGS_IIO_CHAN_INFO_PROCESSED as isize
-        && mask != bindings::BINDINGS_IIO_CHAN_INFO_RAW as isize
-    {
-        return EINVAL.to_errno();
-    }
     if data.ty != ty {
         return EINVAL.to_errno();
     }
-    let value = data.value.load(Ordering::Relaxed);
-    unsafe {
-        *val = value as i32;
+    // A sensor that has not reported yet, for instance because it lacks its
+    // calibration, has no reading rather than a reading of zero.
+    if !data.valid.load(Acquire) {
+        return ENODATA.to_errno();
     }
-    bindings::IIO_VAL_INT as i32
+    let micro = data.value.load(Relaxed);
+    // Both parts fit an `i32` because stored readings never exceed `MAX_MICRO`.
+    let (int, frac) = ((micro / MICRO) as i32, (micro % MICRO) as i32);
+    // SAFETY: `val` and `val2` point to the caller's result variables.
+    unsafe {
+        *val = int;
+        *val2 = frac;
+    }
+    if mask == bindings::BINDINGS_IIO_CHAN_INFO_PROCESSED as isize {
+        bindings::IIO_VAL_INT_PLUS_MICRO as i32
+    } else if mask == bindings::BINDINGS_IIO_CHAN_INFO_RAW as isize {
+        bindings::IIO_VAL_INT as i32
+    } else {
+        EINVAL.to_errno()
+    }
 }
 
 struct IIOSpec {
@@ -135,6 +174,9 @@ impl<T: MessageProcessor + 'static> IIORegistration<T> {
             _p: PhantomData,
         };
         this.dev = unsafe { bindings::iio_device_alloc(data.dev.as_raw(), 0) };
+        if this.dev.is_null() {
+            return Err(ENOMEM);
+        }
         unsafe {
             (*this.dev).priv_ = data.clone().into_foreign().cast();
             (*this.dev).name = name.as_ptr() as _;

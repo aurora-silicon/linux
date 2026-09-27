@@ -527,4 +527,24 @@ config LOONGSON2_THERMAL
 	  is higher than the high temperature threshold or lower than the low
 	  temperature threshold, the interrupt will occur.
 
+config APPLE_SMC_CPU_THERMAL
+	bool "Apple J700 SMC CPU thermal policy"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on ARM_APPLE_SOC_CPUFREQ && SENSORS_MACSMC_HWMON
+	depends on CPU_FREQ_THERMAL
+	select THERMAL_GOV_STEP_WISE
+	help
+	  CPU thermal policy for the Apple J700 (T8140). It follows the
+	  hottest of six SMC CPU die sensors, sends both CPU clusters to
+	  their lowest frequency through cpufreq cooling devices above a
+	  passive trip, and holds them there through a frequency QoS
+	  request while the readings are missing, stale or failing, while
+	  the zone is disabled, or above a second, hard threshold.
+
+	  apple-soc-cpufreq only allows T8140 P-states above 2 when this
+	  policy is present. The thresholds are Linux operating policy, not
+	  Apple or silicon limits.
+
+	  Say Y for J700 kernels.
+
 endif

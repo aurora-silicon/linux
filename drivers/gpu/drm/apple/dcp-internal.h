@@ -311,6 +311,8 @@ struct apple_dcp {
 	 */
 	struct mutex tb_lock;
 	bool tb_clock_ok;
+	/* CRTC powered off while the Type-C cable stays attached */
+	bool typec_crtc_off;
 	struct delayed_work typec_reconnect_wq;
 	struct delayed_work typec_fabric_retrain_wq;
 	u32 typec_reconnect_tries;

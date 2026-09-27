@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,dockchannel.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple DockChannel FIFO bus
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description:
+  DockChannel is a set of byte FIFOs between the application processor and a
+  coprocessor. Each channel has a host side and a remote side, each with a
+  configuration window and a data window, and the channels of one block
+  share an interrupt window whose interrupts signal FIFO threshold events.
+  This node maps the interrupt window, translates the channel register
+  windows for its children and is their interrupt controller. Each child
+  describes one function carried over a channel pair.
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t6020-dockchannel
+          - apple,t6030-dockchannel
+          - apple,t6031-dockchannel
+          - apple,t8112-dockchannel
+          - apple,t8122-dockchannel
+          - apple,t8140-dockchannel
+      - const: apple,dockchannel
+
+  reg:
+    maxItems: 1
+
+  reg-names:
+    const: irq
+
+  interrupts:
+    maxItems: 1
+
+  ranges: true
+
+  nonposted-mmio: true
+
+  '#address-cells':
+    const: 1
+
+  '#size-cells':
+    const: 1
+
+  interrupt-controller: true
+
+  '#interrupt-cells':
+    const: 2
+    description:
+      The first cell is the FIFO interrupt number within the block and the
+      second cell the trigger type.
+
+patternProperties:
+  '^input@[0-9a-f]+$':
+    type: object
+    $ref: /schemas/input/apple,dockchannel-hid.yaml#
+    description: A DockChannel HID transport.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - ranges
+  - '#address-cells'
+  - '#size-cells'
+  - interrupt-controller
+  - '#interrupt-cells'
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        mtp_dockchannel: fifo@314b14000 {
+            compatible = "apple,t8140-dockchannel", "apple,dockchannel";
+            reg = <0x3 0x14b14000 0x0 0x4000>;
+            reg-names = "irq";
+            interrupts = <AIC_IRQ 1137 IRQ_TYPE_LEVEL_HIGH>;
+            ranges = <0x0 0x3 0x14b28000 0x20000>;
+            nonposted-mmio;
+            #address-cells = <1>;
+            #size-cells = <1>;
+            interrupt-controller;
+            #interrupt-cells = <2>;
+
+            input@8000 {
+                compatible = "apple,dockchannel-hid";
+                reg = <0x8000 0x4000>,
+                      <0xc000 0x4000>,
+                      <0x0000 0x4000>,
+                      <0x4000 0x4000>;
+                reg-names = "config", "data", "rmt-config", "rmt-data";
+                iommus = <&mtp_dart 0>;
+                interrupt-parent = <&mtp_dockchannel>;
+                interrupts = <2 IRQ_TYPE_LEVEL_HIGH>,
+                             <3 IRQ_TYPE_LEVEL_HIGH>;
+                interrupt-names = "tx", "rx";
+                apple,fifo-size = <0x800>;
+                apple,helper-cpu = <&mtp>;
+            };
+        };
+    };

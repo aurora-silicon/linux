@@ -1550,6 +1550,7 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 
 	if (dcp_is_typec_output(dcp)) {
 		WRITE_ONCE(dcp->typec_cable_connected, false);
+		WRITE_ONCE(dcp->typec_crtc_off, false);
 		cancel_delayed_work(&dcp->typec_reconnect_wq);
 		cancel_delayed_work(&dcp->placeholder_edid_wq);
 	}
@@ -1788,6 +1789,8 @@ void dcp_poweron(struct platform_device *pdev)
 	int ret;
 
 	if (dcp_is_typec_output(dcp)) {
+		WRITE_ONCE(dcp->typec_crtc_off, false);
+
 		/*
 		 * A Type-C CRTC disable releases its DPTX session. Re-establish it
 		 * synchronously before IOMFB is powered back on.
@@ -1833,26 +1836,28 @@ void dcp_poweroff(struct platform_device *pdev)
 	if (dcp->avep)
 		av_service_disconnect(dcp);
 
+	/*
+	 * Powering a Type-C CRTC off drops DCP's synthetic HPD, and the firmware
+	 * reports that as an unplug. The display is still attached: keep the
+	 * connector connected (see dcpep_cb_hotplug()) and let dcp_poweron()
+	 * re-establish the DPTX session. Recreating it here instead makes the
+	 * display vanish and come back, and compositors light a returning
+	 * display, so DPMS off never sticks. Cable removal is reported through
+	 * the Type-C mux.
+	 */
+	if (dcp_is_typec_output(dcp) && READ_ONCE(dcp->typec_cable_connected))
+		WRITE_ONCE(dcp->typec_crtc_off, true);
+
 	_dcp_poweroff(dcp);
 
 	if (dcp_is_typec_output(dcp)) {
-		/*
-		 * DCP owns a synthetic HPD for Type-C. Release it with the CRTC,
-		 * then recreate the session while the cable remains present.
-		 */
+		/* DCP owns a synthetic HPD for Type-C. Release it with the CRTC. */
 		if (dcp->dptxport[0].enabled && dcp->dptxport[0].connected) {
 			ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
 			if (ret)
 				dev_warn(dcp->dev,
 					 "failed to deassert Type-C DPTX HPD: %d\n", ret);
 			dcp_dptx_disconnect(dcp, 0);
-
-			if (READ_ONCE(dcp->typec_cable_connected)) {
-				dcp->typec_reconnect_tries = 0;
-				mod_delayed_work(system_freezable_wq,
-						 &dcp->typec_reconnect_wq,
-						 DPTX_RECONNECT_DELAY);
-			}
 		}
 	} else if (dcp->hdmi_hpd) {
 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);

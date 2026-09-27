@@ -21,6 +21,7 @@
 #include <linux/of.h>
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 
 #include <linux/pinctrl/pinctrl.h>
@@ -373,6 +374,68 @@ static const struct irq_chip apple_gpio_irqchip = {
 
 /* Probe & register */
 
+struct apple_gpio_hw {
+	/*
+	 * The register block contains slots that fault when read, so the regmap
+	 * cannot be cache-initialised by reading it back; access it uncached and
+	 * only within the valid GPIO registers minus gpio-reserved-ranges.
+	 */
+	bool no_regcache;
+};
+
+static const struct apple_gpio_hw apple_gpio_t8140_hw = {
+	.no_regcache = true,
+};
+
+static int apple_gpio_regmap_access(struct device *dev, unsigned int npins,
+				    struct regmap_config *config)
+{
+	struct regmap_access_table *access;
+	struct regmap_range *ranges;
+	unsigned int start, count;
+	int nvalues = 0, i, ret;
+
+	if (!npins || npins > 512)
+		return -EINVAL;
+
+	if (of_property_present(dev->of_node, "gpio-reserved-ranges")) {
+		nvalues = of_property_count_u32_elems(dev->of_node,
+						    "gpio-reserved-ranges");
+		if (nvalues < 0 || nvalues % 2)
+			return -EINVAL;
+	}
+
+	access = devm_kzalloc(dev, sizeof(*access), GFP_KERNEL);
+	ranges = devm_kcalloc(dev, nvalues / 2 + 1, sizeof(*ranges), GFP_KERNEL);
+	if (!access || !ranges)
+		return -ENOMEM;
+
+	ranges[0].range_min = 0;
+	ranges[0].range_max = REG_GPIO(npins - 1);
+	for (i = 0; i < nvalues / 2; i++) {
+		ret = of_property_read_u32_index(dev->of_node, "gpio-reserved-ranges",
+						2 * i, &start);
+		if (ret)
+			return ret;
+		ret = of_property_read_u32_index(dev->of_node, "gpio-reserved-ranges",
+						2 * i + 1, &count);
+		if (ret)
+			return ret;
+		if (!count || start >= npins || count > npins - start)
+			return -EINVAL;
+		ranges[i + 1].range_min = REG_GPIO(start);
+		ranges[i + 1].range_max = REG_GPIO(start + count - 1);
+	}
+	access->yes_ranges = ranges;
+	access->n_yes_ranges = 1;
+	access->no_ranges = ranges + 1;
+	access->n_no_ranges = nvalues / 2;
+	config->rd_table = access;
+	config->wr_table = access;
+	config->max_register = REG_GPIO(npins - 1);
+	return 0;
+}
+
 static int apple_gpio_register(struct apple_gpio_pinctrl *pctl)
 {
 	struct gpio_irq_chip *girq = &pctl->gpio_chip.irq;
@@ -434,6 +497,8 @@ out_free_irq_data:
 static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 {
 	struct apple_gpio_pinctrl *pctl;
+	struct regmap_config pctl_regmap_config = regmap_config;
+	const struct apple_gpio_hw *hw = device_get_match_data(&pdev->dev);
 	struct pinctrl_pin_desc *pins;
 	unsigned int npins;
 	const char **pin_names;
@@ -475,7 +540,16 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 	if (IS_ERR(pctl->base))
 		return PTR_ERR(pctl->base);
 
-	pctl->map = devm_regmap_init_mmio(&pdev->dev, pctl->base, &regmap_config);
+	if (hw && hw->no_regcache) {
+		pctl_regmap_config.cache_type = REGCACHE_NONE;
+		pctl_regmap_config.num_reg_defaults_raw = 0;
+		res = apple_gpio_regmap_access(&pdev->dev, npins, &pctl_regmap_config);
+		if (res)
+			return dev_err_probe(&pdev->dev, res, "invalid GPIO register ranges\n");
+	}
+
+	pctl->map = devm_regmap_init_mmio(&pdev->dev, pctl->base,
+					 &pctl_regmap_config);
 	if (IS_ERR(pctl->map))
 		return dev_err_probe(&pdev->dev, PTR_ERR(pctl->map),
 				     "Failed to create regmap\n");
@@ -522,6 +596,7 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_gpio_pinctrl_of_match[] = {
+	{ .compatible = "apple,t8140-pinctrl", .data = &apple_gpio_t8140_hw },
 	{ .compatible = "apple,t8103-pinctrl", },
 	{ .compatible = "apple,pinctrl", },
 	{ }

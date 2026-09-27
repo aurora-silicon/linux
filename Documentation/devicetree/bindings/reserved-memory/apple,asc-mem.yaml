@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/reserved-memory/apple,asc-mem.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple coprocessor reserved memory
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description:
+  Memory retained for a bootloader-loaded Apple coprocessor, including the
+  ISP firmware heap. The bootloader supplies the physical address and size
+  from its firmware handoff and records any associated device IOVA mappings
+  in iommu-addresses. Static board sources may carry an empty placeholder
+  that is filled before entering the kernel. The region is not a generic
+  allocatable DMA pool and this binding specifies no fixed address or size.
+
+allOf:
+  - $ref: reserved-memory.yaml#
+
+properties:
+  compatible:
+    const: apple,asc-mem
+
+  reg:
+    maxItems: 1
+
+  no-map: true
+
+  iommu-addresses: true
+
+required:
+  - compatible
+  - reg
+
+unevaluatedProperties: false

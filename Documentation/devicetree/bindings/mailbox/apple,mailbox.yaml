@@ -31,9 +31,14 @@ properties:
               - apple,t8103-asc-mailbox
               - apple,t8112-asc-mailbox
               - apple,t8122-asc-mailbox
+              - apple,t8140-asc-mailbox
               - apple,t6000-asc-mailbox
               - apple,t6020-asc-mailbox
           - const: apple,asc-mailbox-v4
+
+      - description:
+          AOP setup-port mailbox with a separate register layout.
+        const: apple,t8140-aop-setup-mailbox
 
       - description:
           An older ASC mailbox interface found on T2 and A11 that is also
@@ -57,24 +62,59 @@ properties:
     maxItems: 1
 
   interrupts:
-    items:
-      - description: send fifo is empty interrupt
-      - description: send fifo is not empty interrupt
-      - description: receive fifo is empty interrupt
-      - description: receive fifo is not empty interrupt
+    minItems: 2
+    maxItems: 4
 
   interrupt-names:
-    items:
-      - const: send-empty
-      - const: send-not-empty
-      - const: recv-empty
-      - const: recv-not-empty
+    minItems: 2
+    maxItems: 4
+
+  iommus:
+    maxItems: 1
+
+  apple,dma-range:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 2
+    maxItems: 2
+    description:
+      Setup-port DMA allocation window, expressed as a base and nonzero size.
+      This identifies host-available slots in the inherited AOP stream root.
 
   "#mbox-cells":
     const: 0
 
   power-domains:
     maxItems: 1
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8140-aop-setup-mailbox
+    then:
+      properties:
+        interrupts:
+          maxItems: 2
+        interrupt-names:
+          items:
+            - const: send-empty
+            - const: recv-not-empty
+      required:
+        - iommus
+        - apple,dma-range
+    else:
+      properties:
+        interrupts:
+          minItems: 4
+        interrupt-names:
+          items:
+            - const: send-empty
+            - const: send-not-empty
+            - const: recv-empty
+            - const: recv-not-empty
+        iommus: false
+        apple,dma-range: false
 
 required:
   - compatible

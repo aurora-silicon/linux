@@ -13,6 +13,7 @@
 #include <linux/moduleparam.h>
 #include <linux/types.h>
 #include <linux/init.h>
+#include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
@@ -787,10 +788,16 @@ EXPORT_SYMBOL_NS_GPL(cs42l42_src_config, "SND_SOC_CS42L42_CORE");
 static int cs42l42_asp_config(struct snd_soc_component *component,
 			      unsigned int sclk, unsigned int sample_rate)
 {
+	struct cs42l42_private *cs42l42 = snd_soc_component_get_drvdata(component);
 	u32 fsync = sclk / sample_rate;
 
-	/* Set up the LRCLK */
-	if (((fsync * sample_rate) != sclk) || ((fsync % 2) != 0)) {
+	/*
+	 * Set up the LRCLK. A 50/50 duty cycle needs an even number of
+	 * SCLKs per frame; a pulse-framed (DSP) link has no such
+	 * constraint and takes a pulse of half the frame, rounded down.
+	 */
+	if ((fsync * sample_rate) != sclk ||
+	    (cs42l42->dai_format != SND_SOC_DAIFMT_DSP_A && (fsync % 2) != 0)) {
 		dev_err(component->dev,
 			"Unsupported sclk %d/sample rate %d\n",
 			sclk,
@@ -827,6 +834,7 @@ static int cs42l42_asp_config(struct snd_soc_component *component,
 static int cs42l42_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 {
 	struct snd_soc_component *component = codec_dai->component;
+	struct cs42l42_private *cs42l42 = snd_soc_component_get_drvdata(component);
 	u32 asp_cfg_val = 0;
 
 	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
@@ -858,9 +866,26 @@ static int cs42l42_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 					      (CS42L42_ASP_FSD_1_0 <<
 						CS42L42_ASP_FSD_SHIFT));
 		break;
+	case SND_SOC_DAIFMT_DSP_A:
+		/*
+		 * Pulse mode, frame starts on the rising edge of LRCLK,
+		 * data delayed by 1.0 SCLKs. Both channels sit in the same
+		 * LRCLK phase, one slot apart; hw_params places them.
+		 */
+		snd_soc_component_update_bits(component,
+					      CS42L42_ASP_FRM_CFG,
+					      CS42L42_ASP_STP_MASK |
+					      CS42L42_ASP_5050_MASK |
+					      CS42L42_ASP_FSD_MASK,
+					      CS42L42_ASP_STP_MASK |
+					      (CS42L42_ASP_FSD_1_0 <<
+						CS42L42_ASP_FSD_SHIFT));
+		break;
 	default:
 		return -EINVAL;
 	}
+
+	cs42l42->dai_format = fmt & SND_SOC_DAIFMT_FORMAT_MASK;
 
 	/* Bitclock/frame inversion */
 	switch (fmt & SND_SOC_DAIFMT_INV_MASK) {
@@ -915,6 +940,7 @@ static int cs42l42_pcm_hw_params(struct snd_pcm_substream *substream,
 	unsigned int width = (params_width(params) / 8) - 1;
 	unsigned int sample_rate = params_rate(params);
 	unsigned int slot_width = 0;
+	unsigned int ch2_bit = 0;
 	unsigned int val = 0;
 	unsigned int bclk;
 	int ret;
@@ -937,16 +963,32 @@ static int cs42l42_pcm_hw_params(struct snd_pcm_substream *substream,
 		bclk = snd_soc_tdm_params_to_bclk(params, slot_width, 0, 2);
 	}
 
+	/*
+	 * In DSP_A both channels share the LRCLK phase and channel 2 starts
+	 * one slot after channel 1. In I2S each channel sits at the start of
+	 * its own LRCLK phase.
+	 */
+	if (cs42l42->dai_format == SND_SOC_DAIFMT_DSP_A)
+		ch2_bit = params_physical_width(params);
+
 	switch (substream->stream) {
 	case SNDRV_PCM_STREAM_CAPTURE:
-		/* channel 2 on high LRCLK */
-		val = CS42L42_ASP_TX_CH2_AP_MASK |
-		      (width << CS42L42_ASP_TX_CH2_RES_SHIFT) |
+		val = (width << CS42L42_ASP_TX_CH2_RES_SHIFT) |
 		      (width << CS42L42_ASP_TX_CH1_RES_SHIFT);
+		/* channel 2 on high LRCLK */
+		if (cs42l42->dai_format != SND_SOC_DAIFMT_DSP_A)
+			val |= CS42L42_ASP_TX_CH2_AP_MASK;
 
 		snd_soc_component_update_bits(component, CS42L42_ASP_TX_CH_AP_RES,
 				CS42L42_ASP_TX_CH1_AP_MASK | CS42L42_ASP_TX_CH2_AP_MASK |
 				CS42L42_ASP_TX_CH2_RES_MASK | CS42L42_ASP_TX_CH1_RES_MASK, val);
+
+		snd_soc_component_write(component, CS42L42_ASP_TX_CH1_BIT_MSB, 0);
+		snd_soc_component_write(component, CS42L42_ASP_TX_CH1_BIT_LSB, 0);
+		snd_soc_component_write(component, CS42L42_ASP_TX_CH2_BIT_MSB,
+					ch2_bit >> 8);
+		snd_soc_component_write(component, CS42L42_ASP_TX_CH2_BIT_LSB,
+					ch2_bit & 0xff);
 		break;
 	case SNDRV_PCM_STREAM_PLAYBACK:
 		val |= width << CS42L42_ASP_RX_CH_RES_SHIFT;
@@ -955,10 +997,18 @@ static int cs42l42_pcm_hw_params(struct snd_pcm_substream *substream,
 							 CS42L42_ASP_RX_CH_AP_MASK |
 							 CS42L42_ASP_RX_CH_RES_MASK, val);
 		/* Channel 2 on high LRCLK */
-		val |= CS42L42_ASP_RX_CH_AP_HI << CS42L42_ASP_RX_CH_AP_SHIFT;
+		if (cs42l42->dai_format != SND_SOC_DAIFMT_DSP_A)
+			val |= CS42L42_ASP_RX_CH_AP_HI << CS42L42_ASP_RX_CH_AP_SHIFT;
 		snd_soc_component_update_bits(component, CS42L42_ASP_RX_DAI0_CH2_AP_RES,
 							 CS42L42_ASP_RX_CH_AP_MASK |
 							 CS42L42_ASP_RX_CH_RES_MASK, val);
+
+		snd_soc_component_write(component, CS42L42_ASP_RX_DAI0_CH1_BIT_MSB, 0);
+		snd_soc_component_write(component, CS42L42_ASP_RX_DAI0_CH1_BIT_LSB, 0);
+		snd_soc_component_write(component, CS42L42_ASP_RX_DAI0_CH2_BIT_MSB,
+					ch2_bit >> 8);
+		snd_soc_component_write(component, CS42L42_ASP_RX_DAI0_CH2_BIT_LSB,
+					ch2_bit & 0xff);
 
 		/* Channel B comes from the last active channel */
 		snd_soc_component_update_bits(component, CS42L42_SP_RX_CH_SEL,
@@ -1256,6 +1306,297 @@ static void cs42l42_manual_hs_type_detect(struct cs42l42_private *cs42l42)
 				(CS42L42_HSDET_COMP2_LVL_DEFAULT << CS42L42_HSDET_COMP2_LVL_SHIFT));
 }
 
+/*
+ * CS42L83 receives Apple headset remote data over the microphone-bias line.
+ * The receiver operates on the internal oscillator, including while audio
+ * is idle. These control values and status bits are specific to CS42L83.
+ */
+
+/* MISC_DET_CTL */
+#define CS42L83_REMOTE_TX_START		BIT(7)
+/* Upper HSBIAS_CTL bit: set for the 2.7 V setting, clear when grounded. */
+#define CS42L83_HSBIAS_CTL_ON		(2 << CS42L42_HSBIAS_CTL_SHIFT)
+
+/* HS_BIAS_CTL: undocumented field cleared before a bias transition */
+#define CS42L83_HS_BIAS_CTL_TRANSITION	GENMASK(3, 2)
+
+/* DET_INT_STATUS1: volume pulses, outside the CS42L42 interrupt masks */
+#define CS42L83_REMOTE_BUTTONS		GENMASK(4, 0)
+#define CS42L83_REMOTE_VOLUME_DOWN	BIT(0)
+#define CS42L83_REMOTE_VOLUME_UP	BIT(1)
+
+/* DET_INT_STATUS2 / DET_INT2_MASK */
+#define CS42L83_REMOTE_RX_ACK		BIT(3)
+#define CS42L83_REMOTE_BUTTON_IRQ	BIT(5)
+
+/* Identifier: three 3-bit symbols in DET_STATUS1[4:0]:DET_STATUS2[7:4] */
+#define CS42L83_REMOTE_ID_LO		GENMASK(7, 4)
+#define CS42L83_REMOTE_ID_HI		GENMASK(4, 0)
+#define CS42L83_REMOTE_ID_SYMBOLS	3
+#define CS42L83_REMOTE_ID_SYMBOL	GENMASK(2, 0)
+
+/* Complete receiver control values; these are not CS42L42 detect modes. */
+#define CS42L83_REMOTE_BIAS_RESET	0x03
+#define CS42L83_REMOTE_BIAS_IDENTIFY	0x9e
+#define CS42L83_REMOTE_BIAS_BUTTONS	0x5f
+#define CS42L83_REMOTE_RX_CONFIG	0x8f
+#define CS42L83_REMOTE_LEVEL_IDENTIFY	0x36
+#define CS42L83_REMOTE_LEVEL_BUTTONS	0x3c
+#define CS42L83_REMOTE_SENSE_TRIP	(3 << CS42L42_HSBIAS_SENSE_TRIP_SHIFT)
+
+#define CS42L83_REMOTE_BIAS_SETTLE_US	10000
+#define CS42L83_REMOTE_SETTLE_MS	35
+#define CS42L83_REMOTE_RX_POLL_US	5000
+#define CS42L83_REMOTE_RX_TIMEOUT_US	500000
+
+static const unsigned int cs42l83_remote_regs[] = {
+	[CS42L83_REMOTE_SAVED_HSBIAS_SC_AUTOCTL] = CS42L42_HSBIAS_SC_AUTOCTL,
+	[CS42L83_REMOTE_SAVED_WAKE_CTL] = CS42L42_WAKE_CTL,
+	[CS42L83_REMOTE_SAVED_MISC_DET_CTL] = CS42L42_MISC_DET_CTL,
+	[CS42L83_REMOTE_SAVED_MIC_DET_CTL1] = CS42L42_MIC_DET_CTL1,
+	[CS42L83_REMOTE_SAVED_MIC_DET_CTL2] = CS42L42_MIC_DET_CTL2,
+	[CS42L83_REMOTE_SAVED_HS_BIAS_CTL] = CS42L42_HS_BIAS_CTL,
+	[CS42L83_REMOTE_SAVED_HSDET_CTL2] = CS42L42_HSDET_CTL2,
+	[CS42L83_REMOTE_SAVED_DET_INT1_MASK] = CS42L42_DET_INT1_MASK,
+	[CS42L83_REMOTE_SAVED_DET_INT2_MASK] = CS42L42_DET_INT2_MASK,
+};
+
+static_assert(ARRAY_SIZE(cs42l83_remote_regs) == CS42L83_REMOTE_NUM_SAVED_REGS);
+
+static void cs42l83_remote_restore_reg(struct cs42l42_private *cs42l42, int i)
+{
+	int ret;
+
+	ret = regmap_write(cs42l42->regmap, cs42l83_remote_regs[i],
+			   cs42l42->remote_saved[i]);
+	if (ret)
+		dev_warn(cs42l42->dev, "Failed to restore headset detection register %#x: %d\n",
+			 cs42l83_remote_regs[i], ret);
+}
+
+/*
+ * Restore the analogue detector. @settle lets the level detector settle
+ * before its button interrupts are unmasked again, for when it stays in use.
+ */
+static void cs42l83_remote_restore(struct cs42l42_private *cs42l42, bool settle)
+{
+	unsigned int int_status;
+	int i;
+
+	/* Nothing reports a release for a held remote button once disabled. */
+	snd_soc_jack_report(cs42l42->jack, 0,
+			    SND_JACK_BTN_0 | SND_JACK_BTN_1 | SND_JACK_BTN_2);
+
+	for (i = 0; i < CS42L83_REMOTE_SAVED_DET_INT1_MASK; i++)
+		cs42l83_remote_restore_reg(cs42l42, i);
+
+	if (settle)
+		msleep(cs42l42->btn_det_init_dbnce);
+
+	/* Discard events latched while the detector was reconfigured. */
+	regmap_read(cs42l42->regmap, CS42L42_DET_INT_STATUS1, &int_status);
+	regmap_read(cs42l42->regmap, CS42L42_DET_INT_STATUS2, &int_status);
+
+	for (; i < CS42L83_REMOTE_NUM_SAVED_REGS; i++)
+		cs42l83_remote_restore_reg(cs42l42, i);
+
+	cs42l42->remote_active = false;
+}
+
+/*
+ * Hold the bias reference during a bias-mode change and allow it to settle
+ * before starting transmission. Apply the TX bit only after the bias bits.
+ */
+static int cs42l83_remote_set_detect(struct cs42l42_private *cs42l42, unsigned int value)
+{
+	unsigned int old;
+	bool changed;
+	int ret;
+
+	ret = regmap_read(cs42l42->regmap, CS42L42_MISC_DET_CTL, &old);
+	if (ret)
+		return ret;
+	changed = (old & CS42L42_HSBIAS_CTL_MASK) != (value & CS42L42_HSBIAS_CTL_MASK);
+	if (changed) {
+		ret = regmap_update_bits(cs42l42->regmap, CS42L42_HS_BIAS_CTL,
+					 CS42L83_HS_BIAS_CTL_TRANSITION, 0);
+		if (ret)
+			return ret;
+		ret = regmap_update_bits(cs42l42->regmap, CS42L42_HSDET_CTL2,
+					 CS42L42_HSBIAS_REF_MASK, CS42L42_HSBIAS_REF_MASK);
+		if (ret)
+			return ret;
+	}
+	ret = regmap_update_bits(cs42l42->regmap, CS42L42_MISC_DET_CTL,
+				 0xff & ~(value & CS42L83_REMOTE_TX_START), value);
+	if (ret)
+		return ret;
+	if ((old ^ value) & CS42L83_HSBIAS_CTL_ON)
+		usleep_range(CS42L83_REMOTE_BIAS_SETTLE_US,
+			     CS42L83_REMOTE_BIAS_SETTLE_US + 1000);
+	if (value & CS42L83_REMOTE_TX_START) {
+		ret = regmap_write(cs42l42->regmap, CS42L42_MISC_DET_CTL, value);
+		if (ret)
+			return ret;
+	}
+	if (changed)
+		return regmap_update_bits(cs42l42->regmap, CS42L42_HSDET_CTL2,
+					  CS42L42_HSBIAS_REF_MASK, 0);
+	return 0;
+}
+
+/* Called with irq_lock held; every attempt is bounded and has analogue fallback. */
+static void cs42l83_remote_start(struct cs42l42_private *cs42l42)
+{
+	static const struct reg_sequence identify[] = {
+		{ CS42L42_DET_INT2_MASK, 0xff },
+		{ CS42L42_HSBIAS_SC_AUTOCTL, CS42L83_REMOTE_SENSE_TRIP },
+		{ CS42L42_WAKE_CTL, CS42L42_M_HP_WAKE_MASK | CS42L42_M_MIC_WAKE_MASK },
+		{ CS42L42_MIC_DET_CTL2, CS42L83_REMOTE_RX_CONFIG },
+	};
+	unsigned int int_status, status1, status2, id;
+	int i, ret;
+
+	if (cs42l42->devid != CS42L83_CHIP_ID ||
+	    (cs42l42->hs_type != CS42L42_PLUG_CTIA &&
+	     cs42l42->hs_type != CS42L42_PLUG_OMTP))
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(cs42l83_remote_regs); i++) {
+		ret = regmap_read(cs42l42->regmap, cs42l83_remote_regs[i],
+				  &cs42l42->remote_saved[i]);
+		if (ret) {
+			dev_dbg(cs42l42->dev, "Failed to save headset detection state: %d\n", ret);
+			return;
+		}
+	}
+
+	ret = regmap_multi_reg_write(cs42l42->regmap, identify, ARRAY_SIZE(identify));
+	if (ret)
+		goto fallback;
+	/* Reset the bias before applying the identification threshold. */
+	ret = cs42l83_remote_set_detect(cs42l42, CS42L83_REMOTE_BIAS_RESET);
+	if (ret)
+		goto fallback;
+	usleep_range(CS42L83_REMOTE_BIAS_SETTLE_US, CS42L83_REMOTE_BIAS_SETTLE_US + 1000);
+	ret = regmap_update_bits(cs42l42->regmap, CS42L42_MIC_DET_CTL1,
+				 CS42L42_HS_DET_LEVEL_MASK, CS42L83_REMOTE_LEVEL_IDENTIFY);
+	if (ret)
+		goto fallback;
+	/* Discard stale sticky events before identification starts. */
+	ret = regmap_read(cs42l42->regmap, CS42L42_DET_INT_STATUS1, &int_status);
+	if (ret)
+		goto fallback;
+	ret = regmap_read(cs42l42->regmap, CS42L42_DET_INT_STATUS2, &int_status);
+	if (ret)
+		goto fallback;
+	/* Start identification after the controlled bias rise. */
+	ret = cs42l83_remote_set_detect(cs42l42, CS42L83_REMOTE_BIAS_IDENTIFY);
+	if (ret)
+		goto fallback;
+
+	/*
+	 * DET_INT_STATUS2 bit 4 signals TX completion, before the remote reply
+	 * is ready. Wait for RX acknowledgment instead, with a bounded timeout.
+	 */
+	msleep(CS42L83_REMOTE_SETTLE_MS);
+	ret = regmap_read_poll_timeout(cs42l42->regmap, CS42L42_DET_INT_STATUS2,
+				       int_status, int_status & CS42L83_REMOTE_RX_ACK,
+				       CS42L83_REMOTE_RX_POLL_US,
+				       CS42L83_REMOTE_RX_TIMEOUT_US);
+	if (ret)
+		goto fallback;
+	ret = regmap_read(cs42l42->regmap, CS42L42_DET_INT_STATUS1, &int_status);
+	if (ret)
+		goto fallback;
+	ret = regmap_read(cs42l42->regmap, CS42L42_DET_STATUS1, &status1);
+	if (ret)
+		goto fallback;
+	ret = regmap_read(cs42l42->regmap, CS42L42_DET_STATUS2, &status2);
+	if (ret)
+		goto fallback;
+	/* A short or an invalid identifier must retain the analogue detector. */
+	if (status2 & CS42L42_SHORT_TRUE_MASK) {
+		ret = -ENODEV;
+		goto fallback;
+	}
+	id = FIELD_GET(CS42L83_REMOTE_ID_LO, status2) |
+	     FIELD_GET(CS42L83_REMOTE_ID_HI, status1) << 4;
+	for (i = 0; i < CS42L83_REMOTE_ID_SYMBOLS; i++) {
+		unsigned int symbol = (id >> (i * 3)) & CS42L83_REMOTE_ID_SYMBOL;
+
+		/* Valid identifier symbols are 1 to 4. */
+		if (symbol < 1 || symbol > 4) {
+			ret = -ENODEV;
+			goto fallback;
+		}
+	}
+
+	/* Use the remote-button threshold only after a valid identification. */
+	ret = regmap_update_bits(cs42l42->regmap, CS42L42_MIC_DET_CTL1,
+				 CS42L42_HS_DET_LEVEL_MASK, CS42L83_REMOTE_LEVEL_BUTTONS);
+	if (ret)
+		goto fallback;
+
+	/* The receiver now decodes remote button pulses autonomously. */
+	ret = cs42l83_remote_set_detect(cs42l42, CS42L83_REMOTE_BIAS_BUTTONS);
+	if (ret)
+		goto fallback;
+	msleep(CS42L83_REMOTE_SETTLE_MS);
+	ret = regmap_write(cs42l42->regmap, CS42L42_HSBIAS_SC_AUTOCTL,
+			   (cs42l42->hs_bias_sense_en << CS42L42_HSBIAS_SENSE_EN_SHIFT) |
+			   CS42L83_REMOTE_SENSE_TRIP);
+	if (ret)
+		goto fallback;
+	/* Discard events latched while switching to button reception. */
+	ret = regmap_read(cs42l42->regmap, CS42L42_DET_INT_STATUS1, &int_status);
+	if (ret)
+		goto fallback;
+	ret = regmap_read(cs42l42->regmap, CS42L42_DET_INT_STATUS2, &int_status);
+	if (ret)
+		goto fallback;
+	ret = regmap_write(cs42l42->regmap, CS42L42_DET_INT1_MASK,
+			   cs42l42->remote_saved[CS42L83_REMOTE_SAVED_DET_INT1_MASK] &
+			   ~(cs42l42->hs_bias_sense_en << CS42L42_HSBIAS_SENSE_SHIFT));
+	if (ret)
+		goto fallback;
+	ret = regmap_write(cs42l42->regmap, CS42L42_DET_INT2_MASK,
+			   0xff & ~(CS42L83_REMOTE_BUTTON_IRQ |
+				    CS42L42_M_SHORT_DET_MASK | CS42L42_M_SHORT_RLS_MASK));
+	if (ret)
+		goto fallback;
+	cs42l42->remote_active = true;
+	dev_dbg(cs42l42->dev, "Apple headset remote enabled\n");
+	return;
+
+fallback:
+	dev_dbg(cs42l42->dev, "Headset remote identification failed: %d\n", ret);
+	cs42l83_remote_restore(cs42l42, true);
+}
+
+static void cs42l83_remote_buttons(struct cs42l42_private *cs42l42,
+				   unsigned int int1, unsigned int int2)
+{
+	unsigned int buttons = 0;
+
+	/* Volume indications are pulses, without a separate release event. */
+	if (int1 & CS42L83_REMOTE_BUTTONS) {
+		if (int1 & CS42L83_REMOTE_VOLUME_DOWN)
+			buttons |= SND_JACK_BTN_2;
+		if (int1 & CS42L83_REMOTE_VOLUME_UP)
+			buttons |= SND_JACK_BTN_1;
+		if (buttons)
+			snd_soc_jack_report(cs42l42->jack, buttons,
+					    SND_JACK_BTN_1 | SND_JACK_BTN_2);
+		snd_soc_jack_report(cs42l42->jack, 0,
+				    SND_JACK_BTN_1 | SND_JACK_BTN_2);
+	}
+	if (int2 & CS42L42_M_SHORT_DET_MASK)
+		snd_soc_jack_report(cs42l42->jack, SND_JACK_BTN_0, SND_JACK_BTN_0);
+	if (int2 & CS42L42_M_SHORT_RLS_MASK)
+		snd_soc_jack_report(cs42l42->jack, 0, SND_JACK_BTN_0);
+}
+
 static void cs42l42_process_hs_type_detect(struct cs42l42_private *cs42l42)
 {
 	unsigned int hs_det_status;
@@ -1397,6 +1738,9 @@ static void cs42l42_process_hs_type_detect(struct cs42l42_private *cs42l42)
 
 static void cs42l42_init_hs_type_detect(struct cs42l42_private *cs42l42)
 {
+	if (cs42l42->remote_active)
+		cs42l83_remote_restore(cs42l42, false);
+
 	/* Mask tip sense interrupts */
 	regmap_update_bits(cs42l42->regmap,
 				CS42L42_TSRS_PLUG_INT_MASK,
@@ -1484,6 +1828,9 @@ static void cs42l42_init_hs_type_detect(struct cs42l42_private *cs42l42)
 
 static void cs42l42_cancel_hs_type_detect(struct cs42l42_private *cs42l42)
 {
+	if (cs42l42->remote_active)
+		cs42l83_remote_restore(cs42l42, false);
+
 	/* Mask button detect interrupts */
 	regmap_update_bits(cs42l42->regmap,
 		CS42L42_DET_INT2_MASK,
@@ -1663,11 +2010,16 @@ irqreturn_t cs42l42_irq_thread(int irq, void *data)
 	struct cs42l42_private *cs42l42 = (struct cs42l42_private *)data;
 	unsigned int stickies[12];
 	unsigned int masks[12];
+	unsigned int raw_remote_buttons = 0;
 	unsigned int current_plug_status;
 	unsigned int current_button_status;
 	unsigned int i;
+	int ret;
 
-	pm_runtime_get_sync(cs42l42->dev);
+	/* The I2C transport never enables runtime PM; treat it as powered. */
+	ret = pm_runtime_get_active(cs42l42->dev, RPM_TRANSPARENT);
+	if (ret < 0)
+		return IRQ_NONE;
 	mutex_lock(&cs42l42->irq_lock);
 	if (cs42l42->suspended || !cs42l42->init_done) {
 		mutex_unlock(&cs42l42->irq_lock);
@@ -1677,10 +2029,18 @@ irqreturn_t cs42l42_irq_thread(int irq, void *data)
 
 	/* Read sticky registers to clear interrupt */
 	for (i = 0; i < ARRAY_SIZE(stickies); i++) {
-		regmap_read(cs42l42->regmap, irq_params_table[i].status_addr,
-				&(stickies[i]));
-		regmap_read(cs42l42->regmap, irq_params_table[i].mask_addr,
-				&(masks[i]));
+		ret = regmap_read(cs42l42->regmap, irq_params_table[i].status_addr,
+				  &stickies[i]);
+		if (ret)
+			goto out_error;
+		ret = regmap_read(cs42l42->regmap, irq_params_table[i].mask_addr,
+				  &masks[i]);
+		if (ret)
+			goto out_error;
+		/* Capture remote volume pulses before the CS42L42 masks drop them. */
+		if (cs42l42->remote_active &&
+		    irq_params_table[i].status_addr == CS42L42_DET_INT_STATUS1)
+			raw_remote_buttons = stickies[i] & CS42L83_REMOTE_BUTTONS;
 		stickies[i] = stickies[i] & (~masks[i]) &
 				irq_params_table[i].mask;
 	}
@@ -1704,6 +2064,17 @@ irqreturn_t cs42l42_irq_thread(int irq, void *data)
 	if ((~masks[5]) & irq_params_table[5].mask) {
 		if (stickies[5] & CS42L42_HSDET_AUTO_DONE_MASK) {
 			cs42l42_process_hs_type_detect(cs42l42);
+			if (cs42l42->devid == CS42L83_CHIP_ID) {
+				cs42l83_remote_start(cs42l42);
+				/*
+				 * Identification toggles the mic bias, so button events
+				 * latched until now are not key presses, even if the
+				 * analogue detector is retained.
+				 */
+				current_button_status = 0;
+				stickies[7] = 0;
+				raw_remote_buttons = 0;
+			}
 			switch (cs42l42->hs_type) {
 			case CS42L42_PLUG_CTIA:
 			case CS42L42_PLUG_OMTP:
@@ -1754,6 +2125,11 @@ irqreturn_t cs42l42_irq_thread(int irq, void *data)
 		}
 	}
 
+	if (cs42l42->remote_active && cs42l42->plug_state == CS42L42_TS_PLUG) {
+		cs42l83_remote_buttons(cs42l42, raw_remote_buttons, stickies[7]);
+		goto out_unlock;
+	}
+
 	/* Check button detect status */
 	if (cs42l42->plug_state == CS42L42_TS_PLUG && ((~masks[7]) & irq_params_table[7].mask)) {
 		if (!(current_button_status &
@@ -1773,10 +2149,17 @@ irqreturn_t cs42l42_irq_thread(int irq, void *data)
 		}
 	}
 
+out_unlock:
 	mutex_unlock(&cs42l42->irq_lock);
 	pm_runtime_put_autosuspend(cs42l42->dev);
 
 	return IRQ_HANDLED;
+
+out_error:
+	mutex_unlock(&cs42l42->irq_lock);
+	pm_runtime_put_autosuspend(cs42l42->dev);
+	dev_err_ratelimited(cs42l42->dev, "Failed to read jack interrupt state: %d\n", ret);
+	return IRQ_NONE;
 }
 EXPORT_SYMBOL_NS_GPL(cs42l42_irq_thread, "SND_SOC_CS42L42_CORE");
 
@@ -2163,6 +2546,8 @@ int cs42l42_suspend(struct device *dev)
 	 * is shared.
 	 */
 	mutex_lock(&cs42l42->irq_lock);
+	if (cs42l42->remote_active)
+		cs42l83_remote_restore(cs42l42, false);
 	cs42l42->suspended = true;
 
 	/* Save register values that will be overwritten by shutdown sequence */
