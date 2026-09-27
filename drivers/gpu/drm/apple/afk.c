@@ -238,12 +238,49 @@ static struct apple_epic_service *afk_epic_find_service(struct apple_dcp_afkep *
     return NULL;
 }
 
+/*
+ * DCP announces a service again on a fresh channel each time a display
+ * reconnects; it never reuses the old channel. Reuse the slot of a
+ * service that was torn down and disabled and has no command pending,
+ * otherwise repeated reconnects fill the table and later services, such
+ * as the one EDID is read through, cannot be registered.
+ */
+static int afk_alloc_service_slot(struct apple_dcp_afkep *ep)
+{
+	struct apple_epic_service *service;
+	unsigned long flags;
+	bool idle;
+	u32 i;
+
+	for (i = 0; i < ep->num_channels; i++) {
+		service = &ep->services[i];
+		if (service->enabled || !service->torndown)
+			continue;
+		spin_lock_irqsave(&service->lock, flags);
+		idle = bitmap_empty(service->cmd_map, MAX_PENDING_CMDS);
+		spin_unlock_irqrestore(&service->lock, flags);
+		if (idle) {
+			dev_dbg(ep->dcp->dev,
+				"AFK[ep:%02x]: reusing slot %u of torn-down channel %u\n",
+				ep->endpoint, i, service->channel);
+			return i;
+		}
+	}
+
+	if (ep->num_channels >= AFK_MAX_CHANNEL)
+		return -ENOSPC;
+
+	spin_lock_init(&ep->services[ep->num_channels].lock);
+	return ep->num_channels++;
+}
+
 static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 				 u8 *payload, size_t payload_size)
 {
 	char name[32];
 	s64 epic_unit = -1;
 	u32 ch_idx;
+	int slot;
 	const char *service_name = name;
 	const char *epic_name = NULL, *epic_class = NULL;
 	const struct apple_epic_service_ops *ops;
@@ -256,12 +293,6 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	if (payload_size < sizeof(name)) {
 		dev_err(ep->dcp->dev, "AFK[ep:%02x]: payload too small: %lx\n",
 			ep->endpoint, payload_size);
-		return;
-	}
-
-	if (ep->num_channels >= AFK_MAX_CHANNEL) {
-		dev_err(ep->dcp->dev, "AFK[ep:%02x]: too many enabled services!\n",
-			ep->endpoint);
 		return;
 	}
 
@@ -312,8 +343,13 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		goto free;
 	}
 
-	ch_idx = ep->num_channels++;
-	spin_lock_init(&ep->services[ch_idx].lock);
+	slot = afk_alloc_service_slot(ep);
+	if (slot < 0) {
+		dev_err(ep->dcp->dev, "AFK[ep:%02x]: too many enabled services!\n",
+			ep->endpoint);
+		goto free;
+	}
+	ch_idx = slot;
 	ep->services[ch_idx].enabled = true;
 	ep->services[ch_idx].torndown = false;
 	ep->services[ch_idx].ops = ops;
@@ -344,6 +380,8 @@ static void afk_recv_handle_teardown(struct apple_dcp_afkep *ep, u32 channel)
 		return;
 	}
 
+	dev_dbg(ep->dcp->dev, "AFK[ep:%02x]: teardown of %s on channel %u\n",
+		ep->endpoint, service->ops->name, channel);
 	afk_remove_service_debugfs(service);
 
 	// TODO: think through what locking is necessary
