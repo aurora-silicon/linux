@@ -97,6 +97,17 @@ impl Config {
         // unlike the firmware virtual references in the IOMapping records.
         objects[HARDWARE_DATA].u64(storage::GPU_REGION_PHYSICAL,firmware.resources.regions[0].base)?;
         Self::initialize_records(&mut objects)?;
+        // Vertex/tessellation loops need not retire a primitive at every
+        // firmware progress poll. The inherited interval of 10 falsely
+        // declares a valid 35.7 ms TA job stuck on J514S. Keep progress
+        // detection enabled, with a finite interval of 100 firmware polls.
+        // This is independent of the host job bound and 60-second watchdog.
+        // RTKit 2419 copies Globals+0x980 into its TA poll threshold at
+        // text+0x6514; text+0xd710 checks it before sampling engine progress.
+        const TA_PROGRESS_INTERVAL: usize = 0x980;
+        if objects[GLOBALS].read_u32(TA_PROGRESS_INTERVAL)? != 10 { return Err(EINVAL); }
+        objects[GLOBALS].u32(TA_PROGRESS_INTERVAL, 100)?;
+        dev_info!(dev.as_ref(), "M3: firmware TA progress-check interval=100\n");
         // RTKit 2419 +2de48..2dec8 accepts user timestamp stores only
         // within the 64 MiB arena at HwDataB+28. Match map_timestamp().
         objects[HARDWARE_DATA].u64(0x28,g16_memory::TIMESTAMP_RANGE.start)?;
