@@ -170,6 +170,8 @@ struct apple_cio {
 	struct delayed_work pcie_tunnel_work;
 	bool pcie_tunnel_requested;
 	bool pcie_tunnel_populated;
+	/* Protected by pcie_tunnel_lock; gates work while the NHI is removed. */
+	bool pcie_tunnel_stopping;
 
 	/*
 	 * Thunderbolt DP tunnel routing, ported from aurora-silicon/linux#8.
@@ -615,7 +617,8 @@ static void apple_cio_pcie_tunnel_work(struct work_struct *work)
 	int ret;
 
 	mutex_lock(&acio->pcie_tunnel_lock);
-	if (!READ_ONCE(acio->pcie_tunnel_requested)) {
+	if (acio->pcie_tunnel_stopping ||
+	    !READ_ONCE(acio->pcie_tunnel_requested)) {
 		mutex_unlock(&acio->pcie_tunnel_lock);
 		return;
 	}
@@ -665,6 +668,10 @@ static int apple_nhi_pci_tunnel_pre_activate(struct tb_nhi *nhi)
 {
 	struct apple_nhi *anhi = nhi_to_anhi(nhi);
 	struct apple_cio *acio = anhi->acio;
+	guard(mutex)(&acio->pcie_tunnel_lock);
+
+	if (acio->pcie_tunnel_stopping)
+		return -ESHUTDOWN;
 
 	/*
 	 * Remember that the PCIe tunnel reached activation. PCIe-C must not be
@@ -678,6 +685,10 @@ static int apple_nhi_pci_tunnel_post_activate(struct tb_nhi *nhi)
 {
 	struct apple_nhi *anhi = nhi_to_anhi(nhi);
 	struct apple_cio *acio = anhi->acio;
+	guard(mutex)(&acio->pcie_tunnel_lock);
+
+	if (acio->pcie_tunnel_stopping)
+		return -ESHUTDOWN;
 
 	/*
 	 * This is the boundary at which the tunnel becomes usable.
@@ -1452,7 +1463,13 @@ static void apple_cio_stop(struct apple_cio *acio)
 	 * After we shut down the ACIO co-processor we will no longer be able to access
 	 * the MMIO space of these so make sure nothing tries to do just that.
 	 */
+	/* Serialize the shutdown gate with activation callbacks before draining
+	 * the worker. No callback may queue a new activation after this point.
+	 */
+	mutex_lock(&acio->pcie_tunnel_lock);
+	acio->pcie_tunnel_stopping = true;
 	WRITE_ONCE(acio->pcie_tunnel_requested, false);
+	mutex_unlock(&acio->pcie_tunnel_lock);
 	cancel_delayed_work_sync(&acio->pcie_tunnel_work);
 	mutex_lock(&acio->pcie_tunnel_lock);
 
@@ -1479,11 +1496,18 @@ static void apple_cio_stop(struct apple_cio *acio)
 	 * PCIe-C has already reset its port and can wedge waiting on dead control
 	 * traffic. The remaining children are still removed in reverse creation
 	 * order below.
+	 *
+	 * Do not hold pcie_tunnel_lock here. Domain removal takes tb->lock
+	 * and drains its workqueue; a concurrent unplug worker holds tb->lock
+	 * while apple_nhi_pci_tunnel_deactivate() takes pcie_tunnel_lock.
+	 * The shutdown gate keeps PCIe activation stopped across this gap.
 	 */
+	mutex_unlock(&acio->pcie_tunnel_lock);
 	nhi_pdev = READ_ONCE(acio->nhi_pdev);
 	if (nhi_pdev)
 		of_platform_device_destroy(&nhi_pdev->dev, NULL);
 
+	mutex_lock(&acio->pcie_tunnel_lock);
 	of_platform_depopulate(acio->dev);
 	acio->pcie_tunnel_populated = false;
 	mutex_unlock(&acio->pcie_tunnel_lock);
@@ -1574,6 +1598,11 @@ static int apple_cio_start(struct apple_cio *acio)
 	}
 
 	apple_tunable_apply(acio->rc_base, acio->rc_tunable);
+
+	/* The previous NHI and all its callbacks are gone before a new start. */
+	mutex_lock(&acio->pcie_tunnel_lock);
+	acio->pcie_tunnel_stopping = false;
+	mutex_unlock(&acio->pcie_tunnel_lock);
 
 	/*
 	 * Bring up devices which are part of ACIO and are now accessible by the main SoC
