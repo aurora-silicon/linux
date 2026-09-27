@@ -37,6 +37,9 @@ struct dcpext_drm {
 	struct apple_dcp *dcp;
 	bool pageflips;
 	u8 *row;
+	/* Damage from the last completed frame; the idle buffer is one older. */
+	struct drm_rect previous_damage;
+	bool damage_valid;
 	/* Owned by the retained scanout, never by the detachable parent device. */
 	atomic_t *terminal_error;
 };
@@ -117,10 +120,13 @@ static void ext_cancel_flip(struct dcpext_drm *ext, struct drm_atomic_state *sta
 	drm_event_cancel_free(&ext->drm, &event->base);
 }
 
-static int ext_copy_frame(struct dcpext_drm *ext, struct drm_plane_state *ps)
+static int ext_copy_frame(struct dcpext_drm *ext, struct drm_plane_state *old,
+			  struct drm_plane_state *ps)
 {
 	struct drm_shadow_plane_state *shadow = to_drm_shadow_plane_state(ps);
 	struct drm_framebuffer *fb = ps->fb;
+	struct drm_rect bounds = DRM_RECT_INIT(0, 0, EXT_WIDTH, EXT_HEIGHT);
+	struct drm_rect damage, copy;
 	struct dcpext_frame frame;
 	int x, y, ret;
 
@@ -131,22 +137,46 @@ static int ext_copy_frame(struct dcpext_drm *ext, struct drm_plane_state *ps)
 		dcpext_scanout_end_frame(ext->dcp, false);
 		return -EINVAL;
 	}
-	/* The idle buffer contains an older frame, so damage alone is insufficient.
-	 * Copy the complete current framebuffer before publishing its address.
+	/* The idle buffer contains frame N-2. Repair both N-1's damage and the
+	 * current damage from the current framebuffer, without touching scanout.
+	 * Invalid history forces two complete copies, initializing both buffers.
 	 */
-	for (y = 0; y < EXT_HEIGHT; y++) {
-		u8 *dst = frame.pixels + (size_t)y * ext->stride;
+	if (!ext->damage_valid)
+		damage = bounds;
+	else if (!drm_atomic_helper_damage_merged(old, ps, &damage) ||
+		 !drm_rect_intersect(&damage, &bounds))
+		damage = (struct drm_rect) { 0 };
+	copy = damage;
+	if (ext->damage_valid && drm_rect_visible(&ext->previous_damage)) {
+		if (!drm_rect_visible(&copy)) {
+			copy = ext->previous_damage;
+		} else {
+			copy.x1 = min(copy.x1, ext->previous_damage.x1);
+			copy.y1 = min(copy.y1, ext->previous_damage.y1);
+			copy.x2 = max(copy.x2, ext->previous_damage.x2);
+			copy.y2 = max(copy.y2, ext->previous_damage.y2);
+		}
+	}
+	for (y = copy.y1; drm_rect_visible(&copy) && y < copy.y2; y++) {
+		size_t offset = (size_t)y * fb->pitches[0] + copy.x1 * 4;
+		size_t bytes = drm_rect_width(&copy) * 4;
+		u8 *dst = frame.pixels + (size_t)y * ext->stride + copy.x1 * 4;
 
-		iosys_map_memcpy_from(ext->row, &shadow->data[0],
-				     (size_t)y * fb->pitches[0], EXT_STRIDE);
-		for (x = 0; x < EXT_WIDTH; x++)
+		iosys_map_memcpy_from(ext->row, &shadow->data[0], offset, bytes);
+		for (x = 0; x < drm_rect_width(&copy); x++)
 			ext->row[x * 4 + 3] = 0xff;
 		/* Convert in cached memory, then stream to coherent scanout memory.
 		 * Byte stores directly to that mapping make full 4K copies costly.
 		 */
-		memcpy(dst, ext->row, EXT_STRIDE);
+		memcpy(dst, ext->row, bytes);
 	}
-	return dcpext_scanout_end_frame(ext->dcp, true);
+	ret = dcpext_scanout_end_frame(ext->dcp, true);
+	/* Ordered atomic commits advance history only after a completed swap. */
+	if (!ret) {
+		ext->previous_damage = damage;
+		ext->damage_valid = true;
+	}
+	return ret;
 }
 
 static void ext_plane_update(struct drm_plane *plane, struct drm_atomic_state *state)
@@ -175,7 +205,7 @@ static void ext_plane_update(struct drm_plane *plane, struct drm_atomic_state *s
 		goto end_access;
 	}
 	if (ext->pageflips) {
-		ret = ext_copy_frame(ext, ps);
+		ret = ext_copy_frame(ext, old, ps);
 		goto exit_device;
 	}
 	drm_atomic_helper_damage_iter_init(&iter, old, ps);
@@ -223,6 +253,7 @@ static void ext_plane_disable(struct drm_plane *plane, struct drm_atomic_state *
 		return;
 	}
 	if (ext->pageflips) {
+		ext->damage_valid = false;
 		ret = dcpext_scanout_begin_frame(ext->dcp, &frame);
 		if (ret) {
 			ext_cancel_flip(ext, state, ret);
