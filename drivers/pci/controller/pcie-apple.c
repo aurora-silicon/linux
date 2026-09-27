@@ -2086,16 +2086,17 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	return 0;
 }
 
-typedef void (*apple_pcie_dart_fn)(struct device *dev);
+typedef int (*apple_pcie_dart_fn)(struct device *dev);
 
-static void apple_pcie_walk_tunnel_darts(struct apple_pcie *pcie, apple_pcie_dart_fn fn)
+static int apple_pcie_walk_tunnel_darts(struct apple_pcie *pcie, apple_pcie_dart_fn fn)
 {
 	struct device_node *parent, *child;
 	struct platform_device *pdev;
+	int ret = 0;
 
 	parent = of_get_parent(pcie->dev->of_node);
 	if (!parent)
-		return;
+		return -ENODEV;
 
 	for_each_available_child_of_node(parent, child) {
 		if (!of_device_is_compatible(child, "apple,t8103-dart") &&
@@ -2106,12 +2107,16 @@ static void apple_pcie_walk_tunnel_darts(struct apple_pcie *pcie, apple_pcie_dar
 
 		pdev = of_find_device_by_node(child);
 		if (pdev) {
-			fn(&pdev->dev);
+			int err = fn(&pdev->dev);
+
+			if (err && !ret)
+				ret = err;
 			put_device(&pdev->dev);
 		}
 	}
 
 	of_node_put(parent);
+	return ret;
 }
 
 int apple_pcie_tunnel_quiesce(struct device *dev)
@@ -2158,7 +2163,7 @@ int apple_pcie_tunnel_quiesce(struct device *dev)
 	 * Removing the IOMMU later resumes it and issues a command. Gate
 	 * those commands before APPCLK goes away with the port.
 	 */
-	apple_pcie_walk_tunnel_darts(pcie, apple_dart_quiesce_commands);
+	ret = apple_pcie_walk_tunnel_darts(pcie, apple_dart_quiesce_commands);
 
 	list_for_each_entry(port, &pcie->ports, entry) {
 		int err;
@@ -2211,7 +2216,9 @@ int apple_pcie_tunnel_restore(struct device *dev)
 		if (ret)
 			return ret;
 	}
-	apple_pcie_walk_tunnel_darts(pcie, apple_dart_resume_commands);
+	ret = apple_pcie_walk_tunnel_darts(pcie, apple_dart_resume_commands);
+	if (ret)
+		return ret;
 
 	pci_lock_rescan_remove();
 	pci_rescan_bus(bridge->bus);

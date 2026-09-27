@@ -2237,7 +2237,7 @@ err_clk_disable:
 	return ret;
 }
 
-void apple_dart_quiesce_commands(struct device *dev)
+int apple_dart_quiesce_commands(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
 
@@ -2246,24 +2246,29 @@ void apple_dart_quiesce_commands(struct device *dev)
 		guard(spinlock_irqsave)(&dart->lock);
 		WRITE_ONCE(dart->commands_gated, true);
 	}
+	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_dart_quiesce_commands);
 
-void apple_dart_resume_commands(struct device *dev)
+int apple_dart_resume_commands(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	int ret;
 
-	if (!dart || !READ_ONCE(dart->commands_gated))
-		return;
+	if (!dart)
+		return -ENODEV;
+	if (!READ_ONCE(dart->commands_gated))
+		return 0;
 
 	scoped_guard(spinlock_irqsave, &dart->lock)
 		WRITE_ONCE(dart->commands_gated, false);
-	ret = pm_runtime_get_sync(dev);
-	if (ret < 0)
-		pm_runtime_put_noidle(dev);
-	else
-		pm_runtime_put(dev);
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0) {
+		apple_dart_quiesce_commands(dev);
+		return ret;
+	}
+	pm_runtime_put(dev);
+	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_dart_resume_commands);
 

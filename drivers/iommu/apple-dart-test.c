@@ -183,11 +183,41 @@ static void apple_dart_test_gated_commands(struct kunit *test)
 	pm_runtime_disable(dart->dev);
 }
 
+static void apple_dart_test_resume_commands_failure(struct kunit *test)
+{
+	struct apple_dart *dart;
+
+	dart = kunit_kzalloc(test, sizeof(*dart), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dart);
+	dart->dev = kunit_device_register(test, "apple-dart-resume-test");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dart->dev);
+	dev_set_drvdata(dart->dev, dart);
+	spin_lock_init(&dart->lock);
+	pm_runtime_set_active(dart->dev);
+	pm_runtime_enable(dart->dev);
+	apple_dart_quiesce_commands(dart->dev);
+
+	/* A prior runtime-PM error must leave commands gated and report failure. */
+	scoped_guard(spinlock_irqsave, &dart->dev->power.lock)
+		dart->dev->power.runtime_error = -EIO;
+	KUNIT_EXPECT_EQ(test, apple_dart_resume_commands(dart->dev), -EINVAL);
+	KUNIT_EXPECT_TRUE(test, dart->commands_gated);
+	KUNIT_EXPECT_EQ(test, atomic_read(&dart->dev->power.usage_count), 0);
+
+	/* Clearing the PM error permits a later retry without leaking a reference. */
+	KUNIT_EXPECT_EQ(test, pm_runtime_set_active(dart->dev), 0);
+	KUNIT_EXPECT_EQ(test, apple_dart_resume_commands(dart->dev), 0);
+	KUNIT_EXPECT_FALSE(test, dart->commands_gated);
+	KUNIT_EXPECT_EQ(test, atomic_read(&dart->dev->power.usage_count), 0);
+	pm_runtime_disable(dart->dev);
+}
+
 static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_before_attach),
 	KUNIT_CASE(apple_dart_test_locked_handoff),
 	KUNIT_CASE(apple_dart_test_firmware_roots),
 	KUNIT_CASE(apple_dart_test_gated_commands),
+	KUNIT_CASE(apple_dart_test_resume_commands_failure),
 	{}
 };
 

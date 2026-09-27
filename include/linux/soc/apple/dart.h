@@ -11,11 +11,11 @@ struct device;
  * before that clock is gated, and allow them again once it is back.
  */
 #if IS_ENABLED(CONFIG_APPLE_DART)
-void apple_dart_quiesce_commands(struct device *dev);
-void apple_dart_resume_commands(struct device *dev);
+int apple_dart_quiesce_commands(struct device *dev);
+int apple_dart_resume_commands(struct device *dev);
 #else
-static inline void apple_dart_quiesce_commands(struct device *dev) { }
-static inline void apple_dart_resume_commands(struct device *dev) { }
+static inline int apple_dart_quiesce_commands(struct device *dev) { return 0; }
+static inline int apple_dart_resume_commands(struct device *dev) { return 0; }
 #endif
 
 #endif
