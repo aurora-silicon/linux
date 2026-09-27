@@ -457,7 +457,7 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 
 		ret = drm_connector_init(drm, &connector->base,
 					 &apple_connector_funcs,
-					 DRM_MODE_CONNECTOR_USB);
+					 DRM_MODE_CONNECTOR_DisplayPort);
 		if (ret) {
 			kfree(connector);
 			return ret;
