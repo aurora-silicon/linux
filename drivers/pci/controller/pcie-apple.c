@@ -247,6 +247,7 @@ struct apple_pcie_port {
 	int			sid_map_sz;
 	int			idx;
 	bool			started;
+	bool			needs_stop;
 };
 
 static void rmw_set(u32 set, void __iomem *addr)
@@ -898,6 +899,66 @@ static int apple_pcie_tunnel_start(struct apple_pcie_port *port)
 	struct apple_pcie *pcie = port->pcie;
 	u32 stat;
 	int i, ret;
+	u32 link_events = BIT(PORT_INT_LINK_UP) | BIT(PORT_INT_LINK_DOWN) |
+			  BIT(PORT_INT_TUNNEL_ERR);
+
+	/* A failed start still owns partially enabled port hardware. */
+	port->needs_stop = true;
+
+	if (pcie->kernel_init && pcie->power_retained) {
+		/*
+		 * M1 requires the same activation sequence after sleep as after
+		 * cable insertion. In particular, release tunneled reset only
+		 * after APPCLK, PERST and the root-port tunables are restored.
+		 */
+		apple_pcie_tunnel_pulse_intr2axi(pcie);
+		apple_pcie_tunnel_apply_tunable(port->base, port->tunable);
+		apple_pcie_port_rmw_set(port, PORT_APPCLK_EN, PORT_APPCLK);
+		usleep_range(10, 20);
+		apple_pcie_port_rmw_set(port, PORT_PERST_OFF,
+					pcie->hw->port_perst);
+		usleep_range(10, 20);
+		ret = read_poll_timeout_atomic(apple_pcie_port_readl, stat,
+					       stat & PORT_STATUS_READY,
+					       10, 250000, false, port, PORT_STATUS);
+		if (ret)
+			return ret;
+		apple_pcie_tunnel_apply_tunable(pcie->cfg->win, pcie->rc_tunable);
+		ret = apple_pcie_tunnel_release_reset(port);
+		if (ret)
+			return ret;
+
+		/*
+		 * LINKSTS can still contain the pre-suspend link-up indication.
+		 * Require a new link-up event, retrying the LTSSM on a transient
+		 * link-down/tunnel-error event, as during M1 tunnel activation.
+		 */
+		for (i = 0; i < 3; i++) {
+			apple_pcie_port_writel(port, link_events, PORT_INTSTAT);
+			apple_pcie_port_writel(port, PORT_LTSSMCTL_START,
+					       PORT_LTSSMCTL);
+			ret = read_poll_timeout_atomic(apple_pcie_port_readl, stat,
+						       stat & link_events,
+						       1000, 500000, false, port,
+						       PORT_INTSTAT);
+			if (!ret && (stat & link_events) == BIT(PORT_INT_LINK_UP) &&
+			    (apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP))
+				break;
+		}
+		if (i == 3) {
+			dev_err(pcie->dev,
+				"port %pOF tunnel link did not restart (events %#x, link %#x)\n",
+				port->np, stat,
+				apple_pcie_port_readl(port, PORT_LINKSTS));
+			return -ETIMEDOUT;
+		}
+		apple_pcie_port_writel(port, link_events, PORT_INTSTAT);
+		/* Allow downstream functions to finish reset before config I/O. */
+		msleep(100);
+		if (!(apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP))
+			return -ENOLINK;
+		goto restored;
+	}
 
 	if (pcie->power_retained) {
 		/*
@@ -967,6 +1028,7 @@ static int apple_pcie_tunnel_start(struct apple_pcie_port *port)
 			port->np);
 		return ret;
 	}
+restored:
 	if (pcie->power_retained)
 		apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
 
@@ -1008,7 +1070,8 @@ static int apple_pcie_tunnel_stop(struct apple_pcie_port *port)
 	u32 stat;
 	int err = 0, ret;
 
-	port->saved_intmask = apple_pcie_port_readl(port, PORT_INTMSK);
+	if (port->started)
+		port->saved_intmask = apple_pcie_port_readl(port, PORT_INTMSK);
 	apple_pcie_port_writel(port, ~0, PORT_INTMSK);
 	apple_pcie_port_writel(port, ~0, PORT_INTSTAT);
 	apple_pcie_port_writel(port, ~0, PORT_LINKCMDSTS);
@@ -1049,7 +1112,10 @@ static int apple_pcie_tunnel_stop(struct apple_pcie_port *port)
 		err = ret;
 
 	apple_pcie_port_rmw_set(port, PORT_TUNCTRL_PERST_ACK_REQ, PORT_TUNCTRL);
+	/* M1 reports an outstanding acknowledgment until ACK_PEND clears. */
 	ret = read_poll_timeout_atomic(apple_pcie_port_readl, stat,
+				       pcie->kernel_init ?
+				       !(stat & PORT_TUNSTAT_PERST_ACK_PEND) :
 				       stat & PORT_TUNSTAT_PERST_ACK_PEND,
 				       1000, 1000000, false, port, PORT_TUNSTAT);
 	if (ret) {
@@ -1069,6 +1135,8 @@ static int apple_pcie_tunnel_stop(struct apple_pcie_port *port)
 	apple_pcie_port_rmw_clear(port, PORT_TUNCTRL_PERST_ACK_REQ,
 				  PORT_TUNCTRL);
 	port->started = false;
+	port->needs_stop = apple_pcie_port_readl(port, PORT_STATUS) &
+			   PORT_STATUS_READY;
 
 	return err;
 }
@@ -1078,7 +1146,7 @@ static void apple_pcie_port_teardown(struct apple_pcie_port *port)
 	if (port->base)
 		apple_pcie_port_writel(port, ~0, PORT_INTMSK);
 
-	if (port->pcie->hw->tunneled && port->started)
+	if (port->pcie->hw->tunneled && (port->started || port->needs_stop))
 		apple_pcie_tunnel_stop(port);
 
 	apple_pcie_port_unregister_irqs(port);
@@ -2082,7 +2150,7 @@ int apple_pcie_tunnel_quiesce(struct device *dev)
 	list_for_each_entry(port, &pcie->ports, entry) {
 		int err;
 
-		if (!port->started)
+		if (!port->started && !port->needs_stop)
 			continue;
 		err = apple_pcie_tunnel_stop(port);
 		if (err && !ret)
@@ -2121,6 +2189,11 @@ int apple_pcie_tunnel_restore(struct device *dev)
 	list_for_each_entry(port, &pcie->ports, entry) {
 		if (port->started)
 			continue;
+		if (port->needs_stop) {
+			ret = apple_pcie_tunnel_stop(port);
+			if (ret)
+				return ret;
+		}
 		ret = apple_pcie_tunnel_start(port);
 		if (ret)
 			return ret;
