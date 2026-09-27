@@ -62,12 +62,13 @@ enum tb_tunnel_state {
  * @allocated_down: Allocated downstream bandwidth (only for USB3)
  * @bw_mode: DP bandwidth allocation mode registers can be used to
  *	     determine consumed and allocated bandwidth
- * @dprx_started: DPRX negotiation was started (tb_dp_dprx_start() was called for it)
+ * @dprx_started: DPRX has an outstanding worker reference and callback
  * @dprx_canceled: Was DPRX capabilities read poll canceled
  * @host_dp_notified: The NHI glue was told this DP tunnel is up (Apple hosts)
  * @dprx_timeout: If set DPRX capabilities read poll work will timeout after this passes
  * @dprx_work: Worker that is scheduled to poll completion of DPRX capabilities read
- * @callback: Optional callback called when DP tunnel is fully activated
+ * @callback: Optional callback called with the domain lock held when DP tunnel
+ *	     activation completes or DPRX is canceled
  * @callback_data: Optional data for @callback
  * @paths: All paths required by the tunnel
  */
@@ -120,6 +121,7 @@ bool tb_tunnel_reserved_pci(struct tb_port *port, int *reserved_up,
 			    int *reserved_down);
 struct tb_tunnel *tb_tunnel_discover_dp(struct tb *tb, struct tb_port *in,
 					bool alloc_hopid);
+void tb_dp_tunnel_cancel_dprx(struct tb_tunnel *tunnel);
 struct tb_tunnel *tb_tunnel_alloc_dp(struct tb *tb, struct tb_port *in,
 				     struct tb_port *out, int link_nr,
 				     int max_up, int max_down,
