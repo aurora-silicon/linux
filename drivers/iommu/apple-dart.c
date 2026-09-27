@@ -260,7 +260,7 @@ struct apple_dart {
 	u32 locked : 1;
 	u32 tunneled : 1;
 	u32 power_retained : 1;
-	u32 commands_gated : 1;
+	bool commands_gated;
 	struct apple_tunable *tunables;
 	u16 version;
 
@@ -663,6 +663,10 @@ apple_dart_t8020_hw_stream_command(struct apple_dart_stream_map *stream_map,
 	u32 command_reg;
 
 	spin_lock_irqsave(&dart->lock, flags);
+	if (dart->commands_gated) {
+		spin_unlock_irqrestore(&dart->lock, flags);
+		return -EHOSTDOWN;
+	}
 
 	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
 		apple_dart_writel(dart, stream_map->sidmap[i],
@@ -697,6 +701,10 @@ apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 	int sid, ret = 0;
 
 	spin_lock_irqsave(&dart->lock, flags);
+	if (dart->commands_gated) {
+		spin_unlock_irqrestore(&dart->lock, flags);
+		return -EHOSTDOWN;
+	}
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
 		u32 val = FIELD_PREP(DART_T8110_TLB_CMD_OP, command) |
 			  FIELD_PREP(DART_T8110_TLB_CMD_STREAM, sid);
@@ -2233,8 +2241,11 @@ void apple_dart_quiesce_commands(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
 
-	if (dart)
-		dart->commands_gated = true;
+	if (dart) {
+		/* Finish any in-flight command before the port clock is stopped. */
+		guard(spinlock_irqsave)(&dart->lock);
+		WRITE_ONCE(dart->commands_gated, true);
+	}
 }
 EXPORT_SYMBOL_GPL(apple_dart_quiesce_commands);
 
@@ -2243,10 +2254,11 @@ void apple_dart_resume_commands(struct device *dev)
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	int ret;
 
-	if (!dart || !dart->commands_gated)
+	if (!dart || !READ_ONCE(dart->commands_gated))
 		return;
 
-	dart->commands_gated = false;
+	scoped_guard(spinlock_irqsave, &dart->lock)
+		WRITE_ONCE(dart->commands_gated, false);
 	ret = pm_runtime_get_sync(dev);
 	if (ret < 0)
 		pm_runtime_put_noidle(dev);
@@ -2264,7 +2276,7 @@ static void apple_dart_remove(struct platform_device *pdev)
 	 * A command issued then never completes. The next probe resets the
 	 * block after that clock is running again.
 	 */
-	if (!dart->locked && !dart->commands_gated)
+	if (!dart->locked && !READ_ONCE(dart->commands_gated))
 		apple_dart_hw_reset(dart);
 
 	free_irq(dart->irq, dart);
@@ -2415,7 +2427,7 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	 * state. Resetting one here is both unnecessary and earlier than Apple's
 	 * force-active call at the end of PCIe-C port resume.
 	 */
-	if (dart->power_retained || dart->commands_gated)
+	if (dart->power_retained || READ_ONCE(dart->commands_gated))
 		return 0;
 
 	/* Locked DARTs can't be restored, and they should not need it */

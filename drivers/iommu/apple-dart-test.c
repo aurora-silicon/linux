@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Included by apple-dart.c to exercise the locked-domain lifecycle. */
+/* Included by apple-dart.c to exercise domain and command lifecycles. */
 #include <kunit/device.h>
 #include <kunit/test.h>
 
@@ -131,10 +131,63 @@ static void apple_dart_test_firmware_roots(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, live[1], 0x4001ULL);
 }
 
+static void apple_dart_test_gated_commands(struct kunit *test)
+{
+	struct apple_dart_stream_map stream = {};
+	struct apple_dart *dart;
+	u32 sentinel = 0x40;
+	int ret;
+
+	dart = kunit_kzalloc(test, sizeof(*dart), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dart);
+	dart->dev = kunit_device_register(test, "apple-dart-gated-test");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dart->dev);
+	dev_set_drvdata(dart->dev, dart);
+	dart->regs = (__force void __iomem *)kunit_kzalloc(test, SZ_16K, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dart->regs);
+	dart->num_streams = 1;
+	dart->pgsize = SZ_16K;
+	dart->version = 0x0202;
+	spin_lock_init(&dart->lock);
+	stream.dart = dart;
+	__set_bit(0, stream.sidmap);
+	pm_runtime_set_active(dart->dev);
+	pm_runtime_enable(dart->dev);
+
+	writel(sentinel, dart->regs + DART_T8020_STREAM_SELECT);
+	writel(sentinel, dart->regs + DART_T8020_STREAM_COMMAND);
+	writel(sentinel, dart->regs + DART_T8110_TLB_CMD);
+	writel(sentinel, dart->regs + DART_T8110_TLB_START);
+	writel(sentinel, dart->regs + DART_T8110_TLB_END);
+	apple_dart_quiesce_commands(dart->dev);
+
+	/* Neither engine may touch its command registers after quiesce. */
+	KUNIT_EXPECT_EQ(test, apple_dart_t8020_hw_invalidate_tlb(&stream), -EHOSTDOWN);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_T8020_STREAM_SELECT), sentinel);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_T8020_STREAM_COMMAND), sentinel);
+	ret = apple_dart_t8110_hw_tlb_command_range(&stream,
+						    DART_T8110_TLB_CMD_OP_FLUSH_SID,
+						    true, 0, SZ_16K - 1);
+	KUNIT_EXPECT_EQ(test, ret, -EHOSTDOWN);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_T8110_TLB_CMD), sentinel);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_T8110_TLB_START), sentinel);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_T8110_TLB_END), sentinel);
+
+	/* A restored port may submit commands again. */
+	apple_dart_resume_commands(dart->dev);
+	KUNIT_EXPECT_EQ(test, apple_dart_t8020_hw_invalidate_tlb(&stream), 0);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_T8020_STREAM_COMMAND),
+			(u32)DART_T8020_STREAM_COMMAND_INVALIDATE);
+	KUNIT_EXPECT_EQ(test, apple_dart_t8110_hw_invalidate_tlb(&stream), 0);
+	KUNIT_EXPECT_NE(test, readl(dart->regs + DART_T8110_TLB_CMD), sentinel);
+	pm_runtime_disable(dart->dev);
+}
+
 static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_before_attach),
 	KUNIT_CASE(apple_dart_test_locked_handoff),
 	KUNIT_CASE(apple_dart_test_firmware_roots),
+	KUNIT_CASE(apple_dart_test_gated_commands),
 	{}
 };
 
