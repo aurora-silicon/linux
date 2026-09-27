@@ -1,0 +1,29 @@
+Apple external-display host checks
+=================================
+
+Run with Python 3 and a C compiler with address/undefined sanitizers:
+
+  python3 tools/testing/selftests/drm/apple/test-afk-replies.py
+  python3 tools/testing/selftests/drm/apple/test-iboot-wire.py
+  python3 tools/testing/selftests/drm/apple/test-dcpext-present.py
+  python3 tools/testing/selftests/drm/apple/test-dcpext-copy.py
+
+These compile the driver's actual functions with host transport/DMA stubs.
+They exercise received-length validation and late-ACK cleanup, packet bounds,
+presentation ordering, failure latching and buffer ownership. They do not
+establish firmware behavior or visual correctness; those need a hardware boot.
+
+The candidate path is opt-in with appledrm.dcpext_pageflip=1 and limited to the
+14.7 firmware UUID checked in dcpext_scanout_register(). It retains two mapped
+buffers, copies a complete opaque frame into the idle one, then sends
+SwapBegin/SetLayer/SwapEnd/SwapWait. The exact Begin ID is passed to Wait;
+successful Wait is required before the old front buffer is reused. The host
+wait is bounded by AFK. Failure retains both buffers and stops presentation.
+Link loss is terminal in this candidate mode, including hotplug bounces after
+startup: replug recovery must first account for an in-flight transaction.
+
+The read-only dcpext_present sysfs attribute reports mode, retained-buffer
+count, completed desktop swaps, front-buffer index and maximum command/wait
+duration in microseconds. Counters are diagnostics, not hardware timestamps.
+DRM still timestamps completion in software after Wait; this is neither a
+vblank interrupt implementation nor zero-copy scanout.

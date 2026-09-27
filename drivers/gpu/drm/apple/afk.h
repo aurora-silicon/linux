@@ -28,6 +28,9 @@ struct epic_cmd_info {
 	dma_addr_t txbuf_dma;
 	size_t rxlen;
 	size_t txlen;
+	/* DMA allocation lengths above stay immutable until buffers are freed. */
+	size_t reply_len;
+	bool reply_len_valid;
 
 	u32 retcode;
 	bool done;
@@ -201,4 +204,12 @@ int afk_send_command(struct apple_epic_service *service, u8 type,
 int afk_service_call(struct apple_epic_service *service, u16 group, u32 command,
 		     const void *data, size_t data_len, size_t data_pad,
 		     void *output, size_t output_len, size_t output_pad);
+/* Strict variants return only firmware-reported bytes; legacy callers unchanged. */
+int afk_send_command_with_reply_len(struct apple_epic_service *service, u8 type,
+		const void *payload, size_t payload_len, void *output,
+		size_t output_len, u32 *retcode, size_t *reply_len);
+int afk_service_call_with_reply_len(struct apple_epic_service *service,
+		u16 group, u32 command, const void *data, size_t data_len,
+		size_t data_pad, void *output, size_t output_len,
+		size_t output_pad, size_t *reply_len);
 #endif

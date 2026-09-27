@@ -21,4 +21,10 @@ int ibootep_present_pattern(struct apple_dcp *dcp, u64 iova, size_t size, u32 st
 /* Allow one more pattern request, for the retained buffer after a hotplug bounce. */
 int ibootep_rearm_pattern(struct apple_dcp *dcp);
 
+/* Submit a retained buffer without changing power/timing. Success follows
+ * SwapWait for this swap, not merely the SetSwapEnd command acknowledgment.
+ * Failure leaves DMA ownership uncertain: retain every submitted buffer.
+ */
+int ibootep_present_frame(struct apple_dcp *dcp, u64 iova, size_t size, u32 stride);
+
 #endif

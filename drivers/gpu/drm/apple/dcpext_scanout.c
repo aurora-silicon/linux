@@ -9,6 +9,8 @@
 #include <linux/io.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/ktime.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_device.h>
@@ -34,6 +36,10 @@
 #define SCANOUT_STRIDE DCPEXT_STRIDE
 #define SCANOUT_IOVA_BASE (1ULL << 40)
 #define SCANOUT_IOVA_SIZE (1ULL << 36)
+
+static bool dcpext_pageflip;
+module_param(dcpext_pageflip, bool, 0444);
+MODULE_PARM_DESC(dcpext_pageflip, "Use two retained external buffers and wait for firmware swap completion");
 
 /*
  * Some docks and monitors drop HPD once shortly after the first mode is set and
@@ -63,6 +69,12 @@ struct dcpext_scanout {
 	void *pixels;
 	dma_addr_t iova;
 	size_t size;
+	size_t frame_size;
+	bool pageflips;
+	unsigned int front;
+	struct mutex present_lock;
+	u64 frames_completed;
+	u64 present_ns_max;
 	size_t mapped;
 	struct sg_table sgt;
 	struct work_struct work;
@@ -83,7 +95,8 @@ struct dcpext_scanout {
 	struct device_attribute attr;
 	struct device_attribute desktop_attr;
 	struct device_attribute status_attr;
-	struct attribute *attrs[4];
+	struct device_attribute present_attr;
+	struct attribute *attrs[5];
 	struct attribute_group attr_group;
 };
 
@@ -101,7 +114,7 @@ static void scanout_fail(struct dcpext_scanout *scanout, int error)
 {
 	if (READ_ONCE(scanout->stopping))
 		return;
-	if (error >= 0)
+	if (error >= 0 || (scanout->pageflips && error == -ENOLINK))
 		error = -EIO;
 	if (!atomic_cmpxchg(&scanout->terminal_error, 0, error))
 		schedule_work(&scanout->invalidate_work);
@@ -145,6 +158,13 @@ void dcpext_scanout_invalidate(struct apple_dcp *dcp)
 	/* Initial unplug remains allowed; only a started scanout owns DMA. */
 	if (!scanout || !atomic_read(&scanout->requested))
 		return;
+	/* Link loss can race a submitted swap. Until recovery also accounts for
+	 * its completion, keep both buffers and require a fresh boot in this mode.
+	 */
+	if (scanout->pageflips) {
+		scanout_fail(scanout, -EIO);
+		return;
+	}
 	/* The desktop reuses the pattern's retained buffer, so the same restore
 	 * covers a bounce before or after desktop registration. */
 	if (smp_load_acquire(&scanout->pattern_ready)) {
@@ -209,7 +229,7 @@ void dcpext_scanout_link_restored(struct apple_dcp *dcp)
 {
 	struct dcpext_scanout *scanout = smp_load_acquire(&dcp->dcpext_scanout);
 
-	if (!scanout || READ_ONCE(scanout->stopping))
+	if (!scanout || scanout->pageflips || READ_ONCE(scanout->stopping))
 		return;
 	if (atomic_cmpxchg(&scanout->bounce, SCANOUT_BOUNCE_PENDING, SCANOUT_BOUNCE_USED) ==
 	    SCANOUT_BOUNCE_PENDING) {
@@ -239,6 +259,77 @@ static bool scanout_link_ready(struct dcpext_scanout *scanout)
 		READ_ONCE(dcp->typec_cable_connected) &&
 		READ_ONCE(dcp->dptxport[0].connected) &&
 		READ_ONCE(dcp->dptxport[0].enabled);
+}
+
+bool dcpext_scanout_pageflips(struct apple_dcp *dcp)
+{
+	/* Pair with publication of the initialized scanout in register(). */
+	struct dcpext_scanout *scanout = smp_load_acquire(&dcp->dcpext_scanout);
+
+	return scanout && scanout->pageflips;
+}
+
+int dcpext_scanout_begin_frame(struct apple_dcp *dcp, struct dcpext_frame *frame)
+{
+	/* Pair with register(); drm_dev_enter() protects the parent lifetime. */
+	struct dcpext_scanout *scanout = smp_load_acquire(&dcp->dcpext_scanout);
+
+	if (!scanout || !scanout->pageflips)
+		return -EOPNOTSUPP;
+	mutex_lock(&scanout->present_lock);
+	/* Observe the buffers/mappings published before pattern_ready. */
+	if (READ_ONCE(scanout->stopping) || !scanout_link_ready(scanout) ||
+	    !smp_load_acquire(&scanout->pattern_ready)) {
+		mutex_unlock(&scanout->present_lock);
+		return -ENOLINK;
+	}
+	frame->pixels = scanout->pixels + (scanout->front ^ 1) * scanout->frame_size;
+	frame->size = scanout->frame_size;
+	return 0;
+}
+
+int dcpext_scanout_end_frame(struct apple_dcp *dcp, bool present)
+{
+	/* Same publication/lifetime protection as begin_frame(). */
+	struct dcpext_scanout *scanout = smp_load_acquire(&dcp->dcpext_scanout);
+	unsigned int next = scanout->front ^ 1;
+	u64 start;
+	int ret = 0;
+
+	lockdep_assert_held(&scanout->present_lock);
+	if (!present)
+		goto out;
+	if (READ_ONCE(scanout->stopping) || !scanout_link_ready(scanout)) {
+		ret = -ENOLINK;
+		goto out;
+	}
+	dma_wmb();
+	start = ktime_get_ns();
+	ret = ibootep_present_frame(dcp, scanout->iova + next * scanout->frame_size,
+				   scanout->frame_size, SCANOUT_STRIDE);
+	if (ret) {
+		/* Even -ENOLINK from a presentation command is uncertain DMA state;
+		 * use a terminal error that the hotplug restore path cannot clear.
+		 */
+		scanout_fail(scanout, -EIO);
+		goto out;
+	}
+	scanout->front = next;
+	scanout->frames_completed++;
+	scanout->present_ns_max = max(scanout->present_ns_max, ktime_get_ns() - start);
+out:
+	mutex_unlock(&scanout->present_lock);
+	return ret;
+}
+
+static ssize_t dcpext_present_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct dcpext_scanout *scanout = container_of(attr, struct dcpext_scanout, present_attr);
+
+	return sysfs_emit(buf, "pageflips=%u buffers=%u completed=%llu front=%u wait_max_us=%llu\n",
+		scanout->pageflips, scanout->pageflips ? 2 : 1,
+		READ_ONCE(scanout->frames_completed), READ_ONCE(scanout->front),
+		READ_ONCE(scanout->present_ns_max) / NSEC_PER_USEC);
 }
 
 static ssize_t dcpext_status_show(struct device *dev, struct device_attribute *attr, char *buf)
@@ -521,7 +612,8 @@ static void dcpext_pattern_work(struct work_struct *work)
 	ret = scanout_create_device(scanout);
 	if (ret)
 		goto fail;
-	scanout->size = ALIGN((size_t)SCANOUT_STRIDE * SCANOUT_HEIGHT, SZ_16K);
+	scanout->frame_size = ALIGN((size_t)SCANOUT_STRIDE * SCANOUT_HEIGHT, SZ_16K);
+	scanout->size = scanout->frame_size * (scanout->pageflips ? 2 : 1);
 	step = "coherent framebuffer allocation";
 	scanout->pixels = dma_alloc_coherent(dev, scanout->size, &scanout->iova, GFP_KERNEL);
 	if (!scanout->pixels) {
@@ -549,7 +641,13 @@ static void dcpext_pattern_work(struct work_struct *work)
 		ret = -ENOLINK;
 		goto fail;
 	}
-	ret = ibootep_present_pattern(scanout->dcp, scanout->iova, scanout->size, SCANOUT_STRIDE);
+	ret = ibootep_present_pattern(scanout->dcp, scanout->iova,
+				     scanout->frame_size, SCANOUT_STRIDE);
+	if (!ret && scanout->pageflips) {
+		step = "initial firmware swap completion";
+		ret = ibootep_present_frame(scanout->dcp, scanout->iova,
+					   scanout->frame_size, SCANOUT_STRIDE);
+	}
 	if (ret)
 		goto fail;
 	if (atomic_read(&scanout->terminal_error)) {
@@ -602,7 +700,7 @@ static void dcpext_desktop_work(struct work_struct *work)
 	if (READ_ONCE(scanout->stopping) || atomic_read(&scanout->terminal_error) ||
 	    !smp_load_acquire(&scanout->pattern_ready))
 		return;
-	ret = dcpext_drm_register(scanout->dcp, scanout->pixels, scanout->size,
+	ret = dcpext_drm_register(scanout->dcp, scanout->pixels, scanout->frame_size,
 				 SCANOUT_STRIDE, &scanout->terminal_error, &scanout->retained_drm);
 	if (ret) {
 		scanout_fail(scanout, ret);
@@ -655,10 +753,15 @@ int dcpext_scanout_register(struct apple_dcp *dcp)
 {
 	struct device_node *node;
 	struct dcpext_scanout *scanout;
+	const char *uuid;
 	int ret;
 
 	if (!dcp->external || dcp->fw_compat != DCP_FIRMWARE_V_14_7)
 		return -ENODEV;
+	if (dcpext_pageflip &&
+	    (of_property_read_string(dcp->dev->of_node, "apple,firmware-uuid", &uuid) ||
+	     strcmp(uuid, "DDF38191-93B3-324A-BC8F-643006F5AC82")))
+		return -EOPNOTSUPP;
 	node = of_get_child_by_name(dcp->dev->of_node, "scanout");
 	if (!scanout_node_verified(node)) {
 		of_node_put(node);
@@ -672,6 +775,8 @@ int dcpext_scanout_register(struct apple_dcp *dcp)
 	scanout->dcp = dcp;
 	scanout->firmware_dev = get_device(dcp->dev);
 	scanout->node = node;
+	scanout->pageflips = dcpext_pageflip;
+	mutex_init(&scanout->present_lock);
 	atomic_set(&scanout->requested, 0);
 	atomic_set(&scanout->terminal_error, 0);
 	INIT_WORK(&scanout->invalidate_work, dcpext_invalidate_work);
@@ -696,6 +801,11 @@ int dcpext_scanout_register(struct apple_dcp *dcp)
 	scanout->status_attr.attr.mode = 0444;
 	scanout->status_attr.show = dcpext_status_show;
 	scanout->attrs[2] = &scanout->status_attr.attr;
+	sysfs_attr_init(&scanout->present_attr.attr);
+	scanout->present_attr.attr.name = "dcpext_present";
+	scanout->present_attr.attr.mode = 0444;
+	scanout->present_attr.show = dcpext_present_show;
+	scanout->attrs[3] = &scanout->present_attr.attr;
 	scanout->attr_group.attrs = scanout->attrs;
 	ret = devm_add_action_or_reset(dcp->dev, dcpext_scanout_cleanup, scanout);
 	if (ret)
