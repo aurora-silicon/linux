@@ -1170,8 +1170,13 @@ static void tb_dp_dprx_work(struct work_struct *work)
 	struct tb_tunnel *tunnel = container_of(work, typeof(*tunnel), dprx_work.work);
 	struct tb *tb = tunnel->tb;
 
+	/* Teardown cancels this worker while holding the domain lock. */
+	if (!mutex_trylock(&tb->lock)) {
+		queue_delayed_work(tb->wq, &tunnel->dprx_work,
+				   msecs_to_jiffies(TB_DPRX_POLL_DELAY));
+		return;
+	}
 	if (!tunnel->dprx_canceled) {
-		mutex_lock(&tb->lock);
 		if (tb_dp_is_usb4(tunnel->src_port->sw) &&
 		    tb_dp_wait_dprx(tunnel, TB_DPRX_WAIT_TIMEOUT)) {
 			if (ktime_before(ktime_get(), tunnel->dprx_timeout)) {
@@ -1189,24 +1194,18 @@ static void tb_dp_dprx_work(struct work_struct *work)
 		} else {
 			tb_tunnel_set_active(tunnel, true);
 		}
-		mutex_unlock(&tb->lock);
 	}
 
+	tunnel->dprx_started = false;
 	if (tunnel->callback)
 		tunnel->callback(tunnel, tunnel->callback_data);
+	/* Paths still reference router ports, so release them before teardown. */
 	tb_tunnel_put(tunnel);
+	mutex_unlock(&tb->lock);
 }
 
 static int tb_dp_dprx_start(struct tb_tunnel *tunnel)
 {
-	/*
-	 * Bump up the reference to keep the tunnel around. It will be
-	 * dropped in tb_dp_dprx_stop() once the tunnel is deactivated.
-	 */
-	tb_tunnel_get(tunnel);
-
-	tunnel->dprx_started = true;
-
 	if (tb_nhi_is_apple(tunnel->tb->nhi)) {
 		tb_tunnel_warn(tunnel,
 			       "Apple: DP tunnel paths up, not waiting for DPRX\n");
@@ -1214,6 +1213,10 @@ static int tb_dp_dprx_start(struct tb_tunnel *tunnel)
 	}
 
 	if (tunnel->callback) {
+		/* The worker or cancellation drops this reference exactly once. */
+		tb_tunnel_get(tunnel);
+		tunnel->dprx_started = true;
+		tunnel->dprx_canceled = false;
 		tunnel->dprx_timeout = dprx_timeout_to_ktime(dprx_timeout);
 		queue_delayed_work(tunnel->tb->wq, &tunnel->dprx_work, 0);
 		return -EINPROGRESS;
@@ -1226,10 +1229,14 @@ static int tb_dp_dprx_start(struct tb_tunnel *tunnel)
 static void tb_dp_dprx_stop(struct tb_tunnel *tunnel)
 {
 	if (tunnel->dprx_started) {
+		lockdep_assert_held(&tunnel->tb->lock);
 		tunnel->dprx_started = false;
 		tunnel->dprx_canceled = true;
-		if (cancel_delayed_work(&tunnel->dprx_work))
-			tb_tunnel_put(tunnel);
+		cancel_delayed_work_sync(&tunnel->dprx_work);
+		/* The callback also owns resources, including its domain reference. */
+		if (tunnel->callback)
+			tunnel->callback(tunnel, tunnel->callback_data);
+		tb_tunnel_put(tunnel);
 	}
 }
 
@@ -1279,6 +1286,7 @@ void tb_dp_tunnel_deactivate_host(struct tb_tunnel *tunnel)
 {
 	const struct tb_nhi_ops *ops;
 
+	tb_dp_dprx_stop(tunnel);
 	if (!tunnel->host_dp_activated)
 		return;
 	tunnel->host_dp_activated = false;
@@ -1320,7 +1328,6 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 		}
 	} else {
 		tb_dp_tunnel_deactivate_host(tunnel);
-		tb_dp_dprx_stop(tunnel);
 		tb_dp_port_hpd_clear(tunnel->src_port);
 		tb_dp_port_set_hops(tunnel->src_port, 0, 0, 0);
 		if (tb_port_is_dpout(tunnel->dst_port))
@@ -1978,7 +1985,8 @@ err_free:
  * after tb_tunnel_activate() once the tunnel has been fully activated.
  * It can call tb_tunnel_is_active() to check if activation was
  * successful (or if it returns %false there was some sort of issue).
- * The @callback is called without @tb->lock held.
+ * The @callback is called with @tb->lock held. If DPRX was canceled, it
+ * must release its private resources without accessing the tunnel's ports.
  *
  * Return: Pointer to @struct tb_tunnel or %NULL in case of failure.
  */

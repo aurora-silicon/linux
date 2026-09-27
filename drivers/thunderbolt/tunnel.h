@@ -62,7 +62,7 @@ enum tb_tunnel_state {
  * @allocated_down: Allocated downstream bandwidth (only for USB3)
  * @bw_mode: DP bandwidth allocation mode registers can be used to
  *	     determine consumed and allocated bandwidth
- * @dprx_started: DPRX negotiation was started (tb_dp_dprx_start() was called for it)
+ * @dprx_started: DPRX has an outstanding worker reference and callback
  * @dprx_canceled: Was DPRX capabilities read poll canceled
  * @host_dp_notified: The NHI glue was told this DP tunnel is up (Apple hosts)
  * @host_dp_activated: The NHI post-activation hook owns display-side state

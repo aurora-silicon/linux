@@ -1975,7 +1975,9 @@ static void tb_dp_tunnel_active(struct tb_tunnel *tunnel, void *data)
 	struct tb_port *out = tunnel->dst_port;
 	struct tb *tb = data;
 
-	mutex_lock(&tb->lock);
+	lockdep_assert_held(&tb->lock);
+	if (tunnel->dprx_canceled)
+		goto out;
 	if (tb_tunnel_is_active(tunnel)) {
 		int consumed_up, consumed_down, ret;
 
@@ -2022,8 +2024,7 @@ static void tb_dp_tunnel_active(struct tb_tunnel *tunnel, void *data)
 		tb_dp_resource_unavailable(tb, in,
 					   "DPRX negotiation failed");
 	}
-	mutex_unlock(&tb->lock);
-
+out:
 	tb_domain_put(tb);
 }
 
