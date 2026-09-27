@@ -2262,10 +2262,10 @@ static int atc_tunnel_start_t602x(struct apple_atcphy *atcphy, u8 rate)
 		return -EINVAL;
 	}
 	if (atcphy->tunnel_saved) {
-		if (atcphy->tunnel_rate != rate)
-			dev_info(atcphy->dev, "USB4 tunnel clock busy: active rate=0x%x requested=0x%x\n",
-				 atcphy->tunnel_rate, rate);
-		return atcphy->tunnel_rate == rate ? 0 : -EBUSY;
+		if (atcphy->tunnel_rate == rate)
+			return 0;
+		/* A retrain may change rate without first requesting rate zero. */
+		atc_tunnel_restore(atcphy);
 	}
 	if (atcphy->tunnel_attempted)
 		return -EALREADY;
