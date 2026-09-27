@@ -37,6 +37,10 @@ impl Inner {
     /// behind a device that still reports itself healthy.
     fn fail(&mut self, index: usize, vm: &mmu::Vm) {
         self.state.health.mark_failed();
+        #[cfg(CONFIG_DEV_COREDUMP)]
+        if let Err(e) = self.config.fault_snapshot(&self.drm) {
+            dev_err!(self.drm.as_ref(), "M3 fault snapshot failed: {:?}\n", e);
+        }
         let events=self.state.event_messages.load(Ordering::Acquire);
         if let Err(e) = self.jobs[index].log(&self.drm) {
             dev_err!(self.drm.as_ref(), "M3 job diagnostics failed: {:?}\n", e);

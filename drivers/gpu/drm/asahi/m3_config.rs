@@ -52,6 +52,28 @@ pub(crate) struct Config {
     thermal: crate::m3_thermal::Governor,
 }
 impl Config {
+    /// Snapshot owned RAM only. Firmware can still update these buffers;
+    /// per-record time intervals explicitly describe sequential observations.
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    pub(crate) fn fault_snapshot(&mut self, dev: &driver::AsahiDevice) -> Result {
+        let mut dump = crate::g16_fault::Dump::new_m3()?;
+        for (name, index) in [
+            ("root", storage::ROOT), ("runtime", RUNTIME_POINTERS),
+            ("hardware", HARDWARE_DATA), ("globals", GLOBALS),
+            ("control", CONTROL_REGION), ("flags", RUNTIME_FLAGS),
+            ("event-state", storage::EVENT * 2),
+            ("event-ring", storage::EVENT * 2 + 1),
+            ("fwlog-state", storage::FIRMWARE_LOG * 2),
+            ("fwlog-ring", storage::FIRMWARE_LOG * 2 + 1),
+            ("trace-state", storage::TRACE * 2),
+            ("trace-ring", storage::TRACE * 2 + 1),
+        ] {
+            let buffer = &mut self.objects[index];
+            dump.record(name, buffer.va(), buffer.size(), |out| buffer.read(0, out))?;
+        }
+        dump.publish(dev.as_ref())
+    }
+
     pub(crate) fn new(dev: &driver::AsahiDevice, uat: &mmu::Uat, firmware: &crate::m3_firmware::Firmware,
         contents: &crate::m3_adt_config::Contents) -> Result<Self> {
         contents.check_for_upload()?;
