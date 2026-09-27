@@ -8,6 +8,7 @@
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
 #include <linux/rwsem.h>
+#include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
@@ -196,7 +197,7 @@ dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
 	} __attribute__((packed)) *hdr;
 	static_assert(sizeof(*hdr) == 48);
 	size_t bfr_len = output_maxsize + sizeof(*hdr);
-	void *bfr;
+	void *bfr __free(kfree) = NULL;
 	int ret;
 
 	bfr = kzalloc(bfr_len, GFP_KERNEL);
