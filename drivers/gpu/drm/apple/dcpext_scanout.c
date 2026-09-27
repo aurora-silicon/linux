@@ -39,7 +39,14 @@
  * Some docks and monitors drop HPD once shortly after the first mode is set and
  * bring it back within a second or two. Tolerate exactly one such bounce after
  * the first pattern: hold the retained buffer, wait for the link to return, and
- * send the pattern commands again. Anything else still latches a terminal error.
+ * send the pattern commands again.
+ *
+ * A link loss that outlasts the bounce (the dock was unplugged) parks the
+ * scanout: it latches -ENOLINK, so the desktop sees a disconnect, but the
+ * retained buffer and the firmware session stay as they were. When a dock
+ * brings the link back, the pattern commands are sent again exactly as after a
+ * bounce, and the new link gets its own bounce allowance. Any other error, or a
+ * link loss before the first pattern was accepted, is terminal until reboot.
  */
 #define SCANOUT_BOUNCE_GRACE_MS 10000
 #define SCANOUT_REPATTERN_DELAY_MS 1500
@@ -70,6 +77,7 @@ struct dcpext_scanout {
 	atomic_t bounce; /* SCANOUT_BOUNCE_* */
 	struct delayed_work bounce_work;
 	struct delayed_work repattern_work;
+	bool reattached; /* the desktop saw a disconnect before this restore */
 	bool stopping;
 	bool published; /* Firmware callbacks may retain this object until reboot. */
 	struct device_attribute attr;
@@ -106,11 +114,20 @@ bool dcpext_scanout_requested(struct apple_dcp *dcp)
 	return scanout && atomic_read(&scanout->requested);
 }
 
+/* Unplugged after the first pattern: the link is gone, nothing else is lost. */
+static bool scanout_parked(struct dcpext_scanout *scanout)
+{
+	return atomic_read(&scanout->terminal_error) == -ENOLINK &&
+	       smp_load_acquire(&scanout->pattern_ready);
+}
+
+/* True when the scanout can never be used again. A parked scanout is not: the
+ * next dock may route a tunnel and bring its link up to restore it. */
 bool dcpext_scanout_terminal(struct apple_dcp *dcp)
 {
 	struct dcpext_scanout *scanout = smp_load_acquire(&dcp->dcpext_scanout);
 
-	return scanout && atomic_read(&scanout->terminal_error);
+	return scanout && atomic_read(&scanout->terminal_error) && !scanout_parked(scanout);
 }
 
 void dcpext_scanout_fault(struct apple_dcp *dcp, int error)
@@ -143,6 +160,8 @@ void dcpext_scanout_invalidate(struct apple_dcp *dcp)
 		 * before reconnecting it; that is still the same bounce. */
 		if (prev == SCANOUT_BOUNCE_PENDING)
 			return;
+		if (!atomic_read(&scanout->terminal_error))
+			dev_info(scanout->firmware_dev, "external link lost again; scanout parked until a dock brings it back\n");
 	}
 	scanout_fail(scanout, -ENOLINK);
 }
@@ -155,7 +174,8 @@ static void dcpext_bounce_timeout(struct work_struct *work)
 	if (atomic_cmpxchg(&scanout->bounce, SCANOUT_BOUNCE_PENDING, SCANOUT_BOUNCE_USED) !=
 	    SCANOUT_BOUNCE_PENDING)
 		return;
-	dev_err(scanout->firmware_dev, "external link did not return within %u ms\n", SCANOUT_BOUNCE_GRACE_MS);
+	dev_info(scanout->firmware_dev, "external link did not return within %u ms; scanout parked until a dock brings it back\n",
+		 SCANOUT_BOUNCE_GRACE_MS);
 	scanout_fail(scanout, -ENOLINK);
 }
 
@@ -176,6 +196,11 @@ static void dcpext_repattern_work(struct work_struct *work)
 			ret);
 		return;
 	}
+	if (xchg(&scanout->reattached, false)) {
+		dev_info(scanout->firmware_dev, "external pattern restored after an unplug\n");
+		schedule_work(&scanout->invalidate_work);
+		return;
+	}
 	dev_info(scanout->firmware_dev, "external pattern restored after one hotplug bounce\n");
 }
 
@@ -184,11 +209,22 @@ void dcpext_scanout_link_restored(struct apple_dcp *dcp)
 {
 	struct dcpext_scanout *scanout = smp_load_acquire(&dcp->dcpext_scanout);
 
-	if (!scanout || atomic_cmpxchg(&scanout->bounce, SCANOUT_BOUNCE_PENDING, SCANOUT_BOUNCE_USED) !=
-				SCANOUT_BOUNCE_PENDING)
+	if (!scanout || READ_ONCE(scanout->stopping))
 		return;
-	cancel_delayed_work(&scanout->bounce_work);
-	dev_info(scanout->firmware_dev, "external link returned; sending the pattern commands again\n");
+	if (atomic_cmpxchg(&scanout->bounce, SCANOUT_BOUNCE_PENDING, SCANOUT_BOUNCE_USED) ==
+	    SCANOUT_BOUNCE_PENDING) {
+		cancel_delayed_work(&scanout->bounce_work);
+		dev_info(scanout->firmware_dev, "external link returned; sending the pattern commands again\n");
+	} else if (scanout_parked(scanout) &&
+		   atomic_cmpxchg(&scanout->terminal_error, -ENOLINK, 0) == -ENOLINK) {
+		/* The desktop only copies into the retained buffer, so it may see
+		 * the connector again before the pattern commands go out. */
+		atomic_set(&scanout->bounce, SCANOUT_BOUNCE_NONE);
+		WRITE_ONCE(scanout->reattached, true);
+		dev_info(scanout->firmware_dev, "external link up again after an unplug; sending the pattern commands again\n");
+	} else {
+		return;
+	}
 	queue_delayed_work(system_unbound_wq, &scanout->repattern_work,
 			   msecs_to_jiffies(SCANOUT_REPATTERN_DELAY_MS));
 }
@@ -216,7 +252,8 @@ static ssize_t dcpext_status_show(struct device *dev, struct device_attribute *a
 	bool fw_ready = !READ_ONCE(scanout->dcp->crashed) && scanout->dcp->rtk && apple_rtkit_is_running(scanout->dcp->rtk) &&
 		ibootep_is_ready(scanout->dcp) &&
 		smp_load_acquire(&scanout->dcp->dptxport[0].enabled);
-	const char *phase = error ? "terminal" : registered ? "desktop_registered" :
+	const char *phase = error == -ENOLINK && ready ? "parked" : error ? "terminal" :
+		registered ? "desktop_registered" :
 		desktop_requested ? "desktop_pending" : ready ? "pattern_ready" :
 		requested ? "pattern_pending" : "ready";
 
