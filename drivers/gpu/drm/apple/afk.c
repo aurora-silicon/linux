@@ -104,6 +104,10 @@ void afk_shutdown(struct apple_dcp_afkep *afkep)
 	afkep->stopping = true;
 	spin_unlock_irqrestore(&afkep->lock, flags);
 	destroy_workqueue(afkep->wq);
+	if (afkep->rx_scratch) {
+		devm_kfree(afkep->dcp->dev, afkep->rx_scratch);
+		afkep->rx_scratch = NULL;
+	}
 }
 
 int afk_start(struct apple_dcp_afkep *ep)
@@ -193,6 +197,17 @@ static void afk_init_rxtx(struct apple_dcp_afkep *ep, u64 message,
 			"AFK[ep:%02x]: ring buffer size 0x%x != expected 0x%lx\n",
 			ep->endpoint, bufsz, sizeof(*bfr->hdr));
 		return;
+	}
+	if (bufsz < BIT(BLOCK_SHIFT)) {
+		dev_err(ep->dcp->dev, "AFK[ep:%02x]: ring cannot hold an entry\n",
+			ep->endpoint);
+		return;
+	}
+	if (bfr == &ep->rxbfr) {
+		/* Receive dispatch cannot recurse on the ordered endpoint queue. */
+		ep->rx_scratch = devm_kmalloc(ep->dcp->dev, bufsz, GFP_KERNEL);
+		if (!ep->rx_scratch)
+			return;
 	}
 
 	bfr->buf = bfr->hdr + 1;
@@ -606,7 +621,6 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 static bool afk_recv(struct apple_dcp_afkep *ep)
 {
 	struct afk_qe *hdr;
-	u8 *data;
 	u32 rptr, wptr;
 	u32 magic, size, channel, type;
 
@@ -677,9 +691,7 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 	 * sleep and send replies, so retain a private copy before allowing
 	 * the producer to reuse the ring storage.
 	 */
-	data = kmemdup(hdr->data, size, GFP_KERNEL);
-	if (!data)
-		return false;
+	memcpy(ep->rx_scratch, hdr->data, size);
 
 	rptr = ALIGN(rptr + sizeof(*hdr) + size, 1 << BLOCK_SHIFT);
 	if (WARN_ON(rptr > ep->rxbfr.bufsz))
@@ -692,8 +704,7 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 	ep->rxbfr.hdr->rptr = cpu_to_le32(rptr);
 	trace_afk_recv_rwptr_post(ep, rptr, wptr);
 
-	afk_recv_handle(ep, channel, type, data, size);
-	kfree(data);
+	afk_recv_handle(ep, channel, type, ep->rx_scratch, size);
 
 	return true;
 }

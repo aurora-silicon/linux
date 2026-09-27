@@ -263,6 +263,8 @@ struct apple_dcp_afkep {
 
 	struct afk_ringbuffer txbfr;
 	struct afk_ringbuffer rxbfr;
+	/* Private receive entry, owned by the ordered endpoint worker. */
+	void *rx_scratch;
 
 	spinlock_t lock;
 	u16 qe_seq;
