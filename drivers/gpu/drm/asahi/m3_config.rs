@@ -55,8 +55,15 @@ impl Config {
     /// Snapshot owned RAM only. Firmware can still update these buffers;
     /// per-record time intervals explicitly describe sequential observations.
     #[cfg(CONFIG_DEV_COREDUMP)]
-    pub(crate) fn fault_snapshot(&mut self, dev: &driver::AsahiDevice) -> Result {
+    pub(crate) fn fault_snapshot(&mut self, dev: &driver::AsahiDevice, primary: Error, gpu_pending: bool) -> Result {
         let mut dump = crate::g16_fault::Dump::new_m3()?;
+        let mut cause = [0u8; 16];
+        cause[..4].copy_from_slice(&1u32.to_le_bytes());
+        cause[4..8].copy_from_slice(&primary.to_errno().to_le_bytes());
+        cause[8..16].copy_from_slice(&u64::from(gpu_pending).to_le_bytes());
+        dump.record("host-first-error", 0, cause.len(), |out| {
+            out.copy_from_slice(&cause); Ok(())
+        })?;
         for (name, index) in [
             ("root", storage::ROOT), ("runtime", RUNTIME_POINTERS),
             ("hardware", HARDWARE_DATA), ("globals", GLOBALS),

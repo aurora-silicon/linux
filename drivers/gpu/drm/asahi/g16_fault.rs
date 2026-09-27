@@ -16,7 +16,7 @@ pub(crate) struct Dump {
 
 impl Dump {
     pub(crate) fn new(job: u64) -> Result<Self> {
-        Self::with_format(job, b"M4FWD001", usize::MAX)
+        Self::with_format(job, b"M4FWD001", 16 * 1024 * 1024)
     }
 
     /// M3 snapshots have no scheduler job ID yet and contain only bounded
@@ -36,6 +36,7 @@ impl Dump {
     pub(crate) fn record(&mut self, name: &str, va: u64, size: usize,
         read: impl FnOnce(&mut [u8]) -> Result) -> Result {
         if name.is_empty() || name.len() >= 32 || size == 0 { return Err(EINVAL); }
+        let count = self.count.checked_add(1).ok_or(EOVERFLOW)?;
         let start = self.bytes.len();
         let end = start.checked_add(64).and_then(|x| x.checked_add(size)).ok_or(EOVERFLOW)?;
         if end > self.limit { return Err(E2BIG); }
@@ -44,11 +45,14 @@ impl Dump {
         self.bytes[start+32..start+40].copy_from_slice(&va.to_le_bytes());
         self.bytes[start+40..start+48].copy_from_slice(&(size as u64).to_le_bytes());
         let begin = Monotonic::ktime_get() as u64;
-        read(&mut self.bytes[start+64..end])?;
+        if let Err(error) = read(&mut self.bytes[start+64..end]) {
+            self.bytes.truncate(start);
+            return Err(error);
+        }
         let finish = Monotonic::ktime_get() as u64;
         self.bytes[start+48..start+56].copy_from_slice(&begin.to_le_bytes());
         self.bytes[start+56..start+64].copy_from_slice(&finish.to_le_bytes());
-        self.count = self.count.checked_add(1).ok_or(EOVERFLOW)?;
+        self.count = count;
         Ok(())
     }
 
@@ -61,10 +65,11 @@ impl Dump {
         self.bytes[8..12].copy_from_slice(&self.count.to_le_bytes());
         self.bytes[12..16].copy_from_slice(&1u32.to_le_bytes());
         self.bytes[32..40].copy_from_slice(&(length as u64).to_le_bytes());
+        let format = if &self.bytes[..8] == b"M4FWD001" { "M4FWD001" } else { "M3FWD001" };
         let owned = KBox::new(self, GFP_KERNEL)?;
         kernel::devcoredump::dev_coredump(dev, &crate::THIS_MODULE, owned, GFP_KERNEL,
             kernel::devcoredump::DEFAULT_TIMEOUT);
-        dev_info!(dev, "Asahi: sealed {}-byte firmware fault snapshot offered to devcoredump\n", length);
+        dev_info!(dev, "Asahi: sealed {}-byte firmware fault snapshot offered to devcoredump ({})\n", length, format);
         Ok(())
     }
 }

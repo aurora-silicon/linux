@@ -208,6 +208,10 @@ impl rtkit::Operations for Operations {
 
     fn crashed(state: ArcBorrow<'_, State>, crashlog: Option<&[u8]>) {
         state.health.crashed.store(true, Ordering::Release);
+        // Wake the serialized worker even if the firmware can no longer send
+        // its usual completion notification. Never take the runtime lock here.
+        state.events.record();
+        crate::driver::queue_g16_completion_worker(state.drm.clone());
         dev_err!(
             state.dev.as_ref(),
             "M3 G15S: firmware crashed, retained crashlog bytes={}\n",
