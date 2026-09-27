@@ -46,6 +46,8 @@ impl Records {
 
 pub(crate) struct Config {
     objects: KVec<Buffer>,
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    fault_reserve: Option<crate::g16_fault::Dump>,
     _iomaps: KVec<mmu::KernelMapping>,
     pub(crate) completed_events: u64,
     pstates: crate::m3_adt_config::PstateWatch,
@@ -56,7 +58,8 @@ impl Config {
     /// per-record time intervals explicitly describe sequential observations.
     #[cfg(CONFIG_DEV_COREDUMP)]
     pub(crate) fn fault_snapshot(&mut self, dev: &driver::AsahiDevice, primary: Error, gpu_pending: bool) -> Result {
-        let mut dump = crate::g16_fault::Dump::new_m3()?;
+        let mut dump = self.fault_reserve.take().ok_or(ENOMEM)?;
+        dump.begin(0);
         let mut cause = [0u8; 16];
         cause[..4].copy_from_slice(&1u32.to_le_bytes());
         cause[4..8].copy_from_slice(&primary.to_errno().to_le_bytes());
@@ -136,7 +139,16 @@ impl Config {
         crate::m3_adt_config::check_upload(dev.as_ref(), firmware, &mut objects)?;
         g16_memory::publish();
         let thermal = crate::m3_thermal::Governor::new(dev.as_ref(), &contents.pstates)?;
+        #[cfg(CONFIG_DEV_COREDUMP)]
+        let fault_reserve = match crate::g16_fault::Dump::new_m3() {
+            Ok(dump) => Some(dump),
+            Err(error) => {
+                dev_warn!(dev.as_ref(), "M3: fault snapshot reserve unavailable: {:?}\n", error);
+                None
+            }
+        };
         Ok(Self { objects, _iomaps: iomaps, completed_events: 0,
+            #[cfg(CONFIG_DEV_COREDUMP)] fault_reserve,
             pstates: crate::m3_adt_config::PstateWatch::new(contents.pstates), thermal })
     }
     fn initialize_records(objects: &mut [Buffer]) -> Result {
