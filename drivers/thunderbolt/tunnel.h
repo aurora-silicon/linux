@@ -120,6 +120,7 @@ struct tb_tunnel *tb_tunnel_discover_pci(struct tb *tb, struct tb_port *down,
 					 bool alloc_hopid);
 struct tb_tunnel *tb_tunnel_alloc_pci(struct tb *tb, struct tb_port *up,
 				      struct tb_port *down);
+int tb_pci_tunnel_activate_host(struct tb_tunnel *tunnel);
 int tb_pci_tunnel_deactivate_host(struct tb_tunnel *tunnel);
 bool tb_tunnel_reserved_pci(struct tb_port *port, int *reserved_up,
 			    int *reserved_down);

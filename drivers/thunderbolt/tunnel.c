@@ -352,15 +352,20 @@ static int tb_pci_pre_activate(struct tb_tunnel *tunnel)
 {
 	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
 
+	/* Only the tunnel starting at the host owns its native PCIe port. */
+	if (tb_route(tunnel->src_port->sw))
+		return 0;
 	if (ops && ops->pci_tunnel_pre_activate)
 		return ops->pci_tunnel_pre_activate(tunnel->tb->nhi);
 	return 0;
 }
 
-static int tb_pci_post_activate(struct tb_tunnel *tunnel)
+int tb_pci_tunnel_activate_host(struct tb_tunnel *tunnel)
 {
 	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
 
+	if (tb_route(tunnel->src_port->sw))
+		return 0;
 	if (ops && ops->pci_tunnel_post_activate) {
 		/* Also unwind a hook that fails after partial host setup. */
 		tunnel->host_pci_activated = true;
@@ -417,7 +422,7 @@ static int tb_pci_activate(struct tb_tunnel *tunnel, bool activate)
 		if (res)
 			return res;
 
-		return tb_pci_post_activate(tunnel);
+		return tb_pci_tunnel_activate_host(tunnel);
 	} else {
 		/* Downstream router could be unplugged */
 		tb_pci_port_enable(tunnel->dst_port, activate);

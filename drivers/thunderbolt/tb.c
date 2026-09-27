@@ -1705,6 +1705,9 @@ static void tb_discover_tunnels(struct tb *tb)
 		if (tb_tunnel_is_pci(tunnel)) {
 			struct tb_switch *parent = tunnel->dst_port->sw;
 
+			/* Adopt host state only for tunnels retained by this domain. */
+			if (tb_pci_tunnel_activate_host(tunnel))
+				tb_tunnel_warn(tunnel, "failed to adopt PCIe host state\n");
 			while (parent != tunnel->src_port->sw) {
 				parent->boot = true;
 				parent = tb_switch_parent(parent);
