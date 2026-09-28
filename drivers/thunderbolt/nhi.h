@@ -178,6 +178,12 @@ struct tb_nhi_ops {
 #define QUIRK_NO_DMA_PORT	BIT(2)
 #define QUIRK_NO_USB3_BW_ALLOC	BIT(3)
 #define QUIRK_HOST_DP_NFC_CREDITS	BIT(4)
+/*
+ * The host router stays powered and its links stay up across system sleep,
+ * so routers must not be asked to enter sleep: a TBT3 device router that
+ * was told to sleep drops its link on its own some tens of seconds later.
+ */
+#define QUIRK_NO_SYSTEM_SLEEP	BIT(5)
 
 /*
  * Minimal number of vectors when we use MSI-X. Two for control channel

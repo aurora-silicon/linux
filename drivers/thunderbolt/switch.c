@@ -3663,6 +3663,10 @@ void tb_switch_suspend(struct tb_switch *sw, bool runtime)
 		flags |= TB_WAKE_ON_USB4 | TB_WAKE_ON_USB3 | TB_WAKE_ON_PCIE;
 	}
 
+	/* The link stays up; a sleeping router would drop it by itself. */
+	if (!runtime && (sw->tb->nhi->quirks & QUIRK_NO_SYSTEM_SLEEP))
+		return;
+
 	tb_switch_set_wake(sw, flags, runtime);
 
 	if (tb_switch_is_usb4(sw))

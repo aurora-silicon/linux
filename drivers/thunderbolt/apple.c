@@ -1739,9 +1739,22 @@ static int apple_nhi_prepare(struct device *dev)
 	return 0;
 }
 
+/*
+ * ACIO stays powered through suspend-to-idle and keeps its links trained, so
+ * nothing ever completes a router sleep request. Leave the routers awake.
+ */
+static bool router_sleep;
+module_param(router_sleep, bool, 0644);
+MODULE_PARM_DESC(router_sleep, "Ask routers to sleep on system suspend (test only)");
+
 static int apple_nhi_suspend_noirq(struct device *dev)
 {
 	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	if (READ_ONCE(router_sleep))
+		anhi->nhi.quirks &= ~QUIRK_NO_SYSTEM_SLEEP;
+	else
+		anhi->nhi.quirks |= QUIRK_NO_SYSTEM_SLEEP;
 
 	return tb_domain_suspend_noirq(anhi->tb);
 }
