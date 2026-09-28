@@ -161,7 +161,13 @@ const T8103: PlatformProfile = PlatformProfile {
         bag_type: 0x20000,
         arg: 0,
     },
-    key_store: KeyStore::Variant5,
+    // The 13.5 key-store dialect, with the init handshake (0x4d, then set_env).
+    // The j293 and j313 ADTs both carry `/defaults` `cpx-encryption-mode = 2`
+    // (aurora-silicon/linux#37). With Variant5 a j293 running the macOS 15
+    // sepOS answers CREATE_KEYBAG with status -13 and an empty body.
+    key_store: KeyStore::Sepos13 {
+        cpx_encryption_mode: 2,
+    },
 };
 
 const T6020: PlatformProfile = PlatformProfile {
