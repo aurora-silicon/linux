@@ -2080,6 +2080,20 @@ static int apple_pcie_resume_noirq(struct device *dev)
 
 	if (!pcie->hw->tunneled)
 		return 0;
+
+	/*
+	 * The NHI resumes first (see apple_pcie_tunnel_add_links()). If the
+	 * USB4 router was lost during suspend, its teardown has already
+	 * quiesced this host. Starting the ports now would train against a
+	 * tunnel that no longer exists, which leaves them unable to link on
+	 * every later connect; apple_pcie_tunnel_restore() starts them once a
+	 * new tunnel is up.
+	 */
+	if (pcie->bus_stopped) {
+		dev_info(dev, "PCIe-C tunnel lost during suspend, not restarting\n");
+		return 0;
+	}
+
 	list_for_each_entry(port, &pcie->ports, entry) {
 		ret = apple_pcie_tunnel_start(port);
 		if (ret)
