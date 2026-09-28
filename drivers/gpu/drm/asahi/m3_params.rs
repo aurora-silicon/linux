@@ -63,6 +63,9 @@ unsafe fn set_param(
 /// parsed by `$parse: fn(&str) -> Option<u64>`. Not visible in sysfs.
 macro_rules! m3_param {
     ($name:literal, $storage:ident, $parse:path) => {
+        m3_param!($name, $storage, $parse, 0, None);
+    };
+    ($name:literal, $storage:ident, $parse:path, $perm:expr, $get:expr) => {
         const _: () = {
             unsafe extern "C" fn set(
                 val: *const c_char,
@@ -76,7 +79,7 @@ macro_rules! m3_param {
             static OPS: kernel::bindings::kernel_param_ops = kernel::bindings::kernel_param_ops {
                 flags: 0,
                 set: Some(set),
-                get: None,
+                get: $get,
                 free: None,
             };
 
@@ -98,7 +101,7 @@ macro_rules! m3_param {
                     #[cfg(not(MODULE))]
                     mod_: core::ptr::null_mut(),
                     ops: core::ptr::from_ref(&OPS),
-                    perm: 0,
+                    perm: $perm,
                     level: -1,
                     flags: 0,
                     __bindgen_anon_1: kernel::bindings::kernel_param__bindgen_ty_1 {
@@ -107,6 +110,57 @@ macro_rules! m3_param {
                 });
         };
     };
+}
+
+/// Read an atomic parameter without borrowing storage that a sysfs write may
+/// change concurrently. The module-parameter core supplies a PAGE_SIZE buffer.
+///
+/// # Safety
+///
+/// `buffer` must be the module-parameter core's writable output buffer and
+/// `kp` must be an entry declared by `m3_param!` with AtomicU64 storage.
+unsafe extern "C" fn get_atomic_param(
+    buffer: *mut c_char,
+    kp: *const kernel::bindings::kernel_param,
+) -> c_int {
+    use core::fmt::Write;
+
+    // SAFETY: The entry points to static AtomicU64 storage by contract. Loads
+    // and stores are atomic; module-parameter serialization alone would not
+    // protect the scheduler's concurrent reads.
+    let value = unsafe { &*((*kp).__bindgen_anon_1.arg.cast::<AtomicU64>()) }
+        .load(Ordering::Relaxed);
+    // SAFETY: 32 bytes fit in the core's PAGE_SIZE output buffer and hold any
+    // decimal u64 plus its NUL. The core appends the sysfs newline itself.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), 32) };
+    let mut output = kernel::str::Formatter::new(bytes);
+    if write!(output, "{}\0", value).is_err() {
+        return EINVAL.to_errno();
+    }
+    (output.bytes_written() - 1) as c_int
+}
+
+fn parse_render_batch_override(text: &str) -> Option<u64> {
+    parse_u64(text).filter(|value| *value <= crate::m3_pass_layout::SLOTS as u64)
+}
+
+/// Runtime tuning is opt-in: zero keeps the existing boot parameter and its
+/// clamping semantics. Only root may write a bounded 1..=SLOTS override; an
+/// invalid write leaves the previous value intact. Compute batching is separate.
+static M3_RENDER_BATCH_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+m3_param!("m3_render_batch_override", M3_RENDER_BATCH_OVERRIDE,
+    parse_render_batch_override, 0o644, Some(get_atomic_param));
+
+/// Snapshot once per packet. A live change affects later packets, never the
+/// batch storage, ordering or retirement checks of work already being executed.
+pub(crate) fn render_batch_size() -> usize {
+    let override_size = M3_RENDER_BATCH_OVERRIDE.load(Ordering::Relaxed);
+    let size = if override_size == 0 {
+        *crate::module_parameters::m3_render_batch_size.value() as usize
+    } else {
+        override_size as usize
+    };
+    size.clamp(1, crate::m3_pass_layout::SLOTS)
 }
 
 /// `asahi.g15_debug`: G15 bring-up bits, see [`G15Debug`].
