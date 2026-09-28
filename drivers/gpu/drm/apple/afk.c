@@ -152,7 +152,8 @@ static void afk_init_rxtx(struct apple_dcp_afkep *ep, u64 message,
 	u32 base = FIELD_GET(INITRB_OFFSET, message) << BLOCK_SHIFT;
 	u32 size = FIELD_GET(INITRB_SIZE, message) << BLOCK_SHIFT;
 	u16 tag = FIELD_GET(INITRB_TAG, message);
-	u32 bufsz, hdrsz, end, block;
+	u32 bufsz, end, stride;
+	u8 *hdr;
 
 	if (tag != ep->bfr_tag) {
 		dev_err(ep->dcp->dev, "AFK[ep:%02x]: expected tag 0x%x but got 0x%x\n",
@@ -166,10 +167,10 @@ static void afk_init_rxtx(struct apple_dcp_afkep *ep, u64 message,
 		return;
 	}
 
-	if (!ep->bfr || size < sizeof(__le32) || base >= ep->bfr_size) {
+	if (!ep->bfr || base >= ep->bfr_size || size < sizeof(u32)) {
 		dev_err(ep->dcp->dev,
-			"AFK[ep:%02x]: requested base 0x%x >= max size 0x%lx\n",
-			ep->endpoint, base, ep->bfr_size);
+			"AFK[ep:%02x]: invalid ring base 0x%x or size 0x%x\n",
+			ep->endpoint, base, size);
 		return;
 	}
 
@@ -181,23 +182,21 @@ static void afk_init_rxtx(struct apple_dcp_afkep *ep, u64 message,
 		return;
 	}
 
-	bfr->hdr = ep->bfr + base;
+	hdr = (u8 *)ep->bfr + base;
 	dma_rmb();
-	bufsz = le32_to_cpu(READ_ONCE(*(__le32 *)bfr->hdr));
-	hdrsz = size - bufsz;
-	block = hdrsz / AFK_RB_BLOCKS;
-	if (bufsz >= size || hdrsz % AFK_RB_BLOCKS ||
-	    block < AFK_RB_BLOCK_MIN || !is_power_of_2(block) ||
-	    !IS_ALIGNED(bufsz, block) || bufsz < 2 * block) {
+	bufsz = le32_to_cpu(READ_ONCE(*(__le32 *)hdr));
+	if (afk_ring_stride(size, bufsz, &stride)) {
 		dev_err(ep->dcp->dev,
-			"AFK[ep:%02x]: ring bufsz %#x with size %#x gives no valid header (base %#x, msg %#llx)\n",
-			ep->endpoint, bufsz, size, base, message);
+			"AFK[ep:%02x]: invalid ring payload size 0x%x of 0x%x\n",
+			ep->endpoint, bufsz, size);
 		return;
 	}
-	bfr->block = block;
 
-	bfr->buf = (u8 *)bfr->hdr + hdrsz;
+	bfr->rptr = (__le32 *)(hdr + stride);
+	bfr->wptr = (__le32 *)(hdr + 2 * stride);
+	bfr->buf = hdr + 3 * stride;
 	bfr->bufsz = bufsz;
+	bfr->stride = stride;
 	bfr->ready = true;
 
 	if (ep->rxbfr.ready && ep->txbfr.ready)
@@ -683,8 +682,8 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 		return false;
 	}
 
-	rptr = le32_to_cpu(*afk_rb_rptr(&ep->rxbfr));
-	wptr = le32_to_cpu(*afk_rb_wptr(&ep->rxbfr));
+	rptr = le32_to_cpu(*ep->rxbfr.rptr);
+	wptr = le32_to_cpu(*ep->rxbfr.wptr);
 	trace_afk_recv_rwptr_pre(ep, rptr, wptr);
 
 	if (rptr == wptr)
@@ -729,7 +728,7 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 			return false;
 		}
 
-		*afk_rb_rptr(&ep->rxbfr) = cpu_to_le32(rptr);
+		*ep->rxbfr.rptr = cpu_to_le32(rptr);
 	}
 
 	if (rptr + size + sizeof(*hdr) > ep->rxbfr.bufsz) {
@@ -742,15 +741,12 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 	channel = le32_to_cpu(hdr->channel);
 	type = le32_to_cpu(hdr->type);
 
-	rptr = ALIGN(rptr + sizeof(*hdr) + size, ep->rxbfr.block);
-	if (WARN_ON(rptr > ep->rxbfr.bufsz))
-		rptr = 0;
-	if (rptr == ep->rxbfr.bufsz)
-		rptr = 0;
+	rptr = afk_ring_advance(rptr, sizeof(*hdr) + size,
+				ep->rxbfr.bufsz, ep->rxbfr.stride);
 
 	dma_mb();
 
-	*afk_rb_rptr(&ep->rxbfr) = cpu_to_le32(rptr);
+	*ep->rxbfr.rptr = cpu_to_le32(rptr);
 	trace_afk_recv_rwptr_post(ep, rptr, wptr);
 
 	/*
@@ -858,8 +854,8 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	spin_lock_irqsave(&ep->lock, flags);
 
 	dma_rmb();
-	rptr = le32_to_cpu(*afk_rb_rptr(&ep->txbfr));
-	wptr = le32_to_cpu(*afk_rb_wptr(&ep->txbfr));
+	rptr = le32_to_cpu(*ep->txbfr.rptr);
+	wptr = le32_to_cpu(*ep->txbfr.wptr);
 	trace_afk_send_rwptr_pre(ep, rptr, wptr);
 	total_epic_size = sizeof(*ehdr) + sizeof(*eshdr) + payload_len;
 	total_size = sizeof(*hdr) + total_epic_size;
@@ -972,12 +968,11 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 
 	memcpy(ep->txbfr.buf + wptr, payload, payload_len);
 	wptr += payload_len;
-	wptr = ALIGN(wptr, ep->txbfr.block);
-	if (wptr == ep->txbfr.bufsz)
-		wptr = 0;
+	wptr = afk_ring_advance(wptr, 0, ep->txbfr.bufsz,
+				ep->txbfr.stride);
 	trace_afk_send_rwptr_post(ep, rptr, wptr);
 
-	*afk_rb_wptr(&ep->txbfr) = cpu_to_le32(wptr);
+	*ep->txbfr.wptr = cpu_to_le32(wptr);
 	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
 			     FIELD_PREP(SEND_WPTR, wptr));
 	ret = 0;

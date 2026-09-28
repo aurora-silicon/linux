@@ -109,11 +109,11 @@ TRACE_EVENT(dcp_send_msg,
 		      show_dcp_endpoint(__entry->endpoint), __entry->message));
 
 TRACE_EVENT(
-	afk_getbuf, TP_PROTO(struct apple_dcp_afkep *ep, u16 size, u16 tag),
+	afk_getbuf, TP_PROTO(struct apple_dcp_afkep *ep, u32 size, u16 tag),
 	TP_ARGS(ep, size, tag),
 
 	TP_STRUCT__entry(__string(devname, dev_name(ep->dcp->dev))
-				 __field(u8, endpoint) __field(u16, size)
+				 __field(u8, endpoint) __field(u32, size)
 					 __field(u16, tag)),
 
 	TP_fast_assign(__assign_str(devname);
