@@ -22,6 +22,21 @@
 
 	aliases {
 		gpu = &gpu;
+		/* m1n1 copies this machine's Thunderbolt calibration onto the
+		 * node these names point at. Current m1n1 looks up usb4-N-acio
+		 * and usb4-N-nhi; the packaged 1.6.1 bootloader looks up
+		 * usb4_N_rc and usb4_N_nhi. A label on the node is not enough.
+		 */
+		usb4-0-acio = &usb4_0_acio;
+		usb4_0_rc = &usb4_0_acio;
+		usb4-0-nhi = &usb4_0_nhi;
+		usb4_0_nhi = &usb4_0_nhi;
+		usb4_0_pcie_adapter = &usb4_0_acio;
+		usb4-1-acio = &usb4_1_acio;
+		usb4_1_rc = &usb4_1_acio;
+		usb4-1-nhi = &usb4_1_nhi;
+		usb4_1_nhi = &usb4_1_nhi;
+		usb4_1_pcie_adapter = &usb4_1_acio;
 	};
 
 	cpus {
