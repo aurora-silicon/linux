@@ -951,8 +951,8 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 			return ret;
 		}
 
-		// TODO: verify phy_addr, cache attribute
-		bfr->buffer = memremap(phy_addr, bfr->size, MEMREMAP_WB);
+		/* Firmware writes without CPU cache maintenance. */
+		bfr->buffer = memremap(phy_addr, bfr->size, MEMREMAP_WC);
 		if (!bfr->buffer)
 			return -ENOMEM;
 
