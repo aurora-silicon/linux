@@ -93,7 +93,8 @@ enum dwc3_apple_state {
  * @mmio_resource: Resource to be passed to dwc3_core_probe
  * @apple_regs: Apple-specific DWC3 registers
  * @reset: Reset control
- * @usb2_phy: USB2 PHY, configured before the core is brought up
+ * @usb2_phy: USB2 PHY, set to device mode before the core is brought up; the xHCI root hub
+ *	      sets host mode
  * @usb3_phy: USB3 PHY, configured after the core is brought up
  * @role_sw: USB role switch
  * @fixed_hub: A fixed hub sits on the controller's USB2 port, the controller stays in host mode
@@ -269,17 +270,23 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 	lockdep_assert_held(&appledwc->lock);
 
 	/*
-	 * The USB2 PHY on this platform must be configured for host or device mode while it is
-	 * still powered off and before dwc3 tries to access it. Otherwise, the new configuration
-	 * will sometimes only take affect after the *next* time dwc3 is brought up which causes
-	 * the connected device to just not work.
+	 * The USB2 PHY on this platform must be configured for device mode before dwc3 tries to
+	 * access it. Otherwise, the new configuration will sometimes only take affect after the
+	 * *next* time dwc3 is brought up which causes the connected device to just not work.
+	 * Host mode is left to the xHCI root hub, which selects it once the core is out of reset
+	 * (usb_add_hcd() asks for PHY_MODE_USB_HOST_SS, which the PHY rejects, and then for
+	 * PHY_MODE_USB_HOST). On a Type-C port the PHY is already running at this point, because
+	 * the Type-C mux starts it before the role switch reaches this driver, and switching the
+	 * running PHY to host mode while the core is still held in reset leaves the USB2 port
+	 * without a connection for the whole session. A PHY that is in host mode already needs no
+	 * selection here either.
 	 * The USB3 PHY must be configured later after dwc3 has already been initialized.
-	 * Both PHYs were looked up at probe, so this also covers the first bring-up, before
-	 * dwc3_core_probe() has looked them up itself.
+	 * Both PHYs were looked up at probe, so device mode is also selected on the first
+	 * bring-up, before dwc3_core_probe() has looked them up itself.
 	 */
 	switch (state) {
 	case DWC3_APPLE_HOST:
-		ret = phy_set_mode(appledwc->usb2_phy, PHY_MODE_USB_HOST);
+		ret = 0;
 		break;
 	case DWC3_APPLE_DEVICE:
 		ret = phy_set_mode(appledwc->usb2_phy, PHY_MODE_USB_DEVICE);
@@ -326,8 +333,9 @@ static void dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_sta
 	dwc3_apple_set_ptrcap(appledwc, host ? DWC3_GCTL_PRTCAP_HOST : DWC3_GCTL_PRTCAP_DEVICE);
 	/*
 	 * This platform requires SUSPHY to be enabled here already in order to properly
-	 * configure the PHY and switch dwc3's PIPE interface to USB3 PHY. The USB2 PHY
-	 * has already been configured to the correct mode earlier.
+	 * configure the PHY and switch dwc3's PIPE interface to USB3 PHY. The USB2 PHY's
+	 * device mode has already been selected in dwc3_apple_core_start(); its host mode
+	 * is selected by the xHCI root hub as it starts.
 	 */
 	dwc3_enable_susphy(&appledwc->dwc, true);
 	ret = phy_set_mode(appledwc->usb3_phy, host ? PHY_MODE_USB_HOST : PHY_MODE_USB_DEVICE);
