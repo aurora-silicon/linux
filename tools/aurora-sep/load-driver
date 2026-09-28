@@ -35,9 +35,16 @@ while [ "$attempts" -gt 0 ]; do
     attempts=$((attempts - 1))
 done
 
-[ "$verified" = true ] || exit 1
-[ -s "$keybag" ] || exit 1
-[ -s "$refkey" ] || exit 1
+# The trusted-key seal and the ref-key file only exist on a Variant5 key store:
+# ensure_machine_refkey() returns ENODEV for every other profile, so on a
+# Sepos13 machine no ref-key is ever written and these checks can never pass.
+# That takes the service down with exit 1, and fprintd (Requires=aurora-sep)
+# never starts, even though Touch ID itself does not use the ref-key.
+if [ "$verified" != true ]; then
+    echo "apple_sep: trusted-key seal unavailable (expected on a Sepos13 key store)" >&2
+fi
+[ -s "$keybag" ] || { echo "apple_sep: no identity keybag at $keybag" >&2; exit 1; }
+[ -s "$refkey" ] || echo "apple_sep: no ref-key file (expected on a Sepos13 key store)" >&2
 
 attempts=300
 while [ "$attempts" -gt 0 ] && [ ! -c /dev/sep-bio ]; do
