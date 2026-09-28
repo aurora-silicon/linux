@@ -155,11 +155,14 @@ const T8103: PlatformProfile = PlatformProfile {
     },
     dart_range_required: false,
     firmware_region: c"sepfw",
-    // Strict enclave: the type goes in the third word; the first word is 0.
+    // macOS 13.5's AppleKeyStore::identity_create (0xfffffe000994b2d8):
+    // version 2, type 0x400000, parent -1 (it accepts only -1 or <= -10).
+    // This is the pairing aurora-silicon/linux#37 provisioned a j313 with;
+    // with variant 0 / 0x20000 / 0 a j293 gets CREATE_KEYBAG status -13.
     keybag_create: KeybagCreate {
-        variant: 0,
-        bag_type: 0x20000,
-        arg: 0,
+        variant: 2,
+        bag_type: 0x40_0000,
+        arg: -1,
     },
     // The 13.5 key-store dialect, with the init handshake (0x4d, then set_env).
     // The j293 and j313 ADTs both carry `/defaults` `cpx-encryption-mode = 2`
