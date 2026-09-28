@@ -26,6 +26,33 @@
 		disp0_piodma = &disp0_piodma;
 		keyboard = &keyboard;
 		sio = &sio;
+		/* m1n1 writes this machine's Thunderbolt calibration onto these
+		 * aliases. usb4-N-* is current m1n1; usb4_N_* is the 1.6.1 bootloader.
+		 */
+		usb4-0-acio = &usb4_0_acio;
+		usb4-0-nhi = &usb4_0_nhi;
+		usb4-0-pcie-adapter = &usb4_0_acio;
+		usb4-0-pcie = &apciec0;
+		usb4_0_rc = &usb4_0_acio;
+		usb4_0_nhi = &usb4_0_nhi;
+		usb4_0_pcie_adapter = &usb4_0_acio;
+		usb4_0_pcie = &apciec0;
+		usb4-1-acio = &usb4_1_acio;
+		usb4-1-nhi = &usb4_1_nhi;
+		usb4-1-pcie-adapter = &usb4_1_acio;
+		usb4-1-pcie = &apciec1;
+		usb4_1_rc = &usb4_1_acio;
+		usb4_1_nhi = &usb4_1_nhi;
+		usb4_1_pcie_adapter = &usb4_1_acio;
+		usb4_1_pcie = &apciec1;
+		usb4-2-acio = &usb4_2_acio;
+		usb4-2-nhi = &usb4_2_nhi;
+		usb4-2-pcie-adapter = &usb4_2_acio;
+		usb4-2-pcie = &apciec2;
+		usb4_2_rc = &usb4_2_acio;
+		usb4_2_nhi = &usb4_2_nhi;
+		usb4_2_pcie_adapter = &usb4_2_acio;
+		usb4_2_pcie = &apciec2;
 	};
 };
 
