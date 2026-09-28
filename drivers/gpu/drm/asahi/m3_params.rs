@@ -163,6 +163,28 @@ pub(crate) fn render_batch_size() -> usize {
     size.clamp(1, crate::m3_pass_layout::SLOTS)
 }
 
+fn parse_compute_batch_override(text: &str) -> Option<u64> {
+    parse_u64(text).filter(|value| *value <= crate::m3_compute_storage::SLOTS as u64)
+}
+
+/// Independently tune the existing adjacent-compute path. Zero preserves the
+/// boot parameter; invalid writes do not replace the current value. Storage and
+/// engine/VM retirement boundaries are unchanged.
+static M3_COMPUTE_BATCH_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+m3_param!("m3_compute_batch_override", M3_COMPUTE_BATCH_OVERRIDE,
+    parse_compute_batch_override, 0o644, Some(get_atomic_param));
+
+/// Snapshot once per packet, so a live write never changes an in-flight batch.
+pub(crate) fn compute_batch_size() -> usize {
+    let override_size = M3_COMPUTE_BATCH_OVERRIDE.load(Ordering::Relaxed);
+    let size = if override_size == 0 {
+        *crate::module_parameters::m3_compute_batch_size.value() as usize
+    } else {
+        override_size as usize
+    };
+    size.clamp(1, crate::m3_compute_storage::SLOTS)
+}
+
 /// `asahi.g15_debug`: G15 bring-up bits, see [`G15Debug`].
 static G15_DEBUG: AtomicU64 = AtomicU64::new(0);
 m3_param!("g15_debug", G15_DEBUG, parse_u64);
