@@ -2267,9 +2267,19 @@ impl SepData {
             if let Some(user) = crate::sks::DesignateUser::new(SBIO_PROBE_USER_ID) {
                 let special = user.special_handle();
                 if let Ok(keybag::State::Present(stored)) = keybag::read(keybag::Slot::Identity) {
-                    let _ = self.sks_step(crate::sks::SKS_LOCK_STATE_NAME, |healthy| {
-                        self.sks_req_unlock_special(special, stored.secret(), healthy)
-                    });
+                    // Report it: a refusal here would otherwise be invisible, and
+                    // the identity session being locked would be indistinguishable
+                    // from the enclave refusing enrolment for its own reasons.
+                    let unlocked = self
+                        .sks_step(crate::sks::SKS_LOCK_STATE_NAME, |healthy| {
+                            self.sks_req_unlock_special(special, stored.secret(), healthy)
+                        })
+                        .is_some();
+                    dev_info!(
+                        self.dev,
+                        "identity session unlock: {}\n",
+                        if unlocked { "accepted" } else { "REFUSED or not sent" }
+                    );
                 }
             }
         }
