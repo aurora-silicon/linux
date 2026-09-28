@@ -1,4 +1,5 @@
 """Offline watchdog checks: idle GPU, faults, reloads, stale and malformed state."""
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,12 +41,25 @@ class ProgressTests(unittest.TestCase):
                 with patch('completion_progress.time.monotonic', return_value=10):
                     with self.assertRaises(RuntimeError): self.reader.poll(10)
 
+    def test_fault_is_retained_without_advancing_progress(self):
+        self.path.write_text(snapshot(8, healthy=0))
+        with self.assertRaisesRegex(RuntimeError, 'latched unhealthy'):
+            self.reader.poll(10)
+        self.assertEqual(self.reader.previous['completed'], 7)
+        self.assertIsNone(self.reader.latest)
+        evidence = [json.loads(line) for line in self.reader.evidence.read_text().splitlines()]
+        self.assertEqual(evidence[-1]['healthy'], 0)
+        self.assertEqual(evidence[-1]['completed'], 8)
+        # Faults at startup are retained too, without accepting a baseline.
+        with self.assertRaisesRegex(RuntimeError, 'latched unhealthy'):
+            CompletionProgress(self.reader.evidence, self.path)
+
     def test_missing_file_and_malformed_snapshot(self):
         self.path.unlink()
         with self.assertRaises(FileNotFoundError): self.reader.poll(10)
         for sample in ['',snapshot().replace('healthy=1','version=1'),
                        snapshot().replace('version=1','version=2'),
-                       snapshot(count=-1),snapshot(1,0)]:
+                       snapshot(count=-1),snapshot(1,0),snapshot(healthy=2)]:
             with self.subTest(sample=sample),self.assertRaises((RuntimeError,ValueError)):
                 parse(sample)
 

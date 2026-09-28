@@ -2,6 +2,7 @@
 //! Bounded M3 compute and graphics submissions through the common DRM scheduler/syncobjs.
 use kernel::{c_str,dma_fence::*,drm::sched,prelude::*,sync::{Arc,Mutex},new_mutex,xarray};
 use crate::{file,g17_uapi,mmu,queue,m3_drm::Shared};
+use core::sync::atomic::{AtomicBool, Ordering};
 #[derive(Default)]
 pub(crate) struct Completion;
 #[vtable]
@@ -41,6 +42,7 @@ pub(crate) struct Packet {
     pub(crate) attachments:KVec<crate::g16_attachments::Attachments>,
     pub(crate) wide_visibility:KVec<bool>,
     completion:UserFence<Completion>,
+    finish_claimed: AtomicBool,
     vm_job:Pin<KBox<Mutex<Option<mmu::T8140VmJobGuard>>>>,
 }
 impl Packet {
@@ -52,6 +54,10 @@ impl Packet {
             self.timestamps[index][stage*2+i].as_ref().map_or(0,Destination::firmware_address)))
     }
     fn finish(&self,result:Result) {
+        // Retirement, cancellation and a queued scheduler timeout can race.
+        // Claim error/signal ownership once; this flag is NOT proof that the
+        // fence is signaled or that hardware DMA has stopped.
+        if self.finish_claimed.swap(true, Ordering::Relaxed) { return; }
         if let Err(e)=result {self.vm.status().record(e.to_errno());self.completion.set_error(e);}
         // A scheduler job/fence and the runtime's last packet can outlive
         // hardware retirement. They must not keep the VM's active-job count
@@ -74,19 +80,24 @@ impl sched::JobImpl for Job {
         Ok(Some(Fence::from_fence(&job.packet.completion)))
     }
     fn timed_out(job:&mut sched::Job<Self>)->sched::Status {
+        // Retain the publishing branch's explicit diagnostic override.
         if !crate::m3_params::timeout_nohang() {
             if let Some(r)=Option::as_mut(&mut *job.shared.lock()) {r.health().mark_failed();}
             job.packet.finish(Err(ETIMEDOUT));return sched::Status::NoDevice;
         }
-        // run() executes the whole packet before it returns, and it always
-        // finishes the packet itself: every batch retires, fails, or reaches
-        // its own completion limit, which marks the GPU failed. A scheduler
-        // timeout therefore only means the packet as a whole ran longer than
-        // the timeout. Finishing the packet here would set an error on a fence
-        // run() has already signalled, and reporting the device as gone would
-        // drop the job from the pending list for good and kill a working GPU.
-        pr_warn!("M3 scheduler: a packet exceeded the scheduler timeout; its batches keep their own completion limit\n");
-        sched::Status::NoHang
+        let guard=job.shared.lock();
+        let Some(runtime)=guard.as_ref() else {
+            job.packet.finish(Err(ENODEV));
+            return sched::Status::NoDevice;
+        };
+        // The scheduler's deadline covers the whole packet, not one batch.
+        // execute() owns each batch's bounded hardware-completion checks;
+        // waiting for its mutex can itself cross the scheduler deadline.
+        // Reinsert a healthy packet instead of turning a late timeout into
+        // a global device loss or corrupting an already signaled fence.
+        if runtime.health().healthy() { return sched::Status::NoHang; }
+        job.packet.finish(Err(EIO));
+        sched::Status::NoDevice
     }
     fn cancel(job:&mut sched::Job<Self>) {job.packet.finish(Err(ECANCELED));}
 }
@@ -162,6 +173,7 @@ impl queue::Queue for Queue {
         parser.finish().map_err(|_|EINVAL)?;
         let packet=Arc::new(Packet{vm:self.vm.clone(),commands,timestamps,attachments:flushes,wide_visibility:visibility,
             completion:self.fences.new_fence(0,Completion)?.into(),
+            finish_claimed:AtomicBool::new(false),
             vm_job:KBox::pin_init(new_mutex!(Some(vm_job)),GFP_KERNEL)?},GFP_KERNEL)?;
         let mut job=self.entity.new_job(1,Job{shared:self.shared.clone(),packet})?;
         for sync in syncs.drain(0..in_sync_count) {if let Some(f)=sync.fence {job.add_dependency(f)?;}}

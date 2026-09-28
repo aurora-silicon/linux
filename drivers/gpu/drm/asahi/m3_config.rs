@@ -46,12 +46,44 @@ impl Records {
 
 pub(crate) struct Config {
     objects: KVec<Buffer>,
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    fault_reserve: Option<crate::g16_fault::Dump>,
     _iomaps: KVec<mmu::KernelMapping>,
     pub(crate) completed_events: u64,
     pstates: crate::m3_adt_config::PstateWatch,
     thermal: crate::m3_thermal::Governor,
 }
 impl Config {
+    /// Snapshot owned RAM only. Firmware can still update these buffers;
+    /// per-record time intervals explicitly describe sequential observations.
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    pub(crate) fn fault_snapshot(&mut self, dev: &driver::AsahiDevice, primary: Error, gpu_pending: bool) -> Result {
+        let mut dump = self.fault_reserve.take().ok_or(ENOMEM)?;
+        dump.begin(0);
+        let mut cause = [0u8; 16];
+        cause[..4].copy_from_slice(&1u32.to_le_bytes());
+        cause[4..8].copy_from_slice(&primary.to_errno().to_le_bytes());
+        cause[8..16].copy_from_slice(&u64::from(gpu_pending).to_le_bytes());
+        dump.record("host-first-error", 0, cause.len(), |out| {
+            out.copy_from_slice(&cause); Ok(())
+        })?;
+        for (name, index) in [
+            ("root", storage::ROOT), ("runtime", RUNTIME_POINTERS),
+            ("hardware", HARDWARE_DATA), ("globals", GLOBALS),
+            ("control", CONTROL_REGION), ("flags", RUNTIME_FLAGS),
+            ("event-state", storage::EVENT * 2),
+            ("event-ring", storage::EVENT * 2 + 1),
+            ("fwlog-state", storage::FIRMWARE_LOG * 2),
+            ("fwlog-ring", storage::FIRMWARE_LOG * 2 + 1),
+            ("trace-state", storage::TRACE * 2),
+            ("trace-ring", storage::TRACE * 2 + 1),
+        ] {
+            let buffer = &mut self.objects[index];
+            dump.record(name, buffer.va(), buffer.size(), |out| buffer.read(0, out))?;
+        }
+        dump.publish(dev.as_ref())
+    }
+
     pub(crate) fn new(dev: &driver::AsahiDevice, uat: &mmu::Uat, firmware: &crate::m3_firmware::Firmware,
         contents: &crate::m3_adt_config::Contents) -> Result<Self> {
         contents.check_for_upload()?;
@@ -75,6 +107,17 @@ impl Config {
         // unlike the firmware virtual references in the IOMapping records.
         objects[HARDWARE_DATA].u64(storage::GPU_REGION_PHYSICAL,firmware.resources.regions[0].base)?;
         Self::initialize_records(&mut objects)?;
+        // Vertex/tessellation loops need not retire a primitive at every
+        // firmware progress poll. The inherited interval of 10 falsely
+        // declares a valid 35.7 ms TA job stuck on J514S. Keep progress
+        // detection enabled, with a finite interval of 100 firmware polls.
+        // This is independent of the host job bound and 60-second watchdog.
+        // RTKit 2419 copies Globals+0x980 into its TA poll threshold at
+        // text+0x6514; text+0xd710 checks it before sampling engine progress.
+        const TA_PROGRESS_INTERVAL: usize = 0x980;
+        if objects[GLOBALS].read_u32(TA_PROGRESS_INTERVAL)? != 10 { return Err(EINVAL); }
+        objects[GLOBALS].u32(TA_PROGRESS_INTERVAL, 100)?;
+        dev_info!(dev.as_ref(), "M3: firmware TA progress-check interval=100\n");
         // RTKit 2419 +2de48..2dec8 accepts user timestamp stores only
         // within the 64 MiB arena at HwDataB+28. Match map_timestamp().
         objects[HARDWARE_DATA].u64(0x28,g16_memory::TIMESTAMP_RANGE.start)?;
@@ -96,7 +139,16 @@ impl Config {
         crate::m3_adt_config::check_upload(dev.as_ref(), firmware, &mut objects)?;
         g16_memory::publish();
         let thermal = crate::m3_thermal::Governor::new(dev.as_ref(), &contents.pstates)?;
+        #[cfg(CONFIG_DEV_COREDUMP)]
+        let fault_reserve = match crate::g16_fault::Dump::new_m3() {
+            Ok(dump) => Some(dump),
+            Err(error) => {
+                dev_warn!(dev.as_ref(), "M3: fault snapshot reserve unavailable: {:?}\n", error);
+                None
+            }
+        };
         Ok(Self { objects, _iomaps: iomaps, completed_events: 0,
+            #[cfg(CONFIG_DEV_COREDUMP)] fault_reserve,
             pstates: crate::m3_adt_config::PstateWatch::new(contents.pstates), thermal })
     }
     fn initialize_records(objects: &mut [Buffer]) -> Result {

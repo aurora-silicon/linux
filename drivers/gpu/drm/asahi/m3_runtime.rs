@@ -22,6 +22,7 @@ struct Inner {
     jobs: KVec<NativeJob>,
     packets: KVec<Arc<crate::m3_submit::Packet>>,
     gpu_pending: bool,
+    fault_captured: bool,
     timing: [[i64;7];2],
     render_batches: [u64;crate::m3_pass_layout::SLOTS],
     geometry: [GeometryTiming; 32],
@@ -32,14 +33,30 @@ struct Inner {
     device: Device,
 }
 impl Inner {
+    /// Latch before allocating diagnostics, once per runtime. Called under
+    /// its mutex even for errors outside the active-job polling loop.
+    fn capture_fault(&mut self, primary: Error) {
+        self.state.health.mark_failed();
+        if self.fault_captured { return; }
+        self.fault_captured = true;
+        #[cfg(CONFIG_DEV_COREDUMP)]
+        if let Err(error) = self.config.fault_snapshot(&self.drm, primary, self.gpu_pending) {
+            dev_err!(self.drm.as_ref(), "M3 fault snapshot failed: {:?}\n", error);
+        }
+    }
+
     /// Record a batch that failed or never retired. Mark the GPU failed first,
     /// so that a failing diagnostic read cannot leave a job that never retired
     /// behind a device that still reports itself healthy.
-    fn fail(&mut self, index: usize, vm: &mmu::Vm) {
-        self.state.health.mark_failed();
+    fn fail(&mut self, index: usize, vm: &mmu::Vm, primary: Error) {
+        self.capture_fault(primary);
         let events=self.state.event_messages.load(Ordering::Acquire);
-        let _=self.jobs[index].log(&self.drm);
-        let _=self.device.log_engine_state(vm);
+        if let Err(e) = self.jobs[index].log(&self.drm) {
+            dev_err!(self.drm.as_ref(), "M3 job diagnostics failed: {:?}\n", e);
+        }
+        if let Err(e) = self.device.log_engine_state(vm) {
+            dev_err!(self.drm.as_ref(), "M3 engine diagnostics failed: {:?}\n", e);
+        }
         let _=self.config.log_recovery_state(&self.drm,events);
         if crate::m3_params::g15_debug(crate::m3_params::G15Debug::M3ResumeAfterFault) {
             if let Err(e)=self.resume_experiment(index, vm) {
@@ -123,7 +140,7 @@ impl Runtime {
             }
         };
         Ok(Self { inner: ManuallyDrop::new(Inner { transport, state, config, uat, drm, device,
-            jobs:KVec::new(),packets:KVec::new(),gpu_pending:false,timing:[[0;7];2],render_batches:[0;crate::m3_pass_layout::SLOTS],
+            jobs:KVec::new(),packets:KVec::new(),gpu_pending:false,fault_captured:false,timing:[[0;7];2],render_batches:[0;crate::m3_pass_layout::SLOTS],
             geometry:[GeometryTiming::default();32],geometry_overflow:0 }) })
     }
     pub(crate) fn drm(&self) -> driver::AsahiDevRef { self.inner.drm.clone() }
@@ -147,6 +164,20 @@ impl Runtime {
     /// Only the scheduler's run callback calls this, one packet at a time, so
     /// the retained jobs and the batch in flight cannot change while unlocked.
     pub(crate) fn execute(shared:&crate::m3_drm::Shared,packet:Arc<crate::m3_submit::Packet>)->Result {
+        let result = Self::execute_inner(shared, packet);
+        // The scheduler serializes execute calls. Reacquire the runtime lock
+        // before latching any error after publication: retained packets must
+        // not be released by the next submission while DMA may still be active.
+        if let Err(error) = result {
+            if let Some(runtime) = Option::as_mut(&mut *shared.lock()) {
+                if runtime.inner.gpu_pending {
+                    runtime.inner.capture_fault(error);
+                }
+            }
+        }
+        result
+    }
+    fn execute_inner(shared:&crate::m3_drm::Shared,packet:Arc<crate::m3_submit::Packet>)->Result {
         crate::debug::update_debug_flags();
         let unlocked_wait=crate::m3_params::unlocked_wait();
         let render_batch_size=crate::m3_params::render_batch_size();
@@ -260,7 +291,7 @@ impl Runtime {
                 let poll_start=measure.then(Instant::<Monotonic>::now);
                 let messages=inner.state.event_messages.load(Ordering::Acquire);
                 if !inner.state.healthy() || inner.config.drain(&inner.drm).is_err() {
-                    inner.fail(index, &packet.vm);return Err(EIO);
+                    inner.fail(index, &packet.vm, EIO);return Err(EIO);
                 }
                 let complete=inner.jobs[index].complete()? && inner.config.completed_events>=previous_events+expected_events;
                 if let Some(t)=poll_start {polling_ns+=t.elapsed().as_nanos();polls+=1;}
@@ -353,12 +384,12 @@ impl Runtime {
                         },
                         Ok(())=>{}, // Firmware must consume every submitted queue message.
                         Err(e) if e==EBUSY=>{}, // Retirement can trail the event.
-                        Err(e)=>{inner.fail(index, &packet.vm);return Err(e);}
+                        Err(e)=>{inner.fail(index, &packet.vm, e);return Err(e);}
                     }
                 }
                 if start.elapsed()>=Delta::from_secs(2) {
                     dev_err!(inner.drm.as_ref(),"M3 completion events={} previous={}\n",inner.config.completed_events,previous_events);
-                    inner.fail(index, &packet.vm);return Err(ETIMEDOUT);
+                    inner.fail(index, &packet.vm, ETIMEDOUT);return Err(ETIMEDOUT);
                 }
                 // Four bounded 5us polls cover stamps written just after an
                 // event without paying a scheduler round-trip for each poll.
@@ -380,13 +411,18 @@ impl Runtime {
     }
     pub(crate) fn service_events(&mut self) {
         let inner=&mut *self.inner;
-        if inner.state.healthy() && inner.config.drain(&inner.drm).is_err() {
-            inner.state.health.mark_failed();
-            let events=inner.state.event_messages.load(Ordering::Acquire);
-            let _=inner.config.log_recovery_state(&inner.drm,events);
-        }
+        if inner.fault_captured { return; }
+        let result = if inner.state.healthy() { inner.config.drain(&inner.drm) }
+            else { Err(EIO) };
+        if let Err(error) = result { inner.capture_fault(error); }
     }
+
     pub(crate) fn boot(&mut self, pdev: &platform::Device<Core>) -> Result {
+        let result = self.boot_inner(pdev);
+        if let Err(error) = result { self.inner.capture_fault(error); }
+        result
+    }
+    fn boot_inner(&mut self, pdev: &platform::Device<Core>) -> Result {
         let root = self.inner.config.root();
         dev_info!(pdev.as_ref(), "M3: publishing owned initdata {:#x}\n", root);
         Pin::new(&mut self.inner.transport).send_message(0x20, 0x0081000000000000 | (root & ((1u64<<44)-1)))?;
@@ -395,7 +431,7 @@ impl Runtime {
         let start = Instant::<Monotonic>::now();
         while !self.inner.config.ready()? {
             if start.elapsed() >= Delta::from_secs(2) || !self.inner.state.healthy() {
-                let inner=&mut *self.inner;inner.config.log_ready(&inner.drm)?;
+                let inner=&mut *self.inner;let _=inner.config.log_ready(&inner.drm);
                 return Err(ETIMEDOUT);
             }
             fsleep(Delta::from_millis(1));

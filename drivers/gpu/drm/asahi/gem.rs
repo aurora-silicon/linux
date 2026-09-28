@@ -51,6 +51,7 @@ pub(crate) struct AsahiObject {
     exportable: bool,
     /// Whether this is a kernel-created object.
     kernel: bool,
+    _allocation: crate::agx_memory_stats::Allocation,
 }
 
 /// Type alias for the shmem GEM object type for this driver.
@@ -169,6 +170,16 @@ pub(crate) struct AsahiObjConfig {
     kernel: bool,
 }
 
+/// Validate before rounding: wrapping a user size can create a much smaller
+/// backing than requested (or panic with overflow checks). Kernel callers use
+/// the same boundary so malformed calculated sizes cannot bypass this check.
+fn checked_object_size(size: usize) -> Result<usize> {
+    if size == 0 { return Err(EINVAL); }
+    size.checked_add(mmu::UAT_PGMSK)
+        .map(|rounded| rounded & !mmu::UAT_PGMSK)
+        .ok_or(EOVERFLOW)
+}
+
 fn new_kernel_object_with_cpu_mapping(
     dev: &AsahiDevice,
     size: usize,
@@ -176,7 +187,7 @@ fn new_kernel_object_with_cpu_mapping(
 ) -> Result<ObjectRef> {
     let gem = shmem::Object::<AsahiObject>::new(
         dev,
-        align(size, mmu::UAT_PGSZ),
+        checked_object_size(size)?,
         shmem::ObjectConfig::<AsahiObject> {
             map_wc,
             parent_resv_obj: None,
@@ -215,7 +226,7 @@ pub(crate) fn new_object(
 
     let gem = shmem::Object::<AsahiObject>::new(
         dev,
-        align(size, mmu::UAT_PGSZ),
+        checked_object_size(size)?,
         shmem::ObjectConfig::<AsahiObject> {
             map_wc: flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_WRITEBACK == 0,
             parent_resv_obj: parent_object,
@@ -239,7 +250,7 @@ impl DriverObject for AsahiObject {
     const HAS_EXPORT: bool = true;
 
     /// Callback to create the inner data of a GEM object
-    fn new(_dev: &AsahiDevice, _size: usize, args: Self::Args) -> impl PinInit<Self, Error> {
+    fn new(_dev: &AsahiDevice, size: usize, args: Self::Args) -> impl PinInit<Self, Error> {
         let id = GEM_ID.fetch_add(1, Ordering::Relaxed);
         mod_pr_debug!("AsahiObject::new id={}\n", id);
         try_pin_init!(AsahiObject {
@@ -247,6 +258,7 @@ impl DriverObject for AsahiObject {
             flags: args.flags,
             exportable: args.exportable,
             kernel: args.kernel,
+            _allocation: crate::agx_memory_stats::Allocation::gem(size, args.kernel)?,
         })
     }
 

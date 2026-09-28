@@ -14,6 +14,7 @@ pub(crate) struct Buffer {
     object: Backing,
     offset: usize,
     size: usize,
+    _coherent_allocation: Option<crate::agx_memory_stats::Allocation>,
 }
 
 impl Buffer {
@@ -41,7 +42,8 @@ impl Buffer {
         let mapping=if let Some(a)=address {fw.map_io(a&!0x3fff,pa,allocated,protection)?}
             else {fw.map_io_in_range(0xffff_fc2d_0000_0000..0xffff_fc2e_0000_0000,pa,allocated,protection)?};
         let gpu_mapping=if let Some((vm,a))=gpu {Some(vm.map_io(a&!0x3fff,pa,allocated,gpu_protection)?)} else {None};
-        Ok(Self {mapping,gpu_mapping,object:Backing::Coherent(object),offset,size})
+        Ok(Self {mapping,gpu_mapping,object:Backing::Coherent(object),offset,size,
+            _coherent_allocation:Some(crate::agx_memory_stats::Allocation::coherent(allocated)?)})
     }
     /// Allocate owned tiler storage in the driver-reserved GPU range. Keep the
     /// old allocation mapped until the replacement has been fully allocated.
@@ -57,7 +59,7 @@ impl Buffer {
             mmu::UAT_PGSZ as u64,prot::PROT_GPU_FW_SHARED_RW,true)?;
         let gpu_mapping=Some(object.map_into_range(vm,0x74_0000_0000..0x78_0000_0000,
             mmu::UAT_PGSZ as u64,prot::PROT_GPU_SHARED_RW,true)?);
-        Ok(Self {mapping,gpu_mapping,object:Backing::Paged(object),offset:0,size})
+        Ok(Self {mapping,gpu_mapping,object:Backing::Paged(object),offset:0,size,_coherent_allocation:None})
     }
     pub(crate) fn va(&self)->u64 {self.mapping.iova()+self.offset as u64}
     pub(crate) fn gpu_va(&self)->Result<u64> {Ok(self.gpu_mapping.as_ref().ok_or(EINVAL)?.iova()+self.offset as u64)}

@@ -15,8 +15,10 @@ def parse(text):
     values = {k: int(v) for k, v in pairs}
     if set(values) != FIELDS or any(v < 0 for v in values.values()):
         raise RuntimeError('Invalid GPU progress fields')
-    if values['version'] != 1 or values['healthy'] != 1:
-        raise RuntimeError('GPU progress ABI mismatch or latched unhealthy state')
+    if values['version'] != 1:
+        raise RuntimeError('GPU progress ABI mismatch')
+    if values['healthy'] not in (0, 1):
+        raise RuntimeError('Invalid GPU health value')
     if values['generation_ns'] == 0:
         raise RuntimeError('Missing GPU runtime generation')
     if values['completed'] and values['last_completion_ns'] == 0:
@@ -31,7 +33,6 @@ class CompletionProgress:
         self.previous = self._read()
         self.baseline = self.previous['completed']
         self.latest = None
-        self._record(self.previous)
 
     def _read(self):
         # Reading accesses host atomics only, never GPU registers or its worker
@@ -40,7 +41,13 @@ class CompletionProgress:
             text = f.read(1025)
         if len(text) > 1024:
             raise RuntimeError('Oversized GPU progress snapshot')
-        return parse(text)
+        sample = parse(text)
+        # Retain the terminal snapshot before rejecting it. Evidence collection
+        # cannot make an unhealthy sample eligible to renew the watchdog.
+        self._record(sample)
+        if not sample['healthy']:
+            raise RuntimeError('GPU runtime latched unhealthy')
+        return sample
 
     def _record(self, sample):
         with self.evidence.open('a') as f:
@@ -62,7 +69,6 @@ class CompletionProgress:
                 raise RuntimeError(('Stale GPU completion', age))
             self.latest = when
         self.previous = sample
-        self._record(sample)
         return sample['completed']-self.baseline, self.latest
 
     def close(self):

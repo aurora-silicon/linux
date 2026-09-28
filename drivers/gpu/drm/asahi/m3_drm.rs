@@ -18,6 +18,7 @@ pub(crate) struct Registered {
     shared: Shared,
     health: Arc<crate::m3_rtkit::Health>,
     _progress: Pin<KBox<kernel::debugfs::File<ProgressView>>>,
+    _memory: Pin<KBox<kernel::debugfs::File<crate::agx_memory_stats::View>>>,
 }
 impl Registered {
     pub(crate) fn start(pdev: &platform::Device<Core>) -> Result<Self> {
@@ -43,8 +44,10 @@ impl Registered {
         let directory = kernel::debugfs::Dir::new(c"asahi-m3");
         let progress = KBox::pin_init(directory.read_only_file(c"progress",
             ProgressView(health.clone())), GFP_KERNEL)?;
+        let memory = KBox::pin_init(directory.read_only_file(c"memory",
+            crate::agx_memory_stats::View), GFP_KERNEL)?;
         let shared = Arc::pin_init(new_mutex!(Some(runtime)), GFP_KERNEL)?;
-        let owner = Self { registration: KBox::pin_init(new_mutex!(None), GFP_KERNEL)?, shared: shared.clone(), health: health.clone(), _progress: progress };
+        let owner = Self { registration: KBox::pin_init(new_mutex!(None), GFP_KERNEL)?, shared: shared.clone(), health: health.clone(), _progress: progress, _memory: memory };
         let scheduler=Arc::new(drm::sched::Scheduler::new(drm.as_ref(),4,8,0,3000,kernel::c_str!("asahi_m3_sched"))?,GFP_KERNEL)?;
         let backend: Arc<dyn DrmGpu> = Arc::new(Backend { shared, health, scheduler, ids: gpu::SequenceIDs::default(),
             core_mask, max_frequency_khz }, GFP_KERNEL)?;
