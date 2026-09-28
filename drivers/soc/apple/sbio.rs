@@ -20,28 +20,45 @@ impl SepData {
     pub(crate) fn sbio_call(&self, op: &crate::sbio::SbioOp) -> SbioOutcome {
         let done = match self.sbio_transfer(op) {
             Ok(done) => done,
-            Err(_) => {
+            Err(e) => {
+                dev_err!(self.dev, "sbio: {} transfer failed: {:?}\n", op.name, e);
                 return SbioOutcome::Other;
             }
         };
 
         let Some(err) = done.status.answered() else {
+            dev_err!(self.dev, "sbio: {} was not answered\n", op.name);
             return SbioOutcome::Other;
         };
 
         match err as u16 {
             crate::sbio::SBIO_STATUS_OK => SbioOutcome::Ok(done.payload),
-            crate::sbio::SBIO_STATUS_PREREQUISITE => SbioOutcome::PrerequisiteMissing,
-            crate::sbio::SBIO_STATUS_16 => SbioOutcome::Status16,
-            _ => SbioOutcome::Other,
+            crate::sbio::SBIO_STATUS_PREREQUISITE => {
+                dev_err!(self.dev, "sbio: {} refused: status {:#x} (prerequisite missing)\n", op.name, err);
+                SbioOutcome::PrerequisiteMissing
+            }
+            crate::sbio::SBIO_STATUS_16 => {
+                dev_err!(self.dev, "sbio: {} refused: status {:#x}\n", op.name, err);
+                SbioOutcome::Status16
+            }
+            _ => {
+                dev_err!(self.dev, "sbio: {} refused: status {:#x}, payload {} bytes\n", op.name, err, done.payload.len());
+                SbioOutcome::Other
+            }
         }
     }
 
     fn sbio_relay(&self, relay: &crate::sbio::SbioRelay<'_>) -> Option<KVec<u8>> {
         match self.sbio_transfer_raw(relay.opcode(), relay.name(), relay.payload()) {
             Ok(done) if done.status.is_ok() => Some(done.payload),
-            Ok(_) => None,
-            Err(_) => None,
+            Ok(done) => {
+                dev_err!(self.dev, "sbio: relay {} (opcode {:#x}) refused: status {:?}\n", relay.name(), relay.opcode(), done.status.answered());
+                None
+            }
+            Err(e) => {
+                dev_err!(self.dev, "sbio: relay {} (opcode {:#x}) transfer failed: {:?}\n", relay.name(), relay.opcode(), e);
+                None
+            }
         }
     }
 
@@ -1096,6 +1113,7 @@ impl SepData {
         }
 
         let Some(open) = self.begin_enrolment_on_enclave() else {
+            dev_err!(self.dev, "enrol: the enclave refused to open an enrolment (see sbio: lines above)\n");
             self.finish_enrolment(Err(ENROL_STATUS_ENCLAVE));
             let _ = sensor::idle();
             return;
@@ -1138,6 +1156,13 @@ impl SepData {
                     // completion is the flag at offset 0xbfe, not a derived stage count
                     if complete {
                         if !has_template {
+                            dev_err!(
+                                self.dev,
+                                "enrol: enclave flags completion after {} capture(s) (stage {}, {}%) but reports no template\n",
+                                counter,
+                                stage,
+                                percent
+                            );
                             break Some(Err(ENROL_STATUS_ENCLAVE));
                         }
                         enrolment_completed = true;
@@ -1703,6 +1728,7 @@ impl SepData {
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
         if assessment.len() < crate::sbio::ASSESS_MIN_LEN {
+            dev_err!(self.dev, "enrol: IMAGE_ASSESSMENT reply too short: {} bytes (need {})\n", assessment.len(), crate::sbio::ASSESS_MIN_LEN);
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
         let usable = assessment[crate::sbio::ASSESS_USABLE_ENROL] != 0;
@@ -1714,6 +1740,12 @@ impl SepData {
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
         let Some(parsed) = crate::sbio::EnrolmentResult::parse(&result) else {
+            dev_err!(
+                self.dev,
+                "enrol: ENROLMENT_RESULT reply did not parse: {} bytes, head {:02x?}\n",
+                result.len(),
+                &result[..result.len().min(16)]
+            );
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
 
