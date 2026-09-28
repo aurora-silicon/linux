@@ -193,12 +193,17 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 
 	if (in_len > 0)
 		memcpy(out_data, data, in_len);
+	/* An unwritten status must not look like a successful response. */
+	if (out_len)
+		memset(out_data + in_len, 0xff, out_len);
 
 	trace_iomfb_push(dcp, call, context, offset, depth);
 
 	ch->callbacks[depth] = cb;
 	ch->cookies[depth] = cookie;
 	ch->output[depth] = out + sizeof(header) + in_len;
+	ch->in_len[depth] = in_len;
+	ch->out_len[depth] = out_len;
 	ch->end[depth] = offset + ALIGN(data_len, DCP_PACKET_ALIGNMENT);
 
 	dcp_send_message(dcp, IOMFB_ENDPOINT,
@@ -405,6 +410,12 @@ static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context,
 		out = ch->output[ch->depth];
 		ch->output[ch->depth] = NULL;
 	} else {
+		if (header->in_len != ch->in_len[ch->depth] ||
+		    header->out_len != ch->out_len[ch->depth]) {
+			dev_err(dcp->dev, "invalid command response lengths\n");
+			dcp->crashed = true;
+			return;
+		}
 		out = data + sizeof(*header) + header->in_len;
 	}
 

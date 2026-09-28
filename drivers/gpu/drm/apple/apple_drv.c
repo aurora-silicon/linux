@@ -122,10 +122,11 @@ static void apple_crtc_atomic_disable(struct drm_crtc *crtc,
 				      struct drm_atomic_state *state)
 {
 	struct drm_crtc_state *crtc_state;
+	struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
+
 	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 
 	if (crtc_state->active_changed && !crtc_state->active) {
-		struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
 		dcp_poweroff(apple_crtc->dcp);
 	}
 
@@ -230,8 +231,29 @@ static const struct drm_mode_config_funcs apple_mode_config_funcs = {
 	.fb_create		= drm_gem_fb_create,
 };
 
+static void apple_atomic_commit_tail(struct drm_atomic_state *state)
+{
+	struct drm_plane *plane;
+	struct drm_plane_state *old, *new;
+	int i;
+
+	/* Retain displaced scanout even when the CRTC stays inactive. */
+	for_each_oldnew_plane_in_state(state, plane, old, new, i) {
+		struct apple_plane_state *apple_state = to_apple_plane_state(new);
+		struct dcp_fb_reference *entry = apple_state->retirement;
+
+		if (!entry)
+			continue;
+
+		apple_state->retirement = NULL;
+		dcp_retain_framebuffer(to_apple_crtc(old->crtc)->dcp, entry);
+	}
+
+	drm_atomic_helper_commit_tail_rpm(state);
+}
+
 static const struct drm_mode_config_helper_funcs apple_mode_config_helpers = {
-	.atomic_commit_tail	= drm_atomic_helper_commit_tail_rpm,
+	.atomic_commit_tail	= apple_atomic_commit_tail,
 };
 
 static void appledrm_connector_cleanup(struct drm_connector *connector)

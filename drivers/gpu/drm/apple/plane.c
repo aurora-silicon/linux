@@ -5,6 +5,7 @@
 
 #include "plane.h"
 
+#include "dcp-internal.h"
 #include "iomfb_internal.h"
 
 #include <drm/drm_atomic.h>
@@ -13,6 +14,7 @@
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem.h>
+#include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_plane.h>
 
@@ -292,13 +294,56 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 		new_state->iova = obj->dma_addr + base->fb->offsets[0];
 }
 
+static void apple_plane_cleanup_fb(struct drm_plane *plane,
+				   struct drm_plane_state *state)
+{
+	struct apple_plane_state *apple_state = to_apple_plane_state(state);
+	struct dcp_fb_reference *entry = apple_state->retirement;
+
+	if (!entry)
+		return;
+
+	apple_state->retirement = NULL;
+	drm_framebuffer_put(entry->fb);
+	kfree(entry);
+}
+
+static int apple_plane_prepare_fb(struct drm_plane *plane,
+				  struct drm_plane_state *state)
+{
+	struct drm_plane_state *old;
+	struct dcp_fb_reference *entry;
+	int ret;
+
+	ret = drm_gem_plane_helper_prepare_fb(plane, state);
+	if (ret)
+		return ret;
+
+	old = drm_atomic_get_old_plane_state(state->state, plane);
+	if (!old || !old->crtc || !old->fb || old->fb == state->fb)
+		return 0;
+
+	entry = kzalloc_obj(*entry);
+	if (!entry)
+		return -ENOMEM;
+
+	drm_framebuffer_get(old->fb);
+	entry->fb = old->fb;
+	to_apple_plane_state(state)->retirement = entry;
+	return 0;
+}
+
 static const struct drm_plane_helper_funcs apple_primary_plane_helper_funcs = {
+	.prepare_fb	= apple_plane_prepare_fb,
+	.cleanup_fb	= apple_plane_cleanup_fb,
 	.atomic_check	= apple_plane_atomic_check,
 	.atomic_update	= apple_plane_atomic_update,
 	.get_scanout_buffer = drm_fb_dma_get_scanout_buffer,
 };
 
 static const struct drm_plane_helper_funcs apple_plane_helper_funcs = {
+	.prepare_fb	= apple_plane_prepare_fb,
+	.cleanup_fb	= apple_plane_cleanup_fb,
 	.atomic_check	= apple_plane_atomic_check,
 	.atomic_update	= apple_plane_atomic_update,
 };
@@ -307,8 +352,10 @@ static const struct drm_plane_helper_funcs apple_plane_helper_funcs = {
 static void apple_plane_reset(struct drm_plane *plane)
 {
         struct apple_plane_state *state = to_apple_plane_state(plane->state);
-	if (state)
+	if (state) {
+		apple_plane_cleanup_fb(plane, &state->base);
 		__drm_atomic_helper_plane_destroy_state(&state->base);
+	}
 
 	kfree(state);
 	plane->state = NULL;
@@ -340,19 +387,19 @@ apple_plane_duplicate_state(struct drm_plane *plane)
 	return &apple_plane_state->base;
 }
 
-// void apple_plane_destroy_state(struct drm_plane *plane,
-//                                      struct drm_plane_state *state)
-// {
-// 	drm_atomic_helper_plane_destroy_state(plane, state);
-// }
+static void apple_plane_destroy_state(struct drm_plane *plane,
+				      struct drm_plane_state *state)
+{
+	apple_plane_cleanup_fb(plane, state);
+	drm_atomic_helper_plane_destroy_state(plane, state);
+}
 
 static const struct drm_plane_funcs apple_plane_funcs = {
 	.update_plane		= drm_atomic_helper_update_plane,
 	.disable_plane		= drm_atomic_helper_disable_plane,
 	.reset			= apple_plane_reset,
 	.atomic_duplicate_state = apple_plane_duplicate_state,
-	// .atomic_destroy_state	= apple_plane_destroy_state,
-	.atomic_destroy_state	= drm_atomic_helper_plane_destroy_state,
+	.atomic_destroy_state	= apple_plane_destroy_state,
 };
 
 /*

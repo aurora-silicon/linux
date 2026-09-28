@@ -94,6 +94,8 @@ struct dcp_channel {
 	dcp_callback_t callbacks[DCP_MAX_CALL_DEPTH];
 	void *cookies[DCP_MAX_CALL_DEPTH];
 	void *output[DCP_MAX_CALL_DEPTH];
+	u32 in_len[DCP_MAX_CALL_DEPTH];
+	u32 out_len[DCP_MAX_CALL_DEPTH];
 	u16 end[DCP_MAX_CALL_DEPTH];
 
 	/* Current depth of the call stack. Less than DCP_MAX_CALL_DEPTH */
@@ -274,16 +276,12 @@ struct apple_dcp {
 	/* Workqueue for sending vblank events when a dcp swap is not possible */
 	struct work_struct vblank_wq;
 
-	/* List of referenced drm_framebuffers which can be unreferenced
-	 * on the next successfully completed swap.
+	/* List of referenced framebuffers pending a completed replacement swap.
+	 * The commit and RTKit work queues share it under this lock.
 	 */
 	struct list_head swapped_out_fbs;
-	/*
-	 * Protects swapped_out_fbs, which is appended to from the DRM atomic
-	 * commit (dcp_flush -> .atomic_flush) and armed/drained from the RTKit
-	 * workqueue that runs the DCP callbacks.
-	 */
-	spinlock_t swapped_out_lock;
+	/* Protects swapped_out_fbs. */
+	struct mutex swapped_out_fbs_lock;
 
 	struct dcp_brightness brightness;
 	/* Workqueue for updating the initial brightness */

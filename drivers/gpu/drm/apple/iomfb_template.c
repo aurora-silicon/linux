@@ -41,6 +41,7 @@ static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), flags1) == 0x40);
 struct dcp_wait_cookie {
 	struct kref refcount;
 	struct completion done;
+	u32 status;
 };
 
 static void release_wait_cookie(struct kref *ref)
@@ -219,108 +220,15 @@ static u32 dcpep_cb_zero(struct apple_dcp *dcp)
 	return 0;
 }
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-/*
- * Bind every framebuffer displaced by the commit that produced this swap to
- * that swap's id.
- *
- * The id only exists once the firmware answers swap_start, after the atomic
- * commit has queued its entries, so they are queued unarmed and stamped here.
- * Swap-start requests are serialized by the DCP command stack.
- */
-static void dcp_arm_swapped_out_fbs(struct apple_dcp *dcp, u32 swap_id)
-{
-	struct dcp_fb_reference *entry;
-	unsigned long flags;
-
-	spin_lock_irqsave(&dcp->swapped_out_lock, flags);
-	list_for_each_entry(entry, &dcp->swapped_out_fbs, head) {
-		if (entry->armed)
-			continue;
-		entry->swap_id = swap_id;
-		entry->armed = true;
-	}
-	spin_unlock_irqrestore(&dcp->swapped_out_lock, flags);
-}
-
-/*
- * Drop framebuffers whose unbinding swap has completed.
- *
- * Entries must be keyed to the swap that unbinds them, rather than the last
- * swap that happened to have completed when the atomic commit ran.  A later
- * successful completion also retires entries whose own completion was lost;
- * the signed difference keeps that comparison valid across a 32-bit wrap.
- */
-static void dcp_release_swapped_out_fbs(struct apple_dcp *dcp)
-{
-	struct dcp_fb_reference *entry, *tmp;
-	unsigned long flags;
-	LIST_HEAD(done);
-
-	/*
-	 * last_swap_id / have_swap_complete are only ever touched by the RTKit
-	 * worker, which is also the only caller of this function, so the lock
-	 * is here for the list alone.
-	 */
-	spin_lock_irqsave(&dcp->swapped_out_lock, flags);
-	while (!list_empty(&dcp->swapped_out_fbs)) {
-		entry = list_first_entry(&dcp->swapped_out_fbs,
-					 struct dcp_fb_reference, head);
-
-		/* Newest entries; their swap has not been started yet. */
-		if (!entry->armed)
-			break;
-		/* last_swap_id is 0 from kzalloc until a swap really lands. */
-		if (!dcp->have_swap_complete)
-			break;
-		/* Hold the old framebuffer for one additional completed swap. */
-		if ((s32)(dcp->last_swap_id - entry->swap_id) <= 0)
-			break;
-
-		list_move_tail(&entry->head, &done);
-	}
-	spin_unlock_irqrestore(&dcp->swapped_out_lock, flags);
-
-	/* drm_framebuffer_put() can sleep, so never call it under the lock. */
-	list_for_each_entry_safe(entry, tmp, &done, head) {
-		if (entry->fb)
-			drm_framebuffer_put(entry->fb);
-		list_del(&entry->head);
-		kfree(entry);
-	}
-}
-#else
-static void dcp_arm_swapped_out_fbs(struct apple_dcp *dcp, u32 swap_id) { }
-
-static void dcp_release_swapped_out_fbs(struct apple_dcp *dcp)
-{
-	while (!list_empty(&dcp->swapped_out_fbs)) {
-		struct dcp_fb_reference *entry;
-
-		entry = list_first_entry(&dcp->swapped_out_fbs,
-					 struct dcp_fb_reference, head);
-		if (entry->swap_id == dcp->last_swap_id)
-			break;
-		if (entry->fb)
-			drm_framebuffer_put(entry->fb);
-		list_del(&entry->head);
-		kfree(entry);
-	}
-}
-#endif
-
 static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 				   struct DCP_FW_NAME(dc_swap_complete_resp) *resp)
 {
 	ktime_t now = ktime_get();
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
 	dcp->last_swap_id = resp->swap_id;
+	dcp_release_retained_framebuffers(dcp, resp->swap_id);
 
 	dcp_drm_crtc_page_flip(dcp, now);
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-	dcp->have_swap_complete = true;
-	dcp_release_swapped_out_fbs(dcp);
-#endif
 	if (dcp->crc_enabled) {
 		u32 crc32 = 0;
 		drm_crtc_add_crc_entry(&dcp->crtc->base, true, resp->swap_id, &crc32);
@@ -1220,6 +1128,7 @@ static u64 dcpep_cb_get_time(struct apple_dcp *dcp)
 struct dcp_swap_cookie {
 	struct kref refcount;
 	struct completion done;
+	u32 status;
 	u32 swap_id;
 };
 
@@ -1299,33 +1208,42 @@ static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp) { }
 static void dcp_swap_cleared(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	struct DCP_FW_NAME(dcp_swap_submit_resp) *resp = data;
+	struct dcp_swap_cookie *info = cookie;
+	u32 swap_id = DCP_FW_UNION(dcp->swap).swap.swap_id;
+	u32 status = resp ? resp->ret : ~0U;
 
-	if (cookie) {
-		struct dcp_swap_cookie *info = cookie;
+	if (status) {
+		dev_err(dcp->dev, "swap_clear failed! status %u\n", status);
+		dcp_unarm_retained_framebuffers(dcp, swap_id);
+		dcp_drm_crtc_vblank(dcp->crtc);
+	}
+	if (info) {
+		WRITE_ONCE(info->status, status);
 		complete(&info->done);
 		kref_put(&info->refcount, release_swap_cookie);
 	}
-
-	if (resp->ret) {
-		dev_err(dcp->dev, "swap_clear failed! status %u\n", resp->ret);
-		dcp_drm_crtc_vblank(dcp->crtc);
-		return;
-	}
-
-	dcp_release_swapped_out_fbs(dcp);
 }
 
 static void dcp_swap_clear_started(struct apple_dcp *dcp, void *data,
 				   void *cookie)
 {
 	struct DCP_FW_NAME(dcp_swap_start_resp) *resp = data;
-	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
-	dcp_arm_swapped_out_fbs(dcp, resp->swap_id);
+	struct dcp_swap_cookie *info = cookie;
 
-	if (cookie) {
-		struct dcp_swap_cookie *info = cookie;
-		info->swap_id = resp->swap_id;
+	if (!resp || resp->ret) {
+		if (info) {
+			WRITE_ONCE(info->status, resp ? resp->ret : ~0U);
+			complete(&info->done);
+			kref_put(&info->refcount, release_swap_cookie);
+		}
+		dcp_drm_crtc_vblank(dcp->crtc);
+		return;
 	}
+	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
+	dcp_arm_retained_framebuffers(dcp, resp->swap_id);
+
+	if (info)
+		info->swap_id = resp->swap_id;
 
 	dcp_h17p_fix_swap_surfaces(dcp);
 	dcp_swap_submit(dcp, false, &DCP_FW_UNION(dcp->swap), dcp_swap_cleared, cookie);
@@ -1376,6 +1294,7 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 	if (!cookie)
 		return;
 
+	cookie->status = ~0U;
 	init_completion(&cookie->done);
 	kref_init(&cookie->refcount);
 	/* increase refcount to ensure the receiver has a reference */
@@ -1425,12 +1344,24 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 static void complete_set_powerstate(struct apple_dcp *dcp, void *out,
 				    void *cookie)
 {
+	struct dcp_set_power_state_resp *resp = out;
 	struct dcp_wait_cookie *wait = cookie;
 
 	if (wait) {
+		WRITE_ONCE(wait->status, resp ? resp->ret : ~0U);
 		complete(&wait->done);
 		kref_put(&wait->refcount, release_wait_cookie);
 	}
+}
+
+static bool dcp_power_stop_confirmed(struct dcp_wait_cookie *cookie)
+{
+	/* H17P stop semantics still require hardware qualification. */
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	return false;
+#else
+	return READ_ONCE(cookie->status) == 0;
+#endif
 }
 
 static void last_client_closed_poff(struct apple_dcp *dcp, void *out, void *cookie)
@@ -1465,6 +1396,7 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie)
 		return;
+	cookie->status = ~0U;
 	init_completion(&cookie->done);
 	kref_init(&cookie->refcount);
 	/* increase refcount to ensure the receiver has a reference */
@@ -1506,6 +1438,8 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 
 	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(50));
 	swap_id = cookie->swap_id;
+	if (READ_ONCE(cookie->status))
+		ret = 0;
 	kref_put(&cookie->refcount, release_swap_cookie);
 	if (ret <= 0) {
 		dcp->crashed = true;
@@ -1517,6 +1451,7 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	poff_cookie = kzalloc(sizeof(*poff_cookie), GFP_KERNEL);
 	if (!poff_cookie)
 		return;
+	poff_cookie->status = ~0U;
 	init_completion(&poff_cookie->done);
 	kref_init(&poff_cookie->refcount);
 	/* increase refcount to ensure the receiver has a reference */
@@ -1535,10 +1470,15 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 
 	if (ret == 0)
 		dev_warn(dcp->dev, "setPowerState(0) timeout %u ms\n", 1000);
-	else if (ret > 0)
+	else if (ret > 0) {
 		dev_dbg(dcp->dev,
 			"setPowerState(0) finished with %d ms to spare",
 			jiffies_to_msecs(ret));
+		if (dcp_power_stop_confirmed(poff_cookie))
+			dcp_release_all_retained_framebuffers(dcp);
+		else
+			dev_warn(dcp->dev, "scanout stop was not confirmed\n");
+	}
 
 	kref_put(&poff_cookie->refcount, release_wait_cookie);
 
@@ -1573,6 +1513,7 @@ void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp)
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie)
 		return;
+	cookie->status = ~0U;
 	init_completion(&cookie->done);
 	kref_init(&cookie->refcount);
 	/* increase refcount to ensure the receiver has a reference */
@@ -1765,24 +1706,29 @@ TRAMPOLINE_OUT(trampoline_create_backlight_service, dcpep_cb_create_backlight_se
 static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	struct DCP_FW_NAME(dcp_swap_submit_resp) *resp = data;
+	u32 swap_id = DCP_FW_UNION(dcp->swap).swap.swap_id;
 
 	if (resp->ret) {
 		dev_err(dcp->dev, "swap failed! status %u\n", resp->ret);
+		dcp_unarm_retained_framebuffers(dcp, swap_id);
 		dcp_drm_crtc_vblank(dcp->crtc);
 		return;
 	}
 	dcp->swap_start = ktime_get();
 	dcp->swap_submit_timestamp = arch_timer_read_counter();
-
-	dcp_release_swapped_out_fbs(dcp);
 }
 
 static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	struct DCP_FW_NAME(dcp_swap_start_resp) *resp = data;
 
+	if (!resp || resp->ret) {
+		dev_err(dcp->dev, "swap_start was rejected\n");
+		dcp_drm_crtc_vblank(dcp->crtc);
+		return;
+	}
 	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
-	dcp_arm_swapped_out_fbs(dcp, resp->swap_id);
+	dcp_arm_retained_framebuffers(dcp, resp->swap_id);
 
 	trace_iomfb_swap_submit(dcp, resp->swap_id);
 	dcp_h17p_fix_swap_surfaces(dcp);
@@ -1900,6 +1846,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		return -ENOMEM;
 	}
 
+	cookie->status = ~0U;
 	init_completion(&cookie->done);
 	kref_init(&cookie->refcount);
 	/* increase refcount to ensure the receiver has a reference */
@@ -2013,44 +1960,6 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 		l = apl_plane->iomfb_surf;
 		req->swap.swap_enabled |= BIT(l);
-
-		if (old_state->fb && new_state->fb != old_state->fb) {
-			/*
-			 * Race condition between a framebuffer unbind getting
-			 * swapped out and GEM unreferencing a framebuffer. If
-			 * we lose the race, the display gets IOVA faults and
-			 * the DCP crashes. We need to extend the lifetime of
-			 * the drm_framebuffer (and hence the GEM object) until
-			 * after we get a swap complete for the swap unbinding
-			 * it.
-			 */
-			struct dcp_fb_reference *entry =
-				kzalloc(sizeof(*entry), GFP_KERNEL);
-			if (entry) {
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-				unsigned long flags;
-
-				entry->fb = old_state->fb;
-				/*
-				 * Left unarmed: the id of the swap that
-				 * unbinds this framebuffer is not known until
-				 * the firmware answers swap_start.
-				 */
-				spin_lock_irqsave(&dcp->swapped_out_lock,
-						  flags);
-				list_add_tail(&entry->head,
-					      &dcp->swapped_out_fbs);
-				spin_unlock_irqrestore(&dcp->swapped_out_lock,
-						       flags);
-#else
-				entry->fb = old_state->fb;
-				entry->swap_id = dcp->last_swap_id;
-				list_add_tail(&entry->head,
-					      &dcp->swapped_out_fbs);
-#endif
-			}
-			drm_framebuffer_get(old_state->fb);
-		}
 
 		if (!new_state->fb || !new_state->visible) {
 			continue;
@@ -2331,6 +2240,21 @@ void DCP_FW_NAME(iomfb_shutdown)(struct apple_dcp *dcp)
 	struct DCP_FW_NAME(dcp_set_power_state_req) req = {
 		/* defaults are ok */
 	};
+	struct dcp_wait_cookie *cookie;
+	int ret;
 
-	dcp_set_power_state(dcp, DCP_POWER_OOB, &req, NULL, NULL);
+	cookie = kzalloc_obj(*cookie);
+	if (!cookie)
+		return;
+	cookie->status = ~0U;
+	init_completion(&cookie->done);
+	kref_init(&cookie->refcount);
+	kref_get(&cookie->refcount);
+	dcp_set_power_state(dcp, DCP_POWER_OOB, &req, complete_set_powerstate, cookie);
+	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(1000));
+	if (ret > 0 && dcp_power_stop_confirmed(cookie))
+		dcp_release_all_retained_framebuffers(dcp);
+	else
+		dev_warn(dcp->dev, "shutdown scanout stop was not confirmed\n");
+	kref_put(&cookie->refcount, release_wait_cookie);
 }

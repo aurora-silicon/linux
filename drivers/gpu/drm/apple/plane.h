@@ -19,12 +19,15 @@ struct apple_plane {
 
 #define to_apple_plane(x) container_of(x, struct apple_plane, base)
 
+struct dcp_fb_reference;
+
 struct apple_plane_state {
 	struct drm_plane_state base;
 	struct dcp_surface surf;
 	struct dcp_rect src_rect;
 	struct dcp_rect dst_rect;
 	u64 iova;
+	struct dcp_fb_reference *retirement;
 };
 
 #define to_apple_plane_state(x) container_of(x, struct apple_plane_state, base)
