@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Fixed iBoot mode, CPU shadow updates, optionally synchronized buffer swaps. */
 #include <linux/dma-mapping.h>
+#include <linux/bitmap.h>
 #include <linux/dma-fence.h>
 #include <linux/iosys-map.h>
 #include <drm/drm_atomic.h>
@@ -24,6 +25,10 @@
 #define EXT_WIDTH DCPEXT_WIDTH
 #define EXT_HEIGHT DCPEXT_HEIGHT
 #define EXT_STRIDE DCPEXT_STRIDE
+#define EXT_TILE_SIZE 32
+#define EXT_TILE_COLS DIV_ROUND_UP(EXT_WIDTH, EXT_TILE_SIZE)
+#define EXT_TILE_ROWS DIV_ROUND_UP(EXT_HEIGHT, EXT_TILE_SIZE)
+#define EXT_TILE_COUNT (EXT_TILE_COLS * EXT_TILE_ROWS)
 
 struct dcpext_drm {
 	struct drm_device drm;
@@ -38,7 +43,9 @@ struct dcpext_drm {
 	bool pageflips;
 	u8 *row;
 	/* Damage from the last completed frame; the idle buffer is one older. */
-	struct drm_rect previous_damage;
+	DECLARE_BITMAP(previous_damage, EXT_TILE_COUNT);
+	DECLARE_BITMAP(current_damage, EXT_TILE_COUNT);
+	DECLARE_BITMAP(copy_damage, EXT_TILE_COUNT);
 	bool damage_valid;
 	/* Owned by the retained scanout, never by the detachable parent device. */
 	atomic_t *terminal_error;
@@ -120,15 +127,63 @@ static void ext_cancel_flip(struct dcpext_drm *ext, struct drm_atomic_state *sta
 	drm_event_cancel_free(&ext->drm, &event->base);
 }
 
-static int ext_copy_frame(struct dcpext_drm *ext, struct drm_plane_state *old,
-			  struct drm_plane_state *ps)
+/* Bound history storage without merging distant clips into one large box.
+ * A tile conservatively includes unchanged edge pixels, never omits damage.
+ * Scratch maps are protected by the retained scanout's presentation lock.
+ */
+static void ext_damage_tiles(struct dcpext_drm *ext, struct drm_plane_state *old,
+			     struct drm_plane_state *ps)
+{
+	struct drm_atomic_helper_damage_iter iter;
+	struct drm_rect bounds = DRM_RECT_INIT(0, 0, EXT_WIDTH, EXT_HEIGHT);
+	struct drm_rect damage;
+	unsigned int x1, x2, y, y2;
+
+	if (!ext->damage_valid) {
+		bitmap_fill(ext->current_damage, EXT_TILE_COUNT);
+		return;
+	}
+	bitmap_zero(ext->current_damage, EXT_TILE_COUNT);
+	drm_atomic_helper_damage_iter_init(&iter, old, ps);
+	drm_atomic_for_each_plane_damage(&iter, &damage) {
+		if (!drm_rect_intersect(&damage, &bounds))
+			continue;
+		x1 = damage.x1 / EXT_TILE_SIZE;
+		x2 = DIV_ROUND_UP(damage.x2, EXT_TILE_SIZE);
+		y2 = DIV_ROUND_UP(damage.y2, EXT_TILE_SIZE);
+		for (y = damage.y1 / EXT_TILE_SIZE; y < y2; y++)
+			bitmap_set(ext->current_damage, y * EXT_TILE_COLS + x1, x2 - x1);
+	}
+}
+
+static void ext_copy_rect(struct dcpext_drm *ext, struct drm_plane_state *ps,
+			  const struct dcpext_frame *frame, const struct drm_rect *copy)
 {
 	struct drm_shadow_plane_state *shadow = to_drm_shadow_plane_state(ps);
 	struct drm_framebuffer *fb = ps->fb;
-	struct drm_rect bounds = DRM_RECT_INIT(0, 0, EXT_WIDTH, EXT_HEIGHT);
-	struct drm_rect damage, copy;
+	int x, y;
+
+	for (y = copy->y1; y < copy->y2; y++) {
+		size_t offset = (size_t)y * fb->pitches[0] + copy->x1 * 4;
+		size_t bytes = drm_rect_width(copy) * 4;
+		u8 *dst = frame->pixels + (size_t)y * ext->stride + copy->x1 * 4;
+
+		iosys_map_memcpy_from(ext->row, &shadow->data[0], offset, bytes);
+		for (x = 0; x < drm_rect_width(copy); x++)
+			ext->row[x * 4 + 3] = 0xff;
+		/* Convert in cached memory, then stream to coherent scanout memory.
+		 * Byte stores directly to that mapping make full 4K copies costly.
+		 */
+		memcpy(dst, ext->row, bytes);
+	}
+}
+
+static int ext_copy_frame(struct dcpext_drm *ext, struct drm_plane_state *old,
+			  struct drm_plane_state *ps)
+{
 	struct dcpext_frame frame;
-	int x, y, ret;
+	unsigned int row, first, end, bit, next;
+	int ret;
 
 	ret = dcpext_scanout_begin_frame(ext->dcp, &frame);
 	if (ret)
@@ -141,39 +196,32 @@ static int ext_copy_frame(struct dcpext_drm *ext, struct drm_plane_state *old,
 	 * current damage from the current framebuffer, without touching scanout.
 	 * Invalid history forces two complete copies, initializing both buffers.
 	 */
-	if (!ext->damage_valid)
-		damage = bounds;
-	else if (!drm_atomic_helper_damage_merged(old, ps, &damage) ||
-		 !drm_rect_intersect(&damage, &bounds))
-		damage = (struct drm_rect) { 0 };
-	copy = damage;
-	if (ext->damage_valid && drm_rect_visible(&ext->previous_damage)) {
-		if (!drm_rect_visible(&copy)) {
-			copy = ext->previous_damage;
-		} else {
-			copy.x1 = min(copy.x1, ext->previous_damage.x1);
-			copy.y1 = min(copy.y1, ext->previous_damage.y1);
-			copy.x2 = max(copy.x2, ext->previous_damage.x2);
-			copy.y2 = max(copy.y2, ext->previous_damage.y2);
-		}
-	}
-	for (y = copy.y1; drm_rect_visible(&copy) && y < copy.y2; y++) {
-		size_t offset = (size_t)y * fb->pitches[0] + copy.x1 * 4;
-		size_t bytes = drm_rect_width(&copy) * 4;
-		u8 *dst = frame.pixels + (size_t)y * ext->stride + copy.x1 * 4;
+	ext_damage_tiles(ext, old, ps);
+	if (ext->damage_valid)
+		bitmap_or(ext->copy_damage, ext->current_damage,
+			  ext->previous_damage, EXT_TILE_COUNT);
+	else
+		bitmap_copy(ext->copy_damage, ext->current_damage, EXT_TILE_COUNT);
+	for (row = 0; row < EXT_TILE_ROWS; row++) {
+		first = row * EXT_TILE_COLS;
+		end = first + EXT_TILE_COLS;
+		bit = find_next_bit(ext->copy_damage, end, first);
+		while (bit < end) {
+			struct drm_rect copy;
 
-		iosys_map_memcpy_from(ext->row, &shadow->data[0], offset, bytes);
-		for (x = 0; x < drm_rect_width(&copy); x++)
-			ext->row[x * 4 + 3] = 0xff;
-		/* Convert in cached memory, then stream to coherent scanout memory.
-		 * Byte stores directly to that mapping make full 4K copies costly.
-		 */
-		memcpy(dst, ext->row, bytes);
+			next = find_next_zero_bit(ext->copy_damage, end, bit);
+			copy.x1 = (bit - first) * EXT_TILE_SIZE;
+			copy.x2 = min((next - first) * EXT_TILE_SIZE, EXT_WIDTH);
+			copy.y1 = row * EXT_TILE_SIZE;
+			copy.y2 = min((row + 1) * EXT_TILE_SIZE, EXT_HEIGHT);
+			ext_copy_rect(ext, ps, &frame, &copy);
+			bit = find_next_bit(ext->copy_damage, end, next);
+		}
 	}
 	ret = dcpext_scanout_end_frame(ext->dcp, true);
 	/* Ordered atomic commits advance history only after a completed swap. */
 	if (!ret) {
-		ext->previous_damage = damage;
+		bitmap_copy(ext->previous_damage, ext->current_damage, EXT_TILE_COUNT);
 		ext->damage_valid = true;
 	}
 	return ret;
