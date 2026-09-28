@@ -139,6 +139,40 @@ static bool dcp_typec_route_available(struct apple_dcp_typec_route *route)
 	       !dcp_typec_route_fixed_output_busy(route);
 }
 
+/*
+ * Machines whose USB4 docks carry two independent DP streams through one
+ * port: DPIN0 drives the hybrid dcpext0, DPIN1 the Type-C-only dcpext1, and
+ * each port has a second connector for the DPIN1 stream.
+ */
+bool dcp_typec_dual_stream(void)
+{
+	return of_machine_is_compatible("apple,j414s") ||
+	       of_machine_is_compatible("apple,j416c");
+}
+
+bool dcp_is_typec_only(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return !dcp->fixed_phy;
+}
+
+/*
+ * Can this route feed the given connector without changing its
+ * possible_crtcs?  On dual-stream machines those are fixed at probe, since
+ * compositors read them once when the connector appears and pair the
+ * connector with a CRTC before this fabric has routed it.
+ */
+static bool dcp_typec_route_fits(struct apple_dcp_typec_route *route,
+				 struct apple_connector *connector)
+{
+	struct apple_dcp *dcp = route->dcp;
+
+	if (!dcp_typec_dual_stream() || !connector || !dcp->crtc)
+		return true;
+	return connector->candidate_crtcs & drm_crtc_mask(&dcp->crtc->base);
+}
+
 static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 				    struct mux_control *xbar);
 static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route);
@@ -238,9 +272,12 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 		 * Offering it the choice makes it pair the port with a pipeline
 		 * holding a different monitor's mode list, and the modeset is
 		 * rejected with no way for it to recover.  The hotplug that
-		 * follows makes it re-read this.
+		 * follows makes it re-read this.  Dual-stream machines keep
+		 * fixed possible_crtcs instead: compositors that read them once
+		 * (e.g. aquamarine/Hyprland) never see the narrowing.
 		 */
-		if (connector->port_encoder && dcp->crtc)
+		if (connector->port_encoder && dcp->crtc &&
+		    !dcp_typec_dual_stream())
 			connector->port_encoder->possible_crtcs =
 				drm_crtc_mask(&dcp->crtc->base);
 	}
@@ -325,7 +362,7 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 		connector->dcp = NULL;
 
 		/* Unrouted: the port could go to any of its pipelines again. */
-		if (connector->port_encoder)
+		if (connector->port_encoder && !dcp_typec_dual_stream())
 			connector->port_encoder->possible_crtcs =
 				connector->candidate_crtcs;
 	}
@@ -600,17 +637,20 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
 
 		if (!dcp_typec_route_available(candidate))
 			continue;
+		if (!dcp_typec_route_fits(candidate, dpin ?
+					  port->secondary_connector :
+					  port->connector))
+			continue;
 		score = dcp_typec_route_score(candidate);
 		/*
-		 * DPIN0 prefers the hybrid dcpext0 on T6020. J414s DPIN1
-		 * prefers dcpext1 so both pipelines can drive independent
-		 * streams through one dock. Retain J416s' existing preference
-		 * until its second pipeline has been validated separately.
+		 * DPIN0 prefers the hybrid dcpext0 on T6020. On dual-stream
+		 * machines DPIN1 is confined to dcpext1 by its connector's
+		 * possible_crtcs, so both pipelines drive independent streams
+		 * through one dock. Retain J416s' existing preference until
+		 * its second pipeline has been validated separately.
 		 */
-		if (of_machine_is_compatible("apple,j414s") ||
-		    of_machine_is_compatible("apple,j416c")) {
-			if ((dpin == 0 && !candidate->dcp->fixed_phy) ||
-			    (dpin == 1 && candidate->dcp->fixed_phy))
+		if (dcp_typec_dual_stream()) {
+			if (dpin == 0 && !candidate->dcp->fixed_phy)
 				score += 100;
 		} else if (of_machine_is_compatible("apple,j416s") &&
 			   !candidate->dcp->fixed_phy) {
@@ -776,16 +816,12 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 
 				if (!dcp_typec_route_available(candidate))
 					continue;
-				score = dcp_typec_route_score(candidate);
 				/*
-				 * On J414s, leave dcpext0 free for a dock's DP
-				 * tunnel when a direct DP-alt-mode display can use
-				 * the Type-C-only dcpext1 pipeline.
+				 * Lowest free CRTC index first: on dual-stream
+				 * machines that is what a compositor picks from
+				 * the port's fixed possible_crtcs.
 				 */
-				if ((of_machine_is_compatible("apple,j414s") ||
-				     of_machine_is_compatible("apple,j416c")) &&
-				    candidate->dcp->fixed_phy)
-					score += 100;
+				score = dcp_typec_route_score(candidate);
 				if (score < best_score) {
 					best = candidate;
 					best_score = score;
@@ -946,7 +982,8 @@ void dcp_typec_port_set_connector(unsigned int idx, bool secondary,
 	if (owner) {
 		struct apple_dcp *dcp = owner->dcp;
 
-		if (dcp->crtc && connector->port_encoder)
+		if (dcp->crtc && connector->port_encoder &&
+		    !dcp_typec_dual_stream())
 			connector->port_encoder->possible_crtcs =
 				drm_crtc_mask(&dcp->crtc->base);
 

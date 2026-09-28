@@ -269,9 +269,10 @@ apple_connector_atomic_best_encoder(struct drm_connector *conn,
 	struct drm_encoder *encoder;
 
 	/*
-	 * A Type-C port has one encoder, and its possible_crtcs already names
-	 * the pipeline the fabric routed the port to, so it is the only answer
-	 * there is.
+	 * A Type-C port has one encoder, whose possible_crtcs either already
+	 * names the pipeline the fabric routed the port to or, on dual-stream
+	 * machines, the fixed set the fabric only routes within, so it is the
+	 * only answer there is.
 	 */
 	if (apple_connector->port_encoder)
 		return apple_connector->port_encoder;
@@ -437,9 +438,8 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 	/* Keep the existing physical-port connector numbers stable. On J414s,
 	 * append one more connector per port for a second USB4 DP tunnel.
 	 */
-	for (idx = 0; idx < nr_ports *
-	     ((of_machine_is_compatible("apple,j414s") ||
-	       of_machine_is_compatible("apple,j416c")) ? 2 : 1); idx++) {
+	for (idx = 0; idx < nr_ports * (dcp_typec_dual_stream() ? 2 : 1);
+	     idx++) {
 		struct apple_connector *connector;
 		struct apple_encoder *enc;
 		unsigned int port_idx = idx % nr_ports;
@@ -472,8 +472,22 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
 
 		for (i = 0; i < num_dcp; i++) {
-			if (dcp_typec_port_has_candidate(port_idx, dcp[i]))
-				mask |= crtc_mask[i];
+			if (!dcp_typec_port_has_candidate(port_idx, dcp[i]))
+				continue;
+			/*
+			 * A dock's second stream (DPIN1) always runs on the
+			 * lowest-indexed Type-C-only pipeline (dcpext1). Fix the
+			 * connector to it: compositors read possible_crtcs once
+			 * and would otherwise pair it with a pipeline the stream
+			 * can never be routed to.
+			 */
+			if (secondary) {
+				if (dcp_is_typec_only(dcp[i]) &&
+				    (!mask || crtc_mask[i] < mask))
+					mask = crtc_mask[i];
+				continue;
+			}
+			mask |= crtc_mask[i];
 		}
 
 		if (!mask) {
