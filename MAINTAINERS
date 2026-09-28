@@ -1951,6 +1951,8 @@ M:	Janne Grunau <j@jannau.net>
 L:	dri-devel@lists.freedesktop.org
 S:	Maintained
 T:	git git://anongit.freedesktop.org/drm/drm-misc
+F:	Documentation/devicetree/bindings/display/apple,dcp.yaml
+F:	Documentation/devicetree/bindings/display/apple,display-subsystem.yaml
 F:	drivers/gpu/drm/apple/
 
 APPLE PCIE CONTROLLER DRIVER
