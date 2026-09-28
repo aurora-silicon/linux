@@ -654,9 +654,20 @@ impl SepData {
         };
         intent.sending();
         let Some(out) = self.sks_exchange(request.name, request.msg, &request.img) else {
+            dev_err!(
+                self.dev,
+                "sks: CREATE_KEYBAG exchange did not complete (buffers unregistered, wedged, or OOL write failed)\n"
+            );
             return false;
         };
         let Some(body) = self.sks_report_response(crate::sks::SKS_CREATE_NAME, &out) else {
+            dev_err!(
+                self.dev,
+                "sks: CREATE_KEYBAG reply carried no parsable body: mailbox status {}, response {} bytes, response_size {}\n",
+                out.reply.status,
+                out.response.len(),
+                out.reply.response_size
+            );
             return false;
         };
         // 13.5 replies with the struct version and the handle alone
@@ -680,6 +691,11 @@ impl SepData {
             profile::KeyStore::Sepos13 { .. } => 8,
             profile::KeyStore::Variant5 => {
                 let Some((_fv_data, end)) = image::read_blob(body, 8) else {
+                    dev_err!(
+                        self.dev,
+                        "sks: CREATE_KEYBAG reply has no fv_data blob at offset 8 (body {} bytes)\n",
+                        body.len()
+                    );
                     return false;
                 };
                 end
@@ -703,15 +719,23 @@ impl SepData {
             profile::KeyStore::Sepos13 { .. } => None,
             profile::KeyStore::Variant5 => {
                 let Some(bag_uuid) = self.sks_read_uuid(handle) else {
+                    dev_err!(self.dev, "sks: could not read the new keybag's UUID back\n");
                     return false;
                 };
                 Some(bag_uuid)
             }
         };
         let Some(out) = self.sks_send(self.sks_req_copy_keybag(handle)) else {
+            dev_err!(self.dev, "sks: COPY_KEYBAG of the new identity keybag got no reply\n");
             return false;
         };
         let Some(wrapped) = self.wrapped_from_copy_reply(&out, c"new identity keybag") else {
+            dev_err!(
+                self.dev,
+                "sks: COPY_KEYBAG reply unusable: mailbox status {}, response {} bytes\n",
+                out.reply.status,
+                out.response.len()
+            );
             return false;
         };
         let committed = match bag_uuid {
