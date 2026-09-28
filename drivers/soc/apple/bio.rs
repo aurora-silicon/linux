@@ -150,6 +150,20 @@ pub(crate) struct Attest {
     pub(crate) reserved: [u8; 3],
 }
 
+/// Raw biometrics-endpoint probe (diagnostics): userspace supplies an sbio
+/// opcode and body, the driver performs the transfer and returns the raw
+/// status and reply. Lets request layouts be explored without a reboot.
+#[repr(C)]
+pub(crate) struct SbioProbe {
+    pub(crate) opcode: u16,
+    pub(crate) len: u16,
+    pub(crate) status: i32,
+    pub(crate) reply_len: u32,
+    pub(crate) payload: [u8; 152],
+    pub(crate) reply: [u8; 256],
+}
+static_assert!(core::mem::size_of::<SbioProbe>() == 420);
+
 // Sizes are baked into the ioctl numbers.
 static_assert!(core::mem::size_of::<Identity>() == 144);
 static_assert!(core::mem::size_of::<Info>() == 32);
@@ -174,8 +188,8 @@ macro_rules! ioctl_pod {
     };
 }
 ioctl_pod! {
-    to_user: Info, List, EnrolPoll, VerifyPoll, Attest;
-    from_user: EnrolStart, VerifyStart, Delete, Attest
+    to_user: Info, List, EnrolPoll, VerifyPoll, Attest, SbioProbe;
+    from_user: EnrolStart, VerifyStart, Delete, Attest, SbioProbe
 }
 
 const MAGIC: u32 = 0xB1;
@@ -190,6 +204,7 @@ const IOC_CANCEL: u32 = _IO(MAGIC, 0x07);
 const IOC_DELETE: u32 = _IOW::<Delete>(MAGIC, 0x08);
 const IOC_DELETE_ALL: u32 = _IO(MAGIC, 0x09);
 pub(crate) const IOC_ATTEST: u32 = _IOWR::<Attest>(MAGIC, 0x0a);
+pub(crate) const IOC_SBIO_PROBE: u32 = _IOWR::<SbioProbe>(MAGIC, 0x0b);
 
 pub(crate) struct MatchEvidence {
     identity: [u8; UUID_LEN],
