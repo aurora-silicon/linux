@@ -671,6 +671,17 @@ static int apple_nhi_pci_tunnel_deactivate(struct tb_nhi *nhi)
 	 * blocks until the function driver's own timeout fires, and the host has
 	 * nothing to enumerate onto when the tunnel comes back.
 	 */
+	/*
+	 * Withdraw a pending deferred activation first. If the cable bounces,
+	 * the tunnel can be torn down before that work runs, and starting
+	 * PCIe-C against a tunnel that no longer exists leaves the port unable
+	 * to train on every later connect. The work re-checks the request
+	 * under pcie_tunnel_lock, so one already running either finishes
+	 * before we take the lock (and is quiesced below) or does nothing.
+	 */
+	WRITE_ONCE(acio->pcie_tunnel_requested, false);
+	cancel_delayed_work(&acio->pcie_tunnel_work);
+
 	mutex_lock(&acio->pcie_tunnel_lock);
 	if (!acio->pcie_tunnel_populated) {
 		mutex_unlock(&acio->pcie_tunnel_lock);
