@@ -390,6 +390,7 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 {
 	u8 type = FIELD_GET(APPLE_RTKIT_SYSLOG_TYPE, msg);
 	u8 *bfr __free(kfree) = NULL;
+	struct apple_rtkit_crashlog_header header;
 
 	if (type != APPLE_RTKIT_CRASHLOG_CRASH) {
 		dev_warn(rtk->dev, "RTKit: Unknown crashlog message: %llx\n",
@@ -397,27 +398,19 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 		return;
 	}
 
-	if (rtk->crashlog_inherited && !rtk->crashlog_buffer.size) {
-		/*
-		 * The previous owner negotiated the crashlog buffer, so this
-		 * session never learned its geometry. A CRASH message on an
-		 * inherited session is therefore a crash notification, not a
-		 * buffer request, and must not be answered as one.
-		 */
-		dev_err(rtk->dev,
-			"RTKit: adopted co-processor has crashed (crashlog at %#llx, %#llx bytes, not mapped)\n",
-			(u64)FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_IOVA, msg),
-			(u64)FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_SIZE, msg) << 12);
-		rtk->crashed = true;
-		if (rtk->ops->crashed)
-			rtk->ops->crashed(rtk->cookie, NULL, 0);
-		return;
-	}
-
 	if (!rtk->crashlog_buffer.size) {
-		apple_rtkit_common_rx_get_buffer(rtk, &rtk->crashlog_buffer,
-						 APPLE_RTKIT_EP_CRASHLOG, msg);
-		return;
+		if (apple_rtkit_common_rx_get_buffer(rtk, &rtk->crashlog_buffer,
+						     APPLE_RTKIT_EP_CRASHLOG, msg))
+			goto unmapped;
+		if (rtk->crashlog_buffer.size < sizeof(header))
+			goto unmapped;
+
+		apple_rtkit_memcpy(rtk, &header, &rtk->crashlog_buffer, 0,
+				   sizeof(header));
+		if (header.fourcc != APPLE_RTKIT_CRASHLOG_HEADER_FOURCC ||
+		    header.size < sizeof(header) ||
+		    header.size > rtk->crashlog_buffer.size)
+			goto unmapped;
 	}
 
 	dev_err(rtk->dev, "RTKit: co-processor has crashed\n");
@@ -440,6 +433,16 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	rtk->crashed = true;
 	if (rtk->ops->crashed)
 		rtk->ops->crashed(rtk->cookie, bfr, bfr ? rtk->crashlog_buffer.size : 0);
+	return;
+
+unmapped:
+	/* An inherited session already negotiated its crash buffer. */
+	if (!rtk->crashlog_inherited)
+		return;
+	dev_err(rtk->dev, "RTKit: adopted co-processor crashed without a readable log\n");
+	rtk->crashed = true;
+	if (rtk->ops->crashed)
+		rtk->ops->crashed(rtk->cookie, NULL, 0);
 }
 
 static void apple_rtkit_ioreport_rx(struct apple_rtkit *rtk, u64 msg)
