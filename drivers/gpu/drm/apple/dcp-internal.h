@@ -158,6 +158,7 @@ struct apple_dcp_hw_data {
 struct apple_dcp {
 	struct device *dev;
 	struct platform_device *piodma;
+	bool piodma_created;
 	struct iommu_domain *iommu_dom;
 	/* which of the nine cumulative A031 notify-client states to send next */
 	unsigned int a031_step;
