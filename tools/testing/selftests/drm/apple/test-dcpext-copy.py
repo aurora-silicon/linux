@@ -29,6 +29,28 @@ typedef uint64_t u64;
 #define EXT_WIDTH DCPEXT_WIDTH
 #define EXT_HEIGHT DCPEXT_HEIGHT
 #define EXT_STRIDE DCPEXT_STRIDE
+#define DIV_ROUND_UP(n,d) (((n)+(d)-1)/(d))
+#define BITS_PER_LONG (8*sizeof(unsigned long))
+#define DECLARE_BITMAP(name,n) unsigned long name[DIV_ROUND_UP(n,BITS_PER_LONG)]
+/* Small host equivalents of the kernel's generic bitmap primitives. */
+static void bitmap_zero(unsigned long *b,unsigned n) { memset(b,0,DIV_ROUND_UP(n,BITS_PER_LONG)*sizeof(*b)); }
+static void bitmap_fill(unsigned long *b,unsigned n) { memset(b,255,DIV_ROUND_UP(n,BITS_PER_LONG)*sizeof(*b)); }
+static void bitmap_copy(unsigned long *d,const unsigned long *s,unsigned n) { memcpy(d,s,DIV_ROUND_UP(n,BITS_PER_LONG)*sizeof(*d)); }
+static void bitmap_or(unsigned long *d,const unsigned long *a,const unsigned long *b,unsigned n) {
+    for(unsigned i=0;i<DIV_ROUND_UP(n,BITS_PER_LONG);i++)d[i]=a[i]|b[i];
+}
+static void bitmap_set(unsigned long *b,unsigned start,unsigned n) {
+    for(unsigned i=start;i<start+n;i++)b[i/BITS_PER_LONG]|=1UL<<(i%BITS_PER_LONG);
+}
+static unsigned find_next_bit(const unsigned long *b,unsigned n,unsigned start) {
+    while(start<n && !(b[start/BITS_PER_LONG]&(1UL<<(start%BITS_PER_LONG))))start++;
+    return start;
+}
+static unsigned find_next_zero_bit(const unsigned long *b,unsigned n,unsigned start) {
+    while(start<n && (b[start/BITS_PER_LONG]&(1UL<<(start%BITS_PER_LONG))))start++;
+    return start;
+}
+
 #define min(a,b) ((a)<(b)?(a):(b))
 #define max(a,b) ((a)>(b)?(a):(b))
 struct drm_rect { int x1,y1,x2,y2; };
@@ -41,16 +63,31 @@ static bool drm_rect_intersect(struct drm_rect *a,const struct drm_rect *b) {
 }
 struct iosys_map { void *vaddr; };
 struct drm_framebuffer { u32 pitches[1]; };
-struct drm_plane_state { struct drm_framebuffer *fb; struct drm_rect damage; bool full; };
+struct drm_plane_state { struct drm_framebuffer *fb; struct drm_rect clips[300]; unsigned count; bool full; };
 struct drm_shadow_plane_state { struct drm_plane_state base; struct iosys_map data[1]; };
 #define to_drm_shadow_plane_state(p) ((struct drm_shadow_plane_state *)(p))
-/* The core helper supplies clipped/merged damage, or full damage when absent. */
-static bool drm_atomic_helper_damage_merged(const struct drm_plane_state *old,
-                                           const struct drm_plane_state *ps,struct drm_rect *out) {
-    (void)old;*out=ps->full?(struct drm_rect)DRM_RECT_INIT(0,0,EXT_WIDTH,EXT_HEIGHT):ps->damage;
-    return drm_rect_visible(out);
+/* The driver clips each core-supplied rectangle to the fixed plane bounds. */
+struct drm_atomic_helper_damage_iter { const struct drm_plane_state *ps; unsigned next; };
+static void drm_atomic_helper_damage_iter_init(struct drm_atomic_helper_damage_iter *iter,
+        const struct drm_plane_state *old,const struct drm_plane_state *ps) {
+    (void)old;iter->ps=ps;iter->next=0;
 }
-struct dcpext_drm { void *dcp; u8 *row; u32 stride; struct drm_rect previous_damage; bool damage_valid; };
+static bool iter_next(struct drm_atomic_helper_damage_iter *iter,struct drm_rect *out) {
+    if(iter->ps->full) {
+        if(iter->next++)return false;
+        *out=(struct drm_rect)DRM_RECT_INIT(0,0,EXT_WIDTH,EXT_HEIGHT);return true;
+    }
+    if(iter->next>=iter->ps->count)return false;
+    *out=iter->ps->clips[iter->next++];return true;
+}
+#define drm_atomic_for_each_plane_damage(iter,rect) while(iter_next(iter,rect))
+/* TILE_DEFINES */
+struct dcpext_drm {
+    void *dcp; u8 *row; u32 stride; bool damage_valid;
+    DECLARE_BITMAP(previous_damage,EXT_TILE_COUNT);
+    DECLARE_BITMAP(current_damage,EXT_TILE_COUNT);
+    DECLARE_BITMAP(copy_damage,EXT_TILE_COUNT);
+};
 struct dcpext_frame { void *pixels; size_t size; };
 static struct dcpext_frame back;
 static bool begin_fails, end_fails, held;
@@ -102,8 +139,20 @@ int main(void) {
         if(step==13)d=(struct drm_rect)DRM_RECT_INIT(-20,-10,40,30);
         if(step==14 || step==15)d=(struct drm_rect){0};
         if(step==16)d=(struct drm_rect)DRM_RECT_INIT(4000,2300,10,10);
-        shadow.base.full=step==20;shadow.base.damage=d;
-        paint(source,reference,pitch,shadow.base.full?full:d,step);
+        shadow.base.full=step==20;shadow.base.clips[0]=d;shadow.base.count=1;
+        /* Far-apart regions, tile boundaries, overlap and many clips. The
+         * old bounding-box copy moves almost a full frame for these corners. */
+        if(step>=28) {
+            shadow.base.count=step==47?300:8;
+            for(unsigned i=0;i<shadow.base.count;i++) {
+                int x=(i%2)?EXT_WIDTH-39:17+(int)(i%5);
+                int y=(i%3)?EXT_HEIGHT-27:31+(int)(i%7);
+                shadow.base.clips[i]=(struct drm_rect)DRM_RECT_INIT(x,y,35,21);
+            }
+        }
+        if(shadow.base.full)paint(source,reference,pitch,full,step);
+        else for(unsigned i=0;i<shadow.base.count;i++)
+            paint(source,reference,pitch,shadow.base.clips[i],step+i);
         /* A disable or lost history must reseed both idle buffers. */
         if(step==25){memset(buffers,0x19,size*2);ext.damage_valid=false;}
         memcpy(saved_front,buffers+front*size,size);
@@ -112,12 +161,13 @@ int main(void) {
         assert(!memcmp(saved_front,buffers+front*size,size));
         assert(!memcmp(reference,back.pixels,size));
         if(step<2 || step==20 || step==21 || step==25 || step==26)assert(copied==size);
-        if(step>=2 && step<12)assert(copied<size/100);
+        assert(copied<=size); /* Overlapping clips never cause duplicate copies. */
+        if((step>=2 && step<12) || step>=28)assert(copied<size/100);
         if(step==15 || step==16)assert(copied==0);
         front^=1;
     }
     assert(presented==48);
-    struct drm_rect history=ext.previous_damage;
+    DECLARE_BITMAP(history,EXT_TILE_COUNT);bitmap_copy(history,ext.previous_damage,EXT_TILE_COUNT);
     memcpy(saved_front,buffers+front*size,size);
     back=(struct dcpext_frame){buffers+(front^1)*size,size};copied=0;begin_fails=true;
     assert(ext_copy_frame(&ext,&shadow.base,&shadow.base)==-ENOLINK && !copied && !held);
@@ -129,12 +179,12 @@ int main(void) {
     assert(!memcmp(&history,&ext.previous_damage,sizeof(history)));
     assert(!memcmp(saved_front,buffers+front*size,size));
     free(ext.row);free(source);free(buffers);free(reference);free(saved_front);
-    puts("PASS: 48 full-reference frames, two-frame damage history, front preservation, opaque alpha, padded pitch, history reset and failures");
+    puts("PASS: 48 full-reference frames, sparse tiled history (including 300 overlapping clips), front preservation, opaque alpha, padded pitch, history reset and failures");
 }
 '''
-body = preamble
+body = preamble.replace("/* TILE_DEFINES */", function("#define EXT_TILE_SIZE", "struct dcpext_drm"))
 body += function("static bool ext_rect_valid(", "static int ext_plane_check(")
-body += function("static int ext_copy_frame(", "static void ext_plane_update(")
+body += function("static void ext_damage_tiles(", "static void ext_plane_update(")
 with tempfile.TemporaryDirectory(prefix="dcpext-copy-test-") as tmp:
     path = Path(tmp)
     (path / "test.c").write_text(body + tests)
