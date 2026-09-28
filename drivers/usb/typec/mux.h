@@ -3,6 +3,7 @@
 #ifndef __USB_TYPEC_MUX__
 #define __USB_TYPEC_MUX__
 
+#include <linux/notifier.h>
 #include <linux/usb/typec_mux.h>
 
 struct typec_switch_dev {
@@ -29,6 +30,7 @@ extern const struct device_type typec_mux_dev_type;
 struct typec_thunderbolt_switch_dev {
 	struct device dev;
 	typec_thunderbolt_switch_set_fn_t set;
+	struct atomic_notifier_head notifiers;
 };
 
 #define to_typec_thunderbolt_switch_dev(_dev_) \

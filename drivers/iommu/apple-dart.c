@@ -260,6 +260,8 @@ struct apple_dart {
 	u32 locked : 1;
 	u32 tunneled : 1;
 	u32 power_retained : 1;
+	u32 tunnel_state_saved : 1;
+	u32 tunnel_state_restored : 1;
 	bool commands_gated;
 	struct apple_tunable *tunables;
 	u16 version;
@@ -660,6 +662,7 @@ apple_dart_t8020_hw_stream_command(struct apple_dart_stream_map *stream_map,
 	struct apple_dart *dart = stream_map->dart;
 	unsigned long flags;
 	int ret, i;
+	u32 sidmap[BITS_TO_U32(DART_MAX_STREAMS)];
 	u32 command_reg;
 
 	spin_lock_irqsave(&dart->lock, flags);
@@ -668,9 +671,10 @@ apple_dart_t8020_hw_stream_command(struct apple_dart_stream_map *stream_map,
 		return -EHOSTDOWN;
 	}
 
+	bitmap_to_arr32(sidmap, stream_map->sidmap, dart->num_streams);
 	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
-		apple_dart_writel(dart, stream_map->sidmap[i],
-				   DART_T8020_STREAM_SELECT + 4 * i);
+		apple_dart_writel(dart, sidmap[i],
+				  DART_T8020_STREAM_SELECT + 4 * i);
 	apple_dart_writel(dart, command, DART_T8020_STREAM_COMMAND);
 
 	ret = read_poll_timeout_atomic(
@@ -1896,11 +1900,15 @@ static irqreturn_t apple_dart_t8110_irq(int irq, void *dev)
 
 static irqreturn_t apple_dart_irq(int irq, void *dev)
 {
-	irqreturn_t ret;
+	irqreturn_t ret = IRQ_NONE;
 	struct apple_dart *dart = dev;
 
-	WARN_ON(pm_runtime_get_sync(dart->dev) < 0);
-	ret = dart->hw->irq_handler(irq, dev);
+	if (READ_ONCE(dart->commands_gated))
+		return IRQ_NONE;
+	if (pm_runtime_resume_and_get(dart->dev) < 0)
+		return IRQ_NONE;
+	if (!READ_ONCE(dart->commands_gated))
+		ret = dart->hw->irq_handler(irq, dev);
 	pm_runtime_put(dart->dev);
 	return ret;
 }
@@ -2243,8 +2251,11 @@ int apple_dart_quiesce_commands(struct device *dev)
 
 	if (dart) {
 		/* Finish any in-flight command before the port clock is stopped. */
-		guard(spinlock_irqsave)(&dart->lock);
-		WRITE_ONCE(dart->commands_gated, true);
+		scoped_guard(spinlock_irqsave, &dart->lock)
+			WRITE_ONCE(dart->commands_gated, true);
+		/* The fault handler can take dart->lock while acknowledging errors. */
+		if (dart->irq > 0)
+			synchronize_irq(dart->irq);
 	}
 	return 0;
 }
@@ -2271,6 +2282,66 @@ int apple_dart_resume_commands(struct device *dev)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_dart_resume_commands);
+
+/*
+ * System sleep has quiesced every downstream device. PCIe-C calls this
+ * before stopping APPCLK because its domain reset also loses DART state,
+ * even when ordinary runtime PM treats the domain as retained.
+ */
+int apple_dart_save_tunnel_state(struct device *dev)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+	unsigned int sid, idx;
+
+	if (!dart || !dart->tunneled || dart->locked ||
+	    dart->hw->type != DART_T8020 || dart->tunables)
+		return -EOPNOTSUPP;
+
+	guard(spinlock_irqsave)(&dart->lock);
+	if (dart->commands_gated)
+		return -EBUSY;
+	dart->tunnel_state_saved = false;
+	dart->tunnel_state_restored = false;
+
+	for (sid = 0; sid < dart->num_streams; sid++) {
+		dart->save_tcr[sid] = apple_dart_readl(dart, DART_TCR(dart, sid));
+		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
+			dart->save_ttbr[sid][idx] =
+				apple_dart_readl(dart, DART_TTBR(dart, sid, idx));
+	}
+	dart->tunnel_state_saved = true;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_dart_save_tunnel_state);
+
+/* APPCLK is running again, but PCIe link training has not started. */
+int apple_dart_restore_tunnel_state(struct device *dev)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+	unsigned int sid, idx;
+	int ret;
+
+	if (!dart || !dart->tunneled || dart->locked ||
+	    dart->hw->type != DART_T8020 || dart->tunables)
+		return -EOPNOTSUPP;
+	if (!dart->tunnel_state_saved || READ_ONCE(dart->commands_gated))
+		return -EINVAL;
+
+	ret = apple_dart_hw_reset(dart);
+	if (ret)
+		return ret;
+
+	for (sid = 0; sid < dart->num_streams; sid++) {
+		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
+			apple_dart_writel(dart, dart->save_ttbr[sid][idx],
+					  DART_TTBR(dart, sid, idx));
+		apple_dart_writel(dart, dart->save_tcr[sid], DART_TCR(dart, sid));
+	}
+	dart->tunnel_state_saved = false;
+	dart->tunnel_state_restored = true;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_dart_restore_tunnel_state);
 
 static void apple_dart_remove(struct platform_device *pdev)
 {
@@ -2401,6 +2472,9 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	unsigned int sid, idx;
 
+	dart->tunnel_state_restored = false;
+	if (READ_ONCE(dart->commands_gated))
+		return 0;
 	/* The tunneled DART has no state to save when its domain stays on. */
 	if (dart->power_retained)
 		return 0;
@@ -2427,6 +2501,12 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	unsigned int sid, idx;
 	int ret;
 
+	/* PCIe-C restored these mappings before starting its downstream link. */
+	if (dart->tunnel_state_restored) {
+		dart->tunnel_state_restored = false;
+		return 0;
+	}
+
 	/*
 	 * PCIe-C DARTs on an apple,always-on domain retain their translation
 	 * state. Resetting one here is unnecessary; DART access must remain
@@ -2448,7 +2528,7 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	for (sid = 0; sid < dart->num_streams; sid++) {
 		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
 			apple_dart_writel(dart, dart->save_ttbr[sid][idx],
-					   DART_TTBR(dart, sid, idx));
+					  DART_TTBR(dart, sid, idx));
 		apple_dart_writel(dart, dart->save_tcr[sid],
 				   DART_TCR(dart, sid));
 	}

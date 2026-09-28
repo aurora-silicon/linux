@@ -3,6 +3,7 @@
 #define __LINUX_SOC_APPLE_DART_H__
 
 #include <linux/kconfig.h>
+#include <linux/errno.h>
 
 struct device;
 
@@ -13,9 +14,13 @@ struct device;
 #if IS_ENABLED(CONFIG_APPLE_DART)
 int apple_dart_quiesce_commands(struct device *dev);
 int apple_dart_resume_commands(struct device *dev);
+int apple_dart_save_tunnel_state(struct device *dev);
+int apple_dart_restore_tunnel_state(struct device *dev);
 #else
 static inline int apple_dart_quiesce_commands(struct device *dev) { return 0; }
 static inline int apple_dart_resume_commands(struct device *dev) { return 0; }
+static inline int apple_dart_save_tunnel_state(struct device *dev) { return -EOPNOTSUPP; }
+static inline int apple_dart_restore_tunnel_state(struct device *dev) { return -EOPNOTSUPP; }
 #endif
 
 #endif

@@ -378,12 +378,15 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	port->applied_mode = state->mode;
 	port->applied_status = dp_status;
 	port->applied_conf = dp_conf;
-	port->applied_valid = true;
+	/* Failed route acquisition must remain retryable on the next update. */
+	port->applied_valid = false;
 
 	if (!is_dp) {
 		/* a Thunderbolt/USB4 DP tunnel is torn down by its own path */
-		if (port->owner && port->owner->tunnel)
+		if (port->owner && port->owner->tunnel) {
+			port->applied_valid = true;
 			return 0;
+		}
 		if (port->owner) {
 			struct apple_dcp *dcp = port->owner->dcp;
 
@@ -403,6 +406,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 
 		if (state->mode == TYPEC_MODE_USB4)
 			dcp_typec_retrain_active_routes();
+		port->applied_valid = true;
 		return 0;
 	}
 
@@ -455,6 +459,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 			dcp_retrain_oob(dcp->typec_connector);
 	}
 	port->hpd = hpd;
+	port->applied_valid = true;
 
 	return 0;
 }

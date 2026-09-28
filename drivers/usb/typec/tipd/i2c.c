@@ -71,6 +71,8 @@ static int __maybe_unused tps6598x_resume(struct device *dev)
 }
 
 static const struct dev_pm_ops tps6598x_pm_ops = {
+	.prepare = pm_sleep_ptr(tipd_prepare),
+	.complete = pm_sleep_ptr(tipd_complete),
 	SET_SYSTEM_SLEEP_PM_OPS(tps6598x_suspend, tps6598x_resume)
 };
 

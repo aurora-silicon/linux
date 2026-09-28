@@ -1685,6 +1685,7 @@
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 770 IRQ_TYPE_LEVEL_HIGH>;
 				power-domains = <&ps_atc0_pcie>;
+				resets = <&ps_atc0_pcie>;
 
 				msi-controller;
 				msi-parent = <&apciec0>;
@@ -1910,6 +1911,7 @@
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 850 IRQ_TYPE_LEVEL_HIGH>;
 				power-domains = <&ps_atc1_pcie>;
+				resets = <&ps_atc1_pcie>;
 
 				msi-controller;
 				msi-parent = <&apciec1>;

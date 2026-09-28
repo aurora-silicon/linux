@@ -64,6 +64,7 @@
 #include <linux/of_address.h>
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
+#include <linux/notifier.h>
 #include <linux/pci-apple.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
@@ -134,6 +135,7 @@ struct apple_cio {
 	struct device_node *np;
 	struct device_node *pcie_tunnel_np;
 	bool pcie_tunnel_preinitialized;
+	struct reset_control *pcie_reset;
 	void __iomem *pcie_intr2axi_base;
 	struct apple_rtkit *rtk;
 
@@ -159,6 +161,7 @@ struct apple_cio {
 	struct platform_device *nhi_pdev;
 
 	struct typec_thunderbolt_switch_dev *tbt_switch;
+	struct notifier_block pcie_notifier;
 	/* Serializes PCIe-C population with cable teardown. */
 	struct mutex pcie_tunnel_lock;
 	struct delayed_work pcie_tunnel_work;
@@ -166,6 +169,7 @@ struct apple_cio {
 	bool pcie_tunnel_populated;
 	bool pcie_tunnel_stopping;
 	bool pcie_pm_prepared;
+	bool pcie_resume_expected;
 	bool pcie_quiesce_pending;
 
 	/* Type-C connector this router is wired to, for DP tunnel routing */
@@ -489,6 +493,44 @@ apple_cio_pcie_tunnel_is_preinitialized(struct device_node *parent)
 	}
 
 	return false;
+}
+
+static void apple_cio_reset_control_put(void *data)
+{
+	reset_control_put(data);
+}
+
+/*
+ * PCIe-C's reset covers the controller and the DART beside it. It is
+ * optional, since older device trees do not describe it, and only used where
+ * the kernel initializes the controller: resetting it would discard a boot
+ * loader's setup.
+ */
+static int apple_cio_get_pcie_reset(struct apple_cio *acio)
+{
+	struct reset_control *rst = NULL;
+
+	for_each_available_child_of_node_scoped(acio->pcie_tunnel_np, child) {
+		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
+		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+			continue;
+		if (!of_property_read_bool(child, "apple,pciec-kernel-init"))
+			break;
+
+		rst = of_reset_control_get_optional_exclusive(child, NULL);
+		break;
+	}
+	if (IS_ERR(rst))
+		return dev_err_probe(acio->dev, PTR_ERR(rst),
+				     "Unable to get PCIe-C reset\n");
+	if (!rst)
+		return 0;
+
+	/* The bound PCIe host owns the line between ACIO startup attempts. */
+	reset_control_release(rst);
+	acio->pcie_reset = rst;
+	return devm_add_action_or_reset(acio->dev, apple_cio_reset_control_put,
+					rst);
 }
 
 static void apple_cio_iounmap(void *data)
@@ -1598,6 +1640,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	scoped_guard(mutex, &acio->pcie_tunnel_lock) {
 		acio->pcie_tunnel_stopping = false;
 		acio->pcie_pm_prepared = false;
+		acio->pcie_resume_expected = false;
 	}
 	ret = tb_domain_add(anhi->tb, false);
 	if (ret) {
@@ -1690,6 +1733,8 @@ static int apple_nhi_prepare(struct device *dev)
 	struct apple_cio *acio = anhi->acio;
 
 	guard(mutex)(&acio->pcie_tunnel_lock);
+	/* Keep an unresolved expectation across another sleep before revalidation. */
+	acio->pcie_resume_expected |= READ_ONCE(acio->pcie_tunnel_requested);
 	acio->pcie_pm_prepared = true;
 	return 0;
 }
@@ -1861,6 +1906,27 @@ static int apple_cio_start(struct apple_cio *acio)
 
 	lockdep_assert_held(&acio->lock);
 
+	/*
+	 * PCIe-C's power domain stays on across cable teardown, so apart from
+	 * this reset nothing returns the controller to a known state between
+	 * tunnels. After system sleep with a Thunderbolt 3 dock, state left in
+	 * it has kept every later link from training until reboot. Reset it
+	 * while its host and DART are unbound and before ACIO's domains come
+	 * up, in the same order as after boot.
+	 */
+	if (acio->pcie_reset) {
+		ret = reset_control_acquire(acio->pcie_reset);
+		if (ret)
+			return dev_err_probe(acio->dev, ret,
+					     "PCIe-C reset is still in use\n");
+		ret = reset_control_reset(acio->pcie_reset);
+		reset_control_release(acio->pcie_reset);
+		if (ret)
+			return dev_err_probe(acio->dev, ret,
+					     "failed to reset PCIe-C\n");
+		dev_info(acio->dev, "PCIe-C reset before ACIO start\n");
+	}
+
 	/* Create device links to the power domains in order to power them on */
 	for (i = 0; i < acio->pd_list->num_pds; i++) {
 		link = device_link_add(acio->dev, acio->pd_list->pd_devs[i],
@@ -1980,6 +2046,34 @@ remove_links:
 	return ret;
 }
 
+static int apple_cio_check_connection(struct apple_cio *acio)
+{
+	struct platform_device *pdev;
+	int ret;
+
+	lockdep_assert_held(&acio->lock);
+	guard(mutex)(&acio->pcie_tunnel_lock);
+	if (!READ_ONCE(acio->nhi_pdev) || acio->pcie_tunnel_stopping ||
+	    apple_rtkit_is_crashed(acio->rtk))
+		return -ENODEV;
+	if (acio->pcie_pm_prepared || acio->pcie_quiesce_pending)
+		return -EAGAIN;
+
+	/* A display-only or unauthorized session need not have a PCIe tunnel. */
+	if (!READ_ONCE(acio->pcie_tunnel_requested))
+		return acio->pcie_resume_expected ? -ENOLINK : 0;
+	if (!acio->pcie_tunnel_populated)
+		return -EAGAIN;
+	pdev = apple_cio_find_pcie_tunnel(acio);
+	if (!pdev)
+		return -ENODEV;
+	ret = apple_pcie_tunnel_check_state(&pdev->dev);
+	put_device(&pdev->dev);
+	if (!ret)
+		acio->pcie_resume_expected = false;
+	return ret;
+}
+
 static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 				    const struct typec_thunderbolt_switch_data *data)
 {
@@ -2028,7 +2122,7 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 	}
 
 	if (acio->target_cable_info == acio->current_cable_info)
-		return 0;
+		return acio->current_cable_info ? apple_cio_check_connection(acio) : 0;
 
 	/*
 	 * Changing live cable parameters requires an ACIO shutdown. Report the
@@ -2052,6 +2146,18 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 
 	apple_cio_stop(acio);
 	return 0;
+}
+
+static int apple_cio_pcie_notify(struct notifier_block *nb,
+				 unsigned long event, void *data)
+{
+	struct apple_cio *acio = container_of(nb, struct apple_cio, pcie_notifier);
+
+	if (event != APPLE_PCIE_TUNNEL_LINK_DOWN || data != acio->dev)
+		return NOTIFY_DONE;
+
+	typec_thunderbolt_switch_notify(acio->tbt_switch);
+	return NOTIFY_OK;
 }
 
 static int apple_cio_probe(struct platform_device *pdev)
@@ -2095,6 +2201,9 @@ static int apple_cio_probe(struct platform_device *pdev)
 			if (ret)
 				return dev_err_probe(dev, ret,
 						     "failed to map PCIe-C Intr2AXI registers\n");
+			ret = apple_cio_get_pcie_reset(acio);
+			if (ret)
+				return ret;
 		}
 	}
 
@@ -2196,10 +2305,19 @@ static int apple_cio_probe(struct platform_device *pdev)
 		.set = apple_cio_tbt_switch_set,
 		.drvdata = acio,
 	};
+	/* A consumer cannot start a host before its failure listener is ready. */
+	guard(mutex)(&acio->lock);
 	acio->tbt_switch = typec_thunderbolt_switch_register(dev, &desc);
 	if (IS_ERR(acio->tbt_switch))
 		return dev_err_probe(dev, PTR_ERR(acio->tbt_switch),
 				     "Unable to register thunderbolt switch\n");
+
+	acio->pcie_notifier.notifier_call = apple_cio_pcie_notify;
+	ret = apple_pcie_tunnel_register_notifier(&acio->pcie_notifier);
+	if (ret) {
+		typec_thunderbolt_switch_unregister(acio->tbt_switch);
+		return ret;
+	}
 
 	return 0;
 }
@@ -2208,6 +2326,7 @@ static void apple_cio_remove(struct platform_device *pdev)
 {
 	struct apple_cio *acio = platform_get_drvdata(pdev);
 
+	apple_pcie_tunnel_unregister_notifier(&acio->pcie_notifier);
 	typec_thunderbolt_switch_unregister(acio->tbt_switch);
 	cancel_delayed_work_sync(&acio->pcie_tunnel_work);
 
