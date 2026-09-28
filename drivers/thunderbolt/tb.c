@@ -3215,6 +3215,15 @@ static int tb_resume_noirq(struct tb *tb)
 	tb_restore_children(tb->root_switch);
 
 	/*
+	 * Routers that stayed awake still carry our tunnels. Restarting them
+	 * would take down links the hosts kept up through the sleep.
+	 */
+	if (tb->nhi->quirks & QUIRK_KEEP_TUNNELS) {
+		tb_dbg(tb, "tunnels kept across sleep\n");
+		goto out;
+	}
+
+	/*
 	 * If we get here from suspend to disk the boot firmware or the
 	 * restore kernel might have created tunnels of its own. Since
 	 * we cannot be sure they are usable for us we find and tear
@@ -3246,6 +3255,7 @@ static int tb_resume_noirq(struct tb *tb)
 		tb_dbg(tb, "tunnels restarted, sleeping for 100ms\n");
 		msleep(100);
 	}
+out:
 	tb_switch_enter_redrive(tb->root_switch);
 	 /* Allow tb_handle_hotplug to progress events */
 	tcm->hotplug_active = true;

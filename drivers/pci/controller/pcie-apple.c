@@ -37,6 +37,7 @@
 #include <linux/reset.h>
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/tunable.h>
+#include <linux/suspend.h>
 
 #include "../pci.h"
 #include "pci-host-common.h"
@@ -54,6 +55,10 @@ void apple_pcie_tunnel_unregister_notifier(struct notifier_block *nb)
 	atomic_notifier_chain_unregister(&apple_pcie_tunnel_notifiers, nb);
 }
 EXPORT_SYMBOL_GPL(apple_pcie_tunnel_unregister_notifier);
+
+static bool s2idle_keep_link = true;
+module_param(s2idle_keep_link, bool, 0644);
+MODULE_PARM_DESC(s2idle_keep_link, "Keep tunneled links up through suspend-to-idle");
 
 static int link_up_timeout = 500;
 module_param(link_up_timeout, int, 0644);
@@ -236,6 +241,7 @@ struct apple_pcie {
 	bool			kernel_init;
 	bool			bus_stopped;
 	bool			reset_on_resume;
+	bool			link_kept;
 	bool			resume_failed; /* cleared only by teardown and reprobe */
 	struct reset_control	*reset;
 	const struct hw_info	*hw;
@@ -2315,6 +2321,22 @@ int apple_pcie_tunnel_check_state(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_pcie_tunnel_check_state);
 
+/*
+ * Whether the host left its tunnel running for the system sleep in progress.
+ * The caller serializes against unbind through device PM ordering.
+ */
+bool apple_pcie_tunnel_link_kept(struct device *dev)
+{
+	struct pci_host_bridge *bridge = dev_get_drvdata(dev);
+	struct apple_pcie *pcie;
+
+	if (!dev->driver || !bridge)
+		return false;
+	pcie = pci_host_bridge_priv(bridge);
+	return pcie->hw->tunneled && pcie->link_kept;
+}
+EXPORT_SYMBOL_GPL(apple_pcie_tunnel_link_kept);
+
 struct apple_pcie_map {
 	void __iomem *base;
 	struct resource res;
@@ -2587,16 +2609,47 @@ static void apple_pcie_tunnel_hierarchy_gone(struct device *dev)
 		pci_walk_bus(bridge->bus, pci_dev_set_disconnected, NULL);
 }
 
-static int apple_pcie_suspend_noirq(struct device *dev)
+static bool apple_pcie_tunnel_link_healthy(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+
+	if (list_empty(&pcie->ports))
+		return false;
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (!READ_ONCE(port->started) || READ_ONCE(port->link_failed))
+			return false;
+		if (apple_pcie_port_readl(port, PORT_INTSTAT) &
+		    BIT(PORT_INT_LINK_DOWN))
+			return false;
+		if (!(apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * In suspend-to-idle ACIO and the router links stay powered, so an up
+ * tunnel can simply be left running. The functions below keep their state
+ * and resume like any other PCIe device; nothing has to be re-trained.
+ */
+static bool apple_pcie_keep_link(struct apple_pcie *pcie)
+{
+	if (!READ_ONCE(s2idle_keep_link) || !pm_suspend_no_platform())
+		return false;
+	if (!pcie->kernel_init || !pcie->power_retained)
+		return false;
+	if (pcie->bus_stopped || pcie->resume_failed)
+		return false;
+	return apple_pcie_tunnel_link_healthy(pcie);
+}
+
+static void apple_pcie_stop_for_sleep(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
 	struct apple_pcie_port *port;
 	bool active = false, can_reset;
 	int i, ret;
 
-	if (!pcie->hw->tunneled)
-		return 0;
-	pcie->reset_on_resume = false;
 	can_reset = pcie->kernel_init && pcie->power_retained && pcie->reset &&
 		    !pcie->bus_stopped && !pcie->resume_failed;
 	if (can_reset) {
@@ -2624,6 +2677,18 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 	pcie->reset_on_resume = can_reset && active;
 	if (active && !pcie->bus_stopped)
 		apple_pcie_tunnel_hierarchy_lost(dev);
+}
+
+static int apple_pcie_suspend_noirq(struct device *dev)
+{
+	struct apple_pcie *pcie = apple_pcie_lookup(dev);
+
+	if (!pcie->hw->tunneled)
+		return 0;
+	pcie->reset_on_resume = false;
+	pcie->link_kept = apple_pcie_keep_link(pcie);
+	if (!pcie->link_kept)
+		apple_pcie_stop_for_sleep(dev);
 	return 0;
 }
 
@@ -2677,6 +2742,14 @@ static int apple_pcie_resume_noirq(struct device *dev)
 		return 0;
 	if (pcie->resume_failed)
 		return -EIO;
+	if (pcie->link_kept) {
+		pcie->link_kept = false;
+		if (apple_pcie_tunnel_link_healthy(pcie))
+			return 0;
+		/* Lost while asleep: take the same path as a stopped tunnel. */
+		dev_warn(dev, "PCIe-C link lost during suspend-to-idle\n");
+		apple_pcie_stop_for_sleep(dev);
+	}
 	if (pcie->reset_on_resume) {
 		pcie->reset_on_resume = false;
 		ret = apple_pcie_reset_for_resume(pcie);

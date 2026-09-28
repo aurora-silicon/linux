@@ -1747,14 +1747,31 @@ static bool router_sleep;
 module_param(router_sleep, bool, 0644);
 MODULE_PARM_DESC(router_sleep, "Ask routers to sleep on system suspend (test only)");
 
+static bool apple_nhi_pcie_link_kept(struct apple_cio *acio)
+{
+	struct platform_device *pcie_pdev;
+	bool kept = false;
+
+	guard(mutex)(&acio->pcie_tunnel_lock);
+	pcie_pdev = apple_cio_find_pcie_tunnel(acio);
+	if (pcie_pdev) {
+		kept = apple_pcie_tunnel_link_kept(&pcie_pdev->dev);
+		put_device(&pcie_pdev->dev);
+	}
+	return kept;
+}
+
 static int apple_nhi_suspend_noirq(struct device *dev)
 {
 	struct apple_nhi *anhi = dev_get_drvdata(dev);
 
-	if (READ_ONCE(router_sleep))
-		anhi->nhi.quirks &= ~QUIRK_NO_SYSTEM_SLEEP;
-	else
+	anhi->nhi.quirks &= ~(QUIRK_NO_SYSTEM_SLEEP | QUIRK_KEEP_TUNNELS);
+	if (!READ_ONCE(router_sleep)) {
 		anhi->nhi.quirks |= QUIRK_NO_SYSTEM_SLEEP;
+		/* PCIe-C suspends first; its tunnel must then survive resume. */
+		if (apple_nhi_pcie_link_kept(anhi->acio))
+			anhi->nhi.quirks |= QUIRK_KEEP_TUNNELS;
+	}
 
 	return tb_domain_suspend_noirq(anhi->tb);
 }
