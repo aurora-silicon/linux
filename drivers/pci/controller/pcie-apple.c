@@ -2552,6 +2552,41 @@ static void apple_pcie_remove(struct platform_device *pdev)
 	pci_unlock_rescan_remove();
 }
 
+static int apple_pcie_mark_power_lost(struct pci_dev *pdev, void *unused)
+{
+	/*
+	 * Tunnel stop asserts tunneled PERST, so the functions below lose their
+	 * state even when the host stays in suspend-to-idle. Make the PCI core
+	 * resume them as if from D3cold: restore config space in the noirq phase,
+	 * parents first, and wait for each secondary bus before touching it.
+	 */
+	pdev->skip_bus_pm = false;
+	pdev->current_state = PCI_D3cold;
+	return 0;
+}
+
+static void apple_pcie_tunnel_hierarchy_lost(struct device *dev)
+{
+	struct pci_host_bridge *bridge = dev_get_drvdata(dev);
+
+	if (bridge && bridge->bus)
+		pci_walk_bus(bridge->bus, apple_pcie_mark_power_lost, NULL);
+}
+
+static void apple_pcie_tunnel_hierarchy_gone(struct device *dev)
+{
+	struct pci_host_bridge *bridge = dev_get_drvdata(dev);
+
+	/*
+	 * Nothing below a port that failed to resume can be reached. Mark it
+	 * disconnected so that neither the PCI core nor function drivers
+	 * resuming after us issue I/O into the dead aperture; quiesce removes
+	 * the hierarchy once tasks are thawed.
+	 */
+	if (bridge && bridge->bus)
+		pci_walk_bus(bridge->bus, pci_dev_set_disconnected, NULL);
+}
+
 static int apple_pcie_suspend_noirq(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
@@ -2587,6 +2622,8 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 		}
 	}
 	pcie->reset_on_resume = can_reset && active;
+	if (active && !pcie->bus_stopped)
+		apple_pcie_tunnel_hierarchy_lost(dev);
 	return 0;
 }
 
@@ -2659,11 +2696,15 @@ static int apple_pcie_resume_noirq(struct device *dev)
 failed:
 	/* Device PM keeps resuming dependents even after this callback fails. */
 	pcie->resume_failed = true;
+	if (!pcie->bus_stopped)
+		apple_pcie_tunnel_hierarchy_gone(dev);
 	apple_pcie_walk_tunnel_darts(pcie, apple_dart_quiesce_commands, false);
-	list_for_each_entry(port, &pcie->ports, entry) {
-		if (port->started || port->needs_stop)
-			apple_pcie_tunnel_stop(port);
-	}
+	/*
+	 * Leave the port clocked with its link down, the state a surprise
+	 * unplug leaves behind, in which stray accesses complete with an
+	 * error. Quiesce removes the hierarchy and then stops the port when
+	 * ACIO is torn down after resume.
+	 */
 	return ret;
 }
 
