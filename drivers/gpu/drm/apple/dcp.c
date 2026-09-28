@@ -2178,10 +2178,11 @@ static int dcp_connector_type_from_dt(struct device_node *np)
 	return DRM_MODE_CONNECTOR_Unknown;
 }
 
-static void dcp_disable_typec_work(struct apple_dcp *dcp)
+static void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
 {
 	scoped_guard(mutex, &dcp->hpd_mutex) {
-		WRITE_ONCE(dcp->typec_cable_connected, false);
+		if (release_cable)
+			WRITE_ONCE(dcp->typec_cable_connected, false);
 		dcp->typec_generation++;
 	}
 	/* Block new enqueues as well as draining users of the AFK endpoints. */
@@ -2316,7 +2317,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	if (dcp->hdmi_hpd_irq)
 		disable_irq(dcp->hdmi_hpd_irq);
 
-	dcp_disable_typec_work(dcp);
+	dcp_disable_typec_work(dcp, true);
 	typec_mux_put(dcp->typec_mux);
 
 	if (dcp->avep) {
@@ -2568,7 +2569,13 @@ static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
-	dcp_disable_typec_work(dcp);
+	/*
+	 * The Type-C route reports cable removal through
+	 * dcp_dptx_disconnect_oob(). A DP tunnel kept through the sleep stays
+	 * connected, and resume powers the CRTC back up through dcp_poweron()
+	 * as after DPMS off.
+	 */
+	dcp_disable_typec_work(dcp, false);
 
 	if (dcp->avep)
 		av_service_disconnect(dcp);
