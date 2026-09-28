@@ -3152,7 +3152,12 @@ static int tb_suspend_noirq(struct tb *tb)
 	struct tb_cm *tcm = tb_priv(tb);
 
 	tb_dbg(tb, "suspending...\n");
-	tb_disconnect_and_release_dp(tb);
+	/*
+	 * Kept tunnels survive the sleep. Keep DP ones as well, so a display
+	 * behind a dock is only powered down, not reported as unplugged.
+	 */
+	if (!(tb->nhi->quirks & QUIRK_KEEP_TUNNELS))
+		tb_disconnect_and_release_dp(tb);
 	tb_switch_exit_redrive(tb->root_switch);
 	tb_switch_suspend(tb->root_switch, false);
 	tcm->hotplug_active = false; /* signal tb_handle_hotplug to quit */
