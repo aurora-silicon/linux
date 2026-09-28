@@ -16,6 +16,7 @@
 #include <linux/pm.h>
 #include <linux/reset.h>
 
+#include "dwc3-apple-state.h"
 #include "glue.h"
 
 /*
@@ -77,14 +78,9 @@
  * Type-C mux for the SuperSpeed lanes, and the PHY follows those mode changes on its own.
  * Across system sleep such a controller goes through DWC3_APPLE_SUSPENDED: the core is exited
  * and initialised again around the sleep while xhci stays registered, see dwc3_apple_suspend().
+ *
+ * enum dwc3_apple_state is defined in dwc3-apple-state.h.
  */
-enum dwc3_apple_state {
-	DWC3_APPLE_PROBE_PENDING, /* Before first cable connection, dwc3_core_probe not called */
-	DWC3_APPLE_NO_CABLE, /* No cable connected, dwc3 suspended after dwc3_core_exit */
-	DWC3_APPLE_HOST, /* Cable connected, dwc3 in host mode */
-	DWC3_APPLE_DEVICE, /* Cable connected, dwc3 in device mode */
-	DWC3_APPLE_SUSPENDED, /* Fixed-hub host asleep: core exited, xhci still registered */
-};
 
 /**
  * struct dwc3_apple - Apple-specific DWC3 USB controller
@@ -99,7 +95,7 @@ enum dwc3_apple_state {
  * @role_sw: USB role switch
  * @fixed_hub: A fixed hub sits on the controller's USB2 port, the controller stays in host mode
  * @lock: Mutex for synchronizing access
- * @state: Current state of the controller, see documentation for the enum for details
+ * @state: Current state of the controller, see enum dwc3_apple_state and the comment above
  */
 struct dwc3_apple {
 	struct dwc3 dwc;
@@ -265,6 +261,7 @@ static int dwc3_apple_core_init(struct dwc3_apple *appledwc)
  */
 static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
 {
+	enum phy_mode mode;
 	int ret, ret_reset;
 
 	lockdep_assert_held(&appledwc->lock);
@@ -284,19 +281,16 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 	 * Both PHYs were looked up at probe, so device mode is also selected on the first
 	 * bring-up, before dwc3_core_probe() has looked them up itself.
 	 */
-	switch (state) {
-	case DWC3_APPLE_HOST:
-		ret = 0;
-		break;
-	case DWC3_APPLE_DEVICE:
-		ret = phy_set_mode(appledwc->usb2_phy, PHY_MODE_USB_DEVICE);
-		break;
-	default:
+	ret = dwc3_apple_usb2_mode_before_reset(state, &mode);
+	if (ret) {
 		/* Unreachable unless there's a bug in this driver */
-		return -EINVAL;
+		return ret;
 	}
-	if (ret)
-		dev_warn(appledwc->dev, "Failed to set the USB2 PHY mode, err=%d\n", ret);
+	if (mode != PHY_MODE_INVALID) {
+		ret = phy_set_mode(appledwc->usb2_phy, mode);
+		if (ret)
+			dev_warn(appledwc->dev, "Failed to set the USB2 PHY mode, err=%d\n", ret);
+	}
 
 	ret = reset_control_deassert(appledwc->reset);
 	if (ret) {
