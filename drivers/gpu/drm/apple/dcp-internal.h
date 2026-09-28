@@ -48,6 +48,8 @@ struct apple_dcp_typec_route {
 };
 
 bool dcp_is_typec_output(struct apple_dcp *dcp);
+void dcp_swap_watchdog_arm(struct apple_dcp *dcp);
+void dcp_swap_watchdog_complete(struct apple_dcp *dcp);
 bool dcp_is_usb4_output(struct apple_dcp *dcp);
 void dcp_retry_placeholder_edid(struct apple_dcp *dcp,
 				const struct drm_edid *drm_edid);
@@ -253,6 +255,10 @@ struct apple_dcp {
 
 	/* Workqueue for sending vblank events when a dcp swap is not possible */
 	struct work_struct vblank_wq;
+
+	/* Completes a Type-C swap that DCP dropped, and recovers the pipe. */
+	struct delayed_work swap_watchdog_wq;
+	unsigned int swap_watchdog_retrains;
 
 	/* List of referenced drm_framebuffers which can be unreferenced
 	 * on the next successfully completed swap.

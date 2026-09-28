@@ -1142,6 +1142,44 @@ static void dcp_delayed_vblank(struct work_struct *work)
 	dcp_drm_crtc_vblank(dcp->crtc);
 }
 
+#define DCP_SWAP_WATCHDOG_MS		1000
+#define DCP_SWAP_WATCHDOG_RETRAINS	5
+
+/*
+ * DCP drops swaps without completing them while an external pipe is not
+ * enabled, for instance after a modeset that raced a Type-C sink which had
+ * not asserted HPD yet. Userspace would then wait for the flip until the
+ * commit times out, stalling every output it drives. Complete the flip,
+ * mark the mode invalid so later commits do not wait for DCP, and let the
+ * hotplug worker re-apply the active CRTC.
+ */
+static void dcp_swap_watchdog(struct work_struct *work)
+{
+	struct apple_dcp *dcp =
+		container_of(to_delayed_work(work), struct apple_dcp,
+			     swap_watchdog_wq);
+
+	dev_warn(dcp->dev, "swap not completed, retraining the display\n");
+	dcp_mode_invalidate(&dcp->mode_state);
+	dcp_drm_crtc_vblank(dcp->crtc);
+	if (dcp->connector &&
+	    dcp->swap_watchdog_retrains++ < DCP_SWAP_WATCHDOG_RETRAINS)
+		schedule_work(&dcp->connector->hotplug_wq);
+}
+
+void dcp_swap_watchdog_arm(struct apple_dcp *dcp)
+{
+	if (dcp_is_typec_output(dcp))
+		mod_delayed_work(system_wq, &dcp->swap_watchdog_wq,
+				 msecs_to_jiffies(DCP_SWAP_WATCHDOG_MS));
+}
+
+void dcp_swap_watchdog_complete(struct apple_dcp *dcp)
+{
+	cancel_delayed_work(&dcp->swap_watchdog_wq);
+	dcp->swap_watchdog_retrains = 0;
+}
+
 static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 {
 	struct apple_dcp *dcp = cookie;
@@ -1852,6 +1890,7 @@ void dcp_poweroff(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
 
+	cancel_delayed_work(&dcp->swap_watchdog_wq);
 	if (dcp->avep)
 		av_service_disconnect(dcp);
 
@@ -2281,6 +2320,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	set_bit(0, dcp->memdesc_map);
 
 	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
+	INIT_DELAYED_WORK(&dcp->swap_watchdog_wq, dcp_swap_watchdog);
 
 	dcp->swapped_out_fbs =
 		(struct list_head)LIST_HEAD_INIT(dcp->swapped_out_fbs);
@@ -2360,6 +2400,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		cancel_work_sync(&dcp->bl_register_wq);
 		cancel_work_sync(&dcp->bl_update_wq);
 	}
+	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
 	cancel_work_sync(&dcp->vblank_wq);
 
 	devm_clk_put(dev, dcp->clk);
@@ -2576,6 +2617,7 @@ static int dcp_platform_suspend(struct device *dev)
 	 * as after DPMS off.
 	 */
 	dcp_disable_typec_work(dcp, false);
+	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
 
 	if (dcp->avep)
 		av_service_disconnect(dcp);

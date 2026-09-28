@@ -126,6 +126,7 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 	ktime_t now = ktime_get();
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
 	dcp->last_swap_id = resp->swap_id;
+	dcp_swap_watchdog_complete(dcp);
 
 	dcp_drm_crtc_page_flip(dcp, now);
 	if (dcp->crc_enabled) {
@@ -1061,6 +1062,17 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 
 	action = dcp_mode_hotplug(&dcp->mode_state, !!(*connected),
 				  connector ? &connector->connected : NULL);
+	/*
+	 * A Type-C sink can assert HPD only after a modeset has already failed,
+	 * as a TV behind a DP-to-HDMI converter does when it wakes from standby.
+	 * The connector state does not change then; re-apply the mode anyway.
+	 */
+	if (*connected && dcp_is_typec_output(dcp) &&
+	    !READ_ONCE(dcp->mode_state.valid) &&
+	    !READ_ONCE(dcp->mode_state.changing)) {
+		dcp->swap_watchdog_retrains = 0;
+		action |= DCP_HOTPLUG_NOTIFY;
+	}
 	dcp_handle_hotplug_actions(dcp, action);
 }
 
@@ -1164,6 +1176,7 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 	}
 	dcp->swap_start = ktime_get();
 	dcp->swap_submit_timestamp = arch_timer_read_counter();
+	dcp_swap_watchdog_arm(dcp);
 
 	while (!list_empty(&dcp->swapped_out_fbs)) {
 		struct dcp_fb_reference *entry;
