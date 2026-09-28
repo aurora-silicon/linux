@@ -1741,67 +1741,45 @@ err_of_node_put:
 	return ret;
 }
 
-/*
- * Count the "disp-*" entries in reg-names.
- *
- * The positional form below assumes the reg layout is [coproc, disp-0 ...],
- * i.e. exactly one non-disp register, and derives the count as
- * num_resources - 1.  DCPs with H17-generation firmware list a trailing
- * "iop-vbar" register after the display apertures, which would inflate that
- * count, bind the last disp_registers[] entry to iop-vbar and make the
- * "apple,bw-scratch" disp_reg index check reject a valid device tree.
- *
- * Returns a negative errno when reg-names is absent, so callers fall back.
- */
-static int dcp_count_disp_regs(struct device *dev)
-{
-	int n = of_property_count_strings(dev->of_node, "reg-names");
-	const char *name;
-	int i, count = 0;
-
-	if (n <= 0)
-		return -EINVAL;
-
-	for (i = 0; i < n; ++i) {
-		if (of_property_read_string_index(dev->of_node, "reg-names", i,
-						  &name))
-			return -EINVAL;
-		if (!strncmp(name, "disp-", 5))
-			count++;
-	}
-
-	return count ? count : -EINVAL;
-}
-
 static int dcp_get_disp_regs(struct apple_dcp *dcp)
 {
 	struct platform_device *pdev = to_platform_device(dcp->dev);
-	int count = dcp_count_disp_regs(dcp->dev);
-	bool by_name = count > 0;
+	int count = 0;
 	int i, ret;
+	char name[16];
+	const char *reg_name;
+	struct resource *res;
 
-	/* Device trees without reg-names keep the historical positional form. */
-	if (!by_name)
+	if (of_property_present(dcp->dev->of_node, "reg-names")) {
+		ret = of_property_count_strings(dcp->dev->of_node, "reg-names");
+		if (ret < 0)
+			return ret;
+
+		for (i = 0; i < ret; i++) {
+			if (of_property_read_string_index(dcp->dev->of_node,
+							  "reg-names", i, &reg_name))
+				return -EINVAL;
+			if (!strncmp(reg_name, "disp-", 5))
+				count++;
+		}
+	} else {
 		count = pdev->num_resources - 1;
+	}
 
 	if (count <= 0 || count > MAX_DISP_REGISTERS)
 		return -EINVAL;
 
 	for (i = 0; i < count; ++i) {
-		if (by_name) {
-			char name[8];
-
+		if (of_property_present(dcp->dev->of_node, "reg-names")) {
 			snprintf(name, sizeof(name), "disp-%d", i);
-			dcp->disp_registers[i] = platform_get_resource_byname(
-				pdev, IORESOURCE_MEM, name);
+			res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+							   name);
 		} else {
-			dcp->disp_registers[i] = platform_get_resource(
-				pdev, IORESOURCE_MEM, 1 + i);
+			res = platform_get_resource(pdev, IORESOURCE_MEM, 1 + i);
 		}
-		if (!dcp->disp_registers[i]) {
-			dev_err(dcp->dev, "missing display register %d\n", i);
+		if (!res)
 			return -EINVAL;
-		}
+		dcp->disp_registers[i] = res;
 	}
 
 	/* load pmgr bandwidth scratch resource and offset */
