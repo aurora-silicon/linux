@@ -87,6 +87,7 @@ static void native_surface(u8 *s,bool opaque,u32 width,u32 height,u32 pitch)
  s[0x73]=s[0x74]=1;put_unaligned_le64(1,s+0x149);
 }
 static int native_kms_publish(void);
+static bool native_kms_reconnecting(void);
 static int native_kms_unavailable(int error);
 static int native_modes_error;
 static u64 native_modes_error_generation;
@@ -116,6 +117,7 @@ static int native_frame_progress(void)
   if (!ret) {native_frame_done=true;pr_info("m3_dcpext_native: frame hold and power-off completed\n");}
   return ret;
  }
+ if(native_kms_reconnecting())return native_kms_publish();
  blob=m3_dcpext_native_property(native_client,"TimingElements",&bytes);
  if (IS_ERR(blob)) return native_kms_unavailable(PTR_ERR(blob));
  if (!blob) return 0;

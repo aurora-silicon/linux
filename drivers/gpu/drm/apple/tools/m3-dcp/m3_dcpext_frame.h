@@ -4,6 +4,7 @@
  * until reboot, including on partial publication: the caller is already pinned.
  */
 #include <linux/vmalloc.h>
+#include <linux/scatterlist.h>
 #include "m3_dcpext_modes.h"
 #define FRAME_DVA 0x30000000ULL
 #define FRAME_SLOT (FRAME_DVA >> 25)
@@ -147,4 +148,40 @@ static void frame_sync(unsigned int slot,bool for_cpu)
   if(for_cpu)dma_sync_single_for_cpu(dma_dev,frame_dma[i],LEASE_PAGE,DMA_TO_DEVICE);
   else dma_sync_single_for_device(dma_dev,frame_dma[i],LEASE_PAGE,DMA_TO_DEVICE);
  }
+}
+
+/* Replace only the inactive slot, after its last scanout has retired. The
+ * caller owns the backing framebuffer until these PTEs are replaced again. */
+static int frame_map_pages(unsigned int slot, struct sg_table *sgt, u32 offset, u64 bytes)
+{
+ struct sg_page_iter it;
+ unsigned int first=slot*(FRAME_BYTES/LEASE_PAGE), pages=DIV_ROUND_UP_ULL(bytes,LEASE_PAGE), n=0;
+ u32 status;
+ int ret;
+ if(slot>1 || (offset & (LEASE_PAGE-1)) || bytes>FRAME_BYTES)return -EINVAL;
+ if(sgt){
+  for_each_sgtable_page(sgt,&it,offset/LEASE_PAGE){
+   phys_addr_t pa=page_to_phys(sg_page_iter_page(&it));
+   if(pa>=BIT_ULL(42))return -ERANGE;
+   if(++n==pages)break;
+  }
+  if(n!=pages)return -EINVAL;
+ }
+ n=0;
+ if(sgt)for_each_sgtable_page(sgt,&it,offset/LEASE_PAGE){
+  unsigned int i=first+n;
+  WRITE_ONCE(frame_leaf[i/(LEASE_PAGE/8)][i%(LEASE_PAGE/8)],
+    encode_address(page_to_phys(sg_page_iter_page(&it)))|PTE_RW);
+  if(++n==pages)break;
+ }
+ /* Keep unused/guard pages backed by owned scratch memory. */
+ for(;n<FRAME_BYTES/LEASE_PAGE;n++){
+  unsigned int i=first+n;
+  WRITE_ONCE(frame_leaf[i/(LEASE_PAGE/8)][i%(LEASE_PAGE/8)],encode_address(frame_dma[i])|PTE_RW);
+ }
+ dma_wmb();ret=flush_sid();if(ret)return ret;
+ writel(0x100,frame_regs+0x80);
+ ret=readl_poll_timeout(frame_regs+0x80,status,!(status&BIT(31)),1,10000);
+ if(!ret && (readl(frame_regs+0x100)&BIT(31)))ret=-EIO;
+ return ret;
 }

@@ -15,6 +15,7 @@
 #include <drm/drm_file.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
+#include <linux/scatterlist.h>
 #include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
@@ -99,6 +100,8 @@ static int present(struct m3_dcpext_kms *kms, struct drm_atomic_state *state,
 	struct drm_crtc_state *c = drm_atomic_get_new_crtc_state(state, &kms->crtc);
 	struct drm_connector_state *connector;
 	struct drm_framebuffer *fb = NULL;
+	struct sg_table *sgt = NULL;
+	bool copied = false;
 	struct m3_dcpext_native_mode mode;
 	struct iosys_map map[DRM_FORMAT_MAX_PLANES], data[DRM_FORMAT_MAX_PLANES];
 	u64 generation = 0;
@@ -111,13 +114,36 @@ static int present(struct m3_dcpext_kms *kms, struct drm_atomic_state *state,
 		fb = p->fb;
 	}
 	if (fb) {
+		struct drm_gem_object *obj = drm_gem_fb_get_obj(fb, 0);
+		struct scatterlist *sg;
+		unsigned int i;
+		u64 bytes = (u64)fb->pitches[0] * fb->height;
+		bool direct = !(fb->offsets[0] & (PAGE_SIZE - 1)) &&
+			bytes <= (u64)M3_DCPEXT_MAX_PITCH * M3_DCPEXT_MAX_HEIGHT &&
+			fb->offsets[0] <= obj->size && bytes <= obj->size - fb->offsets[0];
+		if (direct) {
+			sgt = drm_gem_shmem_get_pages_sgt(to_drm_gem_shmem_obj(obj));
+			if (IS_ERR(sgt)) return PTR_ERR(sgt);
+			for_each_sgtable_sg(sgt, sg, i)
+				if ((sg_phys(sg) & (PAGE_SIZE - 1)) ||
+				    sg_phys(sg) >= BIT_ULL(42) ||
+				    sg->length > BIT_ULL(42) - sg_phys(sg)) direct = false;
+			if (!direct) sgt = NULL;
+		}
+		if (sgt) {
+			/* The shmem/PRIME helper mapped this attachment BIDIRECTIONAL. */
+			dma_sync_sgtable_for_device(drm_dev_dma_dev(fb->dev), sgt, DMA_BIDIRECTIONAL);
+			goto mapped;
+		}
 		ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
 		if (ret)
 			return ret;
 		ret = drm_gem_fb_vmap(fb, map, data);
 		if (ret)
 			goto end_access;
+		copied = true;
 	}
+mapped:
 	mutex_lock(&kms->owner_lock);
 	if (kms->detached) {
 		ret = -ENODEV;
@@ -132,8 +158,8 @@ static int present(struct m3_dcpext_kms *kms, struct drm_atomic_state *state,
 	}
 	if (!ret)
 		ret = kms->ops->present(kms->cookie, enable ? &mode : NULL, generation,
-				fb ? &data[0] : NULL, fb ? fb->pitches[0] : 0,
-				fb && fb->format->format == DRM_FORMAT_XRGB8888);
+				copied ? &data[0] : NULL, fb ? fb->pitches[0] : 0,
+				fb && fb->format->format == DRM_FORMAT_XRGB8888, fb, sgt);
 	if (!ret && enable)
 		kms->completed++;
 	if (ret && ret != -ESTALE && ret != -ENODEV) {
@@ -143,10 +169,10 @@ static int present(struct m3_dcpext_kms *kms, struct drm_atomic_state *state,
 	mutex_unlock(kms->route_lock);
 unlock_owner:
 	mutex_unlock(&kms->owner_lock);
-	if (fb)
+	if (copied)
 		drm_gem_fb_vunmap(fb, map);
 end_access:
-	if (fb)
+	if (fb && !sgt)
 		drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
 	return ret;
 }

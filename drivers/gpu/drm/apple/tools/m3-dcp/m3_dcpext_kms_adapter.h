@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only OR MIT */
 /* M4 native KMS ownership pattern adapted to J514S old RPC protocol. */
 #include <linux/iosys-map.h>
+#include <drm/drm_framebuffer.h>
 #include "m3_dcpext_kms.h"
 static DEFINE_MUTEX(native_route_lock);
 static struct m3_dcpext_kms *native_kms;
@@ -8,13 +9,22 @@ static bool native_kms_ready,native_kms_finished,native_kms_powered=true;
 static bool native_kms_connected;
 static unsigned int native_kms_frames,native_kms_slot;
 static u32 native_kms_timing,native_kms_color;
+static struct drm_framebuffer *native_slot_fb[2], *native_failed_fb;
+static unsigned int native_direct_frames;
+module_param(native_direct_frames,uint,0400);
+/* Completed-frame aggregate costs; read deltas around a bounded animation. */
+static unsigned long long native_copy_ns,native_sync_ns,native_swap_ns;
+module_param(native_copy_ns,ullong,0400);
+module_param(native_sync_ns,ullong,0400);
+module_param(native_swap_ns,ullong,0400);
 static u64 native_kms_until,native_kms_generation;
 module_param(native_kms_ready,bool,0400);
 module_param(native_kms_frames,uint,0400);
 static int native_kms_present(void *cookie,const struct m3_dcpext_native_mode *mode,
- u64 generation,const struct iosys_map *pixels,u32 source_pitch,bool opaque)
+ u64 generation,const struct iosys_map *pixels,u32 source_pitch,bool opaque,
+ struct drm_framebuffer *fb,struct sg_table *sgt)
 {
- u8 surface[0x22c];void *destination;u64 dva;int ret;
+ u8 surface[0x22c];void *destination;u64 dva,t0,t1,t2,t3;int ret;
  lockdep_assert_held(&native_route_lock);
  /* Hotplug is an ordinary stale atomic commit, not a poisoned device. */
  if(desktop_disconnected || !native_kms_connected)return mode?-ESTALE:0;
@@ -25,7 +35,7 @@ static int native_kms_present(void *cookie,const struct m3_dcpext_native_mode *m
  }
  if(native_kms_finished || !native_kms_ready || generation!=native_kms_generation ||
     generation!=m3_dcpext_native_generation(native_client))return -ESTALE;
- u32 width=mode->geometry.width,height=mode->geometry.height,pitch=ALIGN(width*4,64);
+ u32 width=mode->geometry.width,height=mode->geometry.height,pitch=sgt?source_pitch:ALIGN(width*4,64);
  ret=m3_dcpext_surface_validate(width,height,pitch,FRAME_DVA,FRAME_BYTES);
  if(ret || (pixels && source_pitch<width*4))return ret?:-EINVAL;
  if(mode->timing_id!=native_kms_timing || mode->color_id!=native_kms_color){
@@ -34,16 +44,35 @@ static int native_kms_present(void *cookie,const struct m3_dcpext_native_mode *m
   native_kms_timing=mode->timing_id;native_kms_color=mode->color_id;
  }
  if(!native_kms_powered){ret=m3_dcpext_native_power(native_client,true);if(ret)return ret;native_kms_powered=true;}
- if(!pixels)return m3_dcpext_native_background(native_client,0xff000000);
- /* Initial color bars occupy A. Copy to B first; alternate only on D589. */
+ if(!fb)return m3_dcpext_native_background(native_client,0xff000000);
+ /* Initial color bars occupy A. Use B first; alternate only on D589. */
  unsigned int slot=native_kms_slot?0:1;
  destination=frame_pixels+slot*FRAME_BYTES;
  dva=(FRAME_DVA+slot*FRAME_BYTES)|BIT_ULL(40);
- frame_sync(slot,true);
- for(u32 y=0;y<height;y++)iosys_map_memcpy_from(destination+y*pitch,pixels,(size_t)y*source_pitch,width*4);
- frame_sync(slot,false);dma_wmb();native_surface(surface,opaque,width,height,pitch);
+ t0=ktime_get_ns();
+ if(sgt){
+  if(native_slot_fb[slot]!=fb){
+   struct drm_framebuffer *old=native_slot_fb[slot];
+   drm_framebuffer_get(fb);native_slot_fb[slot]=fb;
+   ret=frame_map_pages(slot,sgt,fb->offsets[0],(u64)pitch*height);
+   if(ret){native_failed_fb=old;return ret;}
+   if(old)drm_framebuffer_put(old);
+  }
+  t3=ktime_get_ns();native_sync_ns+=t3-t0;
+ }else{
+  if(native_slot_fb[slot]){
+   ret=frame_map_pages(slot,NULL,0,0);if(ret)return ret;
+   drm_framebuffer_put(native_slot_fb[slot]);native_slot_fb[slot]=NULL;
+  }
+  frame_sync(slot,true);t1=ktime_get_ns();
+  for(u32 y=0;y<height;y++)iosys_map_memcpy_from(destination+y*pitch,pixels,(size_t)y*source_pitch,width*4);
+  t2=ktime_get_ns();frame_sync(slot,false);dma_wmb();t3=ktime_get_ns();
+  native_sync_ns+=(t1-t0)+(t3-t2);native_copy_ns+=t2-t1;
+ }
+ native_surface(surface,opaque,width,height,pitch);
  ret=m3_dcpext_native_swap(native_client,surface,dva,width,height);
- if(!ret){native_kms_slot^=1;native_kms_frames++;}
+ native_swap_ns+=ktime_get_ns()-t3;
+ if(!ret){native_kms_slot^=1;native_kms_frames++;if(sgt)native_direct_frames++;}
  return ret;
 }
 static const struct m3_dcpext_kms_ops native_kms_ops={.present=native_kms_present};
@@ -76,6 +105,8 @@ static int native_kms_unavailable(int error)
  }
  return 0;
 }
+static bool native_kms_reconnecting(void)
+{return native_kms_ready;}
 static int native_kms_publish(void)
 {
  struct m3_dcpext_native_mode *modes;
@@ -109,8 +140,15 @@ static int native_kms_publish(void)
  ret=m3_dcpext_connector_publish_native(connector,generation,av_edid,av_edid_bytes,modes,count,native_kms_generation);
  mutex_lock(&native_route_lock);
  if(ret)goto out;
- native_kms_connected=true;native_kms_powered=true;native_kms_slot=0;
- native_kms_timing=modes[index].timing_id;native_kms_color=modes[index].color_id;
+ native_kms_connected=true;native_kms_powered=true;native_frame_submitted=true;
+ if(!native_kms_ready){
+  native_kms_slot=0;
+  native_kms_timing=modes[index].timing_id;native_kms_color=modes[index].color_id;
+ }else{
+  /* Retain both pinned slots and the retired/active ordering across hotplug.
+   * Force a fresh mode request before the first new desktop framebuffer. */
+  native_kms_timing=0;native_kms_color=0;
+ }
  if(native_kms_ready){
   mutex_unlock(&native_route_lock);
   m3_dcpext_connector_hotplug(connector);
