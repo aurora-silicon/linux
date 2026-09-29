@@ -33,6 +33,8 @@ static const struct m3_usbc_route_ops *usbc_ops;
 #include "dcpext_syslog.h"
 static struct dcpext_syslog syslog_capture;
 static struct debugfs_blob_wrapper syslog_blob;
+static unsigned int syslog_wraps;
+module_param(syslog_wraps,uint,0400);
 static struct dcpext_session session;
 static DECLARE_COMPLETION(desktop_started);
 static DECLARE_COMPLETION(desktop_finished);
@@ -612,7 +614,7 @@ static int session_dispatch(u64 endpoint,u64 message)
   struct dcpext_buffer *b=&session.buffers[2];
   u64 offset=b->dva & ~BIT_ULL(40); int ret;
   if (b->ready && (offset<LEASE_DVA || offset-LEASE_DVA>session_used || b->size>session_used-(offset-LEASE_DVA))) return -ERANGE;
-  if(session.runtime && syslog_capture.used>sizeof(syslog_capture.capture)-512)syslog_capture.used=0;
+  if(syslog_capture.used>sizeof(syslog_capture.capture)-512){syslog_capture.used=0;syslog_wraps++;}
   ret=dcpext_syslog_observe(&syslog_capture,message,b->ready?pool+offset-LEASE_DVA:NULL,b->size);
   if(ret)return ret;
  }
