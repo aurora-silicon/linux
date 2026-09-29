@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only OR MIT */
 #ifndef M3_HDMI_CONTROL_H
 #define M3_HDMI_CONTROL_H
+u32 m3_hdmi_bridge_irq_count(void);
 bool m3_hdmi_phy_ready(void);
 int m3_hdmi_phy_deactivate(void);
 int m3_hdmi_phy_activate(void);

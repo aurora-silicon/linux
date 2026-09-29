@@ -20,6 +20,7 @@ static int native_poll(void *cookie,unsigned long timeout)
  int ret;
  do {
   u64 msg,ep;
+  ret=hdmi_irq_progress();if(ret)return ret;
   ret=dcpext_session_poll(&session);if(ret)return ret;
   if(!(readl(session_fifo+0x114)&BIT(17))){
    msg=readq(session_fifo+0x830);ep=readq(session_fifo+0x838);dma_rmb();

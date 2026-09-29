@@ -5,6 +5,8 @@
  * exist. Do not toggle the reset, CEC or force-DFU lines. Retain ownership.
  */
 #include <linux/module.h>
+#include <linux/interrupt.h>
+#include <linux/ktime.h>
 #include <linux/device.h>
 #include <linux/delay.h>
 #include <linux/of.h>
@@ -18,6 +20,33 @@ static int hpd = -1;
 module_param(hpd, int, 0400);
 static struct device *owner;
 static struct gpio_desc *port, *bridge, *detect;
+static unsigned int hpd_edges,hpd_irqs,hpd_last_low_us;
+module_param(hpd_edges,uint,0400);
+module_param(hpd_irqs,uint,0400);
+module_param(hpd_last_low_us,uint,0400);
+static u64 hpd_falling_ns;
+static int hpd_irq;
+/* Apple GPIO is MMIO-backed and cannot sleep. Classify short HPD pulses in
+ * hard IRQ context so scheduler latency cannot turn an IRQ into cable loss.
+ * Firmware RPCs run in the serialized session context, never from here.
+ */
+static irqreturn_t bridge_hpd_edge(int irq,void *cookie)
+{
+ u64 now=ktime_get_ns(),low;
+ int level=gpiod_get_value(detect);
+ if(level<0)return IRQ_HANDLED;
+ hpd_edges++;
+ if(!level){hpd_falling_ns=now;return IRQ_HANDLED;}
+ if(!hpd_falling_ns)return IRQ_HANDLED;
+ low=now-hpd_falling_ns;hpd_falling_ns=0;
+ WRITE_ONCE(hpd_last_low_us,min_t(u64,low/1000,U32_MAX));
+ if(low>=100000 && low<=2000000)WRITE_ONCE(hpd_irqs,hpd_irqs+1);
+ return IRQ_HANDLED;
+}
+u32 m3_hdmi_bridge_irq_count(void);
+u32 m3_hdmi_bridge_irq_count(void)
+{return READ_ONCE(hpd_irqs);}
+EXPORT_SYMBOL_GPL(m3_hdmi_bridge_irq_count);
 /* The session owns firmware notifications; this module owns the GPIO. */
 int m3_hdmi_bridge_hpd(void);
 int m3_hdmi_bridge_hpd(void)
@@ -52,6 +81,12 @@ static int __init probe(void)
  if (gpiod_get_direction(port) != 0 || gpiod_get_direction(bridge) != 0) {
   ret=-EINVAL;goto done;
  }
+ if(gpiod_cansleep(detect)){ret=-EOPNOTSUPP;goto done;}
+ hpd_irq=gpiod_to_irq(detect);
+ if(hpd_irq<0){ret=hpd_irq;goto done;}
+ ret=devm_request_irq(owner,hpd_irq,bridge_hpd_edge,
+                      IRQF_TRIGGER_RISING|IRQF_TRIGGER_FALLING,"m3-hdmi-hpd",owner);
+ if(ret)goto done;
  p=gpiod_get_value_cansleep(port);b=gpiod_get_value_cansleep(bridge);
  hpd=gpiod_get_value_cansleep(detect);
  pr_info("m3_hdmi_bridge: before port=%d bridge=%d hpd=%d\n",p,b,hpd);

@@ -514,10 +514,13 @@ static int dptx_apcall(u32 channel,const u8 *payload,u32 size)
  reply[35]=8;put_unaligned_le32(size-44,reply+36);
  return old_epic_write(channel,8,reply,size);
 }
+#include "m3_dcpext_hpd_irq.h"
 static int afk_record(void *cookie, const u8 *payload, u32 size)
 {
  u32 channel = get_unaligned_le32(afk.capture + afk.capture_size - size - 12);
  u32 kind = get_unaligned_le32(afk.capture + afk.capture_size - size - 8);
+ int irq_ret=hdmi_irq_record(channel,kind,payload,size);
+ if(irq_ret)return irq_ret<0?irq_ret:0;
  if (size >= 76 && payload[0] == 2 && payload[20] == 4 && !payload[21] &&
      get_unaligned_le16(payload + 22) == 0x30 &&
      !memcmp(payload + 40, port?"dispext1:dcpdptx-port-epic:0":"dispext0:dcpdptx-port-epic:0", sizeof("dispext0:dcpdptx-port-epic:0")) &&
@@ -538,7 +541,7 @@ static int afk_record(void *cookie, const u8 *payload, u32 size)
      (get_unaligned_le32(rpc_rx+64)!=(rpc_command==12?0x100:0) ||
       get_unaligned_le32(rpc_rx+68)!=rpc_target))return -EPROTO;
   pr_info("m3_dcpext_session: DPTX command=%u reply accepted\n",rpc_command);
-  rpc_pending=false;rpc_tag++;
+  rpc_pending=false;rpc_tag=(rpc_tag+1)&0x7fff;
   if(desktop_hpd_rpc){
    desktop_hpd_rpc=false;
    pr_info("m3_dcpext_session: runtime link stage=%u HPD=%u acknowledged\n",desktop_link_stage,desktop_hpd_value);
@@ -732,6 +735,11 @@ static int session_run(void)
    * Diagnostics without a desktop do not require the bridge module. */
   desktop_read_hpd=usb_c?link_hpd:symbol_get(m3_hdmi_bridge_hpd);
   if(!desktop_read_hpd)return -ENODEV;
+  if(!usb_c){
+   hdmi_irq_count=symbol_get(m3_hdmi_bridge_irq_count);
+   if(!hdmi_irq_count)return -ENODEV;
+   hdmi_irq_seen=hdmi_irq_count();
+  }
   ret=desktop_read_hpd();
   if(ret<0 || (!usb_c && ret!=1))return ret<0?ret:-ENOLINK;
  }
@@ -841,6 +849,7 @@ runtime_link_deferred:
    pr_warn("m3_dcpext_session: diagnostic ASC NMI fallback; expect firmware crash/reboot recovery\n");
    writel(0x10,session_cpu+0x1004);writel(1,session_cpu+0x1014);
   }
+  ret = hdmi_irq_progress();if(ret)break;
   ret = dcpext_session_poll(&session);
   if (ret) break;
   if (session.phase == DCPEXT_RUNNING) {
