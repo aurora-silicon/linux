@@ -119,6 +119,13 @@ impl Health {
             && !self.failed()
     }
 
+    pub(crate) fn set_gpu_pending(&self, pending: bool) { self.progress.set_pending(pending); }
+
+    pub(crate) fn activity_snapshot(&self) -> (u64, u64, bool) {
+        let (generation, epoch) = self.progress.activity_snapshot();
+        (generation, epoch, self.healthy())
+    }
+
     pub(crate) fn record_completion(&self) { self.progress.record_completion(); }
 
     pub(crate) fn progress_snapshot(&self) -> (u64, u64, u64, bool) {

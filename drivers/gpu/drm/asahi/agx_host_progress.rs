@@ -7,14 +7,34 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use kernel::time::{ClockSource, Monotonic};
 
 pub(crate) struct Progress {
+    // Odd epochs conservatively mean potentially outstanding device work.
+    // Start busy until boot has proved that its initial work is retired.
+    activity_epoch: AtomicU64,
     completed: AtomicU64,
     last_completion_ns: AtomicU64,
     generation_ns: u64,
 }
 impl Progress {
     pub(crate) fn new() -> Self {
-        Self { completed: AtomicU64::new(0), last_completion_ns: AtomicU64::new(0),
+        Self { activity_epoch: AtomicU64::new(1), completed: AtomicU64::new(0), last_completion_ns: AtomicU64::new(0),
             generation_ns: Monotonic::ktime_get() as u64 }
+    }
+    /// Serialized runtime writer: set before any publication can reach firmware,
+    /// clear only after all published work has proven retirement. An error must
+    /// never clear this state merely because a software queue was discarded.
+    pub(crate) fn set_pending(&self, pending: bool) {
+        let old = self.activity_epoch.load(Ordering::Relaxed);
+        if (old & 1 != 0) != pending {
+            // Exhaustion remains permanently busy, never wraps back to idle.
+            self.activity_epoch.store(old.checked_add(1).unwrap_or(u64::MAX), Ordering::Release);
+        }
+        if pending {
+            // Order the host marker before subsequent device queue publication.
+            core::sync::atomic::fence(Ordering::SeqCst);
+        }
+    }
+    pub(crate) fn activity_snapshot(&self) -> (u64, u64) {
+        (self.generation_ns, self.activity_epoch.load(Ordering::Acquire))
     }
     pub(crate) fn record_completion(&self) {
         // A reader observing a new count sees this timestamp or a later REAL
