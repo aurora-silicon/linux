@@ -17,8 +17,10 @@ int m3_dcpext_native_swap(struct m3_dcpext_native *dcp, const void *surface, u64
 		       u32 width, u32 height);
 int m3_dcpext_native_background(struct m3_dcpext_native *dcp, u32 color);
 int m3_dcpext_native_panel(struct m3_dcpext_native *dcp, unsigned int action);
-/* Caller owns the returned snapshot and must kfree it. */
+/* Caller owns the returned snapshot and must kvfree it. NULL means absent;
+ * ERR_PTR reports allocation failure. */
 void *m3_dcpext_native_property(struct m3_dcpext_native *dcp, const char *key, u32 *size);
+int m3_dcpext_native_metadata_error(struct m3_dcpext_native *);
 int m3_dcpext_native_pump(struct m3_dcpext_native *, unsigned long timeout);
 int m3_dcpext_native_mode(struct m3_dcpext_native *, u32 color, u32 timing);
 int m3_dcpext_native_power(struct m3_dcpext_native *, bool on);

@@ -295,7 +295,7 @@ static int publish_snapshot(struct m3_dcpext_connector *c, u64 generation,
 	if (native) {
 		for (u32 i = 0; i < count; i++) {
 			u32 rate;
-			if (m3_dcpext_mode_validate(&native[i].geometry, &rate) ||
+			if (m3_dcpext_mode_validate_link(&native[i].geometry, M3_DCPEXT_HBR2_4LANE_KBPS, &rate) ||
 			    !native[i].hsync || !native[i].vsync ||
 			    (u64)native[i].geometry.width + native[i].hfront + native[i].hsync > native[i].geometry.htotal ||
 			    (u64)native[i].geometry.height + native[i].vfront + native[i].vsync > native[i].geometry.vtotal)

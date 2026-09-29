@@ -61,7 +61,11 @@ static int native_record(void *cookie,u32 kind,u64 msg,const void *data,u32 size
 {
  u8 *p=native_capture+native_capture_used;
  if(session.runtime)return 0;
- if(size>sizeof(native_capture)-native_capture_used-16)return -ENOSPC;
+ if(size>sizeof(native_capture)-native_capture_used-16){
+  /* Diagnostics must never break the protocol they observe. */
+  pr_warn_once("m3_dcpext: native capture full; retaining prefix, RPC continues\n");
+  return 0;
+ }
  put_unaligned_le32(kind,p);put_unaligned_le32(size,p+4);put_unaligned_le64(msg,p+8);
  memcpy(p+16,data,size);native_capture_used+=size+16;return 0;
 }
@@ -83,6 +87,10 @@ static void native_surface(u8 *s,bool opaque,u32 width,u32 height,u32 pitch)
  s[0x73]=s[0x74]=1;put_unaligned_le64(1,s+0x149);
 }
 static int native_kms_publish(void);
+static int native_kms_unavailable(int error);
+static int native_modes_error;
+static u64 native_modes_error_generation;
+module_param(native_modes_error,int,0400);
 static int native_frame_progress(void)
 {
  struct m3_dcpext_native_mode *modes;
@@ -94,6 +102,12 @@ static int native_frame_progress(void)
  u8 surface[0x22c] = {};
  if (!native_frame || native_frame_done) return 0;
  if(desktop_disconnected || desktop_hpd_dirty || desktop_hpd_rpc || desktop_link_stage)return 0;
+ ret=m3_dcpext_native_metadata_error(native_client);
+ if(ret)return native_kms_unavailable(ret);
+ if(native_modes_error){
+  if(native_modes_error_generation==m3_dcpext_native_generation(native_client))return 0;
+  native_modes_error=0;native_frame_submitted=false;
+ }
  if (native_frame_submitted) {
   if(native_kms_trial)return native_kms_publish();
   if (session_now(NULL)<native_frame_until) return 0;
@@ -103,16 +117,18 @@ static int native_frame_progress(void)
   return ret;
  }
  blob=m3_dcpext_native_property(native_client,"TimingElements",&bytes);
+ if (IS_ERR(blob)) return native_kms_unavailable(PTR_ERR(blob));
  if (!blob) return 0;
  modes=kcalloc(M3_DCPEXT_NATIVE_MAX_MODES,sizeof(*modes),GFP_KERNEL);
- if (!modes) {kfree(blob);return -ENOMEM;}
- ret=m3_dcpext_native_modes_parse(blob,bytes,modes,M3_DCPEXT_NATIVE_MAX_MODES,&count);
+ if (!modes) {kvfree(blob);return native_kms_unavailable(-ENOMEM);}
+ ret=m3_dcpext_native_modes_parse_link(blob,bytes,modes,M3_DCPEXT_NATIVE_MAX_MODES,&count,link_payload_kbps());
  if (!ret) ret=m3_dcpext_native_mode_select(&wanted,modes,count,&selected);
+ if(ret){kfree(modes);kvfree(blob);return native_kms_unavailable(ret);}
  if (!ret) {
   pr_info("m3_dcpext_native: selected timing=%u color=%u 1080p60 from %u modes\n",modes[selected].timing_id,modes[selected].color_id,count);
   ret=m3_dcpext_native_mode(native_client,modes[selected].color_id,modes[selected].timing_id);
  }
- kfree(modes);kfree(blob);if (ret) return ret;
+ kfree(modes);kvfree(blob);if (ret) return ret;
  ret=m3_dcpext_native_power(native_client,true);if (ret) return ret;
  native_surface(surface,false,1920,1080,7680);
  ret=m3_dcpext_native_swap(native_client,surface,FRAME_DVA|BIT_ULL(40),1920,1080);

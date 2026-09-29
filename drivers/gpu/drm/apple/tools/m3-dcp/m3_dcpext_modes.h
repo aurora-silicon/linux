@@ -14,6 +14,7 @@ typedef uint8_t u8;typedef uint32_t u32;typedef uint64_t u64;
 #define M3_DCPEXT_MAX_HEIGHT 2160
 #define M3_DCPEXT_MAX_PITCH (M3_DCPEXT_MAX_WIDTH * 4)
 #define M3_DCPEXT_MAX_PAYLOAD_KBPS 8640000
+#define M3_DCPEXT_HBR2_4LANE_KBPS 17280000
 
 /* Mode data is supplied by DRM's EDID parser, never invented here. */
 struct m3_dcpext_mode {
@@ -22,6 +23,8 @@ struct m3_dcpext_mode {
 };
 
 #define M3_DCPEXT_NATIVE_MAX_MODES 128
+/* Total retained-property budget; assembly grows as chunks arrive. */
+#define M3_DCPEXT_MAX_PROPERTY_BYTES 0x800000
 struct m3_dcpext_native_mode {
 	struct m3_dcpext_mode geometry;
 	u32 hfront, hsync, vfront, vsync;
@@ -35,6 +38,12 @@ struct m3_dcpext_native_mode {
 int m3_dcpext_native_modes_parse(const void *blob, u32 bytes,
 			       struct m3_dcpext_native_mode *modes,
 			       u32 capacity, u32 *count);
+/* Explicit route bandwidth; USB-C remains two-lane HBR2. */
+int m3_dcpext_native_modes_parse_link(const void *blob, u32 bytes,
+                               struct m3_dcpext_native_mode *modes,
+                               u32 capacity, u32 *count, u32 payload_kbps);
+int m3_dcpext_mode_validate_link(const struct m3_dcpext_mode *mode,
+                               u32 payload_kbps, u32 *fps_16_16);
 /* Match full EDID timing geometry to a uniquely closest native timing. */
 int m3_dcpext_native_mode_select(const struct m3_dcpext_native_mode *requested,
 				const struct m3_dcpext_native_mode *modes,

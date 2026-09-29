@@ -13,6 +13,7 @@
 #include "m3_dcpext_rpc.h"
 #include "m3_dcpext_native.h"
 #include "m3_dcpext_modes.h"
+#include "m3_dcpext_property.h"
 
 #define A(n) M3_DCP_TAG('A', n)
 #define D(n) M3_DCP_TAG('D', n)
@@ -39,8 +40,8 @@ struct m3_dcpext_native {
 	u32 property_count;
 	struct { u32 service; char key[64]; void *data; u32 size; } raw[MAX_RAW_PROPERTIES];
 	u32 raw_count, raw_bytes;
-	void *chunk;
-	u32 chunk_size, chunk_offset;
+	struct m3_property_transfer chunk;
+	int metadata_error;
 	u64 completion_count;
 	u8 completion_last[0x6f0];
 	u64 analytics_count;
@@ -108,7 +109,7 @@ static int raw_property(struct m3_dcpext_native *dcp, u32 service, const u8 *key
 	void *copy;
 	u32 i, old_size = 0;
 
-	if (!memchr(key, 0, 64) || size > SZ_1M)
+	if (!memchr(key, 0, 64) || size > M3_DCPEXT_MAX_PROPERTY_BYTES)
 		return -EINVAL;
 	for (i = 0; i < dcp->raw_count; i++)
 		if (dcp->raw[i].service == service && !strcmp(dcp->raw[i].key, key))
@@ -119,7 +120,7 @@ static int raw_property(struct m3_dcpext_native *dcp, u32 service, const u8 *key
 		old_size = dcp->raw[i].size;
 	if (dcp->raw_bytes - old_size + size > SZ_8M)
 		return -ENOSPC;
-	copy = kvmemdup(data, size ?: 1, GFP_KERNEL);
+	copy = kvmemdup(size ? data : "", size ?: 1, GFP_KERNEL);
 	if (!copy)
 		return -ENOMEM;
 	if (i == dcp->raw_count)
@@ -130,7 +131,7 @@ static int raw_property(struct m3_dcpext_native *dcp, u32 service, const u8 *key
 	dcp->raw[i].data = copy;
 	dcp->raw[i].size = size;
 	dcp->raw_bytes += size - old_size;
- if(!service && !strcmp(key,"TimingElements"))dcp->mode_generation++;
+ if(!service && !strcmp(key,"TimingElements")){dcp->mode_generation++;dcp->metadata_error=0;}
 	return 0;
 }
 
@@ -233,40 +234,25 @@ static int callback(struct m3_dcpext_rpc *b, void *cookie, u32 tag,
 	if ((tag == D(577) && SHAPE(4, 0)) || (tag == D(300) && SHAPE(16, 0)))
 		return 0;
 	if (tag == D(127) && SHAPE(4, 4)) {
-		count = get_unaligned_le32(in);
-		if (dcp->chunk || !count || count > 0x100001)
-			return -EINVAL;
-		dcp->chunk_size = count - 1;
-		dcp->chunk_offset = 0;
-		dcp->chunk = kvzalloc(max_t(u32, 1, dcp->chunk_size), GFP_KERNEL);
-		if (!dcp->chunk)
-			return -ENOMEM;
-		out[0] = 1;
-		return 0;
+		ret = m3_property_begin(&dcp->chunk, get_unaligned_le32(in),
+				M3_DCPEXT_MAX_PROPERTY_BYTES - dcp->raw_bytes);
+		goto property_reply;
 	}
 	if (tag == D(128) && SHAPE(0x1008, 4)) {
-		offset = get_unaligned_le32(in + 0x1000);
-		count = get_unaligned_le32(in + 0x1004);
-		if (!dcp->chunk || offset != dcp->chunk_offset || count > 4096 ||
-		    offset > dcp->chunk_size || count > dcp->chunk_size - offset)
-			return -EINVAL;
-		memcpy(dcp->chunk + offset, in, count);
-		dcp->chunk_offset += count;
-		out[0] = 1;
-		return 0;
+		ret = m3_property_append(&dcp->chunk, get_unaligned_le32(in + 0x1000),
+				in, get_unaligned_le32(in + 0x1004));
+		goto property_reply;
 	}
 	if (tag == D(129) && SHAPE(64, 4)) {
-		if (!dcp->chunk || dcp->chunk_offset != dcp->chunk_size || !memchr(in, 0, 64) ||
-		    dcp->raw_count == MAX_RAW_PROPERTIES || dcp->raw_bytes + dcp->chunk_size > SZ_8M)
-			return -EINVAL;
-		ret = raw_property(dcp, 0, in, dcp->chunk, dcp->chunk_size);
-		if (ret)
-			return ret;
-		kvfree(dcp->chunk);
-		dcp->chunk = NULL;
-		dev_info(dcp->dev, "M3 property %.64s: %u bytes\n", in, dcp->chunk_size);
-		out[0] = 1;
-		return 0;
+		ret = m3_property_complete(&dcp->chunk);
+		if (!ret && !memchr(in, 0, 64))
+			ret = -EINVAL;
+		if (!ret)
+			ret = raw_property(dcp, 0, in, dcp->chunk.data, dcp->chunk.size);
+		if (!ret)
+			dev_info(dcp->dev, "M3 property %.64s: %u bytes\n", in, dcp->chunk.size);
+		m3_property_reset(&dcp->chunk);
+		goto property_reply;
 	}
 	if (tag == D(408) && SHAPE(8, 8)) {
 		count = get_unaligned_le32(in + 4);
@@ -481,6 +467,16 @@ static int callback(struct m3_dcpext_rpc *b, void *cookie, u32 tag,
 	dev_err(dcp->dev, "M3 unhandled kernel callback %#x %u/%u\n", tag, in_size, out_size);
 	return -EOPNOTSUPP;
 #undef SHAPE
+property_reply:
+	if (ret) {
+		dev_warn_ratelimited(dcp->dev, "M3 property rejected: %d; keeping RPC alive\n", ret);
+		dcp->metadata_error = ret;
+		m3_property_reset(&dcp->chunk);
+	}
+	/* D127/D128/D129 return a bool. False rejects data, not the transport. */
+	out[0] = !ret;
+	return 0;
+
 }
 
 int m3_dcpext_native_open(struct m3_dcpext_native *dcp)
@@ -719,7 +715,8 @@ void *m3_dcpext_native_property(struct m3_dcpext_native *dcp, const char *key, u
 	for (i = 0; i < dcp->raw_count; i++) {
 		if (!dcp->raw[i].service && !strcmp(dcp->raw[i].key, key)) {
 			*size = dcp->raw[i].size;
-			copy = kmemdup(dcp->raw[i].data, *size, GFP_KERNEL);
+			copy = kvmemdup(*size ? dcp->raw[i].data : "", *size ?: 1, GFP_KERNEL);
+			if (!copy) copy = ERR_PTR(-ENOMEM);
 			break;
 		}
 	}
@@ -764,6 +761,8 @@ void m3_dcpext_native_invalidate_sink(struct m3_dcpext_native *dcp)
 {
  mutex_lock(&dcp->lock);
  dcp->mode_generation++;
+ dcp->metadata_error=0;
+ m3_property_reset(&dcp->chunk);
  for(u32 i=0;i<dcp->raw_count;) {
   if(dcp->raw[i].service ||
      (strcmp(dcp->raw[i].key,"TimingElements") &&
@@ -778,4 +777,9 @@ void m3_dcpext_native_invalidate_sink(struct m3_dcpext_native *dcp)
 u64 m3_dcpext_native_generation(struct m3_dcpext_native *dcp)
 {
  u64 generation;mutex_lock(&dcp->lock);generation=dcp->mode_generation;mutex_unlock(&dcp->lock);return generation;
+}
+
+int m3_dcpext_native_metadata_error(struct m3_dcpext_native *dcp)
+{
+ return READ_ONCE(dcp->metadata_error);
 }

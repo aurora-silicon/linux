@@ -18,12 +18,16 @@
 static bool usb_c=DCPEXT_INSTANCE!=0;
 module_param(usb_c,bool,0400);
 /* Opt-in compatibility experiment for eventual shared-stream routing.
- * Keep the normal HDMI four-lane/HBR policy until separately qualified.
+ * The two-lane experiment retains the USB-C payload limit.
  */
 static bool hdmi_test_two_lane_hbr2;
 module_param(hdmi_test_two_lane_hbr2,bool,0400);
 static unsigned int link_max_lanes(void)
 {return usb_c || hdmi_test_two_lane_hbr2 ? 2 : 4;}
+static unsigned int link_max_rate(void)
+{return 20;}
+static unsigned int link_payload_kbps(void)
+{return link_max_lanes() * link_max_rate() * 270000U * 8 / 10;}
 static const struct m3_usbc_route_ops *usbc_ops;
 #include "dcpext_session.c"
 #include "dcpext_syslog.h"
@@ -473,7 +477,7 @@ static int dptx_apcall(u32 channel,const u8 *payload,u32 size)
   ret=link_get_rate();if(ret<0)return ret;
   if(ret){ret=link_xbar_up();if(ret)return ret;}break;
  case 7:
-  if(len!=32)return -EINVAL;put_unaligned_le32(usb_c || hdmi_test_two_lane_hbr2 ? 20 : 10,data+16);break;
+  if(len!=32)return -EINVAL;put_unaligned_le32(link_max_rate(),data+16);break;
  case 8:
   if(len!=32)return -EINVAL;
   ret=link_get_rate();if(ret<0)return ret;
@@ -717,7 +721,9 @@ static int session_run(void)
  pr_info("m3_dcpext_session: CPU RUN set; firmware vector unchanged\n");
  session.defer_iop_quiesce = quiesce_first;
  if (afk_endpoint) dir = debugfs_create_dir(port ? "m3_dcpext_session1" : "m3_dcpext_session", NULL);
- if(dir)audio_debugfs(dir);
+ if(dir){audio_debugfs(dir);
+  if(native_startup)debugfs_create_file("native-capture",0400,dir,NULL,&native_capture_fops);
+ }
  early_at = session_now(NULL) + 2000;
  if(iboot_modes || native_startup){session.duration_ms=16000;session.message_limit=512;}
  ret = dcpext_session_begin(&session, &ops, NULL);
@@ -872,7 +878,6 @@ runtime_link_deferred:
  if (afk_endpoint) {
   syslog_blob.data=syslog_capture.capture;syslog_blob.size=syslog_capture.used;
   debugfs_create_blob("syslog-capture",0400,dir,&syslog_blob);
-  if(native_startup)debugfs_create_file("native-capture",0400,dir,NULL,&native_capture_fops);
   if(aux_endpoint)debugfs_create_file("aux-capture",0400,dir,NULL,&aux_fops);
   debugfs_create_file("session-pool",0400,dir,NULL,&pool_fops);
   if(hotplug)snapshot_ram(dir, 1);

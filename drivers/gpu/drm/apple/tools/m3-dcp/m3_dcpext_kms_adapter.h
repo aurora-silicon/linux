@@ -47,6 +47,35 @@ static int native_kms_present(void *cookie,const struct m3_dcpext_native_mode *m
  return ret;
 }
 static const struct m3_dcpext_kms_ops native_kms_ops={.present=native_kms_present};
+/* A rejected catalog is not a failed firmware transport. Keep servicing RPCs
+ * and expose an unavailable connector until a new sink publication arrives. */
+static int native_kms_unavailable(int error)
+{
+ int ret;
+ if(!native_desktop)return error;
+ if(native_modes_error==error && native_kms_ready)return 0;
+ native_modes_error=error;
+ native_modes_error_generation=m3_dcpext_native_generation(native_client);
+ pr_warn("m3_dcpext: external mode metadata rejected (%d); internal desktop retained\n",error);
+ if(!native_kms){
+  native_kms=m3_dcpext_kms_create(dma_dev,&native_kms_ops,NULL,&native_route_lock,
+    usb_c?DRM_MODE_CONNECTOR_DisplayPort:DRM_MODE_CONNECTOR_HDMIA);
+  if(IS_ERR(native_kms)){ret=PTR_ERR(native_kms);native_kms=NULL;return ret;}
+ }
+ native_kms_connected=false;
+ mutex_unlock(&native_route_lock);
+ m3_dcpext_connector_invalidate(m3_dcpext_kms_connector(native_kms),false);
+ if(native_kms_ready)m3_dcpext_connector_hotplug(m3_dcpext_kms_connector(native_kms));
+ mutex_lock(&native_route_lock);
+ if(!native_kms_ready){
+  ret=dcpext_session_enter_runtime(&session);if(ret)return ret;
+  afk.streaming=true;aux_afk.streaming=true;
+  ret=m3_dcpext_kms_register(native_kms);if(ret)return ret;
+  native_kms_ready=true;native_frame_submitted=true;
+  desktop_notify(0);
+ }
+ return 0;
+}
 static int native_kms_publish(void)
 {
  struct m3_dcpext_native_mode *modes;
@@ -57,15 +86,17 @@ static int native_kms_publish(void)
  void *blob;u32 bytes=0,count,index,w,h;u64 generation;int ret;
  if(native_kms_connected || !av_edid_done)return 0;
  blob=m3_dcpext_native_property(native_client,"DisplayAttributes",&bytes);
+ if(IS_ERR(blob))return native_kms_unavailable(PTR_ERR(blob));
  if(!blob)return 0;
- ret=m3_dcpext_native_dimensions(blob,bytes,&w,&h);kfree(blob);if(ret)return ret;
+ ret=m3_dcpext_native_dimensions(blob,bytes,&w,&h);kvfree(blob);if(ret)return native_kms_unavailable(ret);
  blob=m3_dcpext_native_property(native_client,"TimingElements",&bytes);
+ if(IS_ERR(blob))return native_kms_unavailable(PTR_ERR(blob));
  if(!blob)return 0;
  modes=kcalloc(M3_DCPEXT_NATIVE_MAX_MODES,sizeof(*modes),GFP_KERNEL);
- if(!modes){kfree(blob);return -ENOMEM;}
- ret=m3_dcpext_native_modes_parse(blob,bytes,modes,M3_DCPEXT_NATIVE_MAX_MODES,&count);kfree(blob);
+ if(!modes){kvfree(blob);return native_kms_unavailable(-ENOMEM);}
+ ret=m3_dcpext_native_modes_parse_link(blob,bytes,modes,M3_DCPEXT_NATIVE_MAX_MODES,&count,link_payload_kbps());kvfree(blob);
  if(!ret)ret=m3_dcpext_native_mode_select(&wanted,modes,count,&index);
- if(ret)goto out;
+ if(ret){kfree(modes);return native_kms_unavailable(ret);}
  native_kms_generation=m3_dcpext_native_generation(native_client);
  if(!native_kms){
   native_kms=m3_dcpext_kms_create(dma_dev,&native_kms_ops,NULL,&native_route_lock,
