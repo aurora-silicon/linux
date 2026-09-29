@@ -40,14 +40,21 @@ properties:
           - const: apple,t8103-usb4-acio
 
   reg:
+    minItems: 2
     items:
       - description: Root complex and co-processor control registers
       - description: SRAM used for communication with the co-processor
+      - description: |
+          PCIe adapter configuration space of the USB4 router. Present where
+          the root complex exposes the adapter separately, so that the tunnel
+          can be configured before a PCIe-C link is brought up.
 
   reg-names:
+    minItems: 2
     items:
       - const: rc
       - const: sram
+      - const: pcie-adapter
 
   mboxes:
     maxItems: 1
@@ -66,7 +73,11 @@ properties:
       apple,pcie-tunnel is present, the fourth domain powers its PCIe-C
       controller and is enabled only after the USB4 PCIe tunnel is active.
 
-  thunderbolt-switch: true
+  thunderbolt-switch:
+    type: boolean
+    description:
+      Marks this root complex as the USB4/Thunderbolt switch that the Type-C
+      PD controller hands cable information to, so the Type-C mux can find it.
 
   apple,pcie-tunnel:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -85,6 +96,18 @@ properties:
       List of (register offset, mask, value) tuples copied from Apple's Device
       Tree, converted by the bootloader and used to configure the root complex
       after the co-processor has booted.
+
+  apple,tunable-pcie-adapter:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset
+        - description: Mask of bits to clear
+        - description: Bits to set
+    description: |
+      As apple,tunable-rc, but applied to the PCIe adapter configuration space
+      named by the pcie-adapter reg entry. Only meaningful where that entry is
+      present.
 
   '#address-cells':
     const: 1
