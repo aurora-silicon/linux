@@ -12,6 +12,7 @@
 #include <linux/workqueue.h>
 #include "m3_dcpext_rpc.h"
 #include "m3_dcpext_native.h"
+#include "m3_dcpext_modes.h"
 
 #define A(n) M3_DCP_TAG('A', n)
 #define D(n) M3_DCP_TAG('D', n)
@@ -640,7 +641,7 @@ static int native_swap(struct m3_dcpext_native *dcp, const void *surface, u64 dv
 	u32 id;
 	int ret;
 
-	if (surface && (!dva || !width || width > 3024 || !height || height > 1964))
+	if (surface && (!dva || !width || width > M3_DCPEXT_MAX_WIDTH || !height || height > M3_DCPEXT_MAX_HEIGHT))
 		return -EINVAL;
 	swap = kzalloc(0x1b58, GFP_KERNEL);
 	if (!swap)

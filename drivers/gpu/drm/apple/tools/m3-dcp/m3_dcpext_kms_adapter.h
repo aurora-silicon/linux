@@ -7,6 +7,7 @@ static struct m3_dcpext_kms *native_kms;
 static bool native_kms_ready,native_kms_finished,native_kms_powered=true;
 static bool native_kms_connected;
 static unsigned int native_kms_frames,native_kms_slot;
+static u32 native_kms_timing,native_kms_color;
 static u64 native_kms_until,native_kms_generation;
 module_param(native_kms_ready,bool,0400);
 module_param(native_kms_frames,uint,0400);
@@ -24,7 +25,14 @@ static int native_kms_present(void *cookie,const struct m3_dcpext_native_mode *m
  }
  if(native_kms_finished || !native_kms_ready || generation!=native_kms_generation ||
     generation!=m3_dcpext_native_generation(native_client))return -ESTALE;
- if(mode->geometry.width!=1920 || mode->geometry.height!=1080 || (pixels && source_pitch<7680))return -EINVAL;
+ u32 width=mode->geometry.width,height=mode->geometry.height,pitch=ALIGN(width*4,64);
+ ret=m3_dcpext_surface_validate(width,height,pitch,FRAME_DVA,FRAME_BYTES);
+ if(ret || (pixels && source_pitch<width*4))return ret?:-EINVAL;
+ if(mode->timing_id!=native_kms_timing || mode->color_id!=native_kms_color){
+  if(native_kms_powered){ret=m3_dcpext_native_power(native_client,false);if(ret)return ret;native_kms_powered=false;}
+  ret=m3_dcpext_native_mode(native_client,mode->color_id,mode->timing_id);if(ret)return ret;
+  native_kms_timing=mode->timing_id;native_kms_color=mode->color_id;
+ }
  if(!native_kms_powered){ret=m3_dcpext_native_power(native_client,true);if(ret)return ret;native_kms_powered=true;}
  if(!pixels)return m3_dcpext_native_background(native_client,0xff000000);
  /* Initial color bars occupy A. Copy to B first; alternate only on D589. */
@@ -32,9 +40,9 @@ static int native_kms_present(void *cookie,const struct m3_dcpext_native_mode *m
  destination=frame_pixels+slot*FRAME_BYTES;
  dva=(FRAME_DVA+slot*FRAME_BYTES)|BIT_ULL(40);
  frame_sync(slot,true);
- for(u32 y=0;y<1080;y++)iosys_map_memcpy_from(destination+y*7680,pixels,(size_t)y*source_pitch,7680);
- frame_sync(slot,false);dma_wmb();native_surface(surface,opaque);
- ret=m3_dcpext_native_swap(native_client,surface,dva,1920,1080);
+ for(u32 y=0;y<height;y++)iosys_map_memcpy_from(destination+y*pitch,pixels,(size_t)y*source_pitch,width*4);
+ frame_sync(slot,false);dma_wmb();native_surface(surface,opaque,width,height,pitch);
+ ret=m3_dcpext_native_swap(native_client,surface,dva,width,height);
  if(!ret){native_kms_slot^=1;native_kms_frames++;}
  return ret;
 }
@@ -67,10 +75,11 @@ static int native_kms_publish(void)
  connector=m3_dcpext_kms_connector(native_kms);
  mutex_unlock(&native_route_lock);
  generation=m3_dcpext_connector_invalidate(connector,true);
- ret=m3_dcpext_connector_publish_native(connector,generation,av_edid,av_edid_bytes,&modes[index],1,native_kms_generation);
+ ret=m3_dcpext_connector_publish_native(connector,generation,av_edid,av_edid_bytes,modes,count,native_kms_generation);
  mutex_lock(&native_route_lock);
  if(ret)goto out;
  native_kms_connected=true;native_kms_powered=true;native_kms_slot=0;
+ native_kms_timing=modes[index].timing_id;native_kms_color=modes[index].color_id;
  if(native_kms_ready){
   mutex_unlock(&native_route_lock);
   m3_dcpext_connector_hotplug(connector);
@@ -83,7 +92,7 @@ static int native_kms_publish(void)
  ret=m3_dcpext_kms_register(native_kms);
  if(ret)native_kms_ready=false;
  else {
-  pr_info("m3_dcpext_native: HDMI DRM registered: 1080p60 %ux%u mm, desktop=%u\n",w,h,native_desktop);
+  pr_info("m3_dcpext_native: HDMI DRM registered: native modes, %ux%u mm, desktop=%u\n",w,h,native_desktop);
   if(native_desktop)desktop_notify(0);
  }
 out:

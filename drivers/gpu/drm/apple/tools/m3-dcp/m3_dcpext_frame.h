@@ -4,13 +4,17 @@
  * until reboot, including on partial publication: the caller is already pinned.
  */
 #include <linux/vmalloc.h>
+#include "m3_dcpext_modes.h"
 #define FRAME_DVA 0x30000000ULL
 #define FRAME_SLOT (FRAME_DVA >> 25)
-#define FRAME_BYTES ALIGN(1920 * 1080 * 4 + 24 * LEASE_PAGE, LEASE_PAGE)
+#define FRAME_BYTES ALIGN(M3_DCPEXT_MAX_PITCH * M3_DCPEXT_MAX_HEIGHT + 24 * LEASE_PAGE, LEASE_PAGE)
+#define FRAME_LEAVES DIV_ROUND_UP(2 * FRAME_BYTES / LEASE_PAGE, LEASE_PAGE / 8)
+static_assert(FRAME_SLOT + FRAME_LEAVES <= LEASE_PAGE / 8);
+static_assert(LEASE_PAGE == PAGE_SIZE);
 static bool iboot_image;
 module_param(iboot_image,bool,0400);
 static void *frame_pixels,*frame_ram;
-static u64 *frame_leaf,*frame_root;
+static u64 *frame_leaf[FRAME_LEAVES],*frame_root;
 static void __iomem *frame_regs;
 static dma_addr_t frame_dma[2*FRAME_BYTES/LEASE_PAGE];
 static u64 encode_address(phys_addr_t address);
@@ -57,10 +61,14 @@ static int frame_prepare_publish(struct device_node *dcp,int count)
   * borrowing a live scanout aperture. SID4 PIODMA is not modified. */
  ret=-EBUSY;
  for(unsigned int i=0;i<LEASE_PAGE/8;i++)if(READ_ONCE(frame_root[i]))goto ram_out;
- if(READ_ONCE(root[FRAME_SLOT]))goto ram_out;
- frame_leaf=(void *)get_zeroed_page(GFP_KERNEL);frame_pixels=vzalloc(2*FRAME_BYTES);
- ret=-ENOMEM;if(!frame_leaf || !frame_pixels)goto ram_out;
- if(virt_to_phys(frame_leaf)>=BIT_ULL(42)){ret=-ERANGE;goto ram_out;}
+ for(unsigned int i=0;i<FRAME_LEAVES;i++)if(READ_ONCE(root[FRAME_SLOT+i]))goto ram_out;
+ frame_pixels=vzalloc(2*FRAME_BYTES);
+ ret=-ENOMEM;if(!frame_pixels)goto ram_out;
+ for(unsigned int i=0;i<FRAME_LEAVES;i++){
+  frame_leaf[i]=(void *)get_zeroed_page(GFP_KERNEL);
+  if(!frame_leaf[i])goto ram_out;
+  if(virt_to_phys(frame_leaf[i])>=BIT_ULL(42)){ret=-ERANGE;goto ram_out;}
+ }
  for(unsigned int y=0;y<1080;y++)for(unsigned int x=0;x<1920;x++){
   static const u32 bars[]={0xffff0000,0xff00ff00,0xff0000ff,0xffffff00,0xffff00ff,0xff00ffff,0xffffffff,0xff202020};
   ((u32 *)frame_pixels)[y*1920+x]=x<8 || y<8 || x>=1912 || y>=1072?0xffffffff:bars[x*8/1920];
@@ -71,13 +79,14 @@ static int frame_prepare_publish(struct device_node *dcp,int count)
   if(frame_dma[i]>=BIT_ULL(42) || frame_dma[i]&(LEASE_PAGE-1) || dma_to_phys(dma_dev,frame_dma[i])!=frame_dma[i]){
    ret=-ERANGE;goto ram_out;
   }
-  frame_leaf[i]=encode_address(frame_dma[i])|PTE_RW;
+  frame_leaf[i/(LEASE_PAGE/8)][i%(LEASE_PAGE/8)]=encode_address(frame_dma[i])|PTE_RW;
  }
  ret=-EAGAIN;
  if(readl(frame_regs+0x1400)!=ttbr || readl(frame_regs+0x1000)!=tcr || readl(frame_regs+0x200)!=protect)goto ram_out;
  dma_wmb();
- if(cmpxchg64_relaxed(&root[FRAME_SLOT],0,encode_address(virt_to_phys(frame_leaf))|1) ||
-    cmpxchg64_relaxed(&frame_root[FRAME_SLOT],0,encode_address(virt_to_phys(frame_leaf))|1))goto ram_out;
+ for(unsigned int i=0;i<FRAME_LEAVES;i++)
+  if(cmpxchg64_relaxed(&root[FRAME_SLOT+i],0,encode_address(virt_to_phys(frame_leaf[i]))|1) ||
+     cmpxchg64_relaxed(&frame_root[FRAME_SLOT+i],0,encode_address(virt_to_phys(frame_leaf[i]))|1))goto ram_out;
  ret=flush_sid();if(ret)goto ram_out;
  dma_wmb();writel(0x100,frame_regs+0x80);
  ret=readl_poll_timeout(frame_regs+0x80,status,!(status&BIT(31)),1,10000);

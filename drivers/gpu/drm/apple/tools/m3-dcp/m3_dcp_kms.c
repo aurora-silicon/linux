@@ -21,6 +21,7 @@
 #include <drm/drm_debugfs.h>
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_drv.h>
+#include <drm/drm_dumb_buffers.h>
 #include <drm/drm_print.h>
 #include <drm/drm_encoder.h>
 #include <drm/drm_fb_dma_helper.h>
@@ -405,13 +406,16 @@ static const struct drm_mode_config_helper_funcs m3_mode_helpers = {
 static int m3_dumb_create(struct drm_file *file, struct drm_device *drm,
 			  struct drm_mode_create_dumb *args)
 {
-	/* llvmpipe pads its storage to 64-pixel tiles. The scanout framebuffer
-	 * and plane still have to match the exact native panel extent. */
-	if (args->bpp != 32 || !args->width || args->width > ALIGN(3024, 64) ||
-	    !args->height || args->height > ALIGN(1964, 64))
+	int ret;
+
+	/* The compositor also allocates external-output buffers on its primary
+	 * DRM device. Limit scanout geometry in the plane check, not allocations.
+	 * The DRM helper checks pitch/size overflow before applying alignment. */
+	if (args->bpp != 32)
 		return -EINVAL;
-	args->pitch = ALIGN(args->width * 4, 64);
-	args->size = PAGE_ALIGN((u64)args->pitch * args->height);
+	ret = drm_mode_size_dumb(drm, args, 64, 0);
+	if (ret)
+		return ret;
 	return drm_gem_dma_dumb_create_internal(file, drm, args);
 }
 

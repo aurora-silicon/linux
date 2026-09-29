@@ -67,19 +67,19 @@ static int native_record(void *cookie,u32 kind,u64 msg,const void *data,u32 size
 }
 static const struct m3_dcpext_rpc_ops native_ops={.send=session_send,.poll=native_poll,
  .alloc=native_alloc,.map=native_map,.retire=native_retire,.dart_power=native_power,.record=native_record};
-static void native_surface(u8 *s,bool opaque)
+static void native_surface(u8 *s,bool opaque,u32 width,u32 height,u32 pitch)
 {
  memset(s,0,0x22c);s[2]=opaque;
  /* Qualified M3 linear BGRA s, plane 0. */
  put_unaligned_le32(1,s+3);put_unaligned_le32(1,s+7);
  put_unaligned_le32(0x42475241,s+0xb);s[0x13]=13;s[0x14]=12;
- put_unaligned_le32(7680,s+0x15);put_unaligned_le16(1,s+0x19);
+ put_unaligned_le32(pitch,s+0x15);put_unaligned_le16(1,s+0x19);
  s[0x1b]=s[0x1c]=1;
- put_unaligned_le32(1920,s+0x21);put_unaligned_le32(1080,s+0x25);
- put_unaligned_le32(1920*1080*4,s+0x29);put_unaligned_le32(1,s+0x35);
- put_unaligned_le64(1,s+0x51);put_unaligned_le32(1920,s+0x59);
- put_unaligned_le32(1080,s+0x5d);put_unaligned_le32(7680,s+0x69);
- put_unaligned_le32(1920*1080*4,s+0x6d);put_unaligned_le16(4,s+0x71);
+ put_unaligned_le32(width,s+0x21);put_unaligned_le32(height,s+0x25);
+ put_unaligned_le32(pitch*height,s+0x29);put_unaligned_le32(1,s+0x35);
+ put_unaligned_le64(1,s+0x51);put_unaligned_le32(width,s+0x59);
+ put_unaligned_le32(height,s+0x5d);put_unaligned_le32(pitch,s+0x69);
+ put_unaligned_le32(pitch*height,s+0x6d);put_unaligned_le16(4,s+0x71);
  s[0x73]=s[0x74]=1;put_unaligned_le64(1,s+0x149);
 }
 static int native_kms_publish(void);
@@ -114,7 +114,7 @@ static int native_frame_progress(void)
  }
  kfree(modes);kfree(blob);if (ret) return ret;
  ret=m3_dcpext_native_power(native_client,true);if (ret) return ret;
- native_surface(surface,false);
+ native_surface(surface,false,1920,1080,7680);
  ret=m3_dcpext_native_swap(native_client,surface,FRAME_DVA|BIT_ULL(40),1920,1080);
  if (!ret) {
   native_frame_submitted=true;av_read_ready=true;native_frame_until=session_now(NULL)+5000;
