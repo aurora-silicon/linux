@@ -266,7 +266,7 @@ static int native_color(const struct native_blob *b,
 	bool found = false, best_rgb = false;
 	int ret = native_member(b, mode, "ColorModes", &array);
 
-	if (ret || array.type != 2 || array.count > 64)
+	if (ret || array.type != 2)
 		return -EINVAL;
 	pos = array.begin;
 	for (u32 i = 0; i < array.count; i++) {
