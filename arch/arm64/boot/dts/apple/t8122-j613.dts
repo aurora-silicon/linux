@@ -46,6 +46,17 @@
 	};
 };
 
+/*
+ * The boot framebuffer is the same panel: with its physical size simpledrm
+ * reports 224 dpi instead of assuming 96, so early users (Plymouth, fbcon)
+ * pick the same HiDPI scale as the display driver does later. As on the
+ * J413 and J313.
+ */
+&framebuffer0 {
+	panel = <&panel>;
+	post-init-providers = <&panel>;
+};
+
 &wifi0 {
 	brcm,board-type = "apple,dnieper";
 };
