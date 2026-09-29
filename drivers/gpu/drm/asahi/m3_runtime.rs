@@ -246,7 +246,13 @@ impl Runtime {
         while command_index<packet.commands.len() {
             let control=packet.commands[command_index];
             let batch_count=if matches!(control,crate::m3_submit::Command::Render{..}) {
-                packet.commands[command_index..].iter().take(render_batch_size)
+                // The first render draw initializes the shared buffer manager and opens both
+                // render queues: publish it alone. Draws appended to it would advance the shared
+                // manager and event counters it starts from.
+                let started=Option::as_ref(&*guard).ok_or(ENODEV)?.inner.jobs.iter()
+                    .any(|job| matches!(job,NativeJob::Render(j) if j.started()));
+                let limit=if started {render_batch_size} else {1};
+                packet.commands[command_index..].iter().take(limit)
                     .take_while(|c|matches!(c,crate::m3_submit::Command::Render{..})).count()
             } else {
                 packet.commands[command_index..].iter().take(compute_batch_size)

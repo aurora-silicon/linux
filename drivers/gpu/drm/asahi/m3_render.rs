@@ -371,6 +371,8 @@ impl Render {
     pub(crate) fn early_count(&self)->u32 {self.early_count}
     pub(crate) fn heads(&self)->[u16;2] {self.heads}
     pub(crate) fn ordinal(&self)->u64 {self.draw}
+    /// Whether any draw has been published (the first one initializes the buffer manager).
+    pub(crate) fn started(&self)->bool {self.draw>0}
     pub(crate) fn first(&self)->bool {self.draw==self.batch_count as u64}
     pub(crate) fn begin_batch(&mut self,dev:&driver::AsahiDevice,uat:&mmu::Uat,vm:&mmu::Vm,
         commands:&[crate::m3_submit::Command])->Result {
