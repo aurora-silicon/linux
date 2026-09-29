@@ -2255,7 +2255,7 @@ impl kernel::InPlaceModule for SepModule {
                     // nothing on an unlisted SoC, which is indistinguishable
                     // from a driver that started correctly.
                     Err(_) => pr_info!(
-                        "apple_sep: no platform profile for this SoC; the SEP stays disabled\n"
+                        "no platform profile for this SoC; the SEP stays disabled\n"
                     ),
                 }
             },
