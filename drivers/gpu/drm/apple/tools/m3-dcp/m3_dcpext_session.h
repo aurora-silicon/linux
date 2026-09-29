@@ -662,6 +662,37 @@ static ssize_t afk_read(struct file *file, char __user *buf, size_t count, loff_
 static const struct file_operations afk_fops = {
  .owner = THIS_MODULE, .read = afk_read, .llseek = default_llseek,
 };
+/* Snapshot the retained RTKit log while the desktop remains active. Allocate
+ * outside the route lock and copy under it; userspace reads never block RPCs.
+ * Each open owns an immutable, bounded snapshot, including during wraparound.
+ */
+struct syslog_snapshot { size_t size; u8 data[]; };
+static int syslog_live_open(struct inode *inode, struct file *file)
+{
+ struct syslog_snapshot *snapshot;
+ snapshot=kvmalloc(struct_size(snapshot,data,sizeof(syslog_capture.capture)),GFP_KERNEL);
+ if(!snapshot)return -ENOMEM;
+ mutex_lock(&native_route_lock);
+ snapshot->size=syslog_capture.used;
+ if(snapshot->size>sizeof(syslog_capture.capture)){
+  mutex_unlock(&native_route_lock);kvfree(snapshot);return -EIO;
+ }
+ memcpy(snapshot->data,syslog_capture.capture,snapshot->size);
+ mutex_unlock(&native_route_lock);
+ file->private_data=snapshot;
+ return 0;
+}
+static ssize_t syslog_live_read(struct file *file,char __user *buf,size_t count,loff_t *offset)
+{
+ struct syslog_snapshot *snapshot=file->private_data;
+ return simple_read_from_buffer(buf,count,offset,snapshot->data,snapshot->size);
+}
+static int syslog_live_release(struct inode *inode,struct file *file)
+{kvfree(file->private_data);return 0;}
+static const struct file_operations syslog_live_fops={
+ .owner=THIS_MODULE,.open=syslog_live_open,.read=syslog_live_read,
+ .release=syslog_live_release,.llseek=default_llseek,
+};
 static int session_run(void)
 {
  static const struct dcpext_session_ops ops = {
@@ -722,6 +753,7 @@ static int session_run(void)
  session.defer_iop_quiesce = quiesce_first;
  if (afk_endpoint) dir = debugfs_create_dir(port ? "m3_dcpext_session1" : "m3_dcpext_session", NULL);
  if(dir){audio_debugfs(dir);
+  debugfs_create_file("syslog-live",0400,dir,NULL,&syslog_live_fops);
   if(native_startup)debugfs_create_file("native-capture",0400,dir,NULL,&native_capture_fops);
  }
  early_at = session_now(NULL) + 2000;
