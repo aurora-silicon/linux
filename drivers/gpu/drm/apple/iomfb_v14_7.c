@@ -184,6 +184,8 @@ struct apple_dcp_v14 {
 	u32 stride;
 	u32 fb_width, fb_height;
 	u32 panel_width, panel_height;
+	/* The panel's notch rows (apple,notch-height), hidden or not. */
+	u32 notch_rows;
 	u64 clock_rate;
 
 	struct dcp_v14_property properties[DCP_V14_MAX_PROPERTIES];
@@ -1374,7 +1376,13 @@ int iomfb_v14_7_probe(struct apple_dcp *dcp)
 	return 0;
 }
 
-/* The boot framebuffer gives the stride and, with the notch rows, the panel size. */
+/*
+ * The boot framebuffer gives the stride and the panel size. The boot loader
+ * either hides the notch rows from it (the default) or keeps them;
+ * apple,notch-height is recorded either way. A board with a known panel
+ * tells the two apart by the height; any other board is taken to have the
+ * notch hidden.
+ */
 static int dcp_v14_geometry(struct apple_dcp_v14 *v14)
 {
 	struct device_node *fb = of_find_compatible_node(NULL, NULL, "simple-framebuffer");
@@ -1391,14 +1399,17 @@ static int dcp_v14_geometry(struct apple_dcp_v14 *v14)
 	of_node_put(fb);
 	if (ret)
 		return ret;
-	/* The boot loader hides the notch rows from the boot framebuffer. */
 	of_property_read_u32(v14->dev->of_node, "apple,notch-height", &notch);
 	/* The firmware takes this stride as its default: 4 bytes per pixel. */
 	if (!v14->fb_width || !v14->fb_height || v14->stride != v14->fb_width * 4 ||
 	    notch > MAX_NOTCH_HEIGHT)
 		return -EINVAL;
+	v14->notch_rows = notch;
 	v14->panel_width = v14->fb_width;
 	v14->panel_height = v14->fb_height + notch;
+	/* The boot loader kept the notch rows: the framebuffer is the whole panel. */
+	if (v14->board->panel_height && notch && v14->fb_height == v14->board->panel_height)
+		v14->panel_height = v14->fb_height;
 	/* A board with a known panel takes no other. */
 	if (v14->board->panel_width &&
 	    (v14->panel_width != v14->board->panel_width ||
@@ -2209,7 +2220,7 @@ int iomfb_v14_7_start(struct apple_dcp *dcp)
 	mutex_unlock(&dcp->modes_lock);
 	dev_info(dcp->dev, "%s display started: %ux%u@%d, %u notch rows %s, %ux%u mm\n",
 		 v14->board->name, mode->hdisplay, mode->vdisplay, drm_mode_vrefresh(mode),
-		 dcp->notch_height ?: v14->panel_height - v14->fb_height,
+		 v14->notch_rows,
 		 dcp->notch_height ? "hidden" : "shown", mode->width_mm, mode->height_mm);
 	return 0;
 fail:
