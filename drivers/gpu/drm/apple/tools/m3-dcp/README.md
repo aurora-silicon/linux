@@ -178,3 +178,15 @@ The failed module remains pinned and the kernel is tainted until a future
 reboot; no forced unload or reboot was attempted. All raw captures, temporary
 helper sources/binaries and logs remain local under `build/m3-panel-wake` and
 `tools/m3-dcp/live-brightness` in the source-collection workspace.
+## Large HDMI timing publications (2026-09-29)
+
+A connected HDMI monitor published 57 timing records in 1,013,116 bytes. The
+OSSerialize traversal exhausted the old fixed 65,536-value budget despite all
+byte/container/depth limits being satisfied. That returned EINVAL before the
+first frame; the automatic late-display guard retained the watchdog and the
+machine reset. Budgets now derive from the publication size (one tag consumes
+at least four bytes). The 1 MiB publication, nesting and container bounds are
+unchanged. Offline parsing now admits 29 modes under the existing HBR/SDR
+policy. The host sanitizer regression includes an oversized value-count fixture
+and the real capture, alongside malformed/truncated inputs. No mode bandwidth
+or color restrictions are relaxed by this fix. Hardware validation follows.

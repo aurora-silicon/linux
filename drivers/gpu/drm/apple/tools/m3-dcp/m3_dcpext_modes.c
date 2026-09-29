@@ -100,6 +100,10 @@ int m3_dcpext_mode_select(const struct m3_dcpext_mode *m,
  * Bound every container and skip, including unknown fields. Keep this parser
  * independent of DRM so captured and malformed publications use the same code
  * in host sanitizer tests and in the driver. */
+/* Every value consumes at least one four-byte tag. Bound traversal by the
+ * publication size rather than an unrelated 65536-node ceiling: HDMI sinks
+ * with many timing/color combinations can legitimately exceed that ceiling.
+ * The byte, depth and per-container limits remain independently enforced. */
 struct native_value {
 	u32 type, count, begin, end;
 };
@@ -171,7 +175,7 @@ static int native_member(const struct native_blob *b,
 			 struct native_value *out)
 {
 	struct native_value key, value;
-	u32 pos = dict->begin, budget = 65536;
+	u32 pos = dict->begin, budget = b->bytes / 4;
 	bool found = false;
 	int ret;
 
@@ -231,7 +235,7 @@ static int native_color_excluded(const struct native_blob *b,
 				 const char *name, u32 id)
 {
 	struct native_value array, value;
-	u32 pos, budget = 65536;
+	u32 pos, budget = b->bytes / 4;
 	int ret = native_member(b, mode, name, &array);
 
 	if (ret || array.type != 2)
@@ -251,7 +255,7 @@ static int native_color(const struct native_blob *b,
 			const struct native_value *mode, u32 *id)
 {
 	struct native_value array, color;
-	u32 pos, budget = 65536, best_score = 0;
+	u32 pos, budget = b->bytes / 4, best_score = 0;
 	bool found = false;
 	int ret = native_member(b, mode, "ColorModes", &array);
 
@@ -382,7 +386,7 @@ int m3_dcpext_native_modes_parse(const void *data, u32 bytes,
 	struct native_blob blob = { .data = data, .bytes = bytes };
 	struct native_value root, value;
 	struct m3_dcpext_native_mode mode;
-	u32 pos = 4, budget = 65536, used = 0;
+	u32 pos = 4, budget = bytes / 4, used = 0;
 	int ret;
 
 	if (!count)
@@ -396,7 +400,7 @@ int m3_dcpext_native_modes_parse(const void *data, u32 bytes,
 	    ((pos + 3) & ~3U) != bytes)
 		return -EINVAL;
 	pos = root.begin;
-	budget = 65536;
+	budget = bytes / 4;
 	for (u32 i = 0; i < root.count; i++) {
 		ret = native_value_read(&blob, &pos, 0, &budget, &value);
 		if (!ret)
@@ -467,7 +471,7 @@ int m3_dcpext_native_mode_select(const struct m3_dcpext_native_mode *requested,
 int m3_dcpext_native_dimensions(const void *data,u32 bytes,u32 *width_mm,u32 *height_mm)
 {
  struct native_blob b={.data=data,.bytes=bytes};struct native_value root;
- u32 pos=4,budget=65536,w,h;int ret;
+ u32 pos=4,budget=bytes/4,w,h;int ret;
  if(!data || bytes<8 || bytes>0x100000 || !width_mm || !height_mm || get_unaligned_le32(data)!=0xd3)return -EINVAL;
  ret=native_value_read(&b,&pos,0,&budget,&root);
  if(ret || root.type!=1 || ((pos+3)&~3U)!=bytes)return -EINVAL;
