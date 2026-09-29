@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-/* External native DRM device. PRIME/shmem sources are copied into retained
- * hardware scanout by the route owner. Firmware never accesses GEM storage;
- * importing a GPU buffer therefore does not require contiguous physical RAM.
+/* External native DRM device. The route owner maps pinned PRIME/shmem pages
+ * into its retained scanout aperture, with a copy fallback for unaligned data.
  * Native completion handling follows the internal M3 KMS implementation. */
 #include <linux/module.h>
 #include <linux/iosys-map.h>
@@ -285,7 +284,10 @@ static const struct drm_driver kms_driver = {
 	 * without requiring a render engine on the display device. */
 	.driver_features = DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC |
 			   DRIVER_SYNCOBJ | DRIVER_SYNCOBJ_TIMELINE,
-	DRM_GEM_SHMEM_DRIVER_OPS,
+	/* Direct scanout needs the pinned SG table. The default shmem ops
+	 * import without mapping and are only suitable for CPU-copy scanout. */
+	.gem_prime_import_sg_table = drm_gem_shmem_prime_import_sg_table,
+	.dumb_create = drm_gem_shmem_dumb_create,
 	.fops = &kms_fops,
 	.name = "m3-dcpext",
 	.desc = "J514S native HDMI",

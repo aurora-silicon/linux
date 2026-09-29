@@ -79,8 +79,8 @@ static int flush_sid(void)
 	u32 status;
 
 	/* DART table walks are coherent, as in apple_dart_finalize_domain. */
-	pr_info("m3_dcpext_dma: flushing SID5\n");
-	msleep(20);
+	/* Completion polling orders reuse; a diagnostic sleep here would
+	 * impose a 20 ms floor on every runtime scanout remapping. */
 	dma_wmb();
 	writel(0x100 | 5, regs + 0x80);
 	return readl_poll_timeout(regs + 0x80, status, !(status & BIT(31)), 1, 10000);
