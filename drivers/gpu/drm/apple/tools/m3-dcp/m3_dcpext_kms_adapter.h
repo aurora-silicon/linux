@@ -125,7 +125,7 @@ static int native_kms_publish(void)
  if(!blob)return 0;
  modes=kcalloc(M3_DCPEXT_NATIVE_MAX_MODES,sizeof(*modes),GFP_KERNEL);
  if(!modes){kvfree(blob);return native_kms_unavailable(-ENOMEM);}
- ret=m3_dcpext_native_modes_parse_link(blob,bytes,modes,M3_DCPEXT_NATIVE_MAX_MODES,&count,link_payload_kbps());kvfree(blob);
+ ret=m3_dcpext_native_modes_parse_transport(blob,bytes,modes,M3_DCPEXT_NATIVE_MAX_MODES,&count,link_payload_kbps(),!usb_c && !hdmi_test_two_lane_hbr2);kvfree(blob);
  if(!ret)ret=m3_dcpext_native_mode_select(&wanted,modes,count,&index);
  if(ret){kfree(modes);return native_kms_unavailable(ret);}
  native_kms_generation=m3_dcpext_native_generation(native_client);

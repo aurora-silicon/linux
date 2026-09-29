@@ -30,7 +30,7 @@ struct m3_dcpext_native_mode {
 	struct m3_dcpext_mode geometry;
 	u32 hfront, hsync, vfront, vsync;
 	u32 color_id, timing_id;
-	bool hpositive, vpositive, preferred;
+	bool hpositive, vpositive, preferred, dsc;
 };
 
 /* Decode the current native TimingElements publication. Only real, uncompressed
@@ -44,6 +44,11 @@ int m3_dcpext_native_modes_parse(const void *blob, u32 bytes,
 int m3_dcpext_native_modes_parse_link(const void *blob, u32 bytes,
                                struct m3_dcpext_native_mode *modes,
                                u32 capacity, u32 *count, u32 payload_kbps);
+/* Opt-in DSC transport: current firmware-safe DSC-required color IDs only. */
+int m3_dcpext_native_modes_parse_transport(const void *blob,u32 bytes,
+ struct m3_dcpext_native_mode *modes,u32 capacity,u32 *count,u32 payload_kbps,bool allow_dsc);
+int m3_dcpext_native_mode_validate(const struct m3_dcpext_native_mode *mode,
+ u32 payload_kbps,u32 *fps_16_16);
 int m3_dcpext_mode_validate_link(const struct m3_dcpext_mode *mode,
                                u32 payload_kbps, u32 *fps_16_16);
 /* Match full EDID timing geometry to a uniquely closest native timing. */

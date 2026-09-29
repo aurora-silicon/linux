@@ -27,28 +27,51 @@ int m3_dcpext_surface_validate(u32 width, u32 height, u32 pitch,
 	return 0;
 }
 
-int m3_dcpext_mode_validate_link(const struct m3_dcpext_mode *m,
-                               u32 payload_kbps, u32 *fps_16_16)
+static int mode_geometry_validate(const struct m3_dcpext_mode *m, u32 *fps_16_16)
 {
 	u64 fps, total;
 
-	if (!payload_kbps || payload_kbps > M3_DCPEXT_HBR3_4LANE_KBPS ||
-	    !m || !fps_16_16 || !m->width ||
+	if (!m || !fps_16_16 || !m->width ||
 	    m->width > M3_DCPEXT_MAX_WIDTH || !m->height || m->height > M3_DCPEXT_MAX_HEIGHT || !m->clock_khz ||
 	    m->htotal <= m->width || m->vtotal <= m->height ||
 	    m->htotal > 65535 || m->vtotal > 65535)
 		return -EINVAL;
 	if (m->interlaced || m->doublescan)
 		return -EOPNOTSUPP;
-	/* Link payload after 8b/10b encoding, 24 wire bits per RGB pixel. */
-	if ((u64)m->clock_khz * 24 > payload_kbps)
-		return -ERANGE;
 	total = (u64)m->htotal * m->vtotal;
 	fps = ((u64)m->clock_khz * 1000 * 65536 + total / 2) / total;
 	if (fps < 24 * 65536 || fps > 120 * 65536)
 		return -ERANGE;
 	*fps_16_16 = fps;
 	return 0;
+}
+
+int m3_dcpext_mode_validate_link(const struct m3_dcpext_mode *m,
+                               u32 payload_kbps, u32 *fps_16_16)
+{
+	int ret;
+
+	if (!payload_kbps || payload_kbps > M3_DCPEXT_HBR3_4LANE_KBPS)
+		return -EINVAL;
+	ret = mode_geometry_validate(m, fps_16_16);
+	if (ret)
+		return ret;
+	return (u64)m->clock_khz * 24 > payload_kbps ? -ERANGE : 0;
+}
+
+int m3_dcpext_native_mode_validate(const struct m3_dcpext_native_mode *m,
+                                  u32 payload_kbps, u32 *fps_16_16)
+{
+	if (!m)
+		return -EINVAL;
+	if (!m->dsc)
+		return m3_dcpext_mode_validate_link(&m->geometry, payload_kbps, fps_16_16);
+	/* DSC admission is limited to the HDMI HBR3 route. The current firmware
+	 * publication must explicitly require DSC and must NOT mark the color
+	 * unsafe. DCP owns its encoder/PPS and the converter's DSC decompressor. */
+	if (payload_kbps != M3_DCPEXT_HBR3_4LANE_KBPS)
+		return -EOPNOTSUPP;
+	return mode_geometry_validate(&m->geometry, fps_16_16);
 }
 
 int m3_dcpext_mode_validate(const struct m3_dcpext_mode *m, u32 *fps_16_16)
@@ -259,7 +282,7 @@ static int native_color_excluded(const struct native_blob *b,
 }
 
 static int native_color(const struct native_blob *b,
-			const struct native_value *mode, u32 *id)
+			const struct native_value *mode, u32 *id, bool allow_dsc, bool *dsc)
 {
 	struct native_value array, color;
 	u32 pos, budget = b->bytes / 4, best_score = 0;
@@ -272,6 +295,7 @@ static int native_color(const struct native_blob *b,
 	for (u32 i = 0; i < array.count; i++) {
 		u32 candidate, score, depth, encoding, eotf, range, colorimetry;
 		bool virtual, rgb, yuv;
+		int compressed;
 
 		ret = native_value_read(b, &pos, 0, &budget, &color);
 		if (ret || native_bool(b, &color, "IsVirtual", &virtual))
@@ -294,15 +318,19 @@ static int native_color(const struct native_blob *b,
 		if (depth != 8 || eotf || (!rgb && !yuv))
 			continue;
 		ret = native_color_excluded(b, mode, "UnsafeColorElementIDs", candidate);
-		if (!ret)
-			ret = native_color_excluded(b, mode, "DSCRequiredColorElementIDs", candidate);
 		if (ret < 0)
 			return ret;
 		if (ret)
 			continue;
+		compressed = native_color_excluded(b, mode, "DSCRequiredColorElementIDs", candidate);
+		if (compressed < 0)
+			return compressed;
+		if (compressed && !allow_dsc)
+			continue;
 		if (!found || (rgb && !best_rgb) ||
 		    (rgb == best_rgb && (score > best_score || (score == best_score && candidate < *id)))) {
 			*id = candidate;
+			*dsc = !!compressed;
 			best_score = score;
 			best_rgb = rgb;
 			found = true;
@@ -350,7 +378,7 @@ static int native_pipe_count(const struct native_blob *b,
 }
 
 static int native_mode(const struct native_blob *b, const struct native_value *v,
-		       struct m3_dcpext_native_mode *out, u32 payload_kbps)
+		       struct m3_dcpext_native_mode *out, u32 payload_kbps, bool allow_dsc)
 {
 	struct m3_dcpext_mode *m = &out->geometry;
 	u32 horizontal_rate, rate, pipes_h, pipes_v, ignored;
@@ -386,15 +414,16 @@ static int native_mode(const struct native_blob *b, const struct native_value *v
 		return -EOPNOTSUPP;
 	clock = (u64)m->htotal * m->vtotal * rate;
 	m->clock_khz = (clock + 32768000) / 65536000;
-	ret = m3_dcpext_mode_validate_link(m, payload_kbps, &ignored);
+	ret = native_color(b, v, &out->color_id, allow_dsc, &out->dsc);
 	if (ret)
-		return -EOPNOTSUPP;
-	return native_color(b, v, &out->color_id);
+		return ret;
+	ret = m3_dcpext_native_mode_validate(out, payload_kbps, &ignored);
+	return ret ? -EOPNOTSUPP : 0;
 }
 
-int m3_dcpext_native_modes_parse_link(const void *data, u32 bytes,
+int m3_dcpext_native_modes_parse_transport(const void *data, u32 bytes,
 			       struct m3_dcpext_native_mode *modes,
-			       u32 capacity, u32 *count, u32 payload_kbps)
+			       u32 capacity, u32 *count, u32 payload_kbps, bool allow_dsc)
 {
 	struct native_blob blob = { .data = data, .bytes = bytes };
 	struct native_value root, value;
@@ -406,6 +435,7 @@ int m3_dcpext_native_modes_parse_link(const void *data, u32 bytes,
 		return -EINVAL;
 	*count = 0;
 	if (!payload_kbps || payload_kbps > M3_DCPEXT_HBR3_4LANE_KBPS ||
+	    (allow_dsc && payload_kbps != M3_DCPEXT_HBR3_4LANE_KBPS) ||
 	    !data || !modes || !capacity || capacity > M3_DCPEXT_NATIVE_MAX_MODES ||
 	    bytes < 8 || bytes > M3_DCPEXT_MAX_PROPERTY_BYTES || get_unaligned_le32(data) != 0xd3)
 		return -EINVAL;
@@ -418,7 +448,7 @@ int m3_dcpext_native_modes_parse_link(const void *data, u32 bytes,
 	for (u32 i = 0; i < root.count; i++) {
 		ret = native_value_read(&blob, &pos, 0, &budget, &value);
 		if (!ret)
-			ret = native_mode(&blob, &value, &mode, payload_kbps);
+			ret = native_mode(&blob, &value, &mode, payload_kbps, allow_dsc);
 		if (ret == -EOPNOTSUPP)
 			continue;
 		if (ret)
@@ -433,6 +463,10 @@ int m3_dcpext_native_modes_parse_link(const void *data, u32 bytes,
 	*count = used;
 	return 0;
 }
+
+int m3_dcpext_native_modes_parse_link(const void *data,u32 bytes,
+ struct m3_dcpext_native_mode *modes,u32 capacity,u32 *count,u32 payload_kbps)
+{return m3_dcpext_native_modes_parse_transport(data,bytes,modes,capacity,count,payload_kbps,false);}
 
 int m3_dcpext_native_modes_parse(const void *data, u32 bytes,
                                struct m3_dcpext_native_mode *modes,
@@ -454,14 +488,14 @@ int m3_dcpext_native_mode_select(const struct m3_dcpext_native_mode *requested,
 	if (!requested || !modes || !selected || count > M3_DCPEXT_NATIVE_MAX_MODES)
 		return -EINVAL;
 	g = &requested->geometry;
-	ret = m3_dcpext_mode_validate_link(g, M3_DCPEXT_HBR3_4LANE_KBPS, &rate);
+	ret = mode_geometry_validate(g, &rate);
 	if (ret)
 		return ret;
 	for (u32 i = 0; i < count; i++) {
 		const struct m3_dcpext_native_mode *m = &modes[i];
 		u32 delta, candidate_rate;
 
-		if (m3_dcpext_mode_validate_link(&m->geometry, M3_DCPEXT_HBR3_4LANE_KBPS, &candidate_rate) ||
+		if (m3_dcpext_native_mode_validate(m, M3_DCPEXT_HBR3_4LANE_KBPS, &candidate_rate) ||
 		    g->width != m->geometry.width || g->height != m->geometry.height ||
 		    g->htotal != m->geometry.htotal || g->vtotal != m->geometry.vtotal ||
 		    requested->hfront != m->hfront || requested->hsync != m->hsync ||

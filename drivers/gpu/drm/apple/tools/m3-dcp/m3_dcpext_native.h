@@ -26,4 +26,5 @@ int m3_dcpext_native_mode(struct m3_dcpext_native *, u32 color, u32 timing);
 int m3_dcpext_native_power(struct m3_dcpext_native *, bool on);
 u64 m3_dcpext_native_generation(struct m3_dcpext_native *);
 void m3_dcpext_native_invalidate_sink(struct m3_dcpext_native *);
+bool m3_dcpext_native_property_ready(struct m3_dcpext_native *,const char *key);
 #endif

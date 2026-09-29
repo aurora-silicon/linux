@@ -736,6 +736,21 @@ void *m3_dcpext_native_property(struct m3_dcpext_native *dcp, const char *key, u
 	return copy;
 }
 
+bool m3_dcpext_native_property_ready(struct m3_dcpext_native *dcp,const char *key)
+{
+	bool ready = false;
+
+	mutex_lock(&dcp->lock);
+	for (u32 i = 0; i < dcp->raw_count; i++) {
+		if (!dcp->raw[i].service && !strcmp(dcp->raw[i].key, key)) {
+			ready = dcp->raw[i].size != 0;
+			break;
+		}
+	}
+	mutex_unlock(&dcp->lock);
+	return ready;
+}
+
 void m3_dcpext_native_analytics_show(struct m3_dcpext_native *dcp, struct seq_file *seq)
 {
 	mutex_lock(&dcp->lock);

@@ -118,13 +118,21 @@ static int native_frame_progress(void)
   if (!ret) {native_frame_done=true;pr_info("m3_dcpext_native: frame hold and power-off completed\n");}
   return ret;
  }
- if(native_kms_reconnecting())return native_kms_publish();
+ if(native_kms_reconnecting()){
+  /* Reconnect has no bootstrap frame. Fresh metadata proves discovery has
+   * completed, so permit EDID acquisition before publishing the connector.
+   * Invalidation clears these properties; never reuse the previous sink. */
+  if(m3_dcpext_native_property_ready(native_client,"TimingElements") &&
+     m3_dcpext_native_property_ready(native_client,"DisplayAttributes"))
+   av_read_ready=true;
+  return native_kms_publish();
+ }
  blob=m3_dcpext_native_property(native_client,"TimingElements",&bytes);
  if (IS_ERR(blob)) return native_kms_unavailable(PTR_ERR(blob));
  if (!blob) return 0;
  modes=kcalloc(M3_DCPEXT_NATIVE_MAX_MODES,sizeof(*modes),GFP_KERNEL);
  if (!modes) {kvfree(blob);return native_kms_unavailable(-ENOMEM);}
- ret=m3_dcpext_native_modes_parse_link(blob,bytes,modes,M3_DCPEXT_NATIVE_MAX_MODES,&count,link_payload_kbps());
+ ret=m3_dcpext_native_modes_parse_transport(blob,bytes,modes,M3_DCPEXT_NATIVE_MAX_MODES,&count,link_payload_kbps(),!usb_c && !hdmi_test_two_lane_hbr2);
  if (!ret) ret=m3_dcpext_native_mode_select(&wanted,modes,count,&selected);
  if(ret){kfree(modes);kvfree(blob);return native_kms_unavailable(ret);}
  if (!ret) {
