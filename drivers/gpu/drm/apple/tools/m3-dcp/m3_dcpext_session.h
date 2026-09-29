@@ -25,7 +25,7 @@ module_param(hdmi_test_two_lane_hbr2,bool,0400);
 static unsigned int link_max_lanes(void)
 {return usb_c || hdmi_test_two_lane_hbr2 ? 2 : 4;}
 static unsigned int link_max_rate(void)
-{return 20;}
+{return usb_c || hdmi_test_two_lane_hbr2 ? 20 : 30;}
 static unsigned int link_payload_kbps(void)
 {return link_max_lanes() * link_max_rate() * 270000U * 8 / 10;}
 static const struct m3_usbc_route_ops *usbc_ops;

@@ -32,7 +32,7 @@ int m3_dcpext_mode_validate_link(const struct m3_dcpext_mode *m,
 {
 	u64 fps, total;
 
-	if (!payload_kbps || payload_kbps > M3_DCPEXT_HBR2_4LANE_KBPS ||
+	if (!payload_kbps || payload_kbps > M3_DCPEXT_HBR3_4LANE_KBPS ||
 	    !m || !fps_16_16 || !m->width ||
 	    m->width > M3_DCPEXT_MAX_WIDTH || !m->height || m->height > M3_DCPEXT_MAX_HEIGHT || !m->clock_khz ||
 	    m->htotal <= m->width || m->vtotal <= m->height ||
@@ -263,7 +263,7 @@ static int native_color(const struct native_blob *b,
 {
 	struct native_value array, color;
 	u32 pos, budget = b->bytes / 4, best_score = 0;
-	bool found = false;
+	bool found = false, best_rgb = false;
 	int ret = native_member(b, mode, "ColorModes", &array);
 
 	if (ret || array.type != 2 || array.count > 64)
@@ -271,7 +271,7 @@ static int native_color(const struct native_blob *b,
 	pos = array.begin;
 	for (u32 i = 0; i < array.count; i++) {
 		u32 candidate, score, depth, encoding, eotf, range, colorimetry;
-		bool virtual;
+		bool virtual, rgb, yuv;
 
 		ret = native_value_read(b, &pos, 0, &budget, &color);
 		if (ret || native_bool(b, &color, "IsVirtual", &virtual))
@@ -286,8 +286,12 @@ static int native_color(const struct native_blob *b,
 		    native_uint(b, &color, "Colorimetry", &colorimetry) ||
 		    native_uint(b, &color, "DynamicRange", &range))
 			return -EINVAL;
-		if (depth != 8 || encoding || eotf || range ||
-		    (colorimetry != 10 && colorimetry != 16))
+		/* DCP performs RGB framebuffer -> wire format conversion for A411.
+		 * Enum values match the shared Asahi parser.h. Prefer RGB to retain
+		 * text chroma; use BT.709 limited-range 4:2:2 only when needed. */
+		rgb = !encoding && !range && (colorimetry == 10 || colorimetry == 16);
+		yuv = encoding == 3 && range == 1 && colorimetry == 1;
+		if (depth != 8 || eotf || (!rgb && !yuv))
 			continue;
 		ret = native_color_excluded(b, mode, "UnsafeColorElementIDs", candidate);
 		if (!ret)
@@ -296,9 +300,11 @@ static int native_color(const struct native_blob *b,
 			return ret;
 		if (ret)
 			continue;
-		if (!found || score > best_score || (score == best_score && candidate < *id)) {
+		if (!found || (rgb && !best_rgb) ||
+		    (rgb == best_rgb && (score > best_score || (score == best_score && candidate < *id)))) {
 			*id = candidate;
 			best_score = score;
+			best_rgb = rgb;
 			found = true;
 		}
 	}
@@ -399,7 +405,7 @@ int m3_dcpext_native_modes_parse_link(const void *data, u32 bytes,
 	if (!count)
 		return -EINVAL;
 	*count = 0;
-	if (!payload_kbps || payload_kbps > M3_DCPEXT_HBR2_4LANE_KBPS ||
+	if (!payload_kbps || payload_kbps > M3_DCPEXT_HBR3_4LANE_KBPS ||
 	    !data || !modes || !capacity || capacity > M3_DCPEXT_NATIVE_MAX_MODES ||
 	    bytes < 8 || bytes > M3_DCPEXT_MAX_PROPERTY_BYTES || get_unaligned_le32(data) != 0xd3)
 		return -EINVAL;
@@ -448,14 +454,14 @@ int m3_dcpext_native_mode_select(const struct m3_dcpext_native_mode *requested,
 	if (!requested || !modes || !selected || count > M3_DCPEXT_NATIVE_MAX_MODES)
 		return -EINVAL;
 	g = &requested->geometry;
-	ret = m3_dcpext_mode_validate_link(g, M3_DCPEXT_HBR2_4LANE_KBPS, &rate);
+	ret = m3_dcpext_mode_validate_link(g, M3_DCPEXT_HBR3_4LANE_KBPS, &rate);
 	if (ret)
 		return ret;
 	for (u32 i = 0; i < count; i++) {
 		const struct m3_dcpext_native_mode *m = &modes[i];
 		u32 delta, candidate_rate;
 
-		if (m3_dcpext_mode_validate_link(&m->geometry, M3_DCPEXT_HBR2_4LANE_KBPS, &candidate_rate) ||
+		if (m3_dcpext_mode_validate_link(&m->geometry, M3_DCPEXT_HBR3_4LANE_KBPS, &candidate_rate) ||
 		    g->width != m->geometry.width || g->height != m->geometry.height ||
 		    g->htotal != m->geometry.htotal || g->vtotal != m->geometry.vtotal ||
 		    requested->hfront != m->hfront || requested->hsync != m->hsync ||

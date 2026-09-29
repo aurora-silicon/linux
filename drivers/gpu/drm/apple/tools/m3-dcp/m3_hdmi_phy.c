@@ -63,7 +63,7 @@ EXPORT_SYMBOL_GPL(m3_hdmi_phy_get_rate);
 int m3_hdmi_phy_set_rate(unsigned int rate)
 {
  int ret;
- if(rate!=0 && rate!=6 && rate!=10 && rate!=20)return -EINVAL;
+ if(rate!=0 && rate!=6 && rate!=10 && rate!=20 && rate!=30)return -EINVAL;
  if(!m3_hdmi_phy_ready())return -EHOSTDOWN;
  if(rate==main_rate)return 0;
  ret=main_rate?m3_hdmi_atc_dp_main_stop(core,3):0;

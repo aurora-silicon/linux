@@ -102,7 +102,7 @@ static int m3_hdmi_atc_dp_main_prepare(void __iomem *regs, unsigned int pair_mas
 {
 	int ret;
 	if ((!pair_mask || pair_mask > 3) ||
-	    (rate != 6 && rate != 10 && rate != 20) || ssc)
+	    (rate != 6 && rate != 10 && rate != 20 && rate != 30) || ssc)
 		return -EOPNOTSUPP;
 	ret = m3_hdmi_dp_pll_prepare(regs, pair_mask, rate, ssc);
 	if (ret)

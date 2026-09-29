@@ -15,6 +15,7 @@ typedef uint8_t u8;typedef uint32_t u32;typedef uint64_t u64;
 #define M3_DCPEXT_MAX_PITCH (M3_DCPEXT_MAX_WIDTH * 4)
 #define M3_DCPEXT_MAX_PAYLOAD_KBPS 8640000
 #define M3_DCPEXT_HBR2_4LANE_KBPS 17280000
+#define M3_DCPEXT_HBR3_4LANE_KBPS 25920000
 
 /* Mode data is supplied by DRM's EDID parser, never invented here. */
 struct m3_dcpext_mode {
@@ -33,7 +34,8 @@ struct m3_dcpext_native_mode {
 };
 
 /* Decode the current native TimingElements publication. Only real, uncompressed
- * 8bpc full-range RGB/SDR modes within the transport policy are admitted.
+ * 8bpc SDR RGB or BT.709 limited-range YCbCr422 modes are admitted. RGB is
+ * preferred; the bandwidth check conservatively budgets 24 wire bits/pixel.
  * No allocation; count is zero on error. IDs belong to this publication only. */
 int m3_dcpext_native_modes_parse(const void *blob, u32 bytes,
 			       struct m3_dcpext_native_mode *modes,
