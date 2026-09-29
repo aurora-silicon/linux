@@ -8,11 +8,13 @@ struct drm_framebuffer;
 struct sg_table;
 struct m3_dcpext_kms;
 
-/* The route mutex serializes callbacks/hotplug and hardware commits. For direct scanout, fb/sgt describe pinned GEM pages; the owner retains
- * its own framebuffer reference while a DART slot maps them. Otherwise pixels
- * are CPU-readable until present returns and copied into retained slots. Success requires matching firmware completion.
- * Disable has mode/pixels NULL; an active mode with pixels NULL presents only
- * the background. Neither operation may free uncertain DMA resources. */
+/* The route mutex serializes callbacks/hotplug and hardware commits.
+ * For direct scanout, fb/sgt describe pinned GEM pages; the owner retains its
+ * own framebuffer reference while a DART slot maps them. Otherwise pixels
+ * are CPU-readable until present returns and copied into retained slots.
+ * Success requires matching firmware completion. Disable has mode NULL;
+ * an active mode with fb NULL presents only the background. Neither operation
+ * may free uncertain DMA resources. */
 struct m3_dcpext_kms_ops {
 	int (*present)(void *cookie, const struct m3_dcpext_native_mode *mode,
 		       u64 generation, const struct iosys_map *pixels,

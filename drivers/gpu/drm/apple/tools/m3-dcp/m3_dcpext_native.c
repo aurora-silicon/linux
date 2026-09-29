@@ -4,6 +4,7 @@
 #include <linux/ktime.h>
 #include <linux/err.h>
 #include <linux/mutex.h>
+#include <linux/module.h>
 #include <linux/of.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
@@ -629,12 +630,18 @@ int m3_dcpext_native_power(struct m3_dcpext_native *dcp, bool on)
  return ret;
 }
 
+/* Last 32 serialized swaps: ID, begin/A406-ack/completion monotonic us.
+ * Fixed-size overwrite telemetry; no allocation or logging in the frame loop. */
+static unsigned long long swap_timings[32 * 4];
+static unsigned int swap_timing_index;
+module_param_array(swap_timings, ullong, NULL, 0400);
 static int native_swap(struct m3_dcpext_native *dcp, const void *surface, u64 dva,
 		       u32 width, u32 height, u32 background)
 {
 	__le32 start[4] = {}, started[2], result[3];
 	u8 *swap;
 	u32 id;
+	unsigned int ti;
 	int ret;
 
 	if (surface && (!dva || !width || width > M3_DCPEXT_MAX_WIDTH || !height || height > M3_DCPEXT_MAX_HEIGHT))
@@ -643,12 +650,16 @@ static int native_swap(struct m3_dcpext_native *dcp, const void *surface, u64 dv
 	if (!swap)
 		return -ENOMEM;
 	mutex_lock(&dcp->lock);
+	ti = (swap_timing_index++ % 32) * 4;
+	swap_timings[ti + 1] = ktime_to_us(ktime_get());
 	ret = call(dcp, A(406), start, sizeof(start), started, sizeof(started), 0);
 	if (ret || le32_to_cpu(started[1])) {
 		ret = ret ?: -EIO;
 		goto out;
 	}
 	id = le32_to_cpu(started[0]);
+	swap_timings[ti] = id;
+	swap_timings[ti + 2] = ktime_to_us(ktime_get());
 	if (!id) {
 		ret = -EPROTO;
 		goto out;
@@ -683,6 +694,7 @@ static int native_swap(struct m3_dcpext_native *dcp, const void *surface, u64 dv
 		swap[0x1b4b + plane] = 0;
 	}
 	ret = call(dcp, A(407), swap, 0x1b58, result, sizeof(result), id);
+	swap_timings[ti + 3] = ktime_to_us(ktime_get());
 	if (!ret && get_unaligned_le32((u8 *)result + 5))
 		ret = -EIO;
 	if (!ret && !surface)

@@ -24,6 +24,10 @@
 #include <drm/drm_vblank.h>
 #include "m3_dcpext_kms.h"
 
+/* Bounded diagnostic control for qualifying callback delivery latency. */
+static unsigned int flip_slack_us = 2000;
+module_param(flip_slack_us, uint, 0600);
+
 struct m3_dcpext_kms {
 	struct drm_device drm;
 	struct drm_plane plane;
@@ -38,6 +42,7 @@ struct m3_dcpext_kms {
 	bool detached;
 	bool failed;
 	u64 completed;
+	ktime_t submit_time, completion_time;
 };
 
 static struct m3_dcpext_kms *to_kms(struct drm_device *drm)
@@ -155,10 +160,13 @@ mapped:
 		ret = connector ? m3_dcpext_connector_commit_native(&kms->connector,
 				connector, &c->mode, &mode, &generation) : -EINVAL;
 	}
-	if (!ret)
+	if (!ret) {
+		kms->submit_time = ktime_get();
 		ret = kms->ops->present(kms->cookie, enable ? &mode : NULL, generation,
 				copied ? &data[0] : NULL, fb ? fb->pitches[0] : 0,
 				fb && fb->format->format == DRM_FORMAT_XRGB8888, fb, sgt);
+		kms->completion_time = ktime_get();
+	}
 	if (!ret && enable)
 		kms->completed++;
 	if (ret && ret != -ESTALE && ret != -ENODEV) {
@@ -203,7 +211,31 @@ static void finish_event(struct drm_crtc *crtc, struct drm_atomic_state *state, 
 		return;
 	}
 	spin_lock_irqsave(&crtc->dev->event_lock, flags);
-	drm_crtc_send_vblank_event(crtc, event);
+	if (c->active && event->event.base.type == DRM_EVENT_FLIP_COMPLETE) {
+		struct m3_dcpext_kms *kms = to_kms(crtc->dev);
+		ktime_t flip = kms->completion_time;
+		s64 delta = ktime_us_delta(flip, kms->submit_time);
+		struct timespec64 tv;
+
+		/* Based on Asahi dcp_crtc_send_page_flip_event(): DCP reports
+		 * completion after the physical flip. Using callback receipt as
+		 * the flip time makes KWin submit too late for the next refresh,
+		 * halving HDMI cadence. Preserve at least 500 us after submit;
+		 * M3 measurements need a 2 ms cap rather than Asahi's 1 ms.
+		 * This is a bounded latency estimate, not
+		 * a hardware timestamp. Never signal before real completion. */
+		if (delta > 500)
+			flip = ktime_sub_us(flip, min_t(s64, delta - 500,
+					min(READ_ONCE(flip_slack_us), 4000U)));
+		tv = ktime_to_timespec64(flip);
+		event->pipe = drm_crtc_index(crtc);
+		event->event.vbl.sequence = drm_crtc_vblank_count(crtc);
+		event->event.vbl.tv_sec = tv.tv_sec;
+		event->event.vbl.tv_usec = tv.tv_nsec / 1000;
+		drm_send_event_timestamp_locked(crtc->dev, &event->base, flip);
+	} else {
+		drm_crtc_send_vblank_event(crtc, event);
+	}
 	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
 }
 
