@@ -57,4 +57,12 @@ static inline bool apple_dp_tunnel_t602x(void)
 	return of_machine_compatible_match(machines);
 }
 
+/*
+ * Display crossbar: point a DP IN output that is not selected yet at source
+ * @state without bringing the connection up, or back at its idle source
+ * (MUX_IDLE_DISCONNECT). The later mux selection does the rest.
+ * -EOPNOTSUPP on T602X crossbars.
+ */
+int apple_dpxbar_preselect(struct mux_control *mux, int state);
+
 #endif

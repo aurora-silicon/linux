@@ -93,10 +93,13 @@ struct apple_dpxbar_hw {
 	unsigned int n_ufp;
 	u32 tunable;
 	const struct mux_control_ops *ops;
+	/* DP IN runs without the FIFO_RD_PCLK1 cycle-slip toggle (t600x) */
+	bool dpin_no_cycle_slip;
 };
 
 struct apple_dpxbar {
 	struct device *dev;
+	const struct apple_dpxbar_hw *hw;
 	void __iomem *regs;
 	int selected_dispext[MUX_MAX];
 	spinlock_t lock;
@@ -361,6 +364,12 @@ static void apple_dpxbar_check_gates(struct apple_dpxbar *dpxbar, unsigned int i
 			 apple_dpxbar_names[index], wr, rd, out);
 }
 
+/* The RD_PCLK toggle below is needed for the PHY output, and for DP IN on some SoCs. */
+static bool apple_dpxbar_cycle_slip(struct apple_dpxbar *dpxbar, unsigned int index)
+{
+	return index == MUX_DPPHY || !dpxbar->hw->dpin_no_cycle_slip;
+}
+
 static int apple_dpxbar_set(struct mux_control *mux, int state)
 {
 	struct apple_dpxbar *dpxbar = mux_chip_priv(mux->chip);
@@ -479,9 +488,11 @@ static int apple_dpxbar_set(struct mux_control *mux, int state)
 		 * 5 usec is required which is doubled here to be on the
 		 * safe side.
 		 */
-		dpxbar_clear32(dpxbar, FIFO_RD_PCLK1_EN, dispext_bit);
-		udelay(10);
-		dpxbar_set32(dpxbar, FIFO_RD_PCLK1_EN, dispext_bit);
+		if (apple_dpxbar_cycle_slip(dpxbar, index)) {
+			dpxbar_clear32(dpxbar, FIFO_RD_PCLK1_EN, dispext_bit);
+			udelay(10);
+			dpxbar_set32(dpxbar, FIFO_RD_PCLK1_EN, dispext_bit);
+		}
 
 		dpxbar->selected_dispext[index] = state;
 	}
@@ -585,9 +596,11 @@ static int apple_dpxbar_t8103_link_up(struct mux_control *mux)
 		dpxbar_set32(dpxbar, OUT_PCLK1_EN, atc_bit);
 		dpxbar_set32(dpxbar, CROSSBAR_ATC_EN, atc_bit);
 		dpxbar_set32(dpxbar, CROSSBAR_DISPEXT_EN, dispext_bit);
-		dpxbar_clear32(dpxbar, FIFO_RD_PCLK1_EN, dispext_bit);
-		udelay(10);
-		dpxbar_set32(dpxbar, FIFO_RD_PCLK1_EN, dispext_bit);
+		if (apple_dpxbar_cycle_slip(dpxbar, index)) {
+			dpxbar_clear32(dpxbar, FIFO_RD_PCLK1_EN, dispext_bit);
+			udelay(10);
+			dpxbar_set32(dpxbar, FIFO_RD_PCLK1_EN, dispext_bit);
+		}
 	}
 	spin_unlock_irqrestore(&dpxbar->lock, flags);
 	if (ret)
@@ -600,6 +613,57 @@ static int apple_dpxbar_t8103_link_up(struct mux_control *mux)
 		readl(dpxbar->regs + OUT_PCLK1_EN_STAT));
 	return 0;
 }
+
+int apple_dpxbar_preselect(struct mux_control *mux, int state)
+{
+	struct apple_dpxbar *dpxbar;
+	unsigned int index, mux_state;
+	unsigned long flags;
+	u32 mask, set;
+	int ret = 0;
+
+	if (!mux)
+		return -EINVAL;
+	dpxbar = apple_dpxbar_from_mux(mux, &index);
+	if (!dpxbar)
+		return -EOPNOTSUPP;
+	if (state == MUX_IDLE_DISCONNECT)
+		mux_state = 0;
+	else if (state >= 0 && state < 9)
+		mux_state = state;
+	else
+		return -EINVAL;
+
+	switch (index) {
+	case MUX_DPIN0:
+		mask = CROSSBAR_MUX_CTRL_DPIN0_SELECT0 | CROSSBAR_MUX_CTRL_DPIN0_SELECT1;
+		set = FIELD_PREP(CROSSBAR_MUX_CTRL_DPIN0_SELECT0, mux_state) |
+		      FIELD_PREP(CROSSBAR_MUX_CTRL_DPIN0_SELECT1, mux_state);
+		break;
+	case MUX_DPIN1:
+		mask = CROSSBAR_MUX_CTRL_DPIN1_SELECT0 | CROSSBAR_MUX_CTRL_DPIN1_SELECT1;
+		set = FIELD_PREP(CROSSBAR_MUX_CTRL_DPIN1_SELECT0, mux_state) |
+		      FIELD_PREP(CROSSBAR_MUX_CTRL_DPIN1_SELECT1, mux_state);
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	spin_lock_irqsave(&dpxbar->lock, flags);
+	/* a selected output already points at its source */
+	if (dpxbar->selected_dispext[index] >= 0)
+		ret = -EBUSY;
+	else
+		dpxbar_mask32(dpxbar, CROSSBAR_MUX_CTRL, mask, set);
+	spin_unlock_irqrestore(&dpxbar->lock, flags);
+	if (ret)
+		return ret;
+
+	dev_dbg(dpxbar->dev, "%s: source preselected, MUX_CTRL=%08x\n",
+		apple_dpxbar_names[index], readl(dpxbar->regs + CROSSBAR_MUX_CTRL));
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_dpxbar_preselect);
 
 static const struct mux_control_ops apple_dpxbar_ops = {
 	.set = apple_dpxbar_set,
@@ -772,6 +836,7 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 		return PTR_ERR(mux_chip);
 
 	dpxbar = mux_chip_priv(mux_chip);
+	dpxbar->hw = hw;
 	mux_chip->ops = hw->ops;
 	spin_lock_init(&dpxbar->lock);
 
@@ -815,6 +880,7 @@ static const struct apple_dpxbar_hw apple_dpxbar_hw_t6000 = {
 	.n_ufp = 9,
 	.tunable = 5,
 	.ops = &apple_dpxbar_ops,
+	.dpin_no_cycle_slip = true,
 };
 
 static const struct apple_dpxbar_hw apple_dpxbar_hw_t6020 = {
