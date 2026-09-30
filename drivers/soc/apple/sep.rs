@@ -18,6 +18,7 @@ mod hwrng;
 mod image;
 mod keybag;
 mod keybag_identity;
+mod pm;
 mod profile;
 mod proto;
 mod refkey;
@@ -105,6 +106,11 @@ const OOL_SIZE_SBIO: usize = 0x4000;
 const OOL_SIZE_SCRD: usize = 0x4000;
 
 const SBIO_TIMEOUT_MS: time::Msecs = 5000;
+
+// How long going to sleep waits for an ended capture to stop: one enclave
+// request in flight, plus the capture loop's interrupt-wait backstop.
+const SLEEP_DRAIN_MS: u32 = 6000;
+static_assert!(SLEEP_DRAIN_MS as u64 > SBIO_TIMEOUT_MS as u64);
 
 const SKS_ALLOC: usize = 0x8000;
 
@@ -672,6 +678,16 @@ struct SepData {
 
     shutting_down: Atomic<bool>,
 
+    // The system is going to sleep: no capture may start. Changed under the
+    // bio session lock; `sleep_over` is signalled when it clears.
+    suspending: Atomic<bool>,
+
+    #[pin]
+    sleep_over: CondVar,
+
+    // Enrol and verify work items between `capture_begin` and `capture_end`.
+    captures_running: Atomic<u32>,
+
     #[pin]
     rx_work: Work<SepData>,
 
@@ -839,6 +855,9 @@ impl SepData {
                 settle_idle_ticks: Atomic::new(0),
                 registered: Atomic::new(false),
                 shutting_down: Atomic::new(false),
+                suspending: Atomic::new(false),
+                sleep_over <- new_condvar!("SepData::sleep_over"),
+                captures_running: Atomic::new(0),
                 rx_work <- new_work!("SepData::rx_work"),
                 enrol_work <- new_work!("SepData::enrol_work"),
                 verify_work <- new_work!("SepData::verify_work"),
@@ -1957,6 +1976,10 @@ impl SepData {
 
     fn remove(&self) {
         self.shutting_down.store(true, Relaxed);
+        pm::unregister();
+        // Release any capture start still held for a resume that will not be
+        // reported now.
+        self.sleep_finished();
         self.release_firmware_mapping();
         trusted::unregister();
         self.unregister_fv_kernel();
@@ -2143,10 +2166,11 @@ impl WorkItem<ENROL_WORK_ID> for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
-        if this.shutting_down.load(Relaxed) {
+        if this.shutting_down.load(Relaxed) || !this.capture_begin() {
             return;
         }
         this.run_enrolment();
+        this.capture_end();
     }
 }
 
@@ -2154,10 +2178,11 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
-        if this.shutting_down.load(Relaxed) {
+        if this.shutting_down.load(Relaxed) || !this.capture_begin() {
             return;
         }
         this.run_verify();
+        this.capture_end();
     }
 }
 
@@ -2212,6 +2237,10 @@ impl platform::Driver for SepDriver {
 
         if let Err(e) = trusted::register(data.clone()) {
             dev_warn!(data.dev, "trusted-keys: registration failed ({:?})\n", e);
+        }
+
+        if let Err(e) = pm::register(data.clone()) {
+            dev_warn!(data.dev, "sleep notifier registration failed ({:?}); a capture may run into a suspend\n", e);
         }
 
         if data.registered.load(Relaxed) {

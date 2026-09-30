@@ -2577,6 +2577,81 @@ impl SepData {
         }
     }
 
+    /// Called by the enrol and verify work items before they touch the sensor.
+    /// Returns false if the system is going to sleep; the session has then
+    /// been ended and the capture must not start. A true return must be
+    /// paired with [`Self::capture_end`].
+    pub(crate) fn capture_begin(&self) -> bool {
+        let mut session = self.bio_session.lock();
+        if self.suspending.load(Relaxed) {
+            let woke = bio::abort_capture(&mut session);
+            drop(session);
+            if woke {
+                self.bio_wake();
+            }
+            return false;
+        }
+        self.captures_running.fetch_add(1, Relaxed);
+        true
+    }
+
+    pub(crate) fn capture_end(&self) {
+        self.captures_running.fetch_sub(1, Relaxed);
+    }
+
+    /// The system is about to suspend. End any capture in progress, hold new
+    /// ones, and wait for the enrol or verify work to stop touching the sensor
+    /// before devices go down.
+    pub(crate) fn sleep_prepare(&self) {
+        let woke = {
+            let mut session = self.bio_session.lock();
+            self.suspending.store(true, Relaxed);
+            bio::abort_capture(&mut session)
+        };
+        if woke {
+            dev_info!(
+                self.dev,
+                "Touch ID: ending the capture in progress before sleep\n"
+            );
+            self.bio_wake();
+        }
+
+        let mut waited: u32 = 0;
+        while self.captures_running.load(Relaxed) != 0 {
+            if waited >= SLEEP_DRAIN_MS {
+                dev_warn!(
+                    self.dev,
+                    "Touch ID: a capture was still running {} ms after the system started to sleep; continuing\n",
+                    SLEEP_DRAIN_MS
+                );
+                return;
+            }
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
+            waited += 10;
+        }
+    }
+
+    /// The system has resumed, or the suspend was aborted.
+    pub(crate) fn sleep_finished(&self) {
+        let _session = self.bio_session.lock();
+        self.suspending.store(false, Relaxed);
+        self.sleep_over.notify_all();
+    }
+
+    /// Holds a capture start until the system is awake. Userspace is thawed
+    /// before the driver hears of the resume, so a lock screen that retries at
+    /// once would otherwise be refused. A start made just before the system
+    /// sleeps is interrupted by the freezer and restarted after resume.
+    fn wait_until_awake(&self) -> Result<()> {
+        let mut session = self.bio_session.lock();
+        while self.suspending.load(Relaxed) {
+            if self.sleep_over.wait_interruptible(&mut session) {
+                return Err(ERESTARTSYS);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn queue_enrolment(this: Arc<SepData>) {
         if workqueue::system()
             .enqueue::<Arc<SepData>, ENROL_WORK_ID>(this.clone())
@@ -2621,6 +2696,11 @@ impl SepData {
     pub(crate) fn bio_ioctl(&self, cmd: u32, arg: usize) -> Result<bio::Handled> {
         if cmd == bio::IOC_ATTEST {
             return self.bio_attest(arg);
+        }
+        // A capture started while the system goes to sleep would run into the
+        // suspend; `capture_begin` repeats this check under the session lock.
+        if bio::starts_capture(cmd) {
+            self.wait_until_awake()?;
         }
         // Query SEP outside the bio session/index locks. A host index can
         // outlive its SEP identity after a failed cold restore; userspace
