@@ -1037,6 +1037,10 @@ impl SepData {
             return;
         }
         let Some(patch) = self.wake_sensor() else {
+            dev_warn!(
+                self.dev,
+                "sbio: the sensor did not wake at attach; the next verify retries the bring-up\n"
+            );
             return;
         };
         if !self.complete_bringup(patch) {
@@ -1229,7 +1233,31 @@ impl SepData {
         Ok(())
     }
 
+    // The attach-time bring-up can fail after the Catacomb restore (the
+    // sensor patch step has no retry), which leaves the device-view proof
+    // undone and every verify refused until reboot. The restore itself is
+    // still a valid candidate, so bring the sensor up once more and let
+    // complete_bringup() finish the proof before refusing.
+    fn retry_restore_proof(&self) {
+        if self.templates_restored.load(Relaxed)
+            || !self.cold_restore_candidate.load(Relaxed)
+            || self.device_view_synced.load(Relaxed)
+        {
+            return;
+        }
+        dev_warn!(
+            self.dev,
+            "verify: attach-time bring-up left the device-view proof undone; retrying the sensor bring-up\n"
+        );
+        if !self.bring_sensor_online() {
+            dev_err!(self.dev, "verify: the retried sensor bring-up failed\n");
+        }
+        let _ = sensor::idle();
+        self.refresh_match_credential();
+    }
+
     pub(crate) fn run_verify(&self) {
+        self.retry_restore_proof();
         if !self.templates_restored.load(Relaxed) {
             dev_err!(
                 self.dev,
