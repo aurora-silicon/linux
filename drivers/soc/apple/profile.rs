@@ -143,10 +143,6 @@ pub(crate) struct PlatformProfile {
     pub(crate) key_store: KeyStore,
     /// Platforms with reboot-tested owner export and user-before-master saves.
     pub(crate) persistent_enrol: bool,
-    /// Set the SCRD match credential up again at the end of a cold restore.
-    /// Without it these platforms answer every MATCH_RESULT after a reboot
-    /// with 0x1, although the Catacomb restore itself succeeds.
-    pub(crate) refresh_match_credential: bool,
 }
 
 const T8103: PlatformProfile = PlatformProfile {
@@ -180,7 +176,6 @@ const T8103: PlatformProfile = PlatformProfile {
         cpx_encryption_mode: 2,
     },
     persistent_enrol: true,
-    refresh_match_credential: false,
 };
 
 /// M1 Pro (J316s). The M1 family cold-boots its SEP like T8103, so the boot
@@ -217,7 +212,6 @@ const T6000: PlatformProfile = PlatformProfile {
         cpx_encryption_mode: 2,
     },
     persistent_enrol: true,
-    refresh_match_credential: true,
 };
 
 const T6020: PlatformProfile = PlatformProfile {
@@ -247,7 +241,6 @@ const T6020: PlatformProfile = PlatformProfile {
     },
     key_store: KeyStore::Variant5,
     persistent_enrol: true,
-    refresh_match_credential: true,
 };
 
 /// MacBook Neo. The J700 ADT records a pre-booted SEP, a spi2 Mesa sensor
@@ -281,7 +274,6 @@ const T8140: PlatformProfile = PlatformProfile {
         bag_type: 0,
         arg: -1,
     },
-    refresh_match_credential: true,
 };
 
 static_assert!(T8103.shmem_capacity == 0x30000);
