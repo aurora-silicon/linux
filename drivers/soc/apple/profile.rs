@@ -143,6 +143,10 @@ pub(crate) struct PlatformProfile {
     pub(crate) key_store: KeyStore,
     /// Platforms with reboot-tested owner export and user-before-master saves.
     pub(crate) persistent_enrol: bool,
+    /// Set the SCRD match credential up again at the end of a cold restore.
+    /// Without it these platforms answer every MATCH_RESULT after a reboot
+    /// with 0x1, although the Catacomb restore itself succeeds.
+    pub(crate) refresh_match_credential: bool,
 }
 
 const T8103: PlatformProfile = PlatformProfile {
@@ -176,14 +180,14 @@ const T8103: PlatformProfile = PlatformProfile {
         cpx_encryption_mode: 2,
     },
     persistent_enrol: true,
+    refresh_match_credential: false,
 };
 
 /// M1 Pro (J316s). The M1 family cold-boots its SEP like T8103, so the boot
 /// path, shared-memory geometry and key store follow T8103. The sensor sits on
 /// SPI2 at the T6020 address, in the mode T6020 verified: the J313, J316s and
 /// J414s platform device trees describe the same sensor (id 0x3352)
-/// identically. Enrolment persistence is not yet reboot-tested here, so it
-/// stays opt-in (`j414s_persistent_enrol=1`).
+/// identically. Enrolment persistence is reboot-tested on J314s.
 const T6000: PlatformProfile = PlatformProfile {
     name: "T6000/J316s",
     shmem_capacity: 0x3_0000,
@@ -212,7 +216,8 @@ const T6000: PlatformProfile = PlatformProfile {
     key_store: KeyStore::Sepos13 {
         cpx_encryption_mode: 2,
     },
-    persistent_enrol: false,
+    persistent_enrol: true,
+    refresh_match_credential: true,
 };
 
 const T6020: PlatformProfile = PlatformProfile {
@@ -242,6 +247,7 @@ const T6020: PlatformProfile = PlatformProfile {
     },
     key_store: KeyStore::Variant5,
     persistent_enrol: true,
+    refresh_match_credential: true,
 };
 
 /// MacBook Neo. The J700 ADT records a pre-booted SEP, a spi2 Mesa sensor
@@ -275,6 +281,7 @@ const T8140: PlatformProfile = PlatformProfile {
         bag_type: 0,
         arg: -1,
     },
+    refresh_match_credential: true,
 };
 
 static_assert!(T8103.shmem_capacity == 0x30000);

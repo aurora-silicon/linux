@@ -1037,6 +1037,10 @@ impl SepData {
             return;
         }
         let Some(patch) = self.wake_sensor() else {
+            dev_warn!(
+                self.dev,
+                "sbio: the sensor did not wake at attach; the next verify retries the bring-up\n"
+            );
             return;
         };
         if !self.complete_bringup(patch) {
@@ -1190,8 +1194,30 @@ impl SepData {
         self.ensure_restored_after(prepared);
         self.attach_bringup();
         self.probe_owner_export();
+        self.refresh_match_credential();
         self.touchid_started.store(true, Relaxed);
         Ok(())
+    }
+
+    // On the variant-5 key store and on T6000 the SCRD credential set up
+    // before the Catacomb restore does not survive the rest of activation:
+    // J414c and J314s then answered every cold-boot MATCH_RESULT with 0x1 on
+    // a usable image. Setting it up once more here was enough for every
+    // match that boot, including verifies that re-register the sensor with
+    // CLEAR_STATE.
+    fn refresh_match_credential(&self) {
+        if !self.profile.refresh_match_credential || !self.templates_restored.load(Relaxed) {
+            return;
+        }
+        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            return;
+        };
+        if !self.establish_scrd_match_context(user) {
+            dev_warn!(
+                self.dev,
+                "Touch ID: the match credential did not re-establish after the restore; the enclave may refuse matches this boot\n"
+            );
+        }
     }
 
     fn prepare_bio_open(&self) -> Result<()> {
@@ -1207,7 +1233,31 @@ impl SepData {
         Ok(())
     }
 
+    // The attach-time bring-up can fail after the Catacomb restore (the
+    // sensor patch step has no retry), which leaves the device-view proof
+    // undone and every verify refused until reboot. The restore itself is
+    // still a valid candidate, so bring the sensor up once more and let
+    // complete_bringup() finish the proof before refusing.
+    fn retry_restore_proof(&self) {
+        if self.templates_restored.load(Relaxed)
+            || !self.cold_restore_candidate.load(Relaxed)
+            || self.device_view_synced.load(Relaxed)
+        {
+            return;
+        }
+        dev_warn!(
+            self.dev,
+            "verify: attach-time bring-up left the device-view proof undone; retrying the sensor bring-up\n"
+        );
+        if !self.bring_sensor_online() {
+            dev_err!(self.dev, "verify: the retried sensor bring-up failed\n");
+        }
+        let _ = sensor::idle();
+        self.refresh_match_credential();
+    }
+
     pub(crate) fn run_verify(&self) {
+        self.retry_restore_proof();
         if !self.templates_restored.load(Relaxed) {
             dev_err!(
                 self.dev,
@@ -1545,6 +1595,7 @@ impl SepData {
             let st = match sensor::status() {
                 Ok(st) => st,
                 Err(_) => {
+                    dev_warn!(self.dev, "sensor: status read failed on wake\n");
                     return None;
                 }
             };
@@ -1568,6 +1619,7 @@ impl SepData {
                 continue;
             };
             if !self.register_sensor(&id) {
+                dev_warn!(self.dev, "sensor: the enclave did not register the sensor\n");
                 return None;
             }
 
@@ -1860,36 +1912,50 @@ impl SepData {
             SbioOutcome::Ok(b) => b,
             SbioOutcome::PrerequisiteMissing => {
                 if !self.init_sequence_counter() {
+                    dev_warn!(
+                        self.dev,
+                        "sensor patch: sequence counter init failed before the patch fetch\n"
+                    );
                     return None;
                 }
                 match self.sbio_call(&crate::sbio::sbio_fetch_patch()) {
                     SbioOutcome::Ok(b) => b,
                     _ => {
+                        dev_warn!(
+                            self.dev,
+                            "sensor patch: patch fetch failed after the sequence counter init\n"
+                        );
                         return None;
                     }
                 }
             }
             SbioOutcome::Status16 => {
+                dev_warn!(self.dev, "sensor patch: patch fetch answered status 16\n");
                 return None;
             }
             SbioOutcome::Other => {
+                dev_warn!(self.dev, "sensor patch: patch fetch failed\n");
                 return None;
             }
         };
         if blob.is_empty() {
+            dev_warn!(self.dev, "sensor patch: the enclave returned an empty patch\n");
             return None;
         }
 
         // enable command is mandatory; skipping it leaves the sensor in state 9
         if sensor::setup_patch_enable().is_err() {
+            dev_warn!(self.dev, "sensor patch: the patch enable command failed on the bus\n");
             return None;
         }
 
         if !self.await_sensor_state(sensor::STATE_IDLE, c"idle, before sending the patch") {
+            dev_warn!(self.dev, "sensor patch: the sensor did not reach idle before the patch\n");
             return None;
         }
 
         if sensor::send_patch(&blob).is_err() {
+            dev_warn!(self.dev, "sensor patch: sending the patch failed on the bus\n");
             return None;
         }
 
@@ -1899,12 +1965,20 @@ impl SepData {
             let st = match sensor::status() {
                 Ok(st) => st,
                 Err(_) => {
+                    dev_warn!(
+                        self.dev,
+                        "sensor patch: status read failed while waiting for the acknowledgment\n"
+                    );
                     return None;
                 }
             };
             if st.patch_ack() == sensor::PATCH_ACCEPTED {
                 if let Ok(after) = sensor::status() {
                     if after.state == sensor::STATE_NEEDS_PATCH {
+                        dev_warn!(
+                            self.dev,
+                            "sensor patch: acknowledged, but the sensor still asks for a patch\n"
+                        );
                         return None;
                     }
                 }
@@ -1913,6 +1987,11 @@ impl SepData {
         }
 
         let _ = sensor::status();
+        dev_warn!(
+            self.dev,
+            "sensor patch: no acknowledgment after {} polls\n",
+            PATCH_POLL_ATTEMPTS
+        );
         None
     }
 
