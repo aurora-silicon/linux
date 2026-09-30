@@ -1554,6 +1554,13 @@ impl SepData {
                     // completion is the flag at offset 0xbfe, not a derived stage count
                     if complete {
                         if !has_template {
+                            dev_err!(
+                                self.dev,
+                                "enrol: enclave flags completion after {} capture(s) (stage {}, {}%) but reports no template\n",
+                                counter,
+                                stage,
+                                percent
+                            );
                             break Some(Err(ENROL_STATUS_ENCLAVE));
                         }
                         enrolment_completed = true;
