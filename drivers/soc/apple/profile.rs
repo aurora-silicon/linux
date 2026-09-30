@@ -187,8 +187,7 @@ const T8103: PlatformProfile = PlatformProfile {
 /// path, shared-memory geometry and key store follow T8103. The sensor sits on
 /// SPI2 at the T6020 address, in the mode T6020 verified: the J313, J316s and
 /// J414s platform device trees describe the same sensor (id 0x3352)
-/// identically. Enrolment persistence is not yet reboot-tested here, so it
-/// stays opt-in (`j414s_persistent_enrol=1`).
+/// identically. Enrolment persistence is reboot-tested on J314s.
 const T6000: PlatformProfile = PlatformProfile {
     name: "T6000/J316s",
     shmem_capacity: 0x3_0000,
@@ -217,7 +216,7 @@ const T6000: PlatformProfile = PlatformProfile {
     key_store: KeyStore::Sepos13 {
         cpx_encryption_mode: 2,
     },
-    persistent_enrol: false,
+    persistent_enrol: true,
     refresh_match_credential: true,
 };
 
