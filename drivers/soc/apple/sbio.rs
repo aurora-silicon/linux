@@ -35,6 +35,37 @@ impl SepData {
         }
     }
 
+    // A match step whose refusal ends the verify. libfprint reports every
+    // failed verify as the same unspecified error, so the enclave's exact
+    // answer has to be recorded here or nowhere. Success is decided as in
+    // `sbio_call`.
+    fn sbio_verify_step(&self, op: &crate::sbio::SbioOp) -> Option<KVec<u8>> {
+        let done = match self.sbio_transfer(op) {
+            Ok(done) => done,
+            Err(e) => {
+                dev_err!(
+                    self.dev,
+                    "verify: {} transfer failed ({:?})\n",
+                    op.name(),
+                    e
+                );
+                return None;
+            }
+        };
+        match done.status.answered() {
+            Some(err) if err as u16 == crate::sbio::SBIO_STATUS_OK => Some(done.payload),
+            _ => {
+                dev_err!(
+                    self.dev,
+                    "verify: {} answered status {}\n",
+                    op.name(),
+                    done.status
+                );
+                None
+            }
+        }
+    }
+
     pub(crate) fn sbio_call(&self, op: &crate::sbio::SbioOp) -> SbioOutcome {
         let done = match self.sbio_transfer(op) {
             Ok(done) => done,
@@ -1221,6 +1252,7 @@ impl SepData {
         }
 
         let Some(token_bytes) = self.mint_token_bytes() else {
+            dev_err!(self.dev, "verify: could not draw a result token\n");
             self.finish_verify(
                 bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE),
                 [0u8; bio::TOKEN_LEN],
@@ -1232,6 +1264,7 @@ impl SepData {
 
         // The enclave refuses a capture from an uncalibrated sensor (0x65 answers 1).
         if !self.bring_sensor_online() {
+            dev_err!(self.dev, "verify: the sensor did not come back online\n");
             self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR), token_bytes);
             let _ = sensor::idle();
             return;
@@ -1267,40 +1300,79 @@ impl SepData {
         self.finish_verify(outcome, token_bytes);
     }
 
+    // Every exit that fails a live verify logs why: userspace sees only a bare
+    // "unspecified error", which cannot tell a sensor fault from a refused
+    // match step.
     fn verify_one_image(&self) -> bio::VerifyOutcome {
         let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            dev_err!(self.dev, "verify: invalid probe user id\n");
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
 
-        if sensor::start_capture().is_err() {
+        if let Err(e) = sensor::start_capture() {
+            dev_err!(self.dev, "verify: could not start the capture ({:?})\n", e);
             return bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR);
         }
         let advertised = match self.await_capture() {
             CaptureWait::Ready(n) => n,
             CaptureWait::Timeout => {
+                dev_warn!(self.dev, "verify: the capture ended without a frame\n");
                 return bio::VerifyOutcome::Failed(ENROL_STATUS_TIMEOUT);
             }
-            CaptureWait::Fault(_state) => {
+            CaptureWait::Fault(state) => {
+                dev_err!(
+                    self.dev,
+                    "verify: the sensor fell to state {} during the capture\n",
+                    state
+                );
                 return bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR);
             }
-            CaptureWait::Abandon => return bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR),
+            CaptureWait::Abandon => {
+                // A cancelled verify also abandons; only a live one is a fault.
+                if bio::verify_is_live(&self.bio_session.lock()) {
+                    dev_err!(
+                        self.dev,
+                        "verify: the sensor status became unreadable during the capture\n"
+                    );
+                }
+                return bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR);
+            }
         };
 
         let capture = match sensor::read_capture(advertised) {
             Ok(capture) => capture,
-            Err(sensor::CaptureError::Checksum { .. }) | Err(sensor::CaptureError::Length(_)) => {
+            Err(sensor::CaptureError::Checksum {
+                advertised: sent,
+                computed,
+            }) => {
+                dev_warn!(
+                    self.dev,
+                    "verify: frame checksum mismatch (sensor sent {:#06x}, computed {:#06x})\n",
+                    sent,
+                    computed
+                );
                 return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
             }
-            Err(sensor::CaptureError::Bus(_)) => {
+            Err(sensor::CaptureError::Length(n)) => {
+                dev_warn!(
+                    self.dev,
+                    "verify: the sensor advertised an unusable frame length {}\n",
+                    n
+                );
+                return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
+            }
+            Err(sensor::CaptureError::Bus(e)) => {
+                dev_err!(self.dev, "verify: reading the frame failed ({:?})\n", e);
                 return bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR);
             }
             Err(sensor::CaptureError::NoMemory) => {
-                return bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR)
+                dev_err!(self.dev, "verify: no memory for the frame\n");
+                return bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR);
             }
         };
 
         if self
-            .sbio_expect_ok(&crate::sbio::sbio_prepare_image_processing())
+            .sbio_verify_step(&crate::sbio::sbio_prepare_image_processing())
             .is_none()
         {
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
@@ -1316,7 +1388,7 @@ impl SepData {
             user,
             crate::shim::monotonic_ns(),
         );
-        if self.sbio_expect_ok(&init).is_none() {
+        if self.sbio_verify_step(&init).is_none() {
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
 
@@ -1330,21 +1402,35 @@ impl SepData {
         }
         drop(capture);
 
-        let Some(assessment) = self.sbio_expect_ok(&crate::sbio::sbio_image_assessment()) else {
+        let Some(assessment) = self.sbio_verify_step(&crate::sbio::sbio_image_assessment()) else {
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
         if assessment.len() <= crate::sbio::ASSESS_USABLE_MATCH {
+            dev_err!(
+                self.dev,
+                "verify: image assessment is {} bytes, too short to read\n",
+                assessment.len()
+            );
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
 
         if assessment[crate::sbio::ASSESS_USABLE_MATCH] == 0 {
+            dev_warn!(
+                self.dev,
+                "verify: the image is not usable for matching (partial contact)\n"
+            );
             return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
         }
 
-        let Some(result) = self.sbio_expect_ok(&crate::sbio::sbio_match_result()) else {
+        let Some(result) = self.sbio_verify_step(&crate::sbio::sbio_match_result()) else {
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
         let Some(parsed) = crate::sbio::MatchResult::parse(&result) else {
+            dev_err!(
+                self.dev,
+                "verify: the {}-byte match result did not parse\n",
+                result.len()
+            );
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
 
@@ -1357,6 +1443,11 @@ impl SepData {
         let known = self.bio_index.lock().contains_uuid(&identity);
 
         if !known {
+            dev_err!(
+                self.dev,
+                "verify: the enclave matched identity {}, which the host index does not hold\n",
+                Hex(&identity)
+            );
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
 
