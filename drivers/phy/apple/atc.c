@@ -2026,6 +2026,13 @@ static int atcphy_power_on(struct apple_atcphy *atcphy)
  * without touching the lane mux. Based on Oliver Lukschander's t6020 tunnel
  * clock patch (asahi-j416s-display).
  */
+/* t600x (M1 Pro/Max) has the t8103 generation ATC. */
+static bool apple_atc_tunnel_is_t600x(void)
+{
+	return of_machine_is_compatible("apple,t6000") ||
+	       of_machine_is_compatible("apple,t6001");
+}
+
 /*
  * Stop the tunnel pixel clock: switch the AUSPLL output drivers off and send
  * APB command 3. TX_DP_CTRL0, the sleep overrides and the
@@ -2043,57 +2050,30 @@ static void atc_tunnel_stop_t8103(struct apple_atcphy *atcphy)
 	dev_dbg(atcphy->dev, "DP tunnel clock stopped\n");
 }
 
-static int atc_tunnel_start_t8103(struct apple_atcphy *atcphy, u8 rate)
+/*
+ * TX_DP_CTRL0: PMA lane reset release, pixel clock enable + rate selector.
+ * t8103 feeds the tunnel from PCLK1 alone; t600x also runs PCLK2 and the DP IN
+ * (DPRX) clock at the same rate.
+ */
+static void atc_tunnel_pclk_t8103(struct apple_atcphy *atcphy, u32 selector)
 {
-	u32 selector, value;
-	int ret;
-
-	lockdep_assert_held(&atcphy->lock);
-	switch (rate) {
-	case 0x06:	/* RBR */
-		selector = 4;
-		break;
-	case 0x0a:	/* HBR */
-		selector = 3;
-		break;
-	case 0x14:	/* HBR2 */
-		selector = 1;
-		break;
-	case 0x1e:	/* HBR3 */
-		selector = 0;
-		break;
-	default:
-		return -EINVAL;
+	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTXPHY_PMA_LANE_RESET_N);
+	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTXPHY_PMA_LANE_RESET_N_OV);
+	if (apple_atc_tunnel_is_t600x()) {
+		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPRX_PCLK_ENABLE);
+		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK2_ENABLE);
+		core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPRX_PCLK_SELECT,
+			    FIELD_PREP(DPRX_PCLK_SELECT, selector));
+		core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK2_SELECT,
+			    FIELD_PREP(DPTX_PCLK2_SELECT, selector));
 	}
-	if (atcphy->tunnel_clock_on) {
-		if (atcphy->tunnel_rate == rate)
-			return 0;
-		/*
-		 * Rate change: DCP brackets it with WillChange/DidChange link
-		 * configuration, so the crossbar is already down; reselect PCLK1.
-		 */
-		core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_SELECT,
-			    FIELD_PREP(DPTX_PCLK1_SELECT, selector));
-		atcphy->tunnel_rate = rate;
-		return 0;
-	}
-	/*
-	 * Don't take the PLL from another clock client or an in-flight command.
-	 * Only live PLL outputs or a pending request mean that: the PCLK gates
-	 * in TX_DP_CTRL0 read set when idle and AUSPLL_LOCK stays set after a
-	 * stop, so neither says anything about another client.
-	 */
-	if (readl(atcphy->regs.core + AUSPLL_CLKOUT_MASTER) & AUSPLL_CLKOUT_MASTER_DRVR_EN ||
-	    readl(atcphy->regs.core + AUSPLL_APB_CMD_OVERRIDE) & AUSPLL_APB_CMD_OVERRIDE_REQ)
-		return -EBUSY;
-	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_CMN_SHM_STS_REG0, value,
-				 value & ACIOPHY_CMN_SHM_STS_REG0_CMD_READY, 10, 10000);
-	if (ret)
-		return ret;
-	atcphy->tunnel_clock_on = true;
-	/* the PLL no longer holds a DP alt mode configuration */
-	atcphy->dp_link_rate = -1;
+	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_ENABLE);
+	core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_SELECT,
+		    FIELD_PREP(DPTX_PCLK1_SELECT, selector));
+}
 
+static void atc_tunnel_wake_t8103(struct apple_atcphy *atcphy)
+{
 	/*
 	 * The PHY is up in USB4/TBT mode here. These overrides only force the
 	 * already awake blocks to stay awake for the DP clock path; the order
@@ -2131,12 +2111,60 @@ static int atc_tunnel_start_t8103(struct apple_atcphy *atcphy, u8 rate)
 	core_clear32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_RX_CLAMP);
 	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_RX_CLAMP_OV);
 	udelay(2);
-	/* TX_DP_CTRL0: PMA lane reset release, PCLK1 enable + rate selector */
-	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTXPHY_PMA_LANE_RESET_N);
-	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTXPHY_PMA_LANE_RESET_N_OV);
-	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_ENABLE);
-	core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_SELECT,
-		    FIELD_PREP(DPTX_PCLK1_SELECT, selector));
+}
+
+static int atc_tunnel_start_t8103(struct apple_atcphy *atcphy, u8 rate)
+{
+	u32 selector, value;
+	int ret;
+
+	lockdep_assert_held(&atcphy->lock);
+	switch (rate) {
+	case 0x06:	/* RBR */
+		selector = 4;
+		break;
+	case 0x0a:	/* HBR */
+		selector = 3;
+		break;
+	case 0x14:	/* HBR2 */
+		selector = 1;
+		break;
+	case 0x1e:	/* HBR3 */
+		selector = 0;
+		break;
+	default:
+		return -EINVAL;
+	}
+	if (atcphy->tunnel_clock_on) {
+		if (atcphy->tunnel_rate == rate)
+			return 0;
+		/*
+		 * Rate change: DCP brackets it with WillChange/DidChange link
+		 * configuration, so the crossbar is already down; reselect the clocks.
+		 */
+		atc_tunnel_pclk_t8103(atcphy, selector);
+		atcphy->tunnel_rate = rate;
+		return 0;
+	}
+	/*
+	 * Don't take the PLL from another clock client or an in-flight command.
+	 * Only live PLL outputs or a pending request mean that: the PCLK gates
+	 * in TX_DP_CTRL0 read set when idle and AUSPLL_LOCK stays set after a
+	 * stop, so neither says anything about another client.
+	 */
+	if (readl(atcphy->regs.core + AUSPLL_CLKOUT_MASTER) & AUSPLL_CLKOUT_MASTER_DRVR_EN ||
+	    readl(atcphy->regs.core + AUSPLL_APB_CMD_OVERRIDE) & AUSPLL_APB_CMD_OVERRIDE_REQ)
+		return -EBUSY;
+	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_CMN_SHM_STS_REG0, value,
+				 value & ACIOPHY_CMN_SHM_STS_REG0_CMD_READY, 10, 10000);
+	if (ret)
+		return ret;
+	atcphy->tunnel_clock_on = true;
+	/* the PLL no longer holds a DP alt mode configuration */
+	atcphy->dp_link_rate = -1;
+
+	atc_tunnel_wake_t8103(atcphy);
+	atc_tunnel_pclk_t8103(atcphy, selector);
 
 	/* fixed AUSPLL descriptor */
 	core_clear32(atcphy, AUSPLL_FREQ_CFG, AUSPLL_FREQ_REFCLK);
@@ -2769,6 +2797,12 @@ static bool apple_atc_is_typec_core(u64 base)
 	       base == 0xf03000000ULL;
 }
 
+/* t600x (M1 Pro/Max) runs the t8103 tunnel clock sequence unchanged. */
+static bool apple_atc_tunnel_is_t8103_style(void)
+{
+	return of_machine_is_compatible("apple,t8103") || apple_atc_tunnel_is_t600x();
+}
+
 int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 {
 	struct apple_atcphy *atcphy;
@@ -2778,7 +2812,7 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 		return -EINVAL;
 	atcphy = phy_get_drvdata(phy);
 	/* Keep each supported SoC on its qualified clock sequence. */
-	if (!of_machine_is_compatible("apple,t8103") && !apple_dp_tunnel_t602x())
+	if (!apple_atc_tunnel_is_t8103_style() && !apple_dp_tunnel_t602x())
 		return -EOPNOTSUPP;
 	if (apple_dp_tunnel_t602x() &&
 	    (!of_device_is_compatible(atcphy->np, "apple,t6020-atcphy") ||
@@ -2787,7 +2821,7 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 		return -EINVAL;
 	guard(mutex)(&atcphy->lock);
 	if (!rate) {
-		if (of_machine_is_compatible("apple,t8103"))
+		if (apple_atc_tunnel_is_t8103_style())
 			atc_tunnel_stop_t8103(atcphy);
 		else
 			atc_tunnel_stop_t602x(atcphy, dpin);
@@ -2795,7 +2829,7 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 	}
 	if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 && atcphy->mode != APPLE_ATCPHY_MODE_TBT)
 		return -EBUSY;
-	ret = of_machine_is_compatible("apple,t8103") ?
+	ret = apple_atc_tunnel_is_t8103_style() ?
 		atc_tunnel_start_t8103(atcphy, rate) :
 		atc_tunnel_set_t602x(atcphy, dpin, rate);
 	dev_dbg(atcphy->dev, "DP tunnel clock rate 0x%x: %d (TX_DP_CTRL0=%08x PCLK_STAT=%08x)\n",
@@ -2804,6 +2838,30 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_atc_dp_tunnel_rate);
+
+int apple_atc_dp_tunnel_open(struct phy *phy)
+{
+	struct apple_atcphy *atcphy;
+
+	if (!phy || phy->ops != &apple_atc_dp_phy_ops)
+		return -EINVAL;
+	if (!apple_atc_tunnel_is_t600x())
+		return -EOPNOTSUPP;
+	atcphy = phy_get_drvdata(phy);
+	guard(mutex)(&atcphy->lock);
+	if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 && atcphy->mode != APPLE_ATCPHY_MODE_TBT)
+		return -EBUSY;
+	if (!atcphy->tunnel_clock_on) {
+		atc_tunnel_wake_t8103(atcphy);
+		atc_tunnel_pclk_t8103(atcphy, 0);
+	}
+	dev_dbg(atcphy->dev, "DP tunnel open (CFG0=%08x SLEEP_CTRL=%08x TX_DP_CTRL0=%08x)\n",
+		readl(atcphy->regs.core + ACIOPHY_CFG0),
+		readl(atcphy->regs.core + ACIOPHY_SLEEP_CTRL),
+		readl(atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0));
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_atc_dp_tunnel_open);
 
 static struct phy *atcphy_xlate(struct device *dev, const struct of_phandle_args *args)
 {
