@@ -7613,10 +7613,11 @@ Kernel parameters
 			[HW,ARM64]
 			Format: <bool>
 			Drive displays behind Thunderbolt DisplayPort tunnels
-			on Apple t8103 (M1): route a display pipeline to the
-			host router's DP IN adapter whenever the connection
-			manager sets up a DP tunnel. Set to 0 to leave displays
-			behind a dock dark. Default: true
+			on Apple t8103 and t600x (M1, M1 Pro and M1 Max):
+			route a display pipeline to the host router's DP IN
+			adapter whenever the connection manager sets up a DP
+			tunnel. Set to 0 to leave displays behind a dock dark.
+			Default: true
 
 	thunderbolt_apple.dpin_aux=
 			[HW,ARM64]

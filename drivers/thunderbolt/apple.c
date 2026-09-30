@@ -210,7 +210,18 @@ struct apple_cio {
 
 static bool dp_display = true;
 module_param(dp_display, bool, 0444);
-MODULE_PARM_DESC(dp_display, "Drive displays behind Thunderbolt DP tunnels on t8103 (default: true)");
+MODULE_PARM_DESC(dp_display, "Drive displays behind Thunderbolt DP tunnels on t8103 and t600x (default: true)");
+
+/*
+ * The M1 Pro/Max ATC is the t8103 generation: same DP IN adapter registers,
+ * same crossbar and the same tunnel pixel clock sequence.
+ */
+static bool apple_cio_dp_is_t8103_style(void)
+{
+	return of_machine_is_compatible("apple,t8103") ||
+	       of_machine_is_compatible("apple,t6000") ||
+	       of_machine_is_compatible("apple,t6001");
+}
 
 /* DPTX_INACTIVE handshake: request (in)active, wait for the ACK */
 struct apple_dpin_poll {
@@ -391,7 +402,7 @@ static int apple_dpin_up(struct apple_dpin_ctx *c)
 		 * back. Nothing handles these interrupts yet; they are enabled
 		 * as part of bringing the adapter up.
 		 */
-		if (of_machine_is_compatible("apple,t8103")) {
+		if (apple_cio_dp_is_t8103_style()) {
 			irq = readl(regs + APPLE_DPIN_IRQ_STATUS);
 			writel(irq, regs + APPLE_DPIN_IRQ_STATUS);
 			if (irq & BIT(0))
@@ -1615,7 +1626,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	 * the connection manager) only where it is enabled and known to work.
 	 */
 	anhi->ops = apple_nhi_ops;
-	if (dp_display && acio->dp_wq && of_machine_is_compatible("apple,t8103"))
+	if (dp_display && acio->dp_wq && apple_cio_dp_is_t8103_style())
 		anhi->ops.dp_tunnel_changed = apple_nhi_dp_tunnel_changed;
 	if (acio->dp_wq && apple_dp_tunnel_t602x()) {
 		anhi->ops.dp_tunnel_pre_activate = apple_nhi_dp_tunnel_pre_activate;
