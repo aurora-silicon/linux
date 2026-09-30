@@ -2562,6 +2562,10 @@ static const struct apple_nvme_hw apple_nvme_t8103_hw = {
 	.max_queue_depth = 64,
 };
 
+/*
+ * The post-M4 (T8132 and later) I/O queue setup follows Yureka Lilian's T8132
+ * support in m1n1 (commit 53f8ee9b54ba, "nvme: support T8132").
+ */
 static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.has_lsq_nvmmu = true,
 	.has_separate_nvmmu = true,

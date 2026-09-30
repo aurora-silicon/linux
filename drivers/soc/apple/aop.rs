@@ -174,7 +174,7 @@ const SETUP_ALS_EP: u8 = 0x21;
 const SETUP_SOURCE_EP: u8 = 0x20;
 const SETUP_SET_SOURCE_BUFFER: u64 = 0x6b80_3ce4_92bd_9547;
 /// The calibration is an 80-byte message: a 64-bit operation code, a 64-bit
-/// body length of 56, and 64 bytes of data that are sent as captured (the
+/// body length of 56, and 64 bytes of calibration data sent unchanged (the
 /// last eight lie beyond the stated body length).
 const ALS_CALIBRATION_LEN: usize = 80;
 const ALS_CALIBRATION_OPERATION: u64 = 0x0746_b8d6_6515_2e31;
@@ -2253,8 +2253,8 @@ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
 /// T8140: the firmware is started with the boot arguments the bootloader
 /// left, boots through the setup port and speaks EPIC version 4. Of the
 /// advertised AFK endpoints, the application map is 0x20 misc, 0x21
-/// aop-audio, 0x22 aop-voicetrigger, 0x23 als and 0x2b aop-audprov, which
-/// are the ones macOS starts as well; the rest are started if they will.
+/// aop-audio, 0x22 aop-voicetrigger, 0x23 als and 0x2b aop-audprov; the rest
+/// are started if they will.
 const HW_CFG_T8140: AopHwConfig = AopHwConfig {
     ec0p: 0,
     aopt: 0,

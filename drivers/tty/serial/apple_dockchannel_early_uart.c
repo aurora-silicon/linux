@@ -2,6 +2,8 @@
 /*
  * Apple DockChannel UART driver
  * Copyright The Asahi Linux Contributors
+ *
+ * Based on the DockChannel UART earlycon by Yureka Lilian <yureka@cyberchaos.dev>.
  */
 
 #include <linux/console.h>

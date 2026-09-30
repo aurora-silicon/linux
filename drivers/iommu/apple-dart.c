@@ -621,6 +621,13 @@ apple_dart_hw_sync_locked(struct io_pgtable_cfg *cfg,
 			u64 *owned = dart->locked_owned[sid][idx];
 			u64 *ours = cfg->apple_dart_cfg.ttbr[idx];
 
+			/*
+			 * Firmware mappings are created before attach maps the
+			 * locked roots. Attach will publish these entries once
+			 * both the live root and its ownership shadow exist.
+			 */
+			if (!live && !owned)
+				continue;
 			if (!live || !owned || !ours) {
 				ret = -EIO;
 				goto out;

@@ -802,7 +802,7 @@
 			 * appears as als.1.auto and sits unbound without this
 			 * node); the ADT has /arm-io/aop/iop-aop-nub/als with
 			 * als-supports-color = 0, an ALS serial in /product and
-			 * macOS's auto-brightness curve in /exbright.  The driver
+			 * a brightness curve in /exbright.  The driver
 			 * matches on the generic compatible only and requires
 			 * the machine-supplied CT817 setup calibration.
 			 */
@@ -878,7 +878,8 @@
 		 * report windows differ from t8103 and are described by the
 		 * t8140 driver variant, not by older SoC offsets.  DMA streams:
 		 * dart-aop mapper-admac-base-ns 8, mapper-admac-leap-ns 10,
-		 * mapper-admac-leap-s 11 (exclave-gated under macOS).
+		 * mapper-admac-leap-s 11 (reached through the proxy aperture
+		 * described below).
 		 */
 		admac_base_ns: dma-controller@313800000 {
 			compatible = "apple,t8140-admac";

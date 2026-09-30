@@ -957,8 +957,8 @@ impl SndSocT8140AopData {
     /// Speaker stream start, from the system workqueue right after trigger
     /// START: the DMA must be running before pwrd starts the LEAP consuming
     /// (issued from prepare, before the DMA, the wire stays silent), then the
-    /// firmware unmute, the value the native amplifier driver writes after
-    /// enabling its output.
+    /// firmware unmute, the value observed on the bus once the amplifier
+    /// output is enabled.
     fn spkr_go(&self) -> Result<()> {
         if !self.spkr_want_run.load(Relaxed) || self.spkr.running.load(Relaxed) {
             return Ok(());

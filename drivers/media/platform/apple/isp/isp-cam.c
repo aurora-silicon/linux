@@ -579,11 +579,12 @@ void apple_isp_stop_camera(struct apple_isp *isp)
 
 /*
  * Capture watchdog. While it is not serviced, the ISP firmware replaces
- * every frame with a flat fill. macOS services it only while its
- * camera-in-use indicator is shown, which makes it a privacy interlock.
- * That indicator is drawn by the display pipeline for secure firmware
- * that Linux does not run, so the driver services the watchdog whenever
- * it captures, with the register sequence and rate observed on macOS.
+ * every frame with a flat fill. The firmware expects it to be serviced
+ * only while a camera-in-use indicator is shown, which makes it a privacy
+ * interlock. That indicator is drawn by the display pipeline for secure
+ * firmware that Linux does not run, so the driver services the watchdog
+ * whenever it captures, with the register sequence and rate observed on
+ * the running hardware.
  */
 static void apple_isp_wdt_kick(struct apple_isp *isp)
 {

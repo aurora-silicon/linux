@@ -2,6 +2,8 @@
 /*
  * Apple DockChannel UART driver
  * Copyright The Asahi Linux Contributors
+ *
+ * Based on the DockChannel UART driver by Yureka Lilian <yureka@cyberchaos.dev>.
  */
 
 #include <linux/console.h>
@@ -386,5 +388,6 @@ static int __init dcuart_init(void)
 }
 device_initcall(dcuart_init);
 
+MODULE_AUTHOR("Yureka Lilian <yureka@cyberchaos.dev>");
 MODULE_DESCRIPTION("Apple DockChannel UART driver");
 MODULE_LICENSE("Dual MIT/GPL");
