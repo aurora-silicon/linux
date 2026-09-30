@@ -785,6 +785,17 @@ fn build_images(
 
     let mut globals = zeroed(GLOBALS)?;
     write(&mut globals, 0, initdata::raw_bytes(&*c.globals))?;
+    // The gate of the firmware's frequency-feedback cap, per SoC.
+    let (ut, given) = m3_params::ut_engagement(soc);
+    write(&mut globals, offset_of!(raw::GlobalsG15V14_8_3, ut_engagement), &ut.to_le_bytes())?;
+    if ut != 1 || given {
+        dev_info!(
+            dev,
+            "M3: Globals ut_engagement={}{}\n",
+            ut,
+            if given { " (asahi.m3_ut_engagement)" } else { "" }
+        );
+    }
     images[GLOBALS] = Some(globals);
 
     let mut power = zeroed(GLOBALS_POWER)?;

@@ -364,6 +364,23 @@ pub(crate) fn unlocked_wait() -> bool {
     M3_UNLOCKED_WAIT.load(Ordering::Relaxed) != 0
 }
 
+/// `asahi.m3_ut_engagement=0|1`: Globals +0x7d0, the gate of the firmware's frequency-feedback
+/// cap. Unset: the SoC's default ([`crate::m3_soc::Soc::ut_engagement`]).
+static M3_UT_ENGAGEMENT: AtomicU64 = AtomicU64::new(UT_ENGAGEMENT_UNSET);
+const UT_ENGAGEMENT_UNSET: u64 = u64::MAX;
+fn parse_ut_engagement(text: &str) -> Option<u64> {
+    parse_u64(text).filter(|v| *v <= 1)
+}
+m3_param!("m3_ut_engagement", M3_UT_ENGAGEMENT, parse_ut_engagement);
+
+/// The frequency-feedback gate for `soc`, and whether `asahi.m3_ut_engagement` set it.
+pub(crate) fn ut_engagement(soc: &crate::m3_soc::Soc) -> (u32, bool) {
+    match M3_UT_ENGAGEMENT.load(Ordering::Relaxed) {
+        UT_ENGAGEMENT_UNSET => (soc.ut_engagement, false),
+        v => (v as u32, true),
+    }
+}
+
 /// Bits of `asahi.m3_retire_mmio`.
 pub(crate) const RETIRE_MMIO_BUSY: u64 = 1 << 0;
 pub(crate) const RETIRE_MMIO_FAULTS: u64 = 1 << 1;

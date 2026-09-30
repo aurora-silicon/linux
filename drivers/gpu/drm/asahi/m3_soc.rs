@@ -151,6 +151,10 @@ pub(crate) struct Soc {
     pub(crate) hwdata_object: Option<HwDataObject>,
     /// The register lists the GPU's firmware expects in compute and render commands.
     pub(crate) registers: RegisterSet,
+    /// Globals +0x7d0, which gates the firmware's frequency-feedback cap: the firmware measures
+    /// the GPU clock against the requested performance state and, while this is 1, caps the
+    /// state on a shortfall (`asahi.m3_ut_engagement` overrides it).
+    pub(crate) ut_engagement: u32,
 }
 
 impl Soc {
@@ -293,6 +297,7 @@ pub(crate) static T6030: Soc = Soc {
     // The fixed allocation, uncached.
     hwdata_object: None,
     registers: RegisterSet::G15S,
+    ut_engagement: 1,
 };
 
 /// T8122 (M3, G15G): one die, one cluster of ten core slots (eight or ten of them active).
@@ -380,6 +385,10 @@ pub(crate) static T8122: Soc = Soc {
         cached: true,
     }),
     registers: RegisterSet::G15G,
+    // On a T8122 with the 14.8.3 system firmware the shader clock runs at 3/4 of every requested
+    // state, so with the cap engaged the GPU stays at state 2 (462 MHz effective) under any load.
+    // With 0 it reaches the requested states (state 8: about 1000 MHz effective).
+    ut_engagement: 0,
 };
 
 /// The T8122 HwData object's firmware VA: 0x8a80 bytes before the end of the fixed allocation's
