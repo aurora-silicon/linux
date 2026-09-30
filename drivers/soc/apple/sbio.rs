@@ -1567,6 +1567,7 @@ impl SepData {
             let st = match sensor::status() {
                 Ok(st) => st,
                 Err(_) => {
+                    dev_warn!(self.dev, "sensor: status read failed on wake\n");
                     return None;
                 }
             };
@@ -1590,6 +1591,7 @@ impl SepData {
                 continue;
             };
             if !self.register_sensor(&id) {
+                dev_warn!(self.dev, "sensor: the enclave did not register the sensor\n");
                 return None;
             }
 
@@ -1882,36 +1884,50 @@ impl SepData {
             SbioOutcome::Ok(b) => b,
             SbioOutcome::PrerequisiteMissing => {
                 if !self.init_sequence_counter() {
+                    dev_warn!(
+                        self.dev,
+                        "sensor patch: sequence counter init failed before the patch fetch\n"
+                    );
                     return None;
                 }
                 match self.sbio_call(&crate::sbio::sbio_fetch_patch()) {
                     SbioOutcome::Ok(b) => b,
                     _ => {
+                        dev_warn!(
+                            self.dev,
+                            "sensor patch: patch fetch failed after the sequence counter init\n"
+                        );
                         return None;
                     }
                 }
             }
             SbioOutcome::Status16 => {
+                dev_warn!(self.dev, "sensor patch: patch fetch answered status 16\n");
                 return None;
             }
             SbioOutcome::Other => {
+                dev_warn!(self.dev, "sensor patch: patch fetch failed\n");
                 return None;
             }
         };
         if blob.is_empty() {
+            dev_warn!(self.dev, "sensor patch: the enclave returned an empty patch\n");
             return None;
         }
 
         // enable command is mandatory; skipping it leaves the sensor in state 9
         if sensor::setup_patch_enable().is_err() {
+            dev_warn!(self.dev, "sensor patch: the patch enable command failed on the bus\n");
             return None;
         }
 
         if !self.await_sensor_state(sensor::STATE_IDLE, c"idle, before sending the patch") {
+            dev_warn!(self.dev, "sensor patch: the sensor did not reach idle before the patch\n");
             return None;
         }
 
         if sensor::send_patch(&blob).is_err() {
+            dev_warn!(self.dev, "sensor patch: sending the patch failed on the bus\n");
             return None;
         }
 
@@ -1921,12 +1937,20 @@ impl SepData {
             let st = match sensor::status() {
                 Ok(st) => st,
                 Err(_) => {
+                    dev_warn!(
+                        self.dev,
+                        "sensor patch: status read failed while waiting for the acknowledgment\n"
+                    );
                     return None;
                 }
             };
             if st.patch_ack() == sensor::PATCH_ACCEPTED {
                 if let Ok(after) = sensor::status() {
                     if after.state == sensor::STATE_NEEDS_PATCH {
+                        dev_warn!(
+                            self.dev,
+                            "sensor patch: acknowledged, but the sensor still asks for a patch\n"
+                        );
                         return None;
                     }
                 }
@@ -1935,6 +1959,11 @@ impl SepData {
         }
 
         let _ = sensor::status();
+        dev_warn!(
+            self.dev,
+            "sensor patch: no acknowledgment after {} polls\n",
+            PATCH_POLL_ATTEMPTS
+        );
         None
     }
 
