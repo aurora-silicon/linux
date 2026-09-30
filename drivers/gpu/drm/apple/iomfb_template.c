@@ -946,15 +946,21 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 
 	dcp_swap_start(dcp, false, &swap_req, dcp_swap_clear_started, cookie);
 
-	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(50));
+	/*
+	 * On unplug the firmware powers the external pipe down on its own and
+	 * can take tens of milliseconds before it answers (and swallows) the
+	 * clear swap. That is not a crash: a real one is reported through the
+	 * RTKit crash callback. Wait longer and carry on with the power-off
+	 * either way, otherwise every later modeset fails with -EINVAL.
+	 */
+	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(500));
 	swap_id = cookie->swap_id;
 	kref_put(&cookie->refcount, release_swap_cookie);
-	if (ret <= 0) {
-		dcp->crashed = true;
-		return;
-	}
-
-	dev_dbg(dcp->dev, "%s: clear swap submitted: %u\n", __func__, swap_id);
+	if (ret <= 0)
+		dev_warn(dcp->dev, "%s: clear swap timed out\n", __func__);
+	else
+		dev_dbg(dcp->dev, "%s: clear swap submitted: %u\n", __func__,
+			swap_id);
 
 	poff_cookie = kzalloc(sizeof(*poff_cookie), GFP_KERNEL);
 	if (!poff_cookie)
