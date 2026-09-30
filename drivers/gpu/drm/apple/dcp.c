@@ -126,6 +126,7 @@ static bool dcp_typec_route_available(struct apple_dcp_typec_route *route)
 static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 				    struct mux_control *xbar);
 static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route);
+static int dcp_dpxbar_preselect(struct mux_control *mux, int state);
 static int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port);
 
 /*
@@ -236,6 +237,8 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 	scoped_guard(mutex, &dcp->tb_lock) {
 		if (!route->tunnel || route->xbar_up)
 			ret = mux_control_deselect(route->active_xbar ?: route->xbar);
+		else
+			dcp_dpxbar_preselect(route->active_xbar, MUX_IDLE_DISCONNECT);
 		if (ret)
 			return ret;
 		route->xbar_up = false;
@@ -485,6 +488,46 @@ static int dcp_dpxbar_link(struct mux_control *mux, bool up)
 	return ret;
 }
 
+static int dcp_dpxbar_preselect(struct mux_control *mux, int state)
+{
+	typeof(&apple_dpxbar_preselect) fn = symbol_get(apple_dpxbar_preselect);
+	int ret;
+
+	if (!fn)
+		return -ENOENT;
+	ret = fn(mux, state);
+	symbol_put(apple_dpxbar_preselect);
+	return ret;
+}
+
+/*
+ * Thunderbolt DP IN, before DCP hears about the display: point the DP IN
+ * output at this pipeline and wake the ATC's DP clock path. The crossbar
+ * connection itself still only comes up in dcp_tunnel_crossbar_up(), but an
+ * output left at its idle source (dispext0) only suits the pipeline that is
+ * dispext0: any other one activates the link, gets no answer from the sink
+ * and gives up with DEVICE_NOT_RESPONDING before it ever sets a link rate.
+ */
+static void dcp_tunnel_prepare(struct apple_dcp_typec_route *route,
+			       struct mux_control *xbar)
+{
+	typeof(&apple_atc_dp_tunnel_open) open;
+	struct apple_dcp *dcp = route->dcp;
+	int ret;
+
+	ret = dcp_dpxbar_preselect(xbar, route->mux_index);
+	if (ret && ret != -EOPNOTSUPP)
+		dev_warn(dcp->dev, "DP tunnel crossbar preselect failed: %d\n", ret);
+
+	open = symbol_get(apple_atc_dp_tunnel_open);
+	if (!open)
+		return;
+	ret = open(dcp->phy);
+	symbol_put(apple_atc_dp_tunnel_open);
+	if (ret && ret != -EOPNOTSUPP)
+		dev_warn(dcp->dev, "DP tunnel PHY open failed: %d\n", ret);
+}
+
 /* DP IN adapter handshake through the thunderbolt glue; tb_lock held */
 static int dcp_tunnel_dpin_locked(struct apple_dcp *dcp, bool active)
 {
@@ -693,6 +736,7 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
 		return ret;
 	}
 	port->owner = best;
+	dcp_tunnel_prepare(best, ctl);
 
 	dev_info(dcp->dev, "display routed to Thunderbolt DP tunnel dpin%u\n", dpin);
 
