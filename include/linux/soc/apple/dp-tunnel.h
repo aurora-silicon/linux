@@ -31,6 +31,13 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
 int apple_atc_dp_tunnel_rate(struct phy *phy, u8 rate);
 
 /*
+ * ATC PHY: wake the DP clock path of a PHY in Thunderbolt/USB4 mode ahead of
+ * apple_atc_dp_tunnel_rate(), before DCP is told about the display.
+ * -EOPNOTSUPP where the rate call does all of it (everything but t600x).
+ */
+int apple_atc_dp_tunnel_open(struct phy *phy);
+
+/*
  * Display crossbar: take the connection of an already selected output down or
  * bring it back up (clock gates and enables) around a link reconfiguration.
  * The mux selection is left alone; link_down() also leaves the ATC output
