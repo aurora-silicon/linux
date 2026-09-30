@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-/* T8132 GFX TVM gate, a parent of the PMGR GFX power domain. */
+/* T8122/T8132 GFX TVM gate, a parent of the PMGR GFX power domain. */
 #include <linux/bitops.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -69,6 +69,7 @@ static int apple_gfx_tvm_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_gfx_tvm_match[] = {
+	{ .compatible = "apple,t8122-gfx-tvm" },
 	{ .compatible = "apple,t8132-gfx-tvm" },
 	{ }
 };

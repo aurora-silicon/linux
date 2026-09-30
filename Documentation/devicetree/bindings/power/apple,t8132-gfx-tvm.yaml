@@ -21,7 +21,11 @@ allOf:
 
 properties:
   compatible:
-    const: apple,t8132-gfx-tvm
+    oneOf:
+      - const: apple,t8132-gfx-tvm
+      - items:
+          - const: apple,t8122-gfx-tvm
+          - const: apple,t8132-gfx-tvm
 
   reg:
     maxItems: 1
