@@ -396,9 +396,10 @@ impl SepData {
             }
         }
 
-        // J313 and J414s need an owner export even though state 0x3 has no
-        // save-pending bit. Both restored a fresh enrollment after this export
-        // and user-before-master completion. Other profiles remain opt-in.
+        // The owner Catacomb must be exported even though state 0x3 has no
+        // save-pending bit. J313, J414s and J314s each restored a fresh
+        // enrollment after this export and user-before-master completion.
+        // Every profile now does this.
         if self.profile.persistent_enrol || *module_parameters::j414s_persistent_enrol.value() != 0 {
             if owner_initial_state == Some(0x3)
                 && !self.save_catacomb(
