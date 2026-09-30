@@ -1195,15 +1195,14 @@ impl SepData {
         Ok(())
     }
 
-    // On the variant-5 key store the SCRD credential set up before the
-    // Catacomb restore does not survive the rest of activation: J414c then
-    // answered every cold-boot MATCH_RESULT with 0x1 on a usable image.
-    // Setting it up once more here was enough for every match that boot,
-    // including verifies that re-register the sensor with CLEAR_STATE.
+    // On the variant-5 key store and on T6000 the SCRD credential set up
+    // before the Catacomb restore does not survive the rest of activation:
+    // J414c and J314s then answered every cold-boot MATCH_RESULT with 0x1 on
+    // a usable image. Setting it up once more here was enough for every
+    // match that boot, including verifies that re-register the sensor with
+    // CLEAR_STATE.
     fn refresh_match_credential(&self) {
-        if self.profile.key_store != profile::KeyStore::Variant5
-            || !self.templates_restored.load(Relaxed)
-        {
+        if !self.profile.refresh_match_credential || !self.templates_restored.load(Relaxed) {
             return;
         }
         let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
