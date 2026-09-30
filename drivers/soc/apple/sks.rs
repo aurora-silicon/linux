@@ -609,6 +609,23 @@ impl SepData {
         })
     }
 
+    // A completed CREATE_KEYBAG that the enclave answered with a non-zero
+    // status created nothing, so the persisted intent must not block the next
+    // attempt: without this, every later seal fails with EEXIST. Any other
+    // failure (timeout, no answer) keeps the intent and stays fail-closed.
+    fn sks_mark_create_refused(&self, slot: keybag::Slot, status: i8) {
+        if status == 0 {
+            return;
+        }
+        if let Err(e) = keybag::mark_refused(slot) {
+            dev_err!(
+                self.dev,
+                "sks: cannot mark refused keybag create retryable: {:?}\n",
+                e
+            );
+        }
+    }
+
     pub(crate) fn sks_provision_identity_keybag(&self) -> bool {
         let proof = match keybag::read(keybag::Slot::Identity) {
             Ok(keybag::State::Present(_)) => return true,
@@ -668,6 +685,7 @@ impl SepData {
                 out.response.len(),
                 out.reply.response_size
             );
+            self.sks_mark_create_refused(slot, out.reply.status);
             return false;
         };
         // 13.5 replies with the struct version and the handle alone
@@ -683,6 +701,7 @@ impl SepData {
                 out.reply.status,
                 body.len()
             );
+            self.sks_mark_create_refused(slot, out.reply.status);
             return false;
         }
         let variant = u32::from_le_bytes(body[0..4].try_into().unwrap());
