@@ -1221,8 +1221,31 @@ impl SepData {
         self.ensure_restored_after(prepared);
         self.attach_bringup();
         self.probe_owner_export();
+        self.refresh_match_credential();
         self.touchid_started.store(true, Relaxed);
         Ok(())
+    }
+
+    // On the variant-5 key store the SCRD credential set up before the
+    // Catacomb restore does not survive the rest of activation: J414c then
+    // answered every cold-boot MATCH_RESULT with 0x1 on a usable image.
+    // Setting it up once more here was enough for every match that boot,
+    // including verifies that re-register the sensor with CLEAR_STATE.
+    fn refresh_match_credential(&self) {
+        if self.profile.key_store != profile::KeyStore::Variant5
+            || !self.templates_restored.load(Relaxed)
+        {
+            return;
+        }
+        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            return;
+        };
+        if !self.establish_scrd_match_context(user) {
+            dev_warn!(
+                self.dev,
+                "Touch ID: the match credential did not re-establish after the restore; the enclave may refuse matches this boot\n"
+            );
+        }
     }
 
     fn prepare_bio_open(&self) -> Result<()> {
