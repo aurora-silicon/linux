@@ -401,6 +401,12 @@ impl Store {
         Ok(true)
     }
 
+    /// Whether this store accepts writes: `xart_writes=1` and APFS proved the
+    /// extent writable.
+    pub(crate) fn writes_enabled(&self) -> bool {
+        self.writes_enabled
+    }
+
     /// Byte offset of the APFS-resolved gigalocker extent in the container.
     pub(crate) fn base(&self) -> u64 {
         self.base

@@ -2697,6 +2697,19 @@ impl SepData {
         if cmd == bio::IOC_ATTEST {
             return self.bio_attest(arg);
         }
+        // With xART writes off the enclave cannot persist what an enrolment or
+        // a match changes. It saves anti-replay state after every match, and a
+        // refused save has left it unresponsive until reboot. Refuse the
+        // capture instead; attach and the read-only ioctls still work.
+        if bio::starts_capture(cmd) && !self.xart_writable() {
+            if !self.capture_refusal_logged().xchg(true, Relaxed) {
+                dev_warn!(
+                    self.dev,
+                    "Touch ID: enrol and verify need xart_writes=1; the enclave saves anti-replay state after every match and stops responding when that save is refused\n"
+                );
+            }
+            return Err(EROFS);
+        }
         // A capture started while the system goes to sleep would run into the
         // suspend; `capture_begin` repeats this check under the session lock.
         if bio::starts_capture(cmd) {

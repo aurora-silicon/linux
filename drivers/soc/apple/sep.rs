@@ -598,6 +598,11 @@ struct SepData {
 
     enrol_open: Atomic<bool>,
 
+    // One warning each per boot: an xART write refused because writes are
+    // off, and a Touch ID capture refused for the same reason.
+    xart_refusal_logged: Atomic<bool>,
+    capture_refusal_logged: Atomic<bool>,
+
     #[pin]
     enrol_material: Mutex<Option<EnrolMaterial>>,
 
@@ -815,6 +820,8 @@ impl SepData {
                 touchid_started: Atomic::new(false),
                 touchid_failed: Atomic::new(false),
                 enrol_open: Atomic::new(false),
+                xart_refusal_logged: Atomic::new(false),
+                capture_refusal_logged: Atomic::new(false),
                 sensor_calibrated: Atomic::new(false),
                 templates_restored: Atomic::new(false),
                 cold_restore_candidate: Atomic::new(false),
@@ -1260,6 +1267,16 @@ impl SepData {
         store.as_mut().map(f)
     }
 
+    /// Whether the enclave's xART writes reach the store.
+    pub(crate) fn xart_writable(&self) -> bool {
+        self.with_store(|store| store.writes_enabled())
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn capture_refusal_logged(&self) -> &Atomic<bool> {
+        &self.capture_refusal_logged
+    }
+
     fn with_host_store<R>(&self, f: impl FnOnce(&mut store::Store) -> R) -> Option<R> {
         let mut guard = self.host_store.lock();
         let store: &mut Option<store::Store> = &mut guard;
@@ -1341,19 +1358,32 @@ impl SepData {
 
         let os_uuid = self.xarm.lock().os_uuid;
         let serviced = self.with_store(|store| {
-            xarm::service(
+            let done = xarm::service(
                 req,
                 &payload,
                 &mut staging,
                 store,
                 PROTECTED_DATA_AVAILABLE,
                 os_uuid,
-            )
+            );
+            (done, store.writes_enabled())
         });
-        let Some(done) = serviced else {
+        let Some((done, writable)) = serviced else {
             self.fail_xarm(req.tag);
             return;
         };
+
+        if !writable
+            && xarm::is_write(req.opcode)
+            && done.reply.status != xarm::STATUS_OK
+            && !self.xart_refusal_logged.xchg(true, Relaxed)
+        {
+            dev_warn!(
+                self.dev,
+                "xART: refused the enclave's write (op 0x{:02x}): writes are disabled (xart_writes=0)\n",
+                req.opcode
+            );
+        }
 
         if *module_parameters::xarm_trace.value() != 0 {
             dev_info!(
@@ -2305,7 +2335,7 @@ module! {
     params: {
         xart_writes: u8 {
             default: 0,
-            description: "Opt in to shared xART writes only if APFS proves a single unsnapshotted .gl extent",
+            description: "Opt in to shared xART writes only if APFS proves a single unsnapshotted .gl extent; Touch ID enrol and verify need it",
         },
         xart_start_sector: u64 {
             default: 0,
