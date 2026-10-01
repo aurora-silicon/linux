@@ -149,54 +149,53 @@ impl Runtime {
         use crate::util::RangeExt;
         let reserved_range=0x70_0000_0000..0x80_0000_0000;
         if range.overlaps(reserved_range.clone()) {return Err(EINVAL);}
+        if self.inner.gpu_pending { self.inner.state.events.record_cpu_preparation(); }
         let vm=self.inner.uat.new_vm(id, range)?;
         let mut reserved=KVec::new();reserved.push(reserved_range,GFP_KERNEL)?;reserved.push(0x100_8000_0000..0x101_0000_0000,GFP_KERNEL)?;reserved.push(0x10_0000_0000..0x10_0800_0000,GFP_KERNEL)?;reserved.push(0x10_7400_0000..0x10_7402_8000,GFP_KERNEL)?;
         vm.install_driver_mappings(KVec::new(),reserved)?;
         Ok(vm)
     }
     pub(crate) fn map_timestamp(&self,mut bo:crate::gem::ObjectRef,range:core::ops::Range<usize>)->Result<mmu::KernelMapping> {
+        if self.inner.gpu_pending { self.inner.state.events.record_cpu_preparation(); }
         bo.map_range_into_range(self.inner.uat.kernel_vm(),range,crate::g16_memory::TIMESTAMP_RANGE,
             mmu::UAT_PGSZ as u64,mmu::PROT_FW_SHARED_RW,false)
     }
-    /// Run one packet to retirement. The runtime lock is held while a batch is
-    /// prepared, published and polled, and released while waiting for the GPU
-    /// (asahi.m3_unlocked_wait, default on; 0 holds it throughout, as before).
-    /// Only the scheduler's run callback calls this, one packet at a time, so
-    /// the retained jobs and the batch in flight cannot change while unlocked.
-    pub(crate) fn execute(shared:&crate::m3_drm::Shared,packet:Arc<crate::m3_submit::Packet>)->Result {
+    /// The DRM scheduler's single run-job worker owns execution. Release only
+    /// the runtime mutex during bounded waits so independent CPU VM/timestamp
+    /// preparation can overlap GPU work; no second packet or pass is published.
+    pub(crate) fn execute(shared: &crate::m3_drm::Shared,
+                          packet: Arc<crate::m3_submit::Packet>) -> Result {
         let result = Self::execute_inner(shared, packet);
-        // The scheduler serializes execute calls. Reacquire the runtime lock
-        // before latching any error after publication: retained packets must
-        // not be released by the next submission while DMA may still be active.
         if let Err(error) = result {
             if let Some(runtime) = Option::as_mut(&mut *shared.lock()) {
-                if runtime.inner.gpu_pending {
-                    runtime.inner.capture_fault(error);
-                }
+                if runtime.inner.gpu_pending { runtime.inner.capture_fault(error); }
             }
         }
         result
     }
-    fn execute_inner(shared:&crate::m3_drm::Shared,packet:Arc<crate::m3_submit::Packet>)->Result {
+    fn execute_inner(shared: &crate::m3_drm::Shared,
+                     packet: Arc<crate::m3_submit::Packet>) -> Result {
         crate::debug::update_debug_flags();
-        let unlocked_wait=crate::m3_params::unlocked_wait();
         let render_batch_size=crate::m3_params::render_batch_size();
         let compute_batch_size=crate::m3_params::compute_batch_size();
-        let mut guard=shared.lock();
-        let events={
-            let inner=&mut *Option::as_mut(&mut *guard).ok_or(ENODEV)?.inner;
-            if !inner.state.healthy() {return Err(EIO);}
-            if packet.commands.is_empty() || packet.commands.len()>256 {
-                pr_err!("M3 submit limit: commands={} maximum=256\n",packet.commands.len());
+        let mut guard = shared.lock();
+        let events = {
+            let inner = &mut *Option::as_mut(&mut *guard).ok_or(ENODEV)?.inner;
+            if !inner.state.healthy() { return Err(EIO); }
+            // A future second executor must fail closed, never reset storage
+            // or clear retained owners of the scheduler's in-flight packet.
+            if inner.gpu_pending { return Err(EBUSY); }
+            if packet.commands.is_empty() || packet.commands.len() > 256 {
+                pr_err!("M3 submit limit: commands={} maximum=256\n", packet.commands.len());
                 return Err(E2BIG);
             }
-            // Engine boundaries and VM switches still require full retirement.
-            // Adjacent commands may be prepared together in disjoint storage;
-            // explicit fragment-to-TA barriers retain packet resource ordering.
-            // Keep the current VM job guard through completion, not every old packet.
-            inner.packets.clear();inner.packets.push(packet.clone(),GFP_KERNEL)?;
+            inner.packets.clear();
+            inner.packets.push(packet.clone(), GFP_KERNEL)?;
             inner.state.events.clone()
         };
+        // Snapshot once per packet. A root policy write cannot change ownership
+        // halfway through it. The initial value preserves m3_unlocked_wait.
+        let overlap_cpu = events.cpu_overlap();
         let mut command_index=0;
         while command_index<packet.commands.len() {
             let control=packet.commands[command_index];
@@ -285,8 +284,8 @@ impl Runtime {
             let measure=crate::debug::debug_enabled(crate::debug::DebugFlags::M3SubmitSummary);
             let (mut polling_ns,mut retirement_ns,mut sleeping_ns,mut polls)=(0,0,0,0);
             loop {
-                // The runtime can only have been removed (device unbind) while
-                // unlocked. Its Drop keeps every owner of a pending job alive.
+                // Unbind may remove the runtime while unlocked. Drop either
+                // proves ASC stopped or quarantines all pending DMA owners.
                 let inner=&mut *Option::as_mut(&mut *guard).ok_or(ENODEV)?.inner;
                 let poll_start=measure.then(Instant::<Monotonic>::now);
                 let messages=inner.state.event_messages.load(Ordering::Acquire);
@@ -404,9 +403,12 @@ impl Runtime {
                 // up for the duration of a job.
                 let sleep_start=measure.then(Instant::<Monotonic>::now);
                 if messages!=waited_at {waited_at=messages;trailing=0;}
-                let mut wait=|| if trailing<4 {trailing+=1;fsleep(Delta::from_micros(5));}
-                    else {events.wait_past(messages);trailing=0;};
-                if unlocked_wait {drop(guard);wait();guard=shared.lock();} else {wait();}
+                let mut wait=|| {
+                    if trailing<4 {trailing+=1;fsleep(Delta::from_micros(5));}
+                    else {events.wait_past(messages);trailing=0;}
+                };
+                if overlap_cpu { drop(guard); wait(); guard=shared.lock(); }
+                else { wait(); }
                 if let Some(t)=sleep_start {sleeping_ns+=t.elapsed().as_nanos();}
             }
             command_index+=batch_count;

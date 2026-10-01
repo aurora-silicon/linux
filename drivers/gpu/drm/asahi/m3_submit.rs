@@ -74,7 +74,7 @@ impl Packet {
 pub(crate) struct Job {shared:Shared,packet:Arc<Packet>}
 impl sched::JobImpl for Job {
     fn run(job:&mut sched::Job<Self>)->Result<Option<Fence>> {
-        let result=crate::m3_runtime::Runtime::execute(&job.shared,job.packet.clone());
+        let result=crate::m3_runtime::Runtime::execute(&job.shared, job.packet.clone());
         if let Err(e)=result {pr_err!("M3 scheduler: execution failed {:?}\n",e);}
         job.packet.finish(result);
         Ok(Some(Fence::from_fence(&job.packet.completion)))

@@ -36,9 +36,9 @@ impl kernel::debugfs::Writer for TimingView {
 struct CompletionView(Arc<crate::m3_rtkit::EventWait>);
 impl kernel::debugfs::Writer for CompletionView {
     fn write(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
-        let (us, irqs, sleeps, timers) = self.0.snapshot();
-        writeln!(f, "version=1 wait_us={} notifications={} sleeps={} timer_wakes={}",
-                 us, irqs, sleeps, timers)
+        let (us, irqs, sleeps, timers, preparations) = self.0.snapshot();
+        writeln!(f, "version=1 wait_us={} notifications={} sleeps={} timer_wakes={} cpu_preparations={}",
+                 us, irqs, sleeps, timers, preparations)
     }
 }
 impl kernel::debugfs::Reader for CompletionView {
@@ -53,6 +53,27 @@ impl kernel::debugfs::Reader for CompletionView {
     }
 }
 
+struct SubmitOverlapView(Arc<crate::m3_rtkit::EventWait>);
+impl kernel::debugfs::Writer for SubmitOverlapView {
+    fn write(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        writeln!(f, "{}", u8::from(self.0.cpu_overlap()))
+    }
+}
+impl kernel::debugfs::Reader for SubmitOverlapView {
+    fn read_from_slice(&self, reader: &mut kernel::uaccess::UserSliceReader) -> Result {
+        let len=reader.len();
+        if len==0 || len>2 {return Err(EINVAL);}
+        let mut bytes=[0u8;2];reader.read_slice(&mut bytes[..len])?;
+        let text=core::str::from_utf8(&bytes[..len]).map_err(|_|EINVAL)?.trim();
+        match text {
+            "0" => self.0.set_cpu_overlap(false),
+            "1" => self.0.set_cpu_overlap(true),
+            _ => return Err(EINVAL),
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct Registered {
     registration: Pin<KBox<Mutex<Option<drm::driver::Registration<driver::AsahiDriver>>>>>,
     shared: Shared,
@@ -62,6 +83,7 @@ pub(crate) struct Registered {
     _memory: Pin<KBox<kernel::debugfs::File<crate::agx_memory_stats::View>>>,
     _timing: Pin<KBox<kernel::debugfs::File<TimingView>>>,
     _completion: Pin<KBox<kernel::debugfs::File<CompletionView>>>,
+    _overlap: Pin<KBox<kernel::debugfs::File<SubmitOverlapView>>>,
 }
 impl Registered {
     pub(crate) fn start(pdev: &platform::Device<Core>) -> Result<Self> {
@@ -95,8 +117,10 @@ impl Registered {
             TimingView(health.clone())), GFP_KERNEL)?;
         let completion = KBox::pin_init(directory.read_write_file(c"completion_wait",
             CompletionView(runtime.completion_wait())), GFP_KERNEL)?;
+        let overlap = KBox::pin_init(directory.read_write_file(c"submit_overlap",
+            SubmitOverlapView(runtime.completion_wait())), GFP_KERNEL)?;
         let shared = Arc::pin_init(new_mutex!(Some(runtime)), GFP_KERNEL)?;
-        let owner = Self { registration: KBox::pin_init(new_mutex!(None), GFP_KERNEL)?, shared: shared.clone(), health: health.clone(), _progress: progress, _activity: activity, _memory: memory, _timing: timing, _completion: completion };
+        let owner = Self { registration: KBox::pin_init(new_mutex!(None), GFP_KERNEL)?, shared: shared.clone(), health: health.clone(), _progress: progress, _activity: activity, _memory: memory, _timing: timing, _completion: completion, _overlap: overlap };
         let scheduler=Arc::new(drm::sched::Scheduler::new(drm.as_ref(),4,8,0,3000,kernel::c_str!("asahi_m3_sched"))?,GFP_KERNEL)?;
         let backend: Arc<dyn DrmGpu> = Arc::new(Backend { shared, health, scheduler, ids: gpu::SequenceIDs::default(),
             core_mask, max_frequency_khz }, GFP_KERNEL)?;

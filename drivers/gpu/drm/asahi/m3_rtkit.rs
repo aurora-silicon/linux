@@ -24,6 +24,8 @@ use kernel::{
 pub(crate) struct EventWait {
     count: AtomicU64,
     wait_us: AtomicU64,
+    overlap_cpu: AtomicBool,
+    cpu_preparations: AtomicU64,
     sleeps: AtomicU64,
     timer_wakes: AtomicU64,
     #[pin]
@@ -38,6 +40,8 @@ impl EventWait {
             pin_init!(EventWait {
                 count: AtomicU64::new(0),
                 wait_us: AtomicU64::new(100),
+                overlap_cpu: AtomicBool::new(crate::m3_params::unlocked_wait()),
+                cpu_preparations: AtomicU64::new(0),
                 sleeps: AtomicU64::new(0),
                 timer_wakes: AtomicU64::new(0),
                 arrived <- Completion::new(),
@@ -61,9 +65,21 @@ impl EventWait {
         Ok(())
     }
 
-    pub(crate) fn snapshot(&self) -> (u64, u64, u64, u64) {
+    pub(crate) fn cpu_overlap(&self) -> bool {
+        self.overlap_cpu.load(Ordering::Relaxed)
+    }
+    pub(crate) fn set_cpu_overlap(&self, enabled: bool) {
+        self.overlap_cpu.store(enabled, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_cpu_preparation(&self) {
+        self.cpu_preparations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot(&self) -> (u64, u64, u64, u64, u64) {
         (self.wait_us.load(Ordering::Relaxed), self.count.load(Ordering::Acquire),
-         self.sleeps.load(Ordering::Relaxed), self.timer_wakes.load(Ordering::Relaxed))
+         self.sleeps.load(Ordering::Relaxed), self.timer_wakes.load(Ordering::Relaxed),
+         self.cpu_preparations.load(Ordering::Relaxed))
     }
 
     /// Sleep until a notification later than `seen` has been recorded or
