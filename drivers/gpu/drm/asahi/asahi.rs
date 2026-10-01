@@ -46,6 +46,7 @@ mod m3_config;
 mod m3_board;
 mod m3_init_layout;
 mod m3_runtime;
+mod m3_timeline;
 mod m3_coverage;
 mod m3_drm;
 mod m3_params;

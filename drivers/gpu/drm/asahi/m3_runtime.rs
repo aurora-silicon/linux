@@ -365,7 +365,8 @@ impl Runtime {
                             t[0]+=1;t[1]+=preparation_ns;t[2]+=active_ns;t[3]+=gpu_ns as i64;
                             for i in 0..3 {t[4+i]+=stages[i] as i64;}
                             if t[0]%128==0 {
-                                dev_info!(inner.drm.as_ref(),"M3_TIMING kind={} count={} prepare_ns={} active_ns={} gpu_ns={} ta_ns={} fragment_ns={} gap_ns={}\n",kind,t[0],t[1],t[2],t[3],t[4],t[5],t[6]);
+                                dev_info!(inner.drm.as_ref(),"M3_TIMING kind={} count={} prepare_ns={} active_ns={} gpu_ns={} ta_ns={} fragment_ns={} gap_ns={} ordinal={}\n",kind,t[0],t[1],t[2],t[3],t[4],t[5],t[6],
+                                    match &inner.jobs[index] {NativeJob::Render(j)=>j.ordinal(),NativeJob::Compute(j)=>j.ordinal()});
                             }
                             if kind==0 && t[0]%512==0 &&
                                 crate::debug::debug_enabled(crate::debug::DebugFlags::M3SubmitSummary) {

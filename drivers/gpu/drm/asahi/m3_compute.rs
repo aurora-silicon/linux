@@ -6,6 +6,7 @@ use crate::m3_state_layout as state;
 use crate::{m3_compute_layout as command, m3_compute_sequence as microsequence,
     m3_pool_layout::GpuRegion, m3_init_layout::Region};
 use crate::{driver,mmu,g16_memory::{self},m3_memory::Buffer,m3_compute_storage as storage};
+use crate::m3_timeline as timeline;
 use storage::{NOTIFIER,PREEMPTION,GPU_CONTEXT,JOB_LIST,QUEUE_SCRATCH,TIMESTAMPS,
     TAIL_SCRATCH,MICROSEQUENCE_SCRATCH,Mapping};
 const UMA_POOL:crate::m3_pool::Owners=crate::m3_pool::Owners {
@@ -28,13 +29,13 @@ pub(crate) struct Compute {
     sequence_bytes: KVec<u8>,
     _binding: mmu::VmBind,
     stats: Region,
-    sequence: u32,
+    sequence: u64,
     last_progress_ns: i64,
     head: u16,
     cached_views: KVec<CachedViews>,
     slot: usize,
     batch_count: usize,
-    checkpoint: (u32,u16,usize),
+    checkpoint: (u64,u16,usize),
 }
 impl Compute {
     pub(crate) fn new(dev: &driver::AsahiDevice, uat: &mmu::Uat, vm: &mmu::Vm,
@@ -60,7 +61,7 @@ impl Compute {
             objects.push(b,GFP_KERNEL)?;
         }
         Self::encode_command(&mut objects, &mut command_bytes, binding.slot(), control, 1, 0)?;
-        Self::encode_sequence(&mut objects, &mut sequence_bytes, stats, binding.slot(), 0xc1000100, 0)?;
+        Self::encode_sequence(&mut objects, &mut sequence_bytes, stats, binding.slot(), timeline::stamp(0xc1000000,1), 0)?;
         UMA_POOL.initialize(&mut objects)?;
         Self::initialize_state(&mut objects, binding.slot())?;
         // Queue references are firmware VAs from live allocations. In contrast
@@ -98,19 +99,19 @@ impl Compute {
         Ok(Self {_client_command:client_command.ok_or(EINVAL)?,objects,command_bytes,sequence_bytes,_binding:binding,stats,last_progress_ns:0,sequence:1,head:1,cached_views:KVec::new(),slot:0,batch_count:1,checkpoint:(0,0,0)})
     }
     fn encode_command(objects: &mut [Buffer], bytes: &mut [u8], context: u32,
-        control: crate::g16_compute::Control, sequence: u32, slot: usize) -> Result {
+        control: crate::g16_compute::Control, sequence: u64, slot: usize) -> Result {
         let offset = |owner:usize| storage::slot_offset(owner,slot).map_err(|_|EINVAL);
         let fw = |owner: usize| queue::FirmwareVa::new(objects[owner].va()+offset(owner)? as u64).map_err(|_| EINVAL);
         let preemption = &objects[PREEMPTION];
         let value = command::Command {
-            context, counter: sequence.checked_sub(1).ok_or(EINVAL)?, notifier: fw(NOTIFIER)?,
+            context, counter: timeline::previous(sequence), notifier: fw(NOTIFIER)?,
             preemption: GpuRegion::new(preemption.gpu_va()?+offset(PREEMPTION)? as u64, storage::allocation(PREEMPTION).map_err(|_|EINVAL)?.size).map_err(|_| EINVAL)?,
             cdm: command::GpuVa::new(control.base).map_err(|_| EINVAL)?,
             cdm_last: command::GpuVa::new(control.end.checked_sub(4).ok_or(EINVAL)?).map_err(|_| EINVAL)?,
             gpu_alias: command::GpuVa::new(objects[storage::COMMAND].gpu_va()?+offset(storage::COMMAND)? as u64).map_err(|_| EINVAL)?,
             microsequence: fw(storage::MICROSEQUENCE)?, microsequence_size: microsequence::LENGTH as u32,
             stamp: fw(storage::STAMP)?, fw_stamp: fw(storage::FW_STAMP)?,
-            stamp_value: 0xc1000000u32.checked_add(sequence.checked_mul(256).ok_or(EOVERFLOW)?).ok_or(EOVERFLOW)?,
+            stamp_value: timeline::stamp(0xc1000000,sequence),
             timestamps: [fw(TIMESTAMPS[0])?, fw(TIMESTAMPS[1])?],
             pool: fw(storage::POOL)?, tail_scratch: fw(TAIL_SCRATCH)?, flush_stamps: false,
         };
@@ -145,7 +146,7 @@ impl Compute {
         let mut list = [0; state::JOB_LIST_SIZE];
         state::job_list(&mut list, list_owner).map_err(|_| EINVAL)?;
         objects[JOB_LIST].write(0, &list)?;
-        for (owner, value) in [(storage::COUNTER, 1), (storage::EVENT, 1), (storage::STAMP, 0xc1000000)] {
+        for (owner, value) in [(storage::COUNTER, 1), (storage::EVENT, 1), (storage::STAMP, timeline::stamp(0xc1000000,0))] {
             let mut bytes = [0; state::MANAGER_STATE_SIZE];
             let bytes = bytes.get_mut(..objects[owner].size()).ok_or(EINVAL)?;
             state::counter(bytes, value).map_err(|_| EINVAL)?;
@@ -156,7 +157,7 @@ impl Compute {
     }
     pub(crate) fn replay(&mut self, uat: &mmu::Uat, vm: &mmu::Vm,
         control: crate::g16_compute::Control) -> Result {
-        if !self.complete()? || self.sequence >= 0x003e_ffff { return Err(EBUSY); }
+        if !self.complete()? { return Err(EBUSY); }
         // All prior flushed stamps/events and engine idle were checked by
         // Runtime before entry. Keep pool/queue ownership, remap only client
         // views and patch the context when switching Vulkan processes.
@@ -203,7 +204,7 @@ impl Compute {
     /// remains unpublished. Firmware serializes each command, including its
     /// original completion flush, in this one compute queue.
     pub(crate) fn append(&mut self,control:crate::g16_compute::Control)->Result {
-        if self.batch_count>=storage::SLOTS || self.sequence>=0x003e_ffff {return Err(E2BIG);}
+        if self.batch_count>=storage::SLOTS {return Err(E2BIG);}
         self.slot=self.batch_count;
         for i in storage::RESET {
             let offset=storage::slot_offset(i,self.slot).map_err(|_|EINVAL)?;
@@ -211,12 +212,12 @@ impl Compute {
             self.objects[i].fill_range(offset,size,if i==PREEMPTION {0xcc} else {0})?;
         }
         self.objects[NOTIFIER].u32(state::NOTIFIER_CONTEXT,self._binding.slot())?;
-        self.sequence+=1;
+        self.sequence=self.sequence.checked_add(1).ok_or(EOVERFLOW)?;
         Self::encode_command(&mut self.objects,&mut self.command_bytes,self._binding.slot(),control,self.sequence,self.slot)?;
         let stamp=self.stamp();
         Self::encode_sequence(&mut self.objects,&mut self.sequence_bytes,self.stats,self._binding.slot(),stamp,self.slot)?;
-        self.objects[storage::EVENT].u32(0,self.sequence)?;
-        self.objects[storage::COUNTER].u32(0,self.sequence)?;
+        self.objects[storage::EVENT].u32(0,self.sequence as u32)?;
+        self.objects[storage::COUNTER].u32(0,self.sequence as u32)?;
         let address=self.objects[storage::COMMAND].va()+storage::slot_offset(storage::COMMAND,self.slot).map_err(|_|EINVAL)? as u64;
         self.objects[storage::RING].u64(usize::from(self.head)*8,address)?;
         self.head=(self.head+1)%queue::QUALIFIED_CAPACITY as u16;
@@ -230,8 +231,8 @@ impl Compute {
     pub(crate) fn abort_batch(&mut self)->Result {
         (self.sequence,self.head,self.batch_count)=self.checkpoint;
         self.slot=self.batch_count.saturating_sub(1);
-        self.objects[storage::EVENT].u32(0,self.sequence)?;
-        self.objects[storage::COUNTER].u32(0,self.sequence)?;
+        self.objects[storage::EVENT].u32(0,self.sequence as u32)?;
+        self.objects[storage::COUNTER].u32(0,self.sequence as u32)?;
         self.objects[storage::QUEUE_STATE].u32(queue::WRITE,u32::from(self.head))?;
         g16_memory::publish();Ok(())
     }
@@ -265,7 +266,7 @@ impl Compute {
         self.objects[storage::MICROSEQUENCE].write(sequence+microsequence::HAS_ATTACHMENTS,&[u8::from(attachments.count()!=0)])?;
         g16_memory::publish();Ok(())
     }
-    fn stamp(&self) -> u32 { 0xc1000000 + self.sequence*0x100 }
+    fn stamp(&self) -> u32 { timeline::stamp(0xc1000000,self.sequence) }
     pub(crate) fn gpu_ns(&mut self)->Result<u64> {
         let mut total=0;
         for slot in 0..self.batch_count {total+=self.slot_gpu_ns(slot)?;}
@@ -278,7 +279,8 @@ impl Compute {
         Ok(if start!=0 && end>=start {(end-start)*1000/24} else {0})
     }
     pub(crate) fn head(&self) -> u16 { self.head }
-    pub(crate) fn first(&self) -> bool { self.sequence == self.batch_count as u32 }
+    pub(crate) fn ordinal(&self)->u64 {self.sequence}
+    pub(crate) fn first(&self) -> bool { self.sequence == self.batch_count as u64 }
     pub(crate) fn progress(&mut self, dev: &driver::AsahiDevice) -> Result {
         // Report real completions by elapsed time as well as sequence count;
         // batches need not land on a multiple of 128.

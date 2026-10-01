@@ -8,6 +8,7 @@ use crate::{m3_pass::{Pass,ViewOwner},m3_pass_layout::{self as pass_layout,Field
 use crate::{m3_fragment_command as fragment, m3_tiler_command as tiler, m3_render_sequence as sequence, m3_init_layout::Region};
 use crate::{m3_parameter_layout as parameter, m3_pool_layout::GpuRegion};
 use crate::{driver,mmu,pgtable::prot,m3_memory::Buffer,m3_shared_layout as s,g17_uapi};
+use crate::m3_timeline as timeline;
 use s::{PB_FIRST,PB_GROUPS,PB_BLOCKS_PER_GROUP,PB_BLOCK_SIZE};
 const PB_BLOCKS:u32=(PB_GROUPS*PB_BLOCKS_PER_GROUP) as u32;
 pub(crate) const PB_PAGES:u32=PB_BLOCKS*4;
@@ -27,9 +28,9 @@ pub(crate) struct Render {
     _binding:mmu::VmBind,
     stats: Region, sequence_bytes: KVec<u8>, tiler_bytes: KVec<u8>, fragment_bytes: KVec<u8>,
     last_progress_ns:i64,
-    draw:u32, heads:[u16;2], cached_views:KVec<CachedViews>,
+    draw:u64, heads:[u16;2], cached_views:KVec<CachedViews>,
     slot:usize, batch_count:usize, early_count:u32,
-    checkpoint:(u32,[u16;2],usize,usize,u32),
+    checkpoint:(u64,[u16;2],usize,usize,u32),
 }
 // Queue allocations belong to Render, not to a pass. Keep their fixed arenas
 // and firmware/shared mapping permissions from the qualified allocation map.
@@ -137,8 +138,8 @@ impl Render {
         self.objects[MANAGER_MISC].write(0, &manager)?;
         for (owner, value) in [(TA_POOL_COUNTER, 1), (FRAGMENT_POOL_COUNTER, 1),
             (s::EVENT_COUNT, 2), (s::BM_COUNTER, 1),
-            (s::TA_STAMP, s::STAMP_TA - 256), (s::TA_FW_STAMP, s::STAMP_TA - 256),
-            (s::FRAGMENT_STAMP, s::STAMP_FRAGMENT - 256), (s::FRAGMENT_FW_STAMP, s::STAMP_FRAGMENT - 256)] {
+            (s::TA_STAMP, timeline::stamp(s::STAMP_TA - 256, 0)), (s::TA_FW_STAMP, timeline::stamp(s::STAMP_TA - 256, 0)),
+            (s::FRAGMENT_STAMP, timeline::stamp(s::STAMP_FRAGMENT - 256, 0)), (s::FRAGMENT_FW_STAMP, timeline::stamp(s::STAMP_FRAGMENT - 256, 0))] {
             let mut bytes = [0; state::MANAGER_STATE_SIZE];
             let bytes = bytes.get_mut(..self.objects[owner].size()).ok_or(EINVAL)?;
             state::counter(bytes, value).map_err(|_| EINVAL)?;
@@ -181,33 +182,33 @@ impl Render {
     // Construct synchronization from the actual owners after resetting a pass,
     // before publishing its ring entries. InitBM is shared and dispatched only
     // for draw one; rewriting its bytes after retirement preserves the old path.
-    fn prepare_sync(&mut self, early: bool, draw: u32) -> Result {
+    fn prepare_sync(&mut self, early: bool, draw: u64) -> Result {
         let address = |owner: usize| queue::FirmwareVa::new(self.objects[owner].va()).map_err(|_| EINVAL);
         let manager = address(BUFFER_MANAGER)?;
         let ta_stamp = address(s::TA_FW_STAMP)?;
         let fs_stamp = address(s::FRAGMENT_FW_STAMP)?;
         let mut init = [0; sync::INIT_BM_SIZE];
         sync::InitBufferManager { context: self._binding.slot(), slot: 0,
-            block_count: PB_BLOCKS, manager, stamp: s::STAMP_TA }
+            block_count: PB_BLOCKS, manager, stamp: timeline::stamp(s::STAMP_TA - 256, 1) }
             .encode(&mut init).map_err(|_| EINVAL)?;
         self.init_bm.write(0, &init)?;
-        let ta_value = s::STAMP_TA + (draw - 1) * 256;
-        let fs_value = s::STAMP_FRAGMENT + (draw - 1) * 256;
+        let ta_value = timeline::stamp(s::STAMP_TA - 256, draw);
+        let fs_value = timeline::stamp(s::STAMP_FRAGMENT - 256, draw);
         self.write_barrier(P::TilerToFragment, sync::Barrier {
             stamp: ta_stamp, wait_value: ta_value, event: 0, self_value: fs_value,
             uuid: 0x3d0000, dependency: sync::Dependency::TilerToFragment })?;
         self.write_barrier(P::TilerDependency, sync::Barrier {
             stamp: if early { ta_stamp } else { fs_stamp },
-            wait_value: if early { ta_value - 256 } else { fs_value - 256 },
+            wait_value: if early { ta_value.wrapping_sub(256) } else { fs_value.wrapping_sub(256) },
             event: u32::from(!early), self_value: ta_value,
             uuid: DEPENDENCY_UUID, dependency: sync::Dependency::PreviousPass })?;
         self.write_barrier(P::FragmentDependency, sync::Barrier {
-            stamp: fs_stamp, wait_value: fs_value - 256, event: 1, self_value: fs_value,
+            stamp: fs_stamp, wait_value: fs_value.wrapping_sub(256), event: 1, self_value: fs_value,
             uuid: DEPENDENCY_UUID, dependency: sync::Dependency::PreviousPass })
     }
     // Prepare each private command after its retired slot is reset. The
     // reusable host staging allocation is copied before the next slot is built.
-    fn prepare_tiler(&mut self,r:g17_uapi::UapiRenderCommand,draw:u32)->Result {
+    fn prepare_tiler(&mut self,r:g17_uapi::UapiRenderCommand,draw:u64)->Result {
         use crate::m3_compute_layout::GpuVa;
         let pass=&self.passes[self.slot];
         let shared=|index:usize| queue::FirmwareVa::new(self.objects[index].va()).map_err(|_|EINVAL);
@@ -227,7 +228,7 @@ impl Render {
             scene:fw(P::Scene)?,empty:shared(547)?,gpu_alias:GpuVa::new(command.gpu_va()?).map_err(|_|EINVAL)?,
             sequence:Region::new(seq.va(),seq.size()).map_err(|_|EINVAL)?,pool:shared(UMA_POOLS[0].manager)?,
             scratch:fw(P::TilerScratch)?,stamp:shared(s::TA_STAMP)?,fw_stamp:shared(s::TA_FW_STAMP)?,
-            stamp_value:s::STAMP_TA+(draw-1)*256,timestamps:[fw(P::TilerStart)?,fw(P::TilerEnd)?],
+            stamp_value:timeline::stamp(s::STAMP_TA - 256, draw),timestamps:[fw(P::TilerStart)?,fw(P::TilerEnd)?],
             user_timestamps:[fw(P::TilerUserStart)?,fw(P::TilerUserEnd)?],preemption:[gpu(P::Preemption0)?,gpu(P::Preemption1)?,gpu(P::Preemption2)?],
             tilemap:gpu(P::Tilemap)?,tpc:gpu(P::Tpc)?,tpc_bytes:g.tpc_bytes,heap:gpu(P::HeapMetadata)?,
             scene_user:gpu(P::SceneUser)?,initial_scene_entry,geometry:g,page_count:PB_PAGES,
@@ -237,7 +238,7 @@ impl Render {
         value.encode(&mut self.tiler_bytes).map_err(|_|EINVAL)?;
         self.passes[self.slot].get_mut(P::TilerCommand).write(0,&self.tiler_bytes)
     }
-    fn prepare_sequences(&mut self,draw:u32)->Result {
+    fn prepare_sequences(&mut self,draw:u64)->Result {
         for fs in [false,true] {
             let pass=&self.passes[self.slot];
             let region=|field:P| {let b=pass.get(field);Region::new(b.va(),b.size()).map_err(|_|EINVAL)};
@@ -251,12 +252,12 @@ impl Render {
                 queue:shared(if fs{s::FRAGMENT_QUEUE}else{s::TA_QUEUE})?,scene:fw(P::Scene)?,
                 manager:shared(BUFFER_MANAGER)?,pool:shared(UMA_POOLS[usize::from(fs)].manager)?,
                 fw_stamp:shared(if fs{s::FRAGMENT_FW_STAMP}else{s::TA_FW_STAMP})?,
-                context:self._binding.slot(),stamp:(if fs{s::STAMP_FRAGMENT}else{s::STAMP_TA})+(draw-1)*256,
+                context:self._binding.slot(),stamp:timeline::stamp((if fs{s::STAMP_FRAGMENT}else{s::STAMP_TA}) - 256, draw),
             };
             if fs {
                 let b=pass.get(P::FragmentScratch);
                 let scratch=GpuRegion::new(b.gpu_va()?,b.size()).map_err(|_|EINVAL)?;
-                sequence::Fragment{owners,scratch,queue_command_count:draw-1}.encode(&mut self.sequence_bytes).map_err(|_|EINVAL)?;
+                sequence::Fragment{owners,scratch,queue_command_count:timeline::previous(draw)}.encode(&mut self.sequence_bytes).map_err(|_|EINVAL)?;
             }else{sequence::Tiler{owners,scratch:fw(P::TilerScratch)?}.encode(&mut self.sequence_bytes).map_err(|_|EINVAL)?;}
             self.passes[self.slot].get_mut(target).write(0,&self.sequence_bytes)?;
         }
@@ -279,7 +280,7 @@ impl Render {
         g.set_samples(r.samples).map_err(|_|EINVAL)?;
         Ok(g)
     }
-    fn prepare_fragment(&mut self,r:g17_uapi::UapiRenderCommand,usc:u64,draw:u32)->Result {
+    fn prepare_fragment(&mut self,r:g17_uapi::UapiRenderCommand,usc:u64,draw:u64)->Result {
         use crate::{m3_compute_layout::GpuVa,g16_render_state::{Program,DepthStencil}};
         let pass=&self.passes[self.slot];
         let shared=|index:usize| queue::FirmwareVa::new(self.objects[index].va()).map_err(|_|EINVAL);
@@ -301,7 +302,7 @@ impl Render {
             gpu_alias:GpuVa::new(command.gpu_va()?).map_err(|_|EINVAL)?,tilemap:gpu(P::Tilemap)?,
             heap:gpu(P::HeapMetadata)?,auxiliary:gpu(P::Auxiliary)?,scene_user:gpu(P::SceneUser)?,
             scratch:gpu(P::FragmentScratch)?,pool:shared(UMA_POOLS[1].manager)?,stamp:shared(s::FRAGMENT_STAMP)?,
-            fw_stamp:shared(s::FRAGMENT_FW_STAMP)?,stamp_value:s::STAMP_FRAGMENT+(draw-1)*256,
+            fw_stamp:shared(s::FRAGMENT_FW_STAMP)?,stamp_value:timeline::stamp(s::STAMP_FRAGMENT - 256, draw),
             timestamps:[fw(P::FragmentStart)?,fw(P::FragmentEnd)?],user_timestamps:[fw(P::FragmentUserStart)?,fw(P::FragmentUserEnd)?],
             state:fragment::State {
                 geometry,multisample:r.multisample_control,merge_upper:[r.merge_upper_x,r.merge_upper_y],
@@ -357,12 +358,13 @@ impl Render {
     }
     pub(crate) fn early_count(&self)->u32 {self.early_count}
     pub(crate) fn heads(&self)->[u16;2] {self.heads}
-    pub(crate) fn first(&self)->bool {self.draw==self.batch_count as u32}
+    pub(crate) fn ordinal(&self)->u64 {self.draw}
+    pub(crate) fn first(&self)->bool {self.draw==self.batch_count as u64}
     pub(crate) fn begin_batch(&mut self,dev:&driver::AsahiDevice,uat:&mmu::Uat,vm:&mmu::Vm,
         commands:&[crate::m3_submit::Command])->Result {
         if !self.complete()? {return Err(EBUSY);}
-        if commands.is_empty() || commands.len()>pass_layout::SLOTS
-            || self.draw as usize+commands.len()>0x003e_ffff {return Err(E2BIG);}
+        if commands.is_empty() || commands.len()>pass_layout::SLOTS {return Err(E2BIG);}
+        self.draw.checked_add(commands.len() as u64).ok_or(EOVERFLOW)?;
         // Validate every pass before changing any queue or completion state.
         for &command in commands {
             let crate::m3_submit::Command::Render{command:r,..}=command else {return Err(EINVAL);};
@@ -429,8 +431,8 @@ impl Render {
     /// state if a later descriptor/timestamp check fails before publication.
     pub(crate) fn abort_batch(&mut self)->Result {
         (self.draw,self.heads,self.batch_count,self.slot,self.early_count)=self.checkpoint;
-        self.objects[s::BM_COUNTER].u32(0,self.draw)?;
-        self.objects[s::EVENT_COUNT].u32(0,self.draw*2)?;
+        self.objects[s::BM_COUNTER].u32(0,self.draw as u32)?;
+        self.objects[s::EVENT_COUNT].u32(0,timeline::events(self.draw,2))?;
         for (stage,pointers) in [s::TA_POINTERS,s::FRAGMENT_POINTERS].into_iter().enumerate() {
             self.objects[pointers].u32(queue::WRITE,u32::from(self.heads[stage]))?;
         }
@@ -441,9 +443,9 @@ impl Render {
     /// Each append selects disjoint host-mutated pass storage. A TA dependency
     /// retains full fragment-to-next-TA ordering for arbitrary resource hazards.
     pub(crate) fn append(&mut self,r:g17_uapi::UapiRenderCommand,usc:u64)->Result {
-        if self.batch_count>=pass_layout::SLOTS || self.draw>=0x003e_ffff {
-            pr_err!("M3 render sequence limit: batch={} slots={} draw={} maximum={}\n",
-                self.batch_count,pass_layout::SLOTS,self.draw,0x003e_ffffu32);
+        if self.batch_count>=pass_layout::SLOTS {
+            pr_err!("M3 render batch limit: batch={} slots={}\n",
+                self.batch_count,pass_layout::SLOTS);
             return Err(E2BIG);
         }
         self.slot=self.batch_count;
@@ -458,12 +460,12 @@ impl Render {
         // notification state and previous stamps retain firmware ownership.
         self.passes[self.slot].reset(&Self::geometry(r)?)?;
         self.init_bm.fill(0)?; // retain the prior shared InitBM reset before encoding
-        self.draw+=1;
+        self.draw=self.draw.checked_add(1).ok_or(EOVERFLOW)?;
         self.batch_count+=1;
         let draw=self.draw;
-        self.objects[s::BM_COUNTER].u32(0,draw)?;
-        self.objects[s::EVENT_COUNT].u32(0,draw*2)?;
-        let entry_offset = (self.draw % MANAGER_SCENE_COUNT) as usize * 4;
+        self.objects[s::BM_COUNTER].u32(0,draw as u32)?;
+        self.objects[s::EVENT_COUNT].u32(0,timeline::events(draw,2))?;
+        let entry_offset = (self.draw % u64::from(MANAGER_SCENE_COUNT)) as usize * 4;
         let scene_list = &mut self.objects[s::BM_SCENES];
         if entry_offset + 4 > scene_list.size() { return Err(ERANGE); }
         let manager_entry = queue::FirmwareVa::new(scene_list.va().checked_add(entry_offset as u64)
@@ -526,8 +528,8 @@ impl Render {
     }
     pub(crate) fn queues(&self)->[u64;2] {[self.objects[s::TA_QUEUE].va(),self.objects[s::FRAGMENT_QUEUE].va()]}
     pub(crate) fn complete(&mut self)->Result<bool> {
-        for (stamp,fw,pointers,value,head) in [(s::TA_STAMP,s::TA_FW_STAMP,s::TA_POINTERS,s::STAMP_TA-256+self.draw*256,self.heads[0]),
-            (s::FRAGMENT_STAMP,s::FRAGMENT_FW_STAMP,s::FRAGMENT_POINTERS,s::STAMP_FRAGMENT-256+self.draw*256,self.heads[1])] {
+        for (stamp,fw,pointers,value,head) in [(s::TA_STAMP,s::TA_FW_STAMP,s::TA_POINTERS,timeline::stamp(s::STAMP_TA - 256, self.draw),self.heads[0]),
+            (s::FRAGMENT_STAMP,s::FRAGMENT_FW_STAMP,s::FRAGMENT_POINTERS,timeline::stamp(s::STAMP_FRAGMENT - 256, self.draw),self.heads[1])] {
             if self.objects[stamp].read_u32(0)?!=value || self.objects[fw].read_u32(0)?!=value
                 || self.objects[pointers].read_u32(queue::DONE)?!=u32::from(head)
                 || self.objects[pointers].read_u32(queue::READ)?!=u32::from(head) {return Ok(false);}
