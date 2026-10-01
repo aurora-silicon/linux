@@ -2,6 +2,7 @@ config TYPEC_TPS6598X_CORE
 	tristate
 	select USB_ROLE_SWITCH
 	select POWER_SUPPLY
+	select USB_COMMON if DEBUG_FS
 
 config TYPEC_TPS6598X
 	tristate "TI TPS6598x USB Power Delivery controller driver"

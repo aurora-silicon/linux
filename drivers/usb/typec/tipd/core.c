@@ -92,10 +92,6 @@ struct tps6598x_rx_identity_reg {
 	struct usb_pd_identity identity;
 } __packed;
 
-/* Standard Task return codes */
-#define TPS_TASK_TIMEOUT		1
-#define TPS_TASK_REJECTED		3
-
 /* Debounce delay for mode changes, in milliseconds */
 #define CD321X_DEBOUNCE_DELAY_MS 500
 
@@ -105,6 +101,7 @@ enum {
 	TPS_MODE_BIST,
 	TPS_MODE_DISC,
 	TPS_MODE_PTCH,
+	TPS_MODE_DBMA,
 };
 
 static const char *const modes[] = {
@@ -113,6 +110,7 @@ static const char *const modes[] = {
 	[TPS_MODE_BIST]	= "BIST",
 	[TPS_MODE_DISC]	= "DISC",
 	[TPS_MODE_PTCH] = "PTCH",
+	[TPS_MODE_DBMA] = "DBMa",
 };
 
 /* Unrecognized commands will be replaced with "!CMD" */
@@ -125,14 +123,7 @@ static enum power_supply_property tps6598x_psy_props[] = {
 
 static const char *tps6598x_psy_name_prefix = "tps6598x-source-psy-";
 
-/*
- * Max data bytes for Data1, Data2, and other registers. See ch 1.3.2:
- * https://www.ti.com/lit/ug/slvuan1a/slvuan1a.pdf
- */
-#define TPS_MAX_LEN	64
-
-static int
-tps6598x_block_read(struct tps6598x *tps, u8 reg, void *val, size_t len)
+int tps6598x_block_read(struct tps6598x *tps, u8 reg, void *val, size_t len)
 {
 	u8 data[TPS_MAX_LEN + 1];
 	int ret;
@@ -298,10 +289,10 @@ static void tps6598x_disconnect(struct tps6598x *tps, u32 status)
 	power_supply_changed(tps->psy);
 }
 
-static int tps6598x_exec_cmd_tmo(struct tps6598x *tps, const char *cmd,
-			     size_t in_len, const u8 *in_data,
-			     size_t out_len, u8 *out_data,
-			     u32 cmd_timeout_ms, u32 res_delay_ms)
+int tps6598x_exec_cmd_tmo(struct tps6598x *tps, const char *cmd,
+			  size_t in_len, const u8 *in_data,
+			  size_t out_len, u8 *out_data,
+			  u32 cmd_timeout_ms, u32 res_delay_ms)
 {
 	unsigned long timeout;
 	u32 val;
@@ -1106,6 +1097,14 @@ static int tps6598x_check_mode(struct tps6598x *tps)
 	case TPS_MODE_BOOT:
 		dev_warn(tps->dev, "dead-battery condition\n");
 		return ret;
+	case TPS_MODE_DBMA:
+		/*
+		 * Apple firmware only: the application firmware runs in its
+		 * debug mode (entered with LOCK + "DBMa"), in which it still
+		 * handles the port and additionally accepts VDMs/DVEn. A boot
+		 * loader arming Apple Debug USB on this port leaves it here.
+		 */
+		return ret;
 	case TPS_MODE_BIST:
 	case TPS_MODE_DISC:
 	default:
@@ -1844,6 +1843,17 @@ int tipd_init(struct tps6598x *tps)
 			return ret;
 	}
 
+	/*
+	 * A controller found in "DBMa" is used as it is. Nothing below issues a
+	 * 4CC command (the S0 power state switch above only does if the
+	 * controller is not in S0 already), so probing neither leaves the debug
+	 * mode nor disturbs a Debug USB or serial route set up before Linux.
+	 * Remember it, so that the debugfs interface never tears that mode down.
+	 */
+	tps->dbma_at_probe = ret == TPS_MODE_DBMA;
+	if (tps->dbma_at_probe)
+		dev_info(tps->dev, "controller in debug mode \"DBMa\", leaving it there\n");
+
 	ret = tps6598x_write64(tps, TPS_REG_INT_MASK1, tps->data->irq_mask1);
 	if (ret)
 		goto err_reset_controller;
@@ -1912,6 +1922,8 @@ int tipd_init(struct tps6598x *tps)
 		enable_irq_wake(tps->irq);
 	}
 
+	tipd_debugfs_register(tps);
+
 	return 0;
 
 err_disconnect:
@@ -1934,6 +1946,8 @@ EXPORT_SYMBOL_GPL(tipd_init);
 
 void tipd_remove(struct tps6598x *tps)
 {
+	tipd_debugfs_unregister(tps);
+
 	if (!tps->irq)
 		cancel_delayed_work_sync(&tps->wq_poll);
 	else
@@ -2077,6 +2091,12 @@ const struct tipd_data tipd_sn201202x_data = {
 	.connect = cd321x_connect,
 };
 EXPORT_SYMBOL_GPL(tipd_sn201202x_data);
+
+static void __exit tipd_core_exit(void)
+{
+	tipd_debugfs_exit();
+}
+module_exit(tipd_core_exit);
 
 MODULE_AUTHOR("Heikki Krogerus <heikki.krogerus@linux.intel.com>");
 MODULE_LICENSE("GPL v2");

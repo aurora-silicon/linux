@@ -274,6 +274,16 @@
 #define TPS_65981_2_6_INTEVENT_LEN             8
 #define TPS_65987_8_INTEVENT_LEN               11
 
+/*
+ * Max data bytes for Data1, Data2, and other registers. See ch 1.3.2:
+ * https://www.ti.com/lit/ug/slvuan1a/slvuan1a.pdf
+ */
+#define TPS_MAX_LEN	64
+
+/* Standard Task return codes */
+#define TPS_TASK_TIMEOUT		1
+#define TPS_TASK_REJECTED		3
+
 struct tps6598x;
 
 struct tipd_data {
@@ -300,6 +310,7 @@ struct tps6598x {
 	struct mutex lock; /* device lock */
 	int irq;
 	u8 i2c_protocol:1;
+	u8 dbma_at_probe:1; /* Apple "DBMa" debug mode was active at probe */
 
 	struct gpio_desc *reset;
 	struct typec_port *port;
@@ -319,6 +330,8 @@ struct tps6598x {
 	struct delayed_work	wq_poll;
 
 	const struct tipd_data *data;
+
+	struct tipd_debugfs *debugfs;
 };
 
 /* TPS_REG_USB4_STATUS */
@@ -399,5 +412,22 @@ int tipd_init(struct tps6598x *tps);
 void tipd_remove(struct tps6598x *tps);
 int tipd_suspend(struct tps6598x *tps);
 int tipd_resume(struct tps6598x *tps);
+
+/* Internal to tps6598x-core */
+int tps6598x_block_read(struct tps6598x *tps, u8 reg, void *val, size_t len);
+int tps6598x_exec_cmd_tmo(struct tps6598x *tps, const char *cmd,
+			  size_t in_len, const u8 *in_data,
+			  size_t out_len, u8 *out_data,
+			  u32 cmd_timeout_ms, u32 res_delay_ms);
+
+#ifdef CONFIG_DEBUG_FS
+void tipd_debugfs_register(struct tps6598x *tps);
+void tipd_debugfs_unregister(struct tps6598x *tps);
+void tipd_debugfs_exit(void);
+#else
+static inline void tipd_debugfs_register(struct tps6598x *tps) { }
+static inline void tipd_debugfs_unregister(struct tps6598x *tps) { }
+static inline void tipd_debugfs_exit(void) { }
+#endif
 
 #endif /* __TPS6598X_H__ */
