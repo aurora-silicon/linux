@@ -137,17 +137,26 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 			writel_relaxed(mbox->hw->irq_bit_send_empty,
 				       mbox->regs + mbox->hw->irq_ack);
 		}
-		enable_irq(mbox->irq_send_empty);
 		reinit_completion(&mbox->tx_empty);
+		if (!mbox->tx_irq_unmasked) {
+			mbox->tx_irq_unmasked = true;
+			enable_irq(mbox->irq_send_empty);
+		}
 		spin_unlock_irqrestore(&mbox->tx_lock, flags);
 
 		t = wait_for_completion_interruptible_timeout(
 			&mbox->tx_empty,
 			msecs_to_jiffies(APPLE_MBOX_TX_TIMEOUT));
-		if (t < 0)
-			return t;
-		else if (t == 0)
-			return -ETIMEDOUT;
+		if (t <= 0) {
+			/* A late IRQ may already have masked this under tx_lock. */
+			spin_lock_irqsave(&mbox->tx_lock, flags);
+			if (mbox->tx_irq_unmasked) {
+				disable_irq_nosync(mbox->irq_send_empty);
+				mbox->tx_irq_unmasked = false;
+			}
+			spin_unlock_irqrestore(&mbox->tx_lock, flags);
+			return t < 0 ? t : -ETIMEDOUT;
+		}
 
 		spin_lock_irqsave(&mbox->tx_lock, flags);
 		mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->a2i_control);
@@ -175,7 +184,10 @@ static irqreturn_t apple_mbox_send_empty_irq(int irq, void *data)
 	 * it at the main controller again.
 	 */
 	spin_lock(&mbox->tx_lock);
-	disable_irq_nosync(mbox->irq_send_empty);
+	if (mbox->tx_irq_unmasked) {
+		disable_irq_nosync(mbox->irq_send_empty);
+		mbox->tx_irq_unmasked = false;
+	}
 	complete(&mbox->tx_empty);
 	spin_unlock(&mbox->tx_lock);
 
@@ -186,8 +198,15 @@ static int apple_mbox_poll_locked(struct apple_mbox *mbox)
 {
 	struct apple_mbox_msg msg;
 	int ret = 0;
+	u32 mbox_ctrl;
 
-	u32 mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
+	/*
+	 * A detached receiver (RTKit teardown in progress) leaves firmware
+	 * traffic in the FIFO; it is drained again once a receiver is attached.
+	 */
+	if (!mbox->rx)
+		return 0;
+	mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
 
 	while (!(mbox_ctrl & mbox->hw->control_empty)) {
 		msg.msg0 = readq_relaxed(mbox->regs + mbox->hw->i2a_recv0);

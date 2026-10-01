@@ -34,6 +34,9 @@ struct apple_mbox {
 	/** Receive callback for incoming messages */
 	void (*rx)(struct apple_mbox *mbox, struct apple_mbox_msg msg, void *cookie);
 	void *cookie;
+
+	/* Protected by tx_lock; send-error and IRQ paths mask this only once. */
+	bool tx_irq_unmasked;
 };
 
 struct apple_mbox *apple_mbox_get(struct device *dev, int index);

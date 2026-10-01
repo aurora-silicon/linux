@@ -86,6 +86,14 @@ properties:
 
   dma-coherent: true
 
+  apple,pciec-kernel-init:
+    type: boolean
+    description:
+      PCIe-C only. The operating system cold-initializes the port itself
+      when the USB4 PCIe tunnel comes up, instead of relying on the
+      bootloader to have done so. Set on machines where the bootloader
+      does not initialize PCIe-C.
+
 patternProperties:
   "^pci@":
     $ref: /schemas/pci/pci-bus.yaml#
@@ -195,6 +203,7 @@ allOf:
             - const: phy3
         ranges:
           maxItems: 2
+        apple,pciec-kernel-init: false
       patternProperties:
         "^pci@":
           required:

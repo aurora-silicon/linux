@@ -2370,7 +2370,8 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 
 	if (!phy || phy->ops != &apple_atc_dp_phy_ops ||
 	    (!of_machine_is_compatible("apple,j414s") &&
-	     !of_machine_is_compatible("apple,j416s")))
+	     !of_machine_is_compatible("apple,j416s") &&
+	     !of_machine_is_compatible("apple,j416c")))
 		return -EOPNOTSUPP;
 	atcphy = phy_get_drvdata(phy);
 	if (!of_device_is_compatible(atcphy->np, "apple,t6020-atcphy") ||
