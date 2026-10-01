@@ -2540,6 +2540,16 @@ static int atcphy_usb3_power_off(struct phy *phy)
 	atcphy_park_pipehandler(atcphy);
 	atcphy->host_active = false;
 
+	/*
+	 * dwc3 can tear its host down while a DisplayPort alt mode link is up,
+	 * e.g. when a monitor's built-in hub re-enumerates after a hot-plug.
+	 * Powering the PHY off then cuts the DP lanes under DCP, which reports a
+	 * DPTX FIFO error and drops the display. The Type-C mux turns the PHY off
+	 * when the alt mode actually ends, so leave a DP mode alone here.
+	 */
+	if (atcphy_modes[atcphy->mode].enable_dp_aux)
+		return 0;
+
 	if (atcphy->mode != APPLE_ATCPHY_MODE_OFF)
 		atcphy_configure(atcphy, APPLE_ATCPHY_MODE_OFF);
 
