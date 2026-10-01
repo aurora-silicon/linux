@@ -23,6 +23,9 @@ use kernel::{
 #[pin_data]
 pub(crate) struct EventWait {
     count: AtomicU64,
+    wait_us: AtomicU64,
+    sleeps: AtomicU64,
+    timer_wakes: AtomicU64,
     #[pin]
     arrived: Completion,
     #[pin]
@@ -34,6 +37,9 @@ impl EventWait {
         Arc::pin_init(
             pin_init!(EventWait {
                 count: AtomicU64::new(0),
+                wait_us: AtomicU64::new(100),
+                sleeps: AtomicU64::new(0),
+                timer_wakes: AtomicU64::new(0),
                 arrived <- Completion::new(),
                 timer <- HrTimer::new(),
             }),
@@ -46,8 +52,22 @@ impl EventWait {
         self.arrived.complete();
     }
 
+    /// Diagnostic tuning changes only the bounded resnapshot cadence, never
+    /// stamps, pipe retirement, event counts, fences or the two-second timeout.
+    /// Atomic publication permits root to compare policies in the same boot.
+    pub(crate) fn set_wait_us(&self, us: u64) -> Result {
+        if !(25..=1000).contains(&us) { return Err(EINVAL); }
+        self.wait_us.store(us, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(crate) fn snapshot(&self) -> (u64, u64, u64, u64) {
+        (self.wait_us.load(Ordering::Relaxed), self.count.load(Ordering::Acquire),
+         self.sleeps.load(Ordering::Relaxed), self.timer_wakes.load(Ordering::Relaxed))
+    }
+
     /// Sleep until a notification later than `seen` has been recorded or
-    /// 100 us elapse. A one-jiffy fallback alone takes up to 4 ms at HZ=250,
+    /// the selected 25..1000 us elapse (default 100 us). A one-jiffy fallback alone takes up to 4 ms at HZ=250,
     /// even when the GPU stamp arrives just after its notification. The timer
     /// adds a bounded resnapshot without replacing IRQ wakeups or busy-waiting.
     /// Only the single completion worker may call this method.
@@ -61,7 +81,9 @@ impl EventWait {
                 if self.count.load(Ordering::Acquire) != seen { return true; }
                 // The handle keeps EventWait alive and cancels synchronously
                 // on every return, before a subsequent wait can arm the timer.
-                let timer = self.clone().start(Delta::from_micros(100));
+                self.sleeps.fetch_add(1, Ordering::Relaxed);
+                let timer = self.clone().start(Delta::from_micros(
+                    self.wait_us.load(Ordering::Relaxed) as i64));
                 // Retain one tick as a backup bound; normally either the real
                 // interrupt or our high-resolution timer supplies the token.
                 self.arrived.wait_for_completion_timeout(1);
@@ -79,6 +101,7 @@ impl HrTimerCallback for EventWait {
 
     fn run(this: ArcBorrow<'_, Self>, _ctx: HrTimerCallbackContext<'_, Self>) -> HrTimerRestart {
         // Wake only: a timer expiry is not a firmware completion notification.
+        this.timer_wakes.fetch_add(1, Ordering::Relaxed);
         this.arrived.complete();
         HrTimerRestart::NoRestart
     }

@@ -398,7 +398,7 @@ impl Runtime {
                 // Four bounded 5us polls cover stamps written just after an
                 // event without paying a scheduler round-trip for each poll.
                 // fsleep uses udelay at <=10us. Longer waits still sleep until
-                // an IRQ or the 100us timer; retirement checks remain above.
+                // an IRQ or the bounded resnapshot timer; retirement checks remain above.
                 // Wait without the runtime lock, so that VM creation, timestamp
                 // mapping and the completion worker's event drain are not held
                 // up for the duration of a job.
@@ -412,6 +412,9 @@ impl Runtime {
             command_index+=batch_count;
         }
         Ok(())
+    }
+    pub(crate) fn completion_wait(&self) -> Arc<m3_rtkit::EventWait> {
+        self.inner.state.events.clone()
     }
     pub(crate) fn service_events(&mut self) {
         let inner=&mut *self.inner;
