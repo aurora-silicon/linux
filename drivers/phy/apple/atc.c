@@ -2678,10 +2678,9 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, u8 rate)
 		return -EINVAL;
 	atcphy = phy_get_drvdata(phy);
 	/* Keep each supported SoC on its qualified clock sequence. */
-	if (!of_machine_is_compatible("apple,t8103") &&
-	    !of_machine_is_compatible("apple,j416s"))
+	if (!of_machine_is_compatible("apple,t8103") && !apple_dp_tunnel_t602x())
 		return -EOPNOTSUPP;
-	if (of_machine_is_compatible("apple,j416s") &&
+	if (apple_dp_tunnel_t602x() &&
 	    (!of_device_is_compatible(atcphy->np, "apple,t6020-atcphy") ||
 	     !apple_atc_is_typec_core(atcphy->res.core->start) ||
 	     resource_size(atcphy->res.core) < 0x7048))

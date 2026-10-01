@@ -309,7 +309,7 @@ static int apple_dpin_set_active_t8103(struct apple_cio *acio, void __iomem *dpi
 static int apple_dpin_set_active(struct apple_cio *acio, void __iomem *regs,
 				 unsigned int idx, bool active)
 {
-	if (of_machine_is_compatible("apple,j416s"))
+	if (apple_dp_tunnel_t602x())
 		return apple_dpin_set_active_t602x(acio, regs, idx, active);
 	return apple_dpin_set_active_t8103(acio, regs, idx, active);
 }
@@ -1599,7 +1599,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	anhi->ops = apple_nhi_ops;
 	if (dp_display && acio->dp_wq && of_machine_is_compatible("apple,t8103"))
 		anhi->ops.dp_tunnel_changed = apple_nhi_dp_tunnel_changed;
-	if (acio->dp_wq && of_machine_is_compatible("apple,j416s")) {
+	if (acio->dp_wq && apple_dp_tunnel_t602x()) {
 		anhi->ops.dp_tunnel_pre_activate = apple_nhi_dp_tunnel_pre_activate;
 		anhi->ops.dp_tunnel_post_activate = apple_nhi_dp_tunnel_post_activate;
 		anhi->ops.dp_tunnel_deactivate = apple_nhi_dp_tunnel_deactivate;

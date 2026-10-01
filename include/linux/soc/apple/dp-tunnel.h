@@ -8,6 +8,7 @@
 #ifndef _LINUX_SOC_APPLE_DP_TUNNEL_H_
 #define _LINUX_SOC_APPLE_DP_TUNNEL_H_
 
+#include <linux/of.h>
 #include <linux/types.h>
 
 struct device_node;
@@ -39,5 +40,20 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, u8 rate);
  */
 int apple_dpxbar_link_down(struct mux_control *mux);
 int apple_dpxbar_link_up(struct mux_control *mux);
+
+/*
+ * The M2 Pro and M2 Max laptops. Their shared device tree routes the display
+ * crossbar to the Thunderbolt DP IN adapters, and they take the T602X tunnel
+ * path: DP IN handshake, tunnel pixel clock, and the longer link timeouts.
+ * The M2 Pro and M2 Max desktops have no such routes in their device tree.
+ */
+static inline bool apple_dp_tunnel_t602x(void)
+{
+	static const char *const machines[] = {
+		"apple,j414s", "apple,j414c", "apple,j416s", "apple,j416c", NULL,
+	};
+
+	return of_machine_compatible_match(machines);
+}
 
 #endif

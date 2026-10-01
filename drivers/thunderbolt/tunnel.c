@@ -14,6 +14,7 @@
 #include <linux/of.h>
 #include <linux/string.h>
 #include <linux/string_helpers.h>
+#include <linux/soc/apple/dp-tunnel.h>
 
 #include "tunnel.h"
 #include "tb.h"
@@ -104,7 +105,7 @@ MODULE_PARM_DESC(bw_alloc_mode,
 static bool dp_video_counter;
 module_param(dp_video_counter, bool, 0444);
 MODULE_PARM_DESC(dp_video_counter,
-		 "diagnostic: count packets on the DP video path's DP IN hop and its downstream (hub-side) hop (Apple j416s right ACIO route only; read via debugfs port counters); default: false");
+		 "diagnostic: count packets on the DP video path's DP IN hop and its downstream (hub-side) hop (Apple M2 Pro/Max laptop right ACIO route only; read via debugfs port counters); default: false");
 
 static void tb_dp_dump_apple(struct tb_tunnel *tunnel);
 static int tb_apple_nhi_typec_index(struct tb_nhi *nhi);
@@ -956,16 +957,17 @@ static int tb_dp_xchg_caps(struct tb_tunnel *tunnel)
 			     in->cap_adap + DP_REMOTE_CAP, 1);
 }
 
-/* Apple j416s right-hand ACIO DP IN adapter only; shared by the diagnostic
- * packet counter and the bandwidth-grant workaround below.
+/* Right-hand ACIO DP IN adapter of the Apple M2 Pro and M2 Max laptops only;
+ * shared by the diagnostic packet counter and the bandwidth-grant workaround
+ * below.
  */
-static bool tb_dp_is_apple_j416s_right_dpin(const struct tb_port *in)
+static bool tb_dp_is_apple_t602x_right_dpin(const struct tb_port *in)
 {
 	if (!tb_port_is_dpin(in))
 		return false;
 	if (!in->sw->tb || !tb_nhi_is_apple(in->sw->tb->nhi))
 		return false;
-	if (!of_machine_is_compatible("apple,j416s"))
+	if (!apple_dp_tunnel_t602x())
 		return false;
 
 	/* Right-hand USB-C ports only ("f01f" NHI); see tb_apple_nhi_typec_index(). */
@@ -974,7 +976,7 @@ static bool tb_dp_is_apple_j416s_right_dpin(const struct tb_port *in)
 
 static bool tb_dp_apple_dpin_needs_bw_grant(const struct tb_port *in)
 {
-	return tb_dp_is_apple_j416s_right_dpin(in);
+	return tb_dp_is_apple_t602x_right_dpin(in);
 }
 
 static int tb_dp_bandwidth_alloc_mode_enable(struct tb_tunnel *tunnel)
@@ -1074,7 +1076,7 @@ static int tb_dp_bandwidth_alloc_mode_enable(struct tb_tunnel *tunnel)
 	/*
 	 * Initial allocation should be 0 according the spec, which relies
 	 * on the DP IN adapter later raising it via a bandwidth request
-	 * notification. The Apple j416s right-hand ACIO DP IN adapter has
+	 * notification. The Apple M2 Pro right-hand ACIO DP IN adapter has
 	 * never been observed to generate that notification: link training
 	 * and a full DCP frame complete with this field (DP_STATUS
 	 * allocated-bandwidth) still reading 0 and no picture.
@@ -1734,7 +1736,7 @@ static bool tb_dp_video_counter_wanted(const struct tb_path *path)
 	if (!dp_video_counter || !path->path_length)
 		return false;
 
-	return tb_dp_is_apple_j416s_right_dpin(path->hops[0].in_port);
+	return tb_dp_is_apple_t602x_right_dpin(path->hops[0].in_port);
 }
 
 static int tb_dp_init_video_path(struct tb_path *path, bool pm_support)

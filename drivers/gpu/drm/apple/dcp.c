@@ -660,8 +660,8 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
 		if (!dcp_typec_route_available(candidate))
 			continue;
 		score = dcp_typec_route_score(candidate);
-		/* j416s dcpext0 completes tunneled link training; prefer it. */
-		if (of_machine_is_compatible("apple,j416s") &&
+		/* dcpext0 completes tunneled link training here; prefer it. */
+		if (apple_dp_tunnel_t602x() &&
 		    !candidate->dcp->fixed_phy && score < UINT_MAX - 100)
 			score += 100;
 		if (score < best_score) {
@@ -1394,8 +1394,7 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 	}
 	dcp->dptxport[port].connected = true;
 	if (dcp_is_typec_output(dcp)) {
-		if (dcp_is_usb4_output(dcp) &&
-		    of_machine_is_compatible("apple,j416s"))
+		if (dcp_is_usb4_output(dcp) && apple_dp_tunnel_t602x())
 			ret = dptxport_set_hpd_timeout(dcp->dptxport[port].service,
 						       true, 8000);
 		else
@@ -1410,7 +1409,7 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 	}
 
 	mutex_unlock(&dcp->hpd_mutex);
-	timeout = dcp_is_usb4_output(dcp) && of_machine_is_compatible("apple,j416s") ?
+	timeout = dcp_is_usb4_output(dcp) && apple_dp_tunnel_t602x() ?
 		  DPTX_TUNNEL_CONNECT_TIMEOUT : DPTX_CONNECT_TIMEOUT;
 	ret = wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
 					  timeout);
@@ -1540,7 +1539,7 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 	}
 
 	if (++dcp->typec_reconnect_tries <
-	    (dcp_is_usb4_output(dcp) && of_machine_is_compatible("apple,j416s") ?
+	    (dcp_is_usb4_output(dcp) && apple_dp_tunnel_t602x() ?
 	     1 : DPTX_RECONNECT_RETRIES)) {
 		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq,
 				 DPTX_RECONNECT_DELAY);

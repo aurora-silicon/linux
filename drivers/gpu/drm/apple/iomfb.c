@@ -14,6 +14,7 @@
 #include <linux/of_device.h>
 #include <linux/ratelimit.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/rtkit.h>
 
 #include <drm/drm_atomic_helper.h>
@@ -302,7 +303,7 @@ void dcp_hotplug(struct work_struct *work)
 	 * flush, or the CRTC gets no signal.
 	 */
 	if (connector->base.state && !READ_ONCE(dcp->mode_state.valid) && connector->connected &&
-	    !(dcp_is_usb4_output(dcp) && of_machine_is_compatible("apple,j416s"))) {
+	    !(dcp_is_usb4_output(dcp) && apple_dp_tunnel_t602x())) {
 		drm_connector_set_link_status_property(&connector->base,
 						       DRM_MODE_LINK_STATUS_BAD);
 
