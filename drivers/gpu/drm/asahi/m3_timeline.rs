@@ -6,9 +6,13 @@
 //! its distance is well below the half-range. Keep the host command ordinal
 //! separately in u64 so stamp wrap never re-registers a queue or emits InitBM.
 
-/// Wire stamp after `ordinal` commands, starting from the retired seed.
+/// Nonzero wire stamp after `ordinal` commands, from the retired seed.
+/// As on the M4 runtime, do not publish zero as a completion stamp. The
+/// 24-bit stamp sequence skips zero; command ordinals/event counts do not.
 pub(crate) const fn stamp(seed: u32, ordinal: u64) -> u32 {
-    seed.wrapping_add((ordinal as u32).wrapping_mul(0x100))
+    const PERIOD: u64 = 0x00ff_ffff;
+    let unit = (((seed >> 8) as u64 - 1 + ordinal % PERIOD) % PERIOD) + 1;
+    (unit as u32) << 8
 }
 
 /// Firmware command count, before the command with this host ordinal.

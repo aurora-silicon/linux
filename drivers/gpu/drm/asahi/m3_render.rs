@@ -199,11 +199,11 @@ impl Render {
             uuid: 0x3d0000, dependency: sync::Dependency::TilerToFragment })?;
         self.write_barrier(P::TilerDependency, sync::Barrier {
             stamp: if early { ta_stamp } else { fs_stamp },
-            wait_value: if early { ta_value.wrapping_sub(256) } else { fs_value.wrapping_sub(256) },
+            wait_value: timeline::stamp((if early {s::STAMP_TA} else {s::STAMP_FRAGMENT}) - 256, draw - 1),
             event: u32::from(!early), self_value: ta_value,
             uuid: DEPENDENCY_UUID, dependency: sync::Dependency::PreviousPass })?;
         self.write_barrier(P::FragmentDependency, sync::Barrier {
-            stamp: fs_stamp, wait_value: fs_value.wrapping_sub(256), event: 1, self_value: fs_value,
+            stamp: fs_stamp, wait_value: timeline::stamp(s::STAMP_FRAGMENT - 256, draw - 1), event: 1, self_value: fs_value,
             uuid: DEPENDENCY_UUID, dependency: sync::Dependency::PreviousPass })
     }
     // Prepare each private command after its retired slot is reset. The
