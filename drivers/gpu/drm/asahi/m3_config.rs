@@ -284,6 +284,7 @@ impl Config {
                 let mut r = self.objects[state].read_u32(base)? as usize;
                 let w = self.objects[state].read_u32(base+0x20)? as usize;
                 if r >= count || w >= count { return Err(EIO); }
+                let previous_read = r;
                 while r != w {
                     if (state==storage::TRACE*2 && self.completed_events<4) || state==storage::FIRMWARE_LOG*2 {
                         let mut raw=[0u8;0xd8];
@@ -304,7 +305,9 @@ impl Config {
                     }
                     r = (r+1) % count;
                 }
-                self.objects[state].u32(base, r as u32)?;
+                // Publish actual consumption only, as RxChannel::get does.
+                // Empty polls need no write to firmware's shared state line.
+                if r != previous_read { self.objects[state].u32(base, r as u32)?; }
             }
         }
         Ok(())

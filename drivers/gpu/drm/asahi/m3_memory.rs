@@ -113,10 +113,12 @@ impl Buffer {
         Ok(())
     }
     pub(crate) fn u32(&mut self,offset:usize,value:u32)->Result {
-        if (self.offset+offset)&3!=0 || offset.checked_add(4).ok_or(EOVERFLOW)?>self.size {return Err(ERANGE);}
+        if offset.checked_add(4).ok_or(EOVERFLOW)?>self.size {return Err(ERANGE);}
+        let start=self.offset.checked_add(offset).ok_or(EOVERFLOW)?;
+        if start&3!=0 {return Err(ERANGE);}
         let ptr=self.cpu_ptr()?;
         // SAFETY: aligned, bounded WC GEM storage retained by this owner.
-        unsafe {ptr.add(self.offset+offset).cast::<u32>().write_volatile(value.to_le())};Ok(())
+        unsafe {ptr.add(start).cast::<u32>().write_volatile(value.to_le())};Ok(())
     }
     pub(crate) fn u64(&mut self,offset:usize,value:u64)->Result {self.write(offset,&value.to_le_bytes())}
     pub(crate) fn read(&mut self,offset:usize,data:&mut[u8])->Result {
@@ -129,13 +131,27 @@ impl Buffer {
         } Ok(())
     }
     pub(crate) fn read_u32(&mut self,offset:usize)->Result<u32> {
-        if (self.offset+offset)&3!=0 {let mut b=[0;4];self.read(offset,&mut b)?;return Ok(u32::from_le_bytes(b));}
-        if (self.offset+offset)&3!=0 || offset.checked_add(4).ok_or(EOVERFLOW)?>self.size {return Err(ERANGE);}
+        if offset.checked_add(4).ok_or(EOVERFLOW)?>self.size {return Err(ERANGE);}
+        let start=self.offset.checked_add(offset).ok_or(EOVERFLOW)?;
+        if start&3!=0 {let mut b=[0;4];self.read(offset,&mut b)?;return Ok(u32::from_le_bytes(b));}
         let ptr=self.cpu_ptr()?;
         // SAFETY: aligned, checked atomic producer/consumer word in WC RAM.
-        let value=unsafe {ptr.cast_const().add(self.offset+offset).cast::<u32>().read_volatile()};
+        let value=unsafe {ptr.cast_const().add(start).cast::<u32>().read_volatile()};
         unsafe {core::arch::asm!("dmb oshld",options(nostack,preserves_flags))};
         Ok(u32::from_le(value))
     }
-    pub(crate) fn read_u64(&mut self,offset:usize)->Result<u64> {let mut b=[0;8];self.read(offset,&mut b)?;Ok(u64::from_le_bytes(b))}
+    pub(crate) fn read_u64(&mut self,offset:usize)->Result<u64> {
+        if offset.checked_add(8).ok_or(EOVERFLOW)?>self.size {return Err(ERANGE);}
+        let start=self.offset.checked_add(offset).ok_or(EOVERFLOW)?;
+        // Packed firmware records also contain unaligned u64 fields. Retain
+        // their byte-wise access rather than issuing an unaligned word load.
+        if start&7!=0 {let mut b=[0;8];self.read(offset,&mut b)?;return Ok(u64::from_le_bytes(b));}
+        let ptr=self.cpu_ptr()?;
+        // SAFETY: retained page-aligned coherent/WC backing, checked aligned
+        // eight-byte span. One volatile word load avoids eight separate reads
+        // and byte-wise tearing of an aligned firmware timestamp/counter.
+        let value=unsafe {ptr.cast_const().add(start).cast::<u64>().read_volatile()};
+        unsafe {core::arch::asm!("dmb oshld",options(nostack,preserves_flags))};
+        Ok(u64::from_le(value))
+    }
 }
