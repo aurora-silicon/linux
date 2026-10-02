@@ -216,6 +216,13 @@ static void ane_tm_push_tq(struct ane_device *ane, struct ane_request *req)
 	tm_write32(ane, TM_PUSH, TQ_PRTY_TABLE[qid] | (qid & 7) << 8); // magic
 }
 
+/*
+ * Last raw TM tick read from TM_IRQ_TMST in the latest event drain.
+ * Diagnostic only (unit unknown; the timeline file labels it as a
+ * raw tick); unsynchronized by design.
+ */
+u32 ane_last_tmst;
+
 static int ane_tm_collect_events(struct ane_device *ane,
 				 struct ane_request *req, u32 *finished)
 {
@@ -228,7 +235,7 @@ static int ane_tm_collect_events(struct ane_device *ane,
 			u32 info = tm_read32(ane, TM_IRQ_INFO(line));
 
 			tm_read32(ane, TM_IRQ_UNK1(line));
-			tm_read32(ane, TM_IRQ_TMST(line));
+			ane_last_tmst = tm_read32(ane, TM_IRQ_TMST(line));
 			tm_read32(ane, TM_IRQ_UNK2(line));
 			if (req && info == (0x05000000 | (req->nid << 16) |
 					    (req->td_count - 1)))

@@ -17,4 +17,7 @@ int ane_tm_recover(struct ane_device *ane);
 #define ANE_PS_ALL_ON		  ((1U << (4 * 6)) - 1)
 u32 ane_tm_ps_act(struct ane_device *ane);
 
+/* Last raw TM tick captured by ane_tm_collect_events (diagnostic). */
+extern u32 ane_last_tmst;
+
 #endif /* __ANE_TM_H__ */

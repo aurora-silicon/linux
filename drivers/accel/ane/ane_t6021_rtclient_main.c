@@ -87,6 +87,7 @@
 #include <linux/workqueue.h>
 
 #include <drm/drm_accel.h>
+#include <drm/drm_debugfs.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
@@ -95,6 +96,7 @@
 #include <drm/drm_mm.h>
 #include <crypto/sha2.h>
 
+#include "ane_stats.h"
 #include "ane_t6021.h"
 #include "ane_t6021_boot.h"
 
@@ -177,6 +179,17 @@ module_param(hello_wait_ms, uint, 0444);
 MODULE_PARM_DESC(hello_wait_ms,
 		 "RTKit HELLO wait in legacy mode; 0 (default) skips RTKit and leaves the mailbox stopped. A firmware that speaks RTKit needs 1000.");
 
+/*
+ * Producer-side stats (ane_stats sysfs, ane_timeline debugfs), read
+ * once at probe. stats=0 keeps the hot path at its single predictable
+ * branch (the NULL stats_slots check) and no files are created. Same
+ * name and meaning as ane.ko's parameter.
+ */
+static bool stats = true;
+module_param(stats, bool, 0444);
+MODULE_PARM_DESC(stats,
+		 "Expose ane_stats sysfs and ane_timeline debugfs (default 1; 0 = no files and the hot path skips the counters)");
+
 #define ANE_LEGACY_ALLOCS 8192
 #define ANE_LEGACY_BYTES SZ_512M
 
@@ -222,6 +235,15 @@ struct ane_rtclient {
 	 * which the firmware may reference forever (held until reboot).
 	 */
 	struct ane_legacy_buffer *cmd_buf;
+
+	/*
+	 * Producer-side stats (see ane_stats.h). stats=0 or a failed
+	 * ring allocation leaves stats_slots NULL, which is the one
+	 * hot-path gate: no files, no counter updates.
+	 */
+	struct ane_stats_counters stats_ctrs;
+	struct ane_stats_ring stats_ring;
+	struct ane_stats_ring_entry *stats_slots;
 };
 
 /* Per-open BO ownership (drm_file->driver_priv). Handles live in the
@@ -889,6 +911,8 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 						     unsigned int timeout_ms)
 {
 	int ret;
+	u64 stats_ticket = 0;
+	u64 stats_submit_ns = 0;
 
 	ane_t6021_tracing = opcode == CSNE_CMD_PROCEDURE_CALL && trace_td &&
 			    ane->soc->trace_td_off;
@@ -896,10 +920,38 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 		ane_t6021_trace->calls++;
 		ane_t6021_trace_add(ANE_TR_CALL, 0);
 	}
+	/* Producer contract hot path (ane_stats.h): record submit at
+	 * command enqueue, completion after the call returns, one
+	 * begin/complete pair per engine submission. Only
+	 * CSNE_CMD_PROCEDURE_CALL is engine work; the control-plane
+	 * exchanges that ride this function (LOAD_PROGRAM,
+	 * CREATE_PROCESS, CH_PROPERTY_WRITE, CONFIG_GET) are not
+	 * counted, so jobs matches the engine calls the workload made.
+	 * The T6021 path can run concurrently (MBI per-channel rings),
+	 * so overlapping calls share a busy period and busy_ns is the
+	 * union of the submit-to-completion windows. tmst is 0 (no
+	 * host TM on T6021; documented in the file header line).
+	 * tasks = 1 (one call per submission); rc = ret. The gate is the
+	 * ring, as on ane.ko: stats=0 or a failed probe allocation leaves
+	 * stats_slots NULL, and the hooks must not run on a NULL ring.
+	 */
+	bool stats_call = ane->stats_slots &&
+			  opcode == CSNE_CMD_PROCEDURE_CALL;
+
+	if (stats_call) {
+		stats_submit_ns = ktime_get_ns();
+		stats_ticket = ane_stats_begin(&ane->stats_ctrs,
+					       &ane->stats_ring,
+					       stats_submit_ns, 1);
+	}
 	ret = ane_rtclient_legacy_exchange(ane, command, length, opcode,
 					   channel, timeout_ms);
 	if (ret) {
 		ane_t6021_tracing = false;
+		if (stats_call)
+			ane_stats_complete(&ane->stats_ctrs,
+					   &ane->stats_ring, stats_ticket,
+					   ktime_get_ns(), (u32)ret, 0);
 		dev_info(ane->dev, "EXCH op=%#x failed %d (fw allocs %u, %zu bytes)\n",
 			 opcode, ret, ane->legacy_allocated, ane->legacy_bytes);
 		atomic_set(&ane_t6021_quarantined, 1);
@@ -913,12 +965,21 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 		if (!ret && call_settle_us)
 			usleep_range(call_settle_us, call_settle_us + 100);
 		if (ret) {
+			if (stats_call)
+				ane_stats_complete(&ane->stats_ctrs,
+						   &ane->stats_ring,
+						   stats_ticket,
+						   ktime_get_ns(),
+						   (u32)ret, 0);
 			dev_info(ane->dev, "call completion wait failed %d\n",
 				 ret);
 			atomic_set(&ane_t6021_quarantined, 1);
 			return ret;
 		}
 	}
+	if (stats_call)
+		ane_stats_complete(&ane->stats_ctrs, &ane->stats_ring,
+				   stats_ticket, ktime_get_ns(), 0, 0);
 	/* The fw talks back on the target-to-host rings (fwlog, perf);
 	 * hand those slots back so the rings never fill (the sequencer
 	 * did this per step; same ack, channels 4 and 6).
@@ -2304,6 +2365,25 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 		return -EPROTO;
 	}
 
+	/* Producer-side stats: preallocate the ring at probe; the files
+	 * and the hot-path branch key off stats_slots.
+	 */
+	if (stats) {
+		ane->stats_slots = devm_kcalloc(dev,
+						1u << ANE_STATS_RING_ORDER_DEFAULT,
+						sizeof(*ane->stats_slots),
+						GFP_KERNEL);
+		if (ane->stats_slots) {
+			ane_stats_counters_init(&ane->stats_ctrs,
+						&ane->stats_ring,
+						ANE_STATS_RING_ORDER_DEFAULT);
+			ane->stats_ring.slots = ane->stats_slots;
+		} else {
+			dev_warn(dev,
+				 "ane_stats ring allocation failed; stats disabled\n");
+		}
+	}
+
 	{
 		struct ane_t6021_drm *adrm;
 		int drmret;
@@ -2320,6 +2400,10 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 		}
 		adrm->dev = dev;
 		adrm->ane = ane;
+		if (ane->stats_slots)
+			drm_debugfs_add_file(&adrm->drm, "ane_timeline",
+					     ane_timeline_show,
+					     &ane->stats_ring);
 		WRITE_ONCE(ane_t6021_perf_ane, ane);
 		drmret = drm_dev_register(&adrm->drm, 0);
 		if (drmret) {
@@ -2372,10 +2456,51 @@ static const struct of_device_id ane_rtclient_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, ane_rtclient_of_match);
 
+/*
+ * ane_stats: cumulative busy_ns/jobs for this device (mode 0444, no
+ * root needed). Formatting lives in ane_stats_emit() (ane_stats.h),
+ * shared with ane.ko.
+ */
+static ssize_t ane_stats_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct ane_rtclient *ane = dev_get_drvdata(dev);
+
+	return ane_stats_emit(buf, &ane->stats_ctrs);
+}
+static DEVICE_ATTR_RO(ane_stats);
+
+static struct attribute *ane_t6021_stats_attrs[] = {
+	&dev_attr_ane_stats.attr,
+	NULL,
+};
+
+/* ane_stats appears only when stats=1 gave the device a ring. */
+static umode_t ane_t6021_stats_is_visible(struct kobject *kobj,
+					  struct attribute *attr, int n)
+{
+	struct ane_rtclient *ane = dev_get_drvdata(kobj_to_dev(kobj));
+
+	if (attr == &dev_attr_ane_stats.attr && !ane->stats_slots)
+		return 0;
+	return attr->mode;
+}
+
+static const struct attribute_group ane_t6021_stats_group = {
+	.attrs = ane_t6021_stats_attrs,
+	.is_visible = ane_t6021_stats_is_visible,
+};
+
+static const struct attribute_group *ane_t6021_stats_groups[] = {
+	&ane_t6021_stats_group,
+	NULL,
+};
+
 static struct platform_driver ane_rtclient_driver = {
 	.driver = {
 		.name = "ane_t6021",
 		.of_match_table = ane_rtclient_of_match,
+		.dev_groups = ane_t6021_stats_groups,
 		.suppress_bind_attrs = true,
 	},
 	.probe = ane_rtclient_probe,

@@ -7903,6 +7903,7 @@ M:	Joshua Warren <816217+joshuaswarren@users.noreply.github.com>
 L:	asahi@lists.linux.dev
 L:	dri-devel@lists.freedesktop.org
 S:	Maintained
+F:	Documentation/ABI/testing/sysfs-class-accel-ane
 F:	Documentation/devicetree/bindings/npu/apple,ane.yaml
 F:	drivers/accel/ane/
 F:	include/uapi/drm/ane_accel.h

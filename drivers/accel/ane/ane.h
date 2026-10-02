@@ -15,6 +15,8 @@
 
 #include <drm/ane_accel.h>
 
+#include "ane_stats.h"
+
 struct ane_device {
 	struct drm_device drm;
 	struct device *dev;
@@ -112,6 +114,16 @@ struct ane_device {
 		bool busy;
 		bool on;
 	} boost;
+
+	/*
+	 * Producer-side stats (sysfs ane_stats, debugfs ane_timeline;
+	 * see ane_stats.h). stats=0 or a failed ring allocation leaves
+	 * stats_slots NULL, which is the one hot-path gate: no files,
+	 * no counter updates.
+	 */
+	struct ane_stats_counters stats_ctrs;
+	struct ane_stats_ring stats_ring;
+	struct ane_stats_ring_entry *stats_slots;
 };
 
 struct ane_request {

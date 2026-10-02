@@ -2,7 +2,9 @@
 /* Copyright 2022 Eileen Yoon <eyn@gmx.com> */
 
 #include <linux/atomic.h>
+#include <linux/device.h>
 #include <linux/iommu.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
@@ -11,6 +13,7 @@
 #include <linux/sysfs.h>
 
 #include <drm/drm_accel.h>
+#include <drm/drm_debugfs.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_ioctl.h>
@@ -52,6 +55,16 @@ static int map_mode = 3;
 module_param(map_mode, int, 0644);
 MODULE_PARM_DESC(map_mode,
 		 "BO mapping: bit0=IOMMU_CACHE DART descriptors, bit1=cacheable CPU vmas (default 3 = cached; 0 = writecombine + non-cacheable rollback)");
+
+/*
+ * Producer-side stats (ane_stats sysfs, ane_timeline debugfs), read
+ * once at probe. stats=0 keeps the hot path at its single predictable
+ * branch (the NULL stats_slots check) and no files are created.
+ */
+static bool stats = true;
+module_param(stats, bool, 0444);
+MODULE_PARM_DESC(stats,
+		 "Expose ane_stats sysfs and ane_timeline debugfs (default 1; 0 = no files and the hot path skips the counters)");
 
 #define CMD_BUF_BDX 0
 #define KRN_BUF_BDX 1
@@ -480,6 +493,7 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 	struct drm_gem_object *btsp = NULL;
 	struct ane_bo *bo;
 	struct ane_request req;
+	u64 stats_idx = 0;
 	int err;
 
 	memset(&req, 0, sizeof(req));
@@ -561,9 +575,18 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 	if (err < 0)
 		goto unlock;
 
+	if (ane->stats_slots)
+		stats_idx = ane_stats_begin(&ane->stats_ctrs, &ane->stats_ring,
+					    ktime_get_ns(), req.td_count);
+
 	ane_boost_begin(ane);
 	err = ane_tm_execute(ane, &req);
 	ane_boost_end(ane);
+
+	if (ane->stats_slots)
+		ane_stats_complete(&ane->stats_ctrs, &ane->stats_ring,
+				   stats_idx, ktime_get_ns(),
+				   err ? (u32)err : 0, ane_last_tmst);
 
 unlock:
 	mutex_unlock(&ane->engine_lock);
@@ -611,12 +634,47 @@ static ssize_t reset_store(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_WO(reset);
 
+/*
+ * ane_stats: cumulative busy_ns/jobs for this device (mode 0444, no
+ * root needed). Formatting lives in ane_stats_emit() (ane_stats.h),
+ * shared with ane_t6021.ko.
+ */
+static ssize_t ane_stats_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct ane_device *ane = dev_get_drvdata(dev);
+
+	return ane_stats_emit(buf, &ane->stats_ctrs);
+}
+static DEVICE_ATTR_RO(ane_stats);
+
 static struct attribute *ane_dev_attrs[] = {
 	&dev_attr_wedged.attr,
 	&dev_attr_reset.attr,
+	&dev_attr_ane_stats.attr,
 	NULL,
 };
-ATTRIBUTE_GROUPS(ane_dev);
+
+/* ane_stats appears only when stats=1 gave the device a ring. */
+static umode_t ane_dev_attr_is_visible(struct kobject *kobj,
+				       struct attribute *attr, int n)
+{
+	struct ane_device *ane = dev_get_drvdata(kobj_to_dev(kobj));
+
+	if (attr == &dev_attr_ane_stats.attr && !ane->stats_slots)
+		return 0;
+	return attr->mode;
+}
+
+static const struct attribute_group ane_dev_group = {
+	.attrs = ane_dev_attrs,
+	.is_visible = ane_dev_attr_is_visible,
+};
+
+static const struct attribute_group *ane_dev_groups[] = {
+	&ane_dev_group,
+	NULL,
+};
 
 static int ane_drm_open(struct drm_device *drm, struct drm_file *file)
 {
@@ -964,6 +1022,25 @@ static int ane_platform_probe(struct platform_device *pdev)
 	atomic_set(&ane->wedged, 0);
 	ane->tm_retention = soc->tm_retention;
 
+	/* Producer-side stats: preallocate the ring at probe; the files
+	 * and the hot-path branch key off stats_slots.
+	 */
+	if (stats) {
+		ane->stats_slots = devm_kcalloc(dev,
+						1u << ANE_STATS_RING_ORDER_DEFAULT,
+						sizeof(*ane->stats_slots),
+						GFP_KERNEL);
+		if (ane->stats_slots) {
+			ane_stats_counters_init(&ane->stats_ctrs,
+						&ane->stats_ring,
+						ANE_STATS_RING_ORDER_DEFAULT);
+			ane->stats_ring.slots = ane->stats_slots;
+		} else {
+			dev_warn(dev,
+				 "ane_stats ring allocation failed; stats disabled\n");
+		}
+	}
+
 	/* Managed power first: genpd links hold the ANE/DART supplier
 	 * topology awake before any register is touched.
 	 */
@@ -1039,6 +1116,11 @@ static int ane_platform_probe(struct platform_device *pdev)
 	err = ane_dart_init(ane);
 	if (err < 0)
 		goto put_pm;
+
+	if (ane->stats_slots)
+		drm_debugfs_add_file(drm, "ane_timeline",
+				     ane_timeline_show,
+				     &ane->stats_ring);
 
 	err = drm_dev_register(drm, 0);
 	if (err < 0)
