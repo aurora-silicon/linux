@@ -149,12 +149,6 @@ module_param(boot_prevent_nap, bool, 0444);
 MODULE_PARM_DESC(boot_prevent_nap,
 		 "Retain firmware nap-prevention counter via init resource bit (default on: proven add-path value)");
 
-/* This object links into both ane_t6021.ko and ane_t6021_rtclient.ko;
- * per-object metadata keeps modpost happy for either composition.
- */
-MODULE_LICENSE("Dual MIT/GPL");
-MODULE_DESCRIPTION("T6021 ANE contract-pinned boot sequence core");
-
 /* Boot-write gates — ITEMIZED, each a HARD gate: the ENTIRE write
  * sequence (preboot engine table, scratch clear + pulse, RVBAR
  * resolution, CPU release, publication, wake) runs start-to-finish
