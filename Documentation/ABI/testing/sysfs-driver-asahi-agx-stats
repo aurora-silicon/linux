@@ -1,0 +1,56 @@
+What:		/sys/class/drm/card*/device/agx_stats
+Date:		October 2026
+Contact:	Asahi Linux GPU driver maintainers
+Description:
+		Read-only dump of the AGX firmware statistics decoded by the
+		drm/asahi driver. The driver already polls the firmware statistics
+		ring (see `drivers/gpu/drm/asahi/channel.rs::StatsChannel::poll`,
+		`drivers/gpu/drm/asahi/fw/channels.rs::StatsMsg`) and exposes the
+		latest values via this file.
+
+		The file is owned by the platform device
+		`/sys/devices/platform/<...>.gpu/`, which is symlinked from the
+		`device` entry of the matching DRM card under `/sys/class/drm/`.
+
+		One `key value` pair per line. Lines are ASCII integer values
+		unless noted. Unknown keys may be appended in future firmware
+		versions and must be ignored by readers.
+
+		Module parameter `asahi.stats_export` (default 1) controls
+		whether the driver retains the values. When 0, the file shows
+		`unsupported` (the firmware messages are still polled but
+		discarded).
+
+		Access: Read-only. Owner-readable (mode 0444).
+
+		busy_ns    cumulative u64; nanoseconds the firmware has reported
+		           itself busy since boot. Saturates at u64::MAX.
+		           Derived from successive FwBusy timestamps; on T6001
+		           (M1 Max, 13.5) the firmware timestamp unit is
+		           nanoseconds. Validated against a controlled MLX
+		           matmul loop (idle: flat; full load: >50% util1).
+
+		jobs       u64; cumulative completed submissions since boot.
+		           Starts at 0; reserved for the submission-completion
+		           landing. On T6001 firmware the firmware does not currently
+		           emit a dedicated job counter message, so this stays 0.
+
+		pstate     u32; current performance state index (PowerState.pstate).
+
+		power_mw   u32; latest average power reading in milliwatts
+		           (AvgPower.avg_power). May be 0 if the firmware has not
+		           yet reported AvgPower.
+
+		util1..util4   u32; raw `Utilization` fields from the firmware,
+		           unscaled. Semantics (firmware tick vs % vs MHz) are
+		           validated against a controlled MLX load and may
+		           differ per SoC revision. Treat as raw until a per-chip
+		           doc note lands.
+
+		temperature_raw, temperature_scale, temperature_tmin,
+		temperature_tmax    u32; latest Temperature sample and scale (or
+		           0 if Temperature has not yet arrived).
+
+		Field meanings (units, window, saturation) are documented in
+		`drivers/gpu/drm/asahi/stats.rs` and may evolve with firmware
+		revisions.
