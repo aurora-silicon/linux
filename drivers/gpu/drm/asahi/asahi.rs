@@ -26,6 +26,8 @@ mod pgtable;
 mod queue;
 mod regs;
 mod slotalloc;
+mod stats;
+mod sysfs_exports;
 mod util;
 #[cfg(CONFIG_DRM_ASAHI_MAPLE_TREE)]
 mod vm;
@@ -56,6 +58,11 @@ kernel::module_platform_driver! {
             default: 0,
             // permissions: 0o644,
             description: "Fully isolate GPU contexts (limits performance)",
+        },
+        stats_export: u8 {
+            default: 1,
+            // permissions: 0,
+            description: "Export AGX firmware stats to sysfs (1 = on, 0 = off)",
         },
     },
 }
