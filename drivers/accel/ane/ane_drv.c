@@ -92,7 +92,7 @@ static int ane_iommu_map_pages(struct ane_device *ane, struct ane_bo *bo)
 	if (bo->mm)
 		return -EBUSY;
 
-	bo->mm = kzalloc(sizeof(*bo->mm), GFP_KERNEL);
+	bo->mm = kzalloc_obj(*bo->mm);
 	if (!bo->mm)
 		return -ENOMEM;
 
@@ -227,7 +227,7 @@ static void ane_preserve_bo(struct ane_device *ane, struct ane_bo *bo)
 {
 	struct ane_preserved *p;
 
-	p = kzalloc(sizeof(*p), GFP_KERNEL);
+	p = kzalloc_obj(*p);
 	if (!p) {
 		/* Fail closed the old way: the node stays inserted and the
 		 * pages leak until reboot - safe, just unreclaimable.
@@ -380,7 +380,7 @@ static int ane_bo_init(struct drm_device *drm, void *data,
 	if (args->pad || !args->size)
 		return -EINVAL;
 
-	bo = kzalloc(sizeof(struct ane_bo), GFP_KERNEL);
+	bo = kzalloc_obj(*bo);
 	if (!bo)
 		return -ENOMEM;
 	INIT_LIST_HEAD(&bo->node);

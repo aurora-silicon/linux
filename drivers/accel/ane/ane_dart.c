@@ -206,7 +206,7 @@ int ane_dart_drain_fault(struct ane_device *ane, u64 fault_iova,
 		return -ENOMEM;
 	iova = fault_iova & ~((1ULL << ane->shift) - 1);
 
-	node = kzalloc(sizeof(*node), GFP_KERNEL);
+	node = kzalloc_obj(*node);
 	if (!node) {
 		__free_page(page);
 		return -ENOMEM;

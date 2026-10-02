@@ -1402,7 +1402,7 @@ static int ane_t6021_bo_init_ioctl(struct drm_device *drm, void *data,
 		return -ENOSPC;
 	}
 	ane = to_ane_t6021_drm(drm)->ane;
-	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
+	bo = kzalloc_obj(*bo);
 	if (!bo) {
 		atomic64_sub(PAGE_ALIGN(args->size), &ane_t6021_bo_total_bytes);
 		return -ENOMEM;
@@ -1536,7 +1536,7 @@ static int ane_t6021_open(struct drm_device *drm, struct drm_file *file)
 {
 	struct ane_t6021_fd *fd;
 
-	fd = kzalloc(sizeof(*fd), GFP_KERNEL);
+	fd = kzalloc_obj(*fd);
 	if (!fd)
 		return -ENOMEM;
 	INIT_LIST_HEAD(&fd->bos);
@@ -1885,7 +1885,7 @@ static int ane_rtclient_attach_genpd(struct ane_rtclient *ane)
 		if (pd->dev == dev)
 			goto found;
 
-	pd = kzalloc(sizeof(*pd), GFP_KERNEL);
+	pd = kzalloc_obj(*pd);
 	if (!pd) {
 		err = -ENOMEM;
 		goto out;
