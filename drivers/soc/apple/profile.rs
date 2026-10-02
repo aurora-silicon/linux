@@ -380,6 +380,16 @@ pub(crate) fn detect() -> Result<&'static PlatformProfile> {
     if machine_has(b"apple,t6000") {
         return Ok(&T6000);
     }
+    // t6000.dtsi is defined as a cut-down t6001: it includes t6001.dtsi and
+    // deletes the parts the smaller die lacks. Both pull in t600x-die0.dtsi,
+    // so the SEP, its mailbox, its DART and the SPI controller sit at the same
+    // addresses with the same interrupts on either part, and the T6000
+    // constants apply to the M1 Max unchanged. The Mac Studio (j375c) is also
+    // a t6001 but leaves the SEP disabled, so nothing binds there; apple,t6002
+    // (M1 Ultra, no built-in sensor) stays unmapped.
+    if machine_has(b"apple,t6001") {
+        return Ok(&T6000);
+    }
     if machine_has(b"apple,t8140") {
         return Ok(&T8140);
     }
