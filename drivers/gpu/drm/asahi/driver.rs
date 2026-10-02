@@ -2,6 +2,7 @@
 
 //! Top-level GPU driver implementation.
 
+use kernel::bindings;
 use kernel::{
     c_str,
     device::Core,
@@ -46,10 +47,23 @@ unsafe impl Sync for AsahiData {}
 pub(crate) struct AsahiDriver {
     #[expect(unused)]
     drm: ARef<drm::Device<Self>>,
+    /// Raw `struct device *` of the platform device. Stored once at probe
+    /// time so the `Drop` impl can find the sysfs file on unregister.
+    raw_dev: *mut bindings::device,
 }
 
 unsafe impl Send for AsahiDriver {}
 unsafe impl Sync for AsahiDriver {}
+
+impl Drop for AsahiDriver {
+    fn drop(&mut self) {
+        // SAFETY: `self.raw_dev` was set in `probe` from the platform
+        // device's `as_raw()`, valid for the lifetime of the bound driver.
+        if !self.raw_dev.is_null() {
+            crate::sysfs_exports::unregister(self.raw_dev);
+        }
+    }
+}
 
 /// Convenience type alias for the DRM device type for this driver.
 pub(crate) type AsahiDevice = drm::device::Device<AsahiDriver>;
@@ -232,6 +246,11 @@ impl platform::Driver for AsahiDriver {
 
         drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0)?;
 
-        Ok(Self { drm })
+        // Register the sysfs file on the platform device. Must happen after
+        // the DRM device is registered so the device is fully bound.
+        let raw_dev = pdev.as_ref().as_raw();
+        crate::sysfs_exports::register(raw_dev)?;
+
+        Ok(Self { drm, raw_dev })
     }
 }
