@@ -50,6 +50,10 @@ struct ane_fw_seg {
 	char name[17];		/* 16 + NUL */
 };
 
+/* request_firmware() names */
+#define ANE_FW_SELENE_NAME	"apple/ane/t602x_ane0_fw_selene_rc4x.macho"
+#define ANE_FW_BIA_NAME		"apple/ane/h14_ane_fw_bia_j4xx.macho"
+
 /* One pinned image. The patch fields are the payload's LC_SYMTAB
  * addresses: the __rtk_patch records _rtk_stack_guard, RTK_soc,
  * RTK_soc_revision, RTK_cpu_physical_address and
@@ -66,7 +70,7 @@ struct ane_fw_image {
 };
 
 static const struct ane_fw_image ane_fw_selene = {
-	.name = "apple/ane/t602x_ane0_fw_selene_rc4x.macho",
+	.name = ANE_FW_SELENE_NAME,
 	.sha256 = {
 		0xa9, 0xc4, 0xb7, 0x71, 0x29, 0x4a, 0x6b, 0x11,
 		0x56, 0x24, 0xd9, 0x48, 0x0a, 0x62, 0x48, 0xd0,
@@ -83,7 +87,7 @@ static const struct ane_fw_image ane_fw_selene = {
 };
 
 static const struct ane_fw_image ane_fw_bia = {
-	.name = "apple/ane/h14_ane_fw_bia_j4xx.macho",
+	.name = ANE_FW_BIA_NAME,
 	.sha256 = {
 		0xaf, 0x58, 0x7d, 0xfa, 0x96, 0xb1, 0xe0, 0x1d,
 		0x2b, 0x2e, 0x0f, 0x9f, 0x77, 0x6e, 0x5d, 0xbe,

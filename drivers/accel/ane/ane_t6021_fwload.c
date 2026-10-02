@@ -89,6 +89,8 @@
  */
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_DESCRIPTION("T6021 ANE firmware staging + entry alias");
+MODULE_FIRMWARE(ANE_FW_SELENE_NAME);
+MODULE_FIRMWARE(ANE_FW_BIA_NAME);
 
 static bool fw_load = true;
 module_param(fw_load, bool, 0444);
@@ -565,8 +567,8 @@ int ane_t6021_fwload_probe(struct ane_t6021 *ane)
 	ret = request_firmware(&fw, img->name, ane->dev);
 	if (ret) {
 		dev_err(ane->dev,
-			"fwload: request_firmware(%s): %d — stage the payload "
-			"with omarchy-ane-firmware-fetch\n", img->name, ret);
+			"cannot load firmware %s: %d; install it with omarchy-ane-firmware-fetch (or equivalent for your distribution)\n",
+			img->name, ret);
 		return ret;
 	}
 
