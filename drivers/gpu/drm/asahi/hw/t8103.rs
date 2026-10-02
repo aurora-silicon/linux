@@ -13,6 +13,7 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
     gpu_core: GpuCore::G13G,
 
     base_clock_hz: 24_000_000,
+    uat_ias: 39,
     uat_oas: 40,
     num_dies: 1,
     max_num_clusters: 1,

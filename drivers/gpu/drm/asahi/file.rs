@@ -61,6 +61,7 @@ struct Vm {
     ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
     ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
     vm: mmu::Vm,
+    user_range: Range<u64>,
     kernel_range: Range<u64>,
     _dummy_mapping: mmu::KernelMapping,
 }
@@ -68,8 +69,8 @@ struct Vm {
 impl Drop for Vm {
     fn drop(&mut self) {
         // When the user Vm is dropped, unmap everything in the user range
-        let left_range = VM_USER_RANGE.start..self.kernel_range.start;
-        let right_range = self.kernel_range.end..VM_USER_RANGE.end;
+        let left_range = self.user_range.start..self.kernel_range.start;
+        let right_range = self.kernel_range.end..self.user_range.end;
 
         if !left_range.is_empty()
             && self
@@ -201,6 +202,8 @@ pub(crate) enum Object {
 // #[pin_data]
 pub(crate) struct File {
     id: u64,
+    /// Available VM range for the user
+    user_range: Range<u64>,
     // #[pin]
     vms: xarray::XArray<KBox<Vm>>,
     // #[pin]
@@ -211,9 +214,6 @@ pub(crate) struct File {
 
 /// Convenience type alias for our DRM `File` type.
 pub(crate) type DrmFile = drm::File<File>;
-
-/// Available VM range for the user
-const VM_USER_RANGE: Range<u64> = mmu::IOVA_USER_USABLE_RANGE;
 
 /// Minimum reserved AS for kernel mappings
 const VM_KERNEL_MIN_SIZE: u64 = 0x20000000;
@@ -227,9 +227,10 @@ impl drm::file::DriverFile for File {
 
         let gpu = &device.gpu;
         let id = gpu.ids().file.next();
+        let user_range = gpu.uat_geometry().user_usable_range();
 
         mod_dev_dbg!(device, "[File {}]: DRM device opened\n", id);
-        Ok(KBox::pin_init(File::new(id), GFP_KERNEL)?)
+        Ok(KBox::pin_init(File::new(id, user_range), GFP_KERNEL)?)
     }
 
     fn as_raw(&self) -> *mut bindings::drm_file {
@@ -241,7 +242,7 @@ impl drm::file::DriverFile for File {
 unsafe impl AnyBitPattern for uapi::drm_asahi_gem_bind_op {}
 
 impl File {
-    fn new(id: u64) -> impl PinInit<Self, Error> {
+    fn new(id: u64, user_range: Range<u64>) -> impl PinInit<Self, Error> {
         unsafe {
             pin_init::pin_init_from_closure(move |slot: *mut Self| {
                 let raw_vms = addr_of_mut!((*slot).vms);
@@ -259,6 +260,7 @@ impl File {
                     .__pinned_init(raw_objects)?;
 
                 (*slot).id = id;
+                (*slot).user_range = user_range;
                 Ok(())
             })
         }
@@ -305,8 +307,8 @@ impl File {
         let mut params = uapi::drm_asahi_params_global {
             features: 0,
 
-            vm_start: VM_USER_RANGE.start,
-            vm_end: VM_USER_RANGE.end,
+            vm_start: file.inner().user_range.start,
+            vm_end: file.inner().user_range.end,
             vm_kernel_min_size: VM_KERNEL_MIN_SIZE,
 
             max_commands_per_submission: MAX_COMMANDS_PER_SUBMISSION,
@@ -344,9 +346,10 @@ impl File {
         file: &DrmFile,
     ) -> Result<u32> {
         let kernel_range = data.kernel_start..data.kernel_end;
+        let user_range = file.inner().user_range.clone();
 
         // Validate requested kernel range
-        if !VM_USER_RANGE.is_superset(kernel_range.clone())
+        if !user_range.is_superset(kernel_range.clone())
             || kernel_range.range() < VM_KERNEL_MIN_SIZE
             || kernel_range.start & (mmu::UAT_PGMSK as u64) != 0
             || kernel_range.end & (mmu::UAT_PGMSK as u64) != 0
@@ -415,8 +418,12 @@ impl File {
         );
         let mut dummy_obj = gem::new_kernel_object(device, 0x4000)?;
         dummy_obj.vmap()?.memset(0);
-        let dummy_mapping =
-            dummy_obj.map_at(&vm, mmu::IOVA_UNK_PAGE, mmu::PROT_GPU_SHARED_RW, true)?;
+        let dummy_mapping = dummy_obj.map_at(
+            &vm,
+            gpu.uat_geometry().unk_page(),
+            mmu::PROT_GPU_SHARED_RW,
+            true,
+        )?;
 
         mod_dev_dbg!(device, "[File {} VM {}]: VM created\n", file_id, id);
         resv.fill(KBox::new(
@@ -424,6 +431,7 @@ impl File {
                 ualloc,
                 ualloc_priv,
                 vm,
+                user_range,
                 kernel_range,
                 _dummy_mapping: dummy_mapping,
             },
@@ -616,7 +624,7 @@ impl File {
             return Err(EINVAL);
         }
 
-        if !VM_USER_RANGE.is_superset(range.clone()) {
+        if !file.inner().user_range.is_superset(range.clone()) {
             cls_pr_debug!(
                 Errors,
                 "gem_bind: Invalid map range {:#x}..{:#x} (not contained in user range)\n",
@@ -697,7 +705,7 @@ impl File {
         let end = data.addr.checked_add(data.range).ok_or(EINVAL)?;
         let range = start..end;
 
-        if !VM_USER_RANGE.is_superset(range.clone()) {
+        if !file.inner().user_range.is_superset(range.clone()) {
             cls_pr_debug!(
                 Errors,
                 "gem_bind: Invalid unmap range {:#x}..{:#x} (not contained in user range)\n",

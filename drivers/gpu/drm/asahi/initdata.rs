@@ -537,7 +537,11 @@ impl<'a> InitDataBuilder::ver<'a> {
                     unk_28: U64(0), // U64(0x11_00000000),
                     // Unknown page
                     //unk_30: U64(0x6f_ffff8000),
-                    unk_30: U64(mmu::IOVA_UNK_PAGE),
+                    unk_30: U64(mmu::UatGeometry {
+                        ias: cfg.uat_ias,
+                        oas: cfg.uat_oas,
+                    }
+                    .unk_page()),
                     timestamp_area_base: U64(gpu::IOVA_KERN_TIMESTAMP_RANGE.start),
                     // TODO: yuv matrices
                     chip_id: cfg.chip_id,
