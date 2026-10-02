@@ -17,6 +17,7 @@ properties:
           - apple,agx-g13s
           - apple,agx-g14g
           - apple,agx-g14s
+          - apple,agx-t8140
       - items:
           - enum:
               - apple,agx-g13c
@@ -29,22 +30,22 @@ properties:
           - const: apple,agx-g14s
 
   reg:
-    items:
-      - description: GPU coprocessor control registers
-      - description: GPU block MMIO registers
+    minItems: 2
+    maxItems: 3
 
   reg-names:
-    items:
-      - const: asc
-      - const: sgx
+    minItems: 2
+    maxItems: 3
 
   power-domains:
     maxItems: 1
 
   mboxes:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
 
   memory-region:
+    minItems: 3
     items:
       - description: Region containing GPU MMU TTBs
       - description: Region containing GPU MMU page tables
@@ -56,6 +57,7 @@ properties:
       - description: Shared global variables with GPU firmware
 
   memory-region-names:
+    minItems: 3
     items:
       - const: ttbs
       - const: pagetables
@@ -63,6 +65,8 @@ properties:
       - const: hw-cal-a
       - const: hw-cal-b
       - const: globals
+
+  operating-points-v2: true
 
   apple,firmware-abi:
     $ref: /schemas/types.yaml#/definitions/uint32-array
@@ -77,7 +81,54 @@ required:
   - reg
   - mboxes
   - memory-region
-  - apple,firmware-abi
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,agx-t8140
+    then:
+      properties:
+        reg:
+          items:
+            - description: GFX coprocessor control registers
+            - description: GFX1 coprocessor control registers
+            - description: GPU block MMIO registers
+        reg-names:
+          items:
+            - const: asc
+            - const: asc1
+            - const: sgx
+        mboxes:
+          items:
+            - description: GFX coprocessor mailbox
+            - description: GFX1 coprocessor mailbox
+        memory-region:
+          maxItems: 3
+        memory-region-names:
+          maxItems: 3
+      required:
+        - power-domains
+        - operating-points-v2
+    else:
+      properties:
+        reg:
+          items:
+            - description: GPU coprocessor control registers
+            - description: GPU block MMIO registers
+        reg-names:
+          items:
+            - const: asc
+            - const: sgx
+        mboxes:
+          maxItems: 1
+        memory-region:
+          minItems: 6
+        memory-region-names:
+          minItems: 6
+      required:
+        - apple,firmware-abi
 
 additionalProperties: false
 
