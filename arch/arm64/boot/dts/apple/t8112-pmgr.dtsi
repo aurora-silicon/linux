@@ -1132,6 +1132,10 @@
 		power-domains = <&ps_venc_pipe5>, <&ps_venc_pipe4>;
 	};
 
+	/*
+	 * These states serve only the ANE. They stay disabled with the ane
+	 * node in t8112.dtsi; enable them together with it.
+	 */
 	ps_ane_sys_cpu: power-controller@c008 {
 		compatible = "apple,t8112-pmgr-pwrstate", "apple,pmgr-pwrstate";
 		reg = <0xc008 4>;
@@ -1139,6 +1143,7 @@
 		#reset-cells = <0>;
 		label = "ane_sys_cpu";
 		power-domains = <&ps_ane_sys>;
+		status = "disabled";
 	};
 
 	ps_ane_td: power-controller@c010 {
@@ -1148,6 +1153,7 @@
 		#reset-cells = <0>;
 		label = "ane_td";
 		power-domains = <&ps_ane_sys_cpu>;
+		status = "disabled";
 	};
 
 	ps_ane_base: power-controller@c018 {
@@ -1157,6 +1163,7 @@
 		#reset-cells = <0>;
 		label = "ane_base";
 		power-domains = <&ps_ane_td>;
+		status = "disabled";
 	};
 
 	ps_ane_set1: power-controller@c020 {
@@ -1166,6 +1173,7 @@
 		#reset-cells = <0>;
 		label = "ane_set1";
 		power-domains = <&ps_ane_base>;
+		status = "disabled";
 	};
 
 	ps_ane_set2: power-controller@c028 {
@@ -1175,6 +1183,7 @@
 		#reset-cells = <0>;
 		label = "ane_set2";
 		power-domains = <&ps_ane_set1>;
+		status = "disabled";
 	};
 
 	ps_ane_set3: power-controller@c030 {
@@ -1184,6 +1193,7 @@
 		#reset-cells = <0>;
 		label = "ane_set3";
 		power-domains = <&ps_ane_set2>;
+		status = "disabled";
 	};
 
 	ps_ane_set4: power-controller@c038 {
@@ -1193,6 +1203,7 @@
 		#reset-cells = <0>;
 		label = "ane_set4";
 		power-domains = <&ps_ane_set3>;
+		status = "disabled";
 	};
 
 	ps_disp0_cpu0: power-controller@10000 {
