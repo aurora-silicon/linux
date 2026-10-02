@@ -39,6 +39,14 @@
 		label = "isp_sys";
 	};
 
+	ps_avd_sys: power-controller@270 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x270 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "avd_sys";
+	};
+
 	ps_ans: power-controller@278 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x278 4>;
