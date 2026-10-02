@@ -109,6 +109,7 @@ pub(crate) struct Health {
     mapped: AtomicBool,
     failed: AtomicBool,
     progress: crate::agx_host_progress::Progress,
+    pub(crate) timing: crate::agx_timing_stats::Stats,
 }
 
 impl Health {
@@ -116,6 +117,13 @@ impl Health {
         self.mapped.load(Ordering::Acquire)
             && !self.crashed.load(Ordering::Acquire)
             && !self.failed()
+    }
+
+    pub(crate) fn set_gpu_pending(&self, pending: bool) { self.progress.set_pending(pending); }
+
+    pub(crate) fn activity_snapshot(&self) -> (u64, u64, bool) {
+        let (generation, epoch) = self.progress.activity_snapshot();
+        (generation, epoch, self.healthy())
     }
 
     pub(crate) fn record_completion(&self) { self.progress.record_completion(); }
@@ -145,6 +153,7 @@ impl State {
                     mapped: AtomicBool::new(false),
                     failed: AtomicBool::new(false),
                     progress: crate::agx_host_progress::Progress::new(),
+                    timing: crate::agx_timing_stats::Stats::new(),
                 }, GFP_KERNEL)?,
                 claimed: AtomicBool::new(false),
                 event_messages: AtomicU64::new(0),

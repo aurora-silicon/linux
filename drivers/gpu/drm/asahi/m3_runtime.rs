@@ -263,7 +263,8 @@ impl Runtime {
             }
             let preparation_ns=prepare.elapsed().as_nanos();
             let previous_events=inner.config.completed_events;
-            inner.gpu_pending=true;
+            inner.state.health.set_gpu_pending(true);
+            inner.gpu_pending = true;
             let expected_events=match &inner.jobs[index] {
                 NativeJob::Compute(j)=>{
                     inner.config.submit_queue(2,j.queue(),j.head(),2,j.first())?;
@@ -333,6 +334,8 @@ impl Runtime {
                             }
                             let t=&mut inner.timing[kind];
                             let active_ns=start.elapsed().as_nanos();
+                            inner.state.health.timing.record(kind==0, batch_count as u64,
+                                preparation_ns, active_ns, gpu_ns, stages);
                             if let Some(t)=retire_start {retirement_ns+=t.elapsed().as_nanos();}
                             if crate::debug::debug_enabled(crate::debug::DebugFlags::M3SubmitSummary) {
                                 if let crate::m3_submit::Command::Render {command:r,..}=control {
@@ -379,7 +382,8 @@ impl Runtime {
                                     *g=GeometryTiming::default();
                                 }
                             }
-                            inner.gpu_pending=false;break;
+                            inner.gpu_pending = false;
+                            inner.state.health.set_gpu_pending(false);break;
                         },
                         Ok(())=>{}, // Firmware must consume every submitted queue message.
                         Err(e) if e==EBUSY=>{}, // Retirement can trail the event.
@@ -441,6 +445,7 @@ impl Runtime {
         inner.config.drain(&inner.drm)?;
         inner.config.log_ready(&inner.drm)?;
         inner.config.check_pstate(&inner.drm, &inner.device, "after boot")?;
+        inner.state.health.set_gpu_pending(false);
         dev_info!(pdev.as_ref(), "M3: firmware accepted owned initdata and device controls\n");
         Ok(())
     }
