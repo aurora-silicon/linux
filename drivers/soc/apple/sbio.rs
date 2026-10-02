@@ -1282,7 +1282,17 @@ impl SepData {
             "verify: attach-time bring-up left the device-view proof undone; retrying the sensor bring-up\n"
         );
         if !self.bring_sensor_online() {
-            dev_err!(self.dev, "verify: the retried sensor bring-up failed\n");
+            // After a failed first patch, the enclave can refuse the serial
+            // re-registration that follows CLEAR_STATE, while a reboot's
+            // fresh registration works. Retry once from the fresh stage.
+            dev_warn!(
+                self.dev,
+                "verify: retrying the sensor bring-up from a fresh registration\n"
+            );
+            self.bringup.store(BRINGUP_FRESH, Relaxed);
+            if !self.bring_sensor_online() {
+                dev_err!(self.dev, "verify: the retried sensor bring-up failed\n");
+            }
         }
         let _ = sensor::idle();
         self.refresh_match_credential();
@@ -1961,48 +1971,63 @@ impl SepData {
         }
     }
 
+    // Each failure names its step: a report that only says "sequence counter
+    // init failed" cannot tell the enclave side from the sensor side.
     fn init_sequence_counter(&self) -> bool {
         let challenge = match self.sbio_call(&crate::sbio::sbio_request_challenge()) {
             SbioOutcome::Ok(c) => c,
             SbioOutcome::PrerequisiteMissing => {
                 if !self.establish_session() {
+                    dev_warn!(self.dev, "sequence counter: session setup failed\n");
                     return false;
                 }
                 match self.sbio_call(&crate::sbio::sbio_request_challenge()) {
                     SbioOutcome::Ok(c) => c,
                     _ => {
+                        dev_warn!(self.dev, "sequence counter: challenge request failed after session setup\n");
                         return false;
                     }
                 }
             }
             SbioOutcome::Status16 => {
+                dev_warn!(self.dev, "sequence counter: challenge request answered status 16\n");
                 return false;
             }
             SbioOutcome::Other => {
+                dev_warn!(self.dev, "sequence counter: challenge request failed\n");
                 return false;
             }
         };
         if challenge.len() < sensor::CHALLENGE_LEN {
+            dev_warn!(self.dev, "sequence counter: short challenge ({} bytes)\n", challenge.len());
             return false;
         }
         let mut out = [0u8; sensor::CHALLENGE_LEN];
         out.copy_from_slice(&challenge[..sensor::CHALLENGE_LEN]);
 
         if sensor::send_challenge(&out).is_err() {
+            dev_warn!(self.dev, "sequence counter: sending the challenge to the sensor failed\n");
             return false;
         }
 
         let reply = match sensor::read_challenge_reply() {
             Ok(r) => r,
             Err(_) => {
+                dev_warn!(self.dev, "sequence counter: the sensor did not answer the challenge\n");
                 return false;
             }
         };
 
         match self.sbio_transfer(&crate::sbio::sbio_commit_challenge(&reply)) {
             Ok(done) if done.status.is_ok() => true,
-            Ok(_) => false,
-            Err(_) => false,
+            Ok(done) => {
+                dev_warn!(self.dev, "sequence counter: the enclave refused the sensor's reply, status {}\n", done.status);
+                false
+            }
+            Err(e) => {
+                dev_warn!(self.dev, "sequence counter: committing the reply failed {:?}\n", e);
+                false
+            }
         }
     }
 
