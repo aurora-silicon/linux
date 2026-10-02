@@ -251,6 +251,80 @@
 		};
 	};
 
+	gpu_opp: opp-table-gpu {
+		compatible = "operating-points-v2";
+
+		/*
+		 * NOTE: The operating points are device-specific and must be
+		 * filled in by the bootloader. Entries keep the order of the
+		 * GPU performance states, which is not sorted by frequency.
+		 */
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <125000>;
+		};
+		opp01 {
+			opp-hz = /bits/ 64 <338000000>;
+			opp-microvolt = <605000>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <492000000>;
+			opp-microvolt = <630000>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <618000000>;
+			opp-microvolt = <650000>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <796000000>;
+			opp-microvolt = <695000>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <928000000>;
+			opp-microvolt = <745000>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <952000000>;
+			opp-microvolt = <800000>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <1056000000>;
+			opp-microvolt = <800000>;
+		};
+		opp08 {
+			opp-hz = /bits/ 64 <1053000000>;
+			opp-microvolt = <845000>;
+		};
+		opp09 {
+			opp-hz = /bits/ 64 <1170000000>;
+			opp-microvolt = <845000>;
+		};
+		opp10 {
+			opp-hz = /bits/ 64 <1152000000>;
+			opp-microvolt = <885000>;
+		};
+		opp11 {
+			opp-hz = /bits/ 64 <1278000000>;
+			opp-microvolt = <885000>;
+		};
+		opp12 {
+			opp-hz = /bits/ 64 <1204000000>;
+			opp-microvolt = <905000>;
+		};
+		opp13 {
+			opp-hz = /bits/ 64 <1338000000>;
+			opp-microvolt = <905000>;
+		};
+		opp14 {
+			opp-hz = /bits/ 64 <1326000000>;
+			opp-microvolt = <975000>;
+		};
+		opp15 {
+			opp-hz = /bits/ 64 <1470000000>;
+			opp-microvolt = <975000>;
+		};
+	};
+
 	timer {
 		compatible = "arm,armv8-timer";
 		interrupt-parent = <&aic>;
@@ -266,6 +340,29 @@
 		#clock-cells = <0>;
 		clock-frequency = <24000000>;
 		clock-output-names = "clkref";
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		uat_handoff: uat-handoff {
+			reg = <0 0 0 0>;
+		};
+
+		/* Only reserved: the GPU node does not reference it */
+		uat_l2_pagetables: uat-l2-pagetables {
+			reg = <0 0 0 0>;
+		};
+
+		uat_pagetables: uat-pagetables {
+			reg = <0 0 0 0>;
+		};
+
+		uat_ttbs: uat-ttbs {
+			reg = <0 0 0 0>;
+		};
 	};
 
 	soc: soc {
@@ -701,6 +798,51 @@
 			orientation-switch;
 			mode-switch;
 			power-domains = <&ps_atc0_usb>;
+			status = "disabled";
+		};
+
+		gpu: gpu@482600000 {
+			compatible = "apple,agx-t8140";
+			reg = <0x4 0x82600000 0x0 0x4000>,
+			      <0x4 0x82e00000 0x0 0x4000>,
+			      <0x4 0x80000000 0x0 0x4000000>;
+			reg-names = "asc", "asc1", "sgx";
+			mboxes = <&gfx_mbox>, <&gfx1_mbox>;
+			power-domains = <&ps_gfx>;
+			memory-region = <&uat_ttbs>, <&uat_pagetables>,
+					<&uat_handoff>;
+			memory-region-names = "ttbs", "pagetables", "handoff";
+			operating-points-v2 = <&gpu_opp>;
+			status = "disabled";
+		};
+
+		gfx_mbox: mailbox@482608000 {
+			compatible = "apple,t8140-gfx-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x4 0x82608000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 993 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 994 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 995 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 996 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			power-domains = <&ps_gfx>;
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
+		gfx1_mbox: mailbox@482e08000 {
+			compatible = "apple,t8140-gfx-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x4 0x82e08000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 997 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 998 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 999 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1000 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			power-domains = <&ps_gfx>;
+			#mbox-cells = <0>;
 			status = "disabled";
 		};
 	};
