@@ -88,3 +88,50 @@
 &gpu {
 	compatible = "apple,agx-t6001", "apple,agx-g13c", "apple,agx-g13s";
 };
+
+/*
+ * The ANE has run on the M1 Max, so enable it here with its DARTs and the
+ * power states only it uses. t6000.dtsi defines APPLE_ANE_UNTESTED before
+ * including this file: the ANE has not run on the M1 Pro yet.
+ */
+#ifndef APPLE_ANE_UNTESTED
+&ane {
+	status = "okay";
+};
+
+&ane_dart0 {
+	status = "okay";
+};
+
+&ane_dart1 {
+	status = "okay";
+};
+
+&ane_dart2 {
+	status = "okay";
+};
+
+&ps_ane_base {
+	status = "okay";
+};
+
+&ps_ane_set0 {
+	status = "okay";
+};
+
+&ps_ane_set1 {
+	status = "okay";
+};
+
+&ps_ane_set2 {
+	status = "okay";
+};
+
+&ps_ane_set3 {
+	status = "okay";
+};
+
+&ps_ane_set4 {
+	status = "okay";
+};
+#endif

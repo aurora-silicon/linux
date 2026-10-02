@@ -1453,7 +1453,7 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 417 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
-			status = "okay";
+			status = "disabled";
 		};
 
 		ane_dart1: iommu@26b810000 {
@@ -1464,7 +1464,7 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 417 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
-			status = "okay";
+			status = "disabled";
 		};
 
 		ane_dart2: iommu@26b820000 {
@@ -1475,7 +1475,7 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 417 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
-			status = "okay";
+			status = "disabled";
 		};
 
 		ane: ane@26bc04000 {
@@ -1488,7 +1488,7 @@
 			iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
 			power-domains = <&ps_ane_set1>, <&ps_ane_set2>,
 				<&ps_ane_set3>, <&ps_ane_set4>, <&ps_ane_set5>;
-			status = "okay";
+			status = "disabled";
 		};
 
 		dispext0_dart: iommu@271304000 {
@@ -2173,3 +2173,52 @@
 };
 
 #include "t8103-pmgr.dtsi"
+
+/*
+ * The ANE has not run on the M1 yet, so it stays off together with its
+ * DARTs and the power states only it uses. Drop this define to enable
+ * them once it has.
+ */
+#define APPLE_ANE_UNTESTED
+
+#ifndef APPLE_ANE_UNTESTED
+&ane {
+	status = "okay";
+};
+
+&ane_dart0 {
+	status = "okay";
+};
+
+&ane_dart1 {
+	status = "okay";
+};
+
+&ane_dart2 {
+	status = "okay";
+};
+
+&ps_ane_base {
+	status = "okay";
+};
+
+&ps_ane_set1 {
+	status = "okay";
+};
+
+&ps_ane_set2 {
+	status = "okay";
+};
+
+&ps_ane_set3 {
+	status = "okay";
+};
+
+&ps_ane_set4 {
+	status = "okay";
+};
+
+&ps_ane_set5 {
+	status = "okay";
+};
+#endif

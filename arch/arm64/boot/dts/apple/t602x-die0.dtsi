@@ -13,7 +13,7 @@
 		interrupts = <AIC_IRQ 0 884 IRQ_TYPE_LEVEL_HIGH>;
 		interrupt-names = "recv-not-empty";
 		#mbox-cells = <0>;
-		status = "okay";
+		status = "disabled";
 	};
 
 	ane_dart0: iommu@285800000 {
@@ -23,7 +23,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 885 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_pmp>;
-		status = "okay";
+		status = "disabled";
 	};
 
 	ane_dart1: iommu@285810000 {
@@ -33,7 +33,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 885 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_cpu>;
-		status = "okay";
+		status = "disabled";
 	};
 
 	ane_dart2: iommu@285820000 {
@@ -43,7 +43,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 885 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_cpu>;
-		status = "okay";
+		status = "disabled";
 	};
 
 	ane: ane@284000000 {
@@ -62,7 +62,7 @@
 		resets = <&ps_ane_cpu>;
 		mboxes = <&ane_mbox>;
 		memory-region = <&ane_alias_iova>;
-		status = "okay";
+		status = "disabled";
 	};
 
 	nco: clock-controller@28e03c000 {

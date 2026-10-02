@@ -1010,6 +1010,7 @@
 		#reset-cells = <0>;
 		label = "ane_base";
 		power-domains = <&ps_ane_sys_cpu>;
+		status = "disabled";
 	};
 
 	ps_ane_set1: power-controller@c010 {
@@ -1019,6 +1020,7 @@
 		#reset-cells = <0>;
 		label = "ane_set1";
 		power-domains = <&ps_ane_base>;
+		status = "disabled";
 	};
 
 	ps_ane_set2: power-controller@c018 {
@@ -1028,6 +1030,7 @@
 		#reset-cells = <0>;
 		label = "ane_set2";
 		power-domains = <&ps_ane_base>;
+		status = "disabled";
 	};
 
 	ps_ane_set3: power-controller@c020 {
@@ -1037,6 +1040,7 @@
 		#reset-cells = <0>;
 		label = "ane_set3";
 		power-domains = <&ps_ane_base>;
+		status = "disabled";
 	};
 
 	ps_ane_set4: power-controller@c028 {
@@ -1046,6 +1050,7 @@
 		#reset-cells = <0>;
 		label = "ane_set4";
 		power-domains = <&ps_ane_base>;
+		status = "disabled";
 	};
 
 	ps_ane_set5: power-controller@c030 {
@@ -1055,6 +1060,7 @@
 		#reset-cells = <0>;
 		label = "ane_set5";
 		power-domains = <&ps_ane_base>;
+		status = "disabled";
 	};
 
 	ps_disp0_cpu0: power-controller@10018 {
