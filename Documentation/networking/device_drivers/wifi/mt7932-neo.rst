@@ -3,7 +3,7 @@
 MT7932 radio bring-up on the MacBook Neo
 ======================================
 
-This draft combines the existing J700 MT7932 fullmac Wi-Fi driver with an
+This contribution combines the existing J700 MT7932 fullmac Wi-Fi driver with an
 opt-in PCIe Bluetooth transport on the public Aurora platform. Wi-Fi uses
 cfg80211 and NetworkManager with firmware-managed WPA2-CCMP authentication.
 It is not an mt76/mac80211 softmac implementation.
@@ -16,8 +16,8 @@ The Wi-Fi import is pinned to
 compatibility changes: bounded 64/65-record configuration parsing, native scan
 IE encoding, and selected WPA2 PSK admission with trailing AKM alternatives.
 This contribution imports an existing implementation; it does not claim an
-independent rewrite. Existing source notices are retained. Neo radio research
-and bring-up credit goes to DJ (DjDeveloperr), Ace (Acelogic), and Ryan Murray.
+independent rewrite. Existing source notices are retained. Co-authored by
+DJ (DjDeveloperr), Ace (Acelogic), and Ryan Murray.
 
 Platform and configuration
 --------------------------
@@ -122,7 +122,7 @@ The earlier Bluetooth candidate passed two bonded AirPods reconnects and
 headset audio was not repeated on the combined candidate because no AirPods
 appeared during its discovery runs.
 
-This remains a draft, with concrete production merge blockers:
+The experimental implementation has concrete production merge blockers:
 
 * PCI bootstrap memory remains retained until external reset; controller
   removal, suspend, kexec and reusable-arena lifetime are not qualified.
