@@ -82,6 +82,7 @@ use crate::{
     mmu,
     queue,
     regs,
+    stats,
     workqueue, //
 };
 
@@ -728,6 +729,12 @@ impl GpuManager::ver {
         let buffer_mgr = buffer::BufferManager::ver::new()?;
         let event_manager_clone = event_manager.clone();
         let buffer_mgr_clone = buffer_mgr.clone();
+        let stats_snap = Arc::new(stats::StatsSnapshot::default(), GFP_KERNEL);
+        // Publish the snapshot pointer to the C sysfs shim. It is cleared
+        // (by the same shim) on registration removal; until then readers see
+        // a stable pointer and AtomicU* races that govern.
+        stats::SNAPSHOT_PTR.store(Arc::as_ptr(&stats_snap) as u64, Ordering::Relaxed);
+        let stats_snap_clone = stats_snap.clone();
         let alloc_ref = &mut alloc;
         let rx_channels = KBox::init(
             try_init!(RxChannels::ver {
@@ -739,7 +746,7 @@ impl GpuManager::ver {
                 )?,
                 fw_log: channel::FwLogChannel::new(dev, alloc_ref)?,
                 ktrace: channel::KTraceChannel::new(dev, alloc_ref)?,
-                stats: channel::StatsChannel::ver::new(dev, alloc_ref)?,
+                stats: channel::StatsChannel::ver::new(dev, alloc_ref, stats_snap_clone)?,
             }),
             GFP_KERNEL,
         )?;

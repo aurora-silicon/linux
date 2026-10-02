@@ -23,7 +23,8 @@ use crate::{
     buffer,
     event,
     gpu,
-    mem, //
+    mem,
+    module_parameters, //
 };
 use kernel::{
     c_str,
@@ -584,11 +585,14 @@ impl KTraceChannel {
 }
 
 /// Statistics channel, reporting power-related statistics to the driver.
-/// Not really implemented other than debug logs yet...
+/// Debug-logs the messages and, when the `stats_export` module parameter
+/// is enabled, also updates the shared `StatsSnapshot` exported via
+/// `/sys/class/drm/card*/device/agx_stats`.
 #[versions(AGX)]
 pub(crate) struct StatsChannel {
     dev: AsahiDevRef,
     ch: RxChannel<ChannelState, RawStatsMsg::ver>,
+    snap: Arc<crate::stats::StatsSnapshot>,
 }
 
 #[versions(AGX)]
@@ -597,10 +601,12 @@ impl StatsChannel::ver {
     pub(crate) fn new(
         dev: &AsahiDevice,
         alloc: &mut gpu::KernelAllocators,
+        snap: Arc<crate::stats::StatsSnapshot>,
     ) -> Result<StatsChannel::ver> {
         Ok(StatsChannel::ver {
             dev: dev.into(),
             ch: RxChannel::<ChannelState, RawStatsMsg::ver>::new(alloc, 0x100)?,
+            snap,
         })
     }
 
@@ -620,6 +626,9 @@ impl StatsChannel::ver {
                     // accessing the enum view is valid.
                     let msg = unsafe { msg.msg };
                     cls_dev_dbg!(StatsCh, self.dev, "Stats: {:?}\n", msg);
+                    if *module_parameters::stats_export.value() != 0 {
+                        self.snap.update_from(&msg);
+                    }
                 }
                 _ => {
                     // SAFETY: The raw view is always valid for all bit patterns.
