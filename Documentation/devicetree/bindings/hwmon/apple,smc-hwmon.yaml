@@ -40,13 +40,11 @@ properties:
   compatible:
     const: apple,smc-hwmon
 
-  apple,cpu-thermal-policy:
-    type: boolean
+  "#thermal-sensor-cells":
+    const: 1
     description:
-      Enable the J700 CPU thermal provider over the first six temperature
-      channels, which must contain Te05, Te0S, Tp01, Tp05, Tp09 and Tp0D.
-      Further temperature channels are reporting-only. The provider holds
-      CPU frequency constraints while these readings are unavailable.
+      The cell is the zero-based index of a temperature channel, counting
+      the temperature-* child nodes in order.
 
 patternProperties:
   "^current-[A-Za-z0-9]{4}$":
