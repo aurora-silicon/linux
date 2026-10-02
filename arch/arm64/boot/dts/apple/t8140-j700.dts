@@ -17,6 +17,7 @@
 
 	aliases {
 		atcphy0 = &atcphy0;
+		gpu = &gpu;
 		keyboard = &keyboard;
 		serial0 = &serial0;
 		wifi0 = &wifi0;
@@ -1346,6 +1347,18 @@
 			};
 		};
 	};
+};
+
+&gfx_mbox {
+	status = "okay";
+};
+
+&gfx1_mbox {
+	status = "okay";
+};
+
+&gpu {
+	status = "okay";
 };
 
 #include "hwmon-common.dtsi"
