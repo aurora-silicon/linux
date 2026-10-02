@@ -19,11 +19,11 @@ static const int TQ_PRTY_TABLE[ANE_TQ_COUNT] = { 0x1, 0x2, 0x3,	 0x4,
 #define TM_PUSH			  0x8
 #define TM_TQ_EN		  0xc
 
-#define TM_IRQ_EVTC(line)	  (0x14 + (line * 0x14))
-#define TM_IRQ_INFO(line)	  (0x18 + (line * 0x14))
-#define TM_IRQ_UNK1(line)	  (0x1c + (line * 0x14))
-#define TM_IRQ_TMST(line)	  (0x20 + (line * 0x14))
-#define TM_IRQ_UNK2(line)	  (0x24 + (line * 0x14))
+#define TM_IRQ_EVTC(line)	  (0x14 + ((line) * 0x14))
+#define TM_IRQ_INFO(line)	  (0x18 + ((line) * 0x14))
+#define TM_IRQ_UNK1(line)	  (0x1c + ((line) * 0x14))
+#define TM_IRQ_TMST(line)	  (0x20 + ((line) * 0x14))
+#define TM_IRQ_UNK2(line)	  (0x24 + ((line) * 0x14))
 
 #define TM_COMMITTED		  0x44
 #define TM_STATUS		  0x54
@@ -34,28 +34,30 @@ static const int TQ_PRTY_TABLE[ANE_TQ_COUNT] = { 0x1, 0x2, 0x3,	 0x4,
 #define TM_IRQ_ACK		  0x6c
 #define TM_IRQ_EN2		  0x70
 
-#define TQ_STATUS(qid)		  (0x000 + (qid * 0x148))
-#define TQ_PRTY(qid)		  (0x010 + (qid * 0x148))
-#define TQ_VACANT(qid)		  (0x014 + (qid * 0x148))
-#define TQ_INFO(qid)		  (0x01c + (qid * 0x148))
+#define TQ_STATUS(qid)		  (0x000 + ((qid) * 0x148))
+#define TQ_PRTY(qid)		  (0x010 + ((qid) * 0x148))
+#define TQ_VACANT(qid)		  (0x014 + ((qid) * 0x148))
+#define TQ_INFO(qid)		  (0x01c + ((qid) * 0x148))
 
-#define TQ_BAR1(qid, bdx)	  (0x020 + (qid * 0x148) + (bdx * 0x4))
-#define TQ_NID1(qid)		  (0x0a0 + (qid * 0x148))
-#define TQ_SIZE2(qid)		  (0x0a4 + (qid * 0x148))
-#define TQ_ADDR2(qid)		  (0x0a8 + (qid * 0x148))
+#define TQ_BAR1(qid, bdx)	  (0x020 + ((qid) * 0x148) + ((bdx) * 0x4))
+#define TQ_NID1(qid)		  (0x0a0 + ((qid) * 0x148))
+#define TQ_SIZE2(qid)		  (0x0a4 + ((qid) * 0x148))
+#define TQ_ADDR2(qid)		  (0x0a8 + ((qid) * 0x148))
 
-#define TQ_BAR2(qid, bdx)	  (0x0ac + (qid * 0x148) + (bdx * 0x4))
-#define TQ_NID2(qid)		  (0x12c + (qid * 0x148))
-#define TQ_SIZE1(qid)		  (0x130 + (qid * 0x148))
-#define TQ_ADDR1(qid)		  (0x134 + (qid * 0x148))
+#define TQ_BAR2(qid, bdx)	  (0x0ac + ((qid) * 0x148) + ((bdx) * 0x4))
+#define TQ_NID2(qid)		  (0x12c + ((qid) * 0x148))
+#define TQ_SIZE1(qid)		  (0x130 + ((qid) * 0x148))
+#define TQ_ADDR1(qid)		  (0x134 + ((qid) * 0x148))
 
 #define TM_IS_IDLE		  0x1
 #define TM_IS_FINE		  0x22222222
 
-#define tm_read32(ane, off)	  (readl(ane->engine + ANE_TM_BASE + off))
-#define tq_read32(ane, off)	  (readl(ane->engine + ANE_TQ_BASE + off))
-#define tm_write32(ane, off, val) (writel(val, ane->engine + ANE_TM_BASE + off))
-#define tq_write32(ane, off, val) (writel(val, ane->engine + ANE_TQ_BASE + off))
+#define tm_read32(ane, off)	  (readl((ane)->engine + ANE_TM_BASE + (off)))
+#define tq_read32(ane, off)	  (readl((ane)->engine + ANE_TQ_BASE + (off)))
+#define tm_write32(ane, off, val) \
+	(writel(val, (ane)->engine + ANE_TM_BASE + (off)))
+#define tq_write32(ane, off, val) \
+	(writel(val, (ane)->engine + ANE_TQ_BASE + (off)))
 
 /* The ane SET block (m1n1 ANE.ps_map) maps the pmgr power-state words
  * for this engine (set0, base, set1..4). pmgr reads are always safe and
