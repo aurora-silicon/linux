@@ -2217,6 +2217,8 @@ static unsigned long dcp_dptx_wait_linkcfg(struct apple_dcp *dcp, u32 port,
  * With a @session, every step checks that it is still the live one, and a
  * revoked session returns -ESTALE without touching the new one's state.
  */
+static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port);
+
 static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable,
 				const struct dcp_fabric_session *session, bool cable,
 				bool recovery)
@@ -2287,8 +2289,26 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		goto out_unlock;
 	}
 
-	if (dcp->dptxport[port].connected)
-		goto out_unlock;
+	if (dcp->dptxport[port].connected) {
+		/*
+		 * Being told a display showed up while we still think one is
+		 * attached means the disconnect never reached us. It is
+		 * reported on the controller the Type-C connector names, which
+		 * is the one driving the port's PHY rather than this one when
+		 * the display came over a tunnel; and a tunnel whose block
+		 * simply loses power never reaches the teardown path that
+		 * would report it either.
+		 *
+		 * Trust the event: the old display is gone. Drop it here
+		 * rather than silently ignoring the new one, which left every
+		 * later hotplug dead until reboot.
+		 */
+		dev_info(dcp->dev,
+			 "connect while still connected, dropping stale display\n");
+		ret = dcp_dptx_release_locked(dcp, port);
+		if (ret)
+			goto out_unlock;
+	}
 	if (dcp->external)
 		smp_store_release(&dcp->external_link_ready, false);
 
@@ -2651,8 +2671,6 @@ void dcp_external_ready(struct apple_dcp *dcp)
 }
 
 #define DCP_EXTERNAL_RETRIES	3
-
-static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port);
 
 /*
  * Bounded recovery for a native external pipe: re-apply the display mode,
