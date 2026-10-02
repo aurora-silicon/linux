@@ -475,11 +475,19 @@ static int macsmc_battery_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW:
 		ret = apple_smc_read_u16(power->smc, SMC_KEY(B0TE), &vu16);
-		val->intval = vu16 == 0xffff ? 0 : vu16 * 60;
+		if (ret)
+			break;
+		if (vu16 == U16_MAX)
+			return -ENODATA;
+		val->intval = vu16 * 60;
 		break;
 	case POWER_SUPPLY_PROP_TIME_TO_FULL_NOW:
 		ret = apple_smc_read_u16(power->smc, SMC_KEY(B0TF), &vu16);
-		val->intval = vu16 == 0xffff ? 0 : vu16 * 60;
+		if (ret)
+			break;
+		if (vu16 == U16_MAX)
+			return -ENODATA;
+		val->intval = vu16 * 60;
 		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
 		ret = apple_smc_read_u8(power->smc, SMC_KEY(BUIC), &vu8);
