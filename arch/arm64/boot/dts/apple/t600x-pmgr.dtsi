@@ -678,8 +678,8 @@
 
 #if DIE_NO == 0
 	/*
-	 * Only the die 0 ANE is described. The ane node leaves set5 out:
-	 * it lies past the end of the ADT ANE pmgr range (0xc02c).
+	 * Only the die 0 ANE is described. Its pmgr range ends at 0xc02c,
+	 * with set4, so no set5 is described at 0xc030.
 	 */
 	DIE_NODE(ps_ane_set0): power-controller@c000 {
 		compatible = "apple,t6000-pmgr-pwrstate", "apple,pmgr-pwrstate";
@@ -732,15 +732,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = DIE_LABEL(ane_set4);
-		power-domains = <&DIE_NODE(ps_ane_base)>;
-	};
-
-	DIE_NODE(ps_ane_set5): power-controller@c030 {
-		compatible = "apple,t6000-pmgr-pwrstate", "apple,pmgr-pwrstate";
-		reg = <0xc030 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = DIE_LABEL(ane_set5);
 		power-domains = <&DIE_NODE(ps_ane_base)>;
 	};
 #endif
