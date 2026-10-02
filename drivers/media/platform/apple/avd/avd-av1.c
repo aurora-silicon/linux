@@ -1430,6 +1430,9 @@ static void avd_av1_submit(struct avd_ctx *ctx)
 static void avd_av1_adjust_decoded_fmt(struct avd_ctx *ctx,
 				       struct v4l2_pix_format_mplane *pix_mp)
 {
+	/* Keep both auxiliary regions aligned after compressed storage. */
+	pix_mp->plane_fmt[0].sizeimage =
+		ALIGN(pix_mp->plane_fmt[0].sizeimage, AVD_ALIGN);
 	pix_mp->plane_fmt[0].sizeimage += ALIGN(AVD_CDFS_SIZE, AVD_ALIGN);
 	pix_mp->plane_fmt[0].sizeimage +=
 		ALIGN(avd_color_size(pix_mp->width, pix_mp->height), AVD_ALIGN);

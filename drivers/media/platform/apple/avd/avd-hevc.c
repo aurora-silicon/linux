@@ -43,6 +43,7 @@
 #define HEVC_FLAG_TMVP_EN(v)	FIELD_PREP(BIT(21), !!(v))
 
 #define HEVC_SCL_DIMS	0x127ffff
+#define HEVC_DMA_CONFIG	BIT(26)
 
 static inline u32 mv_color_size(u32 w, u32 h)
 {
@@ -107,7 +108,8 @@ static void stream_refs(struct avd_ctx *ctx, struct avd_hevc_run *run)
 
 	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
 
-	push(0, "");
+	push(ctx->dev->variant->quirks & AVD_QUIRK_HEVC_V5_HEADER ?
+		     HEVC_DMA_CONFIG : 0, "reference_dma_config");
 	pusha(hevc_ctx->bufs.mv_above_info.addr, "mv_above_info", 7);
 	pusha(run->addresses.mv_color, "mv_color", 0);
 
@@ -289,11 +291,14 @@ static void hevc_set_flags(struct avd_ctx *ctx, struct avd_hevc_run *run)
 static void set_header(struct avd_ctx *ctx, struct avd_hevc_run *run)
 {
 	const struct v4l2_ctrl_hevc_sps *sps = run->sps;
+	const struct v4l2_ctrl_hevc_pps *pps = run->pps;
 	struct avd_dev *avd = ctx->dev;
 	struct avd_hevc_ctx *hevc_ctx = ctx->priv;
 	u32 bytesperline;
 	u32 width = sps->pic_width_in_luma_samples;
 	u32 height = sps->pic_height_in_luma_samples;
+	u32 dma_config = avd->variant->quirks & AVD_QUIRK_HEVC_V5_HEADER ?
+			 HEVC_DMA_CONFIG : 0;
 
 	bool is_intra = run->sl[0].slice_type == V4L2_HEVC_SLICE_TYPE_I;
 
@@ -340,27 +345,45 @@ static void set_header(struct avd_ctx *ctx, struct avd_hevc_run *run)
 			     !(avd->variant->quirks & AVD_QUIRK_NO_PIPE_STATE)),
 	     "hdr_98_const_30");
 
-	push(0, "");
+	push(dma_config, "dma_config");
 	push(0, "");
 
 	if (avd->variant->revision == 3)
 		push(0, "zero");
 
-	push(0, "");
-	push(0, "");
+	push(dma_config, "dma_config");
+	push(dma_config, "dma_config");
 
 	if (avd->variant->revision == 3)
 		push(0, "zero");
 	else if (!(avd->variant->quirks & AVD_QUIRK_NO_PIPE_STATE))
 		pusha(hevc_ctx->bufs.pipe_state.addr, "pipe_state", 0);
 
-	pusha(hevc_ctx->bufs.ip_above.addr, "ip_above", 0);
-	pusha(hevc_ctx->bufs.lf_above.addr, "lf_above", 1);
-	pusha(hevc_ctx->bufs.lf_above_info.addr, "lf_above_info", 2);
-	pusha(hevc_ctx->bufs.lf_left.addr, "lf_left", 3);
-	pusha(hevc_ctx->bufs.lf_left_info.addr, "lf_left_info", 4);
-	pusha(hevc_ctx->bufs.az_above.addr, "az_above", 8);
-	pusha(hevc_ctx->bufs.sw_left.addr, "sw_left", 9);
+	pusha(hevc_ctx->bufs.ip_above.addr, "scratch_addr", 0);
+	pusha(hevc_ctx->bufs.lf_above.addr, "scratch_addr", 1);
+	pusha(hevc_ctx->bufs.lf_above_info.addr, "scratch_addr", 2);
+
+	if ((pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED) ||
+	    !(avd->variant->quirks & AVD_QUIRK_HEVC_V5_HEADER)) {
+		pusha(hevc_ctx->bufs.lf_left.addr,
+		      "scratch_addr", 3);
+		pusha(hevc_ctx->bufs.lf_left_info.addr,
+		      "scratch_addr", 4);
+		if (avd->variant->quirks & AVD_QUIRK_HEVC_V5_HEADER)
+			pusha(0, "reserved_scratch", 0);
+		pusha(hevc_ctx->bufs.az_above.addr,
+		      "scratch_addr", 8);
+		pusha(hevc_ctx->bufs.sw_left.addr,
+		      "scratch_addr", 9);
+	} else {
+		pusha(0, "", 3);
+		pusha(0, "", 4);
+		if (avd->variant->quirks & AVD_QUIRK_HEVC_V5_HEADER)
+			pusha(0, "reserved_scratch", 0);
+		pusha(hevc_ctx->bufs.az_above.addr,
+		      "scratch_addr", 8);
+		pusha(0, "", 9);
+	}
 
 	push(0, "");
 
@@ -621,8 +644,9 @@ static void stream_slice_mv(struct avd_ctx *ctx, struct avd_hevc_run *run,
 		dma_addr_t mv_color_addr =
 			vb2_dma_contig_plane_dma_addr(&ref->base.vb.vb2_buf,
 						      0) +
-			(ref->base.vb.planes[0].length -
-			 mv_color_size(fmt_width(ctx), fmt_height(ctx)));
+			round_down(ref->base.vb.planes[0].length -
+				   mv_color_size(fmt_width(ctx), fmt_height(ctx)),
+				   AVD_ALIGN);
 		pusha(mv_color_addr, "slc_bd4_sps_tile_addr2_lsb8",
 		      decode->dpb[ref_list[sl->collocated_ref_idx]]
 			      .pic_order_cnt_val);
@@ -979,7 +1003,9 @@ static void update_dec_buf_info(struct avd_decoded_buffer *buf,
 static void avd_hevc_adjust_decoded_fmt(struct avd_ctx *ctx,
 					struct v4l2_pix_format_mplane *pix_mp)
 {
-	pix_mp->plane_fmt[0].sizeimage +=
+	/* Keep the MV table outside 128-byte-aligned compressed storage. */
+	pix_mp->plane_fmt[0].sizeimage =
+		ALIGN(pix_mp->plane_fmt[0].sizeimage, AVD_ALIGN) +
 		mv_color_size(pix_mp->width, pix_mp->height);
 }
 
@@ -1312,7 +1338,8 @@ static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
 
 	mv_color_len = mv_color_size(fmt_width(ctx), fmt_height(ctx));
 
-	run->addresses.mv_color = run->base.y_out + (dst_len - mv_color_len);
+	run->addresses.mv_color =
+		run->base.y_out + round_down(dst_len - mv_color_len, AVD_ALIGN);
 	return 0;
 }
 

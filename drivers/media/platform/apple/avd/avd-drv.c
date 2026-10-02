@@ -128,8 +128,10 @@ static int avd_wait_submission_queue(struct avd_ctx *ctx, int vp)
 	}
 
 	if (cur >= max / 2) {
-		/* TODO: to high? low? Has weird side effects??? */
-		usleep_range(500, 650);
+		if (avd->variant->quirks & AVD_QUIRK_HEVC_V5_HEADER)
+			usleep_range(100, 150);
+		else
+			usleep_range(500, 650);
 	}
 	return 0;
 }
@@ -169,6 +171,8 @@ int avd_submit_job(struct avd_ctx *ctx)
 	ctx->fifo_idx = 0;
 	for (i = 0; i < sub->codec; i++)
 		vp += avd->variant->vp_slots[i];
+	if (avd->variant->vp_slot_base[sub->codec])
+		vp = avd->variant->vp_slot_base[sub->codec];
 
 	/*
 	 * avd_device_run() keeps this job from being finished (and the next one
@@ -195,7 +199,9 @@ int avd_submit_job(struct avd_ctx *ctx)
 		seg = &segments[idx];
 		for (i = 0; i < seg->num; i++)
 			writel(seg->instructions[i], reg);
-		if (avd_wait_submission_queue(ctx, vp))
+		if ((!(avd->variant->quirks & AVD_QUIRK_HEVC_V5_HEADER) ||
+		     sub->codec == AVD_CODEC_HEVC) &&
+		    avd_wait_submission_queue(ctx, vp))
 			break;
 		if (idx == num) {
 			/* A completion from here on belongs to this job. */
@@ -727,12 +733,18 @@ static const struct avd_variant avd_t8122_variant = {
 };
 
 static const struct avd_variant avd_t8140_variant = {
-	/* This is filled in using the tunables, what vp/pp to use? */
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 2,
 		[AVD_CODEC_H264] = 1,
 		[AVD_CODEC_VP9] = 1,
 		[AVD_CODEC_AV1] = 1,
+	},
+	/* Tier 0 has holes between the codec-specific VP blocks. */
+	.vp_slot_base = {
+		[AVD_CODEC_HEVC] = 0,
+		[AVD_CODEC_H264] = 4,
+		[AVD_CODEC_VP9] = 8,
+		[AVD_CODEC_AV1] = 9,
 	},
 	.fifo_slots = 7,
 	.configure_stream = t8122_configure_stream,
@@ -746,6 +758,7 @@ static const struct avd_variant avd_t8140_variant = {
 	.submit_offset = 0x40,
 	.submit_queue_max_offset = 0x44,
 	.submit_queue_status_offset = 0x7c,
+	.quirks = AVD_QUIRK_HEVC_V5_HEADER,
 };
 
 static const struct avd_variant avd_t8132_variant = {

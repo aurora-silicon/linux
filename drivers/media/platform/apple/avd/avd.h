@@ -32,6 +32,8 @@
 /* Shifts addreses right and bytesperline?? */
 #define AVD_QUIRK_LSR	BIT(0)
 #define AVD_QUIRK_NO_PIPE_STATE	 BIT(1)
+/* HEVC DMA configuration and extended scratch-address table. */
+#define AVD_QUIRK_HEVC_V5_HEADER	BIT(2)
 
 #define VP_SLOT_NONE		255
 #define INST_FIFO_SLOT_NONE	255
@@ -176,6 +178,7 @@ struct avd_coded_fmt_desc {
 
 struct avd_variant {
 	unsigned int vp_slots[4];
+	unsigned int vp_slot_base[4];
 	unsigned int fifo_slots;
 	unsigned int capabilities;
 	void (*configure_stream)(struct avd_dev *avd, dma_addr_t addr,
