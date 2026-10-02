@@ -21,6 +21,7 @@
 	aliases {
 		bluetooth0 = &bluetooth0;
 		keyboard = &keyboard;
+		sep = &sep;
 		wifi0 = &wifi0;
 	};
 
@@ -280,6 +281,24 @@
 
 	tp_accel {
 	};
+};
+
+/*
+ * Mesa fingerprint sensor on spi2 (J415 ADT /arm-io/spi2/mesa): power on AP
+ * GPIO 178, active high. The data-ready line (GPIO 177) is left out, so the
+ * driver polls until its trigger is confirmed. Native chip select only.
+ */
+&spi2 {
+	status = "okay";
+};
+
+&mesa {
+	status = "okay";
+	enable-gpios = <&pinctrl_ap 178 GPIO_ACTIVE_HIGH>;
+	spi-cs-setup-delay-ns = <20>;
+	spi-cs-hold-delay-ns = <20>;
+	/* Per-device factory data from this Mac's own iBoot system container. */
+	firmware-name = "apple/mesacal-j415.bin";
 };
 
 #include "isp-imx558-cfg0.dtsi"
