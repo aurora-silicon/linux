@@ -588,6 +588,47 @@
 			status = "disabled";
 		};
 
+		ave_dart0: iommu@285080000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x2 0x85080000 0 0xc000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 955 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_venc0_sys>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x00004000 0 0x0fffc000>;
+			status = "disabled";
+		};
+
+		ave_dart1: iommu@2850a0000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x2 0x850a0000 0 0xc000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 955 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_venc0_sys>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x00004000 0 0x0fffc000>;
+			status = "disabled";
+		};
+
+		ave: video-codec@285100000 {
+			compatible = "apple,t8140-ave";
+			reg = <0x2 0x85100000 0 0x45c000>,
+			      <0x2 0x85050000 0 0x4000>,
+			      <0x2 0x85800000 0 0x800000>;
+			reg-names = "codec", "mailbox", "coproc";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 958 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 952 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 951 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 954 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 953 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_venc0_dma>, <&ps_venc0_pipe4>,
+				       <&ps_venc0_pipe5>, <&ps_venc0_me0>, <&ps_venc0_me1>;
+			power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
+			iommus = <&ave_dart0 0>, <&ave_dart1 0>;
+			status = "disabled";
+		};
+
 		pcie0: pcie@1cb0000000 {
 			compatible = "apple,t8140-pcie";
 			device_type = "pci";

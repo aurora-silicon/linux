@@ -23,6 +23,14 @@
 		label = "gpio";
 	};
 
+	ps_venc0_sys: power-controller@240 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x240 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc0_sys";
+	};
+
 	ps_apcie_gp: power-controller@258 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x258 4>;
@@ -257,6 +265,51 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_cvm";
+	};
+
+	ps_venc0_dma: power-controller@8000 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc0_dma";
+		power-domains = <&ps_venc0_sys>;
+	};
+
+	ps_venc0_pipe4: power-controller@8008 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8008 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc0_pipe4";
+		power-domains = <&ps_venc0_dma>;
+	};
+
+	ps_venc0_pipe5: power-controller@8010 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8010 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc0_pipe5";
+		power-domains = <&ps_venc0_dma>;
+	};
+
+	ps_venc0_me0: power-controller@8018 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8018 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc0_me0";
+		power-domains = <&ps_venc0_dma>;
+	};
+
+	ps_venc0_me1: power-controller@8020 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8020 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc0_me1";
+		power-domains = <&ps_venc0_me0>;
 	};
 };
 
