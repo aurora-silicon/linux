@@ -17,6 +17,7 @@
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
+#include <linux/soc/apple/dp-tunnel.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -65,9 +66,21 @@ static int apple_drm_gem_dumb_create(struct drm_file *file_priv,
 	return drm_gem_dma_dumb_create_internal(file_priv, drm, args);
 }
 
+/*
+ * A compositor or boot splash is closing the device.  drm_release() has
+ * already taken its file off the file list, so the Type-C fabric can tell
+ * whether any other one still has the device open.
+ */
+static void apple_drm_postclose(struct drm_device *drm, struct drm_file *file)
+{
+	if (file->was_master)
+		dcp_typec_reorder();
+}
+
 static const struct drm_driver apple_drm_driver = {
 	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(apple_drm_gem_dumb_create),
 	DRM_FBDEV_DMA_DRIVER_OPS,
+	.postclose		= apple_drm_postclose,
 	.name			= DRIVER_NAME,
 	.desc			= DRIVER_DESC,
 	.major			= 1,
@@ -269,9 +282,10 @@ apple_connector_atomic_best_encoder(struct drm_connector *conn,
 	struct drm_encoder *encoder;
 
 	/*
-	 * A Type-C port has one encoder, and its possible_crtcs already names
-	 * the pipeline the fabric routed the port to, so it is the only answer
-	 * there is.
+	 * A Type-C port has one encoder, whose possible_crtcs either already
+	 * names the pipeline the fabric routed the port to or, on dual-stream
+	 * machines, the fixed set the fabric only routes within, so it is the
+	 * only answer there is.
 	 */
 	if (apple_connector->port_encoder)
 		return apple_connector->port_encoder;
@@ -423,10 +437,10 @@ static int apple_probe_per_dcp(struct device *dev,
 }
 
 /*
- * Create one connector per physical Type-C port and attach it to every
- * pipeline that can drive it.  Keeping the connector tied to the port rather
- * than to a pipeline is what gives userspace a stable name to hang its
- * per-monitor configuration on.
+ * Create a connector per physical Type-C port and attach it to every
+ * pipeline that can drive it. The M2 Pro/Max laptops append a second
+ * connector per port for a dock's second DP tunnel, preserving primary
+ * connector names.
  */
 static int apple_probe_typec_ports(struct drm_device *drm,
 				   struct platform_device **dcp,
@@ -435,9 +449,16 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 	unsigned int idx, nr_ports = dcp_typec_nr_ports();
 	int i, ret;
 
-	for (idx = 0; idx < nr_ports; idx++) {
+	/* Keep the existing physical-port connector numbers stable. On the
+	 * M2 Pro/Max laptops, append one more connector per port for a second
+	 * USB4 DP tunnel.
+	 */
+	for (idx = 0; idx < nr_ports * (dcp_typec_dual_stream() ? 2 : 1);
+	     idx++) {
 		struct apple_connector *connector;
 		struct apple_encoder *enc;
+		unsigned int port_idx = idx % nr_ports;
+		bool secondary = idx >= nr_ports;
 		u32 mask = 0;
 
 		connector = kzalloc_obj(*connector);
@@ -450,7 +471,7 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 
 		ret = drm_connector_init(drm, &connector->base,
 					 &apple_connector_funcs,
-					 DRM_MODE_CONNECTOR_USB);
+					 DRM_MODE_CONNECTOR_DisplayPort);
 		if (ret) {
 			kfree(connector);
 			return ret;
@@ -466,13 +487,27 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
 
 		for (i = 0; i < num_dcp; i++) {
-			if (dcp_typec_port_has_candidate(idx, dcp[i]))
-				mask |= crtc_mask[i];
+			if (!dcp_typec_port_has_candidate(port_idx, dcp[i]))
+				continue;
+			/*
+			 * A dock's second stream (DPIN1) always runs on the
+			 * lowest-indexed Type-C-only pipeline (dcpext1). Fix the
+			 * connector to it: compositors read possible_crtcs once
+			 * and would otherwise pair it with a pipeline the stream
+			 * can never be routed to.
+			 */
+			if (secondary) {
+				if (dcp_is_typec_only(dcp[i]) &&
+				    (!mask || crtc_mask[i] < mask))
+					mask = crtc_mask[i];
+				continue;
+			}
+			mask |= crtc_mask[i];
 		}
 
 		if (!mask) {
 			drm_warn(drm, "Type-C port %u has no display pipeline\n",
-				 idx);
+					 port_idx);
 			return -ENODEV;
 		}
 
@@ -496,7 +531,7 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		connector->port_encoder = &enc->base;
 		connector->candidate_crtcs = mask;
 
-		dcp_typec_port_set_connector(idx, connector);
+		dcp_typec_port_set_connector(port_idx, secondary, connector);
 	}
 
 	return 0;
@@ -684,6 +719,9 @@ static int apple_drm_init(struct device *dev)
 	ret = drm_dev_register(&apple->drm, 0);
 	if (ret)
 		goto err_unbind;
+
+	/* the fabric keeps order only once registered: catch up on probe */
+	dcp_typec_reorder();
 
 	drm_client_setup_with_fourcc(&apple->drm, DRM_FORMAT_XRGB8888);
 

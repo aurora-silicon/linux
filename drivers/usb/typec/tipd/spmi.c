@@ -279,6 +279,8 @@ out_resume:
 MODULE_DEVICE_TABLE(of, sn201202x_of_match);
 
 static const struct dev_pm_ops sn201202x_pm_ops = {
+	.prepare = pm_sleep_ptr(tipd_prepare),
+	.complete = pm_sleep_ptr(tipd_complete),
 	SET_SYSTEM_SLEEP_PM_OPS(sn201202x_suspend, sn201202x_resume)
 };
 

@@ -14,6 +14,7 @@
 #include <linux/of_device.h>
 #include <linux/ratelimit.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/rtkit.h>
 
 #include <drm/drm_atomic_helper.h>
@@ -254,12 +255,23 @@ static int dcp_retrain_active_crtc(struct apple_connector *connector)
 	return ret;
 }
 
+void dcp_handle_hotplug_actions(struct apple_dcp *dcp, unsigned int action)
+{
+	if (action & DCP_HOTPLUG_VBLANK)
+		schedule_work(&dcp->vblank_wq);
+	if ((action & DCP_HOTPLUG_NOTIFY) && dcp->connector)
+		schedule_work(&dcp->connector->hotplug_wq);
+}
+
 void dcp_retrain_oob(struct apple_connector *connector)
 {
-	struct apple_dcp *dcp = platform_get_drvdata(connector->dcp);
+	struct platform_device *pdev = READ_ONCE(connector->dcp);
+	struct apple_dcp *dcp;
 
-	if (!READ_ONCE(connector->connected) || !READ_ONCE(dcp->valid_mode))
+	/* a Type-C port with no pipeline behind it has nothing to retrain */
+	if (!pdev || !READ_ONCE(connector->connected))
 		return;
+	dcp = platform_get_drvdata(pdev);
 
 	/*
 	 * Bringing up another high-speed Type-C route can disturb an active DPTX
@@ -267,21 +279,27 @@ void dcp_retrain_oob(struct apple_connector *connector)
 	 * use the normal hotplug worker to replay the active CRTC from process
 	 * context; sending a synthetic disconnect would tear down the connector.
 	 */
-	WRITE_ONCE(dcp->valid_mode, false);
+	dcp_mode_invalidate(&dcp->mode_state);
 	schedule_work(&connector->hotplug_wq);
 }
 
 void dcp_hotplug(struct work_struct *work)
 {
 	struct apple_connector *connector;
+	struct platform_device *pdev;
 	struct apple_dcp *dcp;
 	int ret;
 
 	connector = container_of(work, struct apple_connector, hotplug_wq);
 
-	dcp = platform_get_drvdata(connector->dcp);
+	pdev = READ_ONCE(connector->dcp);
+	if (!pdev) {	/* a Type-C port unrouted after this was queued */
+		drm_kms_helper_connector_hotplug_event(&connector->base);
+		return;
+	}
+	dcp = platform_get_drvdata(pdev);
 	dev_info(dcp->dev, "%s() connected:%d valid_mode:%d nr_modes:%u\n", __func__,
-		 connector->connected, dcp->valid_mode, dcp->nr_modes);
+		 connector->connected, READ_ONCE(dcp->mode_state.valid), dcp->nr_modes);
 
 	if (!connector->connected) {
 		drm_edid_free(connector->drm_edid);
@@ -293,7 +311,8 @@ void dcp_hotplug(struct work_struct *work)
 	 * display modes from atomic_flush, so userspace needs to trigger a
 	 * flush, or the CRTC gets no signal.
 	 */
-	if (connector->base.state && !dcp->valid_mode && connector->connected) {
+	if (connector->base.state && !READ_ONCE(dcp->mode_state.valid) && connector->connected &&
+	    !(dcp_is_usb4_output(dcp) && apple_dp_tunnel_t602x())) {
 		drm_connector_set_link_status_property(&connector->base,
 						       DRM_MODE_LINK_STATUS_BAD);
 
@@ -401,7 +420,7 @@ static void dcpep_got_msg(struct apple_dcp *dcp, u64 message)
 int dcp_get_modes(struct drm_connector *connector)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
-	struct platform_device *pdev = apple_connector->dcp;
+	struct platform_device *pdev = READ_ONCE(apple_connector->dcp);
 	struct apple_dcp *dcp;
 
 	struct drm_device *dev = connector->dev;
@@ -437,10 +456,10 @@ int dcp_get_modes(struct drm_connector *connector)
 	}
 	drm_connector_set_vrr_capable_property(connector, vrr_capable);
 
-	if (dcp->nr_modes && dcp->dcpavserv.enabled &&
+	if (dcp->nr_modes &&
 	    !apple_connector->drm_edid) {
 		const struct drm_edid *edid;
-		edid = dcpavserv_copy_edid(dcp->dcpavserv.service);
+		edid = dcpavserv_copy_edid(dcp);
 		if (IS_ERR_OR_NULL(edid)) {
 			dev_info(dcp->dev, "copy_edid failed: %pe\n", edid);
 		} else {
@@ -448,8 +467,10 @@ int dcp_get_modes(struct drm_connector *connector)
 			apple_connector->drm_edid = edid;
 		}
 	}
-	if (dcp->nr_modes && apple_connector->drm_edid)
+	if (dcp->nr_modes && apple_connector->drm_edid) {
 		drm_edid_connector_update(connector, apple_connector->drm_edid);
+		dcp_retry_placeholder_edid(dcp, apple_connector->drm_edid);
+	}
 
 	/*
 	 * An internal panel has no EDID, so nothing fills in the refresh range
@@ -486,7 +507,7 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 				    const struct drm_display_mode *mode)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
-	struct platform_device *pdev = apple_connector->dcp;
+	struct platform_device *pdev = READ_ONCE(apple_connector->dcp);
 	struct apple_dcp *dcp;
 
 	if (!pdev)
@@ -502,6 +523,7 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
 	struct apple_dcp *dcp = platform_get_drvdata(apple_crtc->dcp);
 	struct drm_crtc_state *crtc_state;
+	unsigned int action;
 	int ret = -EIO;
 	bool modeset;
 
@@ -509,7 +531,8 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	if (!crtc_state)
 		return 0;
 
-	modeset = drm_atomic_crtc_needs_modeset(crtc_state) || !dcp->valid_mode;
+	modeset = drm_atomic_crtc_needs_modeset(crtc_state) ||
+		  !READ_ONCE(dcp->mode_state.valid);
 
 	if (!modeset)
 		return 0;
@@ -518,6 +541,7 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	if (crtc_state->mode.hdisplay == 0 && crtc_state->mode.vdisplay == 0)
 		return 0;
 
+	dcp_mode_begin(&dcp->mode_state);
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:
 		ret = iomfb_modeset_v12_3(dcp, crtc_state);
@@ -530,6 +554,10 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 			  dcp->fw_compat);
 		break;
 	}
+
+	action = dcp_mode_finish(&dcp->mode_state, !ret, dcp->connector ?
+				&dcp->connector->connected : NULL);
+	dcp_handle_hotplug_actions(dcp, action);
 
 	return ret;
 }
@@ -562,7 +590,7 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 	 * re-runs the modeset, which marks the mode valid again, before the
 	 * firmware has reported the display back.
 	 */
-	if (!dcp->valid_mode || !dcp->connector || !dcp->connector->connected) {
+	if (!READ_ONCE(dcp->mode_state.valid) || !dcp->connector || !dcp->connector->connected) {
 		schedule_work(&dcp->vblank_wq);
 		return;
 	}
@@ -646,7 +674,7 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 {
 	/* We're going down */
 	dcp->active = false;
-	dcp->valid_mode = false;
+	dcp_mode_invalidate(&dcp->mode_state);
 
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:

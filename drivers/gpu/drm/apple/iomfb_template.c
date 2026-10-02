@@ -126,6 +126,7 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 	ktime_t now = ktime_get();
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
 	dcp->last_swap_id = resp->swap_id;
+	dcp_swap_watchdog_complete(dcp);
 
 	dcp_drm_crtc_page_flip(dcp, now);
 	if (dcp->crc_enabled) {
@@ -493,6 +494,13 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 static struct dcp_read_edt_data_resp
 dcpep_cb_read_edt_data(struct apple_dcp *dcp, struct dcp_read_edt_data_req *req)
 {
+	/* Observe boot-property requests without inventing firmware timings. */
+	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_eDP)
+		dev_info(dcp->dev,
+			 "read_edt_data key=%.*s count=%u default0=%#x ret=0\n",
+			 (int)sizeof(req->key), req->key, req->count,
+			 req->value[0]);
+
 	return (struct dcp_read_edt_data_resp){
 		.value[0] = req->value[0],
 		.ret = 0,
@@ -602,6 +610,12 @@ static u8 dcpep_cb_prop_end(struct apple_dcp *dcp,
 			    struct dcp_set_dcpav_prop_end_req *req)
 {
 	u8 resp = dcpep_process_chunks(dcp, req);
+
+	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_eDP)
+		dev_info(dcp->dev,
+			 "DCP property key=%.*s bytes=%zu accepted=%u nr_modes=%u\n",
+			 (int)sizeof(req->key), req->key, dcp->chunks.length,
+			 resp, dcp->nr_modes);
 
 	/* move chunked data to connector to provide it via debugfs */
 	dcp_connector_update_dict(dcp->connector, req->key, &dcp->chunks);
@@ -932,15 +946,21 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 
 	dcp_swap_start(dcp, false, &swap_req, dcp_swap_clear_started, cookie);
 
-	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(50));
+	/*
+	 * On unplug the firmware powers the external pipe down on its own and
+	 * can take tens of milliseconds before it answers (and swallows) the
+	 * clear swap. That is not a crash: a real one is reported through the
+	 * RTKit crash callback. Wait longer and carry on with the power-off
+	 * either way, otherwise every later modeset fails with -EINVAL.
+	 */
+	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(500));
 	swap_id = cookie->swap_id;
 	kref_put(&cookie->refcount, release_swap_cookie);
-	if (ret <= 0) {
-		dcp->crashed = true;
-		return;
-	}
-
-	dev_dbg(dcp->dev, "%s: clear swap submitted: %u\n", __func__, swap_id);
+	if (ret <= 0)
+		dev_warn(dcp->dev, "%s: clear swap timed out\n", __func__);
+	else
+		dev_dbg(dcp->dev, "%s: clear swap submitted: %u\n", __func__,
+			swap_id);
 
 	poff_cookie = kzalloc(sizeof(*poff_cookie), GFP_KERNEL);
 	if (!poff_cookie)
@@ -1015,6 +1035,7 @@ void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp)
 static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 {
 	struct apple_connector *connector = dcp->connector;
+	unsigned int action;
 
 	/* DCP issues hotplug_gated callbacks after SetPowerState() calls on
 	 * devices with display (macbooks, imacs). This must not result in
@@ -1025,6 +1046,13 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 	 */
 	if (dcp->main_display)
 		return;
+	/*
+	 * Report firmware hotplug independently of the USB4 PHY experiment.
+	 * Reassigning lpdptxphy blanked eDP even with these callbacks ignored;
+	 * suppressing connector notifications does not protect the panel.
+	 * Mode probing still uses this DCP's firmware modes, and mode_valid
+	 * rejects modes absent from that list. Do not synthesize a mode here.
+	 */
 
 	/*
 	 * Same for the unplug a Type-C output reports after its CRTC was
@@ -1033,42 +1061,27 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 	if (!(*connected) && READ_ONCE(dcp->typec_crtc_off) &&
 	    READ_ONCE(dcp->typec_cable_connected)) {
 		dev_dbg(dcp->dev, "cb_hotplug() ignoring unplug of powered-off Type-C output\n");
-		dcp->valid_mode = false;
+		dcp_mode_invalidate(&dcp->mode_state);
 		schedule_work(&dcp->vblank_wq);
 		return;
 	}
+	if (dcp_is_typec_output(dcp) && *connected && dcp->nr_modes)
+		complete_all(&dcp->typec_iomfb_hpd_ready);
 
-	if (dcp->during_modeset) {
-		/*
-		 * Remember it rather than dropping it.  Resume re-runs the
-		 * modeset and the firmware reports the display back while that
-		 * is still in flight; discarding it leaves the connector marked
-		 * disconnected forever, with no further event to correct it.
-		 */
-		dev_info(dcp->dev,
-			 "cb_hotplug() deferred during modeset connected:%llu\n",
-			 *connected);
-		dcp->pending_hotplug = true;
-		dcp->pending_hotplug_connected = !!(*connected);
-		return;
+	action = dcp_mode_hotplug(&dcp->mode_state, !!(*connected),
+				  connector ? &connector->connected : NULL);
+	/*
+	 * A Type-C sink can assert HPD only after a modeset has already failed,
+	 * as a TV behind a DP-to-HDMI converter does when it wakes from standby.
+	 * The connector state does not change then; re-apply the mode anyway.
+	 */
+	if (*connected && dcp_is_typec_output(dcp) &&
+	    !READ_ONCE(dcp->mode_state.valid) &&
+	    !READ_ONCE(dcp->mode_state.changing)) {
+		dcp->swap_watchdog_retrains = 0;
+		action |= DCP_HOTPLUG_NOTIFY;
 	}
-
-	dev_info(dcp->dev, "cb_hotplug() connected:%llu, valid_mode:%d\n",
-		 *connected, dcp->valid_mode);
-
-	/* Hotplug invalidates mode. DRM doesn't always handle this. */
-	if (!(*connected)) {
-		dcp->valid_mode = false;
-		/* after unplug swap will not complete until the next
-		 * set_digital_out_mode */
-		schedule_work(&dcp->vblank_wq);
-	}
-
-	if (connector && connector->connected != !!(*connected)) {
-		connector->connected = !!(*connected);
-		dcp->valid_mode = false;
-		schedule_work(&connector->hotplug_wq);
-	}
+	dcp_handle_hotplug_actions(dcp, action);
 }
 
 static void
@@ -1171,6 +1184,7 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 	}
 	dcp->swap_start = ktime_get();
 	dcp->swap_submit_timestamp = arch_timer_read_counter();
+	dcp_swap_watchdog_arm(dcp);
 
 	while (!list_empty(&dcp->swapped_out_fbs)) {
 		struct dcp_fb_reference *entry;
@@ -1200,7 +1214,8 @@ static void do_swap(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	struct dcp_swap_start_req start_req = { 0 };
 
-	if (dcp->connector && dcp->connector->connected)
+	if (READ_ONCE(dcp->mode_state.valid) && dcp->connector &&
+	    READ_ONCE(dcp->connector->connected))
 		dcp_swap_start(dcp, false, &start_req, dcp_swap_started, NULL);
 	else
 		dcp_drm_crtc_vblank(dcp->crtc);
@@ -1298,7 +1313,6 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	/* increase refcount to ensure the receiver has a reference */
 	kref_get(&cookie->refcount);
 
-	dcp->during_modeset = true;
 	dcp->swap_submit_timestamp = 0;
 
 	if (mode->vrr)
@@ -1317,25 +1331,6 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	ret = wait_for_completion_timeout(&cookie->done,
 					  msecs_to_jiffies(8500));
 
-	dcp->during_modeset = false;
-
-	if (dcp->pending_hotplug) {
-		bool connected = dcp->pending_hotplug_connected;
-		struct apple_connector *connector = dcp->connector;
-
-		dcp->pending_hotplug = false;
-		dev_info(dcp->dev, "replaying deferred hotplug connected:%d\n",
-			 connected);
-
-		if (!connected)
-			dcp->valid_mode = false;
-
-		if (connector && connector->connected != connected) {
-			connector->connected = connected;
-			dcp->valid_mode = false;
-			schedule_work(&connector->hotplug_wq);
-		}
-	}
 	dev_info(dcp->dev, "set_digital_out_mode finished:%d\n", ret);
 
 	if (ret == 0) {
@@ -1353,7 +1348,6 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			jiffies_to_msecs(ret));
 	}
 	kref_put(&cookie->refcount, release_wait_cookie);
-	dcp->valid_mode = true;
 	dcp->vrr_enabled = mode->vrr && crtc_state->vrr_enabled;
 
 	return 0;

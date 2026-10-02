@@ -1129,6 +1129,28 @@ tb_port_path_direction_downstream(const struct tb_port *src,
 	return src->sw->config.depth < dst->sw->config.depth;
 }
 
+/*
+ * DP IN adapter of an Apple silicon host router (its NHI glue wants DP tunnel
+ * notifications). These need a few extra steps compared to other hosts.
+ */
+static inline bool tb_port_is_apple_host_dpin(const struct tb_port *port)
+{
+	const struct tb *tb = port->sw->tb;
+
+	/* the KUnit tests build switches without a domain */
+	if (!tb || !tb->nhi || tb_route(port->sw) || !tb_port_is_dpin(port))
+		return false;
+	return tb->nhi->ops && tb->nhi->ops->dp_tunnel_changed;
+}
+
+static inline bool tb_port_needs_host_dp_credits(const struct tb_port *port)
+{
+	const struct tb *tb = port->sw->tb;
+
+	return tb && tb->nhi && !tb_route(port->sw) && tb_port_is_dpin(port) &&
+	       (tb->nhi->quirks & QUIRK_HOST_DP_NFC_CREDITS);
+}
+
 static inline bool tb_port_use_credit_allocation(const struct tb_port *port)
 {
 	return tb_port_is_null(port) && port->sw->credit_allocation;
@@ -1460,6 +1482,8 @@ int usb4_port_retimer_nvm_read(struct tb_port *port, u8 index,
 			       unsigned int address, void *buf, size_t size);
 
 int usb4_usb3_port_max_link_rate(struct tb_port *port);
+int usb4_usb3_port_consumed_bandwidth(struct tb_port *port, int *upstream_bw,
+				      int *downstream_bw);
 int usb4_usb3_port_allocated_bandwidth(struct tb_port *port, int *upstream_bw,
 				       int *downstream_bw);
 int usb4_usb3_port_allocate_bandwidth(struct tb_port *port, int *upstream_bw,

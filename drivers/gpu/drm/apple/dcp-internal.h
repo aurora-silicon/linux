@@ -17,6 +17,7 @@
 
 #include "dptxep.h"
 #include "iomfb.h"
+#include "iomfb-state.h"
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
 #include "epic/dpavservep.h"
@@ -38,9 +39,20 @@ struct apple_dcp_typec_route {
 	u32 dptx_phy;
 	u32 mux_index;
 	bool selected;
+	/* crossbar output actually selected: xbar (dpphy) or a Thunderbolt dpin */
+	unsigned int tunnel_dpin;
+	struct mux_control *active_xbar;
+	bool tunnel;
+	/* tunnel: crossbar brought up (at DidChangeLinkConfiguration) */
+	bool xbar_up;
 };
 
 bool dcp_is_typec_output(struct apple_dcp *dcp);
+void dcp_swap_watchdog_arm(struct apple_dcp *dcp);
+void dcp_swap_watchdog_complete(struct apple_dcp *dcp);
+bool dcp_is_usb4_output(struct apple_dcp *dcp);
+void dcp_retry_placeholder_edid(struct apple_dcp *dcp,
+				const struct drm_edid *drm_edid);
 
 struct dcpav_service_epic;
 
@@ -203,11 +215,12 @@ struct apple_dcp {
 	u64 swap_submit_timestamp;
 
 	/* Current display mode */
-	bool during_modeset;
-	/* hotplug reported while a modeset was in flight, applied afterwards */
-	bool pending_hotplug;
-	bool pending_hotplug_connected;
-	bool valid_mode;
+	struct dcp_mode_state mode_state;
+	/* One HPD pulse after a placeholder EDID, per Type-C connection. */
+	bool placeholder_retried;
+	u64 typec_generation;	/* hpd_mutex: identifies the current connection */
+	u64 placeholder_generation;
+	struct delayed_work placeholder_edid_wq;
 	bool use_timestamps;
 	bool vrr_enabled;
 	struct dcp_set_digital_out_mode_req mode;
@@ -242,6 +255,10 @@ struct apple_dcp {
 
 	/* Workqueue for sending vblank events when a dcp swap is not possible */
 	struct work_struct vblank_wq;
+
+	/* Completes a Type-C swap that DCP dropped, and recovers the pipe. */
+	struct delayed_work swap_watchdog_wq;
+	unsigned int swap_watchdog_retrains;
 
 	/* List of referenced drm_framebuffers which can be unreferenced
 	 * on the next successfully completed swap.
@@ -285,8 +302,24 @@ struct apple_dcp {
 	u32 nr_typec_routes;
 	bool phy_managed_by_typec;
 	bool typec_cable_connected;
+	/* DPTX feeds a Thunderbolt DP IN adapter, not the Type-C PHY lanes */
+	bool dptx_tunnel;
+	/* DFP port in the DPTX target: 0 = dpphy, 1 = dpin0, 2 = dpin1 */
+	u8 dptx_dfp_port;
+	/* wakes/sleeps the Thunderbolt DP IN adapter from DCP Activate/Deactivate */
+	int (*tb_dpin_set_active)(void *ctx, bool active);
+	void *tb_dpin_ctx;
+	/*
+	 * Serializes the Thunderbolt DP IN callback and tunnel crossbar state
+	 * between DCP apcalls and tunnel teardown; never held while waiting
+	 * for DCP.
+	 */
+	struct mutex tb_lock;
+	bool tb_clock_ok;
 	/* CRTC powered off while the Type-C cable stays attached */
 	bool typec_crtc_off;
+	/* IOMFB reports its video interface ready after DPTX link training. */
+	struct completion typec_iomfb_hpd_ready;
 	struct delayed_work typec_reconnect_wq;
 	struct delayed_work typec_fabric_retrain_wq;
 	u32 typec_reconnect_tries;
@@ -308,6 +341,7 @@ struct apple_dcp {
 };
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
+void dcp_handle_hotplug_actions(struct apple_dcp *dcp, unsigned int action);
 
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);

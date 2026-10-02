@@ -6,15 +6,19 @@
  * Author: Heikki Krogerus <heikki.krogerus@linux.intel.com>
  */
 
+#include <linux/atomic.h>
 #include <linux/bits.h>
 #include <linux/bitfield.h>
 #include <linux/interrupt.h>
+#include <linux/notifier.h>
 #include <linux/power_supply.h>
 #include <linux/usb/typec.h>
 #include <linux/usb/typec_mux.h>
 
 #ifndef __TPS6598X_H__
 #define __TPS6598X_H__
+
+#include "cd321x-pm.h"
 
 #define TPS_FIELD_GET(_mask, _reg) ((typeof(_mask))(((_reg) & (_mask)) >> __bf_shf(_mask)))
 
@@ -283,6 +287,7 @@ struct tipd_data {
 	void (*remove)(struct tps6598x *tps);
 	int (*register_port)(struct tps6598x *tps, struct fwnode_handle *node);
 	void (*unregister_port)(struct tps6598x *tps);
+	void (*ready)(struct tps6598x *tps);
 	void (*trace_data_status)(u32 status);
 	void (*trace_power_status)(u16 status);
 	void (*trace_status)(u32 status);
@@ -292,6 +297,8 @@ struct tipd_data {
 	bool (*read_data_status)(struct tps6598x *tps);
 	int (*reset)(struct tps6598x *tps);
 	int (*connect)(struct tps6598x *tps, u32 status);
+	void (*suspend_prepare)(struct tps6598x *tps);
+	void (*resume_reverify)(struct tps6598x *tps);
 };
 
 struct tps6598x {
@@ -369,14 +376,21 @@ struct cd321x {
 
 	struct typec_mux *mux;
 	struct typec_mux_state state;
+	bool state_valid;
 	u32 dp_status;
 	u32 dp_conf;
 	struct typec_thunderbolt_switch *tbt_switch;
+	struct notifier_block tbt_notifier;
+	bool tbt_notifier_registered;
+	atomic_t link_event;
 	bool display_route_active;
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;
+	struct delayed_work resume_work;
+	struct cd321x_pm_state pm;
 	struct usb_pd_identity cur_partner_identity;
+	bool cur_partner_is_pd;
 
 	struct fwnode_handle *connector_fwnode;
 };
@@ -397,6 +411,8 @@ extern const struct regmap_config tps6598x_regmap_config;
 
 int tipd_init(struct tps6598x *tps);
 void tipd_remove(struct tps6598x *tps);
+int tipd_prepare(struct device *dev);
+void tipd_complete(struct device *dev);
 int tipd_suspend(struct tps6598x *tps);
 int tipd_resume(struct tps6598x *tps);
 

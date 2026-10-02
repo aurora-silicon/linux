@@ -316,6 +316,16 @@ config APPLE_DART
 
 	  Say Y here if you are using an Apple SoC.
 
+config APPLE_DART_KUNIT_TEST
+	bool "KUnit tests for Apple DART locked domains" if !KUNIT_ALL_TESTS
+	depends on APPLE_DART=y && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Test firmware mapping before attachment and locked page-table
+	  handoff without accessing physical DART hardware. Verify that
+	  legacy display roots can be replaced while newer firmware-owned
+	  roots retain their mappings and reject conflicting host entries.
+
 config S390_IOMMU
 	def_bool y if S390 && PCI
 	depends on S390 && PCI

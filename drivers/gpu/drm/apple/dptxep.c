@@ -3,8 +3,13 @@
 
 #include <linux/bitfield.h>
 #include <linux/completion.h>
+#include <linux/module.h>
 #include <linux/phy/phy.h>
 #include <linux/delay.h>
+#include <linux/jiffies.h>
+#include <linux/printk.h>
+
+#include <linux/soc/apple/dp-tunnel.h>
 
 #include "afk.h"
 #include "dcp.h"
@@ -73,30 +78,79 @@ struct dptxport_apcall_set_tiled {
 	__le32 retcode;
 };
 
+/*
+ * Ported from aurora-silicon/linux#8: a Thunderbolt DP tunnel uses the same
+ * plain CORE|ATC|DIE|CONNECTED target as a direct alt-mode PHY. CORE is the
+ * DFP port (0 = dpphy, 1/2 = dpin0/dpin1, dcp->dptx_dfp_port), ATC is the
+ * route's own ATC index -- no separate DPIN field.
+ */
+static u32 dptxport_remote_target(struct apple_dcp *dcp, u8 core, u8 atc,
+				  u8 die)
+{
+	return FIELD_PREP(DCPDPTX_REMOTE_PORT_CORE, core) |
+	       FIELD_PREP(DCPDPTX_REMOTE_PORT_ATC, atc) |
+	       FIELD_PREP(DCPDPTX_REMOTE_PORT_DIE, die) |
+	       DCPDPTX_REMOTE_PORT_CONNECTED;
+}
+
 int dptxport_validate_connection(struct apple_epic_service *service, u8 core,
 				 u8 atc, u8 die)
 {
 	struct dptx_port *dptx = service->cookie;
 	struct dcpdptx_connection_cmd cmd, resp;
 	int ret;
-	u32 target = FIELD_PREP(DCPDPTX_REMOTE_PORT_CORE, core) |
-		     FIELD_PREP(DCPDPTX_REMOTE_PORT_ATC, atc) |
-		     FIELD_PREP(DCPDPTX_REMOTE_PORT_DIE, die) |
-		     DCPDPTX_REMOTE_PORT_CONNECTED;
+	u32 target = dptxport_remote_target(service->ep->dcp, core, atc, die);
+
+	/*
+	 * attributes: role (0 = direct PHY, 1 = Thunderbolt/USB4 DP IN) |
+	 * supportsHPD << 8. A real, hardware-validated reference
+	 * implementation of the equivalent Thunderbolt DP tunnel mechanism
+	 * on a different SoC (aurora-silicon/linux#8) adds this exact role
+	 * bit for its tunnel routes; our own analog-DPIN path has never set
+	 * it, always sending a plain direct-PHY attributes value even
+	 * though this is a genuinely USB4-tunneled connection. DCP firmware
+	 * appears to treat a failed AUX probe as fatal for role=0 but keeps
+	 * training regardless for role=1 (a Thunderbolt tunnel's AUX
+	 * proxying may not respond as fast as a direct PHY's): repeated
+	 * test runs with substantially different Activate/crossbar ordering
+	 * all reached the identical INACTIVE_SINK_DETECTED/DPRX-timeout
+	 * outcome, which points at a signal we are not sending at all
+	 * rather than a timing issue fixable by reordering.
+	 */
+	u32 attrs = 0x100 | (dcp_is_usb4_output(service->ep->dcp) ? 1 : 0);
 
 	trace_dptxport_validate_connection(dptx, core, atc, die);
+	dptx->validate_calls++;
+	dev_dbg(service->ep->dcp->dev,
+		 "DPTX validate: call #%u this boot target=0x%x core=%u atc=%u die=%u attrs=0x%x caller=%pS\n",
+		 dptx->validate_calls, target, core, atc, die,
+		 attrs, __builtin_return_address(0));
 
 	cmd.target = cpu_to_le32(target);
-	cmd.unk = cpu_to_le32(0x100);
+	cmd.unk = cpu_to_le32(attrs);
 	ret = afk_service_call(service, 0, 12, &cmd, sizeof(cmd), 40, &resp,
 			       sizeof(resp), 40);
 	if (ret)
 		return ret;
 
-	if (le32_to_cpu(resp.target) != target)
+	if (le32_to_cpu(resp.target) != target) {
+		dev_warn(service->ep->dcp->dev,
+			 "validate_connection: target reply 0x%x (sent 0x%x)\n",
+			 le32_to_cpu(resp.target), target);
 		return -EINVAL;
-	if (le32_to_cpu(resp.unk) != 0x100)
-		return -EINVAL;
+	}
+	if (le32_to_cpu(resp.unk) != attrs) {
+		/* only the Thunderbolt DP IN role is allowed to differ */
+		if (!dcp_is_usb4_output(service->ep->dcp)) {
+			dev_warn(service->ep->dcp->dev,
+				 "validate_connection: attrs reply 0x%x (sent 0x%x), rejecting\n",
+				 le32_to_cpu(resp.unk), attrs);
+			return -EINVAL;
+		}
+		dev_info(service->ep->dcp->dev,
+			 "validate_connection: attrs reply 0x%x (sent 0x%x)\n",
+			 le32_to_cpu(resp.unk), attrs);
+	}
 
 	return 0;
 }
@@ -106,14 +160,18 @@ int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
 {
 	struct dptx_port *dptx = service->cookie;
 	struct dcpdptx_connection_cmd cmd, resp;
-	u32 unk_field = supports_hpd ? DCPDPTX_REMOTE_PORT_SUPPORTS_HPD : 0;
+	/* same role bit as dptxport_validate_connection() above */
+	u32 unk_field = (supports_hpd ? DCPDPTX_REMOTE_PORT_SUPPORTS_HPD : 0) |
+			(dcp_is_usb4_output(service->ep->dcp) ? 1 : 0);
 	int ret;
-	u32 target = FIELD_PREP(DCPDPTX_REMOTE_PORT_CORE, core) |
-		     FIELD_PREP(DCPDPTX_REMOTE_PORT_ATC, atc) |
-		     FIELD_PREP(DCPDPTX_REMOTE_PORT_DIE, die) |
-		     DCPDPTX_REMOTE_PORT_CONNECTED;
+	u32 target = dptxport_remote_target(service->ep->dcp, core, atc, die);
 
 	trace_dptxport_connect(dptx, core, atc, die);
+	dptx->connect_calls++;
+	dev_dbg(service->ep->dcp->dev,
+		 "DPTX connect: call #%u this boot target=0x%x unk=0x%x caller=%pS\n",
+		 dptx->connect_calls, target, unk_field,
+		 __builtin_return_address(0));
 
 	cmd.target = cpu_to_le32(target);
 	cmd.unk = cpu_to_le32(unk_field);
@@ -122,8 +180,12 @@ int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
 	if (ret)
 		return ret;
 
-	if (le32_to_cpu(resp.target) != target)
+	if (le32_to_cpu(resp.target) != target) {
+		dev_warn(service->ep->dcp->dev,
+			 "connect: target reply 0x%x (sent 0x%x)\n",
+			 le32_to_cpu(resp.target), target);
 		return -EINVAL;
+	}
 	if (le32_to_cpu(resp.unk) != unk_field)
 		dev_notice(service->ep->dcp->dev, "unexpected unk field in reply: 0x%x (0x%x)\n",
 			  le32_to_cpu(resp.unk), unk_field);
@@ -133,15 +195,38 @@ int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
 
 int dptxport_request_display(struct apple_epic_service *service)
 {
-	return afk_service_call(service, 0, 6, NULL, 0, 16, NULL, 0, 16);
+	struct dptx_port *dptx = service->cookie;
+	int ret;
+
+	dptx->request_calls++;
+	dev_dbg(service->ep->dcp->dev,
+		 "DPTX request_display: call #%u this boot caller=%pS\n",
+		 dptx->request_calls, __builtin_return_address(0));
+	ret = afk_service_call(service, 0, 6, NULL, 0, 16, NULL, 0, 16);
+	dev_dbg(service->ep->dcp->dev,
+		 "DPTX request_display: call #%u result=%d\n",
+		 dptx->request_calls, ret);
+	return ret;
 }
 
 int dptxport_release_display(struct apple_epic_service *service)
 {
-	return afk_service_call(service, 0, 7, NULL, 0, 16, NULL, 0, 16);
+	struct dptx_port *dptx = service->cookie;
+	int ret;
+
+	dptx->release_calls++;
+	dev_dbg(service->ep->dcp->dev,
+		 "DPTX release_display: call #%u this boot caller=%pS\n",
+		 dptx->release_calls, __builtin_return_address(0));
+	ret = afk_service_call(service, 0, 7, NULL, 0, 16, NULL, 0, 16);
+	dev_dbg(service->ep->dcp->dev,
+		 "DPTX release_display: call #%u result=%d\n",
+		 dptx->release_calls, ret);
+	return ret;
 }
 
-int dptxport_set_hpd(struct apple_epic_service *service, bool hpd)
+int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
+			     unsigned int timeout_ms)
 {
 	struct dcpdptx_hotplug_cmd cmd, resp;
 	int ret;
@@ -151,13 +236,22 @@ int dptxport_set_hpd(struct apple_epic_service *service, bool hpd)
 	if (hpd)
 		cmd.unk = cpu_to_le32(1);
 
-	ret = afk_service_call(service, 8, 8, &cmd, sizeof(cmd), 12, &resp,
-			       sizeof(resp), 12);
+	ret = afk_service_call_timeout(service, 8, 8, &cmd, sizeof(cmd), 12,
+				       &resp, sizeof(resp), 12, timeout_ms);
 	if (ret)
 		return ret;
-	if (le32_to_cpu(resp.unk) != hpd)
+	if (le32_to_cpu(resp.unk) != hpd) {
+		dev_warn(service->ep->dcp->dev,
+			 "set_hpd: unk reply 0x%x (sent hpd=%d)\n",
+			 le32_to_cpu(resp.unk), hpd);
 		return -EINVAL;
+	}
 	return 0;
+}
+
+int dptxport_set_hpd(struct apple_epic_service *service, bool hpd)
+{
+	return dptxport_set_hpd_timeout(service, hpd, MSEC_PER_SEC);
 }
 
 static int
@@ -261,6 +355,15 @@ static int dptxport_call_get_max_lane_count(struct apple_epic_service *service,
 	if (reply_size < sizeof(*reply))
 		return -EINVAL;
 
+	if (!dptx->atcphy) {
+		/* USB4 DP IN: no ATC DP PHY to validate. */
+		dptx->lane_count = 4;
+		reply->retcode = cpu_to_le32(0);
+		reply->lane_count = cpu_to_le64(4);
+		dev_info(dcp->dev, "get_max_lane_count: USB4 DP IN, 4 lanes\n");
+		return 0;
+	}
+
 	ret = phy_validate(dptx->atcphy, PHY_MODE_DP, 0, &phy_ops);
 	if (ret < 0) {
 		dev_err(dcp->dev, "phy_validate failed: %d\n", ret);
@@ -310,9 +413,9 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 	case 0 ... 2:
 	case 4:
 		dptx->phy_ops.dp.lanes = lane_count;
-		// Use dptx phy index > 3 as indication for dptx-phy or
-		// lpdptx-phy and configure the number of lanes for those
-		dptx->phy_ops.dp.set_lanes = (dcp->dptx_phy > 3);
+		/* USB4 DP IN has no ATC PHY; still accept the lane count. */
+		dptx->phy_ops.dp.set_lanes =
+			dcp_is_usb4_output(dcp) || (dcp->dptx_phy > 3);
 		break;
 	default:
 		dev_err(dcp->dev, "set_active_lane_count: invalid lane count:%llu\n", lane_count);
@@ -322,7 +425,7 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 	}
 
 	if (dptx->phy_ops.dp.set_lanes) {
-		if (dptx->atcphy) {
+		if (dptx->atcphy && !dcp_is_usb4_output(dcp)) {
 			ret = phy_configure(dptx->atcphy, &dptx->phy_ops);
 			if (ret)
 				return ret;
@@ -334,8 +437,30 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 	reply->retcode = cpu_to_le32(retcode);
 	reply->lane_count = cpu_to_le64(lane_count);
 
-	if (lane_count > 0)
+	if (lane_count > 0) {
+		dev_info(dcp->dev, "USB4/DPTX: SET_ACTIVE_LANE_COUNT %llu\n",
+			 lane_count);
+		/*
+		 * dcp_usb4_drm_allowed() (usb4_force_dptx) used to gate this
+		 * for the old manual-training sysfs knob (module_param_cb
+		 * usb4_dptx_train), removed wholesale in 0dc9f50 when
+		 * apple_dcp_tb_dp_tunnel() replaced it with automatic tunnel
+		 * detection -- but usb4_force_dptx itself, and this gate,
+		 * were left behind with no way left to ever set it true.
+		 * dcp_dptx_connect()'s single wait_for_completion_timeout()
+		 * on linkcfg_completion is now shared by both the alt-mode
+		 * and USB4-tunnel paths (also part of 0dc9f50's unification),
+		 * so gating it here meant every tunneled connect timed out
+		 * after a fully successful DPRX/AUX handshake and lane
+		 * negotiation -- firmware does not send FORCE_HOTPLUG_DETECT
+		 * (the only other completion site) for a tunnel. The
+		 * reference (aurora-silicon/linux#8) completes
+		 * linkcfg_completion here unconditionally; usb4_lane_completion
+		 * has no consumer anywhere in this tree, so this drops both the
+		 * dead gate and the dead completion and matches the reference.
+		 */
 		complete(&dptx->linkcfg_completion);
+	}
 
 	return ret;
 }
@@ -370,6 +495,14 @@ dptxport_call_will_change_link_config(struct apple_epic_service *service)
 static int
 dptxport_call_did_change_link_config(struct apple_epic_service *service)
 {
+	/*
+	 * Ported from aurora-silicon/linux#8: bringing the tunnel crossbar
+	 * connection up (dcp_tunnel_crossbar_up()) now happens in
+	 * dptxport_call(), after this succeeds, gated on
+	 * dptx_tunnel && link_rate -- not inside this handler, and its
+	 * result is never propagated back to DCP as a call failure.
+	 */
+
 	/* assume the link config did change and wait a little bit */
 	mdelay(10);
 
@@ -394,6 +527,8 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 
 	link_rate = le32_to_cpu(request->link_rate);
 	trace_dptxport_call_set_link_rate(dptx, link_rate);
+	dev_info(service->ep->dcp->dev, "DPTXPort: SET_LINK_RATE 0x%x\n",
+		 link_rate);
 
 	switch (link_rate) {
 	case LINK_RATE_RBR:
@@ -426,18 +561,25 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 	}
 
 	if (phy_set_rate) {
-		dptx->phy_ops.dp.link_rate = phy_link_rate;
-		dptx->phy_ops.dp.set_rate = 1;
-
-		if (dptx->atcphy) {
+		/*
+		 * Ported from aurora-silicon/linux#8: a Thunderbolt DP tunnel
+		 * starts/stops its own pixel clock instead of configuring the
+		 * PHY directly, and never fails the apcall over it -- a
+		 * failed clock just keeps the crossbar connection down
+		 * (dcp->tb_clock_ok), which dcp_tunnel_crossbar_up() checks.
+		 */
+		if (dptx->atcphy && service->ep->dcp->dptx_tunnel) {
+			dcp_tunnel_set_rate(service->ep->dcp, dptx->atcphy,
+					    link_rate);
+		} else if (dptx->atcphy) {
+			dptx->phy_ops.dp.link_rate = phy_link_rate;
+			dptx->phy_ops.dp.set_rate = 1;
 			ret = phy_configure(dptx->atcphy, &dptx->phy_ops);
 			if (ret)
 				return ret;
 		}
 
-		//if (dptx->phy_ops.dp.set_rate)
 		dptx->link_rate = dptx->pending_link_rate = link_rate;
-
 	}
 
 	//dptx->pending_link_rate = link_rate;
@@ -457,7 +599,15 @@ static int dptxport_call_get_supports_hpd(struct apple_epic_service *service,
 		return -EINVAL;
 
 	reply->retcode = cpu_to_le32(0);
-	reply->supported = cpu_to_le32(dcp_is_typec_output(dcp));
+	/*
+	 * Analog DPIN CORE=1 already uses AFK set_hpd (returns 0).
+	 * Denying HPD here made request_display ACTIVATE then 22/24
+	 * DEVICE_NOT_STARTED (~5.5s). Advertise HPD so firmware uses
+	 * that path instead of waiting for a PHY start.
+	 */
+	reply->supported = cpu_to_le32(dcp_is_typec_output(dcp) ? 1 : 0);
+	dev_info(dcp->dev, "DPTXPort: GET_SUPPORTS_HPD %u usb4=%d\n",
+		 le32_to_cpu(reply->supported), dcp_is_usb4_output(dcp));
 	return 0;
 }
 
@@ -493,11 +643,20 @@ dptxport_call_activate(struct apple_epic_service *service,
 		       void *reply, size_t reply_size)
 {
 	struct dptx_port *dptx = service->cookie;
-	const struct apple_dcp *dcp = service->ep->dcp;
+	struct apple_dcp *dcp = service->ep->dcp;
 
-	/* Standalone PHYs need DCP input selection here. Type-C owns ATC PHY mode. */
-	if (!dcp->phy_managed_by_typec)
+	/*
+	 * Ported from aurora-silicon/linux#8: no crossbar, and no PHY mode
+	 * change for a tunnel (dptx->atcphy must stay in USB4/TBT mode the
+	 * whole connection, see dcp_tunnel_set_rate()). The DP IN adapter is
+	 * only woken (DPTX_INACTIVE=0) here, via dcp_tunnel_dpin_activate();
+	 * waking it earlier hangs the machine. Activate always replies
+	 * success to DCP.
+	 */
+	if (dptx->atcphy && !dcp->phy_managed_by_typec)
 		phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP, dcp->index);
+	if (dcp->dptx_tunnel)
+		dcp_tunnel_dpin_activate(dcp, true);
 
 	memcpy(reply, data, min(reply_size, data_size));
 	if (reply_size >= 4)
@@ -512,9 +671,12 @@ dptxport_call_deactivate(struct apple_epic_service *service,
 		       void *reply, size_t reply_size)
 {
 	struct dptx_port *dptx = service->cookie;
-	const struct apple_dcp *dcp = service->ep->dcp;
+	struct apple_dcp *dcp = service->ep->dcp;
 
-	if (!dcp->phy_managed_by_typec)
+	dev_info(dcp->dev, "DPTXPort: DEACTIVATE\n");
+	if (dcp->dptx_tunnel)
+		dcp_tunnel_dpin_activate(dcp, false);
+	if (dptx->atcphy && !dcp->phy_managed_by_typec)
 		phy_set_mode_ext(dptx->atcphy, PHY_MODE_INVALID, 0);
 
 	memcpy(reply, data, min(reply_size, data_size));
@@ -530,12 +692,30 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 {
 	struct dptx_port *dptx = service->cookie;
 	trace_dptxport_apcall(dptx, idx, data_size);
+	dev_dbg(service->ep->dcp->dev, "DPTXPort: APCALL %u (%zu bytes)\n",
+		 idx, data_size);
+	if (data_size)
+		print_hex_dump_debug("DPTXPort: apcall data: ",
+				     DUMP_PREFIX_OFFSET, 16, 1, data,
+				     min(data_size, (size_t)64), true);
 
 	switch (idx) {
 	case DPTX_APCALL_WILL_CHANGE_LINKG_CONFIG:
+		/*
+		 * Ported from aurora-silicon/linux#8: a re-link on an
+		 * established tunnel takes the crossbar connection down
+		 * first.
+		 */
+		if (service->ep->dcp->dptx_tunnel && dptx->link_rate)
+			dcp_tunnel_crossbar_down(service->ep->dcp);
 		return dptxport_call_will_change_link_config(service);
-	case DPTX_APCALL_DID_CHANGE_LINK_CONFIG:
-		return dptxport_call_did_change_link_config(service);
+	case DPTX_APCALL_DID_CHANGE_LINK_CONFIG: {
+		int ret = dptxport_call_did_change_link_config(service);
+
+		if (!ret && service->ep->dcp->dptx_tunnel && dptx->link_rate)
+			dcp_tunnel_crossbar_up(service->ep->dcp);
+		return ret;
+	}
 	case DPTX_APCALL_GET_MAX_LINK_RATE:
 		return dptxport_call_get_max_link_rate(service, reply,
 						       reply_size);
@@ -546,6 +726,15 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 						   reply, reply_size);
 	case DPTX_APCALL_GET_MAX_LANE_COUNT:
 		return dptxport_call_get_max_lane_count(service, reply, reply_size);
+	case DPTX_APCALL_GET_ACTIVE_LANE_COUNT: {
+		struct dptxport_apcall_lane_count *lc = reply;
+
+		if (reply_size < sizeof(*lc))
+			return -EINVAL;
+		lc->retcode = cpu_to_le32(0);
+		lc->lane_count = cpu_to_le64(dptx->lane_count);
+		return 0;
+	}
         case DPTX_APCALL_SET_ACTIVE_LANE_COUNT:
 		return dptxport_call_set_active_lane_count(service, data, data_size,
 							   reply, reply_size);
@@ -582,6 +771,26 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	case DPTX_APCALL_DEACTIVATE:
 		return dptxport_call_deactivate(service, data, data_size,
 						reply, reply_size);
+	case DPTX_APCALL_FORCE_HOTPLUG_DETECT:
+		dev_info(service->ep->dcp->dev,
+			 "DPTXPort: FORCE_HOTPLUG_DETECT\n");
+		complete(&dptx->linkcfg_completion);
+		memcpy(reply, data, min(reply_size, data_size));
+		if (reply_size >= 4)
+			memset(reply, 0, 4);
+		return 0;
+	case DPTX_APCALL_INACTIVE_SINK_DETECTED:
+		/*
+		 * Normal prelude to link training on USB4. Ack and wait for
+		 * SET_ACTIVE_LANE_COUNT. Treating this as failure made
+		 * firmware DEACTIVATE after it had already set lanes/rate.
+		 */
+		dev_info(service->ep->dcp->dev,
+			 "DPTXPort: INACTIVE_SINK_DETECTED (keep waiting for lanes)\n");
+		memcpy(reply, data, min(reply_size, data_size));
+		if (reply_size >= 4)
+			memset(reply, 0, 4);
+		return 0;
 	default:
 		/* just try to ACK and hope for the best... */
 		dev_info(service->ep->dcp->dev, "DPTXPort: acking unhandled call %u\n",
