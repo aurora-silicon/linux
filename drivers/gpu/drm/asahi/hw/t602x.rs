@@ -53,6 +53,7 @@ pub(crate) const HWCONFIG_T6022: super::HwConfig = HwConfig {
     gpu_core: GpuCore::G14D,
 
     base_clock_hz: 24_000_000,
+    uat_ias: 39,
     uat_oas: 42,
     num_dies: 2,
     max_num_clusters: 8,
