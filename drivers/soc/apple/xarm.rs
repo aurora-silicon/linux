@@ -83,6 +83,12 @@ pub(crate) struct Serviced {
     pub(crate) reply_bytes: usize,
 }
 
+/// Requests that change the store: a refusal of one means the enclave's state
+/// was not persisted.
+pub(crate) fn is_write(opcode: u8) -> bool {
+    matches!(opcode, OP_ROOT_WRITE | OP_SESSION_WRITE | OP_SESSION_DELETE)
+}
+
 pub(crate) fn service(
     req: &Request,
     outbound: &[u8],

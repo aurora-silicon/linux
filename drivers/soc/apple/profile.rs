@@ -8,7 +8,7 @@
 //! here once. The driver reads addresses from the device tree, never scans for
 //! them, and never patches properties at runtime.
 //!
-//! Four bring-up targets are modelled:
+//! Five bring-up targets are modelled:
 //!
 //! * `T8103` / J313 (MacBook Air, M1): the host boots the SEP with the boot
 //!   endpoint handshake over a 0x30000 shared-memory window.
@@ -18,6 +18,8 @@
 //!   single-message registration over a 0x40000 window.
 //! * `T8140` / J700 (MacBook Neo, A18 Pro): iBoot boots sepOS before the AP
 //!   OS, so the driver uses the warm registration path.
+//! * `T8112` / J413, J415 (MacBook Air, M2): iBoot hands over a running SEP and
+//!   a powered sensor, so the driver uses the warm registration path.
 
 // The boot handshake, identity source, sensor and DART fields are consumed by
 // the boot-endpoint, identity and sensor-transport paths.
@@ -182,8 +184,7 @@ const T8103: PlatformProfile = PlatformProfile {
 /// path, shared-memory geometry and key store follow T8103. The sensor sits on
 /// SPI2 at the T6020 address, in the mode T6020 verified: the J313, J316s and
 /// J414s platform device trees describe the same sensor (id 0x3352)
-/// identically. Enrolment persistence is not yet reboot-tested here, so it
-/// stays opt-in (`j414s_persistent_enrol=1`).
+/// identically. Enrolment persistence is reboot-tested on J314s.
 const T6000: PlatformProfile = PlatformProfile {
     name: "T6000/J316s",
     shmem_capacity: 0x3_0000,
@@ -212,7 +213,7 @@ const T6000: PlatformProfile = PlatformProfile {
     key_store: KeyStore::Sepos13 {
         cpx_encryption_mode: 2,
     },
-    persistent_enrol: false,
+    persistent_enrol: true,
 };
 
 const T6020: PlatformProfile = PlatformProfile {
@@ -249,7 +250,7 @@ const T6020: PlatformProfile = PlatformProfile {
 /// board; device-tree nodes remain authoritative for addresses and resources.
 const T8140: PlatformProfile = PlatformProfile {
     key_store: KeyStore::Variant5,
-    persistent_enrol: false,
+    persistent_enrol: true,
     name: "T8140/J700",
     shmem_capacity: 0x4_0000,
     shmem_first_item: b"CINP",
@@ -277,6 +278,47 @@ const T8140: PlatformProfile = PlatformProfile {
     },
 };
 
+/// MacBook Air M2 (J413, J415). iBoot leaves the SEP running and the Mesa
+/// sensor powered (J415: AP GPIO 178 is a driven-high output at handoff), so
+/// this is a warm-registration platform like T6020. The J415 ADT describes the
+/// sensor exactly as J413's does: spi2 at the T8103 address, power on AP GPIO
+/// 178, data-ready on 177, 8 MHz, chip select 0. The SEP DART aperture is
+/// 0x4000 + 0xffff0000, below 4 GiB, so no wide DMA mask. `/defaults`
+/// carries `cpx-encryption-mode = 2`.
+///
+/// The shared-memory geometry and key-store dialect follow the other
+/// warm-registration platforms (T6020, T8140).
+const T8112: PlatformProfile = PlatformProfile {
+    name: "T8112/J415",
+    shmem_capacity: 0x4_0000,
+    shmem_first_item: b"CINP",
+    bootstrap: Bootstrap::WarmRegister,
+    identity: IdentitySource::Chosen,
+    sensor: SensorProfile {
+        controller_base: 0x2_3510_8000,
+        chip_select: 0,
+        max_hz: 8_000_000,
+        cs_setup_ns: 20,
+        cs_hold_ns: 20,
+        mode: SpiMode::Mode1,
+        expected_id: 0x3352,
+        capture_qualified: false,
+    },
+    dart_range_required: true,
+    wide_dma_mask: false,
+    firmware_region: c"sepfw",
+    // J415 accepted the 13.5 GET_CAPABILITIES/SET_ENV init but refused the
+    // strict CREATE_KEYBAG (mailbox status -1, empty reply), as J700 did;
+    // use the T6020 form like the other warm-registration platforms.
+    keybag_create: KeybagCreate {
+        variant: 5,
+        bag_type: 0,
+        arg: -1,
+    },
+    key_store: KeyStore::Variant5,
+    persistent_enrol: true,
+};
+
 static_assert!(T8103.shmem_capacity == 0x30000);
 static_assert!(T6020.shmem_capacity == 0x40000);
 static_assert!(T8140.shmem_capacity == 0x40000);
@@ -287,6 +329,8 @@ static_assert!(T8103.sensor.expected_id == T6020.sensor.expected_id);
 static_assert!(T6000.shmem_capacity == T8103.shmem_capacity);
 static_assert!(T6000.sensor.controller_base == T6020.sensor.controller_base);
 static_assert!(T6000.sensor.expected_id == T6020.sensor.expected_id);
+static_assert!(T8112.shmem_capacity == T6020.shmem_capacity);
+static_assert!(T8112.sensor.controller_base == T8103.sensor.controller_base);
 
 /// Whether the machine root declares `compatible`.
 ///
@@ -336,8 +380,21 @@ pub(crate) fn detect() -> Result<&'static PlatformProfile> {
     if machine_has(b"apple,t6000") {
         return Ok(&T6000);
     }
+    // t6000.dtsi is defined as a cut-down t6001: it includes t6001.dtsi and
+    // deletes the parts the smaller die lacks. Both pull in t600x-die0.dtsi,
+    // so the SEP, its mailbox, its DART and the SPI controller sit at the same
+    // addresses with the same interrupts on either part, and the T6000
+    // constants apply to the M1 Max unchanged. The Mac Studio (j375c) is also
+    // a t6001 but leaves the SEP disabled, so nothing binds there; apple,t6002
+    // (M1 Ultra, no built-in sensor) stays unmapped.
+    if machine_has(b"apple,t6001") {
+        return Ok(&T6000);
+    }
     if machine_has(b"apple,t8140") {
         return Ok(&T8140);
+    }
+    if machine_has(b"apple,t8112") {
+        return Ok(&T8112);
     }
     Err(ENODEV)
 }

@@ -15,6 +15,44 @@
 / {
 	compatible = "apple,j316c", "apple,t6001", "apple,arm-platform";
 	model = "Apple MacBook Pro (16-inch, M1 Max, 2021)";
+
+	aliases {
+		sep = &sep;
+	};
+};
+
+/*
+ * m1n1 keys off the sep alias to add the sepfw region and the boot
+ * manifests the driver needs to cold-boot SEPOS.
+ */
+&sep {
+	status = "okay";
+};
+
+/*
+ * The J314s/J316s lines, read from those machines' platform device trees
+ * (/arm-io/spi2/mesa) and identical on the 14" and 16" M1 Pro: the power
+ * line is gpio0 pin 196 (function-mesa_pwr, active high) and the data-ready
+ * line is pin 195. The M1 Max boards share this family's board file,
+ * t600x-j314-j316.dtsi. J316c's own platform device tree has not been
+ * checked yet, and J316c is untested.
+ */
+&spi2 {
+	status = "okay";
+};
+
+&mesa {
+	status = "okay";
+	enable-gpios = <&pinctrl_ap 196 GPIO_ACTIVE_HIGH>;
+	interrupt-parent = <&pinctrl_ap>;
+	interrupts = <195 IRQ_TYPE_EDGE_RISING>;
+	spi-cs-setup-delay-ns = <20>;
+	spi-cs-hold-delay-ns = <20>;
+	/*
+	 * Per-device factory data, extracted from this machine's own macOS
+	 * install; it is not redistributable.
+	 */
+	firmware-name = "apple/mesacal-j316c.bin";
 };
 
 &wifi0 {

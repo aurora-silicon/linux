@@ -21,6 +21,7 @@
 	aliases {
 		bluetooth0 = &bluetooth0;
 		keyboard = &keyboard;
+		sep = &sep;
 		wifi0 = &wifi0;
 	};
 
@@ -254,6 +255,26 @@
 
 	tp_accel {
 	};
+};
+
+/*
+ * Mesa fingerprint sensor on spi2. The J413 platform device tree
+ * (/arm-io/spi2/mesa) describes it as J415's does: power on AP GPIO 178,
+ * active high, data-ready on GPIO 177. As on J415, the data-ready line is
+ * left out, so the driver polls until its trigger is confirmed. Native chip
+ * select only. J413 is untested.
+ */
+&spi2 {
+	status = "okay";
+};
+
+&mesa {
+	status = "okay";
+	enable-gpios = <&pinctrl_ap 178 GPIO_ACTIVE_HIGH>;
+	spi-cs-setup-delay-ns = <20>;
+	spi-cs-hold-delay-ns = <20>;
+	/* Per-device factory data from this Mac's own iBoot system container. */
+	firmware-name = "apple/mesacal-j413.bin";
 };
 
 #include "isp-imx558-cfg0.dtsi"
