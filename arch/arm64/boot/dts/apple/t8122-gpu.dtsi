@@ -24,6 +24,10 @@
 			     <AIC_IRQ 721 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_gfx>;
 		mboxes = <&agx_mbox>;
+		memory-region = <&uat_ttbs>, <&uat_pagetables>,
+				<&uat_handoff>, <&uat_pagetables_l2>;
+		memory-region-names = "ttbs", "pagetables", "handoff",
+				      "pagetables-l2";
 		status = "disabled";
 	};
 
