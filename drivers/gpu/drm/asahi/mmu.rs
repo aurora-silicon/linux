@@ -1047,7 +1047,13 @@ impl Vm {
         let is_kernel = ttb.is_some();
 
         let page_table = if let Some(ttb) = ttb {
-            UatPageTable::new_with_ttb(ttb, geometry.kernel_range(), geometry.ias, geometry.oas)?
+            UatPageTable::new_with_ttb(
+                ttb,
+                geometry.kernel_range(),
+                geometry.ias,
+                geometry.oas,
+                false,
+            )?
         } else {
             UatPageTable::new(geometry.ias, geometry.oas)?
         };

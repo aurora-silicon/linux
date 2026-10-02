@@ -253,6 +253,10 @@ pub(crate) struct DumpedPage {
 pub(crate) struct UatPageTable {
     ttb: PhysicalAddr,
     ttb_owned: bool,
+    /// Tables below a root the driver did not allocate may belong to the bootloader or the
+    /// firmware, so only the tables recorded here are ever freed. `None` if the driver owns the
+    /// tables below the root, as with the handoff firmware interface.
+    driver_tables: Option<KVec<PhysicalAddr>>,
     va_range: Range<u64>,
     ias_mask: u64,
     oas_mask: u64,
@@ -266,17 +270,21 @@ impl UatPageTable {
         Ok(UatPageTable {
             ttb,
             ttb_owned: true,
+            driver_tables: None,
             va_range: 0..(1u64 << ias),
             ias_mask: (1u64 << ias) - 1,
             oas_mask: (1u64 << oas) - 1,
         })
     }
 
+    /// Borrow a root; track individual child ownership only when other agents
+    /// can install tables below it. Handoff roots have driver-owned children.
     pub(crate) fn new_with_ttb(
         ttb: PhysicalAddr,
         va_range: Range<u64>,
         ias: u32,
         oas: u32,
+        shared_tables: bool,
     ) -> Result<Self> {
         mod_pr_debug!(
             "UATPageTable::new_with_ttb: ttb={:#x} range={:#x?} ias={} oas={}\n",
@@ -291,7 +299,7 @@ impl UatPageTable {
         if (va_range.start | va_range.end) & (UAT_PGMSK as u64) != 0 {
             return Err(EINVAL);
         }
-        // SAFETY: The TTB is should remain valid (if properly mapped), as it is bootloader-managed.
+        // SAFETY: The bootloader-managed root stays valid while this page table exists.
         if unsafe { Page::borrow_phys(&ttb) }.is_none() {
             pr_err!(
                 "UATPageTable::new_with_ttb: ttb at {:#x} is not mapped (DT using no-map?)\n",
@@ -303,6 +311,7 @@ impl UatPageTable {
         Ok(UatPageTable {
             ttb,
             ttb_owned: false,
+            driver_tables: shared_tables.then(KVec::new),
             va_range,
             ias_mask: (1u64 << ias) - 1,
             oas_mask: (1u64 << oas) - 1,
@@ -362,8 +371,7 @@ impl UatPageTable {
                                 level,
                                 phys
                             );
-                            // SAFETY: Page tables for our VA ranges always come from Page::into_phys().
-                            unsafe { Page::from_phys(phys) };
+                            self.free_table(phys);
                         }
                         mod_pr_debug!("UATPageTable::with_pages: invalidate level {}\n", level);
                     }
@@ -396,6 +404,9 @@ impl UatPageTable {
                             if upte_val == 0 && alloc {
                                 let pt_page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
                                 mod_pr_debug!("UATPageTable::with_pages: alloc PT at {:#x}\n", pt_page.phys());
+                                if let Some(tables) = self.driver_tables.as_mut() {
+                                    tables.push(pt_page.phys(), GFP_KERNEL)?;
+                                }
                                 let pt_paddr = Page::into_phys(pt_page);
                                 upte_val = pt_paddr | PTE_TYPE_LEAF_TABLE;
                                 upte.store(upte_val, Ordering::Relaxed);
@@ -467,13 +478,27 @@ impl UatPageTable {
                         level,
                         phys
                     );
-                    // SAFETY: Page tables for our VA ranges always come from Page::into_phys().
-                    unsafe { Page::from_phys(phys) };
+                    self.free_table(phys);
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Free a page table, unless it was not allocated by the driver.
+    fn free_table(&mut self, phys: PhysicalAddr) {
+        if let Some(tables) = self.driver_tables.as_mut() {
+            match tables.iter().position(|&table| table == phys) {
+                Some(index) => {
+                    tables.swap_remove(index);
+                }
+                None => return,
+            }
+        }
+        // SAFETY: Page tables allocated by the driver always come from Page::into_phys(). Without
+        // `driver_tables`, every child table belongs to the driver.
+        unsafe { Page::from_phys(phys) };
     }
 
     pub(crate) fn alloc_pages(&mut self, iova_range: Range<u64>) -> Result {
