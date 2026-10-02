@@ -191,6 +191,35 @@ struct drm_asahi_params_global {
 	 * seconds, rather than hardcoding a particular firmware's rate.
 	 */
 	__u64 command_timestamp_frequency_hz;
+
+	/**
+	 * @usc_generation: Instruction set generation of the unified shader
+	 * cores: 2 for G13 and G14, 3 for G15 and newer.
+	 */
+	__u32 usc_generation;
+
+	/**
+	 * @gpu_hal_generation: Command stream generation, from
+	 * enum drm_asahi_gpu_hal_generation.
+	 */
+	__u32 gpu_hal_generation;
+};
+
+/**
+ * enum drm_asahi_gpu_hal_generation - GPU command stream generation
+ *
+ * The command stream generation determines the layout of the control streams
+ * and descriptors that userspace builds for the GPU.
+ */
+enum drm_asahi_gpu_hal_generation {
+	/** @DRM_ASAHI_GPU_HAL_LEGACY: Unnumbered generation of G13 to G15. */
+	DRM_ASAHI_GPU_HAL_LEGACY = 0,
+
+	/** @DRM_ASAHI_GPU_HAL_200: Generation 200, used by G17P. */
+	DRM_ASAHI_GPU_HAL_200 = 200,
+
+	/** @DRM_ASAHI_GPU_HAL_300: Generation 300. */
+	DRM_ASAHI_GPU_HAL_300 = 300,
 };
 
 /**
@@ -213,19 +242,168 @@ enum drm_asahi_feature {
 	 * userspace can speculate memory accesses more aggressively.
 	 */
 	DRM_ASAHI_FEATURE_SOFT_FAULTS = (1UL) << 0,
+
+	/**
+	 * @DRM_ASAHI_FEATURE_VM_STATUS: GET_PARAMS supports
+	 * DRM_ASAHI_PARAM_GROUP_VM_STATUS.
+	 */
+	DRM_ASAHI_FEATURE_VM_STATUS = (1UL) << 1,
+
+	/**
+	 * @DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES: Each queue reserves its own
+	 * hardware execution state when it is created, and GET_PARAMS
+	 * supports DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS.
+	 */
+	DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES = (1UL) << 2,
+
+	/**
+	 * @DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS: Every hardware command of
+	 * a submission waits for all of the submission's input syncs, including
+	 * their errors, so independent commands need no extra dependency on the
+	 * first command. Userspace that splits a batch across several
+	 * submissions and relies on this must pass its input syncs to each of
+	 * them.
+	 */
+	DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS = (1UL) << 3,
+
+	/**
+	 * @DRM_ASAHI_FEATURE_VM_STATUS_MIRROR: GET_PARAMS supports
+	 * DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR, which registers a userspace
+	 * word that always holds the VM status that
+	 * DRM_ASAHI_PARAM_GROUP_VM_STATUS would return. The kernel stores a
+	 * failure there before it signals any fence of the failed job, so after
+	 * a successful wait a load of the word replaces the VM_STATUS query.
+	 * Registration may still be refused.
+	 */
+	DRM_ASAHI_FEATURE_VM_STATUS_MIRROR = (1UL) << 4,
+};
+
+/**
+ * define DRM_ASAHI_PARAM_GROUP_VM_STATUS - GET_PARAMS group for
+ * struct drm_asahi_vm_status
+ */
+#define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
+
+/**
+ * define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS - GET_PARAMS group for
+ * struct drm_asahi_queue_limits
+ */
+#define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
+
+/**
+ * define DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR - GET_PARAMS group for
+ * struct drm_asahi_vm_status_mirror
+ */
+#define DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR 3
+
+/**
+ * struct drm_asahi_vm_status - VM status, GET_PARAMS group
+ * DRM_ASAHI_PARAM_GROUP_VM_STATUS
+ *
+ * This is an in/out query on a VM of the calling file. Userspace sets
+ * &drm_asahi_get_params.pointer to this structure and
+ * &drm_asahi_get_params.size to its size.
+ *
+ * The kernel records the failure of an accepted job before it signals the
+ * job's fences, so userspace must query the status after a successful syncobj
+ * wait before it treats the work as successfully executed. A signalled
+ * syncobj alone does not indicate successful execution. An execution failure
+ * also marks other VMs whose work can no longer make progress. A query never
+ * resets or recovers the GPU.
+ *
+ * Invalid requests fail with EINVAL (non-zero @flags or @pad, wrong size),
+ * ENOENT (@vm_id unknown to the calling file) or EFAULT, and write nothing.
+ */
+struct drm_asahi_vm_status {
+	/** @vm_id: VM to query */
+	__u32 vm_id;
+
+	/** @flags: MBZ */
+	__u32 flags;
+
+	/**
+	 * @error: Output: 0 if no submission error was observed, otherwise the
+	 * first error as a negative errno. The error is sticky for the lifetime
+	 * of the VM: neither creating queues nor waiting on other fences clears
+	 * it.
+	 */
+	__s32 error;
+
+	/** @pad: MBZ */
+	__u32 pad;
+};
+
+/**
+ * struct drm_asahi_queue_limits - Queue limits, GET_PARAMS group
+ * DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS
+ *
+ * The query neither allocates nor resets anything.
+ */
+struct drm_asahi_queue_limits {
+	/**
+	 * @max_queues: Maximum number of queues on the device, shared by all
+	 * files and VMs. This is a hardware bound, not a promise that as many
+	 * are currently available: QUEUE_CREATE reserves a queue's hardware
+	 * state and fails once it runs out.
+	 */
+	__u32 max_queues;
+
+	/**
+	 * @max_in_flight_per_queue: Number of jobs of a queue that the
+	 * hardware may run at once. Further jobs wait behind the preceding work
+	 * and their dependencies.
+	 */
+	__u32 max_in_flight_per_queue;
+
+	/** @flags: Reserved, zero */
+	__u32 flags;
+
+	/** @pad: Reserved, zero */
+	__u32 pad;
+};
+
+/**
+ * struct drm_asahi_vm_status_mirror - VM status mirror registration, GET_PARAMS
+ * group DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR
+ *
+ * Registers a 32-bit word in a GEM object of the calling file. The kernel
+ * keeps its own reference to the object for the lifetime of the VM status,
+ * zeroes the word, and from then on keeps it equal to the VM status error
+ * (see &drm_asahi_vm_status.error). Each VM accepts one registration.
+ * EOPNOTSUPP means that userspace must keep using
+ * DRM_ASAHI_PARAM_GROUP_VM_STATUS.
+ */
+struct drm_asahi_vm_status_mirror {
+	/** @vm_id: VM whose status is mirrored */
+	__u32 vm_id;
+
+	/** @handle: GEM object holding the word, at most 64 KiB in size */
+	__u32 handle;
+
+	/** @offset: Byte offset of the word in the object, 4-byte aligned */
+	__u32 offset;
+
+	/** @flags: MBZ */
+	__u32 flags;
 };
 
 /**
  * struct drm_asahi_get_params - Arguments passed to DRM_IOCTL_ASAHI_GET_PARAMS
  */
 struct drm_asahi_get_params {
-	/** @param_group: Parameter group to fetch (MBZ) */
+	/**
+	 * @param_group: Parameter group: 0 for struct drm_asahi_params_global,
+	 * otherwise one of DRM_ASAHI_PARAM_GROUP_*.
+	 */
 	__u32 param_group;
 
 	/** @pad: MBZ */
 	__u32 pad;
 
-	/** @pointer: User pointer to write parameter struct */
+	/**
+	 * @pointer: User pointer to the parameter struct. The VM status groups
+	 * also read their input from it.
+	 */
 	__u64 pointer;
 
 	/**
@@ -790,6 +968,15 @@ enum drm_asahi_render_flags {
 	DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING = (1U << 2),
 
 	/**
+	 * @DRM_ASAHI_RENDER_RSRC_SPEC_HI: The command carries the high halves
+	 * of the background and end-of-tile resource specifiers
+	 * (&drm_asahi_cmd_render.bg_rsrc_spec_hi and the following fields).
+	 * Kernels that do not know the flag reject the command instead of
+	 * silently truncating the specifiers.
+	 */
+	DRM_ASAHI_RENDER_RSRC_SPEC_HI = (1U << 4),
+
+	/**
 	 * @DRM_ASAHI_RENDER_DBIAS_IS_INT: Use integer depth bias formula.
 	 *
 	 * Graphics specifications contain two alternate formulas for depth
@@ -1107,6 +1294,18 @@ struct drm_asahi_cmd_render {
 
 	/** @ts_frag: Timestamps for the fragment portion of the render */
 	struct drm_asahi_timestamps ts_frag;
+
+	/** @bg_eot_rsrc_spec_hi: High half of @eot.rsrc_spec */
+	__u32 bg_eot_rsrc_spec_hi;
+
+	/** @bg_eot_partial_rsrc_spec_hi: High half of @partial_eot.rsrc_spec */
+	__u32 bg_eot_partial_rsrc_spec_hi;
+
+	/** @bg_rsrc_spec_hi: High half of @bg.rsrc_spec */
+	__u32 bg_rsrc_spec_hi;
+
+	/** @bg_partial_rsrc_spec_hi: High half of @partial_bg.rsrc_spec */
+	__u32 bg_partial_rsrc_spec_hi;
 };
 
 /**
