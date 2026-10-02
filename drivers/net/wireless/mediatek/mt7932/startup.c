@@ -30,20 +30,21 @@ static int mt_stock_config(struct mt7932 *m)
 	if (ret)
 		return ret;
 	ret = -EINVAL;
-	if (file->size != 8 + 65 * 68 || memcmp(file->data, "J7CF", 4) ||
-	    get_unaligned_le32(file->data + 4) != 65)
+	if (file->size < 8 || memcmp(file->data, "J7CF", 4))
+		goto out;
+	count = get_unaligned_le32(file->data + 4);
+	if ((count != 64 && count != 65) || file->size != 8 + count * 68)
 		goto out;
 	/*
 	 * Each absent normalized key appends one record. Reserve for all of
 	 * them, including structurally valid packages missing every such key.
 	 */
-	records = kcalloc(65 + ARRAY_SIZE(updates), sizeof(*records), GFP_KERNEL);
+	records = kcalloc(count + ARRAY_SIZE(updates), sizeof(*records), GFP_KERNEL);
 	if (!records) {
 		ret = -ENOMEM;
 		goto out;
 	}
-	memcpy(records, file->data + 8, 65 * 68);
-	count = 65;
+	memcpy(records, file->data + 8, count * 68);
 	for (i = 0; i < count; i++) {
 		if (records[i].type != 3 || !records[i].key_len || records[i].key_len >= 32 ||
 		    records[i].value_len >= 32 || records[i].reserved ||
@@ -404,6 +405,7 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 {
 	static const int rates[] = {10,20,55,110,60,90,120,180,240,360,480,540};
 	static const u32 ciphers[] = { WLAN_CIPHER_SUITE_CCMP };
+	static const u32 akms[] = { WLAN_AKM_SUITE_PSK };
 	unsigned int i;
 	int ret;
 
@@ -419,6 +421,8 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 	m->wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
 	m->wiphy->cipher_suites = ciphers;
 	m->wiphy->n_cipher_suites = ARRAY_SIZE(ciphers);
+	m->wiphy->akm_suites = akms;
+	m->wiphy->n_akm_suites = ARRAY_SIZE(akms);
 	wiphy_ext_feature_set(m->wiphy, NL80211_EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK);
 	m->wiphy->max_scan_ssids = 1;
 	m->wiphy->max_scan_ie_len = 600;

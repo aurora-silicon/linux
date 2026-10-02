@@ -539,7 +539,7 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 	if (!open && (params->crypto.wpa_versions != NL80211_WPA_VERSION_2 ||
 	    params->crypto.n_ciphers_pairwise != 1 || params->crypto.ciphers_pairwise[0] != WLAN_CIPHER_SUITE_CCMP ||
 	    params->crypto.cipher_group != WLAN_CIPHER_SUITE_CCMP ||
-	    params->crypto.n_akm_suites != 1 || params->crypto.akm_suites[0] != WLAN_AKM_SUITE_PSK ||
+	    !params->crypto.n_akm_suites || params->crypto.akm_suites[0] != WLAN_AKM_SUITE_PSK ||
 	    !params->crypto.psk || params->mfp == NL80211_MFP_REQUIRED ||
 	    !params->ssid_len || params->ssid_len > 32))
 		return -EOPNOTSUPP;

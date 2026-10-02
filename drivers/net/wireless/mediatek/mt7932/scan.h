@@ -83,7 +83,10 @@ static inline void mt7932_scan_disconnected_passive(u8 body[0x4d4])
 	put_unaligned_le16(233, body + 0x4ca);
 }
 
-/* Bounded standard caller-IE carriage, not the reference's silent override. */
+/* This firmware requires its native wildcard template. Directed scans use
+ * no probe IEs. Forwarding the normal supplicant extras stalled the campaign
+ * on J700; arbitrary caller probe-IE carriage remains unsupported here.
+ */
 static inline int mt7932_scan_options(u8 body[0x4d4], const u8 *ssid,
 				      size_t ssid_length, const u8 *ies, size_t ie_length)
 {
@@ -102,11 +105,9 @@ static inline int mt7932_scan_options(u8 body[0x4d4], const u8 *ssid,
 		put_unaligned_le32(ssid_length, body + 8);
 		memcpy(body + 12, ssid, ssid_length);
 	}
-	if (ie_length || ssid_length) {
+	if (ssid_length) {
 		memset(body + 0xe2, 0, 600);
-		put_unaligned_le16(ie_length, body + 0xe0);
-		if (ie_length)
-			memcpy(body + 0xe2, ies, ie_length);
+		put_unaligned_le16(0, body + 0xe0);
 	}
 	return 0;
 }
