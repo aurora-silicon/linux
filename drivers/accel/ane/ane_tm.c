@@ -267,6 +267,9 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 	err = ane_tm_collect_events(ane, NULL, &finished);
 	if (err < 0)
 		goto wedge;
+	/* Order the CPU writes to the request buffers and the event
+	 * acknowledgments before the queue writes that start the engine.
+	 */
 	wmb();
 	ane_tm_push_tq(ane, req);
 
@@ -316,6 +319,10 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 		}
 		status = tq_read32(ane, TQ_NID1(req->qid));
 		tq_write32(ane, TQ_NID1(req->qid), status & ~1U);
+		/* Kept from the qualified completion sequence (clear the
+		 * NID valid bit, then the queue status). writel() already
+		 * orders the two writes to the engine.
+		 */
 		rmb();
 		tq_write32(ane, TQ_STATUS(req->qid), 0x0);
 		ane_dart_release_scratch(ane, scratch, scratch_pages);
@@ -333,6 +340,7 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 		goto wedge;
 	}
 	tq_write32(ane, TQ_NID1(req->qid), status & ~1U);
+	/* Same completion sequence as the contained-fault path above. */
 	rmb();
 	tq_write32(ane, TQ_STATUS(req->qid), 0x0);
 	ane_dart_unmask(ane);

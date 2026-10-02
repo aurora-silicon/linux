@@ -46,7 +46,12 @@ struct ane_device {
 	int dart_count;
 
 	int irq;
+	/* Protects mm and the iommu_map()/iommu_unmap() calls on domain. */
 	struct mutex iommu_lock;
+	/*
+	 * Serializes engine access (submit, BO mapping, recovery, removal)
+	 * and protects bo_list, preserved_list and removed.
+	 */
 	struct mutex engine_lock;
 	struct list_head bo_list;
 
@@ -98,7 +103,7 @@ struct ane_device {
 	 * run ~2x slower while schedutil parks the idle clusters low.
 	 */
 	struct ane_boost {
-		struct mutex lock;
+		struct mutex lock;	/* protects the fields below */
 		struct delayed_work off;
 		struct freq_qos_request *legs;
 		int nlegs;

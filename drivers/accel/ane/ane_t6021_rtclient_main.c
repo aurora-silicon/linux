@@ -506,6 +506,9 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 
 		if (pending) {
 			writel(pending, ipi + 0xc000);
+			/* Complete the IPI acknowledgment before the
+			 * next reads of the command and malloc rings.
+			 */
 			mb();
 		}
 		header = READ_ONCE(io[0]);
