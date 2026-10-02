@@ -11,6 +11,9 @@ enum Backing {
 pub(crate) struct Buffer {
     mapping: mmu::KernelMapping,
     gpu_mapping: Option<mmu::KernelMapping>,
+    // Every client view must preserve the owner's cache and access policy.
+    // A VM switch changes the address space, not the backing's attributes.
+    gpu_protection: prot::Prot,
     object: Backing,
     offset: usize,
     size: usize,
@@ -42,7 +45,7 @@ impl Buffer {
         let mapping=if let Some(a)=address {fw.map_io(a&!0x3fff,pa,allocated,protection)?}
             else {fw.map_io_in_range(0xffff_fc2d_0000_0000..0xffff_fc2e_0000_0000,pa,allocated,protection)?};
         let gpu_mapping=if let Some((vm,a))=gpu {Some(vm.map_io(a&!0x3fff,pa,allocated,gpu_protection)?)} else {None};
-        Ok(Self {mapping,gpu_mapping,object:Backing::Coherent(object),offset,size,
+        Ok(Self {mapping,gpu_mapping,gpu_protection,object:Backing::Coherent(object),offset,size,
             _coherent_allocation:Some(crate::agx_memory_stats::Allocation::coherent(allocated)?)})
     }
     /// Allocate owned tiler storage in the driver-reserved GPU range. Keep the
@@ -57,9 +60,12 @@ impl Buffer {
         let mut object=gem::new_kernel_object_wc(dev,size)?;
         let mapping=object.map_into_range(fw,0xffff_fc2d_0000_0000..0xffff_fc2e_0000_0000,
             mmu::UAT_PGSZ as u64,prot::PROT_GPU_FW_SHARED_RW,true)?;
+        // Growth retains the cached GPU-only policy of the original TPC and
+        // tilemap allocations; the firmware alias remains shared/uncached.
+        let gpu_protection=prot::Prot::from_pte(crate::m3_pass_layout::Access::GpuCachedRw.pte());
         let gpu_mapping=Some(object.map_into_range(vm,0x74_0000_0000..0x78_0000_0000,
-            mmu::UAT_PGSZ as u64,prot::PROT_GPU_SHARED_RW,true)?);
-        Ok(Self {mapping,gpu_mapping,object:Backing::Paged(object),offset:0,size,_coherent_allocation:None})
+            mmu::UAT_PGSZ as u64,gpu_protection,true)?);
+        Ok(Self {mapping,gpu_mapping,gpu_protection,object:Backing::Paged(object),offset:0,size,_coherent_allocation:None})
     }
     pub(crate) fn va(&self)->u64 {self.mapping.iova()+self.offset as u64}
     pub(crate) fn gpu_va(&self)->Result<u64> {Ok(self.gpu_mapping.as_ref().ok_or(EINVAL)?.iova()+self.offset as u64)}
@@ -67,8 +73,8 @@ impl Buffer {
     pub(crate) fn map_gpu_view(&mut self,vm:&mmu::Vm)->Result<mmu::KernelMapping> {
         let address=self.gpu_va()?&!0x3fff;
         match &mut self.object {
-            Backing::Coherent(object)=>vm.map_io(address,object.dma_handle().try_into()?,object.size(),prot::PROT_GPU_SHARED_RW),
-            Backing::Paged(object)=>object.map_at(vm,address,prot::PROT_GPU_SHARED_RW,true),
+            Backing::Coherent(object)=>vm.map_io(address,object.dma_handle().try_into()?,object.size(),self.gpu_protection),
+            Backing::Paged(object)=>object.map_at(vm,address,self.gpu_protection,true),
         }
     }
     /// The backing retains its CPU mapping until Buffer is dropped. Callers
