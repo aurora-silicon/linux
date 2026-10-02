@@ -880,54 +880,33 @@ static int ane_attach_genpd(struct ane_device *ane)
 }
 
 /*
- * Per-SoC support descriptor, one per Linux `compatible`.
+ * Per-SoC descriptor, one per Linux `compatible`.
  *
  * Everything the probe needs except the SET block is derived from the
  * device tree by design: DART topology from "iommus", power wiring from
- * "power-domains", the engine window from "reg", the IRQ by name. Board
- * facts belong in the overlay, not in compiled constants. The SET block
- * is the one exception: the live overlays carry no range for it, so it
- * is compiled in per SoC — and only from a source that has proven the
+ * "power-domains", the engine window from "reg", the IRQ by name. The SET
+ * block is the one exception: the device tree carries no range for it, so
+ * it is compiled in per SoC, and only from a source that has proven the
  * address on hardware (m1n1 proxyclient ANE.ps_map, then a bound device).
  * A guessed SET base is not a bug but a brick: direct writes to the
  * block external-abort the SoC (T6001 named by netconsole 2026-09-16,
- * PS_SET0 down at 0x28e08c000; T8103 same mechanism at 0x23b70c000),
- * which is why a SoC without proven constants must refuse to bind
- * instead of carrying a guess.
- *
- * Qualification tiers:
- *  ANE_QUALIFIED   — execution proven on this silicon; binds normally.
- *  ANE_RECOGNIZED  — constants present, never run on hardware; binds
- *                    only with ane.allow_unqualified=1, loudly.
- *  ANE_UNSUPPORTED — no proven constants; refuses and names the data
- *                    needed to advance the port.
+ * PS_SET0 down at 0x28e08c000; T8103 same mechanism at 0x23b70c000).
+ * The M2 family (T602x, T8112) runs the ANE firmware and binds to
+ * ane_t6021 instead.
  */
-enum ane_qual {
-	ANE_QUALIFIED,
-	ANE_RECOGNIZED,
-	ANE_UNSUPPORTED,
-};
-
 struct ane_soc {
 	phys_addr_t ps_base;
-	enum ane_qual qual;
 	/* True when the tm/tq register file survives a genpd cycle in
 	 * retention and recovery must drain it (see ane_tm_drain_retained).
 	 */
 	bool tm_retention;
 };
 
-static bool allow_unqualified;
-module_param(allow_unqualified, bool, 0444);
-MODULE_PARM_DESC(allow_unqualified,
-		 "Bind recognized-but-unproven ANE SoCs (unverified SET base: external-abort risk)");
-
 static const struct ane_soc ane_soc_t8103 = {
 	/* M1 (m1-test-host). SET block mapped read-only for the recovery ACTUAL
 	 * log and the powered-on guard. Execution proven in the fleet.
 	 */
 	.ps_base = 0x23b70c000ULL,
-	.qual = ANE_QUALIFIED,
 };
 
 static const struct ane_soc ane_soc_t6000 = {
@@ -935,42 +914,12 @@ static const struct ane_soc ane_soc_t6000 = {
 	 * (proven on T6001/t6001-test-host); M1 Pro and M1 Ultra are untested.
 	 */
 	.ps_base = 0x28e08c000ULL,
-	.qual = ANE_QUALIFIED,
 	.tm_retention = true,
-};
-
-static const struct ane_soc ane_soc_t6020 = {
-	/* M2 Pro (t6020). Community device-tree captures exist, but the
-	 * SET base is unproven and the H14 compiler backend is unqualified:
-	 * no constants may enter here yet.
-	 */
-	.ps_base = 0,
-	.qual = ANE_UNSUPPORTED,
-};
-
-static const struct ane_soc ane_soc_t6021 = {
-	/* M2 Max (T6021, t6021-test-host). SET window 0x8e08c000 = pmgr base
-	 * 0x8e080000 + 0xc000, present in ane0's own reg on macOS captures
-	 * of both 26.6.2 and 27.0 (2026-09-18, 11/11 derivation-input
-	 * checks each, zero delta); the Linux translation reuses the pmgr
-	 * high bits proven on T6000/T6020 rows (low-32 match) ->
-	 * 0x28e08c000. Recognized, not qualified: constants complete, but
-	 * no Linux execution yet, and the t6021 pwrstate word layout
-	 * (which of set0/base/set1..4 sits at which offset — macOS-side
-	 * capture cannot see it) is unverified; the first probe resume
-	 * logs the ACTUAL nibbles through this window as the Linux-side
-	 * probe (receipt 2026-09-18-t6021-driver-entry-prepared.md).
-	 * Promotion to ANE_QUALIFIED needs an exact run on this silicon.
-	 */
-	.ps_base = 0x28e08c000ULL,
-	.qual = ANE_RECOGNIZED,
 };
 
 static const struct of_device_id ane_of_match[] = {
 	{ .compatible = "apple,t8103-ane", .data = &ane_soc_t8103 },
 	{ .compatible = "apple,t6000-ane", .data = &ane_soc_t6000 },
-	{ .compatible = "apple,t6020-ane", .data = &ane_soc_t6020 },
-	{ .compatible = "apple,t6021-ane", .data = &ane_soc_t6021 },
 	{}
 };
 
@@ -979,31 +928,10 @@ MODULE_DEVICE_TABLE(of, ane_of_match);
 static int ane_platform_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	const struct of_device_id *id = of_match_device(ane_of_match, dev);
-	const struct ane_soc *soc = id->data;
+	const struct ane_soc *soc = of_device_get_match_data(dev);
 	struct ane_device *ane;
 	struct drm_device *drm;
 	int err;
-
-	/* Tier gate before any power-domain, MMIO or IRQ interaction: an
-	 * unqualified SoC must fail cleanly, never half-probe.
-	 */
-	if (soc->qual == ANE_UNSUPPORTED) {
-		dev_err(dev,
-			"%s: unsupported ANE: no proven SET-block base (a guessed base external-aborts the SoC); not binding. To advance this port, run the mlx-omarchy quick collector (scripts/collect_quick.py: captures ANE/DART/PMGR/AIC device-tree data, no driver needed) and submit the capture\n",
-			id->compatible);
-		return -ENODEV;
-	}
-	if (soc->qual == ANE_RECOGNIZED && !allow_unqualified) {
-		dev_err(dev,
-			"%s: recognized but unqualified: constants present, execution never proven on this silicon; not binding. Override with ane.allow_unqualified=1, or prove a run and report it\n",
-			id->compatible);
-		return -ENODEV;
-	}
-	if (soc->qual == ANE_RECOGNIZED)
-		dev_warn(dev,
-			 "%s: UNQUALIFIED bind forced by allow_unqualified: no execution proven on this silicon — SET-block base and board topology unverified\n",
-			 id->compatible);
 
 	ane = devm_drm_dev_alloc(dev, &ane_drm_driver, struct ane_device, drm);
 	if (IS_ERR(ane))
@@ -1172,7 +1100,7 @@ static int __maybe_unused ane_runtime_resume(struct device *dev)
 		 * SET window reads come first (pmgr class, always safe
 		 * per T6001/T8103 bisect evidence), then the engine. A
 		 * hard reset after the last off-box line names the
-		 * killing access exactly (T6021 console bring-up).
+		 * killing access exactly.
 		 */
 		struct resource *eng = platform_get_resource_byname(
 			to_platform_device(dev), IORESOURCE_MEM, "engine");
@@ -1198,8 +1126,8 @@ static int __maybe_unused ane_runtime_resume(struct device *dev)
 		/* Linux-side pwrstate probe: ACTUAL nibbles read through
 		 * the SoC descriptor's SET window while the partition is
 		 * raised. 0xffffff means the mapped window is the live
-		 * pmgr SET block with every word on; anything else names
-		 * the t6021 word layout to fix before promotion.
+		 * pmgr SET block with every word on; anything else means
+		 * the window does not match the expected word layout.
 		 */
 		dev_info(dev, "ANERD ps probe act=%#x\n", ane_ps_act(ane));
 	}
