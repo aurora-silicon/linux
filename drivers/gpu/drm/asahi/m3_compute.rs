@@ -278,6 +278,13 @@ impl Compute {
         let end=self.objects[TIMESTAMPS[1]].read_u64(storage::slot_offset(TIMESTAMPS[1],slot).map_err(|_|EINVAL)?)?;
         Ok(if start!=0 && end>=start {(end-start)*1000/24} else {0})
     }
+    /// A batch span includes gaps between its compute commands, unlike gpu_ns.
+    /// Read only after stamps, queues, events and idle state prove retirement.
+    pub(crate) fn batch_gpu_span(&mut self)->Result<[u64;2]> {
+        if self.batch_count == 0 {return Err(EINVAL);}
+        Ok([self.objects[TIMESTAMPS[0]].read_u64(storage::slot_offset(TIMESTAMPS[0],0).map_err(|_|EINVAL)?)?,
+            self.objects[TIMESTAMPS[1]].read_u64(storage::slot_offset(TIMESTAMPS[1],self.batch_count-1).map_err(|_|EINVAL)?)?])
+    }
     pub(crate) fn head(&self) -> u16 { self.head }
     pub(crate) fn ordinal(&self)->u64 {self.sequence}
     pub(crate) fn first(&self) -> bool { self.sequence == self.batch_count as u64 }

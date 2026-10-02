@@ -339,6 +339,13 @@ impl Render {
         let end=self.passes[self.batch_count-1].get_mut(P::FragmentEnd).read_u64(0)?;
         Ok(if start!=0 && end>=start {(end-start)*1000/24} else {0})
     }
+    /// Read retained timestamps only after exact batch retirement. The first
+    /// TA and final fragment delimit the batch in the shared 24 MHz counter.
+    pub(crate) fn batch_gpu_span(&mut self)->Result<[u64;2]> {
+        if self.batch_count == 0 {return Err(EINVAL);}
+        Ok([self.passes[0].get_mut(P::TilerStart).read_u64(0)?,
+            self.passes[self.batch_count-1].get_mut(P::FragmentEnd).read_u64(0)?])
+    }
     pub(crate) fn stage_ns(&mut self)->Result<[u64;3]> {
         let mut total=[0;3];
         for slot in 0..self.batch_count {

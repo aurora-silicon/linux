@@ -264,6 +264,10 @@ impl Runtime {
             let previous_events=inner.config.completed_events;
             inner.state.health.set_gpu_pending(true);
             inner.gpu_pending = true;
+            // Diagnostic only: publication precedes queue writes/doorbells.
+            // Never compare an unscaled AP counter to firmware timestamps.
+            let boundary_profile=crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming);
+            let publication_tick=if boundary_profile {physical_counter()} else {0};
             let expected_events=match &inner.jobs[index] {
                 NativeJob::Compute(j)=>{
                     inner.config.submit_queue(2,j.queue(),j.head(),2,j.first())?;
@@ -299,6 +303,7 @@ impl Runtime {
                     match inner.device.check_idle() {
                         Ok(()) if inner.config.pipes_idle()?=>{
                             if let Err(e)=inner.config.check_pstate(&inner.drm,&inner.device,"after a job") {inner.state.health.mark_failed();return Err(e);}
+                            let observed_tick=if boundary_profile {physical_counter()} else {0};
                             // Stamps, both queue indices, required events,
                             // firmware health, engines and pipes are verified.
                             inner.state.health.record_completion();
@@ -316,6 +321,15 @@ impl Runtime {
                             };
                             if kind==0 {inner.render_batches[batch_count-1]+=1;}
                             if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {
+                                let (cs,span)=match (&mut inner.jobs[index],control) {
+                                    (NativeJob::Compute(j),crate::m3_submit::Command::Compute(c))=>(c.base,j.batch_gpu_span()?),
+                                    (NativeJob::Render(j),crate::m3_submit::Command::Render{command:r,..})=>(r.vdm_base,j.batch_gpu_span()?),
+                                    _=>return Err(EINVAL),
+                                };
+                                let valid=publication_tick!=0 && span[0]>=publication_tick &&
+                                    span[1]>=span[0] && observed_tick>=span[1];
+                                dev_info!(inner.drm.as_ref(),"M3_BATCH_BOUNDARY cs={:#x} batch={} publication_tick={} gpu_start_tick={} gpu_end_tick={} observed_tick={} counter_hz=24000000 valid={}\n",
+                                    cs,batch_count,publication_tick,span[0],span[1],observed_tick,u32::from(valid));
                                 if let NativeJob::Compute(j)=&mut inner.jobs[index] {
                                     for slot in 0..batch_count {
                                         let crate::m3_submit::Command::Compute(c)=packet.commands[command_index+slot] else {return Err(EINVAL);};
@@ -481,4 +495,18 @@ impl Drop for Runtime {
         // drains callbacks before dropping retained commands, UAT and power.
         unsafe { ManuallyDrop::drop(&mut self.inner) };
     }
+}
+
+/// Same scaling contract as G16's qualified publication profiler. AP counter
+/// rates may differ between SoCs; firmware command timestamps use 24 MHz.
+fn physical_counter() -> u64 {
+    let tick: u64;
+    let frequency: u64;
+    // SAFETY: Read architectural counters only; no device state is modified.
+    unsafe { core::arch::asm!("mrs {f}, cntfrq_el0", "mrs {t}, cntpct_el0",
+        f = out(reg) frequency, t = out(reg) tick,
+        options(nomem, nostack, preserves_flags)) };
+    let frequency = frequency & 0xffff_ffff;
+    if frequency == 0 { return 0; }
+    (tick / frequency) * 24_000_000 + (tick % frequency) * 24_000_000 / frequency
 }
