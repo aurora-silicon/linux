@@ -105,10 +105,18 @@ impl Inner {
         self.config.log_recovery_state(&self.drm,events)
     }
 }
-pub(crate) struct Runtime { inner: ManuallyDrop<Inner> }
+// Keep the large graph on the heap: returning and moving it through probe,
+// Registration and Mutex initialization otherwise duplicates it on the bounded
+// kernel stack. ManuallyDrop retains the whole allocation on failed ASC stop.
+pub(crate) struct Runtime { inner: ManuallyDrop<KBox<Inner>> }
 impl Runtime {
+    #[inline(never)]
     pub(crate) fn new(pdev: &platform::Device<Core>, device: Device, contents: crate::m3_adt_config::Contents) -> Result<Self> {
         device.require_stopped(pdev)?;
+        // Reserve before starting ASC. ENOMEM must not drop firmware owners
+        // while the coprocessor may still access them. Writing the completed
+        // graph into this allocation is infallible.
+        let owner = KBox::<Inner>::new_uninit(GFP_KERNEL)?;
         let drm: driver::AsahiDevRef = kernel::drm::Device::new(pdev.as_ref(), driver::AsahiData::new(pdev, None, true))?;
         let state = m3_rtkit::State::new(pdev, drm.clone(), device.firmware().resources.regions[5])?;
         let mut transport = rtkit::RtKit::new(pdev.as_ref(), None, 0, state.clone())?;
@@ -139,9 +147,9 @@ impl Runtime {
                 return Err(e);
             }
         };
-        Ok(Self { inner: ManuallyDrop::new(Inner { transport, state, config, uat, drm, device,
+        Ok(Self { inner: ManuallyDrop::new(owner.write(Inner { transport, state, config, uat, drm, device,
             jobs:KVec::new(),packets:KVec::new(),gpu_pending:false,fault_captured:false,timing:[[0;7];2],render_batches:[0;crate::m3_pass_layout::SLOTS],
-            geometry:[GeometryTiming::default();32],geometry_overflow:0 }) })
+            geometry:[GeometryTiming::default();32],geometry_overflow:0 })) })
     }
     pub(crate) fn drm(&self) -> driver::AsahiDevRef { self.inner.drm.clone() }
     pub(crate) fn health(&self) -> Arc<m3_rtkit::Health> { self.inner.state.health.clone() }
@@ -180,7 +188,7 @@ impl Runtime {
         let compute_batch_size=crate::m3_params::compute_batch_size();
         let mut guard = shared.lock();
         let events = {
-            let inner = &mut *Option::as_mut(&mut *guard).ok_or(ENODEV)?.inner;
+            let inner: &mut Inner = &mut *Option::as_mut(&mut *guard).ok_or(ENODEV)?.inner;
             if !inner.state.healthy() { return Err(EIO); }
             // A future second executor must fail closed, never reset storage
             // or clear retained owners of the scheduler's in-flight packet.
@@ -207,7 +215,7 @@ impl Runtime {
                     .take_while(|c|matches!(c,crate::m3_submit::Command::Compute(_))).count()
             };
             let prepare=Instant::<Monotonic>::now();
-            let inner=&mut *Option::as_mut(&mut *guard).ok_or(ENODEV)?.inner;
+            let inner: &mut Inner=&mut *Option::as_mut(&mut *guard).ok_or(ENODEV)?.inner;
             let found=inner.jobs.iter().position(|job| matches!((job,control),
                 (NativeJob::Compute(_),crate::m3_submit::Command::Compute(_)) |
                 (NativeJob::Render(_),crate::m3_submit::Command::Render{..})));
@@ -290,7 +298,7 @@ impl Runtime {
             loop {
                 // Unbind may remove the runtime while unlocked. Drop either
                 // proves ASC stopped or quarantines all pending DMA owners.
-                let inner=&mut *Option::as_mut(&mut *guard).ok_or(ENODEV)?.inner;
+                let inner: &mut Inner=&mut *Option::as_mut(&mut *guard).ok_or(ENODEV)?.inner;
                 let poll_start=measure.then(Instant::<Monotonic>::now);
                 let messages=inner.state.event_messages.load(Ordering::Acquire);
                 if !inner.state.healthy() || inner.config.drain(&inner.drm).is_err() {
@@ -433,7 +441,7 @@ impl Runtime {
         self.inner.state.events.clone()
     }
     pub(crate) fn service_events(&mut self) {
-        let inner=&mut *self.inner;
+        let inner: &mut Inner=&mut *self.inner;
         if inner.fault_captured { return; }
         let result = if inner.state.healthy() { inner.config.drain(&inner.drm) }
             else { Err(EIO) };
@@ -454,14 +462,14 @@ impl Runtime {
         let start = Instant::<Monotonic>::now();
         while !self.inner.config.ready()? {
             if start.elapsed() >= Delta::from_secs(2) || !self.inner.state.healthy() {
-                let inner=&mut *self.inner;let _=inner.config.log_ready(&inner.drm);
+                let inner: &mut Inner=&mut *self.inner;let _=inner.config.log_ready(&inner.drm);
                 return Err(ETIMEDOUT);
             }
             fsleep(Delta::from_millis(1));
         }
         // Import the configured idle policy again after initial power-up.
         self.send_control(0x13)?;
-        let inner = &mut *self.inner;
+        let inner: &mut Inner = &mut *self.inner;
         inner.config.drain(&inner.drm)?;
         inner.config.log_ready(&inner.drm)?;
         inner.config.check_pstate(&inner.drm, &inner.device, "after boot")?;
@@ -474,7 +482,7 @@ impl Runtime {
         Pin::new(&mut self.inner.transport).send_message(0x21, 0x0083000000000011)?;
         let start = Instant::<Monotonic>::now();
         loop {
-            let inner = &mut *self.inner;
+            let inner: &mut Inner = &mut *self.inner;
             inner.config.drain(&inner.drm)?;
             if !inner.state.healthy() { return Err(EIO); }
             if inner.config.control_done(next)? { return Ok(()); }
