@@ -1208,13 +1208,13 @@ static int __maybe_unused ane_runtime_resume(struct device *dev)
 		eng = platform_get_resource_byname(pdev, IORESOURCE_MEM,
 						   "engine");
 
-		dev_info(dev,
-			 "ANE-resume: genpd raise complete; SET window probe next\n");
+		dev_dbg(dev,
+			"ANE-resume: genpd raise complete; SET window probe next\n");
 		ane_ps_act_probe(ane);
 
-		dev_info(dev,
-			 "ANE-resume: SET window probed; first engine access next (TM_TQ_EN tm+0x0c @ engine %pr + 0x2000c)\n",
-			 eng);
+		dev_dbg(dev,
+			"ANE-resume: SET window probed; first engine access next (TM_TQ_EN tm+0x0c @ engine %pr + 0x2000c)\n",
+			eng);
 	}
 
 	ane_tm_enable(ane, first);
@@ -1223,7 +1223,7 @@ static int __maybe_unused ane_runtime_resume(struct device *dev)
 	 * its post-reset status against it.
 	 */
 	if (!ane->tm_status_known) {
-		dev_info(dev, "ANE-resume: enable writes survived; TM_STATUS read next\n");
+		dev_dbg(dev, "ANE-resume: enable writes survived; TM_STATUS read next\n");
 		ane->tm_status_fresh = ane_tm_status(ane);
 		ane->tm_status_known = true;
 		/* Linux-side pwrstate probe: ACTUAL nibbles read through
@@ -1232,7 +1232,7 @@ static int __maybe_unused ane_runtime_resume(struct device *dev)
 		 * pmgr SET block with every word on; anything else means
 		 * the window does not match the expected word layout.
 		 */
-		dev_info(dev, "ANERD ps probe act=%#x\n", ane_ps_act(ane));
+		dev_dbg(dev, "ANERD ps probe act=%#x\n", ane_ps_act(ane));
 	}
 
 	return 0;
