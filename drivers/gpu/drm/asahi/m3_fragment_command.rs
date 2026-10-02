@@ -32,6 +32,10 @@ pub(crate) struct State {
     pub(crate) mirror_tile_mode:u32,
     pub(crate) depth:DepthStencil,
     pub(crate) stencil:DepthStencil,
+    // Paired ZLS metadata address/stride. Native 26A428 compressed depth
+    // witness: 153c1/153c9 and partial mirror +1e0; independent of image data.
+    pub(crate) depth_compression:DepthStencil,
+    pub(crate) stencil_compression:DepthStencil,
     pub(crate) zls_control:u64,
     pub(crate) depth_dimensions:u32,
     pub(crate) depth_clear:u32,
@@ -94,7 +98,10 @@ impl Command {
             (0x15329,s.depth.base),(0x15331,s.depth.base),(0x15339,s.stencil.base),(0x15341,s.stencil.base),
             (0x15231,0),(0x15221,0),(0x15239,0),(0x15229,0),
             (0x15401,s.depth.stride),(0x15421,s.depth.stride),(0x15409,s.stencil.stride),(0x15429,s.stencil.stride),
-            (0x153c1,0),(0x15411,0),(0x153c9,0),(0x15431,0),(0x153d1,0),(0x15419,0),(0x153d9,0),(0x15439,0),
+            (0x153c1,s.depth_compression.base),(0x15411,s.depth_compression.stride),
+            (0x153c9,s.depth_compression.base),(0x15431,s.depth_compression.stride),
+            (0x153d1,s.stencil_compression.base),(0x15419,s.stencil_compression.stride),
+            (0x153d9,s.stencil_compression.base),(0x15439,s.stencil_compression.stride),
             (0x16429,self.tilemap.get()),(0x16060,layer_metadata),(0x16431,u64::from(4*g.region_stride)<<24),
             (0x10039,s.tile_mode),(0x16020,0),(0x16451,0),(0x15359,0),(0x100b8,0x8860),
             (0x16461,self.auxiliary.get()),(0x16090,self.auxiliary.get()),(0x120a1,0x1c),(0x101e9,0x1c),
@@ -126,8 +133,10 @@ impl Command {
             (0x168,s.partial_background.resources),(0x170,s.partial_background.address),
             (0x198,s.partial_background.resources),(0x1a0,s.partial_background.address),
             (0x1a8,s.zls_control),(0x1b8,s.depth.base),(0x1c0,s.depth.stride),
+            (0x1c8,s.depth_compression.stride),(0x1e0,s.depth_compression.base),
             (0x1d0,s.depth.base),(0x1d8,s.depth.base),
             (0x1e8,s.stencil.base),(0x1f0,s.stencil.stride),(0x200,s.stencil.base),(0x208,s.stencil.base),
+            (0x1f8,s.stencil_compression.stride),(0x210,s.stencil_compression.base),
             (0x26c,s.partial_eot.address),(0x28c,s.partial_eot.address),(0x2c0,u64::from(s.depth_dimensions))] {
             pointer(bytes,PARAMETERS+offset,value);
         }

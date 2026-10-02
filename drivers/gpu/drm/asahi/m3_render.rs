@@ -313,6 +313,8 @@ impl Render {
                 tile_mode,mirror_tile_mode:tile_mode as u32,
                 depth:DepthStencil{base:r.depth.base,stride:u64::from(r.depth.stride)},
                 stencil:DepthStencil{base:r.stencil.base,stride:u64::from(r.stencil.stride)},
+                depth_compression:DepthStencil{base:r.depth.compression_base,stride:u64::from(r.depth.compression_stride)},
+                stencil_compression:DepthStencil{base:r.stencil.compression_base,stride:u64::from(r.stencil.compression_stride)},
                 zls_control:r.zls_control,depth_dimensions:r.depth_dimensions,depth_clear:r.depth_clear,
                 stencil_clear:r.stencil_clear,sample_size:u32::from(r.sample_size),process_empty_tiles:r.flags&2!=0,
             },
