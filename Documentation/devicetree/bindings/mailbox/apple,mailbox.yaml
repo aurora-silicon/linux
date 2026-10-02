@@ -38,6 +38,14 @@ properties:
           - const: apple,asc-mailbox-v4
 
       - description:
+          ASC mailboxes of the T8140 GPU coprocessors. Unlike the other
+          T8140 ASC mailboxes, they do not need the application processor
+          to enable their receive FIFO.
+        items:
+          - const: apple,t8140-gfx-asc-mailbox
+          - const: apple,asc-mailbox-v4
+
+      - description:
           AOP setup-port mailbox with a separate register layout.
         const: apple,t8140-aop-setup-mailbox
 
