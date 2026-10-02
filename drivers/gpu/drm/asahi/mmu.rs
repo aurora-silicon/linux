@@ -752,7 +752,11 @@ impl KernelMapping {
         };
 
         // Tell the firmware to do a cache flush
-        if let Err(e) = (*owner.dev).gpu.fwctl(cmd) {
+        let ret = match (*owner.dev).gpu.manager() {
+            Some(gpu) => gpu.fwctl(cmd),
+            None => Err(ENODEV),
+        };
+        if let Err(e) = ret {
             dev_err!(
                 owner.dev.as_ref(),
                 "MMU: ASC cache flush {:#x}:{:#x} failed (err: {:?})\n",
