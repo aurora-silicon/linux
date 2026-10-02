@@ -324,6 +324,11 @@ impl File {
             max_frequency_khz: gpu.get_dyncfg().pwr.max_frequency_khz(),
 
             command_timestamp_frequency_hz: 1_000_000_000, // User timestamps always in nanoseconds
+
+            // G13 and G14 share the second shader ISA generation and predate the numbered
+            // command stream generations.
+            usc_generation: 2,
+            gpu_hal_generation: uapi::drm_asahi_gpu_hal_generation_DRM_ASAHI_GPU_HAL_LEGACY,
         };
 
         for (i, mask) in gpu.get_dyncfg().id.core_masks.iter().enumerate() {
