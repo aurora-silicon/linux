@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/dma/apple,t8140-piodma-diagnostic.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8140 experimental PCIe PIODMA bootstrap engine
+
+maintainers:
+  - Ace <Acelogic@users.noreply.github.com>
+
+description: |
+  The J700 diagnostic driver uses this engine for a single retained request
+  before enabling native downstream ECAM access. It does not expose generic
+  DMA channels. This experimental binding describes that bounded bootstrap;
+  it does not establish an engine reset, removal or memory reuse contract.
+
+properties:
+  compatible:
+    const: apple,t8140-piodma-diagnostic
+
+  reg:
+    items:
+      - description: Request engine
+      - description: Interrupt aggregator
+      - description: PCIe fabric interface
+
+  reg-names:
+    items:
+      - const: engine
+      - const: irq-aggregator
+      - const: fabric
+
+  interrupts:
+    maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+  iommus:
+    maxItems: 1
+
+  apple,pcie-host:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: PCIe host controller whose ECAM access this engine primes.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - power-domains
+  - iommus
+  - apple,pcie-host
+
+additionalProperties: false

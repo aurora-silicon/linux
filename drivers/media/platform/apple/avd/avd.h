@@ -14,10 +14,10 @@
 #ifndef AVD_H_
 #define AVD_H_
 
-#include "linux/bitmap.h"
 #include <linux/platform_device.h>
 #include <linux/firmware.h>
 #include <linux/iommu.h>
+#include <linux/spinlock.h>
 
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
@@ -32,13 +32,20 @@
 /* Shifts addreses right and bytesperline?? */
 #define AVD_QUIRK_LSR	BIT(0)
 #define AVD_QUIRK_NO_PIPE_STATE	 BIT(1)
+/* HEVC DMA configuration and extended scratch-address table. */
+#define AVD_QUIRK_HEVC_V5_HEADER	BIT(2)
 
 #define VP_SLOT_NONE		255
 #define INST_FIFO_SLOT_NONE	255
 
-/* AVD needs most addresses to be aligned to 256 */
+/*
+ * AVD needs most addresses to be aligned to 256
+ * the only exception are the compressed buffers, they are aligned to 128
+ * instead
+ */
 #define AVD_ALIGN	256
-
+/* hevc, with a b slice where all references are active and weights are sent */
+#define AVD_MAX_INST	512
 
 struct avd_ctx;
 struct avd_dev;
@@ -89,14 +96,13 @@ struct avd_av1_decoded_buffer_info {
 	u32 order_hints[V4L2_AV1_TOTAL_REFS_PER_FRAME];
 	u8 ref_frame_idx[V4L2_AV1_REFS_PER_FRAME];
 	bool intrabc;
-	size_t priv_tlb_size;
+	size_t color_size;
 };
 
 struct avd_hevc_decoded_buffer_info {
 	/* Info needed when the decoded frame serves as a reference frame. */
 	bool is_intra;
 };
-
 
 struct avd_comp {
 	u32 size;
@@ -111,13 +117,15 @@ struct avd_decoded_buffer {
 	struct v4l2_m2m_buffer base;
 
 	struct avd_comp comp;
+	/* Pending CPU fill, retained with the buffer until dequeue. */
+	size_t grey_chroma_offset;
+	bool grey_chroma_10bit;
 
 	union {
 		struct avd_vp9_decoded_buffer_info vp9;
 		struct avd_hevc_decoded_buffer_info hevc;
 		struct avd_av1_decoded_buffer_info av1;
 	};
-
 };
 
 static inline struct avd_decoded_buffer *
@@ -170,6 +178,7 @@ struct avd_coded_fmt_desc {
 
 struct avd_variant {
 	unsigned int vp_slots[4];
+	unsigned int vp_slot_base[4];
 	unsigned int fifo_slots;
 	unsigned int capabilities;
 	void (*configure_stream)(struct avd_dev *avd, dma_addr_t addr,
@@ -182,6 +191,14 @@ struct avd_variant {
 	u32 submit_queue_max_offset;
 	u32 submit_queue_status_offset;
 	unsigned int quirks;
+};
+
+/* Lifecycle of the one m2m job the device runs at a time. */
+enum avd_job_state {
+	AVD_JOB_IDLE,
+	AVD_JOB_RUNNING,	/* inside avd_device_run() */
+	AVD_JOB_SUBMITTED,	/* handed to the hardware, watchdog armed */
+	AVD_JOB_FINISHING,	/* claimed by the IRQ handler or the watchdog */
 };
 
 struct avd_dev {
@@ -203,12 +220,35 @@ struct avd_dev {
 
 	struct mutex vdev_lock;
 
+	/* The current job; see avd_device_run(). Protected by job_lock. */
+	spinlock_t job_lock;
+	enum avd_job_state job_state;
+	struct avd_ctx *job_ctx;
+	u64 job_seq;
+	bool job_end_sent;
+	bool job_pending;
+	enum vb2_buffer_state job_pending_result;
+
 	struct reset_control *rstc;
 
-	unsigned long vp_slots;
-	unsigned long inst_fifo_slots;
-
 	const struct avd_variant *variant;
+};
+
+struct avd_segment {
+	size_t num;
+	u32 instructions[AVD_MAX_INST];
+};
+
+struct avd_job {
+	enum avd_codec codec;
+	size_t num;
+	struct avd_segment *segments;
+};
+
+struct avd_buf {
+	void *cpu;
+	dma_addr_t addr;
+	size_t size;
 };
 
 struct avd_ctx {
@@ -224,20 +264,19 @@ struct avd_ctx {
 	bool decomp;
 
 	struct delayed_work watchdog_work;
+	/* job_seq of the job watchdog_work was armed for */
+	u64 wd_seq;
 
 	void *priv;
 
 	struct avd_comp comp;
-
-	u8 fifo_idx;
-	u8 vp_slot;
+	int fifo_idx;
+	struct avd_job job;
+	struct avd_buf inst;
 };
 
-struct avd_buf {
-	void *cpu;
-	dma_addr_t addr;
-	size_t size;
-};
+int avd_init_job(struct avd_ctx *ctx, enum avd_codec codec, size_t segments);
+int avd_submit_job(struct avd_ctx *ctx);
 
 int avd_buf_alloc(struct avd_dev *avd, struct avd_buf *buf, size_t size);
 void avd_buf_free(struct avd_dev *avd, struct avd_buf *buf);
@@ -272,19 +311,6 @@ static inline u32 fmt_width(struct avd_ctx *ctx)
 
 void fill_comp(struct avd_comp *comp, enum avd_image_fmt image_fmt,
 		u32 width, u32 height);
-int alloc_slots(struct avd_dev *avd, struct avd_ctx *ctx, enum avd_codec codec);
-
-static inline void free_vp_slot(struct avd_dev *avd, struct avd_ctx *ctx)
-{
-	clear_bit(ctx->vp_slot, &avd->vp_slots);
-	ctx->vp_slot = VP_SLOT_NONE;
-}
-
-static inline void free_inst_slot(struct avd_dev *avd, struct avd_ctx *ctx)
-{
-	clear_bit(ctx->fifo_idx, &avd->inst_fifo_slots);
-	ctx->fifo_idx = INST_FIFO_SLOT_NONE;
-}
 
 static inline struct avd_ctx *file_to_ctx(struct file *filp)
 {

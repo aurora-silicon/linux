@@ -19,6 +19,7 @@
 		atcphy0 = &atcphy0;
 		keyboard = &keyboard;
 		serial0 = &serial0;
+		wifi0 = &wifi0;
 	};
 
 	chosen {
@@ -1349,3 +1350,57 @@
 
 #include "hwmon-common.dtsi"
 #include "hwmon-laptop.dtsi"
+
+&pcie0 {
+	/* Experiment: guard stays closed until the retained bootstrap succeeds. */
+	apple,piodma = <&pcie0_piodma_diag>;
+	iommu-map = <0x100 &pcie0_dart 1 2>;
+	iommu-map-mask = <0xffff>;
+	pinctrl-0 = <&pcie0_clkreq>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
+&pcie0_port0 {
+	reset-gpios = <&pinctrl_ap 114 GPIO_ACTIVE_LOW>;
+	pwren-gpios = <&smc_gpio 8 GPIO_ACTIVE_HIGH>;
+	max-link-speed = <2>;
+	status = "okay";
+};
+
+&pinctrl_ap {
+	pcie0_clkreq: pcie0-clkreq {
+		pinmux = <APPLE_PINMUX(101, 2)>;
+	};
+};
+
+/* Experimental SID17 bootstrap; arena ownership lasts until full reset. */
+&pcie0_dart {
+	status = "okay";
+	apple,dma-range = /bits/ 64 <0 0x1000000000>;
+};
+
+/ {
+	pcie0_piodma_diag: dma-controller@390030000 {
+		compatible = "apple,t8140-piodma-diagnostic";
+		reg = <0x3 0x90030000 0x0 0x4000>,
+		      <0x3 0x90034000 0x0 0x4000>,
+		      <0x3 0x90038000 0x0 0x4000>;
+		reg-names = "engine", "irq-aggregator", "fabric";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1207 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_apcie_gp>;
+		iommus = <&pcie0_dart 17>;
+		apple,pcie-host = <&pcie0>;
+	};
+};
+
+&pcie0_port0 {
+	bus-range = <1 1>;
+	wifi0: wifi@0,0 {
+		compatible = "pci14c3,7932";
+		reg = <0x10000 0 0 0 0>;
+		/* Public m1n1 supplies this device's address at boot. */
+		local-mac-address = [00 00 00 00 00 00];
+	};
+};

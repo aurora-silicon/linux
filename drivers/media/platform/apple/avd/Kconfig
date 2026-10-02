@@ -11,3 +11,9 @@ config VIDEO_APPLE_AVD
 	select VIDEOBUF2_DMA_CONTIG
 	select V4L2_H264
 	select V4L2_VP9
+	help
+	  Support the Apple Silicon stateless video decoder.
+
+	  Build the decoder firmware from https://github.com/aurora-silicon/avd-fw
+	  and install it under /lib/firmware/apple/. J700/T8140 uses the
+	  avd-fw-v5-t0.bin image. Firmware is supplied separately from this driver.

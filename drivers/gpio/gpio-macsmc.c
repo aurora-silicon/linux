@@ -28,6 +28,11 @@
 #define MACSMC_J700_AFE_RESET_LO	0x10000
 #define MACSMC_J700_AFE_RESET_HI	0x130000
 
+/* J700 amfm-sunrise function-reg_on: pKW8("pcIO", 0x800000, 0x80000). */
+#define MACSMC_J700_RADIO_REG_ON_GPIO	8
+#define MACSMC_J700_RADIO_REG_ON_LO	0x800000
+#define MACSMC_J700_RADIO_REG_ON_HI	0x80000
+
 /*
  * Commands 0-6 are, presumably, the intended API.
  * Command 0xff lets you get/set the pin configuration in detail directly,
@@ -89,14 +94,16 @@ struct macsmc_gpio {
 	int first_index;
 	smc_key base_key;
 
-	bool j700_afe_reset;
-	bool j700_afe_reset_level;
+	bool j700_pcio;
+	DECLARE_BITMAP(j700_pcio_level, MAX_GPIO);
 };
 
-static bool macsmc_gpio_is_j700_afe_reset(struct macsmc_gpio *smcgp,
+static bool macsmc_gpio_is_j700_pcio(struct macsmc_gpio *smcgp,
 					  unsigned int offset)
 {
-	return smcgp->j700_afe_reset && offset == MACSMC_J700_AFE_RESET_GPIO;
+	return smcgp->j700_pcio &&
+		(offset == MACSMC_J700_AFE_RESET_GPIO ||
+		 offset == MACSMC_J700_RADIO_REG_ON_GPIO);
 }
 
 static int macsmc_gpio_nr(smc_key key)
@@ -169,7 +176,7 @@ static int macsmc_gpio_get_direction(struct gpio_chip *gc, unsigned int offset)
 	u32 val;
 	int ret;
 
-	if (macsmc_gpio_is_j700_afe_reset(smcgp, offset))
+	if (macsmc_gpio_is_j700_pcio(smcgp, offset))
 		return GPIO_LINE_DIRECTION_OUT;
 
 	/* First try reading the explicit pin mode register */
@@ -193,8 +200,8 @@ static int macsmc_gpio_get(struct gpio_chip *gc, unsigned int offset)
 	int ret;
 
 	/* pcIO cannot be read back; report the last level written. */
-	if (macsmc_gpio_is_j700_afe_reset(smcgp, offset))
-		return smcgp->j700_afe_reset_level;
+	if (macsmc_gpio_is_j700_pcio(smcgp, offset))
+		return test_bit(offset, smcgp->j700_pcio_level);
 
 	ret = macsmc_gpio_get_direction(gc, offset);
 	if (ret < 0)
@@ -218,9 +225,18 @@ static int macsmc_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
 	smc_key key = macsmc_gpio_key(smcgp->base_key, offset);
 	int ret;
 
-	if (macsmc_gpio_is_j700_afe_reset(smcgp, offset)) {
-		u64 payload = ((u64)MACSMC_J700_AFE_RESET_HI << 32) |
-			      MACSMC_J700_AFE_RESET_LO | (value ? 1 : 0);
+	if (macsmc_gpio_is_j700_pcio(smcgp, offset)) {
+		u32 lo, hi;
+		u64 payload;
+
+		if (offset == MACSMC_J700_RADIO_REG_ON_GPIO) {
+			lo = MACSMC_J700_RADIO_REG_ON_LO;
+			hi = MACSMC_J700_RADIO_REG_ON_HI;
+		} else {
+			lo = MACSMC_J700_AFE_RESET_LO;
+			hi = MACSMC_J700_AFE_RESET_HI;
+		}
+		payload = ((u64)hi << 32) | lo | !!value;
 
 		ret = apple_smc_write_u64(smcgp->smc, SMC_KEY(pcIO), payload);
 		if (ret < 0) {
@@ -229,7 +245,7 @@ static int macsmc_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
 					    offset, !!value, ret);
 			return ret;
 		}
-		smcgp->j700_afe_reset_level = !!value;
+		assign_bit(offset, smcgp->j700_pcio_level, value);
 		return 0;
 	}
 
@@ -252,8 +268,10 @@ static int macsmc_gpio_init_valid_mask(struct gpio_chip *gc,
 	count = min(smcgp->smc->key_count, MAX_GPIO);
 
 	bitmap_zero(valid_mask, ngpios);
-	if (smcgp->j700_afe_reset)
+	if (smcgp->j700_pcio) {
 		set_bit(MACSMC_J700_AFE_RESET_GPIO, valid_mask);
+		set_bit(MACSMC_J700_RADIO_REG_ON_GPIO, valid_mask);
+	}
 
 	for (i = 0; i < count; i++) {
 		int ret, gpio_nr;
@@ -297,7 +315,7 @@ static int macsmc_gpio_probe(struct platform_device *pdev)
 	smcgp->dev = &pdev->dev;
 	smcgp->smc = smc;
 	smcgp->base_key = data ? data->base_key : _SMC_KEY("gP\0\0");
-	smcgp->j700_afe_reset = of_machine_is_compatible("apple,j700") &&
+	smcgp->j700_pcio = of_machine_is_compatible("apple,j700") &&
 				device_is_compatible(&pdev->dev, "apple,smc-gpio");
 
 	smcgp->first_index = macsmc_gpio_find_first_gpio_index(smcgp);

@@ -588,6 +588,62 @@
 			status = "disabled";
 		};
 
+		pcie0: pcie@1cb0000000 {
+			compatible = "apple,t8140-pcie";
+			device_type = "pci";
+			reg = <0x1c 0xb0000000 0x0 0x10000000>,
+			      <0x3 0x94000000 0x0 0x4000>,
+			      <0x3 0x90028000 0x0 0x8000>,
+			      <0x3 0x91028000 0x0 0x8000>,
+			      <0x3 0x92028000 0x0 0x8000>,
+			      <0x3 0x97020000 0x0 0x4000>,
+			      <0x3 0x97024000 0x0 0x4000>,
+			      <0x3 0x97028000 0x0 0x4000>;
+			reg-names = "config", "rc", "port0", "port1", "port2",
+				    "phy0", "phy1", "phy2";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1205 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1214 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1223 IRQ_TYPE_LEVEL_HIGH>;
+			msi-controller;
+			msi-parent = <&pcie0>;
+			/* Only port 0 is described; it owns the first 32 vectors. */
+			msi-ranges = <&aic AIC_IRQ 1331 IRQ_TYPE_EDGE_RISING 32>;
+			bus-range = <0 1>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0x0 0x20000000>,
+				 <0x02000000 0x0 0x80000000 0xb 0x80000000 0x0 0x40000000>;
+			power-domains = <&ps_apcie_gp>;
+			status = "disabled";
+
+			pcie0_port0: pci@0,0 {
+				device_type = "pci";
+				reg = <0 0 0 0 0>;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+				interrupt-controller;
+				#interrupt-cells = <1>;
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &pcie0_port0 0 0 0 0>,
+						<0 0 0 2 &pcie0_port0 0 0 0 1>,
+						<0 0 0 3 &pcie0_port0 0 0 0 2>,
+						<0 0 0 4 &pcie0_port0 0 0 0 3>;
+				status = "disabled";
+			};
+		};
+
+		pcie0_dart: iommu@390000000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x3 0x90000000 0x0 0x20000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1206 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_apcie_gp>;
+			status = "disabled";
+		};
+
 		dwc3_0: usb@40a280000 {
 			compatible = "apple,t8140-dwc3", "apple,t8103-dwc3";
 			reg = <0x4 0x0a280000 0x0 0xcd00>,
@@ -681,6 +737,30 @@
 					 <APPLE_PINMUX(171, 1)>;
 			};
 
+		};
+
+		avd: avd@381080000 {
+			compatible = "apple,t8140-avd";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 936 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 937 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_avd_sys>;
+			resets = <&ps_avd_sys>;
+			reg = <0x3 0x81080000 0x0 0x10000>,
+			      <0x3 0x81090000 0x0 0x10000>,
+			      <0x3 0x810a0000 0x0 0x4000>,
+			      <0x3 0x81100000 0x0 0x10000>;
+			reg-names = "code", "sram", "mbox", "ctrl";
+			iommus = <&avd_dart 0>, <&avd_dart 1>, <&avd_dart 2>;
+		};
+
+		avd_dart: iommu@381020000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x3 0x81020000 0x0 0x20000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 943 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_avd_sys>;
 		};
 
 		i2c0: i2c@385010000 {

@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config MT7932_FULLMAC
+	tristate "Experimental J700 MT7932 fullmac wireless support"
+	depends on PCI && OF && ARM64 && IOMMU_DMA
+	select FW_LOADER
+	select CFG80211
+	help
+	  Native support for the built-in J700 Wi-Fi endpoint: managed
+	  WPA2-CCMP station operation on 2.4 GHz and channels 36..48 at 20 MHz.
+	  Requires original firmware, own calibration and original-derived
+	  country policy packages in addition to the cfg80211 regulatory database.
+	  Requires a trained retained PCI link and a translated SID1 DMA domain.
+	  Firmware, runtime DMA and calibration negotiation start automatically;
+	  cfg80211 and userspace select the country and network. No test boot
+	  parameters are required for ordinary station operation.
+	  Module removal stops host users and performs a checked PCI function
+	  reset before releasing DMA storage. A failed reset blocks removal,
+	  retaining resources until an explicit retry succeeds or system reset.
+	  Other MediaTek devices and other machines are not matched.

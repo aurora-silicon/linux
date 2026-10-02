@@ -26,6 +26,7 @@ properties:
           - apple,t8112-avd
           - apple,t6020-avd
           - apple,t8122-avd
+          - apple,t8140-avd
 
   reg:
     items:

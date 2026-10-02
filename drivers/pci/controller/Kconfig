@@ -57,6 +57,17 @@ config PCIE_APPLE
 
 	  If unsure, say Y if you have an Apple Silicon system.
 
+config PCIE_APPLE_PIODMA_DIAG
+	bool "J700 PIODMA diagnostic (requires full reset after use)"
+	depends on PCIE_APPLE=y && ARCH_APPLE && IOMMU_DMA
+	depends on !PM_SLEEP && !KEXEC_CORE
+	help
+	  Build the experimental SID17 retained bootstrap provider. It submits
+	  one fixed request, validates typed ECAM and permits enumeration of
+	  the two Neo functions only with the explicit enumerate=1 parameter.
+	  Its arena remains owned until a full reset. This is not production
+	  support, and does not qualify memory reuse or radio operation.
+
 config PCI_VERSATILE
 	bool "ARM Versatile PB PCI controller"
 	depends on ARCH_VERSATILE || COMPILE_TEST
