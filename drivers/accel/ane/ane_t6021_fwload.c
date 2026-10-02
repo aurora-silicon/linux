@@ -93,14 +93,12 @@ MODULE_DESCRIPTION("T6021 ANE firmware staging + entry alias");
 static bool fw_load = true;
 module_param(fw_load, bool, 0444);
 MODULE_PARM_DESC(fw_load,
-		 "Validate + DART-map the 13.5 PRELOAD payload (default on: "
-		 "the proven add-path configuration).");
+		 "Validate + DART-map the 13.5 PRELOAD payload (default on: the proven add-path configuration).");
 
 static unsigned int fw_extra_ram = 0x200000;
 module_param(fw_extra_ram, uint, 0444);
 MODULE_PARM_DESC(fw_extra_ram,
-		 "Page-aligned owned RAM after the 5 MiB firmware allocation "
-		 "(default 0x200000, the proven add-path grant; maximum 16 MiB).");
+		 "Page-aligned owned RAM after the 5 MiB firmware allocation (default 0x200000, the proven add-path grant; maximum 16 MiB).");
 
 /* Preloaded-placement alias, lab only: map the iBoot-reserved SEG0/SEGi
  * phys at the entry IOVAs (the preload, with iBoot's patches in place).
@@ -113,11 +111,7 @@ MODULE_PARM_DESC(fw_extra_ram,
 static bool fw_alias_reserved;
 module_param(fw_alias_reserved, bool, 0444);
 MODULE_PARM_DESC(fw_alias_reserved,
-		 "Lab, T6021: map reserved SEG0 0x10000848000+0xc4000 at entry and "
-		 "SEG1 0x10001400000+0x438000 after it (probe refuses unless no-map "
-		 "/reserved-memory nodes cover both); 0 (default) = run the staged "
-		 "copy with iBoot's patches replayed (own memory, the only mode on "
-		 "T6020/T6022).");
+		 "Lab, T6021: map reserved SEG0 0x10000848000+0xc4000 at entry and SEG1 0x10001400000+0x438000 after it (probe refuses unless no-map /reserved-memory nodes cover both); 0 (default) = run the staged copy with iBoot's patches replayed (own memory, the only mode on T6020/T6022).");
 
 static bool ane_t6021_fw_alias_is_reserved(struct device *dev)
 {
@@ -314,7 +308,8 @@ static int ane_t6021_fw_alias_map(struct ane_t6021 *ane, bool reserved)
 		 * DATA section unmapped past the SEG0 head.
 		 */
 		struct { u64 iova, phys, len; } win[] = {
-			{ 0x10000000000ull, ane_t6021_fw_preload[0].phys, ane_t6021_fw_preload[0].len },
+			{ 0x10000000000ull, ane_t6021_fw_preload[0].phys,
+			  ane_t6021_fw_preload[0].len },
 			{ 0, ane_t6021_fw_preload[1].phys, ane_t6021_fw_preload[1].len },
 			{ entry + 0x4fc000, 0, fw_extra_ram ? ane->fw_size - 0x4fc000 : 0 },
 		};
@@ -340,7 +335,8 @@ static int ane_t6021_fw_alias_map(struct ane_t6021 *ane, bool reserved)
 
 			for (o = 0; o < win[w].len; o += ANE_T6021_FW_ALIAS_PAGE) {
 				phys_addr_t pa = w < 2 ? win[w].phys + o :
-					iommu_iova_to_phys(dom, ane->fw_iova + win[w].iova + o - entry);
+					iommu_iova_to_phys(dom, ane->fw_iova +
+							   win[w].iova + o - entry);
 				if (!pa || !IS_ALIGNED(pa, ANE_T6021_FW_ALIAS_PAGE)) {
 					ret = -EFAULT;
 					goto err_unmap_mapped;

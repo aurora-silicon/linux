@@ -69,14 +69,11 @@
 #define ANE_T6021_INIT_TEMPLATE_OFF	0x6c	/* 256 B at [0x6C,0x16C) */
 #define ANE_T6021_INIT_TEMPLATE_SIZE	0x100
 #define ANE_T6021_INIT_TBIT_OFF		0xc0	/* template-relative */
-#define ANE_T6021_INIT_TBIT_VAL		0x4	/* RESOLVED (Main raw
-					 * anchors 0x9612b78/7c/80:
-					 * ldr/orr#4/str on the dev+0x998
-					 * template); the conditional
-					 * |=0x10 is a separate, still
-					 * unqualified mutation and is
-					 * NOT set
-					 */
+/* RESOLVED (Main raw anchors 0x9612b78/7c/80: ldr/orr#4/str on the
+ * dev+0x998 template); the conditional |=0x10 is a separate, still
+ * unqualified mutation and is NOT set.
+ */
+#define ANE_T6021_INIT_TBIT_VAL		0x4
 
 static inline u64 ane_t6021_rvbar_compose(u64 iova)
 {
@@ -451,18 +448,14 @@ struct ane_t6021_boot_io {
 	u64 (*rd64)(void *ctx, unsigned int off);
 	void (*wr32)(void *ctx, unsigned int off, u32 v);
 	void (*wr64)(void *ctx, unsigned int off, u64 v);
-	void (*publish_barrier)(void *ctx); /* orders the coherent fill
-					     * before the device publish:
-					     * dma_wmb() = dmb oshst on
-					     * arm64; NOT claimed as dsb st
-					     * (completion)
-					     */
-	void (*phase)(void *ctx, const char *what); /* bounded phase log:
-					     * emitted ONCE before each
-					     * write/poll block so a crash
-					     * source survives netconsole
-					     * (never per-poll)
-					     */
+	/* Orders the coherent fill before the device publish: dma_wmb() =
+	 * dmb oshst on arm64; NOT claimed as dsb st (completion).
+	 */
+	void (*publish_barrier)(void *ctx);
+	/* Bounded phase log: emitted ONCE before each write/poll block so a
+	 * crash source survives netconsole (never per-poll).
+	 */
+	void (*phase)(void *ctx, const char *what);
 	void (*poll_wait)(void *ctx);    /* 1 ms poll delay */
 	/* prepare(): called once, strictly AFTER poll A and BEFORE the
 	 * SCRATCH0/1 publish; returns the suballoc DVA halves. Kernel
@@ -603,7 +596,7 @@ ane_t6021_boot_run(const struct ane_t6021_boot_io *io,
 		unsigned int ti;
 
 		io->phase(io->ctx, "P-1 grant-tunables begin");
-		for (ti = 0; ti < sizeof(tun) / sizeof(tun[0]); ti++) {
+		for (ti = 0; ti < ARRAY_SIZE(tun); ti++) {
 			io->phase(io->ctx, tun[ti].off == 0x000 ?
 				  "P-1a eng+0x000" :
 				  tun[ti].off == 0x038 ? "P-1b eng+0x038" :

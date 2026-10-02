@@ -529,9 +529,9 @@ int ane_t6021_boot_start(struct ane_t6021 *ane, int stop_after, int table_mode,
  * The generic processor takes commands < 0x1b89 bytes (work-item size
  * bound @0x4d134-0x4d158) and writes completion state back into the
  * command block (strb @0x4d324 byte +6, str @0x4d3b0 qword +8) — the
- * ring slot doubles as the response area. PING/BUILDINFO/BOOT/
- * REG_FILE_LOAD/IPC_ENDPOINT_SET fall through the processor's id tree
- * to the default path (0x4e65c): carried without field parsing, so
+ * ring slot doubles as the response area. The processor's id tree
+ * sends PING/BUILDINFO/BOOT/REG_FILE_LOAD/IPC_ENDPOINT_SET on to the
+ * default path (0x4e65c): carried without field parsing, so
  * their payloads beyond the header are opaque until the W1 live
  * exchange pins them.
  */

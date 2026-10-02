@@ -620,7 +620,7 @@ MODULE_PARM_DESC(call_settle_us,
  * trace state is protected by ane_t6021_fw_lock.
  */
 #define ANE_TRACE_MAGIC		0x31445441	/* "ATD1" */
-#define ANE_TRACE_RECS		(1U << 18)
+#define ANE_TRACE_RECS		BIT(18)
 #define ANE_PMGR_PS_LAST_OFF	0x30
 
 enum {
@@ -1085,7 +1085,8 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 			sha256_update(&sha, (const u8 *)hdr, sizeof(hdr));
 			left = sections[i].size;
 			while (left) {
-				size_t n = min(left, (size_t)ANE_T6021_BO_HASH_CHUNK);
+				size_t n = min_t(size_t, left,
+						 ANE_T6021_BO_HASH_CHUNK);
 
 				memcpy(scratch, (const u8 *)bo->cpu +
 				       sections[i].offset +
@@ -2238,9 +2239,9 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 					 READ_ONCE(((u32 *)command->cpu)[1]),
 					 READ_ONCE(((u32 *)command->cpu)[2]),
 					 qret);
-				if (qret)
+				if (qret) {
 					cfg_err = qret;
-				else if (!READ_ONCE(((u32 *)command->cpu)[2])) {
+				} else if (!READ_ONCE(((u32 *)command->cpu)[2])) {
 					dev_err(dev,
 						"LEGACY CONFIG_GET reply word +0x08 zero\n");
 					cfg_err = -EPROTO;
@@ -2337,11 +2338,11 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 	return 0;
 
 err_pm_or_hold:
-	if (ane->held)
+	if (ane->held) {
 		dev_warn(dev,
 			 "probe failed after CPU start (%pe) — binding fenced; power/rings/IRQ HELD until reboot\n",
 			 ERR_PTR(ret));
-	else {
+	} else {
 		pm_runtime_put_sync_suspend(dev);
 		pm_runtime_disable(dev);
 	}

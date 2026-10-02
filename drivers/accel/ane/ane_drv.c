@@ -513,8 +513,8 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 		}
 		gem[bdx] = &bo->base;
 		if (!bo->iova ||
-		    ((bdx == CMD_BUF_BDX) &&
-		     (args->tsk_size >= (bo->npages << ane->shift)))) {
+		    (bdx == CMD_BUF_BDX &&
+		     args->tsk_size >= (bo->npages << ane->shift))) {
 			err = -EINVAL;
 			goto put;
 		}
@@ -749,10 +749,10 @@ static int ane_drm_mmap(struct file *file, struct vm_area_struct *vma)
 	 */
 	vm_flags_mod(vma, VM_IO | VM_DONTEXPAND | VM_DONTDUMP, VM_PFNMAP);
 
-	if (map_mode & 2)
+	if (map_mode & 2) {
 		vma->vm_page_prot =
 			pgprot_decrypted(vm_get_page_prot(vma->vm_flags));
-	else {
+	} else {
 		vma->vm_page_prot =
 			pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
 		vma->vm_page_prot = pgprot_decrypted(vma->vm_page_prot);
@@ -859,8 +859,9 @@ static int ane_attach_genpd(struct ane_device *ane)
 {
 	struct device *dev = ane->dev;
 
-	ane->pd_count = of_count_phandle_with_args(
-		dev->of_node, "power-domains", "#power-domain-cells");
+	ane->pd_count = of_count_phandle_with_args(dev->of_node,
+						   "power-domains",
+						   "#power-domain-cells");
 	if (ane->pd_count < 1)
 		return ane->pd_count < 0 ? ane->pd_count : -EINVAL;
 	if (ane->pd_count == 1)
@@ -1119,8 +1120,11 @@ static int __maybe_unused ane_runtime_resume(struct device *dev)
 		 * hard reset after the last off-box line names the
 		 * killing access exactly.
 		 */
-		struct resource *eng = platform_get_resource_byname(
-			to_platform_device(dev), IORESOURCE_MEM, "engine");
+		struct platform_device *pdev = to_platform_device(dev);
+		struct resource *eng;
+
+		eng = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+						   "engine");
 
 		dev_info(dev,
 			 "ANE-resume: genpd raise complete; SET window probe next\n");
