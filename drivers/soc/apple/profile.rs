@@ -8,7 +8,7 @@
 //! here once. The driver reads addresses from the device tree, never scans for
 //! them, and never patches properties at runtime.
 //!
-//! Four bring-up targets are modelled:
+//! Five bring-up targets are modelled:
 //!
 //! * `T8103` / J313 (MacBook Air, M1): the host boots the SEP with the boot
 //!   endpoint handshake over a 0x30000 shared-memory window.
@@ -18,6 +18,8 @@
 //!   single-message registration over a 0x40000 window.
 //! * `T8140` / J700 (MacBook Neo, A18 Pro): iBoot boots sepOS before the AP
 //!   OS, so the driver uses the warm registration path.
+//! * `T8112` / J413, J415 (MacBook Air, M2): iBoot hands over a running SEP and
+//!   a powered sensor, so the driver uses the warm registration path.
 
 // The boot handshake, identity source, sensor and DART fields are consumed by
 // the boot-endpoint, identity and sensor-transport paths.
@@ -277,6 +279,47 @@ const T8140: PlatformProfile = PlatformProfile {
     },
 };
 
+/// MacBook Air M2 (J413, J415). iBoot leaves the SEP running and the Mesa
+/// sensor powered (J415: AP GPIO 178 is a driven-high output at handoff), so
+/// this is a warm-registration platform like T6020. The J415 ADT describes the
+/// sensor exactly as J413's does: spi2 at the T8103 address, power on AP GPIO
+/// 178, data-ready on 177, 8 MHz, chip select 0. The SEP DART aperture is
+/// 0x4000 + 0xffff0000, below 4 GiB, so no wide DMA mask. `/defaults`
+/// carries `cpx-encryption-mode = 2`.
+///
+/// The shared-memory geometry and key-store dialect follow the other
+/// warm-registration platforms (T6020, T8140).
+const T8112: PlatformProfile = PlatformProfile {
+    name: "T8112/J415",
+    shmem_capacity: 0x4_0000,
+    shmem_first_item: b"CINP",
+    bootstrap: Bootstrap::WarmRegister,
+    identity: IdentitySource::Chosen,
+    sensor: SensorProfile {
+        controller_base: 0x2_3510_8000,
+        chip_select: 0,
+        max_hz: 8_000_000,
+        cs_setup_ns: 20,
+        cs_hold_ns: 20,
+        mode: SpiMode::Mode1,
+        expected_id: 0x3352,
+        capture_qualified: false,
+    },
+    dart_range_required: true,
+    wide_dma_mask: false,
+    firmware_region: c"sepfw",
+    // J415 accepted the 13.5 GET_CAPABILITIES/SET_ENV init but refused the
+    // strict CREATE_KEYBAG (mailbox status -1, empty reply), as J700 did;
+    // use the T6020 form like the other warm-registration platforms.
+    keybag_create: KeybagCreate {
+        variant: 5,
+        bag_type: 0,
+        arg: -1,
+    },
+    key_store: KeyStore::Variant5,
+    persistent_enrol: true,
+};
+
 static_assert!(T8103.shmem_capacity == 0x30000);
 static_assert!(T6020.shmem_capacity == 0x40000);
 static_assert!(T8140.shmem_capacity == 0x40000);
@@ -287,6 +330,8 @@ static_assert!(T8103.sensor.expected_id == T6020.sensor.expected_id);
 static_assert!(T6000.shmem_capacity == T8103.shmem_capacity);
 static_assert!(T6000.sensor.controller_base == T6020.sensor.controller_base);
 static_assert!(T6000.sensor.expected_id == T6020.sensor.expected_id);
+static_assert!(T8112.shmem_capacity == T6020.shmem_capacity);
+static_assert!(T8112.sensor.controller_base == T8103.sensor.controller_base);
 
 /// Whether the machine root declares `compatible`.
 ///
@@ -338,6 +383,9 @@ pub(crate) fn detect() -> Result<&'static PlatformProfile> {
     }
     if machine_has(b"apple,t8140") {
         return Ok(&T8140);
+    }
+    if machine_has(b"apple,t8112") {
+        return Ok(&T8112);
     }
     Err(ENODEV)
 }
