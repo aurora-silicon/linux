@@ -195,9 +195,8 @@ int ane_tm_enqueue(struct ane_device *ane, struct ane_request *req)
 
 	tq_write32(ane, TQ_STATUS(qid), 0x1);
 
-	for (int bdx = 0; bdx < ANE_TILE_COUNT; bdx++) {
+	for (int bdx = 0; bdx < DRM_ANE_TILE_COUNT; bdx++)
 		tq_write32(ane, TQ_BAR1(qid, bdx), req->bar[bdx]);
-	}
 
 	tq_write32(ane, TQ_SIZE1(qid), ((req->td_size >> 2) - 1) << 0x10);
 	tq_write32(ane, TQ_ADDR1(qid), req->btsp_iova);

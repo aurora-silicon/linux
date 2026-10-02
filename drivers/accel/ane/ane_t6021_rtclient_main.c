@@ -990,9 +990,10 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 	size_t binds_size;
 	int ret, i, j;
 
-	if (user->section_count < 1 ||
+	BUILD_BUG_ON(DRM_ANE_MAX_SECTIONS != ANE_T6021_LOAD_SEC_COUNT);
+	if (user->pad || user->section_count < 1 ||
 	    user->section_count > ANE_T6021_LOAD_SEC_COUNT ||
-	    user->generic_count > ANE_M2_MAX_BINDS || !fd)
+	    user->generic_count > DRM_ANE_MAX_BINDS || !fd)
 		return -EINVAL;
 
 	sections = kmalloc_array(user->section_count, sizeof(*sections),
@@ -1015,6 +1016,12 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 					binds_size)) {
 		ret = -EFAULT;
 		goto out;
+	}
+	for (i = 0; i < user->generic_count; i++) {
+		if (binds[i].pad) {
+			ret = -EINVAL;
+			goto out;
+		}
 	}
 
 	/* Lab contract: the record slot IS the section identity (slot =
@@ -1248,7 +1255,7 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 	size_t cmd_size;
 	int ret, i;
 
-	if (user->count < 1 || user->count > ANE_M2_MAX_BINDS ||
+	if (user->pad || user->count < 1 || user->count > DRM_ANE_MAX_BINDS ||
 	    user->priority < 2 || user->priority > 7 || !fd)
 		return -EINVAL;
 
@@ -1259,6 +1266,12 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 	if (copy_from_user(ios, u64_to_user_ptr(user->io_ptr), ios_size)) {
 		kfree(ios);
 		return -EFAULT;
+	}
+	for (i = 0; i < user->count; i++) {
+		if (ios[i].flags || ios[i].reserved) {
+			kfree(ios);
+			return -EINVAL;
+		}
 	}
 
 	cmd_size = sizeof(struct ane_csne_cmd_procedure_call) +
@@ -1364,7 +1377,8 @@ static int ane_t6021_bo_init_ioctl(struct drm_device *drm, void *data,
 	struct ane_t6021_bo *bo;
 	struct ane_rtclient *ane;
 
-	if (args->size == 0 || args->size > ANE_T6021_BO_MAX || !fd)
+	if (args->pad || args->size == 0 || args->size > ANE_T6021_BO_MAX ||
+	    !fd)
 		return -EINVAL;
 	/* A parked io BO is already mapped and counted; its old contents
 	 * belong to another process, so it is zeroed like a new one.
@@ -1447,6 +1461,8 @@ static int ane_t6021_bo_free_ioctl(struct drm_device *drm, void *data,
 
 	if (!fd)
 		return -ENODEV;
+	if (args->pad)
+		return -EINVAL;
 	mutex_lock(&ane_t6021_bo_lock);
 	list_for_each_entry(b, &fd->bos, node) {
 		if (b->handle == args->handle) {
@@ -1538,6 +1554,25 @@ static void ane_t6021_postclose(struct drm_device *drm, struct drm_file *file)
 	mutex_unlock(&ane_t6021_bo_lock);
 	kfree(fd);
 	file->driver_priv = NULL;
+}
+
+static int ane_t6021_get_caps_ioctl(struct drm_device *drm, void *data,
+				    struct drm_file *file)
+{
+	struct drm_ane_get_caps *args = data;
+
+	if (args->flags || args->pad)
+		return -EINVAL;
+
+	*args = (struct drm_ane_get_caps) {
+		.size = sizeof(*args),
+		.abi_version = DRM_ANE_ABI_V2,
+		.chip_family = DRM_ANE_CHIP_H14,
+		.section_size = sizeof(struct drm_ane_section),
+		.bind_size = sizeof(struct drm_ane_generic_bind),
+		.exec_io_size = sizeof(struct drm_ane_exec_io),
+	};
+	return 0;
 }
 
 static int ane_t6021_submit_ioctl(struct drm_device *drm, void *data,
@@ -1650,6 +1685,7 @@ static int ane_t6021_exec_ioctl(struct drm_device *drm, void *data,
 }
 
 static const struct drm_ioctl_desc ane_t6021_ioctls[] = {
+	DRM_IOCTL_DEF_DRV(ANE_GET_CAPS, ane_t6021_get_caps_ioctl, 0),
 	DRM_IOCTL_DEF_DRV(ANE_BO_INIT, ane_t6021_bo_init_ioctl, 0),
 	DRM_IOCTL_DEF_DRV(ANE_BO_FREE, ane_t6021_bo_free_ioctl, 0),
 	DRM_IOCTL_DEF_DRV(ANE_SUBMIT, ane_t6021_submit_ioctl, 0),
@@ -1685,7 +1721,7 @@ static const struct drm_driver ane_t6021_drm_driver = {
 	.ioctls = ane_t6021_ioctls,
 	.num_ioctls = ARRAY_SIZE(ane_t6021_ioctls),
 	.fops = &ane_t6021_fops,
-	.major = ANE_ABI_M2_MAJOR,
+	.major = DRM_ANE_ABI_V2,
 	.minor = 0,
 	.name = "ane",
 	.desc = "Apple Neural Engine (T6021/M2)",
@@ -2289,7 +2325,7 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 		}
 		dev_info(dev,
 			 "loaded ane_t6021 (DRM major %d minor %d; ABI 2; legacy_only=%u chman_ok=%u booted=%u; state %s; BO cap %u MiB)\n",
-			 ANE_ABI_M2_MAJOR, 0,
+			 DRM_ANE_ABI_V2, 0,
 			 legacy_only, ane->chman_ok,
 			 ane->fw ? ane->fw->booted : 0,
 			 ane->held ? "HELD" : "ready", bo_total_max_mb);

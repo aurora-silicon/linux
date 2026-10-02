@@ -352,6 +352,22 @@ static const struct drm_gem_object_funcs ane_gem_object_funcs = {
 	.vm_ops = &drm_gem_ane_vm_ops,
 };
 
+static int ane_get_caps(struct drm_device *drm, void *data,
+			struct drm_file *file)
+{
+	struct drm_ane_get_caps *args = data;
+
+	if (args->flags || args->pad)
+		return -EINVAL;
+
+	*args = (struct drm_ane_get_caps) {
+		.size = sizeof(*args),
+		.abi_version = DRM_ANE_ABI_V1,
+		.chip_family = DRM_ANE_CHIP_H13,
+	};
+	return 0;
+}
+
 static int ane_bo_init(struct drm_device *drm, void *data,
 		       struct drm_file *file)
 {
@@ -460,7 +476,7 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 {
 	struct ane_device *ane = drm->dev_private;
 	struct drm_ane_submit *args = data;
-	struct drm_gem_object *gem[ANE_TILE_COUNT] = { 0 };
+	struct drm_gem_object *gem[DRM_ANE_TILE_COUNT] = { 0 };
 	struct drm_gem_object *btsp = NULL;
 	struct ane_bo *bo;
 	struct ane_request req;
@@ -483,11 +499,11 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 	}
 
 	req.qid = 4;
-	req.nid = ANE_FIFO_NID;
+	req.nid = DRM_ANE_FIFO_NID;
 	req.td_size = args->td_size;
 	req.td_count = args->td_count;
 
-	for (int bdx = 0; bdx < ANE_TILE_COUNT; bdx++) {
+	for (int bdx = 0; bdx < DRM_ANE_TILE_COUNT; bdx++) {
 		if (!args->handles[bdx])
 			continue;
 		bo = bo_lookup(file, args->handles[bdx]);
@@ -510,8 +526,8 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 	 * access. Since this isn't page aligned, we represent the two as one
 	 * buffer and calculate the delimiter (where the weights would start).
 	 */
-	req.bar[KRN_BUF_BDX] =
-		req.bar[CMD_BUF_BDX] + round_up(args->tsk_size, ANE_CMD_GRAN);
+	req.bar[KRN_BUF_BDX] = req.bar[CMD_BUF_BDX] +
+			       round_up(args->tsk_size, DRM_ANE_CMD_GRAN);
 
 	bo = bo_lookup(file, args->btsp_handle);
 	if (!bo) {
@@ -553,7 +569,7 @@ unlock:
 	mutex_unlock(&ane->engine_lock);
 put:
 	drm_gem_object_put(btsp);
-	for (int bdx = 0; bdx < ANE_TILE_COUNT; bdx++) {
+	for (int bdx = 0; bdx < DRM_ANE_TILE_COUNT; bdx++) {
 		if (gem[bdx])
 			drm_gem_object_put(gem[bdx]);
 	}
@@ -561,6 +577,7 @@ put:
 }
 
 static const struct drm_ioctl_desc ane_drm_ioctls[] = {
+	DRM_IOCTL_DEF_DRV(ANE_GET_CAPS, ane_get_caps, 0),
 	DRM_IOCTL_DEF_DRV(ANE_BO_INIT, ane_bo_init, 0),
 	DRM_IOCTL_DEF_DRV(ANE_BO_FREE, ane_bo_free, 0),
 	DRM_IOCTL_DEF_DRV(ANE_SUBMIT, ane_submit, 0),
@@ -656,9 +673,9 @@ static void ane_drm_postclose(struct drm_device *drm, struct drm_file *file)
 }
 
 /*
- * The driver only owns three ioctls (ANE_BO_INIT, ANE_BO_FREE,
- * ANE_SUBMIT). Anything outside that table would otherwise fall through
- * the standard drm_ioctl path to legacy primary-node handlers that
+ * The driver only owns four ioctls (ANE_GET_CAPS, ANE_BO_INIT,
+ * ANE_BO_FREE, ANE_SUBMIT). The standard drm_ioctl path would otherwise
+ * pass anything outside that table to legacy primary-node handlers that
  * dereference drm_device.unique, which an accel node never sets. Reject
  * such callers explicitly so they fail with -ENOTTY instead of oopsing.
  *
@@ -764,7 +781,7 @@ static const struct drm_driver ane_drm_driver = {
 	.ioctls = ane_drm_ioctls,
 	.num_ioctls = ARRAY_SIZE(ane_drm_ioctls),
 	.fops = &ane_drm_fops,
-	.major = ANE_ABI_MAJOR,
+	.major = DRM_ANE_ABI_V1,
 	.name = "ane",
 	.desc = "Apple Neural Engine driver",
 };
