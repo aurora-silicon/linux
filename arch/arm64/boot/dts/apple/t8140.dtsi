@@ -58,6 +58,7 @@
 			i-cache-size = <0x20000>;
 			d-cache-size = <0x10000>;
 			operating-points-v2 = <&ecluster_opp>;
+			capacity-dmips-mhz = <712>;
 			performance-domains = <&cpufreq_e>;
 		};
 
@@ -71,6 +72,7 @@
 			i-cache-size = <0x20000>;
 			d-cache-size = <0x10000>;
 			operating-points-v2 = <&ecluster_opp>;
+			capacity-dmips-mhz = <712>;
 			performance-domains = <&cpufreq_e>;
 		};
 
@@ -84,6 +86,7 @@
 			i-cache-size = <0x20000>;
 			d-cache-size = <0x10000>;
 			operating-points-v2 = <&ecluster_opp>;
+			capacity-dmips-mhz = <712>;
 			performance-domains = <&cpufreq_e>;
 		};
 
@@ -97,6 +100,7 @@
 			i-cache-size = <0x20000>;
 			d-cache-size = <0x10000>;
 			operating-points-v2 = <&ecluster_opp>;
+			capacity-dmips-mhz = <712>;
 			performance-domains = <&cpufreq_e>;
 		};
 
@@ -110,6 +114,7 @@
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
 			operating-points-v2 = <&pcluster_opp>;
+			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p>;
 		};
 
@@ -123,6 +128,7 @@
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
 			operating-points-v2 = <&pcluster_opp>;
+			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p>;
 		};
 
