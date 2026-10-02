@@ -305,35 +305,19 @@ impl File {
         let mut params = uapi::drm_asahi_params_global {
             features: 0,
 
-            gpu_generation: gpu.get_dyncfg().id.gpu_gen as u32,
-            gpu_variant: gpu.get_dyncfg().id.gpu_variant as u32,
-            gpu_revision: gpu.get_dyncfg().id.gpu_rev as u32,
-            chip_id: gpu.get_cfg().chip_id,
-
-            num_dies: gpu.get_cfg().num_dies,
-            num_clusters_total: gpu.get_dyncfg().id.num_clusters,
-            num_cores_per_cluster: gpu.get_dyncfg().id.num_cores,
-            core_masks: [0; uapi::DRM_ASAHI_MAX_CLUSTERS as usize],
-
             vm_start: VM_USER_RANGE.start,
             vm_end: VM_USER_RANGE.end,
             vm_kernel_min_size: VM_KERNEL_MIN_SIZE,
 
             max_commands_per_submission: MAX_COMMANDS_PER_SUBMISSION,
             max_attachments: crate::microseq::MAX_ATTACHMENTS as u32,
-            max_frequency_khz: gpu.get_dyncfg().pwr.max_frequency_khz(),
 
             command_timestamp_frequency_hz: 1_000_000_000, // User timestamps always in nanoseconds
 
-            // G13 and G14 share the second shader ISA generation and predate the numbered
-            // command stream generations.
-            usc_generation: 2,
-            gpu_hal_generation: uapi::drm_asahi_gpu_hal_generation_DRM_ASAHI_GPU_HAL_LEGACY,
+            ..pin_init::zeroed()
         };
 
-        for (i, mask) in gpu.get_dyncfg().id.core_masks.iter().enumerate() {
-            *(params.core_masks.get_mut(i).ok_or(EIO)?) = (*mask).into();
-        }
+        gpu.get_params(&mut params)?;
 
         if *module_parameters::fault_control.value() == 0xb {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
@@ -985,7 +969,9 @@ impl File {
         }
 
         let gpu = &device.gpu;
-        gpu.update_globals();
+        if let Some(manager) = gpu.manager() {
+            manager.update_globals();
+        }
 
         // Upgrade to Arc<T> to drop the XArray lock early
         let queue: Arc<Mutex<KBox<dyn queue::Queue>>> = file
@@ -1070,7 +1056,7 @@ impl File {
 
         // TODO: Do this on device-init for perf.
         let gpu = &device.gpu;
-        let frequency_hz = gpu.get_cfg().base_clock_hz as u64;
+        let frequency_hz = gpu.base_clock_hz() as u64;
         let ts_gcd = gcd(frequency_hz, NSEC_PER_SEC as u64);
 
         let num = (NSEC_PER_SEC as u64) / ts_gcd;

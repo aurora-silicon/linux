@@ -130,7 +130,11 @@ impl Drop for GpuContext {
     fn drop(&mut self) {
         mod_dev_dbg!(self.dev, "GpuContext: Freeing GPU context\n");
         let data = self.data.take().unwrap();
-        (*self.dev).gpu.free_context(data);
+        // A context only exists for the manager whose allocators created it, so the manager is
+        // always present.
+        if let Some(gpu) = (*self.dev).gpu.manager() {
+            gpu.free_context(data);
+        }
     }
 }
 

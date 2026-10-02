@@ -26,7 +26,10 @@ use crate::debug::*;
 use crate::driver::{AsahiDevRef, AsahiDevice};
 use crate::file::MAX_COMMANDS_PER_SUBMISSION;
 use crate::fw::types::*;
-use crate::gpu::GpuManager;
+use crate::gpu::{
+    Gpu,
+    GpuManager, //
+};
 use crate::inner_weak_ptr;
 use crate::microseq;
 use crate::module_parameters;
@@ -435,6 +438,7 @@ impl Queue::ver {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         dev: &AsahiDevice,
+        gpu: &dyn GpuManager,
         vm: mmu::Vm,
         alloc: &mut gpu::KernelAllocators,
         ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
@@ -479,8 +483,7 @@ impl Queue::ver {
             sched::Scheduler::new(dev.as_ref(), 1, WQ_SIZE, 0, 100000, c_str!("asahi_sched"))?;
         let entity = sched::Entity::new(&sched, sched::Priority::Kernel)?;
 
-        let buffer =
-            buffer::Buffer::ver::new(&*(*dev).gpu, alloc, ualloc.clone(), ualloc_priv, mgr)?;
+        let buffer = buffer::Buffer::ver::new(gpu, alloc, ualloc.clone(), ualloc_priv, mgr)?;
 
         let mut ret = Queue::ver {
             dev: dev.into(),
