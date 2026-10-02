@@ -10,6 +10,7 @@
 #ifndef _LINUX_APPLE_RTKIT_H_
 #define _LINUX_APPLE_RTKIT_H_
 
+#include <linux/bits.h>
 #include <linux/device.h>
 #include <linux/types.h>
 #include <linux/mailbox_client.h>
@@ -40,8 +41,18 @@ struct apple_rtkit_shmem {
 };
 
 /*
+ * The co-processor places its shared buffers itself. A buffer request that
+ * carries an IOVA is set up with shmem_setup and acknowledged by sending the
+ * request back unchanged. The crashlog endpoint is started while the endpoint
+ * map is handled, before the map is acknowledged.
+ */
+#define APPLE_RTKIT_COPROC_PLACES_BUFFERS	BIT(0)
+
+/*
  * Struct to represent implementation-specific RTKit operations.
  *
+ * @flags:         Combination of APPLE_RTKIT_* flags describing the
+ *                 co-processor.
  * @crashed:       Called when the co-processor has crashed. Runs in process
  *                 context.
  * @recv_message:  Function called when a message from RTKit is received
@@ -63,6 +74,7 @@ struct apple_rtkit_shmem {
  *                 context.
  */
 struct apple_rtkit_ops {
+	unsigned int flags;
 	void (*crashed)(void *cookie, const void *crashlog, size_t crashlog_size);
 	void (*recv_message)(void *cookie, u8 endpoint, u64 message);
 	bool (*recv_message_early)(void *cookie, u8 endpoint, u64 message);

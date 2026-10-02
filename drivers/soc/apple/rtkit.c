@@ -100,6 +100,11 @@ bool apple_rtkit_is_crashed(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_is_crashed);
 
+static bool apple_rtkit_coproc_places_buffers(struct apple_rtkit *rtk)
+{
+	return rtk->ops->flags & APPLE_RTKIT_COPROC_PLACES_BUFFERS;
+}
+
 static int apple_rtkit_management_send(struct apple_rtkit *rtk, u8 type,
 					u64 msg)
 {
@@ -169,6 +174,14 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		set_bit(ep, rtk->endpoints);
 	}
 
+	/*
+	 * For co-processors that place their own buffers, the crashlog
+	 * endpoint is started before the map is acknowledged.
+	 */
+	if (apple_rtkit_coproc_places_buffers(rtk) && base == 0 &&
+	    test_bit(APPLE_RTKIT_EP_CRASHLOG, &bitmap))
+		apple_rtkit_start_ep(rtk, APPLE_RTKIT_EP_CRASHLOG);
+
 	reply = FIELD_PREP(APPLE_RTKIT_MGMT_EPMAP_BASE, base);
 	if (msg & APPLE_RTKIT_MGMT_EPMAP_LAST)
 		reply |= APPLE_RTKIT_MGMT_EPMAP_LAST;
@@ -193,6 +206,10 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		case APPLE_RTKIT_EP_IOREPORT:
 		case APPLE_RTKIT_EP_OSLOG:
 		case APPLE_RTKIT_EP_TRACEKIT:
+			/* already started while handling the map */
+			if (ep == APPLE_RTKIT_EP_CRASHLOG &&
+			    apple_rtkit_coproc_places_buffers(rtk))
+				break;
 			dev_dbg(rtk->dev,
 				"RTKit: Starting system endpoint 0x%02x\n", ep);
 			apple_rtkit_start_ep(rtk, ep);
@@ -338,6 +355,9 @@ reply:
 					    buffer->iova);
 		}
 		apple_rtkit_send_message(rtk, ep, reply, NULL, false);
+	} else if (apple_rtkit_coproc_places_buffers(rtk)) {
+		/* acknowledge the co-processor's own buffer with its request */
+		apple_rtkit_send_message(rtk, ep, msg, NULL, false);
 	}
 
 	return 0;
