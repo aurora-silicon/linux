@@ -265,10 +265,13 @@ void dcp_handle_hotplug_actions(struct apple_dcp *dcp, unsigned int action)
 
 void dcp_retrain_oob(struct apple_connector *connector)
 {
-	struct apple_dcp *dcp = platform_get_drvdata(connector->dcp);
+	struct platform_device *pdev = READ_ONCE(connector->dcp);
+	struct apple_dcp *dcp;
 
-	if (!READ_ONCE(connector->connected))
+	/* a Type-C port with no pipeline behind it has nothing to retrain */
+	if (!pdev || !READ_ONCE(connector->connected))
 		return;
+	dcp = platform_get_drvdata(pdev);
 
 	/*
 	 * Bringing up another high-speed Type-C route can disturb an active DPTX
@@ -283,12 +286,18 @@ void dcp_retrain_oob(struct apple_connector *connector)
 void dcp_hotplug(struct work_struct *work)
 {
 	struct apple_connector *connector;
+	struct platform_device *pdev;
 	struct apple_dcp *dcp;
 	int ret;
 
 	connector = container_of(work, struct apple_connector, hotplug_wq);
 
-	dcp = platform_get_drvdata(connector->dcp);
+	pdev = READ_ONCE(connector->dcp);
+	if (!pdev) {	/* a Type-C port unrouted after this was queued */
+		drm_kms_helper_connector_hotplug_event(&connector->base);
+		return;
+	}
+	dcp = platform_get_drvdata(pdev);
 	dev_info(dcp->dev, "%s() connected:%d valid_mode:%d nr_modes:%u\n", __func__,
 		 connector->connected, READ_ONCE(dcp->mode_state.valid), dcp->nr_modes);
 
@@ -411,7 +420,7 @@ static void dcpep_got_msg(struct apple_dcp *dcp, u64 message)
 int dcp_get_modes(struct drm_connector *connector)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
-	struct platform_device *pdev = apple_connector->dcp;
+	struct platform_device *pdev = READ_ONCE(apple_connector->dcp);
 	struct apple_dcp *dcp;
 
 	struct drm_device *dev = connector->dev;
@@ -498,7 +507,7 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 				    const struct drm_display_mode *mode)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
-	struct platform_device *pdev = apple_connector->dcp;
+	struct platform_device *pdev = READ_ONCE(apple_connector->dcp);
 	struct apple_dcp *dcp;
 
 	if (!pdev)

@@ -66,9 +66,21 @@ static int apple_drm_gem_dumb_create(struct drm_file *file_priv,
 	return drm_gem_dma_dumb_create_internal(file_priv, drm, args);
 }
 
+/*
+ * A compositor or boot splash is closing the device.  drm_release() has
+ * already taken its file off the file list, so the Type-C fabric can tell
+ * whether any other one still has the device open.
+ */
+static void apple_drm_postclose(struct drm_device *drm, struct drm_file *file)
+{
+	if (file->was_master)
+		dcp_typec_reorder();
+}
+
 static const struct drm_driver apple_drm_driver = {
 	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(apple_drm_gem_dumb_create),
 	DRM_FBDEV_DMA_DRIVER_OPS,
+	.postclose		= apple_drm_postclose,
 	.name			= DRIVER_NAME,
 	.desc			= DRIVER_DESC,
 	.major			= 1,
@@ -707,6 +719,9 @@ static int apple_drm_init(struct device *dev)
 	ret = drm_dev_register(&apple->drm, 0);
 	if (ret)
 		goto err_unbind;
+
+	/* the fabric keeps order only once registered: catch up on probe */
+	dcp_typec_reorder();
 
 	drm_client_setup_with_fourcc(&apple->drm, DRM_FORMAT_XRGB8888);
 
