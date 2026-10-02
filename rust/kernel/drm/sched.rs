@@ -112,13 +112,49 @@ unsafe extern "C" fn free_job_cb<T: JobImpl>(sched_job: *mut bindings::drm_sched
 unsafe extern "C" fn cancel_job_cb<T: JobImpl>(sched_job: *mut bindings::drm_sched_job) {
     // SAFETY: All of our jobs are Job<T>.
     let p = unsafe { crate::container_of!(sched_job, Job<T>, job) as *mut Job<T> };
+    // SAFETY: A job on the pending list has a valid scheduler fence.
+    let s_fence = unsafe { (*sched_job).s_fence };
+    // SAFETY: `s_fence` is valid and holds a reference to its parent, if any.
+    let parent = unsafe { (*s_fence).parent };
+    // SAFETY: `s_fence` is valid.
+    let finished = unsafe { addr_of_mut!((*s_fence).finished) };
+
+    // drm_sched_fini() has stopped the scheduler workers, but the hardware fence can still
+    // signal concurrently. Fence callbacks run under the fence lock, so removing ours either
+    // disarms it or waits until it has completed the job.
+    let callback_removed = !parent.is_null()
+        // SAFETY: run_job() armed `cb` on `parent` before the submission worker was stopped.
+        && unsafe { bindings::dma_fence_remove_callback(parent, addr_of_mut!((*sched_job).cb)) };
+
+    // A job without a parent either completed when run_job() returned, or had its parent
+    // detached by drm_sched_stop(), which also returned its credits.
+    let complete_here = callback_removed
+        // SAFETY: `finished` is a valid, initialized fence.
+        || (parent.is_null() && unsafe { bindings::dma_fence_get_status(finished) } == 0);
 
     // SAFETY: All of our jobs are Job<T>.
     T::cancel(unsafe { &mut *p });
 
-    let fence = unsafe { Fence::get_raw(&mut (*(*sched_job).s_fence).finished) };
-    fence.set_error(ECANCELED);
-    let _ = fence.signal();
+    if complete_here {
+        // Account for the job exactly as drm_sched_job_done() would have.
+        //
+        // SAFETY: The job belongs to the scheduler being torn down, which is still valid.
+        unsafe {
+            let sched = (*s_fence).sched;
+            if callback_removed {
+                bindings::atomic_sub(
+                    (*sched_job).credits as i32,
+                    addr_of_mut!((*sched).credit_count),
+                );
+            }
+            bindings::atomic_dec((*sched).score);
+        }
+
+        // SAFETY: `finished` is a valid fence.
+        let fence = unsafe { Fence::get_raw(finished) };
+        fence.set_error(ECANCELED);
+        fence.signal();
+    }
 }
 
 /// A DRM scheduler job.
