@@ -1,0 +1,537 @@
+{
+  "date_utc": "2026-10-02",
+  "target": "Apple J700/T8140, Mac17,5",
+  "kernel_release": "7.1.12-aurora-neo-existing-wifi-20261001-r2+",
+  "public_base": "1d2904fd3301c63620f07c81ae79f2486a81a9a6",
+  "driver_source": {
+    "repository": "https://github.com/aurora-silicon/linux-neo-cleanroom-eryk-with-wifi",
+    "branch": "wifi/width-qualification-20260912",
+    "commit": "610cb463c03f9bc68a5d020e7ca443af1fda4856",
+    "integration_changes": [
+      "64-or-65-entry owned config package validation",
+      "Native scan template and directed zero-IE compatibility",
+      "Selected WPA2 PSK admission with alternative AKMs; explicit PSK capability",
+      "Kconfig/Makefile registration",
+      "J700 PCI Wi-Fi node and bootloader MAC alias"
+    ]
+  },
+  "image_sha256": "e9877f3943c5cf04970a1d1b336ea68096377907802063dbce2082b93d20011a",
+  "module_sha256": "aefb08e7cde9398cdce9ca40e29374950dfe989d138813c203cd2f264e44c7f4",
+  "device_tree_sha256": "8e706f4b443ded0e4dd140a6fe33dd5e4a0f70be852b774254c7f1c462afc4fd",
+  "config_sha256": "d5a276107754bf8528503a6ceed9954d4eabb6e2d1ebbb116137bf2fa0da29f0",
+  "checked_wifi_module_removal_reset_reload": "PASS before Bluetooth admission",
+  "firmware_in_repository": false,
+  "independent_rewrite_claim": false,
+  "results": {
+    "wifi_2g": {
+      "result": "WIFI_PHYSICAL_NETWORK_E2E_PASS",
+      "steps": [
+        "REQUESTED_NETWORK_SCAN_OBSERVED",
+        "WPA2_SAVED_PROFILE_ACTIVATED",
+        "DHCP_ROUTE_OBSERVED",
+        "GATEWAY_ROUNDTRIPS_VERIFIED",
+        "DNS_TLS_DOWNLOAD_VERIFIED",
+        "KDE_RUNNING_NO_KERNEL_FAULT"
+      ],
+      "samples": [
+        {
+          "gateway_received": 3,
+          "gateway_loss_percent": 0,
+          "dns": true,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "gateway_received": 3,
+          "gateway_loss_percent": 0,
+          "dns": true,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "gateway_received": 3,
+          "gateway_loss_percent": 0,
+          "dns": true,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        }
+      ],
+      "kernel_release": "7.1.12-aurora-neo-existing-wifi-20261001-r2+",
+      "interface": "wlan0",
+      "rescan_exit": 0,
+      "visible_networks": 16,
+      "requested_network_visible": true,
+      "activation_exit": 0,
+      "frequency_mhz": 2437,
+      "kernel_faults": 0
+    },
+    "wifi_5g_reconnect_with_bluetooth_enabled": {
+      "result": "WIFI_PHYSICAL_NETWORK_E2E_PASS",
+      "steps": [
+        "REQUESTED_NETWORK_SCAN_OBSERVED",
+        "WPA2_SAVED_PROFILE_ACTIVATED",
+        "DHCP_ROUTE_OBSERVED",
+        "GATEWAY_ROUNDTRIPS_VERIFIED",
+        "DNS_TLS_DOWNLOAD_VERIFIED",
+        "KDE_RUNNING_NO_KERNEL_FAULT"
+      ],
+      "samples": [
+        {
+          "gateway_received": 3,
+          "gateway_loss_percent": 0,
+          "dns": true,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "gateway_received": 3,
+          "gateway_loss_percent": 0,
+          "dns": true,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "gateway_received": 3,
+          "gateway_loss_percent": 0,
+          "dns": true,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        }
+      ],
+      "kernel_release": "7.1.12-aurora-neo-existing-wifi-20261001-r2+",
+      "interface": "wlan0",
+      "rescan_exit": 0,
+      "visible_networks": 15,
+      "requested_network_visible": true,
+      "activation_exit": 0,
+      "frequency_mhz": 5240,
+      "kernel_faults": 0
+    },
+    "coexistence_2g": {
+      "result": "RADIO_COEXISTENCE_FAILED",
+      "kernel_release": "7.1.12-aurora-neo-existing-wifi-20261001-r2+",
+      "samples": [
+        {
+          "elapsed_seconds": 2.178,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 6.366,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 10.557,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 14.737,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 18.921,
+          "bluetooth_discovering": true,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 23.433,
+          "bluetooth_discovering": true,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 27.621,
+          "bluetooth_discovering": true,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 31.831,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 36.094,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 40.288,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 44.477,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 48.667,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 52.858,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 57.033,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 61.21,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 65.406,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 70.585,
+          "bluetooth_discovering": false,
+          "gateway_received": 2,
+          "gateway_loss_percent": 33.3333,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 74.759,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        }
+      ],
+      "bluetooth": {
+        "result": "DISCOVERY_AND_HCI_POWER_CYCLE_PASS",
+        "steps": [
+          "POWERED_ON",
+          "DISCOVERY_OBSERVED_AND_STOPPED",
+          "POWERED_OFF",
+          "POWERED_ON_WITH_NEW_SETUP"
+        ],
+        "qualification": "Discovery and normal HCI power cycle; pairing/audio unqualified",
+        "observed_devices": 18,
+        "airpods_candidates": 0,
+        "faults": 0,
+        "crypto_errors": 0
+      },
+      "error": "Gateway packet loss; inspect all recorded samples",
+      "kernel_or_driver_faults": 0
+    },
+    "coexistence_5g": {
+      "result": "WIFI_TRAFFIC_BT_DISCOVERY_POWER_CYCLE_COEXISTENCE_PASS",
+      "kernel_release": "7.1.12-aurora-neo-existing-wifi-20261001-r2+",
+      "samples": [
+        {
+          "elapsed_seconds": 2.185,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 6.365,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 10.557,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 14.751,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 18.951,
+          "bluetooth_discovering": true,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 23.136,
+          "bluetooth_discovering": true,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 27.324,
+          "bluetooth_discovering": true,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 31.531,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 35.711,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 39.905,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 44.089,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 48.271,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 52.468,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 56.66,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 60.844,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 65.026,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 69.214,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "elapsed_seconds": 73.408,
+          "bluetooth_discovering": false,
+          "gateway_received": 3,
+          "gateway_loss_percent": 0.0,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        }
+      ],
+      "start_monotonic_seconds": 1900.801662714,
+      "bluetooth": {
+        "result": "DISCOVERY_AND_HCI_POWER_CYCLE_PASS",
+        "steps": [
+          "POWERED_ON",
+          "DISCOVERY_OBSERVED_AND_STOPPED",
+          "POWERED_OFF",
+          "POWERED_ON_WITH_NEW_SETUP"
+        ],
+        "qualification": "Discovery and normal HCI power cycle; pairing/audio unqualified",
+        "observed_devices": 20,
+        "airpods_candidates": 0,
+        "faults": 0,
+        "crypto_errors": 0
+      },
+      "kernel_or_driver_faults": 0
+    },
+    "public_network_harness": {
+      "result": "WIFI_PHYSICAL_NETWORK_E2E_PASS",
+      "steps": [
+        "REQUESTED_NETWORK_SCAN_OBSERVED",
+        "WPA2_SAVED_PROFILE_ACTIVATED",
+        "DHCP_ROUTE_OBSERVED",
+        "GATEWAY_ROUNDTRIPS_VERIFIED",
+        "DNS_TLS_DOWNLOAD_VERIFIED",
+        "KDE_RUNNING_NO_KERNEL_FAULT"
+      ],
+      "samples": [
+        {
+          "gateway_received": 3,
+          "gateway_loss_percent": 0,
+          "dns": true,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "gateway_received": 3,
+          "gateway_loss_percent": 0,
+          "dns": true,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        },
+        {
+          "gateway_received": 3,
+          "gateway_loss_percent": 0,
+          "dns": true,
+          "tls_verified": true,
+          "download_bytes": 713,
+          "download_sha256": "7d3e61f8f627c8cc640c209ba0777db95f198a64e766f47484c321d5eb5e0962"
+        }
+      ],
+      "kernel_release": "7.1.12-aurora-neo-existing-wifi-20261001-r2+",
+      "interface": "wlan0",
+      "rescan_exit": 0,
+      "visible_networks": 15,
+      "requested_network_visible": true,
+      "activation_exit": 0,
+      "frequency_mhz": 5240,
+      "kernel_faults": 0
+    }
+  },
+  "limits": [
+    "RAM-overlay physical deployment; no persistent installation qualification",
+    "2.4 GHz coexistence had one missed gateway reply; no zero-loss pass",
+    "No concurrent headset audio on combined candidate",
+    "No suspend, kexec, PCI removal, recovery or saturation qualification",
+    "Earlier Bluetooth-only candidate had an audible AAC pass and two bonded reconnects"
+  ]
+}
