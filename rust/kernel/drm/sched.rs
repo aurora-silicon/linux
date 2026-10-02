@@ -381,12 +381,9 @@ struct SchedulerOwner<T: JobImpl> {
 
 impl<T: JobImpl> Drop for SchedulerOwner<T> {
     fn drop(&mut self) {
-        let sched = self.allocation.sched.get();
-
-        // SAFETY: The scheduler is valid. This assumes drm_sched_fini() will take care of
-        // freeing all in-progress jobs.
-        unsafe { bindings::drm_sched_stop(sched, core::ptr::null_mut()) };
-        unsafe { bindings::drm_sched_fini(sched) };
+        // SAFETY: The scheduler is valid. drm_sched_fini() stops the scheduler workers, then
+        // cancels and frees all remaining jobs through `cancel_job_cb()`.
+        unsafe { bindings::drm_sched_fini(self.allocation.sched.get()) };
     }
 }
 
