@@ -942,7 +942,6 @@ impl File {
                     let vm = file_vm.borrow().vm.clone();
                     core::mem::drop(file_vm);
                     vm.drop_mappings(bo)?;
-                    vm.untrack_context_object(bo);
                     if idx == usize::MAX {
                         break;
                     }

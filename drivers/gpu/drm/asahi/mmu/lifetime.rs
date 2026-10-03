@@ -491,6 +491,10 @@ impl Vm {
             state.objects.push(gem.into(), GFP_KERNEL)?;
         }
         if state.active != 0 || state.draining {
+            // Stop new jobs from selecting this accepted cleanup candidate.
+            // The queued object retains its GEM while the candidate is removed.
+            // Actual unmap repeats this under exec to order any intervening bind.
+            self.untrack_context_object(gem);
             return Ok(());
         }
         state.draining = true;
