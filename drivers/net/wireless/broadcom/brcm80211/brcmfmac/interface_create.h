@@ -9,5 +9,6 @@
 
 int brcmf_cfg80211_request_sta_if(struct brcmf_if *ifp, u8 *macaddr);
 int brcmf_cfg80211_request_ap_if(struct brcmf_if *ifp);
+int brcmf_cfg80211_request_awdl_if(struct brcmf_if *ifp, u8 *macaddr);
 
 #endif /* _BRCMF_INTERFACE_CREATE_H_ */
