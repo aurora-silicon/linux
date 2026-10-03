@@ -25,6 +25,7 @@
 		disp0 = &display;
 		disp0_piodma = &disp0_piodma;
 		keyboard = &keyboard;
+		sep = &sep;
 		sio = &sio;
 	};
 };

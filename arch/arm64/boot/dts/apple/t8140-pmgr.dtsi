@@ -6,6 +6,15 @@
  */
 
 &pmgr {
+	ps_sep_aon: power-controller@60 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x60 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "sep_aon";
+		apple,always-on;
+	};
+
 	ps_aic: power-controller@110 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x110 4>;
@@ -73,6 +82,14 @@
 		label = "i2c0";
 	};
 
+	ps_spi_p: power-controller@2f0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2f0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "spi_p";
+	};
+
 	ps_apcie_st: power-controller@310 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x310 4>;
@@ -80,6 +97,15 @@
 		#reset-cells = <0>;
 		label = "apcie_st";
 		power-domains = <&ps_ans>;
+	};
+
+	ps_spi2: power-controller@340 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x340 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "spi2";
+		power-domains = <&ps_spi_p>;
 	};
 
 	ps_apcie_sys_st: power-controller@3a0 {
@@ -155,6 +181,15 @@
 	 * apple,force-disable pattern) never reached ACTIVE again on J700
 	 * (isp_cpu_core0 stuck at ACTUAL=0 on the second firmware boot).
 	 */
+	ps_sep: power-controller@c00 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xc00 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "sep";
+		apple,always-on;
+	};
+
 	ps_isp_cpu: power-controller@4000 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x4000 4>;

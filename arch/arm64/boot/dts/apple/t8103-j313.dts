@@ -94,6 +94,34 @@
 	};
 };
 
+/*
+ * Mesa fingerprint sensor on SPI2. The power line (pin 108, active high) comes
+ * from the J313 platform device tree, which also lists an interrupt on pin 104. The
+ * interrupt is left out on purpose: the driver polls, and the trigger flags in
+ * the ADT (3) are not decoded with any certainty here. Pin 104 reads back as a
+ * plain input with a pull-down, which rules out the two active-low readings of
+ * that value but does not decide between the remaining ones.
+ *
+ * Do not add cs-gpios. The sensor needs the controller's native chip select,
+ * otherwise the SPI core skips the hardware CS timing.
+ */
+&spi2 {
+	status = "okay";
+};
+
+&mesa {
+	status = "okay";
+	enable-gpios = <&pinctrl_ap 108 GPIO_ACTIVE_HIGH>;
+	spi-cs-setup-delay-ns = <20>;
+	spi-cs-hold-delay-ns = <20>;
+	/*
+	 * Per-device factory data written at manufacture.  It is not
+	 * redistributable and has to be extracted from the machine's own macOS
+	 * install, so the name only fixes where the driver looks for it.
+	 */
+	firmware-name = "apple/mesacal-j313.bin";
+};
+
 &i2c1 {
 	speaker_left: codec@31 {
 		compatible = "ti,tas5770l", "ti,tas2770";

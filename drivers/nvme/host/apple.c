@@ -10,6 +10,8 @@
  */
 
 #include <linux/async.h>
+#include <linux/blk-crypto.h>
+#include <linux/blk-crypto-profile.h>
 #include <linux/blkdev.h>
 #include <linux/blk-mq.h>
 #include <linux/device.h>
@@ -257,6 +259,7 @@ struct apple_nvme {
 	unsigned long flush_interval;
 	unsigned long last_flush;
 	struct delayed_work flush_dwork;
+	struct blk_crypto_profile crypto_profile;
 };
 
 /* Bit in recovery_flags: recovery_work owns the next controller stop. */
@@ -292,6 +295,9 @@ MODULE_PARM_DESC(flush_interval,
 
 static_assert(sizeof(struct nvme_command) == 64);
 static_assert(sizeof(struct apple_nvmmu_tcb) == 128);
+
+#define APPLE_NVME_CRYPTO_KEY_SIZE 64
+#define APPLE_NVME_CRYPTO_DATA_UNIT_SIZE 4096
 
 static inline struct apple_nvme *ctrl_to_apple_nvme(struct nvme_ctrl *ctrl)
 {
@@ -575,9 +581,12 @@ static void apple_nvme_submit_cmd_t8015(struct apple_nvme_queue *q,
 
 
 static void apple_nvme_submit_cmd_t8103(struct apple_nvme_queue *q,
-				  struct nvme_command *cmd)
+				  struct nvme_command *cmd,
+				  struct request *req)
 {
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
+	const u8 *key = NULL;
+	u64 dun = 0;
 	u32 tag = nvme_tag_from_cid(cmd->common.command_id);
 	struct apple_nvmmu_tcb *tcb = &q->tcbs[tag];
 
@@ -594,6 +603,22 @@ static void apple_nvme_submit_cmd_t8103(struct apple_nvme_queue *q,
 	else
 		tcb->dma_flags = APPLE_ANS_TCB_DMA_FROM_DEVICE;
 
+	if (unlikely(req->crypt_ctx)) {
+		const struct blk_crypto_key *blk_key = req->crypt_ctx->bc_key;
+
+		key = blk_key->bytes;
+		dun = req->crypt_ctx->bc_dun[0];
+	}
+
+	if (key) {
+		__le64 dun_le = cpu_to_le64(dun);
+
+		tcb->dma_flags |= BIT(2);
+		memcpy(tcb->aes_iv, &dun_le, sizeof(dun_le));
+		memset(tcb->_aes_unk, 0, sizeof(tcb->_aes_unk));
+		memcpy(tcb->_aes_unk, key, 4);
+		memcpy(tcb->_aes_unk + 16, key + 16, 48);
+	}
 	memcpy(&q->sqes[tag], cmd, sizeof(*cmd));
 
 	/*
@@ -846,9 +871,18 @@ static __always_inline void apple_nvme_unmap_rq(struct request *req)
 {
 	struct apple_nvme_iod *iod = blk_mq_rq_to_pdu(req);
 	struct apple_nvme *anv = queue_to_apple_nvme(iod->q);
+	struct apple_nvmmu_tcb *tcb;
+	u32 tag;
 
 	if (blk_rq_nr_phys_segments(req))
 		apple_nvme_unmap_data(anv, req);
+	tag = nvme_tag_from_cid(iod->cmd.common.command_id);
+	tcb = &iod->q->tcbs[tag];
+	if (unlikely(tcb->dma_flags & BIT(2))) {
+		memzero_explicit(tcb->aes_iv, sizeof(tcb->aes_iv));
+		memzero_explicit(tcb->_aes_unk, sizeof(tcb->_aes_unk));
+		tcb->dma_flags &= ~BIT(2);
+	}
 }
 
 static void apple_nvme_complete_rq(struct request *req)
@@ -1080,6 +1114,20 @@ static blk_status_t apple_nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 	ret = nvme_setup_cmd(ns, req);
 	if (ret)
 		return ret;
+	if (unlikely(req->crypt_ctx)) {
+		const struct blk_crypto_key *key = req->crypt_ctx->bc_key;
+
+		if (WARN_ON_ONCE(key->size != APPLE_NVME_CRYPTO_KEY_SIZE ||
+				 key->crypto_cfg.crypto_mode !=
+					 BLK_ENCRYPTION_MODE_AES_256_XTS ||
+				 key->crypto_cfg.key_type !=
+					 BLK_CRYPTO_KEY_TYPE_HW_WRAPPED ||
+				 key->crypto_cfg.data_unit_size !=
+					 APPLE_NVME_CRYPTO_DATA_UNIT_SIZE)) {
+			ret = BLK_STS_NOTSUPP;
+			goto out_free_cmd;
+		}
+	}
 
 	if (blk_rq_nr_phys_segments(req)) {
 		ret = apple_nvme_map_data(anv, req, cmnd);
@@ -1095,7 +1143,7 @@ static blk_status_t apple_nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
         }
 
 	if (anv->hw->has_lsq_nvmmu)
-		apple_nvme_submit_cmd_t8103(q, cmnd);
+		apple_nvme_submit_cmd_t8103(q, cmnd, req);
 	else
 		apple_nvme_submit_cmd_t8015(q, cmnd);
 
@@ -2374,6 +2422,18 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	if (ret)
 		goto out_detach_genpd;
 
+	if (anv->hw->has_lsq_nvmmu) {
+		ret = devm_blk_crypto_profile_init(dev, &anv->crypto_profile, 0);
+		if (ret)
+			goto out_detach_genpd;
+		anv->crypto_profile.max_dun_bytes_supported = sizeof(u64);
+		anv->crypto_profile.key_types_supported =
+			BLK_CRYPTO_KEY_TYPE_HW_WRAPPED;
+		anv->crypto_profile.modes_supported[BLK_ENCRYPTION_MODE_AES_256_XTS] =
+			BIT(ilog2(APPLE_NVME_CRYPTO_DATA_UNIT_SIZE));
+		anv->crypto_profile.dev = dev;
+	}
+
 	ret = nvme_init_ctrl(&anv->ctrl, anv->dev, &nvme_ctrl_ops,
 			     NVME_QUIRK_SKIP_CID_GEN | NVME_QUIRK_IDENTIFY_CNS |
 			     NVME_QUIRK_ADMIN_PAGE_ALIGN | anv->hw->quirks);
@@ -2384,6 +2444,9 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 
 	/* Released by apple_nvme_free_ctrl(), including asynchronous users. */
 	kref_get(&anv->ref);
+
+	if (anv->hw->has_lsq_nvmmu)
+		anv->ctrl.crypto_profile = &anv->crypto_profile;
 
 	return anv;
 out_detach_genpd:

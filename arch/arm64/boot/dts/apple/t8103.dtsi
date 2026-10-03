@@ -861,6 +861,51 @@
 			status = "disabled";
 		};
 
+		/*
+		 * The J313 platform device tree puts the Mesa fingerprint sensor
+		 * on SPI2.  The 120 MHz parent was confirmed by timing transfers:
+		 * a 22158-byte transfer requested at 8 MHz, divider 15, ran at
+		 * 7.45 Mbit/s.  A 200 MHz parent would make that divider
+		 * 13.3 MHz, and the measurement could not then have come out
+		 * below 8 MHz.
+		 *
+		 * The pin group was read out of the hardware rather than taken
+		 * from a schematic.  iBoot leaves every SPI pad it uses at
+		 * peripheral function 1, and the three buses whose groups are
+		 * already described here have the same register signature: two
+		 * pads with no pull for CLK and MOSI, one with a pull-down for
+		 * MISO.  Pins 128, 129 and 130 are the only remaining pads with
+		 * that signature, and they are contiguous, so they are SPI2.
+		 * Pin 131 is a different pad type and is not part of the group.
+		 *
+		 * There is no chip-select pin.  The platform device tree gives
+		 * SPI1, SPI3 and SPI4 a GPIO chip select (pins 45, 49 and 24, each the
+		 * last pad of its group) and gives SPI2 the string "null", so
+		 * SPI2 uses the controller's own chip select.  That is also why
+		 * SPI0, which has no GPIO chip select either, lists three pins.
+		 */
+		spi2: spi@235108000 {
+			compatible = "apple,t8103-spi", "apple,spi";
+			reg = <0x2 0x35108000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 616 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_120m>;
+			pinctrl-0 = <&spi2_pins>;
+			pinctrl-names = "default";
+			power-domains = <&ps_spi2>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+
+			mesa: fingerprint@0 {
+				compatible = "apple,mesa-fingerprint";
+				reg = <0>;
+				spi-max-frequency = <8000000>;
+				spi-cpha;
+				status = "disabled";
+			};
+		};
+
 		spi3: spi@23510c000 {
 			compatible = "apple,t8103-spi", "apple,spi";
 			reg = <0x2 0x3510c000 0x0 0x4000>;
@@ -1124,6 +1169,12 @@
 					<APPLE_PINMUX(43, 1)>,
 					<APPLE_PINMUX(44, 1)>,
 					<APPLE_PINMUX(45, 1)>;
+			};
+
+			spi2_pins: spi2-pins {
+				pinmux = <APPLE_PINMUX(128, 1)>, /* CLK */
+					<APPLE_PINMUX(129, 1)>, /* MOSI */
+					<APPLE_PINMUX(130, 1)>; /* MISO */
 			};
 
 			spi3_pins: spi3-pins {

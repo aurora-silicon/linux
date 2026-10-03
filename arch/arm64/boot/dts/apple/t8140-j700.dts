@@ -18,6 +18,7 @@
 	aliases {
 		atcphy0 = &atcphy0;
 		keyboard = &keyboard;
+		sep = &sep;
 		serial0 = &serial0;
 		wifi0 = &wifi0;
 	};
@@ -76,6 +77,34 @@
 		#sound-dai-cells = <0>;
 		cirrus,ts-inv = <1>;
 		sound-name-prefix = "Jack";
+	};
+};
+
+&sep {
+	status = "okay";
+};
+
+/*
+ * Touch ID sensor.  Its rails are switched by the SMC through the pcLD key
+ * rather than by a GPIO; the rail words are given in power-on order.  The
+ * calibration file is per-device factory data and is not redistributable.
+ */
+&spi2 {
+	status = "okay";
+
+	fingerprint@0 {
+		compatible = "apple,mesa-fingerprint";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		spi-cpol;
+		spi-cs-setup-delay-ns = <20>;
+		spi-cs-hold-delay-ns = <20>;
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <135 IRQ_TYPE_EDGE_RISING>;
+		apple,smc = <&smc>;
+		apple,smc-power-key = "pcLD";
+		apple,smc-power-rails = <0x01010000 0x01020000>;
+		firmware-name = "apple/mesacal-j700.bin";
 	};
 };
 
