@@ -592,14 +592,18 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 		if (dcp->nr_modes == 0)
 			dev_warn(dcp->dev, "TimingElements without valid modes!\n");
 	} else if (!strcmp(req->key, "DisplayAttributes")) {
+		bool backlight_control;
+
 		ret = parse_display_attributes(&ctx, &dcp->width_mm,
-					&dcp->height_mm);
+					&dcp->height_mm, &backlight_control);
 
 		if (ret) {
 			dev_warn(dcp->dev, "failed to parse display attribs\n");
 			return false;
 		}
 
+		WRITE_ONCE(dcp->ext_backlight,
+			   backlight_control && !dcp_has_panel(dcp));
 		dcp_set_dimensions(dcp);
 	}
 

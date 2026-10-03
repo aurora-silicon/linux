@@ -250,6 +250,8 @@ struct apple_dcp {
 
 	/* Attributes of the connected display */
 	int width_mm, height_mm;
+	/* an external display whose backlight DCP can drive */
+	bool ext_backlight;
 
 	unsigned notch_height;
 
