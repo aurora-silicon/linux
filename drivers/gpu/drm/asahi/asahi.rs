@@ -56,6 +56,7 @@ mod m3_client;
 mod g15_boot;
 mod g15_initdata;
 mod g15_probe;
+mod t8122_admission;
 mod g15_selftest;
 #[cfg(CONFIG_DEV_COREDUMP)]
 mod agx_fault;

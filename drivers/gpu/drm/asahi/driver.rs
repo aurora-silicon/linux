@@ -30,6 +30,7 @@ use crate::{
     hw,
     identity,
     regs, //
+    t8122_admission,
 };
 
 use kernel::macros::vtable;
@@ -211,7 +212,24 @@ kernel::of_device_table!(
 );
 
 fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocConfig) -> Error {
-
+    if soc.chip_id == 0x8122 {
+        // This gate reads only DT properties. A complete hardware config and
+        // exact image gate are still missing, so startup remains disabled.
+        match t8122_admission::read_identity(pdev) {
+            Ok(identity) => dev_info!(
+                pdev.as_ref(),
+                "G15G: T8122 revision 2.0 identity admitted ({} active / {} slots); image and hardware config incomplete, startup refused\n",
+                identity.active_cores,
+                identity.core_slots
+            ),
+            Err(error) => dev_info!(
+                pdev.as_ref(),
+                "G15G: T8122 identity or ABI rejected ({:?}); startup refused\n",
+                error
+            ),
+        }
+        return ENODEV;
+    }
 
     let Some(expected) =
         identity::decode_gpu_identity(soc.hw_family, soc.hw_variant, soc.num_dies as u8)
