@@ -92,7 +92,10 @@ impl event::Queues for Service<'_> {
         self.render_masks[1] |= masks[1];
     }
     fn complete_compute(&mut self, masks: [u64; 2]) -> Result {
-        self.firmware.scan_compute(Some(masks), self.deferred)
+        // A batch without a queue identity still observes completions whose
+        // notification was coalesced; identified batches retain QID filtering.
+        let selected = (masks != [0; 2]).then_some(masks);
+        self.firmware.scan_compute(selected, self.deferred)
     }
 }
 
