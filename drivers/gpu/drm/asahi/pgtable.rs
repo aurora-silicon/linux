@@ -685,6 +685,17 @@ impl UatPageTable {
         })
     }
 
+    /// Discards an aligned map operation that failed before acquiring a GPUVA owner.
+    /// Missing tables and leaves are expected; existing table storage stays allocated.
+    pub(crate) fn discard_partial_map(&mut self, iova_range: Range<u64>) -> Result {
+        self.with_pages(iova_range, false, false, |_, ptes| {
+            for pte in ptes {
+                pte.store(0, Ordering::Relaxed);
+            }
+            Ok(())
+        })
+    }
+
     #[cfg(CONFIG_DEV_COREDUMP)]
     pub(crate) fn dump_pages(&mut self, iova_range: Range<u64>) -> Result<KVVec<DumpedPage>> {
         let mut pages = KVVec::new();
