@@ -279,6 +279,15 @@ pub(crate) trait Gpu: Send + Sync {
     fn is_crashed(&self) -> bool;
     /// Fill in the hardware description reported to userspace.
     fn get_params(&self, params: &mut uapi::drm_asahi_params_global) -> Result;
+    /// Whether user VMs retain a sticky error and support a userspace mirror.
+    fn supports_vm_status(&self) -> bool {
+        false
+    }
+    /// Limits for independently executing queues, if supported by this GPU.
+    fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
+        None
+    }
+
     /// Frequency of the CPU timer that GPU timestamps are derived from.
     fn base_clock_hz(&self) -> u32;
     /// Return the GPU address space geometry.
@@ -689,6 +698,7 @@ impl GpuManager::ver {
                     oas: cfg.uat_oas,
                 },
                 map_kernel_to_user,
+                mmu::UatFirmware::Handoff,
             )?,
             GFP_KERNEL,
         )?)

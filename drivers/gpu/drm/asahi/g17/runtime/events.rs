@@ -1,0 +1,419 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+//! Event and restart callbacks borrow the complete firmware owner. The reusable
+//! completion collector belongs to the worker and is drained outside its mutex.
+
+use super::DeferredBatch;
+use crate::g17::{
+    channel, event,
+    fw::channels::{Event, FreeListCompletion, TvbGrowRequest},
+    recovery,
+    status::VmStatus,
+    Firmware, Role,
+};
+use kernel::{prelude::*, sync::Arc};
+
+struct Service<'a> {
+    firmware: &'a mut Firmware,
+    deferred: &'a mut DeferredBatch,
+    render_masks: [u64; 2],
+    settlement_error: Option<Error>,
+}
+
+impl event::Transport for Service<'_> {
+    fn trace(&mut self, role: Role) {
+        let firmware = &mut self.firmware;
+        firmware
+            .rings
+            .drain_trace(&firmware.primary.state.shared.dev, &firmware.init, role);
+    }
+    fn statistics(&mut self, role: Role) {
+        let firmware = &mut self.firmware;
+        firmware
+            .rings
+            .drain_statistics(&firmware.primary.state.shared.dev, &firmware.init, role);
+    }
+    fn drain(
+        &mut self,
+        role: Role,
+        mut consume: impl FnMut(&mut Self, Event) -> Result<bool>,
+    ) -> Result {
+        let mut events = channel::Events::new(role);
+        while let Some(event) =
+            events.next(&self.firmware.primary.state.shared.dev, &self.firmware.init)?
+        {
+            if !consume(self, event)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+    fn recovery_state(&self) -> Result<u32> {
+        recovery::Memory::recovery_state(&self.firmware.init)
+    }
+}
+
+impl event::Host for Service<'_> {
+    fn recovery(&self) -> &recovery::State {
+        &self.firmware.recovery
+    }
+    fn recovery_mut(&mut self) -> &mut recovery::State {
+        &mut self.firmware.recovery
+    }
+}
+
+impl event::Queues for Service<'_> {
+    fn context_killed(&mut self, cookie: u64) {
+        self.firmware.queues.exit_acks.note(cookie);
+    }
+    fn flush_tvb_reply(&mut self) -> Result<bool> {
+        self.firmware.flush_tvb_reply()
+    }
+    fn flush_freelist_release(&mut self) -> Result<bool> {
+        self.firmware.flush_freelist_release()
+    }
+    fn observe_render_releases(&mut self) -> Result {
+        self.firmware.observe_render_releases()
+    }
+    fn control_backpressured(&self) -> bool {
+        self.firmware.render_control_backpressured()
+    }
+    fn queue_tvb_grow(&mut self, request: TvbGrowRequest) -> Result {
+        self.firmware.queue_tvb_grow(request)
+    }
+    fn complete_freelist_grow(&mut self, completion: FreeListCompletion) -> Result {
+        self.firmware.complete_freelist_grow(completion)
+    }
+    fn retain_render_completions(&mut self, masks: [u64; 2]) {
+        // Inline timeout and drain callers may discard the worker hints. The
+        // queue owner retains stamps until its borrowed pair returns to scan.
+        self.firmware.queues.retain_render_completions(masks);
+        self.render_masks[0] |= masks[0];
+        self.render_masks[1] |= masks[1];
+    }
+    fn complete_compute(&mut self, masks: [u64; 2]) -> Result {
+        self.firmware.scan_compute(Some(masks), self.deferred)
+    }
+}
+
+impl recovery::Host for Service<'_> {
+    fn recovery(&self) -> &recovery::State {
+        &self.firmware.recovery
+    }
+    fn recovery_mut(&mut self) -> &mut recovery::State {
+        &mut self.firmware.recovery
+    }
+}
+
+impl recovery::Memory for Service<'_> {
+    fn recovery_state(&self) -> Result<u32> {
+        self.firmware.init.recovery_state()
+    }
+    fn host_recovery(&self) -> Result<u32> {
+        self.firmware.init.host_recovery()
+    }
+    fn fault_sources(&self) -> Result<recovery::Sources> {
+        self.firmware.init.fault_sources()
+    }
+
+    fn transition(&self, expected: u32, next: u32) -> Result {
+        self.firmware.init.transition(expected, next)
+    }
+    fn clear_timestamps(&self) -> Result {
+        self.firmware.init.clear_timestamps()
+    }
+    fn entries(&self, out: &mut [recovery::Entry; recovery::MAX_ENTRIES]) -> Result<usize> {
+        self.firmware.init.entries(out)
+    }
+    fn wait_tick(&self) {
+        self.firmware.init.wait_tick();
+    }
+}
+
+impl recovery::Queues for Service<'_> {
+    fn render_pass_started(&self, qid: u8, stamp: u64) -> Option<bool> {
+        self.firmware.queues.render_pass_started(qid, stamp)
+    }
+    fn publish_recovery_targets(&self) -> Option<Error> {
+        let mut failure = self.firmware.queues.publish_render_recovery_targets();
+        for queue in self
+            .firmware
+            .queues
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+        {
+            if let Err(error) = queue.publish_recovery_target() {
+                failure = failure.or(Some(error));
+            }
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        failure
+    }
+    fn render_scheduler_active(&self) -> bool {
+        self.firmware.queues.render_scheduler_active() || !self.firmware.queues.teardown.is_empty()
+    }
+    fn oldest_spared(&self, qid: u8) -> Option<bool> {
+        self.firmware.queues.render_oldest_spared(qid).or_else(|| {
+            self.firmware
+                .queues
+                .compute
+                .iter()
+                .flatten()
+                .filter_map(|entry| entry.queue.as_deref())
+                .find(|queue| queue.qid() == qid)
+                .and_then(|queue| queue.oldest_spared())
+        })
+    }
+    fn visit_owners(&self, qid: u8, visit: &mut dyn FnMut(&Arc<VmStatus>)) {
+        self.firmware.queues.visit_render_owners(qid, visit);
+        for queue in self
+            .firmware
+            .queues
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+        {
+            if queue.qid() == qid {
+                queue.visit_owners(visit);
+            }
+        }
+    }
+    fn classify_work(&mut self, class: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) -> u128 {
+        for queue in self
+            .firmware
+            .queues
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+        {
+            queue.classify(class);
+        }
+        self.firmware.queues.classify_render(class)
+    }
+    fn settle_blamed_render(&mut self, qid: u8, error: Error) {
+        let result = self
+            .firmware
+            .settle_blamed_render(qid, error, self.deferred);
+        self.settlement_error = self.settlement_error.or(result.err());
+    }
+    fn settle_cancelled_renders(&mut self, qids: u128) {
+        let result = self.firmware.settle_cancelled_renders(qids, self.deferred);
+        self.settlement_error = self.settlement_error.or(result.err());
+    }
+    fn rescan_compute(&mut self) -> Result {
+        self.firmware.scan_compute(None, self.deferred)
+    }
+    fn release_retired_compute(&mut self) {
+        let result = self.firmware.release_compute_witnesses(self.deferred);
+        self.settlement_error = self.settlement_error.or(result.err());
+    }
+}
+
+impl Firmware {
+    fn release_compute_witnesses(&mut self, deferred: &mut DeferredBatch) -> Result {
+        let state = recovery::Memory::recovery_state(&self.init)?;
+        let view = crate::g17::qos::View::new(self.init.qos()?)?;
+        let registry = &mut self.queues;
+        for queue in registry
+            .compute
+            .iter_mut()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref_mut())
+        {
+            queue.release_witnessed(
+                state,
+                |owner| registry.accounting.complete(&view, &[owner]),
+                &mut |event| deferred.push(event),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn service_runtime_events(
+        &mut self,
+        deferred: &mut DeferredBatch,
+    ) -> Result<(event::Pending, [u64; 2])> {
+        let mut service = Service {
+            firmware: self,
+            deferred,
+            render_masks: [0; 2],
+            settlement_error: None,
+        };
+        let pending = event::service(&mut service)?;
+        if pending.recovery {
+            // Inline timeout/drain service can consume the restart record too.
+            // Close publication in this same critical section and ensure the
+            // event worker will join builders before the restart handshake.
+            let shared = &service.firmware.primary.state.shared;
+            shared.preparations.close();
+            shared.queue_events();
+        }
+        Ok((pending, service.render_masks))
+    }
+
+    /// Preparation admission is already closed and all builders have joined.
+    pub(super) fn service_runtime_recovery(&mut self, deferred: &mut DeferredBatch) -> Result {
+        let shared = self.primary.state.shared.clone();
+        let mut service = Service {
+            firmware: self,
+            deferred,
+            render_masks: [0; 2],
+            settlement_error: None,
+        };
+        let result = recovery::service(&mut service, || {
+            shared.crashed.load(core::sync::atomic::Ordering::Acquire)
+        })?;
+        if let Some(error) = result.target_error {
+            dev_warn!(
+                shared.dev.as_ref(),
+                "Recovery target copy failed: {:?}\n",
+                error
+            );
+        }
+        if let Some(error) = result.scan_error {
+            dev_warn!(
+                shared.dev.as_ref(),
+                "Post-recovery compute scan failed: {:?}\n",
+                error
+            );
+        }
+        if let Some(error) = service.settlement_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+impl crate::g17::Shared {
+    /// The single event work item owns this preallocated collector until all
+    /// callbacks are finished. Shutdown can detach Firmware during an off-lock
+    /// boundary; the collector itself still owns every deferred completion.
+    pub(in crate::g17) fn run_runtime_events(self: &Arc<Self>) {
+        if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
+            self.stop_queues();
+            return;
+        }
+        let mut deferred = {
+            let mut state = self.state.lock();
+            let Some(firmware) = (*state).as_deref_mut() else {
+                return;
+            };
+            let Some(deferred) = firmware.queues.worker_deferred.take() else {
+                drop(state);
+                self.lose_device_quietly();
+                return;
+            };
+            deferred
+        };
+        let result = self.runtime_event_turn(&mut deferred);
+        deferred.finish();
+        if let Some(firmware) = (*self.state.lock()).as_deref_mut() {
+            firmware.queues.worker_deferred = Some(deferred);
+        }
+        if let Err(error) = result {
+            dev_err!(self.dev.as_ref(), "GPU event service failed: {:?}\n", error);
+            self.lose_device_quietly();
+            self.stop_queues();
+        }
+    }
+
+    fn runtime_event_turn(self: &Arc<Self>, deferred: &mut DeferredBatch) -> Result {
+        let (recover, masks) = {
+            let mut state = self.state.lock();
+            let Some(firmware) = (*state).as_deref_mut() else {
+                return Ok(());
+            };
+            let (pending, masks) = firmware.service_runtime_events(deferred)?;
+            let recover = pending.recovery || firmware.recovery.pending();
+            if recover {
+                // Epoch closure and event consumption are serialized with every
+                // publisher. Joining builders must happen after unlocking.
+                self.preparations.close();
+            }
+            (recover, masks)
+        };
+        deferred.finish();
+        if recover {
+            self.preparations.wait_drained();
+        }
+        let mut state = self.state.lock();
+        let Some(firmware) = (*state).as_deref_mut() else {
+            return Ok(());
+        };
+        if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(EIO);
+        }
+        if recover {
+            firmware.service_runtime_recovery(deferred)?;
+            if !firmware.recovery.pending() {
+                if !self.preparations.reopen() {
+                    return Ok(());
+                }
+                // Restart stopped consumption before its following record.
+                // Resume builders before observing pairs outside this lock.
+                self.queue_events();
+            }
+        }
+        // Replay only at this outer boundary, after recovery has settled.
+        // Publication may service events but must never recurse into replay.
+        firmware.replay_compute(deferred)?;
+        drop(state);
+        self.observe_renders(masks, deferred)?;
+        let mut state = self.state.lock();
+        let Some(firmware) = (*state).as_deref_mut() else {
+            return Ok(());
+        };
+        if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(EIO);
+        }
+        let now = super::now_ns();
+        let compute = firmware
+            .queues
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .any(|queue| queue.in_flight());
+        let in_flight = compute || firmware.queues.render_in_flight();
+        let idle = firmware.idle_check(now, in_flight)?;
+        firmware.reclaim_drained_renders(deferred)?;
+        firmware.service_compute_exit(deferred)?;
+        {
+            let mut reclaim = self.reclaim.lock();
+            firmware.service_teardown(&mut reclaim)?;
+            if !reclaim.is_empty() {
+                self.queue_reclaims();
+            }
+        }
+        let backpressured = firmware.render_control_backpressured();
+        let polling = backpressured
+            || firmware.queues.teardown.polling(now)
+            || firmware.compute_exit_polling(now);
+        if polling {
+            self.queue_poll();
+        }
+        if let Some(delay) = idle {
+            self.queue_idle(delay);
+        }
+        if firmware.recovery.pending() {
+            self.preparations.close();
+            self.queue_events();
+        } else if !recover
+            && !polling
+            && (channel::Events::pending(&firmware.init, Role::Primary)?
+                || channel::Events::pending(&firmware.init, Role::Secondary)?)
+        {
+            // A full bounded pass must not depend on a fresh notification for
+            // records that arrived while it was consuming the same ring.
+            self.queue_events();
+        }
+        if firmware.render_grow_pending() && !firmware.recovery.pending() {
+            self.queue_grow();
+        }
+        Ok(())
+    }
+}

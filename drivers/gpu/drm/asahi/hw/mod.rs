@@ -15,6 +15,7 @@ pub(crate) mod t600x;
 pub(crate) mod t602x;
 pub(crate) mod t8103;
 pub(crate) mod t8112;
+pub(crate) mod t8140;
 
 /// GPU generation enumeration. Note: Part of the UABI.
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -22,6 +23,7 @@ pub(crate) mod t8112;
 pub(crate) enum GpuGen {
     G13 = 13,
     G14 = 14,
+    G17 = 17,
 }
 
 /// GPU variant enumeration. Note: Part of the UABI.
