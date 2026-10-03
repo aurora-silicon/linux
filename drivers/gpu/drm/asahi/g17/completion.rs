@@ -89,6 +89,7 @@ pub(crate) struct Completion {
     member: Member,
     destinations: [Option<Destination>; 4],
     compute: Option<ComputeTimestamps>,
+    feed: Option<Arc<super::feed::Feed>>,
     #[pin]
     vm_job: Mutex<Option<mmu::VmJobGuard>>,
     #[pin]
@@ -111,6 +112,7 @@ impl Completion {
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
         timestamps: &[uapi::drm_asahi_timestamps],
         compute: bool,
+        feed: Option<Arc<super::feed::Feed>>,
     ) -> Result<Arc<Self>> {
         if timestamps.len() != if compute { 1 } else { 2 } {
             return Err(EINVAL);
@@ -133,6 +135,7 @@ impl Completion {
                 member,
                 destinations,
                 compute,
+                feed,
                 vm_job <- new_mutex!(Some(vm_job), "G17 command VM pin"),
                 render <- new_mutex!(None, "G17 command render lease"),
                 signalled: AtomicBool::new(false),
@@ -308,6 +311,9 @@ impl Completion {
     pub(crate) fn complete(&self, result: Result<[u64; 4]>) {
         if self.signalled.swap(true, Ordering::AcqRel) {
             return;
+        }
+        if let (Some(feed), Ok(ticks)) = (&self.feed, &result) {
+            feed.note_render_pass(ticks[2], ticks[3]);
         }
         let result = result.and_then(|ticks| {
             for (destination, ticks) in self.destinations.iter().zip(ticks) {

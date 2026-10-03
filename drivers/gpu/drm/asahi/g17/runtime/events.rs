@@ -311,6 +311,7 @@ impl crate::g17::Shared {
         };
         let result = self.runtime_event_turn(&mut deferred);
         deferred.finish();
+        self.queue_feed();
         if let Some(firmware) = (*self.state.lock()).as_deref_mut() {
             firmware.queues.worker_deferred = Some(deferred);
         }

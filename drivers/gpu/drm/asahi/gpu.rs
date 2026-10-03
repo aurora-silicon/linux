@@ -287,7 +287,10 @@ pub(crate) trait Gpu: Send + Sync {
     fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
         None
     }
-
+    /// Temporary capacity hint and validity in milliseconds for subsequent syncobj waits.
+    fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
+        None
+    }
     /// Frequency of the CPU timer that GPU timestamps are derived from.
     fn base_clock_hz(&self) -> u32;
     /// Return the GPU address space geometry.

@@ -66,6 +66,10 @@ impl Backend {
 }
 
 impl job::Backend for Backend {
+    fn feed(&self) -> Option<Arc<crate::g17::feed::Feed>> {
+        Some(self.shared.feed.clone())
+    }
+
     fn ensure_compute(&self) -> Result {
         Backend::ensure_compute(self)
     }

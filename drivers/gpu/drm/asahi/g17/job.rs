@@ -222,6 +222,11 @@ fn check_status(fence: &Fence) -> Result {
 /// The backend retains visible packets through exact retirement or processor stop.
 /// It performs all completion signalling after releasing the device mutex.
 pub(crate) trait Backend: Send + Sync {
+    /// Device detector retained by render completions after queue teardown.
+    fn feed(&self) -> Option<Arc<super::feed::Feed>> {
+        None
+    }
+
     /// Lazily create or rebind this logical queue's physical compute graph.
     fn ensure_compute(&self) -> Result;
     /// Settle outstanding work of a terminal VM before an ioctl error is published.
