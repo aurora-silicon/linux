@@ -1821,7 +1821,6 @@ static void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
 	/* Block new enqueues as well as draining users of the AFK endpoints. */
 	disable_delayed_work_sync(&dcp->typec_reconnect_wq);
 	disable_delayed_work_sync(&dcp->placeholder_edid_wq);
-	disable_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
 	disable_delayed_work_sync(&dcp->hdmi_settle_wq);
 	disable_delayed_work_sync(&dcp->hdmi_recheck_wq);
 	dcp_hdmi_disable(dcp);
@@ -1831,7 +1830,6 @@ static void dcp_enable_typec_work(struct apple_dcp *dcp)
 {
 	enable_delayed_work(&dcp->typec_reconnect_wq);
 	enable_delayed_work(&dcp->placeholder_edid_wq);
-	enable_delayed_work(&dcp->typec_fabric_retrain_wq);
 	enable_delayed_work(&dcp->hdmi_settle_wq);
 	enable_delayed_work(&dcp->hdmi_recheck_wq);
 	dcp_hdmi_enable(dcp);
@@ -2189,12 +2187,9 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			  dcp_typec_reconnect_work);
 	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq,
 			  dcp_placeholder_edid_work);
-	INIT_DELAYED_WORK(&dcp->typec_fabric_retrain_wq,
-			  dcp_typec_retrain_work);
 	/* Balanced by enable at successful component bind. */
 	disable_delayed_work(&dcp->typec_reconnect_wq);
 	disable_delayed_work(&dcp->placeholder_edid_wq);
-	disable_delayed_work(&dcp->typec_fabric_retrain_wq);
 	/*
 	 * A native external pipe's bind enables these; firmware callbacks may
 	 * come before it. The 14.7 panel never uses them, but suspend cancels

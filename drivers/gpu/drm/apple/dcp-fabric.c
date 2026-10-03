@@ -41,8 +41,6 @@ struct apple_dcp_typec_port {
 	struct apple_dcp_typec_route *secondary_owner;
 	/* Keep a port on its last DCP while that pipeline remains free. */
 	struct apple_dcp_typec_route *preferred_route;
-	/* Ignore the USB4 fallback immediately following this port's DP teardown. */
-	unsigned long dp_release_deadline;
 	/* DRM connector for this physical port, driven by whichever DCP owns it */
 	struct apple_connector *connector;
 	/* A second logical stream through this port's USB4 dock. */
@@ -438,34 +436,6 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 	}
 
 	return 0;
-}
-
-void dcp_typec_retrain_work(struct work_struct *work)
-{
-	struct apple_dcp *dcp =
-		container_of(to_delayed_work(work), struct apple_dcp,
-			     typec_fabric_retrain_wq);
-
-	struct apple_connector *connector = READ_ONCE(dcp->typec_connector);
-
-	if (READ_ONCE(dcp->active_typec_route) && connector)
-		dcp_retrain_oob(connector);
-}
-
-static void dcp_typec_retrain_active_routes(void)
-{
-	struct apple_dcp_typec_port *port;
-
-	list_for_each_entry(port, &dcp_typec_ports, link) {
-		if (port->owner)
-			mod_delayed_work(system_freezable_wq,
-					 &port->owner->dcp->typec_fabric_retrain_wq,
-					 msecs_to_jiffies(200));
-		if (port->secondary_owner)
-			mod_delayed_work(system_freezable_wq,
-					 &port->secondary_owner->dcp->typec_fabric_retrain_wq,
-					 msecs_to_jiffies(200));
-	}
 }
 
 /*
@@ -944,7 +914,6 @@ static void dcp_typec_route_waiting(void)
 		if (!route || dcp_typec_route_activate(route, route->xbar))
 			continue;
 		port->owner = route;
-		port->dp_release_deadline = 0;
 		dcp_typec_port_attach(port);
 	}
 }
@@ -1110,7 +1079,6 @@ static bool dcp_rebalance_activate(void *data, void *entry)
 	}
 	port->owner = route;
 	port->preferred_route = route;
-	port->dp_release_deadline = 0;
 	dcp_typec_port_attach(port);
 	return false;
 }
@@ -1248,7 +1216,6 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 			if (ret)
 				return ret;
 			port->owner = NULL;
-			port->dp_release_deadline = jiffies + msecs_to_jiffies(10000);
 			if (dcp->hdmi_hpd && dcp->active &&
 			    gpiod_get_value_cansleep(dcp->hdmi_hpd))
 				dcp_dptx_connect(dcp, 0);
@@ -1258,18 +1225,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 			dcp_typec_rebalance_locked(NULL, 0);
 		}
 
-		/*
-		 * A port leaving DP can report SAFE/NONE before falling back to USB4.
-		 * Resetting every other live CRTC for that same cable removal blanks
-		 * unaffected displays. Keep the guard across the Type-C state sequence;
-		 * a later, independent USB4 attach still gets recovery.
-		 */
-		if (state->mode == TYPEC_MODE_USB4) {
-			if (!port->dp_release_deadline ||
-			    time_after_eq(jiffies, port->dp_release_deadline))
-				dcp_typec_retrain_active_routes();
-			port->dp_release_deadline = 0;
-		}
+		/* Data-only USB4 changes do not invalidate other display routes. */
 		port->applied_valid = true;
 		return 0;
 	}
@@ -1323,7 +1279,6 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 		if (ret)
 			return ret;
 		port->owner = best;
-		port->dp_release_deadline = 0;
 	}
 
 	if (!hpd && port->hpd) {
@@ -2273,7 +2228,6 @@ static int dcp_follow_attach(void *data, unsigned int index, bool restore)
 	slot->attachment_generation = dcp_modes_transfer_begin(dcp);
 	slot->port->owner = route;
 	slot->port->preferred_route = route;
-	slot->port->dp_release_deadline = 0;
 	scoped_guard(mutex, &dcp->hpd_mutex) {
 		WRITE_ONCE(dcp->typec_cable_connected, true);
 		dcp->typec_generation++;

@@ -90,7 +90,6 @@ int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, bool active);
 /* DCP probe, resume and endpoint teardown hooks. */
 int dcp_register_typec_routes(struct apple_dcp *dcp);
 void dcp_typec_routes_disable(struct apple_dcp *dcp);
-void dcp_typec_retrain_work(struct work_struct *work);
 void dcp_fabric_init(struct apple_dcp *dcp);
 void dcp_fabric_hdmi_resume(struct apple_dcp *dcp);
 void dcp_fabric_hdmi_reinit(struct apple_dcp *dcp, const char *why);

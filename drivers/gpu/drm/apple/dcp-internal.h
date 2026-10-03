@@ -370,7 +370,6 @@ struct apple_dcp {
 	/* IOMFB reports its video interface ready after DPTX link training. */
 	struct completion typec_iomfb_hpd_ready;
 	struct delayed_work typec_reconnect_wq;
-	struct delayed_work typec_fabric_retrain_wq;
 	u32 typec_reconnect_tries;
 	struct dcp_fabric_session typec_reconnect_session; /* hpd_mutex */
 
