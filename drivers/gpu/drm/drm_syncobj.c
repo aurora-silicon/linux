@@ -1170,13 +1170,14 @@ static signed long drm_syncobj_array_wait_timeout(struct drm_syncobj **syncobjs,
 		}
 	}
 
-	/* Recheck expiry after allocations, user copies and deadline callbacks. */
-	util_min = drm_syncobj_wait_hint(file_private);
 	/* Polls, availability waits and already-complete fences need no boost. */
-	if (util_min && timeout > 0 &&
-	    !(flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE)) {
-		scope_previous = sched_util_min_scope_enter(util_min);
-		scope_active = true;
+	if (timeout > 0 && !(flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE)) {
+		/* Recheck expiry after allocations, user copies and deadline callbacks. */
+		util_min = drm_syncobj_wait_hint(file_private);
+		if (util_min) {
+			scope_previous = sched_util_min_scope_enter(util_min);
+			scope_active = true;
+		}
 	}
 
 	do {
