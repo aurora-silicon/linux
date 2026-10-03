@@ -11,9 +11,6 @@
 
 #define GPU_REPEAT(x) <x x>
 
-/* The ANE has only run on the M1 Max so far: leave it off on the M1 Pro */
-#define APPLE_ANE_UNTESTED
-
 #include "t6001.dtsi"
 
 / {

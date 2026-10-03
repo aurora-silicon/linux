@@ -2175,13 +2175,9 @@
 #include "t8103-pmgr.dtsi"
 
 /*
- * The ANE has not run on the M1 yet, so it stays off together with its
- * DARTs and the power states only it uses. Drop this define to enable
- * them once it has.
+ * The ANE has run on the M1, so enable it here with its DARTs and the
+ * power states only it uses.
  */
-#define APPLE_ANE_UNTESTED
-
-#ifndef APPLE_ANE_UNTESTED
 &ane {
 	status = "okay";
 };
@@ -2221,4 +2217,3 @@
 &ps_ane_set5 {
 	status = "okay";
 };
-#endif
