@@ -3,6 +3,7 @@
 //! Exact identities and visibility witnesses for a physical compute queue.
 //! A shared work-state counter can include other engines and cannot prove this queue retired.
 
+use crate::g17::initdata::ComputeCompletion;
 use kernel::prelude::*;
 
 pub(crate) const IN_FLIGHT: usize = 16;
@@ -170,17 +171,20 @@ impl Batch {
         self.open = Some(ticket.qid);
         Ok(())
     }
-    /// The transport reads eight aligned words from a 0x40-byte firmware record. Records can be
-    /// overwritten during a scan: incomplete or older identities are skipped, never consumed.
-    pub(crate) fn fold(&mut self, words: [u64; 8]) -> Result {
-        let qid = ((words[0] >> 9) & 0x7f) as usize;
+    /// Capture the control word once, then read only a requested identity's payload.
+    /// Records can be overwritten during a scan: incomplete or older identities are skipped.
+    pub(crate) fn fold(&mut self, record: ComputeCompletion<'_>) -> Result {
+        let control = record.read(0)?;
+        let qid = ((control >> 9) & 0x7f) as usize;
         let (start, count) = self.slots[qid];
-        if count == 0 || words[6] & !1 == 0 || words[7] == 0 {
+        if count == 0 {
             return Ok(());
         }
-        let descriptor = words[6] & !1;
-        let kick =
-            (((words[0] >> 8) & 0xffff_ffff_00) | ((words[0] >> 48) & 0xff)) & 0xff_ffff_ffff;
+        let descriptor = record.read(6)? & !1;
+        if descriptor == 0 || record.read(7)? == 0 {
+            return Ok(());
+        }
+        let kick = (((control >> 8) & 0xffff_ffff_00) | ((control >> 48) & 0xff)) & 0xff_ffff_ffff;
         let requests = self.requests.get_mut(start..start + count).ok_or(EIO)?;
         let Some(request) = requests
             .iter_mut()
@@ -188,7 +192,7 @@ impl Batch {
         else {
             return Ok(());
         };
-        let timestamps = [words[2] & TIME_MASK, words[5] & TIME_MASK];
+        let timestamps = [record.read(2)? & TIME_MASK, record.read(5)? & TIME_MASK];
         if timestamps[0] == 0
             || timestamps[1] == 0
             || request
