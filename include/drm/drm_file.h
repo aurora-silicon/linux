@@ -320,6 +320,10 @@ struct drm_file {
 	/** @syncobj_xa: Mapping of sync object handles to object pointers. */
 	struct xarray syncobj_xa;
 
+	/* Driver-provided recent-feeder hint, protected by table_lock. */
+	unsigned int syncobj_wait_util_min;
+	unsigned long syncobj_wait_hint_until;
+
 	/** @filp: Pointer to the core file structure. */
 	struct file *filp;
 
