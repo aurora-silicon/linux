@@ -182,14 +182,19 @@ impl<B: Backend> Queue<B> {
         }
         let other = 1 - index;
         let prefix = order.wait_through[other];
-        let count = self.frontiers[other]
+        let frontier = if prefix.is_some() {
+            self.frontiers[other].as_slice()
+        } else {
+            &[]
+        };
+        let count = frontier
             .iter()
             .filter(|(sequence, _)| Order::contains(prefix, *sequence))
             .count();
         let mut dependencies = KVec::with_capacity(inputs.len() + count, GFP_KERNEL)?;
         let mut checked_inputs = KVec::with_capacity(inputs.len(), GFP_KERNEL)?;
         let mut firmware = KVec::with_capacity(count, GFP_KERNEL)?;
-        for (sequence, fences) in &self.frontiers[other] {
+        for (sequence, fences) in frontier {
             if Order::contains(prefix, *sequence) {
                 dependencies.push(fences.ready.clone(), GFP_KERNEL)?;
                 firmware.push(fences.completed.clone(), GFP_KERNEL)?;
