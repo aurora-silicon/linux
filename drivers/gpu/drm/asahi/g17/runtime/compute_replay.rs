@@ -18,6 +18,18 @@ impl Firmware {
         if state != 0 {
             return Ok(());
         }
+        let commands = self
+            .queues
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .map(|queue| queue.replay_commands())
+            .sum::<usize>();
+        if commands == 0 {
+            return Ok(());
+        }
+        deferred.reserve_replays(commands)?;
         let view = qos::View::new(self.init.qos()?)?;
         for entry in self.queues.compute.iter_mut().flatten() {
             if let Some(queue) = entry.queue.as_deref_mut() {
