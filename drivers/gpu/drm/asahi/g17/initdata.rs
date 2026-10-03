@@ -29,6 +29,26 @@ const COMPUTE_CONTROL_BLOCKS: u32 = 25;
 const COMPUTE_CONTROL_CURSOR: u32 = 0x18;
 const COMPUTE_RUN_ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
 
+/// A borrowed completion slot. Read the identity before requesting its timestamps;
+/// unrelated QIDs need only the control word. Each access is an aligned live load.
+pub(crate) struct ComputeCompletion<'a> {
+    object: &'a KernelObject,
+    offset: usize,
+}
+
+impl ComputeCompletion<'_> {
+    pub(crate) fn read(&self, word: usize) -> Result<u64> {
+        if word >= 8 {
+            return Err(EINVAL);
+        }
+        // The scanner bounds offset to a 0x40-byte slot in the completion ring.
+        Ok(self
+            .object
+            .dword(self.offset + word * 8)?
+            .load(Ordering::Relaxed))
+    }
+}
+
 /// Unpublished device-wide compute backing, prepared without the device mutex. The cache
 /// identity belongs to this allocation, not to any one physical queue or client VM.
 pub(super) struct ComputeShared {
@@ -555,18 +575,15 @@ impl InitData {
     /// scanner latches exact identities; firmware retains sole ownership of these slots.
     pub(super) fn scan_compute_completions(
         &self,
-        mut record: impl FnMut([u64; 8]) -> Result,
+        mut record: impl FnMut(ComputeCompletion<'_>) -> Result,
     ) -> Result {
         let object = self.object(self.completion_rings[0])?;
         fence(Ordering::Acquire);
         for slot in 0..(abi::COMPLETION_RING_SIZE / 0x40).min(0x800) {
-            let mut words = [0; 8];
-            for (index, word) in words.iter_mut().enumerate() {
-                *word = object
-                    .dword(slot * 0x40 + index * 8)?
-                    .load(Ordering::Relaxed);
-            }
-            record(words)?;
+            record(ComputeCompletion {
+                object,
+                offset: slot * 0x40,
+            })?;
         }
         Ok(())
     }
