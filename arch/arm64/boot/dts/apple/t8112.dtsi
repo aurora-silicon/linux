@@ -1707,6 +1707,64 @@
 			power-domains = <&ps_avd_sys>;
 		};
 
+		ane_mbox: mailbox@26b408000 {
+			compatible = "apple,t8112-ane-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x2 0x6b408000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 520 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "recv-not-empty";
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
+		ane_dart0: iommu@26b800000 {
+			compatible = "apple,t8112-dart", "apple,t8110-dart";
+			reg = <0x2 0x6b800000 0x0 0x4000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 521 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_ane_sys>;
+			status = "disabled";
+		};
+
+		ane_dart1: iommu@26b810000 {
+			compatible = "apple,t8112-dart", "apple,t8110-dart";
+			reg = <0x2 0x6b810000 0x0 0x4000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 521 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_ane_sys>;
+			status = "disabled";
+		};
+
+		ane_dart2: iommu@26b820000 {
+			compatible = "apple,t8112-dart", "apple,t8110-dart";
+			reg = <0x2 0x6b820000 0x0 0x4000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 521 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_ane_sys>;
+			status = "disabled";
+		};
+
+		ane: ane@26a000000 {
+			compatible = "apple,t8112-ane";
+			reg = <0x2 0x6a000000 0x0 0x2000000>,
+				<0x2 0x3b700000 0x0 0x18000>,
+				<0x2 0x3b724000 0x0 0x4000>,
+				<0x2 0x3d2c8060 0x0 0x8>;
+			reg-names = "engine", "pmgr", "set", "fuse";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 520 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "ane";
+			iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
+			power-domains = <&ps_ane_sys_cpu>, <&ps_ane_td>,
+				<&ps_ane_base>, <&ps_ane_set1>, <&ps_ane_set2>,
+				<&ps_ane_set3>, <&ps_ane_set4>;
+			mboxes = <&ane_mbox>;
+			status = "disabled";
+		};
+
 		dispext0_dart: iommu@271304000 {
 			compatible = "apple,t8112-dart", "apple,t8110-dart";
 			reg = <0x2 0x71304000 0x0 0x4000>;

@@ -2570,6 +2570,7 @@ F:	Documentation/devicetree/bindings/leds/backlight/apple,dwi-bl.yaml
 F:	Documentation/devicetree/bindings/mailbox/apple,mailbox.yaml
 F:	Documentation/devicetree/bindings/mfd/apple,smc.yaml
 F:	Documentation/devicetree/bindings/net/bluetooth/brcm,bcm4377-bluetooth.yaml
+F:	Documentation/devicetree/bindings/npu/apple,ane.yaml
 F:	Documentation/devicetree/bindings/nvme/apple,nvme-ans.yaml
 F:	Documentation/devicetree/bindings/nvmem/apple,efuses.yaml
 F:	Documentation/devicetree/bindings/nvmem/apple,spmi-nvmem.yaml
@@ -7897,6 +7898,16 @@ L:	linux-pm@vger.kernel.org
 S:	Maintained
 F:	drivers/soc/ti/smartreflex.c
 F:	include/linux/power/smartreflex.h
+
+DRM ACCEL DRIVER FOR APPLE NEURAL ENGINE
+M:	Joshua Warren <816217+joshuaswarren@users.noreply.github.com>
+L:	asahi@lists.linux.dev
+L:	dri-devel@lists.freedesktop.org
+S:	Maintained
+F:	Documentation/ABI/testing/sysfs-class-accel-ane
+F:	Documentation/devicetree/bindings/npu/apple,ane.yaml
+F:	drivers/accel/ane/
+F:	include/uapi/drm/ane_accel.h
 
 DRM ACCEL DRIVERS FOR INTEL VPU
 M:	Maciej Falkowski <maciej.falkowski@linux.intel.com>

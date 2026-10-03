@@ -675,6 +675,74 @@
 		#reset-cells = <0>;
 		label = DIE_LABEL(trace_fab);
 	};
+
+#if DIE_NO == 0
+	/*
+	 * Only the die 0 ANE is described. Its pmgr range ends at 0xc02c,
+	 * with set4, so no set5 is described at 0xc030. These states serve
+	 * only the ANE and are disabled with it; the SoC file that enables
+	 * the ANE enables them too.
+	 */
+	DIE_NODE(ps_ane_set0): power-controller@c000 {
+		compatible = "apple,t6000-pmgr-pwrstate", "apple,pmgr-pwrstate";
+		reg = <0xc000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = DIE_LABEL(ane_set0);
+		power-domains = <&DIE_NODE(ps_ane_sys_cpu)>;
+		status = "disabled";
+	};
+
+	DIE_NODE(ps_ane_base): power-controller@c008 {
+		compatible = "apple,t6000-pmgr-pwrstate", "apple,pmgr-pwrstate";
+		reg = <0xc008 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = DIE_LABEL(ane_base);
+		power-domains = <&DIE_NODE(ps_ane_set0)>;
+		status = "disabled";
+	};
+
+	DIE_NODE(ps_ane_set1): power-controller@c010 {
+		compatible = "apple,t6000-pmgr-pwrstate", "apple,pmgr-pwrstate";
+		reg = <0xc010 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = DIE_LABEL(ane_set1);
+		power-domains = <&DIE_NODE(ps_ane_base)>;
+		status = "disabled";
+	};
+
+	DIE_NODE(ps_ane_set2): power-controller@c018 {
+		compatible = "apple,t6000-pmgr-pwrstate", "apple,pmgr-pwrstate";
+		reg = <0xc018 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = DIE_LABEL(ane_set2);
+		power-domains = <&DIE_NODE(ps_ane_base)>;
+		status = "disabled";
+	};
+
+	DIE_NODE(ps_ane_set3): power-controller@c020 {
+		compatible = "apple,t6000-pmgr-pwrstate", "apple,pmgr-pwrstate";
+		reg = <0xc020 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = DIE_LABEL(ane_set3);
+		power-domains = <&DIE_NODE(ps_ane_base)>;
+		status = "disabled";
+	};
+
+	DIE_NODE(ps_ane_set4): power-controller@c028 {
+		compatible = "apple,t6000-pmgr-pwrstate", "apple,pmgr-pwrstate";
+		reg = <0xc028 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = DIE_LABEL(ane_set4);
+		power-domains = <&DIE_NODE(ps_ane_base)>;
+		status = "disabled";
+	};
+#endif
 };
 
 &DIE_NODE(pmgr_east) {

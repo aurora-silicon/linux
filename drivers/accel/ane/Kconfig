@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config DRM_ACCEL_ANE
+	tristate "Apple Neural Engine (ANE)"
+	depends on DRM_ACCEL
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on APPLE_RTKIT
+	depends on APPLE_DART || COMPILE_TEST
+	depends on MMU
+	select CRYPTO_LIB_SHA256
+	help
+	  Choose this option if you have an Apple SoC with a Neural Engine:
+	  M1 (T8103), M1 Pro, Max and Ultra (T6000, T6001, T6002), M2
+	  (T8112), or M2 Pro, Max and Ultra (T6020, T6021, T6022).
+
+	  The interface exposed to userspace is described in
+	  include/uapi/drm/ane_accel.h.
+
+	  If unsure, say N.
+
+	  To compile this driver as modules, choose M here: the module for
+	  the M1 family will be called ane, and the module for the M2 family
+	  will be called ane_t6021.
