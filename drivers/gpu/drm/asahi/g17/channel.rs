@@ -184,7 +184,6 @@ impl Events {
         while self.remaining != 0 {
             init.validate_event_ring(role)?;
             self.remaining -= 1;
-            fence(Ordering::Acquire);
             let consumer = consumer_word.load(Ordering::Relaxed);
             let producer = producer_word.load(Ordering::Relaxed);
             if consumer >= EVENT_SLOTS || producer >= EVENT_SLOTS {
@@ -194,6 +193,8 @@ impl Events {
                 self.remaining = 0;
                 break;
             }
+            // Observe the producer before reading the record it publishes.
+            fence(Ordering::Acquire);
             let offset = status::EVENT_RING as usize + consumer as usize * EVENT_RECORD_SIZE;
             let record = EventRecord::from_words(init.status_read_words(role, offset)?);
             let event = record.decode();
