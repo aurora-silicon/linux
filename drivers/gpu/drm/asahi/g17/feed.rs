@@ -1,34 +1,41 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Detects sustained host refill gaps and temporarily requests CPU capacity.
-//! Detector updates are lock-free. The device's single feed worker owns the
-//! frequency requests; its lock never nests inside a driver publication lock.
+//! Detector updates are lock-free. The worker and policy callbacks serialize
+//! frequency requests without nesting their mutex inside a publication lock.
 //! Shutdown first closes the detector, joins its producers and the worker,
 //! then removes requests. All request storage and policy references are owned
 //! by this device, independently of other GPU instances.
+//! Policy creation and the initial snapshot take the policy rwsem before the
+//! requests mutex. Removal callbacks and the worker take only requests;
+//! notifier unregistration joins callbacks without holding that mutex.
 
 use crate::hw::t8140::qos::CLOCK_HZ;
 use core::{
     pin::Pin,
-    ptr,
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use kernel::{
-    bindings, new_mutex,
     prelude::*,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{delay::fsleep, ClockSource, Delta, Monotonic},
-    types::Opaque,
 };
+
+#[cfg(CONFIG_CPU_FREQ)]
+use core::ptr;
+#[cfg(CONFIG_CPU_FREQ)]
+use kernel::{bindings, new_mutex, sync::Mutex, types::Opaque};
 
 const MAX_REFILL_TICKS: u64 = CLOCK_HZ / 500;
 const STREAK_ON: u32 = 8;
 const STREAK_MAX: u32 = 64;
 const LINGER_NS: u64 = 8_000_000;
 const POLL_MS: i64 = 2;
+#[cfg(CONFIG_CPU_FREQ)]
 const FLOOR_PERCENT: u64 = 50;
 const WAIT_UTIL_MIN: u32 = 512;
 const WAIT_HINT_MS: u32 = 8;
+#[cfg(CONFIG_CPU_FREQ)]
 const MAX_POLICIES: usize = 8;
 
 struct Detector {
@@ -114,6 +121,7 @@ impl Detector {
     }
 }
 
+#[cfg(CONFIG_CPU_FREQ)]
 #[pin_data]
 struct Requests {
     #[pin]
@@ -121,13 +129,14 @@ struct Requests {
     policies: [*mut bindings::cpufreq_policy; MAX_POLICIES],
     maxima: [u32; MAX_POLICIES],
     applied: [u32; MAX_POLICIES],
-    count: usize,
 }
 
-// SAFETY: Each nonnull policy retains cpufreq_cpu_get's reference. Access to
-// the pinned request array and metadata is exclusive under Feed::requests.
+// SAFETY: Each nonnull policy owns a kobject reference. The device requests
+// mutex serializes the pinned slots with the worker and policy callbacks.
+#[cfg(CONFIG_CPU_FREQ)]
 unsafe impl Send for Requests {}
 
+#[cfg(CONFIG_CPU_FREQ)]
 impl Requests {
     fn new() -> Self {
         Self {
@@ -135,126 +144,255 @@ impl Requests {
             policies: [ptr::null_mut(); MAX_POLICIES],
             maxima: [0; MAX_POLICIES],
             applied: [0; MAX_POLICIES],
-            count: 0,
         }
     }
 
-    fn register(self: Pin<&mut Self>) {
+    /// The caller holds the policy's read or write lock and keeps it alive.
+    /// Policy removal must subsequently pass through this device's notifier.
+    unsafe fn add(self: Pin<&mut Self>, policy: *mut bindings::cpufreq_policy) {
         let this = self.project();
-        if *this.count != 0 {
+        if this.policies.contains(&policy) {
             return;
         }
-        // SAFETY: nr_cpu_ids is initialized before driver probe.
-        let cpus = unsafe { bindings::nr_cpu_ids };
-        for cpu in 0..cpus {
-            // SAFETY: Accepts any CPU number; a nonnull result owns one reference.
-            let policy = unsafe { bindings::cpufreq_cpu_get(cpu) };
-            if policy.is_null() {
+        let Some(index) = this.policies.iter().position(|entry| entry.is_null()) else {
+            return;
+        };
+        // SAFETY: The caller keeps the initialized policy alive. The vacant
+        // request slot is pinned and exclusively owned under the requests mutex.
+        let result = unsafe {
+            bindings::freq_qos_add_request(
+                ptr::addr_of_mut!((*policy).constraints),
+                this.requests
+                    .get()
+                    .cast::<bindings::freq_qos_request>()
+                    .add(index),
+                bindings::freq_qos_req_type_FREQ_QOS_MIN,
+                bindings::FREQ_QOS_MIN_DEFAULT_VALUE as i32,
+            )
+        };
+        if result >= 0 {
+            // SAFETY: The caller's policy reference or CREATE callback keeps the
+            // kobject alive. Retain it until REMOVE or device shutdown removes
+            // this request; cpuinfo is protected by the caller's policy lock.
+            unsafe {
+                bindings::kobject_get(ptr::addr_of_mut!((*policy).kobj));
+                this.maxima[index] = (*policy).cpuinfo.max_freq;
+            }
+            this.policies[index] = policy;
+            this.applied[index] = bindings::FREQ_QOS_MIN_DEFAULT_VALUE as u32;
+        }
+    }
+
+    fn apply(self: Pin<&mut Self>, enabled: bool) -> bool {
+        let this = self.project();
+        let mut applied = false;
+        for index in 0..MAX_POLICIES {
+            if this.policies[index].is_null() {
                 continue;
             }
-            let count = *this.count;
-            if count < MAX_POLICIES && !this.policies[..count].contains(&policy) {
-                // SAFETY: The policy is referenced. This zeroed, unregistered
-                // slot is pinned and remains alive until remove_request.
+            let value = if enabled {
+                (u64::from(this.maxima[index]) * FLOOR_PERCENT / 100) as u32
+            } else {
+                bindings::FREQ_QOS_MIN_DEFAULT_VALUE as u32
+            };
+            if this.applied[index] != value {
+                // SAFETY: This slot is registered, pinned and exclusively locked;
+                // the policy reference keeps its constraints alive through REMOVE.
                 let result = unsafe {
-                    bindings::freq_qos_add_request(
-                        ptr::addr_of_mut!((*policy).constraints),
+                    bindings::freq_qos_update_request(
                         this.requests
                             .get()
                             .cast::<bindings::freq_qos_request>()
-                            .add(count),
-                        bindings::freq_qos_req_type_FREQ_QOS_MIN,
-                        bindings::FREQ_QOS_MIN_DEFAULT_VALUE as i32,
+                            .add(index),
+                        value as i32,
                     )
                 };
                 if result >= 0 {
-                    this.policies[count] = policy;
-                    // SAFETY: cpuinfo is immutable while this policy is referenced.
-                    this.maxima[count] = unsafe { (*policy).cpuinfo.max_freq };
-                    this.applied[count] = bindings::FREQ_QOS_MIN_DEFAULT_VALUE as u32;
-                    *this.count += 1;
-                    continue;
+                    this.applied[index] = value;
                 }
             }
-            // SAFETY: Balances the reference acquired above for a duplicate,
-            // unavailable slot or failed registration. Successful slots retain it.
-            unsafe { bindings::cpufreq_cpu_put(policy) };
+            applied |= this.applied[index] != bindings::FREQ_QOS_MIN_DEFAULT_VALUE as u32;
         }
+        applied
     }
 
-    fn apply(mut self: Pin<&mut Self>, enabled: bool) -> bool {
-        if enabled {
-            self.as_mut().register();
-        }
+    fn remove(self: Pin<&mut Self>, policy: *mut bindings::cpufreq_policy) {
         let this = self.project();
-        for index in 0..*this.count {
-            let floor = if enabled {
-                (u64::from(this.maxima[index]) * FLOOR_PERCENT / 100) as u32
-            } else {
-                0
-            };
-            let value = if floor == 0 {
-                bindings::FREQ_QOS_MIN_DEFAULT_VALUE as u32
-            } else {
-                floor
-            };
-            if this.applied[index] == value {
-                continue;
-            }
-            this.applied[index] = value;
-            // SAFETY: This slot is registered, pinned and exclusively locked;
-            // its referenced policy keeps the constraints alive.
-            unsafe {
-                bindings::freq_qos_update_request(
-                    this.requests
-                        .get()
-                        .cast::<bindings::freq_qos_request>()
-                        .add(index),
-                    value as i32,
-                )
-            };
+        let Some(index) = this.policies.iter().position(|entry| *entry == policy) else {
+            return;
+        };
+        // SAFETY: This registered pinned slot is exclusively locked. The policy
+        // cannot finish removal until this reference is dropped. Keep all other
+        // request slots at their original addresses when releasing this slot.
+        unsafe {
+            bindings::freq_qos_remove_request(
+                this.requests
+                    .get()
+                    .cast::<bindings::freq_qos_request>()
+                    .add(index),
+            );
+            bindings::cpufreq_cpu_put(policy);
         }
-        *this.count != 0 && enabled
+        this.policies[index] = ptr::null_mut();
+        this.maxima[index] = 0;
+        this.applied[index] = bindings::FREQ_QOS_MIN_DEFAULT_VALUE as u32;
     }
 
-    fn clear(self: Pin<&mut Self>) {
-        let this = self.project();
-        for index in 0..*this.count {
-            // SAFETY: Registered pinned slot, exclusively locked. Remove the
-            // constraint link before releasing its policy reference.
-            unsafe {
-                bindings::freq_qos_remove_request(
-                    this.requests
-                        .get()
-                        .cast::<bindings::freq_qos_request>()
-                        .add(index),
-                );
-                bindings::cpufreq_cpu_put(this.policies[index]);
+    fn clear(mut self: Pin<&mut Self>) {
+        for index in 0..MAX_POLICIES {
+            let policy = self.policies[index];
+            if !policy.is_null() {
+                self.as_mut().remove(policy);
             }
-            this.policies[index] = ptr::null_mut();
         }
-        *this.count = 0;
     }
 }
+
+/// Only the blocking notifier core accesses this block after registration.
+#[cfg(CONFIG_CPU_FREQ)]
+#[pin_data]
+struct PolicyNotifier {
+    #[pin]
+    block: Opaque<bindings::notifier_block>,
+}
+
+// SAFETY: The pinned notifier is registered once before publishing Feed and
+// unregistered at shutdown. The blocking notifier core serializes its links;
+// callbacks use only Feed's atomic state and request mutex.
+#[cfg(CONFIG_CPU_FREQ)]
+unsafe impl Send for PolicyNotifier {}
+// SAFETY: As above; no Rust access mutates the registered block.
+#[cfg(CONFIG_CPU_FREQ)]
+unsafe impl Sync for PolicyNotifier {}
 
 #[pin_data(PinnedDrop)]
 pub(crate) struct Feed {
     detector: Detector,
+    #[cfg(CONFIG_CPU_FREQ)]
     #[pin]
     requests: Mutex<Requests>,
+    #[cfg(CONFIG_CPU_FREQ)]
+    #[pin]
+    notifier: PolicyNotifier,
+    #[cfg(CONFIG_CPU_FREQ)]
+    registered: AtomicBool,
     applied: AtomicBool,
 }
 
 impl Feed {
     pub(crate) fn new() -> Result<Arc<Self>> {
-        Arc::pin_init(
+        let feed = Arc::pin_init(
             pin_init!(Self {
                 detector: Detector::new(),
+                #[cfg(CONFIG_CPU_FREQ)]
                 requests <- new_mutex!(Requests::new(), "G17 CPU feed"),
+                #[cfg(CONFIG_CPU_FREQ)]
+                notifier <- pin_init!(PolicyNotifier {
+                    block: Opaque::new(bindings::notifier_block {
+                        notifier_call: Some(Self::policy_event),
+                        next: ptr::null_mut(),
+                        priority: 0,
+                    }),
+                }),
+                #[cfg(CONFIG_CPU_FREQ)]
+                registered: AtomicBool::new(false),
                 applied: AtomicBool::new(false),
             }),
             GFP_KERNEL,
-        )
+        )?;
+        #[cfg(CONFIG_CPU_FREQ)]
+        feed.register_policies();
+        Ok(feed)
+    }
+
+    /// Seed existing policies once; later creation/removal is event driven.
+    #[cfg(CONFIG_CPU_FREQ)]
+    fn register_policies(&self) {
+        // SAFETY: Feed is pinned in its Arc and has not been published. The
+        // notifier block lives until shutdown unregisters and joins callbacks.
+        let result = unsafe {
+            bindings::cpufreq_register_notifier(
+                self.notifier.block.get(),
+                bindings::CPUFREQ_POLICY_NOTIFIER,
+            )
+        };
+        if result < 0 {
+            // CPUFreq can be disabled at boot independently of this driver.
+            return;
+        }
+        self.registered.store(true, Ordering::Release);
+        // SAFETY: nr_cpu_ids is initialized before driver probe.
+        let cpus = unsafe { bindings::nr_cpu_ids };
+        for cpu in 0..cpus {
+            // SAFETY: The bounded CPU index is valid; a nonnull result owns a
+            // reference even if removal begins before acquiring the policy lock.
+            let policy = unsafe { bindings::cpufreq_cpu_get(cpu) };
+            if policy.is_null() {
+                continue;
+            }
+            // CREATE holds the policy write lock before taking requests. Use
+            // the same lock order and wait out partial policy initialization.
+            // SAFETY: The retained reference keeps the policy and rwsem alive.
+            unsafe { bindings::down_read(ptr::addr_of_mut!((*policy).rwsem)) };
+            {
+                let mut requests = self.requests.lock();
+                // Removal unpublishes the CPU pointer before its notifier takes
+                // requests. Rechecking under this mutex makes either the seed
+                // skip the policy or the subsequent REMOVE release its slot.
+                // SAFETY: The CPU index is valid; balance this extra reference below.
+                let current = unsafe { bindings::cpufreq_cpu_get(cpu) };
+                // SAFETY: The policy read lock excludes unfinished CREATE. If
+                // this policy is still published, REMOVE cannot yet have removed
+                // the core max request without passing our held requests mutex.
+                let initialized =
+                    current == policy && unsafe { !(*policy).max_freq_req.qos.is_null() };
+                if initialized {
+                    // SAFETY: The reference and read lock keep the initialized
+                    // policy alive; registered REMOVE callbacks cover its lifetime.
+                    unsafe { requests.as_mut().add(policy) };
+                }
+                if !current.is_null() {
+                    // SAFETY: Balances the second lookup, independently of its identity.
+                    unsafe { bindings::cpufreq_cpu_put(current) };
+                }
+            }
+            // SAFETY: Balance the read lock and first lookup after releasing requests.
+            unsafe {
+                bindings::up_read(ptr::addr_of_mut!((*policy).rwsem));
+                bindings::cpufreq_cpu_put(policy);
+            }
+        }
+    }
+
+    #[cfg(CONFIG_CPU_FREQ)]
+    unsafe extern "C" fn policy_event(
+        block: *mut bindings::notifier_block,
+        event: c_ulong,
+        data: *mut core::ffi::c_void,
+    ) -> core::ffi::c_int {
+        // SAFETY: This callback is installed only on Feed::notifier.block. Its
+        // owner remains pinned until unregister joins every callback.
+        let notifier =
+            unsafe { kernel::container_of!(Opaque::cast_from(block), PolicyNotifier, block) };
+        // SAFETY: The notifier is the embedded, pinned field of this live Feed.
+        let feed = unsafe { &*kernel::container_of!(notifier, Feed, notifier) };
+        let policy = data.cast::<bindings::cpufreq_policy>();
+        let mut requests = feed.requests.lock();
+        if event == bindings::CPUFREQ_REMOVE_POLICY as c_ulong {
+            requests.as_mut().remove(policy);
+        } else if event == bindings::CPUFREQ_CREATE_POLICY as c_ulong
+            && !feed.detector.stopping.load(Ordering::Acquire)
+        {
+            // SAFETY: CREATE supplies an initialized policy with its write lock
+            // held and guarantees REMOVE before the core releases its storage.
+            unsafe { requests.as_mut().add(policy) };
+        } else {
+            return bindings::NOTIFY_DONE as _;
+        }
+        let enabled = feed.detector.wanted(Self::now());
+        let applied = requests.as_mut().apply(enabled);
+        feed.applied.store(applied, Ordering::Relaxed);
+        bindings::NOTIFY_OK as _
     }
 
     fn now() -> u64 {
@@ -262,7 +400,9 @@ impl Feed {
     }
 
     pub(crate) fn note_render_pass(&self, start: u64, end: u64) {
-        self.detector.note(start, end, Self::now());
+        if cfg!(CONFIG_CPU_FREQ) {
+            self.detector.note(start, end, Self::now());
+        }
     }
 
     /// Called after a firmware event pass, before queuing the single feed work item.
@@ -270,12 +410,16 @@ impl Feed {
         self.detector.pending.swap(false, Ordering::AcqRel)
     }
 
+    #[cfg(CONFIG_CPU_FREQ)]
     fn apply(&self, enabled: bool) {
         let mut requests = self.requests.lock();
         let enabled = enabled && !self.detector.stopping.load(Ordering::Acquire);
         let applied = requests.as_mut().apply(enabled);
         self.applied.store(applied, Ordering::Relaxed);
     }
+
+    #[cfg(not(CONFIG_CPU_FREQ))]
+    fn apply(&self, _enabled: bool) {}
 
     /// Worker context; the linger deadline has no firmware event of its own.
     pub(crate) fn run(&self) {
@@ -317,7 +461,22 @@ impl Feed {
     /// Call after work items are joined. Removing requests withdraws their floor.
     pub(crate) fn shutdown(&self) {
         self.begin_shutdown();
-        self.requests.lock().as_mut().clear();
+        #[cfg(CONFIG_CPU_FREQ)]
+        {
+            // Unregister joins callbacks, which take requests: never hold that
+            // mutex here. Device shutdown has already joined the feed worker.
+            if self.registered.swap(false, Ordering::AcqRel) {
+                // SAFETY: The block was registered successfully and remains
+                // pinned and alive until this synchronous removal returns.
+                unsafe {
+                    bindings::cpufreq_unregister_notifier(
+                        self.notifier.block.get(),
+                        bindings::CPUFREQ_POLICY_NOTIFIER,
+                    );
+                }
+            }
+            self.requests.lock().as_mut().clear();
+        }
         self.applied.store(false, Ordering::Relaxed);
     }
 }
