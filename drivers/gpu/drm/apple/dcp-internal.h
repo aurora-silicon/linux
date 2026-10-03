@@ -250,6 +250,8 @@ struct apple_dcp {
 
 	/* Attributes of the connected display */
 	int width_mm, height_mm;
+	/* an external display whose backlight DCP can drive */
+	bool ext_backlight;
 
 	unsigned notch_height;
 
@@ -345,6 +347,7 @@ void dcp_handle_hotplug_actions(struct apple_dcp *dcp, unsigned int action);
 
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
+s32 dcp_ext_backlight_value(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
 
 #define DCP_AUDIO_MAX_CHANS 15

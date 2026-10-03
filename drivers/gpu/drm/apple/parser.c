@@ -615,11 +615,13 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 }
 
 int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
-			     int *height_mm)
+			     int *height_mm, bool *backlight_control)
 {
 	int ret = 0;
 	struct iterator it;
 	s64 width_cm = 0, height_cm = 0;
+
+	*backlight_control = false;
 
 	dcp_parse_foreach_in_dict(handle, it) {
 		char *key = parse_string(it.handle);
@@ -630,6 +632,8 @@ int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
 			ret = parse_int(it.handle, &width_cm);
 		else if (!strcmp(key, "MaxVerticalImageSize"))
 			ret = parse_int(it.handle, &height_cm);
+		else if (!strcmp(key, "SupportsBacklightControl"))
+			ret = parse_bool(it.handle, backlight_control);
 		else
 			skip(it.handle);
 

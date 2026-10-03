@@ -2191,6 +2191,11 @@ static int apple_pcie_tunnel_add_link(struct apple_pcie *pcie,
  * that suspends before a power-cycled display's hub reconnects never sees
  * the hub. Hold a runtime PM reference for as long as each function exists,
  * so that neither its driver nor power/control can suspend it.
+ *
+ * Keep the root port's link out of ASPM L1, too. Pulling the cable while
+ * the link idles in L1 wedges the root port: every later cold init leaves
+ * it unable to train, until the SoC is reset. The root port is added before
+ * the bus behind it is scanned, so ASPM never enables L1 on its link.
  */
 static int apple_pcie_tunnel_pci_notify(struct notifier_block *nb,
 					unsigned long action, void *data)
@@ -2205,6 +2210,8 @@ static int apple_pcie_tunnel_pci_notify(struct notifier_block *nb,
 	switch (action) {
 	case BUS_NOTIFY_ADD_DEVICE:
 		pm_runtime_get_noresume(&pdev->dev);
+		if (pci_pcie_type(pdev) == PCI_EXP_TYPE_ROOT_PORT)
+			pcie_aspm_remove_cap(pdev, PCI_EXP_LNKCAP_ASPM_L1);
 		break;
 	case BUS_NOTIFY_DEL_DEVICE:
 		pm_runtime_put_noidle(&pdev->dev);

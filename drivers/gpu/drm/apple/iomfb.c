@@ -292,6 +292,8 @@ void dcp_hotplug(struct work_struct *work)
 
 	connector = container_of(work, struct apple_connector, hotplug_wq);
 
+	apple_connector_backlight_sync(connector);
+
 	pdev = READ_ONCE(connector->dcp);
 	if (!pdev) {	/* a Type-C port unrouted after this was queued */
 		drm_kms_helper_connector_hotplug_event(&connector->base);

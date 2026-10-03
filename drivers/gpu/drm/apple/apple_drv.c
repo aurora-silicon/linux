@@ -259,6 +259,16 @@ static void appledrm_connector_cleanup(struct drm_connector *connector)
 	kfree(apple_connector);
 }
 
+static int apple_connector_late_register(struct drm_connector *connector)
+{
+	return apple_connector_backlight_late_register(to_apple_connector(connector));
+}
+
+static void apple_connector_early_unregister(struct drm_connector *connector)
+{
+	apple_connector_backlight_early_unregister(to_apple_connector(connector));
+}
+
 static const struct drm_connector_funcs apple_connector_funcs = {
 	.fill_modes		= drm_helper_probe_single_connector_modes,
 	.destroy		= appledrm_connector_cleanup,
@@ -268,6 +278,8 @@ static const struct drm_connector_funcs apple_connector_funcs = {
 	.detect			= apple_connector_detect,
 	.debugfs_init		= apple_connector_debugfs_init,
 	.oob_hotplug_event	= apple_connector_oob_hotplug,
+	.late_register		= apple_connector_late_register,
+	.early_unregister	= apple_connector_early_unregister,
 };
 
 /*
@@ -325,6 +337,7 @@ static int apple_connector_create(struct drm_device *drm,
 		return -ENOMEM;
 
 	mutex_init(&connector->chunk_lock);
+	apple_connector_backlight_init(connector);
 	drm_connector_helper_add(&connector->base,
 				 &apple_connector_helper_funcs);
 	if (attach_fwnode)
@@ -466,6 +479,7 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 			return -ENOMEM;
 
 		mutex_init(&connector->chunk_lock);
+		apple_connector_backlight_init(connector);
 		drm_connector_helper_add(&connector->base,
 					 &apple_connector_helper_funcs);
 
