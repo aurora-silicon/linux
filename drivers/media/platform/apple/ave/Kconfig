@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config VIDEO_APPLE_AVE_EXPERIMENTAL
+	tristate "Apple T8140 experimental video encoder transport"
+	depends on ARCH_APPLE && ARM64_16K_PAGES
+	depends on PM_GENERIC_DOMAINS && IOMMU_DMA && DEBUG_FS
+	depends on !SUSPEND && !HIBERNATION && !KEXEC_CORE
+	select CRC32
+	help
+	  Experimental root-only AVE firmware and command transport for the
+	  MacBook Neo. This does not register a V4L2 or FFmpeg encoder.
+
+	  It requires the bootloader's reserved, preloaded firmware and an
+	  explicit enable=1 module parameter. After firmware startup, memory
+	  and power references remain pinned until a hardware reset. Do not
+	  enable this on a general-purpose kernel requiring suspend or kexec.
