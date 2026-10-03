@@ -501,6 +501,14 @@ impl DeferredBatch {
             values: KVVec::with_capacity(capacity, GFP_KERNEL)?,
         })
     }
+    /// A recovery pass can fail and retire each retained command at most once.
+    /// Reserve before changing queues, plus a full publication for its caller.
+    /// Healthy submissions keep the small publication collector unchanged.
+    fn reserve_replays(&mut self, commands: usize) -> Result {
+        self.values
+            .reserve(2 * commands + 2 * Self::DEPTH, GFP_KERNEL)?;
+        Ok(())
+    }
     pub(super) fn push(&mut self, value: super::completion::Deferred) -> Result {
         use super::completion::Deferred;
         // Publishers may acquire the device mutex as soon as this pass drops

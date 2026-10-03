@@ -798,6 +798,16 @@ impl Queue {
         Ok(())
     }
 
+    /// Both FIFOs are bounded by IN_FLIGHT. Count all retained commands of
+    /// queues which this pass can release, replay or quarantine on failure.
+    pub(crate) fn replay_commands(&self) -> usize {
+        if self.awaiting_witness || self.replays.len != 0 {
+            self.active.len + self.replays.len
+        } else {
+            0
+        }
+    }
+
     pub(crate) fn replay_front(&self) -> Option<Arc<Packet>> {
         self.replays.front().cloned()
     }
