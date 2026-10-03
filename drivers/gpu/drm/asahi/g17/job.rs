@@ -249,6 +249,17 @@ struct Job<B: Backend> {
     packet: Arc<Packet>,
 }
 
+impl<B: Backend> Drop for Job<B> {
+    fn drop(&mut self) {
+        // Entity teardown can free a queued job without invoking cancel.
+        // Its independent fence may still order another engine. A claimed
+        // publisher keeps responsibility for visible work and its VM pin.
+        if self.packet.publication.load(Ordering::Acquire) == 0 {
+            self.backend.cancel(self.packet.clone());
+        }
+    }
+}
+
 impl<B: Backend> sched::JobImpl for Job<B> {
     fn false_timeout(job: &mut sched::Job<Self>) -> bool {
         job.is_finished()
