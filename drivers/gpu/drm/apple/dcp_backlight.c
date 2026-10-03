@@ -5,12 +5,15 @@
 #include <drm/drm_crtc.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_modeset_lock.h>
+#include <drm/drm_print.h>
 
 #include <linux/backlight.h>
+#include <linux/math64.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
 #include "linux/jiffies.h"
 
+#include "connector.h"
 #include "dcp.h"
 #include "dcp-internal.h"
 
@@ -255,4 +258,131 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 	dcp->brightness.dac = calculate_dac(dcp, dcp->brightness.nits);
 
 	return 0;
+}
+
+/*
+ * External displays that report SupportsBacklightControl, such as the Apple
+ * Studio Display, take the same swap backlight fields as an integrated
+ * panel.  bl_value is then a signed 32-bit level from 0 (dimmest) to S32_MAX
+ * (brightest); DCP converts it for the display.  The backlight device belongs
+ * to the connector, so userspace can tell which output it dims.
+ */
+#define DCP_EXT_BL_MAX	1000
+
+/* The bl_value for the display on this DCP, or -1 if it has no backlight. */
+s32 dcp_ext_backlight_value(struct apple_dcp *dcp)
+{
+	struct apple_connector *connector = READ_ONCE(dcp->connector);
+
+	if (!connector || !READ_ONCE(dcp->ext_backlight))
+		return -1;
+
+	return div_u64((u64)READ_ONCE(connector->bl_level) * S32_MAX,
+		       DCP_EXT_BL_MAX);
+}
+
+static int dcp_ext_backlight_update_status(struct backlight_device *bd)
+{
+	struct apple_connector *connector = bl_get_data(bd);
+	struct platform_device *pdev;
+	struct apple_dcp *dcp;
+
+	WRITE_ONCE(connector->bl_level, backlight_get_brightness(bd));
+
+	/* An unrouted port picks the level up when it powers on again. */
+	pdev = READ_ONCE(connector->dcp);
+	if (!pdev)
+		return 0;
+
+	dcp = platform_get_drvdata(pdev);
+	/* pairs with the xchg() in iomfb_flush: it sees the level or leaves update set */
+	smp_store_release(&dcp->brightness.update, true);
+
+	return dcp_backlight_update(dcp);
+}
+
+static const struct backlight_ops dcp_ext_backlight_ops = {
+	.update_status = dcp_ext_backlight_update_status,
+};
+
+static void apple_connector_backlight_register(struct apple_connector *connector)
+{
+	struct backlight_properties props = {
+		.type = BACKLIGHT_RAW,
+		.max_brightness = DCP_EXT_BL_MAX,
+		.brightness = connector->bl_level,
+	};
+	struct backlight_device *bd;
+	char name[32];
+
+	snprintf(name, sizeof(name), "apple-%s-bl", connector->base.name);
+	bd = backlight_device_register(name, connector->base.kdev, connector,
+				       &dcp_ext_backlight_ops, &props);
+	if (IS_ERR(bd)) {
+		drm_warn(connector->base.dev,
+			 "%s: failed to register backlight: %pe\n",
+			 connector->base.name, bd);
+		return;
+	}
+
+	connector->bl_dev = bd;
+}
+
+static void apple_connector_backlight_unregister(struct apple_connector *connector)
+{
+	backlight_device_unregister(connector->bl_dev);
+	connector->bl_dev = NULL;
+}
+
+void apple_connector_backlight_init(struct apple_connector *connector)
+{
+	mutex_init(&connector->bl_lock);
+	connector->bl_level = DCP_EXT_BL_MAX;
+}
+
+/*
+ * Register the backlight while a display that supports it is connected, and
+ * drop it otherwise.  Called from the connector's hotplug work.
+ */
+void apple_connector_backlight_sync(struct apple_connector *connector)
+{
+	struct platform_device *pdev;
+	bool want = false;
+
+	mutex_lock(&connector->bl_lock);
+
+	pdev = READ_ONCE(connector->dcp);
+	if (connector->bl_allowed && READ_ONCE(connector->connected) && pdev) {
+		struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+		want = READ_ONCE(dcp->ext_backlight);
+	}
+
+	if (want && !connector->bl_dev)
+		apple_connector_backlight_register(connector);
+	else if (!want && connector->bl_dev)
+		apple_connector_backlight_unregister(connector);
+
+	mutex_unlock(&connector->bl_lock);
+}
+
+int apple_connector_backlight_late_register(struct apple_connector *connector)
+{
+	mutex_lock(&connector->bl_lock);
+	connector->bl_allowed = true;
+	mutex_unlock(&connector->bl_lock);
+
+	/* a display may have connected before the connector was registered */
+	apple_connector_backlight_sync(connector);
+
+	return 0;
+}
+
+void apple_connector_backlight_early_unregister(struct apple_connector *connector)
+{
+	mutex_lock(&connector->bl_lock);
+	connector->bl_allowed = false;
+	if (connector->bl_dev)
+		apple_connector_backlight_unregister(connector);
+	mutex_unlock(&connector->bl_lock);
 }

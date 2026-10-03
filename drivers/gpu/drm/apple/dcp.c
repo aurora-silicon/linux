@@ -2193,6 +2193,8 @@ static void disconnected_hpd_event(struct apple_connector *con)
 		drm_edid_free(con->drm_edid);
 		con->drm_edid = NULL;
 		drm_kms_helper_connector_hotplug_event(&con->base);
+		/* drops the display's backlight, outside the caller's locks */
+		schedule_work(&con->hotplug_wq);
 	}
 }
 

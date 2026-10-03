@@ -1490,6 +1490,15 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->swap.bl_value = dcp->brightness.dac;
 		req->swap.bl_power = 0x40;
 		dcp->brightness.update = false;
+	} else if (!dcp_has_panel(dcp) && xchg(&dcp->brightness.update, false)) {
+		/* read after clearing: a newer level sets update again and commits */
+		s32 bl = dcp_ext_backlight_value(dcp);
+
+		if (bl >= 0) {
+			req->swap.bl_unk = 1;
+			req->swap.bl_value = bl;
+			req->swap.bl_power = 0x40;
+		}
 	}
 
 	if (crtc_state->color_mgmt_changed) {
