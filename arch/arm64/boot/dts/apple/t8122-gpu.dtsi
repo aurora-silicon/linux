@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple T8122 (M3 / G15G) GPU discovery description.
+ *
+ * The register ranges and interrupts come from the J613 iBoot ADT captured
+ * by the opt-in m1n1 diagnostic exporter. The GPU and mailbox remain disabled
+ * until m1n1 can reserve the firmware/UAT memory and validate its handoff.
+ */
+
+&{/soc} {
+	gpu: gpu@292400000 {
+		compatible = "apple,agx-t8122";
+		reg = <0x2 0x92400000 0x0 0x6c000>,
+		      <0x2 0x90000000 0x0 0x4000000>;
+		reg-names = "asc", "sgx";
+		interrupt-parent = <&aic>;
+		/* Preserve the ADT order; entry 5 (IRQ 729) is marked invalid there. */
+		interrupts = <AIC_IRQ 706 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 707 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 708 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 709 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 727 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 729 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 721 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_gfx>;
+		mboxes = <&agx_mbox>;
+		status = "disabled";
+	};
+
+	/* ASC mailbox subwindow follows the T8122 ASC layout. The IRQ role
+	 * mapping follows the other T8122 ASC mailboxes; it is not yet live-tested
+	 * for GFX. Leave this provider disabled with the GPU.
+	 */
+	agx_mbox: mbox@292408000 {
+		compatible = "apple,t8122-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0x92408000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 723 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 724 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 725 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 726 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+};
