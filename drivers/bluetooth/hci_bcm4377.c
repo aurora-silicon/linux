@@ -588,6 +588,10 @@ struct bcm4377_data {
 	/* Set once a recovery reprobe has been queued for this binding. */
 	unsigned long reset_pending;
 
+	/* System sleep: firmware quiesced, or kept running to wake us. */
+	bool quiesced;
+	bool wake_armed;
+
 	struct bcm4377_context *ctx;
 	dma_addr_t ctx_dma;
 
@@ -2271,6 +2275,13 @@ static void bcm4377_hci_free_dev(void *data)
 	hci_free_dev(data);
 }
 
+static bool bcm4377_hci_wakeup(struct hci_dev *hdev)
+{
+	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+
+	return device_may_wakeup(&bcm4377->pdev->dev);
+}
+
 struct bcm4377_reset_work {
 	struct work_struct work;
 	struct pci_dev *pdev;
@@ -2442,6 +2453,7 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	hdev->set_bdaddr = bcm4377_hci_set_bdaddr;
 	hdev->setup = bcm4377_hci_setup;
 	hdev->reset = bcm4377_hci_reset;
+	hdev->wakeup = bcm4377_hci_wakeup;
 
 	if (bcm4377->hw->broken_mws_transport_config)
 		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_MWS_TRANSPORT_CONFIG);
@@ -2479,14 +2491,28 @@ static int bcm4377_suspend(struct device *dev)
 	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
 	int ret;
 
+	/* With wakeup allowed this programs the event filter and scan. */
 	ret = hci_suspend_dev(bcm4377->hdev);
 	if (ret)
 		return ret;
+
+	if (device_may_wakeup(dev)) {
+		/*
+		 * Remote wakeup: leave the firmware running and the function
+		 * in D0, so a connection attempt from a wake-allowed device
+		 * raises an interrupt. Saving the state here stops the PCI
+		 * core from putting the function into D3hot.
+		 */
+		pci_save_state(pdev);
+		bcm4377->wake_armed = !enable_irq_wake(pdev->irq);
+		return 0;
+	}
 
 	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_QUIESCE,
 		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
 	/* Flush the posted write before the system goes to sleep. */
 	ioread32(bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
+	bcm4377->quiesced = true;
 
 	return 0;
 }
@@ -2496,10 +2522,18 @@ static int bcm4377_resume(struct device *dev)
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
 
-	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE,
-		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
-	/* The firmware must see UNQUIESCE before the resume commands. */
-	ioread32(bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
+	if (bcm4377->wake_armed) {
+		disable_irq_wake(pdev->irq);
+		bcm4377->wake_armed = false;
+	}
+
+	if (bcm4377->quiesced) {
+		iowrite32(BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE,
+			  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
+		/* The firmware must see UNQUIESCE before the resume commands. */
+		ioread32(bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
+		bcm4377->quiesced = false;
+	}
 
 	return hci_resume_dev(bcm4377->hdev);
 }
