@@ -48,10 +48,10 @@ pub(crate) struct Submission {
 }
 
 impl Submission {
-    pub(crate) fn new(contexts: &FenceContexts, context: Arc<Context>) -> Result<Arc<Self>> {
+    fn new(fence: UserFence<CompletionFence>, context: Arc<Context>) -> Result<Arc<Self>> {
         Ok(Arc::new(
             Self {
-                fence: independent(contexts)?,
+                fence,
                 work_state: Arc::new(WorkStateLease::deferred(context), GFP_KERNEL)?,
                 remaining: AtomicU32::new(1),
                 error: AtomicI32::new(0),
@@ -168,9 +168,11 @@ impl Outputs {
     }
 
     /// Publish the actual aggregate before enqueueing any command.
-    pub(crate) fn publish(&mut self, submission: Arc<Submission>) {
+    pub(crate) fn publish(&mut self, context: Arc<Context>) -> Result<Arc<Submission>> {
+        let submission = Submission::new(self.fallback.clone(), context)?;
         install(self.syncs.drain(self.input_count..), &submission.fence());
-        self.submission = Some(submission);
+        self.submission = Some(submission.clone());
+        Ok(submission)
     }
 
     /// The caller first records terminal VM errors and settles prior failed work.
@@ -184,6 +186,7 @@ impl Drop for Outputs {
     fn drop(&mut self) {
         if let Some(submission) = self.submission.take() {
             submission.finish_enqueue(self.result);
+            return;
         }
         if let Err(error) = self.result {
             self.fallback.set_error(error);

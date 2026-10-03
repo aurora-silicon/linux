@@ -286,8 +286,7 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
             }
             let (pending, guards) = self.prepare_submission(bytes)?;
             let mut guards = guards.into_iter();
-            let aggregate = Submission::new(&self.fences, self.context.clone())?;
-            outputs.publish(aggregate.clone());
+            let aggregate = outputs.publish(self.context.clone())?;
             for (command, order) in pending {
                 let guard = guards.next().ok_or(EIO)?;
                 self.enqueue(
