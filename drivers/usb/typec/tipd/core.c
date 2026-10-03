@@ -805,7 +805,7 @@ static void cd321x_dp_release_first(struct cd321x *cd321x)
 		cd321x->dp_status = dp_data.status;
 }
 
-static void cd321x_retry_revalidation(struct cd321x *cd321x)
+static void cd321x_retry_revalidation(struct cd321x *cd321x, bool reconnect)
 {
 	lockdep_assert_held(&cd321x->tps.lock);
 	if (cd321x->pm.phase != CD321X_PM_RUNNING &&
@@ -815,7 +815,7 @@ static void cd321x_retry_revalidation(struct cd321x *cd321x)
 
 	/* Keep a later physical event retryable if the automatic budget expires. */
 	cd321x->state_valid = false;
-	if (cd321x_pm_retry(&cd321x->pm))
+	if (cd321x_pm_retry(&cd321x->pm, reconnect))
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work,
 				 msecs_to_jiffies(CD321X_DEBOUNCE_DELAY_MS));
 	else
@@ -1002,6 +1002,7 @@ static void cd321x_update_work(struct work_struct *work)
 
 		tps->partner = typec_register_partner(tps->port, &desc);
 		if (IS_ERR(tps->partner)) {
+			ret = PTR_ERR(tps->partner);
 			dev_warn(tps->dev, "%s: failed to register partner\n", __func__);
 			tps->partner = NULL;
 			goto retry;
@@ -1035,7 +1036,8 @@ static void cd321x_update_work(struct work_struct *work)
 	return;
 
 retry:
-	cd321x_retry_revalidation(cd321x);
+	/* A deferred PCIe activation is not evidence of a failed cable. */
+	cd321x_retry_revalidation(cd321x, ret != -EAGAIN);
 }
 
 static void cd321x_queue_status(struct cd321x *cd321x)
@@ -1101,7 +1103,7 @@ static void cd321x_resume_work(struct work_struct *work)
 	if (atomic_xchg(&cd321x->link_event, 0)) {
 		if (cd321x_pm_link_event(&cd321x->pm)) {
 			cd321x->state_valid = false;
-			dev_info(tps->dev, "revalidating cable after tunnel link failure\n");
+			dev_info(tps->dev, "revalidating cable after tunnel state change\n");
 		} else {
 			dev_warn_ratelimited(tps->dev,
 					     "tunnel link recovery budget exhausted\n");
@@ -1129,7 +1131,7 @@ static void cd321x_resume_work(struct work_struct *work)
 	return;
 
 retry:
-	cd321x_retry_revalidation(cd321x);
+	cd321x_retry_revalidation(cd321x, true);
 }
 
 static void cd321x_suspend_prepare(struct tps6598x *tps)

@@ -95,18 +95,18 @@ static inline void cd321x_pm_snapshot_ready(struct cd321x_pm_state *pm)
 	pm->phase = CD321X_PM_APPLY;
 }
 
-static inline bool cd321x_pm_retry(struct cd321x_pm_state *pm)
+static inline bool cd321x_pm_retry(struct cd321x_pm_state *pm, bool reconnect)
 {
 	/* Runtime cable updates need the same bounded fresh-read recovery. */
 	if (pm->phase == CD321X_PM_RUNNING) {
-		pm->force_reconnect = true;
+		pm->force_reconnect |= reconnect;
 		pm->phase = CD321X_PM_REVALIDATE;
 		pm->attempts_left = CD321X_RESUME_ATTEMPTS;
 		return true;
 	}
 	if (pm->phase != CD321X_PM_REVALIDATE && pm->phase != CD321X_PM_APPLY)
 		return false;
-	pm->force_reconnect = true;
+	pm->force_reconnect |= reconnect;
 	if (pm->attempts_left) {
 		pm->phase = CD321X_PM_REVALIDATE;
 		return true;
