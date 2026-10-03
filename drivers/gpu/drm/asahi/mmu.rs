@@ -386,12 +386,15 @@ impl gpuvm::DriverGpuVm for VmInner {
                 one_page
             );
 
-            self.page_table.map_pages(
+            if let Err(error) = self.page_table.map_pages(
                 iova..(iova + len as u64),
                 addr as PhysicalAddr,
                 ctx.prot,
                 one_page,
-            )?;
+            ) {
+                self.rollback_failed_map(op.addr(), op.range());
+                return Err(error);
+            }
 
             left -= len;
             iova += len as u64;
@@ -449,6 +452,7 @@ impl gpuvm::DriverGpuVm for VmInner {
                 op.range(),
                 op.addr()
             );
+            self.rollback_failed_map(op.addr(), op.range());
             return Err(EINVAL);
         }
         self.tlbi_contexts_naming_root(op.addr(), op.range() as usize);
@@ -570,6 +574,25 @@ impl gpuvm::DriverGpuVm for VmInner {
 }
 
 impl VmInner {
+    /// A failed map has no GPUVA owner to retain its backing or remove its leaves.
+    /// GPUVM has already split or removed overlaps throughout this operation's range.
+    fn rollback_failed_map(&mut self, addr: u64, size: u64) {
+        if self.uat_inner.firmware == UatFirmware::Handoff {
+            return;
+        }
+        // Include the current segment: map_pages can fail after writing some of its leaves.
+        // The checked GPUVM operation supplies an aligned range without overflow.
+        let result = self.page_table.discard_partial_map(addr..addr + size);
+        self.tlbi_contexts_naming_root(addr, size as usize);
+        if let Err(error) = result {
+            dev_err!(
+                self.dev.as_ref(),
+                "Could not discard failed mapping: {:?}\n",
+                error
+            );
+        }
+    }
+
     fn mapping_mutation(&mut self) -> MappingMutation {
         let state = self.mapping_epoch.clone();
         if let Some(state) = state.as_ref() {
