@@ -1,0 +1,348 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+//! Paired render retirement evidence and bounded ownership of in-flight work.
+//! Queue progress and execution timestamps precede the completion stamps which
+//! authorize releasing command memory. A signalled error is not that witness.
+
+use crate::hw::t8140::queues;
+use core::sync::atomic::{fence, Ordering};
+use kernel::prelude::*;
+
+const DEPTH: usize = queues::RENDER_DEPTH as usize;
+const MAX_GROUP_ITEMS: u32 = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Cursors {
+    pub(crate) done: u32,
+    pub(crate) read: u32,
+    pub(crate) write: u32,
+}
+
+impl Cursors {
+    fn valid(self) -> bool {
+        self.done <= self.write && self.read <= self.write
+    }
+
+    fn idle(self) -> bool {
+        self.done == self.read && self.read == self.write
+    }
+}
+
+/// Each engine may omit its configuration update independently. Preserve both
+/// exact windows; neither target can be reconstructed from a render ordinal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Window {
+    base: u32,
+    count: u32,
+    capacity: u32,
+}
+
+impl Window {
+    pub(crate) fn new(base: u32, count: u32, capacity: u32) -> Result<Self> {
+        if base >= capacity || !(2..=MAX_GROUP_ITEMS).contains(&count) || count >= capacity {
+            return Err(EINVAL);
+        }
+        Ok(Self {
+            base,
+            count,
+            capacity,
+        })
+    }
+
+    pub(crate) fn target(self) -> u32 {
+        ((u64::from(self.base) + u64::from(self.count)) % u64::from(self.capacity)) as u32
+    }
+
+    fn normalize(self, cursors: Cursors) -> Result<Cursors> {
+        // Earlier and later groups can coexist in a snapshot. Anchor behind
+        // this group's base so a backwards observation cannot look like wrap.
+        let back = MAX_GROUP_ITEMS * (DEPTH as u32 - 1);
+        let limit = MAX_GROUP_ITEMS * DEPTH as u32 + back;
+        if limit >= self.capacity {
+            return Err(EINVAL);
+        }
+        let base = (u64::from(self.base) + u64::from(self.capacity) - u64::from(back))
+            % u64::from(self.capacity);
+        let distance = |value: u32| -> Result<u32> {
+            if value >= self.capacity {
+                return Err(EIO);
+            }
+            let distance =
+                (u64::from(value) + u64::from(self.capacity) - base) % u64::from(self.capacity);
+            if distance > u64::from(limit) {
+                return Err(EIO);
+            }
+            Ok(distance as u32)
+        };
+        Ok(Cursors {
+            done: distance(cursors.done)?,
+            read: distance(cursors.read)?,
+            write: distance(cursors.write)?,
+        })
+    }
+
+    fn progress(self, previous: Cursors, current: Cursors) -> Result<(bool, bool, bool)> {
+        let previous = self.normalize(previous)?;
+        let current = self.normalize(current)?;
+        let prefix = MAX_GROUP_ITEMS * (DEPTH as u32 - 1) + self.count;
+        if !previous.valid()
+            || !current.valid()
+            || current.done < previous.done
+            || current.read < previous.read
+            || current.write < previous.write
+            || prefix > current.write
+        {
+            return Err(EIO);
+        }
+        Ok((
+            current.read >= prefix,
+            current.done >= prefix,
+            current.idle(),
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Ticket {
+    /// Full physical-pair ordinal, retained through owner switches and slot wrap.
+    pub(crate) ordinal: u64,
+    pub(crate) windows: [Window; 2],
+    pub(crate) previous: [Cursors; 2],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Snapshot {
+    pub(crate) cursors: [Cursors; 2],
+    pub(crate) job_list_empty: bool,
+    /// The tiler writes the start and fragment processing writes the end.
+    pub(crate) pass: [u64; 2],
+}
+
+impl Snapshot {
+    fn executed(self) -> bool {
+        self.pass[0] != 0 && self.pass[1] != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Observation {
+    pub(crate) accepted: bool,
+    pub(crate) retired: bool,
+    pub(crate) complete: bool,
+    pub(crate) idle: bool,
+}
+
+pub(crate) fn observe(ticket: &Ticket, snapshot: Snapshot) -> Result<Observation> {
+    let ta = ticket.windows[0].progress(ticket.previous[0], snapshot.cursors[0])?;
+    let fragment = ticket.windows[1].progress(ticket.previous[1], snapshot.cursors[1])?;
+    let retired = ta.1 && fragment.1;
+    Ok(Observation {
+        accepted: ta.0 && fragment.0,
+        retired,
+        complete: retired && snapshot.executed(),
+        idle: ta.2 && fragment.2 && snapshot.job_list_empty,
+    })
+}
+
+/// Outstanding publications span less than half the 24-bit stamp sequence.
+/// A zero stamp is valid when that sequence wraps.
+pub(crate) const fn stamp_covers(stamp: u32, published: u64) -> bool {
+    let delta = stamp.wrapping_sub((published as u32).wrapping_shl(8));
+    delta & 0xff == 0 && delta < 0x8000_0000
+}
+
+fn visible(ticket: &Ticket, stamps: [u32; 2]) -> Result<bool> {
+    let published = ticket.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
+    Ok(stamps
+        .into_iter()
+        .all(|stamp| stamp_covers(stamp, published)))
+}
+
+/// Reads the graph owned by one physical pair. The owner validates the full
+/// ordinal before reading reused descriptor/timestamp slots. Word accessors
+/// perform aligned atomic loads; the observer supplies the acquire barriers.
+pub(crate) trait Memory {
+    fn snapshot(&mut self, ordinal: u64) -> Result<Snapshot>;
+    fn stamps(&mut self) -> Result<[u32; 2]>;
+    fn pass(&mut self, ordinal: u64) -> Result<[u64; 2]>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Poll {
+    Retry,
+    Pending,
+    Complete([u64; 4]),
+}
+
+/// Observe the ordered front. Individually sampled cursor words can straddle
+/// a firmware update, so an invalid snapshot receives one immediate reread.
+/// Shared work-state membership can include other engines and cannot gate a
+/// successful individual member's completion.
+pub(crate) fn poll(ticket: &mut Ticket, memory: &mut impl Memory) -> Result<Poll> {
+    fence(Ordering::Acquire);
+    let mut snapshot = memory.snapshot(ticket.ordinal)?;
+    let observation = match observe(ticket, snapshot) {
+        Ok(observation) => observation,
+        Err(_) => {
+            fence(Ordering::Acquire);
+            snapshot = memory.snapshot(ticket.ordinal)?;
+            match observe(ticket, snapshot) {
+                Ok(observation) => observation,
+                Err(_) => return Ok(Poll::Retry),
+            }
+        }
+    };
+    complete_poll(ticket, memory, snapshot, observation)
+}
+
+/// Finish an observation sampled while its exact pair was exclusively borrowed.
+/// The caller restores that pair and validates its epoch and front ticket first.
+/// Completion stamps and the final timestamp refresh remain commit-time reads.
+pub(crate) fn poll_observed(
+    ticket: &mut Ticket,
+    memory: &mut impl Memory,
+    snapshot: Snapshot,
+) -> Result<Poll> {
+    let observation = observe(ticket, snapshot)?;
+    complete_poll(ticket, memory, snapshot, observation)
+}
+
+fn complete_poll(
+    ticket: &mut Ticket,
+    memory: &mut impl Memory,
+    snapshot: Snapshot,
+    observation: Observation,
+) -> Result<Poll> {
+    if observation.complete {
+        if !visible(ticket, memory.stamps()?)? {
+            return Ok(Poll::Pending);
+        }
+        // Refresh this generation's pass after observing the post-maintenance
+        // stamps. The pre-stamp snapshot alone cannot authorize export.
+        fence(Ordering::Acquire);
+        let [start, end] = memory.pass(ticket.ordinal)?;
+        return Ok(Poll::Complete([start, start, start, end]));
+    }
+    ticket.previous = snapshot.cursors;
+    Ok(Poll::Pending)
+}
+
+/// Strict timeout settlement accepts only a nonexecuted, retired and unlinked
+/// group. Drain reclamation may also settle executed groups, but retains both
+/// ownership proofs and the exact post-maintenance stamps in either case.
+pub(crate) fn abandoned(
+    ticket: &Ticket,
+    snapshot: Snapshot,
+    stamps: [u32; 2],
+    recovery_state: u32,
+    accept_executed: bool,
+) -> Result<bool> {
+    let completion = observe(ticket, snapshot)?;
+    if !completion.retired || !snapshot.job_list_empty || (snapshot.executed() && !accept_executed)
+    {
+        return Ok(false);
+    }
+    Ok(visible(ticket, stamps)? && recovery_state == 0)
+}
+
+/// Pair-wide proof, checked before and after servicing free-list events and
+/// again after retiring all trackers. A proof from before event service must
+/// not authorize releasing guards after a new recovery began.
+pub(crate) fn drained(
+    published: u64,
+    stamps: [u32; 2],
+    free_list: [u64; 2],
+    recovery_state: u32,
+) -> bool {
+    published == 0
+        || (stamps
+            .into_iter()
+            .all(|stamp| stamp_covers(stamp, published))
+            && free_list[0] == free_list[1]
+            && recovery_state == 0)
+}
+
+/// Fixed storage keeps admission, rollback and retirement allocation-free.
+/// Each element retains its packet and resource leases independently of fences.
+pub(crate) struct Tracker<T> {
+    entries: [Option<T>; DEPTH],
+    head: usize,
+    len: usize,
+}
+
+impl<T> Tracker<T> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            entries: [const { None }; DEPTH],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+    pub(crate) fn room(&self) -> bool {
+        self.len < DEPTH
+    }
+    pub(crate) fn front(&self) -> Option<&T> {
+        if self.len == 0 {
+            None
+        } else {
+            self.entries[self.head].as_ref()
+        }
+    }
+    pub(crate) fn front_mut(&mut self) -> Option<&mut T> {
+        if self.len == 0 {
+            None
+        } else {
+            self.entries[self.head].as_mut()
+        }
+    }
+    pub(crate) fn back(&self) -> Option<&T> {
+        if self.len == 0 {
+            None
+        } else {
+            self.entries[(self.head + self.len - 1) % DEPTH].as_ref()
+        }
+    }
+    pub(crate) fn back_mut(&mut self) -> Option<&mut T> {
+        if self.len == 0 {
+            None
+        } else {
+            self.entries[(self.head + self.len - 1) % DEPTH].as_mut()
+        }
+    }
+    pub(crate) fn push(&mut self, value: T) -> core::result::Result<(), T> {
+        if !self.room() {
+            return Err(value);
+        }
+        self.entries[(self.head + self.len) % DEPTH] = Some(value);
+        self.len += 1;
+        Ok(())
+    }
+    pub(crate) fn pop(&mut self) -> Option<T> {
+        if self.len == 0 {
+            return None;
+        }
+        let value = self.entries[self.head].take();
+        self.head = (self.head + 1) % DEPTH;
+        self.len -= 1;
+        value
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
+        Iterator::chain(
+            self.entries[self.head..].iter(),
+            self.entries[..self.head].iter(),
+        )
+        .take(self.len)
+        .filter_map(Option::as_ref)
+    }
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        let (before, after) = self.entries.split_at_mut(self.head);
+        Iterator::chain(after.iter_mut(), before.iter_mut())
+            .take(self.len)
+            .filter_map(Option::as_mut)
+    }
+}

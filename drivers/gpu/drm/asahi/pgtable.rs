@@ -62,6 +62,32 @@ const UAT_LEVELS: usize = 3;
 /// Number of address bits below the index of a top-level page table entry.
 pub(crate) const UAT_TOP_LEVEL_SHIFT: usize = UAT_PGBIT + (UAT_LEVELS - 1) * UAT_LVBIT;
 
+/// Runs `f` on the first `count` top-level entries of the root page table at `ttb`.
+///
+/// # Safety
+///
+/// `ttb` must be the physical address of a page table root in RAM that stays allocated while `f`
+/// runs. Other agents (the GPU firmware) may access the entries concurrently, which is why they
+/// are only exposed as atomics.
+pub(crate) unsafe fn with_root_entries<R>(
+    ttb: PhysicalAddr,
+    count: usize,
+    f: impl FnOnce(&[AtomicU64]) -> R,
+) -> Result<R> {
+    if count > UAT_NPTE {
+        return Err(EINVAL);
+    }
+    // SAFETY: The caller guarantees that `ttb` is an allocated page in RAM.
+    let page = unsafe { Page::borrow_phys(&ttb) }.ok_or(EIO)?;
+    page.with_pointer_into_page(0, count * PTE_SIZE, |p| {
+        // SAFETY: with_pointer_into_page() ensures the pointer is valid for `count` PTEs, and page
+        // table entries are naturally aligned.
+        Ok(f(unsafe {
+            core::slice::from_raw_parts(p as *const AtomicU64, count)
+        }))
+    })
+}
+
 const PTE_TYPE_BITS: u64 = 3;
 const PTE_TYPE_LEAF_TABLE: u64 = 3;
 
@@ -179,7 +205,6 @@ impl Prot {
         }
     }
 
-    #[cfg(CONFIG_DEV_COREDUMP)]
     pub(crate) const fn from_pte(pte: u64) -> Self {
         Prot {
             high_bits: (pte >> UAT_HIGH_BITS_SHIFT) as u16,
@@ -226,6 +251,19 @@ impl Prot {
             | (self.high_bits as u64) << UAT_HIGH_BITS_SHIFT
             | (self.memattr as u64) << UAT_MEMATTR_SHIFT
             | UAT_AF
+    }
+
+    /// Whether this leaf allows the requested GPU accesses.
+    pub(crate) const fn allows_gpu(&self, need_read: bool, need_write: bool) -> bool {
+        let uxn = self.high_bits & HIGH_BITS_UXN != 0;
+        let pxn = self.high_bits & HIGH_BITS_PXN != 0;
+        let (readable, writable) = match self.ap {
+            AP_FW_GPU => (pxn, uxn),
+            AP_FW => (uxn && pxn, false),
+            AP_GPU => (!pxn, uxn != pxn),
+            _ => (false, false),
+        };
+        (!need_read || readable) && (!need_write || writable)
     }
 
     pub(crate) const fn is_cached_noncoherent(&self) -> bool {
@@ -499,6 +537,59 @@ impl UatPageTable {
         // SAFETY: Page tables allocated by the driver always come from Page::into_phys(). Without
         // `driver_tables`, every child table belongs to the driver.
         unsafe { Page::from_phys(phys) };
+    }
+
+    /// Checks every page, including holes skipped by the page-table walker.
+    pub(crate) fn covers_range(
+        &mut self,
+        range: Range<u64>,
+        read: bool,
+        write: bool,
+    ) -> Result<bool> {
+        if range.is_empty() || (range.start | range.end) & UAT_PGMSK as u64 != 0 {
+            return Ok(false);
+        }
+        let expected = (range.end - range.start) >> UAT_PGBIT;
+        let mut visited = 0u64;
+        let mut permitted = true;
+        self.with_pages(range, false, false, |_, ptes| {
+            visited = visited.checked_add(ptes.len() as u64).ok_or(EOVERFLOW)?;
+            for pte in ptes {
+                let value = pte.load(Ordering::Acquire);
+                if value & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE
+                    || !Prot::from_pte(value).allows_gpu(read, write)
+                {
+                    permitted = false;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(expected == visited && permitted)
+    }
+
+    /// Resolves an existing leaf without creating page tables.
+    pub(crate) fn translate_iova(&mut self, iova: u64) -> Result<u64> {
+        let entry = self.leaf_entry(iova & !(UAT_PGMSK as u64))?;
+        Ok((entry & self.oas_mask & !(UAT_PGMSK as u64)) | (iova & UAT_PGMSK as u64))
+    }
+
+    /// Reads one mapped leaf entry without allocating missing tables.
+    pub(crate) fn leaf_entry(&mut self, iova: u64) -> Result<u64> {
+        if iova & UAT_PGMSK as u64 != 0 {
+            return Err(EINVAL);
+        }
+        let end = iova.checked_add(UAT_PGSZ as u64).ok_or(EINVAL)?;
+        let mut value = 0;
+        self.with_pages(iova..end, false, false, |_, ptes| {
+            if let Some(pte) = ptes.first() {
+                value = pte.load(Ordering::Relaxed);
+            }
+            Ok(())
+        })?;
+        if value & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
+            return Err(EFAULT);
+        }
+        Ok(value)
     }
 
     pub(crate) fn alloc_pages(&mut self, iova_range: Range<u64>) -> Result {
