@@ -22,6 +22,9 @@ struct dcp_display_metadata {
 	u32 defaults;
 };
 
+/* Whether the firmware names this sink as a Studio Display (see the .c for which). */
+bool dcp_metadata_is_studio_display(const struct dcp_display_metadata *metadata);
+
 #define DCP_METADATA_DEFAULT_SIZE	BIT(0)
 #define DCP_METADATA_DEFAULT_COLOR	BIT(1)
 #define DCP_METADATA_DEFAULT_NAME	BIT(2)
