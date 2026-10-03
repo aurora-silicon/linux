@@ -48,6 +48,14 @@ impl<T: DriverFile> File<T> {
         self.0.get()
     }
 
+    /// Tag recent feeder work for temporary capacity hints during syncobj waits.
+    /// User scheduling attributes and CPU affinity remain unchanged.
+    pub fn set_syncobj_wait_hint(&self, util_min: u32, duration_ms: u32) {
+        // SAFETY: this File keeps the opened drm_file alive; the C helper
+        // bounds both arguments and serializes the per-file hint internally.
+        unsafe { bindings::drm_syncobj_set_wait_hint(self.as_raw(), util_min, duration_ms) };
+    }
+
     fn driver_priv(&self) -> *mut T {
         // SAFETY: By the type invariants of `Self`, `self.as_raw()` is always valid.
         unsafe { (*self.as_raw()).driver_priv }.cast()
