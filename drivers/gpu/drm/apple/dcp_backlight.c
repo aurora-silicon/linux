@@ -148,8 +148,10 @@ static int drm_crtc_set_brightness(struct apple_dcp *dcp)
 	ret = drm_modeset_lock(&crtc->mutex, &ctx);
 	if (ret == -EDEADLK) {
 		drm_modeset_backoff(&ctx);
+		drm_modeset_acquire_fini(&ctx);
 		return -EDEADLK;
 	} else if (ret == -ERESTARTSYS) {
+		drm_modeset_acquire_fini(&ctx);
 		return -ERESTARTSYS;
 	}
 
@@ -177,6 +179,7 @@ fail:
 	drm_atomic_state_put(state);
 done:
 	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
 
 	return ret;
 }
@@ -210,8 +213,10 @@ static int dcp_set_brightness(struct backlight_device *bd)
 	ret = drm_modeset_lock(&dcp->crtc->base.mutex, &ctx);
 	if (ret == -EDEADLK) {
 		drm_modeset_backoff(&ctx);
+		drm_modeset_acquire_fini(&ctx);
 		return -EDEADLK;
 	} else if (ret == -ERESTARTSYS) {
+		drm_modeset_acquire_fini(&ctx);
 		return -ERESTARTSYS;
 	}
 
@@ -219,6 +224,7 @@ static int dcp_set_brightness(struct backlight_device *bd)
 	dcp->brightness.update = true;
 
 	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
 
 	return dcp_backlight_update(dcp);
 }
