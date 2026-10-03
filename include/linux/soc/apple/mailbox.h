@@ -24,7 +24,7 @@ struct apple_mbox {
 	bool active;
 
 	int irq_recv_not_empty;
-	int irq_send_empty;
+	int irq_send_empty; /* < 0: no send-empty IRQ, TX polls */
 
 	spinlock_t rx_lock;
 	spinlock_t tx_lock;

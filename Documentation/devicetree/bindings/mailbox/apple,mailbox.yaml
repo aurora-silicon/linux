@@ -38,6 +38,13 @@ properties:
           - const: apple,asc-mailbox-v4
 
       - description:
+          The T6021 ANE coprocessor mailbox is an ASC mailbox. Only its
+          recv-not-empty interrupt is known.
+        items:
+          - const: apple,t6021-ane-mailbox
+          - const: apple,asc-mailbox-v4
+
+      - description:
           AOP setup-port mailbox with a separate register layout.
         const: apple,t8140-aop-setup-mailbox
 
@@ -63,11 +70,11 @@ properties:
     maxItems: 1
 
   interrupts:
-    minItems: 2
+    minItems: 1
     maxItems: 4
 
   interrupt-names:
-    minItems: 2
+    minItems: 1
     maxItems: 4
 
   iommus:
@@ -96,6 +103,7 @@ allOf:
     then:
       properties:
         interrupts:
+          minItems: 2
           maxItems: 2
         interrupt-names:
           items:
@@ -106,6 +114,34 @@ allOf:
         - apple,dma-range
     else:
       properties:
+        iommus: false
+        apple,dma-range: false
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6021-ane-mailbox
+    then:
+      properties:
+        interrupt-names:
+          minItems: 1
+          items:
+            - const: recv-not-empty
+            - const: send-empty
+            - const: send-not-empty
+            - const: recv-empty
+
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              enum:
+                - apple,t6021-ane-mailbox
+                - apple,t8140-aop-setup-mailbox
+    then:
+      properties:
         interrupts:
           minItems: 4
         interrupt-names:
@@ -114,8 +150,6 @@ allOf:
             - const: send-not-empty
             - const: recv-empty
             - const: recv-not-empty
-        iommus: false
-        apple,dma-range: false
 
 required:
   - compatible
