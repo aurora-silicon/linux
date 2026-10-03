@@ -37,7 +37,6 @@ use kernel::error::code::*;
 use kernel::new_mutex;
 use kernel::prelude::*;
 use kernel::sync::{
-    aref::ARef,
     Arc,
     Mutex, //
 };
@@ -56,17 +55,6 @@ use kernel::{
 const DEBUG_CLASS: DebugFlags = DebugFlags::File;
 
 pub(crate) const MAX_COMMANDS_PER_SUBMISSION: u32 = 64;
-
-/// Context-view registry updates applied after a prepared VM batch commits.
-enum MappingUpdate {
-    Map {
-        object: ARef<gem::Object>,
-        address: u64,
-        size: u64,
-        offset: u64,
-    },
-    Unmap(Range<u64>),
-}
 
 /// A client instance of an `mmu::Vm` address space.
 struct Vm {
@@ -700,7 +688,6 @@ impl File {
             )
         };
         let mut batch = mmu::PreparedUserBindBatch::new(count)?;
-        let mut updates = KVec::with_capacity(count, GFP_KERNEL)?;
         let mut unmaps = 0;
         // A fresh reader per declared stride also skips extension bytes in longer records.
         for bytes in bytes.chunks_exact(stride) {
@@ -723,7 +710,6 @@ impl File {
                     return Err(EINVAL);
                 }
                 batch.push_unmap(vm.prepare_user_unmap(op.addr, op.range)?)?;
-                updates.push(MappingUpdate::Unmap(range), GFP_KERNEL)?;
                 unmaps += 1;
                 continue;
             }
@@ -763,31 +749,9 @@ impl File {
                 prot,
                 single_page,
             )?)?;
-            updates.push(
-                MappingUpdate::Map {
-                    object,
-                    address: op.addr,
-                    size: op.range,
-                    offset: op.offset,
-                },
-                GFP_KERNEL,
-            )?;
         }
         vm.reserve_deferred_user_unmaps(unmaps)?;
         vm.commit_prepared_user_bind_batch(&mut batch)?;
-        for update in updates {
-            match update {
-                MappingUpdate::Map {
-                    object,
-                    address,
-                    size,
-                    offset,
-                } => {
-                    vm.track_context_binding(object, address, size, offset)?;
-                }
-                MappingUpdate::Unmap(range) => vm.untrack_context_range(range),
-            }
-        }
         vm.bo_deferred_cleanup();
         Ok(0)
     }

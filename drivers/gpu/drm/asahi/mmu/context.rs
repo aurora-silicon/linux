@@ -4,6 +4,8 @@
 //!
 //! Userspace owns low views 1 through 6. Only the reserved null view is created
 //! here. Its installation is serialized per VM and retained through VM teardown.
+//! Commits take bindings after the GPUVM exec lock; deferred unmaps take it
+//! after the VM lifetime lock. Readers release bindings before taking either.
 
 use super::*;
 use crate::hw::t8140::CONTEXT_VIEWS;
@@ -17,6 +19,24 @@ struct Bindings {
     generation: u64,
     slots: [Option<Binding>; CONTEXT_VIEWS.len()],
 }
+/// All arithmetic for a canonical map is checked before its page-table commit.
+pub(super) struct PreparedBinding {
+    address: u64,
+    object_offset: u64,
+    touched: u8,
+    covered: u8,
+}
+
+/// Final GEM release can acquire DMA reservations. Keep replaced references
+/// until the caller has released its GPUVM and mapping-admission locks.
+pub(super) struct RetiredBindings([Option<Binding>; CONTEXT_VIEWS.len()]);
+
+impl RetiredBindings {
+    fn new() -> Self {
+        Self(core::array::from_fn(|_| None))
+    }
+}
+
 #[pin_data]
 pub(super) struct ContextBindings {
     #[pin]
@@ -57,64 +77,99 @@ impl Vm {
         Ok(())
     }
 
-    /// Arithmetic is preflighted before invalidating any retained candidate.
-    pub(crate) fn track_context_binding(
+    pub(super) fn prepare_context_binding(
         &self,
-        gem: ARef<gem::Object>,
         address: u64,
         size: u64,
         object_offset: u64,
-    ) -> Result {
-        let Some(context) = self.context_bindings.as_ref() else {
-            return Ok(());
+    ) -> Result<PreparedBinding> {
+        let mut update = PreparedBinding {
+            address,
+            object_offset,
+            touched: 0,
+            covered: 0,
         };
+        if self.context_bindings.is_none() {
+            return Ok(update);
+        }
         let end = address.checked_add(size).ok_or(EOVERFLOW)?;
-        let mut offsets = [None; CONTEXT_VIEWS.len()];
         for (index, view) in CONTEXT_VIEWS.iter().enumerate() {
+            if address < view.source + view.size as u64 && view.source < end {
+                update.touched |= 1 << index;
+            }
             if address <= view.source && view.source + view.size as u64 <= end {
-                offsets[index] = Some(usize::try_from(
+                update.covered |= 1 << index;
+                usize::try_from(
                     object_offset
                         .checked_add(view.source - address)
                         .ok_or(EOVERFLOW)?,
-                )?);
+                )?;
             }
         }
+        Ok(update)
+    }
+
+    /// Called after a successful leaf commit, while its exec lock still orders
+    /// mapping changes. The prepared update cannot fail after visibility.
+    pub(super) fn commit_context_binding(
+        &self,
+        gem: &ARef<gem::Object>,
+        update: &PreparedBinding,
+    ) -> RetiredBindings {
+        let mut retired = RetiredBindings::new();
+        if update.touched == 0 {
+            return retired;
+        }
+        let Some(context) = self.context_bindings.as_ref() else {
+            return retired;
+        };
         let mut bindings = context.bindings.lock();
-        let mut touched = false;
-        for (index, view) in CONTEXT_VIEWS.iter().enumerate() {
-            if address < view.source + view.size as u64 && view.source < end {
-                bindings.slots[index] = None;
-                touched = true;
+        for (index, slot) in bindings.slots.iter_mut().enumerate() {
+            if update.touched & (1 << index) != 0 {
+                retired.0[index] = slot.take();
             }
-            if let Some(offset) = offsets[index] {
-                bindings.slots[index] = Some(Binding {
+            if update.covered & (1 << index) != 0 {
+                // Coverage proves source >= address. Preparation checked this
+                // exact sum and its usize conversion against the same view.
+                let offset = (update.object_offset
+                    + (CONTEXT_VIEWS[index].source - update.address)) as usize;
+                *slot = Some(Binding {
                     gem: gem.clone(),
                     offset,
                 });
-                touched = true;
             }
         }
-        if touched {
-            bindings.generation = bindings.generation.wrapping_add(1);
-        }
-        Ok(())
+        bindings.generation = bindings.generation.wrapping_add(1);
+        retired
     }
 
-    pub(crate) fn untrack_context_range(&self, range: Range<u64>) {
+    /// Successful user unmaps and accepted deferred unmaps invalidate the
+    /// matching candidates. Returning their owners avoids destruction under
+    /// the caller's exec or lifetime lock.
+    pub(super) fn untrack_context_ranges(
+        &self,
+        ranges: impl Iterator<Item = Range<u64>>,
+    ) -> RetiredBindings {
+        let mut retired = RetiredBindings::new();
         let Some(context) = self.context_bindings.as_ref() else {
-            return;
+            return retired;
         };
         let mut bindings = context.bindings.lock();
-        let mut touched = false;
-        for (index, view) in CONTEXT_VIEWS.iter().enumerate() {
-            if range.start < view.source + view.size as u64 && view.source < range.end {
-                bindings.slots[index] = None;
-                touched = true;
+        for range in ranges {
+            let mut touched = false;
+            for (index, view) in CONTEXT_VIEWS.iter().enumerate() {
+                if range.start < view.source + view.size as u64 && view.source < range.end {
+                    if let Some(binding) = bindings.slots[index].take() {
+                        retired.0[index] = Some(binding);
+                    }
+                    touched = true;
+                }
+            }
+            if touched {
+                bindings.generation = bindings.generation.wrapping_add(1);
             }
         }
-        if touched {
-            bindings.generation = bindings.generation.wrapping_add(1);
-        }
+        retired
     }
 
     pub(crate) fn untrack_context_object(&self, gem: &gem::Object) {
