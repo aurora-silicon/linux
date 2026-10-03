@@ -299,7 +299,7 @@ impl super::super::Backend {
                 // returns, while the original installed kick owner stays live.
                 drop(prepared);
                 drop(storage);
-                {
+                let grow_ready = {
                     let mut state = self.shared.state.lock();
                     let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
                     if result.is_err() {
@@ -315,8 +315,12 @@ impl super::super::Backend {
                     entry.preparing = None;
                     entry.pending_owner = None;
                     entry.pending_owner_closed = false;
-                }
+                    firmware.render_grow_ready()
+                };
                 self.shared.changed.notify_all();
+                if grow_ready {
+                    self.shared.queue_grow();
+                }
                 result
             }
             Build::Rebind {
@@ -345,7 +349,7 @@ impl super::super::Backend {
                     Ok(binding) => (Some(binding), None),
                     Err(error) => (None, Some(error)),
                 };
-                let result = {
+                let (result, grow_ready) = {
                     let mut state = self.shared.state.lock();
                     let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
                     let result = (|| {
@@ -398,7 +402,7 @@ impl super::super::Backend {
                     entry.pending_owner_closed = false;
                     entry.pair = Some(pair);
                     entry.borrowed_dependencies = None;
-                    result
+                    (result, firmware.render_grow_ready())
                 };
                 drop(prepared);
                 if result.is_err() {
@@ -413,6 +417,9 @@ impl super::super::Backend {
                     }
                 }
                 self.shared.changed.notify_all();
+                if grow_ready {
+                    self.shared.queue_grow();
+                }
                 result
             }
         };
@@ -582,16 +589,24 @@ impl super::super::Backend {
             }
             firmware.publish_render(self.owner, slot, packet, deferred)
         })();
-        if published.is_err() && !packet.is_published() {
-            firmware
-                .queues
-                .render
-                .entry_mut(slot)?
-                .pair
-                .as_mut()
-                .ok_or(EIO)?
-                .discard_prepared(packet)?;
+        let result = (|| {
+            if published.is_err() && !packet.is_published() {
+                firmware
+                    .queues
+                    .render
+                    .entry_mut(slot)?
+                    .pair
+                    .as_mut()
+                    .ok_or(EIO)?
+                    .discard_prepared(packet)?;
+            }
+            published
+        })();
+        let grow_ready = firmware.render_grow_ready();
+        drop(state);
+        if grow_ready {
+            self.shared.queue_grow();
         }
-        published
+        result
     }
 }
