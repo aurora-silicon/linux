@@ -1058,6 +1058,8 @@ impl gpu::Gpu for Gpu {
     }
 
     fn get_params(&self, params: &mut uapi::drm_asahi_params_global) -> Result {
+        params.features |=
+            uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS as u64;
         params.gpu_generation = hw::GpuGen::G17 as u32;
         params.gpu_variant = self.cfg.identity.gpu_variant as u32;
         params.gpu_revision = self.id.gpu_rev as u32;
@@ -1085,6 +1087,14 @@ impl gpu::Gpu for Gpu {
 
     fn supports_vm_status(&self) -> bool {
         true
+    }
+
+    fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
+        Some(uapi::drm_asahi_queue_limits {
+            max_queues: mmu::MAX_EXECUTION_CONTEXTS,
+            max_in_flight_per_queue: hw::t8140::queues::RENDER_PAIRS_PER_OWNER as u32,
+            ..Default::default()
+        })
     }
 
     fn uat_geometry(&self) -> mmu::UatGeometry {
