@@ -573,7 +573,7 @@ void dcp_backlight_desktop_finish(struct apple_dcp *dcp, u32 id,
 
 #define SCALE_FACTOR (1 << 10)
 
-static u32 interpolate(int val, int min, int max, u32 *tbl, size_t tbl_size)
+static u32 interpolate(int val, int min, int max, const u32 *tbl, size_t tbl_size)
 {
 	u32 frac;
 	u64 low, high;
@@ -942,6 +942,31 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 	return 0;
 }
 
+#define EXT_MIN_NITS	4
+#define EXT_MAX_NITS	600
+/*
+ * The swap's bl_value for an external Apple display (Studio Display) is the
+ * same field as the built-in panel's: a 16 bit code in the upper half of the
+ * word, not nits.  The built-in panel's own table pins the shape of that curve --
+ * 2 nits is 0x1000 and 510 nits is 0x7fe0, i.e. nits scales as code^(8/3).
+ *
+ * This table is that curve stretched to the Studio Display's 4..600 nits,
+ * 65 entries evenly spaced in nits. By eye at 600, 380, 250, 130 and 40 nits,
+ * and against the brightness the display reports over HID (Andy Wei's
+ * measurements; not repeated here).
+ */
+static const u32 ext_brightness_code[] = {
+	0x1388, 0x1ea9, 0x2568, 0x2a92, 0x2edb, 0x3293, 0x35e2, 0x38e2,
+	0x3ba4, 0x3e34, 0x4099, 0x42db, 0x44fe, 0x4706, 0x48f6, 0x4ad2,
+	0x4c9a, 0x4e51, 0x4ff9, 0x5193, 0x5320, 0x54a0, 0x5616, 0x5782,
+	0x58e4, 0x5a3c, 0x5b8d, 0x5cd6, 0x5e17, 0x5f51, 0x6085, 0x61b2,
+	0x62da, 0x63fc, 0x6518, 0x6630, 0x6742, 0x6850, 0x6959, 0x6a5e,
+	0x6b5f, 0x6c5c, 0x6d55, 0x6e4b, 0x6f3d, 0x702c, 0x7117, 0x71ff,
+	0x72e5, 0x73c7, 0x74a6, 0x7583, 0x765d, 0x7735, 0x780a, 0x78dc,
+	0x79ac, 0x7a7a, 0x7b46, 0x7c0f, 0x7cd7, 0x7d9c, 0x7e5f, 0x7f21,
+	0x7fe0,
+};
+
 /*
  * External displays that report SupportsBacklightControl, such as the Apple
  * Studio Display, take the same swap backlight fields as an integrated
@@ -970,6 +995,25 @@ s32 dcp_ext_backlight_value(struct apple_dcp *dcp)
 	level = READ_ONCE(connector->bl_level);
 	if (level < 0)
 		return -1;
+
+	/*
+	 * A Studio Display's brightness follows the curve above, so the level is
+	 * taken as a position between its minimum and maximum nits. Any other
+	 * display keeps the linear mapping. The display is known by the identity
+	 * the firmware reports, since it may send no EDID.
+	 */
+	if (level > 0 && dcp_firmware_metadata_studio_display(dcp)) {
+		int nits = EXT_MIN_NITS +
+			   div_u64((u64)level * (EXT_MAX_NITS - EXT_MIN_NITS), DCP_EXT_BL_MAX);
+
+		/* interpolate() needs an index below the last entry */
+		if (nits >= EXT_MAX_NITS)
+			return ext_brightness_code[ARRAY_SIZE(ext_brightness_code) - 1] << 16;
+
+		return interpolate(nits, EXT_MIN_NITS, EXT_MAX_NITS,
+				   ext_brightness_code,
+				   ARRAY_SIZE(ext_brightness_code)) << 16;
+	}
 
 	return div_u64((u64)level * S32_MAX, DCP_EXT_BL_MAX);
 }

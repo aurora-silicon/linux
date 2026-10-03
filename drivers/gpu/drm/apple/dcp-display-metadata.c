@@ -90,6 +90,21 @@ static s64 dcp_metadata_side(const u32 *a, const u32 *b, const u32 *point)
 }
 
 /* Validate the complete colour description before changing any EDID bytes. */
+/*
+ * What the firmware reports for the 2022 Studio Display: manufacturer APP,
+ * product 0xae3a (read from one on a 14-inch M5 Max MacBook Pro; it sends no
+ * EDID there, so this is the only identity there is). The built-in panels are
+ * APP with product 0 or 0x0616, and other Apple displays have other product
+ * codes, so none of them match.
+ */
+#define DCP_STUDIO_DISPLAY_PRODUCT	0xae3a
+
+bool dcp_metadata_is_studio_display(const struct dcp_display_metadata *metadata)
+{
+	return !strncmp(metadata->manufacturer, "APP", sizeof(metadata->manufacturer)) &&
+	       metadata->product == DCP_STUDIO_DISPLAY_PRODUCT;
+}
+
 static int dcp_metadata_color(struct edid *edid, const struct dcp_display_metadata *metadata)
 {
 	u32 coordinate[8], gamma;

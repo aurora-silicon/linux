@@ -19,6 +19,9 @@ struct dcp_display_metadata {
 	u32 max_luminance, max_fall, min_luminance; /* 16.16 cd/m2 */
 };
 
+/* Whether the firmware names this sink as a Studio Display (see the .c for which). */
+bool dcp_metadata_is_studio_display(const struct dcp_display_metadata *metadata);
+
 /* Calibrated target named by the boot-populated raw ADT. */
 enum dcp_panel_gamut {
 	DCP_PANEL_GAMUT_UNSPECIFIED,

@@ -887,6 +887,22 @@ bool dcp_firmware_metadata_current(struct apple_dcp *dcp, u64 generation)
 	return valid;
 }
 
+/* Whether the sink the firmware describes now is a Studio Display. */
+bool dcp_firmware_metadata_studio_display(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	bool studio;
+
+	if (!dcp_firmware_metadata_enabled(dcp))
+		return false;
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	studio = dcp->metadata.attributes_valid &&
+		 dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.attributes_ticket) &&
+		 dcp_metadata_is_studio_display(&dcp->metadata.attributes);
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	return studio;
+}
+
 const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation)
 {
 	struct dcp_display_metadata attributes;

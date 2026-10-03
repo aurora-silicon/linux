@@ -1014,6 +1014,7 @@ void dcp_firmware_metadata_attributes(struct apple_dcp *dcp,
 				      const struct dcp_display_metadata *attributes);
 void dcp_firmware_metadata_timing(struct apple_dcp *dcp);
 bool dcp_firmware_metadata_current(struct apple_dcp *dcp, u64 generation);
+bool dcp_firmware_metadata_studio_display(struct apple_dcp *dcp);
 const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation);
 
 void iomfb_scanout_complete_h17p(struct apple_dcp *dcp);
