@@ -310,8 +310,9 @@ pub(crate) struct DumpedPage {
     pub(crate) data: Option<Owned<Page>>,
 }
 
-// Diagnostic DMA-backed table pages. VM serialization protects all accesses;
-// returned CPU pointers remain stable as the owning vector grows.
+// DMA-backed M3 table owners, sorted by unique DMA address. VM serialization
+// protects all accesses. Insertion/removal move descriptors only: table backing
+// and returned CPU pointers remain stable as the owning vector changes.
 struct DmaTables {
     dev: kernel::sync::aref::ARef<kernel::device::Device>,
     pages: core::cell::RefCell<KVec<kernel::dma::Coherent<[u64]>>>,
@@ -324,14 +325,28 @@ impl DmaTables {
         // SAFETY: admitted M3 runtime retains the bound device and all tables
         // until ASC and GPU consumers have been quiesced.
         let page=kernel::dma::Coherent::zeroed_slice(unsafe {self.dev.as_bound()},UAT_NPTE,GFP_KERNEL)?;
-        let pa=page.dma_handle();self.pages.borrow_mut().push(page,GFP_KERNEL)?;Ok(pa)
+        let pa = page.dma_handle();
+        let mut pages = self.pages.borrow_mut();
+        let index = match pages.binary_search_by_key(&pa, |p| p.dma_handle()) {
+            Ok(_) => return Err(EEXIST),
+            Err(index) => index,
+        };
+        pages.reserve(1, GFP_KERNEL)?;
+        pages.insert_within_capacity(index, page).map_err(|_| ENOMEM)?;
+        Ok(pa)
     }
-    fn pointer(&self,pa:u64)->Option<*mut Pte> {
-        self.pages.borrow().iter().find(|p|p.dma_handle()==pa).map(|p|p.as_mut_ptr().cast::<Pte>())
+    fn pointer(&self, pa: u64) -> Option<*mut Pte> {
+        let pages = self.pages.borrow();
+        let index = pages.binary_search_by_key(&pa, |p| p.dma_handle()).ok()?;
+        Some(pages[index].as_mut_ptr().cast::<Pte>())
     }
     fn free(&self,pa:u64) {
-        let mut pages=self.pages.borrow_mut();
-        if let Some(i)=pages.iter().position(|p|p.dma_handle()==pa) {pages.swap_remove(i);}
+        let mut pages = self.pages.borrow_mut();
+        if let Ok(index) = pages.binary_search_by_key(&pa, |p| p.dma_handle()) {
+            // Removal preserves the physical-address order. Moving a DMA
+            // owner moves its descriptor, never the retained table backing.
+            drop(pages.remove(index));
+        }
     }
 }
 
