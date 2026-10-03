@@ -183,22 +183,21 @@ impl<B: Backend> Queue<B> {
         let other = 1 - index;
         let prefix = order.wait_through[other];
         let frontier = if prefix.is_some() {
-            self.frontiers[other].as_slice()
+            let frontier = self.frontiers[other].as_slice();
+            // Accepted sequences increase from one, and retain preserves their
+            // order, so all members of a logical prefix form one slice.
+            let end = frontier.partition_point(|(sequence, _)| Order::contains(prefix, *sequence));
+            &frontier[..end]
         } else {
             &[]
         };
-        let count = frontier
-            .iter()
-            .filter(|(sequence, _)| Order::contains(prefix, *sequence))
-            .count();
+        let count = frontier.len();
         let mut dependencies = KVec::with_capacity(inputs.len() + count, GFP_KERNEL)?;
         let mut checked_inputs = KVec::with_capacity(inputs.len(), GFP_KERNEL)?;
         let mut firmware = KVec::with_capacity(count, GFP_KERNEL)?;
-        for (sequence, fences) in frontier {
-            if Order::contains(prefix, *sequence) {
-                dependencies.push(fences.ready.clone(), GFP_KERNEL)?;
-                firmware.push(fences.completed.clone(), GFP_KERNEL)?;
-            }
+        for (_, fences) in frontier {
+            dependencies.push(fences.ready.clone(), GFP_KERNEL)?;
+            firmware.push(fences.completed.clone(), GFP_KERNEL)?;
         }
         // Each command owns every input fence; independent engines may publish in
         // either order and must each consume an input's error status before running.
