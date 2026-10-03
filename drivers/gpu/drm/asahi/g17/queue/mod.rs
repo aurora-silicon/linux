@@ -162,6 +162,7 @@ impl<B: Backend> Queue<B> {
                 objects,
                 timestamps,
                 false,
+                self.backend.feed(),
             )?,
             Validated::Compute { timestamps, .. } => Completion::new(
                 &self.dev,
@@ -172,6 +173,7 @@ impl<B: Backend> Queue<B> {
                 objects,
                 core::slice::from_ref(timestamps),
                 true,
+                None,
             )?,
         };
         if engine == Engine::Compute {

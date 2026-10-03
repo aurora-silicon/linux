@@ -13,6 +13,7 @@ mod compute_control;
 mod compute_replay;
 mod compute_exit;
 mod events;
+mod feed;
 mod render;
 pub(super) mod teardown;
 
