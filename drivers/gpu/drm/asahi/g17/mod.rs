@@ -180,7 +180,7 @@ const INITDATA_ACK_TIMEOUT_MS: u32 = 2000;
 const RECEIVER_ATTEMPTS: usize = 3;
 const RECEIVER_RETRY_MS: i64 = 20;
 /// The firmware does not notify the host when it retires device-control records, so their
-/// counters are polled at this interval, at most [`OPENING_RETIRE_POLLS`] times.
+/// counters are sampled initially and after at most [`OPENING_RETIRE_POLLS`] waits.
 const OPENING_RETIRE_POLL_MS: i64 = 1;
 const OPENING_RETIRE_POLLS: usize = 100;
 
