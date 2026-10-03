@@ -106,16 +106,15 @@ impl Vm {
             return Ok(None);
         }
         let mut footprint = Footprint::new(self.id);
+        let bindings = self.shared_bindings.as_ref().and_then(|shared| {
+            (shared.count.load(Ordering::Relaxed) != 0).then(|| shared.bindings.lock())
+        });
         for attachment in attachments.as_slice() {
             let end = attachment.va.saturating_add(attachment.size);
             footprint.push_vm(attachment.va, end);
-            let Some(shared) = &self.shared_bindings else {
+            let Some(bindings) = &bindings else {
                 continue;
             };
-            if shared.count.load(Ordering::Relaxed) == 0 {
-                continue;
-            }
-            let bindings = shared.bindings.lock();
             for entry in bindings.iter() {
                 let first = entry.start.max(attachment.va);
                 let last = entry.end.min(end);
@@ -129,6 +128,7 @@ impl Vm {
                 }
             }
         }
+        drop(bindings);
         Ok(Some(Arc::new(footprint, GFP_KERNEL)?))
     }
 }
