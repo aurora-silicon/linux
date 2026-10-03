@@ -415,7 +415,9 @@ impl crate::g17::Shared {
             // records that arrived while it was consuming the same ring.
             self.queue_events();
         }
-        if firmware.render_grow_pending() && !firmware.recovery.pending() {
+        let grow_ready = firmware.render_grow_ready();
+        drop(state);
+        if grow_ready {
             self.queue_grow();
         }
         Ok(())
