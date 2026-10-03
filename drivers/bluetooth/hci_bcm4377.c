@@ -2485,6 +2485,8 @@ static int bcm4377_suspend(struct device *dev)
 
 	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_QUIESCE,
 		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
+	/* Flush the posted write before the system goes to sleep. */
+	ioread32(bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
 
 	return 0;
 }
@@ -2496,6 +2498,8 @@ static int bcm4377_resume(struct device *dev)
 
 	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE,
 		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
+	/* The firmware must see UNQUIESCE before the resume commands. */
+	ioread32(bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
 
 	return hci_resume_dev(bcm4377->hdev);
 }
