@@ -933,6 +933,8 @@ static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 					 "failed to restore PCIe-C after tunnel activation: %d\n",
 					 ret);
 			put_device(&pcie_pdev->dev);
+		} else {
+			ret = -EAGAIN;
 		}
 		return ret;
 	}
@@ -976,6 +978,7 @@ static void apple_cio_pcie_tunnel_work(struct work_struct *work)
 	struct apple_cio *acio =
 		container_of(to_delayed_work(work), struct apple_cio,
 			     pcie_tunnel_work);
+	bool activated = false;
 	int ret = 0;
 
 	mutex_lock(&acio->pcie_tunnel_lock);
@@ -986,10 +989,15 @@ static void apple_cio_pcie_tunnel_work(struct work_struct *work)
 		if (ret)
 			goto unlock;
 	}
-	if (READ_ONCE(acio->pcie_tunnel_requested))
+	if (READ_ONCE(acio->pcie_tunnel_requested)) {
 		ret = apple_cio_activate_pcie_tunnel_locked(acio);
+		activated = !ret;
+	}
 unlock:
 	mutex_unlock(&acio->pcie_tunnel_lock);
+	/* Wake a deferred Type-C check after asynchronous PCIe setup finishes. */
+	if (activated)
+		typec_thunderbolt_switch_notify(acio->tbt_switch);
 	if (ret && ret != -EAGAIN)
 		dev_err(acio->dev, "deferred PCIe-C transition failed: %d\n", ret);
 }

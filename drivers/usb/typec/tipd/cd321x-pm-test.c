@@ -31,7 +31,7 @@ static void cd321x_revalidation_errors_bounded_test(struct kunit *test)
 	for (i = 0; i < CD321X_RESUME_ATTEMPTS; i++) {
 		KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
 		KUNIT_EXPECT_FALSE(test, cd321x_pm_can_update(&pm));
-		KUNIT_EXPECT_EQ(test, cd321x_pm_retry(&pm),
+		KUNIT_EXPECT_EQ(test, cd321x_pm_retry(&pm, true),
 				i + 1 < CD321X_RESUME_ATTEMPTS);
 	}
 	/* Give up without permitting an update from the old cable snapshot. */
@@ -48,7 +48,7 @@ static void cd321x_activation_failure_rereads_test(struct kunit *test)
 	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
 	cd321x_pm_snapshot_ready(&pm);
 	/* A PHY or ACIO error must not be treated as successful restoration. */
-	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, true));
 	KUNIT_EXPECT_FALSE(test, cd321x_pm_can_update(&pm));
 	cd321x_pm_complete(&pm);
 	KUNIT_EXPECT_FALSE(test, cd321x_pm_can_update(&pm));
@@ -81,11 +81,11 @@ static void cd321x_repeat_suspend_cancels_retry_test(struct kunit *test)
 	cd321x_pm_prepare(&pm);
 	KUNIT_ASSERT_TRUE(test, cd321x_pm_resume(&pm));
 	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
-	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, true));
 	/* The next prepare wins over a delayed retry from the previous wake. */
 	cd321x_pm_prepare(&pm);
 	KUNIT_EXPECT_FALSE(test, cd321x_pm_begin_read(&pm));
-	KUNIT_EXPECT_FALSE(test, cd321x_pm_retry(&pm));
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_retry(&pm, true));
 	KUNIT_EXPECT_FALSE(test, cd321x_pm_can_update(&pm));
 	KUNIT_ASSERT_TRUE(test, cd321x_pm_resume(&pm));
 	KUNIT_EXPECT_EQ(test, pm.attempts_left, (unsigned int)CD321X_RESUME_ATTEMPTS);
@@ -104,7 +104,7 @@ static void cd321x_suspend_before_apply_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, cd321x_pm_can_update(&pm));
 	cd321x_pm_complete(&pm);
 	KUNIT_EXPECT_FALSE(test, cd321x_pm_can_update(&pm));
-	KUNIT_EXPECT_FALSE(test, cd321x_pm_retry(&pm));
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_retry(&pm, true));
 }
 
 static void cd321x_remove_drains_resume_test(struct kunit *test)
@@ -115,7 +115,7 @@ static void cd321x_remove_drains_resume_test(struct kunit *test)
 	KUNIT_ASSERT_TRUE(test, cd321x_pm_resume(&pm));
 	cd321x_pm_remove(&pm);
 	KUNIT_EXPECT_FALSE(test, cd321x_pm_begin_read(&pm));
-	KUNIT_EXPECT_FALSE(test, cd321x_pm_retry(&pm));
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_retry(&pm, true));
 	KUNIT_EXPECT_FALSE(test, cd321x_pm_can_update(&pm));
 	cd321x_pm_prepare(&pm);
 	KUNIT_EXPECT_FALSE(test, cd321x_pm_resume(&pm));
@@ -133,7 +133,7 @@ static void cd321x_read_and_apply_share_budget_test(struct kunit *test)
 		KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
 		if (i & 1)
 			cd321x_pm_snapshot_ready(&pm);
-		KUNIT_EXPECT_EQ(test, cd321x_pm_retry(&pm),
+		KUNIT_EXPECT_EQ(test, cd321x_pm_retry(&pm, true),
 				i + 1 < CD321X_RESUME_ATTEMPTS);
 	}
 	KUNIT_EXPECT_FALSE(test, cd321x_pm_begin_read(&pm));
@@ -148,7 +148,7 @@ static void cd321x_status_event_after_exhaustion_test(struct kunit *test)
 	KUNIT_ASSERT_TRUE(test, cd321x_pm_resume(&pm));
 	for (i = 0; i < CD321X_RESUME_ATTEMPTS; i++) {
 		KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
-		cd321x_pm_retry(&pm);
+		cd321x_pm_retry(&pm, true);
 	}
 	/* A power/plug-only interrupt has not read the data or cable registers. */
 	KUNIT_ASSERT_TRUE(test, cd321x_pm_event(&pm));
@@ -168,12 +168,12 @@ static void cd321x_runtime_failure_revalidates_test(struct kunit *test)
 	unsigned int i;
 
 	/* A failed ordinary cable update has already consumed its IRQ changes. */
-	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, true));
 	KUNIT_EXPECT_FALSE(test, cd321x_pm_can_update(&pm));
 	for (i = 0; i < CD321X_RESUME_ATTEMPTS; i++) {
 		KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
 		cd321x_pm_snapshot_ready(&pm);
-		KUNIT_EXPECT_EQ(test, cd321x_pm_retry(&pm),
+		KUNIT_EXPECT_EQ(test, cd321x_pm_retry(&pm, true),
 				i + 1 < CD321X_RESUME_ATTEMPTS);
 	}
 	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_STALE);
@@ -210,7 +210,7 @@ static void cd321x_failed_resume_forces_reconnect_test(struct kunit *test)
 	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
 	cd321x_pm_snapshot_ready(&pm);
 	/* Fresh cable data cannot override a provider's recorded resume failure. */
-	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, true));
 	KUNIT_EXPECT_TRUE(test, pm.force_reconnect);
 	/* A new suspend must preserve recovery that has not been applied yet. */
 	cd321x_pm_prepare(&pm);
@@ -227,10 +227,10 @@ static void cd321x_stale_recovery_keeps_reconnect_test(struct kunit *test)
 	struct cd321x_pm_state pm = {};
 	unsigned int i;
 
-	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, true));
 	for (i = 0; i < CD321X_RESUME_ATTEMPTS; i++) {
 		KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
-		cd321x_pm_retry(&pm);
+		cd321x_pm_retry(&pm, true);
 	}
 	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_STALE);
 	KUNIT_EXPECT_TRUE(test, pm.force_reconnect);
@@ -258,7 +258,7 @@ static void cd321x_late_link_failure_test(struct kunit *test)
 	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
 	cd321x_pm_snapshot_ready(&pm);
 	/* Only the provider's failed check requests a fresh forced reconnect. */
-	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, true));
 	KUNIT_EXPECT_TRUE(test, pm.force_reconnect);
 	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
 	cd321x_pm_snapshot_ready(&pm);
@@ -276,7 +276,7 @@ static void cd321x_link_event_during_final_apply_test(struct kunit *test)
 	for (i = 0; i < CD321X_RESUME_ATTEMPTS; i++) {
 		KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
 		if (i + 1 < CD321X_RESUME_ATTEMPTS)
-			KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm));
+			KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, true));
 	}
 	cd321x_pm_snapshot_ready(&pm);
 	KUNIT_ASSERT_EQ(test, pm.attempts_left, 0U);
@@ -300,7 +300,7 @@ static void cd321x_link_reprobe_storm_bounded_test(struct kunit *test)
 		for (attempt = 0; attempt < CD321X_RESUME_ATTEMPTS; attempt++) {
 			KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
 			cd321x_pm_snapshot_ready(&pm);
-			KUNIT_EXPECT_EQ(test, cd321x_pm_retry(&pm),
+			KUNIT_EXPECT_EQ(test, cd321x_pm_retry(&pm, true),
 					attempt + 1 < CD321X_RESUME_ATTEMPTS);
 		}
 	}
@@ -367,7 +367,60 @@ static void cd321x_link_event_suspend_and_rearm_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, cd321x_pm_can_update(&pm));
 }
 
+static void cd321x_busy_provider_preserves_connection_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+
+	cd321x_pm_new_connection(&pm);
+	/* PCIe activation runs asynchronously after the Type-C switch returns. */
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, false));
+	KUNIT_EXPECT_FALSE(test, pm.force_reconnect);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+	cd321x_pm_snapshot_ready(&pm);
+	cd321x_pm_complete(&pm);
+	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_RUNNING);
+	KUNIT_EXPECT_FALSE(test, pm.force_reconnect);
+}
+
+static void cd321x_busy_provider_completion_reopens_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+	unsigned int i;
+
+	cd321x_pm_new_connection(&pm);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, false));
+	for (i = 0; i < CD321X_RESUME_ATTEMPTS; i++) {
+		KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+		cd321x_pm_snapshot_ready(&pm);
+		cd321x_pm_retry(&pm, false);
+	}
+	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_STALE);
+	KUNIT_EXPECT_FALSE(test, pm.force_reconnect);
+	/* The PCIe worker's completion notification permits a fresh check. */
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_link_event(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+	cd321x_pm_snapshot_ready(&pm);
+	cd321x_pm_complete(&pm);
+	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_RUNNING);
+	KUNIT_EXPECT_FALSE(test, pm.force_reconnect);
+}
+
+static void cd321x_busy_provider_keeps_real_failure_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, true));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+	cd321x_pm_snapshot_ready(&pm);
+	/* Busy retries must not erase recovery requested by a real failure. */
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, false));
+	KUNIT_EXPECT_TRUE(test, pm.force_reconnect);
+}
+
 static struct kunit_case cd321x_pm_cases[] = {
+	KUNIT_CASE(cd321x_busy_provider_preserves_connection_test),
+	KUNIT_CASE(cd321x_busy_provider_completion_reopens_test),
+	KUNIT_CASE(cd321x_busy_provider_keeps_real_failure_test),
 	KUNIT_CASE(cd321x_late_link_failure_test),
 	KUNIT_CASE(cd321x_link_event_during_final_apply_test),
 	KUNIT_CASE(cd321x_link_reprobe_storm_bounded_test),
