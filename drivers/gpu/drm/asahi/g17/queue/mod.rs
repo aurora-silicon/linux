@@ -284,11 +284,12 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
             if self.context.status().get() != 0 {
                 return Err(EIO);
             }
-            let (pending, mut guards) = self.prepare_submission(bytes)?;
+            let (pending, guards) = self.prepare_submission(bytes)?;
+            let mut guards = guards.into_iter();
             let aggregate = Submission::new(&self.fences, self.context.clone())?;
             outputs.publish(aggregate.clone());
             for (command, order) in pending {
-                let guard = guards.remove(0).map_err(|_| EIO)?;
+                let guard = guards.next().ok_or(EIO)?;
                 self.enqueue(
                     id,
                     command,
