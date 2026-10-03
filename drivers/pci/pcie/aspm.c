@@ -1545,6 +1545,7 @@ void pcie_aspm_remove_cap(struct pci_dev *pdev, u32 lnkcap)
 		 lnkcap & PCI_EXP_LNKCAP_ASPM_L1 ? " L1" : "");
 
 }
+EXPORT_SYMBOL_GPL(pcie_aspm_remove_cap);
 
 static int pcie_aspm_set_policy(const char *val,
 				const struct kernel_param *kp)
