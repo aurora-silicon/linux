@@ -585,6 +585,9 @@ struct bcm4377_data {
 
 	struct completion event;
 
+	/* Set once a recovery reprobe has been queued for this binding. */
+	unsigned long reset_pending;
+
 	struct bcm4377_context *ctx;
 	dma_addr_t ctx_dma;
 
@@ -2268,6 +2271,57 @@ static void bcm4377_hci_free_dev(void *data)
 	hci_free_dev(data);
 }
 
+struct bcm4377_reset_work {
+	struct work_struct work;
+	struct pci_dev *pdev;
+};
+
+static void bcm4377_reset_work(struct work_struct *work)
+{
+	struct bcm4377_reset_work *rw =
+		container_of(work, struct bcm4377_reset_work, work);
+
+	/*
+	 * Remove and probe again: probe resets the function and boots the
+	 * firmware from scratch. device_reprobe() frees the old bcm4377_data,
+	 * which is why this work and its device reference live outside it.
+	 */
+	if (device_reprobe(&rw->pdev->dev))
+		dev_err(&rw->pdev->dev, "reprobe after command timeout failed\n");
+
+	pci_dev_put(rw->pdev);
+	kfree(rw);
+}
+
+/*
+ * Called by the HCI core (from process context) on a command timeout. After
+ * some system resumes the controller stops answering commands for good:
+ * every later command times out until the module is reloaded. Recover the
+ * same way, by rebinding the driver.
+ */
+static void bcm4377_hci_reset(struct hci_dev *hdev)
+{
+	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+	struct bcm4377_reset_work *rw;
+
+	/* A timeout while still setting up would only loop probe failures. */
+	if (hci_dev_test_flag(hdev, HCI_SETUP))
+		return;
+	if (test_and_set_bit(0, &bcm4377->reset_pending))
+		return;
+
+	rw = kzalloc_obj(*rw);
+	if (!rw) {
+		clear_bit(0, &bcm4377->reset_pending);
+		return;
+	}
+
+	bt_dev_err(hdev, "controller not responding, rebinding the driver");
+	rw->pdev = pci_dev_get(bcm4377->pdev);
+	INIT_WORK(&rw->work, bcm4377_reset_work);
+	schedule_work(&rw->work);
+}
+
 static void bcm4377_hci_unregister_dev(void *data)
 {
 	hci_unregister_dev(data);
@@ -2387,6 +2441,7 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	hdev->send = bcm4377_hci_send_frame;
 	hdev->set_bdaddr = bcm4377_hci_set_bdaddr;
 	hdev->setup = bcm4377_hci_setup;
+	hdev->reset = bcm4377_hci_reset;
 
 	if (bcm4377->hw->broken_mws_transport_config)
 		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_MWS_TRANSPORT_CONFIG);
