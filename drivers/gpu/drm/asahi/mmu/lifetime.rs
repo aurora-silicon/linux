@@ -436,6 +436,9 @@ impl Vm {
         if !state.quarantined {
             return Err(EBUSY);
         }
+        // Reserve before accepting any range; a partial deferred batch must
+        // not leave canonical metadata ahead of the accepted cleanup.
+        state.unmaps.reserve(batch.ops.len(), GFP_KERNEL)?;
         for op in &batch.ops {
             if let PreparedUserBindOp::Unmap(unmap) = op {
                 let range = (unmap.iova, unmap.size);
@@ -444,6 +447,12 @@ impl Vm {
                 }
             }
         }
+        let retired = self.untrack_context_ranges(batch.ops.iter().filter_map(|op| match op {
+            PreparedUserBindOp::Unmap(unmap) => Some(unmap.iova..unmap.iova + unmap.size),
+            PreparedUserBindOp::Map(_) => None,
+        }));
+        drop(state);
+        drop(retired);
         Ok(true)
     }
 
