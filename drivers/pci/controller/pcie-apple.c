@@ -36,6 +36,7 @@
 #include <linux/soc/apple/pci-apple-piodma.h>
 #include <linux/pci-ecam.h>
 #include <linux/pm_runtime.h>
+#include <linux/rcupdate.h>
 #include <linux/reset.h>
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/tunable.h>
@@ -351,6 +352,7 @@ struct apple_pcie {
 
 struct apple_pcie_port {
 	raw_spinlock_t		lock;
+	raw_spinlock_t		irq_lock;
 	struct apple_pcie	*pcie;
 	struct device_node	*np;
 	void __iomem		*base;
@@ -368,6 +370,7 @@ struct apple_pcie_port {
 	bool			started;
 	bool			needs_stop;
 	bool			link_failed;
+	bool			irq_disabled;
 };
 
 static void rmw_set(u32 set, void __iomem *addr)
@@ -648,6 +651,10 @@ static void apple_port_irq_handler(struct irq_desc *desc)
 
 	chained_irq_enter(chip, desc);
 
+	raw_spin_lock(&port->irq_lock);
+	if (port->irq_disabled)
+		goto out;
+
 	stat = apple_pcie_port_readl(port, PORT_INTSTAT);
 	/* Masked link events can belong to the resume poller. */
 	stat &= ~apple_pcie_port_readl(port, PORT_INTMSK);
@@ -655,6 +662,8 @@ static void apple_port_irq_handler(struct irq_desc *desc)
 	for_each_set_bit(i, &stat, 32)
 		generic_handle_domain_irq(port->domain, i);
 
+out:
+	raw_spin_unlock(&port->irq_lock);
 	chained_irq_exit(chip, desc);
 }
 
@@ -789,6 +798,37 @@ static void apple_pcie_port_unregister_irqs(struct apple_pcie_port *port)
 		irq_domain_free_irqs(port->link_irqs[i], 1);
 		port->link_irqs[i] = 0;
 	}
+}
+
+/*
+ * A chained handler is not tracked by IRQD_IRQ_INPROGRESS, and AIC does not
+ * report IRQCHIP_STATE_ACTIVE. Gate and drain MMIO explicitly before masking
+ * the parent; disable_irq() alone cannot synchronize this chained handler.
+ */
+static void apple_pcie_port_disable_irq(struct apple_pcie_port *port)
+{
+	unsigned long flags;
+
+	if (!port->irq || !port->domain || port->irq_disabled)
+		return;
+
+	raw_spin_lock_irqsave(&port->irq_lock, flags);
+	port->irq_disabled = true;
+	raw_spin_unlock_irqrestore(&port->irq_lock, flags);
+	disable_irq(port->irq);
+}
+
+static void apple_pcie_port_enable_irq(struct apple_pcie_port *port)
+{
+	unsigned long flags;
+
+	if (!port->irq_disabled)
+		return;
+
+	raw_spin_lock_irqsave(&port->irq_lock, flags);
+	port->irq_disabled = false;
+	raw_spin_unlock_irqrestore(&port->irq_lock, flags);
+	enable_irq(port->irq);
 }
 
 static u32 apple_pcie_rid2sid_write(struct apple_pcie_port *port,
@@ -1328,6 +1368,8 @@ static int apple_pcie_tunnel_stop(struct apple_pcie_port *port)
 
 static void apple_pcie_port_teardown(struct apple_pcie_port *port)
 {
+	apple_pcie_port_disable_irq(port);
+
 	if (port->base)
 		apple_pcie_port_writel(port, ~0, PORT_INTMSK);
 
@@ -1338,6 +1380,8 @@ static void apple_pcie_port_teardown(struct apple_pcie_port *port)
 
 	if (port->irq) {
 		irq_set_chained_handler_and_data(port->irq, NULL, NULL);
+		/* Drain callbacks that cached the old chained-handler data. */
+		synchronize_rcu();
 		irq_dispose_mapping(port->irq);
 		port->irq = 0;
 	}
@@ -1543,6 +1587,7 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	port->np = of_node_get(np);
 
 	raw_spin_lock_init(&port->lock);
+	raw_spin_lock_init(&port->irq_lock);
 	INIT_LIST_HEAD(&port->entry);
 
 	snprintf(name, sizeof(name), "port%d", port->idx);
@@ -2794,6 +2839,10 @@ int apple_pcie_tunnel_quiesce(struct device *dev)
 	if (!pcie->bus_stopped) {
 		struct pci_dev *pdev, *tmp;
 
+		/* Masking PORT_INTMSK alone does not drain an in-flight handler. */
+		list_for_each_entry(port, &pcie->ports, entry)
+			apple_pcie_port_disable_irq(port);
+
 		pci_walk_bus(bridge->bus, pci_dev_set_disconnected, NULL);
 
 		/*
@@ -2878,6 +2927,8 @@ int apple_pcie_tunnel_restore(struct device *dev)
 	pci_rescan_bus(bridge->bus);
 	pci_walk_bus(bridge->bus, apple_pcie_tunnel_keep_d0, NULL);
 	pcie->bus_stopped = false;
+	list_for_each_entry(port, &pcie->ports, entry)
+		apple_pcie_port_enable_irq(port);
 	pci_unlock_rescan_remove();
 
 	dev_info(dev, "PCIe-C hierarchy restored after tunnel activation\n");
