@@ -381,8 +381,8 @@ static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_ENCLAVE);
 static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_SENSOR);
 
 // Captures per enrolment, including retries for partial contact and bad
-// frames. A J414s needs up to 22 accepted captures. bio::ENROL_STAGES is
-// derived from this, so every capture allowed here can raise the stage.
+// frames. One J414s has needed up to 22. bio::ENROL_STAGES is derived from
+// this, so the stages cannot run out before the budget does.
 const ENROL_MAX_CAPTURES: u32 = 36;
 
 const ENROL_POLL_MS: u32 = 2;
