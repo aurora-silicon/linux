@@ -683,8 +683,10 @@ impl gpuvm::DriverGpuVm for VmInner {
         // GPUVM cannot see driver-owned KernelMappings.  Preflight the full
         // object range in the authoritative page table and allocate every
         // intermediate table before the first scatterlist leaf is written.
-        self.page_table
-            .prepare_map(op.addr()..op.addr().checked_add(op.range()).ok_or(EOVERFLOW)?)?;
+        if self.uat_inner.fault.is_some() {
+            self.page_table
+                .prepare_map(op.addr()..op.addr().checked_add(op.range()).ok_or(EOVERFLOW)?)?;
+        }
 
         let mut do_map = |mut addr: usize, mut len: usize, offset: &mut usize| -> Result<bool> {
             if left == 0 {
@@ -927,12 +929,12 @@ impl VmInner {
     /// Map an `mm::Node` representing an mapping in VA space.
     fn map_node(&mut self, node: &mm::Node<(), KernelMappingInner>, prot: Prot) -> Result {
         let mut iova = node.start();
-        let mapping_end = iova
-            .checked_add(node.mapped_size as u64)
-            .ok_or(EOVERFLOW)?;
+        let mapping_end = if self.uat_inner.fault.is_some() {
+            iova.checked_add(node.mapped_size as u64).ok_or(EOVERFLOW)?
+        } else { iova + node.mapped_size as u64 };
         // The private fixed-mapping allocator cannot see GPUVM-owned leaves.
         // Reserve the complete page-table walk before installing any SG run.
-        self.page_table.prepare_map(iova..mapping_end)?;
+        if self.uat_inner.fault.is_some() { self.page_table.prepare_map(iova..mapping_end)?; }
         let guard = node.bo.as_ref().ok_or(EINVAL)?.inner().inner.lock();
         let sgt = guard.sgt.as_ref().ok_or(EINVAL)?;
         let mut offset = node.offset;
@@ -2978,6 +2980,11 @@ impl Vm {
 
         let mut inner = self.inner.exec_lock(Some(gem), true)?;
 
+        // Legacy preallocation happens before GPUVM can unmap an old VA.
+        if self.uat_inner.fault.is_none() {
+            inner.page_table.alloc_pages(addr..(addr + size))?;
+        }
+
         ctx.vm_bo = Some(vm_bo);
 
         if (addr | size | offset) & (UAT_PGMSK as u64) != 0 {
@@ -3052,9 +3059,9 @@ impl Vm {
         let iova = node.start();
         mod_dev_dbg!(inner.dev, "MMU: IO map: {:#x}:{:#x} -> {:#x}\n", phys, size, iova);
 
-        let prepared = inner
-            .page_table
-            .prepare_map(iova..iova.checked_add(size as u64).ok_or(EOVERFLOW)?);
+        let prepared = if self.uat_inner.fault.is_some() {
+            inner.page_table.prepare_map(iova..iova.checked_add(size as u64).ok_or(EOVERFLOW)?)
+        } else { Ok(()) };
         if let Err(error) = prepared {
             // Drop the VM lock before the reserved node and its owner refs.
             core::mem::drop(inner);
