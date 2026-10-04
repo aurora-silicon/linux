@@ -233,6 +233,10 @@ void of_iommu_get_resv_regions(struct device *dev, struct list_head *list)
 		maps = of_get_property(it.node, "iommu-addresses", &size);
 		if (!maps)
 			continue;
+		if (size % sizeof(*maps)) {
+			dev_warn(dev, "Invalid iommu-addresses size %d\n", size);
+			continue;
+		}
 
 		end = maps + size / sizeof(__be32);
 
@@ -250,8 +254,9 @@ void of_iommu_get_resv_regions(struct device *dev, struct list_head *list)
 			}
 
 			/* Consume every tuple, including mappings owned by another device. */
-			maps = of_translate_dma_region(np, maps, &iova, &length);
-			if (!maps || maps > end) {
+			maps = of_translate_dma_region_checked(np, maps, end - maps,
+							       &iova, &length);
+			if (!maps) {
 				dev_warn(dev, "Invalid iommu-addresses translation\n");
 				break;
 			}

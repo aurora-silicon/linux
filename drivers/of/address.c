@@ -645,17 +645,9 @@ u64 of_translate_dma_address(struct device_node *dev, const __be32 *in_addr)
 }
 EXPORT_SYMBOL(of_translate_dma_address);
 
-/**
- * of_translate_dma_region - Translate device tree address and size tuple
- * @dev: device tree node for which to translate
- * @prop: pointer into array of cells
- * @start: return value for the start of the DMA range
- * @length: return value for the length of the DMA range
- *
- * Returns a pointer to the cell immediately following the translated DMA region.
- */
-const __be32 *of_translate_dma_region(struct device_node *dev, const __be32 *prop,
-				      phys_addr_t *start, size_t *length)
+static const __be32 *__of_translate_dma_region(struct device_node *dev,
+					       const __be32 *prop, size_t cells,
+					       phys_addr_t *start, size_t *length)
 {
 	struct device_node *parent __free(device_node) = __of_get_dma_parent(dev);
 	u64 address, size;
@@ -666,6 +658,18 @@ const __be32 *of_translate_dma_region(struct device_node *dev, const __be32 *pro
 
 	na = of_bus_n_addr_cells(parent);
 	ns = of_bus_n_size_cells(parent);
+
+	if (cells != SIZE_MAX) {
+		const struct of_bus *bus = of_match_bus(parent);
+		int bus_na, bus_ns;
+
+		if (!OF_CHECK_COUNTS(na, ns) || na > cells || ns > cells - na || !bus)
+			return NULL;
+		/* Address translation can use a bus-specific cell count. */
+		bus->count_cells(dev, &bus_na, &bus_ns);
+		if (!OF_CHECK_COUNTS(bus_na, bus_ns) || bus_na > cells)
+			return NULL;
+	}
 
 	address = of_translate_dma_address(dev, prop);
 	if (address == OF_BAD_ADDR)
@@ -681,7 +685,40 @@ const __be32 *of_translate_dma_region(struct device_node *dev, const __be32 *pro
 
 	return prop + na + ns;
 }
+
+/**
+ * of_translate_dma_region - Translate device tree address and size tuple
+ * @dev: device tree node for which to translate
+ * @prop: pointer into array of cells
+ * @start: return value for the start of the DMA range
+ * @length: return value for the length of the DMA range
+ *
+ * Returns a pointer to the cell immediately following the translated DMA region.
+ */
+const __be32 *of_translate_dma_region(struct device_node *dev, const __be32 *prop,
+				      phys_addr_t *start, size_t *length)
+{
+	return __of_translate_dma_region(dev, prop, SIZE_MAX, start, length);
+}
 EXPORT_SYMBOL(of_translate_dma_region);
+
+/**
+ * of_translate_dma_region_checked - Translate a bounded address and size tuple
+ * @dev: device tree node for which to translate
+ * @prop: pointer into array of cells
+ * @cells: number of cells remaining in the array
+ * @start: return value for the start of the DMA range
+ * @length: return value for the length of the DMA range
+ *
+ * Returns the next cell, or NULL if the tuple is truncated or cannot be translated.
+ */
+const __be32 *of_translate_dma_region_checked(struct device_node *dev,
+					      const __be32 *prop, size_t cells,
+					      phys_addr_t *start, size_t *length)
+{
+	return __of_translate_dma_region(dev, prop, cells, start, length);
+}
+EXPORT_SYMBOL(of_translate_dma_region_checked);
 
 const __be32 *__of_get_address(struct device_node *dev, int index, int bar_no,
 			       u64 *size, unsigned int *flags)
