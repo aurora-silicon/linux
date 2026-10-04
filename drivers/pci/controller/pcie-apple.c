@@ -815,7 +815,8 @@ static void apple_pcie_port_disable_irq(struct apple_pcie_port *port)
 	raw_spin_lock_irqsave(&port->irq_lock, flags);
 	port->irq_disabled = true;
 	raw_spin_unlock_irqrestore(&port->irq_lock, flags);
-	disable_irq(port->irq);
+	/* The gate drained chained MMIO; avoid a sleeping wait in noirq PM. */
+	disable_irq_nosync(port->irq);
 }
 
 static void apple_pcie_port_enable_irq(struct apple_pcie_port *port)
@@ -3323,6 +3324,8 @@ static void apple_pcie_stop_for_sleep(struct device *dev)
 			can_reset = false;
 		}
 	}
+	list_for_each_entry(port, &pcie->ports, entry)
+		apple_pcie_port_disable_irq(port);
 	list_for_each_entry(port, &pcie->ports, entry) {
 		if (port->started) {
 			active = true;
@@ -3444,10 +3447,15 @@ static int apple_pcie_resume_noirq(struct device *dev)
 		if (ret)
 			goto failed;
 	}
+	list_for_each_entry(port, &pcie->ports, entry)
+		apple_pcie_port_enable_irq(port);
 
 	return 0;
 
 failed:
+	/* A retained link can fail before the sleep path ever closed the gate. */
+	list_for_each_entry(port, &pcie->ports, entry)
+		apple_pcie_port_disable_irq(port);
 	/* Device PM keeps resuming dependents even after this callback fails. */
 	pcie->resume_failed = true;
 	if (!pcie->bus_stopped)
