@@ -9,15 +9,15 @@
 use core::ffi::{c_int, c_ulonglong};
 
 extern "C" {
-    /// Pointer to the live snapshot, or 0 when no device has registered.
-    /// Set by Rust (`crate::stats::SNAPSHOT_PTR`); read by C.
-    static mut asahi_stats_snapshot_ptr: c_ulonglong;
-
     /// Register the `agx_stats` sysfs file on `dev`. Returns 0 on success.
     fn asahi_sysfs_register(dev: *mut kernel::bindings::device) -> c_int;
 
     /// Unregister the `agx_stats` sysfs file and clear the snapshot pointer.
     fn asahi_sysfs_unregister(dev: *mut kernel::bindings::device);
+
+    /// Publish the snapshot pointer for the C-side `show` callback (the C
+    /// static `asahi_stats_snapshot_ptr` is the single storage location).
+    fn asahi_stats_set_snapshot_ptr(p: c_ulonglong);
 }
 
 /// Register the sysfs file. Safe to call from `AsahiDriver::probe` after the
@@ -34,4 +34,9 @@ pub(crate) fn register(dev: *mut kernel::bindings::device) -> kernel::error::Res
 /// Unregister the sysfs file. Safe to call from the device release path.
 pub(crate) fn unregister(dev: *mut kernel::bindings::device) {
     unsafe { asahi_sysfs_unregister(dev) };
+}
+
+/// Publish the address of the live `StatsSnapshot` to the C shim.
+pub(crate) fn set_snapshot_ptr(ptr: *const crate::stats::StatsSnapshot) {
+    unsafe { asahi_stats_set_snapshot_ptr(ptr as c_ulonglong) };
 }

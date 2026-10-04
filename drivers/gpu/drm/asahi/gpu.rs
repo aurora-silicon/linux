@@ -83,6 +83,7 @@ use crate::{
     queue,
     regs,
     stats,
+    sysfs_exports,
     workqueue, //
 };
 
@@ -734,7 +735,7 @@ impl GpuManager::ver {
         // Publish the snapshot pointer to the C sysfs shim. It is cleared
         // (by the same shim) on registration removal; until then readers see
         // a stable pointer and AtomicU* races that govern.
-        stats::SNAPSHOT_PTR.store(Arc::as_ptr(&stats_snap) as u64, Ordering::Relaxed);
+        sysfs_exports::set_snapshot_ptr(Arc::as_ptr(&stats_snap));
         let stats_snap_clone = stats_snap.clone();
         let alloc_ref = &mut alloc;
         let rx_channels = KBox::init(

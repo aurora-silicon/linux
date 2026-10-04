@@ -60,11 +60,12 @@ pub(crate) struct StatsSnapshot {
     pub(crate) jobs: AtomicU64,
 }
 
-/// Pointer to the live snapshot, set from Rust probe (via `into_raw`) and
-/// read by the C `show` callback. `Ordering::Relaxed` is fine: the show path
-/// races against the IRQ path only in establishing visibility of the pointer
-/// itself; once visible, individual `AtomicU*` loads carry the data race.
-pub(crate) static SNAPSHOT_PTR: AtomicU64 = AtomicU64::new(0);
+/// Pointer to the live snapshot: the C static `asahi_stats_snapshot_ptr`
+/// (see `sysfs.c`) is the single storage location, written through
+/// `sysfs_exports::set_snapshot_ptr` and read by the C `show` callback via
+/// `READ_ONCE`. The pointer is established before the DRM device registers
+/// and removed on unregister; the pointed-to fields are `AtomicU*` and carry
+/// the data races themselves.
 
 impl StatsSnapshot {
     /// Bump the completed-submission counter (called from the queue

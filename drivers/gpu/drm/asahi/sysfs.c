@@ -46,12 +46,16 @@ struct asahi_stats_snapshot {
 };
 
 /*
- * Set by Rust; read via READ_ONCE. A NULL (0) pointer means the device has
- * not yet exposed stats (or has been unregistered). The Rust side owns the
- * lifetime of the pointed-to struct.
+ * Set by Rust through asahi_stats_set_snapshot_ptr(); read via READ_ONCE.
+ * A NULL (0) pointer means the device has not yet exposed stats (or has been
+ * unregistered). The Rust side owns the lifetime of the pointed-to struct.
  */
 unsigned long long asahi_stats_snapshot_ptr;
-EXPORT_SYMBOL_GPL(asahi_stats_snapshot_ptr);
+
+void asahi_stats_set_snapshot_ptr(unsigned long long p)
+{
+	WRITE_ONCE(asahi_stats_snapshot_ptr, p);
+}
 
 static ssize_t agx_stats_show(struct device *dev,
 			      struct device_attribute *attr, char *buf)
