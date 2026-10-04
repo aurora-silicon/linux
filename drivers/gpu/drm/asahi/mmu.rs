@@ -671,7 +671,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         op: &mut gpuvm::OpMap<Self>,
         ctx: &mut Self::StepContext,
     ) -> Result {
-        if self.uat_inner.fault.load(Ordering::Acquire) { return Err(EIO); }
+        if self.uat_inner.fault.as_ref().is_some_and(|fault| fault.load(Ordering::Acquire)) { return Err(EIO); }
         let mut iova = op.addr();
         let mut left = op.range() as usize;
         let mut offset = op.offset() as usize;
@@ -789,7 +789,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         op: &mut gpuvm::OpUnMap<Self>,
         _ctx: &mut Self::StepContext,
     ) -> Result {
-        if self.uat_inner.fault.load(Ordering::Acquire) { return Err(EIO); }
+        if self.uat_inner.fault.as_ref().is_some_and(|fault| fault.load(Ordering::Acquire)) { return Err(EIO); }
         let va = op.va().expect("step_unmap: missing VA");
 
         mod_dev_dbg!(self.dev, "MMU: unmap: {:#x}:{:#x}\n", va.addr(), va.range());
@@ -821,7 +821,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         vm_bo: &gpuvm::GpuVmBo<Self>,
         ctx: &mut Self::StepContext,
     ) -> Result {
-        if self.uat_inner.fault.load(Ordering::Acquire) { return Err(EIO); }
+        if self.uat_inner.fault.as_ref().is_some_and(|fault| fault.load(Ordering::Acquire)) { return Err(EIO); }
         let va = op.unmap().va().expect("No previous VA");
         let orig_addr = va.addr();
         let orig_range = va.range();
@@ -996,7 +996,7 @@ impl VmInner {
 /// Shared reference to a virtual memory address space ([`Vm`]).
 #[derive(Clone)]
 pub(crate) struct Vm {
-    fault: Arc<AtomicBool>,
+    fault: Option<Arc<AtomicBool>>,
     id: u64,
     inner: ARef<gpuvm::GpuVm<VmInner>>,
     dummy_obj: ARef<gem::Object>,
@@ -1008,7 +1008,7 @@ pub(crate) struct Vm {
 }
 impl Drop for Vm {
     fn drop(&mut self) {
-        if self.fault.load(Ordering::Acquire) {
+        if self.fault.as_ref().is_some_and(|fault| fault.load(Ordering::Acquire)) {
             // Keep the GPUVM and its user BO bindings until a future reset
             // implementation can prove that firmware no longer references it.
             core::mem::forget(self.inner.clone());
@@ -1423,6 +1423,201 @@ impl KernelMapping {
         )
     }
 
+    fn remap_uncached_and_flush_legacy(&mut self) {
+        let mut owner = self
+            .0
+            .owner
+            .exec_lock(None, false)
+            .expect("Failed to exec_lock in remap_uncached_and_flush");
+
+        mod_dev_dbg!(
+            owner.dev,
+            "MMU: remap as uncached {:#x}:{:#x}\n",
+            self.iova(),
+            self.size()
+        );
+
+        // Remap in-place as uncached.
+        // Do not try to unmap the guard page (-1)
+        let prot = self.0.prot.as_uncached();
+        if owner
+            .page_table
+            .reprot_pages(self.iova_range(), prot)
+            .is_err()
+        {
+            dev_err!(
+                owner.dev.as_ref(),
+                "MMU: remap {:#x}:{:#x} failed\n",
+                self.iova(),
+                self.size()
+            );
+        }
+        fence(Ordering::SeqCst);
+
+        // If we don't have (and have never had) a VM slot, just return
+        let slot = match owner.slot() {
+            None => return,
+            Some(slot) => slot,
+        };
+
+        let flush_slot = if owner.is_kernel {
+            // If this is a kernel mapping, always flush on index 64
+            UAT_NUM_CTX as u32
+        } else {
+            // Otherwise, check if this slot is the active one, otherwise return
+            // Also check that we actually own this slot
+            let ttb = owner.ttb() | TTBR_VALID | (slot as u64) << TTBR_ASID_SHIFT;
+
+            let uat_inner = self.0.uat_inner.lock();
+            let handoff_guard = uat_inner.handoff().lock_legacy();
+            let cur_slot = uat_inner.handoff().current_slot();
+            let ttb_cur = uat_inner.ttbs()[slot as usize].ttb0.load(Ordering::Relaxed);
+            drop(handoff_guard);
+            if cur_slot == Some(slot) && ttb_cur == ttb {
+                slot
+            } else {
+                return;
+            }
+        };
+
+        // FIXME: There is a race here, though it'll probably never happen in practice.
+        // In theory, it's possible for the ASC to finish using our slot, whatever command
+        // it was processing to complete, the slot to be lost to another context, and the ASC
+        // to begin using it again with a different page table, thus faulting when it gets a
+        // flush request here. In practice, the chance of this happening is probably vanishingly
+        // small, as all 62 other slots would have to be recycled or in use before that slot can
+        // be reused, and the ASC using user contexts at all is very rare.
+
+        // Still, the locking around UAT/Handoff/TTBs should probably be redesigned to better
+        // model the interactions with the firmware and avoid these races.
+        // Possibly TTB changes should be tied to slot locks:
+
+        // Flush:
+        //  - Can early check handoff here (no need to lock).
+        //      If user slot and it doesn't match the active ASC slot,
+        //      we can elide the flush as the ASC guarantees it flushes
+        //      TLBs/caches when it switches context. We just need a
+        //      barrier to ensure ordering.
+        //  - Lock TTB slot
+        //      - If user ctx:
+        //          - Lock handoff AP-side
+        //              - Lock handoff dekker
+        //                  - Check TTB & handoff cur ctx
+        //      - Perform flush if necessary
+        //          - This implies taking the fwring lock
+        //
+        // TTB change:
+        //  - lock TTB slot
+        //      - lock handoff AP-side
+        //          - lock handoff dekker
+        //              change TTB
+
+        // Lock this flush slot, and write the range to it
+        let flush = self.0.uat_inner.lock_flush(flush_slot);
+        let pages = self.size() >> UAT_PGBIT;
+        flush.begin_flush_legacy(self.iova(), self.size() as u64);
+        if pages >= 0x10000 {
+            dev_err!(
+                owner.dev.as_ref(),
+                "MMU: Flush too big ({:#x} pages))\n",
+                pages
+            );
+        }
+
+        let cmd = fw::channels::FwCtlMsg {
+            addr: fw::types::U64(self.iova()),
+            unk_8: 0,
+            slot: flush_slot,
+            page_count: pages as u16,
+            unk_12: 2, // ?
+        };
+
+        // Tell the firmware to do a cache flush
+        if let Err(e) = (*owner.dev).gpu().and_then(|gpu| gpu.fwctl(cmd)) {
+            dev_err!(
+                owner.dev.as_ref(),
+                "MMU: ASC cache flush {:#x}:{:#x} failed (err: {:?})\n",
+                self.iova(),
+                self.size(),
+                e
+            );
+        }
+
+        // Finish the flush
+        flush.end_flush_legacy();
+
+        // Slot is unlocked here
+    }
+
+    fn drop_legacy(&mut self) {
+        // This is the main unmap function for UAT mappings.
+        // The sequence of operations here is finicky, due to the interaction
+        // between cached GFX ASC mappings and the page tables. These mappings
+        // always have to be flushed from the cache before being unmapped.
+
+        // For uncached mappings, just unmapping and flushing the TLB is sufficient.
+
+        // For cached mappings, this is the required sequence:
+        // 1. Remap it as uncached
+        // 2. Flush the TLB range
+        // 3. If kernel VA mapping OR user VA mapping and handoff.current_slot() == slot:
+        //    a. Take a lock for this slot
+        //    b. Write the flush range to the right context slot in handoff area
+        //    c. Issue a cache invalidation request via FwCtl queue
+        //    d. Poll for completion via queue
+        //    e. Check for completion flag in the handoff area
+        //    f. Drop the lock
+        // 4. Unmap
+        // 5. Flush the TLB range again
+
+        if self.0.prot.is_cached_noncoherent() {
+            mod_pr_debug!(
+                "MMU: remap as uncached {:#x}:{:#x}\n",
+                self.iova(),
+                self.size()
+            );
+            self.remap_uncached_and_flush_legacy();
+        }
+
+        let mut owner = self
+            .0
+            .owner
+            .exec_lock(None, false)
+            .expect("exec_lock failed in KernelMapping::drop");
+        mod_dev_dbg!(
+            owner.dev,
+            "MMU: unmap {:#x}:{:#x}\n",
+            self.iova(),
+            self.size()
+        );
+
+        if owner.page_table.unmap_pages(self.iova_range()).is_err() {
+            dev_err!(
+                owner.dev.as_ref(),
+                "MMU: unmap {:#x}:{:#x} failed\n",
+                self.iova(),
+                self.size()
+            );
+        }
+
+        if let Some(asid) = owner.slot() {
+            fence(Ordering::SeqCst);
+            mem::tlbi_range(asid as u8, self.iova() as usize, self.size());
+            mod_dev_dbg!(
+                owner.dev,
+                "MMU: flush range: asid={:#x} start={:#x} len={:#x}\n",
+                asid,
+                self.iova(),
+                self.size()
+            );
+            mem::sync();
+        }
+        drop(owner);
+        // SAFETY: This is the original legacy teardown order. The node was
+        // automatically dropped after the old Drop callback returned.
+        unsafe { ManuallyDrop::drop(&mut self.0) };
+    }
+
     /// Remap a cached mapping as uncached, then synchronously flush that range of VAs from the
     /// coprocessor cache. This is required to safely unmap cached/private mappings.
     fn remap_uncached_and_flush(&mut self) -> Result {
@@ -1568,7 +1763,12 @@ no_debug!(KernelMapping);
 
 impl Drop for KernelMapping {
     fn drop(&mut self) {
-        if self.0.uat_inner.fault.load(Ordering::Acquire) { return; }
+        if self.0.uat_inner.fault.is_none() {
+            self.drop_legacy();
+            return;
+        }
+
+        if self.0.uat_inner.fault.as_ref().is_some_and(|fault| fault.load(Ordering::Acquire)) { return; }
         // This is the main unmap function for UAT mappings.
         // The sequence of operations here is finicky, due to the interaction
         // between cached GFX ASC mappings and the page tables. These mappings
@@ -1596,7 +1796,7 @@ impl Drop for KernelMapping {
                 self.size()
             );
             if let Err(error) = self.remap_uncached_and_flush() {
-                self.0.uat_inner.fault.store(true, Ordering::Release);
+                if let Some(fault) = &self.0.uat_inner.fault { fault.store(true, Ordering::Release); }
                 pr_err!("UAT: retaining mapping after failed firmware flush ({:?})\n", error);
                 return;
             }
@@ -1605,7 +1805,7 @@ impl Drop for KernelMapping {
         let mut owner = match self.0.owner.exec_lock(None, false) {
             Ok(owner) => owner,
             Err(_) => {
-                self.0.uat_inner.fault.store(true, Ordering::Release);
+                if let Some(fault) = &self.0.uat_inner.fault { fault.store(true, Ordering::Release); }
                 return;
             }
         };
@@ -1623,7 +1823,7 @@ impl Drop for KernelMapping {
                 self.iova(),
                 self.size()
             );
-            self.0.uat_inner.fault.store(true, Ordering::Release);
+            if let Some(fault) = &self.0.uat_inner.fault { fault.store(true, Ordering::Release); }
             return;
         }
 
@@ -1648,7 +1848,7 @@ impl Drop for KernelMapping {
 
 /// Shared UAT global data structures
 struct UatShared {
-    fault: Arc<AtomicBool>,
+    fault: Option<Arc<AtomicBool>>,
     kernel_ttb1: u64,
     map_kernel_to_user: bool,
     handoff_rgn: UatRegion,
@@ -1657,9 +1857,11 @@ struct UatShared {
 
 impl UatShared {
     fn lock_handoff(&self) -> Result<HandoffGuard<'_>> {
-        if self.fault.load(Ordering::Acquire) { return Err(EIO); }
+        if self.fault.is_none() { return Ok(self.handoff().lock_legacy()); }
+
+        if self.fault.as_ref().is_some_and(|fault| fault.load(Ordering::Acquire)) { return Err(EIO); }
         self.handoff().try_lock().inspect_err(|_| {
-            self.fault.store(true, Ordering::Release);
+            if let Some(fault) = &self.fault { fault.store(true, Ordering::Release); }
         })
     }
 
@@ -1683,7 +1885,7 @@ unsafe impl Send for UatShared {}
 #[pin_data]
 struct UatInner {
     m3_running: bool,
-    fault: Arc<AtomicBool>,
+    fault: Option<Arc<AtomicBool>>,
     firmware_cache_flush_ready: AtomicBool,
     /// `Vm::id` of the VM whose root is currently published at the G17P
     /// compute contexts (`T8140_COMPUTE_CTXS`), or 0 for none.
@@ -1738,15 +1940,36 @@ pub(crate) struct Uat {
     t8140_context_phase: AtomicU8,
 }
 
-struct HandoffGuard<'a>(&'a Handoff);
+struct HandoffGuard<'a>(&'a Handoff, bool);
 
 impl Drop for HandoffGuard<'_> {
     fn drop(&mut self) {
-        self.0.unlock();
+        if self.1 {
+            self.0.turn.store(1, Ordering::Relaxed);
+            self.0.lock_ap.store(0, Ordering::Release);
+        } else {
+            self.0.unlock();
+        }
     }
 }
 
 impl Handoff {
+    fn lock_legacy(&self) -> HandoffGuard<'_> {
+        self.lock_ap.store(1, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+
+        while self.lock_fw.load(Ordering::Relaxed) != 0 {
+            if self.turn.load(Ordering::Relaxed) != 0 {
+                self.lock_ap.store(0, Ordering::Relaxed);
+                while self.turn.load(Ordering::Relaxed) != 0 {}
+                self.lock_ap.store(1, Ordering::Relaxed);
+                fence(Ordering::SeqCst);
+            }
+        }
+        fence(Ordering::Acquire);
+        HandoffGuard(self, true)
+    }
+
     /// Acquire firmware exclusion or return an error after a bounded wait.
     /// The guard releases exclusion on every return path, including errors.
     fn try_lock(&self) -> Result<HandoffGuard<'_>> {
@@ -1757,7 +1980,7 @@ impl Handoff {
             pr_err!("UAT handoff: firmware exclusion timed out; AP interest withdrawn\n");
             return Err(ETIMEDOUT);
         }
-        Ok(HandoffGuard(self))
+        Ok(HandoffGuard(self, false))
     }
 
     /// Unlock the handoff region, allowing firmware access
@@ -1768,7 +1991,7 @@ impl Handoff {
     /// Returns the current Vm slot mapped by the firmware for lower/unprivileged access, if any.
     fn current_slot(&self) -> Option<u32> {
         let slot = self.cur_slot.load(Ordering::Relaxed);
-        if slot == 0 || slot >= UAT_NUM_CTX as u32 {
+        if slot == 0 || slot == u32::MAX {
             None
         } else {
             Some(slot)
@@ -1802,14 +2025,14 @@ impl Handoff {
             let start = Instant::<Monotonic>::now();
             const TIMEOUT: Delta = Delta::from_millis(1000);
 
-            let mut guard = self.try_lock()?;
+            let mut guard = if m3 { self.try_lock()? } else { self.lock_legacy() };
             while start.elapsed() < TIMEOUT {
                 if self.magic_fw.load(Ordering::Relaxed) == PPL_MAGIC {
                     break;
                 } else {
                     drop(guard);
                     fsleep(Delta::from_millis(10));
-                    guard = self.try_lock()?;
+                    guard = if m3 { self.try_lock()? } else { self.lock_legacy() };
                 }
             }
 
@@ -1867,6 +2090,29 @@ struct HandoffFlush(*const FlushInfo, HandoffMode);
 unsafe impl Send for HandoffFlush {}
 
 impl HandoffFlush {
+    fn end_flush_legacy(&self) {
+        // SAFETY: Per the type invariant, this is safe
+        let flush = unsafe { self.0.as_ref().unwrap() };
+        let state = flush.state.load(Ordering::Relaxed);
+        if state != 2 {
+            pr_err!("Handoff: expected flush state 2, got {}\n", state);
+        }
+        flush.state.store(0, Ordering::Relaxed);
+    }
+
+    fn begin_flush_legacy(&self, start: u64, size: u64) {
+        // SAFETY: Per the type invariant, this is safe
+        let flush = unsafe { self.0.as_ref().unwrap() };
+
+        let state = flush.state.load(Ordering::Relaxed);
+        if state != 0 {
+            pr_err!("Handoff: expected flush state 0, got {}\n", state);
+        }
+        flush.addr.store(start, Ordering::Relaxed);
+        flush.size.store(size, Ordering::Relaxed);
+        flush.state.store(1, Ordering::Relaxed);
+    }
+
     /// Set up a flush operation for the coprocessor
     fn begin_flush(&self, start: u64, size: u64) -> Result {
         // SAFETY: Per the type invariant, this is safe
@@ -1921,7 +2167,7 @@ impl Vm {
         id: u64,
         t8140_internal: bool,
     ) -> Result<Vm> {
-        if uat_inner.fault.load(Ordering::Acquire) { return Err(EIO); }
+        if uat_inner.fault.as_ref().is_some_and(|fault| fault.load(Ordering::Acquire)) { return Err(EIO); }
         let fault = uat_inner.fault.clone();
         let dummy_obj = gem::new_kernel_object(dev, UAT_PGSZ)?;
         let is_kernel = ttb.is_some();
@@ -2889,7 +3135,7 @@ impl Vm {
 
 impl Drop for VmInner {
     fn drop(&mut self) {
-        if self.uat_inner.fault.load(Ordering::Acquire) {
+        if self.uat_inner.fault.as_ref().is_some_and(|fault| fault.load(Ordering::Acquire)) {
             self.page_table.quarantine();
             core::mem::forget(self.uat_inner.clone());
             return;
@@ -4350,7 +4596,7 @@ impl Uat {
 
     /// Binds a `Vm` to a slot, preferring the last used one.
     pub(crate) fn bind(&self, vm: &Vm) -> Result<VmBind> {
-        if self.inner.fault.load(Ordering::Acquire) { return Err(EIO); }
+        if self.inner.fault.as_ref().is_some_and(|fault| fault.load(Ordering::Acquire)) { return Err(EIO); }
         let mut binding = vm.binding.lock();
 
         if binding.binding.is_none() {
@@ -4481,7 +4727,7 @@ impl Uat {
 
     /// Creates the reference-counted inner data for a new `Uat` instance.
     #[inline(never)]
-    fn make_inner(dev: &driver::AsahiDevice, handoff_mode: HandoffMode) -> Result<Arc<UatInner>> {
+    fn make_inner(dev: &driver::AsahiDevice, handoff_mode: HandoffMode, m3: bool) -> Result<Arc<UatInner>> {
         let cached = !matches!(handoff_mode,HandoffMode::LazyFirmwareT8132|HandoffMode::FirmwareT6030);
         let handoff_rgn = Self::map_region(dev.as_ref(), c_str!("handoff"), HANDOFF_SIZE, cached)?;
         let ttbs_rgn = Self::map_region(dev.as_ref(), c_str!("ttbs"), SLOTS_SIZE, cached)?;
@@ -4492,7 +4738,11 @@ impl Uat {
 
         dev_info!(dev.as_ref(), "MMU: Initializing kernel page table\n");
 
-        let fault = Arc::new(AtomicBool::new(false), GFP_KERNEL)?;
+        let fault = if !m3 {
+            None
+        } else {
+            Some(Arc::new(AtomicBool::new(false), GFP_KERNEL)?)
+        };
         let shared_fault = fault.clone();
         Arc::pin_init(
             try_pin_init!(UatInner {
@@ -4812,7 +5062,7 @@ impl Uat {
             }
         }
 
-        let inner = Self::make_inner(dev, handoff_mode)?;
+        let inner = Self::make_inner(dev, handoff_mode, cfg.chip_id == 0x6030)?;
 
         let of_node = dev.as_ref().of_node().ok_or(EINVAL)?;
         let res = crate::m3_resources::reserved_resource(&of_node, c_str!("pagetables"))?;
@@ -4910,7 +5160,7 @@ impl Uat {
         inner.map_kernel_to_user = map_kernel_to_user;
         inner.kernel_ttb1 = ttb1;
 
-        inner.handoff().init(handoff_mode, cfg == UatConfig::T6030)?;
+        inner.handoff().init(handoff_mode, cfg.chip_id == 0x6030)?;
 
         dev_info!(dev.as_ref(), "MMU: Initializing TTBs\n");
 
