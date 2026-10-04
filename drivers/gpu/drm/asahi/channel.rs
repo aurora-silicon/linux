@@ -26,6 +26,7 @@ use crate::{
     mem,
     module_parameters, //
 };
+use core::sync::atomic::Ordering;
 use kernel::{
     c_str,
     prelude::*,
@@ -627,7 +628,51 @@ impl StatsChannel::ver {
                     let msg = unsafe { msg.msg };
                     cls_dev_dbg!(StatsCh, self.dev, "Stats: {:?}\n", msg);
                     if *module_parameters::stats_export.value() != 0 {
-                        self.snap.update_from(&msg);
+                        // Retain the latest values for /sys/class/drm/card*/
+                        // device/agx_stats. Read-only with respect to
+                        // scheduling or power behaviour: the firmware already
+                        // sent the message, we only keep what it said.
+                        match &msg {
+                            StatsMsg::Utilization {
+                                util1,
+                                util2,
+                                util3,
+                                util4,
+                                ..
+                            } => {
+                                self.snap.util1.store(*util1, Ordering::Relaxed);
+                                self.snap.util2.store(*util2, Ordering::Relaxed);
+                                self.snap.util3.store(*util3, Ordering::Relaxed);
+                                self.snap.util4.store(*util4, Ordering::Relaxed);
+                            }
+                            StatsMsg::PowerState { pstate, .. } => {
+                                self.snap.pstate.store(*pstate, Ordering::Relaxed);
+                            }
+                            StatsMsg::AvgPower { avg_power, .. } => {
+                                self.snap.avg_power_mw.store(*avg_power, Ordering::Relaxed);
+                            }
+                            StatsMsg::Temperature {
+                                raw_value, scale, ..
+                            } => {
+                                self.snap
+                                    .temperature_raw
+                                    .store(*raw_value, Ordering::Relaxed);
+                                self.snap.temperature_scale.store(*scale, Ordering::Relaxed);
+                            }
+                            StatsMsg::FwBusy { timestamp, .. } => {
+                                // Integrate successive FwBusy timestamps into
+                                // the cumulative busy_ns counter. The firmware
+                                // timestamp unit is nanoseconds on T6001
+                                // (13.5); other SoCs must validate the unit
+                                // against a controlled load.
+                                let ts = timestamp.0;
+                                let prev = self.snap.last_busy_ts.swap(ts, Ordering::Relaxed);
+                                if prev != 0 && ts >= prev {
+                                    self.snap.busy_ns.fetch_add(ts - prev, Ordering::Relaxed);
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 _ => {

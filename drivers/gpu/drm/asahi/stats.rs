@@ -6,7 +6,9 @@
 //! (see `fw::channels.rs::StatsMsg`) and exposes them to the sysfs file
 //! `agx_stats` (registered from `sysfs.c`).
 //!
-//! The snapshot is process-local and process-private. `update_from()` is called
+//! The snapshot is process-local and process-private. The firmware-stat
+//! decoder that feeds it lives in `StatsChannel::poll` (`channel.rs`), inside
+//! the versioned context where `StatsMsg` is nameable; `note_job()` is called
 //! from the `recv_message` rtkit callback (so the firmware mailbox IRQ
 //! context); the sysfs `show` callback runs in arbitrary process context. All
 //! fields use `AtomicU*` so neither side takes a lock.
@@ -31,8 +33,6 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::fw::channels::StatsMsg;
-
 /// Process-wide snapshot of AGX firmware stats.
 ///
 /// Lives in the `GpuManager`; the raw pointer is published to a module-level
@@ -51,7 +51,7 @@ pub(crate) struct StatsSnapshot {
     pub(crate) temperature_tmin: AtomicU32,
     pub(crate) temperature_tmax: AtomicU32,
     /// Last observed firmware busy timestamp (monotonic, firmware units).
-    last_busy_ts: AtomicU64,
+    pub(crate) last_busy_ts: AtomicU64,
     /// Cumulative nanoseconds the firmware reports itself as busy.
     pub(crate) busy_ns: AtomicU64,
     /// Completed submissions since boot, counted at fence signal in
@@ -67,91 +67,6 @@ pub(crate) struct StatsSnapshot {
 pub(crate) static SNAPSHOT_PTR: AtomicU64 = AtomicU64::new(0);
 
 impl StatsSnapshot {
-    /// Update retained fields from a `StatsMsg`. Called from
-    /// `StatsChannel::poll` after the existing debug-log, only when
-    /// `module_parameters::stats_export` is on.
-    pub(crate) fn update_from(&self, msg: &StatsMsg::ver) {
-        match *msg {
-            StatsMsg::Utilization {
-                timestamp: _,
-                util1,
-                util2,
-                util3,
-                util4,
-            } => {
-                self.util1.store(u32::from(util1), Ordering::Relaxed);
-                self.util2.store(u32::from(util2), Ordering::Relaxed);
-                self.util3.store(u32::from(util3), Ordering::Relaxed);
-                self.util4.store(u32::from(util4), Ordering::Relaxed);
-            }
-            StatsMsg::PowerState {
-                timestamp: _,
-                last_busy_ts: _,
-                active,
-                poweroff,
-                unk1: _,
-                pstate,
-                unk2: _,
-                unk3: _,
-            } => {
-                self.pstate.store(u32::from(pstate), Ordering::Relaxed);
-                // `active` / `poweroff` are debug-only flags (pwr state
-                // transitions); surface them via util later if useful.
-                let _ = (active, poweroff);
-            }
-            StatsMsg::AvgPower {
-                active_cs: _,
-                unk2: _,
-                unk3: _,
-                unk4: _,
-                avg_power,
-            } => {
-                self.avg_power_mw
-                    .store(u32::from(avg_power), Ordering::Relaxed);
-            }
-            StatsMsg::Temperature {
-                __pad: _,
-                raw_value,
-                scale,
-                tmin,
-                tmax,
-            } => {
-                self.temperature_raw
-                    .store(u32::from(raw_value), Ordering::Relaxed);
-                self.temperature_scale
-                    .store(u32::from(scale), Ordering::Relaxed);
-                self.temperature_tmin
-                    .store(u32::from(tmin), Ordering::Relaxed);
-                self.temperature_tmax
-                    .store(u32::from(tmax), Ordering::Relaxed);
-            }
-            StatsMsg::FwBusy { timestamp, busy } => {
-                let ts = u64::from(timestamp);
-                let prev = self.last_busy_ts.swap(ts, Ordering::Relaxed);
-                if prev != 0 && ts >= prev {
-                    let delta = ts - prev;
-                    // Add firmware timestamp units to busy_ns. The firmware
-                    // uses nanoseconds on T6001 (validated against an MLX
-                    // matmul); for other SoCs the unit may differ and the
-                    // field will be renamed.
-                    self.busy_ns.fetch_add(delta, Ordering::Relaxed);
-                }
-                let _ = busy; // currently unused; busy count is the delta above.
-            }
-            StatsMsg::PowerOn { .. } | StatsMsg::PowerOff { .. } | StatsMsg::PState { .. } => {
-                // Cumulative on/off times; not in the producer contract yet.
-            }
-            StatsMsg::Unk1(_)
-            | StatsMsg::Unk5(_)
-            | StatsMsg::Unk6(_)
-            | StatsMsg::Unk7(_)
-            | StatsMsg::Unk8(_)
-            | StatsMsg::TempSensor { .. } => {
-                // Unknowns / per-sensor temp; passed through silently.
-            }
-        }
-    }
-
     /// Bump the completed-submission counter (called from the queue
     /// completion path in `JobFence::command_complete`, NOT from the stats
     /// channel).
