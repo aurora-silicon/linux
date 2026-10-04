@@ -3075,6 +3075,20 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	dcp_disable_typec_work(dcp, true);
 	typec_mux_put(dcp->typec_mux);
 
+	if (dcp->fixed_connector_type == DRM_MODE_CONNECTOR_eDP) {
+		/* Registration runs asynchronously and its devres can belong
+		 * to the platform device rather than the component bind group.
+		 * Stop callbacks and userspace writes while the CRTC, RTKit and
+		 * IOMMU they use are still available.
+		 */
+		disable_work_sync(&dcp->bl_register_wq);
+		disable_work_sync(&dcp->bl_update_wq);
+		if (dcp->brightness.bl_dev) {
+			devm_backlight_device_unregister(dev, dcp->brightness.bl_dev);
+			dcp->brightness.bl_dev = NULL;
+		}
+	}
+
 	if (dcp->avep) {
 		av_service_disconnect(dcp);
 		afk_shutdown(dcp->avep);
@@ -3123,10 +3137,6 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		dcp->piodma = NULL;
 	}
 
-	if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
-		cancel_work_sync(&dcp->bl_register_wq);
-		cancel_work_sync(&dcp->bl_update_wq);
-	}
 	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
 	cancel_work_sync(&dcp->vblank_wq);
 
