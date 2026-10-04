@@ -30,8 +30,10 @@
  *  - keeps the PMP and PMS_SRAM domains on, as iBoot left them: the PTD the
  *    DCP firmware and the PMP share lives in that SRAM;
  *  - gives the PMP DART and mailbox the interrupt parent of the DCP mailbox.
- * If any of this cannot be done, the display nodes stay enabled but the PMP
- * is not added, and the display driver does not start.
+ * Everything the PMP needs is checked before the display nodes are enabled.
+ * On a machine other than the J516S, or if a check fails or the PMP cannot be
+ * added, the display nodes stay (or are put back) disabled and the display
+ * stays on the boot framebuffer.
  */
 
 #define pr_fmt(fmt) "apple-t6030-display: " fmt
@@ -237,6 +239,19 @@ static int __init gate_apply(struct device_node **np)
 		np[GATE_DCP], np[GATE_DISPLAY]);
 
 	return 0;
+}
+
+/* Disables the display nodes again when the PMP could not be added. */
+static void __init gate_revert(void)
+{
+	int ret = of_changeset_revert(&gate_cs);
+
+	if (ret) {
+		pr_err("could not disable the display nodes again: %d\n", ret);
+		return;
+	}
+	of_changeset_destroy(&gate_cs);
+	pr_info("display nodes disabled again, display stays on the boot framebuffer\n");
 }
 
 /* The single power domain of @np, if it is a T6030 power state. */
@@ -697,9 +712,12 @@ static int __init apple_t6030_display_gate(void)
 		return 0;
 	}
 
-	if (!gate_resolve(np) && !gate_apply(np) && !gate_pmp_resolve(np, ps, &aic) &&
-	    !gate_pmp_apply(np[GATE_DCP], ps, aic))
-		gate_dcpext();
+	if (!gate_resolve(np) && !gate_pmp_resolve(np, ps, &aic) && !gate_apply(np)) {
+		if (gate_pmp_apply(np[GATE_DCP], ps, aic))
+			gate_revert();
+		else
+			gate_dcpext();
+	}
 	of_node_put(aic);
 	for (i = 0; i < PMP_PS_NR; i++)
 		of_node_put(ps[i]);

@@ -157,11 +157,11 @@ config APPLE_T6030_DISPLAY_GATE
 	help
 	  The T6030 device tree keeps the internal display nodes disabled so
 	  the display stays on the boot framebuffer until the boot loader has
-	  validated the display handoff. This option enables those nodes
-	  before devices are created once the boot loader has marked the
-	  handoff as validated. On the J516S it also adds the power
-	  management processor from a built-in overlay. It does nothing on
-	  other SoCs. apple_t6030_display.enable=0 keeps the boot framebuffer.
+	  validated the display handoff. On the J516S this option enables
+	  those nodes before devices are created once the boot loader has
+	  marked the handoff as validated, and adds the power management
+	  processor from a built-in overlay. It does nothing on other
+	  machines. apple_t6030_display.enable=0 keeps the boot framebuffer.
 
 	  Say 'y' if you want the native display on M3 Pro MacBook Pros.
 
