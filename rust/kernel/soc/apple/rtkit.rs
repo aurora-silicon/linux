@@ -300,15 +300,7 @@ impl<T: Operations> RtKit<T> {
         to_result(unsafe { bindings::apple_rtkit_boot(self.rtk) })
     }
 
-    /// G17-only policy is intentionally unsupported in this M3/TB integration.
-    pub fn new_g17p(
-        _dev: &device::Device,
-        _mbox_name: Option<&'static CStr>,
-        _mbox_idx: usize,
-        _data: T::Data,
-    ) -> Result<Self> {
-        Err(crate::error::Error::from_errno(-(bindings::EOPNOTSUPP as i32)))
-    }
+
 
     /// Passive endpoint discovery is not supported in the M3 runtime path.
     pub fn new_epmap_only(

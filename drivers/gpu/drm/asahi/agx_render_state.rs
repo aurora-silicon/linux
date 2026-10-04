@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-use crate::g16_render::{BuildError, Geometry, Register, Stage};
+use crate::agx_render::{BuildError, Geometry, Register, Stage};
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Program { pub address: u64, pub resources: u64 }

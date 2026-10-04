@@ -120,11 +120,14 @@ impl Registered {
         let overlap = KBox::pin_init(directory.read_write_file(c"submit_overlap",
             SubmitOverlapView(runtime.completion_wait())), GFP_KERNEL)?;
         let shared = Arc::pin_init(new_mutex!(Some(runtime)), GFP_KERNEL)?;
+        if !drm.completion.populate(crate::m3_completion::Completion::new(shared.clone())?) {
+            return Err(EBUSY);
+        }
         let owner = Self { registration: KBox::pin_init(new_mutex!(None), GFP_KERNEL)?, shared: shared.clone(), health: health.clone(), _progress: progress, _activity: activity, _memory: memory, _timing: timing, _completion: completion, _overlap: overlap };
         let scheduler=Arc::new(drm::sched::Scheduler::new(drm.as_ref(),4,8,0,3000,kernel::c_str!("asahi_m3_sched"))?,GFP_KERNEL)?;
         let backend: Arc<dyn DrmGpu> = Arc::new(Backend { shared, health, scheduler, ids: gpu::SequenceIDs::default(),
             core_mask, max_frequency_khz }, GFP_KERNEL)?;
-        if !drm.gpu.populate(backend) { return Err(EBUSY); }
+        if !drm.gpu.populate(crate::drm_gpu::Backend::M3(backend)) { return Err(EBUSY); }
         if crate::m3_board::expose_render_node() {
             *owner.registration.lock() = Some(drm::driver::Registration::new(&drm, 0)?);
             dev_info!(pdev.as_ref(), "M3: firmware ready; common DRM GEM/VM frontend registered\n");
@@ -147,9 +150,7 @@ impl DrmGpu for Backend {
     fn ids(&self) -> &gpu::SequenceIDs { &self.ids }
     fn is_crashed(&self) -> bool { !self.health.healthy() }
     fn update_globals(&self) {}
-    fn service_g16_jobs(&self) {
-        if let Some(runtime)=Option::as_mut(&mut *self.shared.lock()) { runtime.service_events(); }
-    }
+
     fn supports_vm_status(&self) -> bool { true }
     fn supports_scheduled_queues(&self)->bool {true}
     fn submission_error(&self) -> i32 { if self.is_crashed() { EIO.to_errno() } else { 0 } }

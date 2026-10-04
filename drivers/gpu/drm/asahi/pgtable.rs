@@ -654,7 +654,7 @@ impl UatPageTable {
         self.ttb
     }
 
-    fn with_pages<F>(
+    fn with_pages_legacy<F>(
         &mut self,
         iova_range: Range<u64>,
         alloc: bool,

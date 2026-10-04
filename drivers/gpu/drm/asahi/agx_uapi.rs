@@ -10,26 +10,6 @@
 //! G17P render parameters or compute-entry operands. This module allocates no
 //! object, publishes no queue state, and performs no firmware or MMIO action.
 
-#[cfg(not(test))]
-use crate::{g17_compute, g17_render, g17_submission};
-#[cfg(test)]
-#[path = "g17_compute.rs"]
-mod g17_compute;
-#[cfg(test)]
-#[path = "g17_render.rs"]
-mod g17_render;
-#[cfg(test)]
-#[allow(dead_code)]
-#[path = "g17_submission.rs"]
-mod g17_submission;
-
-use g17_render::{
-    G17pRenderParameters, RenderBuildError, RenderDescriptorMetadata, RenderDescriptorObjects,
-};
-use g17_submission::{
-    G17PClBarrierDependency, G17PClKickEntryOperands, G17PClMcacheAperture, G17PClRceBinding,
-};
-
 pub(crate) const UAPI_COMMAND_HEADER_SIZE: usize = 8;
 pub(crate) const UAPI_RENDER_SIZE: usize = 256;
 pub(crate) const UAPI_COMPUTE_SIZE: usize = 64;
@@ -38,13 +18,6 @@ pub(crate) const UAPI_MAX_ATTACHMENTS: usize = 16;
 pub(crate) const UAPI_MAX_HARDWARE_COMMANDS: u32 = 64;
 pub(crate) const UAPI_BARRIER_NONE: u16 = 0xffff;
 pub(crate) const USC_WINDOW_SIZE: u64 = 1 << 32;
-#[cfg(not(test))]
-pub(crate) const COMPUTE_G17P_ADD3_PROOF: u32 =
-    kernel::uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_G17P_ADD3_PROOF as u32;
-#[cfg(test)]
-pub(crate) const COMPUTE_G17P_ADD3_PROOF: u32 = 1 << 0;
-const G17P_ADD3_BUFFER_BYTES: u64 = 64 * 4;
-
 const COMMAND_RENDER: u16 = 0;
 const COMMAND_COMPUTE: u16 = 1;
 const SET_VERTEX_ATTACHMENTS: u16 = 2;
@@ -96,20 +69,6 @@ pub(crate) enum UapiTranslateError {
     ProgramOffset,
     ZlsFields,
     StencilClearBits,
-    RenderBuild(RenderBuildError),
-    ComputeBuild(g17_compute::ComputeBuildError),
-}
-
-impl From<RenderBuildError> for UapiTranslateError {
-    fn from(value: RenderBuildError) -> Self {
-        Self::RenderBuild(value)
-    }
-}
-
-impl From<g17_compute::ComputeBuildError> for UapiTranslateError {
-    fn from(value: g17_compute::ComputeBuildError) -> Self {
-        Self::ComputeBuild(value)
-    }
 }
 
 impl UapiTranslateError {
@@ -146,8 +105,8 @@ impl UapiTranslateError {
             Self::ProgramOffset => "program-offset",
             Self::ZlsFields => "zls-fields",
             Self::StencilClearBits => "stencil-clear-bits",
-            Self::RenderBuild(_) => "render-build",
-            Self::ComputeBuild(_) => "compute-build",
+
+
         }
     }
 }
@@ -655,22 +614,6 @@ pub(crate) fn validate_attachments<A: GpuAddressSpace>(
     Ok(())
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct RenderInternalState {
-    pub(crate) parameters: G17pRenderParameters,
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct TranslatedRenderCommand {
-    pub(crate) flags: u32,
-    pub(crate) vdm_base: u64,
-    pub(crate) parameters: G17pRenderParameters,
-    pub(crate) vertex_attachments: UapiAttachmentList,
-    pub(crate) fragment_attachments: UapiAttachmentList,
-    pub(crate) vertex_timestamps: UapiTimestamps,
-    pub(crate) fragment_timestamps: UapiTimestamps,
-}
-
 pub(crate) fn validate_zls<A: GpuAddressSpace>(
     address_space: &A,
     value: UapiZlsBuffer,
@@ -721,237 +664,6 @@ pub(crate) fn validate_zls<A: GpuAddressSpace>(
     Ok(())
 }
 
-pub(crate) fn translate_render_command<A: GpuAddressSpace>(
-    command: UapiRenderCommand,
-    vertex_attachments: UapiAttachmentList,
-    fragment_attachments: UapiAttachmentList,
-    queue: QueueUscWindow,
-    address_space: &A,
-    internal: RenderInternalState,
-) -> Result<TranslatedRenderCommand, UapiTranslateError> {
-    if command.flags & !RENDER_FLAGS != 0 {
-        return Err(UapiTranslateError::FlagsUnknownBits);
-    }
-    // Genuinely unimplemented on G17P rather than merely unvalidated:
-    // `G17pRenderParameters` carries no helper-program fields at all, so
-    // VERTEX_SCRATCH has nowhere to put the scratch binding, and there is no
-    // cluster-count control for NO_VERTEX_CLUSTERING. A clean EINVAL beats
-    // rendering with the request silently dropped.
-    if command.flags & (RENDER_VERTEX_SCRATCH | RENDER_NO_VERTEX_CLUSTERING) != 0 {
-        return Err(UapiTranslateError::FlagsUnsupported);
-    }
-    // RSRC_SPEC_HI is *declarative*, and honouring it must not mean rejecting.
-    // The UAPI defines it as "the appended resource-specifier high dwords are
-    // present", and states its purpose: "This flag lets old kernels report an
-    // unsupported render payload instead of silently truncating 64-bit G17
-    // values." It exists for kernels that do NOT understand the dwords.
-    //
-    // This kernel does understand them -- `program()` ORs the high dword in
-    // unconditionally, with no reference to the flag -- so the flag cannot
-    // change what we do with a payload that sets it. The old check therefore
-    // refused payloads it would otherwise have handled identically, protecting
-    // nothing; it is the same bring-up leftover as the stencil-clear mask.
-    //
-    // Honour the documented meaning instead: when the flag is clear the high
-    // dwords are "not present", so mask them off rather than refuse the
-    // submission. A userspace built against the 240-byte upstream struct (whose
-    // payload `padded_payload` zero-fills) and one that clears the flag now
-    // behave identically, which is what "not present" has to mean.
-    let resource_spec_mask = if command.flags & RENDER_RSRC_SPEC_HI != 0 {
-        u64::MAX
-    } else {
-        u32::MAX as u64
-    };
-    if !(1..=16_384).contains(&command.width) || !(1..=16_384).contains(&command.height) {
-        return Err(UapiTranslateError::Dimensions);
-    }
-    if !(1..=2048).contains(&command.layers) {
-        return Err(UapiTranslateError::Layers);
-    }
-    if !matches!(
-        (command.utile_width, command.utile_height),
-        (32, 32) | (32, 16) | (16, 16)
-    ) {
-        return Err(UapiTranslateError::UtileDimensions);
-    }
-    let samples_log2 = match command.samples {
-        1 => 0,
-        2 => 1,
-        4 => 2,
-        _ => return Err(UapiTranslateError::Samples),
-    };
-    let utile_bytes = command.sample_size as u64
-        * command.utile_width as u64
-        * command.utile_height as u64
-        * command.samples as u64;
-    if utile_bytes > 32_768 {
-        return Err(UapiTranslateError::TilebufferSize);
-    }
-    let blocks_per_utile = utile_bytes.div_ceil(2048);
-
-    if command.vdm_base == 0 || command.vdm_base & 3 != 0 {
-        return Err(UapiTranslateError::AddressAlignment);
-    }
-    require_range(address_space, command.vdm_base, 4, GpuAccess::Read)?;
-
-    if command.scissor_base == 0 || command.scissor_base & 7 != 0 {
-        return Err(UapiTranslateError::AddressAlignment);
-    }
-    require_range(address_space, command.scissor_base, 8, GpuAccess::Read)?;
-    if command.depth_bias_base != 0 {
-        if command.depth_bias_base & 7 != 0 {
-            return Err(UapiTranslateError::AddressAlignment);
-        }
-        require_range(address_space, command.depth_bias_base, 8, GpuAccess::Read)?;
-    }
-    if command.occlusion_query_base != 0 {
-        if command.occlusion_query_base & 7 != 0 {
-            return Err(UapiTranslateError::AddressAlignment);
-        }
-        require_range(
-            address_space,
-            command.occlusion_query_base,
-            8,
-            GpuAccess::Write,
-        )?;
-    }
-    validate_zls(address_space, command.depth, command.layers)?;
-    validate_zls(address_space, command.stencil, command.layers)?;
-    validate_sampler(
-        address_space,
-        command.sampler_heap,
-        command.sampler_count as u32,
-    )?;
-    if command.vertex_helper
-        != (UapiHelperProgram {
-            binary: 0,
-            config: 0,
-            data: 0,
-        })
-        || command.fragment_helper
-            != (UapiHelperProgram {
-                binary: 0,
-                config: 0,
-                data: 0,
-            })
-    {
-        return Err(UapiTranslateError::HelperProgram);
-    }
-    // `isp_bgobjvals` is the *whole* ISP_BGOBJVALS register value, not just
-    // the stencil clear: the UAPI documents "the bottom 8-bits contain the
-    // stencil buffer clear value", and every Mesa backend unconditionally
-    // seeds the upper bits with 0x300 before OR-ing the clear in
-    // (hk_cmd_draw.c `render->cr.isp_bgobjvals = 0x300;`,
-    // agx_pipe.c `c->isp_bgobjvals = 0x300;`, d12_queue.c `0x300 | stencil`).
-    // The legacy queue path passes the field straight through to the firmware
-    // (queue/render.rs `let load_bgobjvals = cmdbuf.isp_bgobjvals as u64`), so
-    // rejecting anything above 0xff refused every real render pass while the
-    // in-tree render selftest -- which leaves the field zero -- was accepted.
-    // Accept the register value; `build_*_descriptor` re-asserts the 0x300
-    // bits with `stencil_clear_value | 0x300`, which is idempotent for the
-    // value userspace sends and still supplies 0x300 when it sends zero.
-
-    let background = queue.full_program(address_space, command.background.usc)?;
-    let end_of_tile = queue.full_program(address_space, command.end_of_tile.usc)?;
-    let partial_background = queue.full_program(address_space, command.partial_background.usc)?;
-    let partial_end_of_tile = queue.full_program(address_space, command.partial_end_of_tile.usc)?;
-    validate_attachments(address_space, &vertex_attachments)?;
-    validate_attachments(address_space, &fragment_attachments)?;
-
-    let utile_config = ((command.utile_width as u64 / 16) << 12)
-        | ((command.utile_height as u64 / 16) << 14)
-        | samples_log2;
-    let mut tile_config = 0x280;
-    if command.layers > 1 {
-        tile_config |= 1;
-    }
-    if command.flags & RENDER_PROCESS_EMPTY_TILES != 0 {
-        tile_config |= 0x1_0000;
-    }
-
-    let mut parameters = internal.parameters;
-    parameters.width = command.width as u32;
-    parameters.height = command.height as u32;
-    parameters.encoder = command.vdm_base;
-    parameters.layers = command.layers;
-    parameters.utile_width = command.utile_width;
-    parameters.utile_height = command.utile_height;
-    parameters.utile_config = utile_config;
-    parameters.multisample_control = command.multisample_control;
-    parameters.ppp_control = command.ppp_control as u64;
-    parameters.tib_blocks = blocks_per_utile;
-    parameters.tile_config = tile_config;
-    parameters.depth_dimensions = command.depth_dimensions as u64;
-    parameters.depth_buffer = command.depth.base;
-    parameters.depth_aux_buffer = command.depth.compression_base;
-    parameters.depth_stride = command.depth.stride as u64;
-    parameters.depth_aux_stride = command.depth.compression_stride as u64;
-    parameters.stencil_buffer = command.stencil.base;
-    parameters.stencil_aux_buffer = command.stencil.compression_base;
-    parameters.stencil_stride = command.stencil.stride as u64;
-    parameters.stencil_aux_stride = command.stencil.compression_stride as u64;
-    parameters.depth_flags = command.zls_control;
-    parameters.occlusion_query_base = command.occlusion_query_base;
-    parameters.scissor_array = command.scissor_base;
-    parameters.depth_bias_array = command.depth_bias_base;
-    parameters.sampler_array = command.sampler_heap;
-    parameters.sampler_count = command.sampler_count as u32;
-    parameters.process_empty_tiles = command.flags & RENDER_PROCESS_EMPTY_TILES != 0;
-    parameters.merge_upper_x_bits = command.merge_upper_x;
-    parameters.merge_upper_y_bits = command.merge_upper_y;
-    parameters.depth_clear_value_bits = command.depth_clear;
-    parameters.stencil_clear_value = command.stencil_clear;
-    parameters.load_pipeline_bind = g17p_bg_resource_spec(
-        command.background.resource_spec,
-        resource_spec_mask,
-        internal.parameters.bg_resource_prefix,
-    );
-    parameters.load_pipeline = background;
-    parameters.store_pipeline_bind = command.end_of_tile.resource_spec & resource_spec_mask;
-    parameters.store_pipeline = end_of_tile;
-    parameters.partial_load_pipeline_bind = g17p_bg_resource_spec(
-        command.partial_background.resource_spec,
-        resource_spec_mask,
-        internal.parameters.bg_resource_prefix,
-    );
-    parameters.partial_load_pipeline = partial_background;
-    parameters.partial_store_pipeline_bind =
-        command.partial_end_of_tile.resource_spec & resource_spec_mask;
-    parameters.partial_store_pipeline = partial_end_of_tile;
-
-    Ok(TranslatedRenderCommand {
-        flags: command.flags,
-        vdm_base: command.vdm_base,
-        parameters,
-        vertex_attachments,
-        fragment_attachments,
-        vertex_timestamps: command.vertex_timestamps,
-        fragment_timestamps: command.fragment_timestamps,
-    })
-}
-
-fn g17p_bg_resource_spec(resource_spec: u64, present_mask: u64, diagnostic_prefix: u64) -> u64 {
-    diagnostic_prefix | (resource_spec & present_mask)
-}
-
-pub(crate) fn build_render_descriptors(
-    command: &TranslatedRenderCommand,
-    objects: RenderDescriptorObjects,
-    tiling_metadata: RenderDescriptorMetadata,
-    fragment_metadata: RenderDescriptorMetadata,
-    tiling: &mut [u8],
-    fragment: &mut [u8],
-) -> Result<(), UapiTranslateError> {
-    g17_render::build_ta_descriptor(&command.parameters, objects, tiling_metadata, tiling)?;
-    g17_render::build_fragment_descriptor(
-        &command.parameters,
-        objects,
-        fragment_metadata,
-        fragment,
-    )?;
-    Ok(())
-}
-
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct TranslatedComputeCommand {
     pub(crate) usc_exec_base: u64,
@@ -961,7 +673,6 @@ pub(crate) struct TranslatedComputeCommand {
     pub(crate) sampler_heap: u64,
     pub(crate) sampler_count: u32,
     pub(crate) attachments: UapiAttachmentList,
-    pub(crate) g17p_add3_buffers: Option<[u64; 3]>,
     pub(crate) timestamps: UapiTimestamps,
 }
 
@@ -972,7 +683,7 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
     address_space: &A,
 ) -> Result<TranslatedComputeCommand, UapiTranslateError> {
     queue.validate()?;
-    if command.flags & !COMPUTE_G17P_ADD3_PROOF != 0 {
+    if command.flags != 0 {
         return Err(UapiTranslateError::FlagsUnknownBits);
     }
     if command.control_stream_base & 3 != 0
@@ -997,38 +708,6 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
     {
         return Err(UapiTranslateError::HelperProgram);
     }
-    let g17p_add3_buffers = if command.flags & COMPUTE_G17P_ADD3_PROOF != 0 {
-        let entries = attachments.as_slice();
-        if entries.len() != 3
-            || entries
-                .iter()
-                .any(|entry| entry.size < G17P_ADD3_BUFFER_BYTES)
-        {
-            return Err(UapiTranslateError::Add3ProofAttachments);
-        }
-        require_range(
-            address_space,
-            entries[0].address,
-            G17P_ADD3_BUFFER_BYTES,
-            GpuAccess::Read,
-        )?;
-        require_range(
-            address_space,
-            entries[1].address,
-            G17P_ADD3_BUFFER_BYTES,
-            GpuAccess::Read,
-        )?;
-        require_range(
-            address_space,
-            entries[2].address,
-            G17P_ADD3_BUFFER_BYTES,
-            GpuAccess::Write,
-        )?;
-        Some([entries[0].address, entries[1].address, entries[2].address])
-    } else {
-        validate_attachments(address_space, &attachments)?;
-        None
-    };
     Ok(TranslatedComputeCommand {
         usc_exec_base: queue.base,
         control_stream_base: command.control_stream_base,
@@ -1037,117 +716,6 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
         sampler_heap: command.sampler_heap,
         sampler_count: command.sampler_count,
         attachments,
-        g17p_add3_buffers,
         timestamps: command.timestamps,
     })
 }
-
-/// Queue-owned inputs that are independent of one userspace compute command.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct ComputeInternalState {
-    pub(crate) preempt_base: u64,
-    pub(crate) dispatch_identity: u64,
-    pub(crate) context_id: u32,
-    pub(crate) work_ordinal: u32,
-    pub(crate) robustness: u64,
-    pub(crate) operand_state_base: u64,
-    pub(crate) execution_gate: u64,
-}
-
-/// GPU addresses resolved from the UAPI timestamp handles while the object
-/// table is locked.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct ComputeTimestampAddresses {
-    pub(crate) start: u64,
-    pub(crate) end: u64,
-}
-
-/// A compute command owns exactly one start/end pair. Both words must be
-/// visible before the queue entry and its userspace fence can retire.
-pub(crate) const fn completed_compute_timestamps(start: u64, end: u64) -> Option<[u64; 2]> {
-    if start == 0 || end == 0 {
-        None
-    } else {
-        Some([start, end])
-    }
-}
-
-/// Build the complete selector-3 descriptor for a translated command.
-///
-/// This is the boundary that consumes the command's CDM range, sampler state,
-/// USC window, and timestamp destinations. The translated attachment list
-/// remains in `command` for the queue's reservation and lifetime tracking.
-pub(crate) fn build_compute_descriptor(
-    command: &TranslatedComputeCommand,
-    internal: ComputeInternalState,
-    objects: g17_compute::ComputeDescriptorObjects,
-    metadata: g17_compute::ComputeDescriptorMetadata,
-    timestamps: ComputeTimestampAddresses,
-    raw: &mut [u8],
-) -> Result<(), UapiTranslateError> {
-    let registers = g17_compute::build_compute_registers(
-        g17_compute::ComputeRegisterParameters {
-            preempt_base: internal.preempt_base,
-            cdm_base: command.control_stream_base,
-            usc_exec_base: command.usc_exec_base,
-            helper_binary: 0,
-            helper_data: 0,
-            helper_config: 0,
-            dispatch_identity: internal.dispatch_identity,
-            context_id: internal.context_id,
-            work_ordinal: internal.work_ordinal,
-            robustness: internal.robustness,
-            operand_state_base: internal.operand_state_base,
-            execution_gate: internal.execution_gate,
-        },
-    )?;
-    g17_compute::build_compute_descriptor(
-        &registers,
-        objects,
-        metadata,
-        g17_compute::ComputeDescriptorCommand {
-            cdm_terminator: command.control_stream_terminator,
-            sampler_array: command.sampler_heap,
-            sampler_count: command.sampler_count,
-            user_timestamp_start: timestamps.start,
-            user_timestamp_end: timestamps.end,
-        },
-        raw,
-    )?;
-    Ok(())
-}
-
-#[derive(Debug, Copy, Clone)]
-pub(crate) struct ComputeEntryContext<'a> {
-    pub(crate) descriptor_flag_4c: bool,
-    pub(crate) descriptor_flag_5c8: bool,
-    pub(crate) converted_command_timestamp: u64,
-    pub(crate) barriers: &'a [G17PClBarrierDependency],
-    pub(crate) mcache: Option<G17PClMcacheAperture>,
-    pub(crate) payload: [u64; 2],
-    pub(crate) event_mask: [u64; 4],
-    pub(crate) rce_kind: u8,
-    pub(crate) rce_bindings: [G17PClRceBinding; 4],
-    pub(crate) auxiliary: u64,
-}
-
-impl TranslatedComputeCommand {
-    pub(crate) const fn entry_operands<'a>(
-        &self,
-        context: ComputeEntryContext<'a>,
-    ) -> G17PClKickEntryOperands<'a> {
-        G17PClKickEntryOperands {
-            descriptor_flag_4c: context.descriptor_flag_4c,
-            descriptor_flag_5c8: context.descriptor_flag_5c8,
-            converted_command_timestamp: context.converted_command_timestamp,
-            barriers: context.barriers,
-            mcache: context.mcache,
-            payload: context.payload,
-            event_mask: context.event_mask,
-            rce_kind: context.rce_kind,
-            rce_bindings: context.rce_bindings,
-            auxiliary: context.auxiliary,
-        }
-    }
-}
-

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-use crate::{g16_render::Geometry, g16_render_state::{Program,DepthStencil},
+use crate::{agx_render::Geometry, agx_render_state::{Program,DepthStencil},
     m3_compute_layout::GpuVa, m3_init_layout::{Error,Region},
     m3_queue_layout::FirmwareVa, m3_render_sequence::fragment};
 pub(crate) const SIZE:usize=0xc73;
@@ -77,7 +77,7 @@ impl Command {
         let s=&self.state;let g=&s.geometry;
         let layer_metadata=self.heap.get().checked_add(if g.layers>1 {0x200}else{0}).ok_or(Error::Address)?;
         GpuVa::new(layer_metadata).map_err(|_|Error::Address)?;
-        let user=crate::g16_render_state::compact(self.scene_user.get().checked_add(0x40).ok_or(Error::Address)?)
+        let user=crate::agx_render_state::compact(self.scene_user.get().checked_add(0x40).ok_or(Error::Address)?)
             .map_err(|_|Error::Address)? & !15;
         let width=(g.pixels&0xffff)+1;let height=(g.pixels>>16)+1;
         let tx=(width+31)/32;let ty=(height+31)/32;

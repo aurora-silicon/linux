@@ -4,13 +4,10 @@
 
 
 #[cfg(not(test))]
-use crate::{g15_initdata, g17_rtkit};
+use crate::g15_initdata;
 #[cfg(test)]
 #[path = "g15_initdata.rs"]
 mod g15_initdata;
-#[cfg(test)]
-#[path = "g17_rtkit.rs"]
-mod g17_rtkit;
 
 /// Design generation that uses this single-role contract.
 const G15_GENERATION: u32 = 15;
@@ -80,9 +77,7 @@ const fn implemented_pre_handoff_evidence() -> u16 {
     // interface version is confirmed inside the apple-rtkit core window. The
     // G15 `GFX` image is not on disk, so that stays unconfirmed and this bit
     // fails closed independently of the shared codec constant.
-    if g17_rtkit::GROUNDED_CODEC_AVAILABLE
-        && g17_rtkit::EXECUTABLE_TRANSPORT_AVAILABLE
-        && G15_FIRMWARE_INTERFACE_VERSION_CONFIRMED
+    if G15_FIRMWARE_INTERFACE_VERSION_CONFIRMED
     {
         implemented |= missing::RTKIT_TRANSPORT;
     }
@@ -118,8 +113,11 @@ pub(crate) const G15_INITDATA_DOORBELL_ENDPOINT: u8 = 0x20;
 /// Compose the G15 init-data doorbell exactly as G17 does (the wire form is
 /// byte-identical: `(0x81 << 48) | (fw_va & 0xFFFFFFFFFFF)`). Delegates to the
 /// shared codec so the two never drift.
-pub(crate) const fn encode_initdata_doorbell(firmware_va: u64) -> Result<u64, g17_rtkit::WireError> {
-    g17_rtkit::encode_initdata_doorbell(firmware_va)
+pub(crate) const fn encode_initdata_doorbell(firmware_va: u64) -> Result<u64, ()> {
+    const MASK: u64 = (1 << 44) - 1;
+    let high = firmware_va & !MASK;
+    if high != 0 && high != !MASK { return Err(()); }
+    Ok((0x81 << 48) | (firmware_va & MASK))
 }
 
 
@@ -264,8 +262,6 @@ mod tests {
         // firmware's RTKit interface version cannot be confirmed offline.
         assert!(g15_initdata::GROUNDED_LAYOUT_AVAILABLE);
         assert!(!g15_initdata::BOOTABLE_LAYOUT_AVAILABLE);
-        assert!(g17_rtkit::GROUNDED_CODEC_AVAILABLE);
-        assert!(g17_rtkit::EXECUTABLE_TRANSPORT_AVAILABLE);
         assert!(!G15_FIRMWARE_INTERFACE_VERSION_CONFIRMED);
         assert!(missing.contains(missing::RTKIT_TRANSPORT));
     }
@@ -287,10 +283,6 @@ mod tests {
     #[test]
     fn initdata_doorbell_matches_the_shared_codec() {
         let va = 0x0123_4567_89ab;
-        assert_eq!(
-            encode_initdata_doorbell(va),
-            g17_rtkit::encode_initdata_doorbell(va)
-        );
         assert_eq!(
             encode_initdata_doorbell(va).unwrap(),
             0x0081_0000_0000_0000u64 | va

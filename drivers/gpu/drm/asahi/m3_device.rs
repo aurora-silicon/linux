@@ -5,10 +5,9 @@
 //! queues must be stopped before this object is released.
 
 use kernel::{
-    bindings, c_str,
+    c_str,
     device::Core,
     devres::Devres,
-    error::to_result,
     io::{
         mem::IoMem,
         Io,
@@ -29,7 +28,6 @@ pub(crate) struct Device {
     asc: Pin<KBox<Devres<IoMem<0x4000>>>>,
     sgx: Pin<KBox<Devres<IoMem>>>,
     firmware: Firmware,
-    power_vote: bool,
     core_mask: u32,
 }
 
@@ -57,13 +55,10 @@ impl Device {
         dev_info!(pdev.as_ref(), "M3: SGX aperture mapped\n");
         let pmp = crate::m3_board::has_pmp_link(pdev);
         if pmp {
-            // SAFETY: the platform device is live for the entire call. The C API
-            // creates a managed supplier link to the declared, ready PMP driver.
-            to_result(unsafe { bindings::apple_pmp_link_device(pdev.as_ref().as_raw()) })?;
-            dev_info!(pdev.as_ref(), "M3: PMP device linked\n");
-        } else {
-            dev_info!(pdev.as_ref(), "M3: no apple,pmp link; GPU power is left to its power domain\n");
+            dev_err!(pdev.as_ref(), "M3: optional apple,pmp GPU link is unsupported\n");
+            return Err(ENOTSUPP);
         }
+        dev_info!(pdev.as_ref(), "M3: no apple,pmp link; GPU power is left to its power domain\n");
         if asc.access(pdev.as_ref())?.read32(ASC_CPU_CONTROL) & ASC_CPU_RUN != 0 {
             dev_err!(
                 pdev.as_ref(),
@@ -76,15 +71,9 @@ impl Device {
             asc,
             sgx,
             firmware,
-            power_vote: false,
             core_mask: 0,
         };
-        if pmp {
-            // SAFETY: PMP lifetime is linked above. Command 0xf, logical device 5
-            // is the executed J514S AGX power contract; the bridge waits for ACK.
-            to_result(unsafe { bindings::apple_pmp_set_device_power(0x0f, 5, 1) })?;
-            device.power_vote = true;
-        }
+
         let registers = device.sgx.access(pdev.as_ref())?;
         let version = registers.try_read32(0xd04000)?;
         let counts = registers.try_read32(0xd04010)?;
@@ -356,32 +345,4 @@ impl Device {
         Ok(())
     }
 
-}
-
-impl Drop for Device {
-    fn drop(&mut self) {
-        if !self.power_vote {
-            return;
-        }
-        // Transport checks stop ASC before the RTKit client is released. Require
-        // that proof before relinquishing the inner power vote.
-        match self.asc.try_access() {
-            Some(asc) if asc.read32(ASC_CPU_CONTROL) & ASC_CPU_RUN == 0 => {}
-            _ => {
-                dev_err!(
-                    self.dev.as_ref(),
-                    "M3 G15S: cannot prove ASC stopped; retaining PMP vote\n"
-                );
-                return;
-            }
-        }
-        // SAFETY: the managed device link keeps PMP bound through remove.
-        if let Err(error) = to_result(unsafe { bindings::apple_pmp_set_device_power(0x0f, 5, 0) }) {
-            dev_err!(
-                self.dev.as_ref(),
-                "M3 G15S: PMP power release failed: {:?}\n",
-                error
-            );
-        }
-    }
 }

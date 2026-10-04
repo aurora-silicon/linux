@@ -58,99 +58,7 @@ const DEBUG_CLASS: DebugFlags = DebugFlags::File;
 
 pub(crate) const MAX_COMMANDS_PER_SUBMISSION: u32 = 64;
 
-fn t8140_simplefb_phys_range() -> Result<(usize, usize)> {
-    let chosen = of::chosen().ok_or(ENOENT)?;
-    let mut candidate = None;
 
-    for node in chosen.children() {
-        let compatible: KVec<u8> = match node.get_property(c_str!("compatible")) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        if compatible.as_slice()
-            != b"apple,simple-framebuffer\0simple-framebuffer\0"
-        {
-            continue;
-        }
-        if candidate.is_some() {
-            return Err(EINVAL);
-        }
-
-        let reg: KVec<u64> = node.get_property(c_str!("reg"))?;
-        let width: u32 = node.get_property(c_str!("width"))?;
-        let height: u32 = node.get_property(c_str!("height"))?;
-        let stride: u32 = node.get_property(c_str!("stride"))?;
-        let format: KVec<u8> = node.get_property(c_str!("format"))?;
-        if reg.len() != 2
-            || format.as_slice() != b"x8r8g8b8\0"
-            || width == 0
-            || height == 0
-            || stride < width.checked_mul(4).ok_or(EOVERFLOW)?
-        {
-            return Err(EINVAL);
-        }
-
-        let visible = usize::try_from(stride)?
-            .checked_mul(usize::try_from(height)?)
-            .ok_or(EOVERFLOW)?;
-        let mapped = align(visible as u64, mmu::UAT_PGSZ as u64);
-        let base = usize::try_from(reg[0])?;
-        let size = usize::try_from(reg[1])?;
-        let mapped = usize::try_from(mapped)?;
-        if base & mmu::UAT_PGMSK != 0 || visible > size {
-            return Err(EINVAL);
-        }
-        candidate = Some((base, mapped));
-    }
-
-    let (base, mapped) = candidate.ok_or(ENOENT)?;
-    let root = of::root().ok_or(ENOENT)?;
-    let mut reserved = None;
-    for node in root.children() {
-        let name: KVec<u8> = match node.get_property(c_str!("name")) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        if name.as_slice() == b"reserved-memory\0" {
-            if reserved.replace(node).is_some() {
-                return Err(EINVAL);
-            }
-        }
-    }
-    let reserved = reserved.ok_or(ENOENT)?;
-    let target_end = base.checked_add(mapped).ok_or(EOVERFLOW)?;
-    let mut covered = false;
-    for node in reserved.children() {
-        let compatible: KVec<u8> = match node.get_property(c_str!("compatible")) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        let no_map: KVec<u8> = match node.get_property(c_str!("no-map")) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        if compatible.as_slice() != b"framebuffer\0" || !no_map.is_empty() {
-            continue;
-        }
-        let reg: KVec<u64> = node.get_property(c_str!("reg"))?;
-        if reg.len() != 2 {
-            return Err(EINVAL);
-        }
-        let reserve_base = usize::try_from(reg[0])?;
-        let reserve_size = usize::try_from(reg[1])?;
-        let reserve_end = reserve_base.checked_add(reserve_size).ok_or(EOVERFLOW)?;
-        if reserve_base <= base && target_end <= reserve_end {
-            if covered {
-                return Err(EINVAL);
-            }
-            covered = true;
-        }
-    }
-    if !covered {
-        return Err(EINVAL);
-    }
-    Ok((base, mapped))
-}
 
 /// A client instance of an `mmu::Vm` address space.
 struct Vm {
@@ -291,7 +199,7 @@ pub(crate) struct File {
     queues: xarray::XArray<Arc<Mutex<KBox<dyn queue::Queue>>>>,
     // #[pin]
     objects: xarray::XArray<KBox<Object>>,
-    m3_client: crate::m3_client::ClientGate,
+    m3_client: Option<crate::m3_client::ClientGate>,
 }
 
 /// Convenience type alias for our DRM `File` type.
@@ -342,7 +250,7 @@ impl File {
                 xarray::XArray::<KBox<Object>>::new(xarray::AllocKind::Alloc1)
                     .__pinned_init(raw_objects)?;
 
-                addr_of_mut!((*slot).m3_client).write(crate::m3_client::ClientGate::new());
+                addr_of_mut!((*slot).m3_client).write(if device.is_m3 { Some(crate::m3_client::ClientGate::new()) } else { None });
                 (*slot).id = id;
                 Ok(())
             })
@@ -378,11 +286,11 @@ impl File {
 
         let gpu = device.gpu()?;
 
-        if data.param_group == crate::g17_status::PARAM_GROUP_VM_STATUS {
+        if data.param_group == crate::agx_status::PARAM_GROUP_VM_STATUS {
             return Self::get_vm_status(device, data, file);
         }
-        if data.param_group == crate::g17_queue_limits::PARAM_GROUP_QUEUE_LIMITS {
-            if data.pad != 0 || data.size < crate::g17_queue_limits::QUEUE_LIMITS_SIZE as u64 {
+        if data.param_group == crate::agx_queue_limits::PARAM_GROUP_QUEUE_LIMITS {
+            if data.pad != 0 || data.size < crate::agx_queue_limits::QUEUE_LIMITS_SIZE as u64 {
                 return Err(EINVAL);
             }
             let bytes = gpu.independent_queue_limits().ok_or(EINVAL)?;
@@ -428,10 +336,10 @@ impl File {
         };
 
         if gpu.supports_vm_status() {
-            params.features |= crate::g17_status::FEATURE_VM_STATUS;
+            params.features |= crate::agx_status::FEATURE_VM_STATUS;
         }
         if gpu.independent_queue_limits().is_some() {
-            params.features |= crate::g17_queue_limits::FEATURE_INDEPENDENT_QUEUES;
+            params.features |= crate::agx_queue_limits::FEATURE_INDEPENDENT_QUEUES;
         }
         if gpu.supports_scheduled_queues() {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SCHEDULED_QUEUES as u64;
@@ -462,7 +370,7 @@ impl File {
             core::slice::from_raw_parts(&params as *const _ as *const u8, size)
         })?;
 
-        file.inner().m3_client.note_params(data.size);
+        if let Some(gate) = &file.inner().m3_client { gate.note_params(data.size); }
         Ok(0)
     }
 
@@ -470,7 +378,7 @@ impl File {
     /// File-local lookup enforces VM ownership. Status survives queue teardown.
     fn get_vm_status(device: &AsahiDevice, data: &uapi::drm_asahi_get_params,
                      file: &DrmFile) -> Result<u32> {
-        use crate::g17_status::{decode_request, encode_response, VM_STATUS_SIZE};
+        use crate::agx_status::{decode_request, encode_response, VM_STATUS_SIZE};
         if !device.gpu()?.supports_vm_status() { return Err(EINVAL); }
         if data.pad != 0 || data.size < VM_STATUS_SIZE as u64 { return Err(EINVAL); }
         let user = UserPtr::from_addr(data.pointer as _);
@@ -481,7 +389,7 @@ impl File {
             let vms = file.inner().vms();
             let guard = vms.lock();
             let vm = guard.get(vm_id as usize).ok_or(ENOENT)?;
-            vm.vm.status().clone()
+            vm.vm.status()?.clone()
         };
         status.record(device.gpu()?.submission_error());
         let bytes = encode_response(vm_id, status.get());
@@ -495,7 +403,7 @@ impl File {
         data: &mut uapi::drm_asahi_vm_create,
         file: &DrmFile,
     ) -> Result<u32> {
-        file.inner().m3_client.admit_vm(device)?;
+        if let Some(gate) = &file.inner().m3_client { gate.admit_vm(device)?; }
         let kernel_range = data.kernel_start..data.kernel_end;
         let user_range = device.gpu()?.user_range()?;
 
@@ -520,33 +428,6 @@ impl File {
         let gpu = device.gpu()?;
         let file_id = file.inner().id;
         let vm = gpu.new_vm(kernel_range.clone())?;
-
-        let simplefb_iova = *module_parameters::g17p_simplefb_iova.value();
-        if simplefb_iova != 0 {
-            if gpu.params()?.chip_id != 0x8140 {
-                return Err(ENOTSUPP);
-            }
-            let (simplefb_phys, simplefb_size) = t8140_simplefb_phys_range()?;
-            let simplefb_end = simplefb_iova
-                .checked_add(simplefb_size as u64)
-                .ok_or(EOVERFLOW)?;
-            let simplefb_range = simplefb_iova..simplefb_end;
-            if simplefb_iova & mmu::UAT_PGMSK as u64 != 0
-                || !user_range.is_superset(simplefb_range.clone())
-                || kernel_range.overlaps(simplefb_range.clone())
-                || vm.driver_range_overlaps(simplefb_range)
-            {
-                return Err(EINVAL);
-            }
-            vm.install_simplefb_mapping(simplefb_iova, simplefb_phys, simplefb_size)?;
-            dev_info!(
-                device,
-                "G17P simplefb: retained GPU alias {:#x}:{:#x} -> phys {:#x}\n",
-                simplefb_iova,
-                simplefb_size,
-                simplefb_phys,
-            );
-        }
 
         let vm_xa = file.inner().vms();
         let resv = vm_xa.lock().reserve_limit(1..=u32::MAX, GFP_KERNEL)?;
@@ -873,18 +754,7 @@ impl File {
             return Err(EINVAL);
         }
 
-        vm.validate_t8140_native_context_binding(data.addr, data.range, single_page)?;
         vm.bind_object(&bo, data.addr, data.range, data.offset, prot, single_page)?;
-        // G17P secure GART has a second, context-0 view for fixed resource
-        // subranges. Record backing identity here, but do not publish the
-        // global context-0 aliases until this VM owns a render submission.
-        vm.track_t8140_native_context_binding(
-            bo.clone(),
-            data.addr,
-            data.range,
-            data.offset,
-        )?;
-
         vm.bo_deferred_cleanup();
 
         Ok(0)
@@ -958,7 +828,7 @@ impl File {
         }
 
         vm.unmap_range(range.start, range.range())?;
-        vm.untrack_t8140_native_context_range(range);
+
 
         vm.bo_deferred_cleanup();
 
@@ -978,7 +848,7 @@ impl File {
                     let vm = file_vm.borrow().vm.clone();
                     core::mem::drop(file_vm);
                     vm.drop_mappings(bo)?;
-                    vm.untrack_t8140_native_context_object(bo);
+
                     if idx == usize::MAX {
                         break;
                     }

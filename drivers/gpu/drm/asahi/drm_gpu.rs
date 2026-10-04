@@ -2,7 +2,7 @@
 
 //! Generation-neutral DRM-facing GPU operations.
 //!
-//! The legacy manager remains unchanged behind [`LegacyDrmGpu`]. T8140 uses
+//! The legacy manager remains unchanged behind [`LegacyDrmGpu`]. M3 uses
 //! the same file and ioctl layer through its own adapter without pretending to
 //! be an AGX2 firmware manager.
 
@@ -43,7 +43,6 @@ pub(crate) trait DrmGpu: Send + Sync {
     /// Permanent submission-domain failure; querying must not reset firmware.
     fn submission_error(&self) -> i32 { 0 }
     fn update_globals(&self);
-    fn service_g16_jobs(&self) {}
     fn params(&self) -> Result<DrmGpuParams>;
     fn user_range(&self) -> Result<Range<u64>>;
     fn unknown_page(&self) -> Result<u64>;
@@ -63,13 +62,28 @@ pub(crate) trait DrmGpu: Send + Sync {
         range: Range<usize>,
     ) -> Result<mmu::KernelMapping>;
 
-    /// Legacy-only operations reached by objects that cannot exist on G17P.
+    /// Legacy-only operations reached by objects that cannot exist on M3.
     fn legacy_manager(&self) -> Option<&Arc<dyn gpu::GpuManager>> {
         None
     }
     fn free_context(&self, _data: KBox<fw::types::GpuObject<fw::workqueue::GpuContextData>>) {}
     fn fwctl(&self, _msg: fw::channels::FwCtlMsg) -> Result {
         Err(ENODEV)
+    }
+}
+
+/// Publish an existing manager without allocating another reference-counted adapter.
+pub(crate) enum Backend {
+    Legacy(LegacyDrmGpu),
+    M3(Arc<dyn DrmGpu>),
+}
+
+impl Backend {
+    pub(crate) fn gpu(&self) -> &dyn DrmGpu {
+        match self {
+            Self::Legacy(manager) => manager,
+            Self::M3(runtime) => &**runtime,
+        }
     }
 }
 

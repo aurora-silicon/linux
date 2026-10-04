@@ -5,7 +5,7 @@ use crate::m3_queue_layout as queue;
 use crate::m3_state_layout as state;
 use crate::{m3_compute_layout as command, m3_compute_sequence as microsequence,
     m3_pool_layout::GpuRegion, m3_init_layout::Region};
-use crate::{driver,mmu,g16_memory::{self},m3_memory::Buffer,m3_compute_storage as storage};
+use crate::{driver,mmu,agx_memory::{self},m3_memory::Buffer,m3_compute_storage as storage};
 use crate::m3_timeline as timeline;
 use storage::{NOTIFIER,PREEMPTION,GPU_CONTEXT,JOB_LIST,QUEUE_SCRATCH,TIMESTAMPS,
     TAIL_SCRATCH,MICROSEQUENCE_SCRATCH,Mapping};
@@ -39,7 +39,7 @@ pub(crate) struct Compute {
 }
 impl Compute {
     pub(crate) fn new(dev: &driver::AsahiDevice, uat: &mmu::Uat, vm: &mmu::Vm,
-        stats: Region, control: crate::g16_compute::Control) -> Result<Self> {
+        stats: Region, control: crate::agx_compute::Control) -> Result<Self> {
         let binding=uat.bind(vm)?;
         let mut objects=KVec::new();
         let mut client_command=None;
@@ -91,7 +91,7 @@ impl Compute {
         let mut stream=[0u8;48];
         vm.read_bytes(control.base,&mut stream)?;
         dev_info!(dev.as_ref(),"M3 client CDM bytes={:02x?}\n",stream);
-        g16_memory::publish();
+        agx_memory::publish();
         // Match the qualified lab's complete publication sequence, including
         // completion of WC TTBAT stores before broadcasting invalidation.
         crate::mem::sync();crate::mem::tlbi_all();crate::mem::sync();
@@ -99,7 +99,7 @@ impl Compute {
         Ok(Self {_client_command:client_command.ok_or(EINVAL)?,objects,command_bytes,sequence_bytes,_binding:binding,stats,last_progress_ns:0,sequence:1,head:1,cached_views:KVec::new(),slot:0,batch_count:1,checkpoint:(0,0,0)})
     }
     fn encode_command(objects: &mut [Buffer], bytes: &mut [u8], context: u32,
-        control: crate::g16_compute::Control, sequence: u64, slot: usize) -> Result {
+        control: crate::agx_compute::Control, sequence: u64, slot: usize) -> Result {
         let offset = |owner:usize| storage::slot_offset(owner,slot).map_err(|_|EINVAL);
         let fw = |owner: usize| queue::FirmwareVa::new(objects[owner].va()+offset(owner)? as u64).map_err(|_| EINVAL);
         let preemption = &objects[PREEMPTION];
@@ -156,7 +156,7 @@ impl Compute {
         objects[PREEMPTION].fill(0xcc)
     }
     pub(crate) fn replay(&mut self, uat: &mmu::Uat, vm: &mmu::Vm,
-        control: crate::g16_compute::Control) -> Result {
+        control: crate::agx_compute::Control) -> Result {
         if !self.complete()? { return Err(EBUSY); }
         // All prior flushed stamps/events and engine idle were checked by
         // Runtime before entry. Keep pool/queue ownership, remap only client
@@ -203,7 +203,7 @@ impl Compute {
     /// Append only while the previous batch is fully retired and this one
     /// remains unpublished. Firmware serializes each command, including its
     /// original completion flush, in this one compute queue.
-    pub(crate) fn append(&mut self,control:crate::g16_compute::Control)->Result {
+    pub(crate) fn append(&mut self,control:crate::agx_compute::Control)->Result {
         if self.batch_count>=storage::SLOTS {return Err(E2BIG);}
         self.slot=self.batch_count;
         for i in storage::RESET {
@@ -223,7 +223,7 @@ impl Compute {
         self.head=(self.head+1)%queue::QUALIFIED_CAPACITY as u16;
         self.batch_count+=1;
         self.objects[storage::QUEUE_STATE].u32(queue::WRITE,u32::from(self.head))?;
-        g16_memory::publish();crate::mem::sync();crate::mem::tlbi_all();crate::mem::sync();
+        agx_memory::publish();crate::mem::sync();crate::mem::tlbi_all();crate::mem::sync();
         Ok(())
     }
     /// Roll back producer state before any SubmitQueue publication. Old ring
@@ -234,7 +234,7 @@ impl Compute {
         self.objects[storage::EVENT].u32(0,self.sequence as u32)?;
         self.objects[storage::COUNTER].u32(0,self.sequence as u32)?;
         self.objects[storage::QUEUE_STATE].u32(queue::WRITE,u32::from(self.head))?;
-        g16_memory::publish();Ok(())
+        agx_memory::publish();Ok(())
     }
     fn offset(&self,owner:usize)->Result<usize> {
         storage::slot_offset(owner,self.slot).map_err(|_|EINVAL)
@@ -247,7 +247,7 @@ impl Compute {
         let command=self.offset(storage::COMMAND)?;
         self.objects[storage::MICROSEQUENCE].u32(sequence+microsequence::GENERATION,0)?;
         self.objects[storage::COMMAND].u32(command+command::FLUSH_STAMPS,u32::from(!coalesce))?;
-        g16_memory::publish();Ok(())
+        agx_memory::publish();Ok(())
     }
     pub(crate) fn set_user_timestamps(&mut self,addresses:[u64;2])->Result {
         let offset=self.offset(storage::COMMAND)?+command::USER_TIMESTAMPS;
@@ -258,13 +258,13 @@ impl Compute {
         for start in [microsequence::TIMESTAMP_START,microsequence::TIMESTAMP_END] {
             self.objects[storage::MICROSEQUENCE].u64(sequence+start+microsequence::USER_TIMESTAMP_POINTER,pointer)?;
         }
-        g16_memory::publish();Ok(())
+        agx_memory::publish();Ok(())
     }
-    pub(crate) fn set_attachments(&mut self,attachments:&crate::g16_attachments::Attachments)->Result {
+    pub(crate) fn set_attachments(&mut self,attachments:&crate::agx_attachments::Attachments)->Result {
         let sequence=self.offset(storage::MICROSEQUENCE)?;
         self.objects[storage::MICROSEQUENCE].write(sequence+microsequence::ATTACHMENTS,&attachments.0)?;
         self.objects[storage::MICROSEQUENCE].write(sequence+microsequence::HAS_ATTACHMENTS,&[u8::from(attachments.count()!=0)])?;
-        g16_memory::publish();Ok(())
+        agx_memory::publish();Ok(())
     }
     fn stamp(&self) -> u32 { timeline::stamp(0xc1000000,self.sequence) }
     pub(crate) fn gpu_ns(&mut self)->Result<u64> {

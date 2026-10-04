@@ -6,7 +6,7 @@ use crate::m3_init_storage as storage;
 use storage::{REGION_A,RUNTIME_POINTERS,HARDWARE_DATA,UNKNOWN_PAIR,UNKNOWN_SMALL,
     UNKNOWN_C0,UNKNOWN_C1,UNKNOWN_C3,GLOBALS,GLOBALS_POWER,CONTROL_REGION,RUNTIME_FLAGS,
     FW_CONTROL_STATE,FW_CONTROL_RING};
-use crate::{driver,g16_memory::{self},m3_memory::Buffer,mmu,pgtable::prot};
+use crate::{driver,agx_memory::{self},m3_memory::Buffer,mmu,pgtable::prot};
 
 /// The root, runtime-pointer and firmware-control records, encoded for the owners
 /// `region` describes. Config uploads them for its own allocations; the device-tree
@@ -47,7 +47,7 @@ impl Records {
 pub(crate) struct Config {
     objects: KVec<Buffer>,
     #[cfg(CONFIG_DEV_COREDUMP)]
-    fault_reserve: Option<crate::g16_fault::Dump>,
+    fault_reserve: Option<crate::agx_fault::Dump>,
     _iomaps: KVec<mmu::KernelMapping>,
     pub(crate) completed_events: u64,
     pstates: crate::m3_adt_config::PstateWatch,
@@ -120,7 +120,7 @@ impl Config {
         dev_info!(dev.as_ref(), "M3: firmware TA progress-check interval=100\n");
         // RTKit 2419 +2de48..2dec8 accepts user timestamp stores only
         // within the 64 MiB arena at HwDataB+28. Match map_timestamp().
-        objects[HARDWARE_DATA].u64(0x28,g16_memory::TIMESTAMP_RANGE.start)?;
+        objects[HARDWARE_DATA].u64(0x28,agx_memory::TIMESTAMP_RANGE.start)?;
         // RTKit 2419 HwDataA follows the 0x4580-byte HwDataB. Request the
         // boot performance state through firmware (asahi.m3_boot_pstate) and cap
         // the states it may use (asahi.m3_max_pstate), retaining the voltage
@@ -137,10 +137,10 @@ impl Config {
         objects[RUNTIME_FLAGS].u32(0,u32::from(crate::debug::debug_enabled(
             crate::debug::DebugFlags::SubmitTiming)))?;
         crate::m3_adt_config::check_upload(dev.as_ref(), firmware, &mut objects)?;
-        g16_memory::publish();
+        agx_memory::publish();
         let thermal = crate::m3_thermal::Governor::new(dev.as_ref(), &contents.pstates)?;
         #[cfg(CONFIG_DEV_COREDUMP)]
-        let fault_reserve = match crate::g16_fault::Dump::new_m3() {
+        let fault_reserve = match crate::agx_fault::Dump::new_m3() {
             Ok(dump) => Some(dump),
             Err(error) => {
                 dev_warn!(dev.as_ref(), "M3: fault snapshot reserve unavailable: {:?}\n", error);
@@ -195,9 +195,9 @@ impl Config {
         message[20..22].copy_from_slice(&head.to_le_bytes());
         message[22]=event;message[23]=u8::from(new); // New queue; caller selected the event slot.
         self.objects[ring].write(w as usize*0x18,&message)?;
-        g16_memory::publish();
+        agx_memory::publish();
         self.objects[state].u32(0x20,(w+1)%256)?;
-        g16_memory::publish();
+        agx_memory::publish();
         Ok(())
     }
     pub(crate) fn pipes_idle(&mut self) -> Result<bool> {
@@ -234,9 +234,9 @@ impl Config {
     pub(crate) fn resume_halted(&mut self) -> Result {
         let control=&mut self.objects[CONTROL_REGION];
         control.u32(0x4590,0)?;
-        g16_memory::publish();
+        agx_memory::publish();
         control.u32(0x45a0,1)?;
-        g16_memory::publish();
+        agx_memory::publish();
         Ok(())
     }
     /// Read-only snapshot of the firmware's recovery words in the control
@@ -264,10 +264,10 @@ impl Config {
         let mut bytes = [0; 0x38];
         bytes[..4].copy_from_slice(&opcode.to_le_bytes());
         self.objects[storage::DEVICE_CONTROL*2+1].write(w as usize * 0x38, &bytes)?;
-        g16_memory::publish();
+        agx_memory::publish();
         let next = (w + 1) % 256;
         self.objects[storage::DEVICE_CONTROL*2].u32(0x20, next)?;
-        g16_memory::publish();
+        agx_memory::publish();
         Ok(next)
     }
     pub(crate) fn control_done(&mut self, next: u32) -> Result<bool> {

@@ -17,7 +17,6 @@ config DRM_ASAHI
 	depends on IOMMU_SUPPORT
 	depends on PAGE_SIZE_16KB
 	select APPLE_PMP_REPORT
-	select APPLE_PMP
 	select CRYPTO_LIB_SHA256
 	select RUST_DRM_SCHED
 	select RUST_DRM_GEM_SHMEM_HELPER

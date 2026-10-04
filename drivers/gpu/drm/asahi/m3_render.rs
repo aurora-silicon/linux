@@ -7,7 +7,7 @@ use crate::m3_scene_layout as scene;
 use crate::{m3_pass::{Pass,ViewOwner},m3_pass_layout::{self as pass_layout,Field as P,Space}};
 use crate::{m3_fragment_command as fragment, m3_tiler_command as tiler, m3_render_sequence as sequence, m3_init_layout::Region};
 use crate::{m3_parameter_layout as parameter, m3_pool_layout::GpuRegion};
-use crate::{driver,mmu,pgtable::prot,m3_memory::Buffer,m3_shared_layout as s,g17_uapi};
+use crate::{driver,mmu,pgtable::prot,m3_memory::Buffer,m3_shared_layout as s,agx_uapi};
 use crate::m3_timeline as timeline;
 use s::{PB_FIRST,PB_GROUPS,PB_BLOCKS_PER_GROUP,PB_BLOCK_SIZE};
 const PB_BLOCKS:u32=(PB_GROUPS*PB_BLOCKS_PER_GROUP) as u32;
@@ -89,7 +89,7 @@ impl Render {
         job.initialize_state()?;
         job.initialize_queues()?;
         dev_info!(dev.as_ref(),"M3 native render storage initialized, PB={} MiB\n",PB_BLOCKS as usize*PB_BLOCK_SIZE/(1024*1024));
-        crate::g16_memory::publish();crate::mem::sync();crate::mem::tlbi_all();crate::mem::sync();
+        crate::agx_memory::publish();crate::mem::sync();crate::mem::tlbi_all();crate::mem::sync();
         unsafe {core::arch::asm!("isb",options(nostack,preserves_flags))};
         Ok(job)
     }
@@ -208,7 +208,7 @@ impl Render {
     }
     // Prepare each private command after its retired slot is reset. The
     // reusable host staging allocation is copied before the next slot is built.
-    fn prepare_tiler(&mut self,r:g17_uapi::UapiRenderCommand,draw:u64)->Result {
+    fn prepare_tiler(&mut self,r:agx_uapi::UapiRenderCommand,draw:u64)->Result {
         use crate::m3_compute_layout::GpuVa;
         let pass=&self.passes[self.slot];
         let shared=|index:usize| queue::FirmwareVa::new(self.objects[index].va()).map_err(|_|EINVAL);
@@ -232,7 +232,7 @@ impl Render {
             user_timestamps:[fw(P::TilerUserStart)?,fw(P::TilerUserEnd)?],preemption:[gpu(P::Preemption0)?,gpu(P::Preemption1)?,gpu(P::Preemption2)?],
             tilemap:gpu(P::Tilemap)?,tpc:gpu(P::Tpc)?,tpc_bytes:g.tpc_bytes,heap:gpu(P::HeapMetadata)?,
             scene_user:gpu(P::SceneUser)?,initial_scene_entry,geometry:g,page_count:PB_PAGES,
-            vdm:crate::g16_render_state::compact(r.vdm_base).map_err(|_|EINVAL)?,
+            vdm:crate::agx_render_state::compact(r.vdm_base).map_err(|_|EINVAL)?,
             multisample:r.multisample_control,ppp:r.ppp_control,process_empty_tiles:r.flags&2!=0,
         };
         value.encode(&mut self.tiler_bytes).map_err(|_|EINVAL)?;
@@ -272,16 +272,16 @@ impl Render {
         self.objects[NOTIFIER].u32(state::NOTIFIER_CONTEXT, context)?;
         Ok(())
     }
-    fn geometry(r:g17_uapi::UapiRenderCommand)->Result<crate::g16_render::Geometry> {
-        use crate::g16_render::{Geometry,Utile};
+    fn geometry(r:agx_uapi::UapiRenderCommand)->Result<crate::agx_render::Geometry> {
+        use crate::agx_render::{Geometry,Utile};
         let x=if r.utile_width==16 {Utile::Pixels16} else {Utile::Pixels32};
         let y=if r.utile_height==16 {Utile::Pixels16} else {Utile::Pixels32};
         let mut g=Geometry::new_layered(u32::from(r.width),u32::from(r.height),x,y,2,r.layers).map_err(|_|EINVAL)?;
         g.set_samples(r.samples).map_err(|_|EINVAL)?;
         Ok(g)
     }
-    fn prepare_fragment(&mut self,r:g17_uapi::UapiRenderCommand,usc:u64,draw:u64)->Result {
-        use crate::{m3_compute_layout::GpuVa,g16_render_state::{Program,DepthStencil}};
+    fn prepare_fragment(&mut self,r:agx_uapi::UapiRenderCommand,usc:u64,draw:u64)->Result {
+        use crate::{m3_compute_layout::GpuVa,agx_render_state::{Program,DepthStencil}};
         let pass=&self.passes[self.slot];
         let shared=|index:usize| queue::FirmwareVa::new(self.objects[index].va()).map_err(|_|EINVAL);
         let fw=|field:P| queue::FirmwareVa::new(pass.get(field).va()).map_err(|_|EINVAL);
@@ -290,7 +290,7 @@ impl Render {
         let command=pass.get(P::FragmentCommand);
         let geometry=Self::geometry(r)?;
         let mask=if r.flags&16!=0 {u64::MAX} else {u32::MAX as u64};
-        let program=|p:g17_uapi::UapiProgram|->Result<Program> {Ok(Program {
+        let program=|p:agx_uapi::UapiProgram|->Result<Program> {Ok(Program {
             address:usc.checked_add(u64::from(p.usc&!63)).ok_or(EOVERFLOW)?,resources:p.resource_spec&mask,
         })};
         let tilebuffer_control=(u32::from(r.sample_size)*u32::from(r.utile_width)*u32::from(r.utile_height)*u32::from(r.samples)).div_ceil(2048)
@@ -334,7 +334,7 @@ impl Render {
             self.passes[self.slot].get_mut(sequence).u64(start+sequence::USER_TIMESTAMP_POINTER,pointer)?;
             self.passes[self.slot].get_mut(sequence).u64(end+sequence::USER_TIMESTAMP_POINTER,pointer)?;
         }
-        crate::g16_memory::publish();Ok(())
+        crate::agx_memory::publish();Ok(())
     }
     pub(crate) fn gpu_ns(&mut self)->Result<u64> {
         let start=self.passes[0].get_mut(P::TilerStart).read_u64(0)?;
@@ -378,7 +378,7 @@ impl Render {
         for &command in commands {
             let crate::m3_submit::Command::Render{command:r,..}=command else {return Err(EINVAL);};
             Self::geometry(r)?;
-            crate::g16_render_state::compact(r.vdm_base).map_err(|_|EINVAL)?;
+            crate::agx_render_state::compact(r.vdm_base).map_err(|_|EINVAL)?;
         }
         if !self._binding.matches(vm) {
             let next=if let Some(index)=self.cached_views.iter().position(|v|v.binding.matches(vm)) {
@@ -445,13 +445,13 @@ impl Render {
         for (stage,pointers) in [s::TA_POINTERS,s::FRAGMENT_POINTERS].into_iter().enumerate() {
             self.objects[pointers].u32(queue::WRITE,u32::from(self.heads[stage]))?;
         }
-        crate::g16_memory::publish();
+        crate::agx_memory::publish();
         Ok(())
     }
     /// Called only while the shared queues are fully retired and unpublished.
     /// Each append selects disjoint host-mutated pass storage. A TA dependency
     /// retains full fragment-to-next-TA ordering for arbitrary resource hazards.
-    pub(crate) fn append(&mut self,r:g17_uapi::UapiRenderCommand,usc:u64)->Result {
+    pub(crate) fn append(&mut self,r:agx_uapi::UapiRenderCommand,usc:u64)->Result {
         if self.batch_count>=pass_layout::SLOTS {
             pr_err!("M3 render batch limit: batch={} slots={}\n",
                 self.batch_count,pass_layout::SLOTS);
@@ -506,10 +506,10 @@ impl Render {
                 self.objects[ring].u64(usize::from(self.heads[stage])*8,address)?;
                 self.heads[stage]=(self.heads[stage]+1)%0x500;
             }
-            crate::g16_memory::publish();
+            crate::agx_memory::publish();
             self.objects[pointers].u32(queue::WRITE,u32::from(self.heads[stage]))?;
         }
-        crate::g16_memory::publish();crate::mem::sync();crate::mem::tlbi_all();crate::mem::sync();Ok(())
+        crate::agx_memory::publish();crate::mem::sync();crate::mem::tlbi_all();crate::mem::sync();Ok(())
     }
     /// Emitted only after both events, stamp/queue checks, clear faults,
     /// idle engines and consumed firmware pipes have been checked by Runtime.

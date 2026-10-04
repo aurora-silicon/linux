@@ -6,7 +6,7 @@
 //! are sequential observations, not atomic with running firmware.
 
 use kernel::{prelude::*, time::{ClockSource, Monotonic}};
-use crate::g16_memory::Buffer;
+use crate::agx_memory::Buffer;
 
 pub(crate) struct Dump {
     bytes: KVVec<u8>,

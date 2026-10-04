@@ -29,7 +29,7 @@ pub(crate) const RT_FIELD_EXTENT: usize = 0x471;
 pub(crate) const HW_GLOBALS_MIN_EXTENT: usize = 0x2600;
 
 // 44-bit firmware address form, identical to G17 (the init-data doorbell tag
-// truncates to 44 bits; see `g17_rtkit`).
+// truncates to 44 bits; see `g15_boot::encode_initdata_doorbell`).
 const INITDATA_ADDR_MASK: u64 = 0x0000_0fff_ffff_ffff;
 const INITDATA_ADDR_PREFIX: u64 = 0xffff_f000_0000_0000;
 

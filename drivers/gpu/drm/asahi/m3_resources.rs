@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! J514S resources admitted against the measured M3 boot contract.
-pub(crate) use crate::g16_resources::{Region, Resources};
+pub(crate) use crate::agx_resources::{Region, Resources};
 
 use kernel::{bindings, c_str, io::resource::Resource, of, prelude::*};
 

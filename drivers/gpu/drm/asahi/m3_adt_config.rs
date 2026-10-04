@@ -545,7 +545,7 @@ fn build_images(dev: &device::Device, firmware: &Firmware) -> Result<KVec<Option
         split_pstates: true,
         // The cap is applied to the uploaded objects, for either source (`publish_pstates`).
         cap: None,
-        timestamp_base: Some(crate::g16_memory::TIMESTAMP_RANGE.start),
+        timestamp_base: Some(crate::agx_memory::TIMESTAMP_RANGE.start),
         reference_ppm: true,
     };
     let c = initdata::InitDataBuilderG15V14_8_3::g15_contents(cfg, &dyncfg, &g15).inspect_err(|e| {
@@ -783,7 +783,7 @@ pub(crate) fn publish_runtime_cap(globals: &mut Buffer, cap: u32) -> Result {
     for off in GLOBALS_RUNTIME_CAP {
         globals.u32(off, 100 * cap)?;
     }
-    crate::g16_memory::publish();
+    crate::agx_memory::publish();
     Ok(())
 }
 

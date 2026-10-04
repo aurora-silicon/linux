@@ -29,11 +29,10 @@ use kernel::{
 
 use crate::{
     driver::AsahiDevice,
-    g17_uapi::{
+    agx_uapi::{
         GpuAccess,
         GpuAddressSpace, //
     },
-    hw::GpuGen,
     mmu,
 };
 
@@ -64,9 +63,6 @@ impl ClientGate {
 
     /// Whether this file may create a VM. Only G15 devices are gated.
     pub(crate) fn admit_vm(&self, device: &AsahiDevice) -> Result {
-        if device.gpu()?.params()?.gpu_generation != GpuGen::G15 as u32 {
-            return Ok(());
-        }
         let size = self.params_size.load(Ordering::Relaxed);
         if size >= AGX3_PARAMS_SIZE {
             return Ok(());

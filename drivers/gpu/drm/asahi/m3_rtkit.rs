@@ -3,7 +3,7 @@
 //! RTKit callbacks for the identified J514S firmware. The firmware advertises
 //! its crash storage by physical address inside the reserved data segment.
 
-use crate::g16_resources::Region;
+use crate::agx_resources::Region;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel::{
     c_str, impl_has_hr_timer,
@@ -244,7 +244,7 @@ impl rtkit::Operations for Operations {
         // Wake the serialized worker even if the firmware can no longer send
         // its usual completion notification. Never take the runtime lock here.
         state.events.record();
-        crate::driver::queue_g16_completion_worker(state.drm.clone());
+        crate::m3_completion::queue(&state.drm);
         dev_err!(
             state.dev.as_ref(),
             "M3 G15S: firmware crashed, retained crashlog bytes={}\n",
@@ -311,7 +311,7 @@ impl rtkit::Operations for Operations {
                     <kernel::time::Monotonic as kernel::time::ClockSource>::ktime_get(),
                     state.event_messages.load(Ordering::Acquire));
             }
-            crate::driver::queue_g16_completion_worker(state.drm.clone());
+            crate::m3_completion::queue(&state.drm);
             return;
         }
         dev_warn!(

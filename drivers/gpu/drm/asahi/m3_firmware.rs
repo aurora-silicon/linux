@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 
-use crate::m3_resources as g16_resources;
+use crate::m3_resources as agx_resources;
 
 const TEXT_SIZE: u64 = 0x5c000;
 const DATA_SIZE: u64 = 0x114000;
@@ -16,7 +16,7 @@ fn normalize_boot_entropy(text: &mut [u8]) -> bool {
 
 #[derive(Debug)]
 pub(crate) struct Firmware {
-    pub(crate) resources: g16_resources::Resources,
+    pub(crate) resources: agx_resources::Resources,
     /// The identified image.
     pub(crate) image: &'static crate::m3_board::KnownImage,
 }
@@ -26,7 +26,7 @@ impl Firmware {
         "RTKit-2419.140.12.release"
     }
 
-    fn matching_layout(resources: &g16_resources::Resources) -> bool {
+    fn matching_layout(resources: &agx_resources::Resources) -> bool {
         resources.regions[4].size == TEXT_SIZE
             && resources.regions[5].size == DATA_SIZE
             && resources.firmware_vas == [0xffff_fc00_0000_0000, 0xffff_fc00_0005_c000]
@@ -36,7 +36,7 @@ impl Firmware {
 #[cfg(not(test))]
 pub(crate) fn identify_loaded(
     pdev: &kernel::platform::Device<kernel::device::Core>,
-    resources: g16_resources::Resources,
+    resources: agx_resources::Resources,
 ) -> kernel::error::Result<Firmware> {
     use kernel::{
         bindings, c_str,
@@ -49,7 +49,7 @@ pub(crate) fn identify_loaded(
         return Err(ENODEV);
     }
     let node = pdev.as_ref().of_node().ok_or(ENODEV)?;
-    let text = g16_resources::reserved_resource(&node, c_str!("fw-text"))?;
+    let text = agx_resources::reserved_resource(&node, c_str!("fw-text"))?;
     if text.start() != resources.regions[4].base || text.size() != TEXT_SIZE {
         return Err(EINVAL);
     }

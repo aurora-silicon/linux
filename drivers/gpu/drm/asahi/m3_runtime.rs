@@ -157,7 +157,7 @@ impl Runtime {
     }
     pub(crate) fn map_timestamp(&self,mut bo:crate::gem::ObjectRef,range:core::ops::Range<usize>)->Result<mmu::KernelMapping> {
         if self.inner.gpu_pending { self.inner.state.events.record_cpu_preparation(); }
-        bo.map_range_into_range(self.inner.uat.kernel_vm(),range,crate::g16_memory::TIMESTAMP_RANGE,
+        bo.map_range_into_range(self.inner.uat.kernel_vm(),range,crate::agx_memory::TIMESTAMP_RANGE,
             mmu::UAT_PGSZ as u64,mmu::PROT_FW_SHARED_RW,false)
     }
     /// The DRM scheduler's single run-job worker owns execution. Release only

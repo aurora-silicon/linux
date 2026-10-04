@@ -28,7 +28,7 @@ impl Pass {
     pub(crate) fn get_mut(&mut self,field:Field)->&mut Buffer {&mut self.buffers[field as usize]}
     /// Caller must prove retirement, and must not clear a prepared sibling.
     /// Dependency commands are rewritten completely by the sync encoder.
-    pub(crate) fn reset(&mut self,geometry:&crate::g16_render::Geometry)->Result {
+    pub(crate) fn reset(&mut self,geometry:&crate::agx_render::Geometry)->Result {
         // Tiler arenas grow to retain the largest prior target. The firmware
         // descriptors use the current geometry's strides and layer count, so
         // only that prefix is addressable by this pass. Clear it on every use,

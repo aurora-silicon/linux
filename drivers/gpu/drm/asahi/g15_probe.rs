@@ -130,13 +130,12 @@ pub(crate) fn probe(pdev: &platform::Device<Core>) -> Result<G15Manager> {
     regs::Resources::start_cpu(pdev)?;
 
     let drm: ARef<AsahiDevice> =
-        drm::device::Device::new(pdev.as_ref(), AsahiData::new(pdev, Some(res)))?;
+        drm::device::Device::new(pdev.as_ref(), AsahiData::new(pdev, Some(res), true))?;
     let res = drm.resources.as_ref().ok_or(ENODEV)?;
 
     let legacy_gpu =
         gpu::GpuManagerG15V14_8_3::new(&drm.clone(), res, cfg)? as Arc<dyn gpu::GpuManager>;
-    let gpu: Arc<dyn drm_gpu::DrmGpu> =
-        Arc::new(drm_gpu::LegacyDrmGpu::new(legacy_gpu.clone()), GFP_KERNEL)?;
+    let gpu = drm_gpu::Backend::Legacy(drm_gpu::LegacyDrmGpu::new(legacy_gpu.clone()));
 
     if !drm.gpu.populate(gpu) {
         return Err(EBUSY);

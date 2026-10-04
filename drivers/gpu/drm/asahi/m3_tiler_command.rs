@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-use crate::{g16_render::Geometry, m3_compute_layout::GpuVa,
+use crate::{agx_render::Geometry, m3_compute_layout::GpuVa,
     m3_init_layout::{Error,Region}, m3_queue_layout::FirmwareVa,
     m3_render_sequence::ta};
 pub(crate) const SIZE:usize=0x92b;
@@ -12,7 +12,7 @@ pub(crate) const CONTEXT:usize=0xc;
 fn word(out:&mut[u8],off:usize,value:u32) {out[off..off+4].copy_from_slice(&value.to_le_bytes());}
 fn pointer(out:&mut[u8],off:usize,value:u64) {out[off..off+8].copy_from_slice(&value.to_le_bytes());}
 fn compact(address:u64)->Result<u64,Error> {
-    crate::g16_render_state::compact(address).map_err(|_|Error::Address)
+    crate::agx_render_state::compact(address).map_err(|_|Error::Address)
 }
 pub(crate) struct Command {
     pub(crate) context:u32,
