@@ -596,6 +596,26 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
 	{},
 };
 
+static void apple_drm_quiesce_connectors(struct drm_device *drm)
+{
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector;
+
+	drm_connector_list_iter_begin(drm, &iter);
+	drm_for_each_connector_iter(connector, &iter) {
+		struct apple_connector *apple_connector = to_apple_connector(connector);
+
+		/* DCP callbacks can still enqueue these until component unbind
+		 * has drained RTKit. Stop their users before releasing endpoints,
+		 * clocks and IOMMUs, and reject enqueues during that release.
+		 */
+		disable_work_sync(&apple_connector->hotplug_wq);
+		disable_work_sync(&apple_connector->bl_sync_wq);
+		disable_work_sync(&apple_connector->bl_commit_wq);
+	}
+	drm_connector_list_iter_end(&iter);
+}
+
 static int apple_drm_init_dcp(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
@@ -701,7 +721,7 @@ static int apple_drm_init(struct device *dev)
 
 	ret = drmm_mode_config_init(&apple->drm);
 	if (ret)
-		goto err_unbind;
+		goto err_components;
 
 	/*
 	 * IOMFB::UPPipeDCP_H13P::verify_surfaces produces the error "plane
@@ -749,6 +769,8 @@ static int apple_drm_init(struct device *dev)
 	return 0;
 
 err_unbind:
+	apple_drm_quiesce_connectors(&apple->drm);
+err_components:
 	component_unbind_all(dev, NULL);
 	return ret;
 }
@@ -757,6 +779,7 @@ static void apple_drm_uninit(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
+	apple_drm_quiesce_connectors(&apple->drm);
 	drm_dev_unregister(&apple->drm);
 	drm_atomic_helper_shutdown(&apple->drm);
 
