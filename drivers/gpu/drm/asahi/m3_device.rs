@@ -112,7 +112,7 @@ impl Device {
         // SAFETY: This is the admitted T6030's 42-bit physical DMA capability.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(42)?)? };
         crate::mmu::check_handoff_guard()?;
-        dev_info!(pdev.as_ref(), "M3 G15S: private-memory handoff guard passed success and both timeout paths\n");
+        dev_info!(pdev.as_ref(), "M3 G15S: GPU handoff lock checked.\n");
         for _ in 0..2 {
             let drm: ARef<crate::driver::AsahiDevice> = kernel::drm::Device::new(
                 pdev.as_ref(), crate::driver::AsahiData::new(pdev, None, true))?;
@@ -122,7 +122,7 @@ impl Device {
             drop(object);
             drop(drm);
         }
-        dev_info!(pdev.as_ref(), "M3 G15S: initialized DRM data and GEM allocation/cleanup passed twice; backend absent, device unregistered\n");
+        dev_info!(pdev.as_ref(), "M3 G15S: DRM data initialized; backend absent, device unregistered\n");
         Ok(())
     }
 
@@ -152,8 +152,8 @@ impl Device {
             }
         }
         sgx.try_write64(selector,0xd800)?;
-        // Read-only per-core service/debug snapshot, using RTKit2419's
-        // existing selector protocol (also used by the M3 Python guard).
+        // Read-only per-core service/debug snapshot, using the same
+        // core-selector protocol as the idle check.
         let service=sgx.try_read32(0xa010)?;
         let debug=sgx.try_read32(0xa000)?;
         let cores=sgx.try_read32(0xe01500)?;

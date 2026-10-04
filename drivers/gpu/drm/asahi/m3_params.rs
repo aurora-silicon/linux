@@ -190,13 +190,13 @@ m3_param!("g15_debug", G15_DEBUG, parse_u64);
 
 /// Bits of `asahi.g15_debug`, the bring-up switches of the G15 manager backend.
 ///
-/// The numbers are the ones these switches had in `asahi.debug_flags` during bring-up, so old
-/// notes stay valid. Bits 49 and 50 are no longer switches: the HwDataB power-management flags
-/// they enabled are always set on G15.
+/// The bit numbers are unchanged from their earlier `asahi.debug_flags` positions. Bits 49
+/// and 50 are no longer switches: the HwDataB power-management flags they enabled are always
+/// set on G15.
 #[derive(Copy, Clone)]
 #[repr(u32)]
 pub(crate) enum G15Debug {
-    /// A/B experiment: issue the Fender kick (0x11, then 0x10) before starting the ASC. The
+    /// Debug switch: issue the Fender kick (0x11, then 0x10) before starting the ASC. The
     /// G15 firmware boots and runs jobs without it.
     FenderKick = 41,
     /// Register the DRM device (card/render nodes) for the manager backend, like
@@ -232,7 +232,7 @@ pub(crate) enum G15Debug {
     /// and the Globals power-interface targets and performance-state cap, instead of the
     /// manager's validated values.
     ManagerReferencePpm = 55,
-    /// Experiment for the runtime backend: when a job fails and the firmware reports that it has
+    /// Debug switch for the runtime backend: when a job fails and the firmware reports that it has
     /// halted, clear the halted flag and set resume, then log for about half a second what the
     /// firmware, the engines and the failed job do. The GPU stays marked failed either way.
     M3ResumeAfterFault = 56,

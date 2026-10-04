@@ -60,7 +60,7 @@ impl Inner {
         let _=self.config.log_recovery_state(&self.drm,events);
         if crate::m3_params::g15_debug(crate::m3_params::G15Debug::M3ResumeAfterFault) {
             if let Err(e)=self.resume_experiment(index, vm) {
-                dev_err!(self.drm.as_ref(),"M3 resume experiment: stopped by {:?}\n",e);
+                dev_err!(self.drm.as_ref(),"M3: resume-after-fault: stopped by {:?}\n",e);
             }
         }
     }
@@ -76,10 +76,10 @@ impl Inner {
             halt=self.config.halt_state()?;
         }
         if halt.1==0 {
-            dev_info!(self.drm.as_ref(),"M3 resume experiment: the firmware did not halt within 100 ms (halt_count={} resume={}); not resuming\n",halt.0,halt.2);
+            dev_info!(self.drm.as_ref(),"M3: resume-after-fault: the firmware did not halt within 100 ms (halt_count={} resume={}); not resuming\n",halt.0,halt.2);
             return Ok(());
         }
-        dev_info!(self.drm.as_ref(),"M3 resume experiment: the firmware halted (halt_count={} halted={}); clearing halted and setting resume\n",halt.0,halt.1);
+        dev_info!(self.drm.as_ref(),"M3: resume-after-fault: the firmware halted (halt_count={} halted={}); clearing halted and setting resume\n",halt.0,halt.1);
         self.config.resume_halted()?;
         let resumed=Instant::<Monotonic>::now();
         let mut last=None;
@@ -92,7 +92,7 @@ impl Inner {
             let crashed=self.state.health.crashed();
             let now=(halt,engines,complete,events,crashed);
             if last!=Some(now) {
-                dev_info!(self.drm.as_ref(),"M3 resume experiment +{}us: halt_count={} halted={} resume={} engines={} job_complete={} event_messages={} crashed={}\n",
+                dev_info!(self.drm.as_ref(),"M3: resume-after-fault: +{}us: halt_count={} halted={} resume={} engines={} job_complete={} event_messages={} crashed={}\n",
                     resumed.elapsed().as_nanos()/1000,halt.0,halt.1,halt.2,engines,complete,events,crashed);
                 last=Some(now);
             }

@@ -90,7 +90,7 @@ mod implementation {
             unsafe {Self::new_with_flag(resources,MemFlag::WB)}
         }
         /// # Safety
-        /// Same reservation/ownership contract as new; J514S lab uses WC.
+        /// Same reservation and ownership as `new`. J514S maps these tables write-combining.
         pub(crate) unsafe fn new_wc(resources:KVec<Resource>)->Result<Self> {
             unsafe {Self::new_with_flag(resources,MemFlag::WC)}
         }

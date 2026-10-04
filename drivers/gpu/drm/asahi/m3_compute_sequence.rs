@@ -29,8 +29,7 @@ pub(crate) struct Sequence {
     pub(crate) context: u32,
     pub(crate) generation: u32,
     pub(crate) pool: FirmwareVa,
-    /// Five distinct firmware-owned scratch buffers, including the fields
-    /// called g15_gptr_* by the producer. They are not low client GPU pointers.
+    /// Five distinct firmware-owned scratch buffers. They are not low client GPU pointers.
     pub(crate) scratch: [FirmwareVa; 5],
     pub(crate) fw_stamp: FirmwareVa,
     pub(crate) stamp_value: u32,

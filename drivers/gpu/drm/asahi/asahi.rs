@@ -140,11 +140,7 @@ kernel::module_platform_driver! {
         // these appear under /sys/module/asahi/parameters -- they can only be
         // set on the insmod command line. Looking for one in sysfs and not
         // finding it does not mean the build lacks it; check
-        // `strings asahi.ko | grep parmtype=` instead. This cost a hardware
-        // cycle once already.
-
-        // 2026-09-01 follow-up: descriptor +0x789=0x10 was also hardware-null
-        // (same fault-free TA timeout and recovery as the 0x08 baseline).
+        // `strings asahi.ko | grep parmtype=` instead.
 
     },
 }

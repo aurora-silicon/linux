@@ -86,14 +86,14 @@ impl Compute {
         dev_info!(dev.as_ref(),"M3 compute graph: context={} queue={:#x} command={:#x} low={:#x} cdm={:#x}..{:#x} pool={:#x}\n",
             binding.slot(),objects[storage::QUEUE].va(),objects[storage::COMMAND].va(),
             objects[storage::COMMAND].gpu_va()?,control.base,control.end,objects[storage::POOL].va());
-        // RTKit 2419's qualified M3 register producer uses absolute IOTO
-        // addresses and does not emit M4's USC_EXEC_BASE_CP register.
+        // The M3 compute stream uses absolute IOTO addresses and does not
+        // include the USC_EXEC_BASE_CP register.
         let mut stream=[0u8;48];
         vm.read_bytes(control.base,&mut stream)?;
         dev_info!(dev.as_ref(),"M3 client CDM bytes={:02x?}\n",stream);
         agx_memory::publish();
-        // Match the qualified lab's complete publication sequence, including
-        // completion of WC TTBAT stores before broadcasting invalidation.
+        // Finish the write-combining page-table stores before broadcasting
+        // the invalidation.
         crate::mem::sync();crate::mem::tlbi_all();crate::mem::sync();
         unsafe {core::arch::asm!("isb",options(nostack,preserves_flags))};
         Ok(Self {_client_command:client_command.ok_or(EINVAL)?,objects,command_bytes,sequence_bytes,_binding:binding,stats,last_progress_ns:0,sequence:1,head:1,cached_views:KVec::new(),slot:0,batch_count:1,checkpoint:(0,0,0)})
@@ -152,7 +152,8 @@ impl Compute {
             state::counter(bytes, value).map_err(|_| EINVAL)?;
             objects[owner].write(0, bytes)?;
         }
-        // Preserve the qualified producer's poison, including on replay reset.
+        // Fill the preemption buffer with 0xcc, including when a compute
+        // command is submitted again.
         objects[PREEMPTION].fill(0xcc)
     }
     pub(crate) fn replay(&mut self, uat: &mmu::Uat, vm: &mmu::Vm,

@@ -119,7 +119,7 @@ pub(crate) fn probe(pdev: &platform::Device<Core>) -> Result<G15Manager> {
     res.init_mmio()?;
     res.init_mmio_g15(ttbs.start() as u64)?;
 
-    // A/B experiment only (asahi.g15_debug bit 41): the Fender kick (0x11 at probe, 0x10 at
+    // Debug switch only (asahi.g15_debug bit 41): the Fender kick (0x11 at probe, 0x10 at
     // start). The G15 firmware boots without it.
     if g15_debug(G15Debug::FenderKick) {
         res.g15_fender_kick(regs::FENDER_KICK_PROBE)?;

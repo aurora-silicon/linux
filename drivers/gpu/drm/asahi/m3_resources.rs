@@ -5,8 +5,8 @@ pub(crate) use crate::agx_resources::{Region, Resources};
 use kernel::{bindings, c_str, io::resource::Resource, of, prelude::*};
 
 /// Live overlays are not inserted in OF's boot-time reserved_mem registry.
-/// Keep the ordinary lookup for every static handoff; the J514S experiment
-/// can use no-map nodes only if their ranges are outside all Linux System RAM.
+/// Keep the ordinary lookup for every static handoff. A no-map node is
+/// accepted only when its range is outside all Linux System RAM.
 pub(crate) fn reserved_resource(node: &of::Node, name: &CStr) -> Result<Resource> {
     if let Ok(r) = node.reserved_mem_region_to_resource_byname(name) {
         return Ok(r);

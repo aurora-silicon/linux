@@ -261,7 +261,7 @@ impl Resources {
         );
         // G15 MMU configuration sequence. The meaning of the 0x80d8 / 1 / 0x3ff
         // words is unknown.
-        // TODO: confirm this sequence with a hypervisor MMIO trace.
+        // TODO: confirm this register sequence on hardware.
         self.sgx_write32::<FENDER_MMU_TTBAT_BASE>(
             (ttbat_base >> 14) as u32 & FENDER_MMU_TTBAT_BASE_MASK,
         );

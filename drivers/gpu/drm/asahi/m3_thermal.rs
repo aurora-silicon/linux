@@ -66,11 +66,10 @@ use crate::{
 /// The thermal zones read, each the hottest of a set of SoC die sensors: the SMC's die sensors
 /// (registered by the SMC hwmon driver) and the PMP's CPU cluster sensors (registered by the
 /// PMP report driver once the PMP runs). Zones that do not exist are skipped; a zone that
-/// exists but cannot be read fails the reading. J516S requires both zones to
-/// preserve the sensor coverage used in its thermal qualification.
+/// exists but cannot be read fails the reading. J516S needs both zones. The SMC die
+/// sensors alone stayed below 67 C while the PMP hotspot exceeded 85 C and the cap
+/// stepped down.
 const ZONES: [&CStr; 2] = [c_str!("macsmc_soc_die"), c_str!("apple_pmp_hotspot")];
-// The J516S thermal qualification used both sources; the SMC alone read
-// below 67 C while the PMP exceeded 85 C and caused the tested throttling.
 // Do not raise its cap on a partial reconstruction of that sensor set.
 const J516_REQUIRED_ZONES: u32 = 3;
 

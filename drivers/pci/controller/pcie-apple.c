@@ -1815,9 +1815,8 @@ static int apple_msi_init(struct apple_pcie *pcie)
 				      "apple,msi-vector-base", NULL) &&
 		    args.args[1] == 1342 && pcie->nvecs == 512) {
 			/*
-			 * Old experimental boot DTs exposed the global window to
-			 * each host. Correct it here so old recovery kernels can
-			 * continue using the unchanged shared bootloader DT.
+			 * Older device trees gave each host the global MSI window.
+			 * Correct it here so those device trees keep working.
 			 */
 			pcie->msi_vector_base = expected_base;
 			pcie->nvecs = 32;
