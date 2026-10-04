@@ -1233,12 +1233,30 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 static void do_swap(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	struct dcp_swap_start_req start_req = { 0 };
+	struct DCP_FW_NAME(dcp_swap_submit_req) *req = &DCP_FW_UNION(dcp->swap);
 
 	if (READ_ONCE(dcp->mode_state.valid) && dcp->connector &&
-	    READ_ONCE(dcp->connector->connected))
+	    READ_ONCE(dcp->connector->connected)) {
+		/* The CTM reply may arrive after a link loss. Consume the
+		 * external level only here, once the swap can be submitted.
+		 */
+		if (!dcp_has_panel(dcp) &&
+		    xchg(&dcp->brightness.update, false)) {
+			s32 bl = dcp_ext_backlight_value(dcp);
+
+			if (bl >= 0) {
+				req->swap.bl_unk = 1;
+				req->swap.bl_value = bl;
+				req->swap.bl_power = 0x40;
+			} else {
+				/* DisplayAttributes may still be on their way. */
+				smp_store_release(&dcp->brightness.update, true);
+			}
+		}
 		dcp_swap_start(dcp, false, &start_req, dcp_swap_started, NULL);
-	else
+	} else {
 		dcp_drm_crtc_vblank(dcp->crtc);
+	}
 }
 
 static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data,
@@ -1506,21 +1524,6 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->swap.bl_value = dcp->brightness.dac;
 		req->swap.bl_power = 0x40;
 		dcp->brightness.update = false;
-	} else if (!dcp_has_panel(dcp) && READ_ONCE(dcp->mode_state.valid) &&
-		   dcp->connector && READ_ONCE(dcp->connector->connected) &&
-		   xchg(&dcp->brightness.update, false)) {
-		/*
-		 * Consumed only when do_swap() will send the swap, so a level is
-		 * not lost to a dropped one. Read after clearing: a newer level
-		 * sets update again and commits.
-		 */
-		s32 bl = dcp_ext_backlight_value(dcp);
-
-		if (bl >= 0) {
-			req->swap.bl_unk = 1;
-			req->swap.bl_value = bl;
-			req->swap.bl_power = 0x40;
-		}
 	}
 
 	if (crtc_state->color_mgmt_changed) {

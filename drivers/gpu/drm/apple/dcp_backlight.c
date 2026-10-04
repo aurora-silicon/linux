@@ -316,7 +316,7 @@ static int dcp_ext_backlight_update_status(struct backlight_device *bd)
 		return 0;
 
 	dcp = platform_get_drvdata(pdev);
-	/* pairs with the xchg() in iomfb_flush: it sees the level or leaves update set */
+	/* Pairs with do_swap(): it sees the level or leaves update set. */
 	smp_store_release(&dcp->brightness.update, true);
 
 	/*
