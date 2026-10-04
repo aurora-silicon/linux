@@ -266,7 +266,11 @@ enum drm_asahi_feature {
 	 */
 	DRM_ASAHI_FEATURE_SCHEDULED_QUEUES = (1UL) << 3,
 
-	/* Bits 4 and 5 are reserved. This kernel never sets them. */
+	/*
+	 * Bits 4, 5, 7 and 9 are reserved. These numbers are already in use
+	 * outside this header, so they must not be given another meaning.
+	 * This kernel never sets them.
+	 */
 
 	/** @DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY: Render commands may request
 	 * fragment-only dependencies with DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY.
@@ -924,6 +928,12 @@ enum drm_asahi_render_flags {
 	 */
 	DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY = (1U << 5),
 
+	/*
+	 * Bits 6 and 7 are reserved. These numbers are already in use outside
+	 * this header, so they must not be given another meaning. This kernel
+	 * rejects render commands that set them.
+	 */
+
 	/**
 	 * @DRM_ASAHI_RENDER_DBIAS_IS_INT: Use integer depth bias formula.
 	 *
@@ -1254,6 +1264,13 @@ struct drm_asahi_cmd_render {
 
 	/** @bg_partial_rsrc_spec_hi: High dword of @partial_bg.rsrc_spec */
 	__u32 bg_partial_rsrc_spec_hi;
+
+	/*
+	 * The 64 bytes that may follow, room for eight struct
+	 * drm_asahi_timestamp entries, are reserved. That layout is already in
+	 * use outside this header, so a future field must not give this space
+	 * another meaning. This kernel does not interpret it.
+	 */
 };
 
 /**
@@ -1291,6 +1308,13 @@ struct drm_asahi_cmd_compute {
 
 	/** @ts: Timestamps for the compute command */
 	struct drm_asahi_timestamps ts;
+
+	/*
+	 * The 64 bytes that may follow, room for eight struct
+	 * drm_asahi_timestamp entries, are reserved. That layout is already in
+	 * use outside this header, so a future field must not give this space
+	 * another meaning. This kernel does not interpret it.
+	 */
 };
 
 /**
