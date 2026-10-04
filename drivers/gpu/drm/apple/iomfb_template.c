@@ -516,7 +516,12 @@ static void iomfbep_cb_enable_backlight_message_ap_gated(struct apple_dcp *dcp,
 	 * syslog: "[BrightnessLCD.cpp:743][AFK]nitsToDBV: iDAC out of range"
 	 */
 	dcp->brightness.update = true;
-	schedule_work(&dcp->bl_update_wq);
+	/*
+	 * Only a DCP with an integrated panel has bl_update_wq. An external
+	 * display's level goes out with the next swap.
+	 */
+	if (dcp_has_panel(dcp))
+		schedule_work(&dcp->bl_update_wq);
 }
 
 /* Chunked data transfer for property dictionaries */
