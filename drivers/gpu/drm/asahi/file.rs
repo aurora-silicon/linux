@@ -46,10 +46,8 @@ use kernel::uaccess::{
     UserSlice, //
 };
 use kernel::{
-    c_str,
     dma_fence,
     drm,
-    of,
     uapi,
     xarray, //
 };
@@ -248,7 +246,7 @@ impl drm::file::DriverFile for File {
         let id = gpu.ids().file.next();
 
         mod_dev_dbg!(device, "[File {}]: DRM device opened\n", id);
-        Ok(KBox::pin_init(File::new(id), GFP_KERNEL)?)
+        Ok(KBox::pin_init(File::new(id, device.is_m3), GFP_KERNEL)?)
     }
 
     fn as_raw(&self) -> *mut bindings::drm_file {
@@ -260,7 +258,7 @@ impl drm::file::DriverFile for File {
 unsafe impl AnyBitPattern for uapi::drm_asahi_gem_bind_op {}
 
 impl File {
-    fn new(id: u64) -> impl PinInit<Self, Error> {
+    fn new(id: u64, is_m3: bool) -> impl PinInit<Self, Error> {
         unsafe {
             pin_init::pin_init_from_closure(move |slot: *mut Self| {
                 let raw_vms = addr_of_mut!((*slot).vms);
@@ -277,7 +275,7 @@ impl File {
                 xarray::XArray::<KBox<Object>>::new(xarray::AllocKind::Alloc1)
                     .__pinned_init(raw_objects)?;
 
-                addr_of_mut!((*slot).m3_client).write(if device.is_m3 { Some(crate::m3_client::ClientGate::new()) } else { None });
+                addr_of_mut!((*slot).m3_client).write(if is_m3 { Some(crate::m3_client::ClientGate::new()) } else { None });
                 (*slot).id = id;
                 Ok(())
             })
@@ -316,15 +314,7 @@ impl File {
         if data.param_group == crate::agx_status::PARAM_GROUP_VM_STATUS {
             return Self::get_vm_status(device, data, file);
         }
-        if data.param_group == crate::agx_queue_limits::PARAM_GROUP_QUEUE_LIMITS {
-            if data.pad != 0 || data.size < crate::agx_queue_limits::QUEUE_LIMITS_SIZE as u64 {
-                return Err(EINVAL);
-            }
-            let bytes = gpu.independent_queue_limits().ok_or(EINVAL)?;
-            UserSlice::new(UserPtr::from_addr(data.pointer as _), bytes.len())
-                .writer().write_slice(&bytes)?;
-            return Ok(0);
-        }
+
         if data.param_group != 0 || data.pad != 0 {
             cls_pr_debug!(Errors, "get_params: Invalid arguments\n");
             return Err(EINVAL);
@@ -365,9 +355,7 @@ impl File {
         if gpu.supports_vm_status() {
             params.features |= crate::agx_status::FEATURE_VM_STATUS;
         }
-        if gpu.independent_queue_limits().is_some() {
-            params.features |= crate::agx_queue_limits::FEATURE_INDEPENDENT_QUEUES;
-        }
+
         if gpu.supports_scheduled_queues() {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SCHEDULED_QUEUES as u64;
         }

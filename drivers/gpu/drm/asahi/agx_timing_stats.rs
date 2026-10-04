@@ -5,7 +5,6 @@
 //! atomic fields (no data races) and explicitly report contention. GPU spans
 //! include firmware/engine gaps and may overlap: they are not utilization.
 use core::sync::atomic::{fence, AtomicU64, Ordering};
-use kernel::prelude::*;
 
 pub(crate) struct Stats {
     sequence: AtomicU64,

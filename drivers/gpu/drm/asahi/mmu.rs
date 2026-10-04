@@ -2816,7 +2816,7 @@ impl Uat {
         match handoff_mode {
             HandoffMode::FirmwareT6030 => { if cfg != UatConfig::T6030 {return Err(ENODEV);} }
             HandoffMode::StoppedFirmwareT6030 => {
-                if !cfg == UatConfig::T6030 { return Err(ENODEV); }
+                if cfg != UatConfig::T6030 { return Err(ENODEV); }
             }
             HandoffMode::FirmwareDekker => {
                 if cfg.ias != 39

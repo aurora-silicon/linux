@@ -70,7 +70,6 @@ mod agx_render;
 mod agx_render_state;
 mod agx_resources;
 mod agx_status;
-mod agx_queue_limits;
 mod agx_uapi;
 mod gem;
 mod gpu;

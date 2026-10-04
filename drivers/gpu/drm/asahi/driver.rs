@@ -11,7 +11,6 @@ use kernel::{
     },
     drm,
     drm::ioctl,
-    new_mutex,
     of,
     platform,
     prelude::*,
@@ -236,14 +235,12 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
 
     dev_info!(
         pdev.as_ref(),
-        "AGX3: matched {:?}{:?} (chip {:#x}, USC gen {}, HAL {:?}, {:?} firmware roles, {:?} submission, {}-bit UAT roots, {}-bit OAS)\n",
+        "AGX3: matched {:?}{:?} (chip {:#x}, USC gen {}, HAL {:?}, {}-bit UAT roots, {}-bit OAS)\n",
         expected.gpu_gen,
         expected.gpu_variant,
         soc.chip_id,
         expected.usc_generation,
         expected.gpu_hal_generation,
-        expected.firmware_roles,
-        expected.submission_transport,
         soc.uat_ias,
         soc.uat_oas
     );

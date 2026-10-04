@@ -336,14 +336,7 @@ pub(crate) struct GpuIdConfig {
     pub(crate) core_masks: KVec<u32>,
     /// Packed mask of all active cores.
     pub(crate) core_masks_packed: KVec<u32>,
-    /// GPC performance-state map nibble sampled during the safe SGX ID probe.
-    /// G17P emits this cached high nibble in fragment register 0x1c838. The
-    /// 3D descriptor tail at +0x2110 has an independent render-setup source.
-    pub(crate) gpc_perf_state_map: u32,
-    /// Low nibble of the same SGX 0xe01480 word, written to 3D tail +0x210c.
-    pub(crate) gpc_perf_state_map_low: u32,
-    /// Bit 0 of SGX 0xe0141c, written to 3D tail +0x2104.
-    pub(crate) gpc_perf_state_control: u32,
+
 }
 
 /// Configurable CS/AFR GPU power settings from the device tree.

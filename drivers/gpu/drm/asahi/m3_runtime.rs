@@ -109,7 +109,7 @@ pub(crate) struct Runtime { inner: ManuallyDrop<Inner> }
 impl Runtime {
     pub(crate) fn new(pdev: &platform::Device<Core>, device: Device, contents: crate::m3_adt_config::Contents) -> Result<Self> {
         device.require_stopped(pdev)?;
-        let drm: driver::AsahiDevRef = kernel::drm::Device::new(pdev.as_ref(), driver::AsahiData::new(pdev, None))?;
+        let drm: driver::AsahiDevRef = kernel::drm::Device::new(pdev.as_ref(), driver::AsahiData::new(pdev, None, true))?;
         let state = m3_rtkit::State::new(pdev, drm.clone(), device.firmware().resources.regions[5])?;
         let mut transport = rtkit::RtKit::new(pdev.as_ref(), None, 0, state.clone())?;
         if crate::m3_adt_config::stop_before_asc(pdev.as_ref()) { return Err(ENODEV); }

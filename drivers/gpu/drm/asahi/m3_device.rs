@@ -119,7 +119,7 @@ impl Device {
         dev_info!(pdev.as_ref(), "M3 G15S: private-memory handoff guard passed success and both timeout paths\n");
         for _ in 0..2 {
             let drm: ARef<crate::driver::AsahiDevice> = kernel::drm::Device::new(
-                pdev.as_ref(), crate::driver::AsahiData::new(pdev, None))?;
+                pdev.as_ref(), crate::driver::AsahiData::new(pdev, None, true))?;
             if drm.gpu().is_ok() { return Err(EIO); }
             let mut object = crate::gem::new_kernel_object(&drm, 0x4000)?;
             object.vmap()?.memset(0);
@@ -135,7 +135,7 @@ impl Device {
         use crate::{driver, gem, mmu, pgtable::prot};
         if self.asc.access(pdev.as_ref())?.read32(ASC_CPU_CONTROL) & ASC_CPU_RUN != 0 { return Err(EBUSY); }
         let drm: ARef<driver::AsahiDevice> = kernel::drm::Device::new(
-            pdev.as_ref(), driver::AsahiData::new(pdev, None))?;
+            pdev.as_ref(), driver::AsahiData::new(pdev, None, true))?;
         for _ in 0..2 {
             // SAFETY: Device owns power and ASC control, ASC is stopped, and
             // this UAT and every mapping are destroyed before starting RTKit.

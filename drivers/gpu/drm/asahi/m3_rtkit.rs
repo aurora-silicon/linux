@@ -15,7 +15,7 @@ use kernel::{
     prelude::*,
     soc::apple::rtkit,
     sync::{aref::ARef, Arc, ArcBorrow},
-    time::{Delta, Monotonic, hrtimer::{HasHrTimer, HrTimer, HrTimerCallback,
+    time::{Delta, Monotonic, hrtimer::{HrTimer, HrTimerCallback,
         HrTimerCallbackContext, HrTimerPointer, HrTimerRestart, RelativeMode}},
 };
 

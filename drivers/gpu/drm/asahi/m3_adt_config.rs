@@ -328,9 +328,6 @@ fn t6030_identity(cfg: &'static hw::HwConfig) -> hw::GpuIdConfig {
         total_active_cores: 0,
         core_masks: KVec::new(),
         core_masks_packed: KVec::new(),
-        gpc_perf_state_map: 0,
-        gpc_perf_state_map_low: 0,
-        gpc_perf_state_control: 0,
     }
 }
 

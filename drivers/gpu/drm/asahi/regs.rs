@@ -7,18 +7,20 @@
 //! the few operations that require that, mainly reading the MMU fault status, reading GPU ID
 //! information, and starting the GPU firmware coprocessor.
 
-use crate::hw;
+use crate::{hw, identity};
 use kernel::{
     c_str,
     device::Core,
     devres::Devres,
     io::{
         mem::IoMem, //
+        poll::read_poll_timeout,
         Io,
     },
     platform,
     prelude::*,
     sync::aref::ARef, //
+    time::Delta,
 };
 
 /// Size of the ASC control MMIO region.
@@ -212,6 +214,12 @@ pub(crate) struct Resources {
 }
 
 impl Resources {
+    fn sgx_write32<const OFF: usize>(&self, val: u32) {
+        if let Some(sgx) = self.sgx.try_access() {
+            sgx.relaxed().write32(val, OFF);
+        }
+    }
+
     pub(crate) fn init_mmio_g15(&self, ttbat_base: u64) -> Result {
         self.g15_setup_mmu_config(ttbat_base)
     }
@@ -492,7 +500,7 @@ impl Resources {
                 core_mask_regs.push(self.sgx_read32::<CORE_MASK_1>(), GFP_KERNEL)?;
                 (id_clusters >> 12) & 0xff
             }
-            6 | 0x7 | 0xa => {
+            6 | 0x7 => {
                 core_mask_regs.push(self.sgx_read32::<CORE_MASKS_G14X>(), GFP_KERNEL)?;
                 core_mask_regs.push(self.sgx_read32::<{ CORE_MASKS_G14X + 4 }>(), GFP_KERNEL)?;
                 core_mask_regs.push(self.sgx_read32::<{ CORE_MASKS_G14X + 8 }>(), GFP_KERNEL)?;
@@ -619,9 +627,6 @@ impl Resources {
             total_active_cores,
             core_masks,
             core_masks_packed,
-            gpc_perf_state_map: 0,
-            gpc_perf_state_map_low: 0,
-            gpc_perf_state_control: 0,
         })
     }
 
