@@ -91,6 +91,14 @@ static const struct macsmc_hwmon_board {
 	},
 };
 
+static bool macsmc_hwmon_is_m3(void)
+{
+	return of_machine_is_compatible("apple,t6030") ||
+	       of_machine_is_compatible("apple,t6031") ||
+	       of_machine_is_compatible("apple,t6032") ||
+	       of_machine_is_compatible("apple,t8122");
+}
+
 static const struct macsmc_hwmon_board *macsmc_hwmon_board(void)
 {
 	unsigned int i;
@@ -108,6 +116,8 @@ static const char *macsmc_hwmon_die_key_list(void)
 {
 	const struct macsmc_hwmon_board *board;
 
+	if (!macsmc_hwmon_is_m3())
+		return NULL;
 	if (soc_die_keys)
 		return strcmp(soc_die_keys, "none") ? soc_die_keys : NULL;
 	board = macsmc_hwmon_board();
@@ -630,20 +640,22 @@ static int macsmc_hwmon_create_sensor(struct device *dev, struct apple_smc *smc,
 	if (ret)
 		return ret;
 
-	if (!(sensor->info.flags & APPLE_SMC_READABLE))
-		return -EACCES;
+	if (macsmc_hwmon_is_m3()) {
+		if (!(sensor->info.flags & APPLE_SMC_READABLE))
+			return -EACCES;
 
-	switch (sensor->info.type_code) {
-	case __SMC_KEY('f', 'l', 't', ' '):
-		if (sensor->info.size != sizeof(u32))
-			return -EINVAL;
-		break;
-	case __SMC_KEY('i', 'o', 'f', 't'):
-		if (sensor->info.size != sizeof(u64))
-			return -EINVAL;
-		break;
-	default:
-		return -EOPNOTSUPP;
+		switch (sensor->info.type_code) {
+		case __SMC_KEY('f', 'l', 't', ' '):
+			if (sensor->info.size != sizeof(u32))
+				return -EINVAL;
+			break;
+		case __SMC_KEY('i', 'o', 'f', 't'):
+			if (sensor->info.size != sizeof(u64))
+				return -EINVAL;
+			break;
+		default:
+			return -EOPNOTSUPP;
+		}
 	}
 
 	ret = of_property_read_string(sensor_node, "label", &label);
@@ -1218,7 +1230,7 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 
 	hwmon->dev = &pdev->dev;
 	hwmon->smc = smc;
-	hwmon->register_thermal_zones = !of_machine_is_compatible("apple,j713");
+	hwmon->register_thermal_zones = true;
 
 	ret = macsmc_hwmon_populate_sensors(hwmon, hwmon->dev->of_node);
 	if (ret) {
@@ -1226,9 +1238,11 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	ret = macsmc_hwmon_create_pressure(hwmon, hwmon->dev->of_node);
-	if (ret)
-		return ret;
+	if (macsmc_hwmon_is_m3()) {
+		ret = macsmc_hwmon_create_pressure(hwmon, hwmon->dev->of_node);
+		if (ret)
+			return ret;
+	}
 
 	if (!hwmon->curr.count && !hwmon->fan.count &&
 	    !hwmon->power.count && !hwmon->temp.count &&
@@ -1249,16 +1263,17 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 	hwmon->hwmon_dev = devm_hwmon_device_register_with_info(&pdev->dev,
 								"macsmc_hwmon", hwmon,
 								&hwmon->chip_info,
-								macsmc_hwmon_extra_groups);
+								macsmc_hwmon_is_m3() ? macsmc_hwmon_extra_groups : NULL);
 	if (IS_ERR(hwmon->hwmon_dev))
 		return dev_err_probe(hwmon->dev, PTR_ERR(hwmon->hwmon_dev),
 				     "Probing SMC hwmon device failed\n");
 
-	macsmc_hwmon_debugfs_init(hwmon);
-
-	ret = macsmc_hwmon_die_register(hwmon);
-	if (ret)
-		return ret;
+	if (macsmc_hwmon_is_m3()) {
+		macsmc_hwmon_debugfs_init(hwmon);
+		ret = macsmc_hwmon_die_register(hwmon);
+		if (ret)
+			return ret;
+	}
 
 	dev_dbg(hwmon->dev, "Registered SMC hwmon device. Sensors:\n");
 	dev_dbg(hwmon->dev,
