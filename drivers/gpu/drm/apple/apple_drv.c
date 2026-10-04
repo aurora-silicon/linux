@@ -343,6 +343,8 @@ static int apple_connector_create(struct drm_device *drm,
 
 	mutex_init(&connector->chunk_lock);
 	apple_connector_backlight_init(connector);
+	/* before anything can fail: cleanup cancels it */
+	INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
 	drm_connector_helper_add(&connector->base,
 				 &apple_connector_helper_funcs);
 	if (attach_fwnode)
@@ -359,7 +361,6 @@ static int apple_connector_create(struct drm_device *drm,
 	connector->base.polled = DRM_CONNECTOR_POLL_HPD;
 	connector->connected = false;
 	connector->dcp = dcp;
-	INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
 
 	ret = drm_connector_attach_encoder(&connector->base, &encoder->base);
 	if (ret)
@@ -485,6 +486,8 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 
 		mutex_init(&connector->chunk_lock);
 		apple_connector_backlight_init(connector);
+		/* before anything can fail: cleanup cancels it */
+		INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
 		drm_connector_helper_add(&connector->base,
 					 &apple_connector_helper_funcs);
 
@@ -503,7 +506,6 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		connector->base.polled = DRM_CONNECTOR_POLL_HPD;
 		connector->connected = false;
 		connector->dcp = NULL;
-		INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
 
 		for (i = 0; i < num_dcp; i++) {
 			if (!dcp_typec_port_has_candidate(port_idx, dcp[i]))
