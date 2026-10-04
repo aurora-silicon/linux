@@ -6,7 +6,7 @@
 #   ... | bash -s -- --uninstall      go back to the kernel this Mac had before
 #   ... | bash -s -- --reset-touchid  start Touch ID over: new keybag, enrol again
 #
-# Kernel: iconidentify/aurora-linux custom/sep (e508e107a473), aurora-silicon/linux aurora-wip plus the
+# Kernel: iconidentify/aurora-linux custom/sep (343853c3e861), aurora-silicon/linux aurora-wip plus the
 # Secure Enclave (Touch ID) driver, Thunderbolt (#8), the Apple video
 # decoder (#45), the M2 Max (t6021) profile and the consolidated Touch ID
 # series (aurora-silicon/linux#69: matching after a reboot on every profile,
@@ -71,6 +71,9 @@
 # and nothing is sent until a level is chosen. On the M1/M2 Pro and Max it
 # keeps the Thunderbolt root port's link out of ASPM L1, so unplugging an idle
 # dock no longer leaves the port dead until reboot.
+# 11.35 lets a Touch ID enrolment take up to 36 captures, enough for the 16 to
+# 22 an M2 Pro needs (iconidentify/aurora-linux#17, Justin Pfister), and
+# reports one stage per capture, so every accepted touch shows progress.
 # It replaces linux-asahi (or linux-aurora) as a pacman package,
 # so mkinitcpio and update-m1n1 run from their own hooks; on a GRUB Mac this
 # script regenerates grub.cfg and keeps the previous kernel as a fallback entry.
@@ -99,8 +102,8 @@ set -euo pipefail
 
 # The kernel package version and the release tag move independently: a release
 # that only changes m1n1 reuses the previous kernel packages unchanged.
-VERSION=7.1.12.aurora2-11.34
-TAG=sep-7.1.12.aurora2-11.34
+VERSION=7.1.12.aurora2-11.35
+TAG=sep-7.1.12.aurora2-11.35
 # Packages are fetched from this script's own tag, never from "latest": the
 # checksums below belong to this release and nothing else.
 RELEASE_URL=https://github.com/iconidentify/aurora-linux/releases/download/$TAG
@@ -108,8 +111,8 @@ RELEASES_API=https://api.github.com/repos/iconidentify/aurora-linux/releases
 # Where to always get the current script, whatever this copy turns out to be.
 LATEST_URL=https://github.com/iconidentify/aurora-linux/releases/latest/download/install-aurora-sep.sh
 PACKAGES=(
-  "linux-aurora-$VERSION-aarch64.pkg.tar.zst 2d525694a1451c26b5ede7b1e8e63abd2085b03b620b6c54864119fc04c0f0ee"
-  "linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst 2242777b47969d42910a4375872721368eb69015db7a773f3e723d45adf49e36"
+  "linux-aurora-$VERSION-aarch64.pkg.tar.zst 675547a1d03600c27eeaf149996a8316c8a8d9793cab2890723303fb4b00a3d0"
+  "linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst 7135fb88679696b04b59e2d5d1760d4c5a50f8216a7d5de2ca10e25aa89f4d70"
   "libfprint-1.94.100-1.1-aarch64.pkg.tar.zst bc7d9762db6644f2cfb58ddb209602c1d513845eb1498c098e01f12600fcbdf9"
   "aurora-touchid-20261003-1-any.pkg.tar.zst 29b0360fac8c257d754e64bd1b9c33c487eb2595dd3c31e9138d7a476afa3d64"
   "m1n1-aurora-1.6.1.aurora3-1-aarch64.pkg.tar.zst bc3451aaa88bc3f4912bc3613f9569aa8f3e05f376fa851fa837b5e2080e8c2f"
@@ -992,7 +995,7 @@ SAFETY, NON-NEGOTIABLE
              sudo dmesg | grep -E 'cold init done|link up after|translation fault|HC died'
            Any "translation fault" or "HC died" line is a failure to report.
            For a full report, after plugging the dock in:
-             curl -fsSLO https://raw.githubusercontent.com/iconidentify/aurora-linux/refs/tags/sep-7.1.12.aurora2-11.34/tools/aurora-tb/tb-pcie-report
+             curl -fsSLO https://raw.githubusercontent.com/iconidentify/aurora-linux/refs/tags/sep-7.1.12.aurora2-11.35/tools/aurora-tb/tb-pcie-report
              sudo sh tb-pcie-report --no-wait
 
    6c. Across suspend:
