@@ -72,6 +72,33 @@ struct Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
+        if !self.vm.is_m3() {
+
+        // When the user Vm is dropped, unmap everything in the user range
+        let left_range = self.user_range.start..self.kernel_range.start;
+        let right_range = self.kernel_range.end..self.user_range.end;
+
+        if !left_range.is_empty()
+            && self
+                .vm
+                .unmap_range(left_range.start, left_range.range())
+                .is_err()
+        {
+            pr_err!("Vm::Drop: vm.unmap_range() failed\n");
+        }
+        if !right_range.is_empty()
+            && self
+                .vm
+                .unmap_range(right_range.start, right_range.range())
+                .is_err()
+        {
+            pr_err!("Vm::Drop: vm.unmap_range() failed\n");
+        }
+
+        self.vm.bo_deferred_cleanup();
+                return;
+        }
+
         if self
             .vm
             .unmap_user_ranges(self.user_range.clone(), self.kernel_range.clone())
