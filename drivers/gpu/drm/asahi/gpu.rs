@@ -337,24 +337,34 @@ impl G15GfxData {
         );
         let crash_off = 0x10_8000usize;
         let mut cl = [0u8; 16];
-        let mut ef = true;
-        for (i, b) in cl.iter_mut().enumerate() {
-            // SAFETY: crash_off + 16 < size (0x114000); the mapping is live.
-            *b = unsafe { core::ptr::read_volatile(self.cpu.as_ptr().add(crash_off + i)) };
-            ef &= *b == 0xef;
-        }
-        let fill = if ef {
-            "untouched 0xef fill"
+        // A device-tree fw-data region can be smaller than the J516S carveout.
+        if crash_off.checked_add(cl.len()).is_some_and(|end| end <= self.size) {
+            let mut ef = true;
+            for (i, b) in cl.iter_mut().enumerate() {
+                // SAFETY: crash_off + 16 <= size (checked above); the mapping is live.
+                *b = unsafe { core::ptr::read_volatile(self.cpu.as_ptr().add(crash_off + i)) };
+                ef &= *b == 0xef;
+            }
+            let fill = if ef {
+                "untouched 0xef fill"
+            } else {
+                "HAS DATA"
+            };
+            dev_info!(
+                dev,
+                "G15 gfx-data [{}]: crashlog +0x108000: {:02x?} ({})\n",
+                tag,
+                cl,
+                fill
+            );
         } else {
-            "HAS DATA"
-        };
-        dev_info!(
-            dev,
-            "G15 gfx-data [{}]: crashlog +0x108000: {:02x?} ({})\n",
-            tag,
-            cl,
-            fill
-        );
+            dev_info!(
+                dev,
+                "G15 gfx-data [{}]: crashlog +0x108000 is outside the {:#x}-byte region\n",
+                tag,
+                self.size
+            );
+        }
         const THREADS: [(u64, &str); 5] = [
             (0x0, "agx_background"),
             (0x140, "agx_recovery"),
