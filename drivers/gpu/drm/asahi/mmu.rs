@@ -2313,9 +2313,16 @@ impl Uat {
         name: &CStr,
         size: usize,
         cached: bool,
+        m3: bool,
     ) -> Result<UatRegion> {
         let of_node = dev.of_node().ok_or(EINVAL)?;
-        let res = crate::m3_resources::reserved_resource(&of_node, name)?;
+        // Only the T6030 owner may fall back to its static reserved-memory
+        // nodes. Every other GPU keeps the plain lookup and its errors.
+        let res = if m3 {
+            crate::m3_resources::reserved_resource(&of_node, name)?
+        } else {
+            of_node.reserved_mem_region_to_resource_byname(name)?
+        };
         let base = res.start();
         let res_size = res.size().try_into()?;
 
@@ -2494,8 +2501,9 @@ impl Uat {
     #[inline(never)]
     fn make_inner(dev: &driver::AsahiDevice, handoff_mode: HandoffMode, m3: bool) -> Result<Arc<UatInner>> {
         let cached = !matches!(handoff_mode,HandoffMode::StoppedFirmwareT6030|HandoffMode::FirmwareT6030);
-        let handoff_rgn = Self::map_region(dev.as_ref(), c_str!("handoff"), HANDOFF_SIZE, cached)?;
-        let ttbs_rgn = Self::map_region(dev.as_ref(), c_str!("ttbs"), SLOTS_SIZE, cached)?;
+        let handoff_rgn =
+            Self::map_region(dev.as_ref(), c_str!("handoff"), HANDOFF_SIZE, cached, m3)?;
+        let ttbs_rgn = Self::map_region(dev.as_ref(), c_str!("ttbs"), SLOTS_SIZE, cached, m3)?;
 
         // SAFETY: The Handoff struct layout matches the firmware's view of memory at this address,
         // and the region is at least large enough per the size specified above.
@@ -2609,7 +2617,11 @@ impl Uat {
         let inner = Self::make_inner(dev, handoff_mode, cfg.chip_id == 0x6030)?;
 
         let of_node = dev.as_ref().of_node().ok_or(EINVAL)?;
-        let res = crate::m3_resources::reserved_resource(&of_node, c_str!("pagetables"))?;
+        let res = if cfg.chip_id == 0x6030 {
+            crate::m3_resources::reserved_resource(&of_node, c_str!("pagetables"))?
+        } else {
+            of_node.reserved_mem_region_to_resource_byname(c_str!("pagetables"))?
+        };
         let ttb1 = res.start();
         let ttb1size: usize = res.size().try_into()?;
 
