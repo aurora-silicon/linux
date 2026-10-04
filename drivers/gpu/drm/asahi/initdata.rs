@@ -182,6 +182,11 @@ impl PStateTables {
             len += 1;
             last_mv = mv;
         }
+        // At least one running state must have a nonzero voltage; callers
+        // index the table up to len - 1 and clamp caps to 1..=len - 1.
+        if len < 2 {
+            return Err(EINVAL);
+        }
         Ok((primary, secondary, len))
     }
 
