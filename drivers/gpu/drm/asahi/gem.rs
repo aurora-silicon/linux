@@ -51,7 +51,7 @@ pub(crate) struct AsahiObject {
     exportable: bool,
     /// Whether this is a kernel-created object.
     kernel: bool,
-    _allocation: crate::agx_memory_stats::Allocation,
+    _allocation: Option<crate::agx_memory_stats::Allocation>,
 }
 
 /// Type alias for the shmem GEM object type for this driver.
@@ -191,6 +191,7 @@ fn new_kernel_object_with_cpu_mapping(
         shmem::ObjectConfig::<AsahiObject> {
             map_wc,
             parent_resv_obj: None,
+            synchronous_reclaim: dev.is_m3,
         },
         AsahiObjConfig {
             flags: 0,
@@ -230,6 +231,7 @@ pub(crate) fn new_object(
         shmem::ObjectConfig::<AsahiObject> {
             map_wc: flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_WRITEBACK == 0,
             parent_resv_obj: parent_object,
+            synchronous_reclaim: dev.is_m3,
         },
         AsahiObjConfig {
             flags,
@@ -250,7 +252,7 @@ impl DriverObject for AsahiObject {
     const HAS_EXPORT: bool = true;
 
     /// Callback to create the inner data of a GEM object
-    fn new(_dev: &AsahiDevice, size: usize, args: Self::Args) -> impl PinInit<Self, Error> {
+    fn new(dev: &AsahiDevice, size: usize, args: Self::Args) -> impl PinInit<Self, Error> {
         let id = GEM_ID.fetch_add(1, Ordering::Relaxed);
         mod_pr_debug!("AsahiObject::new id={}\n", id);
         try_pin_init!(AsahiObject {
@@ -258,7 +260,9 @@ impl DriverObject for AsahiObject {
             flags: args.flags,
             exportable: args.exportable,
             kernel: args.kernel,
-            _allocation: crate::agx_memory_stats::Allocation::gem(size, args.kernel)?,
+            _allocation: if dev.is_m3 {
+                Some(crate::agx_memory_stats::Allocation::gem(size, args.kernel)?)
+            } else { None },
         })
     }
 

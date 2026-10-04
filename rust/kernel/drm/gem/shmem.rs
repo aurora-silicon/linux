@@ -55,6 +55,10 @@ pub struct ObjectConfig<'a, T: DriverObject> {
     /// Whether to set the write-combine map flag.
     pub map_wc: bool,
 
+    /// Reclaim private backing pages before returning from the final free callback.
+    /// The default retains the usual deferred file-release policy.
+    pub synchronous_reclaim: bool,
+
     /// Reuse the DMA reservation from another GEM object.
     ///
     /// The newly created [`Object`] will hold an owned refcount to `parent_resv_obj` if specified.
@@ -74,6 +78,7 @@ pub struct Object<T: DriverObject> {
     obj: Opaque<bindings::drm_gem_shmem_object>,
     /// Parent object that owns this object's DMA reservation object.
     parent_resv_obj: Option<ARef<Object<T>>>,
+    synchronous_reclaim: bool,
     #[pin]
     inner: T,
 }
@@ -130,6 +135,7 @@ impl<T: DriverObject> Object<T> {
             try_pin_init!(Self {
                 obj <- Opaque::init_zeroed(),
                 parent_resv_obj: config.parent_resv_obj.map(|p| p.into()),
+                synchronous_reclaim: config.synchronous_reclaim,
                 inner <- T::new(dev, size, args),
             }),
             GFP_KERNEL,
@@ -183,7 +189,11 @@ impl<T: DriverObject> Object<T> {
         //
         // SAFETY: The final GEM reference owns filp until release below.
         // Imported objects have no private shmem file.
-        let backing = unsafe { (*obj).filp };
+        // SAFETY: This callback is installed only on a fully initialized Object<T>.
+        let owner = unsafe { container_of!(Opaque::cast_from(this), Self, obj) };
+        let backing = if unsafe { (*owner).synchronous_reclaim } {
+            unsafe { (*obj).filp }
+        } else { core::ptr::null_mut() };
         if !backing.is_null() {
             // SAFETY: The GEM reference still owns this live file.
             unsafe { bindings::get_file(backing) };
