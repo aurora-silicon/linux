@@ -770,6 +770,9 @@ static int apple_drm_init(struct device *dev)
 
 err_unbind:
 	apple_drm_quiesce_connectors(&apple->drm);
+	component_unbind_all(dev, NULL);
+	dcp_unlink(&apple->drm);
+	return ret;
 err_components:
 	component_unbind_all(dev, NULL);
 	return ret;
@@ -785,6 +788,7 @@ static void apple_drm_uninit(struct device *dev)
 
 	component_unbind_all(dev, NULL);
 
+	dcp_unlink(&apple->drm);
 	dev_set_drvdata(dev, NULL);
 }
 
