@@ -1583,7 +1583,7 @@ impl SepData {
                 break None;
             }
             if counter >= ENROL_MAX_CAPTURES {
-                dev_warn!(
+                dev_err!(
                     self.dev,
                     "enrol: capture budget exhausted ({} captures); aborting\n",
                     counter
