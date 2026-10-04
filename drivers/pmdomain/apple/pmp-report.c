@@ -317,7 +317,7 @@ static int apple_pmp_t6030_check_sram(struct apple_pmp_report *rep, uuid_t *imag
 	offset = readl(sram + PMP_SRAM_BOOTARGS_OFFSET);
 	size = readl(sram + PMP_SRAM_BOOTARGS_SIZE);
 	if (!uuid_equal(image, &want) || size < 8 || size > SZ_4K ||
-	    offset > sram_size - size || offset & 3) {
+	    size > sram_size || offset > sram_size - size || offset & 3) {
 		ret = -EINVAL;
 		goto out;
 	}
