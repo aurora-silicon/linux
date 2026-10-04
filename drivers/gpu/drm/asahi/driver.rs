@@ -275,10 +275,12 @@ kernel::of_device_table!(
             of::DeviceId::new(c_str!("apple,agx-t6022")),
             ProbeConfig::Supported(&hw::t602x::HWCONFIG_T6022)
         ),
-        // AGX3 (G15/G16/G17) identification targets. These intentionally
-        // select no HwConfig: unproved power/MMIO/firmware-tuning fields
-        // must never be represented by copied or zero-filled legacy values,
-        // and the probe fails closed before any firmware handoff.
+        // AGX3 (G15) identification targets. These intentionally select no
+        // HwConfig: unproved power/MMIO/firmware-tuning fields must never be
+        // represented by copied or zero-filled legacy values. T6030 starts
+        // the M3 runtime; the others fail closed before any firmware handoff.
+        // The M4 (G16) and M5/A18 Pro (G17) bring-up runtimes are not bound
+        // in this kernel.
         (
             of::DeviceId::new(c_str!("apple,agx-t8122")),
             ProbeConfig::Agx3Diagnostic(&hw::agx3::T8122)
@@ -294,42 +296,6 @@ kernel::of_device_table!(
         (
             of::DeviceId::new(c_str!("apple,agx-t6032")),
             ProbeConfig::Agx3Diagnostic(&hw::agx3::T6032)
-        ),
-        (
-            of::DeviceId::new(c_str!("apple,agx-t8132")),
-            ProbeConfig::Agx3Diagnostic(&hw::agx3::T8132)
-        ),
-        (
-            of::DeviceId::new(c_str!("apple,agx-t6040")),
-            ProbeConfig::Agx3Diagnostic(&hw::agx3::T6040)
-        ),
-        (
-            of::DeviceId::new(c_str!("apple,agx-t6041")),
-            ProbeConfig::Agx3Diagnostic(&hw::agx3::T6041)
-        ),
-        (
-            of::DeviceId::new(c_str!("apple,agx-t8140")),
-            ProbeConfig::Agx3Diagnostic(&hw::agx3::T8140)
-        ),
-        (
-            of::DeviceId::new(c_str!("gpu,t8140")),
-            ProbeConfig::Agx3Diagnostic(&hw::agx3::T8140)
-        ),
-        (
-            of::DeviceId::new(c_str!("apple,agx-t8142")),
-            ProbeConfig::Agx3Diagnostic(&hw::agx3::T8142)
-        ),
-        (
-            of::DeviceId::new(c_str!("apple,agx-t6050")),
-            ProbeConfig::Agx3Diagnostic(&hw::agx3::T6050)
-        ),
-        (
-            of::DeviceId::new(c_str!("apple,agx-t6051")),
-            ProbeConfig::Agx3Diagnostic(&hw::agx3::T6051)
-        ),
-        (
-            of::DeviceId::new(c_str!("gpu,t6050")),
-            ProbeConfig::Agx3Diagnostic(&hw::agx3::T6050)
         ),
     ]
 );

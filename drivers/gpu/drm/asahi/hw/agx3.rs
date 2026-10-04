@@ -58,19 +58,13 @@ pub(crate) const T6031: SocConfig = agx3(0x6031, GpuGen::G15, GpuVariant::C, 0x7
 /// Apple M3 Ultra (G15D, two dies).
 pub(crate) const T6032: SocConfig = agx3(0x6032, GpuGen::G15, GpuVariant::D, 0x7, 4, 2);
 
+// The A18 Pro (G17P) and M4 (G16G) GPUs are not bound in this kernel; their
+// identities stay as test fixtures for the shared identity decoder.
+#[cfg(test)]
 pub(crate) const T8140: SocConfig = agx3(0x8140, GpuGen::G17, GpuVariant::P, 0xa, 0, 1);
 /// Apple M4 (G16G).
+#[cfg(test)]
 pub(crate) const T8132: SocConfig = agx3(0x8132, GpuGen::G16, GpuVariant::G, 0xa, 2, 1);
-/// Apple M4 Pro (G16S).
-pub(crate) const T6040: SocConfig = agx3(0x6040, GpuGen::G16, GpuVariant::S, 0xa, 3, 1);
-/// Apple M4 Max (G16C).
-pub(crate) const T6041: SocConfig = agx3(0x6041, GpuGen::G16, GpuVariant::C, 0xa, 4, 1);
-
-pub(crate) const T8142: SocConfig = agx3(0x8142, GpuGen::G17, GpuVariant::G, 0xb, 2, 1);
-/// Apple M5 Pro (G17S).
-pub(crate) const T6050: SocConfig = agx3(0x6050, GpuGen::G17, GpuVariant::S, 0xb, 3, 1);
-/// Apple M5 Max (G17C).
-pub(crate) const T6051: SocConfig = agx3(0x6051, GpuGen::G17, GpuVariant::C, 0xb, 4, 1);
 
 
 // -------------------------------------------------------------------------
@@ -184,9 +178,7 @@ mod tests {
     };
     use super::*;
 
-    const ALL: [&SocConfig; 11] = [
-        &T8122, &T6030, &T6031, &T6032, &T8140, &T8132, &T6040, &T6041, &T8142, &T6050, &T6051,
-    ];
+    const ALL: [&SocConfig; 6] = [&T8122, &T6030, &T6031, &T6032, &T8140, &T8132];
 
     #[test]
     fn every_soc_decodes_to_its_stated_identity() {
