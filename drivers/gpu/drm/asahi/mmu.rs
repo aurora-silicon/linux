@@ -1454,14 +1454,17 @@ impl Handoff {
     fn try_lock(&self) -> Result<HandoffGuard<'_>> {
         let start = Instant::<Monotonic>::now();
         self.try_lock_until(|| start.elapsed() >= Delta::from_millis(100))
+            .inspect_err(|_| {
+                pr_err!("UAT handoff: firmware exclusion timed out; AP interest withdrawn\n");
+            })
     }
 
-    /// `try_lock` with a caller-supplied expiry test.
+    /// `try_lock` with a caller-supplied expiry test. A timeout returns
+    /// ETIMEDOUT without logging, so the probe self-check stays quiet.
     fn try_lock_until(&self, expired: impl FnMut() -> bool) -> Result<HandoffGuard<'_>> {
         if !crate::handoff_lock::acquire(&self.lock_ap, &self.lock_fw, &self.turn,
             expired,
             || fsleep(Delta::from_micros(20))) {
-            pr_err!("UAT handoff: firmware exclusion timed out; AP interest withdrawn\n");
             return Err(ETIMEDOUT);
         }
         Ok(HandoffGuard(self, false))
