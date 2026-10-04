@@ -730,7 +730,7 @@ impl GpuManager::ver {
         let buffer_mgr = buffer::BufferManager::ver::new()?;
         let event_manager_clone = event_manager.clone();
         let buffer_mgr_clone = buffer_mgr.clone();
-        let stats_snap = Arc::new(stats::StatsSnapshot::default(), GFP_KERNEL);
+        let stats_snap = Arc::new(stats::StatsSnapshot::default(), GFP_KERNEL)?;
         // Publish the snapshot pointer to the C sysfs shim. It is cleared
         // (by the same shim) on registration removal; until then readers see
         // a stable pointer and AtomicU* races that govern.
