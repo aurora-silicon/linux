@@ -85,9 +85,7 @@ impl Buffer {
             Backing::Paged(object)=>Ok(object.cached_vmap()?.as_mut_ptr()),
         }
     }
-    pub(crate) fn replace_gpu_view(&mut self, mapping: mmu::KernelMapping) {
-        self.gpu_mapping = Some(mapping);
-    }
+
     pub(crate) fn swap_gpu_view(&mut self, mapping: mmu::KernelMapping)->Result<mmu::KernelMapping> {
         self.gpu_mapping.replace(mapping).ok_or(EINVAL)
     }

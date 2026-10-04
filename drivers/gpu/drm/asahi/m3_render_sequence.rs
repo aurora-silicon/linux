@@ -4,37 +4,37 @@ use crate::{m3_init_layout::{Error, Region}, m3_queue_layout::FirmwareVa,
 pub(crate) const STORAGE: usize = 0x1000;
 pub(crate) const USER_TIMESTAMP_POINTER: usize = 0x24;
 pub(crate) mod ta {
-    pub const TIMESTAMP_START: usize = 0x1cc;
-    pub const TIMESTAMP_END: usize = 0x20c;
-    pub const FINALIZE: usize = 0x248;
-    pub const LENGTH: usize = 0x2d8;
-    pub const POOL: usize = 0x18c;
-    pub const COMMAND_TAIL: usize = 0x8a8;
-    pub const USER_PAIR: usize = COMMAND_TAIL + 0x18;
-    pub const REGISTERS: usize = 0x40;
-    pub const STRUCT3: usize = 0x784;
-    pub const SAMPLER_ARRAY: usize = 0x84c;
-    pub const SCRATCH_STATE: usize = 0x890;
-    pub const STATS: usize = 0x1884;
-    pub const UUID: u32 = 0x7a0000;
+    pub(crate) const TIMESTAMP_START: usize = 0x1cc;
+    pub(crate) const TIMESTAMP_END: usize = 0x20c;
+    pub(crate) const FINALIZE: usize = 0x248;
+    pub(crate) const LENGTH: usize = 0x2d8;
+    pub(crate) const POOL: usize = 0x18c;
+    pub(crate) const COMMAND_TAIL: usize = 0x8a8;
+    pub(crate) const USER_PAIR: usize = COMMAND_TAIL + 0x18;
+    pub(crate) const REGISTERS: usize = 0x40;
+    pub(crate) const STRUCT3: usize = 0x784;
+    pub(crate) const SAMPLER_ARRAY: usize = 0x84c;
+    pub(crate) const SCRATCH_STATE: usize = 0x890;
+    pub(crate) const STATS: usize = 0x1884;
+    pub(crate) const UUID: u32 = 0x7a0000;
 }
 pub(crate) mod fragment {
-    pub const TIMESTAMP_START: usize = 0x1dc;
-    pub const TIMESTAMP_END: usize = 0x21c;
-    pub const FINALIZE: usize = 0x258;
-    pub const LENGTH: usize = 0x310;
-    pub const POOL: usize = 0x1a4;
-    pub const COMMAND_TAIL: usize = 0xbf0;
-    pub const USER_PAIR: usize = COMMAND_TAIL + 0x18;
-    pub const REGISTERS: usize = 0x80;
-    pub const BUSY: usize = 0xb70;
-    pub const STRUCT6: usize = 0xb74;
+    pub(crate) const TIMESTAMP_START: usize = 0x1dc;
+    pub(crate) const TIMESTAMP_END: usize = 0x21c;
+    pub(crate) const FINALIZE: usize = 0x258;
+    pub(crate) const LENGTH: usize = 0x310;
+    pub(crate) const POOL: usize = 0x1a4;
+    pub(crate) const COMMAND_TAIL: usize = 0xbf0;
+    pub(crate) const USER_PAIR: usize = COMMAND_TAIL + 0x18;
+    pub(crate) const REGISTERS: usize = 0x80;
+    pub(crate) const BUSY: usize = 0xb70;
+    pub(crate) const STRUCT6: usize = 0xb74;
     // Start.struct7 and Finalize.job_meta refer to this prefix, not +0xbac.
-    pub const STRUCT7: usize = 0xba0;
-    pub const SCRATCH_FLAG: usize = 0xa58;
-    pub const SCRATCH_STATE: usize = 0xbd8;
-    pub const STATS: usize = 0x24c8;
-    pub const UUID: u32 = 0x3d0000;
+    pub(crate) const STRUCT7: usize = 0xba0;
+    pub(crate) const SCRATCH_FLAG: usize = 0xa58;
+    pub(crate) const SCRATCH_STATE: usize = 0xbd8;
+    pub(crate) const STATS: usize = 0x24c8;
+    pub(crate) const UUID: u32 = 0x3d0000;
 }
 fn word(out: &mut [u8], off: usize, value: u32) { out[off..off+4].copy_from_slice(&value.to_le_bytes()); }
 fn pointer(out: &mut [u8], off: usize, value: u64) { out[off..off+8].copy_from_slice(&value.to_le_bytes()); }

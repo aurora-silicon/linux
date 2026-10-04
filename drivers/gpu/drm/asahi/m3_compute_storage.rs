@@ -17,7 +17,6 @@ pub(crate) const QUEUE_SCRATCH:usize=34;
 pub(crate) const STAMP:usize=35;
 pub(crate) const FW_STAMP:usize=36;
 pub(crate) const TIMESTAMPS:[usize;2]=[37,38];
-pub(crate) const USER_TIMESTAMPS:[usize;2]=[39,40];
 pub(crate) const PREEMPTION:usize=41;
 pub(crate) const COMMAND:usize=42;
 pub(crate) const TAIL_SCRATCH:usize=43;

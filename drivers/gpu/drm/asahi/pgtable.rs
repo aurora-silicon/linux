@@ -86,33 +86,6 @@ const fn complete_coverage(expected: u64, visited: u64, permitted: bool) -> bool
     permitted && visited == expected
 }
 
-/// One maximal run of leaf-mapped pages found by
-/// [`UatPageTable::collect_mapped_ranges`].
-///
-/// `pte` is the run's first leaf entry, kept so a caller can tell a
-/// GPU-readable mapping apart from a firmware-only one without walking again.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
-pub(crate) struct MappedRange {
-    pub(crate) start: u64,
-    pub(crate) end: u64,
-    pub(crate) pte: u64,
-}
-
-fn push_mapped_range(
-    out: &mut [MappedRange],
-    count: &mut usize,
-    truncated: &mut bool,
-    run: MappedRange,
-) {
-    match out.get_mut(*count) {
-        Some(slot) => {
-            *slot = run;
-            *count += 1;
-        }
-        None => *truncated = true,
-    }
-}
-
 #[cfg(CONFIG_DEV_COREDUMP)]
 pub(crate) const PTE_ADDR_BITS: u64 = (!UAT_PGMSK as u64) & (!UAT_HIGH_BITS);
 
@@ -170,11 +143,6 @@ pub(crate) mod prot {
     pub(crate) const PROT_FW_MMIO_RW: Prot = PROT_FW_RW.memattr(MEMATTR_DEV);
     /// Firmware MMIO R/O
     pub(crate) const PROT_FW_MMIO_RO: Prot = PROT_FW_RO.memattr(MEMATTR_DEV);
-    /// M4 loader slot 36: protected device leaf (AP=3, PXN, no GPU access).
-    /// This is a firmware register aperture, never a userspace permission.
-    pub(crate) const PROT_FW_PROTECTED_MMIO: Prot = Prot {
-        memattr: MEMATTR_DEV, ap: 3, high_bits: HIGH_BITS_PXN,
-    };
     /// Firmware shared (uncached) RW
     pub(crate) const PROT_FW_SHARED_RW: Prot = PROT_FW_RW.memattr(MEMATTR_UNCACHED);
     /// Firmware shared (uncached) RO
@@ -399,8 +367,6 @@ impl UatPageTable {
             coverage: None,
         })
     }
-
-
 
     pub(crate) fn new_m3_coherent(ias:u8,oas:u32,dev:&crate::driver::AsahiDevice)->Result<Self> {
         let mut table=Self::new(ias,oas)?;
@@ -1061,62 +1027,6 @@ impl UatPageTable {
         let covered = complete_coverage(expected, visited, permitted);
         if cache && covered { if let Some(cache) = &mut self.coverage { cache.remember(start, end, need_read, need_write); } }
         Ok(covered)
-    }
-
-    /// Collect the maximal runs of leaf-mapped pages inside `iova_range`.
-    ///
-    /// This reads page-table memory only -- ordinary DRAM, never GPU MMIO --
-    /// so it is safe to call with the GPU cores power-gated, which is the
-    /// state a faulted submission leaves them in.  Holes are skipped at
-    /// whole-table granularity by `with_pages`, so walking the full user
-    /// window costs one pass over the tables that actually exist.
-    ///
-    /// Returns the number of runs written to `out` and whether `out` was too
-    /// small to hold them all.
-    pub(crate) fn collect_mapped_ranges(
-        &mut self,
-        iova_range: Range<u64>,
-        out: &mut [MappedRange],
-    ) -> Result<(usize, bool)> {
-        if (iova_range.start | iova_range.end) & UAT_PGMSK as u64 != 0 {
-            return Err(EINVAL);
-        }
-
-        let page = UAT_PGSZ as u64;
-        let mut count = 0usize;
-        let mut truncated = false;
-        let mut current: Option<MappedRange> = None;
-
-        self.with_pages(iova_range, false, false, false, |iova, ptes| {
-            for (idx, ppte) in ptes.iter().enumerate() {
-                let pte = ppte.load(Ordering::Acquire);
-                let addr = iova + (idx as u64) * page;
-                if pte & PTE_TYPE_BITS == PTE_TYPE_LEAF_TABLE {
-                    if let Some(run) = current.as_mut() {
-                        if run.end == addr {
-                            run.end = addr + page;
-                            continue;
-                        }
-                    }
-                    if let Some(run) = current.take() {
-                        push_mapped_range(out, &mut count, &mut truncated, run);
-                    }
-                    current = Some(MappedRange {
-                        start: addr,
-                        end: addr + page,
-                        pte,
-                    });
-                } else if let Some(run) = current.take() {
-                    push_mapped_range(out, &mut count, &mut truncated, run);
-                }
-            }
-            Ok(())
-        })?;
-
-        if let Some(run) = current.take() {
-            push_mapped_range(out, &mut count, &mut truncated, run);
-        }
-        Ok((count, truncated))
     }
 
     fn pte_bits(&self) -> u64 {

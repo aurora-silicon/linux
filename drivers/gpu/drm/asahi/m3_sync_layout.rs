@@ -4,24 +4,24 @@ use crate::m3_queue_layout::{Error, FirmwareVa};
 pub(crate) const INIT_BM_SIZE: usize = 0x20;
 pub(crate) const BARRIER_SIZE: usize = 0x3e;
 mod init {
-    pub const OPCODE: usize = 0;
-    pub const CONTEXT: usize = 4;
-    pub const SLOT: usize = 8;
+    pub(crate) const OPCODE: usize = 0;
+    pub(crate) const CONTEXT: usize = 4;
+    pub(crate) const SLOT: usize = 8;
     // 0xc: unresolved block_count2, zero in the qualified producer.
-    pub const BLOCK_COUNT: usize = 0x10;
-    pub const MANAGER: usize = 0x14;
-    pub const STAMP: usize = 0x1c;
+    pub(crate) const BLOCK_COUNT: usize = 0x10;
+    pub(crate) const MANAGER: usize = 0x14;
+    pub(crate) const STAMP: usize = 0x1c;
 }
 mod barrier {
-    pub const OPCODE: usize = 0;
-    pub const STAMP: usize = 4;
-    pub const STAMP2: usize = 0xc;
-    pub const WAIT_VALUE: usize = 0x14;
-    pub const EVENT: usize = 0x18;
-    pub const SELF_VALUE: usize = 0x1c;
-    pub const UUID: usize = 0x20;
+    pub(crate) const OPCODE: usize = 0;
+    pub(crate) const STAMP: usize = 4;
+    pub(crate) const STAMP2: usize = 0xc;
+    pub(crate) const WAIT_VALUE: usize = 0x14;
+    pub(crate) const EVENT: usize = 0x18;
+    pub(crate) const SELF_VALUE: usize = 0x1c;
+    pub(crate) const UUID: usize = 0x20;
     // 0x24: unresolved u16, 0x26: external-barrier u32, both zero.
-    pub const INTERNAL_TYPE: usize = 0x2a;
+    pub(crate) const INTERNAL_TYPE: usize = 0x2a;
 }
 fn u32_at(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());

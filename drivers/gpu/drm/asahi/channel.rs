@@ -658,13 +658,6 @@ impl DeviceControlChannel::ver {
         self.ch.wait_for(wptr, Self::COMMAND_TIMEOUT_MS)
     }
 
-    /// Read-only snapshot of the 14.x ring index words (G15: in Fender SRAM). None before 14.x.
-    pub(crate) fn indices(&self) -> Option<RingIndices> {
-        #[ver(V >= V14_8_3)]
-        return Some(self.ch.indices());
-        #[ver(V < V14_8_3)]
-        return None;
-    }
 }
 
 /// Pipe channel to submit WorkQueue execution requests.
@@ -732,13 +725,6 @@ impl PipeChannel::ver {
         self.ch.put(msg);
     }
 
-    /// Read-only snapshot of the 14.x ring index words (G15: in Fender SRAM). None before 14.x.
-    pub(crate) fn indices(&self) -> Option<RingIndices> {
-        #[ver(V >= V14_8_3)]
-        return Some(self.ch.indices());
-        #[ver(V < V14_8_3)]
-        return None;
-    }
 }
 
 /// Ring storage of the Firmware Control channel.
@@ -861,10 +847,6 @@ impl EventChannel::ver {
             received: 0,
         })
     }
-
-
-
-
 
     /// Registers the managing `Gpu` instance that will handle events on this channel.
     pub(crate) fn set_manager(&mut self, gpu: Arc<dyn gpu::GpuManager>) {
@@ -1326,5 +1308,19 @@ impl EventChannelG15V14_8_3 {
     }
     pub(crate) fn ring_snapshot(&self) -> KVec<(u32, u32)> {
         self.ch.snapshot()
+    }
+}
+
+impl DeviceControlChannelG15V14_8_3 {
+    /// Read the retained G15 ring index words.
+    pub(crate) fn indices(&self) -> Option<RingIndices> {
+        Some(self.ch.indices())
+    }
+}
+
+impl PipeChannelG15V14_8_3 {
+    /// Read the retained G15 ring index words.
+    pub(crate) fn indices(&self) -> Option<RingIndices> {
+        Some(self.ch.indices())
     }
 }

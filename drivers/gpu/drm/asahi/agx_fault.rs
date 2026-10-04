@@ -6,7 +6,6 @@
 //! are sequential observations, not atomic with running firmware.
 
 use kernel::{prelude::*, time::{ClockSource, Monotonic}};
-use crate::agx_memory::Buffer;
 
 pub(crate) struct Dump {
     bytes: KVVec<u8>,
@@ -15,9 +14,6 @@ pub(crate) struct Dump {
 }
 
 impl Dump {
-    pub(crate) fn new(job: u64) -> Result<Self> {
-        Self::with_format(job, b"M4FWD001", 16 * 1024 * 1024)
-    }
 
     /// M3 snapshots have no scheduler job ID yet and contain only bounded
     /// driver-owned firmware configuration and channel storage.
@@ -67,16 +63,12 @@ impl Dump {
         Ok(())
     }
 
-    pub(crate) fn buffer(&mut self, name: &str, buffer: &mut Buffer, size: usize) -> Result {
-        self.record(name, buffer.va(), size, |out| buffer.read(0, out))
-    }
-
     pub(crate) fn publish(mut self, dev: &kernel::device::Device) -> Result {
         let length = self.bytes.len();
         self.bytes[8..12].copy_from_slice(&self.count.to_le_bytes());
         self.bytes[12..16].copy_from_slice(&1u32.to_le_bytes());
         self.bytes[32..40].copy_from_slice(&(length as u64).to_le_bytes());
-        let format = if &self.bytes[..8] == b"M4FWD001" { "M4FWD001" } else { "M3FWD001" };
+        let format = "M3FWD001";
         let owned = KBox::new(self, GFP_NOWAIT)?;
         kernel::devcoredump::dev_coredump(dev, &crate::THIS_MODULE, owned, GFP_NOWAIT,
             kernel::devcoredump::DEFAULT_TIMEOUT);

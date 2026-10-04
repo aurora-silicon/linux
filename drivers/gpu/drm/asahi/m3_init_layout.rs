@@ -30,19 +30,19 @@ fn pointer(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 mod root {
-    pub const VERSION: usize = 0;
-    pub const REGION_A: usize = 8;
-    pub const RUNTIME: usize = 0x18;
-    pub const GLOBALS: usize = 0x20;
-    pub const HOST_ALLOCATIONS: usize = 0x2c;
-    pub const PAGE_SIZE: usize = 0x30;
-    pub const PAGE_BITS: usize = 0x32;
-    pub const LEVEL_COUNT: usize = 0x33;
-    pub const LEVELS: usize = 0x34;
-    pub const LEVEL_STRIDE: usize = 0x20;
-    pub const NEW_A: usize = 0xa8;
-    pub const CONTROL: usize = 0xb0;
-    pub const POWER: usize = 0xb8;
+    pub(crate) const VERSION: usize = 0;
+    pub(crate) const REGION_A: usize = 8;
+    pub(crate) const RUNTIME: usize = 0x18;
+    pub(crate) const GLOBALS: usize = 0x20;
+    pub(crate) const HOST_ALLOCATIONS: usize = 0x2c;
+    pub(crate) const PAGE_SIZE: usize = 0x30;
+    pub(crate) const PAGE_BITS: usize = 0x32;
+    pub(crate) const LEVEL_COUNT: usize = 0x33;
+    pub(crate) const LEVELS: usize = 0x34;
+    pub(crate) const LEVEL_STRIDE: usize = 0x20;
+    pub(crate) const NEW_A: usize = 0xa8;
+    pub(crate) const CONTROL: usize = 0xb0;
+    pub(crate) const POWER: usize = 0xb8;
 }
 pub(crate) struct Root {
     pub(crate) region_a: Region,
@@ -90,21 +90,21 @@ impl Root {
 #[derive(Clone, Copy)]
 pub(crate) struct Channel { pub(crate) state: Region, pub(crate) ring: Region }
 mod runtime {
-    pub const HARDWARE: usize = 0;
-    pub const UNKNOWN_PAIR: [usize; 2] = [8, 16];
-    pub const HOST_CHANNELS: usize = 0x18;
-    pub const HOST_CHANNEL_COUNT: usize = 13;
-    pub const HOST_CHANNEL_STRIDE: usize = 0x20;
-    pub const FIRMWARE_CHANNELS: usize = 0x1b8;
-    pub const FIRMWARE_CHANNEL_STRIDE: usize = 0x10;
-    pub const UNKNOWN_SMALL: usize = 0x1f8;
-    pub const HARDWARE_B_VIEWS: [usize; 4] = [0x234, 0x23c, 0x244, 0x24c];
-    pub const UNKNOWN_C0: usize = 0x2a8;
-    pub const UNKNOWN_C1: [usize; 2] = [0x2b0, 0x2b8];
-    pub const UNKNOWN_C3: [usize; 2] = [0x2c0, 0x2c8];
-    pub const UNKNOWN_2D0: usize = 0x2d0;
-    pub const UNKNOWN_3B0: usize = 0x3b0;
-    pub const HARDWARE_A: usize = 0x441;
+    pub(crate) const HARDWARE: usize = 0;
+    pub(crate) const UNKNOWN_PAIR: [usize; 2] = [8, 16];
+    pub(crate) const HOST_CHANNELS: usize = 0x18;
+    pub(crate) const HOST_CHANNEL_COUNT: usize = 13;
+    pub(crate) const HOST_CHANNEL_STRIDE: usize = 0x20;
+    pub(crate) const FIRMWARE_CHANNELS: usize = 0x1b8;
+    pub(crate) const FIRMWARE_CHANNEL_STRIDE: usize = 0x10;
+    pub(crate) const UNKNOWN_SMALL: usize = 0x1f8;
+    pub(crate) const HARDWARE_B_VIEWS: [usize; 4] = [0x234, 0x23c, 0x244, 0x24c];
+    pub(crate) const UNKNOWN_C0: usize = 0x2a8;
+    pub(crate) const UNKNOWN_C1: [usize; 2] = [0x2b0, 0x2b8];
+    pub(crate) const UNKNOWN_C3: [usize; 2] = [0x2c0, 0x2c8];
+    pub(crate) const UNKNOWN_2D0: usize = 0x2d0;
+    pub(crate) const UNKNOWN_3B0: usize = 0x3b0;
+    pub(crate) const HARDWARE_A: usize = 0x441;
 }
 pub(crate) struct RuntimePointers {
     pub(crate) hardware: Region,
@@ -159,10 +159,10 @@ impl RuntimePointers {
 }
 
 mod control {
-    pub const UNKNOWN_4: usize = 4;
-    pub const CHANNEL_STATE: usize = 0x4568;
-    pub const CHANNEL_RING: usize = 0x4570;
-    pub const UNKNOWN_45C4: usize = 0x45c4;
+    pub(crate) const UNKNOWN_4: usize = 4;
+    pub(crate) const CHANNEL_STATE: usize = 0x4568;
+    pub(crate) const CHANNEL_RING: usize = 0x4570;
+    pub(crate) const UNKNOWN_45C4: usize = 0x45c4;
 }
 pub(crate) struct ControlRegion { pub(crate) channel: Channel }
 impl ControlRegion {

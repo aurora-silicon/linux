@@ -307,7 +307,7 @@ impl Compute {
             self.objects[storage::QUEUE_STATE].read_u32(queue::READ)?, self.head);
         Ok(())
     }
-    pub(crate) fn registers(&self)->Result<u64> {Ok(self.objects[storage::COMMAND].gpu_va()?+command::REGISTERS as u64)}
+
     pub(crate) fn queue(&self)->u64 {self.objects[storage::QUEUE].va()}
     pub(crate) fn complete(&mut self)->Result<bool> {
         Ok(self.objects[storage::STAMP].read_u32(0)?==self.stamp()

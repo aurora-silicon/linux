@@ -720,36 +720,15 @@ impl Drop for M3VmJobGuard {
     }
 }
 
-
 struct VmDriverMappings {
     mappings: KVec<KernelMapping>,
     reserved_ranges: KVec<Range<u64>>,
-    render_pool: Option<VmRenderPoolMappings>,
-    compute_pool: Option<VmRenderPoolMappings>,
 }
 no_debug!(VmDriverMappings);
 
-/// Cached aliases of one retained render pool in this VM. KernelMapping owns
-/// GpuVm<VmInner>, which has no back-reference to Vm::driver_mappings. Do not
-/// retain a Vm, VmBind or application-context lease here: those own the outer
-/// Vm and would make this cache keep itself alive.
-struct VmRenderPoolMappings {
-    pool_id: u64,
-    /// Number of this pool's TVB blocks mapped in this VM (zero for compute).
-    tvb_blocks: usize,
-    mappings: KVec<KernelMapping>,
-}
-no_debug!(VmRenderPoolMappings);
-
 impl VmDriverMappings {
     fn iter_mappings(&self) -> impl Iterator<Item = &KernelMapping> {
-        Iterator::chain(
-            Iterator::chain(
-                self.mappings.iter(),
-                self.compute_pool.iter().flat_map(|pool| pool.mappings.iter()),
-            ),
-            self.render_pool.iter().flat_map(|pool| pool.mappings.iter()),
-        )
+        self.mappings.iter()
     }
 }
 
@@ -863,60 +842,6 @@ impl KernelMapping {
     /// Returns the IOVA base of this mapping
     pub(crate) fn iova_range(&self) -> Range<u64> {
         self.0.start()..(self.0.start() + self.0.mapped_size as u64)
-    }
-
-    /// Borrow the mapped GEM subrange through a temporary CPU mapping.
-    ///
-    /// The caller must serialize CPU access with firmware or GPU writes. This
-    /// helper only owns the kernel VMap lifetime and applies the object offset
-    /// carried by this mapping.
-    pub(crate) fn with_cpu_bytes<R>(
-        &self,
-        f: impl FnOnce(&mut [u8]) -> Result<R>,
-    ) -> Result<R> {
-        let gem = self.0._gem.as_ref().ok_or(EINVAL)?;
-        let end = self
-            .0
-            .offset
-            .checked_add(self.0.mapped_size)
-            .ok_or(EOVERFLOW)?;
-        if end > gem.size() {
-            return Err(ERANGE);
-        }
-        let vmap = gem.vmap::<u8>()?;
-        let bytes = unsafe {
-            // SAFETY: the VMap covers the complete GEM allocation and the
-            // checked subrange is retained by this KernelMapping.
-            core::slice::from_raw_parts_mut(
-                vmap.as_mut_ptr().add(self.0.offset),
-                self.0.mapped_size,
-            )
-        };
-        f(bytes)
-    }
-
-    /// Map the same GEM subrange into another VM. The caller owns the returned
-    /// alias and must retain it for every GPU access that uses its address.
-    pub(crate) fn map_alias_into_range(
-        &self,
-        vm: &Vm,
-        range: Range<u64>,
-        prot: Prot,
-    ) -> Result<KernelMapping> {
-        let gem = self.0._gem.as_ref().ok_or(EINVAL)?;
-        let end = self
-            .0
-            .offset
-            .checked_add(self.0.mapped_size)
-            .ok_or(EOVERFLOW)?;
-        vm.map_in_range(
-            &*gem,
-            self.0.offset..end,
-            UAT_PGSZ as u64,
-            range,
-            prot,
-            false,
-        )
     }
 
     fn remap_uncached_and_flush_legacy(&mut self) {
@@ -1759,131 +1684,8 @@ impl Vm {
         *retained = Some(VmDriverMappings {
             mappings,
             reserved_ranges,
-            render_pool: None,
-            compute_pool: None,
         });
         Ok(())
-    }
-
-    /// Whether this VM already retains aliases of the exact render-pool
-    /// generation. The caller allocates pool IDs monotonically, never from a
-    /// recyclable GPU address, so a new firmware session cannot reuse stale
-    /// aliases merely because its backing landed at the same address.
-    pub(crate) fn render_pool_mappings_match(&self, pool_id: u64) -> bool {
-        let Some(driver_mappings) = &self.driver_mappings else { return false; };
-        pool_id != 0
-            && driver_mappings.lock().as_ref().is_some_and(|driver| {
-                driver
-                    .render_pool
-                    .as_ref()
-                    .is_some_and(|pool| pool.pool_id == pool_id)
-            })
-    }
-
-    /// Retain the first-use render aliases and exclude them from user unmaps.
-    /// Installation never replaces a live generation; callers must retire its
-    /// GPU work and explicitly clear it before installing a different pool.
-    pub(crate) fn install_render_pool_mappings(
-        &self,
-        pool_id: u64,
-        tvb_blocks: usize,
-        mappings: KVec<KernelMapping>,
-    ) -> Result {
-        if pool_id == 0 {
-            return Err(EINVAL);
-        }
-        let mut retained = self.driver_mappings.as_ref().ok_or(EINVAL)?.lock();
-        let driver = Option::as_mut(&mut *retained).ok_or(EINVAL)?;
-        if driver.render_pool.is_some() {
-            return Err(EBUSY);
-        }
-        driver.render_pool = Some(VmRenderPoolMappings { pool_id, tvb_blocks, mappings });
-        Ok(())
-    }
-
-    pub(crate) fn render_pool_tvb_blocks(&self, pool_id: u64) -> Option<usize> {
-        if pool_id == 0 { return None; }
-        self.driver_mappings.as_ref()?.lock().as_ref()?.render_pool.as_ref()
-            .filter(|pool| pool.pool_id == pool_id).map(|pool| pool.tvb_blocks)
-    }
-
-    /// Append newly backed blocks without replacing any existing VM alias.
-    /// Both allocation and the expected-capacity check precede mutation. The
-    /// caller only publishes the enlarged PM pool after this succeeds.
-    pub(crate) fn append_render_pool_mappings(
-        &self, pool_id: u64, previous_blocks: usize, tvb_blocks: usize,
-        mappings: KVec<KernelMapping>,
-    ) -> Result {
-        if pool_id == 0 || tvb_blocks <= previous_blocks
-            || mappings.len() != tvb_blocks - previous_blocks { return Err(EINVAL); }
-        let mut retained = self.driver_mappings.as_ref().ok_or(EINVAL)?.lock();
-        let pool = Option::as_mut(&mut *retained).and_then(|driver| driver.render_pool.as_mut())
-            .filter(|pool| pool.pool_id == pool_id).ok_or(EINVAL)?;
-        if pool.tvb_blocks != previous_blocks { return Err(EBUSY); }
-        let added = mappings.len();
-        let length = pool.mappings.len().checked_add(added).ok_or(EOVERFLOW)?;
-        pool.mappings.reserve(added, GFP_KERNEL)?;
-        for (slot, mapping) in pool.mappings.spare_capacity_mut().iter_mut().zip(mappings) {
-            slot.write(mapping);
-        }
-        // SAFETY: reserve provided room for every element of the exact-size
-        // mapping vector, and the loop initialized those added slots once.
-        unsafe { pool.mappings.set_len(length); }
-        pool.tvb_blocks = tvb_blocks;
-        Ok(())
-    }
-
-    /// Release an obsolete pool after its GPU references have retired. Drop
-    /// outside driver_mappings: KernelMapping teardown takes the GPUVM lock.
-    pub(crate) fn clear_render_pool_mappings(&self) {
-        let Some(driver_mappings) = &self.driver_mappings else { return; };
-        let previous = {
-            let mut retained = driver_mappings.lock();
-            Option::as_mut(&mut *retained).and_then(|driver| driver.render_pool.take())
-        };
-        drop(previous);
-    }
-
-    pub(crate) fn compute_pool_mappings_match(&self, pool_id: u64) -> bool {
-        let Some(driver_mappings) = &self.driver_mappings else { return false; };
-        pool_id != 0
-            && driver_mappings.lock().as_ref().is_some_and(|driver| {
-                driver
-                    .compute_pool
-                    .as_ref()
-                    .is_some_and(|pool| pool.pool_id == pool_id)
-            })
-    }
-
-    /// Retain the first-use compute aliases and exclude them from user unmaps.
-    /// Installation never replaces a live generation; callers must retire its
-    /// GPU work and explicitly clear it before installing a different pool.
-    pub(crate) fn install_compute_pool_mappings(
-        &self,
-        pool_id: u64,
-        mappings: KVec<KernelMapping>,
-    ) -> Result {
-        if pool_id == 0 {
-            return Err(EINVAL);
-        }
-        let mut retained = self.driver_mappings.as_ref().ok_or(EINVAL)?.lock();
-        let driver = Option::as_mut(&mut *retained).ok_or(EINVAL)?;
-        if driver.compute_pool.is_some() {
-            return Err(EBUSY);
-        }
-        driver.compute_pool = Some(VmRenderPoolMappings { pool_id, tvb_blocks: 0, mappings });
-        Ok(())
-    }
-
-    /// Release an obsolete pool after its GPU references have retired. Drop
-    /// outside driver_mappings: KernelMapping teardown takes the GPUVM lock.
-    pub(crate) fn clear_compute_pool_mappings(&self) {
-        let Some(driver_mappings) = &self.driver_mappings else { return; };
-        let previous = {
-            let mut retained = driver_mappings.lock();
-            Option::as_mut(&mut *retained).and_then(|driver| driver.compute_pool.take())
-        };
-        drop(previous);
     }
 
     pub(crate) fn driver_range_overlaps(&self, range: Range<u64>) -> bool {
@@ -1924,7 +1726,6 @@ impl Vm {
             if !right.is_empty() { self.unmap_range(right.start, right.range())?; }
             return Ok(());
         };
-
 
         let retained = driver_mappings.lock();
         let driver = retained.as_ref();
@@ -2015,21 +1816,6 @@ impl Vm {
         inner.page_table.translate_iova(address)
     }
 
-    /// Collect this VM's GPU-visible mappings inside `range`.
-    ///
-    /// Page-table memory only: this walks ordinary DRAM and never touches GPU
-    /// MMIO, so it is safe to call after a faulted submission has let the
-    /// cores power-gate.  Returns the number of runs written and whether
-    /// `out` was too small to hold them all.
-    pub(crate) fn mapped_ranges(
-        &self,
-        range: Range<u64>,
-        out: &mut [pgtable::MappedRange],
-    ) -> Result<(usize, bool)> {
-        let mut inner = self.inner.exec_lock(None, false)?;
-        inner.page_table.collect_mapped_ranges(range, out)
-    }
-
     /// Read GPU-visible bytes out of this VM.
     ///
     /// Fail-closed: the whole span must first pass `covers_range` with GPU
@@ -2038,12 +1824,7 @@ impl Vm {
     /// object that is mapped into this VM, never GPU MMIO, so it is safe with
     /// the cores gated.
     ///
-    /// It exists so the driver can enumerate the pointers a submission
-    /// actually dereferences.  A GMMU page fault names no address on G17P (the
-    /// MMIO fault bank is a reset-default phantom), and the UAPI carries only
-    /// the control-stream range -- every other pointer the GPU follows lives
-    /// *inside* the command stream and the Ioto program, where only a reader
-    /// like this can find it.
+    /// M3 compute validates the client control stream before publishing it.
     pub(crate) fn read_bytes(&self, iova: u64, out: &mut [u8]) -> Result {
         if out.is_empty() {
             return Err(EINVAL);
@@ -2079,23 +1860,12 @@ impl Vm {
         Ok(())
     }
 
-    /// Physical base of this VM's page-table root.
-    ///
-    /// This is what a hardware context's TTB0 has to name for the GPU to see
-    /// any of this VM's mappings, so it is the other half of a reachability
-    /// check that `covers_range` alone cannot make.
-    pub(crate) fn page_table_root(&self) -> u64 {
-        self.binding.lock().ttb
-    }
-
     /// Snapshot the first `out.len()` hardware context-table (TTBAT) entries
     /// as `(ttb0, ttb1)` pairs.
     ///
-    /// The TTBAT is an ordinary host DRAM region, so this reads no GPU MMIO
-    /// and is safe with the cores gated.  A G17P compute kick declares
-    /// hardware context 2 or 3, so comparing those entries against
-    /// [`Vm::page_table_root`] is the direct test of whether the GPU is
-    /// walking this VM's tables at all -- something `covers_range` cannot see.
+    /// The TTBAT is ordinary host DRAM, so this reads no GPU MMIO
+    /// and is safe with the cores gated. M3 fault diagnostics use it to
+    /// identify the tables visible to each hardware context.
     pub(crate) fn context_roots(&self, out: &mut [(u64, u64)]) -> Result {
         let inner = self.inner.exec_lock(None, false)?;
         let shared = inner.uat_inner.lock();
@@ -2554,23 +2324,6 @@ impl Uat {
         &self.kernel_lower_vm
     }
 
-    /// Return the kernel-half VA range owned by this UAT.
-    pub(crate) fn kernel_va_range(&self) -> Result<Range<u64>> {
-        iova_kern_range(self.cfg)
-    }
-
-    /// Arm firmware-backed mapping teardown after the DRM device data slot
-    /// contains its live DrmGpu owner. Legacy/Dekker UATs start armed.
-    pub(crate) fn mark_firmware_cache_flush_ready(&self) {
-        if !self
-            .inner
-            .firmware_cache_flush_ready
-            .swap(true, Ordering::AcqRel)
-        {
-            dev_info!(self.dev.as_ref(), "MMU: firmware cache flushes armed\n");
-        }
-    }
-
     #[cfg(CONFIG_DEV_COREDUMP)]
     pub(crate) fn dump_kernel_pages(&self) -> Result<KVVec<pgtable::DumpedPage>> {
         // Full upper-half range for this SoC's root geometry.
@@ -2748,20 +2501,6 @@ impl Uat {
         )
     }
 
-    /// J514S shares the measured lazy firmware handoff and reserved root geometry.
-    /// Safety: the admitted M3 owner must hold GFX power and stopped ASC.
-    pub(crate) unsafe fn new_t6030(dev: &driver::AsahiDevice, firmware: &crate::m3_firmware::Firmware) -> Result<Self> {
-        let node = dev.as_ref().of_node().ok_or(ENODEV)?;
-        for (index, name) in [(0,c_str!("ttbs")),(1,c_str!("pagetables")),(2,c_str!("handoff")),(3,c_str!("shared-l2"))] {
-            let r = crate::m3_resources::reserved_resource(&node, name)?;
-            if r.start()!=firmware.resources.regions[index].base || r.size()!=firmware.resources.regions[index].size { return Err(EINVAL); }
-        }
-        // RTKit 2419 commands retain canonical GPU-visible high-half pointers.
-        // The qualified J514S bridge publishes the shared high root in the
-        // client context as well as context zero; M4 uses different aliases.
-        Self::new_with_config(dev, UatConfig::T6030, true, HandoffMode::StoppedFirmwareT6030)
-    }
-
     /// # Safety
     /// J514S RTKit has completed wake, but has not received an initdata root.
     /// The owner retains power and excludes GPU jobs until publication.
@@ -2906,7 +2645,6 @@ impl Uat {
             ctx.ttb0.store(0, Ordering::Relaxed);
             ctx.ttb1.store(0, Ordering::Relaxed);
         }
-
 
         drop(handoff_guard);
 

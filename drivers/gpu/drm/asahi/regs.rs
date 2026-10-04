@@ -78,8 +78,6 @@ const FENDER_MMU_8028: usize = FENDER + 0x8028;
 /// TTBAT base, PA >> 14 in a 28-bit field (G13X had it at +0x8024).
 const FENDER_MMU_TTBAT_BASE: usize = FENDER + 0x802c;
 const FENDER_MMU_TTBAT_BASE_MASK: u32 = (1 << 28) - 1;
-/// TTBAT cache invalidate: (ctx << 8) | arg.
-const FENDER_MMU_TTBAT_INVAL: usize = FENDER + 0x8030;
 /// GPC performance state ([3:0]); host-owned on G15, firmware-owned on G14S.
 const GPC_PERF_STATE: usize = FENDER + 0x101000;
 /// GPC -> host interrupt enable: bit 0/1/2 for type 0/1/2.
@@ -92,7 +90,6 @@ const SGX_EVENT_STATUS: usize = 0xc020;
 const SGX_KICK_CTL: usize = 0xc050;
 const SGX_BUSY_MASK: usize = 0xc120;
 const SGX_DONE_MASK: usize = 0xc128;
-
 
 const FAULT_ADDR_MASK_G15: u64 = (1 << 42) - 1;
 /// Enum representing the unit that caused an MMU fault.
@@ -282,10 +279,6 @@ impl Resources {
         self.sgx_write32::<FENDER_MMU_ENABLE>(1);
 
         Ok(())
-    }
-
-    pub(crate) fn g15_invalidate_ttbat_cache(&self, ctx: u8, arg: u8) {
-        self.sgx_write32::<FENDER_MMU_TTBAT_INVAL>(((ctx as u32) << 8) | arg as u32);
     }
 
     pub(crate) fn g15_fender_kick(&self, cmd: u32) -> Result {

@@ -178,9 +178,7 @@ impl Config {
         let owner = &self.objects[HARDWARE_DATA];
         init::Region::new(owner.va(), owner.size()).map_err(|_| EINVAL)
     }
-    pub(crate) fn submit_compute(&mut self, queue: u64) -> Result {
-        self.submit_queue(2,queue,1,0,true)
-    }
+
     pub(crate) fn render_pb(&mut self) -> Result {
         self.objects[UNKNOWN_C1].write(0,&storage::parameter_buffer(crate::m3_render::PB_PAGES).map_err(|_|EINVAL)?)
     }

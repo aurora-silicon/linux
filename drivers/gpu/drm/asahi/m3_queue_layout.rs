@@ -9,19 +9,19 @@ pub(crate) const CAPACITY: usize = 0x50;
 pub(crate) const QUALIFIED_CAPACITY: u32 = 0x500;
 
 mod info {
-    pub const STATE: usize = 0x00;
-    pub const RING: usize = 0x08;
-    pub const JOB_LIST: usize = 0x10;
-    pub const GPU_SCRATCH: usize = 0x18;
-    pub const EVENT_ID: usize = 0x2c;
-    pub const PRIORITY_UNKNOWN_38: usize = 0x38;
-    pub const PRIORITY_UNKNOWN_40: usize = 0x40;
-    pub const PRIORITY_5: usize = 0x48;
-    pub const UNKNOWN_4C: usize = 0x4c;
-    pub const UUID: usize = 0x50;
+    pub(crate) const STATE: usize = 0x00;
+    pub(crate) const RING: usize = 0x08;
+    pub(crate) const JOB_LIST: usize = 0x10;
+    pub(crate) const GPU_SCRATCH: usize = 0x18;
+    pub(crate) const EVENT_ID: usize = 0x2c;
+    pub(crate) const PRIORITY_UNKNOWN_38: usize = 0x38;
+    pub(crate) const PRIORITY_UNKNOWN_40: usize = 0x40;
+    pub(crate) const PRIORITY_5: usize = 0x48;
+    pub(crate) const UNKNOWN_4C: usize = 0x4c;
+    pub(crate) const UUID: usize = 0x50;
     // V14_8_3 adds a four-byte field before this unaligned pointer.
-    pub const CONTEXT: usize = 0xa4;
-    pub const UNKNOWN_TAIL: usize = 0xac;
+    pub(crate) const CONTEXT: usize = 0xa4;
+    pub(crate) const UNKNOWN_TAIL: usize = 0xac;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
