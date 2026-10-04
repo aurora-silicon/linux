@@ -506,7 +506,7 @@ impl PwrConfig {
             }
 
             // Round up: a voltage is never published below the device tree's.
-            volt_uv.iter_mut().for_each(|a| *a = a.div_ceil(1000));
+            volt_uv.iter_mut().for_each(|a| *a = if cfg.gpu_gen == GpuGen::G15 { a.div_ceil(1000) } else { *a / 1000 });
             let volt_mv = volt_uv;
 
             let pwr_mw = pwr_uw / 1000;
@@ -663,7 +663,7 @@ impl PwrConfig {
             se_kp: prop!("apple,se-kp", f32!(-5.0)),
             se_kp_1: prop!("apple,se-kp-1", f32!(-10.0)),
             se_reset_criteria: prop!("apple,se-reset-criteria", 50),
-            se_target: prop!("apple,se-target", 1400),
+            se_target: if cfg.gpu_gen == GpuGen::G15 { prop!("apple,se-target", 1400) } else { 1400 },
 
             perf_states,
             power_zones,

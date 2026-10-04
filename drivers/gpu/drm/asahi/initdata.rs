@@ -482,7 +482,9 @@ impl<'a> InitDataBuilder::ver<'a> {
         #[ver(V >= V14_8_3)]
         let runtime = g15.layout == G15Layout::Runtime;
         let max_ps_scaled = 100 * max_ps;
-        let boost_ps_count = max_ps.checked_sub(base_ps).ok_or(EINVAL)?;
+        let boost_ps_count = if cfg.gpu_gen == hw::GpuGen::G15 {
+            max_ps.checked_sub(base_ps).ok_or(EINVAL)?
+        } else { max_ps - base_ps };
 
         #[allow(unused_variables)]
         let base_clock_khz = cfg.base_clock_hz / 1000;
