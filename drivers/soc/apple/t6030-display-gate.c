@@ -603,8 +603,11 @@ static void __init gate_dcpext(void)
 		return;
 	np[0] = gate_find_one("apple,t6030-dcpext");
 	if (!np[0] || of_property_read_u32(np[0], "apple,t6030-dcpext-memory-ready", &ready) ||
-	    ready != 1 || !of_property_present(np[0], "memory-region"))
-		goto out;
+	    ready != 1 || !of_property_present(np[0], "memory-region")) {
+		/* The boot loader did not hand the external processor over. */
+		pr_info("dcpext not handed off by the boot loader, left disabled\n");
+		goto put;
+	}
 	np[1] = gate_target(np[0], "iommus", "#iommu-cells", 1, 5, "apple,t8110-dart");
 	np[2] = gate_target(np[0], "mboxes", "#mbox-cells", 0, 0, "apple,asc-mailbox-v4");
 	for (i = 0; i < 3; i++)
@@ -667,6 +670,7 @@ static void __init gate_dcpext(void)
 out:
 	if (!applied)
 		pr_warn("dcpext remains disabled: power and memory prerequisites were not applied\n");
+put:
 	of_node_put(domain);
 	of_node_put(entry);
 	of_node_put(report);

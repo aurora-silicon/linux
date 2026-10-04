@@ -116,7 +116,7 @@ kernel::module_platform_driver! {
         },
         m3_expose: i32 {
             default: -1,
-            description: "M3 render node registration: -1 = auto (only on apple,j514s, where the M3 runtime is validated), 0 = never, 1 = always",
+            description: "M3 render node registration: -1 = auto (on apple,j514s and apple,j516s, where the M3 runtime is validated), 0 = never, 1 = always",
         },
 
         fault_control: u32 {
