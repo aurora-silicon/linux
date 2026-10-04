@@ -506,15 +506,21 @@ pub(crate) struct GpuManager {
     #[pin]
     rtkit: Mutex<Option<rtkit::RtKit<GpuManager::ver>>>,
     /// Diagnostics: RTKit messages received on the non-system endpoints.
+    #[ver(V >= V14_8_3)]
     rtk_rx_msgs: AtomicU64,
     /// Diagnostics: firmware-provided (mapped) RTKit buffers mapped / refused.
+    #[ver(V >= V14_8_3)]
     rtk_shmem_mapped: AtomicU64,
+    #[ver(V >= V14_8_3)]
     rtk_shmem_map_failed: AtomicU64,
     /// G15 diagnostics: ktime (ns) at which MSG_INIT was sent, 0 before.
+    #[ver(V >= V14_8_3)]
     g15_init_ns: AtomicI64,
     /// G15 diagnostics: last P2+0x14 value seen by the init poll.
+    #[ver(V >= V14_8_3)]
     g15_init_state: AtomicU32,
     /// G15 diagnostics (asahi.g15_debug bit 46): read-only mapping of the firmware data carveout.
+    #[ver(V >= V14_8_3)]
     g15_gfxdata: Option<G15GfxData>,
     #[pin]
     rx_channels: Mutex<RxChannels::ver>,
@@ -586,6 +592,10 @@ pub(crate) trait GpuManager: Send + Sync {
     /// Send a firmware control command (secure cache flush).
     fn fwctl(&self, msg: fw::channels::FwCtlMsg) -> Result;
     /// Log a read-only firmware health sample labelled `tag` (G15 bring-up diagnostics).
+    #[ver(V < V14_8_3)]
+    fn health_report(&self, _tag: &str) {}
+
+    #[ver(V >= V14_8_3)]
     fn health_report(&self, tag: &str);
     /// Get the static GPU configuration for this SoC.
     fn get_cfg(&self) -> &'static hw::HwConfig;
@@ -1022,6 +1032,8 @@ impl rtkit::Operations for GpuManager::ver {
     fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, ep: u8, msg: u64) {
         let dev = &data.dev;
         //dev_info!(dev.as_ref(), "RtKit message: {:#x}:{:#x}\n", ep, msg);
+        #[ver(V >= V14_8_3)]
+        {
         let n = data.rtk_rx_msgs.fetch_add(1, Ordering::Relaxed);
         // G15 bring-up: log the first firmware messages (bounded).
         if data.cfg.gpu_gen == hw::GpuGen::G15 && n < 32 {
@@ -1032,6 +1044,8 @@ impl rtkit::Operations for GpuManager::ver {
                 ep,
                 msg
             );
+        }
+
         }
 
         if ep != EP_FIRMWARE || msg != MSG_RX_DOORBELL {
@@ -1089,6 +1103,12 @@ impl rtkit::Operations for GpuManager::ver {
 
     /// Map a buffer the firmware placed at its own VA. G15 only: on G13/G14 this keeps the
     /// previous behaviour (the default implementation's EINVAL).
+    #[ver(V < V14_8_3)]
+    fn shmem_map(_data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _iova: usize, _size: usize) -> Result<Self::Buffer> {
+        Err(EINVAL)
+    }
+
+    #[ver(V >= V14_8_3)]
     fn shmem_map(
         data: <Self::Data as ForeignOwnable>::Borrowed<'_>,
         iova: usize,
@@ -1526,11 +1546,17 @@ impl GpuManager::ver {
                 io_mappings: KVec::new(),
                 next_mmio_iova: mmu::kern_iova(cfg, IOVA_KERN_MMIO_RANGE.start),
                 rtkit <- new_mutex!(None, "rtkit"),
+                #[ver(V >= V14_8_3)]
                 rtk_rx_msgs: AtomicU64::new(0),
+                #[ver(V >= V14_8_3)]
                 rtk_shmem_mapped: AtomicU64::new(0),
+                #[ver(V >= V14_8_3)]
                 rtk_shmem_map_failed: AtomicU64::new(0),
+                #[ver(V >= V14_8_3)]
                 g15_init_ns: AtomicI64::new(0),
+                #[ver(V >= V14_8_3)]
                 g15_init_state: AtomicU32::new(0),
+                #[ver(V >= V14_8_3)]
                 g15_gfxdata: G15GfxData::map(dev, cfg),
                 crashed: AtomicBool::new(false),
                 event_manager,
@@ -2010,6 +2036,7 @@ impl GpuManager::ver {
     }
 
     /// Microseconds since MSG_INIT was sent (0 if it was not sent yet).
+    #[ver(V >= V14_8_3)]
     fn us_since_init(&self) -> i64 {
         let t = self.g15_init_ns.load(Ordering::Relaxed);
         if t == 0 {
@@ -2723,6 +2750,30 @@ impl GpuManager for GpuManager::ver {
         self as Arc<dyn Any + Sync + Send>
     }
 
+    #[ver(V < V14_8_3)]
+    fn init(&self) -> Result {
+        self.tx_channels.lock().device_control.send(
+            &fw::channels::DeviceControlMsg::ver::Initialize(Default::default()),
+        );
+
+        let initdata = self.initdata.gpu_va().get();
+        let mut guard = self.rtkit.lock();
+        let mut rtk = guard.as_mut().as_pin_mut().unwrap();
+
+        rtk.as_mut().boot()?;
+        rtk.as_mut().start_endpoint(EP_FIRMWARE)?;
+        rtk.as_mut().start_endpoint(EP_DOORBELL)?;
+        rtk.as_mut()
+            .send_message(EP_FIRMWARE, MSG_INIT | (initdata & INIT_DATA_MASK))?;
+        rtk.as_mut()
+            .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
+        core::mem::drop(guard);
+
+        self.kick_firmware()?;
+        Ok(())
+    }
+
+    #[ver(V >= V14_8_3)]
     fn init(&self) -> Result {
         #[ver(V < V14_8_3)]
         self.tx_channels.lock().device_control.send(

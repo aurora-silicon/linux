@@ -838,6 +838,7 @@ pub(crate) struct EventChannel {
     buf_mgr: buffer::BufferManager::ver,
     gpu: Option<Arc<dyn gpu::GpuManager>>,
     /// Number of messages received on this channel (diagnostics).
+    #[ver(V >= V14_8_3)]
     received: u64,
 }
 
@@ -856,16 +857,19 @@ impl EventChannel::ver {
             ev_mgr,
             buf_mgr,
             gpu: None,
+            #[ver(V >= V14_8_3)]
             received: 0,
         })
     }
 
     /// Returns the number of messages received on this channel so far.
+    #[ver(V >= V14_8_3)]
     pub(crate) fn received(&self) -> u64 {
         self.received
     }
 
     /// Read-only (firmware wptr, host rptr) per sub-channel (G15 bring-up diagnostics).
+    #[ver(V >= V14_8_3)]
     pub(crate) fn ring_snapshot(&self) -> KVec<(u32, u32)> {
         self.ch.snapshot()
     }
@@ -886,7 +890,6 @@ impl EventChannel::ver {
         self.poll_14x();
         #[ver(V < V14_8_3)]
         while let Some(msg) = self.ch.get(0) {
-            self.received += 1;
             // SAFETY: The raw view is always valid for all bit patterns.
             let tag = unsafe { msg.raw.0 };
             match tag {
@@ -1154,7 +1157,7 @@ impl FwLogChannel {
     pub(crate) fn poll(&mut self) {
         for i in 0..=FwLogChannelState::SUB_CHANNELS - 1 {
             while let Some(msg) = self.ch.peek(i) {
-                self.received += 1;
+                if self.log_all_info { self.received += 1; }
                 cls_dev_dbg!(FwLogCh, self.dev, "FwLog{}: {:?}\n", i, msg);
                 if msg.msg_type != 2 {
                     dev_warn!(self.dev.as_ref(), "Unknown FWLog{} message: {:?}\n", i, msg);
@@ -1254,6 +1257,7 @@ pub(crate) struct StatsChannel {
     ch: RxChannel<ChannelState, RawStatsMsg::ver>,
     /// Counts of message types this driver does not decode, by type (the last slot collects
     /// every type above it).
+    #[ver(V >= V14_8_3)]
     unknown: [u64; 17],
 }
 
@@ -1267,6 +1271,7 @@ impl StatsChannel::ver {
         Ok(StatsChannel::ver {
             dev: dev.into(),
             ch: RxChannel::<ChannelState, RawStatsMsg::ver>::new(alloc, 0x100)?,
+            #[ver(V >= V14_8_3)]
             unknown: [0; 17],
         })
     }
@@ -1289,6 +1294,11 @@ impl StatsChannel::ver {
                     cls_dev_dbg!(StatsCh, self.dev, "Stats: {:?}\n", msg);
                 }
                 _ => {
+                    #[ver(V < V14_8_3)]
+                    pr_warn!("Unknown stats message: {:?}\n", unsafe { msg.raw });
+                    #[ver(V >= V14_8_3)]
+                    {
+
                     // Some firmware sends periodic records this driver does not decode (type 15
                     // arrives about 250 times per second on G15). Count them: log the first one
                     // of each type, then one summary line each time the count doubles from 1024.
@@ -1310,6 +1320,7 @@ impl StatsChannel::ver {
                             count,
                             tag
                         );
+                    }
                     }
                 }
             }

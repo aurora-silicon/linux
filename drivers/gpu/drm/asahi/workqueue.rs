@@ -793,7 +793,7 @@ impl WorkQueue::ver {
     #[allow(dead_code)]
     pub(crate) fn fw_stamp_raw(&self) -> Option<u32> {
         let inner = self.inner.lock();
-        inner.event.as_ref().map(|ev| ev.0.fw_current())
+        inner.event.as_ref().map(|ev| inner.event_manager.fw_current(ev.0.slot()))
     }
 
     /// Work-ring pointers the firmware walks after consuming a pipe kick.
