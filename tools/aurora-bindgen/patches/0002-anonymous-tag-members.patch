@@ -1,6 +1,6 @@
 --- a/bindgen/clang.rs
 +++ b/bindgen/clang.rs
-@@ -1204,6 +1204,29 @@
+@@ -1204,6 +1204,34 @@
  }
  
  impl Type {
@@ -11,12 +11,17 @@
 +            cur: CXCursor,
 +            data: CXClientData,
 +        ) -> CXVisitorResult {
++            // SAFETY: clang_Type_visitFields invokes this callback synchronously
++            // with the live Vec pointer supplied below; callbacks do not overlap.
 +            let fields = unsafe { &mut *data.cast::<Vec<Cursor>>() };
 +            fields.push(Cursor { x: cur });
 +            CXVisit_Continue
 +        }
 +
 +        let mut fields = Vec::<Cursor>::new();
++        // SAFETY: self.x is the live Clang type owned by the parsing context.
++        // The visitor only borrows fields during this call, and Clang does not
++        // retain the callback data after returning.
 +        unsafe {
 +            clang_Type_visitFields(
 +                self.x,

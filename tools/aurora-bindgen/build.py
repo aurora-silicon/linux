@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
 """Fetch pinned source, apply generic fixes, and build/test a private bindgen."""
+if not __debug__:
+    raise SystemExit("optimized Python is unsupported: validation assertions must remain enabled")
+
 import argparse,hashlib,json,subprocess,tarfile,urllib.request,shutil,os,sys
 from pathlib import Path
 P=Path(__file__).resolve().parent;ap=argparse.ArgumentParser();ap.add_argument('--output-dir',required=True,type=Path);ap.add_argument('--archive',type=Path);ap.add_argument('--jobs',type=int,default=2);a=ap.parse_args();assert 1<=a.jobs<=2
