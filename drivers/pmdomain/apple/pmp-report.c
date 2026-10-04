@@ -14,6 +14,7 @@
 #include <linux/jiffies.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
@@ -61,7 +62,13 @@ struct apple_pmp_report {
 	atomic_t start_queued;
 	struct completion started;
 	int start_result;
+	bool stopping;
+	unsigned int waiters;
+	struct completion waiters_done;
 };
+
+/* Serializes M3 publication, startup requests and waiter references. */
+static DEFINE_MUTEX(apple_pmp_report_mutex);
 
 
 static umode_t apple_pmp_temp_is_visible(const void *data,
@@ -460,7 +467,9 @@ static int apple_pmp_t6030_check(struct apple_pmp_report *rep)
 
 static void apple_pmp_t6030_finish(struct apple_pmp_report *rep, int result)
 {
-	rep->start_result = result;
+	guard(mutex)(&apple_pmp_report_mutex);
+	if (!rep->stopping)
+		rep->start_result = result;
 	complete_all(&rep->started);
 }
 
@@ -847,9 +856,31 @@ static void apple_pmp_t6030_start(struct work_struct *work)
 /* Queues the start once both the requests are seeded and a consumer asked. */
 static void apple_pmp_t6030_request_start(struct apple_pmp_report *rep)
 {
-	if (READ_ONCE(rep->seeded) && atomic_read(&rep->start_requested) &&
+	guard(mutex)(&apple_pmp_report_mutex);
+	if (!rep->stopping && READ_ONCE(rep->seeded) && atomic_read(&rep->start_requested) &&
 	    !atomic_xchg(&rep->start_queued, 1))
 		queue_work(system_unbound_wq, &rep->start_work);
+}
+
+static void apple_pmp_report_remove(struct platform_device *pdev)
+{
+	struct apple_pmp_report *rep = platform_get_drvdata(pdev);
+	bool waiters;
+
+	if (!rep->offsets->starts_pmp)
+		return;
+
+	scoped_guard(mutex, &apple_pmp_report_mutex) {
+		rep->stopping = true;
+		platform_set_drvdata(pdev, NULL);
+		rep->start_result = -ENODEV;
+		complete_all(&rep->started);
+		waiters = rep->waiters;
+	}
+	/* No work or waiter may use the devres state after remove returns. */
+	cancel_work_sync(&rep->start_work);
+	if (waiters)
+		wait_for_completion(&rep->waiters_done);
 }
 
 /*
@@ -875,37 +906,54 @@ int apple_pmp_report_wait_ready(struct device_node *entry, unsigned long timeout
 		of_node_put(parent);
 		return -EINVAL;
 	}
+	/* Only M3 reports publish state under the startup lifetime lock. */
+	if (!of_device_is_compatible(parent, "apple,t6030-pmp-v2-report")) {
+		of_node_put(parent);
+		return -EINVAL;
+	}
 	pdev = of_find_device_by_node(parent);
 	of_node_put(parent);
 	if (!pdev)
 		return -EPROBE_DEFER;
 
-	rep = platform_get_drvdata(pdev);
-	if (!rep) {
-		put_device(&pdev->dev);
-		return -EPROBE_DEFER;
-	}
-	if (!rep->offsets->starts_pmp) {
-		put_device(&pdev->dev);
-		return -EINVAL;
+	/* A device reference alone does not pin its driver's devres. */
+	scoped_guard(mutex, &apple_pmp_report_mutex) {
+		rep = platform_get_drvdata(pdev);
+		if (!rep) {
+			ret = -EPROBE_DEFER;
+			goto out_put;
+		}
+		if (rep->stopping) {
+			ret = -ENODEV;
+			goto out_put;
+		}
+		rep->waiters++;
 	}
 
 	atomic_set(&rep->start_requested, 1);
 	/* Pairs with the barrier after seeding: one side sees the other's flag. */
 	smp_mb__after_atomic();
 	apple_pmp_t6030_request_start(rep);
-	if (!wait_for_completion_timeout(&rep->started, timeout)) {
-		ret = -ETIMEDOUT;
-	} else if (rep->start_result) {
-		ret = rep->start_result;
-	} else if (!(rep->ack & BIT_ULL(id))) {
-		ret = -EINVAL;
-	} else {
-		status = readq(rep->base + rep->offsets->status);
-		ack = readq(rep->base + rep->offsets->actual);
-		ret = status == PMP_REPORT_READY && (ack & BIT_ULL(id)) ? 0 : -EIO;
+	ret = wait_for_completion_timeout(&rep->started, timeout) ? 0 : -ETIMEDOUT;
+	scoped_guard(mutex, &apple_pmp_report_mutex) {
+		if (rep->stopping) {
+			ret = -ENODEV;
+		} else if (!ret) {
+			if (rep->start_result) {
+				ret = rep->start_result;
+			} else if (!(rep->ack & BIT_ULL(id))) {
+				ret = -EINVAL;
+			} else {
+				status = readq(rep->base + rep->offsets->status);
+				ack = readq(rep->base + rep->offsets->actual);
+				ret = status == PMP_REPORT_READY && (ack & BIT_ULL(id)) ? 0 : -EIO;
+			}
+		}
+		if (!--rep->waiters && rep->stopping)
+			complete(&rep->waiters_done);
 	}
 
+out_put:
 	put_device(&pdev->dev);
 	return ret;
 }
@@ -931,6 +979,7 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	rep->offsets = of_device_get_match_data(dev);
 	if (rep->offsets->starts_pmp) {
 		init_completion(&rep->started);
+		init_completion(&rep->waiters_done);
 		INIT_WORK(&rep->start_work, apple_pmp_t6030_start);
 		ret = apple_pmp_t6030_check(rep);
 		if (ret == -EPROBE_DEFER) {
@@ -941,12 +990,19 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 			/* Stay bound, so consumers learn why and do not wait. */
 			of_node_put(rep->pmp);
 			rep->pmp = NULL;
-			dev_set_drvdata(dev, rep);
+			scoped_guard(mutex, &apple_pmp_report_mutex)
+				dev_set_drvdata(dev, rep);
 			apple_pmp_t6030_finish(rep, ret);
 			return 0;
 		}
 	}
-	dev_set_drvdata(dev, rep);
+	if (rep->offsets->starts_pmp) {
+		guard(mutex)(&apple_pmp_report_mutex);
+
+		dev_set_drvdata(dev, rep);
+	} else {
+		dev_set_drvdata(dev, rep);
+	}
 	if (of_device_is_compatible(np, "apple,t8132-pmp-v2-report")) {
 		ret = apple_pmp_temp_register(rep);
 		if (ret)
@@ -1023,6 +1079,7 @@ static const struct of_device_id apple_pmp_report_of_match[] = {
 
 static struct platform_driver apple_pmp_report_driver = {
 	.probe = apple_pmp_report_probe,
+	.remove = apple_pmp_report_remove,
 	.driver = {
 		.name = "apple-pmp-report",
 		.of_match_table = apple_pmp_report_of_match,
