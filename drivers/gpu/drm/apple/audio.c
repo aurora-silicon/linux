@@ -251,8 +251,10 @@ static int dcp_pcm_open(struct snd_pcm_substream *substream)
 
 	mutex_lock(&dcpaud->data_lock);
 	ret = dcpaud_init_dma(dcpaud);
-	if (ret < 0)
+	if (ret < 0) {
+		mutex_unlock(&dcpaud->data_lock);
 		return ret;
+	}
 
 	if (!dcpaud->connected) {
 		mutex_unlock(&dcpaud->data_lock);
