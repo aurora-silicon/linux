@@ -46,7 +46,7 @@ const fn iomaps(mcc_count: usize, has_die1: bool) -> [Option<IOMapping>; 20] {
 pub(crate) const HWCONFIG_T6002: super::HwConfig = HwConfig {
     chip_id: 0x6002,
     gpu_gen: GpuGen::G13,
-    gpu_variant: GpuVariant::C,
+    gpu_variant: GpuVariant::D,
     gpu_core: Some(GpuCore::G13C),
 
     base_clock_hz: 24_000_000,

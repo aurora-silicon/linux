@@ -2040,50 +2040,6 @@ impl Resources {
         let family = ((id_version >> 24) & 0xff) as u8;
         let variant = ((id_version >> 16) & 0xff) as u8;
         let num_dies = (id_counts_1 >> 16) & 0xf;
-        let identity =
-            identity::decode_gpu_identity(family, variant, num_dies as u8).ok_or_else(|| {
-                dev_err!(
-                    self.dev.as_ref(),
-                    "Unknown GPU identity (family {:#x}, variant {:#x}, dies {})\n",
-                    family,
-                    variant,
-                    num_dies
-                );
-                ENODEV
-            })?;
-
-        // This is intentionally sampled only in the existing GPU-ID probe
-        // window. Those ID/core-mask reads already require the SGX control
-        // aperture to be safely accessible; reading this register later from
-        // render submission would race GPU core power-gating and can raise an
-        // asynchronous SError on G17P. Cache the decoded nibble in GpuIdConfig
-        // and carry it through ordinary host memory from here on.
-        let (gpc_perf_state_map, gpc_perf_state_map_low, gpc_perf_state_control) = if identity
-            .gpu_gen
-            == hw::GpuGen::G17
-            && identity.gpu_variant == identity::GpuVariant::P
-        {
-            let sgx = self.sgx.try_access().ok_or(ENODEV)?;
-            let registers = sgx.relaxed();
-            let control_raw = registers.try_read32(T8140_GPC_PERF_STATE_CONTROL)?;
-            let map_raw = registers.try_read32(T8140_GPC_PERF_STATE_MAP)?;
-            let map = t8140_gpc_perf_state_map(map_raw);
-            let map_low = t8140_gpc_perf_state_map_low(map_raw);
-            let control = t8140_gpc_perf_state_control(control_raw);
-            dev_info!(
-                self.dev.as_ref(),
-                "G17P GPC performance-state map: control_raw={:#010x} map_raw={:#010x} control={} low={:#x} high={:#x}\n",
-                control_raw,
-                map_raw,
-                control,
-                map_low,
-                map,
-            );
-            (map, map_low, control)
-        } else {
-            (0, 0, 0)
-        };
-
         let mut core_mask_regs = KVec::new();
 
         let num_clusters = match family {
@@ -2177,11 +2133,39 @@ impl Resources {
             }
         };
 
+        // Preserve the public G13/G14 identity independently of the firmware
+        // core identity: the legacy ABI distinguishes Max and Ultra by clusters.
+        let (gpu_gen, gpu_variant, usc_generation, gpu_hal_generation) = if family <= 6 {
+            let gpu_gen = match family {
+                4 => hw::GpuGen::G13,
+                5 | 6 => hw::GpuGen::G14,
+                a => {
+                    dev_err!(self.dev.as_ref(), "Unknown GPU generation {}\n", a);
+                    return Err(ENODEV);
+                }
+            };
+            let gpu_variant = match variant {
+                1 => hw::GpuVariant::P,
+                2 => hw::GpuVariant::G,
+                3 => hw::GpuVariant::S,
+                4 if num_clusters > 4 => hw::GpuVariant::D,
+                4 => hw::GpuVariant::C,
+                a => {
+                    dev_err!(self.dev.as_ref(), "Unknown GPU variant {}\n", a);
+                    return Err(ENODEV);
+                }
+            };
+            (gpu_gen, gpu_variant, 2, identity::GpuHalGeneration::Legacy)
+        } else {
+            let id = identity::decode_gpu_identity(family, variant, num_dies as u8).ok_or(ENODEV)?;
+            (id.gpu_gen, id.gpu_variant, id.usc_generation, id.gpu_hal_generation)
+        };
+
         Ok(hw::GpuIdConfig {
-            gpu_gen: identity.gpu_gen,
-            gpu_variant: identity.gpu_variant,
-            usc_generation: identity.usc_generation,
-            gpu_hal_generation: identity.gpu_hal_generation,
+            gpu_gen,
+            gpu_variant,
+            usc_generation,
+            gpu_hal_generation,
             gpu_rev,
             gpu_rev_id,
             num_dies,
@@ -2192,9 +2176,9 @@ impl Resources {
             total_active_cores,
             core_masks,
             core_masks_packed,
-            gpc_perf_state_map,
-            gpc_perf_state_map_low,
-            gpc_perf_state_control,
+            gpc_perf_state_map: 0,
+            gpc_perf_state_map_low: 0,
+            gpc_perf_state_control: 0,
         })
     }
 

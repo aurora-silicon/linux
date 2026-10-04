@@ -113,7 +113,7 @@ impl DrmGpu for LegacyDrmGpu {
             gpu_variant: dyncfg.id.gpu_variant as u32,
             gpu_revision: dyncfg.id.gpu_rev as u32,
             chip_id: cfg.chip_id,
-            num_dies: dyncfg.id.num_dies,
+            num_dies: if cfg.gpu_gen == crate::hw::GpuGen::G15 { dyncfg.id.num_dies } else { cfg.num_dies },
             num_clusters_total: dyncfg.id.num_clusters,
             num_cores_per_cluster: dyncfg.id.num_cores,
             core_masks,
