@@ -193,6 +193,7 @@ struct apple_cio {
 	struct dev_pm_domain_list *pd_list;
 
 	struct mutex lock; /* serializes cable transitions and ACIO power up/down */
+	bool removing; /* protected by lock */
 
 	u32 current_cable_info;
 	u32 target_cable_info;
@@ -2524,6 +2525,9 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 
 	guard(mutex)(&acio->lock);
 
+	if (acio->removing)
+		return -ESHUTDOWN;
+
 	dev_dbg(acio->dev, "set cable state: %d\n", data->state);
 
 	switch (data->state) {
@@ -2789,6 +2793,10 @@ static int apple_cio_probe(struct platform_device *pdev)
 static void apple_cio_remove(struct platform_device *pdev)
 {
 	struct apple_cio *acio = platform_get_drvdata(pdev);
+
+	/* Wait for an in-flight set and reject all later consumer callbacks. */
+	scoped_guard(mutex, &acio->lock)
+		acio->removing = true;
 
 	apple_pcie_tunnel_unregister_notifier(&acio->pcie_notifier);
 
