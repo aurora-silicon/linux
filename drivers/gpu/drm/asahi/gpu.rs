@@ -309,7 +309,11 @@ impl G15GfxData {
 
     /// Whether `va` lies inside the carveout.
     fn contains(&self, va: u64) -> bool {
-        va >= self.va_base && va < self.va_base + self.size as u64
+        va >= self.va_base
+            && self
+                .va_base
+                .checked_add(self.size as u64)
+                .is_some_and(|end| va < end)
     }
 
     /// Log the firmware's init-progress words, thread handles and crashlog fill.
@@ -385,7 +389,8 @@ impl G15GfxData {
             // saved PC/SP can be decoded offline.
             if verbose && self.contains(h) && h % 8 == 0 {
                 for row in 0..4u64 {
-                    let va = h + row * 0x20;
+                    // A wrapped address fails r64()'s range check like any other.
+                    let va = h.wrapping_add(row * 0x20);
                     dev_info!(
                         dev,
                         "G15 gfx-data [{}]:   {}+{:#04x}: {:016x} {:016x} {:016x} {:016x}\n",
@@ -393,9 +398,9 @@ impl G15GfxData {
                         name,
                         row * 0x20,
                         self.r64(va).unwrap_or(u64::MAX),
-                        self.r64(va + 8).unwrap_or(u64::MAX),
-                        self.r64(va + 0x10).unwrap_or(u64::MAX),
-                        self.r64(va + 0x18).unwrap_or(u64::MAX)
+                        self.r64(va.wrapping_add(8)).unwrap_or(u64::MAX),
+                        self.r64(va.wrapping_add(0x10)).unwrap_or(u64::MAX),
+                        self.r64(va.wrapping_add(0x18)).unwrap_or(u64::MAX)
                     );
                 }
             }
