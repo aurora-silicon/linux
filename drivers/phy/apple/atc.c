@@ -105,6 +105,15 @@
 #define AUSPLL_FREQ_CFG 0x2224
 #define AUSPLL_FREQ_REFCLK GENMASK(1, 0)
 
+/* T8122 AUSPLL fields differ from T8103, including the APB handshake. */
+#define T8122_AUSPLL_FREQ_CFG 0x2234
+#define T8122_AUSPLL_BGR 0x2218
+#define T8122_AUSPLL_PCLK_DRIVER BIT(3)
+#define T8122_AUSPLL_REFBUF_DRIVER BIT(11)
+#define T8122_DP_PCLK_STATUS 0x7034
+#define T8122_APB_PRESERVE 0xe0000006U
+#define T8122_PCLK_ENABLES GENMASK(15, 13)
+
 #define AUS_COMMON_SHIM_BLK_BIAS_REG 0x0a00
 #define AUS_COMMON_SHIM_BLK_BIAS_REG_BGBIAS_OV BIT(1)
 
@@ -2038,6 +2047,149 @@ static bool apple_atc_tunnel_is_t600x(void)
  * APB command 3. TX_DP_CTRL0, the sleep overrides and the
  * descriptor are left as they are; the next start programs them again.
  */
+static int atc_t8122_tunnel_apb(struct apple_atcphy *atcphy, u32 command,
+			      bool ack)
+{
+	u32 value;
+
+	core_mask32(atcphy, AUSPLL_APB_CMD_OVERRIDE, ~T8122_APB_PRESERVE, command);
+	return readl_poll_timeout(atcphy->regs.core + AUSPLL_APB_CMD_OVERRIDE,
+				 value, !!(value & BIT(1)) == ack, 1, 10000);
+}
+
+static int atc_t8122_tunnel_stop(struct apple_atcphy *atcphy)
+{
+	u32 value;
+	int ret, err;
+
+	lockdep_assert_held(&atcphy->lock);
+	if (!atcphy->tunnel_clock_on)
+		return 0;
+
+	/* Last/only client: gates off, reset, stop PLL, then output driver off. */
+	atcphy->tunnel_rate = 0;
+	core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, T8122_PCLK_ENABLES);
+	core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+		     DPTXPHY_PMA_LANE_RESET_N | DPTXPHY_PMA_LANE_RESET_N_OV);
+	ret = atc_t8122_tunnel_apb(atcphy, 0x10000001, true);
+	/* Always release REQ, including a failed start/ACK, to unwind our request. */
+	err = atc_t8122_tunnel_apb(atcphy, 0x10000018, false);
+	if (!ret)
+		ret = err;
+	err = readl_poll_timeout(atcphy->regs.core + T8122_DP_PCLK_STATUS,
+				 value, !(value & ACIOPHY_AUSPLL_LOCK), 1, 10000);
+	if (!ret)
+		ret = err;
+	core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, T8122_AUSPLL_PCLK_DRIVER);
+	/* Keep ownership on failure: do not silently hand a live PLL to a new mode. */
+	if (ret) {
+		dev_err(atcphy->dev, "T8122 tunnel clock shutdown incomplete: %d\n", ret);
+		return ret;
+	}
+	atcphy->tunnel_clock_on = false;
+	atcphy->tunnel_rate = 0;
+	return 0;
+}
+
+static int atc_t8122_tunnel_start(struct apple_atcphy *atcphy, u8 rate)
+{
+	u32 selector, value, saved_tx;
+	int ret, cleanup;
+
+	lockdep_assert_held(&atcphy->lock);
+	switch (rate) {
+	case 0x06:
+		selector = 4;
+		break;
+	case 0x0a:
+		selector = 3;
+		break;
+	case 0x14:
+		selector = 1;
+		break;
+	case 0x1e:
+		selector = 0;
+		break;
+	default:
+		return -EINVAL;
+	}
+	if (atcphy->tunnel_clock_on) {
+		/* A failed shutdown retains ownership, but is not a running clock. */
+		if (!atcphy->tunnel_rate)
+			return -EBUSY;
+		if (atcphy->tunnel_rate == rate)
+			return 0;
+		core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+			    DPTX_PCLK1_ENABLE | DPTX_PCLK1_SELECT,
+			    FIELD_PREP(DPTX_PCLK1_SELECT, selector));
+		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+			   DPTX_PCLK1_ENABLE);
+		atcphy->tunnel_rate = rate;
+		return 0;
+	}
+	saved_tx = readl(atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0);
+	if ((readl(atcphy->regs.core + AUSPLL_CLKOUT_MASTER) & T8122_AUSPLL_PCLK_DRIVER) ||
+	    (readl(atcphy->regs.core + AUSPLL_APB_CMD_OVERRIDE) & (BIT(0) | BIT(1))) ||
+	    (readl(atcphy->regs.core + T8122_DP_PCLK_STATUS) & ACIOPHY_AUSPLL_LOCK) ||
+	    ((saved_tx & T8122_PCLK_ENABLES) && (saved_tx & 0xffff) != 0xe001))
+		return -EBUSY;
+
+	/* Inactive slots use selector zero; all gates stay off during PLL setup. */
+	core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, GENMASK(15, 4),
+		    FIELD_PREP(DPTX_PCLK1_SELECT, selector));
+	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_SMALL);
+	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_SMALL_OV);
+	udelay(1);
+	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_BIG);
+	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_BIG_OV);
+	udelay(1);
+	core_clear32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_CLAMP);
+	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_CLAMP_OV);
+	udelay(1);
+	core_set32(atcphy, AUS_COMMON_SHIM_BLK_BIAS_REG, AUS_COMMON_SHIM_BLK_BIAS_REG_BGBIAS_OV);
+	udelay(15);
+	ret = readl_poll_timeout(atcphy->regs.core + AUS_COMMON_DIG_RCAL1, value,
+				 value & AUS_COMMON_DIG_RCAL1_ALL_CODES_DONE, 1, 10000);
+	if (ret) {
+		writel(saved_tx, atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0);
+		return ret;
+	}
+
+	atcphy->tunnel_clock_on = true;
+	atcphy->tunnel_rate = 0;
+	atcphy->dp_link_rate = -1;
+	core_clear32(atcphy, T8122_AUSPLL_FREQ_CFG, GENMASK(1, 0));
+	writel(0x1e0e021c, atcphy->regs.core + AUSPLL_FREQ_DESC_A);
+	core_clear32(atcphy, AUSPLL_FREQ_DESC_B, GENMASK(27, 0));
+	core_mask32(atcphy, AUSPLL_FREQ_DESC_C, GENMASK(22, 0), 0x644a00);
+	core_mask32(atcphy, AUSPLL_CLKOUT_DIV, GENMASK(20, 16), BIT(16));
+	core_set32(atcphy, T8122_AUSPLL_BGR, BIT(0));
+	core_set32(atcphy, AUSPLL_CLKOUT_MASTER,
+		   T8122_AUSPLL_PCLK_DRIVER | T8122_AUSPLL_REFBUF_DRIVER);
+	ret = atc_t8122_tunnel_apb(atcphy, 0x10000001, true);
+	if (ret)
+		goto fail;
+	ret = readl_poll_timeout(atcphy->regs.core + T8122_DP_PCLK_STATUS, value,
+				 value & ACIOPHY_AUSPLL_LOCK, 1, 10000);
+	if (ret)
+		goto fail;
+	ret = atc_t8122_tunnel_apb(atcphy, 0x10010000, false);
+	if (ret)
+		goto fail;
+	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+		   DPTXPHY_PMA_LANE_RESET_N | DPTXPHY_PMA_LANE_RESET_N_OV);
+	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_ENABLE);
+	atcphy->tunnel_rate = rate;
+	return 0;
+
+fail:
+	dev_err(atcphy->dev, "T8122 tunnel clock start failed: %d\n", ret);
+	cleanup = atc_t8122_tunnel_stop(atcphy);
+	if (!cleanup)
+		writel(saved_tx, atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0);
+	return ret;
+}
+
 static void atc_tunnel_stop_t8103(struct apple_atcphy *atcphy)
 {
 	lockdep_assert_held(&atcphy->lock);
@@ -2511,6 +2663,13 @@ static int atc_tunnel_set_t602x(struct apple_atcphy *atcphy, unsigned int dpin,
 	return 0;
 }
 
+/* T6030 (M3 Pro): T8122-generation PHYs, only the DP IN0 route so far. */
+static bool apple_atc_tunnel_is_t6030(struct apple_atcphy *atcphy)
+{
+	return of_machine_is_compatible("apple,t6030") &&
+	       atcphy->hw->gen == ATCPHY_GENERATION_T8122;
+}
+
 static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 {
 	int ret = 0;
@@ -2518,8 +2677,14 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 
 	lockdep_assert_held(&atcphy->lock);
 	/* the mode change below may power the PHY down: stop the tunnel clock first */
-	atc_tunnel_stop_t8103(atcphy);
-	atc_tunnel_restore(atcphy);
+	if (apple_atc_tunnel_is_t6030(atcphy)) {
+		ret = atc_t8122_tunnel_stop(atcphy);
+		if (ret)
+			return ret;
+	} else {
+		atc_tunnel_stop_t8103(atcphy);
+		atc_tunnel_restore(atcphy);
+	}
 
 	if (mode == APPLE_ATCPHY_MODE_OFF) {
 		ret = atcphy_power_off(atcphy);
@@ -2812,6 +2977,22 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 		return -EINVAL;
 	atcphy = phy_get_drvdata(phy);
 	/* Keep each supported SoC on its qualified clock sequence. */
+	if (apple_atc_tunnel_is_t6030(atcphy)) {
+		if (dpin)
+			return -EOPNOTSUPP;
+		guard(mutex)(&atcphy->lock);
+		if (!rate)
+			return atc_t8122_tunnel_stop(atcphy);
+		if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 &&
+		    atcphy->mode != APPLE_ATCPHY_MODE_TBT)
+			return -EBUSY;
+		ret = atc_t8122_tunnel_start(atcphy, rate);
+		dev_dbg(atcphy->dev, "DP tunnel clock rate 0x%x: %d (TX_DP_CTRL0=%08x PCLK_STAT=%08x)\n",
+			rate, ret,
+			readl(atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0),
+			readl(atcphy->regs.core + T8122_DP_PCLK_STATUS));
+		return ret;
+	}
 	if (!apple_atc_tunnel_is_t8103_style() && !apple_dp_tunnel_t602x())
 		return -EOPNOTSUPP;
 	if (apple_dp_tunnel_t602x() &&

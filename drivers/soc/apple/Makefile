@@ -17,6 +17,11 @@ apple-rtkit-helper-y = rtkit-helper.o
 obj-$(CONFIG_APPLE_SART) += apple-sart.o
 apple-sart-y = sart.o
 
+obj-$(CONFIG_APPLE_T6030_DISPLAY_GATE) += apple-t6030-display.o
+apple-t6030-display-y := t6030-display-gate.o t6030-j516s-pmp.dtbo.o
+# The gate adds the interrupt parent from the base tree at boot.
+DTC_FLAGS_t6030-j516s-pmp := -Wno-interrupts_property
+
 obj-$(CONFIG_APPLE_TUNABLE) += apple-tunable.o
 apple-tunable-y = tunable.o
 

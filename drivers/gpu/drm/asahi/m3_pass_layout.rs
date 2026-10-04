@@ -1,0 +1,109 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+//! Qualified G15/J514S sixteen-pass allocation contract. The strides describe
+//! the existing fixed arenas; they are not permission to relocate or overlap
+//! firmware-owned storage. Legacy unused allocations remain until separately
+//! qualified for removal. No generated object indices appear in this layout.
+pub(crate) const SLOTS:usize=16;
+pub(crate) const RESET_COUNT:usize=32;
+pub(crate) const COUNT:usize=34;
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+#[repr(usize)]
+pub(crate) enum Field {
+    FragmentStart,FragmentEnd,TilerStart,TilerEnd,
+    FragmentUserStart,FragmentUserEnd,TilerUserStart,TilerUserEnd,
+    Auxiliary,Preemption0,Preemption1,Preemption2,Tpc,Tilemap,HeapMetadata,
+    LegacyClusterTilemap,LegacyClusterMetadata0,LegacyClusterMetadata1,
+    LegacyClusterMetadata2,LegacyClusterMetadata3,LegacySceneUser,
+    Scene,SceneUser,TilerToFragment,FragmentCommand,LegacyFragmentTail,
+    FragmentSequence,FragmentScratch,TilerCommand,LegacyTilerTail,
+    TilerSequence,TilerScratch,TilerDependency,FragmentDependency,
+}
+pub(crate) const FIELDS:[Field;COUNT]=[
+    Field::FragmentStart,Field::FragmentEnd,Field::TilerStart,Field::TilerEnd,
+    Field::FragmentUserStart,Field::FragmentUserEnd,Field::TilerUserStart,Field::TilerUserEnd,
+    Field::Auxiliary,Field::Preemption0,Field::Preemption1,Field::Preemption2,Field::Tpc,Field::Tilemap,Field::HeapMetadata,
+    Field::LegacyClusterTilemap,Field::LegacyClusterMetadata0,Field::LegacyClusterMetadata1,
+    Field::LegacyClusterMetadata2,Field::LegacyClusterMetadata3,Field::LegacySceneUser,
+    Field::Scene,Field::SceneUser,Field::TilerToFragment,Field::FragmentCommand,Field::LegacyFragmentTail,
+    Field::FragmentSequence,Field::FragmentScratch,Field::TilerCommand,Field::LegacyTilerTail,
+    Field::TilerSequence,Field::TilerScratch,Field::TilerDependency,Field::FragmentDependency,
+];
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub(crate) enum Space {Firmware,ClientGpu}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub(crate) enum Access {GpuFirmwareCachedRw,GpuFirmwareUncachedRw,FirmwareUncachedRw,GpuCachedRw,GpuUncachedRw}
+impl Access {
+    /// Exact original PTE attributes, applied in the allocation's own space.
+    /// Names follow pgtable.rs AP/UXN/PXN and MEMATTR definitions; bit 3 is
+    /// the uncached memory attribute, not a read-only access flag.
+    pub(crate) const fn pte(self)->u64 {
+        match self {
+            Self::GpuFirmwareCachedRw=>0xe0000000000000,
+            Self::GpuFirmwareUncachedRw=>0xe0000000000008,
+            Self::FirmwareUncachedRw=>0xc0000000000048,
+            Self::GpuCachedRw=>0xc0000000000080,
+            Self::GpuUncachedRw=>0xc0000000000088,
+        }
+    }
+}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub(crate) struct Allocation {
+    pub(crate) address:u64,
+    pub(crate) space:Space,
+    pub(crate) size:usize,
+    pub(crate) access:Access,
+    /// Command GPU alias in the lower kernel root, additionally mapped in the
+    /// active client VM. The command's canonical address remains firmware VA.
+    pub(crate) gpu_alias:Option<u64>,
+}
+#[derive(Debug,PartialEq,Eq)]
+pub(crate) enum Error {Slot,Address}
+/// Preserve all fixed virtual addresses, sizes, permission bits and aliases.
+/// The caller controls allocation order and lifetime; the layout owns no memory.
+pub(crate) fn allocation(slot:usize,field:Field)->Result<Allocation,Error> {
+    use Field::*;
+    use Space::*;
+    use Access::*;
+    if slot>=SLOTS {return Err(Error::Slot);}
+    let (base,stride,size,space,access,alias)=match field {
+        FragmentStart=>(0xfffffc20700f3ff8,0x74000,8,Firmware,GpuFirmwareUncachedRw,None),
+        FragmentEnd=>(0xfffffc20700fbff8,0x74000,8,Firmware,GpuFirmwareUncachedRw,None),
+        TilerStart=>(0xfffffc2070103ff8,0x74000,8,Firmware,GpuFirmwareUncachedRw,None),
+        TilerEnd=>(0xfffffc207010bff8,0x74000,8,Firmware,GpuFirmwareUncachedRw,None),
+        FragmentUserStart=>(0xfffffc2071003ff8,0x20000,8,Firmware,FirmwareUncachedRw,None),
+        FragmentUserEnd=>(0xfffffc207100bff8,0x20000,8,Firmware,FirmwareUncachedRw,None),
+        TilerUserStart=>(0xfffffc2071013ff8,0x20000,8,Firmware,FirmwareUncachedRw,None),
+        TilerUserEnd=>(0xfffffc207101bff8,0x20000,8,Firmware,FirmwareUncachedRw,None),
+        Auxiliary=>(0x100848a0000,0x98000,131072,ClientGpu,GpuUncachedRw,None),
+        Preemption0=>(0x1006083580,0x118000,2688,ClientGpu,GpuCachedRw,None),
+        Preemption1=>(0x100609bb00,0x118000,1280,ClientGpu,GpuCachedRw,None),
+        Preemption2=>(0x10060b3f80,0x118000,128,ClientGpu,GpuCachedRw,None),
+        Tpc=>(0x10060c8000,0x118000,262144,ClientGpu,GpuCachedRw,None),
+        Tilemap=>(0x1006118000,0x118000,98304,ClientGpu,GpuCachedRw,None),
+        HeapMetadata=>(0x1006143000,0x118000,4096,ClientGpu,GpuCachedRw,None),
+        LegacyClusterTilemap=>(0x100848c8000,0x98000,196608,ClientGpu,GpuUncachedRw,None),
+        LegacyClusterMetadata0=>(0x10084903ff8,0x98000,8,ClientGpu,GpuUncachedRw,None),
+        LegacyClusterMetadata1=>(0x1008490b380,0x98000,3200,ClientGpu,GpuUncachedRw,None),
+        LegacyClusterMetadata2=>(0x10084913b00,0x98000,1280,ClientGpu,GpuUncachedRw,None),
+        LegacyClusterMetadata3=>(0x1008491bfa0,0x98000,96,ClientGpu,GpuUncachedRw,None),
+        LegacySceneUser=>(0x10084920000,0x98000,65536,ClientGpu,GpuUncachedRw,None),
+        Scene=>(0xfffffc2070113f80,0x74000,128,Firmware,GpuFirmwareUncachedRw,None),
+        SceneUser=>(0x1006158000,0x118000,65536,ClientGpu,GpuCachedRw,None),
+        TilerToFragment=>(0xfffffc200066ffc0,0xcc000,62,Firmware,FirmwareUncachedRw,None),
+        FragmentCommand=>(0xfffffc207011b380,0x74000,3187,Firmware,GpuFirmwareUncachedRw,Some(0x7200003380)),
+        LegacyFragmentTail=>(0xfffffc2070120000,0x74000,65536,Firmware,GpuFirmwareUncachedRw,None),
+        FragmentSequence=>(0xfffffc20006b3000,0xcc000,4096,Firmware,FirmwareUncachedRw,None),
+        FragmentScratch=>(0x1006178000,0x118000,65536,ClientGpu,GpuCachedRw,None),
+        TilerCommand=>(0xfffffc20701376c0,0x74000,2347,Firmware,GpuFirmwareUncachedRw,Some(0x72000136c0)),
+        LegacyTilerTail=>(0xfffffc207013c000,0x74000,65536,Firmware,GpuFirmwareUncachedRw,None),
+        TilerSequence=>(0xfffffc20006f7000,0xcc000,4096,Firmware,FirmwareUncachedRw,None),
+        TilerScratch=>(0xfffffc2070150000,0x74000,65536,Firmware,GpuFirmwareUncachedRw,None),
+        TilerDependency=>(0xfffffc200132ffc0,0x44000,62,Firmware,FirmwareUncachedRw,None),
+        FragmentDependency=>(0xfffffc200176ffc0,0x44000,62,Firmware,FirmwareUncachedRw,None),
+    };
+    let address=base+(slot as u64)*stride;
+    let gpu_alias=alias.map(|base|base+(slot as u64)*0x20000);
+    // Both roots must retain matching 16-KiB page offsets for coherent backing.
+    if gpu_alias.is_some_and(|alias|alias&0x3fff!=address&0x3fff) {return Err(Error::Address);}
+    Ok(Allocation {address,space,size,access,gpu_alias})
+}

@@ -9,6 +9,7 @@ use crate::{
     default_zeroed,
     trivial_gpustruct, //
 };
+use kernel::static_assert;
 use kernel::sync::Arc;
 
 #[derive(Debug)]
@@ -152,12 +153,22 @@ pub(crate) mod raw {
         pub(crate) unk_94: u32,
         pub(crate) pending: AtomicU32,
         pub(crate) unk_9c: u32,
+        // G15 channel state is 0x24c0 bytes and `gpu_context` sits at +0xa4.
+        #[ver(V >= V14_8_3)]
+        pub(crate) unk_a0: u32,
         pub(crate) gpu_context: GpuPointer<'a, super::GpuContextData>,
         pub(crate) unk_a8: U64,
         #[ver(V >= V13_2 && G < G14X)]
         pub(crate) unk_b0: u32,
+        // Firmware-private scratch in this same object. `gpu_buf` points at +0xb0.
+        #[ver(V >= V14_8_3)]
+        pub(crate) fw_scratch: Array<0x240c, u8>,
     }
 }
+
+// The G15 channel state is 0x24c0 bytes, context pointer at +0xa4.
+static_assert!(core::mem::size_of::<raw::QueueInfoG15V14_8_3<'_>>() == 0x24c0);
+static_assert!(core::mem::offset_of!(raw::QueueInfoG15V14_8_3<'_>, gpu_context) == 0xa4);
 
 trivial_gpustruct!(Barrier);
 trivial_gpustruct!(RingState);

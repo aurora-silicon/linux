@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * USB4/Thunderbolt wiring of the t6030 (M3 Pro) MacBook Pros j514s and j516s: each USB-C connector's
+ * port@2 points at the ACIO router of the same ATC block.
+ *
+ * typec0 = left back (ATC0), typec1 = left front (ATC1), typec2 = right (ATC2).
+ */
+
+/ {
+	aliases {
+		/* m1n1 fills the ACIO, PCIe adapter and NHI tunables and the DROM through these */
+		usb4_0_rc = &usb4_0_acio;
+		usb4_1_rc = &usb4_1_acio;
+		usb4_2_rc = &usb4_2_acio;
+		usb4_0_pcie_adapter = &usb4_0_acio;
+		usb4_1_pcie_adapter = &usb4_1_acio;
+		usb4_2_pcie_adapter = &usb4_2_acio;
+		usb4_0_nhi = &usb4_0_nhi;
+		usb4_1_nhi = &usb4_1_nhi;
+		usb4_2_nhi = &usb4_2_nhi;
+	};
+};
+
+#define T603X_USB4_GRAPH(n)						\
+&typec##n {								\
+	ports {								\
+		port@2 {						\
+			reg = <2>;					\
+			typec##n##_con_tbt: endpoint {			\
+				remote-endpoint = <&usb4_##n##_acio_tbt>; \
+			};						\
+		};							\
+	};								\
+};									\
+									\
+&usb4_##n##_acio {							\
+	ports {								\
+		#address-cells = <1>;					\
+		#size-cells = <0>;					\
+									\
+		port@1 {						\
+			reg = <1>;					\
+			usb4_##n##_acio_tbt: endpoint {			\
+				remote-endpoint = <&typec##n##_con_tbt>; \
+			};						\
+		};							\
+	};								\
+}
+
+T603X_USB4_GRAPH(0);
+T603X_USB4_GRAPH(1);
+T603X_USB4_GRAPH(2);
+
+#undef T603X_USB4_GRAPH

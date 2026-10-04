@@ -1,0 +1,465 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+//! Module parameters of the T6030 (M3) backends.
+//!
+//! The `module!` parameter support only parses plain integers. The parameters here are declared
+//! with their own `kernel_param` entries (the same layout the `module!` macro emits), so they can
+//! take symbolic values on the kernel command line, e.g. `asahi.m3_backend=manager`, and hex or
+//! decimal masks.
+
+use core::ffi::{
+    c_char,
+    c_int,
+};
+use core::sync::atomic::{
+    AtomicU64,
+    Ordering, //
+};
+
+use kernel::{
+    c_str,
+    device::Core,
+    platform,
+    prelude::*, //
+};
+
+/// Parse a decimal or `0x`-prefixed hexadecimal `u64`.
+fn parse_u64(text: &str) -> Option<u64> {
+    let text = text.trim();
+    match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => text.parse::<u64>().ok(),
+    }
+}
+
+/// Store the parsed value of a parameter string into the `AtomicU64` behind `kp`.
+///
+/// # Safety
+///
+/// `val` must be NULL or a NUL-terminated string, and `kp` must be a `kernel_param` declared by
+/// [`m3_param!`], whose `arg` points at a static `AtomicU64`.
+unsafe fn set_param(
+    val: *const c_char,
+    kp: *const kernel::bindings::kernel_param,
+    parse: fn(&str) -> Option<u64>,
+) -> c_int {
+    if val.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: `val` is a NUL-terminated string per the function contract.
+    let Ok(text) = unsafe { core::ffi::CStr::from_ptr(val) }.to_str() else {
+        return EINVAL.to_errno();
+    };
+    let Some(value) = parse(text) else {
+        return EINVAL.to_errno();
+    };
+    // SAFETY: `arg` points at the static `AtomicU64` this entry was declared with.
+    let slot = unsafe { &*(*kp).__bindgen_anon_1.arg.cast::<AtomicU64>() };
+    slot.store(value, Ordering::Relaxed);
+    0
+}
+
+/// Declare a module parameter `asahi.<name>` stored in the static `AtomicU64` `$storage` and
+/// parsed by `$parse: fn(&str) -> Option<u64>`. Not visible in sysfs.
+macro_rules! m3_param {
+    ($name:literal, $storage:ident, $parse:path) => {
+        m3_param!($name, $storage, $parse, 0, None);
+    };
+    ($name:literal, $storage:ident, $parse:path, $perm:expr, $get:expr) => {
+        const _: () = {
+            unsafe extern "C" fn set(
+                val: *const c_char,
+                kp: *const kernel::bindings::kernel_param,
+            ) -> c_int {
+                // SAFETY: Called by the parameter parser with a value string (or NULL) and the
+                // `kernel_param` entry declared below.
+                unsafe { set_param(val, kp, $parse) }
+            }
+
+            static OPS: kernel::bindings::kernel_param_ops = kernel::bindings::kernel_param_ops {
+                flags: 0,
+                set: Some(set),
+                get: $get,
+                free: None,
+            };
+
+            #[link_section = "__param"]
+            #[used(compiler)]
+            static PARAM: kernel::module_param::KernelParam =
+                kernel::module_param::KernelParam::new(kernel::bindings::kernel_param {
+                    name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
+                        kernel::c_str!($name)
+                    } else {
+                        kernel::c_str!(concat!("asahi.", $name))
+                    }),
+                    // SAFETY: `__this_module` is constructed by the kernel at load time and
+                    // is not freed until the module is unloaded.
+                    #[cfg(MODULE)]
+                    mod_: unsafe {
+                        core::ptr::from_ref(&kernel::bindings::__this_module).cast_mut()
+                    },
+                    #[cfg(not(MODULE))]
+                    mod_: core::ptr::null_mut(),
+                    ops: core::ptr::from_ref(&OPS),
+                    perm: $perm,
+                    level: -1,
+                    flags: 0,
+                    __bindgen_anon_1: kernel::bindings::kernel_param__bindgen_ty_1 {
+                        arg: core::ptr::from_ref(&$storage).cast_mut().cast(),
+                    },
+                });
+        };
+    };
+}
+
+/// Read an atomic parameter without borrowing storage that a sysfs write may
+/// change concurrently. The module-parameter core supplies a PAGE_SIZE buffer.
+///
+/// # Safety
+///
+/// `buffer` must be the module-parameter core's writable output buffer and
+/// `kp` must be an entry declared by `m3_param!` with AtomicU64 storage.
+unsafe extern "C" fn get_atomic_param(
+    buffer: *mut c_char,
+    kp: *const kernel::bindings::kernel_param,
+) -> c_int {
+    use core::fmt::Write;
+
+    // SAFETY: The entry points to static AtomicU64 storage by contract. Loads
+    // and stores are atomic; module-parameter serialization alone would not
+    // protect the scheduler's concurrent reads.
+    let value = unsafe { &*((*kp).__bindgen_anon_1.arg.cast::<AtomicU64>()) }
+        .load(Ordering::Relaxed);
+    // SAFETY: 32 bytes fit in the core's PAGE_SIZE output buffer and hold any
+    // decimal u64 plus its NUL. The core appends the sysfs newline itself.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), 32) };
+    let mut output = kernel::str::Formatter::new(bytes);
+    if write!(output, "{}\0", value).is_err() {
+        return EINVAL.to_errno();
+    }
+    (output.bytes_written() - 1) as c_int
+}
+
+fn parse_render_batch_override(text: &str) -> Option<u64> {
+    parse_u64(text).filter(|value| *value <= crate::m3_pass_layout::SLOTS as u64)
+}
+
+/// Runtime tuning is opt-in: zero keeps the existing boot parameter and its
+/// clamping semantics. Only root may write a bounded 1..=SLOTS override; an
+/// invalid write leaves the previous value intact. Compute batching is separate.
+static M3_RENDER_BATCH_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+m3_param!("m3_render_batch_override", M3_RENDER_BATCH_OVERRIDE,
+    parse_render_batch_override, 0o644, Some(get_atomic_param));
+
+/// Snapshot once per packet. A live change affects later packets, never the
+/// batch storage, ordering or retirement checks of work already being executed.
+pub(crate) fn render_batch_size() -> usize {
+    let override_size = M3_RENDER_BATCH_OVERRIDE.load(Ordering::Relaxed);
+    let size = if override_size == 0 {
+        *crate::module_parameters::m3_render_batch_size.value() as usize
+    } else {
+        override_size as usize
+    };
+    size.clamp(1, crate::m3_pass_layout::SLOTS)
+}
+
+fn parse_compute_batch_override(text: &str) -> Option<u64> {
+    parse_u64(text).filter(|value| *value <= crate::m3_compute_storage::SLOTS as u64)
+}
+
+/// Independently tune the existing adjacent-compute path. Zero preserves the
+/// boot parameter; invalid writes do not replace the current value. Storage and
+/// engine/VM retirement boundaries are unchanged.
+static M3_COMPUTE_BATCH_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+m3_param!("m3_compute_batch_override", M3_COMPUTE_BATCH_OVERRIDE,
+    parse_compute_batch_override, 0o644, Some(get_atomic_param));
+
+/// Snapshot once per packet, so a live write never changes an in-flight batch.
+pub(crate) fn compute_batch_size() -> usize {
+    let override_size = M3_COMPUTE_BATCH_OVERRIDE.load(Ordering::Relaxed);
+    let size = if override_size == 0 {
+        *crate::module_parameters::m3_compute_batch_size.value() as usize
+    } else {
+        override_size as usize
+    };
+    size.clamp(1, crate::m3_compute_storage::SLOTS)
+}
+
+/// `asahi.g15_debug`: G15 bring-up bits, see [`G15Debug`].
+static G15_DEBUG: AtomicU64 = AtomicU64::new(0);
+m3_param!("g15_debug", G15_DEBUG, parse_u64);
+
+/// Bits of `asahi.g15_debug`, the bring-up switches of the G15 manager backend.
+///
+/// The numbers are the ones these switches had in `asahi.debug_flags` during bring-up, so old
+/// notes stay valid. Bits 49 and 50 are no longer switches: the HwDataB power-management flags
+/// they enabled are always set on G15.
+#[derive(Copy, Clone)]
+#[repr(u32)]
+pub(crate) enum G15Debug {
+    /// A/B experiment: issue the Fender kick (0x11, then 0x10) before starting the ASC. The
+    /// G15 firmware boots and runs jobs without it.
+    FenderKick = 41,
+    /// Register the DRM device (card/render nodes) for the manager backend, like
+    /// `asahi.m3_expose=1`. Off by default so compositors and system Mesa never see a GPU that
+    /// cannot run userspace jobs yet; the firmware bring-up runs either way.
+    ExposeDrm = 42,
+    /// Turn the firmware log on (RuntimePointers+0x230 = 1) before MSG_INIT. The firmware
+    /// writes no log records while it is 0.
+    FwLog = 43,
+    /// A/B: ring a DEVCTRL (0x83|0x11) and a KICKFW (0x83|0x10) doorbell immediately after
+    /// MSG_INIT, before the firmware has registered its EP 0x21 handler.
+    LegacyDoorbells = 44,
+    /// Skip the post-init DeviceControl liveness probe (no doorbell at all after MSG_INIT).
+    NoDevctlProbe = 45,
+    /// Map the gfx-data carveout (firmware data) read-only and log the init progress words,
+    /// thread handles and crashlog fill at every health sample.
+    GfxDataPeek = 46,
+    /// After firmware init, submit one empty compute job and poll its stamp for 2 seconds.
+    /// Never fails probe and never blocks boot past that poll.
+    SelfTest = 47,
+    /// With [`G15Debug::SelfTest`]: first run a firmware-only copy of the job (cmd+0x878 = 1,
+    /// StartCL skip path, no hardware kick). The real job runs only if that one completes.
+    SelfTestSkipFirst = 51,
+    /// Runtime backend: stop the probe right before the GPU coprocessor would be started. The
+    /// firmware never runs; everything before that point (admission, firmware identity,
+    /// InitData generation, register identity checks) still does.
+    StopBeforeAsc = 53,
+    /// A/B for the manager backend: publish the performance states as the two voltage-sorted
+    /// tables (with their device-tree index maps) instead of one table in device-tree order.
+    ManagerSplitPstates = 54,
+    /// A/B for the manager backend: write the power-controller block's PPM words at +0xc8..+0xd8
+    /// in the order the runtime backend's InitData uses (0, enable, target power, kp, ki*dt),
+    /// and the Globals power-interface targets and performance-state cap, instead of the
+    /// manager's validated values.
+    ManagerReferencePpm = 55,
+    /// Experiment for the runtime backend: when a job fails and the firmware reports that it has
+    /// halted, clear the halted flag and set resume, then log for about half a second what the
+    /// firmware, the engines and the failed job do. The GPU stays marked failed either way.
+    M3ResumeAfterFault = 56,
+}
+
+/// Returns whether a `asahi.g15_debug` bit is set.
+pub(crate) fn g15_debug(bit: G15Debug) -> bool {
+    G15_DEBUG.load(Ordering::Relaxed) & (1u64 << (bit as u32)) != 0
+}
+
+/// The raw `asahi.g15_debug` value, for logging.
+pub(crate) fn g15_debug_mask() -> u64 {
+    G15_DEBUG.load(Ordering::Relaxed)
+}
+
+/// `asahi.m3_backend` values.
+const BACKEND_AUTO: u64 = 0;
+const BACKEND_RUNTIME: u64 = 1;
+const BACKEND_MANAGER: u64 = 2;
+const BACKEND_OFF: u64 = 3;
+
+fn parse_backend(text: &str) -> Option<u64> {
+    match text.trim() {
+        "auto" | "0" => Some(BACKEND_AUTO),
+        "runtime" | "1" => Some(BACKEND_RUNTIME),
+        "manager" | "2" => Some(BACKEND_MANAGER),
+        "off" | "3" => Some(BACKEND_OFF),
+        _ => None,
+    }
+}
+
+/// `asahi.m3_backend=auto|runtime|manager|off`: which T6030 GPU backend probe starts.
+static M3_BACKEND: AtomicU64 = AtomicU64::new(BACKEND_AUTO);
+m3_param!("m3_backend", M3_BACKEND, parse_backend);
+
+/// The T6030 GPU backend to start.
+pub(crate) enum T6030Backend {
+    /// The serialized M3 runtime (m3_drm / m3_runtime).
+    Runtime,
+    /// The G15 GpuManager backend (g15_probe).
+    Manager,
+    /// No backend: the probe stops without touching the GPU.
+    Off,
+}
+
+/// Whether the root node's compatible list contains `compatible`.
+fn board_is(compatible: &[u8]) -> bool {
+    kernel::of::root()
+        .and_then(|root| root.get_property::<KVec<u8>>(c_str!("compatible")).ok())
+        .is_some_and(|board| board.split(|b| *b == 0).any(|s| s == compatible))
+}
+
+/// `asahi.m3_initdata` values.
+const INITDATA_AUTO: u64 = 0;
+const INITDATA_ADT: u64 = 2;
+
+fn parse_initdata(text: &str) -> Option<u64> {
+    match text.trim() {
+        "auto" | "0" => Some(INITDATA_AUTO),
+        "adt" | "2" => Some(INITDATA_ADT),
+        _ => None,
+    }
+}
+
+/// `asahi.m3_initdata=auto|adt`: the runtime backend's InitData contents are generated from the
+/// device tree either way; the value is logged.
+static M3_INITDATA: AtomicU64 = AtomicU64::new(INITDATA_AUTO);
+m3_param!("m3_initdata", M3_INITDATA, parse_initdata);
+
+/// Requested source of the runtime backend's InitData contents.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) enum InitDataParam {
+    /// Not given: contents generated from the device tree.
+    Auto,
+    /// Contents generated from the device tree.
+    Adt,
+}
+
+/// The `asahi.m3_initdata` setting.
+pub(crate) fn initdata_param() -> InitDataParam {
+    match M3_INITDATA.load(Ordering::Relaxed) {
+        INITDATA_ADT => InitDataParam::Adt,
+        _ => InitDataParam::Auto,
+    }
+}
+
+/// Default of `asahi.m3_max_pstate` for device-tree InitData and the G15 manager backend: the
+/// fifth performance state (1056 MHz on J516S).
+pub(crate) const MAX_PSTATE_DEFAULT: u64 = 5;
+/// A performance-state parameter that is not given.
+const PSTATE_UNSET: u64 = u64::MAX;
+
+/// `asahi.m3_max_pstate`: the highest GPU performance state the driver lets the firmware use,
+/// as an index into the voltage-sorted performance-state table (1 = lowest, 8 = highest on
+/// T6030; the G15 manager backend translates it to its device-tree ordered table). It is
+/// clamped to the device tree's highest performance state. Unset means
+/// [`MAX_PSTATE_DEFAULT`], except with the runtime backend while its thermal limit is on or
+/// holding, which keeps the whole table.
+static M3_MAX_PSTATE: AtomicU64 = AtomicU64::new(PSTATE_UNSET);
+m3_param!("m3_max_pstate", M3_MAX_PSTATE, parse_u64);
+
+/// `asahi.m3_boot_pstate`: the performance state the runtime backend requests at boot, clamped
+/// to the cap. Unset means the cap.
+static M3_BOOT_PSTATE: AtomicU64 = AtomicU64::new(PSTATE_UNSET);
+m3_param!("m3_boot_pstate", M3_BOOT_PSTATE, parse_u64);
+
+/// The `asahi.m3_max_pstate` setting, if given, before clamping to the performance-state table.
+pub(crate) fn max_pstate_param() -> Option<u64> {
+    Some(M3_MAX_PSTATE.load(Ordering::Relaxed)).filter(|v| *v != PSTATE_UNSET)
+}
+
+/// The `asahi.m3_boot_pstate` setting, if given, before clamping.
+pub(crate) fn boot_pstate_param() -> Option<u64> {
+    Some(M3_BOOT_PSTATE.load(Ordering::Relaxed)).filter(|v| *v != PSTATE_UNSET)
+}
+
+/// `asahi.m3_timeout_nohang`: 1 (default) makes a scheduler timeout of a runtime-backend job
+/// report "no hang", because the runtime completes every packet itself and enforces its own
+/// per-batch completion limit. 0 keeps the previous handling: mark the GPU failed, fail the
+/// packet again and report the device as gone.
+static M3_TIMEOUT_NOHANG: AtomicU64 = AtomicU64::new(1);
+m3_param!("m3_timeout_nohang", M3_TIMEOUT_NOHANG, parse_u64);
+
+/// Whether `asahi.m3_timeout_nohang` is set (the default).
+pub(crate) fn timeout_nohang() -> bool {
+    M3_TIMEOUT_NOHANG.load(Ordering::Relaxed) != 0
+}
+
+/// `asahi.m3_unlocked_wait`: 1 (default) releases the runtime lock while the runtime backend
+/// waits for a batch to complete, so VM creation, timestamp mapping and the event worker are
+/// not held up by a running job. 0 holds the lock from preparation to retirement, as before.
+static M3_UNLOCKED_WAIT: AtomicU64 = AtomicU64::new(1);
+m3_param!("m3_unlocked_wait", M3_UNLOCKED_WAIT, parse_u64);
+
+/// Whether `asahi.m3_unlocked_wait` is set (the default).
+pub(crate) fn unlocked_wait() -> bool {
+    M3_UNLOCKED_WAIT.load(Ordering::Relaxed) != 0
+}
+
+/// `asahi.m3_thermal` values.
+const THERMAL_OFF: u64 = 0;
+const THERMAL_HOLD: u64 = 1;
+const THERMAL_ON: u64 = 2;
+const THERMAL_UNSET: u64 = u64::MAX;
+
+fn parse_thermal(text: &str) -> Option<u64> {
+    match text.trim() {
+        "off" | "0" => Some(THERMAL_OFF),
+        "hold" => Some(THERMAL_HOLD),
+        "on" | "1" => Some(THERMAL_ON),
+        _ => None,
+    }
+}
+
+static M3_THERMAL: AtomicU64 = AtomicU64::new(THERMAL_UNSET);
+m3_param!("m3_thermal", M3_THERMAL, parse_thermal);
+
+/// How the runtime backend limits the GPU performance state by temperature.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum ThermalMode {
+    /// Today's fixed cap: the firmware is given the cap as its highest state, and nothing
+    /// changes it at runtime.
+    Off,
+    /// The firmware is given the whole table as its highest state, and the runtime cap words
+    /// hold the fixed cap for the whole boot. The same performance as `Off`, if the firmware
+    /// follows the runtime cap: this checks that it does.
+    Hold,
+    /// As `Hold`, and the runtime cap follows the SoC die temperature, up to the whole table
+    /// while the die is cool.
+    On,
+}
+
+/// The `asahi.m3_thermal` setting, if given.
+pub(crate) fn thermal_param() -> Option<ThermalMode> {
+    match M3_THERMAL.load(Ordering::Relaxed) {
+        THERMAL_OFF => Some(ThermalMode::Off),
+        THERMAL_HOLD => Some(ThermalMode::Hold),
+        THERMAL_ON => Some(ThermalMode::On),
+        _ => None,
+    }
+}
+
+/// Default and bounds of `asahi.m3_thermal_hot`, in degrees Celsius.
+pub(crate) const THERMAL_HOT_DEFAULT: u64 = 80;
+pub(crate) const THERMAL_HOT_MIN: u64 = 40;
+pub(crate) const THERMAL_HOT_MAX: u64 = 85;
+
+/// `asahi.m3_thermal_hot`: the SoC die temperature (degrees Celsius) at or above which the thermal
+/// limit lowers the runtime cap, clamped to [`THERMAL_HOT_MIN`]..=[`THERMAL_HOT_MAX`].
+static M3_THERMAL_HOT: AtomicU64 = AtomicU64::new(THERMAL_HOT_DEFAULT);
+m3_param!("m3_thermal_hot", M3_THERMAL_HOT, parse_u64);
+
+/// The `asahi.m3_thermal_hot` setting and whether it was clamped.
+pub(crate) fn thermal_hot_param() -> (u64, bool) {
+    let value = M3_THERMAL_HOT.load(Ordering::Relaxed);
+    let clamped = value.clamp(THERMAL_HOT_MIN, THERMAL_HOT_MAX);
+    (clamped, clamped != value)
+}
+
+/// Select the T6030 GPU backend from `asahi.m3_backend`, and say which one and why.
+///
+/// `auto` keeps the runtime backend on J514S, the board it is validated on. On other T6030
+/// boards it starts nothing until the runtime is validated there; `asahi.m3_backend=runtime`
+/// starts it anyway.
+pub(crate) fn t6030_backend(pdev: &platform::Device<Core>) -> T6030Backend {
+    let dev = pdev.as_ref();
+    match M3_BACKEND.load(Ordering::Relaxed) {
+        BACKEND_RUNTIME => {
+            dev_info!(dev, "M3: asahi.m3_backend=runtime\n");
+            T6030Backend::Runtime
+        }
+        BACKEND_MANAGER => {
+            dev_info!(dev, "M3: asahi.m3_backend=manager: starting the G15 manager backend\n");
+            T6030Backend::Manager
+        }
+        BACKEND_OFF => {
+            dev_info!(dev, "M3: asahi.m3_backend=off: no GPU backend started\n");
+            T6030Backend::Off
+        }
+        _ if board_is(b"apple,j514s") => T6030Backend::Runtime,
+        _ => {
+            dev_info!(
+                dev,
+                "M3: asahi.m3_backend=auto: no GPU backend on this board: the runtime backend is not validated here yet (asahi.m3_backend=runtime starts it, asahi.m3_backend=manager starts the G15 manager backend)\n"
+            );
+            T6030Backend::Off
+        }
+    }
+}

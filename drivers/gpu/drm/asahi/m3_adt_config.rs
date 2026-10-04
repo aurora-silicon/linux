@@ -1,0 +1,1026 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+
+use core::mem::{offset_of, size_of};
+
+use kernel::{
+    c_str, device,
+    device::Core,
+    platform,
+    prelude::*,
+    time::{delay::fsleep, Delta},
+};
+
+use crate::{
+    fw::initdata::raw,
+    hw, initdata,
+    initdata::{G15Layout, G15Options},
+    m3_config::Records,
+    m3_firmware::Firmware,
+    m3_init_layout as init,
+    m3_init_storage as storage,
+    m3_memory::Buffer,
+    m3_params::{self, G15Debug, InitDataParam, ThermalMode},
+};
+
+/// Owner indices (`m3_init_storage`) of the objects the typed builders generate.
+pub(crate) const INITDATA: usize = storage::ROOT;
+pub(crate) const RUNTIME_POINTERS: usize = storage::RUNTIME_POINTERS;
+pub(crate) const HWDATA: usize = storage::HARDWARE_DATA;
+pub(crate) const GLOBALS: usize = storage::GLOBALS;
+pub(crate) const GLOBALS_POWER: usize = storage::GLOBALS_POWER;
+pub(crate) const STATUS: usize = storage::CONTROL_REGION;
+pub(crate) const DEBUG: usize = storage::RUNTIME_FLAGS;
+/// HwDataA follows HwDataB inside the HwData object.
+pub(crate) const HWDATA_A: usize = 0x4580;
+
+/// Offset of HwDataB's IO-mapping table and the size of one entry.
+const IO_MAPPINGS: usize = offset_of!(raw::HwDataBG15V14_8_3, io_mappings);
+const IO_MAPPING_SIZE: usize = size_of::<raw::IOMapping>();
+/// Number of IO-mapping slots of HwDataB.
+const IO_MAPPING_SLOTS: usize = 31;
+
+/// The firmware IO mappings of the runtime backend (HwDataB slot, physical address, total size,
+/// element size, writable). The runtime maps IO with its own IO-mapping table
+/// (`m3_init_storage::IOMAPS`), which must cover every entry (checked when the contents are
+/// built). The physical addresses are T6030 SoC register blocks, the same ones the G15 manager
+/// maps (`hw::t6030`).
+const RUNTIME_IO_MAPPINGS: [(usize, u64, u32, u32, bool); 15] = [
+    (0, 0x2_90d0_0000, 0x14_4000, 0x14_4000, true), // Fender
+    (1, 0x2_0e10_1000, 1, 1, false),                // AIC timer
+    (2, 0x3_5101_4000, 0x4000, 0x4000, true),       // AIC software interrupts
+    (3, 0x2_9000_0000, 0x2_0000, 0x2_0000, true),   // RGX
+    (7, 0x3_502b_c000, 0x1000, 0x1000, false),      // analog temperature sensors
+    (9, 0x2_90e0_8000, 0x8000, 0x8000, true),       // metrology sensors
+    (11, 0x2_2000_0000, 0x12_a000, 0x9_5000, true), // memory cache, two instances
+    (12, 0x3_5104_c000, 0x4000, 0x4000, false),     // AIC banked registers
+    (18, 0x3_503d_0000, 0x4000, 0x4000, true),      // telemetry dashboard
+    (19, 0x3_503c_0000, 0x4000, 0x4000, false),     // telemetry dashboard (read)
+    (20, 0x3_503d_8000, 0x4000, 0x4000, true),      // telemetry dashboard (config)
+    (23, 0x2_9300_0000, 0x40_0000, 0x40_0000, true), // AFR registers
+    (25, 0x3_0945_c000, 1, 1, true),                // ANE doorbell
+    (26, 0x3_5028_0000, 0x8000, 0x8000, false),     // PMS metrology sensors
+    (29, 0x2_90e5_c000, 0x4000, 0x4000, false),     // GFX clock generator
+];
+
+/// Highest performance state device-tree InitData may use without the driver's thermal limit
+/// (`asahi.m3_thermal=off`), and the runtime cap the thermal limit starts at and falls back to
+/// (the "safe cap"). The InitData's fast-die temperature controller words stay 0, so the
+/// firmware does not limit the die temperature by itself.
+pub(crate) const ADT_MAX_PSTATE_LIMIT: u32 = 5;
+
+/// The performance states the runtime backend lets the firmware use.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct PstatePolicy {
+    /// Highest entry of the published table.
+    pub(crate) table_max: u32,
+    /// Frequency of the highest entry of the published table, in MHz.
+    pub(crate) table_max_mhz: u32,
+    /// The ceiling: the highest entry the firmware is given (the InitData's highest-state
+    /// words). A reported state above it marks the GPU failed.
+    pub(crate) max: u32,
+    /// The runtime cap at boot (the Globals cap words): the highest entry the firmware may use
+    /// until the thermal limit changes it. Equal to `max` unless the thermal limit is on or
+    /// holding, which start here and never go below it.
+    pub(crate) safe: u32,
+    /// The entry requested at boot, at most `safe`.
+    pub(crate) boot: u32,
+    /// Frequency of the ceiling entry, in MHz.
+    pub(crate) max_mhz: u32,
+    /// Frequency of the `safe` entry, in MHz.
+    pub(crate) safe_mhz: u32,
+    /// Frequency of the boot entry, in MHz.
+    pub(crate) boot_mhz: u32,
+    /// Frequency of every entry of the published table, in MHz (entry 0 is the off state).
+    pub(crate) freqs: [u32; 16],
+    /// `asahi.m3_thermal`.
+    pub(crate) thermal: ThermalMode,
+}
+
+impl PstatePolicy {
+    /// The highest frequency the GPU may run at this boot, for userspace: the ceiling's when
+    /// the thermal limit is on, the runtime cap's otherwise.
+    pub(crate) fn reported_max_mhz(&self) -> u32 {
+        match self.thermal {
+            ThermalMode::On => self.max_mhz,
+            ThermalMode::Off | ThermalMode::Hold => self.safe_mhz,
+        }
+    }
+
+    /// Clamp the `asahi.m3_max_pstate` and `asahi.m3_boot_pstate` settings to the published table
+    /// of `hwdata` (the generated HwData object image).
+    fn new(dev: &device::Device, hwdata: &[u8]) -> Result<Self> {
+        let hwb_max = offset_of!(raw::HwDataBG15V14_8_3, max_pstate);
+        let hwb_freq = offset_of!(raw::HwDataBG15V14_8_3, frequencies);
+        let table_max = read_u32(hwdata, hwb_max)?;
+        if table_max == 0 || table_max >= 16 {
+            return Err(EINVAL);
+        }
+        let freq = |i: u32| read_u32(hwdata, hwb_freq + 4 * i as usize);
+        // Unset: the thermal limit is on.
+        let thermal = m3_params::thermal_param().unwrap_or(ThermalMode::On);
+        // Unset: the whole table when the thermal limit bounds the runtime cap, the default cap
+        // otherwise.
+        let requested = m3_params::max_pstate_param().unwrap_or(match thermal {
+            ThermalMode::Hold | ThermalMode::On => u64::from(table_max),
+            ThermalMode::Off => m3_params::MAX_PSTATE_DEFAULT,
+        });
+        let mut max = requested.clamp(1, u64::from(table_max)) as u32;
+        if u64::from(max) != requested {
+            dev_info!(
+                dev,
+                "M3: asahi.m3_max_pstate={} clamped to {} (the table has states 1..={})\n",
+                requested,
+                max,
+                table_max
+            );
+        }
+        if thermal == ThermalMode::Off && max > ADT_MAX_PSTATE_LIMIT {
+            dev_info!(
+                dev,
+                "M3: performance cap {} lowered to {}: device-tree InitData leaves the fast-die temperature controller off and the thermal limit is off (asahi.m3_thermal=off)\n",
+                max,
+                ADT_MAX_PSTATE_LIMIT
+            );
+            max = ADT_MAX_PSTATE_LIMIT;
+        }
+        // Without the thermal limit the runtime cap is the ceiling; with it, the runtime cap
+        // starts at (and never goes below) the cap used without it.
+        let safe = match thermal {
+            ThermalMode::Off => max,
+            ThermalMode::Hold | ThermalMode::On => max.min(ADT_MAX_PSTATE_LIMIT),
+        };
+        let boot = m3_params::boot_pstate_param()
+            .unwrap_or(u64::from(safe))
+            .clamp(1, u64::from(safe)) as u32;
+        let mut freqs = [0u32; 16];
+        for (i, f) in freqs.iter_mut().enumerate().take(table_max as usize + 1) {
+            *f = freq(i as u32)?;
+        }
+        Ok(PstatePolicy {
+            table_max,
+            table_max_mhz: freqs[table_max as usize],
+            max,
+            safe,
+            boot,
+            max_mhz: freqs[max as usize],
+            safe_mhz: freqs[safe as usize],
+            boot_mhz: freqs[boot as usize],
+            freqs,
+            thermal,
+        })
+    }
+}
+
+/// The runtime backend's InitData contents: the generated object images and the
+/// performance-state policy.
+pub(crate) struct Contents {
+    /// Generated images, per owner; None for owners that stay zero. Only the three image
+    /// owners' images are uploaded; the records' are checked.
+    images: KVec<Option<KVVec<u8>>>,
+    /// The performance states the firmware may use.
+    pub(crate) pstates: PstatePolicy,
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+    let word = bytes.get(offset..offset + 4).ok_or(EINVAL)?;
+    Ok(u32::from_le_bytes(word.try_into().map_err(|_| EINVAL)?))
+}
+
+fn write(bytes: &mut [u8], offset: usize, data: &[u8]) -> Result {
+    bytes
+        .get_mut(offset..offset + data.len())
+        .ok_or(EINVAL)?
+        .copy_from_slice(data);
+    Ok(())
+}
+
+impl Contents {
+    /// Build the InitData contents from this board's device tree (`asahi.m3_initdata`), before
+    /// any GPU register is touched.
+    pub(crate) fn select(pdev: &platform::Device<Core>, firmware: &Firmware) -> Result<Self> {
+        let dev = pdev.as_ref();
+        let param = m3_params::initdata_param();
+        check_version(dev, firmware)?;
+        let images = build_images(dev, firmware)?;
+        let hwdata = images.get(HWDATA).and_then(|i| i.as_deref()).ok_or(EINVAL)?;
+        let pstates = PstatePolicy::new(dev, hwdata)?;
+        // The published states never go above the device tree's highest operating point.
+        if let Some(dt_khz) = crate::m3_board::max_frequency_khz(pdev) {
+            if 1000 * pstates.max_mhz > dt_khz {
+                dev_err!(
+                    dev,
+                    "M3: performance cap {} MHz is above the device tree's highest operating point ({} kHz)\n",
+                    pstates.max_mhz,
+                    dt_khz
+                );
+                return Err(EINVAL);
+            }
+        }
+        dev_info!(
+            dev,
+            "M3: InitData contents: generated from the device tree (asahi.m3_initdata={}); performance states 1..={}, cap {} ({} MHz), boot request {} ({} MHz); thermal limit {}, firmware highest state {} ({} MHz)\n",
+            match param {
+                InitDataParam::Auto => "auto",
+                InitDataParam::Adt => "adt",
+            },
+            pstates.table_max,
+            pstates.safe,
+            pstates.safe_mhz,
+            pstates.boot,
+            pstates.boot_mhz,
+            match pstates.thermal {
+                ThermalMode::Off => "off",
+                ThermalMode::Hold => "holding",
+                ThermalMode::On => "on",
+            },
+            pstates.max,
+            pstates.max_mhz
+        );
+        Ok(Contents { images, pstates })
+    }
+
+    /// Check the contents before they are uploaded.
+    pub(crate) fn check_for_upload(&self) -> Result {
+        if self.images.len() == storage::COUNT {
+            Ok(())
+        } else {
+            Err(EINVAL)
+        }
+    }
+
+    /// The initial contents of owner `index`, allocated as `a`: its generated image, or nothing
+    /// (zeroed) for owners without one.
+    pub(crate) fn initial<'a>(&'a self, index: usize, a: &storage::Allocation) -> Result<&'a [u8]> {
+        if a.initial == storage::Initial::Zero {
+            return Ok(&[]);
+        }
+        let image = self.images.get(index).and_then(|i| i.as_deref()).ok_or(EINVAL)?;
+        if image.len() != a.size {
+            return Err(EINVAL);
+        }
+        Ok(image)
+    }
+}
+
+/// The fixed allocation of owner `index`, as a firmware region moved by `delta`.
+fn allocation_region(index: usize, delta: u64) -> Result<init::Region> {
+    let a = storage::allocation(index).map_err(|_| EINVAL)?;
+    init::Region::new(a.address.checked_add(delta).ok_or(EINVAL)?, a.size).map_err(|_| EINVAL)
+}
+
+/// The records the runtime constructs, encoded for its fixed allocation table moved by `delta`.
+pub(crate) fn allocation_records(delta: u64) -> Result<Records> {
+    Records::encode(|index| allocation_region(index, delta))
+}
+
+/// The version word of the constructed InitData root.
+pub(crate) fn constructed_version() -> Result<u64> {
+    let records = allocation_records(0)?;
+    Ok(u64::from_le_bytes(records.root[..8].try_into().map_err(|_| EINVAL)?))
+}
+
+/// Refuse to go on when the InitData root the runtime constructs carries another version than
+/// the loaded firmware expects.
+fn check_version(dev: &device::Device, firmware: &Firmware) -> Result {
+    let version = constructed_version()?;
+    if version != firmware.image.initdata_magic {
+        dev_err!(
+            dev,
+            "M3: the constructed InitData version {:#x} is not the one the loaded firmware expects ({:#x})\n",
+            version,
+            firmware.image.initdata_magic
+        );
+        return Err(ENODEV);
+    }
+    Ok(())
+}
+
+/// Whether the runtime probe stops before the GPU coprocessor starts (`asahi.g15_debug` bit
+/// 53). Logs the stop.
+pub(crate) fn stop_before_asc(dev: &device::Device) -> bool {
+    let stop = m3_params::g15_debug(G15Debug::StopBeforeAsc);
+    if stop {
+        dev_info!(
+            dev,
+            "M3: asahi.g15_debug bit 53: stopping before the GPU coprocessor starts; the firmware was not started\n"
+        );
+    }
+    stop
+}
+
+/// The GPU identity the runtime backend admits (SGX ID words 0x07031100 / 0x00110209, checked in
+/// `m3_device` before the firmware starts): G15, variant S, revision B1, one die with two
+/// clusters of ten core slots.
+fn t6030_identity(cfg: &'static hw::HwConfig) -> hw::GpuIdConfig {
+    hw::GpuIdConfig {
+        gpu_gen: hw::GpuGen::G15,
+        gpu_variant: hw::GpuVariant::S,
+        usc_generation: 3,
+        gpu_hal_generation: hw::GpuHalGeneration::Legacy,
+        gpu_rev: hw::GpuRevision::B1,
+        gpu_rev_id: hw::GpuRevisionID::B1,
+        num_dies: cfg.num_dies,
+        num_clusters: cfg.max_num_clusters,
+        num_cores: cfg.max_num_cores,
+        num_frags: cfg.max_num_frags,
+        num_gps: cfg.max_num_gps,
+        total_active_cores: 0,
+        core_masks: KVec::new(),
+        core_masks_packed: KVec::new(),
+        gpc_perf_state_map: 0,
+        gpc_perf_state_map_low: 0,
+        gpc_perf_state_control: 0,
+    }
+}
+
+pub(crate) const BOARD_DATA: [usize; 3] = [HWDATA, GLOBALS, GLOBALS_POWER];
+
+/// The pointers of the constructed records that the typed firmware structures place: record
+/// owner, offset, target owner, offset into the target.
+const RECORD_POINTERS: [(usize, usize, usize, usize); 7] = {
+    type InitData = raw::InitDataG15V14_8_3<'static>;
+    type RuntimePointers = raw::RuntimePointersG15V14_8_3<'static>;
+    [
+        (INITDATA, offset_of!(InitData, runtime_pointers), RUNTIME_POINTERS, 0),
+        (INITDATA, offset_of!(InitData, globals), GLOBALS, 0),
+        (INITDATA, offset_of!(InitData, debug_block), DEBUG, 0),
+        (INITDATA, offset_of!(InitData, status_block), STATUS, 0),
+        (INITDATA, offset_of!(InitData, power_ctl_block), GLOBALS_POWER, 0),
+        (RUNTIME_POINTERS, offset_of!(RuntimePointers, hwdata_b), HWDATA, 0),
+        (RUNTIME_POINTERS, offset_of!(RuntimePointers, hwdata_a), HWDATA, HWDATA_A),
+    ]
+};
+
+/// The bytes of a constructed record, by owner.
+pub(crate) fn record_bytes(records: &Records, owner: usize) -> Option<&[u8]> {
+    match owner {
+        INITDATA => Some(&records.root[..]),
+        RUNTIME_POINTERS => Some(&records.runtime[..]),
+        STATUS => Some(&records.control[..]),
+        _ => None,
+    }
+}
+
+fn check_layout() -> Result {
+    type InitData = raw::InitDataG15V14_8_3<'static>;
+    type RuntimePointers = raw::RuntimePointersG15V14_8_3<'static>;
+    let records = allocation_records(0)?;
+    let pointer = |owner: usize, offset: usize| -> Option<u64> {
+        let bytes = record_bytes(&records, owner)?.get(offset..offset + 8)?;
+        Some(u64::from_le_bytes(bytes.try_into().ok()?))
+    };
+    let mut ok = true;
+    for (owner, offset, target, at) in RECORD_POINTERS {
+        let a = storage::allocation(target).map_err(|_| EINVAL)?;
+        ok &= at < a.size && pointer(owner, offset) == Some(a.address + at as u64);
+    }
+    for index in 0..storage::COUNT {
+        let a = storage::allocation(index).map_err(|_| EINVAL)?;
+        let board = BOARD_DATA.contains(&index);
+        ok &= board == (a.initial != storage::Initial::Zero);
+    }
+    let size = |index: usize| storage::allocation(index).map_or(0, |a| a.size);
+    let ok = ok
+        && size(INITDATA) >= size_of::<InitData>()
+        && size(RUNTIME_POINTERS) >= offset_of!(RuntimePointers, hwdata_a) + 8
+        && HWDATA_A >= size_of::<raw::HwDataBG15V14_8_3>()
+        && size(HWDATA) >= HWDATA_A + size_of::<raw::HwDataAG15V14_8_3>()
+        && size(GLOBALS) >= size_of::<raw::GlobalsG15V14_8_3>()
+        && size(GLOBALS_POWER) >= size_of::<raw::PowerCtlBlock>()
+        && size(STATUS) >= size_of::<raw::StatusBlock>()
+        && size(DEBUG) >= size_of::<raw::DebugBlock>();
+    if ok { Ok(()) } else { Err(EINVAL) }
+}
+
+/// Fill HwDataB's IO-mapping table (the runtime fills the virtual addresses when it maps them),
+/// checking every entry against the runtime's IO mapping of the same slot.
+fn fill_io_mappings(dev: &device::Device, cfg: &'static hw::HwConfig, hwdata: &mut [u8]) -> Result {
+    for &(slot, phys, total, element, writable) in RUNTIME_IO_MAPPINGS.iter() {
+        let entry = IO_MAPPINGS + slot * IO_MAPPING_SIZE;
+        let virt = entry + offset_of!(raw::IOMapping, virt_addr);
+        // The same register block as the manager's table.
+        let same_block = cfg.io_mappings.get(slot).and_then(|m| m.as_ref()).is_some_and(|m| {
+            m.base as u64 & !0x3fff == phys & !0x3fff && m.writable == writable
+        });
+        let covered = storage::IOMAPS.iter().any(|io| {
+            io.slot == slot
+                && io.pointer_field() == Ok(virt)
+                && io.physical + io.offset as u64 == phys
+                && phys + u64::from(total) <= io.physical + io.size as u64
+        });
+        if !same_block || !covered || element == 0 || total % element != 0 {
+            dev_err!(dev, "M3: IO mapping slot {} ({:#x}) does not match the object layout\n", slot, phys);
+            return Err(EINVAL);
+        }
+        write(hwdata, entry + offset_of!(raw::IOMapping, phys_addr), &phys.to_le_bytes())?;
+        write(hwdata, entry + offset_of!(raw::IOMapping, total_size), &total.to_le_bytes())?;
+        write(hwdata, entry + offset_of!(raw::IOMapping, element_size), &element.to_le_bytes())?;
+        write(
+            hwdata,
+            entry + offset_of!(raw::IOMapping, readwrite),
+            &u64::from(writable).to_le_bytes(),
+        )?;
+    }
+    // Every IO mapping the runtime makes must belong to one of the entries above.
+    for io in storage::IOMAPS.iter() {
+        if !RUNTIME_IO_MAPPINGS.iter().any(|&(slot, ..)| slot == io.slot) {
+            dev_err!(dev, "M3: IO mapping slot {} ({:#x}) has no device-tree InitData entry\n", io.slot, io.physical);
+            return Err(EINVAL);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn check_upload(dev: &device::Device, firmware: &Firmware, objects: &mut [Buffer]) -> Result {
+    let mut bad = 0u32;
+    let version = objects.get_mut(INITDATA).ok_or(EINVAL)?.read_u64(0)?;
+    if version != firmware.image.initdata_magic {
+        dev_err!(
+            dev,
+            "M3: InitData self-check: version {:#x}, the loaded firmware expects {:#x}\n",
+            version,
+            firmware.image.initdata_magic
+        );
+        bad += 1;
+    }
+    for (owner, offset, target, at) in RECORD_POINTERS {
+        let expected = objects.get(target).ok_or(EINVAL)?.va() + at as u64;
+        let value = objects.get_mut(owner).ok_or(EINVAL)?.read_u64(offset)?;
+        if value != expected {
+            dev_err!(
+                dev,
+                "M3: InitData self-check: owner {} +{:#x} holds {:#x}, not owner {} +{:#x} ({:#x})\n",
+                owner,
+                offset,
+                value,
+                target,
+                at,
+                expected
+            );
+            bad += 1;
+        }
+    }
+    let hwdata = objects.get_mut(HWDATA).ok_or(EINVAL)?;
+    for slot in 0..IO_MAPPING_SLOTS {
+        let entry = IO_MAPPINGS + slot * IO_MAPPING_SIZE;
+        let phys = hwdata.read_u64(entry + offset_of!(raw::IOMapping, phys_addr))?;
+        let virt = hwdata.read_u64(entry + offset_of!(raw::IOMapping, virt_addr))?;
+        let total = u64::from(hwdata.read_u32(entry + offset_of!(raw::IOMapping, total_size))?);
+        let ok = match storage::IOMAPS.iter().find(|io| io.slot == slot) {
+            Some(io) => {
+                phys == io.physical + io.offset as u64
+                    && virt == io.address + io.offset as u64
+                    && total != 0
+                    && phys + total <= io.physical + io.size as u64
+            }
+            None => phys == 0 && virt == 0,
+        };
+        if !ok {
+            dev_err!(
+                dev,
+                "M3: InitData self-check: IO mapping slot {} describes {:#x}+{:#x} at {:#x}, which the runtime does not map there\n",
+                slot,
+                phys,
+                total,
+                virt
+            );
+            bad += 1;
+        }
+    }
+    let region = hwdata.read_u64(storage::GPU_REGION_PHYSICAL)?;
+    if region != firmware.resources.regions[0].base {
+        dev_err!(
+            dev,
+            "M3: InitData self-check: GPU region {:#x}, the resources admitted {:#x}\n",
+            region,
+            firmware.resources.regions[0].base
+        );
+        bad += 1;
+    }
+    if bad != 0 {
+        dev_err!(dev, "M3: InitData self-check failed ({} findings); not publishing the InitData\n", bad);
+        return Err(EINVAL);
+    }
+    dev_info!(
+        dev,
+        "M3: InitData self-check passed: version {:#x}, {} record pointers, {} IO mappings, GPU region {:#x}\n",
+        version,
+        RECORD_POINTERS.len(),
+        storage::IOMAPS.len(),
+        region
+    );
+    Ok(())
+}
+
+/// A zeroed image of owner `index`.
+fn zeroed(index: usize) -> Result<KVVec<u8>> {
+    let size = storage::allocation(index).map_err(|_| EINVAL)?.size;
+    Ok(KVVec::from_elem(0u8, size, GFP_KERNEL)?)
+}
+
+/// Build the images of the generated owners from the device tree.
+fn build_images(dev: &device::Device, firmware: &Firmware) -> Result<KVec<Option<KVVec<u8>>>> {
+    check_layout().inspect_err(|_| {
+        dev_err!(dev, "M3: the constructed InitData records do not match the G15 InitData structures\n")
+    })?;
+    let cfg: &'static hw::HwConfig = &hw::t6030::HWCONFIG_T6030;
+    let pwr = hw::PwrConfig::load(dev, cfg).inspect_err(|e| {
+        dev_err!(dev, "M3: cannot read the GPU power configuration from the device tree ({:?})\n", e)
+    })?;
+    let node = dev.of_node().ok_or(ENODEV)?;
+    let dyncfg = hw::DynConfig {
+        uat_ttb_base: firmware.resources.regions[0].base,
+        id: t6030_identity(cfg),
+        pwr,
+        firmware_version: node
+            .get_property::<KVec<u32>>(c_str!("apple,firmware-version"))
+            .unwrap_or_default(),
+        hw_data_a: KVVec::new(),
+        hw_data_b: KVVec::new(),
+        hw_globals: KVVec::new(),
+    };
+    let g15 = G15Options {
+        layout: G15Layout::Runtime,
+        split_pstates: true,
+        // The cap is applied to the uploaded objects, for either source (`publish_pstates`).
+        cap: None,
+        timestamp_base: Some(crate::g16_memory::TIMESTAMP_RANGE.start),
+        reference_ppm: true,
+    };
+    let c = initdata::InitDataBuilderG15V14_8_3::g15_contents(cfg, &dyncfg, &g15).inspect_err(|e| {
+        dev_err!(dev, "M3: cannot build InitData from the device tree ({:?})\n", e)
+    })?;
+
+    let mut images = KVec::new();
+    for _ in 0..storage::COUNT {
+        images.push(None, GFP_KERNEL)?;
+    }
+
+    // InitData: the magic of the identified firmware, the host-mapped allocations flag and the
+    // UAT description; the pointers are the constructed record's.
+    type InitData = raw::InitDataG15V14_8_3<'static>;
+    let mut root = zeroed(INITDATA)?;
+    write(&mut root, offset_of!(InitData, ver_info), &firmware.image.initdata_magic.to_le_bytes())?;
+    write(&mut root, offset_of!(InitData, unk_2c), &1u32.to_le_bytes())?;
+    write(&mut root, offset_of!(InitData, uat_page_size), &0x4000u16.to_le_bytes())?;
+    write(&mut root, offset_of!(InitData, uat_page_bits), &[14, 3])?;
+    for (i, level) in c.uat_levels.iter().enumerate() {
+        let at = offset_of!(InitData, uat_level_info) + i * size_of::<raw::UatLevelInfo>();
+        write(&mut root, at, initdata::raw_bytes(level))?;
+    }
+    images[INITDATA] = Some(root);
+
+    // RuntimePointers: only its configuration words; everything else is a pointer.
+    type RuntimePointers = raw::RuntimePointersG15V14_8_3<'static>;
+    let mut rt = zeroed(RUNTIME_POINTERS)?;
+    write(&mut rt, offset_of!(RuntimePointers, unk_2d0), &g15.runtime_pointers_2d0().to_le_bytes())?;
+    write(&mut rt, offset_of!(RuntimePointers, cswitch_hist_ctl), &[0xff])?;
+    images[RUNTIME_POINTERS] = Some(rt);
+
+    // HwData: HwDataB, then HwDataA.
+    let mut hwdata = zeroed(HWDATA)?;
+    write(&mut hwdata, 0, initdata::raw_bytes(&*c.hwdata_b))?;
+    write(&mut hwdata, HWDATA_A, initdata::raw_bytes(&*c.hwdata_a))?;
+    // The system counter value at InitData creation, the base of the firmware's first power and
+    // energy interval.
+    let now: u64;
+    // SAFETY: reading the architectural counter has no side effects and is allowed at EL1/EL2.
+    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now, options(nomem, nostack, preserves_flags)) };
+    write(
+        &mut hwdata,
+        HWDATA_A + offset_of!(raw::HwDataAG15V14_8_3, init_timestamp),
+        &now.to_le_bytes(),
+    )?;
+    fill_io_mappings(dev, cfg, &mut hwdata)?;
+    images[HWDATA] = Some(hwdata);
+
+    let mut globals = zeroed(GLOBALS)?;
+    write(&mut globals, 0, initdata::raw_bytes(&*c.globals))?;
+    images[GLOBALS] = Some(globals);
+
+    let mut power = zeroed(GLOBALS_POWER)?;
+    write(&mut power, 0, initdata::raw_bytes(&*c.power_ctl_block))?;
+    images[GLOBALS_POWER] = Some(power);
+
+    let mut status = zeroed(STATUS)?;
+    write(&mut status, 0, initdata::raw_bytes(&*c.status_block))?;
+    images[STATUS] = Some(status);
+
+    let top = c.tables.primary_state(&dyncfg.pwr, c.tables.len - 1);
+    dev_info!(
+        dev,
+        "M3: device-tree InitData: {} performance states in two voltage-sorted tables from {} device-tree states, top {} MHz at {} mV, SRAM floor {} mV, maximum power {} mW\n",
+        c.tables.len - 1,
+        dyncfg.pwr.perf_states.len() - 1,
+        top.freq_hz / 1_000_000,
+        top.max_volt_mv(),
+        dyncfg.pwr.min_sram_microvolt.div_ceil(1000),
+        dyncfg.pwr.max_power_mw
+    );
+    log_tables(dev, &c.hwdata_b, c.tables.len);
+    Ok(images)
+}
+
+/// Log the published performance-state tables, one line per entry: the primary table (fastest
+/// state per voltage) and the secondary one (slowest), each with the device-tree index of the
+/// entry, and the third table.
+fn log_tables(dev: &device::Device, b: &raw::HwDataBG15V14_8_3, len: usize) {
+    let uniform = |row: &[u32; 8]| row.iter().all(|v| *v == row[0]);
+    for i in 1..len.min(16) {
+        let aux = &b.aux_ps_3;
+        let ok = uniform(&b.voltages[i]) && uniform(&b.voltages_sram[i]);
+        dev_info!(
+            dev,
+            "M3: performance state {}: primary dt {} {} MHz core {} mV SRAM {} mV; secondary dt {} {} MHz; third {} MHz core {} mV SRAM {} mV{}\n",
+            i,
+            b.unk_arr_0[i],
+            b.frequencies[i],
+            b.voltages[i][0],
+            b.voltages_sram[i][0],
+            b.unk_arr_0[16 + i],
+            b.frequencies_2[i],
+            aux.frequencies[i],
+            aux.voltages[i][0],
+            aux.voltages_sram[i][0],
+            if ok { "" } else { " (columns differ)" }
+        );
+    }
+}
+
+/// HwDataA words that hold the highest usable performance state scaled by 100.
+const HWA_MAX_SCALED: [usize; 15] = {
+    type A = raw::HwDataAG15V14_8_3;
+    let se = offset_of!(A, unk_e10_0);
+    [
+        offset_of!(A, max_pstate_scaled),
+        offset_of!(A, max_pstate_scaled_2),
+        offset_of!(A, max_pstate_scaled_3),
+        offset_of!(A, max_pstate_scaled_4),
+        offset_of!(A, max_pstate_scaled_5),
+        offset_of!(A, max_pstate_scaled_7),
+        offset_of!(A, max_pstate_scaled_8),
+        offset_of!(A, max_pstate_scaled_9),
+        offset_of!(A, max_pstate_scaled_10),
+        offset_of!(A, max_pstate_scaled_11),
+        offset_of!(A, max_pstate_scaled_12),
+        offset_of!(A, max_pstate_scaled_13),
+        offset_of!(A, max_pstate_scaled_14),
+        se + offset_of!(raw::HwDataA140Extra, max_pstate_scaled_1),
+        se + offset_of!(raw::HwDataA140Extra, max_pstate_scaled_2),
+    ]
+};
+
+/// HwDataA words that hold the base (lowest settled) performance state scaled by 100.
+const HWA_BASE_SCALED: [usize; 4] = {
+    type A = raw::HwDataAG15V14_8_3;
+    [
+        offset_of!(A, base_pstate_scaled),
+        offset_of!(A, base_pstate_scaled_2),
+        offset_of!(A, base_pstate_scaled_3),
+        offset_of!(A, base_pstate_scaled_4),
+    ]
+};
+
+/// Offsets in Globals of the runtime cap words: the second and third power-interface targets and
+/// the performance-state cap, each the highest usable state scaled by 100.
+const GLOBALS_RUNTIME_CAP: [usize; 3] = {
+    type G = raw::GlobalsG15V14_8_3;
+    let power_if_target = offset_of!(G, power_if_target);
+    [power_if_target + 4, power_if_target + 8, offset_of!(G, perf_state_cap)]
+};
+
+pub(crate) fn publish_pstates(
+    dev: &device::Device,
+    hwdata: &mut Buffer,
+    globals: &mut Buffer,
+    p: &PstatePolicy,
+) -> Result {
+    use crate::float::F32;
+    type A = raw::HwDataAG15V14_8_3;
+    let a = |offset: usize| HWDATA_A + offset;
+    let full = 100 * p.table_max;
+    let base_scaled = hwdata.read_u32(a(offset_of!(A, base_pstate_scaled)))?;
+    let globals_max = GLOBALS_RUNTIME_CAP;
+
+    let mut expected = true;
+    for off in HWA_MAX_SCALED {
+        expected &= hwdata.read_u32(a(off))? == full;
+    }
+    for off in HWA_BASE_SCALED {
+        expected &= hwdata.read_u32(a(off))? == base_scaled;
+    }
+    for off in globals_max {
+        expected &= globals.read_u32(off)? == full;
+    }
+    expected &= hwdata.read_u32(a(offset_of!(A, max_pstate_scaled_6)))? == F32::from(full).to_bits();
+    let base = base_scaled / 100;
+    if !expected
+        || base_scaled % 100 != 0
+        || base == 0
+        || base > p.safe
+        || p.boot > p.safe
+        || p.safe > p.max
+    {
+        dev_err!(dev, "M3: unexpected performance-state words in the InitData; not starting the firmware\n");
+        return Err(EINVAL);
+    }
+
+    let ceiling = 100 * p.max;
+    let max_power = F32::from_bits(hwdata.read_u32(a(offset_of!(A, max_power_1)))?);
+    let min_duty = hwdata.read_u32(a(offset_of!(A, pwr_min_duty_cycle)))?;
+    for off in HWA_MAX_SCALED {
+        hwdata.u32(a(off), ceiling)?;
+    }
+    hwdata.u32(a(offset_of!(A, max_pstate_scaled_6)), F32::from(ceiling).to_bits())?;
+    hwdata.u32(a(offset_of!(A, pwr_pstate_related_k)), (-F32::from(ceiling) / max_power).to_bits())?;
+    hwdata.u32(
+        a(offset_of!(A, pwr_pstate_max_dc_offset)),
+        (min_duty as i32 - ceiling as i32) as u32,
+    )?;
+    hwdata.u32(
+        a(offset_of!(A, boost_state_unk_k)),
+        (F32::from(p.max - base) / crate::f32!(0.95)).to_bits(),
+    )?;
+    for off in globals_max {
+        globals.u32(off, 100 * p.safe)?;
+    }
+
+    for off in [offset_of!(A, actual_pstate), offset_of!(A, tgt_pstate)] {
+        hwdata.u32(a(off), p.boot)?;
+    }
+    let settle = base;
+    dev_info!(
+        dev,
+        "M3: firmware performance request: state {} ({} MHz), base state {}, cap state {} ({} MHz) of 1..={}\n",
+        p.boot,
+        p.boot_mhz,
+        settle,
+        p.safe,
+        p.safe_mhz,
+        p.table_max
+    );
+    if p.safe != p.max {
+        dev_info!(
+            dev,
+            "M3: firmware highest state {} ({} MHz); the runtime cap starts at {} ({} MHz)\n",
+            p.max,
+            p.max_mhz,
+            p.safe,
+            p.safe_mhz
+        );
+    }
+    Ok(())
+}
+
+/// Set the runtime cap: the Globals runtime cap words, which the firmware keeps reading while it
+/// runs, so the store alone moves the cap, with no message. `cap` must be a state of the
+/// published table.
+pub(crate) fn publish_runtime_cap(globals: &mut Buffer, cap: u32) -> Result {
+    if cap == 0 || cap >= 16 {
+        return Err(EINVAL);
+    }
+    for off in GLOBALS_RUNTIME_CAP {
+        globals.u32(off, 100 * cap)?;
+    }
+    crate::g16_memory::publish();
+    Ok(())
+}
+
+/// The integer part of a non-negative, finite F32 given by its bits; None otherwise.
+fn f32_bits_to_u32(bits: u32) -> Option<u32> {
+    let exp = (bits >> 23) & 0xff;
+    if bits >> 31 != 0 || exp == 0xff {
+        return None;
+    }
+    if exp < 127 {
+        return Some(0);
+    }
+    let mant = u64::from((bits & 0x7f_ffff) | 0x80_0000);
+    let shift = exp - 127;
+    let value = if shift >= 23 {
+        mant.checked_shl(shift - 23)?
+    } else {
+        mant >> (23 - shift)
+    };
+    u32::try_from(value).ok()
+}
+
+/// One reading of the performance state: SGX+0xe01000, and the HwDataA actual and current
+/// state and frequency (MHz, F32 bits) the firmware publishes.
+#[derive(Copy, Clone, PartialEq, Eq)]
+struct PstateSample {
+    register: u32,
+    actual: u32,
+    current: u32,
+    freq_bits: u32,
+}
+
+/// Number of lines logging changes of the performance state per boot.
+const PSTATE_LOG_LINES: u32 = 64;
+
+/// Number of lines warning about a reported state above the runtime cap per boot.
+const RUNTIME_CAP_WARN_LINES: u32 = 16;
+
+/// Checks the performance state the firmware reports against the ceiling and the runtime cap,
+/// after boot and after every job.
+///
+/// The firmware publishes its actual and current state and its frequency in HwDataA. A
+/// frequency above the ceiling entry's, or, when no running frequency is reported, a state in
+/// the published table above the ceiling, that is still there when read again 1 ms later fails
+/// the check. The same above the runtime cap (when it is below the ceiling) is reported to the
+/// caller, which decides whether it persists too long (the thermal limit). Values outside the
+/// published table are logged and not enforced: they are not states of this table.
+/// SGX+0xe01000 is logged next to them but not enforced, as the index space of that register is
+/// not established on every board. The published tables list device-tree operating points only,
+/// so the check guards the cap, not the voltages.
+pub(crate) struct PstateWatch {
+    policy: PstatePolicy,
+    last: Option<PstateSample>,
+    lines: u32,
+    warn_lines: u32,
+    register_noted: bool,
+    unknown_noted: bool,
+    excused_noted: bool,
+}
+
+impl PstateWatch {
+    pub(crate) fn new(policy: PstatePolicy) -> Self {
+        PstateWatch {
+            policy,
+            last: None,
+            lines: 0,
+            warn_lines: 0,
+            register_noted: false,
+            unknown_noted: false,
+            excused_noted: false,
+        }
+    }
+
+    fn sample(hwdata: &mut Buffer, register: u32) -> Result<PstateSample> {
+        type A = raw::HwDataAG15V14_8_3;
+        Ok(PstateSample {
+            register,
+            actual: hwdata.read_u32(HWDATA_A + offset_of!(A, actual_pstate))?,
+            current: hwdata.read_u32(HWDATA_A + offset_of!(A, cur_pstate))?,
+            freq_bits: hwdata.read_u32(HWDATA_A + offset_of!(A, freq_mhz))?,
+        })
+    }
+
+    /// Frequency of entry `state` of the published table, in MHz.
+    fn mhz(&self, state: u32) -> u32 {
+        self.policy.freqs.get(state as usize).copied().unwrap_or(0)
+    }
+
+    /// The reported frequency in MHz, if it is a running frequency of the published table.
+    fn freq_mhz(&self, s: &PstateSample) -> Option<u32> {
+        f32_bits_to_u32(s.freq_bits).filter(|mhz| *mhz > 0 && *mhz <= self.policy.table_max_mhz)
+    }
+
+    /// Whether a reported state lies within the published table but above `cap`.
+    fn state_above(&self, s: &PstateSample, cap: u32) -> Option<(&'static str, u32)> {
+        let above = |v: u32| v > cap && v <= self.policy.table_max;
+        if above(s.actual) {
+            Some(("actual state", s.actual))
+        } else if above(s.current) {
+            Some(("current state", s.current))
+        } else {
+            None
+        }
+    }
+
+    /// The reported value above `cap` that lies within the published table, if any. The
+    /// frequency is the physical quantity: a state above the cap is excused when the reported
+    /// frequency is a running frequency within the cap (the state words then use another
+    /// index space), and counts otherwise.
+    fn above(&self, s: &PstateSample, cap: u32) -> Option<(&'static str, u32)> {
+        match self.freq_mhz(s) {
+            Some(mhz) if mhz > self.mhz(cap) => Some(("frequency (MHz)", mhz)),
+            Some(_) => None,
+            None => self.state_above(s, cap),
+        }
+    }
+
+    /// Whether a reported value is not a state or frequency of the published table.
+    fn unknown(&self, s: &PstateSample) -> bool {
+        let p = &self.policy;
+        s.actual > p.table_max
+            || s.current > p.table_max
+            || f32_bits_to_u32(s.freq_bits).is_none_or(|mhz| mhz > p.table_max_mhz)
+    }
+
+    fn log(&self, dev: &device::Device, what: &str, s: &PstateSample, cap: u32) {
+        dev_info!(
+            dev,
+            "M3: performance state {}: firmware actual {} current {} frequency {} MHz, sgx+0xe01000 {:#x}; cap state {} ({} MHz)\n",
+            what,
+            s.actual,
+            s.current,
+            f32_bits_to_u32(s.freq_bits).unwrap_or(u32::MAX),
+            s.register,
+            cap,
+            self.mhz(cap)
+        );
+    }
+
+    /// Check the reported performance state. `register` reads SGX+0xe01000; `what` names the
+    /// point of the check for the log; `cap` is the runtime cap the firmware may use now
+    /// (clamped to the ceiling). Returns ERANGE when the firmware stays above the ceiling;
+    /// otherwise whether it stays above `cap`, and the highest state it reports (0 if neither
+    /// state word is a state of the published table).
+    pub(crate) fn check(
+        &mut self,
+        dev: &device::Device,
+        hwdata: &mut Buffer,
+        register: impl Fn() -> Result<u32>,
+        what: &str,
+        cap: u32,
+    ) -> Result<(bool, u32)> {
+        let ceiling = self.policy.max;
+        let cap = cap.clamp(1, ceiling);
+        let mut s = Self::sample(hwdata, register()?)?;
+        let mut over = false;
+        if let Some((field, value)) = self.above(&s, cap) {
+            if cap == ceiling || self.warn_lines < RUNTIME_CAP_WARN_LINES {
+                self.warn_lines = self.warn_lines.saturating_add(u32::from(cap != ceiling));
+                dev_warn!(
+                    dev,
+                    "M3: firmware reports {} {} above the cap {} ({} MHz) {}; reading again\n",
+                    field,
+                    value,
+                    cap,
+                    self.mhz(cap),
+                    what
+                );
+            }
+            fsleep(Delta::from_millis(1));
+            s = Self::sample(hwdata, register()?)?;
+            if let Some((field, value)) = self.above(&s, ceiling) {
+                self.log(dev, what, &s, cap);
+                dev_err!(
+                    dev,
+                    "M3: firmware {} {} stays above the cap {} ({} MHz); marking the GPU failed\n",
+                    field,
+                    value,
+                    ceiling,
+                    self.mhz(ceiling)
+                );
+                return Err(ERANGE);
+            }
+            over = self.above(&s, cap).is_some();
+        }
+        if !self.excused_noted {
+            if let Some((field, value)) = self.state_above(&s, cap) {
+                if !over {
+                    self.excused_noted = true;
+                    dev_info!(
+                        dev,
+                        "M3: firmware {} {} is above the cap {} but its frequency is within it {}; not enforced\n",
+                        field,
+                        value,
+                        cap,
+                        what
+                    );
+                }
+            }
+        }
+        if !self.unknown_noted && self.unknown(&s) {
+            self.unknown_noted = true;
+            dev_info!(
+                dev,
+                "M3: firmware performance words outside the published table (states 1..={}, up to {} MHz) {}; not enforced\n",
+                self.policy.table_max,
+                self.policy.table_max_mhz,
+                what
+            );
+            self.log(dev, what, &s, cap);
+        }
+        if !self.register_noted && s.register & 0xf > cap {
+            self.register_noted = true;
+            dev_info!(
+                dev,
+                "M3: sgx+0xe01000 reads {:#x}, above the cap as a table index; logged only\n",
+                s.register
+            );
+        }
+        let key = PstateSample {
+            register: s.register & 0xf,
+            ..s
+        };
+        if self.last != Some(key) {
+            if self.lines < PSTATE_LOG_LINES {
+                self.log(dev, what, &s, cap);
+            } else if self.lines == PSTATE_LOG_LINES {
+                dev_info!(dev, "M3: further performance state changes are not logged\n");
+            }
+            self.lines = self.lines.saturating_add(1);
+            self.last = Some(key);
+        }
+        let peak = [s.actual, s.current]
+            .into_iter()
+            .filter(|v| *v <= self.policy.table_max)
+            .max()
+            .unwrap_or(0);
+        Ok((over, peak))
+    }
+}

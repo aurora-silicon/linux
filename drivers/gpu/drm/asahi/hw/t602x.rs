@@ -50,10 +50,11 @@ pub(crate) const HWCONFIG_T6022: super::HwConfig = HwConfig {
     chip_id: 0x6022,
     gpu_gen: GpuGen::G14,
     gpu_variant: GpuVariant::D,
-    gpu_core: GpuCore::G14D,
+    gpu_core: Some(GpuCore::G14D),
 
     base_clock_hz: 24_000_000,
     uat_oas: 42,
+    uat_ias: 39,
     num_dies: 2,
     max_num_clusters: 8,
     max_num_cores: 10,
@@ -149,7 +150,7 @@ pub(crate) const HWCONFIG_T6022: super::HwConfig = HwConfig {
 pub(crate) const HWCONFIG_T6021: super::HwConfig = HwConfig {
     chip_id: 0x6021,
     gpu_variant: GpuVariant::C,
-    gpu_core: GpuCore::G14C,
+    gpu_core: Some(GpuCore::G14C),
 
     num_dies: 1,
     max_num_clusters: 4,
@@ -164,7 +165,7 @@ pub(crate) const HWCONFIG_T6021: super::HwConfig = HwConfig {
 pub(crate) const HWCONFIG_T6020: super::HwConfig = HwConfig {
     chip_id: 0x6020,
     gpu_variant: GpuVariant::S,
-    gpu_core: GpuCore::G14S,
+    gpu_core: Some(GpuCore::G14S),
 
     db: HwConfigB {
         unk_454: 0,

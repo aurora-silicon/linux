@@ -340,14 +340,32 @@ unsafe impl<T: DriverGpuVm> AlwaysRefCounted for GpuVmBo<T> {
     }
 
     unsafe fn dec_ref(mut obj: NonNull<Self>) {
-        // SAFETY: drm_gpuvm_bo_put() requires holding the gpuva lock, which is the dma_resv lock by default.
-        // The drm_gpuvm_put function satisfies the requirements for dec_ref().
-        // (We do not support custom locks yet.)
+        // SAFETY: The owned vm_bo reference keeps its GEM and VM alive.
+        // Immediate-mode GPUVA lists use gpuva.lock, not dma_resv. The final
+        // put may unlink this BO concurrently with find/obtain/unlink, so it
+        // must take the same lock as those operations. Keep a separate GEM
+        // reference until after unlocking: the final vm_bo put can release
+        // its GEM reference and otherwise free the mutex we still hold.
         unsafe {
-            let resv = (*obj.as_mut().bo.obj).resv;
-            bindings::dma_resv_lock(resv, core::ptr::null_mut());
-            bindings::drm_gpuvm_bo_put(&mut obj.as_mut().bo);
-            bindings::dma_resv_unlock(resv);
+            let bo = &mut obj.as_mut().bo;
+            let gem = bo.obj;
+            bindings::drm_gem_object_get(gem);
+            let immediate = (*bo.vm).flags
+                & bindings::drm_gpuvm_flags_DRM_GPUVM_IMMEDIATE_MODE != 0;
+            let resv = (*gem).resv;
+            let gpuva_lock = &raw mut (*gem).gpuva.lock;
+            if immediate {
+                bindings::mutex_lock(gpuva_lock);
+            } else {
+                bindings::dma_resv_lock(resv, core::ptr::null_mut());
+            }
+            bindings::drm_gpuvm_bo_put(bo);
+            if immediate {
+                bindings::mutex_unlock(gpuva_lock);
+            } else {
+                bindings::dma_resv_unlock(resv);
+            }
+            bindings::drm_gem_object_put(gem);
         }
     }
 }

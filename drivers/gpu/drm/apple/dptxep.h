@@ -78,4 +78,8 @@ int dptxport_set_hpd(struct apple_epic_service *service, bool hpd);
 int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
 			     unsigned int timeout_ms);
 
+
+struct apple_dcp;
+int dpav_ctrl_init(struct apple_dcp *dcp);
+int dptx_prepare_interfaces(struct apple_dcp *dcp);
 #endif

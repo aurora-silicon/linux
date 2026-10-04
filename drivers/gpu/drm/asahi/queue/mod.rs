@@ -330,7 +330,9 @@ impl sched::JobImpl for QueueJob::ver {
         });
 
         let gpu = match (*job.dev)
-            .gpu
+            .gpu()?
+            .legacy_manager()
+            .ok_or(EIO)?
             .clone()
             .arc_as_any()
             .downcast::<gpu::GpuManager::ver>()
@@ -479,8 +481,9 @@ impl Queue::ver {
             sched::Scheduler::new(dev.as_ref(), 1, WQ_SIZE, 0, 100000, c_str!("asahi_sched"))?;
         let entity = sched::Entity::new(&sched, sched::Priority::Kernel)?;
 
+        let legacy_gpu = (*dev).gpu()?.legacy_manager().ok_or(EIO)?;
         let buffer =
-            buffer::Buffer::ver::new(&*(*dev).gpu, alloc, ualloc.clone(), ualloc_priv, mgr)?;
+            buffer::Buffer::ver::new(&**legacy_gpu, alloc, ualloc.clone(), ualloc_priv, mgr)?;
 
         let mut ret = Queue::ver {
             dev: dev.into(),
@@ -617,7 +620,9 @@ impl Queue for Queue::ver {
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result {
         let gpu = match (*self.dev)
-            .gpu
+            .gpu()?
+            .legacy_manager()
+            .ok_or(EIO)?
             .clone()
             .arc_as_any()
             .downcast::<gpu::GpuManager::ver>()

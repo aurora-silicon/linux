@@ -32,6 +32,16 @@ static inline void dcp_mode_begin(struct dcp_mode_state *state)
 	spin_unlock_irqrestore(&state->lock, flags);
 }
 
+/* For firmware that keeps a single mode and has no modeset in flight. */
+static inline void dcp_mode_set_valid(struct dcp_mode_state *state, bool valid)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&state->lock, flags);
+	state->valid = valid;
+	spin_unlock_irqrestore(&state->lock, flags);
+}
+
 static inline void dcp_mode_invalidate(struct dcp_mode_state *state)
 {
 	unsigned long flags;

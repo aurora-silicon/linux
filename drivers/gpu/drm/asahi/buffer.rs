@@ -59,7 +59,7 @@ use kernel::{
 const DEBUG_CLASS: DebugFlags = DebugFlags::Buffer;
 
 /// There are 127 GPU/firmware-side buffer manager slots (yes, 127, not 128).
-const NUM_BUFFERS: u32 = 127;
+pub(crate) const NUM_BUFFERS: u32 = 127;
 
 /// Page size bits for buffer pages (32K). VAs must be aligned to this size.
 pub(crate) const PAGE_SHIFT: usize = 15;

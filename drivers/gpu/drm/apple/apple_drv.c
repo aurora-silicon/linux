@@ -397,7 +397,20 @@ static int apple_probe_per_dcp(struct device *dev,
 	bool supports_l10r = !dcp_fw_compat_is_12_x(dcp);
 	enum drm_plane_type plane_type;
 
+	if (dcp_fw_compat_is_14_7(dcp)) {
+		planes[0] = apple_plane_init_v14_7(drm, 1U << num, 0,
+						    DRM_PLANE_TYPE_PRIMARY);
+		if (IS_ERR(planes[0]))
+			return PTR_ERR(planes[0]);
+		ret = drm_plane_create_zpos_immutable_property(planes[0], 0);
+		if (ret)
+			return ret;
+		zpos = 1;
+	}
+
 	for_each_set_bit(surf, iomfb_surfaces, DCP_MAX_PLANES) {
+		if (dcp_fw_compat_is_14_7(dcp))
+			break;
 		plane_type = (zpos == 0) ? DRM_PLANE_TYPE_PRIMARY : DRM_PLANE_TYPE_OVERLAY;
 		planes[zpos] = apple_plane_init(drm, 1U << num, surf,
 						supports_l10r, plane_type);
@@ -593,8 +606,18 @@ err:
 static const struct of_device_id apple_dcp_id_tbl[] = {
 	{ .compatible = "apple,dcp" },
 	{ .compatible = "apple,dcpext" },
+	{ .compatible = "apple,t6030-dcp" },
 	{},
 };
+
+/*
+ * The T6030 external display processor runs its own firmware session and is
+ * not part of the display subsystem's DRM device.
+ */
+static bool apple_dcp_in_drm(const struct device_node *np)
+{
+	return !of_device_is_compatible(np, "apple,t6030-dcpext");
+}
 
 static void apple_drm_quiesce_connectors(struct drm_device *drm)
 {
@@ -628,6 +651,8 @@ static int apple_drm_init_dcp(struct device *dev)
 
 	for_each_matching_node(np, apple_dcp_id_tbl) {
 		bool dcp_ext;
+		if (!apple_dcp_in_drm(np))
+			continue;
 		if (!of_device_is_available(np)) {
 			of_node_put(np);
 			continue;
@@ -814,7 +839,7 @@ static int add_dcp_components(struct device *dev,
 	int num = 0;
 
 	for_each_matching_node(np, apple_dcp_id_tbl) {
-		if (of_device_is_available(np)) {
+		if (apple_dcp_in_drm(np) && of_device_is_available(np)) {
 			drm_of_component_match_add(dev, matchptr,
 						   component_compare_of, np);
 			num++;
@@ -874,6 +899,7 @@ static void apple_platform_remove(struct platform_device *pdev)
 
 static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,display-subsystem" },
+	{ .compatible = "apple,t6030-display-subsystem" },
 	{}
 };
 MODULE_DEVICE_TABLE(of, of_match);

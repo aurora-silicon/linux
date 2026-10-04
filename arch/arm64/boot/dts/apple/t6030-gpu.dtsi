@@ -1,0 +1,203 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+
+/ {
+	aliases {
+		gpu = &gpu;	/* m1n1 dt_set_gpu() finds the node through this alias */
+	};
+
+	gpu_opp: opp-table-gpu {
+		compatible = "operating-points-v2";
+
+		/*
+		 * NOTE: placeholder only. m1n1 (dt_set_gpu_t6030) deletes these children and creates one OPP per
+		 * runtime ADT pstate (perf-state-count entries), with one opp-microvolt cell per MGPU (2) and
+		 * opp-microwatt from the G15S max-power model (KB 50 §5.1, §5.3).
+		 * G15-TODO(E1): the pstate count and the frequency/voltage values are iBoot-patched ADT data
+		 * (perf-states / perf-state-count are 0 in the ADT template, KB 00 §1.5).
+		 */
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <400000 400000>;
+			opp-microwatt = <0>;
+		};
+		opp01 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <400000 400000>;
+			opp-microwatt = <0>;
+		};
+	};
+
+	reserved-memory {
+		gpu_globals: globals {
+			status = "disabled";
+		};
+
+		gpu_hw_cal_a: hw-cal-a {
+			status = "disabled";
+		};
+
+		gpu_hw_cal_b: hw-cal-b {
+			status = "disabled";
+		};
+
+		/*
+		 * Filled and enabled by m1n1 from the ADT sgx gfx-handoff-*, gfx-shared-region-* and gpu-region-*
+		 * properties. Disabled until then, so that neither the kernel nor m1n1's RAM-map scan (dt_set_memory)
+		 * sees a zero-sized placeholder.
+		 */
+		uat_handoff: uat-handoff {
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+
+		uat_pagetables: uat-pagetables {
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+
+		uat_ttbs: uat-ttbs {
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+
+		/* G15: iBoot's second-level table of the firmware TTBR1 tree (ADT gfx-shared-l2-region);
+		 * must be in the linear map like uat-pagetables. m1n1 fills reg and enables it. */
+		uat_pagetables_l2: uat-pagetables-l2 {
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+	};
+};
+
+&soc {
+	/*
+	 * ADT /arm-io/gfx-asc reg[0] = 0x8240_0000 (size 0x6c000) -> 0x2_9240_0000 (KB 60 §2.4, §L).
+	 * ADT /arm-io/sgx reg[0] = 0x8000_0000 (size 0x32a_4000) -> 0x2_9000_0000; reg[1] = Fender 0x2_90d0_0000
+	 * (size 0x16_c000) lies inside the 16 MiB "sgx" window used here (KB 50 §2, KB 60 §2.1). As on t602x the
+	 * "asc" window is 0x40000 and the "sgx" window 0x1000000, which covers the ID block (sgx+0xd04000), the core
+	 * masks (sgx+0xe01500) and the Fender MMU block (sgx+0xd08000) (KB 60 §2.1).
+	 * The GPU uses no DART: gfx-asc's ADT iommu-parent is "mapper-gfx-asc" (compatible "iommu-mapper,gfx"),
+	 * which is the UAT that drm/asahi manages itself, as on t602x (KB 40).
+	 */
+	gpu: gpu@292400000 {
+		/* m1n1 sets "okay" as its last step, after every other property has been filled in */
+		status = "disabled";
+		/* G15-TODO(E5): binding names are ours; "apple,agx-t6030" is the one drm/asahi and m1n1 match */
+		compatible = "apple,agx-t6030", "apple,agx-g15x", "apple,agx-g15s";
+		reg = <0x2 0x92400000 0 0x40000>,
+			<0x2 0x90000000 0 0x1000000>;
+		reg-names = "asc", "sgx";
+		interrupt-parent = <&aic>;
+		/*
+		 * ADT /arm-io/sgx interrupts, in ADT order (KB 60 §2.4). interrupts-valid = 0x5f marks entry 5
+		 * (838) invalid; it is kept so that the order matches the ADT, as t602x keeps all 7.
+		 */
+		interrupts = <AIC_IRQ 815 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 816 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 817 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 818 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 836 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 838 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 830 IRQ_TYPE_LEVEL_HIGH>;
+		mboxes = <&agx_mbox>;
+		/* pmgr_gfx "gfx" pwrstate at +0x110 (parents gpx, afr) (KB 50 §8.1, KB 60 §2.2 item 4) */
+		power-domains = <&ps_gfx>;
+		/*
+		 * Do not hold back the ps_gfx sync_state() on this device when it never probes (fw_devlink would
+		 * otherwise keep "gfx" in its boot state forever).
+		 */
+		post-init-providers = <&ps_gfx>;
+		memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
+				<&gpu_hw_cal_a>, <&gpu_hw_cal_b>, <&gpu_globals>;
+		memory-region-names = "ttbs", "pagetables", "handoff",
+				      "hw-cal-a", "hw-cal-b", "globals";
+
+		apple,firmware-abi = <0 0 0>;
+		apple,firmware-version = <0 0 0>;
+		apple,firmware-compat = <0 0 0>;
+
+		/* No apple,cs-opp / apple,afr-opp / CS+AFR leak coefs: G15S has no CS/AFR domains (KB 50 §3.3) */
+		operating-points-v2 = <&gpu_opp>;
+
+		apple,min-sram-microvolt = <810000>;
+		apple,perf-base-pstate = <1>;
+
+		/* ADT /arm-io/sgx gpu-* tunables, ADT name minus the "gpu-" prefix (KB 50 §1.2, §9) */
+		apple,avg-power-filter-tc-ms = <40>;
+		apple,avg-power-ki-only = <45.0>;
+		apple,avg-power-kp = <1.4>;
+		apple,avg-power-min-duty-cycle = <40>;
+		apple,avg-power-target-filter-tc = <1>;
+		apple,fast-die0-integral-gain = <1552.0>;
+		apple,fast-die0-proportional-gain = <37.0>;
+		apple,idleoff-standby-timer = <1500>;
+		apple,perf-boost-ce-step = <50>;
+		apple,perf-boost-min-util = <90>;
+		apple,perf-filter-drop-threshold = <0>;
+		apple,perf-filter-time-constant = <5>;
+		apple,perf-filter-time-constant2 = <200>;
+		apple,perf-integral-gain = <1.755>;
+		apple,perf-integral-gain2 = <1.755>;
+		apple,perf-integral-min-clamp = <0>;
+		apple,perf-proportional-gain = <5.85>;
+		apple,perf-proportional-gain2 = <5.85>;
+		apple,perf-tgt-utilization = <80>;
+		apple,power-sample-period = <8>;
+		apple,ppm-filter-time-constant-ms = <32>;
+		apple,ppm-ki = <28.0>;
+		apple,ppm-kp = <0.1>;
+		apple,pwr-filter-time-constant = <313>;
+		apple,pwr-integral-gain = <0.0202129>;
+		apple,pwr-integral-min-clamp = <0>;
+		apple,pwr-min-duty-cycle = <40>;
+		apple,pwr-proportional-gain = <5.2831855>;
+		apple,pwr-sample-period-aic-clks = <200000>;
+		apple,se-engagement-criteria = <600>;
+		apple,se-filter-time-constant = <9>;
+		apple,se-filter-time-constant-1 = <3>;
+		apple,se-inactive-threshold = <2500>;
+		apple,se-ki = <-50.0>;
+		apple,se-ki-1 = <-100.0>;
+		apple,se-kp = <-5.0>;
+		apple,se-kp-1 = <-10.0>;
+		apple,se-reset-criteria = <50>;
+		/*
+		 * G15-TODO(E3): ADT props with no drm/asahi DT binding yet: gpu-se-tgt = 1400,
+		 * gpu-fast-die0-alarm-threshold = 94, gpu-fast-die0-target = 94, gpu-fast-die0-sensor-mask = 0x8080,
+		 * gpu-sochot-temp = 111, gpu-idleoff-min_conf. Add them if the G15 firmware structs need them
+		 * (KB 50 §1.2, §6, §9 "NEW candidates").
+		 */
+
+		/*
+		 * One value per MGPU (drm/asahi requires max_num_clusters = 2 entries). Placeholders: m1n1 writes the
+		 * single fused G15S core leakage 2*(v+1) into both entries and 0 for SRAM (KB 50 §5.2).
+		 * G15-TODO(E3): which firmware fields consume these on G15S (DPE replaces the leakage model, KB 50 §5.5).
+		 */
+		apple,core-leak-coef = <1.0 1.0>;
+		apple,sram-leak-coef = <0.0 0.0>;
+	};
+
+	/*
+	 * gfx-asc mailbox at asc + 0x8000, as on t602x and for every other t6030 ASC (smc/aop/ans/mtp mailboxes
+	 * are all at their ADT reg[0] + 0x8000) (KB 60 §2.4).
+	 * ADT /arm-io/gfx-asc interrupts = <833 832 835 834>. The other t6030 ASCs list theirs in the same
+	 * (n+1, n, n+3, n+2) ADT order and map to send-empty, send-not-empty, recv-empty, recv-not-empty = n..n+3,
+	 * so 832..835 here.
+	 * Compatible: only "apple,t6030-agx-asc-mailbox" (matched by this tree's mailbox.c), the same
+	 * as the boot.bin DTB (m3-gpu-work dtb/src/t6030-gpu-shipped.dtsi). Without the
+	 * "apple,asc-mailbox-v4" fallback, kernels without G15 support leave the gfx-asc mailbox
+	 * (IRQs 832-835) unbound. Add the fallback once G15 is known to work.
+	 */
+	agx_mbox: mbox@292408000 {
+		compatible = "apple,t6030-agx-asc-mailbox";
+		reg = <0x2 0x92408000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 832 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 833 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 834 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 835 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+			"recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+};

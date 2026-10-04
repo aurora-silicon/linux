@@ -134,6 +134,28 @@ impl<'a, T: AsBytes + FromBytes> IoSysMapRef<'a, T> {
         }
     }
 
+    /// Create a new system-memory (not `__iomem`) [`IoSysMapRef`] from a kernel virtual address,
+    /// for drivers that map memory themselves (e.g. with `memremap()` or `vm_map_ram()`).
+    ///
+    /// # Safety
+    ///
+    /// - `vaddr` must point to normal (not `__iomem`) kernel-mapped memory of at least `size`
+    ///   bytes.
+    /// - That mapping must remain valid for the lifetime `'a`.
+    pub unsafe fn from_vaddr(vaddr: *mut T, size: usize) -> IoSysMapRef<'a, T> {
+        let map = RawIoSysMap(
+            bindings::iosys_map {
+                is_iomem: false,
+                __bindgen_anon_1: bindings::iosys_map__bindgen_ty_1 {
+                    vaddr: vaddr.cast(),
+                },
+            },
+            PhantomData,
+        );
+        // SAFETY: The caller guarantees the size and lifetime requirements of `new()`.
+        unsafe { Self::new(map, size) }
+    }
+
     /// Return the size of the `IoSysMapRef`.
     #[inline]
     pub fn size(&self) -> usize {

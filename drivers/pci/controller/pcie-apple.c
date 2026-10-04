@@ -298,6 +298,20 @@ static const struct hw_info t8103_pciec_hw = {
 	.tunneled		= true,
 };
 
+/*
+ * t8122 PCIe-C keeps the t8103 doorbell and RID2SID registers, but MSI
+ * delivery uses the t602x map. The map is indexed by the MSI data, and
+ * the dock bridge's vectors start at 32.
+ */
+static const struct hw_info t8122_pciec_hw = {
+	.port_msiaddr		= PORT_MSIADDR,
+	.port_perst		= PORT_PERST,
+	.port_rid2sid		= PORT_RID2SID,
+	.port_msimap		= PORT_T602X_MSIMAP,
+	.max_rid2sid		= 64,
+	.tunneled		= true,
+};
+
 struct apple_pcie {
 	struct mutex		lock;
 	struct device		*dev;
@@ -332,6 +346,7 @@ struct apple_pcie {
 	struct irq_fwspec	fwspec;
 	struct irq_domain	*msi_domain;
 	u32			nvecs;
+	u32			msi_vector_base;
 };
 
 struct apple_pcie_port {
@@ -682,7 +697,7 @@ static int apple_pcie_port_setup_irq(struct apple_pcie_port *port)
 	if (pcie->hw->port_msimap) {
 		for (int i = 0; i < pcie->nvecs; i++)
 			apple_pcie_port_writel(port,
-				FIELD_PREP(PORT_MSIMAP_TARGET, i) |
+				FIELD_PREP(PORT_MSIMAP_TARGET, pcie->msi_vector_base + i) |
 				PORT_MSIMAP_ENABLE,
 				pcie->hw->port_msimap + 4 * i);
 	} else {
@@ -1021,7 +1036,7 @@ static void apple_pcie_tunnel_restore_irq_hw(struct apple_pcie_port *port)
 	if (pcie->hw->port_msimap) {
 		for (i = 0; i < pcie->nvecs; i++)
 			apple_pcie_port_writel(port,
-				FIELD_PREP(PORT_MSIMAP_TARGET, i) |
+				FIELD_PREP(PORT_MSIMAP_TARGET, pcie->msi_vector_base + i) |
 				PORT_MSIMAP_ENABLE,
 				pcie->hw->port_msimap + 4 * i);
 	} else {
@@ -1739,6 +1754,13 @@ static const struct msi_parent_ops apple_msi_parent_ops = {
 	.init_dev_msi_info	= msi_lib_init_dev_msi_info,
 };
 
+/* T6030 has one shared AIC MSI window, partitioned by its ADT bridges. */
+static bool apple_t6030_msi_slice_valid(u32 base, u32 count, u32 aic_irq)
+{
+	return (base == 0x20 || base == 0x40 || base == 0x60) &&
+	       count == 32 && aic_irq == 1342 + base;
+}
+
 static int apple_msi_init(struct apple_pcie *pcie)
 {
 	struct fwnode_handle *fwnode = dev_fwnode(pcie->dev);
@@ -1763,6 +1785,64 @@ static int apple_msi_init(struct apple_pcie *pcie)
 		return ret;
 	}
 
+	/*
+	 * The controller-wide ADT count (512) is not a per-host allocation.
+	 * Internal PCIe owns vectors 0..31. Each PCIe-C bridge owns a distinct
+	 * 32-vector slice. Keep endpoint MSI data local, and route its table
+	 * entry to the corresponding shared-window vector.
+	 */
+	if (pcie->hw == &t8122_pciec_hw) {
+		struct resource ecam;
+		u32 expected_base;
+
+		/* These ECAM apertures identify the three T6030 ADT bridges. */
+		if (!of_machine_is_compatible("apple,t6030") ||
+		    of_address_to_resource(to_of_node(fwnode), 0, &ecam))
+			goto invalid_slice;
+		switch (ecam.start) {
+		case 0x730000000ULL: expected_base = 0x20; break;
+		case 0xb30000000ULL: expected_base = 0x40; break;
+		case 0xf30000000ULL: expected_base = 0x60; break;
+		default: goto invalid_slice;
+		}
+		if (args.args_count != 3 || args.args[0] != 0 ||
+		    args.args[2] != IRQ_TYPE_EDGE_RISING)
+			goto invalid_slice;
+		ret = of_property_read_u32(to_of_node(fwnode),
+					   "apple,msi-vector-base",
+					   &pcie->msi_vector_base);
+		if (!of_find_property(to_of_node(fwnode),
+				      "apple,msi-vector-base", NULL) &&
+		    args.args[1] == 1342 && pcie->nvecs == 512) {
+			/*
+			 * Old experimental boot DTs exposed the global window to
+			 * each host. Correct it here so old recovery kernels can
+			 * continue using the unchanged shared bootloader DT.
+			 */
+			pcie->msi_vector_base = expected_base;
+			pcie->nvecs = 32;
+			args.args[1] += expected_base;
+			dev_info(pcie->dev, "correcting legacy MSI window to IRQ %u count 32\n",
+				 args.args[1]);
+		} else if (ret) {
+			goto invalid_slice;
+		}
+		if (pcie->msi_vector_base != expected_base ||
+		    !apple_t6030_msi_slice_valid(pcie->msi_vector_base,
+					pcie->nvecs, args.args[1]))
+			goto invalid_slice;
+	}
+
+	/* Keep map targets within the supported 8-bit range. */
+	if (pcie->hw->port_msimap &&
+	    (!pcie->nvecs || pcie->nvecs > 256 ||
+	     pcie->msi_vector_base >
+	     FIELD_MAX(PORT_MSIMAP_TARGET) + 1 - pcie->nvecs)) {
+		of_node_put(args.np);
+		return dev_err_probe(pcie->dev, -EINVAL, "MSI map out of range\n");
+	}
+	info.size = pcie->nvecs;
+
 	of_phandle_args_to_fwspec(args.np, args.args, args.args_count,
 				  &pcie->fwspec);
 	of_node_put(args.np);
@@ -1783,6 +1863,11 @@ static int apple_msi_init(struct apple_pcie *pcie)
 		return -ENOMEM;
 	}
 	return 0;
+
+invalid_slice:
+	of_node_put(args.np);
+	return dev_err_probe(pcie->dev, -EINVAL,
+			     "invalid or missing PCIe-C MSI slice\n");
 }
 
 static void apple_pcie_cleanup(void *data)
@@ -3331,6 +3416,7 @@ static const struct dev_pm_ops apple_pcie_pm_ops = {
 };
 
 static const struct of_device_id apple_pcie_of_match[] = {
+	{ .compatible = "apple,t8122-pciec",	.data = &t8122_pciec_hw },
 	{ .compatible = "apple,t8103-pciec",	.data = &t8103_pciec_hw },
 	{ .compatible = "apple,t6000-pciec",	.data = &t8103_pciec_hw },
 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },

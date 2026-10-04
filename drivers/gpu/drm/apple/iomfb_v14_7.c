@@ -1,0 +1,1514 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+#include <linux/clk.h>
+#include <linux/debugfs.h>
+#include <linux/device.h>
+#include <linux/dma-mapping.h>
+#include <linux/iommu.h>
+#include <linux/ktime.h>
+#include <linux/mfd/syscon.h>
+#include <linux/module.h>
+#include <linux/of.h>
+#include <linux/of_address.h>
+#include <linux/workqueue.h>
+#include <linux/of_device.h>
+#include <linux/of_platform.h>
+#include <linux/platform_device.h>
+#include <linux/regmap.h>
+#include <linux/scatterlist.h>
+#include <linux/sizes.h>
+#include <linux/slab.h>
+#include <linux/soc/apple/pmp-report.h>
+#include <linux/soc/apple/rtkit.h>
+#include <linux/unaligned.h>
+#include <linux/workqueue.h>
+
+#include <drm/drm_atomic.h>
+#include <drm/drm_fb_dma_helper.h>
+#include <drm/drm_fourcc.h>
+#include <drm/drm_framebuffer.h>
+#include <drm/drm_gem_dma_helper.h>
+#include <drm/drm_print.h>
+#include <drm/drm_vblank.h>
+
+#include "afk.h"
+#include "dcp.h"
+#include "dcp-internal.h"
+#include "dcpext_scanout.h"
+#include "dcp-lifecycle.h"
+#include "iomfb_internal.h"
+#include "iomfb_v14_7.h"
+#include "iomfb_v14_7_link.h"
+#include "iomfb_v14_7_swap.h"
+#include "parser.h"
+
+#define A(n) DCP_V14_TAG('A', n)
+#define D(n) DCP_V14_TAG('D', n)
+
+/* The image whose method and callback layouts this file implements. */
+#define DCP_V14_FIRMWARE_UUID	"DDF38191-93B3-324A-BC8F-643006F5AC82"
+
+#define DCP_V14_CPU_CONTROL	0x44
+#define DCP_V14_CPU_STATUS	0x48
+#define DCP_V14_PMP_TIMEOUT	msecs_to_jiffies(30000)
+#define DCP_V14_RTKIT_RETRIES	4
+#define DCP_V14_MAX_PROPERTIES	256
+#define DCP_V14_MAX_RAW		32
+#define DCP_V14_MAX_RAW_BYTES	SZ_8M
+#define DCP_V14_MAX_BUFFERS	64
+#define DCP_V14_MAX_BUFFER	SZ_16M
+#define DCP_V14_MAX_BUFFER_BYTES SZ_64M
+/* IOMFB layer of the primary plane. */
+#define DCP_V14_LAYER		0
+#define DCP_V14_BLACK		0xff000000
+
+struct dcp_v14_property {
+	u32 service;
+	char key[64];
+	u64 value;
+};
+
+struct dcp_v14_raw {
+	u32 service;
+	char key[64];
+	void *data;
+	u32 size;
+};
+
+struct dcp_v14_buffer {
+	void *cpu;
+	dma_addr_t iova;
+	phys_addr_t phys;
+	size_t size;
+	bool retired;
+	bool piodma_mapped;
+};
+
+struct apple_dcp_v14 {
+	struct device *dev;
+	/* Cleared when KMS unbinds; the firmware session outlives it. */
+	struct apple_dcp *dcp;
+	struct apple_rtkit *rtk;
+	struct dcp_v14_link link;
+
+	/* Owns the RPC stream: start, swaps and idle callbacks. */
+	struct mutex lock;
+	struct work_struct idle_work;
+	bool failed;
+	bool started;
+
+	/* Boot framebuffer and native panel timing (notch rows included). */
+	u32 stride;
+	u32 fb_width, fb_height;
+	u32 panel_width, panel_height;
+	u64 clock_rate;
+
+	struct dcp_v14_property properties[DCP_V14_MAX_PROPERTIES];
+	u32 property_count;
+	struct dcp_v14_raw raw[DCP_V14_MAX_RAW];
+	u32 raw_count, raw_bytes;
+	void *chunk;
+	u32 chunk_size, chunk_offset;
+	u64 analytics;
+
+	struct dcp_v14_buffer buffers[DCP_V14_MAX_BUFFERS];
+	u32 buffer_count;
+	u64 buffer_bytes;
+	struct platform_device *piodma;
+	struct iommu_domain *piodma_domain;
+
+	/* Scanned out until the next swap completes. */
+	struct drm_framebuffer *active_fb;
+	u64 swaps;
+	u64 swap_ns_max;
+};
+
+/* One DCP session per boot: RTKit is never started twice. */
+static bool dcp_v14_session;
+
+static int dcp_v14_callback(void *cookie, u32 tag, const void *input, u32 in_size,
+			    void *output, u32 out_size);
+
+/* Called with the lock held, or from a callback. */
+static int dcp_v14_call(struct apple_dcp_v14 *v14, u32 tag, const void *in, u32 in_size,
+			void *out, u32 out_size, u32 completion)
+{
+	int ret;
+
+	if (v14->failed)
+		return -EIO;
+	dev_dbg(v14->dev, "call %#x in %u out %u\n", tag, in_size, out_size);
+	ret = dcp_v14_link_call(&v14->link, tag, in, in_size, out, out_size, completion,
+				dcp_v14_callback, v14);
+	if (ret) {
+		v14->failed = true;
+		dev_err(v14->dev, "DCP call %#x failed: %d; recovery requires a reboot\n",
+			tag, ret);
+	}
+	return ret;
+}
+
+/* A call with an optional u32 input of 1 and an optional u32 result to check. */
+static int dcp_v14_simple_call(struct apple_dcp_v14 *v14, u32 tag, bool input, bool reply,
+			       bool expected)
+{
+	__le32 one = cpu_to_le32(1), result = 0;
+	int ret;
+
+	ret = dcp_v14_call(v14, tag, input ? &one : NULL, input ? 4 : 0,
+			   reply ? &result : NULL, reply ? 4 : 0, 0);
+	if (!ret && reply && le32_to_cpu(result) != expected)
+		return -EPROTO;
+	return ret;
+}
+
+static struct dcp_v14_property *dcp_v14_property(struct apple_dcp_v14 *v14, u32 service,
+						 const u8 *key, bool create)
+{
+	struct dcp_v14_property *p;
+	u32 i;
+
+	if (!memchr(key, 0, 64))
+		return ERR_PTR(-EINVAL);
+	for (i = 0; i < v14->property_count; i++) {
+		p = &v14->properties[i];
+		if (p->service == service && !strcmp(p->key, key))
+			return p;
+	}
+	if (!create)
+		return NULL;
+	if (v14->property_count == DCP_V14_MAX_PROPERTIES)
+		return ERR_PTR(-ENOSPC);
+	p = &v14->properties[v14->property_count++];
+	p->service = service;
+	strscpy(p->key, key, sizeof(p->key));
+	return p;
+}
+
+static int dcp_v14_raw_property(struct apple_dcp_v14 *v14, u32 service, const u8 *key,
+				const void *data, u32 size)
+{
+	u32 i, old_size = 0;
+	void *copy;
+
+	if (!memchr(key, 0, 64) || size > SZ_1M)
+		return -EINVAL;
+	for (i = 0; i < v14->raw_count; i++)
+		if (v14->raw[i].service == service && !strcmp(v14->raw[i].key, key))
+			break;
+	if (i == DCP_V14_MAX_RAW)
+		return -ENOSPC;
+	if (i < v14->raw_count)
+		old_size = v14->raw[i].size;
+	if (v14->raw_bytes - old_size + size > DCP_V14_MAX_RAW_BYTES)
+		return -ENOSPC;
+	copy = kvmemdup(data, size ?: 1, GFP_KERNEL);
+	if (!copy)
+		return -ENOMEM;
+	if (i == v14->raw_count)
+		v14->raw_count++;
+	kvfree(v14->raw[i].data);
+	v14->raw[i].service = service;
+	strscpy(v14->raw[i].key, key, sizeof(v14->raw[i].key));
+	v14->raw[i].data = copy;
+	v14->raw[i].size = size;
+	v14->raw_bytes += size - old_size;
+	return 0;
+}
+
+/* The firmware's allocate-buffer callback wants a physically contiguous buffer. */
+static int dcp_v14_alloc(struct apple_dcp_v14 *v14, u64 request, u32 *id)
+{
+	struct dcp_v14_buffer *buf;
+	struct sg_table table;
+	dma_addr_t iova;
+	size_t size;
+	void *cpu;
+	int ret;
+
+	if (!request || request > DCP_V14_MAX_BUFFER)
+		return -EINVAL;
+	size = ALIGN(request, SZ_16K);
+	if (v14->buffer_count == DCP_V14_MAX_BUFFERS ||
+	    v14->buffer_bytes + size > DCP_V14_MAX_BUFFER_BYTES)
+		return -ENOSPC;
+	cpu = dma_alloc_attrs(v14->dev, size, &iova, GFP_KERNEL, DMA_ATTR_FORCE_CONTIGUOUS);
+	if (!cpu)
+		return -ENOMEM;
+	ret = dma_get_sgtable_attrs(v14->dev, &table, cpu, iova, size,
+				    DMA_ATTR_FORCE_CONTIGUOUS);
+	if (ret)
+		goto free;
+	if (table.orig_nents != 1 || table.sgl->length < size) {
+		sg_free_table(&table);
+		ret = -ERANGE;
+		goto free;
+	}
+	buf = &v14->buffers[v14->buffer_count];
+	buf->phys = sg_phys(table.sgl);
+	sg_free_table(&table);
+	memset(cpu, 0, size);
+	dma_wmb();
+	buf->cpu = cpu;
+	buf->iova = iova;
+	buf->size = size;
+	v14->buffer_bytes += size;
+	/* The firmware takes id 0 as a failure. */
+	*id = ++v14->buffer_count;
+	dev_info(v14->dev, "DCP buffer %u: %zu bytes at %pad\n", *id, size, &iova);
+	return 0;
+free:
+	dma_free_attrs(v14->dev, size, cpu, iova, DMA_ATTR_FORCE_CONTIGUOUS);
+	return ret;
+}
+
+/* Maps a firmware buffer at the same address for the PIODMA stream. */
+static int dcp_v14_map_piodma(struct apple_dcp_v14 *v14, u32 id)
+{
+	struct dcp_v14_buffer *buf = &v14->buffers[id - 1];
+	struct device_node *node;
+	size_t offset;
+	u32 marker;
+	int ret;
+
+	if (buf->retired)
+		return -EINVAL;
+	if (buf->piodma_mapped)
+		return 0;
+	if (!v14->piodma) {
+		node = of_get_child_by_name(v14->dev->of_node, "piodma");
+		if (!node || !of_device_is_available(node) ||
+		    of_property_read_u32(node, "apple,t6030-handoff", &marker) || marker != 1) {
+			of_node_put(node);
+			return -ENODEV;
+		}
+		v14->piodma = of_platform_device_create(node, NULL, v14->dev);
+		if (!v14->piodma) {
+			of_node_put(node);
+			return -ENOMEM;
+		}
+		ret = dma_set_mask_and_coherent(&v14->piodma->dev, DMA_BIT_MASK(42));
+		if (!ret)
+			ret = of_dma_configure(&v14->piodma->dev, node, true);
+		of_node_put(node);
+		/* Never destroy a device attached to a locked DART stream. */
+		if (ret)
+			return ret;
+		v14->piodma_domain = iommu_get_domain_for_dev(&v14->piodma->dev);
+	}
+	if (IS_ERR_OR_NULL(v14->piodma_domain))
+		return -EIO;
+	ret = iommu_map(v14->piodma_domain, buf->iova, buf->phys, buf->size,
+			IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
+	if (ret)
+		return ret;
+	for (offset = 0; offset < buf->size; offset += SZ_16K)
+		if (iommu_iova_to_phys(v14->piodma_domain, buf->iova + offset) !=
+		    buf->phys + offset)
+			return -EIO;
+	buf->piodma_mapped = true;
+	dev_info(v14->dev, "PIODMA mapped DCP buffer %u: %zu bytes at %pad\n",
+		 id, buf->size, &buf->iova);
+	return 0;
+}
+
+/* Runs on the thread that owns the RPC stream; the lock is held. */
+static int dcp_v14_callback(void *cookie, u32 tag, const void *input, u32 in_size,
+			    void *output, u32 out_size)
+{
+	struct apple_dcp_v14 *v14 = cookie;
+	const u8 *in = input;
+	u8 *out = output;
+	struct dcp_v14_property *p;
+	u32 count, offset, service, key_offset, id;
+	int ret;
+
+#define SHAPE(i, o) (in_size == (i) && out_size == (o))
+	/* get_time */
+	if (tag == D(209) && SHAPE(0, 8)) {
+		put_unaligned_le64(ktime_to_ms(ktime_get_real()), out);
+		return 0;
+	}
+	/* No default framebuffer is allocated by this host. */
+	if ((tag == D(596) && SHAPE(0, 4)) || (tag == D(582) && SHAPE(8, 4)))
+		return 0;
+	/*
+	 * Tiling state get and set: event, parameter, u32 value and a nullable
+	 * byte. Like the M1/M2 hosts: no tiled display, no setter.
+	 */
+	if ((tag == D(115) && SHAPE(16, 8)) || (tag == D(116) && SHAPE(16, 4))) {
+		if (in[12] > 1)
+			return -EINVAL;
+		if (tag == D(115))
+			out[4] = 1;
+		return 0;
+	}
+	/*
+	 * Analytics event: name[64], serialized dictionary[4096], nullable
+	 * flag. The dictionary is in/out and the firmware parses it even on
+	 * failure, so it is echoed back unchanged; status 0 accepts it.
+	 */
+	if (tag == D(114) && SHAPE(4164, 4100)) {
+		if (!memchr(in, 0, 64) || in[4160] > 1 || (!in[4160] && in[64] != 'd'))
+			return -EINVAL;
+		if (!in[4160])
+			memcpy(out, in + 64, 4096);
+		put_unaligned_le32(0, out + 4096);
+		v14->analytics++;
+		dev_dbg(v14->dev, "analytics event %llu: %.64s\n", v14->analytics, in);
+		return 0;
+	}
+	/* Swap information for a completed swap; the link checks its id. */
+	if (tag == D(589) && SHAPE(0x6f0, 0))
+		return 0;
+	if ((tag == D(588) && SHAPE(8, 0)) || (tag == D(598) && SHAPE(0, 0)))
+		return 0;
+	/* Main-display query, answered by asking the firmware. */
+	if (tag == D(599) && SHAPE(0, 0))
+		return dcp_v14_simple_call(v14, A(410), false, true, true);
+	/* Service creation and boot signals. */
+	if ((tag == D(108) || tag == D(109) || tag == D(110) || tag == D(111) ||
+	     tag == D(112) || tag == D(113) || tag == D(0) || tag == D(1)) && SHAPE(0, 4)) {
+		out[0] = 1;
+		return 0;
+	}
+	/* Hotplug: echo the tiled-display record when present. */
+	if (tag == D(576) && SHAPE(88, 76)) {
+		if (!(in[84] & 1))
+			memcpy(out, in + 8, 76);
+		return 0;
+	}
+	if ((tag == D(577) && SHAPE(4, 0)) || (tag == D(300) && SHAPE(16, 0)))
+		return 0;
+	/* Chunked property transfer: start, chunk, end. */
+	if (tag == D(127) && SHAPE(4, 4)) {
+		count = get_unaligned_le32(in);
+		if (v14->chunk || !count || count > 0x100001)
+			return -EINVAL;
+		v14->chunk_size = count - 1;
+		v14->chunk_offset = 0;
+		v14->chunk = kvzalloc(max_t(u32, 1, v14->chunk_size), GFP_KERNEL);
+		if (!v14->chunk)
+			return -ENOMEM;
+		out[0] = 1;
+		return 0;
+	}
+	if (tag == D(128) && SHAPE(0x1008, 4)) {
+		offset = get_unaligned_le32(in + 0x1000);
+		count = get_unaligned_le32(in + 0x1004);
+		if (!v14->chunk || offset != v14->chunk_offset || count > 4096 ||
+		    offset > v14->chunk_size || count > v14->chunk_size - offset)
+			return -EINVAL;
+		memcpy(v14->chunk + offset, in, count);
+		v14->chunk_offset += count;
+		out[0] = 1;
+		return 0;
+	}
+	if (tag == D(129) && SHAPE(64, 4)) {
+		if (!v14->chunk || v14->chunk_offset != v14->chunk_size || !memchr(in, 0, 64))
+			return -EINVAL;
+		ret = dcp_v14_raw_property(v14, 0, in, v14->chunk, v14->chunk_size);
+		if (ret)
+			return ret;
+		kvfree(v14->chunk);
+		v14->chunk = NULL;
+		dev_dbg(v14->dev, "property %.64s: %u bytes\n", in, v14->chunk_size);
+		out[0] = 1;
+		return 0;
+	}
+	/*
+	 * Display clock frequencies: index 0 is the display clock iBoot set
+	 * up, index 1 is not used. Nothing here programs a clock.
+	 */
+	if (tag == D(408) && SHAPE(8, 8)) {
+		count = get_unaligned_le32(in + 4);
+		if (memcmp(in, "VORP", 4) || count > 1)
+			return -EINVAL;
+		put_unaligned_le64(count ? 0 : v14->clock_rate, out);
+		dev_dbg(v14->dev, "display clock %u: %llu Hz\n", count, get_unaligned_le64(out));
+		return 0;
+	}
+	if (tag == D(125) && SHAPE(100, 36)) {
+		count = get_unaligned_le32(in + 64);
+		if (count > 8)
+			return -EINVAL;
+		memcpy(out, in + 68, count * 4);
+		return 0;
+	}
+	/* Frame sync properties: echo them when present. */
+	if (tag == D(6) && SHAPE(60, 56)) {
+		if (!(in[56] & 1))
+			memcpy(out, in, 56);
+		return 0;
+	}
+	/* Dark boot and hibernation wake: no. */
+	if ((tag == D(122) || tag == D(123)) && SHAPE(0, 4))
+		return 0;
+	/* Late boot: the calls the firmware expects from its host, in order. */
+	if (tag == D(121) && SHAPE(0, 4)) {
+		static const struct {
+			u32 tag;
+			bool input, reply, expected;
+		} sequence[] = {
+			{ A(444), false, true, true },
+			{ A(29), false, false, false },
+			{ A(466), true, false, false },
+			{ A(0), true, true, true },
+			{ A(463), false, true, true },
+		};
+
+		for (count = 0; count < ARRAY_SIZE(sequence); count++) {
+			ret = dcp_v14_simple_call(v14, sequence[count].tag, sequence[count].input,
+						  sequence[count].reply, sequence[count].expected);
+			if (ret)
+				return ret;
+		}
+		out[0] = 1;
+		return 0;
+	}
+	/* Default stride: that of the boot framebuffer. */
+	if (tag == D(101) && SHAPE(0, 4)) {
+		put_unaligned_le32(v14->stride, out);
+		return 0;
+	}
+	/* Real-time bandwidth: explicitly declined. */
+	if (tag == D(3) && SHAPE(4, 60)) {
+		put_unaligned_le32(1, out + 56);
+		return 0;
+	}
+	if (tag == D(451) && SHAPE(20, 28)) {
+		u32 alignment = get_unaligned_le32(in + 12);
+		u64 size = get_unaligned_le64(in + 4);
+		struct dcp_v14_buffer *buf;
+
+		dev_dbg(v14->dev, "allocation flags %#x size %llu alignment %u\n",
+			get_unaligned_le32(in), size, alignment);
+		if (get_unaligned_le32(in) != 0x703 || !is_power_of_2(alignment) ||
+		    alignment > SZ_16K || in[16] || in[17] || in[18])
+			return -EINVAL;
+		ret = dcp_v14_alloc(v14, size, &id);
+		if (ret)
+			return ret;
+		buf = &v14->buffers[id - 1];
+		if ((buf->phys | buf->iova) & (alignment - 1))
+			return -EINVAL;
+		put_unaligned_le64(buf->phys, out);
+		put_unaligned_le64(buf->iova, out + 8);
+		put_unaligned_le64(buf->size, out + 16);
+		put_unaligned_le32(id, out + 24);
+		return 0;
+	}
+	/* Map a buffer for PIODMA; the AP virtual address is not used. */
+	if (tag == D(201) && SHAPE(12, 20)) {
+		u64 buffer = get_unaligned_le64(in);
+
+		if (!buffer || buffer > v14->buffer_count || get_unaligned_le32(in + 8) != 1)
+			return -EINVAL;
+		ret = dcp_v14_map_piodma(v14, buffer);
+		if (ret)
+			return ret;
+		put_unaligned_le64(0, out);
+		put_unaligned_le64(v14->buffers[buffer - 1].iova, out + 8);
+		put_unaligned_le32(0, out + 16);
+		return 0;
+	}
+	/* Release: the buffer stays allocated and mapped until reboot. */
+	if (tag == D(454) && SHAPE(4, 4)) {
+		id = get_unaligned_le32(in);
+		if (!id || id > v14->buffer_count || v14->buffers[id - 1].retired)
+			return -EINVAL;
+		v14->buffers[id - 1].retired = true;
+		out[0] = 1;
+		return 0;
+	}
+	/* Raw property read. */
+	if (tag == D(400) && SHAPE(76, 0xc04)) {
+		count = get_unaligned_le32(in + 68);
+		service = get_unaligned_le32(in);
+		if (count > 0xc00 || (in[72] & 1) || !memchr(in + 4, 0, 64))
+			return -EINVAL;
+		for (offset = 0; offset < v14->raw_count; offset++) {
+			struct dcp_v14_raw *raw = &v14->raw[offset];
+
+			if (raw->service != service || strcmp(raw->key, in + 4))
+				continue;
+			if (raw->size > count)
+				return -ENOSPC;
+			memcpy(out, raw->data, raw->size);
+			put_unaligned_le32(raw->size, out + 0xc00);
+			break;
+		}
+		return 0;
+	}
+	/* Unsigned property read. */
+	if (tag == D(401) && SHAPE(80, 12)) {
+		/*
+		 * The PMU temperature the M1/M2 mini-LED hosts report: a fixed
+		 * placeholder in centidegrees, not a measurement.
+		 */
+		if (!memcmp(in, "SUMP", 4) && !strncmp(in + 4, "Temperature", 64)) {
+			put_unaligned_le64(3029, out);
+			out[8] = 1;
+			return 0;
+		}
+		p = dcp_v14_property(v14, get_unaligned_le32(in), in + 4, false);
+		if (IS_ERR(p))
+			return PTR_ERR(p);
+		if (p) {
+			put_unaligned_le64(p->value, out);
+			out[8] = 1;
+		} else {
+			dev_dbg(v14->dev, "no host property %#x %.64s\n",
+				get_unaligned_le32(in), in + 4);
+		}
+		return 0;
+	}
+	/* Dictionary properties, kept raw. */
+	if ((tag == D(413) && SHAPE(4168, 4)) ||
+	    ((tag == D(552) || tag == D(561)) && SHAPE(4164, 4)) ||
+	    (tag == D(567) && SHAPE(128, 4))) {
+		key_offset = tag == D(413) ? 4 : 0;
+		service = key_offset ? get_unaligned_le32(in) : 0;
+		if (tag != D(567) && (in[key_offset + 4160] & 1)) {
+			out[0] = 1;
+			return 0;
+		}
+		count = tag == D(567) ? strnlen(in + 64, 64) : 4096;
+		ret = dcp_v14_raw_property(v14, service, in + key_offset, in + key_offset + 64,
+					   count);
+		if (!ret)
+			out[0] = 1;
+		return ret;
+	}
+	/* Number and boolean properties. */
+	if ((tag == D(563) && SHAPE(76, 4)) || (tag == D(565) && SHAPE(72, 4)) ||
+	    (tag == D(414) && SHAPE(80, 4)) || (tag == D(415) && SHAPE(76, 4)) ||
+	    ((tag == D(102) || tag == D(104)) && SHAPE(68, 0))) {
+		key_offset = (tag == D(414) || tag == D(415)) ? 4 : 0;
+		service = key_offset ? get_unaligned_le32(in) : 0;
+		count = (tag == D(563) || tag == D(414)) ? 8 : 4;
+		if (out_size && (in[key_offset + 64 + count] & 1)) {
+			out[0] = 1;
+			return 0;
+		}
+		p = dcp_v14_property(v14, service, in + key_offset, true);
+		if (IS_ERR(p))
+			return PTR_ERR(p);
+		p->value = count == 8 ? get_unaligned_le64(in + key_offset + 64) :
+					get_unaligned_le32(in + key_offset + 64);
+		if (tag == D(104))
+			p->value = in[64];
+		if (out_size)
+			out[0] = 1;
+		return 0;
+	}
+	/*
+	 * Property operations a host-service proxy replays when it starts
+	 * with queued operations. They return nothing.
+	 */
+	if ((tag == D(402) && SHAPE(76, 0)) || (tag == D(404) && SHAPE(72, 0)) ||
+	    (tag == D(406) && SHAPE(72, 0)) || (tag == D(407) && SHAPE(72, 0))) {
+		dev_dbg(v14->dev, "proxy property callback %#x\n", tag);
+		return 0;
+	}
+	/* Property removal. */
+	if (tag == D(107) && SHAPE(64, 0)) {
+		p = dcp_v14_property(v14, 0, in, false);
+		if (IS_ERR(p))
+			return PTR_ERR(p);
+		if (p) {
+			*p = v14->properties[--v14->property_count];
+			memset(&v14->properties[v14->property_count], 0, sizeof(*p));
+		}
+		return 0;
+	}
+	/* PMU and backlight service matching, answered by the firmware. */
+	if ((tag == D(206) || tag == D(207)) && SHAPE(0, 4)) {
+		ret = dcp_v14_simple_call(v14, tag == D(206) ? A(131) : A(132), false, true,
+					  false);
+		if (!ret)
+			out[0] = 1;
+		return ret;
+	}
+	if (tag == D(100) && SHAPE(0, 0)) {
+		__le32 result;
+
+		return dcp_v14_call(v14, A(374), NULL, 0, &result, sizeof(result), 0);
+	}
+#undef SHAPE
+	dev_err(v14->dev, "unhandled DCP callback %#x %u/%u\n", tag, in_size, out_size);
+	return -EOPNOTSUPP;
+}
+
+/* Firmware notifications that arrive while no call is in progress. */
+static void dcp_v14_idle(struct work_struct *work)
+{
+	struct apple_dcp_v14 *v14 = container_of(work, struct apple_dcp_v14, idle_work);
+	int ret = 0;
+
+	mutex_lock(&v14->lock);
+	while (!v14->failed && !ret)
+		ret = dcp_v14_link_pump(&v14->link, 0, dcp_v14_callback, v14);
+	if (ret && ret != -ETIMEDOUT && ret != -EAGAIN) {
+		v14->failed = true;
+		dev_err(v14->dev, "DCP notification failed: %d; recovery requires a reboot\n", ret);
+	}
+	mutex_unlock(&v14->lock);
+}
+
+static void dcp_v14_crashed(void *cookie, const void *crashlog, size_t crashlog_size)
+{
+	struct apple_dcp_v14 *v14 = cookie;
+	struct apple_dcp *dcp = READ_ONCE(v14->dcp);
+
+	WRITE_ONCE(v14->failed, true);
+	if (dcp) {
+		WRITE_ONCE(dcp->crashed, true);
+		if (dcp->external)
+			dcpext_scanout_fault(dcp, -EIO);
+	}
+	dev_err(v14->dev, "DCP firmware crashed; its buffers are kept until reboot\n");
+	dcp_v14_link_fail(&v14->link);
+}
+
+static void dcp_v14_recv(void *cookie, u8 endpoint, u64 message)
+{
+	struct apple_dcp_v14 *v14 = cookie;
+
+	if (endpoint == DISP0_ENDPOINT && v14->dcp && v14->dcp->external) {
+		if (v14->dcp->ibootep)
+			afk_receive_message(v14->dcp->ibootep, message);
+		return;
+	}
+	if (endpoint == DPTX_ENDPOINT) {
+		dev_info(v14->dev, "DPTX message %#llx\n", message);
+		if (v14->dcp && v14->dcp->dptxep)
+			afk_receive_message(v14->dcp->dptxep, message);
+		return;
+	}
+	if (endpoint == DPAV_CTRL_ENDPOINT) {
+		dev_info(v14->dev, "DPAV message %#llx\n", message);
+		if (v14->dcp && v14->dcp->dpavctrlep)
+			afk_receive_message(v14->dcp->dpavctrlep, message);
+		return;
+	}
+	if (endpoint == AV_ENDPOINT) {
+		dev_info(v14->dev, "AV message %#llx\n", message);
+		if (v14->dcp && v14->dcp->avep)
+			afk_receive_message(v14->dcp->avep, message);
+		return;
+	}
+	if (endpoint == DPAVSERV_ENDPOINT) {
+		dev_info(v14->dev, "DPAVSERV message %#llx\n", message);
+		if (v14->dcp && v14->dcp->dcpavservep)
+			afk_receive_message(v14->dcp->dcpavservep, message);
+		return;
+	}
+	if (endpoint != APPLE_DCP_LINK_ENDPOINT) {
+		dev_dbg(v14->dev, "ignored endpoint %#x message %#llx\n", endpoint, message);
+		return;
+	}
+	dcp_v14_link_receive(&v14->link, message);
+}
+
+/*
+ * Buffers the firmware already owns must lie in a reserved region the boot
+ * loader described, and be mapped linearly there. The OS log is a physical
+ * address, not a DART address.
+ */
+static int dcp_v14_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
+{
+	struct apple_dcp_v14 *v14 = cookie;
+	struct device *dev = v14->dev;
+	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
+	phys_addr_t phys;
+	int i;
+
+	if (!bfr->size || bfr->size > SZ_16M || !domain)
+		return -EINVAL;
+	if (!bfr->iova) {
+		bfr->buffer = dma_alloc_coherent(dev, bfr->size, &bfr->iova, GFP_KERNEL);
+		if (!bfr->buffer)
+			return -ENOMEM;
+		memset(bfr->buffer, 0, bfr->size);
+		dma_wmb();
+		return 0;
+	}
+	phys = iommu_iova_to_phys(domain, bfr->iova);
+	for (i = 0; ; i++) {
+		struct device_node *node = of_parse_phandle(dev->of_node, "memory-region", i);
+		struct resource res;
+		size_t off;
+		bool oslog, valid;
+
+		if (!node)
+			return -ERANGE;
+		oslog = of_property_read_bool(node, "apple,dcp-os-log");
+		valid = !of_address_to_resource(node, 0, &res);
+		of_node_put(node);
+		if (!valid)
+			continue;
+		if (oslog && bfr->iova == res.start)
+			phys = res.start;
+		if (phys < res.start || phys > res.end || bfr->size - 1 > res.end - phys)
+			continue;
+		if (!oslog) {
+			for (off = 0; off < bfr->size; off += SZ_16K)
+				if (iommu_iova_to_phys(domain, bfr->iova + off) != phys + off)
+					return -ERANGE;
+			if (iommu_iova_to_phys(domain, bfr->iova + bfr->size - 1) !=
+			    phys + bfr->size - 1)
+				return -ERANGE;
+		}
+		bfr->buffer = memremap(phys, bfr->size, MEMREMAP_WB);
+		if (!bfr->buffer)
+			return -ENOMEM;
+		bfr->is_mapped = true;
+		dev_dbg(dev, "RTKit buffer at %pad: %pa, %zu bytes\n", &bfr->iova, &phys,
+			bfr->size);
+		return 0;
+	}
+}
+
+static void dcp_v14_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr)
+{
+	struct apple_dcp_v14 *v14 = cookie;
+
+	if (bfr->is_mapped)
+		memunmap(bfr->buffer);
+	else
+		dma_free_coherent(v14->dev, bfr->size, bfr->buffer, bfr->iova);
+}
+
+static const struct apple_rtkit_ops dcp_v14_rtkit_ops = {
+	.crashed = dcp_v14_crashed,
+	.recv_message = dcp_v14_recv,
+	.shmem_setup = dcp_v14_shmem_setup,
+	.shmem_destroy = dcp_v14_shmem_destroy,
+};
+
+/* Freed only if RTKit never started: the firmware may call into it until reboot. */
+static void dcp_v14_release(void *data)
+{
+	struct apple_dcp_v14 *v14 = data;
+
+	if (!v14->rtk)
+		kfree(v14);
+}
+
+/* Read only: bind maps and claims these registers. */
+static int dcp_v14_cpu_running(struct device *dev)
+{
+	struct resource *res;
+	void __iomem *coproc;
+	u32 control;
+
+	res = platform_get_resource_byname(to_platform_device(dev), IORESOURCE_MEM, "coproc");
+	if (!res)
+		return -ENODEV;
+	coproc = ioremap_np(res->start, resource_size(res));
+	if (!coproc)
+		return -ENOMEM;
+	control = readl(coproc + DCP_V14_CPU_CONTROL);
+	iounmap(coproc);
+	if (!(control & APPLE_DCP_COPROC_CPU_CONTROL_RUN))
+		return dev_err_probe(dev, -EBUSY,
+				     "T6030 display not started: the DCP CPU is stopped (%#x); the PMP is not started for it\n",
+				     control);
+	return 0;
+}
+
+int iomfb_v14_7_probe(struct apple_dcp *dcp)
+{
+	struct device *dev = dcp->dev;
+	struct device_node *np = dev->of_node, *entry;
+	struct apple_dcp_v14 *v14;
+	const char *uuid = NULL;
+	u32 marker = 0;
+	int ret;
+
+	if (of_property_read_string(np, "apple,firmware-uuid", &uuid) ||
+	    strcmp(uuid, DCP_V14_FIRMWARE_UUID))
+		return dev_err_probe(dev, -ENODEV,
+				     "T6030 display not started: DCP firmware %s is not supported\n",
+				     uuid ?: "(unknown)");
+	if (of_property_read_u32(np, "apple,t6030-handoff", &marker) || marker != 1)
+		return dev_err_probe(dev, -ENODEV,
+				     "T6030 display not started: no boot loader display handoff\n");
+	if (!iommu_get_domain_for_dev(dev))
+		return dev_err_probe(dev, -ENODEV,
+				     "T6030 display not started: the DCP has no DART domain\n");
+	ret = dcp_v14_cpu_running(dev);
+	if (ret)
+		return ret;
+
+	entry = of_parse_phandle(np, "apple,pmp-report", 0);
+	if (!entry)
+		return dev_err_probe(dev, -ENODEV,
+				     "T6030 display not started: no apple,pmp-report, the PMP is not described\n");
+	ret = apple_pmp_report_wait_ready(entry, DCP_V14_PMP_TIMEOUT);
+	of_node_put(entry);
+	if (ret == -EPROBE_DEFER)
+		return dev_err_probe(dev, ret, "waiting for the PMP report\n");
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "T6030 display not started: the PMP has not acknowledged the display request; the boot framebuffer stays\n");
+
+	v14 = kzalloc_obj(*v14);
+	if (!v14)
+		return -ENOMEM;
+	v14->dev = dev;
+	v14->dcp = dcp;
+	mutex_init(&v14->lock);
+	INIT_WORK(&v14->idle_work, dcp_v14_idle);
+	ret = devm_add_action_or_reset(dev, dcp_v14_release, v14);
+	if (ret)
+		return ret;
+	dcp->v14 = v14;
+	dev_info(dev, "PMP running with the display request acknowledged\n");
+	return 0;
+}
+
+/* The boot framebuffer gives the stride and, with the notch rows, the panel size. */
+static int dcp_v14_geometry(struct apple_dcp_v14 *v14)
+{
+	struct device_node *fb = of_find_compatible_node(NULL, NULL, "simple-framebuffer");
+	u32 notch = 0;
+	int ret;
+
+	if (!fb)
+		return -ENODEV;
+	ret = of_property_read_u32(fb, "width", &v14->fb_width);
+	if (!ret)
+		ret = of_property_read_u32(fb, "height", &v14->fb_height);
+	if (!ret)
+		ret = of_property_read_u32(fb, "stride", &v14->stride);
+	of_node_put(fb);
+	if (ret)
+		return ret;
+	/* The boot loader hides the notch rows from the boot framebuffer. */
+	of_property_read_u32(v14->dev->of_node, "apple,notch-height", &notch);
+	/* The firmware takes this stride as its default: 4 bytes per pixel. */
+	if (!v14->fb_width || !v14->fb_height || v14->stride != v14->fb_width * 4 ||
+	    notch > MAX_NOTCH_HEIGHT)
+		return -EINVAL;
+	v14->panel_width = v14->fb_width;
+	v14->panel_height = v14->fb_height + notch;
+	return 0;
+}
+
+static void dcpext_bringup(struct work_struct *work);
+
+/* Verify the mappings installed by the IOMMU core before touching the ASC. */
+static int dcpext_verify_memory(struct apple_dcp *dcp)
+{
+	static const char *const names[] = {"asc-firmware", "dcp_data", "heap"};
+	static const u64 iovas[] = {0x10040000000ULL, 0x10080000000ULL, 0x100c0000000ULL};
+	struct device *dev = dcp->dev;
+	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
+	u32 ready;
+	int i;
+
+	if (!domain || of_property_read_u32(dev->of_node,
+		"apple,t6030-dcpext-memory-ready", &ready) || ready != 1)
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		struct device_node *mem;
+		struct resource res;
+		u64 off, size;
+		int idx = of_property_match_string(dev->of_node, "memory-region-names", names[i]);
+		if (idx < 0)
+			return idx;
+		mem = of_parse_phandle(dev->of_node, "memory-region", idx);
+		if (!mem)
+			return -EINVAL;
+		if (!of_property_present(mem, "no-map") || of_address_to_resource(mem, 0, &res)) {
+			of_node_put(mem);
+			return -EINVAL;
+		}
+		of_node_put(mem);
+		size = resource_size(&res);
+		if (!size || size > SZ_256M || !IS_ALIGNED(res.start, SZ_16K) ||
+		    !IS_ALIGNED(size, SZ_16K))
+			return -EINVAL;
+		for (off = 0; off < size; off += SZ_16K) {
+			if (iommu_iova_to_phys(domain, iovas[i] + off) != res.start + off) {
+				dev_err(dev, "dcpext %s mapping mismatch at %#llx; CPU untouched\n",
+					names[i], iovas[i] + off);
+				return -EINVAL;
+			}
+		}
+		dev_info(dev, "dcpext verified %s: %pa + %#llx at %#llx\n",
+			 names[i], &res.start, size, iovas[i]);
+	}
+	return 0;
+}
+
+static ssize_t dcpext_start_store(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	bool start;
+	int ret = kstrtobool(buf, &start);
+
+	if (ret || !start)
+		return -EINVAL;
+	/* Serialize the one-shot handoff with idle system suspend. */
+	guard(mutex)(&dcp->hpd_mutex);
+	if (READ_ONCE(dcp->external_suspended))
+		return -EBUSY;
+	if (!dcp_v14_session)
+		return -EAGAIN;
+	if (atomic_cmpxchg(&dcp->external_requested, 0, 1))
+		return -EBUSY;
+	/* Keep code and firmware callbacks alive after this one-shot request. */
+	__module_get(THIS_MODULE);
+	schedule_work(&dcp->external_work);
+	return count;
+}
+static DEVICE_ATTR_WO(dcpext_start);
+
+static struct attribute *dcpext_attrs[] = { &dev_attr_dcpext_start.attr, NULL };
+static const struct attribute_group dcpext_group = { .attrs = dcpext_attrs };
+
+static void dcpext_cancel(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	cancel_work_sync(&dcp->external_work);
+}
+
+int iomfb_v14_7_external_start(struct apple_dcp *dcp)
+{
+	int ret;
+
+	/* This path does not run component bind, which sets the panel's mask.
+	 * The external DART window also starts above 1 TiB.
+	 */
+	ret = dma_set_mask_and_coherent(dcp->dev, DMA_BIT_MASK(42));
+	if (ret)
+		return dev_err_probe(dcp->dev, ret, "dcpext requires 42-bit DMA\n");
+	ret = dcpext_verify_memory(dcp);
+	if (ret)
+		return ret;
+	atomic_set(&dcp->external_requested, 0);
+	INIT_WORK(&dcp->external_work, dcpext_bringup);
+	ret = devm_add_action_or_reset(dcp->dev, dcpext_cancel, dcp);
+	if (ret)
+		return ret;
+	ret = devm_device_add_group(dcp->dev, &dcpext_group);
+	if (!ret)
+		dev_info(dcp->dev, "dcpext memory verified; waiting for explicit dcpext_start\n");
+	return ret;
+}
+
+/* Refuse startup unless both the hardware floor and PMP vote are in place. */
+static int dcpext_check_power(struct apple_dcp *dcp)
+{
+	struct device *dev = dcp->dev;
+	struct device_node *ps, *entry;
+	struct regmap *map;
+	const char *label;
+	u32 offset, value;
+	int ret;
+
+	ps = of_parse_phandle(dev->of_node, "power-domains", 0);
+	if (!ps)
+		return -ENODEV;
+	ret = of_property_read_string(ps, "label", &label);
+	if (ret || strcmp(label, "dispext0_cpu")) {
+		of_node_put(ps);
+		return -EINVAL;
+	}
+	ret = of_property_read_u32(ps, "reg", &offset);
+	map = syscon_node_to_regmap(ps->parent);
+	of_node_put(ps);
+	if (ret)
+		return ret;
+	if (IS_ERR(map))
+		return PTR_ERR(map);
+	ret = regmap_read(map, offset, &value);
+	if (ret)
+		return ret;
+	if (((value >> 16) & 0xf) != 0xf || ((value >> 4) & 0xf) != 0xf)
+		return dev_err_probe(dev, -EIO,
+			"dcpext power floor is not active: %#x\n", value);
+
+	entry = of_parse_phandle(dev->of_node, "apple,pmp-report", 0);
+	if (!entry)
+		return -ENODEV;
+	ret = apple_pmp_report_wait_ready(entry, DCP_V14_PMP_TIMEOUT);
+	of_node_put(entry);
+	return ret;
+}
+
+static void dcpext_bringup(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp, external_work);
+	struct apple_dcp_v14 *v14;
+	struct device *dev = dcp->dev;
+	struct resource *res;
+	struct apple_rtkit *rtk;
+	u32 control;
+	int ret, n;
+
+	ret = dcpext_check_power(dcp);
+	if (ret) {
+		dev_err(dev, "dcpext startup refused: power prerequisites failed: %d\n", ret);
+		return;
+	}
+	dev_info(dev, "dcpext CPU power floor active and PMP request acknowledged\n");
+
+	res = platform_get_resource_byname(to_platform_device(dev),
+					   IORESOURCE_MEM, "coproc");
+	if (!res) {
+		dev_err(dev, "dcpext has no coproc register\n");
+		return;
+	}
+	dcp->coproc_reg = devm_ioremap_resource(dev, res);
+	if (IS_ERR(dcp->coproc_reg)) {
+		dev_err(dev, "dcpext coproc map failed: %ld\n",
+			PTR_ERR(dcp->coproc_reg));
+		dcp->coproc_reg = NULL;
+		return;
+	}
+
+	control = readl(dcp->coproc_reg + DCP_V14_CPU_CONTROL);
+	dev_info(dev, "dcpext CPU control %#x\n", control);
+	ret = dcpext_verify_memory(dcp);
+	if (ret)
+		return;
+
+	v14 = kzalloc_obj(*v14);
+	if (!v14)
+		return;
+	v14->dev = dev;
+	v14->dcp = dcp;
+	mutex_init(&v14->lock);
+	INIT_WORK(&v14->idle_work, dcp_v14_idle);
+	dcp->v14 = v14;
+	dcp_v14_link_init(&v14->link, dev, NULL);
+
+	rtk = apple_rtkit_init(dev, v14, "mbox", 0, &dcp_v14_rtkit_ops);
+	if (IS_ERR(rtk)) {
+		dev_err(dev, "dcpext RTKit init failed: %ld\n", PTR_ERR(rtk));
+		return;
+	}
+	v14->rtk = rtk;
+	v14->link.rtk = rtk;
+	dcp->rtk = rtk;
+
+	if (!(control & APPLE_DCP_COPROC_CPU_CONTROL_RUN)) {
+		writel(control | APPLE_DCP_COPROC_CPU_CONTROL_RUN,
+		       dcp->coproc_reg + DCP_V14_CPU_CONTROL);
+		dev_info(dev, "dcpext CPU started by explicit request\n");
+	}
+	ret = apple_rtkit_wake(rtk);
+	for (n = 0; ret == -ETIME && n < DCP_V14_RTKIT_RETRIES; n++)
+		ret = apple_rtkit_boot(rtk);
+	if (ret) {
+		dev_err(dev, "dcpext RTKit did not wake: %d\n", ret);
+		return;
+	}
+
+	dev_info(dev, "dcpext RTKit session running\n");
+	if (apple_rtkit_has_endpoint(rtk, DPAV_CTRL_ENDPOINT))
+		dpav_ctrl_init(dcp);
+	if (apple_rtkit_has_endpoint(rtk, DPTX_ENDPOINT))
+		dptxep_init(dcp);
+	/* External mode discovery only; this does not power or modeset a display. */
+	if (apple_rtkit_has_endpoint(rtk, DISP0_ENDPOINT)) {
+		ret = ibootep_init(dcp);
+		if (ret)
+			dev_err(dev, "dcpext mode-query endpoint failed: %d\n", ret);
+	}
+}
+
+int iomfb_v14_7_bind(struct apple_dcp *dcp)
+{
+	struct apple_dcp_v14 *v14 = dcp->v14;
+	struct device *dev = dcp->dev;
+	struct apple_rtkit *rtk;
+	u32 control, status;
+	struct clk *clk;
+	int ret, n;
+
+	if (!v14)
+		return -ENODEV;
+	if (v14->rtk || dcp_v14_session)
+		return dev_err_probe(dev, -EBUSY,
+				     "T6030 display not started: an earlier DCP session is kept; reboot to restart the display\n");
+
+	control = readl(dcp->coproc_reg + DCP_V14_CPU_CONTROL);
+	status = readl(dcp->coproc_reg + DCP_V14_CPU_STATUS);
+	dev_info(dev, "DCP CPU control %#x status %#x\n", control, status);
+	if (!(control & APPLE_DCP_COPROC_CPU_CONTROL_RUN))
+		return dev_err_probe(dev, -EBUSY,
+				     "T6030 display not started: the DCP CPU is stopped, and interrupted firmware is never resumed\n");
+
+	ret = dcp_v14_geometry(v14);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "T6030 display not started: no usable boot framebuffer\n");
+	clk = clk_get(dev, NULL);
+	if (IS_ERR(clk))
+		return dev_err_probe(dev, PTR_ERR(clk),
+				     "T6030 display not started: no display clock\n");
+	v14->clock_rate = clk_get_rate(clk);
+	clk_put(clk);
+	if (!v14->clock_rate)
+		return dev_err_probe(dev, -EINVAL,
+				     "T6030 display not started: the display clock has no rate\n");
+
+	dcp_v14_link_init(&v14->link, dev, NULL);
+	rtk = apple_rtkit_init(dev, v14, "mbox", 0, &dcp_v14_rtkit_ops);
+	if (IS_ERR(rtk))
+		return dev_err_probe(dev, PTR_ERR(rtk),
+				     "T6030 display not started: RTKit init failed\n");
+	/* From here nothing is freed and the module stays loaded. */
+	v14->rtk = rtk;
+	v14->link.rtk = rtk;
+	dcp->rtk = rtk;
+	dcp_v14_session = true;
+	__module_get(THIS_MODULE);
+
+	ret = apple_rtkit_wake(rtk);
+	for (n = 0; ret == -ETIME && n < DCP_V14_RTKIT_RETRIES; n++)
+		ret = apple_rtkit_boot(rtk);
+	if (ret) {
+		v14->failed = true;
+		return dev_err_probe(dev, ret,
+				     "T6030 display not started: the DCP RTKit session did not wake; the boot framebuffer stays\n");
+	}
+	dev_info(dev, "DCP RTKit session running\n");
+	/* The internal panel uses IOMFB only; dock DPTX belongs to dcpext. */
+	return 0;
+}
+
+void iomfb_v14_7_unbind(struct apple_dcp *dcp)
+{
+	struct apple_dcp_v14 *v14 = dcp->v14;
+
+	dcp->active = false;
+	dcp_mode_set_valid(&dcp->mode_state, false);
+	if (!v14)
+		return;
+	WRITE_ONCE(v14->dcp, NULL);
+	if (v14->rtk)
+		dev_info(dcp->dev, "display unbound; the DCP session and its buffers are kept until reboot\n");
+}
+
+static int dcp_v14_status_show(struct seq_file *m, void *unused)
+{
+	struct apple_dcp_v14 *v14 = m->private;
+	struct drm_framebuffer *fb;
+	int ret;
+
+	ret = mutex_lock_interruptible(&v14->lock);
+	if (ret)
+		return ret;
+	fb = v14->active_fb;
+	seq_printf(m, "started %d\nfailed %d\nswaps %llu\nswap_max_us %llu\n",
+		   v14->started, v14->failed, v14->swaps, v14->swap_ns_max / NSEC_PER_USEC);
+	seq_printf(m, "active_fb %u\nimported %d\n", fb ? fb->base.id : 0,
+		   fb && fb->obj[0]->import_attach);
+	seq_printf(m, "panel %ux%u\nboot_fb %ux%u stride %u\nclock %llu\n",
+		   v14->panel_width, v14->panel_height, v14->fb_width, v14->fb_height,
+		   v14->stride, v14->clock_rate);
+	seq_printf(m, "buffers %u bytes %llu\nproperties %u raw %u\nanalytics %llu\n",
+		   v14->buffer_count, v14->buffer_bytes, v14->property_count, v14->raw_count,
+		   v14->analytics);
+	mutex_unlock(&v14->lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(dcp_v14_status);
+
+/* One mode: the native timing of the boot panel, less the hidden notch rows. */
+static int dcp_v14_mode(struct apple_dcp *dcp, struct apple_dcp_v14 *v14)
+{
+	struct dcp_display_mode *modes, *best = NULL;
+	struct dcp_parse_ctx ctx;
+	unsigned int count, i;
+	void *blob = NULL;
+	u32 size = 0;
+	int ret;
+
+	for (i = 0; i < v14->raw_count; i++) {
+		if (!v14->raw[i].service && !strcmp(v14->raw[i].key, "PreferredTimingElements")) {
+			size = v14->raw[i].size;
+			blob = v14->raw[i].data;
+			break;
+		}
+	}
+	if (!blob)
+		return -ENODATA;
+	ret = parse(blob, size, &ctx);
+	if (ret)
+		return ret;
+	ctx.dcp = dcp;
+	modes = enumerate_modes(&ctx, &count, dcp->panel.width_mm, dcp->panel.height_mm,
+				dcp->notch_height, true);
+	if (IS_ERR(modes))
+		return PTR_ERR(modes);
+	for (i = 0; i < count; i++) {
+		struct drm_display_mode *m = &modes[i].mode;
+		int hz = drm_mode_vrefresh(m);
+
+		dev_dbg(dcp->dev, "timing %u/%u: " DRM_MODE_FMT "%s\n", i + 1, count,
+			DRM_MODE_ARG(m), m->type & DRM_MODE_TYPE_PREFERRED ? " best" : "");
+		if (m->hdisplay != v14->panel_width ||
+		    m->vdisplay != v14->panel_height - dcp->notch_height ||
+		    (hz != 60 && hz != 120))
+			continue;
+		if (!best || (m->type & DRM_MODE_TYPE_PREFERRED))
+			best = &modes[i];
+	}
+	if (!best) {
+		dev_err(dcp->dev, "no %ux%u timing at 60 or 120 Hz among %u\n", v14->panel_width,
+			v14->panel_height - dcp->notch_height, count);
+		kfree(modes);
+		return -EINVAL;
+	}
+	best->mode.type |= DRM_MODE_TYPE_PREFERRED;
+	dcp->modes = kmemdup(best, sizeof(*best), GFP_KERNEL);
+	kfree(modes);
+	if (!dcp->modes)
+		return -ENOMEM;
+	dcp->nr_modes = 1;
+	return 0;
+}
+
+int iomfb_v14_7_start(struct apple_dcp *dcp)
+{
+	struct apple_dcp_v14 *v14 = dcp->v14;
+	const struct drm_display_mode *mode;
+	const char *step;
+	int ret;
+
+	if (!v14 || !v14->rtk || v14->failed || v14->started)
+		return -ENODEV;
+
+	step = "DCPLink";
+	ret = dcp_v14_link_start(&v14->link);
+	if (ret)
+		goto fail;
+
+	mutex_lock(&v14->lock);
+	step = "start signal";
+	ret = dcp_v14_simple_call(v14, A(401), false, true, true);
+	if (!ret) {
+		step = "first client open";
+		ret = dcp_v14_simple_call(v14, A(455), false, false, false);
+	}
+	mutex_unlock(&v14->lock);
+	if (ret)
+		goto fail;
+	dcp_v14_link_set_idle_work(&v14->link, &v14->idle_work);
+
+	step = "panel mode";
+	mutex_lock(&v14->lock);
+	ret = dcp_v14_mode(dcp, v14);
+	mutex_unlock(&v14->lock);
+	if (ret)
+		goto fail;
+
+	v14->started = true;
+	/* Never removed, like the session it describes. */
+	debugfs_create_file("dcp-t6030", 0400, NULL, v14, &dcp_v14_status_fops);
+	dcp->connector->connected = true;
+	dcp_set_dimensions(dcp);
+	dcp_mode_set_valid(&dcp->mode_state, true);
+	dcp->active = true;
+	complete(&dcp->start_done);
+
+	mode = &dcp->modes[0].mode;
+	dev_info(dcp->dev, "T6030 display started: %ux%u@%d, %u notch rows %s, %ux%u mm\n",
+		 mode->hdisplay, mode->vdisplay, drm_mode_vrefresh(mode),
+		 dcp->notch_height ?: v14->panel_height - v14->fb_height,
+		 dcp->notch_height ? "hidden" : "shown", mode->width_mm, mode->height_mm);
+	return 0;
+fail:
+	v14->failed = true;
+	dev_err(dcp->dev,
+		"T6030 display not started: %s failed: %d; the boot framebuffer stays (reboot to retry)\n",
+		step, ret);
+	return ret;
+}
+
+/* Swap start, then the swap; returns once the firmware completed that swap. */
+static int dcp_v14_swap(struct apple_dcp_v14 *v14, const u8 *surface, u64 iova,
+			u32 width, u32 height, u32 dst_y)
+{
+	__le32 start[4] = {}, started[2], result[3];
+	u8 *swap;
+	u32 id;
+	int ret;
+
+	if (surface && (!iova || !width || width > v14->panel_width || !height ||
+			dst_y > v14->panel_height || height > v14->panel_height - dst_y))
+		return -EINVAL;
+	swap = kmalloc(DCP_V14_SWAP_SIZE, GFP_KERNEL);
+	if (!swap)
+		return -ENOMEM;
+
+	mutex_lock(&v14->lock);
+	ret = dcp_v14_call(v14, A(406), start, sizeof(start), started, sizeof(started), 0);
+	if (!ret && le32_to_cpu(started[1]))
+		ret = -EIO;
+	id = le32_to_cpu(started[0]);
+	if (!ret && !id)
+		ret = -EPROTO;
+	if (!ret) {
+		dcp_v14_encode_swap(swap, id, DCP_V14_BLACK, surface, iova, width, height,
+				    dst_y, DCP_V14_LAYER);
+		ret = dcp_v14_call(v14, A(407), swap, DCP_V14_SWAP_SIZE, result, sizeof(result),
+				   id);
+		/* The swap status sits at byte 5 of the reply. */
+		if (!ret && get_unaligned_le32((u8 *)result + 5))
+			ret = -EIO;
+	}
+	if (ret)
+		v14->failed = true;
+	mutex_unlock(&v14->lock);
+
+	kfree(swap);
+	return ret;
+}
+
+/* Shows @fb (or only the black background) and keeps it until the next swap. */
+static bool dcp_v14_present(struct apple_dcp_v14 *v14, struct drm_framebuffer *fb, u32 dst_y)
+{
+	u8 surface[DCP_V14_SURFACE_SIZE];
+	struct drm_framebuffer *old;
+	u64 iova = 0, start, elapsed, swaps;
+	int ret;
+
+	if (READ_ONCE(v14->failed))
+		return false;
+	if (fb) {
+		drm_framebuffer_get(fb);
+		dcp_v14_encode_surface(surface, fb->pitches[0], fb->width, fb->height,
+				       fb->format->format == DRM_FORMAT_XRGB8888);
+		iova = drm_fb_dma_get_gem_obj(fb, 0)->dma_addr;
+	}
+	start = ktime_get_ns();
+	ret = dcp_v14_swap(v14, fb ? surface : NULL, iova, fb ? fb->width : 0,
+			   fb ? fb->height : 0, dst_y);
+	elapsed = ktime_get_ns() - start;
+	if (ret) {
+		/* Either framebuffer may still be scanned out: keep both. */
+		dev_err(v14->dev, "native DCP flip failed %d; buffers pinned until reboot\n", ret);
+		return false;
+	}
+	mutex_lock(&v14->lock);
+	old = v14->active_fb;
+	v14->active_fb = fb;
+	swaps = ++v14->swaps;
+	v14->swap_ns_max = max(v14->swap_ns_max, elapsed);
+	mutex_unlock(&v14->lock);
+	if (old)
+		drm_framebuffer_put(old);
+	if (swaps <= 3)
+		dev_info(v14->dev, "swap %llu complete: surface %d, imported %d, %llu us\n",
+			 swaps, !!fb, fb && fb->obj[0]->import_attach, elapsed / NSEC_PER_USEC);
+	return true;
+}
+
+/* Releases helper waiters without reporting a completed flip. */
+static void dcp_v14_cancel_event(struct apple_dcp *dcp)
+{
+	struct apple_crtc *crtc = dcp->crtc;
+	struct drm_pending_vblank_event *event;
+	unsigned long flags;
+
+	spin_lock_irqsave(&crtc->base.dev->event_lock, flags);
+	event = crtc->event;
+	crtc->event = NULL;
+	spin_unlock_irqrestore(&crtc->base.dev->event_lock, flags);
+	if (!event)
+		return;
+	if (event->base.fence) {
+		dma_fence_set_error(event->base.fence, -EIO);
+		dma_fence_signal(event->base.fence);
+	}
+	if (event->base.completion) {
+		complete_all(event->base.completion);
+		if (event->base.completion_release)
+			event->base.completion_release(event->base.completion);
+		event->base.completion = NULL;
+	}
+	drm_event_cancel_free(crtc->base.dev, &event->base);
+}
+
+/* Only the layout the firmware was qualified with: one full-mode linear plane. */
+int iomfb_v14_7_atomic_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
+			     struct drm_atomic_state *state)
+{
+	struct apple_dcp_v14 *v14 = dcp->v14;
+	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+	struct drm_plane_state *p = drm_atomic_get_new_plane_state(state, crtc->primary);
+	struct drm_gem_dma_object *obj;
+	struct drm_framebuffer *fb;
+	u32 width, height;
+
+	if (dcp->crashed || !v14 || READ_ONCE(v14->failed))
+		return -EIO;
+	if (!crtc_state || !crtc_state->active || !p || p->crtc != crtc || !p->visible)
+		return 0;
+
+	fb = p->fb;
+	width = crtc_state->mode.hdisplay;
+	height = crtc_state->mode.vdisplay;
+	if (fb->format->format != DRM_FORMAT_XRGB8888 &&
+	    fb->format->format != DRM_FORMAT_ARGB8888)
+		return -EINVAL;
+	if (fb->modifier != DRM_FORMAT_MOD_LINEAR || fb->offsets[0] ||
+	    fb->pitches[0] < width * 4 || (fb->pitches[0] & 63))
+		return -EINVAL;
+	if (p->src_x || p->src_y || p->crtc_x || p->crtc_y ||
+	    p->src_w != width << 16 || p->src_h != height << 16 ||
+	    p->crtc_w != width || p->crtc_h != height ||
+	    fb->width != width || fb->height != height)
+		return -EINVAL;
+	obj = drm_fb_dma_get_gem_obj(fb, 0);
+	if (!obj || !obj->dma_addr || (u64)fb->pitches[0] * height > obj->base.size)
+		return -EINVAL;
+	return 0;
+}
+
+int iomfb_v14_7_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state)
+{
+	/* The firmware keeps the timing it booted with, which is the only mode. */
+	if (!lookup_mode(dcp, &crtc_state->mode))
+		return -EINVAL;
+	dcp_mode_set_valid(&dcp->mode_state, true);
+	return 0;
+}
+
+void iomfb_v14_7_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
+		       struct drm_atomic_state *state)
+{
+	struct drm_plane_state *p = drm_atomic_get_new_plane_state(state, crtc->primary);
+	struct drm_framebuffer *fb;
+
+	if (!p)
+		p = crtc->primary->state;
+	fb = p && p->visible ? p->fb : NULL;
+	dcp->swap_start = ktime_get();
+	if (dcp->v14 && dcp_v14_present(dcp->v14, fb, dcp->notch_height))
+		dcp_drm_crtc_page_flip(dcp, ktime_get());
+	else
+		dcp_v14_cancel_event(dcp);
+}
+
+void iomfb_v14_7_poweron(struct apple_dcp *dcp)
+{
+	/* The panel stays on; the next swap shows the plane again. */
+}
+
+void iomfb_v14_7_poweroff(struct apple_dcp *dcp)
+{
+	/* Blank to black; the panel and the DCP stay powered. */
+	if (dcp->v14 && dcp->v14->started)
+		dcp_v14_present(dcp->v14, NULL, 0);
+}

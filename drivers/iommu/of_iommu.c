@@ -237,23 +237,33 @@ void of_iommu_get_resv_regions(struct device *dev, struct list_head *list)
 		end = maps + size / sizeof(__be32);
 
 		while (maps < end) {
-			struct device_node *np;
+			struct device_node *np __free(device_node) = NULL;
+			phys_addr_t iova;
+			size_t length;
 			u32 phandle;
 
 			phandle = be32_to_cpup(maps++);
 			np = of_find_node_by_phandle(phandle);
+			if (!np) {
+				dev_warn(dev, "Invalid iommu-addresses phandle %#x\n", phandle);
+				break;
+			}
+
+			/* Consume every tuple, including mappings owned by another device. */
+			maps = of_translate_dma_region(np, maps, &iova, &length);
+			if (!maps || maps > end) {
+				dev_warn(dev, "Invalid iommu-addresses translation\n");
+				break;
+			}
 
 			if (np == dev->of_node) {
 				int prot = IOMMU_READ | IOMMU_WRITE;
 				struct iommu_resv_region *region;
 				enum iommu_resv_type type;
-				phys_addr_t iova;
-				size_t length;
 
 				if (of_dma_is_coherent(dev->of_node))
 					prot |= IOMMU_CACHE;
 
-				maps = of_translate_dma_region(np, maps, &iova, &length);
 				if (length == 0) {
 					dev_warn(dev, "Cannot reserve IOVA region of 0 size\n");
 					continue;

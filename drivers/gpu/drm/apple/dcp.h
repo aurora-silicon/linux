@@ -50,6 +50,7 @@ bool dcp_typec_dual_stream(void);
 void dcp_typec_reorder(void);
 bool dcp_is_typec_only(struct platform_device *pdev);
 bool dcp_fw_compat_is_12_x(struct platform_device *pdev);
+bool dcp_fw_compat_is_14_7(struct platform_device *pdev);
 unsigned long* dcp_get_iomfb_surfaces(struct platform_device *pdev);
 void dcp_link(struct platform_device *pdev, struct apple_crtc *apple,
 	      struct apple_connector *connector);

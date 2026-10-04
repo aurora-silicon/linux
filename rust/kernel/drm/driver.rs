@@ -135,7 +135,12 @@ pub trait Driver {
 pub struct Registration<T: Driver>(ARef<drm::Device<T>>);
 
 impl<T: Driver> Registration<T> {
-    fn new(drm: &drm::Device<T>, flags: usize) -> Result<Self> {
+    /// Register a DRM device with an explicitly owned lifetime.
+    ///
+    /// Dropping the returned registration prevents new opens. Existing files
+    /// can retain the device, so the driver must separately reject operations
+    /// after its hardware runtime has been removed.
+    pub fn new(drm: &drm::Device<T>, flags: usize) -> Result<Self> {
         // SAFETY: `drm.as_raw()` is valid by the invariants of `drm::Device`.
         to_result(unsafe { bindings::drm_dev_register(drm.as_raw(), flags) })?;
 

@@ -228,7 +228,9 @@ impl super::QueueInner::ver {
         frg_user_timestamps.end = common::get_timestamp_object(objects, cmdbuf.ts_frag.end)?;
 
         let gpu = match (*self.dev)
-            .gpu
+            .gpu()?
+            .legacy_manager()
+            .ok_or(EIO)?
             .as_any()
             .downcast_ref::<gpu::GpuManager::ver>()
         {

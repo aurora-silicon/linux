@@ -264,6 +264,7 @@ void thermal_cooling_device_update(struct thermal_cooling_device *);
 void thermal_cooling_device_unregister(struct thermal_cooling_device *);
 struct thermal_zone_device *thermal_zone_get_zone_by_name(const char *name);
 int thermal_zone_get_temp(struct thermal_zone_device *tz, int *temp);
+int thermal_zone_get_temp_by_name(const char *name, int *temp);
 int thermal_zone_get_slope(struct thermal_zone_device *tz);
 int thermal_zone_get_offset(struct thermal_zone_device *tz);
 bool thermal_trip_is_bound_to_cdev(struct thermal_zone_device *tz,
@@ -325,6 +326,8 @@ static inline struct thermal_zone_device *thermal_zone_get_zone_by_name(
 { return ERR_PTR(-ENODEV); }
 static inline int thermal_zone_get_temp(
 		struct thermal_zone_device *tz, int *temp)
+{ return -ENODEV; }
+static inline int thermal_zone_get_temp_by_name(const char *name, int *temp)
 { return -ENODEV; }
 static inline int thermal_zone_get_slope(
 		struct thermal_zone_device *tz)

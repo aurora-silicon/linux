@@ -46,11 +46,12 @@ const fn iomaps(mcc_count: usize, has_die1: bool) -> [Option<IOMapping>; 20] {
 pub(crate) const HWCONFIG_T6002: super::HwConfig = HwConfig {
     chip_id: 0x6002,
     gpu_gen: GpuGen::G13,
-    gpu_variant: GpuVariant::D,
-    gpu_core: GpuCore::G13C,
+    gpu_variant: GpuVariant::C,
+    gpu_core: Some(GpuCore::G13C),
 
     base_clock_hz: 24_000_000,
     uat_oas: 42,
+    uat_ias: 39,
     num_dies: 2,
     max_num_clusters: 8,
     max_num_cores: 8,
@@ -136,7 +137,7 @@ pub(crate) const HWCONFIG_T6002: super::HwConfig = HwConfig {
 pub(crate) const HWCONFIG_T6001: super::HwConfig = HwConfig {
     chip_id: 0x6001,
     gpu_variant: GpuVariant::C,
-    gpu_core: GpuCore::G13C,
+    gpu_core: Some(GpuCore::G13C),
 
     num_dies: 1,
     max_num_clusters: 4,
@@ -150,7 +151,7 @@ pub(crate) const HWCONFIG_T6001: super::HwConfig = HwConfig {
 pub(crate) const HWCONFIG_T6000: super::HwConfig = HwConfig {
     chip_id: 0x6000,
     gpu_variant: GpuVariant::S,
-    gpu_core: GpuCore::G13S,
+    gpu_core: Some(GpuCore::G13S),
 
     max_num_clusters: 2,
     fast_sensor_mask: [0x8080, 0],

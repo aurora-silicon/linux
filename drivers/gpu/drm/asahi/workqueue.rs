@@ -130,7 +130,11 @@ impl Drop for GpuContext {
     fn drop(&mut self) {
         mod_dev_dbg!(self.dev, "GpuContext: Freeing GPU context\n");
         let data = self.data.take().unwrap();
-        (*self.dev).gpu.free_context(data);
+        if let Ok(gpu) = (*self.dev).gpu() {
+            gpu.free_context(data);
+        }
+        // Without a published backend this is constructor unwind: the context
+        // never reached firmware and its owned allocation drops normally.
     }
 }
 
@@ -514,14 +518,42 @@ impl<'a> JobSubmission::ver<'a> {
         let event = inner.event.as_mut().expect("JobSubmission lost its event");
 
         let event_slot = event.0.slot();
+        // The 14.x pipe entry timestamp is in 24 MHz system counter ticks. The firmware uses it
+        // only for its utilisation histogram, which runs once power management is on (HwDataB
+        // +0xa38/+0xa40); a nanosecond value there is about 41x too large.
+        #[ver(V >= V14_8_3)]
+        let _now_ticks: u64 = {
+            let v: u64;
+            // SAFETY: CNTVCT_EL0 is readable at EL1 and the read has no side effects.
+            unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v) };
+            v
+        };
 
         let msg = fw::channels::RunWorkQueueMsg::ver {
+            #[ver(V < V14_8_3)]
             pipe_type: inner.pipe_type,
+            // Host counter ticks at encode time (0 was dequeued and not retired).
+            #[ver(V >= V14_8_3)]
+            timestamp: U64(_now_ticks),
             work_queue: Some(inner.info.weak_pointer()),
+            #[ver(V < V14_8_3)]
             wptr: inner.wptr,
+            #[ver(V < V14_8_3)]
             event_slot,
+            #[ver(V < V14_8_3)]
             is_new: inner.new,
+            #[ver(V < V14_8_3)]
             __pad: Default::default(),
+            // 14.x pipe entry: command type 2 for compute (CL) submissions and 0 for the
+            // vertex (TA) pipe, which is PipeType's own discriminant.
+            #[ver(V >= V14_8_3)]
+            cmd_type: inner.pipe_type as u32,
+            #[ver(V >= V14_8_3)]
+            wptr: inner.wptr as u16,
+            #[ver(V >= V14_8_3)]
+            event_slot: event_slot as u8,
+            #[ver(V >= V14_8_3)]
+            is_new: inner.new as u8,
         };
         channel.send(&msg);
         inner.new = false;
@@ -681,6 +713,10 @@ impl WorkQueue::ver {
                         state: inner.state.gpu_pointer(),
                         ring: inner.ring.gpu_pointer(),
                         notifier_list: inner.notifier_list.gpu_pointer(),
+                        // G15: scratch lives inside this object at +0xb0.
+                        #[ver(V >= V14_8_3)]
+                        gpu_buf: unsafe { _p.offset(0xb0, core::ptr::null::<&[u8]>()).upgrade() },
+                        #[ver(V < V14_8_3)]
                         gpu_buf: inner.gpu_buf.gpu_pointer(),
                         gpu_rptr1: Default::default(),
                         gpu_rptr2: Default::default(),
@@ -702,10 +738,15 @@ impl WorkQueue::ver {
                         unk_94: 0,
                         pending: Default::default(),
                         unk_9c: 0,
+                        #[ver(V >= V14_8_3)]
+                        unk_a0: 0,
                         gpu_context: inner.gpu_context.gpu_pointer(),
                         unk_a8: Default::default(),
                         #[ver(V >= V13_2 && G < G14X)]
                         unk_b0: 0,
+                        // In-place so the 0x240c-byte scratch is not built on the stack.
+                        #[ver(V >= V14_8_3)]
+                        fw_scratch <- pin_init::init_zeroed(),
                     })
                 },
             )?,
@@ -738,6 +779,38 @@ impl WorkQueue::ver {
             }),
             GFP_KERNEL,
         )
+    }
+
+    /// Host-memory stamp word for the queue's current event, if it holds one.
+    /// Only the G15 self-test calls this, so other versions see it as unused.
+    #[allow(dead_code)]
+    pub(crate) fn stamp_raw(&self) -> Option<u32> {
+        let inner = self.inner.lock();
+        inner.event.as_ref().map(|ev| ev.0.current().raw())
+    }
+
+    /// Firmware-private stamp word for the queue's current event.
+    #[allow(dead_code)]
+    pub(crate) fn fw_stamp_raw(&self) -> Option<u32> {
+        let inner = self.inner.lock();
+        inner.event.as_ref().map(|ev| ev.0.fw_current())
+    }
+
+    /// Work-ring pointers the firmware walks after consuming a pipe kick.
+    /// `(queue VA, ring[0], done, gpu_rptr, cpu_wptr, size)`.
+    #[allow(dead_code)]
+    pub(crate) fn ring_snapshot(&self) -> (u64, u64, u32, u32, u32, u32) {
+        let inner = self.inner.lock();
+        let (done, gpu_rptr, cpu_wptr, size) = inner.info.state.with(|raw, _inner| {
+            (
+                raw.gpu_doneptr.load(Ordering::Acquire),
+                raw.gpu_rptr.load(Ordering::Acquire),
+                raw.cpu_wptr.load(Ordering::Acquire),
+                raw.rb_size,
+            )
+        });
+        let ring0 = inner.info.ring[0];
+        (inner.info.gpu_va().get(), ring0, done, gpu_rptr, cpu_wptr, size)
     }
 
     pub(crate) fn event_info(&self) -> Option<QueueEventInfo::ver> {

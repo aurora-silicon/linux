@@ -21,6 +21,8 @@ use core::ops::{
     DerefMut, //
 };
 use kernel::{
+    sync::CondVarTimeoutResult,
+    time::msecs_to_jiffies,
     error::{
         code::*,
         Result, //
@@ -133,6 +135,11 @@ struct SlotAllocatorOuter<T: SlotItem> {
 
 /// A shared reference to a slot allocator instance.
 pub(crate) struct SlotAllocator<T: SlotItem>(Arc<SlotAllocatorOuter<T>>);
+
+/// How long a CONSTRAINED slot allocator waits for a slot before failing.
+/// Long enough for a client to exit and free one, short enough that a leaked
+/// binding produces an error instead of an unbounded block.
+const CONSTRAINED_SLOT_WAIT_MS: u32 = 2000;
 
 impl<T: SlotItem> SlotAllocator<T> {
     /// Creates a new `SlotAllocator`, with a fixed number of slots and arbitrary associated data.
@@ -261,6 +268,48 @@ impl<T: SlotItem> SlotAllocator<T> {
                         "{}: out of slots, blocking\n",
                         core::any::type_name::<Self>()
                     );
+                }
+                // A CONSTRAINED allocator must not wait forever. T8140 sets
+                // slot_limit to 1, so if the single user slot is held by a
+                // binding that is never released -- which a render abandoned
+                // after a timeout does, since its abandon path deliberately
+                // frees nothing -- every later client blocks here for the life
+                // of the runtime. Measured: a compute submitted after a failed
+                // render sits in this wait for 42 seconds and only leaves when
+                // a signal arrives, failing -512 ERESTARTSYS from exactly the
+                // wait_interruptible below.
+                //
+                // Transient contention still resolves: a slot freed by a
+                // client exiting wakes the condvar well inside the bound.
+                // Exhausting it means the holder is not coming back, and
+                // EBUSY is the honest answer. The unlimited case, which every
+                // non-T8140 configuration uses, keeps the original
+                // indefinite wait.
+                if inner.slot_limit != usize::MAX {
+                    if first {
+                        pr_warn!(
+                            "{}: out of slots with a limit of {}, waiting up to {}ms\n",
+                            core::any::type_name::<Self>(),
+                            inner.slot_limit,
+                            CONSTRAINED_SLOT_WAIT_MS,
+                        );
+                    }
+                    first = false;
+                    match self.0.cond.wait_interruptible_timeout(
+                        &mut inner,
+                        msecs_to_jiffies(CONSTRAINED_SLOT_WAIT_MS),
+                    ) {
+                        CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
+                        CondVarTimeoutResult::Timeout => {
+                            pr_warn!(
+                                "{}: no slot freed within {}ms; failing with EBUSY rather than blocking\n",
+                                core::any::type_name::<Self>(),
+                                CONSTRAINED_SLOT_WAIT_MS,
+                            );
+                            return Err(EBUSY);
+                        }
+                        CondVarTimeoutResult::Woken { .. } => continue,
+                    }
                 }
                 first = false;
                 if self.0.cond.wait_interruptible(&mut inner) {
