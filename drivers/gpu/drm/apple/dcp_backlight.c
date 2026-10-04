@@ -431,6 +431,18 @@ void apple_connector_backlight_sync(struct apple_connector *connector)
 	else if (!want && connector->bl_dev)
 		apple_connector_backlight_unregister(connector);
 
+	/* Attributes and HPD can arrive after the first swap on reconnect.
+	 * Replay a chosen level on the current pipeline, even on a static
+	 * desktop where userspace has no further commits to submit.
+	 */
+	if (want && READ_ONCE(connector->bl_level) >= 0) {
+		struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+		/* Publish the retained level before do_swap() consumes update. */
+		smp_store_release(&dcp->brightness.update, true);
+		schedule_work(&connector->bl_commit_wq);
+	}
+
 	mutex_unlock(&connector->bl_lock);
 }
 
