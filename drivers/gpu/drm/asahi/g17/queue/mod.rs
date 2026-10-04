@@ -21,7 +21,7 @@ use crate::{
 use core::ops::Range;
 use kernel::{
     c_str,
-    dma_fence::FenceContexts,
+    dma_fence::{FenceContexts, RawDmaFence},
     prelude::*,
     sync::{Arc, LockClassKey},
     xarray,
@@ -147,7 +147,24 @@ impl<B: Backend> Queue<B> {
             Validated::Compute { .. } => Engine::Compute,
         };
         let index = engine.index();
-        self.frontiers[index].retain(|(_, fences)| job::fence_status(&fences.completed) == 0);
+        // One earliest failed timestamp covers every prefix containing a later
+        // failure, without retaining the producer's packet or mappings.
+        let mut retained_timestamp_failure = false;
+        self.frontiers[index].retain(|(_, fences)| {
+            let status = job::fence_status(&fences.completed);
+            if status == 0 {
+                return true;
+            }
+            if engine == Engine::Compute
+                && status < 0
+                && fences.ready.raw() == fences.completed.raw()
+                && !retained_timestamp_failure
+            {
+                retained_timestamp_failure = true;
+                return true;
+            }
+            false
+        });
         self.frontiers[index].reserve(1, GFP_KERNEL)?;
         if engine == Engine::Compute {
             self.ensure_compute()?;
@@ -192,9 +209,32 @@ impl<B: Backend> Queue<B> {
             &[]
         };
         let count = frontier.len();
-        let mut dependencies = KVec::with_capacity(inputs.len() + count, GFP_KERNEL)?;
-        let mut checked_inputs = KVec::with_capacity(inputs.len(), GFP_KERNEL)?;
+        let timestamp_prefix = order.wait_through[index];
+        let timestamps = if engine == Engine::Compute && timestamp_prefix.is_some() {
+            let frontier = self.frontiers[index].as_slice();
+            let end = frontier
+                .partition_point(|(sequence, _)| Order::contains(timestamp_prefix, *sequence));
+            &frontier[..end]
+        } else {
+            &[]
+        };
+        let timestamp_count = timestamps
+            .iter()
+            .filter(|(_, fences)| fences.ready.raw() == fences.completed.raw())
+            .count();
+        let mut dependencies =
+            KVec::with_capacity(inputs.len() + count + timestamp_count, GFP_KERNEL)?;
+        let mut checked_inputs = KVec::with_capacity(inputs.len() + timestamp_count, GFP_KERNEL)?;
         let mut firmware = KVec::with_capacity(count, GFP_KERNEL)?;
+        // Same-engine parents order GPU execution, not the host's timestamp
+        // writes. Only timestamp publishers need these completion waits and
+        // status checks; ordinary compute keeps its existing queue ordering.
+        for (_, fences) in timestamps {
+            if fences.ready.raw() == fences.completed.raw() {
+                checked_inputs.push(fences.completed.clone(), GFP_KERNEL)?;
+                dependencies.push(fences.ready.clone(), GFP_KERNEL)?;
+            }
+        }
         for (_, fences) in frontier {
             dependencies.push(fences.ready.clone(), GFP_KERNEL)?;
             firmware.push(fences.completed.clone(), GFP_KERNEL)?;
