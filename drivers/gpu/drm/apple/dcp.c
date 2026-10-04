@@ -3073,6 +3073,11 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		disable_irq(dcp->hdmi_hpd_irq);
 
 	dcp_disable_typec_work(dcp, true);
+	/* RTKit is released after this unbind callback, and can still deliver
+	 * a final swap completion or hotplug while its receive queue drains.
+	 */
+	disable_delayed_work_sync(&dcp->swap_watchdog_wq);
+	disable_work_sync(&dcp->vblank_wq);
 	typec_mux_put(dcp->typec_mux);
 
 	if (dcp->fixed_connector_type == DRM_MODE_CONNECTOR_eDP) {
@@ -3136,9 +3141,6 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		of_platform_device_destroy(&dcp->piodma->dev, NULL);
 		dcp->piodma = NULL;
 	}
-
-	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
-	cancel_work_sync(&dcp->vblank_wq);
 
 	devm_clk_put(dev, dcp->clk);
 	dcp->clk = NULL;
