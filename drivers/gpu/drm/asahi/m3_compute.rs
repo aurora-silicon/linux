@@ -90,7 +90,7 @@ impl Compute {
         // include the USC_EXEC_BASE_CP register.
         let mut stream=[0u8;48];
         vm.read_bytes(control.base,&mut stream)?;
-        dev_info!(dev.as_ref(),"M3 client CDM bytes={:02x?}\n",stream);
+        crate::cls_dev_dbg!(Compute,dev,"M3 client CDM bytes={:02x?}\n",stream);
         agx_memory::publish();
         // Finish the write-combining page-table stores before broadcasting
         // the invalidation.
