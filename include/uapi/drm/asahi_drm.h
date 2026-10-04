@@ -195,17 +195,17 @@ struct drm_asahi_params_global {
 	/**
 	 * @usc_generation: Unified shader core (USC) ISA generation.
 	 *
-	 * This is 2 for G13/G14 and 3 for G15/G16/G17. It does not
-	 * distinguish the binary encoding groups within AGX3.
+	 * This is 2 for G13/G14 and 3 for G15. It does not distinguish the
+	 * binary encoding groups within AGX3.
 	 */
 	__u32 usc_generation;
 
 	/**
-	 * @gpu_hal_generation: Apple GPU HAL/command-stream generation.
+	 * @gpu_hal_generation: Apple GPU HAL/command-stream generation, a value
+	 * of enum drm_asahi_gpu_hal_generation.
 	 *
-	 * This is DRM_ASAHI_GPU_HAL_LEGACY for G13-G15,
-	 * DRM_ASAHI_GPU_HAL_200 for G16 and G17P/G17A, and
-	 * DRM_ASAHI_GPU_HAL_300 for G17G/G17S/G17C.
+	 * This kernel supports G13-G15 only and always reports
+	 * DRM_ASAHI_GPU_HAL_LEGACY.
 	 */
 	__u32 gpu_hal_generation;
 };
@@ -217,10 +217,10 @@ enum drm_asahi_gpu_hal_generation {
 	/** @DRM_ASAHI_GPU_HAL_LEGACY: GPU predates the numbered HAL generations. */
 	DRM_ASAHI_GPU_HAL_LEGACY = 0,
 
-	/** @DRM_ASAHI_GPU_HAL_200: Apple HAL200 command stream. */
+	/** @DRM_ASAHI_GPU_HAL_200: HAL200 command stream. Never reported by this kernel. */
 	DRM_ASAHI_GPU_HAL_200 = 200,
 
-	/** @DRM_ASAHI_GPU_HAL_300: Apple HAL300 command stream. */
+	/** @DRM_ASAHI_GPU_HAL_300: HAL300 command stream. Never reported by this kernel. */
 	DRM_ASAHI_GPU_HAL_300 = 300,
 };
 
@@ -248,7 +248,11 @@ enum drm_asahi_feature {
 	/** @DRM_ASAHI_FEATURE_VM_STATUS: GET_PARAMS VM_STATUS is supported. */
 	DRM_ASAHI_FEATURE_VM_STATUS = (1UL) << 1,
 
-	/** @DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES: QUEUE_LIMITS and reserved independent compute queues. */
+	/**
+	 * @DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES: GET_PARAMS group
+	 * DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS is available. This kernel never
+	 * sets this bit.
+	 */
 	DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES = (1UL) << 2,
 
 	/**
@@ -262,9 +266,10 @@ enum drm_asahi_feature {
 	 */
 	DRM_ASAHI_FEATURE_SCHEDULED_QUEUES = (1UL) << 3,
 
+	/* Bits 4 and 5 are reserved. This kernel never sets them. */
+
 	/** @DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY: Render commands may request
 	 * fragment-only dependencies with DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY.
-	 * Bits 4 and 5 are reserved by the M4 timestamp-copy capabilities.
 	 */
 	DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY = (1UL) << 6,
 
@@ -308,8 +313,9 @@ struct drm_asahi_vm_status {
  * @flags: Reserved, zero.
  * @pad: Reserved, zero.
  *
- * Independent compute execution is supported. Graphics work retains its own
- * engine scheduling constraints. Query does not allocate or reset anything.
+ * The query is available only when DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES is
+ * set, which this kernel never does; otherwise it fails with EINVAL. A query
+ * does not allocate or reset anything.
  */
 struct drm_asahi_queue_limits {
     __u32 max_queues;
@@ -322,7 +328,14 @@ struct drm_asahi_queue_limits {
  * struct drm_asahi_get_params - Arguments passed to DRM_IOCTL_ASAHI_GET_PARAMS
  */
 struct drm_asahi_get_params {
-	/** @param_group: 0 global properties, 1 VM status, 2 queue limits. */
+	/**
+	 * @param_group: Parameter group to fetch: 0 for struct
+	 * drm_asahi_params_global, DRM_ASAHI_PARAM_GROUP_VM_STATUS when
+	 * DRM_ASAHI_FEATURE_VM_STATUS is set, or
+	 * DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS when
+	 * DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES is set. Any other group, or a
+	 * group whose feature bit is clear, fails with EINVAL.
+	 */
 	__u32 param_group;
 
 	/** @pad: MBZ */
@@ -894,8 +907,9 @@ enum drm_asahi_render_flags {
 
 	/**
 	 * @DRM_ASAHI_RENDER_RSRC_SPEC_HI: The appended resource-specifier high
-	 * dwords are present. This flag lets old kernels report an unsupported
-	 * render payload instead of silently truncating 64-bit G17 values.
+	 * dwords are present. A kernel that cannot use them rejects the flag
+	 * instead of silently truncating the values. This kernel accepts it on
+	 * T6030 only.
 	 */
 	DRM_ASAHI_RENDER_RSRC_SPEC_HI = (1U << 4),
 
@@ -1250,12 +1264,7 @@ struct drm_asahi_cmd_render {
  * single compute command, although timestamps are at command granularity.
  */
 struct drm_asahi_cmd_compute {
-	/**
-	 * @flags: Combination of drm_asahi_compute_flags.
-	 *
-	 * The G17P add3 proof flag is a bring-up-only contract. It treats exactly
-	 * three compute attachments as input A, input B, and output respectively.
-	 */
+	/** @flags: Combination of drm_asahi_compute_flags. */
 	__u32 flags;
 
 	/** @sampler_count: Number of samplers in the sampler heap. */
@@ -1289,8 +1298,8 @@ struct drm_asahi_cmd_compute {
  */
 enum drm_asahi_compute_flags {
 	/**
-	 * @DRM_ASAHI_COMPUTE_G17P_ADD3_PROOF: Populate the retained G17P
-	 * three-buffer table from this command's three compute attachments.
+	 * @DRM_ASAHI_COMPUTE_G17P_ADD3_PROOF: Reserved. This kernel rejects
+	 * compute commands that set it.
 	 */
 	DRM_ASAHI_COMPUTE_G17P_ADD3_PROOF = (1L << 0),
 
