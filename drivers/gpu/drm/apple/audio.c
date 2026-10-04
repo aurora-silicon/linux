@@ -43,6 +43,7 @@ struct dcp_audio {
 	struct snd_jack *jack;
 	struct snd_pcm_substream *substream;
 	unsigned int open_cookie;
+	bool open_unplugged;
 
 	struct mutex data_lock;
 	bool dcp_connected; /// dcp status keep for delayed initialization
@@ -69,6 +70,32 @@ static const struct snd_pcm_hardware dcp_pcm_hw = {
 	.channels_max		= 16,
 	.buffer_bytes_max	= SIZE_MAX,
 	.period_bytes_min	= 4096, /* TODO */
+	.period_bytes_max	= SIZE_MAX,
+	.periods_min		= 2,
+	.periods_max		= UINT_MAX,
+};
+
+/*
+ * Without a sink the DCP has no audio elements to derive constraints from.
+ * Offer a plain stereo format so that the PCM can still be opened and
+ * configured, as HDMI PCMs on other platforms can. Userspace (PipeWire,
+ * PulseAudio) probes the PCM once when the card appears and drops the
+ * output for good if that fails, so a monitor attached later would never
+ * show up. Starting the stream still fails until a sink is connected.
+ */
+static const struct snd_pcm_hardware dcp_pcm_hw_unplugged = {
+	.info	 = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
+		   SNDRV_PCM_INFO_INTERLEAVED,
+	.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE |
+		   SNDRV_PCM_FMTBIT_S32_LE,
+	.rates			= SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_44100 |
+				  SNDRV_PCM_RATE_48000,
+	.rate_min		= 32000,
+	.rate_max		= 48000,
+	.channels_min		= 2,
+	.channels_max		= 2,
+	.buffer_bytes_max	= SIZE_MAX,
+	.period_bytes_min	= 4096,
 	.period_bytes_max	= SIZE_MAX,
 	.periods_min		= 2,
 	.periods_max		= UINT_MAX,
@@ -256,12 +283,14 @@ static int dcp_pcm_open(struct snd_pcm_substream *substream)
 		return ret;
 	}
 
-	if (!dcpaud->connected) {
-		mutex_unlock(&dcpaud->data_lock);
-		return -ENXIO;
-	}
+	dcpaud->open_unplugged = !dcpaud->connected;
 	dcpaud->open_cookie = dcpaud->connection_cookie;
 	mutex_unlock(&dcpaud->data_lock);
+
+	if (dcpaud->open_unplugged) {
+		hw = dcp_pcm_hw_unplugged;
+		goto refine;
+	}
 
 	ret = dcpaud_read_remote_info(dcpaud);
 	if (ret < 0)
@@ -278,6 +307,7 @@ static int dcp_pcm_open(struct snd_pcm_substream *substream)
 			    SNDRV_PCM_HW_PARAM_FORMAT, SNDRV_PCM_HW_PARAM_CHANNELS, -1);
 
 	hw = dcp_pcm_hw;
+refine:
 	hw.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
 			  SNDRV_PCM_INFO_INTERLEAVED;
 	hw.periods_min = 2;
@@ -299,6 +329,7 @@ static int dcp_pcm_close(struct snd_pcm_substream *substream)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
 	dcpaud->selected_chmap.channels = 0;
+	dcpaud->open_unplugged = false;
 
 	return snd_dmaengine_pcm_close(substream);
 }
@@ -320,6 +351,9 @@ static int dcp_pcm_hw_params(struct snd_pcm_substream *substream,
 	struct dma_slave_config slave_config;
 	struct dma_chan *chan = snd_dmaengine_pcm_get_chan(substream);
 	int ret;
+
+	if (dcpaud->open_unplugged)
+		return 0;
 
 	if (!dcpaud_connection_up(dcpaud))
 		return -ENXIO;
@@ -361,6 +395,10 @@ static int dcp_pcm_hw_free(struct snd_pcm_substream *substream)
 static int dcp_pcm_prepare(struct snd_pcm_substream *substream)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
+
+	/* alsa-lib prepares right after hw_params; see dcp_pcm_hw_unplugged */
+	if (dcpaud->open_unplugged)
+		return 0;
 
 	if (!dcpaud_connection_up(dcpaud))
 		return -ENXIO;
