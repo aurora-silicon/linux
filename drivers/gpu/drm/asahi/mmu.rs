@@ -1409,8 +1409,13 @@ impl Handoff {
     /// The guard releases exclusion on every return path, including errors.
     fn try_lock(&self) -> Result<HandoffGuard<'_>> {
         let start = Instant::<Monotonic>::now();
+        self.try_lock_until(|| start.elapsed() >= Delta::from_millis(100))
+    }
+
+    /// `try_lock` with a caller-supplied expiry test.
+    fn try_lock_until(&self, expired: impl FnMut() -> bool) -> Result<HandoffGuard<'_>> {
         if !crate::handoff_lock::acquire(&self.lock_ap, &self.lock_fw, &self.turn,
-            || start.elapsed() >= Delta::from_millis(100),
+            expired,
             || fsleep(Delta::from_micros(20))) {
             pr_err!("UAT handoff: firmware exclusion timed out; AP interest withdrawn\n");
             return Err(ETIMEDOUT);
@@ -1504,7 +1509,11 @@ pub(crate) fn check_handoff_guard() -> Result {
     handoff.lock_fw.store(1, Ordering::Release);
     for turn in [0, 1] {
         handoff.turn.store(turn, Ordering::Release);
-        if handoff.try_lock().err() != Some(ETIMEDOUT)
+        // Expire on the second poll instead of waiting out the 100 ms bound.
+        // Turn 1 then times out while yielding to the firmware, and turn 0
+        // while waiting for the firmware flag, so both timeout paths still run.
+        let mut polls = 0u32;
+        if handoff.try_lock_until(|| { polls += 1; polls >= 2 }).err() != Some(ETIMEDOUT)
             || handoff.lock_ap.load(Ordering::Acquire) != 0
             || handoff.lock_fw.load(Ordering::Acquire) != 1 { return Err(EIO); }
     }
