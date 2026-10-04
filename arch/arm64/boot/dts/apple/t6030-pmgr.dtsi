@@ -179,6 +179,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "disp_sys";
+		/* The bootloader leaves the internal display powered. */
+		apple,inherited-on;
 	};
 
 	ps_jpg: power-controller@1c8 {
@@ -349,6 +351,8 @@
 		#reset-cells = <0>;
 		label = "disp_fe";
 		power-domains = <&ps_disp_sys>;
+		/* The bootloader leaves the internal display powered. */
+		apple,inherited-on;
 	};
 
 	ps_spi0: power-controller@260 {
@@ -1267,6 +1271,8 @@
 		label = "disp_cpu";
 		power-domains = <&ps_disp_fe>;
 		apple,min-state = <4>;
+		/* The bootloader leaves the internal display powered. */
+		apple,inherited-on;
 	};
 };
 

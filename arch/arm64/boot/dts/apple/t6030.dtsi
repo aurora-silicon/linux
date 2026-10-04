@@ -1424,6 +1424,12 @@
 			power-domains = <&ps_atc0_usb>;
 		};
 
+		atcphy0_xbar: mux@70304c000 {
+			compatible = "apple,t6020-display-crossbar";
+			reg = <0x7 0x0304c000 0x0 0x4000>;
+			#mux-control-cells = <1>;
+		};
+
 		dwc3_1: usb@b02280000 {
 			compatible = "apple,t6030-dwc3", "apple,t8103-dwc3";
 			reg = <0xb 0x02280000 0x0 0xcd00>, <0xb 0x0228cd00 0x0 0x3200>;
@@ -1536,3 +1542,4 @@
 #include "t6030-pmgr.dtsi"
 #include "t6030-gpu.dtsi"
 #include "t6030-usb4.dtsi"
+#include "t6030-dcp.dtsi"

@@ -18,6 +18,7 @@
 		usb4_0_nhi = &usb4_0_nhi;
 		usb4_1_nhi = &usb4_1_nhi;
 		usb4_2_nhi = &usb4_2_nhi;
+		usb4_0_pcie = &usb4_0_pcie;
 	};
 };
 
@@ -50,5 +51,16 @@
 T603X_USB4_GRAPH(0);
 T603X_USB4_GRAPH(1);
 T603X_USB4_GRAPH(2);
+
+&typec0 {
+	ports {
+		port@3 {
+			reg = <3>;
+			typec0_dcpext: endpoint {
+				remote-endpoint = <&dcpext_typec0>;
+			};
+		};
+	};
+};
 
 #undef T603X_USB4_GRAPH

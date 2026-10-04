@@ -76,6 +76,10 @@
 				<&ps_atc##n##_cio_pcie>,		\
 				<&ps_atc##n##_cio_usb>,			\
 				<&ps_atc##n##_pcie>;			\
+		post-init-providers = <&ps_atc##n##_cio>,		\
+				<&ps_atc##n##_cio_pcie>,		\
+				<&ps_atc##n##_cio_usb>,			\
+				<&ps_atc##n##_pcie>;			\
 									\
 		thunderbolt-switch;					\
 									\
@@ -128,6 +132,76 @@
 	T6030_USB4(0, 7, 0x7, 1076);
 	T6030_USB4(1, b, 0xb, 1134);
 	T6030_USB4(2, f, 0xf, 1192);
+
+	usb4_0_pcie_tunnel: usb4-pcie-tunnel-0 {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		usb4_0_pcie_dart: iommu@721008000 {
+			compatible = "apple,t6030-dart", "apple,t8110-dart";
+			reg = <0x7 0x21008000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1077 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			/* apple,tunable is filled by the bootloader */
+		};
+
+		usb4_0_pcie: pcie@730000000 {
+			compatible = "apple,t8122-pciec", "apple,t8103-pciec";
+			device_type = "pci";
+			reg = <0x7 0x30000000 0x0 0x10000000>,
+			      <0x7 0x20000000 0x0 0x4000>,
+			      <0x7 0x21000000 0x0 0x8000>,
+			      <0x7 0x20004000 0x0 0x4000>,
+			      <0x7 0x20200000 0x0 0x4000>,
+			      <0x7 0x21010000 0x0 0x4000>,
+			      <0x7 0x20008000 0x0 0x4000>,
+			      <0x7 0x2100c000 0x0 0x4000>;
+			reg-names = "config", "rc", "port0", "fabric",
+				    "debug", "ltssm", "oe-fabric", "intr2axi";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1076 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc0_cio_pcie>;
+			apple,pciec-kernel-init;
+			/* apple,tunable-oe-fabric is filled by the bootloader */
+			msi-controller;
+			msi-parent = <&usb4_0_pcie>;
+			msi-ranges = <&aic AIC_IRQ 1342 IRQ_TYPE_EDGE_RISING 0x200>;
+			iommu-map = <0x0 &usb4_0_pcie_dart 0x0 0x40>;
+			iommu-map-mask = <0x3f>;
+			bus-range = <0x0 0x7f>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x43000000 0x8 0x0
+				  0x8 0x0 0x2 0x0>,
+				 <0x02000000 0x0 0x100000
+				  0xa 0x100000 0x0 0x3ff00000>,
+				 <0x42000000 0x0 0x40000000
+				  0xa 0x40000000 0x0 0x40000000>;
+
+			usb4_0_pcie_port: pci@0,0 {
+				device_type = "pci";
+				reg = <0x0 0x0 0x0 0x0 0x0>;
+				external-facing;
+				/* apple,tunable is filled by the bootloader */
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+				interrupt-controller;
+				#interrupt-cells = <1>;
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &usb4_0_pcie_port 0 0 0 0>,
+						<0 0 0 2 &usb4_0_pcie_port 0 0 0 1>,
+						<0 0 0 3 &usb4_0_pcie_port 0 0 0 2>,
+						<0 0 0 4 &usb4_0_pcie_port 0 0 0 3>;
+			};
+		};
+	};
+};
+
+&usb4_0_acio {
+	apple,pcie-tunnel = <&usb4_0_pcie_tunnel>;
 };
 
 /* LSTX (USB4 sideband TX) pins, ADT acioN gpio-lstx */
