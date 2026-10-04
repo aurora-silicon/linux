@@ -172,6 +172,8 @@ static char *parse_string(struct dcp_parse_ctx *handle)
 		return (void *)in;
 
 	out = kmalloc(tag->size + 1, GFP_KERNEL);
+	if (!out)
+		return ERR_PTR(-ENOMEM);
 
 	memcpy(out, in, tag->size);
 	out[tag->size] = '\0';
