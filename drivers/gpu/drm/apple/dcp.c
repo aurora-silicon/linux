@@ -366,6 +366,8 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 		WRITE_ONCE(connector->connected, false);
 		/* hotplug work queued before this checks for it */
 		WRITE_ONCE(connector->dcp, NULL);
+		/* no pipeline, so no backlight */
+		schedule_work(&connector->bl_sync_wq);
 
 		/* Unrouted: the port could go to any of its pipelines again. */
 		if (connector->port_encoder && !dcp_typec_dual_stream())
@@ -374,6 +376,7 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 	}
 	dcp->typec_connector = NULL;
 	dcp->connector = dcp->fixed_connector;
+	WRITE_ONCE(dcp->ext_backlight, false);
 
 	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_USB) {
 		dcp->connector_type = dcp->fixed_connector_type;
@@ -2189,12 +2192,22 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 static void disconnected_hpd_event(struct apple_connector *con)
 {
 	if (con && con->connected) {
+		struct platform_device *pdev = READ_ONCE(con->dcp);
+
+		if (pdev) {
+			struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+			WRITE_ONCE(dcp->ext_backlight, false);
+		}
 		con->connected = 0;
 		drm_edid_free(con->drm_edid);
 		con->drm_edid = NULL;
 		drm_kms_helper_connector_hotplug_event(&con->base);
-		/* drops the display's backlight, outside the caller's locks */
-		schedule_work(&con->hotplug_wq);
+		/*
+		 * Drop the display's backlight, outside the caller's locks. Not
+		 * the hotplug work, which would send a second hotplug event.
+		 */
+		schedule_work(&con->bl_sync_wq);
 	}
 }
 

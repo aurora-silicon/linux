@@ -269,25 +269,46 @@ int dcp_backlight_register(struct apple_dcp *dcp)
  */
 #define DCP_EXT_BL_MAX	1000
 
-/* The bl_value for the display on this DCP, or -1 if it has no backlight. */
+/*
+ * The bl_value for the display on this DCP, or -1 to send none: it has no
+ * backlight, or userspace has not chosen a level yet, so the display keeps
+ * its own.
+ */
 s32 dcp_ext_backlight_value(struct apple_dcp *dcp)
 {
 	struct apple_connector *connector = READ_ONCE(dcp->connector);
+	int level;
 
 	if (!connector || !READ_ONCE(dcp->ext_backlight))
 		return -1;
 
-	return div_u64((u64)READ_ONCE(connector->bl_level) * S32_MAX,
-		       DCP_EXT_BL_MAX);
+	level = READ_ONCE(connector->bl_level);
+	if (level < 0)
+		return -1;
+
+	return div_u64((u64)level * S32_MAX, DCP_EXT_BL_MAX);
 }
 
 static int dcp_ext_backlight_update_status(struct backlight_device *bd)
 {
 	struct apple_connector *connector = bl_get_data(bd);
+	int level = bd->props.brightness;
 	struct platform_device *pdev;
 	struct apple_dcp *dcp;
 
-	WRITE_ONCE(connector->bl_level, backlight_get_brightness(bd));
+	/* The display's power belongs to DRM, not to fbdev blanking. */
+	if (backlight_is_blank(bd))
+		return 0;
+
+	/*
+	 * Until a level is chosen the device reports DCP_EXT_BL_MAX, and
+	 * systemd-backlight writes what it reads back when it has nothing
+	 * saved. Sending that would turn the display to full brightness.
+	 */
+	if (READ_ONCE(connector->bl_level) < 0 && level == DCP_EXT_BL_MAX)
+		return 0;
+
+	WRITE_ONCE(connector->bl_level, level);
 
 	/* An unrouted port picks the level up when it powers on again. */
 	pdev = READ_ONCE(connector->dcp);
@@ -298,11 +319,44 @@ static int dcp_ext_backlight_update_status(struct backlight_device *bd)
 	/* pairs with the xchg() in iomfb_flush: it sees the level or leaves update set */
 	smp_store_release(&dcp->brightness.update, true);
 
-	return dcp_backlight_update(dcp);
+	/*
+	 * Commit from a work item: a slider's stream of writes collapses into
+	 * a few commits, and none of them blocks with ops_lock held.
+	 */
+	schedule_work(&connector->bl_commit_wq);
+	return 0;
+}
+
+static void apple_connector_backlight_commit_work(struct work_struct *work)
+{
+	struct apple_connector *connector =
+		container_of(work, struct apple_connector, bl_commit_wq);
+	struct platform_device *pdev = READ_ONCE(connector->dcp);
+	int ret;
+
+	if (!pdev)
+		return;
+
+	do {
+		ret = dcp_backlight_update(platform_get_drvdata(pdev));
+	} while (ret == -EDEADLK);
+
+	/* update stays set, so the next swap carries the level anyway */
+	if (ret)
+		drm_dbg(connector->base.dev, "%s: backlight commit: %d\n",
+			connector->base.name, ret);
+}
+
+/* Never follow fbdev blanking, which would store a level of 0. */
+static bool dcp_ext_backlight_controls_device(struct backlight_device *bd,
+					      struct device *display_dev)
+{
+	return false;
 }
 
 static const struct backlight_ops dcp_ext_backlight_ops = {
 	.update_status = dcp_ext_backlight_update_status,
+	.controls_device = dcp_ext_backlight_controls_device,
 };
 
 static void apple_connector_backlight_register(struct apple_connector *connector)
@@ -310,12 +364,18 @@ static void apple_connector_backlight_register(struct apple_connector *connector
 	struct backlight_properties props = {
 		.type = BACKLIGHT_RAW,
 		.max_brightness = DCP_EXT_BL_MAX,
-		.brightness = connector->bl_level,
+		.brightness = connector->bl_level < 0 ? DCP_EXT_BL_MAX :
+							 connector->bl_level,
 	};
 	struct backlight_device *bd;
 	char name[32];
 
-	snprintf(name, sizeof(name), "apple-%s-bl", connector->base.name);
+	/*
+	 * Sorts after the integrated panel's apple-panel-bl in any locale:
+	 * userspace that takes the first backlight as the built-in screen's
+	 * (Omarchy's omarchy-hw-display) keeps the panel.
+	 */
+	snprintf(name, sizeof(name), "dcp-%s-bl", connector->base.name);
 	bd = backlight_device_register(name, connector->base.kdev, connector,
 				       &dcp_ext_backlight_ops, &props);
 	if (IS_ERR(bd)) {
@@ -334,10 +394,18 @@ static void apple_connector_backlight_unregister(struct apple_connector *connect
 	connector->bl_dev = NULL;
 }
 
+static void apple_connector_backlight_sync_work(struct work_struct *work)
+{
+	apple_connector_backlight_sync(container_of(work, struct apple_connector,
+						    bl_sync_wq));
+}
+
 void apple_connector_backlight_init(struct apple_connector *connector)
 {
 	mutex_init(&connector->bl_lock);
-	connector->bl_level = DCP_EXT_BL_MAX;
+	INIT_WORK(&connector->bl_sync_wq, apple_connector_backlight_sync_work);
+	INIT_WORK(&connector->bl_commit_wq, apple_connector_backlight_commit_work);
+	connector->bl_level = -1;
 }
 
 /*
@@ -385,4 +453,6 @@ void apple_connector_backlight_early_unregister(struct apple_connector *connecto
 	if (connector->bl_dev)
 		apple_connector_backlight_unregister(connector);
 	mutex_unlock(&connector->bl_lock);
+	/* nothing can queue it again once the device is gone */
+	cancel_work_sync(&connector->bl_commit_wq);
 }

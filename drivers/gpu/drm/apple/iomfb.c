@@ -292,11 +292,10 @@ void dcp_hotplug(struct work_struct *work)
 
 	connector = container_of(work, struct apple_connector, hotplug_wq);
 
-	apple_connector_backlight_sync(connector);
-
 	pdev = READ_ONCE(connector->dcp);
 	if (!pdev) {	/* a Type-C port unrouted after this was queued */
 		drm_kms_helper_connector_hotplug_event(&connector->base);
+		apple_connector_backlight_sync(connector);
 		return;
 	}
 	dcp = platform_get_drvdata(pdev);
@@ -333,6 +332,8 @@ void dcp_hotplug(struct work_struct *work)
 	}
 
 	drm_kms_helper_connector_hotplug_event(&connector->base);
+	/* after the event, so registering a backlight cannot delay it */
+	apple_connector_backlight_sync(connector);
 }
 
 static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,

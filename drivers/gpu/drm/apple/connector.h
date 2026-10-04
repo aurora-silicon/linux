@@ -65,9 +65,15 @@ struct apple_connector {
 	 * registration against the connector's sysfs lifetime.
 	 */
 	struct mutex bl_lock;
+	struct work_struct bl_sync_wq;	/* apple_connector_backlight_sync() */
+	struct work_struct bl_commit_wq; /* sends a new level */
 	struct backlight_device *bl_dev;
 	bool bl_allowed;	/* between late_register and early_unregister */
-	int bl_level;		/* kept across replug, applied on every power-on */
+	/*
+	 * Kept across replug and applied on every power-on, once userspace has
+	 * chosen one; -1 until then, and nothing is sent.
+	 */
+	int bl_level;
 };
 
 #define to_apple_connector(x) container_of(x, struct apple_connector, base)

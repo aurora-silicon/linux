@@ -599,6 +599,8 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 	} else if (!strcmp(req->key, "DisplayAttributes")) {
 		bool backlight_control;
 
+		/* a display whose attributes do not parse gets no backlight */
+		WRITE_ONCE(dcp->ext_backlight, false);
 		ret = parse_display_attributes(&ctx, &dcp->width_mm,
 					&dcp->height_mm, &backlight_control);
 
@@ -1495,8 +1497,14 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->swap.bl_value = dcp->brightness.dac;
 		req->swap.bl_power = 0x40;
 		dcp->brightness.update = false;
-	} else if (!dcp_has_panel(dcp) && xchg(&dcp->brightness.update, false)) {
-		/* read after clearing: a newer level sets update again and commits */
+	} else if (!dcp_has_panel(dcp) && READ_ONCE(dcp->mode_state.valid) &&
+		   dcp->connector && READ_ONCE(dcp->connector->connected) &&
+		   xchg(&dcp->brightness.update, false)) {
+		/*
+		 * Consumed only when do_swap() will send the swap, so a level is
+		 * not lost to a dropped one. Read after clearing: a newer level
+		 * sets update again and commits.
+		 */
 		s32 bl = dcp_ext_backlight_value(dcp);
 
 		if (bl >= 0) {

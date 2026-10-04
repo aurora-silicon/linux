@@ -251,6 +251,11 @@ static void appledrm_connector_cleanup(struct drm_connector *connector)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
 
+	/* Queued by the last disconnect at shutdown; they use the connector. */
+	cancel_work_sync(&apple_connector->hotplug_wq);
+	cancel_work_sync(&apple_connector->bl_sync_wq);
+	cancel_work_sync(&apple_connector->bl_commit_wq);
+	mutex_destroy(&apple_connector->bl_lock);
 	drm_connector_cleanup(connector);
 	kfree(apple_connector->color_elements.data);
 	kfree(apple_connector->timing_elements.data);
