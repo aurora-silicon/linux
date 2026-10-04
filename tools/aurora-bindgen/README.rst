@@ -13,6 +13,8 @@ Neither repair changes C structure storage or kernel configuration.
 the patched source files. It also records the qualified private tool's digest;
 that digest is evidence for that build, not a promise that a different host,
 compiler or build path produces identical bytes.
+The manifest identifies when that digest predates comment-only patch changes;
+each rebuild must record its own binary digest.
 
 Build in a fresh private directory::
 
@@ -24,6 +26,8 @@ supply an already downloaded source archive; its digest is still checked. The
 script builds and runs compile-only valid-input checks, then prints the exact
 ``BINDGEN=/absolute/path/to/bindgen`` make argument. It installs nothing globally.
 Use that argument for the complete kernel Image and matching modules build.
+Both scripts reject optimized Python (``-O``, ``-OO`` or ``PYTHONOPTIMIZE``)
+before creating output, since their validation assertions must remain enabled.
 
 Tests and target accounting
 ---------------------------
@@ -32,6 +36,9 @@ Tests and target accounting
 covers empty alignments 1/2/8/64/128, nesting, packed empty records, anonymous
 struct/union members, field access and ordinary tag-only declarations. It
 requires unconditional const layout assertions in the generated output.
+An additional bitfield fixture rejects unknown Rust lints in the fixed tool's
+output. This fixture checks compiler compatibility, not the layout repairs,
+and is excluded from the optional unpatched-baseline comparison.
 Nothing is executed on a GPU, and the generated object files are not run.
 
 Example using an existing private tool and the installed unpatched baseline::
@@ -49,6 +56,13 @@ allow explicit kernel/cross targets, with matching architecture required.
 ``--rust-sysroot`` and ``--rust-libdir`` support a separately prepared Rust core.
 An unavailable Rust target/core emits a machine-readable SKIP and exit 77;
 that target has not passed. Other compiler or layout errors fail normally.
+
+Select ``--rustc`` explicitly to check the compiler used for the kernel. The
+generator's ``--rust-target 1.85`` selects emitted language features; it does
+not select the Rust compiler used by the tests. A compatibility adapter may
+remove an exact generated lint attribute unsupported by that compiler, while
+retaining all layout assertions. Its underlying binary must be the corrected
+generator, and its changes and both tool digests belong in the build record.
 
 Repository guard and supported tool versions
 --------------------------------------------

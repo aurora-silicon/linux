@@ -6,14 +6,15 @@
   "cargo_lock_sha256": "85edb9aab2d5649f39b805dc52e3f27ebf8af4d94b049601aee1c55fcf450393",
   "patches": {
     "0001-empty-alignment.patch": "eb71efca5c60adc9db6837c933ff377e8aefad53655057406ff9f1464dd3147f",
-    "0002-anonymous-tag-members.patch": "9072ec2fd9d0f0160615cbfd0d9cfe16d23cd0ae90747a2aa984b8694bdee9ec"
+    "0002-anonymous-tag-members.patch": "3c1f6a9fdf02b7cd6f11b1d0787eec7d8a14cf6f140f414cc3069eeb75524562"
   },
   "patched_files": {
     "bindgen/codegen/mod.rs": "4c100fa631bdd655b509e1797411e341f9a954207d64f8f2efc285201f5f14d9",
-    "bindgen/clang.rs": "bd65a80b028045dec2ff1ca9ee347301726b30f94a0ee743a3041d4f598e45e4",
+    "bindgen/clang.rs": "4271adf1fd24f9a8e58e2a69c48f3de6574318461203b513d34308e38852dcd1",
     "bindgen/ir/comp.rs": "7d53770db84376699421c8057fbecbfc00e8a6f62ca38919bd4c718e56e40438"
   },
   "qualified_private_tool_sha256": "dc794acc7b0d7e3cbfa1533b4b59f2518cd0cc1bff1dbb7fd104229c23c0d146",
   "qualified_host_toolchain": "rustc/cargo1.98.1, LLVM/libclang22.1.8, nativeAArch64; kernel Rust1.85.0",
-  "runtime_tests_performed": false
+  "runtime_tests_performed": false,
+  "qualified_private_tool_note": "Digest identifies the previously qualified binary before safety-comment-only patch changes; a rebuild from this manifest must record its own binary digest."
 }

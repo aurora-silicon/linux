@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
 """Compile valid generated bindings for explicitly matching C/Rust targets."""
+if not __debug__:
+    raise SystemExit("optimized Python is unsupported: validation assertions must remain enabled")
+
 import argparse,hashlib,json,re,subprocess,sys
 from pathlib import Path
 P=Path(__file__).resolve().parent
@@ -10,7 +13,7 @@ def run(cmd):return subprocess.run(cmd,capture_output=True,text=True)
 host=next(x.split(': ',1)[1] for x in subprocess.check_output([a.rustc,'-vV'],text=True).splitlines() if x.startswith('host: '));rt=a.rust_target or host;ct=a.clang_target or rt
 arch=lambda t:{'arm64':'aarch64','amd64':'x86_64'}.get(t.split('-')[0],t.split('-')[0])
 assert arch(rt)==arch(ct),('C/Rust architecture mismatch',ct,rt)
-rust=[a.rustc,'--edition=2021','--crate-type=rlib','--crate-name','layout_check','--emit=obj','-Cpanic=abort','--target='+rt]
+rust=[a.rustc,'--edition=2021','--crate-type=rlib','--crate-name','layout_check','--deny=unknown-lints','--emit=obj','-Cpanic=abort','--target='+rt]
 if a.rust_sysroot:rust+=['--sysroot='+a.rust_sysroot]
 if a.rust_libdir:rust+=['-L',str(Path(a.rust_libdir).resolve())]
 probe=O/'target.rs';probe.write_text('#![no_std]\npub fn available() -> usize { core::mem::size_of::<usize>() }\n');r=run(rust+[str(probe),'-o',str(O/'target.o')]);(O/'target.log').write_text(r.stdout+r.stderr)
@@ -26,11 +29,14 @@ unsafe fn check_fields(a: &mut outer, b: &mut wrapper, c: &mut union_member, d: 
 }
 '''
 cases=[];equal={};toolset=[('fixed',a.bindgen)]+([('baseline',a.baseline_bindgen)] if a.baseline_bindgen else [])
-for fixture,language,extra in [('aligned-empty.h','c',[]),('aligned-empty.hpp','c++',[]),('anonymous-members.h','c',['-fms-extensions']),('tag-only.h','c',[])]:
+for fixture,language,extra in [('aligned-empty.h','c',[]),('aligned-empty.hpp','c++',[]),('anonymous-members.h','c',['-fms-extensions']),('tag-only.h','c',[]),('bitfields.h','c',[])]:
  header=P/'tests'/fixture
  # Also ask the C compiler to accept the ordinary fixture independently.
  ccmd=[a.clang,'--target='+ct,'-x',language,*extra,'-Wno-microsoft-anon-tag','-c',str(header),'-o',str(O/(fixture+'.c.o'))];cr=run(ccmd);(O/(fixture+'.c.log')).write_text(cr.stdout+cr.stderr);assert cr.returncode==0,(fixture,cr.stderr)
  for label,tool in toolset:
+  # The baseline comparison covers layout repairs; this fixture checks the fixed tool
+  # against the selected compiler, including compatibility adapters when needed.
+  if fixture == 'bitfields.h' and label == 'baseline':continue
   cmd=[tool,str(header),'--rust-target','1.85','--no-doc-comments','--use-core','--no-derive-debug','--ctypes-prefix','core::ffi','--','-target',ct,'-x',language,*extra]
   g=run(cmd);assert g.returncode==0,(fixture,g.stderr)
   assert 'const _: ()' in g.stdout and '#[test]' not in g.stdout,'generator did not emit unconditional const layout checks'
