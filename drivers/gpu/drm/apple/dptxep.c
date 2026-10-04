@@ -10,7 +10,6 @@
 #include <linux/printk.h>
 
 #include <linux/soc/apple/dp-tunnel.h>
-#include <linux/soc/apple/rtkit.h>
 #include <linux/string.h>
 
 #include "afk.h"
@@ -948,47 +947,6 @@ static const struct apple_epic_service_ops dpav_ctrl_ops[] = {
 	},
 	{}
 };
-
-static void dptx_av_bind(struct apple_epic_service *service, const char *name,
-			 const char *class, s64 unit)
-{
-	dev_info(service->ep->dcp->dev,
-		 "AV service %s class %s unit %lld channel %u\n",
-		 name ? name : "", class ? class : "", unit, service->channel);
-}
-
-static const struct apple_epic_service_ops dptx_av_ops[] = {
-	{ .name = "DCPAVSimpleVideoInterface", .init = dptx_av_bind },
-	{ .name = "dcpav-video-interface-epic", .init = dptx_av_bind },
-	{ .name = "IOAVVideoInterface", .init = dptx_av_bind },
-	{ .name = "IOAVController", .init = dptx_av_bind },
-	{}
-};
-
-int dptx_prepare_interfaces(struct apple_dcp *dcp)
-{
-	int ret;
-
-	if (apple_rtkit_has_endpoint(dcp->rtk, AV_ENDPOINT) && !dcp->avep) {
-		dcp->avep = afk_init(dcp, AV_ENDPOINT, dptx_av_ops);
-		if (IS_ERR(dcp->avep)) {
-			dev_warn(dcp->dev, "AV endpoint init failed: %ld\n",
-				 PTR_ERR(dcp->avep));
-			dcp->avep = NULL;
-		} else {
-			ret = afk_start(dcp->avep);
-			dev_info(dcp->dev, "AV endpoint start: %d\n", ret);
-		}
-	}
-
-	if (apple_rtkit_has_endpoint(dcp->rtk, DPAVSERV_ENDPOINT) &&
-	    !dcp->dcpavservep) {
-		ret = dpavservep_init(dcp);
-		dev_info(dcp->dev, "DPAV service endpoint: %d\n", ret);
-	}
-
-	return 0;
-}
 
 int dpav_ctrl_init(struct apple_dcp *dcp)
 {
