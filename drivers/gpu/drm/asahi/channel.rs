@@ -837,8 +837,8 @@ pub(crate) struct EventChannel {
     ev_mgr: Arc<event::EventManager>,
     buf_mgr: buffer::BufferManager::ver,
     gpu: Option<Arc<dyn gpu::GpuManager>>,
-    /// Number of messages received on this channel (diagnostics).
     #[ver(V >= V14_8_3)]
+    /// Number of messages received on this channel (diagnostics).
     received: u64,
 }
 
@@ -862,17 +862,9 @@ impl EventChannel::ver {
         })
     }
 
-    /// Returns the number of messages received on this channel so far.
-    #[ver(V >= V14_8_3)]
-    pub(crate) fn received(&self) -> u64 {
-        self.received
-    }
 
-    /// Read-only (firmware wptr, host rptr) per sub-channel (G15 bring-up diagnostics).
-    #[ver(V >= V14_8_3)]
-    pub(crate) fn ring_snapshot(&self) -> KVec<(u32, u32)> {
-        self.ch.snapshot()
-    }
+
+
 
     /// Registers the managing `Gpu` instance that will handle events on this channel.
     pub(crate) fn set_manager(&mut self, gpu: Arc<dyn gpu::GpuManager>) {
@@ -1255,9 +1247,9 @@ impl KTraceChannel {
 pub(crate) struct StatsChannel {
     dev: AsahiDevRef,
     ch: RxChannel<ChannelState, RawStatsMsg::ver>,
+    #[ver(V >= V14_8_3)]
     /// Counts of message types this driver does not decode, by type (the last slot collects
     /// every type above it).
-    #[ver(V >= V14_8_3)]
     unknown: [u64; 17],
 }
 
@@ -1325,5 +1317,14 @@ impl StatsChannel::ver {
                 }
             }
         }
+    }
+}
+
+impl EventChannelG15V14_8_3 {
+    pub(crate) fn received(&self) -> u64 {
+        self.received
+    }
+    pub(crate) fn ring_snapshot(&self) -> KVec<(u32, u32)> {
+        self.ch.snapshot()
     }
 }

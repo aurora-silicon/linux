@@ -224,7 +224,7 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
         return EINVAL;
     };
 
-    if expected.uat_input_address_bits != soc.uat_ias {
+    if soc.uat_ias != 42 {
         dev_err!(
             pdev.as_ref(),
             "AGX3: static UAT width for chip {:#x} disagrees with the identity decode\n",

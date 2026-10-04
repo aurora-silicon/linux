@@ -1482,7 +1482,7 @@ impl Handoff {
     /// its AP state before firmware starts.
     fn init(&self, mode: HandoffMode, m3: bool) -> Result {
         self.magic_ap.store(PPL_MAGIC, Ordering::Relaxed);
-        self.cur_slot.store(if m3 { u32::MAX } else if mode == HandoffMode::StoppedFirmwareT6030 { 0xffff } else { 0 }, Ordering::Relaxed);
+        self.cur_slot.store(if m3 && mode != HandoffMode::FirmwareDekker { u32::MAX } else { 0 }, Ordering::Relaxed);
         self.unk3.store(0, Ordering::Relaxed);
         if mode == HandoffMode::StoppedFirmwareT6030 {
             // This mode is constructed only with ASC stopped. Preserve the

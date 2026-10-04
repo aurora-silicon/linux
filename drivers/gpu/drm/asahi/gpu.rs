@@ -505,22 +505,22 @@ pub(crate) struct GpuManager {
     next_mmio_iova: u64,
     #[pin]
     rtkit: Mutex<Option<rtkit::RtKit<GpuManager::ver>>>,
+    #[ver(V >= V14_8_3)]
     /// Diagnostics: RTKit messages received on the non-system endpoints.
-    #[ver(V >= V14_8_3)]
     rtk_rx_msgs: AtomicU64,
-    /// Diagnostics: firmware-provided (mapped) RTKit buffers mapped / refused.
     #[ver(V >= V14_8_3)]
+    /// Diagnostics: firmware-provided (mapped) RTKit buffers mapped / refused.
     rtk_shmem_mapped: AtomicU64,
     #[ver(V >= V14_8_3)]
     rtk_shmem_map_failed: AtomicU64,
+    #[ver(V >= V14_8_3)]
     /// G15 diagnostics: ktime (ns) at which MSG_INIT was sent, 0 before.
-    #[ver(V >= V14_8_3)]
     g15_init_ns: AtomicI64,
+    #[ver(V >= V14_8_3)]
     /// G15 diagnostics: last P2+0x14 value seen by the init poll.
-    #[ver(V >= V14_8_3)]
     g15_init_state: AtomicU32,
-    /// G15 diagnostics (asahi.g15_debug bit 46): read-only mapping of the firmware data carveout.
     #[ver(V >= V14_8_3)]
+    /// G15 diagnostics (asahi.g15_debug bit 46): read-only mapping of the firmware data carveout.
     g15_gfxdata: Option<G15GfxData>,
     #[pin]
     rx_channels: Mutex<RxChannels::ver>,
@@ -592,10 +592,6 @@ pub(crate) trait GpuManager: Send + Sync {
     /// Send a firmware control command (secure cache flush).
     fn fwctl(&self, msg: fw::channels::FwCtlMsg) -> Result;
     /// Log a read-only firmware health sample labelled `tag` (G15 bring-up diagnostics).
-    #[ver(V < V14_8_3)]
-    fn health_report(&self, _tag: &str) {}
-
-    #[ver(V >= V14_8_3)]
     fn health_report(&self, tag: &str);
     /// Get the static GPU configuration for this SoC.
     fn get_cfg(&self) -> &'static hw::HwConfig;
@@ -1101,9 +1097,9 @@ impl rtkit::Operations for GpuManager::ver {
         Ok(RtkitBuffer::Alloc(RtkitObject { vmap, mapping }))
     }
 
-    /// Map a buffer the firmware placed at its own VA. G15 only: on G13/G14 this keeps the
-    /// previous behaviour (the default implementation's EINVAL).
     #[ver(V < V14_8_3)]
+    // Map a buffer the firmware placed at its own VA. G15 only: on G13/G14 this keeps the
+    // previous behaviour (the default implementation's EINVAL).
     fn shmem_map(_data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _iova: usize, _size: usize) -> Result<Self::Buffer> {
         Err(EINVAL)
     }
@@ -2035,8 +2031,8 @@ impl GpuManager::ver {
         Ok(())
     }
 
-    /// Microseconds since MSG_INIT was sent (0 if it was not sent yet).
     #[ver(V >= V14_8_3)]
+    // Microseconds since MSG_INIT was sent (0 if it was not sent yet).
     fn us_since_init(&self) -> i64 {
         let t = self.g15_init_ns.load(Ordering::Relaxed);
         if t == 0 {
@@ -2046,17 +2042,17 @@ impl GpuManager::ver {
         }
     }
 
-    /// G15: read the P2 debug block init word (+0x14).
     #[ver(V >= V14_8_3)]
+    // G15: read the P2 debug block init word (+0x14).
     fn g15_p2_init_word(&self) -> u32 {
         self.initdata
             .debug_block
             .with(|raw, _| raw.init_state.load(Ordering::Acquire))
     }
 
-    /// G15: poll P2+0x14 every ~1 ms for up to [`G15_INIT_POLL_TIMEOUT_MS`] after MSG_INIT.
-    /// Returns true once the firmware reports post-INIT init done (1). Never fails the probe.
     #[ver(V >= V14_8_3)]
+    // G15: poll P2+0x14 every ~1 ms for up to [`G15_INIT_POLL_TIMEOUT_MS`] after MSG_INIT.
+    // Returns true once the firmware reports post-INIT init done (1). Never fails the probe.
     fn g15_wait_init_done(&self) -> bool {
         let dev = self.dev.as_ref();
         let start = Instant::<Monotonic>::now();
@@ -2129,8 +2125,8 @@ impl GpuManager::ver {
         }
     }
 
-    /// G15: ring the devctl doorbell once and log the result.
     #[ver(V >= V14_8_3)]
+    // G15: ring the devctl doorbell once and log the result.
     fn g15_ring_devctl(&self, why: &str) -> Result {
         let mut guard = self.rtkit.lock();
         let rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
@@ -2147,10 +2143,10 @@ impl GpuManager::ver {
         ret
     }
 
-    /// G15 liveness probe: ring the devctl doorbell once (the ring holds the pre-INIT 0x13
-    /// entry) and watch the read index, read-only, at fixed points. Re-rings once if nothing
-    /// moved by [`G15_PROBE_RERING_MS`]. Never uses the unbounded wait path.
     #[ver(V >= V14_8_3)]
+    // G15 liveness probe: ring the devctl doorbell once (the ring holds the pre-INIT 0x13
+    // entry) and watch the read index, read-only, at fixed points. Re-rings once if nothing
+    // moved by [`G15_PROBE_RERING_MS`]. Never uses the unbounded wait path.
     fn g15_devctl_probe(&self) {
         let dev = self.dev.as_ref();
         let before = self.tx_channels.lock().device_control.indices();
@@ -2207,9 +2203,9 @@ impl GpuManager::ver {
         dev_info!(dev, "G15 devctl probe: result {:?}: {}\n", after, verdict);
     }
 
-    /// G15: log the identity of this boot's firmware objects (VAs, the INIT message, the InitData
-    /// bytes) and their UAT translations. Read-only.
     #[ver(V >= V14_8_3)]
+    // G15: log the identity of this boot's firmware objects (VAs, the INIT message, the InitData
+    // bytes) and their UAT translations. Read-only.
     fn g15_identity_dump(&self) {
         let dev = self.dev.as_ref();
         let initdata = self.initdata.gpu_va().get();
@@ -2290,8 +2286,8 @@ impl GpuManager::ver {
         }
     }
 
-    /// G15: the extra firmware words logged by each health sample. Read-only.
     #[ver(V >= V14_8_3)]
+    // G15: the extra firmware words logged by each health sample. Read-only.
     fn g15_sample_words(&self, tag: &str) {
         let dev = self.dev.as_ref();
         let p2 = self.initdata.debug_block.with(|raw, _| {
@@ -2920,6 +2916,10 @@ impl GpuManager for GpuManager::ver {
         });
     }
 
+    #[ver(V < V14_8_3)]
+    fn health_report(&self, _tag: &str) {}
+
+    #[ver(V >= V14_8_3)]
     fn health_report(&self, tag: &str) {
         let dev = self.dev.as_ref();
         dev_info!(
