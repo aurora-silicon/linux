@@ -633,7 +633,7 @@ impl StatsChannel::ver {
                         // scheduling or power behaviour: the firmware already
                         // sent the message, we only keep what it said.
                         match &msg {
-                            StatsMsg::Utilization {
+                            StatsMsg::ver::Utilization {
                                 util1,
                                 util2,
                                 util3,
@@ -645,13 +645,13 @@ impl StatsChannel::ver {
                                 self.snap.util3.store(*util3, Ordering::Relaxed);
                                 self.snap.util4.store(*util4, Ordering::Relaxed);
                             }
-                            StatsMsg::PowerState { pstate, .. } => {
+                            StatsMsg::ver::PowerState { pstate, .. } => {
                                 self.snap.pstate.store(*pstate, Ordering::Relaxed);
                             }
-                            StatsMsg::AvgPower { avg_power, .. } => {
+                            StatsMsg::ver::AvgPower { avg_power, .. } => {
                                 self.snap.avg_power_mw.store(*avg_power, Ordering::Relaxed);
                             }
-                            StatsMsg::Temperature {
+                            StatsMsg::ver::Temperature {
                                 raw_value, scale, ..
                             } => {
                                 self.snap
@@ -659,7 +659,7 @@ impl StatsChannel::ver {
                                     .store(*raw_value, Ordering::Relaxed);
                                 self.snap.temperature_scale.store(*scale, Ordering::Relaxed);
                             }
-                            StatsMsg::FwBusy { timestamp, .. } => {
+                            StatsMsg::ver::FwBusy { timestamp, .. } => {
                                 // Integrate successive FwBusy timestamps into
                                 // the cumulative busy_ns counter. The firmware
                                 // timestamp unit is nanoseconds on T6001
