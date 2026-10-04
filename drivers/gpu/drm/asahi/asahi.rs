@@ -4,7 +4,6 @@
 //! Driver for the Apple AGX GPUs found in Apple Silicon SoCs.
 
 mod alloc;
-mod apple_gpu_topology;
 mod buffer;
 mod channel;
 #[cfg(CONFIG_DEV_COREDUMP)]

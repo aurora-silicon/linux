@@ -82,7 +82,7 @@ pub(crate) struct AsahiDriver {
 /// an exact AGX3 identification target whose firmware boundary remains closed.
 pub(crate) enum ProbeConfig {
     Supported(&'static hw::HwConfig),
-    /// AGX3 (G15/G16/G17) target: chip identification and the read-only
+    /// AGX3 (G15) target: chip identification and the read-only
     /// topology decode run at probe time, then the probe fails closed before
     /// DMA setup, ASC start, or any MMIO write.
     Agx3Diagnostic(&'static hw::agx3::SocConfig),

@@ -2,12 +2,12 @@
 
 #![cfg_attr(not(test), allow(dead_code))]
 
-//! Pure modern-Asahi UAPI parsing and G17P command translation.
+//! Shared modern-Asahi UAPI parsing.
 //!
 //! The byte layouts match `drm_asahi_cmd_header`, `drm_asahi_cmd_render`,
 //! `drm_asahi_cmd_compute`, and `drm_asahi_attachment`. Translation validates
 //! the queue's 4 GiB USC window and every userspace range before constructing
-//! G17P render parameters or compute-entry operands. This module allocates no
+//! M3 render parameters or compute-entry operands. This module allocates no
 //! object, publishes no queue state, and performs no firmware or MMIO action.
 
 pub(crate) const UAPI_COMMAND_HEADER_SIZE: usize = 8;

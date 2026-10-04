@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-//! Immutable fault-only snapshots of owned G16 firmware memory.
+//! Immutable fault-only snapshots of owned M3 firmware memory.
 //!
 //! Records contain name[32], firmware VA, length, begin/end monotonic ns,
 //! then exactly `length` bytes. No MMIO or application BOs are read. Reads
