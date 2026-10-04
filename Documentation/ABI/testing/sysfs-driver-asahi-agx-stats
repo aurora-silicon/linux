@@ -24,16 +24,20 @@ Description:
 		Access: Read-only. Owner-readable (mode 0444).
 
 		busy_ns    cumulative u64; nanoseconds the firmware has reported
-		           itself busy since boot. Saturates at u64::MAX.
+		           itself busy since boot. Wraps at u64::MAX like any
+		           u64 counter (at nanosecond granularity, after about
+		           584 years of accumulated busy time).
 		           Derived from successive FwBusy timestamps; on T6001
 		           (M1 Max, 13.5) the firmware timestamp unit is
-		           nanoseconds. Validated against a controlled MLX
+		           nanoseconds. Other SoCs must validate the unit
+		           against a controlled load before trusting the
+		           magnitude. Validated against a controlled MLX
 		           matmul loop (idle: flat; full load: >50% util1).
 
 		jobs       u64; cumulative completed submissions since boot.
-		           Starts at 0; reserved for the submission-completion
-		           landing. On T6001 firmware the firmware does not currently
-		           emit a dedicated job counter message, so this stays 0.
+		           Counted on the host at submission completion (when
+		           the last command of a submission completes and its
+		           fence signals), not from a firmware counter.
 
 		pstate     u32; current performance state index (PowerState.pstate).
 
@@ -47,9 +51,9 @@ Description:
 		           differ per SoC revision. Treat as raw until a per-chip
 		           doc note lands.
 
-		temperature_raw, temperature_scale, temperature_tmin,
-		temperature_tmax    u32; latest Temperature sample and scale (or
-		           0 if Temperature has not yet arrived).
+		temperature_raw, temperature_scale    u32; latest Temperature
+		           sample and scale (or 0 if Temperature has not yet
+		           arrived).
 
 		Field meanings (units, window, saturation) are documented in
 		`drivers/gpu/drm/asahi/stats.rs` and may evolve with firmware
