@@ -2134,6 +2134,18 @@ impl Vm {
             return Err(EINVAL);
         }
 
+        // Legacy GPUs only map fixed addresses here, and keep logging each
+        // firmware MMIO mapping at boot as they always have.
+        if self.fault.is_none() {
+            dev_info!(
+                inner.dev.as_ref(),
+                "MMU: IO map: {:#x}:{:#x} -> {:#x}\n",
+                phys,
+                size,
+                iova
+            );
+        }
+
         let payload = KernelMappingInner {
             owner: self.inner.clone(), uat_inner: inner.uat_inner.clone(), prot,
             bo: None, _gem: None, offset: 0, mapped_size: size,
@@ -2145,7 +2157,9 @@ impl Vm {
                 0, range.start, range.end, mm::InsertMode::Best)?
         };
         let iova = node.start();
-        mod_dev_dbg!(inner.dev, "MMU: IO map: {:#x}:{:#x} -> {:#x}\n", phys, size, iova);
+        if self.fault.is_some() {
+            mod_dev_dbg!(inner.dev, "MMU: IO map: {:#x}:{:#x} -> {:#x}\n", phys, size, iova);
+        }
 
         let prepared = if self.fault.is_some() {
             inner.page_table.prepare_map(iova..iova.checked_add(size as u64).ok_or(EOVERFLOW)?)
