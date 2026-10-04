@@ -31,7 +31,7 @@ use kernel::{
     c_str,
     device,
     drm::{
-        gem::{shmem, BaseObject},
+        gem::shmem,
         gpuvm,
         mm, //
     },
