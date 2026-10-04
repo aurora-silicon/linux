@@ -9,10 +9,12 @@
  * share one device tree.
  *
  * This gate enables those five nodes before platform devices are created.
- * It acts only if the kernel command line carries
- * apple_t6030_display.enable=1 and the boot loader has set
- * apple,t6030-handoff = <1> on the DCP and on the display subsystem, which
- * it does after it has checked and locked the inherited DART mappings. The
+ * It acts only if the boot loader has set apple,t6030-handoff = <1> on the
+ * DCP and on the display subsystem, which it does after it has checked and
+ * locked the inherited DART mappings. apple_t6030_display.enable=0 on the
+ * kernel command line keeps the display on the boot framebuffer instead;
+ * apple_t6030_display.dcpext=0 and apple_t6030_display.scanout=0 do the same
+ * for the external display processor and its scanout. The
  * targets are found through the DCP's and the display subsystem's
  * phandles, and each must still be disabled. Otherwise nothing is changed.
  *
@@ -76,7 +78,7 @@ static const char *const pmp_ps_labels[PMP_PS_NR] __initconst = {
 extern const u8 __dtbo_t6030_j516s_pmp_begin[];
 extern const u8 __dtbo_t6030_j516s_pmp_end[];
 
-static bool gate_requested __initdata;
+static bool gate_requested __initdata = true;
 
 /* Kept after a successful apply: the live tree now holds its properties. */
 static struct of_changeset gate_cs;
@@ -438,7 +440,7 @@ static int __init gate_pmp_apply(struct device_node *dcp, struct device_node **p
 
 /* An external handoff describes memory only; firmware startup is a later,
  * explicit driver operation. Older kernels leave all these nodes disabled. */
-static bool gate_dcpext_requested __initdata;
+static bool gate_dcpext_requested __initdata = true;
 static struct of_changeset gate_dcpext_cs;
 
 static int __init gate_dcpext_setup(char *arg)
@@ -447,7 +449,7 @@ static int __init gate_dcpext_setup(char *arg)
 }
 early_param("apple_t6030_display.dcpext", gate_dcpext_setup);
 
-static bool gate_scanout_requested __initdata;
+static bool gate_scanout_requested __initdata = true;
 static struct of_changeset gate_scanout_cs;
 
 static int __init gate_scanout_setup(char *arg)
@@ -683,13 +685,11 @@ static int __init apple_t6030_display_gate(void)
 	struct device_node *aic = NULL;
 	int i;
 
-	if (!gate_requested) {
-		pr_debug("not requested\n");
+	if (!of_machine_is_compatible("apple,t6030"))
 		return 0;
-	}
 
-	if (!of_machine_is_compatible("apple,t6030")) {
-		pr_warn("not enabling: this is not a T6030\n");
+	if (!gate_requested) {
+		pr_info("disabled on the command line, display stays on the boot framebuffer\n");
 		return 0;
 	}
 

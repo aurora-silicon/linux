@@ -16,9 +16,10 @@ const CORES_PER_CLUSTER: u32 = 10;
 /// MGPU clusters on T6030.
 const CLUSTERS: u32 = 2;
 
-/// Board the M3 runtime is validated on; `asahi.m3_expose=auto` registers the render node only
-/// there.
-const VALIDATED_BOARD: &[u8] = b"apple,j514s";
+/// Boards the M3 runtime is validated on: the M3 Pro MacBook Pros (14" J514S, 16" J516S).
+/// `asahi.m3_expose=auto` registers the render node and `asahi.m3_backend=auto` starts the
+/// runtime only on these.
+const VALIDATED_BOARDS: &[&[u8]] = &[b"apple,j514s", b"apple,j516s"];
 
 /// Whether the root node's compatible list contains `compatible`.
 fn board_is(compatible: &[u8]) -> bool {
@@ -29,6 +30,11 @@ fn board_is(compatible: &[u8]) -> bool {
         return false;
     };
     board.split(|b| *b == 0).any(|s| s == compatible)
+}
+
+/// Whether this is a board the M3 runtime is validated on.
+pub(crate) fn runtime_validated_board() -> bool {
+    VALIDATED_BOARDS.iter().any(|board| board_is(board))
 }
 
 /// Whether the fused core-enable mask (SGX+0xe01500) describes a usable T6030 GPU: at least one
@@ -451,6 +457,6 @@ pub(crate) fn expose_render_node() -> bool {
     match *crate::module_parameters::m3_expose.value() {
         0 => false,
         v if v > 0 => true,
-        _ => board_is(VALIDATED_BOARD),
+        _ => runtime_validated_board(),
     }
 }

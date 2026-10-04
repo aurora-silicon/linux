@@ -56,10 +56,6 @@ static bool show_notch;
 module_param(show_notch, bool, 0644);
 MODULE_PARM_DESC(show_notch, "Use the full display height and shows the notch");
 
-static bool dcpext_probe;
-module_param(dcpext_probe, bool, 0444);
-MODULE_PARM_DESC(dcpext_probe, "Opt into experimental T6030 external DCP probe (may hang)");
-
 bool hdmi_audio;
 module_param(hdmi_audio, bool, 0644);
 MODULE_PARM_DESC(hdmi_audio, "Enable unstable HDMI audio support");

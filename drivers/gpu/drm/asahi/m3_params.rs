@@ -17,7 +17,6 @@ use core::sync::atomic::{
 };
 
 use kernel::{
-    c_str,
     device::Core,
     platform,
     prelude::*, //
@@ -279,13 +278,6 @@ pub(crate) enum T6030Backend {
     Off,
 }
 
-/// Whether the root node's compatible list contains `compatible`.
-fn board_is(compatible: &[u8]) -> bool {
-    kernel::of::root()
-        .and_then(|root| root.get_property::<KVec<u8>>(c_str!("compatible")).ok())
-        .is_some_and(|board| board.split(|b| *b == 0).any(|s| s == compatible))
-}
-
 /// `asahi.m3_initdata` values.
 const INITDATA_AUTO: u64 = 0;
 const INITDATA_ADT: u64 = 2;
@@ -435,9 +427,9 @@ pub(crate) fn thermal_hot_param() -> (u64, bool) {
 
 /// Select the T6030 GPU backend from `asahi.m3_backend`, and say which one and why.
 ///
-/// `auto` keeps the runtime backend on J514S, the board it is validated on. On other T6030
-/// boards it starts nothing until the runtime is validated there; `asahi.m3_backend=runtime`
-/// starts it anyway.
+/// `auto` starts the runtime backend on the boards it is validated on (the M3 Pro MacBook
+/// Pros). On other T6030 boards it starts nothing until the runtime is validated there;
+/// `asahi.m3_backend=runtime` starts it anyway.
 pub(crate) fn t6030_backend(pdev: &platform::Device<Core>) -> T6030Backend {
     let dev = pdev.as_ref();
     match M3_BACKEND.load(Ordering::Relaxed) {
@@ -453,7 +445,7 @@ pub(crate) fn t6030_backend(pdev: &platform::Device<Core>) -> T6030Backend {
             dev_info!(dev, "M3: asahi.m3_backend=off: no GPU backend started\n");
             T6030Backend::Off
         }
-        _ if board_is(b"apple,j514s") => T6030Backend::Runtime,
+        _ if crate::m3_board::runtime_validated_board() => T6030Backend::Runtime,
         _ => {
             dev_info!(
                 dev,

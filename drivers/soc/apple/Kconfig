@@ -153,15 +153,17 @@ config APPLE_PMP
 config APPLE_T6030_DISPLAY_GATE
 	bool "Apple T6030 internal display enable gate"
 	depends on ARCH_APPLE && OF_DYNAMIC && OF_OVERLAY
+	default ARCH_APPLE
 	help
 	  The T6030 device tree keeps the internal display nodes disabled so
-	  the display stays on the boot framebuffer by default. This option
-	  enables those nodes before devices are created when the command
-	  line contains apple_t6030_display.enable=1 and the boot loader has
-	  marked the display handoff as validated. On the J516S it also adds
-	  the power management processor from a built-in overlay.
+	  the display stays on the boot framebuffer until the boot loader has
+	  validated the display handoff. This option enables those nodes
+	  before devices are created once the boot loader has marked the
+	  handoff as validated. On the J516S it also adds the power
+	  management processor from a built-in overlay. It does nothing on
+	  other SoCs. apple_t6030_display.enable=0 keeps the boot framebuffer.
 
-	  Say 'n' unless you are bringing up the T6030 display.
+	  Say 'y' if you want the native display on M3 Pro MacBook Pros.
 
 endmenu
 
