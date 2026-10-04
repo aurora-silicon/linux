@@ -265,6 +265,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 	dcp->phy = route->phy;
 	dcp->dptx_phy = route->dptx_phy;
 	dcp->connector_type = DRM_MODE_CONNECTOR_USB;
+	WRITE_ONCE(dcp->ext_backlight, false);
 	if (connector) {
 		WRITE_ONCE(connector->dcp, to_platform_device(dcp->dev));
 		dcp->typec_connector = connector;

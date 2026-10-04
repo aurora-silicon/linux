@@ -1088,6 +1088,13 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 	if (dcp_is_typec_output(dcp) && *connected && dcp->nr_modes)
 		complete_all(&dcp->typec_iomfb_hpd_ready);
 
+	/* A firmware HPD loss can bypass disconnected_hpd_event(), for
+	 * example on the fixed output. Do not lend its capability to the next
+	 * sink while that sink's DisplayAttributes are still arriving.
+	 */
+	if (!*connected)
+		WRITE_ONCE(dcp->ext_backlight, false);
+
 	action = dcp_mode_hotplug(&dcp->mode_state, !!(*connected),
 				  connector ? &connector->connected : NULL);
 	/*
