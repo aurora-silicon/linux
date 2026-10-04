@@ -54,9 +54,9 @@ pub(crate) struct StatsSnapshot {
     last_busy_ts: AtomicU64,
     /// Cumulative nanoseconds the firmware reports itself as busy.
     pub(crate) busy_ns: AtomicU64,
-    /// Completed submissions since boot. Starts at 0; updated only when the
-    /// firmware signals completion. T6001 firmware does not emit a dedicated
-    /// job counter message, so this stays 0 on T6001.
+    /// Completed submissions since boot, counted at fence signal in
+    /// `JobFence::command_complete` when the last command of a submission
+    /// completes.
     pub(crate) jobs: AtomicU64,
 }
 
@@ -152,8 +152,9 @@ impl StatsSnapshot {
         }
     }
 
-    /// Bump the submission completion counter (called from the queue submit
-    /// path, NOT from the stats channel).
+    /// Bump the completed-submission counter (called from the queue
+    /// completion path in `JobFence::command_complete`, NOT from the stats
+    /// channel).
     pub(crate) fn note_job(&self) {
         self.jobs.fetch_add(1, Ordering::Relaxed);
     }

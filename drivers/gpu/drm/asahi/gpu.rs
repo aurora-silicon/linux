@@ -256,6 +256,7 @@ pub(crate) struct GpuManager {
     fwctl_channel: Mutex<channel::FwCtlChannel>,
     pipes: PipeChannels::ver,
     event_manager: Arc<event::EventManager>,
+    stats: Arc<stats::StatsSnapshot>,
     buffer_mgr: buffer::BufferManager::ver,
     ids: SequenceIDs,
     #[allow(clippy::vec_box)]
@@ -771,6 +772,7 @@ impl GpuManager::ver {
                 rtkit <- new_mutex!(None, "rtkit"),
                 crashed: AtomicBool::new(false),
                 event_manager,
+                stats: stats_snap.clone(),
                 alloc <- new_mutex!(alloc, "alloc"),
                 fwctl_channel <- new_mutex!(fwctl_channel, "fwctl_channel"),
                 rx_channels <- new_mutex!(KBox::<RxChannels::ver>::into_inner(rx_channels), "rx_channels"),
@@ -1358,6 +1360,7 @@ impl GpuManager for GpuManager::ver {
                 ualloc,
                 ualloc_priv,
                 self.event_manager.clone(),
+                self.stats.clone(),
                 &self.buffer_mgr,
                 id,
                 priority,
