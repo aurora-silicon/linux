@@ -493,6 +493,24 @@ static void afk_recv_handle_std_service(struct apple_dcp_afkep *ep, u32 channel,
 			 ep->endpoint, channel);
 		return;
 	}
+	/*
+	 * 14.7 can return only an IOReturn, including after a host timeout or
+	 * service teardown. Use the normal result path to release late-ack DMA
+	 * and command slots with their original allocation lengths.
+	 */
+	if (ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
+	    eshdr->category == EPIC_CAT_REPLY && payload_size >= 4 &&
+	    payload_size < sizeof(struct epic_cmd)) {
+		struct epic_cmd cmd = {};
+		u16 tag = le16_to_cpu(eshdr->tag);
+
+		memcpy(&cmd.retcode, payload, sizeof(cmd.retcode));
+		dev_err(ep->dcp->dev,
+			"AFK[ep:%02x]: channel %d short reply type %#x tag %#x ret %#x\n",
+			ep->endpoint, channel, type, tag, le32_to_cpu(cmd.retcode));
+		return afk_recv_handle_reply(ep, channel, tag, &cmd, sizeof(cmd));
+	}
+
 	if (service->torndown) {
 		dev_warn(ep->dcp->dev,
 			 "AFK[ep:%02x]: std service notify on torn down service "
@@ -544,42 +562,6 @@ static void afk_recv_handle_std_service(struct apple_dcp_afkep *ep, u32 channel,
 		if (service->ops->report)
 			service->ops->report(service, le16_to_cpu(eshdr->type),
 					     payload, payload_size);
-		return;
-	}
-
-	/*
-	 * 14.7 answers a command to an unpublished interface with a NOTIFY
-	 * whose category is REPLY and whose payload is one IOReturn
-	 * (kIOReturnNoDevice is 0xe00002c0). That is the command result.
-	 */
-	if (ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
-	    eshdr->category == EPIC_CAT_REPLY && payload_size >= 4 &&
-	    payload_size < sizeof(struct epic_cmd)) {
-		u32 rc;
-		u16 tag = le16_to_cpu(eshdr->tag);
-		u8 idx = tag & 0xff;
-		unsigned long flags;
-
-		memcpy(&rc, payload, sizeof(rc));
-		rc = le32_to_cpu(rc);
-		dev_err(ep->dcp->dev,
-			"AFK[ep:%02x]: channel %d short reply type %#x tag %#x ret %#x\n",
-			ep->endpoint, channel, type, tag, rc);
-		if (idx < MAX_PENDING_CMDS) {
-			spin_lock_irqsave(&service->lock, flags);
-			if (test_bit(idx, service->cmd_map) &&
-			    !service->cmds[idx].done &&
-			    service->cmds[idx].tag == tag) {
-				/* A result with no reply payload, not a short reply. */
-				service->cmds[idx].reply_len = 0;
-				service->cmds[idx].reply_len_valid = true;
-				service->cmds[idx].done = true;
-				service->cmds[idx].retcode = rc;
-				if (service->cmds[idx].completion)
-					complete(service->cmds[idx].completion);
-			}
-			spin_unlock_irqrestore(&service->lock, flags);
-		}
 		return;
 	}
 
