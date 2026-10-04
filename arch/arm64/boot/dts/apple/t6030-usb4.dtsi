@@ -144,7 +144,17 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1077 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
-			/* apple,tunable is filled by the bootloader */
+			/* No bootloader fills this one; the tunnel's cold init needs it. */
+			apple,tunable =
+				<0x20c 0x800001b7 0x800001b7>,
+				<0x220 0xf0f0f 0xf0f0f>,
+				<0x224 0xffffff 0x80808>,
+				<0x300 0x1f31 0x1>,
+				<0x308 0x3ffffffc 0x10000000>,
+				<0x310 0x3ffffffc 0x3ffffffc>,
+				<0x318 0x1f31 0x1>,
+				<0x320 0x3ffffffc 0x1f00000>,
+				<0x328 0x3ffffffc 0x1f0bffc>;
 		};
 
 		usb4_0_pcie: pcie@730000000 {
@@ -164,7 +174,17 @@
 			interrupts = <AIC_IRQ 1076 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_atc0_cio_pcie>;
 			apple,pciec-kernel-init;
-			/* apple,tunable-oe-fabric is filled by the bootloader */
+			/*
+			 * m1n1 fills the rc, fabric and debug tunables through the
+			 * usb4_0_pcie alias, but not this one.
+			 */
+			apple,tunable-oe-fabric =
+				<0x4 0x70007 0x40004>,
+				<0x8 0x1 0x1>,
+				<0xc 0x1 0x1>,
+				<0x10 0x801f 0x4>,
+				<0x18 0x801f 0x4>,
+				<0x20 0x801f 0x4>;
 			msi-controller;
 			msi-parent = <&usb4_0_pcie>;
 			msi-ranges = <&aic AIC_IRQ 1342 IRQ_TYPE_EDGE_RISING 0x200>;
