@@ -34,9 +34,17 @@ struct dcp_v14_event {
 /* Called with the lock held. */
 static void link_fail(struct dcp_v14_link *link)
 {
+	struct dcp_v14_event *e, *next;
+
 	if (!link->failed)
 		dev_err(link->dev, "DCP link stopped; firmware buffers are kept until reboot\n");
 	link->failed = true;
+	/* Nothing dequeues events from a failed link. */
+	list_for_each_entry_safe(e, next, &link->events, list) {
+		list_del(&e->list);
+		kfree(e);
+	}
+	link->event_count = 0;
 	wake_up(&link->wait);
 }
 
@@ -372,6 +380,7 @@ int dcp_v14_link_pump(struct dcp_v14_link *link, unsigned long timeout,
 /*
  * Calls @tag and handles the callbacks that arrive until its reply, and, for
  * a non-zero @completion_id, until the swap-complete callback for that swap.
+ * A call that fails once submitted, including by timing out, stops the link.
  * Must not be called concurrently with itself or dcp_v14_link_pump(), except
  * from inside a callback handler.
  */
@@ -434,8 +443,10 @@ retry:
 		struct dcp_v14_event *e = link_next_event(link, max_t(long, deadline - jiffies, 0));
 		struct apple_dcp_link_rpc_header *h;
 
-		if (IS_ERR(e))
-			return PTR_ERR(e);
+		if (IS_ERR(e)) {
+			ret = PTR_ERR(e);
+			goto abandon;
+		}
 		h = (void *)e->data;
 		if (e->kind == DCP_V14_EVENT_REPLY) {
 			if (replied || e->size != size || e->message != expected ||
@@ -456,9 +467,16 @@ retry:
 		}
 		kfree(e);
 		if (ret)
-			return ret;
+			goto abandon;
 		if (replied && (!completion_id || completed == completion_id))
 			return 0;
 	}
-	return -ETIMEDOUT;
+	ret = -ETIMEDOUT;
+abandon:
+	/* The firmware may still answer: queue nothing for a call nobody waits for. */
+	mutex_lock(&link->lock);
+	link->calls[nested].active = false;
+	link_fail(link);
+	mutex_unlock(&link->lock);
+	return ret;
 }
