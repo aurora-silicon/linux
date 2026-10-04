@@ -215,6 +215,22 @@ static int parse_bool(struct dcp_parse_ctx *handle, bool *b)
 	return 0;
 }
 
+/*
+ * For an optional flag: a value of another type reads as false instead of
+ * failing the whole dictionary, which the key did not do before it was read.
+ */
+static int parse_bool_or_skip(struct dcp_parse_ctx *handle, bool *b)
+{
+	struct dcp_parse_ctx at = *handle;
+
+	if (!parse_bool(handle, b))
+		return 0;
+
+	*handle = at;
+	*b = false;
+	return skip(handle);
+}
+
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
 static int parse_blob(struct dcp_parse_ctx *handle, size_t size, u8 const **blob)
 {
@@ -633,7 +649,7 @@ int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
 		else if (!strcmp(key, "MaxVerticalImageSize"))
 			ret = parse_int(it.handle, &height_cm);
 		else if (!strcmp(key, "SupportsBacklightControl"))
-			ret = parse_bool(it.handle, backlight_control);
+			ret = parse_bool_or_skip(it.handle, backlight_control);
 		else
 			skip(it.handle);
 
