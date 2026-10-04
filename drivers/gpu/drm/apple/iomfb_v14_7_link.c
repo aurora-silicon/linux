@@ -415,6 +415,10 @@ retry:
 			ret = dcp_v14_link_pump(link, 0, callback, cookie);
 			if (ret) {
 				kfree(packet);
+				/* The caller gives up on the session: stop queueing. */
+				mutex_lock(&link->lock);
+				link_fail(link);
+				mutex_unlock(&link->lock);
 				return ret;
 			}
 		}
@@ -422,6 +426,7 @@ retry:
 	mutex_lock(&link->lock);
 	nested = link->callback_depth != 0;
 	if (nested && !link->callback_count) {
+		link_fail(link);
 		mutex_unlock(&link->lock);
 		kfree(packet);
 		return -EPROTO;
