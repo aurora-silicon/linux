@@ -3,6 +3,7 @@
 
 #include <linux/atomic.h>
 #include <linux/device.h>
+#include <linux/of.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
 #include <linux/unaligned.h>
@@ -736,6 +737,15 @@ static const struct apple_epic_service_ops ibootep_ops[] = {
 int ibootep_init(struct apple_dcp *dcp)
 {
 	int ret;
+
+	if (!of_machine_is_compatible("apple,t6030") &&
+	    !of_machine_is_compatible("apple,t6031") &&
+	    !of_machine_is_compatible("apple,t6032") &&
+	    !of_machine_is_compatible("apple,t8122")) {
+		dcp->ibootep = afk_init(dcp, DISP0_ENDPOINT, ibootep_ops);
+		afk_start(dcp->ibootep);
+		return 0;
+	}
 
 	if (dcp->ibootep)
 		return -EBUSY;
