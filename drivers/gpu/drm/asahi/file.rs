@@ -56,6 +56,8 @@ const DEBUG_CLASS: DebugFlags = DebugFlags::File;
 
 pub(crate) const MAX_COMMANDS_PER_SUBMISSION: u32 = 64;
 
+const LEGACY_VM_USER_RANGE: Range<u64> = mmu::IOVA_USER_BASE..mmu::IOVA_UNK_PAGE;
+
 
 
 /// A client instance of an `mmu::Vm` address space.
@@ -709,8 +711,17 @@ impl File {
             return Err(EINVAL);
         }
 
-        // The user range is per-device geometry, so this check moves below
-        // the VM lookup (which is where the range is stored).
+        if file.inner().m3_client.is_none()
+            && !LEGACY_VM_USER_RANGE.is_superset(range.clone())
+        {
+            cls_pr_debug!(
+                Errors,
+                "gem_bind: Invalid map range {:#x}..{:#x} (not contained in user range)\n",
+                start,
+                end
+            );
+            return Err(EINVAL); // Invalid map range
+        }
 
         let prot = if data.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_READ != 0 {
             if data.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE != 0 {
@@ -740,7 +751,7 @@ impl File {
         let _ = guarded_vm;
         core::mem::drop(guard);
 
-        if !user_range.is_superset(range.clone()) {
+        if file.inner().m3_client.is_some() && !user_range.is_superset(range.clone()) {
             cls_pr_debug!(
                 Errors,
                 "gem_bind: Invalid map range {:#x}..{:#x} (not contained in user range)\n",
@@ -802,6 +813,18 @@ impl File {
         let end = data.addr.checked_add(data.range).ok_or(EINVAL)?;
         let range = start..end;
 
+        if file.inner().m3_client.is_none()
+            && !LEGACY_VM_USER_RANGE.is_superset(range.clone())
+        {
+            cls_pr_debug!(
+                Errors,
+                "gem_bind: Invalid unmap range {:#x}..{:#x} (not contained in user range)\n",
+                start,
+                end
+            );
+            return Err(EINVAL); // Invalid unmap range
+        }
+
         let vms_xa = file.inner().vms();
         let guard = vms_xa.lock();
         let guarded_vm = guard.get(vm_id).ok_or(ENOENT)?;
@@ -813,7 +836,7 @@ impl File {
         let _ = guarded_vm;
         core::mem::drop(guard);
 
-        if !user_range.is_superset(range.clone()) {
+        if file.inner().m3_client.is_some() && !user_range.is_superset(range.clone()) {
             cls_pr_debug!(
                 Errors,
                 "gem_bind: Invalid unmap range {:#x}..{:#x} (not contained in user range)\n",
