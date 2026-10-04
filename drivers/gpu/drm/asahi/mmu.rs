@@ -628,6 +628,50 @@ impl VmInner {
             .unwrap_or(false)
     }
 
+    /// Copy `out.len()` bytes at `iova` from the pages this VM maps, through
+    /// the kernel's linear map. `before_copy` receives the kernel address and
+    /// length of each chunk, which never crosses a page, before it is copied.
+    ///
+    /// The caller holds the VM execution lock for the whole call. Every PTE
+    /// change takes that lock, and a page leaves the page table before the GEM
+    /// reference that keeps it allocated is released, so a concurrent unbind
+    /// or GEM close cannot free a page while it is being read.
+    fn copy_from_mapped_pages(
+        &mut self,
+        iova: u64,
+        out: &mut [u8],
+        mut before_copy: impl FnMut(*mut u8, usize),
+    ) -> Result {
+        let total = out.len();
+        let mut done = 0usize;
+        while done < total {
+            let addr = iova.checked_add(done as u64).ok_or(EOVERFLOW)?;
+            let phys = self.page_table.translate_iova(addr)?;
+            let page_mask = (kernel::page::PAGE_SIZE as PhysicalAddr) - 1;
+            let page_phys = phys & !page_mask;
+            let offset = (phys - page_phys) as usize;
+            let chunk = cmp::min(kernel::page::PAGE_SIZE - offset, total - done);
+            // SAFETY: `translate_iova` resolved this address through a leaf
+            // PTE of this VM while the VM execution lock is held. The lock
+            // stays held until the copy below finishes, so the PTE cannot be
+            // removed and the GEM object it maps keeps the page allocated.
+            // `borrow_phys` additionally rejects anything without a struct
+            // page.
+            let page = unsafe { Page::borrow_phys(&page_phys) }.ok_or(EFAULT)?;
+            let dst = &mut out[done..done + chunk];
+            page.with_pointer_into_page(offset, chunk, |ptr| {
+                before_copy(ptr, chunk);
+                // SAFETY: `with_pointer_into_page` bounds-checked
+                // `offset..offset + chunk` inside the page.
+                let src = unsafe { core::slice::from_raw_parts(ptr as *const u8, chunk) };
+                dst.copy_from_slice(src);
+                Ok(())
+            })?;
+            done += chunk;
+        }
+        Ok(())
+    }
+
     /// Map an `mm::Node` representing an mapping in VA space.
     fn map_node(&mut self, node: &mm::Node<(), KernelMappingInner>, prot: Prot) -> Result {
         let mut iova = node.start();
@@ -1845,10 +1889,8 @@ impl Vm {
     /// the cores gated.
     ///
     /// The VM execution lock is held from the coverage check until the last
-    /// byte is copied. Every PTE change takes that lock, and a page leaves the
-    /// page table before the GEM reference that keeps it allocated is
-    /// released, so a concurrent unbind or GEM close cannot free a page while
-    /// it is being read.
+    /// byte is copied, so a concurrent unbind or GEM close cannot free a page
+    /// while it is being read.
     ///
     /// M3 compute validates the client control stream before publishing it.
     pub(crate) fn read_bytes(&self, iova: u64, out: &mut [u8]) -> Result {
@@ -1859,33 +1901,28 @@ impl Vm {
         if !inner.covers_mapped_range(iova, out.len() as u64, true, false) {
             return Err(EFAULT);
         }
-        let total = out.len();
-        let mut done = 0usize;
-        while done < total {
-            let addr = iova.checked_add(done as u64).ok_or(EOVERFLOW)?;
-            let phys = inner.page_table.translate_iova(addr)?;
-            let page_mask = (kernel::page::PAGE_SIZE as PhysicalAddr) - 1;
-            let page_phys = phys & !page_mask;
-            let offset = (phys - page_phys) as usize;
-            let chunk = cmp::min(kernel::page::PAGE_SIZE - offset, total - done);
-            // SAFETY: `translate_iova` resolved this address through a leaf
-            // PTE of this VM while the VM execution lock is held. The lock
-            // stays held until the copy below finishes, so the PTE cannot be
-            // removed and the GEM object it maps keeps the page allocated.
-            // `borrow_phys` additionally rejects anything without a struct
-            // page.
-            let page = unsafe { Page::borrow_phys(&page_phys) }.ok_or(EFAULT)?;
-            let dst = &mut out[done..done + chunk];
-            page.with_pointer_into_page(offset, chunk, |ptr| {
-                // SAFETY: `with_pointer_into_page` bounds-checked
-                // `offset..offset + chunk` inside the page.
-                let src = unsafe { core::slice::from_raw_parts(ptr as *const u8, chunk) };
-                dst.copy_from_slice(src);
-                Ok(())
-            })?;
-            done += chunk;
+        inner.copy_from_mapped_pages(iova, out, |_, _| {})
+    }
+
+    /// Read the bytes this VM maps at `iova`, calling `before_copy` with the
+    /// kernel address and length of each chunk, within one page, before it is
+    /// copied.
+    ///
+    /// Unlike `read_bytes`, this checks no GPU access permission: an unmapped
+    /// address simply fails translation. The VM execution lock is held from
+    /// the first translation until the last copy, so a concurrent unbind or
+    /// GEM close cannot free a page while it is being read.
+    pub(crate) fn read_mapped_bytes(
+        &self,
+        iova: u64,
+        out: &mut [u8],
+        before_copy: impl FnMut(*mut u8, usize),
+    ) -> Result {
+        if out.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let mut inner = self.inner.exec_lock(None, false)?;
+        inner.copy_from_mapped_pages(iova, out, before_copy)
     }
 
     /// Snapshot the first `out.len()` hardware context-table (TTBAT) entries

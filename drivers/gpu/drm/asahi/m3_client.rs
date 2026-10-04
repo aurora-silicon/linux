@@ -18,11 +18,6 @@ use core::sync::atomic::{
 };
 
 use kernel::{
-    addr::PhysicalAddr,
-    page::{
-        Page,
-        PAGE_SIZE, //
-    },
     prelude::*,
     uapi,
 };
@@ -201,29 +196,11 @@ pub(crate) fn check_compute_launches<A: GpuAddressSpace>(
 /// speculative fetch. Each line is cleaned and invalidated before it is read, so the bytes
 /// come from memory, as the GPU will fetch them. Cleaning never discards data: a dirty line from
 /// a cached mapping is written back first.
+///
+/// `Vm::read_mapped_bytes` holds the VM execution lock from translation until the copy, so the
+/// pages cannot be unmapped and freed while they are cleaned and read.
 fn read_through_cache(vm: &mmu::Vm, iova: u64, out: &mut [u8]) -> Result {
-    let mut done = 0usize;
-    while done < out.len() {
-        let address = iova.checked_add(done as u64).ok_or(EOVERFLOW)?;
-        let phys = vm.translate_iova(address)?;
-        let offset = (phys & (PAGE_SIZE as PhysicalAddr - 1)) as usize;
-        let page_phys = phys - offset as PhysicalAddr;
-        let chunk = (PAGE_SIZE - offset).min(out.len() - done);
-        // SAFETY: `translate_iova` resolved the address through a leaf entry of this VM, so it
-        // names a page of an object mapped, and therefore pinned, in the VM (as for
-        // `Vm::read_bytes`). `borrow_phys` rejects addresses without a struct page.
-        let page = unsafe { Page::borrow_phys(&page_phys) }.ok_or(EFAULT)?;
-        let dst = &mut out[done..done + chunk];
-        page.with_pointer_into_page(offset, chunk, |src| {
-            clean_invalidate(src as usize, chunk);
-            // SAFETY: `with_pointer_into_page` checked `offset..offset + chunk` against the
-            // page, and `dst` is `chunk` bytes long.
-            unsafe { core::ptr::copy_nonoverlapping(src.cast_const(), dst.as_mut_ptr(), chunk) };
-            Ok(())
-        })?;
-        done += chunk;
-    }
-    Ok(())
+    vm.read_mapped_bytes(iova, out, |src, len| clean_invalidate(src as usize, len))
 }
 
 /// Clean and invalidate the data cache lines covering `start..start + len` to the point of
