@@ -57,4 +57,8 @@ Description:
 
 		Field meanings (units, window, saturation) are documented in
 		`drivers/gpu/drm/asahi/stats.rs` and may evolve with firmware
-		revisions.
+		revisions. busy_ns is monotonic non-decreasing while the device
+		is bound (it only accumulates). The snapshot struct is
+		`#[repr(C)]` on the Rust side and its offsets are asserted at
+		build time in `sysfs.c`; readers must parse `key value` lines and
+		must not assume binary layout of this file.

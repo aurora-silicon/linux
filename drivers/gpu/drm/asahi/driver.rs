@@ -2,6 +2,7 @@
 
 //! Top-level GPU driver implementation.
 
+use crate::module_parameters;
 use kernel::bindings;
 use kernel::{
     c_str,
@@ -249,7 +250,7 @@ impl platform::Driver for AsahiDriver {
         // Register the sysfs file on the platform device. Must happen after
         // the DRM device is registered so the device is fully bound.
         let raw_dev = pdev.as_ref().as_raw();
-        crate::sysfs_exports::register(raw_dev)?;
+        crate::sysfs_exports::register(raw_dev, *module_parameters::stats_export.value() != 0)?;
 
         Ok(Self { drm, raw_dev })
     }

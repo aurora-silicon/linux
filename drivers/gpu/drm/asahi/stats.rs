@@ -35,10 +35,12 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Process-wide snapshot of AGX firmware stats.
 ///
-/// Lives in the `GpuManager`; the raw pointer is published to a module-level
-/// `AtomicPtr` (`stats::SNAPSHOT_PTR`) for the C `show` callback to read
-/// without walking the kernel object graph.
+/// Lives in the `GpuManager`; the C static `asahi_stats_snapshot_ptr` (see
+/// `sysfs.c`) holds its address for the C `show` callback, so the field
+/// layout is a cross-language contract: `#[repr(C)]` makes the declaration
+/// order binding and `sysfs.c` asserts the offsets at build time.
 #[derive(Default)]
+#[repr(C)]
 pub(crate) struct StatsSnapshot {
     pub(crate) util1: AtomicU32,
     pub(crate) util2: AtomicU32,

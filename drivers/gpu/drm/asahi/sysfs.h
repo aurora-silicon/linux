@@ -5,7 +5,7 @@
 
 struct device;
 
-int asahi_sysfs_register(struct device *dev);
+int asahi_sysfs_register(struct device *dev, int export_enabled);
 void asahi_sysfs_unregister(struct device *dev);
 void asahi_stats_set_snapshot_ptr(unsigned long long p);
 

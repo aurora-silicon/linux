@@ -17,6 +17,7 @@
 #include <linux/errno.h>
 #include <linux/export.h>
 #include <linux/module.h>
+#include <linux/stddef.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
 #include <linux/types.h>
@@ -24,10 +25,16 @@
 #include "sysfs.h"
 
 /*
- * Mirror of `crate::stats::StatsSnapshot` field layout. Rust sets
+ * Mirror of `#[repr(C)] crate::stats::StatsSnapshot` field layout. Rust sets
  * `asahi_stats_snapshot_ptr` (an atomic u64) to the heap address of one of
  * these, and clears it on unregister. Field reads are all `Relaxed` atomic
  * u32 / u64 (the C side uses READ_ONCE).
+ *
+ * The Rust struct carries `#[repr(C)]` so this declaration order is binding;
+ * the BUILD_BUG_ONs in asahi_sysfs_register() turn any drift (a repr(Rust)
+ * struct is silently reordered by rustc, which once cross-aligned this
+ * readout: busy_ns bounced in 2^32 steps and jobs read 0 while incrementing)
+ * into a compile error.
  */
 struct asahi_stats_snapshot {
 	u32 util1;
@@ -44,6 +51,8 @@ struct asahi_stats_snapshot {
 	u64 busy_ns;
 	u64 jobs;
 };
+
+static int asahi_stats_export_enabled;
 
 /*
  * Set by Rust through asahi_stats_set_snapshot_ptr(); read via READ_ONCE.
@@ -68,7 +77,7 @@ static ssize_t agx_stats_show(struct device *dev,
 	rcu_read_lock();
 	snap = (struct asahi_stats_snapshot __rcu *)
 		READ_ONCE(asahi_stats_snapshot_ptr);
-	if (!snap) {
+	if (!snap || !READ_ONCE(asahi_stats_export_enabled)) {
 		rcu_read_unlock();
 		return scnprintf(buf, PAGE_SIZE, "unsupported\n");
 	}
@@ -103,12 +112,20 @@ static DEVICE_ATTR_RO(agx_stats);
  * Called from Rust's `AsahiDriver::probe` after the DRM device is
  * registered. Returns 0 on success, or a negative errno.
  */
-int asahi_sysfs_register(struct device *dev)
+int asahi_sysfs_register(struct device *dev, int export_enabled)
 {
 	int ret;
 
 	if (!dev)
 		return -ENODEV;
+
+	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, pstate) != 16);
+	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, last_busy_ts) != 40);
+	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, busy_ns) != 48);
+	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, jobs) != 56);
+	BUILD_BUG_ON(sizeof(struct asahi_stats_snapshot) != 64);
+
+	WRITE_ONCE(asahi_stats_export_enabled, export_enabled);
 
 	ret = device_create_file(dev, &dev_attr_agx_stats);
 	if (ret)

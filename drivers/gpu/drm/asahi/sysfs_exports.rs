@@ -9,8 +9,9 @@
 use core::ffi::{c_int, c_ulonglong};
 
 extern "C" {
-    /// Register the `agx_stats` sysfs file on `dev`. Returns 0 on success.
-    fn asahi_sysfs_register(dev: *mut kernel::bindings::device) -> c_int;
+    /// Register the `agx_stats` sysfs file on `dev`; `export_enabled` 0
+    /// makes the file print `unsupported`. Returns 0 on success.
+    fn asahi_sysfs_register(dev: *mut kernel::bindings::device, export_enabled: c_int) -> c_int;
 
     /// Unregister the `agx_stats` sysfs file and clear the snapshot pointer.
     fn asahi_sysfs_unregister(dev: *mut kernel::bindings::device);
@@ -22,8 +23,11 @@ extern "C" {
 
 /// Register the sysfs file. Safe to call from `AsahiDriver::probe` after the
 /// DRM device has been registered.
-pub(crate) fn register(dev: *mut kernel::bindings::device) -> kernel::error::Result {
-    let ret = unsafe { asahi_sysfs_register(dev) };
+pub(crate) fn register(
+    dev: *mut kernel::bindings::device,
+    export_enabled: bool,
+) -> kernel::error::Result {
+    let ret = unsafe { asahi_sysfs_register(dev, export_enabled as c_int) };
     if ret < 0 {
         Err(unsafe { kernel::error::Error::from_errno(ret) })
     } else {
