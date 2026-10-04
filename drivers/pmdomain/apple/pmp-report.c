@@ -1099,7 +1099,8 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return dev_err_probe(dev, ret, "missing label property\n");
 
-	ent->no_ack = of_property_read_bool(node, "apple,no-ack");
+	ent->no_ack = ((struct apple_pmp_report *)dev_get_drvdata(dev->parent))->offsets->starts_pmp &&
+		of_property_read_bool(node, "apple,no-ack");
 	if (of_property_read_bool(node, "apple,always-on")) {
 		ent->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
 		apple_pmp_report_set_state(&ent->genpd, true);

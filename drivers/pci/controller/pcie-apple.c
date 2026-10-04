@@ -1834,7 +1834,7 @@ static int apple_msi_init(struct apple_pcie *pcie)
 	}
 
 	/* Keep map targets within the supported 8-bit range. */
-	if (pcie->hw->port_msimap &&
+	if (pcie->hw == &t8122_pciec_hw &&
 	    (!pcie->nvecs || pcie->nvecs > 256 ||
 	     pcie->msi_vector_base >
 	     FIELD_MAX(PORT_MSIMAP_TARGET) + 1 - pcie->nvecs)) {
