@@ -3527,16 +3527,25 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	if (dcp->external)
 		return iomfb_v14_7_external_start(dcp);
 
-	return component_add(&pdev->dev, &dcp_comp_ops);
+	ret = component_add(&pdev->dev, &dcp_comp_ops);
+	/* A failed bind run from here may already have started RTKit. */
+	if (ret && dcp->fw_compat == DCP_FIRMWARE_V_14_7)
+		iomfb_v14_7_remove(dcp);
+	return ret;
 }
 
 static void dcp_platform_remove(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	if (dcp && dcp->external)
+	if (dcp && dcp->external) {
+		iomfb_v14_7_remove(dcp);
 		return;
+	}
 	component_del(&pdev->dev, &dcp_comp_ops);
+	/* Unbind does not wait for RTKit callbacks, or run if bind failed late. */
+	if (dcp && dcp->fw_compat == DCP_FIRMWARE_V_14_7)
+		iomfb_v14_7_remove(dcp);
 }
 
 static void dcp_platform_shutdown(struct platform_device *pdev)

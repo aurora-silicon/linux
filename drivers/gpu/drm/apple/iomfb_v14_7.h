@@ -18,6 +18,8 @@ int iomfb_v14_7_bind(struct apple_dcp *dcp);
 int iomfb_v14_7_external_start(struct apple_dcp *dcp);
 /* Component unbind: KMS goes away; the firmware session is kept until reboot. */
 void iomfb_v14_7_unbind(struct apple_dcp *dcp);
+/* Platform remove: the apple_dcp is freed next; the firmware session is kept. */
+void iomfb_v14_7_remove(struct apple_dcp *dcp);
 /* DCPLink, start signal, first client open and the panel mode. */
 int iomfb_v14_7_start(struct apple_dcp *dcp);
 

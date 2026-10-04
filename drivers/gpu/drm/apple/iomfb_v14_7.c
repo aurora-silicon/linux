@@ -86,7 +86,7 @@ struct dcp_v14_buffer {
 
 struct apple_dcp_v14 {
 	struct device *dev;
-	/* Cleared when KMS unbinds; the firmware session outlives it. */
+	/* Cleared on KMS unbind and on removal; the firmware session outlives it. */
 	struct apple_dcp *dcp;
 	struct apple_rtkit *rtk;
 	struct dcp_v14_link link;
@@ -674,34 +674,36 @@ static void dcp_v14_crashed(void *cookie, const void *crashlog, size_t crashlog_
 static void dcp_v14_recv(void *cookie, u8 endpoint, u64 message)
 {
 	struct apple_dcp_v14 *v14 = cookie;
+	/* NULL once removal has started; removal waits for this callback. */
+	struct apple_dcp *dcp = READ_ONCE(v14->dcp);
 
-	if (endpoint == DISP0_ENDPOINT && v14->dcp && v14->dcp->external) {
-		if (v14->dcp->ibootep)
-			afk_receive_message(v14->dcp->ibootep, message);
+	if (endpoint == DISP0_ENDPOINT && dcp && dcp->external) {
+		if (dcp->ibootep)
+			afk_receive_message(dcp->ibootep, message);
 		return;
 	}
 	if (endpoint == DPTX_ENDPOINT) {
 		dev_info(v14->dev, "DPTX message %#llx\n", message);
-		if (v14->dcp && v14->dcp->dptxep)
-			afk_receive_message(v14->dcp->dptxep, message);
+		if (dcp && dcp->dptxep)
+			afk_receive_message(dcp->dptxep, message);
 		return;
 	}
 	if (endpoint == DPAV_CTRL_ENDPOINT) {
 		dev_info(v14->dev, "DPAV message %#llx\n", message);
-		if (v14->dcp && v14->dcp->dpavctrlep)
-			afk_receive_message(v14->dcp->dpavctrlep, message);
+		if (dcp && dcp->dpavctrlep)
+			afk_receive_message(dcp->dpavctrlep, message);
 		return;
 	}
 	if (endpoint == AV_ENDPOINT) {
 		dev_info(v14->dev, "AV message %#llx\n", message);
-		if (v14->dcp && v14->dcp->avep)
-			afk_receive_message(v14->dcp->avep, message);
+		if (dcp && dcp->avep)
+			afk_receive_message(dcp->avep, message);
 		return;
 	}
 	if (endpoint == DPAVSERV_ENDPOINT) {
 		dev_info(v14->dev, "DPAVSERV message %#llx\n", message);
-		if (v14->dcp && v14->dcp->dcpavservep)
-			afk_receive_message(v14->dcp->dcpavservep, message);
+		if (dcp && dcp->dcpavservep)
+			afk_receive_message(dcp->dcpavservep, message);
 		return;
 	}
 	if (endpoint != APPLE_DCP_LINK_ENDPOINT) {
@@ -1196,6 +1198,43 @@ void iomfb_v14_7_unbind(struct apple_dcp *dcp)
 	WRITE_ONCE(v14->dcp, NULL);
 	if (v14->rtk)
 		dev_info(dcp->dev, "display unbound; the DCP session and its buffers are kept until reboot\n");
+}
+
+/* Waits for the messages dcp_v14_recv() has already queued for its endpoints. */
+static void dcp_v14_flush_endpoints(struct apple_dcp *dcp)
+{
+	struct apple_dcp_afkep *eps[] = {
+		dcp->ibootep, dcp->dptxep, dcp->dpavctrlep, dcp->avep, dcp->dcpavservep,
+	};
+	int i;
+
+	/* A failed afk_init() can leave an error pointer behind. */
+	for (i = 0; i < ARRAY_SIZE(eps); i++)
+		if (!IS_ERR_OR_NULL(eps[i]))
+			flush_workqueue(eps[i]->wq);
+}
+
+void iomfb_v14_7_remove(struct apple_dcp *dcp)
+{
+	struct apple_dcp_v14 *v14;
+
+	/* Bring-up creates the external session; a late dcpext_start must not. */
+	if (dcp->external)
+		disable_work_sync(&dcp->external_work);
+	v14 = dcp->v14;
+	if (!v14)
+		return;
+	/*
+	 * devres frees the apple_dcp next, but RTKit keeps calling into v14.
+	 * Callbacks that already loaded the old pointer finish before the
+	 * flush returns; later ones see NULL.
+	 */
+	WRITE_ONCE(v14->dcp, NULL);
+	if (v14->rtk)
+		apple_rtkit_flush_rx(v14->rtk);
+	/* Their endpoints are freed with the apple_dcp too; nothing queues more now. */
+	dcp_v14_flush_endpoints(dcp);
+	cancel_work_sync(&v14->idle_work);
 }
 
 static int dcp_v14_status_show(struct seq_file *m, void *unused)

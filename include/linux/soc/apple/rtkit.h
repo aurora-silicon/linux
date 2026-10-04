@@ -225,6 +225,15 @@ int apple_rtkit_send_message(struct apple_rtkit *rtk, u8 ep, u64 message,
 int apple_rtkit_poll(struct apple_rtkit *rtk);
 
 /*
+ * Wait until the messages already received have been handled, including the
+ * recv_message, crashed and shmem_setup callbacks the worker thread ran for
+ * them. Must not be called from one of those callbacks.
+ *
+ * @rtk:            RTKit reference
+ */
+void apple_rtkit_flush_rx(struct apple_rtkit *rtk);
+
+/*
  * Checks if an endpoint with a given index exists
  *
  * @rtk:            RTKit reference
