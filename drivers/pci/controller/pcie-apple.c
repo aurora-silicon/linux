@@ -2839,10 +2839,6 @@ int apple_pcie_tunnel_quiesce(struct device *dev)
 	if (!pcie->bus_stopped) {
 		struct pci_dev *pdev, *tmp;
 
-		/* Masking PORT_INTMSK alone does not drain an in-flight handler. */
-		list_for_each_entry(port, &pcie->ports, entry)
-			apple_pcie_port_disable_irq(port);
-
 		pci_walk_bus(bridge->bus, pci_dev_set_disconnected, NULL);
 
 		/*
@@ -2858,6 +2854,10 @@ int apple_pcie_tunnel_quiesce(struct device *dev)
 
 		pcie->bus_stopped = true;
 	}
+
+	/* Endpoint removal may still need INTx while the port is clocked. */
+	list_for_each_entry(port, &pcie->ports, entry)
+		apple_pcie_port_disable_irq(port);
 
 	/*
 	 * Removing the IOMMU later resumes it and issues a command. Gate
@@ -2924,11 +2924,12 @@ int apple_pcie_tunnel_restore(struct device *dev)
 
 	apple_pcie_tunnel_wait_ready(pcie);
 	pci_lock_rescan_remove();
+	/* Rescan publishes endpoints and can probe interrupt-dependent drivers. */
+	list_for_each_entry(port, &pcie->ports, entry)
+		apple_pcie_port_enable_irq(port);
 	pci_rescan_bus(bridge->bus);
 	pci_walk_bus(bridge->bus, apple_pcie_tunnel_keep_d0, NULL);
 	pcie->bus_stopped = false;
-	list_for_each_entry(port, &pcie->ports, entry)
-		apple_pcie_port_enable_irq(port);
 	pci_unlock_rescan_remove();
 
 	dev_info(dev, "PCIe-C hierarchy restored after tunnel activation\n");
