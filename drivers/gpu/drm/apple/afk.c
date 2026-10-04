@@ -552,7 +552,8 @@ static void afk_recv_handle_std_service(struct apple_dcp_afkep *ep, u32 channel,
 	 * whose category is REPLY and whose payload is one IOReturn
 	 * (kIOReturnNoDevice is 0xe00002c0). That is the command result.
 	 */
-	if (eshdr->category == EPIC_CAT_REPLY && payload_size >= 4 &&
+	if (ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
+	    eshdr->category == EPIC_CAT_REPLY && payload_size >= 4 &&
 	    payload_size < sizeof(struct epic_cmd)) {
 		u32 rc;
 		u16 tag = le16_to_cpu(eshdr->tag);
@@ -566,8 +567,12 @@ static void afk_recv_handle_std_service(struct apple_dcp_afkep *ep, u32 channel,
 			ep->endpoint, channel, type, tag, rc);
 		if (idx < MAX_PENDING_CMDS) {
 			spin_lock_irqsave(&service->lock, flags);
-			if (!service->cmds[idx].done &&
+			if (test_bit(idx, service->cmd_map) &&
+			    !service->cmds[idx].done &&
 			    service->cmds[idx].tag == tag) {
+				/* A result with no reply payload, not a short reply. */
+				service->cmds[idx].reply_len = 0;
+				service->cmds[idx].reply_len_valid = true;
 				service->cmds[idx].done = true;
 				service->cmds[idx].retcode = rc;
 				if (service->cmds[idx].completion)
