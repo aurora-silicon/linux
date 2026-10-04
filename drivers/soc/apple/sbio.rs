@@ -1577,16 +1577,21 @@ impl SepData {
         let mut enrolment_completed = false;
         let mut enrolment_persisted = false;
         let mut identity: Option<[u8; bio::UUID_LEN]> = None;
+        let mut last_percent: u32 = 0;
 
         let outcome = loop {
             if !bio::enrol_is_live(&self.bio_session.lock()) {
                 break None;
             }
             if counter >= ENROL_MAX_CAPTURES {
-                dev_err!(
+                let accepted = self.enrol_frames_accepted.load(Relaxed);
+                dev_warn!(
                     self.dev,
-                    "enrol: capture budget exhausted ({} captures); aborting\n",
-                    counter
+                    "enrol: capture budget exhausted ({} captures: {} accepted, reaching {}%, {} retried); aborting\n",
+                    counter,
+                    accepted,
+                    last_percent,
+                    counter.saturating_sub(accepted)
                 );
                 break Some(Err(ENROL_STATUS_TOO_MANY));
             }
@@ -1599,6 +1604,7 @@ impl SepData {
                     has_template,
                 } => {
                     counter = counter.saturating_add(1);
+                    last_percent = percent;
                     let woke = bio::enrol_advance(
                         &mut self.bio_session.lock(),
                         stage,

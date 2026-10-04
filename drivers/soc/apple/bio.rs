@@ -54,9 +54,9 @@ enum MatchResult {
 
 // A stage is an accepted capture, not a bucket of SEP's coverage percentage.
 // Leave the final stage for the completed template. libfprint reports a touch
-// only when the stage rises, so this must cover the longest enrolment (J414s
-// takes up to 22 captures); one that completes sooner jumps to the total.
-pub(crate) const ENROL_STAGES: u32 = 24;
+// only when the stage rises, so every capture the budget allows gets a stage;
+// an enrolment that completes sooner jumps to the total.
+pub(crate) const ENROL_STAGES: u32 = crate::ENROL_MAX_CAPTURES;
 
 const TOKEN_LIFETIME_NS: u64 = 10 * 1_000_000_000;
 

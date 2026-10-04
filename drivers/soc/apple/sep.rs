@@ -380,11 +380,10 @@ static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_TIMEOUT);
 static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_ENCLAVE);
 static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_SENSOR);
 
+// Captures per enrolment, including retries for partial contact and bad
+// frames. A J414s needs up to 22 accepted captures. bio::ENROL_STAGES is
+// derived from this, so every capture allowed here can raise the stage.
 const ENROL_MAX_CAPTURES: u32 = 36;
-// Partial-contact retries count against the budget too. Keep it at least
-// half again the stages, as it was when the driver began (8 stages, 12
-// captures), so a change to one cannot leave the other behind.
-static_assert!(ENROL_MAX_CAPTURES >= bio::ENROL_STAGES + bio::ENROL_STAGES / 2);
 
 const ENROL_POLL_MS: u32 = 2;
 
