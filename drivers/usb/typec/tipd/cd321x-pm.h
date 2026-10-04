@@ -23,11 +23,13 @@ struct cd321x_pm_state {
 	unsigned int attempts_left;
 	unsigned int link_events_left;
 	bool force_reconnect;
+	bool provider_busy;
 };
 
 static inline void cd321x_pm_new_connection(struct cd321x_pm_state *pm)
 {
 	pm->link_events_left = CD321X_LINK_EVENTS;
+	pm->provider_busy = false;
 }
 
 static inline void cd321x_pm_init(struct cd321x_pm_state *pm)
@@ -55,6 +57,7 @@ static inline void cd321x_pm_prepare(struct cd321x_pm_state *pm)
 	if (pm->phase != CD321X_PM_REMOVED)
 		pm->phase = CD321X_PM_PREPARED;
 	pm->attempts_left = 0;
+	pm->provider_busy = false;
 }
 
 static inline bool cd321x_pm_resume(struct cd321x_pm_state *pm)
@@ -76,9 +79,25 @@ static inline bool cd321x_pm_link_event(struct cd321x_pm_state *pm)
 
 	/* Host reprobes must not create an unlimited series of recovery runs. */
 	pm->link_events_left--;
+	pm->provider_busy = false;
 	pm->phase = CD321X_PM_REVALIDATE;
 	pm->attempts_left = CD321X_RESUME_ATTEMPTS;
 	/* A stale notification does not itself prove the current session failed. */
+	return true;
+}
+
+static inline bool cd321x_pm_activation_ready(struct cd321x_pm_state *pm)
+{
+	/* A completion cannot refill failed recovery or restart a healthy cable. */
+	if (!pm->provider_busy || pm->force_reconnect ||
+	    (pm->phase != CD321X_PM_REVALIDATE && pm->phase != CD321X_PM_APPLY &&
+	     pm->phase != CD321X_PM_STALE))
+		return false;
+
+	pm->provider_busy = false;
+	pm->phase = CD321X_PM_REVALIDATE;
+	if (!pm->attempts_left)
+		pm->attempts_left = CD321X_RESUME_ATTEMPTS;
 	return true;
 }
 
@@ -99,6 +118,7 @@ static inline bool cd321x_pm_retry(struct cd321x_pm_state *pm, bool reconnect)
 {
 	/* Runtime cable updates need the same bounded fresh-read recovery. */
 	if (pm->phase == CD321X_PM_RUNNING) {
+		pm->provider_busy = !reconnect;
 		pm->force_reconnect |= reconnect;
 		pm->phase = CD321X_PM_REVALIDATE;
 		pm->attempts_left = CD321X_RESUME_ATTEMPTS;
@@ -106,6 +126,7 @@ static inline bool cd321x_pm_retry(struct cd321x_pm_state *pm, bool reconnect)
 	}
 	if (pm->phase != CD321X_PM_REVALIDATE && pm->phase != CD321X_PM_APPLY)
 		return false;
+	pm->provider_busy = !reconnect;
 	pm->force_reconnect |= reconnect;
 	if (pm->attempts_left) {
 		pm->phase = CD321X_PM_REVALIDATE;
@@ -131,6 +152,7 @@ static inline void cd321x_pm_complete(struct cd321x_pm_state *pm)
 		pm->phase = CD321X_PM_RUNNING;
 		pm->attempts_left = 0;
 		pm->force_reconnect = false;
+		pm->provider_busy = false;
 	}
 }
 

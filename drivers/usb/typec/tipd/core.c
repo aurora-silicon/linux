@@ -1093,6 +1093,7 @@ static void cd321x_resume_work(struct work_struct *work)
 					    struct cd321x, resume_work);
 	struct tps6598x *tps = &cd321x->tps;
 	u32 status;
+	bool fault, ready;
 
 	guard(mutex)(&tps->lock);
 	if (cd321x->pm.phase == CD321X_PM_INITIALIZING ||
@@ -1100,7 +1101,9 @@ static void cd321x_resume_work(struct work_struct *work)
 	    cd321x->pm.phase == CD321X_PM_REMOVED)
 		return;
 
-	if (atomic_xchg(&cd321x->link_event, 0)) {
+	fault = atomic_xchg(&cd321x->link_event, 0);
+	ready = atomic_xchg(&cd321x->ready_event, 0);
+	if (fault) {
 		if (cd321x_pm_link_event(&cd321x->pm)) {
 			cd321x->state_valid = false;
 			dev_info(tps->dev, "revalidating cable after tunnel state change\n");
@@ -1108,6 +1111,8 @@ static void cd321x_resume_work(struct work_struct *work)
 			dev_warn_ratelimited(tps->dev,
 					     "tunnel link recovery budget exhausted\n");
 		}
+	} else if (ready && cd321x_pm_activation_ready(&cd321x->pm)) {
+		cd321x->state_valid = false;
 	}
 	if (!cd321x_pm_begin_read(&cd321x->pm))
 		return;
@@ -1559,11 +1564,15 @@ static int cd321x_tbt_notify(struct notifier_block *nb,
 {
 	struct cd321x *cd321x = container_of(nb, struct cd321x, tbt_notifier);
 
-	if (event != TYPEC_THUNDERBOLT_SWITCH_REVALIDATE)
+	if (event != TYPEC_THUNDERBOLT_SWITCH_REVALIDATE &&
+	    event != TYPEC_THUNDERBOLT_SWITCH_READY)
 		return NOTIFY_DONE;
 
 	/* Publish the event even if the worker is already reading or applying. */
-	atomic_xchg(&cd321x->link_event, 1);
+	if (event == TYPEC_THUNDERBOLT_SWITCH_READY)
+		atomic_set(&cd321x->ready_event, 1);
+	else
+		atomic_set(&cd321x->link_event, 1);
 	mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
 	return NOTIFY_OK;
 }
@@ -1605,6 +1614,7 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	INIT_DELAYED_WORK(&cd321x->update_work, cd321x_update_work);
 	INIT_DELAYED_WORK(&cd321x->resume_work, cd321x_resume_work);
 	atomic_set(&cd321x->link_event, 0);
+	atomic_set(&cd321x->ready_event, 0);
 	cd321x_pm_init(&cd321x->pm);
 
 	ret = tps6598x_register_port(tps, fwnode);

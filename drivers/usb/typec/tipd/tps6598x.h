@@ -395,6 +395,7 @@ struct cd321x {
 	struct notifier_block tbt_notifier;
 	bool tbt_notifier_registered;
 	atomic_t link_event;
+	atomic_t ready_event;
 	bool display_route_active;
 
 	struct cd321x_status update_status;

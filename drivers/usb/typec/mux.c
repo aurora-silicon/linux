@@ -631,6 +631,20 @@ void typec_thunderbolt_switch_notify(struct typec_thunderbolt_switch_dev *sw)
 }
 EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_notify);
 
+/**
+ * typec_thunderbolt_switch_notify_ready - Report completed activation
+ * @sw: Registered provider switch
+ *
+ * Wake consumers waiting on a busy provider without requesting fault recovery.
+ * As with revalidation notifications, drain producers before unregistering.
+ */
+void typec_thunderbolt_switch_notify_ready(struct typec_thunderbolt_switch_dev *sw)
+{
+	atomic_notifier_call_chain(&sw->notifiers,
+				   TYPEC_THUNDERBOLT_SWITCH_READY, NULL);
+}
+EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_notify_ready);
+
 static void typec_thunderbolt_switch_release(struct device *dev)
 {
 	kfree(to_typec_thunderbolt_switch_dev(dev));

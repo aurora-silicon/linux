@@ -397,7 +397,8 @@ static void cd321x_busy_provider_completion_reopens_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_STALE);
 	KUNIT_EXPECT_FALSE(test, pm.force_reconnect);
 	/* The PCIe worker's completion notification permits a fresh check. */
-	KUNIT_ASSERT_TRUE(test, cd321x_pm_link_event(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_activation_ready(&pm));
+	KUNIT_EXPECT_EQ(test, pm.link_events_left, (unsigned int)CD321X_LINK_EVENTS);
 	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
 	cd321x_pm_snapshot_ready(&pm);
 	cd321x_pm_complete(&pm);
@@ -417,7 +418,94 @@ static void cd321x_busy_provider_keeps_real_failure_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, pm.force_reconnect);
 }
 
+static void cd321x_completion_failure_sequence_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+
+	cd321x_pm_new_connection(&pm);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, false));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_activation_ready(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+	cd321x_pm_snapshot_ready(&pm);
+	cd321x_pm_complete(&pm);
+	KUNIT_EXPECT_EQ(test, pm.link_events_left, (unsigned int)CD321X_LINK_EVENTS);
+
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_link_event(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+	cd321x_pm_snapshot_ready(&pm);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, true));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+	cd321x_pm_snapshot_ready(&pm);
+	cd321x_pm_complete(&pm);
+	/* Completion after a successful forced restart must spend no budget. */
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_activation_ready(&pm));
+	KUNIT_EXPECT_EQ(test, pm.link_events_left, CD321X_LINK_EVENTS - 1U);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_link_event(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+	KUNIT_EXPECT_EQ(test, pm.link_events_left, CD321X_LINK_EVENTS - 2U);
+}
+
+static void cd321x_ready_keeps_failed_recovery_bounded_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+	unsigned int event, attempt;
+
+	cd321x_pm_new_connection(&pm);
+	for (event = 0; event < CD321X_LINK_EVENTS; event++) {
+		KUNIT_ASSERT_TRUE(test, cd321x_pm_link_event(&pm));
+		for (attempt = 0; attempt < CD321X_RESUME_ATTEMPTS; attempt++) {
+			KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+			cd321x_pm_snapshot_ready(&pm);
+			cd321x_pm_retry(&pm, true);
+		}
+		KUNIT_EXPECT_FALSE(test, cd321x_pm_activation_ready(&pm));
+	}
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_link_event(&pm));
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_begin_read(&pm));
+	KUNIT_EXPECT_EQ(test, pm.link_events_left, 0U);
+}
+
+static void cd321x_ready_preserves_failure_and_lifecycle_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+
+	cd321x_pm_init(&pm);
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_activation_ready(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_ready(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, true));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, false));
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_activation_ready(&pm));
+	KUNIT_EXPECT_TRUE(test, pm.force_reconnect);
+	cd321x_pm_prepare(&pm);
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_activation_ready(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_resume(&pm));
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_activation_ready(&pm));
+	cd321x_pm_remove(&pm);
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_activation_ready(&pm));
+}
+
+static void cd321x_ready_during_apply_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+
+	cd321x_pm_new_connection(&pm);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, false));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+	cd321x_pm_snapshot_ready(&pm);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_activation_ready(&pm));
+	/* The old queued APPLY cannot erase the requested fresh read. */
+	cd321x_pm_complete(&pm);
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_can_update(&pm));
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_activation_ready(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+	KUNIT_EXPECT_EQ(test, pm.link_events_left, (unsigned int)CD321X_LINK_EVENTS);
+}
+
 static struct kunit_case cd321x_pm_cases[] = {
+	KUNIT_CASE(cd321x_completion_failure_sequence_test),
+	KUNIT_CASE(cd321x_ready_keeps_failed_recovery_bounded_test),
+	KUNIT_CASE(cd321x_ready_preserves_failure_and_lifecycle_test),
+	KUNIT_CASE(cd321x_ready_during_apply_test),
 	KUNIT_CASE(cd321x_busy_provider_preserves_connection_test),
 	KUNIT_CASE(cd321x_busy_provider_completion_reopens_test),
 	KUNIT_CASE(cd321x_busy_provider_keeps_real_failure_test),

@@ -1238,7 +1238,7 @@ unlock:
 	mutex_unlock(&acio->pcie_tunnel_lock);
 	/* Wake a deferred Type-C check after asynchronous PCIe setup finishes. */
 	if (activated)
-		typec_thunderbolt_switch_notify(acio->tbt_switch);
+		typec_thunderbolt_switch_notify_ready(acio->tbt_switch);
 	if (ret && ret != -EAGAIN)
 		dev_err(acio->dev, "deferred PCIe-C transition failed: %d\n", ret);
 }
