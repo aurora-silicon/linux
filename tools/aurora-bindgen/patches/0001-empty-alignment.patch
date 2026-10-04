@@ -1,0 +1,20 @@
+--- a/bindgen/codegen/mod.rs
++++ b/bindgen/codegen/mod.rs
+@@ -2468,6 +2468,17 @@
+                     }
+                 }
+             }
++        } else if !is_union && !forward_decl {
++            // A zero-sized C struct can still require explicit alignment.
++            // Its alignment also determines the offsets of subsequent fields
++            // when it is embedded in another type. Do not add storage here.
++            if let Some(layout) = layout {
++                if struct_layout.requires_explicit_align(layout) &&
++                    layout.align > 1
++                {
++                    explicit_align = Some(layout.align);
++                }
++            }
+         } else if is_union && !forward_decl {
+             if let Some(layout) = layout {
+                 // TODO(emilio): It'd be nice to unify this with the struct path above somehow.

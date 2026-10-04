@@ -1,0 +1,13 @@
+struct incomplete;
+struct empty1 {} __attribute__((aligned(1)));
+struct outer1 { unsigned char prefix[12]; struct empty1 value; unsigned long after; };
+struct empty2 {} __attribute__((aligned(2)));
+struct outer2 { unsigned char prefix[12]; struct empty2 value; unsigned long after; };
+struct empty8 {} __attribute__((aligned(8)));
+struct outer8 { unsigned char prefix[12]; struct empty8 value; unsigned long after; };
+struct empty64 {} __attribute__((aligned(64)));
+struct outer64 { unsigned char prefix[12]; struct empty64 value; unsigned long after; };
+struct empty128 {} __attribute__((aligned(128)));
+struct outer128 { unsigned char prefix[12]; struct empty128 value; unsigned long after; };
+struct packed_empty {} __attribute__((packed,aligned(64)));
+struct packed_container { char prefix; struct packed_empty value; unsigned long after; };

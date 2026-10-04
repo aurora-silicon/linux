@@ -1,0 +1,85 @@
+--- a/bindgen/clang.rs
++++ b/bindgen/clang.rs
+@@ -1204,6 +1204,29 @@
+ }
+ 
+ impl Type {
++    /// Get actual record fields, including implicit anonymous fields omitted
++    /// from `clang_visitChildren` for Microsoft anonymous tag members.
++    pub(crate) fn fields(&self) -> Vec<Cursor> {
++        extern "C" fn collect_field(
++            cur: CXCursor,
++            data: CXClientData,
++        ) -> CXVisitorResult {
++            let fields = unsafe { &mut *data.cast::<Vec<Cursor>>() };
++            fields.push(Cursor { x: cur });
++            CXVisit_Continue
++        }
++
++        let mut fields = Vec::<Cursor>::new();
++        unsafe {
++            clang_Type_visitFields(
++                self.x,
++                collect_field,
++                (&mut fields as *mut Vec<Cursor>).cast(),
++            );
++        }
++        fields
++    }
++
+     /// Get this type's kind.
+     pub(crate) fn kind(&self) -> CXTypeKind {
+         self.x.kind
+--- a/bindgen/ir/comp.rs
++++ b/bindgen/ir/comp.rs
+@@ -1340,6 +1340,16 @@
+                 _ => false,
+             });
+ 
++        // Microsoft anonymous named-tag members have real implicit FieldDecls
++        // in the type's field list, but only a non-definition record cursor in
++        // child traversal. Keep positive field evidence: a tag declaration by
++        // itself is not necessarily storage in the containing record.
++        let mut implicit_fields: Vec<_> = ty
++            .fields()
++            .into_iter()
++            .filter(|field| field.spelling().is_empty() && !field.is_bit_field())
++            .collect();
++
+         let mut maybe_anonymous_struct_field = None;
+         cursor.visit(|cur| {
+             if cur.kind() != CXCursor_FieldDecl {
+@@ -1463,6 +1473,33 @@
+                     // definition, it's a valid inner type.
+                     //
+                     // [1]: https://github.com/rust-lang/rust-bindgen/issues/482
++                    if matches!(cur.kind(), CXCursor_StructDecl | CXCursor_UnionDecl) &&
++                        !cur.is_definition()
++                    {
++                        if let Some(index) = implicit_fields.iter().position(|field| {
++                            field.cur_type().canonical_type() ==
++                                cur.cur_type().canonical_type()
++                        }) {
++                            let field = implicit_fields.remove(index);
++                            let field_type = Item::from_ty_or_ref(
++                                field.cur_type(),
++                                field,
++                                Some(potential_id),
++                                ctx,
++                            );
++                            ci.fields.append_raw_field(RawField::new(
++                                None,
++                                field_type,
++                                field.raw_comment(),
++                                Annotations::new(&field),
++                                None,
++                                field.public_accessible(),
++                                field.offset_of_field().ok(),
++                            ));
++                            return CXChildVisit_Continue;
++                        }
++                    }
++
+                     let is_inner_struct =
+                         cur.semantic_parent() == cursor || cur.is_definition();
+                     if !is_inner_struct {
