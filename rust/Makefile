@@ -444,10 +444,13 @@ endif
 bindgen_c_flags_final = $(bindgen_c_flags_lto) -fno-builtin -D__BINDGEN__
 
 # `--rust-target` points to our minimum supported Rust version.
+# Keep bindgen layout assertions enabled: a lost alignment can change field
+# offsets without changing the containing type size. See Documentation/rust/
+# bindgen-layout-checks.rst for generator requirements.
 quiet_cmd_bindgen = BINDGEN $@
       cmd_bindgen = \
 	$(BINDGEN) $< $(bindgen_target_flags) --rust-target 1.85 \
-		--use-core --with-derive-default --ctypes-prefix ffi --no-layout-tests \
+		--use-core --with-derive-default --ctypes-prefix ffi \
 		--no-debug '.*' --enable-function-attribute-detection \
 		-o $@ -- $(bindgen_c_flags_final) -DMODULE \
 		$(bindgen_target_cflags) $(bindgen_target_extra)
