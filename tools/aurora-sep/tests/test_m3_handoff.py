@@ -6,6 +6,7 @@ directory, and replaces sudo and the EFI-partition lookup.
 """
 from pathlib import Path
 import gzip
+import re
 import os
 import shutil
 import subprocess
@@ -13,6 +14,13 @@ import tempfile
 import unittest
 
 INSTALLER = Path(__file__).resolve().parent.parent / "install-aurora-sep.sh"
+
+# Release names, read from the installer so the tests follow each release.
+_SRC = INSTALLER.read_text()
+VERSION = re.search(r"^VERSION=(\S+)$", _SRC, re.M).group(1)
+M1N1_M1M2 = re.search(r'^  "(m1n1-aurora-\S+) ', _SRC, re.M).group(1)
+M1N1_M3 = re.search(r'^M3_M1N1_PACKAGE="(\S+) ', _SRC, re.M).group(1)
+KERNEL_PKG = f"linux-aurora-{VERSION}-aarch64.pkg.tar.zst"
 
 OUR_FREEZE = (
     "# >>> aurora-sep: keep this M3's boot.bin as it is (remove with: install-aurora-sep.sh --uninstall)\n"
@@ -327,8 +335,8 @@ esp_bootbin() {{ [[ -f '{self.esp}/m1n1/boot.bin' ]] && echo '{self.esp}/m1n1/bo
         return [line.split()[0] for line in out.splitlines()]
 
     def test_packages_per_mac(self):
-        m1n1_m1m2 = "m1n1-aurora-1.6.1.aurora3-1-aarch64.pkg.tar.zst"
-        m1n1_m3 = "m1n1-aurora-1.6.1.aurora6-1-aarch64.pkg.tar.zst"
+        m1n1_m1m2 = M1N1_M1M2
+        m1n1_m3 = M1N1_M3
         for board, stub, try_, want in [("j314s", "13.5", 0, m1n1_m1m2), ("j293", "13.5", 0, m1n1_m1m2),
                                         ("j700", "26.4", 0, None), ("j613", "14.8.3", 0, None),
                                         ("j514c", "14.8.3", 0, None), ("j514s", "14.8.3", 0, None),
@@ -338,7 +346,7 @@ esp_bootbin() {{ [[ -f '{self.esp}/m1n1/boot.bin' ]] && echo '{self.esp}/m1n1/bo
                 got = self.packages(board, stub, try_)
                 m1n1 = [p for p in got if p.startswith("m1n1-aurora-")]
                 self.assertEqual(m1n1, [want] if want else [])
-                self.assertIn("linux-aurora-7.1.12.aurora2-11.36-aarch64.pkg.tar.zst", got)
+                self.assertIn(KERNEL_PKG, got)
                 self.assertEqual(len(got), 5 if want else 4)
 
     # Uninstall

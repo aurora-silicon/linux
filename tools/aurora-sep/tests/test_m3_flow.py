@@ -9,12 +9,15 @@ chosen.* lines. pacman -U and the m1n1/kernel installs run it, as the hooks do.
 from pathlib import Path
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import unittest
 
 INSTALLER = Path(__file__).resolve().parent.parent / "install-aurora-sep.sh"
+# The installer's VERSION names the boot.bin copy it keeps on the EFI partition.
+VERSION = re.search(r"^VERSION=(\S+)$", INSTALLER.read_text(), re.M).group(1)
 
 BOARDS = {
     "j516s": ["apple,j516s", "apple,t6030", "apple,arm-platform"],
@@ -215,7 +218,7 @@ boot_chain() {{ echo limine; }}
         return [l.rsplit("/", 1)[1] for l in self.log().splitlines() if l.startswith("curl ")]
 
     def kept_copy(self):
-        return self.tmp / "esp/m1n1/boot.bin.before-7.1.12.aurora2-11.36"
+        return self.tmp / f"esp/m1n1/boot.bin.before-{VERSION}"
 
     # M3 Pro on the handoff path
 

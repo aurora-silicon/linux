@@ -78,6 +78,9 @@
 # USB-C or Thunderbolt display gets the HDMI port's pipeline when HDMI is idle,
 # and a dock display left waiting lights once a pipeline frees. M3 support is
 # experimental and kernel-only (see is_m3).
+# 11.109-test (not a release): the M3 Pro display handoff on the 14" J514S.
+# Kernel 11.109 takes each Mac's PMP values from the boot loader, and m1n1
+# aurora7 passes them (/chosen/asahi,t6030-pmp). For --m3-handoff on a J514S.
 # 11.36.1 changes only this script and adds an M3 m1n1: an M3 Pro model whose
 # m1n1 display and GPU handoff has been booted (the 16" J516S for now) gets
 # m1n1-aurora with it switched on, and the built-in display and GPU work.
@@ -118,8 +121,8 @@ set -euo pipefail
 
 # The kernel package version and the release tag move independently: a release
 # that only changes m1n1 reuses the previous kernel packages unchanged.
-VERSION=7.1.12.aurora2-11.36
-TAG=sep-7.1.12.aurora2-11.36.1
+VERSION=7.1.12.aurora2-11.109
+TAG=sep-7.1.12.aurora2-11.109-test
 # Packages are fetched from this script's own tag, never from "latest": the
 # checksums below belong to this release and nothing else.
 RELEASE_URL=https://github.com/iconidentify/aurora-linux/releases/download/$TAG
@@ -127,15 +130,15 @@ RELEASES_API=https://api.github.com/repos/iconidentify/aurora-linux/releases
 # Where to always get the current script, whatever this copy turns out to be.
 LATEST_URL=https://github.com/iconidentify/aurora-linux/releases/latest/download/install-aurora-sep.sh
 PACKAGES=(
-  "linux-aurora-$VERSION-aarch64.pkg.tar.zst cb5cb0800fafaaecde2dcb350044bc3afbfc7018ef2f54dd4422bc26c293c9ec"
-  "linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst e21ab2add5491d404980f87bce168cfd05ee298e1fc0f12815d9ff68d12e6398"
+  "linux-aurora-$VERSION-aarch64.pkg.tar.zst 036f8a20a94363c247443cb5809707b5e884bc80f11531723c7409d91f867815"
+  "linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst 9eb62c16a727d17c809a5eb5f847e4ad4adce211304a12f99ff936cf9c9487b5"
   "libfprint-1.94.100-1.1-aarch64.pkg.tar.zst bc7d9762db6644f2cfb58ddb209602c1d513845eb1498c098e01f12600fcbdf9"
   "aurora-touchid-20261003-1-any.pkg.tar.zst 29b0360fac8c257d754e64bd1b9c33c487eb2595dd3c31e9138d7a476afa3d64"
   "m1n1-aurora-1.6.1.aurora3-1-aarch64.pkg.tar.zst bc3451aaa88bc3f4912bc3613f9569aa8f3e05f376fa851fa837b5e2080e8c2f"
 )
 # Only for an M3 on the handoff path (see m3_plan), in place of the m1n1-aurora
 # above: the same m1n1 plus the T6030 display and GPU handoff.
-M3_M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora6-1-aarch64.pkg.tar.zst 16747a63b59815ba54f95c59ab97514fb7178aa459953aa4369effce90456af8"
+M3_M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora7-1-aarch64.pkg.tar.zst 547d0d5f9daa283749d84e5a9c875fee06ce449eeb8252e41c11b3ce63e11184"
 PINNED="linux-aurora linux-aurora-headers libfprint m1n1-aurora"
 PIN_BEGIN="# >>> aurora-sep pin (remove with: install-aurora-sep.sh --uninstall)"
 PIN_END="# <<< aurora-sep pin"
@@ -1548,7 +1551,7 @@ fingerprint.
              sudo dmesg | grep -E 'cold init done|link up after|translation fault|HC died'
            Any "translation fault" or "HC died" line is a failure to report.
            For a full report, after plugging the dock in:
-             curl -fsSLO https://raw.githubusercontent.com/iconidentify/aurora-linux/refs/tags/sep-7.1.12.aurora2-11.36.1/tools/aurora-tb/tb-pcie-report
+             curl -fsSLO https://raw.githubusercontent.com/iconidentify/aurora-linux/refs/tags/sep-7.1.12.aurora2-11.109-test/tools/aurora-tb/tb-pcie-report
              sudo sh tb-pcie-report --no-wait
 
    6c. Across suspend:
