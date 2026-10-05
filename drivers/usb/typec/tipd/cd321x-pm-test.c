@@ -484,6 +484,49 @@ static void cd321x_ready_preserves_failure_and_lifecycle_test(struct kunit *test
 	KUNIT_EXPECT_FALSE(test, cd321x_pm_activation_ready(&pm));
 }
 
+static void cd321x_ready_with_exhausted_fault_budget_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+	unsigned int i;
+
+	cd321x_pm_new_connection(&pm);
+	for (i = 0; i < CD321X_LINK_EVENTS; i++) {
+		KUNIT_ASSERT_TRUE(test, cd321x_pm_link_event(&pm));
+		KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+		cd321x_pm_snapshot_ready(&pm);
+		cd321x_pm_complete(&pm);
+	}
+	/* The provider stays busy activating a host until the reads run out. */
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, false));
+	for (i = 0; i < CD321X_RESUME_ATTEMPTS; i++) {
+		KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+		cd321x_pm_snapshot_ready(&pm);
+		KUNIT_EXPECT_EQ(test, cd321x_pm_retry(&pm, false),
+				i + 1 < CD321X_RESUME_ATTEMPTS);
+	}
+	KUNIT_ASSERT_EQ(test, pm.phase, CD321X_PM_STALE);
+	/* The refused fault must not swallow the completion that came with it. */
+	KUNIT_EXPECT_EQ(test, cd321x_pm_notifications(&pm, true, true),
+			CD321X_PM_FAULT_REFUSED | CD321X_PM_READY_ACCEPTED);
+	KUNIT_EXPECT_FALSE(test, pm.provider_busy);
+	KUNIT_EXPECT_EQ(test, pm.link_events_left, 0U);
+	KUNIT_EXPECT_TRUE(test, cd321x_pm_begin_read(&pm));
+}
+
+static void cd321x_fault_outranks_coalesced_ready_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+
+	cd321x_pm_new_connection(&pm);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, false));
+	/* An accepted fault already cleared provider_busy: READY adds nothing. */
+	KUNIT_EXPECT_EQ(test, cd321x_pm_notifications(&pm, true, true),
+			CD321X_PM_FAULT_ACCEPTED);
+	KUNIT_EXPECT_EQ(test, pm.link_events_left, CD321X_LINK_EVENTS - 1U);
+	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_REVALIDATE);
+	KUNIT_EXPECT_EQ(test, cd321x_pm_notifications(&pm, false, false), 0U);
+}
+
 static void cd321x_ready_during_apply_test(struct kunit *test)
 {
 	struct cd321x_pm_state pm = {};
@@ -505,6 +548,8 @@ static struct kunit_case cd321x_pm_cases[] = {
 	KUNIT_CASE(cd321x_completion_failure_sequence_test),
 	KUNIT_CASE(cd321x_ready_keeps_failed_recovery_bounded_test),
 	KUNIT_CASE(cd321x_ready_preserves_failure_and_lifecycle_test),
+	KUNIT_CASE(cd321x_ready_with_exhausted_fault_budget_test),
+	KUNIT_CASE(cd321x_fault_outranks_coalesced_ready_test),
 	KUNIT_CASE(cd321x_ready_during_apply_test),
 	KUNIT_CASE(cd321x_busy_provider_preserves_connection_test),
 	KUNIT_CASE(cd321x_busy_provider_completion_reopens_test),

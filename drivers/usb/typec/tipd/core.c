@@ -1092,6 +1092,7 @@ static void cd321x_resume_work(struct work_struct *work)
 	struct cd321x *cd321x = container_of(to_delayed_work(work),
 					    struct cd321x, resume_work);
 	struct tps6598x *tps = &cd321x->tps;
+	unsigned int notes;
 	u32 status;
 	bool fault, ready;
 
@@ -1103,17 +1104,14 @@ static void cd321x_resume_work(struct work_struct *work)
 
 	fault = atomic_xchg(&cd321x->link_event, 0);
 	ready = atomic_xchg(&cd321x->ready_event, 0);
-	if (fault) {
-		if (cd321x_pm_link_event(&cd321x->pm)) {
-			cd321x->state_valid = false;
-			dev_info(tps->dev, "revalidating cable after tunnel state change\n");
-		} else {
-			dev_warn_ratelimited(tps->dev,
-					     "tunnel link recovery budget exhausted\n");
-		}
-	} else if (ready && cd321x_pm_activation_ready(&cd321x->pm)) {
+	notes = cd321x_pm_notifications(&cd321x->pm, fault, ready);
+	if (notes & CD321X_PM_FAULT_ACCEPTED)
+		dev_info(tps->dev, "revalidating cable after tunnel state change\n");
+	if (notes & CD321X_PM_FAULT_REFUSED)
+		dev_warn_ratelimited(tps->dev,
+				     "tunnel link recovery budget exhausted\n");
+	if (notes & (CD321X_PM_FAULT_ACCEPTED | CD321X_PM_READY_ACCEPTED))
 		cd321x->state_valid = false;
-	}
 	if (!cd321x_pm_begin_read(&cd321x->pm))
 		return;
 

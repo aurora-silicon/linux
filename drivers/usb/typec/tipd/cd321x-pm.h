@@ -101,6 +101,29 @@ static inline bool cd321x_pm_activation_ready(struct cd321x_pm_state *pm)
 	return true;
 }
 
+#define CD321X_PM_FAULT_ACCEPTED	0x1U
+#define CD321X_PM_FAULT_REFUSED		0x2U
+#define CD321X_PM_READY_ACCEPTED	0x4U
+
+/*
+ * Apply the link fault and activation completion one worker pass collected.
+ * An accepted fault clears provider_busy, so a completion that came with it
+ * changes nothing more. A fault the budget refuses must not swallow the
+ * completion.
+ */
+static inline unsigned int cd321x_pm_notifications(struct cd321x_pm_state *pm,
+						   bool fault, bool ready)
+{
+	unsigned int res = 0;
+
+	if (fault)
+		res |= cd321x_pm_link_event(pm) ? CD321X_PM_FAULT_ACCEPTED :
+						  CD321X_PM_FAULT_REFUSED;
+	if (ready && cd321x_pm_activation_ready(pm))
+		res |= CD321X_PM_READY_ACCEPTED;
+	return res;
+}
+
 static inline bool cd321x_pm_begin_read(struct cd321x_pm_state *pm)
 {
 	if (pm->phase != CD321X_PM_REVALIDATE || !pm->attempts_left)
