@@ -2525,8 +2525,9 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 
 	guard(mutex)(&acio->lock);
 
+	/* Removal turns the cable off itself; only refuse to start new work. */
 	if (acio->removing)
-		return -ESHUTDOWN;
+		return data->state == TYPEC_THUNDERBOLT_SWITCH_OFF ? 0 : -ESHUTDOWN;
 
 	dev_dbg(acio->dev, "set cable state: %d\n", data->state);
 
@@ -2794,7 +2795,13 @@ static void apple_cio_remove(struct platform_device *pdev)
 {
 	struct apple_cio *acio = platform_get_drvdata(pdev);
 
-	/* Wait for an in-flight set and reject all later consumer callbacks. */
+	/*
+	 * Wait for an in-flight set; from here on, sets start no new work. That
+	 * only holds while the ACIO exists: it does not revoke the switch
+	 * handles consumers keep, so a set arriving after remove returns still
+	 * reaches freed memory, as it did before (only a manual unbind gets
+	 * there).
+	 */
 	scoped_guard(mutex, &acio->lock)
 		acio->removing = true;
 
