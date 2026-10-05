@@ -34,8 +34,10 @@ def find_tool():
     # where macvdmtool usually lives.
     here = os.path.dirname(os.path.abspath(__file__))
     for p in (shutil.which(TOOL), "/usr/local/bin/macvdmtool",
-              "/opt/homebrew/bin/macvdmtool", os.path.join(here, "macvdmtool")):
-        if p and os.access(p, os.X_OK):
+              "/opt/homebrew/bin/macvdmtool", os.path.join(here, "macvdmtool"),
+              # the built tool inside a macvdmtool clone next to this script
+              os.path.join(here, "macvdmtool", "macvdmtool")):
+        if p and os.path.isfile(p) and os.access(p, os.X_OK):
             return p
     sys.exit("macvdmtool not found: install it in /usr/local/bin, or put it next to this script.")
 
