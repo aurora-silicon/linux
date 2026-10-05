@@ -19,11 +19,15 @@
  * phandles, and each must still be disabled. Otherwise nothing is changed.
  *
  * The DCP firmware needs the power management processor (PMP) running,
- * which iBoot leaves loaded but halted. On the J516S, once the display nodes
- * are enabled, the gate also adds the PMP from a built-in overlay: its node,
- * DART and mailbox (disabled), and a PMP report node whose driver sets the
- * display and storage requests and starts the PMP when the display driver
- * asks for it. Before any driver probes, the gate then
+ * which iBoot leaves loaded but halted. Once the display nodes are enabled,
+ * the gate also adds the PMP from a built-in overlay: its node, DART and
+ * mailbox (disabled), and a PMP report node whose driver sets the display
+ * and storage requests and starts the PMP when the display driver asks for
+ * it. The PMP node needs this Mac's board and DRAM vendor ids and its PMP
+ * tunables. A boot loader that copies them from the ADT into
+ * /chosen/asahi,t6030-pmp gets the T6030 overlay with those values, on any
+ * T6030 board; without them, only a J516S gets the PMP, from an overlay with
+ * one J516S's values. Before any driver probes, the gate then
  *  - raises the minimum power state of the display domains (display
  *    subsystem, front end and DCP CPU) to "active", so that the PMP can
  *    never power the running DCP down;
@@ -31,7 +35,7 @@
  *    DCP firmware and the PMP share lives in that SRAM;
  *  - gives the PMP DART and mailbox the interrupt parent of the DCP mailbox.
  * Everything the PMP needs is checked before the display nodes are enabled.
- * On a machine other than the J516S, or if a check fails or the PMP cannot be
+ * Without PMP values for this Mac, or if a check fails or the PMP cannot be
  * added, the display nodes stay (or are put back) disabled and the display
  * stays on the boot framebuffer.
  */
@@ -76,9 +80,19 @@ static const char *const pmp_ps_labels[PMP_PS_NR] __initconst = {
 
 #define PMGR_PS_ACTIVE	15
 
-/* Built-in overlay with the J516S PMP, its DART and mailbox, and its report. */
+/*
+ * Built-in overlays with the PMP, its DART and mailbox, and its report. The
+ * T6030 one has no per-Mac values: the gate copies them from the node the
+ * boot loader fills from this Mac's ADT. The J516S one carries the values
+ * of one J516S, for a boot loader that passes none.
+ */
+extern const u8 __dtbo_t6030_pmp_begin[];
+extern const u8 __dtbo_t6030_pmp_end[];
 extern const u8 __dtbo_t6030_j516s_pmp_begin[];
 extern const u8 __dtbo_t6030_j516s_pmp_end[];
+
+/* This Mac's PMP values, from the boot loader, or NULL. */
+static struct device_node *gate_pmp_values __initdata;
 
 static bool gate_requested __initdata = true;
 
@@ -298,8 +312,18 @@ static int __init gate_pmp_resolve(struct device_node **np, struct device_node *
 	struct device_node *pmgr, *other;
 	int i;
 
-	if (!of_machine_is_compatible("apple,j516s")) {
-		pr_warn("PMP not added: its description is for the J516S only\n");
+	gate_pmp_values = of_find_node_by_path("/chosen/asahi,t6030-pmp");
+	if (gate_pmp_values &&
+	    (!of_property_present(gate_pmp_values, "apple,board-id") ||
+	     !of_property_present(gate_pmp_values, "apple,dram-vendor-id") ||
+	     !of_property_present(gate_pmp_values, "apple,tunable-uuid"))) {
+		pr_warn("PMP not added: %pOF is incomplete\n", gate_pmp_values);
+		of_node_put(gate_pmp_values);
+		gate_pmp_values = NULL;
+		return -EINVAL;
+	}
+	if (!gate_pmp_values && !of_machine_is_compatible("apple,j516s")) {
+		pr_warn("PMP not added: the boot loader passed no PMP values for this Mac\n");
 		return -ENODEV;
 	}
 
@@ -378,14 +402,50 @@ static int __init gate_set_u32(struct of_changeset *cs, struct device_node *np,
 	return of_changeset_update_property(cs, np, prop);
 }
 
+/*
+ * Adds every apple,* property of the boot loader's PMP values to @pmp, which
+ * the T6030 overlay leaves without them. Returns the number added.
+ */
+static int __init gate_pmp_copy_values(struct of_changeset *cs, struct device_node *pmp)
+{
+	struct property *src, *prop;
+	int n = 0, ret;
+
+	for_each_property_of_node(gate_pmp_values, src) {
+		if (strncmp(src->name, "apple,", 6))
+			continue;
+		/* Kept for good: the live tree refers to it once applied. */
+		prop = kzalloc_obj(*prop);
+		if (!prop)
+			return -ENOMEM;
+		prop->name = kstrdup(src->name, GFP_KERNEL);
+		prop->value = kmemdup(src->value, src->length, GFP_KERNEL);
+		prop->length = src->length;
+		if (!prop->name || (src->length && !prop->value)) {
+			kfree(prop->name);
+			kfree(prop->value);
+			kfree(prop);
+			return -ENOMEM;
+		}
+		ret = of_changeset_add_property(cs, pmp, prop);
+		if (ret)
+			return ret;
+		n++;
+	}
+	return n;
+}
+
 static int __init gate_pmp_apply(struct device_node *dcp, struct device_node **ps,
 				 struct device_node *aic)
 {
-	const size_t size = __dtbo_t6030_j516s_pmp_end - __dtbo_t6030_j516s_pmp_begin;
+	const u8 *dtbo = gate_pmp_values ? __dtbo_t6030_pmp_begin : __dtbo_t6030_j516s_pmp_begin;
+	const size_t size = gate_pmp_values ?
+		__dtbo_t6030_pmp_end - __dtbo_t6030_pmp_begin :
+		__dtbo_t6030_j516s_pmp_end - __dtbo_t6030_j516s_pmp_begin;
 	struct device_node *report, *disp = NULL, *pmp = NULL, *dart = NULL, *mbox = NULL;
-	int ovcs_id = 0, ret, i;
+	int ovcs_id = 0, ret, i, values = 0;
 
-	ret = of_overlay_fdt_apply(__dtbo_t6030_j516s_pmp_begin, size, &ovcs_id, NULL);
+	ret = of_overlay_fdt_apply(dtbo, size, &ovcs_id, NULL);
 	if (ret) {
 		pr_err("PMP not added: overlay failed: %d\n", ret);
 		return ret;
@@ -430,6 +490,10 @@ static int __init gate_pmp_apply(struct device_node *dcp, struct device_node **p
 		if (!of_property_read_bool(ps[i], "apple,always-on"))
 			ret = of_changeset_add_prop_bool(&gate_pmp_cs, ps[i], "apple,always-on");
 	}
+	if (!ret && gate_pmp_values) {
+		values = gate_pmp_copy_values(&gate_pmp_cs, pmp);
+		ret = values < 0 ? values : 0;
+	}
 	if (!ret)
 		ret = of_changeset_apply(&gate_pmp_cs);
 
@@ -446,6 +510,10 @@ static int __init gate_pmp_apply(struct device_node *dcp, struct device_node **p
 		return ret;
 	}
 
+	if (gate_pmp_values)
+		pr_info("PMP: this Mac's %d values from %pOF\n", values, gate_pmp_values);
+	else
+		pr_info("PMP: the built-in J516S values; the boot loader passed none\n");
 	pr_info("added the PMP and its display and storage report; minimum power state of %s, %s and %s raised to active; %s and %s kept on\n",
 		pmp_ps_labels[PMP_PS_DISP_SYS], pmp_ps_labels[PMP_PS_DISP_FE],
 		pmp_ps_labels[PMP_PS_DISP_CPU], pmp_ps_labels[PMP_PS_PMP],

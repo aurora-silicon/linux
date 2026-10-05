@@ -1,0 +1,106 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * T6030 power management processor, added by the T6030 display gate when
+ * it enables the internal display, on any T6030 board whose boot loader
+ * passes that Mac's PMP values in /chosen/asahi,t6030-pmp.
+ *
+ * The layout is the J516S overlay's (t6030-j516s-pmp.dtso): the PMP, its
+ * DART, its mailbox and its report, at the T6030's addresses and
+ * interrupts, which are the same on every T6030 board. It carries none of
+ * the per-Mac values. The gate copies those from /chosen/asahi,t6030-pmp
+ * onto the PMP node: apple,board-id and apple,dram-vendor-id from the ADT
+ * /chosen node, apple,dram-capacity and every apple,tunable-* value from
+ * the ADT iop-pmp-nub node, including apple,tunable-uuid.
+ *
+ * As in the J516S overlay, the PMP, its DART and its mailbox stay disabled
+ * here; the PMP report driver starts the PMP when the display driver first
+ * asks for it.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	fragment@0 {
+		target-path = "/soc";
+
+		__overlay__ {
+			#address-cells = <2>;
+			#size-cells = <2>;
+
+			pmp_report: pmp-report@3503c0000 {
+				compatible = "apple,t6030-pmp-v2-report";
+				/* PTD read aperture and update page */
+				reg = <0x3 0x503c0000 0x0 0x14000>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+				apple,pmp = <&pmp>;
+
+				/*
+				 * The gate points the DCP at this entry (apple,pmp-report)
+				 * through the phandle; the overlay itself does not refer to it.
+				 */
+				pmp_report_disp: report@7 {
+					compatible = "apple,t6000-pmp-v2-report-entry";
+					reg = <0x7>;
+					label = "pmp-disp";
+					#power-domain-cells = <0>;
+					apple,always-on;
+					phandle = <0x100>;
+				};
+
+				/* Enabled only by the explicit dcpext gate, before PMP starts. */
+				pmp_report_dispext0: report@8 {
+					compatible = "apple,t6000-pmp-v2-report-entry";
+					reg = <0x8>;
+					label = "pmp-dispext0";
+					#power-domain-cells = <0>;
+					apple,always-on;
+					/* Missing external ACK must not block the internal panel. */
+					apple,defer-startup-ack;
+					phandle = <0x101>;
+					status = "disabled";
+				};
+
+				pmp_report_ans: report@10 {
+					compatible = "apple,t6000-pmp-v2-report-entry";
+					reg = <0x10>;
+					label = "pmp-ans";
+					#power-domain-cells = <0>;
+					apple,always-on;
+					/* The PMP does not acknowledge storage requests. */
+					apple,no-ack;
+				};
+			};
+
+			pmp_dart: iommu@350300000 {
+				compatible = "apple,t6030-dart", "apple,t8110-dart";
+				reg = <0x3 0x50300000 0x0 0x4000>;
+				#iommu-cells = <1>;
+				interrupts = <0 734 4>;
+				status = "disabled";
+			};
+
+			pmp_mbox: mailbox@350c08000 {
+				compatible = "apple,t6030-asc-mailbox", "apple,asc-mailbox-v4";
+				reg = <0x3 0x50c08000 0x0 0x4000>;
+				interrupts = <0 730 4>, <0 731 4>, <0 732 4>, <0 733 4>;
+				interrupt-names = "send-empty", "send-not-empty",
+						  "recv-empty", "recv-not-empty";
+				#mbox-cells = <0>;
+				status = "disabled";
+			};
+
+			pmp: pmp@350500000 {
+				compatible = "apple,t6030-pmp-v2", "apple,t6000-pmp-v2";
+				reg = <0x3 0x50500000 0x0 0x80000>,
+				      <0x3 0x50c00000 0x0 0x4000>;
+				reg-names = "pmp", "asc";
+				mboxes = <&pmp_mbox>;
+				mbox-names = "mbox";
+				iommus = <&pmp_dart 0>;
+				status = "disabled";
+			};
+		};
+	};
+};
