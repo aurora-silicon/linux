@@ -482,6 +482,23 @@ class M3AirDryRunTest(M3AirTest):
         self.assertIn("keeping it", out)
         self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff t6030")
 
+    def test_plain_rerun_updates_the_dry_run_m1n1(self):
+        # Scott's path: an Air on 11.110-test's dry run takes a newer dry-run
+        # m1n1 from the next test build's plain one-liner, no flag needed.
+        self.mac("j613")
+        self.air_install(try_=1)
+        newer = "m1n1-aurora-1.6.1.aurora8.1-1-aarch64.pkg.tar.zst"
+        names = [l[len("chosen."):].split("=")[0] for l in DRY_RUN]
+        self.fixture(newer, None, ["asahi,t8122-gpu"] + names)
+        proc = self.air_install(pkg=f"{newer} {self.shas[newer]}")
+        self.assertIn("keeping it", proc.stdout)
+        boot = self.boot.read_bytes()
+        self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora8.1-1\n"), boot)
+        self.assertTrue(boot.endswith(b"UBOOT" + DRY_RUN_LINES), boot)
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff air-dry-run")
+        # The boot loader the Mac had before the first test stays the kept copy.
+        self.assertEqual(self.kept_copy().read_bytes(), b"M1N1:original\n")
+
     def test_install_syncs_after_the_rebuild(self):
         src = SRC[SRC.index("      m3_verify_bootbin\n"):]
         self.assertTrue(re.match(r"      m3_verify_bootbin\n(\s*#.*\n)*\s*sync\n", src), src[:200])
