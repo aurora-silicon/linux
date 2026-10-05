@@ -95,6 +95,120 @@ const SEGMENT_PROPS: [&CStr; 3] = [
     c_str!("apple,firmware-segment-flags"),
 ];
 
+/// Power-management properties of a GPU node whose SoC takes them from the boot loader
+/// (`Soc::power_from_boot_loader`), one 32-bit cell each: the ones the T6030 device tree carries
+/// as static values, and the shader-engine target. The boot loader copies each from the ADT's GPU
+/// node (`apple,X` from `gpu-X`; `apple,se-target` from `gpu-se-tgt`).
+const BOOT_LOADER_POWER: [&CStr; 41] = [
+    c_str!("apple,perf-base-pstate"),
+    c_str!("apple,min-sram-microvolt"),
+    c_str!("apple,avg-power-filter-tc-ms"),
+    c_str!("apple,avg-power-ki-only"),
+    c_str!("apple,avg-power-kp"),
+    c_str!("apple,avg-power-min-duty-cycle"),
+    c_str!("apple,avg-power-target-filter-tc"),
+    c_str!("apple,fast-die0-integral-gain"),
+    c_str!("apple,fast-die0-proportional-gain"),
+    c_str!("apple,idleoff-standby-timer"),
+    c_str!("apple,perf-boost-ce-step"),
+    c_str!("apple,perf-boost-min-util"),
+    c_str!("apple,perf-filter-drop-threshold"),
+    c_str!("apple,perf-filter-time-constant"),
+    c_str!("apple,perf-filter-time-constant2"),
+    c_str!("apple,perf-integral-gain"),
+    c_str!("apple,perf-integral-gain2"),
+    c_str!("apple,perf-integral-min-clamp"),
+    c_str!("apple,perf-proportional-gain"),
+    c_str!("apple,perf-proportional-gain2"),
+    c_str!("apple,perf-tgt-utilization"),
+    c_str!("apple,power-sample-period"),
+    c_str!("apple,ppm-filter-time-constant-ms"),
+    c_str!("apple,ppm-ki"),
+    c_str!("apple,ppm-kp"),
+    c_str!("apple,pwr-filter-time-constant"),
+    c_str!("apple,pwr-integral-gain"),
+    c_str!("apple,pwr-integral-min-clamp"),
+    c_str!("apple,pwr-min-duty-cycle"),
+    c_str!("apple,pwr-proportional-gain"),
+    c_str!("apple,pwr-sample-period-aic-clks"),
+    c_str!("apple,se-engagement-criteria"),
+    c_str!("apple,se-filter-time-constant"),
+    c_str!("apple,se-filter-time-constant-1"),
+    c_str!("apple,se-inactive-threshold"),
+    c_str!("apple,se-ki"),
+    c_str!("apple,se-ki-1"),
+    c_str!("apple,se-kp"),
+    c_str!("apple,se-kp-1"),
+    c_str!("apple,se-reset-criteria"),
+    c_str!("apple,se-target"),
+];
+
+/// Check that the boot loader gave a GPU node of `soc` every per-machine property the runtime
+/// would otherwise take from a static device tree or a driver default: [`BOOT_LOADER_POWER`], the
+/// 64-bit `apple,fast-die0-sensor-mask`, one core and one SRAM leakage coefficient per cluster,
+/// the firmware version (three cells, not all zero), and an operating-point table of at least two
+/// entries, each with one voltage per cluster and a power, and a frequency after the first. Logs
+/// every missing or malformed property.
+fn check_boot_loader_power(dev: &device::Device, node: &of::Node, soc: &Soc) -> Result {
+    let mut bad = 0u32;
+    let mut expect = |name: &CStr, want: usize, nonzero: bool| {
+        match node.get_property::<KVec<u8>>(name) {
+            Ok(value) if value.len() == want && (!nonzero || value.iter().any(|b| *b != 0)) => {}
+            Ok(value) => {
+                dev_info!(
+                    dev,
+                    "M3: not admitted: {:?} is {} bytes, {} expected{}\n",
+                    name,
+                    value.len(),
+                    want,
+                    if nonzero { ", not all zero" } else { "" }
+                );
+                bad += 1;
+            }
+            Err(_) => {
+                dev_info!(dev, "M3: not admitted: the boot loader did not add {:?}\n", name);
+                bad += 1;
+            }
+        }
+    };
+    for name in BOOT_LOADER_POWER {
+        expect(name, 4, false);
+    }
+    expect(c_str!("apple,fast-die0-sensor-mask"), 8, false);
+    expect(c_str!("apple,core-leak-coef"), 4 * soc.clusters as usize, false);
+    expect(c_str!("apple,sram-leak-coef"), 4 * soc.clusters as usize, false);
+    expect(c_str!("apple,firmware-version"), 12, true);
+
+    let mut opps = 0u32;
+    let mut opps_ok = true;
+    match node.parse_phandle(c_str!("operating-points-v2"), 0) {
+        Some(table) => {
+            for opp in table.children() {
+                let hz = opp.get_property::<u64>(c_str!("opp-hz")).unwrap_or(0);
+                let volts = opp.get_property::<KVec<u32>>(c_str!("opp-microvolt")).map_or(0, |v| v.len());
+                let power = opp.get_property::<u32>(c_str!("opp-microwatt")).is_ok();
+                opps_ok &= volts == soc.clusters as usize && power && (opps == 0 || hz != 0);
+                opps += 1;
+            }
+        }
+        None => opps_ok = false,
+    }
+    if !opps_ok || opps < 2 {
+        dev_info!(
+            dev,
+            "M3: not admitted: the operating points are not the boot loader's ({} entries; each needs opp-hz, {} opp-microvolt cells and opp-microwatt)\n",
+            opps,
+            soc.clusters
+        );
+        bad += 1;
+    }
+    if bad != 0 {
+        return Err(EINVAL);
+    }
+    dev_info!(dev, "M3: boot loader power configuration accepted ({} operating points)\n", opps);
+    Ok(())
+}
+
 /// Whether the GPU node lists the memory region `name` in memory-region-names.
 fn lists_region(node: &of::Node, name: &CStr) -> bool {
     node.get_property::<KVec<u8>>(c_str!("memory-region-names"))
@@ -201,6 +315,9 @@ pub(crate) fn admit(pdev: &platform::Device<Core>, soc: &Soc) -> Result<Resource
         ));
     }
     dev_info!(dev, "M3: board compatible accepted\n");
+    if soc.power_from_boot_loader {
+        check_boot_loader_power(dev, &node, soc)?;
+    }
 
     for name in REGIONS {
         if lists_region(&node, name) {

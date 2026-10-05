@@ -89,6 +89,7 @@ impl Registered {
     pub(crate) fn start(pdev: &platform::Device<Core>, soc: &'static crate::m3_soc::Soc) -> Result<Self> {
         let resources = crate::m3_resources::from_device(pdev, soc)?;
         dev_info!(pdev.as_ref(), "M3: resource admission complete\n");
+        soc.require_complete(pdev.as_ref())?;
         let firmware = crate::m3_firmware::identify_loaded(pdev, soc, resources)?;
         dev_info!(pdev.as_ref(), "M3: firmware identity accepted\n");
         // InitData source and contents, before any GPU register access.
