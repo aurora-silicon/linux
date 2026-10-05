@@ -104,6 +104,9 @@ u64 dcp_fabric_presence_edge(struct dcp_fabric_presence *presence,
 bool dcp_fabric_presence_sample(struct dcp_fabric_presence *presence,
 				u64 generation, bool high,
 				unsigned long now, unsigned long window);
+bool dcp_fabric_presence_recheck(struct dcp_fabric_presence *presence,
+				 u64 generation, bool high,
+				 unsigned long now, unsigned long window);
 bool dcp_fabric_presence_expire(struct dcp_fabric_presence *presence,
 				u64 generation, bool high, unsigned long now);
 unsigned int dcp_fabric_score(const struct dcp_fabric_pipeline *pipeline,

@@ -59,6 +59,7 @@ static DEFINE_MUTEX(dcp_typec_fabric_lock);
 static LIST_HEAD(dcp_typec_ports);
 
 static enum dcp_fabric_presence_state dcp_hdmi_presence(struct apple_dcp *dcp);
+static void dcp_hdmi_update_locked(struct apple_dcp *dcp);
 
 bool dcp_is_typec_output(struct apple_dcp *dcp)
 {
@@ -566,12 +567,49 @@ static void dcp_hdmi_settle_work(struct work_struct *work)
 	symbol_put(apple_tb_dp_capacity_available);
 }
 
+static void dcp_hdmi_recheck_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work),
+					     struct apple_dcp, hdmi_recheck_wq);
+	unsigned long flags;
+	u64 generation;
+	bool changed;
+	int level;
+
+	/* Oneshot unmask precedes thread completion. Never wait under fabric. */
+	synchronize_irq(dcp->hdmi_hpd_irq);
+	guard(mutex)(&dcp_typec_fabric_lock);
+	if (dcp_typec_dual_stream())
+		return;
+	spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
+	generation = dcp->hdmi_presence.generation;
+	spin_unlock_irqrestore(&dcp->hdmi_presence_lock, flags);
+	level = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+	if (level < 0) {
+		dcp_hdmi_sample(dcp, generation, level);
+		return;
+	}
+	spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
+	changed = dcp_fabric_presence_recheck(&dcp->hdmi_presence, generation,
+					      level > 0, jiffies,
+					      msecs_to_jiffies(DCP_HDMI_HOLD_MS));
+	spin_unlock_irqrestore(&dcp->hdmi_presence_lock, flags);
+	if (!changed)
+		return;
+	dcp_hdmi_schedule(dcp);
+	dcp_hdmi_update_locked(dcp);
+	/* Catch a level change during this update's firmware/debounce waits. */
+	mod_delayed_work(system_freezable_wq, &dcp->hdmi_recheck_wq, 0);
+}
+
 void dcp_fabric_init(struct apple_dcp *dcp)
 {
 	spin_lock_init(&dcp->hdmi_presence_lock);
 	dcp->hdmi_presence.state = DCP_FABRIC_ABSENT;
 	INIT_DELAYED_WORK(&dcp->hdmi_settle_wq, dcp_hdmi_settle_work);
+	INIT_DELAYED_WORK(&dcp->hdmi_recheck_wq, dcp_hdmi_recheck_work);
 	disable_delayed_work(&dcp->hdmi_settle_wq);
+	disable_delayed_work(&dcp->hdmi_recheck_wq);
 }
 
 /* Caller enables the HPD IRQ first; a later edge invalidates this sample. */
@@ -1852,15 +1890,14 @@ irqreturn_t dcp_dp2hdmi_hpd_edge(int irq, void *data)
 	return IRQ_WAKE_THREAD;
 }
 
-irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
+static void dcp_hdmi_update_locked(struct apple_dcp *dcp)
 {
-	struct apple_dcp *dcp = data;
 	bool connected;
 	unsigned long flags;
 	u64 generation;
 	int level;
 
-	guard(mutex)(&dcp_typec_fabric_lock);
+	lockdep_assert_held(&dcp_typec_fabric_lock);
 	spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
 	generation = dcp->hdmi_presence.generation;
 	spin_unlock_irqrestore(&dcp->hdmi_presence_lock, flags);
@@ -1883,7 +1920,7 @@ irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
 			   gpiod_get_value_cansleep(dcp->hdmi_hpd)) {
 			dcp_typec_hdmi_waits(dcp);
 		}
-		return IRQ_HANDLED;
+		return;
 	}
 	connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
 
@@ -1909,7 +1946,17 @@ irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
 		else
 			dcp_dptx_connect(dcp, 0);
 	}
+}
 
+irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	dcp_hdmi_update_locked(dcp);
+	/* The GPIO edge detector is off throughout an oneshot handler. */
+	if (!dcp_typec_dual_stream())
+		mod_delayed_work(system_freezable_wq, &dcp->hdmi_recheck_wq, 0);
 	return IRQ_HANDLED;
 }
 

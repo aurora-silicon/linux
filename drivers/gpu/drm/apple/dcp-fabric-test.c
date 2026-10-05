@@ -625,6 +625,54 @@ static void fabric_presence_wrap_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, presence.deadline, 0UL);
 }
 
+static void fabric_masked_edge_test(struct kunit *test)
+{
+	struct fabric_fixture f;
+	struct dcp_fabric_presence presence = {};
+	u64 generation;
+	bool irq_masked = true, gpio_high = true;
+
+	fabric_init(&f, false);
+	f.pipeline[1].owned = true;
+	generation = dcp_fabric_presence_edge(&presence, 100, 10000);
+	KUNIT_ASSERT_TRUE(test,
+			  dcp_fabric_presence_sample(&presence, generation, gpio_high, 100, 10000));
+	KUNIT_ASSERT_EQ(test, presence.state, DCP_FABRIC_PRESENT);
+	/* Fake oneshot debounce: fall with detector off, no hardirq generation. */
+	gpio_high = false;
+	KUNIT_EXPECT_TRUE(test, irq_masked);
+	KUNIT_EXPECT_EQ(test, presence.generation, generation);
+	/* IRQ completion unmasks before the queued synchronized recheck. */
+	irq_masked = false;
+	KUNIT_EXPECT_FALSE(test, irq_masked);
+	KUNIT_ASSERT_TRUE(test,
+			  dcp_fabric_presence_recheck(&presence, generation, gpio_high,
+						      600, 10000));
+	KUNIT_EXPECT_EQ(test, presence.state, DCP_FABRIC_SETTLING);
+	KUNIT_EXPECT_EQ(test, presence.deadline, 10600UL);
+	KUNIT_EXPECT_NE(test, presence.generation, generation);
+	f.pipeline[0].presence = presence.state;
+	KUNIT_EXPECT_EQ(test, fabric_tunnel(&f, 0, 0), -EBUSY);
+	KUNIT_EXPECT_EQ(test, fabric_direct(&f, 1), -EBUSY);
+	KUNIT_EXPECT_FALSE(test,
+			   dcp_fabric_presence_recheck(&presence, generation, true, 601, 10000));
+	generation = presence.generation;
+	KUNIT_EXPECT_FALSE(test,
+			   dcp_fabric_presence_recheck(&presence, generation, false, 602, 10000));
+	KUNIT_EXPECT_EQ(test, presence.deadline, 10600UL);
+	KUNIT_EXPECT_TRUE(test,
+			  dcp_fabric_presence_expire(&presence, generation, false, 10600));
+	f.pipeline[0].presence = presence.state;
+	fabric_promote(&f);
+	KUNIT_EXPECT_PTR_EQ(test, f.port[1].owner[0], &f.route[1][0]);
+	/* A rise lost during a low handler clears the hold on post-unmask read. */
+	generation = dcp_fabric_presence_edge(&presence, 20000, 10000);
+	KUNIT_EXPECT_TRUE(test,
+			  dcp_fabric_presence_recheck(&presence, generation, true, 20500, 10000));
+	KUNIT_EXPECT_EQ(test, presence.state, DCP_FABRIC_PRESENT);
+	KUNIT_EXPECT_EQ(test, presence.deadline, 0UL);
+}
+
 static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE_PARAM(fabric_scenario_test, fabric_scenario_gen_params),
 	KUNIT_CASE(fabric_dark_tunnel_test),
@@ -632,6 +680,7 @@ static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE(fabric_deactivate_failure_test),
 	KUNIT_CASE(fabric_unbound_and_mask_test),
 	KUNIT_CASE(fabric_presence_wrap_test),
+	KUNIT_CASE(fabric_masked_edge_test),
 	{}
 };
 

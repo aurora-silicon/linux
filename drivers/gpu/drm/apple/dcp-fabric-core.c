@@ -62,6 +62,21 @@ bool dcp_fabric_presence_sample(struct dcp_fabric_presence *presence,
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_presence_sample);
 
+bool dcp_fabric_presence_recheck(struct dcp_fabric_presence *presence,
+				 u64 generation, bool high,
+				 unsigned long now, unsigned long window)
+{
+	bool present = presence->state == DCP_FABRIC_PRESENT;
+
+	if (generation != presence->generation || high == present)
+		return false;
+	/* Synthesize an edge which the masked GPIO detector could not record. */
+	generation = dcp_fabric_presence_edge(presence, now, window);
+	dcp_fabric_presence_sample(presence, generation, high, now, window);
+	return true;
+}
+EXPORT_SYMBOL_GPL(dcp_fabric_presence_recheck);
+
 bool dcp_fabric_presence_expire(struct dcp_fabric_presence *presence,
 				u64 generation, bool high, unsigned long now)
 {

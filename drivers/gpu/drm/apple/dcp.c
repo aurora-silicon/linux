@@ -1364,6 +1364,7 @@ static void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
 	disable_delayed_work_sync(&dcp->placeholder_edid_wq);
 	disable_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
 	disable_delayed_work_sync(&dcp->hdmi_settle_wq);
+	disable_delayed_work_sync(&dcp->hdmi_recheck_wq);
 }
 
 static void dcp_enable_typec_work(struct apple_dcp *dcp)
@@ -1372,6 +1373,7 @@ static void dcp_enable_typec_work(struct apple_dcp *dcp)
 	enable_delayed_work(&dcp->placeholder_edid_wq);
 	enable_delayed_work(&dcp->typec_fabric_retrain_wq);
 	enable_delayed_work(&dcp->hdmi_settle_wq);
+	enable_delayed_work(&dcp->hdmi_recheck_wq);
 	/* A cable can be routed before the DRM component binds. */
 	if (READ_ONCE(dcp->typec_cable_connected))
 		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq, 0);

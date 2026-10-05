@@ -343,6 +343,7 @@ struct apple_dcp {
 	spinlock_t hdmi_presence_lock;
 	struct dcp_fabric_presence hdmi_presence;
 	struct delayed_work hdmi_settle_wq;
+	struct delayed_work hdmi_recheck_wq;
 };
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
