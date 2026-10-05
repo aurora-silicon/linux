@@ -245,7 +245,7 @@ class M3AirTest(flow.M3FlowBase):
         self.assertNotIn(flow.AURORA3, self.downloaded())
         self.assertNotIn(flow.AURORA6, self.downloaded())
         self.assertEqual(self.kept_copy().read_bytes(), b"M1N1:original\n")
-        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff")
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff air-gpu")
         self.assertNotIn("M1N1_UPDATE_DISABLED", self.update_conf.read_text())
 
         self.sh("uninstall_all")
@@ -261,7 +261,7 @@ class M3AirTest(flow.M3FlowBase):
         out = self.air_install().stdout
         self.assertIn("keeping it", out)
         self.assertTrue(self.boot.read_bytes().endswith(AIR_GPU))
-        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff")
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff air-gpu")
 
     def test_rerun_without_an_air_package_stops(self):
         # A later build without the Air's m1n1 never drops a tested Air back
@@ -395,7 +395,8 @@ class M3AirDryRunTest(M3AirTest):
         self.assertIn("case D", self.sh("m3_plan").stdout)
         err = self.sh("M3_TRY=1\nm3_plan").stderr
         self.assertIn("GPU and display dry run", err)
-        self.assertIn("switches\n    nothing on", err)
+        self.assertIn("it switches nothing on", err)
+        self.assertIn("short identity read", err)
 
     def test_handoff_and_back(self):
         self.mac("j613")
@@ -409,7 +410,7 @@ class M3AirDryRunTest(M3AirTest):
         self.assertNotIn(b"t8122-gpu=1", boot)
         self.assertNotIn(b"t6030", boot)
         self.assertEqual(self.kept_copy().read_bytes(), b"M1N1:original\n")
-        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff")
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff air-dry-run")
         self.sh("uninstall_all")
         boot = self.boot.read_bytes()
         self.assertTrue(boot.startswith(b"M1N1:m1n1-stock\n"), boot)
@@ -443,6 +444,47 @@ class M3AirDryRunTest(M3AirTest):
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn(why, proc.stderr)
                 self.assertIn("Nothing was installed", proc.stderr)
+
+    # The recorded variant: a dry run never becomes a GPU start unasked.
+
+    def test_later_gpu_build_needs_a_new_opt_in(self):
+        self.mac("j613")
+        self.air_install(try_=1)
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff air-dry-run")
+        before = self.boot.read_bytes()
+        self.dry_run = 0          # a later release that starts the GPU
+        proc = self.air_install(check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("earlier test build's boot loader", proc.stderr)
+        self.assertIn("(air-dry-run)", proc.stderr)
+        self.assertIn("Nothing was installed", proc.stderr)
+        self.assertEqual(self.boot.read_bytes(), before)
+        # Asking again switches it.
+        self.air_install(try_=1)
+        self.assertTrue(self.boot.read_bytes().endswith(b"UBOOT" + AIR_GPU), self.boot.read_bytes())
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff air-gpu")
+
+    def test_unrecorded_variant_needs_a_new_opt_in(self):
+        # A record without a variant (the never-released 6e8493e4) is not kept.
+        self.mac("j613")
+        self.air_install(try_=1)
+        (self.state / "m3-mode").write_text("handoff\n")
+        proc = self.air_install(check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("Nothing was installed", proc.stderr)
+
+    def test_m3_pro_old_record_still_kept(self):
+        # 11.36.1 recorded a bare "handoff" on M3 Pros; that still keeps it.
+        self.mac("j516s")
+        self.air_install()
+        (self.state / "m3-mode").write_text("handoff\n")
+        out = self.air_install().stdout
+        self.assertIn("keeping it", out)
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff t6030")
+
+    def test_install_syncs_after_the_rebuild(self):
+        src = SRC[SRC.index("      m3_verify_bootbin\n"):]
+        self.assertTrue(re.match(r"      m3_verify_bootbin\n(\s*#.*\n)*\s*sync\n", src), src[:200])
 
 if __name__ == "__main__":
     unittest.main()

@@ -239,7 +239,7 @@ class M3FlowTest(M3FlowBase):
         self.assertIn(AURORA6, self.downloaded())
         self.assertNotIn(AURORA3, self.downloaded())
         self.assertEqual(self.kept_copy().read_bytes(), b"M1N1:original\n")
-        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff")
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff t6030")
         self.assertFalse(self.update_conf.read_text().count("M1N1_UPDATE_DISABLED"))
 
         self.uninstall()
@@ -333,7 +333,7 @@ class M3FlowTest(M3FlowBase):
         self.install(try_=1)
         out = self.install().stdout
         self.assertIn("keeping it", out)
-        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff")
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff t6030")
         self.assertTrue(self.boot.read_bytes().endswith(SWITCHES))
         self.assertNotIn("M1N1_UPDATE_DISABLED", self.update_conf.read_text())
         self.uninstall()
