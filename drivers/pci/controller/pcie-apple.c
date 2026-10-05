@@ -693,6 +693,12 @@ static int apple_pcie_port_setup_irq(struct apple_pcie_port *port)
 	apple_pcie_port_writel(port, ~0, PORT_INTSTAT);
 	apple_pcie_port_writel(port, ~0, PORT_LINKCMDSTS);
 
+	/*
+	 * AIC has no irq_disable callback, so a lazy disable would only mark
+	 * the parent disabled, and a chained handler never masks it later.
+	 * Make apple_pcie_port_disable_irq() really mask it.
+	 */
+	irq_set_status_flags(port->irq, IRQ_DISABLE_UNLAZY);
 	irq_set_chained_handler_and_data(port->irq, apple_port_irq_handler, port);
 
 	/* Configure MSI base address */
@@ -801,9 +807,15 @@ static void apple_pcie_port_unregister_irqs(struct apple_pcie_port *port)
 }
 
 /*
- * A chained handler is not tracked by IRQD_IRQ_INPROGRESS, and AIC does not
- * report IRQCHIP_STATE_ACTIVE. Gate and drain MMIO explicitly before masking
- * the parent; disable_irq() alone cannot synchronize this chained handler.
+ * Mask the parent first: the gated handler no longer reads or acknowledges
+ * PORT_INTSTAT, so a level interrupt left unmasked would be unmasked again at
+ * every EOI and fire without end. IRQ_DISABLE_UNLAZY makes
+ * disable_irq_nosync() mask at AIC right away.
+ *
+ * A chained handler is not tracked by IRQD_IRQ_INPROGRESS, so neither
+ * disable_irq() nor synchronize_irq() would wait for one that is already
+ * running. Closing the gate under irq_lock does: it waits for a handler inside
+ * the gated section, and any later handler skips the port registers.
  */
 static void apple_pcie_port_disable_irq(struct apple_pcie_port *port)
 {
@@ -812,11 +824,10 @@ static void apple_pcie_port_disable_irq(struct apple_pcie_port *port)
 	if (!port->irq || !port->domain || port->irq_disabled)
 		return;
 
+	disable_irq_nosync(port->irq);
 	raw_spin_lock_irqsave(&port->irq_lock, flags);
 	port->irq_disabled = true;
 	raw_spin_unlock_irqrestore(&port->irq_lock, flags);
-	/* The gate drained chained MMIO; avoid a sleeping wait in noirq PM. */
-	disable_irq_nosync(port->irq);
 }
 
 static void apple_pcie_port_enable_irq(struct apple_pcie_port *port)
@@ -3453,9 +3464,11 @@ static int apple_pcie_resume_noirq(struct device *dev)
 	return 0;
 
 failed:
-	/* A retained link can fail before the sleep path ever closed the gate. */
-	list_for_each_entry(port, &pcie->ports, entry)
-		apple_pcie_port_disable_irq(port);
+	/*
+	 * Ports the sleep path stopped are still gated and masked; nothing has
+	 * reopened them. A retained link that failed was never gated: leave it
+	 * serviceable, as after a surprise unplug, until teardown masks it.
+	 */
 	/* Device PM keeps resuming dependents even after this callback fails. */
 	pcie->resume_failed = true;
 	if (!pcie->bus_stopped)
