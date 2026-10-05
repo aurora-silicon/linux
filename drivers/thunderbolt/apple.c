@@ -219,11 +219,7 @@ struct apple_cio {
 		struct mutex lock;	/* protects regs, alive, waiting, paused */
 		void __iomem *regs;	/* mapped while a DP tunnel uses this adapter */
 		unsigned int idx;
-		bool alive;		/* tunnel up; cleared before it is torn down */
-		bool handed;		/* appledrm has our callback; work only */
-		bool rearm;		/* a fresh tunnel needs a fresh DCP route */
-		bool waiting;		/* no display pipeline was free for it */
-		bool paused;		/* system sleep: no retries */
+		struct apple_dpin_state state;
 	} dpin[2];
 };
 
@@ -393,7 +389,7 @@ static int apple_dpin_dcp_set_active(void *data, bool active)
 
 	guard(mutex)(&c->lock);
 	/* the tunnel is being torn down: the block may already be off */
-	if (!c->alive || !c->regs)
+	if (!c->state.alive || !c->regs)
 		return -ENODEV;
 	return apple_dpin_set_active(c->acio, c->regs, c->idx, active);
 }
@@ -410,7 +406,7 @@ static int apple_dpin_connect(struct apple_dpin_ctx *c, bool active)
 		/* A down event can arrive during the readiness sleep. */
 		if (active) {
 			scoped_guard(mutex, &c->lock)
-				alive = c->alive;
+				alive = c->state.alive;
 			if (!alive)
 				return -ENODEV;
 		}
@@ -431,14 +427,12 @@ static int apple_dpin_connect(struct apple_dpin_ctx *c, bool active)
 		 * Neither has handed a callback or changed the display route.
 		 * Other failures are terminal for this tunnel event.
 		 */
-		if (!active || (ret != -ENODEV && ret != -EAGAIN) ||
-		    tries >= (ret == -EAGAIN ? APPLE_DP_FIRMWARE_TRIES :
-					       APPLE_DP_CONNECT_TRIES))
+		if (!apple_dpin_readiness_retry(active, ret, tries))
 			return ret;
 
 		scoped_guard(mutex, &c->lock) {
-			alive = c->alive;
-			paused = c->paused;
+			alive = c->state.alive;
+			paused = c->state.paused;
 		}
 		if (!alive)
 			return -ENODEV;
@@ -457,7 +451,6 @@ static int apple_dpin_up(struct apple_dpin_ctx *c)
 	struct apple_cio *acio = c->acio;
 	void __iomem *regs = c->regs;
 	u32 irq;
-	int ret;
 
 	if (!regs) {
 		regs = ioremap_np(acio->rc_res->start + APPLE_DPIN_OFFSET +
@@ -468,7 +461,7 @@ static int apple_dpin_up(struct apple_dpin_ctx *c)
 	scoped_guard(mutex, &c->lock) {
 		c->regs = regs;
 		/* unplugged meanwhile: the block may be off, leave it alone */
-		if (!c->alive)
+		if (!c->state.alive)
 			return -ENODEV;
 		/*
 		 * Acknowledge what is pending and enable the DP IN interrupts:
@@ -486,10 +479,7 @@ static int apple_dpin_up(struct apple_dpin_ctx *c)
 		}
 	}
 
-	ret = apple_dpin_connect(c, true);
-	if (!ret)
-		c->handed = true;
-	return ret;
+	return apple_dpin_connect(c, true);
 }
 
 static void apple_dpin_down(struct apple_dpin_ctx *c)
@@ -497,17 +487,18 @@ static void apple_dpin_down(struct apple_dpin_ctx *c)
 	void __iomem *regs;
 	int ret;
 
-	if (c->handed) {
+	if (c->state.handed) {
 		ret = apple_dpin_connect(c, false);
 		if (ret)
 			dev_warn(c->acio->dev, "dpin%u: display teardown failed: %d\n",
 				 c->idx, ret);
-		c->handed = false;
 	}
 	/* the adapter was put to sleep before the tunnel went away */
 	scoped_guard(mutex, &c->lock) {
 		regs = c->regs;
 		c->regs = NULL;
+		apple_dpin_step(&c->state, c->acio->dp, APPLE_DPIN_DROPPED,
+				false, 0);
 	}
 	if (regs)
 		iounmap(regs);
@@ -524,11 +515,12 @@ static void apple_dpin_retry_fn(struct work_struct *work)
 {
 	struct apple_dpin_ctx *c = container_of(to_delayed_work(work),
 						struct apple_dpin_ctx, retry);
-	bool again;
+	unsigned int actions;
 
 	scoped_guard(mutex, &c->lock)
-		again = c->alive && c->waiting && !c->paused;
-	if (again)
+		actions = apple_dpin_step(&c->state, c->acio->dp,
+					  APPLE_DPIN_RETRY, !!c->regs, 0);
+	if (actions & APPLE_DPIN_QUEUE)
 		queue_work(c->acio->dp_wq, &c->work);
 }
 
@@ -540,80 +532,56 @@ static void apple_dpin_retry_fn(struct work_struct *work)
 static void apple_dpin_work_fn(struct work_struct *work)
 {
 	struct apple_dpin_ctx *c = container_of(work, struct apple_dpin_ctx, work);
-	bool want, rearm;
+	unsigned int actions;
 	int ret;
 
 	for (;;) {
-		scoped_guard(mutex, &c->lock) {
-			want = c->alive;
-			rearm = c->rearm;
-			c->rearm = false;
-		}
+		scoped_guard(mutex, &c->lock)
+			actions = apple_dpin_step(&c->state, c->acio->dp,
+						  APPLE_DPIN_WORK, !!c->regs, 0);
 
-		if (!want) {
-			scoped_guard(mutex, &c->lock)
-				c->waiting = false;
+		if (actions & APPLE_DPIN_CANCEL_RETRY)
 			cancel_delayed_work(&c->retry);
-			if (c->handed || c->regs) {
-				apple_dpin_down(c);
-				dev_dbg(c->acio->dev, "dpin%u: DP tunnel down\n", c->idx);
-			}
-			return;
-		}
-		if (rearm && c->handed) {
-			dev_info(c->acio->dev,
-				 "dpin%u: replacing stale display route for new tunnel\n",
-				 c->idx);
+		if (actions & APPLE_DPIN_DROP) {
+			if (actions & APPLE_DPIN_AGAIN)
+				dev_info(c->acio->dev,
+					 "dpin%u: replacing stale display route for new tunnel\n",
+					 c->idx);
 			apple_dpin_down(c);
-			continue;
+			if (actions & APPLE_DPIN_AGAIN)
+				continue;
+			dev_dbg(c->acio->dev, "dpin%u: DP tunnel down\n", c->idx);
 		}
-		if (c->handed)
+		if (!(actions & APPLE_DPIN_ATTACH))
 			return;
 
 		ret = apple_dpin_up(c);
-		if (ret) {
-			bool wait = (ret == -EBUSY || ret == -EAGAIN) &&
-				    c->acio->dp->capacity_retry;
-			bool first = false, paused = false;
-
-			scoped_guard(mutex, &c->lock) {
-				want = c->alive;
-				if (want && wait) {
-					first = !c->waiting;
-					c->waiting = true;
-					paused = c->paused;
-				} else {
-					/* the connection manager decides about the tunnel again */
-					c->waiting = false;
-				}
-			}
-			if (!wait)
-				cancel_delayed_work(&c->retry);
-			if (!want)
-				continue;	/* unplugged meanwhile: clean up */
-			if (wait) {
-				if (first)
-					dev_info(c->acio->dev,
-						 "dpin%u: no display pipeline free; waiting for one\n",
-						 c->idx);
-				/* after system sleep, apple_nhi_complete() asks again */
-				if (!paused)
-					mod_delayed_work(c->acio->dp_wq, &c->retry,
-							 msecs_to_jiffies(APPLE_DPIN_RETRY_MS));
-				return;
-			}
-			dev_warn(c->acio->dev, "dpin%u: DP tunnel setup failed: %d\n",
-				 c->idx, ret);
-			return;
-		}
 		scoped_guard(mutex, &c->lock) {
-			if (c->waiting)
+			actions = apple_dpin_step(&c->state, c->acio->dp,
+						  APPLE_DPIN_RESULT, !!c->regs, ret);
+			if (actions & APPLE_DPIN_RECOVERED)
 				dev_info(c->acio->dev,
 					 "dpin%u: a display pipeline came free; DP tunnel up\n",
 					 c->idx);
-			c->waiting = false;
 		}
-		dev_dbg(c->acio->dev, "dpin%u: DP tunnel up\n", c->idx);
+		if (actions & APPLE_DPIN_CANCEL_RETRY)
+			cancel_delayed_work(&c->retry);
+		if (actions & APPLE_DPIN_AGAIN) {
+			if (actions & APPLE_DPIN_LOG_CONNECTED)
+				dev_dbg(c->acio->dev, "dpin%u: DP tunnel up\n", c->idx);
+			continue;
+		}
+		if (actions & APPLE_DPIN_FIRST_WAIT)
+			dev_info(c->acio->dev,
+				 "dpin%u: no display pipeline free; waiting for one\n",
+				 c->idx);
+		if (actions & APPLE_DPIN_ARM_RETRY)
+			mod_delayed_work(c->acio->dp_wq, &c->retry,
+					 msecs_to_jiffies(APPLE_DPIN_RETRY_MS));
+		if (actions & APPLE_DPIN_WARN)
+			dev_warn(c->acio->dev, "dpin%u: DP tunnel setup failed: %d\n",
+				 c->idx, ret);
+		return;
 	}
 }
 
@@ -1592,10 +1560,9 @@ static int apple_nhi_dp_tunnel_post_activate(struct tb_nhi *nhi,
 		 * running on a controller detach. Force the DCP route through a
 		 * down/up cycle instead of treating the old handoff as this one.
 		 */
-		scoped_guard(mutex, &c->lock) {
-			c->alive = true;
-			c->rearm = true;
-		}
+		scoped_guard(mutex, &c->lock)
+			apple_dpin_step(&c->state, c->acio->dp, APPLE_DPIN_REARM,
+					!!c->regs, 0);
 		queue_work(anhi->acio->dp_wq, &c->work);
 	}
 	apple_dp_dump_host_adapters(anhi);
@@ -1632,9 +1599,10 @@ static void apple_nhi_dp_tunnel_deactivate(struct tb_nhi *nhi,
 		struct apple_dpin_ctx *c = &anhi->acio->dpin[idx];
 
 		scoped_guard(mutex, &c->lock) {
-			if (c->alive && c->regs)
+			if (c->state.alive && c->regs)
 				apple_dpin_set_active(c->acio, c->regs, c->idx, false);
-			c->alive = false;
+			apple_dpin_step(&c->state, c->acio->dp, APPLE_DPIN_DOWN,
+					!!c->regs, 0);
 		}
 		queue_work(anhi->acio->dp_wq, &c->work);
 	}
@@ -1677,12 +1645,14 @@ static void apple_nhi_dp_tunnel_changed(struct tb_nhi *nhi, u8 in_port,
 		 * torn down after this returns), so put the adapter back to
 		 * sleep and mask its interrupts now; nothing may touch it after.
 		 */
-		if (!active && c->alive && c->regs) {
+		if (!active && c->state.alive && c->regs) {
 			apple_dpin_set_active(acio, c->regs, dpin, false);
 			writel(readl(c->regs + APPLE_DPIN_IRQ_ENABLE) & ~3,
 			       c->regs + APPLE_DPIN_IRQ_ENABLE);
 		}
-		c->alive = active;
+		apple_dpin_step(&c->state, acio->dp,
+				active ? APPLE_DPIN_UP : APPLE_DPIN_DOWN,
+				!!c->regs, 0);
 	}
 	queue_work(acio->dp_wq, &acio->dpin[dpin].work);
 }
@@ -1700,7 +1670,7 @@ static bool apple_nhi_dp_tunnel_awaits_display(struct tb_nhi *nhi,
 		return false;
 	c = &anhi->acio->dpin[idx];
 	guard(mutex)(&c->lock);
-	return c->alive && c->waiting;
+	return c->state.alive && c->state.waiting;
 }
 
 static const struct tb_nhi_ops apple_nhi_ops = {
@@ -1934,7 +1904,8 @@ static void apple_dpin_pause_retries(struct apple_cio *acio)
 		struct apple_dpin_ctx *c = &acio->dpin[i];
 
 		scoped_guard(mutex, &c->lock)
-			c->paused = true;
+			apple_dpin_step(&c->state, acio->dp, APPLE_DPIN_PAUSE,
+					!!c->regs, 0);
 		cancel_delayed_work_sync(&c->retry);
 		flush_work(&c->work);
 	}
@@ -1946,10 +1917,12 @@ static void apple_dpin_resume_retries(struct apple_cio *acio)
 		return;
 	for (unsigned int i = 0; i < ARRAY_SIZE(acio->dpin); i++) {
 		struct apple_dpin_ctx *c = &acio->dpin[i];
+		unsigned int actions;
 
 		guard(mutex)(&c->lock);
-		c->paused = false;
-		if (c->alive && c->waiting)
+		actions = apple_dpin_step(&c->state, acio->dp,
+					  APPLE_DPIN_RESUME, !!c->regs, 0);
+		if (actions & APPLE_DPIN_ARM_RETRY)
 			mod_delayed_work(acio->dp_wq, &c->retry,
 					 msecs_to_jiffies(APPLE_DPIN_RETRY_MS));
 	}
