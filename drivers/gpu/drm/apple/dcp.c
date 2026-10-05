@@ -207,11 +207,23 @@ static int dcp_dpxbar_tunnel_select_source(struct mux_control *mux, int state)
 static unsigned int dcp_typec_route_score(struct apple_dcp_typec_route *route)
 {
 	struct apple_dcp *dcp = route->dcp;
+	unsigned int score;
 
 	if (!dcp->crtc)
 		return UINT_MAX - 1;
 
-	return drm_crtc_index(&dcp->crtc->base);
+	score = drm_crtc_index(&dcp->crtc->base);
+	/*
+	 * Without dual-stream docks no stream is tied to the hybrid, so it goes
+	 * to a Type-C port only when no Type-C-only pipeline is free, and an HDMI
+	 * display plugged in later finds its pipeline idle.  The port's encoder is
+	 * narrowed to the routed pipeline before its connector reports connected,
+	 * so the compositor pairs the connector with that pipeline.
+	 */
+	if (!dcp_typec_dual_stream() && dcp->fixed_phy)
+		score += 100;
+
+	return score;
 }
 
 static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
@@ -682,6 +694,27 @@ dcp_typec_lowest_free(struct apple_dcp_typec_port *port)
 }
 
 /*
+ * The pipeline a port without one takes: the one it last had if that is
+ * free, as a compositor keeps a reconnected connector's CRTC, otherwise the
+ * best-ranked free one.  Without dual-stream docks a free Type-C-only
+ * pipeline comes first even when the port last had the hybrid, which an HDMI
+ * display needs.
+ */
+static struct apple_dcp_typec_route *
+dcp_typec_free_route(struct apple_dcp_typec_port *port)
+{
+	struct apple_dcp_typec_route *last = port->preferred_route;
+	struct apple_dcp_typec_route *best = dcp_typec_lowest_free(port);
+
+	if (!last || !dcp_typec_route_available(last))
+		return best;
+	if (!dcp_typec_dual_stream() && best &&
+	    dcp_typec_route_score(best) < dcp_typec_route_score(last))
+		return best;
+	return last;
+}
+
+/*
  * Route the direct DP-alt ports left waiting for a pipeline.  Their DP
  * state is not reported again while it stays the same, so nothing else
  * would.  Each goes back to the pipeline it last had if that is free, as
@@ -697,9 +730,7 @@ static void dcp_typec_route_waiting(void)
 		if (port->owner || !port->dp_wanted || !port->dp_hpd)
 			continue;
 
-		route = port->preferred_route;
-		if (!route || !dcp_typec_route_available(route))
-			route = dcp_typec_lowest_free(port);
+		route = dcp_typec_free_route(port);
 		if (!route || dcp_typec_route_activate(route, route->xbar))
 			continue;
 		port->owner = route;
@@ -812,19 +843,107 @@ dcp_typec_rebalance_locked(struct apple_dcp_typec_port *arriving,
 }
 
 /*
- * A route has let its pipeline go.  Until a compositor owns the display
- * the plan places everything anew; after that the pipeline goes to a port
- * left waiting for one.
+ * A display is plugged into the HDMI port while its pipeline, the hybrid,
+ * drives a Type-C port.  Without dual-stream docks, move a direct DP-alt
+ * display to a free Type-C-only pipeline -- an unplug and replug of that
+ * display, as in dcp_typec_rebalance_locked() -- and give the hybrid back to
+ * HDMI.  A Thunderbolt tunnel never moves.  Otherwise the HDMI display waits,
+ * and gets the hybrid when the Type-C display lets it go.  A display that
+ * cannot move is put back where it was rather than left dark.
+ */
+static void dcp_typec_reclaim_hybrid(struct apple_dcp *dcp)
+{
+	struct apple_dcp_typec_route *owner = READ_ONCE(dcp->active_typec_route);
+	struct apple_dcp_typec_route *dest = NULL, *candidate;
+	struct apple_dcp_typec_port *port;
+
+	lockdep_assert_held(&dcp_typec_fabric_lock);
+
+	if (!owner || !dcp->hdmi_hpd || !gpiod_get_value_cansleep(dcp->hdmi_hpd))
+		return;
+	port = owner->port;
+	if (owner->tunnel || port->owner != owner) {
+		dev_info(dcp->dev,
+			 "HDMI display waits: its pipeline drives a Thunderbolt display on %pOF\n",
+			 port->connector_np);
+		return;
+	}
+
+	list_for_each_entry(candidate, &port->routes, port_link) {
+		if (candidate != owner && !candidate->dcp->fixed_phy &&
+		    dcp_typec_route_available(candidate)) {
+			dest = candidate;
+			break;
+		}
+	}
+	if (!dest) {
+		dev_info(dcp->dev,
+			 "HDMI display waits: its pipeline drives %pOF and no other pipeline is free\n",
+			 port->connector_np);
+		return;
+	}
+
+	dev_info(dcp->dev, "moving %pOF to %s for the HDMI display\n",
+		 port->connector_np, dev_name(dest->dcp->dev));
+	if (port->hpd || dcp->typec_cable_connected ||
+	    (dcp->typec_connector && dcp->typec_connector->connected))
+		dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
+	port->hpd = false;
+	if (dcp_typec_route_deactivate(owner) && owner->selected) {
+		/* still routed: leave the display where it is */
+		dcp_typec_port_attach(port);
+		return;
+	}
+	port->owner = NULL;
+
+	if (dcp_typec_route_activate(dest, dest->xbar)) {
+		dev_warn(dcp->dev, "could not move %pOF to %s; the HDMI display waits\n",
+			 port->connector_np, dev_name(dest->dcp->dev));
+		if (!dcp_typec_route_activate(owner, owner->xbar)) {
+			port->owner = owner;
+			dcp_typec_port_attach(port);
+		}
+		return;
+	}
+	port->owner = dest;
+	port->preferred_route = dest;
+	port->dp_release_deadline = 0;
+	dcp_typec_port_attach(port);
+
+	if (dcp->active)
+		dcp_dptx_connect(dcp, 0);
+}
+
+/* A pipeline came free: an HDMI display waiting for its hybrid may get it now. */
+static void dcp_typec_reclaim_waiting_hdmi(void)
+{
+	struct apple_dcp_typec_port *port;
+	struct apple_dcp_typec_route *route;
+
+	if (dcp_typec_dual_stream())
+		return;
+
+	list_for_each_entry(port, &dcp_typec_ports, link)
+		list_for_each_entry(route, &port->routes, port_link)
+			if (route->dcp->fixed_phy &&
+			    READ_ONCE(route->dcp->active_typec_route))
+				dcp_typec_reclaim_hybrid(route->dcp);
+}
+
+/*
+ * A route has let its pipeline go.  Until a compositor owns the display of a
+ * dual-stream machine the plan places everything anew; otherwise the
+ * pipeline goes to a port left waiting for one.  The caller has already
+ * handed a hybrid back to a live HDMI display.
  */
 static void dcp_typec_pipeline_freed(void)
 {
-	if (!dcp_typec_dual_stream())
-		return;
-
 	if (dcp_typec_keep_order())
 		dcp_typec_rebalance_locked(NULL, 0);
 	else
 		dcp_typec_route_waiting();
+	/* a waiting port took the pipeline first: it moves no lit display */
+	dcp_typec_reclaim_waiting_hdmi();
 }
 
 /*
@@ -972,13 +1091,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	}
 
 	if (!port->owner) {
-		if (port->preferred_route &&
-		    dcp_typec_route_available(port->preferred_route))
-			best = port->preferred_route;
-
-		if (!best)
-			best = dcp_typec_lowest_free(port);
-
+		best = dcp_typec_free_route(port);
 		if (!best)
 			return -EBUSY;
 
@@ -2409,13 +2522,19 @@ static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
 		/*
 		 * Until a compositor owns the display, a live HDMI output
 		 * takes its pipeline back from a direct DP-alt route: the
-		 * compositor pairs the HDMI connector with it first.
+		 * compositor pairs the HDMI connector with it first.  Without
+		 * dual-stream docks the Type-C display moves to a free
+		 * Type-C-only pipeline instead, at any time.
 		 */
-		if (dcp_typec_keep_order() &&
+		if ((dcp_typec_keep_order() || !dcp_typec_dual_stream()) &&
 		    gpiod_get_value_cansleep(dcp->hdmi_hpd)) {
 			msleep(500);
-			if (gpiod_get_value_cansleep(dcp->hdmi_hpd))
+			if (!gpiod_get_value_cansleep(dcp->hdmi_hpd))
+				return IRQ_HANDLED;
+			if (dcp_typec_keep_order())
 				dcp_typec_rebalance_locked(NULL, 0);
+			else
+				dcp_typec_reclaim_hybrid(dcp);
 		}
 		return IRQ_HANDLED;
 	}
