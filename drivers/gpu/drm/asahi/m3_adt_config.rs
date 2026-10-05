@@ -21,6 +21,7 @@ use crate::{
     m3_init_storage as storage,
     m3_memory::Buffer,
     m3_params::{self, G15Debug, InitDataParam, ThermalMode},
+    m3_soc::{IoMapping, Soc},
 };
 
 /// Owner indices (`m3_init_storage`) of the objects the typed builders generate.
@@ -40,12 +41,12 @@ const IO_MAPPING_SIZE: usize = size_of::<raw::IOMapping>();
 /// Number of IO-mapping slots of HwDataB.
 const IO_MAPPING_SLOTS: usize = 31;
 
-/// The firmware IO mappings of the runtime backend (HwDataB slot, physical address, total size,
-/// element size, writable). The runtime maps IO with its own IO-mapping table
+/// The T6030 firmware IO mappings of the runtime backend (HwDataB slot, physical address, total
+/// size, element size, writable). The runtime maps IO with its own IO-mapping table
 /// (`m3_init_storage::IOMAPS`), which must cover every entry (checked when the contents are
 /// built). The physical addresses are T6030 SoC register blocks, the same ones the G15 manager
 /// maps (`hw::t6030`).
-const RUNTIME_IO_MAPPINGS: [(usize, u64, u32, u32, bool); 15] = [
+pub(crate) const T6030_IO_MAPPINGS: [IoMapping; 15] = [
     (0, 0x2_90d0_0000, 0x14_4000, 0x14_4000, true), // Fender
     (1, 0x2_0e10_1000, 1, 1, false),                // AIC timer
     (2, 0x3_5101_4000, 0x4000, 0x4000, true),       // AIC software interrupts
@@ -198,11 +199,11 @@ fn write(bytes: &mut [u8], offset: usize, data: &[u8]) -> Result {
 impl Contents {
     /// Build the InitData contents from this board's device tree (`asahi.m3_initdata`), before
     /// any GPU register is touched.
-    pub(crate) fn select(pdev: &platform::Device<Core>, firmware: &Firmware) -> Result<Self> {
+    pub(crate) fn select(pdev: &platform::Device<Core>, firmware: &Firmware, soc: &Soc) -> Result<Self> {
         let dev = pdev.as_ref();
         let param = m3_params::initdata_param();
         check_version(dev, firmware)?;
-        let images = build_images(dev, firmware)?;
+        let images = build_images(dev, firmware, soc)?;
         let hwdata = images.get(HWDATA).and_then(|i| i.as_deref()).ok_or(EINVAL)?;
         let pstates = PstatePolicy::new(dev, hwdata)?;
         // The published states never go above the device tree's highest operating point.
@@ -309,17 +310,17 @@ pub(crate) fn stop_before_asc(dev: &device::Device) -> bool {
     stop
 }
 
-/// The GPU identity the runtime backend admits (SGX ID words 0x07031100 / 0x00110209, checked in
-/// `m3_device` before the firmware starts): G15, variant S, revision B1, one die with two
-/// clusters of ten core slots.
-fn t6030_identity(cfg: &'static hw::HwConfig) -> hw::GpuIdConfig {
+/// The GPU identity the runtime backend admits for `soc` (its SGX ID words, checked in
+/// `m3_device` before the firmware starts): on T6030, G15, variant S, revision B1, one die with
+/// two clusters of ten core slots.
+fn soc_identity(soc: &Soc, cfg: &'static hw::HwConfig) -> hw::GpuIdConfig {
     hw::GpuIdConfig {
         gpu_gen: hw::GpuGen::G15,
-        gpu_variant: hw::GpuVariant::S,
+        gpu_variant: soc.gpu_variant,
         usc_generation: 3,
         gpu_hal_generation: hw::GpuHalGeneration::Legacy,
-        gpu_rev: hw::GpuRevision::B1,
-        gpu_rev_id: hw::GpuRevisionID::B1,
+        gpu_rev: soc.gpu_revision,
+        gpu_rev_id: soc.gpu_revision_id,
         num_dies: cfg.num_dies,
         num_clusters: cfg.max_num_clusters,
         num_cores: cfg.max_num_cores,
@@ -392,8 +393,13 @@ fn check_layout() -> Result {
 
 /// Fill HwDataB's IO-mapping table (the runtime fills the virtual addresses when it maps them),
 /// checking every entry against the runtime's IO mapping of the same slot.
-fn fill_io_mappings(dev: &device::Device, cfg: &'static hw::HwConfig, hwdata: &mut [u8]) -> Result {
-    for &(slot, phys, total, element, writable) in RUNTIME_IO_MAPPINGS.iter() {
+fn fill_io_mappings(
+    dev: &device::Device,
+    cfg: &'static hw::HwConfig,
+    mappings: &[IoMapping],
+    hwdata: &mut [u8],
+) -> Result {
+    for &(slot, phys, total, element, writable) in mappings.iter() {
         let entry = IO_MAPPINGS + slot * IO_MAPPING_SIZE;
         let virt = entry + offset_of!(raw::IOMapping, virt_addr);
         // The same register block as the manager's table.
@@ -421,7 +427,7 @@ fn fill_io_mappings(dev: &device::Device, cfg: &'static hw::HwConfig, hwdata: &m
     }
     // Every IO mapping the runtime makes must belong to one of the entries above.
     for io in storage::IOMAPS.iter() {
-        if !RUNTIME_IO_MAPPINGS.iter().any(|&(slot, ..)| slot == io.slot) {
+        if !mappings.iter().any(|&(slot, ..)| slot == io.slot) {
             dev_err!(dev, "M3: IO mapping slot {} ({:#x}) has no device-tree InitData entry\n", io.slot, io.physical);
             return Err(EINVAL);
         }
@@ -517,18 +523,19 @@ fn zeroed(index: usize) -> Result<KVVec<u8>> {
 }
 
 /// Build the images of the generated owners from the device tree.
-fn build_images(dev: &device::Device, firmware: &Firmware) -> Result<KVec<Option<KVVec<u8>>>> {
+fn build_images(dev: &device::Device, firmware: &Firmware, soc: &Soc) -> Result<KVec<Option<KVVec<u8>>>> {
     check_layout().inspect_err(|_| {
         dev_err!(dev, "M3: the constructed InitData records do not match the G15 InitData structures\n")
     })?;
-    let cfg: &'static hw::HwConfig = &hw::t6030::HWCONFIG_T6030;
+    let cfg: &'static hw::HwConfig = soc.hwcfg.ok_or(ENODEV)?;
+    let io_mappings = soc.io_mappings.ok_or(ENODEV)?;
     let pwr = hw::PwrConfig::load(dev, cfg).inspect_err(|e| {
         dev_err!(dev, "M3: cannot read the GPU power configuration from the device tree ({:?})\n", e)
     })?;
     let node = dev.of_node().ok_or(ENODEV)?;
     let dyncfg = hw::DynConfig {
         uat_ttb_base: firmware.resources.regions[0].base,
-        id: t6030_identity(cfg),
+        id: soc_identity(soc, cfg),
         pwr,
         firmware_version: node
             .get_property::<KVec<u32>>(c_str!("apple,firmware-version"))
@@ -589,7 +596,7 @@ fn build_images(dev: &device::Device, firmware: &Firmware) -> Result<KVec<Option
         HWDATA_A + offset_of!(raw::HwDataAG15V14_8_3, init_timestamp),
         &now.to_le_bytes(),
     )?;
-    fill_io_mappings(dev, cfg, &mut hwdata)?;
+    fill_io_mappings(dev, cfg, io_mappings, &mut hwdata)?;
     images[HWDATA] = Some(hwdata);
 
     let mut globals = zeroed(GLOBALS)?;

@@ -406,7 +406,7 @@ impl platform::Driver for AsahiDriver {
                     crate::m3_params::T6030Backend::Off => return Err(ENODEV),
                     crate::m3_params::T6030Backend::Runtime => {}
                 }
-                let runtime = crate::m3_drm::Registered::start(pdev)?;
+                let runtime = crate::m3_drm::Registered::start(pdev, &crate::m3_soc::T6030)?;
                 return Ok(Self { runtime: AsahiRuntime::M3(runtime) });
             }
             ProbeConfig::Agx3Diagnostic(soc) => return Err(refuse_agx3_probe(pdev, soc)),

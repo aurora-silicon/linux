@@ -41,6 +41,7 @@ pub(crate) fn reserved_resource(node: &of::Node, name: &CStr) -> Result<Resource
 
 pub(crate) fn from_device(
     pdev: &kernel::platform::Device<kernel::device::Core>,
+    soc: &crate::m3_soc::Soc,
 ) -> kernel::error::Result<Resources> {
-    crate::m3_board::admit(pdev)
+    crate::m3_board::admit(pdev, soc)
 }

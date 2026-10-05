@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! T6030 (M3 Pro, G15S) board facts for the M3 runtime, read from the hardware and the device
-//! tree instead of being fixed to one board.
+//! Board facts for the M3 runtime, read from the hardware and the device tree instead of being
+//! fixed to one board. The per-SoC facts are in [`crate::m3_soc`].
 
 use kernel::{bindings, c_str, device, device::Core, io::resource::Resource, of, platform, prelude::*, uapi};
 
@@ -10,16 +10,7 @@ use crate::m3_resources::{
     Region,
     Resources, //
 };
-
-/// Core slots per MGPU cluster on T6030.
-const CORES_PER_CLUSTER: u32 = 10;
-/// MGPU clusters on T6030.
-const CLUSTERS: u32 = 2;
-
-/// Boards the M3 runtime is validated on: the M3 Pro MacBook Pros (14" J514S, 16" J516S).
-/// `asahi.m3_expose=auto` registers the render node and `asahi.m3_backend=auto` starts the
-/// runtime only on these.
-const VALIDATED_BOARDS: &[&[u8]] = &[b"apple,j514s", b"apple,j516s"];
+use crate::m3_soc::Soc;
 
 /// Whether the root node's compatible list contains `compatible`.
 fn board_is(compatible: &[u8]) -> bool {
@@ -32,23 +23,25 @@ fn board_is(compatible: &[u8]) -> bool {
     board.split(|b| *b == 0).any(|s| s == compatible)
 }
 
-/// Whether this is a board the M3 runtime is validated on.
-pub(crate) fn runtime_validated_board() -> bool {
-    VALIDATED_BOARDS.iter().any(|board| board_is(board))
+/// Whether this is a board the M3 runtime is validated on (`soc.validated_boards`).
+/// `asahi.m3_expose=auto` registers the render node and `asahi.m3_backend=auto` starts the
+/// runtime only on these.
+pub(crate) fn runtime_validated_board(soc: &Soc) -> bool {
+    soc.validated_boards.iter().any(|board| board_is(board))
 }
 
-/// Whether the fused core-enable mask (SGX+0xe01500) describes a usable T6030 GPU: at least one
-/// core, and no core outside the 2 x 10 core slots. The mask varies with the SKU (0x6f5fc on a
-/// 14-core part, 0x7fdff on an 18-core part); absent cores must never be enabled.
-pub(crate) fn core_mask_valid(mask: u32) -> bool {
-    mask != 0 && mask >> (CORES_PER_CLUSTER * CLUSTERS) == 0
+/// Whether the fused core-enable mask (SGX+0xe01500) describes a usable GPU of `soc`: at least
+/// one core, and no core outside its core slots (2 x 10 on T6030). The mask varies with the SKU
+/// (0x6f5fc on a 14-core T6030, 0x7fdff on an 18-core one); absent cores must never be enabled.
+pub(crate) fn core_mask_valid(soc: &Soc, mask: u32) -> bool {
+    mask != 0 && mask >> (soc.cores_per_cluster * soc.clusters) == 0
 }
 
-/// Per-cluster UAPI core masks for a T6030 core-enable mask.
-pub(crate) fn core_masks(mask: u32) -> [u32; uapi::DRM_ASAHI_MAX_CLUSTERS as usize] {
+/// Per-cluster UAPI core masks for a core-enable mask of `soc`.
+pub(crate) fn core_masks(soc: &Soc, mask: u32) -> [u32; uapi::DRM_ASAHI_MAX_CLUSTERS as usize] {
     let mut masks = [0; uapi::DRM_ASAHI_MAX_CLUSTERS as usize];
-    for (cluster, slot) in masks.iter_mut().enumerate().take(CLUSTERS as usize) {
-        *slot = (mask >> (cluster as u32 * CORES_PER_CLUSTER)) & ((1 << CORES_PER_CLUSTER) - 1);
+    for (cluster, slot) in masks.iter_mut().enumerate().take(soc.clusters as usize) {
+        *slot = (mask >> (cluster as u32 * soc.cores_per_cluster)) & ((1 << soc.cores_per_cluster) - 1);
     }
     masks
 }
@@ -67,7 +60,7 @@ pub(crate) fn max_frequency_khz(pdev: &platform::Device<Core>) -> Option<u32> {
     u32::try_from(max_hz / 1000).ok().filter(|khz| *khz != 0)
 }
 
-/// Register windows the runtime maps: name, base, minimum size.
+/// Register windows the runtime maps: name, base, minimum size. The same on T6030 and T8122.
 const REG_WINDOWS: [(&CStr, u64, u64); 2] = [
     (c_str!("asc"), 0x2_9240_0000, 0x4000),
     (c_str!("sgx"), 0x2_9000_0000, 0x100_0000),
@@ -173,19 +166,13 @@ pub(crate) fn static_region(node: &of::Node, name: &CStr) -> Option<Result<(Reso
     Some(Ok((unsafe { core::mem::transmute::<bindings::resource, Resource>(raw) }, nomap)))
 }
 
-/// Accepted compatible lists of the GPU coprocessor mailbox.
-const MBOX_COMPATIBLES: [&[u8]; 2] = [
-    b"apple,t6030-asc-mailbox\0apple,asc-mailbox-v4\0",
-    b"apple,t6030-agx-asc-mailbox\0",
-];
-
-/// Admit a T6030 GPU described by the device tree, either statically or by a runtime overlay.
+/// Admit a GPU of `soc` described by the device tree, either statically or by a runtime overlay.
 ///
-/// The device must be a T6030 GPU node with the ASC and SGX windows at their T6030 addresses
+/// The device must be a GPU node of `soc` with the ASC and SGX windows at their addresses
 /// (at least as large as the runtime maps), the GPU coprocessor mailbox, the six handoff regions
 /// by name (from the reserved-memory registry or no-map overlay nodes), and the firmware segment
 /// description. Every refusal is logged.
-pub(crate) fn admit(pdev: &platform::Device<Core>) -> Result<Resources> {
+pub(crate) fn admit(pdev: &platform::Device<Core>, soc: &Soc) -> Result<Resources> {
     let dev = pdev.as_ref();
     let refuse = |what: &str, err: Error| {
         dev_info!(dev, "M3: not admitted: {}\n", what);
@@ -193,12 +180,14 @@ pub(crate) fn admit(pdev: &platform::Device<Core>) -> Result<Resources> {
     };
     let node = dev.of_node().ok_or(ENODEV)?;
 
-    if !board_is(b"apple,t6030") {
-        return Err(refuse("not a T6030 board", ENODEV));
+    if !board_is(soc.board.as_bytes()) {
+        dev_info!(dev, "M3: not admitted: not a {} board\n", soc.name);
+        return Err(ENODEV);
     }
     let compatible: KVec<u8> = node.get_property(c_str!("compatible"))?;
-    if !compatible.split(|b| *b == 0).any(|s| s == b"apple,agx-t6030") {
-        return Err(refuse("GPU node is not apple,agx-t6030", ENODEV));
+    if !compatible.split(|b| *b == 0).any(|s| s == soc.gpu.as_bytes()) {
+        dev_info!(dev, "M3: not admitted: GPU node is not {}\n", soc.gpu);
+        return Err(ENODEV);
     }
     // The runtime runs the firmware that the bootloader loaded, in place: without the
     // bootloader's description of its segments there is nothing to admit.
@@ -258,11 +247,11 @@ pub(crate) fn admit(pdev: &platform::Device<Core>) -> Result<Resources> {
     let irq_names: KVec<u8> = mbox.get_property(c_str!("interrupt-names"))?;
     let irqs: KVec<u32> = mbox.get_property(c_str!("interrupts"))?;
     let cells: u32 = mbox.get_property(c_str!("#mbox-cells"))?;
-    if !MBOX_COMPATIBLES.contains(&compat.as_slice())
+    if !soc.mailbox_compatibles.iter().any(|c| *c == compat.as_slice())
         || mbox_reg.as_slice() != [2, 0x92408000, 0, 0x4000]
         || cells != 0
         || irq_names.as_slice() != b"send-empty\0send-not-empty\0recv-empty\0recv-not-empty\0"
-        || irqs.as_slice() != [0, 832, 4, 0, 833, 4, 0, 834, 4, 0, 835, 4]
+        || irqs.as_slice() != soc.mailbox_interrupts
     {
         return Err(refuse("unexpected GPU mailbox description", EINVAL));
     }
@@ -317,7 +306,7 @@ pub(crate) struct KnownImage {
     pub(crate) initdata_magic: u64,
 }
 
-/// GPU firmware images known to the M3 runtime. An image is accepted when every recorded
+/// T6030 GPU firmware images known to the M3 runtime. An image is accepted when every recorded
 /// identity (UUID, hash) matches.
 pub(crate) static KNOWN_IMAGES: [KnownImage; 2] = [
     KnownImage {
@@ -391,6 +380,7 @@ pub(crate) fn identify(
     dev: &device::Device,
     text: &[u8],
     stkg_sha256: &[u8; 32],
+    images: &'static [KnownImage],
 ) -> Option<&'static KnownImage> {
     let info = image_info(text);
     let masked_sha256 = info.as_ref().and_then(|info| {
@@ -414,7 +404,7 @@ pub(crate) fn identify(
         as_str(&stkg_hex),
         if masked_sha256.is_some() { as_str(&masked_hex) } else { "n/a" }
     );
-    let image = KNOWN_IMAGES.iter().find(|image| {
+    let image = images.iter().find(|image| {
         (image.uuid.is_some() || image.stkg_sha256.is_some())
             && image.uuid.map_or(true, |known| uuid == Some(known))
             && image.stkg_sha256.map_or(true, |known| known == *stkg_sha256)
@@ -452,11 +442,11 @@ pub(crate) fn region_is_nomap(node: &of::Node, name: &CStr) -> bool {
 ///
 /// Userspace drivers pick up any registered render node. Until the M3 runtime is validated on a
 /// board, a render node there would let a stock userspace driver submit work the board may not
-/// run correctly. `auto` (-1) registers it only on the board the runtime was validated on.
-pub(crate) fn expose_render_node() -> bool {
+/// run correctly. `auto` (-1) registers it only on the boards the runtime was validated on.
+pub(crate) fn expose_render_node(soc: &Soc) -> bool {
     match *crate::module_parameters::m3_expose.value() {
         0 => false,
         v if v > 0 => true,
-        _ => runtime_validated_board(),
+        _ => runtime_validated_board(soc),
     }
 }

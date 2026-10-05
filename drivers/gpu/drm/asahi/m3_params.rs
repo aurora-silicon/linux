@@ -445,7 +445,7 @@ pub(crate) fn t6030_backend(pdev: &platform::Device<Core>) -> T6030Backend {
             dev_info!(dev, "M3: asahi.m3_backend=off: no GPU backend started\n");
             T6030Backend::Off
         }
-        _ if crate::m3_board::runtime_validated_board() => T6030Backend::Runtime,
+        _ if crate::m3_board::runtime_validated_board(&crate::m3_soc::T6030) => T6030Backend::Runtime,
         _ => {
             dev_info!(
                 dev,
