@@ -4,11 +4,13 @@ An Air stays kernel-only unless its owner asks for m1n1's GPU handoff with
 --m3-handoff, and then only when the release carries M3_AIR_M1N1_PACKAGE.
 The handoff writes chosen.asahi,t8122-gpu=1 (and chosen.asahi,t8122-dcp=1
 only with M3_AIR_DCP=1) to /etc/m1n1.conf. Every case sets
-M3_AIR_M1N1_PACKAGE itself, so the tests don't depend on what the installer
-ships with.
+M3_AIR_M1N1_PACKAGE and M3_AIR_DRY_RUN itself, so the tests don't depend on
+what the installer ships with. M3AirDryRunTest covers the dry run, which
+writes M3_AIR_DRY_RUN_SWITCHES instead.
 """
 from pathlib import Path
 import re
+import shutil
 import unittest
 
 import test_m3_flow as flow
@@ -33,9 +35,11 @@ class M3AirTest(flow.M3FlowBase):
                                      "asahi,t8122-gpu", "asahi,t8122-dcp"])
         self.air_pkg = f"{AURORA8} {self.shas[AURORA8]}"
 
+    dry_run = 0
+
     def sh(self, body, pkg=None, dcp=0, boards=None, check=True):
         pkg = self.air_pkg if pkg is None else pkg
-        pre = f'M3_AIR_M1N1_PACKAGE="{pkg}"\nM3_AIR_DCP={dcp}\n'
+        pre = f'M3_AIR_M1N1_PACKAGE="{pkg}"\nM3_AIR_DCP={dcp}\nM3_AIR_DRY_RUN={self.dry_run}\n'
         if boards is not None:
             pre += f'M3_HANDOFF_BOARDS="{boards}"\n'
         return self.run_sh(pre + body, check=check)
@@ -312,6 +316,133 @@ class M3AirTest(flow.M3FlowBase):
         self.assertNotIn(b"chosen.", boot)
         self.assertFalse(self.m1n1_conf.exists())
 
+
+
+DRY_RUN = shell_value("M3_AIR_DRY_RUN_SWITCHES").split()
+DRY_RUN_LINES = b"".join(l.encode() + b"\n" for l in DRY_RUN)
+
+
+class M3AirDryRunTest(M3AirTest):
+    """The dry run this build ships: read and report, switch nothing on."""
+    dry_run = 1
+
+    def setUp(self):
+        super().setUp()
+        # aurora8 knows every dry-run switch, the handoff's too.
+        shutil.rmtree(self.tmp / ("root-" + AURORA8))
+        names = [l[len("chosen."):].split("=")[0] for l in DRY_RUN]
+        self.fixture(AURORA8, None, ["asahi,t6030-gpu", "asahi,t6030-dcp", "asahi,t6030-dcpext",
+                                     "asahi,t8122-gpu"] + names)
+        self.air_pkg = f"{AURORA8} {self.shas[AURORA8]}"
+
+    # The inherited handoff tests run with M3_AIR_DRY_RUN=0 in M3AirTest; the
+    # ones that only make sense for the handoff's switches are skipped here.
+    def test_switches(self):
+        self.mac("j613")
+        for dcp in (0, 1):
+            self.assertEqual(self.sh("m3_switches", dcp=dcp).stdout.split(), DRY_RUN)
+        self.mac("j516s")
+        self.assertEqual(self.sh("m3_switches").stdout.strip(), shell_value("M3_SWITCHES"))
+
+    def test_shipped_settings(self):
+        # A release decision: change this test with it.
+        self.assertEqual(re.search(r"^M3_AIR_DRY_RUN=(\S+)$", SRC, re.M).group(1), "1")
+        self.assertEqual(DRY_RUN, ["chosen.asahi,t8122-gpu-diag=1",
+                                   "chosen.asahi,t8122-gpu-handoff-diag=1",
+                                   "chosen.asahi,t8122-gpu-power-diag=1",
+                                   "chosen.asahi,t8122-dcp=1"])
+        # The dry run never asks for the GPU setup itself.
+        self.assertNotIn("chosen.asahi,t8122-gpu=1", DRY_RUN)
+        self.assertTrue(re.search(r'^M3_AIR_M1N1_PACKAGE="m1n1-aurora-\S+ [0-9a-f]{64}"$', SRC, re.M))
+
+    def test_conf_block(self):
+        self.mac("j613")
+        self.sh("m3_switches_write\nm3_switches_write")
+        chosen = [l for l in self.m1n1_conf.read_text().splitlines() if l.startswith("chosen.")]
+        self.assertEqual(chosen, DRY_RUN)
+        self.sh("m3_switches_remove")
+        # Nothing else was in it, so the file goes.
+        self.assertFalse(self.m1n1_conf.exists())
+
+    def test_conf_block_replaces_an_m3_pro_block(self):
+        self.mac("j516s")
+        self.sh("m3_switches_write")
+        self.mac("j613")
+        self.sh("m3_switches_write")
+        chosen = [l for l in self.m1n1_conf.read_text().splitlines() if l.startswith("chosen.")]
+        self.assertEqual(chosen, DRY_RUN)
+
+    def test_package_check(self):
+        pkgs = self.tmp / "pkgs"
+        self.mac("j613")
+        self.assertEqual(self.sh(f"m1n1_pkg_has_handoff '{pkgs / AURORA8}' && echo yes").stdout.strip(), "yes")
+        # An m1n1 with the GPU handoff switch alone can't run the dry run.
+        self.fixture("m1n1-gpu-only.pkg.tar.zst", None, ["asahi,t8122-gpu"])
+        only = pkgs / "m1n1-gpu-only.pkg.tar.zst"
+        self.assertEqual(self.sh(f"m1n1_pkg_has_handoff '{only}' && echo yes || echo no").stdout.strip(), "no")
+
+    def test_verify_bootbin(self):
+        self.mac("j613")
+        self.boot.write_bytes(b"M1N1:original\nDTBS:x\nUBOOT" + DRY_RUN_LINES)
+        (self.fake / "m1n1.bin").write_text("M1N1:original\n")
+        self.assertIn("M3 Air handoff switches", self.sh("m3_verify_bootbin").stdout)
+        self.boot.write_bytes(b"M1N1:original\nDTBS:x\nUBOOT" + AIR_GPU)
+        proc = self.sh("m3_verify_bootbin", check=False)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_plan_messages(self):
+        self.mac("j613")
+        self.assertIn("case D", self.sh("m3_plan").stdout)
+        err = self.sh("M3_TRY=1\nm3_plan").stderr
+        self.assertIn("GPU and display dry run", err)
+        self.assertIn("switches\n    nothing on", err)
+
+    def test_handoff_and_back(self):
+        self.mac("j613")
+        proc = self.air_install(try_=1)
+        self.assertIn("only\n    reads and reports", proc.stdout)
+        self.assertIn("serial recorder", proc.stdout)
+        self.assertIn("M3 Air handoff switches", proc.stdout)
+        boot = self.boot.read_bytes()
+        self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora8-1\n"), boot)
+        self.assertTrue(boot.endswith(b"UBOOT" + DRY_RUN_LINES), boot)
+        self.assertNotIn(b"t8122-gpu=1", boot)
+        self.assertNotIn(b"t6030", boot)
+        self.assertEqual(self.kept_copy().read_bytes(), b"M1N1:original\n")
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff")
+        self.sh("uninstall_all")
+        boot = self.boot.read_bytes()
+        self.assertTrue(boot.startswith(b"M1N1:m1n1-stock\n"), boot)
+        self.assertNotIn(b"chosen.", boot)
+        self.assertFalse(self.m1n1_conf.exists())
+
+    def test_rerun_keeps_the_handoff(self):
+        self.mac("j615")
+        self.air_install(try_=1)
+        self.assertIn("keeping it", self.air_install().stdout)
+        self.assertTrue(self.boot.read_bytes().endswith(DRY_RUN_LINES))
+
+    def test_display_switch(self):
+        self.skipTest("the dry run always includes the display part")
+
+    def test_refused_with_an_m1n1_that_lacks_the_switch(self):
+        self.mac("j613")
+        before = self.boot.read_bytes()
+        proc = self.air_install(try_=1, pkg=f"{flow.AURORA6} {self.shas[flow.AURORA6]}", check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("no M3 Air GPU and display dry run", proc.stderr)
+        self.assertEqual(self.boot.read_bytes(), before)
+        self.assertNotIn("pacman -U", self.log())
+
+    def test_plan_try_refused(self):
+        for board, stub, pkg, why in [("j613", "14.8.3", "", "no m1n1 with the M3 MacBook Air GPU"),
+                                      ("j613", "15.6", None, "stub is 15.6")]:
+            with self.subTest(board=board, stub=stub, pkg=pkg):
+                self.mac(board, stub=stub)
+                proc = self.sh("M3_TRY=1\nm3_plan", pkg=pkg, check=False)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn(why, proc.stderr)
+                self.assertIn("Nothing was installed", proc.stderr)
 
 if __name__ == "__main__":
     unittest.main()
