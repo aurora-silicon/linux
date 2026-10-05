@@ -20,6 +20,9 @@ struct phy;
  * crossbar output of DP IN adapter @dpin (0/1) of the router wired to
  * @connector_np. @set_active(@ctx, active) runs the DP IN adapter's
  * DPTX_INACTIVE handshake and is called back from DCP's link activation.
+ * Activation returns -EBUSY while no pipeline is free for the stream (or a
+ * direct DP-alt route still holds the port), which may change and is worth
+ * asking again, and -EADDRINUSE if another tunnel stream holds the port.
  */
 int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
 			   bool active, int (*set_active)(void *ctx, bool active),

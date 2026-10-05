@@ -1437,7 +1437,7 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
 			return 0;
 		dev_warn((*slot)->dcp->dev,
 			 "port already routed, not taking DP tunnel dpin%u\n", dpin);
-		return -EBUSY;
+		return -EADDRINUSE;
 	}
 	if (port->owner && !port->owner->tunnel)
 		return -EBUSY;

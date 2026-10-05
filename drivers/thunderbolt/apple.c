@@ -205,13 +205,14 @@ struct apple_cio {
 		struct apple_cio *acio;
 		struct work_struct work;
 		struct delayed_work retry;	/* re-queues work while waiting */
-		struct mutex lock;	/* protects regs, alive and waiting */
+		struct mutex lock;	/* protects regs, alive, waiting, paused */
 		void __iomem *regs;	/* mapped while a DP tunnel uses this adapter */
 		unsigned int idx;
 		bool alive;		/* tunnel up; cleared before it is torn down */
 		bool handed;		/* appledrm has our callback; work only */
 		bool rearm;		/* a fresh tunnel needs a fresh DCP route */
 		bool waiting;		/* no display pipeline was free for it */
+		bool paused;		/* system sleep: no retries */
 	} dpin[2];
 };
 
@@ -508,9 +509,19 @@ static void apple_dpin_retry_fn(struct work_struct *work)
 	bool again;
 
 	scoped_guard(mutex, &c->lock)
-		again = c->alive && c->waiting;
+		again = c->alive && c->waiting && !c->paused;
 	if (again)
 		queue_work(c->acio->dp_wq, &c->work);
+}
+
+/*
+ * Only where both the display allocator and the connection manager can hold
+ * a tunnel for a pipeline (M1-family hosts, see
+ * apple_nhi_dp_tunnel_awaits_display()) does a refused tunnel wait for one.
+ */
+static bool apple_dpin_can_wait(void)
+{
+	return apple_cio_dp_is_t8103_style();
 }
 
 static void apple_dpin_work_fn(struct work_struct *work)
@@ -548,24 +559,28 @@ static void apple_dpin_work_fn(struct work_struct *work)
 
 		ret = apple_dpin_up(c);
 		if (ret) {
-			bool first = false;
+			bool wait = ret == -EBUSY && apple_dpin_can_wait();
+			bool first = false, paused = false;
 
 			scoped_guard(mutex, &c->lock) {
 				want = c->alive;
-				if (want && ret == -EBUSY) {
+				if (want && wait) {
 					first = !c->waiting;
 					c->waiting = true;
+					paused = c->paused;
 				}
 			}
 			if (!want)
 				continue;	/* unplugged meanwhile: clean up */
-			if (ret == -EBUSY) {
+			if (wait) {
 				if (first)
 					dev_info(c->acio->dev,
 						 "dpin%u: no display pipeline free; waiting for one\n",
 						 c->idx);
-				mod_delayed_work(c->acio->dp_wq, &c->retry,
-						 msecs_to_jiffies(APPLE_DPIN_RETRY_MS));
+				/* after system sleep, apple_nhi_complete() asks again */
+				if (!paused)
+					mod_delayed_work(c->acio->dp_wq, &c->retry,
+							 msecs_to_jiffies(APPLE_DPIN_RETRY_MS));
 				return;
 			}
 			dev_warn(c->acio->dev, "dpin%u: DP tunnel setup failed: %d\n",
@@ -1748,7 +1763,9 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	anhi->ops = apple_nhi_ops;
 	if (dp_display && acio->dp_wq && apple_cio_dp_tunnel_changed_supported()) {
 		anhi->ops.dp_tunnel_changed = apple_nhi_dp_tunnel_changed;
-		anhi->ops.dp_tunnel_awaits_display = apple_nhi_dp_tunnel_awaits_display;
+		if (apple_dpin_can_wait())
+			anhi->ops.dp_tunnel_awaits_display =
+				apple_nhi_dp_tunnel_awaits_display;
 	}
 	if (acio->dp_wq && apple_dp_tunnel_t602x()) {
 		anhi->ops.dp_tunnel_pre_activate = apple_nhi_dp_tunnel_pre_activate;
@@ -1878,10 +1895,47 @@ static void apple_nhi_remove(struct platform_device *pdev)
  * apple_nhi pointer in driver data. The generic NHI PM callbacks cannot be
  * installed here because they expect driver data to contain struct tb.
  */
+/*
+ * A tunnel waiting for a display pipeline asks appledrm again every few
+ * seconds.  Not while devices suspend and resume: stop asking before any of
+ * them suspends, let an attempt in flight finish, and ask again once all of
+ * them have resumed.  The tunnel itself keeps waiting meanwhile.
+ */
+static void apple_dpin_pause_retries(struct apple_cio *acio)
+{
+	if (!acio->dp_wq)
+		return;
+	for (unsigned int i = 0; i < ARRAY_SIZE(acio->dpin); i++) {
+		struct apple_dpin_ctx *c = &acio->dpin[i];
+
+		scoped_guard(mutex, &c->lock)
+			c->paused = true;
+		cancel_delayed_work_sync(&c->retry);
+		flush_work(&c->work);
+	}
+}
+
+static void apple_dpin_resume_retries(struct apple_cio *acio)
+{
+	if (!acio->dp_wq)
+		return;
+	for (unsigned int i = 0; i < ARRAY_SIZE(acio->dpin); i++) {
+		struct apple_dpin_ctx *c = &acio->dpin[i];
+
+		guard(mutex)(&c->lock);
+		c->paused = false;
+		if (c->alive && c->waiting)
+			mod_delayed_work(acio->dp_wq, &c->retry,
+					 msecs_to_jiffies(APPLE_DPIN_RETRY_MS));
+	}
+}
+
 static int apple_nhi_prepare(struct device *dev)
 {
 	struct apple_nhi *anhi = dev_get_drvdata(dev);
 	struct apple_cio *acio = anhi->acio;
+
+	apple_dpin_pause_retries(acio);
 
 	guard(mutex)(&acio->pcie_tunnel_lock);
 	/* Keep an unresolved expectation across another sleep before revalidation. */
@@ -1961,6 +2015,7 @@ static void apple_nhi_complete(struct device *dev)
 	struct apple_cio *acio = anhi->acio;
 
 	tb_domain_complete(anhi->tb);
+	apple_dpin_resume_retries(acio);
 
 	guard(mutex)(&acio->pcie_tunnel_lock);
 	acio->pcie_pm_prepared = false;

@@ -1193,19 +1193,21 @@ static void tb_dp_dprx_work(struct work_struct *work)
 				   msecs_to_jiffies(TB_DPRX_POLL_DELAY));
 		return;
 	}
+	if (!tunnel->dprx_canceled && tb_dp_host_awaits_display(tunnel)) {
+		/*
+		 * Nothing drives the tunnel yet, so DPRX cannot be done: leave
+		 * the adapter alone and let the timeout run from when the host
+		 * takes it.
+		 */
+		tunnel->dprx_timeout = dprx_timeout_to_ktime(dprx_timeout);
+		queue_delayed_work(tb->wq, &tunnel->dprx_work,
+				   msecs_to_jiffies(TB_DPRX_AWAIT_POLL_DELAY));
+		mutex_unlock(&tb->lock);
+		return;
+	}
 	if (!tunnel->dprx_canceled) {
-		bool awaits = tb_dp_host_awaits_display(tunnel);
-
 		if (tb_dp_is_usb4(tunnel->src_port->sw) &&
-		    tb_dp_wait_dprx(tunnel, awaits ? 0 : TB_DPRX_WAIT_TIMEOUT)) {
-			if (awaits) {
-				/* the timeout runs from when the host takes it */
-				tunnel->dprx_timeout = dprx_timeout_to_ktime(dprx_timeout);
-				queue_delayed_work(tb->wq, &tunnel->dprx_work,
-						   msecs_to_jiffies(TB_DPRX_AWAIT_POLL_DELAY));
-				mutex_unlock(&tb->lock);
-				return;
-			}
+		    tb_dp_wait_dprx(tunnel, TB_DPRX_WAIT_TIMEOUT)) {
 			if (ktime_before(ktime_get(), tunnel->dprx_timeout)) {
 				queue_delayed_work(tb->wq, &tunnel->dprx_work,
 						   msecs_to_jiffies(TB_DPRX_POLL_DELAY));
