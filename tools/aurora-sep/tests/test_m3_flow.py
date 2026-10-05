@@ -221,7 +221,9 @@ boot_chain() {{ echo limine; }}
 
     def test_fresh_m3_pro_gets_the_handoff(self):
         self.mac("j516s")
-        self.install()
+        out = self.install().stdout
+        self.assertIn("built-in display at its native resolution", out)
+        self.assertNotIn("run:  aurora-touchid-setup", out)
         boot = self.boot.read_bytes()
         self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora6-1\n"), boot)
         self.assertTrue(boot.endswith(SWITCHES), boot)
@@ -280,6 +282,8 @@ boot_chain() {{ echo limine; }}
         self.mac(board, **kw)
         before = self.boot.read_bytes()
         out = self.install().stdout
+        self.assertIn("Touch ID is not supported", out)
+        self.assertNotIn("run:  aurora-touchid-setup", out)
         self.assertEqual(self.boot.read_bytes(), before)
         self.assertIn("boot.bin is unchanged", out)
         self.assertFalse([d for d in self.downloaded() if d.startswith("m1n1-aurora-")])
@@ -395,7 +399,8 @@ boot_chain() {{ echo limine; }}
 
     def test_m1_pro_unchanged(self):
         self.mac("j314s")
-        self.install()
+        out = self.install().stdout
+        self.assertIn("run:  aurora-touchid-setup", out)
         boot = self.boot.read_bytes()
         self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora3-1\n"), boot)
         self.assertNotIn(b"chosen.", boot)

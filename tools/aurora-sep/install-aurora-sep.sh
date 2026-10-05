@@ -1164,7 +1164,15 @@ install_all() {
   if is_neo; then neo_radio_notice; fi
   pacman -Q linux-aurora libfprint aurora-touchid
   echo
-  if [[ -f $MODPROBE_CONF ]]; then
+  if [[ $M3_MODE == handoff ]]; then
+    say "Done. Reboot with someone watching: expect the Omarchy logo, the boot menu, then the
+    desktop on the built-in display at its native resolution. Touch ID is not supported
+    on M3 yet."
+  elif [[ $M3_MODE == kernel ]]; then
+    say "Done. Reboot: expect the desktop on the boot framebuffer. Touch ID is not supported
+    on M3 yet. How to help bring this M3 further: step 11 of the test plan that the
+    --agent-prompt command below prints."
+  elif [[ -f $MODPROBE_CONF ]]; then
     say "Done, read-only. Reboot; the SEP driver will attach and report without writing."
     echo "   Enrolling a finger needs writes: delete $MODPROBE_CONF, reboot, then run aurora-touchid-setup."
   else
@@ -1386,6 +1394,11 @@ SAFETY, NON-NEGOTIABLE
   - Do not paste key material, serial numbers, or the contents of
     mesa_calibration.bin into a report.
 
+ON AN M3 (M3, M3 Pro, M3 Max): Touch ID is not supported there yet. Do steps
+0 and 1, then go to step 11, which says what should happen on your model and
+how to get it added. Steps 6, 7 and 9 apply as well, and step 8 without the
+fingerprint.
+
 0. CONFIRM YOU HAVE THE CURRENT BUILD
    Results against a superseded build waste everyone's time, and a saved copy
    of this script installs its own packages forever. This script checks on
@@ -1603,57 +1616,80 @@ SAFETY, NON-NEGOTIABLE
 
    Report "not tested" honestly rather than guessing, for any of the above.
 
-11. M3 (M3, M3 PRO, M3 MAX) ONLY
-   Every M3 is experimental. The installer took one of two paths and said
-   which near the start; the file below records it too:
-     cat /var/lib/aurora-sep/m3-mode
-   - kernel: the kernel only. m1n1's boot.bin was left exactly as it was,
-     and the install ended with "M3: m1n1's boot.bin is unchanged". Expect
-     the desktop on the boot framebuffer (one fixed resolution, software
-     rendering).
-   - handoff: an M3 Pro model whose m1n1 display and GPU handoff has been
-     booted before. The installer replaced boot.bin, kept the old one as
-     m1n1/boot.bin.before-<version> on the EFI partition, and printed the
-     macOS steps to put it back. Expect the built-in display at its native
-     resolution and the GPU in use.
-   Check and quote:
-     tr -d '\0' < /proc/device-tree/compatible; echo
-     ls /sys/class/drm/
-     sudo dmesg | grep -iE 'asahi.*(gpu|firmware)|apple-dcp|t6030' | head -20
-     ls /proc/device-tree/soc/usb4-pcie-tunnel-0/pcie@730000000/pci@0,0/apple,tunable 2>&1
-   Then: does it reach the desktop, and do Wi-Fi, Bluetooth, keyboard,
-   trackpad, audio and one suspend/resume work? With a Thunderbolt dock, do
-   its display and its PCIe devices (Ethernet, storage) come up? Report each
-   one, including "not tested".
+11. M3 MACS (M3, M3 PRO, M3 MAX): WHAT SHOULD HAPPEN, AND HOW YOURS GETS ADDED
+   Every M3 is experimental, and every M3 report moves M3 support forward.
+   Touch ID is not supported on M3 yet: skip steps 2 to 5 and the fingerprint
+   part of step 8, and expect
+   "apple_sep: no platform profile for this SoC; the SEP stays disabled".
+   First find the model and chip, then follow the matching case below:
+     tr '\0' '\n' < /proc/device-tree/compatible | head -2
+     cat /var/lib/aurora-sep/m3-mode     # after an install: kernel or handoff
 
-   ADDING AN M3 PRO MODEL TO THE HANDOFF
-   Only an M3 Pro (apple,t6030: J514S 14", J516S 16") can try the handoff;
-   m1n1 has none for the M3 or M3 Max yet, and the installer refuses there.
-   The installer also refuses unless the Mac has the macOS 14.8.3
-   system-firmware stub that the Omarchy installer gives every M3.
-   This REPLACES THE MAC'S BOOT LOADER. If the new one does not start, the
-   Mac stops before any boot menu, and the only way back is from macOS on
-   the same Mac. So:
-     - Do it only with the owner's explicit agreement, and only if the owner
-       can start macOS on this Mac (hold the power button at startup).
-     - Keep the restore steps the installer prints: they name this Mac's EFI
-       partition and the saved boot.bin.before-<version>.
-     - Do not try it unattended or over SSH alone: someone must be at the Mac
-       for the first boot.
-   Then, with the owner watching:
-     curl -fsSL https://github.com/iconidentify/aurora-linux/releases/latest/download/install-aurora-sep.sh | bash -s -- --m3-handoff
-   and reboot. Report one of:
-     - It boots to the desktop on the built-in display at native resolution:
-       give the checks above, and again after one suspend/resume. That
-       report is what adds the model to the installer's list.
-     - It stops in m1n1 (text on screen, no boot menu) or stays black: the
-       owner puts the old boot.bin back from macOS with the printed steps.
-       Report exactly what the screen showed and when.
-     - It boots, but the display or GPU is wrong: collect
-         sudo journalctl -b -k | grep -iE 'dcp|asahi|t6030|m1n1'
-       over SSH if you can, then run the installer with --uninstall, which
-       puts the stock m1n1 back, and reboot.
-   Title such a report "<board> (<model>): M3 handoff works" or "... fails".
+   A. apple,j516s + apple,t6030 (MacBook Pro 16" M3 Pro): SUPPORTED, handoff on.
+      The plain one-liner installs the kernel and replaces m1n1 with one
+      that hands the built-in display and the GPU over to Linux. While it
+      runs it prints:
+        M3 Pro (j516s, macOS 14.8.3 stub): installing m1n1 with the display and GPU handoff
+      then the macOS steps to put the old boot loader back (it is kept as
+      m1n1/boot.bin.before-<version> on the EFI partition), and at the end:
+        m1n1's boot.bin is this release's m1n1 with the M3 Pro handoff switches
+      Reboot with the owner watching. Expected within about a minute: the
+      Omarchy logo, the boot menu, then the desktop on the built-in display
+      at 3456x2234, GPU accelerated. Then run the checks below and report.
+
+   B. any other apple,t6030 model (MacBook Pro 14" M3 Pro, J514S): NOT ON
+      THE LIST YET. A REPORT FROM YOU IS HOW IT GETS ADDED.
+      The plain one-liner installs the kernel only (boot.bin untouched, boot
+      framebuffer) and says so:
+        M3 Pro (j514s): installing the kernel only, and boot.bin stays as it is.
+      Run the checks below on that first; it is a useful report on its own.
+      Then, to try the display and GPU handoff on this model:
+        - Only with the owner's explicit agreement, with the owner at the
+          Mac for the first boot, and only if the owner can start macOS on
+          this Mac (hold the power button at startup). If the new boot
+          loader does not start, macOS on the same Mac is the only way back.
+        - The installer itself refuses unless the Mac has the macOS 14.8.3
+          system-firmware stub that the Omarchy installer gives every M3.
+        - Run:
+            curl -fsSL https://github.com/iconidentify/aurora-linux/releases/latest/download/install-aurora-sep.sh | bash -s -- --m3-handoff
+          Keep the restore steps it prints (they name this Mac's EFI
+          partition). It must end with "m1n1's boot.bin is this release's
+          m1n1 with the M3 Pro handoff switches"; if it stops with an error
+          instead, nothing was changed: report the error.
+        - Reboot, with the owner watching. Then report exactly one of:
+          * WORKS: the desktop on the built-in display at native resolution.
+            Give the checks below, and again after one suspend/resume. Title
+            it "<board> (<model>): M3 handoff works". This report is what
+            adds the model to the list in the next release; until then a
+            plain re-run of the one-liner keeps the handoff on this Mac.
+          * STOPS: m1n1 text and no boot menu, or a black screen for more than
+            two minutes. The owner puts the old boot.bin back from macOS with
+            the printed steps. Report what the screen showed and when.
+          * WRONG: it boots, but the display or the GPU is wrong. Collect
+              sudo journalctl -b -k | grep -iE 'dcp|asahi|t6030|m1n1'
+            over SSH if you can, then run the installer with --uninstall
+            (it puts the stock m1n1 back) and reboot.
+
+   C. apple,t8122 (MacBook Air 13"/15" M3, MacBook Pro 14" M3, iMac M3) or
+      apple,t6031 / apple,t6034 (M3 Max): KERNEL ONLY for now.
+      m1n1 has no display and GPU handoff for these chips yet, and
+      --m3-handoff refuses here. The one-liner installs the kernel only and
+      leaves boot.bin as it is. Expected: the desktop on the boot framebuffer
+      (one fixed resolution, software rendering). Report what works and
+      what does not: Wi-Fi, Bluetooth, keyboard, trackpad, audio, USB and
+      Thunderbolt, suspend/resume, battery. These reports decide which chip
+      gets the handoff next.
+
+   Checks for every M3 (quote the output; on a kernel-only M3 the handoff
+   lines are expected to be missing, so say so):
+     tr -d '\0' < /proc/device-tree/chosen/asahi,m1n1-stage2-version; echo
+     ls /proc/device-tree/soc/dcp@*/apple,t6030-handoff 2>&1
+     for c in /sys/class/drm/card*-*; do [ -e "$c/status" ] && echo "$c $(cat "$c/status") $(head -1 "$c/modes")"; done
+     sudo dmesg | grep -E 't6030-display|\[drm\] Initialized|GPU firmware|aop.*crash|apple_sep' | head -12
+     nproc
+     ls /proc/device-tree/soc/usb4-pcie-tunnel-0/pcie@730000000/pci@0,0/apple,tunable 2>&1
+   In the report header, set **M3 path:** to kernel, handoff, or handoff
+   with --m3-handoff.
 
 HOW TO REPORT
   Open one issue per Mac at https://github.com/iconidentify/aurora-linux/issues
