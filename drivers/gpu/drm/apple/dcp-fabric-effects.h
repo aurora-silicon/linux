@@ -5,6 +5,13 @@
 #include "dcp-fabric-core.h"
 
 /* Effect executors shared by the driver and KUnit's fake hardware. */
+static inline void dcp_fabric_run_capacity(bool available, void (*notify)(void *ctx),
+					   void *ctx)
+{
+	if (available)
+		notify(ctx);
+}
+
 struct dcp_fabric_resume_ops {
 	void (*enable_irq)(void *ctx);
 	void (*sample)(void *ctx);

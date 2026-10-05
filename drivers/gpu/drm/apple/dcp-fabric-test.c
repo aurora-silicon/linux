@@ -1545,8 +1545,26 @@ static void fabric_binding_drain_test(struct kunit *test)
 	}
 }
 
+static void fabric_capacity_notification_test(struct kunit *test)
+{
+	struct fabric_fake f;
+	u64 generation;
+	bool available;
+
+	fabric_fake_init(&f, test, false);
+	generation = dcp_fabric_presence_edge(&f.presence, 1000, 10000);
+	for (unsigned int i = 0; i < 3; i++) {
+		available = dcp_fabric_presence_expire(&f.presence, generation,
+						       false, i ? 11000 : 10999);
+		dcp_fabric_run_capacity(available, fabric_fake_rebalance, &f);
+		KUNIT_EXPECT_EQ(test, f.count, i ? 1U : 0U);
+	}
+	KUNIT_EXPECT_EQ(test, f.trace[0], FX_REBALANCE);
+}
+
 static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE_PARAM(fabric_shared_wiring_test, fabric_wiring_gen_params),
+	KUNIT_CASE(fabric_capacity_notification_test),
 	KUNIT_CASE(fabric_binding_cookie_test),
 	KUNIT_CASE(fabric_reconnect_session_test),
 	KUNIT_CASE(fabric_binding_drain_test),

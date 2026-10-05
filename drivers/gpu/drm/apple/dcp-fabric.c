@@ -548,11 +548,15 @@ static bool dcp_hdmi_sample(struct apple_dcp *dcp, u64 generation, int level)
 	return accepted;
 }
 
+static void dcp_hdmi_capacity_available(void *ctx)
+{
+	dcp_typec_pipeline_freed();
+}
+
 static void dcp_hdmi_settle_work(struct work_struct *work)
 {
 	struct apple_dcp *dcp = container_of(to_delayed_work(work),
 					     struct apple_dcp, hdmi_settle_wq);
-	typeof(apple_tb_dp_capacity_available) *notify;
 	unsigned long flags;
 	u64 generation;
 	bool available;
@@ -574,17 +578,8 @@ static void dcp_hdmi_settle_work(struct work_struct *work)
 					       level > 0, jiffies);
 	spin_unlock_irqrestore(&dcp->hdmi_presence_lock, flags);
 	dcp_hdmi_schedule(dcp);
-	if (!available)
-		return;
-
-	/* One capacity event, fanned out to direct ports and eligible tunnels. */
-	dcp_typec_pipeline_freed();
-	notify = symbol_get(apple_tb_dp_capacity_available);
-	if (!notify)
-		return;
-	for (unsigned int i = 0; i < dcp->nr_typec_routes; i++)
-		notify(dcp->typec_routes[i].port->connector_np);
-	symbol_put(apple_tb_dp_capacity_available);
+	/* Notify direct ports once when HDMI capacity becomes available. */
+	dcp_fabric_run_capacity(available, dcp_hdmi_capacity_available, dcp);
 }
 
 static void dcp_hdmi_recheck_work(struct work_struct *work)
