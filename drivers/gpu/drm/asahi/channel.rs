@@ -663,9 +663,15 @@ impl StatsChannel::ver {
                                 // an idle desktop, while FwBusy timestamp
                                 // deltas (the prior producer) covered 0.17%
                                 // of that matmul. The timestamps are base-
-                                // clock ticks (24 MHz), so convert once
-                                // here; the u128 intermediate keeps
-                                // (ts - prev) * util * 1e9 far from overflow.
+                                // clock ticks (24 MHz), so convert to ns
+                                // once here. The kernel runtime has no
+                                // 128-bit division, so split whole seconds
+                                // from the tick remainder: whole seconds
+                                // contribute util * 1e7 ns each (1e9 / 100
+                                // exactly), the remainder contributes
+                                // rem * util * 1e9 / (100 * ts_hz), which
+                                // cannot overflow u64 (rem < ts_hz <= 24e6
+                                // on supported SoCs).
                                 let util = [*util1, *util2, *util3, *util4]
                                     .into_iter()
                                     .max()
@@ -673,11 +679,16 @@ impl StatsChannel::ver {
                                     .min(100) as u64;
                                 let ts = timestamp.0;
                                 if self.last_util_ts != 0 && ts > self.last_util_ts {
-                                    let busy = ((ts - self.last_util_ts) as u128
-                                        * util as u128
-                                        * 1_000_000_000)
-                                        / (100 * self.ts_hz as u128);
-                                    self.snap.busy_ns.fetch_add(busy as u64, Ordering::Relaxed);
+                                    let delta = ts - self.last_util_ts;
+                                    let whole_s = delta / self.ts_hz;
+                                    let rem = delta % self.ts_hz;
+                                    let busy = whole_s
+                                        .saturating_mul(util)
+                                        .saturating_mul(10_000_000)
+                                        .saturating_add(
+                                            rem * util * 1_000_000_000 / (100 * self.ts_hz),
+                                        );
+                                    self.snap.busy_ns.fetch_add(busy, Ordering::Relaxed);
                                 }
                                 self.last_util_ts = ts;
                             }

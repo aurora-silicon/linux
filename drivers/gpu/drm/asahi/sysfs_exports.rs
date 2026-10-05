@@ -29,7 +29,7 @@ pub(crate) fn register(
 ) -> kernel::error::Result {
     let ret = unsafe { asahi_sysfs_register(dev, export_enabled as c_int) };
     if ret < 0 {
-        Err(unsafe { kernel::error::Error::from_errno(ret) })
+        Err(kernel::error::Error::from_errno(ret))
     } else {
         Ok(())
     }
