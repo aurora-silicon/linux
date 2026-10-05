@@ -1624,8 +1624,37 @@ static void fabric_nonhybrid_hdmi_resume_test(struct kunit *test)
 	}
 }
 
+static void fabric_rebind_presence_test(struct kunit *test)
+{
+	for (unsigned int high = 0; high < 2; high++) {
+		struct fabric_fake f;
+		u64 previous;
+		bool expired;
+
+		fabric_fake_init(&f, test, false);
+		previous = dcp_fabric_presence_edge(&f.presence, 0, 10000);
+		/* Unbind drained the expiry; bind re-enables work before this sample. */
+		f.levels[0] = high;
+		dcp_fabric_run_resume(&fabric_fake_resume_ops, &f);
+		KUNIT_ASSERT_EQ(test, f.count, 2U);
+		KUNIT_EXPECT_EQ(test, f.trace[0], FX_IRQ_ENABLE);
+		KUNIT_EXPECT_EQ(test, f.trace[1], FX_SAMPLE);
+		KUNIT_EXPECT_EQ(test, f.presence.state,
+				high ? DCP_FABRIC_PRESENT : DCP_FABRIC_SETTLING);
+		KUNIT_EXPECT_EQ(test, f.presence.deadline, high ? 0UL : 11000UL);
+		expired = dcp_fabric_presence_expire(&f.presence, previous, false, 11000);
+		KUNIT_EXPECT_FALSE(test, expired);
+		if (!high) {
+			expired = dcp_fabric_presence_expire(&f.presence,
+							     f.presence.generation, false, 11000);
+			KUNIT_EXPECT_TRUE(test, expired);
+		}
+	}
+}
+
 static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE_PARAM(fabric_shared_wiring_test, fabric_wiring_gen_params),
+	KUNIT_CASE(fabric_rebind_presence_test),
 	KUNIT_CASE(fabric_nonhybrid_hdmi_resume_test),
 	KUNIT_CASE(fabric_resume_no_connect_test),
 	KUNIT_CASE(fabric_connector_flow_core_test),
