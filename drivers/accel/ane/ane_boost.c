@@ -2,28 +2,14 @@
 /*
  * Engine-busy CPU cluster boost.
  *
- * Bandwidth-bound programs run at a speed set by the CPU cluster
- * p-states. Measured on jwm1 (T8103, 2026-09-25, ane-linux-experiments
- * receipt jwm1-ane-dvfs-boost): with a mostly-sleeping submitter at
- * normal priority, 75 of 489 Qwen decode steps take 100-175 ms instead
- * of 70, every program in a slow step ~2x its normal wall, the
- * submitter's CPU time and run delay unchanged; both clusters pinned
- * at their top p-state (performance governor, or SCHED_FIFO for the
- * submitter, which schedutil boosts the same way) -> 0 of 489. The
- * whole-encoder Parakeet program (140 ms) moves too once the QoS lapses
- * mid-submit: timed from submit start, the hold dropped 100 ms into
- * every encoder run, median 171 ms (140-238); held to completion, 138.0
- * (137.7-138.7), jwm1 2026-09-25. The likely
- * mechanism is the second p-state field apple-soc-cpufreq writes with
- * the cluster p-state on T8103 only (DVFS_CMD PS2, has_ps2); the
- * memory-controller tuning its author named as unimplemented is still
- * absent from the tree. Whatever the field drives, the cure is the
- * cluster p-state, which cpufreq lets a driver request.
+ * Bandwidth-bound programs depend on CPU cluster frequency. On our
+ * T8103 hardware, holding the highest cluster frequency reduced slow
+ * submissions and keeping the boost until completion reduced latency.
  *
- * So hold a min-frequency QoS at the top of every cpufreq policy while a
- * submit runs, and drop it boost_idle_ms after the last one completes.
- * The QoS goes through cpufreq's own constraint object, so it composes
- * with any governor and never touches the DVFS registers.
+ * Hold a minimum-frequency QoS at the top of every cpufreq policy
+ * while a submission runs, then release it boost_idle_ms after the last
+ * completion. Use cpufreq constraints so the request composes with the
+ * governor without direct DVFS register access.
  */
 #include <linux/cpufreq.h>
 #include <linux/jiffies.h>

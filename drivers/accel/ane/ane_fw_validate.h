@@ -1,30 +1,17 @@
 /* SPDX-License-Identifier: GPL-2.0-only OR MIT */
 /*
- * ane_fw_validate.h — pinned ANE firmware images, their validator, and
- * iBoot's runtime patches.
- *
- * Single source of truth shared by the kernel loader
- * (ane_t6021_fwload.c) and the offline regression
- * (tools/h14_boot_regression.c). Strict EXACT-image assertions (no
- * generic Mach-O parsing).
- *
- * The images are the macOS 13.5 (22G74) payloads that iBoot preloads on
- * the stub every Omarchy install boots: selene for T6020/T6021/T6022
- * (byte-verified live at SEG0 on T6021, notebook 20260926T230146Z) and
- * bia for T8112 (receipts/2026-10-01-t8112-ane). Both have 5 load
- * commands (2 segments + LC_SYMTAB + LC_UUID + LC_UNIXTHREAD), entry 0.
- *
- * Userspace consumers typedef u8/u32/u64/size_t/bool and provide
- * get_unaligned_le32/64, memcmp and memcpy (see that tool's source);
- * kernel consumers get these from linux/types.h + linux/string.h.
- * This header intentionally includes nothing.
+ * ANE image validation and runtime boot fields, shared by the kernel
+ * loader and host regression. Validation checks the supported image
+ * layout, including five load commands, two segments and entry zero.
+ * Consumers provide types, unaligned accessors and memory helpers;
+ * this header intentionally includes nothing.
  */
 #ifndef __ANE_FW_VALIDATE_H__
 #define __ANE_FW_VALIDATE_H__
 
-/* FWIM surface size = config+0x138 byte-count = 0x500000 (Main
- * 2026-09-20, audit 751caa4, T6021). Covers the selene vmsize 0x4fc000
- * and the bia vmsize 0x4ec000; NOT derivable from the blob length.
+/*
+ * The 0x500000-byte allocation covers virtual segment ranges, independent of
+ * file length.
  */
 #define ANE_FW_BUF_SIZE		0x500000
 #define ANE_FW_ENTRY_PC		0x0
@@ -54,11 +41,10 @@ struct ane_fw_seg {
 #define ANE_FW_SELENE_NAME	"apple/ane/t602x_ane0_fw_selene_rc4x.macho"
 #define ANE_FW_BIA_NAME		"apple/ane/h14_ane_fw_bia_j4xx.macho"
 
-/* One pinned image. The patch fields are the payload's LC_SYMTAB
- * addresses: the __rtk_patch records _rtk_stack_guard, RTK_soc,
- * RTK_soc_revision, RTK_cpu_physical_address and
- * RTK_cpu_wrapper_physical_address, then the type-1
- * __rtk_platform_asc_tunables_block.
+/*
+ * Image descriptor: expected size, checksum, segment layout and boot
+ * field locations for the guard, SoC, revision, ASC core/wrapper
+ * addresses and tunable block.
  */
 struct ane_fw_image {
 	const char *name;		/* request_firmware() path */
@@ -118,11 +104,11 @@ ane_fw_validate_blob(const u8 *blob, size_t size,
 	u64 entry = (u64)~0ULL;
 
 	if (size != fw->size) {
-		*reason = "size != pinned image";
+		*reason = "image size mismatch";
 		return -1;
 	}
 	if (memcmp(fw->sha256, actual_sha, 32) != 0) {
-		*reason = "sha256 != pinned payload hash";
+		*reason = "image checksum mismatch";
 		return -1;
 	}
 
@@ -147,7 +133,7 @@ ane_fw_validate_blob(const u8 *blob, size_t size,
 	}
 	if (ncmds != ANE_FW_NCMDS || sizeofcmds != ANE_FW_SIZEOF_CMDS ||
 	    flags != ANE_FW_FLAGS) {
-		*reason = "header fields != pinned image";
+		*reason = "unsupported image header";
 		return -1;
 	}
 
@@ -195,7 +181,7 @@ ane_fw_validate_blob(const u8 *blob, size_t size,
 				}
 			}
 			if (k == ANE_FW_NSEGS) {
-				*reason = "segment != pinned layout";
+				*reason = "unsupported segment layout";
 				return -1;
 			}
 			nsegs++;
@@ -250,29 +236,19 @@ ane_fw_validate_blob(const u8 *blob, size_t size,
 }
 
 /*
- * iBoot runtime patches. iBoot places the image at its Mach-O vm layout
- * (TEXT vm 0, DATA vm segs[1].vmaddr) and then writes the fields below.
- * The 17 pre-Linux T6021 captures (receipts/2026-10-01-t602x-independent)
- * differ from the archive in these bytes only; only the stack guard
- * changes between boots. A driver that runs its own copy writes them
- * itself.
- *
- * Each __rtk_patch_* record is {u32 tag, u32 value length, value}.
+ * Runtime boot fields in the staged virtual layout. Set the data-segment
+ * DVA and tagged records containing a u32 tag, u32 value length and
+ * value. Validate every destination before modifying the image.
  */
 #define ANE_FW_DATA_BASE_VM	0x423c	/* TEXT u64: IOVA of DATA (both images) */
 #define ANE_FW_TUNABLES_MAX	0x24	/* type-1 block capacity (header byte 2) */
 
 /*
- * iBoot's ASC tunables for the ANE (coprocessor id 4): one record list
- * and the chip-revision keys of the entries that carry it, highest
- * first. iBoot fills the firmware's type-1 block from the first entry
- * whose key <= the chip revision: header {type 1, flags 3 (20-byte
- * records), capacity 0x24, count, u32 key}, then {u32 offset, u64 mask,
- * u64 value} per record (iBoot table offsets carry flag bit 30; the
- * block does not). Source: iBootStage2 macOS 26.6.2 (25G83), LZFSE, not
- * encrypted (receipts/2026-10-01-t8112-optin). The 13.5 iBoot2 that
- * preloads the 13.5 image is encrypted; on T6021 its block (the
- * captures) equals the 25G83 records exactly.
+ * ASC tunable records contain u32 offset, u64 mask and u64 value.
+ * Choose the highest revision key not exceeding the chip revision.
+ * The block header carries type 1, flags 3, capacity 0x24, count and
+ * u32 revision key. The table offset flag bit 30 is omitted from the
+ * serialized block.
  */
 struct ane_asc_tunable {
 	u32 off;
@@ -287,12 +263,7 @@ struct ane_asc_tunables {
 	struct ane_asc_tunable r[ANE_FW_TUNABLES_MAX];
 };
 
-/* T6021, T6022: j414c/j416c/j180d/j475d 25G83, type-1 key 0x10 (the
- * 0x150010 record) then type-3 key 0x10 (the rest), which is the T6021
- * capture block byte for byte (header key 0x10). 25G83 adds key 0x11;
- * the capture (RTK_soc_revision 0x11, block key 0x10) shows 13.5 has
- * none, so it is left out.
- */
+/* T6021/T6022 tunables use revision key 0x10. */
 static const struct ane_asc_tunables ane_t602x_asc_tunables = {
 	.keys = { 0x10, 0x01, 0x00 },
 	.nkeys = 3,
@@ -325,9 +296,7 @@ static const struct ane_asc_tunables ane_t602x_asc_tunables = {
 	},
 };
 
-/* T6020: j414s/j416s 25G83, one type-1 entry, key 0x00. The offsets of
- * T6021; 13 values differ.
- */
+/* T6020 tunables use revision key zero. */
 static const struct ane_asc_tunables ane_t6020_asc_tunables = {
 	.keys = { 0x00 },
 	.nkeys = 1,
@@ -360,9 +329,7 @@ static const struct ane_asc_tunables ane_t6020_asc_tunables = {
 	},
 };
 
-/* T8112: j413/j415/j473/j493 25G83, one type-1 table under keys 0x10
- * and 0x00, no type-3 entry. The T6021 offsets without 0x150010.
- */
+/* T8112 tunables use revision keys 0x10 and zero. */
 static const struct ane_asc_tunables ane_t8112_asc_tunables = {
 	.keys = { 0x10, 0x00 },
 	.nkeys = 2,
@@ -394,10 +361,7 @@ static const struct ane_asc_tunables ane_t8112_asc_tunables = {
 	},
 };
 
-/* T8112 RTK_soc_revision from its two eFuse words at 0x23d2c8060, as
- * iBootStage2 25G83 j413 0x40270 (and j415/j473/j493) computes it:
- * bits 2:0 = w0[29:27], bits 6:4 = {w1[0], w0[31:30]}.
- */
+/* T8112 revision: bits 2:0 = w0[29:27]; bits 6:4 = {w1[0], w0[31:30]}. */
 static inline u32 ane_t8112_fuse_revision(u32 w0, u32 w1)
 {
 	return ((w0 >> 27) & 7) | ((((w0 >> 30) | (w1 << 2)) & 7) << 4);
@@ -433,11 +397,11 @@ ane_fw_apply_boot_patches(u8 *img, const struct ane_fw_image *fw,
 	static const u8 tunables_unset[8] = {
 		0x01, 0x03, ANE_FW_TUNABLES_MAX, 0x00, 0xff, 0xff, 0xff, 0xff };
 	static const struct { u32 tag, len; } rec[ANE_FW_RTK_PATCHES] = {
-		{ 0x53544b47, 8 },	/* _rtk_stack_guard */
-		{ 0x534f435f, 4 },	/* RTK_soc */
-		{ 0x534f4352, 4 },	/* RTK_soc_revision */
-		{ 0x43704164, 8 },	/* RTK_cpu_physical_address */
-		{ 0x57724164, 8 },	/* ..._wrapper_physical_address */
+		{ 0x53544b47, 8 },	/* Stack guard */
+		{ 0x534f435f, 4 },	/* SoC ID */
+		{ 0x534f4352, 4 },	/* SoC revision */
+		{ 0x43704164, 8 },	/* ASC core physical address */
+		{ 0x57724164, 8 },	/* ASC wrapper physical address */
 	};
 	const u64 val[ANE_FW_RTK_PATCHES] = {
 		p->stack_guard, p->soc, p->soc_revision, p->cpu_pa,
@@ -453,18 +417,18 @@ ane_fw_apply_boot_patches(u8 *img, const struct ane_fw_image *fw,
 		return -1;
 	}
 	if (get_unaligned_le64(img + ANE_FW_DATA_BASE_VM)) {
-		*reason = "DATA base field is not the archive zero";
+		*reason = "DATA base field is not zero";
 		return -1;
 	}
 	for (i = 0; i < ANE_FW_RTK_PATCHES; i++) {
 		if (get_unaligned_le32(img + fw->rtk_vm[i]) != rec[i].tag ||
 		    get_unaligned_le32(img + fw->rtk_vm[i] + 4) != rec[i].len) {
-			*reason = "__rtk_patch record != pinned image";
+			*reason = "boot field record mismatch";
 			return -1;
 		}
 	}
 	if (memcmp(blk, tunables_unset, 8)) {
-		*reason = "tunables block header != pinned image";
+		*reason = "tunable block header mismatch";
 		return -1;
 	}
 
