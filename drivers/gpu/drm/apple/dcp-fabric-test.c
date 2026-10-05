@@ -776,7 +776,7 @@ struct fabric_fake {
 	struct dcp_fabric_route *best;
 	enum fabric_fake_effect trace[64];
 	unsigned int count, reads, wait_ms, plans, attempts[2], releasing;
-	unsigned int failed_activations;
+	unsigned int failed_activations, nr_typec_routes;
 	int levels[3], activate_error, deactivate_error;
 	bool borrowed, frozen, connector, irq_enabled, inject_edge;
 	bool selected, fixed_live, has_xbar, t6030, t6020_xbar, persistent;
@@ -788,6 +788,7 @@ static void fabric_fake_init(struct fabric_fake *f, struct kunit *test, bool dua
 	f->test = test;
 	f->connector = true;
 	f->has_xbar = true;
+	f->nr_typec_routes = 3;
 	fabric_init(&f->f, dual);
 }
 
@@ -921,7 +922,11 @@ static const struct dcp_fabric_resume_sample_ops fabric_fake_resume_sample_ops =
 
 static void fabric_fake_resume_sample(void *ctx)
 {
-	dcp_fabric_run_resume_sample(&fabric_fake_resume_sample_ops, ctx);
+	struct fabric_fake *f = ctx;
+	bool enabled = dcp_fabric_hdmi_settle_enabled(f->f.pipeline[0].has_fixed,
+						   f->nr_typec_routes, f->f.policy.dual_stream);
+
+	dcp_fabric_run_resume_sample(enabled, &fabric_fake_resume_sample_ops, ctx);
 }
 
 static const struct dcp_fabric_resume_ops fabric_fake_resume_ops = {
@@ -1587,16 +1592,41 @@ static void fabric_resume_no_connect_test(struct kunit *test)
 		f.borrowed = !!(row & 2);
 		f.levels[0] = !!(row & 1);
 		dcp_fabric_run_resume(&fabric_fake_resume_ops, &f);
-		KUNIT_ASSERT_EQ(test, f.count, 2U);
+		KUNIT_ASSERT_EQ(test, f.count, (row & 4) ? 1U : 2U);
 		KUNIT_EXPECT_EQ(test, f.trace[0], FX_IRQ_ENABLE);
-		KUNIT_EXPECT_EQ(test, f.trace[1], FX_SAMPLE);
-		KUNIT_EXPECT_EQ(test, f.presence.state,
-				(row & 1) ? DCP_FABRIC_PRESENT : DCP_FABRIC_SETTLING);
+		if (!(row & 4)) {
+			KUNIT_EXPECT_EQ(test, f.trace[1], FX_SAMPLE);
+			KUNIT_EXPECT_EQ(test, f.presence.state,
+					(row & 1) ? DCP_FABRIC_PRESENT : DCP_FABRIC_SETTLING);
+		} else {
+			KUNIT_EXPECT_EQ(test, f.presence.state, DCP_FABRIC_ABSENT);
+		}
+	}
+}
+
+static void fabric_nonhybrid_hdmi_resume_test(struct kunit *test)
+{
+	/* HDMI-only pipelines and Type-C-only pipelines never arm the hold. */
+	for (unsigned int row = 0; row < 6; row++) {
+		struct fabric_fake f;
+
+		fabric_fake_init(&f, test, row == 5);
+		f.nr_typec_routes = row < 4 ? 0 : 3;
+		f.f.pipeline[0].has_fixed = row != 4;
+		f.levels[0] = 1;
+		dcp_fabric_run_resume(&fabric_fake_resume_ops, &f);
+		KUNIT_ASSERT_EQ(test, f.count, 1U);
+		KUNIT_EXPECT_EQ(test, f.trace[0], FX_IRQ_ENABLE);
+		KUNIT_EXPECT_EQ(test, f.reads, 0U);
+		KUNIT_EXPECT_EQ(test, f.presence.state, DCP_FABRIC_ABSENT);
+		KUNIT_EXPECT_EQ(test, f.presence.generation, 0ULL);
+		KUNIT_EXPECT_EQ(test, f.presence.deadline, 0UL);
 	}
 }
 
 static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE_PARAM(fabric_shared_wiring_test, fabric_wiring_gen_params),
+	KUNIT_CASE(fabric_nonhybrid_hdmi_resume_test),
 	KUNIT_CASE(fabric_resume_no_connect_test),
 	KUNIT_CASE(fabric_connector_flow_core_test),
 	KUNIT_CASE(fabric_capacity_notification_test),

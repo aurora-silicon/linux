@@ -12,6 +12,11 @@ static inline void dcp_fabric_run_capacity(bool available, void (*notify)(void *
 		notify(ctx);
 }
 
+static inline bool dcp_fabric_hdmi_settle_enabled(bool fixed, unsigned int routes, bool dual)
+{
+	return fixed && routes && !dual;
+}
+
 struct dcp_fabric_resume_ops {
 	void (*enable_irq)(void *ctx);
 	void (*sample)(void *ctx);
@@ -43,10 +48,16 @@ struct dcp_fabric_resume_sample_ops {
 };
 
 static inline void
-dcp_fabric_run_resume_sample(const struct dcp_fabric_resume_sample_ops *ops, void *ctx)
+dcp_fabric_run_resume_sample(bool enabled,
+			     const struct dcp_fabric_resume_sample_ops *ops, void *ctx)
 {
-	u64 generation = ops->edge(ctx);
-	int level = ops->read_hpd(ctx);
+	u64 generation;
+	int level;
+
+	if (!enabled)
+		return;
+	generation = ops->edge(ctx);
+	level = ops->read_hpd(ctx);
 
 	ops->sample(ctx, generation, level);
 }

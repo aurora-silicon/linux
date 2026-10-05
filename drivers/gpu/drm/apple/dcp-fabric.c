@@ -491,11 +491,20 @@ static bool dcp_typec_keep_order(void)
 static void dcp_typec_pipeline_freed(void);
 static int dcp_fixed_output_select(struct apple_dcp *dcp);
 
+static bool dcp_hdmi_settle_enabled(struct apple_dcp *dcp)
+{
+	return dcp->hdmi_hpd &&
+	       dcp_fabric_hdmi_settle_enabled(!!dcp->fixed_phy, dcp->nr_typec_routes,
+					      dcp_typec_dual_stream());
+}
+
 static enum dcp_fabric_presence_state dcp_hdmi_presence(struct apple_dcp *dcp)
 {
 	enum dcp_fabric_presence_state state;
 	unsigned long flags;
 
+	if (!dcp_hdmi_settle_enabled(dcp))
+		return DCP_FABRIC_ABSENT;
 	spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
 	state = dcp->hdmi_presence.state;
 	spin_unlock_irqrestore(&dcp->hdmi_presence_lock, flags);
@@ -508,6 +517,8 @@ static u64 dcp_hdmi_edge(struct apple_dcp *dcp)
 	unsigned long flags;
 	u64 generation;
 
+	if (!dcp_hdmi_settle_enabled(dcp))
+		return 0;
 	spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
 	generation = dcp_fabric_presence_edge(&dcp->hdmi_presence, jiffies,
 					      msecs_to_jiffies(DCP_HDMI_HOLD_MS));
@@ -520,7 +531,7 @@ static void dcp_hdmi_schedule(struct apple_dcp *dcp)
 	unsigned long flags, delay = 0;
 	bool settling;
 
-	if (dcp_typec_dual_stream())
+	if (!dcp_hdmi_settle_enabled(dcp))
 		return;
 	spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
 	settling = dcp->hdmi_presence.state == DCP_FABRIC_SETTLING;
@@ -538,6 +549,8 @@ static bool dcp_hdmi_sample(struct apple_dcp *dcp, u64 generation, int level)
 	unsigned long flags;
 	bool accepted;
 
+	if (!dcp_hdmi_settle_enabled(dcp))
+		return false;
 	/* A failed GPIO read cannot establish absence. Keep a full guard. */
 	spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
 	accepted = dcp_fabric_presence_sample(&dcp->hdmi_presence, generation,
@@ -563,7 +576,7 @@ static void dcp_hdmi_settle_work(struct work_struct *work)
 	int level;
 
 	guard(mutex)(&dcp_typec_fabric_lock);
-	if (!dcp->hdmi_hpd || dcp_typec_dual_stream())
+	if (!dcp_hdmi_settle_enabled(dcp))
 		return;
 	spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
 	generation = dcp->hdmi_presence.generation;
@@ -594,7 +607,7 @@ static void dcp_hdmi_recheck_work(struct work_struct *work)
 	/* Oneshot unmask precedes thread completion. Never wait under fabric. */
 	synchronize_irq(dcp->hdmi_hpd_irq);
 	guard(mutex)(&dcp_typec_fabric_lock);
-	if (dcp_typec_dual_stream())
+	if (!dcp_hdmi_settle_enabled(dcp))
 		return;
 	spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
 	generation = dcp->hdmi_presence.generation;
@@ -646,8 +659,10 @@ static const struct dcp_fabric_resume_sample_ops dcp_resume_sample_ops = {
 
 void dcp_fabric_hdmi_resume(struct apple_dcp *dcp)
 {
+	if (!dcp_hdmi_settle_enabled(dcp))
+		return;
 	guard(mutex)(&dcp_typec_fabric_lock);
-	dcp_fabric_run_resume_sample(&dcp_resume_sample_ops, dcp);
+	dcp_fabric_run_resume_sample(true, &dcp_resume_sample_ops, dcp);
 }
 
 /* A Thunderbolt tunnel holds @dcp's pipeline: it never moves. */
@@ -2345,11 +2360,13 @@ static void dcp_hdmi_update_locked(struct apple_dcp *dcp)
 	int level;
 
 	lockdep_assert_held(&dcp_typec_fabric_lock);
-	spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
-	generation = dcp->hdmi_presence.generation;
-	spin_unlock_irqrestore(&dcp->hdmi_presence_lock, flags);
-	level = gpiod_get_value_cansleep(dcp->hdmi_hpd);
-	dcp_hdmi_sample(dcp, generation, level);
+	if (dcp_hdmi_settle_enabled(dcp)) {
+		spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
+		generation = dcp->hdmi_presence.generation;
+		spin_unlock_irqrestore(&dcp->hdmi_presence_lock, flags);
+		level = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+		dcp_hdmi_sample(dcp, generation, level);
+	}
 	dcp_fabric_run_hdmi(&dcp_hdmi_ops, dcp);
 }
 
@@ -2360,7 +2377,7 @@ irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
 	guard(mutex)(&dcp_typec_fabric_lock);
 	dcp_hdmi_update_locked(dcp);
 	/* The GPIO edge detector is off throughout an oneshot handler. */
-	if (!dcp_typec_dual_stream())
+	if (dcp_hdmi_settle_enabled(dcp))
 		mod_delayed_work(system_freezable_wq, &dcp->hdmi_recheck_wq, 0);
 	return IRQ_HANDLED;
 }
