@@ -38,6 +38,14 @@ def synthetic_record(with_manifest=True):
     return tlv(0x30, ia5(b"comb") + fdrd + secb)
 
 
+def synthetic_fsc2_image(kind=b"FSC2", with_manifest=True):
+    """A standalone IMG4 as the MacBook Neo stores it, structurally."""
+    im4p = tlv(0x30, ia5(b"IM4P") + ia5(kind) + ia5(b"test")
+                + tlv(0x04, b"CALB" + b"x" * 64))
+    manifest = tlv(0xA0, tlv(0x30, ia5(b"IM4M"))) if with_manifest else b""
+    return tlv(0x30, ia5(b"IMG4") + im4p + manifest)
+
+
 class CalibrationExtractorTests(unittest.TestCase):
     def test_scans_only_complete_manifest_marked_record(self):
         record = synthetic_record()
@@ -48,6 +56,21 @@ class CalibrationExtractorTests(unittest.TestCase):
 
     def test_rejects_record_without_manifest_markers(self):
         self.assertEqual(extractor.find_calibrations(synthetic_record(False)), [])
+
+    def test_scans_a_standalone_fsc2_image(self):
+        image = synthetic_fsc2_image()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "isc.img"
+            source.write_bytes(b"prefix" + image + b"suffix")
+            self.assertEqual(extractor.scan_input(source), [(6, image)])
+
+    def test_rejects_fsc2_image_without_manifest_or_of_another_type(self):
+        self.assertEqual(extractor.find_calibrations(synthetic_fsc2_image(with_manifest=False)), [])
+        self.assertEqual(extractor.find_calibrations(synthetic_fsc2_image(kind=b"FSCx")), [])
+
+    def test_the_fscl_image_inside_a_comb_record_is_found_once(self):
+        record = synthetic_record()
+        self.assertEqual(extractor.find_calibrations(record), [(0, len(record))])
 
     def test_rejects_input_output_aliases_and_symlinks(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Carve the per-device Mesa calibration from an Apple iBoot System Container."""
+"""Carve the per-device Mesa calibration from an Apple iBoot System Container.
+
+Most Macs keep it as a comb record wrapping a signed FSCl IMG4. The MacBook
+Neo (J700) keeps it as a standalone signed IMG4 whose IM4P type is FSC2.
+"""
 
 import argparse
 import hashlib
@@ -136,7 +140,57 @@ def validate_calibration(data, start):
     return outer.end
 
 
+def validate_fsc2_image(data, start):
+    """Return the end offset if data[start:] is a standalone signed FSC2 IMG4."""
+    img4 = TLV(data, start)
+    if img4.tag != 0x30:
+        raise DERError("IMG4 is not a sequence")
+    img4_children = child_tlvs(data, img4)
+    take_child(data, img4_children, 0x16, b"IMG4")
+
+    im4p = take_child(data, img4_children, 0x30)
+    im4p_children = child_tlvs(data, im4p)
+    take_child(data, im4p_children, 0x16, b"IM4P")
+    take_child(data, im4p_children, 0x16, b"FSC2")
+    take_child(data, im4p_children, 0x16)
+    payload = take_child(data, im4p_children, 0x04).content(data)
+    if b"CALB" not in payload[:256]:
+        raise DERError("FSC2 payload lacks its CALB header")
+
+    # As for FSCl, a signed calibration carries an IM4M manifest after the IM4P.
+    manifest = take_child(data, img4_children, 0xA0)
+    if b"IM4M" not in manifest.content(data):
+        raise DERError("IMG4 lacks an FSC2 manifest")
+    return img4.end
+
+
 def find_calibrations(data):
+    results = find_comb_calibrations(data)
+    # A standalone FSC2 IMG4 never sits inside a comb record already found.
+    signature = b"\x16\x04IMG4"
+    search_at = 0
+    while True:
+        marker = data.find(signature, search_at)
+        if marker < 0:
+            break
+        for header_length in range(2, 7):
+            start = marker - header_length
+            if start < 0 or data[start] != 0x30:
+                continue
+            if any(begin <= start < end for begin, end in results):
+                continue
+            try:
+                end = validate_fsc2_image(data, start)
+            except DERError:
+                continue
+            candidate = (start, end)
+            if candidate not in results:
+                results.append(candidate)
+        search_at = marker + 1
+    return results
+
+
+def find_comb_calibrations(data):
     results = []
     signature = b"\x16\x04comb"
     search_at = 0
@@ -307,7 +361,7 @@ def main():
                 candidates.append((input_path, offset, blob))
         if not candidates:
             raise RuntimeError(
-                "no signed Mesa FSCl/CALB calibration found; expected the raw "
+                "no signed Mesa FSCl or FSC2 calibration found; expected the raw "
                 "iBoot System Container (Apple Silicon boot partition)"
             )
         blobs = {}
