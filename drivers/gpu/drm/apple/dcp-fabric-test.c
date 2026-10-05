@@ -7,6 +7,7 @@
 #include <linux/soc/apple/dp-tunnel.h>
 
 #include "dcp-fabric-core.h"
+#include "dcp-fabric-effects.h"
 
 struct fabric_fixture {
 	struct dcp_fabric_pipeline pipeline[2];
@@ -221,7 +222,7 @@ static const struct fabric_scenario scenarios[] = {
 	{ "S5_full_hdmi_direct_tunnel", 5 },
 	{ "S6_direct_release_then_tunnel", 6 },
 	{ "S7_tunnel_release_promotes_direct", 7 },
-	{ "S8_frozen_hdmi_waits", 8 },
+	{ "S8_frozen_hdmi_waits_core", 8 },
 	{ "S9_parked_fixed_reselect", 9 },
 	{ "S10_hdmi_blink", 10 },
 	{ "S11_hdmi_absence", 11 },
@@ -229,25 +230,25 @@ static const struct fabric_scenario scenarios[] = {
 	{ "S13_boot_three_outputs", 13 },
 	{ "S14_boot_two_typec", 14 },
 	{ "S15_boot_hdmi_tunnel", 15 },
-	{ "S16_resume_arms_settle", 16 },
+	{ "S16_resume_arms_settle_core", 16 },
 	{ "S17_occupied_slot_errors", 17 },
 	{ "S18_connector_mask", 18 },
 	{ "S20_base_capacity", 20 },
 	{ "S21_base_lone", 21 },
 	{ "S30_dual_pairing_plan", 30 },
 	{ "S31_dual_dpin_candidates", 31 },
-	{ "S32_dual_hdmi_reclaim", 32 },
+	{ "S32_dual_hdmi_reclaim_core", 32 },
 	{ "S33_dual_scores", 33 },
 	{ "S34_dual_park_reselect", 34 },
 	{ "S35_dual_retry_off", 35 },
 	{ "S40_desktop_promotion", 40 },
 	{ "S41_dedicated_hdmi", 41 },
-	{ "S50a_panel_has_no_routes", 50 },
-	{ "S50b_external_service_readiness", 51 },
-	{ "S50c_terminal_scanout", 52 },
-	{ "S50d_external_attach_dispatch", 53 },
-	{ "S50e_t6030_crossbar", 54 },
-	{ "S50f_unwired_m3_ports", 55 },
+	{ "S50a_panel_has_no_routes_core", 50 },
+	{ "S50b_external_service_readiness_core", 51 },
+	{ "S50c_terminal_scanout_core", 52 },
+	{ "S50d_external_attach_dispatch_core", 53 },
+	{ "S50e_t6030_crossbar_core", 54 },
+	{ "S50f_unwired_m3_ports_core", 55 },
 };
 
 static void fabric_scenario_desc(const struct fabric_scenario *scenario,
@@ -500,7 +501,7 @@ static void fabric_dark_tunnel_test(struct kunit *test)
 			   dcp_fabric_movable(&f.route[1][0], &f.route[1][1]));
 }
 
-static void fabric_effect_failure_test(struct kunit *test)
+static void fabric_effect_failure_core_test(struct kunit *test)
 {
 	struct fabric_fixture f;
 
@@ -740,16 +741,694 @@ static void fabric_shared_wiring_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_dp_tunnel_dual_stream(NULL));
 }
 
+enum fabric_fake_effect {
+	FX_IRQ_ENABLE,
+	FX_SAMPLE,
+	FX_RESTORE_PHY,
+	FX_SELECT_MUX,
+	FX_MUX_FAIL,
+	FX_CONNECT_FIXED,
+	FX_WAIT,
+	FX_WAITING,
+	FX_REBALANCE,
+	FX_REGISTER,
+	FX_CANDIDATE,
+	FX_BIND,
+	FX_ACTIVATE,
+	FX_ROLLBACK,
+	FX_CLAIM,
+	FX_QUEUE,
+	FX_OOB,
+	FX_SOC,
+	FX_XBAR,
+	FX_RECORD,
+	FX_PLAN,
+	FX_DEACTIVATE,
+	FX_CLEAR,
+	FX_KEEP,
+};
+
+struct fabric_fake {
+	struct kunit *test;
+	struct fabric_fixture f;
+	struct dcp_fabric_presence presence;
+	struct dcp_fabric_route *best;
+	enum fabric_fake_effect trace[64];
+	unsigned int count, reads, wait_ms, plans, attempts[2], releasing;
+	unsigned int failed_activations;
+	int levels[3], activate_error, deactivate_error;
+	bool borrowed, frozen, connector, irq_enabled, inject_edge;
+	bool selected, fixed_live, has_xbar, t6030, t6020_xbar, persistent;
+};
+
+static void fabric_fake_init(struct fabric_fake *f, struct kunit *test, bool dual)
+{
+	memset(f, 0, sizeof(*f));
+	f->test = test;
+	f->connector = true;
+	f->has_xbar = true;
+	fabric_init(&f->f, dual);
+}
+
+static void fabric_fake_trace(struct fabric_fake *f, enum fabric_fake_effect effect)
+{
+	KUNIT_ASSERT_LT(f->test, f->count, (unsigned int)ARRAY_SIZE(f->trace));
+	f->trace[f->count++] = effect;
+}
+
+static bool fabric_fake_borrowed(void *ctx)
+{
+	return ((struct fabric_fake *)ctx)->borrowed;
+}
+
+static bool fabric_fake_keep_order(void *ctx)
+{
+	struct fabric_fake *f = ctx;
+
+	return dcp_fabric_keep_order(f->f.policy.dual_stream, true, f->frozen);
+}
+
+static bool fabric_fake_dual(void *ctx)
+{
+	return ((struct fabric_fake *)ctx)->f.policy.dual_stream;
+}
+
+static int fabric_fake_hpd(void *ctx)
+{
+	struct fabric_fake *f = ctx;
+	unsigned int index = min(f->reads++, 2U);
+
+	if (f->inject_edge) {
+		f->inject_edge = false;
+		dcp_fabric_presence_edge(&f->presence, 1001, 10000);
+	}
+	return f->levels[index];
+}
+
+static void fabric_fake_wait(void *ctx, unsigned int ms)
+{
+	struct fabric_fake *f = ctx;
+
+	f->wait_ms += ms;
+	fabric_fake_trace(f, FX_WAIT);
+}
+
+static void fabric_fake_waiting(void *ctx)
+{
+	fabric_fake_trace(ctx, FX_WAITING);
+}
+
+static void fabric_fake_rebalance(void *ctx)
+{
+	fabric_fake_trace(ctx, FX_REBALANCE);
+}
+
+static void fabric_fake_observed(void *ctx, bool high, bool debounced)
+{
+}
+
+static void fabric_fake_restore_phy(void *ctx)
+{
+	fabric_fake_trace(ctx, FX_RESTORE_PHY);
+}
+
+static int fabric_fake_select_mux(void *ctx)
+{
+	fabric_fake_trace(ctx, FX_SELECT_MUX);
+	return 0;
+}
+
+static const struct dcp_fabric_fixed_ops fabric_fake_fixed_ops = {
+	.restore_phy = fabric_fake_restore_phy,
+	.select_mux = fabric_fake_select_mux,
+};
+
+static void fabric_fake_connect(void *ctx)
+{
+	fabric_fake_trace(ctx, FX_CONNECT_FIXED);
+}
+
+static void fabric_fake_select_connect(void *ctx)
+{
+	struct fabric_fake *f = ctx;
+
+	if (!dcp_fabric_run_fixed(true, f->borrowed, true, &fabric_fake_fixed_ops, f))
+		fabric_fake_connect(f);
+}
+
+static const struct dcp_fabric_hdmi_ops fabric_fake_hdmi_ops = {
+	.borrowed = fabric_fake_borrowed,
+	.keep_order = fabric_fake_keep_order,
+	.dual_stream = fabric_fake_dual,
+	.read_hpd = fabric_fake_hpd,
+	.wait = fabric_fake_wait,
+	.rebalance = fabric_fake_rebalance,
+	.waiting = fabric_fake_waiting,
+	.observed = fabric_fake_observed,
+	.connect_fixed = fabric_fake_select_connect,
+};
+
+static void fabric_fake_enable_irq(void *ctx)
+{
+	struct fabric_fake *f = ctx;
+
+	f->irq_enabled = true;
+	fabric_fake_trace(f, FX_IRQ_ENABLE);
+}
+
+static u64 fabric_fake_edge(void *ctx)
+{
+	struct fabric_fake *f = ctx;
+
+	return dcp_fabric_presence_edge(&f->presence, 1000, 10000);
+}
+
+static bool fabric_fake_sample(void *ctx, u64 generation, int level)
+{
+	struct fabric_fake *f = ctx;
+
+	KUNIT_EXPECT_TRUE(f->test, f->irq_enabled);
+	fabric_fake_trace(f, FX_SAMPLE);
+	return dcp_fabric_presence_sample(&f->presence, generation, level > 0, 1000, 10000);
+}
+
+static const struct dcp_fabric_resume_sample_ops fabric_fake_resume_sample_ops = {
+	.edge = fabric_fake_edge,
+	.read_hpd = fabric_fake_hpd,
+	.sample = fabric_fake_sample,
+	.borrowed = fabric_fake_borrowed,
+	.connect_fixed = fabric_fake_select_connect,
+};
+
+static void fabric_fake_resume_sample(void *ctx)
+{
+	dcp_fabric_run_resume_sample(&fabric_fake_resume_sample_ops, ctx);
+}
+
+static const struct dcp_fabric_resume_ops fabric_fake_resume_ops = {
+	.enable_irq = fabric_fake_enable_irq,
+	.sample = fabric_fake_resume_sample,
+};
+
+static int fabric_fake_register(void *ctx)
+{
+	fabric_fake_trace(ctx, FX_REGISTER);
+	return 0;
+}
+
+static int fabric_fake_candidate(void *ctx)
+{
+	struct fabric_fake *f = ctx;
+	int error;
+
+	fabric_fake_trace(f, FX_CANDIDATE);
+	f->best = dcp_fabric_tunnel_candidate(&f->f.port[0], &f->f.policy, NULL,
+					      false, 0, f->connector, &error);
+	return f->best ? 0 : error;
+}
+
+static int fabric_fake_activate(void *ctx)
+{
+	struct fabric_fake *f = ctx;
+
+	fabric_fake_trace(f, FX_BIND);
+	fabric_fake_trace(f, FX_ACTIVATE);
+	/* Fault injection may bypass admission: reject a missing target safely. */
+	return f->best ? f->activate_error : -EINVAL;
+}
+
+static void fabric_fake_rollback(void *ctx)
+{
+	fabric_fake_trace(ctx, FX_ROLLBACK);
+}
+
+static void fabric_fake_claim(void *ctx)
+{
+	struct fabric_fake *f = ctx;
+
+	fabric_fake_trace(f, FX_CLAIM);
+	f->f.port[0].owner[0] = f->best;
+	f->best->pipeline->owned = true;
+}
+
+static bool fabric_fake_external(void *ctx)
+{
+	struct fabric_fake *f = ctx;
+
+	return f->best->pipeline->external;
+}
+
+static bool fabric_fake_connector(void *ctx)
+{
+	return ((struct fabric_fake *)ctx)->connector;
+}
+
+static void fabric_fake_queue(void *ctx)
+{
+	fabric_fake_trace(ctx, FX_QUEUE);
+}
+
+static void fabric_fake_oob(void *ctx)
+{
+	fabric_fake_trace(ctx, FX_OOB);
+}
+
+static const struct dcp_fabric_attach_ops fabric_fake_attach_ops = {
+	.candidate = fabric_fake_candidate,
+	.activate = fabric_fake_activate,
+	.rollback = fabric_fake_rollback,
+	.claim = fabric_fake_claim,
+	.external = fabric_fake_external,
+	.has_connector = fabric_fake_connector,
+	.queue_reconnect = fabric_fake_queue,
+	.connect_oob = fabric_fake_oob,
+};
+
+static int fabric_fake_dispatch(void *ctx, const struct dcp_fabric_port *port)
+{
+	struct fabric_fake *f = ctx;
+
+	KUNIT_EXPECT_PTR_EQ(f->test, port, &f->f.port[0]);
+	return dcp_fabric_run_attach(&fabric_fake_attach_ops, f);
+}
+
+static bool fabric_fake_has_xbar(void *ctx)
+{
+	return ((struct fabric_fake *)ctx)->has_xbar;
+}
+
+static bool fabric_fake_tunnel(void *ctx)
+{
+	return true;
+}
+
+static bool fabric_fake_xbar(void *ctx)
+{
+	struct fabric_fake *f = ctx;
+
+	fabric_fake_trace(f, FX_XBAR);
+	return f->t6020_xbar;
+}
+
+static bool fabric_fake_soc(void *ctx)
+{
+	struct fabric_fake *f = ctx;
+
+	fabric_fake_trace(f, FX_SOC);
+	return f->t6030;
+}
+
+static void fabric_fake_record_soc(void *ctx, bool t6030)
+{
+	struct fabric_fake *f = ctx;
+
+	f->f.pipeline[0].t6030_dpin = t6030;
+	fabric_fake_trace(f, FX_RECORD);
+}
+
+static const struct dcp_fabric_link_ops fabric_fake_link_ops = {
+	.has_xbar = fabric_fake_has_xbar,
+	.tunnel = fabric_fake_tunnel,
+	.t6020_xbar = fabric_fake_xbar,
+	.t6030_soc = fabric_fake_soc,
+	.record_soc = fabric_fake_record_soc,
+};
+
+static int fabric_fake_deactivate(void *ctx)
+{
+	struct fabric_fake *f = ctx;
+	struct dcp_fabric_route *owner = f->f.port[f->releasing].owner[0];
+	int ret = f->deactivate_error;
+
+	fabric_fake_trace(f, FX_DEACTIVATE);
+	/* Model the real failure: release ownership, restore PHY, fail mux. */
+	owner->pipeline->owned = false;
+	f->selected = false;
+	fabric_fake_trace(f, FX_RESTORE_PHY);
+	if (ret)
+		fabric_fake_trace(f, FX_MUX_FAIL);
+	f->deactivate_error = 0;
+	return ret;
+}
+
+static bool fabric_fake_selected(void *ctx)
+{
+	return ((struct fabric_fake *)ctx)->selected;
+}
+
+static bool fabric_fake_fixed_live(void *ctx)
+{
+	return ((struct fabric_fake *)ctx)->fixed_live;
+}
+
+static void fabric_fake_keep(void *ctx)
+{
+	fabric_fake_trace(ctx, FX_KEEP);
+}
+
+static void fabric_fake_clear(void *ctx)
+{
+	struct fabric_fake *f = ctx;
+
+	f->f.port[f->releasing].owner[0] = NULL;
+	fabric_fake_trace(f, FX_CLEAR);
+}
+
+static const struct dcp_fabric_deactivate_ops fabric_fake_deactivate_ops = {
+	.deactivate = fabric_fake_deactivate,
+	.selected = fabric_fake_selected,
+	.fixed_live = fabric_fake_fixed_live,
+	.keep_owner = fabric_fake_keep,
+	.clear_owner = fabric_fake_clear,
+	.connect_fixed = fabric_fake_connect,
+};
+
+static void fabric_fake_plan(void *ctx)
+{
+	struct fabric_fake *f = ctx;
+
+	f->plans++;
+	fabric_fake_trace(f, FX_PLAN);
+	dcp_fabric_plan(f->f.pipeline, f->f.port, NULL, 0);
+}
+
+static void *fabric_fake_first(void *ctx)
+{
+	struct fabric_fake *f = ctx;
+
+	return &f->f.port[0];
+}
+
+static void *fabric_fake_next(void *ctx, void *entry)
+{
+	struct fabric_fake *f = ctx;
+	struct dcp_fabric_port *port = entry;
+	unsigned int p = port - f->f.port;
+
+	return p < 2 ? &f->f.port[p + 1] : NULL;
+}
+
+static bool fabric_fake_deactivate_one(void *ctx, void *entry)
+{
+	struct fabric_fake *f = ctx;
+	struct dcp_fabric_port *port = entry;
+	unsigned int p = port - f->f.port;
+
+	if (!dcp_fabric_movable(port->owner[0], f->f.plan[p].target[0]))
+		return false;
+	f->releasing = p;
+	return dcp_fabric_run_deactivate(&fabric_fake_deactivate_ops, f);
+}
+
+static bool fabric_fake_activate_one(void *ctx, void *entry)
+{
+	struct fabric_fake *f = ctx;
+	struct dcp_fabric_port *port = entry;
+	unsigned int p = port - f->f.port;
+	struct dcp_fabric_route *target = f->f.plan[p].target[0];
+	unsigned int index;
+
+	if (port->owner[0] || !target || !port->wanted || !port->hpd)
+		return false;
+	index = target->pipeline == &f->f.pipeline[0] ? 0 : 1;
+	f->attempts[index]++;
+	fabric_fake_trace(f, FX_ACTIVATE);
+	if (f->failed_activations || (f->persistent && f->plans < 4)) {
+		if (f->failed_activations)
+			f->failed_activations--;
+		f->f.pipeline[0].fixed_busy = true;
+		return true;
+	}
+	target->pipeline->owned = true;
+	port->owner[0] = target;
+	return false;
+}
+
+static const struct dcp_fabric_rebalance_ops fabric_fake_rebalance_ops = {
+	.plan = fabric_fake_plan,
+	.first = fabric_fake_first,
+	.next = fabric_fake_next,
+	.deactivate = fabric_fake_deactivate_one,
+	.activate = fabric_fake_activate_one,
+};
+
+static void fabric_effect_s8_test(struct kunit *test)
+{
+	struct fabric_fake f;
+
+	fabric_fake_init(&f, test, false);
+	f.borrowed = true;
+	f.frozen = true;
+	f.levels[0] = 1;
+	dcp_fabric_run_hdmi(&fabric_fake_hdmi_ops, &f);
+	KUNIT_ASSERT_EQ(test, f.count, 1U);
+	KUNIT_EXPECT_EQ(test, f.trace[0], FX_WAITING);
+	/* When the direct route leaves, the same handler restores and connects. */
+	f.borrowed = false;
+	f.reads = 0;
+	f.levels[1] = 1;
+	dcp_fabric_run_hdmi(&fabric_fake_hdmi_ops, &f);
+	KUNIT_ASSERT_EQ(test, f.count, 5U);
+	KUNIT_EXPECT_EQ(test, f.trace[1], FX_WAIT);
+	KUNIT_EXPECT_EQ(test, f.trace[2], FX_RESTORE_PHY);
+	KUNIT_EXPECT_EQ(test, f.trace[3], FX_SELECT_MUX);
+	KUNIT_EXPECT_EQ(test, f.trace[4], FX_CONNECT_FIXED);
+}
+
+static void fabric_effect_s32_test(struct kunit *test)
+{
+	struct fabric_fake f;
+
+	fabric_fake_init(&f, test, true);
+	f.borrowed = true;
+	f.levels[0] = 1;
+	f.levels[1] = 1;
+	dcp_fabric_run_hdmi(&fabric_fake_hdmi_ops, &f);
+	KUNIT_ASSERT_EQ(test, f.count, 2U);
+	KUNIT_EXPECT_EQ(test, f.trace[0], FX_WAIT);
+	KUNIT_EXPECT_EQ(test, f.trace[1], FX_REBALANCE);
+	KUNIT_EXPECT_EQ(test, f.wait_ms, 500U);
+	/* The post-debounce level and compositor gate both suppress reclaim. */
+	f.count = 0;
+	f.reads = 0;
+	f.wait_ms = 0;
+	f.levels[1] = 0;
+	dcp_fabric_run_hdmi(&fabric_fake_hdmi_ops, &f);
+	KUNIT_ASSERT_EQ(test, f.count, 1U);
+	KUNIT_EXPECT_EQ(test, f.trace[0], FX_WAIT);
+	f.count = 0;
+	f.reads = 0;
+	f.frozen = true;
+	dcp_fabric_run_hdmi(&fabric_fake_hdmi_ops, &f);
+	KUNIT_EXPECT_EQ(test, f.count, 0U);
+}
+
+static void fabric_effect_s16_test(struct kunit *test)
+{
+	struct fabric_fake f;
+	u64 generation;
+
+	fabric_fake_init(&f, test, false);
+	dcp_fabric_run_resume(&fabric_fake_resume_ops, &f);
+	KUNIT_ASSERT_EQ(test, f.count, 2U);
+	KUNIT_EXPECT_EQ(test, f.trace[0], FX_IRQ_ENABLE);
+	KUNIT_EXPECT_EQ(test, f.trace[1], FX_SAMPLE);
+	KUNIT_EXPECT_EQ(test, f.presence.state, DCP_FABRIC_SETTLING);
+	KUNIT_EXPECT_EQ(test, f.presence.deadline, 11000UL);
+	generation = f.presence.generation;
+	f.count = 0;
+	f.reads = 0;
+	f.levels[0] = 1;
+	dcp_fabric_run_resume(&fabric_fake_resume_ops, &f);
+	KUNIT_ASSERT_EQ(test, f.count, 5U);
+	KUNIT_EXPECT_EQ(test, f.trace[2], FX_RESTORE_PHY);
+	KUNIT_EXPECT_EQ(test, f.trace[3], FX_SELECT_MUX);
+	KUNIT_EXPECT_EQ(test, f.trace[4], FX_CONNECT_FIXED);
+	KUNIT_EXPECT_EQ(test, f.presence.state, DCP_FABRIC_PRESENT);
+	KUNIT_EXPECT_EQ(test, f.presence.deadline, 0UL);
+	KUNIT_EXPECT_FALSE(test,
+			   dcp_fabric_presence_expire(&f.presence, generation, false, 11000));
+	/* A falling hardirq during GPIO sampling invalidates the high sample. */
+	f.count = 0;
+	f.reads = 0;
+	f.inject_edge = true;
+	dcp_fabric_run_resume(&fabric_fake_resume_ops, &f);
+	KUNIT_EXPECT_EQ(test, f.count, 2U);
+	KUNIT_EXPECT_EQ(test, f.presence.state, DCP_FABRIC_SETTLING);
+}
+
+static void fabric_effect_s50a_test(struct kunit *test)
+{
+	struct fabric_fake f;
+
+	fabric_fake_init(&f, test, false);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_run_probe(false, fabric_fake_register, &f), 0);
+	KUNIT_EXPECT_EQ(test, f.count, 0U);
+	KUNIT_EXPECT_FALSE(test, f.f.pipeline[0].owned);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_run_probe(true, fabric_fake_register, &f), 0);
+	KUNIT_ASSERT_EQ(test, f.count, 1U);
+	KUNIT_EXPECT_EQ(test, f.trace[0], FX_REGISTER);
+}
+
+static void fabric_effect_s50bc_test(struct kunit *test)
+{
+	struct fabric_fake f;
+
+	fabric_fake_init(&f, test, false);
+	f.f.port[0].routes = &f.f.route[0][1];
+	f.f.pipeline[1].external = true;
+	f.f.pipeline[1].services_ready = false;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_run_attach(&fabric_fake_attach_ops, &f), -EAGAIN);
+	KUNIT_ASSERT_EQ(test, f.count, 1U);
+	KUNIT_EXPECT_EQ(test, f.trace[0], FX_CANDIDATE);
+	KUNIT_EXPECT_PTR_EQ(test, f.f.port[0].owner[0], NULL);
+	f.count = 0;
+	f.f.pipeline[1].terminal = true;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_run_attach(&fabric_fake_attach_ops, &f), -ESHUTDOWN);
+	KUNIT_EXPECT_EQ(test, f.count, 1U);
+	f.count = 0;
+	f.f.pipeline[1].terminal = false;
+	f.f.pipeline[1].services_ready = true;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_run_attach(&fabric_fake_attach_ops, &f), 0);
+	KUNIT_ASSERT_EQ(test, f.count, 5U);
+	KUNIT_EXPECT_EQ(test, f.trace[4], FX_QUEUE);
+	KUNIT_EXPECT_PTR_EQ(test, f.f.port[0].owner[0], &f.f.route[0][1]);
+}
+
+static void fabric_effect_s50d_test(struct kunit *test)
+{
+	struct fabric_fake f;
+
+	fabric_fake_init(&f, test, false);
+	KUNIT_ASSERT_EQ(test, dcp_fabric_run_attach(&fabric_fake_attach_ops, &f), 0);
+	KUNIT_ASSERT_EQ(test, f.count, 5U);
+	KUNIT_EXPECT_EQ(test, f.trace[4], FX_OOB);
+	fabric_fake_init(&f, test, false);
+	f.f.pipeline[1].external = true;
+	KUNIT_ASSERT_EQ(test, dcp_fabric_run_attach(&fabric_fake_attach_ops, &f), 0);
+	KUNIT_ASSERT_EQ(test, f.count, 5U);
+	KUNIT_EXPECT_EQ(test, f.trace[4], FX_QUEUE);
+	fabric_fake_init(&f, test, false);
+	f.activate_error = -EIO;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_run_attach(&fabric_fake_attach_ops, &f), -EIO);
+	KUNIT_ASSERT_EQ(test, f.count, 4U);
+	KUNIT_EXPECT_EQ(test, f.trace[3], FX_ROLLBACK);
+	KUNIT_EXPECT_PTR_EQ(test, f.f.port[0].owner[0], NULL);
+}
+
+static void fabric_effect_s50e_test(struct kunit *test)
+{
+	struct fabric_fake f;
+
+	fabric_fake_init(&f, test, false);
+	f.t6030 = true;
+	f.t6020_xbar = true;
+	KUNIT_EXPECT_TRUE(test, dcp_fabric_run_t6030_link(&fabric_fake_link_ops, &f));
+	KUNIT_EXPECT_TRUE(test, f.f.pipeline[0].t6030_dpin);
+	f.t6030 = false;
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_run_t6030_link(&fabric_fake_link_ops, &f));
+	KUNIT_EXPECT_FALSE(test, f.f.pipeline[0].t6030_dpin);
+	f.t6030 = true;
+	f.t6020_xbar = false;
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_run_t6030_link(&fabric_fake_link_ops, &f));
+	f.has_xbar = false;
+	f.count = 0;
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_run_t6030_link(&fabric_fake_link_ops, &f));
+	KUNIT_EXPECT_EQ(test, f.count, 0U);
+}
+
+static void fabric_effect_s50f_test(struct kunit *test)
+{
+	struct fabric_fake f;
+
+	fabric_fake_init(&f, test, false);
+	f.f.port[0].next = NULL;
+	KUNIT_EXPECT_EQ(test,
+			dcp_fabric_run_request(f.f.port, 2, 0, fabric_fake_dispatch, &f), -ENODEV);
+	KUNIT_EXPECT_EQ(test,
+			dcp_fabric_run_request(f.f.port, 3, 0, fabric_fake_dispatch, &f), -ENODEV);
+	KUNIT_EXPECT_EQ(test, f.count, 0U);
+	KUNIT_EXPECT_EQ(test,
+			dcp_fabric_run_request(f.f.port, 1, 0, fabric_fake_dispatch, &f), 0);
+	KUNIT_EXPECT_EQ(test, f.count, 5U);
+}
+
+static void fabric_effect_failure_test(struct kunit *test)
+{
+	struct fabric_fake f;
+
+	fabric_fake_init(&f, test, true);
+	f.f.port[0].wanted = true;
+	f.f.port[0].hpd = true;
+	f.f.port[1].wanted = true;
+	f.f.port[1].hpd = true;
+	f.failed_activations = 1;
+	dcp_fabric_run_rebalance(&fabric_fake_rebalance_ops, &f);
+	KUNIT_EXPECT_EQ(test, f.plans, 2U);
+	KUNIT_EXPECT_EQ(test, f.attempts[0], 1U);
+	KUNIT_EXPECT_EQ(test, f.attempts[1], 1U);
+	KUNIT_EXPECT_PTR_EQ(test, f.f.port[0].owner[0], &f.f.route[0][1]);
+	KUNIT_EXPECT_PTR_EQ(test, f.f.port[1].owner[0], NULL);
+	/* Persistent failure still takes the third fresh snapshot and stops. */
+	fabric_fake_init(&f, test, true);
+	f.f.port[0].wanted = true;
+	f.f.port[0].hpd = true;
+	f.f.port[1].wanted = true;
+	f.f.port[1].hpd = true;
+	f.persistent = true;
+	dcp_fabric_run_rebalance(&fabric_fake_rebalance_ops, &f);
+	KUNIT_EXPECT_EQ(test, f.plans, 3U);
+	KUNIT_EXPECT_EQ(test, f.attempts[0], 1U);
+	KUNIT_EXPECT_EQ(test, f.attempts[1], 1U);
+	KUNIT_EXPECT_PTR_EQ(test, f.f.port[0].owner[0], NULL);
+	KUNIT_EXPECT_PTR_EQ(test, f.f.plan[0].target[0], &f.f.route[0][1]);
+}
+
+static void fabric_effect_deactivate_failure_test(struct kunit *test)
+{
+	struct fabric_fake f;
+
+	fabric_fake_init(&f, test, true);
+	f.f.port[0].wanted = true;
+	f.f.port[0].hpd = true;
+	f.f.port[0].owner[0] = &f.f.route[0][0];
+	f.f.pipeline[0].owned = true;
+	f.f.pipeline[0].fixed_busy = true;
+	f.deactivate_error = -EIO;
+	f.fixed_live = true;
+	dcp_fabric_run_rebalance(&fabric_fake_rebalance_ops, &f);
+	KUNIT_ASSERT_GE(test, f.count, 8U);
+	KUNIT_EXPECT_EQ(test, f.trace[0], FX_PLAN);
+	KUNIT_EXPECT_EQ(test, f.trace[1], FX_DEACTIVATE);
+	KUNIT_EXPECT_EQ(test, f.trace[2], FX_RESTORE_PHY);
+	KUNIT_EXPECT_EQ(test, f.trace[3], FX_MUX_FAIL);
+	KUNIT_EXPECT_EQ(test, f.trace[4], FX_CLEAR);
+	KUNIT_EXPECT_EQ(test, f.trace[5], FX_CONNECT_FIXED);
+	KUNIT_EXPECT_EQ(test, f.trace[6], FX_PLAN);
+	KUNIT_EXPECT_EQ(test, f.plans, 2U);
+	KUNIT_EXPECT_PTR_EQ(test, f.f.port[0].owner[0], &f.f.route[0][1]);
+}
+
 static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE_PARAM(fabric_shared_wiring_test, fabric_wiring_gen_params),
 	KUNIT_CASE_PARAM(fabric_scenario_test, fabric_scenario_gen_params),
 	KUNIT_CASE(fabric_dark_tunnel_test),
-	KUNIT_CASE(fabric_effect_failure_test),
+	KUNIT_CASE(fabric_effect_failure_core_test),
 	KUNIT_CASE(fabric_deactivate_failure_test),
 	KUNIT_CASE(fabric_unbound_and_mask_test),
 	KUNIT_CASE(fabric_presence_wrap_test),
 	KUNIT_CASE(fabric_masked_edge_test),
 	KUNIT_CASE_PARAM(fabric_wiring_test, fabric_wiring_gen_params),
+	KUNIT_CASE(fabric_effect_s8_test),
+	KUNIT_CASE(fabric_effect_s16_test),
+	KUNIT_CASE(fabric_effect_s32_test),
+	KUNIT_CASE(fabric_effect_s50a_test),
+	KUNIT_CASE(fabric_effect_s50bc_test),
+	KUNIT_CASE(fabric_effect_s50d_test),
+	KUNIT_CASE(fabric_effect_s50e_test),
+	KUNIT_CASE(fabric_effect_s50f_test),
+	KUNIT_CASE(fabric_effect_failure_test),
+	KUNIT_CASE(fabric_effect_deactivate_failure_test),
 	{}
 };
 

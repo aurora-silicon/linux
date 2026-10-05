@@ -40,6 +40,7 @@
 #include "afk.h"
 #include "av.h"
 #include "dcp.h"
+#include "dcp-fabric-effects.h"
 #include "dcp-fabric.h"
 #include "dcpext_scanout.h"
 #include "dcp-internal.h"
@@ -1887,28 +1888,31 @@ static int dcp_platform_suspend(struct device *dev)
 	return 0;
 }
 
+static void dcp_resume_enable_irq(void *ctx)
+{
+	struct apple_dcp *dcp = ctx;
+
+	enable_irq(dcp->hdmi_hpd_irq);
+}
+
+static void dcp_resume_sample(void *ctx)
+{
+	dcp_fabric_hdmi_resume(ctx);
+}
+
+static const struct dcp_fabric_resume_ops dcp_resume_ops = {
+	.enable_irq = dcp_resume_enable_irq,
+	.sample = dcp_resume_sample,
+};
+
 static int dcp_platform_resume(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
 	dcp_enable_typec_work(dcp);
-	if (dcp->hdmi_hpd_irq) {
-		enum dcp_fabric_resume_step steps[2];
-		unsigned int i;
-
-		/* Observe future edges before sampling any edges lost in sleep. */
-		dcp_fabric_resume_steps(steps);
-		for (i = 0; i < ARRAY_SIZE(steps); i++) {
-			switch (steps[i]) {
-			case DCP_FABRIC_ENABLE_HPD_IRQ:
-				enable_irq(dcp->hdmi_hpd_irq);
-				break;
-			case DCP_FABRIC_SAMPLE_HPD:
-				dcp_fabric_hdmi_resume(dcp);
-				break;
-			}
-		}
-	}
+	/* Observe future edges before sampling any edges lost in sleep. */
+	if (dcp->hdmi_hpd_irq)
+		dcp_fabric_run_resume(&dcp_resume_ops, dcp);
 
 	if (dcp->avep)
 		av_service_connect(dcp);
