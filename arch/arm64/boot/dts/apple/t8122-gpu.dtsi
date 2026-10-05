@@ -5,7 +5,36 @@
  * The register ranges and interrupts come from the J613 iBoot ADT captured
  * by the opt-in m1n1 diagnostic exporter. The GPU and mailbox remain disabled
  * until m1n1 can reserve the firmware/UAT memory and validate its handoff.
+ *
+ * The rest of the GPU description is this machine's, so the boot loader
+ * fills it from its ADT when it hands the GPU over: the performance states
+ * and their power, the leakage coefficients, the power-management
+ * coefficients, the firmware version and the firmware and UAT memory. It
+ * enables the mailbox and then the GPU node last. drm/asahi refuses a T8122
+ * GPU node with any of these missing. Nothing here has a T6030 value
+ * copied into it.
  */
+
+/ {
+	aliases {
+		gpu = &gpu;	/* m1n1 finds the GPU node through this alias */
+	};
+
+	gpu_opp: opp-table-gpu {
+		compatible = "operating-points-v2";
+
+		/*
+		 * Placeholder only. The boot loader deletes these children and
+		 * creates one OPP per performance state, with one opp-microvolt
+		 * cell for the single GPU cluster. Until then every value is zero.
+		 */
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+			opp-microwatt = <0>;
+		};
+	};
+};
 
 &{/soc} {
 	gpu: gpu@292400000 {
@@ -23,20 +52,38 @@
 			     <AIC_IRQ 729 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 721 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_gfx>;
+		/*
+		 * Do not hold back the ps_gfx sync_state() on this device when it
+		 * never probes, as on the T6030.
+		 */
+		post-init-providers = <&ps_gfx>;
 		mboxes = <&agx_mbox>;
 		memory-region = <&uat_ttbs>, <&uat_pagetables>,
 				<&uat_handoff>, <&uat_pagetables_l2>;
 		memory-region-names = "ttbs", "pagetables", "handoff",
 				      "pagetables-l2";
+
+		/* Zero until the boot loader identifies the loaded GPU firmware. */
+		apple,firmware-abi = <0 0 0>;
+		apple,firmware-version = <0 0 0>;
+		apple,firmware-compat = <0 0 0>;
+
+		operating-points-v2 = <&gpu_opp>;
+
+		/* The boot loader sets "okay" as its last step. */
 		status = "disabled";
 	};
 
 	/* ASC mailbox subwindow follows the T8122 ASC layout. The IRQ role
 	 * mapping follows the other T8122 ASC mailboxes; it is not yet live-tested
 	 * for GFX. Leave this provider disabled with the GPU.
+	 *
+	 * Like the T6030 one it carries no asc-mailbox-v4 fallback, so a kernel
+	 * without M3 GPU support leaves it unbound even after the boot loader
+	 * has enabled it.
 	 */
 	agx_mbox: mbox@292408000 {
-		compatible = "apple,t8122-asc-mailbox", "apple,asc-mailbox-v4";
+		compatible = "apple,t8122-agx-asc-mailbox";
 		reg = <0x2 0x92408000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 723 IRQ_TYPE_LEVEL_HIGH>,
