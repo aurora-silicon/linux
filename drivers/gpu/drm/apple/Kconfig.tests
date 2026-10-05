@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+config DRM_APPLE_FABRIC_CORE
+	tristate
+
+config DRM_APPLE_FABRIC_KUNIT_TEST
+	tristate "KUnit tests for the Apple display fabric" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	select DRM_APPLE_FABRIC_CORE
+	default KUNIT_ALL_TESTS
+	help
+	  Test Apple display pipeline allocation, connector ordering and fixed
+	  output priority without DRM devices or Apple display hardware.
+	  The suite covers direct DisplayPort and USB4 tunnel combinations,
+	  immutable tunnel ownership and external display service readiness.

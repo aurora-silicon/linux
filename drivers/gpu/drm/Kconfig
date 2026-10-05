@@ -362,6 +362,8 @@ source "drivers/gpu/drm/xlnx/Kconfig"
 
 endif
 
+source "drivers/gpu/drm/apple/Kconfig.tests"
+
 # Separate option because drm_panel_orientation_quirks.c is shared with fbdev
 config DRM_PANEL_ORIENTATION_QUIRKS
 	tristate

@@ -128,6 +128,7 @@ struct apple_dcp_hw_data {
 struct dcpext_scanout;
 
 struct apple_dcp {
+	struct dcp_fabric_pipeline fabric;
 	struct device *dev;
 	struct platform_device *piodma;
 	struct iommu_domain *iommu_dom;

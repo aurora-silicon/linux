@@ -14,6 +14,7 @@ config DRM_APPLE
 	select VIDEOMODE_HELPERS
 	depends on BACKLIGHT_CLASS_DEVICE
 	select MULTIPLEXER
+	select DRM_APPLE_FABRIC_CORE
 	help
 	  Say Y if you have an Apple Silicon chipset. This includes the
 	  Type-C display fabric and Thunderbolt display routing.

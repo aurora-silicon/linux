@@ -6,6 +6,8 @@
 #include <linux/list.h>
 #include <linux/types.h>
 
+#include "dcp-fabric-core.h"
+
 struct apple_connector;
 struct apple_crtc;
 struct device_node;
@@ -22,6 +24,7 @@ struct apple_dcp;
 struct apple_dcp_typec_port;
 
 struct apple_dcp_typec_route {
+	struct dcp_fabric_route core;
 	struct apple_dcp *dcp;
 	struct apple_dcp_typec_port *port;
 	struct list_head port_link;
