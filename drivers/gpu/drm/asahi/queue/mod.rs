@@ -30,6 +30,7 @@ use crate::gpu::GpuManager;
 use crate::inner_weak_ptr;
 use crate::microseq;
 use crate::module_parameters;
+use crate::stats;
 use crate::util::{
     AnyBitPattern,
     Reader, //
@@ -128,6 +129,7 @@ pub(crate) struct Queue {
     q_comp: Option<SubQueue::ver>,
     fence_ctx: FenceContexts,
     inner: QueueInner::ver,
+    stats: Arc<stats::StatsSnapshot>,
 }
 
 #[versions(AGX)]
@@ -149,6 +151,7 @@ pub(crate) struct QueueInner {
 pub(crate) struct JobFence {
     id: u64,
     pending: AtomicU64,
+    stats: Option<Arc<stats::StatsSnapshot>>,
 }
 
 #[versions(AGX)]
@@ -165,6 +168,9 @@ impl JobFence::ver {
             remain
         );
         if remain == 0 {
+            if let Some(stats) = &self.stats {
+                stats.note_job();
+            }
             mod_pr_debug!("JobFence[{}]: Signaling\n", self.id);
             self.signal();
         }
@@ -440,6 +446,7 @@ impl Queue::ver {
         ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
         ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
         event_manager: Arc<event::EventManager>,
+        stats: Arc<stats::StatsSnapshot>,
         mgr: &buffer::BufferManager::ver,
         id: u64,
         priority: u32,
@@ -491,6 +498,7 @@ impl Queue::ver {
             q_frag: None,
             q_comp: None,
             fence_ctx: FenceContexts::new(1, QUEUE_NAME, QUEUE_CLASS_KEY)?,
+            stats,
             inner: QueueInner::ver {
                 dev: dev.into(),
                 ualloc,
@@ -676,6 +684,7 @@ impl Queue for Queue::ver {
                 JobFence::ver {
                     id,
                     pending: Default::default(),
+                    stats: Some(self.stats.clone()),
                 },
             )?
             .into();
