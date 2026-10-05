@@ -15,7 +15,8 @@ config DRM_APPLE
 	depends on BACKLIGHT_CLASS_DEVICE
 	select MULTIPLEXER
 	help
-	  Say Y if you have an Apple Silicon chipset.
+	  Say Y if you have an Apple Silicon chipset. This includes the
+	  Type-C display fabric and Thunderbolt display routing.
 
 config DRM_APPLE_AUDIO
 	bool "DisplayPort/HDMI Audio support"

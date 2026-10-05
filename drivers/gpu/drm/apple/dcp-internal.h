@@ -15,6 +15,7 @@
 #include <linux/scatterlist.h>
 #include <linux/usb/typec_mux.h>
 
+#include "dcp-fabric.h"
 #include "dptxep.h"
 #include "iomfb.h"
 #include "iomfb-state.h"
@@ -24,34 +25,11 @@
 #include "epic/dpavservep.h"
 
 #define DCP_MAX_PLANES 4
-#define DCP_MAX_TYPEC_ROUTES 4
 
-struct apple_dcp;
 struct apple_dcp_afkep;
-struct apple_dcp_typec_port;
 
-struct apple_dcp_typec_route {
-	struct apple_dcp *dcp;
-	struct apple_dcp_typec_port *port;
-	struct list_head port_link;
-	struct phy *phy;
-	struct mux_control *xbar;
-	struct typec_mux_dev *typec_mux;
-	u32 dptx_phy;
-	u32 mux_index;
-	bool selected;
-	/* crossbar output actually selected: xbar (dpphy) or a Thunderbolt dpin */
-	unsigned int tunnel_dpin;
-	struct mux_control *active_xbar;
-	bool tunnel;
-	/* tunnel: crossbar brought up (at DidChangeLinkConfiguration) */
-	bool xbar_up;
-};
-
-bool dcp_is_typec_output(struct apple_dcp *dcp);
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp);
 void dcp_swap_watchdog_complete(struct apple_dcp *dcp);
-bool dcp_is_usb4_output(struct apple_dcp *dcp);
 void dcp_retry_placeholder_edid(struct apple_dcp *dcp,
 				const struct drm_edid *drm_edid);
 
