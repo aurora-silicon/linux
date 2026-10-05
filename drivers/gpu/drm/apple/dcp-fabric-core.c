@@ -8,6 +8,25 @@
 
 #include "dcp-fabric-core.h"
 
+enum dcp_fabric_wiring dcp_fabric_wiring(bool dpin0, bool dpin1, bool legacy,
+					 unsigned int endpoints)
+{
+	if (dpin0 != dpin1)
+		return DCP_FABRIC_INVALID_WIRING;
+	if (endpoints < 2)
+		return DCP_FABRIC_SINGLE_STREAM;
+	if (dpin0 && dpin1)
+		return DCP_FABRIC_DUAL_NAMED;
+	return legacy ? DCP_FABRIC_DUAL_LEGACY : DCP_FABRIC_SINGLE_STREAM;
+}
+EXPORT_SYMBOL_GPL(dcp_fabric_wiring);
+
+bool dcp_fabric_t6020_flow(bool usb4, bool soc_support, bool route_wired)
+{
+	return usb4 && soc_support && route_wired;
+}
+EXPORT_SYMBOL_GPL(dcp_fabric_t6020_flow);
+
 int dcp_fabric_tunnel_request(const struct dcp_fabric_port *ports,
 			      unsigned long key, unsigned int dpin,
 			      const struct dcp_fabric_port **found)

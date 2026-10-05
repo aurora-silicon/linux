@@ -60,6 +60,17 @@ struct dcp_fabric_policy {
 	bool dual_stream;
 };
 
+enum dcp_fabric_wiring {
+	DCP_FABRIC_SINGLE_STREAM,
+	DCP_FABRIC_DUAL_NAMED,
+	DCP_FABRIC_DUAL_LEGACY,
+	DCP_FABRIC_INVALID_WIRING,
+};
+
+enum dcp_fabric_wiring dcp_fabric_wiring(bool dpin0, bool dpin1, bool legacy,
+					 unsigned int endpoints);
+bool dcp_fabric_t6020_flow(bool usb4, bool soc_support, bool route_wired);
+
 enum dcp_fabric_capacity_action {
 	DCP_FABRIC_PROMOTE,
 	DCP_FABRIC_REBALANCE,

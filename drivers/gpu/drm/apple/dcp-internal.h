@@ -122,6 +122,7 @@ struct dcp_panel {
 
 struct apple_dcp_hw_data {
 	u32 num_dptx_ports;
+	bool t6020_tunnel_flow;
 };
 
 /* TODO: move IOMFB members to its own struct */

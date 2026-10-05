@@ -30,6 +30,8 @@ struct apple_dcp_typec_route {
 	struct list_head port_link;
 	struct phy *phy;
 	struct mux_control *xbar;
+	struct mux_control *dpin[2];
+	bool dual_stream;
 	struct typec_mux_dev *typec_mux;
 	u32 dptx_phy;
 	u32 mux_index;
@@ -44,6 +46,7 @@ struct apple_dcp_typec_route {
 
 bool dcp_is_typec_output(struct apple_dcp *dcp);
 bool dcp_is_usb4_output(struct apple_dcp *dcp);
+bool dcp_uses_t6020_tunnel_flow(struct apple_dcp *dcp);
 
 bool dcp_has_typec_routes(struct platform_device *pdev);
 

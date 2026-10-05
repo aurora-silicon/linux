@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright 2021 Alyssa Rosenzweig */
 
+#include <linux/atomic.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/jiffies.h>
@@ -57,6 +58,8 @@ struct apple_dcp_typec_port {
 
 static DEFINE_MUTEX(dcp_typec_fabric_lock);
 static LIST_HEAD(dcp_typec_ports);
+/* Current DTs wire the same stream capacity on every physical port. */
+static atomic_t dcp_dual_stream_routes = ATOMIC_INIT(0);
 
 static enum dcp_fabric_presence_state dcp_hdmi_presence(struct apple_dcp *dcp);
 static void dcp_hdmi_update_locked(struct apple_dcp *dcp);
@@ -70,6 +73,16 @@ bool dcp_is_typec_output(struct apple_dcp *dcp)
 bool dcp_is_usb4_output(struct apple_dcp *dcp)
 {
 	return dcp->active_typec_route && dcp->active_typec_route->tunnel;
+}
+
+/* SoC flow support and board wiring are separate qualifications. */
+bool dcp_uses_t6020_tunnel_flow(struct apple_dcp *dcp)
+{
+	struct apple_dcp_typec_route *route = READ_ONCE(dcp->active_typec_route);
+
+	return dcp_fabric_t6020_flow(dcp_is_usb4_output(dcp),
+				     dcp->hw.t6020_tunnel_flow,
+				     route && route->dual_stream);
 }
 
 static bool dcp_typec_route_is_dp(const struct typec_mux_state *state)
@@ -121,7 +134,7 @@ static bool dcp_typec_route_available(struct apple_dcp_typec_route *route)
  */
 bool dcp_typec_dual_stream(void)
 {
-	return apple_dp_tunnel_t602x();
+	return atomic_read(&dcp_dual_stream_routes) > 0;
 }
 
 bool dcp_is_typec_only(struct platform_device *pdev)
@@ -1220,7 +1233,7 @@ static int dcp_tunnel_dpin_locked(struct apple_dcp *dcp, bool active)
 /*
  * T6030 drives the DP IN outputs of its T6020-style crossbar directly: the mux
  * selection only routes, and the link is brought up separately. The M2 Pro and
- * M2 Max laptops share the crossbar but take the apple_dp_tunnel_t602x() path.
+ * M2 Max laptops share the layout but qualify their T6020 flow separately.
  */
 static bool dcp_t6030_dpin_route(struct apple_dcp_typec_route *route)
 {
@@ -1488,13 +1501,16 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
 		}
 	}
 
-	/* The route's crossbar control is dpphy (0); dpin0/dpin1 are 1/2. */
-	if (best->xbar != &best->xbar->chip->mux[0] ||
-	    best->xbar->chip->controllers < 3) {
-		ret = -EOPNOTSUPP;
-		goto err_reorder;
+	ctl = best->dpin[dpin];
+	if (!ctl) {
+		/* Legacy DT ABI: unnamed DPIN controls share the DP-alt chip. */
+		if (best->xbar != &best->xbar->chip->mux[0] ||
+		    best->xbar->chip->controllers < 3) {
+			ret = -EOPNOTSUPP;
+			goto err_reorder;
+		}
+		ctl = &best->xbar->chip->mux[1 + dpin];
 	}
-	ctl = &best->xbar->chip->mux[1 + dpin];
 
 	dcp = best->dcp;
 	scoped_guard(mutex, &dcp->tb_lock) {
@@ -1717,11 +1733,76 @@ static void dcp_typec_route_unregister(void *data)
 	}
 	port->hpd = !!(port->owner || port->secondary_owner);
 	list_del(&route->port_link);
+	if (route->dual_stream)
+		atomic_dec(&dcp_dual_stream_routes);
 	if (list_empty(&port->routes)) {
 		list_del(&port->link);
 		of_node_put(port->connector_np);
 		kfree(port);
 	}
+}
+
+static unsigned int dcp_typec_route_endpoints(struct device_node *connector_np)
+{
+	struct device_node *port __free(device_node) =
+		of_graph_get_port_by_id(connector_np, 3);
+	unsigned int count = 0;
+
+	if (!port)
+		return 0;
+	for_each_of_graph_port_endpoint(port, endpoint)
+		count++;
+	return count;
+}
+
+/* Look up capability controls without selecting or changing any mux. */
+static int dcp_typec_route_wiring(struct apple_dcp_typec_route *route,
+				  struct device_node *connector_np, unsigned int index)
+{
+	struct device *dev = route->dcp->dev;
+	struct mux_control *legacy = NULL;
+	enum dcp_fabric_wiring wiring;
+	char name[24];
+	unsigned int i;
+	bool named[2];
+
+	for (i = 0; i < 2; i++) {
+		snprintf(name, sizeof(name), "typec%u-dpin%u", index, i);
+		named[i] = of_property_match_string(dev->of_node, "mux-control-names", name) >= 0;
+		if (!named[i])
+			continue;
+		route->dpin[i] = devm_mux_control_get(dev, name);
+		if (IS_ERR(route->dpin[i]))
+			return PTR_ERR(route->dpin[i]);
+		if (route->xbar != &route->xbar->chip->mux[0] ||
+		    route->xbar->chip->controllers < 3 ||
+		    route->dpin[i] != &route->xbar->chip->mux[1 + i])
+			return -EINVAL;
+	}
+	if (!named[0] && !named[1]) {
+		snprintf(name, sizeof(name), "typec%u-usb4", index);
+		if (of_property_match_string(dev->of_node, "mux-control-names", name) >= 0) {
+			legacy = devm_mux_control_get(dev, name);
+			if (IS_ERR(legacy))
+				return PTR_ERR(legacy);
+			if (route->xbar != &route->xbar->chip->mux[0] ||
+			    route->xbar->chip->controllers < 3 ||
+			    legacy != &route->xbar->chip->mux[1])
+				return -EINVAL;
+		}
+	}
+	wiring = dcp_fabric_wiring(named[0], named[1], !!legacy,
+				   dcp_typec_route_endpoints(connector_np));
+	if (wiring == DCP_FABRIC_INVALID_WIRING)
+		return -EINVAL;
+	route->dual_stream = wiring != DCP_FABRIC_SINGLE_STREAM;
+	if (wiring == DCP_FABRIC_DUAL_LEGACY) {
+		/* Old j414/j416 ESP DTBs name cell 1 but never name cell 2. */
+		route->dpin[0] = legacy;
+		route->dpin[1] = &route->xbar->chip->mux[2];
+		dev_warn_once(dev, "legacy typecN-usb4 DPIN wiring; update the device tree\n");
+	}
+	return 0;
 }
 
 int dcp_register_typec_routes(struct apple_dcp *dcp)
@@ -1802,10 +1883,19 @@ int dcp_register_typec_routes(struct apple_dcp *dcp)
 					     "%pOF: missing Type-C connector\n",
 					     route_np);
 
+		ret = dcp_typec_route_wiring(route, connector_np, route_index);
+		if (ret) {
+			of_node_put(connector_np);
+			return dev_err_probe(dev, ret, "%pOF: invalid DPIN wiring\n", route_np);
+		}
+
 		mutex_lock(&dcp_typec_fabric_lock);
 		route->port = dcp_typec_port_get(connector_np);
-		if (route->port)
+		if (route->port) {
 			list_add_tail(&route->port_link, &route->port->routes);
+			if (route->dual_stream)
+				atomic_inc(&dcp_dual_stream_routes);
+		}
 		mutex_unlock(&dcp_typec_fabric_lock);
 		if (!route->port)
 			return -ENOMEM;
@@ -1818,6 +1908,8 @@ int dcp_register_typec_routes(struct apple_dcp *dcp)
 		if (IS_ERR(route->typec_mux)) {
 			mutex_lock(&dcp_typec_fabric_lock);
 			list_del(&route->port_link);
+			if (route->dual_stream)
+				atomic_dec(&dcp_dual_stream_routes);
 			if (list_empty(&route->port->routes)) {
 				list_del(&route->port->link);
 				of_node_put(route->port->connector_np);

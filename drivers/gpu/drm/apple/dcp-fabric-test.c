@@ -673,6 +673,61 @@ static void fabric_masked_edge_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, presence.deadline, 0UL);
 }
 
+struct fabric_wiring_case {
+	const char *name;
+	bool dpin0;
+	bool dpin1;
+	bool legacy;
+	unsigned int endpoints;
+	bool soc_support;
+	enum dcp_fabric_wiring expected;
+	bool flow;
+};
+
+static const struct fabric_wiring_case wiring_cases[] = {
+	{ "M1_base", false, false, false, 1, false, DCP_FABRIC_SINGLE_STREAM, false },
+	{ "M1_pro_j314_two_candidates", false, false, false, 2, false,
+	  DCP_FABRIC_SINGLE_STREAM, false },
+	{ "M1_ultra", false, false, false, 1, false, DCP_FABRIC_SINGLE_STREAM, false },
+	{ "M2_base", false, false, false, 1, false, DCP_FABRIC_SINGLE_STREAM, false },
+	{ "M2_desktop", false, false, false, 1, true, DCP_FABRIC_SINGLE_STREAM, false },
+	{ "M2_j414_new_dtb", true, true, false, 2, true, DCP_FABRIC_DUAL_NAMED, true },
+	{ "M2_j416_new_dtb", true, true, false, 2, true, DCP_FABRIC_DUAL_NAMED, true },
+	{ "M2_j414_old_esp_dtb", false, false, true, 2, true, DCP_FABRIC_DUAL_LEGACY, true },
+	{ "M2_j416_old_esp_dtb", false, false, true, 2, true, DCP_FABRIC_DUAL_LEGACY, true },
+	{ "M3_shared_crossbar_single", false, false, false, 1, false,
+	  DCP_FABRIC_SINGLE_STREAM, false },
+	{ "named_wins_over_legacy", true, true, true, 2, true, DCP_FABRIC_DUAL_NAMED, true },
+	{ "dpin0_only_invalid", true, false, false, 2, true, DCP_FABRIC_INVALID_WIRING, false },
+	{ "dpin1_only_invalid", false, true, true, 2, true, DCP_FABRIC_INVALID_WIRING, false },
+	{ "no_graph", true, true, false, 0, true, DCP_FABRIC_SINGLE_STREAM, false },
+	{ "one_candidate_named", true, true, false, 1, true, DCP_FABRIC_SINGLE_STREAM, false },
+	{ "one_candidate_legacy", false, false, true, 1, true, DCP_FABRIC_SINGLE_STREAM, false },
+	{ "future_wiring_cannot_enable_soc_flow", true, true, false, 2, false,
+	  DCP_FABRIC_DUAL_NAMED, false },
+};
+
+static void fabric_wiring_desc(const struct fabric_wiring_case *row, char *desc)
+{
+	strscpy(desc, row->name, KUNIT_PARAM_DESC_SIZE);
+}
+
+KUNIT_ARRAY_PARAM(fabric_wiring, wiring_cases, fabric_wiring_desc);
+
+static void fabric_wiring_test(struct kunit *test)
+{
+	const struct fabric_wiring_case *row = test->param_value;
+	enum dcp_fabric_wiring wiring;
+	bool dual;
+
+	wiring = dcp_fabric_wiring(row->dpin0, row->dpin1, row->legacy, row->endpoints);
+	KUNIT_EXPECT_EQ(test, wiring, row->expected);
+	dual = wiring == DCP_FABRIC_DUAL_NAMED || wiring == DCP_FABRIC_DUAL_LEGACY;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_t6020_flow(true, row->soc_support, dual), row->flow);
+	/* SoC and wiring qualification must never change HDMI or DP-alt flow. */
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_t6020_flow(false, row->soc_support, dual));
+}
+
 static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE_PARAM(fabric_scenario_test, fabric_scenario_gen_params),
 	KUNIT_CASE(fabric_dark_tunnel_test),
@@ -681,6 +736,7 @@ static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE(fabric_unbound_and_mask_test),
 	KUNIT_CASE(fabric_presence_wrap_test),
 	KUNIT_CASE(fabric_masked_edge_test),
+	KUNIT_CASE_PARAM(fabric_wiring_test, fabric_wiring_gen_params),
 	{}
 };
 

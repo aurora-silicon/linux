@@ -102,9 +102,12 @@
 	mux-controls = <&atcphy3_xbar 0>, <&atcphy0_xbar 0>,
 		       <&atcphy1_xbar 0>, <&atcphy2_xbar 0>,
 		       <&atcphy0_xbar 1>, <&atcphy1_xbar 1>,
-		       <&atcphy2_xbar 1>;
+		       <&atcphy2_xbar 1>,
+		       <&atcphy0_xbar 2>, <&atcphy1_xbar 2>,
+		       <&atcphy2_xbar 2>;
 	mux-control-names = "dp-xbar", "typec0", "typec1", "typec2",
-			    "typec0-usb4", "typec1-usb4", "typec2-usb4";
+			    "typec0-dpin0", "typec1-dpin0", "typec2-dpin0",
+			    "typec0-dpin1", "typec1-dpin1", "typec2-dpin1";
 	mux-index = <0>;
 	apple,dptx-phy = <3>;
 	apple,typec-mux-indices = <0 0 0>;
@@ -183,9 +186,12 @@
 	mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>,
 		       <&atcphy2_xbar 0>,
 		       <&atcphy0_xbar 1>, <&atcphy1_xbar 1>,
-		       <&atcphy2_xbar 1>;
+		       <&atcphy2_xbar 1>,
+		       <&atcphy0_xbar 2>, <&atcphy1_xbar 2>,
+		       <&atcphy2_xbar 2>;
 	mux-control-names = "typec0", "typec1", "typec2",
-			    "typec0-usb4", "typec1-usb4", "typec2-usb4";
+			    "typec0-dpin0", "typec1-dpin0", "typec2-dpin0",
+			    "typec0-dpin1", "typec1-dpin1", "typec2-dpin1";
 	apple,typec-mux-indices = <2 2 2>;
 	apple,typec-dptx-phys = <0 1 2>;
 

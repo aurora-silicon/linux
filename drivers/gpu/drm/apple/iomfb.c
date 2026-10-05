@@ -313,7 +313,7 @@ void dcp_hotplug(struct work_struct *work)
 	 * flush, or the CRTC gets no signal.
 	 */
 	if (connector->base.state && !READ_ONCE(dcp->mode_state.valid) && connector->connected &&
-	    !(dcp_is_usb4_output(dcp) && apple_dp_tunnel_t602x())) {
+	    !(dcp_uses_t6020_tunnel_flow(dcp))) {
 		drm_connector_set_link_status_property(&connector->base,
 						       DRM_MODE_LINK_STATUS_BAD);
 
