@@ -23,16 +23,16 @@ Description:
 
 		Access: Read-only. Owner-readable (mode 0444).
 
-		busy_ns    cumulative u64; nanoseconds the firmware has reported
-		           itself busy since boot. Wraps at u64::MAX like any
-		           u64 counter (at nanosecond granularity, after about
-		           584 years of accumulated busy time).
-		           Derived from successive FwBusy timestamps; on T6001
-		           (M1 Max, 13.5) the firmware timestamp unit is
-		           nanoseconds. Other SoCs must validate the unit
-		           against a controlled load before trusting the
-		           magnitude. Validated against a controlled MLX
-		           matmul loop (idle: flat; full load: >50% util1).
+		busy_ns    cumulative u64; utilization-weighted busy time since
+		           boot: each Utilization message window contributes its
+		           duration scaled by the busiest subqueue percentage.
+		           Monotonic; bounded by elapsed wall time regardless of
+		           the firmware timestamp tick rate. MEASURED on T6021
+		           (M2 Max, 13.5): idle desktop fraction ~0.01, saturated
+		           4096^2 fp16 matmul fraction ~1.0 (util1..4 = 100).
+		           T6001 shares the message format (fw 13.5); the same
+		           idle-vs-matmul check must be run there before the
+		           absolute-magnitude (ns) claim is made.
 
 		jobs       u64; cumulative completed submissions since boot.
 		           Counted on the host at submission completion (when

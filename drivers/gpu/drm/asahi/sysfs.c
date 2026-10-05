@@ -47,7 +47,6 @@ struct asahi_stats_snapshot {
 	u32 temperature_scale;
 	u32 temperature_tmin;
 	u32 temperature_tmax;
-	u64 last_busy_ts;
 	u64 busy_ns;
 	u64 jobs;
 };
@@ -120,10 +119,9 @@ int asahi_sysfs_register(struct device *dev, int export_enabled)
 		return -ENODEV;
 
 	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, pstate) != 16);
-	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, last_busy_ts) != 40);
-	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, busy_ns) != 48);
-	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, jobs) != 56);
-	BUILD_BUG_ON(sizeof(struct asahi_stats_snapshot) != 64);
+	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, busy_ns) != 40);
+	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, jobs) != 48);
+	BUILD_BUG_ON(sizeof(struct asahi_stats_snapshot) != 56);
 
 	WRITE_ONCE(asahi_stats_export_enabled, export_enabled);
 

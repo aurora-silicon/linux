@@ -21,11 +21,11 @@
 //! - `avg_power_mw`: average power in milliwatts from `AvgPower` (firmware
 //!   field is u32 — units not validated for every chip rev; treat as raw).
 //! - `temperature`: raw `Temperature` value, scale, tmin, tmax.
-//! - `busy_ns`: cumulative nanoseconds the firmware reports itself as busy,
-//!   derived from successive `FwBusy { busy, timestamp }` deltas. Saturates
-//!   at u64::MAX.
-//! - `jobs`: completed submissions since boot. Currently always 0 on T6001;
-//!   reserved for the ring-event submission-counter landing.
+//! - `busy_ns`: cumulative utilization-weighted busy time, derived from
+//!   successive `Utilization` windows (busiest subqueue percentage x window
+//!   duration). Monotonic and bounded by elapsed time. Saturates at u64::MAX.
+//! - `jobs`: completed submissions since boot, counted at submission
+//!   completion (`JobFence::command_complete`).
 //!
 //! This module is read-only with respect to scheduling or power behaviour:
 //! the firmware already sends the messages, the channel already polls them,
@@ -52,9 +52,7 @@ pub(crate) struct StatsSnapshot {
     pub(crate) temperature_scale: AtomicU32,
     pub(crate) temperature_tmin: AtomicU32,
     pub(crate) temperature_tmax: AtomicU32,
-    /// Last observed firmware busy timestamp (monotonic, firmware units).
-    pub(crate) last_busy_ts: AtomicU64,
-    /// Cumulative nanoseconds the firmware reports itself as busy.
+    /// Cumulative utilization-weighted busy time.
     pub(crate) busy_ns: AtomicU64,
     /// Completed submissions since boot, counted at fence signal in
     /// `JobFence::command_complete` when the last command of a submission

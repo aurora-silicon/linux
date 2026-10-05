@@ -594,6 +594,9 @@ pub(crate) struct StatsChannel {
     dev: AsahiDevRef,
     ch: RxChannel<ChannelState, RawStatsMsg::ver>,
     snap: Arc<crate::stats::StatsSnapshot>,
+    /// Last `Utilization` message timestamp (raw firmware units), for
+    /// utilization-weighted `busy_ns` integration.
+    last_util_ts: u64,
 }
 
 #[versions(AGX)]
@@ -608,6 +611,7 @@ impl StatsChannel::ver {
             dev: dev.into(),
             ch: RxChannel::<ChannelState, RawStatsMsg::ver>::new(alloc, 0x100)?,
             snap,
+            last_util_ts: 0,
         })
     }
 
@@ -634,16 +638,40 @@ impl StatsChannel::ver {
                         // sent the message, we only keep what it said.
                         match &msg {
                             StatsMsg::ver::Utilization {
+                                timestamp,
                                 util1,
                                 util2,
                                 util3,
                                 util4,
-                                ..
                             } => {
                                 self.snap.util1.store(*util1, Ordering::Relaxed);
                                 self.snap.util2.store(*util2, Ordering::Relaxed);
                                 self.snap.util3.store(*util3, Ordering::Relaxed);
                                 self.snap.util4.store(*util4, Ordering::Relaxed);
+                                // busy_ns: utilization-weighted busy time. Each
+                                // Utilization window contributes its duration
+                                // scaled by the busiest subqueue's percentage.
+                                // MEASURED on T6021 (round-3 window): util1..4
+                                // read 100 across a saturated 30 s matmul and
+                                // 0-2 on an idle desktop, while FwBusy
+                                // timestamp deltas (the prior producer)
+                                // covered 0.17% of that matmul. The busy
+                                // fraction is invariant to the firmware tick
+                                // rate; divide before scaling to avoid u64
+                                // overflow near u64::MAX timestamps.
+                                let util = [*util1, *util2, *util3, *util4]
+                                    .into_iter()
+                                    .max()
+                                    .unwrap_or(0)
+                                    .min(100) as u64;
+                                let ts = timestamp.0;
+                                if self.last_util_ts != 0 && ts > self.last_util_ts {
+                                    self.snap.busy_ns.fetch_add(
+                                        (ts - self.last_util_ts) / 100 * util,
+                                        Ordering::Relaxed,
+                                    );
+                                }
+                                self.last_util_ts = ts;
                             }
                             StatsMsg::ver::PowerState { pstate, .. } => {
                                 self.snap.pstate.store(*pstate, Ordering::Relaxed);
@@ -658,18 +686,6 @@ impl StatsChannel::ver {
                                     .temperature_raw
                                     .store(*raw_value, Ordering::Relaxed);
                                 self.snap.temperature_scale.store(*scale, Ordering::Relaxed);
-                            }
-                            StatsMsg::ver::FwBusy { timestamp, .. } => {
-                                // Integrate successive FwBusy timestamps into
-                                // the cumulative busy_ns counter. The firmware
-                                // timestamp unit is nanoseconds on T6001
-                                // (13.5); other SoCs must validate the unit
-                                // against a controlled load.
-                                let ts = timestamp.0;
-                                let prev = self.snap.last_busy_ts.swap(ts, Ordering::Relaxed);
-                                if prev != 0 && ts >= prev {
-                                    self.snap.busy_ns.fetch_add(ts - prev, Ordering::Relaxed);
-                                }
                             }
                             _ => {}
                         }
