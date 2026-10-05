@@ -59,8 +59,10 @@
 			status = "disabled";
 		};
 
-		/* G15: iBoot's second-level table of the firmware TTBR1 tree (ADT gfx-shared-l2-region);
-		 * must be in the linear map like uat-pagetables. m1n1 fills reg and enables it. */
+		/*
+		 * G15 second-level TTBR1 table: keep it in the linear map with
+		 * uat-pagetables. The bootloader fills reg and enables this node.
+		 */
 		uat_pagetables_l2: uat-pagetables-l2 {
 			reg = <0 0 0 0>;
 			status = "disabled";

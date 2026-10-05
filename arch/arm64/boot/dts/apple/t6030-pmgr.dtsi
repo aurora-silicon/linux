@@ -1152,7 +1152,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "apcie_phy_sw";
-		apple,always-on; /* macOS does not turn this off */
+		apple,always-on; /* Keep the PCIe PHY power domain enabled. */
 	};
 
 	ps_sep: power-controller@c00 {
