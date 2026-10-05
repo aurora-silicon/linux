@@ -2546,6 +2546,30 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 	return dcp_dptx_disconnect(dcp, port);
 }
 
+/*
+ * A hybrid let go while its HDMI port was empty was parked on a Type-C PHY
+ * (see dcp_typec_route_deactivate()).  Point it at the HDMI output again
+ * before connecting a display that has arrived there.
+ */
+static int dcp_fixed_output_select(struct apple_dcp *dcp)
+{
+	int ret;
+
+	lockdep_assert_held(&dcp_typec_fabric_lock);
+
+	if (!dcp->fixed_phy || dcp->active_typec_route)
+		return 0;
+	dcp->phy = dcp->fixed_phy;
+	dcp->dptx_phy = dcp->fixed_dptx_phy;
+	if (dcp->xbar && !dcp->fixed_route_selected) {
+		ret = mux_control_select(dcp->xbar, dcp->fixed_mux_index);
+		if (ret)
+			return ret;
+		dcp->fixed_route_selected = true;
+	}
+	return 0;
+}
+
 static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
 {
 	struct apple_dcp *dcp = data;
@@ -2592,8 +2616,14 @@ static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
 		dev_info(dcp->dev, "DP2HDMI HPD irq, 500ms debounce: connected:%d\n", connected);
 	}
 
-	if (connected)
-		dcp_dptx_connect(dcp, 0);
+	if (connected) {
+		int ret = dcp_fixed_output_select(dcp);
+
+		if (ret)
+			dev_err(dcp->dev, "could not select the HDMI output: %d\n", ret);
+		else
+			dcp_dptx_connect(dcp, 0);
+	}
 
 	return IRQ_HANDLED;
 }
