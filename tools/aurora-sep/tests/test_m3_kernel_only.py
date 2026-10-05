@@ -66,7 +66,7 @@ AURORA_SEP_SOURCE_ONLY=1 source '{INSTALLER}'
 sudo=""
 DT='{self.dt}'
 UPDATE_M1N1_CONF='{self.conf}'
-m3_bootbin() {{ [[ -f '{self.boot}' ]] && echo '{self.boot}'; }}
+esp_bootbin() {{ [[ -f '{self.boot}' ]] && echo '{self.boot}'; }}
 {body}
 """
         proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
@@ -152,8 +152,6 @@ m3_bootbin() {{ [[ -f '{self.boot}' ]] && echo '{self.boot}'; }}
         state.mkdir()
         proc = self.run_sh(
             f"STATE='{state}'\n"
-            # m1n1_update writes /etc/default/update-m1n1 itself; point it here.
-            f"eval \"$(declare -f m1n1_update | command sed 's|conf=/etc/default/update-m1n1|conf={self.conf}|')\"\n"
             "m1n1_update", check=False)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("was not rebuilt", proc.stderr)
