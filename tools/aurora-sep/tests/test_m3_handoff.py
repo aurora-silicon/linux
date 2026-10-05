@@ -258,8 +258,11 @@ esp_bootbin() {{ [[ -f '{self.esp}/m1n1/boot.bin' ]] && echo '{self.esp}/m1n1/bo
             self.skipTest("bsdtar and zstd are needed to build a fixture package")
         root = self.tmp / "pkgroot"
         (root / "usr/lib/asahi-boot").mkdir(parents=True)
+        # Strings near the start of a large binary, as in the real 3.8 MB m1n1:
+        # a reader that stops early must not fail the check under pipefail.
         (root / "usr/lib/asahi-boot/m1n1.bin").write_bytes(
             b"\x7fm1n1\x00" + b"\x00".join(s.encode() for s in strings) + b"\x00tail"
+            + bytes(range(256)) * 4096
         )
         pkg = self.tmp / "m1n1-aurora-test-1-aarch64.pkg.tar.zst"
         subprocess.run(["bsdtar", "--zstd", "-cf", str(pkg), "-C", str(root), "usr"], check=True)

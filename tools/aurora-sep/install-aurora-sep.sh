@@ -381,9 +381,11 @@ m3_stub_problem() {
 m1n1_pkg_has_handoff() {
   local bin s rc=0
   bin=$(mktemp)
-  bsdtar -xOf "$1" usr/lib/asahi-boot/m1n1.bin >"$bin" 2>/dev/null || rc=1
+  # One string per line, in a file: grep -q on a pipe would stop reading early
+  # and fail the 3.8 MB tr with SIGPIPE under pipefail.
+  { bsdtar -xOf "$1" usr/lib/asahi-boot/m1n1.bin | tr '\0' '\n' >"$bin"; } 2>/dev/null || rc=1
   for s in asahi,t6030-gpu asahi,t6030-dcp asahi,t6030-dcpext; do
-    ((rc == 0)) && ! tr '\0' '\n' <"$bin" | grep -qaxF "$s" && rc=1
+    ((rc == 0)) && ! grep -qaxF "$s" "$bin" && rc=1
   done
   rm -f "$bin"
   return "$rc"

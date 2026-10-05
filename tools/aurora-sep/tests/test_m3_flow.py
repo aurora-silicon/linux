@@ -152,7 +152,7 @@ class M3FlowTest(unittest.TestCase):
             root = self.tmp / ("root-" + name)
             (root / "usr/lib/asahi-boot").mkdir(parents=True)
             (root / "usr/lib/asahi-boot/m1n1.bin").write_bytes(
-                b"m1n1\0" + b"\0".join(s.encode() for s in strings) + b"\0end")
+                b"m1n1\0" + b"\0".join(s.encode() for s in strings) + b"\0end" + bytes(range(256)) * 4096)
             subprocess.run(["bsdtar", "--zstd", "-cf", str(path), "-C", str(root), "usr"], check=True)
         self.shas[name] = hashlib.sha256(path.read_bytes()).hexdigest()
 
