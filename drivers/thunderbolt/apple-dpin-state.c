@@ -11,6 +11,7 @@ const struct apple_dpin_policy apple_dpin_m1 = {
 	.flow = APPLE_DPIN_CHANGED,
 	.capacity_retry = true,
 	.setup_irqs = true,
+	.defer_new_bringup = true,
 	.host_policy = TB_HOST_DP_NOTIFY,
 };
 
@@ -46,6 +47,18 @@ bool apple_dpin_readiness_retry(bool active, int result, unsigned int tries)
 					  APPLE_DP_CONNECT_TRIES);
 }
 
+bool apple_dpin_admission_blocked(const struct apple_dpin_state *s,
+				  const struct apple_dpin_policy *p, bool admitted)
+{
+	return p->defer_new_bringup && s->paused && !admitted;
+}
+
+bool apple_dpin_awaits_display(const struct apple_dpin_state *s,
+			       const struct apple_dpin_policy *p)
+{
+	return s->alive && (s->waiting || (p->defer_new_bringup && s->deferred_first));
+}
+
 unsigned int apple_dpin_step(struct apple_dpin_state *s,
 			     const struct apple_dpin_policy *p,
 			     enum apple_dpin_event event, bool mapped, int result)
@@ -59,14 +72,23 @@ unsigned int apple_dpin_step(struct apple_dpin_state *s,
 		fallthrough;
 	case APPLE_DPIN_UP:
 		s->alive = true;
+		if (p->defer_new_bringup && s->paused && (!s->handed || s->rearm) &&
+		    !s->waiting) {
+			s->deferred_first = true;
+			s->replay_queued = false;
+		}
 		s->phase = s->handed ? APPLE_DPIN_HANDED : APPLE_DPIN_ACTIVATING;
 		return APPLE_DPIN_QUEUE;
 	case APPLE_DPIN_DOWN:
 		s->alive = false;
+		s->deferred_first = false;
+		s->replay_queued = false;
 		s->phase = s->handed || mapped ? APPLE_DPIN_TEARDOWN : APPLE_DPIN_IDLE;
 		return APPLE_DPIN_QUEUE;
 	case APPLE_DPIN_WORK:
 		if (!s->alive) {
+			s->deferred_first = false;
+			s->replay_queued = false;
 			s->rearm = false;
 			s->waiting = false;
 			s->phase = s->handed || mapped ? APPLE_DPIN_TEARDOWN :
@@ -84,10 +106,20 @@ unsigned int apple_dpin_step(struct apple_dpin_state *s,
 			s->phase = APPLE_DPIN_HANDED;
 			return 0;
 		}
-		/* Preserve legacy event bring-up while paused; #29 is separate. */
+		if (apple_dpin_admission_blocked(s, p, false)) {
+			if (!s->waiting)
+				s->deferred_first = true;
+			s->replay_queued = false;
+			s->phase = s->waiting ? APPLE_DPIN_WAITING_PIPELINE :
+						APPLE_DPIN_SLEEP_DEFERRED;
+			return 0;
+		}
+		/* Actual map/IRQ admission clears deferral, after WORK drops its lock. */
 		s->phase = APPLE_DPIN_ACTIVATING;
 		return APPLE_DPIN_ATTACH;
 	case APPLE_DPIN_RESULT:
+		s->deferred_first = false;
+		s->replay_queued = false;
 		if (!result) {
 			s->handed = true;
 			if (s->waiting)
@@ -126,10 +158,41 @@ unsigned int apple_dpin_step(struct apple_dpin_state *s,
 		return 0;
 	case APPLE_DPIN_PAUSE:
 		s->paused = true;
+		if (p->defer_new_bringup && s->alive && !s->handed && !s->waiting &&
+		    s->phase == APPLE_DPIN_ACTIVATING)
+			s->deferred_first = true;
 		return 0;
 	case APPLE_DPIN_RESUME:
 		s->paused = false;
+		if (p->defer_new_bringup && s->alive && s->deferred_first && !s->replay_queued) {
+			s->replay_queued = true;
+			s->phase = APPLE_DPIN_ACTIVATING;
+			return APPLE_DPIN_QUEUE;
+		}
 		return s->alive && s->waiting ? APPLE_DPIN_ARM_RETRY : 0;
+	case APPLE_DPIN_DEFER_FIRST:
+		if (!s->alive)
+			return APPLE_DPIN_AGAIN;
+		if (!s->waiting)
+			s->deferred_first = true;
+		s->replay_queued = false;
+		s->phase = s->waiting ? APPLE_DPIN_WAITING_PIPELINE :
+					APPLE_DPIN_SLEEP_DEFERRED;
+		/* Complete may have raced this already-admitted worker. */
+		if (!s->paused)
+			return s->waiting ? APPLE_DPIN_ARM_RETRY : APPLE_DPIN_AGAIN;
+		return 0;
+	case APPLE_DPIN_ADMITTED:
+		s->phase = APPLE_DPIN_CONNECTING;
+		s->deferred_first = false;
+		s->replay_queued = false;
+		return 0;
+	case APPLE_DPIN_END_PM_GATE:
+		/* The owning NHI has stopped producers and drained the old workers. */
+		s->paused = false;
+		s->deferred_first = false;
+		s->replay_queued = false;
+		return 0;
 	}
 	return 0;
 }

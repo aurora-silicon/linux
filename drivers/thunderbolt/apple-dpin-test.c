@@ -65,6 +65,11 @@ static unsigned int legacy_step(struct legacy_dpin *c, bool can_wait,
 		if (c->handed)
 			return 0;
 		return APPLE_DPIN_ATTACH;
+	case APPLE_DPIN_ADMITTED:
+	case APPLE_DPIN_END_PM_GATE:
+	case APPLE_DPIN_DEFER_FIRST:
+		/* No such outcome existed in the baseline. */
+		return 0;
 	case APPLE_DPIN_RESULT:
 		if (ret) {
 			wait = (ret == -EBUSY || ret == -EAGAIN) && can_wait;
@@ -126,9 +131,11 @@ static void compare_transition(struct kunit *test,
 		.rearm = s.rearm, .waiting = s.waiting, .paused = s.paused,
 	};
 	unsigned int expected, actual;
+	struct apple_dpin_policy baseline = *profile;
 
+	baseline.defer_new_bringup = false;
 	expected = legacy_step(&c, profile->capacity_retry, event, mapped, result);
-	actual = apple_dpin_step(&s, profile, event, mapped, result);
+	actual = apple_dpin_step(&s, &baseline, event, mapped, result);
 	KUNIT_ASSERT_EQ_MSG(test, actual, expected, "mask=%u mapped=%u event=%u ret=%d",
 			    mask, mapped, event, result);
 	expect_legacy_fields(test, &s, &c);
@@ -167,12 +174,15 @@ static void run_trace(struct kunit *test, const struct apple_dpin_policy *profil
 {
 	struct apple_dpin_state state = {};
 	struct legacy_dpin legacy = {};
+	struct apple_dpin_policy baseline = *profile;
 	unsigned int i, actual, expected;
+
+	baseline.defer_new_bringup = false;
 
 	for (i = 0; i < count; i++) {
 		expected = legacy_step(&legacy, profile->capacity_retry,
 				       trace[i].event, trace[i].mapped, trace[i].result);
-		actual = apple_dpin_step(&state, profile, trace[i].event,
+		actual = apple_dpin_step(&state, &baseline, trace[i].event,
 					 trace[i].mapped, trace[i].result);
 		KUNIT_ASSERT_EQ_MSG(test, actual, trace[i].actions, "step %u", i);
 		KUNIT_ASSERT_EQ_MSG(test, actual, expected, "oracle step %u", i);
@@ -233,7 +243,7 @@ static void apple_dpin_preserve_paused_event(struct kunit *test)
 	const struct dpin_trace trace[] = {
 		{ APPLE_DPIN_PAUSE, false, 0, 0, APPLE_DPIN_IDLE },
 		{ APPLE_DPIN_UP, false, 0, APPLE_DPIN_QUEUE, APPLE_DPIN_ACTIVATING },
-		/* #29 is deliberately not fixed by the extraction. */
+		/* Keep the pre-fix behavior in the baseline oracle. */
 		{ APPLE_DPIN_WORK, false, 0, APPLE_DPIN_ATTACH, APPLE_DPIN_ACTIVATING },
 		{ APPLE_DPIN_RESULT, true, -EAGAIN,
 		  APPLE_DPIN_FIRST_WAIT, APPLE_DPIN_WAITING_PIPELINE },
@@ -371,12 +381,12 @@ static void apple_dpin_all_policy_fields(struct kunit *test)
 	};
 	const struct apple_dpin_policy expected[] = {
 		{},
-		{ APPLE_DPIN_CHANGED, true, true, false, TB_HOST_DP_NOTIFY },
-		{ APPLE_DPIN_PRE_POST, false, false, true,
+		{ APPLE_DPIN_CHANGED, true, true, false, true, TB_HOST_DP_NOTIFY },
+		{ APPLE_DPIN_PRE_POST, false, false, true, false,
 		  TB_HOST_DP_HPD_ON_ACTIVATE | TB_HOST_DP_ACTIVE_BEFORE_DPRX |
 		  TB_HOST_DP_KEEP_DPRX_TIMEOUT | TB_HOST_DP_ADAPTER_QUIRKS |
 		  TB_HOST_DP_INITIAL_BW_GRANT },
-		{ APPLE_DPIN_CHANGED, false, false, false, TB_HOST_DP_NOTIFY },
+		{ APPLE_DPIN_CHANGED, false, false, false, false, TB_HOST_DP_NOTIFY },
 	};
 	unsigned int i, queue, display;
 
@@ -386,6 +396,7 @@ static void apple_dpin_all_policy_fields(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, actual[i]->setup_irqs, expected[i].setup_irqs);
 		KUNIT_EXPECT_EQ(test, actual[i]->t602x_handshake, expected[i].t602x_handshake);
 		KUNIT_EXPECT_EQ(test, actual[i]->host_policy, expected[i].host_policy);
+		KUNIT_EXPECT_EQ(test, actual[i]->defer_new_bringup, expected[i].defer_new_bringup);
 		for (queue = 0; queue < 2; queue++) {
 			for (display = 0; display < 2; display++) {
 				enum apple_dpin_flow old_hooks, new_hooks;
@@ -425,7 +436,278 @@ static void apple_dpin_policy_independent_of_hooks(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, tb_port_is_apple_host_dpin(&in));
 }
 
+static unsigned int sleep_step(struct apple_dpin_state *s, enum apple_dpin_event event)
+{
+	return apple_dpin_step(s, &apple_dpin_m1, event, false, 0);
+}
+
+static void apple_dpin_sleep_deferred_first(struct kunit *test)
+{
+	struct apple_dpin_state s = {};
+
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_PAUSE), 0U);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_UP), APPLE_DPIN_QUEUE);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_WORK), 0U);
+	KUNIT_EXPECT_EQ(test, s.phase, APPLE_DPIN_SLEEP_DEFERRED);
+	KUNIT_EXPECT_TRUE(test, s.deferred_first);
+	KUNIT_EXPECT_FALSE(test, s.waiting);
+	/* complete runs for normal resume and when another device aborts suspend. */
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_RESUME), APPLE_DPIN_QUEUE);
+	KUNIT_EXPECT_TRUE(test, s.deferred_first);
+	KUNIT_EXPECT_TRUE(test, s.replay_queued);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_RESUME), 0U);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_WORK), APPLE_DPIN_ATTACH);
+}
+
+static void apple_dpin_sleep_aborted_suspend(struct kunit *test)
+{
+	struct apple_dpin_state s = {};
+
+	/* Work queued before prepare has not entered DCP yet. */
+	sleep_step(&s, APPLE_DPIN_UP);
+	sleep_step(&s, APPLE_DPIN_PAUSE);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_WORK), 0U);
+	/* A later device rejects suspend: PM complete must reopen admission. */
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_RESUME), APPLE_DPIN_QUEUE);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_RESUME), 0U);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_WORK), APPLE_DPIN_ATTACH);
+	KUNIT_EXPECT_FALSE(test, s.paused);
+}
+
+static void apple_dpin_sleep_unplug_before_complete(struct kunit *test)
+{
+	struct apple_dpin_state s = {};
+
+	sleep_step(&s, APPLE_DPIN_PAUSE);
+	sleep_step(&s, APPLE_DPIN_UP);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_WORK), 0U);
+	sleep_step(&s, APPLE_DPIN_DOWN);
+	KUNIT_EXPECT_FALSE(test, s.deferred_first);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_RESUME), 0U);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_WORK), APPLE_DPIN_CANCEL_RETRY);
+	KUNIT_EXPECT_EQ(test, s.phase, APPLE_DPIN_IDLE);
+}
+
+static void apple_dpin_sleep_pre_call_gate(struct kunit *test)
+{
+	struct apple_dpin_state s = { .alive = true };
+
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_WORK), APPLE_DPIN_ATTACH);
+	/* Pause wins before up() admits mapping, IRQ setup and the first call. */
+	sleep_step(&s, APPLE_DPIN_PAUSE);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_DEFER_FIRST), 0U);
+	KUNIT_EXPECT_TRUE(test, s.deferred_first);
+	KUNIT_EXPECT_FALSE(test, s.waiting);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_RESUME), APPLE_DPIN_QUEUE);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_WORK), APPLE_DPIN_ATTACH);
+}
+
+static void apple_dpin_sleep_interrupted_readiness(struct kunit *test)
+{
+	struct apple_dpin_state s = { .alive = true };
+	unsigned int actions;
+
+	sleep_step(&s, APPLE_DPIN_WORK);
+	sleep_step(&s, APPLE_DPIN_PAUSE);
+	/* At least one call entered: retain the legacy capacity retry at complete. */
+	actions = apple_dpin_step(&s, &apple_dpin_m1, APPLE_DPIN_RESULT, true, -EAGAIN);
+	KUNIT_EXPECT_EQ(test, actions, APPLE_DPIN_FIRST_WAIT);
+	KUNIT_EXPECT_TRUE(test, s.waiting);
+	KUNIT_EXPECT_FALSE(test, s.deferred_first);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_RESUME), APPLE_DPIN_ARM_RETRY);
+	/* A queued capacity retry losing the pre-call race keeps the same timing. */
+	sleep_step(&s, APPLE_DPIN_PAUSE);
+	sleep_step(&s, APPLE_DPIN_DEFER_FIRST);
+	KUNIT_EXPECT_FALSE(test, s.deferred_first);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_RESUME), APPLE_DPIN_ARM_RETRY);
+}
+
+static void apple_dpin_sleep_handed_and_policy_scope(struct kunit *test)
+{
+	struct apple_dpin_state s = { .alive = true, .handed = true,
+				      .phase = APPLE_DPIN_HANDED };
+	const struct apple_dpin_policy * const unaffected[] = {
+		&apple_dpin_m2, &apple_dpin_m3,
+	};
+	unsigned int i, actions;
+
+	sleep_step(&s, APPLE_DPIN_PAUSE);
+	KUNIT_EXPECT_EQ(test, s.phase, APPLE_DPIN_HANDED);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_WORK), 0U);
+	KUNIT_EXPECT_TRUE(test, s.handed);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_RESUME), 0U);
+	KUNIT_EXPECT_EQ(test, s.phase, APPLE_DPIN_HANDED);
+	for (i = 0; i < ARRAY_SIZE(unaffected); i++) {
+		s = (struct apple_dpin_state){ .alive = true, .paused = true };
+		KUNIT_EXPECT_FALSE(test, unaffected[i]->defer_new_bringup);
+		actions = apple_dpin_step(&s, unaffected[i], APPLE_DPIN_WORK, false, 0);
+		KUNIT_EXPECT_EQ(test, actions, APPLE_DPIN_ATTACH);
+	}
+}
+
+static void apple_dpin_sleep_complete_races_deferral(struct kunit *test)
+{
+	struct apple_dpin_state s = { .alive = true };
+
+	sleep_step(&s, APPLE_DPIN_PAUSE);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_RESUME), 0U);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_DEFER_FIRST), APPLE_DPIN_AGAIN);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_WORK), APPLE_DPIN_ATTACH);
+}
+
+static void apple_dpin_sleep_map_connect_pause(struct kunit *test)
+{
+	struct apple_dpin_state s = { .alive = true };
+	unsigned int actions;
+
+	/* up() checks this under the same lock as mapping and IRQ enable. */
+	KUNIT_EXPECT_FALSE(test, apple_dpin_admission_blocked(&s, &apple_dpin_m1, false));
+	sleep_step(&s, APPLE_DPIN_PAUSE);
+	/* Pause between map and connect cannot undo the already admitted call. */
+	KUNIT_EXPECT_FALSE(test, apple_dpin_admission_blocked(&s, &apple_dpin_m1, true));
+	KUNIT_EXPECT_TRUE(test, apple_dpin_admission_blocked(&s, &apple_dpin_m1, false));
+	/* Its first call entered: readiness interrupted by sleep is capacity wait. */
+	actions = apple_dpin_step(&s, &apple_dpin_m1, APPLE_DPIN_RESULT, true, -EAGAIN);
+	KUNIT_EXPECT_EQ(test, actions, APPLE_DPIN_FIRST_WAIT);
+	KUNIT_EXPECT_TRUE(test, s.waiting);
+	KUNIT_EXPECT_FALSE(test, s.deferred_first);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_RESUME), APPLE_DPIN_ARM_RETRY);
+}
+
+static void apple_dpin_sleep_dprx_retention(struct kunit *test)
+{
+	struct apple_dpin_state s = {};
+
+	sleep_step(&s, APPLE_DPIN_PAUSE);
+	sleep_step(&s, APPLE_DPIN_UP);
+	/* DPRX can run before the DP-IN worker latches deferred_first. */
+	KUNIT_EXPECT_TRUE(test, apple_dpin_awaits_display(&s, &apple_dpin_m1));
+	sleep_step(&s, APPLE_DPIN_WORK);
+	KUNIT_EXPECT_TRUE(test, apple_dpin_awaits_display(&s, &apple_dpin_m1));
+	sleep_step(&s, APPLE_DPIN_RESUME);
+	/* Complete queued the replay, but it has not admitted a first call yet. */
+	KUNIT_EXPECT_TRUE(test, apple_dpin_awaits_display(&s, &apple_dpin_m1));
+	sleep_step(&s, APPLE_DPIN_WORK);
+	/* WORK plans ATTACH but actual up() admission has not happened yet. */
+	KUNIT_EXPECT_TRUE(test, apple_dpin_awaits_display(&s, &apple_dpin_m1));
+	sleep_step(&s, APPLE_DPIN_ADMITTED);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_awaits_display(&s, &apple_dpin_m1));
+	s.waiting = true;
+	KUNIT_EXPECT_TRUE(test, apple_dpin_awaits_display(&s, &apple_dpin_m1));
+	sleep_step(&s, APPLE_DPIN_DOWN);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_awaits_display(&s, &apple_dpin_m1));
+	s = (struct apple_dpin_state){ .alive = true, .handed = true, .paused = true };
+	KUNIT_EXPECT_FALSE(test, apple_dpin_awaits_display(&s, &apple_dpin_m1));
+	s.handed = false;
+	KUNIT_EXPECT_FALSE(test, apple_dpin_awaits_display(&s, &apple_dpin_m2));
+	KUNIT_EXPECT_FALSE(test, apple_dpin_awaits_display(&s, &apple_dpin_m3));
+}
+
+static void apple_dpin_sleep_complete_before_work(struct kunit *test)
+{
+	struct apple_dpin_state s = {};
+
+	sleep_step(&s, APPLE_DPIN_PAUSE);
+	sleep_step(&s, APPLE_DPIN_UP);
+	KUNIT_EXPECT_TRUE(test, s.deferred_first);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_RESUME), APPLE_DPIN_QUEUE);
+	/* An expired DPRX poll running before the first WORK must still retain. */
+	KUNIT_EXPECT_TRUE(test, apple_dpin_awaits_display(&s, &apple_dpin_m1));
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_WORK), APPLE_DPIN_ATTACH);
+	KUNIT_EXPECT_TRUE(test, apple_dpin_awaits_display(&s, &apple_dpin_m1));
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_RESUME), 0U);
+	sleep_step(&s, APPLE_DPIN_ADMITTED);
+	KUNIT_EXPECT_FALSE(test, s.deferred_first);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_awaits_display(&s, &apple_dpin_m1));
+	/* A new handoff replacing an old handed route has the same retention. */
+	s = (struct apple_dpin_state){ .alive = true, .handed = true };
+	sleep_step(&s, APPLE_DPIN_PAUSE);
+	sleep_step(&s, APPLE_DPIN_REARM);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_RESUME), APPLE_DPIN_QUEUE);
+	KUNIT_EXPECT_TRUE(test, apple_dpin_awaits_display(&s, &apple_dpin_m1));
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_WORK),
+			APPLE_DPIN_DROP | APPLE_DPIN_AGAIN);
+	sleep_step(&s, APPLE_DPIN_DROPPED);
+	KUNIT_EXPECT_TRUE(test, apple_dpin_awaits_display(&s, &apple_dpin_m1));
+	/* Admission failure also ends retention instead of keeping a dead route. */
+	s = (struct apple_dpin_state){ .alive = true, .deferred_first = true };
+	apple_dpin_step(&s, &apple_dpin_m1, APPLE_DPIN_RESULT, false, -ENOMEM);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_awaits_display(&s, &apple_dpin_m1));
+}
+
+static void apple_dpin_sleep_terminal_no_retention(struct kunit *test)
+{
+	struct apple_dpin_state s = { .alive = true };
+
+	apple_dpin_step(&s, &apple_dpin_m1, APPLE_DPIN_RESULT, true, -EIO);
+	KUNIT_EXPECT_EQ(test, s.phase, APPLE_DPIN_FAILED);
+	sleep_step(&s, APPLE_DPIN_PAUSE);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_awaits_display(&s, &apple_dpin_m1));
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_RESUME), 0U);
+	/* Pending work before prepare is retained; an entered call is drained. */
+	sleep_step(&s, APPLE_DPIN_UP);
+	sleep_step(&s, APPLE_DPIN_PAUSE);
+	KUNIT_EXPECT_TRUE(test, apple_dpin_awaits_display(&s, &apple_dpin_m1));
+	sleep_step(&s, APPLE_DPIN_RESUME);
+	sleep_step(&s, APPLE_DPIN_WORK);
+	sleep_step(&s, APPLE_DPIN_ADMITTED);
+	sleep_step(&s, APPLE_DPIN_PAUSE);
+	KUNIT_EXPECT_FALSE(test, s.deferred_first);
+}
+
+static void apple_dpin_sleep_capacity_work_pause(struct kunit *test)
+{
+	struct apple_dpin_state s = { .alive = true };
+
+	apple_dpin_step(&s, &apple_dpin_m1, APPLE_DPIN_RESULT, true, -EBUSY);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_RETRY), APPLE_DPIN_QUEUE);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_WORK), APPLE_DPIN_ATTACH);
+	/* Existing capacity retry loses the race between WORK and up admission. */
+	sleep_step(&s, APPLE_DPIN_PAUSE);
+	KUNIT_EXPECT_TRUE(test, s.waiting);
+	KUNIT_EXPECT_FALSE(test, s.deferred_first);
+	KUNIT_EXPECT_TRUE(test, apple_dpin_awaits_display(&s, &apple_dpin_m1));
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_RESUME), APPLE_DPIN_ARM_RETRY);
+	/* Late deferral result must also retain the 2-second capacity policy. */
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_DEFER_FIRST), APPLE_DPIN_ARM_RETRY);
+	KUNIT_EXPECT_FALSE(test, s.deferred_first);
+}
+
+static void apple_dpin_sleep_nhi_replacement(struct kunit *test)
+{
+	struct apple_dpin_state s = {};
+
+	sleep_step(&s, APPLE_DPIN_PAUSE);
+	sleep_step(&s, APPLE_DPIN_UP);
+	sleep_step(&s, APPLE_DPIN_WORK);
+	sleep_step(&s, APPLE_DPIN_DOWN);
+	/* Ordinary unplug cannot reopen another device's prepare gate. */
+	KUNIT_EXPECT_TRUE(test, s.paused);
+	sleep_step(&s, APPLE_DPIN_WORK);
+	/* NHI removal ends the gate only after stopping producers and draining. */
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_END_PM_GATE), 0U);
+	KUNIT_EXPECT_FALSE(test, s.paused);
+	KUNIT_EXPECT_FALSE(test, s.deferred_first);
+	KUNIT_EXPECT_FALSE(test, s.replay_queued);
+	/* Replacement NHI brings up its first tunnel without old complete(). */
+	sleep_step(&s, APPLE_DPIN_UP);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_WORK), APPLE_DPIN_ATTACH);
+}
+
 static struct kunit_case apple_dpin_cases[] = {
+	KUNIT_CASE(apple_dpin_sleep_capacity_work_pause),
+	KUNIT_CASE(apple_dpin_sleep_terminal_no_retention),
+	KUNIT_CASE(apple_dpin_sleep_complete_before_work),
+	KUNIT_CASE(apple_dpin_sleep_map_connect_pause),
+	KUNIT_CASE(apple_dpin_sleep_dprx_retention),
+	KUNIT_CASE(apple_dpin_sleep_nhi_replacement),
+	KUNIT_CASE(apple_dpin_sleep_deferred_first),
+	KUNIT_CASE(apple_dpin_sleep_aborted_suspend),
+	KUNIT_CASE(apple_dpin_sleep_unplug_before_complete),
+	KUNIT_CASE(apple_dpin_sleep_pre_call_gate),
+	KUNIT_CASE(apple_dpin_sleep_interrupted_readiness),
+	KUNIT_CASE(apple_dpin_sleep_handed_and_policy_scope),
+	KUNIT_CASE(apple_dpin_sleep_complete_races_deferral),
 	KUNIT_CASE(apple_dpin_exhaustive_equivalence),
 	KUNIT_CASE(apple_dpin_m1_capacity_trace),
 	KUNIT_CASE(apple_dpin_t602x_rearm_trace),

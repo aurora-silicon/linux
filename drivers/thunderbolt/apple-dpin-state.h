@@ -21,6 +21,7 @@ struct apple_dpin_policy {
 	bool capacity_retry;
 	bool setup_irqs;
 	bool t602x_handshake;
+	bool defer_new_bringup;
 	unsigned long host_policy;
 };
 
@@ -36,6 +37,8 @@ enum apple_dpin_phase {
 	APPLE_DPIN_HANDED,
 	APPLE_DPIN_TEARDOWN,
 	APPLE_DPIN_FAILED,
+	APPLE_DPIN_SLEEP_DEFERRED,
+	APPLE_DPIN_CONNECTING,
 };
 
 /* Desired tunnel state and worker-owned handoff state are separate facts. */
@@ -46,6 +49,8 @@ struct apple_dpin_state {
 	bool rearm;
 	bool waiting;
 	bool paused;
+	bool deferred_first;
+	bool replay_queued;
 };
 
 enum apple_dpin_event {
@@ -58,6 +63,10 @@ enum apple_dpin_event {
 	APPLE_DPIN_RETRY,
 	APPLE_DPIN_PAUSE,
 	APPLE_DPIN_RESUME,
+	/* No DCP call entered: sleep gate, not an allocation failure. */
+	APPLE_DPIN_DEFER_FIRST,
+	APPLE_DPIN_END_PM_GATE,
+	APPLE_DPIN_ADMITTED,
 };
 
 #define APPLE_DPIN_QUEUE		BIT(0)
@@ -77,5 +86,9 @@ unsigned int apple_dpin_step(struct apple_dpin_state *state,
 bool apple_dpin_readiness_retry(bool active, int result, unsigned int tries);
 enum apple_dpin_flow apple_dpin_hooks(const struct apple_dpin_policy *policy,
 				      bool queue_present, bool display_enabled);
+bool apple_dpin_admission_blocked(const struct apple_dpin_state *state,
+				  const struct apple_dpin_policy *policy, bool admitted);
+bool apple_dpin_awaits_display(const struct apple_dpin_state *state,
+			       const struct apple_dpin_policy *policy);
 
 #endif
