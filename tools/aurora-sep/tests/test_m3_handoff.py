@@ -43,6 +43,7 @@ BOARDS = {
     "j514c": ["apple,j514c", "apple,t6031", "apple,arm-platform"],
     "j293": ["apple,j293", "apple,t8103", "apple,arm-platform"],
     "j613": ["apple,j613", "apple,t8122", "apple,arm-platform"],
+    "j504": ["apple,j504", "apple,t8122", "apple,arm-platform"],
     "j314s": ["apple,j314s", "apple,t6000", "apple,arm-platform"],
     "j700": ["apple,j700", "apple,t8140", "apple,arm-platform"],
 }
@@ -170,7 +171,8 @@ esp_bootbin() {{ [[ -f '{self.esp}/m1n1/boot.bin' ]] && echo '{self.esp}/m1n1/bo
         self.assertIn("nobody", out)
 
     def test_plan_try_refused_elsewhere(self):
-        for board, stub, why in [("j613", "14.8.3", "M3 Pro"), ("j514c", "14.8.3", "M3 Pro"),
+        # The M3 MacBook Air's own opt-in is in test_m3_air.py.
+        for board, stub, why in [("j504", "14.8.3", "M3 Pro"), ("j514c", "14.8.3", "M3 Pro"),
                                  ("j314s", "13.5", "isn't an M3"), ("j700", "26.4", "isn't an M3"),
                                  ("j514s", "15.6", "stub is 15.6"), ("j516s", "15.6", "stub is 15.6")]:
             with self.subTest(board=board, stub=stub):

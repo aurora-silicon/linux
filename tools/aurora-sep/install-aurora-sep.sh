@@ -87,6 +87,9 @@
 # Every other M3 stays kernel-only, and --m3-handoff lets an M3 Pro owner try
 # the handoff on a model not yet on the list (see --agent-prompt). M1, M2 and
 # the Neo are unchanged.
+# The M3 MacBook Air (T8122, 13" J613 and 15" J615) can opt in to m1n1's GPU
+# handoff with --m3-handoff once a release carries M3_AIR_M1N1_PACKAGE: the
+# display stays on the boot framebuffer, and a plain run stays kernel-only.
 # It replaces linux-asahi (or linux-aurora) as a pacman package,
 # so mkinitcpio and update-m1n1 run from their own hooks; on a GRUB Mac this
 # script regenerates grub.cfg and keeps the previous kernel as a fallback entry.
@@ -139,6 +142,12 @@ PACKAGES=(
 # Only for an M3 on the handoff path (see m3_plan), in place of the m1n1-aurora
 # above: the same m1n1 plus the T6030 display and GPU handoff.
 M3_M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora7-1-aarch64.pkg.tar.zst 547d0d5f9daa283749d84e5a9c875fee06ce449eeb8252e41c11b3ce63e11184"
+# Only for an M3 MacBook Air on the handoff path, in place of the m1n1-aurora
+# above: m1n1-aurora with the T8122 GPU handoff (aurora8 is the first), as
+# "file sha256". It may name the same package as M3_M1N1_PACKAGE once one m1n1
+# carries both. Empty until that package is published: an Air then stays
+# kernel-only, and --m3-handoff on an Air stops with nothing installed.
+M3_AIR_M1N1_PACKAGE=""
 PINNED="linux-aurora linux-aurora-headers libfprint m1n1-aurora"
 PIN_BEGIN="# >>> aurora-sep pin (remove with: install-aurora-sep.sh --uninstall)"
 PIN_END="# <<< aurora-sep pin"
@@ -223,6 +232,16 @@ is_m3_pro() {
   tr '\0' '\n' <"$DT/compatible" 2>/dev/null | grep -qx 'apple,t6030'
 }
 
+# The M3 MacBook Airs. The other T8122 Macs (the 14" MacBook Pro M3, J504, and
+# the iMacs, J433 and J434) have no handoff path and stay kernel-only.
+M3_AIR_BOARDS="j613 j615"
+is_m3_air() {
+  local board
+  tr '\0' '\n' <"$DT/compatible" 2>/dev/null | grep -qx 'apple,t8122' || return 1
+  board=$(this_board)
+  [[ -n $board && " $M3_AIR_BOARDS " == *" $board "* ]]
+}
+
 # M3 support is experimental. Every M3 gets linux-aurora; what happens to m1n1's
 # stage 2 (boot.bin: m1n1, device trees and U-Boot) depends on the model, and
 # m3_plan decides it before anything is downloaded (M3_MODE):
@@ -237,6 +256,10 @@ is_m3_pro() {
 #            iconidentify/m3-m1n1) stays off unless boot.bin ends with the
 #            three M3_SWITCHES lines; update-m1n1 copies chosen.* lines from
 #            /etc/m1n1.conf into every rebuild, so they survive updates.
+#            An M3 MacBook Air takes the same path with its own m1n1
+#            (M3_AIR_M1N1_PACKAGE) and switches (m3_switches): the GPU
+#            handoff only, and only with --m3-handoff until its board is in
+#            M3_HANDOFF_BOARDS.
 # M1, M2 and the Neo keep the m1n1-aurora in PACKAGES: only an M3 on the
 # handoff path gets the newer m1n1.
 UPDATE_M1N1_CONF=/etc/default/update-m1n1
@@ -244,9 +267,17 @@ M3_FREEZE_BEGIN="# >>> aurora-sep: keep this M3's boot.bin as it is (remove with
 M3_FREEZE_END="# <<< aurora-sep: keep this M3's boot.bin as it is"
 M3_FROZEN_BY=""
 M3_BOOTBIN_SHA=""
-# Models the handoff has been booted on, by us or by a tester's report.
+# Models the handoff has been booted on, by us or by a tester's report. Only
+# an M3 Pro (t6030) or an M3 MacBook Air (M3_AIR_BOARDS) listed here gets it
+# by default; no Air is listed yet.
 M3_HANDOFF_BOARDS="j516s"
 M3_SWITCHES="chosen.asahi,t6030-gpu=1 chosen.asahi,t6030-dcp=1 chosen.asahi,t6030-dcpext=1"
+# The M3 MacBook Air's switches. The GPU handoff alone for now: the display
+# stays on the boot framebuffer. Set M3_AIR_DCP=1 to add the display handoff
+# once m1n1's T8122 DCP handoff has been booted on an Air.
+M3_AIR_GPU_SWITCH="chosen.asahi,t8122-gpu=1"
+M3_AIR_DCP_SWITCH="chosen.asahi,t8122-dcp=1"
+M3_AIR_DCP=0
 # The handoff is tested with one macOS system-firmware stub only, 14.8.3 (GPU
 # firmware 14.8.3, DCP 14.7), which the Omarchy installer gives every M3. m1n1
 # reports the stub's iBoot as asahi,iboot2-version.
@@ -257,6 +288,8 @@ M1N1_CONF=/etc/m1n1.conf
 M1N1_BIN=/usr/lib/asahi-boot/m1n1.bin
 M1N1_CONF_BEGIN="# >>> aurora-sep: M3 Pro display and GPU handoff (remove with: install-aurora-sep.sh --uninstall)"
 M1N1_CONF_END="# <<< aurora-sep: M3 Pro display and GPU handoff"
+M1N1_CONF_AIR_BEGIN="# >>> aurora-sep: M3 Air handoff (remove with: install-aurora-sep.sh --uninstall)"
+M1N1_CONF_AIR_END="# <<< aurora-sep: M3 Air handoff"
 # The M3 bring-up's install-m3gpu.sh froze boot.bin with exactly these lines,
 # and left this marker when it created the file.
 M3GPU_FREEZE=(
@@ -268,8 +301,8 @@ M3GPU_MARKER=/etc/default/.update-m1n1.created-by-m3gpu
 # none (not an M3), kernel or handoff; set by m3_plan, kept in $STATE/m3-mode
 # for --uninstall.
 M3_MODE=none
-# Set by --m3-handoff: the owner asks for the handoff on an M3 Pro model that
-# isn't in M3_HANDOFF_BOARDS yet.
+# Set by --m3-handoff: the owner asks for the handoff on an M3 Pro or M3
+# MacBook Air model that isn't in M3_HANDOFF_BOARDS yet.
 M3_TRY=0
 
 # Whether update-m1n1 would exit without building, judged the way it judges:
@@ -358,7 +391,41 @@ m3_bootbin_report() {
 is_m3_handoff_board() {
   local board
   board=$(this_board)
-  is_m3_pro && [[ -n $board && " $M3_HANDOFF_BOARDS " == *" $board "* ]]
+  { is_m3_pro || is_m3_air; } && [[ -n $board && " $M3_HANDOFF_BOARDS " == *" $board "* ]]
+}
+
+# The switch lines this Mac's handoff needs, separated by spaces: the T6030
+# ones, or the M3 Air's.
+m3_switches() {
+  if ! is_m3_air; then
+    echo "$M3_SWITCHES"
+  elif [[ $M3_AIR_DCP == 1 ]]; then
+    echo "$M3_AIR_GPU_SWITCH $M3_AIR_DCP_SWITCH"
+  else
+    echo "$M3_AIR_GPU_SWITCH"
+  fi
+}
+
+# This Mac's m1n1 package on the handoff path, as "file sha256".
+m3_m1n1_package() {
+  if is_m3_air; then echo "$M3_AIR_M1N1_PACKAGE"; else echo "$M3_M1N1_PACKAGE"; fi
+}
+
+# Whether this release carries an m1n1 for the M3 Air: a whole "file sha256"
+# entry, not the empty placeholder.
+m3_air_package_ok() {
+  [[ $M3_AIR_M1N1_PACKAGE =~ ^m1n1-aurora-[^[:space:]]+-aarch64\.pkg\.tar\.zst\ [0-9a-f]{64}$ ]]
+}
+
+# What the handoff does on this Mac, for messages.
+m3_handoff_name() {
+  if ! is_m3_air; then
+    echo "M3 Pro display and GPU handoff"
+  elif [[ $M3_AIR_DCP == 1 ]]; then
+    echo "M3 Air display and GPU handoff"
+  else
+    echo "M3 Air GPU handoff"
+  fi
 }
 
 # Why this Mac's system-firmware stub isn't the one the handoff is tested
@@ -380,14 +447,17 @@ m3_stub_problem() {
   return 0
 }
 
-# True when a downloaded m1n1-aurora package carries all three handoff switches.
+# True when a downloaded m1n1-aurora package knows every switch this Mac's
+# handoff needs (m3_switches): asahi,t6030-gpu for chosen.asahi,t6030-gpu=1.
 m1n1_pkg_has_handoff() {
   local bin s rc=0
   bin=$(mktemp)
   # One string per line, in a file: grep -q on a pipe would stop reading early
   # and fail the 3.8 MB tr with SIGPIPE under pipefail.
   { bsdtar -xOf "$1" usr/lib/asahi-boot/m1n1.bin | tr '\0' '\n' >"$bin"; } 2>/dev/null || rc=1
-  for s in asahi,t6030-gpu asahi,t6030-dcp asahi,t6030-dcpext; do
+  for s in $(m3_switches); do
+    s=${s#chosen.}
+    s=${s%%=*}
     ((rc == 0)) && ! grep -qaxF "$s" "$bin" && rc=1
   done
   rm -f "$bin"
@@ -453,23 +523,29 @@ m3gpu_unfreeze() {
   say "Lifted the M3 bring-up's freeze on update-m1n1 (from install-m3gpu.sh)"
 }
 
-# /etc/m1n1.conf without this script's switch block, on stdout.
+# /etc/m1n1.conf without this script's switch block (M3 Pro or M3 Air), on
+# stdout.
 m1n1_conf_without_switches() {
   [[ -f $M1N1_CONF ]] || return 0
-  awk -v b="$M1N1_CONF_BEGIN" -v e="$M1N1_CONF_END" '
-    $0 == b { skip = 1; next }
-    skip && $0 == e { skip = 0; next }
+  awk -v b="$M1N1_CONF_BEGIN" -v e="$M1N1_CONF_END" \
+    -v ab="$M1N1_CONF_AIR_BEGIN" -v ae="$M1N1_CONF_AIR_END" '
+    $0 == b || $0 == ab { skip = 1; next }
+    skip && ($0 == e || $0 == ae) { skip = 0; next }
     !skip' "$M1N1_CONF"
 }
 
 m3_switches_write() {
-  local tmp s
+  local tmp s begin=$M1N1_CONF_BEGIN end=$M1N1_CONF_END
+  if is_m3_air; then
+    begin=$M1N1_CONF_AIR_BEGIN
+    end=$M1N1_CONF_AIR_END
+  fi
   tmp=$(mktemp)
   m1n1_conf_without_switches >"$tmp"
   {
-    echo "$M1N1_CONF_BEGIN"
-    for s in $M3_SWITCHES; do echo "$s"; done
-    echo "$M1N1_CONF_END"
+    echo "$begin"
+    for s in $(m3_switches); do echo "$s"; done
+    echo "$end"
   } >>"$tmp"
   $sudo install -m 644 "$tmp" "$M1N1_CONF"
   rm -f "$tmp"
@@ -477,7 +553,7 @@ m3_switches_write() {
 
 m3_switches_remove() {
   local tmp
-  [[ -f $M1N1_CONF ]] && grep -qxF "$M1N1_CONF_BEGIN" "$M1N1_CONF" || return 0
+  [[ -f $M1N1_CONF ]] && grep -qxF -e "$M1N1_CONF_BEGIN" -e "$M1N1_CONF_AIR_BEGIN" "$M1N1_CONF" || return 0
   tmp=$(mktemp)
   m1n1_conf_without_switches >"$tmp"
   if grep -q '[^[:space:]]' "$tmp"; then
@@ -498,28 +574,50 @@ m3_recorded_mode() {
 # Decide the M3 path before anything is downloaded, so a Mac this release can't
 # set up as asked stops with nothing changed.
 m3_plan() {
-  local board problem
+  local board problem air=0
   M3_MODE=none
   if ! is_m3; then
-    ((M3_TRY == 0)) || die "--m3-handoff is for an M3 Pro, and this Mac isn't an M3. Nothing was installed."
+    ((M3_TRY == 0)) || die "--m3-handoff is for an M3 Pro or an M3 MacBook Air, and this Mac isn't an M3. Nothing was installed."
     return 0
   fi
   board=$(this_board)
+  if is_m3_air; then air=1; fi
   # An update never takes the handoff away again: once a Mac has it (listed, or
   # tried with --m3-handoff), a plain run keeps it, and its checks still apply.
   if ((M3_TRY == 0)) && [[ $(m3_recorded_mode) == handoff ]]; then
     M3_TRY=1
-    say "M3 ($board): this Mac has m1n1's display and GPU handoff from an earlier install; keeping it"
+    if ((air)); then
+      say "M3 MacBook Air ($board): this Mac has m1n1's GPU handoff from an earlier install; keeping it"
+    else
+      say "M3 ($board): this Mac has m1n1's display and GPU handoff from an earlier install; keeping it"
+    fi
   fi
   M3_MODE=kernel
-  if ! is_m3_pro; then
-    ((M3_TRY == 0)) || die "--m3-handoff is for an M3 Pro (t6030); this M3 ($board) has no
-    display and GPU handoff in m1n1 yet. Nothing was installed."
+  if ((air)); then
+    # Never by default: a plain run gives an Air the handoff only once its
+    # board is in M3_HANDOFF_BOARDS, and never without this release's m1n1.
+    if ! m3_air_package_ok; then
+      ((M3_TRY == 0)) || die "--m3-handoff: this release has no m1n1 with the M3 MacBook Air GPU
+    handoff yet, so it can't switch it on. Nothing was installed. (--uninstall puts the stock
+    m1n1 back on an Air that has the handoff from an earlier test build.)"
+      say "M3 MacBook Air ($board): installing the kernel only. This release has no m1n1 with the
+    GPU handoff for the Air, so boot.bin stays as it is and the display runs on the boot
+    framebuffer."
+      return 0
+    fi
+    if ! is_m3_handoff_board && ((M3_TRY == 0)); then
+      say "M3 MacBook Air ($board): installing the kernel only, and boot.bin stays as it is. m1n1's
+    GPU handoff for the Air is being tested and is not switched on by default. To help test it
+    (it replaces this Mac's boot loader), see case D in the M3 section of: bash -s -- --agent-prompt"
+      return 0
+    fi
+  elif ! is_m3_pro; then
+    ((M3_TRY == 0)) || die "--m3-handoff is for an M3 Pro (t6030) or an M3 MacBook Air (j613, j615);
+    this M3 ($board) has no display and GPU handoff in m1n1 yet. Nothing was installed."
     say "M3 ($board): installing the kernel only. m1n1 has no display and GPU handoff for this chip
     yet, so boot.bin stays as it is and the display runs on the boot framebuffer."
     return 0
-  fi
-  if ! is_m3_handoff_board && ((M3_TRY == 0)); then
+  elif ! is_m3_handoff_board && ((M3_TRY == 0)); then
     say "M3 Pro ($board): installing the kernel only, and boot.bin stays as it is. The display and
     GPU handoff in m1n1 hasn't been booted on this model yet. To try it (it replaces this
     Mac's boot loader), see the M3 section of: bash -s -- --agent-prompt"
@@ -529,23 +627,32 @@ m3_plan() {
   if [[ -n $problem ]]; then
     ((M3_TRY == 0)) || die "--m3-handoff: the handoff is only tested with the macOS $M3_STUB_VERSION
     system-firmware stub, and this Mac differs: $problem. Nothing was installed."
-    warn "the M3 Pro display and GPU handoff is only tested with the macOS $M3_STUB_VERSION
+    warn "the $(m3_handoff_name) is only tested with the macOS $M3_STUB_VERSION
     system-firmware stub, and this Mac differs: $problem. Installing the kernel only;
     boot.bin stays as it is."
     return 0
   fi
   if update_m1n1_frozen_by_others; then
     die "$UPDATE_M1N1_CONF sets M1N1_UPDATE_DISABLED, and not from this script or the M3
-    bring-up's install-m3gpu.sh. Switching the M3 Pro handoff on needs m1n1's boot.bin rebuilt.
-    Remove that line and run this again. Nothing was installed."
+    bring-up's install-m3gpu.sh. Switching the $(m3_handoff_name) on needs m1n1's boot.bin
+    rebuilt. Remove that line and run this again. Nothing was installed."
   fi
   if update_m1n1_customised; then
     die "$UPDATE_M1N1_CONF points update-m1n1 at its own m1n1, U-Boot, config or target
-    (M1N1=, SOURCE=, U_BOOT=, CONFIG= or TARGET=). The M3 Pro handoff needs boot.bin built
-    from this release's m1n1. Remove those lines and run this again. Nothing was installed."
+    (M1N1=, SOURCE=, U_BOOT=, CONFIG= or TARGET=). The $(m3_handoff_name) needs boot.bin
+    built from this release's m1n1. Remove those lines and run this again. Nothing was installed."
   fi
   M3_MODE=handoff
-  if is_m3_handoff_board; then
+  if ((air)); then
+    if is_m3_handoff_board; then
+      say "M3 MacBook Air ($board, macOS $M3_STUB_VERSION stub): installing m1n1 with the $(m3_handoff_name)"
+    else
+      warn "--m3-handoff: trying m1n1's GPU handoff on an M3 MacBook Air ($board). It is in testing
+    and not on by default. This replaces the Mac's boot loader; the steps to put the old one
+    back from macOS follow. The display stays on the boot framebuffer, and the desktop keeps
+    rendering in software: this is for testing the GPU handoff, not a faster desktop."
+    fi
+  elif is_m3_handoff_board; then
     say "M3 Pro ($board, macOS $M3_STUB_VERSION stub): installing m1n1 with the display and GPU handoff"
   else
     warn "--m3-handoff: trying m1n1's display and GPU handoff on an M3 Pro model ($board) nobody
@@ -558,20 +665,21 @@ m3_plan() {
 # appends /etc/m1n1.conf's lines straight after the gzipped U-Boot, so the
 # first one has no newline in front: look for the block, not whole lines.
 m3_verify_bootbin() {
-  local target tail block size
-  target=$(esp_bootbin) || die "could not find m1n1's boot.bin to check the M3 Pro switches in"
+  local target tail block size kind="M3 Pro"
+  if is_m3_air; then kind="M3 Air"; fi
+  target=$(esp_bootbin) || die "could not find m1n1's boot.bin to check the $kind switches in"
   size=$(stat -c %s "$M1N1_BIN")
   $sudo cmp -s -n "$size" "$M1N1_BIN" "$target" ||
     die "$target does not start with this release's m1n1 ($M1N1_BIN), so it was not rebuilt.
     The boot loader this Mac booted with is kept as m1n1/boot.bin.before-$VERSION on the EFI
     partition and in $STATE/boot.bin.saved. Please report it before rebooting."
-  block=$(tr ' ' '\n' <<<"$M3_SWITCHES")
+  block=$(m3_switches | tr ' ' '\n')
   tail=$($sudo tail -c 1024 "$target" | tr -d '\0')
   [[ $tail == *"$block"* ]] ||
-    die "the rebuilt $target does not carry the M3 Pro switch lines. The boot loader this Mac
+    die "the rebuilt $target does not carry the $kind switch lines. The boot loader this Mac
     booted with is kept as m1n1/boot.bin.before-$VERSION on the EFI partition and in
     $STATE/boot.bin.saved. Please report it before rebooting."
-  say "m1n1's boot.bin is this release's m1n1 with the M3 Pro handoff switches"
+  say "m1n1's boot.bin is this release's m1n1 with the $kind handoff switches"
 }
 
 # --uninstall on a bring-up Mac: update-m1n1 has just rebuilt boot.bin from the
@@ -1037,15 +1145,16 @@ snapshot_boot_state() {
 }
 
 # The packages this Mac gets, one "file sha256" per line: PACKAGES, except
-# that a Neo keeps its own m1n1, and an M3 gets M3_M1N1_PACKAGE on the handoff
-# path and no m1n1 otherwise. Needs m3_plan first.
+# that a Neo keeps its own m1n1, and an M3 gets its handoff m1n1
+# (m3_m1n1_package) on the handoff path and no m1n1 otherwise. Needs m3_plan
+# first.
 packages_for_this_mac() {
   local entry
   for entry in "${PACKAGES[@]}"; do
     if [[ $entry == m1n1-aurora-* ]] && { is_neo || [[ $M3_MODE != none ]]; }; then continue; fi
     echo "$entry"
   done
-  if [[ $M3_MODE == handoff ]]; then echo "$M3_M1N1_PACKAGE"; fi
+  if [[ $M3_MODE == handoff ]]; then m3_m1n1_package; fi
   return 0
 }
 
@@ -1074,15 +1183,20 @@ install_all() {
     Please report it with the file name above."
     [[ $(sha256sum "$work/$file" | cut -d' ' -f1) == "$sha" ]] || die "$file does not match its published checksum"
   done
-  if [[ $M3_MODE == handoff ]] && ! m1n1_pkg_has_handoff "$work/${M3_M1N1_PACKAGE%% *}"; then
-    die "this release's M3 m1n1 has no M3 Pro display and GPU handoff, so it can't switch it
+  if [[ $M3_MODE == handoff ]]; then
+    entry=$(m3_m1n1_package)
+    m1n1_pkg_has_handoff "$work/${entry%% *}" ||
+      die "this release's M3 m1n1 has no $(m3_handoff_name), so it can't switch it
     on. Nothing was installed. Please report it at https://github.com/iconidentify/aurora-linux/issues"
   fi
 
   snapshot "aurora-sep $VERSION"
   # Before pacman's update-m1n1 hook rebuilds boot.bin below.
   is_neo || unproven_board_backup
-  if [[ $M3_MODE == handoff ]]; then
+  if [[ $M3_MODE == handoff ]] && is_m3_air; then
+    keep_bootbin_on_esp "This replaces the boot loader of this M3 MacBook Air ($(this_board))
+    with m1n1-aurora and its GPU handoff."
+  elif [[ $M3_MODE == handoff ]]; then
     keep_bootbin_on_esp "This replaces the boot loader of this M3 Pro ($(this_board)) with
     m1n1-aurora and its display and GPU handoff."
   fi
@@ -1167,7 +1281,12 @@ install_all() {
   if is_neo; then neo_radio_notice; fi
   pacman -Q linux-aurora libfprint aurora-touchid
   echo
-  if [[ $M3_MODE == handoff ]]; then
+  if [[ $M3_MODE == handoff ]] && is_m3_air && [[ $M3_AIR_DCP != 1 ]]; then
+    say "Done. Reboot with someone watching: expect the Omarchy logo, the boot menu, then the
+    desktop on the boot framebuffer, as before. The GPU handoff is for testing: the desktop
+    still renders in software. Touch ID is not supported on M3 yet. What to check and
+    report: case D of step 11 of the test plan that the --agent-prompt command below prints."
+  elif [[ $M3_MODE == handoff ]]; then
     say "Done. Reboot with someone watching: expect the Omarchy logo, the boot menu, then the
     desktop on the built-in display at its native resolution. Touch ID is not supported
     on M3 yet."
@@ -1627,6 +1746,7 @@ fingerprint.
    First find the model and chip, then follow the matching case below:
      tr '\0' '\n' < /proc/device-tree/compatible | head -2
      cat /var/lib/aurora-sep/m3-mode     # after an install: kernel or handoff
+   On an M3 MacBook Air, follow case D.
 
    A. apple,j516s + apple,t6030 (MacBook Pro 16" M3 Pro): SUPPORTED, handoff on.
       The plain one-liner installs the kernel and replaces m1n1 with one
@@ -1673,15 +1793,70 @@ fingerprint.
             over SSH if you can, then run the installer with --uninstall
             (it puts the stock m1n1 back) and reboot.
 
-   C. apple,t8122 (MacBook Air 13"/15" M3, MacBook Pro 14" M3, iMac M3) or
-      apple,t6031 / apple,t6034 (M3 Max): KERNEL ONLY for now.
-      m1n1 has no display and GPU handoff for these chips yet, and
+   C. apple,t8122 other than the MacBook Air (MacBook Pro 14" M3, J504;
+      iMac M3, J433/J434) or apple,t6031 / apple,t6034 (M3 Max): KERNEL
+      ONLY for now.
+      m1n1 has no display and GPU handoff for these Macs yet, and
       --m3-handoff refuses here. The one-liner installs the kernel only and
       leaves boot.bin as it is. Expected: the desktop on the boot framebuffer
       (one fixed resolution, software rendering). Report what works and
       what does not: Wi-Fi, Bluetooth, keyboard, trackpad, audio, USB and
       Thunderbolt, suspend/resume, battery. These reports decide which chip
       gets the handoff next.
+
+   D. apple,j613 or apple,j615 + apple,t8122 (MacBook Air 13" or 15" M3):
+      KERNEL ONLY BY DEFAULT. THE GPU HANDOFF IS AN OPT-IN TEST.
+      The plain one-liner installs the kernel only, as in case C, and says so:
+        M3 MacBook Air (j613): installing the kernel only ...
+      Run the checks below on that first and report it: it is the baseline
+      every later Air test is compared with.
+      Then, to test m1n1's GPU handoff on this Air:
+        - What it does: it replaces this Mac's boot loader (m1n1) with one
+          that starts the Air's GPU for Linux. The screen does not change:
+          the display stays on the boot framebuffer (one fixed resolution),
+          and the desktop still renders in software, because no Mesa drives
+          this GPU yet. Success means the kernel finds a working GPU, not a
+          faster desktop.
+        - Only with the owner's explicit agreement, with the owner at the
+          Mac for the first boot, with the Aurora maintainer told first and
+          reachable while it runs, and only if the owner can start macOS on
+          this Mac (hold the power button at startup). If the new boot
+          loader does not start, macOS on the same Mac is the only way back.
+        - If the installer says this release has no m1n1 with the Air's GPU
+          handoff, the test build is not out yet: stop there. It also
+          refuses unless the Mac has the macOS 14.8.3 system-firmware stub
+          that the Omarchy installer gives every M3.
+        - Run:
+            curl -fsSL https://github.com/iconidentify/aurora-linux/releases/latest/download/install-aurora-sep.sh | bash -s -- --m3-handoff
+          It warns "--m3-handoff: trying m1n1's GPU handoff on an M3 MacBook
+          Air", then prints the restore steps: keep them, they name this
+          Mac's EFI partition. It must end with "m1n1's boot.bin is this
+          release's m1n1 with the M3 Air handoff switches"; if it stops with
+          an error instead, nothing was changed: report the error.
+        - Reboot, with the owner watching. Expected within about a minute:
+          the Omarchy logo, the boot menu, then the same desktop as before.
+          Then report exactly one of:
+          * WORKS: the desktop comes up as before. On a build whose kernel
+            drives the Air's GPU (its release notes say so), the kernel has
+            also taken the GPU: a render node, renderD128, is listed.
+              ls -l /dev/dri/
+              sudo dmesg | grep -iE 'asahi|gpu|g15|t8122' | head -40
+            Give the checks below too, and again after one suspend/resume.
+            Title it "<board> (<model>): M3 Air GPU handoff works".
+          * STOPS: m1n1 text and no boot menu, or a black screen for more
+            than two minutes. The owner puts the old boot.bin back from
+            macOS with the printed steps. Report what the screen showed and
+            when.
+          * WRONG: it boots, but something from the baseline no longer works
+            (keyboard, Wi-Fi, suspend), a build that should drive the GPU
+            shows no render node, or the kernel log shows GPU errors. Collect
+              sudo journalctl -b -k | grep -iE 'asahi|gpu|g15|t8122|m1n1'
+            over SSH if you can, then run the installer with --uninstall
+            (it puts the stock m1n1 back) and reboot.
+        - Do not start games or GPU programs: nothing on the desktop uses
+          this GPU yet, and a GPU fault can freeze the Mac until a reboot.
+        - Later plain runs of the one-liner keep the handoff on this Air;
+          --uninstall takes it off.
 
    Checks for every M3 (quote the output; on a kernel-only M3 the handoff
    lines are expected to be missing, so say so):

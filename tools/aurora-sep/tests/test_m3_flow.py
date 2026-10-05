@@ -23,6 +23,8 @@ BOARDS = {
     "j516s": ["apple,j516s", "apple,t6030", "apple,arm-platform"],
     "j514s": ["apple,j514s", "apple,t6030", "apple,arm-platform"],
     "j613": ["apple,j613", "apple,t8122", "apple,arm-platform"],
+    "j615": ["apple,j615", "apple,t8122", "apple,arm-platform"],
+    "j504": ["apple,j504", "apple,t8122", "apple,arm-platform"],
     "j314s": ["apple,j314s", "apple,t6000", "apple,arm-platform"],
 }
 SWITCHES = b"chosen.asahi,t6030-gpu=1\nchosen.asahi,t6030-dcp=1\nchosen.asahi,t6030-dcpext=1\n"
@@ -122,7 +124,9 @@ cp "$FAKE_PKGS/$(basename "$url")" "$out"
 """
 
 
-class M3FlowTest(unittest.TestCase):
+class M3FlowBase(unittest.TestCase):
+    """The fake Mac and its helpers, without tests (test_m3_air.py uses it too)."""
+
     def setUp(self):
         if not shutil.which("bsdtar") or not shutil.which("zstd"):
             self.skipTest("bsdtar and zstd are needed to build the fixture m1n1 packages")
@@ -220,6 +224,8 @@ boot_chain() {{ echo limine; }}
     def kept_copy(self):
         return self.tmp / f"esp/m1n1/boot.bin.before-{VERSION}"
 
+
+class M3FlowTest(M3FlowBase):
     # M3 Pro on the handoff path
 
     def test_fresh_m3_pro_gets_the_handoff(self):
@@ -311,7 +317,8 @@ boot_chain() {{ echo limine; }}
         self.assert_kernel_only("j516s", stub="15.6")
 
     def test_trial_refused_on_an_m3(self):
-        self.mac("j613")
+        # A plain M3 that isn't an Air (the Air's opt-in is in test_m3_air.py).
+        self.mac("j504")
         before = self.boot.read_bytes()
         proc = self.install(try_=1, check=False)
         self.assertNotEqual(proc.returncode, 0)
