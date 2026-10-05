@@ -553,10 +553,17 @@ static bool dcp_typec_keep_order(void)
  */
 #define DCP_HDMI_HOLD_MS	10000
 
+static void dcp_hdmi_hold(struct apple_dcp *dcp)
+{
+	WRITE_ONCE(dcp->hdmi_hold_until,
+		   jiffies + msecs_to_jiffies(DCP_HDMI_HOLD_MS));
+}
+
 static bool dcp_hdmi_held(struct apple_dcp *dcp)
 {
-	return dcp->hdmi_hpd && dcp->hdmi_hold_until &&
-	       time_before(jiffies, dcp->hdmi_hold_until);
+	unsigned long until = READ_ONCE(dcp->hdmi_hold_until);
+
+	return dcp->hdmi_hpd && until && time_before(jiffies, until);
 }
 
 /* A Thunderbolt tunnel holds @dcp's pipeline: it never moves. */
@@ -2482,6 +2489,18 @@ static int dcp_fixed_output_select(struct apple_dcp *dcp)
 	return 0;
 }
 
+/*
+ * Any HDMI HPD edge: a display is there or just was.  Start the hold at the
+ * edge itself, before a tunnel retry can take the fabric lock ahead of the
+ * thread (see dcp_hdmi_held()).
+ */
+static irqreturn_t dcp_dp2hdmi_hpd_edge(int irq, void *data)
+{
+	dcp_hdmi_hold(data);
+
+	return IRQ_WAKE_THREAD;
+}
+
 static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
 {
 	struct apple_dcp *dcp = data;
@@ -2489,8 +2508,8 @@ static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
 
 	guard(mutex)(&dcp_typec_fabric_lock);
 
-	/* any edge: a display is there or just was (see dcp_hdmi_held()) */
-	dcp->hdmi_hold_until = jiffies + msecs_to_jiffies(DCP_HDMI_HOLD_MS);
+	/* again from here, should the edge handler not have run */
+	dcp_hdmi_hold(dcp);
 
 	if (READ_ONCE(dcp->active_typec_route)) {
 		/*
@@ -3543,7 +3562,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			dcp->hdmi_hpd_irq = irq;
 
 			ret = devm_request_threaded_irq(dev, dcp->hdmi_hpd_irq,
-						NULL, dcp_dp2hdmi_hpd,
+						dcp_dp2hdmi_hpd_edge, dcp_dp2hdmi_hpd,
 						IRQF_ONESHOT | IRQF_NO_AUTOEN |
 						IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
 						"dp2hdmi-hpd-irq", dcp);
@@ -3742,8 +3761,11 @@ static int dcp_platform_resume(struct device *dev)
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
 	dcp_enable_typec_work(dcp);
-	if (dcp->hdmi_hpd_irq)
+	if (dcp->hdmi_hpd_irq) {
+		/* edges were not seen in sleep, and monitors blink on waking */
+		dcp_hdmi_hold(dcp);
 		enable_irq(dcp->hdmi_hpd_irq);
+	}
 
 	if (dcp->avep)
 		av_service_connect(dcp);
