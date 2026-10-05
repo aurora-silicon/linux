@@ -532,6 +532,14 @@ static bool dcp_typec_frozen(struct drm_device *drm)
 	return false;
 }
 
+/* Can a lit Type-C display move to another pipeline without a compositor noticing? */
+static bool dcp_typec_thawed(void)
+{
+	struct drm_device *drm = dcp_typec_drm();
+
+	return drm && READ_ONCE(drm->registered) && !dcp_typec_frozen(drm);
+}
+
 /* Are the routes kept in compositor pairing order right now? */
 static bool dcp_typec_keep_order(void)
 {
@@ -844,10 +852,12 @@ dcp_typec_rebalance_locked(struct apple_dcp_typec_port *arriving,
 
 /*
  * A display is plugged into the HDMI port while its pipeline, the hybrid,
- * drives a Type-C port.  Without dual-stream docks, move a direct DP-alt
+ * drives a Type-C port.  Without dual-stream docks, and only while no
+ * compositor owns the display (see dcp_typec_frozen()), move a direct DP-alt
  * display to a free Type-C-only pipeline -- an unplug and replug of that
  * display, as in dcp_typec_rebalance_locked() -- and give the hybrid back to
- * HDMI.  A Thunderbolt tunnel never moves.  Otherwise the HDMI display waits,
+ * HDMI.  A compositor keeps its pairing and could miss the brief unplug,
+ * and a Thunderbolt tunnel never moves.  Otherwise the HDMI display waits,
  * and gets the hybrid when the Type-C display lets it go.  A display that
  * cannot move is put back where it was rather than left dark.
  */
@@ -856,15 +866,24 @@ static void dcp_typec_reclaim_hybrid(struct apple_dcp *dcp)
 	struct apple_dcp_typec_route *owner = READ_ONCE(dcp->active_typec_route);
 	struct apple_dcp_typec_route *dest = NULL, *candidate;
 	struct apple_dcp_typec_port *port;
+	bool hdmi_ok = true;
+	int ret;
 
 	lockdep_assert_held(&dcp_typec_fabric_lock);
 
-	if (!owner || !dcp->hdmi_hpd || !gpiod_get_value_cansleep(dcp->hdmi_hpd))
+	if (dcp_typec_dual_stream() || !owner || !dcp->hdmi_hpd ||
+	    !gpiod_get_value_cansleep(dcp->hdmi_hpd))
 		return;
 	port = owner->port;
 	if (owner->tunnel || port->owner != owner) {
 		dev_info(dcp->dev,
 			 "HDMI display waits: its pipeline drives a Thunderbolt display on %pOF\n",
+			 port->connector_np);
+		return;
+	}
+	if (!dcp_typec_thawed()) {
+		dev_info(dcp->dev,
+			 "HDMI display waits: its pipeline drives the display on %pOF\n",
 			 port->connector_np);
 		return;
 	}
@@ -889,10 +908,16 @@ static void dcp_typec_reclaim_hybrid(struct apple_dcp *dcp)
 	    (dcp->typec_connector && dcp->typec_connector->connected))
 		dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
 	port->hpd = false;
-	if (dcp_typec_route_deactivate(owner) && owner->selected) {
+	ret = dcp_typec_route_deactivate(owner);
+	if (ret && owner->selected) {
 		/* still routed: leave the display where it is */
 		dcp_typec_port_attach(port);
 		return;
+	}
+	if (ret) {
+		/* released, but the crossbar did not switch to HDMI */
+		dev_warn(dcp->dev, "could not switch to the HDMI display: %d\n", ret);
+		hdmi_ok = false;
 	}
 	port->owner = NULL;
 
@@ -902,16 +927,27 @@ static void dcp_typec_reclaim_hybrid(struct apple_dcp *dcp)
 		if (!dcp_typec_route_activate(owner, owner->xbar)) {
 			port->owner = owner;
 			dcp_typec_port_attach(port);
+			return;
 		}
-		return;
+		/*
+		 * Left without a pipeline: it is served as a waiting port when
+		 * one frees, and its next DP state report is applied again.
+		 */
+		dev_err(dcp->dev, "could not put %pOF back; replug that display\n",
+			port->connector_np);
+		port->applied_valid = false;
+	} else {
+		port->owner = dest;
+		port->preferred_route = dest;
+		port->dp_release_deadline = 0;
+		dcp_typec_port_attach(port);
 	}
-	port->owner = dest;
-	port->preferred_route = dest;
-	port->dp_release_deadline = 0;
-	dcp_typec_port_attach(port);
 
-	if (dcp->active)
+	/* the HDMI display may have gone while the Type-C display moved */
+	if (hdmi_ok && dcp->active && gpiod_get_value_cansleep(dcp->hdmi_hpd))
 		dcp_dptx_connect(dcp, 0);
+	else if (hdmi_ok)
+		dcp_typec_route_waiting();
 }
 
 /* A pipeline came free: an HDMI display waiting for its hybrid may get it now. */
@@ -954,13 +990,12 @@ static void dcp_typec_pipeline_freed(void)
  */
 void dcp_typec_reorder(void)
 {
-	if (!dcp_typec_dual_stream())
-		return;
-
 	guard(mutex)(&dcp_typec_fabric_lock);
 
 	if (dcp_typec_keep_order())
 		dcp_typec_rebalance_locked(NULL, 0);
+	else if (!dcp_typec_dual_stream() && dcp_typec_thawed())
+		dcp_typec_reclaim_waiting_hdmi();
 }
 
 static int dcp_typec_route_set(struct typec_mux_dev *mux,
@@ -2524,17 +2559,20 @@ static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
 		 * takes its pipeline back from a direct DP-alt route: the
 		 * compositor pairs the HDMI connector with it first.  Without
 		 * dual-stream docks the Type-C display moves to a free
-		 * Type-C-only pipeline instead, at any time.
+		 * Type-C-only pipeline instead, if it can (see
+		 * dcp_typec_reclaim_hybrid()).
 		 */
-		if ((dcp_typec_keep_order() || !dcp_typec_dual_stream()) &&
+		if (dcp_typec_keep_order() &&
 		    gpiod_get_value_cansleep(dcp->hdmi_hpd)) {
 			msleep(500);
-			if (!gpiod_get_value_cansleep(dcp->hdmi_hpd))
-				return IRQ_HANDLED;
-			if (dcp_typec_keep_order())
+			if (gpiod_get_value_cansleep(dcp->hdmi_hpd))
 				dcp_typec_rebalance_locked(NULL, 0);
-			else
-				dcp_typec_reclaim_hybrid(dcp);
+		} else if (!dcp_typec_dual_stream() &&
+			   gpiod_get_value_cansleep(dcp->hdmi_hpd)) {
+			/* debounce only what may move a display */
+			if (dcp_typec_thawed())
+				msleep(500);
+			dcp_typec_reclaim_hybrid(dcp);
 		}
 		return IRQ_HANDLED;
 	}
