@@ -1,0 +1,171 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/apple,dcp-typec-routes.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple DCP Type-C display routing properties
+
+maintainers:
+  - Janne Grunau <j@jannau.net>
+
+description: |
+  Common routing properties of an Apple display coprocessor (DCP). This schema
+  describes the connections to ATC PHYs and their display crossbars, rather
+  than the coprocessor's mailbox, memory, panel or firmware interfaces.
+
+  Each route index N names a typecN PHY and a typecN DP Alt Mode crossbar output
+  on the DCP node. The route's graph endpoint connects to the corresponding
+  Type-C connector's display port (port@3). Two route endpoints on that port
+  mean two candidate pipelines; that alone does not imply two tunnel streams.
+
+  For a port wired to both Thunderbolt DP IN adapters, name typecN-dpin0 and
+  typecN-dpin1 crossbar controls on the pipelines that can drive them. Crossbar
+  mux cells 0, 1 and 2 describe the DP PHY, DP IN 0 and DP IN 1 outputs,
+  respectively. The per-port prefix distinguishes multiple ATCs on one DCP.
+  Dual-stream wiring requires these two named controls and two port@3
+  endpoints. It does not describe SoC handshake or retry policy.
+
+  Legacy typecN-usb4 names describe cell 1 on old j414/j416 DTBs. With two
+  port@3 endpoints they retain the existing dual-stream wiring; cell 2 is
+  implicit in that legacy ABI. New DTs must name both DP IN controls instead.
+
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,dcp
+          - apple,dcpext
+    typec-routes: true
+  required:
+    - compatible
+    - typec-routes
+
+properties:
+  phys:
+    minItems: 1
+    maxItems: 5
+    description: Fixed-output DP PHY followed by the wired Type-C DP PHYs.
+
+  phy-names:
+    minItems: 1
+    maxItems: 5
+    items:
+      enum: [dp-phy, typec0, typec1, typec2, typec3]
+
+  mux-controls:
+    minItems: 1
+    maxItems: 13
+    description: Fixed, DP Alt Mode and wired DP IN crossbar output controls.
+
+  mux-control-names:
+    minItems: 1
+    maxItems: 13
+    items:
+      anyOf:
+        - enum:
+            - dp-xbar
+            - typec0
+            - typec1
+            - typec2
+            - typec3
+            - typec0-dpin0
+            - typec0-dpin1
+            - typec1-dpin0
+            - typec1-dpin1
+            - typec2-dpin0
+            - typec2-dpin1
+            - typec3-dpin0
+            - typec3-dpin1
+        - enum: [typec0-usb4, typec1-usb4, typec2-usb4, typec3-usb4]
+          deprecated: true
+
+  apple,typec-mux-indices:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 4
+    description: |
+      Crossbar source state for each route index, indexed by route reg.
+      This selects the pipeline input, not the DP IN adapter number.
+
+  apple,typec-dptx-phys:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 4
+    description: DPTX PHY target for each route index, indexed by route reg.
+
+  typec-routes:
+    type: object
+    additionalProperties: false
+    properties:
+      '#address-cells':
+        const: 1
+      '#size-cells':
+        const: 0
+    patternProperties:
+      '^route@[0-3]$':
+        type: object
+        additionalProperties: false
+        properties:
+          reg:
+            items:
+              - maximum: 3
+          mode-switch:
+            type: boolean
+          port:
+            $ref: /schemas/graph.yaml#/properties/port
+        required:
+          - reg
+          - mode-switch
+          - port
+    required:
+      - '#address-cells'
+      - '#size-cells'
+    anyOf:
+      - required: [route@0]
+      - required: [route@1]
+      - required: [route@2]
+      - required: [route@3]
+
+required:
+  - phys
+  - phy-names
+  - mux-controls
+  - mux-control-names
+  - apple,typec-mux-indices
+  - apple,typec-dptx-phys
+  - typec-routes
+
+# This common schema validates routing independently of other DCP interfaces.
+additionalProperties: true
+
+examples:
+  - |
+    #include <dt-bindings/phy/phy.h>
+
+    dcp {
+        compatible = "apple,t6020-dcpext", "apple,dcpext";
+        phys = <&atcphy0 PHY_TYPE_DP>;
+        phy-names = "typec0";
+        mux-controls = <&atcphy0_xbar 0>, <&atcphy0_xbar 1>,
+                       <&atcphy0_xbar 2>;
+        mux-control-names = "typec0", "typec0-dpin0", "typec0-dpin1";
+        apple,typec-mux-indices = <2>;
+        apple,typec-dptx-phys = <0>;
+
+        typec-routes {
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            route@0 {
+                reg = <0>;
+                mode-switch;
+                port {
+                    endpoint {
+                        remote-endpoint = <&typec0_display>;
+                    };
+                };
+            };
+        };
+    };

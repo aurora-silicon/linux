@@ -1951,6 +1951,7 @@ M:	Janne Grunau <j@jannau.net>
 L:	dri-devel@lists.freedesktop.org
 S:	Maintained
 T:	git git://anongit.freedesktop.org/drm/drm-misc
+F:	Documentation/devicetree/bindings/display/apple,dcp-typec-routes.yaml
 F:	drivers/gpu/drm/apple/
 F:	drivers/gpu/drm/apple/dcp-fabric*
 
