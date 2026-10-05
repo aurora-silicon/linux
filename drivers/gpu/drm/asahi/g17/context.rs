@@ -39,7 +39,7 @@ impl QosIds {
         let mut used = self.used.lock();
         let id = used.trailing_ones();
         if id == 128 {
-            return Err(ENOSPC);
+            return Err(crate::g17::queue_stats::enospc(crate::g17::queue_stats::Pool::QueueContextQos));
         }
         *used |= 1u128 << id;
         Ok(QosLease {

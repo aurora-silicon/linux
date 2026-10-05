@@ -6,7 +6,7 @@
 //! and their ring backing stay owned until both firmware processors stop;
 //! command completion alone does not detach a hardware queue.
 
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 use kernel::prelude::*;
 
 use super::{
@@ -15,7 +15,30 @@ use super::{
 };
 use crate::{hw::t8140, mem, mmu};
 
-const QID_COUNT: usize = QID_MAX as usize + 1;
+pub(super) const QID_COUNT: usize = QID_MAX as usize + 1;
+
+pub(super) const COMPUTE_RENDER_RESERVE: usize = 16;
+pub(super) static LEASED: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
+pub(super) static PUBLISHED: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
+pub(super) static HIGH_WATER: AtomicU32 = AtomicU32::new(0);
+pub(super) static EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+pub(super) static RESERVE_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn leased_total() -> u32 {
+    LEASED.iter().map(|count| count.load(Ordering::Relaxed)).sum()
+}
+
+fn exhausted(engine: DataMaster, reserve: bool) -> Error {
+    if reserve {
+        RESERVE_REFUSED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+    }
+    super::queue_stats::enospc(match engine {
+        DataMaster::Compute => super::queue_stats::Pool::QidCompute,
+        _ => super::queue_stats::Pool::QidRenderPair,
+    })
+}
 
 /// Stable physical-channel identity. The owner must not be reused within a
 /// device lifetime, including after an unpublished allocation is cancelled.
@@ -44,12 +67,16 @@ struct Identity {
 /// One shared namespace for tiling, fragment and compute queues.
 pub(crate) struct QueueIds {
     entries: [Option<Identity>; QID_COUNT],
+    compute_publication: u64,
+    leased: usize,
 }
 
 impl QueueIds {
     pub(crate) fn new() -> impl Init<Self, Error> {
         kernel::try_init!(Self {
             entries <- pin_init::init_array_from_fn(|_| None),
+            compute_publication: 0,
+            leased: 0,
         })
     }
 
@@ -76,11 +103,16 @@ impl QueueIds {
                 Err(EINVAL)
             };
         }
+        // Healthy existing channels keep their QID. Never recycle a published
+        // identity to recover capacity after a fault; leave eight render pairs.
+        if engine == DataMaster::Compute && QID_COUNT - self.leased <= COMPUTE_RENDER_RESERVE {
+            return Err(exhausted(engine, true));
+        }
         let index = preferred
             .map(usize::from)
             .filter(|index| self.entries.get(*index).is_some_and(Option::is_none))
             .or_else(|| self.entries.iter().position(Option::is_none))
-            .ok_or(ENOSPC)?;
+            .ok_or_else(|| exhausted(engine, false))?;
         let id = Id {
             qid: index as u8,
             owner,
@@ -90,7 +122,16 @@ impl QueueIds {
             id,
             published: false,
         });
+        self.leased += 1;
+        LEASED[engine as usize].fetch_add(1, Ordering::Relaxed);
+        HIGH_WATER.fetch_max(leased_total(), Ordering::Relaxed);
         Ok(id)
+    }
+
+    /// Ordered under the device mutex; no atomic operation on the submission path.
+    pub(crate) fn next_compute_publication(&mut self) -> Result<u64> {
+        self.compute_publication = self.compute_publication.checked_add(1).ok_or(EOVERFLOW)?;
+        Ok(self.compute_publication)
     }
 
     /// Call after preflighting the complete installation, before any address
@@ -104,7 +145,10 @@ impl QueueIds {
         if entry.id != id {
             return Err(EINVAL);
         }
-        entry.published = true;
+        if !entry.published {
+            entry.published = true;
+            PUBLISHED[id.engine as usize].fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -113,9 +157,22 @@ impl QueueIds {
         match slot {
             Some(entry) if entry.id == id && !entry.published => {
                 *slot = None;
+                self.leased -= 1;
+                LEASED[id.engine as usize].fetch_sub(1, Ordering::Relaxed);
                 Ok(())
             }
             _ => Err(EINVAL),
+        }
+    }
+}
+
+impl Drop for QueueIds {
+    fn drop(&mut self) {
+        for entry in self.entries.iter().flatten() {
+            LEASED[entry.id.engine as usize].fetch_sub(1, Ordering::Relaxed);
+            if entry.published {
+                PUBLISHED[entry.id.engine as usize].fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 }

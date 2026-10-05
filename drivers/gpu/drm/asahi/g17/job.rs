@@ -248,7 +248,7 @@ pub(crate) trait Backend: Send + Sync {
     fn timed_out(&self, packet: Arc<Packet>) -> sched::Status;
     fn cancel(&self, packet: Arc<Packet>);
     /// Transfer a timeout to an outstanding off-lock graph transaction, if any.
-    fn defer_timeout(&self, packet: &Arc<Packet>) -> bool;
+    fn defer_timeout(&self, packet: &Arc<Packet>, renewals: u8) -> bool;
     /// Return true only after taking publication ownership and recording its result.
     fn try_early(&self, packet: &Arc<Packet>) -> bool;
     fn count_backlog(&self, packet: &Packet);
@@ -256,6 +256,7 @@ pub(crate) trait Backend: Send + Sync {
 
 struct Job<B: Backend> {
     backend: Arc<B>,
+    victim_renewals: u8,
     packet: Arc<Packet>,
 }
 
@@ -272,9 +273,14 @@ impl<B: Backend> Drop for Job<B> {
 
 impl<B: Backend> sched::JobImpl for Job<B> {
     fn false_timeout(job: &mut sched::Job<Self>) -> bool {
-        job.is_finished()
-            || job.packet.completion.take_replay_timeout()
-            || job.backend.defer_timeout(&job.packet)
+        if job.is_finished() || job.packet.completion.take_replay_timeout() {
+            return true;
+        }
+        let deferred = job.backend.defer_timeout(&job.packet, job.victim_renewals);
+        if deferred && job.packet.engine() == Engine::Compute {
+            job.victim_renewals += 1;
+        }
+        deferred
     }
 
     fn prepare(job: &mut sched::Job<Self>) -> Option<Fence> {
@@ -337,6 +343,7 @@ impl<B: Backend> Scheduler<B> {
             1,
             Job {
                 backend: self.backend.clone(),
+                victim_renewals: 0,
                 packet: packet.clone(),
             },
         )?;
