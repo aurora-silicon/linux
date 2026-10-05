@@ -172,8 +172,12 @@ version_notice() {
 }
 
 boot_chain() {
-  # /boot/efi can be readable only by root, so test through sudo.
-  if pacman -Q omarchy-mac-boot >/dev/null 2>&1 &&
+  # /boot/efi can be readable only by root, so test through sudo. Limine is
+  # active where omarchy-mac-boot is installed, or where its activation marker
+  # and defaults exist without it (the test omarchy-mac-limine-active and
+  # limine-mkinitcpio-hook's Apple gate make), as on Macs switched by hand.
+  if { pacman -Q omarchy-mac-boot >/dev/null 2>&1 ||
+    [[ -f /var/lib/omarchy/limine.enabled && -f /etc/default/limine ]]; } &&
     { $sudo test -e /boot/EFI/BOOT/BOOTAA64.EFI || $sudo test -e /boot/efi/EFI/BOOT/BOOTAA64.EFI; } &&
     command -v limine >/dev/null; then
     echo limine
