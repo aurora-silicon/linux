@@ -3094,12 +3094,16 @@ static void tb_test_dp_dprx_cancel_running(struct kunit *test)
 struct tb_test_dprx_gate {
 	struct tb_nhi nhi;
 	bool deferred;
+	struct completion *worker_passed;
+	unsigned int samples;
 };
 
 static bool tb_test_dprx_awaits_display(struct tb_nhi *nhi, struct tb_port *in)
 {
 	struct tb_test_dprx_gate *gate = container_of(nhi, struct tb_test_dprx_gate, nhi);
 
+	if (gate->deferred && ++gate->samples == 2)
+		complete(gate->worker_passed);
 	return gate->deferred;
 }
 
@@ -3109,6 +3113,7 @@ static void tb_test_dprx_finished(struct tb_tunnel *tunnel, void *data)
 
 	lockdep_assert_held(&tunnel->tb->lock);
 	ctx->completions++;
+	complete(&ctx->worker_passed);
 }
 
 static void tb_test_dp_dprx_deferred_first(struct kunit *test)
@@ -3116,8 +3121,10 @@ static void tb_test_dp_dprx_deferred_first(struct kunit *test)
 	static const struct tb_nhi_ops ops = {
 		.dp_tunnel_awaits_display = tb_test_dprx_awaits_display,
 	};
-	struct tb_test_dprx_gate gate = { .nhi.ops = &ops, .deferred = true };
 	struct tb_test_dprx ctx = { .test = test };
+	struct tb_test_dprx_gate gate = {
+		.nhi.ops = &ops, .deferred = true, .worker_passed = &ctx.worker_passed,
+	};
 	struct tb_switch *host, *dev;
 	struct tb_tunnel *tunnel;
 	struct tb *tb;
@@ -3140,23 +3147,25 @@ static void tb_test_dp_dprx_deferred_first(struct kunit *test)
 	tb->nhi = &gate.nhi;
 	mutex_init(&tb->lock);
 	init_completion(&ctx.worker_passed);
-	INIT_WORK(&ctx.marker, tb_test_dprx_marker);
 	mutex_lock(&tb->lock);
 	/* Start with an expired timeout and a worker-owned tunnel reference. */
 	kref_get(&tunnel->kref);
 	tunnel->dprx_started = true;
 	tunnel->dprx_timeout = ktime_sub_ms(ktime_get(), 30000);
 	queue_delayed_work(tb->wq, &tunnel->dprx_work, 0);
-	queue_work(tb->wq, &ctx.marker);
 	mutex_unlock(&tb->lock);
+	/* A second gated pass proves that the worker queued its next poll. */
 	if (!wait_for_completion_timeout(&ctx.worker_passed, 5 * HZ)) {
-		KUNIT_FAIL(test, "DPRX worker did not reach marker");
+		KUNIT_FAIL(test, "DPRX worker did not reach deferred gate");
 		goto out;
 	}
 	mutex_lock(&tb->lock);
+	/* Quiesce the next poll before inspecting pending state and its reference. */
+	cancel_delayed_work_sync(&tunnel->dprx_work);
+	KUNIT_EXPECT_GE(test, gate.samples, 2U);
 	KUNIT_EXPECT_EQ(test, ctx.completions, 0U);
 	KUNIT_EXPECT_TRUE(test, tunnel->dprx_started);
-	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&tunnel->dprx_work));
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&tunnel->dprx_work));
 	KUNIT_EXPECT_TRUE(test, ktime_after(tunnel->dprx_timeout, ktime_get()));
 	KUNIT_EXPECT_EQ(test, kref_read(&tunnel->kref), 2U);
 
@@ -3165,10 +3174,9 @@ static void tb_test_dp_dprx_deferred_first(struct kunit *test)
 	host->generation = 3;
 	reinit_completion(&ctx.worker_passed);
 	mod_delayed_work(tb->wq, &tunnel->dprx_work, 0);
-	queue_work(tb->wq, &ctx.marker);
 	mutex_unlock(&tb->lock);
 	if (!wait_for_completion_timeout(&ctx.worker_passed, 5 * HZ)) {
-		KUNIT_FAIL(test, "released DPRX worker did not reach marker");
+		KUNIT_FAIL(test, "released DPRX worker did not finish");
 		goto out;
 	}
 	mutex_lock(&tb->lock);
@@ -3181,7 +3189,6 @@ out:
 	mutex_lock(&tb->lock);
 	tb_dp_tunnel_deactivate_host(tunnel);
 	mutex_unlock(&tb->lock);
-	cancel_work_sync(&ctx.marker);
 	destroy_workqueue(tb->wq);
 	tb_tunnel_put(tunnel);
 	mutex_destroy(&tb->lock);
