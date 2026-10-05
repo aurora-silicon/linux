@@ -204,12 +204,14 @@ struct apple_cio {
 	struct apple_dpin_ctx {
 		struct apple_cio *acio;
 		struct work_struct work;
-		struct mutex lock;	/* protects regs and alive */
+		struct delayed_work retry;	/* re-queues work while waiting */
+		struct mutex lock;	/* protects regs, alive and waiting */
 		void __iomem *regs;	/* mapped while a DP tunnel uses this adapter */
 		unsigned int idx;
 		bool alive;		/* tunnel up; cleared before it is torn down */
 		bool handed;		/* appledrm has our callback; work only */
 		bool rearm;		/* a fresh tunnel needs a fresh DCP route */
+		bool waiting;		/* no display pipeline was free for it */
 	} dpin[2];
 };
 
@@ -370,6 +372,12 @@ static int apple_dpin_dcp_set_active(void *data, bool active)
 	return apple_dpin_set_active(c->acio, c->regs, c->idx, active);
 }
 
+/*
+ * With every display pipeline taken, a tunnel asks again this often while its
+ * display stays connected, so it lights once another display lets one go.
+ */
+#define APPLE_DPIN_RETRY_MS		2000
+
 /* appledrm may still be probing when a dock is present at boot: wait up to 30 s */
 #define APPLE_DP_CONNECT_TRIES		60
 #define APPLE_DP_CONNECT_WAIT_MS	500
@@ -491,6 +499,20 @@ static void apple_dpin_down(struct apple_dpin_ctx *c)
  * adapter on an ordered queue, so events are never lost and nothing has to be
  * allocated on the way down: whatever was handed to appledrm is taken back.
  */
+static void apple_dpin_work_fn(struct work_struct *work);
+
+static void apple_dpin_retry_fn(struct work_struct *work)
+{
+	struct apple_dpin_ctx *c = container_of(to_delayed_work(work),
+						struct apple_dpin_ctx, retry);
+	bool again;
+
+	scoped_guard(mutex, &c->lock)
+		again = c->alive && c->waiting;
+	if (again)
+		queue_work(c->acio->dp_wq, &c->work);
+}
+
 static void apple_dpin_work_fn(struct work_struct *work)
 {
 	struct apple_dpin_ctx *c = container_of(work, struct apple_dpin_ctx, work);
@@ -505,6 +527,9 @@ static void apple_dpin_work_fn(struct work_struct *work)
 		}
 
 		if (!want) {
+			scoped_guard(mutex, &c->lock)
+				c->waiting = false;
+			cancel_delayed_work(&c->retry);
 			if (c->handed || c->regs) {
 				apple_dpin_down(c);
 				dev_dbg(c->acio->dev, "dpin%u: DP tunnel down\n", c->idx);
@@ -523,13 +548,36 @@ static void apple_dpin_work_fn(struct work_struct *work)
 
 		ret = apple_dpin_up(c);
 		if (ret) {
-			scoped_guard(mutex, &c->lock)
+			bool first = false;
+
+			scoped_guard(mutex, &c->lock) {
 				want = c->alive;
+				if (want && ret == -EBUSY) {
+					first = !c->waiting;
+					c->waiting = true;
+				}
+			}
 			if (!want)
 				continue;	/* unplugged meanwhile: clean up */
+			if (ret == -EBUSY) {
+				if (first)
+					dev_info(c->acio->dev,
+						 "dpin%u: no display pipeline free; waiting for one\n",
+						 c->idx);
+				mod_delayed_work(c->acio->dp_wq, &c->retry,
+						 msecs_to_jiffies(APPLE_DPIN_RETRY_MS));
+				return;
+			}
 			dev_warn(c->acio->dev, "dpin%u: DP tunnel setup failed: %d\n",
 				 c->idx, ret);
 			return;
+		}
+		scoped_guard(mutex, &c->lock) {
+			if (c->waiting)
+				dev_info(c->acio->dev,
+					 "dpin%u: a display pipeline came free; DP tunnel up\n",
+					 c->idx);
+			c->waiting = false;
 		}
 		dev_dbg(c->acio->dev, "dpin%u: DP tunnel up\n", c->idx);
 	}
@@ -537,7 +585,12 @@ static void apple_dpin_work_fn(struct work_struct *work)
 
 static void apple_cio_destroy_wq(void *data)
 {
-	destroy_workqueue(data);
+	struct apple_cio *acio = data;
+
+	/* a pending retry would queue onto the destroyed queue */
+	for (unsigned int i = 0; i < ARRAY_SIZE(acio->dpin); i++)
+		cancel_delayed_work_sync(&acio->dpin[i].retry);
+	destroy_workqueue(acio->dp_wq);
 }
 
 static void apple_cio_of_node_put(void *data)
@@ -2457,6 +2510,7 @@ static int apple_cio_probe(struct platform_device *pdev)
 			acio->dpin[i].acio = acio;
 			acio->dpin[i].idx = i;
 			INIT_WORK(&acio->dpin[i].work, apple_dpin_work_fn);
+			INIT_DELAYED_WORK(&acio->dpin[i].retry, apple_dpin_retry_fn);
 			ret = devm_mutex_init(dev, &acio->dpin[i].lock);
 			if (ret)
 				return ret;
@@ -2464,7 +2518,7 @@ static int apple_cio_probe(struct platform_device *pdev)
 		acio->dp_wq = alloc_ordered_workqueue("%s-dp", 0, dev_name(dev));
 		if (!acio->dp_wq)
 			return -ENOMEM;
-		ret = devm_add_action_or_reset(dev, apple_cio_destroy_wq, acio->dp_wq);
+		ret = devm_add_action_or_reset(dev, apple_cio_destroy_wq, acio);
 		if (ret)
 			return ret;
 	}
