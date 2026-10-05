@@ -5,6 +5,7 @@
 #include <linux/limits.h>
 #include <linux/jiffies.h>
 #include <linux/module.h>
+#include <linux/soc/apple/dp-tunnel.h>
 
 #include "dcp-fabric-core.h"
 
@@ -13,11 +14,9 @@ enum dcp_fabric_wiring dcp_fabric_wiring(bool dpin0, bool dpin1, bool legacy,
 {
 	if (dpin0 != dpin1)
 		return DCP_FABRIC_INVALID_WIRING;
-	if (endpoints < 2)
+	if (!apple_dp_tunnel_wiring_dual(endpoints, dpin0, dpin1, legacy))
 		return DCP_FABRIC_SINGLE_STREAM;
-	if (dpin0 && dpin1)
-		return DCP_FABRIC_DUAL_NAMED;
-	return legacy ? DCP_FABRIC_DUAL_LEGACY : DCP_FABRIC_SINGLE_STREAM;
+	return dpin0 ? DCP_FABRIC_DUAL_NAMED : DCP_FABRIC_DUAL_LEGACY;
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_wiring);
 

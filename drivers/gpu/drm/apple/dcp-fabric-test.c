@@ -4,6 +4,7 @@
 #include <linux/errno.h>
 #include <linux/module.h>
 #include <linux/limits.h>
+#include <linux/soc/apple/dp-tunnel.h>
 
 #include "dcp-fabric-core.h"
 
@@ -728,7 +729,19 @@ static void fabric_wiring_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, dcp_fabric_t6020_flow(false, row->soc_support, dual));
 }
 
+static void fabric_shared_wiring_test(struct kunit *test)
+{
+	const struct fabric_wiring_case *row = test->param_value;
+	bool dual = row->expected == DCP_FABRIC_DUAL_NAMED ||
+		    row->expected == DCP_FABRIC_DUAL_LEGACY;
+
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_wiring_dual(row->endpoints, row->dpin0,
+							  row->dpin1, row->legacy), dual);
+	KUNIT_EXPECT_FALSE(test, apple_dp_tunnel_dual_stream(NULL));
+}
+
 static struct kunit_case fabric_tests[] = {
+	KUNIT_CASE_PARAM(fabric_shared_wiring_test, fabric_wiring_gen_params),
 	KUNIT_CASE_PARAM(fabric_scenario_test, fabric_scenario_gen_params),
 	KUNIT_CASE(fabric_dark_tunnel_test),
 	KUNIT_CASE(fabric_effect_failure_test),
