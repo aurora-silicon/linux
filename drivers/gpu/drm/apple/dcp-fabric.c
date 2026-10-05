@@ -827,7 +827,11 @@ replan:
 
 	list_for_each_entry(port, &dcp_typec_ports, link) {
 		struct apple_dcp_typec_route *owner = port->owner;
+		enum dcp_fabric_deactivate_step steps[3];
 		struct apple_dcp *dcp;
+		unsigned int count, i;
+		bool fixed_live;
+		int ret;
 
 		if (!dcp_fabric_movable(owner ? &owner->core : NULL,
 					port->target ? &port->target->core :
@@ -842,19 +846,27 @@ replan:
 		    (dcp->typec_connector && dcp->typec_connector->connected))
 			dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
 		port->hpd = false;
-		if (dcp_typec_route_deactivate(owner)) {
-			if (owner->selected)
+		ret = dcp_typec_route_deactivate(owner);
+		/* Deactivate's fixed-mux error has already released the route. */
+		fixed_live = !(ret && owner->selected) && dcp->hdmi_hpd &&
+			     dcp->active && gpiod_get_value_cansleep(dcp->hdmi_hpd);
+		count = dcp_fabric_deactivate_steps(ret, owner->selected,
+						    fixed_live, steps);
+		for (i = 0; i < count; i++) {
+			switch (steps[i]) {
+			case DCP_FABRIC_KEEP_OWNER:
 				dcp_typec_port_attach(port);
-			else
+				break;
+			case DCP_FABRIC_CLEAR_OWNER:
 				port->owner = NULL;
-			goto replan;
+				break;
+			case DCP_FABRIC_CONNECT_FIXED:
+				dcp_dptx_connect(dcp, 0);
+				break;
+			case DCP_FABRIC_REPLAN:
+				goto replan;
+			}
 		}
-		port->owner = NULL;
-
-		/* as after a DP exit, hand the hybrid back to a live HDMI */
-		if (dcp->hdmi_hpd && dcp->active &&
-		    gpiod_get_value_cansleep(dcp->hdmi_hpd))
-			dcp_dptx_connect(dcp, 0);
 	}
 
 	list_for_each_entry(port, &dcp_typec_ports, link) {

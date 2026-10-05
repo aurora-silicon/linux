@@ -70,6 +70,22 @@ enum dcp_fabric_fixed_step {
 	DCP_FABRIC_SELECT_MUX,
 };
 
+enum dcp_fabric_deactivate_step {
+	DCP_FABRIC_KEEP_OWNER,
+	DCP_FABRIC_CLEAR_OWNER,
+	DCP_FABRIC_CONNECT_FIXED,
+	DCP_FABRIC_REPLAN,
+};
+
+enum dcp_fabric_resume_step {
+	DCP_FABRIC_ENABLE_HPD_IRQ,
+	DCP_FABRIC_SAMPLE_HPD,
+};
+
+unsigned int dcp_fabric_deactivate_steps(int error, bool selected, bool fixed_live,
+					 enum dcp_fabric_deactivate_step steps[3]);
+void dcp_fabric_resume_steps(enum dcp_fabric_resume_step steps[2]);
+
 enum dcp_fabric_attach_action {
 	DCP_FABRIC_ATTACH_OOB,
 	DCP_FABRIC_ATTACH_WORK,

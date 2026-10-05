@@ -1891,9 +1891,21 @@ static int dcp_platform_resume(struct device *dev)
 
 	dcp_enable_typec_work(dcp);
 	if (dcp->hdmi_hpd_irq) {
+		enum dcp_fabric_resume_step steps[2];
+		unsigned int i;
+
 		/* Observe future edges before sampling any edges lost in sleep. */
-		enable_irq(dcp->hdmi_hpd_irq);
-		dcp_fabric_hdmi_resume(dcp);
+		dcp_fabric_resume_steps(steps);
+		for (i = 0; i < ARRAY_SIZE(steps); i++) {
+			switch (steps[i]) {
+			case DCP_FABRIC_ENABLE_HPD_IRQ:
+				enable_irq(dcp->hdmi_hpd_irq);
+				break;
+			case DCP_FABRIC_SAMPLE_HPD:
+				dcp_fabric_hdmi_resume(dcp);
+				break;
+			}
+		}
 	}
 
 	if (dcp->avep)

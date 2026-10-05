@@ -288,6 +288,32 @@ dcp_fabric_tunnel_candidate(const struct dcp_fabric_port *port,
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_tunnel_candidate);
 
+unsigned int dcp_fabric_deactivate_steps(int error, bool selected, bool fixed_live,
+					 enum dcp_fabric_deactivate_step steps[3])
+{
+	unsigned int count = 0;
+
+	if (error && selected) {
+		steps[count++] = DCP_FABRIC_KEEP_OWNER;
+	} else {
+		steps[count++] = DCP_FABRIC_CLEAR_OWNER;
+		if (fixed_live)
+			steps[count++] = DCP_FABRIC_CONNECT_FIXED;
+	}
+	/* Preserve fixed-output effects before discarding the failed plan. */
+	if (error)
+		steps[count++] = DCP_FABRIC_REPLAN;
+	return count;
+}
+EXPORT_SYMBOL_GPL(dcp_fabric_deactivate_steps);
+
+void dcp_fabric_resume_steps(enum dcp_fabric_resume_step steps[2])
+{
+	steps[0] = DCP_FABRIC_ENABLE_HPD_IRQ;
+	steps[1] = DCP_FABRIC_SAMPLE_HPD;
+}
+EXPORT_SYMBOL_GPL(dcp_fabric_resume_steps);
+
 unsigned int dcp_fabric_fixed_steps(bool has_fixed, bool owned, bool needs_mux,
 				    enum dcp_fabric_fixed_step steps[2])
 {

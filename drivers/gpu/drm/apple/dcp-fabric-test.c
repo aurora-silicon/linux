@@ -142,6 +142,24 @@ static void fabric_presence_scenario(struct kunit *test,
 		return;
 	}
 	if (id == 16) {
+		enum dcp_fabric_resume_step steps[2];
+		bool irq_enabled = false, sampled = false;
+		unsigned int i;
+
+		/* Fake IRQ/GPIO effects consume the production ordering decision. */
+		dcp_fabric_resume_steps(steps);
+		for (i = 0; i < ARRAY_SIZE(steps); i++) {
+			switch (steps[i]) {
+			case DCP_FABRIC_ENABLE_HPD_IRQ:
+				irq_enabled = true;
+				break;
+			case DCP_FABRIC_SAMPLE_HPD:
+				KUNIT_EXPECT_TRUE(test, irq_enabled);
+				sampled = true;
+				break;
+			}
+		}
+		KUNIT_EXPECT_TRUE(test, sampled);
 		/* Resume starts after IRQ enable: low gets the full window. */
 		newer = dcp_fabric_presence_edge(&presence, 20100, window);
 		KUNIT_ASSERT_TRUE(test,
@@ -511,6 +529,57 @@ static void fabric_effect_failure_test(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, f.port[1].owner[0], &f.route[1][1]);
 }
 
+static void fabric_deactivate_failure_test(struct kunit *test)
+{
+	struct fabric_fixture f;
+	enum dcp_fabric_deactivate_step steps[3];
+	unsigned int count, i, connects = 0, replans = 0;
+	bool selected = true;
+
+	fabric_init(&f, true);
+	f.port[0].wanted = true;
+	f.port[0].hpd = true;
+	f.port[0].owner[0] = &f.route[0][0];
+	f.pipeline[0].owned = true;
+	dcp_fabric_plan(f.pipeline, f.port, NULL, 0);
+	/* Fake deactivate releases the route, restores PHY, then mux fails. */
+	selected = false;
+	f.pipeline[0].owned = false;
+	f.pipeline[0].fixed_busy = true;
+	count = dcp_fabric_deactivate_steps(-EIO, selected, true, steps);
+	KUNIT_ASSERT_EQ(test, count, 3U);
+	KUNIT_EXPECT_EQ(test, steps[0], DCP_FABRIC_CLEAR_OWNER);
+	KUNIT_EXPECT_EQ(test, steps[1], DCP_FABRIC_CONNECT_FIXED);
+	KUNIT_EXPECT_EQ(test, steps[2], DCP_FABRIC_REPLAN);
+	for (i = 0; i < count; i++) {
+		switch (steps[i]) {
+		case DCP_FABRIC_KEEP_OWNER:
+			KUNIT_FAIL(test, "released route cannot retain ownership");
+			break;
+		case DCP_FABRIC_CLEAR_OWNER:
+			f.port[0].owner[0] = NULL;
+			break;
+		case DCP_FABRIC_CONNECT_FIXED:
+			KUNIT_EXPECT_PTR_EQ(test, f.port[0].owner[0], NULL);
+			connects++;
+			break;
+		case DCP_FABRIC_REPLAN:
+			KUNIT_EXPECT_EQ(test, connects, 1U);
+			dcp_fabric_plan(f.pipeline, f.port, NULL, 0);
+			replans++;
+			break;
+		}
+	}
+	KUNIT_EXPECT_EQ(test, connects, 1U);
+	KUNIT_EXPECT_EQ(test, replans, 1U);
+	KUNIT_EXPECT_PTR_EQ(test, f.plan[0].target[0], &f.route[0][1]);
+	/* Success uses the same parent clear/connect sequence, without replan. */
+	count = dcp_fabric_deactivate_steps(0, false, true, steps);
+	KUNIT_EXPECT_EQ(test, count, 2U);
+	KUNIT_EXPECT_EQ(test, steps[0], DCP_FABRIC_CLEAR_OWNER);
+	KUNIT_EXPECT_EQ(test, steps[1], DCP_FABRIC_CONNECT_FIXED);
+}
+
 static void fabric_unbound_and_mask_test(struct kunit *test)
 {
 	struct fabric_fixture f;
@@ -560,6 +629,7 @@ static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE_PARAM(fabric_scenario_test, fabric_scenario_gen_params),
 	KUNIT_CASE(fabric_dark_tunnel_test),
 	KUNIT_CASE(fabric_effect_failure_test),
+	KUNIT_CASE(fabric_deactivate_failure_test),
 	KUNIT_CASE(fabric_unbound_and_mask_test),
 	KUNIT_CASE(fabric_presence_wrap_test),
 	{}
