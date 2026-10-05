@@ -1562,8 +1562,28 @@ static void fabric_capacity_notification_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f.trace[0], FX_REBALANCE);
 }
 
+static void fabric_connector_flow_core_test(struct kunit *test)
+{
+	bool single_stream = apple_dp_tunnel_wiring_dual(2, false, false, false);
+
+	/* Plain dcpext2/3 routes inherit the physical connector's capacity. */
+	for (unsigned int dcp = 0; dcp < 4; dcp++) {
+		bool route_has_dpin = dcp < 2;
+		bool connector_wired = apple_dp_tunnel_wiring_dual(2, true, true, false);
+
+		KUNIT_EXPECT_TRUE(test, dcp_fabric_t6020_flow(true, true, connector_wired));
+		if (!route_has_dpin)
+			KUNIT_EXPECT_FALSE(test, dcp_fabric_t6020_flow(true, true, route_has_dpin));
+		KUNIT_EXPECT_FALSE(test, dcp_fabric_t6020_flow(false, true, connector_wired));
+		KUNIT_EXPECT_FALSE(test, dcp_fabric_t6020_flow(true, false, connector_wired));
+	}
+	/* Two endpoints alone do not enable the flow on a single-stream port. */
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_t6020_flow(true, true, single_stream));
+}
+
 static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE_PARAM(fabric_shared_wiring_test, fabric_wiring_gen_params),
+	KUNIT_CASE(fabric_connector_flow_core_test),
 	KUNIT_CASE(fabric_capacity_notification_test),
 	KUNIT_CASE(fabric_binding_cookie_test),
 	KUNIT_CASE(fabric_reconnect_session_test),

@@ -20,9 +20,9 @@ enum dcp_fabric_wiring dcp_fabric_wiring(bool dpin0, bool dpin1, bool legacy,
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_wiring);
 
-bool dcp_fabric_t6020_flow(bool usb4, bool soc_support, bool route_wired)
+bool dcp_fabric_t6020_flow(bool usb4, bool soc_support, bool connector_wired)
 {
-	return usb4 && soc_support && route_wired;
+	return usb4 && soc_support && connector_wired;
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_t6020_flow);
 

@@ -84,10 +84,10 @@ bool dcp_is_usb4_output(struct apple_dcp *dcp)
 bool dcp_uses_t6020_tunnel_flow(struct apple_dcp *dcp)
 {
 	struct apple_dcp_typec_route *route = READ_ONCE(dcp->active_typec_route);
+	bool connector_wired = route && apple_dp_tunnel_dual_stream(route->port->connector_np);
 
 	return dcp_fabric_t6020_flow(dcp_is_usb4_output(dcp),
-				     dcp->hw.t6020_tunnel_flow,
-				     route && route->dual_stream);
+				     dcp->hw.t6020_tunnel_flow, connector_wired);
 }
 
 static bool dcp_typec_route_is_dp(const struct typec_mux_state *state)
