@@ -390,7 +390,7 @@ static int apple_dpin_connect(struct apple_dpin_ctx *c, bool active)
 	struct apple_cio *acio = c->acio;
 	typeof(&apple_dcp_tb_dp_tunnel) fn;
 	unsigned int tries;
-	bool alive;
+	bool alive, paused;
 	int ret;
 
 	for (tries = 1; ; tries++) {
@@ -423,10 +423,15 @@ static int apple_dpin_connect(struct apple_dpin_ctx *c, bool active)
 					       APPLE_DP_CONNECT_TRIES))
 			return ret;
 
-		scoped_guard(mutex, &c->lock)
+		scoped_guard(mutex, &c->lock) {
 			alive = c->alive;
+			paused = c->paused;
+		}
 		if (!alive)
 			return -ENODEV;
+		/* not across system sleep: ask again once it is over */
+		if (paused)
+			return -EAGAIN;
 		if (tries == 1)
 			dev_info(acio->dev, "dpin%u: waiting for display driver/firmware readiness\n",
 				 c->idx);
@@ -559,7 +564,8 @@ static void apple_dpin_work_fn(struct work_struct *work)
 
 		ret = apple_dpin_up(c);
 		if (ret) {
-			bool wait = ret == -EBUSY && apple_dpin_can_wait();
+			bool wait = (ret == -EBUSY || ret == -EAGAIN) &&
+				    apple_dpin_can_wait();
 			bool first = false, paused = false;
 
 			scoped_guard(mutex, &c->lock) {
@@ -568,8 +574,13 @@ static void apple_dpin_work_fn(struct work_struct *work)
 					first = !c->waiting;
 					c->waiting = true;
 					paused = c->paused;
+				} else {
+					/* the connection manager decides about the tunnel again */
+					c->waiting = false;
 				}
 			}
+			if (!wait)
+				cancel_delayed_work(&c->retry);
 			if (!want)
 				continue;	/* unplugged meanwhile: clean up */
 			if (wait) {
@@ -1898,12 +1909,14 @@ static void apple_nhi_remove(struct platform_device *pdev)
 /*
  * A tunnel waiting for a display pipeline asks appledrm again every few
  * seconds.  Not while devices suspend and resume: stop asking before any of
- * them suspends, let an attempt in flight finish, and ask again once all of
- * them have resumed.  The tunnel itself keeps waiting meanwhile.
+ * them suspends, let an attempt in flight finish (a wait for appledrm to
+ * load gives way, see apple_dpin_connect()), and ask again once all of them
+ * have resumed.  The tunnel itself keeps waiting meanwhile.  Tunnel events
+ * still bring a display up or down at any time, as they always have.
  */
 static void apple_dpin_pause_retries(struct apple_cio *acio)
 {
-	if (!acio->dp_wq)
+	if (!acio->dp_wq || !apple_dpin_can_wait())
 		return;
 	for (unsigned int i = 0; i < ARRAY_SIZE(acio->dpin); i++) {
 		struct apple_dpin_ctx *c = &acio->dpin[i];
@@ -1917,7 +1930,7 @@ static void apple_dpin_pause_retries(struct apple_cio *acio)
 
 static void apple_dpin_resume_retries(struct apple_cio *acio)
 {
-	if (!acio->dp_wq)
+	if (!acio->dp_wq || !apple_dpin_can_wait())
 		return;
 	for (unsigned int i = 0; i < ARRAY_SIZE(acio->dpin); i++) {
 		struct apple_dpin_ctx *c = &acio->dpin[i];
