@@ -1394,7 +1394,6 @@ static void apple_pcie_port_teardown(struct apple_pcie_port *port)
 		/* An IRQ may have selected our handler without loading its data. */
 		irq_set_chained_handler(port->irq, NULL);
 		synchronize_rcu();
-		irq_set_handler_data(port->irq, NULL);
 		irq_dispose_mapping(port->irq);
 		port->irq = 0;
 	}
