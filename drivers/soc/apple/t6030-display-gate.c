@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * Apple T6030 internal display enable gate
+ * Apple T6030 internal display enable gate, and its T8122 counterpart
  *
  * The T6030 device tree describes the internal display (the DCP, its
  * mailbox, the two display DARTs and the display subsystem) with every node
@@ -38,9 +38,16 @@
  * Without PMP values for this Mac, or if a check fails or the PMP cannot be
  * added, the display nodes stay (or are put back) disabled and the display
  * stays on the boot framebuffer.
+ *
+ * What differs between SoCs is in struct gate_soc. On T8122 (M3) the gate
+ * serves the same handoff, marked apple,t8122-handoff by the boot loader on
+ * apple,t8122-dcp and apple,t8122-display-subsystem nodes. No T8122 PMP
+ * description is built in yet, so there it never enables anything; a T8122
+ * device tree without display nodes is normal and the gate says nothing.
+ * apple_t8122_display.enable=0 has the same effect as the T6030 option.
  */
 
-#define pr_fmt(fmt) "apple-t6030-display: " fmt
+#define pr_fmt(fmt) fmt
 
 #include <linux/errno.h>
 #include <linux/init.h>
@@ -101,6 +108,75 @@ static struct device_node *gate_pmp_values __initdata;
  */
 static const char gate_pmp_uuid[] __initconst = "2F4EB4C4-001B-3ACF-A9A0-68D8E42FC3A7";
 
+/* One SoC's internal display handoff, as the gate checks and completes it */
+struct gate_soc {
+	const char *machine;		/* root compatible */
+	const char *prefix;		/* log prefix */
+	const char *name;
+	const char *dcp_compat;
+	const char *display_compat;
+	const char *marker;		/* set to <1> by the boot loader */
+	const char *pwrstate_compat;	/* the PMGR power states */
+	const char *dcp_full_name;	/* the DCP node the PMP overlay expects, under /soc */
+	const char *pmp_values;		/* the boot loader's PMP values for this Mac */
+	const char *pmp_uuid;		/* the PMP image the PMP support is written for */
+	const char *report_compat;	/* the PMP report the overlay adds */
+	const u8 *pmp_dtbo, *pmp_dtbo_end;	/* NULL: no PMP description built in */
+	const char *fallback_board;	/* gets the fallback overlay without boot loader values */
+	const u8 *fallback_dtbo, *fallback_dtbo_end;
+	bool quiet_without_nodes;	/* no display nodes in the device tree is normal */
+	bool dcpext;			/* the external display processor and its scanout */
+};
+
+static const struct gate_soc gate_t6030 __initconst = {
+	.machine = "apple,t6030",
+	.prefix = "apple-t6030-display: ",
+	.name = "T6030",
+	.dcp_compat = "apple,t6030-dcp",
+	.display_compat = "apple,t6030-display-subsystem",
+	.marker = "apple,t6030-handoff",
+	.pwrstate_compat = "apple,t6030-pmgr-pwrstate",
+	.dcp_full_name = "dcp@28ec00000",
+	.pmp_values = "/chosen/asahi,t6030-pmp",
+	.pmp_uuid = gate_pmp_uuid,
+	.report_compat = "apple,t6030-pmp-v2-report",
+	.pmp_dtbo = __dtbo_t6030_pmp_begin,
+	.pmp_dtbo_end = __dtbo_t6030_pmp_end,
+	.fallback_board = "apple,j516s",
+	.fallback_dtbo = __dtbo_t6030_j516s_pmp_begin,
+	.fallback_dtbo_end = __dtbo_t6030_j516s_pmp_end,
+	.dcpext = true,
+};
+
+/*
+ * T8122 (M3 MacBook Air): the same handoff and power states. Neither the PMP
+ * placement nor its image are known for T8122 yet, so there is no PMP
+ * description and the gate refuses before it changes anything.
+ */
+static const struct gate_soc gate_t8122 __initconst = {
+	.machine = "apple,t8122",
+	.prefix = "apple-t8122-display: ",
+	.name = "T8122",
+	.dcp_compat = "apple,t8122-dcp",
+	.display_compat = "apple,t8122-display-subsystem",
+	.marker = "apple,t8122-handoff",
+	.pwrstate_compat = "apple,t8122-pmgr-pwrstate",
+	.pmp_values = "/chosen/asahi,t8122-pmp",
+	.quiet_without_nodes = true,
+};
+
+static const struct gate_soc *const gate_socs[] __initconst = {
+	&gate_t6030,
+	&gate_t8122,
+};
+
+/* The SoC this boot runs on, if the gate serves it. */
+static const struct gate_soc *gate_soc __initdata;
+
+#define gate_info(fmt, ...) pr_info("%s" fmt, gate_soc->prefix, ##__VA_ARGS__)
+#define gate_warn(fmt, ...) pr_warn("%s" fmt, gate_soc->prefix, ##__VA_ARGS__)
+#define gate_err(fmt, ...) pr_err("%s" fmt, gate_soc->prefix, ##__VA_ARGS__)
+
 /* The boot loader's values the gate copies onto the PMP node. */
 static bool __init gate_pmp_value_wanted(const struct property *prop)
 {
@@ -123,6 +199,12 @@ static int __init gate_setup(char *arg)
 }
 early_param("apple_t6030_display.enable", gate_setup);
 
+static int __init gate_setup_t8122(char *arg)
+{
+	return gate_setup(arg);
+}
+early_param("apple_t8122_display.enable", gate_setup_t8122);
+
 /* Returns the only node compatible with @compat, or NULL if there are none or several. */
 static struct device_node *__init gate_find_one(const char *compat)
 {
@@ -144,7 +226,7 @@ static bool __init gate_marked(const struct device_node *np)
 {
 	u32 val;
 
-	return !of_property_read_u32(np, "apple,t6030-handoff", &val) && val == 1;
+	return !of_property_read_u32(np, gate_soc->marker, &val) && val == 1;
 }
 
 static bool __init gate_disabled(const struct device_node *np)
@@ -186,27 +268,36 @@ static int __init gate_resolve(struct device_node **np)
 {
 	int i;
 
-	np[GATE_DCP] = gate_find_one("apple,t6030-dcp");
+	struct device_node *any;
+
+	if (gate_soc->quiet_without_nodes) {
+		any = of_find_compatible_node(NULL, NULL, gate_soc->dcp_compat);
+		if (!any)
+			return -ENODEV;
+		of_node_put(any);
+	}
+
+	np[GATE_DCP] = gate_find_one(gate_soc->dcp_compat);
 	if (!np[GATE_DCP]) {
-		pr_warn("not enabling: need exactly one apple,t6030-dcp node\n");
+		gate_warn("not enabling: need exactly one %s node\n", gate_soc->dcp_compat);
 		return -ENODEV;
 	}
 
-	np[GATE_DISPLAY] = gate_find_one("apple,t6030-display-subsystem");
+	np[GATE_DISPLAY] = gate_find_one(gate_soc->display_compat);
 	if (!np[GATE_DISPLAY]) {
-		pr_warn("not enabling: need exactly one apple,t6030-display-subsystem node\n");
+		gate_warn("not enabling: need exactly one %s node\n", gate_soc->display_compat);
 		return -ENODEV;
 	}
 
 	if (!gate_marked(np[GATE_DCP]) || !gate_marked(np[GATE_DISPLAY])) {
-		pr_warn("not enabling: the boot loader did not set apple,t6030-handoff\n");
+		gate_warn("not enabling: the boot loader did not set %s\n", gate_soc->marker);
 		return -EPERM;
 	}
 
 	np[GATE_DCP_DART] = gate_target(np[GATE_DCP], "iommus", "#iommu-cells",
 					1, 5, "apple,t8110-dart");
 	if (!np[GATE_DCP_DART]) {
-		pr_warn("not enabling: %pOF iommus is not one apple,t8110-dart stream 5\n",
+		gate_warn("not enabling: %pOF iommus is not one apple,t8110-dart stream 5\n",
 			np[GATE_DCP]);
 		return -EINVAL;
 	}
@@ -215,7 +306,7 @@ static int __init gate_resolve(struct device_node **np)
 					  "#iommu-cells", 1, 0,
 					  "apple,t8110-dart");
 	if (!np[GATE_DISP0_DART]) {
-		pr_warn("not enabling: %pOF iommus is not one apple,t8110-dart stream 0\n",
+		gate_warn("not enabling: %pOF iommus is not one apple,t8110-dart stream 0\n",
 			np[GATE_DISPLAY]);
 		return -EINVAL;
 	}
@@ -223,20 +314,20 @@ static int __init gate_resolve(struct device_node **np)
 	np[GATE_DCP_MBOX] = gate_target(np[GATE_DCP], "mboxes", "#mbox-cells",
 					0, 0, "apple,asc-mailbox-v4");
 	if (!np[GATE_DCP_MBOX]) {
-		pr_warn("not enabling: %pOF mboxes is not one apple,asc-mailbox-v4\n",
+		gate_warn("not enabling: %pOF mboxes is not one apple,asc-mailbox-v4\n",
 			np[GATE_DCP]);
 		return -EINVAL;
 	}
 
 	if (np[GATE_DCP_DART] == np[GATE_DISP0_DART]) {
-		pr_warn("not enabling: the DCP and the display subsystem share %pOF\n",
+		gate_warn("not enabling: the DCP and the display subsystem share %pOF\n",
 			np[GATE_DCP_DART]);
 		return -EINVAL;
 	}
 
 	for (i = 0; i < GATE_NR_NODES; i++) {
 		if (!gate_disabled(np[i])) {
-			pr_warn("not enabling: %pOF is not disabled\n", np[i]);
+			gate_warn("not enabling: %pOF is not disabled\n", np[i]);
 			return -EBUSY;
 		}
 	}
@@ -261,11 +352,11 @@ static int __init gate_apply(struct device_node **np)
 
 	if (ret) {
 		of_changeset_destroy(&gate_cs);
-		pr_err("not enabling: changeset failed: %d\n", ret);
+		gate_err("not enabling: changeset failed: %d\n", ret);
 		return ret;
 	}
 
-	pr_info("enabled %pOF, %pOF, %pOF, %pOF and %pOF\n",
+	gate_info("enabled %pOF, %pOF, %pOF, %pOF and %pOF\n",
 		np[GATE_DCP_DART], np[GATE_DISP0_DART], np[GATE_DCP_MBOX],
 		np[GATE_DCP], np[GATE_DISPLAY]);
 
@@ -278,25 +369,25 @@ static void __init gate_revert(void)
 	int ret = of_changeset_revert(&gate_cs);
 
 	if (ret) {
-		pr_err("could not disable the display nodes again: %d\n", ret);
+		gate_err("could not disable the display nodes again: %d\n", ret);
 		return;
 	}
 	of_changeset_destroy(&gate_cs);
-	pr_info("display nodes disabled again, display stays on the boot framebuffer\n");
+	gate_info("display nodes disabled again, display stays on the boot framebuffer\n");
 }
 
-/* The single power domain of @np, if it is a T6030 power state. */
+/* The single power domain of @np, if it is one of the SoC's power states. */
 static struct device_node *__init gate_ps_parent(struct device_node *np)
 {
 	return gate_target(np, "power-domains", "#power-domain-cells", 0, 0,
-			   "apple,t6030-pmgr-pwrstate");
+			   gate_soc->pwrstate_compat);
 }
 
 static bool __init gate_ps_is(const struct device_node *np, const char *label)
 {
 	const char *name;
 
-	return np && of_device_is_compatible(np, "apple,t6030-pmgr-pwrstate") &&
+	return np && of_device_is_compatible(np, gate_soc->pwrstate_compat) &&
 	       !of_property_read_string(np, "label", &name) && !strcmp(name, label);
 }
 
@@ -329,7 +420,12 @@ static int __init gate_pmp_resolve(struct device_node **np, struct device_node *
 	struct device_node *pmgr, *other;
 	int i;
 
-	gate_pmp_values = of_find_node_by_path("/chosen/asahi,t6030-pmp");
+	if (!gate_soc->pmp_dtbo) {
+		gate_warn("PMP not added: no %s PMP description is built in\n", gate_soc->name);
+		return -ENODEV;
+	}
+
+	gate_pmp_values = of_find_node_by_path(gate_soc->pmp_values);
 	if (gate_pmp_values) {
 		const char *uuid = NULL;
 		u32 v;
@@ -337,39 +433,40 @@ static int __init gate_pmp_resolve(struct device_node **np, struct device_node *
 		if (of_property_read_u32(gate_pmp_values, "apple,board-id", &v) ||
 		    of_property_read_u32(gate_pmp_values, "apple,dram-vendor-id", &v) ||
 		    of_property_read_string(gate_pmp_values, "apple,tunable-uuid", &uuid)) {
-			pr_warn("PMP not added: %pOF is incomplete\n", gate_pmp_values);
+			gate_warn("PMP not added: %pOF is incomplete\n", gate_pmp_values);
 			of_node_put(gate_pmp_values);
 			gate_pmp_values = NULL;
 			return -EINVAL;
 		}
-		if (strcmp(uuid, gate_pmp_uuid)) {
-			pr_warn("PMP not added: this Mac's PMP firmware image is %s, not %s\n",
-				uuid, gate_pmp_uuid);
+		if (strcmp(uuid, gate_soc->pmp_uuid)) {
+			gate_warn("PMP not added: this Mac's PMP firmware image is %s, not %s\n",
+				uuid, gate_soc->pmp_uuid);
 			of_node_put(gate_pmp_values);
 			gate_pmp_values = NULL;
 			return -EINVAL;
 		}
 	}
-	if (!gate_pmp_values && !of_machine_is_compatible("apple,j516s")) {
-		pr_warn("PMP not added: the boot loader passed no PMP values for this Mac\n");
+	if (!gate_pmp_values && (!gate_soc->fallback_board ||
+				 !of_machine_is_compatible(gate_soc->fallback_board))) {
+		gate_warn("PMP not added: the boot loader passed no PMP values for this Mac\n");
 		return -ENODEV;
 	}
 
 	other = of_find_compatible_node(NULL, NULL, "apple,t6000-pmp-v2");
 	if (!other)
-		other = of_find_compatible_node(NULL, NULL, "apple,t6030-pmp-v2-report");
+		other = of_find_compatible_node(NULL, NULL, gate_soc->report_compat);
 	if (other) {
-		pr_warn("PMP not added: %pOF already exists\n", other);
+		gate_warn("PMP not added: %pOF already exists\n", other);
 		of_node_put(other);
 		return -EEXIST;
 	}
 
 	/* The overlay's DCP fragment names this path. */
-	if (strcmp(of_node_full_name(np[GATE_DCP]), "dcp@28ec00000") ||
+	if (strcmp(of_node_full_name(np[GATE_DCP]), gate_soc->dcp_full_name) ||
 	    !of_node_name_eq(np[GATE_DCP]->parent, "soc") ||
 	    !of_node_is_root(np[GATE_DCP]->parent->parent)) {
-		pr_warn("PMP not added: the DCP is %pOF, not /soc/dcp@28ec00000\n",
-			np[GATE_DCP]);
+		gate_warn("PMP not added: the DCP is %pOF, not /soc/%s\n",
+			np[GATE_DCP], gate_soc->dcp_full_name);
 		return -EINVAL;
 	}
 
@@ -386,21 +483,21 @@ static int __init gate_pmp_resolve(struct device_node **np, struct device_node *
 	}
 	for (i = 0; i < PMP_PS_NR; i++) {
 		if (!gate_ps_is(ps[i], pmp_ps_labels[i])) {
-			pr_warn("PMP not added: no %s power state where expected\n",
+			gate_warn("PMP not added: no %s power state where expected\n",
 				pmp_ps_labels[i]);
 			return -ENODEV;
 		}
 	}
 	for (i = PMP_PS_DISP_SYS; i <= PMP_PS_DISP_CPU; i++) {
 		if (!of_property_read_bool(ps[i], "apple,inherited-on")) {
-			pr_warn("PMP not added: %pOF is not apple,inherited-on\n", ps[i]);
+			gate_warn("PMP not added: %pOF is not apple,inherited-on\n", ps[i]);
 			return -EINVAL;
 		}
 	}
 
 	*aic = of_parse_phandle(np[GATE_DCP_MBOX], "interrupt-parent", 0);
 	if (!*aic || !of_property_read_bool(*aic, "interrupt-controller")) {
-		pr_warn("PMP not added: %pOF has no interrupt parent\n", np[GATE_DCP_MBOX]);
+		gate_warn("PMP not added: %pOF has no interrupt parent\n", np[GATE_DCP_MBOX]);
 		return -EINVAL;
 	}
 
@@ -470,20 +567,20 @@ static int __init gate_pmp_copy_values(struct of_changeset *cs, struct device_no
 static int __init gate_pmp_apply(struct device_node *dcp, struct device_node **ps,
 				 struct device_node *aic)
 {
-	const u8 *dtbo = gate_pmp_values ? __dtbo_t6030_pmp_begin : __dtbo_t6030_j516s_pmp_begin;
+	const u8 *dtbo = gate_pmp_values ? gate_soc->pmp_dtbo : gate_soc->fallback_dtbo;
 	const size_t size = gate_pmp_values ?
-		__dtbo_t6030_pmp_end - __dtbo_t6030_pmp_begin :
-		__dtbo_t6030_j516s_pmp_end - __dtbo_t6030_j516s_pmp_begin;
+		gate_soc->pmp_dtbo_end - gate_soc->pmp_dtbo :
+		gate_soc->fallback_dtbo_end - gate_soc->fallback_dtbo;
 	struct device_node *report, *disp = NULL, *pmp = NULL, *dart = NULL, *mbox = NULL;
 	int ovcs_id = 0, ret, i, values = 0;
 
 	ret = of_overlay_fdt_apply(dtbo, size, &ovcs_id, NULL);
 	if (ret) {
-		pr_err("PMP not added: overlay failed: %d\n", ret);
+		gate_err("PMP not added: overlay failed: %d\n", ret);
 		return ret;
 	}
 
-	report = of_find_compatible_node(NULL, NULL, "apple,t6030-pmp-v2-report");
+	report = of_find_compatible_node(NULL, NULL, gate_soc->report_compat);
 	if (report) {
 		struct device_node *child;
 
@@ -538,15 +635,15 @@ static int __init gate_pmp_apply(struct device_node *dcp, struct device_node **p
 	if (ret) {
 		of_changeset_destroy(&gate_pmp_cs);
 		of_overlay_remove(&ovcs_id);
-		pr_err("PMP not added: changeset failed: %d\n", ret);
+		gate_err("PMP not added: changeset failed: %d\n", ret);
 		return ret;
 	}
 
 	if (gate_pmp_values)
-		pr_info("PMP: this Mac's %d values from %pOF\n", values, gate_pmp_values);
+		gate_info("PMP: this Mac's %d values from %pOF\n", values, gate_pmp_values);
 	else
-		pr_info("PMP: the built-in J516S values; the boot loader passed none\n");
-	pr_info("added the PMP and its display and storage report; minimum power state of %s, %s and %s raised to active; %s and %s kept on\n",
+		gate_info("PMP: the built-in J516S values; the boot loader passed none\n");
+	gate_info("added the PMP and its display and storage report; minimum power state of %s, %s and %s raised to active; %s and %s kept on\n",
 		pmp_ps_labels[PMP_PS_DISP_SYS], pmp_ps_labels[PMP_PS_DISP_FE],
 		pmp_ps_labels[PMP_PS_DISP_CPU], pmp_ps_labels[PMP_PS_PMP],
 		pmp_ps_labels[PMP_PS_PMS_SRAM]);
@@ -694,10 +791,10 @@ static void __init gate_dispext_scanout(struct device_node *dcp)
 	if (ret)
 		of_changeset_destroy(&gate_scanout_cs);
 	else
-		pr_info("external scanout DART verified locked with empty SID0/SID4 roots; enabled SID0 consumer\n");
+		gate_info("external scanout DART verified locked with empty SID0/SID4 roots; enabled SID0 consumer\n");
 out:
 	if (ret)
-		pr_warn("external scanout remains disabled: handoff/root validation failed (%d)\n", ret);
+		gate_warn("external scanout remains disabled: handoff/root validation failed (%d)\n", ret);
 	if (mmio)
 		iounmap(mmio);
 	of_node_put(region);
@@ -720,7 +817,7 @@ static void __init gate_dcpext(void)
 	if (!np[0] || of_property_read_u32(np[0], "apple,t6030-dcpext-memory-ready", &ready) ||
 	    ready != 1 || !of_property_present(np[0], "memory-region")) {
 		/* The boot loader did not hand the external processor over. */
-		pr_info("dcpext not handed off by the boot loader, left disabled\n");
+		gate_info("dcpext not handed off by the boot loader, left disabled\n");
 		goto put;
 	}
 	np[1] = gate_target(np[0], "iommus", "#iommu-cells", 1, 5, "apple,t8110-dart");
@@ -776,15 +873,15 @@ static void __init gate_dcpext(void)
 		ret = of_changeset_apply(&gate_dcpext_cs);
 	if (ret) {
 		of_changeset_destroy(&gate_dcpext_cs);
-		pr_warn("external memory gate failed: %d\n", ret);
+		gate_warn("external memory gate failed: %d\n", ret);
 	} else {
 		applied = true;
-		pr_info("enabled dcpext memory devices and PMP DISPEXT0 request with CPU power floor; external CPU startup remains manual\n");
+		gate_info("enabled dcpext memory devices and PMP DISPEXT0 request with CPU power floor; external CPU startup remains manual\n");
 		gate_dispext_scanout(np[0]);
 	}
 out:
 	if (!applied)
-		pr_warn("dcpext remains disabled: power and memory prerequisites were not applied\n");
+		gate_warn("dcpext remains disabled: power and memory prerequisites were not applied\n");
 put:
 	of_node_put(domain);
 	of_node_put(entry);
@@ -804,18 +901,21 @@ static int __init apple_t6030_display_gate(void)
 	struct device_node *aic = NULL;
 	int i;
 
-	if (!of_machine_is_compatible("apple,t6030"))
+	for (i = 0; i < ARRAY_SIZE(gate_socs) && !gate_soc; i++)
+		if (of_machine_is_compatible(gate_socs[i]->machine))
+			gate_soc = gate_socs[i];
+	if (!gate_soc)
 		return 0;
 
 	if (!gate_requested) {
-		pr_info("disabled on the command line, display stays on the boot framebuffer\n");
+		gate_info("disabled on the command line, display stays on the boot framebuffer\n");
 		return 0;
 	}
 
 	if (!gate_resolve(np) && !gate_pmp_resolve(np, ps, &aic) && !gate_apply(np)) {
 		if (gate_pmp_apply(np[GATE_DCP], ps, aic))
 			gate_revert();
-		else
+		else if (gate_soc->dcpext)
 			gate_dcpext();
 	}
 	of_node_put(aic);

@@ -165,6 +165,10 @@ config APPLE_T6030_DISPLAY_GATE
 	  built-in ones). Without them it does nothing.
 	  apple_t6030_display.enable=0 keeps the boot framebuffer.
 
+	  The same gate serves T8122 (M3) device trees with
+	  apple,t8122-handoff. No T8122 PMP description is built in yet, so
+	  on T8122 it never enables anything.
+
 	  Say 'y' if you want the native display on M3 Pro MacBook Pros.
 
 endmenu
