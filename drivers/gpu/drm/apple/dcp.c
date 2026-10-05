@@ -552,6 +552,21 @@ static bool dcp_typec_keep_order(void)
 	return drm && READ_ONCE(drm->registered) && !dcp_typec_frozen(drm);
 }
 
+/*
+ * HDMI hotplug often blinks: a monitor waking up or switching inputs drops
+ * HPD for a second or so.  A Thunderbolt tunnel never moves once it has a
+ * pipeline, so without dual-stream docks one may not take the hybrid until
+ * HDMI has been quiet for this long, or a tunnel waiting for a pipeline
+ * would take it in the blink and keep the returning HDMI display dark.
+ */
+#define DCP_HDMI_HOLD_MS	10000
+
+static bool dcp_hdmi_held(struct apple_dcp *dcp)
+{
+	return dcp->hdmi_hpd && dcp->hdmi_hold_until &&
+	       time_before(jiffies, dcp->hdmi_hold_until);
+}
+
 /* A Thunderbolt tunnel holds @dcp's pipeline: it never moves. */
 static bool dcp_typec_tunnel_held(struct apple_dcp *dcp)
 {
@@ -1457,6 +1472,8 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
 		if (ordered && candidate != planned)
 			continue;
 		if (!dcp_typec_route_available(candidate))
+			continue;
+		if (!dcp_typec_dual_stream() && dcp_hdmi_held(candidate->dcp))
 			continue;
 		if (!dcp_typec_route_fits(candidate, dpin ?
 					  port->secondary_connector :
@@ -2576,6 +2593,9 @@ static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
 	bool connected;
 
 	guard(mutex)(&dcp_typec_fabric_lock);
+
+	/* any edge: a display is there or just was (see dcp_hdmi_held()) */
+	dcp->hdmi_hold_until = jiffies + msecs_to_jiffies(DCP_HDMI_HOLD_MS);
 
 	if (READ_ONCE(dcp->active_typec_route)) {
 		/*
