@@ -1581,6 +1581,50 @@ reset_touchid() {
 # Printed by --agent-prompt, and pointed at from the end of a successful
 # install. This is written for an agent driving the test on a real Mac: it says
 # what to establish, what counts as a pass, and how to write it up.
+# --m3-report: one file with what an M3 test report needs, in the current
+# directory. It reads only: the boot loader's /chosen entries, a kernel log
+# filtered to the M3 bring-up, USB-C and display state. Lines naming a USB
+# serial number are dropped and MAC addresses are masked.
+M3_REPORT_DMESG='asahi|agx|gpu|g15|dcp|dart|t8122|t6030|reserved|iommu|mailbox|pmp|simpledrm|m1n1|tipd|typec|sn201202|atc|usb|xhci|dwc3|thermal|macsmc'
+m3_report() {
+  local dir out board soc f
+  board=$(this_board) soc=$(this_soc)
+  out=$PWD/aurora-m3-report-${board:-mac}-$(date +%Y%m%d-%H%M%S).tgz
+  dir=$(mktemp -d)
+  {
+    echo "board: ${board:-?} soc: ${soc:-?}"
+    echo "kernel: $(uname -r)"
+    for f in os-fw-version system-fw-version iboot2-version m1n1-stage1-version m1n1-stage2-version; do
+      printf '%s: ' "$f"; { tr -d '\0' <"$DT/chosen/asahi,$f"; } 2>/dev/null || printf '-'; echo
+    done
+    pacman -Q linux-aurora m1n1-aurora m1n1 2>/dev/null || true
+    printf 'm3-mode: '; cat "$STATE/m3-mode" 2>/dev/null || echo -
+    echo "m1n1.conf switches:"; grep '^chosen\.' "$M1N1_CONF" 2>/dev/null || echo -
+  } >"$dir/system.txt"
+  { dmesg 2>/dev/null || $sudo dmesg; } | grep -iE "$M3_REPORT_DMESG" | grep -viE 'serialnumber|serial number' |
+    sed -E 's/([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}/xx:xx:xx:xx:xx:xx/g' >"$dir/dmesg-m3.txt" || true
+  mkdir -p "$dir/chosen"
+  for f in "$DT"/chosen/asahi,t8122-* "$DT"/chosen/asahi,t6030-*; do
+    [[ -e $f ]] && cp -r "$f" "$dir/chosen/"
+  done
+  {
+    echo "== lsusb -t"; lsusb -t 2>/dev/null || echo "(lsusb not installed)"
+    echo "== /sys/class/typec"
+    for f in /sys/class/typec/port*; do
+      [[ -d $f ]] || continue
+      echo "$(basename "$f"): data_role=$(cat "$f/data_role" 2>/dev/null) power_role=$(cat "$f/power_role" 2>/dev/null)"
+    done
+    echo "== /dev/dri"; ls -l /dev/dri 2>/dev/null || true
+    echo "== drm connectors"
+    for f in /sys/class/drm/card*-*/status; do [[ -e $f ]] && echo "$f: $(cat "$f")"; done
+  } >"$dir/usb-display.txt" 2>&1
+  tar czf "$out" -C "$dir" . && rm -rf "$dir"
+  say "Report written to $out
+    Attach it to your issue at https://github.com/iconidentify/aurora-linux/issues, together
+    with the serial log if you recorded one. It has no full kernel log, no USB serial numbers
+    and no MAC addresses."
+}
+
 agent_prompt() {
   cat <<'PROMPT'
 You are testing an experimental Secure Enclave / Touch ID kernel on an Apple
@@ -1934,15 +1978,12 @@ fingerprint.
           device tree for the Air for the first time. Expected within about a
           minute: the Omarchy logo, the boot menu, then the same desktop as
           before. Then report exactly one of:
-          * WORKS: the desktop comes up as before. Collect and attach:
-              sudo dmesg | grep -iE 'asahi|agx|gpu|dcp|dart|t8122|reserved|iommu|mailbox|pmp|simpledrm|m1n1' > dmesg-air.txt
-              ls -d /proc/device-tree/chosen/asahi,t8122-*
-            and, if that lists anything:
-              sudo tar czf air-dryrun.tgz -C /proc/device-tree/chosen $(cd /proc/device-tree/chosen && ls -d asahi,t8122-*)
-            (if it lists nothing, say so instead), plus the serial log with
-            the line that shows the Mac's serial number removed. Skim
-            dmesg-air.txt for serial numbers or MAC addresses before posting.
-            Give the baseline checks below again too. Title it
+          * WORKS: the desktop comes up as before. Run the test build's
+            one-liner with --m3-report (same URL, "bash -s -- --m3-report"):
+            it writes one file, aurora-m3-report-<board>-<date>.tgz, in the
+            current directory. Attach that and the serial log, with the
+            line that shows the Mac's serial number removed. Give the
+            baseline checks below again too. Title it
             "<board> (<model>): M3 Air dry run".
           * STOPS: m1n1 text and no boot menu, or a black screen for more
             than two minutes. The owner puts the old boot.bin back from
@@ -2005,7 +2046,7 @@ PROMPT
 }
 
 # A reset needs none of the kernel and boot checks; it checks for itself.
-preflight_needed() { case ${1:-} in --agent-prompt | --reset-touchid) return 1 ;; *) return 0 ;; esac; }
+preflight_needed() { case ${1:-} in --agent-prompt | --reset-touchid | --m3-report) return 1 ;; *) return 0 ;; esac; }
 
 # Tests source this file for its functions only.
 if [[ ${AURORA_SEP_SOURCE_ONLY:-} == 1 ]]; then return 0; fi
@@ -2030,6 +2071,7 @@ case ${1:-} in
   --read-only) READ_ONLY=1; install_all ;;
   --uninstall) uninstall_all ;;
   --reset-touchid) shift; reset_touchid "$@" ;;
+  --m3-report) m3_report ;;
   --agent-prompt) t=$(newer_release); [[ -n $t ]] && warn "the current release is $t; this plan is for $TAG"; agent_prompt ;;
-  *) die "unknown option $1 (--read-only, --uninstall, --reset-touchid, --agent-prompt or --m3-handoff)" ;;
+  *) die "unknown option $1 (--read-only, --uninstall, --reset-touchid, --agent-prompt, --m3-report or --m3-handoff)" ;;
 esac
