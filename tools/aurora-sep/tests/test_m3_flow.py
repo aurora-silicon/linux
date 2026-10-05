@@ -34,7 +34,7 @@ OUR_FREEZE = (
     "# <<< aurora-sep: keep this M3's boot.bin as it is\n"
 )
 AURORA3 = "m1n1-aurora-1.6.1.aurora3-1-aarch64.pkg.tar.zst"
-AURORA5 = "m1n1-aurora-1.6.1.aurora5-1-aarch64.pkg.tar.zst"
+AURORA6 = "m1n1-aurora-1.6.1.aurora6-1-aarch64.pkg.tar.zst"
 OTHERS = [
     "linux-aurora-7.1.12.aurora2-11.36-aarch64.pkg.tar.zst",
     "linux-aurora-headers-7.1.12.aurora2-11.36-aarch64.pkg.tar.zst",
@@ -48,7 +48,11 @@ op=$1; shift
 case $op in
   -Q)
     for p in "$@"; do
-      case $p in linux-aurora | linux-asahi) grep -qx "$p" "$FAKE/installed" || exit 1 ;; esac
+      case $p in
+        linux-aurora | linux-asahi) grep -qx "$p" "$FAKE/installed" || exit 1 ;;
+        m1n1-aurora) grep -q '^m1n1-aurora' "$FAKE/m1n1" || exit 1 ;;
+        m1n1) grep -q '^m1n1-stock' "$FAKE/m1n1" || exit 1 ;;
+      esac
       echo "$p 1-1"
     done ;;
   -Qq) exit 1 ;;
@@ -57,11 +61,12 @@ case $op in
       echo /usr/lib/modules/7.1.12-2-11.36-sep-ARCH/dtbs/fake.dtb
     exit 0 ;;
   -U)
+    if [[ -n ${FAKE_FAIL_U:-} ]]; then echo "error: failed to commit transaction" >&2; exit 1; fi
     for f in "$@"; do
       [[ $f == -* || $f == 4 ]] && continue
       b=$(basename "$f")
       case $b in
-        m1n1-aurora-*) echo "${b%-aarch64.pkg.tar.zst}" >"$FAKE/m1n1" ;;
+        m1n1-aurora-*) echo "${b%-aarch64.pkg.tar.zst}" >"$FAKE/m1n1"; printf 'M1N1:%s\n' "${b%-aarch64.pkg.tar.zst}" >"$FAKE/m1n1.bin" ;;
         linux-aurora-headers-*) ;;
         linux-aurora-*) sed -i '/^linux-asahi$/d' "$FAKE/installed"; echo linux-aurora >>"$FAKE/installed" ;;
       esac
@@ -71,7 +76,7 @@ case $op in
     hook=0
     for p in "$@"; do
       case $p in
-        m1n1) echo m1n1-stock >"$FAKE/m1n1"; hook=1 ;;
+        m1n1) echo m1n1-stock >"$FAKE/m1n1"; printf 'M1N1:m1n1-stock\n' >"$FAKE/m1n1.bin"; hook=1 ;;
         linux-asahi) sed -i '/^linux-aurora$/d' "$FAKE/installed"; echo linux-asahi >>"$FAKE/installed"; hook=1 ;;
       esac
     done
@@ -82,14 +87,20 @@ exit 0
 
 UPDATE_M1N1 = r"""#!/bin/bash
 echo "update-m1n1 $*" >>"$FAKE/log"
-if [[ -f $FAKE_UPDATE_CONF ]] &&
-  bash -c 'set -e; . "$1"; [ -n "${M1N1_UPDATE_DISABLED:-}" ]' _ "$FAKE_UPDATE_CONF" 2>/dev/null; then
-  echo "update-m1n1 frozen" >>"$FAKE/log"
-  exit 0
+# As the real one: sourced by sh under set -e (bash in POSIX mode on Arch).
+if [[ -f $FAKE_UPDATE_CONF ]]; then
+  if ! sh -c 'set -e; . "$1"' _ "$FAKE_UPDATE_CONF" 2>/dev/null; then
+    echo "update-m1n1 failed sourcing" >>"$FAKE/log"
+    exit 1
+  fi
+  if sh -c 'set -e; . "$1"; [ -n "${M1N1_UPDATE_DISABLED:-}" ]' _ "$FAKE_UPDATE_CONF" 2>/dev/null; then
+    echo "update-m1n1 frozen" >>"$FAKE/log"
+    exit 0
+  fi
 fi
-dtbs=$(bash -c 'set -e; DTBS=; [ -f "$1" ] && . "$1"; echo "$DTBS"' _ "$FAKE_UPDATE_CONF")
+dtbs=$(sh -c 'set -e; DTBS=; [ -f "$1" ] && . "$1"; echo "$DTBS"' _ "$FAKE_UPDATE_CONF")
 {
-  printf 'M1N1:%s\n' "$(cat "$FAKE/m1n1")"
+  cat "$FAKE/m1n1.bin"
   printf 'DTBS:%s\n' "${dtbs:-asahi}"
   printf 'UBOOT'
   grep -E '^chosen\.' "$FAKE_M1N1_CONF" 2>/dev/null || true
@@ -126,11 +137,12 @@ class M3FlowTest(unittest.TestCase):
                            ("systemctl", "#!/bin/sh\nexit 0\n")):
             (self.tmp / "bin" / name).write_text(body)
             (self.tmp / "bin" / name).chmod(0o755)
+        self.extra_env = {}
         self.shas = {}
         for name in OTHERS:
             self.fixture(name, name.encode())
         self.fixture(AURORA3, None, [])
-        self.fixture(AURORA5, None, ["asahi,t6030-gpu", "asahi,t6030-dcp", "asahi,t6030-dcpext"])
+        self.fixture(AURORA6, None, ["asahi,t6030-gpu", "asahi,t6030-dcp", "asahi,t6030-dcpext"])
 
     def fixture(self, name, data, strings=None):
         path = self.tmp / "pkgs" / name
@@ -152,6 +164,7 @@ class M3FlowTest(unittest.TestCase):
             '{"system_version": {"ProductVersion": "%s"}}' % stub)
         (self.fake / "installed").write_text(kernel + "\n")
         (self.fake / "m1n1").write_text(m1n1 + "\n")
+        (self.fake / "m1n1.bin").write_text("M1N1:" + m1n1 + "\n")
         (self.fake / "log").write_text("")
         self.boot.write_bytes(bootbin)
 
@@ -167,10 +180,11 @@ M1N1_CONF='{self.m1n1_conf}'
 UPDATE_M1N1_CONF='{self.update_conf}'
 M3GPU_MARKER='{self.tmp}/etc/default/.update-m1n1.created-by-m3gpu'
 MODPROBE_CONF='{self.tmp}/etc/aurora-sep.conf'
+M1N1_BIN='{self.fake}/m1n1.bin'
 PACKAGES=(
 {pkgs}
 )
-M3_M1N1_PACKAGE="{AURORA5} {self.shas[AURORA5]}"
+M3_M1N1_PACKAGE="{AURORA6} {self.shas[AURORA6]}"
 esp_bootbin() {{ echo '{self.boot}'; }}
 version_notice() {{ :; }}; sep_write_notice() {{ :; }}; ane_dkms_notice() {{ :; }}
 snapshot() {{ :; }}; add_pin() {{ :; }}; remove_pin() {{ :; }}
@@ -182,13 +196,14 @@ boot_chain() {{ echo limine; }}
                "FAKE": str(self.fake), "FAKE_PKGS": str(self.tmp / "pkgs"),
                "FAKE_ESP": str(self.tmp / "esp"), "FAKE_UPDATE_CONF": str(self.update_conf),
                "FAKE_M1N1_CONF": str(self.m1n1_conf)}
+        env.update(self.extra_env)
         proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
         if check:
             self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         return proc
 
-    def install(self, try_=0, check=True):
-        return self.run_sh(f"M3_TRY={try_}\ninstall_all", check=check)
+    def install(self, try_=0, check=True, env=""):
+        return self.run_sh(f"{env}\nM3_TRY={try_}\ninstall_all", check=check)
 
     def uninstall(self):
         return self.run_sh("uninstall_all")
@@ -208,9 +223,9 @@ boot_chain() {{ echo limine; }}
         self.mac("j516s")
         self.install()
         boot = self.boot.read_bytes()
-        self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora5-1\n"), boot)
+        self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora6-1\n"), boot)
         self.assertTrue(boot.endswith(SWITCHES), boot)
-        self.assertIn(AURORA5, self.downloaded())
+        self.assertIn(AURORA6, self.downloaded())
         self.assertNotIn(AURORA3, self.downloaded())
         self.assertEqual(self.kept_copy().read_bytes(), b"M1N1:original\n")
         self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff")
@@ -228,7 +243,7 @@ boot_chain() {{ echo limine; }}
         self.update_conf.write_text(OUR_FREEZE)
         self.install()
         boot = self.boot.read_bytes()
-        self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora5-1\n"), boot)
+        self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora6-1\n"), boot)
         self.assertTrue(boot.endswith(SWITCHES), boot)
         self.assertNotIn("M1N1_UPDATE_DISABLED", self.update_conf.read_text())
 
@@ -240,7 +255,7 @@ boot_chain() {{ echo limine; }}
         marker.touch()
         self.install()
         boot = self.boot.read_bytes()
-        self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora5-1\n"), boot)
+        self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora6-1\n"), boot)
         self.assertTrue(boot.endswith(SWITCHES))
         # The hook ran while the bring-up freeze still held, so the first
         # rebuild is the installer's own, with the new m1n1 in place.
@@ -297,6 +312,85 @@ boot_chain() {{ echo limine; }}
         self.assertEqual(self.boot.read_bytes(), before)
         self.assertNotIn("pacman -U", self.log())
 
+    # Later runs and failures (review of 5c7daa75)
+
+    def test_rerun_without_the_flag_keeps_a_tried_handoff(self):
+        self.mac("j514s")
+        self.install(try_=1)
+        out = self.install().stdout
+        self.assertIn("keeping it", out)
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff")
+        self.assertTrue(self.boot.read_bytes().endswith(SWITCHES))
+        self.assertNotIn("M1N1_UPDATE_DISABLED", self.update_conf.read_text())
+        self.uninstall()
+        self.assertTrue(self.boot.read_bytes().startswith(b"M1N1:m1n1-stock\n"))
+        self.assertFalse(self.m1n1_conf.exists())
+
+    def test_failed_install_then_uninstall_keeps_the_bringup(self):
+        handbuilt = b"M1N1:bringup\nDTBS:hand\nUBOOT" + SWITCHES
+        self.mac("j516s", m1n1="m1n1-bringup", bootbin=handbuilt)
+        self.update_conf.write_text(BRINGUP_FREEZE)
+        marker = self.tmp / "etc/default/.update-m1n1.created-by-m3gpu"
+        marker.touch()
+        self.extra_env = {"FAKE_FAIL_U": "1"}
+        proc = self.install(check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.extra_env = {}
+        self.uninstall()
+        self.assertEqual(self.boot.read_bytes(), handbuilt)
+        self.assertEqual(self.update_conf.read_text(), BRINGUP_FREEZE)
+        self.assertTrue(marker.exists())
+
+    def test_failed_install_then_uninstall_keeps_omarchys_config(self):
+        own = "export LC_ALL=C\n"
+        self.mac("j516s")
+        self.update_conf.write_text(own)
+        self.extra_env = {"FAKE_FAIL_U": "1"}
+        self.assertNotEqual(self.install(check=False).returncode, 0)
+        self.extra_env = {}
+        self.uninstall()
+        self.assertEqual(self.update_conf.read_text(), own)
+
+    def test_uninstall_after_an_11_36_kernel_only_install_and_update(self):
+        # 11.36 recorded linux-asahi, then rewrote it to linux-aurora on a re-run.
+        self.mac("j516s", kernel="linux-aurora")
+        self.update_conf.write_text(OUR_FREEZE)
+        (self.state / "previous-package").write_text("linux-aurora 7.1.12.aurora2-11.36-1\n")
+        self.install()
+        self.uninstall()
+        self.assertIn("linux-asahi linux-asahi-headers libfprint m1n1", self.log())
+        self.assertNotIn("-S --noconfirm --ask 4 linux-aurora", self.log())
+
+    def test_previous_package_is_kept_across_updates(self):
+        self.mac("j314s")
+        self.install()
+        self.install()
+        self.assertTrue((self.state / "previous-package").read_text().startswith("linux-asahi"))
+
+    def test_handoff_refuses_a_boot_bin_that_was_not_rebuilt(self):
+        # A freeze update-m1n1 honours but the pattern check would miss, on a
+        # hand-built boot.bin that already ends with the switches.
+        handbuilt = b"M1N1:bringup\nDTBS:hand\nUBOOT" + SWITCHES
+        self.mac("j516s", m1n1="m1n1-bringup", bootbin=handbuilt)
+        self.update_conf.write_text(BRINGUP_FREEZE + ": ${M1N1_UPDATE_DISABLED:=1}\n")
+        proc = self.install(check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(self.boot.read_bytes(), handbuilt)
+
+    def test_handoff_refuses_a_custom_m1n1_path(self):
+        self.mac("j516s")
+        self.update_conf.write_text("M1N1=/opt/my-m1n1.bin\n")
+        proc = self.install(check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("Nothing was installed", proc.stderr)
+        self.assertNotIn("pacman -U", self.log())
+
+    def test_empty_mode_file_does_not_break_uninstall(self):
+        self.mac("j613")
+        self.install()
+        (self.state / "m3-mode").write_text("")
+        self.uninstall()
+
     # M1/M2 are unchanged: aurora3, no switches, no M3 state
 
     def test_m1_pro_unchanged(self):
@@ -306,7 +400,7 @@ boot_chain() {{ echo limine; }}
         self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora3-1\n"), boot)
         self.assertNotIn(b"chosen.", boot)
         self.assertIn(AURORA3, self.downloaded())
-        self.assertNotIn(AURORA5, self.downloaded())
+        self.assertNotIn(AURORA6, self.downloaded())
         self.assertFalse((self.state / "m3-mode").exists())
         self.assertFalse(self.m1n1_conf.exists())
 

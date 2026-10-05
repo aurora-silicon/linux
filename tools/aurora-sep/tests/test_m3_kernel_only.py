@@ -21,7 +21,7 @@ BRINGUP_FREEZE = (
 # What m1n1_update writes on M1/M2 (11.35).
 AURORA_DTBS = (
     "# aurora-sep: build m1n1's stage 2 from the device trees the installed\n"
-    "DTBS=$(pacman -Qlq linux-aurora 2>/dev/null | grep '/dtbs/[^/]*\\.dtb$'; true)\n"
+    "DTBS=$(pacman -Qlq linux-aurora 2>/dev/null | grep '/dtbs/[^/]*\\.dtb$' || true)\n"
 )
 COMPATIBLE = {
     "j516s": ["apple,j516s", "apple,t6030"],

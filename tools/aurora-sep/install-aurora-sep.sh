@@ -135,7 +135,7 @@ PACKAGES=(
 )
 # Only for an M3 on the handoff path (see m3_plan), in place of the m1n1-aurora
 # above: the same m1n1 plus the T6030 display and GPU handoff.
-M3_M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora5-1-aarch64.pkg.tar.zst e06dd92a75fb95cba822eb0a414a6f01f6d5bf9ca4f85749b0ef663922c38294"
+M3_M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora6-1-aarch64.pkg.tar.zst 16747a63b59815ba54f95c59ab97514fb7178aa459953aa4369effce90456af8"
 PINNED="linux-aurora linux-aurora-headers libfprint m1n1-aurora"
 PIN_BEGIN="# >>> aurora-sep pin (remove with: install-aurora-sep.sh --uninstall)"
 PIN_END="# <<< aurora-sep pin"
@@ -250,6 +250,8 @@ M3_SWITCHES="chosen.asahi,t6030-gpu=1 chosen.asahi,t6030-dcp=1 chosen.asahi,t603
 M3_STUB_VERSION=14.8.3
 M3_STUB_IBOOT=iBoot-10151.140.19
 M1N1_CONF=/etc/m1n1.conf
+# What update-m1n1 puts at the start of boot.bin.
+M1N1_BIN=/usr/lib/asahi-boot/m1n1.bin
 M1N1_CONF_BEGIN="# >>> aurora-sep: M3 Pro display and GPU handoff (remove with: install-aurora-sep.sh --uninstall)"
 M1N1_CONF_END="# <<< aurora-sep: M3 Pro display and GPU handoff"
 # The M3 bring-up's install-m3gpu.sh froze boot.bin with exactly these lines,
@@ -361,7 +363,7 @@ is_m3_handoff_board() {
 # macOS version, and m1n1 reports the stub's iBoot.
 m3_stub_problem() {
   local iboot bootbin info="" version=""
-  iboot=$(tr -d '\0' <"$DT/chosen/asahi,iboot2-version" 2>/dev/null) || iboot=""
+  iboot=$({ tr -d '\0' <"$DT/chosen/asahi,iboot2-version"; } 2>/dev/null) || iboot=""
   if bootbin=$(esp_bootbin); then
     info=${bootbin%/m1n1/boot.bin}/asahi/stub_info.json
     version=$($sudo cat "$info" 2>/dev/null | grep -o '"ProductVersion": *"[^"]*"' | head -1 |
@@ -381,7 +383,7 @@ m1n1_pkg_has_handoff() {
   bin=$(mktemp)
   bsdtar -xOf "$1" usr/lib/asahi-boot/m1n1.bin >"$bin" 2>/dev/null || rc=1
   for s in asahi,t6030-gpu asahi,t6030-dcp asahi,t6030-dcpext; do
-    ((rc == 0)) && ! grep -qaF "$s" "$bin" && rc=1
+    ((rc == 0)) && ! tr '\0' '\n' <"$bin" | grep -qaxF "$s" && rc=1
   done
   rm -f "$bin"
   return "$rc"
@@ -408,9 +410,21 @@ update_m1n1_frozen_by_others() {
     $0 == b { skip = 1; next }
     skip && $0 == e { skip = 0; next }
     !skip' >"$tmp"
-  grep -Eq '^[^#]*M1N1_UPDATE_DISABLED=' "$tmp" && rc=0
+  # shellcheck disable=SC2016 # expanded by that sh, not here
+  env -i PATH="$PATH" sh -c 'set -e; . "$1"; [ -n "${M1N1_UPDATE_DISABLED:-}" ]' _ "$tmp" \
+    >/dev/null 2>&1 && rc=0
   rm -f "$tmp"
   return "$rc"
+}
+
+# True when update-m1n1's configuration points it at another m1n1, U-Boot or
+# config than the packaged ones: the handoff check could then pass on a boot.bin
+# this release did not build.
+update_m1n1_customised() {
+  [[ -f $UPDATE_M1N1_CONF ]] || return 1
+  # shellcheck disable=SC2016 # expanded by that sh, not here
+  env -i PATH="$PATH" sh -c '. "$1" >/dev/null 2>&1; [ -n "${M1N1:-}${SOURCE:-}${U_BOOT:-}${CONFIG:-}${TARGET:-}" ]' _ \
+    "$UPDATE_M1N1_CONF" >/dev/null 2>&1
 }
 
 # Lift the M3 bring-up's freeze: only its own three lines, and its marker.
@@ -422,7 +436,7 @@ m3gpu_unfreeze() {
   tmp=$(mktemp)
   m3gpu_unfrozen >"$tmp"
   if [[ -e $M3GPU_MARKER ]]; then
-    $sudo touch "$STATE/m3gpu-marker.saved"
+    [[ -f $STATE/m3gpu-marker.saved ]] || $sudo touch "$STATE/m3gpu-marker.saved"
     $sudo rm -f "$M3GPU_MARKER"
   fi
   if grep -q '[^[:space:]]' "$tmp"; then
@@ -469,6 +483,13 @@ m3_switches_remove() {
   rm -f "$tmp"
 }
 
+# The M3 path an earlier install took, or nothing.
+m3_recorded_mode() {
+  local mode=""
+  if [[ -f $STATE/m3-mode ]]; then read -r mode _ <"$STATE/m3-mode" || true; fi
+  echo "$mode"
+}
+
 # Decide the M3 path before anything is downloaded, so a Mac this release can't
 # set up as asked stops with nothing changed.
 m3_plan() {
@@ -479,6 +500,12 @@ m3_plan() {
     return 0
   fi
   board=$(this_board)
+  # An update never takes the handoff away again: once a Mac has it (listed, or
+  # tried with --m3-handoff), a plain run keeps it, and its checks still apply.
+  if ((M3_TRY == 0)) && [[ $(m3_recorded_mode) == handoff ]]; then
+    M3_TRY=1
+    say "M3 ($board): this Mac has m1n1's display and GPU handoff from an earlier install; keeping it"
+  fi
   M3_MODE=kernel
   if ! is_m3_pro; then
     ((M3_TRY == 0)) || die "--m3-handoff is for an M3 Pro (t6030); this M3 ($board) has no
@@ -507,6 +534,11 @@ m3_plan() {
     bring-up's install-m3gpu.sh. Switching the M3 Pro handoff on needs m1n1's boot.bin rebuilt.
     Remove that line and run this again. Nothing was installed."
   fi
+  if update_m1n1_customised; then
+    die "$UPDATE_M1N1_CONF points update-m1n1 at its own m1n1, U-Boot, config or target
+    (M1N1=, SOURCE=, U_BOOT=, CONFIG= or TARGET=). The M3 Pro handoff needs boot.bin built
+    from this release's m1n1. Remove those lines and run this again. Nothing was installed."
+  fi
   M3_MODE=handoff
   if is_m3_handoff_board; then
     say "M3 Pro ($board, macOS $M3_STUB_VERSION stub): installing m1n1 with the display and GPU handoff"
@@ -521,13 +553,20 @@ m3_plan() {
 # appends /etc/m1n1.conf's lines straight after the gzipped U-Boot, so the
 # first one has no newline in front: look for the block, not whole lines.
 m3_verify_bootbin() {
-  local target tail block
+  local target tail block size
   target=$(esp_bootbin) || die "could not find m1n1's boot.bin to check the M3 Pro switches in"
+  size=$(stat -c %s "$M1N1_BIN")
+  $sudo cmp -s -n "$size" "$M1N1_BIN" "$target" ||
+    die "$target does not start with this release's m1n1 ($M1N1_BIN), so it was not rebuilt.
+    The boot loader this Mac booted with is kept as m1n1/boot.bin.before-$VERSION on the EFI
+    partition and in $STATE/boot.bin.saved. Please report it before rebooting."
   block=$(tr ' ' '\n' <<<"$M3_SWITCHES")
   tail=$($sudo tail -c 1024 "$target" | tr -d '\0')
   [[ $tail == *"$block"* ]] ||
-    die "the rebuilt $target does not carry the M3 Pro switch lines; the previous one is saved in $STATE/boot.bin.saved"
-  say "m1n1's boot.bin carries the M3 Pro handoff switches"
+    die "the rebuilt $target does not carry the M3 Pro switch lines. The boot loader this Mac
+    booted with is kept as m1n1/boot.bin.before-$VERSION on the EFI partition and in
+    $STATE/boot.bin.saved. Please report it before rebooting."
+  say "m1n1's boot.bin is this release's m1n1 with the M3 Pro handoff switches"
 }
 
 # --uninstall on a bring-up Mac: update-m1n1 has just rebuilt boot.bin from the
@@ -539,7 +578,7 @@ m3_restore_bringup() {
   $sudo cp -p "$STATE/update-m1n1.m3gpu.saved" "$UPDATE_M1N1_CONF"
   if [[ -f $STATE/m3gpu-marker.saved ]]; then $sudo touch "$M3GPU_MARKER"; fi
   if [[ -f $STATE/boot.bin.saved ]] && target=$(esp_bootbin); then
-    $sudo cp "$STATE/boot.bin.saved" "$target"
+    replace_on_esp "$STATE/boot.bin.saved" "$target"
     say "Restored the M3 bring-up's boot.bin and its freeze on update-m1n1"
   else
     warn "restored the M3 bring-up's freeze on update-m1n1, but not its boot.bin (no saved copy)"
@@ -567,12 +606,28 @@ unproven_board_backup() {
     booted it on this model yet."
 }
 
+# Replace a file on the EFI partition without ever leaving a partial one in
+# its place: copy next to it, compare, then rename.
+replace_on_esp() {
+  local src=$1 dst=$2
+  if ! { $sudo cp "$src" "$dst.new" && $sudo cmp -s "$src" "$dst.new" && sync &&
+    $sudo mv "$dst.new" "$dst" && sync; }; then
+    die "could not write $dst; the previous one is still there"
+  fi
+}
+
 keep_bootbin_on_esp() {
   local why=$1 target keep uuid
   if target=$(esp_bootbin); then
     keep=$target.before-$VERSION
-    $sudo test -f "$keep" || $sudo cp "$target" "$keep" ||
-      die "could not keep a copy of $target; nothing was installed"
+    # Only a complete, compared copy gets the final name, so a later run can
+    # trust one it finds.
+    if ! $sudo test -f "$keep"; then
+      if ! { $sudo cp "$target" "$keep.new" && $sudo cmp -s "$target" "$keep.new" && sync &&
+        $sudo mv "$keep.new" "$keep"; }; then
+        die "could not keep a copy of $target; nothing was installed"
+      fi
+    fi
     uuid=$(findmnt -no PARTUUID --target "${target%/m1n1/boot.bin}")
     warn "$why If the Mac stops in m1n1 after this install (m1n1
     text on screen, often \"No valid payload found\", and no boot menu), put the
@@ -731,8 +786,9 @@ m1n1_update() {
 # upgrade the running kernel's modules are restored unowned but still carry that
 # pkgbase, so both kernels' DTBs would be bundled. m1n1 keeps the last matching
 # DTB, and the glob sorts 11.10 before 11.9, so the stale one can win.
-# (update-m1n1 runs under set -e, so this assignment must always succeed.)
-DTBS=$(pacman -Qlq linux-aurora 2>/dev/null | grep '/dtbs/[^/]*\.dtb$'; true)
+# (update-m1n1 runs under sh's set -e, which on Arch also applies inside
+# $(...), so the pipeline must succeed even when grep matches nothing.)
+DTBS=$(pacman -Qlq linux-aurora 2>/dev/null | grep '/dtbs/[^/]*\.dtb$' || true)
 EOF
   $sudo install -m 644 "$tmp" "$conf"
   rm -f "$tmp"
@@ -948,6 +1004,33 @@ neo_radio_notice() {
     - Bluetooth is off by default in this release."
 }
 
+# The first install records what it found, before anything changes, so that
+# --uninstall can put it back even after a run that stopped partway:
+# update-m1n1's configuration (without this script's own M3 freeze from 11.36),
+# or that there was none; the bring-up's freeze; and boot.bin itself.
+snapshot_boot_state() {
+  local tmp target
+  if [[ ! -e $STATE/update-m1n1.default.saved && ! -e $STATE/update-m1n1.absent ]]; then
+    if [[ -f $UPDATE_M1N1_CONF ]]; then
+      tmp=$(mktemp)
+      m3_unfrozen >"$tmp"
+      $sudo install -m 644 "$tmp" "$STATE/update-m1n1.default.saved"
+      rm -f "$tmp"
+    else
+      $sudo touch "$STATE/update-m1n1.absent"
+    fi
+  fi
+  if [[ -f $UPDATE_M1N1_CONF && ! -f $STATE/update-m1n1.m3gpu.saved ]] &&
+    grep -qxF "${M3GPU_FREEZE[0]}" "$UPDATE_M1N1_CONF"; then
+    $sudo cp -p "$UPDATE_M1N1_CONF" "$STATE/update-m1n1.m3gpu.saved"
+    if [[ -e $M3GPU_MARKER ]]; then $sudo touch "$STATE/m3gpu-marker.saved"; fi
+  fi
+  if [[ ! -f $STATE/boot.bin.saved ]] && target=$(esp_bootbin); then
+    $sudo cp "$target" "$STATE/boot.bin.saved"
+  fi
+  return 0
+}
+
 # The packages this Mac gets, one "file sha256" per line: PACKAGES, except
 # that a Neo keeps its own m1n1, and an M3 gets M3_M1N1_PACKAGE on the handoff
 # path and no m1n1 otherwise. Needs m3_plan first.
@@ -999,10 +1082,14 @@ install_all() {
     m1n1-aurora and its display and GPU handoff."
   fi
   $sudo install -d "$STATE"
+  snapshot_boot_state
   if [[ ! -f $STATE/previous && $chain == grub ]]; then
     keep_grub_fallback "$kernel"
   fi
-  pacman -Q "$kernel" | $sudo tee "$STATE/previous-package" >/dev/null
+  # The kernel this Mac had before the first install; an update keeps it.
+  if [[ ! -f $STATE/previous-package ]]; then
+    pacman -Q "$kernel" | $sudo tee "$STATE/previous-package" >/dev/null
+  fi
   if [[ $M3_MODE != none ]]; then echo "$M3_MODE" | $sudo tee "$STATE/m3-mode" >/dev/null; fi
   # Before pacman's update-m1n1 hook runs on the kernel's device trees.
   case $M3_MODE in
@@ -1051,14 +1138,21 @@ install_all() {
   case $M3_MODE in
     kernel) m3_bootbin_report ;;
     handoff)
+      # grub.cfg first, so a failed check below never leaves it pointing at
+      # the replaced kernel.
+      if [[ $chain == grub ]]; then grub_update; fi
       m3gpu_unfreeze
       m3_unfreeze
+      if update_m1n1_frozen; then
+        die "update-m1n1 is still frozen in $UPDATE_M1N1_CONF, so boot.bin can't be rebuilt with
+    the handoff. boot.bin was not changed. Please report it with that file."
+      fi
       m1n1_update
       m3_verify_bootbin
       ;;
     *) m1n1_update ;;
   esac
-  if [[ $chain == grub ]]; then
+  if [[ $chain == grub && $M3_MODE != handoff ]]; then
     grub_update
   fi
 
@@ -1084,12 +1178,21 @@ install_all() {
 
 uninstall_all() {
   local previous=linux-asahi m3_mode=none
-  [[ -f $STATE/previous-package ]] && read -r previous _ <"$STATE/previous-package"
-  # 11.36 kept no record: every M3 it installed was kernel-only.
-  if [[ -f $STATE/m3-mode ]]; then
-    read -r m3_mode _ <"$STATE/m3-mode"
-  elif is_m3; then
-    m3_mode=kernel
+  if [[ -f $STATE/previous-package ]]; then read -r previous _ <"$STATE/previous-package" || true; fi
+  # 11.36 rewrote this on every run, so an updated Mac may name linux-aurora
+  # itself, which the repositories don't carry for these Macs.
+  if [[ -z $previous || $previous == linux-aurora ]]; then previous="linux-asahi"; fi
+  # 11.36 kept no record: every M3 it installed was kernel-only. Whatever the
+  # record says, an M3 with m1n1-aurora installed had its boot loader replaced.
+  m3_mode=$(m3_recorded_mode)
+  if is_m3; then
+    if pacman -Q m1n1-aurora >/dev/null 2>&1; then
+      m3_mode=handoff
+    elif [[ $m3_mode != handoff ]]; then
+      m3_mode=kernel
+    fi
+  else
+    m3_mode=none
   fi
   command -v aurora-touchid-setup >/dev/null && aurora-touchid-setup --remove || true
   $sudo systemctl disable apple-sep.path apple-sep.service 2>/dev/null || true
@@ -1597,6 +1700,10 @@ done
 set -- "${args[@]}"
 if ((M3_TRY)) && [[ -n ${1:-} && $1 != --read-only ]]; then
   die "--m3-handoff goes with an install (alone or with --read-only), not with $1"
+fi
+# One option at a time; only --reset-touchid takes arguments of its own.
+if (($# > 1)) && [[ $1 != --reset-touchid ]]; then
+  die "unexpected arguments after $1: ${*:2}"
 fi
 
 if preflight_needed "${1:-}"; then preflight; fi

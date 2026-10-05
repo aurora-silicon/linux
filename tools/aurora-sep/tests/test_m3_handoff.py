@@ -55,6 +55,7 @@ class M3PathTest(unittest.TestCase):
         (self.esp / "m1n1").mkdir(parents=True)
         (self.esp / "asahi").mkdir()
         (self.esp / "m1n1" / "boot.bin").write_bytes(b"m1n1-old\x00\x01" * 8)
+        (self.tmp / "m1n1.bin").write_bytes(b"m1n1")
 
     def mac(self, board, iboot=GOOD_IBOOT, stub="14.8.3"):
         (self.dt / "compatible").write_bytes(
@@ -81,6 +82,7 @@ STATE='{self.state}'
 M1N1_CONF='{self.etc}/m1n1.conf'
 UPDATE_M1N1_CONF='{self.etc}/default/update-m1n1'
 M3GPU_MARKER='{self.etc}/default/.update-m1n1.created-by-m3gpu'
+M1N1_BIN='{self.tmp}/m1n1.bin'
 esp_bootbin() {{ [[ -f '{self.esp}/m1n1/boot.bin' ]] && echo '{self.esp}/m1n1/boot.bin'; }}
 {body}
 """
@@ -217,7 +219,8 @@ esp_bootbin() {{ [[ -f '{self.esp}/m1n1/boot.bin' ]] && echo '{self.esp}/m1n1/bo
         conf = self.etc / "default" / "update-m1n1"
         for text, want in [(FREEZE, "no"), (OUR_FREEZE, "no"), (FREEZE + OUR_FREEZE, "no"),
                            ("M1N1_UPDATE_DISABLED=1\n", "yes"),
-                           ("# M1N1_UPDATE_DISABLED=1\n", "no"), (FREEZE + "export M1N1_UPDATE_DISABLED=y\n", "yes")]:
+                           ("# M1N1_UPDATE_DISABLED=1\n", "no"), (FREEZE + "export M1N1_UPDATE_DISABLED=y\n", "yes"),
+                           (FREEZE + ": ${M1N1_UPDATE_DISABLED:=1}\n", "yes")]:
             with self.subTest(text=text):
                 conf.write_text(text)
                 out = self.run_sh("update_m1n1_frozen_by_others && echo yes || echo no").stdout.strip()
@@ -266,6 +269,20 @@ esp_bootbin() {{ [[ -f '{self.esp}/m1n1/boot.bin' ]] && echo '{self.esp}/m1n1/bo
         pkg = self.package(["asahi,t6030-gpu", "asahi,t6030-dcp", "asahi,t6030-dcpext"])
         self.assertEqual(self.run_sh(f"m1n1_pkg_has_handoff '{pkg}' && echo yes").stdout.strip(), "yes")
 
+    def test_package_with_only_dcpext(self):
+        # asahi,t6030-dcp is a prefix of asahi,t6030-dcpext: match whole strings.
+        pkg = self.package(["asahi,t6030-gpu", "asahi,t6030-dcpext"])
+        self.assertEqual(self.run_sh(f"m1n1_pkg_has_handoff '{pkg}' && echo yes || echo no").stdout.strip(), "no")
+
+    def test_customised_update_m1n1(self):
+        conf = self.etc / "default" / "update-m1n1"
+        for text, want in [("M1N1=/opt/x.bin\n", "yes"), ("U_BOOT=/opt/u\n", "yes"), ("CONFIG=/x\n", "yes"),
+                           (FREEZE, "no"), (OUR_FREEZE, "no"), ("# M1N1=/x\n", "no")]:
+            with self.subTest(text=text):
+                conf.write_text(text)
+                out = self.run_sh("update_m1n1_customised && echo yes || echo no").stdout.strip()
+                self.assertEqual(out, want)
+
     def test_package_without_dcpext(self):
         pkg = self.package(["asahi,t6030-gpu", "asahi,t6030-dcp"])
         self.assertEqual(self.run_sh(f"m1n1_pkg_has_handoff '{pkg}' && echo yes || echo no").stdout.strip(), "no")
@@ -284,9 +301,17 @@ esp_bootbin() {{ [[ -f '{self.esp}/m1n1/boot.bin' ]] && echo '{self.esp}/m1n1/bo
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("switch lines", proc.stderr)
 
+    def test_verify_bootbin_wrong_m1n1(self):
+        boot = self.esp / "m1n1" / "boot.bin"
+        boot.write_bytes(b"MIMI" + gzip.compress(b"u-boot" * 64) + "\n".join(SWITCHES).encode() + b"\n")
+        proc = self.run_sh("m3_verify_bootbin", check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("not rebuilt", proc.stderr)
+
     def test_verify_real_layout(self):
         # The m3pro's hand-built boot.bin ends exactly like this (2026-10-03).
         boot = self.esp / "m1n1" / "boot.bin"
+        (self.tmp / "m1n1.bin").write_bytes(b"\x1f\x8b")
         boot.write_bytes(b"\x1f\x8b" + os.urandom(900) + b"chosen.asahi,t6030-gpu=1\n"
                          b"chosen.asahi,t6030-dcp=1\nchosen.asahi,t6030-dcpext=1\n")
         self.run_sh("m3_verify_bootbin")
@@ -300,7 +325,7 @@ esp_bootbin() {{ [[ -f '{self.esp}/m1n1/boot.bin' ]] && echo '{self.esp}/m1n1/bo
 
     def test_packages_per_mac(self):
         m1n1_m1m2 = "m1n1-aurora-1.6.1.aurora3-1-aarch64.pkg.tar.zst"
-        m1n1_m3 = "m1n1-aurora-1.6.1.aurora5-1-aarch64.pkg.tar.zst"
+        m1n1_m3 = "m1n1-aurora-1.6.1.aurora6-1-aarch64.pkg.tar.zst"
         for board, stub, try_, want in [("j314s", "13.5", 0, m1n1_m1m2), ("j293", "13.5", 0, m1n1_m1m2),
                                         ("j700", "26.4", 0, None), ("j613", "14.8.3", 0, None),
                                         ("j514c", "14.8.3", 0, None), ("j514s", "14.8.3", 0, None),
