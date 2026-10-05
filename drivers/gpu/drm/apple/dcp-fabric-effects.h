@@ -40,8 +40,6 @@ struct dcp_fabric_resume_sample_ops {
 	u64 (*edge)(void *ctx);
 	int (*read_hpd)(void *ctx);
 	bool (*sample)(void *ctx, u64 generation, int level);
-	bool (*borrowed)(void *ctx);
-	void (*connect_fixed)(void *ctx);
 };
 
 static inline void
@@ -50,8 +48,7 @@ dcp_fabric_run_resume_sample(const struct dcp_fabric_resume_sample_ops *ops, voi
 	u64 generation = ops->edge(ctx);
 	int level = ops->read_hpd(ctx);
 
-	if (ops->sample(ctx, generation, level) && level > 0 && !ops->borrowed(ctx))
-		ops->connect_fixed(ctx);
+	ops->sample(ctx, generation, level);
 }
 
 struct dcp_fabric_fixed_ops {

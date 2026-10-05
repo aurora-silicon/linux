@@ -917,8 +917,6 @@ static const struct dcp_fabric_resume_sample_ops fabric_fake_resume_sample_ops =
 	.edge = fabric_fake_edge,
 	.read_hpd = fabric_fake_hpd,
 	.sample = fabric_fake_sample,
-	.borrowed = fabric_fake_borrowed,
-	.connect_fixed = fabric_fake_select_connect,
 };
 
 static void fabric_fake_resume_sample(void *ctx)
@@ -1241,10 +1239,9 @@ static void fabric_effect_s16_test(struct kunit *test)
 	f.reads = 0;
 	f.levels[0] = 1;
 	dcp_fabric_run_resume(&fabric_fake_resume_ops, &f);
-	KUNIT_ASSERT_EQ(test, f.count, 5U);
-	KUNIT_EXPECT_EQ(test, f.trace[2], FX_RESTORE_PHY);
-	KUNIT_EXPECT_EQ(test, f.trace[3], FX_SELECT_MUX);
-	KUNIT_EXPECT_EQ(test, f.trace[4], FX_CONNECT_FIXED);
+	KUNIT_ASSERT_EQ(test, f.count, 2U);
+	KUNIT_EXPECT_EQ(test, f.trace[0], FX_IRQ_ENABLE);
+	KUNIT_EXPECT_EQ(test, f.trace[1], FX_SAMPLE);
 	KUNIT_EXPECT_EQ(test, f.presence.state, DCP_FABRIC_PRESENT);
 	KUNIT_EXPECT_EQ(test, f.presence.deadline, 0UL);
 	KUNIT_EXPECT_FALSE(test,
@@ -1581,8 +1578,26 @@ static void fabric_connector_flow_core_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, dcp_fabric_t6020_flow(true, true, single_stream));
 }
 
+static void fabric_resume_no_connect_test(struct kunit *test)
+{
+	for (unsigned int row = 0; row < 8; row++) {
+		struct fabric_fake f;
+
+		fabric_fake_init(&f, test, !!(row & 4));
+		f.borrowed = !!(row & 2);
+		f.levels[0] = !!(row & 1);
+		dcp_fabric_run_resume(&fabric_fake_resume_ops, &f);
+		KUNIT_ASSERT_EQ(test, f.count, 2U);
+		KUNIT_EXPECT_EQ(test, f.trace[0], FX_IRQ_ENABLE);
+		KUNIT_EXPECT_EQ(test, f.trace[1], FX_SAMPLE);
+		KUNIT_EXPECT_EQ(test, f.presence.state,
+				(row & 1) ? DCP_FABRIC_PRESENT : DCP_FABRIC_SETTLING);
+	}
+}
+
 static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE_PARAM(fabric_shared_wiring_test, fabric_wiring_gen_params),
+	KUNIT_CASE(fabric_resume_no_connect_test),
 	KUNIT_CASE(fabric_connector_flow_core_test),
 	KUNIT_CASE(fabric_capacity_notification_test),
 	KUNIT_CASE(fabric_binding_cookie_test),

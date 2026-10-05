@@ -638,23 +638,10 @@ static bool dcp_resume_presence_sample(void *ctx, u64 generation, int level)
 	return dcp_hdmi_sample(ctx, generation, level);
 }
 
-static void dcp_resume_connect_fixed(void *ctx)
-{
-	struct apple_dcp *dcp = ctx;
-	int ret = dcp_fixed_output_select(dcp);
-
-	if (!ret)
-		dcp_dptx_connect(dcp, 0);
-	else
-		dev_err(dcp->dev, "could not select the HDMI output on resume: %d\n", ret);
-}
-
 static const struct dcp_fabric_resume_sample_ops dcp_resume_sample_ops = {
 	.edge = dcp_resume_presence_edge,
 	.read_hpd = dcp_hdmi_read_hpd,
 	.sample = dcp_resume_presence_sample,
-	.borrowed = dcp_hdmi_borrowed,
-	.connect_fixed = dcp_resume_connect_fixed,
 };
 
 void dcp_fabric_hdmi_resume(struct apple_dcp *dcp)
