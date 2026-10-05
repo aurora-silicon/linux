@@ -546,6 +546,9 @@ struct ComputeHost<'a> {
     generation: u64,
 }
 impl compute::Host for ComputeHost<'_> {
+    fn next_compute_publication(&mut self) -> Result<u64> {
+        self.qids.next_compute_publication()
+    }
     fn epoch(&self) -> Result<(u64, u32)> {
         Ok((
             self.generation,

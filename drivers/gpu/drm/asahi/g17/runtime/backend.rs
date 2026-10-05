@@ -138,6 +138,12 @@ impl job::Backend for Backend {
                 Engine::Render => self.render_packet(&packet, &mut deferred),
             }
         };
+        if result.as_ref().is_err_and(|error| *error == ENOSPC) {
+            crate::g17::queue_stats::note_submit_enospc(match packet.engine() {
+                Engine::Compute => "compute-publish",
+                Engine::Render => "render-publish",
+            });
+        }
         self.release_backlog(&packet);
         self.finish_publication(&packet, result, &mut deferred)
     }
@@ -169,9 +175,9 @@ impl job::Backend for Backend {
         }
     }
 
-    fn defer_timeout(&self, packet: &Arc<Packet>) -> bool {
-        if packet.engine() != Engine::Render {
-            return false;
+    fn defer_timeout(&self, packet: &Arc<Packet>, renewals: u8) -> bool {
+        if packet.engine() == Engine::Compute {
+            return self.defer_compute_timeout(packet, renewals);
         }
         let mut state = self.shared.state.lock();
         (*state)

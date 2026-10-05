@@ -308,6 +308,7 @@ impl<T> Fifo<T> {
 
 struct Active {
     packet: Arc<Packet>,
+    published: u64,
     work: Arc<WorkStateLease>,
     ticket: Option<Ticket>,
     observed: Option<Observation>,
@@ -363,6 +364,7 @@ impl Backing {
 /// Installed graph and its exact logical owner. A released idle graph may change owners only
 /// after a retirement witness. Failed work retains its pointers independently of fence state.
 pub(crate) struct Queue {
+    slot_accounting: crate::g17::queue_stats::ComputeAccount,
     owner: Option<u64>,
     binding: Binding,
     previous: Option<Previous>,
@@ -412,6 +414,7 @@ impl Queue {
         context.mark_published();
         Ok(Self {
             owner: Some(owner),
+            slot_accounting: crate::g17::queue_stats::ComputeAccount::new(),
             binding,
             previous: None,
             kick,
@@ -446,6 +449,11 @@ impl Queue {
     pub(crate) fn qid(&self) -> u8 {
         self.kick.id().qid()
     }
+    fn update_slot_accounting(&mut self) {
+        self.slot_accounting.update(self.owner.is_some(), self.released,
+            self.quarantined, self.retired_by_teardown);
+    }
+
     pub(crate) fn owner(&self) -> Option<u64> {
         self.owner
     }
@@ -462,6 +470,22 @@ impl Queue {
     pub(crate) fn room(&self) -> bool {
         !self.quarantined && !self.released && self.replays.len == 0 && self.active.len < IN_FLIGHT
     }
+    /// Quarantines without a pending witness no longer describe live pipe order.
+    pub(crate) fn timeout_head(&self) -> Option<crate::g17::timeout::Head> {
+        if self.quarantined && !self.awaiting_witness {
+            return None;
+        }
+        self.active.front().map(|active| crate::g17::timeout::Head {
+            vm: Arc::as_ptr(active.packet.completion.status()) as usize,
+            published: active.published,
+            finished: active.observed.is_some(),
+        })
+    }
+
+    pub(crate) fn can_classify_timeout(&self, packet: &Arc<Packet>) -> bool {
+        !self.quarantined && self.owns_packet(packet)
+    }
+
     pub(crate) fn oldest_spared(&self) -> Option<bool> {
         self.active
             .front()
@@ -567,10 +591,12 @@ impl Queue {
     ) -> Result<Option<Arc<VmStatus>>> {
         if !self.quarantined {
             self.quarantined = true;
+            self.update_slot_accounting();
             self.quarantine_error = Some(error);
             self.failure_status_pending = true;
             self.retirement_proved = false;
             self.retired_by_teardown = false;
+            self.update_slot_accounting();
             let all_spared =
                 self.active.len != 0 && self.active.iter().all(|a| a.packet.completion.spared());
             self.spared_quarantine = all_spared && error == ENODATA;
@@ -676,6 +702,7 @@ impl Queue {
                     self.retirement_ready = self.active.len == 0;
                     if self.released && self.retirement_ready {
                         self.owner = None;
+                        self.update_slot_accounting();
                     }
                 }
                 Ok(None) | Err(EAGAIN) => {
@@ -782,6 +809,7 @@ impl Queue {
             self.submitted = 0;
             self.kick.clear_parent_after_recovery();
             self.quarantined = false;
+            self.update_slot_accounting();
             self.retire_pending = false;
             self.retirement_ready = true;
             if self
@@ -793,6 +821,7 @@ impl Queue {
             }
             if self.released {
                 self.owner = None;
+                self.update_slot_accounting();
             }
         }
         Ok(())
@@ -932,9 +961,12 @@ impl Queue {
         }
         context.mark_published();
         self.owner = Some(owner);
+        self.update_slot_accounting();
         self.released = false;
+        self.update_slot_accounting();
         self.retirement_ready = false;
         self.retired_by_teardown = false;
+        self.update_slot_accounting();
         Ok(())
     }
     /// True allows the registry to cancel the never-published QID and drop this graph. An
@@ -944,11 +976,14 @@ impl Queue {
             return Ok(true);
         }
         self.released = true;
+        self.update_slot_accounting();
         if self.active.len == 0 && !self.quarantined {
             if let Some(previous) = self.previous.as_ref().filter(|p| p.publication.is_none()) {
                 if let Err(error) = self.graph.set_owner(&previous.context) {
                     self.quarantined = true;
+                    self.update_slot_accounting();
                     self.retired_by_teardown = true;
+                    self.update_slot_accounting();
                     return Err(error);
                 }
                 let mut previous = self.previous.take().ok_or(EIO)?;
@@ -961,6 +996,7 @@ impl Queue {
             }
             if self.retirement_ready {
                 self.owner = None;
+                self.update_slot_accounting();
             }
         }
         Ok(false)
@@ -1027,7 +1063,9 @@ impl Queue {
             return Ok(true);
         }
         self.released = true;
+        self.update_slot_accounting();
         self.retired_by_teardown = true;
+        self.update_slot_accounting();
         if let Some(active) = self
             .active
             .iter_mut()
@@ -1159,6 +1197,7 @@ impl Graph {
 /// Borrowed device operations used during one publication. Implementations borrow the initdata,
 /// coprocessor and accounting fields separately from the Registry that owns physical queues.
 pub(crate) trait Host {
+    fn next_compute_publication(&mut self) -> Result<u64>;
     fn epoch(&self) -> Result<(u64, u32)>;
     fn prepare_compute_shared(&mut self) -> Result;
     fn qos_publish(&mut self, owner: qos::Owner, scheduler: u64) -> Result<qos::Publication>;
@@ -1313,9 +1352,11 @@ impl Queue {
             event_mask: COMPUTE_KICK_EVENT_MASK,
             register_arrays: ComputeDescriptor::register_bindings(descriptor_low)?,
         };
+        let published = host.next_compute_publication()?;
         self.active
             .push(Active {
                 packet: packet.clone(),
+                published,
                 work: work.clone(),
                 ticket: None,
                 observed: None,

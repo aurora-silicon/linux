@@ -164,6 +164,7 @@ impl crate::g17::Firmware {
             return Ok(());
         }
         let mut serviced = false;
+        let mut draining = 0;
         for slot in 1..self.queues.render.entries.len() {
             if !self.queues.render.entries[slot]
                 .as_ref()
@@ -172,6 +173,7 @@ impl crate::g17::Firmware {
             {
                 continue;
             }
+            draining += 1;
             if let Err(error) = self.drain_render_slot(slot, &mut serviced, deferred) {
                 dev_warn!(
                     self.primary.state.shared.dev.as_ref(),
@@ -181,6 +183,7 @@ impl crate::g17::Firmware {
                 );
             }
         }
+        crate::g17::queue_stats::note_draining_pairs(draining);
         Ok(())
     }
 
