@@ -91,6 +91,12 @@ struct tb_nhi_ring_layout {
  *			     adapters have VE/AE enabled
  * @dp_tunnel_deactivate: Releases state from an attempted post-activation hook,
  *			 before adapters are disabled or the host router is removed
+ * @dp_tunnel_awaits_display: Whether the host has no display pipeline free yet
+ *			      for the DP tunnel from host DP IN adapter @in and
+ *			      will drive it once one frees. DPRX cannot complete
+ *			      meanwhile, so the tunnel is kept instead of being
+ *			      torn down at the DPRX timeout. Called with the
+ *			      domain lock held.
  * @is_present: Whether the device is currently present on the parent bus
  * @init_interrupts: NHI specific interrupt initialization hook
  */
@@ -119,6 +125,7 @@ struct tb_nhi_ops {
 				     struct tb_port *out);
 	bool (*is_present)(struct tb_nhi *nhi);
 	void (*dp_tunnel_changed)(struct tb_nhi *nhi, u8 in_port, bool active);
+	bool (*dp_tunnel_awaits_display)(struct tb_nhi *nhi, struct tb_port *in);
 	int (*init_interrupts)(struct tb_nhi *nhi);
 };
 

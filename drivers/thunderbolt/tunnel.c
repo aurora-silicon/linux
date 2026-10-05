@@ -85,6 +85,8 @@
 #define TB_DPRX_TIMEOUT			12000
 #define TB_DPRX_WAIT_TIMEOUT		25
 #define TB_DPRX_POLL_DELAY		50
+/* how often to look again while the host has no display pipeline for the tunnel */
+#define TB_DPRX_AWAIT_POLL_DELAY	1000
 
 static int dprx_timeout = TB_DPRX_TIMEOUT;
 module_param(dprx_timeout, int, 0444);
@@ -1167,6 +1169,19 @@ static int tb_dp_wait_dprx(struct tb_tunnel *tunnel, int timeout_msec)
 	return -ETIMEDOUT;
 }
 
+/*
+ * Some hosts (Apple silicon) have fewer display pipelines than DP IN adapters.
+ * A tunnel the host has no pipeline for yet cannot finish DPRX until one frees,
+ * so it must not be torn down as failed meanwhile.
+ */
+static bool tb_dp_host_awaits_display(struct tb_tunnel *tunnel)
+{
+	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
+
+	return ops && ops->dp_tunnel_awaits_display &&
+	       ops->dp_tunnel_awaits_display(tunnel->tb->nhi, tunnel->src_port);
+}
+
 static void tb_dp_dprx_work(struct work_struct *work)
 {
 	struct tb_tunnel *tunnel = container_of(work, typeof(*tunnel), dprx_work.work);
@@ -1179,8 +1194,18 @@ static void tb_dp_dprx_work(struct work_struct *work)
 		return;
 	}
 	if (!tunnel->dprx_canceled) {
+		bool awaits = tb_dp_host_awaits_display(tunnel);
+
 		if (tb_dp_is_usb4(tunnel->src_port->sw) &&
-		    tb_dp_wait_dprx(tunnel, TB_DPRX_WAIT_TIMEOUT)) {
+		    tb_dp_wait_dprx(tunnel, awaits ? 0 : TB_DPRX_WAIT_TIMEOUT)) {
+			if (awaits) {
+				/* the timeout runs from when the host takes it */
+				tunnel->dprx_timeout = dprx_timeout_to_ktime(dprx_timeout);
+				queue_delayed_work(tb->wq, &tunnel->dprx_work,
+						   msecs_to_jiffies(TB_DPRX_AWAIT_POLL_DELAY));
+				mutex_unlock(&tb->lock);
+				return;
+			}
 			if (ktime_before(ktime_get(), tunnel->dprx_timeout)) {
 				queue_delayed_work(tb->wq, &tunnel->dprx_work,
 						   msecs_to_jiffies(TB_DPRX_POLL_DELAY));

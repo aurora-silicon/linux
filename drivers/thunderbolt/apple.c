@@ -1653,6 +1653,22 @@ static void apple_nhi_dp_tunnel_changed(struct tb_nhi *nhi, u8 in_port,
 	queue_work(acio->dp_wq, &acio->dpin[dpin].work);
 }
 
+/* The display side refused this tunnel a pipeline for now and asks again. */
+static bool apple_nhi_dp_tunnel_awaits_display(struct tb_nhi *nhi,
+					       struct tb_port *in)
+{
+	struct apple_nhi *anhi = nhi_to_anhi(nhi);
+	struct apple_dpin_ctx *c;
+	int idx;
+
+	idx = apple_dpin_index_for_port(anhi, in);
+	if (idx < 0 || idx > 1 || !anhi->acio)
+		return false;
+	c = &anhi->acio->dpin[idx];
+	guard(mutex)(&c->lock);
+	return c->alive && c->waiting;
+}
+
 static const struct tb_nhi_ops apple_nhi_ops = {
 	.request_ring_irq = apple_nhi_request_irq,
 	.release_ring_irq = apple_nhi_release_irq,
@@ -1730,8 +1746,10 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	 * the connection manager) only where it is enabled and known to work.
 	 */
 	anhi->ops = apple_nhi_ops;
-	if (dp_display && acio->dp_wq && apple_cio_dp_tunnel_changed_supported())
+	if (dp_display && acio->dp_wq && apple_cio_dp_tunnel_changed_supported()) {
 		anhi->ops.dp_tunnel_changed = apple_nhi_dp_tunnel_changed;
+		anhi->ops.dp_tunnel_awaits_display = apple_nhi_dp_tunnel_awaits_display;
+	}
 	if (acio->dp_wq && apple_dp_tunnel_t602x()) {
 		anhi->ops.dp_tunnel_pre_activate = apple_nhi_dp_tunnel_pre_activate;
 		anhi->ops.dp_tunnel_post_activate = apple_nhi_dp_tunnel_post_activate;
