@@ -15,6 +15,7 @@ mod file;
 mod float;
 mod fw;
 mod gem;
+mod gem_stats;
 mod g17;
 mod gpu;
 mod hw;

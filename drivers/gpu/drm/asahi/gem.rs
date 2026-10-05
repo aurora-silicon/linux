@@ -41,10 +41,12 @@ use crate::{
 const DEBUG_CLASS: DebugFlags = DebugFlags::Gem;
 
 /// Represents the inner data of a GEM object for this driver.
-#[pin_data]
+#[pin_data(PinnedDrop)]
 pub(crate) struct AsahiObject {
     /// ID for debug
     id: u64,
+    /// Object size retained for live-object accounting.
+    size: usize,
     /// Object creation flags.
     flags: u32,
     /// Whether this object can be exported.
@@ -150,6 +152,13 @@ impl ObjectRef {
     }
 }
 
+#[pinned_drop]
+impl PinnedDrop for AsahiObject {
+    fn drop(self: Pin<&mut Self>) {
+        crate::gem_stats::note_free(self.kernel, self.size);
+    }
+}
+
 pub(crate) struct AsahiObjConfig {
     flags: u32,
     exportable: bool,
@@ -226,11 +235,17 @@ impl DriverObject for AsahiObject {
     const HAS_EXPORT: bool = true;
 
     /// Callback to create the inner data of a GEM object
-    fn new(_dev: &AsahiDevice, _size: usize, args: Self::Args) -> impl PinInit<Self, Error> {
+    fn new(_dev: &AsahiDevice, size: usize, args: Self::Args) -> impl PinInit<Self, Error> {
         let id = GEM_ID.fetch_add(1, Ordering::Relaxed);
         mod_pr_debug!("AsahiObject::new id={}\n", id);
         try_pin_init!(AsahiObject {
             id,
+            // All remaining fields are infallible. PinnedDrop balances the
+            // accounting once this initializer completes.
+            size: {
+                crate::gem_stats::note_new(args.kernel, size);
+                size
+            },
             flags: args.flags,
             exportable: args.exportable,
             kernel: args.kernel,
