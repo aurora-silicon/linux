@@ -5,3 +5,5 @@ phy-apple-atc-y			:= atc.o
 
 obj-$(CONFIG_PHY_APPLE_DPTX)	+= phy-apple-dptx.o
 phy-apple-dptx-y		+= dptx.o
+
+obj-$(CONFIG_PHY_APPLE_ATC_KUNIT_TEST)	+= atc-tunnel-test.o

@@ -9,11 +9,6 @@
  * The PHY handles muxing between these different protocols and also provides the
  * reset controller for the attached DWC3 USB controller.
  *
- * No documentation for this PHY is available and its operation has been
- * reverse engineered by observing the XNU's MMIO access using a thin hypervisor
- * and correlating register access to XNU's very verbose debug output. Most
- * register names comes from this debug output as well.
- *
  * In order to correctly setup the high speed lanes for the various modes
  * calibration values copied from Apple's firmware by our bootloader m1n1 are
  * required. Without these only USB2 operation is possible.
@@ -45,6 +40,8 @@
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
 #include <linux/usb/typec_tbt.h>
+
+#include "atc-tunnel.h"
 
 #define AUSPLL_FSM_CTRL 0x1014
 
@@ -657,6 +654,8 @@ struct atcphy_hw {
  * @mode: Current PHY operating mode
  * @swap_lanes: True if lanes must be swapped due to cable orientation
  * @dp_link_rate: DisplayPort link rate
+ * @tunnel_dual_stream: This PHY connector has qualified dual-stream tunnel wiring
+ * @tunnel_routes_present: Qualified dual-stream routes exist on this SoC
  * @tunnel_clock_on: True while the DisplayPort-over-Thunderbolt pixel clock runs
  * @tunnel_attempted: A T602X tunnel clock setup has been attempted
  * @tunnel_saved: T602X PHY registers have been saved for tunnel teardown
@@ -709,6 +708,8 @@ struct apple_atcphy {
 	bool swap_lanes;
 	enum atcphy_pipehandler_state pipe_state;
 
+	bool tunnel_dual_stream;
+	bool tunnel_routes_present;
 	bool tunnel_clock_on;
 	bool tunnel_attempted, tunnel_saved;
 	u32 tunnel_saved_regs[12];
@@ -2956,12 +2957,6 @@ static const struct phy_ops apple_atc_dp_phy_ops = {
  * Called by appledrm when DCP sets the link rate of a DPTX that feeds
  * Thunderbolt DP IN adapter @dpin (rate is the DP link rate code, 0 = stop).
  */
-static bool apple_atc_is_typec_core(u64 base)
-{
-	return base == 0x703000000ULL || base == 0xb03000000ULL ||
-	       base == 0xf03000000ULL;
-}
-
 /* t600x (M1 Pro/Max) runs the t8103 tunnel clock sequence unchanged. */
 static bool apple_atc_tunnel_is_t8103_style(void)
 {
@@ -2993,13 +2988,15 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 			readl(atcphy->regs.core + T8122_DP_PCLK_STATUS));
 		return ret;
 	}
-	if (!apple_atc_tunnel_is_t8103_style() && !apple_dp_tunnel_t602x())
-		return -EOPNOTSUPP;
-	if (apple_dp_tunnel_t602x() &&
-	    (!of_device_is_compatible(atcphy->np, "apple,t6020-atcphy") ||
-	     !apple_atc_is_typec_core(atcphy->res.core->start) ||
-	     resource_size(atcphy->res.core) < 0x7048))
-		return -EINVAL;
+	if (!apple_atc_tunnel_is_t8103_style()) {
+		bool valid_core = apple_atc_t602x_core_valid(atcphy->np, atcphy->res.core->start,
+							     resource_size(atcphy->res.core));
+
+		ret = apple_atc_t602x_gate(atcphy->tunnel_dual_stream,
+					   atcphy->tunnel_routes_present, valid_core);
+		if (ret)
+			return ret;
+	}
 	guard(mutex)(&atcphy->lock);
 	if (!rate) {
 		if (apple_atc_tunnel_is_t8103_style())
@@ -3515,6 +3512,29 @@ power_off:
 	return ret;
 }
 
+static void apple_atc_tunnel_wiring(struct apple_atcphy *atcphy)
+{
+	struct device_node *connector __free(device_node) = NULL;
+	struct device_node *candidate;
+
+	if (!apple_atc_t602x_qualified(of_root))
+		return;
+	connector = of_graph_get_remote_node(atcphy->np, 0, -1);
+	atcphy->tunnel_dual_stream = apple_dp_tunnel_dual_stream(connector);
+	if (atcphy->tunnel_dual_stream) {
+		atcphy->tunnel_routes_present = true;
+		return;
+	}
+	/* Preserve EINVAL for invalid cores when qualified routes exist elsewhere. */
+	for_each_compatible_node(candidate, NULL, "usb-c-connector") {
+		if (!apple_dp_tunnel_dual_stream(candidate))
+			continue;
+		atcphy->tunnel_routes_present = true;
+		of_node_put(candidate);
+		break;
+	}
+}
+
 static int atcphy_probe(struct platform_device *pdev)
 {
 	struct apple_atcphy *atcphy;
@@ -3531,6 +3551,7 @@ static int atcphy_probe(struct platform_device *pdev)
 
 	atcphy->dev = dev;
 	atcphy->np = dev->of_node;
+	apple_atc_tunnel_wiring(atcphy);
 	mutex_init(&atcphy->lock);
 	platform_set_drvdata(pdev, atcphy);
 

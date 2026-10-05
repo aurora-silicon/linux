@@ -3291,8 +3291,44 @@ static void tb_test_dp_generation(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, (u64)atomic64_read(&counter), U64_MAX);
 }
 
+static void tb_test_apple_right_dpin_wiring(struct kunit *test)
+{
+	const struct {
+		const char *name;
+		bool wired;
+		unsigned long policy;
+		bool expected;
+	} cases[] = {
+		{ "701f00000.nhi", true, TB_HOST_DP_INITIAL_BW_GRANT, false },
+		{ "b01f00000.nhi", true, TB_HOST_DP_INITIAL_BW_GRANT, false },
+		{ "f01f00000.nhi", true, TB_HOST_DP_INITIAL_BW_GRANT, true },
+		{ "f01f00000.nhi", false, TB_HOST_DP_INITIAL_BW_GRANT, false },
+		{ "f01f00000.nhi", true, TB_HOST_DP_NOTIFY, false },
+		{ "f01f00000.nhi", true, 0, false },
+		{ "pci-nhi", true, TB_HOST_DP_INITIAL_BW_GRANT, false },
+	};
+	struct tb_nhi missing = {
+		.host_dp_policy = TB_HOST_DP_INITIAL_BW_GRANT,
+		.host_dp_dual_stream = true,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		struct device dev = { .init_name = cases[i].name };
+		struct tb_nhi nhi = {
+			.dev = &dev, .host_dp_policy = cases[i].policy,
+			.host_dp_dual_stream = cases[i].wired,
+		};
+
+		KUNIT_EXPECT_EQ(test, tb_apple_nhi_needs_bw_grant(&nhi), cases[i].expected);
+	}
+	KUNIT_EXPECT_FALSE(test, tb_apple_nhi_needs_bw_grant(NULL));
+	KUNIT_EXPECT_FALSE(test, tb_apple_nhi_needs_bw_grant(&missing));
+}
+
 static struct kunit_case tb_test_cases[] = {
 	KUNIT_CASE(tb_test_dp_generation),
+	KUNIT_CASE(tb_test_apple_right_dpin_wiring),
 	KUNIT_CASE(tb_test_pci_host_teardown),
 	KUNIT_CASE(tb_test_pci_host_daisy_chain),
 	KUNIT_CASE(tb_test_dp_dprx_deferred_first),

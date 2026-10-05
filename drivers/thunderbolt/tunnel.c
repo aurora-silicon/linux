@@ -981,12 +981,7 @@ static bool tb_dp_is_apple_t602x_right_dpin(const struct tb_port *in)
 {
 	if (!tb_port_is_dpin(in))
 		return false;
-	if (!in->sw->tb ||
-	    !tb_host_dp_policy(in->sw->tb->nhi, TB_HOST_DP_INITIAL_BW_GRANT))
-		return false;
-
-	/* Right-hand USB-C ports only ("f01f" NHI); see tb_apple_nhi_typec_index(). */
-	return tb_apple_nhi_typec_index(in->sw->tb->nhi) == 2;
+	return in->sw->tb && tb_apple_nhi_needs_bw_grant(in->sw->tb->nhi);
 }
 
 static bool tb_dp_apple_dpin_needs_bw_grant(const struct tb_port *in)
@@ -1864,6 +1859,12 @@ static int tb_apple_nhi_typec_index(struct tb_nhi *nhi)
 	if (strstr(name, "f01f"))
 		return 2;
 	return -1;
+}
+
+bool tb_apple_nhi_needs_bw_grant(struct tb_nhi *nhi)
+{
+	return tb_host_dp_policy(nhi, TB_HOST_DP_INITIAL_BW_GRANT) &&
+	       nhi->host_dp_dual_stream && tb_apple_nhi_typec_index(nhi) == 2;
 }
 
 static void tb_dp_dump_apple(struct tb_tunnel *tunnel)

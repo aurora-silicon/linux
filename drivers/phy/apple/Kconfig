@@ -21,3 +21,13 @@ config PHY_APPLE_DPTX
 	  such as the M2.
 	  This driver provides support for DisplayPort and is used on the
 	  Mac mini (M2 and M2 Pro, 2023).
+
+config PHY_APPLE_ATC_KUNIT_TEST
+	tristate "KUnit tests for Apple ATC tunnel qualification" if !KUNIT_ALL_TESTS
+	depends on KUNIT && OF
+	default KUNIT_ALL_TESTS
+	help
+	  Test the SoC and per-connector wiring gates for Apple ATC tunnel
+	  clocks, including unsupported and invalid-core error results.
+	  The suite calls the production qualification and clock admission
+	  helpers with OF fixtures and wiring cases, without PHY hardware.

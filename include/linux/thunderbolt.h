@@ -498,6 +498,7 @@ static inline struct tb_xdomain *tb_service_parent(struct tb_service *svc)
  * @hop_count: Number of rings (end point hops) supported by NHI.
  * @quirks: NHI specific quirks if any
  * @host_dp_policy: Host display tunnel policies supplied by the NHI glue
+ * @host_dp_dual_stream: The host connector has two physically wired DP-IN streams
  * @domain_released: Completed when domain has been fully released
  */
 struct tb_nhi {
@@ -514,6 +515,7 @@ struct tb_nhi {
 	u32 hop_count;
 	unsigned long quirks;
 	unsigned long host_dp_policy;
+	bool host_dp_dual_stream;
 	struct completion domain_released;
 };
 

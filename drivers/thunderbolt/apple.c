@@ -214,6 +214,7 @@ struct apple_cio {
 
 	/* Type-C connector this router is wired to, for DP tunnel routing */
 	struct device_node *connector_np;
+	bool dp_dual_stream;
 	struct workqueue_struct *dp_wq;
 	struct apple_dpin_ctx {
 		struct apple_cio *acio;
@@ -273,19 +274,13 @@ static const struct of_device_id apple_dpin_qualified_soc[] = {
 	{},
 };
 
-/* Compatibility bridge until the display-to-DP-IN DT route binding lands. */
-static bool apple_dpin_legacy_t602x_routes(void)
-{
-	return apple_dp_tunnel_t602x();
-}
-
 const struct apple_dpin_policy *
 apple_dpin_policy_select(const struct apple_dpin_policy *hw,
-			 const struct device_node *root, bool legacy_routes)
+			 const struct device_node *root, bool dual_stream)
 {
 	if (!of_match_node(apple_dpin_qualified_soc, root))
 		return &apple_dpin_disabled;
-	if (hw->flow == APPLE_DPIN_PRE_POST && !legacy_routes)
+	if (hw->flow == APPLE_DPIN_PRE_POST && !dual_stream)
 		return &apple_dpin_disabled;
 	return hw;
 }
@@ -1854,6 +1849,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	 * the connection manager) only where it is enabled and known to work.
 	 */
 	anhi->ops = apple_nhi_ops;
+	anhi->nhi.host_dp_dual_stream = acio->dp_dual_stream;
 	dp_hooks = apple_dpin_hooks(acio->dp, !!acio->dp_wq, dp_display);
 	if (dp_hooks == APPLE_DPIN_CHANGED) {
 		anhi->ops.dp_tunnel_changed = apple_nhi_dp_tunnel_changed;
@@ -2595,9 +2591,6 @@ static int apple_cio_probe(struct platform_device *pdev)
 	acio->hw = of_device_get_match_data(dev);
 	if (!acio->hw)
 		return -EINVAL;
-	/* Controller compatibles describe registers, not display qualification. */
-	acio->dp = apple_dpin_policy_select(acio->hw->dp, of_root,
-					    apple_dpin_legacy_t602x_routes());
 
 	if (acio->hw->mxwrap) {
 		struct resource *cpu_res;
@@ -2707,6 +2700,9 @@ static int apple_cio_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, -EINVAL, "Not enough PM domains\n");
 
 	acio->connector_np = of_graph_get_remote_node(dev->of_node, 1, -1);
+	acio->dp_dual_stream = apple_dp_tunnel_dual_stream(acio->connector_np);
+	/* Register layout, root qualification and connector wiring are separate. */
+	acio->dp = apple_dpin_policy_select(acio->hw->dp, of_root, acio->dp_dual_stream);
 	if (acio->connector_np) {
 		ret = devm_add_action_or_reset(dev, apple_cio_of_node_put,
 					       acio->connector_np);

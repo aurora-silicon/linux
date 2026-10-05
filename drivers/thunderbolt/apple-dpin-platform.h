@@ -9,6 +9,6 @@ struct device_node;
 
 const struct apple_dpin_policy *
 apple_dpin_policy_select(const struct apple_dpin_policy *hw,
-			 const struct device_node *root, bool legacy_routes);
+			 const struct device_node *root, bool dual_stream);
 
 #endif
