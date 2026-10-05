@@ -321,6 +321,13 @@ apple_connector_detect(struct drm_connector *connector, bool force)
 		connector_status_connected : connector_status_disconnected;
 }
 
+void apple_connector_queue_release_crtc(struct apple_connector *apple_connector)
+{
+	if (!apple_connector->port_encoder)
+		return;
+	schedule_work(&apple_connector->release_crtc_wq);
+}
+
 static void apple_connector_oob_hotplug(struct drm_connector *connector,
 					enum drm_connector_status status)
 {
@@ -829,6 +836,7 @@ static void appledrm_connector_cleanup(struct drm_connector *connector)
 	struct apple_connector *apple_connector = to_apple_connector(connector);
 
 	/* Queued by the last disconnect at shutdown; they use the connector. */
+	cancel_work_sync(&apple_connector->release_crtc_wq);
 	cancel_work_sync(&apple_connector->hotplug_wq);
 	cancel_work_sync(&apple_connector->bl_sync_wq);
 	cancel_work_sync(&apple_connector->bl_commit_wq);
@@ -1045,6 +1053,7 @@ static int apple_connector_create(struct drm_device *drm,
 	apple_connector_backlight_init(connector);
 	/* before anything can fail: cleanup cancels it */
 	INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
+	INIT_WORK(&connector->release_crtc_wq, apple_connector_release_crtc);
 	drm_connector_helper_add(&connector->base,
 				 &apple_connector_helper_funcs);
 	if (attach_fwnode)
@@ -1315,6 +1324,7 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		apple_connector_backlight_init(connector);
 		/* before anything can fail: cleanup cancels it */
 		INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
+		INIT_WORK(&connector->release_crtc_wq, apple_connector_release_crtc);
 		drm_connector_helper_add(&connector->base,
 					 &apple_connector_helper_funcs);
 
@@ -1486,6 +1496,7 @@ static void apple_drm_quiesce_connectors(struct drm_device *drm)
 		 * has drained RTKit. Stop their users before releasing endpoints,
 		 * clocks and IOMMUs, and reject enqueues during that release.
 		 */
+		disable_work_sync(&apple_connector->release_crtc_wq);
 		disable_work_sync(&apple_connector->hotplug_wq);
 		disable_work_sync(&apple_connector->bl_sync_wq);
 		disable_work_sync(&apple_connector->bl_commit_wq);

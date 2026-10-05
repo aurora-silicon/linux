@@ -3942,6 +3942,14 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 
 	disconnected_hpd_event(dcp->connector);
 
+	/*
+	 * Userspace has been told; make sure the CRTC comes back even when it
+	 * does not act, or the next port routed to this pipeline is rejected
+	 * by the atomic helper's clone check and stays dark.
+	 */
+	if (dcp->connector)
+		apple_connector_queue_release_crtc(dcp->connector);
+
 	if (dcp->avep)
 		av_service_disconnect(dcp);
 
