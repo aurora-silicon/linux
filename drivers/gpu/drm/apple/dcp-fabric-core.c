@@ -3,6 +3,7 @@
 #include <linux/errno.h>
 #include <linux/export.h>
 #include <linux/limits.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
 
 #include "dcp-fabric-core.h"
@@ -39,9 +40,46 @@ bool dcp_fabric_fixed_busy(bool typec_only, bool independent, bool connected,
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_fixed_busy);
 
-bool dcp_fabric_available(const struct dcp_fabric_pipeline *pipeline)
+u64 dcp_fabric_presence_edge(struct dcp_fabric_presence *presence,
+			     unsigned long now, unsigned long window)
 {
-	return !pipeline->owned && !pipeline->fixed_busy;
+	presence->generation++;
+	presence->state = DCP_FABRIC_SETTLING;
+	presence->deadline = now + window;
+	return presence->generation;
+}
+EXPORT_SYMBOL_GPL(dcp_fabric_presence_edge);
+
+bool dcp_fabric_presence_sample(struct dcp_fabric_presence *presence,
+				u64 generation, bool high,
+				unsigned long now, unsigned long window)
+{
+	if (generation != presence->generation)
+		return false;
+	presence->state = high ? DCP_FABRIC_PRESENT : DCP_FABRIC_SETTLING;
+	presence->deadline = high ? 0 : now + window;
+	return true;
+}
+EXPORT_SYMBOL_GPL(dcp_fabric_presence_sample);
+
+bool dcp_fabric_presence_expire(struct dcp_fabric_presence *presence,
+				u64 generation, bool high, unsigned long now)
+{
+	if (generation != presence->generation ||
+	    presence->state != DCP_FABRIC_SETTLING ||
+	    time_before(now, presence->deadline))
+		return false;
+	presence->state = high ? DCP_FABRIC_PRESENT : DCP_FABRIC_ABSENT;
+	presence->deadline = 0;
+	return !high;
+}
+EXPORT_SYMBOL_GPL(dcp_fabric_presence_expire);
+
+bool dcp_fabric_available(const struct dcp_fabric_pipeline *pipeline,
+			  const struct dcp_fabric_policy *policy)
+{
+	return !pipeline->owned && !pipeline->fixed_busy &&
+		(policy->dual_stream || pipeline->presence == DCP_FABRIC_ABSENT);
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_available);
 
@@ -93,7 +131,7 @@ dcp_fabric_free_route(const struct dcp_fabric_port *port,
 	for (route = port->routes; route; route = route->next) {
 		unsigned int score;
 
-		if (!dcp_fabric_available(route->pipeline))
+		if (!dcp_fabric_available(route->pipeline, policy))
 			continue;
 		score = dcp_fabric_score(route->pipeline, policy);
 		if (score < best_score) {
@@ -101,7 +139,7 @@ dcp_fabric_free_route(const struct dcp_fabric_port *port,
 			best_score = score;
 		}
 	}
-	if (!last || !dcp_fabric_available(last->pipeline))
+	if (!last || !dcp_fabric_available(last->pipeline, policy))
 		return best;
 	if (!policy->dual_stream && best &&
 	    best_score < dcp_fabric_score(last->pipeline, policy))
@@ -222,9 +260,7 @@ dcp_fabric_tunnel_candidate(const struct dcp_fabric_port *port,
 		unsigned int score;
 
 		if ((ordered && route != planned) ||
-		    !dcp_fabric_available(pipeline))
-			continue;
-		if (!policy->dual_stream && pipeline->hdmi_held)
+		    !dcp_fabric_available(pipeline, policy))
 			continue;
 		if (!dcp_fabric_fits(pipeline, policy,
 				     port->candidate_crtcs[dpin],

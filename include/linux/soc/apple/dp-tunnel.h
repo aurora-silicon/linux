@@ -76,4 +76,7 @@ static inline bool apple_dp_tunnel_t602x(void)
  */
 int apple_dpxbar_preselect(struct mux_control *mux, int state);
 
+/* Optional TB capacity wakeup: RCU lookup and queue only, never a mutex/wait. */
+void apple_tb_dp_capacity_available(struct device_node *connector_np);
+
 #endif

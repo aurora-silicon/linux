@@ -107,6 +107,88 @@ static void fabric_promote(struct fabric_fixture *f)
 			fabric_direct(f, p);
 }
 
+/* Both borrowers consume the same hardirq/sample/expiry decisions. */
+static void fabric_presence_scenario(struct kunit *test,
+				     struct fabric_fixture *f, unsigned int id)
+{
+	struct dcp_fabric_presence presence = {};
+	const unsigned long window = 10000;
+	u64 edge, newer;
+	unsigned int events = 0;
+
+	f->pipeline[1].owned = true;
+	edge = dcp_fabric_presence_edge(&presence, 100, window);
+	KUNIT_EXPECT_EQ(test, presence.deadline, 10100UL);
+	f->pipeline[0].presence = presence.state;
+	KUNIT_EXPECT_EQ(test, fabric_tunnel(f, 0, 0), -EBUSY);
+	KUNIT_EXPECT_EQ(test, fabric_direct(f, 1), -EBUSY);
+	KUNIT_EXPECT_FALSE(test,
+			   dcp_fabric_presence_expire(&presence, edge, false, 10100 - 1));
+
+	if (id == 10) {
+		/* A waking monitor returns before the window ends. */
+		newer = dcp_fabric_presence_edge(&presence, 1100, window);
+		KUNIT_ASSERT_TRUE(test,
+				  dcp_fabric_presence_sample(&presence, newer, true, 1100, window));
+		KUNIT_EXPECT_EQ(test, presence.state, DCP_FABRIC_PRESENT);
+		KUNIT_EXPECT_EQ(test, presence.deadline, 0UL);
+		KUNIT_EXPECT_FALSE(test,
+				   dcp_fabric_presence_expire(&presence, edge, false, 10100));
+		KUNIT_EXPECT_FALSE(test,
+				   dcp_fabric_presence_expire(&presence, newer, false, 11100));
+		f->pipeline[0].presence = presence.state;
+		f->pipeline[0].fixed_busy = true;
+		KUNIT_EXPECT_EQ(test, fabric_tunnel(f, 0, 0), -EBUSY);
+		return;
+	}
+	if (id == 16) {
+		/* Resume starts after IRQ enable: low gets the full window. */
+		newer = dcp_fabric_presence_edge(&presence, 20100, window);
+		KUNIT_ASSERT_TRUE(test,
+				  dcp_fabric_presence_sample(&presence, newer, false,
+							     20200, window));
+		KUNIT_EXPECT_EQ(test, presence.deadline, 30200UL);
+		KUNIT_EXPECT_FALSE(test,
+				   dcp_fabric_presence_expire(&presence, edge, false, 30200));
+		/* A high sample clears the edge hold and invalidates its expiry. */
+		KUNIT_ASSERT_TRUE(test,
+				  dcp_fabric_presence_sample(&presence, newer, true,
+							     20300, window));
+		KUNIT_EXPECT_EQ(test, presence.state, DCP_FABRIC_PRESENT);
+		KUNIT_EXPECT_EQ(test, presence.deadline, 0UL);
+		KUNIT_EXPECT_FALSE(test,
+				   dcp_fabric_presence_expire(&presence, newer, false, 30200));
+		/* A falling edge after the sample wins; stale high cannot undo it. */
+		edge = dcp_fabric_presence_edge(&presence, 20400, window);
+		KUNIT_EXPECT_FALSE(test,
+				   dcp_fabric_presence_sample(&presence, newer, true,
+							      20500, window));
+		KUNIT_EXPECT_EQ(test, presence.state, DCP_FABRIC_SETTLING);
+		KUNIT_EXPECT_EQ(test, presence.deadline, 30400UL);
+		f->pipeline[0].presence = presence.state;
+		KUNIT_EXPECT_EQ(test, fabric_tunnel(f, 0, 0), -EBUSY);
+		KUNIT_EXPECT_EQ(test, fabric_direct(f, 1), -EBUSY);
+		return;
+	}
+
+	KUNIT_ASSERT_TRUE(test,
+			  dcp_fabric_presence_expire(&presence, edge, false, 10100));
+	events++;
+	f->pipeline[0].presence = presence.state;
+	KUNIT_EXPECT_EQ(test, presence.state, DCP_FABRIC_ABSENT);
+	/* The event is consumed once, even if the expiry callback is repeated. */
+	if (dcp_fabric_presence_expire(&presence, edge, false, 10101))
+		events++;
+	KUNIT_EXPECT_EQ(test, events, 1U);
+	if (id == 11) {
+		KUNIT_EXPECT_EQ(test, fabric_tunnel(f, 0, 0), 0);
+		KUNIT_EXPECT_PTR_EQ(test, f->port[0].owner[0], &f->route[0][0]);
+	} else {
+		fabric_promote(f);
+		KUNIT_EXPECT_PTR_EQ(test, f->port[1].owner[0], &f->route[1][0]);
+	}
+}
+
 struct fabric_scenario {
 	const char *name;
 	unsigned int id;
@@ -128,7 +210,7 @@ static const struct fabric_scenario scenarios[] = {
 	{ "S13_boot_three_outputs", 13 },
 	{ "S14_boot_two_typec", 14 },
 	{ "S15_boot_hdmi_tunnel", 15 },
-	{ "S16_resume_protection", 16 },
+	{ "S16_resume_arms_settle", 16 },
 	{ "S17_occupied_slot_errors", 17 },
 	{ "S18_connector_mask", 18 },
 	{ "S20_base_capacity", 20 },
@@ -176,7 +258,7 @@ static void fabric_scenario_test(struct kunit *test)
 		KUNIT_ASSERT_EQ(test, fabric_direct(&f, 0), 0);
 		f.pipeline[0].fixed_busy = true;
 		KUNIT_EXPECT_PTR_EQ(test, f.port[0].owner[0], &f.route[0][1]);
-		KUNIT_EXPECT_FALSE(test, dcp_fabric_available(&f.pipeline[0]));
+		KUNIT_EXPECT_FALSE(test, dcp_fabric_available(&f.pipeline[0], &f.policy));
 		break;
 	case 3:
 		KUNIT_ASSERT_EQ(test, fabric_tunnel(&f, 0, 0), 0);
@@ -253,24 +335,10 @@ static void fabric_scenario_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, steps[1], DCP_FABRIC_SELECT_MUX);
 		break;
 	case 10:
-	case 16:
-		f.pipeline[1].owned = true;
-		f.pipeline[0].hdmi_held = true;
-		KUNIT_EXPECT_EQ(test, fabric_tunnel(&f, 0, 0), -EBUSY);
-		f.pipeline[0].fixed_busy = true;
-		f.pipeline[0].hdmi_held = false;
-		KUNIT_EXPECT_EQ(test, fabric_tunnel(&f, 0, 0), -EBUSY);
-		break;
 	case 11:
-		f.pipeline[1].owned = true;
-		f.pipeline[0].hdmi_held = true;
-		KUNIT_EXPECT_EQ(test, fabric_tunnel(&f, 0, 0), -EBUSY);
-		f.pipeline[0].hdmi_held = false;
-		KUNIT_EXPECT_EQ(test, fabric_tunnel(&f, 0, 0), 0);
-		break;
 	case 12:
-		kunit_skip(test,
-			   "W4a adds direct borrower settling protection");
+	case 16:
+		fabric_presence_scenario(test, &f, scenario->id);
 		break;
 	case 15:
 		f.pipeline[0].fixed_busy = true;
@@ -345,7 +413,7 @@ static void fabric_scenario_test(struct kunit *test)
 		KUNIT_EXPECT_PTR_EQ(test,
 				    dcp_fabric_free_route(&f.port[0], &f.policy),
 				    &f.route[0][1]);
-		f.pipeline[0].hdmi_held = true;
+		f.pipeline[0].presence = DCP_FABRIC_SETTLING;
 		KUNIT_EXPECT_EQ(test, fabric_tunnel(&f, 1, 0), 0);
 		break;
 	case 35:
@@ -468,11 +536,32 @@ static void fabric_unbound_and_mask_test(struct kunit *test)
 			(u32)(BIT(1) | BIT(2)));
 }
 
+static void fabric_presence_wrap_test(struct kunit *test)
+{
+	struct dcp_fabric_presence presence = {};
+	u64 generation;
+
+	generation = dcp_fabric_presence_edge(&presence, ULONG_MAX - 50, 100);
+	KUNIT_EXPECT_FALSE(test,
+			   dcp_fabric_presence_expire(&presence, generation, false, ULONG_MAX - 1));
+	KUNIT_EXPECT_FALSE(test,
+			   dcp_fabric_presence_expire(&presence, generation, false, 48));
+	KUNIT_EXPECT_TRUE(test,
+			  dcp_fabric_presence_expire(&presence, generation, false, 49));
+	generation = dcp_fabric_presence_edge(&presence, 100, 100);
+	/* An expiry which samples high cannot advertise capacity. */
+	KUNIT_EXPECT_FALSE(test,
+			   dcp_fabric_presence_expire(&presence, generation, true, 200));
+	KUNIT_EXPECT_EQ(test, presence.state, DCP_FABRIC_PRESENT);
+	KUNIT_EXPECT_EQ(test, presence.deadline, 0UL);
+}
+
 static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE_PARAM(fabric_scenario_test, fabric_scenario_gen_params),
 	KUNIT_CASE(fabric_dark_tunnel_test),
 	KUNIT_CASE(fabric_effect_failure_test),
 	KUNIT_CASE(fabric_unbound_and_mask_test),
+	KUNIT_CASE(fabric_presence_wrap_test),
 	{}
 };
 

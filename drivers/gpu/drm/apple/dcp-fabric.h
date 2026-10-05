@@ -73,7 +73,8 @@ int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, bool active);
 /* DCP probe, resume and endpoint teardown hooks. */
 int dcp_register_typec_routes(struct apple_dcp *dcp);
 void dcp_typec_retrain_work(struct work_struct *work);
-void dcp_hdmi_hold(struct apple_dcp *dcp);
+void dcp_fabric_init(struct apple_dcp *dcp);
+void dcp_fabric_hdmi_resume(struct apple_dcp *dcp);
 irqreturn_t dcp_dp2hdmi_hpd_edge(int irq, void *data);
 irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data);
 void dcp_fabric_shutdown_dptx(struct apple_dcp *dcp);

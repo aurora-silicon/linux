@@ -339,8 +339,10 @@ struct apple_dcp {
 	struct apple_connector *fixed_connector;
 	struct apple_connector *typec_connector;
 	int hdmi_hpd_irq;
-	/* jiffies until which a Thunderbolt tunnel may not borrow this pipeline */
-	unsigned long hdmi_hold_until;
+	/* Hardirq, resume and expiry share one generation under this lock. */
+	spinlock_t hdmi_presence_lock;
+	struct dcp_fabric_presence hdmi_presence;
+	struct delayed_work hdmi_settle_wq;
 };
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);

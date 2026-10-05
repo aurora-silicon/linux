@@ -4,6 +4,18 @@
 
 #include <linux/types.h>
 
+enum dcp_fabric_presence_state {
+	DCP_FABRIC_ABSENT,
+	DCP_FABRIC_SETTLING,
+	DCP_FABRIC_PRESENT,
+};
+
+struct dcp_fabric_presence {
+	enum dcp_fabric_presence_state state;
+	u64 generation;
+	unsigned long deadline;
+};
+
 struct dcp_fabric_pipeline {
 	struct dcp_fabric_pipeline *next;
 	unsigned int crtc_index;
@@ -12,7 +24,7 @@ struct dcp_fabric_pipeline {
 	bool fixed_busy;
 	bool owned;
 	bool tunnel_held;
-	bool hdmi_held;
+	enum dcp_fabric_presence_state presence;
 	bool terminal;
 	bool services_ready;
 	bool external;
@@ -69,7 +81,15 @@ int dcp_fabric_tunnel_request(const struct dcp_fabric_port *ports,
 enum dcp_fabric_capacity_action dcp_fabric_capacity_action(bool keep_order);
 bool dcp_fabric_fixed_busy(bool typec_only, bool independent, bool connected,
 			   bool hpd);
-bool dcp_fabric_available(const struct dcp_fabric_pipeline *pipeline);
+bool dcp_fabric_available(const struct dcp_fabric_pipeline *pipeline,
+			  const struct dcp_fabric_policy *policy);
+u64 dcp_fabric_presence_edge(struct dcp_fabric_presence *presence,
+			     unsigned long now, unsigned long window);
+bool dcp_fabric_presence_sample(struct dcp_fabric_presence *presence,
+				u64 generation, bool high,
+				unsigned long now, unsigned long window);
+bool dcp_fabric_presence_expire(struct dcp_fabric_presence *presence,
+				u64 generation, bool high, unsigned long now);
 unsigned int dcp_fabric_score(const struct dcp_fabric_pipeline *pipeline,
 			      const struct dcp_fabric_policy *policy);
 bool dcp_fabric_fits(const struct dcp_fabric_pipeline *pipeline,
