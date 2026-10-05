@@ -748,7 +748,12 @@ impl GpuManager::ver {
                 )?,
                 fw_log: channel::FwLogChannel::new(dev, alloc_ref)?,
                 ktrace: channel::KTraceChannel::new(dev, alloc_ref)?,
-                stats: channel::StatsChannel::ver::new(dev, alloc_ref, stats_snap_clone)?,
+                stats: channel::StatsChannel::ver::new(
+                    dev,
+                    alloc_ref,
+                    stats_snap_clone,
+                    u64::from(cfg.base_clock_hz),
+                )?,
             }),
             GFP_KERNEL,
         )?;

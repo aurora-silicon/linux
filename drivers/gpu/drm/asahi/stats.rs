@@ -21,9 +21,11 @@
 //! - `avg_power_mw`: average power in milliwatts from `AvgPower` (firmware
 //!   field is u32 — units not validated for every chip rev; treat as raw).
 //! - `temperature`: raw `Temperature` value, scale, tmin, tmax.
-//! - `busy_ns`: cumulative utilization-weighted busy time, derived from
-//!   successive `Utilization` windows (busiest subqueue percentage x window
-//!   duration). Monotonic and bounded by elapsed time. Saturates at u64::MAX.
+//! - `busy_ns`: cumulative utilization-weighted busy time in nanoseconds,
+//!   derived from successive `Utilization` windows (busiest subqueue
+//!   percentage x window duration; the firmware timestamps are base-clock
+//!   ticks, 24 MHz, converted with `HwConfig::base_clock_hz`). Monotonic and
+//!   bounded by elapsed time. Saturates at u64::MAX.
 //! - `jobs`: completed submissions since boot, counted at submission
 //!   completion (`JobFence::command_complete`).
 //!

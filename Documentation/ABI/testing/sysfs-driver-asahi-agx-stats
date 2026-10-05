@@ -23,16 +23,18 @@ Description:
 
 		Access: Read-only. Owner-readable (mode 0444).
 
-		busy_ns    cumulative u64; utilization-weighted busy time since
-		           boot: each Utilization message window contributes its
-		           duration scaled by the busiest subqueue percentage.
-		           Monotonic; bounded by elapsed wall time regardless of
-		           the firmware timestamp tick rate. MEASURED on T6021
+		busy_ns    cumulative u64; utilization-weighted busy time in
+		           nanoseconds since boot: each Utilization message window
+		           contributes its duration scaled by the busiest subqueue
+		           percentage. Firmware timestamps are base-clock ticks
+		           (HwConfig.base_clock_hz, 24 MHz on every supported SoC)
+		           and are converted to ns by the driver. Monotonic;
+		           bounded by elapsed wall time. MEASURED on T6021
 		           (M2 Max, 13.5): idle desktop fraction ~0.01, saturated
 		           4096^2 fp16 matmul fraction ~1.0 (util1..4 = 100).
-		           T6001 shares the message format (fw 13.5); the same
-		           idle-vs-matmul check must be run there before the
-		           absolute-magnitude (ns) claim is made.
+		           T6001 shares the message format and the 24 MHz clock
+		           (fw 13.5); the same idle-vs-matmul check must be run
+		           there before the magnitude claim is repeated.
 
 		jobs       u64; cumulative completed submissions since boot.
 		           Counted on the host at submission completion (when

@@ -594,7 +594,11 @@ pub(crate) struct StatsChannel {
     dev: AsahiDevRef,
     ch: RxChannel<ChannelState, RawStatsMsg::ver>,
     snap: Arc<crate::stats::StatsSnapshot>,
-    /// Last `Utilization` message timestamp (raw firmware units), for
+    /// Rate of firmware stats-message timestamps (Hz). All stats timestamps
+    /// run on the chip base clock (`HwConfig::base_clock_hz`, 24 MHz on every
+    /// supported SoC), not nanoseconds.
+    ts_hz: u64,
+    /// Last `Utilization` message timestamp (raw base-clock ticks), for
     /// utilization-weighted `busy_ns` integration.
     last_util_ts: u64,
 }
@@ -606,11 +610,13 @@ impl StatsChannel::ver {
         dev: &AsahiDevice,
         alloc: &mut gpu::KernelAllocators,
         snap: Arc<crate::stats::StatsSnapshot>,
+        ts_hz: u64,
     ) -> Result<StatsChannel::ver> {
         Ok(StatsChannel::ver {
             dev: dev.into(),
             ch: RxChannel::<ChannelState, RawStatsMsg::ver>::new(alloc, 0x100)?,
             snap,
+            ts_hz,
             last_util_ts: 0,
         })
     }
@@ -648,17 +654,18 @@ impl StatsChannel::ver {
                                 self.snap.util2.store(*util2, Ordering::Relaxed);
                                 self.snap.util3.store(*util3, Ordering::Relaxed);
                                 self.snap.util4.store(*util4, Ordering::Relaxed);
-                                // busy_ns: utilization-weighted busy time. Each
-                                // Utilization window contributes its duration
-                                // scaled by the busiest subqueue's percentage.
-                                // MEASURED on T6021 (round-3 window): util1..4
-                                // read 100 across a saturated 30 s matmul and
-                                // 0-2 on an idle desktop, while FwBusy
-                                // timestamp deltas (the prior producer)
-                                // covered 0.17% of that matmul. The busy
-                                // fraction is invariant to the firmware tick
-                                // rate; divide before scaling to avoid u64
-                                // overflow near u64::MAX timestamps.
+                                // busy_ns: utilization-weighted busy time in
+                                // nanoseconds. Each Utilization window
+                                // contributes its duration scaled by the
+                                // busiest subqueue's percentage. MEASURED on
+                                // T6021 (round-3 window): util1..4 read 100
+                                // across a saturated 30 s matmul and 0-2 on
+                                // an idle desktop, while FwBusy timestamp
+                                // deltas (the prior producer) covered 0.17%
+                                // of that matmul. The timestamps are base-
+                                // clock ticks (24 MHz), so convert once
+                                // here; the u128 intermediate keeps
+                                // (ts - prev) * util * 1e9 far from overflow.
                                 let util = [*util1, *util2, *util3, *util4]
                                     .into_iter()
                                     .max()
@@ -666,10 +673,11 @@ impl StatsChannel::ver {
                                     .min(100) as u64;
                                 let ts = timestamp.0;
                                 if self.last_util_ts != 0 && ts > self.last_util_ts {
-                                    self.snap.busy_ns.fetch_add(
-                                        (ts - self.last_util_ts) / 100 * util,
-                                        Ordering::Relaxed,
-                                    );
+                                    let busy = ((ts - self.last_util_ts) as u128
+                                        * util as u128
+                                        * 1_000_000_000)
+                                        / (100 * self.ts_hz as u128);
+                                    self.snap.busy_ns.fetch_add(busy as u64, Ordering::Relaxed);
                                 }
                                 self.last_util_ts = ts;
                             }
