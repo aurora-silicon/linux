@@ -20,15 +20,23 @@ struct phy;
 /*
  * appledrm: route a display pipeline to (active) or away from (!active) the
  * crossbar output of DP IN adapter @dpin (0/1) of the router wired to
- * @connector_np. @set_active(@ctx, active) runs the DP IN adapter's
+ * @connector_np. @set_active(@binding, active) runs the DP IN adapter's
  * DPTX_INACTIVE handshake and is called back from DCP's link activation.
  * Activation returns -EBUSY while no pipeline is free for the stream (or a
  * direct DP-alt route still holds the port), which may change and is worth
  * asking again, and -EADDRINUSE if another tunnel stream holds the port.
+ * @generation is a nonzero TB-provider-lifetime handoff identity, unchanged
+ * by retries. TB admits the immutable @binding before this call: synchronous
+ * Activate may run before attach returns success. A matching active request
+ * is idempotent; a mismatched live cookie/binding returns -ESTALE before
+ * mutation. Detach and failed attach retire/drain callbacks and reconnect
+ * before returning, so TB may then free the binding. No provider tombstone
+ * survives complete drain: TB rejects stale queued requests in its context
+ * and drains every binding before module unload/counter reset.
  */
 int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
-			   bool active, int (*set_active)(void *ctx, bool active),
-			   void *ctx);
+			   u64 generation, bool active,
+			   int (*set_active)(void *binding, bool active), void *binding);
 
 /*
  * ATC PHY: start the pixel clock for a DP tunnel at DP link rate code @rate,

@@ -82,6 +82,7 @@
 
 #include "apple-dpin-handshake.h"
 #include "apple-dpin-state.h"
+#include "apple-dpin-request.h"
 #include "apple-dpin-platform.h"
 #include "nhi.h"
 #include "tb.h"
@@ -164,6 +165,8 @@ module_param(dpin_mode_value, uint, 0644);
 MODULE_PARM_DESC(dpin_mode_value,
 		 "DPIN0 MODE_A/MODE_B lab value (0-" __stringify(APPLE_DPIN_MODE_VALUE_MAX) "); read at each activate");
 
+struct apple_dpin_binding;
+
 struct apple_cio {
 	struct device *dev;
 	struct device_node *np;
@@ -220,7 +223,15 @@ struct apple_cio {
 		void __iomem *regs;	/* mapped while a DP tunnel uses this adapter */
 		unsigned int idx;
 		struct apple_dpin_state state;
+		struct apple_dpin_tokens tokens;
+		struct apple_dpin_binding *binding; /* worker-owned, handed to DCP */
 	} dpin[2];
+};
+
+/* Immutable identity for one callback handoff; freed only after provider drain. */
+struct apple_dpin_binding {
+	struct apple_dpin_ctx *ctx;
+	u64 generation;
 };
 
 /*
@@ -382,24 +393,57 @@ static int apple_dpin_set_active(struct apple_cio *acio, void __iomem *regs,
 	return apple_dpin_set_active_t8103(acio, regs, idx, active);
 }
 
-/* Called by appledrm from DCP's Activate/Deactivate calls. */
-static int apple_dpin_dcp_set_active(void *data, bool active)
+static void apple_dpin_request_inactive(void *data)
 {
 	struct apple_dpin_ctx *c = data;
 
+	apple_dpin_set_active(c->acio, c->regs, c->idx, false);
+}
+
+static void apple_dpin_request_mask_irqs(void *data)
+{
+	struct apple_dpin_ctx *c = data;
+
+	writel(readl(c->regs + APPLE_DPIN_IRQ_ENABLE) & ~3,
+	       c->regs + APPLE_DPIN_IRQ_ENABLE);
+}
+
+static bool apple_dpin_request(struct apple_dpin_ctx *c, u64 generation, bool active)
+{
+	const struct apple_dpin_request_ops ops = {
+		.inactive = apple_dpin_request_inactive,
+		.mask_irqs = apple_dpin_request_mask_irqs,
+		.ctx = c,
+	};
+
+	lockdep_assert_held(&c->lock);
+	return apple_dpin_powered_request(&c->state, &c->tokens, c->acio->dp,
+					  generation, active, !!c->regs, &ops);
+}
+
+/* Called by appledrm from DCP's Activate/Deactivate calls. */
+static int apple_dpin_dcp_set_active(void *data, bool active)
+{
+	const struct apple_dpin_binding *binding = data;
+	struct apple_dpin_ctx *c = binding->ctx;
+
 	guard(mutex)(&c->lock);
+	if (!apple_dpin_token_access(&c->tokens, binding->generation))
+		return -ESTALE;
 	/* the tunnel is being torn down: the block may already be off */
 	if (!c->state.alive || !c->regs)
 		return -ENODEV;
 	return apple_dpin_set_active(c->acio, c->regs, c->idx, active);
 }
 
-static int apple_dpin_connect(struct apple_dpin_ctx *c, bool active)
+static int apple_dpin_connect(struct apple_dpin_ctx *c,
+			      struct apple_dpin_binding *binding,
+			      bool active)
 {
 	struct apple_cio *acio = c->acio;
 	typeof(&apple_dcp_tb_dp_tunnel) fn;
 	unsigned int tries;
-	bool alive, paused, blocked;
+	bool alive, paused;
 	int ret;
 
 	for (tries = 1; ; tries++) {
@@ -408,27 +452,34 @@ static int apple_dpin_connect(struct apple_dpin_ctx *c, bool active)
 		 * Prepare drains that call; every subsequent attempt needs a new gate.
 		 */
 		if (active) {
-			scoped_guard(mutex, &c->lock) {
-				alive = c->state.alive;
-				blocked = apple_dpin_admission_blocked(&c->state, acio->dp,
-								       tries == 1);
-			}
-			if (!alive)
-				return -ENODEV;
-			if (blocked)
+			guard(mutex)(&c->lock);
+			if (!c->state.alive || c->tokens.requested != binding->generation)
+				return -ESTALE;
+			if (apple_dpin_admission_blocked(&c->state, acio->dp, tries == 1))
 				return -EAGAIN;
+			/* up() admitted the first call; retry admits a fresh attempt. */
+			if (tries == 1) {
+				if (!apple_dpin_token_access(&c->tokens, binding->generation))
+					return -ESTALE;
+			} else if (!apple_dpin_token_admit(&c->tokens, binding->generation)) {
+				return -ESTALE;
+			}
 		}
 		fn = symbol_get(apple_dcp_tb_dp_tunnel);
 		if (fn) {
-			ret = fn(acio->connector_np, c->idx, active,
+			ret = fn(acio->connector_np, c->idx, binding->generation, active,
 				 active ? apple_dpin_dcp_set_active : NULL,
-				 active ? c : NULL);
+				 active ? binding : NULL);
 			symbol_put(apple_dcp_tb_dp_tunnel);
 		} else {
 			/* appledrm gone: it has dropped our callback with it */
 			if (!active)
 				return 0;
 			ret = -ENODEV;
+		}
+		if (active && ret) {
+			scoped_guard(mutex, &c->lock)
+				apple_dpin_token_revoke(&c->tokens, binding->generation);
 		}
 		/* ENODEV is driver probing; EAGAIN is a registered external
 		 * route whose firmware services have not been published yet.
@@ -454,7 +505,8 @@ static int apple_dpin_connect(struct apple_dpin_ctx *c, bool active)
 	}
 }
 
-static int apple_dpin_up(struct apple_dpin_ctx *c, bool *deferred)
+static int apple_dpin_up(struct apple_dpin_ctx *c,
+			 struct apple_dpin_binding *binding, bool *deferred)
 {
 	struct apple_cio *acio = c->acio;
 	void __iomem *regs = c->regs;
@@ -462,8 +514,8 @@ static int apple_dpin_up(struct apple_dpin_ctx *c, bool *deferred)
 
 	*deferred = false;
 	scoped_guard(mutex, &c->lock) {
-		if (!c->state.alive)
-			return -ENODEV;
+		if (!c->state.alive || c->tokens.requested != binding->generation)
+			return -ESTALE;
 		if (apple_dpin_admission_blocked(&c->state, acio->dp, false)) {
 			*deferred = true;
 			return -EAGAIN;
@@ -490,29 +542,42 @@ static int apple_dpin_up(struct apple_dpin_ctx *c, bool *deferred)
 				writel(readl(regs + APPLE_DPIN_STATUS), regs + APPLE_DPIN_STATUS);
 			writel(readl(regs + APPLE_DPIN_IRQ_ENABLE) | 3, regs + APPLE_DPIN_IRQ_ENABLE);
 		}
+		/* Activate may run before attach returns, so admit its immutable cookie now. */
+		apple_dpin_token_admit(&c->tokens, binding->generation);
 		apple_dpin_step(&c->state, acio->dp, APPLE_DPIN_ADMITTED, true, 0);
 	}
 
-	return apple_dpin_connect(c, true);
+	return apple_dpin_connect(c, binding, true);
+}
+
+static void apple_dpin_release_binding(struct apple_dpin_binding *binding)
+{
+	struct apple_dpin_ctx *c = binding->ctx;
+	int ret;
+
+	/* Admission is revoked before the provider retires and drains this token. */
+	scoped_guard(mutex, &c->lock)
+		apple_dpin_token_revoke(&c->tokens, binding->generation);
+	ret = apple_dpin_connect(c, binding, false);
+	if (ret && ret != -ESTALE)
+		dev_warn(c->acio->dev, "dpin%u: display teardown failed: %d\n",
+			 c->idx, ret);
+	kfree(binding);
 }
 
 static void apple_dpin_down(struct apple_dpin_ctx *c)
 {
 	void __iomem *regs;
-	int ret;
 
-	if (c->state.handed) {
-		ret = apple_dpin_connect(c, false);
-		if (ret)
-			dev_warn(c->acio->dev, "dpin%u: display teardown failed: %d\n",
-				 c->idx, ret);
+	if (c->binding) {
+		apple_dpin_release_binding(c->binding);
+		c->binding = NULL;
 	}
-	/* the adapter was put to sleep before the tunnel went away */
+	/* The powered request hook idled the adapter before queued teardown. */
 	scoped_guard(mutex, &c->lock) {
 		regs = c->regs;
 		c->regs = NULL;
-		apple_dpin_step(&c->state, c->acio->dp, APPLE_DPIN_DROPPED,
-				false, 0);
+		apple_dpin_step(&c->state, c->acio->dp, APPLE_DPIN_DROPPED, false, 0);
 	}
 	if (regs)
 		iounmap(regs);
@@ -546,15 +611,19 @@ static void apple_dpin_retry_fn(struct work_struct *work)
 static void apple_dpin_work_fn(struct work_struct *work)
 {
 	struct apple_dpin_ctx *c = container_of(work, struct apple_dpin_ctx, work);
+	struct apple_dpin_binding *binding;
 	enum apple_dpin_event event;
-	bool deferred;
+	bool deferred, stale;
 	unsigned int actions;
+	u64 generation;
 	int ret;
 
 	for (;;) {
-		scoped_guard(mutex, &c->lock)
+		scoped_guard(mutex, &c->lock) {
 			actions = apple_dpin_step(&c->state, c->acio->dp,
 						  APPLE_DPIN_WORK, !!c->regs, 0);
+			generation = c->tokens.requested;
+		}
 
 		if (actions & APPLE_DPIN_CANCEL_RETRY)
 			cancel_delayed_work(&c->retry);
@@ -571,16 +640,44 @@ static void apple_dpin_work_fn(struct work_struct *work)
 		if (!(actions & APPLE_DPIN_ATTACH))
 			return;
 
-		ret = apple_dpin_up(c, &deferred);
+		binding = kzalloc_obj(*binding);
+		deferred = false;
+		if (binding) {
+			binding->ctx = c;
+			binding->generation = generation;
+			ret = apple_dpin_up(c, binding, &deferred);
+		} else {
+			ret = -ENOMEM;
+		}
 		event = deferred ? APPLE_DPIN_DEFER_FIRST : APPLE_DPIN_RESULT;
 		scoped_guard(mutex, &c->lock) {
-			actions = apple_dpin_step(&c->state, c->acio->dp,
-						  event, !!c->regs, ret);
-			if (actions & APPLE_DPIN_RECOVERED)
-				dev_info(c->acio->dev,
-					 "dpin%u: a display pipeline came free; DP tunnel up\n",
-					 c->idx);
+			stale = !c->state.alive || c->tokens.requested != generation;
+			if (!ret) {
+				stale |= !apple_dpin_token_complete(&c->tokens, generation);
+				if (!stale)
+					c->binding = binding;
+			} else {
+				apple_dpin_token_revoke(&c->tokens, generation);
+			}
+			if (!stale) {
+				actions = apple_dpin_step(&c->state, c->acio->dp,
+							  event, !!c->regs, ret);
+				if (actions & APPLE_DPIN_RECOVERED)
+					dev_info(c->acio->dev,
+						 "dpin%u: a display pipeline came free; DP tunnel up\n",
+						 c->idx);
+			}
 		}
+		if (stale) {
+			/* A late success owns only its own token, never the new request. */
+			if (!ret)
+				apple_dpin_release_binding(binding);
+			else
+				kfree(binding);
+			continue;
+		}
+		if (ret)
+			kfree(binding);
 		if (actions & APPLE_DPIN_CANCEL_RETRY)
 			cancel_delayed_work(&c->retry);
 		if (actions & APPLE_DPIN_AGAIN) {
@@ -1536,10 +1633,22 @@ static int apple_nhi_dp_tunnel_pre_activate(struct tb_nhi *nhi,
 
 static int apple_nhi_dp_tunnel_post_activate(struct tb_nhi *nhi,
 					     struct tb_port *in,
-					     struct tb_port *out)
+					     struct tb_port *out, u64 generation)
 {
 	struct apple_nhi *anhi = nhi_to_anhi(nhi);
 	int i, idx;
+	struct apple_dpin_ctx *c = NULL;
+
+	/* Validate the token before changing analog/AUX or display state. */
+	idx = apple_dpin_index_for_port(anhi, in);
+	if (idx >= 0 && idx <= 1 && anhi->acio && anhi->acio->connector_np &&
+	    anhi->acio->dp_wq) {
+		c = &anhi->acio->dpin[idx];
+		scoped_guard(mutex, &c->lock) {
+			if (!apple_dpin_request(c, generation, true))
+				return -ESTALE;
+		}
+	}
 
 	dev_info(anhi->dev,
 		 "DP IN tunnel routing: tunnel %u:%u <-> %u:%u\n",
@@ -1559,7 +1668,6 @@ static int apple_nhi_dp_tunnel_post_activate(struct tb_nhi *nhi,
 	apple_dp_dump_vse(in->sw);
 
 	/* Route the display pipeline through the selected host DP IN adapter. */
-	idx = apple_dpin_index_for_port(anhi, in);
 	if (idx < 0 || idx > 1 || !anhi->acio) {
 		dev_warn(anhi->dev,
 			 "DP IN tunnel: could not map port %u to a dpin index\n",
@@ -1570,16 +1678,7 @@ static int apple_nhi_dp_tunnel_post_activate(struct tb_nhi *nhi,
 	} else if (!anhi->acio->dp_wq) {
 		dev_warn(anhi->dev, "DP IN tunnel: no work queue for dpin%d\n", idx);
 	} else {
-		struct apple_dpin_ctx *c = &anhi->acio->dpin[idx];
-
-		/*
-		 * A new tunnel can arrive without the old tunnel's teardown hook
-		 * running on a controller detach. Force the DCP route through a
-		 * down/up cycle instead of treating the old handoff as this one.
-		 */
-		scoped_guard(mutex, &c->lock)
-			apple_dpin_step(&c->state, c->acio->dp, APPLE_DPIN_REARM,
-					!!c->regs, 0);
+		/* Request and REARM were published together before the diagnostics. */
 		queue_work(anhi->acio->dp_wq, &c->work);
 	}
 	apple_dp_dump_host_adapters(anhi);
@@ -1602,13 +1701,10 @@ static int apple_nhi_dp_tunnel_post_activate(struct tb_nhi *nhi,
 
 static void apple_nhi_dp_tunnel_deactivate(struct tb_nhi *nhi,
 					   struct tb_port *in,
-					   struct tb_port *out)
+					   struct tb_port *out, u64 generation)
 {
 	struct apple_nhi *anhi = nhi_to_anhi(nhi);
 	int idx;
-
-	anhi->dp_aux_armed = false;
-	cancel_delayed_work(&anhi->dp_aux_work);
 
 	/* Sleep the adapter before tunnel teardown can remove its power. */
 	idx = apple_dpin_index_for_port(anhi, in);
@@ -1616,18 +1712,18 @@ static void apple_nhi_dp_tunnel_deactivate(struct tb_nhi *nhi,
 		struct apple_dpin_ctx *c = &anhi->acio->dpin[idx];
 
 		scoped_guard(mutex, &c->lock) {
-			if (c->state.alive && c->regs)
-				apple_dpin_set_active(c->acio, c->regs, c->idx, false);
-			apple_dpin_step(&c->state, c->acio->dp, APPLE_DPIN_DOWN,
-					!!c->regs, 0);
+			if (!apple_dpin_request(c, generation, false))
+				return;
 		}
 		queue_work(anhi->acio->dp_wq, &c->work);
 	}
+	anhi->dp_aux_armed = false;
+	cancel_delayed_work(&anhi->dp_aux_work);
 	dev_info(anhi->dev, "DP IN tunnel routing: tunnel down\n");
 }
 
 static void apple_nhi_dp_tunnel_changed(struct tb_nhi *nhi, u8 in_port,
-					bool active)
+					u64 generation, bool active)
 {
 	struct apple_nhi *anhi = nhi_to_anhi(nhi);
 	struct apple_cio *acio = anhi->acio;
@@ -1657,19 +1753,9 @@ static void apple_nhi_dp_tunnel_changed(struct tb_nhi *nhi, u8 in_port,
 	scoped_guard(mutex, &acio->dpin[dpin].lock) {
 		struct apple_dpin_ctx *c = &acio->dpin[dpin];
 
-		/*
-		 * Going down: the block is still powered here (the tunnel is
-		 * torn down after this returns), so put the adapter back to
-		 * sleep and mask its interrupts now; nothing may touch it after.
-		 */
-		if (!active && c->state.alive && c->regs) {
-			apple_dpin_set_active(acio, c->regs, dpin, false);
-			writel(readl(c->regs + APPLE_DPIN_IRQ_ENABLE) & ~3,
-			       c->regs + APPLE_DPIN_IRQ_ENABLE);
-		}
-		apple_dpin_step(&c->state, acio->dp,
-				active ? APPLE_DPIN_UP : APPLE_DPIN_DOWN,
-				!!c->regs, 0);
+		/* Publish cookie, powered retirement and lifecycle event under one lock. */
+		if (!apple_dpin_request(c, generation, active))
+			return;
 	}
 	queue_work(acio->dp_wq, &acio->dpin[dpin].work);
 }

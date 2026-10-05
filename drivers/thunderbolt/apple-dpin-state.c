@@ -47,6 +47,60 @@ bool apple_dpin_readiness_retry(bool active, int result, unsigned int tries)
 					  APPLE_DP_CONNECT_TRIES);
 }
 
+bool apple_dpin_token_request(struct apple_dpin_tokens *t, u64 generation, bool active)
+{
+	if (!generation)
+		return false;
+	if (active) {
+		if (generation <= t->latest && t->requested != generation)
+			return false;
+		t->latest = generation;
+		if (t->requested != generation)
+			t->admitted = 0;
+		t->requested = generation;
+		return true;
+	}
+	if (t->requested != generation)
+		return false;
+	t->requested = 0;
+	t->admitted = 0;
+	return true;
+}
+
+bool apple_dpin_token_admit(struct apple_dpin_tokens *t, u64 generation)
+{
+	if (!generation || t->requested != generation)
+		return false;
+	t->inflight = generation;
+	t->admitted = generation;
+	return true;
+}
+
+bool apple_dpin_token_complete(struct apple_dpin_tokens *t, u64 generation)
+{
+	if (t->inflight == generation)
+		t->inflight = 0;
+	if (!apple_dpin_token_access(t, generation))
+		return false;
+	t->handed = generation;
+	return true;
+}
+
+void apple_dpin_token_revoke(struct apple_dpin_tokens *t, u64 generation)
+{
+	if (t->admitted == generation)
+		t->admitted = 0;
+	if (t->inflight == generation)
+		t->inflight = 0;
+	if (t->handed == generation)
+		t->handed = 0;
+}
+
+bool apple_dpin_token_access(const struct apple_dpin_tokens *t, u64 generation)
+{
+	return generation && t->requested == generation && t->admitted == generation;
+}
+
 bool apple_dpin_admission_blocked(const struct apple_dpin_state *s,
 				  const struct apple_dpin_policy *p, bool admitted)
 {
@@ -57,6 +111,15 @@ bool apple_dpin_awaits_display(const struct apple_dpin_state *s,
 			       const struct apple_dpin_policy *p)
 {
 	return s->alive && (s->waiting || (p->defer_new_bringup && s->deferred_first));
+}
+
+enum apple_dpin_event apple_dpin_request_event(const struct apple_dpin_state *s,
+					       const struct apple_dpin_tokens *t,
+					       u64 generation, bool active)
+{
+	if (!active)
+		return APPLE_DPIN_DOWN;
+	return s->handed && t->requested != generation ? APPLE_DPIN_REARM : APPLE_DPIN_UP;
 }
 
 unsigned int apple_dpin_step(struct apple_dpin_state *s,

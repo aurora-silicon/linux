@@ -6,6 +6,7 @@
 
 #include "apple-dpin-platform.h"
 #include "apple-dpin-state.h"
+#include "apple-dpin-request.h"
 #include "tb.h"
 
 struct legacy_dpin {
@@ -266,7 +267,7 @@ static void apple_dpin_preserve_coalesced_replace(struct kunit *test)
 		  APPLE_DPIN_LOG_CONNECTED | APPLE_DPIN_AGAIN, APPLE_DPIN_HANDED },
 		{ APPLE_DPIN_DOWN, true, 0, APPLE_DPIN_QUEUE, APPLE_DPIN_TEARDOWN },
 		{ APPLE_DPIN_UP, true, 0, APPLE_DPIN_QUEUE, APPLE_DPIN_HANDED },
-		/* F-rearm remains a separately approved generation fix. */
+		/* Raw UP preserves the oracle; the production cookie selector emits REARM. */
 		{ APPLE_DPIN_WORK, true, 0, 0, APPLE_DPIN_HANDED },
 	};
 
@@ -694,7 +695,257 @@ static void apple_dpin_sleep_nhi_replacement(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_WORK), APPLE_DPIN_ATTACH);
 }
 
+static void apple_dpin_cookie_initial_activate(struct kunit *test)
+{
+	struct apple_dpin_tokens t = {};
+
+	KUNIT_EXPECT_FALSE(test, apple_dpin_token_request(&t, 0, true));
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_request(&t, 1, true));
+	KUNIT_EXPECT_FALSE(test, apple_dpin_token_access(&t, 1));
+	/* up() admits before fabric attach, whose Activate can be synchronous. */
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_admit(&t, 1));
+	KUNIT_EXPECT_EQ(test, t.inflight, 1ULL);
+	KUNIT_EXPECT_EQ(test, t.handed, 0ULL);
+	KUNIT_EXPECT_TRUE(test, apple_dpin_token_access(&t, 1));
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_complete(&t, 1));
+	KUNIT_EXPECT_EQ(test, t.inflight, 0ULL);
+	KUNIT_EXPECT_EQ(test, t.handed, 1ULL);
+	KUNIT_EXPECT_TRUE(test, apple_dpin_token_access(&t, 1));
+}
+
+static void apple_dpin_cookie_superseded_attach(struct kunit *test)
+{
+	struct apple_dpin_tokens t = {};
+
+	apple_dpin_token_request(&t, 1, true);
+	apple_dpin_token_admit(&t, 1);
+	/* A new request synchronously closes the old MMIO gate before drain. */
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_request(&t, 2, true));
+	KUNIT_EXPECT_FALSE(test, apple_dpin_token_access(&t, 1));
+	KUNIT_EXPECT_FALSE(test, apple_dpin_token_complete(&t, 1));
+	KUNIT_EXPECT_EQ(test, t.handed, 0ULL);
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_admit(&t, 2));
+	/* Old cleanup cannot revoke a new attempt or turn down its request. */
+	apple_dpin_token_revoke(&t, 1);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_token_request(&t, 1, false));
+	KUNIT_EXPECT_FALSE(test, apple_dpin_token_request(&t, 1, true));
+	KUNIT_EXPECT_TRUE(test, apple_dpin_token_access(&t, 2));
+	KUNIT_EXPECT_EQ(test, t.inflight, 2ULL);
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_complete(&t, 2));
+	KUNIT_EXPECT_EQ(test, t.handed, 2ULL);
+}
+
+static void apple_dpin_cookie_down_reuse(struct kunit *test)
+{
+	struct apple_dpin_tokens t = {};
+
+	apple_dpin_token_request(&t, 7, true);
+	apple_dpin_token_admit(&t, 7);
+	apple_dpin_token_complete(&t, 7);
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_request(&t, 7, false));
+	KUNIT_EXPECT_FALSE(test, apple_dpin_token_access(&t, 7));
+	apple_dpin_token_revoke(&t, 7);
+	/* A late old UP cannot resurrect a retired handoff in a reused context. */
+	KUNIT_EXPECT_FALSE(test, apple_dpin_token_request(&t, 7, true));
+	KUNIT_EXPECT_FALSE(test, apple_dpin_token_request(&t, 6, true));
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_request(&t, 8, true));
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_admit(&t, 8));
+	KUNIT_EXPECT_FALSE(test, apple_dpin_token_access(&t, 7));
+	KUNIT_EXPECT_TRUE(test, apple_dpin_token_access(&t, 8));
+}
+
+static void apple_dpin_cookie_readiness_retry(struct kunit *test)
+{
+	struct apple_dpin_tokens t = {};
+
+	apple_dpin_token_request(&t, 11, true);
+	apple_dpin_token_admit(&t, 11);
+	/* Failed attach returns only after draining callbacks, then revokes. */
+	apple_dpin_token_revoke(&t, 11);
+	KUNIT_EXPECT_EQ(test, t.requested, 11ULL);
+	KUNIT_EXPECT_EQ(test, t.latest, 11ULL);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_token_access(&t, 11));
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_admit(&t, 11));
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_complete(&t, 11));
+	KUNIT_EXPECT_TRUE(test, apple_dpin_token_access(&t, 11));
+	KUNIT_EXPECT_EQ(test, t.handed, 11ULL);
+}
+
+static void apple_dpin_cookie_coalesced_rearm(struct kunit *test)
+{
+	struct apple_dpin_state s = { .alive = true, .handed = true };
+	struct apple_dpin_tokens t = {};
+	enum apple_dpin_event event;
+
+	apple_dpin_token_request(&t, 21, true);
+	apple_dpin_token_admit(&t, 21);
+	apple_dpin_token_complete(&t, 21);
+	/* DOWN and new UP coalesce before ordered work executes. */
+	apple_dpin_token_request(&t, 21, false);
+	sleep_step(&s, APPLE_DPIN_DOWN);
+	event = apple_dpin_request_event(&s, &t, 22, true);
+	KUNIT_EXPECT_EQ(test, event, APPLE_DPIN_REARM);
+	apple_dpin_token_request(&t, 22, true);
+	sleep_step(&s, event);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_WORK),
+			APPLE_DPIN_DROP | APPLE_DPIN_AGAIN);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_token_access(&t, 21));
+	apple_dpin_token_revoke(&t, 21);
+	sleep_step(&s, APPLE_DPIN_DROPPED);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_WORK), APPLE_DPIN_ATTACH);
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_admit(&t, 22));
+	KUNIT_EXPECT_TRUE(test, apple_dpin_token_access(&t, 22));
+	apple_dpin_token_complete(&t, 22);
+	s.handed = true;
+	/* Repeated active=true on the same handed token stays idempotent. */
+	event = apple_dpin_request_event(&s, &t, 22, true);
+	KUNIT_EXPECT_EQ(test, event, APPLE_DPIN_UP);
+	sleep_step(&s, event);
+	KUNIT_EXPECT_EQ(test, sleep_step(&s, APPLE_DPIN_WORK), 0U);
+}
+
+struct dpin_request_fake {
+	struct kunit *test;
+	struct apple_dpin_tokens *tokens;
+	u64 old_generation;
+	u64 requested;
+	unsigned int inactive;
+	unsigned int masked;
+};
+
+static void dpin_request_fake_inactive(void *data)
+{
+	struct dpin_request_fake *fake = data;
+
+	/* The exact production executor must revoke before its first MMIO effect. */
+	KUNIT_EXPECT_FALSE(fake->test,
+			   apple_dpin_token_access(fake->tokens, fake->old_generation));
+	KUNIT_EXPECT_EQ(fake->test, fake->tokens->requested, fake->requested);
+	fake->inactive++;
+}
+
+static void dpin_request_fake_mask(void *data)
+{
+	struct dpin_request_fake *fake = data;
+
+	KUNIT_EXPECT_EQ(fake->test, fake->inactive, 1U);
+	fake->masked++;
+}
+
+static void apple_dpin_cookie_powered_request(struct kunit *test)
+{
+	const struct {
+		const char *name;
+		bool active;
+		bool alive;
+		bool mapped;
+		const struct apple_dpin_policy *policy;
+		u64 generation;
+		bool accepted;
+		unsigned int inactive;
+		unsigned int masked;
+	} cases[] = {
+		{ "M1 replacement without DOWN", true, true, true, &apple_dpin_m1, 32, true, 1, 0 },
+		{ "M2 replacement without DOWN", true, true, true, &apple_dpin_m2, 32, true, 1, 0 },
+		{ "M3 replacement without DOWN", true, true, true, &apple_dpin_m3, 32, true, 1, 0 },
+		{ "same active token", true, true, true, &apple_dpin_m1, 31, true, 0, 0 },
+		{ "stale active token", true, true, true, &apple_dpin_m1, 30, false, 0, 0 },
+		{ "stale DOWN", false, true, true, &apple_dpin_m1, 30, false, 0, 0 },
+		{ "M1 powered DOWN", false, true, true, &apple_dpin_m1, 31, true, 1, 1 },
+		{ "M2 powered DOWN", false, true, true, &apple_dpin_m2, 31, true, 1, 0 },
+		{ "unmapped first activation", true, false, false, &apple_dpin_m1, 32, true, 0, 0 },
+		{ "unpowered DOWN", false, false, true, &apple_dpin_m1, 31, true, 0, 0 },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		struct apple_dpin_tokens tokens = {};
+		struct apple_dpin_state state = {
+			.alive = cases[i].alive, .handed = cases[i].mapped,
+		};
+		struct dpin_request_fake fake = {
+			.test = test, .tokens = &tokens, .old_generation = 31,
+		};
+		const struct apple_dpin_request_ops ops = {
+			.inactive = dpin_request_fake_inactive,
+			.mask_irqs = dpin_request_fake_mask,
+			.ctx = &fake,
+		};
+		bool accepted;
+
+		if (cases[i].active)
+			fake.requested = cases[i].generation;
+		KUNIT_ASSERT_TRUE(test, apple_dpin_token_request(&tokens, 31, true));
+		KUNIT_ASSERT_TRUE(test, apple_dpin_token_admit(&tokens, 31));
+		KUNIT_ASSERT_TRUE(test, apple_dpin_token_complete(&tokens, 31));
+		accepted = apple_dpin_powered_request(&state, &tokens, cases[i].policy,
+						      cases[i].generation, cases[i].active,
+						      cases[i].mapped, &ops);
+		KUNIT_EXPECT_EQ_MSG(test, accepted, cases[i].accepted, "%s", cases[i].name);
+		KUNIT_EXPECT_EQ_MSG(test, fake.inactive, cases[i].inactive, "%s", cases[i].name);
+		KUNIT_EXPECT_EQ_MSG(test, fake.masked, cases[i].masked, "%s", cases[i].name);
+		if (accepted && (cases[i].generation != 31 || !cases[i].active))
+			KUNIT_EXPECT_FALSE(test, apple_dpin_token_access(&tokens, 31));
+		else
+			KUNIT_EXPECT_TRUE(test, apple_dpin_token_access(&tokens, 31));
+		if (accepted) {
+			KUNIT_EXPECT_EQ(test, state.alive, cases[i].active);
+			KUNIT_EXPECT_EQ(test, state.rearm,
+					cases[i].active && cases[i].mapped &&
+					cases[i].generation != 31);
+		}
+	}
+}
+
+static void apple_dpin_cookie_post_inflight_replacement(struct kunit *test)
+{
+	struct apple_dpin_tokens tokens = {};
+	struct apple_dpin_state state = { .alive = true, .phase = APPLE_DPIN_CONNECTING };
+	struct dpin_request_fake fake = {
+		.test = test, .tokens = &tokens, .old_generation = 31, .requested = 32,
+	};
+	const struct apple_dpin_request_ops ops = {
+		.inactive = dpin_request_fake_inactive,
+		.mask_irqs = dpin_request_fake_mask,
+		.ctx = &fake,
+	};
+
+	/* An M2 post arrives while the previous attach has not returned. */
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_request(&tokens, 31, true));
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_admit(&tokens, 31));
+	KUNIT_ASSERT_TRUE(test, apple_dpin_powered_request(&state, &tokens, &apple_dpin_m2,
+							   32, true, true, &ops));
+	KUNIT_EXPECT_EQ(test, fake.inactive, 1U);
+	/* Token and event must both be visible when the hook drops the lock. */
+	KUNIT_EXPECT_EQ(test, tokens.requested, 32ULL);
+	KUNIT_EXPECT_EQ(test, state.phase, APPLE_DPIN_ACTIVATING);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_token_complete(&tokens, 31));
+	apple_dpin_token_revoke(&tokens, 31);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&state, &apple_dpin_m2,
+					      APPLE_DPIN_WORK, true, 0), APPLE_DPIN_ATTACH);
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_admit(&tokens, 32));
+	apple_dpin_step(&state, &apple_dpin_m2, APPLE_DPIN_ADMITTED, true, 0);
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_complete(&tokens, 32));
+	apple_dpin_step(&state, &apple_dpin_m2, APPLE_DPIN_RESULT, true, 0);
+	/* Post's later code only queues: it cannot inject a delayed REARM. */
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&state, &apple_dpin_m2,
+					      APPLE_DPIN_WORK, true, 0), 0U);
+	KUNIT_ASSERT_TRUE(test, apple_dpin_powered_request(&state, &tokens, &apple_dpin_m2,
+							   32, true, true, &ops));
+	KUNIT_EXPECT_EQ(test, fake.inactive, 1U);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&state, &apple_dpin_m2,
+					      APPLE_DPIN_WORK, true, 0), 0U);
+	KUNIT_EXPECT_TRUE(test, apple_dpin_token_access(&tokens, 32));
+}
+
 static struct kunit_case apple_dpin_cases[] = {
+	KUNIT_CASE(apple_dpin_cookie_post_inflight_replacement),
+	KUNIT_CASE(apple_dpin_cookie_powered_request),
+	KUNIT_CASE(apple_dpin_cookie_initial_activate),
+	KUNIT_CASE(apple_dpin_cookie_superseded_attach),
+	KUNIT_CASE(apple_dpin_cookie_down_reuse),
+	KUNIT_CASE(apple_dpin_cookie_readiness_retry),
+	KUNIT_CASE(apple_dpin_cookie_coalesced_rearm),
 	KUNIT_CASE(apple_dpin_sleep_capacity_work_pause),
 	KUNIT_CASE(apple_dpin_sleep_terminal_no_retention),
 	KUNIT_CASE(apple_dpin_sleep_complete_before_work),

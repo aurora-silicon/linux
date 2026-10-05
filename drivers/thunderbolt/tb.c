@@ -1730,7 +1730,7 @@ static void tb_discover_tunnels(struct tb *tb)
  * DP IN adapter of the host router by hand. Tell the NHI glue when a DP
  * tunnel starting at one of those adapters comes or goes.
  */
-static void tb_dp_tunnel_notify(struct tb_tunnel *tunnel, bool active)
+static int tb_dp_tunnel_notify(struct tb_tunnel *tunnel, bool active)
 {
 	struct tb_port *in = tunnel->src_port;
 
@@ -1740,9 +1740,16 @@ static void tb_dp_tunnel_notify(struct tb_tunnel *tunnel, bool active)
 	 * host router is gone.
 	 */
 	if (!active && !tunnel->host_dp_notified)
-		return;
+		return 0;
 	if (!tb_tunnel_is_dp(tunnel) || !tb_port_is_apple_host_dpin(in))
-		return;
+		return 0;
+	if (active && !tunnel->host_dp_notified) {
+		u64 generation = tb_dp_tunnel_alloc_generation();
+
+		if (!generation)
+			return -EOVERFLOW;
+		tunnel->host_dp_generation = generation;
+	}
 	/*
 	 * After both DP adapters are enabled, pulse the DP IN adapter's HPD
 	 * propagation bit for 10 ms and wait up to 2 s for its HPD status, so
@@ -1781,7 +1788,9 @@ static void tb_dp_tunnel_notify(struct tb_tunnel *tunnel, bool active)
 	}
 notify:
 	tunnel->host_dp_notified = active;
-	tunnel->tb->nhi->ops->dp_tunnel_changed(tunnel->tb->nhi, in->port, active);
+	tunnel->tb->nhi->ops->dp_tunnel_changed(tunnel->tb->nhi, in->port,
+						 tunnel->host_dp_generation, active);
+	return 0;
 }
 
 static void tb_deactivate_and_free_tunnel(struct tb_tunnel *tunnel)
@@ -2102,7 +2111,12 @@ static void tb_tunnel_one_dp(struct tb *tb, struct tb_port *in,
 		goto err_free;
 	}
 
-	tb_dp_tunnel_notify(tunnel, true);
+	ret = tb_dp_tunnel_notify(tunnel, true);
+	if (ret) {
+		tb_tunnel_deactivate(tunnel);
+		list_del(&tunnel->list);
+		goto err_free;
+	}
 	return;
 
 err_free:

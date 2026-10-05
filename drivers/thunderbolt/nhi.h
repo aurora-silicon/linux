@@ -120,11 +120,11 @@ struct tb_nhi_ops {
 	int (*dp_tunnel_pre_activate)(struct tb_nhi *nhi, struct tb_port *in,
 				      struct tb_port *out);
 	int (*dp_tunnel_post_activate)(struct tb_nhi *nhi, struct tb_port *in,
-				       struct tb_port *out);
+				       struct tb_port *out, u64 generation);
 	void (*dp_tunnel_deactivate)(struct tb_nhi *nhi, struct tb_port *in,
-				     struct tb_port *out);
+				     struct tb_port *out, u64 generation);
 	bool (*is_present)(struct tb_nhi *nhi);
-	void (*dp_tunnel_changed)(struct tb_nhi *nhi, u8 in_port, bool active);
+	void (*dp_tunnel_changed)(struct tb_nhi *nhi, u8 in_port, u64 generation, bool active);
 	bool (*dp_tunnel_awaits_display)(struct tb_nhi *nhi, struct tb_port *in);
 	int (*init_interrupts)(struct tb_nhi *nhi);
 };

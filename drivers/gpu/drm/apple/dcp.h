@@ -56,6 +56,8 @@ void dcp_set_dimensions(struct apple_dcp *dcp);
 void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);
 
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port);
+void dcp_queue_typec_reconnect(struct apple_dcp *dcp, unsigned long delay);
+int dcp_dptx_disconnect_drained(struct apple_dcp *dcp, u32 port);
 int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port);
 
 int iomfb_start_rtkit(struct apple_dcp *dcp);

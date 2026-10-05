@@ -16,6 +16,7 @@
 #include <linux/usb/typec_mux.h>
 
 #include "dcp-fabric.h"
+#include "dcp-fabric-session.h"
 #include "dptxep.h"
 #include "iomfb.h"
 #include "iomfb-state.h"
@@ -311,6 +312,8 @@ struct apple_dcp {
 	/* wakes/sleeps the Thunderbolt DP IN adapter from DCP Activate/Deactivate */
 	int (*tb_dpin_set_active)(void *ctx, bool active);
 	void *tb_dpin_ctx;
+	u64 tb_generation; /* tb_lock: admitted callback cookie, including attach */
+	bool tb_retiring; /* fabric lock: pipeline reserved until binding drain */
 	/*
 	 * Serializes the Thunderbolt DP IN callback and tunnel crossbar state
 	 * between DCP apcalls and tunnel teardown; never held while waiting
@@ -325,6 +328,7 @@ struct apple_dcp {
 	struct delayed_work typec_reconnect_wq;
 	struct delayed_work typec_fabric_retrain_wq;
 	u32 typec_reconnect_tries;
+	struct dcp_fabric_session typec_reconnect_session; /* hpd_mutex */
 
 	struct gpio_desc *hdmi_hpd;
 	struct gpio_desc *hdmi_pwren;

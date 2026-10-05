@@ -53,6 +53,22 @@ struct apple_dpin_state {
 	bool replay_queued;
 };
 
+/* Protected by the DP-IN lock; admission precedes a synchronous fabric call. */
+struct apple_dpin_tokens {
+	u64 latest; /* tombstone prevents a retired request from being resurrected */
+	u64 requested;
+	u64 inflight;
+	u64 admitted;
+	u64 handed;
+};
+
+bool apple_dpin_token_request(struct apple_dpin_tokens *tokens, u64 generation,
+			      bool active);
+bool apple_dpin_token_admit(struct apple_dpin_tokens *tokens, u64 generation);
+bool apple_dpin_token_complete(struct apple_dpin_tokens *tokens, u64 generation);
+void apple_dpin_token_revoke(struct apple_dpin_tokens *tokens, u64 generation);
+bool apple_dpin_token_access(const struct apple_dpin_tokens *tokens, u64 generation);
+
 enum apple_dpin_event {
 	APPLE_DPIN_UP,
 	APPLE_DPIN_REARM,
@@ -79,6 +95,10 @@ enum apple_dpin_event {
 #define APPLE_DPIN_WARN		BIT(7)
 #define APPLE_DPIN_RECOVERED	BIT(8)
 #define APPLE_DPIN_LOG_CONNECTED	BIT(9)
+
+enum apple_dpin_event apple_dpin_request_event(const struct apple_dpin_state *state,
+					       const struct apple_dpin_tokens *tokens,
+					       u64 generation, bool active);
 
 unsigned int apple_dpin_step(struct apple_dpin_state *state,
 			     const struct apple_dpin_policy *policy,

@@ -1954,6 +1954,7 @@ T:	git git://anongit.freedesktop.org/drm/drm-misc
 F:	Documentation/devicetree/bindings/display/apple,dcp-typec-routes.yaml
 F:	drivers/gpu/drm/apple/
 F:	drivers/gpu/drm/apple/dcp-fabric*
+F:	include/linux/soc/apple/dp-tunnel.h
 
 APPLE PCIE CONTROLLER DRIVER
 M:	Marc Zyngier <maz@kernel.org>

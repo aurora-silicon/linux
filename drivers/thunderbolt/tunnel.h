@@ -9,6 +9,8 @@
 #ifndef TB_TUNNEL_H_
 #define TB_TUNNEL_H_
 
+#include <linux/atomic.h>
+
 #include "tb.h"
 
 enum tb_tunnel_type {
@@ -64,6 +66,7 @@ enum tb_tunnel_state {
  *	     determine consumed and allocated bandwidth
  * @dprx_started: DPRX has an outstanding worker reference and callback
  * @dprx_canceled: Was DPRX capabilities read poll canceled
+ * @host_dp_generation: Nonzero identity of the announced display handoff
  * @host_dp_notified: The NHI glue was told this DP tunnel is up (Apple hosts)
  * @host_dp_activated: The NHI post-activation hook owns display-side state
  * @host_pci_activated: The NHI post-activation hook owns PCIe host state
@@ -105,6 +108,7 @@ struct tb_tunnel {
 	bool bw_mode;
 	bool dprx_started;
 	bool dprx_canceled;
+	u64 host_dp_generation;
 	bool host_dp_notified;
 	bool host_dp_activated;
 	bool host_pci_activated;
@@ -145,6 +149,8 @@ struct tb_tunnel *tb_tunnel_alloc_usb3(struct tb *tb, struct tb_port *up,
 
 void tb_tunnel_put(struct tb_tunnel *tunnel);
 void tb_dp_tunnel_deactivate_host(struct tb_tunnel *tunnel);
+u64 tb_dp_tunnel_alloc_generation(void);
+u64 tb_dp_generation_alloc(atomic64_t *counter);
 int tb_tunnel_activate(struct tb_tunnel *tunnel);
 void tb_tunnel_deactivate(struct tb_tunnel *tunnel);
 

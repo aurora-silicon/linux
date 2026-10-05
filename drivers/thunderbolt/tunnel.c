@@ -6,6 +6,7 @@
  * Copyright (C) 2019, Intel Corporation
  */
 
+#include <linux/atomic.h>
 #include <linux/delay.h>
 #include <linux/export.h>
 #include <linux/slab.h>
@@ -128,6 +129,28 @@ static const char * const tb_event_names[] = {
 
 /* Synchronizes kref_get()/put() of struct tb_tunnel */
 static DEFINE_MUTEX(tb_tunnel_lock);
+
+/* Saturate on wrap: a token must never be zero or reused while work can live. */
+static atomic64_t tb_dp_generation = ATOMIC64_INIT(0);
+
+u64 tb_dp_generation_alloc(atomic64_t *counter)
+{
+	u64 previous, next;
+
+	for (;;) {
+		previous = atomic64_read(counter);
+		next = previous + 1;
+		if (!next)
+			return 0;
+		if ((u64)atomic64_cmpxchg(counter, previous, next) == previous)
+			return next;
+	}
+}
+
+u64 tb_dp_tunnel_alloc_generation(void)
+{
+	return tb_dp_generation_alloc(&tb_dp_generation);
+}
 
 static inline unsigned int tb_usable_credits(const struct tb_port *port)
 {
@@ -1312,7 +1335,7 @@ void tb_dp_tunnel_deactivate_host(struct tb_tunnel *tunnel)
 	ops = tunnel->tb->nhi->ops;
 	if (ops && ops->dp_tunnel_deactivate)
 		ops->dp_tunnel_deactivate(tunnel->tb->nhi, tunnel->src_port,
-					  tunnel->dst_port);
+					  tunnel->dst_port, tunnel->host_dp_generation);
 }
 
 static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
@@ -1402,11 +1425,16 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 		const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
 
 		if (ops && ops->dp_tunnel_post_activate) {
+			u64 generation = tb_dp_tunnel_alloc_generation();
+
+			if (!generation)
+				return -EOVERFLOW;
+			tunnel->host_dp_generation = generation;
 			/* Also unwind a hook that fails after partial setup. */
 			tunnel->host_dp_activated = true;
 			ret = ops->dp_tunnel_post_activate(tunnel->tb->nhi,
 							   tunnel->src_port,
-							   tunnel->dst_port);
+							   tunnel->dst_port, generation);
 			if (ret)
 				return ret;
 		}

@@ -3188,7 +3188,7 @@ out:
 }
 
 static void tb_test_dp_host_disconnect(struct tb_nhi *nhi, struct tb_port *in,
-				       struct tb_port *out)
+				       struct tb_port *out, u64 generation)
 {
 	struct tb_test_dp_host *host = container_of(nhi, struct tb_test_dp_host, nhi);
 
@@ -3274,7 +3274,25 @@ static void tb_test_tunnel_dp_host_credits(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, tb_port_needs_host_dp_credits(&host->ports[5]));
 }
 
+static void tb_test_dp_generation(struct kunit *test)
+{
+	atomic64_t counter = ATOMIC64_INIT(0);
+
+	KUNIT_EXPECT_EQ(test, tb_dp_generation_alloc(&counter), 1ULL);
+	KUNIT_EXPECT_EQ(test, tb_dp_generation_alloc(&counter), 2ULL);
+	/* Unsigned cookies continue across the signed atomic64 boundary. */
+	atomic64_set(&counter, S64_MAX);
+	KUNIT_EXPECT_EQ(test, tb_dp_generation_alloc(&counter), (u64)S64_MAX + 1);
+	atomic64_set(&counter, (s64)(U64_MAX - 1));
+	KUNIT_EXPECT_EQ(test, tb_dp_generation_alloc(&counter), U64_MAX);
+	/* Overflow refuses new handoffs permanently; never reuse zero or one. */
+	KUNIT_EXPECT_EQ(test, tb_dp_generation_alloc(&counter), 0ULL);
+	KUNIT_EXPECT_EQ(test, tb_dp_generation_alloc(&counter), 0ULL);
+	KUNIT_EXPECT_EQ(test, (u64)atomic64_read(&counter), U64_MAX);
+}
+
 static struct kunit_case tb_test_cases[] = {
+	KUNIT_CASE(tb_test_dp_generation),
 	KUNIT_CASE(tb_test_pci_host_teardown),
 	KUNIT_CASE(tb_test_pci_host_daisy_chain),
 	KUNIT_CASE(tb_test_dp_dprx_deferred_first),

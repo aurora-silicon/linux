@@ -38,6 +38,7 @@ struct apple_dcp_typec_route {
 	bool selected;
 	/* crossbar output actually selected: xbar (dpphy) or a Thunderbolt dpin */
 	unsigned int tunnel_dpin;
+	u64 tunnel_generation;
 	struct mux_control *active_xbar;
 	bool tunnel;
 	/* tunnel: crossbar brought up (at DidChangeLinkConfiguration) */
