@@ -2,7 +2,37 @@
 #ifndef _APPLE_DPIN_REQUEST_H
 #define _APPLE_DPIN_REQUEST_H
 
+#include <linux/errno.h>
+
 #include "apple-dpin-state.h"
+
+struct apple_dpin_provider_ops {
+	bool (*get)(void *ctx);
+	bool (*held)(void *ctx);
+	int (*call)(void *ctx, bool active);
+	void (*put)(void *ctx);
+	void *ctx;
+};
+
+/* A successful attach owns the provider reference until detach has drained it. */
+static inline int
+apple_dpin_provider_call(bool active, const struct apple_dpin_provider_ops *ops)
+{
+	int ret;
+
+	if (active) {
+		if (!ops->get(ops->ctx))
+			return -ENODEV;
+	} else if (!ops->held(ops->ctx)) {
+		/* This binding never attached, or its failed attach already drained. */
+		return 0;
+	}
+	ret = ops->call(ops->ctx, active);
+	/* Both failed attach and detach return only after callback drain. */
+	if (!active || ret)
+		ops->put(ops->ctx);
+	return ret;
+}
 
 struct apple_dpin_request_ops {
 	void (*inactive)(void *ctx);

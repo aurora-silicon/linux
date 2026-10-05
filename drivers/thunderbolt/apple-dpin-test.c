@@ -938,7 +938,157 @@ static void apple_dpin_cookie_post_inflight_replacement(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, apple_dpin_token_access(&tokens, 32));
 }
 
+struct dpin_provider_fake {
+	struct kunit *test;
+	struct apple_dpin_tokens tokens;
+	bool available;
+	bool callback_live;
+	unsigned int references;
+	unsigned int gets;
+	unsigned int puts;
+	unsigned int calls;
+	unsigned int drains;
+	int attach_result;
+};
+
+static bool dpin_provider_fake_get(void *data)
+{
+	struct dpin_provider_fake *fake = data;
+
+	fake->gets++;
+	if (!fake->available)
+		return false;
+	KUNIT_EXPECT_EQ(fake->test, fake->references, 0U);
+	fake->references++;
+	return true;
+}
+
+static bool dpin_provider_fake_held(void *data)
+{
+	struct dpin_provider_fake *fake = data;
+
+	return fake->references != 0;
+}
+
+static int dpin_provider_fake_call(void *data, bool active)
+{
+	struct dpin_provider_fake *fake = data;
+
+	fake->calls++;
+	KUNIT_EXPECT_EQ(fake->test, fake->references, 1U);
+	if (active) {
+		/* Initial Activate can call the binding before attach returns. */
+		fake->callback_live = true;
+		KUNIT_EXPECT_TRUE(fake->test, apple_dpin_token_access(&fake->tokens, 7));
+		if (!fake->attach_result)
+			return 0;
+	} else {
+		/* Deactivate may still call the binding while detach drains it. */
+		KUNIT_EXPECT_FALSE(fake->test, apple_dpin_token_access(&fake->tokens, 7));
+	}
+	fake->callback_live = false;
+	fake->drains++;
+	return active ? fake->attach_result : 0;
+}
+
+static void dpin_provider_fake_put(void *data)
+{
+	struct dpin_provider_fake *fake = data;
+
+	KUNIT_EXPECT_EQ(fake->test, fake->references, 1U);
+	KUNIT_EXPECT_FALSE(fake->test, fake->callback_live);
+	fake->references--;
+	fake->puts++;
+}
+
+static struct apple_dpin_provider_ops dpin_provider_fake_ops(struct dpin_provider_fake *fake)
+{
+	return (struct apple_dpin_provider_ops) {
+		.get = dpin_provider_fake_get,
+		.held = dpin_provider_fake_held,
+		.call = dpin_provider_fake_call,
+		.put = dpin_provider_fake_put,
+		.ctx = fake,
+	};
+}
+
+static void apple_dpin_provider_handed_lifetime(struct kunit *test)
+{
+	struct dpin_provider_fake fake = { .test = test, .available = true };
+	struct apple_dpin_provider_ops ops = dpin_provider_fake_ops(&fake);
+
+	apple_dpin_token_request(&fake.tokens, 7, true);
+	apple_dpin_token_admit(&fake.tokens, 7);
+	KUNIT_ASSERT_EQ(test, apple_dpin_provider_call(true, &ops), 0);
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_complete(&fake.tokens, 7));
+	KUNIT_EXPECT_EQ(test, fake.references, 1U);
+	KUNIT_EXPECT_EQ(test, fake.puts, 0U);
+	KUNIT_EXPECT_TRUE(test, fake.callback_live);
+	/* A live reference keeps ordinary module unload from entering exit. */
+	KUNIT_EXPECT_TRUE(test, dpin_provider_fake_held(&fake));
+	/* Detach uses that reference even when another lookup would be denied. */
+	fake.available = false;
+	apple_dpin_token_revoke(&fake.tokens, 7);
+	KUNIT_ASSERT_EQ(test, apple_dpin_provider_call(false, &ops), 0);
+	KUNIT_EXPECT_EQ(test, fake.gets, 1U);
+	KUNIT_EXPECT_EQ(test, fake.calls, 2U);
+	KUNIT_EXPECT_EQ(test, fake.drains, 1U);
+	KUNIT_EXPECT_EQ(test, fake.puts, 1U);
+	KUNIT_EXPECT_EQ(test, fake.references, 0U);
+	KUNIT_EXPECT_FALSE(test, fake.callback_live);
+}
+
+static void apple_dpin_provider_failed_retry(struct kunit *test)
+{
+	struct dpin_provider_fake fake = {
+		.test = test, .available = true, .attach_result = -EAGAIN,
+	};
+	struct apple_dpin_provider_ops ops = dpin_provider_fake_ops(&fake);
+
+	apple_dpin_token_request(&fake.tokens, 7, true);
+	apple_dpin_token_admit(&fake.tokens, 7);
+	KUNIT_ASSERT_EQ(test, apple_dpin_provider_call(true, &ops), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, fake.references, 0U);
+	KUNIT_EXPECT_EQ(test, fake.puts, 1U);
+	KUNIT_EXPECT_EQ(test, fake.drains, 1U);
+	KUNIT_EXPECT_FALSE(test, fake.callback_live);
+	/* A failed attempt has no held binding to detach or resolve again. */
+	KUNIT_ASSERT_EQ(test, apple_dpin_provider_call(false, &ops), 0);
+	KUNIT_EXPECT_EQ(test, fake.gets, 1U);
+	KUNIT_EXPECT_EQ(test, fake.calls, 1U);
+	apple_dpin_token_revoke(&fake.tokens, 7);
+	apple_dpin_token_admit(&fake.tokens, 7);
+	fake.attach_result = 0;
+	KUNIT_ASSERT_EQ(test, apple_dpin_provider_call(true, &ops), 0);
+	KUNIT_EXPECT_EQ(test, fake.references, 1U);
+	/* A late successful attach still owns its reference until stale cleanup. */
+	apple_dpin_token_request(&fake.tokens, 8, true);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_token_complete(&fake.tokens, 7));
+	KUNIT_ASSERT_EQ(test, apple_dpin_provider_call(false, &ops), 0);
+	KUNIT_EXPECT_EQ(test, fake.gets, 2U);
+	KUNIT_EXPECT_EQ(test, fake.puts, 2U);
+	KUNIT_EXPECT_EQ(test, fake.drains, 2U);
+	KUNIT_EXPECT_EQ(test, fake.references, 0U);
+	KUNIT_EXPECT_FALSE(test, fake.callback_live);
+}
+
+static void apple_dpin_provider_unavailable(struct kunit *test)
+{
+	struct dpin_provider_fake fake = { .test = test };
+	struct apple_dpin_provider_ops ops = dpin_provider_fake_ops(&fake);
+
+	KUNIT_ASSERT_EQ(test, apple_dpin_provider_call(true, &ops), -ENODEV);
+	KUNIT_ASSERT_EQ(test, apple_dpin_provider_call(false, &ops), 0);
+	KUNIT_EXPECT_EQ(test, fake.gets, 1U);
+	KUNIT_EXPECT_EQ(test, fake.calls, 0U);
+	KUNIT_EXPECT_EQ(test, fake.puts, 0U);
+	KUNIT_EXPECT_EQ(test, fake.references, 0U);
+}
+
 static struct kunit_case apple_dpin_cases[] = {
+	KUNIT_CASE(apple_dpin_provider_handed_lifetime),
+	KUNIT_CASE(apple_dpin_provider_failed_retry),
+	KUNIT_CASE(apple_dpin_provider_unavailable),
 	KUNIT_CASE(apple_dpin_cookie_post_inflight_replacement),
 	KUNIT_CASE(apple_dpin_cookie_powered_request),
 	KUNIT_CASE(apple_dpin_cookie_initial_activate),

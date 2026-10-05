@@ -233,6 +233,7 @@ struct apple_cio {
 struct apple_dpin_binding {
 	struct apple_dpin_ctx *ctx;
 	u64 generation;
+	typeof(apple_dcp_tb_dp_tunnel) *tunnel; /* owns the provider module reference */
 };
 
 /*
@@ -431,12 +432,51 @@ static int apple_dpin_dcp_set_active(void *data, bool active)
 	return apple_dpin_set_active(c->acio, c->regs, c->idx, active);
 }
 
+static bool apple_dpin_provider_get(void *data)
+{
+	struct apple_dpin_binding *binding = data;
+
+	binding->tunnel = symbol_get(apple_dcp_tb_dp_tunnel);
+	return !!binding->tunnel;
+}
+
+static bool apple_dpin_provider_held(void *data)
+{
+	struct apple_dpin_binding *binding = data;
+
+	return !!binding->tunnel;
+}
+
+static int apple_dpin_provider_invoke(void *data, bool active)
+{
+	struct apple_dpin_binding *binding = data;
+	struct apple_dpin_ctx *c = binding->ctx;
+
+	return binding->tunnel(c->acio->connector_np, c->idx, binding->generation, active,
+			       active ? apple_dpin_dcp_set_active : NULL,
+			       active ? binding : NULL);
+}
+
+static void apple_dpin_provider_put(void *data)
+{
+	struct apple_dpin_binding *binding = data;
+
+	symbol_put(apple_dcp_tb_dp_tunnel);
+	binding->tunnel = NULL;
+}
+
 static int apple_dpin_connect(struct apple_dpin_ctx *c,
 			      struct apple_dpin_binding *binding,
 			      bool active)
 {
 	struct apple_cio *acio = c->acio;
-	typeof(&apple_dcp_tb_dp_tunnel) fn;
+	const struct apple_dpin_provider_ops ops = {
+		.get = apple_dpin_provider_get,
+		.held = apple_dpin_provider_held,
+		.call = apple_dpin_provider_invoke,
+		.put = apple_dpin_provider_put,
+		.ctx = binding,
+	};
 	unsigned int tries;
 	bool alive, paused;
 	int ret;
@@ -460,18 +500,7 @@ static int apple_dpin_connect(struct apple_dpin_ctx *c,
 				return -ESTALE;
 			}
 		}
-		fn = symbol_get(apple_dcp_tb_dp_tunnel);
-		if (fn) {
-			ret = fn(acio->connector_np, c->idx, binding->generation, active,
-				 active ? apple_dpin_dcp_set_active : NULL,
-				 active ? binding : NULL);
-			symbol_put(apple_dcp_tb_dp_tunnel);
-		} else {
-			/* appledrm gone: it has dropped our callback with it */
-			if (!active)
-				return 0;
-			ret = -ENODEV;
-		}
+		ret = apple_dpin_provider_call(active, &ops);
 		if (active && ret) {
 			scoped_guard(mutex, &c->lock)
 				apple_dpin_token_revoke(&c->tokens, binding->generation);
