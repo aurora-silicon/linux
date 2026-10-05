@@ -497,6 +497,7 @@ static inline struct tb_xdomain *tb_service_parent(struct tb_service *svc)
  *		    MSI-X is used.
  * @hop_count: Number of rings (end point hops) supported by NHI.
  * @quirks: NHI specific quirks if any
+ * @host_dp_policy: Host display tunnel policies supplied by the NHI glue
  * @domain_released: Completed when domain has been fully released
  */
 struct tb_nhi {
@@ -512,6 +513,7 @@ struct tb_nhi {
 	struct work_struct interrupt_work;
 	u32 hop_count;
 	unsigned long quirks;
+	unsigned long host_dp_policy;
 	struct completion domain_released;
 };
 

@@ -1140,7 +1140,7 @@ static inline bool tb_port_is_apple_host_dpin(const struct tb_port *port)
 	/* the KUnit tests build switches without a domain */
 	if (!tb || !tb->nhi || tb_route(port->sw) || !tb_port_is_dpin(port))
 		return false;
-	return tb->nhi->ops && tb->nhi->ops->dp_tunnel_changed;
+	return tb->nhi->host_dp_policy & TB_HOST_DP_NOTIFY;
 }
 
 static inline bool tb_port_needs_host_dp_credits(const struct tb_port *port)

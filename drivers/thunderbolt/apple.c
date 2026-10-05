@@ -81,6 +81,8 @@
 #include <linux/workqueue.h>
 
 #include "apple-dpin-handshake.h"
+#include "apple-dpin-state.h"
+#include "apple-dpin-platform.h"
 #include "nhi.h"
 #include "tb.h"
 
@@ -103,14 +105,22 @@ struct apple_cio_hw {
 	bool mxwrap;
 	bool lstx_explicit;
 	bool strict_fw_ready;
+	const struct apple_dpin_policy *dp;
 };
 
-static const struct apple_cio_hw apple_cio_t8103_hw = {};
+static const struct apple_cio_hw apple_cio_t8103_hw = {
+	.dp = &apple_dpin_m1,
+};
+
+static const struct apple_cio_hw apple_cio_t6020_hw = {
+	.dp = &apple_dpin_m2,
+};
 
 static const struct apple_cio_hw apple_cio_t6030_hw = {
 	.mxwrap = true,
 	.lstx_explicit = true,
 	.strict_fw_ready = true,
+	.dp = &apple_dpin_m3,
 };
 
 #define APPLE_CIO_NHI_HOP_COUNT 0x0
@@ -158,6 +168,7 @@ struct apple_cio {
 	struct device *dev;
 	struct device_node *np;
 	const struct apple_cio_hw *hw;
+	const struct apple_dpin_policy *dp;
 	void __iomem *cpu_base;
 	struct device_node *pcie_tunnel_np;
 	bool pcie_tunnel_preinitialized;
@@ -245,17 +256,31 @@ MODULE_PARM_DESC(dp_display, "Drive displays behind Thunderbolt DP tunnels on t8
  * The M1 Pro/Max ATC is the t8103 generation: same DP IN adapter registers,
  * same crossbar and the same tunnel pixel clock sequence.
  */
-static bool apple_cio_dp_is_t8103_style(void)
+static const struct of_device_id apple_dpin_qualified_soc[] = {
+	{ .compatible = "apple,t8103" },
+	{ .compatible = "apple,t6000" },
+	{ .compatible = "apple,t6001" },
+	{ .compatible = "apple,t6020" },
+	{ .compatible = "apple,t6021" },
+	{ .compatible = "apple,t6030" },
+	{},
+};
+
+/* Compatibility bridge until the display-to-DP-IN DT route binding lands. */
+static bool apple_dpin_legacy_t602x_routes(void)
 {
-	return of_machine_is_compatible("apple,t8103") ||
-	       of_machine_is_compatible("apple,t6000") ||
-	       of_machine_is_compatible("apple,t6001");
+	return apple_dp_tunnel_t602x();
 }
 
-/* T6030 reports DP tunnel changes the same way, with its own PHY and crossbar. */
-static bool apple_cio_dp_tunnel_changed_supported(void)
+const struct apple_dpin_policy *
+apple_dpin_policy_select(const struct apple_dpin_policy *hw,
+			 const struct device_node *root, bool legacy_routes)
 {
-	return apple_cio_dp_is_t8103_style() || of_machine_is_compatible("apple,t6030");
+	if (!of_match_node(apple_dpin_qualified_soc, root))
+		return &apple_dpin_disabled;
+	if (hw->flow == APPLE_DPIN_PRE_POST && !legacy_routes)
+		return &apple_dpin_disabled;
+	return hw;
 }
 
 /* DPTX_INACTIVE handshake: request (in)active, wait for the ACK */
@@ -356,7 +381,7 @@ static int apple_dpin_set_active_t8103(struct apple_cio *acio, void __iomem *dpi
 static int apple_dpin_set_active(struct apple_cio *acio, void __iomem *regs,
 				 unsigned int idx, bool active)
 {
-	if (apple_dp_tunnel_t602x())
+	if (acio->dp->t602x_handshake)
 		return apple_dpin_set_active_t602x(acio, regs, idx, active);
 	return apple_dpin_set_active_t8103(acio, regs, idx, active);
 }
@@ -372,18 +397,6 @@ static int apple_dpin_dcp_set_active(void *data, bool active)
 		return -ENODEV;
 	return apple_dpin_set_active(c->acio, c->regs, c->idx, active);
 }
-
-/*
- * With every display pipeline taken, a tunnel asks again this often while its
- * display stays connected, so it lights once another display lets one go.
- */
-#define APPLE_DPIN_RETRY_MS		2000
-
-/* appledrm may still be probing when a dock is present at boot: wait up to 30 s */
-#define APPLE_DP_CONNECT_TRIES		60
-#define APPLE_DP_CONNECT_WAIT_MS	500
-/* Explicit external firmware startup can follow userspace initialization. */
-#define APPLE_DP_FIRMWARE_TRIES		240
 
 static int apple_dpin_connect(struct apple_dpin_ctx *c, bool active)
 {
@@ -464,7 +477,7 @@ static int apple_dpin_up(struct apple_dpin_ctx *c)
 		 * back. Nothing handles these interrupts yet; they are enabled
 		 * as part of bringing the adapter up.
 		 */
-		if (apple_cio_dp_is_t8103_style()) {
+		if (acio->dp->setup_irqs) {
 			irq = readl(regs + APPLE_DPIN_IRQ_STATUS);
 			writel(irq, regs + APPLE_DPIN_IRQ_STATUS);
 			if (irq & BIT(0))
@@ -524,11 +537,6 @@ static void apple_dpin_retry_fn(struct work_struct *work)
  * a tunnel for a pipeline (M1-family hosts, see
  * apple_nhi_dp_tunnel_awaits_display()) does a refused tunnel wait for one.
  */
-static bool apple_dpin_can_wait(void)
-{
-	return apple_cio_dp_is_t8103_style();
-}
-
 static void apple_dpin_work_fn(struct work_struct *work)
 {
 	struct apple_dpin_ctx *c = container_of(work, struct apple_dpin_ctx, work);
@@ -565,7 +573,7 @@ static void apple_dpin_work_fn(struct work_struct *work)
 		ret = apple_dpin_up(c);
 		if (ret) {
 			bool wait = (ret == -EBUSY || ret == -EAGAIN) &&
-				    apple_dpin_can_wait();
+				    c->acio->dp->capacity_retry;
 			bool first = false, paused = false;
 
 			scoped_guard(mutex, &c->lock) {
@@ -1721,6 +1729,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	struct apple_tunable *tunable;
 	struct resource *res;
 	struct tb_port *port;
+	enum apple_dpin_flow dp_hooks;
 	int cap_apple;
 	int ret = 0;
 
@@ -1772,22 +1781,25 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	 * the connection manager) only where it is enabled and known to work.
 	 */
 	anhi->ops = apple_nhi_ops;
-	if (dp_display && acio->dp_wq && apple_cio_dp_tunnel_changed_supported()) {
+	dp_hooks = apple_dpin_hooks(acio->dp, !!acio->dp_wq, dp_display);
+	if (dp_hooks == APPLE_DPIN_CHANGED) {
 		anhi->ops.dp_tunnel_changed = apple_nhi_dp_tunnel_changed;
-		if (apple_dpin_can_wait())
+		anhi->nhi.host_dp_policy = acio->dp->host_policy;
+		if (acio->dp->capacity_retry)
 			anhi->ops.dp_tunnel_awaits_display =
 				apple_nhi_dp_tunnel_awaits_display;
 	}
-	if (acio->dp_wq && apple_dp_tunnel_t602x()) {
+	if (dp_hooks == APPLE_DPIN_PRE_POST) {
 		anhi->ops.dp_tunnel_pre_activate = apple_nhi_dp_tunnel_pre_activate;
 		anhi->ops.dp_tunnel_post_activate = apple_nhi_dp_tunnel_post_activate;
 		anhi->ops.dp_tunnel_deactivate = apple_nhi_dp_tunnel_deactivate;
+		anhi->nhi.host_dp_policy = acio->dp->host_policy;
 	}
 	anhi->nhi.ops = &anhi->ops;
 	anhi->nhi.ring_layout = &apple_nhi_ring_layout;
 	anhi->nhi.iobase = anhi->nhi_base;
 	anhi->nhi.quirks = QUIRK_NO_DMA_PORT | QUIRK_NO_USB3_BW_ALLOC;
-	if (anhi->ops.dp_tunnel_changed || anhi->ops.dp_tunnel_post_activate)
+	if (anhi->nhi.host_dp_policy)
 		anhi->nhi.quirks |= QUIRK_HOST_DP_NFC_CREDITS;
 
 	anhi->nhi.hop_count = readl(anhi->nhi_base + APPLE_CIO_NHI_HOP_COUNT) &
@@ -1916,7 +1928,7 @@ static void apple_nhi_remove(struct platform_device *pdev)
  */
 static void apple_dpin_pause_retries(struct apple_cio *acio)
 {
-	if (!acio->dp_wq || !apple_dpin_can_wait())
+	if (!acio->dp_wq || !acio->dp->capacity_retry)
 		return;
 	for (unsigned int i = 0; i < ARRAY_SIZE(acio->dpin); i++) {
 		struct apple_dpin_ctx *c = &acio->dpin[i];
@@ -1930,7 +1942,7 @@ static void apple_dpin_pause_retries(struct apple_cio *acio)
 
 static void apple_dpin_resume_retries(struct apple_cio *acio)
 {
-	if (!acio->dp_wq || !apple_dpin_can_wait())
+	if (!acio->dp_wq || !acio->dp->capacity_retry)
 		return;
 	for (unsigned int i = 0; i < ARRAY_SIZE(acio->dpin); i++) {
 		struct apple_dpin_ctx *c = &acio->dpin[i];
@@ -2111,7 +2123,12 @@ static void apple_cio_remove_children(struct apple_cio *acio)
 	nhi_pdev = READ_ONCE(acio->nhi_pdev);
 	if (nhi_pdev)
 		of_platform_device_destroy(&nhi_pdev->dev, NULL);
-	/* removing the NHI released its DP tunnels: let the display side finish */
+	/*
+	 * NHI removal has released tb->lock and pcie_tunnel_lock. DP work and
+	 * its DCP/crossbar/PHY callbacks never acquire acio->lock: they take
+	 * only the DP-IN lock on this controller. Keep that invariant for
+	 * future monitor/reconnect work; this drain holds acio->lock.
+	 */
 	if (acio->dp_wq)
 		flush_workqueue(acio->dp_wq);
 
@@ -2478,6 +2495,9 @@ static int apple_cio_probe(struct platform_device *pdev)
 	acio->hw = of_device_get_match_data(dev);
 	if (!acio->hw)
 		return -EINVAL;
+	/* Controller compatibles describe registers, not display qualification. */
+	acio->dp = apple_dpin_policy_select(acio->hw->dp, of_root,
+					    apple_dpin_legacy_t602x_routes());
 
 	if (acio->hw->mxwrap) {
 		struct resource *cpu_res;
@@ -2601,6 +2621,7 @@ static int apple_cio_probe(struct platform_device *pdev)
 			if (ret)
 				return ret;
 		}
+		/* Prepare/remove drain this queue; it must remain non-freezable. */
 		acio->dp_wq = alloc_ordered_workqueue("%s-dp", 0, dev_name(dev));
 		if (!acio->dp_wq)
 			return -ENOMEM;
@@ -2649,6 +2670,10 @@ static const struct of_device_id apple_acio_match[] = {
 	{
 		.compatible = "apple,t6030-usb4-acio",
 		.data = &apple_cio_t6030_hw,
+	},
+	{
+		.compatible = "apple,t6020-usb4-acio",
+		.data = &apple_cio_t6020_hw,
 	},
 	{
 		.compatible = "apple,t8103-usb4-acio",

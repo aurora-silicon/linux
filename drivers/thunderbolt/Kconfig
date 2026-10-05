@@ -74,4 +74,14 @@ config USB4_APPLE_SOC
 	  To compile the driver as a module, choose M here. The module
 	  will be called thunderbolt_apple.
 
+config USB4_APPLE_DPIN_KUNIT_TEST
+	bool "Apple DP-IN lifecycle tests" if !KUNIT_ALL_TESTS
+	depends on USB4_APPLE_SOC && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Test Apple DP-IN display handoff decisions against the legacy rules.
+	  Check retry, sleep, teardown and host policy trace equivalence with
+	  the pre-extraction driver, including unqualified SoC exclusions.
+	  The tests use no live Apple devices or hardware register access.
+
 endif # USB4

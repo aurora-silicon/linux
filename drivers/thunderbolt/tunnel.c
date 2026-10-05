@@ -14,7 +14,6 @@
 #include <linux/of.h>
 #include <linux/string.h>
 #include <linux/string_helpers.h>
-#include <linux/soc/apple/dp-tunnel.h>
 
 #include "tunnel.h"
 #include "tb.h"
@@ -112,17 +111,9 @@ MODULE_PARM_DESC(dp_video_counter,
 static void tb_dp_dump_apple(struct tb_tunnel *tunnel);
 static int tb_apple_nhi_typec_index(struct tb_nhi *nhi);
 
-static bool tb_nhi_is_apple(const struct tb_nhi *nhi)
+static bool tb_host_dp_policy(const struct tb_nhi *nhi, unsigned long policy)
 {
-	struct device_node *np;
-
-	if (!nhi || !nhi->dev || !nhi->ops ||
-	    !nhi->ops->dp_tunnel_post_activate)
-		return false;
-	np = nhi->dev->of_node;
-	if (!np && nhi->dev->parent)
-		np = nhi->dev->parent->of_node;
-	return np && of_device_is_compatible(np, "apple,t8103-usb4-nhi");
+	return nhi && (nhi->host_dp_policy & policy);
 }
 
 static const char * const tb_tunnel_names[] = { "PCI", "DP", "DMA", "USB3" };
@@ -967,9 +958,8 @@ static bool tb_dp_is_apple_t602x_right_dpin(const struct tb_port *in)
 {
 	if (!tb_port_is_dpin(in))
 		return false;
-	if (!in->sw->tb || !tb_nhi_is_apple(in->sw->tb->nhi))
-		return false;
-	if (!apple_dp_tunnel_t602x())
+	if (!in->sw->tb ||
+	    !tb_host_dp_policy(in->sw->tb->nhi, TB_HOST_DP_INITIAL_BW_GRANT))
 		return false;
 
 	/* Right-hand USB-C ports only ("f01f" NHI); see tb_apple_nhi_typec_index(). */
@@ -1214,7 +1204,7 @@ static void tb_dp_dprx_work(struct work_struct *work)
 				mutex_unlock(&tb->lock);
 				return;
 			}
-			if (tb_nhi_is_apple(tb->nhi)) {
+			if (tb_host_dp_policy(tb->nhi, TB_HOST_DP_KEEP_DPRX_TIMEOUT)) {
 				tb_tunnel_warn(tunnel,
 					       "Apple: DPRX timeout, keeping DP tunnel\n");
 				tb_dp_dump_apple(tunnel);
@@ -1235,7 +1225,7 @@ static void tb_dp_dprx_work(struct work_struct *work)
 
 static int tb_dp_dprx_start(struct tb_tunnel *tunnel)
 {
-	if (tb_nhi_is_apple(tunnel->tb->nhi)) {
+	if (tb_host_dp_policy(tunnel->tb->nhi, TB_HOST_DP_ACTIVE_BEFORE_DPRX)) {
 		tb_tunnel_warn(tunnel,
 			       "Apple: DP tunnel paths up, not waiting for DPRX\n");
 		tb_tunnel_set_active(tunnel, true);
@@ -1370,7 +1360,8 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 
 	if (tb_port_is_dpout(tunnel->dst_port)) {
 		struct tb_port *out = tunnel->dst_port;
-		bool apple_dpin = (tb_nhi_is_apple(tunnel->tb->nhi) ||
+		bool apple_dpin = (tb_host_dp_policy(tunnel->tb->nhi,
+						   TB_HOST_DP_ADAPTER_QUIRKS) ||
 				  tb_port_is_apple_host_dpin(tunnel->src_port)) &&
 				  tb_port_is_dpin(tunnel->src_port) &&
 				  out->cap_adap;
@@ -1400,7 +1391,8 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 			return ret;
 	}
 
-	if (active && tb_nhi_is_apple(tunnel->tb->nhi)) {
+	if (active && tb_host_dp_policy(tunnel->tb->nhi,
+					TB_HOST_DP_HPD_ON_ACTIVATE)) {
 		if (tb_port_is_dpin(tunnel->src_port))
 			tb_dp_apple_pulse_hpd(tunnel->src_port);
 		tb_dp_dump_apple(tunnel);
