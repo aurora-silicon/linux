@@ -542,8 +542,9 @@ static int apple_pmp_t6030_enable(struct apple_pmp_report *rep)
 }
 
 /*
- * T6030 PMP temperatures, read from the SRAM of the PMP image the J516S
- * overlay names (the report driver starts no other image): 0xa4-byte records
+ * T6030 PMP temperatures, read from the SRAM of the PMP image the PMP node
+ * names in apple,tunable-uuid (the report driver starts no other image, and
+ * the display gate gives the node only the image it knows): 0xa4-byte records
  * with the sensor name at +0x94, the last valid sample (1/64 degree Celsius)
  * at +0x3c and its valid flag at +0x48. The current sample is not used: it is
  * invalid while a CPU cluster is idle, so the last valid sample of an idle

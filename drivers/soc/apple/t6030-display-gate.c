@@ -94,6 +94,23 @@ extern const u8 __dtbo_t6030_j516s_pmp_end[];
 /* This Mac's PMP values, from the boot loader, or NULL. */
 static struct device_node *gate_pmp_values __initdata;
 
+/*
+ * The PMP firmware image the T6030 PMP support was brought up with, as the
+ * J516S overlay names it. The report driver starts only the image the PMP
+ * node names; values from the boot loader must name this one too.
+ */
+static const char gate_pmp_uuid[] __initconst = "2F4EB4C4-001B-3ACF-A9A0-68D8E42FC3A7";
+
+/* The boot loader's values the gate copies onto the PMP node. */
+static bool __init gate_pmp_value_wanted(const struct property *prop)
+{
+	if (!strcmp(prop->name, "apple,board-id") ||
+	    !strcmp(prop->name, "apple,dram-vendor-id") ||
+	    !strcmp(prop->name, "apple,dram-capacity"))
+		return prop->length == sizeof(u32);
+	return strstarts(prop->name, "apple,tunable-");
+}
+
 static bool gate_requested __initdata = true;
 
 /* Kept after a successful apply: the live tree now holds its properties. */
@@ -313,14 +330,25 @@ static int __init gate_pmp_resolve(struct device_node **np, struct device_node *
 	int i;
 
 	gate_pmp_values = of_find_node_by_path("/chosen/asahi,t6030-pmp");
-	if (gate_pmp_values &&
-	    (!of_property_present(gate_pmp_values, "apple,board-id") ||
-	     !of_property_present(gate_pmp_values, "apple,dram-vendor-id") ||
-	     !of_property_present(gate_pmp_values, "apple,tunable-uuid"))) {
-		pr_warn("PMP not added: %pOF is incomplete\n", gate_pmp_values);
-		of_node_put(gate_pmp_values);
-		gate_pmp_values = NULL;
-		return -EINVAL;
+	if (gate_pmp_values) {
+		const char *uuid = NULL;
+		u32 v;
+
+		if (of_property_read_u32(gate_pmp_values, "apple,board-id", &v) ||
+		    of_property_read_u32(gate_pmp_values, "apple,dram-vendor-id", &v) ||
+		    of_property_read_string(gate_pmp_values, "apple,tunable-uuid", &uuid)) {
+			pr_warn("PMP not added: %pOF is incomplete\n", gate_pmp_values);
+			of_node_put(gate_pmp_values);
+			gate_pmp_values = NULL;
+			return -EINVAL;
+		}
+		if (strcmp(uuid, gate_pmp_uuid)) {
+			pr_warn("PMP not added: this Mac's PMP firmware image is %s, not %s\n",
+				uuid, gate_pmp_uuid);
+			of_node_put(gate_pmp_values);
+			gate_pmp_values = NULL;
+			return -EINVAL;
+		}
 	}
 	if (!gate_pmp_values && !of_machine_is_compatible("apple,j516s")) {
 		pr_warn("PMP not added: the boot loader passed no PMP values for this Mac\n");
@@ -403,7 +431,7 @@ static int __init gate_set_u32(struct of_changeset *cs, struct device_node *np,
 }
 
 /*
- * Adds every apple,* property of the boot loader's PMP values to @pmp, which
+ * Adds the boot loader's PMP values (gate_pmp_value_wanted()) to @pmp, which
  * the T6030 overlay leaves without them. Returns the number added.
  */
 static int __init gate_pmp_copy_values(struct of_changeset *cs, struct device_node *pmp)
@@ -412,7 +440,7 @@ static int __init gate_pmp_copy_values(struct of_changeset *cs, struct device_no
 	int n = 0, ret;
 
 	for_each_property_of_node(gate_pmp_values, src) {
-		if (strncmp(src->name, "apple,", 6))
+		if (!gate_pmp_value_wanted(src))
 			continue;
 		/* Kept for good: the live tree refers to it once applied. */
 		prop = kzalloc_obj(*prop);
@@ -428,8 +456,12 @@ static int __init gate_pmp_copy_values(struct of_changeset *cs, struct device_no
 			return -ENOMEM;
 		}
 		ret = of_changeset_add_property(cs, pmp, prop);
-		if (ret)
+		if (ret) {
+			kfree(prop->name);
+			kfree(prop->value);
+			kfree(prop);
 			return ret;
+		}
 		n++;
 	}
 	return n;
