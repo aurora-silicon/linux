@@ -225,6 +225,31 @@ is_neo() {
   tr '\0' '\n' <"$DT/compatible" 2>/dev/null | grep -qx 'apple,t8140'
 }
 
+# The chips this release installs on: M1 (t8103, t6000, t6001, t6002), M2
+# (t8112, t6020, t6021, t6022), the MacBook Neo (t8140) and the M3s that is_m3
+# lists. The kernel also carries device trees for the M3 Ultra (t6032) and
+# M4 and later chips (t8132, t8142, t8152), but nobody has booted this kernel
+# on them, and the M1/M2 path would replace their boot loader with an m1n1
+# that can't start them. Keep this list in step with is_m3 and is_neo.
+SUPPORTED_SOCS="t8103 t6000 t6001 t6002 t8112 t6020 t6021 t6022 t8140 t8122 t6030 t6031 t6034"
+
+# This Mac's chip from the device tree, as tNNNN; empty when there is none.
+this_soc() {
+  tr '\0' '\n' <"$DT/compatible" 2>/dev/null | sed -n 's/^apple,\(t[0-9][0-9][0-9][0-9]\)$/\1/p' | head -1
+}
+
+# Stops before anything is downloaded or changed on a chip this release
+# doesn't support. --agent-prompt and --reset-touchid don't come here.
+require_supported_soc() {
+  local soc
+  soc=$(this_soc)
+  [[ -n $soc && " $SUPPORTED_SOCS " == *" $soc "* ]] && return 0
+  die "this Mac (${soc:+apple,$soc, }$(this_board)) is not one $VERSION supports: M1, M2, the MacBook
+    Neo, and M3, M3 Pro and M3 Max. ${1:-Installing} would replace its boot loader with an m1n1 that
+    can't start it. Nothing was changed. If you are bringing this Mac up, please open an issue at
+    https://github.com/iconidentify/aurora-linux/issues"
+}
+
 # Every M3 chip: M3 (t8122), M3 Pro (t6030), M3 Max (t6031, t6034).
 is_m3() {
   tr '\0' '\n' <"$DT/compatible" 2>/dev/null | grep -Eqx 'apple,(t8122|t6030|t6031|t6034)'
@@ -1209,6 +1234,7 @@ packages_for_this_mac() {
 install_all() {
   local entry file sha kernel chain
   local -a entries
+  require_supported_soc
   version_notice
   sep_write_notice
   ane_dkms_notice
@@ -1371,6 +1397,7 @@ install_all() {
 
 uninstall_all() {
   local previous=linux-asahi m3_mode=none
+  require_supported_soc "Uninstalling, which rebuilds boot.bin with the stock m1n1,"
   if [[ -f $STATE/previous-package ]]; then read -r previous _ <"$STATE/previous-package" || true; fi
   # 11.36 rewrote this on every run, so an updated Mac may name linux-aurora
   # itself, which the repositories don't carry for these Macs.
