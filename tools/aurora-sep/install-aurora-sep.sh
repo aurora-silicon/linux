@@ -89,6 +89,9 @@
 # the SEP warm-registration guard and preboot-UUID forwarding from
 # aurora-silicon/m1n1, and the usb4-N-pcie-adapter alias fallback
 # (aurora-silicon/m1n1#4).
+# M3: experimental and kernel-only. linux-aurora goes on, and m1n1's boot.bin
+# stays exactly as it is: no m1n1-aurora, no /etc/m1n1.conf, no update-m1n1
+# run, and a freeze on update-m1n1 unless one is in place already.
 # On M2 and later the platform hands Linux an already-running Secure
 # Enclave, and the driver attaches to it with one registration that can only be
 # sent once per boot. Stock m1n1 asks the enclave for randomness on the way up,
@@ -125,6 +128,7 @@ FALLBACK_ID=aurora-sep-previous-kernel
 # Written only by --read-only; keeps the driver from writing to the enclave.
 MODPROBE_CONF=/etc/modprobe.d/aurora-sep.conf
 READ_ONLY=0
+DT=/proc/device-tree
 
 say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
@@ -184,7 +188,112 @@ boot_chain() {
 # branch. m1n1-aurora has no T8140 support, so on a Neo this script never
 # installs it or the stock m1n1 over the one the Mac already boots.
 is_neo() {
-  tr '\0' '\n' </proc/device-tree/compatible 2>/dev/null | grep -qx 'apple,t8140'
+  tr '\0' '\n' <"$DT/compatible" 2>/dev/null | grep -qx 'apple,t8140'
+}
+
+# Every M3 chip: M3 (t8122), M3 Pro (t6030), M3 Max (t6031, t6034).
+is_m3() {
+  tr '\0' '\n' <"$DT/compatible" 2>/dev/null | grep -Eqx 'apple,(t8122|t6030|t6031|t6034)'
+}
+
+# M3 support is experimental in this release and kernel-only. An M3 gets
+# linux-aurora, but m1n1's stage 2 (boot.bin: m1n1, device trees and U-Boot)
+# stays exactly as it is: the M3 Pro's display and GPU handoff needs an m1n1
+# this release doesn't ship. So on an M3 the script installs no m1n1-aurora,
+# writes no /etc/m1n1.conf and never runs update-m1n1. pacman's update-m1n1
+# hook would still rebuild boot.bin when the kernel's device trees arrive, so
+# unless something has frozen update-m1n1 already (the M3 bring-up's
+# install-m3gpu.sh has), the script adds its own freeze; --uninstall lifts it.
+UPDATE_M1N1_CONF=/etc/default/update-m1n1
+M3_FREEZE_BEGIN="# >>> aurora-sep: keep this M3's boot.bin as it is (remove with: install-aurora-sep.sh --uninstall)"
+M3_FREEZE_END="# <<< aurora-sep: keep this M3's boot.bin as it is"
+M3_FROZEN_BY=""
+M3_BOOTBIN_SHA=""
+
+# Whether update-m1n1 would exit without building, judged the way it judges:
+# it sources this file and stops when M1N1_UPDATE_DISABLED is non-empty.
+update_m1n1_frozen() {
+  [[ -f $UPDATE_M1N1_CONF ]] || return 1
+  # shellcheck disable=SC2016 # expanded by that sh, not here
+  env -i PATH="$PATH" sh -c 'set -e; . "$1"; [ -n "${M1N1_UPDATE_DISABLED:-}" ]' _ \
+    "$UPDATE_M1N1_CONF" >/dev/null 2>&1
+}
+
+m3_freeze() {
+  local tmp
+  if update_m1n1_frozen; then
+    M3_FROZEN_BY=already
+    return 0
+  fi
+  tmp=$(mktemp)
+  if [[ -f $UPDATE_M1N1_CONF ]]; then cat "$UPDATE_M1N1_CONF" >"$tmp"; fi
+  printf '%s\nM1N1_UPDATE_DISABLED=1\n%s\n' "$M3_FREEZE_BEGIN" "$M3_FREEZE_END" >>"$tmp"
+  $sudo install -m 644 "$tmp" "$UPDATE_M1N1_CONF"
+  rm -f "$tmp"
+  update_m1n1_frozen || die "could not freeze update-m1n1 in $UPDATE_M1N1_CONF; nothing was installed"
+  M3_FROZEN_BY=aurora-sep
+}
+
+# Lift only this script's freeze; a file that held nothing else goes.
+m3_unfreeze() {
+  local tmp
+  [[ -f $UPDATE_M1N1_CONF ]] && grep -qxF "$M3_FREEZE_BEGIN" "$UPDATE_M1N1_CONF" || return 0
+  tmp=$(mktemp)
+  awk -v b="$M3_FREEZE_BEGIN" -v e="$M3_FREEZE_END" '
+    $0 == b { skip = 1; next }
+    skip && $0 == e { skip = 0; next }
+    !skip' "$UPDATE_M1N1_CONF" >"$tmp"
+  if grep -q '[^[:space:]]' "$tmp"; then
+    $sudo install -m 644 "$tmp" "$UPDATE_M1N1_CONF"
+  else
+    $sudo rm -f "$UPDATE_M1N1_CONF"
+  fi
+  rm -f "$tmp"
+}
+
+# m1n1's boot.bin on the EFI partition. Omarchy mounts that partition readable
+# by root only, so look through sudo.
+m3_bootbin() {
+  local target
+  for target in /boot/efi/m1n1/boot.bin /boot/m1n1/boot.bin; do
+    if $sudo test -f "$target"; then
+      echo "$target"
+      return 0
+    fi
+  done
+  return 1
+}
+
+m3_bootbin_sha() {
+  local target
+  target=$(m3_bootbin) || return 0
+  $sudo sha256sum "$target" | cut -d' ' -f1
+}
+
+m3_notice() {
+  warn "M3 support is experimental in $VERSION, and kernel-only: this installs
+    linux-aurora and leaves m1n1's boot.bin (m1n1, device trees and U-Boot) exactly
+    as it is, so the kernel boots with the device trees already in it. The M3 Pro's
+    display and GPU handoff needs an m1n1 that a later release brings; an M3 without
+    it runs on the boot framebuffer."
+}
+
+# After the install: say plainly what happened to boot.bin, and prove it.
+m3_bootbin_report() {
+  local now
+  now=$(m3_bootbin_sha)
+  if [[ -n $M3_BOOTBIN_SHA && $now != "$M3_BOOTBIN_SHA" ]]; then
+    die "m1n1's boot.bin changed during the install, which it must not on an M3.
+    Please report it at https://github.com/iconidentify/aurora-linux/issues before rebooting."
+  fi
+  if [[ $M3_FROZEN_BY == aurora-sep ]]; then
+    say "M3: m1n1's boot.bin is unchanged. pacman's \"Updating m1n1 image\" step did nothing:
+    this script froze update-m1n1 in $UPDATE_M1N1_CONF, so kernel and m1n1
+    updates keep boot.bin as it is. --uninstall lifts the freeze."
+  else
+    say "M3: m1n1's boot.bin is unchanged. pacman's \"Updating m1n1 image\" step did nothing:
+    update-m1n1 was already frozen in $UPDATE_M1N1_CONF, and stays that way."
+  fi
 }
 
 # Boards whose Touch ID support nobody has booted yet. Once a board's device
@@ -376,6 +485,13 @@ EOF
   for target in /boot/m1n1/boot.bin /boot/efi/m1n1/boot.bin; do
     [[ -f $target && ! -f $STATE/boot.bin.saved ]] && $sudo cp "$target" "$STATE/boot.bin.saved"
   done
+  # update-m1n1 exits without a word while this is set; say so rather than
+  # claim a rebuild.
+  if update_m1n1_frozen; then
+    warn "$conf sets M1N1_UPDATE_DISABLED, so m1n1's boot.bin was not rebuilt;
+    it keeps the m1n1 and device trees it already had"
+    return 0
+  fi
   say "Rebuilding m1n1 with the aurora device trees"
   $sudo update-m1n1 || die "update-m1n1 failed; the previous boot.bin is saved in $STATE/boot.bin.saved"
 }
@@ -586,12 +702,17 @@ install_all() {
   kernel=$(current_kernel)
   chain=$(boot_chain)
   if [[ $chain == grub ]]; then boot_space "$kernel"; fi
+  if is_m3; then m3_notice; fi
   work=$(mktemp -d)
   trap 'rm -rf "${work:-}"' EXIT
   for entry in "${PACKAGES[@]}"; do
     read -r file sha <<<"$entry"
     if [[ $file == m1n1-aurora-* ]] && is_neo; then
       say "Keeping this MacBook Neo's own m1n1 (m1n1-aurora has no T8140 support)"
+      continue
+    fi
+    if [[ $file == m1n1-aurora-* ]] && is_m3; then
+      say "Keeping this M3's own m1n1 (M3 support in $VERSION is kernel-only)"
       continue
     fi
     say "Downloading $file"
@@ -611,6 +732,11 @@ install_all() {
     keep_grub_fallback "$kernel"
   fi
   pacman -Q "$kernel" | $sudo tee "$STATE/previous-package" >/dev/null
+  # Before pacman's update-m1n1 hook runs on the kernel's device trees.
+  if is_m3; then
+    M3_BOOTBIN_SHA=$(m3_bootbin_sha)
+    m3_freeze
+  fi
 
   # linux-aurora-headers pulls in pahole, and fprintd below comes from the
   # repositories. On a Mac whose package database has gone stale, pacman
@@ -643,7 +769,12 @@ install_all() {
   # is not this one -- and those DTBs lack the Touch ID sensor node. pacman's
   # own hook already ran update-m1n1 during the install above, before this
   # configuration existed, so run it again now that it is in place.
-  m1n1_update
+  # An M3 keeps the boot.bin it has (see is_m3).
+  if is_m3; then
+    m3_bootbin_report
+  else
+    m1n1_update
+  fi
   if [[ $chain == grub ]]; then
     grub_update
   fi
@@ -679,6 +810,9 @@ uninstall_all() {
   if is_neo; then
     m1n1=
     say "Reinstalling $previous and the stock libfprint; this MacBook Neo keeps its own m1n1"
+  elif is_m3; then
+    m1n1=
+    say "Reinstalling $previous and the stock libfprint; this M3 keeps its m1n1 and boot.bin as they are"
   else
     say "Reinstalling $previous, the stock m1n1 and the stock libfprint"
   fi
@@ -686,7 +820,9 @@ uninstall_all() {
   $sudo pacman -Sy --noconfirm --ask 4 "$previous" "$previous-headers" libfprint $m1n1
   # Restore the stock update-m1n1 configuration on either chain before the
   # rebuild below, so boot.bin goes back to the packaged m1n1 and DTBs.
-  if [[ $(boot_chain) != grub ]]; then
+  # An M3's boot.bin and update-m1n1 configuration were never changed; only
+  # this script's freeze comes off, at the end.
+  if [[ $(boot_chain) != grub ]] && ! is_m3; then
     if [[ -f $STATE/update-m1n1.default.saved ]]; then
       $sudo cp "$STATE/update-m1n1.default.saved" /etc/default/update-m1n1
     else
@@ -699,17 +835,20 @@ uninstall_all() {
     [[ -f $STATE/linux-asahi.preset.saved && ! -f /etc/mkinitcpio.d/linux-asahi.preset ]] &&
       $sudo mv "$STATE/linux-asahi.preset.saved" /etc/mkinitcpio.d/linux-asahi.preset
     [[ -f $STATE/grub.default.saved ]] && $sudo cp "$STATE/grub.default.saved" /etc/default/grub
-    if [[ -f $STATE/update-m1n1.default.saved ]]; then
-      $sudo cp "$STATE/update-m1n1.default.saved" /etc/default/update-m1n1
-    else
-      $sudo rm -f /etc/default/update-m1n1
+    if ! is_m3; then
+      if [[ -f $STATE/update-m1n1.default.saved ]]; then
+        $sudo cp "$STATE/update-m1n1.default.saved" /etc/default/update-m1n1
+      else
+        $sudo rm -f /etc/default/update-m1n1
+      fi
+      $sudo update-m1n1
     fi
-    $sudo update-m1n1
     $sudo systemctl disable aurora-sep-fallback-modules.service 2>/dev/null || true
     $sudo rm -f /etc/systemd/system/aurora-sep-fallback-modules.service
     $sudo rm -f /etc/grub.d/42_aurora_sep_previous /boot/vmlinuz-aurora-sep-previous /boot/initramfs-aurora-sep-previous.img
     $sudo grub-mkconfig -o /boot/grub/grub.cfg
   fi
+  if is_m3; then m3_unfreeze; fi
   $sudo rm -f "$MODPROBE_CONF"
   $sudo rm -rf "$STATE"
   say "Done. Reboot to run $previous."
@@ -1097,6 +1236,9 @@ PROMPT
 
 # A reset needs none of the kernel and boot checks; it checks for itself.
 preflight_needed() { case ${1:-} in --agent-prompt | --reset-touchid) return 1 ;; *) return 0 ;; esac; }
+
+# Tests source this file for its functions only.
+if [[ ${AURORA_SEP_SOURCE_ONLY:-} == 1 ]]; then return 0; fi
 
 if preflight_needed "${1:-}"; then preflight; fi
 case ${1:-} in
