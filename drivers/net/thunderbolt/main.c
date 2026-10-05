@@ -23,6 +23,7 @@
 #include <linux/workqueue.h>
 
 #include <net/ip6_checksum.h>
+#include <net/page_pool/helpers.h>
 
 #include "trace.h"
 
@@ -145,6 +146,8 @@ struct tbnet_ring {
 	unsigned int cons;
 	unsigned int prod;
 	struct tb_ring *ring;
+	/* Rx only: buffer pool with permanent DMA mappings */
+	struct page_pool *pool;
 };
 
 /**
@@ -338,32 +341,25 @@ static void tbnet_free_buffers(struct tbnet_ring *ring)
 	unsigned int i;
 
 	for (i = 0; i < TBNET_RING_SIZE; i++) {
-		struct device *dma_dev = tb_ring_dma_device(ring->ring);
 		struct tbnet_frame *tf = &ring->frames[i];
-		enum dma_data_direction dir;
-		unsigned int order;
-		size_t size;
 
 		if (!tf->page)
 			continue;
 
-		if (ring->ring->is_tx) {
-			dir = DMA_TO_DEVICE;
-			order = 0;
-			size = TBNET_FRAME_SIZE;
+		if (ring->pool) {
+			page_pool_put_full_page(ring->pool, tf->page, false);
 		} else {
-			dir = DMA_FROM_DEVICE;
-			order = TBNET_RX_PAGE_ORDER;
-			size = TBNET_RX_PAGE_SIZE;
+			struct device *dma_dev = tb_ring_dma_device(ring->ring);
+
+			trace_tbnet_free_frame(i, tf->page,
+					       tf->frame.buffer_phy,
+					       DMA_TO_DEVICE);
+
+			dma_unmap_page(dma_dev, tf->frame.buffer_phy,
+				       TBNET_FRAME_SIZE, DMA_TO_DEVICE);
+			__free_page(tf->page);
 		}
 
-		trace_tbnet_free_frame(i, tf->page, tf->frame.buffer_phy, dir);
-
-		if (tf->frame.buffer_phy)
-			dma_unmap_page(dma_dev, tf->frame.buffer_phy, size,
-				       dir);
-
-		__free_pages(tf->page, order);
 		tf->page = NULL;
 	}
 
@@ -408,6 +404,12 @@ static void tbnet_tear_down(struct tbnet *net, bool send_logout)
 					       net->rx_ring.ring->hop);
 		if (ret)
 			netdev_warn(net->dev, "failed to disable DMA paths\n");
+
+		/* Free any partially assembled packet; its fragments are
+		 * page pool pages that must go back before buffer teardown.
+		 */
+		dev_kfree_skb_any(net->skb);
+		net->skb = NULL;
 
 		tb_ring_stop(net->rx_ring.ring);
 		tb_ring_stop(net->tx_ring.ring);
@@ -514,35 +516,30 @@ static int tbnet_alloc_rx_buffers(struct tbnet *net, unsigned int nbuffers)
 	int ret;
 
 	while (nbuffers--) {
-		struct device *dma_dev = tb_ring_dma_device(ring->ring);
 		unsigned int index = ring->prod & (TBNET_RING_SIZE - 1);
 		struct tbnet_frame *tf = &ring->frames[index];
-		dma_addr_t dma_addr;
+		struct page *page;
 
 		if (tf->page)
 			break;
 
 		/* Allocate page (order > 0) so that it can hold maximum
 		 * ThunderboltIP frame (4kB) and the additional room for
-		 * SKB shared info required by build_skb().
+		 * SKB shared info required by build_skb().  The pool keeps
+		 * the DMA mapping alive across recycles.
 		 */
-		tf->page = dev_alloc_pages(TBNET_RX_PAGE_ORDER);
-		if (!tf->page) {
+		page = page_pool_dev_alloc_pages(ring->pool);
+		if (!page) {
 			ret = -ENOMEM;
 			goto err_free;
 		}
 
-		dma_addr = dma_map_page(dma_dev, tf->page, 0,
-					TBNET_RX_PAGE_SIZE, DMA_FROM_DEVICE);
-		if (dma_mapping_error(dma_dev, dma_addr)) {
-			ret = -ENOMEM;
-			goto err_free;
-		}
-
-		tf->frame.buffer_phy = dma_addr;
+		tf->page = page;
+		tf->frame.buffer_phy = page_pool_get_dma_addr(page);
 		tf->dev = net->dev;
 
-		trace_tbnet_alloc_rx_frame(index, tf->page, dma_addr,
+		trace_tbnet_alloc_rx_frame(index, tf->page,
+					   tf->frame.buffer_phy,
 					   DMA_FROM_DEVICE);
 
 		tb_ring_rx(ring->ring, &tf->frame);
@@ -845,9 +842,6 @@ static int tbnet_poll(struct napi_struct *napi, int budget)
 		if (!frame)
 			break;
 
-		dma_unmap_page(dma_dev, frame->buffer_phy,
-			       TBNET_RX_PAGE_SIZE, DMA_FROM_DEVICE);
-
 		tf = container_of(frame, typeof(*tf), frame);
 
 		page = tf->page;
@@ -855,11 +849,14 @@ static int tbnet_poll(struct napi_struct *napi, int budget)
 		net->rx_ring.cons++;
 		cleaned_count++;
 
+		dma_sync_single_for_cpu(dma_dev, page_pool_get_dma_addr(page),
+					TBNET_FRAME_SIZE, DMA_FROM_DEVICE);
+
 		hdr = page_address(page);
 		if (!tbnet_check_frame(net, tf, hdr)) {
 			trace_tbnet_invalid_rx_ip_frame(hdr->frame_size,
 				hdr->frame_id, hdr->frame_index, hdr->frame_count);
-			__free_pages(page, TBNET_RX_PAGE_ORDER);
+			page_pool_put_full_page(net->rx_ring.pool, page, true);
 			dev_kfree_skb_any(net->skb);
 			net->skb = NULL;
 			continue;
@@ -874,11 +871,13 @@ static int tbnet_poll(struct napi_struct *napi, int budget)
 			skb = build_skb(page_address(page),
 					TBNET_RX_PAGE_SIZE);
 			if (!skb) {
-				__free_pages(page, TBNET_RX_PAGE_ORDER);
+				page_pool_put_full_page(net->rx_ring.pool,
+							page, true);
 				net->stats.rx_errors++;
 				break;
 			}
 
+			skb_mark_for_recycle(skb);
 			skb_reserve(skb, hdr_size);
 			skb_put(skb, frame_size);
 
@@ -937,6 +936,7 @@ static int tbnet_open(struct net_device *dev)
 	struct tb_ring *ring;
 	unsigned int flags;
 	int hopid;
+	int ret;
 
 	netif_carrier_off(dev);
 
@@ -977,6 +977,27 @@ static int tbnet_open(struct net_device *dev)
 	}
 	net->rx_ring.ring = ring;
 
+	{
+		struct page_pool_params pp_params = {
+			.order = TBNET_RX_PAGE_ORDER,
+			.pool_size = TBNET_RING_SIZE,
+			.nid = NUMA_NO_NODE,
+			.dev = tb_ring_dma_device(ring),
+			.napi = &net->napi,
+			.dma_dir = DMA_FROM_DEVICE,
+			.max_len = TBNET_FRAME_SIZE,
+			.netdev = dev,
+			.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
+		};
+
+		net->rx_ring.pool = page_pool_create(&pp_params);
+		if (IS_ERR(net->rx_ring.pool)) {
+			ret = PTR_ERR(net->rx_ring.pool);
+			net->rx_ring.pool = NULL;
+			goto err_free_rx_ring;
+		}
+	}
+
 	tb_ring_throttling(net->tx_ring.ring, TBNET_THROTTLING);
 	tb_ring_throttling(net->rx_ring.ring, TBNET_THROTTLING);
 
@@ -984,6 +1005,14 @@ static int tbnet_open(struct net_device *dev)
 	start_login(net);
 
 	return 0;
+
+err_free_rx_ring:
+	tb_ring_free(net->rx_ring.ring);
+	net->rx_ring.ring = NULL;
+	tb_xdomain_release_out_hopid(xd, hopid);
+	tb_ring_free(net->tx_ring.ring);
+	net->tx_ring.ring = NULL;
+	return ret;
 }
 
 static int tbnet_stop(struct net_device *dev)
@@ -1001,6 +1030,11 @@ static int tbnet_stop(struct net_device *dev)
 	tb_xdomain_release_out_hopid(net->xd, net->local_transmit_path);
 	tb_ring_free(net->tx_ring.ring);
 	net->tx_ring.ring = NULL;
+
+	if (net->rx_ring.pool) {
+		page_pool_destroy(net->rx_ring.pool);
+		net->rx_ring.pool = NULL;
+	}
 
 	return 0;
 }
