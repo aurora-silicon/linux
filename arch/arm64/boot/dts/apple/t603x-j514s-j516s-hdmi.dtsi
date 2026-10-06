@@ -61,3 +61,11 @@
 		};
 	};
 };
+
+/*
+ * ATC3 has no USB consumer that would hold its common block on, so across
+ * system sleep it would power down and lose the HDMI PHY state.
+ */
+&ps_atc3_common {
+	apple,always-on;
+};
