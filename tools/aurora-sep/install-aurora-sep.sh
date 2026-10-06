@@ -103,13 +103,18 @@
 # uses, leaving interrupts for a dock's other devices. An M3 Air stays kernel-only.
 # 12.0: one release and one kernel for every Mac this script supports; the
 # 11.1xx test builds end here. On the 16" M3 Pro (J516S) the kernel drives
-# external displays on the USB-C and HDMI ports, and its m1n1 moves to
-# aurora8.5, which also hands over the second external display processor. The
-# M3 Type-C PHY changes behind this apply to every M3. Other M3 Pros keep the
-# handoff opt-in (--m3-handoff). An M3 MacBook Air stays kernel-only unless its
-# owner asks with --m3-handoff for m1n1's display handoff with GPU diagnostics
-# (the same aurora8.5; the desktop stays on the boot framebuffer). An Air that
-# has an earlier test build's boot loader must ask again with --m3-handoff.
+# external displays on the USB-C and HDMI ports, and its m1n1 also hands over
+# the second external display processor. The M3 Type-C PHY changes behind this
+# apply to every M3. Other M3 Pros keep the handoff opt-in (--m3-handoff). An
+# M3 MacBook Air stays kernel-only unless its owner asks with --m3-handoff for
+# m1n1's display handoff with GPU diagnostics (the desktop stays on the boot
+# framebuffer). An Air that has an earlier test build's boot loader must ask
+# again with --m3-handoff.
+# Every Mac that gets an m1n1 from this script now gets the same one,
+# m1n1-aurora aurora12: M1 and M2 move to it from aurora3, and the M3s on the
+# handoff path from aurora7 and 8.x. Only the switches in /etc/m1n1.conf
+# differ between Macs. Each Mac's boot.bin is kept on the EFI partition before
+# it is rebuilt, with the steps to put it back.
 # The kernel also describes the Air's internal display and GPU configuration,
 # both inert for now, and the M2 Max Neural Engine cleans up after a failed
 # probe (iconidentify/aurora-linux#37, Joshua Warren). M1, M2 and the Neo
@@ -124,13 +129,17 @@
 # this Mac's own sensor calibration. After the reboot, run
 # aurora-touchid-setup to enrol a finger and use it for sudo and the lock screen.
 #
-# m1n1: m1n1-aurora builds AsahiLinux/m1n1 main (3e354a24), which knows the
-# macOS 26.5 to 27.0 firmware the MacBook Neo ships with, plus three patches:
-# the SEP warm-registration guard and preboot-UUID forwarding from
-# aurora-silicon/m1n1, and the usb4-N-pcie-adapter alias fallback
-# (aurora-silicon/m1n1#4).
+# m1n1: one m1n1-aurora (M1N1_PACKAGE) for every Mac. It builds
+# AsahiLinux/m1n1 main (3e354a24), which knows the macOS 26.5 to 27.0 firmware
+# the MacBook Neo ships with, plus Omarchy's patches: the SEP
+# warm-registration guard and preboot-UUID forwarding from aurora-silicon/m1n1,
+# the usb4-N-pcie-adapter alias fallback (aurora-silicon/m1n1#4), and the M3
+# display and GPU handoff, which stays off unless /etc/m1n1.conf arms it.
+# Before boot.bin is rebuilt with it, the boot.bin the Mac booted with is kept
+# on the EFI partition (keep_bootbin_on_esp). A MacBook Neo keeps its own m1n1
+# unless NEO_AURORA_M1N1 is 1.
 # M3: experimental. linux-aurora goes on. On an M3 Pro model in
-# M3_HANDOFF_BOARDS (or with --m3-handoff), M3_M1N1_PACKAGE replaces m1n1 and
+# M3_HANDOFF_BOARDS (or with --m3-handoff), m1n1-aurora replaces m1n1 and
 # three chosen.asahi,t6030-* lines in /etc/m1n1.conf switch its display and
 # GPU handoff on. Every other M3 keeps m1n1's boot.bin exactly as it is: no
 # m1n1-aurora, no update-m1n1 run, and a freeze on update-m1n1 unless one is
@@ -161,18 +170,17 @@ PACKAGES=(
   "linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst PENDING-12.0-LAB-BUILD"
   "libfprint-1.94.100-1.1-aarch64.pkg.tar.zst bc7d9762db6644f2cfb58ddb209602c1d513845eb1498c098e01f12600fcbdf9"
   "aurora-touchid-20261003-1-any.pkg.tar.zst 29b0360fac8c257d754e64bd1b9c33c487eb2595dd3c31e9138d7a476afa3d64"
-  "m1n1-aurora-1.6.1.aurora3-1-aarch64.pkg.tar.zst bc3451aaa88bc3f4912bc3613f9569aa8f3e05f376fa851fa837b5e2080e8c2f"
 )
-# Only for an M3 on the handoff path (see m3_plan), in place of the m1n1-aurora
-# above: the same m1n1 plus the T6030 display and GPU handoff. aurora8.5 also
-# hands over the second external display processor.
-M3_M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora8.5-2-aarch64.pkg.tar.zst 7bbf89455b9a96487ee05bfef18ee3e5c8ec57c1af3f97fc15548774d5e92a44"
-# Only for an M3 MacBook Air on the handoff path, in place of the m1n1-aurora
-# above: m1n1-aurora with the T8122 switches, as "file sha256". From aurora8.5
-# one M3 m1n1 carries both, so this names the same package as M3_M1N1_PACKAGE.
-# Left empty, an Air stays kernel-only and --m3-handoff on an Air stops with
-# nothing installed.
-M3_AIR_M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora8.5-2-aarch64.pkg.tar.zst 7bbf89455b9a96487ee05bfef18ee3e5c8ec57c1af3f97fc15548774d5e92a44"
+# The one m1n1 for every Mac, as "file sha256": M1 and M2, an M3 on the handoff
+# path (see m3_plan), and the MacBook Neo once NEO_AURORA_M1N1 is 1. Macs differ
+# only in the switches /etc/m1n1.conf arms (m3_switches), never in the binary.
+M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora12-1-aarch64.pkg.tar.zst PENDING-AURORA12-BUILD"
+# 0: a MacBook Neo keeps its own m1n1 (its M1N1= and U_BOOT= in
+# /etc/default/update-m1n1), as before 12.0. 1: it gets M1N1_PACKAGE like every
+# other Mac, and update-m1n1 builds its boot.bin from that m1n1 and the Neo's
+# own U-Boot. Set it to 1 only once M1N1_PACKAGE carries every patch of the
+# Neo's own m1n1 (aurora-silicon/m1n1, J700) and has booted on a Neo.
+NEO_AURORA_M1N1=0
 PINNED="linux-aurora linux-aurora-headers libfprint m1n1-aurora"
 PIN_BEGIN="# >>> aurora-sep pin (remove with: install-aurora-sep.sh --uninstall)"
 PIN_END="# <<< aurora-sep pin"
@@ -302,16 +310,16 @@ is_m3_air() {
 #            kernel's device trees arrive. --uninstall lifts it.
 #   handoff  An M3 Pro model in M3_HANDOFF_BOARDS on the tested stub, or any M3
 #            Pro whose owner asked for it with --m3-handoff. It gets
-#            M3_M1N1_PACKAGE, whose T6030 display and GPU handoff (from
+#            M1N1_PACKAGE, whose T6030 display and GPU handoff (from
 #            iconidentify/m3-m1n1) stays off unless boot.bin ends with the
 #            three M3_SWITCHES lines; update-m1n1 copies chosen.* lines from
 #            /etc/m1n1.conf into every rebuild, so they survive updates.
-#            An M3 MacBook Air takes the same path with its own m1n1
-#            (M3_AIR_M1N1_PACKAGE) and switches (m3_switches): the display
-#            handoff with GPU diagnostics, and only with --m3-handoff until
-#            its board is in M3_HANDOFF_BOARDS.
-# M1, M2 and the Neo keep the m1n1-aurora in PACKAGES: only an M3 on the
-# handoff path gets the newer m1n1.
+#            An M3 MacBook Air takes the same path with the same m1n1 and its
+#            own switches (m3_switches): the display handoff with GPU
+#            diagnostics, and only with --m3-handoff until its board is in
+#            M3_HANDOFF_BOARDS.
+# M1 and M2 get the same M1N1_PACKAGE with no switches; the Neo keeps its own
+# m1n1 unless NEO_AURORA_M1N1 is 1.
 UPDATE_M1N1_CONF=/etc/default/update-m1n1
 M3_FREEZE_BEGIN="# >>> aurora-sep: keep this M3's boot.bin as it is (remove with: install-aurora-sep.sh --uninstall)"
 M3_FREEZE_END="# <<< aurora-sep: keep this M3's boot.bin as it is"
@@ -359,6 +367,12 @@ M3_STUB_IBOOT=iBoot-10151.140.19
 # m1n1. That has only been seen with these stage 1 versions, as m1n1 reports
 # them in /chosen/asahi,m1n1-stage1-version; the handoff is refused with any
 # other, and on a Mac that reports none.
+# The check is for M3s only. That log buffer placement is the M3's; on M1 and
+# M2 nothing has been seen at that offset, and they have booted aurora3, whose
+# file part reached about 0x110000, from every stage 1 in the field since 11.x.
+# M1N1_PACKAGE is linked to end its file part below 0x120000 (0xe0000 for the
+# aurora8.5 line it comes from), so a stage 1 allowlist there would only
+# refuse Macs that boot today.
 M3_STAGE1_VERSIONS="v1.6.1-dirty"
 # m1n1 (aurora8.5-2 and later) adds this node when one of those log buffers
 # overlaps where stage 1 loaded it. It keeps the buffer reserved and boots on,
@@ -489,15 +503,22 @@ m3_switches() {
   fi
 }
 
-# This Mac's m1n1 package on the handoff path, as "file sha256".
-m3_m1n1_package() {
-  if is_m3_air; then echo "$M3_AIR_M1N1_PACKAGE"; else echo "$M3_M1N1_PACKAGE"; fi
+# Whether this run puts M1N1_PACKAGE on this Mac: M1 and M2, an M3 on the
+# handoff path, and a MacBook Neo only with NEO_AURORA_M1N1=1. Needs m3_plan
+# first.
+m1n1_for_this_mac() {
+  if is_neo; then
+    [[ $NEO_AURORA_M1N1 == 1 ]]
+  elif [[ $M3_MODE != none ]]; then
+    [[ $M3_MODE == handoff ]]
+  fi
 }
 
-# Whether this release carries an m1n1 for the M3 Air: a whole "file sha256"
-# entry, not the empty placeholder.
-m3_air_package_ok() {
-  [[ $M3_AIR_M1N1_PACKAGE =~ ^m1n1-aurora-[^[:space:]]+-aarch64\.pkg\.tar\.zst\ [0-9a-f]{64}$ ]]
+# M1N1_PACKAGE's version, as pacman prints it: 1.6.1.aurora12-1.
+m1n1_version() {
+  local file=${M1N1_PACKAGE%% *}
+  file=${file#m1n1-aurora-}
+  echo "${file%-aarch64.pkg.tar.zst}"
 }
 
 # What the handoff does on this Mac, for messages.
@@ -731,16 +752,7 @@ m3_plan() {
   M3_MODE=kernel
   if ((air)); then
     # Never by default: a plain run gives an Air the handoff only once its
-    # board is in M3_HANDOFF_BOARDS, and never without this release's m1n1.
-    if ! m3_air_package_ok; then
-      ((M3_TRY == 0)) || die "--m3-handoff: this release has no m1n1 with the M3 MacBook Air GPU
-    handoff yet, so it can't switch it on. Nothing was installed. (--uninstall puts the stock
-    m1n1 back on an Air that has the handoff from an earlier test build.)"
-      say "M3 MacBook Air ($board): installing the kernel only. This release has no m1n1 with the
-    GPU handoff for the Air, so boot.bin stays as it is and the display runs on the boot
-    framebuffer."
-      return 0
-    fi
+    # board is in M3_HANDOFF_BOARDS.
     if ! is_m3_handoff_board && ((M3_TRY == 0)); then
       say "M3 MacBook Air ($board): installing the kernel only, and boot.bin stays as it is. m1n1's
     $(m3_handoff_name) for the Air is being tested and is not on by default. To help test it
@@ -864,15 +876,28 @@ this_board() {
   tr '\0' '\n' <"$DT/compatible" 2>/dev/null | sed -n '1s/^apple,//p'
 }
 
-# Before anything rebuilds boot.bin on such a board, keep the one this boot
-# came up on next to it on the EFI partition, where macOS can reach it, and
-# say how to put it back. A later run keeps the first copy.
-unproven_board_backup() {
+# Before anything rebuilds boot.bin with this release's m1n1 (every Mac that
+# m1n1_for_this_mac names), keep the one this boot came up on next to it on the
+# EFI partition, where macOS can reach it, and say how to put it back. A later
+# run of the same release keeps the first copy.
+bootbin_backup() {
   local board
+  m1n1_for_this_mac || return 0
   board=$(this_board)
-  [[ -n $board && " $UNPROVEN_SEP_BOARDS " == *" $board "* ]] || return 0
-  keep_bootbin_on_esp "Touch ID on this Mac model ($board) is new in $VERSION, and nobody has
-    booted it on this model yet."
+  if [[ $M3_MODE == handoff ]] && is_m3_air; then
+    keep_bootbin_on_esp "This replaces the boot loader of this M3 MacBook Air ($board)
+    with m1n1-aurora and its $(m3_handoff_name)."
+  elif [[ $M3_MODE == handoff ]]; then
+    keep_bootbin_on_esp "This replaces the boot loader of this M3 Pro ($board) with
+    m1n1-aurora and its display and GPU handoff."
+  elif [[ -n $board && " $UNPROVEN_SEP_BOARDS " == *" $board "* ]]; then
+    keep_bootbin_on_esp "Touch ID on this Mac model ($board) is new in $VERSION, and nobody has
+    booted it on this model yet. This also replaces its boot loader with m1n1-aurora
+    $(m1n1_version), the one m1n1 every Mac gets from $VERSION on."
+  else
+    keep_bootbin_on_esp "This replaces this Mac's boot loader with m1n1-aurora $(m1n1_version),
+    the one m1n1 every Mac gets from $VERSION on."
+  fi
 }
 
 # Replace a file on the EFI partition without ever leaving a partial one in
@@ -1042,14 +1067,21 @@ EOF
 # Point it at whatever directory linux-aurora owns, now and after its updates.
 m1n1_update() {
   local target conf=$UPDATE_M1N1_CONF tmp
+  local -a drop=(-e '/^# aurora-sep: build m1n1/,/^DTBS=/d' -e '/^DTBS=/d')
   [[ -f $conf && ! -f $STATE/update-m1n1.default.saved ]] &&
     $sudo cp "$conf" "$STATE/update-m1n1.default.saved"
   # Replace only the DTBS setting and keep the rest of the file: a MacBook
   # Neo's M1N1= and U_BOOT= point at its own J700 builds, and dropping them
-  # would rebuild boot.bin from an m1n1 that cannot boot it.
+  # would rebuild boot.bin from an m1n1 that cannot boot it. A Neo on
+  # M1N1_PACKAGE (NEO_AURORA_M1N1=1) drops only its M1N1=, so update-m1n1
+  # takes the packaged m1n1 with the Neo's own U-Boot. --uninstall puts the
+  # saved file back.
+  if is_neo && [[ $NEO_AURORA_M1N1 == 1 ]]; then
+    drop+=(-e '/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}M1N1=/d')
+  fi
   tmp=$(mktemp)
   if [[ -f $conf ]]; then
-    $sudo sed -e '/^# aurora-sep: build m1n1/,/^DTBS=/d' -e '/^DTBS=/d' "$conf" >"$tmp"
+    $sudo sed "${drop[@]}" "$conf" >"$tmp"
   fi
   cat >>"$tmp" <<'EOF'
 # aurora-sep: build m1n1's stage 2 from the device trees the installed
@@ -1304,17 +1336,11 @@ snapshot_boot_state() {
   return 0
 }
 
-# The packages this Mac gets, one "file sha256" per line: PACKAGES, except
-# that a Neo keeps its own m1n1, and an M3 gets its handoff m1n1
-# (m3_m1n1_package) on the handoff path and no m1n1 otherwise. Needs m3_plan
-# first.
+# The packages this Mac gets, one "file sha256" per line: PACKAGES, and
+# M1N1_PACKAGE where m1n1_for_this_mac says so. Needs m3_plan first.
 packages_for_this_mac() {
-  local entry
-  for entry in "${PACKAGES[@]}"; do
-    if [[ $entry == m1n1-aurora-* ]] && { is_neo || [[ $M3_MODE != none ]]; }; then continue; fi
-    echo "$entry"
-  done
-  if [[ $M3_MODE == handoff ]]; then m3_m1n1_package; fi
+  printf '%s\n' "${PACKAGES[@]}"
+  if m1n1_for_this_mac; then echo "$M1N1_PACKAGE"; fi
   return 0
 }
 
@@ -1331,7 +1357,7 @@ install_all() {
   m3_plan
   work=$(mktemp -d)
   trap 'rm -rf "${work:-}"' EXIT
-  if is_neo; then say "Keeping this MacBook Neo's own m1n1 (m1n1-aurora has no T8140 support)"; fi
+  if is_neo && ! m1n1_for_this_mac; then say "Keeping this MacBook Neo's own m1n1 (m1n1-aurora has no T8140 support)"; fi
   if [[ $M3_MODE == kernel ]]; then say "Keeping this M3's own m1n1 and boot.bin"; fi
   mapfile -t entries < <(packages_for_this_mac)
   for entry in "${entries[@]}"; do
@@ -1345,22 +1371,14 @@ install_all() {
     [[ $(sha256sum "$work/$file" | cut -d' ' -f1) == "$sha" ]] || die "$file does not match its published checksum"
   done
   if [[ $M3_MODE == handoff ]]; then
-    entry=$(m3_m1n1_package)
-    m1n1_pkg_has_handoff "$work/${entry%% *}" ||
-      die "this release's M3 m1n1 has no $(m3_handoff_name), so it can't switch it
+    m1n1_pkg_has_handoff "$work/${M1N1_PACKAGE%% *}" ||
+      die "this release's m1n1 has no $(m3_handoff_name), so it can't switch it
     on. Nothing was installed. Please report it at https://github.com/iconidentify/aurora-linux/issues"
   fi
 
   snapshot "aurora-sep $VERSION"
   # Before pacman's update-m1n1 hook rebuilds boot.bin below.
-  is_neo || unproven_board_backup
-  if [[ $M3_MODE == handoff ]] && is_m3_air; then
-    keep_bootbin_on_esp "This replaces the boot loader of this M3 MacBook Air ($(this_board))
-    with m1n1-aurora and its $(m3_handoff_name)."
-  elif [[ $M3_MODE == handoff ]]; then
-    keep_bootbin_on_esp "This replaces the boot loader of this M3 Pro ($(this_board)) with
-    m1n1-aurora and its display and GPU handoff."
-  fi
+  bootbin_backup
   $sudo install -d "$STATE"
   snapshot_boot_state
   if [[ ! -f $STATE/previous && $chain == grub ]]; then
@@ -1513,7 +1531,10 @@ uninstall_all() {
   remove_pin
   snapshot "removing aurora-sep"
   local m1n1=m1n1
-  if is_neo; then
+  # A Neo keeps its own m1n1, unless it got m1n1-aurora (NEO_AURORA_M1N1):
+  # then the stock m1n1 package goes back, and its own M1N1= with the saved
+  # update-m1n1 configuration below.
+  if is_neo && { [[ $NEO_AURORA_M1N1 != 1 ]] || ! pacman -Q m1n1-aurora >/dev/null 2>&1; }; then
     m1n1=
     say "Reinstalling $previous and the stock libfprint; this MacBook Neo keeps its own m1n1"
   elif [[ $m3_mode == kernel ]]; then

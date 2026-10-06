@@ -2,9 +2,12 @@
 
 The real functions run; pacman, update-m1n1, curl, findmnt and systemctl are
 small stubs that record what happened. The fake update-m1n1 behaves like the
-real one where it matters here: it honours M1N1_UPDATE_DISABLED, builds
-boot.bin from the installed m1n1 and device trees, and appends /etc/m1n1.conf's
-chosen.* lines. pacman -U and the m1n1/kernel installs run it, as the hooks do.
+real one where it matters here: it honours M1N1_UPDATE_DISABLED and M1N1=,
+builds boot.bin from the installed m1n1 and device trees, and appends
+/etc/m1n1.conf's chosen.* lines. pacman -U and the m1n1/kernel installs run it,
+as the hooks do. pacman -U installs a package's own m1n1.bin, so boot.bin
+starts with the bytes of the package the installer downloaded; every fixture
+m1n1.bin starts with "M1N1:<package name>".
 """
 from pathlib import Path
 import hashlib
@@ -16,8 +19,15 @@ import tempfile
 import unittest
 
 INSTALLER = Path(__file__).resolve().parent.parent / "install-aurora-sep.sh"
+SRC = INSTALLER.read_text()
 # The installer's VERSION names the boot.bin copy it keeps on the EFI partition.
-VERSION = re.search(r"^VERSION=(\S+)$", INSTALLER.read_text(), re.M).group(1)
+VERSION = re.search(r"^VERSION=(\S+)$", SRC, re.M).group(1)
+# The one m1n1 package every Mac gets, by the name this release ships.
+M1N1_PKG = re.search(r'^M1N1_PACKAGE="(\S+) ', SRC, re.M).group(1)
+M1N1_BASE = M1N1_PKG[:-len("-aarch64.pkg.tar.zst")]
+# Every switch name the shipped m1n1 has to know: the M3 Pro's and the Air's.
+SWITCH_NAMES = sorted({w[len("chosen."):].split("=")[0]
+                       for w in re.findall(r"chosen\.asahi,t(?:6030|8122)-[a-z0-9-]+=1", SRC)})
 
 BOARDS = {
     "j516s": ["apple,j516s", "apple,t6030", "apple,arm-platform"],
@@ -26,6 +36,10 @@ BOARDS = {
     "j615": ["apple,j615", "apple,t8122", "apple,arm-platform"],
     "j504": ["apple,j504", "apple,t8122", "apple,arm-platform"],
     "j314s": ["apple,j314s", "apple,t6000", "apple,arm-platform"],
+    "j293": ["apple,j293", "apple,t8103", "apple,arm-platform"],
+    "j314c": ["apple,j314c", "apple,t6001", "apple,arm-platform"],
+    "j414s": ["apple,j414s", "apple,t6020", "apple,arm-platform"],
+    "j700": ["apple,j700", "apple,t8140", "apple,arm-platform"],
 }
 SWITCHES = b"chosen.asahi,t6030-gpu=1\nchosen.asahi,t6030-dcp=1\nchosen.asahi,t6030-dcpext=1\n"
 BRINGUP_FREEZE = (
@@ -38,7 +52,7 @@ OUR_FREEZE = (
     "M1N1_UPDATE_DISABLED=1\n"
     "# <<< aurora-sep: keep this M3's boot.bin as it is\n"
 )
-AURORA3 = "m1n1-aurora-1.6.1.aurora3-1-aarch64.pkg.tar.zst"
+# An older M3 m1n1 that knows only the M3 Pro's switches.
 AURORA6 = "m1n1-aurora-1.6.1.aurora6-1-aarch64.pkg.tar.zst"
 OTHERS = [
     "linux-aurora-7.1.12.aurora2-11.36-aarch64.pkg.tar.zst",
@@ -71,7 +85,7 @@ case $op in
       [[ $f == -* || $f == 4 ]] && continue
       b=$(basename "$f")
       case $b in
-        m1n1-aurora-*) echo "${b%-aarch64.pkg.tar.zst}" >"$FAKE/m1n1"; printf 'M1N1:%s\n' "${b%-aarch64.pkg.tar.zst}" >"$FAKE/m1n1.bin" ;;
+        m1n1-aurora-*) echo "${b%-aarch64.pkg.tar.zst}" >"$FAKE/m1n1"; bsdtar -xOf "$f" usr/lib/asahi-boot/m1n1.bin >"$FAKE/m1n1.bin" ;;
         linux-aurora-headers-*) ;;
         linux-aurora-*) sed -i '/^linux-asahi$/d' "$FAKE/installed"; echo linux-aurora >>"$FAKE/installed" ;;
       esac
@@ -104,8 +118,9 @@ if [[ -f $FAKE_UPDATE_CONF ]]; then
   fi
 fi
 dtbs=$(sh -c 'set -e; DTBS=; [ -f "$1" ] && . "$1"; echo "$DTBS"' _ "$FAKE_UPDATE_CONF")
+m1n1=$(sh -c 'set -e; M1N1=; [ -f "$1" ] && . "$1"; echo "$M1N1"' _ "$FAKE_UPDATE_CONF")
 {
-  cat "$FAKE/m1n1.bin"
+  cat "${m1n1:-$FAKE/m1n1.bin}"
   printf 'DTBS:%s\n' "${dtbs:-asahi}"
   printf 'UBOOT'
   grep -E '^chosen\.' "$FAKE_M1N1_CONF" 2>/dev/null || true
@@ -146,10 +161,13 @@ class M3FlowBase(unittest.TestCase):
             (self.tmp / "bin" / name).chmod(0o755)
         self.extra_env = {}
         self.shas = {}
+        self.bin_shas = {}
         for name in OTHERS:
             self.fixture(name, name.encode())
-        self.fixture(AURORA3, None, [])
+        self.fixture(M1N1_PKG, None, SWITCH_NAMES)
         self.fixture(AURORA6, None, ["asahi,t6030-gpu", "asahi,t6030-dcp", "asahi,t6030-dcpext"])
+        # The m1n1 package every Mac gets in this fake release.
+        self.m1n1_pkg = M1N1_PKG
 
     def fixture(self, name, data, strings=None):
         path = self.tmp / "pkgs" / name
@@ -157,10 +175,14 @@ class M3FlowBase(unittest.TestCase):
             path.write_bytes(data)
         else:
             root = self.tmp / ("root-" + name)
+            shutil.rmtree(root, ignore_errors=True)
             (root / "usr/lib/asahi-boot").mkdir(parents=True)
-            (root / "usr/lib/asahi-boot/m1n1.bin").write_bytes(
-                b"m1n1\0" + b"\0".join(s.encode() for s in strings) + b"\0end" + bytes(range(256)) * 4096)
+            base = name.removesuffix("-aarch64.pkg.tar.zst").removesuffix(".pkg.tar.zst")
+            m1n1 = (b"M1N1:" + base.encode() + b"\n" + b"m1n1\0" + b"\0".join(s.encode() for s in strings)
+                    + b"\0end" + bytes(range(256)) * 4096)
+            (root / "usr/lib/asahi-boot/m1n1.bin").write_bytes(m1n1)
             subprocess.run(["bsdtar", "--zstd", "-cf", str(path), "-C", str(root), "usr"], check=True)
+            self.bin_shas[name] = hashlib.sha256(m1n1).hexdigest()
         self.shas[name] = hashlib.sha256(path.read_bytes()).hexdigest()
 
     def mac(self, board, kernel="linux-asahi", m1n1="m1n1-stock", bootbin=b"M1N1:original\n",
@@ -181,7 +203,7 @@ class M3FlowBase(unittest.TestCase):
         self.boot.write_bytes(bootbin)
 
     def run_sh(self, body, check=True):
-        pkgs = "\n".join(f'  "{n} {self.shas[n]}"' for n in OTHERS + [AURORA3])
+        pkgs = "\n".join(f'  "{n} {self.shas[n]}"' for n in OTHERS)
         script = f"""
 set -euo pipefail
 AURORA_SEP_SOURCE_ONLY=1 source '{INSTALLER}'
@@ -196,7 +218,7 @@ M1N1_BIN='{self.fake}/m1n1.bin'
 PACKAGES=(
 {pkgs}
 )
-M3_M1N1_PACKAGE="{AURORA6} {self.shas[AURORA6]}"
+M1N1_PACKAGE="{self.m1n1_pkg} {self.shas[self.m1n1_pkg]}"
 esp_bootbin() {{ echo '{self.boot}'; }}
 version_notice() {{ :; }}; sep_write_notice() {{ :; }}; ane_dkms_notice() {{ :; }}
 snapshot() {{ :; }}; add_pin() {{ :; }}; remove_pin() {{ :; }}
@@ -239,10 +261,9 @@ class M3FlowTest(M3FlowBase):
         self.assertIn("built-in display at its native resolution", out)
         self.assertNotIn("run:  aurora-touchid-setup", out)
         boot = self.boot.read_bytes()
-        self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora6-1\n"), boot)
-        self.assertTrue(boot.endswith(SWITCHES), boot)
-        self.assertIn(AURORA6, self.downloaded())
-        self.assertNotIn(AURORA3, self.downloaded())
+        self.assertTrue(boot.startswith(b"M1N1:" + M1N1_BASE.encode() + b"\n"), boot[:80])
+        self.assertTrue(boot.endswith(SWITCHES), boot[-200:])
+        self.assertEqual([d for d in self.downloaded() if d.startswith("m1n1-")], [M1N1_PKG])
         self.assertEqual(self.kept_copy().read_bytes(), b"M1N1:original\n")
         self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff t6030")
         self.assertFalse(self.update_conf.read_text().count("M1N1_UPDATE_DISABLED"))
@@ -259,7 +280,7 @@ class M3FlowTest(M3FlowBase):
         self.update_conf.write_text(OUR_FREEZE)
         self.install()
         boot = self.boot.read_bytes()
-        self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora6-1\n"), boot)
+        self.assertTrue(boot.startswith(b"M1N1:" + M1N1_BASE.encode() + b"\n"), boot[:80])
         self.assertTrue(boot.endswith(SWITCHES), boot)
         self.assertNotIn("M1N1_UPDATE_DISABLED", self.update_conf.read_text())
 
@@ -271,7 +292,7 @@ class M3FlowTest(M3FlowBase):
         marker.touch()
         self.install()
         boot = self.boot.read_bytes()
-        self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora6-1\n"), boot)
+        self.assertTrue(boot.startswith(b"M1N1:" + M1N1_BASE.encode() + b"\n"), boot[:80])
         self.assertTrue(boot.endswith(SWITCHES))
         # The hook ran while the bring-up freeze still held, so the first
         # rebuild is the installer's own, with the new m1n1 in place.
@@ -372,7 +393,7 @@ class M3FlowTest(M3FlowBase):
         proc = self.install()
         self.assertNotIn("stage 1", proc.stderr + proc.stdout)
         self.assertNotIn("overlaps", proc.stderr + proc.stdout)
-        self.assertTrue(self.boot.read_bytes().startswith(b"M1N1:m1n1-aurora-1.6.1.aurora3-1\n"))
+        self.assertTrue(self.boot.read_bytes().startswith(b"M1N1:" + M1N1_BASE.encode() + b"\n"))
 
     def test_trial_refused_on_an_m3(self):
         # A plain M3 that isn't an Air (the Air's opt-in is in test_m3_air.py).
@@ -463,19 +484,79 @@ class M3FlowTest(M3FlowBase):
         (self.state / "m3-mode").write_text("")
         self.uninstall()
 
-    # M1/M2 are unchanged: aurora3, no switches, no M3 state
+    # M1/M2: the same m1n1 as every Mac, no switches, no M3 state, and the
+    # boot.bin they booted with kept first
 
-    def test_m1_pro_unchanged(self):
+    def test_m1_pro_gets_the_one_m1n1(self):
         self.mac("j314s")
-        out = self.install().stdout
+        proc = self.install()
+        out = proc.stdout
         self.assertIn("run:  aurora-touchid-setup", out)
         boot = self.boot.read_bytes()
-        self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora3-1\n"), boot)
+        self.assertTrue(boot.startswith(b"M1N1:" + M1N1_BASE.encode() + b"\n"), boot[:80])
         self.assertNotIn(b"chosen.", boot)
-        self.assertIn(AURORA3, self.downloaded())
-        self.assertNotIn(AURORA6, self.downloaded())
+        self.assertEqual([d for d in self.downloaded() if d.startswith("m1n1-")], [M1N1_PKG])
         self.assertFalse((self.state / "m3-mode").exists())
         self.assertFalse(self.m1n1_conf.exists())
+        # The safety net every Mac whose boot loader changes gets.
+        self.assertEqual(self.kept_copy().read_bytes(), b"M1N1:original\n")
+        self.assertIn("put the\n    boot loader it booted with back from macOS", proc.stderr)
+        self.assertIn("m1n1-aurora " + M1N1_BASE[len("m1n1-aurora-"):], proc.stderr)
+        self.uninstall()
+        self.assertTrue(self.boot.read_bytes().startswith(b"M1N1:m1n1-stock\n"))
+
+    def test_every_mac_gets_the_same_m1n1(self):
+        # M1, M2 and the M3s on the handoff path: one package, and only the
+        # switches differ.
+        for board, try_, switches in [("j293", 0, b""), ("j314s", 0, b""), ("j414s", 0, b""),
+                                      ("j516s", 0, SWITCHES), ("j514s", 1, SWITCHES)]:
+            with self.subTest(board=board):
+                shutil.rmtree(self.state)
+                self.state.mkdir()
+                self.m1n1_conf.unlink(missing_ok=True)
+                self.update_conf.unlink(missing_ok=True)
+                self.mac(board)
+                self.install(try_=try_)
+                boot = self.boot.read_bytes()
+                self.assertTrue(boot.startswith(b"M1N1:" + M1N1_BASE.encode() + b"\n"), boot[:80])
+                self.assertTrue(boot.endswith(b"UBOOT" + switches), boot[-200:])
+                self.assertEqual([d for d in self.downloaded() if d.startswith("m1n1-")], [M1N1_PKG])
+
+    # The MacBook Neo keeps its own m1n1 until NEO_AURORA_M1N1 is 1
+
+    NEO_CONF = "M1N1=__NEO__\nU_BOOT=/usr/lib/neo/u-boot.bin\n"
+
+    def neo(self):
+        own = self.tmp / "neo-m1n1.bin"
+        own.write_bytes(b"M1N1:neo-own\n")
+        self.mac("j700", m1n1="m1n1-stock")
+        conf = self.NEO_CONF.replace("__NEO__", str(own))
+        self.update_conf.write_text(conf)
+        return conf
+
+    def test_neo_keeps_its_own_m1n1(self):
+        conf = self.neo()
+        out = self.install().stdout
+        self.assertIn("Keeping this MacBook Neo's own m1n1", out)
+        self.assertEqual([d for d in self.downloaded() if d.startswith("m1n1-")], [])
+        self.assertTrue(self.boot.read_bytes().startswith(b"M1N1:neo-own\n"))
+        self.assertIn(conf, self.update_conf.read_text())
+        self.assertFalse(self.kept_copy().exists())
+
+    def test_neo_on_the_one_m1n1_with_the_switch(self):
+        conf = self.neo()
+        proc = self.install(env="NEO_AURORA_M1N1=1")
+        self.assertNotIn("own m1n1", proc.stdout)
+        self.assertEqual([d for d in self.downloaded() if d.startswith("m1n1-")], [M1N1_PKG])
+        self.assertTrue(self.boot.read_bytes().startswith(b"M1N1:" + M1N1_BASE.encode() + b"\n"))
+        text = self.update_conf.read_text()
+        self.assertNotIn("M1N1=", text.replace("M1N1_UPDATE", ""))
+        self.assertIn("U_BOOT=/usr/lib/neo/u-boot.bin", text)
+        self.assertEqual(self.kept_copy().read_bytes(), b"M1N1:original\n")
+        self.run_sh("NEO_AURORA_M1N1=1\nuninstall_all")
+        self.assertEqual(self.update_conf.read_text(), conf)
+        self.assertTrue(self.boot.read_bytes().startswith(b"M1N1:neo-own\n"))
+        self.assertIn("libfprint m1n1", self.log())
 
 
 if __name__ == "__main__":

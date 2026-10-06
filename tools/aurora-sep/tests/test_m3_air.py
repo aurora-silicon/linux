@@ -1,11 +1,11 @@
 """The installer's M3 MacBook Air (T8122) path, against the fake Mac of test_m3_flow.
 
 An Air stays kernel-only unless its owner asks for m1n1's GPU handoff with
---m3-handoff, and then only when the release carries M3_AIR_M1N1_PACKAGE.
-The handoff writes chosen.asahi,t8122-gpu=1 (and chosen.asahi,t8122-dcp=1
-only with M3_AIR_DCP=1) to /etc/m1n1.conf. Every case sets
-M3_AIR_M1N1_PACKAGE and M3_AIR_DRY_RUN itself, so the tests don't depend on
-what the installer ships with. M3AirDryRunTest covers the dry run, which
+--m3-handoff. It then gets the one m1n1 every Mac gets (M1N1_PACKAGE), and
+the handoff writes chosen.asahi,t8122-gpu=1 (and chosen.asahi,t8122-dcp=1
+only with M3_AIR_DCP=1) to /etc/m1n1.conf. Every case sets the m1n1 package
+and M3_AIR_DRY_RUN itself, so the tests don't depend on what the installer
+ships with. M3AirDryRunTest covers the dry run, which
 writes M3_AIR_DRY_RUN_SWITCHES instead, and the display handoff
 (M3_AIR_DISPLAY_HANDOFF=1), which writes the same switches under its own
 variant name.
@@ -42,14 +42,17 @@ class M3AirTest(flow.M3FlowBase):
         # aurora8: the T6030 handoff plus the T8122 GPU and display switches.
         self.fixture(AURORA8, None, ["asahi,t6030-gpu", "asahi,t6030-dcp", "asahi,t6030-dcpext",
                                      "asahi,t8122-gpu", "asahi,t8122-dcp"])
-        self.air_pkg = f"{AURORA8} {self.shas[AURORA8]}"
+        # The one m1n1 every Mac of this fake release gets.
+        self.m1n1_pkg = AURORA8
 
     dry_run = 0
 
     def sh(self, body, pkg=None, dcp=0, boards=None, check=True, display=0, variant=None):
-        pkg = self.air_pkg if pkg is None else pkg
-        pre = (f'M3_AIR_M1N1_PACKAGE="{pkg}"\nM3_AIR_DCP={dcp}\nM3_AIR_DRY_RUN={self.dry_run}\n'
+        # pkg: another fixture as this release's one m1n1 package.
+        pre = (f'M3_AIR_DCP={dcp}\nM3_AIR_DRY_RUN={self.dry_run}\n'
                f'M3_AIR_DISPLAY_HANDOFF={display}\n')
+        if pkg is not None:
+            pre += f'M1N1_PACKAGE="{pkg} {self.shas[pkg]}"\n'
         if variant is not None:
             pre += f'M3_AIR_DISPLAY_VARIANT={variant}\n'
         if boards is not None:
@@ -105,21 +108,7 @@ class M3AirTest(flow.M3FlowBase):
         self.assertEqual(sorted(airs), ["j613", "j615"])
         self.assertFalse(set(listed) & set(airs), listed)
 
-    def test_a_listed_air_needs_its_package(self):
-        listed = set(shell_value("M3_HANDOFF_BOARDS").split())
-        if listed & set(shell_value("M3_AIR_BOARDS").split()):
-            self.mac("j613")
-            self.assertEqual(self.run_sh("m3_air_package_ok && echo yes || echo no").stdout.strip(), "yes")
 
-    def test_package_placeholder(self):
-        self.mac("j613")
-        good = "m1n1-aurora-1.6.1.aurora8-1-aarch64.pkg.tar.zst " + "a" * 64
-        for pkg, want in [("", "no"), ("TODO", "no"), ("m1n1-aurora-1.6.1.aurora8-1-aarch64.pkg.tar.zst", "no"),
-                          ("m1n1-aurora-1.6.1.aurora8-1-aarch64.pkg.tar.zst abc", "no"),
-                          ("linux-aurora-x-aarch64.pkg.tar.zst " + "a" * 64, "no"),
-                          (good + " extra", "no"), (good, "yes")]:
-            with self.subTest(pkg=pkg):
-                self.assertEqual(self.sh("m3_air_package_ok && echo yes || echo no", pkg=pkg).stdout.strip(), want)
 
     # Plan
 
@@ -127,11 +116,9 @@ class M3AirTest(flow.M3FlowBase):
         for board, stub, try_, pkg, boards, want in [
             ("j613", "14.8.3", 0, None, None, "kernel"),        # never by default
             ("j615", "14.8.3", 0, None, None, "kernel"),
-            ("j613", "14.8.3", 0, "", None, "kernel"),          # no Air m1n1 in this release
             ("j613", "14.8.3", 1, None, None, "handoff"),       # the owner asked
             ("j615", "14.8.3", 1, None, None, "handoff"),
             ("j613", "14.8.3", 0, None, "j516s j613", "handoff"),   # listed later
-            ("j613", "14.8.3", 0, "", "j516s j613", "kernel"),      # listed, but no m1n1
             ("j613", "15.6", 0, None, "j516s j613", "kernel"),      # listed, other stub
         ]:
             with self.subTest(board=board, stub=stub, try_=try_, pkg=pkg, boards=boards):
@@ -141,14 +128,12 @@ class M3AirTest(flow.M3FlowBase):
     def test_plan_messages(self):
         self.mac("j613")
         self.assertIn("case D", self.sh("m3_plan").stdout)
-        self.assertIn("has no m1n1 with the", self.sh("m3_plan", pkg="").stdout)
         err = self.sh("M3_TRY=1\nm3_plan").stderr
         self.assertIn("in testing", err)
         self.assertIn("desktop keeps", err)
 
     def test_plan_try_refused(self):
-        for board, stub, pkg, why in [("j613", "14.8.3", "", "no m1n1 with the M3 MacBook Air GPU"),
-                                      ("j613", "15.6", None, "stub is 15.6"),
+        for board, stub, pkg, why in [("j613", "15.6", None, "stub is 15.6"),
                                       ("j504", "14.8.3", None, "M3 MacBook Air (j613, j615)")]:
             with self.subTest(board=board, stub=stub, pkg=pkg):
                 self.mac(board, stub=stub)
@@ -217,7 +202,7 @@ class M3AirTest(flow.M3FlowBase):
 
     def test_packages(self):
         for board, try_, pkg, want in [("j613", 0, None, None), ("j613", 1, None, AURORA8),
-                                       ("j613", 0, "", None), ("j516s", 0, None, flow.AURORA6)]:
+                                       ("j516s", 0, None, AURORA8), ("j314s", 0, None, AURORA8)]:
             with self.subTest(board=board, try_=try_, pkg=pkg):
                 self.mac(board)
                 out = self.sh(f"M3_TRY={try_}\nm3_plan >/dev/null 2>&1\npackages_for_this_mac", pkg=pkg).stdout
@@ -251,11 +236,9 @@ class M3AirTest(flow.M3FlowBase):
         boot = self.boot.read_bytes()
         self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora8-1\n"), boot)
         self.assertTrue(boot.endswith(b"UBOOT" + AIR_GPU), boot)
-        self.assertNotIn(b"t6030", boot)
-        self.assertNotIn(b"t8122-dcp", boot)
-        self.assertEqual(self.downloaded().count(AURORA8), 1)
-        self.assertNotIn(flow.AURORA3, self.downloaded())
-        self.assertNotIn(flow.AURORA6, self.downloaded())
+        self.assertNotIn(b"t6030", boot.split(b"UBOOT")[-1])
+        self.assertNotIn(b"t8122-dcp", boot.split(b"UBOOT")[-1])
+        self.assertEqual([d for d in self.downloaded() if d.startswith("m1n1-")], [AURORA8])
         self.assertEqual(self.kept_copy().read_bytes(), b"M1N1:original\n")
         self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff air-gpu")
         self.assertNotIn("M1N1_UPDATE_DISABLED", self.update_conf.read_text())
@@ -275,56 +258,37 @@ class M3AirTest(flow.M3FlowBase):
         self.assertTrue(self.boot.read_bytes().endswith(AIR_GPU))
         self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff air-gpu")
 
-    def test_rerun_without_an_air_package_stops(self):
-        # A later build without the Air's m1n1 never drops a tested Air back
-        # to kernel-only under a boot.bin it can't rebuild.
-        self.mac("j613")
-        self.air_install(try_=1)
-        before = self.boot.read_bytes()
-        proc = self.air_install(pkg="", check=False)
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("Nothing was installed", proc.stderr)
-        self.assertIn("--uninstall", proc.stderr)
-        self.assertEqual(self.boot.read_bytes(), before)
 
     def test_display_switch(self):
         self.mac("j613")
         self.air_install(try_=1, dcp=1)
         self.assertTrue(self.boot.read_bytes().endswith(b"UBOOT" + AIR_GPU + AIR_DCP))
 
-    def test_refused_without_an_air_package(self):
-        self.mac("j613")
-        before = self.boot.read_bytes()
-        proc = self.air_install(try_=1, pkg="", check=False)
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("Nothing was installed", proc.stderr)
-        self.assertEqual(self.boot.read_bytes(), before)
-        self.assertNotIn("pacman -U", self.log())
-        self.assertFalse(self.kept_copy().exists())
 
     def test_refused_with_an_m1n1_that_lacks_the_switch(self):
         self.mac("j613")
         before = self.boot.read_bytes()
-        proc = self.air_install(try_=1, pkg=f"{flow.AURORA6} {self.shas[flow.AURORA6]}", check=False)
+        proc = self.air_install(try_=1, pkg=flow.AURORA6, check=False)
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("no M3 Air GPU handoff", proc.stderr)
         self.assertEqual(self.boot.read_bytes(), before)
         self.assertNotIn("pacman -U", self.log())
 
     def test_m3_pro_unchanged_by_air_settings(self):
+        # The same m1n1 as the Air, with the M3 Pro's own switches.
         self.mac("j516s")
         out = self.air_install(dcp=1).stdout
         self.assertIn("built-in display at its native resolution", out)
         boot = self.boot.read_bytes()
-        self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora6-1\n"), boot)
-        self.assertTrue(boot.endswith(flow.SWITCHES), boot)
-        self.assertNotIn(AURORA8, self.downloaded())
+        self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora8-1\n"), boot[:80])
+        self.assertTrue(boot.endswith(flow.SWITCHES), boot[-200:])
+        self.assertEqual(self.downloaded().count(AURORA8), 1)
 
     def test_m1_unchanged_by_air_settings(self):
         self.mac("j314s")
         self.air_install(dcp=1)
         boot = self.boot.read_bytes()
-        self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora3-1\n"), boot)
+        self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora8-1\n"), boot[:80])
         self.assertNotIn(b"chosen.", boot)
         self.assertFalse(self.m1n1_conf.exists())
 
@@ -345,7 +309,6 @@ class M3AirDryRunTest(M3AirTest):
         names = [l[len("chosen."):].split("=")[0] for l in DRY_RUN]
         self.fixture(AURORA8, None, ["asahi,t6030-gpu", "asahi,t6030-dcp", "asahi,t6030-dcpext",
                                      "asahi,t8122-gpu"] + names)
-        self.air_pkg = f"{AURORA8} {self.shas[AURORA8]}"
 
     # The inherited handoff tests run with M3_AIR_DRY_RUN=0 in M3AirTest; the
     # ones that only make sense for the handoff's switches are skipped here.
@@ -368,9 +331,10 @@ class M3AirDryRunTest(M3AirTest):
         self.assertNotIn("chosen.asahi,t8122-gpu=1", DRY_RUN)
         self.assertEqual(shell_word("M3_AIR_DRY_RUN"), "1")
         self.assertEqual(shell_word("M3_AIR_DISPLAY_HANDOFF"), "1")
-        air_pkg = shell_value("M3_AIR_M1N1_PACKAGE")
-        self.assertRegex(air_pkg, r"^m1n1-aurora-\S+ [0-9a-f]{64}$")
-        self.assertEqual(air_pkg, shell_value("M3_M1N1_PACKAGE"))
+        # One m1n1 for every Mac: no package of the Air's own.
+        self.assertNotIn("M3_AIR_M1N1_PACKAGE", SRC)
+        self.assertNotIn("M3_M1N1_PACKAGE", SRC)
+        self.assertRegex(shell_value("M1N1_PACKAGE"), r"^m1n1-aurora-\S+-aarch64\.pkg\.tar\.zst \S+$")
         # 11.111-test and 11.111.1-test recorded air-display-handoff.
         self.assertNotIn(DISPLAY_VARIANT, ("air-display-handoff", "air-dry-run", "air-gpu", "air-gpu-dcp"))
         self.assertRegex(DISPLAY_VARIANT, r"^air-display-handoff-\S+$")
@@ -427,8 +391,8 @@ class M3AirDryRunTest(M3AirTest):
         boot = self.boot.read_bytes()
         self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora8-1\n"), boot)
         self.assertTrue(boot.endswith(b"UBOOT" + DRY_RUN_LINES), boot)
-        self.assertNotIn(b"t8122-gpu=1", boot)
-        self.assertNotIn(b"t6030", boot)
+        self.assertNotIn(b"t8122-gpu=1", boot.split(b"UBOOT")[-1])
+        self.assertNotIn(b"t6030", boot.split(b"UBOOT")[-1])
         self.assertEqual(self.kept_copy().read_bytes(), b"M1N1:original\n")
         self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff air-dry-run")
         self.sh("uninstall_all")
@@ -449,15 +413,14 @@ class M3AirDryRunTest(M3AirTest):
     def test_refused_with_an_m1n1_that_lacks_the_switch(self):
         self.mac("j613")
         before = self.boot.read_bytes()
-        proc = self.air_install(try_=1, pkg=f"{flow.AURORA6} {self.shas[flow.AURORA6]}", check=False)
+        proc = self.air_install(try_=1, pkg=flow.AURORA6, check=False)
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("no M3 Air GPU and display dry run", proc.stderr)
         self.assertEqual(self.boot.read_bytes(), before)
         self.assertNotIn("pacman -U", self.log())
 
     def test_plan_try_refused(self):
-        for board, stub, pkg, why in [("j613", "14.8.3", "", "no m1n1 with the M3 MacBook Air GPU"),
-                                      ("j613", "15.6", None, "stub is 15.6")]:
+        for board, stub, pkg, why in [("j613", "15.6", None, "stub is 15.6")]:
             with self.subTest(board=board, stub=stub, pkg=pkg):
                 self.mac(board, stub=stub)
                 proc = self.sh("M3_TRY=1\nm3_plan", pkg=pkg, check=False)
@@ -510,7 +473,7 @@ class M3AirDryRunTest(M3AirTest):
         newer = "m1n1-aurora-1.6.1.aurora8.1-1-aarch64.pkg.tar.zst"
         names = [l[len("chosen."):].split("=")[0] for l in DRY_RUN]
         self.fixture(newer, None, ["asahi,t8122-gpu"] + names)
-        proc = self.air_install(pkg=f"{newer} {self.shas[newer]}")
+        proc = self.air_install(pkg=newer)
         self.assertIn("keeping it", proc.stdout)
         boot = self.boot.read_bytes()
         self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora8.1-1\n"), boot)

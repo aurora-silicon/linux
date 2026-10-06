@@ -18,8 +18,8 @@ INSTALLER = Path(__file__).resolve().parent.parent / "install-aurora-sep.sh"
 # Release names, read from the installer so the tests follow each release.
 _SRC = INSTALLER.read_text()
 VERSION = re.search(r"^VERSION=(\S+)$", _SRC, re.M).group(1)
-M1N1_M1M2 = re.search(r'^  "(m1n1-aurora-\S+) ', _SRC, re.M).group(1)
-M1N1_M3 = re.search(r'^M3_M1N1_PACKAGE="(\S+) ', _SRC, re.M).group(1)
+# One m1n1 for every Mac that gets one.
+M1N1 = re.search(r'^M1N1_PACKAGE="(\S+) ', _SRC, re.M).group(1)
 KERNEL_PKG = f"linux-aurora-{VERSION}-aarch64.pkg.tar.zst"
 
 OUR_FREEZE = (
@@ -381,13 +381,11 @@ esp_bootbin() {{ [[ -f '{self.esp}/m1n1/boot.bin' ]] && echo '{self.esp}/m1n1/bo
         return [line.split()[0] for line in out.splitlines()]
 
     def test_packages_per_mac(self):
-        m1n1_m1m2 = M1N1_M1M2
-        m1n1_m3 = M1N1_M3
-        for board, stub, try_, want in [("j314s", "13.5", 0, m1n1_m1m2), ("j293", "13.5", 0, m1n1_m1m2),
+        for board, stub, try_, want in [("j314s", "13.5", 0, M1N1), ("j293", "13.5", 0, M1N1),
                                         ("j700", "26.4", 0, None), ("j613", "14.8.3", 0, None),
                                         ("j514c", "14.8.3", 0, None), ("j514s", "14.8.3", 0, None),
-                                        ("j516s", "15.6", 0, None), ("j516s", "14.8.3", 0, m1n1_m3),
-                                        ("j514s", "14.8.3", 1, m1n1_m3)]:
+                                        ("j516s", "15.6", 0, None), ("j516s", "14.8.3", 0, M1N1),
+                                        ("j514s", "14.8.3", 1, M1N1)]:
             with self.subTest(board=board, stub=stub, try_=try_):
                 got = self.packages(board, stub, try_)
                 m1n1 = [p for p in got if p.startswith("m1n1-aurora-")]
