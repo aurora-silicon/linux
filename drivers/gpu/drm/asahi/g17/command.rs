@@ -289,6 +289,13 @@ pub(crate) enum Validated {
 }
 
 impl Payload {
+    pub(crate) fn prior(&self) -> [u64; 2] {
+        match self {
+            Self::Render(cmd, _) => [cmd.prior_vdm, cmd.prior_cdm],
+            Self::Compute(cmd, _) => [cmd.prior_vdm, cmd.prior_cdm],
+        }
+    }
+
     pub(crate) fn validate(
         &self,
         window: &UscWindow,
@@ -399,6 +406,7 @@ impl Payload {
             }
             Self::Compute(cmd, attachments) => {
                 if cmd.flags != 0
+                    || cmd.scs_layout != 0
                     || cmd.cdm_ctrl_stream_base & 3 != 0
                     || cmd.cdm_ctrl_stream_end & 3 != 0
                     || cmd.cdm_ctrl_stream_end <= cmd.cdm_ctrl_stream_base

@@ -282,6 +282,9 @@ impl<B: Backend> Queue<B> {
     ) -> Result<(KVec<(Validated, Order)>, KVec<mmu::VmJobGuard>)> {
         let parse_guard = self.context.vm().retain_first_job()?;
         let mut parser = Parser::new(bytes);
+        // All historical ordinals use the same entry counters; publication
+        // starts only after the entire ioctl has been validated and pinned.
+        let base = self.sequence;
         let mut preceding = [0; 2];
         let mut pending = KVec::with_capacity(1, GFP_KERNEL)?;
         while let Some(command) = parser.next()? {
@@ -295,7 +298,13 @@ impl<B: Backend> Queue<B> {
                 Validated::Render { .. } => Engine::Render,
                 Validated::Compute { .. } => Engine::Compute,
             };
-            let order = Order::new(self.sequence, preceding, command.barriers, engine)?;
+            let order = Order::new(
+                base,
+                preceding,
+                command.barriers,
+                command.payload.prior(),
+                engine,
+            )?;
             preceding[engine.index()] += 1;
             pending.push((payload, order), GFP_KERNEL)?;
         }

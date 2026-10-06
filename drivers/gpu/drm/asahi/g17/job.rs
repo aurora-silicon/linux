@@ -33,7 +33,7 @@ impl Engine {
 }
 
 /// Logical sequence numbers do not wrap with firmware timestamps. A zero barrier
-/// includes preceding ioctls; the sentinel means independent of that engine.
+/// includes preceding ioctls; the sentinel leaves only an explicit historical prefix.
 #[derive(Clone, Copy)]
 pub(crate) struct Order {
     pub(crate) sequence: u64,
@@ -45,11 +45,16 @@ impl Order {
         base: [u64; 2],
         preceding: [u16; 2],
         barriers: [u16; 2],
+        prior: [u64; 2],
         engine: Engine,
     ) -> Result<Self> {
         let mut sequences = [0; 2];
         let mut wait_through = [None; 2];
         for index in 0..2 {
+            // Earlier commands in this ioctl are not historical commands.
+            if prior[index] > base[index] {
+                return Err(EINVAL);
+            }
             sequences[index] = base[index]
                 .checked_add(u64::from(preceding[index]))
                 .and_then(|value| value.checked_add(1))
@@ -62,6 +67,11 @@ impl Order {
                     base[index]
                         .checked_add(u64::from(barriers[index]))
                         .ok_or(EOVERFLOW)?,
+                );
+            }
+            if prior[index] != 0 {
+                wait_through[index] = Some(
+                    wait_through[index].map_or(prior[index], |last| last.max(prior[index])),
                 );
             }
         }
