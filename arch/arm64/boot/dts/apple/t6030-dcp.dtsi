@@ -18,6 +18,8 @@
 		dcp = &dcp;
 		dcpext0 = &dcpext;
 		dcpext1 = &dcpext1;
+		/* The boot loader fills the ATC3 tunables through this alias. */
+		atcphy3 = &atcphy3;
 		disp0 = &display;
 		disp0-piodma = &disp0_piodma;
 		disp0_piodma = &disp0_piodma;
