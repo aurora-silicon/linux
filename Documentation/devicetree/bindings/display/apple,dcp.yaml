@@ -24,6 +24,7 @@ properties:
               - apple,t6000-dcp
               - apple,t6020-dcp
               - apple,t8140-dcp
+              - apple,t8142-dcp
           - const: apple,dcp
       - items:
           - enum:
@@ -38,17 +39,18 @@ properties:
 
   reg:
     minItems: 2
-    maxItems: 6
+    maxItems: 7
 
   reg-names:
     minItems: 2
     items:
       - const: coproc
       - const: disp-0
-      - const: disp-1
-      - const: disp-2
-      - const: disp-3
-      - const: disp-4
+      - enum: [disp-1, iop-vbar]
+      - enum: [disp-2, iop-vbar]
+      - enum: [disp-3, iop-vbar]
+      - enum: [disp-4, iop-vbar]
+      - const: iop-vbar
 
   mboxes:
     maxItems: 1
@@ -70,6 +72,20 @@ properties:
     minItems: 1
     maxItems: 2
 
+  clock-names:
+    minItems: 1
+    items:
+      - const: clock-154
+      - const: clock-194
+
+  memory-region:
+    minItems: 1
+    maxItems: 64
+
+  memory-region-names:
+    minItems: 1
+    maxItems: 64
+
   phys:
     minItems: 1
     maxItems: 8
@@ -90,7 +106,7 @@ properties:
 
   apple,iomfb-surfaces:
     $ref: /schemas/types.yaml#/definitions/uint32-array
-    minItems: 4
+    minItems: 1
     maxItems: 4
     items:
       enum: [0, 1]
