@@ -252,9 +252,16 @@ static int dcp_v14_alloc(struct apple_dcp_v14 *v14, u64 request, u32 *id)
 	if (v14->buffer_count == DCP_V14_MAX_BUFFERS ||
 	    v14->buffer_bytes + size > DCP_V14_MAX_BUFFER_BYTES)
 		return -ENOSPC;
-	cpu = dma_alloc_attrs(v14->dev, size, &iova, GFP_KERNEL, DMA_ATTR_FORCE_CONTIGUOUS);
-	if (!cpu)
+	/*
+	 * Contiguous memory comes from the CMA area first and from the page
+	 * allocator when that is in use: the CMA miss is not a failure.
+	 */
+	cpu = dma_alloc_attrs(v14->dev, size, &iova, GFP_KERNEL | __GFP_NOWARN,
+			      DMA_ATTR_FORCE_CONTIGUOUS);
+	if (!cpu) {
+		dev_err(v14->dev, "no contiguous memory for a %zu byte DCP buffer\n", size);
 		return -ENOMEM;
+	}
 	ret = dma_get_sgtable_attrs(v14->dev, &table, cpu, iova, size,
 				    DMA_ATTR_FORCE_CONTIGUOUS);
 	if (ret)
