@@ -70,6 +70,16 @@ class M3ReportTest(Base):
         self.assertNotIn("pacman -U", self.log())
         self.assertNotIn("update-m1n1", self.log())
 
+    def test_report_names_the_m1n1_by_its_bytes(self):
+        self.mac("j516s")
+        self.install()
+        sha = self.bin_shas[self.m1n1_pkg]
+        _, files = self.report()
+        text = files["system.txt"].decode()
+        self.assertIn(f"installed m1n1.bin: sha256 {sha}", text)
+        self.assertRegex(text, rf"boot.bin's first \d+ bytes: sha256 {sha}")
+        self.assertIn(f"m1n1-installed: {sha} ", text)
+
     def test_report_needs_no_preflight(self):
         src = flow.INSTALLER.read_text()
         self.assertIn("--agent-prompt | --reset-touchid | --m3-report) return 1", src)

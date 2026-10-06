@@ -119,6 +119,8 @@ if [[ -f $FAKE_UPDATE_CONF ]]; then
 fi
 dtbs=$(sh -c 'set -e; DTBS=; [ -f "$1" ] && . "$1"; echo "$DTBS"' _ "$FAKE_UPDATE_CONF")
 m1n1=$(sh -c 'set -e; M1N1=; [ -f "$1" ] && . "$1"; echo "$M1N1"' _ "$FAKE_UPDATE_CONF")
+# A rebuild that picks up another m1n1 than the installed one.
+m1n1=${FAKE_OTHER_M1N1:-$m1n1}
 {
   cat "${m1n1:-$FAKE/m1n1.bin}"
   printf 'DTBS:%s\n' "${dtbs:-asahi}"
@@ -219,6 +221,7 @@ PACKAGES=(
 {pkgs}
 )
 M1N1_PACKAGE="{self.m1n1_pkg} {self.shas[self.m1n1_pkg]}"
+M1N1_BIN_SHA={self.bin_shas[self.m1n1_pkg]}
 esp_bootbin() {{ echo '{self.boot}'; }}
 version_notice() {{ :; }}; sep_write_notice() {{ :; }}; ane_dkms_notice() {{ :; }}
 snapshot() {{ :; }}; add_pin() {{ :; }}; remove_pin() {{ :; }}
@@ -521,6 +524,64 @@ class M3FlowTest(M3FlowBase):
                 self.assertTrue(boot.startswith(b"M1N1:" + M1N1_BASE.encode() + b"\n"), boot[:80])
                 self.assertTrue(boot.endswith(b"UBOOT" + switches), boot[-200:])
                 self.assertEqual([d for d in self.downloaded() if d.startswith("m1n1-")], [M1N1_PKG])
+
+    # The m1n1 by its bytes (M1N1_BIN_SHA), never by the version it reports
+
+    def fresh_state(self):
+        shutil.rmtree(self.state)
+        self.state.mkdir()
+        self.m1n1_conf.unlink(missing_ok=True)
+        self.update_conf.unlink(missing_ok=True)
+        for kept in self.boot.parent.glob("boot.bin.*"):
+            kept.unlink()
+
+    def test_m1n1_is_checked_and_recorded_by_its_bytes(self):
+        sha = self.bin_shas[M1N1_PKG]
+        size = len((self.tmp / ("root-" + M1N1_PKG) / "usr/lib/asahi-boot/m1n1.bin").read_bytes())
+        for board in ("j314s", "j516s"):
+            with self.subTest(board=board):
+                self.fresh_state()
+                self.mac(board)
+                out = self.install().stdout
+                self.assertIn(f"starts with this release's m1n1 (sha256 {sha})", out)
+                self.assertEqual((self.state / "m1n1-installed").read_text(), f"{sha} {size} {M1N1_PKG}\n")
+
+    def test_a_package_with_other_m1n1_bytes_is_refused(self):
+        # Same file name and version, other bytes: refused before anything changes.
+        for board in ("j314s", "j516s"):
+            with self.subTest(board=board):
+                self.fresh_state()
+                self.mac(board)
+                before = self.boot.read_bytes()
+                proc = self.install(env="M1N1_BIN_SHA=" + "0" * 64, check=False)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn(f"holds an m1n1.bin with sha256 {self.bin_shas[M1N1_PKG]}", proc.stderr)
+                self.assertIn("Nothing was installed", proc.stderr)
+                self.assertEqual(self.boot.read_bytes(), before)
+                self.assertNotIn("pacman -U", self.log())
+                self.assertFalse(self.kept_copy().exists())
+
+    def test_a_rebuild_with_other_m1n1_bytes_stops(self):
+        # update-m1n1 rebuilt boot.bin, but not from this release's m1n1.
+        other = self.tmp / "other-m1n1.bin"
+        other.write_bytes(b"M1N1:" + M1N1_BASE.encode() + b"\n" + b"\0" * 64)
+        self.mac("j314s")
+        self.extra_env = {"FAKE_OTHER_M1N1": str(other)}
+        proc = self.install(check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("not this release's", proc.stderr)
+        self.assertIn(f"boot.bin.before-{VERSION}", proc.stderr)
+        self.assertFalse((self.state / "m1n1-installed").exists())
+
+    def test_frozen_m1_keeps_its_boot_bin_unchecked(self):
+        # As in 11.38: a freeze the owner set is reported, and nothing checks
+        # a boot.bin that was not rebuilt.
+        self.mac("j314s")
+        self.update_conf.write_text("M1N1_UPDATE_DISABLED=1\n")
+        proc = self.install()
+        self.assertIn("was not rebuilt", proc.stderr)
+        self.assertEqual(self.boot.read_bytes(), b"M1N1:original\n")
+        self.assertFalse((self.state / "m1n1-installed").exists())
 
     # The MacBook Neo keeps its own m1n1 until NEO_AURORA_M1N1 is 1
 

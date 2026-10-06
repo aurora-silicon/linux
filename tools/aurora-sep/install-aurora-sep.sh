@@ -175,6 +175,11 @@ PACKAGES=(
 # path (see m3_plan), and the MacBook Neo once NEO_AURORA_M1N1 is 1. Macs differ
 # only in the switches /etc/m1n1.conf arms (m3_switches), never in the binary.
 M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora12-1-aarch64.pkg.tar.zst PENDING-AURORA12-BUILD"
+# The sha256 of the m1n1.bin in M1N1_PACKAGE: the bytes update-m1n1 puts at
+# the start of boot.bin. The script tells m1n1 builds apart by these bytes,
+# never by the version string they report: aurora8.5-1 and 8.5-2 both reported
+# v1.6.1-omarchy.aurora8.5.
+M1N1_BIN_SHA=PENDING-AURORA12-BUILD
 # 0: a MacBook Neo keeps its own m1n1 (its M1N1= and U_BOOT= in
 # /etc/default/update-m1n1), as before 12.0. 1: it gets M1N1_PACKAGE like every
 # other Mac, and update-m1n1 builds its boot.bin from that m1n1 and the Neo's
@@ -381,6 +386,8 @@ M3_OSLOG_OVERLAP=chosen/asahi,m1n1-oslog-overlap
 M1N1_CONF=/etc/m1n1.conf
 # What update-m1n1 puts at the start of boot.bin.
 M1N1_BIN=/usr/lib/asahi-boot/m1n1.bin
+# After a rebuild with M1N1_PACKAGE, $STATE/m1n1-installed records the m1n1
+# that boot.bin was checked to start with: "sha256 bytes package".
 M1N1_CONF_BEGIN="# >>> aurora-sep: M3 Pro display and GPU handoff (remove with: install-aurora-sep.sh --uninstall)"
 M1N1_CONF_END="# <<< aurora-sep: M3 Pro display and GPU handoff"
 M1N1_CONF_AIR_BEGIN="# >>> aurora-sep: M3 Air handoff (remove with: install-aurora-sep.sh --uninstall)"
@@ -577,6 +584,42 @@ m3_oslog_overlap_check() {
     Please report it at https://github.com/iconidentify/aurora-linux/issues with the file that
     --m3-report writes. The boot loader this Mac had before the handoff is kept on the EFI
     partition as m1n1/boot.bin.before-<version>."
+}
+
+# The sha256 of a downloaded m1n1-aurora package's m1n1.bin.
+m1n1_pkg_sha() {
+  { bsdtar -xOf "$1" usr/lib/asahi-boot/m1n1.bin | sha256sum | cut -d' ' -f1; } 2>/dev/null
+}
+
+# The sha256 of the first $2 bytes of boot.bin $1: the m1n1 at its start, when
+# $2 is that m1n1's size.
+bootbin_m1n1_sha() {
+  $sudo head -c "$2" "$1" | sha256sum | cut -d' ' -f1
+}
+
+# True when update-m1n1's configuration names its own m1n1 or target: boot.bin
+# then never starts with M1N1_PACKAGE's m1n1, which is not checked there.
+update_m1n1_own_m1n1() {
+  [[ -f $UPDATE_M1N1_CONF ]] || return 1
+  # shellcheck disable=SC2016 # expanded by that sh, not here
+  env -i PATH="$PATH" sh -c '. "$1" >/dev/null 2>&1; [ -n "${M1N1:-}${SOURCE:-}${TARGET:-}" ]' _ \
+    "$UPDATE_M1N1_CONF" >/dev/null 2>&1
+}
+
+# After update-m1n1 rebuilt boot.bin with M1N1_PACKAGE: check the m1n1 at its
+# start by its bytes, and record it in $STATE/m1n1-installed.
+m1n1_check_and_record() {
+  local target size sha
+  target=$(esp_bootbin) || die "could not find m1n1's boot.bin to check its m1n1 in"
+  size=$(stat -c %s "$M1N1_BIN")
+  sha=$(bootbin_m1n1_sha "$target" "$size")
+  [[ $sha == "$M1N1_BIN_SHA" ]] ||
+    die "the m1n1 at the start of $target is sha256 $sha, not this release's
+    ($M1N1_BIN_SHA), so boot.bin was not rebuilt as it should be. The boot loader this Mac booted
+    with is kept as m1n1/boot.bin.before-$VERSION on the EFI partition. Please report it at
+    https://github.com/iconidentify/aurora-linux/issues before rebooting."
+  printf '%s %s %s\n' "$sha" "$size" "${M1N1_PACKAGE%% *}" | $sudo tee "$STATE/m1n1-installed" >/dev/null
+  say "m1n1's boot.bin starts with this release's m1n1 (sha256 $sha)"
 }
 
 # True when a downloaded m1n1-aurora package knows every switch this Mac's
@@ -1370,6 +1413,13 @@ install_all() {
     Please report it with the file name above."
     [[ $(sha256sum "$work/$file" | cut -d' ' -f1) == "$sha" ]] || die "$file does not match its published checksum"
   done
+  if m1n1_for_this_mac; then
+    sha=$(m1n1_pkg_sha "$work/${M1N1_PACKAGE%% *}")
+    [[ $sha == "$M1N1_BIN_SHA" ]] ||
+      die "${M1N1_PACKAGE%% *} holds an m1n1.bin with sha256 ${sha:-(none)}, not the
+    $M1N1_BIN_SHA this release names. Nothing was installed. Please report it at
+    https://github.com/iconidentify/aurora-linux/issues"
+  fi
   if [[ $M3_MODE == handoff ]]; then
     m1n1_pkg_has_handoff "$work/${M1N1_PACKAGE%% *}" ||
       die "this release's m1n1 has no $(m3_handoff_name), so it can't switch it
@@ -1451,11 +1501,19 @@ install_all() {
       fi
       m1n1_update
       m3_verify_bootbin
+      m1n1_check_and_record
       # The test reboot may be a hard reset (m3-serial.py reboot): get the new
       # boot.bin onto the EFI partition first.
       sync
       ;;
-    *) m1n1_update ;;
+    *)
+      m1n1_update
+      # Not where update-m1n1 is frozen (m1n1_update said so) or builds from
+      # an m1n1 of its own, as a Neo without NEO_AURORA_M1N1 does.
+      if m1n1_for_this_mac && ! update_m1n1_frozen && ! update_m1n1_own_m1n1; then
+        m1n1_check_and_record
+      fi
+      ;;
   esac
   if [[ $chain == grub && $M3_MODE != handoff ]]; then
     grub_update
@@ -1700,6 +1758,24 @@ reset_touchid() {
 # directory. It reads only: the boot loader's /chosen entries, a kernel log
 # filtered to the M3 bring-up, USB-C and display state. Lines naming a USB
 # serial number are dropped and MAC addresses are masked.
+# The m1n1 in boot.bin by its bytes, for --m3-report: two builds can report the
+# same stage 2 version.
+m3_report_m1n1() {
+  local target size="" installed=""
+  if [[ -f $M1N1_BIN ]]; then
+    size=$(stat -c %s "$M1N1_BIN")
+    installed=$(sha256sum "$M1N1_BIN" | cut -d' ' -f1)
+  fi
+  echo "installed m1n1.bin: sha256 ${installed:--} (${size:--} bytes)"
+  if [[ -n $size ]] && target=$(esp_bootbin); then
+    echo "boot.bin: sha256 $($sudo sha256sum "$target" | cut -d' ' -f1)"
+    echo "boot.bin's first $size bytes: sha256 $(bootbin_m1n1_sha "$target" "$size")"
+  else
+    echo "boot.bin: -"
+  fi
+  printf 'm1n1-installed: '; cat "$STATE/m1n1-installed" 2>/dev/null || echo -
+}
+
 M3_REPORT_DMESG='asahi|agx|gpu|g15|dcp|dart|t8122|t6030|reserved|iommu|mailbox|pmp|simpledrm|m1n1|tipd|typec|sn201202|atc|usb|xhci|dwc3|thermal|macsmc'
 m3_report() {
   local dir out board soc f
@@ -1714,6 +1790,7 @@ m3_report() {
     done
     pacman -Q linux-aurora m1n1-aurora m1n1 2>/dev/null || true
     printf 'm3-mode: '; cat "$STATE/m3-mode" 2>/dev/null || echo -
+    m3_report_m1n1
     echo "m1n1.conf switches:"; grep '^chosen\.' "$M1N1_CONF" 2>/dev/null || echo -
     printf 'm1n1-oslog-overlap: '; if [[ -e $DT/$M3_OSLOG_OVERLAP ]]; then echo present; else echo absent; fi
     echo "reserved display logs:"; ls -d "$DT"/reserved-memory/dcp-oslog@* 2>/dev/null || echo -

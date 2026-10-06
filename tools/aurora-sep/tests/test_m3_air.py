@@ -53,6 +53,7 @@ class M3AirTest(flow.M3FlowBase):
                f'M3_AIR_DISPLAY_HANDOFF={display}\n')
         if pkg is not None:
             pre += f'M1N1_PACKAGE="{pkg} {self.shas[pkg]}"\n'
+            pre += f'M1N1_BIN_SHA={self.bin_shas[pkg]}\n'
         if variant is not None:
             pre += f'M3_AIR_DISPLAY_VARIANT={variant}\n'
         if boards is not None:
@@ -564,7 +565,8 @@ class M3AirDryRunTest(M3AirTest):
 
     def test_install_syncs_after_the_rebuild(self):
         src = SRC[SRC.index("      m3_verify_bootbin\n"):]
-        self.assertTrue(re.match(r"      m3_verify_bootbin\n(\s*#.*\n)*\s*sync\n", src), src[:200])
+        self.assertTrue(re.match(r"      m3_verify_bootbin\n      m1n1_check_and_record\n(\s*#.*\n)*\s*sync\n", src),
+                        src[:200])
 
 if __name__ == "__main__":
     unittest.main()
