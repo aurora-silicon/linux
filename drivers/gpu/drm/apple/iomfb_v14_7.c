@@ -123,8 +123,12 @@ struct apple_dcp_v14 {
 	u64 swap_ns_max;
 };
 
-/* One DCP session per boot: RTKit is never started twice. */
-static bool dcp_v14_session;
+/*
+ * The panel's DCP session; one per boot, RTKit is never started twice. The
+ * manual external start waits for it, as the PMP runs once the panel's
+ * request is acknowledged.
+ */
+static bool dcp_v14_panel_session;
 
 static int dcp_v14_callback(void *cookie, u32 tag, const void *input, u32 in_size,
 			    void *output, u32 out_size);
@@ -901,11 +905,45 @@ static int dcp_v14_geometry(struct apple_dcp_v14 *v14)
 
 static void dcpext_bringup(struct work_struct *work);
 
-/* Verify the mappings installed by the IOMMU core before touching the ASC. */
+/*
+ * The IOVA at which @mem's iommu-addresses map @size bytes for the device
+ * @np, as the IOMMU core reads them; 0 if they do not.
+ */
+static u64 dcpext_region_iova(struct device_node *np, struct device_node *mem, u64 size)
+{
+	const __be32 *maps, *end;
+	int len;
+
+	maps = of_get_property(mem, "iommu-addresses", &len);
+	if (!maps || len <= 0 || len % sizeof(*maps))
+		return 0;
+	end = maps + len / sizeof(*maps);
+	while (maps < end) {
+		struct device_node *owner = of_find_node_by_phandle(be32_to_cpup(maps++));
+		phys_addr_t iova;
+		size_t length;
+		bool mine = owner == np;
+
+		if (!owner)
+			return 0;
+		maps = of_translate_dma_region_checked(owner, maps, end - maps, &iova, &length);
+		of_node_put(owner);
+		if (!maps)
+			return 0;
+		if (mine && length == size)
+			return iova;
+	}
+	return 0;
+}
+
+/*
+ * Verify the mappings the IOMMU core installed from the boot loader's
+ * handoff, before touching the processor: each region is mapped linearly at
+ * the address its iommu-addresses give this processor.
+ */
 static int dcpext_verify_memory(struct apple_dcp *dcp)
 {
 	static const char *const names[] = {"asc-firmware", "dcp_data", "heap"};
-	static const u64 iovas[] = {0x10040000000ULL, 0x10080000000ULL, 0x100c0000000ULL};
 	struct device *dev = dcp->dev;
 	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
 	u32 ready;
@@ -917,7 +955,7 @@ static int dcpext_verify_memory(struct apple_dcp *dcp)
 	for (i = 0; i < ARRAY_SIZE(names); i++) {
 		struct device_node *mem;
 		struct resource res;
-		u64 off, size;
+		u64 off, size, iova;
 		int idx = of_property_match_string(dev->of_node, "memory-region-names", names[i]);
 		if (idx < 0)
 			return idx;
@@ -928,20 +966,21 @@ static int dcpext_verify_memory(struct apple_dcp *dcp)
 			of_node_put(mem);
 			return -EINVAL;
 		}
-		of_node_put(mem);
 		size = resource_size(&res);
+		iova = dcpext_region_iova(dev->of_node, mem, size);
+		of_node_put(mem);
 		if (!size || size > SZ_256M || !IS_ALIGNED(res.start, SZ_16K) ||
-		    !IS_ALIGNED(size, SZ_16K))
+		    !IS_ALIGNED(size, SZ_16K) || !iova || !IS_ALIGNED(iova, SZ_16K))
 			return -EINVAL;
 		for (off = 0; off < size; off += SZ_16K) {
-			if (iommu_iova_to_phys(domain, iovas[i] + off) != res.start + off) {
+			if (iommu_iova_to_phys(domain, iova + off) != res.start + off) {
 				dev_err(dev, "dcpext %s mapping mismatch at %#llx; CPU untouched\n",
-					names[i], iovas[i] + off);
+					names[i], iova + off);
 				return -EINVAL;
 			}
 		}
 		dev_info(dev, "dcpext verified %s: %pa + %#llx at %#llx\n",
-			 names[i], &res.start, size, iovas[i]);
+			 names[i], &res.start, size, iova);
 	}
 	return 0;
 }
@@ -959,7 +998,7 @@ static ssize_t dcpext_start_store(struct device *dev, struct device_attribute *a
 	guard(mutex)(&dcp->hpd_mutex);
 	if (READ_ONCE(dcp->external_suspended))
 		return -EBUSY;
-	if (!dcp_v14_session)
+	if (!dcp_v14_panel_session)
 		return -EAGAIN;
 	if (atomic_cmpxchg(&dcp->external_requested, 0, 1))
 		return -EBUSY;
@@ -1017,8 +1056,10 @@ static int dcpext_check_power(struct apple_dcp *dcp)
 	ps = of_parse_phandle(dev->of_node, "power-domains", 0);
 	if (!ps)
 		return -ENODEV;
+	/* The CPU domain of this pipe: dispext<N>_cpu. */
 	ret = of_property_read_string(ps, "label", &label);
-	if (ret || strcmp(label, "dispext0_cpu")) {
+	if (ret || !strstarts(label, "dispext") || strlen(label) < 4 ||
+	    strcmp(label + strlen(label) - 4, "_cpu")) {
 		of_node_put(ps);
 		return -EINVAL;
 	}
@@ -1137,7 +1178,7 @@ int iomfb_v14_7_bind(struct apple_dcp *dcp)
 
 	if (!v14)
 		return -ENODEV;
-	if (v14->rtk || dcp_v14_session)
+	if (v14->rtk || dcp_v14_panel_session)
 		return dev_err_probe(dev, -EBUSY,
 				     "T6030 display not started: an earlier DCP session is kept; reboot to restart the display\n");
 
@@ -1171,7 +1212,7 @@ int iomfb_v14_7_bind(struct apple_dcp *dcp)
 	v14->rtk = rtk;
 	v14->link.rtk = rtk;
 	dcp->rtk = rtk;
-	dcp_v14_session = true;
+	dcp_v14_panel_session = true;
 	__module_get(THIS_MODULE);
 
 	ret = apple_rtkit_wake(rtk);

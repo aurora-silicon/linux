@@ -495,8 +495,9 @@ static int scanout_check_domains(struct dcpext_scanout *scanout)
  * before attaching: neither firmware nor another client may have populated
  * the inherited roots in the meantime. This function performs no MMIO writes.
  */
-static int scanout_recheck_dart(struct device_node *dart)
+static int scanout_recheck_dart(struct device_node *dart, struct device_node *dcp)
 {
+	struct device_node *dart_pd, *dcp_pd;
 	struct resource regs, table, first = {};
 	struct device_node *region = NULL;
 	struct reserved_mem *rmem;
@@ -511,8 +512,14 @@ static int scanout_recheck_dart(struct device_node *dart)
 	    of_property_read_u32_array(dart, "apple,inherited-dart-state", state, 6) ||
 	    state[0] != 0 || state[3] != 4 ||
 	    of_count_phandle_with_args(dart, "memory-region", NULL) != 2 ||
-	    of_address_to_resource(dart, 0, &regs) ||
-	    regs.start != 0x2d1304000ULL || resource_size(&regs) != SZ_16K)
+	    of_address_to_resource(dart, 0, &regs) || resource_size(&regs) != SZ_16K)
+		return -EINVAL;
+	/* The display DART of this processor's own pipe shares its CPU domain. */
+	dart_pd = of_parse_phandle(dart, "power-domains", 0);
+	dcp_pd = of_parse_phandle(dcp, "power-domains", 0);
+	of_node_put(dart_pd);
+	of_node_put(dcp_pd);
+	if (!dart_pd || dart_pd != dcp_pd)
 		return -EINVAL;
 	mmio = ioremap(regs.start, resource_size(&regs));
 	if (!mmio)
@@ -579,7 +586,7 @@ static int scanout_create_device(struct dcpext_scanout *scanout)
 	      of_device_is_compatible(spec.np, "apple,t8110-dart") &&
 	      of_device_is_available(spec.np) ? 0 : -EINVAL;
 	if (!ret)
-		ret = scanout_recheck_dart(spec.np);
+		ret = scanout_recheck_dart(spec.np, scanout->firmware_dev->of_node);
 	of_node_put(spec.np);
 	if (ret)
 		return ret;
