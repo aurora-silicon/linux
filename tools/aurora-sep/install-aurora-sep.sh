@@ -836,10 +836,20 @@ m3_recorded_variant() {
   echo "$variant"
 }
 
+# A Mac that has the handoff from an earlier install, on which this release's
+# m1n1 is not checked ($1, and how this Mac differs, $2): it keeps what it has.
+m3_kept_refusal() {
+  die "M3 ($(this_board)): this Mac has m1n1's $(m3_handoff_name) from an earlier install, and
+    this release's m1n1 is only checked with $1, and this Mac differs: $2.
+    Nothing was installed; this Mac keeps the boot loader and kernel it has. Please report it
+    at $ISSUE_URL with the file that this writes:
+      curl -fsSL $LATEST_URL | bash -s -- --m3-report"
+}
+
 # Decide the M3 path before anything is downloaded, so a Mac this release can't
 # set up as asked stops with nothing changed.
 m3_plan() {
-  local board problem failed variant again="run this again" air=0
+  local board problem failed variant again="run this again" air=0 kept=0
   M3_MODE=none
   if ! is_m3; then
     ((M3_TRY == 0)) || die "--m3-handoff is for an M3 Pro or an M3 MacBook Air, and this Mac isn't an M3. Nothing was installed."
@@ -895,12 +905,9 @@ m3_plan() {
     steps to put the old one back follow), run this again with --m3-handoff:
       curl -fsSL $LATEST_URL | bash -s -- --m3-handoff"
     fi
-    M3_TRY=1
-    if ((air)); then
-      say "M3 MacBook Air ($board): this Mac has m1n1's $(m3_handoff_name) from an earlier install; keeping it"
-    else
-      say "M3 ($board): this Mac has m1n1's display and GPU handoff from an earlier install; keeping it"
-    fi
+    # Kept from the record, not asked for: say so only once every check
+    # below has passed, and refuse in words that name no flag.
+    M3_TRY=1 kept=1
   fi
   M3_MODE=kernel
   if ((air)); then
@@ -926,6 +933,7 @@ m3_plan() {
   fi
   problem=$(m3_stub_problem)
   if [[ -n $problem ]]; then
+    if ((kept)); then m3_kept_refusal "the macOS $M3_STUB_VERSION system-firmware stub" "$problem"; fi
     ((M3_TRY == 0)) || die "--m3-handoff: the handoff is only tested with the macOS $M3_STUB_VERSION
     system-firmware stub, and this Mac differs: $problem. Nothing was installed."
     warn "the $(m3_handoff_name) is only tested with the macOS $M3_STUB_VERSION
@@ -935,6 +943,7 @@ m3_plan() {
   fi
   problem=$(m3_stage1_problem)
   if [[ -n $problem ]]; then
+    if ((kept)); then m3_kept_refusal "m1n1 stage 1 $M3_STAGE1_VERSIONS" "$problem"; fi
     ((M3_TRY == 0)) || die "--m3-handoff: this release's M3 m1n1 is only checked with m1n1 stage 1
     $M3_STAGE1_VERSIONS, and this Mac differs: $problem. Nothing was installed."
     warn "the $(m3_handoff_name) is only checked with m1n1 stage 1 $M3_STAGE1_VERSIONS, and
@@ -950,12 +959,20 @@ m3_plan() {
   if update_m1n1_customised; then
     die "$UPDATE_M1N1_CONF points update-m1n1 at its own m1n1, U-Boot, config or target
     (M1N1=, SOURCE=, U_BOOT=, CONFIG= or TARGET=). The $(m3_handoff_name) needs boot.bin
-    built from this release's m1n1. Remove those lines and run this again. Nothing was installed."
+    built from this release's m1n1. Remove those lines and $again. Nothing was installed."
   fi
   M3_MODE=handoff
+  if ((kept && air)); then
+    say "M3 MacBook Air ($board): this Mac has m1n1's $(m3_handoff_name) from an earlier install; keeping it"
+  elif ((kept)); then
+    say "M3 ($board): this Mac has m1n1's display and GPU handoff from an earlier install; keeping it"
+  fi
   if ((air)); then
     if is_m3_handoff_board; then
       say "M3 MacBook Air ($board, macOS $M3_STUB_VERSION stub): installing m1n1 with the $(m3_handoff_name)"
+    elif ((kept)); then
+      # Its owner asked with --m3-handoff when it was installed.
+      :
     elif [[ $M3_AIR_DISPLAY_HANDOFF == 1 ]]; then
       warn "--m3-handoff: trying m1n1's display handoff on this M3 MacBook Air ($board).
     It publishes the checked display state for Linux and collects GPU diagnostics;
@@ -976,7 +993,7 @@ m3_plan() {
     fi
   elif is_m3_handoff_board; then
     say "M3 Pro ($board, macOS $M3_STUB_VERSION stub): installing m1n1 with the display and GPU handoff"
-  else
+  elif ((!kept)); then
     warn "--m3-handoff: trying m1n1's display and GPU handoff on an M3 Pro model ($board) nobody
     has booted it on yet. This replaces the Mac's boot loader; the steps to put the old one
     back from macOS follow."

@@ -375,8 +375,30 @@ class M3FlowTest(M3FlowBase):
         before_log = self.log()
         proc = self.install(check=False)
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("stage 1 is v1.7.0", proc.stderr)
-        self.assertIn("Nothing was installed", proc.stderr)
+        self.assert_kept_refusal(proc, "stage 1 is v1.7.0")
+        self.assertEqual(self.boot.read_bytes(), before)
+        self.assertNotIn("curl ", self.log()[len(before_log):])
+
+    def assert_kept_refusal(self, proc, why):
+        # No "keeping it" before the error, no flag the owner did not type,
+        # and what to do next.
+        err = " ".join(proc.stderr.split())
+        self.assertIn(why, err)
+        self.assertIn("Nothing was installed; this Mac keeps the boot loader and kernel it has", err)
+        self.assertIn("issues/6", err)
+        self.assertIn("bash -s -- --m3-report", err)
+        self.assertNotIn("--m3-handoff", err)
+        self.assertNotIn("keeping it", proc.stdout)
+
+    def test_handoff_mac_on_another_stub_stops_with_nothing_installed(self):
+        self.mac("j516s")
+        self.install()
+        self.mac("j516s", kernel="linux-aurora", bootbin=self.boot.read_bytes(), stub="15.6")
+        before = self.boot.read_bytes()
+        before_log = self.log()
+        proc = self.install(check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assert_kept_refusal(proc, "stub is 15.6")
         self.assertEqual(self.boot.read_bytes(), before)
         self.assertNotIn("curl ", self.log()[len(before_log):])
 
@@ -424,8 +446,10 @@ class M3FlowTest(M3FlowBase):
     def test_rerun_without_the_flag_keeps_a_tried_handoff(self):
         self.mac("j514s")
         self.install(try_=1)
-        out = self.install().stdout
+        proc = self.install()
+        out = proc.stdout
         self.assertIn("keeping it", out)
+        self.assertNotIn("--m3-handoff: trying", proc.stderr)
         self.assertEqual((self.state / "m3-mode").read_text().strip(), f"handoff {PRO_VARIANT}")
         self.assertTrue(self.boot.read_bytes().endswith(SWITCHES))
         self.assertNotIn("M1N1_UPDATE_DISABLED", self.update_conf.read_text())

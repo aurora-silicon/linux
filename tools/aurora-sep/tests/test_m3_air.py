@@ -563,6 +563,33 @@ class M3AirDryRunTest(M3AirTest):
         self.assertEqual(self.downloaded(), [])
         self.assertEqual(self.plan(display=1), "kernel")
 
+    def test_display_handoff_air_on_another_stage1_keeps_what_it_has(self):
+        # Scott's Air with this release's display handoff, after its stage 1
+        # changed: a plain run stops before any download and names no flag.
+        self.mac("j613")
+        self.air_install(try_=1, display=1)
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), f"handoff {DISPLAY_VARIANT}")
+        self.mac("j613", bootbin=self.boot.read_bytes(), stage1="v1.7.0")
+        before = self.boot.read_bytes()
+        before_downloads = self.downloaded()
+        proc = self.air_install(display=1, check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        err = " ".join(proc.stderr.split())
+        self.assertIn("stage 1 is v1.7.0", err)
+        self.assertIn("this Mac keeps the boot loader and kernel it has", err)
+        self.assertIn("issues/6", err)
+        self.assertNotIn("--m3-handoff", err)
+        self.assertNotIn("keeping it", proc.stdout)
+        self.assertEqual(self.boot.read_bytes(), before)
+        self.assertEqual(self.downloaded(), before_downloads)
+
+    def test_kept_air_gets_no_new_opt_in_warning(self):
+        self.mac("j613")
+        self.air_install(try_=1, display=1)
+        proc = self.air_install(display=1)
+        self.assertIn("keeping it", proc.stdout)
+        self.assertNotIn("--m3-handoff: trying", proc.stderr)
+
     def test_install_syncs_after_the_rebuild(self):
         src = SRC[SRC.index("      m3_verify_bootbin\n"):]
         self.assertTrue(re.match(r"      m3_verify_bootbin\n      m1n1_check_and_record\n(\s*#.*\n)*\s*sync\n", src),
