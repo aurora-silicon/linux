@@ -4,7 +4,10 @@ ReleaseGuardTest fails while any package checksum is still a placeholder:
 a release is cut only when it passes. RealM1n1PackageTest checks the
 m1n1 package this release names, by its file name always, and by its
 content when the file is at hand (AURORA_M1N1_PKG, or the release staging
-directory). UpgradeTest runs 11.38's own script on the fake Mac of
+directory). ReleaseUrlTest and StagedCopyTest cover the staging or mirror
+override (AURORA_RELEASE_URL, AURORA_RELEASES_API): the default is the
+release's own tag, and a staged copy installs through the same download and
+checksum loop. UpgradeTest runs 11.38's own script on the fake Mac of
 test_m3_flow, then this one, as an owner updating would.
 """
 from pathlib import Path
@@ -98,6 +101,90 @@ class RealM1n1PackageTest(unittest.TestCase):
             self.assertIn(name.encode(), strings, name)
         # The file part stays clear of the M3 display log buffer.
         self.assertFalse(any(m1n1[0x120000:0x180000]))
+
+
+TAG = re.search(r"^TAG=(\S+)$", SRC, re.M).group(1)
+DEFAULT_RELEASE_URL = f"https://github.com/iconidentify/aurora-linux/releases/download/{TAG}"
+DEFAULT_RELEASES_API = "https://api.github.com/repos/iconidentify/aurora-linux/releases"
+OVERRIDES = ("AURORA_RELEASE_URL", "AURORA_RELEASES_API")
+
+
+def sourced(body, **env_extra):
+    """Runs body after sourcing the script, with only the overrides given."""
+    env = {k: v for k, v in os.environ.items() if k not in OVERRIDES}
+    env.update(env_extra)
+    script = f"set -euo pipefail\nAURORA_SEP_SOURCE_ONLY=1 source '{flow.INSTALLER}'\n{body}"
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+
+
+class ReleaseUrlTest(unittest.TestCase):
+    """AURORA_RELEASE_URL and AURORA_RELEASES_API, the staging or mirror override."""
+
+    def urls(self, **env):
+        proc = sourced('printf "%s\\n" "$RELEASE_URL" "$RELEASES_API"', **env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.splitlines()
+
+    def test_default(self):
+        self.assertEqual(self.urls(), [DEFAULT_RELEASE_URL, DEFAULT_RELEASES_API])
+
+    def test_empty_is_the_default(self):
+        self.assertEqual(self.urls(AURORA_RELEASE_URL="", AURORA_RELEASES_API=""),
+                         [DEFAULT_RELEASE_URL, DEFAULT_RELEASES_API])
+
+    def test_override(self):
+        self.assertEqual(self.urls(AURORA_RELEASE_URL="file:///srv/stage", AURORA_RELEASES_API="http://127.0.0.1:8000/api"),
+                         ["file:///srv/stage", "http://127.0.0.1:8000/api"])
+
+    def test_releases_api_override(self):
+        if not shutil.which("curl"):
+            self.skipTest("curl is needed")
+        with tempfile.TemporaryDirectory() as d:
+            latest = Path(d) / "latest"
+            api = Path(d).as_uri()
+            latest.write_text('{"tag_name": "%s"}' % TAG)
+            proc = sourced("newer_release", AURORA_RELEASES_API=api)
+            self.assertEqual((proc.returncode, proc.stdout), (0, ""), proc.stderr)
+            latest.write_text('{"tag_name": "sep-7.1.12.aurora2-99.0"}')
+            proc = sourced("newer_release", AURORA_RELEASES_API=api)
+            self.assertEqual(proc.stdout.strip(), "sep-7.1.12.aurora2-99.0", proc.stderr)
+
+
+class StagedCopyTest(flow.M3FlowBase):
+    """install_all with the real curl against a staged copy (file://)."""
+
+    def setUp(self):
+        super().setUp()
+        if not shutil.which("curl"):
+            self.skipTest("curl is needed")
+        # The real curl, not the harness's stub.
+        (self.tmp / "bin/curl").unlink()
+        self.stage = self.tmp / "pkgs"
+        self.extra_env["AURORA_RELEASE_URL"] = self.stage.as_uri()
+
+    def test_install_from_a_staged_copy(self):
+        self.mac("j293")
+        self.install()
+        self.assertTrue(self.boot.read_bytes().startswith(b"M1N1:" + flow.M1N1_BASE.encode() + b"\n"))
+        self.assertIn("linux-aurora", (self.fake / "installed").read_text().split())
+
+    def test_a_staged_copy_is_still_checked(self):
+        self.mac("j293")
+        with open(self.stage / "libfprint-1.94.100-1.1-aarch64.pkg.tar.zst", "ab") as f:
+            f.write(b"x")
+        proc = self.install(check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("does not match its published checksum", proc.stderr)
+        self.assertEqual(self.boot.read_bytes(), b"M1N1:original\n")
+        self.assertNotIn("pacman -U", self.log())
+
+    def test_a_file_missing_from_the_staged_copy(self):
+        self.mac("j293")
+        (self.stage / "aurora-touchid-20261003-1-any.pkg.tar.zst").unlink()
+        proc = self.install(check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("could not download aurora-touchid-20261003-1-any.pkg.tar.zst", proc.stderr)
+        self.assertNotIn("pacman -U", self.log())
 
 
 class UpgradeTest(flow.M3FlowBase):

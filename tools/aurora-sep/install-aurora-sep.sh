@@ -161,8 +161,11 @@ VERSION=7.1.12.aurora2-12.0
 TAG=sep-7.1.12.aurora2-12.0
 # Packages are fetched from this script's own tag, never from "latest": the
 # checksums below belong to this release and nothing else.
-RELEASE_URL=https://github.com/iconidentify/aurora-linux/releases/download/$TAG
-RELEASES_API=https://api.github.com/repos/iconidentify/aurora-linux/releases
+# AURORA_RELEASE_URL and AURORA_RELEASES_API are a staging or mirror override
+# for these two (any URL curl takes, file:// included); the checksums below
+# still decide what is installed.
+RELEASE_URL=${AURORA_RELEASE_URL:-https://github.com/iconidentify/aurora-linux/releases/download/$TAG}
+RELEASES_API=${AURORA_RELEASES_API:-https://api.github.com/repos/iconidentify/aurora-linux/releases}
 # Where to always get the current script, whatever this copy turns out to be.
 LATEST_URL=https://github.com/iconidentify/aurora-linux/releases/latest/download/install-aurora-sep.sh
 PACKAGES=(
