@@ -66,12 +66,17 @@ class M3PathTest(unittest.TestCase):
         (self.esp / "m1n1" / "boot.bin").write_bytes(b"m1n1-old\x00\x01" * 8)
         (self.tmp / "m1n1.bin").write_bytes(b"m1n1")
 
-    def mac(self, board, iboot=GOOD_IBOOT, stub="14.8.3"):
+    def mac(self, board, iboot=GOOD_IBOOT, stub="14.8.3", stage1="v1.6.1-dirty"):
         (self.dt / "compatible").write_bytes(
             b"".join(c.encode() + b"\0" for c in BOARDS[board])
         )
         if iboot is not None:
             (self.dt / "chosen" / "asahi,iboot2-version").write_bytes(iboot.encode() + b"\0")
+        stage1_node = self.dt / "chosen" / "asahi,m1n1-stage1-version"
+        if stage1 is None:
+            stage1_node.unlink(missing_ok=True)
+        else:
+            stage1_node.write_bytes(stage1.encode() + b"\0")
         info = self.esp / "asahi" / "stub_info.json"
         if stub is None:
             info.unlink(missing_ok=True)
@@ -149,6 +154,45 @@ esp_bootbin() {{ [[ -f '{self.esp}/m1n1/boot.bin' ]] && echo '{self.esp}/m1n1/bo
     def test_stub_iboot_unreported(self):
         self.mac("j516s", iboot=None, stub=None)
         self.assertIn("not reported", self.run_sh("m3_stub_problem").stdout)
+
+    # Stage 1
+
+    def test_stage1_versions_shipped(self):
+        # A release decision: widen it only after a captured boot on the
+        # m3pro and on an Air with the new stage 1.
+        self.assertEqual(re.search(r'^M3_STAGE1_VERSIONS="([^"]*)"$', _SRC, re.M).group(1), "v1.6.1-dirty")
+
+    def test_stage1_ok(self):
+        self.mac("j516s")
+        self.assertEqual(self.run_sh("m3_stage1_problem").stdout, "")
+
+    def test_stage1_other_or_missing(self):
+        for stage1, why in [("v1.6.1", "stage 1 is v1.6.1"), ("v1.7.0-dirty", "stage 1 is v1.7.0-dirty"),
+                            ("", "no stage 1 version"), (None, "no stage 1 version")]:
+            with self.subTest(stage1=stage1):
+                self.mac("j516s", stage1=stage1)
+                self.assertIn(why, self.run_sh("m3_stage1_problem").stdout)
+
+    def test_plan_on_another_stage1(self):
+        self.mac("j516s", stage1="v1.7.0")
+        self.assertEqual(self.plan(), "kernel")
+        self.assertIn("only checked with m1n1 stage 1", self.run_sh("m3_plan").stderr)
+        proc = self.run_sh("M3_TRY=1\nm3_plan", check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("stage 1 is v1.7.0", proc.stderr)
+        self.assertIn("Nothing was installed", proc.stderr)
+
+    def test_overlap_marker(self):
+        self.mac("j516s")
+        self.assertEqual(self.run_sh("m3_oslog_overlap_check").stderr, "")
+        (self.dt / "chosen" / "asahi,m1n1-oslog-overlap").write_bytes(b"\0" * 16)
+        err = self.run_sh("m3_oslog_overlap_check").stderr
+        self.assertIn("overlaps where its stage 1 loaded", err)
+        self.assertIn("boot.bin.before-", err)
+        # m3_plan warns on every M3, and installs as before.
+        proc = self.run_sh("m3_plan\necho $M3_MODE")
+        self.assertIn("overlaps", proc.stderr)
+        self.assertEqual(proc.stdout.split()[-1], "handoff")
 
     # Plan
 

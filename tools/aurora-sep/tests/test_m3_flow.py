@@ -164,9 +164,14 @@ class M3FlowBase(unittest.TestCase):
         self.shas[name] = hashlib.sha256(path.read_bytes()).hexdigest()
 
     def mac(self, board, kernel="linux-asahi", m1n1="m1n1-stock", bootbin=b"M1N1:original\n",
-            stub="14.8.3", iboot="iBoot-10151.140.19.700.2"):
+            stub="14.8.3", iboot="iBoot-10151.140.19.700.2", stage1="v1.6.1-dirty"):
         (self.tmp / "dt/compatible").write_bytes(b"".join(c.encode() + b"\0" for c in BOARDS[board]))
         (self.tmp / "dt/chosen/asahi,iboot2-version").write_bytes(iboot.encode() + b"\0")
+        stage1_node = self.tmp / "dt/chosen/asahi,m1n1-stage1-version"
+        if stage1 is None:
+            stage1_node.unlink(missing_ok=True)
+        else:
+            stage1_node.write_bytes(stage1.encode() + b"\0")
         (self.tmp / "esp/asahi/stub_info.json").write_text(
             '{"system_version": {"ProductVersion": "%s"}}' % stub)
         (self.fake / "installed").write_text(kernel + "\n")
@@ -315,6 +320,59 @@ class M3FlowTest(M3FlowBase):
 
     def test_listed_m3_pro_on_another_stub_is_kernel_only(self):
         self.assert_kernel_only("j516s", stub="15.6")
+
+    # Stage 1 (M3_STAGE1_VERSIONS) and the log-buffer overlap marker
+
+    def test_listed_m3_pro_on_another_stage1_is_kernel_only(self):
+        self.assert_kernel_only("j516s", stage1="v1.7.0")
+
+    def test_listed_m3_pro_without_a_stage1_version_is_kernel_only(self):
+        self.assert_kernel_only("j516s", stage1=None)
+
+    def test_handoff_mac_on_another_stage1_stops_with_nothing_installed(self):
+        # A Mac with the handoff from an earlier install (M3_TRY=1 from its
+        # record) keeps its boot.bin as it is: nothing is downloaded or rebuilt.
+        self.mac("j516s")
+        self.install()
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff t6030")
+        self.mac("j516s", kernel="linux-aurora", bootbin=self.boot.read_bytes(), stage1="v1.7.0")
+        before = self.boot.read_bytes()
+        before_log = self.log()
+        proc = self.install(check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("stage 1 is v1.7.0", proc.stderr)
+        self.assertIn("Nothing was installed", proc.stderr)
+        self.assertEqual(self.boot.read_bytes(), before)
+        self.assertNotIn("curl ", self.log()[len(before_log):])
+
+    def test_trial_on_another_stage1_is_refused(self):
+        self.mac("j514s", stage1="v1.5.2")
+        before = self.boot.read_bytes()
+        proc = self.install(try_=1, check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("stage 1 is v1.5.2", proc.stderr)
+        self.assertIn("Nothing was installed", proc.stderr)
+        self.assertEqual(self.boot.read_bytes(), before)
+        self.assertNotIn("pacman -U", self.log())
+
+    def test_oslog_overlap_is_reported_after_a_boot(self):
+        self.mac("j516s")
+        self.install()
+        (self.tmp / "dt/chosen/asahi,m1n1-oslog-overlap").write_bytes(b"\0" * 16)
+        proc = self.install()
+        self.assertIn("display log buffer overlaps", proc.stderr)
+        self.assertIn("--m3-report", proc.stderr)
+        (self.tmp / "dt/chosen/asahi,m1n1-oslog-overlap").unlink()
+        self.assertNotIn("overlaps", self.install().stderr)
+
+    def test_m1_ignores_the_m3_stage1_and_overlap_checks(self):
+        # M1 and M2 are unchanged: no stage 1 gate, no overlap warning.
+        self.mac("j314s", stage1=None)
+        (self.tmp / "dt/chosen/asahi,m1n1-oslog-overlap").write_bytes(b"\0" * 16)
+        proc = self.install()
+        self.assertNotIn("stage 1", proc.stderr + proc.stdout)
+        self.assertNotIn("overlaps", proc.stderr + proc.stdout)
+        self.assertTrue(self.boot.read_bytes().startswith(b"M1N1:m1n1-aurora-1.6.1.aurora3-1\n"))
 
     def test_trial_refused_on_an_m3(self):
         # A plain M3 that isn't an Air (the Air's opt-in is in test_m3_air.py).

@@ -354,6 +354,16 @@ M3_AIR_DRY_RUN_SWITCHES="chosen.asahi,t8122-gpu-diag=1 chosen.asahi,t8122-gpu-ha
 # reports the stub's iBoot as asahi,iboot2-version.
 M3_STUB_VERSION=14.8.3
 M3_STUB_IBOOT=iBoot-10151.140.19
+# The M3 m1n1 (stage 2) must fit below the display processors' log buffers,
+# which every M3 boot so far placed 0x120000 bytes above where stage 1 loaded
+# m1n1. That has only been seen with these stage 1 versions, as m1n1 reports
+# them in /chosen/asahi,m1n1-stage1-version; the handoff is refused with any
+# other, and on a Mac that reports none.
+M3_STAGE1_VERSIONS="v1.6.1-dirty"
+# m1n1 (aurora8.5-2 and later) adds this node when one of those log buffers
+# overlaps where stage 1 loaded it. It keeps the buffer reserved and boots on,
+# but it was never checked in that layout.
+M3_OSLOG_OVERLAP=chosen/asahi,m1n1-oslog-overlap
 M1N1_CONF=/etc/m1n1.conf
 # What update-m1n1 puts at the start of boot.bin.
 M1N1_BIN=/usr/lib/asahi-boot/m1n1.bin
@@ -524,6 +534,30 @@ m3_stub_problem() {
   return 0
 }
 
+# Why this Mac's m1n1 stage 1 isn't one the M3 m1n1 is checked with (see
+# M3_STAGE1_VERSIONS); nothing when it is.
+m3_stage1_problem() {
+  local stage1
+  stage1=$({ tr -d '\0' <"$DT/chosen/asahi,m1n1-stage1-version"; } 2>/dev/null) || stage1=""
+  if [[ -z $stage1 ]]; then
+    echo "its m1n1 reports no stage 1 version"
+  elif [[ " $M3_STAGE1_VERSIONS " != *" $stage1 "* ]]; then
+    echo "its m1n1 stage 1 is $stage1"
+  fi
+  return 0
+}
+
+# After a boot: warn when this boot's m1n1 found a display log buffer over
+# the place stage 1 loaded it (M3_OSLOG_OVERLAP). Only an M3 m1n1 sets it.
+m3_oslog_overlap_check() {
+  [[ -e $DT/$M3_OSLOG_OVERLAP ]] || return 0
+  warn "this boot's m1n1 reports that a display log buffer overlaps where its stage 1 loaded
+    it ($DT/$M3_OSLOG_OVERLAP). This m1n1 was only checked with those buffers clear of it.
+    Please report it at https://github.com/iconidentify/aurora-linux/issues with the file that
+    --m3-report writes. The boot loader this Mac had before the handoff is kept on the EFI
+    partition as m1n1/boot.bin.before-<version>."
+}
+
 # True when a downloaded m1n1-aurora package knows every switch this Mac's
 # handoff needs (m3_switches): asahi,t6030-gpu for chosen.asahi,t6030-gpu=1.
 m1n1_pkg_has_handoff() {
@@ -677,6 +711,7 @@ m3_plan() {
   fi
   board=$(this_board)
   if is_m3_air; then air=1; fi
+  m3_oslog_overlap_check
   # An update never takes the handoff away again: once a Mac has it (listed, or
   # tried with --m3-handoff), a plain run keeps it, and its checks still apply.
   if ((M3_TRY == 0)) && [[ $(m3_recorded_mode) == handoff ]]; then
@@ -731,6 +766,14 @@ m3_plan() {
     warn "the $(m3_handoff_name) is only tested with the macOS $M3_STUB_VERSION
     system-firmware stub, and this Mac differs: $problem. Installing the kernel only;
     boot.bin stays as it is."
+    return 0
+  fi
+  problem=$(m3_stage1_problem)
+  if [[ -n $problem ]]; then
+    ((M3_TRY == 0)) || die "--m3-handoff: this release's M3 m1n1 is only checked with m1n1 stage 1
+    $M3_STAGE1_VERSIONS, and this Mac differs: $problem. Nothing was installed."
+    warn "the $(m3_handoff_name) is only checked with m1n1 stage 1 $M3_STAGE1_VERSIONS, and
+    this Mac differs: $problem. Installing the kernel only; boot.bin stays as it is."
     return 0
   fi
   if update_m1n1_frozen_by_others; then
@@ -1651,11 +1694,13 @@ m3_report() {
     pacman -Q linux-aurora m1n1-aurora m1n1 2>/dev/null || true
     printf 'm3-mode: '; cat "$STATE/m3-mode" 2>/dev/null || echo -
     echo "m1n1.conf switches:"; grep '^chosen\.' "$M1N1_CONF" 2>/dev/null || echo -
+    printf 'm1n1-oslog-overlap: '; if [[ -e $DT/$M3_OSLOG_OVERLAP ]]; then echo present; else echo absent; fi
+    echo "reserved display logs:"; ls -d "$DT"/reserved-memory/dcp-oslog@* 2>/dev/null || echo -
   } >"$dir/system.txt"
   { dmesg 2>/dev/null || $sudo dmesg; } | grep -iE "$M3_REPORT_DMESG" | grep -viE 'serialnumber|serial number' |
     sed -E 's/([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}/xx:xx:xx:xx:xx:xx/g' >"$dir/dmesg-m3.txt" || true
   mkdir -p "$dir/chosen"
-  for f in "$DT"/chosen/asahi,t8122-* "$DT"/chosen/asahi,t6030-*; do
+  for f in "$DT"/chosen/asahi,t8122-* "$DT"/chosen/asahi,t6030-* "$DT/$M3_OSLOG_OVERLAP"; do
     [[ -e $f ]] && cp -r "$f" "$dir/chosen/"
   done
   {
@@ -1670,6 +1715,7 @@ m3_report() {
     for f in /sys/class/drm/card*-*/status; do [[ -e $f ]] && echo "$f: $(cat "$f")"; done
   } >"$dir/usb-display.txt" 2>&1
   tar czf "$out" -C "$dir" . && rm -rf "$dir"
+  m3_oslog_overlap_check
   say "Report written to $out
     Attach it to your issue at https://github.com/iconidentify/aurora-linux/issues, together
     with the serial log if you recorded one. It has no full kernel log, no USB serial numbers
@@ -2070,6 +2116,11 @@ fingerprint.
      sudo dmesg | grep -E 't6030-display|\[drm\] Initialized|GPU firmware|aop.*crash|apple_sep' | head -12
      nproc
      ls /proc/device-tree/soc/usb4-pcie-tunnel-0/pcie@730000000/pci@0,0/apple,tunable 2>&1
+     ls /proc/device-tree/chosen/asahi,m1n1-oslog-overlap 2>&1
+     ls -d /proc/device-tree/reserved-memory/dcp-oslog@* 2>&1
+   With the handoff, the first of those two must say "No such file or
+   directory": if the node exists, report that before anything else. The
+   second lists three dcp-oslog nodes on an M3 Pro and one on an Air.
    In the report header, set **M3 path:** to kernel, handoff, or handoff
    with --m3-handoff.
 

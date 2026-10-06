@@ -586,6 +586,19 @@ class M3AirDryRunTest(M3AirTest):
         # The boot loader the Mac had before its first test stays the kept copy.
         self.assertEqual(self.kept_copy().read_bytes(), b"M1N1:original\n")
 
+    def test_display_handoff_needs_the_checked_stage1(self):
+        # Scott's Air on another m1n1 stage 1: --m3-handoff stops with nothing
+        # downloaded, and a plain run stays kernel-only.
+        self.mac("j613", stage1="v1.7.0")
+        before = self.boot.read_bytes()
+        proc = self.air_install(try_=1, display=1, check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("stage 1 is v1.7.0", proc.stderr)
+        self.assertIn("Nothing was installed", proc.stderr)
+        self.assertEqual(self.boot.read_bytes(), before)
+        self.assertEqual(self.downloaded(), [])
+        self.assertEqual(self.plan(display=1), "kernel")
+
     def test_install_syncs_after_the_rebuild(self):
         src = SRC[SRC.index("      m3_verify_bootbin\n"):]
         self.assertTrue(re.match(r"      m3_verify_bootbin\n(\s*#.*\n)*\s*sync\n", src), src[:200])
