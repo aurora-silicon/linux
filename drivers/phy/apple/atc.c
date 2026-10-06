@@ -3605,7 +3605,7 @@ static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 		{ "apple,tunable-lane0-dp", &atcphy->tunables.lane_dp[0], atcphy->res.core },
 		{ "apple,tunable-lane1-dp", &atcphy->tunables.lane_dp[1], atcphy->res.core },
 	};
-	if (atcphy->hw->gen == ATCPHY_GENERATION_T8122) {
+	if (atcphy->hw->gen == ATCPHY_GENERATION_T8122 && !atcphy->hw->dp_t8122) {
 		tunable_count = ARRAY_SIZE(tunables) - 2;
 		atcphy->tunables.lane_dp[0] = NULL;
 		atcphy->tunables.lane_dp[1] = NULL;
@@ -3614,6 +3614,8 @@ static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 
 	for (size_t i = 0; i < tunable_count; i++) {
 		struct apple_tunable *tunable;
+		bool lane_dp = tunables[i].tunable == &atcphy->tunables.lane_dp[0] ||
+			       tunables[i].tunable == &atcphy->tunables.lane_dp[1];
 
 		if (!atcphy->hw->has_usb4 &&
 		    (tunables[i].tunable == &atcphy->tunables.lane_usb4[0] ||
@@ -3624,6 +3626,14 @@ static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 
 		tunable = devm_apple_tunable_parse(atcphy->dev, atcphy->np, tunables[i].dt_name,
 						   tunables[i].res);
+		/*
+		 * The T8122 DP lane sequence programs the lanes itself; the
+		 * bootloader may add DP lane tunables, which are then applied too.
+		 */
+		if (atcphy->hw->dp_t8122 && lane_dp && tunable == ERR_PTR(-ENOENT)) {
+			*tunables[i].tunable = NULL;
+			continue;
+		}
 		if (IS_ERR(tunable)) {
 			if (PTR_ERR(tunable) != -ENOENT || !atcphy->hw->optional_tunables) {
 				dev_err(atcphy->dev, "Failed to read tunable %s: %ld\n",
