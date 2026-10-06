@@ -696,6 +696,21 @@ fn build_images(
         }
         dev_info!(dev, "M3: fast-die sensor mask {:#x}, from the boot loader\n", mask);
     }
+    // On T8122, log and require the two HwDataB words the firmware's power management depends
+    // on: it powers the GPU cores up for a job only when +0xa38 and +0xa40 are both nonzero.
+    if core::ptr::eq(soc, &crate::m3_soc::T8122) {
+        type B = raw::HwDataBG15V14_8_3;
+        let a38 = read_u32(&hwdata, offset_of!(B, unk_460))?;
+        let a40 = read_u32(&hwdata, offset_of!(B, unk_468))?;
+        dev_info!(dev, "M3: HwDataB +0xa38 {:#x}, +0xa40 {:#x}\n", a38, a40);
+        if a38 == 0 || a40 == 0 {
+            dev_err!(
+                dev,
+                "M3: HwDataB +0xa38 or +0xa40 is 0; the firmware would not power the GPU cores\n"
+            );
+            return Err(EINVAL);
+        }
+    }
     fill_io_mappings(dev, cfg, io_mappings, iomaps, &mut hwdata)?;
     images[HWDATA] = Some(hwdata);
 
