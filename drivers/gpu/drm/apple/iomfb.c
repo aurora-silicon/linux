@@ -419,11 +419,45 @@ static void dcpep_got_msg(struct apple_dcp *dcp, u64 message)
 		dcpep_handle_cb(dcp, ctx_id, data, length, offset);
 }
 
+static void dcp_modes_dimensions_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp, dimensions_wq);
+	u64 generation;
+
+	scoped_guard(mutex, &dcp->modes_lock)
+		generation = dcp->dimensions_generation;
+	dcp_set_dimensions(dcp, generation);
+}
+
+void dcp_modes_init(struct apple_dcp *dcp)
+{
+	mutex_init(&dcp->modes_lock);
+	INIT_WORK(&dcp->dimensions_wq, dcp_modes_dimensions_work);
+	disable_work(&dcp->dimensions_wq);
+}
+
+bool dcp_modes_for_connector(struct apple_dcp *dcp,
+			     struct apple_connector *connector)
+{
+	lockdep_assert_held(&dcp->modes_lock);
+	return dcp->modes_admitted && READ_ONCE(dcp->connector) == connector;
+}
+
 void dcp_modes_begin_attachment(struct apple_dcp *dcp)
 {
 	guard(mutex)(&dcp->modes_lock);
 	dcp->modes_generation++;
 	dcp->modes_admitted = false;
+}
+
+bool dcp_modes_end_typec(struct apple_dcp *dcp, struct apple_dcp_typec_route *route)
+{
+	guard(mutex)(&dcp->modes_lock);
+	if (READ_ONCE(dcp->active_typec_route) != route)
+		return false;
+	dcp->modes_generation++;
+	dcp->modes_admitted = false;
+	return true;
 }
 
 u64 dcp_modes_transfer_begin(struct apple_dcp *dcp)
@@ -450,6 +484,52 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
 	return ret;
 }
 
+int dcp_attributes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
+			   u64 generation)
+{
+	int width_mm, height_mm, ret, i;
+	bool backlight_control, ext;
+
+	guard(mutex)(&dcp->modes_lock);
+	if (generation != dcp->modes_generation)
+		return -ESTALE;
+	ret = parse_display_attributes(handle, &width_mm, &height_mm, &backlight_control);
+	if (ret)
+		return ret;
+	dcp->width_mm = width_mm;
+	dcp->height_mm = height_mm;
+	if (!width_mm || !height_mm) {
+		width_mm = dcp->panel.width_mm;
+		height_mm = dcp->panel.height_mm;
+	}
+	for (i = 0; i < dcp->nr_modes; ++i) {
+		dcp->modes[i].mode.width_mm = width_mm;
+		dcp->modes[i].mode.height_mm = height_mm;
+	}
+	dcp->dimensions_generation = generation;
+	schedule_work(&dcp->dimensions_wq);
+	ext = backlight_control && !dcp_has_panel(dcp);
+	if (ext != READ_ONCE(dcp->ext_backlight)) {
+		WRITE_ONCE(dcp->ext_backlight, ext);
+		if (dcp->connector)
+			schedule_work(&dcp->connector->bl_sync_wq);
+	}
+	return 0;
+}
+
+void dcp_modes_release(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	disable_work_sync(&dcp->dimensions_wq);
+	guard(mutex)(&dcp->modes_lock);
+	dcp->modes_generation++;
+	dcp->modes_admitted = false;
+	kfree(dcp->modes);
+	dcp->modes = NULL;
+	dcp->nr_modes = 0;
+}
+
 int dcp_get_modes(struct drm_connector *connector)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
@@ -471,7 +551,7 @@ int dcp_get_modes(struct drm_connector *connector)
 	dcp = platform_get_drvdata(pdev);
 
 	mutex_lock(&dcp->modes_lock);
-	count = dcp->modes_admitted ? dcp->nr_modes : 0;
+	count = dcp_modes_for_connector(dcp, apple_connector) ? dcp->nr_modes : 0;
 	for (i = 0; i < count; ++i) {
 		if (dcp->modes[i].vrr) {
 			u16 lo = dcp->modes[i].min_vrr >> 16;
@@ -536,13 +616,14 @@ int dcp_get_modes(struct drm_connector *connector)
 }
 
 /* The user may own drm_display_mode, so we need to search for our copy */
-bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
-		 struct dcp_display_mode *out)
+static bool lookup_mode_locked(struct apple_dcp *dcp,
+			       const struct drm_display_mode *mode,
+			       struct dcp_display_mode *out)
 {
 	bool found = false;
 	int i;
 
-	mutex_lock(&dcp->modes_lock);
+	lockdep_assert_held(&dcp->modes_lock);
 	if (!dcp->modes_admitted)
 		goto out_unlock;
 	for (i = 0; i < dcp->nr_modes; ++i) {
@@ -555,8 +636,14 @@ bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
 		}
 	}
 out_unlock:
-	mutex_unlock(&dcp->modes_lock);
 	return found;
+}
+
+bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
+		 struct dcp_display_mode *out)
+{
+	guard(mutex)(&dcp->modes_lock);
+	return lookup_mode_locked(dcp, mode, out);
 }
 
 enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
@@ -570,7 +657,10 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 		return MODE_ERROR;
 	dcp = platform_get_drvdata(pdev);
 
-	return lookup_mode(dcp, mode, NULL) ? MODE_OK : MODE_BAD;
+	guard(mutex)(&dcp->modes_lock);
+	if (!dcp_modes_for_connector(dcp, apple_connector))
+		return MODE_BAD;
+	return lookup_mode_locked(dcp, mode, NULL) ? MODE_OK : MODE_BAD;
 }
 
 int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,

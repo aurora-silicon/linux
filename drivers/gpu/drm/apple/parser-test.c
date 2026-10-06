@@ -3,6 +3,7 @@
 #include <linux/slab.h>
 #include <linux/unaligned.h>
 
+#include "connector.h"
 #include "dcp-internal.h"
 #include "dcp-property.h"
 #include "iomfb_internal.h"
@@ -439,7 +440,7 @@ static void parser_replacement(struct kunit *test)
 	struct drm_display_mode requested;
 
 	KUNIT_ASSERT_NOT_NULL(test, dcp);
-	mutex_init(&dcp->modes_lock);
+	dcp_modes_init(dcp);
 	blob = make_blob(test, &record, 1);
 	KUNIT_ASSERT_NOT_NULL(test, blob);
 	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
@@ -479,7 +480,7 @@ static void parser_attachment_admission(struct kunit *test)
 	struct drm_display_mode requested;
 
 	KUNIT_ASSERT_NOT_NULL(test, dcp);
-	mutex_init(&dcp->modes_lock);
+	dcp_modes_init(dcp);
 	spin_lock_init(&dcp->mode_state.lock);
 	blob = make_blob(test, &record, 1);
 	KUNIT_ASSERT_NOT_NULL(test, blob);
@@ -526,7 +527,7 @@ static void parser_stale_transfer(struct kunit *test)
 	u64 old_generation, current_generation;
 
 	KUNIT_ASSERT_NOT_NULL(test, dcp);
-	mutex_init(&dcp->modes_lock);
+	dcp_modes_init(dcp);
 	blob = make_blob(test, &record, 1);
 	KUNIT_ASSERT_NOT_NULL(test, blob);
 	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
@@ -562,6 +563,263 @@ static void parser_stale_transfer(struct kunit *test)
 	kfree(dcp->modes);
 }
 
+static void parser_connector_ownership(struct kunit *test)
+{
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	struct apple_connector *fixed = kunit_kzalloc(test, sizeof(*fixed), GFP_KERNEL);
+	struct apple_connector *borrowed = kunit_kzalloc(test, sizeof(*borrowed), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	KUNIT_ASSERT_NOT_NULL(test, fixed);
+	KUNIT_ASSERT_NOT_NULL(test, borrowed);
+	dcp_modes_init(dcp);
+	mutex_lock(&dcp->modes_lock);
+	dcp->connector = borrowed;
+	dcp->modes_admitted = true;
+	/* Fixed outputs retain their pipeline even when probing is forced. */
+	fixed->base.force = DRM_FORCE_ON;
+	KUNIT_EXPECT_FALSE(test, dcp_modes_for_connector(dcp, fixed));
+	KUNIT_EXPECT_TRUE(test, dcp_modes_for_connector(dcp, borrowed));
+	dcp->connector = fixed;
+	dcp->modes_admitted = false;
+	KUNIT_EXPECT_FALSE(test, dcp_modes_for_connector(dcp, fixed));
+	dcp->modes_admitted = true;
+	KUNIT_EXPECT_TRUE(test, dcp_modes_for_connector(dcp, fixed));
+	KUNIT_EXPECT_FALSE(test, dcp_modes_for_connector(dcp, borrowed));
+	mutex_unlock(&dcp->modes_lock);
+}
+
+static void parser_route_retirement(struct kunit *test)
+{
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	struct apple_connector *fixed = kunit_kzalloc(test, sizeof(*fixed), GFP_KERNEL);
+	struct apple_dcp_typec_route *route = kunit_kzalloc(test, 1, GFP_KERNEL);
+	struct apple_dcp_typec_route *other = kunit_kzalloc(test, 1, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	KUNIT_ASSERT_NOT_NULL(test, fixed);
+	KUNIT_ASSERT_NOT_NULL(test, route);
+	KUNIT_ASSERT_NOT_NULL(test, other);
+	dcp_modes_init(dcp);
+	dcp->connector = fixed;
+	dcp->active_typec_route = route;
+	dcp->modes_admitted = true;
+	KUNIT_EXPECT_FALSE(test, dcp_modes_end_typec(dcp, other));
+	KUNIT_EXPECT_EQ(test, dcp_modes_transfer_begin(dcp), 0ULL);
+	KUNIT_EXPECT_TRUE(test, dcp_modes_end_typec(dcp, route));
+	KUNIT_EXPECT_EQ(test, dcp_modes_transfer_begin(dcp), 1ULL);
+	KUNIT_EXPECT_FALSE(test, dcp->modes_admitted);
+	dcp->active_typec_route = NULL;
+	KUNIT_EXPECT_FALSE(test, dcp_modes_end_typec(dcp, route));
+	KUNIT_EXPECT_EQ(test, dcp_modes_transfer_begin(dcp), 1ULL);
+	dcp_modes_release(dcp);
+}
+
+static void parser_rejected_replacement(struct kunit *test)
+{
+	struct parser_record record = valid_record(7, 10);
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	struct dcp_display_mode *previous;
+	struct dcp_parse_ctx ctx;
+	struct parser_blob *blob;
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	dcp_modes_init(dcp);
+	blob = make_blob(test, &record, 1);
+	KUNIT_ASSERT_NOT_NULL(test, blob);
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	ctx.dcp = &parser_dcp;
+	KUNIT_ASSERT_EQ(test, dcp_modes_replace(dcp, &ctx, 0), 0);
+	previous = dcp->modes;
+	record.missing = MISSING_SCORE;
+	blob = make_blob(test, &record, 1);
+	KUNIT_ASSERT_NOT_NULL(test, blob);
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	ctx.dcp = &parser_dcp;
+	KUNIT_EXPECT_EQ(test, dcp_modes_replace(dcp, &ctx, 0), -EINVAL);
+	KUNIT_EXPECT_PTR_EQ(test, dcp->modes, previous);
+	KUNIT_EXPECT_EQ(test, dcp->nr_modes, 1U);
+	KUNIT_EXPECT_TRUE(test, dcp->modes_admitted);
+	dcp_modes_begin_attachment(dcp);
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	ctx.dcp = &parser_dcp;
+	KUNIT_EXPECT_EQ(test, dcp_modes_replace(dcp, &ctx, 1), -EINVAL);
+	KUNIT_EXPECT_FALSE(test, dcp->modes_admitted);
+	blob = make_blob(test, &record, 0);
+	KUNIT_ASSERT_NOT_NULL(test, blob);
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	ctx.dcp = &parser_dcp;
+	KUNIT_ASSERT_EQ(test, dcp_modes_replace(dcp, &ctx, 1), 0);
+	KUNIT_EXPECT_EQ(test, dcp->nr_modes, 0U);
+	KUNIT_EXPECT_TRUE(test, dcp->modes_admitted);
+	dcp_modes_release(dcp);
+	KUNIT_EXPECT_PTR_EQ(test, dcp->modes, NULL);
+	KUNIT_EXPECT_FALSE(test, dcp->modes_admitted);
+}
+
+static void parser_attribute_epoch(struct kunit *test)
+{
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	struct parser_blob *blob = kunit_kzalloc(test, sizeof(*blob), GFP_KERNEL);
+	struct dcp_parse_ctx ctx;
+	u64 generation;
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	KUNIT_ASSERT_NOT_NULL(test, blob);
+	dcp_modes_init(dcp);
+	put_unaligned_le32(0xd3, blob->data);
+	blob->size = 4;
+	blob_tag(blob, 1, 3);
+	blob_int(blob, "MaxHorizontalImageSize", 52);
+	blob_int(blob, "MaxVerticalImageSize", 29);
+	blob_bool(blob, "SupportsBacklightControl", true);
+	generation = dcp_modes_transfer_begin(dcp);
+	dcp_modes_begin_attachment(dcp);
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	KUNIT_EXPECT_EQ(test, dcp_attributes_replace(dcp, &ctx, generation), -ESTALE);
+	KUNIT_EXPECT_EQ(test, dcp->width_mm, 0);
+	KUNIT_EXPECT_FALSE(test, dcp->ext_backlight);
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	KUNIT_ASSERT_EQ(test, dcp_attributes_replace(dcp, &ctx, 1), 0);
+	KUNIT_EXPECT_EQ(test, dcp->width_mm, 520);
+	KUNIT_EXPECT_EQ(test, dcp->height_mm, 290);
+	KUNIT_EXPECT_TRUE(test, dcp->ext_backlight);
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	KUNIT_EXPECT_EQ(test, dcp_attributes_replace(dcp, &ctx, generation), -ESTALE);
+	KUNIT_EXPECT_EQ(test, dcp->width_mm, 520);
+	dcp_modes_release(dcp);
+}
+
+static void parser_attributes_malformed(struct kunit *test)
+{
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	struct parser_blob *blob = kunit_kzalloc(test, sizeof(*blob), GFP_KERNEL);
+	struct dcp_parse_ctx ctx;
+	const s64 invalid[] = { -1, INT_MAX / 10 + 1, S64_MAX };
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	KUNIT_ASSERT_NOT_NULL(test, blob);
+	dcp_modes_init(dcp);
+	dcp->width_mm = 520;
+	dcp->height_mm = 290;
+	dcp->ext_backlight = true;
+	put_unaligned_le32(0xd3, blob->data);
+	blob->size = 4;
+	blob_tag(blob, 2, 0);
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	KUNIT_EXPECT_LT(test, dcp_attributes_replace(dcp, &ctx, 0), 0);
+	KUNIT_ASSERT_EQ(test, parse(blob->data, 4, &ctx), 0);
+	KUNIT_EXPECT_LT(test, dcp_attributes_replace(dcp, &ctx, 0), 0);
+	blob->size = 4;
+	blob_tag(blob, 1, 1);
+	blob_int(blob, "Unknown", 1);
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size - 1, &ctx), 0);
+	KUNIT_EXPECT_LT(test, dcp_attributes_replace(dcp, &ctx, 0), 0);
+	for (i = 0; i < ARRAY_SIZE(invalid); ++i) {
+		blob->size = 4;
+		blob_tag(blob, 1, 1);
+		blob_int(blob, "MaxHorizontalImageSize", invalid[i]);
+		KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+		KUNIT_EXPECT_LT(test, dcp_attributes_replace(dcp, &ctx, 0), 0);
+	}
+	KUNIT_EXPECT_EQ(test, dcp->width_mm, 520);
+	KUNIT_EXPECT_EQ(test, dcp->height_mm, 290);
+	KUNIT_EXPECT_TRUE(test, dcp->ext_backlight);
+	dcp_modes_release(dcp);
+}
+
+static void parser_attribute_deferred(struct kunit *test)
+{
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	struct apple_connector *connector = kunit_kzalloc(test, sizeof(*connector), GFP_KERNEL);
+	struct drm_device *dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
+	struct parser_blob *blob = kunit_kzalloc(test, sizeof(*blob), GFP_KERNEL);
+	struct dcp_parse_ctx ctx;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	KUNIT_ASSERT_NOT_NULL(test, connector);
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	KUNIT_ASSERT_NOT_NULL(test, blob);
+	dcp_modes_init(dcp);
+	mutex_init(&dev->mode_config.mutex);
+	connector->base.dev = dev;
+	dcp->connector = connector;
+	dcp->panel.width_mm = 600;
+	dcp->modes = kmalloc_obj(*dcp->modes);
+	KUNIT_ASSERT_NOT_NULL(test, dcp->modes);
+	dcp->nr_modes = 1;
+	put_unaligned_le32(0xd3, blob->data);
+	blob->size = 4;
+	blob_tag(blob, 1, 2);
+	blob_int(blob, "MaxHorizontalImageSize", 52);
+	blob_int(blob, "MaxVerticalImageSize", 29);
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	enable_work(&dcp->dimensions_wq);
+	/* RX must return while a probe holds the DRM lock awaiting a reply. */
+	mutex_lock(&dev->mode_config.mutex);
+	ret = dcp_attributes_replace(dcp, &ctx, 0);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, dcp->modes[0].mode.width_mm, 520);
+	mutex_unlock(&dev->mode_config.mutex);
+	flush_work(&dcp->dimensions_wq);
+	KUNIT_EXPECT_EQ(test, connector->base.display_info.width_mm, 520U);
+	KUNIT_EXPECT_EQ(test, connector->base.display_info.height_mm, 290U);
+	dcp_modes_release(dcp);
+}
+
+static void parser_dimensions_lifetime(struct kunit *test)
+{
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	struct apple_connector *connector = kunit_kzalloc(test, sizeof(*connector), GFP_KERNEL);
+	struct drm_device *dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	KUNIT_ASSERT_NOT_NULL(test, connector);
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	dcp_modes_init(dcp);
+	mutex_init(&dev->mode_config.mutex);
+	connector->base.dev = dev;
+	dcp->connector = connector;
+	dcp->width_mm = 520;
+	dcp->height_mm = 290;
+	KUNIT_EXPECT_FALSE(test, schedule_work(&dcp->dimensions_wq));
+	KUNIT_EXPECT_EQ(test, connector->base.display_info.width_mm, 0U);
+	enable_work(&dcp->dimensions_wq);
+	schedule_work(&dcp->dimensions_wq);
+	flush_work(&dcp->dimensions_wq);
+	KUNIT_EXPECT_EQ(test, connector->base.display_info.width_mm, 520U);
+	disable_work_sync(&dcp->dimensions_wq);
+	dcp->width_mm = 600;
+	KUNIT_EXPECT_FALSE(test, schedule_work(&dcp->dimensions_wq));
+	KUNIT_EXPECT_EQ(test, connector->base.display_info.width_mm, 520U);
+	enable_work(&dcp->dimensions_wq);
+	schedule_work(&dcp->dimensions_wq);
+	flush_work(&dcp->dimensions_wq);
+	KUNIT_EXPECT_EQ(test, connector->base.display_info.width_mm, 600U);
+	dcp_modes_release(dcp);
+	KUNIT_EXPECT_FALSE(test, schedule_work(&dcp->dimensions_wq));
+}
+
+static void parser_catalog_release(struct kunit *test)
+{
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	dcp_modes_init(dcp);
+	dcp->modes = kmalloc_obj(*dcp->modes);
+	KUNIT_ASSERT_NOT_NULL(test, dcp->modes);
+	dcp->nr_modes = 1;
+	dcp->modes_admitted = true;
+	dcp_modes_release(dcp);
+	KUNIT_EXPECT_PTR_EQ(test, dcp->modes, NULL);
+	KUNIT_EXPECT_EQ(test, dcp->nr_modes, 0U);
+	KUNIT_EXPECT_FALSE(test, dcp->modes_admitted);
+	dcp_modes_release(dcp);
+	KUNIT_EXPECT_PTR_EQ(test, dcp->modes, NULL);
+}
+
 static void parser_property_bounds(struct kunit *test)
 {
 	char key[64];
@@ -592,6 +850,14 @@ static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_replacement),
 	KUNIT_CASE(parser_attachment_admission),
 	KUNIT_CASE(parser_stale_transfer),
+	KUNIT_CASE(parser_connector_ownership),
+	KUNIT_CASE(parser_route_retirement),
+	KUNIT_CASE(parser_rejected_replacement),
+	KUNIT_CASE(parser_attribute_epoch),
+	KUNIT_CASE(parser_attributes_malformed),
+	KUNIT_CASE(parser_attribute_deferred),
+	KUNIT_CASE(parser_dimensions_lifetime),
+	KUNIT_CASE(parser_catalog_release),
 	KUNIT_CASE(parser_property_bounds),
 	{}
 };

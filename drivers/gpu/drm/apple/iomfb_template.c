@@ -512,9 +512,8 @@ static void iomfbep_cb_enable_backlight_message_ap_gated(struct apple_dcp *dcp,
 							 u8 *enabled)
 {
 	/*
-	 * update backlight brightness on next swap, on non mini-LED displays
-	 * DCP seems to set an invalid iDAC value after coming out of DPMS.
-	 * syslog: "[BrightnessLCD.cpp:743][AFK]nitsToDBV: iDAC out of range"
+	 * Reapply brightness on the next swap after DPMS wake on panels
+	 * without mini-LED backlights.
 	 */
 	dcp->brightness.update = true;
 	/*
@@ -600,30 +599,16 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 		if (!READ_ONCE(dcp->nr_modes))
 			dev_warn(dcp->dev, "TimingElements without valid modes!\n");
 	} else if (!strcmp(req->key, "DisplayAttributes")) {
-		bool backlight_control = false, ext;
-
-		ret = parse_display_attributes(&ctx, &dcp->width_mm,
-					&dcp->height_mm, &backlight_control);
-
-		/*
-		 * Written once, so the hotplug work never sees a working display
-		 * without its backlight; a display whose attributes do not parse
-		 * gets none. The attributes can arrive after the hotplug work has
-		 * run, so sync the backlight when the answer changes.
-		 */
-		ext = !ret && backlight_control && !dcp_has_panel(dcp);
-		if (ext != READ_ONCE(dcp->ext_backlight)) {
-			WRITE_ONCE(dcp->ext_backlight, ext);
-			if (dcp->connector)
-				schedule_work(&dcp->connector->bl_sync_wq);
-		}
-
+		ret = dcp_attributes_replace(dcp, &ctx, dcp->chunks.modes_generation);
 		if (ret) {
+			if (ret == -ESTALE) {
+				kfree(dcp->chunks.data);
+				dcp->chunks.data = NULL;
+				dcp->chunks.length = 0;
+			}
 			dev_warn(dcp->dev, "failed to parse display attribs\n");
 			return false;
 		}
-
-		dcp_set_dimensions(dcp);
 	}
 
 	return true;

@@ -166,38 +166,36 @@ void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now)
 	spin_unlock_irqrestore(&crtc->base.dev->event_lock, flags);
 }
 
-void dcp_set_dimensions(struct apple_dcp *dcp)
+void dcp_set_dimensions(struct apple_dcp *dcp, u64 generation)
 {
-	int i;
-	int width_mm = dcp->width_mm;
-	int height_mm = dcp->height_mm;
+	struct apple_connector *apple_connector = READ_ONCE(dcp->connector);
+	struct drm_connector *connector = apple_connector ? &apple_connector->base : NULL;
+	int width_mm, height_mm, i;
 
-	if (width_mm == 0 || height_mm == 0) {
+	if (connector)
+		mutex_lock(&connector->dev->mode_config.mutex);
+	mutex_lock(&dcp->modes_lock);
+	if (generation != dcp->modes_generation ||
+	    apple_connector != READ_ONCE(dcp->connector))
+		goto out_unlock;
+	width_mm = dcp->width_mm;
+	height_mm = dcp->height_mm;
+	if (!width_mm || !height_mm) {
 		width_mm = dcp->panel.width_mm;
 		height_mm = dcp->panel.height_mm;
 	}
-
-	/* Set the connector info */
-	if (dcp->connector) {
-		struct drm_connector *connector = &dcp->connector->base;
-
-		mutex_lock(&connector->dev->mode_config.mutex);
+	if (connector) {
 		connector->display_info.width_mm = width_mm;
 		connector->display_info.height_mm = height_mm;
-		mutex_unlock(&connector->dev->mode_config.mutex);
 	}
-
-	/*
-	 * Fix up any probed modes. Modes are created when parsing
-	 * TimingElements, dimensions are calculated when parsing
-	 * DisplayAttributes, and TimingElements may be sent first
-	 */
-	mutex_lock(&dcp->modes_lock);
 	for (i = 0; i < dcp->nr_modes; ++i) {
 		dcp->modes[i].mode.width_mm = width_mm;
 		dcp->modes[i].mode.height_mm = height_mm;
 	}
+out_unlock:
 	mutex_unlock(&dcp->modes_lock);
+	if (connector)
+		mutex_unlock(&connector->dev->mode_config.mutex);
 }
 
 bool dcp_has_panel(struct apple_dcp *dcp)
@@ -1535,7 +1533,10 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
 		if (dcp->external)
 			return 0;
-		return iomfb_v14_7_bind(dcp);
+		ret = iomfb_v14_7_bind(dcp);
+		if (!ret)
+			enable_work(&dcp->dimensions_wq);
+		return ret;
 	}
 
 	ret = dcp_create_piodma_iommu_dev(dcp);
@@ -1578,6 +1579,8 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "Failed to boot RTKit: %d\n", ret);
+	enable_work(&dcp->dimensions_wq);
+	schedule_work(&dcp->dimensions_wq);
 	dcp_enable_typec_work(dcp);
 	return ret;
 }
@@ -1593,6 +1596,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	if (!dcp)
 		return;
 
+	disable_work_sync(&dcp->dimensions_wq);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
 		iomfb_v14_7_unbind(dcp);
 		return;
@@ -1698,7 +1702,11 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	 * Type-C and Thunderbolt routes can be activated as soon as they are
 	 * registered below, before the DRM device binds.
 	 */
-	mutex_init(&dcp->modes_lock);
+	dcp_modes_init(dcp);
+	/* Registered before callback resources, so they drain before the catalog. */
+	ret = devm_add_action_or_reset(dev, dcp_modes_release, dcp);
+	if (ret)
+		return ret;
 	mutex_init(&dcp->hpd_mutex);
 	mutex_init(&dcp->tb_lock);
 	dcp_fabric_init(dcp);

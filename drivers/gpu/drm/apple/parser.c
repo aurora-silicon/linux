@@ -707,12 +707,23 @@ int replace_modes(struct dcp_parse_ctx *handle,
 		  bool internal)
 {
 	struct dcp_display_mode *next;
+	struct dcp_parse_ctx extent = *handle;
+	struct iterator it;
 	unsigned int next_count;
+	int ret;
+
+	ret = iterator_begin(&extent, &it, false);
+	if (ret)
+		return ret;
 
 	next = enumerate_modes(handle, &next_count, width_mm, height_mm,
 			       notch_height, internal);
 	if (IS_ERR(next))
 		return PTR_ERR(next);
+	if (it.len && !next_count) {
+		kfree(next);
+		return -EINVAL;
+	}
 
 	kfree(*modes);
 	*modes = next;
@@ -729,19 +740,22 @@ int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
 
 	*backlight_control = false;
 
-	dcp_parse_foreach_in_dict(handle, it) {
+	ret = iterator_begin(handle, &it, true);
+	if (ret)
+		return ret;
+	for (; it.idx < it.len; ++it.idx) {
 		char *key = parse_string(it.handle);
 
 		if (IS_ERR(key))
 			ret = PTR_ERR(key);
 		else if (!strcmp(key, "MaxHorizontalImageSize"))
-			ret = parse_int(it.handle, &width_cm);
+			ret = parse_int_bound(it.handle, &width_cm, 0, INT_MAX / 10);
 		else if (!strcmp(key, "MaxVerticalImageSize"))
-			ret = parse_int(it.handle, &height_cm);
+			ret = parse_int_bound(it.handle, &height_cm, 0, INT_MAX / 10);
 		else if (!strcmp(key, "SupportsBacklightControl"))
 			ret = parse_bool_or_skip(it.handle, backlight_control);
 		else
-			skip(it.handle);
+			ret = skip(it.handle);
 
 		if (!IS_ERR_OR_NULL(key))
 			kfree(key);

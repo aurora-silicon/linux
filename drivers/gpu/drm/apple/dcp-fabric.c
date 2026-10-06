@@ -226,6 +226,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 	}
 
 	dcp_modes_begin_attachment(dcp);
+	apple_connector_edid_set_live(dcp->connector, false);
 	dcp->phy = route->phy;
 	dcp->dptx_phy = route->dptx_phy;
 	dcp->connector_type = DRM_MODE_CONNECTOR_USB;
@@ -277,6 +278,7 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 	struct apple_connector *connector = dcp->typec_connector;
 	struct mux_control *active_xbar = route->active_xbar;
 	bool was_tunnel = route->tunnel;
+	bool ended_attachment;
 	int ret = 0;
 
 	/*
@@ -322,6 +324,7 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 			dev_warn(dcp->dev, "DP tunnel source reset failed: %d\n", sel);
 	}
 	route->selected = false;
+	ended_attachment = dcp_modes_end_typec(dcp, route);
 	if (dcp->active_typec_route == route)
 		dcp->active_typec_route = NULL;
 
@@ -347,8 +350,10 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 			connector->port_encoder->possible_crtcs =
 				connector->candidate_crtcs;
 	}
-	if (dcp->fixed_connector && dcp->connector != dcp->fixed_connector)
-		dcp_modes_begin_attachment(dcp);
+	if (ended_attachment && dcp->fixed_connector) {
+		apple_connector_set_pipeline(dcp->fixed_connector,
+					     to_platform_device(dcp->dev));
+	}
 	dcp->typec_connector = NULL;
 	dcp->connector = dcp->fixed_connector;
 	WRITE_ONCE(dcp->ext_backlight, false);
