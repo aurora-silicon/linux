@@ -144,6 +144,12 @@
 #define APPLE_CD_REG_INT_STATUS_UPDATE			BIT(8)
 #define APPLE_CD_REG_INT_PLUG_EVENT			BIT(1)
 
+/*
+ * SN201202x: the DP SID status register changed, that is the DisplayPort
+ * status the partner sent last (DP Status Update or Attention).
+ */
+#define SN201202X_INT_DP_SID_UPDATE			BIT_ULL(37)
+
 /* TPS_REG_SYSTEM_POWER_STATE states */
 #define TPS_SYSTEM_POWER_STATE_S0	0x00
 #define TPS_SYSTEM_POWER_STATE_S3	0x03
@@ -362,6 +368,10 @@ struct cd321x_status {
 	struct tps6598x_dp_sid_status_reg dp_sid_status;
 	struct tps6598x_intel_vid_status_reg intel_vid_status;
 	struct tps6598x_usb4_status_reg usb4_status;
+	/* SN201202x: what the DP status showed since the last update */
+	bool dp_sid_event;
+	bool dp_sid_hpd_low;
+	bool dp_sid_irq;
 };
 
 struct cd321x {
@@ -379,6 +389,8 @@ struct cd321x {
 	bool state_valid;
 	u32 dp_status;
 	u32 dp_conf;
+	/* SN201202x: the partner's DP status is current for this DP connection */
+	bool dp_sid_valid;
 	struct typec_thunderbolt_switch *tbt_switch;
 	struct notifier_block tbt_notifier;
 	bool tbt_notifier_registered;
