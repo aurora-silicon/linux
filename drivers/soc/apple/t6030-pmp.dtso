@@ -62,6 +62,22 @@
 					status = "disabled";
 				};
 
+				/*
+				 * The second external display processor. Disabled: no boot
+				 * loader hands that processor over yet, so nothing enables it.
+				 */
+				pmp_report_dispext1: report@9 {
+					compatible = "apple,t6000-pmp-v2-report-entry";
+					reg = <0x9>;
+					label = "pmp-dispext1";
+					#power-domain-cells = <0>;
+					apple,always-on;
+					/* Missing external ACK must not block the internal panel. */
+					apple,defer-startup-ack;
+					phandle = <0x102>;
+					status = "disabled";
+				};
+
 				pmp_report_ans: report@10 {
 					compatible = "apple,t6000-pmp-v2-report-entry";
 					reg = <0x10>;
