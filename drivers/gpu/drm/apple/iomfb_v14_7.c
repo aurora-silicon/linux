@@ -45,8 +45,9 @@
 #define A(n) DCP_V14_TAG('A', n)
 #define D(n) DCP_V14_TAG('D', n)
 
-/* The image whose method and callback layouts this file implements. */
-#define DCP_V14_FIRMWARE_UUID	"DDF38191-93B3-324A-BC8F-643006F5AC82"
+/* The images whose method and callback layouts this file implements. */
+#define DCP_V14_FIRMWARE_UUID	"DDF38191-93B3-324A-BC8F-643006F5AC82"	/* T6030 */
+#define DCP_V14_FIRMWARE_UUID_T8122	"90F849E1-B422-367E-B389-50246F8DEC47"	/* T8122 */
 
 #define DCP_V14_CPU_CONTROL	0x44
 #define DCP_V14_CPU_STATUS	0x48
@@ -1235,13 +1236,15 @@ int iomfb_v14_7_probe(struct apple_dcp *dcp)
 	int ret;
 
 	if (of_property_read_string(np, "apple,firmware-uuid", &uuid) ||
-	    strcmp(uuid, DCP_V14_FIRMWARE_UUID))
+	    (strcmp(uuid, DCP_V14_FIRMWARE_UUID) &&
+	     strcmp(uuid, DCP_V14_FIRMWARE_UUID_T8122)))
 		return dev_err_probe(dev, -ENODEV,
-				     "T6030 display not started: DCP firmware %s is not supported\n",
+				     "display not started: DCP firmware %s is not supported\n",
 				     uuid ?: "(unknown)");
-	if (of_property_read_u32(np, "apple,t6030-handoff", &marker) || marker != 1)
+	if ((of_property_read_u32(np, "apple,t6030-handoff", &marker) || marker != 1) &&
+	    (of_property_read_u32(np, "apple,t8122-handoff", &marker) || marker != 1))
 		return dev_err_probe(dev, -ENODEV,
-				     "T6030 display not started: no boot loader display handoff\n");
+				     "display not started: no boot loader display handoff\n");
 	if (!iommu_get_domain_for_dev(dev))
 		return dev_err_probe(dev, -ENODEV,
 				     "T6030 display not started: the DCP has no DART domain\n");

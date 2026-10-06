@@ -1,0 +1,103 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * T8122 (M3 MacBook Air, J613/J615) internal display.
+ *
+ * Like T6030, the internal DCP, its mailbox, the two display DARTs and the
+ * display subsystem are all described here as status = "disabled". Kernels
+ * that cannot take the display over from iBoot keep scanning out through the
+ * simple framebuffer, and all of them share one device tree. The boot loader
+ * sets apple,t8122-handoff = <1> on the DCP and the display subsystem after
+ * it has checked and locked the inherited DART mappings; the display enable
+ * gate (drivers/soc/apple/t6030-display-gate.c) then enables these nodes.
+ *
+ * Register, interrupt and DART addresses are SoC addresses from the J613
+ * boot device tree: the DCP block and its iop-vbar come from /arm-io/dcp,
+ * the six scan-out apertures from /arm-io/disp0, and the two DARTs from
+ * /arm-io/dart-dcp and /arm-io/dart-disp0 (one reg window each, as T6030
+ * uses). The DCP mailbox interrupts are the four ascwrap IRQs in the
+ * send-empty, send-not-empty, recv-empty, recv-not-empty order the SMC
+ * mailbox in t8122.dtsi uses. The panel child is board-specific and is added
+ * by the board file.
+ *
+ * TODO before a native modeset: this increment does not yet add the disp0
+ * fixed-clock (the DCP driver reads a clock), and the display enable gate
+ * holds these nodes disabled on T8122 until the T8122 PMP is described, so
+ * the DCP driver does not probe from this device tree yet.
+ */
+
+/ {
+	aliases {
+		dcp = &dcp;
+		disp0 = &display;
+		disp0-piodma = &disp0_piodma;
+		disp0_piodma = &disp0_piodma;
+	};
+};
+
+&{/soc} {
+	dcp_mbox: mailbox@28ec08000 {
+		compatible = "apple,t8122-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0x8ec08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 537 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 538 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 539 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 540 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		power-domains = <&ps_disp_cpu>;
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	dcp_dart: iommu@28d30c000 {
+		compatible = "apple,t8122-dart", "apple,t8110-dart";
+		reg = <0x2 0x8d30c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 557 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "disabled";
+	};
+
+	disp0_dart: iommu@28d304000 {
+		compatible = "apple,t8122-dart", "apple,t8110-dart";
+		reg = <0x2 0x8d304000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 557 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "disabled";
+	};
+
+	dcp: dcp@28ec00000 {
+		compatible = "apple,t8122-dcp";
+		mboxes = <&dcp_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcp_dart 5>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3",
+			    "disp-4", "disp-5", "iop-vbar";
+		reg = <0x2 0x8ec00000 0x0 0x4000>,
+		      <0x2 0x8c000000 0x0 0x690000>,
+		      <0x2 0x8c800000 0x0 0x690000>,
+		      <0x2 0x8d320000 0x0 0x4000>,
+		      <0x2 0x8d344000 0x0 0x4000>,
+		      <0x2 0x8e800000 0x0 0x800000>,
+		      <0x2 0xd03d0000 0x0 0x4000>,
+		      <0x2 0x8e850000 0x0 0x4000>;
+		power-domains = <&ps_disp_cpu>;
+		#address-cells = <2>;
+		#size-cells = <2>;
+		status = "disabled";
+
+		disp0_piodma: piodma {
+			iommus = <&disp0_dart 4>;
+		};
+	};
+
+	display: display-subsystem {
+		compatible = "apple,t8122-display-subsystem";
+		iommus = <&disp0_dart 0>;
+		status = "disabled";
+	};
+};

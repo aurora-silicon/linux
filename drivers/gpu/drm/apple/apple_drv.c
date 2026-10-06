@@ -615,6 +615,7 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
 	{ .compatible = "apple,dcp" },
 	{ .compatible = "apple,dcpext" },
 	{ .compatible = "apple,t6030-dcp" },
+	{ .compatible = "apple,t8122-dcp" },
 	{},
 };
 
@@ -912,6 +913,7 @@ static void apple_platform_remove(struct platform_device *pdev)
 static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,display-subsystem" },
 	{ .compatible = "apple,t6030-display-subsystem" },
+	{ .compatible = "apple,t8122-display-subsystem" },
 	{}
 };
 MODULE_DEVICE_TABLE(of, of_match);

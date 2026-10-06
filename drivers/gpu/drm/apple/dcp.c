@@ -1669,6 +1669,14 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 		return DCP_FIRMWARE_UNKNOWN;
 	}
 
+	if (of_device_is_compatible(dev->of_node, "apple,t8122-dcp")) {
+		if (ret >= 0 && !strcmp(compat_str, "14.7.0"))
+			return DCP_FIRMWARE_V_14_7;
+		dev_err(dev, "T8122 display not started: DCP firmware-compat %s is not 14.7.0\n",
+			compat_str);
+		return DCP_FIRMWARE_UNKNOWN;
+	}
+
 	if (strncmp(compat_str, "12.3.0", sizeof(compat_str)) == 0)
 		return DCP_FIRMWARE_V_12_3;
 	/*
@@ -2492,6 +2500,10 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6030 = {
 	.num_dptx_ports = 1,
 };
 
+static const struct apple_dcp_hw_data apple_dcp_hw_t8122 = {
+	.num_dptx_ports = 2,
+};
+
 static const struct apple_dcp_hw_data apple_dcp_hw_t6030_dcpext = {
 	.num_dptx_ports = 1,
 };
@@ -2506,6 +2518,7 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t8112-dcp", .data = &apple_dcp_hw_t8112,  },
 	{ .compatible = "apple,t6030-dcp", .data = &apple_dcp_hw_t6030, },
 	{ .compatible = "apple,t6030-dcpext", .data = &apple_dcp_hw_t6030_dcpext, },
+	{ .compatible = "apple,t8122-dcp", .data = &apple_dcp_hw_t8122, },
 	{ .compatible = "apple,dcp",       .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,dcpext",    .data = &apple_dcp_hw_dcpext, },
 	{}
