@@ -64,6 +64,48 @@ pub(crate) const T6030_IO_MAPPINGS: [IoMapping; 15] = [
     (29, 0x2_90e5_c000, 0x4000, 0x4000, false),     // GFX clock generator
 ];
 
+/// The T8122 firmware IO mappings of the runtime backend, in the same form: the blocks of
+/// `hw::t8122`, each with the total size of its instances and the size of one. The AIC timer
+/// entry is the T6030 one, the same register on every SoC. Before writing them,
+/// `fill_io_mappings` checks every entry against the runtime's IO maps of the SoC, which T8122
+/// does not have yet (`m3_soc::T8122.iomaps`).
+pub(crate) const T8122_IO_MAPPINGS: [IoMapping; 12] = [
+    (0, 0x2_90d0_0000, 0x10_4000, 0x10_4000, true), // Fender
+    (1, 0x2_0e10_1000, 1, 1, false),                // AIC timer
+    (2, 0x2_d101_4000, 0x4000, 0x4000, true),       // AIC software interrupts
+    (3, 0x2_9000_0000, 0x2_0000, 0x2_0000, true),   // RGX
+    (9, 0x2_90e0_8000, 0x8000, 0x8000, true),       // metrology sensors
+    (10, 0x2_90d0_d000, 0x1000, 0x1000, true),      // GM GIFAF registers
+    (11, 0x2_2000_0000, 0xb_0000, 0x5_8000, true),  // memory cache, two instances
+    (18, 0x2_d03d_0000, 0x1000, 0x1000, true),      // telemetry dashboard
+    (19, 0x2_d03c_0000, 0x2000, 0x2000, false),     // telemetry dashboard (read)
+    (25, 0x3_1145_c000, 0x4000, 0x4000, true),      // ANE doorbell
+    (26, 0x2_d028_0000, 0x8000, 0x8000, false),     // PMS metrology sensors
+    (29, 0x2_90e1_c000, 0x4000, 0x4000, false),     // GPU clock generator
+];
+
+/// Whether every entry of `mappings` is a whole number of elements in the HwConfig block of the
+/// same slot, with the same writability: the check `fill_io_mappings` makes when it builds the
+/// InitData.
+const fn same_blocks(mappings: &[IoMapping], cfg: &hw::HwConfig) -> bool {
+    let mut i = 0;
+    while i < mappings.len() {
+        let (slot, phys, total, element, writable) = mappings[i];
+        if slot >= cfg.io_mappings.len() || element == 0 || total % element != 0 {
+            return false;
+        }
+        match cfg.io_mappings[slot] {
+            Some(block)
+                if block.base as u64 & !0x3fff == phys & !0x3fff && block.writable == writable => {}
+            _ => return false,
+        }
+        i += 1;
+    }
+    true
+}
+
+const _: () = assert!(same_blocks(&T8122_IO_MAPPINGS, &hw::t8122::HWCONFIG_T8122));
+
 /// Highest performance state device-tree InitData may use without the driver's thermal limit
 /// (`asahi.m3_thermal=off`), and the runtime cap the thermal limit starts at and falls back to
 /// (the "safe cap"). The InitData's fast-die temperature controller words stay 0, so the

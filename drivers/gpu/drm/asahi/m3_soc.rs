@@ -289,7 +289,7 @@ pub(crate) static T8122: Soc = Soc {
     images: &crate::m3_board::KNOWN_IMAGES_T8122,
     firmware: Some(&crate::m3_firmware::T8122_LAYOUT),
     hwcfg: Some(&hw::t8122::HWCONFIG_T8122),
-    io_mappings: None,
+    io_mappings: Some(&crate::m3_adt_config::T8122_IO_MAPPINGS),
     iomaps: None,
     // The boot loader's ladder from this machine's ADT (J613: eight voltages, up to 1338 MHz).
     pstates: PstateTable::DeviceTree,
