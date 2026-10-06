@@ -1218,7 +1218,7 @@ impl Queue {
         else {
             return Err(EINVAL);
         };
-        let work = packet.completion.work_state();
+        let work = packet.completion.work_state()?;
         let work_word = work.word();
         if work_word == u32::MAX {
             return Err(EINVAL);

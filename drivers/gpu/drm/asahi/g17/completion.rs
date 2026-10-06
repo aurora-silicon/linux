@@ -155,7 +155,7 @@ impl Completion {
     pub(crate) fn status(&self) -> &Arc<VmStatus> {
         &self.status
     }
-    pub(crate) fn work_state(&self) -> Arc<WorkStateLease> {
+    pub(crate) fn work_state(&self) -> Result<Arc<WorkStateLease>> {
         self.member.work_state()
     }
     pub(crate) fn has_timestamps(&self) -> bool {

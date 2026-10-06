@@ -66,7 +66,7 @@ impl Backend {
             }
             let work_state = {
                 let preparation = self.shared.preparations.enter(interruptible)?;
-                let result = packet.completion.work_state().acquire();
+                let result = packet.completion.work_state().and_then(|state| state.acquire());
                 if preparation.is_current() {
                     result
                 } else {

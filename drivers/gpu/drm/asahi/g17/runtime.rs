@@ -763,7 +763,7 @@ impl Backend {
                 return Err(EIO);
             }
             let lease = self.shared.preparations.enter(false)?;
-            packet.completion.work_state().acquire()?;
+            packet.completion.work_state()?.acquire()?;
             let mut state = self.shared.state.lock();
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
             if !lease.is_current() {

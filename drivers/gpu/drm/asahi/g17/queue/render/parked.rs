@@ -120,7 +120,7 @@ impl ParkedPair {
         let Validated::Render { pass, .. } = &first.command else {
             return Err(EINVAL);
         };
-        let word = first.completion.work_state().word();
+        let word = first.completion.work_state()?.word();
         if word == u32::MAX {
             return Err(EINVAL);
         }
