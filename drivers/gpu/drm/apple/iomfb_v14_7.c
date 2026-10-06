@@ -331,6 +331,11 @@ static int dcp_v14_map_piodma(struct apple_dcp_v14 *v14, u32 id)
 	return 0;
 }
 
+/* An external processor's default stride; no framebuffer is allocated for it. */
+#define DCP_V14_EXT_STRIDE	(1920 * 4)
+/* The display clock of every T6030 external pipe, unless the DT names one. */
+#define DCP_V14_EXT_CLOCK	935000000ULL
+
 /* Removes a raw property of service 0. */
 static void dcp_v14_raw_remove(struct apple_dcp_v14 *v14, const char *key)
 {
@@ -1202,6 +1207,14 @@ static int dcp_v14_geometry(struct apple_dcp_v14 *v14)
 	return 0;
 }
 
+/* An external processor's firmware: once started, it runs until reboot. */
+enum {
+	DCPEXT_IDLE,
+	DCPEXT_STARTING,
+	DCPEXT_RUNNING,
+	DCPEXT_FAILED,
+};
+
 static void dcpext_bringup(struct work_struct *work);
 
 /*
@@ -1316,8 +1329,11 @@ static void dcpext_cancel(void *data)
 	struct apple_dcp *dcp = data;
 
 	cancel_work_sync(&dcp->external_work);
+	if (dcp->external_native)
+		cancel_work_sync(&dcp->external_ready_work);
 }
 
+/* The manual diagnostic path: memory checks, then an explicit start. */
 int iomfb_v14_7_external_start(struct apple_dcp *dcp)
 {
 	int ret;
@@ -1340,6 +1356,96 @@ int iomfb_v14_7_external_start(struct apple_dcp *dcp)
 	if (!ret)
 		dev_info(dcp->dev, "dcpext memory verified; waiting for explicit dcpext_start\n");
 	return ret;
+}
+
+static void dcpext_ready_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp, external_ready_work);
+
+	dcp_external_ready(dcp);
+}
+
+/*
+ * The native path, at probe: the same checks as a manual start, without a
+ * start. The coprocessor registers are mapped here, once, for the start
+ * work and component bind alike. A failed check leaves the pipe in the DRM
+ * device, never started, so that the internal panel is not held up.
+ */
+int iomfb_v14_7_external_prepare(struct apple_dcp *dcp)
+{
+	struct device *dev = dcp->dev;
+	const char *uuid = NULL;
+	int ret;
+
+	atomic_set(&dcp->external_requested, 0);
+	WRITE_ONCE(dcp->external_phase, DCPEXT_IDLE);
+	INIT_WORK(&dcp->external_work, dcpext_bringup);
+	INIT_WORK(&dcp->external_ready_work, dcpext_ready_work);
+	ret = devm_add_action_or_reset(dev, dcpext_cancel, dcp);
+	if (ret)
+		return ret;
+
+	dcp->coproc_reg = devm_platform_ioremap_resource_byname(to_platform_device(dev), "coproc");
+	if (IS_ERR(dcp->coproc_reg)) {
+		ret = PTR_ERR(dcp->coproc_reg);
+		dcp->coproc_reg = NULL;
+		goto refuse;
+	}
+	/* The callbacks here are those of one firmware image. */
+	if (of_property_read_string(dev->of_node, "apple,firmware-uuid", &uuid) ||
+	    strcmp(uuid, DCP_V14_FIRMWARE_UUID)) {
+		dev_err(dev, "external display processor firmware %s is not supported\n",
+			uuid ?: "(unknown)");
+		ret = -ENODEV;
+		goto refuse;
+	}
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
+	if (!ret)
+		ret = dcpext_verify_memory(dcp);
+	if (ret)
+		goto refuse;
+	dev_info(dev, "external display processor ready; its firmware starts when a display is attached\n");
+	return 0;
+refuse:
+	WRITE_ONCE(dcp->external_phase, DCPEXT_FAILED);
+	dev_err(dev, "external display processor unusable: handoff check failed: %d\n", ret);
+	return 0;
+}
+
+/* True once DPTX can be used; asks for the start if nothing has. */
+bool iomfb_v14_7_external_ready(struct apple_dcp *dcp)
+{
+	switch (smp_load_acquire(&dcp->external_phase)) {
+	case DCPEXT_RUNNING:
+		return smp_load_acquire(&dcp->dptxport[0].enabled);
+	case DCPEXT_IDLE:
+		/* Not between sleep's prepare and complete; the next attach starts it. */
+		if (READ_ONCE(dcp->external_suspended))
+			return false;
+		if (!atomic_cmpxchg(&dcp->external_requested, 0, 1)) {
+			WRITE_ONCE(dcp->external_phase, DCPEXT_STARTING);
+			dev_info(dcp->dev, "display attached: starting the external display processor\n");
+			/* Firmware callbacks may outlive any later module removal. */
+			__module_get(THIS_MODULE);
+			queue_work(system_unbound_wq, &dcp->external_work);
+		}
+		return false;
+	default:
+		return false;
+	}
+}
+
+/*
+ * System sleep with this processor: allowed before its first start and
+ * while it idles with no display; refused while it starts or drives one,
+ * as the link and the display's buffers are not handed back across sleep.
+ */
+bool iomfb_v14_7_external_busy(struct apple_dcp *dcp)
+{
+	if (smp_load_acquire(&dcp->external_phase) == DCPEXT_STARTING)
+		return true;
+	return READ_ONCE(dcp->active_typec_route) || READ_ONCE(dcp->dptxport[0].connected) ||
+	       READ_ONCE(dcp->external_link_ready) || (dcp->v14 && READ_ONCE(dcp->v14->powered));
 }
 
 /* Refuse startup unless both the hardware floor and PMP vote are in place. */
@@ -1384,9 +1490,13 @@ static int dcpext_check_power(struct apple_dcp *dcp)
 	return ret;
 }
 
-static void dcpext_bringup(struct work_struct *work)
+/*
+ * Starts the processor's CPU and RTKit, then its endpoints. The native path
+ * also brings up DCPLink, for the display interface opened at the first
+ * attach, and the DP AV service the EDID comes from.
+ */
+static int dcpext_boot(struct apple_dcp *dcp)
 {
-	struct apple_dcp *dcp = container_of(work, struct apple_dcp, external_work);
 	struct apple_dcp_v14 *v14;
 	struct device *dev = dcp->dev;
 	struct resource *res;
@@ -1397,35 +1507,49 @@ static void dcpext_bringup(struct work_struct *work)
 	ret = dcpext_check_power(dcp);
 	if (ret) {
 		dev_err(dev, "dcpext startup refused: power prerequisites failed: %d\n", ret);
-		return;
+		return ret;
 	}
 	dev_info(dev, "dcpext CPU power floor active and PMP request acknowledged\n");
 
-	res = platform_get_resource_byname(to_platform_device(dev),
-					   IORESOURCE_MEM, "coproc");
-	if (!res) {
-		dev_err(dev, "dcpext has no coproc register\n");
-		return;
-	}
-	dcp->coproc_reg = devm_ioremap_resource(dev, res);
-	if (IS_ERR(dcp->coproc_reg)) {
-		dev_err(dev, "dcpext coproc map failed: %ld\n",
-			PTR_ERR(dcp->coproc_reg));
-		dcp->coproc_reg = NULL;
-		return;
+	if (!dcp->coproc_reg) {
+		res = platform_get_resource_byname(to_platform_device(dev),
+						   IORESOURCE_MEM, "coproc");
+		if (!res) {
+			dev_err(dev, "dcpext has no coproc register\n");
+			return -ENODEV;
+		}
+		dcp->coproc_reg = devm_ioremap_resource(dev, res);
+		if (IS_ERR(dcp->coproc_reg)) {
+			ret = PTR_ERR(dcp->coproc_reg);
+			dev_err(dev, "dcpext coproc map failed: %d\n", ret);
+			dcp->coproc_reg = NULL;
+			return ret;
+		}
 	}
 
 	control = readl(dcp->coproc_reg + DCP_V14_CPU_CONTROL);
 	dev_info(dev, "dcpext CPU control %#x\n", control);
 	ret = dcpext_verify_memory(dcp);
 	if (ret)
-		return;
+		return ret;
 
 	v14 = kzalloc_obj(*v14);
 	if (!v14)
-		return;
+		return -ENOMEM;
 	v14->dev = dev;
 	v14->dcp = dcp;
+	v14->external = dcp->external_native;
+	if (v14->external) {
+		struct clk *clk = clk_get_optional(dev, NULL);
+
+		if (!IS_ERR_OR_NULL(clk)) {
+			v14->clock_rate = clk_get_rate(clk);
+			clk_put(clk);
+		}
+		if (!v14->clock_rate)
+			v14->clock_rate = DCP_V14_EXT_CLOCK;
+		v14->stride = DCP_V14_EXT_STRIDE;
+	}
 	mutex_init(&v14->lock);
 	INIT_WORK(&v14->idle_work, dcp_v14_idle);
 	dcp->v14 = v14;
@@ -1434,7 +1558,7 @@ static void dcpext_bringup(struct work_struct *work)
 	rtk = apple_rtkit_init(dev, v14, "mbox", 0, &dcp_v14_rtkit_ops);
 	if (IS_ERR(rtk)) {
 		dev_err(dev, "dcpext RTKit init failed: %ld\n", PTR_ERR(rtk));
-		return;
+		return PTR_ERR(rtk);
 	}
 	v14->rtk = rtk;
 	v14->link.rtk = rtk;
@@ -1443,27 +1567,105 @@ static void dcpext_bringup(struct work_struct *work)
 	if (!(control & APPLE_DCP_COPROC_CPU_CONTROL_RUN)) {
 		writel(control | APPLE_DCP_COPROC_CPU_CONTROL_RUN,
 		       dcp->coproc_reg + DCP_V14_CPU_CONTROL);
-		dev_info(dev, "dcpext CPU started by explicit request\n");
+		dev_info(dev, "dcpext CPU started\n");
 	}
 	ret = apple_rtkit_wake(rtk);
 	for (n = 0; ret == -ETIME && n < DCP_V14_RTKIT_RETRIES; n++)
 		ret = apple_rtkit_boot(rtk);
 	if (ret) {
 		dev_err(dev, "dcpext RTKit did not wake: %d\n", ret);
-		return;
+		return ret;
 	}
-
 	dev_info(dev, "dcpext RTKit session running\n");
+
+	if (v14->external) {
+		ret = dcp_v14_link_start(&v14->link);
+		if (ret) {
+			v14->failed = true;
+			dev_err(dev, "dcpext DCPLink did not start: %d\n", ret);
+			return ret;
+		}
+		/* Notifications that arrive with no call in progress. */
+		dcp_v14_link_set_idle_work(&v14->link, &v14->idle_work);
+	}
 	if (apple_rtkit_has_endpoint(rtk, DPAV_CTRL_ENDPOINT))
 		dpav_ctrl_init(dcp);
-	if (apple_rtkit_has_endpoint(rtk, DPTX_ENDPOINT))
-		dptxep_init(dcp);
+	if (apple_rtkit_has_endpoint(rtk, DPTX_ENDPOINT)) {
+		ret = dptxep_init(dcp);
+		if (ret)
+			dev_err(dev, "dcpext DPTX endpoint failed: %d\n", ret);
+	}
+	if (v14->external) {
+		/* The service the attached display's EDID is read from. */
+		if (apple_rtkit_has_endpoint(rtk, DPAVSERV_ENDPOINT)) {
+			ret = dpavservep_init(dcp);
+			if (ret)
+				dev_info(dev, "display EDID service not available: %d\n", ret);
+		}
+		return 0;
+	}
 	/* External mode discovery only; this does not power or modeset a display. */
 	if (apple_rtkit_has_endpoint(rtk, DISP0_ENDPOINT)) {
 		ret = ibootep_init(dcp);
 		if (ret)
 			dev_err(dev, "dcpext mode-query endpoint failed: %d\n", ret);
 	}
+	return 0;
+}
+
+static void dcpext_bringup(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp, external_work);
+	int ret = dcpext_boot(dcp);
+
+	if (!dcp->external_native)
+		return;
+	/* Pairs with external_ready(): the endpoints are published first. */
+	smp_store_release(&dcp->external_phase, ret ? DCPEXT_FAILED : DCPEXT_RUNNING);
+	if (ret) {
+		dev_err(dcp->dev, "external display processor did not start: %d; no retry until reboot\n",
+			ret);
+		return;
+	}
+	dev_info(dcp->dev, "external display processor running\n");
+	dcp_external_ready(dcp);
+}
+
+/*
+ * Opens the display interface (start signal, first client open) on a
+ * running external processor, once, after its first display is attached.
+ * The firmware then describes that display and every later one.
+ */
+int iomfb_v14_7_external_open(struct apple_dcp *dcp)
+{
+	struct apple_dcp_v14 *v14 = dcp->v14;
+	int ret;
+
+	if (smp_load_acquire(&dcp->external_phase) != DCPEXT_RUNNING || !v14)
+		return -ENODEV;
+	mutex_lock(&v14->lock);
+	if (v14->opened) {
+		mutex_unlock(&v14->lock);
+		return 0;
+	}
+	ret = dcp_v14_simple_call(v14, A(401), false, true, true);
+	if (!ret)
+		ret = dcp_v14_simple_call(v14, A(455), false, false, false);
+	if (!ret)
+		v14->opened = true;
+	else
+		v14->failed = true;
+	mutex_unlock(&v14->lock);
+	if (ret) {
+		dev_err(dcp->dev, "external display interface did not open: %d; no retry until reboot\n",
+			ret);
+		return ret;
+	}
+	dev_info(dcp->dev, "external display interface open\n");
+	/* A display described before this could not be enabled until now. */
+	if (dcp->connector && READ_ONCE(dcp->connector->connected))
+		schedule_work(&dcp->connector->hotplug_wq);
+	return 0;
 }
 
 int iomfb_v14_7_bind(struct apple_dcp *dcp)
@@ -1535,7 +1737,9 @@ void iomfb_v14_7_unbind(struct apple_dcp *dcp)
 	dcp_mode_set_valid(&dcp->mode_state, false);
 	if (!v14)
 		return;
-	WRITE_ONCE(v14->dcp, NULL);
+	/* An external session keeps serving its ports; removal detaches it. */
+	if (!v14->external)
+		WRITE_ONCE(v14->dcp, NULL);
 	if (v14->rtk)
 		dev_info(dcp->dev, "display unbound; the DCP session and its buffers are kept until reboot\n");
 }
@@ -1558,9 +1762,11 @@ void iomfb_v14_7_remove(struct apple_dcp *dcp)
 {
 	struct apple_dcp_v14 *v14;
 
-	/* Bring-up creates the external session; a late dcpext_start must not. */
+	/* Bring-up creates the external session; a late start must not. */
 	if (dcp->external)
 		disable_work_sync(&dcp->external_work);
+	if (dcp->external_native)
+		disable_work_sync(&dcp->external_ready_work);
 	v14 = dcp->v14;
 	if (!v14)
 		return;

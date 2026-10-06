@@ -1514,6 +1514,9 @@ static bool dcp_tb_services_ready(struct apple_dcp *dcp)
 {
 	if (!dcp->external || dcp->fw_compat != DCP_FIRMWARE_V_14_7)
 		return true;
+	/* A native processor starts for the tunnel; the tunnel retries meanwhile. */
+	if (dcp->external_native)
+		return iomfb_v14_7_external_ready(dcp);
 	/* Pairs with DPTX RemotePort publication before tunnel acquisition. */
 	return smp_load_acquire(&dcp->dptxport[0].enabled) && ibootep_is_ready(dcp);
 }

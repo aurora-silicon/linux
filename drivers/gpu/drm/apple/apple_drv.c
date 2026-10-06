@@ -619,12 +619,15 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
 };
 
 /*
- * The T6030 external display processor runs its own firmware session and is
- * not part of the display subsystem's DRM device.
+ * A T6030 external display processor is a pipe of this DRM device once the
+ * display gate gave it its display DART; on the manual diagnostic path it
+ * runs a separate session instead.
  */
 static bool apple_dcp_in_drm(const struct device_node *np)
 {
-	return !of_device_is_compatible(np, "apple,t6030-dcpext");
+	if (!of_device_is_compatible(np, "apple,t6030-dcpext"))
+		return true;
+	return dcp_t6030_ext_native(np);
 }
 
 static void apple_drm_quiesce_connectors(struct drm_device *drm)

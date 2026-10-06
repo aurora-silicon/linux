@@ -837,6 +837,9 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 		/* Publish the complete service before boot-time tunnel routing. */
 		smp_store_release(&service->ep->dcp->dptxport[unit].enabled, true);
 		complete(&service->ep->dcp->dptxport[unit].enable_completion);
+		/* A connect that found no port yet is retried from process context. */
+		if (service->ep->dcp->external_native)
+			schedule_work(&service->ep->dcp->external_ready_work);
 		break;
 	default:
 		dev_err(service->ep->dcp->dev, "DPTXPort: invalid unit %lld\n",

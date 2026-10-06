@@ -144,10 +144,20 @@ struct apple_dcp {
 	/* firmware version and compatible firmware version */
 	enum dcp_firmware_version fw_compat;
 	bool external;
+	/*
+	 * A T6030 external processor in the main DRM device: the kernel starts
+	 * its firmware on first use, its modes come from the attached display.
+	 * Clear for the manual diagnostic path (separate scanout, explicit start).
+	 */
+	bool external_native;
 	struct dcpext_scanout *dcpext_scanout;
 	bool external_link_ready; /* Full connect/HPD handshake completed. */
 	bool external_suspended; /* hpd_mutex serializes PM against explicit start */
 	struct work_struct external_work;
+	/* Native: retries pending connects once DPTX ports are announced. */
+	struct work_struct external_ready_work;
+	/* Native: the firmware's start state, see iomfb_v14_7.c. */
+	unsigned int external_phase;
 	atomic_t external_requested;
 
 	/* DCP_FIRMWARE_V_14_7 state; outlives this device once RTKit runs. */
