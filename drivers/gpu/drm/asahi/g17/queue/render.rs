@@ -162,7 +162,7 @@ impl Pair {
         let Validated::Render { pass, .. } = &first.command else {
             return Err(EINVAL);
         };
-        let word = first.completion.work_state().word();
+        let word = first.completion.work_state()?.word();
         if word == u32::MAX {
             return Err(EINVAL);
         }
@@ -271,7 +271,7 @@ impl Pair {
         }
         let ordinal = self.ordinal;
         ordinal.checked_add(1).ok_or(EOVERFLOW)?;
-        let work = packet.completion.work_state();
+        let work = packet.completion.work_state()?;
         let node = work.node_va()?;
         let word = work.word();
         let layout = target::Layout::new(pass, self.clusters)?;
@@ -417,7 +417,7 @@ impl Pair {
         let qids = self.qids();
         let kicks = self.kicks.each_ref().map(kick::Queue::timestamp);
         let parents = self.kicks.each_ref().map(kick::Queue::parent);
-        let work = packet.completion.work_state();
+        let work = packet.completion.work_state()?;
         let work_slot = work.render_slot(self.slot)?;
         self.memory.bind_work_slot(ordinal, qids, work_slot)?;
         let payload = work.channel_payload(self.slot, ordinal)?;
@@ -1382,7 +1382,7 @@ impl Pair {
                 buffer_id,
                 pm_generation,
                 self.ordinal,
-                first.completion.work_state().word(),
+                first.completion.work_state()?.word(),
             )?;
             (Some(memory), Some(persistent), Some(aliases))
         };

@@ -11,9 +11,10 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use kernel::{
     bindings, c_str,
     dma_fence::{Fence, FenceContexts, FenceObject, FenceOps, RawDmaFence, UserFence},
+    new_mutex,
     prelude::*,
     str::CStr,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 pub(crate) struct CompletionFence;
@@ -40,24 +41,29 @@ pub(crate) fn independent(contexts: &FenceContexts) -> Result<UserFence<Completi
 
 /// All command members of an ioctl share its work-state node and aggregate fence.
 /// The initial member keeps the aggregate unsignalled until enqueue finishes.
+#[pin_data]
 pub(crate) struct Submission {
     fence: UserFence<CompletionFence>,
-    work_state: Arc<WorkStateLease>,
+    /// Successful retirement drops only this bookkeeping owner; runtime owners
+    /// and failed submissions keep their work-state allocation.
+    #[pin]
+    work_state: Mutex<Option<Arc<WorkStateLease>>>,
     remaining: AtomicU32,
     error: AtomicI32,
 }
 
 impl Submission {
     fn new(fence: UserFence<CompletionFence>, context: Arc<Context>) -> Result<Arc<Self>> {
-        Ok(Arc::new(
-            Self {
+        let work_state = Arc::new(WorkStateLease::deferred(context), GFP_KERNEL)?;
+        Arc::pin_init(
+            pin_init!(Self {
                 fence,
-                work_state: Arc::new(WorkStateLease::deferred(context), GFP_KERNEL)?,
+                work_state <- new_mutex!(Some(work_state), "G17 submission work state"),
                 remaining: AtomicU32::new(1),
                 error: AtomicI32::new(0),
-            },
+            }),
             GFP_KERNEL,
-        )?)
+        )
     }
 
     pub(crate) fn fence(&self) -> Fence {
@@ -86,6 +92,12 @@ impl Submission {
             let error = self.error.load(Ordering::Acquire);
             if error != 0 {
                 self.fence.set_error(Error::from_errno(error));
+            } else {
+                // Scheduler cleanup can wait behind submission on the same worker.
+                // Once every member and enqueue have succeeded, retained packets
+                // must not prevent new submissions from acquiring work-state nodes.
+                let retired = self.work_state.lock().take();
+                drop(retired);
             }
             self.fence.signal();
         }
@@ -108,8 +120,13 @@ pub(crate) struct Member {
 }
 
 impl Member {
-    pub(crate) fn work_state(&self) -> Arc<WorkStateLease> {
-        self.submission.work_state.clone()
+    pub(crate) fn work_state(&self) -> Result<Arc<WorkStateLease>> {
+        self.submission
+            .work_state
+            .lock()
+            .as_ref()
+            .cloned()
+            .ok_or(ECANCELED)
     }
 
     pub(crate) fn complete(&self, result: Result) {
