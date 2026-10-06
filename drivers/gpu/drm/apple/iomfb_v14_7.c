@@ -97,6 +97,12 @@ struct apple_dcp_v14 {
 	bool failed;
 	bool started;
 
+	/*
+	 * An external processor: no panel. Its modes come from the
+	 * properties the firmware publishes for the attached display.
+	 */
+	bool external;
+
 	/* Boot framebuffer and native panel timing (notch rows included). */
 	u32 stride;
 	u32 fb_width, fb_height;
@@ -316,6 +322,158 @@ static int dcp_v14_map_piodma(struct apple_dcp_v14 *v14, u32 id)
 	return 0;
 }
 
+/* Removes a raw property of service 0. */
+static void dcp_v14_raw_remove(struct apple_dcp_v14 *v14, const char *key)
+{
+	u32 i;
+
+	for (i = 0; i < v14->raw_count; i++) {
+		if (v14->raw[i].service || strcmp(v14->raw[i].key, key))
+			continue;
+		v14->raw_bytes -= v14->raw[i].size;
+		kvfree(v14->raw[i].data);
+		v14->raw[i] = v14->raw[--v14->raw_count];
+		memset(&v14->raw[v14->raw_count], 0, sizeof(v14->raw[0]));
+		return;
+	}
+}
+
+/* A call whose u32 answer is informational only. */
+static int dcp_v14_query(struct apple_dcp_v14 *v14, u32 tag)
+{
+	__le32 result = 0;
+	int ret;
+
+	ret = dcp_v14_call(v14, tag, NULL, 0, &result, sizeof(result), 0);
+	if (!ret)
+		dev_dbg(v14->dev, "call %#x answered %u\n", tag, le32_to_cpu(result));
+	return ret;
+}
+
+/*
+ * Callbacks that an external processor answers differently, or sends only
+ * there. -ENOENT leaves @tag to the shared handler. A display's property
+ * transfer that is malformed or too large is refused with a false reply:
+ * it must not end the session.
+ */
+static int dcp_v14_external_callback(struct apple_dcp_v14 *v14, u32 tag, const u8 *in,
+				     u32 in_size, u8 *out, u32 out_size)
+{
+	struct dcp_v14_property *p;
+	u32 count, offset, service, key_offset;
+	int ret;
+
+#define SHAPE(i, o) (in_size == (i) && out_size == (o))
+	/* Will power off, and a swap the firmware made itself: nothing to retire. */
+	if ((tag == D(2) && SHAPE(0, 0)) || (tag == D(591) && SHAPE(20, 0)))
+		return 0;
+	/* Display DART power, a bool: the DART is powered with the processor. */
+	if (tag == D(574) && SHAPE(4, 4))
+		return in[0] > 1 ? -EINVAL : 0;
+	/* Main-display query: answered by asking the firmware. */
+	if (tag == D(599) && SHAPE(0, 0))
+		return dcp_v14_query(v14, A(410));
+	/* Late boot: the panel's sequence; the first answer differs here. */
+	if (tag == D(121) && SHAPE(0, 4)) {
+		ret = dcp_v14_query(v14, A(444));
+		if (!ret)
+			ret = dcp_v14_simple_call(v14, A(29), false, false, false);
+		if (!ret)
+			ret = dcp_v14_simple_call(v14, A(466), true, false, false);
+		if (!ret)
+			ret = dcp_v14_simple_call(v14, A(0), true, true, true);
+		if (!ret)
+			ret = dcp_v14_simple_call(v14, A(463), false, true, true);
+		if (!ret)
+			out[0] = 1;
+		return ret;
+	}
+	/* PMU service matching; an external display has no panel backlight. */
+	if (tag == D(206) && SHAPE(0, 4)) {
+		ret = dcp_v14_query(v14, A(131));
+		if (!ret)
+			out[0] = 1;
+		return ret;
+	}
+	if (tag == D(207) && SHAPE(0, 4)) {
+		out[0] = 1;
+		return 0;
+	}
+	/* Chunked property transfer: start, chunk, end. */
+	if (tag == D(127) && SHAPE(4, 4)) {
+		count = get_unaligned_le32(in);
+		ret = -EINVAL;
+		if (!v14->chunk && count && count <= 0x100001) {
+			v14->chunk_size = count - 1;
+			v14->chunk_offset = 0;
+			v14->chunk = kvzalloc(max_t(u32, 1, v14->chunk_size), GFP_KERNEL);
+			ret = v14->chunk ? 0 : -ENOMEM;
+		}
+		goto property_reply;
+	}
+	if (tag == D(128) && SHAPE(0x1008, 4)) {
+		offset = get_unaligned_le32(in + 0x1000);
+		count = get_unaligned_le32(in + 0x1004);
+		ret = -EINVAL;
+		if (v14->chunk && offset == v14->chunk_offset && count <= 4096 &&
+		    offset <= v14->chunk_size && count <= v14->chunk_size - offset) {
+			memcpy(v14->chunk + offset, in, count);
+			v14->chunk_offset += count;
+			ret = 0;
+		}
+		goto property_reply;
+	}
+	if (tag == D(129) && SHAPE(64, 4)) {
+		ret = -EINVAL;
+		if (v14->chunk && v14->chunk_offset == v14->chunk_size && memchr(in, 0, 64))
+			ret = dcp_v14_raw_property(v14, 0, in, v14->chunk, v14->chunk_size);
+		kvfree(v14->chunk);
+		v14->chunk = NULL;
+		goto property_reply;
+	}
+	/* Dictionary properties, kept raw. */
+	if ((tag == D(413) && SHAPE(4168, 4)) ||
+	    ((tag == D(552) || tag == D(561)) && SHAPE(4164, 4)) ||
+	    (tag == D(567) && SHAPE(128, 4))) {
+		key_offset = tag == D(413) ? 4 : 0;
+		service = key_offset ? get_unaligned_le32(in) : 0;
+		if (tag != D(567) && (in[key_offset + 4160] & 1)) {
+			out[0] = 1;
+			return 0;
+		}
+		count = tag == D(567) ? strnlen(in + 64, 64) : 4096;
+		ret = dcp_v14_raw_property(v14, service, in + key_offset, in + key_offset + 64,
+					   count);
+		goto property_reply;
+	}
+	/* Property removal, including the display's description on unplug. */
+	if (tag == D(107) && SHAPE(64, 0)) {
+		if (!memchr(in, 0, 64))
+			return -EINVAL;
+		dcp_v14_raw_remove(v14, in);
+		p = dcp_v14_property(v14, 0, in, false);
+		if (IS_ERR(p))
+			return PTR_ERR(p);
+		if (p) {
+			*p = v14->properties[--v14->property_count];
+			memset(&v14->properties[v14->property_count], 0, sizeof(*p));
+		}
+		return 0;
+	}
+#undef SHAPE
+	return -ENOENT;
+
+property_reply:
+	if (ret) {
+		dev_warn_ratelimited(v14->dev, "display property refused: %d\n", ret);
+		kvfree(v14->chunk);
+		v14->chunk = NULL;
+	}
+	/* These answer a bool: false refuses the data, not the link. */
+	out[0] = !ret;
+	return 0;
+}
+
 /* Runs on the thread that owns the RPC stream; the lock is held. */
 static int dcp_v14_callback(void *cookie, u32 tag, const void *input, u32 in_size,
 			    void *output, u32 out_size)
@@ -326,6 +484,12 @@ static int dcp_v14_callback(void *cookie, u32 tag, const void *input, u32 in_siz
 	struct dcp_v14_property *p;
 	u32 count, offset, service, key_offset, id;
 	int ret;
+
+	if (v14->external) {
+		ret = dcp_v14_external_callback(v14, tag, in, in_size, out, out_size);
+		if (ret != -ENOENT)
+			return ret;
+	}
 
 #define SHAPE(i, o) (in_size == (i) && out_size == (o))
 	/* get_time */
@@ -640,6 +804,12 @@ static int dcp_v14_callback(void *cookie, u32 tag, const void *input, u32 in_siz
 		return dcp_v14_call(v14, A(374), NULL, 0, &result, sizeof(result), 0);
 	}
 #undef SHAPE
+	if (v14->external) {
+		/* A zeroed reply reads as false or none; keep the display session. */
+		dev_warn_ratelimited(v14->dev, "unhandled DCP callback %#x %u/%u, answered with zeros\n",
+				     tag, in_size, out_size);
+		return 0;
+	}
 	dev_err(v14->dev, "unhandled DCP callback %#x %u/%u\n", tag, in_size, out_size);
 	return -EOPNOTSUPP;
 }
