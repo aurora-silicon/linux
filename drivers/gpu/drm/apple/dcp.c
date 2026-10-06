@@ -192,10 +192,12 @@ void dcp_set_dimensions(struct apple_dcp *dcp)
 	 * TimingElements, dimensions are calculated when parsing
 	 * DisplayAttributes, and TimingElements may be sent first
 	 */
+	mutex_lock(&dcp->modes_lock);
 	for (i = 0; i < dcp->nr_modes; ++i) {
 		dcp->modes[i].mode.width_mm = width_mm;
 		dcp->modes[i].mode.height_mm = height_mm;
 	}
+	mutex_unlock(&dcp->modes_lock);
 }
 
 bool dcp_has_panel(struct apple_dcp *dcp)
@@ -302,8 +304,7 @@ static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_
 	dev_err(dcp->dev, "DCP has crashed\n");
 	if (dcp->connector) {
 		dcp->connector->connected = 0;
-		drm_edid_free(dcp->connector->drm_edid);
-		dcp->connector->drm_edid = NULL;
+		apple_connector_edid_set_live(dcp->connector, false);
 		schedule_work(&dcp->connector->hotplug_wq);
 	}
 	complete(&dcp->start_done);
@@ -739,6 +740,7 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 
 static void disconnected_hpd_event(struct apple_connector *con)
 {
+	apple_connector_edid_set_live(con, false);
 	if (con && con->connected) {
 		struct platform_device *pdev = READ_ONCE(con->dcp);
 
@@ -748,8 +750,6 @@ static void disconnected_hpd_event(struct apple_connector *con)
 			WRITE_ONCE(dcp->ext_backlight, false);
 		}
 		con->connected = 0;
-		drm_edid_free(con->drm_edid);
-		con->drm_edid = NULL;
 		drm_kms_helper_connector_hotplug_event(&con->base);
 		/*
 		 * Drop the display's backlight, outside the caller's locks. Not
@@ -1698,6 +1698,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	 * Type-C and Thunderbolt routes can be activated as soon as they are
 	 * registered below, before the DRM device binds.
 	 */
+	mutex_init(&dcp->modes_lock);
 	mutex_init(&dcp->hpd_mutex);
 	mutex_init(&dcp->tb_lock);
 	dcp_fabric_init(dcp);

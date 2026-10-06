@@ -256,6 +256,8 @@ static void appledrm_connector_cleanup(struct drm_connector *connector)
 	cancel_work_sync(&apple_connector->bl_sync_wq);
 	cancel_work_sync(&apple_connector->bl_commit_wq);
 	mutex_destroy(&apple_connector->bl_lock);
+	apple_connector_invalidate_edid(apple_connector);
+	mutex_destroy(&apple_connector->edid_lock);
 	drm_connector_cleanup(connector);
 	kfree(apple_connector->color_elements.data);
 	kfree(apple_connector->timing_elements.data);
@@ -342,6 +344,7 @@ static int apple_connector_create(struct drm_device *drm,
 		return -ENOMEM;
 
 	mutex_init(&connector->chunk_lock);
+	apple_connector_edid_init(connector);
 	apple_connector_backlight_init(connector);
 	/* before anything can fail: cleanup cancels it */
 	INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
@@ -360,7 +363,7 @@ static int apple_connector_create(struct drm_device *drm,
 
 	connector->base.polled = DRM_CONNECTOR_POLL_HPD;
 	connector->connected = false;
-	connector->dcp = dcp;
+	apple_connector_set_pipeline(connector, dcp);
 
 	ret = drm_connector_attach_encoder(&connector->base, &encoder->base);
 	if (ret)
@@ -498,6 +501,7 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 			return -ENOMEM;
 
 		mutex_init(&connector->chunk_lock);
+		apple_connector_edid_init(connector);
 		apple_connector_backlight_init(connector);
 		/* before anything can fail: cleanup cancels it */
 		INIT_WORK(&connector->hotplug_wq, dcp_hotplug);

@@ -42,3 +42,13 @@ config DRM_APPLE_KUNIT_TEST
 	  failed modesets. These tests can run on other architectures and do
 	  not require the Apple display driver to be enabled. Also test service
 	  ownership and pending commands across disconnect and reannouncement.
+
+config DRM_APPLE_DISPLAY_KUNIT_TEST
+	bool "KUnit tests for Apple display mode probing" if !KUNIT_ALL_TESTS
+	depends on KUNIT && DRM_APPLE
+	default KUNIT_ALL_TESTS
+	help
+	  Test the production timing parser and display reply bounds without
+	  Apple display hardware, including incomplete records and stable
+	  preferred mode selection. Exercise mode list replacement and EDID
+	  invalidation when a sink or display route changes.

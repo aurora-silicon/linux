@@ -2,6 +2,7 @@
 /* Copyright The Asahi Linux Contributors */
 
 #include "dpavservep.h"
+#include "dpavservep-edid.h"
 
 #include <drm/drm_edid.h>
 
@@ -100,19 +101,6 @@ struct dpavserv_copy_edid_cmd {
 	u8 _pad2[8];
 } __packed;
 
-#define EDID_LEADING_DATA_SIZE		8
-#define EDID_BLOCK_SIZE			128
-#define EDID_EXT_BLOCK_COUNT_OFFSET	0x7E
-#define EDID_MAX_SIZE			SZ_32K
-#define EDID_BUF_SIZE			(EDID_LEADING_DATA_SIZE + EDID_MAX_SIZE)
-
-struct dpavserv_copy_edid_resp {
-	__le64 max_size;
-	u8 _pad1[24];
-	__le64 used_size;
-	u8 _pad2[8];
-	u8 data[];
-} __packed;
 static_assert(sizeof(struct dpavserv_copy_edid_resp) == 48);
 
 static int parse_report(struct apple_epic_service *service, enum epic_subtype type,
@@ -186,47 +174,27 @@ static const struct drm_edid *dcpavserv_read_edid(struct apple_epic_service *ser
 {
 	struct dpavserv_copy_edid_cmd cmd;
 	struct dpavserv_copy_edid_resp *resp __free(kfree) = NULL;
-	size_t resp_size = sizeof(*resp) + EDID_BUF_SIZE;
-	int num_blocks;
-	u64 data_size;
+	size_t resp_size = sizeof(*resp) + DPAVSERV_EDID_BUF_SIZE;
+	size_t reply_size, edid_size;
 	int ret;
 
 	memset(&cmd, 0, sizeof(cmd));
-	cmd.max_size = cpu_to_le64(EDID_BUF_SIZE);
+	cmd.max_size = cpu_to_le64(DPAVSERV_EDID_BUF_SIZE);
 	resp = kzalloc(resp_size, GFP_KERNEL);
 	if (!resp)
 		return ERR_PTR(-ENOMEM);
 
-	ret = afk_service_call(service, 1, 7, &cmd, sizeof(cmd), EDID_BUF_SIZE, resp,
-			       resp_size, 0);
+	ret = afk_service_call_with_reply_len(service, 1, 7, &cmd, sizeof(cmd),
+					      DPAVSERV_EDID_BUF_SIZE, resp,
+					      resp_size, 0, &reply_size);
 	if (ret < 0)
 		return ERR_PTR(ret);
 
-	if (le64_to_cpu(resp->max_size) != EDID_BUF_SIZE)
-		return ERR_PTR(-EIO);
+	ret = dcpavserv_edid_size(resp, reply_size, &edid_size);
+	if (ret)
+		return ERR_PTR(ret);
 
-	// print_hex_dump(KERN_DEBUG, "dpavserv EDID cmd: ", DUMP_PREFIX_NONE,
-	// 	       16, 1, resp, 192, true);
-
-	data_size = le64_to_cpu(resp->used_size);
-	if (data_size < EDID_LEADING_DATA_SIZE + EDID_BLOCK_SIZE ||
-	    data_size > EDID_BUF_SIZE)
-		return ERR_PTR(-EIO);
-
-	/*
-	 * An HDMI 2.x sink using the HF-EEODB announces fewer extension blocks
-	 * in the base block than it sends, so the payload may be longer than
-	 * the base block says. Accept any whole number of blocks at least that
-	 * long and leave the block count to drm_edid, which knows about
-	 * HF-EEODB.
-	 */
-	num_blocks = resp->data[EDID_LEADING_DATA_SIZE + EDID_EXT_BLOCK_COUNT_OFFSET];
-	if ((1 + num_blocks) * EDID_BLOCK_SIZE > data_size - EDID_LEADING_DATA_SIZE ||
-	    (data_size - EDID_LEADING_DATA_SIZE) % EDID_BLOCK_SIZE)
-		return ERR_PTR(-EIO);
-
-	return drm_edid_alloc(resp->data + EDID_LEADING_DATA_SIZE,
-			      data_size - EDID_LEADING_DATA_SIZE);
+	return drm_edid_alloc(resp->data + DPAVSERV_EDID_LEADING_SIZE, edid_size);
 }
 
 const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp)

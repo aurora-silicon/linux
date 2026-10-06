@@ -294,6 +294,7 @@ void dcp_hotplug(struct work_struct *work)
 
 	pdev = READ_ONCE(connector->dcp);
 	if (!pdev) {	/* a Type-C port unrouted after this was queued */
+		apple_connector_invalidate_edid(connector);
 		drm_kms_helper_connector_hotplug_event(&connector->base);
 		apple_connector_backlight_sync(connector);
 		return;
@@ -302,10 +303,8 @@ void dcp_hotplug(struct work_struct *work)
 	dev_info(dcp->dev, "%s() connected:%d valid_mode:%d nr_modes:%u\n", __func__,
 		 connector->connected, READ_ONCE(dcp->mode_state.valid), dcp->nr_modes);
 
-	if (!connector->connected) {
-		drm_edid_free(connector->drm_edid);
-		connector->drm_edid = NULL;
-	}
+	if (!connector->connected)
+		apple_connector_invalidate_edid(connector);
 
 	/*
 	 * DCP defers link training until we set a display mode. But we set
@@ -420,6 +419,27 @@ static void dcpep_got_msg(struct apple_dcp *dcp, u64 message)
 		dcpep_handle_cb(dcp, ctx_id, data, length, offset);
 }
 
+void dcp_modes_begin_attachment(struct apple_dcp *dcp)
+{
+	guard(mutex)(&dcp->modes_lock);
+	dcp->modes_admitted = false;
+}
+
+int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle)
+{
+	int ret;
+
+	guard(mutex)(&dcp->modes_lock);
+	ret = replace_modes(handle, &dcp->modes, &dcp->nr_modes,
+			    dcp->width_mm, dcp->height_mm, dcp->notch_height,
+			    dcp->fixed_connector_type == DRM_MODE_CONNECTOR_eDP);
+	if (!ret) {
+		dcp->modes_admitted = true;
+		apple_connector_invalidate_edid(dcp->connector);
+	}
+	return ret;
+}
+
 int dcp_get_modes(struct drm_connector *connector)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
@@ -430,14 +450,19 @@ int dcp_get_modes(struct drm_connector *connector)
 	struct drm_display_mode *mode;
 	u16 min_vfreq = 0, max_vfreq = 0;
 	bool vrr_capable = false;
+	unsigned int count;
 	int i;
 
 	/* A Type-C port has no pipeline while the fabric is moving it. */
-	if (!pdev)
+	if (!pdev) {
+		drm_edid_connector_update(connector, NULL);
 		return 0;
+	}
 	dcp = platform_get_drvdata(pdev);
 
-	for (i = 0; i < dcp->nr_modes; ++i) {
+	mutex_lock(&dcp->modes_lock);
+	count = dcp->modes_admitted ? dcp->nr_modes : 0;
+	for (i = 0; i < count; ++i) {
 		if (dcp->modes[i].vrr) {
 			u16 lo = dcp->modes[i].min_vrr >> 16;
 			u16 hi = dcp->modes[i].max_vrr >> 16;
@@ -452,27 +477,37 @@ int dcp_get_modes(struct drm_connector *connector)
 
 		if (!mode) {
 			dev_err(dev->dev, "Failed to duplicate display mode\n");
+			mutex_unlock(&dcp->modes_lock);
 			return 0;
 		}
 
 		drm_mode_probed_add(connector, mode);
 	}
+	mutex_unlock(&dcp->modes_lock);
 	drm_connector_set_vrr_capable_property(connector, vrr_capable);
 
-	if (dcp->nr_modes &&
-	    !apple_connector->drm_edid) {
+	if (count) {
 		const struct drm_edid *edid;
-		edid = dcpavserv_copy_edid(dcp);
-		if (IS_ERR_OR_NULL(edid)) {
-			dev_info(dcp->dev, "copy_edid failed: %pe\n", edid);
-		} else {
-			drm_edid_free(apple_connector->drm_edid);
-			apple_connector->drm_edid = edid;
+		u64 generation;
+
+		/* The RPC can sleep while a disconnect or route change clears EDID. */
+		if (apple_connector_edid_begin(apple_connector, pdev, &generation)) {
+			edid = dcpavserv_copy_edid(dcp);
+			if (IS_ERR_OR_NULL(edid))
+				dev_info(dcp->dev, "copy_edid failed: %pe\n", edid);
+			else
+				apple_connector_edid_install(apple_connector, pdev,
+							     generation, edid);
 		}
-	}
-	if (dcp->nr_modes && apple_connector->drm_edid) {
-		drm_edid_connector_update(connector, apple_connector->drm_edid);
-		dcp_retry_placeholder_edid(dcp, apple_connector->drm_edid);
+
+		edid = apple_connector_edid_dup(apple_connector, pdev);
+		drm_edid_connector_update(connector, edid);
+		if (edid) {
+			dcp_retry_placeholder_edid(dcp, edid);
+			drm_edid_free(edid);
+		}
+	} else {
+		drm_edid_connector_update(connector, NULL);
 	}
 
 	/*
@@ -487,23 +522,31 @@ int dcp_get_modes(struct drm_connector *connector)
 		connector->display_info.monitor_range.max_vfreq = max_vfreq;
 	}
 
-	return dcp->nr_modes;
+	return count;
 }
 
 /* The user may own drm_display_mode, so we need to search for our copy */
-struct dcp_display_mode *lookup_mode(struct apple_dcp *dcp,
-					    const struct drm_display_mode *mode)
+bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
+		 struct dcp_display_mode *out)
 {
+	bool found = false;
 	int i;
 
+	mutex_lock(&dcp->modes_lock);
+	if (!dcp->modes_admitted)
+		goto out_unlock;
 	for (i = 0; i < dcp->nr_modes; ++i) {
 		if (drm_mode_match(mode, &dcp->modes[i].mode,
-				   DRM_MODE_MATCH_TIMINGS |
-					   DRM_MODE_MATCH_CLOCK))
-			return &dcp->modes[i];
+				   DRM_MODE_MATCH_TIMINGS | DRM_MODE_MATCH_CLOCK)) {
+			if (out)
+				*out = dcp->modes[i];
+			found = true;
+			break;
+		}
 	}
-
-	return NULL;
+out_unlock:
+	mutex_unlock(&dcp->modes_lock);
+	return found;
 }
 
 enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
@@ -517,7 +560,7 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 		return MODE_ERROR;
 	dcp = platform_get_drvdata(pdev);
 
-	return lookup_mode(dcp, mode) ? MODE_OK : MODE_BAD;
+	return lookup_mode(dcp, mode, NULL) ? MODE_OK : MODE_BAD;
 }
 
 int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
@@ -577,7 +620,7 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
 	/* TODO: support synthesized modes through scaling */
-	return lookup_mode(dcp, mode) != NULL;
+	return lookup_mode(dcp, mode, NULL);
 }
 
 

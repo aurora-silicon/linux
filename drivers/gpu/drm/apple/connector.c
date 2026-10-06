@@ -16,6 +16,81 @@
 
 #include "dcp-internal.h"
 
+void apple_connector_edid_init(struct apple_connector *connector)
+{
+	mutex_init(&connector->edid_lock);
+	connector->edid_generation = 1;
+}
+
+static void apple_connector_edid_clear_locked(struct apple_connector *connector)
+{
+	lockdep_assert_held(&connector->edid_lock);
+	drm_edid_free(connector->drm_edid);
+	connector->drm_edid = NULL;
+	connector->edid_generation++;
+}
+
+void apple_connector_invalidate_edid(struct apple_connector *connector)
+{
+	if (!connector)
+		return;
+	guard(mutex)(&connector->edid_lock);
+	apple_connector_edid_clear_locked(connector);
+}
+
+void apple_connector_edid_set_live(struct apple_connector *connector, bool live)
+{
+	if (!connector)
+		return;
+	guard(mutex)(&connector->edid_lock);
+	if (!live || connector->edid_live != live)
+		apple_connector_edid_clear_locked(connector);
+	connector->edid_live = live;
+}
+
+void apple_connector_set_pipeline(struct apple_connector *connector,
+				  struct platform_device *pdev)
+{
+	guard(mutex)(&connector->edid_lock);
+	apple_connector_edid_clear_locked(connector);
+	connector->edid_live = !!pdev;
+	WRITE_ONCE(connector->dcp, pdev);
+}
+
+bool apple_connector_edid_begin(struct apple_connector *connector,
+				struct platform_device *pdev, u64 *generation)
+{
+	guard(mutex)(&connector->edid_lock);
+	if (!pdev || !connector->edid_live || connector->dcp != pdev || connector->drm_edid)
+		return false;
+	*generation = connector->edid_generation;
+	return true;
+}
+
+/* Consume the fetched EDID even if its route or sink changed during the RPC. */
+bool apple_connector_edid_install(struct apple_connector *connector,
+				  struct platform_device *pdev, u64 generation,
+				  const struct drm_edid *edid)
+{
+	guard(mutex)(&connector->edid_lock);
+	if (!edid || !pdev || !connector->edid_live || connector->dcp != pdev ||
+	    connector->edid_generation != generation || connector->drm_edid) {
+		drm_edid_free(edid);
+		return false;
+	}
+	connector->drm_edid = edid;
+	return true;
+}
+
+const struct drm_edid *apple_connector_edid_dup(struct apple_connector *connector,
+						struct platform_device *pdev)
+{
+	guard(mutex)(&connector->edid_lock);
+	if (!pdev || !connector->edid_live || connector->dcp != pdev || !connector->drm_edid)
+		return NULL;
+	return drm_edid_dup(connector->drm_edid);
+}
+
 enum dcp_chunk_type {
 	DCP_CHUNK_COLOR_ELEMENTS,
 	DCP_CHUNK_TIMING_ELELMENTS,

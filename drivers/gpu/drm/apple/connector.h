@@ -48,6 +48,10 @@ struct apple_connector {
 	u32 candidate_crtcs;
 
 	const struct drm_edid *drm_edid;
+	/* Serializes cache ownership and fetch invalidation across sink changes. */
+	struct mutex edid_lock;
+	u64 edid_generation;
+	bool edid_live;
 
 	/* Workqueue for sending hotplug events to the associated device */
 	struct work_struct hotplug_wq;
@@ -77,6 +81,19 @@ struct apple_connector {
 };
 
 #define to_apple_connector(x) container_of(x, struct apple_connector, base)
+
+void apple_connector_edid_init(struct apple_connector *connector);
+void apple_connector_invalidate_edid(struct apple_connector *connector);
+void apple_connector_edid_set_live(struct apple_connector *connector, bool live);
+void apple_connector_set_pipeline(struct apple_connector *connector,
+				  struct platform_device *pdev);
+bool apple_connector_edid_begin(struct apple_connector *connector,
+				struct platform_device *pdev, u64 *generation);
+bool apple_connector_edid_install(struct apple_connector *connector,
+				  struct platform_device *pdev, u64 generation,
+				  const struct drm_edid *edid);
+const struct drm_edid *apple_connector_edid_dup(struct apple_connector *connector,
+						struct platform_device *pdev);
 
 void apple_connector_debugfs_init(struct drm_connector *connector, struct dentry *root);
 

@@ -1265,7 +1265,7 @@ DEFINE_SHOW_ATTRIBUTE(dcp_v14_status);
 /* One mode: the native timing of the boot panel, less the hidden notch rows. */
 static int dcp_v14_mode(struct apple_dcp *dcp, struct apple_dcp_v14 *v14)
 {
-	struct dcp_display_mode *modes, *best = NULL;
+	struct dcp_display_mode *modes, *best = NULL, *selected;
 	struct dcp_parse_ctx ctx;
 	unsigned int count, i;
 	void *blob = NULL;
@@ -1309,18 +1309,24 @@ static int dcp_v14_mode(struct apple_dcp *dcp, struct apple_dcp_v14 *v14)
 		return -EINVAL;
 	}
 	best->mode.type |= DRM_MODE_TYPE_PREFERRED;
-	dcp->modes = kmemdup(best, sizeof(*best), GFP_KERNEL);
+	selected = kmemdup(best, sizeof(*best), GFP_KERNEL);
 	kfree(modes);
-	if (!dcp->modes)
+	if (!selected)
 		return -ENOMEM;
+	mutex_lock(&dcp->modes_lock);
+	kfree(dcp->modes);
+	dcp->modes = selected;
 	dcp->nr_modes = 1;
+	dcp->modes_admitted = true;
+	mutex_unlock(&dcp->modes_lock);
 	return 0;
 }
 
 int iomfb_v14_7_start(struct apple_dcp *dcp)
 {
 	struct apple_dcp_v14 *v14 = dcp->v14;
-	const struct drm_display_mode *mode;
+	struct drm_display_mode selected;
+	const struct drm_display_mode *mode = &selected;
 	const char *step;
 	int ret;
 
@@ -1360,7 +1366,9 @@ int iomfb_v14_7_start(struct apple_dcp *dcp)
 	dcp->active = true;
 	complete(&dcp->start_done);
 
-	mode = &dcp->modes[0].mode;
+	mutex_lock(&dcp->modes_lock);
+	selected = dcp->modes[0].mode;
+	mutex_unlock(&dcp->modes_lock);
 	dev_info(dcp->dev, "T6030 display started: %ux%u@%d, %u notch rows %s, %ux%u mm\n",
 		 mode->hdisplay, mode->vdisplay, drm_mode_vrefresh(mode),
 		 dcp->notch_height ?: v14->panel_height - v14->fb_height,
@@ -1518,7 +1526,7 @@ int iomfb_v14_7_atomic_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
 int iomfb_v14_7_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state)
 {
 	/* The firmware keeps the timing it booted with, which is the only mode. */
-	if (!lookup_mode(dcp, &crtc_state->mode))
+	if (!lookup_mode(dcp, &crtc_state->mode, NULL))
 		return -EINVAL;
 	dcp_mode_set_valid(&dcp->mode_state, true);
 	return 0;

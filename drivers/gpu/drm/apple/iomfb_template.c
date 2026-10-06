@@ -29,6 +29,7 @@
 #include "iomfb.h"
 #include "iomfb_internal.h"
 #include "parser.h"
+#include "dcp-property.h"
 #include "trace.h"
 #include "version_utils.h"
 
@@ -532,6 +533,9 @@ static u8 dcpep_cb_prop_start(struct apple_dcp *dcp, u32 *length)
 		return false;
 	}
 
+	if (!dcp_property_size_valid(*length))
+		return false;
+
 	dcp->chunks.length = *length;
 	dcp->chunks.data = kzalloc(*length, GFP_KERNEL);
 
@@ -551,7 +555,8 @@ static u8 dcpep_cb_prop_chunk(struct apple_dcp *dcp,
 		return false;
 	}
 
-	if (req->offset + req->length > dcp->chunks.length) {
+	if (!dcp_property_chunk_valid(dcp->chunks.length, req->offset,
+				      req->length, sizeof(req->data))) {
 		dev_warn(dcp->dev, "ignoring overflowing chunk\n");
 		return false;
 	}
@@ -571,9 +576,6 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 		return false;
 	}
 
-	/* used just as opaque pointer for tracing */
-	ctx.dcp = dcp;
-
 	ret = parse(dcp->chunks.data, dcp->chunks.length, &ctx);
 
 	if (ret) {
@@ -581,20 +583,15 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 		return false;
 	}
 
-	if (!strcmp(req->key, "TimingElements")) {
-		dcp->modes = enumerate_modes(&ctx, &dcp->nr_modes,
-					     dcp->width_mm, dcp->height_mm,
-					     dcp->notch_height,
-					     dcp->fixed_connector_type ==
-						     DRM_MODE_CONNECTOR_eDP);
+	ctx.dcp = dcp;
 
-		if (IS_ERR(dcp->modes)) {
+	if (!strcmp(req->key, "TimingElements")) {
+		ret = dcp_modes_replace(dcp, &ctx);
+		if (ret) {
 			dev_warn(dcp->dev, "failed to parse modes\n");
-			dcp->modes = NULL;
-			dcp->nr_modes = 0;
 			return false;
 		}
-		if (dcp->nr_modes == 0)
+		if (!READ_ONCE(dcp->nr_modes))
 			dev_warn(dcp->dev, "TimingElements without valid modes!\n");
 	} else if (!strcmp(req->key, "DisplayAttributes")) {
 		bool backlight_control = false, ext;
@@ -629,7 +626,15 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 static u8 dcpep_cb_prop_end(struct apple_dcp *dcp,
 			    struct dcp_set_dcpav_prop_end_req *req)
 {
-	u8 resp = dcpep_process_chunks(dcp, req);
+	u8 resp;
+
+	if (!dcp_property_key_valid(req->key, sizeof(req->key))) {
+		kfree(dcp->chunks.data);
+		dcp->chunks.data = NULL;
+		dcp->chunks.length = 0;
+		return false;
+	}
+	resp = dcpep_process_chunks(dcp, req);
 
 	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_eDP)
 		dev_info(dcp->dev,
@@ -1095,6 +1100,7 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 	if (!*connected)
 		WRITE_ONCE(dcp->ext_backlight, false);
 
+	apple_connector_edid_set_live(connector, !!(*connected));
 	action = dcp_mode_hotplug(&dcp->mode_state, !!(*connected),
 				  connector ? &connector->connected : NULL);
 	/*
@@ -1309,13 +1315,12 @@ static void dcp_set_adaptive_sync(struct apple_dcp *dcp, u32 min_vrr,
 int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			       struct drm_crtc_state *crtc_state)
 {
-	struct dcp_display_mode *mode;
+	struct dcp_display_mode selected, *mode = &selected;
 	struct dcp_wait_cookie *cookie;
 	struct dcp_color_mode *cmode = NULL;
 	int ret;
 
-	mode = lookup_mode(dcp, &crtc_state->mode);
-	if (!mode) {
+	if (!lookup_mode(dcp, &crtc_state->mode, mode)) {
 		dev_err(dcp->dev, "no match for " DRM_MODE_FMT "\n",
 			DRM_MODE_ARG(&crtc_state->mode));
 		return -EIO;
