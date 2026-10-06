@@ -950,6 +950,13 @@ int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
 		dptxport_release_display(dcp->dptxport[port].service);
 		dcp->dptxport[port].connected = false;
 	}
+	/*
+	 * T6030: the firmware takes a direct crossbar output down when it
+	 * stops the link. Make sure of it for a display released here, also
+	 * when the firmware did not get that far.
+	 */
+	if (dcp->external_native)
+		dcp_direct_crossbar_link(dcp, false);
 	mutex_unlock(&dcp->hpd_mutex);
 
 	return 0;
