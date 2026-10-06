@@ -63,24 +63,32 @@ pub(super) struct Registry {
 }
 
 impl Registry {
-    pub(super) fn new(clusters: u32, descriptor_flags: [u32; 2]) -> Result<Self> {
-        let mut compute = KVec::with_capacity(QIDS, GFP_KERNEL)?;
-        for _ in 0..QIDS {
-            compute.push(None, GFP_KERNEL)?;
-        }
-        let mut qids = kick::QueueIds::new();
-        qids.reserve(1, DataMaster::Tiling, Some(0))?;
-        qids.reserve(2, DataMaster::Fragment, Some(1))?;
-        Ok(Self {
-            qids,
-            buffers: BufferIds::new(),
+    /// Initialize inside the firmware allocation instead of staging the whole
+    /// registry on the probe stack. No additional allocation is required.
+    pub(super) fn new(
+        clusters: u32,
+        descriptor_flags: [u32; 2],
+    ) -> impl Init<Self, Error> {
+        kernel::try_init!(Self {
+            qids <- kick::QueueIds::new().chain(|qids| {
+                qids.reserve(1, DataMaster::Tiling, Some(0))?;
+                qids.reserve(2, DataMaster::Fragment, Some(1))?;
+                Ok(())
+            }),
+            buffers <- BufferIds::new(),
             accounting: qos::Accounting::new(),
             metrics: Arc::new(MetricsIds::new(), GFP_KERNEL)?,
             qos_ids: QosIds::new()?,
             admission: admission::Pool::new()?,
             render: render::RenderState::new(clusters, descriptor_flags)?,
             identities: queue::Identities::new(),
-            compute,
+            compute: {
+                let mut compute = KVec::with_capacity(QIDS, GFP_KERNEL)?;
+                for _ in 0..QIDS {
+                    compute.push(None, GFP_KERNEL)?;
+                }
+                compute
+            },
             compute_building: false,
             compute_scheduler_building: false,
             observations: compute::retirement::Batch::new()?,

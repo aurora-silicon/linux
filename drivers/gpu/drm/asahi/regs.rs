@@ -11,17 +11,18 @@
 //! coprocessors start, and enables dynamic power gating before the firmware is initialized.
 
 use crate::hw;
+use core::mem::MaybeUninit;
 use kernel::{
-    c_str,
+    bindings, c_str,
     device::Core,
     devres::Devres,
+    error::{from_err_ptr, to_result},
     io::{
         mem::IoMem, //
         Io,
     },
     platform,
     prelude::*,
-    str::CStr,
     sync::{aref::ARef, Arc}, //
 };
 
@@ -53,9 +54,6 @@ const CORE_MASK_1: usize = 0xd01514;
 const CORE_MASKS_G14X: usize = 0xe01500;
 const FAULT_INFO_G14X: usize = 0xd8c0;
 const FAULT_ADDR_G14X: usize = 0xd8c8;
-
-/// Cleared after `CPU_RUN` when stopping a G17 coprocessor.
-const CPU_STOP_ACK: u32 = 0x1 << 5; // BIT(5)
 
 /// G17 GPU-to-fabric bridge control words. Bit 0 enables the bridge; the other bits are status.
 const G17_BRIDGE_CONTROL: [usize; 2] = [0x1000104, 0x1000108];
@@ -197,35 +195,62 @@ pub(crate) struct G17Id {
     pub(crate) perf_map: [u32; 2],
 }
 
-/// CPU control registers of one GPU coprocessor.
+/// Provider-owned lifecycle of one G17 firmware coprocessor.
+///
+/// The mailbox provider owns the wrapper mappings and runtime-PM references.
+/// The consumer device link keeps it alive until this GPU has stopped using it.
 pub(crate) struct CpuControl {
-    asc: Pin<KBox<Devres<IoMem<ASC_CTL_SIZE>>>>,
+    dev: ARef<platform::Device>,
+    mbox: *mut bindings::apple_mbox,
 }
 
+// SAFETY: The live provider serializes CPU transitions with its lifecycle mutex;
+// the device link orders provider removal after this consumer's teardown.
+unsafe impl Send for CpuControl {}
+// SAFETY: All accesses use the same provider-serialized lifecycle API.
+unsafe impl Sync for CpuControl {}
+
 impl CpuControl {
-    /// Map the CPU control registers in the `name` register region.
-    pub(crate) fn new(pdev: &platform::Device<Core>, name: &CStr) -> Result<CpuControl> {
-        let req = pdev.io_request_by_name(name).ok_or(EINVAL)?;
-        Ok(CpuControl {
-            asc: KBox::pin_init(req.iomap_sized::<ASC_CTL_SIZE>(), GFP_KERNEL)?,
-        })
+    /// Resolve the mailbox phandle and validate its firmware role before use.
+    pub(crate) fn new(pdev: &platform::Device<Core>, index: usize) -> Result<Self> {
+        let expected = match index {
+            0 => bindings::apple_mbox_ascwrap_v6_role_APPLE_MBOX_ASCWRAP_V6_ROLE_GFX,
+            1 => bindings::apple_mbox_ascwrap_v6_role_APPLE_MBOX_ASCWRAP_V6_ROLE_GFX1,
+            _ => return Err(EINVAL),
+        };
+        // SAFETY: pdev is live; the provider establishes the consumer device link.
+        let mbox = unsafe {
+            from_err_ptr(bindings::apple_mbox_get(pdev.as_ref().as_raw(), index.try_into()?))?
+        };
+        let mut lifecycle = MaybeUninit::uninit();
+        // SAFETY: mbox is live, and lifecycle is writable storage for the C result.
+        to_result(unsafe {
+            bindings::apple_mbox_ascwrap_v6_get_lifecycle(mbox, lifecycle.as_mut_ptr())
+        })?;
+        // SAFETY: A successful provider query initialized every field.
+        if unsafe { lifecycle.assume_init() }.role != expected {
+            return Err(EINVAL);
+        }
+        // SAFETY: This only checks the provider's matching start/stop capability.
+        to_result(unsafe { bindings::apple_mbox_ascwrap_v6_require_safe_cpu_lifecycle(mbox) })?;
+        Ok(Self { dev: pdev.into(), mbox })
     }
 
-    /// Start the coprocessor CPU.
+    /// Start through the owner of the CPU registers and runtime-PM reference.
     pub(crate) fn start(&self) -> Result {
-        let asc = self.asc.try_access().ok_or(ENODEV)?;
-        let val = asc.read32(CPU_CONTROL);
-        asc.write32(val | CPU_RUN, CPU_CONTROL);
-        Ok(())
+        // SAFETY: The constructor established the live, role-checked provider.
+        to_result(unsafe { bindings::apple_mbox_ascwrap_v6_start_cpu(self.mbox) })
     }
 
-    /// Stop the coprocessor CPU. This only gates it: its firmware keeps its state.
+    /// Stop before releasing the transport or any firmware-visible memory.
     pub(crate) fn stop(&self) {
-        if let Some(asc) = self.asc.try_access() {
-            let val = asc.read32(CPU_CONTROL);
-            asc.write32(val & !CPU_RUN, CPU_CONTROL);
-            let val = asc.read32(CPU_CONTROL);
-            asc.write32(val & !CPU_STOP_ACK, CPU_CONTROL);
+        // SAFETY: The provider remains live during consumer teardown. Removal
+        // stops the CPU before setting the fence that can return ENODEV here.
+        let result = to_result(unsafe { bindings::apple_mbox_ascwrap_v6_stop_cpu(self.mbox) });
+        if let Err(error) = result {
+            if error != ENODEV {
+                dev_err!(self.dev.as_ref(), "Could not stop GPU coprocessor: {:?}\n", error);
+            }
         }
     }
 }

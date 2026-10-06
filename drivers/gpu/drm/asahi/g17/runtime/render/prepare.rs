@@ -19,7 +19,7 @@ struct BuildResources {
     global: crate::mmu::Vm,
     metrics: Arc<KernelObject>,
     metrics_ids: Arc<crate::g17::buffer::MetricsIds>,
-    metrics_bases: [u64; 2],
+    metrics_bases: crate::g17::fw::buffer::MetricsAddresses,
     config: Config,
 }
 impl BuildResources {
@@ -31,10 +31,10 @@ impl BuildResources {
             global: firmware._render_global.clone(),
             metrics: firmware._pm_metrics.clone(),
             metrics_ids: firmware.queues.metrics.clone(),
-            metrics_bases: [
-                crate::hw::t8140::CONFIG.pm_metrics.va,
-                firmware.init.metrics_fw_va()?,
-            ],
+            metrics_bases: crate::g17::fw::buffer::MetricsAddresses {
+                firmware: firmware.init.metrics_fw_va()?,
+                client: crate::hw::t8140::CONFIG.pm_metrics.va,
+            },
             config: firmware.queues.render.config,
         })
     }

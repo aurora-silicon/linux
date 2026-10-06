@@ -399,7 +399,7 @@ impl File {
         let status = Self::vm_status(file, vm_id)?;
         UserSlice::new(user, size)
             .writer()
-            .write(&[vm_id, 0, status.get() as u32, 0])?;
+            .write(&[vm_id, 0, status.reported_error() as u32, 0])?;
         Ok(0)
     }
 

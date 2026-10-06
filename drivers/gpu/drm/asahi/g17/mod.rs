@@ -355,12 +355,8 @@ impl Coprocessor {
             GFP_KERNEL,
         )?;
 
-        let name = match role {
-            Role::Primary => c_str!("asc"),
-            Role::Secondary => c_str!("asc1"),
-        };
         Ok(Coprocessor {
-            cpu: regs::CpuControl::new(pdev, name)?,
+            cpu: regs::CpuControl::new(pdev, index)?,
             running: false,
             rtkit: Self::receiver(dev, index, &state)?,
             state,
@@ -924,8 +920,6 @@ impl Gpu {
 
         // The firmware only samples the kernel lower root's top-level entries when it starts, so
         // everything it uses there must be mapped first.
-        let primary = Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Primary)?;
-        let secondary = Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Secondary)?;
         let pm_metrics = KernelObject::new(
             dev,
             uat.kernel_lower_vm(),
@@ -934,28 +928,32 @@ impl Gpu {
             mmu::PROT_GPU_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
+        let primary = Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Primary)
+            .inspect_err(|e| dev_err!(dev.as_ref(), "Primary coprocessor setup failed: {:?}\n", e))?;
+        let secondary = Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Secondary)
+            .inspect_err(|e| dev_err!(dev.as_ref(), "Secondary coprocessor setup failed: {:?}\n", e))?;
         let render_global = uat.new_vm(0, geometry.user_range())?;
 
         let bridge = Bridge::enable(regs)?;
 
         // Install all session ownership before either CPU starts. Error unwinding then runs
         // Firmware::drop, stopping both CPUs before releasing shared objects or translations.
-        let mut firmware = KBox::new(
-            Firmware {
+        let mut firmware = KBox::try_init(
+            kernel::try_init!(Firmware {
                 secondary,
                 primary,
                 bridge,
                 rings: channel::Rings::new(),
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
-                queues: runtime::Registry::new(shared.clusters, shared.descriptor_flags)?,
+                queues <- runtime::Registry::new(shared.clusters, shared.descriptor_flags),
                 pool: object::Pool::new()?,
                 render_ids: Arc::new(freelist::RenderIds::new(), GFP_KERNEL)?,
                 init: initdata::InitData::new(),
                 _render_global: render_global,
                 _pm_metrics: Arc::new(pm_metrics, GFP_KERNEL)?,
                 uat,
-            },
+            }),
             GFP_KERNEL,
         )?;
         let session = &mut *firmware;
