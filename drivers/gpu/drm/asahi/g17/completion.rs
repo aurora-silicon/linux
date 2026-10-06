@@ -324,7 +324,9 @@ impl Completion {
             Ok(())
         });
         if let Err(error) = result {
-            if error != ECANCELED && !self.spared() {
+            if self.spared() {
+                self.status.report_failure(error);
+            } else if error != ECANCELED {
                 self.status.record(error);
             }
             self.fence.set_error(error);
@@ -355,7 +357,9 @@ impl Completion {
         if let Some(guard) = self.vm_job.lock().as_ref() {
             guard.quarantine();
         }
-        if error != ECANCELED && !self.spared() {
+        if self.spared() {
+            self.status.report_failure(error);
+        } else if error != ECANCELED {
             self.status.record(error);
         }
         self.fence.set_error(error);

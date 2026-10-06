@@ -47,10 +47,10 @@ pub(crate) struct QueueIds {
 }
 
 impl QueueIds {
-    pub(crate) const fn new() -> Self {
-        Self {
-            entries: [None; QID_COUNT],
-        }
+    pub(crate) fn new() -> impl Init<Self, Error> {
+        kernel::try_init!(Self {
+            entries <- pin_init::init_array_from_fn(|_| None),
+        })
     }
 
     /// Reuses only an exact owner/engine match. Preferred placement is for

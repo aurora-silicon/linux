@@ -34,21 +34,17 @@ pub(crate) struct BufferIds {
     next_token: u64,
 }
 impl BufferIds {
-    pub(crate) fn new() -> Self {
-        let mut returned = [0; BUFFER_IDS];
-        for (index, entry) in returned.iter_mut().enumerate() {
-            *entry = (BUFFER_IDS - index - 1) as u8;
-        }
-        Self {
-            entries: [BufferId {
+    pub(crate) fn new() -> impl Init<Self, Error> {
+        kernel::try_init!(Self {
+            entries <- pin_init::init_array_from_fn(|_| BufferId {
                 references: 0,
                 owner: false,
                 token: 0,
-            }; BUFFER_IDS],
-            returned,
+            }),
+            returned <- pin_init::init_array_from_fn(|index| (BUFFER_IDS - index - 1) as u8),
             returned_count: BUFFER_IDS,
             next_token: 0,
-        }
+        })
     }
     fn remove_returned(&mut self, id: u8) {
         if let Some(at) = self.returned[..self.returned_count]
@@ -458,14 +454,14 @@ pub(crate) struct MetricsLease {
     _backing: Arc<KernelObject>,
     allocator: Arc<MetricsIds>,
     slot: usize,
-    addresses: [u64; 2],
+    addresses: fw::MetricsAddresses,
 }
 impl MetricsLease {
     /// Clears only the selected retired metrics entry before reusing it.
     pub(crate) fn new(
         ids: &Arc<MetricsIds>,
         object: &Arc<KernelObject>,
-        bases: [u64; 2],
+        bases: fw::MetricsAddresses,
     ) -> Result<Self> {
         let mut selected = None;
         for (bank, used) in ids.used.iter().enumerate() {
@@ -499,13 +495,13 @@ impl MetricsLease {
             _backing: object.clone(),
             allocator: ids.clone(),
             slot,
-            addresses: [0; 2],
+            addresses: fw::MetricsAddresses::default(),
         };
         let offset = slot * fw::METRICS_STRIDE;
-        lease.addresses = [
-            bases[0].checked_add(offset as u64).ok_or(EOVERFLOW)?,
-            bases[1].checked_add(offset as u64).ok_or(EOVERFLOW)?,
-        ];
+        lease.addresses = fw::MetricsAddresses {
+            firmware: bases.firmware.checked_add(offset as u64).ok_or(EOVERFLOW)?,
+            client: bases.client.checked_add(offset as u64).ok_or(EOVERFLOW)?,
+        };
         let words = object.pointer(offset, fw::METRICS_STRIDE)?.cast::<u32>();
         object.word(offset)?;
         for index in 0..fw::SCENES {
@@ -631,7 +627,7 @@ impl Manager {
         Ok(self.graph.gpu_va() + fw::SCENE_TABLE as u64 + (index * size_of::<fw::Scene>()) as u64)
     }
     pub(crate) fn scene_registers(&self, index: usize) -> Result<(u64, u64)> {
-        fw::scene_registers(index, self.scratch, self.metrics.addresses[1])
+        fw::scene_registers(index, self.scratch, self.metrics.addresses.client)
     }
     pub(crate) fn prepare_scene(&mut self, ordinal: u64) -> Result<usize> {
         let scene = self.scenes.select(ordinal)?;

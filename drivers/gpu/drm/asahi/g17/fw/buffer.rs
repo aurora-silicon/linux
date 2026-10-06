@@ -120,11 +120,17 @@ static_assert!(core::mem::offset_of!(State, block_table) == 0x44);
 static_assert!(core::mem::offset_of!(State, discard) == 0x84);
 static_assert!(core::mem::offset_of!(Scene, generation) == 0x4c);
 
+/// The same metrics storage in the firmware and application address spaces.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MetricsAddresses {
+    pub(crate) firmware: u64,
+    pub(crate) client: u64,
+}
+
 pub(crate) struct GraphArgs<'a> {
     pub(crate) fw_va: u64,
     pub(crate) page_list_client: u64,
-    /// Firmware and client views, respectively, of this graph's metrics lease.
-    pub(crate) metrics: [u64; 2],
+    pub(crate) metrics: MetricsAddresses,
     pub(crate) blocks: &'a [u64],
     pub(crate) scratch: u64,
     pub(crate) discard: u64,
@@ -168,8 +174,8 @@ impl Graph {
             }
         }
         for (index, scene) in self.scenes.iter_mut().enumerate() {
-            scene.metric_client = offset_va(args.metrics[1], (index * 4) as u64)?;
-            scene.metric_fw = offset_va(args.metrics[0], (index * 4) as u64)?;
+            scene.metric_client = offset_va(args.metrics.client, (index * 4) as u64)?;
+            scene.metric_fw = offset_va(args.metrics.firmware, (index * 4) as u64)?;
             scene.scratch = scratch + (index % SCRATCH_SLOTS) as u64 * SCRATCH_STRIDE;
             scene.statistics = stats;
         }

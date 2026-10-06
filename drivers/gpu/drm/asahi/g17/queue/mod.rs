@@ -236,6 +236,12 @@ impl<B: Backend> Queue<B> {
             }
         }
         for (_, fences) in frontier {
+            // Successful completion includes host timestamp publication. Its
+            // ready fence adds no ordering and would prevent shallow inline
+            // publication. Failed and pending producers still need checking.
+            if job::fence_status(&fences.completed) > 0 {
+                continue;
+            }
             dependencies.push(fences.ready.clone(), GFP_KERNEL)?;
             firmware.push(fences.completed.clone(), GFP_KERNEL)?;
         }

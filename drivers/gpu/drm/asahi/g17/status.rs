@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Sticky VM errors and their optional userspace mirror. No firmware state is accessed here.
+//! VM admission errors and client failure reporting. No firmware state is accessed here.
 
 use crate::gem;
 use core::cell::UnsafeCell;
@@ -10,9 +10,11 @@ use kernel::prelude::*;
 const MIRROR_MAX_SIZE: usize = 64 * 1024;
 
 /// A VM and its accepted jobs share this status, including after queue destruction.
-/// The first error is permanent. Callers record it before signalling the job's fence.
+/// Client failure is separate from hardware admission: recovery may preserve the
+/// VM while failed accepted work must still be reported before signalling fences.
 pub(crate) struct VmStatus {
     error: AtomicI32,
+    reported_error: AtomicI32,
     mirror: AtomicPtr<i32>,
     mirror_claimed: AtomicBool,
     mirror_owner: UnsafeCell<Option<gem::ObjectRef>>,
@@ -30,6 +32,7 @@ impl VmStatus {
     pub(crate) fn new() -> Self {
         Self {
             error: AtomicI32::new(0),
+            reported_error: AtomicI32::new(0),
             mirror: AtomicPtr::new(core::ptr::null_mut()),
             mirror_claimed: AtomicBool::new(false),
             mirror_owner: UnsafeCell::new(None),
@@ -40,9 +43,26 @@ impl VmStatus {
         self.error.load(Ordering::Acquire)
     }
 
-    /// Store the first error in both the status and any registered mirror.
+    /// Record permanent admission failure and report it to the client.
     pub(crate) fn record(&self, error: Error) {
-        let error = match self.error.compare_exchange(
+        self.report_failure(error);
+        let _ = self.error.compare_exchange(
+            0,
+            error.to_errno(),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    pub(crate) fn reported_error(&self) -> i32 {
+        self.reported_error.load(Ordering::Acquire)
+    }
+
+    /// Report failed accepted work without preventing recovery of the VM.
+    /// Every reporter publishes the first error before returning: a losing
+    /// reporter may signal its fence before the winning reporter resumes.
+    pub(crate) fn report_failure(&self, error: Error) {
+        let error = match self.reported_error.compare_exchange(
             0,
             error.to_errno(),
             Ordering::SeqCst,
@@ -88,11 +108,11 @@ impl VmStatus {
         // SAFETY: The retained owner keeps this checked, aligned word mapped.
         unsafe { AtomicI32::from_ptr(word) }.store(0, Ordering::SeqCst);
 
-        // The pointer publication and error update form a store/load handshake:
-        // either this load sees record's error or record sees our pointer. Stores
+        // The pointer publication and reported error form a store/load handshake:
+        // either this load sees the error or the reporter sees our pointer. Stores
         // after publishing the pointer write only the same first error, never zero.
         self.mirror.store(word, Ordering::SeqCst);
-        let error = self.error.load(Ordering::SeqCst);
+        let error = self.reported_error.load(Ordering::SeqCst);
         if error != 0 {
             // SAFETY: The mapping remains owned by this status as above.
             unsafe { AtomicI32::from_ptr(word) }.store(error, Ordering::SeqCst);
