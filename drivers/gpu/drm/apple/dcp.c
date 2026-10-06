@@ -686,7 +686,10 @@ void dcp_external_ready(struct apple_dcp *dcp)
 		dcp_queue_typec_reconnect(dcp, 0);
 	} else if (dcp->hdmi_hpd && dcp->active &&
 		   gpiod_get_value_cansleep(dcp->hdmi_hpd)) {
-		dcp_dptx_connect(dcp, 0);
+		int ret = dcp_dptx_connect(dcp, 0);
+
+		if (ret && ret != -EAGAIN && ret != -ESTALE && ret != -ESHUTDOWN)
+			dcp_external_retry(dcp, "HDMI display link not set up", ret, 1000);
 	}
 }
 
@@ -766,6 +769,11 @@ void dcp_external_retry_work(struct work_struct *work)
 		dev_info(dcp->dev, "display retry: setting the display mode again\n");
 		dcp_mode_invalidate(&dcp->mode_state);
 		schedule_work(&connector->hotplug_wq);
+		return;
+	}
+	/* An HDMI output connects through the fabric, as on its HPD. */
+	if (!dcp_is_typec_output(dcp) && dcp->hdmi_hpd) {
+		dcp_fabric_hdmi_retry(dcp);
 		return;
 	}
 	if (!READ_ONCE(dcp->typec_cable_connected)) {

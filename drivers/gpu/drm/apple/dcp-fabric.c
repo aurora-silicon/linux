@@ -2444,15 +2444,51 @@ static void dcp_hdmi_observed(void *ctx, bool high, bool debounced)
 		dev_info(dcp->dev, "DP2HDMI HPD irq, connected:%d\n", high);
 }
 
+/* A failed HDMI connect that a retry may fix; see dcp_fabric_hdmi_retry(). */
+static void dcp_hdmi_connect_failed(struct apple_dcp *dcp, int ret)
+{
+	if (dcp->external_native && ret && ret != -EAGAIN && ret != -ESTALE &&
+	    ret != -ESHUTDOWN)
+		dcp_external_retry(dcp, "HDMI display link not set up", ret, 1000);
+}
+
 static void dcp_hdmi_connect_fixed(void *ctx)
 {
 	struct apple_dcp *dcp = ctx;
 	int ret = dcp_fixed_output_select(dcp);
 
+	/* A new HDMI attach gets its own retries. */
+	if (dcp->external_native)
+		atomic_set(&dcp->external_retries, 0);
 	if (ret)
 		dev_err(dcp->dev, "could not select the HDMI output: %d\n", ret);
 	else
-		dcp_dptx_connect(dcp, 0);
+		ret = dcp_dptx_connect(dcp, 0);
+	dcp_hdmi_connect_failed(dcp, ret);
+}
+
+/*
+ * The bounded retry of a native external pipe, for its HDMI output: the
+ * display is attached, but its link did not come up. Set the output up
+ * again, in case the PHY or crossbar lost their setup, and connect again.
+ */
+void dcp_fabric_hdmi_retry(struct apple_dcp *dcp)
+{
+	int ret;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	if (dcp->active_typec_route || gpiod_get_value_cansleep(dcp->hdmi_hpd) <= 0) {
+		dev_info(dcp->dev, "display retry: the HDMI port has no display any more\n");
+		return;
+	}
+	dev_info(dcp->dev, "display retry: connecting the HDMI display again\n");
+	/* Releases a half-made connection; a no-op otherwise. */
+	dcp_dptx_disconnect(dcp, 0);
+	dcp_fixed_hdmi_reinit_locked(dcp, "its display link did not come up");
+	ret = dcp_fixed_output_select(dcp);
+	if (!ret)
+		ret = dcp_dptx_connect(dcp, 0);
+	dcp_hdmi_connect_failed(dcp, ret);
 }
 
 static const struct dcp_fabric_hdmi_ops dcp_hdmi_ops = {
