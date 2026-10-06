@@ -2856,6 +2856,43 @@ static int atcphy_dp_set_rate_t8122(struct apple_atcphy *atcphy, unsigned int li
 	return 0;
 }
 
+/*
+ * Program the drive level DCP chose for each lane. Lanes fill the DP lane
+ * pairs in ascending order, see atc_t8122_dp_lane_map().
+ */
+static int atcphy_dp_set_drive_t8122(struct apple_atcphy *atcphy,
+				     const struct phy_configure_opts_dp *opts)
+{
+	u8 pairs = atcphy->dp_t8122.pairs;
+	u32 presets[4];
+	unsigned int i;
+	int ret;
+
+	lockdep_assert_held(&atcphy->lock);
+
+	if (!pairs)
+		return -ENOLINK;
+	if (!opts->lanes || opts->lanes > 2 * hweight8(pairs))
+		return -EINVAL;
+	for (i = 0; i < opts->lanes; i++) {
+		ret = atc_t8122_dp_preset(opts->voltage[i], opts->pre[i], &presets[i]);
+		if (ret)
+			return ret;
+	}
+	for (i = 0; i < opts->lanes; i++) {
+		unsigned int pair;
+		bool tx;
+
+		ret = atc_t8122_dp_lane_map(pairs, i, &pair, &tx);
+		if (ret)
+			return ret;
+		atc_t8122_dp_lane_drive(atcphy->regs.core, pair, tx, presets[i]);
+	}
+	dev_dbg(atcphy->dev, "DP drive: %u lanes, lane 0 swing %u pre-emphasis %u\n",
+		opts->lanes, opts->voltage[0], opts->pre[0]);
+	return 0;
+}
+
 /* Stop the main link and the AUX channel ahead of a mode change */
 static void atcphy_dp_stop_t8122(struct apple_atcphy *atcphy)
 {
@@ -3115,14 +3152,19 @@ static int atcphy_dpphy_validate(struct phy *phy, enum phy_mode mode, int submod
 static int atcphy_dpphy_configure_t8122(struct apple_atcphy *atcphy,
 					struct phy_configure_opts_dp *opts)
 {
+	int ret;
+
 	guard(mutex)(&atcphy->lock);
 
 	if (opts->set_lanes)
 		return -EINVAL;
-	if (opts->set_rate)
-		return atcphy_dp_set_rate_t8122(atcphy, opts->link_rate);
+	if (opts->set_rate) {
+		ret = atcphy_dp_set_rate_t8122(atcphy, opts->link_rate);
+		if (ret)
+			return ret;
+	}
 	if (opts->set_voltages)
-		return -EINVAL;
+		return atcphy_dp_set_drive_t8122(atcphy, opts);
 	return 0;
 }
 
