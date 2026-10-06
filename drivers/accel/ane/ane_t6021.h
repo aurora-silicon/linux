@@ -557,6 +557,7 @@ void ane_t6021_csne_ping_attempt(struct ane_t6021 *ane);
  * consumes the staged surface separately; staging alone does not
  * release the CPU.
  */
+int ane_t6021_fwload_check(struct device *dev);
 int ane_t6021_fwload_probe(struct ane_t6021 *ane);
 void ane_t6021_fwload_remove(struct ane_t6021 *ane);
 bool ane_t6021_fwload_options_ok(void);
