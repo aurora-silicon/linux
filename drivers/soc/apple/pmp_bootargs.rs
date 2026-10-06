@@ -70,6 +70,14 @@ mod tests {
     }
 
     #[test]
+    fn larger_sram_uses_its_actual_extent() {
+        assert!(region_valid(0x90000, 0x1000, 0x100000));
+        assert!(region_valid(0xffff8, 8, 0x100000));
+        assert!(!region_valid(0xffff8, 9, 0x100000));
+        assert!(!region_valid(0x90000, 0x1000, 0x80000));
+    }
+
+    #[test]
     fn board_memory_and_unknown_records() {
         let mut bytes = Vec::new();
         record(&mut bytes, BDID, &[0; 4]);

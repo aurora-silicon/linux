@@ -45,7 +45,7 @@ use kernel::{
     types::ForeignOwnable, //
 };
 
-const PMP_MMIO_SIZE: usize = 0x80000;
+const PMP_MIN_MMIO_SIZE: usize = 0x80000;
 const ASC_MMIO_SIZE: usize = 0x4000;
 const BOOTARGS_OFFSET: usize = 0x22c;
 const BOOTARGS_SIZE: usize = 0x230;
@@ -121,7 +121,7 @@ impl PmpState {
 #[pin_data]
 struct PmpData {
     dev: ARef<device::Device>,
-    pmp_mmio: Pin<KBox<Devres<IoMem<PMP_MMIO_SIZE>>>>,
+    pmp_mmio: Pin<KBox<Devres<IoMem<PMP_MIN_MMIO_SIZE>>>>,
     asc_mmio: Pin<KBox<Devres<IoMem<ASC_MMIO_SIZE>>>>,
     #[pin]
     rtkit: Mutex<Option<rtkit::RtKit<PmpData>>>,
@@ -132,7 +132,7 @@ struct PmpData {
 impl PmpData {
     fn new(dev: &platform::Device<Core>) -> Result<Arc<PmpData>> {
         let pmp_req = dev.io_request_by_name(c"pmp").ok_or(EINVAL)?;
-        let pmp_mmio = KBox::pin_init(pmp_req.iomap_sized::<PMP_MMIO_SIZE>(), GFP_KERNEL)?;
+        let pmp_mmio = KBox::pin_init(pmp_req.iomap_sized::<PMP_MIN_MMIO_SIZE>(), GFP_KERNEL)?;
         let asc_req = dev.io_request_by_name(c"asc").ok_or(EINVAL)?;
         let asc_mmio = KBox::pin_init(asc_req.iomap_sized::<ASC_MMIO_SIZE>(), GFP_KERNEL)?;
         Arc::pin_init(
@@ -164,7 +164,7 @@ impl PmpData {
         let io = self.pmp_mmio.access(dev.as_ref())?.relaxed();
         let offset = io.read32(BOOTARGS_OFFSET) as usize;
         let size = io.read32(BOOTARGS_SIZE) as usize;
-        if !pmp_bootargs::region_valid(offset, size, PMP_MMIO_SIZE) {
+        if !pmp_bootargs::region_valid(offset, size, io.maxsize()) {
             return Err(EINVAL);
         }
         let mut arg_bytes = kvec![0u8; size]?;
