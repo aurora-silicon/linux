@@ -109,6 +109,9 @@ struct apple_dcp_v14 {
 	bool powered;
 	/* External: catalog generation when a chunked property started. */
 	u64 chunk_generation;
+	/* External: the parts of the display's description published now. */
+	unsigned int described;
+	wait_queue_head_t described_wait;
 
 	/* Boot framebuffer and native panel timing (notch rows included). */
 	u32 stride;
@@ -331,6 +334,14 @@ static int dcp_v14_map_piodma(struct apple_dcp_v14 *v14, u32 id)
 	return 0;
 }
 
+/* Parts of an external display's description, as the firmware publishes it. */
+#define DCP_V14_DESC_TIMING	BIT(0)
+#define DCP_V14_DESC_COLOR	BIT(1)
+#define DCP_V14_DESC_ATTRS	BIT(2)
+#define DCP_V14_DESC_ALL	(DCP_V14_DESC_TIMING | DCP_V14_DESC_COLOR | DCP_V14_DESC_ATTRS)
+/* How long a mode set waits for a description being (re)published. */
+#define DCP_V14_DESC_TIMEOUT_MS	3000
+
 /* An external processor's default stride; no framebuffer is allocated for it. */
 #define DCP_V14_EXT_STRIDE	(1920 * 4)
 /* The display clock of every T6030 external pipe, unless the DT names one. */
@@ -415,16 +426,31 @@ static void dcp_v14_external_published(struct apple_dcp_v14 *v14, const char *ke
 	struct apple_connector *connector;
 	struct dcp_v14_raw *raw = NULL;
 	struct dcp_parse_ctx ctx;
+	unsigned int part = 0;
 	u32 i;
 	int ret;
 
-	if (!dcp || (strcmp(key, "TimingElements") && strcmp(key, "DisplayAttributes") &&
-		     strcmp(key, "ColorElements") && strcmp(key, "Transport")))
+	if (!strcmp(key, "TimingElements"))
+		part = DCP_V14_DESC_TIMING;
+	else if (!strcmp(key, "ColorElements"))
+		part = DCP_V14_DESC_COLOR;
+	else if (!strcmp(key, "DisplayAttributes"))
+		part = DCP_V14_DESC_ATTRS;
+	else if (strcmp(key, "Transport"))
 		return;
 	for (i = 0; i < v14->raw_count && !removed; i++)
 		if (!v14->raw[i].service && !strcmp(v14->raw[i].key, key))
 			raw = &v14->raw[i];
 	if (!removed && !raw)
+		return;
+	/* The timings count once they parse; see below. */
+	if (removed)
+		v14->described &= ~part;
+	else if (part != DCP_V14_DESC_TIMING)
+		v14->described |= part;
+	/* A mode set waits for the whole description; see external_settle(). */
+	wake_up_all(&v14->described_wait);
+	if (!dcp)
 		return;
 	dev_info(dcp->dev, "display %s %s, %u bytes\n", key, removed ? "withdrawn" : "published",
 		 raw ? raw->size : 0);
@@ -455,6 +481,9 @@ static void dcp_v14_external_published(struct apple_dcp_v14 *v14, const char *ke
 			dev_warn(dcp->dev, "display timings not used: %d\n", ret);
 			return;
 		}
+		if (READ_ONCE(dcp->nr_modes))
+			v14->described |= DCP_V14_DESC_TIMING;
+		wake_up_all(&v14->described_wait);
 		dev_info(dcp->dev, "display has %u usable modes\n", READ_ONCE(dcp->nr_modes));
 		dcp_v14_external_hotplug(dcp, READ_ONCE(dcp->nr_modes) > 0);
 	} else if (!strcmp(key, "DisplayAttributes") && !removed) {
@@ -1170,6 +1199,7 @@ int iomfb_v14_7_probe(struct apple_dcp *dcp)
 	v14->dev = dev;
 	v14->dcp = dcp;
 	mutex_init(&v14->lock);
+	init_waitqueue_head(&v14->described_wait);
 	INIT_WORK(&v14->idle_work, dcp_v14_idle);
 	ret = devm_add_action_or_reset(dev, dcp_v14_release, v14);
 	if (ret)
@@ -1558,6 +1588,7 @@ static int dcpext_boot(struct apple_dcp *dcp)
 		v14->stride = DCP_V14_EXT_STRIDE;
 	}
 	mutex_init(&v14->lock);
+	init_waitqueue_head(&v14->described_wait);
 	INIT_WORK(&v14->idle_work, dcp_v14_idle);
 	dcp->v14 = v14;
 	dcp_v14_link_init(&v14->link, dev, NULL);
@@ -2127,18 +2158,81 @@ static int dcp_v14_set_power(struct apple_dcp_v14 *v14, bool on)
 	return ret;
 }
 
+/* The display is fully described, and no description is in transfer. */
+static bool dcp_v14_external_described(struct apple_dcp_v14 *v14)
+{
+	return READ_ONCE(v14->failed) ||
+	       ((READ_ONCE(v14->described) & DCP_V14_DESC_ALL) == DCP_V14_DESC_ALL &&
+		!READ_ONCE(v14->chunk));
+}
+
+/*
+ * Waits, for a bounded time, until the firmware has published the whole
+ * description of the attached display (timings, color modes, attributes)
+ * and is not in the middle of publishing one. A hotplug bounce withdraws it
+ * and publishes it again part by part; a mode set in between would use
+ * timing ids that are gone, or run alongside the publication. Returns with
+ * the RPC lock held, unless it fails.
+ */
+static int dcp_v14_external_settle(struct apple_dcp *dcp, struct apple_dcp_v14 *v14)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(DCP_V14_DESC_TIMEOUT_MS);
+	bool waited = false;
+	long left;
+
+	mutex_lock(&v14->lock);
+	while (!dcp_v14_external_described(v14)) {
+		left = (long)(deadline - jiffies);
+		if (left <= 0)
+			break;
+		if (!waited)
+			dev_info(dcp->dev, "display description incomplete (%#x%s); waiting before the mode is set\n",
+				 v14->described, v14->chunk ? ", in transfer" : "");
+		waited = true;
+		mutex_unlock(&v14->lock);
+		wait_event_timeout(v14->described_wait, dcp_v14_external_described(v14), left);
+		mutex_lock(&v14->lock);
+	}
+	if (v14->failed) {
+		mutex_unlock(&v14->lock);
+		return -EIO;
+	}
+	if (dcp_v14_external_described(v14)) {
+		if (waited)
+			dev_info(dcp->dev, "display description complete again\n");
+		return 0;
+	}
+	/* The attributes only size the display: timings and colors suffice. */
+	if ((v14->described & (DCP_V14_DESC_TIMING | DCP_V14_DESC_COLOR)) ==
+	    (DCP_V14_DESC_TIMING | DCP_V14_DESC_COLOR) && !v14->chunk) {
+		dev_warn(dcp->dev, "display description still incomplete (%#x) after %u ms; setting the mode anyway\n",
+			 v14->described, DCP_V14_DESC_TIMEOUT_MS);
+		return 0;
+	}
+	dev_warn(dcp->dev, "display description incomplete (%#x%s) after %u ms; mode not set\n",
+		 v14->described, v14->chunk ? ", in transfer" : "", DCP_V14_DESC_TIMEOUT_MS);
+	mutex_unlock(&v14->lock);
+	return -EAGAIN;
+}
+
 /* An external display: power down, set the new mode, power up. */
 static int dcp_v14_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state)
 {
 	struct apple_dcp_v14 *v14 = dcp->v14;
-	struct dcp_display_mode mode;
+	struct dcp_display_mode mode = {};
 	int ret = 0;
 
 	if (!v14 || READ_ONCE(v14->failed) || !v14->opened)
 		return -EIO;
-	if (!lookup_mode(dcp, &crtc_state->mode, &mode))
-		return -EINVAL;
-	mutex_lock(&v14->lock);
+	ret = dcp_v14_external_settle(dcp, v14);
+	if (ret)
+		goto out;
+	/* Only after the wait: a new description replaces the catalog. */
+	if (!lookup_mode(dcp, &crtc_state->mode, &mode)) {
+		mutex_unlock(&v14->lock);
+		ret = -EINVAL;
+		goto out;
+	}
 	if (v14->powered && dcp_v14_set_power(v14, false))
 		dev_warn(dcp->dev, "display did not power down before the mode change\n");
 	if (READ_ONCE(v14->failed))
@@ -2152,6 +2246,7 @@ static int dcp_v14_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state
 		v14->panel_height = mode.mode.vdisplay;
 	}
 	mutex_unlock(&v14->lock);
+out:
 	dev_info(dcp->dev, "display mode " DRM_MODE_FMT " (timing %u, color %u): %d\n",
 		 DRM_MODE_ARG(&crtc_state->mode), mode.timing_mode_id, mode.color_mode_id, ret);
 	if (ret)
@@ -2180,8 +2275,12 @@ void iomfb_v14_7_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	if (!p)
 		p = crtc->primary->state;
 	fb = p && p->visible ? p->fb : NULL;
-	/* No swaps while an external display is off, unset or unplugged. */
+	/*
+	 * No swaps while an external display is off, unset, unplugged, or
+	 * being described again.
+	 */
 	if (dcp->external && (!dcp->v14 || !READ_ONCE(dcp->v14->powered) ||
+			      !dcp_v14_external_described(dcp->v14) ||
 			      !READ_ONCE(dcp->mode_state.valid) || !dcp->connector ||
 			      !READ_ONCE(dcp->connector->connected))) {
 		dcp_drm_crtc_vblank(dcp->crtc);
