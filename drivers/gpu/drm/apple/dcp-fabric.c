@@ -262,6 +262,8 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 		route->active_xbar = xbar;
 		route->tunnel = xbar != route->xbar;
 		route->xbar_up = !route->tunnel;
+		/* A newly selected output starts with its clocks off. */
+		dcp->direct_xbar_up = NULL;
 		dcp->dptx_tunnel = route->tunnel;
 		/* crossbar controls are dpphy, dpin0, dpin1: same order as the DFP port */
 		dcp->dptx_dfp_port = route->tunnel ? xbar - &route->xbar->chip->mux[0] : 0;
@@ -310,6 +312,7 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 		}
 		route->active_xbar = NULL;
 		route->tunnel = false;
+		dcp->direct_xbar_up = NULL;
 		dcp->dptx_tunnel = false;
 		dcp->dptx_dfp_port = 0;
 		dcp->tb_dpin_set_active = NULL;
@@ -1435,6 +1438,44 @@ int dcp_tunnel_crossbar_down(struct apple_dcp *dcp)
 		return -ESTALE;
 	dcp_tunnel_dpin_locked(dcp, false);
 	return dcp_dpxbar_link(route->active_xbar, false);
+}
+
+/*
+ * T6030 routes a direct DP PHY output of its crossbar on select and clocks
+ * it only while a link runs, as it does its DP IN outputs. From DCP's link
+ * configuration calls: clocks up once a link is configured at a nonzero
+ * rate, down before the rate changes and when DCP deactivates the port.
+ * The output is the borrowed Type-C route's, or the fixed route's. Other
+ * SoCs clock it at select. Runs inside a DCP apcall: only tb_lock.
+ */
+int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
+{
+	struct apple_dcp_typec_route *route;
+	struct mux_control *xbar = NULL;
+	int ret;
+
+	if (!of_machine_is_compatible("apple,t6030"))
+		return 0;
+	guard(mutex)(&dcp->tb_lock);
+	route = dcp->active_typec_route;
+	if (route && !route->tunnel && route->selected)
+		xbar = route->active_xbar ?: route->xbar;
+	else if (!route && dcp->fixed_route_selected)
+		xbar = dcp->xbar;
+	/* A deselected output went idle, and its clocks with it. */
+	if (dcp->direct_xbar_up && dcp->direct_xbar_up != xbar)
+		dcp->direct_xbar_up = NULL;
+	if (!xbar || !!dcp->direct_xbar_up == up)
+		return 0;
+	ret = dcp_dpxbar_link(xbar, up);
+	if (ret) {
+		dev_warn(dcp->dev, "DP crossbar output %s failed: %d\n", up ? "up" : "down", ret);
+		/* Only a running output can be taken down again. */
+		if (up)
+			return ret;
+	}
+	dcp->direct_xbar_up = up ? xbar : NULL;
+	return ret;
 }
 
 /*

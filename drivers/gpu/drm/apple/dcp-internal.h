@@ -338,6 +338,8 @@ struct apple_dcp {
 	 */
 	struct mutex tb_lock;
 	bool tb_clock_ok;
+	/* tb_lock: the direct DP PHY crossbar output whose clocks run (T6030). */
+	struct mux_control *direct_xbar_up;
 	/* CRTC powered off while the Type-C cable stays attached */
 	bool typec_crtc_off;
 	/* IOMFB reports its video interface ready after DPTX link training. */

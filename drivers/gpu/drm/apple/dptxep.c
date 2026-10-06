@@ -573,6 +573,8 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 			dcp_tunnel_set_rate(service->ep->dcp, dptx->atcphy,
 					    link_rate);
 		} else if (dptx->atcphy) {
+			/* No clocked crossbar output across a PHY rate change. */
+			dcp_direct_crossbar_link(service->ep->dcp, false);
 			dptx->phy_ops.dp.link_rate = phy_link_rate;
 			dptx->phy_ops.dp.set_rate = 1;
 			ret = phy_configure(dptx->atcphy, &dptx->phy_ops);
@@ -677,6 +679,8 @@ dptxport_call_deactivate(struct apple_epic_service *service,
 	dev_info(dcp->dev, "DPTXPort: DEACTIVATE\n");
 	if (dcp->dptx_tunnel)
 		dcp_tunnel_dpin_activate(dcp, false);
+	else
+		dcp_direct_crossbar_link(dcp, false);
 	if (dptx->atcphy && !dcp->phy_managed_by_typec)
 		phy_set_mode_ext(dptx->atcphy, PHY_MODE_INVALID, 0);
 
@@ -709,12 +713,16 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		 */
 		if (service->ep->dcp->dptx_tunnel && dptx->link_rate)
 			dcp_tunnel_crossbar_down(service->ep->dcp);
+		else if (dptx->link_rate)
+			dcp_direct_crossbar_link(service->ep->dcp, false);
 		return dptxport_call_will_change_link_config(service);
 	case DPTX_APCALL_DID_CHANGE_LINK_CONFIG: {
 		int ret = dptxport_call_did_change_link_config(service);
 
 		if (!ret && service->ep->dcp->dptx_tunnel && dptx->link_rate)
 			dcp_tunnel_crossbar_up(service->ep->dcp);
+		else if (!ret && dptx->link_rate)
+			dcp_direct_crossbar_link(service->ep->dcp, true);
 		return ret;
 	}
 	case DPTX_APCALL_GET_MAX_LINK_RATE:

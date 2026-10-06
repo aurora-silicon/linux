@@ -71,6 +71,7 @@ void dcp_unlink(struct drm_device *drm);
 /* Thunderbolt DP tunnels, called from the DPTX endpoint */
 int dcp_tunnel_crossbar_up(struct apple_dcp *dcp);
 int dcp_tunnel_crossbar_down(struct apple_dcp *dcp);
+int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up);
 int dcp_tunnel_set_rate(struct apple_dcp *dcp, struct phy *phy, u32 link_rate);
 int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, bool active);
 
