@@ -591,7 +591,6 @@ impl Queue {
     ) -> Result<Option<Arc<VmStatus>>> {
         if !self.quarantined {
             self.quarantined = true;
-            self.update_slot_accounting();
             self.quarantine_error = Some(error);
             self.failure_status_pending = true;
             self.retirement_proved = false;
@@ -961,9 +960,7 @@ impl Queue {
         }
         context.mark_published();
         self.owner = Some(owner);
-        self.update_slot_accounting();
         self.released = false;
-        self.update_slot_accounting();
         self.retirement_ready = false;
         self.retired_by_teardown = false;
         self.update_slot_accounting();
@@ -981,7 +978,6 @@ impl Queue {
             if let Some(previous) = self.previous.as_ref().filter(|p| p.publication.is_none()) {
                 if let Err(error) = self.graph.set_owner(&previous.context) {
                     self.quarantined = true;
-                    self.update_slot_accounting();
                     self.retired_by_teardown = true;
                     self.update_slot_accounting();
                     return Err(error);
@@ -1063,7 +1059,6 @@ impl Queue {
             return Ok(true);
         }
         self.released = true;
-        self.update_slot_accounting();
         self.retired_by_teardown = true;
         self.update_slot_accounting();
         if let Some(active) = self
