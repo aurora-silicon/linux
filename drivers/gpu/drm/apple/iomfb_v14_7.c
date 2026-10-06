@@ -99,9 +99,16 @@ struct apple_dcp_v14 {
 
 	/*
 	 * An external processor: no panel. Its modes come from the
-	 * properties the firmware publishes for the attached display.
+	 * TimingElements the firmware publishes for the attached display,
+	 * and the kernel sets the mode (A411) and the power state (A472).
 	 */
 	bool external;
+	/* External: start signal and first client open done. */
+	bool opened;
+	/* External: the display is powered (A472) in the mode last set. */
+	bool powered;
+	/* External: catalog generation when a chunked property started. */
+	u64 chunk_generation;
 
 	/* Boot framebuffer and native panel timing (notch rows included). */
 	u32 stride;
@@ -286,9 +293,11 @@ static int dcp_v14_map_piodma(struct apple_dcp_v14 *v14, u32 id)
 	if (buf->piodma_mapped)
 		return 0;
 	if (!v14->piodma) {
+		/* The display gate adds an external pipe's piodma with its DART. */
 		node = of_get_child_by_name(v14->dev->of_node, "piodma");
 		if (!node || !of_device_is_available(node) ||
-		    of_property_read_u32(node, "apple,t6030-handoff", &marker) || marker != 1) {
+		    of_property_read_u32(node, v14->external ? "apple,t6030-dispext-handoff" :
+						 "apple,t6030-handoff", &marker) || marker != 1) {
 			of_node_put(node);
 			return -ENODEV;
 		}
@@ -351,6 +360,110 @@ static int dcp_v14_query(struct apple_dcp_v14 *v14, u32 tag)
 }
 
 /*
+ * The attached display came or went, as the firmware's display description
+ * shows it. Mirrors the hotplug callback of the M1/M2 firmware.
+ */
+static void dcp_v14_external_hotplug(struct apple_dcp *dcp, bool connected)
+{
+	struct apple_connector *connector = READ_ONCE(dcp->connector);
+	unsigned int action;
+
+	/*
+	 * Powering a Type-C CRTC off releases the link, and the firmware then
+	 * withdraws the display. The cable is still in: keep the connector
+	 * as it is and let the next power-on bring the link back.
+	 */
+	if (!connected && READ_ONCE(dcp->typec_crtc_off) &&
+	    READ_ONCE(dcp->typec_cable_connected)) {
+		dcp_mode_invalidate(&dcp->mode_state);
+		return;
+	}
+	/* A description that outlives its cable is stale. */
+	if (connected && dcp_is_typec_output(dcp) && !READ_ONCE(dcp->typec_cable_connected))
+		return;
+	if (connected && dcp_is_typec_output(dcp))
+		complete_all(&dcp->typec_iomfb_hpd_ready);
+	if (!connected)
+		WRITE_ONCE(dcp->ext_backlight, false);
+	if (!connector)
+		return;
+	apple_connector_edid_set_live(connector, connected);
+	action = dcp_mode_hotplug(&dcp->mode_state, connected, &connector->connected);
+	if (connected && !READ_ONCE(dcp->mode_state.valid) &&
+	    !READ_ONCE(dcp->mode_state.changing))
+		action |= DCP_HOTPLUG_NOTIFY;
+	if (!dcp->crtc)
+		action &= ~DCP_HOTPLUG_VBLANK;
+	dcp_handle_hotplug_actions(dcp, action);
+}
+
+/*
+ * A display description the firmware published (or removed, @removed) on an
+ * external processor: the timings and color modes of the attached display
+ * (from its EDID), its attributes, and the link transport. @generation is
+ * the mode catalog generation when the transfer started.
+ */
+static void dcp_v14_external_published(struct apple_dcp_v14 *v14, const char *key,
+				       u64 generation, bool removed)
+{
+	struct apple_dcp *dcp = READ_ONCE(v14->dcp);
+	struct apple_connector *connector;
+	struct dcp_v14_raw *raw = NULL;
+	struct dcp_parse_ctx ctx;
+	u32 i;
+	int ret;
+
+	if (!dcp || (strcmp(key, "TimingElements") && strcmp(key, "DisplayAttributes") &&
+		     strcmp(key, "ColorElements") && strcmp(key, "Transport")))
+		return;
+	for (i = 0; i < v14->raw_count && !removed; i++)
+		if (!v14->raw[i].service && !strcmp(v14->raw[i].key, key))
+			raw = &v14->raw[i];
+	if (!removed && !raw)
+		return;
+	dev_info(dcp->dev, "display %s %s, %u bytes\n", key, removed ? "withdrawn" : "published",
+		 raw ? raw->size : 0);
+
+	/* The connector's debugfs keeps a copy. */
+	connector = READ_ONCE(dcp->connector);
+	if (raw && raw->size && connector) {
+		struct dcp_chunks chunks = {
+			.length = raw->size,
+			.data = kmemdup(raw->data, raw->size, GFP_KERNEL),
+		};
+
+		if (chunks.data)
+			dcp_connector_update_dict(connector, key, &chunks);
+	}
+
+	if (!strcmp(key, "TimingElements")) {
+		if (removed) {
+			dcp_v14_external_hotplug(dcp, false);
+			return;
+		}
+		ret = parse(raw->data, raw->size, &ctx);
+		if (!ret) {
+			ctx.dcp = dcp;
+			ret = dcp_modes_replace(dcp, &ctx, generation);
+		}
+		if (ret) {
+			dev_warn(dcp->dev, "display timings not used: %d\n", ret);
+			return;
+		}
+		dev_info(dcp->dev, "display has %u usable modes\n", READ_ONCE(dcp->nr_modes));
+		dcp_v14_external_hotplug(dcp, READ_ONCE(dcp->nr_modes) > 0);
+	} else if (!strcmp(key, "DisplayAttributes") && !removed) {
+		ret = parse(raw->data, raw->size, &ctx);
+		if (!ret) {
+			ctx.dcp = dcp;
+			ret = dcp_attributes_replace(dcp, &ctx, generation);
+		}
+		if (ret)
+			dev_warn(dcp->dev, "display attributes not used: %d\n", ret);
+	}
+}
+
+/*
  * Callbacks that an external processor answers differently, or sends only
  * there. -ENOENT leaves @tag to the shared handler. A display's property
  * transfer that is malformed or too large is refused with a false reply:
@@ -408,6 +521,8 @@ static int dcp_v14_external_callback(struct apple_dcp_v14 *v14, u32 tag, const u
 			v14->chunk_offset = 0;
 			v14->chunk = kvzalloc(max_t(u32, 1, v14->chunk_size), GFP_KERNEL);
 			ret = v14->chunk ? 0 : -ENOMEM;
+			if (v14->dcp)
+				v14->chunk_generation = dcp_modes_transfer_begin(v14->dcp);
 		}
 		goto property_reply;
 	}
@@ -429,6 +544,8 @@ static int dcp_v14_external_callback(struct apple_dcp_v14 *v14, u32 tag, const u
 			ret = dcp_v14_raw_property(v14, 0, in, v14->chunk, v14->chunk_size);
 		kvfree(v14->chunk);
 		v14->chunk = NULL;
+		if (!ret)
+			dcp_v14_external_published(v14, in, v14->chunk_generation, false);
 		goto property_reply;
 	}
 	/* Dictionary properties, kept raw. */
@@ -444,6 +561,9 @@ static int dcp_v14_external_callback(struct apple_dcp_v14 *v14, u32 tag, const u
 		count = tag == D(567) ? strnlen(in + 64, 64) : 4096;
 		ret = dcp_v14_raw_property(v14, service, in + key_offset, in + key_offset + 64,
 					   count);
+		if (!ret && !service && v14->dcp)
+			dcp_v14_external_published(v14, in + key_offset,
+						   dcp_modes_transfer_begin(v14->dcp), false);
 		goto property_reply;
 	}
 	/* Property removal, including the display's description on unplug. */
@@ -458,6 +578,7 @@ static int dcp_v14_external_callback(struct apple_dcp_v14 *v14, u32 tag, const u
 			*p = v14->properties[--v14->property_count];
 			memset(&v14->properties[v14->property_count], 0, sizeof(*p));
 		}
+		dcp_v14_external_published(v14, in, 0, true);
 		return 0;
 	}
 #undef SHAPE
@@ -837,9 +958,17 @@ static void dcp_v14_crashed(void *cookie, const void *crashlog, size_t crashlog_
 
 	WRITE_ONCE(v14->failed, true);
 	if (dcp) {
+		struct apple_connector *connector = READ_ONCE(dcp->connector);
+
 		WRITE_ONCE(dcp->crashed, true);
 		if (dcp->external)
 			dcpext_scanout_fault(dcp, -EIO);
+		/* The display it drove is gone until reboot. */
+		if (v14->external && connector) {
+			WRITE_ONCE(connector->connected, false);
+			apple_connector_edid_set_live(connector, false);
+			schedule_work(&connector->hotplug_wq);
+		}
 	}
 	dev_err(v14->dev, "DCP firmware crashed; its buffers are kept until reboot\n");
 	dcp_v14_link_fail(&v14->link);
@@ -1625,7 +1754,12 @@ static int dcp_v14_swap(struct apple_dcp_v14 *v14, const u8 *surface, u64 iova,
 		if (!ret && get_unaligned_le32((u8 *)result + 5))
 			ret = -EIO;
 	}
-	if (ret)
+	/*
+	 * An external display can go away under a swap: the firmware then
+	 * refuses it, which ends nothing. Link failures stop the session in
+	 * dcp_v14_call() either way.
+	 */
+	if (ret && !v14->external)
 		v14->failed = true;
 	mutex_unlock(&v14->lock);
 
@@ -1633,8 +1767,12 @@ static int dcp_v14_swap(struct apple_dcp_v14 *v14, const u8 *surface, u64 iova,
 	return ret;
 }
 
-/* Shows @fb (or only the black background) and keeps it until the next swap. */
-static bool dcp_v14_present(struct apple_dcp_v14 *v14, struct drm_framebuffer *fb, u32 dst_y)
+/*
+ * Shows the top-left @width x @height of @fb (or only the black background)
+ * and keeps @fb until the next swap.
+ */
+static bool dcp_v14_present(struct apple_dcp_v14 *v14, struct drm_framebuffer *fb,
+			    u32 width, u32 height, u32 dst_y)
 {
 	u8 surface[DCP_V14_SURFACE_SIZE];
 	struct drm_framebuffer *old;
@@ -1650,9 +1788,16 @@ static bool dcp_v14_present(struct apple_dcp_v14 *v14, struct drm_framebuffer *f
 		iova = drm_fb_dma_get_gem_obj(fb, 0)->dma_addr;
 	}
 	start = ktime_get_ns();
-	ret = dcp_v14_swap(v14, fb ? surface : NULL, iova, fb ? fb->width : 0,
-			   fb ? fb->height : 0, dst_y);
+	ret = dcp_v14_swap(v14, fb ? surface : NULL, iova, fb ? width : 0,
+			   fb ? height : 0, dst_y);
 	elapsed = ktime_get_ns() - start;
+	if (ret && v14->external && !READ_ONCE(v14->failed)) {
+		/* Refused before it was taken: the old framebuffer stays on screen. */
+		if (fb)
+			drm_framebuffer_put(fb);
+		dev_warn_ratelimited(v14->dev, "display refused a swap: %d\n", ret);
+		return false;
+	}
 	if (ret) {
 		/* Either framebuffer may still be scanned out: keep both. */
 		dev_err(v14->dev, "native DCP flip failed %d; buffers pinned until reboot\n", ret);
@@ -1709,8 +1854,15 @@ int iomfb_v14_7_atomic_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	struct drm_framebuffer *fb;
 	u32 width, height;
 
-	if (dcp->crashed || !v14 || READ_ONCE(v14->failed))
+	if (dcp->external) {
+		/* An external pipe can always be switched off, started or not. */
+		if (!crtc_state || !crtc_state->active)
+			return 0;
+		if (dcp->crashed || !v14 || READ_ONCE(v14->failed) || !v14->opened)
+			return -EIO;
+	} else if (dcp->crashed || !v14 || READ_ONCE(v14->failed)) {
 		return -EIO;
+	}
 	if (!crtc_state || !crtc_state->active || !p || p->crtc != crtc || !p->visible)
 		return 0;
 
@@ -1723,10 +1875,12 @@ int iomfb_v14_7_atomic_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	if (fb->modifier != DRM_FORMAT_MOD_LINEAR || fb->offsets[0] ||
 	    fb->pitches[0] < width * 4 || (fb->pitches[0] & 63))
 		return -EINVAL;
+	/* An external pipe may show the top-left of a larger framebuffer. */
 	if (p->src_x || p->src_y || p->crtc_x || p->crtc_y ||
 	    p->src_w != width << 16 || p->src_h != height << 16 ||
 	    p->crtc_w != width || p->crtc_h != height ||
-	    fb->width != width || fb->height != height)
+	    (dcp->external ? fb->width < width || fb->height < height :
+			     fb->width != width || fb->height != height))
 		return -EINVAL;
 	obj = drm_fb_dma_get_gem_obj(fb, 0);
 	if (!obj || !obj->dma_addr || (u64)fb->pitches[0] * height > obj->base.size)
@@ -1734,8 +1888,69 @@ int iomfb_v14_7_atomic_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	return 0;
 }
 
+/* A411: the timing and color mode of the attached display, by their ids. */
+static int dcp_v14_set_mode(struct apple_dcp_v14 *v14, u32 color, u32 timing)
+{
+	__le32 in[2] = { cpu_to_le32(color), cpu_to_le32(timing) }, status = 0;
+	int ret;
+
+	ret = dcp_v14_call(v14, A(411), in, sizeof(in), &status, sizeof(status), 0);
+	return ret ?: (le32_to_cpu(status) ? -EIO : 0);
+}
+
+/* A472: the display's power state; its status sits at byte 4 of the reply. */
+static int dcp_v14_set_power(struct apple_dcp_v14 *v14, bool on)
+{
+	u8 in[12] = {}, out[8] = {};
+	int ret;
+
+	put_unaligned_le64(on, in);
+	ret = dcp_v14_call(v14, A(472), in, sizeof(in), out, sizeof(out), 0);
+	if (!ret && get_unaligned_le32(out + 4))
+		ret = -EIO;
+	/* A refused power-down leaves nothing on: the display is gone already. */
+	if (!ret || (!on && !READ_ONCE(v14->failed)))
+		v14->powered = on;
+	return ret;
+}
+
+/* An external display: power down, set the new mode, power up. */
+static int dcp_v14_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state)
+{
+	struct apple_dcp_v14 *v14 = dcp->v14;
+	struct dcp_display_mode mode;
+	int ret = 0;
+
+	if (!v14 || READ_ONCE(v14->failed) || !v14->opened)
+		return -EIO;
+	if (!lookup_mode(dcp, &crtc_state->mode, &mode))
+		return -EINVAL;
+	mutex_lock(&v14->lock);
+	if (v14->powered && dcp_v14_set_power(v14, false))
+		dev_warn(dcp->dev, "display did not power down before the mode change\n");
+	if (READ_ONCE(v14->failed))
+		ret = -EIO;
+	if (!ret)
+		ret = dcp_v14_set_mode(v14, mode.color_mode_id, mode.timing_mode_id);
+	if (!ret)
+		ret = dcp_v14_set_power(v14, true);
+	if (!ret) {
+		v14->panel_width = mode.mode.hdisplay;
+		v14->panel_height = mode.mode.vdisplay;
+	}
+	mutex_unlock(&v14->lock);
+	dev_info(dcp->dev, "display mode " DRM_MODE_FMT " (timing %u, color %u): %d\n",
+		 DRM_MODE_ARG(&crtc_state->mode), mode.timing_mode_id, mode.color_mode_id, ret);
+	if (ret)
+		return ret;
+	dcp_mode_set_valid(&dcp->mode_state, true);
+	return 0;
+}
+
 int iomfb_v14_7_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state)
 {
+	if (dcp->external)
+		return dcp_v14_external_modeset(dcp, crtc_state);
 	/* The firmware keeps the timing it booted with, which is the only mode. */
 	if (!lookup_mode(dcp, &crtc_state->mode, NULL))
 		return -EINVAL;
@@ -1752,8 +1967,18 @@ void iomfb_v14_7_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	if (!p)
 		p = crtc->primary->state;
 	fb = p && p->visible ? p->fb : NULL;
+	/* No swaps while an external display is off, unset or unplugged. */
+	if (dcp->external && (!dcp->v14 || !READ_ONCE(dcp->v14->powered) ||
+			      !READ_ONCE(dcp->mode_state.valid) || !dcp->connector ||
+			      !READ_ONCE(dcp->connector->connected))) {
+		dcp_drm_crtc_vblank(dcp->crtc);
+		return;
+	}
 	dcp->swap_start = ktime_get();
-	if (dcp->v14 && dcp_v14_present(dcp->v14, fb, dcp->notch_height))
+	if (dcp->v14 && dcp_v14_present(dcp->v14, fb,
+					 fb ? (dcp->external ? p->src_w >> 16 : fb->width) : 0,
+					 fb ? (dcp->external ? p->src_h >> 16 : fb->height) : 0,
+					 dcp->notch_height))
 		dcp_drm_crtc_page_flip(dcp, ktime_get());
 	else
 		dcp_v14_cancel_event(dcp);
@@ -1766,7 +1991,20 @@ void iomfb_v14_7_poweron(struct apple_dcp *dcp)
 
 void iomfb_v14_7_poweroff(struct apple_dcp *dcp)
 {
+	struct apple_dcp_v14 *v14 = dcp->v14;
+
+	/* An external display is powered down; the next enable sets its mode again. */
+	if (dcp->external) {
+		if (v14 && v14->opened && !READ_ONCE(v14->failed)) {
+			mutex_lock(&v14->lock);
+			if (v14->powered && dcp_v14_set_power(v14, false))
+				dev_warn(dcp->dev, "display did not power down\n");
+			mutex_unlock(&v14->lock);
+		}
+		dcp_mode_invalidate(&dcp->mode_state);
+		return;
+	}
 	/* Blank to black; the panel and the DCP stay powered. */
-	if (dcp->v14 && dcp->v14->started)
-		dcp_v14_present(dcp->v14, NULL, 0);
+	if (v14 && v14->started)
+		dcp_v14_present(v14, NULL, 0, 0, 0);
 }
