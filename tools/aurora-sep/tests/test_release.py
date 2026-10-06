@@ -108,6 +108,12 @@ TAG = re.search(r"^TAG=(\S+)$", SRC, re.M).group(1)
 DEFAULT_RELEASE_URL = f"https://github.com/iconidentify/aurora-linux/releases/download/{TAG}"
 DEFAULT_RELEASES_API = "https://api.github.com/repos/iconidentify/aurora-linux/releases"
 OVERRIDES = ("AURORA_RELEASE_URL", "AURORA_RELEASES_API")
+# Values release_source refuses: curl options, no or another scheme, spaces,
+# control characters and bytes outside printable ASCII.
+BAD_VALUES = ("-K/etc/hostname", "--config=/tmp/x", "-o/tmp/x", "ftp://mirror/x", "stage-12.0",
+              "/srv/stage", "file:///srv/st age", "https://m/a\tb", "https://m/a\nb",
+              "https://m/\x1b]0;t\x07", "https://m/\x1b[2J", "https://m/\x7f", "https://m/\u00e9",
+              "HTTPS://m/x", "file://")
 
 
 def sourced(body, **env_extra):
@@ -137,6 +143,24 @@ class ReleaseUrlTest(unittest.TestCase):
         self.assertEqual(self.urls(AURORA_RELEASE_URL="file:///srv/stage", AURORA_RELEASES_API="http://127.0.0.1:8000/api"),
                          ["file:///srv/stage", "http://127.0.0.1:8000/api"])
 
+    def test_bad_values_are_refused(self):
+        for name in OVERRIDES:
+            for value in BAD_VALUES:
+                with self.subTest(name=name, value=value):
+                    proc = sourced("release_source", **{name: value})
+                    self.assertEqual(proc.returncode, 1, proc.stdout)
+                    schemes = "a file://, http:// or https:// URL"
+                    self.assertIn(f"{name} must be {schemes}", proc.stderr)
+                    # The value itself is never echoed.
+                    self.assertNotIn(value, proc.stderr.replace(schemes, ""))
+
+    def test_good_values_are_taken(self):
+        for value in ("file:///srv/stage", "file:///srv/stage/", "file://localhost/srv/a%20b",
+                      "http://127.0.0.1:18712", "https://mirror.example/aurora/12.0/"):
+            with self.subTest(value=value):
+                proc = sourced("release_source", AURORA_RELEASE_URL=value, AURORA_RELEASES_API=value)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+
     def test_printed_commands_name_the_public_release(self):
         # The commands an install prints stay on the public tag under an override.
         proc = sourced('printf "%s\\n" "$PUBLIC_RELEASE_URL"',
@@ -156,6 +180,22 @@ class ReleaseUrlTest(unittest.TestCase):
             latest.write_text('{"tag_name": "sep-7.1.12.aurora2-99.0"}')
             proc = sourced("newer_release", AURORA_RELEASES_API=api)
             self.assertEqual(proc.stdout.strip(), "sep-7.1.12.aurora2-99.0", proc.stderr)
+            # A tag with control characters or anything but [A-Za-z0-9._-] is not taken.
+            for tag in (b"sep-7.1.12.aurora2-99.0\x1b]0;x\x07", b"sep-7.1.12.aurora2-99.0\x1b[2J",
+                        b"sep-7.1.12.aurora2-99.0\\u001b[2J", b"sep-99.0$(id)", b"sep-99.0 x"):
+                with self.subTest(tag=tag):
+                    latest.write_bytes(b'{"tag_name": "' + tag + b'"}')
+                    proc = sourced("newer_release", AURORA_RELEASES_API=api)
+                    self.assertEqual((proc.returncode, proc.stdout), (0, ""), proc.stderr)
+
+    def test_agent_prompt_refuses_a_bad_value(self):
+        env = {k: v for k, v in os.environ.items() if k not in OVERRIDES}
+        env["AURORA_RELEASES_API"] = "-K/etc/hostname"
+        proc = subprocess.run(["bash", str(flow.INSTALLER), "--agent-prompt"],
+                              capture_output=True, text=True, env=env)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("AURORA_RELEASES_API must be", proc.stderr)
+        self.assertEqual(proc.stdout, "")
 
 
 class StagedCopyTest(flow.M3FlowBase):
@@ -193,6 +233,16 @@ class StagedCopyTest(flow.M3FlowBase):
         proc = self.install(check=False)
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("does not match its published checksum", proc.stderr)
+        self.assertEqual(self.boot.read_bytes(), b"M1N1:original\n")
+        self.assertNotIn("pacman -U", self.log())
+
+    def test_a_bad_value_stops_the_install(self):
+        self.mac("j293")
+        self.extra_env["AURORA_RELEASE_URL"] = "-K/etc/hostname"
+        proc = self.install(check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("AURORA_RELEASE_URL must be", proc.stderr)
+        self.assertNotIn("Downloading", proc.stdout)
         self.assertEqual(self.boot.read_bytes(), b"M1N1:original\n")
         self.assertNotIn("pacman -U", self.log())
 

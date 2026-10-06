@@ -164,8 +164,8 @@ TAG=sep-7.1.12.aurora2-12.0
 PUBLIC_RELEASE_URL=https://github.com/iconidentify/aurora-linux/releases/download/$TAG
 PUBLIC_RELEASES_API=https://api.github.com/repos/iconidentify/aurora-linux/releases
 # AURORA_RELEASE_URL and AURORA_RELEASES_API are a staging or mirror override
-# for these two (any URL curl takes, file:// included); the checksums below
-# still decide what is installed. Every command this script prints names
+# for these two (a file://, http:// or https:// URL; see release_source); the
+# checksums below still decide what is installed. Every command this script prints names
 # PUBLIC_RELEASE_URL, never the override: a staged copy can go away, and the
 # script itself is not covered by the checksums.
 RELEASE_URL=${AURORA_RELEASE_URL:-$PUBLIC_RELEASE_URL}
@@ -213,6 +213,27 @@ if (( EUID != 0 )); then
   sudo=sudo
 fi
 
+# AURORA_RELEASE_URL and AURORA_RELEASES_API go to curl and into printed
+# text, so only a plain file://, http:// or https:// URL is taken: nothing curl
+# could read as an option, and no spaces, control characters or other bytes
+# outside printable ASCII (percent-encode those).
+override_ok() {
+  local LC_ALL=C
+  [[ $1 != -* && $1 =~ ^(file|https?)://. && $1 != *[![:graph:]]* ]]
+}
+
+# Checked before the first download or release lookup that uses them.
+release_source() {
+  local name
+  for name in AURORA_RELEASE_URL AURORA_RELEASES_API; do
+    [[ -z ${!name:-} ]] || override_ok "${!name}" ||
+      die "$name must be a file://, http:// or https:// URL without spaces or
+    control characters (percent-encode anything outside printable ASCII).
+    Unset it to use the public release. Nothing was installed."
+  done
+  return 0
+}
+
 # A saved copy of this script keeps installing its own build forever. Tell the
 # operator - human or agent - when a newer one exists. Never fatal: no network,
 # rate limit or API change should stop an install that was going to work.
@@ -224,10 +245,12 @@ newer_release() {
   local seen=""
   # Ask for the release marked Latest. Listing all releases is not ordered by
   # version: they share a commit, so GitHub falls back to comparing tag names
-  # as text, and 11.9 sorts above 11.10.
+  # as text, and 11.9 sorts above 11.10. Only letters, digits, '.', '_' and
+  # '-' are taken as a tag, so a mirror's answer can't put terminal escapes
+  # into the notice.
   seen=$(curl -fsSL --max-time 8 "$RELEASES_API/latest" 2>/dev/null |
-    grep -o '"tag_name"[[:space:]]*:[[:space:]]*"sep-[^"]*"' |
-    head -1 | sed 's/.*"\(sep-[^"]*\)"$/\1/') || true
+    LC_ALL=C grep -o '"tag_name"[[:space:]]*:[[:space:]]*"sep-[A-Za-z0-9._-]*"' |
+    head -1 | sed 's/.*"\(sep-[A-Za-z0-9._-]*\)"$/\1/') || true
   [[ -n $seen && $seen != "$TAG" ]] && echo "$seen"
   return 0
 }
@@ -1528,6 +1551,7 @@ packages_for_this_mac() {
 install_all() {
   local entry file sha kernel chain
   local -a entries
+  release_source
   require_supported_soc
   version_notice
   sep_write_notice
@@ -2463,6 +2487,6 @@ case ${1:-} in
   --uninstall) uninstall_all ;;
   --reset-touchid) shift; reset_touchid "$@" ;;
   --m3-report) m3_report ;;
-  --agent-prompt) t=$(newer_release); [[ -n $t ]] && warn "the current release is $t; this plan is for $TAG"; agent_prompt ;;
+  --agent-prompt) release_source; t=$(newer_release); [[ -n $t ]] && warn "the current release is $t; this plan is for $TAG"; agent_prompt ;;
   *) die "unknown option $1 (--read-only, --uninstall, --reset-touchid, --agent-prompt, --m3-report or --m3-handoff)" ;;
 esac
