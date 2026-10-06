@@ -115,7 +115,8 @@ pub(crate) struct Soc {
     /// Whether the power-management coefficients, the leakage coefficients and the operating
     /// points are this machine's, added by the boot loader from its ADT, rather than static
     /// device-tree values. Admission then requires every one of them (see
-    /// `m3_board::check_boot_loader_power`), with no driver default standing in.
+    /// `m3_board::check_boot_loader_power`), with no driver default standing in except the
+    /// idle-off standby timer, which an ADT may lack.
     pub(crate) power_from_boot_loader: bool,
     /// Code the runtime runs after admission that still holds another SoC's values.
     pub(crate) unported: &'static [&'static str],

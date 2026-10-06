@@ -129,7 +129,11 @@ const SEGMENT_PROPS: [&CStr; 3] = [
 /// (`Soc::power_from_boot_loader`), one 32-bit cell each: the ones the T6030 device tree carries
 /// as static values, and the shader-engine target. The boot loader copies each from the ADT's GPU
 /// node (`apple,X` from `gpu-X`; `apple,se-target` from `gpu-se-tgt`).
-const BOOT_LOADER_POWER: [&CStr; 41] = [
+///
+/// `apple,idleoff-standby-timer` is not among them: the J613 ADT has no
+/// `gpu-idleoff-standby-timer`, so the boot loader adds it only when the ADT has one, and the
+/// HwConfig's default applies otherwise.
+const BOOT_LOADER_POWER: [&CStr; 40] = [
     c_str!("apple,perf-base-pstate"),
     c_str!("apple,min-sram-microvolt"),
     c_str!("apple,avg-power-filter-tc-ms"),
@@ -139,7 +143,6 @@ const BOOT_LOADER_POWER: [&CStr; 41] = [
     c_str!("apple,avg-power-target-filter-tc"),
     c_str!("apple,fast-die0-integral-gain"),
     c_str!("apple,fast-die0-proportional-gain"),
-    c_str!("apple,idleoff-standby-timer"),
     c_str!("apple,perf-boost-ce-step"),
     c_str!("apple,perf-boost-min-util"),
     c_str!("apple,perf-filter-drop-threshold"),
