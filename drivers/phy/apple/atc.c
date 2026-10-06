@@ -41,6 +41,7 @@
 #include <linux/usb/typec_mux.h>
 #include <linux/usb/typec_tbt.h>
 
+#include "atc-t8122-dp.h"
 #include "atc-tunnel.h"
 
 #define AUSPLL_FSM_CTRL 0x1014
