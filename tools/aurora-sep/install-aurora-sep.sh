@@ -406,6 +406,12 @@ M3_MODE=none
 # Set by --m3-handoff: the owner asks for the handoff on an M3 Pro or M3
 # MacBook Air model that isn't in M3_HANDOFF_BOARDS yet.
 M3_TRY=0
+# 1 when this run keeps the boot.bin this Mac has because an m1n1 from this
+# script failed on it before ($STATE/m1n1-failed): set by m3_plan and
+# m1n1_keep_plan.
+M1N1_KEEP=0
+# Where issue reports for a boot loader that failed go.
+ISSUE_URL=https://github.com/iconidentify/aurora-linux/issues/6
 
 # Whether update-m1n1 would exit without building, judged the way it judges:
 # it sources this file and stops when M1N1_UPDATE_DISABLED is non-empty.
@@ -514,7 +520,9 @@ m3_switches() {
 # handoff path, and a MacBook Neo only with NEO_AURORA_M1N1=1. Needs m3_plan
 # first.
 m1n1_for_this_mac() {
-  if is_neo; then
+  if ((M1N1_KEEP)); then
+    return 1
+  elif is_neo; then
     [[ $NEO_AURORA_M1N1 == 1 ]]
   elif [[ $M3_MODE != none ]]; then
     [[ $M3_MODE == handoff ]]
@@ -604,6 +612,64 @@ update_m1n1_own_m1n1() {
   # shellcheck disable=SC2016 # expanded by that sh, not here
   env -i PATH="$PATH" sh -c '. "$1" >/dev/null 2>&1; [ -n "${M1N1:-}${SOURCE:-}${TARGET:-}" ]' _ \
     "$UPDATE_M1N1_CONF" >/dev/null 2>&1
+}
+
+# The m1n1 builds that failed on this Mac: the sha256 that starts each line of
+# $STATE/m1n1-failed. The restore steps (keep_bootbin_on_esp) have the owner
+# add a line; m1n1_rollback_check adds one when it finds the boot.bin put back.
+m1n1_failed_shas() {
+  [[ -f $STATE/m1n1-failed ]] || return 0
+  grep -oE '^[0-9a-f]{64}' "$STATE/m1n1-failed" || true
+}
+
+m1n1_failed_add() {
+  m1n1_failed_shas | grep -qxF "$1" && return 0
+  $sudo install -d "$STATE"
+  echo "$1 $2" | $sudo tee -a "$STATE/m1n1-failed" >/dev/null
+}
+
+# A Mac whose boot.bin was put back by hand after this script rebuilt it, as
+# the restore steps say: boot.bin starts neither with the m1n1 recorded in
+# $STATE/m1n1-installed nor with the m1n1 that is installed now. That m1n1 is
+# recorded as failed on this Mac. A rebuild that only changed the device trees
+# or the switches keeps the same m1n1, and is not taken for one.
+m1n1_rollback_check() {
+  local sha size pkg target
+  [[ -f $STATE/m1n1-installed ]] || return 0
+  read -r sha size pkg _ <"$STATE/m1n1-installed" || return 0
+  [[ $sha =~ ^[0-9a-f]{64}$ && $size =~ ^[0-9]+$ ]] || return 0
+  target=$(esp_bootbin) || return 0
+  [[ $(bootbin_m1n1_sha "$target" "$size") == "$sha" ]] && return 0
+  if [[ -f $M1N1_BIN ]] && $sudo cmp -s -n "$(stat -c %s "$M1N1_BIN")" "$M1N1_BIN" "$target"; then
+    return 0
+  fi
+  m1n1_failed_add "$sha" "${pkg:-m1n1}: boot.bin was put back by hand, found $(date +%F)"
+}
+
+# On a Mac that is not an M3 (m3_plan decides for those): when this release's
+# m1n1 failed on it before, keep the boot.bin it has (M1N1_KEEP). update-m1n1
+# must stay frozen, or pacman's hook would put that m1n1 back.
+m1n1_keep_plan() {
+  if is_m3 || ! m1n1_for_this_mac; then return 0; fi
+  m1n1_failed_shas | grep -qxF "$M1N1_BIN_SHA" || return 0
+  update_m1n1_frozen ||
+    die "this release's m1n1 (sha256 $M1N1_BIN_SHA) failed on this Mac before (recorded in
+    $STATE/m1n1-failed), so this script does not put it back, and update-m1n1 must not either.
+    Keep updates from rebuilding boot.bin, then run this again:
+      echo M1N1_UPDATE_DISABLED=1 | sudo tee -a $UPDATE_M1N1_CONF
+    Nothing was installed. If you have not yet, please report what happened at $ISSUE_URL"
+  M1N1_KEEP=1
+  say "This release's m1n1 (sha256 $M1N1_BIN_SHA) failed on this Mac before (recorded in
+    $STATE/m1n1-failed), so it is not put back: boot.bin stays as it is, and update-m1n1 stays
+    frozen in $UPDATE_M1N1_CONF. If you have not yet, please report what happened at $ISSUE_URL"
+}
+
+# After an install that kept boot.bin (M1N1_KEEP) on a Mac that is not an M3.
+m1n1_keep_report() {
+  [[ $(m3_bootbin_sha) == "$M3_BOOTBIN_SHA" ]] ||
+    die "m1n1's boot.bin changed during the install, which it must not here. Please report it
+    at $ISSUE_URL before rebooting."
+  say "m1n1's boot.bin is unchanged: update-m1n1 stays frozen in $UPDATE_M1N1_CONF."
 }
 
 # After update-m1n1 rebuilt boot.bin with M1N1_PACKAGE: check the m1n1 at its
@@ -767,7 +833,7 @@ m3_recorded_variant() {
 # Decide the M3 path before anything is downloaded, so a Mac this release can't
 # set up as asked stops with nothing changed.
 m3_plan() {
-  local board problem air=0
+  local board problem failed again="run this again" air=0
   M3_MODE=none
   if ! is_m3; then
     ((M3_TRY == 0)) || die "--m3-handoff is for an M3 Pro or an M3 MacBook Air, and this Mac isn't an M3. Nothing was installed."
@@ -776,9 +842,36 @@ m3_plan() {
   board=$(this_board)
   if is_m3_air; then air=1; fi
   m3_oslog_overlap_check
+  # An m1n1 from this script failed on this Mac before: a plain run keeps the
+  # boot loader it has now, whatever this release's m1n1 is, and --m3-handoff
+  # never puts back the one that failed.
+  failed=$(m1n1_failed_shas)
+  if [[ -n $failed ]] && ((M3_TRY == 0)); then
+    M3_MODE=kernel M1N1_KEEP=1
+    say "M3 ($board): an m1n1 from this script failed on this Mac before (recorded in
+    $STATE/m1n1-failed). Installing the kernel only: the boot loader this Mac has now stays as
+    it is. If you have not yet, please report what happened at $ISSUE_URL"
+    return 0
+  fi
+  if [[ -n $failed ]] && grep -qxF "$M1N1_BIN_SHA" <<<"$failed"; then
+    die "--m3-handoff: this release's m1n1 (sha256 $M1N1_BIN_SHA) is the one that failed on this
+    Mac (recorded in $STATE/m1n1-failed), so this script does not put it back.
+    Nothing was installed. Keep the kernel-only install: run this again without --m3-handoff.
+    If you have not yet, please report what happened at $ISSUE_URL"
+  fi
   # An update never takes the handoff away again: once a Mac has it (listed, or
   # tried with --m3-handoff), a plain run keeps it, and its checks still apply.
   if ((M3_TRY == 0)) && [[ $(m3_recorded_mode) == handoff ]]; then
+    # A freeze that is neither this script's nor the bring-up's: the line the
+    # restore steps give after a boot loader failed. Keep that boot.bin.
+    if update_m1n1_frozen_by_others; then
+      M3_MODE=kernel M1N1_KEEP=1
+      say "M3 ($board): this Mac has m1n1's handoff from an earlier install, and update-m1n1 is
+    frozen in $UPDATE_M1N1_CONF, not by this script (the restore steps add that line).
+    Installing the kernel only: the boot loader this Mac has now stays as it is. If a boot
+    loader from this script failed on this Mac, please report it at $ISSUE_URL"
+      return 0
+    fi
     if ((air)) && [[ $(m3_recorded_variant) != "$(m3_variant)" ]]; then
       die "M3 MacBook Air ($board): this Mac has an earlier test build's boot loader
     ($(m3_recorded_variant)), and this release's Air boot loader is a different one: the
@@ -831,10 +924,11 @@ m3_plan() {
     this Mac differs: $problem. Installing the kernel only; boot.bin stays as it is."
     return 0
   fi
+  if ((M3_TRY)); then again+=" with --m3-handoff"; fi
   if update_m1n1_frozen_by_others; then
     die "$UPDATE_M1N1_CONF sets M1N1_UPDATE_DISABLED, and not from this script or the M3
     bring-up's install-m3gpu.sh. Switching the $(m3_handoff_name) on needs m1n1's boot.bin
-    rebuilt. Remove that line and run this again. Nothing was installed."
+    rebuilt with this release's m1n1. Remove that line and $again. Nothing was installed."
   fi
   if update_m1n1_customised; then
     die "$UPDATE_M1N1_CONF points update-m1n1 at its own m1n1, U-Boot, config or target
@@ -883,13 +977,13 @@ m3_verify_bootbin() {
   $sudo cmp -s -n "$size" "$M1N1_BIN" "$target" ||
     die "$target does not start with this release's m1n1 ($M1N1_BIN), so it was not rebuilt.
     The boot loader this Mac booted with is kept as m1n1/boot.bin.before-$VERSION on the EFI
-    partition and in $STATE/boot.bin.saved. Please report it before rebooting."
+    partition. Please report it before rebooting."
   block=$(m3_switches | tr ' ' '\n')
   tail=$($sudo tail -c 1024 "$target" | tr -d '\0')
   [[ $tail == *"$block"* ]] ||
     die "the rebuilt $target does not carry the $kind switch lines. The boot loader this Mac
-    booted with is kept as m1n1/boot.bin.before-$VERSION on the EFI partition and in
-    $STATE/boot.bin.saved. Please report it before rebooting."
+    booted with is kept as m1n1/boot.bin.before-$VERSION on the EFI partition. Please report
+    it before rebooting."
   say "m1n1's boot.bin is this release's m1n1 with the $kind handoff switches"
 }
 
@@ -978,11 +1072,14 @@ keep_bootbin_on_esp() {
       3. sudo diskutil mount diskNsM   (it prints the /Volumes path)
       4. cp -X '<that path>/m1n1/boot.bin.before-$VERSION' '<that path>/m1n1/boot.bin'
     If it boots but something is wrong, the same copy goes back from Linux with:
-      sudo cp '$keep' '$target' && sync
-    After either, keep updates from rebuilding the test boot loader until it is sorted:
+      sudo cp '$keep' '$target.new' && sync && sudo mv '$target.new' '$target' && sync
+    After either, start Linux and run these two lines. The first keeps updates from
+    rebuilding the new boot loader; the second records that its m1n1 failed on this
+    Mac, so no later run of this script puts it back:
       echo M1N1_UPDATE_DISABLED=1 | sudo tee -a $UPDATE_M1N1_CONF
+      echo $M1N1_BIN_SHA | sudo tee -a $STATE/m1n1-failed
     The copy is kept at $keep. Either way, please report it at
-    https://github.com/iconidentify/aurora-linux/issues"
+    $ISSUE_URL"
     return 0
   fi
   die "could not find m1n1's boot.bin on the EFI partition to keep a copy of; nothing was installed"
@@ -1397,7 +1494,9 @@ install_all() {
   kernel=$(current_kernel)
   chain=$(boot_chain)
   if [[ $chain == grub ]]; then boot_space "$kernel"; fi
+  m1n1_rollback_check
   m3_plan
+  m1n1_keep_plan
   work=$(mktemp -d)
   trap 'rm -rf "${work:-}"' EXIT
   if is_neo && ! m1n1_for_this_mac; then say "Keeping this MacBook Neo's own m1n1 (m1n1-aurora has no T8140 support)"; fi
@@ -1451,6 +1550,8 @@ install_all() {
       ;;
     # So the hook's rebuild, where it runs, already carries the switches.
     handoff) m3_switches_write ;;
+    # update-m1n1 is frozen (m1n1_keep_plan): prove boot.bin stays as it is.
+    *) if ((M1N1_KEEP)); then M3_BOOTBIN_SHA=$(m3_bootbin_sha); fi ;;
   esac
 
   # linux-aurora-headers pulls in pahole, and fprintd below comes from the
@@ -1507,11 +1608,15 @@ install_all() {
       sync
       ;;
     *)
-      m1n1_update
-      # Not where update-m1n1 is frozen (m1n1_update said so) or builds from
-      # an m1n1 of its own, as a Neo without NEO_AURORA_M1N1 does.
-      if m1n1_for_this_mac && ! update_m1n1_frozen && ! update_m1n1_own_m1n1; then
-        m1n1_check_and_record
+      if ((M1N1_KEEP)); then
+        m1n1_keep_report
+      else
+        m1n1_update
+        # Not where update-m1n1 is frozen (m1n1_update said so) or builds from
+        # an m1n1 of its own, as a Neo without NEO_AURORA_M1N1 does.
+        if m1n1_for_this_mac && ! update_m1n1_frozen && ! update_m1n1_own_m1n1; then
+          m1n1_check_and_record
+        fi
       fi
       ;;
   esac
@@ -1547,6 +1652,9 @@ install_all() {
     say "Done. Reboot with someone watching: expect the Omarchy logo, the boot menu, then the
     desktop on the built-in display at its native resolution. Touch ID is not supported
     on M3 yet."
+  elif [[ $M3_MODE == kernel ]] && ((M1N1_KEEP)); then
+    say "Done. Reboot: this Mac keeps the boot loader it has now, with this release's kernel.
+    Touch ID is not supported on M3 yet."
   elif [[ $M3_MODE == kernel ]]; then
     say "Done. Reboot: expect the desktop on the boot framebuffer. Touch ID is not supported
     on M3 yet. How to help bring this M3 further: step 11 of the test plan that the
@@ -1556,6 +1664,9 @@ install_all() {
     echo "   Enrolling a finger needs writes: delete $MODPROBE_CONF, reboot, then run aurora-touchid-setup."
   else
     say "Done. Reboot, then run:  aurora-touchid-setup"
+  fi
+  if ((M1N1_KEEP)) && ! is_m3; then
+    echo "   This Mac keeps the boot loader it has: the m1n1 that failed on it is not put back."
   fi
   echo "   Testing this build? The plan and reporting format:"
   echo "      curl -fsSL $RELEASE_URL/install-aurora-sep.sh | bash -s -- --agent-prompt"
@@ -1640,7 +1751,16 @@ uninstall_all() {
     handoff) m3_restore_bringup ;;
   esac
   $sudo rm -f "$MODPROBE_CONF"
+  # The m1n1 builds that failed on this Mac stay recorded, so a later install
+  # never puts one of them back.
+  local failed=""
+  if [[ -f $STATE/m1n1-failed ]]; then failed=$(cat "$STATE/m1n1-failed"); fi
   $sudo rm -rf "$STATE"
+  if [[ -n $failed ]]; then
+    $sudo install -d "$STATE"
+    printf '%s\n' "$failed" | $sudo tee "$STATE/m1n1-failed" >/dev/null
+    say "Kept $STATE/m1n1-failed: a later install never puts back an m1n1 that failed on this Mac"
+  fi
   say "Done. Reboot to run $previous."
 }
 
@@ -1842,6 +1962,23 @@ SAFETY, NON-NEGOTIABLE
     it in writing: repeated cycles drift a device-wide counter.
   - Do not paste key material, serial numbers, or the contents of
     mesa_calibration.bin into a report.
+  - The install replaces the Mac's boot loader (m1n1), on every Mac but an
+    M3 that stays kernel-only and a MacBook Neo. Before it does, it keeps
+    the old one on the EFI partition and prints the steps to put it back:
+    keep them, they name this Mac's EFI partition.
+
+IF THE MAC STOPS IN m1n1 AFTER AN INSTALL (any Mac)
+  m1n1 text on screen and no boot menu, or a black screen for more than two
+  minutes: the owner puts the old boot.bin back from macOS with the printed
+  steps, starts Linux, and runs the two printed lines. The first keeps
+  updates from rebuilding the new boot loader; the second records that its
+  m1n1 failed on this Mac. Later plain runs of the one-liner then keep the
+  boot loader the Mac has and install the rest, and never put that m1n1
+  back. If it boots but something is wrong, the same copy goes back from
+  Linux with the printed line, followed by the same two lines. Do not use
+  --uninstall until the maintainer says so. Report what the screen showed
+  and when, with the serial log if there is one, at
+  https://github.com/iconidentify/aurora-linux/issues/6
 
 ON AN M3 (M3, M3 Pro, M3 Max): Touch ID is not supported there yet. Do steps
 0 and 1, then go to step 11, which says what should happen on your model and
@@ -2090,6 +2227,11 @@ fingerprint.
       time and then HDMI with one USB-C display, and say which port, which
       display and which mode lit. Sleep has known limits on M3; if you try
       it with an external display attached, quote what happened.
+      If it STOPS (m1n1 text and no boot menu, or a black screen for more
+      than two minutes), follow "IF THE MAC STOPS IN m1n1" above. If it
+      boots but the display or the GPU is WRONG, collect
+        sudo journalctl -b -k | grep -iE 'dcp|asahi|t6030|m1n1'
+      first, then follow the same section from Linux.
 
    B. any other apple,t6030 model (MacBook Pro 14" M3 Pro, J514S): NOT ON
       THE LIST YET. A REPORT FROM YOU IS HOW IT GETS ADDED.
@@ -2117,12 +2259,12 @@ fingerprint.
             adds the model to the list in the next release; until then a
             plain re-run of the one-liner keeps the handoff on this Mac.
           * STOPS: m1n1 text and no boot menu, or a black screen for more than
-            two minutes. The owner puts the old boot.bin back from macOS with
-            the printed steps. Report what the screen showed and when.
+            two minutes. Follow "IF THE MAC STOPS IN m1n1" above, and report
+            what the screen showed and when.
           * WRONG: it boots, but the display or the GPU is wrong. Collect
               sudo journalctl -b -k | grep -iE 'dcp|asahi|t6030|m1n1'
-            over SSH if you can, then run the installer with --uninstall
-            (it puts the stock m1n1 back) and reboot.
+            over SSH if you can, then follow the same section from Linux,
+            reboot, and report.
 
    C. apple,t8122 other than the MacBook Air (MacBook Pro 14" M3, J504;
       iMac M3, J433/J434) or apple,t6031 / apple,t6034 (M3 Max): KERNEL
@@ -2191,17 +2333,13 @@ fingerprint.
             baseline checks below again too. Title it
             "<board> (<model>): M3 Air display handoff".
           * STOPS: m1n1 text and no boot menu, or a black screen for more
-            than two minutes. The owner puts the old boot.bin back from
-            macOS with the printed steps, starts Linux, and runs the printed
-            M1N1_UPDATE_DISABLED line so no update rebuilds the new boot
-            loader. Do not run the one-liner again or --uninstall until the
-            maintainer says so. Report what the screen showed and when, with
-            the serial log if there is one: it says where m1n1 stopped.
+            than two minutes. Follow "IF THE MAC STOPS IN m1n1" above.
+            Report what the screen showed and when, with the serial log if
+            there is one: it says where m1n1 stopped.
           * WRONG: it boots, but something from the baseline no longer works
             (keyboard, Wi-Fi, suspend). Collect
               sudo journalctl -b -k | grep -iE 'asahi|gpu|g15|t8122|dcp|m1n1'
-            then run the two printed lines from Linux (put the old boot.bin
-            back, then M1N1_UPDATE_DISABLED), reboot, and report.
+            then follow the same section from Linux, reboot, and report.
         - Later plain runs keep the display handoff on this Air. To go back,
           use the printed restore lines; ask the maintainer before using
           --uninstall on an Air.

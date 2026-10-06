@@ -239,6 +239,15 @@ boot_chain() {{ echo limine; }}
             self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         return proc
 
+    def fresh_state(self):
+        # A Mac this script never ran on, for the next subtest.
+        shutil.rmtree(self.state)
+        self.state.mkdir()
+        self.m1n1_conf.unlink(missing_ok=True)
+        self.update_conf.unlink(missing_ok=True)
+        for kept in self.boot.parent.glob("boot.bin.*"):
+            kept.unlink()
+
     def install(self, try_=0, check=True, env=""):
         return self.run_sh(f"{env}\nM3_TRY={try_}\ninstall_all", check=check)
 
@@ -514,10 +523,7 @@ class M3FlowTest(M3FlowBase):
         for board, try_, switches in [("j293", 0, b""), ("j314s", 0, b""), ("j414s", 0, b""),
                                       ("j516s", 0, SWITCHES), ("j514s", 1, SWITCHES)]:
             with self.subTest(board=board):
-                shutil.rmtree(self.state)
-                self.state.mkdir()
-                self.m1n1_conf.unlink(missing_ok=True)
-                self.update_conf.unlink(missing_ok=True)
+                self.fresh_state()
                 self.mac(board)
                 self.install(try_=try_)
                 boot = self.boot.read_bytes()
@@ -526,14 +532,6 @@ class M3FlowTest(M3FlowBase):
                 self.assertEqual([d for d in self.downloaded() if d.startswith("m1n1-")], [M1N1_PKG])
 
     # The m1n1 by its bytes (M1N1_BIN_SHA), never by the version it reports
-
-    def fresh_state(self):
-        shutil.rmtree(self.state)
-        self.state.mkdir()
-        self.m1n1_conf.unlink(missing_ok=True)
-        self.update_conf.unlink(missing_ok=True)
-        for kept in self.boot.parent.glob("boot.bin.*"):
-            kept.unlink()
 
     def test_m1n1_is_checked_and_recorded_by_its_bytes(self):
         sha = self.bin_shas[M1N1_PKG]
