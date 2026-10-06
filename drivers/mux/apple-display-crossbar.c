@@ -102,7 +102,7 @@ struct apple_dpxbar {
 	const struct apple_dpxbar_hw *hw;
 	void __iomem *regs;
 	int selected_dispext[MUX_MAX];
-	/* T6030 programs its DP IN outputs itself, see apple_dpxbar_t6030_link() */
+	/* T6030 programs all its outputs itself, see apple_dpxbar_t6030_link() */
 	bool t6030_dpin;
 	bool tunnel_link_up[MUX_MAX];
 	spinlock_t lock;
@@ -221,12 +221,29 @@ static void t602x_dump(struct apple_dpxbar *xbar, const char *tag)
 #define T602X_MUX_SELECT 0x030
 #define T602X_ATC_ENABLE 0x034
 
-/* Called with the crossbar lock held and a selected DP IN output. */
+/*
+ * Field of a T6030 output in the gate, select and enable registers. DP IN 0,
+ * DP IN 1 and the DP PHY output use bits 0, 4 and 8.
+ */
+static unsigned int apple_dpxbar_t6030_shift(unsigned int index)
+{
+	switch (index) {
+	case MUX_DPIN0:
+		return 0;
+	case MUX_DPIN1:
+		return 4;
+	case MUX_DPPHY:
+	default:
+		return 8;
+	}
+}
+
+/* Called with the crossbar lock held and a selected output. */
 static void apple_dpxbar_t6030_link(struct apple_dpxbar *xbar,
 				  unsigned int index, bool up)
 {
 	u32 state = xbar->selected_dispext[index];
-	u32 u = BIT(state), shift = index == MUX_DPIN0 ? 0 : 4;
+	u32 u = BIT(state), shift = apple_dpxbar_t6030_shift(index);
 	u32 d = BIT(shift);
 	bool pclk2 = (index == MUX_DPIN1) ^ (state & 1);
 	u32 ps = pclk2 ? 3 : 1;
@@ -282,7 +299,7 @@ static int apple_dpxbar_t6030_dpin_set(struct mux_control *mux, int state)
 	struct apple_dpxbar *xbar = mux_chip_priv(mux->chip);
 	unsigned int index = mux_control_get_index(mux);
 	unsigned long flags;
-	u32 shift = index == MUX_DPIN0 ? 0 : 4;
+	u32 shift = apple_dpxbar_t6030_shift(index);
 	u32 mask = (0xfU << shift) | (0xfU << (shift + 12));
 	unsigned int i;
 
@@ -324,7 +341,8 @@ static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
 
 	if (index >= MUX_MAX)
 		return -EINVAL;
-	if (dpxbar->t6030_dpin && (index == MUX_DPIN0 || index == MUX_DPIN1))
+	/* T6030 routes every output on select and clocks it on link up. */
+	if (dpxbar->t6030_dpin)
 		return apple_dpxbar_t6030_dpin_set(mux, state);
 
 	if (state == MUX_IDLE_DISCONNECT) {
@@ -883,7 +901,7 @@ static int apple_dpxbar_t602x_link_up(struct mux_control *mux)
 	return ret;
 }
 
-/* T6030 DP IN: bring a selected output's connection up or down. */
+/* T6030: bring a selected output's connection up or down. */
 static int apple_dpxbar_t6030_link_set(struct mux_control *mux, bool up)
 {
 	struct apple_dpxbar *xbar = mux_chip_priv(mux->chip);
@@ -891,7 +909,7 @@ static int apple_dpxbar_t6030_link_set(struct mux_control *mux, bool up)
 	unsigned long flags;
 	int ret = 0;
 
-	if (index != MUX_DPIN0 && index != MUX_DPIN1)
+	if (index >= MUX_MAX)
 		return -EINVAL;
 	spin_lock_irqsave(&xbar->lock, flags);
 	if (xbar->selected_dispext[index] < 0)
