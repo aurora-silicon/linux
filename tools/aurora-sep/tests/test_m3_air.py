@@ -6,7 +6,9 @@ The handoff writes chosen.asahi,t8122-gpu=1 (and chosen.asahi,t8122-dcp=1
 only with M3_AIR_DCP=1) to /etc/m1n1.conf. Every case sets
 M3_AIR_M1N1_PACKAGE and M3_AIR_DRY_RUN itself, so the tests don't depend on
 what the installer ships with. M3AirDryRunTest covers the dry run, which
-writes M3_AIR_DRY_RUN_SWITCHES instead.
+writes M3_AIR_DRY_RUN_SWITCHES instead, and the display handoff
+(M3_AIR_DISPLAY_HANDOFF=1), which writes the same switches under its own
+variant name.
 """
 from pathlib import Path
 import re
@@ -27,6 +29,13 @@ def shell_value(name):
     return re.search(rf'^{name}="([^"]*)"$', SRC, re.M).group(1)
 
 
+def shell_word(name):
+    return re.search(rf'^{name}=(\S+)$', SRC, re.M).group(1)
+
+
+DISPLAY_VARIANT = shell_value("M3_AIR_DISPLAY_VARIANT")
+
+
 class M3AirTest(flow.M3FlowBase):
     def setUp(self):
         super().setUp()
@@ -37,9 +46,12 @@ class M3AirTest(flow.M3FlowBase):
 
     dry_run = 0
 
-    def sh(self, body, pkg=None, dcp=0, boards=None, check=True):
+    def sh(self, body, pkg=None, dcp=0, boards=None, check=True, display=0, variant=None):
         pkg = self.air_pkg if pkg is None else pkg
-        pre = f'M3_AIR_M1N1_PACKAGE="{pkg}"\nM3_AIR_DCP={dcp}\nM3_AIR_DRY_RUN={self.dry_run}\n'
+        pre = (f'M3_AIR_M1N1_PACKAGE="{pkg}"\nM3_AIR_DCP={dcp}\nM3_AIR_DRY_RUN={self.dry_run}\n'
+               f'M3_AIR_DISPLAY_HANDOFF={display}\n')
+        if variant is not None:
+            pre += f'M3_AIR_DISPLAY_VARIANT={variant}\n'
         if boards is not None:
             pre += f'M3_HANDOFF_BOARDS="{boards}"\n'
         return self.run_sh(pre + body, check=check)
@@ -323,7 +335,7 @@ DRY_RUN_LINES = b"".join(l.encode() + b"\n" for l in DRY_RUN)
 
 
 class M3AirDryRunTest(M3AirTest):
-    """The dry run this build ships: read and report, switch nothing on."""
+    """The Air dry-run profile, and the display handoff that ships with its switches."""
     dry_run = 1
 
     def setUp(self):
@@ -345,24 +357,23 @@ class M3AirDryRunTest(M3AirTest):
         self.assertEqual(self.sh("m3_switches").stdout.strip(), shell_value("M3_SWITCHES"))
 
     def test_shipped_settings(self):
-        # Two shipped shapes, both valid, depending on the build:
-        #  - a -test build ships the Air dry run: DRY_RUN=1 and a real Air m1n1.
-        #  - a Latest build keeps the Air kernel-only: an empty Air m1n1, so
-        #    --m3-handoff on an Air refuses and nothing is switched on.
-        # The dry-run switch list, when used, is always these four and never
-        # asks for the GPU setup itself.
+        # A release decision: change this test with it. 12.0 ships the Air
+        # display handoff with the dry run's switches, opt-in only, from the
+        # same m1n1 as the M3 Pros, under a variant name no test build used.
         self.assertEqual(DRY_RUN, ["chosen.asahi,t8122-gpu-diag=1",
                                    "chosen.asahi,t8122-gpu-handoff-diag=1",
                                    "chosen.asahi,t8122-gpu-power-diag=1",
                                    "chosen.asahi,t8122-dcp=1"])
+        # The dry run never asks for the GPU setup itself.
         self.assertNotIn("chosen.asahi,t8122-gpu=1", DRY_RUN)
-        dry = re.search(r"^M3_AIR_DRY_RUN=(\S+)$", SRC, re.M).group(1)
+        self.assertEqual(shell_word("M3_AIR_DRY_RUN"), "1")
+        self.assertEqual(shell_word("M3_AIR_DISPLAY_HANDOFF"), "1")
         air_pkg = shell_value("M3_AIR_M1N1_PACKAGE")
-        if air_pkg:
-            self.assertEqual(dry, "1", "a shipped Air m1n1 must ship the dry run")
-            self.assertRegex(air_pkg, r"^m1n1-aurora-\S+ [0-9a-f]{64}$")
-        else:
-            self.assertEqual(dry, "0", "no Air m1n1 shipped, so the dry run is off")
+        self.assertRegex(air_pkg, r"^m1n1-aurora-\S+ [0-9a-f]{64}$")
+        self.assertEqual(air_pkg, shell_value("M3_M1N1_PACKAGE"))
+        # 11.111-test and 11.111.1-test recorded air-display-handoff.
+        self.assertNotIn(DISPLAY_VARIANT, ("air-display-handoff", "air-dry-run", "air-gpu", "air-gpu-dcp"))
+        self.assertRegex(DISPLAY_VARIANT, r"^air-display-handoff-\S+$")
 
     def test_conf_block(self):
         self.mac("j613")
@@ -506,6 +517,73 @@ class M3AirDryRunTest(M3AirTest):
         self.assertTrue(boot.endswith(b"UBOOT" + DRY_RUN_LINES), boot)
         self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff air-dry-run")
         # The boot loader the Mac had before the first test stays the kept copy.
+        self.assertEqual(self.kept_copy().read_bytes(), b"M1N1:original\n")
+
+    # The display handoff (M3_AIR_DISPLAY_HANDOFF=1)
+
+    def test_display_handoff_needs_fresh_opt_in_and_keeps_restore(self):
+        self.mac("j613")
+        self.air_install(try_=1)
+        before = self.boot.read_bytes()
+        before_conf = self.m1n1_conf.read_bytes()
+        before_downloads = self.downloaded()
+        proc = self.air_install(display=1, check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("Nothing was installed", proc.stderr)
+        self.assertIn("display handoff with GPU diagnostics", proc.stderr)
+        self.assertEqual(self.boot.read_bytes(), before)
+        self.assertEqual(self.m1n1_conf.read_bytes(), before_conf)
+        self.assertEqual(self.downloaded(), before_downloads)
+        proc = self.air_install(try_=1, display=1)
+        self.assertIn("Native display still needs T8122 PMP support", proc.stderr)
+        self.assertIn("does not start the GPU", proc.stderr)
+        self.assertIn("Native display and GPU acceleration are not enabled", proc.stdout)
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), f"handoff {DISPLAY_VARIANT}")
+        self.assertTrue(self.boot.read_bytes().endswith(b"UBOOT" + DRY_RUN_LINES))
+        self.assertNotIn(AIR_GPU, self.boot.read_bytes())
+        self.assertEqual(self.kept_copy().read_bytes(), b"M1N1:original\n")
+        proc = self.air_install(display=1)
+        self.assertIn("keeping it", proc.stdout)
+        self.assertEqual(self.kept_copy().read_bytes(), b"M1N1:original\n")
+
+    def test_shipped_display_profile_uses_diagnostics_without_gpu_start(self):
+        self.mac("j613")
+        proc = self.run_sh("M3_TRY=1\nm3_plan\nm3_variant\nm3_switches")
+        self.assertIn(DISPLAY_VARIANT, proc.stdout)
+        self.assertIn("does not start the GPU", proc.stderr)
+        self.assertIn("Native display still needs T8122 PMP support", proc.stderr)
+        switches = [s for s in proc.stdout.split() if s.startswith("chosen.")]
+        self.assertEqual(switches, DRY_RUN)
+        self.assertNotIn("chosen.asahi,t8122-gpu=1", switches)
+
+    def test_release_display_variant_requires_opt_in(self):
+        self.mac("j615")
+        self.assertEqual(self.plan(display=1), "kernel")
+        self.assertEqual(self.plan(try_=1, display=1), "handoff")
+
+    def test_test_build_display_handoff_does_not_move_silently(self):
+        # Scott's path: an Air on 11.111.1-test's display handoff (variant
+        # air-display-handoff, aurora8.4) runs this release's plain one-liner.
+        # It must stop before downloading anything; --m3-handoff moves it.
+        self.mac("j613")
+        self.air_install(try_=1, display=1, variant="air-display-handoff")
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff air-display-handoff")
+        before = self.boot.read_bytes()
+        before_conf = self.m1n1_conf.read_bytes()
+        before_downloads = self.downloaded()
+        proc = self.air_install(display=1, check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("(air-display-handoff)", proc.stderr)
+        self.assertIn(f"({DISPLAY_VARIANT})", proc.stderr)
+        self.assertIn("--m3-handoff", proc.stderr)
+        self.assertIn("Nothing was installed", proc.stderr)
+        self.assertEqual(self.boot.read_bytes(), before)
+        self.assertEqual(self.m1n1_conf.read_bytes(), before_conf)
+        self.assertEqual(self.downloaded(), before_downloads)
+        proc = self.air_install(try_=1, display=1)
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), f"handoff {DISPLAY_VARIANT}")
+        self.assertTrue(self.boot.read_bytes().endswith(b"UBOOT" + DRY_RUN_LINES))
+        # The boot loader the Mac had before its first test stays the kept copy.
         self.assertEqual(self.kept_copy().read_bytes(), b"M1N1:original\n")
 
     def test_install_syncs_after_the_rebuild(self):

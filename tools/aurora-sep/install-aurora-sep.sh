@@ -101,6 +101,19 @@
 # settings and startup tables are checked before it starts; the M3 GPU
 # settings are per chip; each PCI USB controller reserves only the interrupt it
 # uses, leaving interrupts for a dock's other devices. An M3 Air stays kernel-only.
+# 12.0: one release and one kernel for every Mac this script supports; the
+# 11.1xx test builds end here. On the 16" M3 Pro (J516S) the kernel drives
+# external displays on the USB-C and HDMI ports, and its m1n1 moves to
+# aurora8.5, which also hands over the second external display processor. The
+# M3 Type-C PHY changes behind this apply to every M3. Other M3 Pros keep the
+# handoff opt-in (--m3-handoff). An M3 MacBook Air stays kernel-only unless its
+# owner asks with --m3-handoff for m1n1's display handoff with GPU diagnostics
+# (the same aurora8.5; the desktop stays on the boot framebuffer). An Air that
+# has an earlier test build's boot loader must ask again with --m3-handoff.
+# The kernel also describes the Air's internal display and GPU configuration,
+# both inert for now, and the M2 Max Neural Engine cleans up after a failed
+# probe (iconidentify/aurora-linux#37, Joshua Warren). M1, M2 and the Neo
+# keep their boot loaders.
 # It replaces linux-asahi (or linux-aurora) as a pacman package,
 # so mkinitcpio and update-m1n1 run from their own hooks; on a GRUB Mac this
 # script regenerates grub.cfg and keeps the previous kernel as a fallback entry.
@@ -135,8 +148,8 @@ set -euo pipefail
 
 # The kernel package version and the release tag move independently: a release
 # that only changes m1n1 reuses the previous kernel packages unchanged.
-VERSION=7.1.12.aurora2-11.38
-TAG=sep-7.1.12.aurora2-11.38
+VERSION=7.1.12.aurora2-12.0
+TAG=sep-7.1.12.aurora2-12.0
 # Packages are fetched from this script's own tag, never from "latest": the
 # checksums below belong to this release and nothing else.
 RELEASE_URL=https://github.com/iconidentify/aurora-linux/releases/download/$TAG
@@ -144,21 +157,22 @@ RELEASES_API=https://api.github.com/repos/iconidentify/aurora-linux/releases
 # Where to always get the current script, whatever this copy turns out to be.
 LATEST_URL=https://github.com/iconidentify/aurora-linux/releases/latest/download/install-aurora-sep.sh
 PACKAGES=(
-  "linux-aurora-$VERSION-aarch64.pkg.tar.zst f1cecde567b42b93a03c26b78fc13ae8cf0a93e40a429c509df7b62836f9de1a"
-  "linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst 8c9fd8d30fc0392c8b0d4f690bf5c4ef02daea18529a645935bbe83b5a22e746"
+  "linux-aurora-$VERSION-aarch64.pkg.tar.zst PENDING-12.0-LAB-BUILD"
+  "linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst PENDING-12.0-LAB-BUILD"
   "libfprint-1.94.100-1.1-aarch64.pkg.tar.zst bc7d9762db6644f2cfb58ddb209602c1d513845eb1498c098e01f12600fcbdf9"
   "aurora-touchid-20261003-1-any.pkg.tar.zst 29b0360fac8c257d754e64bd1b9c33c487eb2595dd3c31e9138d7a476afa3d64"
   "m1n1-aurora-1.6.1.aurora3-1-aarch64.pkg.tar.zst bc3451aaa88bc3f4912bc3613f9569aa8f3e05f376fa851fa837b5e2080e8c2f"
 )
 # Only for an M3 on the handoff path (see m3_plan), in place of the m1n1-aurora
-# above: the same m1n1 plus the T6030 display and GPU handoff.
-M3_M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora7-1-aarch64.pkg.tar.zst 547d0d5f9daa283749d84e5a9c875fee06ce449eeb8252e41c11b3ce63e11184"
+# above: the same m1n1 plus the T6030 display and GPU handoff. aurora8.5 also
+# hands over the second external display processor.
+M3_M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora8.5-2-aarch64.pkg.tar.zst 7bbf89455b9a96487ee05bfef18ee3e5c8ec57c1af3f97fc15548774d5e92a44"
 # Only for an M3 MacBook Air on the handoff path, in place of the m1n1-aurora
-# above: m1n1-aurora with the T8122 switches (aurora8 is the first), as
-# "file sha256". It may name the same package as M3_M1N1_PACKAGE once one m1n1
-# carries both. Left empty, an Air stays kernel-only and --m3-handoff on an
-# Air stops with nothing installed.
-M3_AIR_M1N1_PACKAGE=""
+# above: m1n1-aurora with the T8122 switches, as "file sha256". From aurora8.5
+# one M3 m1n1 carries both, so this names the same package as M3_M1N1_PACKAGE.
+# Left empty, an Air stays kernel-only and --m3-handoff on an Air stops with
+# nothing installed.
+M3_AIR_M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora8.5-2-aarch64.pkg.tar.zst 7bbf89455b9a96487ee05bfef18ee3e5c8ec57c1af3f97fc15548774d5e92a44"
 PINNED="linux-aurora linux-aurora-headers libfprint m1n1-aurora"
 PIN_BEGIN="# >>> aurora-sep pin (remove with: install-aurora-sep.sh --uninstall)"
 PIN_END="# <<< aurora-sep pin"
@@ -293,9 +307,9 @@ is_m3_air() {
 #            three M3_SWITCHES lines; update-m1n1 copies chosen.* lines from
 #            /etc/m1n1.conf into every rebuild, so they survive updates.
 #            An M3 MacBook Air takes the same path with its own m1n1
-#            (M3_AIR_M1N1_PACKAGE) and switches (m3_switches): the GPU
-#            handoff only, and only with --m3-handoff until its board is in
-#            M3_HANDOFF_BOARDS.
+#            (M3_AIR_M1N1_PACKAGE) and switches (m3_switches): the display
+#            handoff with GPU diagnostics, and only with --m3-handoff until
+#            its board is in M3_HANDOFF_BOARDS.
 # M1, M2 and the Neo keep the m1n1-aurora in PACKAGES: only an M3 on the
 # handoff path gets the newer m1n1.
 UPDATE_M1N1_CONF=/etc/default/update-m1n1
@@ -317,12 +331,23 @@ M3_AIR_DCP=0
 # A dry run in place of the handoff (M3_AIR_DRY_RUN=1): m1n1 reads the Air's
 # GPU and display details from the boot firmware and reports them on the
 # serial console and under /chosen, powers the GPU only for a bounded
-# identity read, and starts nothing. The desktop stays as it was. This build
-# ships the dry run: the Air's GPU can't be started until those details are in.
+# identity read, and starts nothing. The desktop stays as it was.
 # chosen.asahi,t8122-dcp=1 is a dry run only while m1n1 pins no T8122 DCP
 # firmware image (aurora8 pins none); a release whose m1n1 pins one must give
 # the dry run another variant name in m3_variant, so no Air gets it unasked.
-M3_AIR_DRY_RUN=0
+# The display handoff (M3_AIR_DISPLAY_HANDOFF=1) is that case: the same
+# switches with an m1n1 that pins the image (aurora8.3 and later), so m1n1
+# hands the internal display over and publishes its checked state for Linux.
+# The kernel keeps the boot framebuffer until it has a T8122 PMP description,
+# and the GPU switches stay diagnostics: nothing starts the GPU.
+# M3_AIR_DISPLAY_VARIANT names it in $STATE/m3-mode. A plain run keeps an
+# Air's boot loader only while that name matches, so it changes with each m1n1
+# that changes what an Air boots: an Air on an earlier test build's boot loader
+# (air-display-handoff, aurora8.3 and 8.4) moves to this one only with a new
+# --m3-handoff.
+M3_AIR_DISPLAY_HANDOFF=1
+M3_AIR_DISPLAY_VARIANT="air-display-handoff-85"
+M3_AIR_DRY_RUN=1
 M3_AIR_DRY_RUN_SWITCHES="chosen.asahi,t8122-gpu-diag=1 chosen.asahi,t8122-gpu-handoff-diag=1 chosen.asahi,t8122-gpu-power-diag=1 chosen.asahi,t8122-dcp=1"
 # The handoff is tested with one macOS system-firmware stub only, 14.8.3 (GPU
 # firmware 14.8.3, DCP 14.7), which the Omarchy installer gives every M3. m1n1
@@ -469,6 +494,8 @@ m3_air_package_ok() {
 m3_handoff_name() {
   if ! is_m3_air; then
     echo "M3 Pro display and GPU handoff"
+  elif [[ $M3_AIR_DISPLAY_HANDOFF == 1 ]]; then
+    echo "M3 Air display handoff with GPU diagnostics"
   elif [[ $M3_AIR_DRY_RUN == 1 ]]; then
     echo "M3 Air GPU and display dry run"
   elif [[ $M3_AIR_DCP == 1 ]]; then
@@ -626,6 +653,7 @@ m3_recorded_mode() {
 # into a GPU start) without a new --m3-handoff.
 m3_variant() {
   if ! is_m3_air; then echo t6030
+  elif [[ $M3_AIR_DISPLAY_HANDOFF == 1 ]]; then echo "$M3_AIR_DISPLAY_VARIANT"
   elif [[ $M3_AIR_DRY_RUN == 1 ]]; then echo air-dry-run
   elif [[ $M3_AIR_DCP == 1 ]]; then echo air-gpu-dcp
   else echo air-gpu
@@ -654,8 +682,9 @@ m3_plan() {
   if ((M3_TRY == 0)) && [[ $(m3_recorded_mode) == handoff ]]; then
     if ((air)) && [[ $(m3_recorded_variant) != "$(m3_variant)" ]]; then
       die "M3 MacBook Air ($board): this Mac has an earlier test build's boot loader
-    ($(m3_recorded_variant)), and this release's Air boot loader does something else: the
-    $(m3_handoff_name). Run this again with --m3-handoff to switch to it. Nothing was installed."
+    ($(m3_recorded_variant)), and this release's Air boot loader is a different one: the
+    $(m3_handoff_name) ($(m3_variant)). Run this again with --m3-handoff to switch to it.
+    Nothing was installed."
     fi
     M3_TRY=1
     if ((air)); then
@@ -718,6 +747,12 @@ m3_plan() {
   if ((air)); then
     if is_m3_handoff_board; then
       say "M3 MacBook Air ($board, macOS $M3_STUB_VERSION stub): installing m1n1 with the $(m3_handoff_name)"
+    elif [[ $M3_AIR_DISPLAY_HANDOFF == 1 ]]; then
+      warn "--m3-handoff: trying m1n1's display handoff on this M3 MacBook Air ($board).
+    It publishes the checked display state for Linux and collects GPU diagnostics;
+    it does not start the GPU. Native display still needs T8122 PMP support, so the
+    desktop stays on the boot framebuffer and renders in software.
+    This replaces the Mac's boot loader; the steps to put the old one back from macOS follow."
     elif [[ $M3_AIR_DRY_RUN == 1 ]]; then
       warn "--m3-handoff: installing m1n1's GPU and display dry run on this M3 MacBook Air ($board).
     It reads the Air's GPU and display details and reports them for the bring-up, powering the
@@ -1371,7 +1406,14 @@ install_all() {
   if is_neo; then neo_radio_notice; fi
   pacman -Q linux-aurora libfprint aurora-touchid
   echo
-  if [[ $M3_MODE == handoff ]] && is_m3_air && [[ $M3_AIR_DRY_RUN == 1 ]]; then
+  if [[ $M3_MODE == handoff ]] && is_m3_air && [[ $M3_AIR_DISPLAY_HANDOFF == 1 ]]; then
+    say "Done. Reboot with the serial recorder running and someone watching: expect the Omarchy
+    logo, the boot menu, then the same desktop on the boot framebuffer. Check the serial log
+    for the T8122 handoff result and the \"PMP: T8122:\" lines.
+    Native display and GPU acceleration are not enabled. Touch ID is not supported on M3 yet.
+    What to send back: case D of step 11 of the test plan that the --agent-prompt command below
+    prints."
+  elif [[ $M3_MODE == handoff ]] && is_m3_air && [[ $M3_AIR_DRY_RUN == 1 ]]; then
     say "Done. Reboot with the serial recorder running and someone watching: expect the Omarchy
     logo, the boot menu, then the desktop on the boot framebuffer, as before. This build only
     reads and reports, so nothing on the desktop changes. Touch ID is not supported on M3 yet.
@@ -1900,6 +1942,10 @@ fingerprint.
       Reboot with the owner watching. Expected within about a minute: the
       Omarchy logo, the boot menu, then the desktop on the built-in display
       at 3456x2234, GPU accelerated. Then run the checks below and report.
+      External displays: try each USB-C port and the HDMI port, one at a
+      time and then HDMI with one USB-C display, and say which port, which
+      display and which mode lit. Sleep has known limits on M3; if you try
+      it with an external display attached, quote what happened.
 
    B. any other apple,t6030 model (MacBook Pro 14" M3 Pro, J514S): NOT ON
       THE LIST YET. A REPORT FROM YOU IS HOW IT GETS ADDED.
@@ -1951,15 +1997,15 @@ fingerprint.
         M3 MacBook Air (j613): installing the kernel only ...
       Run the checks below on that first and report it: it is the baseline
       every later Air test is compared with.
-      Then, on a test build that carries the Air's dry run (its message says
-      so), run the dry run on this Air:
+      Then, to try m1n1's display handoff with GPU diagnostics on this Air:
         - What it does: it replaces this Mac's boot loader (m1n1) with one
-          that reads the Air's GPU and display details from the boot
-          firmware and reports them: on the serial console, and under
+          that hands the built-in display over and publishes its checked
+          state for Linux, and reads the Air's GPU, PMP and display clock
+          details and reports them: on the serial console, and under
           /proc/device-tree/chosen in Linux. It powers the GPU only for a
-          short identity read and switches nothing on. The screen and the
-          desktop stay exactly as in the baseline. These reports are what
-          the next build, the one that starts the Air's GPU, is made from.
+          short identity read and does not start it. Native display still
+          needs T8122 PMP support in the kernel, so the desktop stays on the
+          boot framebuffer and renders in software, as in the baseline.
         - Only with the owner's explicit agreement, with the owner at the
           Mac for the first boot, with the Aurora maintainer told first and
           reachable while it runs, and only if the owner can start macOS on
@@ -1970,34 +2016,40 @@ fingerprint.
           DFU ports: tools/aurora-m3/m3-serial.py in this repository
           ("sudo python3 m3-serial.py reboot" on the second Mac). Most of
           the display details are only printed there.
-        - Run the test build's one-liner with --m3-handoff (the release
-          tag's URL from its message, not releases/latest):
-            curl -fsSL https://github.com/iconidentify/aurora-linux/releases/download/<test tag>/install-aurora-sep.sh | bash -s -- --m3-handoff
-          It warns "--m3-handoff: installing m1n1's GPU and display dry run",
-          then prints the restore steps, from macOS and from Linux: keep
-          them, they name this Mac's EFI partition and boot.bin. Near the end
-          it must print "m1n1's boot.bin is this release's m1n1 with the M3
-          Air handoff switches". An error ending "Nothing was installed"
-          changed nothing: report it. For any other error, do not reboot:
-          report it first.
+        - Run the one-liner with --m3-handoff, also on an Air that has an
+          earlier test build's boot loader (a plain run there stops with
+          "Run this again with --m3-handoff" and changes nothing):
+            curl -fsSL https://github.com/iconidentify/aurora-linux/releases/latest/download/install-aurora-sep.sh | bash -s -- --m3-handoff
+          It warns "--m3-handoff: trying m1n1's display handoff", then
+          prints the restore steps, from macOS and from Linux: keep them,
+          they name this Mac's EFI partition and boot.bin. Near the end it
+          must print "m1n1's boot.bin is this release's m1n1 with the M3 Air
+          handoff switches". An error ending "Nothing was installed" changed
+          nothing: report it. For any other error, do not reboot: report it
+          first.
         - Reboot: run sync on the Air, then, if the second Mac records the
           serial console, start "sudo python3 m3-serial.py reboot" there; it
           reboots the Air itself. Without one, run "sudo reboot" on the Air.
-          The owner watches the screen. This boot also uses this release's
-          device tree for the Air for the first time. Expected within about a
-          minute: the Omarchy logo, the boot menu, then the same desktop as
-          before. Then report exactly one of:
-          * WORKS: the desktop comes up as before. Run the test build's
-            one-liner with --m3-report (same URL, "bash -s -- --m3-report"):
-            it writes one file, aurora-m3-report-<board>-<date>.tgz, in the
-            current directory. Attach that and the serial log, with the
-            line that shows the Mac's serial number removed. Give the
+          The owner watches the screen. Expected within about a minute: the
+          Omarchy logo, the boot menu, then the same desktop as before. Then
+          report exactly one of:
+          * WORKS: the desktop comes up as before. Run the one-liner with
+            --m3-report ("bash -s -- --m3-report"): it writes one file,
+            aurora-m3-report-<board>-<date>.tgz, in the current directory.
+            Attach that and the serial log, with the line that shows the
+            Mac's serial number removed. A handoff that went through prints
+            "DCP: T8122: handoff published" on the serial console, and Linux
+            keeps the display disabled with "no T8122 PMP description is
+            built in"; if a handoff check refused instead, quote the refusal
+            line (the boot framebuffer is then expected too). The serial log
+            also has "PMP: T8122:" lines, and the report carries
+            /chosen/asahi,t8122-pmp, -pmp-facts and -clock-facts. Give the
             baseline checks below again too. Title it
-            "<board> (<model>): M3 Air dry run".
+            "<board> (<model>): M3 Air display handoff".
           * STOPS: m1n1 text and no boot menu, or a black screen for more
             than two minutes. The owner puts the old boot.bin back from
             macOS with the printed steps, starts Linux, and runs the printed
-            M1N1_UPDATE_DISABLED line so no update rebuilds the test boot
+            M1N1_UPDATE_DISABLED line so no update rebuilds the new boot
             loader. Do not run the one-liner again or --uninstall until the
             maintainer says so. Report what the screen showed and when, with
             the serial log if there is one: it says where m1n1 stopped.
@@ -2006,9 +2058,9 @@ fingerprint.
               sudo journalctl -b -k | grep -iE 'asahi|gpu|g15|t8122|dcp|m1n1'
             then run the two printed lines from Linux (put the old boot.bin
             back, then M1N1_UPDATE_DISABLED), reboot, and report.
-        - Later plain runs of this test build keep the dry run on this Air.
-          To go back, use the printed restore lines; ask the maintainer
-          before using --uninstall on an Air.
+        - Later plain runs keep the display handoff on this Air. To go back,
+          use the printed restore lines; ask the maintainer before using
+          --uninstall on an Air.
 
    Checks for every M3 (quote the output; on a kernel-only M3 the handoff
    lines are expected to be missing, so say so):
