@@ -629,7 +629,7 @@ m1n1_failed_shas() {
 }
 
 m1n1_failed_add() {
-  m1n1_failed_shas | grep -qxF "$1" && return 0
+  grep -qxF "$1" <<<"$(m1n1_failed_shas)" && return 0
   $sudo install -d "$STATE"
   echo "$1 $2" | $sudo tee -a "$STATE/m1n1-failed" >/dev/null
 }
@@ -657,7 +657,7 @@ m1n1_rollback_check() {
 # must stay frozen, or pacman's hook would put that m1n1 back.
 m1n1_keep_plan() {
   if is_m3 || ! m1n1_for_this_mac; then return 0; fi
-  m1n1_failed_shas | grep -qxF "$M1N1_BIN_SHA" || return 0
+  grep -qxF "$M1N1_BIN_SHA" <<<"$(m1n1_failed_shas)" || return 0
   update_m1n1_frozen ||
     die "this release's m1n1 (sha256 $M1N1_BIN_SHA) failed on this Mac before (recorded in
     $STATE/m1n1-failed), so this script does not put it back, and update-m1n1 must not either.
@@ -1905,13 +1905,6 @@ reset_touchid() {
   say "Reboot now. Touch ID creates its new keybag during boot; then enrol your fingers again."
 }
 
-# Printed by --agent-prompt, and pointed at from the end of a successful
-# install. This is written for an agent driving the test on a real Mac: it says
-# what to establish, what counts as a pass, and how to write it up.
-# --m3-report: one file with what an M3 test report needs, in the current
-# directory. It reads only: the boot loader's /chosen entries, a kernel log
-# filtered to the M3 bring-up, USB-C and display state. Lines naming a USB
-# serial number are dropped and MAC addresses are masked.
 # The m1n1 in boot.bin by its bytes, for --m3-report: two builds can report the
 # same stage 2 version.
 m3_report_m1n1() {
@@ -1930,6 +1923,13 @@ m3_report_m1n1() {
   printf 'm1n1-installed: '; cat "$STATE/m1n1-installed" 2>/dev/null || echo -
 }
 
+# Printed by --agent-prompt, and pointed at from the end of a successful
+# install. This is written for an agent driving the test on a real Mac: it says
+# what to establish, what counts as a pass, and how to write it up.
+# --m3-report: one file with what an M3 test report needs, in the current
+# directory. It reads only: the boot loader's /chosen entries, a kernel log
+# filtered to the M3 bring-up, USB-C and display state. Lines naming a USB
+# serial number are dropped and MAC addresses are masked.
 M3_REPORT_DMESG='asahi|agx|gpu|g15|dcp|dart|t8122|t6030|reserved|iommu|mailbox|pmp|simpledrm|m1n1|tipd|typec|sn201202|atc|usb|xhci|dwc3|thermal|macsmc'
 m3_report() {
   local dir out board soc f
