@@ -42,6 +42,7 @@
 #include "dcp.h"
 #include "dcp-fabric-effects.h"
 #include "dcp-fabric.h"
+#include "dcp-hdmi.h"
 #include "dcpext_scanout.h"
 #include "dcp-internal.h"
 #include "iomfb.h"
@@ -1530,6 +1531,7 @@ static void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
 	disable_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
 	disable_delayed_work_sync(&dcp->hdmi_settle_wq);
 	disable_delayed_work_sync(&dcp->hdmi_recheck_wq);
+	dcp_hdmi_disable(dcp);
 }
 
 static void dcp_enable_typec_work(struct apple_dcp *dcp)
@@ -1539,6 +1541,7 @@ static void dcp_enable_typec_work(struct apple_dcp *dcp)
 	enable_delayed_work(&dcp->typec_fabric_retrain_wq);
 	enable_delayed_work(&dcp->hdmi_settle_wq);
 	enable_delayed_work(&dcp->hdmi_recheck_wq);
+	dcp_hdmi_enable(dcp);
 	/* A cable can be routed before the DRM component binds. */
 	if (READ_ONCE(dcp->typec_cable_connected))
 		dcp_queue_typec_reconnect(dcp, 0);
@@ -1884,6 +1887,9 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		dcp->hdmi_hpd = devm_gpiod_get_optional(dev, "hdmi-hpd", GPIOD_IN);
 		if (IS_ERR(dcp->hdmi_hpd))
 			return PTR_ERR(dcp->hdmi_hpd);
+		ret = dcp_hdmi_init(dcp);
+		if (ret)
+			return ret;
 		if (dcp->hdmi_hpd) {
 			int irq = gpiod_to_irq(dcp->hdmi_hpd);
 			if (irq < 0) {

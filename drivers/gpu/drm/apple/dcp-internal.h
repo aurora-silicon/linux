@@ -129,6 +129,7 @@ struct apple_dcp_hw_data {
 
 /* TODO: move IOMFB members to its own struct */
 struct dcpext_scanout;
+struct dcp_hdmi;
 
 struct apple_dcp {
 	struct dcp_fabric_pipeline fabric;
@@ -368,6 +369,8 @@ struct apple_dcp {
 	struct dcp_fabric_presence hdmi_presence;
 	struct delayed_work hdmi_settle_wq;
 	struct delayed_work hdmi_recheck_wq;
+	/* T6030 HDMI converter service requests, see dcp-hdmi.c */
+	struct dcp_hdmi *hdmi;
 };
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);

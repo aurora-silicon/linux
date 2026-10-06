@@ -14,6 +14,7 @@
 
 #include "afk.h"
 #include "dcp.h"
+#include "dcp-hdmi.h"
 #include "dptxep.h"
 #include "parser.h"
 #include "trace.h"
@@ -723,6 +724,8 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 			dcp_tunnel_crossbar_up(service->ep->dcp);
 		else if (!ret && dptx->link_rate)
 			dcp_direct_crossbar_link(service->ep->dcp, true);
+		if (!ret)
+			dcp_hdmi_link_configured(service->ep->dcp, dptx->link_rate);
 		return ret;
 	}
 	case DPTX_APCALL_GET_MAX_LINK_RATE:
