@@ -172,6 +172,8 @@ class M3FlowBase(unittest.TestCase):
         self.fixture(AURORA6, None, ["asahi,t6030-gpu", "asahi,t6030-dcp", "asahi,t6030-dcpext"])
         # The m1n1 package every Mac gets in this fake release.
         self.m1n1_pkg = M1N1_PKG
+        # The script under test; a test can run an earlier release's first.
+        self.installer = INSTALLER
 
     def fixture(self, name, data, strings=None):
         path = self.tmp / "pkgs" / name
@@ -210,7 +212,7 @@ class M3FlowBase(unittest.TestCase):
         pkgs = "\n".join(f'  "{n} {self.shas[n]}"' for n in OTHERS)
         script = f"""
 set -euo pipefail
-AURORA_SEP_SOURCE_ONLY=1 source '{INSTALLER}'
+AURORA_SEP_SOURCE_ONLY=1 source '{self.installer}'
 sudo=""
 DT='{self.tmp}/dt'
 STATE='{self.state}'

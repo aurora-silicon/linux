@@ -70,6 +70,35 @@ class M3ReportTest(Base):
         self.assertNotIn("pacman -U", self.log())
         self.assertNotIn("update-m1n1", self.log())
 
+    def test_overlap_marker_and_display_logs(self):
+        # 12.0's additions: the marker's presence, the dcp-oslog list, the
+        # marker copied with the other /chosen entries, and the warning.
+        self.mac("j516s")
+        marker = self.tmp / "dt/chosen/asahi,m1n1-oslog-overlap"
+        marker.write_bytes(bytes(range(16)))
+        for addr in ("10000000000", "10000100000", "10000200000"):
+            (self.tmp / f"dt/reserved-memory/dcp-oslog@{addr}").mkdir(parents=True)
+        (self.tmp / "dt/chosen/asahi,t6030-display-facts").write_bytes(b"facts\0")
+        proc, files = self.report()
+        text = files["system.txt"].decode()
+        self.assertIn("m1n1-oslog-overlap: present", text)
+        listed = text.split("reserved display logs:\n", 1)[1].splitlines()[:3]
+        self.assertEqual([l.rsplit("/", 1)[1] for l in listed],
+                         ["dcp-oslog@10000000000", "dcp-oslog@10000100000", "dcp-oslog@10000200000"])
+        self.assertEqual(files["chosen/asahi,m1n1-oslog-overlap"], bytes(range(16)))
+        self.assertEqual(files["chosen/asahi,t6030-display-facts"], b"facts\0")
+        self.assertIn("display log buffer overlaps", proc.stderr)
+        self.assertIn("issues", proc.stderr)
+
+    def test_no_overlap_marker(self):
+        self.mac("j613")
+        proc, files = self.report()
+        text = files["system.txt"].decode()
+        self.assertIn("m1n1-oslog-overlap: absent", text)
+        self.assertIn("reserved display logs:\n-\n", text)
+        self.assertNotIn("chosen/asahi,m1n1-oslog-overlap", files)
+        self.assertNotIn("overlaps", proc.stderr)
+
     def test_report_names_the_m1n1_by_its_bytes(self):
         self.mac("j516s")
         self.install()
