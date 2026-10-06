@@ -769,6 +769,34 @@ void dcp_external_retry_work(struct work_struct *work)
 	dcp_queue_typec_reconnect(dcp, 0);
 }
 
+/*
+ * The sink of a native external pipe raised IRQ_HPD with HPD staying high,
+ * as a DP branch device does when the display behind it changes. Pass the
+ * request to the firmware, which services it as a DP source does. If it
+ * cannot take the request, connect the display link anew, which makes the
+ * firmware read the display again.
+ */
+void dcp_external_sink_irq(struct apple_dcp *dcp)
+{
+	struct platform_device *pdev = to_platform_device(dcp->dev);
+	struct apple_epic_service *service = READ_ONCE(dcp->dptxport[0].service);
+	int ret;
+
+	/* With no link up, the next connect reads the display anyway. */
+	if (!dcp->external_native || !service || !READ_ONCE(dcp->dptxport[0].enabled) ||
+	    !READ_ONCE(dcp->dptxport[0].connected))
+		return;
+	ret = dptxport_sink_irq(service);
+	if (!ret) {
+		dev_info(dcp->dev, "display sink IRQ_HPD passed to the firmware\n");
+		return;
+	}
+	dev_info(dcp->dev, "display sink IRQ_HPD not passed (%d): connecting the display anew\n",
+		 ret);
+	dcp_dptx_disconnect_oob(pdev, 0);
+	dcp_dptx_connect_oob(pdev, 0);
+}
+
 int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 {
 	struct dcp_fabric_session session;

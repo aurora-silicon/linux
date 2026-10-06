@@ -1245,7 +1245,14 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	} else if (hpd && dp_data && (dp_data->status & DP_STATUS_IRQ_HPD)) {
 		struct apple_dcp *dcp = port->owner->dcp;
 
-		if (dcp->typec_connector)
+		/*
+		 * A T6030 external processor services the request itself, and
+		 * reads the display again if it changed; elsewhere the active
+		 * mode is applied again.
+		 */
+		if (dcp->typec_connector && dcp->external_native)
+			dcp_external_sink_irq(dcp);
+		else if (dcp->typec_connector)
 			dcp_retrain_oob(dcp->typec_connector);
 	}
 	port->hpd = hpd;

@@ -77,6 +77,7 @@ int dptxport_release_display(struct apple_epic_service *service);
 int dptxport_set_hpd(struct apple_epic_service *service, bool hpd);
 int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
 			     unsigned int timeout_ms);
+int dptxport_sink_irq(struct apple_epic_service *service);
 
 
 struct apple_dcp;

@@ -256,6 +256,12 @@ int dptxport_set_hpd(struct apple_epic_service *service, bool hpd)
 	return dptxport_set_hpd_timeout(service, hpd, MSEC_PER_SEC);
 }
 
+/* The sink raised IRQ_HPD: the firmware services the request as a DP source. */
+int dptxport_sink_irq(struct apple_epic_service *service)
+{
+	return afk_service_call(service, 8, 9, NULL, 0, 16, NULL, 0, 16);
+}
+
 static int
 dptxport_call_get_max_drive_settings(struct apple_epic_service *service,
 				     void *reply_, size_t reply_size)
