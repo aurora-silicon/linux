@@ -108,9 +108,10 @@ static bool dcp_typec_route_fixed_output_busy(struct apple_dcp_typec_route *rout
 	/*
 	 * The 14.7 firmware drives the internal panel on the IOMFB path.
 	 * The DPTX service is a separate output, so the live panel does not
-	 * occupy the Type-C route.
+	 * occupy the Type-C route. An external processor's fixed output (a
+	 * display behind the HDMI port) does, as on M1/M2.
 	 */
-	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7)
+	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7 && !dcp->external)
 		return false;
 	return dcp_fabric_fixed_busy(false,
 				     false,
