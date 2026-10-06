@@ -18,6 +18,8 @@ struct dcpavserv {
 	struct completion enable_completion;
 	u32 unit;
 	struct apple_epic_service *service;
+	/* The service instance last opened; compared only, never used. */
+	struct apple_epic_service *opened;
 };
 
 const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp);

@@ -49,6 +49,7 @@ static void dcpavserv_teardown(struct apple_epic_service *service)
 	if (dcp->dcpavserv.service == service) {
 		dcp->dcpavserv.enabled = false;
 		dcp->dcpavserv.service = NULL;
+		dcp->dcpavserv.opened = NULL;
 		reinit_completion(&dcp->dcpavserv.enable_completion);
 		owned = true;
 	}
@@ -66,6 +67,7 @@ void dpavservep_detach(struct apple_dcp *dcp)
 	service = dcp->dcpavserv.service;
 	dcp->dcpavserv.service = NULL;
 	dcp->dcpavserv.enabled = false;
+	dcp->dcpavserv.opened = NULL;
 	spin_unlock_irqrestore(&dcp->dcpavserv.lock, flags);
 	if (service) {
 		afk_service_disable(service);
@@ -208,6 +210,21 @@ const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp)
 	spin_unlock_irqrestore(&dcp->dcpavserv.lock, flags);
 	if (!service)
 		return ERR_PTR(-ENODEV);
+
+	/*
+	 * The 14.7 firmware of an external processor answers EDID requests
+	 * once its service has been opened; open each announced instance once.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
+	    READ_ONCE(dcp->dcpavserv.opened) != service) {
+		int ret = afk_service_call(service, 4, 6, NULL, 0, 32, NULL, 0, 32);
+
+		if (ret) {
+			afk_service_put(service);
+			return ERR_PTR(ret);
+		}
+		WRITE_ONCE(dcp->dcpavserv.opened, service);
+	}
 
 	edid = dcpavserv_read_edid(service);
 	spin_lock_irqsave(&dcp->dcpavserv.lock, flags);
