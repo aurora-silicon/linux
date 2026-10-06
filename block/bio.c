@@ -3,6 +3,7 @@
  * Copyright (C) 2001 Jens Axboe <axboe@kernel.dk>
  */
 #include <linux/mm.h>
+#include <linux/mm_subpage.h>
 #include <linux/swap.h>
 #include <linux/bio-integrity.h>
 #include <linux/blkdev.h>
@@ -246,6 +247,10 @@ void bio_init(struct bio *bio, struct block_device *bdev, struct bio_vec *table,
 #endif
 #ifdef CONFIG_BLK_DEV_INTEGRITY
 	bio->bi_integrity = NULL;
+#endif
+#ifdef CONFIG_MM_SUBPAGE
+	bio->bi_user_fragments = NULL;
+	bio->bi_nr_user_fragments = 0;
 #endif
 	bio->bi_vcnt = 0;
 
@@ -1159,6 +1164,18 @@ void __bio_release_pages(struct bio *bio, bool mark_dirty)
 {
 	struct folio_iter fi;
 
+#ifdef CONFIG_MM_SUBPAGE
+	if (bio->bi_user_fragments) {
+		release_user_fragments(bio->bi_user_fragments,
+				       bio->bi_nr_user_fragments, mark_dirty);
+		kfree(bio->bi_user_fragments);
+		bio->bi_user_fragments = NULL;
+		bio->bi_nr_user_fragments = 0;
+		bio_clear_flag(bio, BIO_PAGE_PINNED);
+		return;
+	}
+#endif
+
 	bio_for_each_folio_all(fi, bio) {
 		size_t nr_pages;
 
@@ -1220,6 +1237,134 @@ static int bio_iov_iter_align_down(struct bio *bio, struct iov_iter *iter,
 	return 0;
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+static bool bio_subpage_iter(const struct iov_iter *iter)
+{
+	return user_backed_iter(iter) && current->mm &&
+		mm_page_size(current->mm) < PAGE_SIZE;
+}
+
+int bio_iov_user_vecs(const struct iov_iter *iter, int max_vecs)
+{
+	struct iov_iter walk = *iter;
+	unsigned int count = 0;
+
+	if (!bio_subpage_iter(iter))
+		return iov_iter_npages(iter, max_vecs);
+	while (iov_iter_count(&walk) && count < max_vecs) {
+		size_t len, offset, nr;
+
+		iov_iter_advance(&walk, 0);
+		len = min(iter_iov_len(&walk), iov_iter_count(&walk));
+		if (WARN_ON_ONCE(!len))
+			return max_vecs;
+		offset = (unsigned long)iter_iov_addr(&walk) & (MM_SUBPAGE_SIZE - 1);
+		nr = (len >> MM_SUBPAGE_SHIFT) +
+			DIV_ROUND_UP(offset + (len & (MM_SUBPAGE_SIZE - 1)), MM_SUBPAGE_SIZE);
+		if (nr >= max_vecs - count)
+			return max_vecs;
+		count += nr;
+		iov_iter_advance(&walk, len);
+	}
+	return count;
+}
+EXPORT_SYMBOL_GPL(bio_iov_user_vecs);
+
+/* Pins belong to the submitting bio, just as with ordinary BIO_PAGE_PINNED.
+ * Split/cloned bios borrow its vectors and complete before their owner does.
+ */
+static int bio_iov_iter_get_fragments(struct bio *bio, struct iov_iter *iter,
+				    unsigned int align_mask)
+{
+	unsigned int capacity = bio->bi_max_vecs, total = 0;
+	unsigned int flags = iov_iter_rw(iter) == READ ? FOLL_WRITE : 0;
+	int ret = 0;
+
+	if (WARN_ON_ONCE(bio->bi_vcnt || bio->bi_user_fragments || !capacity))
+		return -EINVAL;
+	bio->bi_user_fragments = kmalloc_array(capacity,
+				 sizeof(*bio->bi_user_fragments), GFP_KERNEL);
+	if (!bio->bi_user_fragments)
+		return -ENOMEM;
+	while (iov_iter_count(iter) && bio->bi_nr_user_fragments < capacity &&
+	       total < BIO_MAX_SIZE) {
+		unsigned int i, bytes = 0;
+		long nr;
+
+		iov_iter_advance(iter, 0);
+		nr = pin_user_fragments_remote(current->mm,
+			(unsigned long)iter_iov_addr(iter),
+			min3(iter_iov_len(iter), iov_iter_count(iter),
+			     (size_t)(BIO_MAX_SIZE - total)), flags,
+			bio->bi_user_fragments + bio->bi_nr_user_fragments,
+			capacity - bio->bi_nr_user_fragments);
+		if (nr <= 0) {
+			ret = nr ?: -EFAULT;
+			break;
+		}
+		for (i = 0; i < nr; i++) {
+			struct user_page_fragment *fragment =
+				&bio->bi_user_fragments[bio->bi_nr_user_fragments++];
+			struct page *page = folio_page(fragment->folio,
+					fragment->offset >> PAGE_SHIFT);
+			unsigned int offset = offset_in_page(fragment->offset);
+			struct bio_vec *prev = bio->bi_vcnt ?
+				&bio->bi_io_vec[bio->bi_vcnt - 1] : NULL;
+
+			/* Coalesce physically adjacent quarters within one folio. */
+			if (prev && page_folio(prev->bv_page) == fragment->folio &&
+			    page_to_phys(prev->bv_page) + prev->bv_offset + prev->bv_len ==
+				page_to_phys(page) + offset)
+				prev->bv_len += fragment->length;
+			else
+				bvec_set_page(&bio->bi_io_vec[bio->bi_vcnt++], page,
+					      fragment->length, offset);
+			bytes += fragment->length;
+		}
+		iov_iter_advance(iter, bytes);
+		total += bytes;
+	}
+	/* Trim pins separately from vectors: several pins may share one bvec. */
+	if (total & align_mask) {
+		unsigned int trim = total & align_mask, left = trim;
+
+		while (left) {
+			struct user_page_fragment *fragment =
+				&bio->bi_user_fragments[bio->bi_nr_user_fragments - 1];
+			unsigned int bytes = min(left, fragment->length);
+
+			if (bytes == fragment->length) {
+				release_user_fragments(fragment, 1, false);
+				bio->bi_nr_user_fragments--;
+			} else {
+				fragment->length -= bytes;
+			}
+			left -= bytes;
+		}
+		left = trim;
+		while (left) {
+			struct bio_vec *bv = &bio->bi_io_vec[bio->bi_vcnt - 1];
+			unsigned int bytes = min(left, bv->bv_len);
+
+			bv->bv_len -= bytes;
+			if (!bv->bv_len)
+				bio->bi_vcnt--;
+			left -= bytes;
+		}
+		iov_iter_revert(iter, trim);
+		total -= trim;
+	}
+	bio->bi_iter.bi_size = total;
+	if (!total) {
+		kfree(bio->bi_user_fragments);
+		bio->bi_user_fragments = NULL;
+		return ret ?: -EFAULT;
+	}
+	bio_set_flag(bio, BIO_PAGE_PINNED);
+	return 0;
+}
+#endif
+
 /**
  * bio_iov_iter_get_pages - add user or kernel pages to a bio
  * @bio: bio to add pages to
@@ -1254,6 +1399,11 @@ int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter,
 		iov_iter_advance(iter, bio->bi_iter.bi_size);
 		return 0;
 	}
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (bio_subpage_iter(iter))
+		return bio_iov_iter_get_fragments(bio, iter, len_align_mask);
+#endif
 
 	if (iov_iter_extract_will_pin(iter))
 		bio_set_flag(bio, BIO_PAGE_PINNED);

@@ -267,6 +267,10 @@ struct bio {
 	struct bio_integrity_payload *bi_integrity; /* data integrity */
 #endif
 
+#ifdef CONFIG_MM_SUBPAGE
+	struct user_page_fragment *bi_user_fragments;
+	unsigned short bi_nr_user_fragments;
+#endif
 	unsigned short		bi_vcnt;	/* how many bio_vec's */
 
 	/*

@@ -4,6 +4,7 @@
 #include <linux/fs.h>
 #include <linux/file.h>
 #include <linux/mm.h>
+#include <linux/mm_subpage.h>
 #include <linux/slab.h>
 #include <linux/nospec.h>
 #include <linux/hugetlb.h>
@@ -762,6 +763,95 @@ bool io_check_coalesce_buffer(struct page **page_array, int nr_pages,
 	return true;
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+struct io_fragment_buffer {
+	unsigned int count;
+	struct user_page_fragment fragments[];
+};
+
+static void io_release_fragment_buffer(void *priv)
+{
+	struct io_fragment_buffer *buffer = priv;
+
+	release_user_fragments(buffer->fragments, buffer->count, false);
+	kvfree(buffer);
+}
+
+static struct io_rsrc_node *io_register_fragment_buffer(struct io_ring_ctx *ctx,
+						       struct iovec *iov)
+{
+	unsigned long size = mm_page_size(current->mm);
+	unsigned long first = (unsigned long)iov->iov_base & (size - 1);
+	unsigned int count = DIV_ROUND_UP(first + iov->iov_len, size);
+	struct io_fragment_buffer *buffer;
+	struct io_mapped_ubuf *imu = NULL;
+	struct io_rsrc_node *node;
+	unsigned long charged = 0;
+	unsigned int i;
+	struct xarray seen;
+	long nr;
+	int ret = -ENOMEM;
+
+	node = io_rsrc_node_alloc(ctx, IORING_RSRC_BUFFER);
+	if (!node)
+		return ERR_PTR(-ENOMEM);
+	buffer = kvmalloc(struct_size(buffer, fragments, count), GFP_KERNEL_ACCOUNT);
+	if (!buffer)
+		goto free_node;
+	buffer->count = 0;
+	nr = pin_user_fragments_remote(current->mm, (unsigned long)iov->iov_base,
+			iov->iov_len, FOLL_WRITE | FOLL_LONGTERM, buffer->fragments, count);
+	if (nr > 0)
+		buffer->count = nr;
+	if (nr != count) {
+		ret = nr < 0 ? nr : -EFAULT;
+		goto free_buffer;
+	}
+	imu = io_alloc_imu(ctx, count);
+	if (!imu)
+		goto free_buffer;
+	imu->nr_bvecs = count;
+	imu->acct_pages = 0;
+	/* Several user leaves can share native backing, including aliases. */
+	xa_init(&seen);
+	for (i = 0; i < count; i++) {
+		struct user_page_fragment *f = &buffer->fragments[i];
+
+		ret = xa_insert(&seen, folio_pfn(f->folio), xa_mk_value(1), GFP_KERNEL);
+		if (!ret)
+			charged += folio_nr_pages(f->folio);
+		else if (ret != -EBUSY)
+			break;
+		bvec_set_page(&imu->bvec[i], folio_page(f->folio, f->offset >> PAGE_SHIFT),
+			      f->length, offset_in_page(f->offset));
+	}
+	xa_destroy(&seen);
+	if (ret && ret != -EBUSY)
+		goto free_imu;
+	ret = io_account_mem(ctx->user, ctx->mm_account, charged);
+	if (ret)
+		goto free_imu;
+	imu->acct_pages = charged;
+	imu->ubuf = (unsigned long)iov->iov_base;
+	imu->len = iov->iov_len;
+	imu->folio_shift = mm_page_shift(current->mm);
+	imu->release = io_release_fragment_buffer;
+	imu->priv = buffer;
+	imu->flags = 0;
+	imu->dir = IO_IMU_DEST | IO_IMU_SOURCE;
+	refcount_set(&imu->refs, 1);
+	node->buf = imu;
+	return node;
+free_imu:
+	io_free_imu(ctx, imu);
+free_buffer:
+	io_release_fragment_buffer(buffer);
+free_node:
+	io_cache_free(&ctx->node_cache, node);
+	return ERR_PTR(ret);
+}
+#endif
+
 static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 						   struct iovec *iov,
 						   struct page **last_hpage)
@@ -786,6 +876,11 @@ static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 					 iov->iov_len);
 	if (ret)
 		return ERR_PTR(ret);
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(current->mm) < PAGE_SIZE)
+		return io_register_fragment_buffer(ctx, iov);
+#endif
 
 	node = io_rsrc_node_alloc(ctx, IORING_RSRC_BUFFER);
 	if (!node)
@@ -1095,6 +1190,14 @@ static int io_import_fixed(int ddir, struct iov_iter *iter,
 		bvec += seg_skip;
 		offset &= folio_mask;
 	}
+#ifdef CONFIG_MM_SUBPAGE
+	if (imu->folio_shift < PAGE_SHIFT) {
+		/* Physical fragment offsets are independent of the user address. */
+		size_t first = min_t(size_t, len, bvec->bv_len - offset);
+
+		nr_segs = 1 + DIV_ROUND_UP(len - first, 1UL << imu->folio_shift);
+	} else
+#endif
 	nr_segs = (offset + len + bvec->bv_offset + folio_mask) >> imu->folio_shift;
 	iov_iter_bvec(iter, ddir, bvec, nr_segs, len);
 	iter->iov_offset = offset;
@@ -1356,6 +1459,27 @@ static int io_vec_fill_bvec(int ddir, struct iov_iter *iter,
 			return -EOVERFLOW;
 
 		offset = buf_addr - imu->ubuf;
+#ifdef CONFIG_MM_SUBPAGE
+		if (imu->folio_shift < PAGE_SHIFT) {
+			unsigned int index;
+			unsigned long first = imu->ubuf & folio_mask;
+
+			offset += first;
+			index = offset >> imu->folio_shift;
+			offset &= folio_mask;
+			if (!index)
+				offset -= first;
+			src_bvec = imu->bvec + index;
+			for (; iov_len; offset = 0, bvec_idx++, src_bvec++) {
+				size_t bytes = min_t(size_t, iov_len, src_bvec->bv_len - offset);
+
+				bvec_set_page(&res_bvec[bvec_idx], src_bvec->bv_page,
+					      bytes, src_bvec->bv_offset + offset);
+				iov_len -= bytes;
+			}
+			continue;
+		}
+#endif
 		/*
 		 * Only the first bvec can have non zero bv_offset, account it
 		 * here and work with full folios below.
