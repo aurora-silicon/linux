@@ -129,7 +129,7 @@ impl Soc {
             dev_info!(dev, "M3 {}: missing {}\n", self.gpu_name, what);
             missing += 1;
         };
-        if self.images.is_empty() {
+        if !self.images.iter().any(|image| image.initdata_magic.is_some()) {
             note("the identity of the loaded GPU firmware image and its InitData version");
         }
         if self.firmware.is_none() {

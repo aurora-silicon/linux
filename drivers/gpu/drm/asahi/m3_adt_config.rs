@@ -314,12 +314,12 @@ pub(crate) fn constructed_version() -> Result<u64> {
 /// the loaded firmware expects.
 fn check_version(dev: &device::Device, firmware: &Firmware) -> Result {
     let version = constructed_version()?;
-    if version != firmware.image.initdata_magic {
+    if version != firmware.initdata_magic {
         dev_err!(
             dev,
             "M3: the constructed InitData version {:#x} is not the one the loaded firmware expects ({:#x})\n",
             version,
-            firmware.image.initdata_magic
+            firmware.initdata_magic
         );
         return Err(ENODEV);
     }
@@ -475,12 +475,12 @@ pub(crate) fn check_upload(
 ) -> Result {
     let mut bad = 0u32;
     let version = objects.get_mut(INITDATA).ok_or(EINVAL)?.read_u64(0)?;
-    if version != firmware.image.initdata_magic {
+    if version != firmware.initdata_magic {
         dev_err!(
             dev,
             "M3: InitData self-check: version {:#x}, the loaded firmware expects {:#x}\n",
             version,
-            firmware.image.initdata_magic
+            firmware.initdata_magic
         );
         bad += 1;
     }
@@ -608,7 +608,7 @@ fn build_images(
     // UAT description; the pointers are the constructed record's.
     type InitData = raw::InitDataG15V14_8_3<'static>;
     let mut root = zeroed(INITDATA)?;
-    write(&mut root, offset_of!(InitData, ver_info), &firmware.image.initdata_magic.to_le_bytes())?;
+    write(&mut root, offset_of!(InitData, ver_info), &firmware.initdata_magic.to_le_bytes())?;
     write(&mut root, offset_of!(InitData, unk_2c), &1u32.to_le_bytes())?;
     write(&mut root, offset_of!(InitData, uat_page_size), &0x4000u16.to_le_bytes())?;
     write(&mut root, offset_of!(InitData, uat_page_bits), &[14, 3])?;

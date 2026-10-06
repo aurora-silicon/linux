@@ -14,11 +14,6 @@ mod m3_init_storage;
 #[path = "../../drivers/gpu/drm/asahi/m3_thermal_policy.rs"]
 mod m3_thermal_policy;
 
-// Firmware layout tests need only the image-record type, without device access.
-mod m3_board {
-    #[derive(Debug)]
-    pub(crate) struct KnownImage;
-}
 use agx_resources as m3_resources;
 #[path = "../../drivers/gpu/drm/asahi/m3_firmware.rs"]
 mod m3_firmware;

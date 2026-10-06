@@ -442,79 +442,8 @@ pub(crate) fn has_pmp_link(pdev: &platform::Device<Core>) -> bool {
         .is_some_and(|node| node.get_property::<u32>(c_str!("apple,pmp")).is_ok())
 }
 
-/// A GPU firmware image the runtime can identify.
-#[derive(Debug)]
-pub(crate) struct KnownImage {
-    /// Human-readable identity, for logs.
-    pub(crate) name: &'static str,
-    uuid: Option<[u8; 16]>,
-    stkg_sha256: Option<[u8; 32]>,
-    /// The InitData magic (InitData+0) this firmware expects.
-    pub(crate) initdata_magic: u64,
-}
-
-/// T6030 GPU firmware images known to the M3 runtime. An image is accepted when every recorded
-/// identity (UUID, hash) matches.
-pub(crate) static KNOWN_IMAGES: [KnownImage; 2] = [
-    KnownImage {
-        name: "J514S RTKit-2419.140.12",
-        uuid: None,
-        stkg_sha256: Some(crate::m3_firmware::TEXT_SHA256),
-        initdata_magic: 0x0c08_e21e_8380_0490,
-    },
-    KnownImage {
-        name: "g15s build b0 (firmware 14.8.3) RTKit-2419.140.12",
-        uuid: Some([
-            0xdb, 0xf3, 0x7c, 0x40, 0xea, 0xd5, 0x37, 0x60, 0x94, 0x41, 0x99, 0x50, 0x18, 0x78, 0x29,
-            0x55,
-        ]),
-        stkg_sha256: None,
-        initdata_magic: 0x0c08_e21e_8380_0490,
-    },
-];
-
-/// T8122 C0, firmware-compat 14.8.3. Runtime identification compares the loaded UUID.
-pub(crate) static KNOWN_IMAGES_T8122: [KnownImage; 1] = [KnownImage {
-    name: "T8122 C0 firmware-compat 14.8.3",
-    uuid: Some([
-        0xdf, 0x69, 0x7f, 0x05, 0xf6, 0xb5, 0x33, 0xef, 0xa1, 0x37, 0x61, 0xc4, 0xa7, 0x3d, 0x66,
-        0x6a,
-    ]),
-    stkg_sha256: None,
-    initdata_magic: 0x0c08_e21e_8380_0490,
-}];
-
-const IMAGE_INFO_OFFSET: usize = 0x4200;
-/// Size of the identifying part of the image-info header.
-const IMAGE_INFO_SIZE: usize = 0x38;
-/// First word of the header: a branch over it (`b +0x44`).
-const IMAGE_INFO_BRANCH: u32 = 0x1400_0011;
-/// Header magic, "uuid".
-const IMAGE_INFO_MAGIC: u32 = 0x6469_7575;
-
-/// Parsed image-info header: UUID, patchbay offset and size, TEXT size.
-struct ImageInfo {
-    uuid: [u8; 16],
-    patchbay: core::ops::Range<usize>,
-    text_size: usize,
-}
-
-fn image_info(text: &[u8]) -> Option<ImageInfo> {
-    let hdr = text.get(IMAGE_INFO_OFFSET..IMAGE_INFO_OFFSET + IMAGE_INFO_SIZE)?;
-    let word = |i: usize| u32::from_le_bytes([hdr[i], hdr[i + 1], hdr[i + 2], hdr[i + 3]]);
-    if word(0) != IMAGE_INFO_BRANCH || word(4) != IMAGE_INFO_MAGIC || word(8) != 5 {
-        return None;
-    }
-    let mut uuid = [0u8; 16];
-    uuid.copy_from_slice(&hdr[0x14..0x24]);
-    let start = word(0x2c) as usize;
-    let end = start.checked_add(word(0x30) as usize)?;
-    Some(ImageInfo {
-        uuid,
-        patchbay: start..end,
-        text_size: word(0x34) as usize,
-    })
-}
+pub(crate) use crate::m3_firmware::{KnownImage, KNOWN_IMAGES, KNOWN_IMAGES_T8122};
+use crate::m3_firmware::image_info;
 
 fn sha256(data: &[u8]) -> [u8; 32] {
     let mut digest = [0u8; 32];
@@ -562,11 +491,7 @@ pub(crate) fn identify(
         as_str(&stkg_hex),
         if masked_sha256.is_some() { as_str(&masked_hex) } else { "n/a" }
     );
-    let image = images.iter().find(|image| {
-        (image.uuid.is_some() || image.stkg_sha256.is_some())
-            && image.uuid.map_or(true, |known| uuid == Some(known))
-            && image.stkg_sha256.map_or(true, |known| known == *stkg_sha256)
-    });
+    let image = images.iter().find(|image| image.accepts_runtime(uuid, stkg_sha256));
     match image {
         Some(image) => dev_info!(dev, "M3: GPU firmware identified as {}\n", image.name),
         None => dev_err!(dev, "M3: loaded GPU firmware is not a known image\n"),
