@@ -516,7 +516,9 @@ int dcp_attributes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
 	}
 	dcp->dimensions_generation = generation;
 	schedule_work(&dcp->dimensions_wq);
-	ext = backlight_control && !dcp_has_panel(dcp);
+	/* 14.7 swaps carry no external backlight level. */
+	ext = backlight_control && !dcp_has_panel(dcp) &&
+	      dcp->fw_compat != DCP_FIRMWARE_V_14_7;
 	if (ext != READ_ONCE(dcp->ext_backlight)) {
 		WRITE_ONCE(dcp->ext_backlight, ext);
 		if (dcp->connector)
