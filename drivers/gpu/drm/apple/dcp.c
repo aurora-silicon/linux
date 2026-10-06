@@ -690,6 +690,85 @@ void dcp_external_ready(struct apple_dcp *dcp)
 	}
 }
 
+#define DCP_EXTERNAL_RETRIES	3
+
+/*
+ * Bounded recovery for a native external pipe: re-apply the display mode,
+ * or redo the display link, up to DCP_EXTERNAL_RETRIES times per attached
+ * display, @base_ms, then twice and four times as long apart. A stopped
+ * firmware session cannot be recovered, and is not retried.
+ */
+void dcp_external_retry(struct apple_dcp *dcp, const char *why, int error,
+			unsigned int base_ms)
+{
+	unsigned int n, delay;
+
+	if (!dcp->external_native)
+		return;
+	if (iomfb_v14_7_external_failed(dcp)) {
+		dev_err(dcp->dev, "%s (%d): the external display processor stopped; no retry until reboot\n",
+			why, error);
+		return;
+	}
+	if (delayed_work_pending(&dcp->external_retry_wq)) {
+		dev_info(dcp->dev, "%s (%d): a retry is already queued\n", why, error);
+		return;
+	}
+	n = atomic_inc_return(&dcp->external_retries);
+	if (n > DCP_EXTERNAL_RETRIES) {
+		atomic_set(&dcp->external_retries, DCP_EXTERNAL_RETRIES);
+		dev_warn(dcp->dev, "%s (%d): no retry left after %u; replug the display\n",
+			 why, error, DCP_EXTERNAL_RETRIES);
+		return;
+	}
+	delay = base_ms << (n - 1);
+	dev_info(dcp->dev, "%s (%d): retry %u of %u in %u ms\n", why, error, n,
+		 DCP_EXTERNAL_RETRIES, delay);
+	mod_delayed_work(system_freezable_wq, &dcp->external_retry_wq, msecs_to_jiffies(delay));
+}
+
+void dcp_external_retry_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work), struct apple_dcp,
+					     external_retry_wq);
+	struct apple_connector *connector = READ_ONCE(dcp->connector);
+
+	if (iomfb_v14_7_external_failed(dcp)) {
+		dev_err(dcp->dev, "display retry: the external display processor stopped; no retry until reboot\n");
+		return;
+	}
+	/* Described again: re-apply the mode if it is not set. */
+	if (connector && READ_ONCE(connector->connected)) {
+		if (READ_ONCE(dcp->mode_state.valid)) {
+			dev_info(dcp->dev, "display retry: the display is back and set\n");
+			return;
+		}
+		dev_info(dcp->dev, "display retry: setting the display mode again\n");
+		dcp_mode_invalidate(&dcp->mode_state);
+		schedule_work(&connector->hotplug_wq);
+		return;
+	}
+	if (!READ_ONCE(dcp->typec_cable_connected)) {
+		dev_info(dcp->dev, "display retry: the port has no display any more\n");
+		return;
+	}
+	/*
+	 * The port holds a display that the firmware no longer describes:
+	 * release the link if it is still up, and connect it again, which
+	 * makes the firmware describe the display anew.
+	 */
+	dev_info(dcp->dev, "display retry: reconnecting the display link\n");
+	if (READ_ONCE(dcp->dptxport[0].enabled) && READ_ONCE(dcp->dptxport[0].connected)) {
+		int ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
+
+		if (ret)
+			dev_warn(dcp->dev, "display retry: HPD deassert failed: %d\n", ret);
+		dcp_dptx_disconnect(dcp, 0);
+	}
+	dcp->typec_reconnect_tries = 0;
+	dcp_queue_typec_reconnect(dcp, 0);
+}
+
 int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 {
 	struct dcp_fabric_session session;
@@ -861,6 +940,9 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 		dcp->typec_reconnect_tries = 0;
 		dcp->placeholder_retried = false;
 		cancel_delayed_work(&dcp->typec_reconnect_wq);
+		/* A newly attached display gets its own retries. */
+		if (dcp->external_native)
+			atomic_set(&dcp->external_retries, 0);
 	}
 
 	ret = dcp_dptx_connect(dcp, port);
@@ -1201,6 +1283,7 @@ void dcp_poweroff(struct platform_device *pdev)
 	_dcp_poweroff(dcp);
 
 	if (dcp_is_typec_output(dcp)) {
+		ret = 0;
 		/* DCP owns a synthetic HPD for Type-C. Release it with the CRTC. */
 		if (dcp->dptxport[0].enabled && dcp->dptxport[0].connected) {
 			ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
@@ -1209,6 +1292,17 @@ void dcp_poweroff(struct platform_device *pdev)
 					 "failed to deassert Type-C DPTX HPD: %d\n", ret);
 			dcp_dptx_disconnect(dcp, 0);
 		}
+		/*
+		 * A native external pipe whose display is no longer described
+		 * (it went away during a hotplug bounce) is powered off by the
+		 * desktop for good: with HPD still high, connect the link again
+		 * so that the firmware describes the display anew.
+		 */
+		if (dcp->external_native && READ_ONCE(dcp->typec_cable_connected) &&
+		    (ret || !dcp->connector || !READ_ONCE(dcp->connector->connected)))
+			dcp_external_retry(dcp, ret ? "display link released with an HPD error" :
+					   "display link released with no display described",
+					   ret, 500);
 	} else if (dcp->hdmi_hpd) {
 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
 		if (!connected) {
@@ -1615,6 +1709,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		if (dcp->external_native) {
 			enable_work(&dcp->vblank_wq);
 			enable_delayed_work(&dcp->swap_watchdog_wq);
+			enable_delayed_work(&dcp->external_retry_wq);
 			enable_work(&dcp->dimensions_wq);
 			dcp_enable_typec_work(dcp);
 			return 0;
@@ -1688,6 +1783,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
 		if (dcp->external_native) {
 			dcp_disable_typec_work(dcp, true);
+			disable_delayed_work_sync(&dcp->external_retry_wq);
 			disable_delayed_work_sync(&dcp->swap_watchdog_wq);
 			disable_work_sync(&dcp->vblank_wq);
 		}

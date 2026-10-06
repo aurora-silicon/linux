@@ -159,6 +159,9 @@ struct apple_dcp {
 	struct work_struct external_ready_work;
 	/* Native: the firmware's start state, see iomfb_v14_7.c. */
 	unsigned int external_phase;
+	/* Native: bounded recovery of a display link or mode, see dcp.c. */
+	struct delayed_work external_retry_wq;
+	atomic_t external_retries;
 	atomic_t external_requested;
 
 	/* DCP_FIRMWARE_V_14_7 state; outlives this device once RTKit runs. */
