@@ -626,6 +626,9 @@ struct atcphy_mode_configuration {
  * @dp_t8122: DisplayPort runs the T8122 AUX, AUSPLL and lane sequences
  * @park_pipe_unlocked: Park the PIPE without the lock handshake once the USB
  *                      controller has stopped and no longer clocks the PIPE
+ * @park_dummy_phy: Enable the dummy PIPE backend whenever the PIPE is parked on
+ *                  it; the lock handshake that starts the next PIPE change is
+ *                  only acknowledged while it runs
  */
 struct atcphy_hw {
 	enum atcphy_generation gen;
@@ -636,6 +639,7 @@ struct atcphy_hw {
 	bool optional_tunables;
 	bool dp_t8122;
 	bool park_pipe_unlocked;
+	bool park_dummy_phy;
 };
 
 /**
@@ -1371,11 +1375,22 @@ static int atcphy_configure_pipehandler_usb4(struct apple_atcphy *atcphy)
  * PIPE unless the dummy PHY behind the mux is enabled as well; selecting the
  * dummy backend in PIPEHANDLER_MUX_CTRL is not enough. The earlier SoCs come
  * up and run USB2-only with the bit clear, so they are left alone.
+ *
+ * T8122 PHYs come out of boot with the bit set, and the PIPE lock handshake
+ * that starts the routing to USB3 is only acknowledged while it is: once the
+ * bit is clear (it resets to clear with the PHY's power domain), the next USB3
+ * start times out with "Pipehandler lock not acked". These PHYs keep it set
+ * on every park, see park_dummy_phy.
  */
 static void atcphy_enable_dummy_phy(struct apple_atcphy *atcphy)
 {
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
 	      PIPEHANDLER_DUMMY_PHY_EN);
+}
+
+static bool atcphy_needs_dummy_phy(struct apple_atcphy *atcphy)
+{
+	return !atcphy->hw->has_usb4 || atcphy->hw->park_dummy_phy;
 }
 
 static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy, bool lock)
@@ -1412,7 +1427,7 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy, bool 
 	       PIPEHANDLER_NATIVE_POWER_DOWN, FIELD_PREP(PIPEHANDLER_NATIVE_POWER_DOWN, 2));
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
 	      PIPEHANDLER_NATIVE_RESET);
-	if (!atcphy->hw->has_usb4)
+	if (atcphy_needs_dummy_phy(atcphy))
 		atcphy_enable_dummy_phy(atcphy);
 
 	return 0;
@@ -1491,7 +1506,7 @@ static void atcphy_setup_pipehandler(struct apple_atcphy *atcphy)
 	atcphy_pipehandler_set_mux(atcphy, PIPEHANDLER_MUX_CTRL_DATA_DUMMY,
 				   PIPEHANDLER_MUX_CTRL_CLK_DUMMY);
 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
-	if (!atcphy->hw->has_usb4)
+	if (atcphy_needs_dummy_phy(atcphy))
 		atcphy_enable_dummy_phy(atcphy);
 }
 
@@ -4010,6 +4025,7 @@ static const struct atcphy_hw atcphy_hw_t8122 = {
 	.has_usb4 = true,
 	.dp_t8122 = true,
 	.park_pipe_unlocked = true,
+	.park_dummy_phy = true,
 };
 
 static const struct atcphy_hw atcphy_hw_t8140 = {
