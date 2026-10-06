@@ -9,7 +9,8 @@ override (AURORA_RELEASE_URL, AURORA_RELEASES_API): the default is the
 release's own tag, only a plain file://, http:// or https:// URL is taken,
 a staged copy is named once at the start and installs through the same
 download and checksum loop, and the commands an install prints name the
-public release. PublicDownloadTest keeps the public release's own message
+public release. Only a newer release number is named, and under an override
+with no command to run. PublicDownloadTest keeps the public release's own message
 for a missing file. UpgradeTest runs 11.38's own script on the fake Mac of
 test_m3_flow, then this one, as an owner updating would.
 """
@@ -109,6 +110,15 @@ class RealM1n1PackageTest(unittest.TestCase):
 TAG = re.search(r"^TAG=(\S+)$", SRC, re.M).group(1)
 DEFAULT_RELEASE_URL = f"https://github.com/iconidentify/aurora-linux/releases/download/{TAG}"
 DEFAULT_RELEASES_API = "https://api.github.com/repos/iconidentify/aurora-linux/releases"
+LATEST_URL = re.search(r"^LATEST_URL=(\S+)$", SRC, re.M).group(1)
+# sep-<kernel version>-<release>: the release number orders releases, whatever
+# the kernel version.
+_kernel, _major, _minor = re.match(r"sep-([^-]+)-(\d+)\.(\d+)", TAG).groups()
+_major, _minor = int(_major), int(_minor)
+NEWER_TAGS = (f"{TAG}.1", f"sep-{_kernel}-{_major}.{_minor + 1}", f"sep-{_kernel}-{_major + 1}.0",
+              f"sep-1.0.0.aurora1-{_major + 1}.0")
+OLDER_TAGS = (TAG, f"sep-{_kernel}-{_major - 1}.38", f"sep-{_kernel}-{_major - 1}.36.1",
+              f"sep-{_kernel}-{_major - 1}.9", f"sep-99.0.0.aurora9-{_major - 1}.99", "sep-latest")
 OVERRIDES = ("AURORA_RELEASE_URL", "AURORA_RELEASES_API")
 # Values release_source refuses: curl options, no or another scheme, spaces,
 # control characters and bytes outside printable ASCII.
@@ -223,6 +233,70 @@ class ReleaseUrlTest(unittest.TestCase):
                     latest.write_bytes(b'{"tag_name": "' + tag + b'"}')
                     proc = sourced("newer_release", AURORA_RELEASES_API=api)
                     self.assertEqual((proc.returncode, proc.stdout), (0, ""), proc.stderr)
+
+    def api(self, d, tag):
+        (Path(d) / "latest").write_text('{"tag_name": "%s"}' % tag)
+        return Path(d).as_uri()
+
+    def test_only_a_newer_release_is_named(self):
+        if not shutil.which("curl"):
+            self.skipTest("curl is needed")
+        with tempfile.TemporaryDirectory() as d:
+            for tag, newer in [(t, True) for t in NEWER_TAGS] + [(t, False) for t in OLDER_TAGS]:
+                with self.subTest(tag=tag):
+                    proc = sourced("newer_release", AURORA_RELEASES_API=self.api(d, tag))
+                    self.assertEqual(proc.stdout.strip(), tag if newer else "", proc.stderr)
+
+    def notice(self, d, tag, override):
+        api = self.api(d, tag)
+        if override:
+            return sourced("version_notice", AURORA_RELEASES_API=api)
+        # The public check, read from the same file.
+        return sourced(f"RELEASES_API={api}; PUBLIC_RELEASES_API={api}; version_notice")
+
+    def test_version_notice(self):
+        if not shutil.which("curl"):
+            self.skipTest("curl is needed")
+        newer, older = NEWER_TAGS[-2], OLDER_TAGS[1]
+        with tempfile.TemporaryDirectory() as d:
+            # The public script: a newer release points at the current script.
+            proc = self.notice(d, newer, override=False)
+            self.assertIn(f"this script installs {TAG}, but {newer} is published", proc.stderr)
+            self.assertIn(f"curl -fsSL {LATEST_URL} | bash", proc.stderr)
+            # An older or the same one is not named.
+            for tag in (older, TAG):
+                proc = self.notice(d, tag, override=False)
+                self.assertEqual(proc.stderr, "")
+                self.assertIn(f"{TAG} is the current release", proc.stdout)
+            # An override: a newer release is named, with no command to run.
+            proc = self.notice(d, newer, override=True)
+            self.assertIn(f"{newer} is newer than {TAG}, which this script installs", proc.stderr)
+            self.assertNotIn("curl", proc.stderr)
+            self.assertNotIn("saved copy", proc.stderr)
+            self.assertNotIn("current release", proc.stdout)
+            # An older one: nothing at all.
+            proc = self.notice(d, older, override=True)
+            self.assertEqual((proc.stdout, proc.stderr), ("", ""))
+
+    def agent_prompt(self, **env_extra):
+        env = {k: v for k, v in os.environ.items() if k not in OVERRIDES}
+        env.update(env_extra)
+        return subprocess.run(["bash", str(flow.INSTALLER), "--agent-prompt"],
+                              capture_output=True, text=True, env=env)
+
+    def test_agent_prompt_notice(self):
+        if not shutil.which("curl"):
+            self.skipTest("curl is needed")
+        newer, older = NEWER_TAGS[-2], OLDER_TAGS[1]
+        with tempfile.TemporaryDirectory() as d:
+            proc = self.agent_prompt(AURORA_RELEASES_API=self.api(d, newer))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(f"{newer} is newer than {TAG}, which this plan is for", proc.stderr)
+            self.assertNotIn("current release", proc.stderr)
+            proc = self.agent_prompt(AURORA_RELEASE_URL="file:///srv/stage", AURORA_RELEASES_API=self.api(d, older))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertNotIn(older, proc.stdout + proc.stderr)
+            self.assertNotIn("newer", proc.stderr)
 
     def test_agent_prompt_refuses_a_bad_value(self):
         env = {k: v for k, v in os.environ.items() if k not in OVERRIDES}

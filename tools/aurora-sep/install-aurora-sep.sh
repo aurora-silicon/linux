@@ -222,6 +222,11 @@ override_ok() {
   [[ $1 != -* && $1 =~ ^(file|https?)://. && $1 != *[![:graph:]]* ]]
 }
 
+# True when either override points away from the public release.
+release_overridden() {
+  [[ $RELEASE_URL != "$PUBLIC_RELEASE_URL" || $RELEASES_API != "$PUBLIC_RELEASES_API" ]]
+}
+
 # Checked before the first download or release lookup that uses them. A run
 # from a staging or mirror copy says so once, at the start.
 release_source() {
@@ -232,14 +237,14 @@ release_source() {
     control characters (percent-encode anything outside printable ASCII).
     Unset it to use the public release. Nothing was installed."
   done
-  if [[ $RELEASE_URL != "$PUBLIC_RELEASE_URL" && $RELEASES_API != "$PUBLIC_RELEASES_API" ]]; then
+  if ! release_overridden; then
+    return 0
+  elif [[ $RELEASE_URL != "$PUBLIC_RELEASE_URL" && $RELEASES_API != "$PUBLIC_RELEASES_API" ]]; then
     shown="$RELEASE_URL (release list $RELEASES_API)"
   elif [[ $RELEASE_URL != "$PUBLIC_RELEASE_URL" ]]; then
     shown=$RELEASE_URL
-  elif [[ $RELEASES_API != "$PUBLIC_RELEASES_API" ]]; then
-    shown="release list $RELEASES_API"
   else
-    return 0
+    shown="release list $RELEASES_API"
   fi
   say "Using a staging/mirror copy: $shown; checksums are still verified"
 }
@@ -252,7 +257,7 @@ newer_release() {
   # network, GitHub rate-limits, or the response is not what we expect, and
   # whether set -e acts on that inside a command substitution is subtle enough
   # that it should not be left to chance in a script that runs as root.
-  local seen=""
+  local seen="" mine theirs
   # Ask for the release marked Latest. Listing all releases is not ordered by
   # version: they share a commit, so GitHub falls back to comparing tag names
   # as text, and 11.9 sorts above 11.10. Only letters, digits, '.', '_' and
@@ -261,20 +266,41 @@ newer_release() {
   seen=$(curl -fsSL --max-time 8 "$RELEASES_API/latest" 2>/dev/null |
     LC_ALL=C grep -o '"tag_name"[[:space:]]*:[[:space:]]*"sep-[A-Za-z0-9._-]*"' |
     head -1 | sed 's/.*"\(sep-[A-Za-z0-9._-]*\)"$/\1/') || true
-  [[ -n $seen && $seen != "$TAG" ]] && echo "$seen"
+  # Only a higher release number counts, the part after the kernel version
+  # (sep-7.1.12.aurora2-12.0 is 12.0): a release staged before it is marked
+  # Latest must not be pointed at the older one.
+  mine=${TAG#sep-*-} theirs=${seen#sep-*-}
+  [[ $theirs == [0-9]* && $theirs != "$mine" &&
+    $(printf '%s\n' "$mine" "$theirs" | sort -V | tail -1) == "$theirs" ]] && echo "$seen"
   return 0
 }
 
+# A staging or mirror run names a newer release but points at nothing: the
+# public script is not what it is testing.
 version_notice() {
   local seen
   seen=$(newer_release)
-  if [[ -n $seen ]]; then
+  if [[ -n $seen ]] && release_overridden; then
+    warn "$seen is newer than $TAG, which this script installs"
+  elif [[ -n $seen ]]; then
     warn "this script installs $TAG, but $seen is published.
     You are probably running a saved copy. The current one:
       curl -fsSL $LATEST_URL | bash"
-  else
+  elif ! release_overridden; then
     say "$TAG is the current release"
   fi
+}
+
+# The same check for --agent-prompt, on stderr only.
+prompt_notice() {
+  local seen
+  seen=$(newer_release)
+  if [[ -n $seen ]] && release_overridden; then
+    warn "$seen is newer than $TAG, which this plan is for"
+  elif [[ -n $seen ]]; then
+    warn "the current release is $seen; this plan is for $TAG"
+  fi
+  return 0
 }
 
 boot_chain() {
@@ -2503,6 +2529,6 @@ case ${1:-} in
   --uninstall) uninstall_all ;;
   --reset-touchid) shift; reset_touchid "$@" ;;
   --m3-report) m3_report ;;
-  --agent-prompt) release_source >&2; t=$(newer_release); [[ -n $t ]] && warn "the current release is $t; this plan is for $TAG"; agent_prompt ;;
+  --agent-prompt) release_source >&2; prompt_notice; agent_prompt ;;
   *) die "unknown option $1 (--read-only, --uninstall, --reset-touchid, --agent-prompt, --m3-report or --m3-handoff)" ;;
 esac
