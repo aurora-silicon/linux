@@ -1285,6 +1285,11 @@ static int atcphy_configure_pipehandler_usb3(struct apple_atcphy *atcphy, bool h
 			atcphy_configure_pipehandler_usb3_host_t8103(atcphy);
 		else
 			atcphy_configure_pipehandler_usb3_host_t8122(atcphy);
+		if (atcphy->hw->dp_t8122)
+			dev_dbg(atcphy->dev, "USB3 host BIST done: status2=%08x ov1=%08x ov2=%08x\n",
+				readl(atcphy->regs.core + ACIOPHY_BIST_MAC_USBPHY_STATUS2),
+				readl(atcphy->regs.core + ACIOPHY_BIST_MAC_USBPHY_CFG_OV1),
+				readl(atcphy->regs.core + ACIOPHY_BIST_MAC_USBPHY_CFG_OV2));
 	}
 
 	/* Configure PIPE mux to USB3 PHY */
@@ -1421,6 +1426,8 @@ static int atcphy_configure_pipehandler(struct apple_atcphy *atcphy, bool host)
 		ret = atcphy_configure_pipehandler_dummy(atcphy, true);
 		break;
 	}
+	dev_dbg(atcphy->dev, "PIPE %d -> %d (mode %d, host %d): %d\n", atcphy->pipe_state,
+		state, atcphy->mode, host, ret);
 	atcphy->pipe_state = state;
 
 	return ret;
@@ -3032,6 +3039,16 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	if (atcphy->hw->dp_t8122 && atcphy_modes[mode].enable_dp_aux)
 		atcphy_dp_aux_on_t8122(atcphy);
 
+	if (atcphy->hw->dp_t8122)
+		dev_dbg(atcphy->dev,
+			"mode %d swapped %d: lanes=%08x xbar=%08x misc=%08x power=%08x rcal=%08x\n",
+			mode, atcphy->swap_lanes,
+			readl(atcphy->regs.core + atcphy->hw->aciophy_lane_mode),
+			readl(atcphy->regs.core + atcphy->hw->aciophy_crossbar),
+			readl(atcphy->regs.core + ATCPHY_MISC),
+			readl(atcphy->regs.core + ATCPHY_POWER_STAT),
+			readl(atcphy->regs.core + AUS_COMMON_DIG_RCAL1));
+
 	return 0;
 }
 
@@ -3446,6 +3463,8 @@ static int atcphy_sw_set(struct typec_switch_dev *sw, enum typec_orientation ori
 		atcphy->swap_lanes = true;
 		break;
 	}
+	dev_dbg(atcphy->dev, "orientation %d, lanes swapped %d\n", orientation,
+		atcphy->swap_lanes);
 
 	return 0;
 }
