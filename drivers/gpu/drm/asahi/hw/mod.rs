@@ -17,6 +17,7 @@ pub(crate) mod t602x;
 pub(crate) mod t6030;
 pub(crate) mod t8103;
 pub(crate) mod t8112;
+pub(crate) mod t8122;
 
 /// GPU revision enumeration. Note: Part of the UABI.
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -57,7 +58,7 @@ pub(crate) enum GpuCore {
     // G15M = 19,
     // G15P_AGX2 = 20,
     // G15P = 21,
-    // G15G = 22,
+    G15G = 22,
     G15S = 23,
     // G15C = 24,
 }

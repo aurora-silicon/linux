@@ -250,8 +250,9 @@ pub(crate) static T6030: Soc = Soc {
 /// The compatibles, the mailbox and its interrupts are the T8122 device tree's. The identity is
 /// the one the T8122 identity gate admits (`t8122_admission`: family 7, variant 2, revision 0x20,
 /// core slots in the first core-mask word only), with the die count of the AGX3 identification
-/// table (`hw::agx3::T8122`). Power configuration comes from the boot loader. The runtime
-/// rejects the incomplete hardware configuration before accessing the GPU.
+/// table (`hw::agx3::T8122`). The hardware configuration is `hw::t8122`; power configuration
+/// comes from the boot loader. The runtime rejects the SoC while the rest of its configuration is
+/// missing, before accessing the GPU.
 pub(crate) static T8122: Soc = Soc {
     name: "T8122",
     gpu_name: "G15G",
@@ -287,7 +288,7 @@ pub(crate) static T8122: Soc = Soc {
     },
     images: &crate::m3_board::KNOWN_IMAGES_T8122,
     firmware: Some(&crate::m3_firmware::T8122_LAYOUT),
-    hwcfg: None,
+    hwcfg: Some(&hw::t8122::HWCONFIG_T8122),
     io_mappings: None,
     iomaps: None,
     // The boot loader's ladder from this machine's ADT (J613: eight voltages, up to 1338 MHz).
