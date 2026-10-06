@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/mm.h>
+#include <linux/mm_subpage.h>
 #include <linux/mmzone.h>
 #include <linux/memblock.h>
 #include <linux/page_ext.h>
@@ -78,6 +79,9 @@ static struct page_ext_operations page_idle_ops __initdata = {
 #endif
 
 static struct page_ext_operations *page_ext_ops[] __initdata = {
+#ifdef CONFIG_MM_SUBPAGE
+	&mm_subpage_ext_ops,
+#endif
 #ifdef CONFIG_PAGE_OWNER
 	&page_owner_ops,
 #endif
