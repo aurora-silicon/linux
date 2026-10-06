@@ -224,9 +224,12 @@ out:
 	mutex_unlock(&link->lock);
 }
 
-/* Places a call packet (header, input, zeroed output) and sends it. */
+/*
+ * Places a call packet (header, input, zeroed output) and sends it. A nested
+ * call goes out on the stream of @parent, the callback its caller handles.
+ */
 static int link_submit(struct dcp_v14_link *link, const struct apple_dcp_link_rpc_header *rpc,
-		       u32 size, bool nested)
+		       u32 size, bool nested, u64 parent)
 {
 	struct apple_dcp_link_stream_layout layout;
 	u32 total, offset = 0, input_size, output_size;
@@ -245,7 +248,7 @@ static int link_submit(struct dcp_v14_link *link, const struct apple_dcp_link_rp
 		goto out;
 	}
 	if (nested) {
-		u64 callback = link->callbacks[link->callback_count - 1].message;
+		u64 callback = parent;
 
 		if (apple_dcp_link_message_stream(callback)) {
 			ret = -EOPNOTSUPP;
@@ -289,10 +292,14 @@ out:
 	return ret;
 }
 
-/* Writes the innermost callback's output in place and acknowledges it. */
+/*
+ * Writes a callback's output in place and acknowledges it. Usually that is
+ * the innermost callback; one from another firmware thread may still be
+ * waiting below it, and is answered in its turn.
+ */
 static int link_reply(struct dcp_v14_link *link, u64 message, const void *output, u32 size)
 {
-	unsigned int top;
+	unsigned int i;
 	int ret = -EINVAL;
 
 	mutex_lock(&link->lock);
@@ -300,19 +307,26 @@ static int link_reply(struct dcp_v14_link *link, u64 message, const void *output
 		ret = -EIO;
 		goto out;
 	}
-	if (!link->callback_count)
+	for (i = link->callback_count; i > 0; i--)
+		if (link->callbacks[i - 1].message == message)
+			break;
+	if (!i || size != link->callbacks[i - 1].size) {
+		dev_err(link->dev, "reply to callback %#llx of %u bytes matches none of %u waiting\n",
+			message, size, link->callback_count);
 		goto out;
-	top = link->callback_count - 1;
-	if (message != link->callbacks[top].message || size != link->callbacks[top].size)
-		goto out;
-	memcpy(link->callbacks[top].output, output, size);
+	}
+	i--;
+	memcpy(link->callbacks[i].output, output, size);
 	dma_wmb();
 	ret = apple_rtkit_send_message(link->rtk, APPLE_DCP_LINK_ENDPOINT,
 				       apple_dcp_link_rpc_reply(message), NULL, false);
-	if (ret)
+	if (ret) {
 		link_fail(link);
-	else
+	} else {
 		link->callback_count--;
+		memmove(&link->callbacks[i], &link->callbacks[i + 1],
+			(link->callback_count - i) * sizeof(link->callbacks[0]));
+	}
 out:
 	mutex_unlock(&link->lock);
 	return ret;
@@ -354,11 +368,15 @@ static int link_callback(struct dcp_v14_link *link, struct dcp_v14_event *e,
 	if (in > e->size - sizeof(*h) || out != e->size - sizeof(*h) - in)
 		return -EPROTO;
 	memset(e->data + sizeof(*h) + in, 0, out);
-	link->callback_depth++;
+	if (link->callback_depth >= DCP_V14_LINK_MAX_CALLBACKS)
+		return -EPROTO;
+	link->handling[link->callback_depth++] = e->message;
 	ret = callback(cookie, tag, h + 1, in, e->data + sizeof(*h) + in, out);
 	link->callback_depth--;
-	if (ret)
+	if (ret) {
+		dev_err(link->dev, "callback %#x (%u/%u bytes) failed: %d\n", tag, in, out, ret);
 		return ret;
+	}
 	if (tag == DCP_V14_TAG_D589 && in == DCP_V14_D589_IN_SIZE && completed)
 		*completed = get_unaligned_le32(h + 1);
 	return link_reply(link, e->message, e->data + sizeof(*h) + in, out);
@@ -390,7 +408,7 @@ int dcp_v14_link_call(struct dcp_v14_link *link, u32 tag, const void *input,
 {
 	struct apple_dcp_link_rpc_header *packet;
 	unsigned long deadline = jiffies + DCP_V14_CALL_TIMEOUT;
-	u64 expected = APPLE_DCP_LINK_MSG_RPC_REPLY;
+	u64 expected = APPLE_DCP_LINK_MSG_RPC_REPLY, parent = 0;
 	u32 size, completed = 0;
 	bool nested, replied = false;
 	int ret;
@@ -431,12 +449,13 @@ retry:
 		kfree(packet);
 		return -EPROTO;
 	}
-	/* The reply to a nested call carries the callback's side. */
-	if (nested)
-		expected |= link->callbacks[link->callback_count - 1].message &
-			    APPLE_DCP_LINK_MSG_REMOTE;
+	/* The reply to a nested call carries the side of the callback handled. */
+	if (nested) {
+		parent = link->handling[link->callback_depth - 1];
+		expected |= parent & APPLE_DCP_LINK_MSG_REMOTE;
+	}
 	mutex_unlock(&link->lock);
-	ret = link_submit(link, packet, size, nested);
+	ret = link_submit(link, packet, size, nested, parent);
 	/* A callback arrived between the drain and the submit. */
 	if (ret == -EBUSY && !nested && time_before(jiffies, deadline))
 		goto retry;

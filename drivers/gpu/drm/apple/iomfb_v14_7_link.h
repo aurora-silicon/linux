@@ -59,13 +59,20 @@ struct dcp_v14_link {
 		struct apple_dcp_link_rpc_header header;
 	} calls[2];
 
-	/* Firmware callbacks awaiting a reply, innermost last. */
+	/*
+	 * Firmware callbacks awaiting a reply, in arrival order. Callbacks
+	 * from separate firmware threads can be outstanding at once and are
+	 * answered in the order they are handled, not necessarily the last
+	 * one first.
+	 */
 	struct {
 		u64 message;
 		void *output;
 		u32 size;
 		u32 call;
 	} callbacks[DCP_V14_LINK_MAX_CALLBACKS];
+	/* The callback each running handler answers, innermost last. */
+	u64 handling[DCP_V14_LINK_MAX_CALLBACKS];
 };
 
 void dcp_v14_link_init(struct dcp_v14_link *link, struct device *dev,
