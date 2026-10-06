@@ -122,11 +122,25 @@ static bool dcp_typec_route_fixed_output_busy(struct apple_dcp_typec_route *rout
 				     gpiod_get_value_cansleep(dcp->hdmi_hpd));
 }
 
+/*
+ * A pipeline that can take no Type-C display: its fixed output is live, or
+ * it is a T6030 external processor that failed (handoff check, start, or a
+ * stopped session), which drives nothing until reboot. Planned around and
+ * passed over like a busy one, so that a healthy pipeline takes the port.
+ */
+static bool dcp_typec_route_busy(struct apple_dcp_typec_route *route)
+{
+	struct apple_dcp *dcp = route->dcp;
+
+	return dcp_typec_route_fixed_output_busy(route) ||
+	       (dcp->external_native && iomfb_v14_7_external_failed(dcp));
+}
+
 static bool dcp_typec_route_available(struct apple_dcp_typec_route *route)
 {
 	struct dcp_fabric_pipeline pipeline = {
 		.owned = !!route->dcp->active_typec_route || route->dcp->tb_retiring,
-		.fixed_busy = dcp_typec_route_fixed_output_busy(route),
+		.fixed_busy = dcp_typec_route_busy(route),
 	};
 
 	struct dcp_fabric_policy policy = { .dual_stream = dcp_typec_dual_stream() };
@@ -774,7 +788,7 @@ static void dcp_fabric_snapshot_port(struct apple_dcp_typec_port *port,
 		pipeline->crtc_index =
 			dcp->crtc ? drm_crtc_index(&dcp->crtc->base) : 0;
 		pipeline->has_fixed = !!dcp->fixed_phy;
-		pipeline->fixed_busy = dcp_typec_route_fixed_output_busy(route);
+		pipeline->fixed_busy = dcp_typec_route_busy(route);
 		pipeline->owned = !!dcp->active_typec_route || dcp->tb_retiring;
 		pipeline->tunnel_held = dcp_typec_tunnel_held(dcp);
 		pipeline->presence = dcp_hdmi_presence(dcp);
