@@ -56,8 +56,17 @@ T603X_USB4_GRAPH(2);
 	ports {
 		port@3 {
 			reg = <3>;
-			typec0_dcpext: endpoint {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec0_dcpext: endpoint@0 {
+				reg = <0>;
 				remote-endpoint = <&dcpext_typec0>;
+			};
+
+			typec0_dcpext1: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext1_typec0>;
 			};
 		};
 	};
@@ -67,8 +76,17 @@ T603X_USB4_GRAPH(2);
 	ports {
 		port@3 {
 			reg = <3>;
-			typec1_dcpext: endpoint {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec1_dcpext: endpoint@0 {
+				reg = <0>;
 				remote-endpoint = <&dcpext_typec1>;
+			};
+
+			typec1_dcpext1: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext1_typec1>;
 			};
 		};
 	};
@@ -78,8 +96,17 @@ T603X_USB4_GRAPH(2);
 	ports {
 		port@3 {
 			reg = <3>;
-			typec2_dcpext: endpoint {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec2_dcpext: endpoint@0 {
+				reg = <0>;
 				remote-endpoint = <&dcpext_typec2>;
+			};
+
+			typec2_dcpext1: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext1_typec2>;
 			};
 		};
 	};
