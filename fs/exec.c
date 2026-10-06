@@ -28,6 +28,7 @@
 #include <linux/file.h>
 #include <linux/fdtable.h>
 #include <linux/mm.h>
+#include <linux/mm_subpage.h>
 #include <linux/stat.h>
 #include <linux/fcntl.h>
 #include <linux/futex.h>
@@ -122,6 +123,54 @@ bool path_noexec(const struct path *path)
 	       (path->mnt->mnt_sb->s_iflags & SB_I_NOEXEC);
 }
 
+/* A temporary argument mapping owns one native page or an exact subpage slot. */
+struct arg_page {
+	struct page *page;
+#ifdef CONFIG_MM_SUBPAGE
+	struct mm_subpage *subpage;
+	unsigned int offset;
+#endif
+};
+
+static unsigned long bprm_page_size(const struct linux_binprm *bprm)
+{
+#ifdef CONFIG_MMU
+	return mm_page_size(bprm->mm);
+#else
+	return PAGE_SIZE;
+#endif
+}
+
+/* kmap_local_page() maps one native page, even for a larger user leaf. */
+static unsigned long bprm_copy_size(const struct linux_binprm *bprm)
+{
+	return min(bprm_page_size(bprm), PAGE_SIZE);
+}
+
+static unsigned long bprm_copy_mask(const struct linux_binprm *bprm)
+{
+	return ~(bprm_copy_size(bprm) - 1);
+}
+
+static unsigned long bprm_max_arg_strlen(const struct linux_binprm *bprm)
+{
+	return (MAX_ARG_STRLEN / PAGE_SIZE) * bprm_page_size(bprm);
+}
+
+static unsigned int arg_page_offset(struct arg_page page)
+{
+#ifdef CONFIG_MM_SUBPAGE
+	return page.offset;
+#else
+	return 0;
+#endif
+}
+
+static void *map_arg_page(struct arg_page page)
+{
+	return kmap_local_page(page.page) + arg_page_offset(page);
+}
+
 #ifdef CONFIG_MMU
 /*
  * The nascent bprm->mm is not visible until exec_mmap() but it can
@@ -141,10 +190,10 @@ static void acct_arg_size(struct linux_binprm *bprm, unsigned long pages)
 	add_mm_counter(mm, MM_ANONPAGES, diff);
 }
 
-static struct page *get_arg_page(struct linux_binprm *bprm, unsigned long pos,
+static struct arg_page get_arg_page(struct linux_binprm *bprm, unsigned long pos,
 		int write)
 {
-	struct page *page;
+	struct arg_page page = {};
 	struct vm_area_struct *vma = bprm->vma;
 	struct mm_struct *mm = bprm->mm;
 	int ret;
@@ -155,28 +204,47 @@ static struct page *get_arg_page(struct linux_binprm *bprm, unsigned long pos,
 	 * ahead of time.
 	 */
 	if (!mmap_read_lock_maybe_expand(mm, vma, pos, write))
-		return NULL;
+		return page;
 
 	/*
 	 * We are doing an exec().  'current' is the process
 	 * doing the exec and 'mm' is the new process's mm.
 	 */
-	ret = get_user_pages_remote(mm, pos, 1,
-			write ? FOLL_WRITE : 0,
-			&page, NULL);
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(mm) != PAGE_SIZE) {
+		struct user_page_fragment fragment;
+		struct vm_area_struct *area;
+
+		ret = get_user_fragment_vma_remote(mm, pos, 1, write ? FOLL_WRITE : 0,
+						 &fragment, &area);
+		if (ret > 0) {
+			page.page = folio_page(fragment.folio, fragment.offset >> PAGE_SHIFT);
+			page.subpage = fragment.subpage;
+			page.offset = offset_in_page(fragment.offset) & mm_page_mask(mm);
+		}
+	} else
+#endif
+		ret = get_user_pages_remote(mm, pos, 1,
+				write ? FOLL_WRITE : 0, &page.page, NULL);
 	mmap_read_unlock(mm);
 	if (ret <= 0)
-		return NULL;
+		return page;
 
 	if (write)
-		acct_arg_size(bprm, vma_pages(vma));
+		acct_arg_size(bprm, mm_pages_for_reader(mm, current->mm, vma_user_pages(vma)));
 
 	return page;
 }
 
-static void put_arg_page(struct page *page)
+static void put_arg_page(struct arg_page page)
 {
-	put_page(page);
+#ifdef CONFIG_MM_SUBPAGE
+	if (page.subpage) {
+		mm_subpage_put(page.subpage);
+		return;
+	}
+#endif
+	put_page(page.page);
 }
 
 static void free_arg_pages(struct linux_binprm *bprm)
@@ -184,14 +252,14 @@ static void free_arg_pages(struct linux_binprm *bprm)
 }
 
 static void flush_arg_page(struct linux_binprm *bprm, unsigned long pos,
-		struct page *page)
+		struct arg_page page)
 {
-	flush_cache_page(bprm->vma, pos, page_to_pfn(page));
+	flush_cache_page(bprm->vma, pos, page_to_pfn(page.page));
 }
 
 static bool valid_arg_len(struct linux_binprm *bprm, long len)
 {
-	return len <= MAX_ARG_STRLEN;
+	return len <= bprm_max_arg_strlen(bprm);
 }
 
 #else
@@ -200,7 +268,7 @@ static inline void acct_arg_size(struct linux_binprm *bprm, unsigned long pages)
 {
 }
 
-static struct page *get_arg_page(struct linux_binprm *bprm, unsigned long pos,
+static struct arg_page get_arg_page(struct linux_binprm *bprm, unsigned long pos,
 		int write)
 {
 	struct page *page;
@@ -209,14 +277,14 @@ static struct page *get_arg_page(struct linux_binprm *bprm, unsigned long pos,
 	if (!page && write) {
 		page = alloc_page(GFP_HIGHUSER|__GFP_ZERO);
 		if (!page)
-			return NULL;
+			return (struct arg_page) {};
 		bprm->page[pos / PAGE_SIZE] = page;
 	}
 
-	return page;
+	return (struct arg_page) { .page = page };
 }
 
-static void put_arg_page(struct page *page)
+static void put_arg_page(struct arg_page page)
 {
 }
 
@@ -237,7 +305,7 @@ static void free_arg_pages(struct linux_binprm *bprm)
 }
 
 static void flush_arg_page(struct linux_binprm *bprm, unsigned long pos,
-		struct page *page)
+		struct arg_page page)
 {
 }
 
@@ -259,7 +327,7 @@ static int bprm_mm_init(struct linux_binprm *bprm)
 	int err;
 	struct mm_struct *mm = NULL;
 
-	bprm->mm = mm = mm_alloc();
+	bprm->mm = mm = mm_alloc_exec();
 	err = -ENOMEM;
 	if (!mm)
 		goto err;
@@ -287,6 +355,102 @@ err:
 
 	return err;
 }
+
+#ifdef CONFIG_MM_SUBPAGE
+/*
+ * Final ELF selection may change the granule after argv, envp and script
+ * arguments have been staged. Table geometry is immutable: build a second mm
+ * and transfer bytes at the same temporary stack addresses before committing
+ * exec. Until success, the original bprm and its argument charge remain intact.
+ */
+int bprm_set_page_shift(struct linux_binprm *bprm, unsigned int page_shift)
+{
+	struct linux_binprm replacement = {};
+	struct mm_struct *old_mm;
+	unsigned long pos, end, new_top, string_len = 0;
+	unsigned long old_size = mm_user_fragment_size(bprm->mm), new_size;
+	int ret;
+
+	if (mm_page_shift(bprm->mm) == page_shift)
+		return 0;
+	if (WARN_ON_ONCE(bprm->point_of_no_return))
+		return -EINVAL;
+
+	replacement.mm = mm_alloc_exec_page_shift(page_shift);
+	if (!replacement.mm)
+		return -ENOMEM;
+	ret = -EINVAL;
+	if (mm_page_shift(replacement.mm) != page_shift)
+		goto out;
+	new_size = mm_user_fragment_size(replacement.mm);
+	ret = create_init_stack_vma(replacement.mm, &replacement.vma, &new_top);
+	if (ret)
+		goto out;
+	end = bprm->vma->vm_end - sizeof(void *);
+	ret = -EINVAL;
+	if (new_top != end || bprm->p > end)
+		goto out;
+
+	for (pos = bprm->p; pos < end;) {
+		struct arg_page src, dst;
+		unsigned long src_off = pos & (old_size - 1);
+		unsigned long dst_off = pos & (new_size - 1);
+		unsigned long len = min3(end - pos, old_size - src_off,
+					new_size - dst_off);
+		const char *from;
+		char *to;
+
+		ret = -ERESTARTNOHAND;
+		if (fatal_signal_pending(current))
+			goto out;
+		src = get_arg_page(bprm, pos, 0);
+		ret = -EFAULT;
+		if (!src.page)
+			goto out;
+		dst = get_arg_page(&replacement, pos, 1);
+		if (!dst.page) {
+			put_arg_page(src);
+			ret = -ENOMEM;
+			goto out;
+		}
+		from = map_arg_page(src);
+		to = map_arg_page(dst);
+		/* Recheck per-string limits if the selected granule shrank. */
+		ret = 0;
+		for (unsigned long i = 0; i < len; i++) {
+			if (++string_len > bprm_max_arg_strlen(&replacement)) {
+				ret = -E2BIG;
+				break;
+			}
+			if (!from[src_off + i])
+				string_len = 0;
+		}
+		if (!ret)
+			memcpy(to + dst_off, from + src_off, len);
+		kunmap_local(to);
+		kunmap_local(from);
+		flush_arg_page(&replacement, pos, dst);
+		put_arg_page(dst);
+		put_arg_page(src);
+		if (ret)
+			goto out;
+		pos += len;
+		cond_resched();
+	}
+
+	old_mm = bprm->mm;
+	acct_arg_size(bprm, 0);
+	bprm->mm = replacement.mm;
+	bprm->vma = replacement.vma;
+	bprm->vma_pages = replacement.vma_pages;
+	mmput(old_mm);
+	return 0;
+out:
+	acct_arg_size(&replacement, 0);
+	mmput(replacement.mm);
+	return ret;
+}
+#endif
 
 struct user_arg_ptr {
 #ifdef CONFIG_COMPAT
@@ -449,7 +613,7 @@ static int bprm_stack_limits(struct linux_binprm *bprm)
 static int copy_strings(int argc, struct user_arg_ptr argv,
 			struct linux_binprm *bprm)
 {
-	struct page *kmapped_page = NULL;
+	struct arg_page kmapped_page = {};
 	char *kaddr = NULL;
 	unsigned long kpos = 0;
 	int ret;
@@ -464,7 +628,7 @@ static int copy_strings(int argc, struct user_arg_ptr argv,
 		if (IS_ERR(str))
 			goto out;
 
-		len = strnlen_user(str, MAX_ARG_STRLEN);
+		len = strnlen_user(str, bprm_max_arg_strlen(bprm));
 		if (!len)
 			goto out;
 
@@ -488,9 +652,9 @@ static int copy_strings(int argc, struct user_arg_ptr argv,
 			}
 			cond_resched();
 
-			offset = pos % PAGE_SIZE;
+			offset = pos & ~bprm_copy_mask(bprm);
 			if (offset == 0)
-				offset = PAGE_SIZE;
+				offset = bprm_copy_size(bprm);
 
 			bytes_to_copy = offset;
 			if (bytes_to_copy > len)
@@ -501,23 +665,23 @@ static int copy_strings(int argc, struct user_arg_ptr argv,
 			str -= bytes_to_copy;
 			len -= bytes_to_copy;
 
-			if (!kmapped_page || kpos != (pos & PAGE_MASK)) {
-				struct page *page;
+			if (!kmapped_page.page || kpos != (pos & bprm_copy_mask(bprm))) {
+				struct arg_page page;
 
 				page = get_arg_page(bprm, pos, 1);
-				if (!page) {
+				if (!page.page) {
 					ret = -E2BIG;
 					goto out;
 				}
 
-				if (kmapped_page) {
-					flush_dcache_page(kmapped_page);
+				if (kmapped_page.page) {
+					flush_dcache_page(kmapped_page.page);
 					kunmap_local(kaddr);
 					put_arg_page(kmapped_page);
 				}
 				kmapped_page = page;
-				kaddr = kmap_local_page(kmapped_page);
-				kpos = pos & PAGE_MASK;
+				kaddr = map_arg_page(kmapped_page);
+				kpos = pos & bprm_copy_mask(bprm);
 				flush_arg_page(bprm, kpos, kmapped_page);
 			}
 			if (copy_from_user(kaddr+offset, str, bytes_to_copy)) {
@@ -528,8 +692,8 @@ static int copy_strings(int argc, struct user_arg_ptr argv,
 	}
 	ret = 0;
 out:
-	if (kmapped_page) {
-		flush_dcache_page(kmapped_page);
+	if (kmapped_page.page) {
+		flush_dcache_page(kmapped_page.page);
 		kunmap_local(kaddr);
 		put_arg_page(kmapped_page);
 	}
@@ -541,7 +705,7 @@ out:
  */
 int copy_string_kernel(const char *arg, struct linux_binprm *bprm)
 {
-	int len = strnlen(arg, MAX_ARG_STRLEN) + 1 /* terminating NUL */;
+	int len = strnlen(arg, bprm_max_arg_strlen(bprm)) + 1 /* terminating NUL */;
 	unsigned long pos = bprm->p;
 
 	if (len == 0)
@@ -557,18 +721,19 @@ int copy_string_kernel(const char *arg, struct linux_binprm *bprm)
 
 	while (len > 0) {
 		unsigned int bytes_to_copy = min(len,
-				min_not_zero(offset_in_page(pos), PAGE_SIZE));
-		struct page *page;
+				min_not_zero(pos & ~bprm_copy_mask(bprm), bprm_copy_size(bprm)));
+		struct arg_page page;
 
 		pos -= bytes_to_copy;
 		arg -= bytes_to_copy;
 		len -= bytes_to_copy;
 
 		page = get_arg_page(bprm, pos, 1);
-		if (!page)
+		if (!page.page)
 			return -E2BIG;
-		flush_arg_page(bprm, pos & PAGE_MASK, page);
-		memcpy_to_page(page, offset_in_page(pos), arg, bytes_to_copy);
+		flush_arg_page(bprm, pos & bprm_copy_mask(bprm), page);
+		memcpy_to_page(page.page, arg_page_offset(page) +
+			       (pos & ~bprm_copy_mask(bprm)), arg, bytes_to_copy);
 		put_arg_page(page);
 	}
 
@@ -621,20 +786,20 @@ int setup_arg_pages(struct linux_binprm *bprm,
 
 	/* Add space for stack randomization. */
 	if (current->flags & PF_RANDOMIZE)
-		stack_base += (STACK_RND_MASK << PAGE_SHIFT);
+		stack_base += (STACK_RND_MASK << mm_page_shift(mm));
 
 	/* Make sure we didn't let the argument array grow too large. */
 	if (vma->vm_end - vma->vm_start > stack_base)
 		return -ENOMEM;
 
-	stack_base = PAGE_ALIGN(stack_top - stack_base);
+	stack_base = mm_page_align(mm, stack_top - stack_base);
 
 	stack_shift = vma->vm_start - stack_base;
 	mm->arg_start = bprm->p - stack_shift;
 	bprm->p = vma->vm_end - stack_shift;
 #else
 	stack_top = arch_align_stack(stack_top);
-	stack_top = PAGE_ALIGN(stack_top);
+	stack_top = mm_page_align(mm, stack_top);
 
 	if (unlikely(stack_top < mmap_min_addr) ||
 	    unlikely(vma->vm_end - vma->vm_start >= stack_top - mmap_min_addr))
@@ -702,7 +867,7 @@ int setup_arg_pages(struct linux_binprm *bprm,
 	 * Align this down to a page boundary as expand_stack
 	 * will align it up.
 	 */
-	rlim_stack = bprm->rlim_stack.rlim_cur & PAGE_MASK;
+	rlim_stack = bprm->rlim_stack.rlim_cur & mm_page_mask(mm);
 
 	stack_expand = min(rlim_stack, stack_size + stack_expand);
 
@@ -1323,6 +1488,10 @@ void setup_new_exec(struct linux_binprm * bprm)
 
 	arch_pick_mmap_layout(me->mm, &bprm->rlim_stack);
 
+	/* Consume the one-shot request only after committing to the new image. */
+#ifdef CONFIG_ARCH_HAS_USER_PAGE_SIZE
+	me->exec_page_shift = 0;
+#endif
 	arch_setup_new_exec();
 
 	/* Set the new mm task size. We have to do that late because it may
@@ -1616,25 +1785,25 @@ int remove_arg_zero(struct linux_binprm *bprm)
 {
 	unsigned long offset;
 	char *kaddr;
-	struct page *page;
+	struct arg_page page;
 
 	if (!bprm->argc)
 		return 0;
 
 	do {
-		offset = bprm->p & ~PAGE_MASK;
+		offset = bprm->p & ~bprm_copy_mask(bprm);
 		page = get_arg_page(bprm, bprm->p, 0);
-		if (!page)
+		if (!page.page)
 			return -EFAULT;
-		kaddr = kmap_local_page(page);
+		kaddr = map_arg_page(page);
 
-		for (; offset < PAGE_SIZE && kaddr[offset];
+		for (; offset < bprm_copy_size(bprm) && kaddr[offset];
 				offset++, bprm->p++)
 			;
 
 		kunmap_local(kaddr);
 		put_arg_page(page);
-	} while (offset == PAGE_SIZE);
+	} while (offset == bprm_copy_size(bprm));
 
 	bprm->p++;
 	bprm->argc--;
