@@ -248,9 +248,7 @@ static int parse_bool_or_skip(struct dcp_parse_ctx *handle, bool *b)
 
 	*handle = at;
 	*b = false;
-	/* as before the key was read, a value it cannot skip is not an error */
-	skip(handle);
-	return 0;
+	return skip(handle);
 }
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)

@@ -729,6 +729,48 @@ static void parser_attributes_malformed(struct kunit *test)
 	dcp_modes_release(dcp);
 }
 
+static void parser_optional_flag_extent(struct kunit *test)
+{
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	struct parser_blob *blob = kunit_kzalloc(test, sizeof(*blob), GFP_KERNEL);
+	struct dcp_parse_ctx ctx;
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	KUNIT_ASSERT_NOT_NULL(test, blob);
+	dcp_modes_init(dcp);
+	put_unaligned_le32(0xd3, blob->data);
+	blob->size = 4;
+	blob_tag(blob, 1, 3);
+	blob_int(blob, "MaxHorizontalImageSize", 52);
+	blob_int(blob, "MaxVerticalImageSize", 29);
+	blob_bool(blob, "SupportsBacklightControl", true);
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	KUNIT_ASSERT_EQ(test, dcp_attributes_replace(dcp, &ctx, 0), 0);
+	KUNIT_EXPECT_TRUE(test, dcp->ext_backlight);
+
+	blob->size = 4;
+	blob_tag(blob, 1, 3);
+	blob_int(blob, "MaxHorizontalImageSize", 60);
+	blob_int(blob, "MaxVerticalImageSize", 40);
+	blob_key(blob, "SupportsBacklightControl");
+	blob_tag(blob, 9, 2);
+	blob->data[blob->size++] = 'x';
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	KUNIT_EXPECT_LT(test, dcp_attributes_replace(dcp, &ctx, 0), 0);
+	KUNIT_EXPECT_EQ(test, dcp->width_mm, 520);
+	KUNIT_EXPECT_EQ(test, dcp->height_mm, 290);
+	KUNIT_EXPECT_TRUE(test, dcp->ext_backlight);
+
+	/* A complete value of another type keeps the optional false fallback. */
+	blob->data[blob->size++] = 'y';
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	KUNIT_ASSERT_EQ(test, dcp_attributes_replace(dcp, &ctx, 0), 0);
+	KUNIT_EXPECT_EQ(test, dcp->width_mm, 600);
+	KUNIT_EXPECT_EQ(test, dcp->height_mm, 400);
+	KUNIT_EXPECT_FALSE(test, dcp->ext_backlight);
+	dcp_modes_release(dcp);
+}
+
 static void parser_attribute_deferred(struct kunit *test)
 {
 	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
@@ -855,6 +897,7 @@ static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_rejected_replacement),
 	KUNIT_CASE(parser_attribute_epoch),
 	KUNIT_CASE(parser_attributes_malformed),
+	KUNIT_CASE(parser_optional_flag_extent),
 	KUNIT_CASE(parser_attribute_deferred),
 	KUNIT_CASE(parser_dimensions_lifetime),
 	KUNIT_CASE(parser_catalog_release),
