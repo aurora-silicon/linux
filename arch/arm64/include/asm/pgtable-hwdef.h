@@ -28,8 +28,10 @@
  *
  * which gets simplified as :
  */
+#define ARM64_HW_PGTABLE_LEVELS_FOR(va_bits, page_shift) \
+	(((va_bits) - PTDESC_ORDER - 1) / ((page_shift) - PTDESC_ORDER))
 #define ARM64_HW_PGTABLE_LEVELS(va_bits) \
-	(((va_bits) - PTDESC_ORDER - 1) / PTDESC_TABLE_SHIFT)
+	ARM64_HW_PGTABLE_LEVELS_FOR(va_bits, PAGE_SHIFT)
 
 /*
  * Size mapped by an entry at level n ( -1 <= n <= 3)
@@ -44,7 +46,10 @@
  * Rearranging it a bit we get :
  *   (4 - n) * PTDESC_TABLE_SHIFT + PTDESC_ORDER
  */
-#define ARM64_HW_PGTABLE_LEVEL_SHIFT(n)	(PTDESC_TABLE_SHIFT * (4 - (n)) + PTDESC_ORDER)
+#define ARM64_HW_PGTABLE_LEVEL_SHIFT_FOR(n, page_shift) \
+	(((page_shift) - PTDESC_ORDER) * (4 - (n)) + PTDESC_ORDER)
+#define ARM64_HW_PGTABLE_LEVEL_SHIFT(n) \
+	ARM64_HW_PGTABLE_LEVEL_SHIFT_FOR(n, PAGE_SHIFT)
 
 #define PTRS_PER_PTE		(1 << PTDESC_TABLE_SHIFT)
 
@@ -79,7 +84,8 @@
  * PGDIR_SHIFT determines the size a top-level page table entry can map
  * (depending on the configuration, this level can be -1, 0, 1 or 2).
  */
-#define PGDIR_SHIFT		ARM64_HW_PGTABLE_LEVEL_SHIFT(4 - CONFIG_PGTABLE_LEVELS)
+#define ARM64_NATIVE_PGTABLE_LEVELS ARM64_HW_PGTABLE_LEVELS(VA_BITS)
+#define PGDIR_SHIFT		ARM64_HW_PGTABLE_LEVEL_SHIFT(4 - ARM64_NATIVE_PGTABLE_LEVELS)
 #define PGDIR_SIZE		(_AC(1, UL) << PGDIR_SHIFT)
 #define PGDIR_MASK		(~(PGDIR_SIZE-1))
 #define PTRS_PER_PGD		(1 << (VA_BITS - PGDIR_SHIFT))

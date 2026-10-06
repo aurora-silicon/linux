@@ -10,6 +10,11 @@
 
 #include <linux/pagemap.h>
 
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+void __tlb_remove_table(void *token);
+/* Fragment tokens do not carry a private descriptor callback head. */
+#define tlb_table_is_ptdesc(token) (!((unsigned long)(token) & 1UL))
+#endif
 
 #define tlb_flush tlb_flush
 static void tlb_flush(struct mmu_gather *tlb);
@@ -76,8 +81,14 @@ static inline void tlb_flush(struct mmu_gather *tlb)
 static inline void __pte_free_tlb(struct mmu_gather *tlb, pgtable_t pte,
 				  unsigned long addr)
 {
-	struct ptdesc *ptdesc = page_ptdesc(pte);
+	struct ptdesc *ptdesc = page_ptdesc(pgtable_to_page(pte));
 
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+	if (test_bit(PT_fragmented, &ptdesc->pt_flags.f)) {
+		tlb_remove_table(tlb, (void *)((unsigned long)pte | 1));
+		return;
+	}
+#endif
 	tlb_remove_ptdesc(tlb, ptdesc);
 }
 
@@ -87,6 +98,12 @@ static inline void __pmd_free_tlb(struct mmu_gather *tlb, pmd_t *pmdp,
 {
 	struct ptdesc *ptdesc = virt_to_ptdesc(pmdp);
 
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+	if (test_bit(PT_fragmented, &ptdesc->pt_flags.f)) {
+		tlb_remove_table(tlb, (void *)((unsigned long)pmdp | 1));
+		return;
+	}
+#endif
 	tlb_remove_ptdesc(tlb, ptdesc);
 }
 #endif
@@ -97,9 +114,15 @@ static inline void __pud_free_tlb(struct mmu_gather *tlb, pud_t *pudp,
 {
 	struct ptdesc *ptdesc = virt_to_ptdesc(pudp);
 
-	if (!pgtable_l4_enabled())
+	if (mm_pud_folded(tlb->mm))
 		return;
 
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+	if (test_bit(PT_fragmented, &ptdesc->pt_flags.f)) {
+		tlb_remove_table(tlb, (void *)((unsigned long)pudp | 1));
+		return;
+	}
+#endif
 	tlb_remove_ptdesc(tlb, ptdesc);
 }
 #endif

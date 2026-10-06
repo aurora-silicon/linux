@@ -8,6 +8,10 @@
 #include <asm/cputype.h>
 
 #define MMCF_AARCH32	0x1	/* mm context flag for AArch32 executables */
+#define MMCF_USER_4K	0x2	/* experimental, immutable mm table geometry */
+#define MMCF_USER_16K	0x4	/* experimental, immutable mm table geometry */
+#define MMCF_USER_64K	0x8	/* internal geometry; larger user ABI not enabled */
+#define MMCF_USER_GRANULE (MMCF_USER_4K | MMCF_USER_16K | MMCF_USER_64K)
 #define USER_ASID_BIT	48
 #define USER_ASID_FLAG	(UL(1) << USER_ASID_BIT)
 
@@ -15,6 +19,15 @@
 
 #include <linux/refcount.h>
 #include <asm/cpufeature.h>
+
+/* AArch32 falls back to the native ABI when 4K translation is unavailable. */
+static inline unsigned int arm64_exec_page_shift(bool compat, bool has_4k,
+		unsigned int native_shift, unsigned int requested_shift)
+{
+	if (compat)
+		return has_4k ? 12 : native_shift;
+	return requested_shift ?: native_shift;
+}
 
 typedef struct {
 	atomic64_t	id;
@@ -25,7 +38,34 @@ typedef struct {
 	void		*vdso;
 	unsigned long	flags;
 	u8		pkey_allocation_map;
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+	/* Unissued PTE/PMD/PUD fragments; protected by page_table_lock. */
+	void		*user4k_pt_frag[3];
+#endif
 } mm_context_t;
+
+static inline bool arm64_context_user4k(const mm_context_t *context)
+{
+	return IS_ENABLED(CONFIG_ARM64_USER4K_EXPERIMENTAL) &&
+	       (context->flags & MMCF_USER_4K);
+}
+
+static inline unsigned int arm64_context_page_shift(const mm_context_t *context)
+{
+	if (IS_ENABLED(CONFIG_ARM64_USER4K_EXPERIMENTAL)) {
+		if (context->flags & MMCF_USER_4K)
+			return 12;
+		if (context->flags & MMCF_USER_16K)
+			return 14;
+		if (context->flags & MMCF_USER_64K)
+			return 16;
+	}
+	return PAGE_SHIFT;
+}
+
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+#define arch_mm_page_shift(mm) arm64_context_page_shift(&(mm)->context)
+#endif
 
 /*
  * We use atomic64_read() here because the ASID for an 'mm_struct' can

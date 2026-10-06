@@ -22,6 +22,11 @@ SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len,
 		unsigned long, prot, unsigned long, flags,
 		unsigned long, fd, unsigned long, off)
 {
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(current->mm) != PAGE_SIZE)
+		return ksys_mmap_user(addr, len, prot, flags, fd, off);
+#endif
+
 	if (offset_in_page(off) != 0)
 		return -EINVAL;
 

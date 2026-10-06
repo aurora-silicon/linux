@@ -121,6 +121,9 @@
 
 #define CORE_DUMP_USE_REGSET
 #define ELF_EXEC_PAGESIZE	PAGE_SIZE
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+#define ELF_EXEC_PAGESIZE_MM(mm)	mm_page_size(mm)
+#endif
 
 /*
  * This is the base location for PIE (ET_DYN with INTERP) loads. On
@@ -180,6 +183,12 @@ do {									\
 	else								\
 		NEW_AUX_ENT(AT_IGNORE, 0);				\
 } while (0)
+
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+struct linux_binprm;
+int arm64_bprm_prepare_mm(struct linux_binprm *bprm, bool compat);
+#define arch_bprm_prepare_mm arm64_bprm_prepare_mm
+#endif
 
 #define ARCH_HAS_SETUP_ADDITIONAL_PAGES
 struct linux_binprm;

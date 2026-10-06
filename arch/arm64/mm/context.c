@@ -11,6 +11,7 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
+#include <linux/moduleparam.h>
 
 #include <asm/cpufeature.h>
 #include <asm/mmu_context.h>
@@ -37,6 +38,34 @@ static unsigned long *pinned_asid_map;
 #define NUM_USER_ASIDS		(1UL << asid_bits)
 #define ctxid2asid(asid)	((asid) & ~ASID_MASK)
 #define asid2ctxid(asid, genid)	((asid) | (genid))
+
+#ifdef CONFIG_ARM64_USER4K_KUNIT_TEST
+/* Test-only capacity reduction; hardware ASID width and normal boots are unchanged. */
+static bool user4k_test_small_asids;
+
+static int __init user4k_test_asid_bits_setup(char *str)
+{
+	unsigned int bits;
+
+	if (kstrtouint(str, 0, &bits) || bits != 8)
+		return -EINVAL;
+	user4k_test_small_asids = true;
+	return 0;
+}
+early_param("arm64.user4k_test_asid_bits", user4k_test_asid_bits_setup);
+
+/* Read-only evidence that an EL0 stress run actually crossed ASID rollover. */
+static int user4k_asid_generation_get(char *buffer, const struct kernel_param *kp)
+{
+	return sysfs_emit(buffer, "%llu\n", (unsigned long long)atomic64_read(&asid_generation));
+}
+
+static const struct kernel_param_ops user4k_asid_generation_ops = {
+	.get = user4k_asid_generation_get,
+};
+module_param_cb(user4k_asid_generation, &user4k_asid_generation_ops, NULL, 0444);
+MODULE_PARM_DESC(user4k_asid_generation, "Current ASID generation for mixed-granule VM tests");
+#endif
 
 /* Get the ASIDBits supported by the current CPU */
 static u32 get_cpu_asid_bits(void)
@@ -268,6 +297,13 @@ switch_mm_fastpath:
 	 */
 	if (!system_uses_ttbr0_pan())
 		cpu_switch_mm(mm->pgd, mm);
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+	else {
+		/* uaccess/EL0 return restore only TTBRs, so select TG0 here. */
+		cpu_set_reserved_ttbr0_nosync();
+		cpu_set_mm_tg0(mm);
+	}
+#endif
 }
 
 unsigned long arm64_mm_context_get(struct mm_struct *mm)
@@ -365,6 +401,7 @@ void cpu_do_switch_mm(phys_addr_t pgd_phys, struct mm_struct *mm)
 	ttbr1 |= FIELD_PREP(TTBRx_EL1_ASID_MASK, asid);
 
 	cpu_set_reserved_ttbr0_nosync();
+	cpu_set_mm_tg0(mm);
 	write_sysreg(ttbr1, ttbr1_el1);
 	write_sysreg(ttbr0, ttbr0_el1);
 	isb();
@@ -401,6 +438,12 @@ arch_initcall(asids_update_limit);
 static int asids_init(void)
 {
 	asid_bits = get_cpu_asid_bits();
+#ifdef CONFIG_ARM64_USER4K_KUNIT_TEST
+	if (user4k_test_small_asids) {
+		pr_info("user4k test: limiting ASID allocator to 8 bits\n");
+		asid_bits = 8;
+	}
+#endif
 	atomic64_set(&asid_generation, ASID_FIRST_VERSION);
 	asid_map = bitmap_zalloc(NUM_USER_ASIDS, GFP_KERNEL);
 	if (!asid_map)

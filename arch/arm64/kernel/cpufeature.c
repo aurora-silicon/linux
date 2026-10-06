@@ -1661,6 +1661,62 @@ has_cpuid_feature(const struct arm64_cpu_capabilities *entry, int scope)
 	return feature_matches(val, entry);
 }
 
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+#ifdef CONFIG_ARM64_USER4K_KUNIT_TEST
+/* Removal-only model for late-CPU verification in a disposable test VM. */
+static int user4k_deny_late_cpu __ro_after_init = -1;
+
+static int __init user4k_deny_late_cpu_setup(char *str)
+{
+	int cpu;
+
+	if (kstrtoint(str, 0, &cpu) || cpu <= 0 || cpu >= NR_CPUS)
+		return -EINVAL;
+	user4k_deny_late_cpu = cpu;
+	return 0;
+}
+early_param("arm64.user4k_deny_late_cpu", user4k_deny_late_cpu_setup);
+#ifdef CONFIG_ARM64_64K_PAGES
+static int user16k_deny_late_cpu __ro_after_init = -1;
+
+static int __init user16k_deny_late_cpu_setup(char *str)
+{
+	int cpu;
+
+	if (kstrtoint(str, 0, &cpu) || cpu <= 0 || cpu >= NR_CPUS)
+		return -EINVAL;
+	user16k_deny_late_cpu = cpu;
+	return 0;
+}
+early_param("arm64.user16k_deny_late_cpu", user16k_deny_late_cpu_setup);
+#endif
+#endif
+
+static bool has_user4k_granule(const struct arm64_cpu_capabilities *entry,
+			     int scope)
+{
+#ifdef CONFIG_ARM64_USER4K_KUNIT_TEST
+	if (scope == SCOPE_LOCAL_CPU && system_capabilities_finalized() &&
+	    smp_processor_id() == user4k_deny_late_cpu)
+		return false;
+#endif
+	return has_cpuid_feature(entry, scope);
+}
+
+#ifdef CONFIG_ARM64_64K_PAGES
+static bool has_user16k_granule(const struct arm64_cpu_capabilities *entry,
+			     int scope)
+{
+#ifdef CONFIG_ARM64_USER4K_KUNIT_TEST
+	if (scope == SCOPE_LOCAL_CPU && system_capabilities_finalized() &&
+	    smp_processor_id() == user16k_deny_late_cpu)
+		return false;
+#endif
+	return has_cpuid_feature(entry, scope);
+}
+#endif
+#endif
+
 const struct cpumask *system_32bit_el0_cpumask(void)
 {
 	if (!system_supports_32bit_el0())
@@ -2391,8 +2447,11 @@ static void cpu_enable_mte(struct arm64_cpu_capabilities const *cap)
 	 * clear the tags or set PG_mte_tagged.
 	 */
 	if (!cleared_zero_page) {
+		unsigned long offset;
+
 		cleared_zero_page = true;
-		mte_clear_page_tags(lm_alias(empty_zero_page));
+		for (offset = 0; offset < sizeof(empty_zero_page); offset += PAGE_SIZE)
+			mte_clear_page_tags(lm_alias(empty_zero_page + offset));
 	}
 
 	kasan_init_hw_tags_cpu();
@@ -2529,6 +2588,28 @@ test_has_gicv5_legacy(const struct arm64_cpu_capabilities *entry, int scope)
 }
 
 static const struct arm64_cpu_capabilities arm64_features[] = {
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+	{
+		.desc = "4K userspace translation granule",
+		.type = ARM64_CPUCAP_SYSTEM_FEATURE,
+		.capability = ARM64_HAS_USER4K_GRANULE,
+		.matches = has_user4k_granule,
+		__ARM64_CPUID_FIELDS(ID_AA64MMFR0_EL1, TGRAN4,
+			ID_AA64MMFR0_EL1_TGRAN4_SUPPORTED_MIN,
+			ID_AA64MMFR0_EL1_TGRAN4_SUPPORTED_MAX)
+	},
+#ifdef CONFIG_ARM64_64K_PAGES
+	{
+		.desc = "16K userspace translation granule",
+		.type = ARM64_CPUCAP_SYSTEM_FEATURE,
+		.capability = ARM64_HAS_USER16K_GRANULE,
+		.matches = has_user16k_granule,
+		__ARM64_CPUID_FIELDS(ID_AA64MMFR0_EL1, TGRAN16,
+			ID_AA64MMFR0_EL1_TGRAN16_SUPPORTED_MIN,
+			ID_AA64MMFR0_EL1_TGRAN16_SUPPORTED_MAX)
+	},
+#endif
+#endif
 	{
 		.capability = ARM64_ALWAYS_BOOT,
 		.type = ARM64_CPUCAP_BOOT_CPU_FEATURE,

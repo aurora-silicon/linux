@@ -291,7 +291,7 @@ SYM_TYPED_FUNC_START(idmap_kpti_install_ng_mappings)
 
 	cbnz	cpu, __idmap_kpti_secondary
 
-#if CONFIG_PGTABLE_LEVELS > 4
+#if ARM64_NATIVE_PGTABLE_LEVELS > 4
 	stp	x29, x30, [sp, #-32]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #16]
@@ -352,7 +352,7 @@ alternative_else_nop_endif
 
 	/* Set the flag to zero to indicate that we're all done */
 	str	wzr, [flag_ptr]
-#if CONFIG_PGTABLE_LEVELS > 4
+#if ARM64_NATIVE_PGTABLE_LEVELS > 4
 	ldp	x19, x20, [sp, #16]
 	ldp	x29, x30, [sp], #32
 #endif
@@ -360,39 +360,39 @@ alternative_else_nop_endif
 
 .Lderef_pgd:
 	/* P4D */
-	.if		CONFIG_PGTABLE_LEVELS > 4
+	.if		ARM64_NATIVE_PGTABLE_LEVELS > 4
 	p4d		.req	x30
 	pte_to_phys	cur_p4dp, pgd
 	kpti_map_pgtbl	p4d, 0
 	kpti_mk_tbl_ng	p4d, PTRS_PER_P4D
 	b		.Lnext_pgd
-	.else		/* CONFIG_PGTABLE_LEVELS <= 4 */
+	.else		/* ARM64_NATIVE_PGTABLE_LEVELS <= 4 */
 	p4d		.req	pgd
 	.set		.Lnext_p4d, .Lnext_pgd
 	.endif
 
 .Lderef_p4d:
 	/* PUD */
-	.if		CONFIG_PGTABLE_LEVELS > 3
+	.if		ARM64_NATIVE_PGTABLE_LEVELS > 3
 	pud		.req	x10
 	pte_to_phys	cur_pudp, p4d
 	kpti_map_pgtbl	pud, 1
 	kpti_mk_tbl_ng	pud, PTRS_PER_PUD
 	b		.Lnext_p4d
-	.else		/* CONFIG_PGTABLE_LEVELS <= 3 */
+	.else		/* ARM64_NATIVE_PGTABLE_LEVELS <= 3 */
 	pud		.req	pgd
 	.set		.Lnext_pud, .Lnext_pgd
 	.endif
 
 .Lderef_pud:
 	/* PMD */
-	.if		CONFIG_PGTABLE_LEVELS > 2
+	.if		ARM64_NATIVE_PGTABLE_LEVELS > 2
 	pmd		.req	x13
 	pte_to_phys	cur_pmdp, pud
 	kpti_map_pgtbl	pmd, 2
 	kpti_mk_tbl_ng	pmd, PTRS_PER_PMD
 	b		.Lnext_pud
-	.else		/* CONFIG_PGTABLE_LEVELS <= 2 */
+	.else		/* ARM64_NATIVE_PGTABLE_LEVELS <= 2 */
 	pmd		.req	pgd
 	.set		.Lnext_pmd, .Lnext_pgd
 	.endif

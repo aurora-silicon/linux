@@ -26,6 +26,17 @@
 #include <asm/sysreg.h>
 #include <asm/tlbflush.h>
 
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+#define arch_mm_init_exec arch_mm_init_exec
+static inline void arch_mm_init_exec(struct mm_struct *mm, unsigned int page_shift)
+{
+	if (page_shift == 12)
+		mm->context.flags |= MMCF_USER_4K;
+	else if (page_shift == 14 && PAGE_SHIFT > 14)
+		mm->context.flags |= MMCF_USER_16K;
+}
+#endif
+
 extern bool rodata_full;
 
 static inline void contextidr_thread_switch(struct task_struct *next)
@@ -53,6 +64,29 @@ static inline void cpu_set_reserved_ttbr0(void)
 	isb();
 }
 
+/*
+ * The caller has installed reserved_pg_dir in TTBR0 and excludes preemption.
+ * On a granule transition, complete that installation before changing TG0,
+ * then synchronise the new walk geometry before installing a user root.
+ * ASIDs remain unique across both granules; switching does not flush them.
+ */
+static inline void cpu_set_mm_tg0(struct mm_struct *mm)
+{
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+	unsigned long tcr = read_sysreg(tcr_el1);
+	unsigned int shift = mm_page_shift(mm);
+	unsigned long tg0 = shift == 12 ? TCR_TG0_4K :
+		(shift == 14 ? TCR_TG0_16K : TCR_TG0_64K);
+
+	if ((tcr & TCR_EL1_TG0_MASK) == tg0)
+		return;
+
+	isb();
+	write_sysreg((tcr & ~TCR_EL1_TG0_MASK) | tg0, tcr_el1);
+	isb();
+#endif
+}
+
 void cpu_do_switch_mm(phys_addr_t pgd_phys, struct mm_struct *mm);
 
 static inline void cpu_switch_mm(pgd_t *pgd, struct mm_struct *mm)
@@ -62,16 +96,21 @@ static inline void cpu_switch_mm(pgd_t *pgd, struct mm_struct *mm)
 }
 
 /*
- * Ensure TCR.T0SZ is set to the provided value.
+ * Set TCR.T0SZ and restore native TG0 for the idmap/transition tables.
  */
 static inline void __cpu_set_tcr_t0sz(unsigned long t0sz)
 {
 	unsigned long tcr = read_sysreg(tcr_el1);
+	unsigned long mask = TCR_EL1_T0SZ_MASK;
 
-	if ((tcr & TCR_EL1_T0SZ_MASK) == t0sz)
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+	mask |= TCR_EL1_TG0_MASK;
+	t0sz |= IS_ENABLED(CONFIG_ARM64_64K_PAGES) ? TCR_TG0_64K : TCR_TG0_16K;
+#endif
+	if ((tcr & mask) == t0sz)
 		return;
 
-	tcr &= ~TCR_EL1_T0SZ_MASK;
+	tcr &= ~mask;
 	tcr |= t0sz;
 	write_sysreg(tcr, tcr_el1);
 	isb();
@@ -97,6 +136,8 @@ static inline void cpu_uninstall_idmap(void)
 	local_flush_tlb_all();
 	__cpu_set_tcr_t0sz(TCR_T0SZ(vabits_actual));
 
+	/* SW PAN will restore TTBR0 later, but already needs the mm's TG0. */
+	cpu_set_mm_tg0(mm);
 	if (mm != &init_mm && !system_uses_ttbr0_pan())
 		cpu_switch_mm(mm->pgd, mm);
 }
@@ -168,12 +209,25 @@ init_new_context(struct task_struct *tsk, struct mm_struct *mm)
 {
 	atomic64_set(&mm->context.id, 0);
 	refcount_set(&mm->context.pinned, 0);
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+	memset(mm->context.user4k_pt_frag, 0, sizeof(mm->context.user4k_pt_frag));
+#endif
 
 	/* pkey 0 is the default, so always reserve it. */
 	mm->context.pkey_allocation_map = BIT(0);
 
 	return 0;
 }
+
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+void arm64_user4k_pt_cache_destroy(struct mm_struct *mm);
+
+static inline void destroy_context(struct mm_struct *mm)
+{
+	arm64_user4k_pt_cache_destroy(mm);
+}
+#define destroy_context destroy_context
+#endif
 
 static inline void arch_dup_pkeys(struct mm_struct *oldmm,
 				  struct mm_struct *mm)
@@ -241,6 +295,7 @@ static inline void __switch_mm(struct mm_struct *next)
 	 */
 	if (next == &init_mm) {
 		cpu_set_reserved_ttbr0();
+		cpu_set_mm_tg0(next);
 		return;
 	}
 
