@@ -165,9 +165,10 @@ PUBLIC_RELEASE_URL=https://github.com/iconidentify/aurora-linux/releases/downloa
 PUBLIC_RELEASES_API=https://api.github.com/repos/iconidentify/aurora-linux/releases
 # AURORA_RELEASE_URL and AURORA_RELEASES_API are a staging or mirror override
 # for these two (a file://, http:// or https:// URL; see release_source); the
-# checksums below still decide what is installed. Every command this script prints names
-# PUBLIC_RELEASE_URL, never the override: a staged copy can go away, and the
-# script itself is not covered by the checksums.
+# checksums below still decide what is installed. The commands this script
+# prints name the public release (PUBLIC_RELEASE_URL or LATEST_URL), never the
+# override: a staged copy can go away, and the checksums don't cover the
+# script itself.
 RELEASE_URL=${AURORA_RELEASE_URL:-$PUBLIC_RELEASE_URL}
 RELEASES_API=${AURORA_RELEASES_API:-$PUBLIC_RELEASES_API}
 # Where to always get the current script, whatever this copy turns out to be.
