@@ -146,6 +146,12 @@
 		#size-cells = <2>;
 		status = "disabled";
 
+		/*
+		 * A route stays disabled until the display gate enables it
+		 * together with this processor. An available route with no
+		 * registered mode switch would make the Type-C port wait for
+		 * one forever.
+		 */
 		typec-routes {
 			#address-cells = <1>;
 			#size-cells = <0>;
@@ -153,6 +159,7 @@
 			route@0 {
 				reg = <0>;
 				mode-switch;
+				status = "disabled";
 
 				port {
 					dcpext_typec0: endpoint {
