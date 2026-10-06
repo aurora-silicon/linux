@@ -86,14 +86,15 @@ pub(crate) struct Registered {
     _overlap: Pin<KBox<kernel::debugfs::File<SubmitOverlapView>>>,
 }
 impl Registered {
-    pub(crate) fn start(pdev: &platform::Device<Core>) -> Result<Self> {
-        let resources = crate::m3_resources::from_device(pdev)?;
+    pub(crate) fn start(pdev: &platform::Device<Core>, soc: &'static crate::m3_soc::Soc) -> Result<Self> {
+        let resources = crate::m3_resources::from_device(pdev, soc)?;
         dev_info!(pdev.as_ref(), "M3: resource admission complete\n");
-        let firmware = crate::m3_firmware::identify_loaded(pdev, resources)?;
+        soc.require_complete(pdev.as_ref())?;
+        let firmware = crate::m3_firmware::identify_loaded(pdev, soc, resources)?;
         dev_info!(pdev.as_ref(), "M3: firmware identity accepted\n");
         // InitData source and contents, before any GPU register access.
-        let contents = crate::m3_adt_config::Contents::select(pdev, &firmware)?;
-        let device = crate::m3_device::Device::new(pdev, firmware)?;
+        let contents = crate::m3_adt_config::Contents::select(pdev, &firmware, soc)?;
+        let device = crate::m3_device::Device::new(pdev, firmware, soc)?;
         device.check_drm(pdev)?;
         let core_mask = device.core_mask();
         let max_frequency_khz = 1000 * contents.pstates.reported_max_mhz();
@@ -126,9 +127,9 @@ impl Registered {
         let owner = Self { registration: KBox::pin_init(new_mutex!(None), GFP_KERNEL)?, shared: shared.clone(), health: health.clone(), _progress: progress, _activity: activity, _memory: memory, _timing: timing, _completion: completion, _overlap: overlap };
         let scheduler=Arc::new(drm::sched::Scheduler::new(drm.as_ref(),4,8,0,3000,kernel::c_str!("asahi_m3_sched"))?,GFP_KERNEL)?;
         let backend: Arc<dyn DrmGpu> = Arc::new(Backend { shared, health, scheduler, ids: gpu::SequenceIDs::default(),
-            core_mask, max_frequency_khz }, GFP_KERNEL)?;
+            core_mask, max_frequency_khz, soc }, GFP_KERNEL)?;
         if !drm.gpu.populate(crate::drm_gpu::Backend::M3(backend)) { return Err(EBUSY); }
-        if crate::m3_board::expose_render_node() {
+        if crate::m3_board::expose_render_node(soc) {
             *owner.registration.lock() = Some(drm::driver::Registration::new(&drm, 0)?);
             dev_info!(pdev.as_ref(), "M3: firmware ready; common DRM GEM/VM frontend registered\n");
         } else {
@@ -144,7 +145,8 @@ impl Registered {
 }
 impl Drop for Registered { fn drop(&mut self) { self.stop(); } }
 struct Backend { shared: Shared, health: Arc<crate::m3_rtkit::Health>, ids: gpu::SequenceIDs,
-    scheduler:Arc<drm::sched::Scheduler<crate::m3_submit::Job>>, core_mask: u32, max_frequency_khz: u32 }
+    scheduler:Arc<drm::sched::Scheduler<crate::m3_submit::Job>>, core_mask: u32, max_frequency_khz: u32,
+    soc: &'static crate::m3_soc::Soc }
 impl DrmGpu for Backend {
     fn init(&self) -> Result { if self.is_crashed() { Err(ENODEV) } else { Ok(()) } }
     fn ids(&self) -> &gpu::SequenceIDs { &self.ids }
@@ -155,10 +157,12 @@ impl DrmGpu for Backend {
     fn supports_scheduled_queues(&self)->bool {true}
     fn submission_error(&self) -> i32 { if self.is_crashed() { EIO.to_errno() } else { 0 } }
     fn params(&self) -> Result<DrmGpuParams> {
-        let masks = crate::m3_board::core_masks(self.core_mask);
+        let soc = self.soc;
+        let masks = crate::m3_board::core_masks(soc, self.core_mask);
         Ok(DrmGpuParams { gpu_generation: hw::GpuGen::G15 as u32,
-            gpu_variant: hw::GpuVariant::S as u32, gpu_revision: hw::GpuRevision::B1 as u32,
-            chip_id: 0x6030, num_dies: 1, num_clusters_total: 2, num_cores_per_cluster: 10,
+            gpu_variant: soc.gpu_variant as u32, gpu_revision: soc.gpu_revision as u32,
+            chip_id: soc.chip_id, num_dies: 1, num_clusters_total: soc.clusters,
+            num_cores_per_cluster: soc.cores_per_cluster,
             core_masks: masks, max_frequency_khz: self.max_frequency_khz, usc_generation: 3,
             gpu_hal_generation: hw::GpuHalGeneration::Legacy as u32,
             max_commands_per_submission: crate::file::MAX_COMMANDS_PER_SUBMISSION })

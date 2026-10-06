@@ -425,6 +425,36 @@ pub(crate) fn thermal_hot_param() -> (u64, bool) {
     (clamped, clamped != value)
 }
 
+/// Whether to start the runtime backend on a T8122 (`asahi.m3_backend`), and say why not.
+///
+/// The runtime starts only on the boards the T8122 table allows (the M3 MacBook Airs), with
+/// `auto` and `runtime` alike: it has not run on any T8122, so nothing forces it onto another
+/// board. The G15 manager backend is T6030-only.
+pub(crate) fn t8122_backend(pdev: &platform::Device<Core>) -> bool {
+    let dev = pdev.as_ref();
+    match M3_BACKEND.load(Ordering::Relaxed) {
+        BACKEND_OFF => {
+            dev_info!(dev, "M3: asahi.m3_backend=off: no GPU backend started\n");
+            false
+        }
+        BACKEND_MANAGER => {
+            dev_info!(
+                dev,
+                "M3: asahi.m3_backend=manager: the G15 manager backend is T6030-only; no GPU backend started\n"
+            );
+            false
+        }
+        _ if crate::m3_board::runtime_validated_board(&crate::m3_soc::T8122) => true,
+        _ => {
+            dev_info!(
+                dev,
+                "M3: no GPU backend on this T8122 board: the runtime backend may start only on the M3 MacBook Airs (J613, J615)\n"
+            );
+            false
+        }
+    }
+}
+
 /// Select the T6030 GPU backend from `asahi.m3_backend`, and say which one and why.
 ///
 /// `auto` starts the runtime backend on the boards it is validated on (the M3 Pro MacBook
@@ -445,7 +475,7 @@ pub(crate) fn t6030_backend(pdev: &platform::Device<Core>) -> T6030Backend {
             dev_info!(dev, "M3: asahi.m3_backend=off: no GPU backend started\n");
             T6030Backend::Off
         }
-        _ if crate::m3_board::runtime_validated_board() => T6030Backend::Runtime,
+        _ if crate::m3_board::runtime_validated_board(&crate::m3_soc::T6030) => T6030Backend::Runtime,
         _ => {
             dev_info!(
                 dev,

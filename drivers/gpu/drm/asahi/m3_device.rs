@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Owned M3 G15S register apertures. The platform
+//! Owned M3 register apertures. The platform
 //! power domain owns TVM/PMGR and stays on across probe/remove. Firmware and
 //! queues must be stopped before this object is released.
 
@@ -19,6 +19,7 @@ use kernel::{
 };
 
 use crate::m3_firmware::Firmware;
+use crate::m3_soc::Soc;
 
 const ASC_CPU_CONTROL: usize = 0x44;
 const ASC_CPU_RUN: u32 = 1 << 4;
@@ -29,10 +30,11 @@ pub(crate) struct Device {
     sgx: Pin<KBox<Devres<IoMem>>>,
     firmware: Firmware,
     core_mask: u32,
+    soc: &'static Soc,
 }
 
 impl Device {
-    pub(crate) fn new(pdev: &platform::Device<Core>, firmware: Firmware) -> Result<Self> {
+    pub(crate) fn new(pdev: &platform::Device<Core>, firmware: Firmware, soc: &'static Soc) -> Result<Self> {
         // Map ASC before taking a vote. The larger SGX aperture contains
         // this control window and the separate mailbox provider, so it is
         // mapped without a conflicting claim over those child resources.
@@ -62,7 +64,8 @@ impl Device {
         if asc.access(pdev.as_ref())?.read32(ASC_CPU_CONTROL) & ASC_CPU_RUN != 0 {
             dev_err!(
                 pdev.as_ref(),
-                "M3 G15S: ASC already running; refusing to take ownership\n"
+                "M3 {}: ASC already running; refusing to take ownership\n",
+                soc.gpu_name
             );
             return Err(EBUSY);
         }
@@ -72,23 +75,25 @@ impl Device {
             sgx,
             firmware,
             core_mask: 0,
+            soc,
         };
 
         let registers = device.sgx.access(pdev.as_ref())?;
         let version = registers.try_read32(0xd04000)?;
         let counts = registers.try_read32(0xd04010)?;
         let core_mask = registers.try_read32(0xe01500)?;
-        dev_info!(pdev.as_ref(), "M3 G15S: power acknowledged, version={:#010x} counts={:#010x} core-mask={:#x}, firmware={}\n",
-            version, counts, core_mask, device.firmware.version());
-        // These words identify the qualified M3 G15S configuration. The fused
-        // core mask varies with SKU; absent cores must never be enabled.
-        if version != 0x07031100
-            || counts != 0x00110209
-            || !crate::m3_board::core_mask_valid(core_mask)
+        dev_info!(pdev.as_ref(), "M3 {}: power acknowledged, version={:#010x} counts={:#010x} core-mask={:#x}, firmware={}\n",
+            soc.gpu_name, version, counts, core_mask, device.firmware.version());
+        // These words identify the qualified configuration of this SoC. The
+        // fused core mask varies with SKU; absent cores must never be enabled.
+        if version & soc.id.version_mask != soc.id.version
+            || counts & soc.id.counts_mask != soc.id.counts
+            || !crate::m3_board::core_mask_valid(soc, core_mask)
         {
             return Err(ENODEV);
         }
-        registers.try_write32(0x70001, 0xd14000)?;
+        let (setup_offset, setup_value) = soc.sgx_setup.ok_or(ENODEV)?;
+        registers.try_write32(setup_value, setup_offset)?;
         device.core_mask = core_mask;
         Ok(device)
     }
@@ -109,10 +114,10 @@ impl Device {
 
     pub(crate) fn check_drm(&self, pdev: &platform::Device<Core>) -> Result {
         use kernel::dma::{Device as _, DmaMask};
-        // SAFETY: This is the admitted T6030's 42-bit physical DMA capability.
+        // SAFETY: This is the admitted M3 GPU's 42-bit physical DMA capability.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(42)?)? };
         crate::mmu::check_handoff_guard()?;
-        dev_info!(pdev.as_ref(), "M3 G15S: GPU handoff lock checked.\n");
+        dev_info!(pdev.as_ref(), "M3 {}: GPU handoff lock checked.\n", self.soc.gpu_name);
         for _ in 0..2 {
             let drm: ARef<crate::driver::AsahiDevice> = kernel::drm::Device::new(
                 pdev.as_ref(), crate::driver::AsahiData::new(pdev, None, true))?;
@@ -122,7 +127,7 @@ impl Device {
             drop(object);
             drop(drm);
         }
-        dev_info!(pdev.as_ref(), "M3 G15S: DRM data initialized; backend absent, device unregistered\n");
+        dev_info!(pdev.as_ref(), "M3 {}: DRM data initialized; backend absent, device unregistered\n", self.soc.gpu_name);
         Ok(())
     }
 
@@ -137,10 +142,10 @@ impl Device {
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let pstate = sgx.try_read32(0xe01000)? & 0xf;
         if pstate == 0 {
-            dev_info!(self.dev.as_ref(), "M3 G15S: GPU is powered down; skipping engine/MMU register snapshot\n");
+            dev_info!(self.dev.as_ref(), "M3 {}: GPU is powered down; skipping engine/MMU register snapshot\n", self.soc.gpu_name);
             return Ok(());
         }
-        dev_info!(self.dev.as_ref(), "M3 G15S: reading engine/MMU snapshot at pstate={}\n", pstate);
+        dev_info!(self.dev.as_ref(), "M3 {}: reading engine/MMU snapshot at pstate={}\n", self.soc.gpu_name, pstate);
         let selector=sgx.try_read64(0xd800)?;
         for bank in [0,1,0x100,0x40000,0x40001,0x80000,0xc0000] {
             sgx.try_write64(bank,0xd800)?;
@@ -157,7 +162,7 @@ impl Device {
         let service=sgx.try_read32(0xa010)?;
         let debug=sgx.try_read32(0xa000)?;
         let cores=sgx.try_read32(0xe01500)?;
-        for core in 0..20 {
+        for core in 0..self.soc.clusters * self.soc.cores_per_cluster {
             if cores & (1<<core)==0 {continue;}
             sgx.try_write32(core,0xa010)?;
             sgx.try_write32(core,0xa000)?;
@@ -170,10 +175,10 @@ impl Device {
         sgx.try_write32(debug,0xa000)?;
         let mut mmu = [0u32; 13];
         for (i, word) in mmu.iter_mut().enumerate() { *word = sgx.try_read32(0xd08000 + i * 4)?; }
-        dev_info!(self.dev.as_ref(), "M3 G15S: GPU MMU configuration={:x?}\n", mmu);
+        dev_info!(self.dev.as_ref(), "M3 {}: GPU MMU configuration={:x?}\n", self.soc.gpu_name, mmu);
         for offset in [0xc000,0xc008,0xc010,0xc018,0xc020,0xc028,0xc030,0xc038,0xc060,0xc068,0xc070,0xc078,0xc088,0xc090,0xc098,0xc0a0,0xc0a8,0xc0b0, 0xc040, 0xc048, 0xc050, 0xc058, 0xc080, 0xc120, 0xc140, 0xc148,
             0xd8c0, 0xd8c8] {
-            dev_info!(self.dev.as_ref(), "M3 G15S: SGX +{:#x}={:#018x}\n", offset, sgx.try_read64(offset)?);
+            dev_info!(self.dev.as_ref(), "M3 {}: SGX +{:#x}={:#018x}\n", self.soc.gpu_name, offset, sgx.try_read64(offset)?);
         }
         Ok(())
 

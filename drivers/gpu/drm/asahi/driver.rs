@@ -30,6 +30,7 @@ use crate::{
     hw,
     identity,
     regs, //
+    t8122_admission,
 };
 
 use kernel::macros::vtable;
@@ -188,7 +189,9 @@ kernel::of_device_table!(
         // AGX3 (G15) identification targets. These intentionally select no
         // HwConfig: unproved power/MMIO/firmware-tuning fields must never be
         // represented by copied or zero-filled legacy values. T6030 starts
-        // the M3 runtime; the others fail closed before any firmware handoff.
+        // the M3 runtime; a handed-over T8122 is admitted by it and refused
+        // while its table is incomplete; the others fail closed before any
+        // firmware handoff.
         // The M4 (G16) and M5/A18 Pro (G17) bring-up runtimes are not bound
         // in this kernel.
         (
@@ -210,8 +213,33 @@ kernel::of_device_table!(
     ]
 );
 
-fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocConfig) -> Error {
+/// Start the M3 runtime on a T8122 (M3, G15G) whose GPU the boot loader handed over: only after
+/// its identity gate passes, and only on a board the T8122 table allows. The runtime then admits
+/// the boot loader's description and refuses the SoC while its table is incomplete
+/// (`m3_soc::T8122`).
+fn start_t8122(pdev: &platform::Device<Core>) -> Result<crate::m3_drm::Registered> {
+    // This gate reads only DT properties.
+    let identity = t8122_admission::read_identity(pdev).map_err(|error| {
+        dev_info!(
+            pdev.as_ref(),
+            "G15G: T8122 identity or ABI rejected ({:?}); startup refused\n",
+            error
+        );
+        ENODEV
+    })?;
+    dev_info!(
+        pdev.as_ref(),
+        "G15G: T8122 revision 2.0 identity admitted ({} active / {} slots)\n",
+        identity.active_cores,
+        identity.core_slots
+    );
+    if !crate::m3_params::t8122_backend(pdev) {
+        return Err(ENODEV);
+    }
+    crate::m3_drm::Registered::start(pdev, &crate::m3_soc::T8122)
+}
 
+fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocConfig) -> Error {
 
     let Some(expected) =
         identity::decode_gpu_identity(soc.hw_family, soc.hw_variant, soc.num_dies as u8)
@@ -388,7 +416,11 @@ impl platform::Driver for AsahiDriver {
                     crate::m3_params::T6030Backend::Off => return Err(ENODEV),
                     crate::m3_params::T6030Backend::Runtime => {}
                 }
-                let runtime = crate::m3_drm::Registered::start(pdev)?;
+                let runtime = crate::m3_drm::Registered::start(pdev, &crate::m3_soc::T6030)?;
+                return Ok(Self { runtime: AsahiRuntime::M3(runtime) });
+            }
+            ProbeConfig::Agx3Diagnostic(soc) if soc.chip_id == 0x8122 => {
+                let runtime = start_t8122(pdev)?;
                 return Ok(Self { runtime: AsahiRuntime::M3(runtime) });
             }
             ProbeConfig::Agx3Diagnostic(soc) => return Err(refuse_agx3_probe(pdev, soc)),

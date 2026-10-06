@@ -42,6 +42,7 @@ mod m3_compute_storage;
 mod m3_submit;
 mod m3_config;
 mod m3_board;
+mod m3_soc;
 mod m3_init_layout;
 mod m3_runtime;
 mod m3_completion;
@@ -56,6 +57,7 @@ mod m3_client;
 mod g15_boot;
 mod g15_initdata;
 mod g15_probe;
+mod t8122_admission;
 mod g15_selftest;
 #[cfg(CONFIG_DEV_COREDUMP)]
 mod agx_fault;

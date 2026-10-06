@@ -38,6 +38,27 @@
 		#address-cells = <2>;
 		#size-cells = <2>;
 		ranges;
+
+		/* Filled from the live ADT by opt-in m1n1 diagnostics. */
+		uat_handoff: uat-handoff {
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+
+		uat_pagetables: uat-pagetables {
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+
+		uat_ttbs: uat-ttbs {
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+
+		uat_pagetables_l2: uat-pagetables-l2 {
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
 		/* To be filled by loader */
 	};
 

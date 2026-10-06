@@ -73,6 +73,16 @@
 	interrupts-extended = <&pinctrl_ap 196 IRQ_TYPE_LEVEL_LOW>;
 };
 
+&dcp {
+	panel {
+		compatible = "apple,panel-j514", "apple,panel-mini-led", "apple,panel";
+		width-mm = <302>;
+		height-mm = <196>;
+		adj-height-mm = <189>;
+		apple,max-brightness = <500>;
+	};
+};
+
 &aop_audio {
 	apple,chassis-name = "J514";
 	apple,machine-kind = "MacBook Pro";
