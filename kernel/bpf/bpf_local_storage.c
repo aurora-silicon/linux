@@ -24,6 +24,11 @@ select_bucket(struct bpf_local_storage_map *smap,
 	return &smap->buckets[hash_ptr(local_storage, smap->bucket_log)];
 }
 
+static u32 bpf_selem_size(const struct bpf_local_storage_map *smap)
+{
+	return smap->elem_size + bpf_obj_uptr_extra_size(smap->map.record);
+}
+
 static int mem_charge(struct bpf_local_storage_map *smap, void *owner, u32 size)
 {
 	struct bpf_map *map = &smap->map;
@@ -72,10 +77,10 @@ bpf_selem_alloc(struct bpf_local_storage_map *smap, void *owner,
 {
 	struct bpf_local_storage_elem *selem;
 
-	if (mem_charge(smap, owner, smap->elem_size))
+	if (mem_charge(smap, owner, bpf_selem_size(smap)))
 		return NULL;
 
-	selem = bpf_map_kmalloc_nolock(&smap->map, smap->elem_size,
+	selem = bpf_map_kmalloc_nolock(&smap->map, bpf_selem_size(smap),
 				       __GFP_ZERO, NUMA_NO_NODE);
 
 	if (selem) {
@@ -91,7 +96,7 @@ bpf_selem_alloc(struct bpf_local_storage_map *smap, void *owner,
 		return selem;
 	}
 
-	mem_uncharge(smap, owner, smap->elem_size);
+	mem_uncharge(smap, owner, bpf_selem_size(smap));
 
 	return NULL;
 }
@@ -178,7 +183,7 @@ static void bpf_selem_unlink_storage_nolock_misc(struct bpf_local_storage_elem *
 						 bool free_local_storage, bool pin_owner)
 {
 	void *owner = local_storage->owner;
-	u32 uncharge = smap->elem_size;
+	u32 uncharge = bpf_selem_size(smap);
 
 	if (rcu_access_pointer(local_storage->cache[smap->cache_idx]) ==
 	    SDATA(selem))
@@ -204,7 +209,7 @@ static void bpf_selem_unlink_storage_nolock_misc(struct bpf_local_storage_elem *
 
 /* local_storage->lock must be held and selem->local_storage == local_storage.
  * The caller must ensure selem->smap is still valid to be
- * dereferenced for its smap->elem_size and smap->cache_idx.
+ * dereferenced for its element size and smap->cache_idx.
  */
 static bool bpf_selem_unlink_storage_nolock(struct bpf_local_storage *local_storage,
 					    struct bpf_local_storage_elem *selem,
@@ -234,7 +239,7 @@ void bpf_selem_link_storage_nolock(struct bpf_local_storage *local_storage,
 	struct bpf_local_storage_map *smap;
 
 	smap = rcu_dereference_check(SDATA(selem)->smap, bpf_rcu_lock_held());
-	local_storage->mem_charge += smap->elem_size;
+	local_storage->mem_charge += bpf_selem_size(smap);
 
 	RCU_INIT_POINTER(selem->local_storage, local_storage);
 	hlist_add_head_rcu(&selem->snode, &local_storage->list);
@@ -577,7 +582,7 @@ bpf_local_storage_update(void *owner, struct bpf_local_storage_map *smap,
 		err = bpf_local_storage_alloc(owner, smap, selem);
 		if (err) {
 			bpf_selem_free(selem, true);
-			mem_uncharge(smap, owner, smap->elem_size);
+			mem_uncharge(smap, owner, bpf_selem_size(smap));
 			return ERR_PTR(err);
 		}
 
@@ -661,7 +666,7 @@ unlock:
 free_selem:
 	bpf_selem_free_list(&old_selem_free_list, false);
 	if (alloc_selem) {
-		mem_uncharge(smap, owner, smap->elem_size);
+		mem_uncharge(smap, owner, bpf_selem_size(smap));
 		bpf_selem_free(alloc_selem, true);
 	}
 	return err ? ERR_PTR(err) : SDATA(selem);
@@ -862,7 +867,7 @@ restart:
 	 * exit immediately.
 	 *
 	 * However, while freeing the storage one still needs to access the
-	 * smap->elem_size to do the uncharging in
+	 * bpf_selem_size(smap) to do the uncharging in
 	 * bpf_selem_unlink_storage_nolock().
 	 *
 	 * Hence, wait another rcu grace period for the storage to be freed.

@@ -32,6 +32,8 @@
 #include <crypto/aead.h>
 #include <linux/highmem.h>
 #include <linux/module.h>
+#include <linux/mm.h>
+#include <linux/mm_subpage.h>
 #include <linux/netdevice.h>
 #include <net/dst.h>
 #include <net/inet_connection_sock.h>
@@ -144,6 +146,10 @@ static void destroy_record(struct tls_record_info *record)
 
 	for (i = 0; i < record->num_frags; i++)
 		__skb_frag_unref(&record->frags[i], false);
+
+#ifdef CONFIG_MM_SUBPAGE
+	mm_subpage_refs_put(record->subpage_refs);
+#endif
 	kfree(record);
 }
 
@@ -349,6 +355,9 @@ static int tls_create_new_record(struct tls_offload_context_tx *offload_ctx,
 	record = kmalloc_obj(*record);
 	if (!record)
 		return -ENOMEM;
+#ifdef CONFIG_MM_SUBPAGE
+	record->subpage_refs = NULL;
+#endif
 
 	frag = &record->frags[0];
 	skb_frag_fill_page_desc(frag, pfrag->page, pfrag->offset,
@@ -512,6 +521,15 @@ handle_error:
 				rc = -EIO;
 				goto handle_error;
 			}
+
+#ifdef CONFIG_MM_SUBPAGE
+			rc = mm_subpage_refs_add(&record->subpage_refs, zc_pfrag.page,
+						 off, copy, GFP_KERNEL);
+			if (rc) {
+				iov_iter_revert(iter, copy);
+				goto handle_error;
+			}
+#endif
 
 			zc_pfrag.offset = off;
 			zc_pfrag.size = copy;
@@ -1118,6 +1136,10 @@ int tls_set_device_offload(struct sock *sk)
 		goto release_netdev;
 	}
 
+
+#ifdef CONFIG_MM_SUBPAGE
+	start_marker_record->subpage_refs = NULL;
+#endif
 	offload_ctx = alloc_offload_ctx_tx(ctx);
 	if (!offload_ctx) {
 		rc = -ENOMEM;
