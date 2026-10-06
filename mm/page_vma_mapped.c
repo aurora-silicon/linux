@@ -87,7 +87,7 @@ again:
  * mapped at the @pvmw->pte
  * @pvmw: page_vma_mapped_walk struct, includes a pair pte and pfn range
  * for checking
- * @pte_nr: the number of small pages described by @pvmw->pte.
+ * @pte_nr: the number of native physical pages covered by @pvmw->pte.
  *
  * page_vma_mapped_walk() found a place where pfn range is *potentially*
  * mapped. check_pte() has to validate this.
@@ -108,6 +108,18 @@ static bool check_pte(struct page_vma_mapped_walk *pvmw, unsigned long pte_nr)
 {
 	unsigned long pfn;
 	pte_t ptent = ptep_get(pvmw->pte);
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (pvmw->flags & PVMW_SUBPAGE) {
+		if (!(pvmw->flags & PVMW_MIGRATION))
+			return pte_present(ptent) &&
+				pte_phys_mm(pvmw->vma->vm_mm, ptent) ==
+				PFN_PHYS(pvmw->pfn) + pvmw->subpage_offset;
+		if (pte_swp_subpage_offset(ptent) != pvmw->subpage_offset)
+			return false;
+		/* The common migration check below validates the native PFN. */
+	}
+#endif
 
 	if (pvmw->flags & PVMW_MIGRATION) {
 		const softleaf_t entry = softleaf_from_pte(ptent);
@@ -188,6 +200,18 @@ bool page_vma_mapped_walk(struct page_vma_mapped_walk *pvmw)
 	pud_t *pud;
 	pmd_t pmde;
 
+#ifdef CONFIG_MM_SUBPAGE
+	if (pvmw->flags & PVMW_SUBPAGE) {
+		if (WARN_ON_ONCE(pvmw->nr_pages != 1 ||
+				 mm_page_size(mm) >= PAGE_SIZE ||
+				 !IS_ALIGNED(pvmw->address, mm_page_size(mm)) ||
+				 pvmw->subpage_offset >= PAGE_SIZE ||
+				 !IS_ALIGNED(pvmw->subpage_offset, mm_page_size(mm)) ||
+				 is_vm_hugetlb_page(vma)))
+			return not_found(pvmw);
+	}
+#endif
+
 	/* The only possible pmd mapping has been handled on last iteration */
 	if (pvmw->pmd && !pvmw->pte)
 		return not_found(pvmw);
@@ -213,6 +237,9 @@ bool page_vma_mapped_walk(struct page_vma_mapped_walk *pvmw)
 		return true;
 	}
 
+	/* A query for an interior native page still visits one whole user leaf. */
+	if (mm_page_size(mm) > PAGE_SIZE)
+		pvmw->address &= mm_page_mask(mm);
 	end = vma_address_end(pvmw);
 	if (pvmw->pte)
 		goto next_pte;
@@ -220,21 +247,21 @@ restart:
 	do {
 		pgd = pgd_offset(mm, pvmw->address);
 		if (!pgd_present(*pgd)) {
-			step_forward(pvmw, PGDIR_SIZE);
+			step_forward(pvmw, pgd_size_mm(mm));
 			continue;
 		}
-		p4d = p4d_offset(pgd, pvmw->address);
-		if (!p4d_present(*p4d)) {
-			step_forward(pvmw, P4D_SIZE);
+		p4d = p4d_offset_mm(mm, pgd, pvmw->address);
+		if (!p4d_present_mm(mm, *p4d)) {
+			step_forward(pvmw, p4d_size_mm(mm));
 			continue;
 		}
-		pud = pud_offset(p4d, pvmw->address);
+		pud = pud_offset_mm(mm, p4d, pvmw->address);
 		if (!pud_present(*pud)) {
-			step_forward(pvmw, PUD_SIZE);
+			step_forward(pvmw, pud_size_mm(mm));
 			continue;
 		}
 
-		pvmw->pmd = pmd_offset(pud, pvmw->address);
+		pvmw->pmd = pmd_offset_mm(mm, pud, pvmw->address);
 		/*
 		 * Make sure the pmd value isn't cached in a register by the
 		 * compiler and used as a stale value after we've observed a
@@ -245,6 +272,9 @@ restart:
 		if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) &&
 		    (pmd_trans_huge(pmde) || pmd_is_migration_entry(pmde) ||
 		    pmd_is_device_private_entry(pmde))) {
+			/* Subpage PMD mappings need a distinct huge-page implementation. */
+			if (mm_page_size(mm) != PAGE_SIZE)
+				return not_found(pvmw);
 			pvmw->ptl = pmd_lock(mm, pvmw->pmd);
 			pmde = *pvmw->pmd;
 			if (pmd_is_migration_entry(pmde)) {
@@ -285,7 +315,7 @@ restart:
 			    (pvmw->nr_pages >= HPAGE_PMD_NR))
 				sync_with_folio_pmd_zap(mm, pvmw->pmd);
 
-			step_forward(pvmw, PMD_SIZE);
+			step_forward(pvmw, pmd_size_mm(mm));
 			continue;
 		}
 		if (!map_pte(pvmw, &pmde, &ptl)) {
@@ -294,15 +324,15 @@ restart:
 			goto next_pte;
 		}
 this_pte:
-		if (check_pte(pvmw, 1))
+		if (check_pte(pvmw, mm_pte_native_pages(mm)))
 			return true;
 next_pte:
 		do {
-			pvmw->address += PAGE_SIZE;
+			pvmw->address += mm_page_size(mm);
 			if (pvmw->address >= end)
 				return not_found(pvmw);
 			/* Did we cross page table boundary? */
-			if ((pvmw->address & (PMD_SIZE - PAGE_SIZE)) == 0) {
+			if ((pvmw->address & (pmd_size_mm(mm) - mm_page_size(mm))) == 0) {
 				if (pvmw->ptl) {
 					spin_unlock(pvmw->ptl);
 					pvmw->ptl = NULL;
@@ -345,6 +375,7 @@ unsigned long page_mapped_in_vma(const struct page *page,
 		struct vm_area_struct *vma)
 {
 	const struct folio *folio = page_folio(page);
+	unsigned long address;
 	struct page_vma_mapped_walk pvmw = {
 		.pfn = page_to_pfn(page),
 		.nr_pages = 1,
@@ -352,13 +383,15 @@ unsigned long page_mapped_in_vma(const struct page *page,
 		.flags = PVMW_SYNC,
 	};
 
-	pvmw.address = vma_address(vma, page_pgoff(folio, page), 1);
+	address = vma_address(vma, page_pgoff(folio, page), 1);
+	pvmw.address = address;
 	if (pvmw.address == -EFAULT)
 		goto out;
 	if (!page_vma_mapped_walk(&pvmw))
 		return -EFAULT;
 	page_vma_mapped_walk_done(&pvmw);
 out:
-	return pvmw.address;
+	/* Report this native page's byte address, not the covering leaf start. */
+	return address;
 }
 #endif

@@ -7,7 +7,6 @@
 #include <linux/tracepoint.h>
 #include <trace/events/mmflags.h>
 
-#define PG_COUNT_TO_KB(x) ((x) << (PAGE_SHIFT - 10))
 
 TRACE_EVENT(oom_score_adj_update,
 
@@ -93,10 +92,10 @@ TRACE_EVENT(mark_victim,
 	TP_fast_assign(
 		__entry->pid = task->pid;
 		__assign_str(comm);
-		__entry->total_vm = PG_COUNT_TO_KB(task->mm->total_vm);
-		__entry->anon_rss = PG_COUNT_TO_KB(get_mm_counter(task->mm, MM_ANONPAGES));
-		__entry->file_rss = PG_COUNT_TO_KB(get_mm_counter(task->mm, MM_FILEPAGES));
-		__entry->shmem_rss = PG_COUNT_TO_KB(get_mm_counter(task->mm, MM_SHMEMPAGES));
+		__entry->total_vm = mm_pages_to_kb(task->mm, task->mm->total_vm);
+		__entry->anon_rss = mm_pages_to_kb(task->mm, get_mm_counter(task->mm, MM_ANONPAGES));
+		__entry->file_rss = mm_pages_to_kb(task->mm, get_mm_counter(task->mm, MM_FILEPAGES));
+		__entry->shmem_rss = mm_pages_to_kb(task->mm, get_mm_counter(task->mm, MM_SHMEMPAGES));
 		__entry->uid = uid;
 		__entry->pgtables = mm_pgtables_bytes(task->mm) >> 10;
 		__entry->oom_score_adj = task->signal->oom_score_adj;

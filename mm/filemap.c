@@ -225,6 +225,7 @@ void __filemap_remove_folio(struct folio *folio, void *shadow)
 
 	trace_mm_filemap_delete_from_page_cache(folio);
 	filemap_unaccount_folio(mapping, folio);
+	shmem_uffd_forget(mapping, folio->index, folio_nr_pages(folio));
 	page_cache_delete(mapping, folio, shadow);
 }
 
@@ -308,6 +309,7 @@ static void page_cache_delete_batch(struct address_space *mapping,
 
 		WARN_ON_ONCE(!folio_test_locked(folio));
 
+		shmem_uffd_forget(mapping, folio->index, folio_nr_pages(folio));
 		folio->mapping = NULL;
 		/* Leave folio->index set: truncation lookup relies on it */
 
@@ -827,6 +829,7 @@ void replace_page_cache_folio(struct folio *old, struct folio *new)
 	mem_cgroup_replace_folio(old, new);
 
 	xas_lock_irq(&xas);
+	shmem_uffd_migrate(new, old);
 	xas_store(&xas, new);
 
 	old->mapping = NULL;
@@ -3387,7 +3390,7 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
 		 */
 		struct vm_area_struct *vma = vmf->vma;
 		unsigned long start = vma->vm_pgoff;
-		unsigned long end = start + vma_pages(vma);
+		unsigned long end = vma_last_pgoff(vma) + 1;
 		unsigned long ra_end;
 
 		ra->order = exec_folio_order();
@@ -3529,7 +3532,12 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
 	bool mapping_locked = false;
 
 	max_idx = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
-	if (unlikely(index >= max_idx))
+	if (unlikely(index >= max_idx
+#ifdef CONFIG_MM_SUBPAGE
+		     || (mm_page_size(vmf->vma->vm_mm) < PAGE_SIZE &&
+			 !vma_file_offset_valid(vmf->vma, vmf->address, i_size_read(inode)))
+#endif
+		    ))
 		return VM_FAULT_SIGBUS;
 
 	trace_mm_filemap_fault(mapping, index);
@@ -3633,7 +3641,12 @@ retry_find:
 	 * We must recheck i_size under page lock.
 	 */
 	max_idx = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
-	if (unlikely(index >= max_idx)) {
+	if (unlikely(index >= max_idx
+#ifdef CONFIG_MM_SUBPAGE
+		     || (mm_page_size(vmf->vma->vm_mm) < PAGE_SIZE &&
+			 !vma_file_offset_valid(vmf->vma, vmf->address, i_size_read(inode)))
+#endif
+		    )) {
 		folio_unlock(folio);
 		folio_put(folio);
 		return VM_FAULT_SIGBUS;
@@ -3783,6 +3796,10 @@ static vm_fault_t filemap_map_folio_range(struct vm_fault *vmf,
 	}
 
 	do {
+		if (userfaultfd_missing(vmf->vma) &&
+		    shmem_uffd_range_missing(folio, folio->index +
+			folio_page_idx(folio, page + count), 0, PAGE_SIZE))
+			goto skip;
 		if (PageHWPoison(page + count))
 			goto skip;
 
@@ -3847,6 +3864,9 @@ static vm_fault_t filemap_map_order0_folio(struct vm_fault *vmf,
 	vm_fault_t ret = 0;
 	struct page *page = &folio->page;
 
+	if (userfaultfd_missing(vmf->vma) &&
+	    shmem_uffd_range_missing(folio, folio->index, 0, PAGE_SIZE))
+		goto out;
 	if (PageHWPoison(page))
 		goto out;
 
@@ -3875,6 +3895,48 @@ out:
 	return ret;
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+static vm_fault_t filemap_map_user_pages(struct vm_fault *vmf,
+		pgoff_t first, pgoff_t last)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct address_space *mapping = vma->vm_file->f_mapping;
+	XA_STATE(xas, &mapping->i_pages, first);
+	struct folio *folio;
+	vm_fault_t ret = 0;
+	unsigned short miss = 0, saved;
+
+	rcu_read_lock();
+	folio = next_uptodate_folio(&xas, mapping, last);
+	if (!folio)
+		goto out;
+	if (pmd_none(*vmf->pmd) && vmf->prealloc_pte)
+		pmd_install(vma->vm_mm, vmf->pmd, &vmf->prealloc_pte);
+	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
+				       vmf->address, &vmf->ptl);
+	if (!vmf->pte) {
+		folio_unlock(folio);
+		folio_put(folio);
+		goto out;
+	}
+	do {
+		ret |= map_file_user_pages(vmf, folio, first, last, false);
+		if (!folio_test_workingset(folio))
+			miss += min(folio_next_index(folio) - 1, last) -
+				max(folio->index, first) + 1;
+		folio_unlock(folio);
+		folio_put(folio);
+	} while ((folio = next_uptodate_folio(&xas, mapping, last)) != NULL);
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+	trace_mm_filemap_map_pages(mapping, first, last);
+out:
+	rcu_read_unlock();
+	saved = READ_ONCE(vma->vm_file->f_ra.mmap_miss);
+	WRITE_ONCE(vma->vm_file->f_ra.mmap_miss, saved > miss ? saved - miss : 0);
+	return ret;
+}
+#endif
+
 vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 			     pgoff_t start_pgoff, pgoff_t end_pgoff)
 {
@@ -3889,6 +3951,11 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 	unsigned long rss = 0;
 	unsigned int nr_pages = 0, folio_type;
 	unsigned short mmap_miss = 0, mmap_miss_saved;
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(vma->vm_mm) != PAGE_SIZE)
+		return filemap_map_user_pages(vmf, start_pgoff, end_pgoff);
+#endif
 
 	/*
 	 * Recalculate end_pgoff based on file_end before calling

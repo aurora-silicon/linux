@@ -15,9 +15,10 @@ struct perf_buffer {
 	struct rcu_head			rcu_head;
 #ifdef CONFIG_PERF_USE_VMALLOC
 	struct work_struct		work;
-	int				page_order;	/* allocation order  */
 #endif
 	int				nr_pages;	/* nr of data pages  */
+	unsigned int			data_page_shift; /* bytes per output chunk */
+	unsigned int			mmap_page_shift; /* userspace metadata size */
 	int				overwrite;	/* can overwrite itself */
 	int				paused;		/* can write into ring buffer */
 
@@ -44,7 +45,7 @@ struct perf_buffer {
 	long				aux_head;
 	unsigned int			aux_nest;
 	long				aux_wakeup;	/* last aux_watermark boundary crossed by aux_head */
-	unsigned long			aux_pgoff;
+	u64				aux_offset;
 	int				aux_nr_pages;
 	int				aux_overwrite;
 	refcount_t			aux_mmap_count;
@@ -80,10 +81,11 @@ static inline void rb_toggle_paused(struct perf_buffer *rb, bool pause)
 }
 
 extern struct perf_buffer *
-rb_alloc(int nr_pages, long watermark, int cpu, int flags);
+rb_alloc(unsigned long data_size, unsigned int mmap_page_shift,
+	 long watermark, int cpu, int flags);
 extern void perf_event_wakeup(struct perf_event *event);
 extern int rb_alloc_aux(struct perf_buffer *rb, struct perf_event *event,
-			pgoff_t pgoff, int nr_pages, long watermark, int flags);
+			u64 offset, int nr_pages, long watermark, int flags);
 extern void rb_free_aux(struct perf_buffer *rb);
 extern struct perf_buffer *ring_buffer_get(struct perf_event *event);
 extern void ring_buffer_put(struct perf_buffer *rb);
@@ -99,34 +101,19 @@ void perf_event_aux_event(struct perf_event *event, unsigned long head,
 extern struct page *
 perf_mmap_to_page(struct perf_buffer *rb, unsigned long pgoff);
 
-#ifdef CONFIG_PERF_USE_VMALLOC
-/*
- * Back perf_mmap() with vmalloc memory.
- *
- * Required for architectures that have d-cache aliasing issues.
- */
-
-static inline int page_order(struct perf_buffer *rb)
+static inline unsigned long perf_data_size(struct perf_buffer *rb)
 {
-	return rb->page_order;
+	return (unsigned long)rb->nr_pages << rb->data_page_shift;
 }
-
-#else
-
-static inline int page_order(struct perf_buffer *rb)
-{
-	return 0;
-}
-#endif
 
 static inline int data_page_nr(struct perf_buffer *rb)
 {
-	return rb->nr_pages << page_order(rb);
+	return DIV_ROUND_UP(perf_data_size(rb), PAGE_SIZE);
 }
 
-static inline unsigned long perf_data_size(struct perf_buffer *rb)
+static inline unsigned long perf_metadata_size(struct perf_buffer *rb)
 {
-	return rb->nr_pages << (PAGE_SHIFT + page_order(rb));
+	return 1UL << rb->mmap_page_shift;
 }
 
 static inline unsigned long perf_aux_size(struct perf_buffer *rb)
@@ -154,7 +141,7 @@ static inline unsigned long perf_aux_size(struct perf_buffer *rb)
 			handle->page++;					\
 			handle->page &= rb->nr_pages - 1;		\
 			handle->addr = rb->data_pages[handle->page];	\
-			handle->size = PAGE_SIZE << page_order(rb);	\
+			handle->size = 1UL << rb->data_page_shift;	\
 		}							\
 	} while (len && written == size);				\
 									\

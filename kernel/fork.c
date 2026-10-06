@@ -112,7 +112,7 @@
 #include <linux/pgalloc.h>
 #include <linux/uaccess.h>
 
-#include <asm/mmu_context.h>
+#include <linux/mmu_context.h>
 #include <asm/cacheflush.h>
 #include <asm/tlbflush.h>
 
@@ -639,6 +639,12 @@ static void check_mm(struct mm_struct *mm)
 		}
 	}
 
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm->committed_user_pages)
+		pr_alert("BUG: non-zero user commitment on freeing mm: %lu\n",
+			 mm->committed_user_pages);
+#endif
+
 	if (mm_pgtables_bytes(mm))
 		pr_alert("BUG: non-zero pgtables_bytes on freeing mm: %ld\n",
 				mm_pgtables_bytes(mm));
@@ -1089,6 +1095,9 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	INIT_LIST_HEAD(&mm->mmlist);
 	mm_pgtables_bytes_init(mm);
 	mm->map_count = 0;
+#ifdef CONFIG_MM_SUBPAGE
+	mm->committed_user_pages = 0;
+#endif
 	mm->locked_vm = 0;
 	atomic64_set(&mm->pinned_vm, 0);
 	memset(&mm->rss_stat, 0, sizeof(mm->rss_stat));
@@ -1159,7 +1168,7 @@ fail_mm_init:
 /*
  * Allocate and initialize an mm_struct.
  */
-struct mm_struct *mm_alloc(void)
+static struct mm_struct *__mm_alloc(bool for_exec, unsigned int page_shift)
 {
 	struct mm_struct *mm;
 
@@ -1168,9 +1177,31 @@ struct mm_struct *mm_alloc(void)
 		return NULL;
 
 	memset(mm, 0, sizeof(*mm));
+	if (for_exec)
+		arch_mm_init_exec(mm, page_shift);
 	return mm_init(mm, current, current_user_ns());
 }
+
+struct mm_struct *mm_alloc(void)
+{
+	return __mm_alloc(false, 0);
+}
 EXPORT_SYMBOL_IF_KUNIT(mm_alloc);
+
+struct mm_struct *mm_alloc_exec(void)
+{
+#ifdef CONFIG_ARCH_HAS_USER_PAGE_SIZE
+	return __mm_alloc(true, current->exec_page_shift);
+#else
+	return __mm_alloc(true, 0);
+#endif
+}
+
+/* The caller has validated the requested exec granule. */
+struct mm_struct *mm_alloc_exec_page_shift(unsigned int page_shift)
+{
+	return __mm_alloc(true, page_shift);
+}
 
 static inline void __mmput(struct mm_struct *mm)
 {

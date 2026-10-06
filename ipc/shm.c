@@ -51,6 +51,14 @@
 
 #include "util.h"
 
+#ifndef arch_shm_attach_align
+static unsigned long arch_shm_attach_align(const struct mm_struct *mm,
+					   unsigned long align)
+{
+	return align;
+}
+#endif
+
 struct shmid_kernel /* private to the kernel */
 {
 	struct kern_ipc_perm	shm_perm;
@@ -1538,6 +1546,7 @@ long do_shmat(int shmid, char __user *shmaddr, int shmflg,
 	if (shmid < 0)
 		goto out;
 
+	shmlba = arch_shm_attach_align(current->mm, shmlba);
 	if (addr) {
 		if (addr & (shmlba - 1)) {
 			if (shmflg & SHM_RND) {
@@ -1552,7 +1561,7 @@ long do_shmat(int shmid, char __user *shmaddr, int shmflg,
 					goto out;
 			} else
 #ifndef __ARCH_FORCE_SHMLBA
-				if (addr & ~PAGE_MASK)
+				if (addr & ~mm_page_mask(current->mm))
 #endif
 					goto out;
 		}
@@ -1723,6 +1732,20 @@ COMPAT_SYSCALL_DEFINE3(shmat, int, shmid, compat_uptr_t, shmaddr, int, shmflg)
 }
 #endif
 
+/* VMA splits retain native file indices plus a subpage byte offset. */
+#ifdef CONFIG_MMU
+static bool shm_vma_matches_addr(struct vm_area_struct *vma, unsigned long addr)
+{
+	unsigned long offset;
+
+	if (vma->vm_ops != &shm_vm_ops || vma->vm_start < addr)
+		return false;
+	offset = vma->vm_start - addr;
+	return (offset >> PAGE_SHIFT) == vma->vm_pgoff &&
+	       (offset & ~PAGE_MASK) == vma_subpage_offset(vma);
+}
+#endif
+
 /*
  * detach and kill segment if marked destroyed.
  * The work is done in shm_close.
@@ -1739,7 +1762,7 @@ long ksys_shmdt(char __user *shmaddr)
 	VMA_ITERATOR(vmi, mm, addr);
 #endif
 
-	if (addr & ~PAGE_MASK)
+	if (addr & ~mm_page_mask(mm))
 		return retval;
 
 	if (mmap_write_lock_killable(mm))
@@ -1774,8 +1797,7 @@ long ksys_shmdt(char __user *shmaddr)
 		 * a fragment created by mprotect() and/or munmap(), or it
 		 * otherwise it starts at this address with no hassles.
 		 */
-		if ((vma->vm_ops == &shm_vm_ops) &&
-			(vma->vm_start - addr)/PAGE_SIZE == vma->vm_pgoff) {
+		if (shm_vma_matches_addr(vma, addr)) {
 
 			/*
 			 * Record the file of the shm segment being
@@ -1804,12 +1826,10 @@ long ksys_shmdt(char __user *shmaddr)
 	 * could possibly have landed at. Also cast things to loff_t to
 	 * prevent overflows and make comparisons vs. equal-width types.
 	 */
-	size = PAGE_ALIGN(size);
+	size = ALIGN(size, mm_page_size(mm));
 	while (vma && (loff_t)(vma->vm_end - addr) <= size) {
 		/* finding a matching vma now does not alter retval */
-		if ((vma->vm_ops == &shm_vm_ops) &&
-		    ((vma->vm_start - addr)/PAGE_SIZE == vma->vm_pgoff) &&
-		    (vma->vm_file == file)) {
+		if (shm_vma_matches_addr(vma, addr) && vma->vm_file == file) {
 			do_vmi_align_munmap(&vmi, vma, mm, vma->vm_start,
 					    vma->vm_end, NULL, false);
 		}

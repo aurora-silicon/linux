@@ -330,6 +330,21 @@ struct folio *vma_alloc_zeroed_movable_folio(struct vm_area_struct *vma,
 }
 #endif
 
+#ifndef vma_alloc_zeroed_movable_folio_order
+static inline struct folio *vma_alloc_zeroed_movable_folio_order(
+		struct vm_area_struct *vma, unsigned long addr, unsigned int order)
+{
+	struct folio *folio;
+
+	if (!order)
+		return vma_alloc_zeroed_movable_folio(vma, addr);
+	folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE, order, vma, addr);
+	if (folio && user_alloc_needs_zeroing())
+		clear_user_highpages(&folio->page, addr, folio_nr_pages(folio));
+	return folio;
+}
+#endif
+
 static inline void clear_highpage(struct page *page)
 {
 	void *kaddr = kmap_local_page(page);

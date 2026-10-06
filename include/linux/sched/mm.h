@@ -14,6 +14,10 @@
  * Routines for handling mm_structs
  */
 extern struct mm_struct *mm_alloc(void);
+extern struct mm_struct *mm_alloc_exec(void);
+extern struct mm_struct *mm_alloc_exec_page_shift(unsigned int page_shift);
+/* Return zero for native, an alternative shift, or a negative errno. */
+int arch_exec_page_size_shift(unsigned long size);
 
 /**
  * mmgrab() - Pin a &struct mm_struct.

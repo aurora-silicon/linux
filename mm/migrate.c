@@ -14,6 +14,8 @@
  */
 
 #include <linux/migrate.h>
+#include <linux/mm_subpage.h>
+#include <linux/shmem_fs.h>
 #include <linux/export.h>
 #include <linux/swap.h>
 #include <linux/leafops.h>
@@ -340,14 +342,50 @@ struct rmap_walk_arg {
 	bool map_unused_to_zeropage;
 };
 
+#ifdef CONFIG_MM_SUBPAGE
+static void remove_migration_subpage(struct folio *folio,
+		struct page_vma_mapped_walk *pvmw, pte_t old)
+{
+	struct vm_area_struct *vma = pvmw->vma;
+	softleaf_t entry = softleaf_from_pte(old);
+	struct mm_subpage *slot;
+	pte_t pte;
+	int ret;
+
+	slot = mm_subpage_migrate_restore(folio, pte_swp_subpage_offset(old));
+	pte = phys_pte_mm(vma->vm_mm, mm_subpage_phys(slot), READ_ONCE(vma->vm_page_prot));
+	if (!softleaf_is_migration_young(entry))
+		pte = pte_mkold(pte);
+	if (folio_test_dirty(folio) && softleaf_is_migration_dirty(entry))
+		pte = pte_mkdirty(pte);
+	if (pte_swp_soft_dirty(old))
+		pte = pte_mksoft_dirty(pte);
+	else
+		pte = pte_clear_soft_dirty(pte);
+	if (softleaf_is_migration_write(entry))
+		pte = pte_mkwrite(pte, vma);
+	else if (pte_swp_uffd_wp(old))
+		pte = pte_mkuffd_wp(pte);
+	if (!softleaf_is_migration_read(entry))
+		mm_subpage_set_exclusive(slot);
+	ret = mm_subpage_add_anon_rmap(slot, vma, pvmw->address);
+	VM_BUG_ON_FOLIO(ret, folio);
+	set_pte_at(vma->vm_mm, pvmw->address, pvmw->pte, pte);
+	if (READ_ONCE(vma->vm_flags) & VM_LOCKED)
+		mlock_drain_local();
+	trace_remove_migration_pte(pvmw->address, pte_val(pte), 0);
+	update_mmu_cache(vma, pvmw->address, pvmw->pte);
+}
+#endif
+
 /*
  * Restore a potential migration pte to a working pte entry
  */
 static bool remove_migration_pte(struct folio *folio,
-		struct vm_area_struct *vma, unsigned long addr, void *arg)
+		struct vm_area_struct *vma, struct rmap_walk_range rmap, void *arg)
 {
 	struct rmap_walk_arg *rmap_walk_arg = arg;
-	DEFINE_FOLIO_VMA_WALK(pvmw, rmap_walk_arg->folio, vma, addr, PVMW_SYNC | PVMW_MIGRATION);
+	DEFINE_FOLIO_RMAP_WALK(pvmw, rmap_walk_arg->folio, vma, rmap, PVMW_SYNC | PVMW_MIGRATION);
 
 	while (page_vma_mapped_walk(&pvmw)) {
 		rmap_t rmap_flags = RMAP_NONE;
@@ -372,12 +410,28 @@ static bool remove_migration_pte(struct folio *folio,
 		}
 #endif
 		old_pte = ptep_get(pvmw.pte);
+#ifdef CONFIG_MM_SUBPAGE
+		if (mm_page_size(vma->vm_mm) < PAGE_SIZE && folio_test_anon(folio)) {
+			remove_migration_subpage(folio, &pvmw, old_pte);
+			continue;
+		}
+#endif
 		if (rmap_walk_arg->map_unused_to_zeropage &&
 		    try_to_map_unused_to_zeropage(&pvmw, folio, old_pte, idx))
 			continue;
 
-		folio_get(folio);
+		/* Match the native-page references dropped by try_to_migrate_one(). */
+		if (!folio_test_hugetlb(folio))
+			folio_ref_add(folio, mm_pte_native_pages(vma->vm_mm));
+		else
+			folio_get(folio);
 		pte = mk_pte(new, READ_ONCE(vma->vm_page_prot));
+
+#ifdef CONFIG_MM_SUBPAGE
+		if (mm_page_size(vma->vm_mm) < PAGE_SIZE)
+			pte = phys_pte_mm(vma->vm_mm, page_to_phys(new) +
+					  pte_swp_subpage_offset(old_pte), READ_ONCE(vma->vm_page_prot));
+#endif
 
 		entry = softleaf_from_pte(old_pte);
 		if (!softleaf_is_migration_young(entry))
@@ -431,8 +485,10 @@ static bool remove_migration_pte(struct folio *folio,
 			if (folio_test_anon(folio))
 				folio_add_anon_rmap_pte(folio, new, vma,
 							pvmw.address, rmap_flags);
-			else
+			else {
+				mm_subpage_file_map_add(vma, pte_phys_mm(vma->vm_mm, pte));
 				folio_add_file_rmap_pte(folio, new, vma);
+			}
 			set_pte_at(vma->vm_mm, pvmw.address, pvmw.pte, pte);
 		}
 		if (READ_ONCE(vma->vm_flags) & VM_LOCKED)
@@ -640,10 +696,12 @@ static int __folio_migrate_mapping(struct address_space *mapping,
 		folio_set_dirty(newfolio);
 	}
 
-	if (folio_test_swapcache(folio))
+	if (folio_test_swapcache(folio)) {
 		__swap_cache_replace_folio(ci, folio, newfolio);
-	else
+	} else {
+		shmem_uffd_migrate(newfolio, folio);
 		xas_store(&xas, newfolio);
+	}
 
 	/*
 	 * Drop cache reference from old folio by unfreezing
@@ -1170,8 +1228,10 @@ static void migrate_folio_undo_src(struct folio *src,
 	/* Drop an anon_vma reference if we took one */
 	if (anon_vma)
 		put_anon_vma(anon_vma);
-	if (locked)
+	if (locked) {
+		mm_subpage_migrate_finish(src);
 		folio_unlock(src);
+	}
 	if (ret)
 		list_move_tail(&src->lru, ret);
 }
@@ -1180,8 +1240,10 @@ static void migrate_folio_undo_src(struct folio *src,
 static void migrate_folio_undo_dst(struct folio *dst, bool locked,
 		free_folio_t put_new_folio, unsigned long private)
 {
-	if (locked)
+	if (locked) {
+		mm_subpage_migrate_finish(dst);
 		folio_unlock(dst);
+	}
 	if (put_new_folio)
 		put_new_folio(dst, private);
 	else
@@ -1306,6 +1368,11 @@ static int migrate_folio_unmap(new_folio_t get_new_folio,
 		return 0;
 	}
 
+	rc = mm_subpage_migrate_prepare(src, dst);
+	if (rc)
+		goto out;
+	rc = -EAGAIN;
+
 	/*
 	 * Corner case handling:
 	 * 1. When a new swap-cache page is read into, it is added to the LRU
@@ -1411,6 +1478,8 @@ static int migrate_folio_move(free_folio_t put_new_folio, unsigned long private,
 		remove_migration_ptes(src, dst, 0);
 
 out_unlock_both:
+	mm_subpage_migrate_finish(src);
+	mm_subpage_migrate_finish(dst);
 	folio_unlock(dst);
 	folio_set_owner_migrate_reason(dst, reason);
 	/*

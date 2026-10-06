@@ -427,6 +427,10 @@ void swap_update_readahead(struct folio *folio, struct vm_area_struct *vma,
 	if (unlikely(folio_test_large(folio)))
 		return;
 
+	/* Small-granule PTEs currently use native swap-cluster readahead. */
+	if (vma && mm_page_size(vma->vm_mm) != PAGE_SIZE)
+		vma = NULL;
+
 	readahead = folio_test_clear_readahead(folio);
 	if (vma && vma_ra) {
 		unsigned long ra_val;
@@ -896,7 +900,7 @@ struct folio *swapin_readahead(swp_entry_t entry, gfp_t gfp_mask,
 	struct folio *folio;
 
 	mpol = get_vma_policy(vmf->vma, vmf->address, 0, &ilx);
-	folio = swap_use_vma_readahead() ?
+	folio = swap_use_vma_readahead() && mm_page_size(vmf->vma->vm_mm) == PAGE_SIZE ?
 		swap_vma_readahead(entry, gfp_mask, mpol, ilx, vmf) :
 		swap_cluster_readahead(entry, gfp_mask, mpol, ilx);
 	mpol_cond_put(mpol);

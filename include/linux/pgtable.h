@@ -12,10 +12,17 @@
 #ifdef CONFIG_MMU
 
 #include <linux/mm_types.h>
+#include <linux/mm_granule.h>
 #include <linux/bug.h>
 #include <linux/errno.h>
 #include <asm-generic/pgtable_uffd.h>
 #include <linux/page_table_check.h>
+
+/* pgtable_t is an opaque allocation token, not necessarily struct page *. */
+#ifndef pgtable_to_page
+#define pgtable_to_page(table) (table)
+#define pgtable_from_page(page) (page)
+#endif
 
 #if 5 - defined(__PAGETABLE_P4D_FOLDED) - defined(__PAGETABLE_PUD_FOLDED) - \
 	defined(__PAGETABLE_PMD_FOLDED) != CONFIG_PGTABLE_LEVELS
@@ -154,6 +161,59 @@ static inline pgd_t *pgd_offset_pgd(pgd_t *pgd, unsigned long address)
  * of a process's
  */
 #define pgd_offset_k(address)		pgd_offset(&init_mm, (address))
+
+/* Explicit target-mm accessors; legacy accessors keep native geometry. */
+#ifndef pte_phys_mm
+#define pte_phys_mm(mm, pte) PFN_PHYS(pte_pfn(pte))
+#endif
+#ifndef phys_pte_mm
+#define phys_pte_mm(mm, phys, prot) pfn_pte((phys) >> PAGE_SHIFT, prot)
+#endif
+#ifndef pte_pgprot_mm
+#define pte_pgprot_mm(mm, pte) pte_pgprot(pte)
+#endif
+#ifndef pgd_offset_pgd_mm
+#define pgd_offset_pgd_mm(mm, pgd, addr) pgd_offset_pgd(pgd, addr)
+#endif
+#ifndef p4d_offset_mm
+#define p4d_offset_mm(mm, pgd, addr) p4d_offset(pgd, addr)
+#endif
+#ifndef pud_offset_mm
+#define pud_offset_mm(mm, p4d, addr) pud_offset(p4d, addr)
+#endif
+#ifndef pmd_offset_mm
+#define pmd_offset_mm(mm, pud, addr) pmd_offset(pud, addr)
+#endif
+#ifndef __pte_map_mm
+#define __pte_map_mm(mm, pmd, addr) __pte_map(pmd, addr)
+#endif
+#ifndef pte_offset_kernel_mm
+#define pte_offset_kernel_mm(mm, pmd, addr) pte_offset_kernel(pmd, addr)
+#endif
+
+#ifndef pud_pgtable_mm
+#define pud_pgtable_mm(mm, pud) pud_pgtable(pud)
+#endif
+
+#ifndef pmd_size_mm
+#define pmd_shift_mm(mm) PMD_SHIFT
+#define pud_shift_mm(mm) PUD_SHIFT
+#define p4d_shift_mm(mm) P4D_SHIFT
+#define pmd_size_mm(mm) PMD_SIZE
+#define pud_size_mm(mm) PUD_SIZE
+#define p4d_size_mm(mm) P4D_SIZE
+#define pgd_size_mm(mm) PGDIR_SIZE
+#define pmd_mask_mm(mm) PMD_MASK
+#define pud_mask_mm(mm) PUD_MASK
+#define p4d_mask_mm(mm) P4D_MASK
+#define pgd_mask_mm(mm) PGDIR_MASK
+#endif
+
+#ifndef pte_table_bytes_mm
+#define pte_table_bytes_mm(mm) (PTRS_PER_PTE * sizeof(pte_t))
+#define pmd_table_bytes_mm(mm) (PTRS_PER_PMD * sizeof(pmd_t))
+#define pud_table_bytes_mm(mm) (PTRS_PER_PUD * sizeof(pud_t))
+#endif
 
 /*
  * In many cases it is known that a virtual address is mapped at PMD or PTE
@@ -387,6 +447,10 @@ static inline pte_t pte_advance_pfn(pte_t pte, unsigned long nr)
 #endif
 
 #define pte_next_pfn(pte) pte_advance_pfn(pte, 1)
+
+#ifndef pte_advance_pfn_mm
+#define pte_advance_pfn_mm(mm, pte, nr) pte_advance_pfn(pte, nr)
+#endif
 
 #ifndef set_ptes
 /**
@@ -1465,6 +1529,13 @@ static inline void arch_swap_restore(swp_entry_t entry, struct folio *folio)
  * and any p?d_bad entries - reporting the error before resetting to none.
  * Do the tests inline, but report and clear the bad entry in mm/memory.c.
  */
+#ifndef pgd_addr_end_mm
+#define pgd_addr_end_mm(mm, addr, end) pgd_addr_end(addr, end)
+#define p4d_addr_end_mm(mm, addr, end) p4d_addr_end(addr, end)
+#define pud_addr_end_mm(mm, addr, end) pud_addr_end(addr, end)
+#define pmd_addr_end_mm(mm, addr, end) pmd_addr_end(addr, end)
+#endif
+
 void pgd_clear_bad(pgd_t *);
 
 #ifndef __PAGETABLE_P4D_FOLDED
@@ -1487,6 +1558,25 @@ static inline int pgd_none_or_clear_bad(pgd_t *pgd)
 		return 1;
 	if (unlikely(pgd_bad(*pgd))) {
 		pgd_clear_bad(pgd);
+		return 1;
+	}
+	return 0;
+}
+
+#ifndef p4d_none_mm
+#define p4d_none_mm(mm, p4d) p4d_none(p4d)
+#define p4d_bad_mm(mm, p4d) p4d_bad(p4d)
+#define p4d_present_mm(mm, p4d) p4d_present(p4d)
+#define p4d_clear_mm(mm, p4d) p4d_clear(p4d)
+#endif
+
+static inline int p4d_none_or_clear_bad_mm(struct mm_struct *mm, p4d_t *p4d)
+{
+	if (p4d_none_mm(mm, *p4d))
+		return 1;
+	if (unlikely(p4d_bad_mm(mm, *p4d))) {
+		p4d_ERROR(*p4d);
+		p4d_clear_mm(mm, p4d);
 		return 1;
 	}
 	return 0;
@@ -1979,11 +2069,15 @@ static inline int is_zero_pfn(unsigned long pfn)
 #define zero_pfn(addr)	page_to_pfn(ZERO_PAGE(addr))
 
 #else
+#ifndef ARCH_ZERO_PAGE_SIZE
+#define ARCH_ZERO_PAGE_SIZE PAGE_SIZE
+#endif
+
 static inline int is_zero_pfn(unsigned long pfn)
 {
 	extern unsigned long zero_page_pfn;
 
-	return pfn == zero_page_pfn;
+	return pfn - zero_page_pfn < (ARCH_ZERO_PAGE_SIZE >> PAGE_SHIFT);
 }
 
 static inline unsigned long zero_pfn(unsigned long addr)
@@ -1993,7 +2087,7 @@ static inline unsigned long zero_pfn(unsigned long addr)
 	return zero_page_pfn;
 }
 
-extern uint8_t empty_zero_page[PAGE_SIZE];
+extern uint8_t empty_zero_page[ARCH_ZERO_PAGE_SIZE];
 extern struct page *__zero_page;
 
 static inline struct page *_zero_page(unsigned long addr)

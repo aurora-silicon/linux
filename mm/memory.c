@@ -87,6 +87,8 @@
 #include <asm/tlbflush.h>
 
 #include "pgalloc-track.h"
+#include <linux/mm_subpage.h>
+
 #include "internal.h"
 #include "swap.h"
 
@@ -191,26 +193,26 @@ static inline void free_pmd_range(struct mmu_gather *tlb, pud_t *pud,
 	unsigned long start;
 
 	start = addr;
-	pmd = pmd_offset(pud, addr);
+	pmd = pmd_offset_mm(tlb->mm, pud, addr);
 	do {
-		next = pmd_addr_end(addr, end);
+		next = pmd_addr_end_mm(tlb->mm, addr, end);
 		if (pmd_none_or_clear_bad(pmd))
 			continue;
 		free_pte_range(tlb, pmd, addr);
 	} while (pmd++, addr = next, addr != end);
 
-	start &= PUD_MASK;
+	start &= pud_mask_mm(tlb->mm);
 	if (start < floor)
 		return;
 	if (ceiling) {
-		ceiling &= PUD_MASK;
+		ceiling &= pud_mask_mm(tlb->mm);
 		if (!ceiling)
 			return;
 	}
 	if (end - 1 > ceiling - 1)
 		return;
 
-	pmd = pmd_offset(pud, start);
+	pmd = pmd_offset_mm(tlb->mm, pud, start);
 	pud_clear(pud);
 	pmd_free_tlb(tlb, pmd, start);
 	mm_dec_nr_pmds(tlb->mm);
@@ -225,27 +227,27 @@ static inline void free_pud_range(struct mmu_gather *tlb, p4d_t *p4d,
 	unsigned long start;
 
 	start = addr;
-	pud = pud_offset(p4d, addr);
+	pud = pud_offset_mm(tlb->mm, p4d, addr);
 	do {
-		next = pud_addr_end(addr, end);
+		next = pud_addr_end_mm(tlb->mm, addr, end);
 		if (pud_none_or_clear_bad(pud))
 			continue;
 		free_pmd_range(tlb, pud, addr, next, floor, ceiling);
 	} while (pud++, addr = next, addr != end);
 
-	start &= P4D_MASK;
+	start &= p4d_mask_mm(tlb->mm);
 	if (start < floor)
 		return;
 	if (ceiling) {
-		ceiling &= P4D_MASK;
+		ceiling &= p4d_mask_mm(tlb->mm);
 		if (!ceiling)
 			return;
 	}
 	if (end - 1 > ceiling - 1)
 		return;
 
-	pud = pud_offset(p4d, start);
-	p4d_clear(p4d);
+	pud = pud_offset_mm(tlb->mm, p4d, start);
+	p4d_clear_mm(tlb->mm, p4d);
 	pud_free_tlb(tlb, pud, start);
 	mm_dec_nr_puds(tlb->mm);
 }
@@ -259,26 +261,26 @@ static inline void free_p4d_range(struct mmu_gather *tlb, pgd_t *pgd,
 	unsigned long start;
 
 	start = addr;
-	p4d = p4d_offset(pgd, addr);
+	p4d = p4d_offset_mm(tlb->mm, pgd, addr);
 	do {
-		next = p4d_addr_end(addr, end);
-		if (p4d_none_or_clear_bad(p4d))
+		next = p4d_addr_end_mm(tlb->mm, addr, end);
+		if (p4d_none_or_clear_bad_mm(tlb->mm, p4d))
 			continue;
 		free_pud_range(tlb, p4d, addr, next, floor, ceiling);
 	} while (p4d++, addr = next, addr != end);
 
-	start &= PGDIR_MASK;
+	start &= pgd_mask_mm(tlb->mm);
 	if (start < floor)
 		return;
 	if (ceiling) {
-		ceiling &= PGDIR_MASK;
+		ceiling &= pgd_mask_mm(tlb->mm);
 		if (!ceiling)
 			return;
 	}
 	if (end - 1 > ceiling - 1)
 		return;
 
-	p4d = p4d_offset(pgd, start);
+	p4d = p4d_offset_mm(tlb->mm, pgd, start);
 	pgd_clear(pgd);
 	p4d_free_tlb(tlb, p4d, start);
 }
@@ -320,7 +322,7 @@ void free_pgd_range(struct mmu_gather *tlb,
 	 * Wherever addr is brought up or ceiling brought down, we must
 	 * be careful to reject "the opposite 0" before it confuses the
 	 * subsequent tests.  But what about where end is brought down
-	 * by PMD_SIZE below? no, end can't go down to 0 there.
+	 * by one PMD span below? no, end can't go down to 0 there.
 	 *
 	 * Whereas we round start (addr) and ceiling down, by different
 	 * masks at different levels, in order to test whether a table
@@ -328,19 +330,19 @@ void free_pgd_range(struct mmu_gather *tlb,
 	 * bother to round floor or end up - the tests don't need that.
 	 */
 
-	addr &= PMD_MASK;
+	addr &= pmd_mask_mm(tlb->mm);
 	if (addr < floor) {
-		addr += PMD_SIZE;
+		addr += pmd_size_mm(tlb->mm);
 		if (!addr)
 			return;
 	}
 	if (ceiling) {
-		ceiling &= PMD_MASK;
+		ceiling &= pmd_mask_mm(tlb->mm);
 		if (!ceiling)
 			return;
 	}
 	if (end - 1 > ceiling - 1)
-		end -= PMD_SIZE;
+		end -= pmd_size_mm(tlb->mm);
 	if (addr > end - 1)
 		return;
 	/*
@@ -350,7 +352,7 @@ void free_pgd_range(struct mmu_gather *tlb,
 	tlb_change_page_size(tlb, PAGE_SIZE);
 	pgd = pgd_offset(tlb->mm, addr);
 	do {
-		next = pgd_addr_end(addr, end);
+		next = pgd_addr_end_mm(tlb->mm, addr, end);
 		if (pgd_none_or_clear_bad(pgd))
 			continue;
 		free_p4d_range(tlb, pgd, addr, next, floor, ceiling);
@@ -539,16 +541,16 @@ static void __print_bad_page_map_pgtable(struct mm_struct *mm, unsigned long add
 		return;
 	}
 
-	p4dp = p4d_offset(pgdp, addr);
+	p4dp = p4d_offset_mm(mm, pgdp, addr);
 	p4d = p4dp_get(p4dp);
 	p4dv = p4d_val(p4d);
 
-	if (!p4d_present(p4d) || p4d_leaf(p4d)) {
+	if (!p4d_present_mm(mm, p4d) || p4d_leaf(p4d)) {
 		pr_alert("pgd:%08llx p4d:%08llx\n", pgdv, p4dv);
 		return;
 	}
 
-	pudp = pud_offset(p4dp, addr);
+	pudp = pud_offset_mm(mm, p4dp, addr);
 	pud = pudp_get(pudp);
 	pudv = pud_val(pud);
 
@@ -557,7 +559,7 @@ static void __print_bad_page_map_pgtable(struct mm_struct *mm, unsigned long add
 		return;
 	}
 
-	pmdp = pmd_offset(pudp, addr);
+	pmdp = pmd_offset_mm(mm, pudp, addr);
 	pmd = pmdp_get(pmdp);
 	pmdv = pmd_val(pmd);
 
@@ -950,7 +952,15 @@ copy_nonpresent_pte(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 	struct page *page;
 
 	if (likely(softleaf_is_swap(entry))) {
-		if (swap_dup_entry_direct(entry) < 0)
+		int err;
+
+#ifdef CONFIG_MM_SUBPAGE
+		if (mm_page_size(src_mm) < PAGE_SIZE)
+			err = swap_subpage_dup(entry, pte_swp_subpage_offset(orig_pte));
+		else
+#endif
+			err = swap_dup_entries_direct(entry, mm_pte_native_pages(src_mm));
+		if (err < 0)
 			return -EIO;
 
 		/* make sure dst_mm is on swapoff's mmlist. */
@@ -982,6 +992,10 @@ copy_nonpresent_pte(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 			entry = make_readable_migration_entry(
 							swp_offset(entry));
 			pte = softleaf_to_pte(entry);
+#ifdef CONFIG_MM_SUBPAGE
+			if (mm_page_size(src_mm) < PAGE_SIZE)
+				pte = pte_swp_set_subpage_offset(pte, pte_swp_subpage_offset(orig_pte));
+#endif
 			if (pte_swp_soft_dirty(orig_pte))
 				pte = pte_swp_mksoft_dirty(pte);
 			if (pte_swp_uffd_wp(orig_pte))
@@ -1076,10 +1090,14 @@ copy_present_page(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
 	 * over and copy the page & arm it.
 	 */
 
-	if (copy_mc_user_highpage(&new_folio->page, page, addr, src_vma))
-		return -EHWPOISON;
+	for (unsigned int i = 0; i < mm_pte_native_pages(src_vma->vm_mm); i++) {
+		if (copy_mc_user_highpage(folio_page(new_folio, i), page + i,
+					 addr + i * PAGE_SIZE, src_vma))
+			return -EHWPOISON;
+	}
 
 	*prealloc = NULL;
+	folio_ref_add(new_folio, mm_pte_native_pages(dst_vma->vm_mm) - 1);
 	__folio_mark_uptodate(new_folio);
 	folio_add_new_anon_rmap(new_folio, dst_vma, addr, RMAP_EXCLUSIVE);
 	folio_add_lru_vma(new_folio, dst_vma);
@@ -1094,6 +1112,55 @@ copy_present_page(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
 	set_pte_at(dst_vma->vm_mm, addr, dst_pte, pte);
 	return 0;
 }
+
+#ifdef CONFIG_MM_SUBPAGE
+/* One new native folio may publish several independently locked user leaves. */
+static void subpage_add_new_lru(struct folio *folio, struct vm_area_struct *vma,
+			      unsigned int mapped)
+{
+	folio_add_lru_vma(folio, vma);
+	if ((vma->vm_flags & (VM_LOCKED | VM_SPECIAL)) == VM_LOCKED)
+		while (--mapped)
+			mlock_folio(folio);
+}
+
+/* The destination slot and its charge/metadata were allocated outside PTLs. */
+static int copy_pinned_subpage(struct vm_area_struct *dst_vma, pte_t *dst_pte,
+		pte_t source_pte, unsigned long addr, int *rss,
+		struct mm_subpage *source, struct mm_subpage **prealloc)
+{
+	struct mm_subpage *dest = *prealloc;
+	struct folio *new;
+	pte_t pte;
+	int ret;
+
+	if (!dest)
+		return -EAGAIN;
+	new = mm_subpage_folio(dest);
+	ret = copy_user_subpage_range(&new->page, mm_subpage_offset(dest),
+				&mm_subpage_folio(source)->page, mm_subpage_offset(source),
+				mm_subpage_size(source));
+	if (ret)
+		return ret;
+	/* Fresh, unmapped backing is private to this preallocation. */
+	if (WARN_ON_ONCE(!folio_trylock(new)))
+		return -EBUSY;
+	mm_subpage_set_exclusive(dest);
+	ret = mm_subpage_add_new_anon_rmap(dest, dst_vma, addr);
+	if (!ret) {
+		subpage_add_new_lru(new, dst_vma, 1);
+		rss[MM_ANONPAGES]++;
+		pte = phys_pte_mm(dst_vma->vm_mm, mm_subpage_phys(dest), dst_vma->vm_page_prot);
+		pte = maybe_mkwrite(pte_mkdirty(pte), dst_vma);
+		if (userfaultfd_pte_wp(dst_vma, source_pte))
+			pte = pte_mkuffd_wp(pte);
+		set_pte_at(dst_vma->vm_mm, addr, dst_pte, pte);
+		*prealloc = NULL;
+	}
+	folio_unlock(new);
+	return ret;
+}
+#endif
 
 static __always_inline void __copy_present_ptes(struct vm_area_struct *dst_vma,
 		struct vm_area_struct *src_vma, pte_t *dst_pte, pte_t *src_pte,
@@ -1128,18 +1195,46 @@ static __always_inline void __copy_present_ptes(struct vm_area_struct *dst_vma,
 static inline int
 copy_present_ptes(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
 		 pte_t *dst_pte, pte_t *src_pte, pte_t pte, unsigned long addr,
-		 int max_nr, int *rss, struct folio **prealloc)
+		 int max_nr, int *rss, struct folio **prealloc,
+		 struct mm_subpage **subprealloc)
 {
 	fpb_t flags = FPB_MERGE_WRITE;
 	struct page *page;
 	struct folio *folio;
-	int err, nr;
+	int err, nr, nr_native;
+	unsigned int span = mm_pte_native_pages(src_vma->vm_mm);
 
 	page = vm_normal_page(src_vma, addr, pte);
 	if (unlikely(!page))
 		goto copy_pte;
 
 	folio = page_folio(page);
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(src_vma->vm_mm) < PAGE_SIZE) {
+		if (folio_test_anon(folio)) {
+			struct mm_subpage *slot;
+
+			slot = mm_subpage_get_from_phys(pte_phys_mm(src_vma->vm_mm, pte));
+			if (WARN_ON_ONCE(!slot))
+				return -EINVAL;
+			err = mm_subpage_dup_anon_rmap(slot, dst_vma, src_vma, addr);
+			if (err == -EBUSY) {
+				err = copy_pinned_subpage(dst_vma, dst_pte, pte, addr,
+						  rss, slot, subprealloc);
+				mm_subpage_put(slot);
+				return err ? err : 1;
+			}
+			if (err) {
+				mm_subpage_put(slot);
+				return err;
+			}
+			/* The lookup reference becomes the child's PTE reference. */
+			rss[MM_ANONPAGES]++;
+			goto copy_pte;
+		}
+		max_nr = 1;
+	}
+#endif
 
 	/*
 	 * If we likely have to copy, just don't bother with batching. Make
@@ -1152,18 +1247,25 @@ copy_present_ptes(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
 		if (vma_soft_dirty_enabled(src_vma))
 			flags |= FPB_RESPECT_SOFT_DIRTY;
 
-		nr = folio_pte_batch_flags(folio, src_vma, src_pte, &pte, max_nr, flags);
-		folio_ref_add(folio, nr);
+#ifdef CONFIG_MM_SUBPAGE
+		if (mm_page_size(src_vma->vm_mm) > PAGE_SIZE)
+			nr = folio_subpage_pte_batch_flags(src_vma, folio, src_pte,
+							 &pte, max_nr, flags);
+		else
+#endif
+			nr = folio_pte_batch_flags(folio, src_vma, src_pte, &pte, max_nr, flags);
+		nr_native = nr * span;
+		folio_ref_add(folio, nr_native);
 		if (folio_test_anon(folio)) {
 			if (unlikely(folio_try_dup_anon_rmap_ptes(folio, page,
-								  nr, dst_vma, src_vma))) {
-				folio_ref_sub(folio, nr);
+								  nr_native, dst_vma, src_vma))) {
+				folio_ref_sub(folio, nr_native);
 				return -EAGAIN;
 			}
 			rss[MM_ANONPAGES] += nr;
 			VM_WARN_ON_FOLIO(PageAnonExclusive(page), folio);
 		} else {
-			folio_dup_file_rmap_ptes(folio, page, nr, dst_vma);
+			folio_dup_file_rmap_ptes(folio, page, nr_native, dst_vma);
 			rss[mm_counter_file(folio)] += nr;
 		}
 		__copy_present_ptes(dst_vma, src_vma, dst_pte, src_pte, pte,
@@ -1171,7 +1273,7 @@ copy_present_ptes(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
 		return nr;
 	}
 
-	folio_get(folio);
+	folio_ref_add(folio, span);
 	if (folio_test_anon(folio)) {
 		/*
 		 * If this page may have been pinned by the parent process,
@@ -1181,7 +1283,7 @@ copy_present_ptes(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
 		 */
 		if (unlikely(folio_try_dup_anon_rmap_pte(folio, page, dst_vma, src_vma))) {
 			/* Page may be pinned, we have to copy. */
-			folio_put(folio);
+			folio_put_refs(folio, span);
 			err = copy_present_page(dst_vma, src_vma, dst_pte, src_pte,
 						addr, rss, prealloc, page);
 			return err ? err : 1;
@@ -1189,6 +1291,7 @@ copy_present_ptes(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
 		rss[MM_ANONPAGES]++;
 		VM_WARN_ON_FOLIO(PageAnonExclusive(page), folio);
 	} else {
+		mm_subpage_file_map_add(dst_vma, pte_phys_mm(src_vma->vm_mm, pte));
 		folio_dup_file_rmap_pte(folio, page, dst_vma);
 		rss[mm_counter_file(folio)]++;
 	}
@@ -1202,11 +1305,12 @@ static inline struct folio *folio_prealloc(struct mm_struct *src_mm,
 		struct vm_area_struct *vma, unsigned long addr, bool need_zero)
 {
 	struct folio *new_folio;
+	unsigned int order = max_t(unsigned int, mm_page_shift(src_mm), PAGE_SHIFT) - PAGE_SHIFT;
 
 	if (need_zero)
-		new_folio = vma_alloc_zeroed_movable_folio(vma, addr);
+		new_folio = vma_alloc_zeroed_movable_folio_order(vma, addr, order);
 	else
-		new_folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE, 0, vma, addr);
+		new_folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE, order, vma, addr);
 
 	if (!new_folio)
 		return NULL;
@@ -1219,6 +1323,34 @@ static inline struct folio *folio_prealloc(struct mm_struct *src_mm,
 
 	return new_folio;
 }
+
+#ifdef CONFIG_MM_SUBPAGE
+static struct mm_subpage *anon_subpage_prealloc(struct mm_struct *mm,
+		struct vm_area_struct *vma, unsigned long addr)
+{
+	struct mm_subpage_pool *pool = mm_subpage_pool_create_granule(GFP_KERNEL, mm_page_shift(mm));
+	struct mm_subpage *slot = ERR_PTR(-ENOMEM);
+	struct folio *folio;
+	int ret;
+
+	if (!pool)
+		return slot;
+	folio = folio_prealloc(mm, vma, addr, false);
+	if (!folio)
+		goto out;
+	ret = mm_subpage_pool_add_folio(pool, folio, GFP_KERNEL);
+	if (ret) {
+		folio_put(folio);
+		slot = ERR_PTR(ret);
+		goto out;
+	}
+	slot = mm_subpage_alloc_at(pool, vma_page_offset_at(vma, addr).offset);
+out:
+	mm_subpage_pool_close(pool);
+	mm_subpage_pool_put(pool);
+	return slot;
+}
+#endif
 
 static int
 copy_pte_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
@@ -1236,6 +1368,7 @@ copy_pte_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
 	int rss[NR_MM_COUNTERS];
 	softleaf_t entry = softleaf_mk_none();
 	struct folio *prealloc = NULL;
+	struct mm_subpage *subprealloc = NULL;
 	int nr;
 
 again:
@@ -1316,16 +1449,23 @@ again:
 			WARN_ON_ONCE(ret != -ENOENT);
 		}
 		/* copy_present_ptes() will clear `*prealloc' if consumed */
-		max_nr = (end - addr) / PAGE_SIZE;
+		max_nr = (end - addr) >> mm_page_shift(src_mm);
 		ret = copy_present_ptes(dst_vma, src_vma, dst_pte, src_pte,
-					ptent, addr, max_nr, rss, &prealloc);
+					ptent, addr, max_nr, rss, &prealloc, &subprealloc);
 		/*
 		 * If we need a pre-allocated page for this pte, drop the
 		 * locks, allocate, and try again.
 		 * If copy failed due to hwpoison in source page, break out.
 		 */
-		if (unlikely(ret == -EAGAIN || ret == -EHWPOISON))
+		if (unlikely(ret == -EAGAIN || ret == -EHWPOISON ||
+			     (IS_ENABLED(CONFIG_MM_SUBPAGE) && ret < 0)))
 			break;
+#ifdef CONFIG_MM_SUBPAGE
+		if (subprealloc) {
+			mm_subpage_put(subprealloc);
+			subprealloc = NULL;
+		}
+#endif
 		if (unlikely(prealloc)) {
 			/*
 			 * pre-alloc page cannot be reused by next time so as
@@ -1338,7 +1478,7 @@ again:
 		}
 		nr = ret;
 		progress += 8 * nr;
-	} while (dst_pte += nr, src_pte += nr, addr += PAGE_SIZE * nr,
+	} while (dst_pte += nr, src_pte += nr, addr += mm_page_size(src_mm) * nr,
 		 addr != end);
 
 	lazy_mmu_mode_disable();
@@ -1357,10 +1497,22 @@ again:
 	} else if (ret == -EBUSY || unlikely(ret == -EHWPOISON)) {
 		goto out;
 	} else if (ret ==  -EAGAIN) {
+#ifdef CONFIG_MM_SUBPAGE
+		if (mm_page_size(src_mm) < PAGE_SIZE) {
+			subprealloc = anon_subpage_prealloc(src_mm, src_vma, addr);
+			if (IS_ERR(subprealloc))
+				return PTR_ERR(subprealloc);
+			ret = 0;
+			goto again;
+		}
+#endif
 		prealloc = folio_prealloc(src_mm, src_vma, addr, false);
 		if (!prealloc)
 			return -ENOMEM;
 	} else if (ret < 0) {
+		/* Subpage ownership checks can return additional fatal errors. */
+		if (IS_ENABLED(CONFIG_MM_SUBPAGE))
+			goto out;
 		VM_WARN_ON_ONCE(1);
 	}
 
@@ -1370,6 +1522,10 @@ again:
 	if (addr != end)
 		goto again;
 out:
+#ifdef CONFIG_MM_SUBPAGE
+	if (subprealloc)
+		mm_subpage_put(subprealloc);
+#endif
 	if (unlikely(prealloc))
 		folio_put(prealloc);
 	return ret;
@@ -1388,9 +1544,9 @@ copy_pmd_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
 	dst_pmd = pmd_alloc(dst_mm, dst_pud, addr);
 	if (!dst_pmd)
 		return -ENOMEM;
-	src_pmd = pmd_offset(src_pud, addr);
+	src_pmd = pmd_offset_mm(src_vma->vm_mm, src_pud, addr);
 	do {
-		next = pmd_addr_end(addr, end);
+		next = pmd_addr_end_mm(src_vma->vm_mm, addr, end);
 		if (pmd_is_huge(*src_pmd)) {
 			int err;
 
@@ -1425,9 +1581,9 @@ copy_pud_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
 	dst_pud = pud_alloc(dst_mm, dst_p4d, addr);
 	if (!dst_pud)
 		return -ENOMEM;
-	src_pud = pud_offset(src_p4d, addr);
+	src_pud = pud_offset_mm(src_vma->vm_mm, src_p4d, addr);
 	do {
-		next = pud_addr_end(addr, end);
+		next = pud_addr_end_mm(src_vma->vm_mm, addr, end);
 		if (pud_trans_huge(*src_pud)) {
 			int err;
 
@@ -1461,10 +1617,10 @@ copy_p4d_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
 	dst_p4d = p4d_alloc(dst_mm, dst_pgd, addr);
 	if (!dst_p4d)
 		return -ENOMEM;
-	src_p4d = p4d_offset(src_pgd, addr);
+	src_p4d = p4d_offset_mm(src_vma->vm_mm, src_pgd, addr);
 	do {
-		next = p4d_addr_end(addr, end);
-		if (p4d_none_or_clear_bad(src_p4d))
+		next = p4d_addr_end_mm(src_vma->vm_mm, addr, end);
+		if (p4d_none_or_clear_bad_mm(src_vma->vm_mm, src_p4d))
 			continue;
 		if (copy_pud_range(dst_vma, src_vma, dst_p4d, src_p4d,
 				   addr, next))
@@ -1516,6 +1672,9 @@ copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma)
 	bool is_cow;
 	int ret;
 
+	if (mm_page_shift(dst_mm) != mm_page_shift(src_mm))
+		return -EINVAL;
+
 	if (!vma_needs_copy(dst_vma, src_vma))
 		return 0;
 
@@ -1549,7 +1708,7 @@ copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma)
 	dst_pgd = pgd_offset(dst_mm, addr);
 	src_pgd = pgd_offset(src_mm, addr);
 	do {
-		next = pgd_addr_end(addr, end);
+		next = pgd_addr_end_mm(src_vma->vm_mm, addr, end);
 		if (pgd_none_or_clear_bad(src_pgd))
 			continue;
 		if (unlikely(copy_p4d_range(dst_vma, src_vma, dst_pgd, src_pgd,
@@ -1629,7 +1788,7 @@ zap_install_uffd_wp_if_needed(struct vm_area_struct *vma,
 		if (--nr == 0)
 			break;
 		pte++;
-		addr += PAGE_SIZE;
+		addr += mm_page_size(vma->vm_mm);
 	}
 
 	return was_installed;
@@ -1642,10 +1801,12 @@ static __always_inline void zap_present_folio_ptes(struct mmu_gather *tlb,
 		bool *force_flush, bool *force_break, bool *any_skipped)
 {
 	struct mm_struct *mm = tlb->mm;
+	unsigned int nr_native = nr * mm_pte_native_pages(mm);
 	bool delay_rmap = false;
 
 	if (!folio_test_anon(folio)) {
 		ptent = get_and_clear_full_ptes(mm, addr, pte, nr, tlb->fullmm);
+		mm_subpage_file_map_del(vma, pte_phys_mm(mm, ptent));
 		if (pte_dirty(ptent)) {
 			folio_mark_dirty(folio);
 			if (tlb_delay_rmap(tlb)) {
@@ -1669,16 +1830,44 @@ static __always_inline void zap_present_folio_ptes(struct mmu_gather *tlb,
 							     nr, details, ptent);
 
 	if (!delay_rmap) {
-		folio_remove_rmap_ptes(folio, page, nr, vma);
+		folio_remove_rmap_ptes(folio, page, nr_native, vma);
 
 		if (unlikely(folio_mapcount(folio) < 0))
 			print_bad_pte(vma, addr, ptent, page);
 	}
-	if (unlikely(__tlb_remove_folio_pages(tlb, page, nr, delay_rmap))) {
+	/* Gather payloads count native references, not logical PTEs. */
+	if (unlikely(__tlb_remove_folio_pages(tlb, page, nr_native, delay_rmap))) {
 		*force_flush = true;
 		*force_break = true;
 	}
 }
+
+#ifdef CONFIG_MM_SUBPAGE
+static void zap_present_subpage(struct mmu_gather *tlb,
+		struct vm_area_struct *vma, pte_t *pte, pte_t ptent,
+		unsigned long addr, int *rss, bool *force_flush,
+		bool *force_break, bool *any_skipped)
+{
+	struct mm_subpage *slot = mm_subpage_get_from_phys(pte_phys_mm(tlb->mm, ptent));
+
+	/* All small-granule anonymous PTEs must carry slot ownership. */
+	if (WARN_ON_ONCE(!slot)) {
+		*any_skipped = true;
+		return;
+	}
+	ptep_get_and_clear_full(tlb->mm, addr, pte, tlb->fullmm);
+	arch_check_zapped_pte(vma, ptent);
+	tlb_remove_tlb_entry(tlb, pte, addr);
+	mm_subpage_remove_anon_rmap(slot, vma);
+	rss[MM_ANONPAGES]--;
+	/* Drop the lookup ref, then transfer the PTE ref to the TLB batch. */
+	mm_subpage_put(slot);
+	if (__tlb_remove_subpage(tlb, slot)) {
+		*force_flush = true;
+		*force_break = true;
+	}
+}
+#endif
 
 /*
  * Zap or skip at least one present PTE, trying to batch-process subsequent
@@ -1716,12 +1905,30 @@ static inline int zap_present_ptes(struct mmu_gather *tlb,
 		return 1;
 	}
 
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(mm) < PAGE_SIZE) {
+		if (folio_test_anon(folio)) {
+			zap_present_subpage(tlb, vma, pte, ptent, addr, rss,
+					    force_flush, force_break, any_skipped);
+			return 1;
+		}
+		/* Native folio batching still expresses physical PAGE_SIZE steps. */
+		max_nr = 1;
+	}
+#endif
+
 	/*
 	 * Make sure that the common "small folio" case is as fast as possible
 	 * by keeping the batching logic separate.
 	 */
 	if (unlikely(folio_test_large(folio) && max_nr != 1)) {
-		nr = folio_pte_batch(folio, pte, ptent, max_nr);
+#ifdef CONFIG_MM_SUBPAGE
+		if (mm_page_size(mm) > PAGE_SIZE)
+			nr = folio_subpage_pte_batch(vma, folio, pte, ptent,
+						    max_nr, 0);
+		else
+#endif
+			nr = folio_pte_batch(folio, pte, ptent, max_nr);
 		zap_present_folio_ptes(tlb, vma, folio, page, pte, ptent, nr,
 				       addr, details, rss, force_flush,
 				       force_break, any_skipped);
@@ -1764,9 +1971,20 @@ static inline int zap_nonpresent_ptes(struct mmu_gather *tlb,
 		if (!should_zap_cows(details))
 			return 1;
 
-		nr = swap_pte_batch(pte, max_nr, ptent);
+#ifdef CONFIG_MM_SUBPAGE
+		if (mm_page_size(vma->vm_mm) < PAGE_SIZE) {
+			swap_subpage_put(entry, pte_swp_subpage_offset(ptent), true);
+		} else
+#endif
+		{
+			unsigned int span = mm_pte_native_pages(vma->vm_mm);
+
+			/* Adjacent coarse PTEs advance by a full group of swap slots. */
+			if (span == 1)
+				nr = swap_pte_batch(pte, max_nr, ptent);
+			swap_put_entries_direct(entry, nr * span);
+		}
 		rss[MM_SWAPENTS] -= nr;
-		swap_put_entries_direct(entry, nr);
 	} else if (softleaf_is_migration(entry)) {
 		struct folio *folio = softleaf_to_folio(entry);
 
@@ -1811,7 +2029,7 @@ static inline int do_zap_pte_range(struct mmu_gather *tlb,
 				   bool *any_skipped)
 {
 	pte_t ptent = ptep_get(pte);
-	int max_nr = (end - addr) / PAGE_SIZE;
+	int max_nr = (end - addr) >> mm_page_shift(vma->vm_mm);
 	int nr = 0;
 
 	/* Skip all consecutive none ptes */
@@ -1825,7 +2043,7 @@ static inline int do_zap_pte_range(struct mmu_gather *tlb,
 		if (!max_nr)
 			return nr;
 		pte += nr;
-		addr += nr * PAGE_SIZE;
+		addr += nr * mm_page_size(vma->vm_mm);
 	}
 
 	if (pte_present(ptent))
@@ -1839,13 +2057,14 @@ static inline int do_zap_pte_range(struct mmu_gather *tlb,
 	return nr;
 }
 
-static bool pte_table_reclaim_possible(unsigned long start, unsigned long end,
+static bool pte_table_reclaim_possible(struct mm_struct *mm,
+		unsigned long start, unsigned long end,
 		struct zap_details *details)
 {
 	if (!IS_ENABLED(CONFIG_PT_RECLAIM))
 		return false;
 	/* Only zap if we are allowed to and cover the full page table. */
-	return details && details->reclaim_pt && (end - start >= PMD_SIZE);
+	return details && details->reclaim_pt && (end - start >= pmd_size_mm(mm));
 }
 
 static bool zap_empty_pte_table(struct mm_struct *mm, pmd_t *pmd,
@@ -1877,7 +2096,7 @@ static bool zap_pte_table_if_empty(struct mm_struct *mm, pmd_t *pmd,
 	if (ptl != pml)
 		spin_lock_nested(ptl, SINGLE_DEPTH_NESTING);
 
-	for (i = 0, pte = start_pte; i < PTRS_PER_PTE; i++, pte++) {
+	for (i = 0, pte = start_pte; i < pte_table_bytes_mm(mm) / sizeof(pte_t); i++, pte++) {
 		if (!pte_none(ptep_get(pte)))
 			goto out_ptl;
 	}
@@ -1902,7 +2121,7 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
 				unsigned long addr, unsigned long end,
 				struct zap_details *details)
 {
-	bool can_reclaim_pt = pte_table_reclaim_possible(addr, end, details);
+	bool can_reclaim_pt = pte_table_reclaim_possible(tlb->mm, addr, end, details);
 	bool force_flush = false, force_break = false;
 	struct mm_struct *mm = tlb->mm;
 	int rss[NR_MM_COUNTERS];
@@ -1915,7 +2134,7 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
 	int nr;
 
 retry:
-	tlb_change_page_size(tlb, PAGE_SIZE);
+	tlb_change_page_size(tlb, mm_page_size(mm));
 	init_rss_vec(rss);
 	start_pte = pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
 	if (!pte)
@@ -1936,11 +2155,11 @@ retry:
 		if (any_skipped)
 			can_reclaim_pt = false;
 		if (unlikely(force_break)) {
-			addr += nr * PAGE_SIZE;
+			addr += nr * mm_page_size(vma->vm_mm);
 			direct_reclaim = false;
 			break;
 		}
-	} while (pte += nr, addr += PAGE_SIZE * nr, addr != end);
+	} while (pte += nr, addr += mm_page_size(mm) * nr, addr != end);
 
 	/*
 	 * Fast path: try to hold the pmd lock and unmap the PTE page.
@@ -1997,9 +2216,9 @@ static inline unsigned long zap_pmd_range(struct mmu_gather *tlb,
 	pmd_t *pmd;
 	unsigned long next;
 
-	pmd = pmd_offset(pud, addr);
+	pmd = pmd_offset_mm(tlb->mm, pud, addr);
 	do {
-		next = pmd_addr_end(addr, end);
+		next = pmd_addr_end_mm(tlb->mm, addr, end);
 		if (pmd_is_huge(*pmd)) {
 			if (next - addr != HPAGE_PMD_SIZE)
 				__split_huge_pmd(vma, pmd, addr, false);
@@ -2033,9 +2252,9 @@ static inline unsigned long zap_pud_range(struct mmu_gather *tlb,
 	pud_t *pud;
 	unsigned long next;
 
-	pud = pud_offset(p4d, addr);
+	pud = pud_offset_mm(tlb->mm, p4d, addr);
 	do {
-		next = pud_addr_end(addr, end);
+		next = pud_addr_end_mm(tlb->mm, addr, end);
 		if (pud_trans_huge(*pud)) {
 			if (next - addr != HPAGE_PUD_SIZE)
 				split_huge_pud(vma, pud, addr);
@@ -2061,10 +2280,10 @@ static inline unsigned long zap_p4d_range(struct mmu_gather *tlb,
 	p4d_t *p4d;
 	unsigned long next;
 
-	p4d = p4d_offset(pgd, addr);
+	p4d = p4d_offset_mm(tlb->mm, pgd, addr);
 	do {
-		next = p4d_addr_end(addr, end);
-		if (p4d_none_or_clear_bad(p4d))
+		next = p4d_addr_end_mm(tlb->mm, addr, end);
+		if (p4d_none_or_clear_bad_mm(tlb->mm, p4d))
 			continue;
 		next = zap_pud_range(tlb, vma, p4d, addr, next, details);
 	} while (p4d++, addr = next, addr != end);
@@ -2103,7 +2322,7 @@ static void __zap_vma_range(struct mmu_gather *tlb, struct vm_area_struct *vma,
 		tlb_start_vma(tlb, vma);
 		pgd = pgd_offset(vma->vm_mm, addr);
 		do {
-			next = pgd_addr_end(addr, end);
+			next = pgd_addr_end_mm(tlb->mm, addr, end);
 			if (pgd_none_or_clear_bad(pgd))
 				continue;
 			next = zap_p4d_range(tlb, vma, pgd, addr, next, details);
@@ -2350,7 +2569,7 @@ static int validate_page_before_insert(struct vm_area_struct *vma,
 
 static int insert_page_into_pte_locked(struct vm_area_struct *vma, pte_t *pte,
 				unsigned long addr, struct page *page,
-				pgprot_t prot, bool mkwrite)
+				pgprot_t prot, bool mkwrite, unsigned int offset)
 {
 	struct folio *folio = page_folio(page);
 	pte_t pteval = ptep_get(pte);
@@ -2360,7 +2579,7 @@ static int insert_page_into_pte_locked(struct vm_area_struct *vma, pte_t *pte,
 			return -EBUSY;
 
 		/* see insert_pfn(). */
-		if (pte_pfn(pteval) != page_to_pfn(page)) {
+		if (pte_phys_mm(vma->vm_mm, pteval) != page_to_phys(page) + offset) {
 			WARN_ON_ONCE(!is_zero_pfn(pte_pfn(pteval)));
 			return -EFAULT;
 		}
@@ -2372,17 +2591,18 @@ static int insert_page_into_pte_locked(struct vm_area_struct *vma, pte_t *pte,
 	}
 
 	/* Ok, finally just insert the thing.. */
-	pteval = mk_pte(page, prot);
+	pteval = phys_pte_mm(vma->vm_mm, page_to_phys(page) + offset, prot);
 	if (unlikely(is_zero_folio(folio))) {
 		pteval = pte_mkspecial(pteval);
 	} else {
 		folio_get(folio);
-		pteval = mk_pte(page, prot);
+		pteval = phys_pte_mm(vma->vm_mm, page_to_phys(page) + offset, prot);
 		if (mkwrite) {
 			pteval = pte_mkyoung(pteval);
 			pteval = maybe_mkwrite(pte_mkdirty(pteval), vma);
 		}
 		inc_mm_counter(vma->vm_mm, mm_counter_file(folio));
+		mm_subpage_file_map_add(vma, pte_phys_mm(vma->vm_mm, pteval));
 		folio_add_file_rmap_pte(folio, page, vma);
 	}
 	set_pte_at(vma->vm_mm, addr, pte, pteval);
@@ -2390,7 +2610,7 @@ static int insert_page_into_pte_locked(struct vm_area_struct *vma, pte_t *pte,
 }
 
 static int insert_page(struct vm_area_struct *vma, unsigned long addr,
-			struct page *page, pgprot_t prot, bool mkwrite)
+			struct page *page, pgprot_t prot, bool mkwrite, unsigned int offset)
 {
 	int retval;
 	pte_t *pte;
@@ -2404,83 +2624,120 @@ static int insert_page(struct vm_area_struct *vma, unsigned long addr,
 	if (!pte)
 		goto out;
 	retval = insert_page_into_pte_locked(vma, pte, addr, page, prot,
-					mkwrite);
+					mkwrite, offset);
 	pte_unmap_unlock(pte, ptl);
 out:
 	return retval;
 }
 
-static int insert_page_in_batch_locked(struct vm_area_struct *vma, pte_t *pte,
-			unsigned long addr, struct page *page, pgprot_t prot)
+/* Keep lock batching in units of hardware leaves, backing in native pages. */
+static int insert_page_range(struct vm_area_struct *vma, unsigned long addr,
+			     struct page **pages, unsigned long offset,
+			     unsigned long *length, pgprot_t prot)
 {
-	int err;
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long remaining = *length;
+	unsigned long size = mm_page_size(mm);
+	int ret = 0;
 
-	err = validate_page_before_insert(vma, page);
-	if (err)
-		return err;
-	return insert_page_into_pte_locked(vma, pte, addr, page, prot, false);
+	while (remaining) {
+		unsigned long in_pmd = min(remaining,
+			pmd_size_mm(mm) - (addr & ~pmd_mask_mm(mm)));
+		pmd_t *pmd = walk_to_pmd(mm, addr);
+
+		if (!pmd) {
+			ret = -EFAULT;
+			break;
+		}
+		if (pte_alloc(mm, pmd)) {
+			ret = -ENOMEM;
+			break;
+		}
+		while (in_pmd) {
+			unsigned int batch = min_t(unsigned long, in_pmd / size, 8);
+			unsigned int i;
+			spinlock_t *ptl;
+			pte_t *start = pte_offset_map_lock(mm, pmd, addr, &ptl);
+
+			if (!start) {
+				ret = -EFAULT;
+				goto out;
+			}
+			for (i = 0; i < batch; i++) {
+				struct page *page = pages[offset >> PAGE_SHIFT];
+
+				ret = validate_page_before_insert(vma, page);
+				if (!ret)
+					ret = insert_page_into_pte_locked(vma, start + i,
+						addr, page, prot, false, offset_in_page(offset));
+				if (ret)
+					break;
+				addr += size;
+				offset += size;
+				remaining -= size;
+				in_pmd -= size;
+			}
+			pte_unmap_unlock(start, ptl);
+			if (ret)
+				goto out;
+		}
+	}
+out:
+	*length = remaining;
+	return ret;
 }
 
-/* insert_pages() amortizes the cost of spinlock operations
- * when inserting pages in a loop.
- */
 static int insert_pages(struct vm_area_struct *vma, unsigned long addr,
 			struct page **pages, unsigned long *num, pgprot_t prot)
 {
-	pmd_t *pmd = NULL;
-	pte_t *start_pte, *pte;
-	spinlock_t *pte_lock;
-	struct mm_struct *const mm = vma->vm_mm;
-	unsigned long curr_page_idx = 0;
-	unsigned long remaining_pages_total = *num;
-	unsigned long pages_to_write_in_pmd;
+	unsigned long length;
 	int ret;
-more:
-	ret = -EFAULT;
-	pmd = walk_to_pmd(mm, addr);
-	if (!pmd)
-		goto out;
 
-	pages_to_write_in_pmd = min_t(unsigned long,
-		remaining_pages_total, PTRS_PER_PTE - pte_index(addr));
-
-	/* Allocate the PTE if necessary; takes PMD lock once only. */
-	ret = -ENOMEM;
-	if (pte_alloc(mm, pmd))
-		goto out;
-
-	while (pages_to_write_in_pmd) {
-		int pte_idx = 0;
-		const int batch_size = min_t(int, pages_to_write_in_pmd, 8);
-
-		start_pte = pte_offset_map_lock(mm, pmd, addr, &pte_lock);
-		if (!start_pte) {
-			ret = -EFAULT;
-			goto out;
-		}
-		for (pte = start_pte; pte_idx < batch_size; ++pte, ++pte_idx) {
-			int err = insert_page_in_batch_locked(vma, pte,
-				addr, pages[curr_page_idx], prot);
-			if (unlikely(err)) {
-				pte_unmap_unlock(start_pte, pte_lock);
-				ret = err;
-				remaining_pages_total -= pte_idx;
-				goto out;
-			}
-			addr += PAGE_SIZE;
-			++curr_page_idx;
-		}
-		pte_unmap_unlock(start_pte, pte_lock);
-		pages_to_write_in_pmd -= batch_size;
-		remaining_pages_total -= batch_size;
-	}
-	if (remaining_pages_total)
-		goto more;
-	ret = 0;
-out:
-	*num = remaining_pages_total;
+	if (check_mul_overflow(*num, PAGE_SIZE, &length))
+		return -EOVERFLOW;
+	ret = insert_page_range(vma, addr, pages, 0, &length, prot);
+	/* A partially inserted native page is still an incomplete input page. */
+	*num = DIV_ROUND_UP(length, PAGE_SIZE);
 	return ret;
 }
+
+/**
+ * vm_insert_pages_range - map a byte range from a native-page array
+ * @vma: target VMA, held under the mmap write lock
+ * @addr: first user address
+ * @pages: native backing pages
+ * @nr_pages: size of @pages
+ * @offset: byte offset within the backing array
+ * @length: bytes to map
+ *
+ * Address, offset and length must match the target mm's granule.  A failed
+ * insertion can leave a prefix mapped, as with vm_insert_pages(); the caller
+ * must unmap that prefix when abandoning the mapping.  Physical ownership
+ * remains in native pages.  Each installed user leaf acquires its own ref.
+ */
+int vm_insert_pages_range(struct vm_area_struct *vma, unsigned long addr,
+		struct page **pages, unsigned long nr_pages,
+		unsigned long offset, unsigned long length)
+{
+	unsigned long bytes, end, size = mm_page_size(vma->vm_mm);
+
+	if (!IS_ALIGNED(addr | offset | length, size) ||
+	    check_mul_overflow(nr_pages, PAGE_SIZE, &bytes) ||
+	    offset > bytes || length > bytes - offset ||
+	    check_add_overflow(addr, length, &end) ||
+	    !range_in_vma(vma, addr, end))
+		return -EINVAL;
+	if (!length)
+		return 0;
+	if (vma->vm_flags & VM_PFNMAP)
+		return -EINVAL;
+	if (!(vma->vm_flags & VM_MIXEDMAP)) {
+		mmap_assert_write_locked(vma->vm_mm);
+		vm_flags_set(vma, VM_MIXEDMAP);
+	}
+	return insert_page_range(vma, addr, pages, offset, &length, vma->vm_page_prot);
+}
+EXPORT_SYMBOL_GPL(vm_insert_pages_range);
 
 /**
  * vm_insert_pages - insert multiple pages into user vma, batching the pmd lock.
@@ -2501,9 +2758,12 @@ int vm_insert_pages(struct vm_area_struct *vma, unsigned long addr,
 			struct page **pages, unsigned long *num)
 {
 	const unsigned long nr_pages = *num;
-	const unsigned long end = addr + PAGE_SIZE * nr_pages;
+	unsigned long length, end;
 
-	if (!range_in_vma(vma, addr, end))
+	if (!IS_ALIGNED(addr, mm_page_size(vma->vm_mm)) ||
+	    check_mul_overflow(nr_pages, PAGE_SIZE, &length) ||
+	    check_add_overflow(addr, length, &end) ||
+	    !range_in_vma(vma, addr, end))
 		return -EFAULT;
 	if (!(vma->vm_flags & VM_MIXEDMAP)) {
 		VM_WARN_ON_ONCE(mmap_read_trylock(vma->vm_mm));
@@ -2528,8 +2788,10 @@ int map_kernel_pages_prepare(struct vm_area_desc *desc)
 	}
 
 	nr_pages = action->map_kernel.nr_pages;
-	end = addr + PAGE_SIZE * nr_pages;
-	if (!range_in_vma_desc(desc, addr, end))
+	if (!IS_ALIGNED(addr, mm_page_size(desc->mm)) ||
+	    check_mul_overflow(nr_pages, PAGE_SIZE, &end) ||
+	    check_add_overflow(addr, end, &end) ||
+	    !range_in_vma_desc(desc, addr, end))
 		return -EFAULT;
 
 	return 0;
@@ -2588,9 +2850,34 @@ int vm_insert_page(struct vm_area_struct *vma, unsigned long addr,
 		BUG_ON(vma->vm_flags & VM_PFNMAP);
 		vm_flags_set(vma, VM_MIXEDMAP);
 	}
-	return insert_page(vma, addr, page, vma->vm_page_prot, false);
+	return insert_page(vma, addr, page, vma->vm_page_prot, false, 0);
 }
 EXPORT_SYMBOL(vm_insert_page);
+
+#ifdef CONFIG_MM_SUBPAGE
+/* Explicit physical offset; the VMA and supplied page retain native ownership. */
+vm_fault_t vmf_insert_page_offset(struct vm_area_struct *vma, unsigned long addr,
+		struct page *page, unsigned int offset)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long size = mm_page_size(mm);
+	int err;
+
+	if (!(vma->vm_flags & VM_MIXEDMAP) || (vma->vm_flags & VM_PFNMAP) ||
+	    (addr & (size - 1)) || (offset & (size - 1)) ||
+	    offset > PAGE_SIZE - size || addr < vma->vm_start ||
+	    addr >= vma->vm_end || vma->vm_end - addr < size)
+		return VM_FAULT_SIGBUS;
+	err = insert_page(vma, addr, page, vma->vm_page_prot, false, offset);
+	if (err == -ENOMEM)
+		return VM_FAULT_OOM;
+	if (err < 0 && err != -EBUSY)
+		return VM_FAULT_SIGBUS;
+	return VM_FAULT_NOPAGE;
+}
+EXPORT_SYMBOL_GPL(vmf_insert_page_offset);
+#endif
+
 
 /*
  * __vm_map_pages - maps range of kernel pages into user vma
@@ -2606,20 +2893,22 @@ EXPORT_SYMBOL(vm_insert_page);
  * Return: 0 on success and error code otherwise.
  */
 static int __vm_map_pages(struct vm_area_struct *vma, struct page **pages,
-				unsigned long num, unsigned long offset)
+			 unsigned long num, unsigned long offset,
+			 unsigned int subpage_offset)
 {
-	unsigned long count = vma_pages(vma);
-	unsigned long uaddr = vma->vm_start;
+	unsigned long bytes, available;
 
-	/* Fail if the user requested offset is beyond the end of the object */
-	if (offset >= num)
+	if (offset >= num ||
+	    check_mul_overflow(num - offset, PAGE_SIZE, &available) ||
+	    subpage_offset >= PAGE_SIZE ||
+	    check_mul_overflow(offset, PAGE_SIZE, &bytes) ||
+	    check_add_overflow(bytes, (unsigned long)subpage_offset, &bytes))
 		return -ENXIO;
-
-	/* Fail if the user requested size exceeds available object size */
-	if (count > num - offset)
+	if (vma->vm_end - vma->vm_start >
+	    available - subpage_offset)
 		return -ENXIO;
-
-	return vm_insert_pages(vma, uaddr, pages + offset, &count);
+	return vm_insert_pages_range(vma, vma->vm_start, pages, num, bytes,
+				     vma->vm_end - vma->vm_start);
 }
 
 /**
@@ -2643,7 +2932,7 @@ static int __vm_map_pages(struct vm_area_struct *vma, struct page **pages,
 int vm_map_pages(struct vm_area_struct *vma, struct page **pages,
 				unsigned long num)
 {
-	return __vm_map_pages(vma, pages, num, vma->vm_pgoff);
+	return __vm_map_pages(vma, pages, num, vma->vm_pgoff, vma_subpage_offset(vma));
 }
 EXPORT_SYMBOL(vm_map_pages);
 
@@ -2663,12 +2952,12 @@ EXPORT_SYMBOL(vm_map_pages);
 int vm_map_pages_zero(struct vm_area_struct *vma, struct page **pages,
 				unsigned long num)
 {
-	return __vm_map_pages(vma, pages, num, 0);
+	return __vm_map_pages(vma, pages, num, 0, 0);
 }
 EXPORT_SYMBOL(vm_map_pages_zero);
 
 static vm_fault_t insert_pfn(struct vm_area_struct *vma, unsigned long addr,
-			unsigned long pfn, pgprot_t prot, bool mkwrite)
+			unsigned long pfn, pgprot_t prot, bool mkwrite, unsigned int offset)
 {
 	struct mm_struct *mm = vma->vm_mm;
 	pte_t *pte, entry;
@@ -2690,7 +2979,7 @@ static vm_fault_t insert_pfn(struct vm_area_struct *vma, unsigned long addr,
 			 * allocation and mapping invalidation so just skip the
 			 * update.
 			 */
-			if (pte_pfn(entry) != pfn) {
+			if (pte_phys_mm(mm, entry) != PFN_PHYS(pfn) + offset) {
 				WARN_ON_ONCE(!is_zero_pfn(pte_pfn(entry)));
 				goto out_unlock;
 			}
@@ -2703,7 +2992,7 @@ static vm_fault_t insert_pfn(struct vm_area_struct *vma, unsigned long addr,
 	}
 
 	/* Ok, finally just insert the thing.. */
-	entry = pte_mkspecial(pfn_pte(pfn, prot));
+	entry = pte_mkspecial(phys_pte_mm(mm, PFN_PHYS(pfn) + offset, prot));
 
 	if (mkwrite) {
 		entry = pte_mkyoung(entry);
@@ -2765,9 +3054,9 @@ out_unlock:
  * Context: Process context.  May allocate using %GFP_KERNEL.
  * Return: vm_fault_t value.
  */
-vm_fault_t vmf_insert_pfn_prot_mkwrite(struct vm_area_struct *vma,
+static vm_fault_t __vmf_insert_pfn_prot_mkwrite(struct vm_area_struct *vma,
 			unsigned long addr, unsigned long pfn, pgprot_t pgprot,
-			bool mkwrite)
+			bool mkwrite, unsigned int offset)
 {
 	/*
 	 * Technically, architectures with pte_special can avoid all these
@@ -2789,9 +3078,30 @@ vm_fault_t vmf_insert_pfn_prot_mkwrite(struct vm_area_struct *vma,
 
 	pfnmap_setup_cachemode_pfn(pfn, &pgprot);
 
-	return insert_pfn(vma, addr, pfn, pgprot, mkwrite);
+	return insert_pfn(vma, addr, pfn, pgprot, mkwrite, offset);
+}
+vm_fault_t vmf_insert_pfn_prot_mkwrite(struct vm_area_struct *vma,
+			unsigned long addr, unsigned long pfn, pgprot_t pgprot,
+			bool mkwrite)
+{
+	return __vmf_insert_pfn_prot_mkwrite(vma, addr, pfn, pgprot, mkwrite, 0);
 }
 EXPORT_SYMBOL(vmf_insert_pfn_prot_mkwrite);
+
+/* Explicit quarter offset; a native PFN alone cannot encode a 4K leaf. */
+vm_fault_t vmf_insert_pfn_prot_mkwrite_offset(struct vm_area_struct *vma,
+		unsigned long addr, unsigned long pfn, unsigned int offset,
+		pgprot_t pgprot, bool mkwrite)
+{
+	unsigned long size = mm_page_size(vma->vm_mm);
+
+	if (!IS_ALIGNED(addr | offset, size) || offset > PAGE_SIZE - size ||
+	    addr < vma->vm_start || addr >= vma->vm_end ||
+	    vma->vm_end - addr < size)
+		return VM_FAULT_SIGBUS;
+	return __vmf_insert_pfn_prot_mkwrite(vma, addr, pfn, pgprot, mkwrite, offset);
+}
+EXPORT_SYMBOL_GPL(vmf_insert_pfn_prot_mkwrite_offset);
 
 static bool vm_mixed_ok(struct vm_area_struct *vma, unsigned long pfn,
 			bool mkwrite)
@@ -2840,9 +3150,9 @@ static vm_fault_t __vm_insert_mixed(struct vm_area_struct *vma,
 		 * result in pfn_t_has_page() == false.
 		 */
 		page = pfn_to_page(pfn);
-		err = insert_page(vma, addr, page, pgprot, mkwrite);
+		err = insert_page(vma, addr, page, pgprot, mkwrite, 0);
 	} else {
-		return insert_pfn(vma, addr, pfn, pgprot, mkwrite);
+		return insert_pfn(vma, addr, pfn, pgprot, mkwrite, 0);
 	}
 
 	if (err == -ENOMEM)
@@ -2863,7 +3173,7 @@ vm_fault_t vmf_insert_page_mkwrite(struct vm_fault *vmf, struct page *page,
 	if (addr < vmf->vma->vm_start || addr >= vmf->vma->vm_end)
 		return VM_FAULT_SIGBUS;
 
-	err = insert_page(vmf->vma, addr, page, pgprot, write);
+	err = insert_page(vmf->vma, addr, page, pgprot, write, 0);
 	if (err == -ENOMEM)
 		return VM_FAULT_OOM;
 	if (err < 0 && err != -EBUSY)
@@ -2898,7 +3208,7 @@ vm_fault_t vmf_insert_mixed_mkwrite(struct vm_area_struct *vma,
  */
 static int remap_pte_range(struct mm_struct *mm, pmd_t *pmd,
 			unsigned long addr, unsigned long end,
-			unsigned long pfn, pgprot_t prot)
+			phys_addr_t phys, pgprot_t prot)
 {
 	pte_t *pte, *mapped_pte;
 	spinlock_t *ptl;
@@ -2910,13 +3220,13 @@ static int remap_pte_range(struct mm_struct *mm, pmd_t *pmd,
 	lazy_mmu_mode_enable();
 	do {
 		BUG_ON(!pte_none(ptep_get(pte)));
-		if (!pfn_modify_allowed(pfn, prot)) {
+		if (!pfn_modify_allowed(PHYS_PFN(phys), prot)) {
 			err = -EACCES;
 			break;
 		}
-		set_pte_at(mm, addr, pte, pte_mkspecial(pfn_pte(pfn, prot)));
-		pfn++;
-	} while (pte++, addr += PAGE_SIZE, addr != end);
+		set_pte_at(mm, addr, pte, pte_mkspecial(phys_pte_mm(mm, phys, prot)));
+		phys += mm_page_size(mm);
+	} while (pte++, addr += mm_page_size(mm), addr != end);
 	lazy_mmu_mode_disable();
 	pte_unmap_unlock(mapped_pte, ptl);
 	return err;
@@ -2924,67 +3234,67 @@ static int remap_pte_range(struct mm_struct *mm, pmd_t *pmd,
 
 static inline int remap_pmd_range(struct mm_struct *mm, pud_t *pud,
 			unsigned long addr, unsigned long end,
-			unsigned long pfn, pgprot_t prot)
+			phys_addr_t phys, pgprot_t prot)
 {
 	pmd_t *pmd;
 	unsigned long next;
 	int err;
 
-	pfn -= addr >> PAGE_SHIFT;
 	pmd = pmd_alloc(mm, pud, addr);
 	if (!pmd)
 		return -ENOMEM;
 	VM_BUG_ON(pmd_trans_huge(*pmd));
 	do {
-		next = pmd_addr_end(addr, end);
+		next = pmd_addr_end_mm(mm, addr, end);
 		err = remap_pte_range(mm, pmd, addr, next,
-				pfn + (addr >> PAGE_SHIFT), prot);
+				phys, prot);
 		if (err)
 			return err;
+		phys += next - addr;
 	} while (pmd++, addr = next, addr != end);
 	return 0;
 }
 
 static inline int remap_pud_range(struct mm_struct *mm, p4d_t *p4d,
 			unsigned long addr, unsigned long end,
-			unsigned long pfn, pgprot_t prot)
+			phys_addr_t phys, pgprot_t prot)
 {
 	pud_t *pud;
 	unsigned long next;
 	int err;
 
-	pfn -= addr >> PAGE_SHIFT;
 	pud = pud_alloc(mm, p4d, addr);
 	if (!pud)
 		return -ENOMEM;
 	do {
-		next = pud_addr_end(addr, end);
+		next = pud_addr_end_mm(mm, addr, end);
 		err = remap_pmd_range(mm, pud, addr, next,
-				pfn + (addr >> PAGE_SHIFT), prot);
+				phys, prot);
 		if (err)
 			return err;
+		phys += next - addr;
 	} while (pud++, addr = next, addr != end);
 	return 0;
 }
 
 static inline int remap_p4d_range(struct mm_struct *mm, pgd_t *pgd,
 			unsigned long addr, unsigned long end,
-			unsigned long pfn, pgprot_t prot)
+			phys_addr_t phys, pgprot_t prot)
 {
 	p4d_t *p4d;
 	unsigned long next;
 	int err;
 
-	pfn -= addr >> PAGE_SHIFT;
 	p4d = p4d_alloc(mm, pgd, addr);
 	if (!p4d)
 		return -ENOMEM;
 	do {
-		next = p4d_addr_end(addr, end);
+		next = p4d_addr_end_mm(mm, addr, end);
 		err = remap_pud_range(mm, p4d, addr, next,
-				pfn + (addr >> PAGE_SHIFT), prot);
+				phys, prot);
 		if (err)
 			return err;
+		phys += next - addr;
 	} while (p4d++, addr = next, addr != end);
 	return 0;
 }
@@ -3013,25 +3323,26 @@ static int remap_pfn_range_internal(struct vm_area_struct *vma, unsigned long ad
 {
 	pgd_t *pgd;
 	unsigned long next;
-	unsigned long end = addr + PAGE_ALIGN(size);
 	struct mm_struct *mm = vma->vm_mm;
+	unsigned long end = addr + mm_page_align(mm, size);
+	phys_addr_t phys = PFN_PHYS(pfn);
 	int err;
 
-	if (WARN_ON_ONCE(!PAGE_ALIGNED(addr)))
+	if (WARN_ON_ONCE(!IS_ALIGNED(addr, mm_page_size(mm))))
 		return -EINVAL;
 
 	VM_WARN_ON_ONCE(!vma_test_all_mask(vma, VMA_REMAP_FLAGS));
 
 	BUG_ON(addr >= end);
-	pfn -= addr >> PAGE_SHIFT;
 	pgd = pgd_offset(mm, addr);
 	flush_cache_range(vma, addr, end);
 	do {
-		next = pgd_addr_end(addr, end);
+		next = pgd_addr_end_mm(mm, addr, end);
 		err = remap_p4d_range(mm, pgd, addr, next,
-				pfn + (addr >> PAGE_SHIFT), prot);
+				phys, prot);
 		if (err)
 			return err;
+		phys += next - addr;
 	} while (pgd++, addr = next, addr != end);
 
 	return 0;
@@ -3093,7 +3404,7 @@ static int remap_pfn_range_track(struct vm_area_struct *vma, unsigned long addr,
 	struct pfnmap_track_ctx *ctx = NULL;
 	int err;
 
-	size = PAGE_ALIGN(size);
+	size = mm_page_align(vma->vm_mm, size);
 
 	/*
 	 * If we cover the full VMA, we'll perform actual tracking, and
@@ -3162,7 +3473,7 @@ static int remap_pfn_range_prepare_vma(struct vm_area_struct *vma,
 				       unsigned long addr, unsigned long pfn,
 				       unsigned long size)
 {
-	const unsigned long end = addr + PAGE_ALIGN(size);
+	const unsigned long end = addr + mm_page_align(vma->vm_mm, size);
 	const bool is_cow = is_cow_mapping(vma->vm_flags);
 	int err;
 
@@ -3540,15 +3851,14 @@ static inline int pte_unmap_same(struct vm_fault *vmf)
  *	-EHWPOISON:	copy failed due to hwpoison in source page
  *	-EAGAIN:	copied failed (some other reason)
  */
-static inline int __wp_page_copy_user(struct page *dst, struct page *src,
-				      struct vm_fault *vmf)
+static inline int __wp_native_page_copy_user(struct page *dst, struct page *src,
+				      struct vm_fault *vmf, unsigned long addr)
 {
 	int ret;
 	void *kaddr;
 	void __user *uaddr;
 	struct vm_area_struct *vma = vmf->vma;
 	struct mm_struct *mm = vma->vm_mm;
-	unsigned long addr = vmf->address;
 
 	if (likely(src)) {
 		if (copy_mc_user_highpage(dst, src, addr, vma))
@@ -3636,6 +3946,22 @@ pte_unlock:
 	flush_dcache_page(dst);
 
 	return ret;
+}
+
+static int __wp_page_copy_user(struct page *dst, struct page *src,
+			       struct vm_fault *vmf)
+{
+	unsigned int i, nr = mm_pte_native_pages(vmf->vma->vm_mm);
+
+	for (i = 0; i < nr; i++) {
+		int ret = __wp_native_page_copy_user(dst + i, src ? src + i : NULL,
+						    vmf, vmf->address + i * PAGE_SIZE);
+
+		if (ret)
+			return ret;
+		kmsan_copy_page_meta(dst + i, src ? src + i : NULL);
+	}
+	return 0;
 }
 
 static gfp_t __get_fault_gfp_mask(struct vm_area_struct *vma)
@@ -3883,14 +4209,13 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 			delayacct_wpcopy_end();
 			return err == -EHWPOISON ? VM_FAULT_HWPOISON : 0;
 		}
-		kmsan_copy_page_meta(&new_folio->page, vmf->page);
 	}
 
 	__folio_mark_uptodate(new_folio);
 
 	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, mm,
-				vmf->address & PAGE_MASK,
-				(vmf->address & PAGE_MASK) + PAGE_SIZE);
+				vmf->address & mm_page_mask(mm),
+				(vmf->address & mm_page_mask(mm)) + mm_page_size(mm));
 	mmu_notifier_invalidate_range_start(&range);
 
 	/*
@@ -3927,6 +4252,7 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 		 * some TLBs while the old PTE remains in others.
 		 */
 		ptep_clear_flush(vma, vmf->address, vmf->pte);
+		folio_ref_add(new_folio, mm_pte_native_pages(mm) - 1);
 		folio_add_new_anon_rmap(new_folio, vma, vmf->address, RMAP_EXCLUSIVE);
 		folio_add_lru_vma(new_folio, vma);
 		BUG_ON(unshare && pte_write(entry));
@@ -3970,7 +4296,7 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 	mmu_notifier_invalidate_range_end(&range);
 
 	if (new_folio)
-		folio_put(new_folio);
+		folio_put_refs(new_folio, page_copied ? mm_pte_native_pages(mm) : 1);
 	if (old_folio) {
 		if (page_copied)
 			free_swap_cache(old_folio);
@@ -4092,7 +4418,7 @@ static vm_fault_t wp_page_shared(struct vm_fault *vmf, struct folio *folio)
 	return ret;
 }
 
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+#ifdef CONFIG_MM_ID
 static bool __wp_can_reuse_large_anon_folio(struct folio *folio,
 		struct vm_area_struct *vma)
 {
@@ -4158,18 +4484,18 @@ unlock:
 	folio_unlock_large_mapcount(folio);
 	return exclusive;
 }
-#else /* !CONFIG_TRANSPARENT_HUGEPAGE */
+#else /* !CONFIG_MM_ID */
 static bool __wp_can_reuse_large_anon_folio(struct folio *folio,
 		struct vm_area_struct *vma)
 {
 	BUILD_BUG();
 }
-#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+#endif /* CONFIG_MM_ID */
 
 static bool wp_can_reuse_anon_folio(struct folio *folio,
 				    struct vm_area_struct *vma)
 {
-	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) && folio_test_large(folio))
+	if (IS_ENABLED(CONFIG_MM_ID) && folio_test_large(folio))
 		return __wp_can_reuse_large_anon_folio(folio, vma);
 
 	/*
@@ -4206,6 +4532,177 @@ static bool wp_can_reuse_anon_folio(struct folio *folio,
 	folio_unlock(folio);
 	return true;
 }
+
+#ifdef CONFIG_MM_SUBPAGE
+/* Enter with the original PTE locked; a slot, not its native folio, is copied. */
+static vm_fault_t wp_subpage_copy(struct vm_fault *vmf)
+	__releases(vmf->ptl)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	struct mm_subpage *source = NULL, *dest = NULL;
+	struct mm_subpage_pool *pool = NULL;
+	struct folio *old = vmf->page ? page_folio(vmf->page) : NULL;
+	struct folio *new = NULL;
+	struct mmu_notifier_range range;
+	bool copied = false, unshare = vmf->flags & FAULT_FLAG_UNSHARE;
+	unsigned int offset;
+	vm_fault_t ret = VM_FAULT_SIGBUS;
+	pte_t entry;
+	int err;
+
+	if (old && folio_test_anon(old)) {
+		source = mm_subpage_get_from_phys(pte_phys_mm(mm, vmf->orig_pte));
+		if (WARN_ON_ONCE(!source)) {
+			pte_unmap_unlock(vmf->pte, vmf->ptl);
+			return VM_FAULT_SIGBUS;
+		}
+		if (!mm_subpage_is_exclusive(source) && mm_subpage_mapcount(source) == 1 &&
+		    folio_trylock(old)) {
+			bool reusable = true;
+
+			if (folio_test_swapcache(old)) {
+				swp_entry_t entry = page_swap_entry(&old->page);
+
+				reusable = !swap_subpage_count(entry, mm_subpage_offset(source)) &&
+					!(folio_test_writeback(old) &&
+					  (folio_swap_flags(old) & SWP_STABLE_WRITES));
+			}
+			if (reusable)
+				mm_subpage_try_reuse_anon(source);
+			folio_unlock(old);
+		}
+		if (mm_subpage_is_exclusive(source)) {
+			if (unshare) {
+				pte_unmap_unlock(vmf->pte, vmf->ptl);
+			} else {
+				folio_xchg_last_cpupid(old, (1 << LAST_CPUPID_SHIFT) - 1);
+				/* Exclusivity belongs to the slot, not PageAnonExclusive. */
+				wp_page_reuse(vmf, NULL);
+			}
+			mm_subpage_put(source);
+			return 0;
+		}
+	} else if (old) {
+		folio_get(old);
+	} else if (!is_zero_pfn(pte_pfn(vmf->orig_pte))) {
+		/* Private device/PFN mappings need their own subpage contract. */
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+		return VM_FAULT_SIGBUS;
+	}
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+	vmf->pte = NULL;
+	delayacct_wpcopy_start();
+	ret = vmf_anon_prepare(vmf);
+	if (ret)
+		goto out;
+	offset = vma_page_offset_at(vma, vmf->address).offset;
+	ret = VM_FAULT_OOM;
+	pool = mm_subpage_pool_create_granule(GFP_KERNEL, mm_page_shift(mm));
+	if (!pool)
+		goto out;
+	new = folio_prealloc(mm, vma, vmf->address, false);
+	if (!new)
+		goto out;
+	err = mm_subpage_pool_add_folio(pool, new, GFP_KERNEL);
+	if (err) {
+		folio_put(new);
+		goto out;
+	}
+	dest = source ? mm_subpage_copy_at(pool, source, offset) :
+		mm_subpage_alloc_at(pool, offset);
+	if (IS_ERR(dest)) {
+		if (PTR_ERR(dest) == -EHWPOISON)
+			ret = VM_FAULT_HWPOISON;
+		dest = NULL;
+		goto out;
+	}
+	if (old && !source) {
+		err = copy_user_subpage_range(&new->page, offset, vmf->page,
+					pte_phys_mm(mm, vmf->orig_pte) & ~PAGE_MASK,
+					mm_page_size(mm));
+		if (err) {
+			ret = VM_FAULT_HWPOISON;
+			goto out;
+		}
+	}
+	mm_subpage_pool_close(pool);
+	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, mm,
+				vmf->address, vmf->address + mm_page_size(mm));
+	mmu_notifier_invalidate_range_start(&range);
+	/* Keep the folio alive after a concurrent zap can consume its PTE ref. */
+	folio_get(new);
+	folio_lock(new);
+	ret = 0;
+	vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);
+	if (!vmf->pte)
+		goto unlock_folio;
+	if (!pte_same(ptep_get(vmf->pte), vmf->orig_pte)) {
+		update_mmu_tlb(vma, vmf->address, vmf->pte);
+		goto unlock_pte;
+	}
+	mm_subpage_set_exclusive(dest);
+	err = mm_subpage_add_new_anon_rmap(dest, vma, vmf->address);
+	if (WARN_ON_ONCE(err)) {
+		ret = VM_FAULT_SIGBUS;
+		goto unlock_pte;
+	}
+	entry = pte_sw_mkyoung(phys_pte_mm(mm, mm_subpage_phys(dest), vma->vm_page_prot));
+	if (unshare) {
+		if (pte_soft_dirty(vmf->orig_pte))
+			entry = pte_mksoft_dirty(entry);
+		if (pte_uffd_wp(vmf->orig_pte))
+			entry = pte_mkuffd_wp(entry);
+	} else {
+		entry = maybe_mkwrite(pte_mkdirty(entry), vma);
+	}
+	BUG_ON(unshare && pte_write(entry));
+	flush_cache_page(vma, vmf->address, pte_pfn(vmf->orig_pte));
+	/* Break-before-make also orders removal of the old slot's rmap. */
+	ptep_clear_flush(vma, vmf->address, vmf->pte);
+	subpage_add_new_lru(new, vma, 1);
+	set_pte_at(mm, vmf->address, vmf->pte, entry);
+	update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
+	if (source) {
+		mm_subpage_remove_anon_rmap(source, vma);
+	} else if (old) {
+		mm_subpage_file_map_del(vma, pte_phys_mm(mm, vmf->orig_pte));
+		folio_remove_rmap_pte(old, vmf->page, vma);
+		dec_mm_counter(mm, mm_counter_file(old));
+		inc_mm_counter(mm, MM_ANONPAGES);
+	} else {
+		ksm_might_unmap_zero_page(mm, vmf->orig_pte);
+		inc_mm_counter(mm, MM_ANONPAGES);
+	}
+	dest = NULL; /* The new PTE owns the reference. */
+	copied = true;
+unlock_pte:
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+	vmf->pte = NULL;
+unlock_folio:
+	folio_unlock(new);
+	folio_put(new);
+	mmu_notifier_invalidate_range_end(&range);
+out:
+	if (pool) {
+		mm_subpage_pool_close(pool);
+		if (dest)
+			mm_subpage_put(dest);
+		mm_subpage_pool_put(pool);
+	}
+	if (source) {
+		if (copied)
+			mm_subpage_put(source); /* Retired PTE reference, after TLBI. */
+		mm_subpage_put(source); /* Source stabilisation reference. */
+	} else if (old) {
+		if (copied)
+			folio_put(old);
+		folio_put(old);
+	}
+	delayacct_wpcopy_end();
+	return ret;
+}
+#endif
 
 /*
  * This routine handles present pages, when
@@ -4292,6 +4789,11 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
 		return wp_page_shared(vmf, folio);
 	}
 
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(vma->vm_mm) < PAGE_SIZE)
+		return wp_subpage_copy(vmf);
+#endif
+
 	/*
 	 * Private mapping: create an exclusive anonymous page copy if reuse
 	 * is impossible. We might miss VM_WRITE for FOLL_FORCE handling.
@@ -4301,8 +4803,12 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
 	 */
 	if (folio && folio_test_anon(folio) &&
 	    (PageAnonExclusive(vmf->page) || wp_can_reuse_anon_folio(folio, vma))) {
-		if (!PageAnonExclusive(vmf->page))
-			SetPageAnonExclusive(vmf->page);
+		if (!PageAnonExclusive(vmf->page)) {
+			unsigned int i, nr = mm_pte_native_pages(vma->vm_mm);
+
+			for (i = 0; i < nr; i++)
+				SetPageAnonExclusive(vmf->page + i);
+		}
 		if (unlikely(unshare)) {
 			pte_unmap_unlock(vmf->pte, vmf->ptl);
 			return 0;
@@ -4340,11 +4846,115 @@ static inline void unmap_mapping_range_tree(struct rb_root_cached *root,
 		start = vma->vm_start + ((start_idx - vma->vm_pgoff) << PAGE_SHIFT);
 		size = (end_idx - start_idx) << PAGE_SHIFT;
 
+#ifdef CONFIG_MM_SUBPAGE
+		if (mm_page_size(vma->vm_mm) < PAGE_SIZE) {
+			unsigned long end = vma->vm_end;
+
+			start = vma_address(vma, first_index, last_index - first_index + 1);
+			/* The interval tree guarantees a nonempty intersection. */
+			VM_BUG_ON_VMA(IS_ERR_VALUE(start), vma);
+			if (last_index < vma_last_pgoff(vma))
+				end = vma_address_at_offset(vma, (struct vm_page_offset) {
+					.index = last_index + 1,
+				});
+			size = end - start;
+		} else if (mm_page_size(vma->vm_mm) > PAGE_SIZE) {
+			unsigned long granule = mm_page_size(vma->vm_mm);
+			unsigned long end = min(start + size, vma->vm_end);
+
+			/* A native-page invalidation removes every overlapping leaf. */
+			start = max(round_down(start, granule), vma->vm_start);
+			end = min(round_up(end, granule), vma->vm_end);
+			size = end - start;
+		}
+#endif
+
 		tlb_gather_mmu(&tlb, vma->vm_mm);
 		zap_vma_range_batched(&tlb, vma, start, size, details);
 		tlb_finish_mmu(&tlb);
 	}
 }
+
+#ifdef CONFIG_MM_SUBPAGE
+/* Unmap affected user leaves, including coarse aliases; preserve private COW. */
+void unmap_mapping_subpage_hole(struct address_space *mapping, loff_t first, u64 last)
+{
+	struct vm_area_struct *vma;
+	struct zap_details details = { .skip_cows = true };
+
+	i_mmap_lock_read(mapping);
+	vma_interval_tree_foreach(vma, &mapping->i_mmap,
+				 first >> PAGE_SHIFT, (last - 1) >> PAGE_SHIFT) {
+		unsigned long start, end, granule = mm_page_size(vma->vm_mm);
+		u64 low = round_down((u64)first, granule), high = round_up(last, granule);
+		struct vm_page_offset begin = { low >> PAGE_SHIFT, low & ~PAGE_MASK };
+		struct vm_page_offset finish = { high >> PAGE_SHIFT, high & ~PAGE_MASK };
+		struct vm_page_offset vbegin = vma_page_offset_at(vma, vma->vm_start);
+		struct vm_page_offset vend = vma_page_offset_at(vma, vma->vm_end);
+		struct mmu_gather tlb;
+
+		if (begin.index < vbegin.index ||
+		    (begin.index == vbegin.index && begin.offset <= vbegin.offset))
+			start = vma->vm_start;
+		else
+			start = vma_address_at_offset(vma, begin);
+		if (finish.index > vend.index ||
+		    (finish.index == vend.index && finish.offset >= vend.offset))
+			end = vma->vm_end;
+		else
+			end = vma_address_at_offset(vma, finish);
+		if (IS_ERR_VALUE(start) || IS_ERR_VALUE(end) || start >= end)
+			continue;
+		tlb_gather_mmu(&tlb, vma->vm_mm);
+		zap_vma_range_batched(&tlb, vma, start, end - start, &details);
+		tlb_finish_mmu(&tlb);
+	}
+	i_mmap_unlock_read(mapping);
+}
+
+/*
+ * Native truncation keeps its final partial page. Smaller-granule mms must
+ * additionally discard complete granules in that native page, including
+ * private COW copies. Call on both sides of cache truncation, as for the
+ * ordinary unmap_mapping_range() calls.
+ */
+void unmap_mapping_subpage_tail(struct address_space *mapping, loff_t newsize)
+{
+	struct vm_area_struct *vma;
+	struct zap_details details = { };
+	pgoff_t index = newsize >> PAGE_SHIFT;
+	unsigned int offset = newsize & ~PAGE_MASK;
+
+	if (!offset)
+		return;
+	i_mmap_lock_read(mapping);
+	vma_interval_tree_foreach(vma, &mapping->i_mmap, index, index) {
+		unsigned long start, end, granule = mm_page_size(vma->vm_mm);
+		struct vm_page_offset pos = { .index = index, .offset = round_up(offset, granule) };
+		struct vm_page_offset vpos = vma_page_offset_at(vma, vma->vm_start);
+		struct mmu_gather tlb;
+
+		if (pos.offset >= PAGE_SIZE)
+			continue;
+		if (pos.index < vpos.index ||
+		    (pos.index == vpos.index && pos.offset < vpos.offset))
+			start = vma->vm_start;
+		else
+			start = vma_address_at_offset(vma, pos);
+		if (IS_ERR_VALUE(start))
+			continue;
+		end = vma->vm_end;
+		if (index < vma_last_pgoff(vma))
+			end = vma_address_at_offset(vma, (struct vm_page_offset) {
+				.index = index + 1,
+			});
+		tlb_gather_mmu(&tlb, vma->vm_mm);
+		zap_vma_range_batched(&tlb, vma, start, end - start, &details);
+		tlb_finish_mmu(&tlb);
+	}
+	i_mmap_unlock_read(mapping);
+}
+#endif
 
 /**
  * unmap_mapping_folio() - Unmap single folio from processes.
@@ -4772,6 +5382,134 @@ static void check_swap_exclusive(struct folio *folio, swp_entry_t entry,
 	} while (--nr_pages);
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+/* The swap-cache index remains native-sized; the PTE retains its slot offset. */
+static vm_fault_t do_swap_subpage(struct vm_fault *vmf, swp_entry_t entry)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	struct swap_info_struct *si;
+	struct mm_subpage *slot = NULL;
+	struct folio *folio;
+	unsigned int offset = pte_swp_subpage_offset(vmf->orig_pte);
+	vm_fault_t ret;
+	pte_t pte;
+	int err;
+
+	ret = vmf_anon_prepare(vmf);
+	if (ret)
+		return ret;
+	/* Swap encodes the physical slot, independent of its virtual position. */
+	if (offset >= PAGE_SIZE || !IS_ALIGNED(offset, mm_page_size(mm)))
+		return VM_FAULT_SIGBUS;
+	si = get_swap_device(entry);
+	if (!si)
+		return 0;
+	folio = swap_cache_get_folio(entry);
+	if (folio) {
+		swap_update_readahead(folio, vma, vmf->address);
+	} else {
+		folio = swapin_readahead(entry, GFP_HIGHUSER_MOVABLE, vmf);
+		if (!folio) {
+			vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);
+			if (vmf->pte) {
+				if (pte_same(ptep_get(vmf->pte), vmf->orig_pte))
+					ret = VM_FAULT_OOM;
+				pte_unmap_unlock(vmf->pte, vmf->ptl);
+				vmf->pte = NULL;
+			}
+			goto out_device;
+		}
+		ret = VM_FAULT_MAJOR;
+		count_vm_event(PGMAJFAULT);
+		count_memcg_event_mm(mm, PGMAJFAULT);
+	}
+	ret |= folio_lock_or_retry(folio, vmf);
+	if (ret & VM_FAULT_RETRY)
+		goto out_folio;
+	if (!folio_matches_swap_entry(folio, entry))
+		goto unlock_folio;
+	if (folio_order(folio) || !folio_test_uptodate(folio) || folio_test_ksm(folio)) {
+		ret = VM_FAULT_SIGBUS;
+		goto unlock_folio;
+	}
+	if (PageHWPoison(&folio->page)) {
+		ret = VM_FAULT_HWPOISON;
+		goto unlock_folio;
+	}
+	arch_swap_restore(folio_swap(entry, folio), folio);
+	slot = mm_subpage_restore_granule(folio, offset, mm_page_shift(mm), GFP_KERNEL);
+	if (IS_ERR(slot)) {
+		err = PTR_ERR(slot);
+		slot = NULL;
+		if (err != -EAGAIN)
+			ret = err == -ENOMEM ? VM_FAULT_OOM : VM_FAULT_SIGBUS;
+		goto unlock_folio;
+	}
+	folio_throttle_swaprate(folio, GFP_KERNEL);
+	vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);
+	if (!vmf->pte)
+		goto unlock_folio;
+	if (!pte_same(ptep_get(vmf->pte), vmf->orig_pte))
+		goto unlock_pte;
+	err = mm_subpage_add_anon_rmap(slot, vma, vmf->address);
+	if (err) {
+		ret = err == -ENOMEM ? VM_FAULT_OOM : VM_FAULT_SIGBUS;
+		goto unlock_pte;
+	}
+	/*
+	 * A carried marker proves exclusivity directly. After the last fork
+	 * sharer exits, recover it only with one swap reference to this exact
+	 * quarter and no other mapping or escaped slot reference. Dropping a
+	 * nonpresent PTE in zap flushes pending reclaim TLB invalidations first.
+	 * Stable-write backends must still finish writeback before reuse.
+	 */
+	if (!(folio_test_writeback(folio) && data_race(si->flags & SWP_STABLE_WRITES))) {
+		if (pte_swp_exclusive(vmf->orig_pte))
+			mm_subpage_set_exclusive(slot);
+		else if (swap_subpage_count(entry, offset) == 1)
+			mm_subpage_try_reuse_swap(slot);
+	}
+	pte = pte_sw_mkyoung(phys_pte_mm(mm, mm_subpage_phys(slot), vma->vm_page_prot));
+	if (pte_swp_soft_dirty(vmf->orig_pte))
+		pte = pte_mksoft_dirty(pte);
+	if (pte_swp_uffd_wp(vmf->orig_pte))
+		pte = pte_mkuffd_wp(pte);
+	inc_mm_counter(mm, MM_ANONPAGES);
+	dec_mm_counter(mm, MM_SWAPENTS);
+	swap_subpage_put(entry, offset, false);
+	set_pte_at(mm, vmf->address, vmf->pte, pte);
+	arch_do_swap_page_nr(mm, vma, vmf->address, pte, pte, 1);
+	slot = NULL; /* The restored PTE owns the slot reference. */
+	vmf->orig_pte = pte;
+	if (should_try_to_free_swap(si, folio, vma, 2, vmf->flags))
+		folio_free_swap(folio);
+	folio_unlock(folio);
+	folio_put(folio); /* Drop the cache lookup, not the PTE reference. */
+	put_swap_device(si);
+	if (vmf->flags & FAULT_FLAG_WRITE) {
+		ret |= do_wp_page(vmf);
+		return ret & VM_FAULT_ERROR ? ret & VM_FAULT_ERROR : ret;
+	}
+	update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+	vmf->pte = NULL;
+	return ret;
+unlock_pte:
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+	vmf->pte = NULL;
+unlock_folio:
+	if (slot)
+		mm_subpage_put(slot);
+	folio_unlock(folio);
+out_folio:
+	folio_put(folio);
+out_device:
+	put_swap_device(si);
+	return ret;
+}
+#endif
+
 /*
  * We enter with non-exclusive mmap_lock (to exclude vma changes,
  * but allow concurrent faults), and pte mapped but not yet locked.
@@ -4780,6 +5518,209 @@ static void check_swap_exclusive(struct folio *folio, swp_entry_t entry,
  * We return with the mmap_lock locked or unlocked in the same cases
  * as does filemap_fault().
  */
+#if defined(CONFIG_MM_SUBPAGE) && defined(CONFIG_SWAP)
+/* One coarse PTE owns a naturally aligned group of native swap entries. */
+vm_fault_t do_swap_coarse_page(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	/* Arm64's largest base user page is 64K, its smallest native page 4K. */
+	struct folio *cache[SZ_64K / PAGE_SIZE];
+	unsigned int nr = mm_pte_native_pages(mm), covered = 0, count = 0, i;
+	swp_entry_t entry = softleaf_from_pte(vmf->orig_pte), next;
+	struct swap_info_struct *si;
+	struct folio *backing = NULL;
+	struct page *page;
+	unsigned int start;
+	bool copied = false, exclusive, mapped = false;
+	vm_fault_t ret = 0;
+	pte_t pte;
+
+	vmf->pte = NULL;
+	if (WARN_ON_ONCE(nr <= 1 || nr > ARRAY_SIZE(cache) ||
+			 !IS_ALIGNED(swp_offset(entry), nr)))
+		return VM_FAULT_SIGBUS;
+	si = get_swap_device(entry);
+	if (!si)
+		return 0;
+
+	while (covered < nr) {
+		struct folio *folio;
+		unsigned int take;
+		vm_fault_t wait;
+
+		next = entry;
+		next.val += covered;
+		folio = swap_cache_get_folio(next);
+		if (!folio) {
+			folio = read_swap_cache_async(next, GFP_HIGHUSER_MOVABLE, vma,
+						     vmf->address + covered * PAGE_SIZE, NULL);
+			if (!(ret & VM_FAULT_MAJOR)) {
+				ret |= VM_FAULT_MAJOR;
+				count_vm_event(PGMAJFAULT);
+				count_memcg_event_mm(mm, PGMAJFAULT);
+			}
+		}
+		if (!folio)
+			goto oom;
+		if (!count) {
+			wait = folio_lock_or_retry(folio, vmf);
+			if (wait & VM_FAULT_RETRY) {
+				folio_put(folio);
+				ret |= wait;
+				goto out;
+			}
+		} else if (!folio_trylock(folio)) {
+			/* Drop earlier cache locks before waiting for this I/O or owner. */
+			for (i = 0; i < count; i++) {
+				folio_unlock(cache[i]);
+				folio_put(cache[i]);
+			}
+			count = 0;
+			covered = 0;
+			wait = folio_lock_or_retry(folio, vmf);
+			if (wait & VM_FAULT_RETRY) {
+				folio_put(folio);
+				ret |= wait;
+				goto out;
+			}
+			folio_unlock(folio);
+			folio_put(folio);
+			cond_resched();
+			continue;
+		}
+		cache[count++] = folio;
+		if (!folio_matches_swap_entry(folio, next))
+			goto out;
+		if (!folio_test_uptodate(folio)) {
+			ret = VM_FAULT_SIGBUS;
+			goto out;
+		}
+		start = swp_offset(next) - swp_offset(folio->swap);
+		take = min(nr - covered, folio_nr_pages(folio) - start);
+		for (i = 0; i < take; i++) {
+			if (PageHWPoison(folio_page(folio, start + i))) {
+				ret = VM_FAULT_HWPOISON;
+				goto out;
+			}
+		}
+		arch_swap_restore(folio_swap(next, folio), folio);
+		covered += take;
+	}
+
+	start = swp_offset(entry) - swp_offset(cache[0]->swap);
+	if (count == 1 && IS_ALIGNED(start, nr) &&
+	    (folio_test_anon(cache[0]) || folio_nr_pages(cache[0]) == nr)) {
+		backing = cache[0];
+		page = folio_page(backing, start);
+	} else {
+		backing = vma_alloc_folio(GFP_HIGHUSER_MOVABLE, ilog2(nr), vma, vmf->address);
+		if (!backing)
+			goto oom;
+		copied = true;
+		if (mem_cgroup_swapin_charge_folio(backing, mm, GFP_KERNEL, entry))
+			goto oom;
+		covered = 0;
+		for (i = 0; i < count; i++) {
+			unsigned int j, take;
+
+			start = swp_offset(entry) + covered - swp_offset(cache[i]->swap);
+			take = min(nr - covered, folio_nr_pages(cache[i]) - start);
+			for (j = 0; j < take; j++) {
+				struct page *dst = folio_page(backing, covered + j);
+				struct page *src = folio_page(cache[i], start + j);
+
+				if (copy_mc_user_highpage(dst, src,
+						vmf->address + (covered + j) * PAGE_SIZE, vma)) {
+					ret = VM_FAULT_HWPOISON;
+					goto out;
+				}
+				kmsan_copy_page_meta(dst, src);
+			}
+			covered += take;
+		}
+		folio_set_dirty(backing);
+		__folio_mark_uptodate(backing);
+		page = &backing->page;
+	}
+
+	vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);
+	if (!vmf->pte || !pte_same(ptep_get(vmf->pte), vmf->orig_pte))
+		goto out;
+	exclusive = copied || pte_swp_exclusive(vmf->orig_pte);
+	if (!copied && exclusive) {
+		check_swap_exclusive(backing, entry, nr);
+		if (folio_test_writeback(backing) && data_race(si->flags & SWP_STABLE_WRITES))
+			exclusive = false;
+	}
+	pte = mk_pte(page, vma->vm_page_prot);
+	if (pte_swp_soft_dirty(vmf->orig_pte))
+		pte = pte_mksoft_dirty(pte);
+	if (pte_swp_uffd_wp(vmf->orig_pte))
+		pte = pte_mkuffd_wp(pte);
+	if (exclusive && (vma->vm_flags & VM_WRITE) && !userfaultfd_pte_wp(vma, pte) &&
+	    !pte_needs_soft_dirty_wp(vma, pte)) {
+		pte = pte_mkwrite(pte, vma);
+		if (vmf->flags & FAULT_FLAG_WRITE) {
+			pte = pte_mkdirty(pte);
+			vmf->flags &= ~FAULT_FLAG_WRITE;
+		}
+	}
+	folio_ref_add(backing, nr - copied);
+	if (!folio_test_anon(backing))
+		folio_add_new_anon_rmap(backing, vma, vmf->address,
+					exclusive ? RMAP_EXCLUSIVE : RMAP_NONE);
+	else
+		folio_add_anon_rmap_pte(backing, page, vma, vmf->address,
+					exclusive ? RMAP_EXCLUSIVE : RMAP_NONE);
+	if (copied)
+		folio_add_lru_vma(backing, vma);
+	inc_mm_counter(mm, MM_ANONPAGES);
+	dec_mm_counter(mm, MM_SWAPENTS);
+	flush_icache_pages(vma, page, nr);
+	vmf->orig_pte = pte;
+	set_pte_at(mm, vmf->address, vmf->pte, pte);
+	arch_do_swap_page_nr(mm, vma, vmf->address, pte, pte, 1);
+	mapped = true;
+	covered = 0;
+	for (i = 0; i < count; i++) {
+		unsigned int take;
+
+		start = swp_offset(entry) + covered - swp_offset(cache[i]->swap);
+		take = min(nr - covered, folio_nr_pages(cache[i]) - start);
+		folio_put_swap_range(cache[i], folio_page(cache[i], start), take);
+		covered += take;
+	}
+	goto out;
+
+oom:
+	vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);
+	if (vmf->pte && pte_same(ptep_get(vmf->pte), vmf->orig_pte))
+		ret |= VM_FAULT_OOM;
+out:
+	if (copied && !mapped)
+		folio_put(backing);
+	for (i = 0; i < count; i++) {
+		if (mapped)
+			folio_free_swap(cache[i]);
+		folio_unlock(cache[i]);
+		folio_put(cache[i]);
+	}
+	if (mapped && (vmf->flags & FAULT_FLAG_WRITE)) {
+		ret |= do_wp_page(vmf);
+		vmf->pte = NULL; /* do_wp_page drops the PT lock. */
+	} else if (mapped) {
+		update_mmu_cache(vma, vmf->address, vmf->pte);
+	}
+	if (vmf->pte)
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+	put_swap_device(si);
+	if (!mapped && !(ret & (VM_FAULT_ERROR | VM_FAULT_RETRY)))
+		cond_resched();
+	return ret;
+}
+#endif
+
 vm_fault_t do_swap_page(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
@@ -4853,6 +5794,15 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		}
 		goto out;
 	}
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(vma->vm_mm) < PAGE_SIZE)
+		return do_swap_subpage(vmf, entry);
+#ifdef CONFIG_SWAP
+	if (mm_page_size(vma->vm_mm) > PAGE_SIZE)
+		return do_swap_coarse_page(vmf);
+#endif
+#endif
 
 	/* Prevent swapoff from happening to us. */
 	si = get_swap_device(entry);
@@ -5291,6 +6241,7 @@ void map_anon_folio_pte_nopf(struct folio *folio, pte_t *pte,
 		bool uffd_wp)
 {
 	const unsigned int nr_pages = folio_nr_pages(folio);
+	const unsigned int nr_ptes = folio_size(folio) >> mm_page_shift(vma->vm_mm);
 	pte_t entry = folio_mk_pte(folio, vma->vm_page_prot);
 
 	entry = pte_sw_mkyoung(entry);
@@ -5303,8 +6254,8 @@ void map_anon_folio_pte_nopf(struct folio *folio, pte_t *pte,
 	folio_ref_add(folio, nr_pages - 1);
 	folio_add_new_anon_rmap(folio, vma, addr, RMAP_EXCLUSIVE);
 	folio_add_lru_vma(folio, vma);
-	set_ptes(vma->vm_mm, addr, pte, entry, nr_pages);
-	update_mmu_cache_range(NULL, vma, addr, pte, nr_pages);
+	set_ptes(vma->vm_mm, addr, pte, entry, nr_ptes);
+	update_mmu_cache_range(NULL, vma, addr, pte, nr_ptes);
 }
 
 static void map_anon_folio_pte_pf(struct folio *folio, pte_t *pte,
@@ -5313,9 +6264,122 @@ static void map_anon_folio_pte_pf(struct folio *folio, pte_t *pte,
 	const unsigned int order = folio_order(folio);
 
 	map_anon_folio_pte_nopf(folio, pte, vma, addr, uffd_wp);
-	add_mm_counter(vma->vm_mm, MM_ANONPAGES, 1L << order);
+	add_mm_counter(vma->vm_mm, MM_ANONPAGES, folio_size(folio) >> mm_page_shift(vma->vm_mm));
 	count_mthp_stat(order, MTHP_STAT_ANON_FAULT_ALLOC);
 }
+
+#ifdef CONFIG_MM_SUBPAGE
+static vm_fault_t do_anonymous_subpage(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	struct mm_subpage *slots[PAGE_SIZE / MM_SUBPAGE_SIZE] = {};
+	struct vm_page_offset pos = vma_page_offset_at(vma, vmf->address);
+	struct mm_subpage_pool *pool;
+	struct folio *folio;
+	unsigned long start, end, lower;
+	unsigned int first_offset, nr, target, i, mapped = 0;
+	vm_fault_t ret = VM_FAULT_OOM;
+	pte_t *first;
+	int err;
+
+	/* One native linear index, clipped to the VMA and this PTE table. */
+	lower = max(vma->vm_start, vmf->address & pmd_mask_mm(mm));
+	start = vmf->address - min_t(unsigned long, pos.offset, vmf->address - lower);
+	end = vmf->address + min(PAGE_SIZE - pos.offset,
+		pmd_addr_end_mm(mm, vmf->address, vma->vm_end) - vmf->address);
+	first_offset = pos.offset - (vmf->address - start);
+	nr = (end - start) >> mm_page_shift(mm);
+	target = (vmf->address - start) >> mm_page_shift(mm);
+
+	pool = mm_subpage_pool_create_granule(GFP_KERNEL, mm_page_shift(mm));
+	if (!pool)
+		return VM_FAULT_OOM;
+	/* Supply initialises every byte once, including the unissued slots. */
+	folio = folio_prealloc(mm, vma, vmf->address, false);
+	if (!folio)
+		goto release;
+	err = mm_subpage_pool_add_folio(pool, folio, GFP_KERNEL);
+	if (err) {
+		folio_put(folio);
+		goto release;
+	}
+	for (i = 0; i < nr; i++) {
+		slots[i] = mm_subpage_alloc_at(pool, first_offset + i * mm_page_size(mm));
+		if (IS_ERR(slots[i])) {
+			slots[i] = NULL;
+			goto release;
+		}
+	}
+
+	/* PTE references may disappear as soon as we drop the PTL. */
+	folio_get(folio);
+	folio_lock(folio);
+	ret = 0;
+	vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);
+	if (!vmf->pte)
+		goto unlock_folio;
+	if (vmf_pte_changed(vmf)) {
+		update_mmu_tlb(vma, vmf->address, vmf->pte);
+		goto unlock_pte;
+	}
+	ret = check_stable_address_space(mm);
+	if (ret)
+		goto unlock_pte;
+	if (userfaultfd_missing(vma)) {
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+		vmf->pte = NULL;
+		folio_unlock(folio);
+		folio_put(folio);
+		ret = handle_userfault(vmf, VM_UFFD_MISSING);
+		goto release;
+	}
+
+	first = vmf->pte - target;
+	for (i = 0; i < nr; i++) {
+		unsigned long address = start + i * mm_page_size(mm);
+		pte_t entry;
+
+		/* Do not replace existing mappings or userfaultfd markers nearby. */
+		if (i != target && !pte_none(ptep_get(first + i)))
+			continue;
+		mm_subpage_set_exclusive(slots[i]);
+		err = mm_subpage_add_new_anon_rmap(slots[i], vma, address);
+		if (WARN_ON_ONCE(err)) {
+			ret = VM_FAULT_SIGBUS;
+			break;
+		}
+		entry = phys_pte_mm(mm, mm_subpage_phys(slots[i]), vma->vm_page_prot);
+		entry = pte_sw_mkyoung(entry);
+		if (vma->vm_flags & VM_WRITE)
+			entry = pte_mkwrite(pte_mkdirty(entry), vma);
+		if (i == target && vmf_orig_pte_uffd_wp(vmf))
+			entry = pte_mkuffd_wp(entry);
+		set_pte_at(mm, address, first + i, entry);
+		update_mmu_cache(vma, address, first + i);
+		slots[i] = NULL; /* The PTE now owns the reference. */
+		mapped++;
+	}
+	if (mapped) {
+		subpage_add_new_lru(folio, vma, mapped);
+		add_mm_counter(mm, MM_ANONPAGES, mapped);
+		count_mthp_stat(0, MTHP_STAT_ANON_FAULT_ALLOC);
+	}
+unlock_pte:
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+	vmf->pte = NULL;
+unlock_folio:
+	folio_unlock(folio);
+	folio_put(folio);
+release:
+	mm_subpage_pool_close(pool);
+	for (i = 0; i < ARRAY_SIZE(slots); i++)
+		if (slots[i])
+			mm_subpage_put(slots[i]);
+	mm_subpage_pool_put(pool);
+	return ret;
+}
+#endif
 
 /*
  * We enter with non-exclusive mmap_lock (to exclude vma changes,
@@ -5376,6 +6440,10 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	ret = vmf_anon_prepare(vmf);
 	if (ret)
 		return ret;
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(vma->vm_mm) < PAGE_SIZE)
+		return do_anonymous_subpage(vmf);
+#endif
 	/* Returns NULL on OOM or ERR_PTR(-EAGAIN) if we must retry the fault */
 	folio = alloc_anon_folio(vmf);
 	if (IS_ERR(folio))
@@ -5383,8 +6451,8 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	if (!folio)
 		goto oom;
 
-	nr_pages = folio_nr_pages(folio);
-	addr = ALIGN_DOWN(vmf->address, nr_pages * PAGE_SIZE);
+	nr_pages = folio_size(folio) >> mm_page_shift(vma->vm_mm);
+	addr = ALIGN_DOWN(vmf->address, folio_size(folio));
 
 	/*
 	 * The memory barrier inside __folio_mark_uptodate makes sure that
@@ -5517,6 +6585,10 @@ vm_fault_t do_set_pmd(struct vm_fault *vmf, struct folio *folio, struct page *pa
 	 * PMD mappings if THPs are disabled. As we already have a THP,
 	 * behave as if we are forcing a collapse.
 	 */
+	/* Match the native PTE fault policy: partial data exposes its zero subunits. */
+	if (userfaultfd_missing(vma) && shmem_uffd_has_missing_native_page(folio))
+		return ret;
+
 	if (thp_disabled_by_hw() || vma_thp_disabled(vma, vma->vm_flags,
 						     /* forced_collapse=*/ true))
 		return ret;
@@ -5558,6 +6630,8 @@ vm_fault_t do_set_pmd(struct vm_fault *vmf, struct folio *folio, struct page *pa
 		entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
 
 	add_mm_counter(vma->vm_mm, mm_counter_file(folio), HPAGE_PMD_NR);
+	shmem_uffd_mark_mapped(folio, folio_page_idx(folio, page) << PAGE_SHIFT,
+			       HPAGE_PMD_SIZE);
 	folio_add_file_rmap_pmd(folio, page, vma);
 
 	/*
@@ -5620,6 +6694,8 @@ void set_pte_range(struct vm_fault *vmf, struct folio *folio,
 		folio_add_new_anon_rmap(folio, vma, addr, RMAP_EXCLUSIVE);
 		folio_add_lru_vma(folio, vma);
 	} else {
+		shmem_uffd_mark_mapped(folio, folio_page_idx(folio, page) << PAGE_SHIFT,
+				       (unsigned long)nr << PAGE_SHIFT);
 		folio_add_file_rmap_ptes(folio, page, nr, vma);
 	}
 	set_ptes(vma->vm_mm, addr, vmf->pte, entry, nr);
@@ -5635,6 +6711,252 @@ static bool vmf_pte_changed(struct vm_fault *vmf)
 
 	return !pte_none(ptep_get(vmf->pte));
 }
+
+#ifdef CONFIG_MM_SUBPAGE
+static bool folio_user_range_valid(struct folio *folio, unsigned long offset,
+				 unsigned long size)
+{
+	return offset <= folio_size(folio) && size <= folio_size(folio) - offset &&
+		IS_ALIGNED(page_to_phys(&folio->page) + offset, size);
+}
+
+/*
+ * Map the intersection of a locked cache folio, file-index range, VMA and
+ * the fault's PTE table. vmf->pte points at vmf->address and its lock is held.
+ * Each PTE owns a reference per covered native page (one for a subpage).
+ * The caller's reference is untouched, including when no PTE is installed.
+ */
+vm_fault_t map_file_user_pages(struct vm_fault *vmf, struct folio *folio,
+		pgoff_t first, pgoff_t last, bool fault)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long addr, end, table_start = vmf->address & pmd_mask_mm(mm);
+	unsigned long size = mm_page_size(mm);
+	loff_t file_size = i_size_read(vma->vm_file->f_mapping->host);
+	vm_fault_t ret = 0;
+	unsigned int mapped = 0;
+
+	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+	first = max(first, folio->index);
+	last = min(last, folio_next_index(folio) - 1);
+	if (first > last)
+		return 0;
+	addr = vma_address(vma, first, last - first + 1);
+	if (IS_ERR_VALUE(addr))
+		return 0;
+	addr = ALIGN(max(addr, table_start), size);
+	end = pmd_addr_end_mm(mm, vmf->address, vma->vm_end);
+	if (userfaultfd_armed(vma)) {
+		addr = max(addr, vmf->address);
+		end = min(end, vmf->address + size);
+	}
+	for (; addr < end; addr += size) {
+		struct vm_page_offset pos = vma_page_offset_at(vma, addr);
+		struct page *page;
+		unsigned long offset;
+		unsigned int i, nr = mm_pte_native_pages(mm);
+		bool poisoned = false;
+		pte_t entry, *ptep;
+
+		if (pos.index > last || !vma_file_offset_valid(vma, addr, file_size))
+			break;
+		offset = ((pos.index - folio->index) << PAGE_SHIFT) + pos.offset;
+		/*
+		 * A coarse leaf cannot span separate cache folios or a partial
+		 * requested index range, even if neighboring PFNs happen to match.
+		 */
+		if (nr - 1 > last - pos.index ||
+		    !folio_user_range_valid(folio, offset, size))
+			continue;
+		/* A native cache folio can contain independently missing leaves. */
+		if (userfaultfd_missing(vma) &&
+		    shmem_uffd_range_missing(folio, pos.index, pos.offset, size))
+			continue;
+		page = folio_file_page(folio, pos.index);
+		ptep = vmf->pte + ((long)(addr - vmf->address) >> mm_page_shift(mm));
+		for (i = 0; i < nr; i++)
+			poisoned |= PageHWPoison(page + i);
+		if (poisoned)
+			continue;
+		if (!pte_none(ptep_get(ptep)) &&
+		    !(fault && addr == vmf->address && !vmf_pte_changed(vmf)))
+			continue;
+		flush_icache_pages(vma, page, nr);
+		entry = phys_pte_mm(mm, page_to_phys(page) + pos.offset, vma->vm_page_prot);
+		if (addr != vmf->address && arch_wants_old_prefaulted_pte())
+			entry = pte_mkold(entry);
+		else
+			entry = pte_sw_mkyoung(entry);
+		if (vmf->flags & FAULT_FLAG_WRITE)
+			entry = maybe_mkwrite(pte_mkdirty(entry), vma);
+		else if (pte_write(entry) && folio_test_dirty(folio))
+			entry = pte_mkdirty(entry);
+		if (fault && addr == vmf->address && vmf_orig_pte_uffd_wp(vmf))
+			entry = pte_mkuffd_wp(entry);
+		folio_ref_add(folio, nr);
+		mm_subpage_file_map_add(vma, pte_phys_mm(vma->vm_mm, entry));
+		shmem_uffd_mark_mapped(folio,
+			((pos.index - folio->index) << PAGE_SHIFT) + pos.offset, size);
+		folio_add_file_rmap_pte(folio, page, vma);
+		set_pte_at(mm, addr, ptep, entry);
+		update_mmu_cache_range(vmf, vma, addr, ptep, 1);
+		mapped++;
+		if (addr == vmf->address)
+			ret = VM_FAULT_NOPAGE;
+	}
+	add_mm_counter(mm, mm_counter_file(folio), mapped);
+	return ret;
+}
+
+/*
+ * A non-file fault callback supplies one native page, not a cache-indexed
+ * folio. In particular, VVAR callbacks may reorder native pages. Only map
+ * quarters of this supplied page; never infer adjacent pages from its folio.
+ */
+static vm_fault_t map_special_subpages(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	struct page *page = vmf->page;
+	struct folio *folio = page_folio(page);
+	unsigned int offset = vma_page_offset_at(vma, vmf->address).offset;
+	unsigned long size = mm_page_size(mm), addr, end;
+	vm_fault_t ret = 0;
+	unsigned int mapped = 0;
+
+	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+	if (PageHWPoison(page))
+		return 0;
+	addr = offset > vmf->address ? vma->vm_start :
+		max(vma->vm_start, vmf->address - offset);
+	addr = max(addr, vmf->address & pmd_mask_mm(mm));
+	end = min(vmf->address + PAGE_SIZE - offset,
+		  pmd_addr_end_mm(mm, vmf->address, vma->vm_end));
+	if (userfaultfd_armed(vma)) {
+		addr = vmf->address;
+		end = vmf->address + size;
+	}
+	flush_icache_pages(vma, page, 1);
+	for (; addr < end; addr += size) {
+		unsigned int physical_offset = addr < vmf->address ?
+			offset - (vmf->address - addr) : offset + (addr - vmf->address);
+		pte_t *ptep = vmf->pte + ((long)(addr - vmf->address) >> mm_page_shift(mm));
+		pte_t entry;
+
+		if (!pte_none(ptep_get(ptep)) &&
+		    !(addr == vmf->address && !vmf_pte_changed(vmf)))
+			continue;
+		entry = phys_pte_mm(mm, page_to_phys(page) + physical_offset, vma->vm_page_prot);
+		entry = pte_sw_mkyoung(entry);
+		if (vmf->flags & FAULT_FLAG_WRITE)
+			entry = maybe_mkwrite(pte_mkdirty(entry), vma);
+		if (addr == vmf->address && vmf_orig_pte_uffd_wp(vmf))
+			entry = pte_mkuffd_wp(entry);
+		folio_get(folio);
+		mm_subpage_file_map_add(vma, pte_phys_mm(vma->vm_mm, entry));
+		folio_add_file_rmap_pte(folio, page, vma);
+		set_pte_at(mm, addr, ptep, entry);
+		update_mmu_cache_range(vmf, vma, addr, ptep, 1);
+		mapped++;
+		if (addr == vmf->address)
+			ret = VM_FAULT_NOPAGE;
+	}
+	add_mm_counter(mm, mm_counter_file(folio), mapped);
+	return ret;
+}
+
+static vm_fault_t finish_user_page_fault(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	struct mm_subpage *slot = vmf->cow_subpage;
+	bool is_cow = (vmf->flags & FAULT_FLAG_WRITE) && !(vma->vm_flags & VM_SHARED);
+	struct folio *folio = page_folio(is_cow ? vmf->cow_page : vmf->page);
+	vm_fault_t ret;
+	pte_t entry;
+
+	if (!(vma->vm_flags & VM_SHARED)) {
+		ret = check_stable_address_space(mm);
+		if (ret)
+			return ret;
+	}
+	if (pmd_none(*vmf->pmd)) {
+		if (vmf->prealloc_pte)
+			pmd_install(mm, vmf->pmd, &vmf->prealloc_pte);
+		else if (pte_alloc(mm, vmf->pmd))
+			return VM_FAULT_OOM;
+	}
+	/* The private destination is not yet visible through a PTE. */
+	if (is_cow) {
+		folio_get(folio);
+		folio_lock(folio);
+	}
+	vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);
+	ret = VM_FAULT_NOPAGE;
+	if (!vmf->pte)
+		goto unlock_folio;
+	if (vmf_pte_changed(vmf)) {
+		update_mmu_tlb(vma, vmf->address, vmf->pte);
+		goto unlock;
+	}
+	if (slot) {
+		mm_subpage_set_exclusive(slot);
+		if (WARN_ON_ONCE(mm_subpage_add_new_anon_rmap(slot, vma, vmf->address))) {
+			ret = VM_FAULT_SIGBUS;
+			goto unlock;
+		}
+		entry = phys_pte_mm(mm, mm_subpage_phys(slot), vma->vm_page_prot);
+		entry = maybe_mkwrite(pte_mkdirty(pte_sw_mkyoung(entry)), vma);
+		if (vmf_orig_pte_uffd_wp(vmf))
+			entry = pte_mkuffd_wp(entry);
+		subpage_add_new_lru(folio, vma, 1);
+		set_pte_at(mm, vmf->address, vmf->pte, entry);
+		update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
+		inc_mm_counter(mm, MM_ANONPAGES);
+		vmf->cow_subpage = NULL;
+		ret = 0;
+	} else if (is_cow) {
+		if (!folio_user_range_valid(folio, 0, mm_page_size(mm))) {
+			ret = VM_FAULT_SIGBUS;
+			goto unlock;
+		}
+		entry = phys_pte_mm(mm, page_to_phys(&folio->page), vma->vm_page_prot);
+		entry = maybe_mkwrite(pte_mkdirty(pte_sw_mkyoung(entry)), vma);
+		if (vmf_orig_pte_uffd_wp(vmf))
+			entry = pte_mkuffd_wp(entry);
+		folio_ref_add(folio, mm_pte_native_pages(mm) - 1);
+		folio_add_new_anon_rmap(folio, vma, vmf->address, RMAP_EXCLUSIVE);
+		folio_add_lru_vma(folio, vma);
+		set_pte_at(mm, vmf->address, vmf->pte, entry);
+		update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
+		inc_mm_counter(mm, MM_ANONPAGES);
+		ret = 0;
+	} else {
+		if (vma->vm_file)
+			ret = map_file_user_pages(vmf, folio, folio->index,
+						folio_next_index(folio) - 1, true);
+		else if (mm_page_size(mm) < PAGE_SIZE)
+			ret = map_special_subpages(vmf);
+		else
+			ret = VM_FAULT_SIGBUS;
+		if (ret & VM_FAULT_NOPAGE) {
+			folio_put(folio); /* Consume the fault callback's reference. */
+			ret = 0;
+		} else {
+			ret = VM_FAULT_SIGBUS;
+		}
+	}
+unlock:
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+unlock_folio:
+	if (is_cow) {
+		folio_unlock(folio);
+		folio_put(folio);
+	}
+	return ret;
+}
+#endif
 
 /**
  * finish_fault - finish page fault once we have prepared the page to fault
@@ -5662,6 +6984,11 @@ vm_fault_t finish_fault(struct vm_fault *vmf)
 	int type, nr_pages;
 	unsigned long addr;
 	bool needs_fallback = false;
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(vma->vm_mm) != PAGE_SIZE)
+		return finish_user_page_fault(vmf);
+#endif
 
 fallback:
 	addr = vmf->address;
@@ -5768,13 +7095,12 @@ unlock:
 	return ret;
 }
 
-static unsigned long fault_around_pages __read_mostly =
-	65536 >> PAGE_SHIFT;
+static unsigned long fault_around_bytes __read_mostly = SZ_64K;
 
 #ifdef CONFIG_DEBUG_FS
 static int fault_around_bytes_get(void *data, u64 *val)
 {
-	*val = fault_around_pages << PAGE_SHIFT;
+	*val = READ_ONCE(fault_around_bytes);
 	return 0;
 }
 
@@ -5788,11 +7114,13 @@ static int fault_around_bytes_set(void *data, u64 val)
 		return -EINVAL;
 
 	/*
-	 * The minimum value is 1 page, however this results in no fault-around
-	 * at all. See should_fault_around().
+	 * Keep the policy in bytes: one native page can still contain several
+	 * user leaves. The smallest supported leaf disables fault-around for
+	 * every mm; larger values are compared with each mm's own granule.
 	 */
-	val = max(val, PAGE_SIZE);
-	fault_around_pages = rounddown_pow_of_two(val) >> PAGE_SHIFT;
+	val = max_t(u64, val, IS_ENABLED(CONFIG_MM_SUBPAGE) ?
+		    MM_SUBPAGE_SIZE : PAGE_SIZE);
+	WRITE_ONCE(fault_around_bytes, rounddown_pow_of_two(val));
 
 	return 0;
 }
@@ -5819,23 +7147,41 @@ late_initcall(fault_around_debugfs);
  * This function doesn't cross VMA or page table boundaries, in order to call
  * map_pages() and acquire a PTE lock only once.
  *
- * fault_around_pages defines how many pages we'll try to map.
- * do_fault_around() expects it to be set to a power of two less than or equal
- * to PTRS_PER_PTE.
- *
- * The virtual address of the area that we map is naturally aligned to
- * fault_around_pages * PAGE_SIZE rounded down to the machine page size
- * (and therefore to page order).  This way it's easier to guarantee
- * that we don't cross page table boundaries.
+ * fault_around_bytes is a power-of-two byte policy, independent of either
+ * physical or user granules. The native path converts it to native pages;
+ * the alternative path clamps it to the target mm's PTE-table coverage.
+ * Natural alignment keeps the window inside one page table.
  */
 static vm_fault_t do_fault_around(struct vm_fault *vmf)
 {
-	pgoff_t nr_pages = READ_ONCE(fault_around_pages);
+	unsigned long configured_bytes = READ_ONCE(fault_around_bytes);
+	pgoff_t nr_pages = max(1UL, configured_bytes >> PAGE_SHIFT);
 	pgoff_t pte_off = pte_index(vmf->address);
 	/* The page offset of vmf->address within the VMA. */
 	pgoff_t vma_off = vmf->pgoff - vmf->vma->vm_pgoff;
 	pgoff_t from_pte, to_pte;
 	vm_fault_t ret;
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(vmf->vma->vm_mm) != PAGE_SIZE) {
+		struct vm_area_struct *vma = vmf->vma;
+		unsigned long bytes = min(configured_bytes,
+					pmd_size_mm(vma->vm_mm));
+		unsigned long start = max(ALIGN_DOWN(vmf->address, bytes), vma->vm_start);
+		unsigned long end = min(ALIGN_DOWN(vmf->address, bytes) + bytes, vma->vm_end);
+
+		if (pmd_none(*vmf->pmd)) {
+			vmf->prealloc_pte = pte_alloc_one(vma->vm_mm);
+			if (!vmf->prealloc_pte)
+				return VM_FAULT_OOM;
+		}
+		rcu_read_lock();
+		ret = vma->vm_ops->map_pages(vmf, vma_page_offset_at(vma, start).index,
+					    vma_page_offset_at(vma, end - 1).index);
+		rcu_read_unlock();
+		return ret;
+	}
+#endif
 
 	/* The PTE offset of the start address, clamped to the VMA. */
 	from_pte = max(ALIGN_DOWN(pte_off, nr_pages),
@@ -5871,7 +7217,7 @@ static inline bool should_fault_around(struct vm_fault *vmf)
 		return false;
 
 	/* A single page implies no faulting 'around' at all. */
-	return fault_around_pages > 1;
+	return READ_ONCE(fault_around_bytes) > mm_page_size(vmf->vma->vm_mm);
 }
 
 static vm_fault_t do_read_fault(struct vm_fault *vmf)
@@ -5918,9 +7264,25 @@ static vm_fault_t do_cow_fault(struct vm_fault *vmf)
 	if (ret)
 		return ret;
 
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(vma->vm_mm) < PAGE_SIZE) {
+		vmf->cow_subpage = anon_subpage_prealloc(vma->vm_mm, vma, vmf->address);
+		if (IS_ERR(vmf->cow_subpage)) {
+			vmf->cow_subpage = NULL;
+			return VM_FAULT_OOM;
+		}
+		folio = mm_subpage_folio(vmf->cow_subpage);
+		goto allocated;
+	}
+#endif
+
 	folio = folio_prealloc(vma->vm_mm, vma, vmf->address, false);
 	if (!folio)
 		return VM_FAULT_OOM;
+
+#ifdef CONFIG_MM_SUBPAGE
+allocated:
+#endif
 
 	vmf->cow_page = &folio->page;
 
@@ -5930,10 +7292,38 @@ static vm_fault_t do_cow_fault(struct vm_fault *vmf)
 	if (ret & VM_FAULT_DONE_COW)
 		return ret;
 
-	if (copy_mc_user_highpage(vmf->cow_page, vmf->page, vmf->address, vma)) {
-		ret = VM_FAULT_HWPOISON;
+#ifdef CONFIG_MM_SUBPAGE
+	if (vmf->cow_subpage) {
+		if (copy_user_subpage_range(vmf->cow_page, mm_subpage_offset(vmf->cow_subpage),
+				     vmf->page, vma_page_offset_at(vma, vmf->address).offset,
+				     mm_page_size(vma->vm_mm))) {
+			ret = VM_FAULT_HWPOISON;
+			goto unlock;
+		}
+		goto copied;
+	}
+#endif
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(vma->vm_mm) > PAGE_SIZE &&
+	    !folio_user_range_valid(page_folio(vmf->page),
+			folio_page_idx(page_folio(vmf->page), vmf->page) << PAGE_SHIFT,
+			mm_page_size(vma->vm_mm))) {
+		ret = VM_FAULT_SIGBUS;
 		goto unlock;
 	}
+#endif
+	for (unsigned int i = 0; i < mm_pte_native_pages(vma->vm_mm); i++) {
+		if (copy_mc_user_highpage(vmf->cow_page + i, vmf->page + i,
+					 vmf->address + i * PAGE_SIZE, vma)) {
+			ret = VM_FAULT_HWPOISON;
+			goto unlock;
+		}
+	}
+#ifdef CONFIG_MM_SUBPAGE
+copied:
+#endif
+
 	__folio_mark_uptodate(folio);
 
 	ret |= finish_fault(vmf);
@@ -5944,6 +7334,13 @@ unlock:
 		goto uncharge_out;
 	return ret;
 uncharge_out:
+#ifdef CONFIG_MM_SUBPAGE
+	if (vmf->cow_subpage) {
+		mm_subpage_put(vmf->cow_subpage);
+		vmf->cow_subpage = NULL;
+		return ret;
+	}
+#endif
 	folio_put(folio);
 	return ret;
 }
@@ -6104,31 +7501,33 @@ static void numa_rebuild_single_mapping(struct vm_fault *vmf, struct vm_area_str
 	update_mmu_cache_range(vmf, vma, fault_addr, fault_pte, 1);
 }
 
-static void numa_rebuild_large_mapping(struct vm_fault *vmf, struct vm_area_struct *vma,
+static void numa_rebuild_folio_mapping(struct vm_fault *vmf, struct vm_area_struct *vma,
 				       struct folio *folio, pte_t fault_pte,
 				       bool ignore_writable, bool pte_write_upgrade)
 {
-	int nr = pte_pfn(fault_pte) - folio_pfn(folio);
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned int page_shift = mm_page_shift(mm);
+	unsigned long page_size = 1UL << page_shift;
+	unsigned long offset = pte_phys_mm(mm, fault_pte) - PFN_PHYS(folio_pfn(folio));
 	unsigned long start, end, addr = vmf->address;
-	unsigned long addr_start = addr - (nr << PAGE_SHIFT);
-	unsigned long pt_start = ALIGN_DOWN(addr, PMD_SIZE);
+	unsigned long lower = max(addr & pmd_mask_mm(mm), vma->vm_start);
+	unsigned long upper = pmd_addr_end_mm(mm, addr, vma->vm_end);
 	pte_t *start_ptep;
 
-	/* Stay within the VMA and within the page table. */
-	start = max3(addr_start, pt_start, vma->vm_start);
-	end = min3(addr_start + folio_size(folio), pt_start + PMD_SIZE,
-		   vma->vm_end);
-	start_ptep = vmf->pte - ((addr - start) >> PAGE_SHIFT);
+	/* Stay within the VMA, page table and physical owner without wrapping. */
+	start = addr - min(offset, addr - lower);
+	end = addr + min(folio_size(folio) - offset, upper - addr);
+	start_ptep = vmf->pte - ((addr - start) >> page_shift);
 
-	/* Restore all PTEs' mapping of the large folio */
-	for (addr = start; addr != end; start_ptep++, addr += PAGE_SIZE) {
+	/* Restore the owner's PTEs, including smaller leaves in a native folio. */
+	for (addr = start; addr != end; start_ptep++, addr += page_size) {
 		pte_t ptent = ptep_get(start_ptep);
 		bool writable = false;
 
 		if (!pte_present(ptent) || !pte_protnone(ptent))
 			continue;
 
-		if (pfn_folio(pte_pfn(ptent)) != folio)
+		if (pfn_folio(PHYS_PFN(pte_phys_mm(mm, ptent))) != folio)
 			continue;
 
 		if (!ignore_writable) {
@@ -6221,8 +7620,8 @@ out_map:
 	 * Make it present again, depending on how arch implements
 	 * non-accessible ptes, some can allow access by kernel mode.
 	 */
-	if (folio && folio_test_large(folio))
-		numa_rebuild_large_mapping(vmf, vma, folio, pte, ignore_writable,
+	if (folio && (folio_test_large(folio) || mm_page_shift(vma->vm_mm) < PAGE_SHIFT))
+		numa_rebuild_folio_mapping(vmf, vma, folio, pte, ignore_writable,
 					   pte_write_upgrade);
 	else
 		numa_rebuild_single_mapping(vmf, vma, vmf->address, vmf->pte,
@@ -6455,7 +7854,7 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
 {
 	struct vm_fault vmf = {
 		.vma = vma,
-		.address = address & PAGE_MASK,
+		.address = address & mm_page_mask(vma->vm_mm),
 		.real_address = address,
 		.flags = flags,
 		.pgoff = linear_page_index(vma, address),
@@ -6786,7 +8185,7 @@ int __pud_alloc(struct mm_struct *mm, p4d_t *p4d, unsigned long address)
 		return -ENOMEM;
 
 	spin_lock(&mm->page_table_lock);
-	if (!p4d_present(*p4d)) {
+	if (!p4d_present_mm(mm, *p4d)) {
 		mm_inc_nr_puds(mm);
 		smp_wmb(); /* See comment in pmd_install() */
 		p4d_populate(mm, p4d, new);
@@ -6824,16 +8223,19 @@ int __pmd_alloc(struct mm_struct *mm, pud_t *pud, unsigned long address)
 
 static inline int pfnmap_args_setup(struct follow_pfnmap_args *args,
 				    spinlock_t *lock, pte_t *ptep,
-				    pgprot_t pgprot, unsigned long pfn_base,
+				    pgprot_t pgprot, phys_addr_t phys_base,
 				    unsigned long addr_mask, bool writable,
 				    bool special)
 {
+	phys_addr_t phys = phys_base + (args->address & ~addr_mask);
+
 	if (!writable && args->write)
 		return -EFAULT;
 
 	args->lock = lock;
 	args->ptep = ptep;
-	args->pfn = pfn_base + ((args->address & ~addr_mask) >> PAGE_SHIFT);
+	args->pfn = PHYS_PFN(phys);
+	args->offset = offset_in_page(phys);
 	args->addr_mask = addr_mask;
 	args->pgprot = pgprot;
 	args->writable = writable;
@@ -6885,8 +8287,14 @@ static inline void pfnmap_lockdep_assert(struct vm_area_struct *vma)
  *
  * This function must not be used to modify PTE content.
  *
+ * Legacy callers retain the native-page contract. A caller setting
+ * allow_subpage must use pfn plus offset to identify the requested physical
+ * byte and must limit access to the leaf described by addr_mask. This does
+ * not pin the native page or grant access to neighbouring user mappings.
+ *
  * Return: zero on success, -EFAULT if @args->write was set but the
- * mapping is not writable, -EINVAL if there is no mapping at all.
+ * mapping is not writable, -EINVAL if there is no mapping at all, or
+ * -EOPNOTSUPP for a non-native granule without allow_subpage.
  */
 int follow_pfnmap_start(struct follow_pfnmap_args *args)
 {
@@ -6908,17 +8316,20 @@ int follow_pfnmap_start(struct follow_pfnmap_args *args)
 
 	if (!(vma->vm_flags & (VM_IO | VM_PFNMAP)))
 		goto out;
+	/* A legacy PFN consumer cannot represent partial native-page ownership. */
+	if (mm_page_size(mm) != PAGE_SIZE && !args->allow_subpage)
+		return -EOPNOTSUPP;
 retry:
 	pgdp = pgd_offset(mm, address);
 	if (pgd_none(*pgdp) || unlikely(pgd_bad(*pgdp)))
 		goto out;
 
-	p4dp = p4d_offset(pgdp, address);
+	p4dp = p4d_offset_mm(mm, pgdp, address);
 	p4d = p4dp_get(p4dp);
-	if (p4d_none(p4d) || unlikely(p4d_bad(p4d)))
+	if (p4d_none_mm(mm, p4d) || unlikely(p4d_bad_mm(mm, p4d)))
 		goto out;
 
-	pudp = pud_offset(p4dp, address);
+	pudp = pud_offset_mm(mm, p4dp, address);
 	pud = pudp_get(pudp);
 	if (!pud_present(pud))
 		goto out;
@@ -6934,14 +8345,14 @@ retry:
 			goto retry;
 		}
 		r = pfnmap_args_setup(args, lock, NULL, pud_pgprot(pud),
-				      pud_pfn(pud), PUD_MASK, pud_write(pud),
+				      PFN_PHYS(pud_pfn(pud)), pud_mask_mm(mm), pud_write(pud),
 				      pud_special(pud));
 		if (r)
 			spin_unlock(lock);
 		return r;
 	}
 
-	pmdp = pmd_offset(pudp, address);
+	pmdp = pmd_offset_mm(mm, pudp, address);
 	pmd = pmdp_get_lockless(pmdp);
 	if (!pmd_present(pmd))
 		goto out;
@@ -6957,7 +8368,7 @@ retry:
 			goto retry;
 		}
 		r = pfnmap_args_setup(args, lock, NULL, pmd_pgprot(pmd),
-				      pmd_pfn(pmd), PMD_MASK, pmd_write(pmd),
+				      PFN_PHYS(pmd_pfn(pmd)), pmd_mask_mm(mm), pmd_write(pmd),
 				      pmd_special(pmd));
 		if (r)
 			spin_unlock(lock);
@@ -6970,8 +8381,8 @@ retry:
 	pte = ptep_get(ptep);
 	if (!pte_present(pte))
 		goto unlock;
-	r = pfnmap_args_setup(args, lock, ptep, pte_pgprot(pte),
-			      pte_pfn(pte), PAGE_MASK, pte_write(pte),
+	r = pfnmap_args_setup(args, lock, ptep, pte_pgprot_mm(mm, pte),
+			      pte_phys_mm(mm, pte), mm_page_mask(mm), pte_write(pte),
 			      pte_special(pte));
 	if (r)
 		goto unlock;
@@ -7018,20 +8429,30 @@ int generic_access_phys(struct vm_area_struct *vma, unsigned long addr,
 	resource_size_t phys_addr;
 	pgprot_t prot = __pgprot(0);
 	void __iomem *maddr;
-	int offset = offset_in_page(addr);
+	int offset;
 	int ret = -EINVAL;
 	bool writable;
 	struct follow_pfnmap_args args = {
 		.vma = vma,
 		.address = addr,
-		.write = !!(write & FOLL_WRITE)
+		.write = !!(write & FOLL_WRITE),
+		.allow_subpage = true
 	};
 
+	if (len <= 0)
+		return 0;
+	if (addr < vma->vm_start || addr >= vma->vm_end)
+		return -EINVAL;
+	/* Each following leaf needs its own translation and permission check. */
+	len = min_t(unsigned long, len, vma->vm_end - addr);
+	len = min_t(unsigned long, len, mm_page_size(vma->vm_mm) -
+			(addr & ~mm_page_mask(vma->vm_mm)));
 retry:
 	if (follow_pfnmap_start(&args))
 		return -EINVAL;
 	prot = args.pgprot;
 	phys_addr = (resource_size_t)args.pfn << PAGE_SHIFT;
+	offset = args.offset;
 	writable = args.writable;
 	follow_pfnmap_end(&args);
 
@@ -7043,7 +8464,8 @@ retry:
 		goto out_unmap;
 
 	if ((pgprot_val(prot) != pgprot_val(args.pgprot)) ||
-	    (phys_addr != (args.pfn << PAGE_SHIFT)) ||
+	    (phys_addr != ((resource_size_t)args.pfn << PAGE_SHIFT)) ||
+	    (offset != args.offset) ||
 	    (writable != args.writable)) {
 		follow_pfnmap_end(&args);
 		iounmap(maddr);
@@ -7089,8 +8511,19 @@ static int __access_remote_vm(struct mm_struct *mm, unsigned long addr,
 		void *maddr;
 		struct folio *folio;
 		struct vm_area_struct *vma = NULL;
-		struct page *page = get_user_page_vma_remote(mm, addr,
-							     gup_flags, &vma);
+		struct page *page;
+#ifdef CONFIG_MM_SUBPAGE
+		struct user_page_fragment fragment = {};
+
+		if (mm_page_size(mm) != PAGE_SIZE) {
+			int got = get_user_fragment_vma_remote(mm, addr, len,
+					gup_flags, &fragment, &vma);
+
+			page = got > 0 ? folio_page(fragment.folio,
+					fragment.offset >> PAGE_SHIFT) : ERR_PTR(got ?: -EFAULT);
+		} else
+#endif
+			page = get_user_page_vma_remote(mm, addr, gup_flags, &vma);
 
 		if (IS_ERR(page)) {
 			/* We might need to expand the stack to access it */
@@ -7124,6 +8557,12 @@ static int __access_remote_vm(struct mm_struct *mm, unsigned long addr,
 			offset = addr & (PAGE_SIZE-1);
 			if (bytes > PAGE_SIZE-offset)
 				bytes = PAGE_SIZE-offset;
+#ifdef CONFIG_MM_SUBPAGE
+			if (fragment.folio) {
+				offset = offset_in_page(fragment.offset);
+				bytes = fragment.length;
+			}
+#endif
 
 			maddr = kmap_local_folio(folio, folio_page_idx(folio, page) * PAGE_SIZE);
 			if (write) {
@@ -7134,7 +8573,13 @@ static int __access_remote_vm(struct mm_struct *mm, unsigned long addr,
 				copy_from_user_page(vma, page, addr,
 						    buf, maddr + offset, bytes);
 			}
-			folio_release_kmap(folio, maddr);
+#ifdef CONFIG_MM_SUBPAGE
+			if (fragment.folio) {
+				kunmap_local(maddr);
+				release_user_fragments(&fragment, 1, false);
+			} else
+#endif
+				folio_release_kmap(folio, maddr);
 		}
 		len -= bytes;
 		buf += bytes;

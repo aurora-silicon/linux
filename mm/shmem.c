@@ -30,6 +30,9 @@
 #include <linux/fileattr.h>
 #include <linux/filelock.h>
 #include <linux/mm.h>
+#include <linux/mm_subpage.h>
+#include <linux/khugepaged.h>
+#include <linux/sizes.h>
 #include <linux/random.h>
 #include <linux/sched/signal.h>
 #include <linux/export.h>
@@ -875,6 +878,266 @@ static void shmem_update_stats(struct folio *folio, int nr_pages)
 	lruvec_stat_mod_folio(folio, NR_SHMEM, nr_pages);
 }
 
+#if defined(CONFIG_SHMEM) && defined(CONFIG_MM_SUBPAGE) && defined(CONFIG_USERFAULTFD)
+#define SHMEM_UFFD_ALL_UNITS GENMASK(PAGE_SIZE / SZ_4K - 1, 0)
+
+/*
+ * Resident masks live in page_ext, allowing partial truncate to update them
+ * without allocation. All cache insertion/replacement paths initialize or
+ * transfer them under the folio lock. The inode XArray persists masks only
+ * for swapped indices. Its publication/removal additionally holds i_pages,
+ * before taking uffd_missing's XArray lock.
+ */
+static void shmem_uffd_enable(struct inode *inode)
+{
+	struct shmem_inode_info *info = SHMEM_I(inode);
+
+	spin_lock(&info->lock);
+	info->flags |= SHMEM_F_UFFD_SUBPAGE;
+	spin_unlock(&info->lock);
+}
+
+static unsigned long shmem_uffd_mask(unsigned int offset, unsigned long length)
+{
+	return GENMASK((offset + length - 1) / SZ_4K, offset / SZ_4K);
+}
+
+unsigned long shmem_uffd_missing_mask(struct folio *folio, pgoff_t index)
+{
+	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+	VM_BUG_ON_FOLIO(!folio_contains(folio, index), folio);
+	VM_BUG_ON_FOLIO(!folio_mapping(folio) || !shmem_mapping(folio_mapping(folio)), folio);
+	return mm_subpage_shmem_missing(folio_page(folio, index - folio->index));
+}
+
+int shmem_uffd_set_missing(struct folio *folio, pgoff_t index,
+			   unsigned long missing)
+{
+	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+	if (!folio_mapping(folio) || !shmem_mapping(folio_mapping(folio)) ||
+	    !folio_contains(folio, index) ||
+	    !folio_test_uptodate(folio) || (missing & ~SHMEM_UFFD_ALL_UNITS))
+		return -EINVAL;
+	if (missing)
+		shmem_uffd_enable(folio->mapping->host);
+	mm_subpage_shmem_set_missing(folio_page(folio, index - folio->index), missing);
+	return 0;
+}
+
+bool shmem_uffd_has_missing_native_page(struct folio *folio)
+{
+	struct address_space *mapping = folio_mapping(folio);
+	unsigned long i;
+
+	if (!mapping || !shmem_mapping(mapping) ||
+	    !(READ_ONCE(SHMEM_I(mapping->host)->flags) & SHMEM_F_UFFD_SUBPAGE))
+		return false;
+	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+	/* Native PMD exposure is allowed when every native leaf has some data. */
+	for (i = 0; i < folio_nr_pages(folio); i++)
+		if (mm_subpage_shmem_missing(folio_page(folio, i)) == SHMEM_UFFD_ALL_UNITS)
+			return true;
+	return false;
+}
+
+bool shmem_uffd_range_missing(struct folio *folio, pgoff_t index,
+			      unsigned int offset, unsigned long length)
+{
+	struct address_space *mapping = folio_mapping(folio);
+	unsigned long mask;
+
+	if (!mapping || !shmem_mapping(mapping))
+		return false;
+	mask = shmem_uffd_mask(offset, length);
+	return (shmem_uffd_missing_mask(folio, index) & mask) == mask;
+}
+
+/* A coarse alias with any populated units preserves them and exposes zero holes. */
+static unsigned long shmem_uffd_reason(struct vm_fault *vmf, unsigned long missing)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct vm_page_offset pos = vma_page_offset_at(vma, vmf->address);
+	unsigned long mask = shmem_uffd_mask(pos.offset, mm_page_size(vma->vm_mm));
+
+	if ((missing & mask) == mask)
+		return userfaultfd_missing(vma) ? VM_UFFD_MISSING : 0;
+	return userfaultfd_minor(vma) ? VM_UFFD_MINOR : 0;
+}
+
+void shmem_uffd_mark_present(struct folio *folio, pgoff_t index,
+			     unsigned long present)
+{
+	unsigned long missing = shmem_uffd_missing_mask(folio, index);
+
+	if (missing & present)
+		mm_subpage_shmem_set_missing(folio_page(folio, index - folio->index),
+					     missing & ~present);
+}
+
+void shmem_uffd_mark_mapped(struct folio *folio, unsigned long offset,
+			    unsigned long length)
+{
+	struct address_space *mapping = folio_mapping(folio);
+
+	if (!mapping || !shmem_mapping(mapping) ||
+	    !(READ_ONCE(SHMEM_I(mapping->host)->flags) & SHMEM_F_UFFD_SUBPAGE))
+		return;
+	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+	VM_BUG_ON_FOLIO(offset + length > folio_size(folio), folio);
+	while (length) {
+		unsigned int low = offset & ~PAGE_MASK;
+		unsigned long size = min(length, PAGE_SIZE - low);
+		unsigned long mask = GENMASK((low + size - 1) / SZ_4K, low / SZ_4K);
+
+		shmem_uffd_mark_present(folio, folio->index + (offset >> PAGE_SHIFT), mask);
+		offset += size;
+		length -= size;
+	}
+}
+
+void shmem_uffd_forget(struct address_space *mapping, pgoff_t start,
+		       unsigned long nr)
+{
+	struct xarray *xa;
+	unsigned long index;
+	void *entry;
+
+	if (!shmem_mapping(mapping))
+		return;
+	lockdep_assert_held(&mapping->i_pages.xa_lock);
+	xa = &SHMEM_I(mapping->host)->uffd_missing;
+	if (xa_empty(xa))
+		return;
+	xa_lock(xa);
+	xa_for_each_range(xa, index, entry, start, start + nr - 1)
+		__xa_erase(xa, index);
+	xa_unlock(xa);
+}
+
+/* New cache identity or swap-in: initialize every native page before unlock. */
+static void shmem_uffd_cache_init(struct folio *folio, bool from_swap)
+{
+	struct address_space *mapping = folio->mapping;
+	struct xarray *xa = &SHMEM_I(mapping->host)->uffd_missing;
+	unsigned long i;
+
+	lockdep_assert_held(&mapping->i_pages.xa_lock);
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		void *entry = from_swap ? xa_load(xa, folio->index + i) : NULL;
+
+		mm_subpage_shmem_set_missing(folio_page(folio, i),
+					     entry ? xa_to_value(entry) : 0);
+	}
+	shmem_uffd_forget(mapping, folio->index, folio_nr_pages(folio));
+}
+
+/*
+ * Reserve persistence before committing swap. On failure the cache folio and
+ * its resident mask stay intact; reclaim may retry once memory is available.
+ */
+static int shmem_uffd_swap_prepare(struct folio *folio)
+{
+	struct address_space *mapping = folio->mapping;
+	struct xarray *xa = &SHMEM_I(mapping->host)->uffd_missing;
+	struct mem_cgroup *memcg, *saved;
+	unsigned long i;
+	int err = 0;
+
+	if (!(READ_ONCE(SHMEM_I(mapping->host)->flags) & SHMEM_F_UFFD_SUBPAGE))
+		return 0;
+	/* Reclaim may run outside the backing folio's charge domain. */
+	rcu_read_lock();
+	do {
+		memcg = folio_memcg(folio) ?: root_mem_cgroup;
+	} while (memcg && !mem_cgroup_tryget(memcg));
+	rcu_read_unlock();
+	saved = set_active_memcg(memcg);
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		unsigned long mask = mm_subpage_shmem_missing(folio_page(folio, i));
+
+		if (!mask)
+			continue;
+		err = xa_err(xa_store(xa, folio->index + i, xa_mk_value(mask),
+				     GFP_NOWAIT | __GFP_ACCOUNT | __GFP_NOWARN));
+		if (err)
+			break;
+	}
+	set_active_memcg(saved);
+	mem_cgroup_put(memcg);
+	if (err) {
+		xa_lock_irq(&mapping->i_pages);
+		shmem_uffd_forget(mapping, folio->index, folio_nr_pages(folio));
+		xa_unlock_irq(&mapping->i_pages);
+	}
+	return err;
+}
+
+void shmem_uffd_copy_page(struct page *dst, struct page *src)
+{
+	mm_subpage_shmem_set_missing(dst, src ? mm_subpage_shmem_missing(src) : 0);
+}
+
+void shmem_uffd_migrate(struct folio *dst, struct folio *src)
+{
+	unsigned long i;
+
+	if (!shmem_mapping(src->mapping))
+		return;
+	VM_BUG_ON_FOLIO(!folio_test_locked(src), src);
+	VM_BUG_ON_FOLIO(!folio_test_locked(dst), dst);
+	for (i = 0; i < folio_nr_pages(src); i++)
+		shmem_uffd_copy_page(folio_page(dst, i), folio_page(src, i));
+}
+
+/* Only fully removed 4K units become holes; sub-unit edge bytes stay valid. */
+static void shmem_uffd_partial_hole(struct folio *folio, loff_t start, uoff_t end)
+{
+	loff_t first = max(start, folio_pos(folio));
+	u64 last = min_t(u64, end, folio_next_pos(folio) - 1);
+	unsigned long offset, length;
+	bool pinned;
+
+	if (first >= last ||
+	    (first == folio_pos(folio) && last == folio_next_pos(folio) - 1))
+		return;
+	first = round_up(first, SZ_4K);
+	last = round_down(last + 1, SZ_4K);
+	if (first >= last)
+		return;
+	shmem_uffd_enable(folio->mapping->host);
+	/* Revoke covering coarse aliases before their holes can be refilled. */
+	unmap_mapping_subpage_hole(folio->mapping, first, last);
+	/* Pair with fast GUP's pin-before-PTE-recheck barrier. */
+	smp_mb();
+	pinned = folio_maybe_dma_pinned(folio);
+	offset = first - folio_pos(folio);
+	length = last - first;
+	while (length) {
+		unsigned int low = offset & ~PAGE_MASK;
+		unsigned long nr = min(length, PAGE_SIZE - low);
+		struct page *page = folio_page(folio, offset >> PAGE_SHIFT);
+		unsigned long mask = shmem_uffd_mask(low, nr);
+		unsigned long missing = mm_subpage_shmem_missing(page);
+
+		/*
+		 * A pin survives PTE removal and can modify retained backing.
+		 * Preserve native partial-hole semantics: zero it, but do not
+		 * let a missing-page COPY overwrite a subsequent device write.
+		 * Pins have folio granularity, so exposure is conservative when
+		 * only a neighbouring range is pinned. Full-folio removal still
+		 * detaches old pins from the file's new cache identity.
+		 */
+		mm_subpage_shmem_set_missing(page, pinned ? missing & ~mask : missing | mask);
+		offset += nr;
+		length -= nr;
+	}
+}
+#else
+static void shmem_uffd_cache_init(struct folio *folio, bool from_swap) { }
+static int shmem_uffd_swap_prepare(struct folio *folio) { return 0; }
+static void shmem_uffd_partial_hole(struct folio *folio, loff_t start, uoff_t end) { }
+#endif
+
 /*
  * Somewhat like filemap_add_folio, but error if expected item has gone.
  */
@@ -922,6 +1185,7 @@ int shmem_add_to_page_cache(struct folio *folio,
 		xas_store(&xas, folio);
 		if (xas_error(&xas))
 			goto unlock;
+		shmem_uffd_cache_init(folio, expected != NULL);
 		shmem_update_stats(folio, nr);
 		mapping->nrpages += nr;
 unlock:
@@ -976,8 +1240,10 @@ static long shmem_free_swap(struct address_space *mapping,
 		base = round_down(xas.xa_index, nr_pages);
 		if (base < index || base + nr_pages - 1 > end)
 			nr_pages = 0;
-		else
+		else {
+			shmem_uffd_forget(mapping, base, nr_pages);
 			xas_store(&xas, NULL);
+		}
 	}
 	xas_unlock_irq(&xas);
 
@@ -1020,6 +1286,39 @@ unsigned long shmem_partial_swap_usage(struct address_space *mapping,
 	return swapped << PAGE_SHIFT;
 }
 
+/* Byte-clipped variant for mappings smaller than a native cache page. */
+unsigned long shmem_partial_swap_usage_bytes(struct address_space *mapping,
+					    u64 start, u64 end)
+{
+	XA_STATE(xas, &mapping->i_pages, start >> PAGE_SHIFT);
+	void *entry;
+	unsigned long swapped = 0, last;
+
+	if (start >= end)
+		return 0;
+	last = (end - 1) >> PAGE_SHIFT;
+	rcu_read_lock();
+	xas_for_each(&xas, entry, last) {
+		if (xas_retry(&xas, entry))
+			continue;
+		if (xa_is_value(entry)) {
+			unsigned int order = xas_get_order(&xas);
+			u64 first = ((u64)xas.xa_index & ~((1UL << order) - 1)) << PAGE_SHIFT;
+			u64 stop = first + ((u64)PAGE_SIZE << order);
+
+			swapped += min(stop, end) - max(first, start);
+		}
+		if (xas.xa_index == last)
+			break;
+		if (need_resched()) {
+			xas_pause(&xas);
+			cond_resched_rcu();
+		}
+	}
+	rcu_read_unlock();
+	return swapped;
+}
+
 /*
  * Determine (in bytes) how many of the shmem object's pages mapped by the
  * given vma is swapped out.
@@ -1044,6 +1343,12 @@ unsigned long shmem_swap_usage(struct vm_area_struct *vma)
 	 */
 	if (!swapped)
 		return 0;
+	if (mm_page_size(vma->vm_mm) < PAGE_SIZE) {
+		u64 start = ((u64)vma->vm_pgoff << PAGE_SHIFT) + vma_subpage_offset(vma);
+
+		return shmem_partial_swap_usage_bytes(mapping, start,
+						     start + vma->vm_end - vma->vm_start);
+	}
 
 	if (!vma->vm_pgoff && vma->vm_end - vma->vm_start >= inode->i_size)
 		return swapped << PAGE_SHIFT;
@@ -1099,6 +1404,12 @@ static struct folio *shmem_get_partial_folio(struct inode *inode, pgoff_t index)
 	folio = NULL;
 	shmem_get_folio(inode, index, 0, &folio, SGP_READ);
 	return folio;
+}
+
+static bool shmem_truncate_partial_folio(struct folio *folio, loff_t start, uoff_t end)
+{
+	shmem_uffd_partial_hole(folio, start, end);
+	return truncate_inode_partial_folio(folio, start, end);
 }
 
 /*
@@ -1164,7 +1475,7 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, uoff_t lend,
 	if (folio) {
 		same_folio = lend < folio_next_pos(folio);
 		folio_mark_dirty(folio);
-		if (!truncate_inode_partial_folio(folio, lstart, lend)) {
+		if (!shmem_truncate_partial_folio(folio, lstart, lend)) {
 			start = folio_next_index(folio);
 			if (same_folio)
 				end = folio->index;
@@ -1178,7 +1489,7 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, uoff_t lend,
 		folio = shmem_get_partial_folio(inode, lend >> PAGE_SHIFT);
 	if (folio) {
 		folio_mark_dirty(folio);
-		if (!truncate_inode_partial_folio(folio, lstart, lend))
+		if (!shmem_truncate_partial_folio(folio, lstart, lend))
 			end = folio->index;
 		folio_unlock(folio);
 		folio_put(folio);
@@ -1247,7 +1558,7 @@ whole_folios:
 
 				if (!folio_test_large(folio)) {
 					truncate_inode_folio(mapping, folio);
-				} else if (truncate_inode_partial_folio(folio, lstart, lend)) {
+				} else if (shmem_truncate_partial_folio(folio, lstart, lend)) {
 					/*
 					 * If we split a page, reset the loop so
 					 * that we pick up the new sub pages.
@@ -1355,6 +1666,7 @@ static int shmem_setattr(struct mnt_idmap *idmap,
 		}
 		if (newsize <= oldsize) {
 			loff_t holebegin = round_up(newsize, PAGE_SIZE);
+			unmap_mapping_subpage_tail(inode->i_mapping, newsize);
 			if (oldsize > holebegin)
 				unmap_mapping_range(inode->i_mapping,
 							holebegin, 0, 1);
@@ -1362,6 +1674,7 @@ static int shmem_setattr(struct mnt_idmap *idmap,
 				shmem_truncate_range(inode,
 							newsize, (loff_t)-1);
 			/* unmap again to remove racily COWed private pages */
+			unmap_mapping_subpage_tail(inode->i_mapping, newsize);
 			if (oldsize > holebegin)
 				unmap_mapping_range(inode->i_mapping,
 							holebegin, 0, 1);
@@ -1677,6 +1990,8 @@ try_split:
 		folio_mark_uptodate(folio);
 	}
 
+	if (shmem_uffd_swap_prepare(folio))
+		goto redirty;
 	if (!folio_alloc_swap(folio)) {
 		bool first_swapped = shmem_recalc_inode(inode, 0, nr_pages);
 		int error;
@@ -1730,6 +2045,10 @@ try_split:
 		swap_cache_del_folio(folio);
 		goto redirty;
 	}
+	/* Allocation failed: no swap entry owns the reserved inode metadata. */
+	xa_lock_irq(&mapping->i_pages);
+	shmem_uffd_forget(mapping, folio->index, folio_nr_pages(folio));
+	xa_unlock_irq(&mapping->i_pages);
 	if (nr_pages > 1)
 		goto try_split;
 redirty:
@@ -1931,6 +2250,23 @@ static struct folio *shmem_alloc_folio(gfp_t gfp, int order,
 	folio = folio_alloc_mpol(gfp, order, mpol, ilx, numa_node_id());
 	mpol_cond_put(mpol);
 
+	return folio;
+}
+
+/* Allocate unexposed promotion backing with the inode's zone/NUMA policy. */
+struct folio *shmem_alloc_collapse_folio(struct mm_struct *mm, struct inode *inode,
+				       pgoff_t index, unsigned int order)
+{
+	gfp_t gfp = limit_gfp_mask(GFP_TRANSHUGE, mapping_gfp_mask(inode->i_mapping));
+	struct folio *folio;
+
+	folio = shmem_alloc_folio(gfp, order, SHMEM_I(inode), index);
+	if (!folio)
+		return ERR_PTR(-ENOMEM);
+	if (mem_cgroup_charge(folio, mm, gfp)) {
+		folio_put(folio);
+		return ERR_PTR(-ENOMEM);
+	}
 	return folio;
 }
 
@@ -2484,12 +2820,35 @@ repeat:
 	fault_mm = vma ? vma->vm_mm : NULL;
 
 	folio = filemap_get_entry(inode->i_mapping, index);
-	if (folio && vma && userfaultfd_minor(vma)) {
+	if (folio && vma && userfaultfd_minor(vma) &&
+	    !(READ_ONCE(SHMEM_I(inode)->flags) & SHMEM_F_UFFD_SUBPAGE)) {
 		if (!xa_is_value(folio))
 			folio_put(folio);
 		*fault_type = handle_userfault(vmf, VM_UFFD_MINOR);
 		return 0;
 	}
+
+#if defined(CONFIG_MM_SUBPAGE) && defined(CONFIG_USERFAULTFD)
+	if (xa_is_value(folio) && vma && userfaultfd_armed(vma) &&
+	    (READ_ONCE(SHMEM_I(inode)->flags) & SHMEM_F_UFFD_SUBPAGE)) {
+		unsigned long reason;
+		void *partial;
+
+		/* Cache identity and its persisted mask must describe the same entry. */
+		xa_lock_irq(&inode->i_mapping->i_pages);
+		if (xa_load(&inode->i_mapping->i_pages, index) != folio) {
+			xa_unlock_irq(&inode->i_mapping->i_pages);
+			goto repeat;
+		}
+		partial = xa_load(&SHMEM_I(inode)->uffd_missing, index);
+		reason = shmem_uffd_reason(vmf, partial ? xa_to_value(partial) : 0);
+		xa_unlock_irq(&inode->i_mapping->i_pages);
+		if (reason) {
+			*fault_type = handle_userfault(vmf, reason);
+			return 0;
+		}
+	}
+#endif
 
 	if (xa_is_value(folio)) {
 		error = shmem_swapin_folio(inode, index, &folio,
@@ -2510,6 +2869,20 @@ repeat:
 			folio_put(folio);
 			goto repeat;
 		}
+#if defined(CONFIG_MM_SUBPAGE) && defined(CONFIG_USERFAULTFD)
+		if (vma && userfaultfd_armed(vma) &&
+		    (READ_ONCE(SHMEM_I(inode)->flags) & SHMEM_F_UFFD_SUBPAGE)) {
+			unsigned long reason = shmem_uffd_reason(vmf,
+					shmem_uffd_missing_mask(folio, index));
+
+			if (reason) {
+				folio_unlock(folio);
+				folio_put(folio);
+				*fault_type = handle_userfault(vmf, reason);
+				return 0;
+			}
+		}
+#endif
 		if (sgp == SGP_WRITE)
 			folio_mark_accessed(folio);
 		if (folio_test_uptodate(folio))
@@ -2748,15 +3121,33 @@ static vm_fault_t shmem_fault(struct vm_fault *vmf)
 	struct folio *folio = NULL;
 	vm_fault_t ret = 0;
 	int err;
+#ifdef CONFIG_MM_SUBPAGE
+	bool promoted = false;
+	unsigned long user_size = mm_page_size(vmf->vma->vm_mm);
 
+	/* Missing coarse PTEs require a blocking caller to prepare backing. */
+	if (user_size > PAGE_SIZE && (vmf->flags & FAULT_FLAG_RETRY_NOWAIT))
+		return VM_FAULT_RETRY;
+#endif
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(vmf->vma->vm_mm) < PAGE_SIZE &&
+	    !vma_file_offset_valid(vmf->vma, vmf->address, i_size_read(inode)))
+		return VM_FAULT_SIGBUS;
+#endif
+
+#ifdef CONFIG_MM_SUBPAGE
+retry:
+#endif
 	/*
 	 * Trinity finds that probing a hole which tmpfs is punching can
 	 * prevent the hole-punch from ever completing: noted in i_private.
 	 */
 	if (unlikely(inode->i_private)) {
-		ret = shmem_falloc_wait(vmf, inode);
-		if (ret)
-			return ret;
+		vm_fault_t wait = shmem_falloc_wait(vmf, inode);
+
+		if (wait)
+			return ret | wait;
 	}
 
 	WARN_ON_ONCE(vmf->page != NULL);
@@ -2765,6 +3156,45 @@ static vm_fault_t shmem_fault(struct vm_fault *vmf)
 	if (err)
 		return vmf_error(err);
 	if (folio) {
+#ifdef CONFIG_MM_SUBPAGE
+		if (mm_page_size(vmf->vma->vm_mm) < PAGE_SIZE &&
+		    !vma_file_offset_valid(vmf->vma, vmf->address, i_size_read(inode))) {
+			folio_unlock(folio);
+			folio_put(folio);
+			return VM_FAULT_SIGBUS;
+		}
+		if (user_size > PAGE_SIZE) {
+			struct vm_page_offset pos = vma_page_offset_at(vmf->vma, vmf->address);
+			unsigned long nr = user_size >> PAGE_SHIFT;
+
+			if (pos.offset || !IS_ALIGNED(pos.index, nr)) {
+				folio_unlock(folio);
+				folio_put(folio);
+				return VM_FAULT_SIGBUS;
+			}
+			if (folio_size(folio) < user_size) {
+				folio_unlock(folio);
+				folio_put(folio);
+				folio = NULL;
+				/* Bound work if splitting races a successful promotion. */
+				if (promoted) {
+					cond_resched();
+					return ret | VM_FAULT_NOPAGE;
+				}
+				err = collapse_file_user_page(vmf->vma->vm_mm,
+							      vmf->vma->vm_file, pos.index);
+				if (err == -EAGAIN) {
+					cond_resched();
+					return ret | VM_FAULT_NOPAGE;
+				}
+				if (err)
+					return vmf_error(err);
+				promoted = true;
+				goto retry;
+			}
+		}
+#endif
+
 		vmf->page = folio_file_page(folio, vmf->pgoff);
 		ret |= VM_FAULT_LOCKED;
 	}
@@ -2899,7 +3329,7 @@ static struct mempolicy *shmem_get_policy(struct vm_area_struct *vma,
 	 * by page order, as in shmem_get_pgoff_policy() and get_vma_policy()).
 	 */
 	*ilx = inode->i_ino;
-	index = ((addr - vma->vm_start) >> PAGE_SHIFT) + vma->vm_pgoff;
+	index = vma_page_offset_at(vma, addr).index;
 	return mpol_shared_policy_lookup(&SHMEM_I(inode)->policy, index);
 }
 
@@ -3086,6 +3516,9 @@ static struct inode *__shmem_get_inode(struct mnt_idmap *idmap,
 	memset(info, 0, (char *)inode - (char *)info);
 	INIT_LIST_HEAD_RCU(&info->xattrs);
 	spin_lock_init(&info->lock);
+#if defined(CONFIG_SHMEM) && defined(CONFIG_MM_SUBPAGE) && defined(CONFIG_USERFAULTFD)
+	xa_init_flags(&info->uffd_missing, XA_FLAGS_ACCOUNT);
+#endif
 	atomic_set(&info->stop_eviction, 0);
 	info->seals = F_SEAL_SEAL;
 	info->flags = vma_flags_test(&flags, VMA_NORESERVE_BIT)
@@ -3245,6 +3678,57 @@ static void shmem_mfill_filemap_remove(struct folio *folio,
 	folio_unlock(folio);
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+struct folio *shmem_uffd_prepare_folio(struct vm_area_struct *vma,
+				    unsigned long address, bool *new)
+{
+	struct inode *inode = file_inode(vma->vm_file);
+	pgoff_t index = vma_page_offset_at(vma, address).index;
+	struct folio *folio;
+	int err;
+
+	*new = false;
+	/* Must precede cache insertion: minor faults must wait for initialization. */
+	shmem_uffd_enable(inode);
+retry:
+	err = shmem_get_folio(inode, index, 0, &folio, SGP_NOALLOC);
+	if (!err)
+		return folio;
+	if (err != -ENOENT)
+		return ERR_PTR(err);
+	folio = shmem_mfill_folio_alloc(vma, address);
+	if (!folio)
+		return ERR_PTR(-ENOMEM);
+	clear_highpage(&folio->page);
+	flush_dcache_folio(folio);
+	__folio_mark_uptodate(folio);
+	err = shmem_mfill_filemap_add(folio, vma, address);
+	if (err) {
+		folio_put(folio);
+		if (err == -EEXIST)
+			goto retry;
+		return ERR_PTR(err);
+	}
+	err = shmem_uffd_set_missing(folio, index, SHMEM_UFFD_ALL_UNITS);
+	if (err) {
+		shmem_mfill_filemap_remove(folio, vma);
+		folio_put(folio);
+		return ERR_PTR(err);
+	}
+	*new = true;
+	return folio;
+}
+
+void shmem_uffd_abort_folio(struct folio *folio, struct vm_area_struct *vma, bool new)
+{
+	if (new)
+		shmem_mfill_filemap_remove(folio, vma);
+	else
+		folio_unlock(folio);
+	folio_put(folio);
+}
+#endif
+
 static struct folio *shmem_get_folio_noalloc(struct inode *inode, pgoff_t pgoff)
 {
 	struct folio *folio;
@@ -3331,6 +3815,7 @@ shmem_write_end(const struct kiocb *iocb, struct address_space *mapping,
 		}
 		folio_mark_uptodate(folio);
 	}
+	shmem_uffd_mark_mapped(folio, offset_in_folio(folio, pos), copied);
 	folio_mark_dirty(folio);
 	folio_unlock(folio);
 	folio_put(folio);
@@ -5143,6 +5628,10 @@ static struct inode *shmem_alloc_inode(struct super_block *sb)
 	info = alloc_inode_sb(sb, shmem_inode_cachep, GFP_KERNEL);
 	if (!info)
 		return NULL;
+#if defined(CONFIG_SHMEM) && defined(CONFIG_MM_SUBPAGE) && defined(CONFIG_USERFAULTFD)
+	/* Also cover inode-init failure before __shmem_get_inode() runs. */
+	xa_init_flags(&info->uffd_missing, XA_FLAGS_ACCOUNT);
+#endif
 	return &info->vfs_inode;
 }
 
@@ -5155,6 +5644,9 @@ static void shmem_free_in_core_inode(struct inode *inode)
 
 static void shmem_destroy_inode(struct inode *inode)
 {
+#if defined(CONFIG_SHMEM) && defined(CONFIG_MM_SUBPAGE) && defined(CONFIG_USERFAULTFD)
+	xa_destroy(&SHMEM_I(inode)->uffd_missing);
+#endif
 	if (S_ISREG(inode->i_mode))
 		mpol_free_shared_policy(&SHMEM_I(inode)->policy);
 	if (S_ISDIR(inode->i_mode))
@@ -5972,6 +6464,8 @@ struct folio *shmem_read_folio_gfp(struct address_space *mapping,
 	if (error)
 		return ERR_PTR(error);
 
+	/* A kernel caller receives and may modify the complete native folio. */
+	shmem_uffd_mark_mapped(folio, 0, folio_size(folio));
 	folio_unlock(folio);
 	return folio;
 #else

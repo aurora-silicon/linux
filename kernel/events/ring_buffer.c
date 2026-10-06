@@ -238,7 +238,7 @@ __perf_output_begin(struct perf_output_handle *handle,
 	if (unlikely(head - local_read(&rb->wakeup) > rb->watermark))
 		local_add(rb->watermark, &rb->wakeup);
 
-	page_shift = PAGE_SHIFT + page_order(rb);
+	page_shift = rb->data_page_shift;
 
 	handle->page = (offset >> page_shift) & (rb->nr_pages - 1);
 	offset &= (1UL << page_shift) - 1;
@@ -677,7 +677,7 @@ static void __rb_free_aux(struct perf_buffer *rb)
 }
 
 int rb_alloc_aux(struct perf_buffer *rb, struct perf_event *event,
-		 pgoff_t pgoff, int nr_pages, long watermark, int flags)
+		 u64 offset, int nr_pages, long watermark, int flags)
 {
 	bool overwrite = !(flags & RING_BUFFER_WRITABLE);
 	int node = (event->cpu == -1) ? -1 : cpu_to_node(event->cpu);
@@ -784,7 +784,7 @@ int rb_alloc_aux(struct perf_buffer *rb, struct perf_event *event,
 
 out:
 	if (!ret)
-		rb->aux_pgoff = pgoff;
+		rb->aux_offset = offset;
 	else
 		__rb_free_aux(rb);
 
@@ -803,8 +803,8 @@ void rb_free_aux(struct perf_buffer *rb)
  * Back perf_mmap() with regular GFP_KERNEL-0 pages.
  */
 
-static struct page *
-__perf_mmap_to_page(struct perf_buffer *rb, unsigned long pgoff)
+struct page *
+perf_mmap_to_page(struct perf_buffer *rb, unsigned long pgoff)
 {
 	if (pgoff > rb->nr_pages)
 		return NULL;
@@ -835,10 +835,12 @@ static void perf_mmap_free_page(void *addr)
 	__free_page(page);
 }
 
-struct perf_buffer *rb_alloc(int nr_pages, long watermark, int cpu, int flags)
+struct perf_buffer *rb_alloc(unsigned long data_size, unsigned int mmap_page_shift,
+			     long watermark, int cpu, int flags)
 {
 	struct perf_buffer *rb;
 	unsigned long size;
+	int nr_pages = DIV_ROUND_UP(data_size, PAGE_SIZE);
 	int i, node;
 
 	size = sizeof(struct perf_buffer);
@@ -863,6 +865,10 @@ struct perf_buffer *rb_alloc(int nr_pages, long watermark, int cpu, int flags)
 	}
 
 	rb->nr_pages = nr_pages;
+	rb->mmap_page_shift = mmap_page_shift;
+	/* A ring smaller than a native page still wraps at its requested size. */
+	rb->data_page_shift = data_size && data_size < PAGE_SIZE ?
+			      ilog2(data_size) : PAGE_SHIFT;
 
 	ring_buffer_init(rb, watermark, flags);
 
@@ -892,8 +898,8 @@ void rb_free(struct perf_buffer *rb)
 }
 
 #else
-static struct page *
-__perf_mmap_to_page(struct perf_buffer *rb, unsigned long pgoff)
+struct page *
+perf_mmap_to_page(struct perf_buffer *rb, unsigned long pgoff)
 {
 	/* The '>' counts in the user page. */
 	if (pgoff > data_page_nr(rb))
@@ -917,10 +923,12 @@ void rb_free(struct perf_buffer *rb)
 	schedule_work(&rb->work);
 }
 
-struct perf_buffer *rb_alloc(int nr_pages, long watermark, int cpu, int flags)
+struct perf_buffer *rb_alloc(unsigned long data_size, unsigned int mmap_page_shift,
+			     long watermark, int cpu, int flags)
 {
 	struct perf_buffer *rb;
 	unsigned long size;
+	int nr_pages = DIV_ROUND_UP(data_size, PAGE_SIZE);
 	void *all_buf;
 	int node;
 
@@ -940,9 +948,10 @@ struct perf_buffer *rb_alloc(int nr_pages, long watermark, int cpu, int flags)
 
 	rb->user_page = all_buf;
 	rb->data_pages[0] = all_buf + PAGE_SIZE;
+	rb->mmap_page_shift = mmap_page_shift;
 	if (nr_pages) {
 		rb->nr_pages = 1;
-		rb->page_order = ilog2(nr_pages);
+		rb->data_page_shift = ilog2(data_size);
 	}
 
 	ring_buffer_init(rb, watermark, flags);
@@ -957,21 +966,3 @@ fail:
 }
 
 #endif
-
-struct page *
-perf_mmap_to_page(struct perf_buffer *rb, unsigned long pgoff)
-{
-	if (rb->aux_nr_pages) {
-		/* above AUX space */
-		if (pgoff > rb->aux_pgoff + rb->aux_nr_pages)
-			return NULL;
-
-		/* AUX space */
-		if (pgoff >= rb->aux_pgoff) {
-			int aux_pgoff = array_index_nospec(pgoff - rb->aux_pgoff, rb->aux_nr_pages);
-			return virt_to_page(rb->aux_pages[aux_pgoff]);
-		}
-	}
-
-	return __perf_mmap_to_page(rb, pgoff);
-}

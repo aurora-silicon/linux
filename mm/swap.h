@@ -10,9 +10,12 @@ extern int page_cluster;
 
 #ifdef CONFIG_THP_SWAP
 #define SWAPFILE_CLUSTER	HPAGE_PMD_NR
-#define swap_entry_order(order)	(order)
 #else
 #define SWAPFILE_CLUSTER	256
+#endif
+#if defined(CONFIG_THP_SWAP) || defined(CONFIG_MM_SUBPAGE)
+#define swap_entry_order(order)	(order)
+#else
 #define swap_entry_order(order)	0
 #endif
 
@@ -38,6 +41,9 @@ struct swap_cluster_info {
 	u8 order;
 	atomic_long_t __rcu *table;	/* Swap table entries, see mm/swap_table.h */
 	unsigned int *extend_table;	/* For large swap count, protected by ci->lock */
+#ifdef CONFIG_MM_SUBPAGE
+	unsigned int *subpage_counts;	/* Per-quarter PTE refs, protected by ci->lock */
+#endif
 	struct list_head list;
 };
 
@@ -207,6 +213,8 @@ extern int swap_retry_table_alloc(swp_entry_t entry, gfp_t gfp);
  */
 int folio_alloc_swap(struct folio *folio);
 int folio_dup_swap(struct folio *folio, struct page *subpage);
+int folio_dup_swap_range(struct folio *folio, struct page *page, unsigned int nr);
+void folio_put_swap_range(struct folio *folio, struct page *page, unsigned int nr);
 void folio_put_swap(struct folio *folio, struct page *subpage);
 
 /* For internal use */
@@ -216,6 +224,7 @@ extern void __swap_cluster_free_entries(struct swap_info_struct *si,
 
 /* linux/mm/page_io.c */
 int sio_pool_init(void);
+int swap_extent_io_init(void);
 struct swap_iocb;
 void swap_read_folio(struct folio *folio, struct swap_iocb **plug);
 void __swap_read_unplug(struct swap_iocb *plug);
@@ -396,6 +405,17 @@ static inline int folio_dup_swap(struct folio *folio, struct page *page)
 }
 
 static inline void folio_put_swap(struct folio *folio, struct page *page)
+{
+}
+
+static inline int folio_dup_swap_range(struct folio *folio, struct page *page,
+				       unsigned int nr)
+{
+	return -EINVAL;
+}
+
+static inline void folio_put_swap_range(struct folio *folio, struct page *page,
+				       unsigned int nr)
 {
 }
 

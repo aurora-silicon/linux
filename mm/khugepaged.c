@@ -1066,28 +1066,31 @@ out:
 }
 
 static enum scan_result alloc_charge_folio(struct folio **foliop, struct mm_struct *mm,
-		struct collapse_control *cc)
+		struct collapse_control *cc, unsigned int order)
 {
 	gfp_t gfp = (cc->is_khugepaged ? alloc_hugepage_khugepaged_gfpmask() :
 		     GFP_TRANSHUGE);
 	int node = collapse_find_target_node(cc);
 	struct folio *folio;
 
-	folio = __folio_alloc(gfp, HPAGE_PMD_ORDER, node, &cc->alloc_nmask);
+	folio = __folio_alloc(gfp, order, node, &cc->alloc_nmask);
 	if (!folio) {
 		*foliop = NULL;
-		count_vm_event(THP_COLLAPSE_ALLOC_FAILED);
+		if (is_pmd_order(order))
+			count_vm_event(THP_COLLAPSE_ALLOC_FAILED);
 		return SCAN_ALLOC_HUGE_PAGE_FAIL;
 	}
 
-	count_vm_event(THP_COLLAPSE_ALLOC);
+	if (is_pmd_order(order))
+		count_vm_event(THP_COLLAPSE_ALLOC);
 	if (unlikely(mem_cgroup_charge(folio, mm, gfp))) {
 		folio_put(folio);
 		*foliop = NULL;
 		return SCAN_CGROUP_CHARGE_FAIL;
 	}
 
-	count_memcg_folio_events(folio, THP_COLLAPSE_ALLOC, 1);
+	if (is_pmd_order(order))
+		count_memcg_folio_events(folio, THP_COLLAPSE_ALLOC, 1);
 
 	*foliop = folio;
 	return SCAN_SUCCEED;
@@ -1116,7 +1119,7 @@ static enum scan_result collapse_huge_page(struct mm_struct *mm, unsigned long a
 	 */
 	mmap_read_unlock(mm);
 
-	result = alloc_charge_folio(&folio, mm, cc);
+	result = alloc_charge_folio(&folio, mm, cc, HPAGE_PMD_ORDER);
 	if (result != SCAN_SUCCEED)
 		goto out_nolock;
 
@@ -1880,22 +1883,33 @@ drop_pml:
  *    + unlock and free huge page;
  */
 static enum scan_result collapse_file(struct mm_struct *mm, unsigned long addr,
-		struct file *file, pgoff_t start, struct collapse_control *cc)
+		struct file *file, pgoff_t start, struct collapse_control *cc,
+		unsigned int order)
 {
 	struct address_space *mapping = file->f_mapping;
 	struct page *dst;
 	struct folio *folio, *tmp, *new_folio;
-	pgoff_t index = 0, end = start + HPAGE_PMD_NR;
+	unsigned long nr_pages = 1UL << order;
+	pgoff_t index = 0, end = start + nr_pages;
 	LIST_HEAD(pagelist);
-	XA_STATE_ORDER(xas, &mapping->i_pages, start, HPAGE_PMD_ORDER);
+	XA_STATE_ORDER(xas, &mapping->i_pages, start, order);
 	enum scan_result result = SCAN_SUCCEED;
 	int nr_none = 0;
 	bool is_shmem = shmem_file(file);
 
 	VM_BUG_ON(!IS_ENABLED(CONFIG_READ_ONLY_THP_FOR_FS) && !is_shmem);
-	VM_BUG_ON(start & (HPAGE_PMD_NR - 1));
+	VM_BUG_ON(start & (nr_pages - 1));
 
-	result = alloc_charge_folio(&new_folio, mm, cc);
+	if (is_pmd_order(order)) {
+		result = alloc_charge_folio(&new_folio, mm, cc, order);
+	} else {
+		/* Sub-PMD user leaves must respect the shmem inode's allocation policy. */
+		new_folio = shmem_alloc_collapse_folio(mm, mapping->host, start, order);
+		if (IS_ERR(new_folio)) {
+			new_folio = NULL;
+			result = SCAN_ALLOC_HUGE_PAGE_FAIL;
+		}
+	}
 	if (result != SCAN_SUCCEED)
 		goto out;
 
@@ -2024,7 +2038,7 @@ static enum scan_result collapse_file(struct mm_struct *mm, unsigned long addr,
 		 * we locked the first folio, then a THP might be there already.
 		 * This will be discovered on the first iteration.
 		 */
-		if (is_pmd_order(folio_order(folio))) {
+		if (folio_order(folio) >= order) {
 			result = SCAN_PTE_MAPPED_HUGEPAGE;
 			goto out_unlock;
 		}
@@ -2149,6 +2163,8 @@ xa_unlocked:
 
 		while (index < folio->index) {
 			clear_highpage(dst);
+			if (is_shmem)
+				shmem_uffd_copy_page(dst, NULL);
 			index++;
 			dst++;
 		}
@@ -2158,12 +2174,16 @@ xa_unlocked:
 				result = SCAN_COPY_MC;
 				goto rollback;
 			}
+			if (is_shmem)
+				shmem_uffd_copy_page(dst, folio_page(folio, i));
 			index++;
 			dst++;
 		}
 	}
 	while (index < end) {
 		clear_highpage(dst);
+		if (is_shmem)
+			shmem_uffd_copy_page(dst, NULL);
 		index++;
 		dst++;
 	}
@@ -2205,8 +2225,13 @@ xa_unlocked:
 		 * not be able to observe any missing pages due to the
 		 * previously inserted retry entries.
 		 */
+		/*
+		 * A required user leaf populates its whole granule, as a native
+		 * fault does. Only optional PMD collapse must preserve cache holes
+		 * merely because another VMA has missing-page registration.
+		 */
 		vma_interval_tree_foreach(vma, &mapping->i_mmap, start, end) {
-			if (userfaultfd_missing(vma)) {
+			if (is_pmd_order(order) && userfaultfd_missing(vma)) {
 				result = SCAN_EXCEED_NONE_PTE;
 				goto immap_locked;
 			}
@@ -2229,12 +2254,13 @@ immap_locked:
 	}
 
 	if (is_shmem) {
-		lruvec_stat_mod_folio(new_folio, NR_SHMEM, HPAGE_PMD_NR);
-		lruvec_stat_mod_folio(new_folio, NR_SHMEM_THPS, HPAGE_PMD_NR);
-	} else {
-		lruvec_stat_mod_folio(new_folio, NR_FILE_THPS, HPAGE_PMD_NR);
+		lruvec_stat_mod_folio(new_folio, NR_SHMEM, nr_pages);
+		if (is_pmd_order(order))
+			lruvec_stat_mod_folio(new_folio, NR_SHMEM_THPS, nr_pages);
+	} else if (is_pmd_order(order)) {
+		lruvec_stat_mod_folio(new_folio, NR_FILE_THPS, nr_pages);
 	}
-	lruvec_stat_mod_folio(new_folio, NR_FILE_PAGES, HPAGE_PMD_NR);
+	lruvec_stat_mod_folio(new_folio, NR_FILE_PAGES, nr_pages);
 
 	/*
 	 * Mark new_folio as uptodate before inserting it into the
@@ -2242,14 +2268,14 @@ immap_locked:
 	 * unwritten page.
 	 */
 	folio_mark_uptodate(new_folio);
-	folio_ref_add(new_folio, HPAGE_PMD_NR - 1);
+	folio_ref_add(new_folio, nr_pages - 1);
 
 	if (is_shmem)
 		folio_mark_dirty(new_folio);
 	folio_add_lru(new_folio);
 
 	/* Join all the small entries into a single multi-index entry. */
-	xas_set_order(&xas, start, HPAGE_PMD_ORDER);
+	xas_set_order(&xas, start, order);
 	xas_store(&xas, new_folio);
 	WARN_ON_ONCE(xas_error(&xas));
 	xas_unlock_irq(&xas);
@@ -2258,9 +2284,11 @@ immap_locked:
 	 * Remove pte page tables, so we can re-fault the page as huge.
 	 * If MADV_COLLAPSE, adjust result to call try_collapse_pte_mapped_thp().
 	 */
-	retract_page_tables(mapping, start);
-	if (cc && !cc->is_khugepaged)
-		result = SCAN_PTE_MAPPED_HUGEPAGE;
+	if (is_pmd_order(order)) {
+		retract_page_tables(mapping, start);
+		if (cc && !cc->is_khugepaged)
+			result = SCAN_PTE_MAPPED_HUGEPAGE;
+	}
 	folio_unlock(new_folio);
 
 	/*
@@ -2317,7 +2345,7 @@ rollback:
 	folio_put(new_folio);
 out:
 	VM_BUG_ON(!list_empty(&pagelist));
-	trace_mm_khugepaged_collapse_file(mm, new_folio, index, addr, is_shmem, file, HPAGE_PMD_NR, result);
+	trace_mm_khugepaged_collapse_file(mm, new_folio, index, addr, is_shmem, file, nr_pages, result);
 	return result;
 }
 
@@ -2420,7 +2448,7 @@ static enum scan_result collapse_scan_file(struct mm_struct *mm,
 			result = SCAN_EXCEED_NONE_PTE;
 			count_vm_event(THP_SCAN_EXCEED_NONE_PTE);
 		} else {
-			result = collapse_file(mm, addr, file, start, cc);
+			result = collapse_file(mm, addr, file, start, cc, HPAGE_PMD_ORDER);
 		}
 	}
 
@@ -2829,6 +2857,47 @@ static int madvise_collapse_errno(enum scan_result r)
 	default:
 		return -EINVAL;
 	}
+}
+
+/*
+ * Promote the cache backing for one larger-than-native user leaf. The caller
+ * owns mm/file references; no folio or page-table lock may be held. Start is
+ * a native file index. This sub-PMD shmem path may run under the fault lock:
+ * it neither retracts page tables (which requires mmap write locking) nor
+ * invokes filesystem writeback. Source folios are trylocked and rolled back
+ * on contention. Ordinary PMD collapse retains its existing lock policy.
+ */
+int collapse_file_user_page(struct mm_struct *mm, struct file *file, pgoff_t start)
+{
+	struct collapse_control *cc;
+	unsigned int order;
+	enum scan_result result;
+
+	if (mm_page_shift(mm) <= PAGE_SHIFT || !shmem_file(file))
+		return -EOPNOTSUPP;
+	order = mm_page_shift(mm) - PAGE_SHIFT;
+	/* Shmem's order limit reflects THP policy, not an architectural leaf limit. */
+	if (order >= HPAGE_PMD_ORDER || order > MAX_PAGECACHE_ORDER ||
+	    !IS_ALIGNED(start, 1UL << order) || start > ULONG_MAX - (1UL << order))
+		return -EINVAL;
+	cc = kzalloc(sizeof(*cc), GFP_KERNEL);
+	if (!cc)
+		return -ENOMEM;
+	lru_add_drain_all();
+	result = collapse_file(mm, 0, file, start, cc, order);
+	kfree(cc);
+	if (result == SCAN_SUCCEED || result == SCAN_PTE_MAPPED_HUGEPAGE)
+		return 0;
+	/* Retained references cannot be displaced by replacing their cache folio. */
+	if (result == SCAN_PAGE_COUNT)
+		return -EBUSY;
+	if (result == SCAN_CGROUP_CHARGE_FAIL)
+		return -ENOMEM;
+	if (result == SCAN_COPY_MC)
+		return -EHWPOISON;
+	if (result == SCAN_TRUNCATED)
+		return -EAGAIN;
+	return madvise_collapse_errno(result);
 }
 
 int madvise_collapse(struct vm_area_struct *vma, unsigned long start,

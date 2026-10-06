@@ -192,6 +192,7 @@ struct uprobes_state {
 };
 
 typedef int (*uprobe_write_verify_t)(struct page *page, unsigned long vaddr,
+				     unsigned int page_offset,
 				     uprobe_opcode_t *insn, int nbytes, void *data);
 
 extern void __init uprobes_init(void);

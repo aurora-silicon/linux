@@ -558,7 +558,8 @@ FOLIO_MATCH(compound_info, _head_3);
  * @__page_mapping:   Aliases with page->mapping. Unused for page tables.
  * @pt_index:         Used for s390 gmap.
  * @pt_mm:            Used for x86 pgds.
- * @pt_frag_refcount: For fragmented page table tracking. Powerpc only.
+ * @pt_frag_refcount: For fragmented page table tracking (powerpc, arm64).
+ * @pt_frag_shift:    Immutable arm64 fragment granule, valid through RCU release.
  * @pt_share_count:   Used for HugeTLB PMD page table share count.
  * @_pt_pad_2:        Padding to ensure proper alignment.
  * @ptl:              Lock for the page table.
@@ -585,7 +586,15 @@ struct ptdesc {
 	union {
 		pgoff_t pt_index;
 		struct mm_struct *pt_mm;
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+		/* arm64 is 64-bit: use the spare half of this existing word. */
+		struct {
+			atomic_t pt_frag_refcount;
+			u8 pt_frag_shift;
+		};
+#else
 		atomic_t pt_frag_refcount;
+#endif
 #ifdef CONFIG_HUGETLB_PMD_PAGE_TABLE_SHARING
 		atomic_t pt_share_count;
 #endif
@@ -905,6 +914,9 @@ struct vm_area_desc {
 
 	/* Mutable fields. Populated with initial state. */
 	pgoff_t pgoff;
+#ifdef CONFIG_MM_SUBPAGE
+	unsigned int subpage_offset;
+#endif
 	struct file *vm_file;
 	vma_flags_t vma_flags;
 	pgprot_t page_prot;
@@ -992,6 +1004,9 @@ struct vm_area_struct {
 	/* Information about our backing store: */
 	unsigned long vm_pgoff;		/* Offset (within vm_file) in PAGE_SIZE
 					   units */
+#ifdef CONFIG_MM_SUBPAGE
+	unsigned int vm_subpage_offset; /* Byte offset within vm_pgoff. */
+#endif
 	struct file * vm_file;		/* File we map to (can be NULL). */
 	void * vm_private_data;		/* was vm_pte (shared mem) */
 
@@ -1281,12 +1296,16 @@ struct mm_struct {
 		unsigned int			__percpu *futex_ref;
 #endif
 
-		unsigned long hiwater_rss; /* High-watermark of RSS usage */
-		unsigned long hiwater_vm;  /* High-water virtual memory usage */
+		unsigned long hiwater_rss; /* Peak RSS in user granules */
+		unsigned long hiwater_vm;  /* Peak VM in user granules */
 
-		unsigned long total_vm;	   /* Total pages mapped */
-		unsigned long locked_vm;   /* Pages that have PG_mlocked set */
-		atomic64_t    pinned_vm;   /* Refcount permanently increased */
+		unsigned long total_vm;	   /* Mapped user granules */
+#ifdef CONFIG_MM_SUBPAGE
+		/* VM_ACCOUNT granules; global commitment rounds this sum once. */
+		unsigned long committed_user_pages;
+#endif
+		unsigned long locked_vm;   /* Locked bytes >> MM_ACCOUNT_SHIFT */
+		atomic64_t    pinned_vm;   /* Pinned native physical pages */
 		unsigned long data_vm;	   /* VM_WRITE & ~VM_SHARED & ~VM_STACK */
 		unsigned long exec_vm;	   /* VM_EXEC & ~VM_WRITE & ~VM_STACK */
 		unsigned long stack_vm;	   /* VM_STACK */

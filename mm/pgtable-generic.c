@@ -168,13 +168,15 @@ pud_t pudp_huge_clear_flush(struct vm_area_struct *vma, unsigned long address,
 void pgtable_trans_huge_deposit(struct mm_struct *mm, pmd_t *pmdp,
 				pgtable_t pgtable)
 {
+	struct page *page = pgtable_to_page(pgtable);
+
 	assert_spin_locked(pmd_lockptr(mm, pmdp));
 
 	/* FIFO */
 	if (!pmd_huge_pte(mm, pmdp))
-		INIT_LIST_HEAD(&pgtable->lru);
+		INIT_LIST_HEAD(&page->lru);
 	else
-		list_add(&pgtable->lru, &pmd_huge_pte(mm, pmdp)->lru);
+		list_add(&page->lru, &pgtable_to_page(pmd_huge_pte(mm, pmdp))->lru);
 	pmd_huge_pte(mm, pmdp) = pgtable;
 }
 #endif
@@ -184,15 +186,17 @@ void pgtable_trans_huge_deposit(struct mm_struct *mm, pmd_t *pmdp,
 pgtable_t pgtable_trans_huge_withdraw(struct mm_struct *mm, pmd_t *pmdp)
 {
 	pgtable_t pgtable;
+	struct page *page, *next;
 
 	assert_spin_locked(pmd_lockptr(mm, pmdp));
 
 	/* FIFO */
 	pgtable = pmd_huge_pte(mm, pmdp);
-	pmd_huge_pte(mm, pmdp) = list_first_entry_or_null(&pgtable->lru,
-							  struct page, lru);
+	page = pgtable_to_page(pgtable);
+	next = list_first_entry_or_null(&page->lru, struct page, lru);
+	pmd_huge_pte(mm, pmdp) = pgtable_from_page(next);
 	if (pmd_huge_pte(mm, pmdp))
-		list_del(&pgtable->lru);
+		list_del(&page->lru);
 	return pgtable;
 }
 #endif
@@ -282,7 +286,12 @@ static unsigned long pmdp_get_lockless_start(void) { return 0; }
 static void pmdp_get_lockless_end(unsigned long irqflags) { }
 #endif
 
+#ifdef CONFIG_ARCH_HAS_MM_PGTABLE
+pte_t *__pte_offset_map_mm(struct mm_struct *mm, pmd_t *pmd,
+			   unsigned long addr, pmd_t *pmdvalp)
+#else
 pte_t *__pte_offset_map(pmd_t *pmd, unsigned long addr, pmd_t *pmdvalp)
+#endif
 {
 	unsigned long irqflags;
 	pmd_t pmdval;
@@ -302,11 +311,19 @@ pte_t *__pte_offset_map(pmd_t *pmd, unsigned long addr, pmd_t *pmdvalp)
 		pmd_clear_bad(pmd);
 		goto nomap;
 	}
-	return __pte_map(&pmdval, addr);
+	return __pte_map_mm(mm, &pmdval, addr);
 nomap:
 	rcu_read_unlock();
 	return NULL;
 }
+
+#ifdef CONFIG_ARCH_HAS_MM_PGTABLE
+pte_t *__pte_offset_map(pmd_t *pmd, unsigned long addr, pmd_t *pmdvalp)
+{
+	/* NULL retains native geometry for callers not yet converted. */
+	return __pte_offset_map_mm(NULL, pmd, addr, pmdvalp);
+}
+#endif
 
 pte_t *pte_offset_map_ro_nolock(struct mm_struct *mm, pmd_t *pmd,
 				unsigned long addr, spinlock_t **ptlp)
@@ -314,7 +331,7 @@ pte_t *pte_offset_map_ro_nolock(struct mm_struct *mm, pmd_t *pmd,
 	pmd_t pmdval;
 	pte_t *pte;
 
-	pte = __pte_offset_map(pmd, addr, &pmdval);
+	pte = __pte_offset_map_mm(mm, pmd, addr, &pmdval);
 	if (likely(pte))
 		*ptlp = pte_lockptr(mm, &pmdval);
 	return pte;
@@ -327,7 +344,7 @@ pte_t *pte_offset_map_rw_nolock(struct mm_struct *mm, pmd_t *pmd,
 	pte_t *pte;
 
 	VM_WARN_ON_ONCE(!pmdvalp);
-	pte = __pte_offset_map(pmd, addr, pmdvalp);
+	pte = __pte_offset_map_mm(mm, pmd, addr, pmdvalp);
 	if (likely(pte))
 		*ptlp = pte_lockptr(mm, pmdvalp);
 	return pte;
@@ -397,7 +414,7 @@ pte_t *pte_offset_map_lock(struct mm_struct *mm, pmd_t *pmd,
 	pmd_t pmdval;
 	pte_t *pte;
 again:
-	pte = __pte_offset_map(pmd, addr, &pmdval);
+	pte = __pte_offset_map_mm(mm, pmd, addr, &pmdval);
 	if (unlikely(!pte))
 		return pte;
 	ptl = pte_lockptr(mm, &pmdval);

@@ -8,6 +8,8 @@ extern unsigned int khugepaged_max_ptes_none __read_mostly;
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 extern struct attribute_group khugepaged_attr_group;
 
+int collapse_file_user_page(struct mm_struct *mm, struct file *file, pgoff_t start);
+
 extern int khugepaged_init(void);
 extern void khugepaged_destroy(void);
 extern int start_stop_khugepaged(void);
@@ -32,6 +34,12 @@ static inline void khugepaged_exit(struct mm_struct *mm)
 		__khugepaged_exit(mm);
 }
 #else /* CONFIG_TRANSPARENT_HUGEPAGE */
+static inline int collapse_file_user_page(struct mm_struct *mm, struct file *file,
+					 pgoff_t start)
+{
+	return -EOPNOTSUPP;
+}
+
 static inline void khugepaged_fork(struct mm_struct *mm, struct mm_struct *oldmm)
 {
 }

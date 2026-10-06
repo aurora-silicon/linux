@@ -51,9 +51,10 @@ static struct folio *page_idle_get_folio(unsigned long pfn)
 
 static bool page_idle_clear_pte_refs_one(struct folio *folio,
 					struct vm_area_struct *vma,
-					unsigned long addr, void *arg)
+					struct rmap_walk_range rmap, void *arg)
 {
-	DEFINE_FOLIO_VMA_WALK(pvmw, folio, vma, addr, 0);
+	unsigned long addr = rmap.address;
+	DEFINE_FOLIO_RMAP_WALK(pvmw, folio, vma, rmap, 0);
 	bool referenced = false;
 
 	while (page_vma_mapped_walk(&pvmw)) {
@@ -69,7 +70,7 @@ static bool page_idle_clear_pte_refs_one(struct folio *folio,
 			 */
 			if (likely(pte_present(ptep_get(pvmw.pte))))
 				referenced |= ptep_test_and_clear_young(vma, addr, pvmw.pte);
-			referenced |= mmu_notifier_clear_young(vma->vm_mm, addr, addr + PAGE_SIZE);
+			referenced |= mmu_notifier_clear_young(vma->vm_mm, addr, addr + mm_page_size(vma->vm_mm));
 		} else if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE)) {
 			pmd_t pmdval = pmdp_get(pvmw.pmd);
 

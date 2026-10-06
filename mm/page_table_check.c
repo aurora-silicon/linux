@@ -4,6 +4,7 @@
  * Copyright (c) 2021, Google LLC.
  * Pasha Tatashin <pasha.tatashin@soleen.com>
  */
+#include <kunit/visibility.h>
 #include <linux/kstrtox.h>
 #include <linux/mm.h>
 #include <linux/page_table_check.h>
@@ -13,9 +14,19 @@
 #undef pr_fmt
 #define pr_fmt(fmt)	"page_table_check: " fmt
 
-struct page_table_check {
+#ifdef CONFIG_MM_SUBPAGE
+#define PAGE_TABLE_CHECK_SLOTS (PAGE_SIZE / SZ_4K)
+#else
+#define PAGE_TABLE_CHECK_SLOTS 1
+#endif
+
+struct page_table_check_slot {
 	atomic_t anon_map_count;
 	atomic_t file_map_count;
+};
+
+struct page_table_check {
+	struct page_table_check_slot slots[PAGE_TABLE_CHECK_SLOTS];
 };
 
 static bool __page_table_check_enabled __initdata =
@@ -56,6 +67,74 @@ static struct page_table_check *get_page_table_check(struct page_ext *page_ext)
 	return page_ext_data(page_ext, &page_table_check_ops);
 }
 
+#if IS_ENABLED(CONFIG_KUNIT)
+/* Diagnostic snapshot for private test allocations, not a synchronization API. */
+int page_table_check_get_counts(struct page *page, unsigned int offset,
+			       int *anon, int *file)
+{
+	struct page_ext *ext;
+	struct page_table_check *ptc;
+	unsigned int slot = 0;
+
+	if (static_branch_likely(&page_table_check_disabled))
+		return -EOPNOTSUPP;
+	if (offset >= PAGE_SIZE)
+		return -EINVAL;
+#ifdef CONFIG_MM_SUBPAGE
+	slot = offset / SZ_4K;
+#endif
+	ext = page_ext_get(page);
+	if (!ext)
+		return -ENOENT;
+	ptc = get_page_table_check(ext);
+	*anon = atomic_read(&ptc->slots[slot].anon_map_count);
+	*file = atomic_read(&ptc->slots[slot].file_map_count);
+	page_ext_put(ext);
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(page_table_check_get_counts);
+#endif
+
+static void page_table_check_update(struct page_table_check_slot *slot,
+				    bool anon, bool clear, bool rw)
+{
+	if (anon) {
+		BUG_ON(atomic_read(&slot->file_map_count));
+		if (clear)
+			BUG_ON(atomic_dec_return(&slot->anon_map_count) < 0);
+		else
+			BUG_ON(atomic_inc_return(&slot->anon_map_count) > 1 && rw);
+	} else {
+		BUG_ON(atomic_read(&slot->anon_map_count));
+		if (clear)
+			BUG_ON(atomic_dec_return(&slot->file_map_count) < 0);
+		else
+			BUG_ON(atomic_inc_return(&slot->file_map_count) < 0);
+	}
+}
+
+#ifdef CONFIG_MM_SUBPAGE
+static void page_table_check_subpage(phys_addr_t phys, unsigned long size,
+				     bool clear, bool rw)
+{
+	unsigned long pfn = PHYS_PFN(phys);
+	struct page_table_check *ptc;
+	struct page_ext *ext;
+	struct page *page;
+	unsigned int first = offset_in_page(phys) / SZ_4K, i;
+
+	if (!pfn_valid(pfn))
+		return;
+	page = pfn_to_page(pfn);
+	BUG_ON(PageSlab(page));
+	ext = page_ext_get(page);
+	ptc = get_page_table_check(ext);
+	for (i = first; i < first + size / SZ_4K; i++)
+		page_table_check_update(&ptc->slots[i], PageAnon(page), clear, rw);
+	page_ext_put(ext);
+}
+#endif
+
 /*
  * An entry is removed from the page table, decrement the counters for that page
  * verify that it is of correct type and counters do not become negative.
@@ -78,13 +157,8 @@ static void page_table_check_clear(unsigned long pfn, unsigned long pgcnt)
 	for_each_page_ext(page, pgcnt, page_ext, iter) {
 		struct page_table_check *ptc = get_page_table_check(page_ext);
 
-		if (anon) {
-			BUG_ON(atomic_read(&ptc->file_map_count));
-			BUG_ON(atomic_dec_return(&ptc->anon_map_count) < 0);
-		} else {
-			BUG_ON(atomic_read(&ptc->anon_map_count));
-			BUG_ON(atomic_dec_return(&ptc->file_map_count) < 0);
-		}
+		for (unsigned int i = 0; i < PAGE_TABLE_CHECK_SLOTS; i++)
+			page_table_check_update(&ptc->slots[i], anon, true, false);
 	}
 	rcu_read_unlock();
 }
@@ -113,13 +187,8 @@ static void page_table_check_set(unsigned long pfn, unsigned long pgcnt,
 	for_each_page_ext(page, pgcnt, page_ext, iter) {
 		struct page_table_check *ptc = get_page_table_check(page_ext);
 
-		if (anon) {
-			BUG_ON(atomic_read(&ptc->file_map_count));
-			BUG_ON(atomic_inc_return(&ptc->anon_map_count) > 1 && rw);
-		} else {
-			BUG_ON(atomic_read(&ptc->anon_map_count));
-			BUG_ON(atomic_inc_return(&ptc->file_map_count) < 0);
-		}
+		for (unsigned int i = 0; i < PAGE_TABLE_CHECK_SLOTS; i++)
+			page_table_check_update(&ptc->slots[i], anon, false, rw);
 	}
 	rcu_read_unlock();
 }
@@ -139,8 +208,10 @@ void __page_table_check_zero(struct page *page, unsigned int order)
 	for_each_page_ext(page, 1 << order, page_ext, iter) {
 		struct page_table_check *ptc = get_page_table_check(page_ext);
 
-		BUG_ON(atomic_read(&ptc->anon_map_count));
-		BUG_ON(atomic_read(&ptc->file_map_count));
+		for (unsigned int i = 0; i < PAGE_TABLE_CHECK_SLOTS; i++) {
+			BUG_ON(atomic_read(&ptc->slots[i].anon_map_count));
+			BUG_ON(atomic_read(&ptc->slots[i].file_map_count));
+		}
 	}
 	rcu_read_unlock();
 }
@@ -151,8 +222,15 @@ void __page_table_check_pte_clear(struct mm_struct *mm, unsigned long addr,
 	if (&init_mm == mm)
 		return;
 
-	if (pte_user_accessible_page(mm, addr, pte) && !pte_special(pte))
-		page_table_check_clear(pte_pfn(pte), PAGE_SIZE >> PAGE_SHIFT);
+	if (!pte_user_accessible_page(mm, addr, pte) || pte_special(pte))
+		return;
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(mm) < PAGE_SIZE) {
+		page_table_check_subpage(pte_phys_mm(mm, pte), mm_page_size(mm), true, false);
+		return;
+	}
+#endif
+	page_table_check_clear(pte_pfn(pte), mm_pte_native_pages(mm));
 }
 EXPORT_SYMBOL(__page_table_check_pte_clear);
 
@@ -218,9 +296,20 @@ void __page_table_check_ptes_set(struct mm_struct *mm, unsigned long addr,
 	page_table_check_pte_flags(pte);
 
 	for (i = 0; i < nr; i++)
-		__page_table_check_pte_clear(mm, addr + PAGE_SIZE * i, ptep_get(ptep + i));
-	if (pte_user_accessible_page(mm, addr, pte) && !pte_special(pte))
-		page_table_check_set(pte_pfn(pte), nr, pte_write(pte));
+		__page_table_check_pte_clear(mm, addr + mm_page_size(mm) * i, ptep_get(ptep + i));
+	if (!pte_user_accessible_page(mm, addr, pte) || pte_special(pte))
+		return;
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(mm) < PAGE_SIZE) {
+		phys_addr_t phys = pte_phys_mm(mm, pte);
+
+		for (i = 0; i < nr; i++)
+			page_table_check_subpage(phys + i * mm_page_size(mm), mm_page_size(mm), false,
+						pte_write(pte));
+		return;
+	}
+#endif
+	page_table_check_set(pte_pfn(pte), nr * mm_pte_native_pages(mm), pte_write(pte));
 }
 EXPORT_SYMBOL(__page_table_check_ptes_set);
 
@@ -279,16 +368,17 @@ void __page_table_check_pte_clear_range(struct mm_struct *mm,
 		return;
 
 	if (!pmd_bad(pmd) && !pmd_leaf(pmd)) {
-		pte_t *ptep = pte_offset_map(&pmd, addr);
+		pte_t *ptep = pte_offset_map_mm(mm, &pmd, addr);
+		unsigned long nr = pte_table_bytes_mm(mm) / sizeof(pte_t);
 		unsigned long i;
 
 		if (WARN_ON(!ptep))
 			return;
-		for (i = 0; i < PTRS_PER_PTE; i++) {
+		for (i = 0; i < nr; i++) {
 			__page_table_check_pte_clear(mm, addr, ptep_get(ptep));
-			addr += PAGE_SIZE;
+			addr += mm_page_size(mm);
 			ptep++;
 		}
-		pte_unmap(ptep - PTRS_PER_PTE);
+		pte_unmap(ptep - nr);
 	}
 }

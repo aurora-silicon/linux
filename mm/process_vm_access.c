@@ -7,6 +7,7 @@
 
 #include <linux/compat.h>
 #include <linux/mm.h>
+#include <linux/mm_subpage.h>
 #include <linux/uio.h>
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
@@ -14,6 +15,8 @@
 #include <linux/ptrace.h>
 #include <linux/slab.h>
 #include <linux/syscalls.h>
+
+#include "internal.h"
 
 /**
  * process_vm_rw_pages - read/write pages from task specified
@@ -135,6 +138,63 @@ static int process_vm_rw_single_vec(unsigned long addr,
    which lives on stack */
 #define PVM_MAX_PP_ARRAY_COUNT 16
 
+#ifdef CONFIG_MM_SUBPAGE
+/* Same pin/copy/dirty lifetime as the page-array path, with explicit offsets. */
+int process_vm_rw_fragments(struct mm_struct *mm, unsigned long addr,
+		unsigned long len, struct iov_iter *iter, bool write)
+{
+	struct user_page_fragment stack[PVM_MAX_PP_ARRAY_COUNT];
+	struct user_page_fragment *fragments = stack;
+	unsigned long capacity, nr;
+	int ret = 0;
+
+	if (!len || !iov_iter_count(iter))
+		return 0;
+	capacity = 1 + ((len - 1) >> MM_SUBPAGE_SHIFT) +
+		((((len - 1) & (MM_SUBPAGE_SIZE - 1)) +
+		  (addr & (MM_SUBPAGE_SIZE - 1))) >> MM_SUBPAGE_SHIFT);
+	capacity = min_t(unsigned long, capacity,
+		PVM_MAX_KMALLOC_PAGES * PAGE_SIZE / sizeof(*fragments));
+	if (capacity > ARRAY_SIZE(stack)) {
+		fragments = kmalloc_array(capacity, sizeof(*fragments), GFP_KERNEL);
+		if (!fragments)
+			return -ENOMEM;
+	}
+	while (len && iov_iter_count(iter)) {
+		long got = pin_user_fragments_remote(mm, addr, len,
+					write ? FOLL_WRITE : 0, fragments, capacity);
+
+		if (got <= 0) {
+			ret = -EFAULT;
+			break;
+		}
+		for (nr = 0; nr < got && iov_iter_count(iter); nr++) {
+			struct user_page_fragment *f = &fragments[nr];
+			struct page *page = folio_page(f->folio, f->offset >> PAGE_SHIFT);
+			unsigned int offset = offset_in_page(f->offset);
+			size_t copied;
+
+			if (write)
+				copied = copy_page_from_iter(page, offset, f->length, iter);
+			else
+				copied = copy_page_to_iter(page, offset, f->length, iter);
+			addr += copied;
+			len -= copied;
+			if (copied < f->length && iov_iter_count(iter)) {
+				ret = -EFAULT;
+				break;
+			}
+		}
+		release_user_fragments(fragments, got, write);
+		if (ret)
+			break;
+	}
+	if (fragments != stack)
+		kfree(fragments);
+	return ret;
+}
+#endif
+
 /**
  * process_vm_rw_core - core of reading/writing pages from task specified
  * @pid: PID of process to read/write from/to
@@ -182,17 +242,6 @@ static ssize_t process_vm_rw_core(pid_t pid, struct iov_iter *iter,
 	if (nr_pages == 0)
 		return 0;
 
-	if (nr_pages > PVM_MAX_PP_ARRAY_COUNT) {
-		/* For reliability don't try to kmalloc more than
-		   2 pages worth */
-		process_pages = kmalloc(min_t(size_t, PVM_MAX_KMALLOC_PAGES * PAGE_SIZE,
-					      sizeof(struct page *)*nr_pages),
-					GFP_KERNEL);
-
-		if (!process_pages)
-			return -ENOMEM;
-	}
-
 	/* Get process information */
 	task = find_get_task_by_vpid(pid);
 	if (!task) {
@@ -212,11 +261,35 @@ static ssize_t process_vm_rw_core(pid_t pid, struct iov_iter *iter,
 		goto put_task_struct;
 	}
 
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(mm) != PAGE_SIZE) {
+		for (i = 0; i < riovcnt && iov_iter_count(iter) && !rc; i++)
+			rc = process_vm_rw_fragments(mm, (unsigned long)rvec[i].iov_base,
+						rvec[i].iov_len, iter, vm_write);
+		goto copied;
+	}
+#endif
+	if (nr_pages > PVM_MAX_PP_ARRAY_COUNT) {
+		/* For reliability don't try to kmalloc more than
+		   2 pages worth */
+		process_pages = kmalloc(min_t(size_t, PVM_MAX_KMALLOC_PAGES * PAGE_SIZE,
+					      sizeof(struct page *)*nr_pages),
+					GFP_KERNEL);
+
+		if (!process_pages) {
+			rc = -ENOMEM;
+			goto put_mm;
+		}
+	}
+
 	for (i = 0; i < riovcnt && iov_iter_count(iter) && !rc; i++)
 		rc = process_vm_rw_single_vec(
 			(unsigned long)rvec[i].iov_base, rvec[i].iov_len,
 			iter, process_pages, mm, task, vm_write);
 
+#ifdef CONFIG_MM_SUBPAGE
+copied:
+#endif
 	/* copied = space before - space after */
 	total_len -= iov_iter_count(iter);
 
@@ -226,6 +299,7 @@ static ssize_t process_vm_rw_core(pid_t pid, struct iov_iter *iter,
 	if (total_len)
 		rc = total_len;
 
+put_mm:
 	mmput(mm);
 
 put_task_struct:

@@ -32,6 +32,8 @@ struct swap_iocb;
  * isn't directly visible to userspace.
  */
 #define SHMEM_F_MAPPING_FROZEN	BIT(2)
+/* This inode has used sub-native shared-page validity. */
+#define SHMEM_F_UFFD_SUBPAGE	BIT(3)
 
 struct shmem_inode_info {
 	spinlock_t		lock;
@@ -52,6 +54,10 @@ struct shmem_inode_info {
 	pgoff_t			fallocend;	/* highest fallocate endindex */
 	unsigned int		fsflags;	/* for FS_IOC_[SG]ETFLAGS */
 	atomic_t		stop_eviction;	/* hold when working on inode */
+#if defined(CONFIG_SHMEM) && defined(CONFIG_MM_SUBPAGE) && defined(CONFIG_USERFAULTFD)
+	/* Swapped missing 4K units, keyed by native cache index. */
+	struct xarray		uffd_missing;
+#endif
 #ifdef CONFIG_TMPFS_QUOTA
 	struct dquot __rcu	*i_dquot[MAXQUOTAS];
 #endif
@@ -113,13 +119,56 @@ extern unsigned long shmem_get_unmapped_area(struct file *, unsigned long addr,
 		unsigned long len, unsigned long pgoff, unsigned long flags);
 extern int shmem_lock(struct file *file, int lock, struct ucounts *ucounts);
 #ifdef CONFIG_SHMEM
+struct folio *shmem_alloc_collapse_folio(struct mm_struct *mm, struct inode *inode,
+				       pgoff_t index, unsigned int order);
 bool shmem_mapping(const struct address_space *mapping);
 #else
+static inline struct folio *shmem_alloc_collapse_folio(struct mm_struct *mm,
+		struct inode *inode, pgoff_t index, unsigned int order)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
 static inline bool shmem_mapping(const struct address_space *mapping)
 {
 	return false;
 }
 #endif /* CONFIG_SHMEM */
+#if defined(CONFIG_SHMEM) && defined(CONFIG_MM_SUBPAGE) && defined(CONFIG_USERFAULTFD)
+/* Return a locked cache folio and caller reference; new backing is all missing. */
+struct folio *shmem_uffd_prepare_folio(struct vm_area_struct *vma,
+				    unsigned long address, bool *new);
+void shmem_uffd_abort_folio(struct folio *folio, struct vm_area_struct *vma, bool new);
+bool shmem_uffd_has_missing_native_page(struct folio *folio);
+bool shmem_uffd_range_missing(struct folio *folio, pgoff_t index,
+			      unsigned int offset, unsigned long length);
+/* Resident masks require no allocation; inode metadata persists only in swap. */
+void shmem_uffd_copy_page(struct page *dst, struct page *src);
+void shmem_uffd_migrate(struct folio *dst, struct folio *src);
+/* Locked, uptodate cache folio. */
+unsigned long shmem_uffd_missing_mask(struct folio *folio, pgoff_t index);
+int shmem_uffd_set_missing(struct folio *folio, pgoff_t index,
+			   unsigned long missing);
+/* Clear populated units; no allocation. Caller holds the folio lock. */
+void shmem_uffd_mark_present(struct folio *folio, pgoff_t index,
+			     unsigned long present);
+/* Mark exactly the byte range exposed by a mapping; folio lock held. */
+void shmem_uffd_mark_mapped(struct folio *folio, unsigned long offset,
+			    unsigned long length);
+/* i_pages lock held; deletion, not replacement by swap or migration. */
+void shmem_uffd_forget(struct address_space *mapping, pgoff_t start,
+		       unsigned long nr);
+#else
+static inline void shmem_uffd_copy_page(struct page *dst, struct page *src) { }
+static inline void shmem_uffd_migrate(struct folio *dst, struct folio *src) { }
+static inline bool shmem_uffd_has_missing_native_page(struct folio *folio) { return false; }
+static inline bool shmem_uffd_range_missing(struct folio *folio, pgoff_t index,
+		unsigned int offset, unsigned long length) { return false; }
+static inline void shmem_uffd_mark_mapped(struct folio *folio,
+		unsigned long offset, unsigned long length) { }
+static inline void shmem_uffd_forget(struct address_space *mapping,
+				   pgoff_t start, unsigned long nr) { }
+#endif
+
 void shmem_unlock_mapping(struct address_space *mapping);
 struct page *shmem_read_mapping_page_gfp(struct address_space *mapping,
 					pgoff_t index, gfp_t gfp_mask);
@@ -160,6 +209,8 @@ static inline void shmem_uncharge(struct inode *inode, long pages)
 {
 }
 #endif
+unsigned long shmem_partial_swap_usage_bytes(struct address_space *mapping,
+					    u64 start, u64 end);
 extern unsigned long shmem_partial_swap_usage(struct address_space *mapping,
 						pgoff_t start, pgoff_t end);
 
