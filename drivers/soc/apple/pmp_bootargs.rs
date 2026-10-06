@@ -130,12 +130,18 @@ mod tests {
 
     #[test]
     fn integer_width_bounds() {
+        let value = [0xd4, 0xc3, 0xb2, 0xa1, 0, 0, 0, 0];
         for size in 0..=16 {
             let mut bytes = Vec::new();
             record(&mut bytes, BDID, &vec![0xff; size]);
             let expected = bytes.clone();
-            assert_eq!(patch(&mut bytes, &[(BDID, 7)]), (1..=8).contains(&size));
-            if !(1..=8).contains(&size) {
+            assert_eq!(
+                patch(&mut bytes, &[(BDID, 0xa1b2c3d4)]),
+                (1..=8).contains(&size)
+            );
+            if (1..=8).contains(&size) {
+                assert_eq!(&bytes[8..], &value[..size]);
+            } else {
                 assert_eq!(bytes, expected);
             }
         }
