@@ -25,6 +25,8 @@
 #include <linux/splice.h>
 #include <linux/memcontrol.h>
 #include <linux/mm_inline.h>
+#include <linux/mm_subpage.h>
+#include <linux/refcount.h>
 #include <linux/swap.h>
 #include <linux/writeback.h>
 #include <linux/export.h>
@@ -183,6 +185,79 @@ static void wakeup_pipe_readers(struct pipe_inode_info *pipe)
 	kill_fasync(&pipe->fasync_readers, SIGIO, POLL_IN);
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+/* A shared lifetime for all user leaves coalesced into one native pipe page. */
+struct subpage_pipe_refs {
+	refcount_t refs;
+	unsigned int count;
+	struct user_page_fragment fragments[];
+};
+
+static void subpage_pipe_buf_release(struct pipe_inode_info *pipe, struct pipe_buffer *buf)
+{
+	struct subpage_pipe_refs *refs = (void *)buf->private;
+
+	if (refcount_dec_and_test(&refs->refs)) {
+		release_user_fragments(refs->fragments, refs->count, false);
+		kfree(refs);
+	}
+}
+
+static bool subpage_pipe_buf_get(struct pipe_inode_info *pipe, struct pipe_buffer *buf)
+{
+	struct subpage_pipe_refs *refs = (void *)buf->private;
+
+	return refcount_inc_not_zero(&refs->refs);
+}
+
+static const struct pipe_buf_operations subpage_pipe_buf_ops = {
+	.release = subpage_pipe_buf_release,
+	.get = subpage_pipe_buf_get,
+	/* A gift of user leaves is not ownership of the containing native page. */
+};
+
+static int subpage_pipe_buf_retain(struct pipe_buffer *buf)
+{
+	struct subpage_pipe_refs *refs;
+	unsigned int pos, count = 0;
+
+	if (!buf->len || buf->ops != &nosteal_pipe_buf_ops ||
+	    !folio_test_anon(page_folio(buf->page)))
+		return 0;
+	refs = kmalloc(struct_size(refs, fragments, PAGE_SIZE / MM_SUBPAGE_SIZE), GFP_KERNEL);
+	if (!refs)
+		return -ENOMEM;
+	for (pos = round_down(buf->offset, MM_SUBPAGE_SIZE);
+	     pos < buf->offset + buf->len; pos += MM_SUBPAGE_SIZE) {
+		struct mm_subpage *slot = mm_subpage_get_from_phys(page_to_phys(buf->page) + pos);
+
+		if (!slot) {
+			release_user_fragments(refs->fragments, count, false);
+			kfree(refs);
+			return count ? -EFAULT : 0;
+		}
+		refs->fragments[count++] = (struct user_page_fragment) {
+			.folio = page_folio(buf->page),
+			.subpage = slot,
+			.offset = pos,
+			.length = MM_SUBPAGE_SIZE,
+		};
+	}
+	refcount_set(&refs->refs, 1);
+	refs->count = count;
+	/* Replace the incoming native reference with the typed references. */
+	put_page(buf->page);
+	buf->ops = &subpage_pipe_buf_ops;
+	buf->private = (unsigned long)refs;
+	return 0;
+}
+#else
+static int subpage_pipe_buf_retain(struct pipe_buffer *buf)
+{
+	return 0;
+}
+#endif
+
 /**
  * splice_to_pipe - fill passed data into a pipe
  * @pipe:	pipe to fill
@@ -221,6 +296,16 @@ ssize_t splice_to_pipe(struct pipe_inode_info *pipe,
 		buf->private = spd->partial[page_nr].private;
 		buf->ops = spd->ops;
 		buf->flags = 0;
+		{
+			int err = subpage_pipe_buf_retain(buf);
+
+			if (err) {
+				buf->ops = NULL;
+				if (!ret)
+					ret = err;
+				break;
+			}
+		}
 
 		head++;
 		pipe->head = head;
@@ -852,6 +937,16 @@ ssize_t splice_to_socket(struct pipe_inode_info *pipe, struct file *out,
 				continue;
 			}
 
+#ifdef CONFIG_MM_SUBPAGE
+			/* Other transports still need their downstream lifetime audit. */
+			if (buf->ops == &subpage_pipe_buf_ops &&
+			    sock->ops->family != AF_UNIX &&
+			    sock->ops->family != AF_INET &&
+			    sock->ops->family != AF_INET6) {
+				ret = -EOPNOTSUPP;
+				break;
+			}
+#endif
 			seg = min_t(size_t, remain, buf->len);
 
 			ret = pipe_buf_confirm(pipe, buf);
@@ -1440,6 +1535,79 @@ static ssize_t __do_splice(struct file *in, loff_t __user *off_in,
 	return ret;
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+static ssize_t subpage_iter_to_pipe(struct iov_iter *from,
+				   struct pipe_inode_info *pipe, unsigned int flags)
+{
+	struct user_page_fragment fragments[16];
+	size_t total = 0;
+	long ret = 0;
+
+	if (WARN_ON_ONCE(!user_backed_iter(from)))
+		return -EINVAL;
+	while (iov_iter_count(from)) {
+		unsigned int i = 0;
+		long count;
+
+		/* Normalize empty iovecs before taking the next address. */
+		iov_iter_advance(from, 0);
+		count = get_user_fragments_remote(current->mm,
+			(unsigned long)iter_iov_addr(from),
+			min(iov_iter_count(from), iter_iov_len(from)), 0,
+			fragments, ARRAY_SIZE(fragments));
+		if (count <= 0) {
+			ret = count;
+			break;
+		}
+		while (i < count) {
+			struct user_page_fragment *first = &fragments[i];
+			struct page *page = folio_page(first->folio, first->offset >> PAGE_SHIFT);
+			unsigned int offset = offset_in_page(first->offset);
+			unsigned int length = first->length, nr = 1;
+			struct subpage_pipe_refs *refs;
+			struct pipe_buffer buf;
+
+			/* Preserve native pipe capacity for contiguous packed quarters. */
+			while (i + nr < count && length < PAGE_SIZE - offset) {
+				struct user_page_fragment *next = &fragments[i + nr];
+
+				if (folio_page(next->folio, next->offset >> PAGE_SHIFT) != page ||
+				    offset_in_page(next->offset) != offset + length)
+					break;
+				length += next->length;
+				nr++;
+			}
+			refs = kmalloc(struct_size(refs, fragments, nr), GFP_KERNEL);
+			if (!refs) {
+				ret = -ENOMEM;
+				break;
+			}
+			refcount_set(&refs->refs, 1);
+			refs->count = nr;
+			memcpy(refs->fragments, first, sizeof(*first) * nr);
+			buf = (struct pipe_buffer) {
+				.page = page,
+				.offset = offset,
+				.len = length,
+				.ops = &subpage_pipe_buf_ops,
+				.flags = flags,
+				.private = (unsigned long)refs,
+			};
+			i += nr; /* add_to_pipe consumes these references even on failure. */
+			ret = add_to_pipe(pipe, &buf);
+			if (ret < 0)
+				break;
+			iov_iter_advance(from, ret);
+			total += ret;
+		}
+		release_user_fragments(fragments + i, count - i, false);
+		if (ret < 0)
+			break;
+	}
+	return total ? total : ret;
+}
+#endif
+
 static ssize_t iter_to_pipe(struct iov_iter *from,
 			    struct pipe_inode_info *pipe,
 			    unsigned int flags)
@@ -1451,6 +1619,10 @@ static ssize_t iter_to_pipe(struct iov_iter *from,
 	size_t total = 0;
 	ssize_t ret = 0;
 
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(current->mm) != PAGE_SIZE)
+		return subpage_iter_to_pipe(from, pipe, flags);
+#endif
 	while (iov_iter_count(from)) {
 		struct page *pages[16];
 		ssize_t left;
