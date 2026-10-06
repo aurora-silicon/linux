@@ -6,8 +6,9 @@ m1n1 package this release names, by its file name always, and by its
 content when the file is at hand (AURORA_M1N1_PKG, or the release staging
 directory). ReleaseUrlTest and StagedCopyTest cover the staging or mirror
 override (AURORA_RELEASE_URL, AURORA_RELEASES_API): the default is the
-release's own tag, and a staged copy installs through the same download and
-checksum loop. UpgradeTest runs 11.38's own script on the fake Mac of
+release's own tag, a staged copy installs through the same download and
+checksum loop, and the commands an install prints name the public release.
+UpgradeTest runs 11.38's own script on the fake Mac of
 test_m3_flow, then this one, as an owner updating would.
 """
 from pathlib import Path
@@ -136,6 +137,13 @@ class ReleaseUrlTest(unittest.TestCase):
         self.assertEqual(self.urls(AURORA_RELEASE_URL="file:///srv/stage", AURORA_RELEASES_API="http://127.0.0.1:8000/api"),
                          ["file:///srv/stage", "http://127.0.0.1:8000/api"])
 
+    def test_printed_commands_name_the_public_release(self):
+        # The commands an install prints stay on the public tag under an override.
+        proc = sourced('printf "%s\\n" "$PUBLIC_RELEASE_URL"',
+                       AURORA_RELEASE_URL="file:///srv/stage", AURORA_RELEASES_API="http://127.0.0.1:8000/api")
+        self.assertEqual(proc.stdout.splitlines(), [DEFAULT_RELEASE_URL], proc.stderr)
+        self.assertNotRegex(SRC, r"echo .*\$RELEASE_URL")
+
     def test_releases_api_override(self):
         if not shutil.which("curl"):
             self.skipTest("curl is needed")
@@ -164,7 +172,17 @@ class StagedCopyTest(flow.M3FlowBase):
 
     def test_install_from_a_staged_copy(self):
         self.mac("j293")
-        self.install()
+        proc = self.install()
+        # Every command it prints names the public release, not the stage.
+        printed = proc.stdout + proc.stderr
+        script = f"curl -fsSL {DEFAULT_RELEASE_URL}/install-aurora-sep.sh | bash -s -- "
+        self.assertIn(script + "--agent-prompt", printed)
+        self.assertIn("To undo everything:    " + script + "--uninstall", printed)
+        commands = [l for l in printed.splitlines() if "curl " in l]
+        self.assertTrue(commands)
+        for line in commands:
+            self.assertIn("https://github.com/iconidentify/aurora-linux/releases/", line)
+            self.assertNotIn(self.stage.as_uri(), line)
         self.assertTrue(self.boot.read_bytes().startswith(b"M1N1:" + flow.M1N1_BASE.encode() + b"\n"))
         self.assertIn("linux-aurora", (self.fake / "installed").read_text().split())
 

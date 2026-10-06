@@ -161,11 +161,15 @@ VERSION=7.1.12.aurora2-12.0
 TAG=sep-7.1.12.aurora2-12.0
 # Packages are fetched from this script's own tag, never from "latest": the
 # checksums below belong to this release and nothing else.
+PUBLIC_RELEASE_URL=https://github.com/iconidentify/aurora-linux/releases/download/$TAG
+PUBLIC_RELEASES_API=https://api.github.com/repos/iconidentify/aurora-linux/releases
 # AURORA_RELEASE_URL and AURORA_RELEASES_API are a staging or mirror override
 # for these two (any URL curl takes, file:// included); the checksums below
-# still decide what is installed.
-RELEASE_URL=${AURORA_RELEASE_URL:-https://github.com/iconidentify/aurora-linux/releases/download/$TAG}
-RELEASES_API=${AURORA_RELEASES_API:-https://api.github.com/repos/iconidentify/aurora-linux/releases}
+# still decide what is installed. Every command this script prints names
+# PUBLIC_RELEASE_URL, never the override: a staged copy can go away, and the
+# script itself is not covered by the checksums.
+RELEASE_URL=${AURORA_RELEASE_URL:-$PUBLIC_RELEASE_URL}
+RELEASES_API=${AURORA_RELEASES_API:-$PUBLIC_RELEASES_API}
 # Where to always get the current script, whatever this copy turns out to be.
 LATEST_URL=https://github.com/iconidentify/aurora-linux/releases/latest/download/install-aurora-sep.sh
 PACKAGES=(
@@ -1706,11 +1710,11 @@ install_all() {
     echo "   This Mac keeps the boot loader it has: the m1n1 that failed on it is not put back."
   fi
   echo "   Testing this build? The plan and reporting format:"
-  echo "      curl -fsSL $RELEASE_URL/install-aurora-sep.sh | bash -s -- --agent-prompt"
+  echo "      curl -fsSL $PUBLIC_RELEASE_URL/install-aurora-sep.sh | bash -s -- --agent-prompt"
   if [[ $chain == grub ]]; then
     echo "   The previous kernel stays in the GRUB menu as 'Previous kernel … before aurora-sep'."
   fi
-  echo "   To undo everything:    curl -fsSL $RELEASE_URL/install-aurora-sep.sh | bash -s -- --uninstall"
+  echo "   To undo everything:    curl -fsSL $PUBLIC_RELEASE_URL/install-aurora-sep.sh | bash -s -- --uninstall"
 }
 
 uninstall_all() {
