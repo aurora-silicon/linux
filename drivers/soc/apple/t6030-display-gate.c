@@ -1133,6 +1133,16 @@ static void __init gate_ext_refuse(struct device_node *dcp, const char *why)
 		  ret ? "; its Type-C routes could not be disabled" : "");
 }
 
+/* The firmware the display driver runs external processors with. */
+static bool __init gate_ext_firmware_ok(struct device_node *np)
+{
+	u32 ver[3];
+
+	return of_property_count_u32_elems(np, "apple,firmware-compat") == 3 &&
+	       !of_property_read_u32_array(np, "apple,firmware-compat", ver, 3) &&
+	       ver[0] == 14 && ver[1] == 7 && ver[2] == 0;
+}
+
 static void __init gate_dcpext_one(struct device_node *np, const char *refuse)
 {
 	struct gate_ext ext = { .dcp = of_node_get(np) };
@@ -1154,6 +1164,15 @@ static void __init gate_dcpext_one(struct device_node *np, const char *refuse)
 	}
 	if (ret) {
 		gate_ext_refuse(np, "power, memory or PMP prerequisites are not described");
+		goto put;
+	}
+	/*
+	 * The display driver refuses any other firmware at probe. Its Type-C
+	 * routes would then never register, and every port that lists them
+	 * would wait for them.
+	 */
+	if (!gate_ext_firmware_ok(np)) {
+		gate_ext_refuse(np, "its firmware-compat is not 14.7.0");
 		goto put;
 	}
 	if (gate_scanout_requested) {
