@@ -624,6 +624,8 @@ struct atcphy_mode_configuration {
  *                     generation has none) and the SuperSpeed tunables; USB2
  *                     still works without the latter
  * @dp_t8122: DisplayPort runs the T8122 AUX, AUSPLL and lane sequences
+ * @park_pipe_unlocked: Park the PIPE without the lock handshake once the USB
+ *                      controller has stopped and no longer clocks the PIPE
  */
 struct atcphy_hw {
 	enum atcphy_generation gen;
@@ -633,6 +635,7 @@ struct atcphy_hw {
 	bool has_usb2phy_reg;
 	bool optional_tunables;
 	bool dp_t8122;
+	bool park_pipe_unlocked;
 };
 
 /**
@@ -1355,7 +1358,7 @@ static void atcphy_enable_dummy_phy(struct apple_atcphy *atcphy)
 	      PIPEHANDLER_DUMMY_PHY_EN);
 }
 
-static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy)
+static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy, bool lock)
 {
 	int ret;
 
@@ -1369,17 +1372,21 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy)
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXVALID);
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXDETECT);
 
-	ret = atcphy_pipehandler_lock(atcphy);
-	if (ret)
-		dev_warn(atcphy->dev, "Failed to lock pipehandler");
+	if (lock) {
+		ret = atcphy_pipehandler_lock(atcphy);
+		if (ret)
+			dev_warn(atcphy->dev, "Failed to lock pipehandler");
+	}
 
 	/* Switch to dummy PHY */
 	atcphy_pipehandler_set_mux(atcphy, PIPEHANDLER_MUX_CTRL_DATA_DUMMY,
 				   PIPEHANDLER_MUX_CTRL_CLK_DUMMY);
 
-	ret = atcphy_pipehandler_unlock(atcphy);
-	if (ret)
-		dev_warn(atcphy->dev, "Failed to unlock pipehandler");
+	if (lock) {
+		ret = atcphy_pipehandler_unlock(atcphy);
+		if (ret)
+			dev_warn(atcphy->dev, "Failed to unlock pipehandler");
+	}
 
 	mask32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
 	       PIPEHANDLER_NATIVE_POWER_DOWN, FIELD_PREP(PIPEHANDLER_NATIVE_POWER_DOWN, 2));
@@ -1411,7 +1418,7 @@ static int atcphy_configure_pipehandler(struct apple_atcphy *atcphy, bool host)
 		ret = atcphy_configure_pipehandler_usb4(atcphy);
 		break;
 	case ATCPHY_PIPEHANDLER_STATE_DUMMY:
-		ret = atcphy_configure_pipehandler_dummy(atcphy);
+		ret = atcphy_configure_pipehandler_dummy(atcphy, true);
 		break;
 	}
 	atcphy->pipe_state = state;
@@ -1419,9 +1426,17 @@ static int atcphy_configure_pipehandler(struct apple_atcphy *atcphy, bool host)
 	return ret;
 }
 
-/* Route the PIPE back to the dummy backend unless it is there already */
-static void atcphy_park_pipehandler(struct apple_atcphy *atcphy)
+/*
+ * Route the PIPE back to the dummy backend unless it is there already.
+ * @stopped: the USB controller has exited (SUSPHY set) or is held in reset
+ *
+ * The lock handshake is acknowledged from the PIPE clock, which a stopped
+ * controller no longer runs, so the request times out. On PHYs with
+ * park_pipe_unlocked the mux is then switched without it.
+ */
+static void atcphy_park_pipehandler(struct apple_atcphy *atcphy, bool stopped)
 {
+	bool lock = !(stopped && atcphy->hw->park_pipe_unlocked);
 	int ret;
 
 	lockdep_assert_held(&atcphy->lock);
@@ -1429,7 +1444,9 @@ static void atcphy_park_pipehandler(struct apple_atcphy *atcphy)
 	if (atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY)
 		return;
 
-	ret = atcphy_configure_pipehandler_dummy(atcphy);
+	if (!lock)
+		dev_dbg(atcphy->dev, "Parking the PIPE of a stopped controller\n");
+	ret = atcphy_configure_pipehandler_dummy(atcphy, lock);
 	if (ret)
 		dev_warn(atcphy->dev, "Failed to switch PIPE to dummy: %d\n", ret);
 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
@@ -3076,7 +3093,7 @@ static int atcphy_usb3_power_off(struct phy *phy)
 
 	guard(mutex)(&atcphy->lock);
 
-	atcphy_park_pipehandler(atcphy);
+	atcphy_park_pipehandler(atcphy, true);
 	atcphy->host_active = false;
 
 	if (atcphy->mode != APPLE_ATCPHY_MODE_OFF)
@@ -3370,7 +3387,7 @@ static int atcphy_dwc3_reset_assert(struct reset_controller_dev *rcdev, unsigned
 	guard(mutex)(&atcphy->lock);
 
 	_atcphy_dwc3_reset_assert(atcphy);
-	atcphy_park_pipehandler(atcphy);
+	atcphy_park_pipehandler(atcphy, true);
 	atcphy->host_active = false;
 	atcphy_usb2_power_off(atcphy);
 
@@ -3560,7 +3577,7 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 		 * afterwards while dwc3 is up in host mode.
 		 */
 		if (pipe_state != ATCPHY_PIPEHANDLER_STATE_USB3)
-			atcphy_park_pipehandler(atcphy);
+			atcphy_park_pipehandler(atcphy, false);
 
 		ret = atcphy_configure(atcphy, target_mode);
 		if (ret)
@@ -3925,6 +3942,7 @@ static const struct atcphy_hw atcphy_hw_t8122 = {
 	.aciophy_crossbar = ACIOPHY_CROSSBAR_T8122,
 	.has_usb4 = true,
 	.dp_t8122 = true,
+	.park_pipe_unlocked = true,
 };
 
 static const struct atcphy_hw atcphy_hw_t8140 = {
