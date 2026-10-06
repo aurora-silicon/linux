@@ -335,6 +335,12 @@ M3_BOOTBIN_SHA=""
 # by default; no Air is listed yet.
 M3_HANDOFF_BOARDS="j516s"
 M3_SWITCHES="chosen.asahi,t6030-gpu=1 chosen.asahi,t6030-dcp=1 chosen.asahi,t6030-dcpext=1"
+# The M3 Pro handoff's name in $STATE/m3-mode. A plain run keeps the handoff on
+# an M3 Pro that is not in M3_HANDOFF_BOARDS only while this matches, so it
+# changes with each m1n1 that changes what a Pro boots: a J514S that opted in
+# on an earlier release (t6030: aurora7 or 8.x) moves to this release's m1n1
+# only with a new --m3-handoff. A listed Pro moves with the release.
+M3_PRO_VARIANT="t6030-12"
 # The M3 MacBook Air's handoff switches, for a later build that starts the
 # Air's GPU (M3_AIR_DRY_RUN=0): the GPU alone, or with M3_AIR_DCP=1 the
 # display too, once m1n1's T8122 DCP handoff has been booted on an Air.
@@ -359,7 +365,7 @@ M3_AIR_DCP=0
 # (air-display-handoff, aurora8.3 and 8.4) moves to this one only with a new
 # --m3-handoff.
 M3_AIR_DISPLAY_HANDOFF=1
-M3_AIR_DISPLAY_VARIANT="air-display-handoff-85"
+M3_AIR_DISPLAY_VARIANT="air-display-handoff-12"
 M3_AIR_DRY_RUN=1
 M3_AIR_DRY_RUN_SWITCHES="chosen.asahi,t8122-gpu-diag=1 chosen.asahi,t8122-gpu-handoff-diag=1 chosen.asahi,t8122-gpu-power-diag=1 chosen.asahi,t8122-dcp=1"
 # The handoff is tested with one macOS system-firmware stub only, 14.8.3 (GPU
@@ -816,7 +822,7 @@ m3_recorded_mode() {
 # so a later release never turns one kind of Air test into another (a dry run
 # into a GPU start) without a new --m3-handoff.
 m3_variant() {
-  if ! is_m3_air; then echo t6030
+  if ! is_m3_air; then echo "$M3_PRO_VARIANT"
   elif [[ $M3_AIR_DISPLAY_HANDOFF == 1 ]]; then echo "$M3_AIR_DISPLAY_VARIANT"
   elif [[ $M3_AIR_DRY_RUN == 1 ]]; then echo air-dry-run
   elif [[ $M3_AIR_DCP == 1 ]]; then echo air-gpu-dcp
@@ -833,7 +839,7 @@ m3_recorded_variant() {
 # Decide the M3 path before anything is downloaded, so a Mac this release can't
 # set up as asked stops with nothing changed.
 m3_plan() {
-  local board problem failed again="run this again" air=0
+  local board problem failed variant again="run this again" air=0
   M3_MODE=none
   if ! is_m3; then
     ((M3_TRY == 0)) || die "--m3-handoff is for an M3 Pro or an M3 MacBook Air, and this Mac isn't an M3. Nothing was installed."
@@ -877,6 +883,17 @@ m3_plan() {
     ($(m3_recorded_variant)), and this release's Air boot loader is a different one: the
     $(m3_handoff_name) ($(m3_variant)). Run this again with --m3-handoff to switch to it.
     Nothing was installed."
+    fi
+    # The same for an M3 Pro that is not on the list: it opted in to an
+    # earlier m1n1, not to this one.
+    variant=$(m3_recorded_variant)
+    if is_m3_pro && ! is_m3_handoff_board && [[ $variant != "$(m3_variant)" ]]; then
+      die "M3 Pro ($board): this Mac has m1n1's display and GPU handoff from an earlier release
+    (${variant:-no variant recorded}), and this release's m1n1 is a newer one ($(m3_variant)) that
+    nobody has booted on this model yet. Nothing was installed; this Mac keeps the boot loader
+    and kernel it has. To switch to the new m1n1 (it replaces this Mac's boot loader, and the
+    steps to put the old one back follow), run this again with --m3-handoff:
+      curl -fsSL $LATEST_URL | bash -s -- --m3-handoff"
     fi
     M3_TRY=1
     if ((air)); then
@@ -2258,6 +2275,8 @@ fingerprint.
             it "<board> (<model>): M3 handoff works". This report is what
             adds the model to the list in the next release; until then a
             plain re-run of the one-liner keeps the handoff on this Mac.
+            A release with a newer m1n1 asks again: its plain run stops
+            with "run this again with --m3-handoff" and changes nothing.
           * STOPS: m1n1 text and no boot menu, or a black screen for more than
             two minutes. Follow "IF THE MAC STOPS IN m1n1" above, and report
             what the screen showed and when.

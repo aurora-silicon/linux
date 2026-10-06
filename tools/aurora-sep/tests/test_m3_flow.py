@@ -25,6 +25,8 @@ VERSION = re.search(r"^VERSION=(\S+)$", SRC, re.M).group(1)
 # The one m1n1 package every Mac gets, by the name this release ships.
 M1N1_PKG = re.search(r'^M1N1_PACKAGE="(\S+) ', SRC, re.M).group(1)
 M1N1_BASE = M1N1_PKG[:-len("-aarch64.pkg.tar.zst")]
+# What $STATE/m3-mode records for an M3 Pro on this release's m1n1.
+PRO_VARIANT = re.search(r'^M3_PRO_VARIANT="([^"]*)"$', SRC, re.M).group(1)
 # Every switch name the shipped m1n1 has to know: the M3 Pro's and the Air's.
 SWITCH_NAMES = sorted({w[len("chosen."):].split("=")[0]
                        for w in re.findall(r"chosen\.asahi,t(?:6030|8122)-[a-z0-9-]+=1", SRC)})
@@ -277,7 +279,7 @@ class M3FlowTest(M3FlowBase):
         self.assertTrue(boot.endswith(SWITCHES), boot[-200:])
         self.assertEqual([d for d in self.downloaded() if d.startswith("m1n1-")], [M1N1_PKG])
         self.assertEqual(self.kept_copy().read_bytes(), b"M1N1:original\n")
-        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff t6030")
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), f"handoff {PRO_VARIANT}")
         self.assertFalse(self.update_conf.read_text().count("M1N1_UPDATE_DISABLED"))
 
         self.uninstall()
@@ -367,7 +369,7 @@ class M3FlowTest(M3FlowBase):
         # record) keeps its boot.bin as it is: nothing is downloaded or rebuilt.
         self.mac("j516s")
         self.install()
-        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff t6030")
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), f"handoff {PRO_VARIANT}")
         self.mac("j516s", kernel="linux-aurora", bootbin=self.boot.read_bytes(), stage1="v1.7.0")
         before = self.boot.read_bytes()
         before_log = self.log()
@@ -424,12 +426,53 @@ class M3FlowTest(M3FlowBase):
         self.install(try_=1)
         out = self.install().stdout
         self.assertIn("keeping it", out)
-        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff t6030")
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), f"handoff {PRO_VARIANT}")
         self.assertTrue(self.boot.read_bytes().endswith(SWITCHES))
         self.assertNotIn("M1N1_UPDATE_DISABLED", self.update_conf.read_text())
         self.uninstall()
         self.assertTrue(self.boot.read_bytes().startswith(b"M1N1:m1n1-stock\n"))
         self.assertFalse(self.m1n1_conf.exists())
+
+    def test_m3_pro_variant_shipped(self):
+        # A release decision: change it with each m1n1 that changes what an
+        # M3 Pro boots. 11.36.1 to 11.38 recorded t6030 (or nothing).
+        self.assertRegex(PRO_VARIANT, r"^t6030-\S+$")
+
+    def test_unlisted_pro_on_an_earlier_m1n1_needs_a_new_opt_in(self):
+        # A J514S that took --m3-handoff on 11.37 or 11.38 runs this
+        # release's plain one-liner: nothing moves it to the new m1n1.
+        for recorded in ("handoff t6030", "handoff"):
+            with self.subTest(recorded=recorded):
+                self.fresh_state()
+                self.mac("j514s")
+                self.install(try_=1)
+                (self.state / "m3-mode").write_text(recorded + "\n")
+                (self.state / "m1n1-installed").unlink()
+                before = self.boot.read_bytes()
+                before_conf = self.m1n1_conf.read_bytes()
+                log = self.log()
+                proc = self.install(check=False)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("nobody has booted on this model yet", " ".join(proc.stderr.split()))
+                self.assertIn("bash -s -- --m3-handoff", proc.stderr)
+                self.assertIn("Nothing was installed", proc.stderr)
+                self.assertNotIn("keeping it", proc.stdout)
+                self.assertNotIn("--m3-handoff: trying", proc.stderr)
+                self.assertEqual(self.boot.read_bytes(), before)
+                self.assertEqual(self.m1n1_conf.read_bytes(), before_conf)
+                self.assertNotIn("curl ", self.log()[len(log):])
+                # Asked for, it moves; later plain runs keep it.
+                self.install(try_=1)
+                self.assertEqual((self.state / "m3-mode").read_text().strip(), f"handoff {PRO_VARIANT}")
+                self.assertIn("keeping it", self.install().stdout)
+
+    def test_listed_pro_on_an_earlier_m1n1_moves_with_the_release(self):
+        self.mac("j516s")
+        self.install()
+        (self.state / "m3-mode").write_text("handoff t6030\n")
+        self.install()
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), f"handoff {PRO_VARIANT}")
+        self.assertTrue(self.boot.read_bytes().endswith(SWITCHES))
 
     def test_failed_install_then_uninstall_keeps_the_bringup(self):
         handbuilt = b"M1N1:bringup\nDTBS:hand\nUBOOT" + SWITCHES

@@ -464,7 +464,7 @@ class M3AirDryRunTest(M3AirTest):
         (self.state / "m3-mode").write_text("handoff\n")
         out = self.air_install().stdout
         self.assertIn("keeping it", out)
-        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff t6030")
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), f"handoff {flow.PRO_VARIANT}")
 
     def test_plain_rerun_updates_the_dry_run_m1n1(self):
         # Scott's path: an Air on 11.110-test's dry run takes a newer dry-run
