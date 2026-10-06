@@ -2605,6 +2605,7 @@ F:	drivers/dma/apple-admac.c
 F:	drivers/gpio/gpio-macsmc.c
 F:	drivers/hwmon/macsmc-hwmon.c
 F:	drivers/pmdomain/apple/
+F:	drivers/pmdomain/apple/.kunitconfig.apple-pmp
 F:	drivers/i2c/busses/i2c-pasemi-core.c
 F:	drivers/i2c/busses/i2c-pasemi-platform.c
 F:	drivers/input/misc/macsmc-input.c

@@ -30,6 +30,8 @@
 #include <linux/uuid.h>
 #include <linux/workqueue.h>
 
+#include "pmp-report-validation.h"
+
 #define PMP_REPORT_READY 0x1
 
 struct apple_pmp_report_offsets {
@@ -192,8 +194,6 @@ static int apple_pmp_temp_register(struct apple_pmp_report *rep)
 #define PMP_START_READY_TIMEOUT_MS	3000
 #define PMP_START_ACK_TIMEOUT_MS	1000
 
-#define FOURCC(a, b, c, d) ((u32)(a) << 24 | (u32)(b) << 16 | (u32)(c) << 8 | (u32)(d))
-
 static const struct {
 	const char *label;
 	/* The minimum state must already be "active". */
@@ -296,7 +296,7 @@ static int apple_pmp_t6030_check_sram(struct apple_pmp_report *rep, uuid_t *imag
 	void __iomem *sram;
 	resource_size_t sram_size;
 	const char *expected;
-	u32 offset, size, pos, found = 0;
+	u32 offset, size, pos;
 	u8 *args;
 	uuid_t want;
 	int ret = 0;
@@ -329,21 +329,9 @@ static int apple_pmp_t6030_check_sram(struct apple_pmp_report *rep, uuid_t *imag
 		goto out;
 	}
 	memcpy_fromio(args, sram + offset, size);
-	for (pos = 0; pos + 8 <= size;) {
-		u32 key = get_unaligned_le32(args + pos);
-		u32 len = get_unaligned_le32(args + pos + 4);
-
-		if (key == FOURCC('B', 'D', 'I', 'D'))
-			found |= BIT(0);
-		if (key == FOURCC('D', 'V', 'I', 'D'))
-			found |= BIT(1);
-		if (len > size - pos - 8)
-			break;
-		pos += 8 + len;
-	}
-	kfree(args);
-	if (found != (BIT(0) | BIT(1)))
+	if (!apple_pmp_bootargs_valid(args, size))
 		ret = -EINVAL;
+	kfree(args);
 out:
 	iounmap(sram);
 	return ret;
@@ -354,46 +342,19 @@ out:
  * must be where the offsets say, and each seeded device must be the one its
  * index names, acknowledged exactly when the node expects an acknowledgment.
  */
-#define PMP_SOC_DEVICE_SIZE	0x7c
-#define PMP_SOC_DEVICE_ACK	BIT(1)
-#define PMP_PTD_RANGE_SIZE	32
-#define PMP_PTD_RANGE_REQUEST	10
-#define PMP_PTD_RANGE_ACK	11
-
 static int apple_pmp_t6030_check_layout(struct apple_pmp_report *rep)
 {
 	const u8 *table;
-	unsigned int found = 0;
-	int len, i;
+	int len = 0;
 
 	table = of_get_property(rep->pmp, "apple,tunable-ptd-range", &len);
-	if (!table || len % PMP_PTD_RANGE_SIZE)
-		return -EINVAL;
-	for (i = 0; i < len; i += PMP_PTD_RANGE_SIZE) {
-		u32 id = get_unaligned_le32(table + i);
-		u32 base = get_unaligned_le32(table + i + 4);
-
-		if (id == PMP_PTD_RANGE_REQUEST && base * 16 == rep->offsets->tgt_read &&
-		    0x10000 + base * 8 == rep->offsets->tgt_write)
-			found |= BIT(0);
-		if (id == PMP_PTD_RANGE_ACK && base * 16 == rep->offsets->actual)
-			found |= BIT(1);
-	}
-	if (found != (BIT(0) | BIT(1)))
+	if (!apple_pmp_ranges_valid(table, len, rep->offsets->tgt_read,
+				    rep->offsets->tgt_write, rep->offsets->actual))
 		return -EINVAL;
 
 	table = of_get_property(rep->pmp, "apple,tunable-soc-device", &len);
-	if (!table || len % PMP_SOC_DEVICE_SIZE)
+	if (!apple_pmp_devices_valid(table, len, rep->seed, rep->ack, true))
 		return -EINVAL;
-	for (i = 0; i < 64; i++) {
-		const u8 *dev = table + i * PMP_SOC_DEVICE_SIZE;
-
-		if (!(rep->seed & BIT_ULL(i)))
-			continue;
-		if ((i + 1) * PMP_SOC_DEVICE_SIZE > len || get_unaligned_le32(dev) != i + 1 ||
-		    !(get_unaligned_le32(dev + 8) & PMP_SOC_DEVICE_ACK) != !(rep->ack & BIT_ULL(i)))
-			return -EINVAL;
-	}
 	return 0;
 }
 

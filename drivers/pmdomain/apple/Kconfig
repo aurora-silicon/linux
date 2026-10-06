@@ -21,3 +21,14 @@ config APPLE_PMP_REPORT
 	select PM_GENERIC_DOMAINS
 
 endif
+
+config APPLE_PMP_REPORT_KUNIT_TEST
+	tristate "Apple PMP report validation tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT && PM
+	select PM_GENERIC_DOMAINS
+	default KUNIT_ALL_TESTS
+	help
+	  Tests the PMP report layout, request acknowledgment flags and boot
+	  argument validation without accessing hardware.
+	  Includes malformed tables, address arithmetic and device ordering.
+	  The PMP report driver does not need to be enabled to run this suite.
