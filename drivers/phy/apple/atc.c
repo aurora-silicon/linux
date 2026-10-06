@@ -30,6 +30,8 @@
 #include <linux/of_graph.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
+#include <linux/pm_domain.h>
 #include <linux/reset-controller.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/tunable.h>
@@ -629,6 +631,9 @@ struct atcphy_mode_configuration {
  * @park_dummy_phy: Enable the dummy PIPE backend whenever the PIPE is parked on
  *                  it; the lock handshake that starts the next PIPE change is
  *                  only acknowledged while it runs
+ * @restore_after_pd_off: The PHY's power domain may be switched off in system
+ *                        sleep, which resets the block; bring the tracked
+ *                        state back once the domain is on again
  */
 struct atcphy_hw {
 	enum atcphy_generation gen;
@@ -640,6 +645,7 @@ struct atcphy_hw {
 	bool dp_t8122;
 	bool park_pipe_unlocked;
 	bool park_dummy_phy;
+	bool restore_after_pd_off;
 };
 
 /**
@@ -683,6 +689,9 @@ struct atcphy_hw {
  * @dp_t8122.pairs: Lane pairs (bit mask) whose DisplayPort transmitters run
  * @dp_t8122.rate: Main link rate in Mb/s per lane, 0 while stopped
  * @pipe_state: Backend the PIPE mux ("pipehandler") is routed to
+ * @pd_nb: Power domain notifier, registered with restore_after_pd_off
+ * @pd_was_off: The power domain was switched off since the state was last
+ *              brought back; set from the notifier, cleared under @lock
  * @regs: Memory-mapped registers
  * @regs.core: Core registers
  * @regs.axi2af: AXI to Apple Fabric interface registers
@@ -728,6 +737,9 @@ struct apple_atcphy {
 	int dp_link_rate;
 	bool swap_lanes;
 	enum atcphy_pipehandler_state pipe_state;
+
+	struct notifier_block pd_nb;
+	bool pd_was_off;
 
 	bool tunnel_dual_stream;
 	bool tunnel_routes_present;
@@ -3098,11 +3110,89 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	return 0;
 }
 
+static void _atcphy_dwc3_reset_assert(struct apple_atcphy *atcphy);
+
+/*
+ * A T8122 PHY loses its register state whenever its power domain is switched
+ * off. In system sleep that happens to a domain that no running device holds:
+ * a Type-C port whose USB controller has no role (no cable, or a cable without
+ * USB), or the DisplayPort-only PHY of the HDMI port. The domain then comes back
+ * with the PHY at its reset values, while the driver still tracks the mode the
+ * Type-C mux selected, a parked PIPE and possibly a running DP AUX channel.
+ *
+ * Bring the block back to that state: first the baseline probe establishes
+ * (the USB controller held in reset, USB2 and the PHY off, the PIPE parked on
+ * the dummy backend), then the tracked mode, which applies the tunables again,
+ * sets up the lanes and powers the DP AUX channel. The USB controller has been
+ * in reset all along, since its device keeps the domain on otherwise. A DP main
+ * link or a tunnel pixel clock does not survive the power-down; their users
+ * set them up again, so they are recorded as stopped.
+ *
+ * This runs from the first PHY operation after the domain is back, or from the
+ * resume callback, whichever comes first, so the order in which the Type-C
+ * controller, the USB controller and the display controller resume does not
+ * matter.
+ */
+static void atcphy_restore_after_pd_off(struct apple_atcphy *atcphy)
+{
+	enum atcphy_mode mode = atcphy->mode;
+	int ret;
+
+	lockdep_assert_held(&atcphy->lock);
+
+	if (!atcphy->hw->restore_after_pd_off || !READ_ONCE(atcphy->pd_was_off))
+		return;
+	WRITE_ONCE(atcphy->pd_was_off, false);
+
+	atcphy->dp_t8122.aux = false;
+	atcphy->dp_t8122.pll = false;
+	atcphy->dp_t8122.pairs = 0;
+	atcphy->dp_t8122.rate = 0;
+	atcphy->tunnel_clock_on = false;
+	atcphy->tunnel_rate = 0;
+
+	if (!atcphy->dp_only) {
+		_atcphy_dwc3_reset_assert(atcphy);
+		atcphy->host_active = false;
+		atcphy_usb2_power_off(atcphy);
+	}
+	ret = atcphy_power_off(atcphy);
+	if (ret)
+		dev_warn(atcphy->dev, "PHY did not power down after its domain was off: %d\n",
+			 ret);
+	atcphy->mode = APPLE_ATCPHY_MODE_OFF;
+
+	if (atcphy->dp_only) {
+		dev_dbg(atcphy->dev, "power domain was off, restoring mode %d\n", mode);
+	} else {
+		ret = atcphy_configure_pipehandler_dummy(atcphy, false);
+		if (ret)
+			dev_warn(atcphy->dev, "Failed to park the PIPE after its domain was off: %d\n",
+				 ret);
+		atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+		dev_dbg(atcphy->dev,
+			"power domain was off, restoring mode %d: PIPE mux=%08x lock=%08x/%08x aon=%08x nonsel=%08x\n",
+			mode, readl(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL),
+			readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ),
+			readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK),
+			readl(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN),
+			readl(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE));
+	}
+
+	if (mode == APPLE_ATCPHY_MODE_OFF)
+		return;
+	ret = atcphy_configure(atcphy, mode);
+	if (ret)
+		dev_warn(atcphy->dev, "Failed to restore mode %d after its domain was off: %d\n",
+			 mode, ret);
+}
+
 static int atcphy_usb2_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 {
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
 
 	guard(mutex)(&atcphy->lock);
+	atcphy_restore_after_pd_off(atcphy);
 
 	switch (mode) {
 	case PHY_MODE_USB_HOST:
@@ -3126,6 +3216,7 @@ static int atcphy_usb2_init(struct phy *phy)
 		return 0;
 
 	guard(mutex)(&atcphy->lock);
+	atcphy_restore_after_pd_off(atcphy);
 
 	/*
 	 * dwc3 initialises its PHYs after releasing its reset, and asserting that
@@ -3155,6 +3246,7 @@ static int atcphy_usb3_power_off(struct phy *phy)
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
 
 	guard(mutex)(&atcphy->lock);
+	atcphy_restore_after_pd_off(atcphy);
 
 	atcphy_park_pipehandler(atcphy, true);
 	atcphy->host_active = false;
@@ -3170,6 +3262,7 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
 
 	guard(mutex)(&atcphy->lock);
+	atcphy_restore_after_pd_off(atcphy);
 
 	switch (mode) {
 	case PHY_MODE_USB_HOST:
@@ -3239,6 +3332,7 @@ static int atcphy_dpphy_configure_t8122(struct apple_atcphy *atcphy,
 	int ret;
 
 	guard(mutex)(&atcphy->lock);
+	atcphy_restore_after_pd_off(atcphy);
 
 	if (opts->set_lanes)
 		return -EINVAL;
@@ -3323,6 +3417,7 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 		if (dpin)
 			return -EOPNOTSUPP;
 		guard(mutex)(&atcphy->lock);
+		atcphy_restore_after_pd_off(atcphy);
 		if (!rate)
 			return atc_t8122_tunnel_stop(atcphy);
 		if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 &&
@@ -3448,6 +3543,7 @@ static int atcphy_dwc3_reset_assert(struct reset_controller_dev *rcdev, unsigned
 	struct apple_atcphy *atcphy = container_of(rcdev, struct apple_atcphy, rcdev);
 
 	guard(mutex)(&atcphy->lock);
+	atcphy_restore_after_pd_off(atcphy);
 
 	_atcphy_dwc3_reset_assert(atcphy);
 	atcphy_park_pipehandler(atcphy, true);
@@ -3462,6 +3558,7 @@ static int atcphy_dwc3_reset_deassert(struct reset_controller_dev *rcdev, unsign
 	struct apple_atcphy *atcphy = container_of(rcdev, struct apple_atcphy, rcdev);
 
 	guard(mutex)(&atcphy->lock);
+	atcphy_restore_after_pd_off(atcphy);
 
 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN,
 		PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
@@ -3543,6 +3640,7 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 	int ret;
 
 	guard(mutex)(&atcphy->lock);
+	atcphy_restore_after_pd_off(atcphy);
 
 	if (state->mode == TYPEC_STATE_SAFE) {
 		target_mode = APPLE_ATCPHY_MODE_OFF;
@@ -3976,6 +4074,45 @@ static void apple_atc_tunnel_wiring(struct apple_atcphy *atcphy)
 	}
 }
 
+/*
+ * Called by the PM domain with its lock held, which is a spinlock for these
+ * domains: only record the power-down, atcphy_restore_after_pd_off() acts on it.
+ */
+static int atcphy_pd_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct apple_atcphy *atcphy = container_of(nb, struct apple_atcphy, pd_nb);
+
+	if (action == GENPD_NOTIFY_OFF)
+		WRITE_ONCE(atcphy->pd_was_off, true);
+	return NOTIFY_OK;
+}
+
+static void atcphy_pd_notifier_remove(void *data)
+{
+	dev_pm_genpd_remove_notifier(data);
+}
+
+static void atcphy_probe_pd_notifier(struct apple_atcphy *atcphy)
+{
+	int ret;
+
+	if (!atcphy->hw->restore_after_pd_off)
+		return;
+
+	atcphy->pd_nb.notifier_call = atcphy_pd_notify;
+	ret = dev_pm_genpd_add_notifier(atcphy->dev, &atcphy->pd_nb);
+	if (!ret)
+		ret = devm_add_action_or_reset(atcphy->dev, atcphy_pd_notifier_remove,
+					       atcphy->dev);
+	/* without a single PM domain nothing switches the PHY off underneath us */
+	if (ret == -ENODEV || ret == -EOPNOTSUPP)
+		dev_dbg(atcphy->dev, "no PM domain to follow: %d\n", ret);
+	else if (ret)
+		dev_warn(atcphy->dev,
+			 "Cannot follow the PM domain (%d), PHY state is not restored after it was off\n",
+			 ret);
+}
+
 static int atcphy_probe(struct platform_device *pdev)
 {
 	struct apple_atcphy *atcphy;
@@ -4007,9 +4144,27 @@ static int atcphy_probe(struct platform_device *pdev)
 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 	atcphy->fixed_usb2 = atcphy_usb2_behind_fixed_hub(atcphy);
 	atcphy->typec_mode = APPLE_ATCPHY_MODE_USB2;
+	atcphy_probe_pd_notifier(atcphy);
 
 	return atcphy_probe_finalize(atcphy);
 }
+
+/*
+ * Nothing to save on the way down: whatever the PHY runs stays up when its
+ * domain stays on. If the domain was switched off, restore the state here
+ * unless a PHY operation already did.
+ */
+static int atcphy_resume(struct device *dev)
+{
+	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
+
+	guard(mutex)(&atcphy->lock);
+	atcphy_restore_after_pd_off(atcphy);
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(atcphy_pm_ops, NULL, atcphy_resume);
 
 static const struct atcphy_hw atcphy_hw_t8103 = {
 	.gen = ATCPHY_GENERATION_T8103,
@@ -4026,6 +4181,7 @@ static const struct atcphy_hw atcphy_hw_t8122 = {
 	.dp_t8122 = true,
 	.park_pipe_unlocked = true,
 	.park_dummy_phy = true,
+	.restore_after_pd_off = true,
 };
 
 static const struct atcphy_hw atcphy_hw_t8140 = {
@@ -4048,6 +4204,7 @@ static struct platform_driver atcphy_driver = {
 	.driver = {
 		.name = "phy-apple-atc",
 		.of_match_table = atcphy_match,
+		.pm = pm_sleep_ptr(&atcphy_pm_ops),
 	},
 	.probe = atcphy_probe,
 };
