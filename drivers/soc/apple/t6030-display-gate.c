@@ -655,14 +655,22 @@ static int __init gate_pmp_apply(struct device_node *dcp, struct device_node **p
  * External display processors (dcpext0, dcpext1, ...). The boot loader hands
  * each one over separately: its memory (apple,t6030-dcpext-memory-ready), and
  * its display DART with a scanout child that names it
- * (apple,t6030-dispext-handoff). Nothing here touches a processor's CPU.
+ * (apple,t6030-dispext-handoff). Nothing here touches a processor's CPU: the
+ * display driver starts the firmware when a display is first attached.
  *
- * A processor that was handed over is enabled with its DART, mailbox, PMP
- * request and Type-C routes, and its display DART and scanout child when
- * they check out. Any other processor stays disabled, and so do its Type-C
- * routes, so the USB-C ports never wait for a display mode switch nobody
- * registers. apple_t6030_display.dcpext=0 refuses every processor;
- * apple_t6030_display.scanout=0 leaves the display DARTs alone.
+ * Each processor ends in one of three states:
+ *  - native (the default): the processor, its DART, mailbox, PMP request and
+ *    Type-C routes are enabled; its display DART is added to the display
+ *    subsystem's iommus, so every framebuffer is mapped for this pipe as on
+ *    M1/M2, and a piodma child is added for the DART's PIODMA stream 4. The
+ *    processor then joins the main DRM device.
+ *  - manual (apple_t6030_display.dcpext_manual=1): the earlier diagnostic
+ *    path, with explicit start and a separately mapped scanout buffer.
+ *  - refused: everything stays disabled, and so do its Type-C routes, so the
+ *    USB-C ports never wait for a display mode switch nobody registers.
+ * apple_t6030_display.dcpext=0 refuses every processor;
+ * apple_t6030_display.scanout=0 refuses the display DART, which the native
+ * path needs.
  */
 static bool gate_dcpext_requested __initdata = true;
 
@@ -679,6 +687,14 @@ static int __init gate_scanout_setup(char *arg)
 	return kstrtobool(arg, &gate_scanout_requested);
 }
 early_param("apple_t6030_display.scanout", gate_scanout_setup);
+
+static bool gate_dcpext_manual __initdata;
+
+static int __init gate_dcpext_manual_setup(char *arg)
+{
+	return kstrtobool(arg, &gate_dcpext_manual);
+}
+early_param("apple_t6030_display.dcpext_manual", gate_dcpext_manual_setup);
 
 #define GATE_DCPEXT_MAX		4
 
@@ -970,8 +986,95 @@ static int __init gate_ext_routes(struct of_changeset *cs, struct device_node *d
 	return ret;
 }
 
-/* Enables @ext's processor, and its display DART if that checked out. */
-static int __init gate_ext_apply(struct gate_ext *ext)
+/* The display subsystem's iommus with <@dart 0> appended. */
+static int __init gate_display_add_dart(struct of_changeset *cs, struct device_node *dart)
+{
+	struct device_node *display = gate_find_one(gate_soc->display_compat);
+	struct of_phandle_args args;
+	struct property *old, *prop;
+	__be32 *value;
+	int i, n, ret = -EINVAL;
+
+	if (!display)
+		return -ENODEV;
+	old = of_find_property(display, "iommus", NULL);
+	n = of_count_phandle_with_args(display, "iommus", "#iommu-cells");
+	if (!old || n < 1 || old->length != n * 2 * sizeof(__be32))
+		goto out;
+	for (i = 0; i < n; i++) {
+		if (of_parse_phandle_with_args(display, "iommus", "#iommu-cells", i, &args))
+			goto out;
+		of_node_put(args.np);
+		if (args.np == dart || args.args_count != 1)
+			goto out;
+	}
+	ret = -ENOMEM;
+	prop = kzalloc_obj(*prop);
+	value = kmalloc(old->length + 2 * sizeof(*value), GFP_KERNEL);
+	if (!prop || !value) {
+		kfree(prop);
+		kfree(value);
+		goto out;
+	}
+	memcpy(value, old->value, old->length);
+	value[old->length / sizeof(*value)] = cpu_to_be32(dart->phandle);
+	value[old->length / sizeof(*value) + 1] = cpu_to_be32(0);
+	prop->name = "iommus";
+	prop->length = old->length + 2 * sizeof(*value);
+	prop->value = value;
+	ret = of_changeset_update_property(cs, display, prop);
+out:
+	of_node_put(display);
+	return ret;
+}
+
+/*
+ * The processor's PIODMA stream on its display DART, as the internal DCP's
+ * piodma child: the driver maps firmware buffers there on request.
+ */
+static int __init gate_ext_piodma(struct of_changeset *cs, struct gate_ext *ext)
+{
+	u32 iommus[2] = { ext->disp_dart->phandle, 4 };
+	struct device_node *piodma;
+	int ret;
+
+	piodma = of_get_child_by_name(ext->dcp, "piodma");
+	if (piodma) {
+		ret = of_changeset_update_prop_string(cs, piodma, "status", "okay");
+		if (!ret) {
+			struct property *prop = kzalloc_obj(*prop);
+			__be32 *value = kmalloc(sizeof(iommus), GFP_KERNEL);
+
+			if (!prop || !value) {
+				kfree(prop);
+				kfree(value);
+				ret = -ENOMEM;
+			} else {
+				value[0] = cpu_to_be32(iommus[0]);
+				value[1] = cpu_to_be32(iommus[1]);
+				prop->name = "iommus";
+				prop->length = sizeof(iommus);
+				prop->value = value;
+				ret = of_changeset_update_property(cs, piodma, prop);
+			}
+		}
+		if (!ret)
+			ret = gate_set_u32(cs, piodma, "apple,t6030-dispext-handoff", 1);
+		of_node_put(piodma);
+		return ret;
+	}
+	piodma = of_changeset_create_node(cs, ext->dcp, "piodma");
+	if (!piodma)
+		return -ENOMEM;
+	/* The new node is kept for good, like the changeset that attaches it. */
+	ret = of_changeset_add_prop_u32_array(cs, piodma, "iommus", iommus, ARRAY_SIZE(iommus));
+	if (!ret)
+		ret = of_changeset_add_prop_u32(cs, piodma, "apple,t6030-dispext-handoff", 1);
+	return ret;
+}
+
+/* Enables @ext's processor, in the native or the manual configuration. */
+static int __init gate_ext_apply(struct gate_ext *ext, bool native)
 {
 	struct of_changeset *cs = gate_cs_alloc();
 	int ret;
@@ -994,10 +1097,14 @@ static int __init gate_ext_apply(struct gate_ext *ext)
 	/* A processor's routes are usable exactly when the processor is. */
 	if (!ret)
 		ret = gate_ext_routes(cs, ext->dcp, "okay");
-	if (!ret && ext->scanout_ok) {
-		ret = gate_set_u32(cs, ext->scanout, "apple,t6030-scanout-verified", 1);
+	if (!ret && ext->scanout_ok)
+		ret = of_changeset_update_prop_string(cs, ext->disp_dart, "status", "okay");
+	if (!ret && native) {
+		ret = gate_ext_piodma(cs, ext);
 		if (!ret)
-			ret = of_changeset_update_prop_string(cs, ext->disp_dart, "status", "okay");
+			ret = gate_display_add_dart(cs, ext->disp_dart);
+	} else if (!ret && ext->scanout_ok) {
+		ret = gate_set_u32(cs, ext->scanout, "apple,t6030-scanout-verified", 1);
 		if (!ret)
 			ret = of_changeset_update_prop_string(cs, ext->scanout, "status", "okay");
 	}
@@ -1029,6 +1136,7 @@ static void __init gate_ext_refuse(struct device_node *dcp, const char *why)
 static void __init gate_dcpext_one(struct device_node *np, const char *refuse)
 {
 	struct gate_ext ext = { .dcp = of_node_get(np) };
+	bool native = !gate_dcpext_manual;
 	int ret;
 
 	if (!gate_disabled(np)) {
@@ -1053,15 +1161,22 @@ static void __init gate_dcpext_one(struct device_node *np, const char *refuse)
 		if (ret && ret != -ENODEV)
 			gate_warn("%pOF: display DART handoff failed validation (%d)\n", np, ret);
 	}
-	ret = gate_ext_apply(&ext);
+	if (native && !ext.scanout_ok) {
+		gate_ext_refuse(np, "no usable display DART handoff");
+		goto put;
+	}
+	ret = gate_ext_apply(&ext, native);
 	if (ret) {
 		gate_warn("%pOF: changeset failed: %d\n", np, ret);
 		gate_ext_refuse(np, "the gate could not enable it");
 		goto put;
 	}
-	gate_info("enabled dcpext%u (%pOF) with PMP DISPEXT%u request, CPU power floor and Type-C routes%s; external CPU startup remains manual\n",
-		  ext.index, np, ext.index,
-		  ext.scanout_ok ? ", and its verified scanout DART" : "");
+	if (native)
+		gate_info("enabled dcpext%u (%pOF) with PMP DISPEXT%u request, CPU power floor, display DART %pOF and its Type-C routes; started by the display driver on first use\n",
+			  ext.index, np, ext.index, ext.disp_dart);
+	else
+		gate_info("enabled dcpext%u (%pOF) for manual start%s\n", ext.index, np,
+			  ext.scanout_ok ? " with the verified scanout DART" : "");
 put:
 	gate_ext_put(&ext);
 }
