@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * HDMI port of the t6030 (M3 Pro) MacBook Pros j514s and j516s.
+ *
+ * The first external display processor drives ATC3 as a four-lane
+ * DisplayPort PHY through the ATC3 display crossbar into an on-board
+ * DP-to-HDMI converter, as on the M1/M2 Pro and Max MacBook Pros. The
+ * converter has its own power enable, the HDMI port another one, and the
+ * port's hotplug signal comes in on an AOP GPIO.
+ *
+ * The processor stays a hybrid pipeline: while no HDMI display is attached
+ * it can still be lent to a USB-C port.
+ */
+
+&atcphy3 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@2 {
+			reg = <2>;
+			atcphy3_dp: endpoint {
+				remote-endpoint = <&dcpext_dpout>;
+			};
+		};
+	};
+};
+
+&atcphy3_xbar {
+	status = "okay";
+};
+
+&dcpext {
+	apple,connector-type = "HDMI-A";
+
+	/* HDMI HPD, also used as the hotplug interrupt */
+	hdmi-hpd-gpios = <&pinctrl_aop 47 GPIO_ACTIVE_HIGH>;
+	hdmi-pwren-gpios = <&smc_gpio 15 GPIO_ACTIVE_HIGH>;
+	dp2hdmi-pwren-gpios = <&smc_gpio 26 GPIO_ACTIVE_HIGH>;
+
+	phys = <&atcphy3 PHY_TYPE_DP>, <&atcphy0 PHY_TYPE_DP>,
+	       <&atcphy1 PHY_TYPE_DP>, <&atcphy2 PHY_TYPE_DP>;
+	phy-names = "dp-phy", "typec0", "typec1", "typec2";
+	mux-controls = <&atcphy3_xbar 0>, <&atcphy0_xbar 0>,
+		       <&atcphy1_xbar 0>, <&atcphy2_xbar 0>;
+	mux-control-names = "dp-xbar", "typec0", "typec1", "typec2";
+	mux-index = <0>;
+	apple,dptx-phy = <3>;
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@1 {
+			reg = <1>;
+			dcpext_dpout: endpoint {
+				remote-endpoint = <&atcphy3_dp>;
+			};
+		};
+	};
+};
