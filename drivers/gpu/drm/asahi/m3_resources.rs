@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-//! J514S resources admitted against the measured M3 boot contract.
+//! M3 GPU resources admitted against the measured boot contract (J514S on T6030).
 pub(crate) use crate::agx_resources::{Region, Resources};
 
 use kernel::{bindings, c_str, io::resource::Resource, of, prelude::*};
@@ -14,8 +14,12 @@ pub(crate) fn reserved_resource(node: &of::Node, name: &CStr) -> Result<Resource
     if let Some(found) = crate::m3_board::static_region(node, name) {
         return found.map(|(r, _)| r);
     }
+    // Only for a GPU node whose compatible is exactly that of an M3 SoC table.
     let compatible: KVec<u8> = node.get_property(c_str!("compatible"))?;
-    if compatible.as_slice() != b"apple,agx-t6030\0" { return Err(EINVAL); }
+    let compatible = compatible.strip_suffix(b"\0").ok_or(EINVAL)?;
+    if !crate::m3_soc::SOCS.iter().any(|soc| compatible == soc.gpu.as_bytes()) {
+        return Err(EINVAL);
+    }
     let names: KVec<u8> = node.get_property(c_str!("memory-region-names"))?;
     let index = names.split(|b| *b == 0).position(|n| n == name.to_bytes()).ok_or(EINVAL)?;
     let region = node.parse_phandle(c_str!("memory-region"), index).ok_or(EINVAL)?;

@@ -91,12 +91,11 @@ macro_rules! m3_param {
                     } else {
                         kernel::c_str!(concat!("asahi.", $name))
                     }),
-                    // SAFETY: `__this_module` is constructed by the kernel at load time and
-                    // is not freed until the module is unloaded.
+                    // `__this_module` is constructed by the kernel at load time and is not
+                    // freed until the module is unloaded. Take its address without creating a
+                    // reference to the mutable static.
                     #[cfg(MODULE)]
-                    mod_: unsafe {
-                        core::ptr::from_ref(&kernel::bindings::__this_module).cast_mut()
-                    },
+                    mod_: (&raw const kernel::bindings::__this_module).cast_mut(),
                     #[cfg(not(MODULE))]
                     mod_: core::ptr::null_mut(),
                     ops: core::ptr::from_ref(&OPS),

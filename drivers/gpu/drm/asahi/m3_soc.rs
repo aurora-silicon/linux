@@ -2,17 +2,20 @@
 
 //! The per-SoC facts of the M3 runtime backend.
 //!
-//! The runtime admits, identifies and configures an M3-family GPU from one of these tables. Every
-//! value in a table comes from that SoC's device tree (as the boot loader fills it from its ADT),
-//! from its hardware, or from existing driver code for that SoC; no value of one SoC stands in for
-//! another's. A fact a SoC has no source for yet is `None`, or listed in `unported` when the code
-//! that uses it is still written for another SoC, and the runtime then refuses that SoC right
-//! after admission ([`Soc::require_complete`]), before it reads the firmware, maps a GPU register
-//! or starts the GPU coprocessor.
+//! Each table describes the register windows, memory layout and configuration of one GPU.
+//! Missing configuration is `None`; outstanding runtime requirements are listed in `unported`.
+//! Admission rejects either before reading firmware, mapping GPU registers or starting the
+//! GPU coprocessor ([`Soc::require_complete`]).
 
 use kernel::{device, prelude::*};
 
-use crate::{hw, m3_board::KnownImage, m3_firmware::Layout};
+use crate::{
+    hw,
+    initdata::G15RuntimeHwDataB,
+    m3_board::KnownImage,
+    m3_firmware::Layout,
+    m3_init_storage::IoMap, //
+};
 
 /// The SGX identification words the runtime admits, each compared under its mask.
 pub(crate) struct IdWords {
@@ -22,6 +25,40 @@ pub(crate) struct IdWords {
     /// SGX+0xd04010: dies [19:16], clusters per die [15:8].
     pub(crate) counts: u32,
     pub(crate) counts_mask: u32,
+}
+
+/// The register windows the runtime admits, as CPU physical addresses (device-tree `reg` values
+/// translated through `arm-io` `ranges`).
+pub(crate) struct Windows {
+    /// Base of the GPU coprocessor window (`asc`, ADT `gfx-asc` reg[0]).
+    pub(crate) asc: u64,
+    /// Base of the GPU window (`sgx`, ADT `sgx` reg[0]).
+    pub(crate) sgx: u64,
+    /// Base of the GPU coprocessor mailbox, a 16 KiB window inside `asc`.
+    pub(crate) mailbox: u64,
+}
+
+/// The performance-state table the runtime accepts: checked on the generated InitData before
+/// any GPU register is touched, and again on the uploaded HwDataB.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum PstateTable {
+    /// A fixed table: `states` states above the off state, the highest at `top_mhz` MHz.
+    Fixed { states: u32, top_mhz: u32 },
+    /// The table of the device tree's operating points: one state per distinct voltage above
+    /// the off state, the highest at the highest frequency
+    /// (`t8122_admission::opp_table_shape`).
+    DeviceTree,
+}
+
+/// Optional userspace features advertised for a SoC (`DRM_ASAHI_GET_PARAMS`). The runtime
+/// implements them the same way on every SoC; a SoC advertises one once it has been validated
+/// there. Soft faults are never advertised: the runtime does not apply `asahi.fault_control`.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct Features {
+    /// `DRM_ASAHI_FEATURE_COMPUTE_WIDE_VISIBILITY`.
+    pub(crate) compute_wide_visibility: bool,
+    /// `DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY`, while `asahi.m3_early_tiling` is set.
+    pub(crate) fragment_dependency: bool,
 }
 
 /// One firmware IO mapping of the runtime's InitData: HwDataB slot, physical address, total
@@ -52,6 +89,8 @@ pub(crate) struct Soc {
     pub(crate) mailbox_compatibles: &'static [&'static [u8]],
     /// The mailbox interrupts: send-empty, send-not-empty, recv-empty, recv-not-empty.
     pub(crate) mailbox_interrupts: [u32; 12],
+    /// The register windows of the GPU node and its mailbox.
+    pub(crate) windows: Windows,
     /// The identification words the runtime admits.
     pub(crate) id: IdWords,
     /// GPU firmware images the runtime can identify.
@@ -62,8 +101,17 @@ pub(crate) struct Soc {
     pub(crate) hwcfg: Option<&'static hw::HwConfig>,
     /// The firmware IO mappings of the InitData.
     pub(crate) io_mappings: Option<&'static [IoMapping]>,
+    /// The runtime's mapping of each of those IO mappings: the CPU physical block and the
+    /// firmware VA it is mapped at. One per entry of `io_mappings`, covering it.
+    pub(crate) iomaps: Option<&'static [IoMap]>,
+    /// The performance-state table the runtime accepts.
+    pub(crate) pstates: PstateTable,
     /// The SGX write (offset, value) made after the identity checks, before the firmware starts.
     pub(crate) sgx_setup: Option<(usize, u32)>,
+    /// The runtime InitData's HwDataB configuration words and unit masks.
+    pub(crate) hwdata_b: Option<&'static G15RuntimeHwDataB>,
+    /// The optional userspace features advertised.
+    pub(crate) features: Features,
     /// Whether the power-management coefficients, the leakage coefficients and the operating
     /// points are this machine's, added by the boot loader from its ADT, rather than static
     /// device-tree values. Admission then requires every one of them (see
@@ -74,11 +122,11 @@ pub(crate) struct Soc {
 }
 
 impl Soc {
-    /// Log every fact this table has no source for, and refuse the SoC if there is one.
+    /// Reject incomplete configuration before accessing the GPU.
     pub(crate) fn require_complete(&self, dev: &device::Device) -> Result {
         let mut missing = 0u32;
         let mut note = |what: &str| {
-            dev_info!(dev, "M3 {}: no source yet for {}\n", self.gpu_name, what);
+            dev_info!(dev, "M3 {}: missing {}\n", self.gpu_name, what);
             missing += 1;
         };
         if self.images.is_empty() {
@@ -93,8 +141,14 @@ impl Soc {
         if self.io_mappings.is_none() {
             note("the firmware IO mappings of the InitData");
         }
+        if self.iomaps.is_none() {
+            note("the runtime's mapping of the firmware IO mappings (IO maps)");
+        }
         if self.sgx_setup.is_none() {
             note("the SGX setup write made before the firmware starts");
+        }
+        if self.hwdata_b.is_none() {
+            note("the runtime HwDataB configuration words and unit masks");
         }
         for &what in self.unported {
             note(what);
@@ -104,12 +158,39 @@ impl Soc {
         }
         dev_err!(
             dev,
-            "M3 {}: {} facts have no source yet; not starting the GPU (the firmware was not read, no GPU register was mapped, the coprocessor was not started)\n",
+            "M3 {}: {} configuration requirements missing; GPU startup disabled\n",
             self.gpu_name,
             missing
         );
         Err(ENODEV)
     }
+}
+
+/// The HwDataB configuration words and unit masks of the T6030 runtime InitData, as checked on
+/// J514S and J516S (the runtime's earlier fixed values).
+pub(crate) static T6030_HWDATA_B: G15RuntimeHwDataB = G15RuntimeHwDataB {
+    unk_454: 1,
+    unk_464: 1,
+    unk_a7c: 0x1_0000_0001,
+    unk_a98: 0,
+    unk_abc: 4,
+    unk_ae4: 0x31,
+    unk_b20: 0x14,
+    unk_b24: 3,
+    unk_554: 0,
+    unk_17b8: 5,
+    unit_mask_a: 0x7_0000_0003,
+    unit_mask_b: 7,
+    unk_1808: 1,
+    unk_1818: 1,
+};
+
+/// Every SoC the M3 runtime has a table for.
+pub(crate) static SOCS: [&Soc; 2] = [&T6030, &T8122];
+
+/// The table of the SoC with chip id `chip_id`, if the M3 runtime has one.
+pub(crate) fn by_chip(chip_id: u32) -> Option<&'static Soc> {
+    SOCS.iter().copied().find(|soc| soc.chip_id == chip_id)
 }
 
 /// T6030 (M3 Pro, G15S): one die, two clusters of ten core slots.
@@ -131,6 +212,12 @@ pub(crate) static T6030: Soc = Soc {
         b"apple,t6030-agx-asc-mailbox\0",
     ],
     mailbox_interrupts: [0, 832, 4, 0, 833, 4, 0, 834, 4, 0, 835, 4],
+    // The T6030 device tree (t6030-gpu.dtsi): asc, sgx and the mailbox at asc + 0x8000.
+    windows: Windows {
+        asc: 0x2_9240_0000,
+        sgx: 0x2_9000_0000,
+        mailbox: 0x2_9240_8000,
+    },
     id: IdWords {
         version: 0x0703_1100,
         version_mask: !0,
@@ -141,7 +228,19 @@ pub(crate) static T6030: Soc = Soc {
     firmware: Some(&crate::m3_firmware::T6030_LAYOUT),
     hwcfg: Some(&hw::t6030::HWCONFIG_T6030),
     io_mappings: Some(&crate::m3_adt_config::T6030_IO_MAPPINGS),
+    iomaps: Some(&crate::m3_init_storage::T6030_IOMAPS),
+    // The J514S/J516S runtime table: eight voltage-sorted states up to 1380 MHz.
+    pstates: PstateTable::Fixed {
+        states: 8,
+        top_mhz: 1380,
+    },
     sgx_setup: Some((0xd14000, 0x70001)),
+    hwdata_b: Some(&T6030_HWDATA_B),
+    // Validated on J514S and J516S.
+    features: Features {
+        compute_wide_visibility: true,
+        fragment_dependency: true,
+    },
     power_from_boot_loader: false,
     unported: &[],
 };
@@ -151,8 +250,8 @@ pub(crate) static T6030: Soc = Soc {
 /// The compatibles, the mailbox and its interrupts are the T8122 device tree's. The identity is
 /// the one the T8122 identity gate admits (`t8122_admission`: family 7, variant 2, revision 0x20,
 /// core slots in the first core-mask word only), with the die count of the AGX3 identification
-/// table (`hw::agx3::T8122`). The power configuration comes from the boot loader. Nothing else
-/// has a source for this SoC yet, so the runtime refuses it after admission.
+/// table (`hw::agx3::T8122`). Power configuration comes from the boot loader. The runtime
+/// rejects the incomplete hardware configuration before accessing the GPU.
 pub(crate) static T8122: Soc = Soc {
     name: "T8122",
     gpu_name: "G15G",
@@ -172,6 +271,13 @@ pub(crate) static T8122: Soc = Soc {
         b"apple,t8122-asc-mailbox\0apple,asc-mailbox-v4\0",
     ],
     mailbox_interrupts: [0, 723, 4, 0, 724, 4, 0, 725, 4, 0, 726, 4],
+    // The J613 ADT: sgx reg[0] (child 0x80000000 + arm-io 0x210000000) and gfx-asc reg[0]; the
+    // mailbox at asc + 0x8000 (t8122-gpu.dtsi). The same addresses as on T6030.
+    windows: Windows {
+        asc: 0x2_9240_0000,
+        sgx: 0x2_9000_0000,
+        mailbox: 0x2_9240_8000,
+    },
     id: IdWords {
         version: 0x0702_2000,
         version_mask: 0xffff_ff00,
@@ -179,17 +285,20 @@ pub(crate) static T8122: Soc = Soc {
         counts: 0x0001_0100,
         counts_mask: 0x000f_ff00,
     },
-    images: &[],
-    firmware: None,
+    images: &crate::m3_board::KNOWN_IMAGES_T8122,
+    firmware: Some(&crate::m3_firmware::T8122_LAYOUT),
     hwcfg: None,
     io_mappings: None,
+    iomaps: None,
+    // The boot loader's ladder from this machine's ADT (J613: eight voltages, up to 1338 MHz).
+    pstates: PstateTable::DeviceTree,
     sgx_setup: None,
+    hwdata_b: None,
+    // Neither is validated on G15G yet; userspace keeps its default ordering and visibility.
+    features: Features {
+        compute_wide_visibility: false,
+        fragment_dependency: false,
+    },
     power_from_boot_loader: true,
-    unported: &[
-        "the runtime's IO map table (m3_init_storage::IOMAPS), which holds T6030 addresses",
-        "the runtime UAT setup (mmu::Uat::new_t6030_running), which is keyed to chip 0x6030",
-        "the InitData upload check of the T6030 performance-state table (m3_config)",
-        "the runtime HwDataB configuration words and unit masks, which are the T6030 values (initdata)",
-        "the userspace feature flags, which are keyed to chip 0x6030 (file.rs)",
-    ],
+    unported: &[],
 };

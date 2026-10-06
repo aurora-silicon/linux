@@ -87,9 +87,62 @@ impl IoMap {
         if self.slot>=31 {return Err(Error::Bounds);}
         Ok(0x640+self.slot*32+8)
     }
+    /// The mapping must fit both the CPU physical range and the firmware VA range.
+    fn validate(self) -> Result<(), Error> {
+        self.pointer_field()?;
+        if self.size == 0 || self.offset >= self.size
+            || (self.physical | self.address | self.size as u64) & 0x3fff != 0
+            || self.physical.checked_add(self.size as u64).is_none_or(|end| end > 1 << 42)
+        {
+            return Err(Error::Address);
+        }
+        Region::new(self.address, self.size)?;
+        Ok(())
+    }
+
+    /// Check the subpage physical range without wrapping either endpoint.
+    pub(crate) fn covers(self, physical: u64, total: u32) -> bool {
+        total != 0
+            && self.physical.checked_add(self.offset as u64) == Some(physical)
+            && physical.checked_add(u64::from(total)).is_some_and(|end| {
+                self.physical.checked_add(self.size as u64).is_some_and(|limit| end <= limit)
+            })
+    }
+
     pub(crate) fn pointer(self,owned:Region)->Result<u64,Error> {owned.at(self.offset,1)}
 }
-pub(crate) const IOMAPS:[IoMap;15]=[
+/// Validate every mapping before any GPU access, rejecting duplicate slots and overlapping VAs.
+pub(crate) fn validate_iomaps(iomaps: &[IoMap]) -> Result<(), Error> {
+    if iomaps.is_empty() {
+        return Err(Error::Size);
+    }
+    for (i, io) in iomaps.iter().enumerate() {
+        io.validate()?;
+        for other in &iomaps[..i] {
+            if io.slot == other.slot
+                || (io.address < other.address + other.size as u64
+                    && other.address < io.address + io.size as u64)
+            {
+                return Err(Error::Address);
+            }
+        }
+        for index in 0..COUNT {
+            let owner = allocation(index)?;
+            let start = owner.address & !0x3fff;
+            let end = owner.address.checked_add(owner.size as u64)
+                .and_then(|end| end.checked_add(0x3fff)).ok_or(Error::Address)? & !0x3fff;
+            if io.address < end && start < io.address + io.size as u64 {
+                return Err(Error::Address);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The T6030 runtime's IO maps (`m3_soc::T6030.iomaps`), one per entry of
+/// `m3_adt_config::T6030_IO_MAPPINGS`: the page-aligned CPU physical block and
+/// the fixed firmware VA of each slot.
+pub(crate) const T6030_IOMAPS:[IoMap;15]=[
     IoMap { slot:0, physical:0x290d00000, size:0x144000, address:0xfffffc2068000000, offset:0x0 },
     IoMap { slot:1, physical:0x20e100000, size:0x4000, address:0xfffffc2068148000, offset:0x1000 },
     IoMap { slot:2, physical:0x351014000, size:0x4000, address:0xfffffc2068150000, offset:0x0 },
@@ -116,4 +169,56 @@ pub(crate) fn parameter_buffer(pages:u32)->Result<[u8;16],Error> {
     if pages>0x3fffff {return Err(Error::Bounds);}
     let mut bytes=[0;16];bytes[..4].copy_from_slice(&0x07400000u32.to_le_bytes());
     bytes[4..8].copy_from_slice(&pages.to_le_bytes());Ok(bytes)
+}
+
+#[cfg(test)]
+mod iomap_tests {
+    use super::*;
+
+    #[test]
+    fn t6030_maps_and_relocated_physical_blocks_are_valid() {
+        assert_eq!(validate_iomaps(&T6030_IOMAPS), Ok(()));
+        let mut maps = T6030_IOMAPS;
+        for io in &mut maps {
+            io.physical += 0x40000;
+        }
+        assert_eq!(validate_iomaps(&maps), Ok(()));
+    }
+
+    #[test]
+    fn rejects_duplicate_slots_overlapping_vas_and_initdata_aliases() {
+        let mut maps = T6030_IOMAPS;
+        maps[1].slot = maps[0].slot;
+        assert!(validate_iomaps(&maps).is_err());
+        maps = T6030_IOMAPS;
+        maps[1].address = maps[0].address + 0x4000;
+        assert!(validate_iomaps(&maps).is_err());
+        maps = T6030_IOMAPS;
+        maps[1].address = allocation(HARDWARE_DATA).unwrap().address & !0x3fff;
+        assert!(validate_iomaps(&maps).is_err());
+        assert!(validate_iomaps(&[]).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_ranges_and_preserves_subpage_offsets() {
+        for edit in 0..6 {
+            let mut maps = T6030_IOMAPS;
+            match edit {
+                0 => maps[0].slot = 31,
+                1 => maps[0].size = 0,
+                2 => maps[0].offset = maps[0].size,
+                3 => maps[0].physical = (1 << 42) - 0x4000,
+                4 => maps[0].address = u64::MAX & !0x3fff,
+                _ => maps[0].physical += 1,
+            }
+            assert!(validate_iomaps(&maps).is_err());
+        }
+        let io = T6030_IOMAPS[1];
+        assert!(io.covers(io.physical + 0x1000, 1));
+        assert!(!io.covers(io.physical, 1));
+        assert!(!io.covers(io.physical + 0x1000, 0x4000));
+        assert!(!io.covers(io.physical + 0x1000, 0));
+        let overflow = IoMap { physical: u64::MAX - 0x1000, ..io };
+        assert!(!overflow.covers(u64::MAX, 1));
+    }
 }

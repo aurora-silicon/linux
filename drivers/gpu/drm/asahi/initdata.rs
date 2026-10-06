@@ -71,6 +71,33 @@ pub(crate) struct G15Options {
     /// Manager layout: write the PPM words and the Globals power targets as the runtime layout
     /// does (`asahi.g15_debug` bit 55). The runtime layout always does.
     pub(crate) reference_ppm: bool,
+    /// Runtime layout: the SoC's HwDataB configuration words and unit masks
+    /// (`m3_soc::Soc::hwdata_b`). None for the manager layout, which does not write them.
+    pub(crate) runtime_hwdata_b: Option<&'static G15RuntimeHwDataB>,
+}
+
+/// The HwDataB words of the runtime backend's InitData that are neither its GPU VA layout nor
+/// device-tree values: configuration words where the manager layout keeps 0 or its validated
+/// values (including the A/B pair +0xa98/+0xb40 at 0), and the two unit masks. They are values
+/// of one SoC's runtime InitData (`m3_soc::Soc::hwdata_b`), not derived from the device tree.
+#[derive(Debug)]
+pub(crate) struct G15RuntimeHwDataB {
+    pub(crate) unk_454: u32,
+    pub(crate) unk_464: u32,
+    pub(crate) unk_a7c: u64,
+    pub(crate) unk_a98: u32,
+    pub(crate) unk_abc: u64,
+    pub(crate) unk_ae4: u32,
+    pub(crate) unk_b20: u32,
+    pub(crate) unk_b24: u64,
+    /// +0xb40, the "UAT enabled" word of the manager layout.
+    pub(crate) unk_554: u32,
+    pub(crate) unk_17b8: u32,
+    /// Unit enable masks, +0x17c0/+0x17c8.
+    pub(crate) unit_mask_a: u64,
+    pub(crate) unit_mask_b: u32,
+    pub(crate) unk_1808: u32,
+    pub(crate) unk_1818: u32,
 }
 
 impl G15Options {
@@ -88,6 +115,7 @@ impl G15Options {
             timestamp_base: None,
             reference_ppm: g15
                 && crate::m3_params::g15_debug(crate::m3_params::G15Debug::ManagerReferencePpm),
+            runtime_hwdata_b: None,
         }
     }
 
@@ -1368,6 +1396,7 @@ impl<'a> InitDataBuilder::ver<'a> {
         let pwr = &dyncfg.pwr;
         let tables = g15.tables(pwr)?;
         let runtime = g15.layout == G15Layout::Runtime;
+        let runtime_hwdata_b = g15.runtime_hwdata_b;
         let timestamp_base = match g15.timestamp_base {
             Some(base) => base,
             None => mmu::kern_iova(cfg, gpu::IOVA_KERN_TIMESTAMP_RANGE.start),
@@ -1562,37 +1591,36 @@ impl<'a> InitDataBuilder::ver<'a> {
             raw.unit_mask_b = low_bits(dyncfg.id.num_clusters.min(32)) as u32;
 
             if runtime {
-                Self::hwdata_b_runtime(raw);
+                Self::hwdata_b_runtime(raw, runtime_hwdata_b.ok_or(EINVAL)?);
             }
             Ok(())
         }))
     }
 
-    // The runtime backend's HwDataB words: its GPU VA layout (USC base, unknown page) and
-    // the configuration words its InitData carries where the manager layout keeps 0 or its
-    // validated values (including the A/B pair +0xa98/+0xb40 at 0). The configuration words
-    // and unit masks are the runtime InitData's values, not derived from the device tree: they
-    // hold for the T6030 boards that InitData was checked on (J514S, J516S), not necessarily
-    // for other configurations.
+    // The runtime backend's HwDataB words: its GPU VA layout (USC base, unknown page), and the
+    // SoC's configuration words and unit masks (`words`, see `G15RuntimeHwDataB`). Those are a
+    // runtime InitData's values, not derived from the device tree: the T6030 ones hold for the
+    // boards that InitData was checked on (J514S, J516S), not necessarily for other
+    // configurations.
     #[ver(V >= V14_8_3)]
-    fn hwdata_b_runtime(raw: &mut raw::HwDataB::ver) {
+    fn hwdata_b_runtime(raw: &mut raw::HwDataB::ver, words: &G15RuntimeHwDataB) {
         raw.unk_20 = U64(RUNTIME_USC_BASE);
         raw.unk_28 = U64(RUNTIME_USC_BASE);
         raw.unk_30 = U64(RUNTIME_UNKNOWN_PAGE);
-        raw.unk_454 = 1;
-        raw.unk_464 = 1;
-        raw.unk_a7c = U64(0x1_0000_0001);
-        raw.unk_a98 = 0;
-        raw.unk_abc = U64(4);
-        raw.unk_ae4 = 0x31;
-        raw.unk_b20 = 0x14;
-        raw.unk_b24 = U64(3);
-        raw.unk_554 = 0;
-        raw.unk_17b8 = 5;
-        raw.unit_mask_a = U64(0x7_0000_0003);
-        raw.unit_mask_b = 7;
-        raw.unk_1808 = 1;
-        raw.unk_1818 = 1;
+        raw.unk_454 = words.unk_454;
+        raw.unk_464 = words.unk_464;
+        raw.unk_a7c = U64(words.unk_a7c);
+        raw.unk_a98 = words.unk_a98;
+        raw.unk_abc = U64(words.unk_abc);
+        raw.unk_ae4 = words.unk_ae4;
+        raw.unk_b20 = words.unk_b20;
+        raw.unk_b24 = U64(words.unk_b24);
+        raw.unk_554 = words.unk_554;
+        raw.unk_17b8 = words.unk_17b8;
+        raw.unit_mask_a = U64(words.unit_mask_a);
+        raw.unit_mask_b = words.unit_mask_b;
+        raw.unk_1808 = words.unk_1808;
+        raw.unk_1818 = words.unk_1818;
     }
 
     // Create the G15 (14.8.3) HwDataB structure.

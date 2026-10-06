@@ -60,11 +60,41 @@ pub(crate) fn max_frequency_khz(pdev: &platform::Device<Core>) -> Option<u32> {
     u32::try_from(max_hz / 1000).ok().filter(|khz| *khz != 0)
 }
 
-/// Register windows the runtime maps: name, base, minimum size. The same on T6030 and T8122.
-const REG_WINDOWS: [(&CStr, u64, u64); 2] = [
-    (c_str!("asc"), 0x2_9240_0000, 0x4000),
-    (c_str!("sgx"), 0x2_9000_0000, 0x100_0000),
-];
+/// The shape of the performance-state table the device tree's operating points give: states
+/// above the off state and the highest frequency in MHz (`t8122_admission::opp_table_shape`,
+/// with the highest `opp-microvolt` cell of each point). None without a readable OPP table.
+pub(crate) fn opp_table_shape(pdev: &platform::Device<Core>, soc: &Soc) -> Option<(u32, u32)> {
+    let node = pdev.as_ref().of_node()?;
+    let opps = node.parse_phandle(c_str!("operating-points-v2"), 0)?;
+    let mut points = KVec::new();
+    for opp in opps.children() {
+        let hz = opp.get_property::<u64>(c_str!("opp-hz")).ok()?;
+        let microvolt = opp.get_property::<KVec<u32>>(c_str!("opp-microvolt")).ok()?;
+        let mv = microvolt.first()?.div_ceil(1000);
+        if microvolt.len() != soc.clusters as usize
+            || microvolt.iter().any(|uv| uv.div_ceil(1000) != mv)
+        {
+            return None;
+        }
+        points.push((hz, *microvolt.first()?), GFP_KERNEL).ok()?;
+    }
+    crate::t8122_admission::opp_table_shape(points)
+}
+
+/// Register windows the runtime maps on `soc`: name, base, minimum size. The runtime uses the
+/// first 16 KiB of `asc` (`m3_device`); the first 16 MiB of `sgx` cover the ID block at
+/// +0xd04000, the Fender MMU block at +0xd08000 and the core masks at +0xe01500.
+fn reg_windows(soc: &Soc) -> [(&'static CStr, u64, u64); 2] {
+    [
+        (c_str!("asc"), soc.windows.asc, 0x4000),
+        (c_str!("sgx"), soc.windows.sgx, 0x100_0000),
+    ]
+}
+
+/// The `reg` cells (two address and two size cells) of the mailbox of `soc`: 16 KiB at its base.
+fn expected_mailbox_reg(soc: &Soc) -> [u32; 4] {
+    [(soc.windows.mailbox >> 32) as u32, soc.windows.mailbox as u32, 0, 0x4000]
+}
 
 /// Reserved regions of the firmware handoff, in `Resources::regions` order.
 const REGIONS: [&CStr; 6] = [
@@ -335,7 +365,7 @@ pub(crate) fn admit(pdev: &platform::Device<Core>, soc: &Soc) -> Result<Resource
     }
     dev_info!(dev, "M3: memory region list accepted\n");
 
-    for (name, base, min_size) in REG_WINDOWS {
+    for (name, base, min_size) in reg_windows(soc) {
         let res = pdev
             .resource_by_name(name)
             .ok_or_else(|| refuse("missing register window", EINVAL))?;
@@ -365,7 +395,7 @@ pub(crate) fn admit(pdev: &platform::Device<Core>, soc: &Soc) -> Result<Resource
     let irqs: KVec<u32> = mbox.get_property(c_str!("interrupts"))?;
     let cells: u32 = mbox.get_property(c_str!("#mbox-cells"))?;
     if !soc.mailbox_compatibles.iter().any(|c| *c == compat.as_slice())
-        || mbox_reg.as_slice() != [2, 0x92408000, 0, 0x4000]
+        || mbox_reg.as_slice() != expected_mailbox_reg(soc)
         || cells != 0
         || irq_names.as_slice() != b"send-empty\0send-not-empty\0recv-empty\0recv-not-empty\0"
         || irqs.as_slice() != soc.mailbox_interrupts
@@ -442,6 +472,17 @@ pub(crate) static KNOWN_IMAGES: [KnownImage; 2] = [
         initdata_magic: 0x0c08_e21e_8380_0490,
     },
 ];
+
+/// T8122 C0, firmware-compat 14.8.3. Runtime identification compares the loaded UUID.
+pub(crate) static KNOWN_IMAGES_T8122: [KnownImage; 1] = [KnownImage {
+    name: "T8122 C0 firmware-compat 14.8.3",
+    uuid: Some([
+        0xdf, 0x69, 0x7f, 0x05, 0xf6, 0xb5, 0x33, 0xef, 0xa1, 0x37, 0x61, 0xc4, 0xa7, 0x3d, 0x66,
+        0x6a,
+    ]),
+    stkg_sha256: None,
+    initdata_magic: 0x0c08_e21e_8380_0490,
+}];
 
 const IMAGE_INFO_OFFSET: usize = 0x4200;
 /// Size of the identifying part of the image-info header.

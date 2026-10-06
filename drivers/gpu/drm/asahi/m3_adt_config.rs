@@ -21,7 +21,7 @@ use crate::{
     m3_init_storage as storage,
     m3_memory::Buffer,
     m3_params::{self, G15Debug, InitDataParam, ThermalMode},
-    m3_soc::{IoMapping, Soc},
+    m3_soc::{IoMapping, PstateTable, Soc},
 };
 
 /// Owner indices (`m3_init_storage`) of the objects the typed builders generate.
@@ -43,8 +43,8 @@ const IO_MAPPING_SLOTS: usize = 31;
 
 /// The T6030 firmware IO mappings of the runtime backend (HwDataB slot, physical address, total
 /// size, element size, writable). The runtime maps IO with its own IO-mapping table
-/// (`m3_init_storage::IOMAPS`), which must cover every entry (checked when the contents are
-/// built). The physical addresses are T6030 SoC register blocks, the same ones the G15 manager
+/// (`m3_init_storage::T6030_IOMAPS`), which must cover every entry (checked when the contents
+/// are built). The physical addresses are T6030 SoC register blocks, the same ones the G15 manager
 /// maps (`hw::t6030`).
 pub(crate) const T6030_IO_MAPPINGS: [IoMapping; 15] = [
     (0, 0x2_90d0_0000, 0x14_4000, 0x14_4000, true), // Fender
@@ -181,6 +181,11 @@ pub(crate) struct Contents {
     images: KVec<Option<KVVec<u8>>>,
     /// The performance states the firmware may use.
     pub(crate) pstates: PstatePolicy,
+    /// The runtime's IO maps of the SoC (`Soc::iomaps`), which cover the InitData IO mappings.
+    pub(crate) iomaps: &'static [storage::IoMap],
+    /// The accepted performance-state table (`Soc::pstates`): states above the off state, and
+    /// the frequency of the highest one in MHz.
+    pub(crate) table: (u32, u32),
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
@@ -203,9 +208,33 @@ impl Contents {
         let dev = pdev.as_ref();
         let param = m3_params::initdata_param();
         check_version(dev, firmware)?;
-        let images = build_images(dev, firmware, soc)?;
+        let iomaps = soc.iomaps.ok_or(ENODEV)?;
+        storage::validate_iomaps(iomaps).map_err(|_| EINVAL)?;
+        let images = build_images(dev, firmware, soc, iomaps)?;
         let hwdata = images.get(HWDATA).and_then(|i| i.as_deref()).ok_or(EINVAL)?;
         let pstates = PstatePolicy::new(dev, hwdata)?;
+        let table = match soc.pstates {
+            PstateTable::Fixed { states, top_mhz } => (states, top_mhz),
+            PstateTable::DeviceTree => crate::m3_board::opp_table_shape(pdev, soc).ok_or_else(|| {
+                dev_err!(
+                    dev,
+                    "M3: the device tree's operating points give no performance-state table\n"
+                );
+                EINVAL
+            })?,
+        };
+        if (pstates.table_max, pstates.table_max_mhz) != table {
+            dev_err!(
+                dev,
+                "M3: performance-state table 1..={} up to {} MHz, the {} table is 1..={} up to {} MHz\n",
+                pstates.table_max,
+                pstates.table_max_mhz,
+                soc.name,
+                table.0,
+                table.1
+            );
+            return Err(EINVAL);
+        }
         // The published states never go above the device tree's highest operating point.
         if let Some(dt_khz) = crate::m3_board::max_frequency_khz(pdev) {
             if 1000 * pstates.max_mhz > dt_khz {
@@ -238,7 +267,7 @@ impl Contents {
             pstates.max,
             pstates.max_mhz
         );
-        Ok(Contents { images, pstates })
+        Ok(Contents { images, pstates, iomaps, table })
     }
 
     /// Check the contents before they are uploaded.
@@ -392,25 +421,28 @@ fn check_layout() -> Result {
 }
 
 /// Fill HwDataB's IO-mapping table (the runtime fills the virtual addresses when it maps them),
-/// checking every entry against the runtime's IO mapping of the same slot.
+/// checking every entry against the runtime's IO mapping of the same slot (`iomaps`).
 fn fill_io_mappings(
     dev: &device::Device,
     cfg: &'static hw::HwConfig,
     mappings: &[IoMapping],
+    iomaps: &[storage::IoMap],
     hwdata: &mut [u8],
 ) -> Result {
-    for &(slot, phys, total, element, writable) in mappings.iter() {
+    for (i, &(slot, phys, total, element, writable)) in mappings.iter().enumerate() {
+        if slot >= 31 || mappings[..i].iter().any(|&(other, ..)| other == slot) {
+            return Err(EINVAL);
+        }
         let entry = IO_MAPPINGS + slot * IO_MAPPING_SIZE;
         let virt = entry + offset_of!(raw::IOMapping, virt_addr);
         // The same register block as the manager's table.
         let same_block = cfg.io_mappings.get(slot).and_then(|m| m.as_ref()).is_some_and(|m| {
             m.base as u64 & !0x3fff == phys & !0x3fff && m.writable == writable
         });
-        let covered = storage::IOMAPS.iter().any(|io| {
+        let covered = iomaps.iter().any(|io| {
             io.slot == slot
                 && io.pointer_field() == Ok(virt)
-                && io.physical + io.offset as u64 == phys
-                && phys + u64::from(total) <= io.physical + io.size as u64
+                && io.covers(phys, total)
         });
         if !same_block || !covered || element == 0 || total % element != 0 {
             dev_err!(dev, "M3: IO mapping slot {} ({:#x}) does not match the object layout\n", slot, phys);
@@ -426,7 +458,7 @@ fn fill_io_mappings(
         )?;
     }
     // Every IO mapping the runtime makes must belong to one of the entries above.
-    for io in storage::IOMAPS.iter() {
+    for io in iomaps.iter() {
         if !mappings.iter().any(|&(slot, ..)| slot == io.slot) {
             dev_err!(dev, "M3: IO mapping slot {} ({:#x}) has no device-tree InitData entry\n", io.slot, io.physical);
             return Err(EINVAL);
@@ -435,7 +467,12 @@ fn fill_io_mappings(
     Ok(())
 }
 
-pub(crate) fn check_upload(dev: &device::Device, firmware: &Firmware, objects: &mut [Buffer]) -> Result {
+pub(crate) fn check_upload(
+    dev: &device::Device,
+    firmware: &Firmware,
+    iomaps: &[storage::IoMap],
+    objects: &mut [Buffer],
+) -> Result {
     let mut bad = 0u32;
     let version = objects.get_mut(INITDATA).ok_or(EINVAL)?.read_u64(0)?;
     if version != firmware.image.initdata_magic {
@@ -470,7 +507,7 @@ pub(crate) fn check_upload(dev: &device::Device, firmware: &Firmware, objects: &
         let phys = hwdata.read_u64(entry + offset_of!(raw::IOMapping, phys_addr))?;
         let virt = hwdata.read_u64(entry + offset_of!(raw::IOMapping, virt_addr))?;
         let total = u64::from(hwdata.read_u32(entry + offset_of!(raw::IOMapping, total_size))?);
-        let ok = match storage::IOMAPS.iter().find(|io| io.slot == slot) {
+        let ok = match iomaps.iter().find(|io| io.slot == slot) {
             Some(io) => {
                 phys == io.physical + io.offset as u64
                     && virt == io.address + io.offset as u64
@@ -510,7 +547,7 @@ pub(crate) fn check_upload(dev: &device::Device, firmware: &Firmware, objects: &
         "M3: InitData self-check passed: version {:#x}, {} record pointers, {} IO mappings, GPU region {:#x}\n",
         version,
         RECORD_POINTERS.len(),
-        storage::IOMAPS.len(),
+        iomaps.len(),
         region
     );
     Ok(())
@@ -523,7 +560,12 @@ fn zeroed(index: usize) -> Result<KVVec<u8>> {
 }
 
 /// Build the images of the generated owners from the device tree.
-fn build_images(dev: &device::Device, firmware: &Firmware, soc: &Soc) -> Result<KVec<Option<KVVec<u8>>>> {
+fn build_images(
+    dev: &device::Device,
+    firmware: &Firmware,
+    soc: &Soc,
+    iomaps: &[storage::IoMap],
+) -> Result<KVec<Option<KVVec<u8>>>> {
     check_layout().inspect_err(|_| {
         dev_err!(dev, "M3: the constructed InitData records do not match the G15 InitData structures\n")
     })?;
@@ -551,6 +593,7 @@ fn build_images(dev: &device::Device, firmware: &Firmware, soc: &Soc) -> Result<
         cap: None,
         timestamp_base: Some(crate::agx_memory::TIMESTAMP_RANGE.start),
         reference_ppm: true,
+        runtime_hwdata_b: Some(soc.hwdata_b.ok_or(ENODEV)?),
     };
     let c = initdata::InitDataBuilderG15V14_8_3::g15_contents(cfg, &dyncfg, &g15).inspect_err(|e| {
         dev_err!(dev, "M3: cannot build InitData from the device tree ({:?})\n", e)
@@ -596,7 +639,7 @@ fn build_images(dev: &device::Device, firmware: &Firmware, soc: &Soc) -> Result<
         HWDATA_A + offset_of!(raw::HwDataAG15V14_8_3, init_timestamp),
         &now.to_le_bytes(),
     )?;
-    fill_io_mappings(dev, cfg, io_mappings, &mut hwdata)?;
+    fill_io_mappings(dev, cfg, io_mappings, iomaps, &mut hwdata)?;
     images[HWDATA] = Some(hwdata);
 
     let mut globals = zeroed(GLOBALS)?;

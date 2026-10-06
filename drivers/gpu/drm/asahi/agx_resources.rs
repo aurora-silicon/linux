@@ -105,6 +105,19 @@ mod tests {
         assert!(Resources::validate(1, relocated, VAS, [1, 0]).is_ok());
     }
 
+    /// Relocating the UAT reservations preserves their sizes and ownership checks.
+    #[test]
+    fn relocated_uat_regions_keep_firmware_segments() {
+        let mut regions = observed();
+        for region in &mut regions[..4] {
+            region.base -= 0x40000;
+        }
+        let res = Resources::validate(1, regions, VAS, [1, 0]).unwrap();
+        assert_eq!(res.regions[0].base, 0x103fff78000);
+        assert_eq!(res.regions[4], observed()[4]);
+        assert_eq!(res.regions[5], observed()[5]);
+    }
+
     #[test]
     fn rejects_missing_overlapping_unaligned_and_out_of_range_memory() {
         for r in [

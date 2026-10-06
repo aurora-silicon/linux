@@ -96,7 +96,7 @@ impl Config {
             let mut b=Buffer::at(dev,uat.kernel_vm(),None,Some(a.address),a.size,a.gpu_shared)?;
             b.write(0,image)?;objects.push(b,GFP_KERNEL)?;
         }
-        for io in storage::IOMAPS {
+        for io in contents.iomaps {
             let map=uat.kernel_vm().map_io(io.address,io.physical.try_into()?,io.size,prot::PROT_FW_MMIO_RW)?;
             let owned=init::Region::new(map.iova(),io.size).map_err(|_|EINVAL)?;
             let field=io.pointer_field().map_err(|_|EINVAL)?;
@@ -127,8 +127,14 @@ impl Config {
         // tables, power/thermal ceilings and minimum operating state.
         // The bring-up image initialized actual/target and every base to 1
         // (338 MHz), so short desktop jobs never left that startup state.
-        if objects[HARDWARE_DATA].read_u32(0xb58)? != 8
-            || objects[HARDWARE_DATA].read_u32(0xb5c + 8 * 4)? != 1380 { return Err(EINVAL); }
+        // The uploaded table is the SoC's (`Soc::pstates`): its highest state at +0xb58 and that
+        // state's frequency in the table at +0xb5c (8 and 1380 MHz on T6030).
+        let (states, top_mhz) = contents.table;
+        if objects[HARDWARE_DATA].read_u32(0xb58)? != states
+            || objects[HARDWARE_DATA].read_u32(0xb5c + states as usize * 4)? != top_mhz
+        {
+            return Err(EINVAL);
+        }
         let (hwdata, globals) = objects.split_at_mut(GLOBALS);
         crate::m3_adt_config::publish_pstates(dev.as_ref(), &mut hwdata[HARDWARE_DATA], &mut globals[0], &contents.pstates)?;
         // Firmware ktrace is for explicit detailed diagnostics. Normal games
@@ -136,7 +142,7 @@ impl Config {
         // every firmware operation on the command-processing core.
         objects[RUNTIME_FLAGS].u32(0,u32::from(crate::debug::debug_enabled(
             crate::debug::DebugFlags::SubmitTiming)))?;
-        crate::m3_adt_config::check_upload(dev.as_ref(), firmware, &mut objects)?;
+        crate::m3_adt_config::check_upload(dev.as_ref(), firmware, contents.iomaps, &mut objects)?;
         agx_memory::publish();
         let thermal = crate::m3_thermal::Governor::new(dev.as_ref(), &contents.pstates)?;
         #[cfg(CONFIG_DEV_COREDUMP)]

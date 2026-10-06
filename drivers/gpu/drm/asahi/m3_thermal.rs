@@ -69,35 +69,16 @@ use crate::{
 /// exists but cannot be read fails the reading. The M3 Pro boards (J514S and J516S) need
 /// both zones: on a J516S the SMC die sensors alone stayed below 67 C while the PMP hotspot
 /// exceeded 85 C and the cap stepped down. Without the PMP running, the cap stays safe.
-/// The M3 MacBook Airs (J613 and J615) need the SMC die zone: they have no fan, and no PMP
-/// hotspot zone exists on a T8122, so it is their only SoC die reading.
+/// Every T8122 board requires the SMC die zone; T8122 has no PMP hotspot zone.
 const ZONES: [&CStr; 2] = [c_str!("macsmc_soc_die"), c_str!("apple_pmp_hotspot")];
 // Do not raise its cap on a partial reconstruction of that sensor set.
 const J516_REQUIRED_ZONES: u32 = 3;
-/// The SMC die zone alone (bit 0 of [`ZONES`]).
-const AIR_REQUIRED_ZONES: u32 = 1;
-
 fn required_zones() -> u32 {
     let Some(root) = kernel::of::root() else { return J516_REQUIRED_ZONES; };
     let Ok(compatible) = root.get_property::<KVec<u8>>(c_str!("compatible")) else {
         return J516_REQUIRED_ZONES;
     };
-    if compatible.is_empty() || compatible.last() != Some(&0) {
-        return J516_REQUIRED_ZONES;
-    }
-    if compatible
-        .split(|b| *b == 0)
-        .any(|s| s == b"apple,j516s" || s == b"apple,j514s")
-    {
-        J516_REQUIRED_ZONES
-    } else if compatible
-        .split(|b| *b == 0)
-        .any(|s| s == b"apple,j613" || s == b"apple,j615")
-    {
-        AIR_REQUIRED_ZONES
-    } else {
-        0
-    }
+    crate::m3_thermal_policy::required_zones(&compatible)
 }
 
 /// Sensor polling period while the GPU is busy and while it is idle, in ms.

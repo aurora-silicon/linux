@@ -361,16 +361,22 @@ impl File {
         if gpu.supports_scheduled_queues() {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SCHEDULED_QUEUES as u64;
         }
-        if facts.chip_id==0x6030 && *module_parameters::m3_early_tiling.value()!=0 {
+        // The M3 runtime's optional features are per SoC (`m3_soc::Soc::features`).
+        let m3 = crate::m3_soc::by_chip(facts.chip_id);
+        if m3.is_some_and(|soc| soc.features.fragment_dependency)
+            && *module_parameters::m3_early_tiling.value()!=0
+        {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY as u64;
         }
-        if facts.chip_id==0x6030 {
+        if m3.is_some_and(|soc| soc.features.compute_wide_visibility) {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_WIDE_VISIBILITY as u64;
         }
         // The owned M3/M4 runtimes do not apply the legacy InitData fault_control
         // parameter. Do not invite speculative invalid accesses until its
-        // firmware/MMU soft-fault configuration is implemented and qualified.
-        if !matches!(facts.chip_id, 0x6030 | 0x6031 | 0x6034 | 0x8132)
+        // firmware/MMU soft-fault configuration is implemented and qualified:
+        // not on any SoC with an M3 runtime table, nor on the M3 Max or M4.
+        if m3.is_none()
+            && !matches!(facts.chip_id, 0x6031 | 0x6034 | 0x8132)
             && *module_parameters::fault_control.value() == 0xb
         {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;

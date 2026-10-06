@@ -6,6 +6,22 @@
 //! Times are monotonic nanoseconds from any fixed origin, temperatures millidegrees Celsius, and
 //! states indices of the published performance-state table.
 
+/// Required thermal-zone bits: SMC die (bit 0), PMP hotspot (bit 1).
+/// A missing or malformed compatible list requires both zones.
+pub(crate) fn required_zones(compatible: &[u8]) -> u32 {
+    if compatible.is_empty() || compatible.last() != Some(&0) {
+        return 3;
+    }
+    let has = |name: &[u8]| compatible.split(|b| *b == 0).any(|s| s == name);
+    if has(b"apple,j514s") || has(b"apple,j516s") {
+        3
+    } else if has(b"apple,t8122") || has(b"apple,j613") || has(b"apple,j615") {
+        1
+    } else {
+        0
+    }
+}
+
 /// Nanoseconds per millisecond and per second.
 pub(crate) const MS: i64 = 1_000_000;
 pub(crate) const S: i64 = 1_000 * MS;
@@ -238,5 +254,30 @@ impl Policy {
         };
         self.over = Some((since, count));
         (count >= IGNORED_CHECKS && now - since >= IGNORED_NS).then_some((count, now - since))
+    }
+}
+
+#[cfg(test)]
+mod zone_tests {
+    use super::required_zones;
+
+    #[test]
+    fn every_t8122_board_requires_the_die_zone() {
+        for board in ["j613", "j615", "j504", "j433", "j434"] {
+            let compatible = format!("apple,{board}\0apple,t8122\0apple,arm-platform\0");
+            assert_eq!(required_zones(compatible.as_bytes()), 1);
+        }
+        assert_eq!(required_zones(b"apple,j613\0"), 1);
+        assert_eq!(required_zones(b"apple,j615\0"), 1);
+    }
+
+    #[test]
+    fn pro_and_malformed_lists_keep_both_zone_requirement() {
+        assert_eq!(required_zones(b"apple,j514s\0apple,t6030\0"), 3);
+        assert_eq!(required_zones(b"apple,j516s\0apple,t6030\0"), 3);
+        assert_eq!(required_zones(b""), 3);
+        assert_eq!(required_zones(b"apple,t8122"), 3);
+        assert_eq!(required_zones(b"apple,j274\0apple,t8103\0"), 0);
+        assert_eq!(required_zones(b"apple,t81220\0"), 0);
     }
 }

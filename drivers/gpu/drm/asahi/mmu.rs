@@ -118,8 +118,9 @@ const G15_DEKKER_HANDOFF_OBSERVED: bool = true;
 pub(crate) enum HandoffMode {
     FirmwareDekker,
     StoppedFirmwareT6030,
-    /// J514S RTKit is running before the AP publishes its host mappings.
-    FirmwareT6030,
+    /// The M3 runtime's RTKit is running before the AP publishes its host mappings (observed
+    /// on J514S).
+    FirmwareM3,
 
 }
 
@@ -128,8 +129,8 @@ struct UatConfig {
     chip_id: u32,
     ias: u8,
     oas: u32,
-    /// Kernel tables are the bootloader-reserved handoff tables (T6030 runtime owners);
-    /// false for the HwConfig-driven GpuManager paths.
+    /// Kernel tables are the bootloader-reserved handoff tables (the M3 runtime owner, on any
+    /// SoC it admits); false for the HwConfig-driven GpuManager paths.
     reserved_tables: bool,
 }
 
@@ -143,8 +144,31 @@ impl UatConfig {
         }
     }
 
-    const T6030: Self = Self { chip_id: 0x6030, ias: 42, oas: 42, reserved_tables: true };
+    /// The M3 runtime's UAT on the SoC of `cfg`: the bootloader-reserved handoff tables, with the
+    /// root geometry of that SoC (42-bit roots and output addresses on every AGX3 part). On
+    /// T6030 this is chip 0x6030, 42/42, the configuration its runtime always used.
+    fn m3_runtime(cfg: &'static hw::HwConfig) -> Result<Self> {
+        let soc = crate::m3_soc::by_chip(cfg.chip_id).ok_or(ENODEV)?;
+        if cfg.uat_ias != 42 || cfg.uat_oas != 42
+            || !soc.hwcfg.is_some_and(|expected| core::ptr::eq(expected, cfg))
+        {
+            return Err(ENODEV);
+        }
+        Ok(Self {
+            chip_id: cfg.chip_id,
+            ias: cfg.uat_ias,
+            oas: cfg.uat_oas,
+            reserved_tables: true,
+        })
+    }
 
+    /// Whether an M3 owner holds this UAT: the M3 runtime (reserved tables) on any SoC, or the
+    /// G15 manager backend, which runs on T6030 only. These owners look their reserved regions
+    /// up through `m3_resources`, track faults and VM status, and keep the AP side of the
+    /// handoff themselves.
+    const fn m3_owner(&self) -> bool {
+        self.reserved_tables || self.chip_id == 0x6030
+    }
 }
 
 fn uat_geometry(cfg: UatConfig) -> Result<UatGeometry> {
@@ -1506,7 +1530,7 @@ impl Handoff {
         }
         fence(Ordering::SeqCst);
 
-        if matches!(mode, HandoffMode::FirmwareDekker | HandoffMode::FirmwareT6030) {
+        if matches!(mode, HandoffMode::FirmwareDekker | HandoffMode::FirmwareM3) {
             let start = Instant::<Monotonic>::now();
             const TIMEOUT: Delta = Delta::from_millis(1000);
 
@@ -1658,18 +1682,18 @@ impl Vm {
         let iova_kern_range = iova_kern_range(cfg)?;
 
         let page_table = if let Some(ttb) = ttb {
-            if cfg == UatConfig::T6030 {
+            if cfg.reserved_tables {
                 let node = dev.as_ref().of_node().ok_or(ENODEV)?;
                 let mut resources = KVec::new();
                 for name in [c_str!("pagetables"), c_str!("shared-l2")] {
                     resources.push(crate::m3_resources::reserved_resource(&node, name)?, GFP_KERNEL)?;
                 }
-                // SAFETY: The M4 constructor admits these reservations and
-                // requires ASC stopped during handoff/table initialization.
-                let wc = cfg == UatConfig::T6030
+                // SAFETY: the owner retains these admitted reservations until ASC stops.
+                // Running firmware roots are preserved until host InitData is published.
+                let wc = cfg.reserved_tables
                     && [c_str!("pagetables"), c_str!("shared-l2")].iter().all(|name| crate::m3_board::region_is_nomap(&node, name));
                 let tables = unsafe { if wc {crate::pgtable_memory::ReservedTables::new_wc(resources)} else {crate::pgtable_memory::ReservedTables::new(resources)} }?;
-                if cfg == UatConfig::T6030 && uat_inner.m3_running {
+                if cfg.reserved_tables && uat_inner.m3_running {
                     // RTKit has switched its private mapping regime. Preserve
                     // firmware root entries 0/1; the host window is unused
                     // until this owner publishes initdata.
@@ -1683,7 +1707,7 @@ impl Vm {
             } else {
                 UatPageTable::new_with_ttb(ttb, iova_kern_range.clone(), cfg.ias, cfg.oas)?
             }
-        } else if cfg == UatConfig::T6030 {
+        } else if cfg.reserved_tables {
             UatPageTable::new_m3_coherent(cfg.ias,cfg.oas,dev)?
 
         } else {
@@ -1742,9 +1766,13 @@ impl Vm {
                 }),
             )?,
             binding,
-            driver_mappings: if cfg.chip_id == 0x6030 { Some(Arc::pin_init(new_mutex!(None, "VmDriverMappings"), GFP_KERNEL)?) } else { None },
-            status: if cfg.chip_id == 0x6030 { Some(Arc::new(crate::agx_status::VmStatus::new(), GFP_KERNEL)?) } else { None },
-            job_lifetime: if cfg.chip_id == 0x6030 {
+            driver_mappings: if cfg.m3_owner() {
+                Some(Arc::pin_init(new_mutex!(None, "VmDriverMappings"), GFP_KERNEL)?)
+            } else { None },
+            status: if cfg.m3_owner() {
+                Some(Arc::new(crate::agx_status::VmStatus::new(), GFP_KERNEL)?)
+            } else { None },
+            job_lifetime: if cfg.m3_owner() {
                 Some(Arc::pin_init(new_mutex!(M3VmJobLifetime {
                     active: 0, closed: false, close_ranges: None, closed_objects: KVec::new(),
                 }, "M3VmJobLifetime"), GFP_KERNEL)?)
@@ -2365,7 +2393,7 @@ impl Uat {
         m3: bool,
     ) -> Result<UatRegion> {
         let of_node = dev.of_node().ok_or(EINVAL)?;
-        // Only the T6030 owner may fall back to its static reserved-memory
+        // Only an M3 owner may fall back to its static reserved-memory
         // nodes. Every other GPU keeps the plain lookup and its errors.
         let res = if m3 {
             crate::m3_resources::reserved_resource(&of_node, name)?
@@ -2549,7 +2577,9 @@ impl Uat {
     /// Creates the reference-counted inner data for a new `Uat` instance.
     #[inline(never)]
     fn make_inner(dev: &driver::AsahiDevice, handoff_mode: HandoffMode, m3: bool) -> Result<Arc<UatInner>> {
-        let cached = !matches!(handoff_mode,HandoffMode::StoppedFirmwareT6030|HandoffMode::FirmwareT6030);
+        let cached = !matches!(
+            handoff_mode, HandoffMode::StoppedFirmwareT6030 | HandoffMode::FirmwareM3
+        );
         let handoff_rgn =
             Self::map_region(dev.as_ref(), c_str!("handoff"), HANDOFF_SIZE, cached, m3)?;
         let ttbs_rgn = Self::map_region(dev.as_ref(), c_str!("ttbs"), SLOTS_SIZE, cached, m3)?;
@@ -2568,7 +2598,7 @@ impl Uat {
         let shared_fault = fault.clone();
         Arc::pin_init(
             try_pin_init!(UatInner {
-                m3_running: handoff_mode == HandoffMode::FirmwareT6030,
+                m3_running: handoff_mode == HandoffMode::FirmwareM3,
                 fault,
                 firmware_cache_flush_ready: AtomicBool::new(
                     handoff_mode == HandoffMode::FirmwareDekker
@@ -2591,11 +2621,16 @@ impl Uat {
         )
     }
 
+    /// The M3 runtime's UAT on the SoC of `cfg` (`m3_soc::Soc::hwcfg`).
+    ///
     /// # Safety
-    /// J514S RTKit has completed wake, but has not received an initdata root.
-    /// The owner retains power and excludes GPU jobs until publication.
-    pub(crate) unsafe fn new_t6030_running(dev: &driver::AsahiDevice) -> Result<Self> {
-        Self::new_with_config(dev,UatConfig::T6030,true,HandoffMode::FirmwareT6030)
+    /// The admitted RTKit (J514S on T6030) has completed wake, but has not received an initdata
+    /// root. The owner retains power and excludes GPU jobs until publication.
+    pub(crate) unsafe fn new_m3_running(
+        dev: &driver::AsahiDevice,
+        cfg: &'static hw::HwConfig,
+    ) -> Result<Self> {
+        Self::new_with_config(dev, UatConfig::m3_runtime(cfg)?, true, HandoffMode::FirmwareM3)
     }
 
     #[inline(never)]
@@ -2614,7 +2649,7 @@ impl Uat {
         map_kernel_to_user: bool,
         handoff_mode: HandoffMode,
     ) -> Result<Self> {
-        // M4 requires the stopped-ASC contract of its unsafe constructor.
+        // The stopped-firmware mode requires its dedicated ownership contract.
         if handoff_mode == HandoffMode::StoppedFirmwareT6030 { return Err(EINVAL); }
         Self::new_with_config(
             dev,
@@ -2643,9 +2678,9 @@ impl Uat {
         // M3.
         let kernel_range = iova_kern_range(cfg)?;
         match handoff_mode {
-            HandoffMode::FirmwareT6030 => { if cfg != UatConfig::T6030 {return Err(ENODEV);} }
+            HandoffMode::FirmwareM3 => { if !cfg.reserved_tables {return Err(ENODEV);} }
             HandoffMode::StoppedFirmwareT6030 => {
-                if cfg != UatConfig::T6030 { return Err(ENODEV); }
+                if !cfg.reserved_tables || cfg.chip_id != 0x6030 { return Err(ENODEV); }
             }
             HandoffMode::FirmwareDekker => {
                 if cfg.ias != 39
@@ -2663,10 +2698,10 @@ impl Uat {
 
         }
 
-        let inner = Self::make_inner(dev, handoff_mode, cfg.chip_id == 0x6030)?;
+        let inner = Self::make_inner(dev, handoff_mode, cfg.m3_owner())?;
 
         let of_node = dev.as_ref().of_node().ok_or(EINVAL)?;
-        let res = if cfg.chip_id == 0x6030 {
+        let res = if cfg.m3_owner() {
             crate::m3_resources::reserved_resource(&of_node, c_str!("pagetables"))?
         } else {
             of_node.reserved_mem_region_to_resource_byname(c_str!("pagetables"))?
@@ -2689,7 +2724,7 @@ impl Uat {
             None,
             1,
         )?;
-        if cfg == UatConfig::T6030 {
+        if cfg.reserved_tables {
             // M3's bootstrap command register lists are fetched through this
             // low root in context zero. It never acquires a VmBind, but its
             // mappings are live: dropping/remapping a command must invalidate
@@ -2724,7 +2759,7 @@ impl Uat {
         inner.map_kernel_to_user = map_kernel_to_user;
         inner.kernel_ttb1 = ttb1;
 
-        inner.handoff().init(handoff_mode, cfg.chip_id == 0x6030)?;
+        inner.handoff().init(handoff_mode, cfg.m3_owner())?;
 
         dev_info!(dev.as_ref(), "MMU: Initializing TTBs\n");
 
@@ -2752,7 +2787,7 @@ impl Uat {
 
 impl Drop for Uat {
     fn drop(&mut self) {
-        if self.cfg == UatConfig::T6030 {
+        if self.cfg.reserved_tables {
             self.inner.firmware_cache_flush_ready.store(false, Ordering::Release);
             let inner = self.inner.lock();
             let _guard = match inner.lock_handoff() {

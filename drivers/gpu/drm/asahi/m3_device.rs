@@ -100,6 +100,9 @@ impl Device {
 
     pub(crate) fn core_mask(&self) -> u32 { self.core_mask }
 
+    /// The SoC table this device was admitted with.
+    pub(crate) fn soc(&self) -> &'static Soc { self.soc }
+
     pub(crate) fn check_idle(&self)->Result {
         let sgx=self.sgx.try_access().ok_or(ENODEV)?;
         if (sgx.try_read64(0xc020)? | sgx.try_read64(0xc120)?) & 1 != 0 {
