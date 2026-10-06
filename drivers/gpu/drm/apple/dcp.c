@@ -1983,8 +1983,12 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	disable_delayed_work(&dcp->typec_reconnect_wq);
 	disable_delayed_work(&dcp->placeholder_edid_wq);
 	disable_delayed_work(&dcp->typec_fabric_retrain_wq);
-	if (dcp->external_native) {
-		/* Bind enables these; firmware callbacks may come before it. */
+	/*
+	 * A native external pipe's bind enables these; firmware callbacks may
+	 * come before it. The 14.7 panel never uses them, but suspend cancels
+	 * the watchdog of every processor.
+	 */
+	if (fw_compat == DCP_FIRMWARE_V_14_7) {
 		INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
 		INIT_DELAYED_WORK(&dcp->swap_watchdog_wq, dcp_swap_watchdog);
 		disable_work(&dcp->vblank_wq);
