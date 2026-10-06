@@ -35,8 +35,11 @@
  * SOFTWARE.
  */
 
+#include <linux/moduleparam.h>
 #include <linux/bug.h>
 #include <linux/sched/signal.h>
+#include <linux/mm.h>
+#include <linux/mm_subpage.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/splice.h>
@@ -65,8 +68,35 @@ struct tls_decrypt_ctx {
 	u8 aad[TLS_MAX_AAD_SIZE];
 	u8 tail;
 	bool free_sgout;
+#ifdef CONFIG_MM_SUBPAGE
+	struct user_page_fragment *fragments;
+	unsigned int nr_fragments;
+	bool fragments_dirty;
+	struct llist_node cleanup;
+	void *allocation;
+#endif
 	struct scatterlist sg[];
 };
+
+#if IS_ENABLED(CONFIG_KUNIT) && IS_ENABLED(CONFIG_MM_SUBPAGE)
+/* Explicit test-only async provider selection; normal cipher selection stays intact. */
+static bool user4k_test_async;
+module_param_named(user4k_test_async, user4k_test_async, bool, 0400);
+MODULE_PARM_DESC(user4k_test_async, "KUnit: select cryptd for TLS receive testing");
+static atomic_long_t user4k_rx_deferred = ATOMIC_LONG_INIT(0);
+static atomic_long_t user4k_rx_released = ATOMIC_LONG_INIT(0);
+
+static int user4k_read_count(char *buffer, const struct kernel_param *param)
+{
+	return scnprintf(buffer, PAGE_SIZE, "%ld\n", atomic_long_read(param->arg));
+}
+
+static const struct kernel_param_ops user4k_count_ops = {
+	.get = user4k_read_count,
+};
+module_param_cb(user4k_rx_deferred, &user4k_count_ops, &user4k_rx_deferred, 0444);
+module_param_cb(user4k_rx_released, &user4k_count_ops, &user4k_rx_released, 0444);
+#endif
 
 noinline void tls_err_abort(struct sock *sk, int err)
 {
@@ -184,6 +214,35 @@ static int tls_padding_length(struct tls_prot_info *prot, struct sk_buff *skb,
 	return sub;
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+static void tls_release_user_fragments(struct tls_decrypt_ctx *dctx)
+{
+	release_user_fragments(dctx->fragments, dctx->nr_fragments, dctx->fragments_dirty);
+	kfree(dctx->fragments);
+	dctx->fragments = NULL;
+	dctx->nr_fragments = 0;
+}
+#endif
+
+/* Dirty pin release can take folio locks, so it belongs to the waiting task. */
+static void tls_finish_subpage_decrypts(struct tls_sw_context_rx *ctx)
+{
+#ifdef CONFIG_MM_SUBPAGE
+	struct tls_decrypt_ctx *dctx, *next;
+	struct llist_node *head = llist_del_all(&ctx->subpage_cleanup);
+
+	llist_for_each_entry_safe(dctx, next, head, cleanup) {
+		void *allocation = dctx->allocation;
+
+		tls_release_user_fragments(dctx);
+#if IS_ENABLED(CONFIG_KUNIT)
+		atomic_long_inc(&user4k_rx_released);
+#endif
+		kfree(allocation);
+	}
+#endif
+}
+
 static void tls_decrypt_done(void *data, int err)
 {
 	struct aead_request *aead_req = data;
@@ -196,6 +255,7 @@ static void tls_decrypt_done(void *data, int err)
 	unsigned int pages;
 	struct sock *sk;
 	int aead_size;
+	bool deferred = false;
 
 	/* If requests get too backlogged crypto API returns -EBUSY and calls
 	 * ->complete(-EINPROGRESS) immediately followed by ->complete(0)
@@ -224,17 +284,29 @@ static void tls_decrypt_done(void *data, int err)
 		tls_err_abort(sk, err);
 	}
 
-	/* Free the destination pages if skb was not decrypted inplace */
-	if (dctx->free_sgout) {
-		/* Skip the first S/G entry as it points to AAD */
-		for_each_sg(sg_next(sgout), sg, UINT_MAX, pages) {
-			if (!sg)
-				break;
-			put_page(sg_page(sg));
-		}
+#ifdef CONFIG_MM_SUBPAGE
+	if (dctx->fragments) {
+		dctx->allocation = aead_req;
+#if IS_ENABLED(CONFIG_KUNIT)
+		atomic_long_inc(&user4k_rx_deferred);
+#endif
+		llist_add(&dctx->cleanup, &ctx->subpage_cleanup);
+		deferred = true;
 	}
+#endif
+	if (!deferred) {
+		/* Free the destination pages if skb was not decrypted inplace */
+		if (dctx->free_sgout) {
+			/* Skip the first S/G entry as it points to AAD */
+			for_each_sg(sg_next(sgout), sg, UINT_MAX, pages) {
+				if (!sg)
+					break;
+				put_page(sg_page(sg));
+			}
+		}
 
-	kfree(aead_req);
+		kfree(aead_req);
+	}
 
 	if (atomic_dec_and_test(&ctx->decrypt_pending))
 		complete(&ctx->async_wait.completion);
@@ -246,6 +318,7 @@ static int tls_decrypt_async_wait(struct tls_sw_context_rx *ctx)
 		crypto_wait_req(-EINPROGRESS, &ctx->async_wait);
 	atomic_inc(&ctx->decrypt_pending);
 
+	tls_finish_subpage_decrypts(ctx);
 	__skb_queue_purge(&ctx->async_hold);
 	return ctx->async_wait.err;
 }
@@ -670,6 +743,7 @@ static int tls_split_open_record(struct sock *sk, struct tls_rec *from,
 	msg_opl->sg.size = bytes;
 
 	msg_npl = &new->msg_plaintext;
+	sk_msg_subpages_share(msg_npl, msg_opl);
 	msg_npl->apply_bytes = apply;
 	msg_npl->sg.size = orig_size - bytes;
 
@@ -733,6 +807,7 @@ static void tls_merge_open_record(struct sock *sk, struct tls_rec *to,
 	sk_msg_free(sk, &to->msg_encrypted);
 	sk_msg_xfer_full(&to->msg_encrypted, &from->msg_encrypted);
 
+	sk_msg_subpages_release(msg_npl);
 	kfree(from);
 }
 
@@ -935,12 +1010,14 @@ more_data:
 		redir_ingress = psock->redir_ingress;
 		sk_redir = psock->sk_redir;
 		memcpy(&msg_redir, msg, sizeof(*msg));
+		sk_msg_subpages_get(&msg_redir);
 		if (msg->apply_bytes < send)
 			msg->apply_bytes = 0;
 		else
 			msg->apply_bytes -= send;
 		sk_msg_return_zero(sk, msg, send);
 		msg->sg.size -= send;
+		sk_msg_subpages_drop_empty(msg);
 		release_sock(sk);
 		err = tcp_bpf_sendmsg_redir(sk_redir, redir_ingress,
 					    &msg_redir, send, flags);
@@ -956,6 +1033,7 @@ more_data:
 			*copied -= sk_msg_free_nocharge(sk, &msg_redir);
 			msg->sg.size = 0;
 		}
+		sk_msg_subpages_release(&msg_redir);
 		if (msg->sg.size == 0)
 			tls_free_open_rec(sk);
 		break;
@@ -1036,7 +1114,14 @@ static int tls_sw_sendmsg_splice(struct sock *sk, struct msghdr *msg,
 			return -EIO;
 		}
 
-		sk_msg_page_add(msg_pl, page, part, off);
+		{
+			int ret = sk_msg_page_add(msg_pl, page, part, off);
+
+			if (ret) {
+				iov_iter_revert(&msg->msg_iter, part);
+				return ret;
+			}
+		}
 		msg_pl->sg.copybreak = 0;
 		msg_pl->sg.curr = msg_pl->sg.end;
 		sk_mem_charge(sk, part);
@@ -1454,10 +1539,96 @@ tls_rx_rec_wait(struct sock *sk, struct sk_psock *psock, bool nonblock,
 	return 1;
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+static bool tls_subpage_iter(const struct iov_iter *iter)
+{
+	return user_backed_iter(iter) && current->mm && mm_page_size(current->mm) < PAGE_SIZE;
+}
+#endif
+
+static int tls_iter_sg_capacity(struct iov_iter *iter, size_t length)
+{
+#ifdef CONFIG_MM_SUBPAGE
+	if (tls_subpage_iter(iter)) {
+		struct iov_iter walk = *iter;
+		unsigned int count = 0;
+
+		length = min(length, iov_iter_count(iter));
+		while (length) {
+			size_t bytes, offset;
+
+			iov_iter_advance(&walk, 0);
+			bytes = min(length, iter_iov_len(&walk));
+			if (WARN_ON_ONCE(!bytes))
+				return INT_MAX;
+			offset = (unsigned long)iter_iov_addr(&walk) & (MM_SUBPAGE_SIZE - 1);
+			count += DIV_ROUND_UP(offset + bytes, MM_SUBPAGE_SIZE);
+			iov_iter_advance(&walk, bytes);
+			length -= bytes;
+		}
+		return count;
+	}
+#endif
+	return iov_iter_npages_cap(iter, INT_MAX, length);
+}
+
+#ifdef CONFIG_MM_SUBPAGE
+static int tls_setup_subpage_iter(struct iov_iter *from, int length, int *pages_used,
+				 struct scatterlist *to, int capacity,
+				 struct tls_decrypt_ctx *dctx)
+{
+	unsigned int used = 0, total = 0;
+	int ret = 0;
+
+	if (!length)
+		return 0;
+	if (WARN_ON_ONCE(*pages_used || capacity <= 0))
+		return -EINVAL;
+	dctx->fragments = kmalloc_array(capacity, sizeof(*dctx->fragments), GFP_KERNEL);
+	if (!dctx->fragments)
+		return -ENOMEM;
+	while (length) {
+		long nr;
+		unsigned int i, bytes = 0;
+
+		iov_iter_advance(from, 0);
+		nr = pin_user_fragments_remote(current->mm,
+			(unsigned long)iter_iov_addr(from),
+			min_t(size_t, length, iter_iov_len(from)), FOLL_WRITE,
+			dctx->fragments + used, capacity - used);
+		if (nr <= 0) {
+			ret = nr ?: -EFAULT;
+			goto out;
+		}
+		for (i = 0; i < nr; i++) {
+			struct user_page_fragment *fragment = &dctx->fragments[used];
+
+			sg_set_page(&to[used],
+				folio_page(fragment->folio, fragment->offset >> PAGE_SHIFT),
+				fragment->length, offset_in_page(fragment->offset));
+			sg_unmark_end(&to[used]);
+			bytes += fragment->length;
+			used++;
+		}
+		dctx->nr_fragments = used;
+		iov_iter_advance(from, bytes);
+		length -= bytes;
+		total += bytes;
+	}
+	if (used)
+		sg_mark_end(&to[used - 1]);
+out:
+	if (ret)
+		iov_iter_revert(from, total);
+	*pages_used = used;
+	return ret;
+}
+#endif
+
 static int tls_setup_from_iter(struct iov_iter *from,
 			       int length, int *pages_used,
 			       struct scatterlist *to,
-			       int to_max_pages)
+			       int to_max_pages, struct tls_decrypt_ctx *dctx)
 {
 	int rc = 0, i = 0, num_elem = *pages_used, maxpages;
 	struct page *pages[MAX_SKB_FRAGS];
@@ -1465,6 +1636,10 @@ static int tls_setup_from_iter(struct iov_iter *from,
 	ssize_t copied, use;
 	size_t offset;
 
+#ifdef CONFIG_MM_SUBPAGE
+	if (tls_subpage_iter(from))
+		return tls_setup_subpage_iter(from, length, pages_used, to, to_max_pages, dctx);
+#endif
 	while (length > 0) {
 		i = 0;
 		maxpages = to_max_pages - num_elem;
@@ -1582,7 +1757,7 @@ static int tls_decrypt_sg(struct sock *sk, struct iov_iter *out_iov,
 
 		if (out_iov)
 			n_sgout = 1 + tail_pages +
-				iov_iter_npages_cap(out_iov, INT_MAX, data_len);
+				tls_iter_sg_capacity(out_iov, data_len);
 		else
 			n_sgout = sg_nents(out_sg);
 	} else {
@@ -1615,6 +1790,11 @@ static int tls_decrypt_sg(struct sock *sk, struct iov_iter *out_iov,
 	aead_req = (struct aead_request *)mem;
 	dctx = (struct tls_decrypt_ctx *)(mem + aead_size);
 	dctx->sk = sk;
+#ifdef CONFIG_MM_SUBPAGE
+	dctx->fragments = NULL;
+	dctx->nr_fragments = 0;
+	dctx->fragments_dirty = false;
+#endif
 	sgin = &dctx->sg[0];
 	sgout = &dctx->sg[n_sgin];
 
@@ -1672,7 +1852,7 @@ static int tls_decrypt_sg(struct sock *sk, struct iov_iter *out_iov,
 		sg_set_buf(&sgout[0], dctx->aad, prot->aad_size);
 
 		err = tls_setup_from_iter(out_iov, data_len, &pages, &sgout[1],
-					  (n_sgout - 1 - tail_pages));
+					  (n_sgout - 1 - tail_pages), dctx);
 		if (err < 0)
 			goto exit_free_pages;
 
@@ -1687,6 +1867,10 @@ static int tls_decrypt_sg(struct sock *sk, struct iov_iter *out_iov,
 	}
 	dctx->free_sgout = !!pages;
 
+#ifdef CONFIG_MM_SUBPAGE
+	/* An error from crypto may still leave writes in the destination. */
+	dctx->fragments_dirty = true;
+#endif
 	/* Prepare and submit AEAD request */
 	err = tls_do_decryption(sk, sgin, sgout, dctx->iv,
 				data_len + prot->tail_size, aead_req, darg);
@@ -1715,6 +1899,12 @@ static int tls_decrypt_sg(struct sock *sk, struct iov_iter *out_iov,
 		darg->tail = dctx->tail;
 
 exit_free_pages:
+#ifdef CONFIG_MM_SUBPAGE
+	if (dctx->fragments) {
+		tls_release_user_fragments(dctx);
+		pages = 0;
+	}
+#endif
 	/* Release the pages in case iov was mapped to pages */
 	for (; pages > 0; pages--)
 		put_page(sg_page(&sgout[pages]));
@@ -2795,6 +2985,9 @@ static struct tls_sw_context_rx *init_ctx_rx(struct tls_context *ctx)
 
 	crypto_init_wait(&sw_ctx_rx->async_wait);
 	atomic_set(&sw_ctx_rx->decrypt_pending, 1);
+#ifdef CONFIG_MM_SUBPAGE
+	init_llist_head(&sw_ctx_rx->subpage_cleanup);
+#endif
 	init_waitqueue_head(&sw_ctx_rx->wq);
 	skb_queue_head_init(&sw_ctx_rx->rx_list);
 	skb_queue_head_init(&sw_ctx_rx->async_hold);
@@ -2903,7 +3096,24 @@ int tls_set_sw_offload(struct sock *sk, int tx,
 	rec_seq = crypto_info_rec_seq(src_crypto_info, cipher_desc);
 
 	if (!*aead) {
-		*aead = crypto_alloc_aead(cipher_desc->cipher_name, 0, 0);
+#if IS_ENABLED(CONFIG_KUNIT) && IS_ENABLED(CONFIG_MM_SUBPAGE)
+		if (!tx && user4k_test_async) {
+			struct crypto_aead *sync;
+			char name[CRYPTO_MAX_ALG_NAME];
+
+			/* cryptd instances are named for the concrete child driver. */
+			sync = crypto_alloc_aead(cipher_desc->cipher_name, 0, CRYPTO_ALG_ASYNC);
+			if (IS_ERR(sync)) {
+				*aead = sync;
+			} else {
+				snprintf(name, sizeof(name), "cryptd(%s)",
+					 crypto_tfm_alg_driver_name(crypto_aead_tfm(sync)));
+				*aead = crypto_alloc_aead(name, CRYPTO_ALG_ASYNC, CRYPTO_ALG_ASYNC);
+				crypto_free_aead(sync);
+			}
+		} else
+#endif
+			*aead = crypto_alloc_aead(cipher_desc->cipher_name, 0, 0);
 		if (IS_ERR(*aead)) {
 			rc = PTR_ERR(*aead);
 			*aead = NULL;

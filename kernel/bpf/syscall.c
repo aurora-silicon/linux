@@ -15,6 +15,8 @@
 #include <linux/sched/signal.h>
 #include <linux/vmalloc.h>
 #include <linux/mmzone.h>
+#include <linux/mm_subpage.h>
+#include <linux/workqueue.h>
 #include <linux/anon_inodes.h>
 #include <linux/fdtable.h>
 #include <linux/file.h>
@@ -164,6 +166,43 @@ static void maybe_wait_bpf_programs(struct bpf_map *map)
 		synchronize_rcu_expedited();
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+struct bpf_uptr_pins {
+	struct work_struct work;
+	u32 count;
+	struct user_page_fragment fragments[];
+};
+
+static void bpf_uptr_release_work(struct work_struct *work)
+{
+	struct bpf_uptr_pins *pins = container_of(work, struct bpf_uptr_pins, work);
+
+	release_user_fragments(pins->fragments, pins->count, true);
+	kfree(pins);
+}
+#endif
+
+/* May run from an RCU callback. The bundle owns its pins independently of
+ * the map, task and value, so dirty release can wait for folio locks in work.
+ */
+static bool bpf_obj_release_uptr_pins(const struct btf_record *rec, void *obj)
+{
+#ifdef CONFIG_MM_SUBPAGE
+	struct bpf_uptr_pins **owner, *pins;
+
+	if (!bpf_obj_uptr_extra_size(rec))
+		return false;
+	owner = obj + rec->uptr_pins_off;
+	pins = *owner;
+	if (pins) {
+		*owner = NULL;
+		queue_work(system_unbound_wq, &pins->work);
+		return true;
+	}
+#endif
+	return false;
+}
+
 static void unpin_uptr_kaddr(void *kaddr)
 {
 	if (kaddr)
@@ -175,6 +214,9 @@ static void __bpf_obj_unpin_uptrs(struct btf_record *rec, u32 cnt, void *obj)
 	const struct btf_field *field;
 	void **uptr_addr;
 	int i;
+
+	if (bpf_obj_release_uptr_pins(rec, obj))
+		return;
 
 	for (i = 0, field = rec->fields; i < cnt; i++, field++) {
 		if (field->type != BPF_UPTR)
@@ -193,8 +235,12 @@ static void bpf_obj_unpin_uptrs(struct btf_record *rec, void *obj)
 	__bpf_obj_unpin_uptrs(rec, rec->cnt, obj);
 }
 
-static int bpf_obj_pin_uptrs(struct btf_record *rec, void *obj)
+static int bpf_obj_pin_uptrs(struct bpf_map *map, void *obj)
 {
+	struct btf_record *rec = map->record;
+#ifdef CONFIG_MM_SUBPAGE
+	struct bpf_uptr_pins *pins = NULL;
+#endif
 	const struct btf_field *field;
 	const struct btf_type *t;
 	unsigned long start, end;
@@ -204,6 +250,18 @@ static int bpf_obj_pin_uptrs(struct btf_record *rec, void *obj)
 
 	if (!btf_record_has_field(rec, BPF_UPTR))
 		return 0;
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(current->mm) != PAGE_SIZE) {
+		pins = bpf_map_kzalloc(map, struct_size(pins, fragments, rec->cnt),
+				      GFP_KERNEL);
+		if (!pins)
+			return -ENOMEM;
+		INIT_WORK(&pins->work, bpf_uptr_release_work);
+		pins->count = rec->cnt;
+		*(struct bpf_uptr_pins **)(obj + rec->uptr_pins_off) = pins;
+	}
+#endif
 
 	for (i = 0, field = rec->fields; i < rec->cnt; i++, field++) {
 		if (field->type != BPF_UPTR)
@@ -221,11 +279,34 @@ static int bpf_obj_pin_uptrs(struct btf_record *rec, void *obj)
 			goto unpin_all;
 		}
 
-		/* The uptr's struct cannot span across two pages */
-		if ((start & PAGE_MASK) != (end & PAGE_MASK)) {
+		/* The object must fit in one page of the supplying process. */
+		if ((start & mm_page_mask(current->mm)) !=
+		    (end & mm_page_mask(current->mm))) {
 			err = -EOPNOTSUPP;
 			goto unpin_all;
 		}
+
+#ifdef CONFIG_MM_SUBPAGE
+		if (pins) {
+			struct user_page_fragment *fragment = &pins->fragments[i];
+
+			err = pin_user_fragments_remote(current->mm, start, t->size,
+					FOLL_LONGTERM | FOLL_WRITE, fragment, 1);
+			if (err != 1) {
+				if (!err)
+					err = -EFAULT;
+				goto unpin_all;
+			}
+			if (fragment->length != t->size ||
+			    PageHighMem(folio_page(fragment->folio,
+						 fragment->offset >> PAGE_SHIFT))) {
+				err = -EOPNOTSUPP;
+				goto unpin_all;
+			}
+			*uptr_addr = folio_address(fragment->folio) + fragment->offset;
+			continue;
+		}
+#endif
 
 		err = pin_user_pages_fast(start, 1, FOLL_LONGTERM | FOLL_WRITE, &page);
 		if (err != 1)
@@ -291,7 +372,7 @@ static int bpf_map_update_value(struct bpf_map *map, struct file *map_file,
 		   map->map_type == BPF_MAP_TYPE_BLOOM_FILTER) {
 		err = map->ops->map_push_elem(map, value, flags);
 	} else {
-		err = bpf_obj_pin_uptrs(map->record, value);
+		err = bpf_obj_pin_uptrs(map, value);
 		if (!err) {
 			rcu_read_lock();
 			err = map->ops->map_update_elem(map, key, value, flags);
@@ -815,10 +896,12 @@ void bpf_obj_cancel_fields(struct bpf_map *map, void *obj)
 void bpf_obj_free_fields(const struct btf_record *rec, void *obj)
 {
 	const struct btf_field *fields;
+	bool fragment_pins;
 	int i;
 
 	if (IS_ERR_OR_NULL(rec))
 		return;
+	fragment_pins = bpf_obj_release_uptr_pins(rec, obj);
 	fields = rec->fields;
 	for (i = 0; i < rec->cnt; i++) {
 		struct btf_struct_meta *pointee_struct_meta;
@@ -859,8 +942,9 @@ void bpf_obj_free_fields(const struct btf_record *rec, void *obj)
 			}
 			break;
 		case BPF_UPTR:
-			/* The caller ensured that no one is using the uptr */
-			unpin_uptr_kaddr(*(void **)field_ptr);
+			/* The caller ensured that no one is using the uptr. */
+			if (!fragment_pins)
+				unpin_uptr_kaddr(*(void **)field_ptr);
 			break;
 		case BPF_LIST_HEAD:
 			if (WARN_ON_ONCE(rec->spin_lock_off < 0))
@@ -1350,6 +1434,14 @@ static int map_check_btf(struct bpf_map *map, struct bpf_token *token,
 	if (ret < 0)
 		goto free_map_tab;
 
+#ifdef CONFIG_MM_SUBPAGE
+	if (btf_record_has_field(map->record, BPF_UPTR)) {
+		map->record->uptr_pins_off = ALIGN(map->value_size, sizeof(void *));
+		map->record->uptr_extra_size = map->record->uptr_pins_off +
+					      sizeof(void *) - map->value_size;
+	}
+#endif
+
 	if (map->ops->map_check_btf) {
 		ret = map->ops->map_check_btf(map, btf, key_type, value_type);
 		if (ret < 0)
@@ -1775,6 +1867,24 @@ free_key:
 
 #define BPF_MAP_UPDATE_ELEM_LAST_FIELD flags
 
+static void *bpf_map_memdup_value(struct bpf_map *map, bpfptr_t src, u32 size)
+{
+	u32 extra = bpf_obj_uptr_extra_size(map->record);
+	void *value;
+
+	if (!extra)
+		return kvmemdup_bpfptr(src, size);
+	value = kvmalloc(size + extra, GFP_USER);
+	if (!value)
+		return ERR_PTR(-ENOMEM);
+	memset(value + size, 0, extra);
+	if (copy_from_bpfptr(value, src, size)) {
+		kvfree(value);
+		return ERR_PTR(-EFAULT);
+	}
+	return value;
+}
+
 static int map_update_elem(union bpf_attr *attr, bpfptr_t uattr)
 {
 	bpfptr_t ukey = make_bpfptr(attr->key, uattr.is_kernel);
@@ -1808,7 +1918,7 @@ static int map_update_elem(union bpf_attr *attr, bpfptr_t uattr)
 	}
 
 	value_size = bpf_map_value_size(map, attr->flags);
-	value = kvmemdup_bpfptr(uvalue, value_size);
+	value = bpf_map_memdup_value(map, uvalue, value_size);
 	if (IS_ERR(value)) {
 		err = PTR_ERR(value);
 		goto free_key;
@@ -2021,7 +2131,9 @@ int generic_map_update_batch(struct bpf_map *map, struct file *map_file,
 	if (!key)
 		return -ENOMEM;
 
-	value = kvmalloc(value_size, GFP_USER | __GFP_NOWARN);
+	value = kvmalloc(value_size + bpf_obj_uptr_extra_size(map->record),
+			 GFP_USER | __GFP_NOWARN |
+			 (bpf_obj_uptr_extra_size(map->record) ? __GFP_ZERO : 0));
 	if (!value) {
 		kvfree(key);
 		return -ENOMEM;

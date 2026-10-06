@@ -41,6 +41,8 @@ struct sk_msg_sg {
 };
 
 /* UAPI in filter.c depends on struct sk_msg_sg being first element. */
+struct mm_subpage_refs;
+
 struct sk_msg {
 	struct sk_msg_sg		sg;
 	void				*data;
@@ -49,6 +51,9 @@ struct sk_msg {
 	u32				cork_bytes;
 	u32				flags;
 	struct sk_buff			*skb;
+#ifdef CONFIG_MM_SUBPAGE
+	struct mm_subpage_refs		*subpage_refs;
+#endif
 	struct sock			*sk_redir;
 	struct sock			*sk;
 	struct list_head		list;
@@ -123,6 +128,33 @@ struct sk_psock {
 	struct sock			*sk_pair;
 	struct rcu_work			rwork;
 };
+
+#ifdef CONFIG_MM_SUBPAGE
+int sk_msg_subpages_add(struct sk_msg *msg, struct page *page, u32 offset, u32 len);
+void sk_msg_subpages_get(struct sk_msg *msg);
+void sk_msg_subpages_share(struct sk_msg *dst, const struct sk_msg *src);
+void sk_msg_subpages_release(struct sk_msg *msg);
+static inline void sk_msg_subpages_transfer(struct sk_msg *dst, struct sk_msg *src)
+{
+	dst->subpage_refs = src->subpage_refs;
+	src->subpage_refs = NULL;
+}
+#else
+static inline int sk_msg_subpages_add(struct sk_msg *msg, struct page *page, u32 offset, u32 len)
+{
+	return 0;
+}
+static inline void sk_msg_subpages_get(struct sk_msg *msg) { }
+static inline void sk_msg_subpages_share(struct sk_msg *dst, const struct sk_msg *src) { }
+static inline void sk_msg_subpages_release(struct sk_msg *msg) { }
+static inline void sk_msg_subpages_transfer(struct sk_msg *dst, struct sk_msg *src) { }
+#endif
+
+static inline void sk_msg_subpages_drop_empty(struct sk_msg *msg)
+{
+	if (!msg->sg.size)
+		sk_msg_subpages_release(msg);
+}
 
 int sk_msg_alloc(struct sock *sk, struct sk_msg *msg, int len,
 		 int elem_first_coalesce);
@@ -259,10 +291,14 @@ static inline void sk_msg_compute_data_pointers(struct sk_msg *msg)
 	}
 }
 
-static inline void sk_msg_page_add(struct sk_msg *msg, struct page *page,
+static inline int sk_msg_page_add(struct sk_msg *msg, struct page *page,
 				   u32 len, u32 offset)
 {
 	struct scatterlist *sge;
+	int ret = sk_msg_subpages_add(msg, page, offset, len);
+
+	if (ret)
+		return ret;
 
 	get_page(page);
 	sge = sk_msg_elem(msg, msg->sg.end);
@@ -272,6 +308,7 @@ static inline void sk_msg_page_add(struct sk_msg *msg, struct page *page,
 	__set_bit(msg->sg.end, msg->sg.copy);
 	msg->sg.size += len;
 	sk_msg_iter_next(msg, end);
+	return 0;
 }
 
 static inline void sk_msg_sg_copy(struct sk_msg *msg, u32 i, bool copy_state)
@@ -420,6 +457,7 @@ static inline bool sk_psock_queue_empty(const struct sk_psock *psock)
 
 static inline void kfree_sk_msg(struct sk_msg *msg)
 {
+	sk_msg_subpages_release(msg);
 	if (msg->skb)
 		consume_skb(msg->skb);
 	kfree(msg);

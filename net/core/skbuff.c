@@ -38,6 +38,7 @@
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
+#include <linux/mm_subpage.h>
 #include <linux/interrupt.h>
 #include <linux/in.h>
 #include <linux/inet.h>
@@ -7347,8 +7348,113 @@ nodefer:	kfree_skb_napi_cache(skb);
 		kick_defer_list_purge(cpu);
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+/* The ordinary frag page ref protects allocation, not an anonymous quarter. */
+struct skb_subpage_refs {
+	struct ubuf_info ubuf;
+	struct mm_subpage_refs *owner;
+};
+
+static void skb_subpage_complete(struct sk_buff *skb, struct ubuf_info *ubuf,
+				 bool success)
+{
+	struct skb_subpage_refs *refs = container_of(ubuf, struct skb_subpage_refs, ubuf);
+
+	if (!refcount_dec_and_test(&ubuf->refcnt))
+		return;
+	mm_subpage_refs_put(refs->owner);
+	kfree(refs);
+}
+
+static const struct ubuf_info_ops skb_subpage_ops = {
+	.complete = skb_subpage_complete,
+};
+
+static bool skb_contains_subpage(const struct sk_buff *skb, phys_addr_t phys,
+				 unsigned int size, unsigned int depth)
+{
+	struct sk_buff *child;
+	unsigned int i;
+
+	/* Match the networking recursion bound, conservatively keeping unknowns. */
+	if (depth >= 24)
+		return true;
+	if (skb->head_frag && skb_headlen(skb)) {
+		phys_addr_t start = page_to_phys(virt_to_page(skb->data)) + offset_in_page(skb->data);
+
+		if (start < phys + size && phys < start + skb_headlen(skb))
+			return true;
+	}
+	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+		struct page *page = skb_frag_page(frag);
+		phys_addr_t start;
+
+		if (!page)
+			continue;
+		start = page_to_phys(page) + skb_frag_off(frag);
+		if (start < phys + size && phys < start + skb_frag_size(frag))
+			return true;
+	}
+	skb_walk_frags(skb, child)
+		if (skb_contains_subpage(child, phys, size, depth + 1))
+			return true;
+	return false;
+}
+
+static bool skb_keeps_subpage(const struct mm_subpage *slot, void *context)
+{
+	return skb_contains_subpage(context, mm_subpage_phys(slot), mm_subpage_size(slot), 0);
+}
+
+/* Caller owns the writable skb and keeps the source slot identity alive. */
+static int skb_splice_hold_subpages(struct sk_buff *skb, struct page *page,
+				   unsigned int off, unsigned int len)
+{
+	struct skb_subpage_refs *refs, *new;
+	struct ubuf_info *old = skb_zcopy(skb);
+	struct mm_subpage *probe;
+	int ret;
+
+	if (!len || folio_order(page_folio(page)) || !folio_test_anon(page_folio(page)))
+		return 0;
+	/* Preserve the allocation-free native anonymous path. */
+	probe = mm_subpage_get_from_phys(page_to_phys(page) + round_down(off, MM_SUBPAGE_SIZE));
+	if (!probe)
+		return 0;
+	mm_subpage_put(probe);
+	if (old && (skb_zcopy_is_nouarg(skb) || old->ops != &skb_subpage_ops))
+		return -EOPNOTSUPP;
+	refs = old ? container_of(old, struct skb_subpage_refs, ubuf) : NULL;
+	if (!refs || refcount_read(&old->refcnt) != 1) {
+		new = kzalloc(sizeof(*new), GFP_ATOMIC);
+		if (!new)
+			return -ENOMEM;
+		new->ubuf.ops = &skb_subpage_ops;
+		new->ubuf.flags = SKBFL_ZEROCOPY_FRAG | SKBFL_DONT_ORPHAN;
+		refcount_set(&new->ubuf.refcnt, 1);
+		if (refs)
+			new->owner = mm_subpage_refs_get(refs->owner);
+		skb_zcopy_init(skb, &new->ubuf);
+		net_zcopy_put(old);
+		refs = new;
+	}
+	/* Repeated trim/append must not accumulate references to discarded data. */
+	ret = mm_subpage_refs_prune(&refs->owner, skb_keeps_subpage, skb, GFP_ATOMIC);
+	if (ret)
+		return ret;
+	return mm_subpage_refs_add(&refs->owner, page, off, len, GFP_ATOMIC);
+}
+#else
+static int skb_splice_hold_subpages(struct sk_buff *skb, struct page *page,
+				   unsigned int off, unsigned int len)
+{
+	return 0;
+}
+#endif
+
 static void skb_splice_csum_page(struct sk_buff *skb, struct page *page,
-				 size_t offset, size_t len)
+				 size_t offset, size_t len, size_t progress)
 {
 	const char *kaddr;
 	__wsum csum;
@@ -7356,7 +7462,8 @@ static void skb_splice_csum_page(struct sk_buff *skb, struct page *page,
 	kaddr = kmap_local_page(page);
 	csum = csum_partial(kaddr + offset, len, 0);
 	kunmap_local(kaddr);
-	skb->csum = csum_block_add(skb->csum, csum, skb->len);
+	/* skb->len is updated only after the entire iterator batch. */
+	skb->csum = csum_block_add(skb->csum, csum, skb->len + progress);
 }
 
 /**
@@ -7408,6 +7515,12 @@ ssize_t skb_splice_from_iter(struct sk_buff *skb, struct iov_iter *iter,
 			if (WARN_ON_ONCE(!sendpage_ok(page)))
 				goto out;
 
+			ret = skb_splice_hold_subpages(skb, page, off, part);
+			if (ret < 0) {
+				iov_iter_revert(iter, len);
+				goto out;
+			}
+
 			ret = skb_append_pagefrags(skb, page, off, part,
 						   frag_limit);
 			if (ret < 0) {
@@ -7416,7 +7529,7 @@ ssize_t skb_splice_from_iter(struct sk_buff *skb, struct iov_iter *iter,
 			}
 
 			if (skb->ip_summed == CHECKSUM_NONE)
-				skb_splice_csum_page(skb, page, off, part);
+				skb_splice_csum_page(skb, page, off, part, spliced);
 
 			off = 0;
 			spliced += part;
