@@ -1024,8 +1024,59 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return ret;
 
+	platform_set_drvdata(pdev, dpxbar);
 	return 0;
 }
+
+/*
+ * A T6030 crossbar loses its registers when its power domain goes down in
+ * system sleep, but its routes stay selected: a DCP selects a fixed route
+ * once at probe, and the mux core skips a select of the state it already
+ * holds. Rewrite every selected route on resume.
+ *
+ * The link clocks are not turned back on here. The PHY's link stays stopped
+ * until the DCP configures it again, and the clocks have to follow the PHY.
+ * If the enables did not survive, record the link as down, so the DCP's next
+ * apple_dpxbar_link_up() turns them on again.
+ */
+static int apple_dpxbar_resume(struct device *dev)
+{
+	struct apple_dpxbar *xbar = dev_get_drvdata(dev);
+	unsigned long restored = 0, flags;
+	unsigned int i;
+
+	if (!xbar || !xbar->t6030_dpin)
+		return 0;
+
+	spin_lock_irqsave(&xbar->lock, flags);
+	for (i = 0; i < MUX_MAX; i++) {
+		int state = xbar->selected_dispext[i];
+		u32 shift = apple_dpxbar_t6030_shift(i);
+		u32 mask = (0xfU << shift) | (0xfU << (shift + 12));
+		u32 route = (state << shift) | (state << (shift + 12));
+
+		if (state < 0)
+			continue;
+		if ((readl(xbar->regs + T602X_MUX_SELECT) & mask) != route) {
+			dpxbar_mask32(xbar, T602X_MUX_SELECT, mask, route);
+			restored |= BIT(i);
+		}
+		if (xbar->tunnel_link_up[i] &&
+		    (!(readl(xbar->regs + T602X_ATC_ENABLE) & BIT(shift)) ||
+		     !(readl(xbar->regs + T602X_DISPEXT_ENABLE) & BIT(state)))) {
+			xbar->tunnel_link_up[i] = false;
+			restored |= BIT(i);
+		}
+	}
+	spin_unlock_irqrestore(&xbar->lock, flags);
+
+	for_each_set_bit(i, &restored, MUX_MAX)
+		dev_info(dev, "%s: route %d restored after power loss, link waits for the DCP\n",
+			 apple_dpxbar_names[i], xbar->selected_dispext[i]);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(apple_dpxbar_pm_ops, NULL, apple_dpxbar_resume);
 
 static const struct apple_dpxbar_hw apple_dpxbar_hw_t8103 = {
 	.n_ufp = 2,
@@ -1076,6 +1127,7 @@ static struct platform_driver apple_dpxbar_driver = {
 	.driver = {
 		.name = "apple-display-crossbar",
 		.of_match_table	= apple_dpxbar_ids,
+		.pm = pm_sleep_ptr(&apple_dpxbar_pm_ops),
 	},
 	.probe = apple_dpxbar_probe,
 };
