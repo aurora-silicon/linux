@@ -28,11 +28,14 @@
 #include <linux/iommu.h>
 #include <linux/module.h>
 #include <linux/mm.h>
+#include <linux/mm_subpage.h>
+#include <linux/xarray.h>
 #include <linux/kthread.h>
 #include <linux/rbtree.h>
 #include <linux/sched/signal.h>
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
+#include <linux/sizes.h>
 #include <linux/uaccess.h>
 #include <linux/vfio.h>
 #include <linux/workqueue.h>
@@ -84,6 +87,8 @@ struct vfio_domain {
 	bool			enforce_cache_coherency : 1;
 };
 
+struct vfio_fragment_provider;
+
 struct vfio_dma {
 	struct rb_node		node;
 	dma_addr_t		iova;		/* Device address */
@@ -99,6 +104,7 @@ struct vfio_dma {
 	unsigned long		*bitmap;
 	struct mm_struct	*mm;
 	size_t			locked_vm;
+	struct vfio_fragment_provider *fragments;
 };
 
 struct vfio_batch {
@@ -128,7 +134,9 @@ struct vfio_pfn {
 	struct rb_node		node;
 	dma_addr_t		iova;		/* Device address */
 	unsigned long		pfn;		/* Host pfn */
+	unsigned long		length;		/* Bytes retained in this DMA */
 	unsigned int		ref_count;
+	bool			native_pin; /* separately adopted legacy external PIN */
 };
 
 struct vfio_regions {
@@ -152,6 +160,9 @@ struct vfio_regions {
 #define DIRTY_BITMAP_SIZE_MAX	 DIRTY_BITMAP_BYTES(DIRTY_BITMAP_PAGES_MAX)
 
 static int put_pfn(unsigned long pfn, int prot);
+static void vfio_fragments_put_native_pin(struct vfio_dma *dma, unsigned long pfn);
+static void vfio_fragments_release_range(struct vfio_dma *dma, unsigned long start,
+					 unsigned long length);
 
 static struct vfio_iommu_group*
 vfio_iommu_find_iommu_group(struct vfio_iommu *iommu,
@@ -238,6 +249,12 @@ static void vfio_unlink_dma(struct vfio_iommu *iommu, struct vfio_dma *old)
 }
 
 
+/* Software dirty granularity must survive domain attach/detach unchanged. */
+static size_t vfio_dirty_pgsize(struct vfio_iommu *iommu)
+{
+	return IS_ENABLED(CONFIG_MM_SUBPAGE) ? SZ_4K : 1UL << __ffs(iommu->pgsize_bitmap);
+}
+
 static int vfio_dma_bitmap_alloc(struct vfio_dma *dma, size_t pgsize)
 {
 	uint64_t npages = dma->size / pgsize;
@@ -272,14 +289,15 @@ static void vfio_dma_populate_bitmap(struct vfio_dma *dma, size_t pgsize)
 	for (p = rb_first(&dma->pfn_list); p; p = rb_next(p)) {
 		struct vfio_pfn *vpfn = rb_entry(p, struct vfio_pfn, node);
 
-		bitmap_set(dma->bitmap, (vpfn->iova - dma->iova) >> pgshift, 1);
+		bitmap_set(dma->bitmap, (vpfn->iova - dma->iova) >> pgshift,
+			   vpfn->length >> pgshift);
 	}
 }
 
 static void vfio_iommu_populate_bitmap_full(struct vfio_iommu *iommu)
 {
 	struct rb_node *n;
-	unsigned long pgshift = __ffs(iommu->pgsize_bitmap);
+	unsigned long pgshift = __ffs(vfio_dirty_pgsize(iommu));
 
 	for (n = rb_first(&iommu->dma_list); n; n = rb_next(n)) {
 		struct vfio_dma *dma = rb_entry(n, struct vfio_dma, node);
@@ -383,7 +401,7 @@ static void vfio_unlink_pfn(struct vfio_dma *dma, struct vfio_pfn *old)
 }
 
 static int vfio_add_to_pfn_list(struct vfio_dma *dma, dma_addr_t iova,
-				unsigned long pfn)
+				unsigned long pfn, unsigned long length)
 {
 	struct vfio_pfn *vpfn;
 
@@ -393,6 +411,7 @@ static int vfio_add_to_pfn_list(struct vfio_dma *dma, dma_addr_t iova,
 
 	vpfn->iova = iova;
 	vpfn->pfn = pfn;
+	vpfn->length = length;
 	vpfn->ref_count = 1;
 	vfio_link_pfn(dma, vpfn);
 	return 0;
@@ -421,8 +440,21 @@ static int vfio_iova_put_vfio_pfn(struct vfio_dma *dma, struct vfio_pfn *vpfn)
 
 	vpfn->ref_count--;
 	if (!vpfn->ref_count) {
-		ret = put_pfn(vpfn->pfn, dma->prot);
-		vfio_remove_from_pfn_list(dma, vpfn);
+		if (dma->fragments) {
+			unsigned long offset = vpfn->iova - dma->iova;
+			unsigned long length = vpfn->length;
+
+			unsigned long pfn = vpfn->pfn;
+			bool native_pin = vpfn->native_pin;
+
+			vfio_remove_from_pfn_list(dma, vpfn);
+			if (native_pin)
+				vfio_fragments_put_native_pin(dma, pfn);
+			vfio_fragments_release_range(dma, offset, length);
+		} else {
+			ret = put_pfn(vpfn->pfn, dma->prot);
+			vfio_remove_from_pfn_list(dma, vpfn);
+		}
 	}
 	return ret;
 }
@@ -430,10 +462,19 @@ static int vfio_iova_put_vfio_pfn(struct vfio_dma *dma, struct vfio_pfn *vpfn)
 static int mm_lock_acct(struct task_struct *task, struct mm_struct *mm,
 			bool lock_cap, long npage)
 {
-	int ret = mmap_write_lock_killable(mm);
+	int ret;
 
-	if (ret)
-		return ret;
+	if (!npage)
+		return 0;
+
+	/* A released pin must be refunded even if the caller is interrupted. */
+	if (npage < 0) {
+		mmap_write_lock(mm);
+	} else {
+		ret = mmap_write_lock_killable(mm);
+		if (ret)
+			return ret;
+	}
 
 	ret = __account_locked_vm(mm, abs(npage), npage > 0, task, lock_cap);
 	mmap_write_unlock(mm);
@@ -443,24 +484,27 @@ static int mm_lock_acct(struct task_struct *task, struct mm_struct *mm,
 static int vfio_lock_acct(struct vfio_dma *dma, long npage, bool async)
 {
 	struct mm_struct *mm;
+	bool get_mm = async && npage > 0;
 	int ret;
 
 	if (!npage)
 		return 0;
 
 	mm = dma->mm;
-	if (async && !mmget_not_zero(mm))
+	if (get_mm && !mmget_not_zero(mm))
 		return -ESRCH; /* process exited */
 
 	ret = mm_lock_acct(dma->task, mm, dma->lock_cap, npage);
 	if (!ret)
 		dma->locked_vm += npage;
 
-	if (async)
+	if (get_mm)
 		mmput(mm);
 
 	return ret;
 }
+
+#include "vfio_iommu_type1_fragments.c"
 
 /*
  * Some mappings aren't backed by a struct page, for example an mmap'd
@@ -765,7 +809,8 @@ static long vfio_pin_pages_remote(struct vfio_dma *dma, unsigned long vaddr,
 			 */
 			if (acct_pages) {
 				if (!dma->lock_cap &&
-				    mm->locked_vm + lock_acct + acct_pages > limit) {
+				    mm_locked_vm_native_pages(mm) +
+				    lock_acct + acct_pages > limit) {
 					pr_warn("%s: RLIMIT_MEMLOCK (%ld) exceeded\n",
 						__func__, limit << PAGE_SHIFT);
 					ret = -ENOMEM;
@@ -889,6 +934,78 @@ static int vfio_unpin_page_external(struct vfio_dma *dma, dma_addr_t iova,
 	return unlocked;
 }
 
+/* A native page may contain independently owned fine-grained DMA areas. */
+static unsigned long vfio_unpin_external_range(struct vfio_iommu *iommu,
+					     dma_addr_t start, unsigned long length,
+					     bool do_accounting)
+{
+	unsigned long done = 0;
+
+	while (done < length) {
+		dma_addr_t iova = start + done;
+		struct vfio_dma *dma = vfio_find_dma(iommu, iova, 1);
+		unsigned long bytes;
+
+		if (!dma || iova < dma->iova)
+			break;
+		bytes = min_t(unsigned long, length - done,
+				PAGE_SIZE - offset_in_page(iova));
+		bytes = min(bytes, dma->size - (iova - dma->iova));
+		vfio_unpin_page_external(dma, iova, do_accounting);
+		done += bytes;
+	}
+	return done;
+}
+
+static int vfio_pin_external_segment(struct vfio_iommu *iommu,
+		struct vfio_dma *dma, dma_addr_t iova, unsigned long length,
+		int prot, bool do_accounting, unsigned long *pfn)
+{
+	struct vfio_pfn *vpfn;
+	int ret;
+
+	if ((dma->prot & prot) != prot)
+		return -EPERM;
+	vpfn = vfio_iova_get_vfio_pfn(dma, iova);
+	if (vpfn) {
+		if (vpfn->length != length) {
+			vfio_unpin_page_external(dma, iova, do_accounting);
+			return -EINVAL;
+		}
+		*pfn = vpfn->pfn;
+	} else if (dma->fragments) {
+		ret = vfio_fragments_external(dma, iova, length, pfn);
+		if (ret)
+			return ret;
+	} else {
+		/* Ordinary native mappings still use one native GUP per page. */
+		if (length != PAGE_SIZE)
+			return -EINVAL;
+		ret = vfio_pin_page_external(dma, dma->vaddr + iova - dma->iova,
+					     pfn, do_accounting);
+		if (ret)
+			return ret;
+		if (!pfn_valid(*pfn)) {
+			ret = -EINVAL;
+			goto put_native;
+		}
+		ret = vfio_add_to_pfn_list(dma, iova, *pfn, length);
+		if (ret)
+			goto put_native;
+	}
+	if (iommu->dirty_page_tracking) {
+		unsigned long pgshift = __ffs(vfio_dirty_pgsize(iommu));
+
+		bitmap_set(dma->bitmap, (iova - dma->iova) >> pgshift,
+			   length >> pgshift);
+	}
+	return 0;
+put_native:
+	if (put_pfn(*pfn, dma->prot) && do_accounting)
+		vfio_lock_acct(dma, -1, true);
+	return ret;
+}
+
 static int vfio_iommu_type1_pin_pages(void *iommu_data,
 				      struct iommu_group *iommu_group,
 				      dma_addr_t user_iova,
@@ -897,119 +1014,72 @@ static int vfio_iommu_type1_pin_pages(void *iommu_data,
 {
 	struct vfio_iommu *iommu = iommu_data;
 	struct vfio_iommu_group *group;
-	int i, j, ret;
-	unsigned long remote_vaddr;
-	struct vfio_dma *dma;
+	unsigned long pinned = 0;
 	bool do_accounting;
 	dma_addr_t iova_end;
 	size_t iova_size;
+	int i, ret;
 
 	if (!iommu || !pages || npage <= 0)
 		return -EINVAL;
-
-	/* Supported for v2 version only */
+	/* Callers recover the original byte offset from the returned page. */
+	user_iova = ALIGN_DOWN(user_iova, PAGE_SIZE);
 	if (!iommu->v2)
 		return -EACCES;
-
 	if (check_mul_overflow(npage, PAGE_SIZE, &iova_size) ||
 	    check_add_overflow(user_iova, iova_size - 1, &iova_end))
 		return -EOVERFLOW;
 
 	mutex_lock(&iommu->lock);
-
 	if (WARN_ONCE(iommu->vaddr_invalid_count,
 		      "vfio_pin_pages not allowed with VFIO_UPDATE_VADDR\n")) {
 		ret = -EBUSY;
 		goto pin_done;
 	}
-
-	/* Fail if no dma_umap notifier is registered */
 	if (list_empty(&iommu->device_list)) {
 		ret = -EINVAL;
 		goto pin_done;
 	}
-
-	/*
-	 * If iommu capable domain exist in the container then all pages are
-	 * already pinned and accounted. Accounting should be done if there is no
-	 * iommu capable domain in the container.
-	 */
 	do_accounting = list_empty(&iommu->domain_list);
-
 	for (i = 0; i < npage; i++) {
-		unsigned long phys_pfn;
-		dma_addr_t iova;
-		struct vfio_pfn *vpfn;
+		unsigned long done = 0;
 
-		iova = user_iova + PAGE_SIZE * i;
-		dma = vfio_find_dma(iommu, iova, PAGE_SIZE);
-		if (!dma) {
-			ret = -EINVAL;
-			goto pin_unwind;
-		}
+		pages[i] = NULL;
+		while (done < PAGE_SIZE) {
+			dma_addr_t iova = user_iova + PAGE_SIZE * i + done;
+			struct vfio_dma *dma = vfio_find_dma(iommu, iova, 1);
+			unsigned long length, pfn;
 
-		if ((dma->prot & prot) != prot) {
-			ret = -EPERM;
-			goto pin_unwind;
-		}
-
-		vpfn = vfio_iova_get_vfio_pfn(dma, iova);
-		if (vpfn) {
-			pages[i] = pfn_to_page(vpfn->pfn);
-			continue;
-		}
-
-		remote_vaddr = dma->vaddr + (iova - dma->iova);
-		ret = vfio_pin_page_external(dma, remote_vaddr, &phys_pfn,
-					     do_accounting);
-		if (ret)
-			goto pin_unwind;
-
-		if (!pfn_valid(phys_pfn)) {
-			ret = -EINVAL;
-			goto pin_unwind;
-		}
-
-		ret = vfio_add_to_pfn_list(dma, iova, phys_pfn);
-		if (ret) {
-			if (put_pfn(phys_pfn, dma->prot) && do_accounting)
-				vfio_lock_acct(dma, -1, true);
-			goto pin_unwind;
-		}
-
-		pages[i] = pfn_to_page(phys_pfn);
-
-		if (iommu->dirty_page_tracking) {
-			unsigned long pgshift = __ffs(iommu->pgsize_bitmap);
-
-			/*
-			 * Bitmap populated with the smallest supported page
-			 * size
-			 */
-			bitmap_set(dma->bitmap,
-				   (iova - dma->iova) >> pgshift, 1);
+			if (!dma || iova < dma->iova) {
+				ret = -EINVAL;
+				goto pin_unwind;
+			}
+			length = min_t(unsigned long, PAGE_SIZE - done,
+					dma->size - (iova - dma->iova));
+			ret = vfio_pin_external_segment(iommu, dma, iova, length,
+						       prot, do_accounting, &pfn);
+			if (ret)
+				goto pin_unwind;
+			pinned += length;
+			if (pages[i] && page_to_pfn(pages[i]) != pfn) {
+				ret = -EINVAL;
+				goto pin_unwind;
+			}
+			pages[i] = pfn_to_page(pfn);
+			done += length;
 		}
 	}
-	ret = i;
-
+	ret = npage;
 	group = vfio_iommu_find_iommu_group(iommu, iommu_group);
 	if (!group->pinned_page_dirty_scope) {
 		group->pinned_page_dirty_scope = true;
 		iommu->num_non_pinned_groups--;
 	}
-
 	goto pin_done;
-
 pin_unwind:
-	pages[i] = NULL;
-	for (j = 0; j < i; j++) {
-		dma_addr_t iova;
-
-		iova = user_iova + PAGE_SIZE * j;
-		dma = vfio_find_dma(iommu, iova, PAGE_SIZE);
-		vfio_unpin_page_external(dma, iova, do_accounting);
-		pages[j] = NULL;
-	}
+	vfio_unpin_external_range(iommu, user_iova, pinned, do_accounting);
+	while (i >= 0)
+		pages[i--] = NULL;
 pin_done:
 	mutex_unlock(&iommu->lock);
 	return ret;
@@ -1019,39 +1089,21 @@ static void vfio_iommu_type1_unpin_pages(void *iommu_data,
 					 dma_addr_t user_iova, int npage)
 {
 	struct vfio_iommu *iommu = iommu_data;
-	bool do_accounting;
 	dma_addr_t iova_end;
 	size_t iova_size;
-	int i;
+	unsigned long unpinned;
 
-	/* Supported for v2 version only */
-	if (WARN_ON(!iommu->v2))
+	if (WARN_ON(!iommu->v2) || WARN_ON(npage <= 0))
 		return;
-
-	if (WARN_ON(npage <= 0))
-		return;
-
+	user_iova = ALIGN_DOWN(user_iova, PAGE_SIZE);
 	if (WARN_ON(check_mul_overflow(npage, PAGE_SIZE, &iova_size) ||
 		    check_add_overflow(user_iova, iova_size - 1, &iova_end)))
 		return;
-
 	mutex_lock(&iommu->lock);
-
-	do_accounting = list_empty(&iommu->domain_list);
-	for (i = 0; i < npage; i++) {
-		dma_addr_t iova = user_iova + PAGE_SIZE * i;
-		struct vfio_dma *dma;
-
-		dma = vfio_find_dma(iommu, iova, PAGE_SIZE);
-		if (!dma)
-			break;
-
-		vfio_unpin_page_external(dma, iova, do_accounting);
-	}
-
+	unpinned = vfio_unpin_external_range(iommu, user_iova, iova_size,
+					   list_empty(&iommu->domain_list));
 	mutex_unlock(&iommu->lock);
-
-	WARN_ON(i != npage);
+	WARN_ON(unpinned != iova_size);
 }
 
 static long vfio_sync_unpin(struct vfio_dma *dma, struct vfio_domain *domain,
@@ -1155,6 +1207,10 @@ static long vfio_unmap_unpin(struct vfio_iommu *iommu, struct vfio_dma *dma,
 
 	if (!dma->size)
 		return 0;
+	if (dma->fragments) {
+		vfio_fragments_unmap(iommu, dma);
+		return 0;
+	}
 
 	if (list_empty(&iommu->domain_list))
 		return 0;
@@ -1233,6 +1289,7 @@ static void vfio_remove_dma(struct vfio_iommu *iommu, struct vfio_dma *dma)
 {
 	WARN_ON(!RB_EMPTY_ROOT(&dma->pfn_list));
 	vfio_unmap_unpin(iommu, dma, true);
+	vfio_fragments_destroy(dma);
 	vfio_unlink_dma(iommu, dma);
 	put_task_struct(dma->task);
 	mmdrop(dma->mm);
@@ -1246,21 +1303,18 @@ static void vfio_remove_dma(struct vfio_iommu *iommu, struct vfio_dma *dma)
 static void vfio_update_pgsize_bitmap(struct vfio_iommu *iommu)
 {
 	struct vfio_domain *domain;
+	unsigned long minimum = SZ_4K;
 
 	iommu->pgsize_bitmap = ULONG_MAX;
-
-	list_for_each_entry(domain, &iommu->domain_list, next)
+	list_for_each_entry(domain, &iommu->domain_list, next) {
 		iommu->pgsize_bitmap &= domain->domain->pgsize_bitmap;
-
-	/*
-	 * In case the IOMMU supports page sizes smaller than PAGE_SIZE
-	 * we pretend PAGE_SIZE is supported and hide sub-PAGE_SIZE sizes.
-	 * That way the user will be able to map/unmap buffers whose size/
-	 * start address is aligned with PAGE_SIZE. Pinning code uses that
-	 * granularity while iommu driver can use the sub-PAGE_SIZE size
-	 * to map the buffer.
-	 */
-	if (iommu->pgsize_bitmap & ~PAGE_MASK) {
+		minimum = max(minimum, 1UL << __ffs(domain->domain->pgsize_bitmap));
+	}
+	if (IS_ENABLED(CONFIG_MM_SUBPAGE)) {
+		/* Every domain can compose its minimum pages into this common unit. */
+		iommu->pgsize_bitmap &= ~(minimum - 1);
+		iommu->pgsize_bitmap |= minimum;
+	} else if (iommu->pgsize_bitmap & ~PAGE_MASK) {
 		iommu->pgsize_bitmap &= PAGE_MASK;
 		iommu->pgsize_bitmap |= PAGE_SIZE;
 	}
@@ -1367,6 +1421,8 @@ static void vfio_notify_dma_unmap(struct vfio_iommu *iommu,
 				  struct vfio_dma *dma)
 {
 	struct vfio_device *device;
+	dma_addr_t iova = dma->iova;
+	size_t size = dma->size;
 
 	if (list_empty(&iommu->device_list))
 		return;
@@ -1377,11 +1433,12 @@ static void vfio_notify_dma_unmap(struct vfio_iommu *iommu,
 	 * call back down to this code and try to obtain the iommu->lock we must
 	 * drop it.
 	 */
-	mutex_lock(&iommu->device_list_lock);
+	/* The range is a snapshot: another unmap may free dma while unlocked. */
 	mutex_unlock(&iommu->lock);
+	mutex_lock(&iommu->device_list_lock);
 
 	list_for_each_entry(device, &iommu->device_list, iommu_entry)
-		device->ops->dma_unmap(device, dma->iova, dma->size);
+		device->ops->dma_unmap(device, iova, size);
 
 	mutex_unlock(&iommu->device_list_lock);
 	mutex_lock(&iommu->lock);
@@ -1437,11 +1494,10 @@ static int vfio_dma_do_unmap(struct vfio_iommu *iommu,
 
 	/* When dirty tracking is enabled, allow only min supported pgsize */
 	if ((unmap->flags & VFIO_DMA_UNMAP_FLAG_GET_DIRTY_BITMAP) &&
-	    (!iommu->dirty_page_tracking || (bitmap->pgsize != pgsize))) {
+	    (!iommu->dirty_page_tracking || (bitmap->pgsize != vfio_dirty_pgsize(iommu)))) {
 		goto unlock;
 	}
 
-	WARN_ON((pgsize - 1) & PAGE_MASK);
 again:
 	/*
 	 * vfio-iommu-type1 (v1) - User mappings were coalesced together to
@@ -1530,7 +1586,7 @@ again:
 
 		if (unmap->flags & VFIO_DMA_UNMAP_FLAG_GET_DIRTY_BITMAP) {
 			ret = update_user_bitmap(bitmap->data, iommu, dma,
-						 iova, pgsize);
+						 iova, vfio_dirty_pgsize(iommu));
 			if (ret)
 				break;
 		}
@@ -1587,6 +1643,13 @@ static int vfio_pin_map_dma(struct vfio_iommu *iommu, struct vfio_dma *dma,
 	unsigned long pfn, limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
 	int ret = 0;
 
+	if (dma->fragments) {
+		dma->size = map_size;
+		ret = vfio_fragments_map_all(iommu, dma);
+		if (ret)
+			vfio_remove_dma(iommu, dma);
+		return ret;
+	}
 	vfio_batch_init(&batch);
 
 	while (size) {
@@ -1644,27 +1707,30 @@ static bool vfio_iommu_iova_dma_valid(struct vfio_iommu *iommu,
 	return list_empty(iova);
 }
 
-static int vfio_change_dma_owner(struct vfio_dma *dma)
+static int vfio_change_dma_mm_pages(struct vfio_dma *dma, struct task_struct *task,
+				    struct mm_struct *mm, bool lock_cap, unsigned long pages)
 {
-	struct task_struct *task = current->group_leader;
-	struct mm_struct *mm = current->mm;
-	long npage = dma->locked_vm;
-	bool lock_cap;
+	long old_pages = dma->locked_vm;
 	int ret;
 
-	if (mm == dma->mm)
-		return 0;
-
-	lock_cap = capable(CAP_IPC_LOCK);
-	ret = mm_lock_acct(task, mm, lock_cap, npage);
+	if (mm == dma->mm) {
+		if (pages == old_pages)
+			return 0;
+		ret = mm_lock_acct(task, mm, lock_cap, (long)pages - old_pages);
+		if (!ret)
+			dma->locked_vm = pages;
+		return ret;
+	}
+	ret = mm_lock_acct(task, mm, lock_cap, pages);
 	if (ret)
 		return ret;
 
-	if (mmget_not_zero(dma->mm)) {
-		mm_lock_acct(dma->task, dma->mm, dma->lock_cap, -npage);
-		mmput(dma->mm);
+	/* Metadata adoption can deduplicate charges, but not original PIN refs. */
+	ret = mm_lock_acct(dma->task, dma->mm, dma->lock_cap, -old_pages);
+	if (ret) {
+		mm_lock_acct(task, mm, lock_cap, -(long)pages);
+		return ret;
 	}
-
 	if (dma->task != task) {
 		put_task_struct(dma->task);
 		dma->task = get_task_struct(task);
@@ -1673,7 +1739,38 @@ static int vfio_change_dma_owner(struct vfio_dma *dma)
 	dma->mm = mm;
 	mmgrab(dma->mm);
 	dma->lock_cap = lock_cap;
+	dma->locked_vm = pages;
 	return 0;
+}
+
+static int vfio_change_dma_mm(struct vfio_dma *dma, struct task_struct *task,
+			      struct mm_struct *mm, bool lock_cap)
+{
+	return vfio_change_dma_mm_pages(dma, task, mm, lock_cap, dma->locked_vm);
+}
+
+static int vfio_change_dma_owner(struct vfio_iommu *iommu, struct vfio_dma *dma,
+				 unsigned long vaddr)
+{
+	struct vfio_fragment_provider *provider;
+	int ret;
+
+	if (dma->fragments || (mm_page_size(current->mm) == PAGE_SIZE &&
+			      IS_ALIGNED(vaddr, PAGE_SIZE)))
+		return vfio_change_dma_mm(dma, current->group_leader, current->mm,
+					  capable(CAP_IPC_LOCK));
+
+	/* Prepare only metadata: failure must preserve every legacy pin/charge. */
+	provider = vfio_fragments_prepare_native(iommu, dma);
+	if (IS_ERR(provider))
+		return PTR_ERR(provider);
+	ret = vfio_change_dma_mm_pages(dma, current->group_leader, current->mm,
+				      capable(CAP_IPC_LOCK), vfio_fragments_native_pages(provider));
+	if (ret)
+		vfio_fragments_abort_native(provider);
+	else
+		vfio_fragments_commit_native(dma, provider);
+	return ret;
 }
 
 static int vfio_dma_do_map(struct vfio_iommu *iommu,
@@ -1713,8 +1810,6 @@ static int vfio_dma_do_map(struct vfio_iommu *iommu,
 
 	pgsize = (size_t)1 << __ffs(iommu->pgsize_bitmap);
 
-	WARN_ON((pgsize - 1) & PAGE_MASK);
-
 	if ((size | iova | vaddr) & (pgsize - 1)) {
 		ret = -EINVAL;
 		goto out_unlock;
@@ -1728,7 +1823,7 @@ static int vfio_dma_do_map(struct vfio_iommu *iommu,
 			   dma->size != size) {
 			ret = -EINVAL;
 		} else {
-			ret = vfio_change_dma_owner(dma);
+			ret = vfio_change_dma_owner(iommu, dma, vaddr);
 			if (ret)
 				goto out_unlock;
 			dma->vaddr = vaddr;
@@ -1781,6 +1876,11 @@ static int vfio_dma_do_map(struct vfio_iommu *iommu,
 
 	/* Insert zero-sized and grow as we map chunks of it */
 	vfio_link_dma(iommu, dma);
+	ret = vfio_fragments_init(dma, size);
+	if (ret) {
+		vfio_remove_dma(iommu, dma);
+		goto out_unlock;
+	}
 
 	/* Don't pin and map if container doesn't contain IOMMU capable domain*/
 	if (list_empty(&iommu->domain_list))
@@ -1789,7 +1889,7 @@ static int vfio_dma_do_map(struct vfio_iommu *iommu,
 		ret = vfio_pin_map_dma(iommu, dma, size);
 
 	if (!ret && iommu->dirty_page_tracking) {
-		ret = vfio_dma_bitmap_alloc(dma, pgsize);
+		ret = vfio_dma_bitmap_alloc(dma, vfio_dirty_pgsize(iommu));
 		if (ret)
 			vfio_remove_dma(iommu, dma);
 	}
@@ -1822,6 +1922,14 @@ static int vfio_iommu_replay(struct vfio_iommu *iommu,
 		size_t pos = 0;
 
 		dma = rb_entry(n, struct vfio_dma, node);
+		if (dma->fragments) {
+			ret = vfio_fragments_acquire(dma, 0, dma->size);
+			if (!ret)
+				ret = vfio_fragments_map_domain(dma, domain->domain);
+			if (ret)
+				goto unwind;
+			continue;
+		}
 
 		while (pos < dma->size) {
 			dma_addr_t iova = dma->iova + pos;
@@ -1906,6 +2014,11 @@ unwind:
 		struct vfio_dma *dma = rb_entry(n, struct vfio_dma, node);
 		size_t pos = 0;
 
+		if (dma->fragments) {
+			iommu_unmap(domain->domain, dma->iova, dma->size);
+			vfio_fragments_release_unused(dma);
+			continue;
+		}
 		if (dma->iommu_mapped) {
 			iommu_unmap(domain->domain, dma->iova, dma->size);
 			continue;
@@ -2442,6 +2555,10 @@ static void vfio_iommu_unmap_unpin_reaccount(struct vfio_iommu *iommu)
 		long locked = 0, unlocked = 0;
 
 		dma = rb_entry(n, struct vfio_dma, node);
+		if (dma->fragments) {
+			vfio_unmap_unpin(iommu, dma, true);
+			continue;
+		}
 		unlocked += vfio_unmap_unpin(iommu, dma, false);
 		p = rb_first(&dma->pfn_list);
 		for (; p; p = rb_next(p)) {
@@ -2646,7 +2763,8 @@ static void *vfio_iommu_type1_open(unsigned long arg)
 	mutex_init(&iommu->lock);
 	mutex_init(&iommu->device_list_lock);
 	INIT_LIST_HEAD(&iommu->device_list);
-	iommu->pgsize_bitmap = PAGE_MASK;
+	iommu->pgsize_bitmap = IS_ENABLED(CONFIG_MM_SUBPAGE) ?
+		GENMASK(BITS_PER_LONG - 1, 12) : PAGE_MASK;
 	INIT_LIST_HEAD(&iommu->emulated_iommu_groups);
 
 	return iommu;
@@ -2812,7 +2930,7 @@ static int vfio_iommu_migration_build_caps(struct vfio_iommu *iommu,
 
 	cap_mig.flags = 0;
 	/* support minimum pgsize */
-	cap_mig.pgsize_bitmap = (size_t)1 << __ffs(iommu->pgsize_bitmap);
+	cap_mig.pgsize_bitmap = vfio_dirty_pgsize(iommu);
 	cap_mig.max_dirty_bitmap_size = DIRTY_BITMAP_SIZE_MAX;
 
 	return vfio_info_add_capability(caps, &cap_mig.header, sizeof(cap_mig));
@@ -2910,6 +3028,63 @@ static int vfio_iommu_type1_map_dma(struct vfio_iommu *iommu,
 	return vfio_dma_do_map(iommu, &map);
 }
 
+#ifdef CONFIG_COMPAT
+struct compat_vfio_bitmap {
+	compat_u64 pgsize;
+	compat_u64 size;
+	compat_uptr_t data;
+};
+#endif
+
+static size_t vfio_bitmap_size(void)
+{
+#ifdef CONFIG_COMPAT
+	/* IA32 differs from AArch32/x32 in its u64 alignment and tail padding. */
+	if (in_compat_syscall() && compat_need_64bit_alignment_fixup())
+		return sizeof(struct compat_vfio_bitmap);
+#endif
+	return sizeof(struct vfio_bitmap);
+}
+
+static size_t vfio_dirty_bitmap_get_size(void)
+{
+	return offsetof(struct vfio_iommu_type1_dirty_bitmap_get, bitmap) +
+		vfio_bitmap_size();
+}
+
+static int vfio_bitmap_from_user(struct vfio_bitmap *bitmap, void __user *user)
+{
+#ifdef CONFIG_COMPAT
+	if (in_compat_syscall()) {
+		compat_uptr_t data;
+		unsigned long offset = offsetof(struct vfio_bitmap, data);
+
+		/* Read only the pointer field, never its trailing compat padding. */
+		if (copy_from_user(bitmap, user, offset) ||
+		    get_user(data, (compat_uptr_t __user *)(user + offset)))
+			return -EFAULT;
+		bitmap->data = compat_ptr(data);
+		return 0;
+	}
+#endif
+	return copy_from_user(bitmap, user, sizeof(*bitmap)) ? -EFAULT : 0;
+}
+
+static int vfio_dirty_bitmap_get_from_user(
+		struct vfio_iommu_type1_dirty_bitmap_get *range, void __user *user)
+{
+#ifdef CONFIG_COMPAT
+	if (in_compat_syscall()) {
+		unsigned long offset = offsetof(typeof(*range), bitmap);
+
+		if (copy_from_user(range, user, offset))
+			return -EFAULT;
+		return vfio_bitmap_from_user(&range->bitmap, user + offset);
+	}
+#endif
+	return copy_from_user(range, user, sizeof(*range)) ? -EFAULT : 0;
+}
+
 static int vfio_iommu_type1_unmap_dma(struct vfio_iommu *iommu,
 				      unsigned long arg)
 {
@@ -2937,13 +3112,12 @@ static int vfio_iommu_type1_unmap_dma(struct vfio_iommu *iommu,
 	if (unmap.flags & VFIO_DMA_UNMAP_FLAG_GET_DIRTY_BITMAP) {
 		unsigned long pgshift;
 
-		if (unmap.argsz < (minsz + sizeof(bitmap)))
+		if (unmap.argsz < minsz + vfio_bitmap_size())
 			return -EINVAL;
 
-		if (copy_from_user(&bitmap,
-				   (void __user *)(arg + minsz),
-				   sizeof(bitmap)))
-			return -EFAULT;
+		ret = vfio_bitmap_from_user(&bitmap, (void __user *)(arg + minsz));
+		if (ret)
+			return ret;
 
 		if (!access_ok((void __user *)bitmap.data, bitmap.size))
 			return -EINVAL;
@@ -2992,7 +3166,7 @@ static int vfio_iommu_type1_dirty_pages(struct vfio_iommu *iommu,
 		size_t pgsize;
 
 		mutex_lock(&iommu->lock);
-		pgsize = 1 << __ffs(iommu->pgsize_bitmap);
+		pgsize = vfio_dirty_pgsize(iommu);
 		if (!iommu->dirty_page_tracking) {
 			ret = vfio_dma_bitmap_alloc_all(iommu, pgsize);
 			if (!ret)
@@ -3015,12 +3189,12 @@ static int vfio_iommu_type1_dirty_pages(struct vfio_iommu *iommu,
 		size_t size, iommu_pgsize;
 		dma_addr_t iova, iova_end;
 
-		if (!data_size || data_size < sizeof(range))
+		if (data_size < vfio_dirty_bitmap_get_size())
 			return -EINVAL;
 
-		if (copy_from_user(&range, (void __user *)(arg + minsz),
-				   sizeof(range)))
-			return -EFAULT;
+		ret = vfio_dirty_bitmap_get_from_user(&range, (void __user *)(arg + minsz));
+		if (ret)
+			return ret;
 
 		iova = range.iova;
 		size = range.size;
@@ -3046,7 +3220,7 @@ static int vfio_iommu_type1_dirty_pages(struct vfio_iommu *iommu,
 
 		mutex_lock(&iommu->lock);
 
-		iommu_pgsize = (size_t)1 << __ffs(iommu->pgsize_bitmap);
+		iommu_pgsize = vfio_dirty_pgsize(iommu);
 
 		/* allow only smallest supported pgsize */
 		if (range.bitmap.pgsize != iommu_pgsize) {
@@ -3112,11 +3286,12 @@ static void vfio_iommu_type1_register_device(void *iommu_data,
 	 * Holding both locks here allows avoiding the device_list_lock in
 	 * several fast paths. See vfio_notify_dma_unmap()
 	 */
-	mutex_lock(&iommu->lock);
+	/* Unmap callbacks hold device_list_lock while reentering iommu->lock. */
 	mutex_lock(&iommu->device_list_lock);
+	mutex_lock(&iommu->lock);
 	list_add(&vdev->iommu_entry, &iommu->device_list);
-	mutex_unlock(&iommu->device_list_lock);
 	mutex_unlock(&iommu->lock);
+	mutex_unlock(&iommu->device_list_lock);
 }
 
 static void vfio_iommu_type1_unregister_device(void *iommu_data,
@@ -3127,11 +3302,12 @@ static void vfio_iommu_type1_unregister_device(void *iommu_data,
 	if (!vdev->ops->dma_unmap)
 		return;
 
-	mutex_lock(&iommu->lock);
+	/* Unmap callbacks hold device_list_lock while reentering iommu->lock. */
 	mutex_lock(&iommu->device_list_lock);
+	mutex_lock(&iommu->lock);
 	list_del(&vdev->iommu_entry);
-	mutex_unlock(&iommu->device_list_lock);
 	mutex_unlock(&iommu->lock);
+	mutex_unlock(&iommu->device_list_lock);
 }
 
 static int vfio_iommu_type1_dma_rw_chunk(struct vfio_iommu *iommu,
@@ -3156,6 +3332,22 @@ static int vfio_iommu_type1_dma_rw_chunk(struct vfio_iommu *iommu,
 		return -EPERM;
 
 	mm = dma->mm;
+	if (dma->fragments) {
+		int ret;
+
+		if (!kthread && current->mm != mm)
+			return -EFAULT;
+		offset = user_iova - dma->iova;
+		count = min(count, dma->size - offset);
+		ret = vfio_fragments_rw(dma, offset, data, count, write, copied);
+		if (*copied && write && iommu->dirty_page_tracking) {
+			unsigned long shift = __ffs(vfio_dirty_pgsize(iommu));
+
+			bitmap_set(dma->bitmap, offset >> shift,
+				   ((offset + *copied - 1) >> shift) - (offset >> shift) + 1);
+		}
+		return ret;
+	}
 	if (!mmget_not_zero(mm))
 		return -EPERM;
 
@@ -3175,7 +3367,7 @@ static int vfio_iommu_type1_dma_rw_chunk(struct vfio_iommu *iommu,
 		*copied = copy_to_user((void __user *)vaddr, data,
 					 count) ? 0 : count;
 		if (*copied && iommu->dirty_page_tracking) {
-			unsigned long pgshift = __ffs(iommu->pgsize_bitmap);
+			unsigned long pgshift = __ffs(vfio_dirty_pgsize(iommu));
 			/*
 			 * Bitmap populated with the smallest supported page
 			 * size
@@ -3281,3 +3473,13 @@ MODULE_VERSION(DRIVER_VERSION);
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR(DRIVER_AUTHOR);
 MODULE_DESCRIPTION(DRIVER_DESC);
+
+#ifdef CONFIG_VFIO_TYPE1_ACCOUNT_KUNIT_TEST
+#include "vfio_iommu_type1_account_test.c"
+#if defined(CONFIG_MM_SUBPAGE) && defined(CONFIG_ARM64_USER4K_EXPERIMENTAL)
+#include "vfio_iommu_type1_fragments_test.c"
+#ifdef CONFIG_ARM64_USER4K_VFIO_IOCTL_TEST
+#include "vfio_iommu_type1_ioctl_test.c"
+#endif
+#endif
+#endif

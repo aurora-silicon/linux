@@ -217,7 +217,8 @@ static int iopt_insert_area(struct io_pagetable *iopt, struct iopt_area *area,
 		return -EPERM;
 
 	area->iommu_prot = iommu_prot;
-	area->page_offset = start_byte % PAGE_SIZE;
+	area->page_shift = pages->page_shift;
+	area->page_offset = start_byte & ((1UL << area->page_shift) - 1);
 	if (area->page_offset & (iopt->iova_alignment - 1))
 		return -EINVAL;
 
@@ -225,10 +226,10 @@ static int iopt_insert_area(struct io_pagetable *iopt, struct iopt_area *area,
 	if (check_add_overflow(iova, length - 1, &area->node.last))
 		return -EOVERFLOW;
 
-	area->pages_node.start = start_byte / PAGE_SIZE;
+	area->pages_node.start = start_byte >> area->page_shift;
 	if (check_add_overflow(start_byte, length - 1, &area->pages_node.last))
 		return -EOVERFLOW;
-	area->pages_node.last = area->pages_node.last / PAGE_SIZE;
+	area->pages_node.last >>= area->page_shift;
 	if (WARN_ON(area->pages_node.last >= pages->npages))
 		return -EOVERFLOW;
 
@@ -572,7 +573,7 @@ iommu_read_and_clear_dirty(struct iommu_domain *domain,
 	struct iommu_dirty_bitmap dirty;
 	struct iova_bitmap_fn_arg arg;
 	struct iova_bitmap *iter;
-	int ret = 0;
+	int ret;
 
 	if (!ops || !ops->read_and_clear_dirty)
 		return -EOPNOTSUPP;
@@ -581,7 +582,7 @@ iommu_read_and_clear_dirty(struct iommu_domain *domain,
 				 bitmap->page_size,
 				 u64_to_user_ptr(bitmap->data));
 	if (IS_ERR(iter))
-		return -ENOMEM;
+		return PTR_ERR(iter);
 
 	iommu_dirty_bitmap_init(&dirty, iter, &gather);
 
@@ -589,7 +590,7 @@ iommu_read_and_clear_dirty(struct iommu_domain *domain,
 	arg.iopt = iopt;
 	arg.domain = domain;
 	arg.dirty = &dirty;
-	iova_bitmap_for_each(iter, &arg, __iommu_read_and_clear_dirty);
+	ret = iova_bitmap_for_each(iter, &arg, __iommu_read_and_clear_dirty);
 
 	if (!(flags & IOMMU_DIRTY_NO_CLEAR))
 		iommu_iotlb_sync(domain, &gather);
@@ -615,7 +616,7 @@ int iommufd_check_iova_range(struct io_pagetable *iopt,
 	    ((last_iova + 1) & (iommu_pgsize - 1)))
 		return -EINVAL;
 
-	if (!bitmap->page_size)
+	if (!is_power_of_2(bitmap->page_size))
 		return -EINVAL;
 
 	if ((bitmap->iova & (bitmap->page_size - 1)) ||

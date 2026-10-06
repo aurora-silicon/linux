@@ -1343,7 +1343,7 @@ unsigned long drm_gem_get_unmapped_area(struct file *filp, unsigned long uaddr,
 	struct drm_gem_object *obj;
 	unsigned long ret;
 
-	obj = drm_gem_object_lookup_at_offset(filp, pgoff, len >> PAGE_SHIFT);
+	obj = drm_gem_object_lookup_at_offset(filp, pgoff, DIV_ROUND_UP(len, PAGE_SIZE));
 	if (IS_ERR(obj))
 		obj = NULL;
 
@@ -1379,8 +1379,11 @@ int drm_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 	struct drm_gem_object *obj;
 	int ret;
 
+	/* GEM fake offsets identify an exact object start, not an interior byte. */
+	if (vma_subpage_offset(vma))
+		return -EINVAL;
 	obj = drm_gem_object_lookup_at_offset(filp, vma->vm_pgoff,
-					      vma_pages(vma));
+			DIV_ROUND_UP(vma->vm_end - vma->vm_start, PAGE_SIZE));
 	if (IS_ERR(obj))
 		return PTR_ERR(obj);
 
