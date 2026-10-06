@@ -536,6 +536,7 @@ static u8 dcpep_cb_prop_start(struct apple_dcp *dcp, u32 *length)
 	if (!dcp_property_size_valid(*length))
 		return false;
 
+	dcp->chunks.modes_generation = dcp_modes_transfer_begin(dcp);
 	dcp->chunks.length = *length;
 	dcp->chunks.data = kzalloc(*length, GFP_KERNEL);
 
@@ -586,8 +587,13 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 	ctx.dcp = dcp;
 
 	if (!strcmp(req->key, "TimingElements")) {
-		ret = dcp_modes_replace(dcp, &ctx);
+		ret = dcp_modes_replace(dcp, &ctx, dcp->chunks.modes_generation);
 		if (ret) {
+			if (ret == -ESTALE) {
+				kfree(dcp->chunks.data);
+				dcp->chunks.data = NULL;
+				dcp->chunks.length = 0;
+			}
 			dev_warn(dcp->dev, "failed to parse modes\n");
 			return false;
 		}
@@ -635,6 +641,8 @@ static u8 dcpep_cb_prop_end(struct apple_dcp *dcp,
 		return false;
 	}
 	resp = dcpep_process_chunks(dcp, req);
+	if (!dcp->chunks.data)
+		return resp;
 
 	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_eDP)
 		dev_info(dcp->dev,

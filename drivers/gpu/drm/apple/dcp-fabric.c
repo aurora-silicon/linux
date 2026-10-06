@@ -347,6 +347,8 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 			connector->port_encoder->possible_crtcs =
 				connector->candidate_crtcs;
 	}
+	if (dcp->fixed_connector && dcp->connector != dcp->fixed_connector)
+		dcp_modes_begin_attachment(dcp);
 	dcp->typec_connector = NULL;
 	dcp->connector = dcp->fixed_connector;
 	WRITE_ONCE(dcp->ext_backlight, false);

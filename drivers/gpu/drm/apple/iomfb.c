@@ -422,14 +422,24 @@ static void dcpep_got_msg(struct apple_dcp *dcp, u64 message)
 void dcp_modes_begin_attachment(struct apple_dcp *dcp)
 {
 	guard(mutex)(&dcp->modes_lock);
+	dcp->modes_generation++;
 	dcp->modes_admitted = false;
 }
 
-int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle)
+u64 dcp_modes_transfer_begin(struct apple_dcp *dcp)
+{
+	guard(mutex)(&dcp->modes_lock);
+	return dcp->modes_generation;
+}
+
+int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
+		      u64 generation)
 {
 	int ret;
 
 	guard(mutex)(&dcp->modes_lock);
+	if (generation != dcp->modes_generation)
+		return -ESTALE;
 	ret = replace_modes(handle, &dcp->modes, &dcp->nr_modes,
 			    dcp->width_mm, dcp->height_mm, dcp->notch_height,
 			    dcp->fixed_connector_type == DRM_MODE_CONNECTOR_eDP);

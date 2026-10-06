@@ -107,7 +107,9 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 					 int height_mm, unsigned notch_height,
 					 bool internal);
 void dcp_modes_begin_attachment(struct apple_dcp *dcp);
-int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle);
+u64 dcp_modes_transfer_begin(struct apple_dcp *dcp);
+int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
+		      u64 generation);
 
 /* Caller serializes readers against replacement. */
 int replace_modes(struct dcp_parse_ctx *handle,

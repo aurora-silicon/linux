@@ -444,14 +444,14 @@ static void parser_replacement(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, blob);
 	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
 	ctx.dcp = &parser_dcp;
-	KUNIT_ASSERT_EQ(test, dcp_modes_replace(dcp, &ctx), 0);
+	KUNIT_ASSERT_EQ(test, dcp_modes_replace(dcp, &ctx, dcp_modes_transfer_begin(dcp)), 0);
 	requested = dcp->modes[0].mode;
 	KUNIT_EXPECT_TRUE(test, lookup_mode(dcp, &requested, &selected));
 	KUNIT_EXPECT_EQ(test, selected.timing_mode_id, 7U);
 	previous = dcp->modes;
 	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size - 1, &ctx), 0);
 	ctx.dcp = &parser_dcp;
-	KUNIT_EXPECT_LT(test, dcp_modes_replace(dcp, &ctx), 0);
+	KUNIT_EXPECT_LT(test, dcp_modes_replace(dcp, &ctx, dcp_modes_transfer_begin(dcp)), 0);
 	KUNIT_EXPECT_PTR_EQ(test, dcp->modes, previous);
 	KUNIT_EXPECT_EQ(test, dcp->nr_modes, 1U);
 	record.id = 8;
@@ -459,7 +459,7 @@ static void parser_replacement(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, blob);
 	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
 	ctx.dcp = &parser_dcp;
-	KUNIT_ASSERT_EQ(test, dcp_modes_replace(dcp, &ctx), 0);
+	KUNIT_ASSERT_EQ(test, dcp_modes_replace(dcp, &ctx, dcp_modes_transfer_begin(dcp)), 0);
 	KUNIT_EXPECT_EQ(test, dcp->modes[0].timing_mode_id, 8U);
 	KUNIT_EXPECT_EQ(test, selected.timing_mode_id, 7U);
 	KUNIT_EXPECT_TRUE(test, lookup_mode(dcp, &requested, &selected));
@@ -485,7 +485,7 @@ static void parser_attachment_admission(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, blob);
 	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
 	ctx.dcp = &parser_dcp;
-	KUNIT_ASSERT_EQ(test, dcp_modes_replace(dcp, &ctx), 0);
+	KUNIT_ASSERT_EQ(test, dcp_modes_replace(dcp, &ctx, dcp_modes_transfer_begin(dcp)), 0);
 	requested = dcp->modes[0].mode;
 	KUNIT_EXPECT_TRUE(test, lookup_mode(dcp, &requested, &selected));
 	previous = dcp->modes;
@@ -493,7 +493,7 @@ static void parser_attachment_admission(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, lookup_mode(dcp, &requested, NULL));
 	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size - 1, &ctx), 0);
 	ctx.dcp = &parser_dcp;
-	KUNIT_EXPECT_LT(test, dcp_modes_replace(dcp, &ctx), 0);
+	KUNIT_EXPECT_LT(test, dcp_modes_replace(dcp, &ctx, dcp_modes_transfer_begin(dcp)), 0);
 	KUNIT_EXPECT_PTR_EQ(test, dcp->modes, previous);
 	KUNIT_EXPECT_FALSE(test, lookup_mode(dcp, &requested, NULL));
 	record.id = 8;
@@ -503,7 +503,7 @@ static void parser_attachment_admission(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, blob);
 	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
 	ctx.dcp = &parser_dcp;
-	KUNIT_ASSERT_EQ(test, dcp_modes_replace(dcp, &ctx), 0);
+	KUNIT_ASSERT_EQ(test, dcp_modes_replace(dcp, &ctx, dcp_modes_transfer_begin(dcp)), 0);
 	KUNIT_EXPECT_FALSE(test, lookup_mode(dcp, &requested, NULL));
 	requested = dcp->modes[0].mode;
 	KUNIT_EXPECT_TRUE(test, lookup_mode(dcp, &requested, &selected));
@@ -513,6 +513,52 @@ static void parser_attachment_admission(struct kunit *test)
 	dcp_mode_hotplug(&dcp->mode_state, false, NULL);
 	KUNIT_EXPECT_TRUE(test, lookup_mode(dcp, &requested, &selected));
 	KUNIT_EXPECT_EQ(test, selected.timing_mode_id, 8U);
+	kfree(dcp->modes);
+}
+
+static void parser_stale_transfer(struct kunit *test)
+{
+	struct parser_record record = valid_record(7, 10);
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	struct dcp_parse_ctx ctx;
+	struct parser_blob *blob;
+	struct drm_display_mode requested;
+	u64 old_generation, current_generation;
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	mutex_init(&dcp->modes_lock);
+	blob = make_blob(test, &record, 1);
+	KUNIT_ASSERT_NOT_NULL(test, blob);
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	ctx.dcp = &parser_dcp;
+	old_generation = dcp_modes_transfer_begin(dcp);
+	KUNIT_ASSERT_EQ(test, dcp_modes_replace(dcp, &ctx, old_generation), 0);
+	requested = dcp->modes[0].mode;
+
+	/* An old transfer cannot admit a catalog on a new attachment. */
+	dcp_modes_begin_attachment(dcp);
+	current_generation = dcp_modes_transfer_begin(dcp);
+	KUNIT_ASSERT_NE(test, old_generation, current_generation);
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	ctx.dcp = &parser_dcp;
+	KUNIT_EXPECT_EQ(test, dcp_modes_replace(dcp, &ctx, old_generation), -ESTALE);
+	KUNIT_EXPECT_FALSE(test, lookup_mode(dcp, &requested, NULL));
+
+	record.id = 8;
+	blob = make_blob(test, &record, 1);
+	KUNIT_ASSERT_NOT_NULL(test, blob);
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	ctx.dcp = &parser_dcp;
+	KUNIT_ASSERT_EQ(test, dcp_modes_replace(dcp, &ctx, current_generation), 0);
+	KUNIT_EXPECT_TRUE(test, lookup_mode(dcp, &requested, NULL));
+	KUNIT_EXPECT_EQ(test, dcp->modes[0].timing_mode_id, 8U);
+
+	/* A late old transfer cannot overwrite an already admitted new one. */
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	ctx.dcp = &parser_dcp;
+	KUNIT_EXPECT_EQ(test, dcp_modes_replace(dcp, &ctx, old_generation), -ESTALE);
+	KUNIT_EXPECT_EQ(test, dcp->modes[0].timing_mode_id, 8U);
+	KUNIT_EXPECT_TRUE(test, lookup_mode(dcp, &requested, NULL));
 	kfree(dcp->modes);
 }
 
@@ -545,6 +591,7 @@ static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_notch_vrr),
 	KUNIT_CASE(parser_replacement),
 	KUNIT_CASE(parser_attachment_admission),
+	KUNIT_CASE(parser_stale_transfer),
 	KUNIT_CASE(parser_property_bounds),
 	{}
 };
