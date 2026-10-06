@@ -1797,6 +1797,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	/* The running T6030 firmware is adopted as is. */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
 		if (dcp->external_native) {
+			WRITE_ONCE(dcp->external_detached, false);
 			enable_work(&dcp->vblank_wq);
 			enable_delayed_work(&dcp->swap_watchdog_wq);
 			enable_delayed_work(&dcp->external_retry_wq);

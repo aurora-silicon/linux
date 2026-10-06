@@ -164,6 +164,11 @@ struct apple_dcp {
 	atomic_t external_retries;
 	/* typec_generation when the pending retry was queued */
 	u64 external_retry_generation;
+	/*
+	 * Native: DRM unbound this pipe; firmware callbacks leave its
+	 * connector and CRTC alone. Set under the session lock.
+	 */
+	bool external_detached;
 	atomic_t external_requested;
 
 	/* DCP_FIRMWARE_V_14_7 state; outlives this device once RTKit runs. */

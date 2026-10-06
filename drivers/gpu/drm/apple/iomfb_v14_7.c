@@ -176,7 +176,7 @@ static void dcp_v14_stopped_work(struct work_struct *work)
 	struct apple_dcp *dcp = READ_ONCE(v14->dcp);
 	struct apple_connector *connector;
 
-	if (!dcp)
+	if (!dcp || READ_ONCE(dcp->external_detached))
 		return;
 	connector = READ_ONCE(dcp->connector);
 	dev_err(v14->dev, "external display session stopped: its display is reported disconnected\n");
@@ -433,6 +433,9 @@ static void dcp_v14_external_hotplug(struct apple_dcp *dcp, bool connected)
 	struct apple_connector *connector = READ_ONCE(dcp->connector);
 	unsigned int action;
 
+	if (READ_ONCE(dcp->external_detached))
+		return;
+
 	/*
 	 * Powering a Type-C CRTC off releases the link, and the firmware then
 	 * withdraws the display. The cable is still in: keep the connector
@@ -506,6 +509,9 @@ static void dcp_v14_external_published(struct apple_dcp_v14 *v14, const char *ke
 		return;
 	dev_info(dcp->dev, "display %s %s, %u bytes\n", key, removed ? "withdrawn" : "published",
 		 raw ? raw->size : 0);
+	/* DRM unbound the pipe: its connector and the users of its modes are gone. */
+	if (READ_ONCE(dcp->external_detached))
+		return;
 
 	/* The connector's debugfs keeps a copy. */
 	connector = READ_ONCE(dcp->connector);
@@ -1060,7 +1066,7 @@ static void dcp_v14_crashed(void *cookie, const void *crashlog, size_t crashlog_
 		if (dcp->external)
 			dcpext_scanout_fault(dcp, -EIO);
 		/* The display it drove is gone until reboot. */
-		if (v14->external && connector) {
+		if (v14->external && connector && !READ_ONCE(dcp->external_detached)) {
 			WRITE_ONCE(connector->connected, false);
 			apple_connector_edid_set_live(connector, false);
 			schedule_work(&connector->hotplug_wq);
@@ -1806,7 +1812,8 @@ int iomfb_v14_7_external_open(struct apple_dcp *dcp)
 	}
 	dev_info(dcp->dev, "external display interface open\n");
 	/* A display described before this could not be enabled until now. */
-	if (dcp->connector && READ_ONCE(dcp->connector->connected))
+	if (!READ_ONCE(dcp->external_detached) && dcp->connector &&
+	    READ_ONCE(dcp->connector->connected))
 		schedule_work(&dcp->connector->hotplug_wq);
 	return 0;
 }
@@ -1878,11 +1885,27 @@ void iomfb_v14_7_unbind(struct apple_dcp *dcp)
 
 	dcp->active = false;
 	dcp_mode_set_valid(&dcp->mode_state, false);
+	if (dcp->external_native && !v14)
+		WRITE_ONCE(dcp->external_detached, true);
 	if (!v14)
 		return;
-	/* An external session keeps serving its ports; removal detaches it. */
-	if (!v14->external)
+	/*
+	 * An external session keeps serving its ports; removal detaches it.
+	 * Its callbacks stop using the connector and CRTC DRM frees next:
+	 * the flag is set under the lock they run under, and the crash
+	 * callback and pending work are drained.
+	 */
+	if (v14->external) {
+		mutex_lock(&v14->lock);
+		WRITE_ONCE(dcp->external_detached, true);
+		mutex_unlock(&v14->lock);
+		if (v14->rtk)
+			apple_rtkit_flush_rx(v14->rtk);
+		flush_work(&v14->idle_work);
+		cancel_work_sync(&v14->stopped_work);
+	} else {
 		WRITE_ONCE(v14->dcp, NULL);
+	}
 	if (v14->rtk)
 		dev_info(dcp->dev, "display unbound; the DCP session and its buffers are kept until reboot\n");
 }
