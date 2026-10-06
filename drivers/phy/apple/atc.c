@@ -1140,6 +1140,15 @@ static void atcphy_clear_nonselected_phy_reset(struct apple_atcphy *atcphy)
 		PIPEHANDLER_NATIVE_RESET);
 }
 
+/* Debug only: USB3 PHY status at one step of the T8122 host BIST sequence */
+static void atcphy_usb3_bist_step_dbg(struct apple_atcphy *atcphy, int step)
+{
+	if (atcphy->hw->dp_t8122)
+		dev_dbg(atcphy->dev, "USB3 host BIST step %d: status2=%08x cfg1=%08x\n", step,
+			readl(atcphy->regs.core + ACIOPHY_BIST_MAC_USBPHY_STATUS2),
+			readl(atcphy->regs.core + ACIOPHY_BIST_CFG1));
+}
+
 static void atcphy_configure_pipehandler_usb3_host_t8122(struct apple_atcphy *atcphy)
 {
 	int ret;
@@ -1164,6 +1173,7 @@ static void atcphy_configure_pipehandler_usb3_host_t8122(struct apple_atcphy *at
 	if (ret)
 		dev_warn(atcphy->dev,
 			 "Timed out waiting for ACIOPHY_BIST_MAC_USBPHY_STATUS2_LN0_PHY_STATUS2\n");
+	atcphy_usb3_bist_step_dbg(atcphy, 1);
 
 	core_set32(atcphy, ACIOPHY_BIST_CFG2, ACIOPHY_BIST_CFG2_LN0_PHY_STATUS_RE);
 	udelay(10);
@@ -1185,6 +1195,7 @@ static void atcphy_configure_pipehandler_usb3_host_t8122(struct apple_atcphy *at
 	if (ret)
 		dev_warn(atcphy->dev,
 			 "Timed out waiting for ACIOPHY_BIST_MAC_USBPHY_STATUS2_LN0_PHY_STATUS2 2nd time\n");
+	atcphy_usb3_bist_step_dbg(atcphy, 2);
 	core_set32(atcphy, ACIOPHY_BIST_CFG2, ACIOPHY_BIST_CFG2_LN0_PHY_STATUS_RE);
 	udelay(10);
 	core_clear32(atcphy, ACIOPHY_BIST_CFG2, ACIOPHY_BIST_CFG2_LN0_PHY_STATUS_RE);
@@ -1200,6 +1211,7 @@ static void atcphy_configure_pipehandler_usb3_host_t8122(struct apple_atcphy *at
 		dev_warn(atcphy->dev,
 			 "Timed out waiting for ACIOPHY_BIST_CFG1_USB_EN 3rd toggle\n");
 	core_clear32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_USB_EN);
+	atcphy_usb3_bist_step_dbg(atcphy, 3);
 	core_clear32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_CLOCK_EN);
 }
 
@@ -1431,6 +1443,16 @@ static int atcphy_configure_pipehandler(struct apple_atcphy *atcphy, bool host)
 	}
 	dev_dbg(atcphy->dev, "PIPE %d -> %d (mode %d, host %d): %d\n", atcphy->pipe_state,
 		state, atcphy->mode, host, ret);
+	if (atcphy->hw->dp_t8122)
+		dev_dbg(atcphy->dev,
+			"PIPE regs: ovr=%08x ovr_val=%08x mux=%08x lock=%08x/%08x aon=%08x nonsel=%08x\n",
+			readl(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE),
+			readl(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE_VALUES),
+			readl(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL),
+			readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ),
+			readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK),
+			readl(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN),
+			readl(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE));
 	atcphy->pipe_state = state;
 
 	return ret;
@@ -3051,6 +3073,12 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 			readl(atcphy->regs.core + ATCPHY_MISC),
 			readl(atcphy->regs.core + ATCPHY_POWER_STAT),
 			readl(atcphy->regs.core + AUS_COMMON_DIG_RCAL1));
+	if (atcphy->hw->dp_t8122)
+		dev_dbg(atcphy->dev, "mode %d lane power: rx=%08x rxtx=%08x tx=%08x dpctl=%08x\n",
+			mode, readl(atcphy->regs.core + ATC_T8122_RX_PWR),
+			readl(atcphy->regs.core + ATC_T8122_RXTX_PWR),
+			readl(atcphy->regs.core + ATC_T8122_TX_PWR),
+			readl(atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0));
 
 	return 0;
 }
