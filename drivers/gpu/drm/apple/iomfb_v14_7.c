@@ -107,6 +107,14 @@ struct apple_dcp_v14 {
 	bool opened;
 	/* External: the display is powered (A472) in the mode last set. */
 	bool powered;
+	/*
+	 * External: the mode last set (A411 then A472(1)) runs, from a
+	 * description not changed since, with these ids; and swaps with a
+	 * framebuffer completed since it was set.
+	 */
+	bool mode_live;
+	u32 mode_timing, mode_color;
+	u64 mode_swaps;
 	/* External: catalog generation when a chunked property started. */
 	u64 chunk_generation;
 	/* External: the parts of the display's description published now. */
@@ -457,6 +465,9 @@ static void dcp_v14_external_published(struct apple_dcp_v14 *v14, const char *ke
 		v14->described &= ~part;
 	else if (part != DCP_V14_DESC_TIMING)
 		v14->described |= part;
+	/* Mode ids refer to the timings and colors described when it was set. */
+	if (part == DCP_V14_DESC_TIMING || part == DCP_V14_DESC_COLOR)
+		v14->mode_live = false;
 	/* A mode set waits for the whole description; see external_settle(). */
 	wake_up_all(&v14->described_wait);
 	if (!dcp)
@@ -2071,6 +2082,7 @@ static bool dcp_v14_present(struct apple_dcp_v14 *v14, struct drm_framebuffer *f
 		/* Refused before it was taken: the old framebuffer stays on screen. */
 		if (fb)
 			drm_framebuffer_put(fb);
+		WRITE_ONCE(v14->mode_swaps, 0);
 		dev_warn_ratelimited(v14->dev, "display refused a swap: %d\n", ret);
 		return false;
 	}
@@ -2083,6 +2095,8 @@ static bool dcp_v14_present(struct apple_dcp_v14 *v14, struct drm_framebuffer *f
 	old = v14->active_fb;
 	v14->active_fb = fb;
 	swaps = ++v14->swaps;
+	if (fb)
+		v14->mode_swaps++;
 	v14->swap_ns_max = max(v14->swap_ns_max, elapsed);
 	mutex_unlock(&v14->lock);
 	if (old)
@@ -2187,6 +2201,8 @@ static int dcp_v14_set_power(struct apple_dcp_v14 *v14, bool on)
 	/* A refused power-down leaves nothing on: the display is gone already. */
 	if (!ret || (!on && !READ_ONCE(v14->failed)))
 		v14->powered = on;
+	if (!on)
+		v14->mode_live = false;
 	return ret;
 }
 
@@ -2247,6 +2263,34 @@ static int dcp_v14_external_settle(struct apple_dcp *dcp, struct apple_dcp_v14 *
 	return -EAGAIN;
 }
 
+/* Called with the lock held. */
+static bool dcp_v14_external_mode_live(struct apple_dcp_v14 *v14,
+				       const struct dcp_display_mode *mode)
+{
+	return !v14->failed && v14->powered && v14->mode_live &&
+	       v14->mode_timing == mode->timing_mode_id &&
+	       v14->mode_color == mode->color_mode_id && READ_ONCE(v14->mode_swaps);
+}
+
+/*
+ * Whether the firmware runs @drm_mode, set last, from the description it
+ * has now, and shows swaps in it.
+ */
+bool iomfb_v14_7_external_showing(struct apple_dcp *dcp,
+				  const struct drm_display_mode *drm_mode)
+{
+	struct apple_dcp_v14 *v14 = dcp->v14;
+	struct dcp_display_mode mode = {};
+	bool live;
+
+	if (!dcp->external_native || !v14 || !lookup_mode(dcp, drm_mode, &mode))
+		return false;
+	mutex_lock(&v14->lock);
+	live = dcp_v14_external_described(v14) && dcp_v14_external_mode_live(v14, &mode);
+	mutex_unlock(&v14->lock);
+	return live;
+}
+
 /* An external display: power down, set the new mode, power up. */
 static int dcp_v14_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state)
 {
@@ -2265,6 +2309,19 @@ static int dcp_v14_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state
 		ret = -EINVAL;
 		goto out;
 	}
+	/*
+	 * The firmware already runs this mode and shows swaps in it: setting
+	 * it again only restarts its timings under the display. A retry or a
+	 * replayed CRTC lands here when the display came back as it was.
+	 */
+	if (dcp_v14_external_mode_live(v14, &mode)) {
+		mutex_unlock(&v14->lock);
+		dev_info(dcp->dev, "display mode " DRM_MODE_FMT " (timing %u, color %u) already active and showing\n",
+			 DRM_MODE_ARG(&crtc_state->mode), mode.timing_mode_id, mode.color_mode_id);
+		atomic_set(&dcp->external_retries, 0);
+		dcp_mode_set_valid(&dcp->mode_state, true);
+		return 0;
+	}
 	if (v14->powered && dcp_v14_set_power(v14, false))
 		dev_warn(dcp->dev, "display did not power down before the mode change\n");
 	if (READ_ONCE(v14->failed))
@@ -2276,6 +2333,10 @@ static int dcp_v14_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state
 	if (!ret) {
 		v14->panel_width = mode.mode.hdisplay;
 		v14->panel_height = mode.mode.vdisplay;
+		v14->mode_timing = mode.timing_mode_id;
+		v14->mode_color = mode.color_mode_id;
+		v14->mode_swaps = 0;
+		v14->mode_live = true;
 	}
 	mutex_unlock(&v14->lock);
 out:

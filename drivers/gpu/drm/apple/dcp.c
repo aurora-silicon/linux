@@ -727,6 +727,21 @@ void dcp_external_retry(struct apple_dcp *dcp, const char *why, int error,
 	mod_delayed_work(system_freezable_wq, &dcp->external_retry_wq, msecs_to_jiffies(delay));
 }
 
+/* The active CRTC's mode is the one the firmware runs and shows swaps in. */
+static bool dcp_external_crtc_showing(struct apple_dcp *dcp)
+{
+	struct drm_crtc *crtc = dcp->crtc ? &dcp->crtc->base : NULL;
+	bool showing = false;
+
+	if (!crtc)
+		return false;
+	drm_modeset_lock(&crtc->mutex, NULL);
+	if (crtc->state && crtc->state->active)
+		showing = iomfb_v14_7_external_showing(dcp, &crtc->state->mode);
+	drm_modeset_unlock(&crtc->mutex);
+	return showing;
+}
+
 void dcp_external_retry_work(struct work_struct *work)
 {
 	struct apple_dcp *dcp = container_of(to_delayed_work(work), struct apple_dcp,
@@ -741,6 +756,11 @@ void dcp_external_retry_work(struct work_struct *work)
 	if (connector && READ_ONCE(connector->connected)) {
 		if (READ_ONCE(dcp->mode_state.valid)) {
 			dev_info(dcp->dev, "display retry: the display is back and set\n");
+			return;
+		}
+		if (dcp_external_crtc_showing(dcp)) {
+			dev_info(dcp->dev, "display retry: the display is back in its mode and showing\n");
+			dcp_mode_set_valid(&dcp->mode_state, true);
 			return;
 		}
 		dev_info(dcp->dev, "display retry: setting the display mode again\n");

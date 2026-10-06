@@ -28,6 +28,9 @@ int iomfb_v14_7_external_open(struct apple_dcp *dcp);
 bool iomfb_v14_7_external_busy(struct apple_dcp *dcp);
 /* The external session can no longer be used until reboot. */
 bool iomfb_v14_7_external_failed(struct apple_dcp *dcp);
+/* The firmware runs this mode, set last, and shows swaps in it. */
+bool iomfb_v14_7_external_showing(struct apple_dcp *dcp,
+				  const struct drm_display_mode *mode);
 /* Component unbind: KMS goes away; the firmware session is kept until reboot. */
 void iomfb_v14_7_unbind(struct apple_dcp *dcp);
 /* Platform remove: the apple_dcp is freed next; the firmware session is kept. */
