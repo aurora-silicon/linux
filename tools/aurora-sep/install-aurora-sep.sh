@@ -95,6 +95,12 @@
 # (now m1n1 aurora7, which also passes each Mac's PMP values). --m3-handoff is
 # available on the 14" J514S (opt-in, not yet on by default). This release adds
 # --m3-report and refuses chips it does not support (SUPPORTED_SOCS; #32).
+# 11.38: the same device trees and boot loaders as 11.37. The display driver
+# checks each display's modes and attributes before using them and refreshes a
+# connector's state before reporting a plug or unplug; the M3 Pro PMP's boot
+# settings and startup tables are checked before it starts; the M3 GPU
+# settings are per chip; each PCI USB controller reserves only the interrupt it
+# uses, leaving interrupts for a dock's other devices. An M3 Air stays kernel-only.
 # It replaces linux-asahi (or linux-aurora) as a pacman package,
 # so mkinitcpio and update-m1n1 run from their own hooks; on a GRUB Mac this
 # script regenerates grub.cfg and keeps the previous kernel as a fallback entry.
@@ -129,8 +135,8 @@ set -euo pipefail
 
 # The kernel package version and the release tag move independently: a release
 # that only changes m1n1 reuses the previous kernel packages unchanged.
-VERSION=7.1.12.aurora2-11.37
-TAG=sep-7.1.12.aurora2-11.37
+VERSION=7.1.12.aurora2-11.38
+TAG=sep-7.1.12.aurora2-11.38
 # Packages are fetched from this script's own tag, never from "latest": the
 # checksums below belong to this release and nothing else.
 RELEASE_URL=https://github.com/iconidentify/aurora-linux/releases/download/$TAG
@@ -138,8 +144,8 @@ RELEASES_API=https://api.github.com/repos/iconidentify/aurora-linux/releases
 # Where to always get the current script, whatever this copy turns out to be.
 LATEST_URL=https://github.com/iconidentify/aurora-linux/releases/latest/download/install-aurora-sep.sh
 PACKAGES=(
-  "linux-aurora-$VERSION-aarch64.pkg.tar.zst 1a31635c7073d4a90692a88c9af0b87931caaabd0888c31c1cf1b2335f8f30b5"
-  "linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst c6624e2996e5185ef9a7d24059e4ed639c05697f7e5e2181bd19539e524c9f57"
+  "linux-aurora-$VERSION-aarch64.pkg.tar.zst f1cecde567b42b93a03c26b78fc13ae8cf0a93e40a429c509df7b62836f9de1a"
+  "linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst 8c9fd8d30fc0392c8b0d4f690bf5c4ef02daea18529a645935bbe83b5a22e746"
   "libfprint-1.94.100-1.1-aarch64.pkg.tar.zst bc7d9762db6644f2cfb58ddb209602c1d513845eb1498c098e01f12600fcbdf9"
   "aurora-touchid-20261003-1-any.pkg.tar.zst 29b0360fac8c257d754e64bd1b9c33c487eb2595dd3c31e9138d7a476afa3d64"
   "m1n1-aurora-1.6.1.aurora3-1-aarch64.pkg.tar.zst bc3451aaa88bc3f4912bc3613f9569aa8f3e05f376fa851fa837b5e2080e8c2f"
