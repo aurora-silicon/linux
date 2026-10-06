@@ -79,11 +79,11 @@ static int elf_core_dump(struct coredump_params *cprm);
 #define elf_core_dump	NULL
 #endif
 
-#if ELF_EXEC_PAGESIZE > PAGE_SIZE
-#define ELF_MIN_ALIGN	ELF_EXEC_PAGESIZE
-#else
-#define ELF_MIN_ALIGN	PAGE_SIZE
+#ifndef ELF_EXEC_PAGESIZE_MM
+#define ELF_EXEC_PAGESIZE_MM(mm) ELF_EXEC_PAGESIZE
 #endif
+#define ELF_MIN_ALIGN max_t(unsigned long, mm_page_size(current->mm), \
+			    ELF_EXEC_PAGESIZE_MM(current->mm))
 
 #ifndef ELF_CORE_EFLAGS
 #define ELF_CORE_EFLAGS	0
@@ -93,12 +93,20 @@ static int elf_core_dump(struct coredump_params *cprm);
 #define ELF_PAGEOFFSET(_v) ((_v) & (ELF_MIN_ALIGN-1))
 #define ELF_PAGEALIGN(_v) (((_v) + ELF_MIN_ALIGN - 1) & ~(ELF_MIN_ALIGN - 1))
 
+#ifdef CONFIG_COREDUMP
+static unsigned long elf_min_coredump_size(void)
+{
+	return ELF_EXEC_PAGESIZE_MM(current->mm);
+}
+#endif
+
 static struct linux_binfmt elf_format = {
 	.module		= THIS_MODULE,
 	.load_binary	= load_elf_binary,
 #ifdef CONFIG_COREDUMP
 	.core_dump	= elf_core_dump,
 	.min_coredump	= ELF_EXEC_PAGESIZE,
+	.min_coredump_size = elf_min_coredump_size,
 #endif
 };
 
@@ -248,7 +256,7 @@ create_elf_tables(struct linux_binprm *bprm, const struct elfhdr *exec,
 	ARCH_DLINFO;
 #endif
 	NEW_AUX_ENT(AT_HWCAP, ELF_HWCAP);
-	NEW_AUX_ENT(AT_PAGESZ, ELF_EXEC_PAGESIZE);
+	NEW_AUX_ENT(AT_PAGESZ, ELF_EXEC_PAGESIZE_MM(mm));
 	NEW_AUX_ENT(AT_CLKTCK, CLOCKS_PER_SEC);
 	NEW_AUX_ENT(AT_PHDR, phdr_addr);
 	NEW_AUX_ENT(AT_PHENT, sizeof(struct elf_phdr));
@@ -621,6 +629,13 @@ static inline int arch_check_elf(struct elfhdr *ehdr, bool has_interp,
 }
 
 #endif /* !CONFIG_ARCH_BINFMT_ELF_STATE */
+
+#ifndef arch_bprm_prepare_mm
+static inline int arch_bprm_prepare_mm(struct linux_binprm *bprm, bool compat)
+{
+	return 0;
+}
+#endif
 
 static inline int make_prot(u32 p_flags, struct arch_elf_state *arch_state,
 			    bool has_interp, bool is_interp)
@@ -1006,6 +1021,11 @@ out_free_interp:
 	if (retval)
 		goto out_free_dentry;
 
+	retval = arch_bprm_prepare_mm(bprm,
+				    elf_ex->e_ident[EI_CLASS] == ELFCLASS32);
+	if (retval)
+		goto out_free_dentry;
+
 	/* Flush all traces of the currently running executable */
 	retval = begin_new_exec(bprm);
 	if (retval)
@@ -1335,7 +1355,7 @@ out_free_interp:
 		 * leave a gap between .bss and brk.
 		 */
 		if (!brk_moved)
-			mm->brk = mm->start_brk = mm->brk + PAGE_SIZE;
+			mm->brk = mm->start_brk = mm->brk + mm_page_size(mm);
 
 		mm->brk = mm->start_brk = arch_randomize_brk(mm);
 		brk_moved = true;
@@ -1351,10 +1371,10 @@ out_free_interp:
 		   and some applications "depend" upon this behavior.
 		   Since we do not have the power to recompile these, we
 		   emulate the SVr4 behavior. Sigh. */
-		error = vm_mmap(NULL, 0, PAGE_SIZE, PROT_READ | PROT_EXEC,
+		error = vm_mmap(NULL, 0, mm_page_size(mm), PROT_READ | PROT_EXEC,
 				MAP_FIXED | MAP_PRIVATE, 0);
 
-		retval = do_mseal(0, PAGE_SIZE, 0);
+		retval = do_mseal(0, mm_page_size(mm), 0);
 		if (retval)
 			pr_warn_ratelimited("pid=%d, couldn't seal address 0, ret=%d.\n",
 					    task_pid_nr(current), retval);
@@ -1658,7 +1678,7 @@ static int fill_files_note(struct memelfnote *note, struct coredump_params *cprm
 
 	/* Now we know exact count of files, can store it */
 	data[0] = count;
-	data[1] = PAGE_SIZE;
+	data[1] = mm_page_size(current->mm);
 	/*
 	 * Count usually is less than mm->map_count,
 	 * we need to move filenames down.
@@ -2043,7 +2063,7 @@ static int elf_core_dump(struct coredump_params *cprm)
 		offset += sz;
 	}
 
-	dataoff = offset = roundup(offset, ELF_EXEC_PAGESIZE);
+	dataoff = offset = roundup(offset, ELF_EXEC_PAGESIZE_MM(current->mm));
 
 	offset += cprm->vma_data_size;
 	offset += elf_core_extra_data_size(cprm);
@@ -2083,7 +2103,7 @@ static int elf_core_dump(struct coredump_params *cprm)
 			phdr.p_flags |= PF_W;
 		if (meta->flags & VM_EXEC)
 			phdr.p_flags |= PF_X;
-		phdr.p_align = ELF_EXEC_PAGESIZE;
+		phdr.p_align = ELF_EXEC_PAGESIZE_MM(current->mm);
 
 		if (!dump_emit(cprm, &phdr, sizeof(phdr)))
 			goto end_coredump;
