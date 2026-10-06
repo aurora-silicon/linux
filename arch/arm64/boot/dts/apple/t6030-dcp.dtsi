@@ -134,14 +134,16 @@
 		iommus = <&dcpext_dart 5>;
 		power-domains = <&ps_dispext0_cpu>;
 		resets = <&ps_dispext0_cpu>;
-		phys = <&atcphy0 PHY_TYPE_DP>;
-		phy-names = "typec0";
-		mux-controls = <&atcphy0_xbar 0>;
-		mux-control-names = "typec0";
+		phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>,
+		       <&atcphy2 PHY_TYPE_DP>;
+		phy-names = "typec0", "typec1", "typec2";
+		mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>,
+			       <&atcphy2_xbar 0>;
+		mux-control-names = "typec0", "typec1", "typec2";
 		apple,connector-type = "USB-C";
 		apple,dcp-index = <1>;
-		apple,typec-dptx-phys = <0>;
-		apple,typec-mux-indices = <0>;
+		apple,typec-dptx-phys = <0 1 2>;
+		apple,typec-mux-indices = <0 0 0>;
 		#address-cells = <2>;
 		#size-cells = <2>;
 		status = "disabled";
@@ -164,6 +166,30 @@
 				port {
 					dcpext_typec0: endpoint {
 						remote-endpoint = <&typec0_dcpext>;
+					};
+				};
+			};
+
+			route@1 {
+				reg = <1>;
+				mode-switch;
+				status = "disabled";
+
+				port {
+					dcpext_typec1: endpoint {
+						remote-endpoint = <&typec1_dcpext>;
+					};
+				};
+			};
+
+			route@2 {
+				reg = <2>;
+				mode-switch;
+				status = "disabled";
+
+				port {
+					dcpext_typec2: endpoint {
+						remote-endpoint = <&typec2_dcpext>;
 					};
 				};
 			};
