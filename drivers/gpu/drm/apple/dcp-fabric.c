@@ -2351,6 +2351,42 @@ static int dcp_register_typec_routes_present(void *data)
 	return 0;
 }
 
+/*
+ * Disables every Type-C route of @dcp in the device tree, for good. A
+ * connector passes over unavailable routes when it looks for its display
+ * routes, so its port no longer waits for this processor.
+ */
+void dcp_typec_routes_disable(struct apple_dcp *dcp)
+{
+	struct device_node *routes __free(device_node) =
+		of_get_child_by_name(dcp->dev->of_node, "typec-routes");
+	struct device_node *route;
+	struct of_changeset *cs;
+	int ret = 0;
+
+	if (!routes)
+		return;
+	cs = kzalloc(sizeof(*cs), GFP_KERNEL);
+	if (!cs)
+		return;
+	of_changeset_init(cs);
+	for_each_available_child_of_node(routes, route) {
+		ret = of_changeset_update_prop_string(cs, route, "status", "disabled");
+		if (ret) {
+			of_node_put(route);
+			break;
+		}
+	}
+	if (!ret)
+		ret = of_changeset_apply(cs);
+	if (ret) {
+		dev_err(dcp->dev, "could not disable the Type-C display routes: %d\n", ret);
+		of_changeset_destroy(cs);
+		kfree(cs);
+	}
+	/* Applied, it stays: the live tree refers to it. */
+}
+
 int dcp_register_typec_routes(struct apple_dcp *dcp)
 {
 	struct device_node *routes __free(device_node) =

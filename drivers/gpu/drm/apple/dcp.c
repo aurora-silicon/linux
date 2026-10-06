@@ -1952,12 +1952,72 @@ static const struct component_ops dcp_comp_ops = {
 	.unbind	= dcp_comp_unbind,
 };
 
+/*
+ * A T6030 external processor's fixed (HDMI) output is optional. Its Type-C
+ * routes must register whatever happens to that output: every USB-C port
+ * lists them and waits for them, as the panel's DRM device waits for this
+ * processor. Keep deferring while the HDMI parts may still appear, then go
+ * on as a Type-C-only pipe. Elsewhere the error ends the probe, as before.
+ */
+static int dcp_fixed_output_error(struct apple_dcp *dcp, int err, const char *what)
+{
+	if (!dcp->external_native)
+		return err;
+	if (err == -EPROBE_DEFER) {
+		err = driver_deferred_probe_check_state(dcp->dev);
+		if (err == -EPROBE_DEFER)
+			return err;
+	}
+	dev_err(dcp->dev, "HDMI output unusable (%s: %d); USB-C displays are not affected\n",
+		what, err);
+	if (dcp->fixed_route_selected)
+		mux_control_deselect(dcp->xbar);
+	dcp->fixed_route_selected = false;
+	dcp->xbar = NULL;
+	if (!IS_ERR_OR_NULL(dcp->typec_mux))
+		typec_mux_put(dcp->typec_mux);
+	dcp->typec_mux = NULL;
+	dcp->phy_managed_by_typec = false;
+	/* A requested HPD interrupt stays disabled: nothing enables it now. */
+	dcp->hdmi_hpd_irq = 0;
+	dcp->hdmi_hpd = NULL;
+	dcp->hdmi_pwren = NULL;
+	dcp->dp2hdmi_pwren = NULL;
+	dcp->phy = NULL;
+	dcp->fixed_phy = NULL;
+	dcp->fixed_connector_type = DRM_MODE_CONNECTOR_USB;
+	dcp->connector_type = DRM_MODE_CONNECTOR_USB;
+	return 0;
+}
+
+/*
+ * A T6030 external processor whose Type-C routes did not register: disable
+ * them in the device tree so that the ports stop waiting for them, and add
+ * the processor to the DRM device as a pipe that never starts, so that the
+ * panel is not held up either.
+ */
+static int dcp_native_routes_error(struct apple_dcp *dcp, int err)
+{
+	if (!dcp->external_native)
+		return err;
+	if (err == -EPROBE_DEFER) {
+		err = driver_deferred_probe_check_state(dcp->dev);
+		if (err == -EPROBE_DEFER)
+			return err;
+	}
+	dev_err(dcp->dev, "Type-C display routes unusable: %d; USB-C ports go on without this processor\n",
+		err);
+	dcp_typec_routes_disable(dcp);
+	return 0;
+}
+
 static int dcp_platform_probe(struct platform_device *pdev)
 {
 	enum dcp_firmware_version fw_compat;
 	struct device *dev = &pdev->dev;
 	struct apple_dcp *dcp;
 	int ret, surf, num_surfs;
+	bool routes_failed = false;
 	u32 surf_en;
 	u32 mux_index;
 
@@ -2037,6 +2097,11 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		dcp->hw.num_dptx_ports = 2;
 
 	dcp->phy = devm_phy_optional_get(dev, "dp-phy");
+	if (IS_ERR(dcp->phy) && dcp->external_native) {
+		ret = dcp_fixed_output_error(dcp, PTR_ERR(dcp->phy), "dp-phy");
+		if (ret)
+			return ret;
+	}
 	if (IS_ERR(dcp->phy)) {
 		dev_err(dev, "Failed to get dp-phy: %ld\n", PTR_ERR(dcp->phy));
 		return PTR_ERR(dcp->phy);
@@ -2079,6 +2144,12 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		 * template ADT. TODO: check device ADT
 		 */
 		dcp->hdmi_hpd = devm_gpiod_get_optional(dev, "hdmi-hpd", GPIOD_IN);
+		if (IS_ERR(dcp->hdmi_hpd) && dcp->external_native) {
+			ret = dcp_fixed_output_error(dcp, PTR_ERR(dcp->hdmi_hpd), "hdmi-hpd");
+			if (ret)
+				return ret;
+			goto fixed_done;
+		}
 		if (IS_ERR(dcp->hdmi_hpd))
 			return PTR_ERR(dcp->hdmi_hpd);
 		ret = dcp_hdmi_init(dcp);
@@ -2086,6 +2157,12 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			return ret;
 		if (dcp->hdmi_hpd) {
 			int irq = gpiod_to_irq(dcp->hdmi_hpd);
+			if (irq < 0 && dcp->external_native) {
+				ret = dcp_fixed_output_error(dcp, irq, "hdmi-hpd interrupt");
+				if (ret)
+					return ret;
+				goto fixed_done;
+			}
 			if (irq < 0) {
 				dev_err(dev, "failed to translate HDMI hpd GPIO to IRQ\n");
 				return irq;
@@ -2097,6 +2174,12 @@ static int dcp_platform_probe(struct platform_device *pdev)
 						IRQF_ONESHOT | IRQF_NO_AUTOEN |
 						IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
 						"dp2hdmi-hpd-irq", dcp);
+			if (ret < 0 && dcp->external_native) {
+				ret = dcp_fixed_output_error(dcp, ret, "hdmi-hpd interrupt");
+				if (ret)
+					return ret;
+				goto fixed_done;
+			}
 			if (ret < 0) {
 				dev_err(dev, "failed to request HDMI hpd irq %d: %d\n",
 					irq, ret);
@@ -2110,10 +2193,22 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		 *       on battery powered Macbooks.
 		 */
 		dcp->hdmi_pwren = devm_gpiod_get_optional(dev, "hdmi-pwren", GPIOD_OUT_HIGH);
+		if (IS_ERR(dcp->hdmi_pwren) && dcp->external_native) {
+			ret = dcp_fixed_output_error(dcp, PTR_ERR(dcp->hdmi_pwren), "hdmi-pwren");
+			if (ret)
+				return ret;
+			goto fixed_done;
+		}
 		if (IS_ERR(dcp->hdmi_pwren))
 			return PTR_ERR(dcp->hdmi_pwren);
 
 		dcp->dp2hdmi_pwren = devm_gpiod_get_optional(dev, "dp2hdmi-pwren", GPIOD_OUT_HIGH);
+		if (IS_ERR(dcp->dp2hdmi_pwren) && dcp->external_native) {
+			ret = dcp_fixed_output_error(dcp, PTR_ERR(dcp->dp2hdmi_pwren), "dp2hdmi-pwren");
+			if (ret)
+				return ret;
+			goto fixed_done;
+		}
 		if (IS_ERR(dcp->dp2hdmi_pwren))
 			return PTR_ERR(dcp->dp2hdmi_pwren);
 
@@ -2128,6 +2223,12 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		if (!ret) {
 			dcp->fixed_mux_index = mux_index;
 			dcp->xbar = devm_mux_control_get(dev, "dp-xbar");
+			if (IS_ERR(dcp->xbar) && dcp->external_native) {
+				ret = dcp_fixed_output_error(dcp, PTR_ERR(dcp->xbar), "dp-xbar");
+				if (ret)
+					return ret;
+				goto fixed_done;
+			}
 			if (IS_ERR(dcp->xbar)) {
 				dev_err(dev, "Failed to get dp-xbar: %ld\n", PTR_ERR(dcp->xbar));
 				return PTR_ERR(dcp->xbar);
@@ -2163,9 +2264,14 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		}
 	}
 
+fixed_done:
 	ret = dcp_register_typec_routes(dcp);
-	if (ret)
-		return ret;
+	if (ret) {
+		ret = dcp_native_routes_error(dcp, ret);
+		if (ret)
+			return ret;
+		routes_failed = true;
+	}
 
 	/*
 	 * The manual external path stays out of the panel's DRM device. A
@@ -2178,6 +2284,8 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		ret = iomfb_v14_7_external_prepare(dcp);
 		if (ret)
 			return ret;
+		if (routes_failed)
+			iomfb_v14_7_external_refuse(dcp, "its Type-C display routes did not register");
 	}
 
 	ret = component_add(&pdev->dev, &dcp_comp_ops);

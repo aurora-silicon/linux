@@ -1516,6 +1516,13 @@ refuse:
 	return 0;
 }
 
+/* Probe: the pipe stays in the DRM device, never started. */
+void iomfb_v14_7_external_refuse(struct apple_dcp *dcp, const char *why)
+{
+	WRITE_ONCE(dcp->external_phase, DCPEXT_FAILED);
+	dev_err(dcp->dev, "external display processor unusable: %s\n", why);
+}
+
 /* True once DPTX can be used; asks for the start if nothing has. */
 bool iomfb_v14_7_external_ready(struct apple_dcp *dcp)
 {

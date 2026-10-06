@@ -24,6 +24,7 @@ int iomfb_v14_7_external_start(struct apple_dcp *dcp);
  */
 int iomfb_v14_7_external_prepare(struct apple_dcp *dcp);
 bool iomfb_v14_7_external_ready(struct apple_dcp *dcp);
+void iomfb_v14_7_external_refuse(struct apple_dcp *dcp, const char *why);
 int iomfb_v14_7_external_open(struct apple_dcp *dcp);
 const char *iomfb_v14_7_external_busy(struct apple_dcp *dcp);
 /* The external session can no longer be used until reboot. */
