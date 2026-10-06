@@ -94,6 +94,8 @@ struct apple_dcp_v14 {
 	/* Owns the RPC stream: start, swaps and idle callbacks. */
 	struct mutex lock;
 	struct work_struct idle_work;
+	/* External: reports the display gone once the session stopped. */
+	struct work_struct stopped_work;
 	bool failed;
 	bool started;
 
@@ -157,6 +159,35 @@ static bool dcp_v14_panel_session;
 static int dcp_v14_callback(void *cookie, u32 tag, const void *input, u32 in_size,
 			    void *output, u32 out_size);
 
+/*
+ * An external session stopped on a link error, not a crash: its display is
+ * gone until reboot. Report that as the crash path does, from process
+ * context, so that userspace stops driving the output.
+ */
+static void dcp_v14_external_stopped(struct apple_dcp_v14 *v14)
+{
+	if (v14->external)
+		schedule_work(&v14->stopped_work);
+}
+
+static void dcp_v14_stopped_work(struct work_struct *work)
+{
+	struct apple_dcp_v14 *v14 = container_of(work, struct apple_dcp_v14, stopped_work);
+	struct apple_dcp *dcp = READ_ONCE(v14->dcp);
+	struct apple_connector *connector;
+
+	if (!dcp)
+		return;
+	connector = READ_ONCE(dcp->connector);
+	dev_err(v14->dev, "external display session stopped: its display is reported disconnected\n");
+	dcp_mode_invalidate(&dcp->mode_state);
+	if (connector) {
+		WRITE_ONCE(connector->connected, false);
+		apple_connector_edid_set_live(connector, false);
+		schedule_work(&connector->hotplug_wq);
+	}
+}
+
 /* Called with the lock held, or from a callback. */
 static int dcp_v14_call(struct apple_dcp_v14 *v14, u32 tag, const void *in, u32 in_size,
 			void *out, u32 out_size, u32 completion)
@@ -172,6 +203,7 @@ static int dcp_v14_call(struct apple_dcp_v14 *v14, u32 tag, const void *in, u32 
 		v14->failed = true;
 		dev_err(v14->dev, "DCP call %#x failed: %d; recovery requires a reboot\n",
 			tag, ret);
+		dcp_v14_external_stopped(v14);
 	}
 	return ret;
 }
@@ -1010,6 +1042,7 @@ static void dcp_v14_idle(struct work_struct *work)
 	if (ret && ret != -ETIMEDOUT && ret != -EAGAIN) {
 		v14->failed = true;
 		dev_err(v14->dev, "DCP notification failed: %d; recovery requires a reboot\n", ret);
+		dcp_v14_external_stopped(v14);
 	}
 	mutex_unlock(&v14->lock);
 }
@@ -1643,6 +1676,7 @@ static int dcpext_boot(struct apple_dcp *dcp)
 	mutex_init(&v14->lock);
 	init_waitqueue_head(&v14->described_wait);
 	INIT_WORK(&v14->idle_work, dcp_v14_idle);
+	INIT_WORK(&v14->stopped_work, dcp_v14_stopped_work);
 	dcp->v14 = v14;
 	dcp_v14_link_init(&v14->link, dev, NULL);
 
@@ -1758,10 +1792,12 @@ int iomfb_v14_7_external_open(struct apple_dcp *dcp)
 	ret = dcp_v14_simple_call(v14, A(401), false, true, true);
 	if (!ret)
 		ret = dcp_v14_simple_call(v14, A(455), false, false, false);
-	if (!ret)
+	if (!ret) {
 		v14->opened = true;
-	else
+	} else {
 		v14->failed = true;
+		dcp_v14_external_stopped(v14);
+	}
 	mutex_unlock(&v14->lock);
 	if (ret) {
 		dev_err(dcp->dev, "external display interface did not open: %d; no retry until reboot\n",
@@ -1890,6 +1926,8 @@ void iomfb_v14_7_remove(struct apple_dcp *dcp)
 	/* Their endpoints are freed with the apple_dcp too; nothing queues more now. */
 	dcp_v14_flush_endpoints(dcp);
 	cancel_work_sync(&v14->idle_work);
+	if (v14->external)
+		cancel_work_sync(&v14->stopped_work);
 }
 
 static int dcp_v14_status_show(struct seq_file *m, void *unused)
@@ -2175,6 +2213,15 @@ int iomfb_v14_7_atomic_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	if (dcp->external) {
 		/* An external pipe can always be switched off, started or not. */
 		if (!crtc_state || !crtc_state->active)
+			return 0;
+		/*
+		 * A stopped native session reports its display gone. Until
+		 * userspace switches the pipe off, let commits that include it
+		 * through: nothing is shown on it, and other outputs must not
+		 * fail with it.
+		 */
+		if (dcp->external_native &&
+		    (dcp->crashed || (v14 && READ_ONCE(v14->failed))))
 			return 0;
 		if (dcp->crashed || !v14 || READ_ONCE(v14->failed) || !v14->opened)
 			return -EIO;
