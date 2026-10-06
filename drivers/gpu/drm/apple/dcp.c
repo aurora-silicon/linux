@@ -695,6 +695,8 @@ void dcp_external_ready(struct apple_dcp *dcp)
 
 #define DCP_EXTERNAL_RETRIES	3
 
+static void dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port);
+
 /*
  * Bounded recovery for a native external pipe: re-apply the display mode,
  * or redo the display link, up to DCP_EXTERNAL_RETRIES times per attached
@@ -727,6 +729,8 @@ void dcp_external_retry(struct apple_dcp *dcp, const char *why, int error,
 	delay = base_ms << (n - 1);
 	dev_info(dcp->dev, "%s (%d): retry %u of %u in %u ms\n", why, error, n,
 		 DCP_EXTERNAL_RETRIES, delay);
+	/* An attach or detach after this makes it stale; see the work. */
+	WRITE_ONCE(dcp->external_retry_generation, READ_ONCE(dcp->typec_generation));
 	mod_delayed_work(system_freezable_wq, &dcp->external_retry_wq, msecs_to_jiffies(delay));
 }
 
@@ -750,7 +754,12 @@ void dcp_external_retry_work(struct work_struct *work)
 	struct apple_dcp *dcp = container_of(to_delayed_work(work), struct apple_dcp,
 					     external_retry_wq);
 	struct apple_connector *connector = READ_ONCE(dcp->connector);
+	u64 generation = READ_ONCE(dcp->external_retry_generation);
 
+	if (READ_ONCE(dcp->typec_generation) != generation) {
+		dev_info(dcp->dev, "display retry: the display was attached or detached since; dropped\n");
+		return;
+	}
 	if (iomfb_v14_7_external_failed(dcp)) {
 		dev_err(dcp->dev, "display retry: the external display processor stopped; no retry until reboot\n");
 		return;
@@ -785,15 +794,22 @@ void dcp_external_retry_work(struct work_struct *work)
 	 * release the link if it is still up, and connect it again, which
 	 * makes the firmware describe the display anew.
 	 */
-	dev_info(dcp->dev, "display retry: reconnecting the display link\n");
-	if (READ_ONCE(dcp->dptxport[0].enabled) && READ_ONCE(dcp->dptxport[0].connected)) {
-		int ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		/* Not under a connect or release of another display. */
+		if (dcp->typec_generation != generation || !dcp->typec_cable_connected) {
+			dev_info(dcp->dev, "display retry: the display was attached or detached since; dropped\n");
+			return;
+		}
+		dev_info(dcp->dev, "display retry: reconnecting the display link\n");
+		if (dcp->dptxport[0].enabled && dcp->dptxport[0].connected) {
+			int ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
 
-		if (ret)
-			dev_warn(dcp->dev, "display retry: HPD deassert failed: %d\n", ret);
-		dcp_dptx_disconnect(dcp, 0);
+			if (ret)
+				dev_warn(dcp->dev, "display retry: HPD deassert failed: %d\n", ret);
+			dcp_dptx_release_locked(dcp, 0);
+		}
+		dcp->typec_reconnect_tries = 0;
 	}
-	dcp->typec_reconnect_tries = 0;
 	dcp_queue_typec_reconnect(dcp, 0);
 }
 
@@ -964,12 +980,9 @@ static void disconnected_hpd_event(struct apple_connector *con)
 	}
 }
 
-int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
+static void dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port)
 {
-	/* Release the caller's RemotePort service, not the downstream DFP port. */
-	dev_info(dcp->dev, "%s(port=%d)\n", __func__, port);
-
-	mutex_lock(&dcp->hpd_mutex);
+	lockdep_assert_held(&dcp->hpd_mutex);
 	if (dcp->external) {
 		smp_store_release(&dcp->external_link_ready, false);
 		dcpext_scanout_invalidate(dcp);
@@ -985,6 +998,15 @@ int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
 	 */
 	if (dcp->external_native)
 		dcp_direct_crossbar_link(dcp, false);
+}
+
+int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
+{
+	/* Release the caller's RemotePort service, not the downstream DFP port. */
+	dev_info(dcp->dev, "%s(port=%d)\n", __func__, port);
+
+	mutex_lock(&dcp->hpd_mutex);
+	dcp_dptx_release_locked(dcp, port);
 	mutex_unlock(&dcp->hpd_mutex);
 
 	return 0;
@@ -1004,8 +1026,10 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 		dcp->placeholder_retried = false;
 		cancel_delayed_work(&dcp->typec_reconnect_wq);
 		/* A newly attached display gets its own retries. */
-		if (dcp->external_native)
+		if (dcp->external_native) {
 			atomic_set(&dcp->external_retries, 0);
+			cancel_delayed_work(&dcp->external_retry_wq);
+		}
 	}
 
 	ret = dcp_dptx_connect(dcp, port);
@@ -1023,6 +1047,9 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 		scoped_guard(mutex, &dcp->hpd_mutex) {
 			WRITE_ONCE(dcp->typec_cable_connected, false);
 			dcp->typec_generation++;
+			/* Nothing left to retry for the display that went. */
+			if (dcp->external_native)
+				cancel_delayed_work(&dcp->external_retry_wq);
 		}
 		WRITE_ONCE(dcp->typec_crtc_off, false);
 		reinit_completion(&dcp->typec_iomfb_hpd_ready);

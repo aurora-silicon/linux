@@ -2458,8 +2458,10 @@ static void dcp_hdmi_connect_fixed(void *ctx)
 	int ret = dcp_fixed_output_select(dcp);
 
 	/* A new HDMI attach gets its own retries. */
-	if (dcp->external_native)
+	if (dcp->external_native) {
 		atomic_set(&dcp->external_retries, 0);
+		cancel_delayed_work(&dcp->external_retry_wq);
+	}
 	if (ret)
 		dev_err(dcp->dev, "could not select the HDMI output: %d\n", ret);
 	else

@@ -162,6 +162,8 @@ struct apple_dcp {
 	/* Native: bounded recovery of a display link or mode, see dcp.c. */
 	struct delayed_work external_retry_wq;
 	atomic_t external_retries;
+	/* typec_generation when the pending retry was queued */
+	u64 external_retry_generation;
 	atomic_t external_requested;
 
 	/* DCP_FIRMWARE_V_14_7 state; outlives this device once RTKit runs. */
