@@ -283,6 +283,14 @@ void dcp_retrain_oob(struct apple_connector *connector)
 	schedule_work(&connector->hotplug_wq);
 }
 
+static void dcp_notify_hotplug(struct apple_connector *connector)
+{
+	/* Same-state retrains also need a notification after refreshing status. */
+	if (!(connector->base.polled & DRM_CONNECTOR_POLL_HPD) ||
+	    !drm_connector_helper_hpd_irq_event(&connector->base))
+		drm_kms_helper_connector_hotplug_event(&connector->base);
+}
+
 void dcp_hotplug(struct work_struct *work)
 {
 	struct apple_connector *connector;
@@ -295,7 +303,7 @@ void dcp_hotplug(struct work_struct *work)
 	pdev = READ_ONCE(connector->dcp);
 	if (!pdev) {	/* a Type-C port unrouted after this was queued */
 		apple_connector_invalidate_edid(connector);
-		drm_kms_helper_connector_hotplug_event(&connector->base);
+		dcp_notify_hotplug(connector);
 		apple_connector_backlight_sync(connector);
 		return;
 	}
@@ -330,7 +338,7 @@ void dcp_hotplug(struct work_struct *work)
 				 ret);
 	}
 
-	drm_kms_helper_connector_hotplug_event(&connector->base);
+	dcp_notify_hotplug(connector);
 	/* after the event, so registering a backlight cannot delay it */
 	apple_connector_backlight_sync(connector);
 }

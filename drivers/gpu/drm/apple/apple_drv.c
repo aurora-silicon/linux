@@ -89,13 +89,17 @@ static const struct drm_driver apple_drm_driver = {
 	.fops			= &apple_fops,
 };
 
-static enum drm_connector_status
+enum drm_connector_status
 apple_connector_detect(struct drm_connector *connector, bool force)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
 
-	return apple_connector->connected ? connector_status_connected :
-						  connector_status_disconnected;
+	if (connector->force == DRM_FORCE_ON || connector->force == DRM_FORCE_ON_DIGITAL)
+		return connector_status_connected;
+	if (connector->force == DRM_FORCE_OFF)
+		return connector_status_disconnected;
+	return READ_ONCE(apple_connector->connected) ? connector_status_connected :
+						    connector_status_disconnected;
 }
 
 static void apple_connector_oob_hotplug(struct drm_connector *connector,

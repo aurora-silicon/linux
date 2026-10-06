@@ -16,6 +16,7 @@ struct apple_connector;
 
 void dcp_hotplug(struct work_struct *work);
 void dcp_retrain_oob(struct apple_connector *connector);
+enum drm_connector_status apple_connector_detect(struct drm_connector *connector, bool force);
 
 void apple_connector_backlight_init(struct apple_connector *connector);
 void apple_connector_backlight_sync(struct apple_connector *connector);
