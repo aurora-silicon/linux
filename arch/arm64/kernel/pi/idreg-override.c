@@ -38,11 +38,32 @@ struct ftr_set_desc {
 
 #define FIELD(n, s, f)	{ .name = n, .shift = s, .width = 4, .filter = f }
 
+#if defined(CONFIG_ARM64_USER4K_KUNIT_TEST) && !defined(CONFIG_ARM64_4K_PAGES)
+/* VM capability-model test: only remove 4K support, never fabricate it. */
+static bool __init user4k_granule_test_filter(u64 val)
+{
+	return val == ID_AA64MMFR0_EL1_TGRAN4_NI;
+}
+
+#ifdef CONFIG_ARM64_64K_PAGES
+static bool __init user16k_granule_test_filter(u64 val)
+{
+	return val == ID_AA64MMFR0_EL1_TGRAN16_NI;
+}
+#endif
+#endif
+
 static const struct ftr_set_desc mmfr0 __prel64_initconst = {
 	.name		= "id_aa64mmfr0",
 	.override	= &id_aa64mmfr0_override,
 	.fields		= {
 		FIELD("ecv", ID_AA64MMFR0_EL1_ECV_SHIFT, NULL),
+#if defined(CONFIG_ARM64_USER4K_KUNIT_TEST) && !defined(CONFIG_ARM64_4K_PAGES)
+		FIELD("tgran4", ID_AA64MMFR0_EL1_TGRAN4_SHIFT, user4k_granule_test_filter),
+#ifdef CONFIG_ARM64_64K_PAGES
+		FIELD("tgran16", ID_AA64MMFR0_EL1_TGRAN16_SHIFT, user16k_granule_test_filter),
+#endif
+#endif
 		{}
 	},
 };
@@ -59,11 +80,22 @@ static bool __init mmfr1_vh_filter(u64 val)
 		 val == 0);
 }
 
+#if defined(CONFIG_ARM64_USER4K_KUNIT_TEST) && defined(CONFIG_ARM64_SW_TTBR0_PAN)
+/* VM-only coverage of deferred TTBR0 restore on CPUs which implement PAN. */
+static bool __init user4k_pan_test_filter(u64 val)
+{
+	return val == 0;
+}
+#endif
+
 static const struct ftr_set_desc mmfr1 __prel64_initconst = {
 	.name		= "id_aa64mmfr1",
 	.override	= &id_aa64mmfr1_override,
 	.fields		= {
 		FIELD("vh", ID_AA64MMFR1_EL1_VH_SHIFT, mmfr1_vh_filter),
+#if defined(CONFIG_ARM64_USER4K_KUNIT_TEST) && defined(CONFIG_ARM64_SW_TTBR0_PAN)
+		FIELD("pan", ID_AA64MMFR1_EL1_PAN_SHIFT, user4k_pan_test_filter),
+#endif
 		{}
 	},
 };

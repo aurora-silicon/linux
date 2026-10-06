@@ -7,6 +7,7 @@
 
 #include <linux/compat.h>
 #include <linux/compiler.h>
+#include <linux/mm.h>
 #include <linux/syscalls.h>
 
 #include <asm/syscall.h>
@@ -51,6 +52,11 @@ COMPAT_SYSCALL_DEFINE6(aarch32_mmap2, unsigned long, addr, unsigned long, len,
 		       unsigned long, prot, unsigned long, flags,
 		       unsigned long, fd, unsigned long, off_4k)
 {
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(current->mm) != PAGE_SIZE)
+		return ksys_mmap_user(addr, len, prot, flags, fd, off_4k << 12);
+#endif
+
 	if (off_4k & (~PAGE_MASK >> 12))
 		return -EINVAL;
 

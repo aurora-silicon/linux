@@ -8,6 +8,7 @@
 
 #include <linux/bitops.h>
 #include <linux/mm.h>
+#include <linux/uaccess.h>
 
 #include <asm/page.h>
 #include <asm/cacheflush.h>
@@ -72,3 +73,54 @@ void copy_user_highpage(struct page *to, struct page *from,
 	flush_dcache_page(to);
 }
 EXPORT_SYMBOL_GPL(copy_user_highpage);
+
+#ifdef CONFIG_MM_SUBPAGE
+void clear_user_subpage_range(struct page *page, unsigned int offset, unsigned int size)
+{
+	void *addr = page_address(page) + offset;
+
+	VM_BUG_ON(!is_power_of_2(size) || size < SZ_4K || size > PAGE_SIZE);
+	VM_BUG_ON(!IS_ALIGNED(offset, size) || offset > PAGE_SIZE - size);
+	memset(addr, 0, size);
+	if (system_supports_mte() && page_mte_tagged(page))
+		mte_clear_subpage_tags_range(addr, size);
+	flush_dcache_page(page);
+}
+
+int copy_user_subpage_range(struct page *to, unsigned int to_offset,
+			   struct page *from, unsigned int from_offset, unsigned int size)
+{
+	void *kto = page_address(to), *kfrom = page_address(from);
+
+	VM_BUG_ON(!is_power_of_2(size) || size < SZ_4K || size > PAGE_SIZE);
+	VM_BUG_ON(!IS_ALIGNED(to_offset, size) || to_offset > PAGE_SIZE - size);
+	VM_BUG_ON(!IS_ALIGNED(from_offset, size) || from_offset > PAGE_SIZE - size);
+	if (PageHWPoison(from) || copy_mc_to_kernel(kto + to_offset, kfrom + from_offset, size))
+		return -EHWPOISON;
+	if (kasan_hw_tags_enabled())
+		page_kasan_tag_reset(to);
+	if (system_supports_mte()) {
+		if (page_mte_tagged(from)) {
+			if (try_page_mte_tagging(to))
+				mte_clear_page_tags(kto);
+			mte_copy_subpage_tags_range(kto + to_offset, kfrom + from_offset, size);
+			set_page_mte_tagged(to);
+		} else if (page_mte_tagged(to)) {
+			mte_clear_subpage_tags_range(kto + to_offset, size);
+		}
+	}
+	flush_dcache_page(to);
+	return 0;
+}
+/* Existing 4K fault and ownership callers keep their fixed-size contract. */
+void clear_user_subpage(struct page *page, unsigned int offset)
+{
+	clear_user_subpage_range(page, offset, SZ_4K);
+}
+
+int copy_user_subpage(struct page *to, unsigned int to_offset,
+		      struct page *from, unsigned int from_offset)
+{
+	return copy_user_subpage_range(to, to_offset, from, from_offset, SZ_4K);
+}
+#endif

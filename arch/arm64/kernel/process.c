@@ -7,11 +7,13 @@
  * Copyright (C) 2012 ARM Ltd.
  */
 #include <linux/compat.h>
+#include <linux/binfmts.h>
 #include <linux/efi.h>
 #include <linux/elf.h>
 #include <linux/export.h>
 #include <linux/sched.h>
 #include <linux/sched/debug.h>
+#include <linux/sched/mm.h>
 #include <linux/sched/task.h>
 #include <linux/sched/task_stack.h>
 #include <linux/kernel.h>
@@ -884,6 +886,33 @@ unsigned long arch_align_stack(unsigned long sp)
 	return sp & ~0xf;
 }
 
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+int arm64_bprm_prepare_mm(struct linux_binprm *bprm, bool compat)
+{
+	unsigned int requested = current->exec_page_shift ?:
+				 current->default_exec_page_shift;
+	unsigned int shift = arm64_exec_page_shift(compat,
+			cpus_have_final_cap(ARM64_HAS_USER4K_GRANULE), PAGE_SHIFT,
+			requested);
+
+	return bprm_set_page_shift(bprm, shift);
+}
+
+/* Return zero for the native default, or a validated alternative shift. */
+int arch_exec_page_size_shift(unsigned long size)
+{
+	if (!size || size == PAGE_SIZE)
+		return 0;
+	if (size == SZ_4K)
+		return cpus_have_final_cap(ARM64_HAS_USER4K_GRANULE) ?
+			12 : -EOPNOTSUPP;
+	if (PAGE_SIZE > SZ_16K && size == SZ_16K)
+		return cpus_have_final_cap(ARM64_HAS_USER16K_GRANULE) ?
+			14 : -EOPNOTSUPP;
+	return -EINVAL;
+}
+#endif
+
 #ifdef CONFIG_COMPAT
 int compat_elf_check_arch(const struct elf32_hdr *hdr)
 {
@@ -911,10 +940,10 @@ int compat_elf_check_arch(const struct elf32_hdr *hdr)
  */
 void arch_setup_new_exec(void)
 {
-	unsigned long mmflags = 0;
+	unsigned long mmflags = current->mm->context.flags & MMCF_USER_GRANULE;
 
 	if (is_compat_task()) {
-		mmflags = MMCF_AARCH32;
+		mmflags |= MMCF_AARCH32;
 
 		/*
 		 * Restrict the CPU affinity mask for a 32-bit task so that

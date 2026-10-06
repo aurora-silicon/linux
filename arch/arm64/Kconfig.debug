@@ -21,3 +21,24 @@ config ARM64_RELOC_TEST
 	tristate "Relocation testing module"
 
 source "drivers/hwtracing/coresight/Kconfig"
+
+config ARM64_USER4K_EXPERIMENTAL
+	bool "Experimental mixed-granule userspace"
+	select ARCH_HAS_MM_PGTABLE
+	select ARCH_HAS_USER_PAGE_SIZE
+	select MM_SUBPAGE
+	select MM_ID
+	select HAVE_ARCH_TLB_REMOVE_TABLE
+	select ARCH_SUPPORTS_PT_RECLAIM
+	depends on (ARM64_16K_PAGES || ARM64_64K_PAGES) && ARM64_VA_BITS_48 && ARM64_PA_BITS_48
+	depends on !ARM64_LPA2 && !NO_PAGE_MAPCOUNT
+	default n
+	help
+	  Build the in-development MM support for alternative 4K user tables
+	  on 16K/64K kernels and 16K user tables on 64K kernels.
+	  Ordinary address spaces and kernel tables retain the native granule. An experimental
+	  one-shot prctl selects a supported granule for the next exec.
+	  This is a development ABI: several MM interfaces and device mappings
+	  still require integration and validation. The private prctl numbers
+	  are not upstream assignments or a stable ABI promise.
+	  Say N for normal kernels.

@@ -16,14 +16,19 @@
 #include <asm/tlbflush.h>
 
 static struct kmem_cache *pgd_cache __ro_after_init;
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+static struct kmem_cache *user4k_pgd_cache __ro_after_init;
+static struct kmem_cache *user16k_pgd_cache __ro_after_init;
+static struct kmem_cache *user64k_pgd_cache __ro_after_init;
+#endif
 
 static bool pgdir_is_page_size(void)
 {
 	if (PGD_SIZE == PAGE_SIZE)
 		return true;
-	if (CONFIG_PGTABLE_LEVELS == 4)
+	if (ARM64_NATIVE_PGTABLE_LEVELS == 4)
 		return !pgtable_l4_enabled();
-	if (CONFIG_PGTABLE_LEVELS == 5)
+	if (ARM64_NATIVE_PGTABLE_LEVELS == 5)
 		return !pgtable_l5_enabled();
 	return false;
 }
@@ -32,6 +37,14 @@ pgd_t *pgd_alloc(struct mm_struct *mm)
 {
 	gfp_t gfp = GFP_PGTABLE_USER;
 
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+	if (arm64_context_user4k(&mm->context))
+		return kmem_cache_alloc(user4k_pgd_cache, gfp);
+	if (arm64_mm_alt_granule(mm) && mm_page_shift(mm) == 14)
+		return kmem_cache_alloc(user16k_pgd_cache, gfp);
+	if (arm64_mm_alt_granule(mm) && mm_page_shift(mm) == 16)
+		return kmem_cache_alloc(user64k_pgd_cache, gfp);
+#endif
 	if (pgdir_is_page_size())
 		return __pgd_alloc(mm, 0);
 	else
@@ -40,6 +53,20 @@ pgd_t *pgd_alloc(struct mm_struct *mm)
 
 void pgd_free(struct mm_struct *mm, pgd_t *pgd)
 {
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+	if (arm64_context_user4k(&mm->context)) {
+		kmem_cache_free(user4k_pgd_cache, pgd);
+		return;
+	}
+	if (arm64_mm_alt_granule(mm) && mm_page_shift(mm) == 14) {
+		kmem_cache_free(user16k_pgd_cache, pgd);
+		return;
+	}
+	if (arm64_mm_alt_granule(mm) && mm_page_shift(mm) == 16) {
+		kmem_cache_free(user64k_pgd_cache, pgd);
+		return;
+	}
+#endif
 	if (pgdir_is_page_size())
 		__pgd_free(mm, pgd);
 	else
@@ -48,6 +75,16 @@ void pgd_free(struct mm_struct *mm, pgd_t *pgd)
 
 void __init pgtable_cache_init(void)
 {
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+	if (PAGE_SHIFT < 16)
+		user64k_pgd_cache = kmem_cache_create("user64k_pgd_cache", SZ_64K, SZ_64K,
+						 SLAB_PANIC, NULL);
+	if (PAGE_SHIFT != 14)
+		user16k_pgd_cache = kmem_cache_create("user16k_pgd_cache", SZ_16K, SZ_16K,
+						 SLAB_PANIC, NULL);
+	user4k_pgd_cache = kmem_cache_create("user4k_pgd_cache", SZ_4K, SZ_4K,
+					   SLAB_PANIC, NULL);
+#endif
 	if (pgdir_is_page_size())
 		return;
 
