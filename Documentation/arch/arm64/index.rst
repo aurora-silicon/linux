@@ -32,5 +32,6 @@ ARM64 Architecture
     sve
     tagged-address-abi
     tagged-pointers
+    user4k
 
     features
