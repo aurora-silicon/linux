@@ -263,11 +263,7 @@ static void iommufd_hw_queue_destroy_access(struct iommufd_ctx *ictx,
 					    struct iommufd_access *access,
 					    u64 base_iova, size_t length)
 {
-	u64 aligned_iova = PAGE_ALIGN_DOWN(base_iova);
-	u64 offset = base_iova - aligned_iova;
-
-	iommufd_access_unpin_pages(access, aligned_iova,
-				   PAGE_ALIGN(length + offset));
+	iommufd_access_unpin_pages(access, base_iova, length);
 	iommufd_access_detach_internal(access);
 	iommufd_access_destroy_internal(ictx, access);
 }
@@ -300,66 +296,28 @@ static struct iommufd_access *
 iommufd_hw_queue_alloc_phys(struct iommu_hw_queue_alloc *cmd,
 			    struct iommufd_viommu *viommu, phys_addr_t *base_pa)
 {
-	u64 aligned_iova = PAGE_ALIGN_DOWN(cmd->nesting_parent_iova);
-	u64 offset = cmd->nesting_parent_iova - aligned_iova;
 	struct iommufd_access *access;
-	struct page **pages;
-	size_t max_npages;
-	size_t length;
-	size_t i;
 	int rc;
 
-	/* max_npages = DIV_ROUND_UP(offset + cmd->length, PAGE_SIZE) */
-	if (check_add_overflow(offset, cmd->length, &length))
+	if (cmd->nesting_parent_iova > ULONG_MAX || cmd->length > ULONG_MAX)
 		return ERR_PTR(-ERANGE);
-	if (check_add_overflow(length, PAGE_SIZE - 1, &length))
-		return ERR_PTR(-ERANGE);
-	max_npages = length / PAGE_SIZE;
-	/* length needs to be page aligned too */
-	length = max_npages * PAGE_SIZE;
-
-	/*
-	 * Use kvcalloc() to avoid memory fragmentation for a large page array.
-	 * Set __GFP_NOWARN to avoid syzkaller blowups
-	 */
-	pages = kvzalloc_objs(*pages, max_npages, GFP_KERNEL | __GFP_NOWARN);
-	if (!pages)
-		return ERR_PTR(-ENOMEM);
-
-	access = iommufd_access_create_internal(viommu->ictx);
-	if (IS_ERR(access)) {
-		rc = PTR_ERR(access);
-		goto out_free;
-	}
+	access = iommufd_access_create_internal_phys(viommu->ictx);
+	if (IS_ERR(access))
+		return access;
 
 	rc = iommufd_access_attach_internal(access, viommu->hwpt->ioas);
 	if (rc)
 		goto out_destroy;
-
-	rc = iommufd_access_pin_pages(access, aligned_iova, length, pages, 0);
+	rc = iommufd_access_pin_phys(access, cmd->nesting_parent_iova,
+				     cmd->length, base_pa);
 	if (rc)
 		goto out_detach;
-
-	/* Validate if the underlying physical pages are contiguous */
-	for (i = 1; i < max_npages; i++) {
-		if (page_to_pfn(pages[i]) == page_to_pfn(pages[i - 1]) + 1)
-			continue;
-		rc = -EFAULT;
-		goto out_unpin;
-	}
-
-	*base_pa = (page_to_pfn(pages[0]) << PAGE_SHIFT) + offset;
-	kvfree(pages);
 	return access;
 
-out_unpin:
-	iommufd_access_unpin_pages(access, aligned_iova, length);
 out_detach:
 	iommufd_access_detach_internal(access);
 out_destroy:
 	iommufd_access_destroy_internal(viommu->ictx, access);
-out_free:
-	kvfree(pages);
 	return ERR_PTR(rc);
 }
 

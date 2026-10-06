@@ -52,6 +52,7 @@
 #include <linux/iommu.h>
 #include <linux/iommufd.h>
 #include <linux/kthread.h>
+#include <linux/mm_granule.h>
 #include <linux/overflow.h>
 #include <linux/slab.h>
 #include <linux/sched/mm.h>
@@ -207,7 +208,7 @@ static unsigned long iopt_area_index_to_iova(struct iopt_area *area,
 	index -= iopt_area_index(area);
 	if (index == 0)
 		return iopt_area_iova(area);
-	return iopt_area_iova(area) - area->page_offset + index * PAGE_SIZE;
+	return iopt_area_iova(area) - area->page_offset + (index << area->page_shift);
 }
 
 static unsigned long iopt_area_index_to_iova_last(struct iopt_area *area,
@@ -219,7 +220,7 @@ static unsigned long iopt_area_index_to_iova_last(struct iopt_area *area,
 	if (index == iopt_area_last_index(area))
 		return iopt_area_last_iova(area);
 	return iopt_area_iova(area) - area->page_offset +
-	       (index - iopt_area_index(area) + 1) * PAGE_SIZE - 1;
+	       ((index - iopt_area_index(area) + 1) << area->page_shift) - 1;
 }
 
 static void iommu_unmap_nofail(struct iommu_domain *domain, unsigned long iova,
@@ -993,9 +994,11 @@ static int update_mm_locked_vm(struct iopt_pages *pages, unsigned long npages,
 
 	} else if ((!user || (!user->upages && !user->ufolios)) &&
 		   pages->source_mm != current->mm) {
-		if (!mmget_not_zero(pages->source_mm))
+		if (mmget_not_zero(pages->source_mm))
+			do_put = true;
+		else if (inc)
 			return -EINVAL;
-		do_put = true;
+		/* mmgrab() keeps the lock and counters alive for final uncharge. */
 	}
 
 	mmap_write_lock(pages->source_mm);
@@ -1378,10 +1381,15 @@ static struct iopt_pages *iopt_alloc_pages(unsigned long start_byte,
 
 	kref_init(&pages->kref);
 	xa_init_flags(&pages->pinned_pfns, XA_FLAGS_ACCOUNT);
+#ifdef CONFIG_MM_SUBPAGE
+	xa_init_flags(&pages->fragments, XA_FLAGS_ACCOUNT);
+	xa_init_flags(&pages->fragment_pages, XA_FLAGS_ACCOUNT);
+#endif
+	pages->page_shift = PAGE_SHIFT;
 	mutex_init(&pages->mutex);
 	pages->source_mm = current->mm;
 	mmgrab(pages->source_mm);
-	pages->npages = DIV_ROUND_UP(length + start_byte, PAGE_SIZE);
+	pages->npages = ((length - 1 + start_byte) >> PAGE_SHIFT) + 1;
 	pages->access_itree = RB_ROOT_CACHED;
 	pages->domains_itree = RB_ROOT_CACHED;
 	pages->writable = writable;
@@ -1400,8 +1408,10 @@ struct iopt_pages *iopt_alloc_user_pages(void __user *uptr,
 {
 	struct iopt_pages *pages;
 	unsigned long end;
+	unsigned int shift = min_t(unsigned int, mm_page_shift(current->mm), PAGE_SHIFT);
+	unsigned long granule = 1UL << shift;
 	void __user *uptr_down =
-		(void __user *)ALIGN_DOWN((uintptr_t)uptr, PAGE_SIZE);
+		(void __user *)ALIGN_DOWN((uintptr_t)uptr, granule);
 
 	if (check_add_overflow((unsigned long)uptr, length, &end))
 		return ERR_PTR(-EOVERFLOW);
@@ -1409,6 +1419,8 @@ struct iopt_pages *iopt_alloc_user_pages(void __user *uptr,
 	pages = iopt_alloc_pages(uptr - uptr_down, length, writable);
 	if (IS_ERR(pages))
 		return pages;
+	pages->page_shift = shift;
+	pages->npages = ((length - 1 + (uptr - uptr_down)) >> shift) + 1;
 	pages->uptr = uptr_down;
 	pages->type = IOPT_ADDRESS_USER;
 	return pages;
@@ -1656,6 +1668,12 @@ void iopt_release_pages(struct kref *kref)
 	WARN_ON(!RB_EMPTY_ROOT(&pages->domains_itree.rb_root));
 	WARN_ON(pages->npinned);
 	WARN_ON(!xa_empty(&pages->pinned_pfns));
+#ifdef CONFIG_MM_SUBPAGE
+	WARN_ON(!xa_empty(&pages->fragments));
+	WARN_ON(!xa_empty(&pages->fragment_pages));
+	xa_destroy(&pages->fragments);
+	xa_destroy(&pages->fragment_pages);
+#endif
 	if (iopt_is_dmabuf(pages) && pages->dmabuf.attach) {
 		struct dma_buf *dmabuf = pages->dmabuf.attach->dmabuf;
 
@@ -1832,6 +1850,9 @@ void iopt_area_unmap_domain(struct iopt_area *area, struct iommu_domain *domain)
 void iopt_area_unfill_domain(struct iopt_area *area, struct iopt_pages *pages,
 			     struct iommu_domain *domain)
 {
+	if (iopt_pages_use_fragments(pages))
+		return iopt_fragments_unfill_domain(area, pages, domain);
+
 	if (iopt_dmabuf_revoked(pages))
 		return;
 
@@ -1854,6 +1875,9 @@ int iopt_area_fill_domain(struct iopt_area *area, struct iommu_domain *domain)
 	int rc;
 
 	lockdep_assert_held(&area->pages->mutex);
+
+	if (iopt_pages_use_fragments(area->pages))
+		return iopt_fragments_fill_domain(area, area->pages, domain);
 
 	if (iopt_dmabuf_revoked(area->pages))
 		return 0;
@@ -1915,6 +1939,9 @@ int iopt_area_fill_domains(struct iopt_area *area, struct iopt_pages *pages)
 
 	if (xa_empty(&area->iopt->domains))
 		return 0;
+
+	if (iopt_pages_use_fragments(pages))
+		return iopt_fragments_fill_domains(area, pages);
 
 	mutex_lock(&pages->mutex);
 	if (iopt_is_dmabuf(pages)) {
@@ -2365,6 +2392,10 @@ int iopt_pages_rw_access(struct iopt_pages *pages, unsigned long start_byte,
 	if (iopt_is_dmabuf(pages))
 		return -EINVAL;
 
+	if (iopt_pages_use_fragments(pages) && change_mm &&
+	    !(flags & IOMMUFD_ACCESS_RW_KTHREAD))
+		return iopt_fragments_rw(pages, start_byte, data, length, flags);
+
 	if (pages->type != IOPT_ADDRESS_USER)
 		return iopt_pages_rw_slow(pages, start_index, last_index,
 					  start_byte % PAGE_SIZE, data, length,
@@ -2385,11 +2416,14 @@ int iopt_pages_rw_access(struct iopt_pages *pages, unsigned long start_byte,
 	 * ignore any pinning inconsistencies, unlike a real DMA path.
 	 */
 	if (change_mm) {
-		if (!mmget_not_zero(pages->source_mm))
+		if (!mmget_not_zero(pages->source_mm)) {
+			if (iopt_pages_use_fragments(pages))
+				return iopt_fragments_rw(pages, start_byte, data, length, flags);
 			return iopt_pages_rw_slow(pages, start_index,
 						  last_index,
 						  start_byte % PAGE_SIZE, data,
 						  length, flags);
+		}
 		kthread_use_mm(pages->source_mm);
 	}
 
@@ -2454,6 +2488,11 @@ int iopt_area_add_access(struct iopt_area *area, unsigned long start_index,
 	if (iopt_is_dmabuf(pages))
 		return -EINVAL;
 
+	/* Preserve typed ownership and validate the native output geometry. */
+	if (iopt_pages_use_fragments(pages))
+		return iopt_fragments_add_access(area, start_index, last_index,
+						 out_pages, lock_area);
+
 	mutex_lock(&pages->mutex);
 	access = iopt_pages_get_exact_access(pages, start_index, last_index);
 	if (access) {
@@ -2494,6 +2533,47 @@ err_unlock:
 	return rc;
 }
 
+/* Internal hardware queues consume a contiguous physical byte range. */
+int iopt_area_add_phys_access(struct iopt_area *area, unsigned long start_byte,
+			      unsigned long length, phys_addr_t *out_phys)
+{
+	struct iopt_pages *pages = area->pages;
+	unsigned long first = start_byte >> pages->page_shift;
+	unsigned long last = (start_byte + length - 1) >> pages->page_shift;
+	unsigned long count = last - first + 1, i;
+	struct page **list;
+	phys_addr_t base;
+	int rc;
+
+	if (iopt_is_dmabuf(pages))
+		return -EINVAL;
+	if (iopt_pages_use_fragments(pages))
+		return iopt_fragments_add_phys_access(area, start_byte, length, out_phys);
+
+	/* Retain the native page supplier and its accounting/batching rules. */
+	list = kvcalloc(count, sizeof(*list), GFP_KERNEL_ACCOUNT);
+	if (!list)
+		return -ENOMEM;
+	rc = iopt_area_add_access(area, first, last, list, 0, true);
+	if (rc)
+		goto out_free;
+	base = PFN_PHYS(page_to_pfn(list[0]));
+	for (i = 1; i < count; i++) {
+		if (page_to_pfn(list[i]) != page_to_pfn(list[0]) + i) {
+			rc = -EFAULT;
+			goto out_unpin;
+		}
+	}
+	*out_phys = base + offset_in_page(start_byte);
+	goto out_free;
+
+out_unpin:
+	iopt_area_remove_access(area, first, last, true);
+out_free:
+	kvfree(list);
+	return rc;
+}
+
 /**
  * iopt_area_remove_access() - Release an in-kernel access for PFNs
  * @area: The source of PFNs
@@ -2526,7 +2606,10 @@ void iopt_area_remove_access(struct iopt_area *area, unsigned long start_index,
 		goto out_unlock;
 
 	interval_tree_remove(&access->node, &pages->access_itree);
-	iopt_pages_unfill_xarray(pages, start_index, last_index);
+	if (iopt_pages_use_fragments(pages))
+		iopt_fragments_unfill_access(pages, start_index, last_index);
+	else
+		iopt_pages_unfill_xarray(pages, start_index, last_index);
 	kfree(access);
 out_unlock:
 	mutex_unlock(&pages->mutex);

@@ -531,6 +531,10 @@ static inline bool iommufd_access_is_internal(struct iommufd_access *access)
 }
 
 struct iommufd_access *iommufd_access_create_internal(struct iommufd_ctx *ictx);
+struct iommufd_access *iommufd_access_create_internal_phys(struct iommufd_ctx *ictx);
+int iommufd_access_pin_phys(struct iommufd_access *access, unsigned long iova,
+			   unsigned long length, phys_addr_t *out_phys);
+
 
 static inline void
 iommufd_access_destroy_internal(struct iommufd_ctx *ictx,

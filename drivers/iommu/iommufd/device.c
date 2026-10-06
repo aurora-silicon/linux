@@ -1171,6 +1171,18 @@ struct iommufd_access *iommufd_access_create_internal(struct iommufd_ctx *ictx)
 	return access;
 }
 
+/* Physical byte-span consumers do not impose native-page IOVA alignment. */
+struct iommufd_access *iommufd_access_create_internal_phys(struct iommufd_ctx *ictx)
+{
+	struct iommufd_access *access = __iommufd_access_create(ictx);
+
+	if (IS_ERR(access))
+		return access;
+	access->iova_alignment = 1;
+	iommufd_object_finalize(ictx, &access->obj);
+	return access;
+}
+
 /**
  * iommufd_access_create - Create an iommufd_access
  * @ictx: iommufd file descriptor
@@ -1404,6 +1416,12 @@ static bool check_area_prot(struct iopt_area *area, unsigned int flags)
  * ioas alignment is >= PAGE_SIZE and the iova is PAGE_SIZE aligned. However
  * smaller alignments have corner cases where this API can fail on otherwise
  * aligned iova.
+ *
+ * Alternative user granules are accepted only if each native output page has
+ * an aligned physical base and consecutive backing bytes within the requested
+ * range. The driver must access only @length bytes: a partial final page does
+ * not grant access to its remaining bytes. Fragment ownership stays in the IOAS
+ * until unpin; incompatible physical layouts return -EINVAL.
  */
 int iommufd_access_pin_pages(struct iommufd_access *access, unsigned long iova,
 			     unsigned long length, struct page **out_pages,
@@ -1456,7 +1474,7 @@ int iommufd_access_pin_pages(struct iommufd_access *access, unsigned long iova,
 					  flags, internal);
 		if (rc)
 			goto err_remove;
-		out_pages += last_index - index + 1;
+		out_pages += (last - iter.cur_iova) / PAGE_SIZE + 1;
 	}
 	if (!iopt_area_contig_done(&iter)) {
 		rc = -ENOENT;
@@ -1484,6 +1502,88 @@ err_remove:
 	return rc;
 }
 EXPORT_SYMBOL_NS_GPL(iommufd_access_pin_pages, "IOMMUFD");
+
+/**
+ * iommufd_access_pin_phys - Pin an internal contiguous physical byte span
+ * @access: Internal access created for byte-span pinning
+ * @iova: First IOVA byte
+ * @length: Exact byte length
+ * @out_phys: Physical address of the first byte, set only on success
+ *
+ * Retains native or fragment pin ownership and prevents IOAS unmap until the
+ * matching iommufd_access_unpin_pages(). No surrounding IOVA bytes are required.
+ * The caller must stop hardware access before unpinning or destroying access.
+ */
+int iommufd_access_pin_phys(struct iommufd_access *access, unsigned long iova,
+			   unsigned long length, phys_addr_t *out_phys)
+{
+	struct iopt_area_contig_iter iter;
+	struct io_pagetable *iopt;
+	struct iopt_area *area;
+	unsigned long last_iova;
+	phys_addr_t base = 0;
+	int rc;
+
+	if (!iommufd_access_is_internal(access) || !out_phys || !length)
+		return -EINVAL;
+	if (check_add_overflow(iova, length - 1, &last_iova))
+		return -EOVERFLOW;
+
+	mutex_lock(&access->ioas_lock);
+	if (!access->ioas) {
+		rc = -ENOENT;
+		goto out_unlock;
+	}
+	iopt = &access->ioas->iopt;
+	down_read(&iopt->iova_rwsem);
+	iopt_for_each_contig_area(&iter, area, iopt, iova, last_iova) {
+		unsigned long last = min(last_iova, iopt_area_last_iova(area));
+		phys_addr_t phys;
+
+		if (area->prevent_access || !(area->iommu_prot & IOMMU_READ)) {
+			rc = -EPERM;
+			goto out_remove;
+		}
+		rc = iopt_area_add_phys_access(area,
+			iopt_area_start_byte(area, iter.cur_iova),
+			last - iter.cur_iova + 1, &phys);
+		if (rc)
+			goto out_remove;
+		if (iter.cur_iova == iova) {
+			base = phys;
+		} else if (phys != base + (iter.cur_iova - iova)) {
+			iopt_area_remove_access(area,
+				iopt_area_iova_to_index(area, iter.cur_iova),
+				iopt_area_iova_to_index(area, last), true);
+			rc = -EFAULT;
+			goto out_remove;
+		}
+	}
+	if (!iopt_area_contig_done(&iter)) {
+		rc = -ENOENT;
+		goto out_remove;
+	}
+	*out_phys = base;
+	up_read(&iopt->iova_rwsem);
+	rc = 0;
+	goto out_unlock;
+
+out_remove:
+	/* iter.cur_iova is the first byte whose access was not retained. */
+	if (iter.cur_iova > iova) {
+		unsigned long end = iter.cur_iova - 1;
+
+		iopt_for_each_contig_area(&iter, area, iopt, iova, end)
+			iopt_area_remove_access(area,
+				iopt_area_iova_to_index(area, iter.cur_iova),
+				iopt_area_iova_to_index(area, min(end, iopt_area_last_iova(area))),
+				true);
+	}
+	up_read(&iopt->iova_rwsem);
+out_unlock:
+	mutex_unlock(&access->ioas_lock);
+	return rc;
+}
 
 /**
  * iommufd_access_rw - Read or write data under the iova
