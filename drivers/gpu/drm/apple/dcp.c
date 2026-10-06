@@ -2180,19 +2180,31 @@ static void dcp_platform_shutdown(struct platform_device *pdev)
 }
 
 /*
- * Whether an external processor must keep the system awake. The manual path
- * refuses sleep once its firmware was ever started. A native processor
- * refuses only while it starts or drives a display: idle, its firmware stays
+ * Why an external processor must keep the system awake, or NULL. The manual
+ * path refuses sleep once its firmware was ever started. A native processor
+ * refuses while its firmware starts or holds a display link, and while a
+ * display is attached to it at all, lit or not: resume does not bring an
+ * attached display back. Idle with nothing attached, its firmware stays
  * powered across s2idle like the panel's (the gate holds its CPU domain at
  * the active floor) and the next attach reconnects through it.
  */
-static bool dcp_external_sleep_vetoed(struct apple_dcp *dcp)
+static const char *dcp_external_sleep_vetoed(struct apple_dcp *dcp)
 {
-	if (dcp->external_native)
-		return iomfb_v14_7_external_busy(dcp);
-	return atomic_read(&dcp->external_requested) ||
-	       (dcp->rtk && apple_rtkit_is_running(dcp->rtk)) ||
-	       dcpext_scanout_requested(dcp);
+	const char *why;
+
+	if (!dcp->external_native)
+		return (atomic_read(&dcp->external_requested) ||
+			(dcp->rtk && apple_rtkit_is_running(dcp->rtk)) ||
+			dcpext_scanout_requested(dcp)) ?
+		       "external firmware/scanout attempted" : NULL;
+	why = iomfb_v14_7_external_busy(dcp);
+	if (why)
+		return why;
+	if (READ_ONCE(dcp->active_typec_route) || READ_ONCE(dcp->typec_cable_connected))
+		return "a USB-C display is attached";
+	if (dcp->hdmi_hpd && gpiod_get_value_cansleep(dcp->hdmi_hpd) > 0)
+		return "an HDMI display is attached";
+	return NULL;
 }
 
 /* dpm_prepare completes for every device before any dpm_suspend callback.
@@ -2202,14 +2214,16 @@ static bool dcp_external_sleep_vetoed(struct apple_dcp *dcp)
 static int dcp_platform_prepare(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	const char *why;
 
 	if (!dcp->external)
 		return 0;
 	mutex_lock(&dcp->hpd_mutex);
-	if (dcp_external_sleep_vetoed(dcp)) {
+	why = dcp_external_sleep_vetoed(dcp);
+	if (why) {
 		mutex_unlock(&dcp->hpd_mutex);
 		if (dcp->external_native)
-			dev_warn(dev, "external display attached or starting: refusing system sleep\n");
+			dev_warn(dev, "refusing system sleep: %s\n", why);
 		else
 			dev_warn(dev, "external firmware/scanout attempted: refusing PM prepare; reboot required for retained DMA\n");
 		return -EBUSY;
@@ -2239,11 +2253,14 @@ static int dcp_platform_suspend(struct device *dev)
 	 * attempt we cannot prove DMA/firmware quiescence, even on failure.
 	 */
 	if (dcp->external) {
+		const char *why;
+
 		mutex_lock(&dcp->hpd_mutex);
-		if (dcp_external_sleep_vetoed(dcp)) {
+		why = dcp_external_sleep_vetoed(dcp);
+		if (why) {
 			mutex_unlock(&dcp->hpd_mutex);
 			if (dcp->external_native)
-				dev_warn(dev, "external display attached or starting: suspend refused\n");
+				dev_warn(dev, "suspend refused: %s\n", why);
 			else
 				dev_warn(dev, "external firmware/scanout attempted: suspend refused; retained DMA requires reboot\n");
 			return -EBUSY;

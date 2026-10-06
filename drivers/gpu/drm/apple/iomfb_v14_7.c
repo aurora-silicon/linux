@@ -1501,22 +1501,23 @@ bool iomfb_v14_7_external_ready(struct apple_dcp *dcp)
 }
 
 /*
- * System sleep with this processor: allowed before its first start and
- * while it idles with no display link; refused while it starts or holds a
- * link or a powered display, as those are not handed back across sleep. A
- * route alone (an adapter in DP mode with no display) holds nothing.
+ * What this processor's firmware holds that system sleep would not hand
+ * back, or NULL: a start in progress, or a display link or a powered
+ * display. The caller also refuses sleep while a display is attached.
  */
-bool iomfb_v14_7_external_busy(struct apple_dcp *dcp)
+const char *iomfb_v14_7_external_busy(struct apple_dcp *dcp)
 {
 	switch (smp_load_acquire(&dcp->external_phase)) {
 	case DCPEXT_STARTING:
-		return true;
+		return "its firmware is starting";
 	case DCPEXT_RUNNING:
-		return READ_ONCE(dcp->dptxport[0].connected) ||
-		       READ_ONCE(dcp->external_link_ready) ||
-		       (dcp->v14 && READ_ONCE(dcp->v14->powered));
+		if (READ_ONCE(dcp->dptxport[0].connected) ||
+		    READ_ONCE(dcp->external_link_ready) ||
+		    (dcp->v14 && READ_ONCE(dcp->v14->powered)))
+			return "a display link is up";
+		return NULL;
 	default:
-		return false;
+		return NULL;
 	}
 }
 

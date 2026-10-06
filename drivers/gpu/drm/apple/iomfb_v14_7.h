@@ -20,12 +20,12 @@ int iomfb_v14_7_external_start(struct apple_dcp *dcp);
  * Native external processor: probe-time checks, then a firmware start on
  * first use. _ready() is true once DPTX can be used, and requests the start
  * if nothing has yet; _open() opens the display interface after the first
- * display is attached; _busy() vetoes system sleep.
+ * display is attached; _busy() says why system sleep must wait, or NULL.
  */
 int iomfb_v14_7_external_prepare(struct apple_dcp *dcp);
 bool iomfb_v14_7_external_ready(struct apple_dcp *dcp);
 int iomfb_v14_7_external_open(struct apple_dcp *dcp);
-bool iomfb_v14_7_external_busy(struct apple_dcp *dcp);
+const char *iomfb_v14_7_external_busy(struct apple_dcp *dcp);
 /* The external session can no longer be used until reboot. */
 bool iomfb_v14_7_external_failed(struct apple_dcp *dcp);
 /* The firmware runs this mode, set last, and shows swaps in it. */
