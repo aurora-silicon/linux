@@ -345,15 +345,24 @@ class M3AirDryRunTest(M3AirTest):
         self.assertEqual(self.sh("m3_switches").stdout.strip(), shell_value("M3_SWITCHES"))
 
     def test_shipped_settings(self):
-        # A release decision: change this test with it.
-        self.assertEqual(re.search(r"^M3_AIR_DRY_RUN=(\S+)$", SRC, re.M).group(1), "1")
+        # Two shipped shapes, both valid, depending on the build:
+        #  - a -test build ships the Air dry run: DRY_RUN=1 and a real Air m1n1.
+        #  - a Latest build keeps the Air kernel-only: an empty Air m1n1, so
+        #    --m3-handoff on an Air refuses and nothing is switched on.
+        # The dry-run switch list, when used, is always these four and never
+        # asks for the GPU setup itself.
         self.assertEqual(DRY_RUN, ["chosen.asahi,t8122-gpu-diag=1",
                                    "chosen.asahi,t8122-gpu-handoff-diag=1",
                                    "chosen.asahi,t8122-gpu-power-diag=1",
                                    "chosen.asahi,t8122-dcp=1"])
-        # The dry run never asks for the GPU setup itself.
         self.assertNotIn("chosen.asahi,t8122-gpu=1", DRY_RUN)
-        self.assertTrue(re.search(r'^M3_AIR_M1N1_PACKAGE="m1n1-aurora-\S+ [0-9a-f]{64}"$', SRC, re.M))
+        dry = re.search(r"^M3_AIR_DRY_RUN=(\S+)$", SRC, re.M).group(1)
+        air_pkg = shell_value("M3_AIR_M1N1_PACKAGE")
+        if air_pkg:
+            self.assertEqual(dry, "1", "a shipped Air m1n1 must ship the dry run")
+            self.assertRegex(air_pkg, r"^m1n1-aurora-\S+ [0-9a-f]{64}$")
+        else:
+            self.assertEqual(dry, "0", "no Air m1n1 shipped, so the dry run is off")
 
     def test_conf_block(self):
         self.mac("j613")

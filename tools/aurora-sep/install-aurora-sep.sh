@@ -87,14 +87,14 @@
 # Every other M3 stays kernel-only, and --m3-handoff lets an M3 Pro owner try
 # the handoff on a model not yet on the list (see --agent-prompt). M1, M2 and
 # the Neo are unchanged.
-# 11.110-test (not a release): kernel 11.110 (aurora-linux air/t8122) and, for
-# an M3 MacBook Air (T8122, 13" J613 and 15" J615) that opts in with
-# --m3-handoff, m1n1-aurora aurora8 with a dry run (M3_AIR_DRY_RUN): m1n1
-# reads and reports the Air's GPU and display details and starts nothing. A
-# plain run keeps an Air kernel-only.
-# 11.110.1-test: the same kernel; m1n1 aurora8.1's dry run also reads the
-# display's live state when the Mac reports its power domain on, the panel
-# and PMP details and the GPU's core count; and --m3-report.
+# 11.37: the unified M1/M2/M3 kernel, now 11.110 (aurora-linux air/t8122). Its
+# only device-tree change from 11.36 is the five M3 (T8122) trees; the T8122
+# GPU and display nodes stay disabled and the driver fails closed, so without
+# an opt-in M3 Air m1n1 (shipped only in the -test channel) an Air is kernel-
+# only, exactly as in 11.36. The 16" J516S keeps its display + GPU handoff
+# (now m1n1 aurora7, which also passes each Mac's PMP values). --m3-handoff is
+# available on the 14" J514S (opt-in, not yet on by default). This release adds
+# --m3-report and refuses chips it does not support (SUPPORTED_SOCS; #32).
 # It replaces linux-asahi (or linux-aurora) as a pacman package,
 # so mkinitcpio and update-m1n1 run from their own hooks; on a GRUB Mac this
 # script regenerates grub.cfg and keeps the previous kernel as a fallback entry.
@@ -129,8 +129,8 @@ set -euo pipefail
 
 # The kernel package version and the release tag move independently: a release
 # that only changes m1n1 reuses the previous kernel packages unchanged.
-VERSION=7.1.12.aurora2-11.110
-TAG=sep-7.1.12.aurora2-11.110.1-test
+VERSION=7.1.12.aurora2-11.37
+TAG=sep-7.1.12.aurora2-11.37
 # Packages are fetched from this script's own tag, never from "latest": the
 # checksums below belong to this release and nothing else.
 RELEASE_URL=https://github.com/iconidentify/aurora-linux/releases/download/$TAG
@@ -138,8 +138,8 @@ RELEASES_API=https://api.github.com/repos/iconidentify/aurora-linux/releases
 # Where to always get the current script, whatever this copy turns out to be.
 LATEST_URL=https://github.com/iconidentify/aurora-linux/releases/latest/download/install-aurora-sep.sh
 PACKAGES=(
-  "linux-aurora-$VERSION-aarch64.pkg.tar.zst eeab04119026280308987fb7ac2f5f8996504012d2a6d38fe645f5609cc56986"
-  "linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst 35af393eaaa3eb646217283566e769be5aadfe822d08b3aa0a285b1dd7f26722"
+  "linux-aurora-$VERSION-aarch64.pkg.tar.zst 1a31635c7073d4a90692a88c9af0b87931caaabd0888c31c1cf1b2335f8f30b5"
+  "linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst c6624e2996e5185ef9a7d24059e4ed639c05697f7e5e2181bd19539e524c9f57"
   "libfprint-1.94.100-1.1-aarch64.pkg.tar.zst bc7d9762db6644f2cfb58ddb209602c1d513845eb1498c098e01f12600fcbdf9"
   "aurora-touchid-20261003-1-any.pkg.tar.zst 29b0360fac8c257d754e64bd1b9c33c487eb2595dd3c31e9138d7a476afa3d64"
   "m1n1-aurora-1.6.1.aurora3-1-aarch64.pkg.tar.zst bc3451aaa88bc3f4912bc3613f9569aa8f3e05f376fa851fa837b5e2080e8c2f"
@@ -152,7 +152,7 @@ M3_M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora7-1-aarch64.pkg.tar.zst 547d0d5f9daa283
 # "file sha256". It may name the same package as M3_M1N1_PACKAGE once one m1n1
 # carries both. Left empty, an Air stays kernel-only and --m3-handoff on an
 # Air stops with nothing installed.
-M3_AIR_M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora8.1-1-aarch64.pkg.tar.zst 100919f635e3358027cceb6055f3076f3d29ea11cf2c71721c17a25608dcee13"
+M3_AIR_M1N1_PACKAGE=""
 PINNED="linux-aurora linux-aurora-headers libfprint m1n1-aurora"
 PIN_BEGIN="# >>> aurora-sep pin (remove with: install-aurora-sep.sh --uninstall)"
 PIN_END="# <<< aurora-sep pin"
@@ -316,7 +316,7 @@ M3_AIR_DCP=0
 # chosen.asahi,t8122-dcp=1 is a dry run only while m1n1 pins no T8122 DCP
 # firmware image (aurora8 pins none); a release whose m1n1 pins one must give
 # the dry run another variant name in m3_variant, so no Air gets it unasked.
-M3_AIR_DRY_RUN=1
+M3_AIR_DRY_RUN=0
 M3_AIR_DRY_RUN_SWITCHES="chosen.asahi,t8122-gpu-diag=1 chosen.asahi,t8122-gpu-handoff-diag=1 chosen.asahi,t8122-gpu-power-diag=1 chosen.asahi,t8122-dcp=1"
 # The handoff is tested with one macOS system-firmware stub only, 14.8.3 (GPU
 # firmware 14.8.3, DCP 14.7), which the Omarchy installer gives every M3. m1n1
