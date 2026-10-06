@@ -222,16 +222,26 @@ override_ok() {
   [[ $1 != -* && $1 =~ ^(file|https?)://. && $1 != *[![:graph:]]* ]]
 }
 
-# Checked before the first download or release lookup that uses them.
+# Checked before the first download or release lookup that uses them. A run
+# from a staging or mirror copy says so once, at the start.
 release_source() {
-  local name
+  local name shown
   for name in AURORA_RELEASE_URL AURORA_RELEASES_API; do
     [[ -z ${!name:-} ]] || override_ok "${!name}" ||
       die "$name must be a file://, http:// or https:// URL without spaces or
     control characters (percent-encode anything outside printable ASCII).
     Unset it to use the public release. Nothing was installed."
   done
-  return 0
+  if [[ $RELEASE_URL != "$PUBLIC_RELEASE_URL" && $RELEASES_API != "$PUBLIC_RELEASES_API" ]]; then
+    shown="$RELEASE_URL (release list $RELEASES_API)"
+  elif [[ $RELEASE_URL != "$PUBLIC_RELEASE_URL" ]]; then
+    shown=$RELEASE_URL
+  elif [[ $RELEASES_API != "$PUBLIC_RELEASES_API" ]]; then
+    shown="release list $RELEASES_API"
+  else
+    return 0
+  fi
+  say "Using a staging/mirror copy: $shown; checksums are still verified"
 }
 
 # A saved copy of this script keeps installing its own build forever. Tell the
@@ -1570,11 +1580,17 @@ install_all() {
   for entry in "${entries[@]}"; do
     read -r file sha <<<"$entry"
     say "Downloading $file"
-    curl -fL --retry 3 --progress-bar -o "$work/$file" "$RELEASE_URL/$file" ||
+    if ! curl -fL --retry 3 --progress-bar -o "$work/$file" "$RELEASE_URL/$file"; then
+      [[ $RELEASE_URL == "$PUBLIC_RELEASE_URL" ]] ||
+        die "could not download $file from the staging/mirror copy that
+    AURORA_RELEASE_URL names (shown at the start). That copy is missing the file
+    or can't be reached: check it, or unset AURORA_RELEASE_URL to install from
+    the public release. Nothing was installed."
       die "could not download $file from $TAG.
     The release is missing a file this script expects, which is a packaging
     mistake rather than anything wrong with this Mac. Nothing was installed.
     Please report it with the file name above."
+    fi
     [[ $(sha256sum "$work/$file" | cut -d' ' -f1) == "$sha" ]] || die "$file does not match its published checksum"
   done
   if m1n1_for_this_mac; then
@@ -2487,6 +2503,6 @@ case ${1:-} in
   --uninstall) uninstall_all ;;
   --reset-touchid) shift; reset_touchid "$@" ;;
   --m3-report) m3_report ;;
-  --agent-prompt) release_source; t=$(newer_release); [[ -n $t ]] && warn "the current release is $t; this plan is for $TAG"; agent_prompt ;;
+  --agent-prompt) release_source >&2; t=$(newer_release); [[ -n $t ]] && warn "the current release is $t; this plan is for $TAG"; agent_prompt ;;
   *) die "unknown option $1 (--read-only, --uninstall, --reset-touchid, --agent-prompt, --m3-report or --m3-handoff)" ;;
 esac

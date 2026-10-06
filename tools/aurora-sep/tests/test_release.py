@@ -6,9 +6,11 @@ m1n1 package this release names, by its file name always, and by its
 content when the file is at hand (AURORA_M1N1_PKG, or the release staging
 directory). ReleaseUrlTest and StagedCopyTest cover the staging or mirror
 override (AURORA_RELEASE_URL, AURORA_RELEASES_API): the default is the
-release's own tag, a staged copy installs through the same download and
-checksum loop, and the commands an install prints name the public release.
-UpgradeTest runs 11.38's own script on the fake Mac of
+release's own tag, only a plain file://, http:// or https:// URL is taken,
+a staged copy is named once at the start and installs through the same
+download and checksum loop, and the commands an install prints name the
+public release. PublicDownloadTest keeps the public release's own message
+for a missing file. UpgradeTest runs 11.38's own script on the fake Mac of
 test_m3_flow, then this one, as an owner updating would.
 """
 from pathlib import Path
@@ -161,6 +163,40 @@ class ReleaseUrlTest(unittest.TestCase):
                 proc = sourced("release_source", AURORA_RELEASE_URL=value, AURORA_RELEASES_API=value)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
 
+    def test_the_copy_in_use_is_named_once(self):
+        notice = "Using a staging/mirror copy: %s; checksums are still verified"
+        for env, shown in (({}, None),
+                           ({"AURORA_RELEASE_URL": DEFAULT_RELEASE_URL}, None),
+                           ({"AURORA_RELEASE_URL": "file:///srv/stage"}, "file:///srv/stage"),
+                           ({"AURORA_RELEASES_API": "http://127.0.0.1:8000/api"},
+                            "release list http://127.0.0.1:8000/api"),
+                           ({"AURORA_RELEASE_URL": "file:///srv/stage", "AURORA_RELEASES_API": "http://127.0.0.1:8000/api"},
+                            "file:///srv/stage (release list http://127.0.0.1:8000/api)")):
+            with self.subTest(env=env):
+                proc = sourced("release_source", **env)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                if shown is None:
+                    self.assertEqual(proc.stdout, "")
+                else:
+                    self.assertEqual(len(proc.stdout.splitlines()), 1, proc.stdout)
+                    self.assertIn(notice % shown, proc.stdout)
+
+    def test_agent_prompt_names_the_copy_on_stderr(self):
+        if not shutil.which("curl"):
+            self.skipTest("curl is needed")
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "latest").write_text('{"tag_name": "%s"}' % TAG)
+            env = {k: v for k, v in os.environ.items() if k not in OVERRIDES}
+            env.update(AURORA_RELEASE_URL="file:///srv/stage", AURORA_RELEASES_API=Path(d).as_uri())
+            proc = subprocess.run(["bash", str(flow.INSTALLER), "--agent-prompt"],
+                                  capture_output=True, text=True, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Using a staging/mirror copy: file:///srv/stage", proc.stderr)
+        # The prompt itself is untouched and names only the public release.
+        self.assertNotIn("staging/mirror", proc.stdout)
+        self.assertNotIn("file:///srv/stage", proc.stdout)
+        self.assertNotIn(Path(d).as_uri(), proc.stdout)
+
     def test_printed_commands_name_the_public_release(self):
         # The commands an install prints stay on the public tag under an override.
         proc = sourced('printf "%s\\n" "$PUBLIC_RELEASE_URL"',
@@ -223,6 +259,11 @@ class StagedCopyTest(flow.M3FlowBase):
         for line in commands:
             self.assertIn("https://github.com/iconidentify/aurora-linux/releases/", line)
             self.assertNotIn(self.stage.as_uri(), line)
+        # The stage is named once, in the first line, and nowhere else.
+        notice = f"Using a staging/mirror copy: {self.stage.as_uri()}; checksums are still verified"
+        self.assertIn(notice, proc.stdout.splitlines()[0])
+        self.assertEqual([l for l in printed.splitlines() if self.stage.as_uri() in l],
+                         [proc.stdout.splitlines()[0]])
         self.assertTrue(self.boot.read_bytes().startswith(b"M1N1:" + flow.M1N1_BASE.encode() + b"\n"))
         self.assertIn("linux-aurora", (self.fake / "installed").read_text().split())
 
@@ -252,6 +293,28 @@ class StagedCopyTest(flow.M3FlowBase):
         proc = self.install(check=False)
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("could not download aurora-touchid-20261003-1-any.pkg.tar.zst", proc.stderr)
+        # It blames the staged copy, not the release.
+        self.assertIn("from the staging/mirror copy that\n    AURORA_RELEASE_URL names", proc.stderr)
+        self.assertNotIn("packaging", proc.stderr)
+        self.assertNotIn("report", proc.stderr)
+        self.assertNotIn("pacman -U", self.log())
+
+
+class PublicDownloadTest(flow.M3FlowBase):
+    """A file missing from the public release, with no override set."""
+
+    def setUp(self):
+        super().setUp()
+        self.extra_env.update({name: "" for name in OVERRIDES})
+
+    def test_a_file_missing_from_the_release(self):
+        self.mac("j293")
+        (self.tmp / "pkgs/aurora-touchid-20261003-1-any.pkg.tar.zst").unlink()
+        proc = self.install(check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("could not download aurora-touchid-20261003-1-any.pkg.tar.zst from " + TAG, proc.stderr)
+        self.assertIn("packaging\n    mistake", proc.stderr)
+        self.assertNotIn("staging/mirror", proc.stdout + proc.stderr)
         self.assertNotIn("pacman -U", self.log())
 
 
