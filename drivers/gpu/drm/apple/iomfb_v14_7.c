@@ -1511,6 +1511,9 @@ const char *iomfb_v14_7_external_busy(struct apple_dcp *dcp)
 	case DCPEXT_STARTING:
 		return "its firmware is starting";
 	case DCPEXT_RUNNING:
+		/* A stopped session drives nothing, whatever it held last. */
+		if (dcp->v14 && READ_ONCE(dcp->v14->failed))
+			return NULL;
 		if (READ_ONCE(dcp->dptxport[0].connected) ||
 		    READ_ONCE(dcp->external_link_ready) ||
 		    (dcp->v14 && READ_ONCE(dcp->v14->powered)))

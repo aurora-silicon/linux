@@ -2187,6 +2187,10 @@ static void dcp_platform_shutdown(struct platform_device *pdev)
  * attached display back. Idle with nothing attached, its firmware stays
  * powered across s2idle like the panel's (the gate holds its CPU domain at
  * the active floor) and the next attach reconnects through it.
+ *
+ * A processor that failed (its start, or its session later) never refuses
+ * sleep: it drives no display until reboot, attached or not, and its power
+ * domains stay on across s2idle as they are, like those of a working one.
  */
 static const char *dcp_external_sleep_vetoed(struct apple_dcp *dcp)
 {
@@ -2200,6 +2204,11 @@ static const char *dcp_external_sleep_vetoed(struct apple_dcp *dcp)
 	why = iomfb_v14_7_external_busy(dcp);
 	if (why)
 		return why;
+	if (iomfb_v14_7_external_failed(dcp)) {
+		if (dcp->v14)
+			dev_info(dcp->dev, "external display processor failed earlier: sleeping with it as it is\n");
+		return NULL;
+	}
 	if (READ_ONCE(dcp->active_typec_route) || READ_ONCE(dcp->typec_cable_connected))
 		return "a USB-C display is attached";
 	if (dcp->hdmi_hpd && gpiod_get_value_cansleep(dcp->hdmi_hpd) > 0)
