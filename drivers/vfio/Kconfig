@@ -54,6 +54,18 @@ config VFIO_IOMMU_TYPE1
 	tristate
 	default n
 
+config VFIO_TYPE1_ACCOUNT_KUNIT_TEST
+	bool "Test VFIO type1 pin accounting and retained fragments" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && VFIO_IOMMU_TYPE1=y
+	default KUNIT_ALL_TESTS
+	help
+	  Exercise locked-memory refunds after source-mm exit and DMA owner
+	  changes. Arm64 mixed-granule configurations also test accounting
+	  conversions between user and native page sizes.
+	  Mixed-granule tests exercise retained pins, mappings, replay and
+	  external page arrays with recorded IOMMU translations. No physical
+	  device DMA is performed.
+
 config VFIO_IOMMU_SPAPR_TCE
 	tristate
 	depends on SPAPR_TCE_IOMMU
