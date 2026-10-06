@@ -300,5 +300,8 @@ pub(crate) static T8122: Soc = Soc {
         fragment_dependency: false,
     },
     power_from_boot_loader: true,
-    unported: &[],
+    unported: &[
+        "T8122 runtime allocation layout and fixed control words",
+        "T8122 conservative performance-state ceiling",
+    ],
 };
