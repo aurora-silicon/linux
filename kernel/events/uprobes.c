@@ -30,6 +30,7 @@
 #include <linux/srcu.h>
 #include <linux/oom.h>          /* check_stable_address_space */
 #include <linux/pagewalk.h>
+#include <linux/mm_subpage.h>
 
 #include <linux/uprobes.h>
 
@@ -144,12 +145,14 @@ static bool valid_vma(struct vm_area_struct *vma, bool is_register)
 
 static unsigned long offset_to_vaddr(struct vm_area_struct *vma, loff_t offset)
 {
-	return vma->vm_start + offset - ((loff_t)vma->vm_pgoff << PAGE_SHIFT);
+	return vma->vm_start + offset - ((loff_t)vma->vm_pgoff << PAGE_SHIFT) -
+		vma_subpage_offset(vma);
 }
 
 static loff_t vaddr_to_offset(struct vm_area_struct *vma, unsigned long vaddr)
 {
-	return ((loff_t)vma->vm_pgoff << PAGE_SHIFT) + (vaddr - vma->vm_start);
+	return ((loff_t)vma->vm_pgoff << PAGE_SHIFT) + vma_subpage_offset(vma) +
+		(vaddr - vma->vm_start);
 }
 
 /**
@@ -191,7 +194,8 @@ static void copy_to_page(struct page *page, unsigned long vaddr, const void *src
 	kunmap_local(kaddr);
 }
 
-static int verify_opcode(struct page *page, unsigned long vaddr, uprobe_opcode_t *insn,
+static int verify_opcode(struct page *page, unsigned long vaddr, unsigned int page_offset,
+			 uprobe_opcode_t *insn,
 			 int nbytes, void *data)
 {
 	uprobe_opcode_t old_opcode;
@@ -206,7 +210,7 @@ static int verify_opcode(struct page *page, unsigned long vaddr, uprobe_opcode_t
 	 * is a trap variant; uprobes always wins over any other (gdb)
 	 * breakpoint.
 	 */
-	uprobe_copy_from_page(page, vaddr, &old_opcode, UPROBE_SWBP_INSN_SIZE);
+	uprobe_copy_from_page(page, page_offset, &old_opcode, UPROBE_SWBP_INSN_SIZE);
 	is_swbp = is_swbp_insn(&old_opcode);
 
 	if (is_swbp_insn(insn)) {
@@ -307,14 +311,24 @@ __update_ref_ctr(struct mm_struct *mm, unsigned long vaddr, short d)
 {
 	void *kaddr;
 	struct page *page;
+#ifdef CONFIG_MM_SUBPAGE
+	struct user_page_fragment fragment;
+	struct vm_area_struct *vma;
+	bool alternative = mm_page_size(mm) != PAGE_SIZE;
+#endif
 	int ret;
 	short *ptr;
 
 	if (!vaddr || !d)
 		return -EINVAL;
 
-	ret = get_user_pages_remote(mm, vaddr, 1,
-				    FOLL_WRITE, &page, NULL);
+#ifdef CONFIG_MM_SUBPAGE
+	if (alternative)
+		ret = get_user_fragment_vma_remote(mm, vaddr, sizeof(short),
+						   FOLL_WRITE, &fragment, &vma);
+	else
+#endif
+		ret = get_user_pages_remote(mm, vaddr, 1, FOLL_WRITE, &page, NULL);
 	if (unlikely(ret <= 0)) {
 		/*
 		 * We are asking for 1 page. If get_user_pages_remote() fails,
@@ -323,8 +337,16 @@ __update_ref_ctr(struct mm_struct *mm, unsigned long vaddr, short d)
 		return ret == 0 ? -EBUSY : ret;
 	}
 
-	kaddr = kmap_local_page(page);
-	ptr = kaddr + (vaddr & ~PAGE_MASK);
+#ifdef CONFIG_MM_SUBPAGE
+	if (alternative) {
+		kaddr = kmap_local_folio(fragment.folio, fragment.offset);
+		ptr = kaddr;
+	} else
+#endif
+	{
+		kaddr = kmap_local_page(page);
+		ptr = kaddr + (vaddr & ~PAGE_MASK);
+	}
 
 	if (unlikely(*ptr + d < 0)) {
 		pr_warn("ref_ctr going negative. vaddr: 0x%lx, "
@@ -337,7 +359,12 @@ __update_ref_ctr(struct mm_struct *mm, unsigned long vaddr, short d)
 	ret = 0;
 out:
 	kunmap_local(kaddr);
-	put_page(page);
+#ifdef CONFIG_MM_SUBPAGE
+	if (alternative)
+		release_user_fragments(&fragment, 1, !ret);
+	else
+#endif
+		put_page(page);
 	return ret;
 }
 
@@ -381,7 +408,8 @@ static int update_ref_ctr(struct uprobe *uprobe, struct mm_struct *mm,
 }
 
 static bool orig_page_is_identical(struct vm_area_struct *vma,
-		unsigned long vaddr, struct page *page, bool *pmd_mappable)
+		unsigned long vaddr, struct page *page, unsigned int page_offset,
+		bool *pmd_mappable)
 {
 	const pgoff_t index = vaddr_to_offset(vma, vaddr) >> PAGE_SHIFT;
 	struct folio *orig_folio = filemap_get_folio(vma->vm_file->f_mapping,
@@ -393,19 +421,30 @@ static bool orig_page_is_identical(struct vm_area_struct *vma,
 		return false;
 	orig_page = folio_file_page(orig_folio, index);
 
-	*pmd_mappable = folio_test_pmd_mappable(orig_folio);
-	identical = folio_test_uptodate(orig_folio) &&
-		    pages_identical(page, orig_page);
+	*pmd_mappable = mm_page_size(vma->vm_mm) == PAGE_SIZE &&
+			folio_test_pmd_mappable(orig_folio);
+	if (mm_page_size(vma->vm_mm) < PAGE_SIZE) {
+		unsigned int offset = vma_page_offset_at(vma, vaddr).offset;
+		void *a = kmap_local_page(page), *b = kmap_local_page(orig_page);
+
+		identical = folio_test_uptodate(orig_folio) &&
+			!memcmp(a + page_offset, b + offset, mm_page_size(vma->vm_mm));
+		kunmap_local(b);
+		kunmap_local(a);
+	} else {
+		identical = folio_test_uptodate(orig_folio) &&
+			    pages_identical(page, orig_page);
+	}
 	folio_put(orig_folio);
 	return identical;
 }
 
 static int __uprobe_write(struct vm_area_struct *vma,
-		struct folio_walk *fw, struct folio *folio,
-		unsigned long insn_vaddr, uprobe_opcode_t *insn, int nbytes,
+		struct folio_walk *fw, struct folio *folio, struct mm_subpage *slot,
+		unsigned int page_offset, unsigned long insn_vaddr, uprobe_opcode_t *insn, int nbytes,
 		bool is_register)
 {
-	const unsigned long vaddr = insn_vaddr & PAGE_MASK;
+	const unsigned long vaddr = insn_vaddr & mm_page_mask(vma->vm_mm);
 	bool pmd_mappable;
 
 	/* For now, we'll only handle PTE-mapped folios. */
@@ -417,6 +456,12 @@ static int __uprobe_write(struct vm_area_struct *vma,
 	 * but the VMA might not be writable.
 	 */
 	if (!pte_write(fw->pte)) {
+#ifdef CONFIG_MM_SUBPAGE
+		if (slot) {
+			if (!mm_subpage_is_exclusive(slot))
+				return -EFAULT;
+		} else
+#endif
 		if (!PageAnonExclusive(fw->page))
 			return -EFAULT;
 		if (unlikely(userfaultfd_pte_wp(vma, fw->pte)))
@@ -430,31 +475,49 @@ static int __uprobe_write(struct vm_area_struct *vma,
 	 */
 	flush_cache_page(vma, vaddr, pte_pfn(fw->pte));
 	fw->pte = ptep_clear_flush(vma, vaddr, fw->ptep);
-	copy_to_page(fw->page, insn_vaddr, insn, nbytes);
+	copy_to_page(fw->page, page_offset, insn, nbytes);
 
 	/*
 	 * When unregistering, we may only zap a PTE if uffd is disabled and
 	 * there are no unexpected folio references ...
 	 */
-	if (is_register || userfaultfd_missing(vma) ||
-	    (folio_ref_count(folio) != folio_expected_ref_count(folio) + 1))
+	if (is_register || userfaultfd_missing(vma))
+		goto remap;
+#ifdef CONFIG_MM_SUBPAGE
+	if (slot) {
+		if (!mm_subpage_can_zap(slot))
+			goto remap;
+	} else
+#endif
+	if (folio_ref_count(folio) != folio_expected_ref_count(folio) + 1)
 		goto remap;
 
 	/*
 	 * ... and the mapped page is identical to the original page that
 	 * would get faulted in on next access.
 	 */
-	if (!orig_page_is_identical(vma, vaddr, fw->page, &pmd_mappable))
+	if (!orig_page_is_identical(vma, vaddr, fw->page,
+				    page_offset - (insn_vaddr - vaddr), &pmd_mappable))
 		goto remap;
 
 	dec_mm_counter(vma->vm_mm, MM_ANONPAGES);
-	folio_remove_rmap_pte(folio, fw->page, vma);
+#ifdef CONFIG_MM_SUBPAGE
+	if (slot)
+		mm_subpage_remove_anon_rmap(slot, vma);
+	else
+#endif
+		folio_remove_rmap_pte(folio, fw->page, vma);
 	if (!folio_mapped(folio) && folio_test_swapcache(folio) &&
 	     folio_trylock(folio)) {
 		folio_free_swap(folio);
 		folio_unlock(folio);
 	}
-	folio_put(folio);
+#ifdef CONFIG_MM_SUBPAGE
+	if (slot)
+		mm_subpage_put(slot); /* Retired PTE reference; caller still has its GET. */
+	else
+#endif
+		folio_put(folio);
 
 	return pmd_mappable;
 remap:
@@ -494,13 +557,24 @@ int uprobe_write_opcode(struct arch_uprobe *auprobe, struct vm_area_struct *vma,
 			    verify_opcode, is_register, true /* do_update_ref_ctr */, NULL);
 }
 
+static void uprobe_put_folio(struct folio *folio, struct mm_subpage *slot)
+{
+#ifdef CONFIG_MM_SUBPAGE
+	if (slot) {
+		mm_subpage_put(slot);
+		return;
+	}
+#endif
+	folio_put(folio);
+}
+
 int uprobe_write(struct arch_uprobe *auprobe, struct vm_area_struct *vma,
 		 const unsigned long insn_vaddr, uprobe_opcode_t *insn, int nbytes,
 		 uprobe_write_verify_t verify, bool is_register, bool do_update_ref_ctr,
 		 void *data)
 {
-	const unsigned long vaddr = insn_vaddr & PAGE_MASK;
 	struct mm_struct *mm = vma->vm_mm;
+	const unsigned long vaddr = insn_vaddr & mm_page_mask(mm);
 	struct uprobe *uprobe;
 	int ret, ref_ctr_updated = 0;
 	unsigned int gup_flags = FOLL_FORCE;
@@ -508,7 +582,16 @@ int uprobe_write(struct arch_uprobe *auprobe, struct vm_area_struct *vma,
 	struct folio_walk fw;
 	struct folio *folio;
 	struct page *page;
+	struct mm_subpage *slot = NULL;
+	unsigned int page_offset;
+#ifdef CONFIG_MM_SUBPAGE
+	struct user_page_fragment fragment;
+	struct vm_area_struct *found;
+#endif
 
+	/* Larger-than-native public mms are not enabled by the mixed-page ABI yet. */
+	if (mm_page_size(mm) > PAGE_SIZE)
+		return -EOPNOTSUPP;
 	uprobe = container_of(auprobe, struct uprobe, arch);
 
 	if (WARN_ON_ONCE(!is_cow_mapping(vma->vm_flags)))
@@ -526,14 +609,29 @@ int uprobe_write(struct arch_uprobe *auprobe, struct vm_area_struct *vma,
 		gup_flags |= FOLL_WRITE | FOLL_SPLIT_PMD;
 
 retry:
-	ret = get_user_pages_remote(mm, vaddr, 1, gup_flags, &page, NULL);
-	if (ret <= 0)
-		goto out;
-	folio = page_folio(page);
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(mm) < PAGE_SIZE) {
+		ret = get_user_fragment_vma_remote(mm, vaddr, mm_page_size(mm),
+				gup_flags & ~FOLL_SPLIT_PMD, &fragment, &found);
+		if (ret <= 0)
+			goto out;
+		folio = fragment.folio;
+		slot = fragment.subpage;
+		page = folio_page(folio, fragment.offset >> PAGE_SHIFT);
+		page_offset = offset_in_page(fragment.offset) + insn_vaddr - vaddr;
+	} else
+#endif
+	{
+		ret = get_user_pages_remote(mm, vaddr, 1, gup_flags, &page, NULL);
+		if (ret <= 0)
+			goto out;
+		folio = page_folio(page);
+		page_offset = offset_in_page(insn_vaddr);
+	}
 
-	ret = verify(page, insn_vaddr, insn, nbytes, data);
+	ret = verify(page, insn_vaddr, page_offset, insn, nbytes, data);
 	if (ret <= 0) {
-		folio_put(folio);
+		uprobe_put_folio(folio, slot);
 		goto out;
 	}
 
@@ -541,7 +639,7 @@ retry:
 	if (do_update_ref_ctr && !ref_ctr_updated && uprobe->ref_ctr_offset) {
 		ret = update_ref_ctr(uprobe, mm, is_register ? 1 : -1);
 		if (ret) {
-			folio_put(folio);
+			uprobe_put_folio(folio, slot);
 			goto out;
 		}
 
@@ -551,7 +649,7 @@ retry:
 	ret = 0;
 	if (unlikely(!folio_test_anon(folio) || folio_is_zone_device(folio))) {
 		VM_WARN_ON_ONCE(is_register);
-		folio_put(folio);
+		uprobe_put_folio(folio, slot);
 		goto out;
 	}
 
@@ -562,22 +660,29 @@ retry:
 		 * be able to do it under PTL.
 		 */
 		mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, mm,
-					vaddr, vaddr + PAGE_SIZE);
+					vaddr, vaddr + mm_page_size(mm));
 		mmu_notifier_invalidate_range_start(&range);
 	}
 
 	ret = -EAGAIN;
 	/* Walk the page tables again, to perform the actual update. */
 	if (folio_walk_start(&fw, vma, vaddr, 0)) {
-		if (fw.page == page)
-			ret = __uprobe_write(vma, &fw, folio, insn_vaddr, insn, nbytes, is_register);
+		bool same = fw.page == page;
+#ifdef CONFIG_MM_SUBPAGE
+		if (slot)
+			same &= fw.level == FW_LEVEL_PTE &&
+				pte_phys_mm(mm, fw.pte) == mm_subpage_phys(slot);
+#endif
+		if (same)
+			ret = __uprobe_write(vma, &fw, folio, slot, page_offset,
+					     insn_vaddr, insn, nbytes, is_register);
 		folio_walk_end(&fw, vma);
 	}
 
 	if (!is_register)
 		mmu_notifier_invalidate_range_end(&range);
 
-	folio_put(folio);
+	uprobe_put_folio(folio, slot);
 	switch (ret) {
 	case -EFAULT:
 		gup_flags |= FOLL_WRITE | FOLL_SPLIT_PMD;
@@ -1211,7 +1316,9 @@ build_map_info(struct address_space *mapping, loff_t offset, bool is_register)
  again:
 	i_mmap_lock_read(mapping);
 	vma_interval_tree_foreach(vma, &mapping->i_mmap, pgoff, pgoff) {
-		if (!valid_vma(vma, is_register))
+		if (!valid_vma(vma, is_register) ||
+		    offset < vaddr_to_offset(vma, vma->vm_start) ||
+		    offset >= vaddr_to_offset(vma, vma->vm_end))
 			continue;
 
 		if (!prev && !more) {
@@ -1482,7 +1589,7 @@ static int unapply_uprobe(struct uprobe *uprobe, struct mm_struct *mm)
 		    file_inode(vma->vm_file) != uprobe->inode)
 			continue;
 
-		offset = (loff_t)vma->vm_pgoff << PAGE_SHIFT;
+		offset = vaddr_to_offset(vma, vma->vm_start);
 		if (uprobe->offset <  offset ||
 		    uprobe->offset >= offset + vma->vm_end - vma->vm_start)
 			continue;
@@ -1696,8 +1803,14 @@ static const struct vm_special_mapping xol_mapping = {
 
 unsigned long __weak arch_uprobe_get_xol_area(void)
 {
-	/* Try to map as high as possible, this is only a hint. */
-	return get_unmapped_area(NULL, TASK_SIZE - PAGE_SIZE, PAGE_SIZE, 0, 0);
+	unsigned long size = PAGE_SIZE;
+	unsigned long addr;
+
+	/* XOL arch copy hooks use native offsets into the one backing page. */
+	if (mm_page_size(current->mm) < PAGE_SIZE)
+		size += PAGE_SIZE - mm_page_size(current->mm);
+	addr = get_unmapped_area(NULL, TASK_SIZE - size, size, 0, 0);
+	return IS_ERR_VALUE(addr) ? addr : ALIGN(addr, PAGE_SIZE);
 }
 
 /* Slot allocation for XOL */
@@ -2413,6 +2526,23 @@ static int is_trap_at_addr(struct mm_struct *mm, unsigned long vaddr)
 	if (likely(result == 0))
 		goto out;
 
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(mm) < PAGE_SIZE) {
+		struct user_page_fragment fragment;
+		struct vm_area_struct *vma;
+		void *kaddr;
+
+		result = get_user_fragment_vma_remote(mm, vaddr, UPROBE_SWBP_INSN_SIZE,
+						      FOLL_FORCE, &fragment, &vma);
+		if (result != 1)
+			return result < 0 ? result : -EFAULT;
+		kaddr = kmap_local_folio(fragment.folio, fragment.offset);
+		memcpy(&opcode, kaddr, UPROBE_SWBP_INSN_SIZE);
+		kunmap_local(kaddr);
+		release_user_fragments(&fragment, 1, false);
+		goto out;
+	}
+#endif
 	result = get_user_pages(vaddr, 1, FOLL_FORCE, &page);
 	if (result < 0)
 		return result;
@@ -2453,7 +2583,7 @@ static struct uprobe *find_active_uprobe_speculative(unsigned long bp_vaddr)
 	if (!vm_file)
 		return NULL;
 
-	offset = (loff_t)(vma->vm_pgoff << PAGE_SHIFT) + (bp_vaddr - vma->vm_start);
+	offset = vaddr_to_offset(vma, bp_vaddr);
 	uprobe = find_uprobe_rcu(vm_file->f_inode, offset);
 	if (!uprobe)
 		return NULL;

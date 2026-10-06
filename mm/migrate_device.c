@@ -408,7 +408,7 @@ again:
 			if (anon_exclusive) {
 				pte = ptep_clear_flush(vma, addr, ptep);
 
-				if (folio_try_share_anon_rmap_pte(folio, page)) {
+				if (folio_try_share_anon_rmap_pte(folio, page, vma)) {
 					set_pte_at(mm, addr, ptep, pte);
 					if (fault_folio != folio)
 						folio_unlock(folio);

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/pagewalk.h>
 #include <linux/mm_inline.h>
+#include <linux/mm_subpage.h>
 #include <linux/hugetlb.h>
 #include <linux/huge_mm.h>
 #include <linux/mount.h>
@@ -33,7 +34,7 @@
 #define SENTINEL_VMA_GATE	-2
 
 #define SEQ_PUT_DEC(str, val) \
-		seq_put_decimal_ull_width(m, str, (val) << (PAGE_SHIFT-10), 8)
+		seq_put_decimal_ull_width(m, str, mm_pages_to_kb(mm, val), 8)
 void task_mem(struct seq_file *m, struct mm_struct *mm)
 {
 	unsigned long text, lib, swap, anon, file, shmem;
@@ -58,15 +59,18 @@ void task_mem(struct seq_file *m, struct mm_struct *mm)
 		hiwater_rss = mm->hiwater_rss;
 
 	/* split executable areas between text and lib */
-	text = PAGE_ALIGN(mm->end_code) - (mm->start_code & PAGE_MASK);
-	text = min(text, mm->exec_vm << PAGE_SHIFT);
-	lib = (mm->exec_vm << PAGE_SHIFT) - text;
+	text = mm_page_align(mm, mm->end_code) -
+		(mm->start_code & mm_page_mask(mm));
+	text = min(text, mm_pages_to_bytes(mm, mm->exec_vm));
+	lib = (mm_pages_to_bytes(mm, mm->exec_vm)) - text;
 
 	swap = get_mm_counter_sum(mm, MM_SWAPENTS);
 	SEQ_PUT_DEC("VmPeak:\t", hiwater_vm);
 	SEQ_PUT_DEC(" kB\nVmSize:\t", total_vm);
-	SEQ_PUT_DEC(" kB\nVmLck:\t", mm->locked_vm);
-	SEQ_PUT_DEC(" kB\nVmPin:\t", atomic64_read(&mm->pinned_vm));
+	seq_put_decimal_ull_width(m, " kB\nVmLck:\t",
+		mm_locked_vm_bytes(mm) >> 10, 8);
+	seq_put_decimal_ull_width(m, " kB\nVmPin:\t",
+		atomic64_read(&mm->pinned_vm) << (PAGE_SHIFT - 10), 8);
 	SEQ_PUT_DEC(" kB\nVmHWM:\t", hiwater_rss);
 	SEQ_PUT_DEC(" kB\nVmRSS:\t", total_rss);
 	SEQ_PUT_DEC(" kB\nRssAnon:\t", anon);
@@ -88,20 +92,25 @@ void task_mem(struct seq_file *m, struct mm_struct *mm)
 
 unsigned long task_vsize(struct mm_struct *mm)
 {
-	return PAGE_SIZE * mm->total_vm;
+	return mm_pages_to_bytes(mm, mm->total_vm);
 }
 
 unsigned long task_statm(struct mm_struct *mm,
 			 unsigned long *shared, unsigned long *text,
 			 unsigned long *data, unsigned long *resident)
 {
-	*shared = get_mm_counter_sum(mm, MM_FILEPAGES) +
+	struct mm_struct *reader = current->mm;
+	unsigned long file = get_mm_counter_sum(mm, MM_FILEPAGES) +
 			get_mm_counter_sum(mm, MM_SHMEMPAGES);
-	*text = (PAGE_ALIGN(mm->end_code) - (mm->start_code & PAGE_MASK))
-								>> PAGE_SHIFT;
-	*data = mm->data_vm + mm->stack_vm;
-	*resident = *shared + get_mm_counter_sum(mm, MM_ANONPAGES);
-	return mm->total_vm;
+	unsigned long code = (mm_page_align(mm, mm->end_code) -
+		(mm->start_code & mm_page_mask(mm))) >> mm_page_shift(mm);
+
+	*shared = mm_pages_for_reader(mm, reader, file);
+	*text = mm_pages_for_reader(mm, reader, code);
+	*data = mm_pages_for_reader(mm, reader, mm->data_vm + mm->stack_vm);
+	*resident = mm_pages_for_reader(mm, reader,
+			file + get_mm_counter_sum(mm, MM_ANONPAGES));
+	return mm_pages_for_reader(mm, reader, mm->total_vm);
 }
 
 #ifdef CONFIG_NUMA
@@ -475,7 +484,8 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 
 		dev = inode->i_sb->s_dev;
 		ino = inode->i_ino;
-		pgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;
+		pgoff = (((loff_t)vma->vm_pgoff) << PAGE_SHIFT) +
+			vma_subpage_offset(vma);
 	}
 
 	start = vma->vm_start;
@@ -717,7 +727,8 @@ static int do_procmap_query(struct mm_struct *mm, void __user *uarg)
 	if (vma->vm_file) {
 		const struct inode *inode = file_user_inode(vma->vm_file);
 
-		karg.vma_offset = ((__u64)vma->vm_pgoff) << PAGE_SHIFT;
+		karg.vma_offset = (((__u64)vma->vm_pgoff) << PAGE_SHIFT) +
+			vma_subpage_offset(vma);
 		karg.dev_major = MAJOR(inode->i_sb->s_dev);
 		karg.dev_minor = MINOR(inode->i_sb->s_dev);
 		karg.inode = inode->i_ino;
@@ -857,6 +868,50 @@ const struct file_operations proc_pid_maps_operations = {
  */
 #define PSS_SHIFT 12
 
+#if defined(CONFIG_MM_SUBPAGE) && (defined(CONFIG_PROC_PAGE_MONITOR) || defined(CONFIG_NUMA))
+/* Snapshot only: rmap and quarter counters can change in other address spaces. */
+static void file_quarter_mapcounts(struct page *page, struct mm_subpage_mapcounts *counts)
+{
+	int maps = folio_precise_page_mapcount(page_folio(page), page);
+	unsigned int small = mm_subpage_file_mapcounts(page, counts);
+	unsigned int native = maps > small ? maps - small : 0;
+	unsigned int i;
+
+	for (i = 0; i < MM_SUBPAGES_PER_PAGE; i++)
+		counts->slots[i] += native;
+}
+
+static unsigned int proc_leaf_mapcount(struct vm_area_struct *vma, pte_t pte,
+				      struct page *page)
+{
+	struct folio *folio = page_folio(page);
+	struct mm_subpage_mapcounts counts;
+	unsigned int i, count = 0;
+
+	if (!folio_test_anon(folio)) {
+		unsigned int first = mm_page_size(vma->vm_mm) < PAGE_SIZE ?
+			offset_in_page(pte_phys_mm(vma->vm_mm, pte)) / SZ_4K : 0;
+		unsigned int nr = mm_page_size(vma->vm_mm) / SZ_4K;
+
+		file_quarter_mapcounts(page, &counts);
+		for (i = first; i < first + nr; i++)
+			count = max(count, counts.slots[i]);
+		return count;
+	}
+	if (mm_page_size(vma->vm_mm) < PAGE_SIZE) {
+		struct mm_subpage *slot = mm_subpage_get_from_phys(pte_phys_mm(vma->vm_mm, pte));
+
+		if (slot) {
+			count = mm_subpage_mapcount(slot);
+			mm_subpage_put(slot);
+		}
+		return count;
+	}
+	return folio_precise_page_mapcount(folio, page);
+}
+
+#endif
+
 #ifdef CONFIG_PROC_PAGE_MONITOR
 struct mem_size_stats {
 	unsigned long resident;
@@ -912,6 +967,73 @@ static void smaps_page_accumulate(struct mem_size_stats *mss,
 			mss->shared_clean += size;
 	}
 }
+
+#ifdef CONFIG_MM_SUBPAGE
+static void smaps_account_file_extent(struct mem_size_stats *mss, struct page *page,
+		unsigned int offset, unsigned long size, bool dirty, bool locked, bool present)
+{
+	struct folio *folio = page_folio(page);
+	struct mm_subpage_mapcounts counts = {};
+	unsigned int i;
+
+	if (present)
+		file_quarter_mapcounts(page, &counts);
+	for (i = offset / SZ_4K; i < (offset + size) / SZ_4K; i++) {
+		unsigned long pss = SZ_4K << PSS_SHIFT;
+
+		if (counts.slots[i] > 1)
+			pss /= counts.slots[i];
+		smaps_page_accumulate(mss, folio, SZ_4K, pss, dirty, locked,
+				      present && counts.slots[i] < 2);
+	}
+}
+
+static void smaps_account_small(struct mem_size_stats *mss, struct vm_area_struct *vma,
+				struct page *page, pte_t pte, bool young,
+				bool dirty, bool locked, bool present)
+{
+	struct folio *folio = page_folio(page);
+	unsigned long size = mm_page_size(vma->vm_mm), pss = size << PSS_SHIFT;
+	unsigned int count = present && folio_test_anon(folio) ?
+		proc_leaf_mapcount(vma, pte, page) : 0;
+
+	mss->resident += size;
+	if (folio_test_anon(folio)) {
+		mss->anonymous += size;
+		if (present && !dirty) {
+			struct mm_subpage *slot = mm_subpage_get_from_phys(pte_phys_mm(vma->vm_mm, pte));
+
+			if (slot) {
+				if (mm_subpage_is_lazyfree(slot))
+					mss->lazyfree += size;
+				mm_subpage_put(slot);
+			}
+		}
+	}
+	if (folio_test_ksm(folio))
+		mss->ksm += size;
+	if (young || folio_test_young(folio) || folio_test_referenced(folio))
+		mss->referenced += size;
+	if (present && !folio_test_anon(folio)) {
+		smaps_account_file_extent(mss, page, offset_in_page(pte_phys_mm(vma->vm_mm, pte)),
+					  size, dirty, locked, present);
+		return;
+	}
+	if (count > 1)
+		pss /= count;
+	smaps_page_accumulate(mss, folio, size, pss, dirty, locked, present && count < 2);
+}
+
+static bool smaps_account_file_quarters(struct mem_size_stats *mss, struct page *page,
+					bool dirty, bool locked)
+{
+	if (folio_test_anon(page_folio(page)))
+		return false;
+	smaps_account_file_extent(mss, page, 0, PAGE_SIZE, dirty, locked, true);
+	return true;
+}
+
+#endif
 
 static void smaps_account(struct mem_size_stats *mss, struct page *page,
 		bool compound, bool young, bool dirty, bool locked,
@@ -976,6 +1098,11 @@ static void smaps_account(struct mem_size_stats *mss, struct page *page,
 	for (i = 0; i < nr; i++, page++) {
 		unsigned long pss = PAGE_SIZE << PSS_SHIFT;
 
+#ifdef CONFIG_MM_SUBPAGE
+		if (smaps_account_file_quarters(mss, page, dirty, locked))
+			continue;
+#endif
+
 		if (IS_ENABLED(CONFIG_PAGE_MAPCOUNT)) {
 			mapcount = folio_precise_page_mapcount(folio, page);
 			exclusive = mapcount < 2;
@@ -995,6 +1122,14 @@ static int smaps_pte_hole(unsigned long addr, unsigned long end,
 	struct mem_size_stats *mss = walk->private;
 	struct vm_area_struct *vma = walk->vma;
 
+	if (mm_page_size(vma->vm_mm) < PAGE_SIZE) {
+		struct vm_page_offset pos = vma_page_offset_at(vma, addr);
+		u64 start = ((u64)pos.index << PAGE_SHIFT) + pos.offset;
+
+		mss->swap += shmem_partial_swap_usage_bytes(vma->vm_file->f_mapping,
+							  start, start + end - addr);
+		return 0;
+	}
 	mss->swap += shmem_partial_swap_usage(walk->vma->vm_file->f_mapping,
 					      linear_page_index(vma, addr),
 					      linear_page_index(vma, end));
@@ -1010,7 +1145,7 @@ static void smaps_pte_hole_lookup(unsigned long addr, struct mm_walk *walk)
 #ifdef CONFIG_SHMEM
 	if (walk->ops->pte_hole) {
 		/* depth is not used */
-		smaps_pte_hole(addr, addr + PAGE_SIZE, 0, walk);
+		smaps_pte_hole(addr, addr + mm_page_size(walk->mm), 0, walk);
 	}
 #endif
 }
@@ -1038,15 +1173,20 @@ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
 		if (softleaf_is_swap(entry)) {
 			int mapcount;
 
-			mss->swap += PAGE_SIZE;
-			mapcount = swp_swapcount(entry);
+			mss->swap += mm_page_size(vma->vm_mm);
+#ifdef CONFIG_MM_SUBPAGE
+			if (mm_page_size(vma->vm_mm) < PAGE_SIZE)
+				mapcount = swap_subpage_count(entry, pte_swp_subpage_offset(ptent));
+			else
+#endif
+				mapcount = swp_swapcount(entry);
 			if (mapcount >= 2) {
-				u64 pss_delta = (u64)PAGE_SIZE << PSS_SHIFT;
+				u64 pss_delta = (u64)mm_page_size(vma->vm_mm) << PSS_SHIFT;
 
 				do_div(pss_delta, mapcount);
 				mss->swap_pss += pss_delta;
 			} else {
-				mss->swap_pss += (u64)PAGE_SIZE << PSS_SHIFT;
+				mss->swap_pss += (u64)mm_page_size(vma->vm_mm) << PSS_SHIFT;
 			}
 		} else if (softleaf_has_pfn(entry)) {
 			if (softleaf_is_device_private(entry))
@@ -1058,6 +1198,12 @@ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
 	if (!page)
 		return;
 
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(vma->vm_mm) < PAGE_SIZE) {
+		smaps_account_small(mss, vma, page, ptent, young, dirty, locked, present);
+		return;
+	}
+#endif
 	smaps_account(mss, page, false, young, dirty, locked, present);
 }
 
@@ -1124,7 +1270,7 @@ static int smaps_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
 		walk->action = ACTION_AGAIN;
 		return 0;
 	}
-	for (; addr != end; pte++, addr += PAGE_SIZE)
+	for (; addr != end; pte++, addr += mm_page_size(vma->vm_mm))
 		smaps_pte_entry(pte, addr, walk);
 	pte_unmap_unlock(pte - 1, ptl);
 out:
@@ -1712,7 +1858,7 @@ out:
 		walk->action = ACTION_AGAIN;
 		return 0;
 	}
-	for (; addr != end; pte++, addr += PAGE_SIZE) {
+	for (; addr != end; pte++, addr += mm_page_size(vma->vm_mm)) {
 		ptent = ptep_get(pte);
 
 		if (cp->type == CLEAR_REFS_SOFT_DIRTY) {
@@ -1855,9 +2001,6 @@ struct pagemapread {
 	bool show_pfn;
 };
 
-#define PAGEMAP_WALK_SIZE	(PMD_SIZE)
-#define PAGEMAP_WALK_MASK	(PMD_MASK)
-
 #define PM_ENTRY_BYTES		sizeof(pagemap_entry_t)
 #define PM_PFRAME_BITS		55
 #define PM_PFRAME_MASK		GENMASK_ULL(PM_PFRAME_BITS - 1, 0)
@@ -1884,7 +2027,7 @@ static int add_to_pagemap(pagemap_entry_t *pme, struct pagemapread *pm)
 	return 0;
 }
 
-static bool __folio_page_mapped_exclusively(struct folio *folio, struct page *page)
+static inline bool __folio_page_mapped_exclusively(struct folio *folio, struct page *page)
 {
 	if (IS_ENABLED(CONFIG_PAGE_MAPCOUNT))
 		return folio_precise_page_mapcount(folio, page) == 1;
@@ -1909,7 +2052,7 @@ static int pagemap_pte_hole(unsigned long start, unsigned long end,
 		else
 			hole_end = end;
 
-		for (; addr < hole_end; addr += PAGE_SIZE) {
+		for (; addr < hole_end; addr += mm_page_size(walk->mm)) {
 			err = add_to_pagemap(&pme, pm);
 			if (err)
 				goto out;
@@ -1921,7 +2064,7 @@ static int pagemap_pte_hole(unsigned long start, unsigned long end,
 		/* Addresses in the VMA. */
 		if (vma->vm_flags & VM_SOFTDIRTY)
 			pme = make_pme(0, PM_SOFT_DIRTY);
-		for (; addr < min(end, vma->vm_end); addr += PAGE_SIZE) {
+		for (; addr < min(end, vma->vm_end); addr += mm_page_size(walk->mm)) {
 			err = add_to_pagemap(&pme, pm);
 			if (err)
 				goto out;
@@ -1929,6 +2072,16 @@ static int pagemap_pte_hole(unsigned long start, unsigned long end,
 	}
 out:
 	return err;
+}
+
+static bool pagemap_page_exclusive(struct vm_area_struct *vma, pte_t pte,
+				   struct folio *folio, struct page *page)
+{
+#ifdef CONFIG_MM_SUBPAGE
+	return proc_leaf_mapcount(vma, pte, page) == 1;
+#else
+	return __folio_page_mapped_exclusively(folio, page);
+#endif
 }
 
 static pagemap_entry_t pte_to_pagemap_entry(struct pagemapread *pm,
@@ -1943,7 +2096,7 @@ static pagemap_entry_t pte_to_pagemap_entry(struct pagemapread *pm,
 
 	if (pte_present(pte)) {
 		if (pm->show_pfn)
-			frame = pte_pfn(pte);
+			frame = pte_phys_mm(vma->vm_mm, pte) >> mm_page_shift(vma->vm_mm);
 		flags |= PM_PRESENT;
 		page = vm_normal_page(vma, addr, pte);
 		if (pte_soft_dirty(pte))
@@ -1969,6 +2122,12 @@ static pagemap_entry_t pte_to_pagemap_entry(struct pagemapread *pm,
 				offset = softleaf_to_pfn(entry);
 			else
 				offset = swp_offset(entry);
+#ifdef CONFIG_MM_SUBPAGE
+			if (mm_page_size(vma->vm_mm) < PAGE_SIZE &&
+			    (softleaf_is_swap(entry) || softleaf_has_pfn(entry)))
+				offset = (offset << (PAGE_SHIFT - mm_page_shift(vma->vm_mm))) +
+					(pte_swp_subpage_offset(pte) >> mm_page_shift(vma->vm_mm));
+#endif
 			frame = swp_type(entry) |
 			    (offset << MAX_SWAPFILES_SHIFT);
 		}
@@ -1985,8 +2144,7 @@ static pagemap_entry_t pte_to_pagemap_entry(struct pagemapread *pm,
 		folio = page_folio(page);
 		if (!folio_test_anon(folio))
 			flags |= PM_FILE;
-		if ((flags & PM_PRESENT) &&
-		    __folio_page_mapped_exclusively(folio, page))
+		if ((flags & PM_PRESENT) && pagemap_page_exclusive(vma, pte, folio, page))
 			flags |= PM_MMAP_EXCLUSIVE;
 	}
 
@@ -2102,7 +2260,7 @@ static int pagemap_pmd_range(pmd_t *pmdp, unsigned long addr, unsigned long end,
 		walk->action = ACTION_AGAIN;
 		return err;
 	}
-	for (; addr < end; pte++, addr += PAGE_SIZE) {
+	for (; addr < end; pte++, addr += mm_page_size(walk->mm)) {
 		pagemap_entry_t pme;
 
 		pme = pte_to_pagemap_entry(pm, vma, addr, ptep_get(pte));
@@ -2236,7 +2394,7 @@ static ssize_t pagemap_read(struct file *file, char __user *buf,
 	/* do not disclose physical addresses: attack vector */
 	pm.show_pfn = file_ns_capable(file, &init_user_ns, CAP_SYS_ADMIN);
 
-	pm.len = (PAGEMAP_WALK_SIZE >> PAGE_SHIFT);
+	pm.len = (pmd_size_mm(mm) >> mm_page_shift(mm));
 	pm.buffer = kmalloc_array(pm.len, PM_ENTRY_BYTES, GFP_KERNEL);
 	ret = -ENOMEM;
 	if (!pm.buffer)
@@ -2248,16 +2406,16 @@ static ssize_t pagemap_read(struct file *file, char __user *buf,
 
 	/* watch out for wraparound */
 	start_vaddr = end_vaddr;
-	if (svpfn <= (ULONG_MAX >> PAGE_SHIFT)) {
+	if (svpfn <= (ULONG_MAX >> mm_page_shift(mm))) {
 		unsigned long end;
 
 		ret = mmap_read_lock_killable(mm);
 		if (ret)
 			goto out_free;
-		start_vaddr = untagged_addr_remote(mm, svpfn << PAGE_SHIFT);
+		start_vaddr = untagged_addr_remote(mm, svpfn << mm_page_shift(mm));
 		mmap_read_unlock(mm);
 
-		end = start_vaddr + ((count / PM_ENTRY_BYTES) << PAGE_SHIFT);
+		end = start_vaddr + ((count / PM_ENTRY_BYTES) << mm_page_shift(mm));
 		if (end >= start_vaddr && end < mm->task_size)
 			end_vaddr = end;
 	}
@@ -2272,7 +2430,7 @@ static ssize_t pagemap_read(struct file *file, char __user *buf,
 		unsigned long end;
 
 		pm.pos = 0;
-		end = (start_vaddr + PAGEMAP_WALK_SIZE) & PAGEMAP_WALK_MASK;
+		end = (start_vaddr + pmd_size_mm(mm)) & pmd_mask_mm(mm);
 		/* overflow ? */
 		if (end < start_vaddr || end > end_vaddr)
 			end = end_vaddr;
@@ -2333,6 +2491,7 @@ static int pagemap_release(struct inode *inode, struct file *file)
 
 struct pagemap_scan_private {
 	struct pm_scan_arg arg;
+	unsigned long page_size;
 	unsigned long masks_of_interest, cur_vma_category;
 	struct page_region *vec_buf;
 	unsigned long vec_buf_len, vec_buf_index, found_pages;
@@ -2559,7 +2718,7 @@ static void pagemap_scan_backout_range(struct pagemap_scan_private *p,
 	else
 		cur_buf->start = cur_buf->end = 0;
 
-	p->found_pages -= (end - addr) / PAGE_SIZE;
+	p->found_pages -= (end - addr) / p->page_size;
 }
 #endif
 
@@ -2671,11 +2830,11 @@ static int pagemap_scan_output(unsigned long categories,
 
 	categories &= p->arg.return_mask;
 
-	n_pages = (*end - addr) / PAGE_SIZE;
+	n_pages = (*end - addr) / p->page_size;
 	if (check_add_overflow(p->found_pages, n_pages, &total_pages) ||
 	    total_pages > p->arg.max_pages) {
 		size_t n_too_much = total_pages - p->arg.max_pages;
-		*end -= n_too_much * PAGE_SIZE;
+		*end -= n_too_much * p->page_size;
 		n_pages -= n_too_much;
 		ret = -ENOSPC;
 	}
@@ -2769,7 +2928,7 @@ static int pagemap_scan_pmd_entry(pmd_t *pmd, unsigned long start,
 
 	if ((p->arg.flags & PM_SCAN_WP_MATCHING) && !p->vec_out) {
 		/* Fast path for performing exclusive WP */
-		for (addr = start; addr != end; pte++, addr += PAGE_SIZE) {
+		for (addr = start; addr != end; pte++, addr += p->page_size) {
 			pte_t ptent = ptep_get(pte);
 
 			if ((pte_present(ptent) && pte_uffd_wp(ptent)) ||
@@ -2778,7 +2937,7 @@ static int pagemap_scan_pmd_entry(pmd_t *pmd, unsigned long start,
 			make_uffd_wp_pte(vma, addr, pte, ptent);
 			if (!flush_end)
 				start = addr;
-			flush_end = addr + PAGE_SIZE;
+			flush_end = addr + p->page_size;
 		}
 		goto flush_and_return;
 	}
@@ -2786,8 +2945,8 @@ static int pagemap_scan_pmd_entry(pmd_t *pmd, unsigned long start,
 	if (!p->arg.category_anyof_mask && !p->arg.category_inverted &&
 	    p->arg.category_mask == PAGE_IS_WRITTEN &&
 	    p->arg.return_mask == PAGE_IS_WRITTEN) {
-		for (addr = start; addr < end; pte++, addr += PAGE_SIZE) {
-			unsigned long next = addr + PAGE_SIZE;
+		for (addr = start; addr < end; pte++, addr += p->page_size) {
+			unsigned long next = addr + p->page_size;
 			pte_t ptent = ptep_get(pte);
 
 			if ((pte_present(ptent) && pte_uffd_wp(ptent)) ||
@@ -2807,11 +2966,11 @@ static int pagemap_scan_pmd_entry(pmd_t *pmd, unsigned long start,
 		goto flush_and_return;
 	}
 
-	for (addr = start; addr != end; pte++, addr += PAGE_SIZE) {
+	for (addr = start; addr != end; pte++, addr += p->page_size) {
 		pte_t ptent = ptep_get(pte);
 		unsigned long categories = p->cur_vma_category |
 					   pagemap_page_category(p, vma, addr, ptent);
-		unsigned long next = addr + PAGE_SIZE;
+		unsigned long next = addr + p->page_size;
 
 		if (!pagemap_scan_is_interesting_page(categories, p))
 			continue;
@@ -3007,7 +3166,7 @@ static const struct mm_walk_ops pagemap_scan_ops = {
 	.hugetlb_entry = pagemap_scan_hugetlb_entry,
 };
 
-static int pagemap_scan_get_args(struct pm_scan_arg *arg,
+static int pagemap_scan_get_args(struct mm_struct *mm, struct pm_scan_arg *arg,
 				 unsigned long uarg)
 {
 	if (copy_from_user(arg, (void __user *)uarg, sizeof(*arg)))
@@ -3028,7 +3187,7 @@ static int pagemap_scan_get_args(struct pm_scan_arg *arg,
 	arg->vec = untagged_addr((unsigned long)arg->vec);
 
 	/* Validate memory pointers */
-	if (!IS_ALIGNED(arg->start, PAGE_SIZE))
+	if (!IS_ALIGNED(arg->start, mm_page_size(mm)))
 		return -EINVAL;
 	if (!access_ok((void __user *)(long)arg->start, arg->end - arg->start))
 		return -EFAULT;
@@ -3041,7 +3200,7 @@ static int pagemap_scan_get_args(struct pm_scan_arg *arg,
 		return -EFAULT;
 
 	/* Fixup default values */
-	arg->end = ALIGN(arg->end, PAGE_SIZE);
+	arg->end = ALIGN(arg->end, mm_page_size(mm));
 	arg->walk_end = 0;
 	if (!arg->max_pages)
 		arg->max_pages = ULONG_MAX;
@@ -3060,12 +3219,13 @@ static int pagemap_scan_writeback_args(struct pm_scan_arg *arg,
 	return 0;
 }
 
-static int pagemap_scan_init_bounce_buffer(struct pagemap_scan_private *p)
+static int pagemap_scan_init_bounce_buffer(struct mm_struct *mm,
+					   struct pagemap_scan_private *p)
 {
 	if (!p->arg.vec_len)
 		return 0;
 
-	p->vec_buf_len = min_t(size_t, PAGEMAP_WALK_SIZE >> PAGE_SHIFT,
+	p->vec_buf_len = min_t(size_t, pmd_size_mm(mm) >> mm_page_shift(mm),
 			       p->arg.vec_len);
 	p->vec_buf = kmalloc_objs(*p->vec_buf, p->vec_buf_len);
 	if (!p->vec_buf)
@@ -3106,18 +3266,18 @@ static long pagemap_scan_flush_buffer(struct pagemap_scan_private *p)
 
 static long do_pagemap_scan(struct mm_struct *mm, unsigned long uarg)
 {
-	struct pagemap_scan_private p = {0};
+	struct pagemap_scan_private p = { .page_size = mm_page_size(mm) };
 	unsigned long walk_start;
 	size_t n_ranges_out = 0;
 	int ret;
 
-	ret = pagemap_scan_get_args(&p.arg, uarg);
+	ret = pagemap_scan_get_args(mm, &p.arg, uarg);
 	if (ret)
 		return ret;
 
 	p.masks_of_interest = p.arg.category_mask | p.arg.category_anyof_mask |
 			      p.arg.return_mask;
-	ret = pagemap_scan_init_bounce_buffer(&p);
+	ret = pagemap_scan_init_bounce_buffer(mm, &p);
 	if (ret)
 		return ret;
 
@@ -3219,16 +3379,17 @@ struct numa_maps_private {
 	struct numa_maps md;
 };
 
+static int numa_page_mapcount(struct page *page)
+{
+	if (IS_ENABLED(CONFIG_PAGE_MAPCOUNT))
+		return folio_precise_page_mapcount(page_folio(page), page);
+	return folio_average_page_mapcount(page_folio(page));
+}
+
 static void gather_stats(struct page *page, struct numa_maps *md, int pte_dirty,
-			unsigned long nr_pages)
+			unsigned long nr_pages, int count)
 {
 	struct folio *folio = page_folio(page);
-	int count;
-
-	if (IS_ENABLED(CONFIG_PAGE_MAPCOUNT))
-		count = folio_precise_page_mapcount(folio, page);
-	else
-		count = folio_average_page_mapcount(folio);
 
 	md->pages += nr_pages;
 	if (pte_dirty || folio_test_dirty(folio))
@@ -3318,7 +3479,7 @@ static int gather_pte_stats(pmd_t *pmd, unsigned long addr,
 		page = can_gather_numa_stats_pmd(*pmd, vma, addr);
 		if (page)
 			gather_stats(page, md, pmd_dirty(*pmd),
-				     HPAGE_PMD_SIZE/PAGE_SIZE);
+				     HPAGE_PMD_SIZE/PAGE_SIZE, numa_page_mapcount(page));
 		spin_unlock(ptl);
 		return 0;
 	}
@@ -3333,9 +3494,13 @@ static int gather_pte_stats(pmd_t *pmd, unsigned long addr,
 		struct page *page = can_gather_numa_stats(ptent, vma, addr);
 		if (!page)
 			continue;
-		gather_stats(page, md, pte_dirty(ptent), 1);
+#ifdef CONFIG_MM_SUBPAGE
+		gather_stats(page, md, pte_dirty(ptent), 1, proc_leaf_mapcount(vma, ptent, page));
+#else
+		gather_stats(page, md, pte_dirty(ptent), 1, numa_page_mapcount(page));
+#endif
 
-	} while (pte++, addr += PAGE_SIZE, addr != end);
+	} while (pte++, addr += mm_page_size(vma->vm_mm), addr != end);
 	pte_unmap_unlock(orig_pte, ptl);
 	cond_resched();
 	return 0;
@@ -3357,7 +3522,7 @@ static int gather_hugetlb_stats(pte_t *pte, unsigned long hmask,
 	page = pte_page(huge_pte);
 
 	md = walk->private;
-	gather_stats(page, md, pte_dirty(huge_pte), 1);
+	gather_stats(page, md, pte_dirty(huge_pte), 1, numa_page_mapcount(page));
 out:
 	spin_unlock(ptl);
 	return 0;

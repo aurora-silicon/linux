@@ -40,6 +40,10 @@ struct anon_vma {
 	 * anon_vma if they are the last user on release
 	 */
 	atomic_t refcount;
+#ifdef CONFIG_MM_SUBPAGE
+	/* Immutable base-page requirement shared by this anonymous lineage. */
+	unsigned int min_folio_order;
+#endif
 
 	/*
 	 * Count of child anon_vmas. Equals to the count of all anon_vmas that
@@ -398,29 +402,40 @@ static __always_inline void __folio_rmap_sanity_checks(const struct folio *folio
 }
 
 /*
- * rmap interfaces called when adding or removing pte of page
+ * Single-PTE interfaces cover the complete native-page span of a user leaf.
+ * Multi-page interfaces below retain explicit native physical-page counts.
  */
 void folio_move_anon_rmap(struct folio *, struct vm_area_struct *);
 void folio_add_anon_rmap_ptes(struct folio *, struct page *, int nr_pages,
 		struct vm_area_struct *, unsigned long address, rmap_t flags);
-#define folio_add_anon_rmap_pte(folio, page, vma, address, flags) \
-	folio_add_anon_rmap_ptes(folio, page, 1, vma, address, flags)
+static inline void folio_add_anon_rmap_pte(struct folio *folio, struct page *page,
+		struct vm_area_struct *vma, unsigned long address, rmap_t flags)
+{
+	folio_add_anon_rmap_ptes(folio, page, mm_pte_native_pages(vma->vm_mm),
+			       vma, address, flags);
+}
 void folio_add_anon_rmap_pmd(struct folio *, struct page *,
 		struct vm_area_struct *, unsigned long address, rmap_t flags);
 void folio_add_new_anon_rmap(struct folio *, struct vm_area_struct *,
 		unsigned long address, rmap_t flags);
 void folio_add_file_rmap_ptes(struct folio *, struct page *, int nr_pages,
 		struct vm_area_struct *);
-#define folio_add_file_rmap_pte(folio, page, vma) \
-	folio_add_file_rmap_ptes(folio, page, 1, vma)
+static inline void folio_add_file_rmap_pte(struct folio *folio, struct page *page,
+		struct vm_area_struct *vma)
+{
+	folio_add_file_rmap_ptes(folio, page, mm_pte_native_pages(vma->vm_mm), vma);
+}
 void folio_add_file_rmap_pmd(struct folio *, struct page *,
 		struct vm_area_struct *);
 void folio_add_file_rmap_pud(struct folio *, struct page *,
 		struct vm_area_struct *);
 void folio_remove_rmap_ptes(struct folio *, struct page *, int nr_pages,
 		struct vm_area_struct *);
-#define folio_remove_rmap_pte(folio, page, vma) \
-	folio_remove_rmap_ptes(folio, page, 1, vma)
+static inline void folio_remove_rmap_pte(struct folio *folio, struct page *page,
+		struct vm_area_struct *vma)
+{
+	folio_remove_rmap_ptes(folio, page, mm_pte_native_pages(vma->vm_mm), vma);
+}
 void folio_remove_rmap_pmd(struct folio *, struct page *,
 		struct vm_area_struct *);
 void folio_remove_rmap_pud(struct folio *, struct page *,
@@ -541,7 +556,8 @@ static inline void folio_dup_file_rmap_ptes(struct folio *folio,
 static __always_inline void folio_dup_file_rmap_pte(struct folio *folio,
 		struct page *page, struct vm_area_struct *dst_vma)
 {
-	__folio_dup_file_rmap(folio, page, 1, dst_vma, PGTABLE_LEVEL_PTE);
+	__folio_dup_file_rmap(folio, page, mm_pte_native_pages(dst_vma->vm_mm),
+			      dst_vma, PGTABLE_LEVEL_PTE);
 }
 
 /**
@@ -665,8 +681,8 @@ static __always_inline int folio_try_dup_anon_rmap_pte(struct folio *folio,
 		struct page *page, struct vm_area_struct *dst_vma,
 		struct vm_area_struct *src_vma)
 {
-	return __folio_try_dup_anon_rmap(folio, page, 1, dst_vma, src_vma,
-					 PGTABLE_LEVEL_PTE);
+	return __folio_try_dup_anon_rmap(folio, page, mm_pte_native_pages(src_vma->vm_mm),
+					 dst_vma, src_vma, PGTABLE_LEVEL_PTE);
 }
 
 /**
@@ -708,13 +724,16 @@ static inline int folio_try_dup_anon_rmap_pmd(struct folio *folio,
 static __always_inline int __folio_try_share_anon_rmap(struct folio *folio,
 		struct page *page, int nr_pages, enum pgtable_level level)
 {
+	int i, exclusive_pages = level == PGTABLE_LEVEL_PTE ? nr_pages : 1;
+
 	VM_WARN_ON_FOLIO(!folio_test_anon(folio), folio);
 	VM_WARN_ON_FOLIO(!PageAnonExclusive(page), folio);
 	__folio_rmap_sanity_checks(folio, page, nr_pages, level);
 
 	/* device private folios cannot get pinned via GUP. */
 	if (unlikely(folio_is_device_private(folio))) {
-		ClearPageAnonExclusive(page);
+		for (i = 0; i < exclusive_pages; i++)
+			ClearPageAnonExclusive(page + i);
 		return 0;
 	}
 
@@ -766,7 +785,8 @@ static __always_inline int __folio_try_share_anon_rmap(struct folio *folio,
 
 	if (unlikely(folio_maybe_dma_pinned(folio)))
 		return -EBUSY;
-	ClearPageAnonExclusive(page);
+	for (i = 0; i < exclusive_pages; i++)
+		ClearPageAnonExclusive(page + i);
 
 	/*
 	 * This is conceptually a smp_wmb() paired with the smp_rmb() in
@@ -782,7 +802,8 @@ static __always_inline int __folio_try_share_anon_rmap(struct folio *folio,
  *				   mapped by a PTE possibly shared to prepare
  *				   for KSM or temporary unmapping
  * @folio:	The folio to share a mapping of
- * @page:	The mapped exclusive page
+ * @page:	The first native page covered by the exclusive user PTE
+ * @vma:	The VMA defining the base user PTE granule
  *
  * The caller needs to hold the page table lock and has to have the page table
  * entries cleared/invalidated.
@@ -799,9 +820,10 @@ static __always_inline int __folio_try_share_anon_rmap(struct folio *folio,
  * -EBUSY otherwise.
  */
 static inline int folio_try_share_anon_rmap_pte(struct folio *folio,
-		struct page *page)
+		struct page *page, struct vm_area_struct *vma)
 {
-	return __folio_try_share_anon_rmap(folio, page, 1, PGTABLE_LEVEL_PTE);
+	return __folio_try_share_anon_rmap(folio, page, mm_pte_native_pages(vma->vm_mm),
+					   PGTABLE_LEVEL_PTE);
 }
 
 /**
@@ -855,11 +877,22 @@ struct page *make_device_exclusive(struct mm_struct *mm, unsigned long addr,
 #define PVMW_SYNC		(1 << 0)
 /* Look for migration entries rather than present PTEs */
 #define PVMW_MIGRATION		(1 << 1)
+/* Match one present subpage PTE at address, including its physical offset. */
+#define PVMW_SUBPAGE		(1 << 2)
 
 /* Result flags */
 
 /* The page is mapped across page table boundary */
 #define PVMW_PGTABLE_CROSSED	(1 << 16)
+
+/* One reverse-map callback, optionally restricted to one physical user leaf. */
+struct rmap_walk_range {
+	unsigned long address;
+#ifdef CONFIG_MM_SUBPAGE
+	unsigned int subpage_offset;
+	bool subpage;
+#endif
+};
 
 struct page_vma_mapped_walk {
 	unsigned long pfn;
@@ -871,6 +904,10 @@ struct page_vma_mapped_walk {
 	pte_t *pte;
 	spinlock_t *ptl;
 	unsigned int flags;
+#ifdef CONFIG_MM_SUBPAGE
+	/* PVMW_SUBPAGE: byte offset within pfn; nr_pages must be one. */
+	unsigned int subpage_offset;
+#endif
 };
 
 #define DEFINE_FOLIO_VMA_WALK(name, _folio, _vma, _address, _flags)	\
@@ -882,6 +919,32 @@ struct page_vma_mapped_walk {
 		.address = _address,					\
 		.flags = _flags,					\
 	}
+
+static inline struct page_vma_mapped_walk folio_rmap_walk_init(
+		struct folio *folio, struct vm_area_struct *vma,
+		struct rmap_walk_range range, unsigned int flags)
+{
+	struct page_vma_mapped_walk walk = {
+		.pfn = folio_pfn(folio),
+		.nr_pages = folio_nr_pages(folio),
+		.pgoff = folio_pgoff(folio),
+		.vma = vma,
+		.address = range.address,
+		.flags = flags,
+	};
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (range.subpage) {
+		walk.flags |= PVMW_SUBPAGE;
+		walk.subpage_offset = range.subpage_offset;
+	}
+#endif
+	return walk;
+}
+
+#define DEFINE_FOLIO_RMAP_WALK(name, _folio, _vma, _range, _flags) \
+	struct page_vma_mapped_walk name = \
+		folio_rmap_walk_init(_folio, _vma, _range, _flags)
 
 static inline void page_vma_mapped_walk_done(struct page_vma_mapped_walk *pvmw)
 {
@@ -943,7 +1006,7 @@ void remove_migration_ptes(struct folio *src, struct folio *dst,
  * arg: passed to rmap_one() and invalid_vma()
  * try_lock: bail out if the rmap lock is contended
  * contended: indicate the rmap traversal bailed out due to lock contention
- * rmap_one: executed on each vma where page is mapped
+ * rmap_one: executed for each mapped VMA range (possibly one user leaf)
  * done: for checking traversing termination condition
  * anon_lock: for getting anon_lock by optimized way rather than default
  * invalid_vma: for skipping uninterested vma
@@ -957,7 +1020,7 @@ struct rmap_walk_control {
 	 * Otherwise, return true.
 	 */
 	bool (*rmap_one)(struct folio *folio, struct vm_area_struct *vma,
-					unsigned long addr, void *arg);
+					struct rmap_walk_range range, void *arg);
 	int (*done)(struct folio *folio);
 	struct anon_vma *(*anon_lock)(const struct folio *folio,
 				      struct rmap_walk_control *rwc);
@@ -966,6 +1029,15 @@ struct rmap_walk_control {
 
 void rmap_walk(struct folio *folio, struct rmap_walk_control *rwc);
 void rmap_walk_locked(struct folio *folio, struct rmap_walk_control *rwc);
+#ifdef CONFIG_MM_SUBPAGE
+unsigned int folio_anon_min_order(struct folio *folio);
+#else
+static inline unsigned int folio_anon_min_order(struct folio *folio)
+{
+	return 0;
+}
+#endif
+
 struct anon_vma *folio_lock_anon_vma_read(const struct folio *folio,
 					  struct rmap_walk_control *rwc);
 

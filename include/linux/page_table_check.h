@@ -12,6 +12,10 @@
 
 extern struct static_key_true page_table_check_disabled;
 extern struct page_ext_operations page_table_check_ops;
+#if IS_ENABLED(CONFIG_KUNIT)
+int page_table_check_get_counts(struct page *page, unsigned int offset,
+			       int *anon, int *file);
+#endif
 
 void __page_table_check_zero(struct page *page, unsigned int order);
 void __page_table_check_pte_clear(struct mm_struct *mm, unsigned long addr,

@@ -12,6 +12,9 @@
 #include <linux/rmap.h>
 #include <linux/pgalloc.h>
 #include <linux/hugetlb.h>
+#include <linux/mm_subpage.h>
+
+#include "user-subpage-internal.h"
 
 #include <asm/tlb.h>
 
@@ -100,6 +103,49 @@ void tlb_flush_rmaps(struct mmu_gather *tlb, struct vm_area_struct *vma)
  */
 #define MAX_NR_FOLIOS_PER_FREE		512
 
+#ifdef CONFIG_MM_SUBPAGE
+/* Private to gather batches: never pass this token to encoded_page_ptr(). */
+#define TLB_SUBPAGE_TAG BIT(2)
+
+static void tlb_free_pages_and_subpages(struct encoded_page **pages, unsigned int nr)
+{
+	unsigned int start = 0, i = 0;
+
+	while (i < nr) {
+		unsigned long token = (unsigned long)pages[i];
+
+		if (token & TLB_SUBPAGE_TAG) {
+			if (i != start)
+				free_pages_and_swap_cache(pages + start, i - start);
+			mm_subpage_put((struct mm_subpage *)(token & ~TLB_SUBPAGE_TAG));
+			start = ++i;
+		} else {
+			/* The count payload is not a pointer and may have bit 2 set. */
+			i += encoded_page_flags(pages[i]) & ENCODED_PAGE_BIT_NR_PAGES_NEXT ? 2 : 1;
+		}
+	}
+	if (i != start)
+		free_pages_and_swap_cache(pages + start, i - start);
+}
+
+bool __tlb_remove_subpage(struct mmu_gather *tlb, struct mm_subpage *subpage)
+{
+	struct mmu_gather_batch *batch = tlb->active;
+
+	BUILD_BUG_ON(__alignof__(struct page) < 8);
+	BUILD_BUG_ON(__alignof__(struct mm_subpage) < 8);
+	BUILD_BUG_ON(TLB_SUBPAGE_TAG & ENCODED_PAGE_BITS);
+	VM_BUG_ON(!tlb->end);
+	VM_BUG_ON(mm_page_shift(tlb->mm) != mm_subpage_shift(subpage));
+	batch->encoded_pages[batch->nr++] =
+		(struct encoded_page *)((unsigned long)subpage | TLB_SUBPAGE_TAG);
+	/* Keep room for a following native page/count pair. */
+	return batch->nr >= batch->max - 1 && !tlb_next_batch(tlb);
+}
+#else
+#define tlb_free_pages_and_subpages free_pages_and_swap_cache
+#endif
+
 static void __tlb_batch_free_encoded_pages(struct mmu_gather_batch *batch)
 {
 	struct encoded_page **pages = batch->encoded_pages;
@@ -135,7 +181,7 @@ static void __tlb_batch_free_encoded_pages(struct mmu_gather_batch *batch)
 			}
 		}
 
-		free_pages_and_swap_cache(pages, nr);
+		tlb_free_pages_and_subpages(pages, nr);
 		pages += nr;
 		batch->nr -= nr;
 
@@ -174,7 +220,15 @@ static bool __tlb_remove_folio_pages_size(struct mmu_gather *tlb,
 
 #ifdef CONFIG_MMU_GATHER_PAGE_SIZE
 	VM_WARN_ON(tlb->page_size != page_size);
-	VM_WARN_ON_ONCE(nr_pages != 1 && page_size != PAGE_SIZE);
+	if (page_size > PAGE_SIZE && page_size == mm_page_size(tlb->mm)) {
+		/* A coarse base PTE owns one reference per covered native page. */
+		unsigned long span = mm_pte_native_pages(tlb->mm);
+
+		VM_WARN_ON_ONCE(!nr_pages || nr_pages % span ||
+				!IS_ALIGNED(page_to_pfn(page), span));
+	} else {
+		VM_WARN_ON_ONCE(nr_pages != 1 && page_size != PAGE_SIZE);
+	}
 	VM_WARN_ON_ONCE(page_folio(page) != page_folio(page + nr_pages - 1));
 #endif
 
@@ -208,7 +262,7 @@ bool __tlb_remove_folio_pages(struct mmu_gather *tlb, struct page *page,
 		unsigned int nr_pages, bool delay_rmap)
 {
 	return __tlb_remove_folio_pages_size(tlb, page, nr_pages, delay_rmap,
-					     PAGE_SIZE);
+					     mm_page_size(tlb->mm));
 }
 
 bool __tlb_remove_page_size(struct mmu_gather *tlb, struct page *page, int page_size)
@@ -351,6 +405,13 @@ static inline void __tlb_remove_table_one_rcu(struct rcu_head *head)
 static inline void __tlb_remove_table_one(void *table)
 {
 	struct ptdesc *ptdesc;
+
+	/* Preserve opaque architecture tokens through the RCU grace period. */
+	if (!tlb_table_is_ptdesc(table)) {
+		tlb_remove_table_sync_rcu();
+		__tlb_remove_table(table);
+		return;
+	}
 
 	ptdesc = table;
 	call_rcu(&ptdesc->pt_rcu_head, __tlb_remove_table_one_rcu);

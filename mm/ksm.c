@@ -804,6 +804,10 @@ static struct page *get_mergeable_page(struct ksm_rmap_item *rmap_item)
 	struct folio_walk fw;
 	struct folio *folio;
 
+	/* The KSM comparison and replacement paths still require native leaves. */
+	if (mm_page_size(mm) != PAGE_SIZE)
+		return NULL;
+
 	mmap_read_lock(mm);
 	vma = find_mergeable_vma(mm, addr);
 	if (!vma)
@@ -1338,7 +1342,7 @@ static int write_protect_page(struct vm_area_struct *vma, struct folio *folio,
 
 		/* See folio_try_share_anon_rmap_pte(): clear PTE first. */
 		if (anon_exclusive &&
-		    folio_try_share_anon_rmap_pte(folio, &folio->page)) {
+		    folio_try_share_anon_rmap_pte(folio, &folio->page, vma)) {
 			set_pte_at(mm, pvmw.address, pvmw.pte, entry);
 			goto out_unlock;
 		}
@@ -3206,7 +3210,8 @@ again:
 			if (rwc->invalid_vma && rwc->invalid_vma(vma, rwc->arg))
 				continue;
 
-			if (!rwc->rmap_one(folio, vma, addr, rwc->arg)) {
+			if (!rwc->rmap_one(folio, vma,
+				(struct rmap_walk_range) { .address = addr }, rwc->arg)) {
 				anon_vma_unlock_read(anon_vma);
 				return;
 			}

@@ -3462,6 +3462,46 @@ static void walk_update_folio(struct lru_gen_mm_walk *walk, struct folio *folio,
 	}
 }
 
+static unsigned long lru_pte_index(struct mm_struct *mm, unsigned long addr)
+{
+	if (mm_page_size(mm) == PAGE_SIZE)
+		return pte_index(addr);
+	return (addr >> mm_page_shift(mm)) & (pte_table_bytes_mm(mm) / sizeof(pte_t) - 1);
+}
+
+static unsigned long lru_pmd_index(struct mm_struct *mm, unsigned long addr)
+{
+	if (mm_page_size(mm) == PAGE_SIZE)
+		return pmd_index(addr);
+	return (addr >> pmd_shift_mm(mm)) & (pmd_table_bytes_mm(mm) / sizeof(pmd_t) - 1);
+}
+
+static unsigned long lru_pud_entries(struct mm_struct *mm)
+{
+	return mm_pud_folded(mm) ? 1 : pud_table_bytes_mm(mm) / sizeof(pud_t);
+}
+
+static unsigned long lru_pud_index(struct mm_struct *mm, unsigned long addr)
+{
+	if (mm_pud_folded(mm))
+		return 0;
+	if (mm_page_size(mm) == PAGE_SIZE)
+		return pud_index(addr);
+	return (addr >> pud_shift_mm(mm)) & (lru_pud_entries(mm) - 1);
+}
+
+static unsigned int lru_folio_pte_batch(struct vm_area_struct *vma,
+		struct folio *folio, pte_t *ptep, pte_t *entry, unsigned int max_nr)
+{
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(vma->vm_mm) != PAGE_SIZE)
+		return folio_subpage_pte_batch_flags(vma, folio, ptep, entry,
+						    max_nr, FPB_MERGE_YOUNG_DIRTY);
+#endif
+	return folio_pte_batch_flags(folio, NULL, ptep, entry, max_nr,
+				     FPB_MERGE_YOUNG_DIRTY);
+}
+
 static bool walk_pte_range(pmd_t *pmd, unsigned long start, unsigned long end,
 			   struct mm_walk *args)
 {
@@ -3481,7 +3521,7 @@ static bool walk_pte_range(pmd_t *pmd, unsigned long start, unsigned long end,
 	unsigned int nr;
 	pmd_t pmdval;
 
-	pte = pte_offset_map_rw_nolock(args->mm, pmd, start & PMD_MASK, &pmdval, &ptl);
+	pte = pte_offset_map_rw_nolock(args->mm, pmd, start & pmd_mask_mm(args->mm), &pmdval, &ptl);
 	if (!pte)
 		return false;
 
@@ -3497,7 +3537,7 @@ static bool walk_pte_range(pmd_t *pmd, unsigned long start, unsigned long end,
 
 	lazy_mmu_mode_enable();
 restart:
-	for (i = pte_index(start), addr = start; addr != end; i += nr, addr += nr * PAGE_SIZE) {
+	for (i = lru_pte_index(args->mm, start), addr = start; addr != end; i += nr, addr += nr * mm_page_size(args->mm)) {
 		unsigned long pfn;
 		struct folio *folio;
 		pte_t *cur_pte = pte + i;
@@ -3516,10 +3556,9 @@ restart:
 			continue;
 
 		if (folio_test_large(folio)) {
-			const unsigned int max_nr = (end - addr) >> PAGE_SHIFT;
+			const unsigned int max_nr = (end - addr) >> mm_page_shift(args->mm);
 
-			nr = folio_pte_batch_flags(folio, NULL, cur_pte, &ptent,
-						   max_nr, FPB_MERGE_YOUNG_DIRTY);
+			nr = lru_folio_pte_batch(args->vma, folio, cur_pte, &ptent, max_nr);
 			total += nr - 1;
 			walk->mm_stats[MM_LEAF_TOTAL] += nr - 1;
 		}
@@ -3544,7 +3583,8 @@ restart:
 	walk_update_folio(walk, last, gen, dirty);
 	last = NULL;
 
-	if (i < PTRS_PER_PTE && get_next_vma(PMD_MASK, PAGE_SIZE, args, &start, &end))
+	if (i < pte_table_bytes_mm(args->mm) / sizeof(pte_t) &&
+	    get_next_vma(pmd_mask_mm(args->mm), mm_page_size(args->mm), args, &start, &end))
 		goto restart;
 
 	lazy_mmu_mode_disable();
@@ -3576,13 +3616,13 @@ static void walk_pmd_range_locked(pud_t *pud, unsigned long addr, struct vm_area
 		return;
 	}
 
-	i = addr == -1 ? 0 : pmd_index(addr) - pmd_index(*first);
+	i = addr == -1 ? 0 : lru_pmd_index(args->mm, addr) - lru_pmd_index(args->mm, *first);
 	if (i && i <= MIN_LRU_BATCH) {
 		__set_bit(i - 1, bitmap);
 		return;
 	}
 
-	pmd = pmd_offset(pud, *first);
+	pmd = pmd_offset_mm(args->mm, pud, *first);
 
 	ptl = pmd_lockptr(args->mm, pmd);
 	if (!spin_trylock(ptl))
@@ -3595,7 +3635,7 @@ static void walk_pmd_range_locked(pud_t *pud, unsigned long addr, struct vm_area
 		struct folio *folio;
 
 		/* don't round down the first address */
-		addr = i ? (*first & PMD_MASK) + i * PMD_SIZE : *first;
+		addr = i ? (*first & pmd_mask_mm(args->mm)) + i * pmd_size_mm(args->mm) : *first;
 
 		if (!pmd_present(pmd[i]))
 			goto next;
@@ -3661,14 +3701,14 @@ static void walk_pmd_range(pud_t *pud, unsigned long start, unsigned long end,
 	 * tables to avoid taking the PMD lock; the second, if necessary, takes
 	 * the PMD lock to clear the accessed bit in PMD entries.
 	 */
-	pmd = pmd_offset(pud, start & PUD_MASK);
+	pmd = pmd_offset_mm(args->mm, pud, start & pud_mask_mm(args->mm));
 restart:
 	/* walk_pte_range() may call get_next_vma() */
 	vma = args->vma;
-	for (i = pmd_index(start), addr = start; addr != end; i++, addr = next) {
+	for (i = lru_pmd_index(args->mm, start), addr = start; addr != end; i++, addr = next) {
 		pmd_t val = pmdp_get_lockless(pmd + i);
 
-		next = pmd_addr_end(addr, end);
+		next = pmd_addr_end_mm(args->mm, addr, end);
 
 		if (!pmd_present(val) || is_huge_zero_pmd(val)) {
 			walk->mm_stats[MM_LEAF_TOTAL]++;
@@ -3710,7 +3750,8 @@ restart:
 
 	walk_pmd_range_locked(pud, -1, vma, args, bitmap, &first);
 
-	if (i < PTRS_PER_PMD && get_next_vma(PUD_MASK, PMD_SIZE, args, &start, &end))
+	if (i < pmd_table_bytes_mm(args->mm) / sizeof(pmd_t) &&
+	    get_next_vma(pud_mask_mm(args->mm), pmd_size_mm(args->mm), args, &start, &end))
 		goto restart;
 }
 
@@ -3725,12 +3766,12 @@ static int walk_pud_range(p4d_t *p4d, unsigned long start, unsigned long end,
 
 	VM_WARN_ON_ONCE(p4d_leaf(*p4d));
 
-	pud = pud_offset(p4d, start & P4D_MASK);
+	pud = pud_offset_mm(args->mm, p4d, start & p4d_mask_mm(args->mm));
 restart:
-	for (i = pud_index(start), addr = start; addr != end; i++, addr = next) {
+	for (i = lru_pud_index(args->mm, start), addr = start; addr != end; i++, addr = next) {
 		pud_t val = pudp_get(pud + i);
 
-		next = pud_addr_end(addr, end);
+		next = pud_addr_end_mm(args->mm, addr, end);
 
 		if (!pud_present(val) || WARN_ON_ONCE(pud_leaf(val)))
 			continue;
@@ -3738,15 +3779,16 @@ restart:
 		walk_pmd_range(&val, addr, next, args);
 
 		if (need_resched() || walk->batched >= MAX_LRU_BATCH) {
-			end = (addr | ~PUD_MASK) + 1;
+			end = (addr | ~pud_mask_mm(args->mm)) + 1;
 			goto done;
 		}
 	}
 
-	if (i < PTRS_PER_PUD && get_next_vma(P4D_MASK, PUD_SIZE, args, &start, &end))
+	if (i < lru_pud_entries(args->mm) &&
+	    get_next_vma(p4d_mask_mm(args->mm), pud_size_mm(args->mm), args, &start, &end))
 		goto restart;
 
-	end = round_up(end, P4D_SIZE);
+	end = round_up(end, p4d_size_mm(args->mm));
 done:
 	if (!end || !args->vma)
 		return 1;
@@ -4215,20 +4257,20 @@ bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw, unsigned int nr)
 	/* avoid taking the LRU lock under the PTL when possible */
 	walk = current->reclaim_state ? current->reclaim_state->mm_walk : NULL;
 
-	start = max(addr & PMD_MASK, vma->vm_start);
-	end = min(addr | ~PMD_MASK, vma->vm_end - 1) + 1;
+	start = max(addr & pmd_mask_mm(vma->vm_mm), vma->vm_start);
+	end = min(addr | ~pmd_mask_mm(vma->vm_mm), vma->vm_end - 1) + 1;
 
-	if (end - start == PAGE_SIZE)
+	if (end - start == mm_page_size(vma->vm_mm))
 		return true;
 
-	if (end - start > MIN_LRU_BATCH * PAGE_SIZE) {
-		if (addr - start < MIN_LRU_BATCH * PAGE_SIZE / 2)
-			end = start + MIN_LRU_BATCH * PAGE_SIZE;
-		else if (end - addr < MIN_LRU_BATCH * PAGE_SIZE / 2)
-			start = end - MIN_LRU_BATCH * PAGE_SIZE;
+	if (end - start > MIN_LRU_BATCH * mm_page_size(vma->vm_mm)) {
+		if (addr - start < MIN_LRU_BATCH * mm_page_size(vma->vm_mm) / 2)
+			end = start + MIN_LRU_BATCH * mm_page_size(vma->vm_mm);
+		else if (end - addr < MIN_LRU_BATCH * mm_page_size(vma->vm_mm) / 2)
+			start = end - MIN_LRU_BATCH * mm_page_size(vma->vm_mm);
 		else {
-			start = addr - MIN_LRU_BATCH * PAGE_SIZE / 2;
-			end = addr + MIN_LRU_BATCH * PAGE_SIZE / 2;
+			start = addr - MIN_LRU_BATCH * mm_page_size(vma->vm_mm) / 2;
+			end = addr + MIN_LRU_BATCH * mm_page_size(vma->vm_mm) / 2;
 		}
 	}
 
@@ -4240,10 +4282,10 @@ bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw, unsigned int nr)
 
 	lazy_mmu_mode_enable();
 
-	pte -= (addr - start) / PAGE_SIZE;
+	pte -= (addr - start) / mm_page_size(vma->vm_mm);
 
 	for (i = 0, addr = start; addr != end;
-	     i += nr, pte += nr, addr += nr * PAGE_SIZE) {
+	     i += nr, pte += nr, addr += nr * mm_page_size(vma->vm_mm)) {
 		unsigned long pfn;
 		pte_t ptent = ptep_get(pte);
 
@@ -4257,10 +4299,9 @@ bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw, unsigned int nr)
 			continue;
 
 		if (folio_test_large(folio)) {
-			const unsigned int max_nr = (end - addr) >> PAGE_SHIFT;
+			const unsigned int max_nr = (end - addr) >> mm_page_shift(vma->vm_mm);
 
-			nr = folio_pte_batch_flags(folio, NULL, pte, &ptent,
-						   max_nr, FPB_MERGE_YOUNG_DIRTY);
+			nr = lru_folio_pte_batch(vma, folio, pte, &ptent, max_nr);
 		}
 
 		if (!test_and_clear_young_ptes_notify(vma, addr, pte, nr))
@@ -4634,6 +4675,16 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
 			sc->nr.unqueued_dirty += delta;
 	}
 
+	/*
+	 * Legacy memcg reclaim relies on shrink_folio_list() waiting for
+	 * writeback when reclaim-marked folios cycle through the LRU. Moving
+	 * all of them to a younger generation can exhaust the charge limit
+	 * before I/O completes. Let the common path apply its GFP and mapping
+	 * deadlock checks instead of hiding those folios from it.
+	 */
+	if (writeback && !writeback_throttling_sane(sc))
+		return false;
+
 	/* waiting for writeback */
 	if (writeback || (type == LRU_GEN_FILE && dirty)) {
 		gen = folio_inc_gen(lruvec, folio, true);
@@ -4668,8 +4719,9 @@ static bool isolate_folio(struct lruvec *lruvec, struct folio *folio, struct sca
 	if (!folio_test_referenced(folio))
 		set_mask_bits(&folio->flags.f, LRU_REFS_MASK, 0);
 
-	/* for shrink_folio_list() */
-	folio_clear_reclaim(folio);
+	/* Preserve legacy memcg's repeated-writeback marker for shrink_folio_list(). */
+	if (writeback_throttling_sane(sc) || !folio_test_writeback(folio))
+		folio_clear_reclaim(folio);
 
 	success = lru_gen_del_folio(lruvec, folio, true);
 	VM_WARN_ON_ONCE_FOLIO(!success, folio);

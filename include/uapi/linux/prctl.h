@@ -416,4 +416,22 @@ struct prctl_mm_map {
 # define PR_CFI_DISABLE		_BITUL(1)
 # define PR_CFI_LOCK		_BITUL(2)
 
+/*
+ * Aurora experimental ABI: private numbers, not upstream assignments.
+ * SET_EXEC selects the calling thread's next successful exec granule.
+ * Zero requests native pages; with an alternative DEFAULT in effect this
+ * installs an explicit one-shot native override. GET_EXEC returns zero when
+ * no override remains, or its size in bytes. Successful exec consumes it.
+ * SET_DEFAULT selects the fallback for subsequent execs; zero restores native.
+ * GET_DEFAULT returns the alternative size in bytes, or zero for native.
+ * Fork inherits both policies; exec preserves DEFAULT. Failed exec preserves
+ * both. Neither setter changes the live address space or other threads.
+ * AArch32 always selects 4K when supported, otherwise the native granule,
+ * independently of these preferences. Sizes are capability-checked.
+ */
+#define PR_AURORA_SET_EXEC_PAGE_SIZE 0x41555001
+#define PR_AURORA_GET_EXEC_PAGE_SIZE 0x41555002
+#define PR_AURORA_SET_DEFAULT_PAGE_SIZE 0x41555003
+#define PR_AURORA_GET_DEFAULT_PAGE_SIZE 0x41555004
+
 #endif /* _LINUX_PRCTL_H */

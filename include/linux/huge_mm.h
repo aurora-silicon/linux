@@ -3,6 +3,7 @@
 #define _LINUX_HUGE_MM_H
 
 #include <linux/mm_types.h>
+#include <linux/mm_granule.h>
 
 #include <linux/fs.h> /* only for vma_is_dax() */
 #include <linux/kobject.h>
@@ -331,6 +332,9 @@ struct thpsize {
 static inline bool vma_thp_disabled(struct vm_area_struct *vma,
 		vm_flags_t vm_flags, bool forced_collapse)
 {
+	/* Native THP geometry and rmap cannot describe alternative user leaves. */
+	if (mm_page_size(vma->vm_mm) != PAGE_SIZE)
+		return true;
 	/* Are THPs disabled for this VMA? */
 	if (vm_flags & VM_NOHUGEPAGE)
 		return true;

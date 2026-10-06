@@ -301,6 +301,7 @@ static inline bool userfaultfd_must_wait(struct userfaultfd_ctx *ctx,
 	pmd_t *pmd, _pmd;
 	pte_t *pte;
 	pte_t ptent;
+	spinlock_t *ptl;
 	bool ret;
 
 	assert_fault_locked(vmf);
@@ -308,13 +309,13 @@ static inline bool userfaultfd_must_wait(struct userfaultfd_ctx *ctx,
 	pgd = pgd_offset(mm, address);
 	if (!pgd_present(*pgd))
 		return true;
-	p4d = p4d_offset(pgd, address);
-	if (!p4d_present(*p4d))
+	p4d = p4d_offset_mm(mm, pgd, address);
+	if (!p4d_present_mm(mm, *p4d))
 		return true;
-	pud = pud_offset(p4d, address);
+	pud = pud_offset_mm(mm, p4d, address);
 	if (!pud_present(*pud))
 		return true;
-	pmd = pmd_offset(pud, address);
+	pmd = pmd_offset_mm(mm, pud, address);
 again:
 	_pmd = pmdp_get_lockless(pmd);
 	if (pmd_none(_pmd))
@@ -331,7 +332,7 @@ again:
 	if (pmd_trans_huge(_pmd))
 		return !pmd_write(_pmd) && (reason & VM_UFFD_WP);
 
-	pte = pte_offset_map(pmd, address);
+	pte = pte_offset_map_ro_nolock(mm, pmd, address, &ptl);
 	if (!pte)
 		goto again;
 
@@ -1251,13 +1252,11 @@ static __always_inline void wake_userfault(struct userfaultfd_ctx *ctx,
 		__wake_userfault(ctx, range);
 }
 
-static __always_inline int validate_unaligned_range(
+static __always_inline int validate_byte_range(
 	struct mm_struct *mm, __u64 start, __u64 len)
 {
 	__u64 task_size = mm->task_size;
 
-	if (len & ~PAGE_MASK)
-		return -EINVAL;
 	if (!len)
 		return -EINVAL;
 	if (start >= task_size)
@@ -1269,10 +1268,19 @@ static __always_inline int validate_unaligned_range(
 	return 0;
 }
 
+static __always_inline int validate_unaligned_range(
+	struct mm_struct *mm, __u64 start, __u64 len)
+{
+	if (len & ~mm_page_mask(mm))
+		return -EINVAL;
+
+	return validate_byte_range(mm, start, len);
+}
+
 static __always_inline int validate_range(struct mm_struct *mm,
 					  __u64 start, __u64 len)
 {
-	if (start & ~PAGE_MASK)
+	if (start & ~mm_page_mask(mm))
 		return -EINVAL;
 
 	return validate_unaligned_range(mm, start, len);
@@ -1428,6 +1436,13 @@ out_unlock:
 
 		ioctls_out = basic_ioctls ? UFFD_API_RANGE_IOCTLS_BASIC :
 		    UFFD_API_RANGE_IOCTLS;
+		if (mm_page_size(mm) != PAGE_SIZE) {
+			ioctls_out &= (1ULL << _UFFDIO_WAKE) | (1ULL << _UFFDIO_WRITEPROTECT) |
+				      (1ULL << _UFFDIO_CONTINUE) | (1ULL << _UFFDIO_COPY) |
+				      (1ULL << _UFFDIO_ZEROPAGE) | (1ULL << _UFFDIO_POISON);
+		}
+		if (mm_page_size(mm) < PAGE_SIZE)
+			ioctls_out |= 1ULL << _UFFDIO_MOVE;
 
 		/*
 		 * Declare the WP ioctl only if the WP mode is
@@ -1645,8 +1660,12 @@ static int userfaultfd_copy(struct userfaultfd_ctx *ctx,
 			   sizeof(uffdio_copy)-sizeof(__s64)))
 		goto out;
 
-	ret = validate_unaligned_range(ctx->mm, uffdio_copy.src,
-				       uffdio_copy.len);
+	/*
+	 * COPY reads the pager's address space, which can have a different
+	 * task size and granule from the registered target. Only the target
+	 * range below requires a page-aligned length.
+	 */
+	ret = validate_byte_range(current->mm, uffdio_copy.src, uffdio_copy.len);
 	if (ret)
 		goto out;
 	ret = validate_range(ctx->mm, uffdio_copy.dst, uffdio_copy.len);
@@ -2015,6 +2034,18 @@ static int userfaultfd_api(struct userfaultfd_ctx *ctx,
 
 	/* report all available features and ioctls to userland */
 	uffdio_api.features = UFFD_API_FEATURES;
+	/* Base-page anonymous and shared shmem operations support alternative leaves. */
+	if (mm_page_size(ctx->mm) != PAGE_SIZE)
+		uffdio_api.features &= UFFD_FEATURE_PAGEFAULT_FLAG_WP |
+			UFFD_FEATURE_MISSING_SHMEM | UFFD_FEATURE_MINOR_SHMEM |
+			UFFD_FEATURE_EVENT_FORK | UFFD_FEATURE_EVENT_REMAP |
+			UFFD_FEATURE_EVENT_REMOVE | UFFD_FEATURE_EVENT_UNMAP |
+			UFFD_FEATURE_SIGBUS | UFFD_FEATURE_THREAD_ID | UFFD_FEATURE_EXACT_ADDRESS |
+			UFFD_FEATURE_WP_UNPOPULATED | UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_POISON;
+
+	if (mm_page_size(ctx->mm) < PAGE_SIZE)
+		uffdio_api.features |= UFFD_FEATURE_MOVE;
+
 #ifndef CONFIG_HAVE_ARCH_USERFAULTFD_MINOR
 	uffdio_api.features &=
 		~(UFFD_FEATURE_MINOR_HUGETLBFS | UFFD_FEATURE_MINOR_SHMEM);
@@ -2061,6 +2092,10 @@ static long userfaultfd_ioctl(struct file *file, unsigned cmd,
 
 	if (cmd != UFFDIO_API && !userfaultfd_is_initialized(ctx))
 		return -EINVAL;
+
+	/* Larger-than-native MOVE still requires contiguous-owner support. */
+	if (cmd == UFFDIO_MOVE && mm_page_size(ctx->mm) > PAGE_SIZE)
+		return -EOPNOTSUPP;
 
 	switch(cmd) {
 	case UFFDIO_API:

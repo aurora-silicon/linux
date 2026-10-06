@@ -926,13 +926,15 @@ static int is_call_insn(uprobe_opcode_t *insn)
  * Verification callback used by int3_update uprobe_write calls to make sure
  * the underlying instruction is as expected - either int3 or call.
  */
-static int verify_insn(struct page *page, unsigned long vaddr, uprobe_opcode_t *new_opcode,
+static int verify_insn(struct page *page, unsigned long vaddr, unsigned int page_offset,
+		       uprobe_opcode_t *new_opcode,
 		       int nbytes, void *data)
 {
 	struct write_opcode_ctx *ctx = data;
 	uprobe_opcode_t old_opcode[5];
 
-	uprobe_copy_from_page(page, ctx->base, (uprobe_opcode_t *) &old_opcode, 5);
+	uprobe_copy_from_page(page, page_offset - (vaddr - ctx->base),
+			      (uprobe_opcode_t *) &old_opcode, 5);
 
 	switch (ctx->expect) {
 	case EXPECT_SWBP:

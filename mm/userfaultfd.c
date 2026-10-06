@@ -16,10 +16,19 @@
 #include <linux/hugetlb.h>
 #include <linux/file.h>
 #include <linux/cleanup.h>
+#include <linux/mm_subpage.h>
+#include <linux/shmem_fs.h>
 #include <asm/tlbflush.h>
 #include <asm/tlb.h>
 #include "internal.h"
 #include "swap.h"
+#ifdef CONFIG_MM_SUBPAGE
+#include "user-subpage-internal.h"
+#endif
+
+struct mfill_shared_data {
+	struct folio *source; /* NULL requests a zero-fill. */
+};
 
 struct mfill_state {
 	struct userfaultfd_ctx *ctx;
@@ -32,6 +41,10 @@ struct mfill_state {
 	unsigned long src_addr;
 	unsigned long dst_addr;
 	pmd_t *pmd;
+	struct folio *copy_buffer;
+#ifdef CONFIG_MM_SUBPAGE
+	struct mm_subpage *slots[MM_SUBPAGES_PER_PAGE];
+#endif
 };
 
 static bool anon_can_userfault(struct vm_area_struct *vma, vm_flags_t vm_flags)
@@ -194,8 +207,24 @@ static void uffd_mfill_unlock(struct vm_area_struct *vma)
 }
 #endif
 
+/* Reservations keep the uninstalled leaves private to this operation. */
+static void mfill_free_subpages(struct mfill_state *state)
+{
+#ifdef CONFIG_MM_SUBPAGE
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(state->slots); i++) {
+		if (state->slots[i]) {
+			mm_subpage_put(state->slots[i]);
+			state->slots[i] = NULL;
+		}
+	}
+#endif
+}
+
 static void mfill_put_vma(struct mfill_state *state)
 {
+	mfill_free_subpages(state);
 	if (!state->vma)
 		return;
 
@@ -247,6 +276,7 @@ static int mfill_get_vma(struct mfill_state *state)
 	 */
 	if ((flags & MFILL_ATOMIC_WP) && !(dst_vma->vm_flags & VM_UFFD_WP))
 		goto out_unlock;
+
 
 	if (is_vm_hugetlb_page(dst_vma))
 		return 0;
@@ -320,16 +350,11 @@ static int mfill_establish_pmd(struct mfill_state *state)
 static bool mfill_file_over_size(struct vm_area_struct *dst_vma,
 				 unsigned long dst_addr)
 {
-	struct inode *inode;
-	pgoff_t offset, max_off;
-
 	if (!dst_vma->vm_file)
 		return false;
 
-	inode = dst_vma->vm_file->f_inode;
-	offset = linear_page_index(dst_vma, dst_addr);
-	max_off = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
-	return offset >= max_off;
+	return !vma_file_offset_valid(dst_vma, dst_addr,
+				     i_size_read(file_inode(dst_vma->vm_file)));
 }
 
 /*
@@ -341,7 +366,8 @@ static bool mfill_file_over_size(struct vm_area_struct *dst_vma,
 static int mfill_atomic_install_pte(pmd_t *dst_pmd,
 				    struct vm_area_struct *dst_vma,
 				    unsigned long dst_addr, struct page *page,
-				    uffd_flags_t flags)
+				    uffd_flags_t flags,
+				    const struct mfill_shared_data *shared_data)
 {
 	int ret;
 	struct mm_struct *dst_mm = dst_vma->vm_mm;
@@ -354,6 +380,11 @@ static int mfill_atomic_install_pte(pmd_t *dst_pmd,
 	pte_t dst_ptep;
 
 	_dst_pte = mk_pte(page, dst_vma->vm_page_prot);
+#ifdef CONFIG_MM_SUBPAGE
+	if (page_in_cache && mm_page_size(dst_mm) < PAGE_SIZE)
+		_dst_pte = phys_pte_mm(dst_mm, page_to_phys(page) +
+			vma_page_offset_at(dst_vma, dst_addr).offset, dst_vma->vm_page_prot);
+#endif
 	_dst_pte = pte_mkdirty(_dst_pte);
 	if (page_in_cache && !vm_shared)
 		writable = false;
@@ -384,7 +415,39 @@ static int mfill_atomic_install_pte(pmd_t *dst_pmd,
 	if (!pte_none(dst_ptep) && !pte_is_uffd_marker(dst_ptep))
 		goto out_unlock;
 
+#if defined(CONFIG_MM_SUBPAGE) && defined(CONFIG_SHMEM)
+	if (shared_data) {
+		struct vm_page_offset pos = vma_page_offset_at(dst_vma, dst_addr);
+		unsigned long offset = ((pos.index - folio->index) << PAGE_SHIFT) + pos.offset;
+		unsigned long size = mm_page_size(dst_mm);
+		void *dst, *src;
+
+		if (PageHWPoison(page)) {
+			ret = -EIO;
+			goto out_unlock;
+		}
+		if (!shmem_uffd_range_missing(folio, pos.index, pos.offset, size))
+			goto out_unlock;
+		dst = kmap_local_folio(folio, offset);
+		if (shared_data->source) {
+			src = kmap_local_folio(shared_data->source, 0);
+			memcpy(dst, src, size);
+			kunmap_local(src);
+		} else {
+			memset(dst, 0, size);
+		}
+		kunmap_local(dst);
+		flush_dcache_folio(folio);
+		__folio_mark_uptodate(folio);
+		folio_mark_dirty(folio);
+	}
+#endif
+
 	if (page_in_cache) {
+		mm_subpage_file_map_add(dst_vma, pte_phys_mm(dst_mm, _dst_pte));
+		shmem_uffd_mark_mapped(folio,
+			(folio_page_idx(folio, page) << PAGE_SHIFT) +
+			vma_page_offset_at(dst_vma, dst_addr).offset, mm_page_size(dst_mm));
 		folio_add_file_rmap_pte(folio, page, dst_vma);
 	} else {
 		folio_add_new_anon_rmap(folio, dst_vma, dst_addr, RMAP_EXCLUSIVE);
@@ -411,12 +474,13 @@ out:
 	return ret;
 }
 
-static int mfill_copy_folio_locked(struct folio *folio, unsigned long src_addr)
+static int mfill_copy_folio_locked(struct folio *folio, unsigned long src_addr,
+				   unsigned int offset, unsigned long len)
 {
 	void *kaddr;
 	int ret;
 
-	kaddr = kmap_local_folio(folio, 0);
+	kaddr = kmap_local_folio(folio, offset);
 	/*
 	 * The read mmap_lock is held here.  Despite the
 	 * mmap_lock being read recursive a deadlock is still
@@ -433,8 +497,7 @@ static int mfill_copy_folio_locked(struct folio *folio, unsigned long src_addr)
 	 * and retry the copy outside the mmap_lock.
 	 */
 	pagefault_disable();
-	ret = copy_from_user(kaddr, (const void __user *) src_addr,
-			     PAGE_SIZE);
+	ret = copy_from_user(kaddr, (const void __user *)src_addr, len);
 	pagefault_enable();
 	kunmap_local(kaddr);
 
@@ -507,8 +570,11 @@ DEFINE_FREE(retry_put, struct mfill_retry_state *,
 	    if (_T) mfill_retry_state_put(_T));
 
 static int mfill_copy_folio_retry(struct mfill_state *mfill_state,
-				  struct folio *folio)
+				  struct folio *folio, unsigned int offset,
+				  unsigned long len)
 {
+	struct vm_page_offset pos = vma_page_offset_at(mfill_state->vma,
+						    mfill_state->dst_addr);
 	struct mfill_retry_state retry_state = { 0 };
 	struct mfill_retry_state *for_free __free(retry_put) = &retry_state;
 	unsigned long src_addr = mfill_state->src_addr;
@@ -520,8 +586,8 @@ static int mfill_copy_folio_retry(struct mfill_state *mfill_state,
 	/* retry copying with mm_lock dropped */
 	mfill_put_vma(mfill_state);
 
-	kaddr = kmap_local_folio(folio, 0);
-	err = copy_from_user(kaddr, (const void __user *) src_addr, PAGE_SIZE);
+	kaddr = kmap_local_folio(folio, offset);
+	err = copy_from_user(kaddr, (const void __user *) src_addr, len);
 	kunmap_local(kaddr);
 	if (unlikely(err))
 		return -EFAULT;
@@ -533,7 +599,10 @@ static int mfill_copy_folio_retry(struct mfill_state *mfill_state,
 	if (err)
 		return err;
 
-	if (mfill_retry_state_changed(&retry_state, mfill_state->vma))
+	if (mfill_retry_state_changed(&retry_state, mfill_state->vma) ||
+	    (mm_page_size(mfill_state->ctx->mm) < PAGE_SIZE &&
+	     !vm_page_offset_equal(pos, vma_page_offset_at(mfill_state->vma,
+							 mfill_state->dst_addr))))
 		return -EAGAIN;
 
 	err = mfill_establish_pmd(mfill_state);
@@ -542,6 +611,28 @@ static int mfill_copy_folio_retry(struct mfill_state *mfill_state,
 
 	return 0;
 }
+
+#if defined(CONFIG_MM_SUBPAGE) && defined(CONFIG_SHMEM)
+/* Fill one missing leaf in new or retained shmem backing using staged data. */
+static int mfill_atomic_shmem_hole(struct mfill_state *state,
+				   const struct mfill_shared_data *data)
+{
+	struct vm_page_offset pos;
+	struct folio *folio;
+	bool new;
+	int err;
+
+	folio = shmem_uffd_prepare_folio(state->vma, state->dst_addr, &new);
+	if (IS_ERR(folio))
+		return PTR_ERR(folio);
+	pos = vma_page_offset_at(state->vma, state->dst_addr);
+	err = mfill_atomic_install_pte(state->pmd, state->vma, state->dst_addr,
+		folio_file_page(folio, pos.index), state->flags, data);
+	if (err)
+		shmem_uffd_abort_folio(folio, state->vma, new);
+	return err;
+}
+#endif
 
 static int __mfill_atomic_pte(struct mfill_state *state,
 			      const struct vm_uffd_ops *ops)
@@ -562,7 +653,7 @@ static int __mfill_atomic_pte(struct mfill_state *state,
 		return -ENOMEM;
 
 	if (uffd_flags_mode_is(flags, MFILL_ATOMIC_COPY)) {
-		ret = mfill_copy_folio_locked(folio, src_addr);
+		ret = mfill_copy_folio_locked(folio, src_addr, 0, PAGE_SIZE);
 		/*
 		 * Fallback to copy_from_user outside mmap_lock.
 		 * If retry is successful, mfill_copy_folio_locked() returns
@@ -571,7 +662,7 @@ static int __mfill_atomic_pte(struct mfill_state *state,
 		 * will take care of unlocking if needed.
 		 */
 		if (unlikely(ret)) {
-			ret = mfill_copy_folio_retry(state, folio);
+			ret = mfill_copy_folio_retry(state, folio, 0, PAGE_SIZE);
 			if (ret)
 				goto err_folio_put;
 		}
@@ -590,12 +681,29 @@ static int __mfill_atomic_pte(struct mfill_state *state,
 
 	if (ops->filemap_add) {
 		ret = ops->filemap_add(folio, state->vma, state->dst_addr);
+#if defined(CONFIG_MM_SUBPAGE) && defined(CONFIG_SHMEM)
+		/*
+		 * A pinned large shmem folio can survive a partial hole punch.
+		 * Its cache entry exists while this native-sized range is missing.
+		 * Reuse the prepared source and preserve all neighbouring bytes.
+		 * Ordinary native insertion and non-shmem paths stay unchanged.
+		 */
+		if (ret == -EEXIST && (state->vma->vm_flags & VM_SHARED) &&
+		    shmem_file(state->vma->vm_file) &&
+		    (READ_ONCE(SHMEM_I(file_inode(state->vma->vm_file))->flags) &
+		     SHMEM_F_UFFD_SUBPAGE)) {
+			struct mfill_shared_data data = { .source = folio };
+
+			ret = mfill_atomic_shmem_hole(state, &data);
+			goto err_folio_put;
+		}
+#endif
 		if (ret)
 			goto err_folio_put;
 	}
 
 	ret = mfill_atomic_install_pte(state->pmd, state->vma, dst_addr,
-				       &folio->page, flags);
+				       &folio->page, flags, NULL);
 	if (ret)
 		goto err_filemap_remove;
 
@@ -609,9 +717,183 @@ err_folio_put:
 	return ret;
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+/* Pack only this request's leaves in one native linear index. */
+static struct mm_subpage *mfill_alloc_subpage(struct mfill_state *state)
+{
+	struct vm_area_struct *vma = state->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	struct vm_page_offset pos = vma_page_offset_at(vma, state->dst_addr);
+	unsigned long size = mm_page_size(mm);
+	unsigned int first = pos.offset >> mm_page_shift(mm), i, nr;
+	struct mm_subpage_pool *pool;
+	struct mm_subpage *slot;
+	struct folio *folio;
+	int err = -ENOMEM;
+
+	if (state->slots[first])
+		goto take;
+
+	mfill_free_subpages(state);
+	pool = mm_subpage_pool_create_granule(GFP_KERNEL, mm_page_shift(mm));
+	if (!pool)
+		return ERR_PTR(-ENOMEM);
+	folio = anon_alloc_folio(vma, state->dst_addr);
+	if (!folio)
+		goto out;
+	folio_throttle_swaprate(folio, GFP_KERNEL);
+	err = mm_subpage_pool_add_folio(pool, folio, GFP_KERNEL);
+	if (err) {
+		folio_put(folio);
+		goto out;
+	}
+	nr = min_t(unsigned long, PAGE_SIZE - pos.offset,
+		   state->dst_start + state->len - state->dst_addr) / size;
+	for (i = first; i < first + nr; i++) {
+		slot = mm_subpage_alloc_at(pool, i * size);
+		if (IS_ERR(slot)) {
+			err = PTR_ERR(slot);
+			mfill_free_subpages(state);
+			goto out;
+		}
+		state->slots[i] = slot;
+	}
+out:
+	mm_subpage_pool_close(pool);
+	mm_subpage_pool_put(pool);
+	if (err)
+		return ERR_PTR(err);
+take:
+	slot = state->slots[first];
+	state->slots[first] = NULL;
+	return slot;
+}
+
+static int mfill_atomic_subpage(struct mfill_state *state)
+{
+	struct mm_struct *mm = state->ctx->mm;
+	struct mm_subpage *slot = mfill_alloc_subpage(state);
+	struct vm_area_struct *vma;
+	struct folio *folio;
+	pte_t entry, *pte;
+	spinlock_t *ptl;
+	bool fresh;
+	int err;
+
+	if (IS_ERR(slot))
+		return PTR_ERR(slot);
+	folio = mm_subpage_folio(slot);
+	folio_lock(folio);
+	/* A previous leaf may have entered reclaim between iterations. */
+	err = -EAGAIN;
+	if (folio_test_swapcache(folio))
+		goto unlock_folio;
+	if (uffd_flags_mode_is(state->flags, MFILL_ATOMIC_COPY)) {
+		err = mfill_copy_folio_locked(folio, state->src_addr,
+					     mm_subpage_offset(slot), mm_page_size(mm));
+		if (err) {
+			/*
+			 * The faulting retry must not hold the folio lock, or write
+			 * a folio whose already-visible neighbours can be reclaimed.
+			 * Use fresh backing and discard the remaining reservations
+			 * before dropping the VMA lock.
+			 */
+			folio_unlock(folio);
+			mm_subpage_put(slot);
+			mfill_free_subpages(state);
+			slot = mfill_alloc_subpage(state);
+			if (IS_ERR(slot))
+				return PTR_ERR(slot);
+			folio = mm_subpage_folio(slot);
+			err = mfill_copy_folio_retry(state, folio,
+					mm_subpage_offset(slot), mm_page_size(mm));
+			if (err)
+				goto put_slot;
+			folio_lock(folio);
+		}
+	}
+	/* The allocator zeroed every byte, including unissued neighbours. */
+	__folio_mark_uptodate(folio);
+	vma = state->vma;
+	pte = pte_offset_map_lock(mm, state->pmd, state->dst_addr, &ptl);
+	err = -EAGAIN;
+	if (!pte)
+		goto unlock_folio;
+	err = -EFAULT;
+	if (mfill_file_over_size(vma, state->dst_addr))
+		goto unlock_pte;
+	err = -EEXIST;
+	if (!pte_none(ptep_get(pte)) && !pte_is_uffd_marker(ptep_get(pte)))
+		goto unlock_pte;
+	fresh = !folio_test_anon(folio);
+	mm_subpage_set_exclusive(slot);
+	err = mm_subpage_add_new_anon_rmap(slot, vma, state->dst_addr);
+	if (err)
+		goto unlock_pte;
+	if (fresh)
+		folio_add_lru_vma(folio, vma);
+	else if ((vma->vm_flags & (VM_LOCKED | VM_SPECIAL)) == VM_LOCKED)
+		mlock_folio(folio);
+	inc_mm_counter(mm, MM_ANONPAGES);
+	entry = phys_pte_mm(mm, mm_subpage_phys(slot), vma->vm_page_prot);
+	entry = pte_mkdirty(entry);
+	if (vma->vm_flags & VM_WRITE)
+		entry = pte_mkwrite(entry, vma);
+	if (state->flags & MFILL_ATOMIC_WP)
+		entry = pte_mkuffd_wp(entry);
+	set_pte_at(mm, state->dst_addr, pte, entry);
+	update_mmu_cache(vma, state->dst_addr, pte);
+	/* The PTE owns slot now; release the folio lock before dropping PTL. */
+	folio_unlock(folio);
+	pte_unmap_unlock(pte, ptl);
+	return 0;
+unlock_pte:
+	pte_unmap_unlock(pte, ptl);
+unlock_folio:
+	folio_unlock(folio);
+put_slot:
+	mm_subpage_put(slot);
+	return err;
+}
+#endif
+
+#if defined(CONFIG_MM_SUBPAGE) && defined(CONFIG_SHMEM)
+static int mfill_atomic_shared_subpage(struct mfill_state *state)
+{
+	struct mfill_shared_data data = {};
+	int err;
+
+	if (uffd_flags_mode_is(state->flags, MFILL_ATOMIC_COPY)) {
+		if (!state->copy_buffer)
+			state->copy_buffer = folio_alloc(GFP_KERNEL_ACCOUNT, 0);
+		data.source = state->copy_buffer;
+		if (!data.source)
+			return -ENOMEM;
+		err = mfill_copy_folio_locked(data.source, state->src_addr, 0,
+					     mm_page_size(state->ctx->mm));
+		if (err)
+			err = mfill_copy_folio_retry(state, data.source, 0,
+						    mm_page_size(state->ctx->mm));
+		if (err)
+			return err;
+	}
+	return mfill_atomic_shmem_hole(state, &data);
+}
+#endif
+
 static int mfill_atomic_pte_copy(struct mfill_state *state)
 {
 	const struct vm_uffd_ops *ops = vma_uffd_ops(state->vma);
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(state->ctx->mm) < PAGE_SIZE) {
+#ifdef CONFIG_SHMEM
+		if (state->vma->vm_flags & VM_SHARED)
+			return mfill_atomic_shared_subpage(state);
+#endif
+		return mfill_atomic_subpage(state);
+	}
+#endif
 
 	/*
 	 * The normal page fault path for a MAP_PRIVATE mapping in a
@@ -631,6 +913,16 @@ static int mfill_atomic_pte_copy(struct mfill_state *state)
 static int mfill_atomic_pte_zeroed_folio(struct mfill_state *state)
 {
 	const struct vm_uffd_ops *ops = vma_uffd_ops(state->vma);
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(state->ctx->mm) < PAGE_SIZE) {
+#ifdef CONFIG_SHMEM
+		if (state->vma->vm_flags & VM_SHARED)
+			return mfill_atomic_shared_subpage(state);
+#endif
+		return mfill_atomic_subpage(state);
+	}
+#endif
 
 	return __mfill_atomic_pte(state, ops);
 }
@@ -695,6 +987,13 @@ static int mfill_atomic_pte_continue(struct mfill_state *state)
 	if (IS_ERR_OR_NULL(folio))
 		return -EFAULT;
 
+#if defined(CONFIG_MM_SUBPAGE) && defined(CONFIG_SHMEM)
+	if (vma_is_shmem(dst_vma) && shmem_uffd_range_missing(folio, pgoff,
+		    vma_page_offset_at(dst_vma, dst_addr).offset, mm_page_size(dst_vma->vm_mm))) {
+		ret = -EFAULT;
+		goto out_release;
+	}
+#endif
 	page = folio_file_page(folio, pgoff);
 	if (PageHWPoison(page)) {
 		ret = -EIO;
@@ -702,7 +1001,7 @@ static int mfill_atomic_pte_continue(struct mfill_state *state)
 	}
 
 	ret = mfill_atomic_install_pte(dst_pmd, dst_vma, dst_addr,
-				       page, flags);
+				       page, flags, NULL);
 	if (ret)
 		goto out_release;
 
@@ -964,8 +1263,8 @@ static __always_inline ssize_t mfill_atomic(struct userfaultfd_ctx *ctx,
 	/*
 	 * Sanitize the command parameters:
 	 */
-	VM_WARN_ON_ONCE(dst_start & ~PAGE_MASK);
-	VM_WARN_ON_ONCE(len & ~PAGE_MASK);
+	VM_WARN_ON_ONCE(dst_start & ~mm_page_mask(ctx->mm));
+	VM_WARN_ON_ONCE(len & ~mm_page_mask(ctx->mm));
 
 	/* Does the address range wrap, or is the span zero-sized? */
 	VM_WARN_ON_ONCE(src_start + len <= src_start);
@@ -998,9 +1297,9 @@ static __always_inline ssize_t mfill_atomic(struct userfaultfd_ctx *ctx,
 		cond_resched();
 
 		if (!err) {
-			state.dst_addr += PAGE_SIZE;
-			state.src_addr += PAGE_SIZE;
-			copied += PAGE_SIZE;
+			state.dst_addr += mm_page_size(ctx->mm);
+			state.src_addr += mm_page_size(ctx->mm);
+			copied += mm_page_size(ctx->mm);
 
 			if (fatal_signal_pending(current))
 				err = -EINTR;
@@ -1011,6 +1310,8 @@ static __always_inline ssize_t mfill_atomic(struct userfaultfd_ctx *ctx,
 
 	mfill_put_vma(&state);
 out:
+	if (state.copy_buffer)
+		folio_put(state.copy_buffer);
 	VM_WARN_ON_ONCE(copied < 0);
 	VM_WARN_ON_ONCE(err > 0);
 	VM_WARN_ON_ONCE(!copied && !err);
@@ -1099,8 +1400,8 @@ int mwriteprotect_range(struct userfaultfd_ctx *ctx, unsigned long start,
 	/*
 	 * Sanitize the command parameters:
 	 */
-	VM_WARN_ON_ONCE(start & ~PAGE_MASK);
-	VM_WARN_ON_ONCE(len & ~PAGE_MASK);
+	VM_WARN_ON_ONCE(start & ~mm_page_mask(dst_mm));
+	VM_WARN_ON_ONCE(len & ~mm_page_mask(dst_mm));
 
 	/* Does the address range wrap, or is the span zero-sized? */
 	VM_WARN_ON_ONCE(start + len <= start);
@@ -1303,7 +1604,102 @@ out:
 	return src_addr > src_start ? src_addr - src_start : err;
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+static long move_present_subpage(struct mm_struct *mm,
+		struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
+		unsigned long dst_addr, unsigned long src_addr,
+		pte_t *dst_pte, pte_t *src_pte, pte_t orig_dst, pte_t orig_src,
+		pmd_t *dst_pmd, pmd_t dst_pmdval,
+		spinlock_t *dst_ptl, spinlock_t *src_ptl, struct folio *folio)
+{
+	struct mm_subpage_move move;
+	struct mm_subpage *slot = NULL;
+	pte_t pte;
+	long ret = -EAGAIN;
+
+	flush_cache_range(src_vma, src_addr, src_addr + mm_page_size(mm));
+	double_pt_lock(dst_ptl, src_ptl);
+	if (!is_pte_pages_stable(dst_pte, src_pte, orig_dst, orig_src,
+				dst_pmd, dst_pmdval))
+		goto out;
+	ret = -EBUSY;
+	if (!folio_test_anon(folio) || folio_test_large(folio))
+		goto out;
+	slot = mm_subpage_get_from_phys(pte_phys_mm(mm, orig_src));
+	if (!slot || mm_subpage_folio(slot) != folio)
+		goto out;
+	ret = mm_subpage_move_prepare(&move, slot, src_vma, src_addr,
+				      dst_vma, dst_addr, false);
+	if (ret)
+		goto out;
+	orig_src = ptep_clear_flush(src_vma, src_addr, src_pte);
+	ret = mm_subpage_move_commit(&move);
+	if (ret) {
+		set_pte_at(mm, src_addr, src_pte, orig_src);
+	} else {
+		pte = phys_pte_mm(mm, mm_subpage_phys(slot), dst_vma->vm_page_prot);
+		if (pgtable_supports_soft_dirty())
+			pte = pte_mksoft_dirty(pte);
+		if (pte_dirty(orig_src))
+			pte = pte_mkdirty(pte);
+		pte = pte_mkwrite(pte, dst_vma);
+		set_pte_at(mm, dst_addr, dst_pte, pte);
+		ret = mm_page_size(mm);
+	}
+	mm_subpage_move_finish(&move);
+out:
+	if (slot)
+		mm_subpage_put(slot);
+	double_pt_unlock(dst_ptl, src_ptl);
+	return ret;
+}
+
+/* Both PTLs and, if present, the swap-cache folio lock are held. */
+static int move_swap_subpage(struct mm_struct *mm, struct vm_area_struct *dst_vma,
+		struct vm_area_struct *src_vma, unsigned long dst_addr,
+		unsigned long src_addr, pte_t *dst_pte, pte_t *src_pte,
+		pte_t orig_src, struct folio *folio, swp_entry_t entry)
+{
+	unsigned int offset = pte_swp_subpage_offset(orig_src);
+	struct mm_subpage_move move;
+	struct mm_subpage *slot = NULL;
+	int ret = -EBUSY;
+
+	if (offset >= PAGE_SIZE || !IS_ALIGNED(offset, mm_page_size(mm)))
+		return -EFAULT;
+	if (swap_subpage_count(entry, offset) != 1)
+		return -EBUSY;
+	if (folio) {
+		slot = mm_subpage_get_from_phys(PFN_PHYS(folio_pfn(folio)) + offset);
+		if (slot) {
+			ret = mm_subpage_move_prepare(&move, slot, src_vma, src_addr,
+						      dst_vma, dst_addr, true);
+			if (ret)
+				goto out;
+			ret = mm_subpage_move_commit(&move);
+			if (ret) {
+				mm_subpage_move_finish(&move);
+				goto out;
+			}
+		}
+	}
+	/* No mapping count changes: the same-mm exclusive swap PTE is transferred. */
+	orig_src = ptep_get_and_clear(mm, src_addr, src_pte);
+	if (pgtable_supports_soft_dirty())
+		orig_src = pte_swp_mksoft_dirty(orig_src);
+	set_pte_at(mm, dst_addr, dst_pte, orig_src);
+	if (slot)
+		mm_subpage_move_finish(&move);
+	ret = mm_page_size(mm);
+out:
+	if (slot)
+		mm_subpage_put(slot);
+	return ret;
+}
+#endif
+
 static int move_swap_pte(struct mm_struct *mm, struct vm_area_struct *dst_vma,
+			 struct vm_area_struct *src_vma,
 			 unsigned long dst_addr, unsigned long src_addr,
 			 pte_t *dst_pte, pte_t *src_pte,
 			 pte_t orig_dst_pte, pte_t orig_src_pte,
@@ -1328,6 +1724,21 @@ static int move_swap_pte(struct mm_struct *mm, struct vm_area_struct *dst_vma,
 		double_pt_unlock(dst_ptl, src_ptl);
 		return -EAGAIN;
 	}
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(mm) < PAGE_SIZE) {
+		int ret;
+
+		if (!src_folio && swap_cache_has_folio(entry)) {
+			double_pt_unlock(dst_ptl, src_ptl);
+			return -EAGAIN;
+		}
+		ret = move_swap_subpage(mm, dst_vma, src_vma, dst_addr, src_addr,
+				       dst_pte, src_pte, orig_src_pte, src_folio, entry);
+		double_pt_unlock(dst_ptl, src_ptl);
+		return ret;
+	}
+#endif
 
 	/*
 	 * The src_folio resides in the swapcache, requiring an update to its
@@ -1381,13 +1792,13 @@ static int move_zeropage_pte(struct mm_struct *mm,
 		return -EAGAIN;
 	}
 
-	zero_pte = pte_mkspecial(pfn_pte(zero_pfn(dst_addr),
-					 dst_vma->vm_page_prot));
+	zero_pte = pte_mkspecial(phys_pte_mm(mm, PFN_PHYS(zero_pfn(dst_addr)),
+					      dst_vma->vm_page_prot));
 	ptep_clear_flush(src_vma, src_addr, src_pte);
 	set_pte_at(mm, dst_addr, dst_pte, zero_pte);
 	double_pt_unlock(dst_ptl, src_ptl);
 
-	return PAGE_SIZE;
+	return mm_page_size(mm);
 }
 
 
@@ -1474,7 +1885,7 @@ retry:
 		if (!(mode & UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES))
 			ret = -ENOENT;
 		else /* nothing to do to move a hole */
-			ret = PAGE_SIZE;
+			ret = mm_page_size(mm);
 		goto out;
 	}
 
@@ -1514,7 +1925,8 @@ retry:
 			}
 
 			folio = vm_normal_folio(src_vma, src_addr, orig_src_pte);
-			if (!folio || !PageAnonExclusive(&folio->page)) {
+			if (!folio || (mm_page_size(mm) >= PAGE_SIZE &&
+				       !PageAnonExclusive(&folio->page))) {
 				spin_unlock(src_ptl);
 				ret = -EBUSY;
 				goto out;
@@ -1554,6 +1966,15 @@ retry:
 			}
 		}
 
+#ifdef CONFIG_MM_SUBPAGE
+		if (mm_page_size(mm) < PAGE_SIZE) {
+			ret = move_present_subpage(mm, dst_vma, src_vma, dst_addr, src_addr,
+						   dst_pte, src_pte, orig_dst_pte, orig_src_pte,
+						   dst_pmd, dst_pmdval, dst_ptl, src_ptl, src_folio);
+			goto out;
+		}
+#endif
+
 		/* at this point we have src_folio locked */
 		if (folio_test_large(src_folio)) {
 			/* split_folio() can block */
@@ -1592,7 +2013,8 @@ retry:
 			goto out;
 		}
 
-		if (!pte_swp_exclusive(orig_src_pte)) {
+		/* Smaller leaves validate per-slot swap and mapping counts under PTL. */
+		if (mm_page_size(mm) >= PAGE_SIZE && !pte_swp_exclusive(orig_src_pte)) {
 			ret = -EBUSY;
 			goto out;
 		}
@@ -1635,7 +2057,7 @@ retry:
 				goto retry;
 			}
 		}
-		ret = move_swap_pte(mm, dst_vma, dst_addr, src_addr, dst_pte, src_pte,
+		ret = move_swap_pte(mm, dst_vma, src_vma, dst_addr, src_addr, dst_pte, src_pte,
 				orig_dst_pte, orig_src_pte, dst_pmd, dst_pmdval,
 				dst_ptl, src_ptl, src_folio, si, entry);
 	}
@@ -1692,6 +2114,11 @@ static int validate_move_areas(struct userfaultfd_ctx *ctx,
 	/* Only allow moving if both have the same access and protection */
 	if ((src_vma->vm_flags & VM_ACCESS_FLAGS) != (dst_vma->vm_flags & VM_ACCESS_FLAGS) ||
 	    pgprot_val(src_vma->vm_page_prot) != pgprot_val(dst_vma->vm_page_prot))
+		return -EINVAL;
+
+	/* Native backing cannot mix droppable and swap-backed slot policies. */
+	if (mm_page_size(src_vma->vm_mm) < PAGE_SIZE &&
+	    ((src_vma->vm_flags ^ dst_vma->vm_flags) & VM_DROPPABLE))
 		return -EINVAL;
 
 	/* Only allow moving if both are mlocked or both aren't */
@@ -1926,9 +2353,9 @@ ssize_t move_pages(struct userfaultfd_ctx *ctx, unsigned long dst_start,
 	ssize_t moved = 0;
 
 	/* Sanitize the command parameters. */
-	VM_WARN_ON_ONCE(src_start & ~PAGE_MASK);
-	VM_WARN_ON_ONCE(dst_start & ~PAGE_MASK);
-	VM_WARN_ON_ONCE(len & ~PAGE_MASK);
+	VM_WARN_ON_ONCE(src_start & ~mm_page_mask(mm));
+	VM_WARN_ON_ONCE(dst_start & ~mm_page_mask(mm));
+	VM_WARN_ON_ONCE(len & ~mm_page_mask(mm));
 
 	/* Does the address range wrap, or is the span zero-sized? */
 	VM_WARN_ON_ONCE(src_start + len < src_start);
@@ -2053,10 +2480,12 @@ ssize_t move_pages(struct userfaultfd_ctx *ctx, unsigned long dst_start,
 			ret = move_pages_ptes(mm, dst_pmd, src_pmd,
 					      dst_vma, src_vma, dst_addr,
 					      src_addr, src_end - src_addr, mode);
-			if (ret < 0)
+			if (ret < 0) {
 				err = ret;
-			else
+			} else {
+				err = 0;
 				step_size = ret;
+			}
 		}
 
 		cond_resched();
@@ -2094,6 +2523,17 @@ bool vma_can_userfault(struct vm_area_struct *vma, vm_flags_t vm_flags,
 		       bool wp_async)
 {
 	const struct vm_uffd_ops *ops = vma_uffd_ops(vma);
+
+	if (mm_page_size(vma->vm_mm) != PAGE_SIZE) {
+		if (mm_page_size(vma->vm_mm) > PAGE_SIZE)
+			return false;
+		if (vma_is_anonymous(vma)) {
+			if (vm_flags & VM_UFFD_MINOR)
+				return false;
+		} else if (!vma_is_shmem(vma)) {
+			return false;
+		}
+	}
 
 	if (vma->vm_flags & (VM_DROPPABLE | VM_SHADOW_STACK))
 		return false;

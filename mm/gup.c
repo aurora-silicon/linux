@@ -5,6 +5,7 @@
 #include <linux/spinlock.h>
 
 #include <linux/mm.h>
+#include <linux/mm_subpage.h>
 #include <linux/memfd.h>
 #include <linux/memremap.h>
 #include <linux/pagemap.h>
@@ -1297,6 +1298,11 @@ static struct vm_area_struct *gup_vma_lookup(struct mm_struct *mm,
 #endif
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+static long prefault_subpage_range(struct mm_struct *mm, unsigned long start,
+		unsigned long nr_pages, unsigned int flags, int *locked);
+#endif
+
 /**
  * __get_user_pages() - pin user pages in memory
  * @mm:		mm_struct of target mm
@@ -1362,6 +1368,15 @@ static long __get_user_pages(struct mm_struct *mm,
 
 	if (!nr_pages)
 		return 0;
+
+#ifdef CONFIG_MM_SUBPAGE
+	/* A prefault has no page-array ownership or physical-offset ambiguity. */
+	if (mm_page_size(mm) != PAGE_SIZE) {
+		if (pages || (gup_flags & (FOLL_GET | FOLL_PIN)))
+			return -EOPNOTSUPP;
+		return prefault_subpage_range(mm, start, nr_pages, gup_flags, locked);
+	}
+#endif
 
 	start = untagged_addr_remote(mm, start);
 
@@ -1721,7 +1736,7 @@ static __always_inline long __get_user_pages_locked(struct mm_struct *mm,
 		 */
 		if (likely(pages))
 			pages += ret;
-		start += ret << PAGE_SHIFT;
+		start += ret << mm_page_shift(mm);
 
 		/* The lock was temporarily dropped, so we must unlock later */
 		must_unlock = true;
@@ -1768,7 +1783,7 @@ retry:
 			break;
 		if (likely(pages))
 			pages++;
-		start += PAGE_SIZE;
+		start += mm_page_size(mm);
 	}
 	if (must_unlock && *locked) {
 		/*
@@ -1814,13 +1829,13 @@ long populate_vma_page_range(struct vm_area_struct *vma,
 		unsigned long start, unsigned long end, int *locked)
 {
 	struct mm_struct *mm = vma->vm_mm;
-	unsigned long nr_pages = (end - start) / PAGE_SIZE;
+	unsigned long nr_pages = (end - start) / mm_page_size(mm);
 	int local_locked = 1;
 	int gup_flags;
 	long ret;
 
-	VM_WARN_ON_ONCE(!PAGE_ALIGNED(start));
-	VM_WARN_ON_ONCE(!PAGE_ALIGNED(end));
+	VM_WARN_ON_ONCE(!IS_ALIGNED(start, mm_page_size(mm)));
+	VM_WARN_ON_ONCE(!IS_ALIGNED(end, mm_page_size(mm)));
 	VM_WARN_ON_ONCE_VMA(start < vma->vm_start, vma);
 	VM_WARN_ON_ONCE_VMA(end   > vma->vm_end, vma);
 	mmap_assert_locked(mm);
@@ -1887,12 +1902,12 @@ long populate_vma_page_range(struct vm_area_struct *vma,
 long faultin_page_range(struct mm_struct *mm, unsigned long start,
 			unsigned long end, bool write, int *locked)
 {
-	unsigned long nr_pages = (end - start) / PAGE_SIZE;
+	unsigned long nr_pages = (end - start) / mm_page_size(mm);
 	int gup_flags;
 	long ret;
 
-	VM_WARN_ON_ONCE(!PAGE_ALIGNED(start));
-	VM_WARN_ON_ONCE(!PAGE_ALIGNED(end));
+	VM_WARN_ON_ONCE(!IS_ALIGNED(start, mm_page_size(mm)));
+	VM_WARN_ON_ONCE(!IS_ALIGNED(end, mm_page_size(mm)));
 	mmap_assert_locked(mm);
 
 	/*
@@ -1968,7 +1983,7 @@ int __mm_populate(unsigned long start, unsigned long len, int ignore_errors)
 			}
 			break;
 		}
-		nend = nstart + ret * PAGE_SIZE;
+		nend = nstart + ret * mm_page_size(mm);
 		ret = 0;
 	}
 	if (locked)
@@ -2047,6 +2062,7 @@ size_t fault_in_writeable(char __user *uaddr, size_t size)
 {
 	const unsigned long start = (unsigned long)uaddr;
 	const unsigned long end = start + size;
+	const unsigned long page_size = current->mm ? mm_page_size(current->mm) : PAGE_SIZE;
 	unsigned long cur;
 
 	if (unlikely(size == 0))
@@ -2055,7 +2071,7 @@ size_t fault_in_writeable(char __user *uaddr, size_t size)
 		return size;
 
 	/* Stop once we overflow to 0. */
-	for (cur = start; cur && cur < end; cur = PAGE_ALIGN_DOWN(cur + PAGE_SIZE))
+	for (cur = start; cur && cur < end; cur = round_down(cur + page_size, page_size))
 		unsafe_put_user(0, (char __user *)cur, out);
 out:
 	user_write_access_end();
@@ -2116,6 +2132,7 @@ size_t fault_in_safe_writeable(const char __user *uaddr, size_t size)
 {
 	const unsigned long start = (unsigned long)uaddr;
 	const unsigned long end = start + size;
+	const unsigned long page_size = current->mm ? mm_page_size(current->mm) : PAGE_SIZE;
 	unsigned long cur;
 	struct mm_struct *mm = current->mm;
 	bool unlocked = false;
@@ -2125,7 +2142,7 @@ size_t fault_in_safe_writeable(const char __user *uaddr, size_t size)
 
 	mmap_read_lock(mm);
 	/* Stop once we overflow to 0. */
-	for (cur = start; cur && cur < end; cur = PAGE_ALIGN_DOWN(cur + PAGE_SIZE))
+	for (cur = start; cur && cur < end; cur = round_down(cur + page_size, page_size))
 		if (fixup_user_fault(mm, cur, FAULT_FLAG_WRITE, &unlocked))
 			break;
 	mmap_read_unlock(mm);
@@ -2148,6 +2165,7 @@ size_t fault_in_readable(const char __user *uaddr, size_t size)
 {
 	const unsigned long start = (unsigned long)uaddr;
 	const unsigned long end = start + size;
+	const unsigned long page_size = current->mm ? mm_page_size(current->mm) : PAGE_SIZE;
 	unsigned long cur;
 	volatile char c;
 
@@ -2157,7 +2175,7 @@ size_t fault_in_readable(const char __user *uaddr, size_t size)
 		return size;
 
 	/* Stop once we overflow to 0. */
-	for (cur = start; cur && cur < end; cur = PAGE_ALIGN_DOWN(cur + PAGE_SIZE))
+	for (cur = start; cur && cur < end; cur = round_down(cur + page_size, page_size))
 		unsafe_get_user(c, (const char __user *)cur, out);
 out:
 	user_read_access_end();
@@ -2211,11 +2229,18 @@ struct pages_or_folios {
 		void **entries;
 	};
 	bool has_folios;
+#ifdef CONFIG_MM_SUBPAGE
+	struct user_page_fragment *fragments;
+#endif
 	long nr_entries;
 };
 
 static struct folio *pofs_get_folio(struct pages_or_folios *pofs, long i)
 {
+#ifdef CONFIG_MM_SUBPAGE
+	if (pofs->fragments)
+		return pofs->fragments[i].folio;
+#endif
 	if (pofs->has_folios)
 		return pofs->folios[i];
 	return page_folio(pofs->pages[i]);
@@ -2223,15 +2248,38 @@ static struct folio *pofs_get_folio(struct pages_or_folios *pofs, long i)
 
 static void pofs_clear_entry(struct pages_or_folios *pofs, long i)
 {
+#ifdef CONFIG_MM_SUBPAGE
+	if (pofs->fragments) {
+		pofs->fragments[i] = (struct user_page_fragment) {};
+		return;
+	}
+#endif
 	pofs->entries[i] = NULL;
 }
 
 static void pofs_unpin(struct pages_or_folios *pofs)
 {
+#ifdef CONFIG_MM_SUBPAGE
+	if (pofs->fragments) {
+		release_user_fragments(pofs->fragments, pofs->nr_entries, false);
+		return;
+	}
+#endif
 	if (pofs->has_folios)
 		unpin_folios(pofs->folios, pofs->nr_entries);
 	else
 		unpin_user_pages(pofs->pages, pofs->nr_entries);
+}
+
+static void pofs_unpin_entry(struct pages_or_folios *pofs, long i)
+{
+#ifdef CONFIG_MM_SUBPAGE
+	if (pofs->fragments) {
+		release_user_fragments(&pofs->fragments[i], 1, false);
+		return;
+	}
+#endif
+	unpin_folio(pofs_get_folio(pofs, i));
 }
 
 static struct folio *pofs_next_folio(struct folio *folio,
@@ -2239,6 +2287,17 @@ static struct folio *pofs_next_folio(struct folio *folio,
 {
 	long i = *index_ptr + 1;
 
+#ifdef CONFIG_MM_SUBPAGE
+	/* Several adjacent user quarters can pin the same native folio. */
+	if (pofs->fragments) {
+		while (i < pofs->nr_entries && pofs->fragments[i].folio == folio)
+			i++;
+		if (i == pofs->nr_entries)
+			return NULL;
+		*index_ptr = i;
+		return pofs->fragments[i].folio;
+	}
+#endif
 	if (!pofs->has_folios && folio_test_large(folio)) {
 		const unsigned long start_pfn = folio_pfn(folio);
 		const unsigned long end_pfn = start_pfn + folio_nr_pages(folio);
@@ -2333,9 +2392,9 @@ migrate_longterm_unpinnable_folios(struct list_head *movable_folio_list,
 			 * convert the pin on the source folio to a normal
 			 * reference.
 			 */
-			pofs_clear_entry(pofs, i);
 			folio_get(folio);
-			gup_put_folio(folio, 1, FOLL_PIN);
+			pofs_unpin_entry(pofs, i);
+			pofs_clear_entry(pofs, i);
 
 			if (migrate_device_coherent_folio(folio)) {
 				ret = -EBUSY;
@@ -2352,7 +2411,7 @@ migrate_longterm_unpinnable_folios(struct list_head *movable_folio_list,
 		 * calling folio_isolate_lru() which takes a reference so the
 		 * folio won't be freed if it's migrating.
 		 */
-		unpin_folio(folio);
+		pofs_unpin_entry(pofs, i);
 		pofs_clear_entry(pofs, i);
 	}
 
@@ -2457,6 +2516,23 @@ static long check_and_migrate_movable_folios(unsigned long nr_folios,
 	return 0;
 }
 #endif /* CONFIG_MIGRATION */
+
+#ifdef CONFIG_MM_SUBPAGE
+static long check_and_migrate_movable_fragments(unsigned long count,
+					struct user_page_fragment *fragments)
+{
+#ifdef CONFIG_MIGRATION
+	struct pages_or_folios pofs = {
+		.fragments = fragments,
+		.nr_entries = count,
+	};
+
+	return check_and_migrate_movable_pages_or_folios(&pofs);
+#else
+	return 0;
+#endif
+}
+#endif
 
 /*
  * __gup_longterm_locked() is a wrapper for __get_user_pages_locked which
@@ -3133,6 +3209,11 @@ static unsigned long gup_fast(unsigned long start, unsigned long end,
 	int nr_pinned = 0;
 	unsigned seq;
 
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(current->mm) != PAGE_SIZE)
+		return 0;
+#endif
+
 	if (!IS_ENABLED(CONFIG_HAVE_GUP_FAST) ||
 	    !gup_fast_permitted(start, end))
 		return 0;
@@ -3355,6 +3436,464 @@ long pin_user_pages_remote(struct mm_struct *mm,
 }
 EXPORT_SYMBOL(pin_user_pages_remote);
 
+#ifdef CONFIG_MM_SUBPAGE
+/* 1: acquired, 0: fault required, -EMLINK: read pin needs private backing. */
+static int follow_subpage_fragment(struct vm_area_struct *vma, unsigned long addr,
+		unsigned int flags, struct user_page_fragment *fragment)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	struct mm_subpage *slot = NULL;
+	struct folio *folio;
+	struct page *page;
+	pgd_t *pgd = pgd_offset(mm, addr);
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *ptep, pte;
+	spinlock_t *ptl;
+	phys_addr_t phys;
+	int ret = 0;
+	bool file_ref = false;
+
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		return PTR_ERR_OR_ZERO(no_page_table(vma, flags, addr));
+	p4d = p4d_offset_mm(mm, pgd, addr);
+	if (p4d_none_mm(mm, *p4d) || p4d_bad_mm(mm, *p4d))
+		return PTR_ERR_OR_ZERO(no_page_table(vma, flags, addr));
+	pud = pud_offset_mm(mm, p4d, addr);
+	if (pud_none(*pud))
+		return PTR_ERR_OR_ZERO(no_page_table(vma, flags, addr));
+	if (pud_leaf(*pud) || pud_bad(*pud))
+		return -EOPNOTSUPP;
+	pmd = pmd_offset_mm(mm, pud, addr);
+	if (pmd_none(*pmd))
+		return PTR_ERR_OR_ZERO(no_page_table(vma, flags, addr));
+	if (pmd_leaf(*pmd) || pmd_bad(*pmd))
+		return -EOPNOTSUPP;
+	ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	if (!ptep)
+		return 0;
+	pte = ptep_get(ptep);
+	if (pte_none(pte)) {
+		ret = PTR_ERR_OR_ZERO(no_page_table(vma, flags, addr));
+		goto out;
+	}
+	if (!pte_present(pte) || (pte_protnone(pte) && !gup_can_follow_protnone(vma, flags)))
+		goto out;
+	phys = pte_phys_mm(mm, pte);
+	page = vm_normal_page(vma, addr, pte);
+	if (mm_page_size(mm) > PAGE_SIZE) {
+		unsigned long offset = (addr & (mm_page_size(mm) - 1)) & PAGE_MASK;
+
+		phys += offset;
+		if (page)
+			page += offset >> PAGE_SHIFT;
+	}
+	if (!page) {
+		if (flags & FOLL_DUMP) {
+			ret = -EFAULT;
+			goto out;
+		}
+		if (!is_zero_pfn(pte_pfn(pte))) {
+			ret = -EOPNOTSUPP;
+			goto out;
+		}
+		if (flags & FOLL_WRITE)
+			goto out;
+		folio = page_folio(pfn_to_page(PHYS_PFN(phys)));
+		if (flags & FOLL_GET)
+			folio_get(folio);
+	} else {
+		folio = page_folio(page);
+		/* Coarse leaves use ordinary native-page ownership, not slots. */
+		if (mm_page_size(mm) > PAGE_SIZE) {
+			if ((flags & FOLL_WRITE) &&
+			    !can_follow_write_pte(pte, page, vma, flags))
+				goto out;
+			if (!pte_write(pte) && gup_must_unshare(vma, flags, page)) {
+				ret = -EMLINK;
+				goto out;
+			}
+			ret = try_grab_folio(folio, 1, flags);
+			if (ret)
+				goto out;
+			file_ref = true;
+			goto acquired;
+		}
+		if (!folio_test_anon(folio)) {
+			if (vma->vm_file && folio_mapping(folio) != vma->vm_file->f_mapping) {
+				ret = -EOPNOTSUPP;
+				goto out;
+			}
+			if ((flags & FOLL_WRITE) && !pte_write(pte))
+				goto out;
+			/* Private non-anonymous read pins must first acquire COW ownership. */
+			if ((flags & FOLL_PIN) && is_cow_mapping(vma->vm_flags)) {
+				ret = -EMLINK;
+				goto out;
+			}
+			ret = try_grab_folio(folio, 1, flags);
+			if (ret)
+				goto out;
+			file_ref = true;
+			goto acquired;
+		}
+		if (folio_test_ksm(folio)) {
+			ret = -EOPNOTSUPP;
+			goto out;
+		}
+		slot = mm_subpage_get_from_phys(phys);
+		if (!slot) {
+			ret = -EFAULT;
+			goto out;
+		}
+		if ((flags & FOLL_WRITE) && !pte_write(pte)) {
+			bool force = (flags & FOLL_FORCE) &&
+				!(vma->vm_flags & (VM_SHARED | VM_MAYSHARE | VM_WRITE)) &&
+				(vma->vm_flags & VM_MAYWRITE) && mm_subpage_is_exclusive(slot) &&
+				!pte_needs_soft_dirty_wp(vma, pte) && !userfaultfd_pte_wp(vma, pte);
+
+			if (!force)
+				goto out;
+		}
+		if ((flags & FOLL_PIN) && !mm_subpage_is_exclusive(slot)) {
+			ret = flags & FOLL_WRITE ? 0 : -EMLINK;
+			goto out;
+		}
+		if (flags & FOLL_PIN) {
+			ret = mm_subpage_pin(slot);
+			if (ret) {
+				if (ret == -EAGAIN)
+					ret = 0;
+				goto out;
+			}
+		}
+	}
+acquired:
+	if (slot && (flags & FOLL_WRITE))
+		mm_subpage_cancel_lazyfree(slot);
+	ret = flags & FOLL_PIN ? arch_make_folio_accessible(folio) : 0;
+	if (ret) {
+		if (slot)
+			mm_subpage_unpin(slot);
+		else if (file_ref)
+			gup_put_folio(folio, 1, flags);
+		goto out;
+	}
+	if ((flags & FOLL_TOUCH) && (flags & FOLL_WRITE) &&
+	    !pte_dirty(pte) && !folio_test_dirty(folio))
+		folio_mark_dirty(folio);
+	folio_mark_accessed(folio);
+	flush_anon_page(vma, &folio->page, addr);
+	flush_dcache_folio(folio);
+	fragment->folio = folio;
+	fragment->subpage = slot;
+	fragment->pinned = flags & FOLL_PIN;
+	if (flags & FOLL_GET)
+		slot = NULL; /* The returned record consumes the lookup reference. */
+	fragment->offset = phys - PFN_PHYS(folio_pfn(folio)) +
+		(addr & (mm_user_fragment_size(mm) - 1));
+	ret = 1;
+out:
+	if (slot)
+		mm_subpage_put(slot); /* Lookup reference; success retains a separate pin. */
+	pte_unmap_unlock(ptep, ptl);
+	return ret;
+}
+
+/* No references escape: only ensure each user leaf can be followed. */
+static long prefault_subpage_range(struct mm_struct *mm, unsigned long start,
+		unsigned long nr_pages, unsigned int flags, int *locked)
+{
+	unsigned long done = 0;
+	long ret = 0;
+
+	mmap_assert_locked(mm);
+	start = untagged_addr_remote(mm, start);
+	while (done < nr_pages) {
+		struct user_page_fragment unused;
+		struct vm_area_struct *vma = vma_lookup(mm, start);
+
+		if (!vma) {
+			ret = flags & FOLL_MADV_POPULATE ? -ENOMEM : -EFAULT;
+			break;
+		}
+		ret = check_vma_flags(vma, flags);
+		if (ret) {
+			if (flags & FOLL_MADV_POPULATE)
+				ret = -EINVAL;
+			break;
+		}
+		if (is_vm_hugetlb_page(vma) || (vma->vm_flags & VM_MIXEDMAP)) {
+			ret = flags & FOLL_MADV_POPULATE ? -EINVAL : -EOPNOTSUPP;
+			break;
+		}
+		if (gup_signal_pending(flags)) {
+			ret = -EINTR;
+			break;
+		}
+		cond_resched();
+		ret = follow_subpage_fragment(vma, start, flags, &unused);
+		if (!ret) {
+			ret = faultin_page(vma, start, flags, false, locked);
+			if (!ret)
+				continue;
+			if (ret == -EBUSY || ret == -EAGAIN)
+				ret = 0; /* Preserve GUP's caller-managed retry contract. */
+			break;
+		}
+		if (ret < 0)
+			break;
+		done++;
+		start += mm_page_size(mm);
+	}
+	if (ret == -EOPNOTSUPP && (flags & FOLL_MADV_POPULATE))
+		ret = -EINVAL;
+	return done ? (long)done : ret;
+}
+
+static long user_fragments_remote(struct mm_struct *mm, unsigned long start,
+		unsigned long length, unsigned int flags,
+		struct user_page_fragment *fragments, unsigned long capacity, bool pin,
+		struct vm_area_struct **vma_out, bool dump)
+{
+	const unsigned int allowed = FOLL_WRITE | FOLL_FORCE | FOLL_NOFAULT |
+		FOLL_NOWAIT | FOLL_INTERRUPTIBLE | FOLL_LONGTERM | FOLL_ANON;
+	unsigned int internal = flags | FOLL_TOUCH | FOLL_REMOTE |
+		(pin ? FOLL_PIN : FOLL_GET) | (dump ? FOLL_DUMP : 0);
+	unsigned long end, count = 0;
+	int locked = 0;
+	long ret;
+
+	if (!length)
+		return 0;
+	if ((flags & FOLL_LONGTERM) && !pin)
+		return -EINVAL;
+	if (!fragments || !capacity || capacity > LONG_MAX || (flags & ~allowed))
+		return -EINVAL;
+	if (vma_out) {
+		mmap_assert_locked(mm);
+		*vma_out = NULL;
+	} else {
+		internal |= FOLL_UNLOCKABLE;
+		ret = mmap_read_lock_killable(mm);
+		if (ret)
+			return ret;
+	}
+	locked = 1;
+	start = untagged_addr_remote(mm, start);
+	if (check_add_overflow(start, length, &end)) {
+		ret = -EFAULT;
+		goto out;
+	}
+	if (pin)
+		mm_set_has_pinned_flag(mm);
+	while (start < end && count < capacity) {
+		unsigned long bytes = min(end - start,
+			mm_user_fragment_size(mm) - (start & (mm_user_fragment_size(mm) - 1)));
+		struct vm_area_struct *vma;
+
+		if (!locked) {
+			ret = mmap_read_lock_killable(mm);
+			if (ret)
+				break;
+			locked = 1;
+		}
+		if (gup_signal_pending(internal)) {
+			ret = -EINTR;
+			break;
+		}
+		cond_resched();
+		if (mm_page_size(mm) == PAGE_SIZE) {
+			struct page *page;
+
+			if (dump)
+				ret = __get_user_pages_locked(mm, start, 1, &page, &locked, internal);
+			else if (pin)
+				ret = pin_user_pages_remote(mm, start, 1, flags, &page,
+							   vma_out ? NULL : &locked);
+			else
+				ret = get_user_pages_remote(mm, start, 1, flags, &page,
+							   vma_out ? NULL : &locked);
+			if (ret != 1) {
+				if (!ret)
+					ret = -EAGAIN;
+				break;
+			}
+			fragments[count].folio = page_folio(page);
+			fragments[count].subpage = NULL;
+			fragments[count].pinned = pin;
+			fragments[count].offset = folio_page_idx(page_folio(page), page) * PAGE_SIZE +
+				offset_in_page(start);
+		} else {
+			vma = gup_vma_lookup(mm, start);
+			ret = vma ? check_vma_flags(vma, internal) : -EFAULT;
+			if (ret)
+				break;
+			/* Huge and special/device mappings need separate integration. */
+			if (is_vm_hugetlb_page(vma) ||
+			    (vma->vm_flags & (VM_PFNMAP | VM_MIXEDMAP | VM_IO))) {
+				ret = -EOPNOTSUPP;
+				break;
+			}
+			ret = follow_subpage_fragment(vma, start, internal, &fragments[count]);
+			if (!ret || ret == -EMLINK) {
+				ret = faultin_page(vma, start, internal, ret == -EMLINK, &locked);
+				if (!ret)
+					continue;
+				if (!locked && (ret == -EBUSY || ret == -EAGAIN)) {
+					internal |= FOLL_TRIED;
+					continue;
+				}
+				if (ret == -EBUSY)
+					ret = -EAGAIN;
+				break;
+			}
+			if (ret < 0)
+				break;
+		}
+		if (vma_out)
+			*vma_out = vma_lookup(mm, start);
+		fragments[count++].length = bytes;
+		start += bytes;
+		internal &= ~FOLL_TRIED;
+	}
+out:
+	if (locked && !vma_out)
+		mmap_read_unlock(mm);
+	return count ? (long)count : ret;
+}
+
+long pin_user_fragments_remote(struct mm_struct *mm, unsigned long start,
+		unsigned long length, unsigned int flags,
+		struct user_page_fragment *fragments, unsigned long capacity)
+{
+	unsigned int saved;
+	long ret, count;
+
+	if (!(flags & FOLL_LONGTERM) || mm_page_size(mm) == PAGE_SIZE)
+		return user_fragments_remote(mm, start, length, flags, fragments,
+					     capacity, true, NULL, false);
+	/* Match native long-term GUP: fault outside movable zones, migrate any
+	 * existing unpinnable backing, then retry with fresh typed references.
+	 */
+	saved = memalloc_pin_save();
+	do {
+		count = user_fragments_remote(mm, start, length, flags, fragments,
+					     capacity, true, NULL, false);
+		if (count <= 0) {
+			ret = count;
+			break;
+		}
+		ret = check_and_migrate_movable_fragments(count, fragments);
+	} while (ret == -EAGAIN);
+	memalloc_pin_restore(saved);
+	return ret ? ret : count;
+}
+EXPORT_SYMBOL_GPL(pin_user_fragments_remote);
+
+long get_user_fragments_remote(struct mm_struct *mm, unsigned long start,
+		unsigned long length, unsigned int flags,
+		struct user_page_fragment *fragments, unsigned long capacity)
+{
+	return user_fragments_remote(mm, start, length, flags, fragments, capacity,
+				     false, NULL, false);
+}
+EXPORT_SYMBOL_GPL(get_user_fragments_remote);
+
+int get_user_fragment_vma_remote(struct mm_struct *mm, unsigned long start,
+		unsigned long length, unsigned int flags,
+		struct user_page_fragment *fragment, struct vm_area_struct **vma)
+{
+	int ret;
+
+	/* As with get_user_page_vma_remote(), preserve the caller's VMA lock. */
+	if (!vma)
+		return -EINVAL;
+	*vma = NULL;
+	if (flags & FOLL_NOWAIT)
+		return -EINVAL;
+	ret = user_fragments_remote(mm, start, length, flags, fragment, 1, false, vma, false);
+	if (ret > 0 && !*vma) {
+		release_user_fragments(fragment, 1, false);
+		return -EFAULT;
+	}
+	return ret;
+}
+
+int pin_user_fragment_vma_remote(struct mm_struct *mm, unsigned long start,
+		unsigned long length, unsigned int flags,
+		struct user_page_fragment *fragment, struct vm_area_struct **vma)
+{
+	int ret;
+
+	if (!vma)
+		return -EINVAL;
+	*vma = NULL;
+	if (flags & (FOLL_NOWAIT | FOLL_LONGTERM))
+		return -EINVAL;
+	ret = user_fragments_remote(mm, start, length, flags, fragment, 1, true, vma, false);
+	if (ret > 0 && !*vma) {
+		release_user_fragments(fragment, 1, false);
+		return -EFAULT;
+	}
+	return ret;
+}
+
+#ifdef CONFIG_ELF_CORE
+/* Like get_dump_page(), but preserves the selected user-page ownership. */
+int get_dump_fragment(unsigned long addr, struct user_page_fragment *fragment)
+{
+	return user_fragments_remote(current->mm, addr, mm_user_fragment_size(current->mm),
+			FOLL_FORCE, fragment, 1, false, NULL, true);
+}
+#endif
+
+void mark_user_fragment_dirty(struct user_page_fragment *fragment)
+{
+	struct folio *folio = fragment->folio;
+
+	if (!folio)
+		return;
+	if (!is_zero_folio(folio) && !folio_test_dirty(folio)) {
+		folio_lock(folio);
+		folio_mark_dirty(folio);
+		folio_unlock(folio);
+	}
+	if (fragment->subpage)
+		mm_subpage_cancel_lazyfree(fragment->subpage);
+}
+EXPORT_SYMBOL_GPL(mark_user_fragment_dirty);
+
+void release_user_fragments(struct user_page_fragment *fragments,
+		unsigned long count, bool dirty)
+{
+	unsigned long i;
+
+	for (i = 0; i < count; i++) {
+		struct user_page_fragment *fragment = &fragments[i];
+		struct folio *folio = fragment->folio;
+
+		if (!folio)
+			continue;
+		if (dirty)
+			mark_user_fragment_dirty(fragment);
+		if (fragment->subpage) {
+			if (fragment->pinned)
+				mm_subpage_unpin(fragment->subpage);
+			else
+				mm_subpage_put(fragment->subpage);
+		} else if (fragment->pinned) {
+			unpin_folio(folio);
+		} else {
+			folio_put(folio);
+		}
+		*fragment = (struct user_page_fragment) {};
+	}
+}
+EXPORT_SYMBOL_GPL(release_user_fragments);
+#endif
+
 /**
  * pin_user_pages() - pin user pages in memory for use by other devices
  *
@@ -3406,6 +3945,25 @@ long pin_user_pages_unlocked(unsigned long start, unsigned long nr_pages,
 				     &locked, gup_flags);
 }
 EXPORT_SYMBOL(pin_user_pages_unlocked);
+
+/* Direct cache pins have no PTE fault to publish fine shmem exposure. */
+static int memfd_pin_folio(struct file *memfd, struct folio *folio)
+{
+	bool lock = IS_ENABLED(CONFIG_MM_SUBPAGE) &&
+		    IS_ENABLED(CONFIG_USERFAULTFD) && shmem_file(memfd);
+	int ret;
+
+	/* Serialize both acquisition and exposure against partial hole punch. */
+	if (lock)
+		folio_lock(folio);
+	ret = try_grab_folio(folio, 1, FOLL_PIN);
+	if (lock) {
+		if (!ret)
+			shmem_uffd_mark_mapped(folio, 0, folio_size(folio));
+		folio_unlock(folio);
+	}
+	return ret;
+}
 
 /**
  * memfd_pin_folios() - pin folios associated with a memfd
@@ -3492,7 +4050,7 @@ long memfd_pin_folios(struct file *memfd, loff_t start, loff_t end,
 			for (i = 0; i < nr_found; i++) {
 				folio = fbatch.folios[i];
 
-				if (try_grab_folio(folio, 1, FOLL_PIN)) {
+				if (memfd_pin_folio(memfd, folio)) {
 					folio_batch_release(&fbatch);
 					ret = -EINVAL;
 					goto err;

@@ -29,6 +29,7 @@
 #include <linux/overflow.h>
 #include <linux/sched.h>
 #include <linux/pgtable.h>
+#include <linux/mm_granule.h>
 #include <linux/kasan.h>
 #include <linux/memremap.h>
 #include <linux/slab.h>
@@ -750,6 +751,9 @@ struct vm_fault {
 	};
 
 	struct page *cow_page;		/* Page handler may use for COW fault */
+#ifdef CONFIG_MM_SUBPAGE
+	struct mm_subpage *cow_subpage;	/* Owns cow_page's selected fragment */
+#endif
 	struct page *page;		/* ->fault handlers should return a
 					 * page here, unless VM_FAULT_NOPAGE
 					 * is set (which is also implied by
@@ -1615,7 +1619,7 @@ static inline unsigned long vma_kernel_pagesize(struct vm_area_struct *vma)
 {
 	if (unlikely(vma->vm_ops && vma->vm_ops->pagesize))
 		return vma->vm_ops->pagesize(vma);
-	return PAGE_SIZE;
+	return mm_page_size(vma->vm_mm);
 }
 
 unsigned long vma_mmu_pagesize(struct vm_area_struct *vma);
@@ -2010,6 +2014,10 @@ vm_fault_t do_set_pmd(struct vm_fault *vmf, struct folio *folio, struct page *pa
 void set_pte_range(struct vm_fault *vmf, struct folio *folio,
 		struct page *page, unsigned int nr, unsigned long addr);
 
+#ifdef CONFIG_MM_SUBPAGE
+vm_fault_t map_file_user_pages(struct vm_fault *vmf, struct folio *folio,
+		pgoff_t first, pgoff_t last, bool fault);
+#endif
 vm_fault_t finish_fault(struct vm_fault *vmf);
 #endif
 
@@ -3143,10 +3151,13 @@ struct follow_pfnmap_args {
 	 * @address: the virtual address to walk
 	 * @write: if true, fail with -EFAULT unless the mapping is
 	 * writable
+	 * @allow_subpage: caller handles exact byte offsets and user-leaf bounds;
+	 * otherwise a non-native user granule is rejected
 	 */
 	struct vm_area_struct *vma;
 	unsigned long address;
 	bool write;
+	bool allow_subpage;
 	/**
 	 * Internals:
 	 *
@@ -3157,13 +3168,15 @@ struct follow_pfnmap_args {
 	/**
 	 * Outputs:
 	 *
-	 * @pfn: the PFN of the address
-	 * @addr_mask: address mask covering pfn
+	 * @pfn: native PFN containing the requested physical byte
+	 * @offset: byte offset of that byte within the native physical page
+	 * @addr_mask: virtual address mask of the leaf mapping
 	 * @pgprot: the pgprot_t of the mapping
 	 * @writable: whether the mapping is writable
 	 * @special: whether the mapping is a special mapping (real PFN maps)
 	 */
 	unsigned long pfn;
+	unsigned int offset;
 	unsigned long addr_mask;
 	pgprot_t pgprot;
 	bool writable;
@@ -3213,6 +3226,13 @@ static inline void unmap_mapping_pages(struct address_space *mapping,
 		pgoff_t start, pgoff_t nr, bool even_cows) { }
 static inline void unmap_mapping_range(struct address_space *mapping,
 		loff_t const holebegin, loff_t const holelen, int even_cows) { }
+#endif
+
+#ifdef CONFIG_MM_SUBPAGE
+void unmap_mapping_subpage_tail(struct address_space *mapping, loff_t newsize);
+void unmap_mapping_subpage_hole(struct address_space *mapping, loff_t start, u64 end);
+#else
+static inline void unmap_mapping_subpage_tail(struct address_space *mapping, loff_t newsize) { }
 #endif
 
 static inline void unmap_shared_mapping_range(struct address_space *mapping,
@@ -3443,7 +3463,8 @@ static inline void reset_mm_hiwater_rss(struct mm_struct *mm)
 static inline void setmax_mm_hiwater_rss(unsigned long *maxrss,
 					 struct mm_struct *mm)
 {
-	unsigned long hiwater_rss = get_mm_hiwater_rss(mm);
+	/* signal->maxrss/cmaxrss survive exec and child reaping: store kB. */
+	unsigned long hiwater_rss = mm_pages_to_kb(mm, get_mm_hiwater_rss(mm));
 
 	if (*maxrss < hiwater_rss)
 		*maxrss = hiwater_rss;
@@ -3514,14 +3535,14 @@ static inline void mm_inc_nr_puds(struct mm_struct *mm)
 {
 	if (mm_pud_folded(mm))
 		return;
-	atomic_long_add(PTRS_PER_PUD * sizeof(pud_t), &mm->pgtables_bytes);
+	atomic_long_add(pud_table_bytes_mm(mm), &mm->pgtables_bytes);
 }
 
 static inline void mm_dec_nr_puds(struct mm_struct *mm)
 {
 	if (mm_pud_folded(mm))
 		return;
-	atomic_long_sub(PTRS_PER_PUD * sizeof(pud_t), &mm->pgtables_bytes);
+	atomic_long_sub(pud_table_bytes_mm(mm), &mm->pgtables_bytes);
 }
 #endif
 
@@ -3542,14 +3563,14 @@ static inline void mm_inc_nr_pmds(struct mm_struct *mm)
 {
 	if (mm_pmd_folded(mm))
 		return;
-	atomic_long_add(PTRS_PER_PMD * sizeof(pmd_t), &mm->pgtables_bytes);
+	atomic_long_add(pmd_table_bytes_mm(mm), &mm->pgtables_bytes);
 }
 
 static inline void mm_dec_nr_pmds(struct mm_struct *mm)
 {
 	if (mm_pmd_folded(mm))
 		return;
-	atomic_long_sub(PTRS_PER_PMD * sizeof(pmd_t), &mm->pgtables_bytes);
+	atomic_long_sub(pmd_table_bytes_mm(mm), &mm->pgtables_bytes);
 }
 #endif
 
@@ -3566,12 +3587,12 @@ static inline unsigned long mm_pgtables_bytes(const struct mm_struct *mm)
 
 static inline void mm_inc_nr_ptes(struct mm_struct *mm)
 {
-	atomic_long_add(PTRS_PER_PTE * sizeof(pte_t), &mm->pgtables_bytes);
+	atomic_long_add(pte_table_bytes_mm(mm), &mm->pgtables_bytes);
 }
 
 static inline void mm_dec_nr_ptes(struct mm_struct *mm)
 {
-	atomic_long_sub(PTRS_PER_PTE * sizeof(pte_t), &mm->pgtables_bytes);
+	atomic_long_sub(pte_table_bytes_mm(mm), &mm->pgtables_bytes);
 }
 #else
 
@@ -3594,32 +3615,40 @@ static inline p4d_t *p4d_alloc(struct mm_struct *mm, pgd_t *pgd,
 		unsigned long address)
 {
 	return (unlikely(pgd_none(*pgd)) && __p4d_alloc(mm, pgd, address)) ?
-		NULL : p4d_offset(pgd, address);
+		NULL : p4d_offset_mm(mm, pgd, address);
 }
 
 static inline pud_t *pud_alloc(struct mm_struct *mm, p4d_t *p4d,
 		unsigned long address)
 {
-	return (unlikely(p4d_none(*p4d)) && __pud_alloc(mm, p4d, address)) ?
-		NULL : pud_offset(p4d, address);
+	return (unlikely(p4d_none_mm(mm, *p4d)) && __pud_alloc(mm, p4d, address)) ?
+		NULL : pud_offset_mm(mm, p4d, address);
 }
 
 static inline pmd_t *pmd_alloc(struct mm_struct *mm, pud_t *pud, unsigned long address)
 {
 	return (unlikely(pud_none(*pud)) && __pmd_alloc(mm, pud, address))?
-		NULL: pmd_offset(pud, address);
+		NULL : pmd_offset_mm(mm, pud, address);
 }
 #endif /* CONFIG_MMU */
 
 enum pt_flags {
 	PT_kernel = PG_referenced,
 	PT_reserved = PG_reserved,
+	PT_fragmented = PG_private,
+	PT_frag_defer = PG_active,
 	/* High bits are used for zone/node/section */
 };
 
 static inline struct ptdesc *virt_to_ptdesc(const void *x)
 {
-	return page_ptdesc(virt_to_page(x));
+	struct page *page = virt_to_page(x);
+
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+	/* One hardware table may span multiple native allocator pages. */
+	page = compound_head(page);
+#endif
+	return page_ptdesc(page);
 }
 
 /**
@@ -3836,10 +3865,23 @@ static inline bool pagetable_pte_ctor(struct mm_struct *mm,
 }
 
 pte_t *__pte_offset_map(pmd_t *pmd, unsigned long addr, pmd_t *pmdvalp);
+#ifdef CONFIG_ARCH_HAS_MM_PGTABLE
+pte_t *__pte_offset_map_mm(struct mm_struct *mm, pmd_t *pmd,
+			   unsigned long addr, pmd_t *pmdvalp);
+#else
+#define __pte_offset_map_mm(mm, pmd, addr, pmdvalp) \
+	__pte_offset_map(pmd, addr, pmdvalp)
+#endif
 
 static inline pte_t *pte_offset_map(pmd_t *pmd, unsigned long addr)
 {
 	return __pte_offset_map(pmd, addr, NULL);
+}
+
+static inline pte_t *pte_offset_map_mm(struct mm_struct *mm, pmd_t *pmd,
+				     unsigned long addr)
+{
+	return __pte_offset_map_mm(mm, pmd, addr, NULL);
 }
 
 pte_t *pte_offset_map_lock(struct mm_struct *mm, pmd_t *pmd,
@@ -3859,7 +3901,7 @@ pte_t *pte_offset_map_rw_nolock(struct mm_struct *mm, pmd_t *pmd,
 #define pte_alloc(mm, pmd) (unlikely(pmd_none(*(pmd))) && __pte_alloc(mm, pmd))
 
 #define pte_alloc_map(mm, pmd, address)			\
-	(pte_alloc(mm, pmd) ? NULL : pte_offset_map(pmd, address))
+	(pte_alloc(mm, pmd) ? NULL : pte_offset_map_mm(mm, pmd, address))
 
 #define pte_alloc_map_lock(mm, pmd, address, ptlp)	\
 	(pte_alloc(mm, pmd) ?			\
@@ -3874,7 +3916,7 @@ pte_t *pte_offset_map_rw_nolock(struct mm_struct *mm, pmd_t *pmd,
 static inline struct page *pmd_pgtable_page(pmd_t *pmd)
 {
 	unsigned long mask = ~(PTRS_PER_PMD * sizeof(pmd_t) - 1);
-	return virt_to_page((void *)((unsigned long) pmd & mask));
+	return ptdesc_page(virt_to_ptdesc((void *)((unsigned long)pmd & mask)));
 }
 
 static inline struct ptdesc *pmd_ptdesc(pmd_t *pmd)
@@ -4160,6 +4202,12 @@ extern unsigned long do_mmap(struct file *file, unsigned long addr,
 	unsigned long len, unsigned long prot, unsigned long flags,
 	vm_flags_t vm_flags, unsigned long pgoff, unsigned long *populate,
 	struct list_head *uf);
+#ifdef CONFIG_MM_SUBPAGE
+unsigned long do_mmap_offset(struct file *file, unsigned long addr,
+	unsigned long len, unsigned long prot, unsigned long flags,
+	vm_flags_t vm_flags, struct vm_page_offset pos, unsigned long *populate,
+	struct list_head *uf);
+#endif
 extern int do_vmi_munmap(struct vma_iterator *vmi, struct mm_struct *mm,
 			 unsigned long start, size_t len, struct list_head *uf,
 			 bool unlock);
@@ -4288,7 +4336,11 @@ static inline unsigned long vma_pages(const struct vm_area_struct *vma)
 
 static inline unsigned long vma_last_pgoff(struct vm_area_struct *vma)
 {
+#ifdef CONFIG_MM_SUBPAGE
+	return vma_page_offset_at(vma, vma->vm_end - 1).index;
+#else
 	return vma->vm_pgoff + vma_pages(vma) - 1;
+#endif
 }
 
 static inline unsigned long vma_desc_size(const struct vm_area_desc *desc)
@@ -4541,6 +4593,9 @@ int remap_pfn_range(struct vm_area_struct *vma, unsigned long addr,
 		    unsigned long pfn, unsigned long size, pgprot_t pgprot);
 
 int vm_insert_page(struct vm_area_struct *, unsigned long addr, struct page *);
+int vm_insert_pages_range(struct vm_area_struct *vma, unsigned long addr,
+		struct page **pages, unsigned long nr_pages,
+		unsigned long offset, unsigned long length);
 int vm_insert_pages(struct vm_area_struct *vma, unsigned long addr,
 			struct page **pages, unsigned long *num);
 int map_kernel_pages_prepare(struct vm_area_desc *desc);
@@ -4552,6 +4607,9 @@ int vm_map_pages_zero(struct vm_area_struct *vma, struct page **pages,
 				unsigned long num);
 vm_fault_t vmf_insert_page_mkwrite(struct vm_fault *vmf, struct page *page,
 			bool write);
+vm_fault_t vmf_insert_pfn_prot_mkwrite_offset(struct vm_area_struct *vma,
+		unsigned long addr, unsigned long pfn, unsigned int offset,
+		pgprot_t pgprot, bool mkwrite);
 vm_fault_t vmf_insert_pfn_prot_mkwrite(struct vm_area_struct *vma, unsigned long addr,
 			unsigned long pfn, pgprot_t pgprot, bool mkwrite);
 vm_fault_t vmf_insert_mixed(struct vm_area_struct *vma, unsigned long addr,
@@ -4647,6 +4705,18 @@ static inline vm_fault_t vmf_insert_page(struct vm_area_struct *vma,
 
 	return VM_FAULT_NOPAGE;
 }
+
+/* Insert one user granule from an explicit offset within a native page. */
+#ifdef CONFIG_MM_SUBPAGE
+vm_fault_t vmf_insert_page_offset(struct vm_area_struct *vma, unsigned long addr,
+		struct page *page, unsigned int offset);
+#else
+static inline vm_fault_t vmf_insert_page_offset(struct vm_area_struct *vma,
+		unsigned long addr, struct page *page, unsigned int offset)
+{
+	return offset ? VM_FAULT_SIGBUS : vmf_insert_page(vma, addr, page);
+}
+#endif
 
 #ifndef io_remap_pfn_range_pfn
 static inline unsigned long io_remap_pfn_range_pfn(unsigned long pfn,
