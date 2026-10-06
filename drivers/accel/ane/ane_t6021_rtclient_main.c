@@ -543,14 +543,15 @@ out:
 }
 
 /*
- * Allow output writes to reach DRAM after completion. On our hardware,
- * output became visible about 0.13 ms after acknowledgment and status
- * updates on some calls. A fixed settle margin covers that delay.
+ * Extra sleep after a CALL's finish event. 0 by default: the finish event
+ * already marks the output in DRAM (ane_rtclient_call_wait). The 1 ms
+ * default it replaces dated from a wait on dispatch signals; set it only
+ * to test a suspected late output write.
  */
-static unsigned int call_settle_us = 1000;
+static unsigned int call_settle_us;
 module_param(call_settle_us, uint, 0644);
 MODULE_PARM_DESC(call_settle_us,
-		 "Microseconds to wait after a CALL completes so its output lands (default 1000, 0 = none)");
+		 "Microseconds to sleep after a CALL's finish event (default 0: the event marks the output in DRAM)");
 
 /*
  * Read-only per-CALL TD timeline, disabled by default. When enabled,
@@ -802,6 +803,10 @@ static int ane_rtclient_call_wait_traced(struct ane_rtclient *ane,
  * Acknowledgment, TQ status and the last-committed TD word indicate
  * dispatch rather than execution completion. On our hardware, returning
  * at dispatch could expose zero output before the finish event.
+ * The finish event is also the output-landed signal, so call_settle_us
+ * defaults to 0: measured 2026-10-06, 6000 add calls with new inputs
+ * per call each read their own result right after the event, and
+ * program 20 and the Parakeet encoder stayed bit-identical.
  * Return zero on the event, or -ETIMEDOUT.
  */
 static int ane_rtclient_call_wait(struct ane_rtclient *ane,
@@ -878,8 +883,9 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 						   stats_ticket,
 						   ktime_get_ns(),
 						   (u32)ret, 0);
-			dev_info(ane->dev, "call completion wait failed %d\n",
-				 ret);
+			dev_err(ane->dev,
+				"call completion wait failed %d: no finish event in %u ms\n",
+				ret, timeout_ms);
 			atomic_set(&ane_t6021_quarantined, 1);
 			return ret;
 		}
