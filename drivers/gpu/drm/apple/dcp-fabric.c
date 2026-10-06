@@ -679,6 +679,57 @@ void dcp_fabric_hdmi_resume(struct apple_dcp *dcp)
 	dcp_fabric_run_resume_sample(true, &dcp_resume_sample_ops, dcp);
 }
 
+/*
+ * T6030 HDMI output: the ATC PHY that runs it as four-lane DP, and the
+ * crossbar it goes through, are in power domains that system sleep may
+ * switch off, losing their setup, and the converter is powered through
+ * GPIOs. Set them up again as probe did: converter power on, the PHY taken
+ * out of DP and back into it, and the crossbar output selected again if the
+ * HDMI route holds it. No HDMI link is up when this runs.
+ */
+static void dcp_fixed_hdmi_reinit_locked(struct apple_dcp *dcp, const char *why)
+{
+	int ret = 0;
+
+	lockdep_assert_held(&dcp_typec_fabric_lock);
+	if (!dcp->external_native || !dcp->fixed_phy || !dcp->hdmi_hpd)
+		return;
+	dev_info(dcp->dev, "HDMI: setting up the output again (%s)\n", why);
+	if (dcp->hdmi_pwren)
+		gpiod_set_value_cansleep(dcp->hdmi_pwren, 1);
+	if (dcp->dp2hdmi_pwren)
+		gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, 1);
+	if (dcp->typec_mux && dcp->phy_managed_by_typec) {
+		struct typec_altmode alt = { .svid = USB_TYPEC_DP_SID };
+		struct typec_mux_state state = { .mode = TYPEC_STATE_SAFE };
+
+		ret = typec_mux_set(dcp->typec_mux, &state);
+		if (!ret) {
+			state.alt = &alt;
+			state.mode = TYPEC_DP_STATE_C;
+			ret = typec_mux_set(dcp->typec_mux, &state);
+		}
+		if (ret)
+			dev_warn(dcp->dev, "HDMI: PHY not set up again: %d\n", ret);
+	}
+	if (dcp->xbar && dcp->fixed_route_selected && !dcp->active_typec_route) {
+		scoped_guard(mutex, &dcp->tb_lock)
+			dcp->direct_xbar_up = NULL;
+		ret = mux_control_deselect(dcp->xbar);
+		dcp->fixed_route_selected = false;
+		if (!ret)
+			ret = dcp_fixed_output_select(dcp);
+		if (ret)
+			dev_warn(dcp->dev, "HDMI: crossbar output not selected again: %d\n", ret);
+	}
+}
+
+void dcp_fabric_hdmi_reinit(struct apple_dcp *dcp, const char *why)
+{
+	guard(mutex)(&dcp_typec_fabric_lock);
+	dcp_fixed_hdmi_reinit_locked(dcp, why);
+}
+
 /* A Thunderbolt tunnel holds @dcp's pipeline: it never moves. */
 static bool dcp_typec_tunnel_held(struct apple_dcp *dcp)
 {

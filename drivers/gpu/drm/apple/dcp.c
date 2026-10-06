@@ -2273,6 +2273,9 @@ static int dcp_platform_resume(struct device *dev)
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
 	dcp_enable_typec_work(dcp);
+	/* The HDMI output's PHY and crossbar may have lost their setup in sleep. */
+	if (dcp->external_native)
+		dcp_fabric_hdmi_reinit(dcp, "after system sleep");
 	/* Observe future edges before sampling any edges lost in sleep. */
 	if (dcp->hdmi_hpd_irq)
 		dcp_fabric_run_resume(&dcp_resume_ops, dcp);

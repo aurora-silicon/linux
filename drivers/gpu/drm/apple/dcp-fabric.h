@@ -80,6 +80,7 @@ int dcp_register_typec_routes(struct apple_dcp *dcp);
 void dcp_typec_retrain_work(struct work_struct *work);
 void dcp_fabric_init(struct apple_dcp *dcp);
 void dcp_fabric_hdmi_resume(struct apple_dcp *dcp);
+void dcp_fabric_hdmi_reinit(struct apple_dcp *dcp, const char *why);
 irqreturn_t dcp_dp2hdmi_hpd_edge(int irq, void *data);
 irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data);
 void dcp_fabric_shutdown_dptx(struct apple_dcp *dcp);
