@@ -92,6 +92,9 @@
 # --m3-handoff, m1n1-aurora aurora8 with a dry run (M3_AIR_DRY_RUN): m1n1
 # reads and reports the Air's GPU and display details and starts nothing. A
 # plain run keeps an Air kernel-only.
+# 11.110.1-test: the same kernel; m1n1 aurora8.1's dry run also reads the
+# display's live state when the Mac reports its power domain on, the panel
+# and PMP details and the GPU's core count; and --m3-report.
 # It replaces linux-asahi (or linux-aurora) as a pacman package,
 # so mkinitcpio and update-m1n1 run from their own hooks; on a GRUB Mac this
 # script regenerates grub.cfg and keeps the previous kernel as a fallback entry.
@@ -127,7 +130,7 @@ set -euo pipefail
 # The kernel package version and the release tag move independently: a release
 # that only changes m1n1 reuses the previous kernel packages unchanged.
 VERSION=7.1.12.aurora2-11.110
-TAG=sep-7.1.12.aurora2-11.110-test
+TAG=sep-7.1.12.aurora2-11.110.1-test
 # Packages are fetched from this script's own tag, never from "latest": the
 # checksums below belong to this release and nothing else.
 RELEASE_URL=https://github.com/iconidentify/aurora-linux/releases/download/$TAG
@@ -149,7 +152,7 @@ M3_M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora7-1-aarch64.pkg.tar.zst 547d0d5f9daa283
 # "file sha256". It may name the same package as M3_M1N1_PACKAGE once one m1n1
 # carries both. Left empty, an Air stays kernel-only and --m3-handoff on an
 # Air stops with nothing installed.
-M3_AIR_M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora8-1-aarch64.pkg.tar.zst d443671d819887b01ed712e1ff86429999bec9f857c6d67bf3040647b5c3176e"
+M3_AIR_M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora8.1-1-aarch64.pkg.tar.zst 100919f635e3358027cceb6055f3076f3d29ea11cf2c71721c17a25608dcee13"
 PINNED="linux-aurora linux-aurora-headers libfprint m1n1-aurora"
 PIN_BEGIN="# >>> aurora-sep pin (remove with: install-aurora-sep.sh --uninstall)"
 PIN_END="# <<< aurora-sep pin"
