@@ -1484,15 +1484,23 @@ bool iomfb_v14_7_external_ready(struct apple_dcp *dcp)
 	case DCPEXT_RUNNING:
 		return smp_load_acquire(&dcp->dptxport[0].enabled);
 	case DCPEXT_IDLE:
-		/* Not between sleep's prepare and complete; the next attach starts it. */
-		if (READ_ONCE(dcp->external_suspended))
-			return false;
-		if (!atomic_cmpxchg(&dcp->external_requested, 0, 1)) {
-			WRITE_ONCE(dcp->external_phase, DCPEXT_STARTING);
-			dev_info(dcp->dev, "display attached: starting the external display processor\n");
-			/* Firmware callbacks may outlive any later module removal. */
-			__module_get(THIS_MODULE);
-			queue_work(system_unbound_wq, &dcp->external_work);
+		/*
+		 * Under the lock system sleep's prepare and suspend check the
+		 * phase under: a start is requested before they look, and then
+		 * refuses sleep, or not between them and complete, when the
+		 * next attach starts it. The start work is frozen with tasks.
+		 */
+		scoped_guard(mutex, &dcp->hpd_mutex) {
+			if (READ_ONCE(dcp->external_suspended) ||
+			    smp_load_acquire(&dcp->external_phase) != DCPEXT_IDLE)
+				return false;
+			if (!atomic_cmpxchg(&dcp->external_requested, 0, 1)) {
+				WRITE_ONCE(dcp->external_phase, DCPEXT_STARTING);
+				dev_info(dcp->dev, "display attached: starting the external display processor\n");
+				/* Firmware callbacks may outlive any later module removal. */
+				__module_get(THIS_MODULE);
+				queue_work(system_freezable_wq, &dcp->external_work);
+			}
 		}
 		return false;
 	default:
@@ -1696,11 +1704,27 @@ static int dcpext_boot(struct apple_dcp *dcp)
 	return 0;
 }
 
+/* Native: system sleep began after the start was requested; undo the request. */
+static bool dcpext_start_deferred(struct apple_dcp *dcp)
+{
+	guard(mutex)(&dcp->hpd_mutex);
+	if (!READ_ONCE(dcp->external_suspended))
+		return false;
+	WRITE_ONCE(dcp->external_phase, DCPEXT_IDLE);
+	atomic_set(&dcp->external_requested, 0);
+	dev_info(dcp->dev, "system sleep began: the external display processor starts on the next attach\n");
+	module_put(THIS_MODULE);
+	return true;
+}
+
 static void dcpext_bringup(struct work_struct *work)
 {
 	struct apple_dcp *dcp = container_of(work, struct apple_dcp, external_work);
-	int ret = dcpext_boot(dcp);
+	int ret;
 
+	if (dcp->external_native && dcpext_start_deferred(dcp))
+		return;
+	ret = dcpext_boot(dcp);
 	if (!dcp->external_native)
 		return;
 	/* Pairs with external_ready(): the endpoints are published first. */
