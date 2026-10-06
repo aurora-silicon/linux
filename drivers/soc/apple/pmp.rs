@@ -7,6 +7,8 @@
 
 use core::mem;
 
+mod pmp_bootargs;
+
 use kernel::{
     bindings,
     device::{
@@ -162,21 +164,13 @@ impl PmpData {
         let io = self.pmp_mmio.access(dev.as_ref())?.relaxed();
         let offset = io.read32(BOOTARGS_OFFSET) as usize;
         let size = io.read32(BOOTARGS_SIZE) as usize;
+        if !pmp_bootargs::region_valid(offset, size, PMP_MMIO_SIZE) {
+            return Err(EINVAL);
+        }
         let mut arg_bytes = kvec![0u8; size]?;
         io.try_memcpy_fromio(&mut arg_bytes, offset)?;
-        let mut idx = 0;
-        while idx < size {
-            let key = u32::from_le_bytes(arg_bytes[idx..idx + 4].try_into().unwrap());
-            let size = u32::from_le_bytes(arg_bytes[idx + 4..idx + 8].try_into().unwrap()) as usize;
-            idx += 8;
-            for (k, v) in patches.iter() {
-                if *k != key {
-                    continue;
-                }
-                arg_bytes[idx..idx + size].copy_from_slice(&(*v as u64).to_le_bytes()[..size]);
-                break;
-            }
-            idx += size;
+        if !pmp_bootargs::patch(&mut arg_bytes, patches) {
+            return Err(EINVAL);
         }
         io.try_memcpy_toio(offset, &arg_bytes)
     }
