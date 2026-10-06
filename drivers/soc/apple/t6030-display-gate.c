@@ -14,9 +14,10 @@
  * locked the inherited DART mappings. apple_t6030_display.enable=0 on the
  * kernel command line keeps the display on the boot framebuffer instead;
  * apple_t6030_display.dcpext=0 and apple_t6030_display.scanout=0 do the same
- * for the external display processor and its scanout. The
- * targets are found through the DCP's and the display subsystem's
- * phandles, and each must still be disabled. Otherwise nothing is changed.
+ * for the external display processors and their display DARTs (see
+ * gate_dcpext() below). The targets are found through the DCP's and the
+ * display subsystem's phandles, and each must still be disabled. Otherwise
+ * nothing is changed.
  *
  * The DCP firmware needs the power management processor (PMP) running,
  * which iBoot leaves loaded but halted. Once the display nodes are enabled,
@@ -125,7 +126,7 @@ struct gate_soc {
 	const char *fallback_board;	/* gets the fallback overlay without boot loader values */
 	const u8 *fallback_dtbo, *fallback_dtbo_end;
 	bool quiet_without_nodes;	/* no display nodes in the device tree is normal */
-	bool dcpext;			/* the external display processor and its scanout */
+	bool dcpext;			/* the external display processors and their DARTs */
 };
 
 static const struct gate_soc gate_t6030 __initconst = {
@@ -650,10 +651,20 @@ static int __init gate_pmp_apply(struct device_node *dcp, struct device_node **p
 	return 0;
 }
 
-/* An external handoff describes memory only; firmware startup is a later,
- * explicit driver operation. Older kernels leave all these nodes disabled. */
+/*
+ * External display processors (dcpext0, dcpext1, ...). The boot loader hands
+ * each one over separately: its memory (apple,t6030-dcpext-memory-ready), and
+ * its display DART with a scanout child that names it
+ * (apple,t6030-dispext-handoff). Nothing here touches a processor's CPU.
+ *
+ * A processor that was handed over is enabled with its DART, mailbox, PMP
+ * request and Type-C routes, and its display DART and scanout child when
+ * they check out. Any other processor stays disabled, and so do its Type-C
+ * routes, so the USB-C ports never wait for a display mode switch nobody
+ * registers. apple_t6030_display.dcpext=0 refuses every processor;
+ * apple_t6030_display.scanout=0 leaves the display DARTs alone.
+ */
 static bool gate_dcpext_requested __initdata = true;
-static struct of_changeset gate_dcpext_cs;
 
 static int __init gate_dcpext_setup(char *arg)
 {
@@ -662,13 +673,88 @@ static int __init gate_dcpext_setup(char *arg)
 early_param("apple_t6030_display.dcpext", gate_dcpext_setup);
 
 static bool gate_scanout_requested __initdata = true;
-static struct of_changeset gate_scanout_cs;
 
 static int __init gate_scanout_setup(char *arg)
 {
 	return kstrtobool(arg, &gate_scanout_requested);
 }
 early_param("apple_t6030_display.scanout", gate_scanout_setup);
+
+#define GATE_DCPEXT_MAX		4
+
+/* One external display processor and what the gate found for it. */
+struct gate_ext {
+	struct device_node *dcp, *dart, *mbox;
+	struct device_node *cpu, *fe, *sys;
+	struct device_node *entry;	/* its PMP request, pmp-dispextN */
+	struct device_node *scanout;	/* the boot loader's scanout child */
+	struct device_node *disp_dart;	/* the display DART that child names */
+	unsigned int index;		/* N of dispextN */
+	bool memory;			/* the memory handoff is present */
+	bool scanout_ok;		/* the display DART handoff checked out */
+};
+
+static void __init gate_ext_put(struct gate_ext *ext)
+{
+	of_node_put(ext->disp_dart);
+	of_node_put(ext->scanout);
+	of_node_put(ext->entry);
+	of_node_put(ext->sys);
+	of_node_put(ext->fe);
+	of_node_put(ext->cpu);
+	of_node_put(ext->mbox);
+	of_node_put(ext->dart);
+	of_node_put(ext->dcp);
+}
+
+/*
+ * True if @ps is the power state labelled "dispext<N>_<suffix>". The first
+ * call sets *@index (UINT_MAX on entry); later calls must name the same N.
+ */
+static bool __init gate_ps_dispext(const struct device_node *ps, const char *suffix,
+				   unsigned int *index)
+{
+	const char *label, *p;
+	unsigned int n = 0;
+
+	if (!ps || !of_device_is_compatible(ps, gate_soc->pwrstate_compat) ||
+	    of_property_read_string(ps, "label", &label) || !strstarts(label, "dispext"))
+		return false;
+	p = label + strlen("dispext");
+	if (*p < '0' || *p > '9')
+		return false;
+	while (*p >= '0' && *p <= '9' && n < GATE_DCPEXT_MAX)
+		n = n * 10 + *p++ - '0';
+	if (n >= GATE_DCPEXT_MAX || *p++ != '_' || strcmp(p, suffix))
+		return false;
+	if (*index != UINT_MAX && *index != n)
+		return false;
+	*index = n;
+	return true;
+}
+
+/* The PMP request entry labelled pmp-dispext<index>. */
+static struct device_node *__init gate_pmp_dispext_entry(unsigned int index)
+{
+	struct device_node *report, *child, *found = NULL;
+	char want[16];
+	const char *label;
+
+	report = gate_find_one(gate_soc->report_compat);
+	if (!report || !of_device_is_available(report)) {
+		of_node_put(report);
+		return NULL;
+	}
+	snprintf(want, sizeof(want), "pmp-dispext%u", index);
+	for_each_child_of_node(report, child) {
+		if (!of_property_read_string(child, "label", &label) && !strcmp(label, want)) {
+			found = child;
+			break;
+		}
+	}
+	of_node_put(report);
+	return found;
+}
 
 /*
  * A no-map DT reservation is recorded by the reserved-memory parser, but
@@ -707,10 +793,15 @@ static bool __init gate_scanout_table_reserved(struct device_node *region,
 	return true;
 }
 
-/* Read-only verification before Linux may attach the external display DART. */
-static void __init gate_dispext_scanout(struct device_node *dcp)
+/*
+ * Read-only check of the display DART the boot loader handed over with
+ * @ext's scanout child, before Linux may attach to it: locked, translating,
+ * with empty stream 0 and stream 4 roots in reserved tables, and powered by
+ * the processor's own CPU domain.
+ */
+static int __init gate_dispext_check(struct gate_ext *ext)
 {
-	struct device_node *scanout = NULL, *dart = NULL, *region = NULL;
+	struct device_node *dart = NULL, *region = NULL;
 	struct resource regs, table, first_table = {};
 	struct of_phandle_args spec;
 	void __iomem *mmio = NULL;
@@ -719,18 +810,18 @@ static void __init gate_dispext_scanout(struct device_node *dcp)
 	u64 phys;
 	int i, ret = -EINVAL;
 
-	if (!gate_scanout_requested)
-		return;
-	scanout = of_get_child_by_name(dcp, "scanout");
-	if (!scanout || !gate_disabled(scanout) ||
-	    !of_device_is_compatible(scanout, "apple,t6030-dispext-scanout") ||
-	    of_property_read_u32(scanout, "apple,t6030-dispext-handoff", &marker) || marker != 1)
-		goto out;
-	if (of_count_phandle_with_args(scanout, "iommus", "#iommu-cells") != 1 ||
-	    of_parse_phandle_with_args(scanout, "iommus", "#iommu-cells", 0, &spec))
-		goto out;
+	ext->scanout = of_get_child_by_name(ext->dcp, "scanout");
+	if (!ext->scanout || !gate_disabled(ext->scanout) ||
+	    !of_device_is_compatible(ext->scanout, "apple,t6030-dispext-scanout") ||
+	    of_property_read_u32(ext->scanout, "apple,t6030-dispext-handoff", &marker) ||
+	    marker != 1)
+		return -ENODEV;
+	if (of_count_phandle_with_args(ext->scanout, "iommus", "#iommu-cells") != 1 ||
+	    of_parse_phandle_with_args(ext->scanout, "iommus", "#iommu-cells", 0, &spec))
+		return -EINVAL;
 	dart = spec.np;
 	if (spec.args_count != 1 || spec.args[0] != 0 || !gate_disabled(dart) ||
+	    !dart->phandle || dart == ext->dart ||
 	    !of_device_is_compatible(dart, "apple,t8110-dart") ||
 	    of_property_read_u32(dart, "apple,t6030-dispext-handoff", &marker) || marker != 1 ||
 	    of_property_count_u32_elems(dart, "apple,inherited-dart-state") != 6 ||
@@ -739,9 +830,14 @@ static void __init gate_dispext_scanout(struct device_node *dcp)
 	    of_property_match_string(dart, "memory-region-names", "sid0-page-tables") != 0 ||
 	    of_property_match_string(dart, "memory-region-names", "sid4-page-tables") != 1 ||
 	    state[0] != 0 || state[3] != 4 ||
-	    of_address_to_resource(dart, 0, &regs) ||
-	    regs.start != 0x2d1304000ULL || resource_size(&regs) != SZ_16K)
+	    of_address_to_resource(dart, 0, &regs) || resource_size(&regs) != SZ_16K)
 		goto out;
+	/* The DART belongs to this processor's pipe: it shares its CPU domain. */
+	region = gate_ps_parent(dart);
+	if (region != ext->cpu)
+		goto out;
+	of_node_put(region);
+	region = NULL;
 	mmio = ioremap(regs.start, resource_size(&regs));
 	if (!mmio || !(readl(mmio + 0x200) & BIT(0)))
 		goto out;
@@ -780,117 +876,205 @@ static void __init gate_dispext_scanout(struct device_node *dcp)
 		of_node_put(region);
 		region = NULL;
 	}
-	of_changeset_init(&gate_scanout_cs);
-	ret = gate_set_u32(&gate_scanout_cs, scanout, "apple,t6030-scanout-verified", 1);
-	if (!ret)
-		ret = of_changeset_update_prop_string(&gate_scanout_cs, dart, "status", "okay");
-	if (!ret)
-		ret = of_changeset_update_prop_string(&gate_scanout_cs, scanout, "status", "okay");
-	if (!ret)
-		ret = of_changeset_apply(&gate_scanout_cs);
-	if (ret)
-		of_changeset_destroy(&gate_scanout_cs);
-	else
-		gate_info("external scanout DART verified locked with empty SID0/SID4 roots; enabled SID0 consumer\n");
+	ext->disp_dart = of_node_get(dart);
+	ext->scanout_ok = true;
 out:
-	if (ret)
-		gate_warn("external scanout remains disabled: handoff/root validation failed (%d)\n", ret);
 	if (mmio)
 		iounmap(mmio);
 	of_node_put(region);
 	of_node_put(dart);
-	of_node_put(scanout);
+	return ret;
 }
 
-static void __init gate_dcpext(void)
+/* Everything @ext's processor needs, checked without changing anything. */
+static int __init gate_ext_resolve(struct gate_ext *ext)
 {
-	struct device_node *np[3] = {};
-	struct device_node *cpu = NULL, *fe = NULL, *sys = NULL;
-	struct device_node *report = NULL, *entry = NULL, *domain = NULL, *child;
-	bool applied = false;
+	struct device_node *domain;
 	u32 ready, id;
-	int i, ret;
+	int i;
 
-	if (!gate_dcpext_requested)
-		return;
-	np[0] = gate_find_one("apple,t6030-dcpext");
-	if (!np[0] || of_property_read_u32(np[0], "apple,t6030-dcpext-memory-ready", &ready) ||
-	    ready != 1 || !of_property_present(np[0], "memory-region")) {
-		/* The boot loader did not hand the external processor over. */
-		gate_info("dcpext not handed off by the boot loader, left disabled\n");
-		goto put;
-	}
-	np[1] = gate_target(np[0], "iommus", "#iommu-cells", 1, 5, "apple,t8110-dart");
-	np[2] = gate_target(np[0], "mboxes", "#mbox-cells", 0, 0, "apple,asc-mailbox-v4");
-	for (i = 0; i < 3; i++)
-		if (!np[i] || !gate_disabled(np[i]))
-			goto out;
+	ext->index = UINT_MAX;
+	ext->memory = !of_property_read_u32(ext->dcp, "apple,t6030-dcpext-memory-ready", &ready) &&
+		      ready == 1 && of_property_present(ext->dcp, "memory-region");
+	if (!ext->memory)
+		return -ENODEV;
+	ext->dart = gate_target(ext->dcp, "iommus", "#iommu-cells", 1, 5, "apple,t8110-dart");
+	ext->mbox = gate_target(ext->dcp, "mboxes", "#mbox-cells", 0, 0, "apple,asc-mailbox-v4");
+	if (!ext->dart || !ext->mbox || !gate_disabled(ext->dcp) ||
+	    !gate_disabled(ext->dart) || !gate_disabled(ext->mbox))
+		return -EINVAL;
 
 	/* Do not enable a CPU whose power ownership is not fully described. */
-	cpu = gate_ps_parent(np[0]);
-	if (!gate_ps_is(cpu, "dispext0_cpu"))
-		goto out;
-	fe = gate_ps_parent(cpu);
-	if (!gate_ps_is(fe, "dispext0_fe"))
-		goto out;
-	sys = gate_ps_parent(fe);
-	if (!gate_ps_is(sys, "dispext0_sys"))
-		goto out;
-	for (i = 1; i < 3; i++) {
-		domain = gate_ps_parent(np[i]);
-		if (domain != cpu)
-			goto out;
+	ext->cpu = gate_ps_parent(ext->dcp);
+	if (!gate_ps_dispext(ext->cpu, "cpu", &ext->index))
+		return -EINVAL;
+	ext->fe = gate_ps_parent(ext->cpu);
+	if (!gate_ps_dispext(ext->fe, "fe", &ext->index))
+		return -EINVAL;
+	ext->sys = gate_ps_parent(ext->fe);
+	if (!gate_ps_dispext(ext->sys, "sys", &ext->index))
+		return -EINVAL;
+	for (i = 0; i < 2; i++) {
+		domain = gate_ps_parent(i ? ext->mbox : ext->dart);
 		of_node_put(domain);
-		domain = NULL;
+		if (domain != ext->cpu)
+			return -EINVAL;
 	}
-	report = gate_find_one("apple,t6030-pmp-v2-report");
-	if (!report || !of_device_is_available(report))
-		goto out;
-	for_each_child_of_node(report, child) {
-		if (!strcmp(of_node_full_name(child), "report@8")) {
-			entry = child;
+
+	/* The driver waits for this request's acknowledgement before RUN. */
+	ext->entry = gate_pmp_dispext_entry(ext->index);
+	if (!ext->entry || !gate_disabled(ext->entry) || !ext->entry->phandle ||
+	    !of_device_is_compatible(ext->entry, "apple,t6000-pmp-v2-report-entry") ||
+	    of_property_read_u32(ext->entry, "reg", &id) ||
+	    !of_property_read_bool(ext->entry, "apple,always-on") ||
+	    of_property_read_bool(ext->entry, "apple,no-ack"))
+		return -ENOENT;
+	return 0;
+}
+
+/* Kept for good once applied: the live tree refers to it. */
+static struct of_changeset *__init gate_cs_alloc(void)
+{
+	struct of_changeset *cs = kzalloc_obj(*cs);
+
+	if (cs)
+		of_changeset_init(cs);
+	return cs;
+}
+
+static void __init gate_cs_free(struct of_changeset *cs)
+{
+	of_changeset_destroy(cs);
+	kfree(cs);
+}
+
+/* Sets "status" of every Type-C route of @dcp that does not already have it. */
+static int __init gate_ext_routes(struct of_changeset *cs, struct device_node *dcp,
+				  const char *status)
+{
+	struct device_node *routes, *route;
+	const char *now;
+	int ret = 0;
+
+	routes = of_get_child_by_name(dcp, "typec-routes");
+	for_each_child_of_node(routes, route) {
+		if (!of_property_read_string(route, "status", &now) && !strcmp(now, status))
+			continue;
+		ret = of_changeset_update_prop_string(cs, route, "status", status);
+		if (ret) {
+			of_node_put(route);
 			break;
 		}
 	}
-	if (!entry || !gate_disabled(entry) || !entry->phandle ||
-	    !of_device_is_compatible(entry, "apple,t6000-pmp-v2-report-entry") ||
-	    of_property_read_u32(entry, "reg", &id) || id != 8 ||
-	    !of_property_read_bool(entry, "apple,always-on") ||
-	    of_property_read_bool(entry, "apple,no-ack"))
-		goto out;
+	of_node_put(routes);
+	return ret;
+}
 
-	of_changeset_init(&gate_dcpext_cs);
+/* Enables @ext's processor, and its display DART if that checked out. */
+static int __init gate_ext_apply(struct gate_ext *ext)
+{
+	struct of_changeset *cs = gate_cs_alloc();
+	int ret;
+
+	if (!cs)
+		return -ENOMEM;
 	/* PMGR applies the floor at probe, before the PMP can manage this CPU. */
-	ret = gate_set_u32(&gate_dcpext_cs, cpu, "apple,min-state", PMGR_PS_ACTIVE);
-	/* The driver must wait for this report's acknowledgement before RUN. */
+	ret = gate_set_u32(cs, ext->cpu, "apple,min-state", PMGR_PS_ACTIVE);
+	/* The driver must wait for this request's acknowledgement before RUN. */
 	if (!ret)
-		ret = gate_set_u32(&gate_dcpext_cs, np[0], "apple,pmp-report", entry->phandle);
+		ret = gate_set_u32(cs, ext->dcp, "apple,pmp-report", ext->entry->phandle);
 	if (!ret)
-		ret = of_changeset_update_prop_string(&gate_dcpext_cs, entry, "status", "okay");
-	for (i = 0; i < 3 && !ret; i++)
-		ret = of_changeset_update_prop_string(&gate_dcpext_cs, np[i], "status", "okay");
+		ret = of_changeset_update_prop_string(cs, ext->entry, "status", "okay");
 	if (!ret)
-		ret = of_changeset_apply(&gate_dcpext_cs);
-	if (ret) {
-		of_changeset_destroy(&gate_dcpext_cs);
-		gate_warn("external memory gate failed: %d\n", ret);
-	} else {
-		applied = true;
-		gate_info("enabled dcpext memory devices and PMP DISPEXT0 request with CPU power floor; external CPU startup remains manual\n");
-		gate_dispext_scanout(np[0]);
+		ret = of_changeset_update_prop_string(cs, ext->dart, "status", "okay");
+	if (!ret)
+		ret = of_changeset_update_prop_string(cs, ext->mbox, "status", "okay");
+	if (!ret)
+		ret = of_changeset_update_prop_string(cs, ext->dcp, "status", "okay");
+	/* A processor's routes are usable exactly when the processor is. */
+	if (!ret)
+		ret = gate_ext_routes(cs, ext->dcp, "okay");
+	if (!ret && ext->scanout_ok) {
+		ret = gate_set_u32(cs, ext->scanout, "apple,t6030-scanout-verified", 1);
+		if (!ret)
+			ret = of_changeset_update_prop_string(cs, ext->disp_dart, "status", "okay");
+		if (!ret)
+			ret = of_changeset_update_prop_string(cs, ext->scanout, "status", "okay");
 	}
-out:
-	if (!applied)
-		gate_warn("dcpext remains disabled: power and memory prerequisites were not applied\n");
+	if (!ret)
+		ret = of_changeset_apply(cs);
+	if (ret)
+		gate_cs_free(cs);
+	return ret;
+}
+
+/* Leaves @dcp disabled, and its routes with it. */
+static void __init gate_ext_refuse(struct device_node *dcp, const char *why)
+{
+	struct of_changeset *cs;
+	int ret = -ENOMEM;
+
+	cs = gate_cs_alloc();
+	if (cs) {
+		ret = gate_ext_routes(cs, dcp, "disabled");
+		if (!ret)
+			ret = of_changeset_apply(cs);
+		if (ret)
+			gate_cs_free(cs);
+	}
+	gate_info("%pOF left disabled: %s%s\n", dcp, why,
+		  ret ? "; its Type-C routes could not be disabled" : "");
+}
+
+static void __init gate_dcpext_one(struct device_node *np, const char *refuse)
+{
+	struct gate_ext ext = { .dcp = of_node_get(np) };
+	int ret;
+
+	if (!gate_disabled(np)) {
+		gate_warn("%pOF is not disabled; external display gate skipped\n", np);
+		goto put;
+	}
+	if (refuse) {
+		gate_ext_refuse(np, refuse);
+		goto put;
+	}
+	ret = gate_ext_resolve(&ext);
+	if (ret == -ENODEV) {
+		gate_ext_refuse(np, "the boot loader did not hand it over");
+		goto put;
+	}
+	if (ret) {
+		gate_ext_refuse(np, "power, memory or PMP prerequisites are not described");
+		goto put;
+	}
+	if (gate_scanout_requested) {
+		ret = gate_dispext_check(&ext);
+		if (ret && ret != -ENODEV)
+			gate_warn("%pOF: display DART handoff failed validation (%d)\n", np, ret);
+	}
+	ret = gate_ext_apply(&ext);
+	if (ret) {
+		gate_warn("%pOF: changeset failed: %d\n", np, ret);
+		gate_ext_refuse(np, "the gate could not enable it");
+		goto put;
+	}
+	gate_info("enabled dcpext%u (%pOF) with PMP DISPEXT%u request, CPU power floor and Type-C routes%s; external CPU startup remains manual\n",
+		  ext.index, np, ext.index,
+		  ext.scanout_ok ? ", and its verified scanout DART" : "");
 put:
-	of_node_put(domain);
-	of_node_put(entry);
-	of_node_put(report);
-	of_node_put(sys);
-	of_node_put(fe);
-	of_node_put(cpu);
-	for (i = 0; i < 3; i++)
-		of_node_put(np[i]);
+	gate_ext_put(&ext);
+}
+
+/* Every external processor; @refuse, if set, says why none is enabled. */
+static void __init gate_dcpext(const char *refuse)
+{
+	struct device_node *np;
+
+	if (!refuse && !gate_dcpext_requested)
+		refuse = "disabled on the command line";
+	for_each_compatible_node(np, NULL, "apple,t6030-dcpext")
+		gate_dcpext_one(np, refuse);
 }
 
 /* Runs before of_platform_default_populate_init() at arch_initcall_sync. */
@@ -899,6 +1083,7 @@ static int __init apple_t6030_display_gate(void)
 	struct device_node *np[GATE_NR_NODES] = {};
 	struct device_node *ps[PMP_PS_NR] = {};
 	struct device_node *aic = NULL;
+	bool panel = false;
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(gate_socs) && !gate_soc; i++)
@@ -909,15 +1094,20 @@ static int __init apple_t6030_display_gate(void)
 
 	if (!gate_requested) {
 		gate_info("disabled on the command line, display stays on the boot framebuffer\n");
+		if (gate_soc->dcpext)
+			gate_dcpext("the display gate is disabled");
 		return 0;
 	}
 
 	if (!gate_resolve(np) && !gate_pmp_resolve(np, ps, &aic) && !gate_apply(np)) {
 		if (gate_pmp_apply(np[GATE_DCP], ps, aic))
 			gate_revert();
-		else if (gate_soc->dcpext)
-			gate_dcpext();
+		else
+			panel = true;
 	}
+	/* External processors need the panel's PMP; without it they stay off. */
+	if (gate_soc->dcpext)
+		gate_dcpext(panel ? NULL : "the internal display was not handed over");
 	of_node_put(aic);
 	for (i = 0; i < PMP_PS_NR; i++)
 		of_node_put(ps[i]);
