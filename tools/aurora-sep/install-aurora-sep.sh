@@ -4011,6 +4011,9 @@ M3_SURVEY_DIE_KEYS='^T[pefg]'
 M3_SURVEY_LIMIT_MC=100000
 M3_SURVEY_MIN_MC=-40000
 M3_SURVEY_MAX_MC=150000
+# A load runs only while the sampler runs and a watched temperature is current: a valid sample
+# (a number, -40..150 C) of a die key or a SoC thermal zone no older than this many real seconds.
+M3_SURVEY_STALE_S=10
 # The run's state, for the traps.
 M3_SURVEY_PIDS=()
 M3_SURVEY_P=()
@@ -4021,6 +4024,17 @@ M3_SURVEY_BL_START=""
 M3_SURVEY_SEEN=0
 M3_SURVEY_HOT=""
 M3_SURVEY_STOP=""
+# The samples that count as a watched temperature (set by m3_power_survey; empty: nothing is
+# watched, and no load may run), when the sampler started, and the newest such sample's time.
+M3_SURVEY_WATCH_RE=""
+M3_SURVEY_STARTED=""
+M3_SURVEY_LAST=""
+# Why the survey failed (no load runs after it is set), what the restore left undone (one line
+# per item, with the command that undoes it), and what it verified.
+M3_SURVEY_FAIL=""
+M3_SURVEY_CLEANUP_ERR=""
+M3_SURVEY_BL_DONE=""
+M3_SURVEY_REPORTED=0
 
 # The CPUs split by capacity, as the Air survey split them: those with the highest cpu_capacity
 # are the P-cores (M3_SURVEY_P), the others the E-cores (M3_SURVEY_E). Offline CPUs are left out.
@@ -4053,11 +4067,20 @@ m3_survey_backlight() {
   echo "$best"
 }
 
-m3_survey_bl_set() { echo "$1" | $sudo tee "$M3_SURVEY_BL/brightness" >/dev/null; }
+# Sets the backlight's brightness to VALUE and reads it back: returns 1 unless it reads VALUE.
+m3_survey_bl_set() {
+  echo "$1" | $sudo tee "$M3_SURVEY_BL/brightness" >/dev/null 2>&1 || return 1
+  [[ $(m3_attr "$M3_SURVEY_BL/brightness") == "$1" ]]
+}
 
 # One busy loop pinned to each CPU given, each ending on its own shortly after a phase.
 m3_survey_load() {
   local n max
+  # Never without a watched temperature (the idle-only run has none).
+  if [[ -z $M3_SURVEY_WATCH_RE ]]; then
+    M3_SURVEY_FAIL="no CPU or SoC die temperature is watched, so no load may run"
+    return 1
+  fi
   max=$(awk -v s="$M3_SURVEY_PHASE_S" -v t="$M3_SURVEY_TICK" 'BEGIN { printf "%d", s * t + 15 }')
   for n in "$@"; do
     timeout "$max" taskset -c "$n" sh -c 'while :; do :; done' &
@@ -4065,10 +4088,29 @@ m3_survey_load() {
   done
 }
 
+# Whether a process (by pid) still runs: not gone, not a zombie. From the real /proc.
+m3_survey_alive() {
+  local st
+  [[ -n $1 ]] || return 1
+  st=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  st=${st##*) }
+  [[ ${st%% *} != Z ]]
+}
+
+# The process groups of loads (timeout makes one per loop) that are still running.
+M3_SURVEY_LOAD_LEFT=""
 m3_survey_stop_load() {
+  local pid
   if ((${#M3_SURVEY_PIDS[@]})); then
     kill "${M3_SURVEY_PIDS[@]}" 2>/dev/null || true
     wait "${M3_SURVEY_PIDS[@]}" 2>/dev/null || true
+    for pid in "${M3_SURVEY_PIDS[@]}"; do
+      if pgrep -g "$pid" >/dev/null 2>&1; then
+        kill -KILL -- "-$pid" 2>/dev/null || true
+        sleep 0.2
+        if pgrep -g "$pid" >/dev/null 2>&1; then M3_SURVEY_LOAD_LEFT+=" $pid"; fi
+      fi
+    done
   fi
   M3_SURVEY_PIDS=()
 }
@@ -4095,7 +4137,8 @@ m3_survey_sampler_start() { # KEYS SECONDS
       ts=$(date +%s.%N)
       read -r ph <"$3" || ph=unknown
       if [ -n "$1" ]; then
-        awk -v ts="$ts" -v ph="$ph" '\''$2 ~ /^[TP]/ && NF == 6 && $6 ~ /^-?[0-9]+$/ { print ts, ph, $2, $6 }'\'' "$1"
+        awk -v ts="$ts" -v ph="$ph" '\''$2 ~ /^[TP]/ && NF == 6 && $6 ~ /^-?[0-9]+$/ { print ts, ph, $2, $6 }'\'' "$1" ||
+          echo "$ts $ph ERR smc-key-list"
       fi
       while read -r z k; do
         read -r v <"$z/temp" 2>/dev/null && echo "$ts $ph $k $v"
@@ -4104,62 +4147,148 @@ m3_survey_sampler_start() { # KEYS SECONDS
     done' _ "$1" "$M3_WORK/run" "$M3_WORK/phase" "$M3_WORK/zones" "$M3_SURVEY_GAP" >>"$M3_WORK/out/samples.txt" \
     2>>"$M3_WORK/sampler.err" &
   M3_SURVEY_SAMPLER=$!
+  M3_SURVEY_STARTED=$(date +%s.%N)
 }
 
+# Stops the sampler, and checks that none of it runs any more (its processes carry the run
+# file's path). Returns 1 when some still does.
+M3_SURVEY_SAMPLER_LEFT=""
 m3_survey_sampler_stop() {
-  [[ -n $M3_WORK ]] && rm -f "$M3_WORK/run"
+  local left
+  [[ -n $M3_WORK ]] || return 0
+  rm -f "$M3_WORK/run"
   if [[ -n $M3_SURVEY_SAMPLER ]]; then
     kill "$M3_SURVEY_SAMPLER" 2>/dev/null || true
     wait "$M3_SURVEY_SAMPLER" 2>/dev/null || true
   fi
   M3_SURVEY_SAMPLER=""
+  left=$(pgrep -f -- "$M3_WORK/run" 2>/dev/null | paste -sd' ') || left=""
+  if [[ -n $left ]]; then
+    # shellcheck disable=SC2086 # a list of pids
+    $sudo kill -KILL $left 2>/dev/null || true
+    sleep 0.2
+    left=$(pgrep -f -- "$M3_WORK/run" 2>/dev/null | paste -sd' ') || left=""
+  fi
+  M3_SURVEY_SAMPLER_LEFT=$left
+  [[ -z $left ]]
 }
 
 # Everything a run started or changed, put back: on every exit, and before the tgz is made.
+# Everything verified, M3_SURVEY_CLEANUP_ERR empty and 0; else one line per thing left, each with
+# the command that puts it right, and 1. The backlight's original value is kept until it reads
+# back, so a later call tries again.
 m3_survey_restore() {
+  local err="" now pgid groups=""
   m3_survey_stop_load
-  m3_survey_sampler_stop
-  if [[ -n $M3_SURVEY_BL && -n $M3_SURVEY_BL_START ]]; then
-    m3_survey_bl_set "$M3_SURVEY_BL_START" 2>/dev/null || true
-    M3_SURVEY_BL_START=""
+  m3_survey_sampler_stop || true
+  if [[ -n $M3_SURVEY_LOAD_LEFT ]]; then
+    for pgid in $M3_SURVEY_LOAD_LEFT; do groups+=" -$pgid"; done
+    err+="the CPU load still runs (process groups$M3_SURVEY_LOAD_LEFT); stop it with: kill -KILL --$groups"$'\n'
   fi
+  if [[ -n $M3_SURVEY_SAMPLER_LEFT ]]; then
+    err+="the sampler still runs (pids $M3_SURVEY_SAMPLER_LEFT); stop it with: sudo kill -KILL $M3_SURVEY_SAMPLER_LEFT"$'\n'
+  fi
+  if [[ -n $M3_SURVEY_BL && -n $M3_SURVEY_BL_START ]]; then
+    if m3_survey_bl_set "$M3_SURVEY_BL_START" || { sleep 1; m3_survey_bl_set "$M3_SURVEY_BL_START"; }; then
+      M3_SURVEY_BL_DONE="the backlight reads $M3_SURVEY_BL_START again"
+      M3_SURVEY_BL_START=""
+    else
+      now=$(m3_attr "$M3_SURVEY_BL/brightness")
+      err+="the backlight (${M3_SURVEY_BL##*/}) reads $now, not its original $M3_SURVEY_BL_START; restore it with: echo $M3_SURVEY_BL_START | sudo tee $M3_SURVEY_BL/brightness"$'\n'
+    fi
+  fi
+  M3_SURVEY_CLEANUP_ERR=${err%$'\n'}
+  [[ -z $err ]]
 }
 
-m3_survey_cleanup() {
-  m3_survey_restore
+# The restore's problems as warnings, once.
+m3_survey_report_cleanup() {
+  local line
+  [[ -n $M3_SURVEY_CLEANUP_ERR ]] && ((!M3_SURVEY_REPORTED)) || return 0
+  M3_SURVEY_REPORTED=1
+  while IFS= read -r line; do warn "not restored: $line"; done <<<"$M3_SURVEY_CLEANUP_ERR"
+}
+
+m3_survey_cleanup() { # [report]
+  m3_survey_restore || true
+  if [[ ${1:-} == report ]]; then m3_survey_report_cleanup; fi
   if [[ -n $M3_PARTIAL ]]; then rm -f "$M3_PARTIAL"; fi
   if [[ -n $M3_WORK ]]; then rm -rf "$M3_WORK"; fi
   M3_WORK=""
 }
 
-# Sets M3_SURVEY_HOT to "<key> read <C> C" when a die key or a thermal zone read
-# M3_SURVEY_LIMIT_MC or more in a sample taken since the last call (complete lines only), else to
-# nothing.
-m3_survey_hot() {
-  local raw=$M3_WORK/out/samples.txt n
+# Ctrl-C (or TERM, HUP): everything put back and checked, then exit 130.
+m3_survey_interrupted() {
+  m3_survey_cleanup
+  if [[ -n $M3_SURVEY_CLEANUP_ERR ]]; then
+    warn "interrupted. Nothing was written, and not everything is back as it was:"
+    m3_survey_report_cleanup
+  else
+    warn "interrupted: the load is stopped${M3_SURVEY_BL_DONE:+ and $M3_SURVEY_BL_DONE} (checked). Nothing was written."
+  fi
+  exit 130
+}
+
+# Reads the samples taken since the last call (complete lines only). Sets M3_SURVEY_HOT to
+# "<key> read <C> C" when a die key or a thermal zone read M3_SURVEY_LIMIT_MC or more, and
+# M3_SURVEY_LAST to the time of the newest valid watched sample. While a temperature is watched,
+# sets M3_SURVEY_FAIL when the sampler is gone, could not read the key list, or has no valid
+# watched sample from the last M3_SURVEY_STALE_S seconds; with "current" (before a load), there
+# must be such a sample, however short the run so far.
+m3_survey_check() { # [current]
+  local raw=$M3_WORK/out/samples.txt n now hot last err ref
   n=$(wc -l <"$raw")
-  M3_SURVEY_HOT=$(awk -v from="$M3_SURVEY_SEEN" -v to="$n" -v re="$M3_SURVEY_DIE_KEYS" \
-    -v lim="$M3_SURVEY_LIMIT_MC" -v hi="$M3_SURVEY_MAX_MC" '
+  now=$(date +%s.%N)
+  # "|" separates the three fields: a tab would merge empty ones.
+  IFS='|' read -r hot last err < <(awk -v from="$M3_SURVEY_SEEN" -v to="$n" -v re="$M3_SURVEY_DIE_KEYS" \
+    -v watch="$M3_SURVEY_WATCH_RE" -v lim="$M3_SURVEY_LIMIT_MC" -v lo="$M3_SURVEY_MIN_MC" -v hi="$M3_SURVEY_MAX_MC" '
     NR > to { exit }
-    NR > from && ($3 ~ re || $3 ~ /^tz:/) && $4 ~ /^-?[0-9]+$/ && $4 + 0 >= lim && $4 + 0 <= hi {
-      printf "%s read %.1f C", $3, $4 / 1000; exit
-    }' "$raw")
+    NR <= from { next }
+    $3 == "ERR" { err = $4; next }
+    $4 !~ /^-?[0-9]+$/ || $4 + 0 < lo || $4 + 0 > hi { next }
+    hot == "" && ($3 ~ re || $3 ~ /^tz:/) && $4 + 0 >= lim { hot = sprintf("%s read %.1f C", $3, $4 / 1000) }
+    watch != "" && $3 ~ watch && $1 + 0 > last { last = $1 + 0 }
+    END { printf "%s|%s|%s\n", hot, (last ? sprintf("%.3f", last) : ""), err }' "$raw")
   M3_SURVEY_SEEN=$n
+  M3_SURVEY_HOT=$hot
+  if [[ -n $last ]]; then M3_SURVEY_LAST=$last; fi
+  [[ -n $M3_SURVEY_WATCH_RE ]] || return 0
+  if ! m3_survey_alive "$M3_SURVEY_SAMPLER"; then
+    M3_SURVEY_FAIL="the temperature sampler is not running"
+  elif [[ -n $err ]]; then
+    M3_SURVEY_FAIL="the temperature sampler could not read the SMC key list"
+  elif [[ ${1:-} == current && -z $M3_SURVEY_LAST ]]; then
+    M3_SURVEY_FAIL="there is no valid CPU or SoC die temperature sample yet"
+  else
+    ref=${M3_SURVEY_LAST:-$M3_SURVEY_STARTED}
+    if [[ ${1:-} == current ]]; then ref=$M3_SURVEY_LAST; fi
+    if awk -v n="$now" -v r="${ref:-0}" -v s="$M3_SURVEY_STALE_S" 'BEGIN { exit !(n - r > s) }'; then
+      M3_SURVEY_FAIL="no valid CPU or SoC die temperature sample for more than $M3_SURVEY_STALE_S s"
+    fi
+  fi
+  return 0
 }
 
 # One stretch of sampling under a phase NAME, for SECONDS. Returns 1 when a die key read too
-# hot: the load is stopped at once and M3_SURVEY_STOP says why.
+# hot (M3_SURVEY_STOP says so) or the temperatures are no longer watched (M3_SURVEY_FAIL): the
+# load is stopped at once.
 m3_survey_sample() { # NAME SECONDS
   local i tmp=$M3_WORK/phase.new
   echo "$1" >"$tmp" && mv -f "$tmp" "$M3_WORK/phase"
   echo "$1 $(date +%s.%N) start" >>"$M3_WORK/out/phases.txt"
   for ((i = 0; i < $2; i++)); do
     sleep "$M3_SURVEY_TICK"
-    m3_survey_hot
+    m3_survey_check
     if [[ -n $M3_SURVEY_HOT ]]; then
       m3_survey_stop_load
       M3_SURVEY_STOP="$M3_SURVEY_HOT during $1"
       echo "$1 $(date +%s.%N) stopped: $M3_SURVEY_STOP" >>"$M3_WORK/out/phases.txt"
+      return 1
+    fi
+    if [[ -n $M3_SURVEY_FAIL ]]; then
+      m3_survey_stop_load
+      M3_SURVEY_FAIL+=" (during $1)"
+      echo "$1 $(date +%s.%N) failed: $M3_SURVEY_FAIL" >>"$M3_WORK/out/phases.txt"
       return 1
     fi
   done
@@ -4172,11 +4301,22 @@ m3_survey_phase() { # NAME [CPUS...]
   shift
   m3_survey_stop_load
   m3_survey_sample "rest-before-$name" "$M3_SURVEY_REST_S" || return 1
+  if [[ $name != idle ]]; then
+    # Only on a current watched temperature, from a running sampler.
+    m3_survey_check current
+    if [[ -n $M3_SURVEY_FAIL ]]; then
+      M3_SURVEY_FAIL+=" (before $name)"
+      echo "$name $(date +%s.%N) failed: $M3_SURVEY_FAIL" >>"$M3_WORK/out/phases.txt"
+      return 1
+    fi
+  fi
   case $name in
     idle) ;;
-    backlight-max) m3_survey_bl_set "$(m3_attr "$M3_SURVEY_BL/max_brightness")" ;;
-    backlight-min) m3_survey_bl_set 1 ;;
-    *) m3_survey_load "$@" ;;
+    backlight-max)
+      m3_survey_bl_set "$(m3_attr "$M3_SURVEY_BL/max_brightness")" ||
+        { M3_SURVEY_FAIL="could not set the backlight to its maximum"; return 1; } ;;
+    backlight-min) m3_survey_bl_set 1 || { M3_SURVEY_FAIL="could not set the backlight to 1"; return 1; } ;;
+    *) m3_survey_load "$@" || return 1 ;;
   esac
   m3_survey_sample "$name" "$M3_SURVEY_PHASE_S" || return 1
   m3_survey_stop_load
@@ -4205,10 +4345,18 @@ m3_survey_summary() { # PHASES...
     ($3 ~ re || $3 ~ /^tz:/) && $4 + 0 >= lo && $4 + 0 <= hi && (!($2 in m) || $4 + 0 > m[$2]) { m[$2] = $4 + 0; k[$2] = $3 }
     END { for (p in m) printf "  %-22s %7.1f (%s)\n", p, m[p] / 1000, k[p] }' "$out/samples.txt" | LC_ALL=C sort
   echo
-  if [[ -n $M3_SURVEY_STOP ]]; then
+  if [[ -n $M3_SURVEY_FAIL ]]; then
+    echo "result: failed: $M3_SURVEY_FAIL; the load was stopped and the later phases did not run"
+  elif [[ -n $M3_SURVEY_STOP ]]; then
     echo "result: stopped early: $M3_SURVEY_STOP (limit $((M3_SURVEY_LIMIT_MC / 1000)) C); the later phases did not run"
   else
     echo "result: completed"
+  fi
+  if [[ -n $M3_SURVEY_CLEANUP_ERR ]]; then
+    echo "restore: FAILED"
+    echo "  not restored: ${M3_SURVEY_CLEANUP_ERR//$'\n'/$'\n'  not restored: }"
+  else
+    echo "restore: checked: the load and the sampler have stopped${M3_SURVEY_BL_DONE:+, $M3_SURVEY_BL_DONE}"
   fi
 }
 
@@ -4231,8 +4379,8 @@ m3_power_survey() {
   out=$PWD/aurora-m3-power-${board:-mac}-$(date +%Y%m%d-%H%M%S).tgz
   M3_WORK=$(mktemp -d)
   mkdir "$M3_WORK/out"
-  trap 'm3_survey_cleanup' EXIT
-  trap 'm3_survey_cleanup; warn "interrupted: the load is stopped and anything changed is put back. Nothing was written."; exit 130' INT TERM HUP
+  trap 'm3_survey_cleanup report' EXIT
+  trap 'm3_survey_interrupted' INT TERM HUP
   keys=$(m3_smc_keys_file)
   if [[ -n $keys ]]; then
     # shellcheck disable=SC2016 # awk's fields
@@ -4245,10 +4393,14 @@ m3_power_survey() {
   m3_survey_zones >"$M3_WORK/zones"
   # A load runs only while a die temperature is watched: an SMC die key, or a thermal zone of the
   # SoC or the CPUs.
+  M3_SURVEY_WATCH_RE=""
   n=$(awk -v re="$M3_SURVEY_DIE_KEYS" '$2 ~ re && NF == 6 && $6 ~ /^-?[0-9]+$/' "$M3_WORK/out/smc-keys.txt" | wc -l)
-  if ((n)); then watch="$n SMC die keys (Tp*, Te*, Tf*, Tg*)"; fi
+  if ((n)); then watch="$n SMC die keys (Tp*, Te*, Tf*, Tg*)" M3_SURVEY_WATCH_RE=$M3_SURVEY_DIE_KEYS; fi
   n=$(awk '$2 ~ /^tz:.*(die|cpu|soc|hotspot)/' "$M3_WORK/zones" | wc -l)
-  if ((n)); then watch+="${watch:+ and }$n SoC thermal zones"; fi
+  if ((n)); then
+    watch+="${watch:+ and }$n SoC thermal zones"
+    M3_SURVEY_WATCH_RE+="${M3_SURVEY_WATCH_RE:+|}^tz:.*(die|cpu|soc|hotspot)"
+  fi
   M3_SURVEY_BL=$(m3_survey_backlight)
   if [[ -z $watch ]]; then
     phases=(idle)
@@ -4267,12 +4419,13 @@ m3_power_survey() {
     fi
     if [[ -n $M3_SURVEY_BL ]]; then
       phases+=(backlight-max backlight-min) bl_name=${M3_SURVEY_BL##*/}
-      plan+=$'\n'"      the backlight ($bl_name) at maximum, then at minimum, then back as it was."
+      plan+=$'\n'"      the backlight ($bl_name) at maximum, then at minimum, then at its starting value."
     else
       plan+=$'\n'"      no backlight device, so the backlight phases are left out."
     fi
     plan+=$'\n'"    It stops early if a watched temperature ($watch, or any thermal zone)
-    reads $((M3_SURVEY_LIMIT_MC / 1000)) C."
+    reads $((M3_SURVEY_LIMIT_MC / 1000)) C, and fails, stopping the load, if no fresh one comes in for
+    $M3_SURVEY_STALE_S s or the sampler stops."
   fi
   total=$(awk -v n="${#phases[@]}" -v p="$M3_SURVEY_PHASE_S" -v r="$M3_SURVEY_REST_S" -v t="$M3_SURVEY_TICK" \
     'BEGIN { printf "%d", n * (p + r) * t }')
@@ -4280,7 +4433,8 @@ m3_power_survey() {
     It samples the SMC's temperature (T*) and power (P*) keys and the thermal zones about once a
     second through short, fixed phases, each $M3_SURVEY_PHASE_S s after $M3_SURVEY_REST_S s at rest:
       $plan
-    The load stops and the backlight goes back at the end, on an error and on Ctrl-C.
+    The load stops and the backlight goes back (read back to check) at the end, on an error and on
+    Ctrl-C.
     Nothing else changes. It writes one file in this directory: $out
     Close other programs, keep the display on and the Mac on power."
   say "Starting in $M3_SURVEY_WAIT_S seconds. Press Ctrl-C now to cancel."
@@ -4324,7 +4478,7 @@ m3_power_survey() {
       *) m3_survey_phase "$n" ;;
     esac || break
   done
-  m3_survey_restore
+  m3_survey_restore || true
   {
     m3_survey_summary "${phases[@]}"
     if [[ -n $smc_note ]]; then echo "smc: $smc_note"; fi
@@ -4336,16 +4490,19 @@ m3_power_survey() {
     https://github.com/iconidentify/aurora-linux/issues what this printed, without any file."
   m3_survey_cleanup
   trap - EXIT INT TERM HUP
-  if [[ -n $M3_SURVEY_STOP ]]; then
+  if [[ -n $M3_SURVEY_STOP && -z $M3_SURVEY_FAIL ]]; then
     warn "the survey stopped early: $M3_SURVEY_STOP, at or over the $((M3_SURVEY_LIMIT_MC / 1000)) C limit.
     The load stopped at once; the phases after it did not run."
   fi
   if [[ -n $smc_note ]]; then warn "$smc_note: the file has the CPU topology and the thermal zones only."; fi
   say "Power survey written to $out
-    Everything it changed is back as it was. The host name, user names, serial numbers and MAC
-    addresses in it are masked, and the file was checked for them before it was kept.
-    Attach it to your issue at https://github.com/iconidentify/aurora-linux/issues (drag the file
-    into the comment box)."
+    The host name, user names, serial numbers and MAC addresses in it are masked, and the file
+    was checked for them before it was kept. Attach it to your issue at
+    https://github.com/iconidentify/aurora-linux/issues (drag the file into the comment box)."
+  m3_survey_report_cleanup
+  if [[ -n $M3_SURVEY_FAIL ]]; then die "the survey failed: $M3_SURVEY_FAIL. The load was stopped."; fi
+  [[ -z $M3_SURVEY_CLEANUP_ERR ]] || die "the survey could not put everything back (see above)."
+  say "Checked: the load and the sampler have stopped${M3_SURVEY_BL_DONE:+, and $M3_SURVEY_BL_DONE}."
 }
 
 # ---- the end of an install on an M3 with no handoff path yet -----------------------------------
