@@ -352,6 +352,30 @@ fail:
 	return false;
 }
 
+static bool trampoline_get_uint_prop_h17p(struct apple_dcp *dcp, int tag,
+					  void *out, void *in)
+{
+	const struct dcp_get_uint_prop_req *request = in;
+
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
+		return trampoline_get_uint_prop(dcp, tag, out, in);
+
+	trace_iomfb_callback(dcp, tag, __func__);
+	/* The observed startup query uses Asahi's existing Temperature reply. */
+	if (memcmp(request->obj, "SUMP", sizeof(request->obj)) ||
+	    strnlen(request->key, sizeof(request->key)) == sizeof(request->key) ||
+	    strcmp(request->key, "Temperature") || request->value_null ||
+	    memchr_inv(request->padding, 0, sizeof(request->padding))) {
+		dev_err(dcp->dev, "unqualified D401 integer property query\n");
+		WRITE_ONCE(dcp->crashed, true);
+		return false;
+	}
+
+	put_unaligned_le64(3029, out);
+	*((u8 *)out + offsetof(struct dcp_get_uint_prop_resp, ret)) = true;
+	return true;
+}
+
 static bool trampoline_allocate_buffer_h17p(struct apple_dcp *dcp, int tag,
 					    void *out, void *in)
 {
@@ -435,7 +459,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[209] = trampoline_get_time, /* get_calendar_time_ms */
 	[300] = trampoline_pr_publish,
 	[400] = trampoline_provider_property_h17p,
-	[401] = trampoline_get_uint_prop, /* get_uint_prop */
+	[401] = trampoline_get_uint_prop_h17p, /* get_uint_prop */
 	[404] = trampoline_nop, /* set_uint_prop */
 	[406] = trampoline_set_fx_prop, /* set_fx_prop */
 	[408] = trampoline_get_frequency_h17p, /* getClockFrequency */
