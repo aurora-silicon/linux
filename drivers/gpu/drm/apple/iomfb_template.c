@@ -2195,7 +2195,8 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	/* update brightness if changed */
 	update_brightness = dcp_has_panel(dcp) && dcp->brightness.update;
 #if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
-	update_brightness = update_brightness && !dcp_backlight_active(dcp);
+	update_brightness = update_brightness &&
+			    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G;
 #endif
 	if (update_brightness) {
 		req->swap.bl_unk = 1;

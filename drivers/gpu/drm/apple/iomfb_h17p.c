@@ -110,7 +110,7 @@ void iomfb_serialize_present_h17p(struct dcp_present_h17p *wire,
 }
 
 /* Integer commanded nits are exact binary64 values; no kernel FP is needed. */
-void iomfb_encode_backlight_h17p(struct dcp_present_h17p *wire, u32 nits)
+static u64 iomfb_nits_binary64_h17p(u32 nits)
 {
 	u64 value = 0;
 	unsigned int exponent;
@@ -120,8 +120,33 @@ void iomfb_encode_backlight_h17p(struct dcp_present_h17p *wire, u32 nits)
 		value = (u64)(exponent + 1023) << 52;
 		value |= ((u64)nits << (52 - exponent)) & GENMASK_ULL(51, 0);
 	}
-	/* Measured from Linux presents during ordinary sysfs brightness changes. */
-	put_unaligned_le64(value, wire->swap + 0x35e);
+	return value;
+}
+
+void iomfb_encode_backlight_h17p(struct dcp_present_h17p *wire, u32 nits,
+				 u32 maximum, bool update)
+{
+	u64 ceiling = iomfb_nits_binary64_h17p(maximum);
+	u64 unity = iomfb_nits_binary64_h17p(1);
+
+	/* This profile does not use the older DAC/power words. */
+	memset(wire->swap + 0x32f, 0, 0xd);
+	memset(wire->swap + 0x354, 0, 0x9a);
+	/* The ceiling pair must remain valid even on a brightness-idle frame. */
+	put_unaligned_le64(ceiling, wire->swap + 0x36e);
+	put_unaligned_le64(ceiling, wire->swap + 0x376);
+	if (!update)
+		return;
+
+	/* Linux brightness changes and soft DPMS use the same activation bytes. */
+	put_unaligned_le32(1, wire->swap + 0x354);
+	wire->swap[0x358] = 1;
+	wire->swap[0x359] = 1;
+	wire->swap[0x35a] = 1;
+	put_unaligned_le16(1, wire->swap + 0x35c);
+	put_unaligned_le64(iomfb_nits_binary64_h17p(nits), wire->swap + 0x35e);
+	put_unaligned_le64(unity, wire->swap + 0x37e);
+	put_unaligned_le64(unity, wire->swap + 0x3e6);
 }
 
 static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {

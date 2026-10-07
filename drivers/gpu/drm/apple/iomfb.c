@@ -989,9 +989,16 @@ bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 	int ret;
 
 	lockdep_assert_held(&dcp->iomfb.lock);
-	if (!dcp_backlight_active(dcp))
+	if (!dcp_backlight_active(dcp)) {
+		if (!dcp_has_panel(dcp))
+			return true;
+		if (!dcp->brightness.maximum)
+			return false;
+		iomfb_encode_backlight_h17p(wire, 0,
+					    dcp->brightness.maximum, false);
 		return true;
-	if (!transaction)
+	}
+	if (!transaction || !dcp->brightness.maximum)
 		return false;
 	for (i = 0; i < SWAP_SURFACES; i++)
 		have_surface |= !request->surf_null[i];
@@ -1002,7 +1009,8 @@ bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 		transaction->backlight = present;
 		transaction->backlight_reserved = true;
 	}
-	iomfb_encode_backlight_h17p(wire, present.nits);
+	iomfb_encode_backlight_h17p(wire, present.nits,
+				    dcp->brightness.maximum, !ret);
 	return true;
 }
 

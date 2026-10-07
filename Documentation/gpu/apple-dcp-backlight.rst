@@ -5,20 +5,19 @@ Apple DCP H17P backlight integration
 
 The backlight policy implements the clean display specification's BACKLIGHT-1
 through BACKLIGHT-4, with IOMFB-3 and LIFETIME-1 through LIFETIME-3 constraints.
-It extends the existing Asahi backlight driver. It contains no H17P brightness
-wire layout, calibration table, property command, or guessed initial level.
-Policy activation requires explicit successful configuration. Existing
-unconfigured H17P sessions, including T8142, keep their established DAC,
-property/powerlog and DPMS paths. Older firmware remains on its existing path.
-Neo startup must configure the policy before exposing the backlight or starting
-its DPMS/brightness traffic; a firmware-version match alone does not activate
-this policy.
+It extends the existing Asahi backlight driver. The measured internal H17P profile carries brightness activation through the
+central present queue. It latches the first bounded powerlog hint without
+sending a brightness update and leaves registration unavailable if there is
+no hint. H17G and older firmware retain their existing paths. Physical loader
+level continuity remains a measurement gate.
 
 Admission and startup
 ---------------------
 
-The central display worker must call ``dcp_backlight_configure()`` from process
-context after linking the CRTC and admitting all required records. Its arguments
+The measured profile connects the public powerlog parser to
+``iomfb_configure_backlight_h17p()`` after linking the CRTC. Generic users of
+``dcp_backlight_configure()`` must still supply validated inputs from process
+context. Its arguments
 are the validated maximum commanded nits, an optional inherited level, an
 optional documented ADT default, and a callback that schedules the central
 outbound queue. Maximum must fit the backlight core's signed integer range.
@@ -64,7 +63,8 @@ configuration or surface; ``-EBUSY`` means a prior brightness transaction is
 outstanding; ``-EALREADY`` means no brightness change is pending. These results
 do not clear pending work. The serializer places the returned level only in
 admitted fields of the next valid present. A normal present without a brightness
-change keeps the inherited/completed level; its clean layout must support that.
+change disables the measured activation fragment, preserving the existing
+physical level without resending a level.
 The sequence is a software cookie, not a wire present ID.
 
 Associate the cookie with the central transaction and its strict wire ID. Call
@@ -127,3 +127,37 @@ cached restore, both suspend/DPMS orders, static-surface deferral, busy sequenci
 rejection and stale completion. They do not qualify firmware fields or GNOME.
 Hardware acceptance requires O-BACKLIGHT, O-BACKLIGHT-TAKEOVER (10 Hz PBwo with
 no jump above 0.05 W), O-BACKLIGHT-CRC, O-DPMS (twenty cycles), and O-SUSPEND.
+
+Measured activation and software replay
+--------------------------------------
+
+Linux-boundary measurements on the default J700 driver establish an 18-byte
+fragment at A408 offsets 0x354 through 0x365. Brightness-enabled presents use
+``01 00 00 00 01 01 01 00 01 00`` followed by integer little-endian binary64
+nits. Ordinary presents disable the activation and nits fragment. Its individual control
+bytes have no separately inferred semantics. The two binary64 ceiling fields
+at 0x36e and 0x376 carry the raw panel maximum on every internal present,
+including ordinary frames and frames before a takeover hint arrives. Enabled
+updates additionally carry unity at 0x37e and 0x3e6; other scalars are zero.
+The complete owned block ends at 0x3ed. The observed 525-nit ceiling is distinct
+from the 509-nit exposed software range. Missing ceilings refuse serialization.
+The older DAC/power words at 0x32f through 0x33b stay zero on this profile,
+including before a takeover hint arrives. Enabled zero nits blanks the
+panel while keeping the pipe and retained surface alive. Requests while
+blanked change the restore target; unblank restores it through the same queue.
+
+The measurements include sysfs changes, two GNOME Mutter SetBacklight API
+steps and one PowerSaveMode off/on cycle. The latter reaches near-zero panel
+power while display-pipe power stays at 605 mW. Cached sysfs actual brightness
+on the observed driver is not physical readback while blanked. These records
+do not establish clean-driver firmware acceptance, physical takeover continuity,
+static-screen latency, suspend/resume or a twenty-cycle hardware gate.
+
+The native fixture extracts the actual registration, takeover and queue
+reservation functions and replays captured fragments under AddressSanitizer
+and UndefinedBehaviorSanitizer::
+
+  python3 tools/testing/apple/check-backlight.py --output /path/to/scratch
+
+It mocks locks, scheduling, DRM registration and transport. The fragment corpus
+retains hashes of clean Linux observations, with runtime addresses omitted.

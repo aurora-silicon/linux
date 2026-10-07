@@ -67,7 +67,8 @@ static_assert(sizeof(struct dcp_present_h17p) == 0xe9c);
 static_assert(offsetof(struct dcp_present_h17p, surf) == 0x588);
 static_assert(offsetof(struct dcp_present_h17p, tail) == 0xe38);
 
-void iomfb_encode_backlight_h17p(struct dcp_present_h17p *wire, u32 nits);
+void iomfb_encode_backlight_h17p(struct dcp_present_h17p *wire, u32 nits,
+				 u32 maximum, bool update);
 
 void iomfb_serialize_present_h17p(struct dcp_present_h17p *wire,
 				  const struct dcp_swap_submit_req_h17p *request);
