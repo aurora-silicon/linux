@@ -186,6 +186,19 @@ static bool trampoline_get_frequency_h17p(struct apple_dcp *dcp, int tag,
 	return true;
 }
 
+static bool trampoline_analytics_h17p(struct apple_dcp *dcp, int tag,
+				      void *out, void *in)
+{
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
+		return trampoline_zero(dcp, tag, out, in);
+
+	trace_iomfb_callback(dcp, tag, __func__);
+	/* The dispatcher has validated the measured D114 reply size. */
+	memset(out, 0, 0x1004);
+	*(u8 *)out = 'd';
+	return true;
+}
+
 static bool trampoline_hotplug_h17p(struct apple_dcp *dcp, int tag,
 				    void *out, void *in)
 {
@@ -237,7 +250,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[111] = trampoline_true, /* create_iomfb_service */
 	[112] = trampoline_create_backlight_service, /* create_backlight_service */
 	[113] = trampoline_true, /* create_nvram_service */
-	[114] = trampoline_zero, /* CoreAnalyticsSendEvent */
+	[114] = trampoline_analytics_h17p, /* CoreAnalyticsSendEvent */
 	[117] = trampoline_nop, /* set_idle_caching_state_ap */
 	[118] = trampoline_zero, /* upload_trace_start */
 	[119] = trampoline_zero, /* upload_trace_chunk */
