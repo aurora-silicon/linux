@@ -607,13 +607,23 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 		return ERR_PTR(-ENOMEM);
 
 	for (; it.idx < it.len; ++it.idx) {
+		struct dcp_parse_ctx entry = *it.handle;
+
 		mode = &modes[*count];
 		ret = parse_mode(it.handle, mode, &score, width_mm, height_mm,
 				 notch_height, internal);
 
 		/* Errors for a single mode are recoverable -- just skip it. */
-		if (ret)
+		if (ret) {
+			/* A failed parse can stop in the middle of the dictionary. */
+			*it.handle = entry;
+			ret = skip(it.handle);
+			if (ret) {
+				kfree(modes);
+				return ERR_PTR(ret);
+			}
 			continue;
+		}
 
 		/* Process a successful mode */
 		(*count)++;
