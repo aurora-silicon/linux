@@ -22,6 +22,7 @@ struct dcp_fabric_pipeline {
 	bool bound;
 	bool has_fixed;
 	bool fixed_busy;
+	bool fixed_recent;
 	bool owned;
 	bool tunnel_held;
 	enum dcp_fabric_presence_state presence;
@@ -96,6 +97,33 @@ enum dcp_fabric_resume_step {
 unsigned int dcp_fabric_deactivate_steps(int error, bool selected, bool fixed_live,
 					 enum dcp_fabric_deactivate_step steps[3]);
 void dcp_fabric_resume_steps(enum dcp_fabric_resume_step steps[2]);
+
+enum dcp_fabric_follow {
+	DCP_FABRIC_FOLLOW_STAY,
+	DCP_FABRIC_FOLLOW_MOVE,
+	DCP_FABRIC_FOLLOW_SWAP,
+	DCP_FABRIC_FOLLOW_REFUSE,
+};
+
+enum dcp_fabric_follow
+dcp_fabric_follow(const struct dcp_fabric_route *from,
+		  const struct dcp_fabric_route *to,
+		  const struct dcp_fabric_route *holder,
+		  const struct dcp_fabric_route *holder_back, bool holder_off,
+		  const struct dcp_fabric_policy *policy);
+
+/* All preparation completes before destructive effects; failures restore sources. */
+struct dcp_fabric_follow_ops {
+	int (*prepare)(void *ctx, unsigned int slot);
+	int (*validate)(void *ctx, unsigned int slot);
+	int (*detach)(void *ctx, unsigned int slot, bool destination);
+	int (*attach)(void *ctx, unsigned int slot, bool restore);
+	void (*publish)(void *ctx, unsigned int slot, bool restore);
+	void (*lost)(void *ctx, unsigned int slot);
+};
+
+int dcp_fabric_follow_execute(const struct dcp_fabric_follow_ops *ops,
+			      void *ctx, unsigned int count);
 
 enum dcp_fabric_attach_action {
 	DCP_FABRIC_ATTACH_OOB,

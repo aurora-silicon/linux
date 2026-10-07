@@ -250,7 +250,7 @@ static void dcp_swap_watchdog(struct work_struct *work)
 	dcp_drm_crtc_vblank(dcp->crtc);
 	if (dcp->connector &&
 	    dcp->swap_watchdog_retrains++ < DCP_SWAP_WATCHDOG_RETRAINS)
-		schedule_work(&dcp->connector->hotplug_wq);
+		dcp_queue_hotplug(dcp->connector);
 }
 
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp)
@@ -304,7 +304,7 @@ static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_
 	if (dcp->connector) {
 		dcp->connector->connected = 0;
 		apple_connector_edid_set_live(dcp->connector, false);
-		schedule_work(&dcp->connector->hotplug_wq);
+		dcp_queue_hotplug(dcp->connector);
 	}
 	complete(&dcp->start_done);
 }
@@ -399,6 +399,20 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
 
 	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 
+	/*
+	 * A Type-C display routed to another pipeline: its route follows
+	 * this CRTC if it can (see dcp_typec_follow_check()), and the mode is
+	 * one of the display's, which only the pipeline driving it knows.
+	 */
+	if (crtc_state->enable && drm_atomic_crtc_needs_modeset(crtc_state) &&
+	    dcp_typec_follows_crtc(dcp)) {
+		int ret = dcp_typec_follow_check(dcp, crtc, state,
+					      &crtc_state->mode);
+
+		if (ret)
+			return ret;
+	}
+
 	needs_modeset = drm_atomic_crtc_needs_modeset(crtc_state) ||
 			!READ_ONCE(dcp->mode_state.valid);
 	if (!needs_modeset && (!dcp->connector || !dcp->connector->connected)) {
@@ -443,7 +457,8 @@ static bool dcp_session_valid_locked(struct apple_dcp *dcp,
 {
 	return dcp_fabric_session_valid(session, dcp_session_locked(dcp),
 					!cable || dcp->typec_cable_connected,
-					READ_ONCE(dcp->tb_retiring));
+					READ_ONCE(dcp->tb_retiring) ||
+					READ_ONCE(dcp->typec_follow_retiring));
 }
 
 /* Capture at enqueue, not when a stale worker eventually starts running. */
@@ -451,7 +466,8 @@ void dcp_queue_typec_reconnect(struct apple_dcp *dcp, unsigned long delay)
 {
 	guard(mutex)(&dcp->hpd_mutex);
 
-	if (!dcp->typec_cable_connected || READ_ONCE(dcp->tb_retiring))
+	if (!dcp->typec_cable_connected || READ_ONCE(dcp->tb_retiring) ||
+	    READ_ONCE(dcp->typec_follow_retiring))
 		return;
 	dcp->typec_reconnect_session = dcp_session_locked(dcp);
 	mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq, delay);
@@ -777,7 +793,7 @@ void dcp_external_retry_work(struct work_struct *work)
 		}
 		dev_info(dcp->dev, "display retry: setting the display mode again\n");
 		dcp_mode_invalidate(&dcp->mode_state);
-		schedule_work(&connector->hotplug_wq);
+		dcp_queue_hotplug(connector);
 		return;
 	}
 	/* An HDMI output connects through the fabric, as on its HPD. */
@@ -1060,6 +1076,32 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 	return dcp_dptx_disconnect_drained(dcp, port);
 }
 
+/*
+ * Release the display link of a Type-C output while its display stays
+ * attached, as a CRTC power-off does (see dcp_poweroff()): the firmware's
+ * unplug for it is ignored, and dcp_poweron() connects the link again.
+ */
+void dcp_dptx_park(struct apple_dcp *dcp)
+{
+	int ret;
+
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		WRITE_ONCE(dcp->typec_crtc_off, true);
+		dcp->typec_generation++;
+	}
+	/* Session checks around reconnect waits reject the revoked generation. */
+	cancel_delayed_work(&dcp->typec_reconnect_wq);
+	cancel_delayed_work(&dcp->placeholder_edid_wq);
+	if (dcp->avep)
+		av_service_disconnect(dcp);
+	if (dcp->dptxport[0].enabled && dcp->dptxport[0].connected) {
+		ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
+		if (ret)
+			dev_warn(dcp->dev, "failed to deassert Type-C DPTX HPD: %d\n", ret);
+		dcp_dptx_disconnect(dcp, 0);
+	}
+}
+
 int dcp_dptx_disconnect_drained(struct apple_dcp *dcp, u32 port)
 {
 	WRITE_ONCE(dcp->typec_crtc_off, false);
@@ -1287,6 +1329,27 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 	}
 }
 
+int dcp_typec_prepare_route(struct apple_dcp *dcp)
+{
+	u64 generation;
+	unsigned long ready;
+	int ret;
+
+	if (!dcp_crtc_needs_route_start(dcp))
+		return 0;
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		generation = dcp->typec_generation;
+	ret = dcp_dptx_connect(dcp, 0);
+	if (ret)
+		return ret;
+	ready = wait_for_completion_timeout(&dcp->typec_iomfb_hpd_ready,
+					    msecs_to_jiffies(3000));
+	guard(mutex)(&dcp->hpd_mutex);
+	if (generation != dcp->typec_generation || !dcp->typec_cable_connected)
+		return -ESTALE;
+	return ready ? 0 : -ETIMEDOUT;
+}
+
 void dcp_poweron(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -1298,6 +1361,7 @@ void dcp_poweron(struct platform_device *pdev)
 		wait_for_typec_hpd = READ_ONCE(dcp->typec_crtc_off) &&
 				    READ_ONCE(dcp->typec_cable_connected);
 		WRITE_ONCE(dcp->typec_crtc_off, false);
+		WRITE_ONCE(dcp->typec_follow_start, false);
 
 		/*
 		 * A Type-C CRTC disable releases its DPTX session. Re-establish it

@@ -608,6 +608,267 @@ static void fabric_unbound_and_mask_test(struct kunit *test)
 			(u32)(BIT(1) | BIT(2)));
 }
 
+static void fabric_follow_test(struct kunit *test)
+{
+	struct fabric_fixture f;
+	struct dcp_fabric_route *lg, *hybrid;
+
+	/* A direct port on the second pipeline is paired with the first CRTC. */
+	fabric_init(&f, false);
+	lg = &f.route[0][1];
+	hybrid = &f.route[0][0];
+	f.pipeline[1].owned = true;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(lg, hybrid, NULL, NULL, false,
+						&f.policy),
+			DCP_FABRIC_FOLLOW_MOVE);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(lg, lg, NULL, NULL, false,
+						&f.policy),
+			DCP_FABRIC_FOLLOW_STAY);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(NULL, hybrid, NULL, NULL, false,
+						&f.policy),
+			DCP_FABRIC_FOLLOW_REFUSE);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(lg, NULL, NULL, NULL, false,
+						&f.policy),
+			DCP_FABRIC_FOLLOW_REFUSE);
+
+	/* Existing fixed-output busy/settling policy also applies to a move. */
+	f.pipeline[0].fixed_busy = true;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(lg, hybrid, NULL, NULL, false,
+						&f.policy),
+			DCP_FABRIC_FOLLOW_REFUSE);
+	f.pipeline[0].fixed_busy = false;
+	f.pipeline[0].presence = DCP_FABRIC_SETTLING;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(lg, hybrid, NULL, NULL, false,
+						&f.policy),
+			DCP_FABRIC_FOLLOW_REFUSE);
+	f.pipeline[0].presence = DCP_FABRIC_ABSENT;
+
+	/* Owned with no route to swap with (a retiring tunnel), unbound, not up. */
+	f.pipeline[0].owned = true;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(lg, hybrid, NULL, NULL, false,
+						&f.policy),
+			DCP_FABRIC_FOLLOW_REFUSE);
+	f.pipeline[0].owned = false;
+	f.pipeline[0].bound = false;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(lg, hybrid, NULL, NULL, false,
+						&f.policy),
+			DCP_FABRIC_FOLLOW_REFUSE);
+	f.pipeline[0].bound = true;
+	f.pipeline[0].services_ready = false;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(lg, hybrid, NULL, NULL, false,
+						&f.policy),
+			DCP_FABRIC_FOLLOW_REFUSE);
+	f.pipeline[0].services_ready = true;
+
+	/* #39 on the M2 Max: DPMS on pairs two direct ports the other way round. */
+	fabric_init(&f, true);
+	f.pipeline[0].owned = true;
+	f.pipeline[1].owned = true;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(&f.route[0][1], &f.route[0][0],
+						&f.route[1][0], &f.route[1][1],
+						true, &f.policy),
+			DCP_FABRIC_FOLLOW_SWAP);
+	/* the holder's display is still lit elsewhere */
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(&f.route[0][1], &f.route[0][0],
+						&f.route[1][0], &f.route[1][1],
+						false, &f.policy),
+			DCP_FABRIC_FOLLOW_REFUSE);
+	/* the holder cannot reach the pipeline it would be given */
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(&f.route[0][1], &f.route[0][0],
+						&f.route[1][0], NULL, true,
+						&f.policy),
+			DCP_FABRIC_FOLLOW_REFUSE);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(&f.route[0][1], &f.route[0][0],
+						&f.route[1][0], &f.route[1][0],
+						true, &f.policy),
+			DCP_FABRIC_FOLLOW_REFUSE);
+	/* A direct route must never move into or swap a tunnel binding. */
+	f.route[1][0].tunnel = true;
+	KUNIT_EXPECT_EQ(test,
+			dcp_fabric_follow(&f.route[0][1], &f.route[0][0],
+					  &f.route[1][0], &f.route[1][1], true, &f.policy),
+			DCP_FABRIC_FOLLOW_REFUSE);
+	f.route[1][0].tunnel = false;
+	f.route[0][1].tunnel = true;
+	KUNIT_EXPECT_EQ(test,
+			dcp_fabric_follow(&f.route[0][1], &f.route[0][0],
+					  NULL, NULL, false, &f.policy),
+			DCP_FABRIC_FOLLOW_REFUSE);
+}
+
+static void fabric_follow_recent_fixed(struct kunit *test)
+{
+	struct fabric_fixture f;
+
+	fabric_init(&f, true);
+	f.pipeline[0].fixed_recent = true;
+	KUNIT_EXPECT_EQ(test,
+			dcp_fabric_follow(&f.route[0][1], &f.route[0][0],
+					  NULL, NULL, false, &f.policy),
+			DCP_FABRIC_FOLLOW_REFUSE);
+	f.pipeline[0].fixed_recent = false;
+	KUNIT_EXPECT_EQ(test,
+			dcp_fabric_follow(&f.route[0][1], &f.route[0][0],
+					  NULL, NULL, false, &f.policy),
+			DCP_FABRIC_FOLLOW_MOVE);
+	f.pipeline[0].fixed_recent = true;
+	f.pipeline[0].owned = true;
+	f.pipeline[1].owned = true;
+	KUNIT_EXPECT_EQ(test,
+			dcp_fabric_follow(&f.route[0][1], &f.route[0][0],
+					  &f.route[1][0], &f.route[1][1], true, &f.policy),
+			DCP_FABRIC_FOLLOW_SWAP);
+}
+
+struct follow_effect_fixture {
+	int owner[2];
+	int prepare_error;
+	int validate_error;
+	int attach_error;
+	int restore_error;
+	int destination_detach_error;
+	unsigned int prepared;
+	unsigned int detached;
+	unsigned int published;
+	unsigned int lost;
+};
+
+static int follow_effect_prepare(void *data, unsigned int slot)
+{
+	struct follow_effect_fixture *f = data;
+
+	f->prepared++;
+	return f->prepare_error == slot + 1 ? -ENOMEM : 0;
+}
+
+static int follow_effect_validate(void *data, unsigned int slot)
+{
+	struct follow_effect_fixture *f = data;
+
+	return f->validate_error == slot + 1 ? -ESTALE : 0;
+}
+
+static int follow_effect_detach(void *data, unsigned int slot, bool destination)
+{
+	struct follow_effect_fixture *f = data;
+
+	f->owner[destination ? 1 - slot : slot] = -1;
+	f->detached++;
+	return destination && f->destination_detach_error == slot + 1 ? -EIO : 0;
+}
+
+static int follow_effect_attach(void *data, unsigned int slot, bool restore)
+{
+	struct follow_effect_fixture *f = data;
+
+	if ((!restore && f->attach_error == slot + 1) ||
+	    (restore && f->restore_error == slot + 1))
+		return -EIO;
+	f->owner[restore ? slot : 1 - slot] = slot;
+	return 0;
+}
+
+static void follow_effect_publish(void *data, unsigned int slot, bool restore)
+{
+	struct follow_effect_fixture *f = data;
+
+	f->published |= BIT(slot);
+}
+
+static void follow_effect_lost(void *data, unsigned int slot)
+{
+	struct follow_effect_fixture *f = data;
+
+	f->lost |= BIT(slot);
+}
+
+static const struct dcp_fabric_follow_ops follow_effect_ops = {
+	.prepare = follow_effect_prepare,
+	.validate = follow_effect_validate,
+	.detach = follow_effect_detach,
+	.attach = follow_effect_attach,
+	.publish = follow_effect_publish,
+	.lost = follow_effect_lost,
+};
+
+static void fabric_follow_effect_swap(struct kunit *test)
+{
+	struct follow_effect_fixture f = { .owner = { 0, 1 } };
+
+	KUNIT_ASSERT_EQ(test, dcp_fabric_follow_execute(&follow_effect_ops, &f, 2), 0);
+	KUNIT_EXPECT_EQ(test, f.owner[0], 1);
+	KUNIT_EXPECT_EQ(test, f.owner[1], 0);
+	KUNIT_EXPECT_EQ(test, f.prepared, 2U);
+	KUNIT_EXPECT_EQ(test, f.published, 3U);
+}
+
+static void fabric_follow_effect_oom(struct kunit *test)
+{
+	unsigned int slot;
+
+	for (slot = 1; slot <= 2; slot++) {
+		struct follow_effect_fixture f = { .owner = { 0, 1 }, .prepare_error = slot };
+
+		KUNIT_EXPECT_EQ(test,
+				dcp_fabric_follow_execute(&follow_effect_ops, &f, 2), -ENOMEM);
+		KUNIT_EXPECT_EQ(test, f.detached, 0U);
+		KUNIT_EXPECT_EQ(test, f.owner[0], 0);
+		KUNIT_EXPECT_EQ(test, f.owner[1], 1);
+		KUNIT_EXPECT_EQ(test, f.published, 0U);
+	}
+}
+
+static void fabric_follow_effect_stale(struct kunit *test)
+{
+	struct follow_effect_fixture f = { .owner = { 0, 1 }, .validate_error = 2 };
+
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow_execute(&follow_effect_ops, &f, 2), -ESTALE);
+	KUNIT_EXPECT_EQ(test, f.detached, 0U);
+	KUNIT_EXPECT_EQ(test, f.owner[0], 0);
+	KUNIT_EXPECT_EQ(test, f.owner[1], 1);
+}
+
+static void fabric_follow_effect_rollback(struct kunit *test)
+{
+	unsigned int slot;
+
+	for (slot = 1; slot <= 2; slot++) {
+		struct follow_effect_fixture f = { .owner = { 0, 1 }, .attach_error = slot };
+
+		KUNIT_EXPECT_EQ(test, dcp_fabric_follow_execute(&follow_effect_ops, &f, 2), -EIO);
+		KUNIT_EXPECT_EQ(test, f.owner[0], 0);
+		KUNIT_EXPECT_EQ(test, f.owner[1], 1);
+		KUNIT_EXPECT_EQ(test, f.published, 3U);
+		KUNIT_EXPECT_EQ(test, f.lost, 0U);
+	}
+}
+
+static void fabric_follow_effect_release_restore(struct kunit *test)
+{
+	struct follow_effect_fixture f = {
+		.owner = { 0, 1 }, .attach_error = 2, .destination_detach_error = 1,
+	};
+
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow_execute(&follow_effect_ops, &f, 2), -EIO);
+	KUNIT_EXPECT_EQ(test, f.owner[0], 0);
+	KUNIT_EXPECT_EQ(test, f.owner[1], 1);
+	KUNIT_EXPECT_EQ(test, f.lost, 0U);
+	KUNIT_EXPECT_EQ(test, f.published, 3U);
+}
+
+static void fabric_follow_effect_lost(struct kunit *test)
+{
+	struct follow_effect_fixture f = {
+		.owner = { 0, 1 }, .attach_error = 2, .restore_error = 1,
+	};
+
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow_execute(&follow_effect_ops, &f, 2), -EIO);
+	KUNIT_EXPECT_EQ(test, f.owner[0], -1);
+	KUNIT_EXPECT_EQ(test, f.owner[1], 1);
+	KUNIT_EXPECT_EQ(test, f.lost, (unsigned int)BIT(0));
+	KUNIT_EXPECT_EQ(test, f.published, (unsigned int)BIT(1));
+}
+
 static void fabric_presence_wrap_test(struct kunit *test)
 {
 	struct dcp_fabric_presence presence = {};
@@ -1667,6 +1928,14 @@ static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE(fabric_effect_failure_core_test),
 	KUNIT_CASE(fabric_deactivate_failure_test),
 	KUNIT_CASE(fabric_unbound_and_mask_test),
+	KUNIT_CASE(fabric_follow_test),
+	KUNIT_CASE(fabric_follow_recent_fixed),
+	KUNIT_CASE(fabric_follow_effect_swap),
+	KUNIT_CASE(fabric_follow_effect_oom),
+	KUNIT_CASE(fabric_follow_effect_stale),
+	KUNIT_CASE(fabric_follow_effect_rollback),
+	KUNIT_CASE(fabric_follow_effect_lost),
+	KUNIT_CASE(fabric_follow_effect_release_restore),
 	KUNIT_CASE(fabric_presence_wrap_test),
 	KUNIT_CASE(fabric_masked_edge_test),
 	KUNIT_CASE_PARAM(fabric_wiring_test, fabric_wiring_gen_params),

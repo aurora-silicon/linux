@@ -121,18 +121,48 @@ static void apple_connector_oob_hotplug(struct drm_connector *connector,
 static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 				     struct drm_atomic_state *state)
 {
+	struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
+	struct apple_dcp *dcp = platform_get_drvdata(apple_crtc->dcp);
 	struct drm_crtc_state *crtc_state;
-	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+	bool locked;
+	int ret;
 
-	if (crtc_state->active_changed && crtc_state->active) {
-		struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
+	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+	locked = false;
+	ret = to_apple_atomic_state(state)->failed_routes & drm_crtc_mask(crtc) ?
+		-EIO : dcp_typec_follow_crtc(crtc, state, &locked);
+	/* A failed move must never power or program another sink's pipeline. */
+	if (ret || !dcp_crtc_route_ready(crtc, state, false))
+		goto failed;
+
+	if (crtc_state->active && dcp_crtc_needs_route_start(dcp)) {
+		/* Establish the link/catalog before powering the assigned IOMFB. */
+		ret = dcp_typec_prepare_route(dcp);
+		if (ret)
+			goto failed;
+	}
+	if (crtc_state->active && !dcp_crtc_route_ready(crtc, state, true))
+		goto failed;
+	if (crtc_state->active &&
+	    (crtc_state->active_changed || dcp_crtc_needs_route_start(dcp))) {
 		dcp_poweron(apple_crtc->dcp);
-		/* Force the CTM to be set on first swap */
 		crtc_state->color_mgmt_changed = true;
 	}
-
 	if (crtc_state->active)
 		dcp_crtc_atomic_modeset(crtc, state);
+	dcp_typec_follow_done(locked);
+	return;
+
+failed:
+	if (!ret)
+		ret = -EAGAIN;
+	dcp_mode_invalidate(&dcp->mode_state);
+	dev_err(dcp->dev, "CRTC route unavailable (%d); modeset deferred\n", ret);
+	/* Flush completes any pending flip without issuing a firmware swap. */
+	schedule_work(&dcp->vblank_wq);
+	if (dcp->connector)
+		dcp_route_failure_notify(dcp->connector);
+	dcp_typec_follow_done(locked);
 }
 
 static void apple_crtc_atomic_disable(struct drm_crtc *crtc,
@@ -241,7 +271,35 @@ static const struct drm_crtc_funcs apple_crtc_funcs = {
 
 };
 
+static struct drm_atomic_state *apple_atomic_state_alloc(struct drm_device *dev)
+{
+	struct apple_atomic_state *state = kzalloc_obj(*state);
+
+	if (!state)
+		return NULL;
+	if (drm_atomic_state_init(dev, &state->base)) {
+		kfree(state);
+		return NULL;
+	}
+	return &state->base;
+}
+
+static void apple_atomic_state_clear(struct drm_atomic_state *state)
+{
+	drm_atomic_state_default_clear(state);
+	to_apple_atomic_state(state)->failed_routes = 0;
+}
+
+static void apple_atomic_state_free(struct drm_atomic_state *state)
+{
+	drm_atomic_state_default_release(state);
+	kfree(to_apple_atomic_state(state));
+}
+
 static const struct drm_mode_config_funcs apple_mode_config_funcs = {
+	.atomic_state_alloc	= apple_atomic_state_alloc,
+	.atomic_state_clear	= apple_atomic_state_clear,
+	.atomic_state_free	= apple_atomic_state_free,
 	.atomic_check		= drm_atomic_helper_check,
 	.atomic_commit		= drm_atomic_helper_commit,
 	.fb_create		= drm_gem_fb_create,
@@ -306,8 +364,9 @@ apple_connector_atomic_best_encoder(struct drm_connector *conn,
 
 	/*
 	 * A Type-C port has one encoder, whose possible_crtcs either already
-	 * names the pipeline the fabric routed the port to or, on dual-stream
-	 * machines, the fixed set the fabric only routes within, so it is the
+	 * names the pipeline the fabric routed the port to or spans the set
+	 * the fabric routes within: on dual-stream machines, and where the
+	 * route follows the CRTC (see dcp_typec_follow_crtc()).  So it is the
 	 * only answer there is.
 	 */
 	if (apple_connector->port_encoder)

@@ -13,6 +13,14 @@
 #include "dcp-fabric.h"
 #include "parser.h"
 
+struct apple_atomic_state {
+	struct drm_atomic_state base;
+	/* Failed route transactions suppress both CRTC enables in this commit. */
+	u32 failed_routes;
+};
+
+#define to_apple_atomic_state(s) container_of(s, struct apple_atomic_state, base)
+
 struct apple_crtc {
 	struct drm_crtc base;
 	struct drm_pending_vblank_event *event;
@@ -31,6 +39,7 @@ struct apple_encoder {
 #define to_apple_encoder(x) container_of(x, struct apple_encoder, base)
 
 void dcp_poweroff(struct platform_device *pdev);
+int dcp_typec_prepare_route(struct apple_dcp *dcp);
 void dcp_poweron(struct platform_device *pdev);
 int dcp_set_crc(struct drm_crtc *crtc, bool enabled);
 int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state);
@@ -49,6 +58,11 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 				    const struct drm_display_mode *mode);
 int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 			    struct drm_atomic_state *state);
+bool dcp_crtc_can_retrain(struct drm_crtc *crtc, struct apple_connector *connector);
+bool dcp_crtc_needs_route_start(struct apple_dcp *dcp);
+bool dcp_crtc_route_ready(struct drm_crtc *crtc, struct drm_atomic_state *state,
+			  bool fresh);
+bool dcp_has_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode);
 bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 			 const struct drm_display_mode *mode,
 			 struct drm_display_mode *adjusted_mode);
@@ -64,6 +78,7 @@ void dcp_external_retry_work(struct work_struct *work);
 void dcp_external_sink_irq(struct apple_dcp *dcp);
 void dcp_queue_typec_reconnect(struct apple_dcp *dcp, unsigned long delay);
 int dcp_dptx_disconnect_drained(struct apple_dcp *dcp, u32 port);
+void dcp_dptx_park(struct apple_dcp *dcp);
 int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port);
 
 int iomfb_start_rtkit(struct apple_dcp *dcp);

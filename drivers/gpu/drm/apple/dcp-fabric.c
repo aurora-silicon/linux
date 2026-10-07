@@ -26,6 +26,11 @@
 #include "ibootep.h"
 #include "parser.h"
 
+static bool typec_follow_crtc = true;
+module_param(typec_follow_crtc, bool, 0444);
+MODULE_PARM_DESC(typec_follow_crtc,
+		 "Let direct DP-alt routes follow their selected CRTC (default: on)");
+
 struct apple_dcp_typec_port {
 	struct dcp_fabric_port core;
 	struct dcp_fabric_plan plan;
@@ -159,6 +164,26 @@ bool dcp_typec_dual_stream(void)
 	return atomic_read(&dcp_dual_stream_routes) > 0;
 }
 
+/*
+ * Do the Type-C routes of @dcp follow the CRTC a modeset pairs them with
+ * (see dcp_typec_follow_crtc())? This capability applies to direct routes
+ * on 12.3/13.5 only.
+ */
+bool dcp_typec_follows_crtc(struct apple_dcp *dcp)
+{
+	return typec_follow_crtc && dcp->nr_typec_routes &&
+	       !dcp->external && !dcp->external_native &&
+	       (dcp->fw_compat == DCP_FIRMWARE_V_12_3 ||
+		dcp->fw_compat == DCP_FIRMWARE_V_13_5);
+}
+
+/* Is a routed port's possible_crtcs narrowed to the pipeline driving it? */
+static bool dcp_typec_narrows(struct apple_dcp *dcp, bool tunnel)
+{
+	return !dcp_typec_dual_stream() &&
+	       (tunnel || !dcp_typec_follows_crtc(dcp));
+}
+
 bool dcp_is_typec_only(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -262,10 +287,12 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 		 * rejected with no way for it to recover.  The hotplug that
 		 * follows makes it re-read this.  Dual-stream machines keep
 		 * fixed possible_crtcs instead: compositors that read them once
-		 * (e.g. aquamarine/Hyprland) never see the narrowing.
+		 * (e.g. aquamarine/Hyprland) never see the narrowing.  So do
+		 * pipelines whose routes follow the CRTC they are paired with:
+		 * the pairing is the compositor's to make there.
 		 */
 		if (connector->port_encoder && dcp->crtc &&
-		    !dcp_typec_dual_stream())
+		    dcp_typec_narrows(dcp, xbar != route->xbar))
 			connector->port_encoder->possible_crtcs =
 				dcp_fabric_connector_mask(false,
 							  true, true,
@@ -744,7 +771,7 @@ void dcp_fabric_hdmi_reinit(struct apple_dcp *dcp, const char *why)
 	dcp_fixed_hdmi_reinit_locked(dcp, why);
 }
 
-/* A Thunderbolt tunnel holds @dcp's pipeline: it never moves. */
+/* A Thunderbolt tunnel holds its pipeline; direct moves never steal it. */
 static bool dcp_typec_tunnel_held(struct apple_dcp *dcp)
 {
 	return dcp->active_typec_route && dcp->active_typec_route->tunnel;
@@ -1707,6 +1734,19 @@ struct dcp_tb_attach_context {
 	void *binding;
 };
 
+/* The crossbar control feeding DP IN @dpin of @route's port to its pipeline */
+static struct mux_control *
+dcp_typec_tunnel_ctl(struct apple_dcp_typec_route *route, unsigned int dpin)
+{
+	if (route->dpin[dpin])
+		return route->dpin[dpin];
+	/* Legacy DT ABI: unnamed DPIN controls share the DP-alt chip. */
+	if (route->xbar != &route->xbar->chip->mux[0] ||
+	    route->xbar->chip->controllers < 3)
+		return NULL;
+	return &route->xbar->chip->mux[1 + dpin];
+}
+
 static int dcp_tb_candidate(void *data)
 {
 	struct dcp_tb_attach_context *ctx = data;
@@ -1745,16 +1785,9 @@ static int dcp_tb_candidate(void *data)
 			return ret;
 	}
 
-	ctl = best->dpin[dpin];
-	if (!ctl) {
-		/* Legacy DT ABI: unnamed DPIN controls share the DP-alt chip. */
-		if (best->xbar != &best->xbar->chip->mux[0] ||
-		    best->xbar->chip->controllers < 3) {
-			ret = -EOPNOTSUPP;
-			return ret;
-		}
-		ctl = &best->xbar->chip->mux[1 + dpin];
-	}
+	ctl = dcp_typec_tunnel_ctl(best, dpin);
+	if (!ctl)
+		return -EOPNOTSUPP;
 
 	ctx->best = best;
 	ctx->ctl = ctl;
@@ -1973,6 +2006,528 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
 }
 EXPORT_SYMBOL_GPL(apple_dcp_tb_dp_tunnel);
 
+/*
+ * Direct DP-alt routes follow the CRTC selected by a modeset on 12.3/13.5.
+ * Tunnels keep their existing masks, binding lifetime and routing policy.
+ * Firmware 14.7 and native external processors keep their existing path.
+ */
+struct dcp_typec_follow {
+	struct apple_dcp_typec_port *port;
+	struct apple_dcp_typec_route *from;
+	struct apple_dcp_typec_route *to;
+	struct apple_dcp_typec_route *holder;
+	struct apple_dcp_typec_route *holder_back;
+	enum dcp_fabric_follow action;
+};
+
+/* Catalog snapshots are allocated before either route is disturbed. */
+struct dcp_typec_follow_slot {
+	struct apple_dcp_typec_route *from;
+	struct apple_dcp_typec_route *to;
+	struct apple_dcp_typec_port *port;
+	struct apple_connector *connector;
+	struct dcp_display_mode *modes;
+	unsigned int nr_modes;
+	u64 generation;
+	u64 attachment_generation;
+	bool was_active;
+	bool restored;
+};
+
+struct dcp_typec_follow_context {
+	struct dcp_typec_follow_slot slots[2];
+	struct drm_atomic_state *state;
+};
+
+/*
+ * The fabric lock, from a modeset.  A holder of it can wait for the
+ * modeset locks: a display that goes sends a hotplug event, and with no
+ * compositor running the fbdev client answers that with a commit.  Rather
+ * than deadlock with it, a modeset gives up after a while, and is then
+ * refused or left on its pipeline as if the route could not follow.
+ */
+#define DCP_FOLLOW_LOCK_MS	3000
+
+static bool dcp_typec_follow_lock(bool handoff)
+{
+	unsigned long timeout = jiffies + msecs_to_jiffies(DCP_FOLLOW_LOCK_MS);
+
+	for (;;) {
+		if (!handoff || mutex_trylock(&dcp_tb_handoff_lock)) {
+			if (mutex_trylock(&dcp_typec_fabric_lock))
+				return true;
+			if (handoff)
+				mutex_unlock(&dcp_tb_handoff_lock);
+		}
+		if (time_after(jiffies, timeout))
+			return false;
+		msleep(20);
+	}
+}
+
+static void dcp_typec_follow_unlock(bool handoff)
+{
+	mutex_unlock(&dcp_typec_fabric_lock);
+	if (handoff)
+		mutex_unlock(&dcp_tb_handoff_lock);
+}
+
+static struct apple_dcp_typec_port *
+dcp_typec_port_of(struct apple_connector *connector, bool *secondary)
+{
+	struct apple_dcp_typec_port *port;
+
+	list_for_each_entry(port, &dcp_typec_ports, link) {
+		if (port->connector != connector &&
+		    port->secondary_connector != connector)
+			continue;
+		*secondary = port->secondary_connector == connector;
+		return port;
+	}
+	return NULL;
+}
+
+static struct apple_dcp_typec_route *
+dcp_typec_port_route(struct apple_dcp_typec_port *port, struct apple_dcp *dcp)
+{
+	struct apple_dcp_typec_route *route;
+
+	list_for_each_entry(route, &port->routes, port_link)
+		if (route->dcp == dcp)
+			return route;
+	return NULL;
+}
+
+/*
+ * Is the display of @connector off in @state, or to be shown on @back's
+ * pipeline, so that its route may give @crtc's pipeline up for that one?
+ */
+static bool dcp_typec_follow_holder_off(struct drm_atomic_state *state,
+					struct drm_crtc *crtc,
+					struct apple_connector *connector,
+					struct apple_dcp *back)
+{
+	struct drm_connector_state *conn_state = NULL;
+	struct drm_crtc_state *crtc_state;
+	struct drm_crtc *other;
+
+	if (connector) {
+		conn_state = drm_atomic_get_new_connector_state(state, &connector->base);
+		if (!conn_state)
+			conn_state = connector->base.state;
+	}
+	other = conn_state ? conn_state->crtc : NULL;
+	if (!other)
+		return true;
+	if (other == crtc)
+		return false;
+	if (back->crtc && other == &back->crtc->base)
+		return true;
+	crtc_state = drm_atomic_get_new_crtc_state(state, other);
+	if (!crtc_state)
+		crtc_state = other->state;
+	return crtc_state && !crtc_state->active;
+}
+
+/* May @connector's route follow @crtc to @dcp's pipeline, and how? */
+static int dcp_typec_follow_decide(struct apple_dcp *dcp, struct drm_crtc *crtc,
+				   struct drm_atomic_state *state,
+				   struct apple_connector *connector,
+				   struct dcp_typec_follow *follow)
+{
+	struct dcp_fabric_policy policy = { .dual_stream = dcp_typec_dual_stream() };
+	struct apple_dcp_typec_route *from, *to, *holder, *back = NULL;
+	struct apple_dcp_typec_port *port, *other = NULL;
+	bool secondary, off = false;
+
+	lockdep_assert_held(&dcp_typec_fabric_lock);
+	memset(follow, 0, sizeof(*follow));
+	follow->action = DCP_FABRIC_FOLLOW_REFUSE;
+	port = dcp_typec_port_of(connector, &secondary);
+	if (!port)
+		return -EINVAL;
+	from = secondary ? port->secondary_owner : port->owner;
+	to = dcp_typec_port_route(port, dcp);
+	if (from && from == to) {
+		follow->action = DCP_FABRIC_FOLLOW_STAY;
+		return 0;
+	}
+	/*
+	 * Not routed (yet): nothing to follow, the modeset is checked as it
+	 * stands, as when resume restores a display whose tunnel is not back.
+	 */
+	if (!from || !READ_ONCE(connector->connected))
+		return -ENOENT;
+	/* A dock's second stream has one pipeline, and the plan rules first. */
+	if (secondary || from->tunnel ||
+	    !dcp_typec_follows_crtc(from->dcp) ||
+	    READ_ONCE(from->dcp->tb_retiring) || dcp_typec_keep_order())
+		return -EINVAL;
+	holder = dcp->active_typec_route;
+	if (holder) {
+		other = holder->port;
+		if (holder != other->owner || holder->tunnel)
+			return -EINVAL;
+		back = dcp_typec_port_route(other, from->dcp);
+		off = dcp_typec_follow_holder_off(state, crtc, other->connector,
+						  from->dcp);
+		/* the port's own snapshot below decides for @dcp's pipeline */
+		dcp_fabric_snapshot_port(other, holder->tunnel);
+	}
+	dcp_fabric_snapshot_port(port, from->tunnel);
+	/* Follow-only reservation; arrival allocation retains its existing policy. */
+	if (to)
+		to->core.pipeline->fixed_recent = dcp->hdmi_hpd && dcp->fixed_phy &&
+			READ_ONCE(dcp->hdmi_edge_seen) &&
+			time_before(jiffies, READ_ONCE(dcp->hdmi_edge_jiffies) +
+				    msecs_to_jiffies(DCP_HDMI_HOLD_MS));
+	follow->action = dcp_fabric_follow(&from->core, to ? &to->core : NULL,
+					   holder ? &holder->core : NULL,
+					   back ? &back->core : NULL, off, &policy);
+	if (follow->action == DCP_FABRIC_FOLLOW_REFUSE)
+		return -EINVAL;
+	follow->port = port;
+	follow->from = from;
+	follow->to = to;
+	follow->holder = holder;
+	follow->holder_back = back;
+	return 0;
+}
+
+static int dcp_follow_prepare(void *data, unsigned int index)
+{
+	struct dcp_typec_follow_context *ctx = data;
+	struct dcp_typec_follow_slot *slot = &ctx->slots[index];
+
+	slot->port = slot->from->port;
+	slot->connector = slot->from->dcp->typec_connector;
+	{
+		struct drm_crtc *crtc = &slot->from->dcp->crtc->base;
+		struct drm_crtc_state *old = drm_atomic_get_old_crtc_state(ctx->state, crtc);
+
+		slot->was_active = old && old->active;
+	}
+	slot->modes = dcp_modes_dup(slot->from->dcp, slot->connector,
+				    &slot->nr_modes, &slot->generation);
+	if (IS_ERR(slot->modes)) {
+		int ret = PTR_ERR(slot->modes);
+
+		slot->modes = NULL;
+		return ret;
+	}
+	return 0;
+}
+
+static int dcp_follow_validate(void *data, unsigned int index)
+{
+	struct dcp_typec_follow_context *ctx = data;
+	struct dcp_typec_follow_slot *slot = &ctx->slots[index];
+	struct apple_dcp *dcp = slot->from->dcp;
+
+	guard(mutex)(&dcp->modes_lock);
+	if (dcp->modes_generation != slot->generation ||
+	    !dcp_modes_for_connector(dcp, slot->connector) ||
+	    dcp->active_typec_route != slot->from ||
+	    READ_ONCE(slot->connector->dcp) != to_platform_device(dcp->dev))
+		return -ESTALE;
+	return 0;
+}
+
+static int dcp_follow_release(struct apple_dcp_typec_route *route)
+{
+	struct apple_dcp *dcp = route->dcp;
+	int ret;
+
+	/* Revoked sessions cannot touch the new route after a reconnect wait. */
+	dcp_dptx_park(dcp);
+	apple_connector_edid_set_live(dcp->typec_connector, false);
+	dcp_modes_begin_attachment(dcp);
+	dcp->typec_connector = NULL;
+	WRITE_ONCE(dcp->connector, dcp->fixed_connector);
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		WRITE_ONCE(dcp->typec_cable_connected, false);
+	ret = dcp_typec_route_deactivate(route);
+	if (route->port->owner == route)
+		route->port->owner = NULL;
+	return ret;
+}
+
+static int dcp_follow_detach(void *data, unsigned int index, bool destination)
+{
+	struct dcp_typec_follow_context *ctx = data;
+	struct dcp_typec_follow_slot *slot = &ctx->slots[index];
+
+	return dcp_follow_release(destination ? slot->to : slot->from);
+}
+
+static int dcp_follow_attach(void *data, unsigned int index, bool restore)
+{
+	struct dcp_typec_follow_context *ctx = data;
+	struct dcp_typec_follow_slot *slot = &ctx->slots[index];
+	struct apple_dcp_typec_route *route = restore ? slot->from : slot->to;
+	struct apple_dcp *dcp = route->dcp;
+	int ret;
+
+	ret = dcp_typec_route_activate(route, route->xbar);
+	if (ret)
+		return ret;
+	slot->attachment_generation = dcp_modes_transfer_begin(dcp);
+	slot->port->owner = route;
+	slot->port->preferred_route = route;
+	slot->port->dp_release_deadline = 0;
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		WRITE_ONCE(dcp->typec_cable_connected, true);
+		dcp->typec_generation++;
+		dcp->typec_follow_start = true;
+		dcp->typec_follow_gen = dcp->typec_generation;
+		dcp->typec_reconnect_tries = 0;
+		dcp->placeholder_retried = false;
+		reinit_completion(&dcp->typec_iomfb_hpd_ready);
+		WRITE_ONCE(dcp->typec_crtc_off, true);
+	}
+	return 0;
+}
+
+static void dcp_follow_publish(void *data, unsigned int index, bool restore)
+{
+	struct dcp_typec_follow_context *ctx = data;
+	struct dcp_typec_follow_slot *slot = &ctx->slots[index];
+	struct apple_dcp *dcp = (restore ? slot->from : slot->to)->dcp;
+
+	dcp_modes_adopt(dcp, slot->connector, slot->attachment_generation, slot->modes,
+			slot->nr_modes);
+	slot->modes = NULL;
+	slot->restored = restore;
+}
+
+static void dcp_follow_lost(void *data, unsigned int index)
+{
+	struct dcp_typec_follow_context *ctx = data;
+	struct apple_connector *connector = ctx->slots[index].connector;
+
+	if (connector) {
+		WRITE_ONCE(connector->connected, false);
+		apple_connector_set_pipeline(connector, NULL);
+		dcp_queue_hotplug(connector);
+	}
+}
+
+static const struct dcp_fabric_follow_ops dcp_follow_ops = {
+	.prepare = dcp_follow_prepare,
+	.validate = dcp_follow_validate,
+	.detach = dcp_follow_detach,
+	.attach = dcp_follow_attach,
+	.publish = dcp_follow_publish,
+	.lost = dcp_follow_lost,
+};
+
+static int dcp_typec_follow_move(struct dcp_typec_follow *follow,
+				 struct drm_atomic_state *state)
+{
+	struct dcp_typec_follow_context ctx = {
+		.state = state,
+		.slots[0] = { .from = follow->from, .to = follow->to },
+		.slots[1] = { .from = follow->holder, .to = follow->holder_back },
+	};
+	unsigned int count = follow->action == DCP_FABRIC_FOLLOW_SWAP ? 2 : 1;
+	unsigned int i;
+	int ret;
+
+	/* Keep newly queued and already waiting sessions outside the handoff. */
+	for (i = 0; i < count; i++) {
+		WRITE_ONCE(ctx.slots[i].from->dcp->typec_follow_retiring, true);
+		WRITE_ONCE(ctx.slots[i].to->dcp->typec_follow_retiring, true);
+	}
+	ret = dcp_fabric_follow_execute(&dcp_follow_ops, &ctx, count);
+	if (ret)
+		to_apple_atomic_state(state)->failed_routes |=
+			drm_crtc_mask(&follow->from->dcp->crtc->base) |
+			drm_crtc_mask(&follow->to->dcp->crtc->base);
+	for (i = 0; i < count; i++) {
+		WRITE_ONCE(ctx.slots[i].from->dcp->typec_follow_retiring, false);
+		WRITE_ONCE(ctx.slots[i].to->dcp->typec_follow_retiring, false);
+	}
+	for (i = 0; i < count; i++) {
+		struct dcp_typec_follow_slot *slot = &ctx.slots[i];
+
+		if (slot->restored && slot->was_active) {
+			int error = dcp_dptx_connect(slot->from->dcp, 0);
+
+			if (error)
+				dev_err(slot->from->dcp->dev,
+					"restored route link could not reconnect: %d\n", error);
+		}
+	}
+	if (!ret && count == 1) {
+		struct apple_dcp *freed = ctx.slots[0].from->dcp;
+
+		if (freed->hdmi_hpd && freed->active &&
+		    gpiod_get_value_cansleep(freed->hdmi_hpd))
+			dcp_dptx_connect(freed, 0);
+		dcp_typec_route_waiting();
+	}
+	kfree(ctx.slots[0].modes);
+	kfree(ctx.slots[1].modes);
+	if (ret) {
+		for (i = 0; i < count; i++)
+			if (ctx.slots[i].connector)
+				dcp_route_failure_notify(ctx.slots[i].connector);
+	}
+	return ret;
+}
+
+/*
+ * atomic_check: may the Type-C displays @state puts on @crtc be driven by
+ * its pipeline @dcp? Validate the source catalog under fabric ownership;
+ * commit revalidates the route before making any destructive changes.
+ */
+int dcp_typec_follow_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
+			   struct drm_atomic_state *state,
+			   const struct drm_display_mode *mode)
+{
+	struct drm_connector_state *conn_state;
+	struct dcp_typec_follow follow;
+	struct drm_connector *conn;
+	int i, ret;
+
+	for_each_new_connector_in_state(state, conn, conn_state, i) {
+		struct apple_connector *connector = to_apple_connector(conn);
+
+		if (conn_state->crtc != crtc || !connector->port_encoder ||
+		    READ_ONCE(connector->dcp) == to_platform_device(dcp->dev))
+			continue;
+		if (!state->allow_modeset)
+			return -EINVAL;
+		/* Include both sides in DRM dependency ordering, including off holders. */
+		{
+			struct drm_crtc *other;
+
+			drm_for_each_crtc(other, crtc->dev) {
+				struct drm_crtc_state *other_state;
+
+				other_state = drm_atomic_get_crtc_state(state, other);
+				if (IS_ERR(other_state))
+					return PTR_ERR(other_state);
+			}
+		}
+		if (!dcp_typec_follow_lock(false))
+			return -EBUSY;
+		ret = dcp_typec_follow_decide(dcp, crtc, state, connector, &follow);
+		if (!ret && !dcp_has_mode(follow.action == DCP_FABRIC_FOLLOW_STAY ?
+					 dcp : follow.from->dcp, mode))
+			ret = -EINVAL;
+		dcp_typec_follow_unlock(false);
+		if (ret == -ENOENT)
+			continue;
+		if (ret) {
+			dev_info_ratelimited(dcp->dev, "%s cannot follow its CRTC here\n",
+					     conn->name);
+			return ret;
+		}
+		return 0;
+	}
+	return dcp_has_mode(dcp, mode) ? 0 : -EINVAL;
+}
+
+static bool dcp_typec_direct_commit(struct drm_crtc *crtc,
+				    struct drm_atomic_state *state)
+{
+	struct drm_connector_state *conn_state;
+	struct drm_connector *conn;
+	int i;
+
+	for_each_new_connector_in_state(state, conn, conn_state, i) {
+		struct apple_connector *connector = to_apple_connector(conn);
+		struct platform_device *pdev = READ_ONCE(connector->dcp);
+		struct apple_dcp_typec_route *route;
+		struct apple_dcp *source;
+
+		if (conn_state->crtc != crtc || !connector->port_encoder || !pdev)
+			continue;
+		source = platform_get_drvdata(pdev);
+		/* The second half of a swap still needs its handoff identity held. */
+		if (pdev == to_apple_crtc(crtc)->dcp) {
+			if (dcp_crtc_needs_route_start(source))
+				return true;
+			continue;
+		}
+		route = READ_ONCE(source->active_typec_route);
+		if (route && !READ_ONCE(route->tunnel) &&
+		    dcp_typec_follows_crtc(source))
+			return true;
+	}
+	return false;
+}
+
+static void dcp_follow_fail_commit(struct drm_crtc *crtc, struct drm_atomic_state *state)
+{
+	struct drm_connector_state *conn_state;
+	struct drm_connector *conn;
+	int i;
+
+	to_apple_atomic_state(state)->failed_routes |= drm_crtc_mask(crtc);
+	for_each_new_connector_in_state(state, conn, conn_state, i) {
+		struct apple_connector *connector = to_apple_connector(conn);
+		struct platform_device *pdev = READ_ONCE(connector->dcp);
+		struct apple_dcp *source;
+
+		if (conn_state->crtc != crtc || !connector->port_encoder || !pdev)
+			continue;
+		source = platform_get_drvdata(pdev);
+		if (source->crtc && dcp_typec_follows_crtc(source))
+			to_apple_atomic_state(state)->failed_routes |=
+				drm_crtc_mask(&source->crtc->base);
+	}
+}
+
+/* Hold route identity through power-on/modeset; caller releases on every exit. */
+int dcp_typec_follow_crtc(struct drm_crtc *crtc, struct drm_atomic_state *state,
+			  bool *locked)
+{
+	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	struct drm_connector_state *conn_state;
+	struct dcp_typec_follow follow;
+	struct drm_connector *conn;
+	int i, ret;
+
+	*locked = false;
+	if (!dcp_typec_follows_crtc(dcp) || !dcp_typec_direct_commit(crtc, state))
+		return 0;
+	if (!dcp_typec_follow_lock(true)) {
+		dcp_follow_fail_commit(crtc, state);
+		return -EBUSY;
+	}
+	*locked = true;
+	for_each_new_connector_in_state(state, conn, conn_state, i) {
+		struct apple_connector *connector = to_apple_connector(conn);
+
+		if (conn_state->crtc != crtc || !connector->port_encoder ||
+		    READ_ONCE(connector->dcp) == pdev)
+			continue;
+		ret = dcp_typec_follow_decide(dcp, crtc, state, connector, &follow);
+		if (!ret && follow.action != DCP_FABRIC_FOLLOW_STAY) {
+			struct drm_crtc_state *new = drm_atomic_get_new_crtc_state(state, crtc);
+
+			if (!dcp_has_mode(follow.from->dcp, &new->mode))
+				ret = -EINVAL;
+			else
+				ret = dcp_typec_follow_move(&follow, state);
+		}
+		if (ret && ret != -ENOENT) {
+			dcp_follow_fail_commit(crtc, state);
+			return ret;
+		}
+	}
+	return 0;
+}
+
+void dcp_typec_follow_done(bool locked)
+{
+	if (locked)
+		dcp_typec_follow_unlock(true);
+}
+
 static struct apple_dcp_typec_port *
 dcp_typec_port_get(struct device_node *connector_np)
 {
@@ -2095,8 +2650,7 @@ void dcp_typec_port_set_connector(unsigned int idx, bool secondary,
 	if (owner) {
 		struct apple_dcp *dcp = owner->dcp;
 
-		if (dcp->crtc && connector->port_encoder &&
-		    !dcp_typec_dual_stream())
+		if (dcp->crtc && connector->port_encoder && dcp_typec_narrows(dcp, owner->tunnel))
 			connector->port_encoder->possible_crtcs =
 				dcp_fabric_connector_mask(false,
 							  true, true,
@@ -2439,6 +2993,10 @@ static int dcp_fixed_output_select(struct apple_dcp *dcp)
  */
 irqreturn_t dcp_dp2hdmi_hpd_edge(int irq, void *data)
 {
+	struct apple_dcp *dcp = data;
+
+	WRITE_ONCE(dcp->hdmi_edge_jiffies, jiffies);
+	WRITE_ONCE(dcp->hdmi_edge_seen, true);
 	dcp_hdmi_hpd_edge(data);
 	dcp_hdmi_edge(data);
 

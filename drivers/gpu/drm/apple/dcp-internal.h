@@ -267,6 +267,7 @@ struct apple_dcp {
 	u64 dimensions_generation;
 	struct work_struct dimensions_wq;
 	bool modes_admitted;
+	bool modes_provisional;
 
 	/* Attributes of the connector */
 	int connector_type;
@@ -353,6 +354,9 @@ struct apple_dcp {
 	struct mux_control *direct_xbar_up;
 	/* CRTC powered off while the Type-C cable stays attached */
 	bool typec_crtc_off;
+	bool typec_follow_start;
+	bool typec_follow_retiring;
+	u64 typec_follow_gen;
 	/* IOMFB reports its video interface ready after DPTX link training. */
 	struct completion typec_iomfb_hpd_ready;
 	struct delayed_work typec_reconnect_wq;
@@ -377,6 +381,8 @@ struct apple_dcp {
 	/* Hardirq, resume and expiry share one generation under this lock. */
 	spinlock_t hdmi_presence_lock;
 	struct dcp_fabric_presence hdmi_presence;
+	unsigned long hdmi_edge_jiffies;
+	bool hdmi_edge_seen;
 	struct delayed_work hdmi_settle_wq;
 	struct delayed_work hdmi_recheck_wq;
 	/* T6030 HDMI converter service requests, see dcp-hdmi.c */

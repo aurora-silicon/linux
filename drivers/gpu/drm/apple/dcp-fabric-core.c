@@ -321,6 +321,94 @@ dcp_fabric_tunnel_candidate(const struct dcp_fabric_port *port,
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_tunnel_candidate);
 
+/*
+ * A modeset gives a Type-C stream routed through @from the CRTC of the
+ * pipeline its port reaches through @to (NULL: none).  Stay, move the
+ * route there, swap it with @holder, the route of another port holding
+ * that pipeline, or refuse the modeset.  A move needs a pipeline that is
+ * free but for its CRTC: no live fixed output and its services up.  A
+ * fixed-output settling window follows the existing fabric policy.
+ * A swap needs a holder whose own display is off, or about to be
+ * shown on @from's pipeline, and that can reach @from's pipeline through
+ * @holder_back.
+ */
+enum dcp_fabric_follow
+dcp_fabric_follow(const struct dcp_fabric_route *from,
+		  const struct dcp_fabric_route *to,
+		  const struct dcp_fabric_route *holder,
+		  const struct dcp_fabric_route *holder_back, bool holder_off,
+		  const struct dcp_fabric_policy *policy)
+{
+	const struct dcp_fabric_pipeline *pipeline;
+
+	if (!from || !to || from->tunnel || (holder && holder->tunnel))
+		return DCP_FABRIC_FOLLOW_REFUSE;
+	if (from == to)
+		return DCP_FABRIC_FOLLOW_STAY;
+	pipeline = to->pipeline;
+	if (!pipeline->bound || pipeline->fixed_busy || pipeline->terminal ||
+	    !pipeline->services_ready ||
+	    (!policy->dual_stream && pipeline->presence != DCP_FABRIC_ABSENT))
+		return DCP_FABRIC_FOLLOW_REFUSE;
+	if (!holder)
+		return pipeline->owned || pipeline->fixed_recent ? DCP_FABRIC_FOLLOW_REFUSE :
+					 DCP_FABRIC_FOLLOW_MOVE;
+	if (holder == from || holder->pipeline != pipeline || !holder_off ||
+	    !holder_back || holder_back->pipeline != from->pipeline)
+		return DCP_FABRIC_FOLLOW_REFUSE;
+	return DCP_FABRIC_FOLLOW_SWAP;
+}
+EXPORT_SYMBOL_GPL(dcp_fabric_follow);
+
+int dcp_fabric_follow_execute(const struct dcp_fabric_follow_ops *ops,
+			      void *ctx, unsigned int count)
+{
+	unsigned int i, detached = 0, attached = 0;
+	int ret;
+
+	if (!count || count > 2)
+		return -EINVAL;
+	for (i = 0; i < count; i++) {
+		ret = ops->prepare(ctx, i);
+		if (ret)
+			return ret;
+	}
+	for (i = 0; i < count; i++) {
+		ret = ops->validate(ctx, i);
+		if (ret)
+			return ret;
+	}
+	for (i = 0; i < count; i++) {
+		/* A failed release may already have relinquished ownership. */
+		detached++;
+		ret = ops->detach(ctx, i, false);
+		if (ret)
+			goto rollback;
+	}
+	for (i = 0; i < count; i++) {
+		ret = ops->attach(ctx, i, false);
+		if (ret)
+			goto rollback;
+		attached++;
+	}
+	for (i = 0; i < count; i++)
+		ops->publish(ctx, i, false);
+	return 0;
+
+rollback:
+	/* Only a failed original restore makes a connector terminally lost. */
+	while (attached)
+		ops->detach(ctx, --attached, true);
+	for (i = 0; i < detached; i++) {
+		if (ops->attach(ctx, i, true))
+			ops->lost(ctx, i);
+		else
+			ops->publish(ctx, i, true);
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(dcp_fabric_follow_execute);
+
 unsigned int dcp_fabric_deactivate_steps(int error, bool selected, bool fixed_live,
 					 enum dcp_fabric_deactivate_step steps[3])
 {

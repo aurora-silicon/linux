@@ -1559,7 +1559,7 @@ static void res_is_main_display(struct apple_dcp *dcp, void *out, void *cookie)
 	connector = dcp->connector;
 	if (connector) {
 		connector->connected = dcp->nr_modes > 0;
-		schedule_work(&connector->hotplug_wq);
+		dcp_queue_hotplug(connector);
 	}
 
 	dcp->active = true;

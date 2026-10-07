@@ -185,7 +185,7 @@ static void dcp_v14_stopped_work(struct work_struct *work)
 	if (connector) {
 		WRITE_ONCE(connector->connected, false);
 		apple_connector_edid_set_live(connector, false);
-		schedule_work(&connector->hotplug_wq);
+		dcp_queue_hotplug(connector);
 	}
 }
 
@@ -1070,7 +1070,7 @@ static void dcp_v14_crashed(void *cookie, const void *crashlog, size_t crashlog_
 		if (v14->external && connector && !READ_ONCE(dcp->external_detached)) {
 			WRITE_ONCE(connector->connected, false);
 			apple_connector_edid_set_live(connector, false);
-			schedule_work(&connector->hotplug_wq);
+			dcp_queue_hotplug(connector);
 		}
 	}
 	dev_err(v14->dev, "DCP firmware crashed; its buffers are kept until reboot\n");
@@ -1824,7 +1824,7 @@ int iomfb_v14_7_external_open(struct apple_dcp *dcp)
 	/* A display described before this could not be enabled until now. */
 	if (!READ_ONCE(dcp->external_detached) && dcp->connector &&
 	    READ_ONCE(dcp->connector->connected))
-		schedule_work(&dcp->connector->hotplug_wq);
+		dcp_queue_hotplug(dcp->connector);
 	return 0;
 }
 

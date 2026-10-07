@@ -10,6 +10,9 @@
 
 struct apple_connector;
 struct apple_crtc;
+struct drm_atomic_state;
+struct drm_crtc;
+struct drm_display_mode;
 struct device_node;
 struct drm_device;
 struct mux_control;
@@ -63,6 +66,13 @@ void dcp_typec_port_set_connector(unsigned int idx, bool secondary,
 				  struct apple_connector *connector);
 bool dcp_typec_dual_stream(void);
 void dcp_typec_reorder(void);
+bool dcp_typec_follows_crtc(struct apple_dcp *dcp);
+int dcp_typec_follow_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
+			   struct drm_atomic_state *state,
+			   const struct drm_display_mode *mode);
+int dcp_typec_follow_crtc(struct drm_crtc *crtc, struct drm_atomic_state *state,
+			  bool *locked);
+void dcp_typec_follow_done(bool locked);
 bool dcp_is_typec_only(struct platform_device *pdev);
 void dcp_link(struct platform_device *pdev, struct apple_crtc *apple,
 	      struct apple_connector *connector);

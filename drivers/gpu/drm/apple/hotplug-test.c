@@ -232,7 +232,51 @@ static void hotplug_without_hpd(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, fixture->notification_locked);
 }
 
+static void hotplug_route_failure_notify(struct kunit *test)
+{
+	struct hotplug_fixture *fixture = test->priv;
+
+	fixture->connector.connected = true;
+	WRITE_ONCE(fixture->dcp.mode_state.valid, false);
+	dcp_route_failure_notify(&fixture->connector);
+	flush_work(&fixture->connector.hotplug_wq);
+	KUNIT_EXPECT_EQ(test, fixture->notifications, 1U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&fixture->connector.hotplug_reasons), 0);
+	KUNIT_EXPECT_FALSE(test, work_pending(&fixture->connector.hotplug_wq));
+}
+
+static void hotplug_coalesced_ready(struct kunit *test)
+{
+	struct hotplug_fixture *fixture = test->priv;
+	unsigned int order;
+
+	fixture->connector.connected = true;
+	WRITE_ONCE(fixture->dcp.mode_state.valid, false);
+	for (order = 0; order < 2; order++) {
+		/* Hold the work so both reasons are pending before consumption. */
+		disable_work_sync(&fixture->connector.hotplug_wq);
+		if (order) {
+			dcp_queue_hotplug(&fixture->connector);
+			dcp_route_failure_notify(&fixture->connector);
+		} else {
+			dcp_route_failure_notify(&fixture->connector);
+			dcp_queue_hotplug(&fixture->connector);
+		}
+		fixture->connector.base.state->link_status = DRM_MODE_LINK_STATUS_GOOD;
+		enable_work(&fixture->connector.hotplug_wq);
+		schedule_work(&fixture->connector.hotplug_wq);
+		flush_work(&fixture->connector.hotplug_wq);
+		KUNIT_EXPECT_EQ(test, fixture->observed_link_status,
+				(u64)DRM_MODE_LINK_STATUS_BAD);
+		KUNIT_EXPECT_EQ(test, atomic_read(&fixture->connector.hotplug_reasons), 0);
+		KUNIT_EXPECT_FALSE(test, work_pending(&fixture->connector.hotplug_wq));
+	}
+	KUNIT_EXPECT_EQ(test, fixture->notifications, 2U);
+}
+
 static struct kunit_case hotplug_test_cases[] = {
+	KUNIT_CASE(hotplug_route_failure_notify),
+	KUNIT_CASE(hotplug_coalesced_ready),
 	KUNIT_CASE(hotplug_connected),
 	KUNIT_CASE(hotplug_disconnected),
 	KUNIT_CASE(hotplug_retrain),

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #include <kunit/test.h>
 #include <linux/slab.h>
+#include <linux/platform_device.h>
+
+#include "dcp.h"
 #include <linux/unaligned.h>
 
 #include "connector.h"
@@ -563,6 +566,167 @@ static void parser_stale_transfer(struct kunit *test)
 	kfree(dcp->modes);
 }
 
+static void parser_route_catalog_handoff(struct kunit *test)
+{
+	struct parser_record record = valid_record(7, 10);
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	struct apple_connector *connector = kunit_kzalloc(test, sizeof(*connector), GFP_KERNEL);
+	struct apple_connector *other = kunit_kzalloc(test, sizeof(*other), GFP_KERNEL);
+	struct dcp_display_mode *copy;
+	struct dcp_parse_ctx ctx;
+	struct parser_blob *blob;
+	unsigned int count;
+	u64 generation;
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	KUNIT_ASSERT_NOT_NULL(test, connector);
+	KUNIT_ASSERT_NOT_NULL(test, other);
+	dcp_modes_init(dcp);
+	apple_connector_edid_init(connector);
+	apple_connector_edid_init(other);
+	dcp->connector = connector;
+	blob = make_blob(test, &record, 1);
+	KUNIT_ASSERT_NOT_NULL(test, blob);
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	ctx.dcp = &parser_dcp;
+	KUNIT_ASSERT_EQ(test, dcp_modes_replace(dcp, &ctx, dcp_modes_transfer_begin(dcp)), 0);
+	copy = dcp_modes_dup(dcp, other, &count, &generation);
+	KUNIT_EXPECT_EQ(test, PTR_ERR(copy), (long)-ENODATA);
+	copy = dcp_modes_dup(dcp, connector, &count, &generation);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, copy);
+	KUNIT_EXPECT_EQ(test, count, 1U);
+	dcp_modes_begin_attachment(dcp);
+	dcp_modes_adopt(dcp, connector, generation, copy, count);
+	KUNIT_EXPECT_FALSE(test, dcp->modes_admitted);
+
+	copy = kmemdup(dcp->modes, sizeof(*copy), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, copy);
+	generation = dcp_modes_transfer_begin(dcp);
+	dcp_modes_adopt(dcp, other, generation, copy, 1);
+	KUNIT_EXPECT_FALSE(test, dcp->modes_admitted);
+	copy = kmemdup(dcp->modes, sizeof(*copy), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, copy);
+	dcp_modes_adopt(dcp, connector, generation, copy, 1);
+	KUNIT_EXPECT_TRUE(test, dcp->modes_admitted);
+	KUNIT_EXPECT_TRUE(test, dcp->modes_provisional);
+
+	record.id = 9;
+	blob = make_blob(test, &record, 1);
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	ctx.dcp = &parser_dcp;
+	KUNIT_ASSERT_EQ(test, dcp_modes_replace(dcp, &ctx, generation), 0);
+	KUNIT_EXPECT_FALSE(test, dcp->modes_provisional);
+	KUNIT_EXPECT_EQ(test, dcp->modes[0].timing_mode_id, 9U);
+	/* A copy arriving after the destination's catalog cannot replace its IDs. */
+	copy = kmemdup(dcp->modes, sizeof(*copy), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, copy);
+	copy->timing_mode_id = 7;
+	dcp_modes_adopt(dcp, connector, generation, copy, 1);
+	KUNIT_EXPECT_EQ(test, dcp->modes[0].timing_mode_id, 9U);
+	kfree(dcp->modes);
+}
+
+static void parser_route_programming_guard(struct kunit *test)
+{
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	struct apple_crtc *crtc = kunit_kzalloc(test, sizeof(*crtc), GFP_KERNEL);
+	struct platform_device *pipeline = kunit_kzalloc(test, sizeof(*pipeline), GFP_KERNEL);
+	struct platform_device *other = kunit_kzalloc(test, sizeof(*other), GFP_KERNEL);
+	struct apple_connector *connector = kunit_kzalloc(test, sizeof(*connector), GFP_KERNEL);
+	struct drm_connector_state conn_state = {};
+	struct drm_crtc_state crtc_state = {};
+	struct __drm_crtcs_state crtcs[1] = { { .new_state = &crtc_state } };
+	struct __drm_connnectors_state connections[1] = {};
+	struct drm_atomic_state state = {
+		.connectors = connections, .num_connector = 1, .crtcs = crtcs,
+	};
+	struct drm_encoder encoder = {};
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	KUNIT_ASSERT_NOT_NULL(test, crtc);
+	KUNIT_ASSERT_NOT_NULL(test, pipeline);
+	KUNIT_ASSERT_NOT_NULL(test, other);
+	KUNIT_ASSERT_NOT_NULL(test, connector);
+	dcp_modes_init(dcp);
+	dcp->fw_compat = DCP_FIRMWARE_V_13_5;
+	dcp->nr_typec_routes = 1;
+	dcp->connector = connector;
+	crtc->dcp = pipeline;
+	platform_set_drvdata(pipeline, dcp);
+	connector->port_encoder = &encoder;
+	connector->dcp = other;
+	connector->connected = true;
+	conn_state.crtc = &crtc->base;
+	connections[0].ptr = &connector->base;
+	connections[0].new_state = &conn_state;
+	KUNIT_EXPECT_FALSE(test, dcp_crtc_route_ready(&crtc->base, &state, false));
+	KUNIT_EXPECT_FALSE(test, dcp_crtc_route_ready(&crtc->base, &state, true));
+	connector->dcp = pipeline;
+	KUNIT_EXPECT_TRUE(test, dcp_crtc_can_retrain(&crtc->base, connector));
+	connector->dcp = other;
+	platform_set_drvdata(other, dcp);
+	KUNIT_EXPECT_FALSE(test, dcp_crtc_can_retrain(&crtc->base, connector));
+	connector->dcp = pipeline;
+	dcp->modes_provisional = true;
+	KUNIT_EXPECT_TRUE(test, dcp_crtc_route_ready(&crtc->base, &state, false));
+	KUNIT_EXPECT_FALSE(test, dcp_crtc_route_ready(&crtc->base, &state, true));
+	dcp->modes_provisional = false;
+	KUNIT_EXPECT_TRUE(test, dcp_crtc_route_ready(&crtc->base, &state, true));
+	/* A plane-only commit omits connector entries but keeps its complete mask. */
+	state.num_connector = 0;
+	crtc_state.connector_mask = BIT_ULL(1);
+	dcp->active_typec_route = &dcp->typec_routes[0];
+	dcp->typec_crtc_off = true;
+	KUNIT_EXPECT_FALSE(test, dcp_crtc_needs_route_start(dcp));
+	dcp->typec_follow_start = true;
+	dcp->typec_generation = 5;
+	dcp->typec_follow_gen = 5;
+	KUNIT_EXPECT_TRUE(test, dcp_crtc_needs_route_start(dcp));
+	dcp->typec_follow_gen = 4;
+	KUNIT_EXPECT_FALSE(test, dcp_crtc_needs_route_start(dcp));
+	dcp->typec_follow_gen = 5;
+	dcp->active_typec_route->tunnel = true;
+	KUNIT_EXPECT_FALSE(test, dcp_crtc_needs_route_start(dcp));
+	dcp->active_typec_route->tunnel = false;
+	KUNIT_EXPECT_FALSE(test, dcp_crtc_route_ready(&crtc->base, &state, true));
+	crtc_state.connector_mask = BIT_ULL(0);
+	KUNIT_EXPECT_FALSE(test, dcp_crtc_route_ready(&crtc->base, &state, true));
+	dcp->modes_admitted = true;
+	KUNIT_EXPECT_TRUE(test, dcp_crtc_route_ready(&crtc->base, &state, true));
+	dcp->active_typec_route = NULL;
+	state.num_connector = 1;
+	/* An unrouted disconnected resume keeps its existing deferred path. */
+	connector->dcp = NULL;
+	connector->connected = false;
+	KUNIT_EXPECT_TRUE(test, dcp_crtc_route_ready(&crtc->base, &state, false));
+	/* Native/14.7 continues to use its existing atomic machinery. */
+	dcp->fw_compat = DCP_FIRMWARE_V_14_7;
+	connector->dcp = other;
+	KUNIT_EXPECT_TRUE(test, dcp_crtc_route_ready(&crtc->base, &state, true));
+}
+
+static void parser_route_invalid_own_mode(struct kunit *test)
+{
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	struct apple_crtc *crtc = kunit_kzalloc(test, sizeof(*crtc), GFP_KERNEL);
+	struct platform_device *pdev = kunit_kzalloc(test, sizeof(*pdev), GFP_KERNEL);
+	struct drm_crtc_state crtc_state = { .enable = true, .mode_changed = true };
+	struct __drm_crtcs_state crtcs[1] = { { .new_state = &crtc_state } };
+	struct drm_atomic_state state = { .crtcs = crtcs };
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	KUNIT_ASSERT_NOT_NULL(test, crtc);
+	KUNIT_ASSERT_NOT_NULL(test, pdev);
+	dcp_modes_init(dcp);
+	dcp->fw_compat = DCP_FIRMWARE_V_13_5;
+	dcp->nr_typec_routes = 1;
+	crtc->dcp = pdev;
+	platform_set_drvdata(pdev, dcp);
+	/* No crossing selected: a fixed/paired output still needs its own mode. */
+	KUNIT_EXPECT_TRUE(test, dcp_crtc_mode_fixup(&crtc->base, &crtc_state.mode, NULL));
+	KUNIT_EXPECT_EQ(test, dcp_crtc_atomic_check(&crtc->base, &state), -EINVAL);
+}
+
 static void parser_connector_ownership(struct kunit *test)
 {
 	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
@@ -880,6 +1044,31 @@ static void parser_property_bounds(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, dcp_property_chunk_valid(8192, 8190, 4, 4096));
 }
 
+static void parser_route_prepare_scope(struct kunit *test)
+{
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	struct device *dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
+	struct apple_dcp_typec_route *route = kunit_kzalloc(test, sizeof(*route), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	KUNIT_ASSERT_NOT_NULL(test, route);
+	mutex_init(&dcp->modes_lock);
+	dcp->dev = dev;
+	dcp->fw_compat = DCP_FIRMWARE_V_13_5;
+	dcp->nr_typec_routes = 1;
+	dcp->active_typec_route = route;
+	dcp->typec_crtc_off = true;
+	/* No PHY would fail strict preparation; a paired wake must bypass it. */
+	KUNIT_EXPECT_EQ(test, dcp_typec_prepare_route(dcp), 0);
+	dcp->typec_follow_start = true;
+	dcp->typec_follow_gen = dcp->typec_generation;
+	mutex_init(&dcp->hpd_mutex);
+	KUNIT_EXPECT_EQ(test, dcp_typec_prepare_route(dcp), -ENODEV);
+	mutex_destroy(&dcp->hpd_mutex);
+	mutex_destroy(&dcp->modes_lock);
+}
+
 static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_score_presence),
 	KUNIT_CASE(parser_legacy_ties),
@@ -892,6 +1081,10 @@ static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_replacement),
 	KUNIT_CASE(parser_attachment_admission),
 	KUNIT_CASE(parser_stale_transfer),
+	KUNIT_CASE(parser_route_catalog_handoff),
+	KUNIT_CASE(parser_route_programming_guard),
+	KUNIT_CASE(parser_route_prepare_scope),
+	KUNIT_CASE(parser_route_invalid_own_mode),
 	KUNIT_CASE(parser_connector_ownership),
 	KUNIT_CASE(parser_route_retirement),
 	KUNIT_CASE(parser_rejected_replacement),
