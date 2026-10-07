@@ -456,6 +456,11 @@ impl UatPageTable {
                                 }
                                 let pt_paddr = Page::into_phys(pt_page);
                                 upte_val = pt_paddr | PTE_TYPE_LEAF_TABLE;
+                                // Complete child-table initialization before a
+                                // concurrent device walk can follow its parent.
+                                // A later mapping/TLBI barrier cannot order an
+                                // already-visible parent against earlier clears.
+                                crate::mem::sync();
                                 upte.store(upte_val, Ordering::Relaxed);
                             }
                             if upte_val & PTE_TYPE_BITS == PTE_TYPE_LEAF_TABLE {
