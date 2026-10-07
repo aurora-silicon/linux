@@ -41,12 +41,13 @@ RUN_KEYS = ["schema", "run_id", "release", "written_at", "boot_id", "kernel", "b
             "installer_source"]
 KEYS = RUN_KEYS + ["package", "version", "file", "sha256", "prefix", "result", "installed_version",
                    "installed_by", "preexisting", "user", "render_member", "render_preexisting", "render_added",
-                   "render_by_installer", "user_setup_source", "user_setup", "opt_out", "opt_out_cmdline",
-                   "created_files"]
+                   "render_by_installer", "user_setup_source", "user_setup_session", "user_setup", "opt_out",
+                   "opt_out_cmdline", "created_files"]
 # An error record: the run's keys, and the ownership history.
 ERROR_KEYS = RUN_KEYS + ["package", "result", "record_error", "installed_version", "installed_by", "preexisting",
                          "render_user", "render_preexisting", "render_by_installer"]
-REPEATED = {"integration_path", "render_added_user", "user_setup_path", "opt_out_path", "record_error_key"}
+REPEATED = {"integration_path", "render_added_user", "user_setup_path", "user_setup_ignored", "opt_out_path",
+            "record_error_key"}
 INTEGRATION = re.search(r'^M3_PRO_MESA_INTEGRATION="([^"]*)"$', SRC, re.M).group(1).splitlines()
 # The reasons a login gives in mesa-m3's state file (its report, section 4.3).
 REASONS = ["active", "opt-out", "not-t6030", "no-gpu", "no-display", "no-access", "incomplete-prefix", "user-setup",
@@ -164,6 +165,9 @@ def parse_record(tc, data):
     tc.assertEqual(lists["integration_path"], INTEGRATION)
     tc.assertIn(scalars["user_setup_source"], ("package-detector", "installer-builtin"))
     tc.assertIn(scalars["user_setup"], ("present", "none", "unknown"))
+    tc.assertIn(scalars["user_setup_session"], ("hyprland", "unknown"))
+    for line in lists["user_setup_ignored"]:
+        tc.assertRegex(line, r"^(all|desktop:[a-z0-9_+:-]+) (sure|unsure) /")
     if scalars["user_setup"] != "unknown":
         tc.assertEqual(scalars["user_setup"], "present" if lists["user_setup_path"] else "none")
     tc.assertIn(scalars["render_member"], ("yes", "no", "unknown"))
@@ -524,23 +528,52 @@ class ProMesaTest(flow.M3FlowBase):
         self.assertIn(f"Left as it is: {self.record()['user']}'s own M3 Mesa setup ({h}/.config/environment.d/"
                       "90-vulkan.conf:1 sets VK_ICD_FILENAMES (/home/owner/icd.json); ", out)
         self.assertIn(f"{h}/.config/hypr/hyprland.conf:1 sets LIBGL_DRIVERS_PATH (/home/owner/dri); ", out)
-        self.assertIn(f"{h}/.drirc chooses a driver (dri_driver); ", out)
-        self.assertIn(f"{h}/.config/chonkstep/m3gpu-session.env sets CHONKSTEP_M3_MESA_PREFIX to "
-                      "/home/owner/src/mesa-prefix).", out)
+        self.assertIn(f"{h}/.drirc chooses a driver (dri_driver)).", out)
+        # chonkstep's settings: listed, but a Hyprland session does not read them.
+        self.assertIn("Not counted, as a Hyprland session does not read it (left as it is): desktop:chonkstep sure "
+                      f"{h}/.config/chonkstep/m3gpu-session.env sets CHONKSTEP_M3_MESA_PREFIX to "
+                      "/home/owner/src/mesa-prefix", out)
         self.assertNotIn("91-ours.conf", out)                          # it points at the package's prefix
         self.assertNotIn(f"{h}/.config/drirc", out)
         self.assertIn(f"switched off at login by {h}/.config/mesa-m3/disable: off for", out)
         rec, lists = self.record_lists()
         self.assertEqual((rec["user_setup_source"], rec["user_setup"]), ("installer-builtin", "present"))
+        self.assertEqual(rec["user_setup_session"], "hyprland")
         self.assertEqual(lists["user_setup_path"], [
-            f"{h}/.config/environment.d/90-vulkan.conf", f"{h}/.config/hypr/hyprland.conf",
-            f"{h}/.drirc", f"{h}/.config/chonkstep/m3gpu-session.env"])
+            f"{h}/.config/environment.d/90-vulkan.conf", f"{h}/.config/hypr/hyprland.conf", f"{h}/.drirc"])
+        self.assertEqual(lists["user_setup_ignored"], [
+            f"desktop:chonkstep sure {h}/.config/chonkstep/m3gpu-session.env sets CHONKSTEP_M3_MESA_PREFIX to "
+            "/home/owner/src/mesa-prefix"])
         self.assertEqual(rec["opt_out"], "present")
         self.assertEqual(lists["opt_out_path"], [f"{h}/.config/mesa-m3/disable"])
         self.assertEqual(rec["opt_out_cmdline"], "no")
         self.uninstall()
         after = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in home.rglob("*") if p.is_file()}
         self.assertEqual(after, before)
+
+    def test_chonkstep_alone_is_not_a_setup_of_the_hyprland_session(self):
+        # The lab m3pro today: only chonkstep's file names a private prefix. Stock Hyprland does
+        # not read it: user_setup=none, the finding listed as ignored.
+        self.mac("j516s")
+        (self.home / ".config/chonkstep").mkdir(parents=True)
+        (self.home / ".config/chonkstep/m3gpu-session.env").write_bytes(CHONKSTEP_ENV)
+        proc = self.install()
+        rec, lists = self.record_lists()
+        self.assertEqual((rec["user_setup"], rec["user_setup_session"], lists["user_setup_path"]),
+                         ("none", "hyprland", []))
+        self.assertEqual(lists["user_setup_ignored"], [
+            f"desktop:chonkstep sure {self.home_path}/.config/chonkstep/m3gpu-session.env sets "
+            "CHONKSTEP_M3_MESA_PREFIX to /home/owner/src/mesa-prefix"])
+        out = " ".join(proc.stdout.split())
+        self.assertNotIn("Left as it is: ", out.replace("Left as it is): ", ""))
+        self.assertIn("Not counted, as a Hyprland session does not read it", out)
+        # A uwsm env file for Hyprland choosing a private Mesa is one it reads.
+        (self.home / ".config/uwsm").mkdir(parents=True)
+        (self.home / ".config/uwsm/env-hyprland").write_text("export GALLIUM_DRIVER=zink\n")
+        self.install()
+        rec, lists = self.record_lists()
+        self.assertEqual((rec["user_setup"], lists["user_setup_path"]),
+                         ("present", [f"{self.home_path}/.config/uwsm/env-hyprland"]))
 
     def test_an_unreadable_setting_is_unknown_never_none(self):
         self.mac("j516s")
@@ -955,13 +988,16 @@ class ProMesaTest(flow.M3FlowBase):
 
     # mesa-m3-user-setup's answers (its report, section 4.5): schema 2; exit 0 none, 1 present,
     # 3 unknown.
-    PRESENT = ("echo schema=aurora.mesa-m3-user-setup/2; echo user_setup=present\n"
+    PRESENT = ("echo schema=aurora.mesa-m3-user-setup/3; echo session_desktops=hyprland; echo user_setup=present\n"
                "echo 'user_setup_path=/a path/from the detector'\n"
                "echo 'user_setup_path=/b'\n"
                "echo 'user_setup_detail=/a path/from the detector:3 sets GALLIUM_DRIVER'\n"
-               "echo 'user_setup_detail=/b chooses a driver (dri_driver)'\nexit 1\n")
-    NONE = "echo schema=aurora.mesa-m3-user-setup/2; echo user_setup=none; exit 0\n"
-    UNKNOWN = ("echo schema=aurora.mesa-m3-user-setup/2; echo user_setup=unknown\n"
+               "echo 'user_setup_detail=/b chooses a driver (dri_driver)'\n"
+               "echo 'user_setup_finding=applied desktop:hyprland sure /a path/from the detector:3 sets GALLIUM_DRIVER'\n"
+               "echo 'user_setup_finding=ignored desktop:chonkstep sure /c/m3gpu-session.env sets CHONKSTEP_M3_MESA_PREFIX to /p'\n"
+               "exit 1\n")
+    NONE = "echo schema=aurora.mesa-m3-user-setup/3; echo session_desktops=hyprland; echo user_setup=none; exit 0\n"
+    UNKNOWN = ("echo schema=aurora.mesa-m3-user-setup/3; echo session_desktops=hyprland; echo user_setup=unknown\n"
                "echo user_setup_path=/c; echo 'user_setup_detail=/c cannot be read (Permission denied)'; exit 3\n")
 
     def test_the_user_setup_comes_from_the_packages_detector_once_installed(self):
@@ -972,8 +1008,10 @@ class ProMesaTest(flow.M3FlowBase):
         rec, lists = self.record_lists()
         self.assertEqual((rec["user_setup_source"], rec["user_setup"]), ("package-detector", "present"))
         self.assertEqual(lists["user_setup_path"], ["/a path/from the detector", "/b"])
+        self.assertEqual(lists["user_setup_ignored"],
+                         ["desktop:chonkstep sure /c/m3gpu-session.env sets CHONKSTEP_M3_MESA_PREFIX to /p"])
         self.assertEqual((self.fake / "detector-args").read_text().strip(),
-                         f"--home {self.home_path} --root {self.sysroot}")
+                         f"--home {self.home_path} --session-desktops Hyprland --root {self.sysroot}")
         out = " ".join(proc.stdout.split())
         self.assertIn("(/a path/from the detector:3 sets GALLIUM_DRIVER; /b chooses a driver (dri_driver))", out)
         for body, want in ((self.NONE, ("none", [])), (self.UNKNOWN, ("unknown", ["/c"]))):
@@ -995,7 +1033,9 @@ class ProMesaTest(flow.M3FlowBase):
                          ("installer-builtin", "present", [f"{self.home_path}/.drirc"]))
         for body in ("exit 2\n",                                                  # an error
                      "echo schema=other/1; exit 0\n",                             # another form
-                     "echo schema=aurora.mesa-m3-user-setup/2; echo user_setup=present; exit 0\n",  # inconsistent
+                     "echo schema=aurora.mesa-m3-user-setup/3; echo session_desktops=x; echo user_setup=present; exit 0\n",
+                     "echo schema=aurora.mesa-m3-user-setup/3; echo user_setup=none; exit 0\n",  # no session line
+                     "echo schema=aurora.mesa-m3-user-setup/2; echo user_setup=none; exit 0\n",  # the old schema
                      self.NONE.replace("exit 0", "exit 1")):
             with self.subTest(detector=body):
                 self.detector(body)
@@ -1014,12 +1054,15 @@ class ProMesaTest(flow.M3FlowBase):
                 self.assertIn("copy of mesa-m3's user-setup check failed", " ".join(proc.stderr.split()))
 
     def builtin(self):
-        """The built-in copy's answer for the harness's home: (exit status, [(path, detail)])."""
+        """The built-in copy's answer for the harness's home: (exit status, [(path, detail)]) of the
+        findings a Hyprland session uses."""
         proc = self.run_sh(f"rc=0; m3_pro_mesa_builtin_setup '{self.home_path}' || rc=$?; printf 'rc=%s' \"$rc\"")
         out, _, rc = proc.stdout.rpartition("rc=")
         out = out.split("\0")
         self.assertEqual(out[-1], "")
-        return int(rc), list(zip(out[:-1:2], out[1:-1:2]))
+        triples = list(zip(out[:-1:3], out[1:-1:3], out[2:-1:3]))
+        self.assertEqual(triples[0][:2], ("session", ""))
+        return int(rc), [(p, w) for k, p, w in triples if k == "applied"]
 
     def test_the_built_in_copy_is_the_releases_bytes(self):
         # The heredocs print the files whose sha256 the release names (fill-m3-pro-mesa.sh writes
@@ -1036,8 +1079,8 @@ class ProMesaTest(flow.M3FlowBase):
         self.addCleanup((self.home / ".drirc").chmod, 0o644)
         rc, found = self.builtin()
         self.assertEqual((rc, [p for p, _ in found]), (3, [f"{self.home_path}/.drirc"]))
-        self.assertEqual(self.run_sh(f"rc=0; m3_pro_mesa_builtin_setup '/no such home' || rc=$?; echo $rc").stdout.strip(),
-                         "0")
+        self.assertEqual(self.run_sh("rc=0; m3_pro_mesa_builtin_setup '/no such home' || rc=$?; echo $rc").stdout,
+                         "session\0\0hyprland\0" + "0\n")
 
     def test_u1s_fixtures_pass_on_the_built_in_copy(self):
         # mesa-m3's own detector fixtures (42 cases, exact output and exit status) on this
@@ -1230,12 +1273,16 @@ class ProMesaTest(flow.M3FlowBase):
         block = out[start:out.index("(the wheel or adm group).", start)]
         for text in ("cat /run/user/$(id -u)/mesa-m3-session.state", "journalctl -b -t mesa-m3",
                      "mkdir -p ~/.config/mesa-m3 && touch ~/.config/mesa-m3/disable", "mesa_m3=off",
-                     "rm ~/.config/mesa-m3/disable", "previous-failed", "rm /run/user/$(id -u)/mesa-m3-attempt",
-                     "Ctrl+Alt+F3", "render group"):
+                     "rm ~/.config/mesa-m3/disable", "Ctrl+Alt+F3", "render group"):
             self.assertIn(text, block)
+        self.assertIn("   If a login with GPU graphics did not reach a working desktop, the next logins of that\n"
+                      "   boot render in software (previous-failed). To try the GPU again:\n"
+                      "     rm ~/.local/state/mesa-m3/attempt\n"
+                      "   then log out and in (or reboot).\n", block)
+        self.assertNotIn("mesa-m3-attempt", out)
         words = " ".join(block.split())
         self.assertIn("Reasons: " + ", ".join(REASONS) + ".", words)
-        self.assertLessEqual(len(block.splitlines()), 14)
+        self.assertLessEqual(len(block.splitlines()), 15)
         self.assertTrue(all(len(l) <= 100 for l in block.splitlines()))
         # Not when mesa-m3 is not installed.
         reset_mac(self, "j516s")
@@ -1280,17 +1327,26 @@ class DetectorAgreementTest(flow.M3FlowBase):
 
     def answers(self):
         """((exit status, detector paths), (exit status, built-in paths))."""
-        proc = subprocess.run(["python3", str(self.detector_bin), "--home", self.home_path, "--root", str(self.sysroot)],
-                              capture_output=True, text=True)
+        proc = subprocess.run(["python3", str(self.detector_bin), "--home", self.home_path, "--root", str(self.sysroot),
+                               "--session-desktops", "Hyprland"], capture_output=True, text=True)
         self.assertIn(proc.returncode, (0, 1, 3), proc.stderr)
         lines = proc.stdout.splitlines()
-        self.assertEqual(lines[0], "schema=aurora.mesa-m3-user-setup/2")
+        self.assertEqual(lines[:2], ["schema=aurora.mesa-m3-user-setup/3", "session_desktops=hyprland"])
         theirs = [l.split("=", 1)[1] for l in lines if l.startswith("user_setup_path=")]
-        self.assertEqual(lines[1], "user_setup=" + {0: "none", 1: "present", 3: "unknown"}[proc.returncode])
-        body = f"rc=0; m3_pro_mesa_builtin_setup '{self.home_path}' || rc=$?; printf 'rc=%s' \"$rc\""
-        out, _, rc = self.run_sh(body).stdout.rpartition("rc=")
-        ours = out.split("\0")[:-1:2]
-        return (proc.returncode, theirs), (int(rc), ours)
+        ignored = [l[len("user_setup_finding=ignored "):] for l in lines if l.startswith("user_setup_finding=ignored ")]
+        self.assertEqual(lines[2], "user_setup=" + {0: "none", 1: "present", 3: "unknown"}[proc.returncode])
+        # As the installer collects it, through its own call of its copy.
+        body = (f"m3_pro_mesa_user_home() {{ echo '{self.home_path}'; }}\nm3_pro_mesa_installed() {{ :; }}\n"
+                "m3_pro_mesa_setup_collect\nprintf '%s\\n' \"$M3_PRO_MESA_SETUP_ANSWER\" \"$M3_PRO_MESA_SETUP_SESSION\"\n"
+                "printf 'path=%s\\n' \"${M3_PRO_MESA_SETUP[@]}\" | sed -n '1~2p'\n"
+                "printf 'ignored=%s\\n' \"${M3_PRO_MESA_SETUP_IGNORED[@]}\"\n")
+        got = self.run_sh(body).stdout.splitlines()
+        answer, session = got[0], got[1]
+        ours = [l[5:] for l in got[2:] if l.startswith("path=") and l != "path="]
+        ours_ignored = [l[8:] for l in got[2:] if l.startswith("ignored=") and l != "ignored="]
+        self.assertEqual(session, "hyprland")
+        rc = {"none": 0, "present": 1, "unknown": 3}[answer]
+        return (proc.returncode, theirs, ignored), (rc, ours, ours_ignored)
 
     def write(self, files):
         for rel, data in files.items():
@@ -1309,6 +1365,10 @@ class DetectorAgreementTest(flow.M3FlowBase):
         yield "empty home", {}
         yield "the lab m3pro today", {f"{c}/chonkstep/m3gpu-session.env": CHONKSTEP_ENV.decode(),
                                       f"{c}/hypr/hyprland.conf": "monitor=,preferred,auto,1\n"}
+        yield "a uwsm env file for Hyprland", {f"{c}/uwsm/env-hyprland": "export GALLIUM_DRIVER=zink\n"}
+        yield "a uwsm env file for another desktop", {f"{c}/uwsm/env-sway": "export GALLIUM_DRIVER=zink\n",
+                                                      f"{c}/uwsm/env-chonkstep.d/x": "export VK_ICD_FILENAMES=/x\n"}
+        yield "CHONKSTEP_M3_MESA_PREFIX in a common file", {f"{c}/uwsm/env": "export CHONKSTEP_M3_MESA_PREFIX=/x/p\n"}
         yield "the m3pro after the switch-over", {f"{c}/chonkstep/m3gpu-session.env":
                                                   "CHONKSTEP_M3_CLIENTS=gpu\nCHONKSTEP_M3_MESA_PREFIX=/opt/mesa-m3\n"}
         yield "chonkstep without a prefix", {f"{c}/chonkstep/m3gpu-session.env": "CHONKSTEP_M3_CLIENTS=gpu\n"}
@@ -1366,7 +1426,7 @@ class DetectorAgreementTest(flow.M3FlowBase):
     def test_the_detector_and_the_built_in_copy_agree(self):
         if os.geteuid() == 0:
             self.skipTest("unreadable files need a normal user")
-        n, kinds = 0, set()
+        n, kinds, ignored = 0, set(), 0
         for name, files in self.scenarios():
             with self.subTest(name):
                 for p in self.sysroot.rglob("*"):
@@ -1382,10 +1442,12 @@ class DetectorAgreementTest(flow.M3FlowBase):
                 self.assertEqual(ours, theirs)
                 n += 1
                 kinds.add(theirs[0])
+                ignored += bool(theirs[2])
         for p in self.sysroot.rglob("*"):
             p.chmod(0o755 if p.is_dir() else 0o644)
         self.assertGreaterEqual(n, 70)
         self.assertEqual(kinds, {0, 1, 3})                   # none, present and unknown all covered
+        self.assertGreater(ignored, 3)                        # and findings the session does not use
 
 
 class FromEarlierReleasesTest(flow.M3FlowBase):
