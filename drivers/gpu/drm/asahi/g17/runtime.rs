@@ -184,6 +184,13 @@ impl Registry {
         cap: usize,
     ) -> Result<usize> {
         // Count first: event turns are frequent and the steady state has no excess.
+        let forced = self
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .filter(|queue| queue.vacate_candidate() && queue.needs_fresh_backing())
+            .count();
         let count = self
             .compute
             .iter()
@@ -191,7 +198,7 @@ impl Registry {
             .filter_map(|entry| entry.queue.as_deref())
             .filter(|queue| queue.vacate_candidate())
             .count();
-        if count <= cap {
+        if count <= cap && forced == 0 {
             return Ok(0);
         }
         let mut candidates: KVec<(u64, u8)> = KVec::with_capacity(count, GFP_KERNEL)?;
@@ -202,10 +209,12 @@ impl Registry {
             .filter_map(|entry| entry.queue.as_deref())
             .filter(|queue| queue.vacate_candidate())
         {
-            candidates.push((queue.released_at(), queue.qid()), GFP_KERNEL)?;
+            // Recycled killed queues sort first (time 0) and count beyond the cap.
+            let key = if queue.needs_fresh_backing() { 0 } else { queue.released_at() };
+            candidates.push((key, queue.qid()), GFP_KERNEL)?;
         }
         candidates.sort_unstable();
-        let excess = candidates.len() - cap;
+        let excess = candidates.len().saturating_sub(cap).max(forced);
         let mut published = 0;
         for (_, qid) in candidates.iter().take(excess.min(4)) {
             let queue = self
@@ -1125,6 +1134,7 @@ impl super::Firmware {
             .flatten()
             .filter_map(|entry| entry.queue.as_deref_mut())
         {
+            queue.recycle_killed()?;
             if let Some(binding) = queue.detach_exited_owner() {
                 deferred.defer_binding(binding);
             }
