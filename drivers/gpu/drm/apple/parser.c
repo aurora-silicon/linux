@@ -304,6 +304,14 @@ static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim)
 	struct iterator it;
 	int ret = 0;
 
+	*dim = (struct dimension) {
+		.active = -1,
+		.total = -1,
+		.front_porch = -1,
+		.sync_width = -1,
+		.precise_sync_rate = -1,
+	};
+
 	ret = iterator_begin(handle, &it, true);
 	if (ret)
 		return ret;
@@ -314,15 +322,15 @@ static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim)
 		if (IS_ERR(key))
 			ret = PTR_ERR(key);
 		else if (!strcmp(key, "Active"))
-			ret = parse_int(it.handle, &dim->active);
+			ret = parse_int_bound(it.handle, &dim->active, 0, U16_MAX);
 		else if (!strcmp(key, "Total"))
-			ret = parse_int(it.handle, &dim->total);
+			ret = parse_int_bound(it.handle, &dim->total, 0, U16_MAX);
 		else if (!strcmp(key, "FrontPorch"))
-			ret = parse_int(it.handle, &dim->front_porch);
+			ret = parse_int_bound(it.handle, &dim->front_porch, 0, U16_MAX);
 		else if (!strcmp(key, "SyncWidth"))
-			ret = parse_int(it.handle, &dim->sync_width);
+			ret = parse_int_bound(it.handle, &dim->sync_width, 0, U16_MAX);
 		else if (!strcmp(key, "PreciseSyncRate"))
-			ret = parse_int(it.handle, &dim->precise_sync_rate);
+			ret = parse_int_bound(it.handle, &dim->precise_sync_rate, 1, U32_MAX);
 		else
 			ret = skip(it.handle);
 
@@ -332,6 +340,11 @@ static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim)
 		if (ret)
 			return ret;
 	}
+
+	if (dim->active <= 0 || dim->total < dim->active ||
+	    dim->front_porch < 0 || dim->sync_width < 0 ||
+	    dim->front_porch + dim->sync_width > dim->total - dim->active)
+		return -EINVAL;
 
 	return 0;
 }
@@ -349,6 +362,9 @@ struct color_mode {
 static int fill_color_mode(struct dcp_color_mode *color,
 			   struct color_mode *cmode)
 {
+	if (cmode->id < 0 || cmode->id > U32_MAX)
+		return -EINVAL;
+
 	if (color->score >= cmode->score)
 		return 0;
 
@@ -466,7 +482,7 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
  * specifies the clock in kHz. The intermediate result may overflow a u32, so
  * use a u64 where required.
  */
-static u32 calculate_clock(struct dimension *horiz, struct dimension *vert)
+static u64 calculate_clock(struct dimension *horiz, struct dimension *vert)
 {
 	u32 pixels = horiz->total * vert->total;
 	u64 clock = mul_u32_u32(pixels, vert->precise_sync_rate);
@@ -480,8 +496,9 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 {
 	int ret = 0;
 	struct iterator it;
-	struct dimension horiz = {}, vert = {};
+	struct dimension horiz = { .active = -1 }, vert = { .active = -1 };
 	s64 min_vrr = 0, max_vrr = 0;
+	u64 clock;
 	s64 id = -1;
 	s64 best_color_mode = -1;
 	bool is_virtual = false;
@@ -517,11 +534,11 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		else if (!strcmp(key, "ColorModes"))
 			ret = parse_color_modes(it.handle, out);
 		else if (!strcmp(key, "ID"))
-			ret = parse_int(it.handle, &id);
+			ret = parse_int_bound(it.handle, &id, 0, U32_MAX);
 		else if (!strcmp(key, "IsVirtual"))
 			ret = parse_bool(it.handle, &is_virtual);
 		else if (!strcmp(key, "Score"))
-			ret = parse_int(it.handle, score);
+			ret = parse_int_bound(it.handle, score, 0, S64_MAX);
 		else
 			ret = skip(it.handle);
 
@@ -548,7 +565,9 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	/*
 	 * Reject modes without valid color mode.
 	 */
-	if (best_color_mode < 0)
+	if (best_color_mode < 0 || id < 0 || *score < 0 ||
+	    horiz.active <= 0 || vert.active <= notch_height ||
+	    vert.precise_sync_rate <= 0)
 		return -EINVAL;
 
 	/*
@@ -577,13 +596,17 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		out->vrr = true;
 	}
 
+	clock = calculate_clock(&horiz, &vert);
+	if (!clock || clock > INT_MAX)
+		return -EINVAL;
+
 	vert.active -= notch_height;
 	vert.sync_width += notch_height;
 
 	/* From here we must succeed. Start filling out the mode. */
 	*mode = (struct drm_display_mode) {
 		.type = DRM_MODE_TYPE_DRIVER,
-		.clock = calculate_clock(&horiz, &vert),
+		.clock = clock,
 
 		.vdisplay = vert.active,
 		.vsync_start = vert.active + vert.front_porch,
