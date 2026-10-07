@@ -1406,187 +1406,7 @@ impl StatusBlock {
     }
 }
 
-/// Power state the primary status B carries for the secondary instance,
-/// named by [`SecondaryRoot::power_state_va`].
-#[repr(C, packed)]
-pub(crate) struct PowerState {
-    pub(crate) unk_0: [u8; 0x10],
-    /// Required: 0xf (15).
-    pub(crate) unk_10: u32,
-    /// Required: 0x3f00_0000 (0.5 as an IEEE-754 single).
-    pub(crate) unk_14: u32,
-    /// Required: 0x4088_0000 (4.25 as an IEEE-754 single).
-    pub(crate) unk_18: u32,
-    /// Required: 0x28 (40).
-    pub(crate) unk_1c: u32,
-    /// Required: 1.
-    pub(crate) unk_20: u32,
-    pub(crate) unk_24: [u8; 0xa0],
-    /// Non-zero asks the secondary to reload the limiter settings that
-    /// follow into the power configuration; zero at boot.
-    pub(crate) temp_update: u32,
-    /// Target temperature of the limiter ([`TEMP_TARGET`]).
-    pub(crate) temp_target: u32,
-    /// Release temperature of the limiter ([`TEMP_RELEASE`]).
-    pub(crate) temp_release: u32,
-    pub(crate) unk_d0: [u8; 8],
-    /// Proportional gain of the limiter ([`TEMP_KP`]).
-    pub(crate) temp_kp: u32,
-    /// Integral gain of the limiter ([`TEMP_KI`]).
-    pub(crate) temp_ki: u32,
-    pub(crate) unk_e0: [u8; 0x10],
-    /// Required: 0x26ac (9900).
-    pub(crate) unk_f0: u32,
-    /// Required: 0xc8 (200).
-    pub(crate) unk_f4: u32,
-    pub(crate) unk_f8: [u8; 0x10],
-    /// Required: 0x42c8_0000 (100.0 as an IEEE-754 single).
-    pub(crate) unk_108: u32,
-    /// Required: 0x43c8_0000 (400.0 as an IEEE-754 single).
-    pub(crate) unk_10c: u32,
-    /// Required: 0xc8 (200).
-    pub(crate) unk_110: u32,
-    pub(crate) unk_114: [u8; 0x14],
-    /// Required: 1.
-    pub(crate) unk_128: u32,
-    /// Required: 0x2616 (9750).
-    pub(crate) unk_12c: u32,
-    /// Required: 0x3f00_0000 (0.5 as an IEEE-754 single).
-    pub(crate) unk_130: u32,
-    /// Required: 0x40cc_cccd (6.4 as an IEEE-754 single).
-    pub(crate) unk_134: u32,
-    pub(crate) unk_138: [u8; 0x14],
-    /// Required: 1.
-    pub(crate) unk_14c: u32,
-    pub(crate) unk_150: [u8; 0x70],
-    /// Required: 1.
-    pub(crate) unk_1c0: u32,
-    /// Required: 1.
-    pub(crate) unk_1c4: u32,
-    /// Required: 4.
-    pub(crate) unk_1c8: u32,
-    /// Required: 1 in every entry.
-    pub(crate) unk_1cc: [u32; 4],
-    pub(crate) unk_1dc: [u8; 0x308],
-    /// Required: 1.
-    pub(crate) unk_4e4: u32,
-    /// Required: 0x1f4 (500).
-    pub(crate) unk_4e8: u32,
-    /// Required: 6.
-    pub(crate) unk_4ec: u32,
-    /// Required: 0x30d4 (12500) in every entry.
-    pub(crate) unk_4f0: [u32; 6],
-    pub(crate) unk_508: [u8; 0x14],
-    /// Required: 0x30d4 (12500) in every entry.
-    pub(crate) unk_51c: [u32; 5],
-    /// Required: 1.
-    pub(crate) unk_530: u32,
-    pub(crate) unk_534: [u8; 0x58],
-    /// Required: 6.
-    pub(crate) unk_58c: u32,
-    /// Required: 0xdac (3500).
-    pub(crate) unk_590: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_594: u32,
-    /// Required: 0xbb8 (3000).
-    pub(crate) unk_598: u32,
-    /// Required: 0x64 (100).
-    pub(crate) unk_59c: u32,
-    pub(crate) unk_5a0: [u8; 0x2c],
-    /// Required: 1.
-    pub(crate) unk_5cc: u32,
-    /// Required: 4.
-    pub(crate) unk_5d0: u32,
-    pub(crate) unk_5d4: [u8; 8],
-    /// Required: 0x1f40 (8000).
-    pub(crate) unk_5dc: u32,
-    /// Required: 0xc8 (200).
-    pub(crate) unk_5e0: u32,
-    /// Required: 0xfa0 (4000).
-    pub(crate) unk_5e4: u32,
-    /// Required: 0xc8 (200).
-    pub(crate) unk_5e8: u32,
-    /// Required: 0x7d0 (2000).
-    pub(crate) unk_5ec: u32,
-    /// Required: 0xc8 (200).
-    pub(crate) unk_5f0: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_5f4: u32,
-    /// Required: 0xc8 (200).
-    pub(crate) unk_5f8: u32,
-    pub(crate) unk_5fc: [u8; 8],
-    /// Required: 0x4170_0000 (15.0 as an IEEE-754 single).
-    pub(crate) unk_604: u32,
-    /// Required: 0x40a0_0000 (5.0 as an IEEE-754 single).
-    pub(crate) unk_608: u32,
-    /// Required: 0x20 (32).
-    pub(crate) unk_60c: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_610: u32,
-    pub(crate) unk_614: [u8; 0xc],
-    /// Required: 0x384 (900).
-    pub(crate) unk_620: u32,
-    pub(crate) unk_624: [u8; 0x9c],
-}
 
-// SAFETY: `PowerState` consists of integers and arrays of integers only.
-unsafe impl Zeroable for PowerState {}
-
-static_assert!(size_of::<PowerState>() == 0x6c0);
-
-impl PowerState {
-    fn init(&mut self) {
-        self.unk_10 = 0xf;
-        self.unk_14 = 0x3f00_0000;
-        self.unk_18 = 0x4088_0000;
-        self.unk_1c = 0x28;
-        self.unk_20 = 1;
-        self.temp_target = TEMP_TARGET;
-        self.temp_release = TEMP_RELEASE;
-        self.temp_kp = TEMP_KP;
-        self.temp_ki = TEMP_KI;
-        self.unk_f0 = 0x26ac;
-        self.unk_f4 = 0xc8;
-        self.unk_108 = 0x42c8_0000;
-        self.unk_10c = 0x43c8_0000;
-        self.unk_110 = 0xc8;
-        self.unk_128 = 1;
-        self.unk_12c = 0x2616;
-        self.unk_130 = 0x3f00_0000;
-        self.unk_134 = 0x40cc_cccd;
-        self.unk_14c = 1;
-        self.unk_1c0 = 1;
-        self.unk_1c4 = 1;
-        self.unk_1c8 = 4;
-        self.unk_1cc = [1; 4];
-        self.unk_4e4 = 1;
-        self.unk_4e8 = 0x1f4;
-        self.unk_4ec = 6;
-        self.unk_4f0 = [0x30d4; 6];
-        self.unk_51c = [0x30d4; 5];
-        self.unk_530 = 1;
-        self.unk_58c = 6;
-        self.unk_590 = 0xdac;
-        self.unk_594 = 0x3e8;
-        self.unk_598 = 0xbb8;
-        self.unk_59c = 0x64;
-        self.unk_5cc = 1;
-        self.unk_5d0 = 4;
-        self.unk_5dc = 0x1f40;
-        self.unk_5e0 = 0xc8;
-        self.unk_5e4 = 0xfa0;
-        self.unk_5e8 = 0xc8;
-        self.unk_5ec = 0x7d0;
-        self.unk_5f0 = 0xc8;
-        self.unk_5f4 = 0x3e8;
-        self.unk_5f8 = 0xc8;
-        self.unk_604 = 0x4170_0000;
-        self.unk_608 = 0x40a0_0000;
-        self.unk_60c = 0x20;
-        self.unk_610 = 0x3e8;
-        self.unk_620 = 0x384;
-    }
-}
 
 /// Size of the firmware-control page named by the primary status B.
 pub(crate) const FWCTL_SIZE: usize = 0x4000;
@@ -1667,46 +1487,7 @@ impl PrimaryStatusB {
     }
 }
 
-/// Configuration of the secondary instance, named by
-/// [`SecondaryRoot::config_va`].
-#[repr(C)]
-pub(crate) struct SecondaryConfig {
-    pub(crate) unk_0: [u8; 0x14],
-    /// Required: 1.
-    pub(crate) unk_14: u32,
-    pub(crate) unk_18: [u8; 0x14],
-    /// Required: 1.
-    pub(crate) unk_2c: u32,
-    /// Required: 1.
-    pub(crate) unk_30: u32,
-    pub(crate) unk_34: [u8; 0xc],
-    /// Required: 1.
-    pub(crate) unk_40: u32,
-    pub(crate) unk_44: [u8; 8],
-    /// Required: 1.
-    pub(crate) unk_4c: u32,
-    /// Required: 0x186a (6250).
-    pub(crate) unk_50: u32,
-    pub(crate) unk_54: [u8; 0x2c],
-}
 
-static_assert!(size_of::<SecondaryConfig>() == 0x80);
-
-// SAFETY: `SecondaryConfig` consists of integers and arrays of integers only.
-unsafe impl Zeroable for SecondaryConfig {}
-
-impl SecondaryConfig {
-    /// Initializes the secondary configuration.
-    pub(crate) fn init(&mut self) {
-        clear(self);
-        self.unk_14 = 1;
-        self.unk_2c = 1;
-        self.unk_30 = 1;
-        self.unk_40 = 1;
-        self.unk_4c = 1;
-        self.unk_50 = 0x186a;
-    }
-}
 
 /// Offsets in the private cluster.
 pub(crate) mod private {
@@ -1751,295 +1532,332 @@ const TEMP_KP: u32 = 0x41a2_b852;
 /// single.
 const TEMP_KI: u32 = 0x4116_0419;
 
+/// Nonzero 32-bit words of a firmware object the host builds from constants: (byte offset, value, repeat).
+/// Every other word is zero. Generated from the previously field-by-field builders; the fwdump harness
+/// (`neo-smooth-20261007/kernel/fwdump`) verifies the objects byte for byte.
+type Words = &'static [(usize, u32, usize)];
+
+fn fill_words(bytes: &mut [u8], words: Words) {
+    bytes.fill(0);
+    for &(offset, value, repeat) in words {
+        for index in 0..repeat {
+            let at = offset + 4 * index;
+            bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+}
+
+const POWER_CONFIG_HEAD_WORDS: Words = &[
+    (0x4, 0x5dc00, 2),
+    (0x10, 4, 1),
+    (0x14, 0x3f800000, 1),
+    (0x2c, 1, 2),
+    (0x40, 0x64, 1),
+    (0x44, 1, 1),
+    (0x48, 0x3e8, 1),
+    (0x50, 0x64, 1),
+    (0x60, 4, 1),
+    (0x64, 0x3f800000, 1),
+    (0x6c, 1, 2),
+    (0x80, 0x64, 1),
+    (0x84, 1, 1),
+    (0x88, 0x3e8, 1),
+    (0x90, 0x64, 1),
+    (0xc0, 0x3f828f5c, 11),
+    (0x9b8, 0x271, 1),
+    (0x9c4, 0x3f7f2e9f, 1),
+    (0x9cc, 0x3b516154, 1),
+    (0x9d4, 0x3ca59586, 1),
+    (0x9e0, 0x46153800, 1),
+    (0x9e4, 0x40a90fdb, 1),
+    (0x9ec, 0xbdd67344, 1),
+    (0x9f0, 0x28, 1),
+    (0x9f4, 0x3e8, 2),
+    (0xa04, 0x254e, 1),
+    (0xa38, 0x3e8, 1),
+    (0xa70, 4, 1),
+    (0xa84, 0x3f800000, 1),
+    (0xa8c, 0x40cccccd, 1),
+    (0xa98, 0x47800000, 1),
+    (0xa9c, 0x3f000000, 1),
+    (0xaa8, 0x28, 1),
+    (0xaac, 0x3e8, 1),
+    (0xabc, 0x254e, 1),
+    (0xac8, 0x10, 1),
+    (0xad0, 0x5dc00, 1),
+    (0xb28, 0x5c, 1),
+    (0xb30, 0x64, 1),
+    (0xb34, 0x22, 1),
+    (0xb38, 6, 1),
+    (0xb40, 6, 1),
+    (0xb44, 1, 1),
+    (0xb4c, 0x3f4ccccd, 1),
+    (0xb50, 0x3f7df3b6, 1),
+    (0xb54, 0x3e4ccccd, 1),
+    (0xb58, 0x3c03126f, 1),
+    (0xb5c, 0x3f69d4d8, 2),
+    (0xb68, 0x42be0000, 1),
+    (0xb6c, 0x4064f5c3, 2),
+    (0xb74, 0x41179436, 1),
+    (0xb78, 0x64, 1),
+    (0xb7c, 0x3e8, 1),
+    (0xb80, 0x64, 1),
+    (0xb8c, 0x5c, 1),
+    (0xbc0, 0x64, 1),
+    (0xbe0, 0x401, 1),
+    (0xbe4, 0x6400, 1),
+    (0xbec, 0x1f4000, 1),
+    (0xbf0, 0xc800, 1),
+    (0xbf4, 0xfa000, 1),
+    (0xbf8, 0xc800, 1),
+    (0xbfc, 0x7d000, 1),
+    (0xc00, 0xc800, 1),
+    (0xc04, 0x3e800, 1),
+    (0xc08, 0xc800, 1),
+    (0xc0c, 0x100, 1),
+    (0xc64, 1, 1),
+    (0xc90, 1, 1),
+    (0x1c94, 0xff000000, 1),
+    (0x1c98, 0xff7fff7f, 74),
+];
+
+const POWER_CONFIG_TAIL_WORDS: Words = &[
+    (0x0, 0xff7fff7f, 181),
+    (0x2d4, 0x7fff7f, 1),
+    (0x4d8, 0x47800000, 1),
+    (0x4dc, 0x42200000, 1),
+    (0x4e0, 0x447a0000, 1),
+    (0x4e4, 0x5be, 1),
+    (0x4f8, 0x28, 1),
+    (0x500, 0x42c80000, 1),
+    (0x504, 0x3e8, 1),
+    (0x50c, 0x3f4ccccd, 1),
+    (0x510, 0x3e4ccccd, 1),
+    (0x550, TEMP_SENSOR_MASK as u32, 1),
+    (0x558, TEMP_RELEASE, 1),
+    (0x560, 4, 1),
+    (0x574, 0x3f800000, 1),
+    (0x57c, TEMP_KI, 1),
+    (0x588, 0x47800000, 1),
+    (0x58c, TEMP_KP, 1),
+    (0x598, 0x28, 1),
+    (0x59c, 0x3e8, 2),
+    (0x5ac, TEMP_TARGET, 1),
+    (0x5e0, 0x3e8, 1),
+    (0x7fc, 0x42000006, 1),
+    (0xa10, 0xb8520000, 1),
+    (0xa14, 0x3f7e, 1),
+    (0xa18, 0xd70a0000, 1),
+    (0xa1c, 0x3ba3, 1),
+    (0xa24, 0x43c8, 1),
+    (0xa30, 0x4780, 1),
+    (0xa34, 0x42c8, 1),
+    (0xa3c, 0x384bac8, 1),
+    (0xa40, 0x3e80000, 2),
+    (0xa4c, 0x80000000, 1),
+    (0xa50, 0x26ac453b, 1),
+    (0xa84, 0x3e80000, 1),
+    (0xaa0, 0xc80000, 1),
+    (0xb58, 0x3e8, 1),
+    (0xb6c, 1, 1),
+    (0xba0, 0x101, 1),
+    (0xba4, 0x400, 1),
+    (0xbbc, 0x23f00, 1),
+    (0xbc0, 0x100, 2),
+    (0xbdc, 0x24000, 1),
+    (0xbe0, 0x100, 2),
+    (0xbfc, 0x24100, 1),
+    (0xc48, 1, 1),
+    (0xc50, 0x254e, 3),
+    (0xc68, 0x3f800000, 1),
+    (0xc6c, 4, 1),
+    (0xc70, 0x10, 1),
+    (0xc74, 0x5dc00, 1),
+    (0xd44, 0x3c, 1),
+    (0xd50, 0x3f6eeeef, 1),
+    (0xd58, 0x3d888889, 1),
+    (0xd60, 0x3f000000, 1),
+    (0xd6c, 0x47800000, 1),
+    (0xd70, 0x40880000, 1),
+    (0xd7c, 0x28, 1),
+    (0xd80, 0x3e8, 2),
+    (0xd8c, 0x46153800, 1),
+    (0xd90, 0x254e, 1),
+    (0xd9c, 0xf0, 1),
+    (0xda4, 0x57e400, 1),
+    (0xdc4, 0x3e8, 1),
+    (0xe04, 1, 1),
+    (0xed4, 0x32, 1),
+    (0xed8, 1, 1),
+    (0xee0, 0x3f638e39, 1),
+    (0xee4, 0x3f2aaaab, 1),
+    (0xee8, 0x3de38e39, 1),
+    (0xeec, 0x3eaaaaab, 1),
+    (0xef0, 0xbf4ccccd, 2),
+    (0xefc, 0x47800000, 1),
+    (0xf00, 0xc0a00000, 2),
+    (0xf0c, 0x64, 1),
+    (0xf10, 0x3e8, 1),
+    (0xf14, 0x64, 1),
+    (0xf1c, 0x467a0000, 1),
+    (0xf20, 0x578, 1),
+    (0xf2c, 0x90, 1),
+    (0xf30, 0x30, 1),
+    (0xf34, 0x34bc00, 1),
+    (0xf3c, 0x119400, 1),
+    (0xf48, 0x47800000, 1),
+    (0xf70, 0x3e80, 1),
+    (0xf74, 2, 1),
+    (0xf78, 0x9c4, 1),
+    (0xf7c, 0x20d, 1),
+    (0xf80, 2, 1),
+    (0xf84, 4, 1),
+    (0xf88, 0x32, 1),
+    (0xfb8, 0x47800000, 1),
+    (0xfc8, 0x28, 1),
+    (0xfcc, 0x3e8, 1),
+];
+
+const POWER_STATE_WORDS: Words = &[
+    (0x10, 0xf, 1),
+    (0x14, 0x3f000000, 1),
+    (0x18, 0x40880000, 1),
+    (0x1c, 0x28, 1),
+    (0x20, 1, 1),
+    (0xc8, TEMP_TARGET, 1),
+    (0xcc, TEMP_RELEASE, 1),
+    (0xd8, TEMP_KP, 1),
+    (0xdc, TEMP_KI, 1),
+    (0xf0, 0x26ac, 1),
+    (0xf4, 0xc8, 1),
+    (0x108, 0x42c80000, 1),
+    (0x10c, 0x43c80000, 1),
+    (0x110, 0xc8, 1),
+    (0x128, 1, 1),
+    (0x12c, 0x2616, 1),
+    (0x130, 0x3f000000, 1),
+    (0x134, 0x40cccccd, 1),
+    (0x14c, 1, 1),
+    (0x1c0, 1, 2),
+    (0x1c8, 4, 1),
+    (0x1cc, 1, 4),
+    (0x4e4, 1, 1),
+    (0x4e8, 0x1f4, 1),
+    (0x4ec, 6, 1),
+    (0x4f0, 0x30d4, 6),
+    (0x51c, 0x30d4, 5),
+    (0x530, 1, 1),
+    (0x58c, 6, 1),
+    (0x590, 0xdac, 1),
+    (0x594, 0x3e8, 1),
+    (0x598, 0xbb8, 1),
+    (0x59c, 0x64, 1),
+    (0x5cc, 1, 1),
+    (0x5d0, 4, 1),
+    (0x5dc, 0x1f40, 1),
+    (0x5e0, 0xc8, 1),
+    (0x5e4, 0xfa0, 1),
+    (0x5e8, 0xc8, 1),
+    (0x5ec, 0x7d0, 1),
+    (0x5f0, 0xc8, 1),
+    (0x5f4, 0x3e8, 1),
+    (0x5f8, 0xc8, 1),
+    (0x604, 0x41700000, 1),
+    (0x608, 0x40a00000, 1),
+    (0x60c, 0x20, 1),
+    (0x610, 0x3e8, 1),
+    (0x620, 0x384, 1),
+];
+
+const HW_DATA_AUX_WORDS: Words = &[
+    (0xac, 6, 1),
+    (0xb8, 1, 1),
+    (0x174, 0xac000000, 1),
+    (0x178, 0xe800000d, 1),
+    (0x17c, 0xb8000003, 1),
+    (0x180, 0xe800000b, 1),
+    (0x184, 0xe8000003, 1),
+    (0x188, 0x64000003, 1),
+    (0x18c, 0x20000000, 1),
+    (0x1b4, 4, 1),
+    (0x1c0, 0x3f780000, 1),
+    (0x1c8, 0x3d000000, 1),
+    (0x1d0, 0x40a00000, 1),
+    (0x1dc, 0x47800000, 1),
+    (0x1e0, 0x41700000, 1),
+    (0x1ec, 0x384, 1),
+    (0x1f0, 0x3e8, 2),
+    (0x200, 0x3e8, 1),
+    (0x234, 0x3e8, 1),
+    (0x274, 0x64, 1),
+    (0x290, 0x82a, 1),
+    (0x298, 0x7d, 1),
+    (0x29c, 1, 1),
+    (0xee0, 0x18ae, 1),
+    (0xee8, 1, 1),
+    (0x2eec, 0x41c8cccd, 2),
+    (0x35e4, 1, 1),
+    (0x35e8, 0x1f4, 1),
+    (0x35ec, 6, 1),
+    (0x35f0, 0x30d4, 6),
+    (0x3608, 0xfa0, 1),
+    (0x361c, 0x30d4, 5),
+    (0x3630, 1, 1),
+    (0x37a8, 1, 1),
+    (0x37b4, 0x424ccccd, 1),
+    (0x37f4, 0x44068000, 1),
+    (0x3834, 0x41c9999a, 1),
+    (0x38e0, 0x186a, 1),
+];
+
+const SECONDARY_CONFIG_WORDS: Words = &[
+    (0x14, 1, 1),
+    (0x2c, 1, 2),
+    (0x40, 1, 1),
+    (0x4c, 1, 1),
+    (0x50, 0x186a, 1),
+];
+
+/// Power state the primary status B carries for the secondary instance,
+/// named by [`SecondaryRoot::power_state_va`].
+#[repr(C)]
+pub(crate) struct PowerState(pub(crate) [u8; 0x6c0]);
+
+// SAFETY: `PowerState` is a byte array.
+unsafe impl Zeroable for PowerState {}
+
+impl PowerState {
+    fn init(&mut self) {
+        fill_words(&mut self.0, POWER_STATE_WORDS);
+    }
+}
+
+/// Configuration of the secondary instance, named by
+/// [`SecondaryRoot::config_va`].
+#[repr(C)]
+pub(crate) struct SecondaryConfig(pub(crate) [u8; 0x80]);
+
+// SAFETY: `SecondaryConfig` is a byte array.
+unsafe impl Zeroable for SecondaryConfig {}
+
+impl SecondaryConfig {
+    pub(crate) fn init(&mut self) {
+        fill_words(&mut self.0, SECONDARY_CONFIG_WORDS);
+    }
+}
+
 /// Leading part of the [`PowerConfig`]. The host writes it twice: in the
 /// power configuration and at [`bundle::POWER_CONFIG_COPY`], where the copy
 /// ends with the views it lies in.
-#[repr(C, packed)]
-pub(crate) struct PowerConfigHead {
-    pub(crate) unk_0: [u8; 4],
-    /// Required: 0x5_dc00 (384000).
-    pub(crate) unk_4: u32,
-    /// Required: 0x5_dc00 (384000).
-    pub(crate) unk_8: u32,
-    pub(crate) unk_c: [u8; 4],
-    /// Required: 4.
-    pub(crate) unk_10: u32,
-    /// Required: 0x3f80_0000 (1.0 as an IEEE-754 single).
-    pub(crate) unk_14: u32,
-    pub(crate) unk_18: [u8; 0x14],
-    /// Required: 1.
-    pub(crate) unk_2c: u32,
-    /// Required: 1.
-    pub(crate) unk_30: u32,
-    pub(crate) unk_34: [u8; 0xc],
-    /// Required: 0x64 (100).
-    pub(crate) unk_40: u32,
-    /// Required: 1.
-    pub(crate) unk_44: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_48: u32,
-    pub(crate) unk_4c: [u8; 4],
-    /// Required: 0x64 (100).
-    pub(crate) unk_50: u32,
-    pub(crate) unk_54: [u8; 0xc],
-    /// Required: 4.
-    pub(crate) unk_60: u32,
-    /// Required: 0x3f80_0000 (1.0 as an IEEE-754 single).
-    pub(crate) unk_64: u32,
-    pub(crate) unk_68: [u8; 4],
-    /// Required: 1.
-    pub(crate) unk_6c: u32,
-    /// Required: 1.
-    pub(crate) unk_70: u32,
-    pub(crate) unk_74: [u8; 0xc],
-    /// Required: 0x64 (100).
-    pub(crate) unk_80: u32,
-    /// Required: 1.
-    pub(crate) unk_84: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_88: u32,
-    pub(crate) unk_8c: [u8; 4],
-    /// Required: 0x64 (100).
-    pub(crate) unk_90: u32,
-    pub(crate) unk_94: [u8; 0x2c],
-    /// Required: 0x3f82_8f5c (1.02 as an IEEE-754 single) in every entry.
-    pub(crate) unk_c0: [u32; 11],
-    pub(crate) unk_ec: [u8; 0x8cc],
-    /// Required: 0x271 (625).
-    pub(crate) unk_9b8: u32,
-    pub(crate) unk_9bc: [u8; 8],
-    /// Required: 0x3f7f_2e9f.
-    pub(crate) unk_9c4: u32,
-    pub(crate) unk_9c8: [u8; 4],
-    /// Required: 0x3b51_6154.
-    pub(crate) unk_9cc: u32,
-    pub(crate) unk_9d0: [u8; 4],
-    /// Required: 0x3ca5_9586 (0.020213 as an IEEE-754 single).
-    pub(crate) unk_9d4: u32,
-    pub(crate) unk_9d8: [u8; 8],
-    /// Required: 0x4615_3800 (9550.0 as an IEEE-754 single).
-    pub(crate) unk_9e0: u32,
-    /// Required: 0x40a9_0fdb.
-    pub(crate) unk_9e4: u32,
-    pub(crate) unk_9e8: [u8; 4],
-    /// Required: 0xbdd6_7344.
-    pub(crate) unk_9ec: u32,
-    /// Required: 0x28 (40).
-    pub(crate) unk_9f0: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_9f4: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_9f8: u32,
-    pub(crate) unk_9fc: [u8; 8],
-    /// Required: 0x254e (9550).
-    pub(crate) unk_a04: u32,
-    pub(crate) unk_a08: [u8; 0x30],
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_a38: u32,
-    pub(crate) unk_a3c: [u8; 0x34],
-    /// Required: 4.
-    pub(crate) unk_a70: u32,
-    pub(crate) unk_a74: [u8; 0x10],
-    /// Required: 0x3f80_0000 (1.0 as an IEEE-754 single).
-    pub(crate) unk_a84: u32,
-    pub(crate) unk_a88: [u8; 4],
-    /// Required: 0x40cc_cccd (6.4 as an IEEE-754 single).
-    pub(crate) unk_a8c: u32,
-    pub(crate) unk_a90: [u8; 8],
-    /// Required: 0x4780_0000 (65536.0 as an IEEE-754 single).
-    pub(crate) unk_a98: u32,
-    /// Required: 0x3f00_0000 (0.5 as an IEEE-754 single).
-    pub(crate) unk_a9c: u32,
-    pub(crate) unk_aa0: [u8; 8],
-    /// Required: 0x28 (40).
-    pub(crate) unk_aa8: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_aac: u32,
-    pub(crate) unk_ab0: [u8; 0xc],
-    /// Required: 0x254e (9550).
-    pub(crate) unk_abc: u32,
-    pub(crate) unk_ac0: [u8; 8],
-    /// Required: 0x10 (16).
-    pub(crate) unk_ac8: u32,
-    pub(crate) unk_acc: [u8; 4],
-    /// Required: 0x5_dc00 (384000).
-    pub(crate) unk_ad0: u32,
-    pub(crate) unk_ad4: [u8; 0x54],
-    /// Required: 0x5c (92).
-    pub(crate) unk_b28: u32,
-    pub(crate) unk_b2c: [u8; 4],
-    /// Required: 0x64 (100).
-    pub(crate) unk_b30: u32,
-    /// Required: 0x22 (34).
-    pub(crate) unk_b34: u32,
-    /// Required: 6.
-    pub(crate) unk_b38: u32,
-    pub(crate) unk_b3c: [u8; 4],
-    /// Required: 6.
-    pub(crate) unk_b40: u32,
-    /// Required: 1.
-    pub(crate) unk_b44: u32,
-    pub(crate) unk_b48: [u8; 4],
-    /// Required: 0x3f4c_cccd (0.8 as an IEEE-754 single).
-    pub(crate) unk_b4c: u32,
-    /// Required: 0x3f7d_f3b6 (0.992 as an IEEE-754 single).
-    pub(crate) unk_b50: u32,
-    /// Required: 0x3e4c_cccd (0.2 as an IEEE-754 single).
-    pub(crate) unk_b54: u32,
-    /// Required: 0x3c03_126f (0.008 as an IEEE-754 single).
-    pub(crate) unk_b58: u32,
-    /// Required: 0x3f69_d4d8 (0.913404 as an IEEE-754 single).
-    pub(crate) unk_b5c: u32,
-    /// Required: 0x3f69_d4d8 (0.913404 as an IEEE-754 single).
-    pub(crate) unk_b60: u32,
-    pub(crate) unk_b64: [u8; 4],
-    /// Required: 0x42be_0000 (95.0 as an IEEE-754 single).
-    pub(crate) unk_b68: u32,
-    /// Required: 0x4064_f5c3 (3.5775 as an IEEE-754 single).
-    pub(crate) unk_b6c: u32,
-    /// Required: 0x4064_f5c3 (3.5775 as an IEEE-754 single).
-    pub(crate) unk_b70: u32,
-    /// Required: 0x4117_9436.
-    pub(crate) unk_b74: u32,
-    /// Required: 0x64 (100).
-    pub(crate) unk_b78: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_b7c: u32,
-    /// Required: 0x64 (100).
-    pub(crate) unk_b80: u32,
-    pub(crate) unk_b84: [u8; 8],
-    /// Required: 0x5c (92).
-    pub(crate) unk_b8c: u32,
-    pub(crate) unk_b90: [u8; 0x30],
-    /// Required: 0x64 (100).
-    pub(crate) unk_bc0: u32,
-    pub(crate) unk_bc4: [u8; 0x1c],
-    /// Required: 1.
-    pub(crate) unk_be0: u8,
-    /// Required: 4.
-    pub(crate) unk_be1: u32,
-    /// Required: 0x64 (100).
-    pub(crate) unk_be5: u32,
-    pub(crate) unk_be9: [u8; 4],
-    /// Required: 0x1f40 (8000).
-    pub(crate) unk_bed: u32,
-    /// Required: 0xc8 (200).
-    pub(crate) unk_bf1: u32,
-    /// Required: 0xfa0 (4000).
-    pub(crate) unk_bf5: u32,
-    /// Required: 0xc8 (200).
-    pub(crate) unk_bf9: u32,
-    /// Required: 0x7d0 (2000).
-    pub(crate) unk_bfd: u32,
-    /// Required: 0xc8 (200).
-    pub(crate) unk_c01: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_c05: u32,
-    /// Required: 0xc8 (200).
-    pub(crate) unk_c09: u32,
-    /// Required: 1.
-    pub(crate) unk_c0d: u32,
-    pub(crate) unk_c11: [u8; 0x53],
-    /// Required: 1.
-    pub(crate) unk_c64: u32,
-    pub(crate) unk_c68: [u8; 0x28],
-    /// Required: 1.
-    pub(crate) unk_c90: u32,
-    pub(crate) unk_c94: [u8; 0x1003],
-    /// Required: 0x7fff in every entry; the table continues in
-    /// [`PowerConfigTail`].
-    pub(crate) unk_1c97: [u16; 148],
-    /// Required: 0xff (low byte of the next table entry).
-    pub(crate) unk_1dbf: u8,
-}
+#[repr(C)]
+pub(crate) struct PowerConfigHead(pub(crate) [u8; 0x1dc0]);
 
-static_assert!(bundle::POWER_CONFIG_COPY + size_of::<PowerConfigHead>() == 0xf000);
-
-// SAFETY: `PowerConfigHead` consists of integers and arrays of integers only.
+// SAFETY: `PowerConfigHead` is a byte array.
 unsafe impl Zeroable for PowerConfigHead {}
 
 impl PowerConfigHead {
-    /// Initializes the leading part of the power configuration.
     pub(crate) fn init(&mut self) {
-        clear(self);
-        self.unk_4 = 0x5_dc00;
-        self.unk_8 = 0x5_dc00;
-        self.unk_10 = 4;
-        self.unk_14 = 0x3f80_0000;
-        self.unk_2c = 1;
-        self.unk_30 = 1;
-        self.unk_40 = 0x64;
-        self.unk_44 = 1;
-        self.unk_48 = 0x3e8;
-        self.unk_50 = 0x64;
-        self.unk_60 = 4;
-        self.unk_64 = 0x3f80_0000;
-        self.unk_6c = 1;
-        self.unk_70 = 1;
-        self.unk_80 = 0x64;
-        self.unk_84 = 1;
-        self.unk_88 = 0x3e8;
-        self.unk_90 = 0x64;
-        self.unk_c0 = [0x3f82_8f5c; 11];
-        self.unk_9b8 = 0x271;
-        self.unk_9c4 = 0x3f7f_2e9f;
-        self.unk_9cc = 0x3b51_6154;
-        self.unk_9d4 = 0x3ca5_9586;
-        self.unk_9e0 = 0x4615_3800;
-        self.unk_9e4 = 0x40a9_0fdb;
-        self.unk_9ec = 0xbdd6_7344;
-        self.unk_9f0 = 0x28;
-        self.unk_9f4 = 0x3e8;
-        self.unk_9f8 = 0x3e8;
-        self.unk_a04 = 0x254e;
-        self.unk_a38 = 0x3e8;
-        self.unk_a70 = 4;
-        self.unk_a84 = 0x3f80_0000;
-        self.unk_a8c = 0x40cc_cccd;
-        self.unk_a98 = 0x4780_0000;
-        self.unk_a9c = 0x3f00_0000;
-        self.unk_aa8 = 0x28;
-        self.unk_aac = 0x3e8;
-        self.unk_abc = 0x254e;
-        self.unk_ac8 = 0x10;
-        self.unk_ad0 = 0x5_dc00;
-        self.unk_b28 = 0x5c;
-        self.unk_b30 = 0x64;
-        self.unk_b34 = 0x22;
-        self.unk_b38 = 6;
-        self.unk_b40 = 6;
-        self.unk_b44 = 1;
-        self.unk_b4c = 0x3f4c_cccd;
-        self.unk_b50 = 0x3f7d_f3b6;
-        self.unk_b54 = 0x3e4c_cccd;
-        self.unk_b58 = 0x3c03_126f;
-        self.unk_b5c = 0x3f69_d4d8;
-        self.unk_b60 = 0x3f69_d4d8;
-        self.unk_b68 = 0x42be_0000;
-        self.unk_b6c = 0x4064_f5c3;
-        self.unk_b70 = 0x4064_f5c3;
-        self.unk_b74 = 0x4117_9436;
-        self.unk_b78 = 0x64;
-        self.unk_b7c = 0x3e8;
-        self.unk_b80 = 0x64;
-        self.unk_b8c = 0x5c;
-        self.unk_bc0 = 0x64;
-        self.unk_be0 = 1;
-        self.unk_be1 = 4;
-        self.unk_be5 = 0x64;
-        self.unk_bed = 0x1f40;
-        self.unk_bf1 = 0xc8;
-        self.unk_bf5 = 0xfa0;
-        self.unk_bf9 = 0xc8;
-        self.unk_bfd = 0x7d0;
-        self.unk_c01 = 0xc8;
-        self.unk_c05 = 0x3e8;
-        self.unk_c09 = 0xc8;
-        self.unk_c0d = 1;
-        self.unk_c64 = 1;
-        self.unk_c90 = 1;
-        self.unk_1c97 = [0x7fff; 148];
-        self.unk_1dbf = 0xff;
+        fill_words(&mut self.0, POWER_CONFIG_HEAD_WORDS);
     }
 }
 
@@ -2047,380 +1865,36 @@ impl PowerConfigHead {
 /// whole power configuration. It carries the die temperature limiter: target
 /// and release temperatures in 0.01 °C, proportional and integral gains as
 /// IEEE-754 singles.
-#[repr(C, packed)]
-pub(crate) struct PowerConfigTail {
-    /// Required: 0x7f (high byte of the table entry started in the head).
-    pub(crate) unk_1dc0: u8,
-    /// Required: 0x7fff in every entry.
-    pub(crate) unk_1dc1: [u16; 363],
-    pub(crate) unk_2097: [u8; 0x201],
-    /// Required: 0x4780_0000 (65536.0 as an IEEE-754 single).
-    pub(crate) unk_2298: u32,
-    /// Required: 0x4220_0000 (40.0 as an IEEE-754 single).
-    pub(crate) unk_229c: u32,
-    /// Required: 0x447a_0000 (1000.0 as an IEEE-754 single).
-    pub(crate) unk_22a0: u32,
-    /// Required: 0x5be (1470).
-    pub(crate) unk_22a4: u32,
-    pub(crate) unk_22a8: [u8; 0x10],
-    /// Required: 0x28 (40).
-    pub(crate) unk_22b8: u32,
-    pub(crate) unk_22bc: [u8; 4],
-    /// Required: 0x42c8_0000 (100.0 as an IEEE-754 single).
-    pub(crate) unk_22c0: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_22c4: u32,
-    pub(crate) unk_22c8: [u8; 4],
-    /// Required: 0x3f4c_cccd (0.8 as an IEEE-754 single).
-    pub(crate) unk_22cc: u32,
-    /// Required: 0x3e4c_cccd (0.2 as an IEEE-754 single).
-    pub(crate) unk_22d0: u32,
-    pub(crate) unk_22d4: [u8; 0x3c],
-    /// Die temperature sensors the limiter reads ([`TEMP_SENSOR_MASK`]).
-    pub(crate) temp_sensor_mask: u64,
-    /// Release temperature of the limiter ([`TEMP_RELEASE`]).
-    pub(crate) temp_release: u32,
-    pub(crate) unk_231c: [u8; 4],
-    /// Required: 4.
-    pub(crate) unk_2320: u32,
-    pub(crate) unk_2324: [u8; 0x10],
-    /// Required: 0x3f80_0000 (1.0 as an IEEE-754 single).
-    pub(crate) unk_2334: u32,
-    pub(crate) unk_2338: [u8; 4],
-    /// Integral gain of the limiter ([`TEMP_KI`]).
-    pub(crate) temp_ki: u32,
-    pub(crate) unk_2340: [u8; 8],
-    /// Required: 0x4780_0000 (65536.0 as an IEEE-754 single).
-    pub(crate) unk_2348: u32,
-    /// Proportional gain of the limiter ([`TEMP_KP`]).
-    pub(crate) temp_kp: u32,
-    pub(crate) unk_2350: [u8; 8],
-    /// Required: 0x28 (40).
-    pub(crate) unk_2358: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_235c: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_2360: u32,
-    /// Margin below the target at which the limiter acts, in 0.01 °C.
-    pub(crate) temp_margin: u32,
-    pub(crate) unk_2368: [u8; 4],
-    /// Target temperature of the limiter ([`TEMP_TARGET`]).
-    pub(crate) temp_target: u32,
-    pub(crate) unk_2370: [u8; 0x30],
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_23a0: u32,
-    pub(crate) unk_23a4: [u8; 0x218],
-    /// Required: 0x4200_0006.
-    pub(crate) unk_25bc: u32,
-    pub(crate) unk_25c0: [u8; 0x212],
-    /// Required: 0x3f7e_b852 (0.995 as an IEEE-754 single).
-    pub(crate) unk_27d2: u32,
-    pub(crate) unk_27d6: [u8; 4],
-    /// Required: 0x3ba3_d70a (0.005 as an IEEE-754 single).
-    pub(crate) unk_27da: u32,
-    pub(crate) unk_27de: [u8; 4],
-    /// Required: 0x43c8_0000 (400.0 as an IEEE-754 single).
-    pub(crate) unk_27e2: u32,
-    pub(crate) unk_27e6: [u8; 8],
-    /// Required: 0x4780_0000 (65536.0 as an IEEE-754 single).
-    pub(crate) unk_27ee: u32,
-    /// Required: 0x42c8_0000 (100.0 as an IEEE-754 single).
-    pub(crate) unk_27f2: u32,
-    pub(crate) unk_27f6: [u8; 4],
-    /// Required: 0xbac8_0000.
-    pub(crate) unk_27fa: u32,
-    /// Required: 0x384 (900).
-    pub(crate) unk_27fe: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_2802: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_2806: u32,
-    pub(crate) unk_280a: [u8; 4],
-    /// Required: 0x453b_8000 (3000.0 as an IEEE-754 single).
-    pub(crate) unk_280e: u32,
-    /// Required: 0x26ac (9900).
-    pub(crate) unk_2812: u32,
-    pub(crate) unk_2816: [u8; 0x30],
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_2846: u32,
-    pub(crate) unk_284a: [u8; 0x18],
-    /// Required: 0xc8 (200).
-    pub(crate) unk_2862: u32,
-    pub(crate) unk_2866: [u8; 0xb2],
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_2918: u32,
-    pub(crate) unk_291c: [u8; 0x10],
-    /// Required: 1.
-    pub(crate) unk_292c: u32,
-    pub(crate) unk_2930: [u8; 0x30],
-    /// Required: 1.
-    pub(crate) unk_2960: u8,
-    /// Required: 1.
-    pub(crate) unk_2961: u32,
-    /// Required: 4.
-    pub(crate) unk_2965: u32,
-    pub(crate) unk_2969: [u8; 0x14],
-    /// Required: 0x23f (575).
-    pub(crate) unk_297d: u32,
-    /// Required: 1.
-    pub(crate) unk_2981: u32,
-    /// Required: 1.
-    pub(crate) unk_2985: u32,
-    pub(crate) unk_2989: [u8; 0x14],
-    /// Required: 0x240 (576).
-    pub(crate) unk_299d: u32,
-    /// Required: 1.
-    pub(crate) unk_29a1: u32,
-    /// Required: 1.
-    pub(crate) unk_29a5: u32,
-    pub(crate) unk_29a9: [u8; 0x14],
-    /// Required: 0x241 (577).
-    pub(crate) unk_29bd: u32,
-    pub(crate) unk_29c1: [u8; 0x47],
-    /// Required: 1.
-    pub(crate) unk_2a08: u32,
-    pub(crate) unk_2a0c: [u8; 4],
-    /// Required: 0x254e (9550) in every entry.
-    pub(crate) unk_2a10: [u32; 3],
-    pub(crate) unk_2a1c: [u8; 0xc],
-    /// Required: 0x3f80_0000 (1.0 as an IEEE-754 single).
-    pub(crate) unk_2a28: u32,
-    /// Required: 4.
-    pub(crate) unk_2a2c: u32,
-    /// Required: 0x10 (16).
-    pub(crate) unk_2a30: u32,
-    /// Required: 0x5_dc00 (384000).
-    pub(crate) unk_2a34: u32,
-    pub(crate) unk_2a38: [u8; 0xcc],
-    /// Required: 0x3c (60).
-    pub(crate) unk_2b04: u32,
-    pub(crate) unk_2b08: [u8; 8],
-    /// Required: 0x3f6e_eeef.
-    pub(crate) unk_2b10: u32,
-    pub(crate) unk_2b14: [u8; 4],
-    /// Required: 0x3d88_8889.
-    pub(crate) unk_2b18: u32,
-    pub(crate) unk_2b1c: [u8; 4],
-    /// Required: 0x3f00_0000 (0.5 as an IEEE-754 single).
-    pub(crate) unk_2b20: u32,
-    pub(crate) unk_2b24: [u8; 8],
-    /// Required: 0x4780_0000 (65536.0 as an IEEE-754 single).
-    pub(crate) unk_2b2c: u32,
-    /// Required: 0x4088_0000 (4.25 as an IEEE-754 single).
-    pub(crate) unk_2b30: u32,
-    pub(crate) unk_2b34: [u8; 8],
-    /// Required: 0x28 (40).
-    pub(crate) unk_2b3c: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_2b40: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_2b44: u32,
-    pub(crate) unk_2b48: [u8; 4],
-    /// Required: 0x4615_3800 (9550.0 as an IEEE-754 single).
-    pub(crate) unk_2b4c: u32,
-    /// Required: 0x254e (9550).
-    pub(crate) unk_2b50: u32,
-    pub(crate) unk_2b54: [u8; 8],
-    /// Required: 0xf0 (240).
-    pub(crate) unk_2b5c: u32,
-    pub(crate) unk_2b60: [u8; 4],
-    /// Required: 0x57_e400.
-    pub(crate) unk_2b64: u32,
-    pub(crate) unk_2b68: [u8; 0x1c],
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_2b84: u32,
-    pub(crate) unk_2b88: [u8; 0x3c],
-    /// Required: 1.
-    pub(crate) unk_2bc4: u32,
-    pub(crate) unk_2bc8: [u8; 0xcc],
-    /// Required: 0x32 (50).
-    pub(crate) unk_2c94: u32,
-    /// Required: 1.
-    pub(crate) unk_2c98: u32,
-    pub(crate) unk_2c9c: [u8; 4],
-    /// Required: 0x3f63_8e39.
-    pub(crate) unk_2ca0: u32,
-    /// Required: 0x3f2a_aaab.
-    pub(crate) unk_2ca4: u32,
-    /// Required: 0x3de3_8e39.
-    pub(crate) unk_2ca8: u32,
-    /// Required: 0x3eaa_aaab.
-    pub(crate) unk_2cac: u32,
-    /// Required: 0xbf4c_cccd (-0.8 as an IEEE-754 single).
-    pub(crate) unk_2cb0: u32,
-    /// Required: 0xbf4c_cccd (-0.8 as an IEEE-754 single).
-    pub(crate) unk_2cb4: u32,
-    pub(crate) unk_2cb8: [u8; 4],
-    /// Required: 0x4780_0000 (65536.0 as an IEEE-754 single).
-    pub(crate) unk_2cbc: u32,
-    /// Required: 0xc0a0_0000 (-5.0 as an IEEE-754 single).
-    pub(crate) unk_2cc0: u32,
-    /// Required: 0xc0a0_0000 (-5.0 as an IEEE-754 single).
-    pub(crate) unk_2cc4: u32,
-    pub(crate) unk_2cc8: [u8; 4],
-    /// Required: 0x64 (100).
-    pub(crate) unk_2ccc: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_2cd0: u32,
-    /// Required: 0x64 (100).
-    pub(crate) unk_2cd4: u32,
-    pub(crate) unk_2cd8: [u8; 4],
-    /// Required: 0x467a_0000 (16000.0 as an IEEE-754 single).
-    pub(crate) unk_2cdc: u32,
-    /// Required: 0x578 (1400).
-    pub(crate) unk_2ce0: u32,
-    pub(crate) unk_2ce4: [u8; 8],
-    /// Required: 0x90 (144).
-    pub(crate) unk_2cec: u32,
-    /// Required: 0x30 (48).
-    pub(crate) unk_2cf0: u32,
-    /// Required: 0x34_bc00.
-    pub(crate) unk_2cf4: u32,
-    pub(crate) unk_2cf8: [u8; 4],
-    /// Required: 0x11_9400.
-    pub(crate) unk_2cfc: u32,
-    pub(crate) unk_2d00: [u8; 8],
-    /// Required: 0x4780_0000 (65536.0 as an IEEE-754 single).
-    pub(crate) unk_2d08: u32,
-    pub(crate) unk_2d0c: [u8; 0x24],
-    /// Required: 0x3e80 (16000).
-    pub(crate) unk_2d30: u32,
-    /// Required: 2.
-    pub(crate) unk_2d34: u32,
-    /// Required: 0x9c4 (2500).
-    pub(crate) unk_2d38: u32,
-    /// Required: 0x20d (525).
-    pub(crate) unk_2d3c: u32,
-    /// Required: 2.
-    pub(crate) unk_2d40: u32,
-    /// Required: 4.
-    pub(crate) unk_2d44: u32,
-    /// Required: 0x32 (50).
-    pub(crate) unk_2d48: u32,
-    pub(crate) unk_2d4c: [u8; 0x2c],
-    /// Required: 0x4780_0000 (65536.0 as an IEEE-754 single).
-    pub(crate) unk_2d78: u32,
-    pub(crate) unk_2d7c: [u8; 0xc],
-    /// Required: 0x28 (40).
-    pub(crate) unk_2d88: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_2d8c: u32,
-    pub(crate) unk_2d90: [u8; 0x30],
-}
+#[repr(C)]
+pub(crate) struct PowerConfigTail(pub(crate) [u8; 0x1000]);
 
-static_assert!(core::mem::offset_of!(PowerConfigTail, temp_sensor_mask) == 0x2310 - 0x1dc0);
-static_assert!(core::mem::offset_of!(PowerConfigTail, temp_target) == 0x236c - 0x1dc0);
-static_assert!(size_of::<PowerConfigTail>() == 0x1000);
-
-// SAFETY: `PowerConfigTail` consists of integers and arrays of integers only.
+// SAFETY: `PowerConfigTail` is a byte array.
 unsafe impl Zeroable for PowerConfigTail {}
 
 impl PowerConfigTail {
     fn init(&mut self) {
-        clear(self);
-        self.unk_1dc0 = 0x7f;
-        self.unk_1dc1 = [0x7fff; 363];
-        self.unk_2298 = 0x4780_0000;
-        self.unk_229c = 0x4220_0000;
-        self.unk_22a0 = 0x447a_0000;
-        self.unk_22a4 = 0x5be;
-        self.unk_22b8 = 0x28;
-        self.unk_22c0 = 0x42c8_0000;
-        self.unk_22c4 = 0x3e8;
-        self.unk_22cc = 0x3f4c_cccd;
-        self.unk_22d0 = 0x3e4c_cccd;
-        self.temp_sensor_mask = TEMP_SENSOR_MASK;
-        self.temp_release = TEMP_RELEASE;
-        self.unk_2320 = 4;
-        self.unk_2334 = 0x3f80_0000;
-        self.temp_ki = TEMP_KI;
-        self.unk_2348 = 0x4780_0000;
-        self.temp_kp = TEMP_KP;
-        self.unk_2358 = 0x28;
-        self.unk_235c = 0x3e8;
-        self.unk_2360 = 0x3e8;
-        self.temp_target = TEMP_TARGET;
-        self.unk_23a0 = 0x3e8;
-        self.unk_25bc = 0x4200_0006;
-        self.unk_27d2 = 0x3f7e_b852;
-        self.unk_27da = 0x3ba3_d70a;
-        self.unk_27e2 = 0x43c8_0000;
-        self.unk_27ee = 0x4780_0000;
-        self.unk_27f2 = 0x42c8_0000;
-        self.unk_27fa = 0xbac8_0000;
-        self.unk_27fe = 0x384;
-        self.unk_2802 = 0x3e8;
-        self.unk_2806 = 0x3e8;
-        self.unk_280e = 0x453b_8000;
-        self.unk_2812 = 0x26ac;
-        self.unk_2846 = 0x3e8;
-        self.unk_2862 = 0xc8;
-        self.unk_2918 = 0x3e8;
-        self.unk_292c = 1;
-        self.unk_2960 = 1;
-        self.unk_2961 = 1;
-        self.unk_2965 = 4;
-        self.unk_297d = 0x23f;
-        self.unk_2981 = 1;
-        self.unk_2985 = 1;
-        self.unk_299d = 0x240;
-        self.unk_29a1 = 1;
-        self.unk_29a5 = 1;
-        self.unk_29bd = 0x241;
-        self.unk_2a08 = 1;
-        self.unk_2a10 = [0x254e; 3];
-        self.unk_2a28 = 0x3f80_0000;
-        self.unk_2a2c = 4;
-        self.unk_2a30 = 0x10;
-        self.unk_2a34 = 0x5_dc00;
-        self.unk_2b04 = 0x3c;
-        self.unk_2b10 = 0x3f6e_eeef;
-        self.unk_2b18 = 0x3d88_8889;
-        self.unk_2b20 = 0x3f00_0000;
-        self.unk_2b2c = 0x4780_0000;
-        self.unk_2b30 = 0x4088_0000;
-        self.unk_2b3c = 0x28;
-        self.unk_2b40 = 0x3e8;
-        self.unk_2b44 = 0x3e8;
-        self.unk_2b4c = 0x4615_3800;
-        self.unk_2b50 = 0x254e;
-        self.unk_2b5c = 0xf0;
-        self.unk_2b64 = 0x57_e400;
-        self.unk_2b84 = 0x3e8;
-        self.unk_2bc4 = 1;
-        self.unk_2c94 = 0x32;
-        self.unk_2c98 = 1;
-        self.unk_2ca0 = 0x3f63_8e39;
-        self.unk_2ca4 = 0x3f2a_aaab;
-        self.unk_2ca8 = 0x3de3_8e39;
-        self.unk_2cac = 0x3eaa_aaab;
-        self.unk_2cb0 = 0xbf4c_cccd;
-        self.unk_2cb4 = 0xbf4c_cccd;
-        self.unk_2cbc = 0x4780_0000;
-        self.unk_2cc0 = 0xc0a0_0000;
-        self.unk_2cc4 = 0xc0a0_0000;
-        self.unk_2ccc = 0x64;
-        self.unk_2cd0 = 0x3e8;
-        self.unk_2cd4 = 0x64;
-        self.unk_2cdc = 0x467a_0000;
-        self.unk_2ce0 = 0x578;
-        self.unk_2cec = 0x90;
-        self.unk_2cf0 = 0x30;
-        self.unk_2cf4 = 0x34_bc00;
-        self.unk_2cfc = 0x11_9400;
-        self.unk_2d08 = 0x4780_0000;
-        self.unk_2d30 = 0x3e80;
-        self.unk_2d34 = 2;
-        self.unk_2d38 = 0x9c4;
-        self.unk_2d3c = 0x20d;
-        self.unk_2d40 = 2;
-        self.unk_2d44 = 4;
-        self.unk_2d48 = 0x32;
-        self.unk_2d78 = 0x4780_0000;
-        self.unk_2d88 = 0x28;
-        self.unk_2d8c = 0x3e8;
+        fill_words(&mut self.0, POWER_CONFIG_TAIL_WORDS);
     }
 }
+
+/// Auxiliary hardware data the firmware reads at [`bundle::AUX`], up to the
+/// start of view 3. No pointer names it.
+#[repr(C)]
+pub(crate) struct HwDataAux(pub(crate) [u8; 0x3c80]);
+
+// SAFETY: `HwDataAux` is a byte array.
+unsafe impl Zeroable for HwDataAux {}
+
+impl HwDataAux {
+    pub(crate) fn init(&mut self, secondary_status_va: u64) {
+        fill_words(&mut self.0, HW_DATA_AUX_WORDS);
+        self.0[0xed8..0xee0].copy_from_slice(&secondary_status_va.to_le_bytes());
+    }
+}
+
+
+
+
 
 /// Power configuration, in view 2 of the bundle. The secondary instance
 /// finds it through [`MainConfig::power_config_va`].
@@ -2446,174 +1920,7 @@ impl PowerConfig {
     }
 }
 
-/// Auxiliary hardware data the firmware reads at [`bundle::AUX`], up to the
-/// start of view 3. No pointer names it.
-#[repr(C, packed)]
-pub(crate) struct HwDataAux {
-    pub(crate) unk_0: [u8; 0xac],
-    /// Required: 6.
-    pub(crate) unk_ac: u32,
-    pub(crate) unk_b0: [u8; 8],
-    /// Required: 1.
-    pub(crate) unk_b8: u32,
-    pub(crate) unk_bc: [u8; 0xbb],
-    /// Required: 0xdac (3500).
-    pub(crate) unk_177: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_17b: u32,
-    /// Required: 0xbb8 (3000).
-    pub(crate) unk_17f: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_183: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_187: u32,
-    /// Required: 0x64 (100).
-    pub(crate) unk_18b: u32,
-    /// Required: 0x20 (32).
-    pub(crate) unk_18f: u32,
-    pub(crate) unk_193: [u8; 0x21],
-    /// Required: 4.
-    pub(crate) unk_1b4: u32,
-    pub(crate) unk_1b8: [u8; 8],
-    /// Required: 0x3f78_0000 (0.96875 as an IEEE-754 single).
-    pub(crate) unk_1c0: u32,
-    pub(crate) unk_1c4: [u8; 4],
-    /// Required: 0x3d00_0000 (0.03125 as an IEEE-754 single).
-    pub(crate) unk_1c8: u32,
-    pub(crate) unk_1cc: [u8; 4],
-    /// Required: 0x40a0_0000 (5.0 as an IEEE-754 single).
-    pub(crate) unk_1d0: u32,
-    pub(crate) unk_1d4: [u8; 8],
-    /// Required: 0x4780_0000 (65536.0 as an IEEE-754 single).
-    pub(crate) unk_1dc: u32,
-    /// Required: 0x4170_0000 (15.0 as an IEEE-754 single).
-    pub(crate) unk_1e0: u32,
-    pub(crate) unk_1e4: [u8; 8],
-    /// Required: 0x384 (900).
-    pub(crate) unk_1ec: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_1f0: u32,
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_1f4: u32,
-    pub(crate) unk_1f8: [u8; 8],
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_200: u32,
-    pub(crate) unk_204: [u8; 0x30],
-    /// Required: 0x3e8 (1000).
-    pub(crate) unk_234: u32,
-    pub(crate) unk_238: [u8; 0x3c],
-    /// Required: 0x64 (100).
-    pub(crate) unk_274: u32,
-    pub(crate) unk_278: [u8; 0x18],
-    /// Required: 0x82a (2090).
-    pub(crate) unk_290: u32,
-    pub(crate) unk_294: [u8; 4],
-    /// Required: 0x7d (125).
-    pub(crate) unk_298: u32,
-    /// Required: 1.
-    pub(crate) unk_29c: u32,
-    pub(crate) unk_2a0: [u8; 0xc38],
-    /// GPU address of the secondary state, [`private::SECONDARY_STATUS`] bytes
-    /// into the secondary state grid.
-    pub(crate) secondary_status_va: u64,
-    /// Required: 0x18ae (6318).
-    pub(crate) unk_ee0: u32,
-    pub(crate) unk_ee4: [u8; 4],
-    /// Required: 1.
-    pub(crate) unk_ee8: u32,
-    pub(crate) unk_eec: [u8; 0x2000],
-    /// Required: 0x41c8_cccd (25.1 as an IEEE-754 single).
-    pub(crate) unk_2eec: u32,
-    /// Required: 0x41c8_cccd (25.1 as an IEEE-754 single).
-    pub(crate) unk_2ef0: u32,
-    pub(crate) unk_2ef4: [u8; 0x6f0],
-    /// Required: 1.
-    pub(crate) unk_35e4: u32,
-    /// Required: 0x1f4 (500).
-    pub(crate) unk_35e8: u32,
-    /// Required: 6.
-    pub(crate) unk_35ec: u32,
-    /// Required: 0x30d4 (12500) in every entry.
-    pub(crate) unk_35f0: [u32; 6],
-    /// Required: 0xfa0 (4000).
-    pub(crate) unk_3608: u32,
-    pub(crate) unk_360c: [u8; 0x10],
-    /// Required: 0x30d4 (12500) in every entry.
-    pub(crate) unk_361c: [u32; 5],
-    /// Required: 1.
-    pub(crate) unk_3630: u32,
-    pub(crate) unk_3634: [u8; 0x174],
-    /// Required: 1.
-    pub(crate) unk_37a8: u32,
-    pub(crate) unk_37ac: [u8; 8],
-    /// Required: 0x424c_cccd (51.2 as an IEEE-754 single).
-    pub(crate) unk_37b4: u32,
-    pub(crate) unk_37b8: [u8; 0x3c],
-    /// Required: 0x4406_8000 (538.0 as an IEEE-754 single).
-    pub(crate) unk_37f4: u32,
-    pub(crate) unk_37f8: [u8; 0x3c],
-    /// Required: 0x41c9_999a (25.2 as an IEEE-754 single).
-    pub(crate) unk_3834: u32,
-    pub(crate) unk_3838: [u8; 0xa8],
-    /// Required: 0x186a (6250).
-    pub(crate) unk_38e0: u32,
-    pub(crate) unk_38e4: [u8; 0x39c],
-}
 
-static_assert!(core::mem::offset_of!(HwDataAux, secondary_status_va) == 0xed8);
-static_assert!(bundle::AUX + size_of::<HwDataAux>() == bundle::VIEWS[3]);
-
-// SAFETY: `HwDataAux` consists of integers and arrays of integers only.
-unsafe impl Zeroable for HwDataAux {}
-
-impl HwDataAux {
-    /// Initializes the auxiliary hardware data. `secondary_status_va` is
-    /// the secondary state grid plus [`private::SECONDARY_STATUS`].
-    pub(crate) fn init(&mut self, secondary_status_va: u64) {
-        clear(self);
-        self.unk_ac = 6;
-        self.unk_b8 = 1;
-        self.unk_177 = 0xdac;
-        self.unk_17b = 0x3e8;
-        self.unk_17f = 0xbb8;
-        self.unk_183 = 0x3e8;
-        self.unk_187 = 0x3e8;
-        self.unk_18b = 0x64;
-        self.unk_18f = 0x20;
-        self.unk_1b4 = 4;
-        self.unk_1c0 = 0x3f78_0000;
-        self.unk_1c8 = 0x3d00_0000;
-        self.unk_1d0 = 0x40a0_0000;
-        self.unk_1dc = 0x4780_0000;
-        self.unk_1e0 = 0x4170_0000;
-        self.unk_1ec = 0x384;
-        self.unk_1f0 = 0x3e8;
-        self.unk_1f4 = 0x3e8;
-        self.unk_200 = 0x3e8;
-        self.unk_234 = 0x3e8;
-        self.unk_274 = 0x64;
-        self.unk_290 = 0x82a;
-        self.unk_298 = 0x7d;
-        self.unk_29c = 1;
-        self.unk_ee0 = 0x18ae;
-        self.unk_ee8 = 1;
-        self.unk_2eec = 0x41c8_cccd;
-        self.unk_2ef0 = 0x41c8_cccd;
-        self.unk_35e4 = 1;
-        self.unk_35e8 = 0x1f4;
-        self.unk_35ec = 6;
-        self.unk_35f0 = [0x30d4; 6];
-        self.unk_3608 = 0xfa0;
-        self.unk_361c = [0x30d4; 5];
-        self.unk_3630 = 1;
-        self.unk_37a8 = 1;
-        self.unk_37b4 = 0x424c_cccd;
-        self.unk_37f4 = 0x4406_8000;
-        self.unk_3834 = 0x41c9_999a;
-        self.unk_38e0 = 0x186a;
-        self.secondary_status_va = secondary_status_va;
-    }
-}
 // ---------------------------------------------------------------------------
 // Free lists
 // ---------------------------------------------------------------------------
