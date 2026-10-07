@@ -40,7 +40,7 @@ fn include(
     frontier.include(
         prefix,
         packet.order.sequence,
-        job::fence_status(&packet.completion.fence()),
+        job::fence_status(&packet.completion.scheduler_fence()),
         word,
     )
 }

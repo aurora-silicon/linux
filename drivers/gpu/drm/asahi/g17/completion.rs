@@ -23,6 +23,9 @@ use kernel::{
     uapi, xarray,
 };
 
+mod publication;
+pub(crate) use publication::{Prepared as PreparedPublication, Publication};
+
 struct Destination {
     // Keep the existing GPU alias alive along with its prepared CPU view.
     _mapping: Arc<mmu::KernelMapping>,
@@ -51,7 +54,7 @@ impl Destination {
         Ok(Some(Self { _mapping: mapping, cpu }))
     }
 
-    fn write(&self, ticks: u64) -> Result {
+    fn write(&self, ticks: u64) {
         const NSEC_PER_SEC: u64 = 1_000_000_000;
         let ns = (ticks / cfg::COMMAND_TIMESTAMP_HZ)
             .wrapping_mul(NSEC_PER_SEC)
@@ -60,7 +63,6 @@ impl Destination {
             );
         self.cpu.write(ns);
         barrier(Ordering::Release);
-        Ok(())
     }
 }
 
@@ -97,6 +99,51 @@ impl Destinations {
     }
 }
 
+/// Public outputs do not own physical command resources or a scheduler job.
+struct Output {
+    fence: UserFence<CompletionFence>,
+    member: Member,
+    destinations: Destinations,
+}
+
+impl Output {
+    fn publish(&self, result: Result<[u64; 4]>) {
+        match result {
+            Ok(ticks) => {
+                for (destination, ticks) in self.destinations.iter().zip(ticks) {
+                    if let Some(destination) = destination {
+                        destination.write(ticks);
+                    }
+                }
+            }
+            Err(error) => self.fence.set_error(error),
+        }
+        self.fence.signal();
+        self.member.complete(result.map(|_| ()));
+    }
+}
+
+enum HostOutput {
+    Immediate(Output),
+    Ordered(Arc<Publication>),
+}
+
+impl HostOutput {
+    fn output(&self) -> &Output {
+        match self {
+            Self::Immediate(output) => output,
+            Self::Ordered(publication) => publication.output(),
+        }
+    }
+
+    fn finish(&self, result: Result<[u64; 4]>) {
+        match self {
+            Self::Immediate(output) => output.publish(result),
+            Self::Ordered(publication) => publication.finish(result),
+        }
+    }
+}
+
 /// Firmware writes two aligned words in a fresh write-combined page per compute command.
 struct ComputeTimestamps {
     // Remove the GPU alias before releasing its backing.
@@ -120,9 +167,10 @@ impl ComputeTimestamps {
 #[pin_data]
 pub(crate) struct Completion {
     status: Arc<VmStatus>,
-    fence: UserFence<CompletionFence>,
-    member: Member,
-    destinations: Destinations,
+    output: HostOutput,
+    // Present only when this command's public result may wait for a render
+    // predecessor's host writes. DRM credits must follow the terminal result.
+    terminal: Option<UserFence<CompletionFence>>,
     compute: Option<ComputeTimestamps>,
     feed: Option<Arc<super::feed::Feed>>,
     #[pin]
@@ -148,9 +196,23 @@ impl Completion {
         vm_job: mmu::VmJobGuard,
         destinations: Destinations,
         compute: bool,
+        host_predecessors: bool,
         feed: Option<Arc<super::feed::Feed>>,
     ) -> Result<Arc<Self>> {
         let fence = fence::independent(contexts)?;
+        let ordered = !compute
+            && (host_predecessors || destinations.iter().any(Option::is_some));
+        let terminal = if host_predecessors {
+            Some(fence::independent(contexts)?)
+        } else {
+            None
+        };
+        let output = Output { fence, member, destinations };
+        let output = if ordered {
+            HostOutput::Ordered(Publication::new(output, context.status().clone())?)
+        } else {
+            HostOutput::Immediate(output)
+        };
         let compute = if compute {
             Some(ComputeTimestamps::new(dev, context.vm())?)
         } else {
@@ -159,9 +221,8 @@ impl Completion {
         Arc::pin_init(
             pin_init!(Self {
                 status: context.status().clone(),
-                fence,
-                member,
-                destinations,
+                output,
+                terminal,
                 compute,
                 feed,
                 vm_job <- new_mutex!(Some(vm_job), "G17 command VM pin"),
@@ -180,7 +241,24 @@ impl Completion {
     }
 
     pub(crate) fn fence(&self) -> Fence {
-        Fence::from_fence(&self.fence)
+        Fence::from_fence(&self.output.output().fence)
+    }
+    pub(crate) fn scheduler_fence(&self) -> Fence {
+        self.terminal.as_ref().map_or_else(|| self.fence(), |fence| Fence::from_fence(fence))
+    }
+    pub(crate) fn publication(&self) -> Option<Arc<Publication>> {
+        match &self.output {
+            HostOutput::Ordered(publication) => Some(publication.clone()),
+            HostOutput::Immediate(_) => None,
+        }
+    }
+    fn signal_terminal(&self, result: Result<[u64; 4]>) {
+        if let Some(fence) = &self.terminal {
+            if let Err(error) = result {
+                fence.set_error(error);
+            }
+            fence.signal();
+        }
     }
     /// All fallible scheduler setup has succeeded. Failures from this point
     /// must be visible through VM_STATUS before the accepted job's fence.
@@ -191,10 +269,10 @@ impl Completion {
         &self.status
     }
     pub(crate) fn work_state(&self) -> Result<Arc<WorkStateLease>> {
-        self.member.work_state()
+        self.output.output().member.work_state()
     }
     pub(crate) fn has_timestamps(&self) -> bool {
-        self.destinations.iter().any(Option::is_some)
+        self.output.output().destinations.iter().any(Option::is_some)
     }
 
     pub(crate) fn compute_timestamp_va(&self) -> Result<u64> {
@@ -360,25 +438,16 @@ impl Completion {
         if let (Some(feed), Ok(ticks)) = (&self.feed, &result) {
             feed.note_render_pass(ticks[2], ticks[3]);
         }
-        let result = result.and_then(|ticks| {
-            for (destination, ticks) in self.destinations.iter().zip(ticks) {
-                if let Some(destination) = destination {
-                    destination.write(ticks)?;
-                }
-            }
-            Ok(())
-        });
         if let Err(error) = result {
             if self.spared() {
                 self.status.report_failure(error);
             } else if error != ECANCELED {
                 self.status.record(error);
             }
-            self.fence.set_error(error);
         }
         self.release_healthy();
-        self.fence.signal();
-        self.member.complete(result);
+        self.signal_terminal(result);
+        self.output.finish(result);
     }
 
     /// A rejected, never-published command cannot poison the VM for contention.
@@ -390,10 +459,9 @@ impl Completion {
         if self.accepted.load(Ordering::Acquire) {
             self.status.report_failure(error);
         }
-        self.fence.set_error(error);
         self.release_healthy();
-        self.fence.signal();
-        self.member.complete(Err(error));
+        self.signal_terminal(Err(error));
+        self.output.finish(Err(error));
     }
 
     /// The physical queue must already be quarantined. Keep mappings pinned while
@@ -410,9 +478,8 @@ impl Completion {
         } else if error != ECANCELED {
             self.status.record(error);
         }
-        self.fence.set_error(error);
-        self.fence.signal();
-        self.member.complete(Err(error));
+        self.signal_terminal(Err(error));
+        self.output.finish(Err(error));
     }
 }
 

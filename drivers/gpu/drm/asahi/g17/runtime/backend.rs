@@ -41,7 +41,7 @@ impl Backend {
             Err(error)
         } else {
             deferred.finish();
-            Ok(packet.completion.fence())
+            Ok(packet.completion.scheduler_fence())
         }
     }
 
@@ -115,7 +115,7 @@ impl job::Backend for Backend {
 
     fn publish(&self, packet: Arc<Packet>) -> Result<Fence> {
         if let Some(result) = packet.early_result() {
-            return result.map(|()| packet.completion.fence());
+            return result.map(|()| packet.completion.scheduler_fence());
         }
         let mut deferred = match DeferredBatch::publication() {
             Ok(batch) => batch,
