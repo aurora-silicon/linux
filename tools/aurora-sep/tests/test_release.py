@@ -35,7 +35,7 @@ VERSION = flow.VERSION
 M1N1_PACKAGE = re.search(r'^M1N1_PACKAGE="(\S+) (\S+)"$', SRC, re.M)
 M1N1_BIN_SHA = re.search(r"^M1N1_BIN_SHA=(\S+)$", SRC, re.M).group(1)
 # Every m1n1 a release put on a Mac before this one.
-EARLIER_M1N1 = ["1.6.1.aurora3-1", "1.6.1.aurora7-1", "1.6.1.aurora8.4-1", "1.6.1.aurora8.5-2", "1.6.1.aurora12-1"]
+EARLIER_M1N1 = ["1.6.1.aurora3-1", "1.6.1.aurora7-1", "1.6.1.aurora8.4-1", "1.6.1.aurora8.5-2", "1.6.1.aurora12-1", "1.6.1.aurora12.1-2"]
 
 
 def package_entries():

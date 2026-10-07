@@ -168,6 +168,17 @@
 # is gone: an Air that has it loses it, recorded, just before mesa-m3 goes on,
 # and air-gpu-job.sh runs with /opt/mesa-m3. The hook's reason not-t6030 is now
 # not-supported. On the M3 Pro, nothing else changes.
+# Also in 12.4: the 13" M3 MacBook Air (j613) gets m1n1's display handoff by
+# default (chosen.asahi,t8122-dcp=1 with chosen.asahi,t8122-gpu-handoff-diag=1),
+# so the kernel drives its built-in display; an owner's own chosen.<name>=0 line
+# in /etc/m1n1.conf switches one off. The j615 stays kernel-only. Every Mac
+# moves to m1n1-aurora aurora13: aurora12.1 plus, on a j613 only, a read of the
+# GPU's leakage fuses at every boot, logged and published for Linux and used
+# only with chosen.asahi,t8122-gpu-fuse-leakage=1 in the GPU experiment. The
+# kernel adds the Air's GPU (still only with asahi.t8122_start=1), its display,
+# trackpad haptics for every MacBook (the host-driven click off by default),
+# and keeps a late USB-C display on the M3 Pro connected while its modes are
+# re-described.
 # It replaces linux-asahi (or linux-aurora) as a pacman package,
 # so mkinitcpio and update-m1n1 run from their own hooks; on a GRUB Mac this
 # script regenerates grub.cfg and keeps the previous kernel as a fallback entry.
@@ -229,8 +240,8 @@ RUN_ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null) || RUN_ID=""
 
 # The kernel package version and the release tag move independently: a release
 # that only changes m1n1 reuses the previous kernel packages unchanged.
-VERSION=7.1.12.aurora2-12.3
-TAG=sep-7.1.12.aurora2-12.3
+VERSION=7.1.12.aurora2-12.4
+TAG=sep-7.1.12.aurora2-12.4
 # Packages are fetched from this script's own tag, never from "latest": the
 # checksums below belong to this release and nothing else.
 PUBLIC_RELEASE_URL=https://github.com/iconidentify/aurora-linux/releases/download/$TAG
@@ -246,20 +257,20 @@ RELEASES_API=${AURORA_RELEASES_API:-$PUBLIC_RELEASES_API}
 # Where to always get the current script, whatever this copy turns out to be.
 LATEST_URL=https://github.com/iconidentify/aurora-linux/releases/latest/download/install-aurora-sep.sh
 PACKAGES=(
-  "linux-aurora-$VERSION-aarch64.pkg.tar.zst 2905b644fdec2e335bc226906099a7c828f5e552f228ca6250596468ce0b7308"
-  "linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst 4ff0a9869f6006a12a2bd074d62c0f0d3670498ee0a45a9b07abc65c4c07c668"
+  "linux-aurora-$VERSION-aarch64.pkg.tar.zst PENDING-12.4-LAB-BUILD"
+  "linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst PENDING-12.4-LAB-BUILD"
   "libfprint-1.94.100-1.1-aarch64.pkg.tar.zst bc7d9762db6644f2cfb58ddb209602c1d513845eb1498c098e01f12600fcbdf9"
   "aurora-touchid-20261003-1-any.pkg.tar.zst 29b0360fac8c257d754e64bd1b9c33c487eb2595dd3c31e9138d7a476afa3d64"
 )
 # The one m1n1 for every Mac, as "file sha256": M1 and M2, an M3 on the handoff
 # path (see m3_plan), and the MacBook Neo once NEO_AURORA_M1N1 is 1. Macs differ
 # only in the switches /etc/m1n1.conf arms (m3_switches), never in the binary.
-M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora12.1-2-aarch64.pkg.tar.zst 2c223ef9a36410039f823c171c982296eb1dbd5b0de48f2cf6fc87b2160d12c8"
+M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora13-1-aarch64.pkg.tar.zst 23c7aff0f7b2da5ce272bce0eab7893e01091ce4d9350e4e650af1e9195208fa"
 # The sha256 of the m1n1.bin in M1N1_PACKAGE: the bytes update-m1n1 puts at
 # the start of boot.bin. The script tells m1n1 builds apart by these bytes,
 # never by the version string they report: aurora8.5-1 and 8.5-2 both reported
 # v1.6.1-omarchy.aurora8.5.
-M1N1_BIN_SHA=557d4825ac2e0f0a2c87d75098e5ca04f5932532b9da7845f7c0f70d0cd07aaa
+M1N1_BIN_SHA=bf7b74a4648216432ac36171d896b11fa0584da19b242b16a11aa055963091de
 # 0: a MacBook Neo keeps its own m1n1 (its M1N1= and U_BOOT= in
 # /etc/default/update-m1n1), as before 12.0. 1: it gets M1N1_PACKAGE like every
 # other Mac, and update-m1n1 builds its boot.bin from that m1n1 and the Neo's
@@ -488,6 +499,8 @@ M3_SWITCHES="chosen.asahi,t6030-gpu=1 chosen.asahi,t6030-dcp=1 chosen.asahi,t603
 # aurora12.1 boots an M3 Pro exactly as aurora12 does (its additions are for
 # the T8122 only), so the name stays t6030-12: a Pro that opted in on 12.0
 # or 12.1 moves to aurora12.1 on a plain run, as it would have on 12.0.
+# aurora13 boots an M3 Pro exactly as aurora12.1 does (its additions act on a
+# j613, or only with switches no variant sets), so the name stays t6030-12.
 M3_PRO_VARIANT="t6030-12"
 # The M3 MacBook Air's handoff switches, for a later build that starts the
 # Air's GPU (M3_AIR_DRY_RUN=0): the GPU alone, or with M3_AIR_DCP=1 the
@@ -517,6 +530,11 @@ M3_AIR_DCP=0
 # chosen.asahi,t8122-gpu-power-standin=1, which no variant here sets. So the
 # name stays air-display-handoff-12, and an Air that opted in on 12.0 or 12.1
 # moves to aurora12.1 on a plain run with the same switches.
+# aurora13 adds, on a j613, a read of the GPU's leakage fuses at every boot,
+# logged and published for Linux; the GPU setup uses it only with
+# chosen.asahi,t8122-gpu-fuse-leakage=1, which no variant sets. The names stay,
+# so an Air on either variant moves to aurora13 on a plain run, with its own
+# switches.
 M3_AIR_DISPLAY_HANDOFF=1
 M3_AIR_DISPLAY_VARIANT="air-display-handoff-12"
 M3_AIR_DRY_RUN=1
@@ -532,7 +550,7 @@ M3_AIR_DRY_RUN_SWITCHES="chosen.asahi,t8122-gpu-diag=1 chosen.asahi,t8122-gpu-ha
 # an earlier --m3-handoff keeps them. No variant writes the GPU start,
 # chosen.asahi,t8122-gpu=1.
 M3_AIR_SWITCHES="chosen.asahi,t8122-dcp=1 chosen.asahi,t8122-gpu-handoff-diag=1"
-# Its name in $STATE/m3-mode: aurora12.1's m1n1 with M3_AIR_SWITCHES.
+# Its name in $STATE/m3-mode: this release's m1n1 with M3_AIR_SWITCHES.
 M3_AIR_DEFAULT_VARIANT="air-handoff-12"
 # --m3-gpu-experiment (M3 MacBook Air only) installs the GPU start experiment's tools with the
 # kernel: three scripts in M3_GPU_BIN, from this release (M3_GPU_SCRIPTS, checked like the
@@ -849,7 +867,7 @@ m1n1_for_this_mac() {
   fi
 }
 
-# M1N1_PACKAGE's version, as pacman prints it: 1.6.1.aurora12.1-2.
+# M1N1_PACKAGE's version, as pacman prints it: 1.6.1.aurora13-1.
 m1n1_version() {
   local file=${M1N1_PACKAGE%% *}
   file=${file#m1n1-aurora-}
