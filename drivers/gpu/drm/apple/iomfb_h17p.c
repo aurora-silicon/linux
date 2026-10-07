@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright The Asahi Linux Contributors */
 
+#include <linux/bitops.h>
+#include <linux/unaligned.h>
+
 #include "dcp-link.h"
 #include "iomfb_h17p.h"
 #include "iomfb_v12_3.h"
@@ -104,6 +107,21 @@ void iomfb_serialize_present_h17p(struct dcp_present_h17p *wire,
 	memcpy(wire->surf, request->surf, sizeof(wire->surf));
 	memcpy(wire->tail, (const u8 *)request + tail_offset, tail_size);
 	memset(wire->tail + tail_size, 0, sizeof(wire->tail) - tail_size);
+}
+
+/* Integer commanded nits are exact binary64 values; no kernel FP is needed. */
+void iomfb_encode_backlight_h17p(struct dcp_present_h17p *wire, u32 nits)
+{
+	u64 value = 0;
+	unsigned int exponent;
+
+	if (nits) {
+		exponent = fls(nits) - 1;
+		value = (u64)(exponent + 1023) << 52;
+		value |= ((u64)nits << (52 - exponent)) & GENMASK_ULL(51, 0);
+	}
+	/* Measured from Linux presents during ordinary sysfs brightness changes. */
+	put_unaligned_le64(value, wire->swap + 0x35e);
 }
 
 static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
