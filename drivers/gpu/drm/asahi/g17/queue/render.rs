@@ -34,6 +34,29 @@ pub(crate) use dependencies::Dependencies;
 use kernel::{prelude::*, sync::Arc};
 use retirement::{Ticket, Tracker};
 
+/// Firmware dependencies of one render, kept by origin until the kick entries
+/// are built: the covered earlier renders (their fragment completions) and the
+/// covered compute completion. Which kick waits for the render prefix is the
+/// command's choice (`RenderPass::fragment_barriers`); compute always orders
+/// the tiling kick, since compute output may feed vertex work.
+#[derive(Copy, Clone)]
+pub(crate) struct RenderDependencies {
+    pub(crate) render: [KickDependency; 2],
+    pub(crate) render_count: usize,
+    pub(crate) compute: Option<KickDependency>,
+}
+
+impl RenderDependencies {
+    pub(crate) const EMPTY: Self = Self {
+        render: [KickDependency::ZERO; 2],
+        render_count: 0,
+        compute: None,
+    };
+    pub(crate) fn render(&self) -> &[KickDependency] {
+        &self.render[..self.render_count]
+    }
+}
+
 #[derive(Copy, Clone)]
 pub(crate) struct RenderAddresses {
     /// Tiling then fragment; each pair contains the primary and auxiliary stamp.
@@ -375,7 +398,7 @@ impl Pair {
     pub(crate) fn publish(
         &mut self,
         packet: Arc<Packet>,
-        dependencies: &[KickDependency],
+        dependencies: &RenderDependencies,
         lease: PublicationLease,
         host: &mut impl Host,
         defer: &mut impl FnMut(Deferred) -> Result,
@@ -493,7 +516,32 @@ impl Pair {
             self.memory.graph.queues.gpu_va()
                 + u64::from(qid) * size_of::<queue::QueueRecord>() as u64
         });
-        let fragment_barriers = [KickDependency::new(qids[0], kicks[0]).ok_or(EINVAL)?];
+        // The fragment kick always waits for its own tiling kick. With the
+        // fragment-barriers flag the resolved prefix orders the fragment kick
+        // too, and the tiling kick keeps only its implicit parent, so vertex
+        // work overlaps the predecessors' fragment work as on the native stack.
+        let Validated::Render { pass, .. } = &packet.command else {
+            return Err(EINVAL);
+        };
+        let own_tiling = KickDependency::new(qids[0], kicks[0]).ok_or(EINVAL)?;
+        let mut tiling_barriers = [KickDependency::ZERO; 3];
+        let mut tiling_count = 0;
+        let mut fragment_barriers = [own_tiling; 3];
+        let mut fragment_count = 1;
+        for dependency in dependencies.render() {
+            if pass.fragment_barriers {
+                fragment_barriers[fragment_count] = *dependency;
+                fragment_count += 1;
+            } else {
+                tiling_barriers[tiling_count] = *dependency;
+                tiling_count += 1;
+            }
+        }
+        if let Some(compute) = dependencies.compute {
+            tiling_barriers[tiling_count] = compute;
+            tiling_count += 1;
+        }
+        let tiling_barriers = &tiling_barriers[..tiling_count];
         let args = |stage: usize, barriers, arrays, mcache| KickArgs {
             qid: qids[stage],
             timestamp: kicks[stage],
@@ -516,13 +564,13 @@ impl Pair {
         };
         let ta_args = args(
             0,
-            dependencies,
+            tiling_barriers,
             abi::TaDescriptor::register_bindings(self.memory.graph.descriptor_client(0, ordinal))?,
             None,
         );
         let fragment_args = args(
             1,
-            &fragment_barriers,
+            &fragment_barriers[..fragment_count],
             abi::FragmentDescriptor::register_bindings(
                 self.memory.graph.descriptor_client(1, ordinal),
             )?,

@@ -292,6 +292,12 @@ enum drm_asahi_feature {
 	 * DRM_ASAHI_RENDER_FEW_PRIMITIVES.
 	 */
 	DRM_ASAHI_FEATURE_FEW_PRIMITIVES = (1UL) << 6,
+
+	/**
+	 * @DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS: Render commands accept
+	 * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS.
+	 */
+	DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS = (1UL) << 7,
 };
 
 /**
@@ -1055,6 +1061,25 @@ enum drm_asahi_render_flags {
 	 * always safe. Requires DRM_ASAHI_FEATURE_FEW_PRIMITIVES.
 	 */
 	DRM_ASAHI_RENDER_FEW_PRIMITIVES = (1U << 19),
+
+	/**
+	 * @DRM_ASAHI_RENDER_FRAGMENT_BARRIERS: Only the fragment stage waits for
+	 * this command's barriers.
+	 *
+	 * The render dependencies resolved from @vdm_barrier and @prior_vdm are
+	 * attached to the fragment half of the render instead of its vertex
+	 * (tiling) half, so vertex processing may start while the renders this
+	 * command depends on are still executing their fragment work. The
+	 * fragment half still waits for its own vertex half and for the previous
+	 * fragment work of its physical queue; the compute dependencies from
+	 * @cdm_barrier and @prior_cdm keep ordering the vertex half. Set this
+	 * only when every render dependency into the command is consumed by
+	 * fragment-stage or attachment accesses alone: nothing the vertex stage
+	 * reads (vertex/index/indirect buffers, vertex, tessellation or geometry
+	 * shader resources, transform feedback, conditional-rendering predicates)
+	 * may depend on it. Requires DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS.
+	 */
+	DRM_ASAHI_RENDER_FRAGMENT_BARRIERS = (1U << 20),
 };
 
 /**
