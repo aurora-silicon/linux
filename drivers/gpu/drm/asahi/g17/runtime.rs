@@ -153,6 +153,7 @@ impl Registry {
         &mut self,
         qid: u8,
         pages: crate::g17::freelist::Pages,
+        ring: compute::DescriptorRing,
     ) -> Result<(u16, u64)> {
         let queue = self
             .compute
@@ -161,7 +162,7 @@ impl Registry {
             .filter_map(|entry| entry.queue.as_deref_mut())
             .find(|queue| queue.qid() == qid)
             .ok_or(EAGAIN)?;
-        queue.rearm(pages)
+        queue.rearm(pages, ring)
     }
 
     pub(super) fn bind_rearmed(&mut self, qid: u8, owner: u64, context: &Arc<Context>) -> Result {
@@ -563,12 +564,13 @@ impl Backend {
                     // Fresh zeroed backing is built without the device mutex; the
                     // queue may have been taken or re-armed by another owner since.
                     let pages = crate::g17::freelist::Pages::compute(&alloc)?;
+                    let ring = compute::DescriptorRing::new(&alloc)?;
                     let mut state = self.shared.state.lock();
                     let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
                     if !lease.is_current() {
                         continue;
                     }
-                    let (slot, page_list) = match firmware.queues.rearm_compute(qid, pages) {
+                    let (slot, page_list) = match firmware.queues.rearm_compute(qid, pages, ring) {
                         Err(error) if error == EAGAIN => continue,
                         result => result?,
                     };
