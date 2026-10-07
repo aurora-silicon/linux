@@ -121,7 +121,9 @@ properties:
     maxItems: 4
     items:
       enum: [0, 1]
-    description: Per-slot enable flags, in slot order.
+    description: |
+      Per-slot enable flags, in slot order. The legacy J700 bootloader
+      supplies a single zero to select surface zero instead.
 
   apple,power-lut-data-x:
     $ref: /schemas/types.yaml#/definitions/uint8-array
