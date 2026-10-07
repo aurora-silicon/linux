@@ -26,7 +26,7 @@ impl Backend {
         result
     }
     pub(in crate::g17) fn cancel_render(&self, packet: &Arc<Packet>) -> Result {
-        let fence = packet.completion.fence();
+        let fence = packet.completion.scheduler_fence();
         // SAFETY: The retained fence remains alive across this bounded,
         // uninterruptible queue-teardown wait, without holding a device lock.
         let completed = unsafe {

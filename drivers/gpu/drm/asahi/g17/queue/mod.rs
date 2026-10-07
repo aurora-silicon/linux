@@ -8,7 +8,7 @@ pub(crate) mod render;
 
 use super::{
     command::{Parser, UscWindow, Validated},
-    completion::{Completion, Destinations},
+    completion::{Completion, Destinations, PreparedPublication},
     context::Context,
     fence::{Outputs, Submission},
     job::{self, Backend, Engine, Fences, Order, Packet, Scheduler},
@@ -176,6 +176,15 @@ impl<B: Backend> Queue<B> {
         if engine == Engine::Compute {
             self.ensure_compute()?;
         }
+        // Only earlier render ordinals covered by the explicit logical prefix
+        // can delay host publication. These links never become GPU dependencies.
+        let host_predecessors = self.frontiers[index]
+            .iter()
+            .take_while(|(sequence, _)| {
+                engine == Engine::Render
+                    && Order::contains(order.wait_through[index], *sequence)
+            })
+            .filter_map(|(_, fences)| fences.publication.as_ref());
         let completion = Completion::new(
             &self.dev,
             &self.fences,
@@ -184,8 +193,12 @@ impl<B: Backend> Queue<B> {
             guard,
             destinations,
             engine == Engine::Compute,
+            host_predecessors.clone().next().is_some(),
             if engine == Engine::Render { self.backend.feed() } else { None },
         )?;
+        let publication = completion.publication()
+            .map(|target| PreparedPublication::new(target, host_predecessors))
+            .transpose()?;
         if engine == Engine::Compute {
             self.prune_frontier(Engine::Render.index());
         }
@@ -275,7 +288,7 @@ impl<B: Backend> Queue<B> {
         let fences = scheduler
             .as_mut()
             .ok_or(ENODEV)?
-            .enqueue(packet, dependencies, early)?;
+            .enqueue(packet, dependencies, early, publication)?;
         self.sequence[index] = order.sequence;
         self.frontiers[index]
             .push_within_capacity((order.sequence, fences))

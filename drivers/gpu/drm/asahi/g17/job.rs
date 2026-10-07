@@ -316,6 +316,7 @@ pub(crate) struct Scheduler<B: Backend> {
 pub(crate) struct Fences {
     pub(crate) ready: Fence,
     pub(crate) completed: Fence,
+    pub(crate) publication: Option<Arc<super::completion::Publication>>,
 }
 
 impl<B: Backend> Scheduler<B> {
@@ -338,9 +339,18 @@ impl<B: Backend> Scheduler<B> {
         packet: Arc<Packet>,
         dependencies: KVec<Fence>,
         early: bool,
+        publication: Option<super::completion::PreparedPublication>,
     ) -> Result<Fences> {
         let completed = packet.completion.fence();
         let host_timestamps = packet.completion.has_timestamps();
+        // Only commands which actually write timestamps become host-prefix
+        // producers. Ordinary consumers retain the scheduled ready fence and
+        // their existing firmware dependency path for cross-engine overlap.
+        let host_publication = if host_timestamps {
+            packet.completion.publication()
+        } else {
+            None
+        };
         let mut job = self.entity.new_job(
             1,
             Job {
@@ -354,6 +364,9 @@ impl<B: Backend> Scheduler<B> {
         }
         let mut job = job.arm();
         packet.completion.mark_accepted();
+        if let Some(publication) = publication {
+            publication.activate();
+        }
         let ready = if host_timestamps {
             completed.clone()
         } else {
@@ -365,6 +378,6 @@ impl<B: Backend> Scheduler<B> {
             self.backend.count_backlog(&packet);
         }
         job.push();
-        Ok(Fences { ready, completed })
+        Ok(Fences { ready, completed, publication: host_publication })
     }
 }
