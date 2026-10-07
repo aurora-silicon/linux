@@ -300,12 +300,139 @@ pub(crate) fn arm(dev: &device::Device, soc: &Soc) -> Result<Option<Experiment>>
     Ok(Some(e))
 }
 
+/// Log, in an armed start, that the probe stopped at `stage` before the firmware started.
+pub(crate) fn refused(dev: &device::Device, experiment: Option<&Experiment>, stage: &str, error: Error) {
+    if experiment.is_some() {
+        dev_err!(
+            dev,
+            "M3 G15G start: refused at {} ({:?}); the firmware was not started, see the lines above\n",
+            stage,
+            error
+        );
+    }
+}
+
 /// Log, on a T8122 armed with `asahi.t8122_start=1`, that resource admission refused it.
 pub(crate) fn not_admitted(dev: &device::Device, soc: &Soc) {
     if is_t8122(soc) && knobs::start(&crate::m3_params::t8122_params()) == Start::On {
         dev_err!(
             dev,
             "M3 G15G start: not armed: resource admission refused the GPU (see the lines above); the boot loader did not hand it over completely\n"
+        );
+    }
+}
+
+// One `M3 G15G verdict:` line per outcome of an armed start, so that a tester can tell them
+// apart from the log alone. They run on T8122 only (callers check `is_t8122`); nothing here
+// changes what the runtime does.
+
+/// The GPU coprocessor's start or the driver's InitData upload failed (`m3_runtime::Runtime::new`).
+/// `started`: the coprocessor ran and offered its endpoints.
+pub(crate) fn prepare_verdict(dev: &device::Device, soc: &Soc, started: bool, error: Error) {
+    if !is_t8122(soc) {
+        return;
+    }
+    if started {
+        dev_err!(
+            dev,
+            "M3 G15G verdict: driver-refused ({:?}): the GPU firmware is up, but the driver did not publish the InitData (UAT, upload checks or thermal setup, see above)\n",
+            error
+        );
+    } else {
+        dev_err!(
+            dev,
+            "M3 G15G verdict: firmware-boot-failed ({:?}): the GPU coprocessor did not start, or its RTKit did not offer endpoints 0x20/0x21; no InitData was published\n",
+            error
+        );
+    }
+}
+
+/// The firmware's answer to the published InitData (`m3_runtime::Runtime::boot`). `accepted`:
+/// the firmware wrote its ready words.
+pub(crate) fn boot_verdict(
+    dev: &device::Device,
+    version: u64,
+    accepted: bool,
+    crashed: bool,
+    result: Result,
+) {
+    match result {
+        Ok(()) => dev_info!(
+            dev,
+            "M3 G15G verdict: firmware-running: the firmware accepted the InitData (version {:#x}) and the device controls; no job has run yet\n",
+            version
+        ),
+        Err(e) if accepted => dev_err!(
+            dev,
+            "M3 G15G verdict: firmware-running-check-failed ({:?}): the firmware accepted the InitData (version {:#x}), then a check after boot failed (see above)\n",
+            e,
+            version
+        ),
+        Err(e) if crashed => dev_err!(
+            dev,
+            "M3 G15G verdict: initdata-rejected ({:?}): the firmware crashed after the InitData (version {:#x}) was published; see the crash lines above\n",
+            e,
+            version
+        ),
+        Err(e) => dev_err!(
+            dev,
+            "M3 G15G verdict: initdata-rejected ({:?}): the firmware did not accept the InitData (version {:#x}) within 2 s; see M3 firmware readiness above\n",
+            e,
+            version
+        ),
+    }
+}
+
+/// A job that failed (`m3_runtime::Inner::fail`): `primary` is ETIMEDOUT when it did not finish
+/// within the runtime's 2 s bound; `pstate` is the GPU performance-state register, if readable.
+pub(crate) fn job_failed_verdict(dev: &device::Device, primary: Error, pstate: Option<u32>, crashed: bool) {
+    if primary != ETIMEDOUT || crashed {
+        dev_err!(
+            dev,
+            "M3 G15G verdict: job-faulted ({:?}): the firmware crashed, reported an error, or the GPU reported a fault while the job ran; see the lines around this one\n",
+            primary
+        );
+        return;
+    }
+    match pstate {
+        Some(p) if p & 0xf == 0 => dev_err!(
+            dev,
+            "M3 G15G verdict: job-accepted-never-dispatched: the job did not finish within 2 s and the GPU reads powered down (pstate register {:#x})\n",
+            p
+        ),
+        Some(p) => dev_err!(
+            dev,
+            "M3 G15G verdict: job-timed-out-powered: the job did not finish within 2 s with the GPU powered (pstate register {:#x}); see the engine snapshot below\n",
+            p
+        ),
+        None => dev_err!(
+            dev,
+            "M3 G15G verdict: job-timed-out: the job did not finish within 2 s (pstate register unreadable)\n"
+        ),
+    }
+}
+
+/// The first job of a kind (0 render, 1 compute) retired (`m3_runtime::Runtime::execute`):
+/// `span` is its first start and last end GPU timestamp (24 MHz ticks), if readable.
+pub(crate) fn job_completed_verdict(dev: &device::Device, kind: usize, gpu_ns: u64, span: Option<[u64; 2]>) {
+    let what = if kind == 0 { "render" } else { "compute" };
+    let [start, end] = span.unwrap_or([0, 0]);
+    if start != 0 && end != 0 {
+        dev_info!(
+            dev,
+            "M3 G15G verdict: job-completed: the first {} job finished, GPU timestamps {:#x}..{:#x}, {} ns of GPU time\n",
+            what,
+            start,
+            end,
+            gpu_ns
+        );
+    } else {
+        dev_err!(
+            dev,
+            "M3 G15G verdict: job-retired-without-timestamps: the first {} job retired, but its GPU timestamps are {:#x}..{:#x}\n",
+            what,
+            start,
+            end
         );
     }
 }

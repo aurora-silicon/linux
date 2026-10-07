@@ -50,6 +50,10 @@ impl Inner {
     /// behind a device that still reports itself healthy.
     fn fail(&mut self, index: usize, vm: &mmu::Vm, primary: Error) {
         self.capture_fault(primary);
+        if crate::t8122_start::is_t8122(self.device.soc()) {
+            let pstate=self.device.pstate_register().ok();
+            crate::t8122_start::job_failed_verdict(self.drm.as_ref(),primary,pstate,self.state.health.crashed());
+        }
         let events=self.state.event_messages.load(Ordering::Acquire);
         if let Err(e) = self.jobs[index].log(&self.drm) {
             dev_err!(self.drm.as_ref(), "M3 job diagnostics failed: {:?}\n", e);
@@ -121,6 +125,8 @@ impl Runtime {
         let state = m3_rtkit::State::new(pdev, drm.clone(), device.firmware().resources.regions[5])?;
         let mut transport = rtkit::RtKit::new(pdev.as_ref(), None, 0, state.clone())?;
         if crate::m3_adt_config::stop_before_asc(pdev.as_ref()) { return Err(ENODEV); }
+        // Whether the coprocessor runs and offers its endpoints, for the T8122 verdict.
+        let mut started=false;
         let prepared=(|| -> Result<_> {
             device.start_asc(pdev)?;
             Pin::new(&mut transport).wake()?;
@@ -129,6 +135,7 @@ impl Runtime {
                 if !Pin::new(&mut transport).has_endpoint(ep) {return Err(ENODEV);}
                 Pin::new(&mut transport).start_endpoint(ep)?;
             }
+            started=true;
             // The UAT geometry of the admitted SoC (complete: `Soc::require_complete`).
             let hwcfg=device.soc().hwcfg.ok_or(ENODEV)?;
             // SAFETY: the admitted RTKit (J514S on T6030) is awake; no initdata or GPU
@@ -140,6 +147,7 @@ impl Runtime {
         let (uat,config)=match prepared {
             Ok(v)=>v,
             Err(e)=>{
+                crate::t8122_start::prepare_verdict(pdev.as_ref(),device.soc(),started,e);
                 state.health.mark_failed();
                 if device.stop_asc().is_err() {
                     unsafe {kernel::bindings::__module_get(crate::THIS_MODULE.as_ptr())};
@@ -387,6 +395,13 @@ impl Runtime {
                             }
                             t[0]+=1;t[1]+=preparation_ns;t[2]+=active_ns;t[3]+=gpu_ns as i64;
                             for i in 0..3 {t[4+i]+=stages[i] as i64;}
+                            if t[0]==1 && crate::t8122_start::is_t8122(inner.device.soc()) {
+                                let span=match &mut inner.jobs[index] {
+                                    NativeJob::Compute(j)=>j.batch_gpu_span().ok(),
+                                    NativeJob::Render(j)=>j.batch_gpu_span().ok(),
+                                };
+                                crate::t8122_start::job_completed_verdict(inner.drm.as_ref(),kind,gpu_ns,span);
+                            }
                             if t[0]%128==0 {
                                 dev_info!(inner.drm.as_ref(),"M3_TIMING kind={} count={} prepare_ns={} active_ns={} gpu_ns={} ta_ns={} fragment_ns={} gap_ns={} ordinal={}\n",kind,t[0],t[1],t[2],t[3],t[4],t[5],t[6],
                                     match &inner.jobs[index] {NativeJob::Render(j)=>j.ordinal(),NativeJob::Compute(j)=>j.ordinal()});
@@ -453,6 +468,11 @@ impl Runtime {
     pub(crate) fn boot(&mut self, pdev: &platform::Device<Core>) -> Result {
         let result = self.boot_inner(pdev);
         if let Err(error) = result { self.inner.capture_fault(error); }
+        if crate::t8122_start::is_t8122(self.inner.device.soc()) {
+            let accepted = result.is_ok() || self.inner.config.ready().unwrap_or(false);
+            crate::t8122_start::boot_verdict(pdev.as_ref(), self.inner.device.firmware().initdata_magic,
+                accepted, self.inner.state.health.crashed(), result);
+        }
         result
     }
     fn boot_inner(&mut self, pdev: &platform::Device<Core>) -> Result {

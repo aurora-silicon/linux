@@ -97,12 +97,18 @@ impl Registered {
             soc.require_complete(pdev.as_ref())?;
         }
         let experiment = experiment.as_ref();
-        let firmware = crate::m3_firmware::identify_loaded(pdev, soc, resources, experiment)?;
+        let refused = |stage: &'static str| {
+            move |e: &Error| crate::t8122_start::refused(pdev.as_ref(), experiment, stage, *e)
+        };
+        let firmware = crate::m3_firmware::identify_loaded(pdev, soc, resources, experiment)
+            .inspect_err(refused("the firmware identity"))?;
         dev_info!(pdev.as_ref(), "M3: firmware identity accepted\n");
         // InitData source and contents, before any GPU register access.
-        let contents = crate::m3_adt_config::Contents::select(pdev, &firmware, soc, experiment)?;
-        let device = crate::m3_device::Device::new(pdev, firmware, soc, experiment)?;
-        device.check_drm(pdev)?;
+        let contents = crate::m3_adt_config::Contents::select(pdev, &firmware, soc, experiment)
+            .inspect_err(refused("the InitData contents"))?;
+        let device = crate::m3_device::Device::new(pdev, firmware, soc, experiment)
+            .inspect_err(refused("the GPU registers and identity"))?;
+        device.check_drm(pdev).inspect_err(refused("the DRM setup"))?;
         let core_mask = device.core_mask();
         let max_frequency_khz = 1000 * contents.pstates.reported_max_mhz();
         let mut runtime = crate::m3_runtime::Runtime::new(pdev, device, contents)?;
