@@ -7,6 +7,68 @@
 #include "iomfb_v13_3.h"
 #include "version_utils.h"
 
+struct dcp_callback_size {
+	u32 in_len;
+	u32 out_len;
+	bool valid;
+};
+
+/* R-IOMFB-startup-run21 and R-ANALYTICS Linux boundary observations. */
+static const struct dcp_callback_size callback_sizes[IOMFB_MAX_CB] = {
+	[0] = { 0x0, 0x4, true },
+	[1] = { 0x0, 0x4, true },
+	[3] = { 0x4, 0x14, true },
+	[6] = { 0x54, 0x50, true },
+	[100] = { 0x0, 0x0, true },
+	[101] = { 0x0, 0x4, true },
+	[102] = { 0x44, 0x0, true },
+	[104] = { 0x44, 0x0, true },
+	[108] = { 0x0, 0x4, true },
+	[109] = { 0x0, 0x4, true },
+	[110] = { 0x0, 0x4, true },
+	[111] = { 0x0, 0x4, true },
+	[112] = { 0x0, 0x4, true },
+	[113] = { 0x0, 0x4, true },
+	[114] = { 0x1044, 0x1004, true },
+	[121] = { 0x0, 0x4, true },
+	[123] = { 0x0, 0x4, true },
+	[125] = { 0x64, 0x24, true },
+	[127] = { 0x4, 0x4, true },
+	[128] = { 0x1008, 0x4, true },
+	[129] = { 0x40, 0x4, true },
+	[201] = { 0xc, 0x10, true },
+	[206] = { 0x0, 0x4, true },
+	[207] = { 0x0, 0x4, true },
+	[300] = { 0x10, 0x0, true },
+	[400] = { 0x4c, 0xc04, true },
+	[401] = { 0x50, 0xc, true },
+	[406] = { 0x48, 0x0, true },
+	[411] = { 0x10, 0x1c, true },
+	[413] = { 0x1048, 0x4, true },
+	[414] = { 0x50, 0x4, true },
+	[415] = { 0x4c, 0x4, true },
+	[451] = { 0x14, 0x1c, true },
+	[552] = { 0x1044, 0x4, true },
+	[561] = { 0x1044, 0x4, true },
+	[563] = { 0x4c, 0x4, true },
+	[565] = { 0x48, 0x4, true },
+	[574] = { 0x4, 0x8, true },
+	[575] = { 0x58, 0x4c, true },
+	[582] = { 0x8, 0x4, true },
+	[590] = { 0x730, 0x0, true },
+	[599] = { 0x0, 0x0, true },
+};
+
+bool iomfb_validate_callback_h17p(int tag, u32 in_len, u32 out_len)
+{
+	const struct dcp_callback_size *size;
+
+	if (tag < 0 || tag >= ARRAY_SIZE(callback_sizes))
+		return false;
+	size = &callback_sizes[tag];
+	return size->valid && size->in_len == in_len && size->out_len == out_len;
+}
+
 struct dcp_h17p_hotplug_request {
 	__le64 connected;
 	u8 tiled_display[0x4c];

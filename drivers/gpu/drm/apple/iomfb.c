@@ -163,6 +163,9 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 {
 	struct dcp_method_entry resolved = *call;
 
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P && READ_ONCE(dcp->crashed))
+		return;
+
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G &&
 	    call->tag_h17g[0])
 		memcpy(resolved.tag, call->tag_h17g, sizeof(resolved.tag));
@@ -332,9 +335,28 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	struct device *dev = dcp->dev;
 	struct dcp_packet_header *hdr = data;
 	void *in, *out;
-	int tag = dcp_parse_tag(hdr->tag);
+	int tag;
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 	u8 depth;
+
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	    (length < sizeof(*hdr) || !ch || ch->depth >= DCP_MAX_CALL_DEPTH ||
+	     offset >= 0x8000 || length > 0x8000 - offset)) {
+		dev_err(dev, "invalid IOMFB callback envelope\n");
+		dcp->crashed = true;
+		return;
+	}
+
+	tag = dcp_parse_tag(hdr->tag);
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	    ((u64)sizeof(*hdr) + hdr->in_len + hdr->out_len != length ||
+	     (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+	      !iomfb_validate_callback_h17p(tag, hdr->in_len, hdr->out_len)))) {
+		dev_err(dev, "unqualified IOMFB callback %d (%u, %u)\n",
+			tag, hdr->in_len, hdr->out_len);
+		dcp->crashed = true;
+		return;
+	}
 
 	in = data + sizeof(*hdr);
 	out = in + hdr->in_len;
@@ -704,6 +726,9 @@ bool dcp_is_initialized(struct platform_device *pdev)
 void iomfb_recv_msg(struct apple_dcp *dcp, u64 message)
 {
 	enum dcpep_type type = FIELD_GET(IOMFB_MESSAGE_TYPE, message);
+
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P && READ_ONCE(dcp->crashed))
+		return;
 
 	if (type == IOMFB_MESSAGE_TYPE_INITIALIZED) {
 		/*
