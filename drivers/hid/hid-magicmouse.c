@@ -118,6 +118,22 @@ static u16 haptic_deep_threshold = 500;
 module_param(haptic_deep_threshold, ushort, 0644);
 MODULE_PARM_DESC(haptic_deep_threshold, "summed finger pressure for a deep click, 0 disables (default 500)");
 
+/*
+ * A force click has two stages, and each boundary clicks on the way back
+ * up as well as on the way down: easing off a deep click to an ordinary
+ * press is felt, and so is the final release. The deep stage ends
+ * well below where it starts, for the same reason the first one does: a
+ * finger held near the threshold must not chatter. J613 ordinary clicks peak
+ * at 150-270 and firm presses at 700-910, so this sits above the former.
+ */
+static u16 haptic_deep_release_threshold = 350;
+module_param(haptic_deep_release_threshold, ushort, 0644);
+MODULE_PARM_DESC(haptic_deep_release_threshold, "summed finger pressure at which a deep click ends, below haptic_deep_threshold (default 350)");
+
+static bool haptic_deep_waveform = true;
+module_param(haptic_deep_waveform, bool, 0644);
+MODULE_PARM_DESC(haptic_deep_waveform, "play the actuator's force-click waveform for a deep click (default on; off: the press waveform)");
+
 static u8 haptic_deep_pulses = 1;
 module_param(haptic_deep_pulses, byte, 0644);
 MODULE_PARM_DESC(haptic_deep_pulses, "pulses played for a deep click (default 1)");
@@ -128,12 +144,15 @@ MODULE_PARM_DESC(haptic_deep_gap_ms, "milliseconds between deep-click pulses, 0 
 
 /*
  * Linux has no key for a force click, so which one to send is the user's
- * choice; nothing is sent unless one is named. It is read at probe because the
- * capability has to be advertised when the input device is set up.
+ * choice; nothing is sent unless one is named. It is held down for as long as
+ * the deep stage lasts. The key comes from a separate input device: libinput
+ * drives a touchpad with its own dispatcher, which drops every key that is not
+ * a button, so a key on the trackpad's own device never reaches userspace. It
+ * is read at probe because that device is set up there.
  */
 static u16 haptic_deep_keycode;
 module_param(haptic_deep_keycode, ushort, 0444);
-MODULE_PARM_DESC(haptic_deep_keycode, "key code reported on a deep click, 0 for none (default 0)");
+MODULE_PARM_DESC(haptic_deep_keycode, "key code held during a deep click on a separate \"Force Click\" input device, 0 for none (default 0)");
 
 static u8 haptic_pulse_gap_ms = 25;
 module_param(haptic_pulse_gap_ms, byte, 0644);
@@ -282,8 +301,10 @@ struct magicmouse_sc {
 	struct work_struct haptic_press_work;
 	struct work_struct haptic_release_work;
 	struct work_struct haptic_deep_work;
+	struct work_struct haptic_deep_release_work;
+	struct input_dev *force_input;
 	bool haptic_button_down;
-	bool haptic_deep_fired;
+	bool haptic_deep_down;
 
 	struct hid_device *hdev;
 	struct delayed_work work;
@@ -1478,7 +1499,7 @@ static void magicmouse_haptic_pulses(struct magicmouse_sc *msc, u16 usage,
 		}
 		hid_dbg(msc->hdev, "played %s pulse %u/%u at strength 0x%02x\n",
 			usage == (HID_HP_WAVEFORMRELEASE & HID_USAGE) ?
-				"release" : "press",
+				"release" : deep ? "deep" : "press",
 			i + 1, pulses, strength);
 		if (i + 1 < pulses)
 			msleep(gap);
@@ -1531,8 +1552,32 @@ static void magicmouse_deep_worker(struct work_struct *ws)
 	if (!haptic_press)
 		return;
 
-	magicmouse_haptic_pulses(msc, HID_HP_WAVEFORMPRESS & HID_USAGE, true,
-				 haptic_deep_pulses);
+	magicmouse_haptic_pulses(msc, haptic_deep_waveform ?
+				 APPLE_HP_WAVEFORMDEEPCLICK & HID_USAGE :
+				 HID_HP_WAVEFORMPRESS & HID_USAGE,
+				 true, haptic_deep_pulses);
+}
+
+/* Easing off a deep click to an ordinary press: the first of two releases. */
+static void magicmouse_deep_release_worker(struct work_struct *ws)
+{
+	struct magicmouse_sc *msc =
+		container_of(ws, struct magicmouse_sc, haptic_deep_release_work);
+
+	if (!haptic_press)
+		return;
+
+	magicmouse_haptic_pulses(msc, HID_HP_WAVEFORMRELEASE & HID_USAGE, false,
+				 max_t(u8, haptic_release_pulses, 1));
+}
+
+static void magicmouse_force_key(struct magicmouse_sc *msc, bool down)
+{
+	if (!msc->force_input)
+		return;
+
+	input_report_key(msc->force_input, haptic_deep_keycode, down);
+	input_sync(msc->force_input);
 }
 
 static void magicmouse_release_worker(struct work_struct *ws)
@@ -1575,7 +1620,10 @@ static bool magicmouse_haptic_click(struct magicmouse_sc *msc, u32 pressure,
 	if (!haptic_press && !host_mode) {
 		/* The firmware owns the actuator and reports the button. */
 		msc->haptic_button_down = false;
-		msc->haptic_deep_fired = false;
+		if (msc->haptic_deep_down) {
+			msc->haptic_deep_down = false;
+			magicmouse_force_key(msc, false);
+		}
 		return firmware_button;
 	}
 
@@ -1590,29 +1638,39 @@ static bool magicmouse_haptic_click(struct magicmouse_sc *msc, u32 pressure,
 	if (!haptic_press)
 		queue_work(msc->haptics->wq, &msc->haptic_release_work);
 
-	if (!msc->haptic_button_down && pressure >= haptic_press_threshold) {
-		msc->haptic_button_down = true;
-		msc->haptic_deep_fired = false;
-		hid_dbg(msc->hdev, "click at pressure %u\n", pressure);
-		queue_work(msc->haptics->wq, &msc->haptic_press_work);
-	} else if (msc->haptic_button_down &&
-		   pressure <= haptic_release_threshold) {
+	/*
+	 * Three levels, up, clicked and deep, each step with its own click on
+	 * the way down and on the way back up. One step per frame: a press hard
+	 * enough to reach the deep stage at once still clicks twice, a frame
+	 * apart.
+	 */
+	if (!msc->haptic_button_down) {
+		if (pressure >= haptic_press_threshold) {
+			msc->haptic_button_down = true;
+			hid_dbg(msc->hdev, "click at pressure %u\n", pressure);
+			queue_work(msc->haptics->wq, &msc->haptic_press_work);
+		}
+	} else if (pressure <= haptic_release_threshold) {
 		msc->haptic_button_down = false;
-		msc->haptic_deep_fired = false;
+		if (msc->haptic_deep_down) {
+			msc->haptic_deep_down = false;
+			magicmouse_force_key(msc, false);
+		}
 		hid_dbg(msc->hdev, "release at pressure %u\n", pressure);
 		queue_work(msc->haptics->wq, &msc->haptic_release_work);
-	} else if (msc->haptic_button_down && !msc->haptic_deep_fired &&
-		   haptic_deep_threshold &&
-		   pressure >= haptic_deep_threshold) {
-		/* Pressing harder without lifting: once per click, not while held. */
-		msc->haptic_deep_fired = true;
-		hid_dbg(msc->hdev, "deep click at pressure %u\n", pressure);
-		queue_work(msc->haptics->wq, &msc->haptic_deep_work);
-
-		if (haptic_deep_keycode) {
-			input_report_key(msc->input, haptic_deep_keycode, 1);
-			input_report_key(msc->input, haptic_deep_keycode, 0);
+	} else if (!msc->haptic_deep_down) {
+		if (haptic_deep_threshold && pressure >= haptic_deep_threshold) {
+			msc->haptic_deep_down = true;
+			hid_dbg(msc->hdev, "deep click at pressure %u\n", pressure);
+			queue_work(msc->haptics->wq, &msc->haptic_deep_work);
+			magicmouse_force_key(msc, true);
 		}
+	} else if (pressure <= min(haptic_deep_release_threshold,
+				   haptic_deep_threshold)) {
+		msc->haptic_deep_down = false;
+		hid_dbg(msc->hdev, "deep release at pressure %u\n", pressure);
+		queue_work(msc->haptics->wq, &msc->haptic_deep_release_work);
+		magicmouse_force_key(msc, false);
 	}
 
 	return msc->haptic_button_down;
@@ -1633,7 +1691,10 @@ static void magicmouse_haptic_forget_mode(struct magicmouse_sc *msc)
 
 	msc->haptics->mode = HID_HAPTIC_MODE_DEVICE;
 	msc->haptic_button_down = false;
-	msc->haptic_deep_fired = false;
+	if (msc->haptic_deep_down) {
+		msc->haptic_deep_down = false;
+		magicmouse_force_key(msc, false);
+	}
 }
 #else
 static bool magicmouse_haptic_click(struct magicmouse_sc *msc, u32 pressure,
@@ -1959,6 +2020,46 @@ static void apple_taptic_destroy(struct ff_device *ff)
 	msc->haptic_effects = NULL;
 }
 
+/*
+ * The deep-click key lives on its own input device (see haptic_deep_keycode).
+ * It is managed by devres, so it goes away with the trackpad. Failing to set
+ * it up costs only the key, not the click feedback.
+ */
+static void magicmouse_setup_force_input(struct magicmouse_sc *msc)
+{
+	struct hid_device *hdev = msc->hdev;
+	struct input_dev *input;
+	int ret;
+
+	if (haptic_deep_keycode > KEY_MAX)
+		return;
+
+	input = devm_input_allocate_device(&hdev->dev);
+	if (!input)
+		return;
+
+	input->name = devm_kasprintf(&hdev->dev, GFP_KERNEL, "%s Force Click",
+				     hdev->name);
+	if (!input->name)
+		return;
+	input->phys = hdev->phys;
+	input->uniq = hdev->uniq;
+	input->id.bustype = hdev->bus;
+	input->id.vendor = hdev->vendor;
+	input->id.product = hdev->product;
+	input->id.version = hdev->version;
+	input->dev.parent = &hdev->dev;
+	input_set_capability(input, EV_KEY, haptic_deep_keycode);
+
+	ret = input_register_device(input);
+	if (ret) {
+		hid_warn(hdev, "no force click key (%d)\n", ret);
+		return;
+	}
+
+	msc->force_input = input;
+}
+
 static int apple_taptic_init_mtp(struct magicmouse_sc *msc,
 				 struct hid_haptic_device *haptic_dev)
 {
@@ -1989,9 +2090,11 @@ static int apple_taptic_init_mtp(struct magicmouse_sc *msc,
 	INIT_WORK(&msc->haptic_press_work, magicmouse_press_worker);
 	INIT_WORK(&msc->haptic_release_work, magicmouse_release_worker);
 	INIT_WORK(&msc->haptic_deep_work, magicmouse_deep_worker);
+	INIT_WORK(&msc->haptic_deep_release_work,
+		  magicmouse_deep_release_worker);
 
 	if (haptic_deep_keycode)
-		input_set_capability(msc->input, EV_KEY, haptic_deep_keycode);
+		magicmouse_setup_force_input(msc);
 
 	/* FF_HAPTIC has to be in ffbit before the FF device is created. */
 	input_set_capability(msc->input, EV_FF, FF_HAPTIC);
@@ -2071,6 +2174,7 @@ static void magicmouse_teardown_haptics(struct magicmouse_sc *msc)
 	cancel_work_sync(&msc->haptic_press_work);
 	cancel_work_sync(&msc->haptic_release_work);
 	cancel_work_sync(&msc->haptic_deep_work);
+	cancel_work_sync(&msc->haptic_deep_release_work);
 
 	/*
 	 * Tear the force feedback device down while msc is still valid: an
