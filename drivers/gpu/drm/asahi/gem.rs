@@ -53,6 +53,8 @@ pub(crate) struct AsahiObject {
     exportable: bool,
     /// Whether this is a kernel-created object.
     kernel: bool,
+    /// Driver aliases outside the user GPUVA tree; they pin the backing.
+    kernel_mappings: AtomicU64,
 }
 
 /// Type alias for the shmem GEM object type for this driver.
@@ -186,6 +188,7 @@ fn new_kernel_object_mapped(dev: &AsahiDevice, size: usize, map_wc: bool) -> Res
         dev,
         align(size, mmu::UAT_PGSZ),
         shmem::ObjectConfig::<AsahiObject> {
+            reclaimable_cpu_mappings: false,
             map_wc,
             parent_resv_obj: None,
         },
@@ -206,6 +209,7 @@ pub(crate) fn new_object(
     size: usize,
     flags: u32,
     parent_object: Option<&shmem::Object<AsahiObject>>,
+    reclaim_cpu: bool,
 ) -> Result<ARef<Object>> {
     if (flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0) != parent_object.is_some()
     {
@@ -216,6 +220,7 @@ pub(crate) fn new_object(
         dev,
         align(size, mmu::UAT_PGSZ),
         shmem::ObjectConfig::<AsahiObject> {
+            reclaimable_cpu_mappings: parent_object.is_some() && reclaim_cpu,
             map_wc: flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_WRITEBACK == 0,
             parent_resv_obj: parent_object,
         },
@@ -252,6 +257,7 @@ impl DriverObject for AsahiObject {
             flags: args.flags,
             exportable: args.exportable,
             kernel: args.kernel,
+            kernel_mappings: AtomicU64::new(0),
         })
     }
 
@@ -274,5 +280,39 @@ impl DriverObject for AsahiObject {
         }
 
         obj.prime_export(flags)
+    }
+}
+
+/// A driver-created alias of a GEM object, possibly in a root the user GPUVA
+/// tree does not describe. It keeps the object out of idle reclaim.
+pub(crate) struct KernelMappingPin {
+    object: ARef<Object>,
+}
+
+impl KernelMappingPin {
+    pub(crate) fn new(object: &Object) -> Self {
+        object.kernel_mappings.fetch_add(1, Ordering::AcqRel);
+        Self {
+            object: object.into(),
+        }
+    }
+}
+
+impl core::ops::Deref for KernelMappingPin {
+    type Target = Object;
+    fn deref(&self) -> &Object {
+        &self.object
+    }
+}
+
+impl Drop for KernelMappingPin {
+    fn drop(&mut self) {
+        self.object.kernel_mappings.fetch_sub(1, Ordering::Release);
+    }
+}
+
+impl AsahiObject {
+    pub(crate) fn idle_reclaim_candidate(&self) -> bool {
+        !self.kernel && !self.exportable && self.kernel_mappings.load(Ordering::Acquire) == 0
     }
 }

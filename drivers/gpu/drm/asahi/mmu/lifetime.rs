@@ -71,6 +71,14 @@ pub(super) struct VmLifetime {
 }
 
 impl VmLifetime {
+    pub(super) fn can_reclaim(&self) -> bool {
+        self.state.try_lock().is_some_and(|state| {
+            state.active == 0 && state.commits == 0
+                && !state.blocked && !state.quarantined && !state.draining
+                && !state.closed && !state.cleanup_failed
+        })
+    }
+
     pub(super) fn new() -> Result<Arc<Self>> {
         Arc::pin_init(
             pin_init!(Self {
@@ -89,6 +97,7 @@ impl VmLifetime {
 /// retirement: potentially visible work must retain its guard through quarantine or stop.
 pub(crate) struct VmJobGuard {
     vm: Vm,
+    _residency: Option<residency::Lease>,
 }
 
 impl VmJobGuard {
@@ -344,6 +353,7 @@ impl Vm {
 
     /// Acquires a job reference without imposing a VM-wide limit on healthy work.
     pub(crate) fn retain_job(&self) -> Result<VmJobGuard> {
+        let residency = self.enter_residency()?;
         let lifetime = self.lifetime.as_ref().ok_or(EINVAL)?;
         let mut state = lifetime.state.lock();
         loop {
@@ -355,7 +365,7 @@ impl Vm {
             }
             if !state.draining {
                 state.active = state.active.checked_add(1).ok_or(EOVERFLOW)?;
-                return Ok(VmJobGuard { vm: self.clone() });
+                return Ok(VmJobGuard { vm: self.clone(), _residency: residency });
             }
             lifetime.changed.wait(&mut state);
         }
@@ -533,6 +543,7 @@ impl Vm {
     }
 
     fn unmap_user_ranges_now(&self, user: Range<u64>, _kernel: Range<u64>) -> Result {
+        let _residency = self.enter_retirement_residency();
         // User mappings alone have GPUVA nodes. Kernel and driver aliases use
         // mm::Node and are untouched; GPUVM's embedded kernel cutout is skipped.
         // Closed admission and zero accepted jobs make whole-node teardown safe.
@@ -568,6 +579,7 @@ impl Vm {
     /// Admission stays closed to new jobs while the exec lock is acquired for cleanup.
     /// Recheck queued cleanup and reopen under the same lock used to append it.
     fn drain_mappings(&self, lifetime: &VmLifetime) {
+        let _residency = self.enter_retirement_residency();
         let mut state = lifetime.state.lock();
         let mut failure = None;
         loop {
