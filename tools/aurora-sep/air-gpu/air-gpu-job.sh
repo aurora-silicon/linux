@@ -17,9 +17,13 @@
 # this boot's id, so air-gpu-collect.sh can find it. The record and a "start" line in the
 # journal are written and synced before the job starts, so a hang still leaves them on disk.
 #
+# The record is written durably (fsync of the file and its directory) at the start and at the end;
+# the result is also logged to the journal (tag air-gpu-job), naming the record.
+#
 # Exit status: 0 when every submission completed with correct results, otherwise non-zero
 # (2 not run, 3 first submission never completed, 4 wrong results, 5 stalled later, 6 device
-# lost, 7 killed at the time limit, 8 stuck in the kernel, 1 anything else).
+# lost, 7 killed at the time limit, 8 stuck in the kernel, 9 the result could not be saved to the
+# record, 1 anything else).
 set -euo pipefail
 
 # ---- the Mesa prefix environment (keep in step with the prefix package) ----------------------
@@ -426,16 +430,30 @@ main() {
   work=$(mktemp -d)
   trap 'rm -rf "${work:-}"' EXIT
   out=$work/job.out
-  write_record() { # key=value lines on stdin; staged world-readable, then written as the user (A13)
+  # Writes the record (key=value lines on stdin) as the user (A13) and makes it durable before it
+  # returns: a temp file next to the record, fsync it, rename it over the record, fsync the
+  # directory. A hard reset right after (a GPU hang, a power cycle) still finds this version on
+  # disk. Returns non-zero on any failure, with the reason in $work/rec.err; callers check it.
+  write_record() {
     local pub
-    cat >"$work/rec"
-    # The user can't read the root-only work dir, so copy through a world-readable temp (the
-    # record has no secrets) and let the user write their own file: no root write via a symlink.
-    pub=$(mktemp --tmpdir "air-gpu-job.XXXXXX")
-    cp -f "$work/rec" "$pub"
-    chmod 0644 "$pub"
-    runu cp -f "$pub" "$rec" 2>/dev/null || true
+    cat >"$work/rec" || return 1
+    # The user can't read the root-only work dir, so hand the content over through a
+    # world-readable temp (the record has no secrets).
+    pub=$(mktemp --tmpdir "air-gpu-job.XXXXXX") || return 1
+    if ! { cp -f "$work/rec" "$pub" && chmod 0644 "$pub"; }; then rm -f "$pub"; return 1; fi
+    # shellcheck disable=SC2016 # $1..$3 are expanded by that sh
+    if ! runu sh -c 'cp -f -- "$1" "$2.tmp" && sync -- "$2.tmp" && mv -f -- "$2.tmp" "$2" && sync -- "$3"' \
+      _ "$pub" "$rec" "$recdir" 2>"$work/rec.err"; then
+      rm -f "$pub"
+      return 1
+    fi
     rm -f "$pub"
+  }
+  record_error() { # what failed
+    local why
+    why=$(head -c 300 "$work/rec.err" 2>/dev/null | tr '\n' ' ')
+    say "error: $1: could not save the record $rec${why:+ ($why)}"
+    logger -p user.err -t "$PROG" -- "error: $1: could not save the record $rec${why:+ ($why)}" 2>/dev/null || true
   }
   header() {
     printf '%s\n' "boot_id=$boot" "oneshot=${oneshot:-none}" "kernel=$(uname -r)" "started=$(date -Is)" \
@@ -443,14 +461,21 @@ main() {
   }
 
   if ! render_node_ok; then
-    { header; printf '%s\n' "reached_gpu=no" "result=no-render-node" "exit=2" "elapsed_ms=$(($(now_ms) - start))"; } |
-      write_record
+    log "result: no-render-node (exit 2, 0 ms, 0 submissions) stage none record $rec"
+    if ! { header; printf '%s\n' "reached_gpu=no" "result=no-render-node" "stage=none" "exit=2" \
+      "elapsed_ms=$(($(now_ms) - start))"; } | write_record; then
+      record_error "no render node"
+    fi
     say "not run: no $RENDER_DRIVER render node on this boot (arm with m3_expose=1). Record: $rec"
-    log "not run: no $RENDER_DRIVER render node"
     exit 2
   fi
 
-  { header; echo "result=running"; } | write_record
+  # No durable record, no job: collect could not judge it.
+  if ! { header; echo "result=running"; } | write_record; then
+    record_error "before the job"
+    say "refused: the GPU job was not started because its record could not be saved."
+    exit 2
+  fi
   log "start: $seconds s through $prefix, oneshot ${oneshot:-none}, record $rec"
   # Everything logged so far onto the disk before the GPU is touched.
   if [[ $(id -u) == 0 ]]; then journalctl --sync 2>/dev/null || true; fi
@@ -495,16 +520,22 @@ main() {
   grep -q '^reached_gpu=yes' "$out" && stage="reached-gpu"
   grep -q '^first_submit_ms=' "$out" && stage="submitted"
   grep -q '^loop_ms=' "$out" && stage="finished"
-  {
+  # The result goes to the journal first (a second, independent source collect reads: it names the
+  # record), then to the record, durably. A failed record write is an error, never silent.
+  log "result: $result (exit $rc, $elapsed ms, ${submits:-0} submissions) stage $stage record $rec"
+  if ! {
     header
     printf '%s\n' "reached_gpu=${reached:-no}" "result=$result" "stage=$stage" "exit=$rc" \
       "elapsed_ms=$elapsed" "submits=${submits:-0}" "first_submit_ms=${first:--}" \
       "device=${device:--}" "error=${err:-}"
     echo "--- job output"
     head -c 16384 "$out"
-  } | write_record
+  } | write_record; then
+    record_error "after the job ($result)"
+    say "$result (exit $rc), but the record was not saved; the journal line above has the result."
+    exit 9
+  fi
   rm -f "$out"
-  log "result: $result (exit $rc, $elapsed ms, ${submits:-0} submissions)"
   say "$result (exit $rc, $((elapsed / 1000)).$(((elapsed % 1000) / 100)) s, ${submits:-0} submissions, first in ${first:--} ms, device ${device:--})${err:+: $err}. Record: $rec"
   exit "$rc"
 }

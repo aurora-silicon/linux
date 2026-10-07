@@ -445,9 +445,9 @@ M3_AIR_DRY_RUN_SWITCHES="chosen.asahi,t8122-gpu-diag=1 chosen.asahi,t8122-gpu-ha
 M3_GPU_EXPERIMENT=0
 M3_GPU_BIN=/usr/local/bin
 M3_GPU_SCRIPTS=(
-  "air-gpu-oneshot.sh a0c1361037f5e92d95dd8872166313421814c07e9c9491125bcf0f6309da8b14"
-  "air-gpu-collect.sh a9a11f291a46d84621b237c7b9ce99402c00ef6b07d48bf4f6f7d51fb5b77996"
-  "air-gpu-job.sh fbdc109ffe6563157dd1015c0e8e2b2cf9c1f6c9a06e01aeff3a128557d09698"
+  "air-gpu-oneshot.sh 7d91614ea302e0df1c5d1f3337ab418e35cf312d5c1ad0e4fb54a002a96e7f6d"
+  "air-gpu-collect.sh 86a3e2f87729949cb8590e3678626f9b4e233a1a27af77f77536ddbc22b72624"
+  "air-gpu-job.sh 41106491a5069f11a714991acada9472f2936f48e3a7bcdbbb6660fe8f69987d"
 )
 # PLACEHOLDER until the G15G Mesa build exists: its prefix package as "file sha256" (a pacman
 # package that installs Mesa into a prefix of its own, never over the system Mesa), and that

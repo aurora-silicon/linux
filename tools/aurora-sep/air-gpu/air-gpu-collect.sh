@@ -20,9 +20,20 @@
 #   INITDATA-REJECTED    the firmware came up but did not accept the InitData
 #   FW-RUNNING           the firmware accepted the InitData and runs; no GPU job ran
 #   FW-CRASHED           the firmware ran, then crashed or a post-boot/cap check failed
-#   JOB-NOT-DISPATCHED   a GPU job ran and did not complete correctly (or got stuck/killed)
+#   JOB-NOT-DISPATCHED   a GPU job was never dispatched: the kernel read its GPU start timestamp as 0
+#   JOB-FAILED           a GPU job failed: dispatched or not unknown, or dispatched and not completed
+#                        (stuck, killed, timed out, faulted, wrong results)
+#   JOB-NO-RESULT        a GPU job started but no result was recorded (the boot ended first, or
+#                        it is still running)
 #   JOB-COMPLETED        air-gpu-job.sh ran, and every submission completed with correct results
 #   UNKNOWN              a kernel verdict this script does not recognise
+#
+# The line also names the source that decided it: the command line, the arming record, the
+# kernel's verdict line, the kernel log's structure, or the job evidence. Job evidence comes from
+# two sources read the same way in every pass: the air-gpu-job record files and the journal's
+# air-gpu-job lines for that boot. A record left at result=running whose journal line has the
+# result is judged by the journal, so the same boot gets the same verdict before and after a
+# hard reset.
 set -euo pipefail
 
 # ---- the verdict table: the kernel log lines each step is judged by --------------------------
@@ -33,7 +44,10 @@ set -euo pipefail
 #    t8122_start.rs; impl-k1-t8122-start.md "Verdict strings for the S1 collect script"). Each
 #    label has a rank: the highest-ranked label present decides, so a job failure outranks
 #    job-completed, and a crash/cap/check failure (FW-CRASHED) outranks firmware-running. The
-#    match is on the label up to the first ':' or '('.
+#    match is on the label up to the first ':' or '('. Among equal ranks the later line wins.
+#    JOB-NOT-DISPATCHED is kept for the two labels K1 logs only when the job's GPU start
+#    timestamp is 0 (or unreadable: a line reading "timestamp None" becomes JOB-FAILED); a job
+#    the kernel saw dispatched (job-ran-completion-missed) is never JOB-NOT-DISPATCHED.
 #   label                           verdict             rank
 K1_VERDICTS='
 firmware-boot-failed            FW-BOOT-FAILED      30
@@ -43,13 +57,13 @@ device-control-failed           INITDATA-REJECTED   30
 initdata-rejected               INITDATA-REJECTED   30
 cap-violated                    FW-CRASHED          40
 firmware-running-check-failed   FW-CRASHED          40
-job-faulted                     JOB-NOT-DISPATCHED  50
 job-accepted-never-dispatched   JOB-NOT-DISPATCHED  50
 job-timed-out-powered           JOB-NOT-DISPATCHED  50
-job-timed-out                   JOB-NOT-DISPATCHED  50
-job-ran-completion-missed       JOB-NOT-DISPATCHED  50
-job-retired-without-timestamps  JOB-NOT-DISPATCHED  50
-job-failed-before-wait          JOB-NOT-DISPATCHED  50
+job-timed-out                   JOB-FAILED          50
+job-ran-completion-missed       JOB-FAILED          50
+job-faulted                     JOB-FAILED          50
+job-retired-without-timestamps  JOB-FAILED          50
+job-failed-before-wait          JOB-FAILED          50
 firmware-running                FW-RUNNING          10
 job-completed                   JOB-COMPLETED       20
 '
@@ -77,7 +91,9 @@ RE_INITDATA_SENT='M3: publishing owned initdata'
 RE_INITDATA_OK='M3: firmware accepted owned initdata'
 # The firmware's readiness report (the reason when the InitData was not accepted).
 RE_READINESS='M3 firmware readiness:|M3 firmware error event'
-# The kernel saw a GPU job fail or never run.
+# The kernel saw a GPU job fail. "GPU is powered down" at a failed job is the not-dispatched
+# signature (P3-8); the other lines say the job failed without saying whether it was dispatched.
+RE_JOB_NOT_DISPATCHED='GPU is powered down'
 RE_JOB_FAILED='M3 scheduler: execution failed|M3 completion events=|GPU is powered down|M3 fault render|M3 bank [0-9]+ fault=0x[0-9a-f]*[1-9a-f]|M3 fault mapping'
 #
 # The GPU lines kept in gpu-log.txt, and the firmware's own log lines in firmware-log.txt.
@@ -136,93 +152,186 @@ knobs_of() { tr ' ' '\n' <<<"$1" | grep '^asahi\.' | tr '\n' ' ' | sed 's/ $//';
 
 # The kernel log of a boot, oldest first: this boot's from the journal when the journal has its
 # start, otherwise dmesg; an earlier boot's from the journal.
-kernel_log() {
+# The journal is preferred for every boot (the same source in every pass); dmesg is the fallback
+# only for this boot when the journal lacks its start. KLOG_SRC names the source used.
+KLOG_SRC=""
+kernel_log() { # boot index, output file
   local j
+  KLOG_SRC=journal
   if [[ $1 == 0 ]]; then
     j=$(journalctl -k -b 0 -o short-monotonic --no-pager 2>/dev/null || true)
-    if grep -qaE 'Kernel command line:|Linux version' <<<"$j"; then printf '%s\n' "$j"; return; fi
-    dmesg 2>/dev/null || true
+    if grep -qaE 'Kernel command line:|Linux version' <<<"$j"; then printf '%s\n' "$j" >"$2"; return 0; fi
+    KLOG_SRC=dmesg
+    { dmesg 2>/dev/null || true; } >"$2"
     return 0
   fi
-  journalctl -k -b "$1" -o short-monotonic --no-pager 2>/dev/null || true
+  { journalctl -k -b "$1" -o short-monotonic --no-pager 2>/dev/null || true; } >"$2"
 }
 
-# The analysed boot's job records (air-gpu-job.sh), oldest first.
-job_records() { # boot_id home
-  local f
-  [[ -n $1 && -d $2/air-gpu-runs ]] || return 0
-  for f in "$2"/air-gpu-runs/job-*.txt; do
-    [[ -f $f ]] && grep -qx "boot_id=$1" "$f" && echo "$f"
+# ---- job evidence ----------------------------------------------------------------------------
+# Two sources, read the same way in every pass, reconciled per job (keyed by the record path):
+#   - the record files whose boot_id is the analysed boot's (the user's home, and every home under
+#     EXTRA_HOMES, so a root-shell run still finds the desktop user's; symlinks are skipped);
+#   - the journal's air-gpu-job lines for that boot: "start: ... record <path>" and
+#     "result: <result> (...) stage <stage> record <path>". An older result line without
+#     "record" is paired with the earliest start that has no result yet.
+EXTRA_HOMES="/root /home/*"
+JOB_HOME=""
+job_record_files() { # boot_id
+  local bid=$1 h f
+  [[ -n $bid ]] || return 0
+  # shellcheck disable=SC2086 # EXTRA_HOMES is a list of globs
+  for h in "$JOB_HOME" $EXTRA_HOMES; do
+    [[ -n $h && -d $h/air-gpu-runs && ! -L $h/air-gpu-runs ]] || continue
+    for f in "$h"/air-gpu-runs/job-*.txt; do
+      [[ -f $f && ! -L $f ]] || continue
+      grep -qx "boot_id=$bid" "$f" 2>/dev/null && echo "$f"
+    done
+  done | awk '!seen[$0]++'
+  return 0
+}
+journal_job_lines() { # boot id (or index)
+  journalctl -b "$1" -t air-gpu-job -o cat --no-pager 2>/dev/null || true
+}
+rec_key() { [[ -f $1 ]] || return 0; sed -n "s/^$2=//p" "$1" | head -1; }
+
+# Prints one line per job of the boot: "<result><TAB><source><TAB><record path>".
+#   result: the record's when it holds a final one (not "running"); else the journal's result for
+#           that record; else "running" (the job started and no result was recorded). When both
+#           hold a final result they must agree, or the result is "conflict".
+#   source: record, journal, record+journal, or "journal (record left at running)".
+job_evidence() { # boot_id boot_index
+  local bid=$1 idx=$2 line path r rr jj res src p
+  local -A rec_r=() jr_r=() known=()
+  local -a order=() pending=() np=()
+  while IFS= read -r line; do
+    case $line in
+      "start: "*" record "*)
+        path=${line##* record }
+        if [[ -z ${known[$path]:-} ]]; then known[$path]=1; order+=("$path"); fi
+        pending+=("$path")
+        ;;
+      "result: "*)
+        r=${line#result: }
+        r=${r%% *}
+        if [[ $line == *" record "* ]]; then path=${line##* record }
+        elif ((${#pending[@]})); then path=${pending[0]}
+        else continue; fi
+        jr_r[$path]=$r
+        if [[ -z ${known[$path]:-} ]]; then known[$path]=1; order+=("$path"); fi
+        np=()
+        for p in ${pending[@]+"${pending[@]}"}; do [[ $p == "$path" ]] || np+=("$p"); done
+        pending=(${np[@]+"${np[@]}"})
+        ;;
+    esac
+  done < <(journal_job_lines "${bid:-$idx}")
+  while IFS= read -r path; do
+    rec_r[$path]=$(rec_key "$path" result)
+    if [[ -z ${known[$path]:-} ]]; then known[$path]=1; order+=("$path"); fi
+  done < <(job_record_files "$bid")
+  for path in ${order[@]+"${order[@]}"}; do
+    rr=${rec_r[$path]:-} jj=${jr_r[$path]:-}
+    if [[ -n $rr && $rr != running ]]; then
+      res=$rr src=record
+      if [[ -n $jj ]]; then
+        src=record+journal
+        [[ $jj == "$rr" ]] || res=conflict
+      fi
+    elif [[ -n $jj ]]; then
+      res=$jj src=journal
+      [[ -z $rr ]] || src="journal (record left at running)"
+    else
+      res=running
+      if [[ -n $rr ]]; then src=record; else src=journal; fi
+    fi
+    printf '%s\t%s\t%s\n' "$res" "$src" "$path"
   done
   return 0
 }
-rec_key() { sed -n "s/^$2=//p" "$1" | head -1; }
 
 # ---- the verdict -----------------------------------------------------------------------------
 
-VERDICT="" REASON=""
-# The job records of the analysed boot, folded into one state so the verdict never rests on a
-# single record (A16). Set by job_aggregate, read by classify.
-#   JOB_STATE: pass (>=1 pass, 0 fail) | fail (>=1 fail) | not-reached | none
-#   JOB_DETAIL: a short reason for the chosen state
-JOB_STATE=none JOB_DETAIL=""
+VERDICT="" REASON="" VERDICT_SRC=""
+# The jobs of the analysed boot, folded into one state so the verdict never rests on one record
+# (A16). Set by job_aggregate from job_evidence's lines, read by classify.
+#   JOB_STATE: fail (>=1 failed) | no-result (>=1 started, no result) | pass (>=1 passed) |
+#              not-reached | none, in that order of precedence
+#   JOB_DETAIL: a short reason; JOB_SRC: the source of the deciding job(s)
+JOB_STATE=none JOB_DETAIL="" JOB_SRC=""
 
-# The outcome of one job record (A3): the result alone decides, never reached_gpu. Only
-# no-render-node/no-device mean the job never reached the GPU; stuck, killed, device-lost,
-# fence-timeout, stalled, wrong-result, running and anything else are failures.
-job_outcome() { # record -> echoes pass | fail | not-reached
-  local r
-  r=$(rec_key "$1" result)
-  case $r in
+# One job's result (A3): the result alone decides. Only no-render-node and no-device mean the job
+# never reached the GPU; running means no result was recorded; anything else (stuck, killed,
+# device-lost, fence-timeout, stalled, wrong-result, error, conflict) is a failure.
+job_outcome() { # result -> pass | fail | no-result | not-reached
+  case $1 in
     pass) echo pass ;;
     no-render-node | no-device) echo not-reached ;;
+    running) echo no-result ;;
     *) echo fail ;;
   esac
 }
 
-# Fold every record of the boot (oldest first). Any failure makes the whole state fail (A16).
-job_aggregate() { # record paths...
-  local f o npass=0 nfail=0 nreach=0 n=0 failrec="" passrec="" reachrec=""
-  JOB_STATE=none JOB_DETAIL=""
-  for f in "$@"; do
-    [[ -f $f ]] || continue
+job_aggregate() { # evidence file ("result<TAB>source<TAB>path" lines)
+  local r src path o n=0 npass=0 nfail=0 nnores=0 nreach=0 failp="" fails="" failr="" passp="" passs=""
+  local noresp="" noress="" reachr="" first device stage err
+  JOB_STATE=none JOB_DETAIL="" JOB_SRC=""
+  while IFS=$'\t' read -r r src path; do
+    [[ -n $r ]] || continue
     n=$((n + 1))
-    o=$(job_outcome "$f")
+    o=$(job_outcome "$r")
     case $o in
-      pass) npass=$((npass + 1)); passrec=$f ;;
-      fail) nfail=$((nfail + 1)); failrec=${failrec:-$f} ;;
-      not-reached) nreach=$((nreach + 1)); reachrec=$f ;;
+      pass) npass=$((npass + 1)); passp=$path passs=$src ;;
+      fail) nfail=$((nfail + 1)); if [[ -z $failp ]]; then failp=$path fails=$src failr=$r; fi ;;
+      no-result) nnores=$((nnores + 1)); if [[ -z $noresp ]]; then noresp=$path noress=$src; fi ;;
+      not-reached) nreach=$((nreach + 1)); reachr=$r ;;
     esac
-  done
+  done <"${1:-/dev/null}"
   if ((nfail > 0)); then
-    JOB_STATE=fail
-    JOB_DETAIL="air-gpu-job: $(rec_key "$failrec" result): $(rec_key "$failrec" error) (stage $(rec_key "$failrec" stage); $npass of $n runs passed)"
+    JOB_STATE=fail JOB_SRC=$fails
+    err=$(rec_key "$failp" error) stage=$(rec_key "$failp" stage)
+    JOB_DETAIL="air-gpu-job: $failr${err:+: $err}${stage:+ (stage $stage)}; $npass of $n runs passed"
+  elif ((nnores > 0)); then
+    JOB_STATE=no-result JOB_SRC=$noress
+    JOB_DETAIL="air-gpu-job started (${noresp##*/}) but no result was recorded: the boot ended first, or the job is still running; $npass of $n runs passed"
   elif ((npass > 0)); then
-    JOB_STATE=pass
-    JOB_DETAIL="air-gpu-job: $npass of $n runs completed with correct results (first in $(rec_key "$passrec" first_submit_ms) ms) on $(rec_key "$passrec" device)"
+    JOB_STATE=pass JOB_SRC=$passs
+    first=$(rec_key "$passp" first_submit_ms) device=$(rec_key "$passp" device)
+    JOB_DETAIL="air-gpu-job: $npass of $n runs completed with correct results${first:+ (first in $first ms)}${device:+ on $device}"
   elif ((nreach > 0)); then
-    JOB_STATE=not-reached
-    JOB_DETAIL="air-gpu-job: the job did not reach the GPU ($(rec_key "$reachrec" result))"
-  else
-    JOB_STATE=none
+    JOB_STATE=not-reached JOB_SRC=record
+    JOB_DETAIL="air-gpu-job: the job did not reach the GPU ($reachr)"
   fi
+  return 0
 }
 
-# classify LOG CMDLINE  (JOB_STATE/JOB_DETAIL set by job_aggregate beforehand). It decides the
-# verdict, then applies the A2 crash override to both the kernel-line and the structural paths.
+# Sets VERDICT/REASON/VERDICT_SRC from the job state, for a boot whose firmware accepted the
+# InitData. Returns 1 when there is no job evidence (the caller keeps its own verdict).
+job_verdict() {
+  case $JOB_STATE in
+    fail) VERDICT=JOB-FAILED REASON=$JOB_DETAIL VERDICT_SRC="job $JOB_SRC" ;;
+    no-result) VERDICT=JOB-NO-RESULT REASON=$JOB_DETAIL VERDICT_SRC="job $JOB_SRC" ;;
+    pass) VERDICT=JOB-COMPLETED REASON=$JOB_DETAIL VERDICT_SRC="job $JOB_SRC" ;;
+    *) return 1 ;;
+  esac
+}
+
+# classify LOG CMDLINE  (JOB_STATE set by job_aggregate beforehand). It decides the verdict, then
+# applies the A2 crash override to both the kernel-line and the structural paths.
 classify() { classify_core "$@"; crash_override "$1"; }
 classify_core() {
-  local log=$1 cmd=$2 accept_ln crash_ln line
+  local log=$1 cmd=$2 accept_ln line
   first_ln() { { grep -naE "$1" "$log" || true; } | head -1 | cut -d: -f1; }
   last_line() { { grep -aE "$1" "$log" || true; } | tail -1 | sed -E 's/^\[[^]]*\] *//; s/^[^ ]+ kernel: //'; }
   if ! [[ " $cmd " =~ $RE_ARMED ]]; then
-    VERDICT=NOT-ARMED REASON="asahi.t8122_start=1 is not on the analysed boot's command line"
+    VERDICT=NOT-ARMED VERDICT_SRC=cmdline
+    REASON="asahi.t8122_start=1 is not on the analysed boot's command line"
     return 0
   fi
   if grep -qaE "$RE_K1_VERDICT" "$log"; then
     classify_k1 "$log"
     return 0
   fi
+  VERDICT_SRC=kernel-log
   if ! grep -qaE "$RE_FW_STARTED" "$log"; then
     VERDICT=ARMED-NOT-STARTED
     if line=$(last_line "$RE_REFUSED") && [[ -n $line ]]; then REASON=$line
@@ -232,10 +341,9 @@ classify_core() {
     else REASON="the driver stopped before it started the GPU firmware"; fi
     return 0
   fi
-  crash_ln=$(first_ln "$RE_FW_CRASH")
   if ! grep -qaE "$RE_INITDATA_SENT" "$log"; then
     VERDICT=FW-BOOT-FAILED
-    if [[ -n $crash_ln ]]; then REASON=$(last_line "$RE_FW_CRASH")
+    if line=$(last_line "$RE_FW_CRASH") && [[ -n $line ]]; then REASON=$line
     elif line=$(last_line "$RE_PROBE_FAILED") && [[ -n $line ]]; then REASON="the firmware did not come up: $line"
     else REASON="the firmware was started but never took the InitData"; fi
     return 0
@@ -243,98 +351,95 @@ classify_core() {
   accept_ln=$(first_ln "$RE_INITDATA_OK")
   if [[ -z $accept_ln ]]; then
     VERDICT=INITDATA-REJECTED
-    if [[ -n $crash_ln ]]; then REASON="the firmware crashed after taking the InitData: $(last_line "$RE_FW_CRASH")"
+    if line=$(last_line "$RE_FW_CRASH") && [[ -n $line ]]; then REASON="the firmware crashed after taking the InitData: $line"
     elif line=$(last_line "$RE_READINESS") && [[ -n $line ]]; then REASON=$line
     else REASON="the InitData was sent but the firmware never accepted it"; fi
     return 0
   fi
-  # The firmware accepted the InitData.
-  crash_ln=$({ grep -naE "$RE_FW_CRASH" "$log" || true; } | awk -F: -v a="$accept_ln" '$1 > a { print $1; exit }')
-  if [[ -n $crash_ln && $JOB_STATE != pass && $JOB_STATE != fail ]]; then
-    VERDICT=FW-CRASHED REASON="the firmware accepted the InitData, then crashed: $(last_line "$RE_FW_CRASH")"
+  # The firmware accepted the InitData. The kernel's not-dispatched signature, a failed job, a
+  # kernel job-failure line, a job with no result, a passed job, in that order.
+  if line=$(last_line "$RE_JOB_NOT_DISPATCHED") && [[ -n $line ]]; then
+    VERDICT=JOB-NOT-DISPATCHED REASON="$line${JOB_DETAIL:+; $JOB_DETAIL}"
     return 0
   fi
-  # A job failure line, or a job record that failed or got stuck (A3), overrides a clean run.
   if [[ $JOB_STATE == fail ]]; then
-    VERDICT=JOB-NOT-DISPATCHED
-    if line=$(last_line "$RE_JOB_FAILED") && [[ -n $line ]]; then REASON="$line; $JOB_DETAIL"
-    else REASON=$JOB_DETAIL; fi
+    job_verdict
+    if line=$(last_line "$RE_JOB_FAILED") && [[ -n $line ]]; then REASON="$line; $REASON"; fi
     return 0
   fi
-  if grep -qaE "$RE_JOB_FAILED" "$log"; then
-    VERDICT=JOB-NOT-DISPATCHED REASON=$(last_line "$RE_JOB_FAILED")
+  if line=$(last_line "$RE_JOB_FAILED") && [[ -n $line ]]; then
+    VERDICT=JOB-FAILED REASON="$line${JOB_DETAIL:+; $JOB_DETAIL}"
     return 0
   fi
-  if [[ $JOB_STATE == pass ]]; then
-    VERDICT=JOB-COMPLETED REASON=$JOB_DETAIL
-    return 0
-  fi
+  job_verdict && return 0
   VERDICT=FW-RUNNING
   if [[ $JOB_STATE == not-reached ]]; then REASON="the firmware accepted the InitData and runs; $JOB_DETAIL"
   else REASON="the firmware accepted the InitData and runs; no GPU job ran in this boot"; fi
 }
 
-# The kernel's own verdict lines decide. The highest-ranked label present wins (so a failure
-# beats job-completed, a crash/cap/check beats firmware-running). JOB_STATE then gates the two
-# success verdicts (A4/A16).
+# The kernel's own verdict lines decide. The highest-ranked label present wins (a job outcome
+# beats a crash/cap/check, which beats a firmware outcome, which beats firmware-running); among
+# equal ranks the later line wins. JOB_STATE then gates job-completed and firmware-running
+# (A4/A16): the kernel's line alone never gives JOB-COMPLETED.
 classify_k1() { # LOG
-  local log=$1 outcomes o v rank best="" bestrank=-1 bestv=""
+  local log=$1 o v rank best="" bestrank=-1 bestv=""
   k1_line() { { grep -aE "M3 G15G verdict: $1" "$log" || true; } | tail -1 | sed -E 's/^.*(M3 G15G verdict: )/\1/'; }
-  outcomes=$({ grep -aoE "$RE_K1_VERDICT" "$log" || true; } | sed 's/^M3 G15G verdict: //' | sort -u)
-  for o in $outcomes; do
+  VERDICT_SRC=kernel-verdict
+  while IFS= read -r o; do
     v="" rank=""
     # An unknown label gives no awk output, so read hits EOF; || true keeps set -e from aborting.
     read -r v rank < <(printf '%s\n' "$K1_VERDICTS" | awk -v o="$o" '$1 == o { print $2, $3 }') || true
     [[ -n $v ]] || continue
-    if ((rank > bestrank)); then bestrank=$rank best=$o bestv=$v; fi
-  done
+    if ((rank >= bestrank)); then bestrank=$rank best=$o bestv=$v; fi
+  done < <({ grep -aoE "$RE_K1_VERDICT" "$log" || true; } | sed 's/^M3 G15G verdict: //')
   if [[ -z $bestv ]]; then
     VERDICT=UNKNOWN REASON="a kernel verdict this script does not recognise: $({ grep -aoE "$RE_K1_VERDICT.*" "$log" || true; } | tail -1)"
     return 0
   fi
   case $bestv in
     JOB-COMPLETED)
-      # The kernel's line alone is not enough: a passing air-gpu-job record from this boot is
-      # required, and any failed record keeps it from being JOB-COMPLETED (A4/A16).
       if [[ $JOB_STATE == pass ]]; then
-        VERDICT=JOB-COMPLETED REASON="$(k1_line job-completed); $JOB_DETAIL"
-      elif [[ $JOB_STATE == fail ]]; then
-        VERDICT=JOB-NOT-DISPATCHED REASON="$JOB_DETAIL (the kernel logged: $(k1_line job-completed))"
+        job_verdict
+        REASON="$(k1_line job-completed); $JOB_DETAIL" VERDICT_SRC="kernel-verdict + job $JOB_SRC"
+      elif job_verdict; then
+        REASON="$JOB_DETAIL (the kernel logged: $(k1_line job-completed))"
       else
-        VERDICT=FW-RUNNING REASON="a job retired (kernel: $(k1_line job-completed)), but no air-gpu-job record checked its results on the CPU${JOB_STATE:+; $JOB_DETAIL}"
+        VERDICT=FW-RUNNING
+        REASON="a job retired (kernel: $(k1_line job-completed)), but no air-gpu-job record checked its results on the CPU${JOB_DETAIL:+; $JOB_DETAIL}"
       fi
       ;;
     FW-RUNNING)
-      # firmware-running, no job verdict from the kernel: let a job record decide if there is one.
-      if [[ $JOB_STATE == pass ]]; then
-        VERDICT=JOB-COMPLETED REASON="$JOB_DETAIL (no job-completed line from the kernel)"
-      elif [[ $JOB_STATE == fail ]]; then
-        VERDICT=JOB-NOT-DISPATCHED REASON=$JOB_DETAIL
-      elif [[ $JOB_STATE == not-reached ]]; then
-        VERDICT=FW-RUNNING REASON="$(k1_line firmware-running); $JOB_DETAIL"
-      else
-        VERDICT=FW-RUNNING REASON=$(k1_line firmware-running)
+      if ! job_verdict; then
+        VERDICT=FW-RUNNING REASON="$(k1_line firmware-running)${JOB_DETAIL:+; $JOB_DETAIL}"
       fi
+      ;;
+    JOB-NOT-DISPATCHED)
+      VERDICT=JOB-NOT-DISPATCHED REASON=$(k1_line "$best")
+      # The not-dispatched labels need a GPU start timestamp of 0; an unreadable one proves nothing.
+      [[ $REASON != *"timestamp None"* ]] || VERDICT=JOB-FAILED
+      REASON+="${JOB_DETAIL:+; $JOB_DETAIL}"
       ;;
     *)
       VERDICT=$bestv REASON=$(k1_line "$best")
+      if [[ $bestv == JOB-FAILED && -n $JOB_DETAIL ]]; then REASON+="; $JOB_DETAIL"; fi
       ;;
   esac
   return 0
 }
 
-# A2: after the kernel's verdict lines, a crash, fault or RTKit-crash line still overrides a
-# firmware-running or job-completed verdict; the firmware did not run cleanly.
+# A2: a crash, fault or RTKit-crash line still overrides a firmware-running, job-completed or
+# job-no-result verdict; the firmware did not run cleanly.
 crash_override() { # LOG
   local log=$1 line
-  case $VERDICT in FW-RUNNING | JOB-COMPLETED) ;; *) return 0 ;; esac
+  case $VERDICT in FW-RUNNING | JOB-COMPLETED | JOB-NO-RESULT) ;; *) return 0 ;; esac
   grep -qaE "$RE_FW_CRASH" "$log" || return 0
   line=$({ grep -aE "$RE_FW_CRASH" "$log" || true; } | tail -1 | sed -E 's/^\[[^]]*\] *//; s/^[^ ]+ kernel: //')
-  if [[ $VERDICT == JOB-COMPLETED ]]; then
-    VERDICT=FW-CRASHED REASON="a job completed, then the firmware crashed or faulted: $line (earlier: ${REASON})"
-  else
-    VERDICT=FW-CRASHED REASON="the firmware ran, then crashed or faulted: $line"
-  fi
+  case $VERDICT in
+    JOB-COMPLETED) REASON="a job completed, then the firmware crashed or faulted: $line (earlier: ${REASON})" ;;
+    JOB-NO-RESULT) REASON="the firmware crashed or faulted while a job had no result: $line (${REASON})" ;;
+    *) REASON="the firmware ran, then crashed or faulted: $line" ;;
+  esac
+  VERDICT=FW-CRASHED VERDICT_SRC="kernel-log (crash line)"
 }
 
 # ---- collection ------------------------------------------------------------------------------
@@ -385,7 +490,7 @@ main() {
       elif [[ -z $(oneshot_var) ]]; then
         # The one-shot was consumed (Limine cleared it) but no boot carries the id: the armed
         # boot ran and left no journal, the signature of a hang in the GPU start.
-        boot=0 VERDICT=ARMED-NO-LOG
+        boot=0 VERDICT=ARMED-NO-LOG VERDICT_SRC=arming-record
         REASON="the armed boot (oneshot $armed_id) left no kernel log, most likely a hang in the GPU start before the journal was written; no older boot's result is shown"
       else
         # Still armed, not booted yet: the tester ran this before rebooting.
@@ -403,6 +508,7 @@ main() {
   [[ -z $id && -n $armed_id && $VERDICT == ARMED-NO-LOG ]] && id=$armed_id
   user=${SUDO_USER:-root}
   home=$(user_home "$user")
+  JOB_HOME=$home
   board=$(tr '\0' '\n' <"$DT/compatible" 2>/dev/null | sed -n 's/^apple,\(j[0-9a-z]*\)$/\1/p' | head -1)
   out=$home/air-gpu-collect-${board:-mac}-$(date +%Y%m%d-%H%M%S)
   dir=$(mktemp -d)
@@ -412,16 +518,19 @@ main() {
 
   # The analysed boot's kernel log, and this boot's dmesg.
   log=$d/kernel-log-boot$boot.txt
-  kernel_log "$boot" | scrub >"$log"
+  kernel_log "$boot" "$dir/klog.raw"
+  scrub <"$dir/klog.raw" >"$log"
   if [[ $boot != 0 ]]; then dmesg 2>/dev/null | scrub >"$d/dmesg-boot0.txt" || true; fi
   grep -aiE "$RE_GPU_LINES" "$log" >"$d/gpu-log.txt" || true
   grep -aE "$RE_FW_LOG" "$log" >"$d/firmware-log.txt" || true
 
-  # The analysed boot's job records, folded into JOB_STATE across all of them (A16).
+  # The analysed boot's jobs, from the record files and the journal, folded into JOB_STATE (A16).
   mkdir -p "$d/jobs"
-  mapfile -t recs < <(job_records "$b" "$home")
-  for f in "${recs[@]}"; do cp "$f" "$d/jobs/"; done
-  job_aggregate "${recs[@]}"
+  job_evidence "$b" "$boot" >"$d/jobs/evidence.tsv"
+  journal_job_lines "${b:-$boot}" >"$d/jobs/journal.txt"
+  mapfile -t recs < <(job_record_files "$b")
+  for f in ${recs[@]+"${recs[@]}"}; do head -c 65536 "$f" >"$d/jobs/${f##*/}"; done
+  job_aggregate "$d/jobs/evidence.tsv"
 
   # Judged without the command-line line, which names the knobs. ARMED-NO-LOG was already set.
   if [[ $VERDICT != ARMED-NO-LOG ]]; then
@@ -508,12 +617,12 @@ main() {
   live=$(awk '$2 ~ /^Tg/ && $6 + 0 >= 10000' "$d/smc-keys.txt" | wc -l)
   rails=$(for k in $GPU_RAIL_CANDIDATES; do awk -v k="$k" '$2 == k { printf "%s=%s ", k, $6 }' "$d/smc-keys.txt"; done)
   {
-    echo "AIR-GPU VERDICT: $VERDICT | boot $boot | oneshot ${id:-none} | $REASON"
+    echo "AIR-GPU VERDICT: $VERDICT | boot $boot | oneshot ${id:-none} | source: ${VERDICT_SRC:-?} | $REASON"
     echo "knobs: $(knobs_of "$cmd")"
     echo "kernel armed with: $({ grep -aoE "$RE_K1_ARMED.*" "$log" || true; } | tail -1 | sed -n 's/^.*admitted): //p')"
     echo "render node: $n"
     echo "SMC (this boot): $live of $n_tg Tg* keys read 10 C or more; GPU rail candidates (mW): ${rails:-none found}"
-    echo "job records: ${#recs[@]} (state: $JOB_STATE)"
+    echo "jobs: $(awk 'NF' "$d/jobs/evidence.tsv" | wc -l) (record files ${#recs[@]}, state $JOB_STATE${JOB_SRC:+, from $JOB_SRC}); kernel log from the $KLOG_SRC"
   } >"$d/summary.txt"
 
   # Build the tgz in the work dir (root-owned temp), then copy it out as the user (A13).
@@ -528,11 +637,15 @@ main() {
   pub=$(mktemp --tmpdir "air-gpu-collect.XXXXXX.tgz")
   cp -f "$dir/out.tgz" "$pub"
   chmod 0644 "$pub"
-  if runu cp -f "$pub" "$out.tgz" 2>/dev/null; then
+  # Durable before this returns (fsync the tgz and its directory): a hard reset right after must
+  # not lose it.
+  # shellcheck disable=SC2016 # $1..$3 are expanded by that sh
+  if runu sh -c 'cp -f -- "$1" "$2" && sync -- "$2" && sync -- "$3"' _ "$pub" "$out.tgz" "$home" 2>/dev/null; then
     say "wrote $out.tgz"
   else
     # The user's home was not writable (a symlink, say); keep the tgz where root can reach it.
     cp -f "$pub" "/tmp/$base.tgz"
+    sync "/tmp/$base.tgz" 2>/dev/null || true
     out=/tmp/$base
     say "wrote $out.tgz (could not write $user's home)"
   fi

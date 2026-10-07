@@ -241,6 +241,22 @@ class OneShotTest(unittest.TestCase):
         self.assertIn("removed the air-gpu-oneshot entry", proc.stdout)
         self.assertEqual(self.mac.conf.read_bytes(), before)
 
+    def test_disarm_keeps_the_arming_record_after_the_boot(self):
+        # After the armed boot ran (Limine consumed the one-shot), --disarm removes the entry but
+        # keeps /var/lib/air-gpu/armed, so a later collect still judges that boot by its id.
+        self.oneshot("start", check=True)
+        armed = (self.mac.state / "armed").read_text()
+        self.mac.limine_boots()
+        self.oneshot("--disarm", check=True)
+        self.assertEqual((self.mac.state / "armed").read_text(), armed)
+        self.assertFalse((self.mac.state / "armed.cancelled").exists())
+
+    def test_disarm_before_the_boot_cancels_the_arming_record(self):
+        self.oneshot("start", check=True)
+        self.oneshot("--disarm", check=True)
+        self.assertFalse((self.mac.state / "armed").exists())
+        self.assertTrue((self.mac.state / "armed.cancelled").exists())
+
     def test_disarm_before_the_boot(self):
         before = self.mac.conf.read_bytes()
         store = self.mac.varfile.read_bytes()
@@ -465,18 +481,24 @@ class CollectVerdictTest(unittest.TestCase):
     def setUp(self):
         self.mac = FakeMac(self)
 
-    def verdict(self, log, cmd=ARMED, recs=()):
-        # Write each job record, fold them with job_aggregate, then classify (A16: all records).
+    def verdict(self, log, cmd=ARMED, recs=(), evidence=None, with_src=False):
+        # Write each job record and one evidence line per record ("result<TAB>record<TAB>path"),
+        # or take explicit evidence lines; fold them with job_aggregate (A16), then classify.
         logf = self.mac.tmp / "log.txt"
         logf.write_text(log)
-        paths = []
+        lines = []
         for i, r in enumerate(recs):
             p = self.mac.tmp / f"rec{i}.txt"
             p.write_text(r)
-            paths.append(str(p))
-        agg = "job_aggregate " + " ".join(f"'{p}'" for p in paths)
-        proc = self.mac.run(COLLECT, f"{agg}\nclassify '{logf}' '{cmd}'\necho \"$VERDICT|$REASON\"", check=True)
-        return proc.stdout.strip().split("|", 1)
+            result = re.search(r"^result=(.*)$", r, re.M).group(1)
+            lines.append(f"{result}\trecord\t{p}")
+        lines += list(evidence or ())
+        ev = self.mac.tmp / "evidence.tsv"
+        ev.write_text("".join(l + "\n" for l in lines))
+        proc = self.mac.run(COLLECT, f"job_aggregate '{ev}'\nclassify '{logf}' '{cmd}'\n"
+                            "echo \"$VERDICT|$VERDICT_SRC|$REASON\"", check=True)
+        verdict, src, reason = proc.stdout.strip().split("|", 2)
+        return (verdict, reason, src) if with_src else (verdict, reason)
 
     def test_the_kernels_verdict_lines(self):
         done = k1("job-completed", ": the first compute job finished")
@@ -488,12 +510,13 @@ class CollectVerdictTest(unittest.TestCase):
             (RUNNING + k1("job-accepted-never-dispatched", ": start timestamp 0x0"),
              (rec("fence-timeout"),), "JOB-NOT-DISPATCHED", "job-accepted-never-dispatched"),
             # A failure line outranks a completed line (both present).
-            (RUNNING + done + k1("job-faulted", " (EIO): y"), (REC_PASS,), "JOB-NOT-DISPATCHED", "job-faulted"),
-            (RUNNING + k1("job-retired-without-timestamps", ": z"), (), "JOB-NOT-DISPATCHED",
+            (RUNNING + done + k1("job-faulted", " (EIO): y"), (REC_PASS,), "JOB-FAILED", "job-faulted"),
+            (RUNNING + k1("job-retired-without-timestamps", ": z"), (), "JOB-FAILED",
              "job-retired-without-timestamps"),
             # A4: kernel says completed, but the record's CPU check failed -> not completed.
-            (RUNNING + done, (rec("wrong-result", error="bad"),), "JOB-NOT-DISPATCHED", "wrong-result"),
-            (RUNNING, (rec("running"),), "JOB-NOT-DISPATCHED", "air-gpu-job"),
+            (RUNNING + done, (rec("wrong-result", error="bad"),), "JOB-FAILED", "wrong-result"),
+            # A job that started and recorded no result: its own verdict, never JOB-NOT-DISPATCHED.
+            (RUNNING, (rec("running"),), "JOB-NO-RESULT", "no result was recorded"),
             (RUNNING, (rec("no-render-node"),), "FW-RUNNING", "did not reach the GPU"),
             (RUNNING, (REC_PASS,), "JOB-COMPLETED", "air-gpu-job"),
             (PROBE + K1_ARMED + k1("firmware-boot-failed", " (ENODEV): x"), (), "FW-BOOT-FAILED", "firmware-boot-failed"),
@@ -504,9 +527,16 @@ class CollectVerdictTest(unittest.TestCase):
             (PROBE + K1_ARMED + RTKIT + k1("publish-failed", " (EIO): x"), (), "FW-BOOT-FAILED", "publish-failed"),
             (PROBE + K1_ARMED + RTKIT + PUBLISH + k1("device-control-failed", " (ETIMEDOUT): x"), (),
              "INITDATA-REJECTED", "device-control-failed"),
-            (RUNNING + k1("job-ran-completion-missed", ": GPU start timestamp 0x5"), (), "JOB-NOT-DISPATCHED",
+            # Dispatched (nonzero start timestamp): never JOB-NOT-DISPATCHED (K1: not the C3 row).
+            (RUNNING + k1("job-ran-completion-missed", ": GPU start timestamp 0x5"), (), "JOB-FAILED",
              "job-ran-completion-missed"),
-            (RUNNING + k1("job-failed-before-wait", " (EIO): x"), (), "JOB-NOT-DISPATCHED", "job-failed-before-wait"),
+            (RUNNING + k1("job-failed-before-wait", " (EIO): x"), (), "JOB-FAILED", "job-failed-before-wait"),
+            (RUNNING + k1("job-timed-out", ": both unreadable"), (), "JOB-FAILED", "job-timed-out"),
+            (RUNNING + k1("job-timed-out-powered", ": pstate 0x2, GPU start timestamp Some(0)"), (),
+             "JOB-NOT-DISPATCHED", "job-timed-out-powered"),
+            # The not-dispatched labels with an unreadable start timestamp prove nothing.
+            (RUNNING + k1("job-accepted-never-dispatched", ": GPU start timestamp None"), (), "JOB-FAILED",
+             "timestamp None"),
             # cap-violated and the check-failed crash variant override a success (A2-adjacent).
             (RUNNING + k1("cap-violated", " (EIO): above the cap"), (REC_PASS,), "FW-CRASHED", "cap-violated"),
             (RUNNING + k1("firmware-running-check-failed", " (EIO): x"), (), "FW-CRASHED",
@@ -539,7 +569,7 @@ class CollectVerdictTest(unittest.TestCase):
         # A pass and a fail from the same boot: the fail wins.
         done = k1("job-completed", ": the first compute job finished")
         verdict, reason = self.verdict(RUNNING + done, recs=(rec("wrong-result", error="bad"), REC_PASS))
-        self.assertEqual(verdict, "JOB-NOT-DISPATCHED", reason)
+        self.assertEqual(verdict, "JOB-FAILED", reason)
         self.assertIn("1 of 2 runs passed", reason)
 
     def test_a3_stuck_or_killed_job_is_not_fw_running(self):
@@ -547,7 +577,7 @@ class CollectVerdictTest(unittest.TestCase):
         for result in ("stuck", "killed", "device-lost"):
             with self.subTest(result=result):
                 verdict, reason = self.verdict(RUNNING, recs=(rec(result, stage="opened-device", reached_gpu="no"),))
-                self.assertEqual(verdict, "JOB-NOT-DISPATCHED", reason)
+                self.assertEqual(verdict, "JOB-FAILED", reason)
                 self.assertIn(result, reason)
 
     def test_unknown_kernel_verdict(self):
@@ -586,8 +616,12 @@ class CollectVerdictTest(unittest.TestCase):
             (PROBE + RTKIT + PUBLISH + ACCEPT + crash, (), "FW-CRASHED"),
             (PROBE + RTKIT + PUBLISH + ACCEPT, (REC_PASS,), "JOB-COMPLETED"),
             (PROBE + RTKIT + PUBLISH + ACCEPT + "[ 9.0] host kernel: M3 scheduler: execution failed ETIMEDOUT\n",
+             (rec("fence-timeout"),), "JOB-FAILED"),
+            (PROBE + RTKIT + PUBLISH + ACCEPT + crash, (rec("device-lost"),), "JOB-FAILED"),
+            # The P3-8 signature: the GPU read powered down at the failed job.
+            (PROBE + RTKIT + PUBLISH + ACCEPT + DEV + "M3 G15S: GPU is powered down; skipping engine/MMU register snapshot\n",
              (rec("fence-timeout"),), "JOB-NOT-DISPATCHED"),
-            (PROBE + RTKIT + PUBLISH + ACCEPT + crash, (rec("device-lost"),), "JOB-NOT-DISPATCHED"),
+            (PROBE + RTKIT + PUBLISH + ACCEPT, (rec("running"),), "JOB-NO-RESULT"),
         ]:
             with self.subTest(want=want, log=log[-60:]):
                 self.assertEqual(self.verdict(log, recs=recs)[0], want)
@@ -598,9 +632,12 @@ class CollectVerdictTest(unittest.TestCase):
 
 
 JOURNALCTL = r"""#!/bin/bash
-# The fake journal: $FAKE/journal-<boot>.txt per boot, $FAKE/boots for --list-boots.
-b=0
-while (($#)); do case $1 in -b) b=$2; shift ;; --list-boots) cat "$FAKE/boots"; exit 0 ;; esac; shift; done
+# The fake journal: $FAKE/journal-<boot>.txt (kernel) and $FAKE/jobs-<boot>.txt (the air-gpu-job
+# tag) per boot index, $FAKE/boots for --list-boots. -b takes an index or a boot id.
+b=0 tag=""
+while (($#)); do case $1 in -b) b=$2; shift ;; -t) tag=$2; shift ;; --list-boots) cat "$FAKE/boots"; exit 0 ;; esac; shift; done
+if [[ $b =~ ^[0-9a-f]{32}$ ]]; then b=$(awk -v id="$b" '$2 == id { print $1 }' "$FAKE/boots"); fi
+if [[ $tag == air-gpu-job ]]; then f=$FAKE/jobs-$b.txt; [[ -f $f ]] && cat "$f"; exit 0; fi
 f=$FAKE/journal-$b.txt
 [[ -f $f ]] || { echo "-- No entries --"; exit 1; }
 if [[ " $* " == *" -o cat "* ]]; then sed -E 's/^\[[^]]*\] [^ ]+ kernel: //' "$f"; else cat "$f"; fi
@@ -654,6 +691,7 @@ DEBUGFS='{t}/debug'
 SYS='{t}/sys'
 BOOT_ID='{self.boot_id}'
 STATE_DIR='{self.statedir}'
+EXTRA_HOMES=''
 user_home() {{ echo '{self.home}'; }}
 main {' '.join(args)}
 """
@@ -689,7 +727,9 @@ main {' '.join(args)}
         self.assertIn("xx:xx:xx:xx:xx:xx", log)
         self.assertIn("M3 G15G verdict: job-completed", files["gpu-log.txt"])
         self.assertIn("M3 G15G verdict", files["firmware-log.txt"])
-        self.assertEqual(sorted(k for k in files if k.startswith("jobs/")), ["jobs/job-1.txt"])
+        self.assertEqual(sorted(k for k in files if k.startswith("jobs/job-")), ["jobs/job-1.txt"])
+        self.assertIn("pass\trecord\t", files["jobs/evidence.tsv"])
+        self.assertIn("source: kernel-verdict + job record", last)
         smc = files["smc-keys.txt"]
         self.assertIn("Tg00", smc)
         self.assertIn("PSTR", smc)
@@ -750,13 +790,85 @@ main {' '.join(args)}
         (self.fake / "dmesg.txt").write_text("[ 0.0] this boot\n")
         proc, files = self.collect()
         last = proc.stdout.strip().splitlines()[-1]
-        self.assertTrue(last.startswith("AIR-GPU VERDICT: JOB-NOT-DISPATCHED | boot -1 | oneshot 1007-120000"), last)
-        self.assertIn("air-gpu-job", last)
+        # The record was left at result=running and the journal has no result: JOB-NO-RESULT.
+        self.assertTrue(last.startswith("AIR-GPU VERDICT: JOB-NO-RESULT | boot -1 | oneshot 1007-120000"), last)
+        self.assertIn("no result was recorded", last)
         self.assertIn("kernel-log-boot-1.txt", files)
         self.assertIn("dmesg-boot0.txt", files)
         # Asked for this boot explicitly, it is a normal one.
         proc, _ = self.collect("--boot", "0")
         self.assertIn("AIR-GPU VERDICT: NOT-ARMED | boot 0", proc.stdout.strip().splitlines()[-1])
+
+    REC_PATH = "air-gpu-runs/job-20261006-215736-174219586.txt"
+
+    def rehearsal_record(self, boot_id, result, extra=""):
+        path = self.home / self.REC_PATH
+        path.write_text(f"boot_id={boot_id}\noneshot=1007-120000\nresult={result}\n{extra}")
+        return path
+
+    def test_same_verdict_before_and_after_a_hard_reset(self):
+        # The m3pro rehearsal (2026-10-06): in the armed boot the record said pass; after a hard
+        # reset the record on disk was the earlier result=running copy, while the journal kept the
+        # job's own "result: pass" line (old format, no record path). Both passes must agree.
+        rec = str(self.home / self.REC_PATH)
+        start = f"start: 5 s through /prefix, oneshot 1007-120000, record {rec}\n"
+        self.arm_record("1007-120000")
+        # Pass 1, in the armed boot (boot 0): record pass, journal start + result pass.
+        self.mac.cmdline.write_text(ARMED + "\n")
+        self.journal(0, ARMED, PROBE + RTKIT + PUBLISH + ACCEPT)
+        (self.fake / "jobs-0.txt").write_text(start + "result: pass (exit 0, 5214 ms, 436 submissions)\n")
+        self.rehearsal_record("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "pass", "submits=436\nfirst_submit_ms=0.4\n")
+        proc, _ = self.collect()
+        first = proc.stdout.strip().splitlines()[-1]
+        self.assertTrue(first.startswith("AIR-GPU VERDICT: JOB-COMPLETED | boot 0 | oneshot 1007-120000 | "
+                                         "source: job record+journal"), first)
+        # Pass 2, after the hard reset: the armed boot is -1, its record is the stale copy.
+        self.mac.cmdline.write_text(CMDLINE + "\n")
+        self.boot_id.write_text("cccccccc-cccc-cccc-cccc-cccccccccccc\n")
+        (self.fake / "boots").write_text("IDX BOOT ID FIRST LAST\n -1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa x y\n"
+                                         "  0 cccccccccccccccccccccccccccccccc x y\n")
+        self.journal(-1, ARMED, PROBE + RTKIT + PUBLISH + ACCEPT)
+        (self.fake / "jobs--1.txt").write_text((self.fake / "jobs-0.txt").read_text())
+        self.journal(0, CMDLINE, PROBE)
+        (self.fake / "jobs-0.txt").unlink()
+        self.rehearsal_record("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "running")
+        proc, files = self.collect()
+        second = proc.stdout.strip().splitlines()[-1]
+        self.assertTrue(second.startswith("AIR-GPU VERDICT: JOB-COMPLETED | boot -1 | oneshot 1007-120000 | "
+                                          "source: job journal (record left at running)"), second)
+        self.assertIn("result: pass", files["jobs/journal.txt"])
+
+    def test_record_left_running_with_no_journal_result(self):
+        self.arm_record("1007-120000")
+        self.mac.cmdline.write_text(CMDLINE + "\n")
+        self.journal(0, CMDLINE, PROBE)
+        self.journal(-1, ARMED, PROBE + RTKIT + PUBLISH + ACCEPT)
+        rec = str(self.home / self.REC_PATH)
+        (self.fake / "jobs--1.txt").write_text(f"start: 5 s through /p, oneshot 1007-120000, record {rec}\n")
+        self.rehearsal_record("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "running")
+        proc, _ = self.collect()
+        last = proc.stdout.strip().splitlines()[-1]
+        self.assertTrue(last.startswith("AIR-GPU VERDICT: JOB-NO-RESULT | boot -1"), last)
+        self.assertNotIn("JOB-NOT-DISPATCHED", proc.stdout)
+
+    def test_journal_only_job_and_a_conflict(self):
+        # The record file is missing entirely: the journal's named result line decides.
+        self.arm_record("1007-120000")
+        self.mac.cmdline.write_text(ARMED + "\n")
+        self.journal(0, ARMED, PROBE + RTKIT + PUBLISH + ACCEPT)
+        rec = str(self.home / self.REC_PATH)
+        (self.fake / "jobs-0.txt").write_text(
+            f"start: 5 s through /p, oneshot 1007-120000, record {rec}\n"
+            f"result: pass (exit 0, 5000 ms, 400 submissions) stage finished record {rec}\n")
+        proc, _ = self.collect()
+        self.assertIn("AIR-GPU VERDICT: JOB-COMPLETED | boot 0 | oneshot 1007-120000 | source: job journal |",
+                      proc.stdout)
+        # A record and a journal line that disagree: never a success.
+        self.rehearsal_record("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "fence-timeout")
+        proc, _ = self.collect()
+        last = proc.stdout.strip().splitlines()[-1]
+        self.assertTrue(last.startswith("AIR-GPU VERDICT: JOB-FAILED | boot 0"), last)
+        self.assertIn("conflict", last)
 
     def test_a_normal_boot(self):
         self.journal(0, CMDLINE, PROBE)
@@ -853,6 +965,61 @@ main {' '.join(args)}
         self.assertEqual(rec["stage"], "finished")
         self.assertIn("start:", (self.mac.tmp / "logger.log").read_text())
         self.assertIn("result: pass", (self.mac.tmp / "logger.log").read_text())
+
+    FAKE_SYNC = r"""#!/bin/bash
+# Records each call; with FAKE_SYNC_FAIL=final it fails on the final record (the one with a
+# stage= line), with FAKE_SYNC_FAIL=always on every file. A bare sync (no file) always succeeds.
+echo "sync $*" >>"$FAKE_SYNC_LOG"
+f=${@: -1}
+[[ $# -eq 0 || -d $f ]] && exit 0
+case ${FAKE_SYNC_FAIL:-} in
+  always) exit 1 ;;
+  final) grep -q '^stage=' "$f" 2>/dev/null && exit 1 ;;
+esac
+exit 0
+"""
+
+    def fake_sync(self, fail=""):
+        sync = self.mac.tmp / "bin/sync"
+        sync.write_text(self.FAKE_SYNC)
+        sync.chmod(0o755)
+        os.environ["FAKE_SYNC_LOG"] = str(self.mac.tmp / "sync.log")
+        os.environ["FAKE_SYNC_FAIL"] = fail
+        self.addCleanup(os.environ.pop, "FAKE_SYNC_LOG", None)
+        self.addCleanup(os.environ.pop, "FAKE_SYNC_FAIL", None)
+
+    def test_the_final_record_is_durable(self):
+        # The record is fsynced (file and directory) at the start and at the end, and the journal
+        # result line names the record, so collect has a second source for it.
+        self.fake_sync()
+        proc, _ = self.job(str(self.prefix))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        calls = (self.mac.tmp / "sync.log").read_text().splitlines()
+        recdir = str(self.mac.tmp / "home/air-gpu-runs")
+        self.assertEqual(len([c for c in calls if c.endswith(".txt.tmp")]), 2, calls)   # start, final
+        self.assertEqual(len([c for c in calls if c == f"sync -- {recdir}"]), 2, calls)
+        self.assertEqual(self.record()["result"], "pass")
+        log = (self.mac.tmp / "logger.log").read_text()
+        self.assertRegex(log, r"result: pass \(exit 0, \d+ ms, 480 submissions\) stage finished record .*job-.*\.txt")
+
+    def test_a_final_record_that_cannot_be_saved_is_an_error(self):
+        # No silent || true: exit 9, an error line on the terminal and in the journal, and the
+        # journal still has the result.
+        self.fake_sync("final")
+        proc, _ = self.job(str(self.prefix))
+        self.assertEqual(proc.returncode, 9, proc.stdout + proc.stderr)
+        self.assertIn("error: after the job (pass): could not save the record", proc.stdout)
+        log = (self.mac.tmp / "logger.log").read_text()
+        self.assertIn("error: after the job (pass)", log)
+        self.assertIn("result: pass", log)
+        self.assertEqual(self.record()["result"], "running")   # the durable start copy remains
+
+    def test_no_job_without_a_saved_start_record(self):
+        self.fake_sync("always")
+        proc, _ = self.job(str(self.prefix))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("the GPU job was not started because its record could not be saved", proc.stdout)
+        self.assertNotIn("result:", (self.mac.tmp / "logger.log").read_text())
 
     def test_stuck_before_submitting_records_the_stage(self):
         # A3: the job opened (or was opening) the device, then got stuck; the record says so, so

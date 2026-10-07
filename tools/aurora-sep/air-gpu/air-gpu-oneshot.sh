@@ -588,7 +588,12 @@ do_disarm() {
     write_conf "$rest" || { release_locks; refuse "could not write $CONF."; }
     changed+="removed the air-gpu-oneshot entry from $CONF; "
   fi
-  rm -f "$STATE_DIR/armed"
+  # The arming record stays after an armed boot ran, so air-gpu-collect.sh keeps judging that boot
+  # by its id whenever it runs (the same source in every pass). Only a one-shot cleared before it
+  # booted is marked cancelled: that arming has no boot to judge.
+  if [[ $changed == *"cleared the one-shot"* && -f $STATE_DIR/armed ]]; then
+    mv -f "$STATE_DIR/armed" "$STATE_DIR/armed.cancelled"
+  fi
   sync
   release_locks
   say "disarmed: ${changed:-nothing was armed.}"
