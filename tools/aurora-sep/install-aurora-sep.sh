@@ -5,6 +5,8 @@
 #   ... | bash -s -- --read-only      install, but never let the driver write to the enclave
 #   ... | bash -s -- --uninstall      go back to the kernel this Mac had before
 #   ... | bash -s -- --reset-touchid  start Touch ID over: new keybag, enrol again
+#   ... | bash -s -- --m3-gpu-experiment   M3 MacBook Air only: install the GPU start
+#                                         experiment's scripts with the kernel (arms nothing)
 #
 # Kernel: iconidentify/aurora-linux custom/sep (dbbfb92908ba), aurora-silicon/linux aurora-wip plus the
 # Secure Enclave (Touch ID) driver, Thunderbolt (#8), the Apple video
@@ -435,6 +437,23 @@ M3_AIR_DISPLAY_HANDOFF=1
 M3_AIR_DISPLAY_VARIANT="air-display-handoff-12"
 M3_AIR_DRY_RUN=1
 M3_AIR_DRY_RUN_SWITCHES="chosen.asahi,t8122-gpu-diag=1 chosen.asahi,t8122-gpu-handoff-diag=1 chosen.asahi,t8122-gpu-power-diag=1 chosen.asahi,t8122-dcp=1"
+# --m3-gpu-experiment (M3 MacBook Air only) installs the GPU start experiment's tools with the
+# kernel: three scripts in M3_GPU_BIN, from this release (M3_GPU_SCRIPTS, checked like the
+# packages), and the G15G Mesa prefix package once there is one. It arms nothing and changes
+# no boot setting: air-gpu-oneshot.sh arms one boot at a time, only when its owner runs it.
+# Their sources are tools/aurora-sep/air-gpu/ in this repository.
+M3_GPU_EXPERIMENT=0
+M3_GPU_BIN=/usr/local/bin
+M3_GPU_SCRIPTS=(
+  "air-gpu-oneshot.sh 1201f23161a8d727cd61538b18685f303dec09ff4c522ec972574e50da24009e"
+  "air-gpu-collect.sh b79d765caa47f93b18797d2e6ef2e595e943a3c6a261185cae43c345535fa10c"
+  "air-gpu-job.sh d01bfe5f54aa8c6b559a1443ade9e8bcb5ce04961efa3d1dc42accc5213f52af"
+)
+# PLACEHOLDER until the G15G Mesa build exists: its prefix package as "file sha256" (a pacman
+# package that installs Mesa into a prefix of its own, never over the system Mesa), and that
+# prefix, for air-gpu-job.sh. Empty: this release has none, and the flag installs the scripts.
+M3_GPU_MESA_PACKAGE=""
+M3_GPU_MESA_PREFIX=""
 # The handoff is tested with one macOS system-firmware stub only, 14.8.3 (GPU
 # firmware 14.8.3, DCP 14.7), which the Omarchy installer gives every M3. m1n1
 # reports the stub's iBoot as asahi,iboot2-version.
@@ -1110,6 +1129,88 @@ m3_restore_bringup() {
 # board checked so far has them; these have not been checked.
 UNPROVEN_SEP_BOARDS="j314c j316c j413"
 
+# --m3-gpu-experiment: stops before anything is downloaded on a Mac that is not an M3 Air, or
+# when the Mesa entry is malformed.
+m3_gpu_plan() {
+  ((M3_GPU_EXPERIMENT)) || return 0
+  is_m3_air || die "--m3-gpu-experiment is for the M3 MacBook Air (j613, j615) only, and this Mac is
+    $(this_board) ($(this_soc)). Nothing was installed."
+  [[ -z $M3_GPU_MESA_PACKAGE || $M3_GPU_MESA_PACKAGE =~ ^[A-Za-z0-9._+-]+\.pkg\.tar\.zst\ [0-9a-f]{64}$ ]] ||
+    die "M3_GPU_MESA_PACKAGE is not \"file sha256\" (a packaging mistake). Nothing was installed."
+  warn "--m3-gpu-experiment: installing the M3 Air GPU experiment's scripts$([[ -n $M3_GPU_MESA_PACKAGE ]] && echo " and Mesa prefix") with the kernel.
+    They arm nothing: every boot stays as it is until air-gpu-oneshot.sh arms one."
+}
+
+# The experiment's files for the download loop, "file sha256" per line (none without the flag).
+m3_gpu_files() {
+  ((M3_GPU_EXPERIMENT)) || return 0
+  printf '%s\n' "${M3_GPU_SCRIPTS[@]}"
+  if [[ -n $M3_GPU_MESA_PACKAGE ]]; then echo "$M3_GPU_MESA_PACKAGE"; fi
+  return 0
+}
+
+# After pacman -U (which installed the Mesa package with the kernel): the scripts, what they
+# need, and $STATE/m3-gpu-experiment, which --uninstall reads.
+m3_gpu_install() {
+  local entry file name record=""
+  ((M3_GPU_EXPERIMENT)) || return 0
+  for entry in "${M3_GPU_SCRIPTS[@]}"; do
+    file=${entry%% *}
+    $sudo install -D -m 0755 "$work/$file" "$M3_GPU_BIN/$file"
+    record+="script $file ${entry#* }"$'\n'
+  done
+  if [[ -n $M3_GPU_MESA_PACKAGE ]]; then
+    name=$(bsdtar -xOf "$work/${M3_GPU_MESA_PACKAGE%% *}" .PKGINFO 2>/dev/null | sed -n 's/^pkgname = //p' | head -1)
+    [[ -n $name ]] && record+="mesa $name"$'\n'
+  fi
+  # air-gpu-job.sh runs its job through Python and the Vulkan loader.
+  $sudo pacman -S --needed --noconfirm python vulkan-icd-loader ||
+    warn "could not install python and vulkan-icd-loader; air-gpu-job.sh needs them"
+  printf '%s' "$record" | $sudo tee "$STATE/m3-gpu-experiment" >/dev/null
+}
+
+# What the owner reads at the end of an install with the flag, or of a plain run that keeps
+# the tools of an earlier one.
+m3_gpu_notice() {
+  if ((M3_GPU_EXPERIMENT)); then
+    say "The M3 Air GPU experiment's scripts are in $M3_GPU_BIN: air-gpu-oneshot.sh,
+    air-gpu-collect.sh and air-gpu-job.sh. Nothing is armed; every boot stays normal until
+      sudo air-gpu-oneshot.sh start
+    arms the next boot only (sudo air-gpu-oneshot.sh --check first says whether it can)."
+    if [[ -n $M3_GPU_MESA_PREFIX ]]; then
+      echo "   The G15G Mesa prefix for air-gpu-job.sh: $M3_GPU_MESA_PREFIX"
+    else
+      echo "   This release has no G15G Mesa prefix yet, so air-gpu-job.sh has nothing to run with."
+    fi
+    if [[ " $(m3_switches 2>/dev/null) " != *" $M3_AIR_GPU_SWITCH "* ]]; then
+      echo "   This Mac's boot loader does not hand the GPU over ($M3_AIR_GPU_SWITCH is not armed), so an"
+      echo "   armed boot ends ARMED-NOT-STARTED until a release's --m3-handoff does."
+    fi
+  elif [[ -f $STATE/m3-gpu-experiment ]]; then
+    echo "   Keeping the M3 Air GPU experiment's scripts from an earlier install in $M3_GPU_BIN;"
+    echo "   run this again with --m3-gpu-experiment to update them to this release's."
+  fi
+  return 0
+}
+
+# --uninstall: clears an armed experiment boot, then removes what m3_gpu_install recorded.
+m3_gpu_remove() {
+  local kind name
+  [[ -f $STATE/m3-gpu-experiment ]] || return 0
+  if [[ -x $M3_GPU_BIN/air-gpu-oneshot.sh ]]; then
+    $sudo "$M3_GPU_BIN/air-gpu-oneshot.sh" --disarm ||
+      warn "air-gpu-oneshot.sh --disarm failed: check limine.conf for an air-gpu-oneshot entry"
+  fi
+  while read -r kind name _; do
+    case $kind in
+      script) [[ $name =~ ^air-gpu-[a-z]+\.sh$ ]] && $sudo rm -f "$M3_GPU_BIN/$name" ;;
+      mesa) [[ $name =~ ^[A-Za-z0-9._+-]+$ ]] && { $sudo pacman -Rns --noconfirm "$name" ||
+        warn "could not remove $name"; } ;;
+    esac
+  done <"$STATE/m3-gpu-experiment"
+  say "Removed the M3 Air GPU experiment's scripts"
+}
+
 this_board() {
   tr '\0' '\n' <"$DT/compatible" 2>/dev/null | sed -n '1s/^apple,//p'
 }
@@ -1598,12 +1699,13 @@ install_all() {
   if [[ $chain == grub ]]; then boot_space "$kernel"; fi
   m1n1_rollback_check
   m3_plan
+  m3_gpu_plan
   m1n1_keep_plan
   work=$(mktemp -d)
   trap 'rm -rf "${work:-}"' EXIT
   if is_neo && ! m1n1_for_this_mac; then say "Keeping this MacBook Neo's own m1n1 (m1n1-aurora has no T8140 support)"; fi
   if [[ $M3_MODE == kernel ]]; then say "Keeping this M3's own m1n1 and boot.bin"; fi
-  mapfile -t entries < <(packages_for_this_mac)
+  mapfile -t entries < <(packages_for_this_mac; m3_gpu_files)
   for entry in "${entries[@]}"; do
     read -r file sha <<<"$entry"
     say "Downloading $file"
@@ -1686,6 +1788,7 @@ install_all() {
     $sudo pacman -S --needed --noconfirm libva-v4l2_request-avd ||
       warn "could not install libva-v4l2_request-avd; video players will decode in software until it is installed"
   fi
+  m3_gpu_install
   add_pin
   # Both boot chains boot through m1n1, and both need the aurora device trees
   # in boot.bin: update-m1n1 otherwise takes the DTBs of the highest-versioned
@@ -1776,6 +1879,7 @@ install_all() {
   if ((M1N1_KEEP)) && ! is_m3; then
     echo "   This Mac keeps the boot loader it has: the m1n1 that failed on it is not put back."
   fi
+  m3_gpu_notice
   echo "   Testing this build? The plan and reporting format:"
   echo "      curl -fsSL $PUBLIC_RELEASE_URL/install-aurora-sep.sh | bash -s -- --agent-prompt"
   if [[ $chain == grub ]]; then
@@ -1859,6 +1963,7 @@ uninstall_all() {
     handoff) m3_restore_bringup ;;
   esac
   $sudo rm -f "$MODPROBE_CONF"
+  m3_gpu_remove
   # The m1n1 builds that failed on this Mac stay recorded, so a later install
   # never puts one of them back.
   local failed=""
@@ -2453,6 +2558,16 @@ fingerprint.
         - Later plain runs keep the display handoff on this Air. To go back,
           use the printed restore lines; ask the maintainer before using
           --uninstall on an Air.
+        - The GPU start experiment, only when the maintainer asks for it:
+          --m3-gpu-experiment ("bash -s -- --m3-gpu-experiment", with
+          --m3-handoff if the Air needs it) installs air-gpu-oneshot.sh,
+          air-gpu-collect.sh and air-gpu-job.sh in /usr/local/bin and arms
+          nothing. "sudo air-gpu-oneshot.sh start" (or knob=value ...) arms
+          the next boot only; any boot after it, a power cycle included, is
+          the normal one. After the armed boot (or the boot after it, if it
+          hung) run "sudo air-gpu-collect.sh" and attach its tgz with the
+          last line it prints, "AIR-GPU VERDICT: ...". Stop and report on any
+          crash or panic.
 
    Checks for every M3 (quote the output; on a kernel-only M3 the handoff
    lines are expected to be missing, so say so):
@@ -2509,14 +2624,21 @@ preflight_needed() { case ${1:-} in --agent-prompt | --reset-touchid | --m3-repo
 # Tests source this file for its functions only.
 if [[ ${AURORA_SEP_SOURCE_ONLY:-} == 1 ]]; then return 0; fi
 
-# --m3-handoff goes with an install, alone or with --read-only.
+# --m3-handoff and --m3-gpu-experiment go with an install, alone, together or with --read-only.
 args=()
 for a in "$@"; do
-  if [[ $a == --m3-handoff ]]; then M3_TRY=1; else args+=("$a"); fi
+  case $a in
+    --m3-handoff) M3_TRY=1 ;;
+    --m3-gpu-experiment) M3_GPU_EXPERIMENT=1 ;;
+    *) args+=("$a") ;;
+  esac
 done
 set -- "${args[@]}"
 if ((M3_TRY)) && [[ -n ${1:-} && $1 != --read-only ]]; then
   die "--m3-handoff goes with an install (alone or with --read-only), not with $1"
+fi
+if ((M3_GPU_EXPERIMENT)) && [[ -n ${1:-} && $1 != --read-only ]]; then
+  die "--m3-gpu-experiment goes with an install (alone, with --m3-handoff or with --read-only), not with $1"
 fi
 # One option at a time; only --reset-touchid takes arguments of its own.
 if (($# > 1)) && [[ $1 != --reset-touchid ]]; then
@@ -2531,5 +2653,5 @@ case ${1:-} in
   --reset-touchid) shift; reset_touchid "$@" ;;
   --m3-report) m3_report ;;
   --agent-prompt) release_source >&2; prompt_notice; agent_prompt ;;
-  *) die "unknown option $1 (--read-only, --uninstall, --reset-touchid, --agent-prompt, --m3-report or --m3-handoff)" ;;
+  *) die "unknown option $1 (--read-only, --uninstall, --reset-touchid, --agent-prompt, --m3-report, --m3-handoff or --m3-gpu-experiment)" ;;
 esac
