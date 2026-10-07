@@ -40,6 +40,7 @@ static const struct dcp_callback_size callback_sizes[IOMFB_MAX_CB] = {
 	[128] = { 0x1008, 0x4, true },
 	[129] = { 0x40, 0x4, true },
 	[201] = { 0xc, 0x10, true },
+	[202] = { 0x1a, 0x0, true },
 	[206] = { 0x0, 0x4, true },
 	[207] = { 0x0, 0x4, true },
 	[300] = { 0x10, 0x0, true },
@@ -51,6 +52,7 @@ static const struct dcp_callback_size callback_sizes[IOMFB_MAX_CB] = {
 	[414] = { 0x50, 0x4, true },
 	[415] = { 0x4c, 0x4, true },
 	[451] = { 0x14, 0x1c, true },
+	[454] = { 0x4, 0x1, true },
 	[552] = { 0x1044, 0x4, true },
 	[561] = { 0x1044, 0x4, true },
 	[563] = { 0x4c, 0x4, true },
@@ -439,7 +441,6 @@ static bool trampoline_allocate_buffer_h17p(struct apple_dcp *dcp, int tag,
 	const struct dcp_allocate_buffer_req *wire = in;
 	struct dcp_allocate_buffer_req request = { 0 };
 	struct dcp_allocate_buffer_resp reply;
-	u32 options;
 
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
 		return trampoline_allocate_buffer(dcp, tag, out, in);
@@ -451,29 +452,91 @@ static bool trampoline_allocate_buffer_h17p(struct apple_dcp *dcp, int tag,
 	static_assert(offsetof(struct dcp_allocate_buffer_req, paddr_null) == 16);
 
 	trace_iomfb_callback(dcp, tag, __func__);
-	options = get_unaligned_le32(&wire->unk2);
-	/* Only these option combinations have observed successful replies. */
-	if (get_unaligned_le32(&wire->unk0) != 0x703 ||
-	    (options != 4 && options != SZ_16K) ||
-	    memchr_inv(&wire->paddr_null, 0, 4))
-		goto fail;
-
 	request.size = get_unaligned_le64(&wire->size);
 	reply = dcpep_cb_allocate_buffer(dcp, &request);
-	if (!reply.dva_size)
-		goto fail;
+	if (!reply.dva_size) {
+		/* Exhaustion and allocation errors use the all-zero reply. */
+		memset(out, 0, sizeof(reply));
+		return true;
+	}
 
 	put_unaligned_le64(reply.paddr, out);
 	put_unaligned_le64(reply.dva, (u8 *)out + 8);
 	put_unaligned_le64(reply.dva_size, (u8 *)out + 16);
 	put_unaligned_le32(reply.mem_desc_id, (u8 *)out + 24);
 	return true;
+}
 
-fail:
-	/* Allocation failures have no measured H17P reply encoding. */
-	dev_err(dcp->dev, "unqualified or failed D451 buffer allocation\n");
-	WRITE_ONCE(dcp->crashed, true);
-	return false;
+static bool trampoline_map_piodma_h17p(struct apple_dcp *dcp, int tag,
+				       void *out, void *in)
+{
+	const struct dcp_map_buf_req *wire = in;
+	struct dcp_map_buf_req request = { 0 };
+	struct dcp_map_buf_resp_h17p reply = { 0 };
+	u64 buffer;
+
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
+		return trampoline_map_piodma(dcp, tag, out, in);
+
+	static_assert(sizeof(*wire) == 0xc);
+	static_assert(sizeof(reply) == 0x10);
+	static_assert(offsetof(struct dcp_map_buf_req, unk) == 8);
+	static_assert(offsetof(struct dcp_map_buf_req, dva_null) == 11);
+
+	trace_iomfb_callback(dcp, tag, __func__);
+	buffer = get_unaligned_le64(&wire->buffer);
+	request.buffer = buffer;
+	if (!dcpep_map_piodma(dcp, &request, &reply)) {
+		/* A rejected mapping echoes the descriptor with a zero DVA. */
+		put_unaligned_le32(buffer, out);
+		put_unaligned_le64(0, (u8 *)out + 4);
+		put_unaligned_le32(0, (u8 *)out + 12);
+		return true;
+	}
+
+	put_unaligned_le32(reply.buffer, out);
+	put_unaligned_le64(reply.dva, (u8 *)out + 4);
+	put_unaligned_le32(reply.unk, (u8 *)out + 12);
+	return true;
+}
+
+static bool trampoline_unmap_piodma_h17p(struct apple_dcp *dcp, int tag,
+					 void *out, void *in)
+{
+	const struct dcp_unmap_buf_resp *wire = in;
+	struct dcp_unmap_buf_resp request = { 0 };
+
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
+		return trampoline_unmap_piodma(dcp, tag, out, in);
+
+	static_assert(sizeof(*wire) == 0x1a);
+	static_assert(offsetof(struct dcp_unmap_buf_resp, vaddr) == 8);
+	static_assert(offsetof(struct dcp_unmap_buf_resp, dva) == 16);
+	static_assert(offsetof(struct dcp_unmap_buf_resp, buf_null) == 25);
+
+	trace_iomfb_callback(dcp, tag, __func__);
+	request.buffer = get_unaligned_le64(&wire->buffer);
+	request.vaddr = get_unaligned_le64(&wire->vaddr);
+	request.dva = get_unaligned_le64(&wire->dva);
+	request.unk = wire->unk;
+	request.buf_null = wire->buf_null;
+	dcpep_unmap_piodma(dcp, &request);
+	return true;
+}
+
+static bool
+trampoline_release_mem_desc_h17p(struct apple_dcp *dcp, int tag, void *out,
+				 void *in)
+{
+	u32 id;
+
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
+		return trampoline_release_mem_desc(dcp, tag, out, in);
+
+	trace_iomfb_callback(dcp, tag, __func__);
+	id = get_unaligned_le32(in);
+	*(u8 *)out = dcpep_cb_release_mem_desc(dcp, &id);
+	return true;
 }
 
 /* H17P callback numbering is not a uniform shift of the v13.5 table. */
@@ -508,8 +571,8 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[128] = trampoline_prop_chunk, /* setDCPAVPropChunk */
 	[129] = trampoline_prop_end, /* setDCPAVPropEnd */
 	[130] = trampoline_allocate_bandwidth, /* allocate_bandwidth */
-	[201] = trampoline_map_piodma, /* map_buf */
-	[202] = trampoline_unmap_piodma, /* unmap_buf */
+	[201] = trampoline_map_piodma_h17p, /* map_buf */
+	[202] = trampoline_unmap_piodma_h17p, /* unmap_buf */
 	[206] = iomfbep_cb_match_pmu_service_2, /* match_pmu_service */
 	[207] = iomfbep_cb_match_backlight_service, /* match_backlight_service */
 	[208] = trampoline_nop, /* update_backlight_factor_prop */
@@ -526,7 +589,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[415] = trampoline_true, /* setProperty */
 	[451] = trampoline_allocate_buffer_h17p, /* allocate_buffer */
 	[452] = trampoline_map_physical, /* prepare */
-	[454] = trampoline_release_mem_desc, /* release_descriptor */
+	[454] = trampoline_release_mem_desc_h17p, /* release_descriptor */
 	[552] = trampoline_true,
 	[561] = trampoline_true,
 	[563] = trampoline_true,
