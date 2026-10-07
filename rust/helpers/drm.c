@@ -29,6 +29,12 @@ rust_helper_drm_gem_shmem_object_free(struct drm_gem_object *obj)
 	return drm_gem_shmem_object_free(obj);
 }
 
+__rust_helper bool
+rust_helper_drm_gem_shmem_is_purgeable(struct drm_gem_shmem_object *shmem)
+{
+	return drm_gem_shmem_is_purgeable(shmem);
+}
+
 __rust_helper void
 rust_helper_drm_gem_shmem_object_print_info(struct drm_printer *p, unsigned int indent,
 					    const struct drm_gem_object *obj)

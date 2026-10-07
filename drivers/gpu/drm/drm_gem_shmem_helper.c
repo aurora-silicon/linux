@@ -659,12 +659,13 @@ void drm_gem_shmem_purge_locked(struct drm_gem_shmem_object *shmem)
 
 	drm_WARN_ON(obj->dev, !drm_gem_shmem_is_purgeable(shmem));
 
-	dma_unmap_sgtable(dev->dev, shmem->sgt, DMA_BIDIRECTIONAL, 0);
-	sg_free_table(shmem->sgt);
-	kfree(shmem->sgt);
-	shmem->sgt = NULL;
-
-	drm_gem_shmem_put_pages_locked(shmem);
+	if (shmem->sgt) {
+		dma_unmap_sgtable(dev->dev, shmem->sgt, DMA_BIDIRECTIONAL, 0);
+		sg_free_table(shmem->sgt);
+		kfree(shmem->sgt);
+		shmem->sgt = NULL;
+		drm_gem_shmem_put_pages_locked(shmem);
+	}
 	drm_gem_shmem_put_cpu_pages_locked(shmem);
 
 	shmem->madv = -1;
