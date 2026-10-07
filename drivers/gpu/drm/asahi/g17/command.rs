@@ -23,7 +23,8 @@ const MAX_TILE_BUFFER: u64 = 32768;
 const PROCESS_EMPTY: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES;
 const RSRC_SPEC_HI: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_RSRC_SPEC_HI;
 const DBIAS_INT: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT;
-const RENDER_FLAGS: u32 = PROCESS_EMPTY | RSRC_SPEC_HI | DBIAS_INT;
+const FEW_PRIMITIVES: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FEW_PRIMITIVES;
+const RENDER_FLAGS: u32 = PROCESS_EMPTY | RSRC_SPEC_HI | DBIAS_INT | FEW_PRIMITIVES;
 
 /// Attachment settings persist until replaced, including by an empty list.
 #[derive(Clone, Copy)]
@@ -374,6 +375,7 @@ impl Payload {
                     scissor_va: cmd.isp_scissor_base,
                     depth_bias_va: cmd.isp_dbias_base,
                     depth_bias_is_int: cmd.flags & DBIAS_INT != 0,
+                    few_primitives: cmd.flags & FEW_PRIMITIVES != 0,
                     occlusion_query_va: cmd.isp_oclqry_base,
                     sampler_heap_va: cmd.sampler_heap,
                     sampler_count: cmd.sampler_count.into(),

@@ -1091,7 +1091,8 @@ impl gpu::Gpu for Gpu {
     fn get_params(&self, params: &mut uapi::drm_asahi_params_global) -> Result {
         params.features |=
             uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS as u64
-                | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS as u64;
+                | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS as u64
+                | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES as u64;
         params.gpu_generation = hw::GpuGen::G17 as u32;
         params.gpu_variant = self.cfg.identity.gpu_variant as u32;
         params.gpu_revision = self.id.gpu_rev as u32;
