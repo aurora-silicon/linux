@@ -60,9 +60,7 @@ OUR_FREEZE = (
 # The M3 Pro's Mesa package of the fake release, and what it needs.
 PRO_MESA_VERSION = "26.1.4.g15s1-1"
 PRO_MESA = f"mesa-m3-{PRO_MESA_VERSION}-aarch64.pkg.tar.zst"
-PRO_MESA_NEEDS = ("expat glibc>=2.43 libdisplay-info libdrm libgcc>=3.0 libglvnd libstdc++>=11.1 libx11 libxcb libxext "
-                  "libxshmfence libxxf86vm python spirv-tools>=1:1.4.357.0 systemd-libs vulkan-icd-loader wayland "
-                  "xcb-util-keysyms zlib zstd")
+PRO_MESA_NEEDS = re.search(r'^M3_PRO_MESA_NEEDS="([^"]*)"$', SRC, re.M).group(1)
 # An older M3 m1n1 that knows only the M3 Pro's switches.
 AURORA6 = "m1n1-aurora-1.6.1.aurora6-1-aarch64.pkg.tar.zst"
 OTHERS = [
@@ -158,6 +156,38 @@ esac
 exit 0
 """
 
+# Group membership from $FAKE/groups ("user group ..." lines); everything else from the real id.
+ID = r"""#!/bin/bash
+if [[ ${1:-} == -nG ]]; then
+  shift
+  [[ ${1:-} == -- ]] && shift
+  u=${1:-$(/usr/bin/id -un)}
+  [[ -e $FAKE/no-such-user-$u ]] && exit 1
+  line=$(grep -m1 "^$u " "$FAKE/groups" 2>/dev/null) || line=""
+  echo "$u${line#"$u"}"
+  exit 0
+fi
+exec /usr/bin/id "$@"
+"""
+GETENT = r"""#!/bin/bash
+if [[ ${1:-} == group && ${2:-} == render ]]; then
+  [[ -e $FAKE/no-render-group ]] && exit 2
+  echo "render:x:989:"
+  exit 0
+fi
+exec /usr/bin/getent "$@"
+"""
+GPASSWD = r"""#!/bin/bash
+echo "gpasswd $*" >>"$FAKE/log"
+if [[ -n ${FAKE_FAIL_GPASSWD:-} ]]; then echo "gpasswd: failed (fake)" >&2; exit 1; fi
+u=$2 g=$3
+case $1 in
+  -a) if grep -q "^$u " "$FAKE/groups" 2>/dev/null; then sed -i "/^$u /s/\$/ $g/" "$FAKE/groups"
+      else echo "$u $g" >>"$FAKE/groups"; fi ;;
+  -d) sed -i -E "/^$u /s/ $g( |\$)/\1/" "$FAKE/groups" ;;
+esac
+"""
+
 UPDATE_M1N1 = r"""#!/bin/bash
 echo "update-m1n1 $*" >>"$FAKE/log"
 # As the real one: sourced by sh under set -e (bash in POSIX mode on Arch).
@@ -211,6 +241,7 @@ class M3FlowBase(unittest.TestCase):
         self.state = self.tmp / "state"
         self.fake = self.tmp / "fake"
         for name, body in (("pacman", PACMAN), ("update-m1n1", UPDATE_M1N1), ("curl", CURL),
+                           ("id", ID), ("getent", GETENT), ("gpasswd", GPASSWD),
                            ("findmnt", "#!/bin/sh\ncase \"$*\" in *PARTUUID*) echo fake-uuid ;; *) echo vfat ;; esac\n"),
                            ("systemctl", "#!/bin/sh\nexit 0\n")):
             (self.tmp / "bin" / name).write_text(body)
@@ -225,9 +256,12 @@ class M3FlowBase(unittest.TestCase):
         # The M3 Pro's Mesa package of this fake release (a stand-in by the shipped name's form).
         self.pro_mesa = PRO_MESA
         self.pro_mesa_fixture(PRO_MESA, "mesa-m3", PRO_MESA_VERSION, "opt/mesa-m3")
-        # The invoking user's home, as getent would give it.
-        self.home = self.tmp / "home"
-        self.home.mkdir(exist_ok=True)
+        # The Mac's own files for the user-setup and switch-off checks (their --root), and the
+        # invoking user's home there: home_path as getent gives it on the Mac, home on this host.
+        self.sysroot = self.tmp / "sysroot"
+        self.home_path = "/home/u"
+        self.home = self.sysroot / self.home_path.lstrip("/")
+        self.home.mkdir(parents=True, exist_ok=True)
         # The m1n1 package every Mac gets in this fake release.
         self.m1n1_pkg = M1N1_PKG
         # The script under test; a test can run an earlier release's first.
@@ -298,11 +332,9 @@ M1N1_PACKAGE="{self.m1n1_pkg} {self.shas[self.m1n1_pkg]}"
 M1N1_BIN_SHA={self.bin_shas[self.m1n1_pkg]}
 M3_PRO_MESA_PACKAGE="{self.pro_mesa + ' ' + self.shas[self.pro_mesa] if self.pro_mesa else ''}"
 M3_PRO_MESA_NEEDS="{PRO_MESA_NEEDS}"
-M3_PRO_MESA_DISABLE='{self.tmp}/etc/mesa-m3/disable'
 M3_PRO_MESA_DETECTOR='{self.tmp}/opt/mesa-m3/libexec/mesa-m3-user-setup'
-M3_PRO_MESA_SETUP_LIST='/opt/mesa-m3/share/mesa-m3/user-setup.list'
-M3_PRO_MESA_SETUP_ROOT='{self.tmp}/sysroot'
-m3_pro_mesa_user_home() {{ echo '{self.home}'; }}
+M3_PRO_MESA_SETUP_ROOT='{self.sysroot}'
+m3_pro_mesa_user_home() {{ echo '{self.home_path}'; }}
 esp_bootbin() {{ echo '{self.boot}'; }}
 version_notice() {{ :; }}; sep_write_notice() {{ :; }}; ane_dkms_notice() {{ :; }}
 snapshot() {{ :; }}; add_pin() {{ :; }}; remove_pin() {{ :; }}

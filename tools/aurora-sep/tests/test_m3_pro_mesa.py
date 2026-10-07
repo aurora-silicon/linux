@@ -40,11 +40,18 @@ SCHEMA = "aurora.m3-pro-mesa-state/1"
 RUN_KEYS = ["schema", "run_id", "release", "written_at", "boot_id", "kernel", "board", "installer_sha256",
             "installer_source"]
 KEYS = RUN_KEYS + ["package", "version", "file", "sha256", "prefix", "result", "installed_version",
-                   "installed_by", "preexisting", "user", "user_setup_source", "user_setup", "opt_out",
-                   "opt_out_cmdline", "created_files"]
+                   "installed_by", "preexisting", "user", "render_member", "render_preexisting", "render_added",
+                   "render_by_installer", "user_setup_source", "user_setup", "opt_out", "opt_out_cmdline",
+                   "created_files"]
 # An error record: the run's keys, and the ownership history.
-ERROR_KEYS = RUN_KEYS + ["package", "result", "record_error", "installed_version", "installed_by", "preexisting"]
-REPEATED = {"user_setup_path", "opt_out_path", "record_error_key"}
+ERROR_KEYS = RUN_KEYS + ["package", "result", "record_error", "installed_version", "installed_by", "preexisting",
+                         "render_user", "render_preexisting", "render_by_installer"]
+REPEATED = {"integration_path", "render_added_user", "user_setup_path", "opt_out_path", "record_error_key"}
+INTEGRATION = re.search(r'^M3_PRO_MESA_INTEGRATION="([^"]*)"$', SRC, re.M).group(1).splitlines()
+# The reasons a login gives in mesa-m3's state file (its report, section 4.3).
+REASONS = ["active", "opt-out", "not-t6030", "no-gpu", "no-display", "no-access", "incomplete-prefix", "user-setup",
+           "user-setup-ldpath", "user-setup-unknown", "missing-soname", "load-failed", "log-unreadable", "gpu-fault",
+           "previous-failed"]
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 RESULTS = ["installed", "current", "newer-kept", "skipped-flag", "skipped-deps", "failed"]
 TAG = re.search(r"^TAG=(\S+)$", SRC, re.M).group(1)
@@ -71,8 +78,9 @@ def reset_mac(tc, board):
         if p.name in keep or p.name.startswith(("root-", "install-")):
             continue
         shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink()
-    for d in ("dt/chosen", "esp/m1n1", "esp/asahi", "etc/default", "state", "fake", "home"):
+    for d in ("dt/chosen", "esp/m1n1", "esp/asahi", "etc/default", "state", "fake"):
         (tc.tmp / d).mkdir(parents=True, exist_ok=True)
+    tc.home.mkdir(parents=True, exist_ok=True)
     tc.mac(board)
 
 
@@ -120,8 +128,8 @@ def owner_mesa(tc):
     (tc.fake / "versions").write_text("mesa-m3 26.0.0.owner-1\nmesa-m3-g15g 26.1.4.g15g1-5\n")
     (tc.tmp / "opt/mesa-m3/lib").mkdir(parents=True)
     (tc.tmp / "opt/mesa-m3/lib/libvulkan_asahi.so").write_bytes(b"the owner's own build")
-    (tc.tmp / "home/.config/chonkstep").mkdir(parents=True)
-    (tc.tmp / "home/.config/chonkstep/m3gpu-session.env").write_bytes(CHONKSTEP_ENV)
+    (tc.home / ".config/chonkstep").mkdir(parents=True)
+    (tc.home / ".config/chonkstep/m3gpu-session.env").write_bytes(CHONKSTEP_ENV)
 
 
 def parse_record(tc, data):
@@ -153,11 +161,16 @@ def parse_record(tc, data):
         return scalars, lists
     tc.assertEqual(order, KEYS)
     tc.assertEqual(lists["record_error_key"], [])
+    tc.assertEqual(lists["integration_path"], INTEGRATION)
     tc.assertIn(scalars["user_setup_source"], ("package-detector", "installer-builtin"))
-    if lists["user_setup_path"]:
-        tc.assertEqual(scalars["user_setup"], "present")
-    if scalars["user_setup_source"] == "installer-builtin" and scalars["user_setup"] != "unknown":
+    tc.assertIn(scalars["user_setup"], ("present", "none", "unknown"))
+    if scalars["user_setup"] != "unknown":
         tc.assertEqual(scalars["user_setup"], "present" if lists["user_setup_path"] else "none")
+    tc.assertIn(scalars["render_member"], ("yes", "no", "unknown"))
+    tc.assertIn(scalars["render_preexisting"], ("yes", "no", "unknown"))
+    tc.assertIn(scalars["render_added"], ("yes", "no", "failed"))
+    tc.assertIn(scalars["render_by_installer"], ("yes", "no"))
+    tc.assertEqual(scalars["user"] in lists["render_added_user"], scalars["render_by_installer"] == "yes")
     tc.assertEqual(scalars["opt_out"],
                    "present" if lists["opt_out_path"] or scalars["opt_out_cmdline"] == "yes" else "none")
     return scalars, lists
@@ -237,6 +250,8 @@ class ProMesaTest(flow.M3FlowBase):
                 self.assertEqual(rec["installed_by"], "installer")
                 self.assertEqual(rec["preexisting"], "none")
                 self.assertEqual(rec["user_setup_source"], "installer-builtin")   # no detector in the fake
+                self.assertEqual((rec["render_member"], rec["render_preexisting"], rec["render_added"],
+                                  rec["render_by_installer"]), ("yes", "no", "yes", "yes"))
                 self.assertEqual(rec["user_setup"], "none")
                 self.assertEqual(rec["opt_out"], "none")
                 self.assertEqual(rec["opt_out_cmdline"], "no")
@@ -485,7 +500,8 @@ class ProMesaTest(flow.M3FlowBase):
     def test_the_owners_setup_is_left_as_it_is(self):
         self.mac("j516s")
         # A home whose path has spaces (and an "=" and a ":"): each path stays whole.
-        self.home = home = self.tmp / "home dir/of the=owner: x"
+        self.home_path = h = "/home dir/of the=owner: x"
+        self.home = home = self.sysroot / h.lstrip("/")
         home.mkdir(parents=True)
         files = {
             ".config/chonkstep/m3gpu-session.env": CHONKSTEP_ENV,
@@ -505,37 +521,47 @@ class ProMesaTest(flow.M3FlowBase):
         proc = self.install()
         self.assertEqual(self.record()["result"], "installed")       # still on by default
         out = " ".join(proc.stdout.split())
-        self.assertIn(f"Left as it is: {self.record()['user']}'s own M3 Mesa setup ({home}/.config/"
-                      "environment.d/90-vulkan.conf: sets VK_ICD_FILENAMES;", out)
-        self.assertIn(f"{home}/.config/chonkstep/m3gpu-session.env: CHONKSTEP_M3_MESA_PREFIX=/home/owner/src/"
-                      "mesa-prefix).", out)
-        for rel in (".config/environment.d/90-vulkan.conf", ".config/hypr/hyprland.conf", ".drirc"):
-            self.assertIn(f"{home}/{rel}", out)
+        self.assertIn(f"Left as it is: {self.record()['user']}'s own M3 Mesa setup ({h}/.config/environment.d/"
+                      "90-vulkan.conf:1 sets VK_ICD_FILENAMES (/home/owner/icd.json); ", out)
+        self.assertIn(f"{h}/.config/hypr/hyprland.conf:1 sets LIBGL_DRIVERS_PATH (/home/owner/dri); ", out)
+        self.assertIn(f"{h}/.drirc chooses a driver (dri_driver); ", out)
+        self.assertIn(f"{h}/.config/chonkstep/m3gpu-session.env sets CHONKSTEP_M3_MESA_PREFIX to "
+                      "/home/owner/src/mesa-prefix).", out)
         self.assertNotIn("91-ours.conf", out)                          # it points at the package's prefix
-        self.assertNotIn(f"{home}/.config/drirc", out)
-        self.assertIn(f"switched off at login by {home}/.config/mesa-m3/disable", out)
+        self.assertNotIn(f"{h}/.config/drirc", out)
+        self.assertIn(f"switched off at login by {h}/.config/mesa-m3/disable: off for", out)
         rec, lists = self.record_lists()
-        self.assertEqual(rec["user_setup"], "present")
-        self.assertEqual(rec["user_setup_source"], "installer-builtin")
+        self.assertEqual((rec["user_setup_source"], rec["user_setup"]), ("installer-builtin", "present"))
         self.assertEqual(lists["user_setup_path"], [
-            f"{home}/.config/environment.d/90-vulkan.conf", f"{home}/.config/hypr/hyprland.conf",
-            f"{home}/.drirc", f"{home}/.config/chonkstep/m3gpu-session.env"])
+            f"{h}/.config/environment.d/90-vulkan.conf", f"{h}/.config/hypr/hyprland.conf",
+            f"{h}/.drirc", f"{h}/.config/chonkstep/m3gpu-session.env"])
         self.assertEqual(rec["opt_out"], "present")
-        self.assertEqual(lists["opt_out_path"], [f"{home}/.config/mesa-m3/disable"])
+        self.assertEqual(lists["opt_out_path"], [f"{h}/.config/mesa-m3/disable"])
         self.assertEqual(rec["opt_out_cmdline"], "no")
         self.uninstall()
         after = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in home.rglob("*") if p.is_file()}
         self.assertEqual(after, before)
 
+    def test_an_unreadable_setting_is_unknown_never_none(self):
+        self.mac("j516s")
+        f = self.home / ".config/hypr/hyprland.conf"
+        f.parent.mkdir(parents=True)
+        f.write_text("env = GALLIUM_DRIVER,zink\n")
+        f.chmod(0)
+        self.addCleanup(f.chmod, 0o644)
+        self.install()
+        rec, lists = self.record_lists()
+        self.assertEqual((rec["user_setup"], lists["user_setup_path"]), ("unknown", [f"{self.home_path}/.config/hypr/hyprland.conf"]))
+
     def test_the_system_opt_out_is_reported_and_kept(self):
         self.mac("j516s")
-        off = self.tmp / "etc/mesa-m3/disable"
+        off = self.sysroot / "etc/mesa-m3/disable"
         off.parent.mkdir(parents=True)
         off.write_text("")
         proc = self.install()
-        self.assertIn(f"switched off at login by {off}: off for every user", " ".join(proc.stdout.split()))
+        self.assertIn("switched off at login by /etc/mesa-m3/disable: off for every user", " ".join(proc.stdout.split()))
         rec, lists = self.record_lists()
-        self.assertEqual((rec["opt_out"], lists["opt_out_path"]), ("present", [str(off)]))
+        self.assertEqual((rec["opt_out"], lists["opt_out_path"]), ("present", ["/etc/mesa-m3/disable"]))
         self.uninstall()
         self.assertTrue(off.exists())
 
@@ -579,8 +605,8 @@ class ProMesaTest(flow.M3FlowBase):
             (self.home / ".drirc").write_text('<option name="dri_driver" value="zink"/>')
             (self.home / ".config/environment.d").mkdir(parents=True, exist_ok=True)
             (self.home / ".config/environment.d/a.conf").write_text("VK_DRIVER_FILES=/x\n")
-            (self.tmp / "etc/mesa-m3").mkdir(parents=True, exist_ok=True)
-            (self.tmp / "etc/mesa-m3/disable").write_text("")
+            (self.sysroot / "etc/mesa-m3").mkdir(parents=True, exist_ok=True)
+            (self.sysroot / "etc/mesa-m3/disable").write_text("")
         runs = {
             "installed": dict(),
             "current": dict(before=lambda: self.owner_has(PRO_MESA_VERSION)),
@@ -829,31 +855,34 @@ class ProMesaTest(flow.M3FlowBase):
     def test_a_newline_or_carriage_return_in_any_value_gives_an_error_record(self):
         self.mac("j516s")
         self.install()
+        # A file name with a newline: mesa-m3's detector refuses it (exit 2), so the record says
+        # user_setup=unknown, never the name.
         bad_file = self.home / ".config/environment.d/a\nuser_setup=none.conf"
         bad_file.parent.mkdir(parents=True)
         bad_file.write_text("VK_ICD_FILENAMES=/x\n")
-        for case, extra, key, quoted in (
-                ("a path with a newline", {}, "user_setup_path", "user_setup_path=$'"),
-                ("a user name with a carriage return", {"SUDO_USER": "own\rer"}, "user", "user=$'own\\rer'")):
-            with self.subTest(case=case):
-                if case.startswith("a user"):
-                    bad_file.unlink()
-                self.extra_env.update(extra)
-                proc = self.install(env="M3_PRO_MESA=0", check=False)
-                for k in extra:
-                    self.extra_env.pop(k)
-                self.assertEqual(proc.returncode, 4)
-                data = (self.state / "m3-pro-mesa").read_bytes()
-                rec, lists = parse_record(self, data)
-                self.assertEqual((rec["result"], rec["record_error"]), ("record-error", "value"))
-                self.assertEqual(lists["record_error_key"], [key])
-                # Never the refused value.
-                self.assertNotIn(b"user_setup=none.conf", data)
-                self.assertNotIn(b"own", data)
-                err = " ".join(proc.stderr.split())
-                self.assertEqual(len(record_warnings(proc)), 1, proc.stderr)
-                self.assertIn("a value holds a newline or a carriage return", err)
-                self.assertIn(quoted, err)
+        proc = self.install(env="M3_PRO_MESA=0")
+        data = (self.state / "m3-pro-mesa").read_bytes()
+        rec, lists = parse_record(self, data)
+        self.assertEqual((rec["result"], rec["user_setup"], lists["user_setup_path"]), ("skipped-flag", "unknown", []))
+        self.assertNotIn(b"user_setup=none.conf", data)
+        self.assertIn("the record says user_setup=unknown", " ".join(proc.stderr.split()))
+        bad_file.unlink()
+        # Any other value with a carriage return or a newline (here the user's name): an error record.
+        self.extra_env["SUDO_USER"] = "own\rer"
+        proc = self.install(env="M3_PRO_MESA=0", check=False)
+        self.extra_env.pop("SUDO_USER")
+        self.assertEqual(proc.returncode, 4)
+        data = (self.state / "m3-pro-mesa").read_bytes()
+        rec, lists = parse_record(self, data)
+        self.assertEqual((rec["result"], rec["record_error"]), ("record-error", "value"))
+        self.assertEqual(lists["record_error_key"], ["user"])
+        self.assertEqual(rec["render_user"], "none")
+        self.assertNotIn(b"own\r", data)                                 # never the refused value
+        self.assertNotIn(b"\r", data)
+        err = " ".join(proc.stderr.split())
+        self.assertEqual(len(record_warnings(proc)), 1, proc.stderr)
+        self.assertIn("a value holds a newline or a carriage return", err)
+        self.assertIn("user=$'own\\rer'", err)
         # Refused, and the error record fails too: moved aside.
         self.extra_env["SUDO_USER"] = "own\rer"
         proc = self.install(env=self.stub("rename", self.ALWAYS) + "\nM3_PRO_MESA=0", check=False)
@@ -924,13 +953,16 @@ class ProMesaTest(flow.M3FlowBase):
         path.write_text("#!/bin/bash\n" + 'echo "$*" >"$FAKE/detector-args"\n' + body)
         path.chmod(0o755)
 
-    # mesa-m3-user-setup's answer (U1's report, section 4.5): key=value lines; exit 0 none, 1 present.
-    PRESENT = ("echo schema=aurora.mesa-m3-user-setup/1; echo user_setup=present\n"
+    # mesa-m3-user-setup's answers (its report, section 4.5): schema 2; exit 0 none, 1 present,
+    # 3 unknown.
+    PRESENT = ("echo schema=aurora.mesa-m3-user-setup/2; echo user_setup=present\n"
                "echo 'user_setup_path=/a path/from the detector'\n"
                "echo 'user_setup_path=/b'\n"
-               "echo 'user_setup_detail=/a path/from the detector sets GALLIUM_DRIVER'\n"
-               "echo 'user_setup_detail=/b: chonkstep'\\''s M3 Mesa prefix is /x'\nexit 1\n")
-    NONE = "echo schema=aurora.mesa-m3-user-setup/1; echo user_setup=none; exit 0\n"
+               "echo 'user_setup_detail=/a path/from the detector:3 sets GALLIUM_DRIVER'\n"
+               "echo 'user_setup_detail=/b chooses a driver (dri_driver)'\nexit 1\n")
+    NONE = "echo schema=aurora.mesa-m3-user-setup/2; echo user_setup=none; exit 0\n"
+    UNKNOWN = ("echo schema=aurora.mesa-m3-user-setup/2; echo user_setup=unknown\n"
+               "echo user_setup_path=/c; echo 'user_setup_detail=/c cannot be read (Permission denied)'; exit 3\n")
 
     def test_the_user_setup_comes_from_the_packages_detector_once_installed(self):
         self.mac("j516s")
@@ -940,124 +972,243 @@ class ProMesaTest(flow.M3FlowBase):
         rec, lists = self.record_lists()
         self.assertEqual((rec["user_setup_source"], rec["user_setup"]), ("package-detector", "present"))
         self.assertEqual(lists["user_setup_path"], ["/a path/from the detector", "/b"])
-        self.assertEqual((self.fake / "detector-args").read_text().strip(), f"--home {self.home}")
+        self.assertEqual((self.fake / "detector-args").read_text().strip(),
+                         f"--home {self.home_path} --root {self.sysroot}")
         out = " ".join(proc.stdout.split())
-        self.assertIn("/a path/from the detector: sets GALLIUM_DRIVER; /b: chonkstep's M3 Mesa prefix is /x", out)
-        self.detector(self.NONE)
-        self.install()
-        rec, lists = self.record_lists()
-        self.assertEqual((rec["user_setup_source"], rec["user_setup"], lists["user_setup_path"]),
-                         ("package-detector", "none", []))
+        self.assertIn("(/a path/from the detector:3 sets GALLIUM_DRIVER; /b chooses a driver (dri_driver))", out)
+        for body, want in ((self.NONE, ("none", [])), (self.UNKNOWN, ("unknown", ["/c"]))):
+            self.detector(body)
+            self.install()
+            rec, lists = self.record_lists()
+            self.assertEqual((rec["user_setup_source"], rec["user_setup"], lists["user_setup_path"]),
+                             ("package-detector",) + want)
 
-    def test_the_built_in_check_without_mesa_m3_or_its_detector(self):
-        # Not installed (--no-m3-mesa), or installed without a detector, or the detector fails.
+    def test_the_built_in_copy_without_mesa_m3_or_its_detector(self):
+        # Not installed (--no-m3-mesa), or the installed detector fails: this script's copy.
         self.mac("j516s")
         (self.home / ".drirc").write_text('<option name="dri_driver" value="zink"/>')
         self.detector(self.NONE)
         self.install(env="M3_PRO_MESA=0")
         self.assertFalse((self.fake / "detector-args").exists())
         rec, lists = self.record_lists()
-        self.assertEqual((rec["user_setup_source"], lists["user_setup_path"]),
-                         ("installer-builtin", [f"{self.home}/.drirc"]))
-        self.detector("exit 2\n")
-        proc = self.install()
-        rec, lists = self.record_lists()
-        self.assertEqual((rec["user_setup_source"], lists["user_setup_path"]),
-                         ("installer-builtin", [f"{self.home}/.drirc"]))
-        self.assertIn("mesa-m3-user-setup failed (exit 2)", " ".join(proc.stderr.split()))
-        for body in ("echo schema=other/1; exit 0\n",                       # another form
-                     "echo schema=aurora.mesa-m3-user-setup/1; echo user_setup=present; exit 0\n",  # inconsistent
+        self.assertEqual((rec["user_setup_source"], rec["user_setup"], lists["user_setup_path"]),
+                         ("installer-builtin", "present", [f"{self.home_path}/.drirc"]))
+        for body in ("exit 2\n",                                                  # an error
+                     "echo schema=other/1; exit 0\n",                             # another form
+                     "echo schema=aurora.mesa-m3-user-setup/2; echo user_setup=present; exit 0\n",  # inconsistent
                      self.NONE.replace("exit 0", "exit 1")):
             with self.subTest(detector=body):
                 self.detector(body)
-                self.install()
-                self.assertEqual(self.record()["user_setup_source"], "installer-builtin")
-        # And when the built-in check fails too: unknown, never "none".
-        proc = self.install(env="m3_pro_mesa_builtin_setup() { return 5; }")
-        rec, lists = self.record_lists()
-        self.assertEqual((rec["user_setup"], lists["user_setup_path"]), ("unknown", []))
-        self.assertIn("own check of", " ".join(proc.stderr.split()))
+                proc = self.install()
+                rec, lists = self.record_lists()
+                self.assertEqual((rec["user_setup_source"], lists["user_setup_path"]),
+                                 ("installer-builtin", [f"{self.home_path}/.drirc"]))
+                self.assertIn("mesa-m3-user-setup failed", " ".join(proc.stderr.split()))
+        # And when the copy cannot run either: unknown, never "none".
+        for name, stub in (("no python3", "python3() { return 127; }"),
+                           ("not the release's bytes", "M3_PRO_MESA_DETECTOR_SHA256=" + "0" * 64)):
+            with self.subTest(copy=name):
+                proc = self.install(env=stub + "\nM3_PRO_MESA=0")
+                rec, lists = self.record_lists()
+                self.assertEqual((rec["user_setup"], lists["user_setup_path"]), ("unknown", []))
+                self.assertIn("copy of mesa-m3's user-setup check failed", " ".join(proc.stderr.split()))
 
-    def builtin(self, home=None):
-        proc = self.run_sh(f"m3_pro_mesa_builtin_setup '{home or self.home}'")
-        out = proc.stdout.split("\0")
+    def builtin(self):
+        """The built-in copy's answer for the harness's home: (exit status, [(path, detail)])."""
+        proc = self.run_sh(f"rc=0; m3_pro_mesa_builtin_setup '{self.home_path}' || rc=$?; printf 'rc=%s' \"$rc\"")
+        out, _, rc = proc.stdout.rpartition("rc=")
+        out = out.split("\0")
         self.assertEqual(out[-1], "")
-        return list(zip(out[:-1:2], out[1:-1:2]))
+        return int(rc), list(zip(out[:-1:2], out[1:-1:2]))
 
-    def test_the_built_in_check_follows_the_list(self):
-        rules = re.search(r'^M3_PRO_MESA_SETUP_RULES="([^"]*)"$', SRC, re.M).group(1).splitlines()
-        variables = [r.split()[1] for r in rules if r.startswith("variable ")]
-        self.assertEqual(len(variables), 13)
-        home, cfg, root = self.home, self.home / ".config", self.tmp / "sysroot"
-        envd = cfg / "environment.d"
-        envd.mkdir(parents=True)
-        # Each variable, set to something else: a finding. Pointing into the prefix, in a comment,
-        # or a longer name: none.
-        for v in variables:
-            (envd / f"{v}.conf").write_text(f"{v}=/somewhere/else\n")
-            (envd / f"ours-{v}.conf").write_text(f"{v}=/opt/mesa-m3/lib/x\n")
-            (envd / f"ours2-{v}.conf").write_text(f'export {v}="/opt/mesa-m3"\n')
-            (envd / f"comment-{v}.conf").write_text(f"# {v}=/somewhere/else\n-- {v}=x\n")
-            (envd / f"longer-{v}.conf").write_text(f"MY_{v}_X=/somewhere/else\n")
-        found = dict(self.builtin())
-        self.assertEqual(found, {f"{envd}/{v}.conf": f"sets {v}" for v in variables})
-        for f in envd.iterdir():
-            f.unlink()
-        # LD_LIBRARY_PATH: a directory with Mesa libraries other than PREFIX/lib.
-        mesa = home / "mesa/lib"
-        (mesa / "dri").mkdir(parents=True)
-        (mesa / "dri/zink_dri.so").write_text("")
-        (home / "empty/lib").mkdir(parents=True)
-        (root / "opt/mesa-m3/lib").mkdir(parents=True)
-        (root / "opt/mesa-m3/lib/libgallium-26.so").write_text("")
-        (root / "usr/local/mesa").mkdir(parents=True)
-        (root / "usr/local/mesa/libEGL_mesa.so.0").write_text("")
-        (envd / "a.conf").write_text("LD_LIBRARY_PATH=$HOME/mesa/lib:/opt/mesa-m3/lib\n")
-        (envd / "b.conf").write_text("LD_LIBRARY_PATH=${HOME}/empty/lib:/opt/mesa-m3/lib\n")
-        (envd / "c.conf").write_text('LD_LIBRARY_PATH="/usr/local/mesa"\n')
-        (cfg / "hypr").mkdir()
-        (cfg / "hypr/envs.lua").write_text('-- LD_LIBRARY_PATH=~/mesa/lib\nhl.env("LD_LIBRARY_PATH", "~/empty/lib")\n')
-        found = self.builtin()
-        self.assertEqual(found, [(f"{envd}/a.conf", f"puts another Mesa in LD_LIBRARY_PATH ({mesa})"),
-                                 (f"{envd}/c.conf", "puts another Mesa in LD_LIBRARY_PATH (/usr/local/mesa)")])
-        for f in list(envd.iterdir()) + [cfg / "hypr/envs.lua"]:
-            f.unlink()
-        # Every envfile of the list, the user's and the system's (under the root).
-        files = [cfg / "uwsm/env", cfg / "uwsm/env-hyprland", cfg / "uwsm/env.d/x", cfg / "uwsm/env-hyprland.d/y",
-                 cfg / "uwsm/default",
-                 cfg / "hypr/a.conf", cfg / "hypr/b.lua", root / "etc/xdg/uwsm/env",
-                 root / "etc/xdg/uwsm/env-x", root / "etc/xdg/uwsm/env.d/y", root / "etc/environment"]
-        for f in files:
-            f.parent.mkdir(parents=True, exist_ok=True)
-            f.write_text("export GALLIUM_DRIVER=zink\n")
-        self.assertEqual([p for p, _ in self.builtin()], [str(f) for f in files])
-        for f in files:
-            f.unlink()
-        # drirc: only with a dri_driver option.
-        for f in (home / ".drirc", cfg / "drirc", root / "etc/drirc"):
-            f.write_text('<option name="dri_driver" value="zink"/>')
-        (cfg / "drirc").write_text("<driconf/>")
-        self.assertEqual(self.builtin(), [(str(home / ".drirc"), "chooses a driver (dri_driver)"),
-                                          (str(root / "etc/drirc"), "chooses a driver (dri_driver)")])
-        for f in (home / ".drirc", cfg / "drirc", root / "etc/drirc"):
-            f.unlink()
-        # chonkstep: another prefix (quoted, commented, CRLF); the package's; none set.
-        chonk = cfg / "chonkstep/m3gpu-session.env"
-        chonk.parent.mkdir(parents=True)
-        for text, want in (('export CHONKSTEP_M3_MESA_PREFIX="/home/x/p" # mine\r\n', "CHONKSTEP_M3_MESA_PREFIX=/home/x/p"),
-                           ("CHONKSTEP_M3_MESA_PREFIX=/home/x/q\nCHONKSTEP_M3_MESA_PREFIX=/home/x/r\n",
-                            "CHONKSTEP_M3_MESA_PREFIX=/home/x/r"),
-                           ("CHONKSTEP_M3_MESA_PREFIX=/opt/mesa-m3\n", None),
-                           ("CHONKSTEP_M3_MESA_PREFIX='/opt/mesa-m3/'\n", None),
-                           ("CHONKSTEP_M3_CLIENTS=gpu\n", "sets no CHONKSTEP_M3_MESA_PREFIX: chonkstep's M3 launcher "
-                                                         "uses its own default prefix")):
-            with self.subTest(chonkstep=text):
-                chonk.write_text(text)
-                self.assertEqual(self.builtin(), [(str(chonk), want)] if want else [])
-        # Nothing for a home with none of it, or no home.
-        chonk.unlink()
-        self.assertEqual(self.builtin(), [])
-        self.assertEqual(self.builtin(self.tmp / "no such home"), [])
+    def test_the_built_in_copy_is_the_releases_bytes(self):
+        # The heredocs print the files whose sha256 the release names (fill-m3-pro-mesa.sh writes
+        # both from the package), and the copy answers like the detector.
+        for fn, var in (("m3_pro_mesa_builtin_detector", "M3_PRO_MESA_DETECTOR_SHA256"),
+                        ("m3_pro_mesa_builtin_list", "M3_PRO_MESA_SETUP_LIST_SHA256")):
+            out = subprocess.run(["bash", "-c", f"AURORA_SEP_SOURCE_ONLY=1 source '{flow.INSTALLER}'; {fn}"],
+                                 capture_output=True, check=True).stdout
+            self.assertEqual(hashlib.sha256(out).hexdigest(), re.search(rf"^{var}=(\S+)$", SRC, re.M).group(1))
+        self.assertEqual(self.builtin(), (0, []))
+        (self.home / ".drirc").write_text('<option name="dri_driver" value="zink"/>')
+        self.assertEqual(self.builtin(), (1, [(f"{self.home_path}/.drirc", " chooses a driver (dri_driver)")]))
+        (self.home / ".drirc").chmod(0)
+        self.addCleanup((self.home / ".drirc").chmod, 0o644)
+        rc, found = self.builtin()
+        self.assertEqual((rc, [p for p, _ in found]), (3, [f"{self.home_path}/.drirc"]))
+        self.assertEqual(self.run_sh(f"rc=0; m3_pro_mesa_builtin_setup '/no such home' || rc=$?; echo $rc").stdout.strip(),
+                         "0")
+
+    def test_u1s_fixtures_pass_on_the_built_in_copy(self):
+        # mesa-m3's own detector fixtures (42 cases, exact output and exit status) on this
+        # script's copy, as the package build runs them on the package's.
+        fixtures = Path.home() / "source/aurora-recipes/mesa-m3-recipe/tests/test-user-setup.sh"
+        if not fixtures.is_file() or os.geteuid() == 0:
+            self.skipTest("mesa-m3-recipe/tests/test-user-setup.sh (as a normal user) is needed")
+        det, lst = self.tmp / "mesa-m3-user-setup", self.tmp / "user-setup.list"
+        for fn, path in (("m3_pro_mesa_builtin_detector", det), ("m3_pro_mesa_builtin_list", lst)):
+            path.write_bytes(subprocess.run(["bash", "-c", f"AURORA_SEP_SOURCE_ONLY=1 source '{flow.INSTALLER}'; {fn}"],
+                                            capture_output=True, check=True).stdout)
+        det.chmod(0o755)
+        proc = subprocess.run(["sh", str(fixtures), str(det), str(lst)], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr)
+        self.assertNotIn("FAIL", proc.stdout)
+        self.assertGreaterEqual(proc.stdout.count("\nok ") + proc.stdout.startswith("ok "), 40)
+
+    # The render group (mesa-m3's udev rule gives the M3 Pro's render node to it).
+
+    def groups(self):
+        try:
+            return (self.fake / "groups").read_text()
+        except FileNotFoundError:
+            return ""
+
+    def me(self):
+        return subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip()
+
+    def test_the_desktop_user_is_added_to_render(self):
+        self.mac("j516s")
+        proc = self.install()
+        me = self.me()
+        self.assertIn(f"gpasswd -a {me} render", self.log().splitlines())
+        self.assertIn(f"{me} render", self.groups())
+        rec = self.record()
+        self.assertEqual((rec["render_member"], rec["render_preexisting"], rec["render_added"],
+                          rec["render_by_installer"]), ("yes", "no", "yes", "yes"))
+        out = " ".join(proc.stdout.split())
+        self.assertIn(f"Added {me} to the render group, which the M3 Pro's GPU now needs. That takes effect at the "
+                      "next login: the reboot does that.", out)
+        # A rerun adds nothing and keeps the history.
+        since = len(self.log())
+        proc = self.install()
+        self.assertNotIn("gpasswd", self.log()[since:])
+        rec = self.record()
+        self.assertEqual((rec["render_member"], rec["render_preexisting"], rec["render_added"],
+                          rec["render_by_installer"]), ("yes", "no", "no", "yes"))
+        self.assertNotIn("Added", proc.stdout)
+        # --uninstall takes them out again.
+        since = len(self.log())
+        proc = self.uninstall()
+        self.assertIn(f"gpasswd -d {me} render", self.log()[since:].splitlines())
+        self.assertNotIn("render", self.groups())
+        self.assertIn(f"Took {me} out of the render group, which this script had added them to", proc.stdout)
+
+    def test_a_member_already_stays_a_member(self):
+        self.mac("j516s")
+        me = self.me()
+        (self.fake / "groups").write_text(f"{me} wheel render\n")
+        proc = self.install()
+        self.assertNotIn("gpasswd", self.log())
+        rec = self.record()
+        self.assertEqual((rec["render_member"], rec["render_preexisting"], rec["render_added"],
+                          rec["render_by_installer"]), ("yes", "yes", "no", "no"))
+        self.assertNotIn("render group,", proc.stdout)
+        self.uninstall()
+        self.assertNotIn("gpasswd", self.log())
+        self.assertEqual(self.groups(), f"{me} wheel render\n")
+
+    def test_uninstall_takes_out_only_what_this_script_added(self):
+        me = self.me()
+        for case in ("taken out by hand since", "error record", "another user's run"):
+            with self.subTest(case):
+                reset_mac(self, "j516s")
+                self.install()
+                if case == "taken out by hand since":
+                    (self.fake / "groups").write_text(f"{me} wheel\n")
+                elif case == "error record":
+                    self.extra_env["SUDO_USER"] = "own\rer"
+                    self.install(env="M3_PRO_MESA=0", check=False)
+                    self.extra_env.pop("SUDO_USER")
+                    self.assertEqual(self.record_lists()[1]["render_added_user"], [me])   # kept in the error record
+                else:
+                    self.extra_env["SUDO_USER"] = "other"
+                    self.install()
+                    self.extra_env.pop("SUDO_USER")
+                    rec, lists = self.record_lists()
+                    self.assertEqual((rec["user"], lists["render_added_user"]), ("other", [me, "other"]))
+                before = self.groups()
+                since = len(self.log())
+                proc = self.uninstall()
+                if case == "another user's run":
+                    # Both were added by this script: both come out, and nobody else.
+                    self.assertEqual(sorted(l for l in self.log()[since:].splitlines() if l.startswith("gpasswd")),
+                                     [f"gpasswd -d {me} render", "gpasswd -d other render"])
+                    self.assertNotIn("render", self.groups())
+                else:
+                    self.assertNotIn("gpasswd", self.log()[since:])
+                    self.assertEqual(self.groups(), before)
+                if case == "error record":
+                    self.assertIn("Keeping " + me + " in the render group", proc.stdout)
+
+    def test_a_root_run_adds_no_one(self):
+        self.mac("j516s")
+        proc = self.install(env="m3_pro_mesa_user() { echo root; }")
+        self.assertNotIn("gpasswd", self.log())
+        rec = self.record()
+        self.assertEqual((rec["user"], rec["render_added"], rec["render_by_installer"]), ("root", "no", "no"))
+        self.assertIn("This ran as root, so no desktop user was added to the render group the M3 Pro's GPU now "
+                      "needs: add yours with sudo gpasswd -a <user> render and log in again.", " ".join(proc.stdout.split()))
+        self.assertEqual(proc.returncode, 0)
+
+    def test_render_group_failures(self):
+        me = self.me()
+        for case, env, extra, setup in (
+                ("gpasswd fails", "", {"FAKE_FAIL_GPASSWD": "1"}, None),
+                ("no render group", "", {}, lambda: (self.fake / "no-render-group").write_text("")),
+                ("not a user name", "", {"SUDO_USER": "Not A User"}, None)):
+            with self.subTest(case):
+                reset_mac(self, "j516s")
+                if setup:
+                    setup()
+                self.extra_env.update(extra)
+                try:
+                    proc = self.install(env=env, check=False)
+                finally:
+                    for k in extra:
+                        self.extra_env.pop(k)
+                self.assertEqual(proc.returncode, 3, proc.stderr)
+                rec = self.record()
+                self.assertEqual((rec["result"], rec["render_added"], rec["render_by_installer"]),
+                                 ("installed", "failed", "no"))
+                self.assertIn("render group", " ".join(proc.stderr.split()))
+                self.assertIn("The exit status is 3.", " ".join(proc.stdout.split()))
+                self.assertNotIn(f"{me} render", self.groups())
+
+    def test_no_render_change_without_the_mesa(self):
+        for case, env, extra in (("--no-m3-mesa", "M3_PRO_MESA=0", {}),
+                                 ("dependencies too old", "", {"FAKE_GLIBC": "2.0-1"}),
+                                 ("pacman fails", "", {"FAKE_FAIL_U_FOR": "mesa-m3-*"})):
+            with self.subTest(case):
+                reset_mac(self, "j516s")
+                self.extra_env.update(extra)
+                try:
+                    self.install(env=env, check=False)
+                finally:
+                    for k in extra:
+                        self.extra_env.pop(k)
+                self.assertNotIn("gpasswd", self.log())
+                rec = self.record()
+                self.assertEqual((rec["render_added"], rec["render_member"]), ("no", "no"))
+
+    def test_the_recovery_text(self):
+        self.mac("j516s")
+        proc = self.install()
+        out = proc.stdout
+        start = out.index("   Each login records whether the GPU graphics are on and why:")
+        block = out[start:out.index("(the wheel or adm group).", start)]
+        for text in ("cat /run/user/$(id -u)/mesa-m3-session.state", "journalctl -b -t mesa-m3",
+                     "mkdir -p ~/.config/mesa-m3 && touch ~/.config/mesa-m3/disable", "mesa_m3=off",
+                     "rm ~/.config/mesa-m3/disable", "previous-failed", "rm /run/user/$(id -u)/mesa-m3-attempt",
+                     "Ctrl+Alt+F3", "render group"):
+            self.assertIn(text, block)
+        words = " ".join(block.split())
+        self.assertIn("Reasons: " + ", ".join(REASONS) + ".", words)
+        self.assertLessEqual(len(block.splitlines()), 14)
+        self.assertTrue(all(len(l) <= 100 for l in block.splitlines()))
+        # Not when mesa-m3 is not installed.
+        reset_mac(self, "j516s")
+        proc = self.install(env="M3_PRO_MESA=0")
+        self.assertNotIn("Each login records", proc.stdout)
 
 
 def pro_mesa_package():
@@ -1080,16 +1231,12 @@ def pro_mesa_package():
                      "this release's mesa-m3 package (AURORA_PRO_MESA_PKG), python3 and bsdtar are needed")
 class DetectorAgreementTest(flow.M3FlowBase):
     """mesa-m3's own detector (mesa-m3-user-setup, from the package, with its own list) and this
-    script's built-in copy, on the same homes: the same answer, the same paths in the same order.
-    The session hook yields on the detector's answer; the record before mesa-m3 is installed
-    comes from the built-in copy."""
-
-    HOME = "/home/u"
+    script's built-in copy, as the installer runs it, on the same homes: the same answer, the same
+    paths in the same order. The session hook yields on the detector's answer; the record before
+    mesa-m3 is installed comes from the built-in copy."""
 
     def setUp(self):
         super().setUp()
-        self.root = self.tmp / "sysroot"
-        self.root.mkdir(exist_ok=True)
         pkg = pro_mesa_package()
         detector = re.search(r'^M3_PRO_MESA_DETECTOR="([^"]*)"$', SRC, re.M).group(1)
         listed = re.search(r'^M3_PRO_MESA_SETUP_LIST="([^"]*)"$', SRC, re.M).group(1)
@@ -1098,33 +1245,35 @@ class DetectorAgreementTest(flow.M3FlowBase):
         subprocess.run(["bsdtar", "-xf", str(pkg), "-C", str(self.pkgroot), detector.lstrip("/"), listed.lstrip("/")],
                        check=True)
         self.detector_bin = self.pkgroot / detector.lstrip("/")
-        self.home = self.root / self.HOME.lstrip("/")
 
     def answers(self):
-        """(detector paths, built-in paths), both as paths on the Mac (without the test root)."""
-        proc = subprocess.run(["python3", str(self.detector_bin), "--home", self.HOME, "--root", str(self.root)],
+        """((exit status, detector paths), (exit status, built-in paths))."""
+        proc = subprocess.run(["python3", str(self.detector_bin), "--home", self.home_path, "--root", str(self.sysroot)],
                               capture_output=True, text=True)
-        self.assertIn(proc.returncode, (0, 1), proc.stderr)
+        self.assertIn(proc.returncode, (0, 1, 3), proc.stderr)
         lines = proc.stdout.splitlines()
-        self.assertEqual(lines[0], "schema=aurora.mesa-m3-user-setup/1")
+        self.assertEqual(lines[0], "schema=aurora.mesa-m3-user-setup/2")
         theirs = [l.split("=", 1)[1] for l in lines if l.startswith("user_setup_path=")]
-        self.assertEqual(lines[1], "user_setup=" + ("present" if theirs else "none"))
-        self.assertEqual(proc.returncode, 1 if theirs else 0)
-        out = self.run_sh(f"m3_pro_mesa_builtin_setup '{self.home}'").stdout.split("\0")
-        ours = [p[len(str(self.root)):] if p.startswith(str(self.root)) else p for p in out[:-1:2]]
-        return theirs, ours
+        self.assertEqual(lines[1], "user_setup=" + {0: "none", 1: "present", 3: "unknown"}[proc.returncode])
+        body = f"rc=0; m3_pro_mesa_builtin_setup '{self.home_path}' || rc=$?; printf 'rc=%s' \"$rc\""
+        out, _, rc = self.run_sh(body).stdout.rpartition("rc=")
+        ours = out.split("\0")[:-1:2]
+        return (proc.returncode, theirs), (int(rc), ours)
 
     def write(self, files):
         for rel, data in files.items():
-            path = self.root / rel.lstrip("/")
+            path = self.sysroot / rel.lstrip("/")
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(data)
+            if data is None:
+                path.mkdir(exist_ok=True)
+            else:
+                path.write_text(data)
 
     def scenarios(self):
-        h, c = self.HOME, f"{self.HOME}/.config"
-        variables = [l.split()[1] for l in
-                     re.search(r'^M3_PRO_MESA_SETUP_RULES="([^"]*)"$', SRC, re.M).group(1).splitlines()
-                     if l.startswith("variable ")]
+        h, c = self.home_path, f"{self.home_path}/.config"
+        variables = [l.split("\t")[1] for l in (self.pkgroot / "opt/mesa-m3/share/mesa-m3/user-setup.list").read_text().splitlines()
+                     if l.startswith(("variable\t", "flag\t"))]
+        self.assertEqual(len(variables), 12)
         yield "empty home", {}
         yield "the lab m3pro today", {f"{c}/chonkstep/m3gpu-session.env": CHONKSTEP_ENV.decode(),
                                       f"{c}/hypr/hyprland.conf": "monitor=,preferred,auto,1\n"}
@@ -1139,22 +1288,43 @@ class DetectorAgreementTest(flow.M3FlowBase):
                                          f"{c}/uwsm/env": f'export {v}="/opt/mesa-m3"\n'}
             yield f"{v} commented", {f"{c}/hypr/a.conf": f"# env = {v},/x\n", f"{c}/hypr/b.lua": f"-- {v}=/x\n"}
             yield f"{v} as part of a longer name", {f"{c}/uwsm/env-hyprland": f"MY_{v}_X=/x\n"}
+            yield f"{v} set empty", {f"{c}/uwsm/env": f"export {v}=\n"}
+        # Dave's three counterexamples.
+        yield "d1 a comment naming the prefix", {f"{c}/uwsm/env": "export LIBGL_ALWAYS_SOFTWARE=1 # /opt/mesa-m3/\n"}
+        yield "d2 a list with a private entry", {
+            f"{c}/uwsm/env": "VK_DRIVER_FILES=/opt/mesa-m3/share/vulkan/icd.d/asahi_icd.aarch64.json:/opt/private/icd.json\n"}
+        yield "d3 an unreadable file", {f"{c}/uwsm/env": "UNREADABLE"}
+        yield "d3 an unlistable directory", {f"{c}/hypr/conf.d": "UNLISTABLE"}
+        # Normalised paths, quoting, a later LD_LIBRARY_PATH, Hyprland subdirectories.
+        yield "a path out of the prefix by ..", {f"{c}/uwsm/env": "export GBM_BACKENDS_PATH=/opt/mesa-m3/../x\n"}
+        yield "a quoted ; and a second assignment", {f"{c}/uwsm/env": "A=1; export GALLIUM_DRIVER='zink' # x\n"}
+        yield "LD_LIBRARY_PATH replaced after the hook", {f"{c}/uwsm/env": "export LD_LIBRARY_PATH=/usr/lib\n"}
+        yield "LD_LIBRARY_PATH kept after the hook", {f"{c}/uwsm/env": 'export LD_LIBRARY_PATH="/x:$LD_LIBRARY_PATH"\n'}
+        yield "LD_LIBRARY_PATH replaced before the hook", {f"{c}/environment.d/a.conf": "LD_LIBRARY_PATH=/usr/lib\n"}
+        yield "Hyprland subdirectories", {f"{c}/hypr/conf.d/deep/envs.conf": "env = GBM_BACKENDS_PATH,/home/u/gbm\n",
+                                          f"{c}/hypr/lua/x.lua": 'env("LIBGL_DRIVERS_PATH", "/x")\n'}
+        yield "a Hyprland lua value that is not a literal", {f"{c}/hypr/x.lua": 'env("GALLIUM_DRIVER", os.getenv("X"))\n'}
         yield "Hyprland env lines", {f"{c}/hypr/envs.conf": "env = GBM_BACKENDS_PATH,/home/u/gbm\n",
-                                     f"{c}/hypr/envs.lua": 'hl.env("LIBGL_DRIVERS_PATH", "/x")\n'}
+                                     f"{c}/hypr/envs.lua": 'env("LIBGL_DRIVERS_PATH", "/x")\n'}
         yield "LD_LIBRARY_PATH", {f"{h}/mesa/lib/libgallium-26.so": "", f"{h}/plain/lib/libfoo.so": "",
                                   "/opt/mesa-m3/lib/libgallium-26.so": "", "/usr/local/m/libEGL_mesa.so.0": "",
                                   f"{h}/drm/dri/zink_dri.so": "",
-                                  f"{c}/uwsm/env": "export LD_LIBRARY_PATH=$HOME/plain/lib:/opt/mesa-m3/lib\n",
-                                  f"{c}/uwsm/env.d/a": "LD_LIBRARY_PATH=${HOME}/mesa/lib\n",
-                                  f"{c}/uwsm/env-x.d/b": 'LD_LIBRARY_PATH="/usr/local/m"\n',
+                                  f"{c}/environment.d/1.conf": "LD_LIBRARY_PATH=$HOME/plain/lib:/opt/mesa-m3/lib\n",
+                                  f"{c}/environment.d/2.conf": "LD_LIBRARY_PATH=${HOME}/mesa/lib\n",
+                                  f"{c}/uwsm/env-x.d/b": 'LD_LIBRARY_PATH="/usr/local/m:$LD_LIBRARY_PATH"\n',
                                   f"{c}/hypr/c.conf": "env = LD_LIBRARY_PATH,~/drm\n",
                                   f"{c}/hypr/d.conf": "# LD_LIBRARY_PATH=~/mesa/lib\n"}
         yield "system files", {"/etc/xdg/uwsm/env": "export VK_ICD_FILENAMES=/x.json\n",
                                "/etc/xdg/uwsm/env-hyprland": "export GALLIUM_DRIVER=zink\n",
                                "/etc/xdg/uwsm/env.d/z": "MESA_LOADER_DRIVER_OVERRIDE=zink\n",
+                               "/usr/local/share/uwsm/env": "export GBM_ALWAYS_SOFTWARE=1\n",
+                               "/usr/share/uwsm/env-hyprland": "export DRIRC_CONFIGDIR=/x\n",
+                               "/usr/share/uwsm/env.d/60-later": "export VK_ADD_DRIVER_FILES=/x.json\n",
+                               "/usr/share/uwsm/env.d/40-earlier": "export VK_ADD_DRIVER_FILES=/y.json\n",
                                "/etc/environment": "LIBGL_ALWAYS_SOFTWARE=1\n",
                                "/etc/drirc": '<option name="dri_driver" value="zink"/>'}
         yield "drirc", {f"{h}/.drirc": '<option name = "dri_driver" value="zink"/>', f"{c}/drirc": "<driconf/>"}
+        yield "drirc in an XML comment", {f"{h}/.drirc": '<!-- <option name="dri_driver" value="zink"/> -->'}
         yield "everything at once", {f"{c}/environment.d/1.conf": "VK_DRIVER_FILES=/x\n",
                                      f"{c}/uwsm/default": "GBM_ALWAYS_SOFTWARE=1\n",
                                      f"{c}/hypr/x.conf": "env = DRIRC_CONFIGDIR,/x\n",
@@ -1162,17 +1332,28 @@ class DetectorAgreementTest(flow.M3FlowBase):
                                      f"{c}/chonkstep/m3gpu-session.env": "CHONKSTEP_M3_MESA_PREFIX=/home/u/p\n"}
 
     def test_the_detector_and_the_built_in_copy_agree(self):
-        n = 0
+        if os.geteuid() == 0:
+            self.skipTest("unreadable files need a normal user")
+        n, kinds = 0, set()
         for name, files in self.scenarios():
             with self.subTest(name):
-                shutil.rmtree(self.root)
-                self.root.mkdir()
+                for p in self.sysroot.rglob("*"):
+                    p.chmod(0o755 if p.is_dir() else 0o644)
+                shutil.rmtree(self.sysroot)
                 self.home.mkdir(parents=True)
-                self.write(files)
+                special = {k: v for k, v in files.items() if v in ("UNREADABLE", "UNLISTABLE")}
+                self.write({k: ("x\n" if v == "UNREADABLE" else None if v == "UNLISTABLE" else v)
+                            for k, v in files.items()})
+                for rel in special:
+                    (self.sysroot / rel.lstrip("/")).chmod(0)
                 theirs, ours = self.answers()
                 self.assertEqual(ours, theirs)
-                n += bool(theirs)
-        self.assertGreater(n, 20)            # most scenarios have findings
+                n += 1
+                kinds.add(theirs[0])
+        for p in self.sysroot.rglob("*"):
+            p.chmod(0o755 if p.is_dir() else 0o644)
+        self.assertGreaterEqual(n, 70)
+        self.assertEqual(kinds, {0, 1, 3})                   # none, present and unknown all covered
 
 
 class FromEarlierReleasesTest(flow.M3FlowBase):
@@ -1266,7 +1447,9 @@ class OtherMacsTest(flow.M3FlowBase):
             self.assertIn("mesa-m3", installed)
             self.assertIn("mesa-m3-g15g", installed)
             self.assertEqual(after["tree"]["opt/mesa-m3/lib/libvulkan_asahi.so"], b"the owner's own build")
-            self.assertEqual(after["tree"]["home/.config/chonkstep/m3gpu-session.env"], CHONKSTEP_ENV)
+            home = self.home.relative_to(self.tmp).as_posix()
+            self.assertEqual(after["tree"][f"{home}/.config/chonkstep/m3gpu-session.env"], CHONKSTEP_ENV)
+            self.assertNotIn("gpasswd", log)
 
     def test_no_m3_mesa_changes_nothing_elsewhere(self):
         # The option is taken on every Mac (one release, one set of options) and does nothing there.
@@ -1289,6 +1472,8 @@ class ReleaseAssetTest(unittest.TestCase):
         # anything under the prefix, the package's switch-offs or a home directory. Its only
         # writes are the set-aside in its work directory and the record's publication in $STATE.
         body = SRC[SRC.index("# ---- the M3 Pro's Mesa"):SRC.index("this_board() {")]
+        # Without the byte copies of mesa-m3's files and the recovery text (heredocs, printed only).
+        body = re.sub(r"cat <<'(M3_PRO_MESA_[A-Z_]+)'\n.*?\n\1\n", "", body, flags=re.S)
         code = [l.strip() for l in body.splitlines() if not l.strip().startswith("#")]
         allowed = {
             'if ! tmp=$($sudo mktemp "$STATE/.$M3_PRO_MESA_RECORD_NAME.XXXXXX"); then',
@@ -1297,14 +1482,20 @@ class ReleaseAssetTest(unittest.TestCase):
             'elif ! $sudo mv -f "$tmp" "$rec"; then',
             '$sudo rm -f "$tmp" || M3_PRO_MESA_WRITE_ERR+="; $tmp could not be removed"',
             '$sudo mv -n "$rec" "$name" || true',
+            'dir=$(mktemp -d) || return 2',
+            'm3_pro_mesa_builtin_detector >"$dir/mesa-m3-user-setup"',
+            'm3_pro_mesa_builtin_list >"$dir/user-setup.list"',
+            'rm -rf "$dir"',
+            'if $sudo gpasswd -a "$user" "$g" >/dev/null && m3_pro_mesa_in_group "$user" "$g"; then',
+            'if $sudo gpasswd -d "$u" "$g" >/dev/null; then',
             'mkdir -p "$work/m3-pro"',
             'mv "$work/$file" "$work/m3-pro/"',
         }
         # Commands in command position (line start, after a pipe, a list operator, if, then or $( ),
         # and redirections into a variable's path.
         verb = (r"(^|&&|\|\||\||;|\bthen\b|\b(el)?if !?|\$\()\s*(\$sudo\s+)?"
-                r"(rm|ln|mv|tee|mktemp|chmod|chown|mkdir|cp|install|touch|truncate|dd|sed -i)\b")
-        writes = [l for l in code if re.search(verb, l) or re.search(r"[^2]>\s*\"?\$(?!\(|\{?work)", l)]
+                r"(rm|ln|mv|tee|mktemp|chmod|chown|mkdir|cp|install|touch|truncate|dd|sed -i|gpasswd|usermod)\b")
+        writes = [l for l in code if re.search(verb, l) or re.search(r"(^|\s)>>?\s*\"?\$(?!\(|\{?work)", l)]
         self.assertEqual(sorted(set(writes) - allowed), [])
         self.assertEqual(sorted(allowed - set(writes)), [])
 
