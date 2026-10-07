@@ -206,6 +206,20 @@ impl crate::g17::Firmware {
         slot: u8,
         deferred: &mut DeferredBatch,
     ) -> Result {
+        let observe_before_failure = {
+            let entry = self.queues.render.entry_mut(slot)?;
+            let pair = entry.pair.as_ref().ok_or(EIO)?;
+            entry.pending_error.as_ref().is_some_and(|(status, _)| {
+                Arc::ptr_eq(pair.context().status(), status)
+            })
+        };
+        if observe_before_failure {
+            // VM failure could not observe this pair while preparation owned
+            // it. Restore the same final-observation boundary used by
+            // settle_render_vm before quarantining any still-owned commands.
+            // Keep pending_error intact if observation itself fails.
+            self.retire_render_slot(usize::from(slot), None, deferred)?;
+        }
         let entry = self.queues.render.entry_mut(slot)?;
         let pair = entry.pair.as_mut().ok_or(EIO)?;
         if let Some((status, error)) = entry.pending_error.take() {
