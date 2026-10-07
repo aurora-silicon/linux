@@ -37,6 +37,8 @@ BOARDS = {
     "j613": ["apple,j613", "apple,t8122", "apple,arm-platform"],
     "j615": ["apple,j615", "apple,t8122", "apple,arm-platform"],
     "j504": ["apple,j504", "apple,t8122", "apple,arm-platform"],
+    "j516c": ["apple,j516c", "apple,t6031", "apple,arm-platform"],
+    "j516m": ["apple,j516m", "apple,t6034", "apple,arm-platform"],
     "j314s": ["apple,j314s", "apple,t6000", "apple,arm-platform"],
     "j293": ["apple,j293", "apple,t8103", "apple,arm-platform"],
     "j313": ["apple,j313", "apple,t8103", "apple,arm-platform"],
@@ -55,6 +57,10 @@ OUR_FREEZE = (
     "M1N1_UPDATE_DISABLED=1\n"
     "# <<< aurora-sep: keep this M3's boot.bin as it is\n"
 )
+# The M3 Pro's Mesa package of the fake release, and what it needs.
+PRO_MESA_VERSION = "26.1.4.g15s1-1"
+PRO_MESA = f"mesa-m3-{PRO_MESA_VERSION}-aarch64.pkg.tar.zst"
+PRO_MESA_NEEDS = "glibc>=2.43 gcc-libs>=11 spirv-tools>=1:1.4.357.0"
 # An older M3 m1n1 that knows only the M3 Pro's switches.
 AURORA6 = "m1n1-aurora-1.6.1.aurora6-1-aarch64.pkg.tar.zst"
 OTHERS = [
@@ -78,7 +84,10 @@ case $op in
         glibc) [[ -n ${FAKE_GLIBC-2.43+r9+g1-1} ]] || exit 1; echo "glibc ${FAKE_GLIBC-2.43+r9+g1-1}"; continue ;;
         gcc-libs) [[ -n ${FAKE_GCC_LIBS-15.2.1+r22-1} ]] || exit 1; echo "gcc-libs ${FAKE_GCC_LIBS-15.2.1+r22-1}"; continue ;;
         spirv-tools) [[ -n ${FAKE_SPIRV_TOOLS-1:1.4.357.0-1} ]] || exit 1; echo "spirv-tools ${FAKE_SPIRV_TOOLS-1:1.4.357.0-1}"; continue ;;
-        mesa-*) grep -qx "$p" "$FAKE/installed" || exit 1 ;;
+        # A Mesa package prints the version its .PKGINFO had when -U installed it.
+        mesa-*) grep -qx "$p" "$FAKE/installed" || exit 1
+          echo "$p $(awk -v p="$p" '$1 == p { v = $2 } END { print v ? v : "1-1" }' "$FAKE/versions" 2>/dev/null)"
+          continue ;;
       esac
       echo "$p 1-1"
     done ;;
@@ -101,13 +110,18 @@ case $op in
         m1n1-aurora-*) echo "${b%-aarch64.pkg.tar.zst}" >"$FAKE/m1n1"; bsdtar -xOf "$f" usr/lib/asahi-boot/m1n1.bin >"$FAKE/m1n1.bin"; hook=1 ;;
         linux-aurora-headers-*) ;;
         linux-aurora-*) sed -i '/^linux-asahi$/d' "$FAKE/installed"; echo linux-aurora >>"$FAKE/installed"; hook=1 ;;
-        mesa-*) bsdtar -xOf "$f" .PKGINFO | sed -n 's/^pkgname = //p' >>"$FAKE/installed" ;;
+        mesa-*)
+          n=$(bsdtar -xOf "$f" .PKGINFO | sed -n 's/^pkgname = //p')
+          v=$(bsdtar -xOf "$f" .PKGINFO | sed -n 's/^pkgver = //p')
+          grep -qx "$n" "$FAKE/installed" || echo "$n" >>"$FAKE/installed"
+          echo "$n $v" >>"$FAKE/versions" ;;
       esac
     done
     # As the real hooks: only a kernel or m1n1 package rebuilds boot.bin.
     if ((hook)); then update-m1n1 hook; fi ;;
-  -Rns)
-    for p in "$@"; do [[ $p == -* ]] || sed -i "/^$p\$/d" "$FAKE/installed"; done ;;
+  -Rns | -Rn)
+    if [[ -n ${FAKE_FAIL_R:-} ]]; then echo "error: failed to remove (fake)" >&2; exit 1; fi
+    for p in "$@"; do [[ $p == -* ]] || { sed -i "/^$p\$/d" "$FAKE/installed"; sed -i "/^$p /d" "$FAKE/versions" 2>/dev/null || true; }; done ;;
   -S | -Sy)
     hook=0
     for p in "$@"; do
@@ -185,10 +199,26 @@ class M3FlowBase(unittest.TestCase):
             self.fixture(name, name.encode())
         self.fixture(M1N1_PKG, None, SWITCH_NAMES)
         self.fixture(AURORA6, None, ["asahi,t6030-gpu", "asahi,t6030-dcp", "asahi,t6030-dcpext"])
+        # The M3 Pro's Mesa package of this fake release (a stand-in by the shipped name's form).
+        self.pro_mesa = PRO_MESA
+        self.pro_mesa_fixture(PRO_MESA, "mesa-m3", PRO_MESA_VERSION, "opt/mesa-m3")
+        (self.tmp / "home").mkdir(exist_ok=True)
         # The m1n1 package every Mac gets in this fake release.
         self.m1n1_pkg = M1N1_PKG
         # The script under test; a test can run an earlier release's first.
         self.installer = INSTALLER
+
+    def pro_mesa_fixture(self, name, pkgname, pkgver, prefix):
+        # A pacman package holding only .PKGINFO and a file under its prefix.
+        root = self.tmp / ("root-" + name)
+        shutil.rmtree(root, ignore_errors=True)
+        (root / prefix / "lib").mkdir(parents=True)
+        (root / prefix / "lib/libvulkan_asahi.so").write_bytes(b"stand-in " + name.encode())
+        (root / ".PKGINFO").write_text(f"pkgname = {pkgname}\npkgver = {pkgver}\narch = aarch64\n")
+        path = self.tmp / "pkgs" / name
+        subprocess.run(["bsdtar", "--zstd", "-cf", str(path), "-C", str(root), ".PKGINFO", prefix.split("/")[0]],
+                       check=True)
+        self.shas[name] = hashlib.sha256(path.read_bytes()).hexdigest()
 
     def fixture(self, name, data, strings=None):
         path = self.tmp / "pkgs" / name
@@ -241,6 +271,10 @@ PACKAGES=(
 )
 M1N1_PACKAGE="{self.m1n1_pkg} {self.shas[self.m1n1_pkg]}"
 M1N1_BIN_SHA={self.bin_shas[self.m1n1_pkg]}
+M3_PRO_MESA_PACKAGE="{self.pro_mesa + ' ' + self.shas[self.pro_mesa] if self.pro_mesa else ''}"
+M3_PRO_MESA_NEEDS="{PRO_MESA_NEEDS}"
+M3_PRO_MESA_DISABLE='{self.tmp}/etc/mesa-m3/disable'
+m3_pro_mesa_user_home() {{ echo '{self.tmp}/home'; }}
 esp_bootbin() {{ echo '{self.boot}'; }}
 version_notice() {{ :; }}; sep_write_notice() {{ :; }}; ane_dkms_notice() {{ :; }}
 snapshot() {{ :; }}; add_pin() {{ :; }}; remove_pin() {{ :; }}

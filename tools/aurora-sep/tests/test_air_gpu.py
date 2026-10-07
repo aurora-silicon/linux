@@ -1697,19 +1697,61 @@ class GpuExperimentFlagTest(Base):
         self.assertFalse(self.bin.exists())
         self.assertFalse((self.state / "m3-gpu-experiment").exists())
 
+    def test_the_experiment_runs_as_on_12_2(self):
+        # With --m3-gpu-experiment an Air runs exactly what 12.2's script ran, install then
+        # --uninstall, with the same results on disk (every $sudo command logged too). None of it
+        # is the M3 Pro's Mesa, and a mesa-m3 the owner installed stays.
+        import test_m3_pro_mesa as pro
+        old, old_version = pro.old_installer(self, pro.REL_12_2, "install-12.2.sh")
+
+        def run():
+            a = self.sh(pro.SUDO_LOG + "M3_TRY=0\ninstall_all", check=False).returncode
+            b = self.sh(pro.SUDO_LOG + "uninstall_all", flag=0, check=False).returncode
+            return (a, b)
+
+        def owner():
+            with open(self.fake / "installed", "a") as f:
+                f.write("mesa-m3\n")
+            (self.fake / "versions").write_text("mesa-m3 26.0.0.owner-1\n")
+
+        for board in ("j613", "j615"):
+            for setup in (None, owner):
+                with self.subTest(board=board, owner=bool(setup)):
+                    before = pro.run_with(self, old, board, run, setup)
+                    after = pro.run_with(self, flow.INSTALLER, board, run, setup)
+                    if old_version != flow.VERSION:
+                        before["log"] = before["log"].replace(old_version, flow.VERSION)
+                    self.assertEqual(after["codes"], before["codes"])
+                    self.assertEqual(after["codes"], (0, 0))
+                    self.assertEqual(after["log"].splitlines(), before["log"].splitlines())
+                    self.assertEqual(after["tree"], before["tree"])
+                    self.assertIn(MESA_NAME, after["log"])          # the experiment's own Mesa, as before
+                    self.assertNotIn(pro.PRO_MESA, after["log"])
+                    self.assertNotIn("pacman -Rn --noconfirm mesa-m3\n", after["log"])
+                    self.assertNotIn("state/m3-pro-mesa", after["tree"])
+                    if setup:
+                        self.assertIn("mesa-m3", after["tree"]["fake/installed"].decode().split())
+
     def test_options(self):
         # The option block alone, with die and the actions stubbed: nothing is installed here.
-        block = SRC[SRC.index("# --m3-handoff and --m3-gpu-experiment go with an install"):
+        block = SRC[SRC.index("# --m3-handoff, --m3-gpu-experiment and --no-m3-mesa go with an install"):
                     SRC.index('if preflight_needed "${1:-}"')]
         for args, want in [("--m3-gpu-experiment", "ok 0 1 -"),
                            ("--m3-handoff --m3-gpu-experiment", "ok 1 1 -"),
                            ("--m3-gpu-experiment --read-only", "ok 0 1 --read-only"),
                            ("--m3-gpu-experiment --uninstall", "error: --m3-gpu-experiment goes with an install"),
                            ("--m3-report --m3-gpu-experiment", "error: --m3-gpu-experiment goes with an install"),
-                           ("--uninstall", "ok 0 0 --uninstall")]:
+                           ("--uninstall", "ok 0 0 --uninstall"),
+                           ("--no-m3-mesa", "ok 0 0 - 0"),
+                           ("--m3-gpu-experiment --no-m3-mesa", "ok 0 1 - 0"),
+                           ("--no-m3-mesa --read-only", "ok 0 0 --read-only 0"),
+                           ("--no-m3-mesa --uninstall", "error: --no-m3-mesa goes with an install"),
+                           ("--m3-report --no-m3-mesa", "error: --no-m3-mesa goes with an install"),
+                           ("", "ok 0 0 - 1")]:
             with self.subTest(args=args):
-                script = ('die() { echo "error: $*"; exit 1; }\nM3_TRY=0\nM3_GPU_EXPERIMENT=0\n'
-                          f"set -- {args}\n{block}\necho \"ok $M3_TRY $M3_GPU_EXPERIMENT ${{1:--}}\"\n")
+                script = ('die() { echo "error: $*"; exit 1; }\nM3_TRY=0\nM3_GPU_EXPERIMENT=0\nM3_PRO_MESA=1\n'
+                          f"set -- {args}\n{block}\n"
+                          'echo "ok $M3_TRY $M3_GPU_EXPERIMENT ${1:--} $M3_PRO_MESA"\n')
                 out = subprocess.run(["bash", "-c", script], capture_output=True, text=True).stdout
                 self.assertTrue(out.startswith(want), out)
 
