@@ -104,10 +104,17 @@ STUBS = {
     "uname": '#!/bin/sh\n[ "$*" = -n ] && { echo "$FAKE_HOST"; exit 0; }\nexec /usr/bin/uname "$@"\n',
     "hostname": '#!/bin/sh\necho "$FAKE_HOST.example.lan"\n',
     "hostnamectl": '#!/bin/sh\necho "$FAKE_HOST"\n',
+    # The passwd list and user of these tests; the render group and group membership as the flow
+    # fixture's own stubs give them (the M3 Pro's Mesa adds the desktop user to render).
     "getent": ('#!/bin/sh\n[ "$1" = passwd ] && { printf "root:x:0:0::/root:/bin/bash\\n'
                'alice:x:1000:1000:Alice:/home/alice:/bin/bash\\nbob:x:1001:1001::/home/bob:/bin/bash\\n'
-               'nobody:x:65534:65534::/:/usr/bin/nologin\\n"; exit 0; }\nexec /usr/bin/getent "$@"\n'),
-    "id": '#!/bin/sh\n[ "$*" = -un ] && { echo alice; exit 0; }\nexec /usr/bin/id "$@"\n',
+               'nobody:x:65534:65534::/:/usr/bin/nologin\\n"; exit 0; }\n'
+               '[ "$1" = group ] && [ "$2" = render ] && { [ -e "$FAKE/no-render-group" ] && exit 2; '
+               'echo "render:x:989:"; exit 0; }\nexec /usr/bin/getent "$@"\n'),
+    "id": ('#!/bin/bash\n[[ $* == -un ]] && { echo alice; exit 0; }\n'
+           'if [[ ${1:-} == -nG ]]; then shift; [[ ${1:-} == -- ]] && shift; u=${1:-alice}\n'
+           '  line=$(grep -m1 "^$u " "$FAKE/groups" 2>/dev/null) || line=""; echo "$u${line#"$u"}"; exit 0; fi\n'
+           'exec /usr/bin/id "$@"\n'),
     "udevadm": '#!/bin/sh\necho "udevadm $*" >>"$FAKE/log"\n',
     # phram as the kernel's: loading it binds the two reserved-memory regions and makes their MTD
     # devices (mtd1 adt, mtd2 m1n1_stage2.log) and nodes; unloading removes them. As in the
