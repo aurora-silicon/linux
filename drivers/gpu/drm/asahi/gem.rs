@@ -316,3 +316,12 @@ impl AsahiObject {
         !self.kernel && !self.exportable && self.kernel_mappings.load(Ordering::Acquire) == 0
     }
 }
+
+/// Purge advice for a VM-private, non-exportable object. Returns whether the
+/// contents are retained (0 once purged).
+pub(crate) fn madvise(gem: &Object, dontneed: bool) -> Result<u32> {
+    if gem.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE == 0 || gem.exportable {
+        return Err(EINVAL);
+    }
+    Ok(u32::from(gem.madvise(i32::from(dontneed))))
+}

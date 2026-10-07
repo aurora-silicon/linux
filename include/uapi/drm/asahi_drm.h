@@ -93,6 +93,9 @@ enum drm_asahi_ioctl_id {
 
 	/** @DRM_ASAHI_SUBMIT: Submit commands to a queue. */
 	DRM_ASAHI_SUBMIT,
+
+	/** @DRM_ASAHI_GEM_MADVISE: Mark a VM-private object purgeable or needed. */
+	DRM_ASAHI_GEM_MADVISE,
 };
 
 #define DRM_ASAHI_MAX_CLUSTERS	64
@@ -517,6 +520,41 @@ struct drm_asahi_gem_mmap_offset {
 
 	/** @offset: The fake offset to use for subsequent mmap call */
 	__u64 offset;
+};
+
+/**
+ * enum drm_asahi_gem_madv - Advice for DRM_IOCTL_ASAHI_GEM_MADVISE
+ */
+enum drm_asahi_gem_madv {
+	/** @DRM_ASAHI_GEM_MADV_WILLNEED: The object's contents are needed. */
+	DRM_ASAHI_GEM_MADV_WILLNEED = 0,
+	/**
+	 * @DRM_ASAHI_GEM_MADV_DONTNEED: The object is not referenced by any
+	 * pending or future GPU work until the next WILLNEED. The kernel may
+	 * discard its contents under memory pressure.
+	 */
+	DRM_ASAHI_GEM_MADV_DONTNEED = 1,
+};
+
+/**
+ * struct drm_asahi_gem_madvise - Arguments passed to
+ * DRM_IOCTL_ASAHI_GEM_MADVISE
+ *
+ * Only VM-private objects accept advice. A purged object keeps its handle
+ * and mappings but has no contents; userspace must not use it again.
+ */
+struct drm_asahi_gem_madvise {
+	/** @handle: Handle of the object. */
+	__u32 handle;
+
+	/** @madv: One of enum drm_asahi_gem_madv. */
+	__u32 madv;
+
+	/** @retained: Set by the kernel: 1 if the contents are retained, 0 if purged. */
+	__u32 retained;
+
+	/** @pad: Must be zero. */
+	__u32 pad;
 };
 
 /**
@@ -1430,6 +1468,7 @@ enum {
 	DRM_IOCTL_ASAHI_QUEUE_CREATE     = DRM_IOCTL_ASAHI(WR, QUEUE_CREATE, queue_create),
 	DRM_IOCTL_ASAHI_QUEUE_DESTROY    = DRM_IOCTL_ASAHI(W, QUEUE_DESTROY, queue_destroy),
 	DRM_IOCTL_ASAHI_SUBMIT           = DRM_IOCTL_ASAHI(W, SUBMIT, submit),
+	DRM_IOCTL_ASAHI_GEM_MADVISE      = DRM_IOCTL_ASAHI(WR, GEM_MADVISE, gem_madvise),
 };
 
 #if defined(__cplusplus)

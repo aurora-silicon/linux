@@ -146,6 +146,12 @@ impl Gate {
             .try_lock()
             .is_some_and(|state| state.users == 0 && !state.busy && !state.closed)
     }
+
+    /// A page-table mutation happened outside a `Reclaim` (the purge path runs
+    /// on busy VMs). The next `enter` restores every INVALIDATED mapping.
+    pub(crate) fn note_evicted(&self) {
+        self.state.lock().evicted = true;
+    }
 }
 
 impl Reclaim {
@@ -276,14 +282,14 @@ impl Vm {
         let Some(gate) = self.residency.as_ref() else {
             return 0;
         };
-        if !gate.idle()
-            || self
-                .status
-                .as_ref()
-                .map_or(true, |status| status.get() != 0)
+        if self
+            .status
+            .as_ref()
+            .map_or(true, |status| status.get() != 0)
         {
             return 0;
         }
+        let idle = gate.idle();
         let Some(mut inner) = self.inner.try_lock_private() else {
             return 0;
         };
@@ -292,7 +298,11 @@ impl Vm {
         // this reservation; linked aliases retain their borrowed BO and GEM.
         let _ = unsafe { inner.for_each_private_bo(|_, bo| {
             let object = bo.object();
-            if object.idle_reclaim_candidate() && object.sole_sg_lease_releasable_locked() {
+            // Purgeable objects count on busy VMs too; idle backing only on idle ones.
+            if object.idle_reclaim_candidate()
+                && (object.madv_locked() > 0 || idle)
+                && object.sole_sg_lease_releasable_locked()
+            {
                 pages = pages.saturating_add(object.size() / kernel::page::PAGE_SIZE);
             }
             Ok(true)
@@ -301,12 +311,94 @@ impl Vm {
         pages
     }
 
+    /// Discard the backing of objects userspace marked DONTNEED. This needs
+    /// only the VM reservation: binding edits and restoration hold it too,
+    /// and the advice guarantees no pending or future GPU reference until
+    /// the next WILLNEED. Purged mappings stay INVALIDATED until unbound.
+    fn purge_advised_pages(&self, target: usize) -> usize {
+        let Some(gate) = self.residency.as_ref() else {
+            return 0;
+        };
+        if self
+            .status
+            .as_ref()
+            .map_or(true, |status| status.get() != 0)
+        {
+            return 0;
+        }
+        let Some(mut inner) = self.inner.try_lock_private() else {
+            return 0;
+        };
+        let uat = inner.uat_inner.clone();
+        let Some(shared) = uat.shared.try_lock() else {
+            return 0;
+        };
+        let contexts = shared.contexts_naming_root(inner.ttb());
+        let mut purged = 0usize;
+        // SAFETY: The private reservation excludes binding edits and restoration.
+        // Callbacks change PTEs/flags only; all aliases stay linked.
+        let _ = unsafe { inner.for_each_private_bo(|inner, bo| {
+            if purged >= target { return Ok(false); }
+            let object = bo.object();
+            if !object.idle_reclaim_candidate() || object.madv_locked() <= 0 {
+                return Ok(true);
+            }
+            {
+                let Some(bo_inner) = bo.inner().inner.try_lock() else { return Ok(true); };
+                if bo_inner.sgt.is_some() && !object.sole_sg_lease_releasable_locked() {
+                    return Ok(true);
+                }
+            }
+            // Any mutation that does not end in a completed purge leaves
+            // INVALIDATED aliases with cleared PTEs while madv stays >= 0, so
+            // the next WILLNEED would report the contents retained. Record the
+            // eviction so the gate restores those aliases before the next job.
+            let mut mutated = false;
+            let invalidated = inner.invalidate_private_bo_mappings(bo, |inner, start, range| {
+                mutated = true;
+                let end = start.checked_add(range).ok_or(EOVERFLOW)?;
+                let _change = inner.mapping_mutation();
+                inner.page_table.discard_partial_map(start..end)?;
+                inner.tlbi_context_mask(start, range as usize, contexts);
+                Ok(())
+            });
+            if let Err(error) = invalidated {
+                if mutated {
+                    gate.note_evicted();
+                }
+                return Err(error);
+            }
+            {
+                let Some(mut bo_inner) = bo.inner().inner.try_lock() else {
+                    gate.note_evicted();
+                    return Ok(true);
+                };
+                bo_inner.sg_vec = None;
+                bo_inner.sgt = None;
+            }
+            if object.purge_locked().is_ok() {
+                purged = purged.saturating_add(object.size() / kernel::page::PAGE_SIZE);
+            } else {
+                gate.note_evicted();
+            }
+            Ok(purged < target)
+        }) };
+        drop(shared);
+        drop(inner);
+        purged
+    }
+
     pub(crate) fn reclaim_idle_pages(&self, target: usize) -> usize {
         let Some(gate) = self.residency.as_ref() else {
             return 0;
         };
+        let purged = self.purge_advised_pages(target);
+        if purged >= target {
+            return purged;
+        }
+        let target = target - purged;
         let Some(mut reclaim) = Gate::try_reclaim(gate) else {
-            return 0;
+            return purged;
         };
         // Error fences cannot prove firmware ownership ended.
         if self
@@ -318,14 +410,14 @@ impl Vm {
                 .as_ref()
                 .is_some_and(|lifetime| lifetime.can_reclaim())
         {
-            return 0;
+            return purged;
         }
         let Some(mut inner) = self.inner.try_lock_private() else {
-            return 0;
+            return purged;
         };
         let uat = inner.uat_inner.clone();
         let Some(shared) = uat.shared.try_lock() else {
-            return 0;
+            return purged;
         };
         let contexts = shared.contexts_naming_root(inner.ttb());
         let mut unpinned = 0usize;
@@ -371,7 +463,7 @@ impl Vm {
         drop(shared);
         drop(inner);
 
-        unpinned
+        purged + unpinned
     }
 
     fn restore_idle_pages(&self) -> Result {
@@ -386,16 +478,24 @@ impl Vm {
         loop {
             let map = loop {
                 if let Some(inner) = self.inner.try_lock_private() {
-                    break inner.next_private_mapping(
+                    let map = inner.next_private_mapping(
                         &mut cursor, gpuvm::GpuVaFlags::INVALIDATED,
                     )?;
+                    // Purged (DONTNEED) objects have no contents to restore;
+                    // their mappings stay INVALIDATED until unbound.
+                    // SAFETY: The private guard holds the VM reservation.
+                    let purged = map.as_ref().is_some_and(|map| unsafe { map.object.madv_locked() < 0 });
+                    break (map, purged);
                 }
                 // Wait for reservation ownership without retaining a mapping.
                 drop(self.inner.exec_lock(None, true)?);
             };
             // The reservation guard has dropped before pinning backing, and
             // before any returned object reference can be released on failure.
-            let Some(map) = map else { break; };
+            let (Some(map), purged) = map else { break; };
+            if purged {
+                continue;
+            }
             let mut restored = 0u64;
             let bo_owner = self.inner.find_bo(&map.object).ok_or(EFAULT)?;
             {

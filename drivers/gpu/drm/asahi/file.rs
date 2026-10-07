@@ -636,6 +636,23 @@ impl File {
         Ok(0)
     }
 
+    /// IOCTL: gem_madvise: Mark a VM-private object purgeable or needed.
+    pub(crate) fn gem_madvise(
+        _device: &AsahiDevice,
+        data: &mut uapi::drm_asahi_gem_madvise,
+        file: &DrmFile,
+    ) -> Result<u32> {
+        if data.pad != 0 || data.madv > uapi::drm_asahi_gem_madv_DRM_ASAHI_GEM_MADV_DONTNEED {
+            return Err(EINVAL);
+        }
+        let gem = gem::Object::lookup_handle(file, data.handle)?;
+        data.retained = gem::madvise(
+            &gem,
+            data.madv == uapi::drm_asahi_gem_madv_DRM_ASAHI_GEM_MADV_DONTNEED,
+        )?;
+        Ok(0)
+    }
+
     /// IOCTL: vm_bind: Map or unmap memory into a Vm.
     pub(crate) fn vm_bind(
         device: &AsahiDevice,

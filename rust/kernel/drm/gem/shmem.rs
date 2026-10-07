@@ -297,6 +297,49 @@ impl<T: DriverObject> Object<T> {
         result
     }
 
+    /// Apply purge advice (0 = needed, >0 = may be purged) under the
+    /// object's reservation lock. Returns false if the object was already
+    /// purged; the advice is then ignored.
+    pub fn madvise(&self, madv: i32) -> bool {
+        // SAFETY: The object retains its reservation; the C helper requires it held.
+        unsafe {
+            bindings::dma_resv_lock(self.raw_dma_resv(), core::ptr::null_mut());
+            let retained = bindings::drm_gem_shmem_madvise_locked(self.as_raw_shmem(), madv) != 0;
+            bindings::dma_resv_unlock(self.raw_dma_resv());
+            retained
+        }
+    }
+
+    /// Current purge advice: negative once purged.
+    ///
+    /// # Safety
+    /// The caller holds the object's DMA reservation lock.
+    pub unsafe fn madv_locked(&self) -> i32 {
+        // SAFETY: Reservation ownership serializes the field.
+        unsafe { (*self.as_raw_shmem()).madv }
+    }
+
+    /// Discard the backing of a purgeable object. The handle and logical
+    /// mappings remain; the contents are gone and `madv_locked()` turns negative.
+    ///
+    /// # Safety
+    ///
+    /// The caller holds this object's DMA reservation lock, has removed and
+    /// invalidated every device mapping, and no Rust SG lease remains.
+    pub unsafe fn purge_locked(&self) -> Result {
+        // SAFETY: The caller's contract; the exclusive state below excludes new leases.
+        if !unsafe { bindings::drm_gem_shmem_is_purgeable(self.as_raw_shmem()) } {
+            return Err(EBUSY);
+        }
+        self.sgt_access.compare_exchange(
+            0, SGT_RECLAIMING, Ordering::AcqRel, Ordering::Acquire,
+        ).map_err(|_| EBUSY)?;
+        // SAFETY: See above.
+        unsafe { bindings::drm_gem_shmem_purge_locked(self.as_raw_shmem()) };
+        self.sgt_access.store(0, Ordering::Release);
+        Ok(())
+    }
+
     /// Attempt to create a [`RawIoSysMap`] from the gem object.
     fn raw_vmap<U: AsBytes + FromBytes>(&self) -> Result<RawIoSysMap<U>> {
         build_assert!(
