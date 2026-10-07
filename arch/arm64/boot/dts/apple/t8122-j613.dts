@@ -31,6 +31,32 @@
 	};
 };
 
+&dcp {
+	panel: panel {
+		compatible = "apple,panel-j613", "apple,panel";
+		/*
+		 * 2560x1664 at 224 ppi; 181 mm high without the 64 notch rows,
+		 * as on the J413.
+		 */
+		width-mm = <290>;
+		height-mm = <189>;
+		adj-height-mm = <181>;
+		/* The backlight's maximum: 525 nits. */
+		apple,max-brightness = <525>;
+	};
+};
+
+/*
+ * The boot framebuffer is the same panel: with its physical size simpledrm
+ * reports 224 dpi instead of assuming 96, so early users (Plymouth, fbcon)
+ * pick the same HiDPI scale as the display driver does later. As on the
+ * J413 and J313.
+ */
+&framebuffer0 {
+	panel = <&panel>;
+	post-init-providers = <&panel>;
+};
+
 &wifi0 {
 	brcm,board-type = "apple,dnieper";
 };

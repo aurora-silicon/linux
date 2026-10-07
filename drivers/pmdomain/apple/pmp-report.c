@@ -41,6 +41,13 @@ struct apple_pmp_report_offsets {
 	u32 status;
 	/* The PMP is started by this driver, once its requests are seeded. */
 	bool starts_pmp;
+	/* With starts_pmp: the SoC in messages, and its PMGR power states. */
+	const char *name;
+	const char *pwrstate;
+	/* With starts_pmp: the PMP image has the T6030 temperature records. */
+	bool temps;
+	/* With starts_pmp: soc-device record i holds device id i + 1. */
+	bool devices_ordered;
 };
 
 struct apple_pmp_report {
@@ -212,13 +219,14 @@ static const struct {
 	{ "disp_cpu", true },
 };
 
-/* Finds the single T6030 PMGR power state with @label. */
-static struct device_node *apple_pmp_t6030_domain(const char *label)
+/* Finds the single PMGR power state of this SoC with @label. */
+static struct device_node *apple_pmp_t6030_domain(struct apple_pmp_report *rep,
+						  const char *label)
 {
 	struct device_node *np, *found = NULL;
 	const char *name;
 
-	for_each_compatible_node(np, NULL, "apple,t6030-pmgr-pwrstate") {
+	for_each_compatible_node(np, NULL, rep->offsets->pwrstate) {
 		if (of_property_read_string(np, "label", &name) || strcmp(name, label))
 			continue;
 		if (found) {
@@ -238,15 +246,15 @@ static int apple_pmp_t6030_check_power(struct apple_pmp_report *rep)
 
 	for (i = 0; i < ARRAY_SIZE(apple_pmp_t6030_domains); i++) {
 		const char *label = apple_pmp_t6030_domains[i].label;
-		struct device_node *np = apple_pmp_t6030_domain(label);
+		struct device_node *np = apple_pmp_t6030_domain(rep, label);
 		struct regmap *regmap;
 		u32 offset, val;
 		int ret;
 
 		if (!np)
 			return dev_err_probe(rep->dev, -ENODEV,
-					     "T6030 PMP not started: no single %s power state\n",
-					     label);
+					     "%s PMP not started: no single %s power state\n",
+					     rep->offsets->name, label);
 		ret = of_property_read_u32(np, "reg", &offset);
 		regmap = syscon_node_to_regmap(np->parent);
 		of_node_put(np);
@@ -260,8 +268,8 @@ static int apple_pmp_t6030_check_power(struct apple_pmp_report *rep)
 
 		if (FIELD_GET(APPLE_PMGR_PS_ACTUAL, val) != APPLE_PMGR_PS_ACTIVE)
 			return dev_err_probe(rep->dev, -EIO,
-					     "T6030 PMP not started: %s is not powered (%#x)\n",
-					     label, val);
+					     "%s PMP not started: %s is not powered (%#x)\n",
+					     rep->offsets->name, label, val);
 		/* The PMGR power state driver applies the floor when it probes. */
 		if (apple_pmp_t6030_domains[i].floor &&
 		    FIELD_GET(APPLE_PMGR_PS_MIN, val) != APPLE_PMGR_PS_ACTIVE)
@@ -353,7 +361,8 @@ static int apple_pmp_t6030_check_layout(struct apple_pmp_report *rep)
 		return -EINVAL;
 
 	table = of_get_property(rep->pmp, "apple,tunable-soc-device", &len);
-	if (!apple_pmp_devices_valid(table, len, rep->seed, rep->ack, true))
+	if (!apple_pmp_devices_valid(table, len, rep->seed, rep->ack,
+				     rep->offsets->devices_ordered))
 		return -EINVAL;
 	return 0;
 }
@@ -378,7 +387,8 @@ static int apple_pmp_t6030_check(struct apple_pmp_report *rep)
 	if (!rep->pmp || !of_device_is_compatible(rep->pmp, "apple,t6000-pmp-v2") ||
 	    of_device_is_available(rep->pmp))
 		return dev_err_probe(rep->dev, -EINVAL,
-				     "T6030 PMP not started: apple,pmp is not a disabled PMP node\n");
+				     "%s PMP not started: apple,pmp is not a disabled PMP node\n",
+				     rep->offsets->name);
 	asc = apple_pmp_t6030_map(rep, "asc", NULL);
 	if (!asc)
 		return -ENOMEM;
@@ -386,12 +396,13 @@ static int apple_pmp_t6030_check(struct apple_pmp_report *rep)
 	iounmap(asc);
 	if (control & PMP_ASC_CPU_RUN)
 		return dev_err_probe(rep->dev, -EBUSY,
-				     "T6030 PMP not started: its CPU is already running (%#x)\n",
-				     control);
+				     "%s PMP not started: its CPU is already running (%#x)\n",
+				     rep->offsets->name, control);
 	ret = apple_pmp_t6030_check_sram(rep, &image);
 	if (ret)
 		return dev_err_probe(rep->dev, ret,
-				     "T6030 PMP not started: its SRAM does not hold the described firmware\n");
+				     "%s PMP not started: its SRAM does not hold the described firmware\n",
+				     rep->offsets->name);
 
 	/* 3: the requests this driver seeds, and a PTD with nothing else in it */
 	for_each_available_child_of_node(np, child) {
@@ -407,18 +418,20 @@ static int apple_pmp_t6030_check(struct apple_pmp_report *rep)
 	}
 	if (!rep->seed || !rep->startup_ack)
 		return dev_err_probe(rep->dev, -EINVAL,
-				     "T6030 PMP not started: no acknowledged always-on report\n");
+				     "%s PMP not started: no acknowledged always-on report\n",
+				     rep->offsets->name);
 	if (apple_pmp_t6030_check_layout(rep))
 		return dev_err_probe(rep->dev, -EINVAL,
-				     "T6030 PMP not started: its tunables do not describe this PTD layout\n");
+				     "%s PMP not started: its tunables do not describe this PTD layout\n",
+				     rep->offsets->name);
 
 	status = readq(rep->base + rep->offsets->status);
 	request = readq(rep->base + rep->offsets->tgt_read);
 	ack = readq(rep->base + rep->offsets->actual);
 	if (status || (request & ~rep->seed))
 		return dev_err_probe(rep->dev, -EBUSY,
-				     "T6030 PMP not started: PTD status %#llx request %#llx before start\n",
-				     status, request);
+				     "%s PMP not started: PTD status %#llx request %#llx before start\n",
+				     rep->offsets->name, status, request);
 
 	dev_info(rep->dev,
 		 "PMP halted, firmware %pUb; PTD status %#llx request %#llx ack %#llx; requesting %#llx\n",
@@ -465,8 +478,8 @@ static int apple_pmp_t6030_recheck(struct apple_pmp_report *rep)
 	request = readq(rep->base + rep->offsets->tgt_read);
 	if ((control & PMP_ASC_CPU_RUN) || status || request != rep->seed) {
 		dev_err(rep->dev,
-			"T6030 PMP not started: CPU control %#x, PTD status %#llx request %#llx changed since seeding\n",
-			control, status, request);
+			"%s PMP not started: CPU control %#x, PTD status %#llx request %#llx changed since seeding\n",
+			rep->offsets->name, control, status, request);
 		return -EBUSY;
 	}
 	return 0;
@@ -763,7 +776,8 @@ static void apple_pmp_t6030_start(struct work_struct *work)
 	dev_info(rep->dev, "starting the PMP with request %#llx\n", rep->seed);
 	ret = apple_pmp_t6030_enable(rep);
 	if (ret) {
-		dev_err(rep->dev, "T6030 PMP not started: enabling its nodes failed: %d\n", ret);
+		dev_err(rep->dev, "%s PMP not started: enabling its nodes failed: %d\n",
+			rep->offsets->name, ret);
 		apple_pmp_t6030_finish(rep, ret);
 		return;
 	}
@@ -810,7 +824,8 @@ static void apple_pmp_t6030_start(struct work_struct *work)
 		dev_info(rep->dev, "PMP ready: PTD status %#llx request %#llx ack %#llx\n",
 			 status, request, ack);
 		ret = 0;
-		apple_pmp_t6030_temps_register(rep);
+		if (rep->offsets->temps)
+			apple_pmp_t6030_temps_register(rep);
 	}
 	apple_pmp_t6030_finish(rep, ret);
 }
@@ -978,8 +993,8 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 		/* 4: the always-on entries have seeded their requests */
 		request = readq(rep->base + rep->offsets->tgt_read);
 		if (ret || request != rep->seed) {
-			dev_err(dev, "T6030 PMP not started: request read back %#llx, expected %#llx (%d)\n",
-				request, rep->seed, ret);
+			dev_err(dev, "%s PMP not started: request read back %#llx, expected %#llx (%d)\n",
+				rep->offsets->name, request, rep->seed, ret);
 			apple_pmp_t6030_finish(rep, -EIO);
 			return 0;
 		}
@@ -1028,6 +1043,27 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030 = {
 	.actual = 0x11c0,
 	.status = 0x10,
 	.starts_pmp = true,
+	.name = "T6030",
+	.pwrstate = "apple,t6030-pmgr-pwrstate",
+	.temps = true,
+	.devices_ordered = true,
+};
+
+/*
+ * T8122, from its ADT ptd-range: SOC-DEV-PS-REQ at PTD index 0x100 (read
+ * 0x1000, update 0x10000 + 0x800), SOC-DEV-PS-ACK at 0x108 (0x1080),
+ * PMP-STATUS at 0x1 (0x10). Its soc-device records are not in id order.
+ * The positions of its temperature records are not known, so none are
+ * registered.
+ */
+static const struct apple_pmp_report_offsets apple_pmp_offsets_t8122 = {
+	.tgt_read = 0x1000,
+	.tgt_write = 0x10800,
+	.actual = 0x1080,
+	.status = 0x10,
+	.starts_pmp = true,
+	.name = "T8122",
+	.pwrstate = "apple,t8122-pmgr-pwrstate",
 };
 
 static const struct of_device_id apple_pmp_report_of_match[] = {
@@ -1036,6 +1072,7 @@ static const struct of_device_id apple_pmp_report_of_match[] = {
 	{ .compatible = "apple,t8112-pmp-v2-report", .data = &apple_pmp_offsets_t8112 },
 	{ .compatible = "apple,t8132-pmp-v2-report", .data = &apple_pmp_offsets_t8132 },
 	{ .compatible = "apple,t6030-pmp-v2-report", .data = &apple_pmp_offsets_t6030 },
+	{ .compatible = "apple,t8122-pmp-v2-report", .data = &apple_pmp_offsets_t8122 },
 	{}
 };
 

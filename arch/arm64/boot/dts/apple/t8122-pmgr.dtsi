@@ -209,6 +209,8 @@
 		#reset-cells = <0>;
 		label = "disp_sys";
 		apple,always-on; /* TODO: figure out if we can enable PM here */
+		/* The bootloader leaves the internal display powered. */
+		apple,inherited-on;
 	};
 
 	ps_gfx: power-controller@1e0 {
@@ -252,6 +254,8 @@
 		label = "disp_fe";
 		power-domains = <&ps_disp_sys>;
 		apple,always-on; /* TODO: figure out if we can enable PM here */
+		/* The bootloader leaves the internal display powered. */
+		apple,inherited-on;
 	};
 
 	ps_sio_cpu: power-controller@210 {
@@ -1122,6 +1126,8 @@
 		label = "disp_cpu";
 		power-domains = <&ps_disp_fe>;
 		apple,min-state = <4>;
+		/* The bootloader leaves the internal display powered. */
+		apple,inherited-on;
 	};
 };
 

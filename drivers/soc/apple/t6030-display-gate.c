@@ -42,10 +42,12 @@
  *
  * What differs between SoCs is in struct gate_soc. On T8122 (M3) the gate
  * serves the same handoff, marked apple,t8122-handoff by the boot loader on
- * apple,t8122-dcp and apple,t8122-display-subsystem nodes. No T8122 PMP
- * description is built in yet, so there it never enables anything; a T8122
- * device tree without display nodes is normal and the gate says nothing.
- * apple_t8122_display.enable=0 has the same effect as the T6030 option.
+ * apple,t8122-dcp and apple,t8122-display-subsystem nodes, and adds the T8122
+ * PMP the same way. There is no T8122 fallback: the boot loader must pass
+ * this Mac's PMP values in /chosen/asahi,t8122-pmp, or nothing is enabled. A
+ * T8122 device tree without display nodes is normal and the gate says
+ * nothing. apple_t8122_display.enable=0 has the same effect as the T6030
+ * option.
  */
 
 #define pr_fmt(fmt) fmt
@@ -98,6 +100,8 @@ extern const u8 __dtbo_t6030_pmp_begin[];
 extern const u8 __dtbo_t6030_pmp_end[];
 extern const u8 __dtbo_t6030_j516s_pmp_begin[];
 extern const u8 __dtbo_t6030_j516s_pmp_end[];
+extern const u8 __dtbo_t8122_pmp_begin[];
+extern const u8 __dtbo_t8122_pmp_end[];
 
 /* This Mac's PMP values, from the boot loader, or NULL. */
 static struct device_node *gate_pmp_values __initdata;
@@ -108,6 +112,9 @@ static struct device_node *gate_pmp_values __initdata;
  * node names; values from the boot loader must name this one too.
  */
 static const char gate_pmp_uuid[] __initconst = "2F4EB4C4-001B-3ACF-A9A0-68D8E42FC3A7";
+
+/* The T8122 PMP image of the 14.x system firmware. */
+static const char gate_t8122_pmp_uuid[] __initconst = "3B18C886-4C70-349B-B1C4-70F35DE2C5CD";
 
 /* One SoC's internal display handoff, as the gate checks and completes it */
 struct gate_soc {
@@ -150,9 +157,9 @@ static const struct gate_soc gate_t6030 __initconst = {
 };
 
 /*
- * T8122 (M3 MacBook Air): the same handoff and power states. Neither the PMP
- * placement nor its image are known for T8122 yet, so there is no PMP
- * description and the gate refuses before it changes anything.
+ * T8122 (M3 MacBook Air): the same handoff and power states, and a PMP
+ * overlay at the T8122 addresses. The PMP values must come from the boot
+ * loader: there is no built-in fallback.
  */
 static const struct gate_soc gate_t8122 __initconst = {
 	.machine = "apple,t8122",
@@ -162,7 +169,12 @@ static const struct gate_soc gate_t8122 __initconst = {
 	.display_compat = "apple,t8122-display-subsystem",
 	.marker = "apple,t8122-handoff",
 	.pwrstate_compat = "apple,t8122-pmgr-pwrstate",
+	.dcp_full_name = "dcp@28ec00000",
 	.pmp_values = "/chosen/asahi,t8122-pmp",
+	.pmp_uuid = gate_t8122_pmp_uuid,
+	.report_compat = "apple,t8122-pmp-v2-report",
+	.pmp_dtbo = __dtbo_t8122_pmp_begin,
+	.pmp_dtbo_end = __dtbo_t8122_pmp_end,
 	.quiet_without_nodes = true,
 };
 

@@ -379,6 +379,14 @@ static int tps6598x_dr_set(struct typec_port *port, enum typec_data_role role)
 	u32 status;
 	int ret;
 
+	/*
+	 * On the J613 SN201202x, SWDF/SWUF can stay busy forever. Keep the
+	 * negotiated data role rather than wedge the command mailbox.
+	 */
+	if (of_machine_is_compatible("apple,j613") &&
+	    device_is_compatible(tps->dev, "apple,sn201202x"))
+		return -EOPNOTSUPP;
+
 	mutex_lock(&tps->lock);
 
 	ret = tps6598x_exec_cmd(tps, cmd, 0, NULL, 0, NULL);

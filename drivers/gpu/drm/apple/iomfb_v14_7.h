@@ -7,9 +7,18 @@
 
 struct apple_dcp;
 struct apple_dcp_v14;
+struct dcp_v14_board;
+struct device;
 struct drm_atomic_state;
 struct drm_crtc;
 struct drm_crtc_state;
+
+/*
+ * The board of an internal 14.x DCP node (by compatible and machine): NULL if
+ * the node is not one, ERR_PTR(-ENODEV) if this machine has no board record.
+ */
+const struct dcp_v14_board *iomfb_v14_7_board(struct device *dev);
+const char *iomfb_v14_7_board_name(const struct dcp_v14_board *board);
 
 /* Platform probe: firmware identity, boot loader handoff, PMP acknowledgment. */
 int iomfb_v14_7_probe(struct apple_dcp *dcp);
