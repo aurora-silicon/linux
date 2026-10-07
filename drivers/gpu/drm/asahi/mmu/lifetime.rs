@@ -54,8 +54,9 @@ struct State {
     quarantined: bool,
     draining: bool,
     closed: bool,
+    cleanup_failed: bool,
     close_ranges: Option<(Range<u64>, Range<u64>)>,
-    unmaps: KVec<(u64, u64)>,
+    unmaps: KVec<super::bind::PreparedUserUnmap>,
     objects: KVec<ARef<gem::Object>>,
 }
 
@@ -74,7 +75,7 @@ impl VmLifetime {
         Arc::pin_init(
             pin_init!(Self {
                 state <- new_mutex!(State { active:0, commits:0, blocked:false,
-                    quarantined:false, draining:false, closed:false, close_ranges:None,
+                    quarantined:false, draining:false, closed:false, cleanup_failed:false, close_ranges:None,
                     unmaps:KVec::new(), objects:KVec::new() }, "VM job lifetime"),
                 changed <- new_condvar!("VM mapping admission"),
                 driver <- new_mutex!(None, "VM driver mappings"),
@@ -414,7 +415,7 @@ impl Vm {
         Ok(())
     }
 
-    pub(super) fn defer_bind_batch(&self, batch: &PreparedUserBindBatch) -> Result<bool> {
+    pub(super) fn defer_bind_batch(&self, batch: &mut PreparedUserBindBatch, start: usize) -> Result<bool> {
         use super::bind::PreparedUserBindOp;
         let Some(lifetime) = self.lifetime.as_ref() else {
             return Ok(false);
@@ -428,7 +429,7 @@ impl Vm {
         }
         if batch
             .ops
-            .iter()
+            .iter().skip(start)
             .any(|op| matches!(op, PreparedUserBindOp::Map(_)))
         {
             return Err(EIO);
@@ -438,19 +439,21 @@ impl Vm {
         }
         // Reserve before accepting any range; a partial deferred batch must
         // not leave canonical metadata ahead of the accepted cleanup.
-        state.unmaps.reserve(batch.ops.len(), GFP_KERNEL)?;
-        for op in &batch.ops {
-            if let PreparedUserBindOp::Unmap(unmap) = op {
-                let range = (unmap.iova, unmap.size);
-                if !state.unmaps.contains(&range) {
-                    state.unmaps.push(range, GFP_KERNEL)?;
-                }
-            }
-        }
-        let retired = self.untrack_context_ranges(batch.ops.iter().filter_map(|op| match op {
+        state.unmaps.reserve(batch.ops.len() - start, GFP_KERNEL)?;
+        let retired = self.untrack_context_ranges(batch.ops.iter().skip(start).filter_map(|op| match op {
             PreparedUserBindOp::Unmap(unmap) => Some(unmap.iova..unmap.iova + unmap.size),
             PreparedUserBindOp::Map(_) => None,
         }));
+        // Transfer the preallocated split nodes along with each accepted range.
+        // Already-committed prefix operations must not be replayed: their nodes
+        // may have been consumed and another binding may now occupy the range.
+        for op in batch.ops.drain(start..) {
+            if let PreparedUserBindOp::Unmap(unmap) = op {
+                if !state.unmaps.iter().any(|old| old.iova == unmap.iova && old.size == unmap.size) {
+                    state.unmaps.push(unmap, GFP_KERNEL)?;
+                }
+            }
+        }
         drop(state);
         drop(retired);
         Ok(true)
@@ -461,7 +464,7 @@ impl Vm {
         let Some(lifetime) = self.lifetime.as_ref() else {
             return Ok(false);
         };
-        let mut state = lifetime.state.lock();
+        let state = lifetime.state.lock();
         if state.closed {
             return Err(ENOENT);
         }
@@ -471,8 +474,17 @@ impl Vm {
         if !state.quarantined {
             return Err(EBUSY);
         }
-        if !state.unmaps.contains(&(iova, size)) {
-            state.unmaps.push((iova, size), GFP_KERNEL)?;
+        if state.unmaps.iter().any(|old| old.iova == iova && old.size == size) {
+            return Ok(true);
+        }
+        drop(state);
+        let unmap = self.prepare_user_unmap(iova, size)?;
+        let mut state = lifetime.state.lock();
+        if state.closed { return Err(ENOENT); }
+        if !state.blocked { return Ok(false); }
+        if !state.quarantined { return Err(EBUSY); }
+        if !state.unmaps.iter().any(|old| old.iova == iova && old.size == size) {
+            state.unmaps.push(unmap, GFP_KERNEL)?;
         }
         Ok(true)
     }
@@ -557,24 +569,28 @@ impl Vm {
     /// Recheck queued cleanup and reopen under the same lock used to append it.
     fn drain_mappings(&self, lifetime: &VmLifetime) {
         let mut state = lifetime.state.lock();
+        let mut failure = None;
         loop {
             let close = state.close_ranges.take();
             let unmaps = core::mem::replace(&mut state.unmaps, KVec::new());
             let objects = core::mem::replace(&mut state.objects, KVec::new());
             drop(state);
             if let Some((user, kernel)) = close {
-                if self.unmap_user_ranges_now(user, kernel).is_err() {
+                if let Err(error) = self.unmap_user_ranges_now(user, kernel) {
+                    failure.get_or_insert(error);
                     pr_err!("MMU: deferred VM close failed\n");
                 }
             } else {
-                for (address, size) in unmaps {
-                    if self.unmap_range_now(address, size).is_err() {
+                for mut unmap in unmaps {
+                    if let Err(error) = self.unmap_prepared_cleanup(&mut unmap) {
+                        failure.get_or_insert(error);
                         pr_err!("MMU: deferred user unmap failed\n");
                     }
                 }
             }
             for object in objects {
-                if self.drop_mappings_now(&object).is_err() {
+                if let Err(error) = self.drop_mappings_now(&object) {
+                    failure.get_or_insert(error);
                     pr_err!("MMU: deferred object unmap failed\n");
                 }
             }
@@ -585,7 +601,16 @@ impl Vm {
             }
             state.quarantined = false;
             state.draining = false;
-            if !state.closed {
+            if let Some(error) = failure {
+                // Cleanup is allocation-free for accepted ranges and has a
+                // whole-node low-memory fallback for objects. An unexpected
+                // invariant error must not reopen admission over stale leaves.
+                // GPUVA owners retain backing until final VM close; report the
+                // terminal failure instead of silently discarding its outcome.
+                state.blocked = true;
+                state.cleanup_failed = true;
+                if let Some(status) = &self.status { status.record(error); }
+            } else if !state.closed && !state.cleanup_failed {
                 state.blocked = false;
             }
             drop(state);
