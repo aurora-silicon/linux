@@ -9,12 +9,39 @@ use super::*;
 use kernel::drm::gem::BaseObject;
 use kernel::{new_condvar, sync::CondVar};
 
+/// Re-evicting backing that a job just had to restore only repeats the
+/// restoration. After a restore, reclaim of this VM pauses for a backoff
+/// proportional to what the restore cost, within these bounds.
+const RESTORE_BACKOFF_MIN_NS: u64 = 1_000_000_000;
+const RESTORE_BACKOFF_MAX_NS: u64 = 30_000_000_000;
+const RESTORE_BACKOFF_FACTOR: u64 = 16;
+
+fn now_ns() -> u64 {
+    <kernel::time::Monotonic as kernel::time::ClockSource>::ktime_get() as u64
+}
+
 #[derive(Default)]
 struct State {
     users: usize,
     busy: bool,
     evicted: bool,
     closed: bool,
+    /// Monotonic time the last restoration finished and its duration.
+    restored_at: u64,
+    restore_cost: u64,
+}
+
+impl State {
+    fn in_restore_backoff(&self, now: u64) -> bool {
+        if self.restored_at == 0 {
+            return false;
+        }
+        let backoff = self
+            .restore_cost
+            .saturating_mul(RESTORE_BACKOFF_FACTOR)
+            .clamp(RESTORE_BACKOFF_MIN_NS, RESTORE_BACKOFF_MAX_NS);
+        now.saturating_sub(self.restored_at) < backoff
+    }
 }
 
 #[pin_data]
@@ -76,11 +103,15 @@ impl Gate {
             // No new reader can enter until every retained mapping is restored.
             state.busy = true;
             drop(state);
+            let started = now_ns();
             let result = restore();
             let mut state = gate.state.lock();
             state.busy = false;
             if result.is_ok() {
                 state.evicted = false;
+                let now = now_ns();
+                state.restored_at = now;
+                state.restore_cost = now.saturating_sub(started);
             }
             drop(state);
             gate.ready.notify_all();
@@ -123,7 +154,7 @@ impl Gate {
     /// The busy gate continues to exclude restoration and metadata changes.
     pub(crate) fn try_reclaim(gate: &Arc<Self>) -> Option<Reclaim> {
         let mut state = gate.state.try_lock()?;
-        if state.users != 0 || state.busy || state.closed {
+        if state.users != 0 || state.busy || state.closed || state.in_restore_backoff(now_ns()) {
             return None;
         }
         state.busy = true;
@@ -142,9 +173,12 @@ impl Gate {
     }
 
     pub(crate) fn idle(&self) -> bool {
-        self.state
-            .try_lock()
-            .is_some_and(|state| state.users == 0 && !state.busy && !state.closed)
+        self.state.try_lock().is_some_and(|state| {
+            state.users == 0
+                && !state.busy
+                && !state.closed
+                && !state.in_restore_backoff(now_ns())
+        })
     }
 
     /// A page-table mutation happened outside a `Reclaim` (the purge path runs
