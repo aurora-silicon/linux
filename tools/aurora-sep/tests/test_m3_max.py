@@ -109,7 +109,9 @@ STUBS = {
                'nobody:x:65534:65534::/:/usr/bin/nologin\\n"; exit 0; }\nexec /usr/bin/getent "$@"\n'),
     "id": '#!/bin/sh\n[ "$*" = -un ] && { echo alice; exit 0; }\nexec /usr/bin/id "$@"\n',
     # phram as the kernel's: loading it binds the two reserved-memory regions and makes their MTD
-    # devices (mtd1 adt, mtd2 m1n1_stage2.log) and nodes; unloading removes them.
+    # devices (mtd1 adt, mtd2 m1n1_stage2.log) and nodes; unloading removes them. As in the
+    # kernel, an MTD device has its own of_node link and no parent device (FAKE_ADT_NODE binds adt
+    # to another region).
     "modprobe": r"""#!/bin/bash
 echo "modprobe $*" >>"$FAKE/log"
 S=$M3T/sys
@@ -119,13 +121,13 @@ case "$*" in
     mkdir -p "$S/module/phram"
     [[ -n ${FAKE_NO_ADT_MTD:-} ]] && exit 0
     n=1
-    for r in "adt 10003528000 ${FAKE_ADT_SIZE:-507904}" "m1n1_stage2.log 108d994c000 16384"; do
+    for r in "adt ${FAKE_ADT_NODE:-10003528000} ${FAKE_ADT_SIZE:-507904}" "m1n1_stage2.log 108d994c000 16384"; do
       read -r name addr size <<<"$r"
       m=$S/class/mtd/mtd$n
       mkdir -p "$m" "$S/class/mtd/mtd${n}ro"
       echo "$name" >"$m/name"; echo ram >"$m/type"; echo "$size" >"$m/size"; echo 4096 >"$m/erasesize"
       echo "90:$((n * 2))" >"$m/dev"
-      ln -sfn "$S/bus/platform/devices/$addr.flash" "$m/device"
+      ln -sfn "$M3T/dt/reserved-memory/flash@$addr" "$m/of_node"
       touch "$M3T/dev/mtd$n" "$M3T/dev/mtd${n}ro"
       n=$((n + 1))
     done ;;
@@ -726,8 +728,7 @@ class AdtTest(MaxBase):
         self.assertIn("restored: yes", check)
 
     def test_a_device_bound_to_another_node_is_not_read(self):
-        self.platform("10003528000.flash", "reserved-memory/flash@108d994c000")
-        allow, check = self.files()
+        allow, check = self.files(FAKE_ADT_NODE="108d994c000")
         self.assertIn("does not match its reserved-memory region", allow)
         self.assertNotIn("reader ", self.log())
         self.assert_restored(check)
