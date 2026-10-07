@@ -636,9 +636,8 @@ dcpep_cb_allocate_buffer(struct apple_dcp *dcp,
 
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 	/*
-	 * H17P firmware also needs the physical address: it loads the APT M3
-	 * microcode through it, and with a zero paddr the timing sequencer
-	 * comes up and is powered straight back down.
+	 * Linux allocation traces correlate the first H17P reply address with
+	 * the first SG page. The remaining pages need not be contiguous.
 	 */
 	if (allocated.map.sgl)
 		resp.paddr = sg_phys(allocated.map.sgl);

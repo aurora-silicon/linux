@@ -352,6 +352,49 @@ fail:
 	return false;
 }
 
+static bool trampoline_allocate_buffer_h17p(struct apple_dcp *dcp, int tag,
+					    void *out, void *in)
+{
+	const struct dcp_allocate_buffer_req *wire = in;
+	struct dcp_allocate_buffer_req request = { 0 };
+	struct dcp_allocate_buffer_resp reply;
+	u32 options;
+
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
+		return trampoline_allocate_buffer(dcp, tag, out, in);
+
+	static_assert(sizeof(*wire) == 0x14);
+	static_assert(sizeof(reply) == 0x1c);
+	static_assert(offsetof(struct dcp_allocate_buffer_req, size) == 4);
+	static_assert(offsetof(struct dcp_allocate_buffer_req, unk2) == 12);
+	static_assert(offsetof(struct dcp_allocate_buffer_req, paddr_null) == 16);
+
+	trace_iomfb_callback(dcp, tag, __func__);
+	options = get_unaligned_le32(&wire->unk2);
+	/* Only these option combinations have observed successful replies. */
+	if (get_unaligned_le32(&wire->unk0) != 0x703 ||
+	    (options != 4 && options != SZ_16K) ||
+	    memchr_inv(&wire->paddr_null, 0, 4))
+		goto fail;
+
+	request.size = get_unaligned_le64(&wire->size);
+	reply = dcpep_cb_allocate_buffer(dcp, &request);
+	if (!reply.dva_size)
+		goto fail;
+
+	put_unaligned_le64(reply.paddr, out);
+	put_unaligned_le64(reply.dva, (u8 *)out + 8);
+	put_unaligned_le64(reply.dva_size, (u8 *)out + 16);
+	put_unaligned_le32(reply.mem_desc_id, (u8 *)out + 24);
+	return true;
+
+fail:
+	/* Allocation failures have no measured H17P reply encoding. */
+	dev_err(dcp->dev, "unqualified or failed D451 buffer allocation\n");
+	WRITE_ONCE(dcp->crashed, true);
+	return false;
+}
+
 /* H17P callback numbering is not a uniform shift of the v13.5 table. */
 static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[0] = dcpep_cb_d000_h17p, /* acked after a nested A033 */
@@ -400,7 +443,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[413] = trampoline_true, /* setProperty */
 	[414] = trampoline_sr_set_property_int, /* setProperty */
 	[415] = trampoline_true, /* setProperty */
-	[451] = trampoline_allocate_buffer, /* allocate_buffer */
+	[451] = trampoline_allocate_buffer_h17p, /* allocate_buffer */
 	[452] = trampoline_map_physical, /* prepare */
 	[454] = trampoline_release_mem_desc, /* release_descriptor */
 	[552] = trampoline_true,
