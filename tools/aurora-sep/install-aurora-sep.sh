@@ -445,9 +445,9 @@ M3_AIR_DRY_RUN_SWITCHES="chosen.asahi,t8122-gpu-diag=1 chosen.asahi,t8122-gpu-ha
 M3_GPU_EXPERIMENT=0
 M3_GPU_BIN=/usr/local/bin
 M3_GPU_SCRIPTS=(
-  "air-gpu-oneshot.sh 7d91614ea302e0df1c5d1f3337ab418e35cf312d5c1ad0e4fb54a002a96e7f6d"
-  "air-gpu-collect.sh 86a3e2f87729949cb8590e3678626f9b4e233a1a27af77f77536ddbc22b72624"
-  "air-gpu-job.sh 41106491a5069f11a714991acada9472f2936f48e3a7bcdbbb6660fe8f69987d"
+  "air-gpu-oneshot.sh d0259869b8519439a4dbcdae08ef1b0e17fdcaf84ac746fca61febf6a325f8aa"
+  "air-gpu-collect.sh ac11914e55a8f3a4652b7796ce423f17364e26725e5edd78a9d4d2136adc76de"
+  "air-gpu-job.sh f76e57154e96165daf8834508975a98f745519ab1b51ac2edae4f5710edae349"
 )
 # PLACEHOLDER until the G15G Mesa build exists: its prefix package as "file sha256" (a pacman
 # package that installs Mesa into a prefix of its own, never over the system Mesa), and that
@@ -1251,7 +1251,8 @@ m3_gpu_notice() {
     fi
     if [[ " $(m3_switches 2>/dev/null) " != *" $M3_AIR_GPU_SWITCH "* ]]; then
       echo "   This Mac's boot loader does not hand the GPU over ($M3_AIR_GPU_SWITCH is not armed), so an"
-      echo "   armed boot ends ARMED-NOT-STARTED until a release's --m3-handoff does."
+      echo "   armed boot ends ARMED-NOT-STARTED until the boot loader hands the GPU over (see"
+      echo "   https://github.com/iconidentify/aurora-linux/issues/35)."
     fi
   elif [[ -f $STATE/m3-gpu-experiment ]]; then
     echo "   Keeping the M3 Air GPU experiment's scripts from an earlier install in $M3_GPU_BIN;"
@@ -1260,20 +1261,24 @@ m3_gpu_notice() {
   return 0
 }
 
-# --uninstall: clears an armed experiment boot, then removes what m3_gpu_install recorded.
-# Clear any armed experiment boot. Run BEFORE the kernel is replaced (A10): disarming after the
-# UKI the armed entry pins is gone would leave the one-shot naming a stale entry. Safe to call
-# when nothing is armed, and when the experiment was never installed.
+# The installed one-shot script.
+m3_gpu_oneshot() { $sudo "$M3_GPU_BIN/air-gpu-oneshot.sh" "$@"; }
+
+# Clear any armed experiment boot and its boot entry. Called before anything replaces the kernel:
+# an install (a new release, or a rerun) rebuilds the UKI the armed entry pins, and --uninstall
+# replaces the kernel, so an entry left armed would fail Limine's hash check at the next boot.
+# Returns 0 when the experiment was never installed, or nothing was armed; non-zero when the
+# disarm failed (the caller stops before changing anything).
 m3_gpu_disarm() {
   [[ -f $STATE/m3-gpu-experiment && -x $M3_GPU_BIN/air-gpu-oneshot.sh ]] || return 0
-  $sudo "$M3_GPU_BIN/air-gpu-oneshot.sh" --disarm ||
-    warn "air-gpu-oneshot.sh --disarm failed: check limine.conf for an air-gpu-oneshot entry"
+  say "Clearing any armed M3 Air GPU experiment boot before the kernel is replaced (arm it again after the reboot)"
+  m3_gpu_oneshot --disarm
 }
 
 m3_gpu_remove() {
   local kind name leftover=0
   [[ -f $STATE/m3-gpu-experiment ]] || return 0
-  m3_gpu_disarm
+  # uninstall_all already cleared any armed boot, before the kernel was replaced.
   while read -r kind name _; do
     case $kind in
       script) [[ $name =~ ^air-gpu-[a-z]+\.sh$ ]] && $sudo rm -f "$M3_GPU_BIN/$name" ;;
@@ -1816,6 +1821,8 @@ install_all() {
     on. Nothing was installed. Please report it at https://github.com/iconidentify/aurora-linux/issues"
   fi
 
+  m3_gpu_disarm || die "air-gpu-oneshot.sh --disarm failed, so a boot may still be armed for the
+    kernel this install replaces. Nothing was installed. Run: sudo air-gpu-oneshot.sh --disarm"
   snapshot "aurora-sep $VERSION"
   # Before pacman's update-m1n1 hook rebuilds boot.bin below.
   bootbin_backup
@@ -1973,6 +1980,10 @@ install_all() {
 uninstall_all() {
   local previous=linux-asahi m3_mode=none
   require_supported_soc "Uninstalling, which rebuilds boot.bin with the stock m1n1,"
+  # Before anything changes: a boot left armed for the kernel being removed would fail Limine's
+  # hash check at the next boot.
+  m3_gpu_disarm || die "air-gpu-oneshot.sh --disarm failed, so a boot may still be armed for the
+    kernel --uninstall would remove. Nothing was uninstalled. Run: sudo air-gpu-oneshot.sh --disarm"
   if [[ -f $STATE/previous-package ]]; then read -r previous _ <"$STATE/previous-package" || true; fi
   # 11.36 rewrote this on every run, so an updated Mac may name linux-aurora
   # itself, which the repositories don't carry for these Macs.
@@ -2007,9 +2018,6 @@ uninstall_all() {
     say "Reinstalling $previous, the stock m1n1 and the stock libfprint"
   fi
   $sudo pacman -Rdd --noconfirm aurora-touchid 2>/dev/null || true
-  # Clear any armed experiment boot before the kernel (and its UKI) is replaced, so the one-shot
-  # never names an entry whose kernel image is about to change (A10).
-  m3_gpu_disarm
   # The stock m1n1 has no M3 handoff; drop the switches before its rebuild.
   m3_switches_remove
   $sudo pacman -Sy --noconfirm --ask 4 "$previous" "$previous-headers" libfprint $m1n1
@@ -2648,11 +2656,18 @@ fingerprint.
           --m3-handoff if the Air needs it) installs air-gpu-oneshot.sh,
           air-gpu-collect.sh and air-gpu-job.sh in /usr/local/bin and arms
           nothing. "sudo air-gpu-oneshot.sh start" (or knob=value ...) arms
-          the next boot only; any boot after it, a power cycle included, is
-          the normal one. After the armed boot (or the boot after it, if it
-          hung) run "sudo air-gpu-collect.sh" and attach its tgz with the
-          last line it prints, "AIR-GPU VERDICT: ...". Stop and report on any
-          crash or panic.
+          the next boot only. Limine clears the one-shot before that boot
+          starts, so the boots after it, a power cycle included, should be
+          the normal entry; this has been tested on an M3 Pro only. So the
+          first arming on each Air is the harmless one,
+            sudo air-gpu-oneshot.sh t8122_pstate_cap=1
+          and in that armed boot "sudo air-gpu-oneshot.sh --status" must say
+          "ubootefi.var: does not name air-gpu-oneshot" before any other
+          knob is tried. If the experiment ever boots twice, pick the normal
+          entry in the boot menu and report it. After the armed boot (or the
+          boot after it, if it hung) run "sudo air-gpu-collect.sh" and
+          attach its tgz with the last line it prints, "AIR-GPU VERDICT:
+          ...". Stop and report on any crash or panic.
 
    Checks for every M3 (quote the output; on a kernel-only M3 the handoff
    lines are expected to be missing, so say so):

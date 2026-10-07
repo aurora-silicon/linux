@@ -383,7 +383,7 @@ PY
 
 # Run as the invoking user when we are root under sudo; otherwise run directly. User-side files
 # (the record, its directory) are written this way, never as root, so a symlink a local user
-# planted in their home can't redirect a root write or a chown (A13).
+# planted in their home can't redirect a root write or a chown.
 runu() {
   if [[ $(id -u) == 0 && -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
     runuser -u "$SUDO_USER" -- "$@"
@@ -406,11 +406,15 @@ main() {
     shift
   done
   [[ -n $prefix ]] || usage
-  if ! [[ $seconds =~ ^[0-9]+$ ]] || ((seconds < 1 || seconds > MAX_SECONDS)); then
+  # One digit, so no leading zero reaches $(( )) as an octal number.
+  if ! [[ $seconds =~ ^[1-9]$ ]] || ((seconds > MAX_SECONDS)); then
     say "refused: --seconds takes 1 to $MAX_SECONDS (the whole run is held to $LIMIT_S s)."
     exit 2
   fi
+  # A control character (a newline, say) in the path could forge a key=value line in the record.
+  if [[ $prefix == *[[:cntrl:]]* ]]; then say "refused: the Mesa prefix path has a control character."; exit 2; fi
   prefix=$(realpath -e -- "$prefix" 2>/dev/null) || { say "refused: no Mesa prefix at $prefix."; exit 2; }
+  if [[ $prefix == *[[:cntrl:]]* ]]; then say "refused: the Mesa prefix path has a control character."; exit 2; fi
   icds=("$prefix"/share/vulkan/icd.d/*.json)
   [[ ${#icds[@]} == 1 && -f ${icds[0]} ]] ||
     { say "refused: $prefix/share/vulkan/icd.d must hold exactly one Vulkan driver file."; exit 2; }
@@ -421,7 +425,7 @@ main() {
   user=${SUDO_USER:-$(id -un)}
   home=$(user_home "$user")
   recdir=$home/air-gpu-runs
-  # Created as the user (A13), so a symlink there can only point where the user may already write.
+  # Created as the user, so a symlink there can only point where the user may already write.
   runu mkdir -p "$recdir" 2>/dev/null ||
     { say "refused: could not create $recdir as $user (is it a symlink?)."; exit 2; }
   rec=$recdir/job-$(date +%Y%m%d-%H%M%S-%N).txt
@@ -430,7 +434,7 @@ main() {
   work=$(mktemp -d)
   trap 'rm -rf "${work:-}"' EXIT
   out=$work/job.out
-  # Writes the record (key=value lines on stdin) as the user (A13) and makes it durable before it
+  # Writes the record (key=value lines on stdin) as the user and makes it durable before it
   # returns: a temp file next to the record, fsync it, rename it over the record, fsync the
   # directory. A hard reset right after (a GPU hang, a power cycle) still finds this version on
   # disk. Returns non-zero on any failure, with the reason in $work/rec.err; callers check it.
@@ -481,9 +485,10 @@ main() {
   if [[ $(id -u) == 0 ]]; then journalctl --sync 2>/dev/null || true; fi
   sync
 
-  deadline=$((start + LIMIT_S * 1000))
-  # The job stops submitting 1.5 s before the wrapper's limit, leaving time to report.
-  budget=$((deadline - $(now_ms) - 1500))
+  # The whole run ends within LIMIT_S: TERM at LIMIT_S - 2 s, KILL 1 s later, the verdict 1 s
+  # after that. The job stops submitting 1 s before the TERM, leaving time to report.
+  deadline=$((start + LIMIT_S * 1000 - 2000))
+  budget=$((deadline - $(now_ms) - 1000))
   ((budget > 0)) || budget=0
   (
     while read -r a; do export "${a?}"; done < <(mesa_env "$prefix" "$icd")
@@ -513,7 +518,7 @@ main() {
   device=$(sed -n 's/^device=//p' "$out" | tail -1)
   err=$(sed -n 's/^error=//p' "$out" | tail -1)
   # How far the job got, for collect: a job that started but did not finish is never a clean
-  # FW-RUNNING or JOB-COMPLETED (A3).
+  # FW-RUNNING or JOB-COMPLETED.
   stage=none
   grep -q '^opened_device=' "$out" && stage="opening-device"
   grep -q '^opened_device=yes' "$out" && stage="opened-device"

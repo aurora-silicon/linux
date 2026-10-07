@@ -8,7 +8,7 @@
 #   sudo air-gpu-oneshot.sh --status                 what is armed, and what this boot ran with
 #   sudo air-gpu-oneshot.sh --disarm                 clear the one-shot and remove its boot entry
 #   air-gpu-oneshot.sh --list-knobs                  the knobs this script accepts
-#   --allow-test-on-m3pro                            also run on an M3 Pro (t6030): a rehearsal
+#   --allow-test-on-m3pro                            also run on an M3 Pro (t6030): a test of the boot steps
 #
 # Knobs are written without the "asahi." prefix (t8122_pstate_cap=2); the prefix is accepted too.
 #
@@ -34,20 +34,20 @@ set -euo pipefail
 # the string "asahi.<name>" in that kernel image (the UKI) and refuses one it does not find.
 KNOBS='
 t8122_start             1                                  the T8122 start experiment (always set by this script)
-t8122_initdata_version  0x[1-9a-fA-F][0-9a-fA-F]{0,15}|[1-9][0-9]{0,19}  InitData version for the firmware (default 0x0c08e21e83800490)
+t8122_initdata_version  0x[0-9a-fA-F]{1,16}|[1-9][0-9]{0,19}  InitData version for the firmware (default 0x0c08e21e83800490)
 t8122_fender            rule|adt|0x104000|0x12c000         Fender window: rule 0x104000 (default) or adt 0x12c000
 t8122_clkgen            e1c|e5c|none                       clock-generator slot: SGX+0xe1c000 (default), SGX+0xe5c000, none
 t8122_sgx_setup         none|t6030                         SGX write before the firmware starts: none (default) or T6030 0x70001
-t8122_unit_mask_a       0x[1-9a-fA-F][0-9a-fA-F]{0,8}|[1-9][0-9]{0,10}  HwDataB unit mask A: nonzero, within 0x700000001 (default)
+t8122_unit_mask_a       0x[0-9a-fA-F]{1,9}|[1-9][0-9]{0,10}  HwDataB unit mask A: nonzero, within 0x700000001 (default)
 t8122_unit_mask_b       0x[1-7]|[1-7]                      HwDataB unit mask B: nonzero, within 0x7 (default 0x3)
 t8122_pstate_cap        [1-5]                              highest GPU performance state, 1 to 5 (default 2; above 2 has no temperature feedback yet)
 m3_expose               -1|0|1                             render node: -1 auto (on for J613/J615, the default), 0 off, 1 on
 m3_timeout_nohang       0|1                                on a job timeout, fail the job without the hang path
 '
 
-# Whether a decimal or 0x-hex string is a nonzero value that fits in 64 bits. The regexes bound
-# hex to 16 digits (<= 2^64-1) and forbid a leading zero (so no octal and no $(( )) parse error);
-# this bounds a decimal to 2^64-1 before any arithmetic, which would otherwise wrap silently.
+# Whether a decimal or 0x-hex string fits in 64 bits. The regexes bound hex to 16 digits
+# (<= 2^64-1) and forbid a leading zero in a decimal (so no octal and no $(( )) parse error); this
+# bounds a decimal to 2^64-1 before any arithmetic, which would otherwise wrap silently.
 u64_ok() {
   local t=$1
   [[ $t == 0x* || $t == 0X* ]] && return 0
@@ -65,7 +65,9 @@ knob_ok() { # name value
     *) return 0 ;;
   esac
   case $1 in
-    t8122_initdata_version) ((v != 0)) ;;
+    # Nonzero, and not the kernel's two reserved values (2^64-1 "not given", 2^64-2 "invalid"),
+    # which bash arithmetic reads as -1 and -2.
+    t8122_initdata_version) ((v != 0 && v != -1 && v != -2)) ;;
     t8122_unit_mask_a) ((v != 0 && (v & ~0x700000001) == 0)) ;;
     t8122_unit_mask_b) ((v != 0 && (v & ~0x7) == 0)) ;;
   esac
@@ -126,11 +128,11 @@ is_m3pro() { compatibles | grep -qx 'apple,t6030'; }
 check_board() {
   if is_air; then return 0; fi
   if is_m3pro && ((ALLOW_M3PRO)); then
-    say "rehearsal on an M3 Pro ($(board)): the t8122 knobs do nothing on this GPU"
+    say "test run on an M3 Pro ($(board)): the t8122 knobs do nothing on this GPU"
     return 0
   fi
   if is_m3pro; then
-    refuse "this is an M3 Pro ($(board)), not an M3 MacBook Air (j613, j615); --allow-test-on-m3pro runs the rehearsal."
+    refuse "this is an M3 Pro ($(board)), not an M3 MacBook Air (j613, j615); --allow-test-on-m3pro tests the boot steps there."
   fi
   refuse "this Mac ($(board), $(compatibles | sed -n 's/^apple,\(t[0-9]*\)$/\1/p' | head -1)) is not an M3 MacBook Air (j613, j615)."
 }
@@ -288,7 +290,7 @@ take_locks() {
   local l fd
   # Short waits, and never hold one lock while blocking on the next: the Limine tools wait only
   # ~10 s and then carry on without the lock, so holding one for a minute makes a race more
-  # likely, not less (A8). If a lock can't be taken quickly, back off and refuse; the operator
+  # likely, not less. If a lock can't be taken quickly, back off and refuse; the operator
   # retries. The write itself is still guarded by a compare-before-rename.
   LOCK_FDS=()
   for l in $LOCKS; do
@@ -352,7 +354,7 @@ strip_all_entries() {
 
 # Replaces limine.conf with $1 (plus a final newline), atomically, and syncs it. $2 is the bytes
 # the edit was based on: just before the rename, the file on disk must still be those bytes, or a
-# Limine tool rewrote it since (A8) and the edit is abandoned, so a stale UKI pin can't be written.
+# Limine tool rewrote it since and the edit is abandoned, so a stale UKI pin can't be written.
 write_conf() {
   local tmp=$CONF.air-gpu.tmp
   if [[ -n ${2:-} && $(cat "$CONF") != "$2" ]]; then return 2; fi
@@ -369,7 +371,7 @@ conf_has_block() { grep -qxF "$BEGIN_MARK" "$CONF" 2>/dev/null; }
 conf_entry_count() { grep -cxF "/$ENTRY" "$CONF" 2>/dev/null || true; }
 # A /air-gpu-oneshot entry left in the file with no marked block around it (a tool dropped the
 # markers, or a hand edit): conf_without_block can't remove it, so neither --disarm nor a re-arm
-# would be clean (A10/A11).
+# would be clean.
 conf_has_stray_entry() {
   local n b
   n=$(conf_entry_count)
@@ -378,7 +380,7 @@ conf_has_stray_entry() {
   (( n > b ))
 }
 
-# Whether Limine's own EFI binary has a config hash enrolled (A6): the 128 bytes after the
+# Whether Limine's own EFI binary has a config hash enrolled: the 128 bytes after the
 # ++CONFIG_B2SUM_SIGNATURE++ marker are all '0' in the unenrolled state. An enrolled binary
 # rejects any edited limine.conf on every boot, so arming would brick the Mac until the ESP is
 # fixed from outside. On any SoC this version of limine-mkinitcpio-hook enrolls only on x86_64,
@@ -444,7 +446,7 @@ preflight() {
     p=${p%%=*}
     if ! grep -qaF "$p" "$UKI"; then
       if is_m3pro && ((ALLOW_M3PRO)); then
-        WARNINGS+=("this kernel has no $p parameter; the rehearsal boot ignores it")
+        WARNINGS+=("this kernel has no $p parameter; the test boot ignores it")
       else
         refuse "the kernel the armed entry boots ($KREL) has no $p parameter."
       fi
@@ -470,6 +472,20 @@ preflight() {
   [[ -z $w || $w == "$ENTRY" ]] ||
     refuse "another one-shot boot is armed ($w): not replacing it."
   gpu_node_note
+  esp_note
+}
+
+# The boot loader names the EFI partition it booted from; arming a different one changes nothing
+# at the next boot (harmless, but the boot is then not armed).
+esp_note() {
+  local want have
+  want=$(tr -d '\0' <"$DT/chosen/asahi,efi-system-partition" 2>/dev/null || true)
+  [[ -n $want ]] || return 0
+  have=$(findmnt -no PARTUUID "$ESP" 2>/dev/null || true)
+  [[ -n $have ]] || return 0
+  if [[ ${want,,} != "${have,,}" ]]; then
+    WARNINGS+=("$ESP (PARTUUID $have) is not the EFI partition this boot came from ($want); arming it would not arm the next boot")
+  fi
 }
 
 # The GPU only starts when the boot loader hands it over; say so when this boot's did not.
@@ -510,7 +526,7 @@ new_cmdline() {
 # ---- actions ---------------------------------------------------------------------------------
 
 do_arm() {
-  local before w rest current
+  local before w rest current rc
   is_root || refuse "run as root (sudo)."
   check_board
   # Every refusal comes from this first pass, before anything is touched. The second pass reads
@@ -520,17 +536,24 @@ do_arm() {
   preflight
   ID=$(date +%m%d-%H%M%S)
   NEW_CMDLINE=$(new_cmdline)
-  mkdir -p "$STATE_DIR"
+  mkdir -p "$STATE_DIR" || { release_locks; refuse "could not create $STATE_DIR."; }
   before=$STATE_DIR/limine.conf.before-$ID
-  cp -p "$CONF" "$before"
-  current=$(cat "$CONF")
+  cp -p "$CONF" "$before" || { release_locks; refuse "could not keep a copy of $CONF in $STATE_DIR."; }
+  current=$(cat "$CONF") || { release_locks; refuse "could not read $CONF."; }
   rest=$(conf_without_block) || { release_locks; refuse "$CONF has an air-gpu-oneshot block without its end marker; fix it by hand."; }
-  # write_conf returns 2 if limine.conf changed under us since this read; then nothing was written.
-  write_conf "$rest"$'\n\n'"$(block "$ID" "$SRC_PATH" "$NEW_CMDLINE")" "$current"
-  case $? in
+  # write_conf returns 2 if limine.conf changed under us since this read (nothing was written), 1
+  # if the write failed. Its status is caught here, so set -e can't end the run without a line.
+  rc=0
+  write_conf "$rest"$'\n\n'"$(block "$ID" "$SRC_PATH" "$NEW_CMDLINE")" "$current" || rc=$?
+  case $rc in
     0) ;;
-    2) release_locks; refuse "$CONF changed while arming (a Limine tool ran); try again." ;;
-    *) release_locks; refuse "could not write $CONF." ;;
+    2) release_locks; refuse "$CONF changed while arming (a Limine tool rewrote it); nothing was armed. Try again." ;;
+    *)
+      # The rename may have happened before a failed directory sync: put the file back.
+      if [[ $(cat "$CONF" 2>/dev/null) != "$current" ]]; then cp -p "$before" "$CONF" 2>/dev/null || true; sync; fi
+      release_locks
+      refuse "could not write $CONF; nothing was armed."
+      ;;
   esac
   if ! grep -qxF "/$ENTRY" "$CONF" || ! grep -qxF "    cmdline: $NEW_CMDLINE" "$CONF"; then
     cp -p "$before" "$CONF"; sync; release_locks
@@ -539,15 +562,19 @@ do_arm() {
   if ! set_oneshot || [[ $(armed_name) != "$ENTRY" ]] || ! persist ||
     { [[ -n $VAR_FILE ]] && ! file_has_name "$VAR_FILE"; }; then
     clear_oneshot; persist || true
-    write_conf "$rest" || cp -p "$before" "$CONF"
+    write_conf "$rest" || cp -p "$before" "$CONF" || true
     sync; release_locks
     refuse "the one-shot variable did not read back from the firmware store; it was cleared and the entry removed."
   fi
+  # The arming record, which air-gpu-collect.sh judges by, is synced with everything else.
+  if ! { printf '%s\n' "$ID $KREL $NEW_CMDLINE" >"$STATE_DIR/armed.tmp" && sync "$STATE_DIR/armed.tmp" &&
+    mv -f "$STATE_DIR/armed.tmp" "$STATE_DIR/armed"; }; then
+    say "warning: could not write the arming record $STATE_DIR/armed; the boot is armed, but air-gpu-collect.sh will need --boot to find it"
+  fi
   sync
   release_locks
-  printf '%s\n' "$ID $KREL $NEW_CMDLINE" >"$STATE_DIR/armed"
   for w in "${WARNINGS[@]}"; do say "warning: $w"; done
-  say "armed one boot ($ID): the next boot only runs $KREL with ${PARAMS[*]}; every boot after it is the normal entry. Reboot when ready, then run: sudo air-gpu-collect.sh"
+  say "armed one boot ($ID): the next boot only runs $KREL with ${PARAMS[*]}. Limine clears the one-shot before that boot starts, so the boots after it should be the normal entry; this has been tested on an M3 Pro only, so on a first arming check it with --status in the armed boot. Don't update packages before the reboot. Reboot when ready, then run: sudo air-gpu-collect.sh"
   log "armed one boot ($ID): $KREL ${PARAMS[*]}"
 }
 
@@ -562,15 +589,26 @@ do_check() {
   say "check passed: this Mac can arm one boot of $KREL from $CONF (entry //$SOURCE_ENTRY, variable file ${VAR_FILE:-none}) with: ${PARAMS[*]}. Nothing was changed."
 }
 
+# Whether a boot ran with the recorded arming's id on its command line: this boot, or one in the
+# journal since the record was written.
+arming_booted() {
+  local id
+  read -r id _ <"$STATE_DIR/armed" 2>/dev/null || return 1
+  [[ -n $id ]] || return 1
+  [[ " $(cat "$CMDLINE" 2>/dev/null) " == *" $TAG=$id "* ]] && return 0
+  journalctl _TRANSPORT=kernel --since "@$(stat -c %Y "$STATE_DIR/armed")" -o cat --no-pager 2>/dev/null |
+    grep -q "Kernel command line:.* $TAG=$id\( \|$\)"
+}
+
 do_disarm() {
-  local armed rest changed=""
+  local armed rest current rc changed=""
   is_root || refuse "run as root (sudo)."
   find_esp || refuse "no FAT EFI partition mounted at /boot/efi, /efi or /boot."
   find_var_file || refuse "U-Boot names an unusable variable file in RTStorageVolatile."
   take_locks
   armed=$(armed_name)
   # Persist whenever the variable file still names the entry, even if the RAM variable is already
-  # clear: a first --disarm may have cleared the variable but failed to save (A7), and a second
+  # clear: a first --disarm may have cleared the variable but failed to save, and a second
   # run must finish the save rather than skip it because armed_name is now empty.
   if [[ $armed == "$ENTRY" ]] || { [[ -n $VAR_FILE ]] && file_has_name "$VAR_FILE"; }; then
     clear_oneshot
@@ -582,17 +620,24 @@ do_disarm() {
   elif [[ -n $armed ]]; then
     say "another one-shot is armed ($armed); leaving it alone"
   fi
-  # Remove a marked block, and also a markerless /air-gpu-oneshot entry a tool left behind (A11).
+  # Remove a marked block, and also a markerless /air-gpu-oneshot entry a tool left behind.
   if find_conf && { conf_has_block || conf_has_stray_entry; }; then
+    current=$(cat "$CONF") || { release_locks; refuse "could not read $CONF."; }
     rest=$(strip_all_entries) || { release_locks; refuse "$CONF has an air-gpu-oneshot block without its end marker; fix it by hand."; }
-    write_conf "$rest" || { release_locks; refuse "could not write $CONF."; }
-    changed+="removed the air-gpu-oneshot entry from $CONF; "
+    rc=0
+    write_conf "$rest" "$current" || rc=$?
+    case $rc in
+      0) changed+="removed the air-gpu-oneshot entry from $CONF; " ;;
+      2) release_locks; refuse "$CONF changed while disarming (a Limine tool rewrote it); run --disarm again." ;;
+      *) release_locks; refuse "could not write $CONF; run --disarm again." ;;
+    esac
   fi
-  # The arming record stays after an armed boot ran, so air-gpu-collect.sh keeps judging that boot
-  # by its id whenever it runs (the same source in every pass). Only a one-shot cleared before it
-  # booted is marked cancelled: that arming has no boot to judge.
-  if [[ $changed == *"cleared the one-shot"* && -f $STATE_DIR/armed ]]; then
-    mv -f "$STATE_DIR/armed" "$STATE_DIR/armed.cancelled"
+  # The arming record stays once its boot ran, so air-gpu-collect.sh keeps judging that boot by its
+  # id whenever it runs. Only an arming whose boot never ran (no boot's command line carries its
+  # id) is marked cancelled. A one-shot still in the variable file after its boot ran (U-Boot
+  # did not save Limine's deletion) does not count as never booted.
+  if [[ $changed == *"cleared the one-shot"* && -f $STATE_DIR/armed ]] && ! arming_booted; then
+    mv -f "$STATE_DIR/armed" "$STATE_DIR/armed.cancelled" || true
   fi
   sync
   release_locks
@@ -626,8 +671,17 @@ do_status() {
   fi
 }
 
+# A safety net: any command that fails outside a checked path still ends the run with one line.
+on_error() {
+  printf '%s: error: unexpected failure at line %s (%s); run air-gpu-oneshot.sh --status to see what is armed.\n' \
+    "$PROG" "$1" "$2" >&2
+  log "error: unexpected failure at line $1 ($2)"
+}
+
 main() {
   local action=arm args=() a
+  set -E
+  trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
   for a in "$@"; do
     case $a in
       --allow-test-on-m3pro) ALLOW_M3PRO=1 ;;

@@ -111,6 +111,10 @@ class FakeMac:
         logger = self.tmp / "bin/logger"
         logger.write_text(f'#!/bin/sh\necho "$*" >>"{self.tmp}/logger.log"\n')
         logger.chmod(0o755)
+        # No real journal: an empty one (the collect tests put their own in its place).
+        journal = self.tmp / "bin/journalctl"
+        journal.write_text("#!/bin/sh\nexit 0\n")
+        journal.chmod(0o755)
 
     @staticmethod
     def b2(p):
@@ -208,7 +212,9 @@ class OneShotTest(unittest.TestCase):
         before = self.mac.conf.read_bytes()
         proc = self.oneshot("t8122_pstate_cap=1", "asahi.t8122_clkgen=e1c", check=True)
         self.assertIn("armed one boot", proc.stdout)
-        self.assertIn("every boot after it is the normal entry", proc.stdout)
+        self.assertIn("the boots after it should be the normal entry", proc.stdout)
+        self.assertIn("tested on an M3 Pro only", proc.stdout)
+        self.assertIn("Don't update packages before the reboot", proc.stdout)
         block = self.armed_block()
         self.assertIsNotNone(block)
         lines = block.splitlines()
@@ -240,6 +246,60 @@ class OneShotTest(unittest.TestCase):
         proc = self.oneshot("--disarm", check=True)
         self.assertIn("removed the air-gpu-oneshot entry", proc.stdout)
         self.assertEqual(self.mac.conf.read_bytes(), before)
+
+    # A wrapper that runs a function's original body after a side effect.
+    WRAP = 'eval "orig_$1() $(declare -f "$1" | tail -n +2)"'
+
+    def assert_named_refusal(self, body, why):
+        before = self.mac.conf.read_bytes()
+        proc = self.mac.run(ONESHOT, body)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("refused:", proc.stderr)
+        self.assertIn(why, proc.stderr)
+        self.assertIsNone(self.mac.oneshot_var())                  # nothing armed
+        return proc, before
+
+    def test_a_limine_conf_changed_while_arming_is_refused_by_name(self):
+        # Another tool appends to limine.conf between the read and the rename: a named refusal, no
+        # silent exit, and the file keeps the other tool's change (ours is never written).
+        body = ("wrap() { " + self.WRAP + "; }\nwrap conf_without_block\n"
+                "conf_without_block() { echo '# another tool' >>\"$CONF\"; orig_conf_without_block; }\n"
+                "main start")
+        proc, before = self.assert_named_refusal(body, "changed while arming")
+        self.assertIn("nothing was armed", proc.stderr)
+        self.assertEqual(self.mac.conf.read_bytes(), before + b"# another tool\n")
+
+    def test_a_failed_limine_conf_write_is_refused_by_name(self):
+        proc, before = self.assert_named_refusal("write_conf() { return 1; }\nmain start", "could not write")
+        self.assertEqual(self.mac.conf.read_bytes(), before)
+
+    def test_an_unexpected_failure_still_prints_a_line(self):
+        proc = self.mac.run(ONESHOT, "new_cmdline() { false; }\nmain start")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("error: unexpected failure", proc.stderr)
+        self.assertIsNone(self.mac.oneshot_var())
+
+    def test_disarm_refuses_by_name_when_limine_conf_changes(self):
+        self.oneshot("start", check=True)
+        self.mac.limine_boots()
+        body = ("wrap() { " + self.WRAP + "; }\nwrap strip_all_entries\n"
+                "strip_all_entries() { echo '# another tool' >>\"$CONF\"; orig_strip_all_entries; }\n"
+                "main --disarm")
+        proc = self.mac.run(ONESHOT, body)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("changed while disarming", proc.stderr)
+        self.assertIsNotNone(self.armed_block())                   # left for the next --disarm
+
+    def test_disarm_in_the_armed_boot_keeps_the_record(self):
+        # The armed boot ran, but U-Boot did not save Limine's deletion (the variable file still
+        # names the entry). --disarm clears it, and keeps the arming record: that boot did run.
+        self.oneshot("start", check=True)
+        armed = (self.mac.state / "armed").read_text()
+        oneshot_id = armed.split()[0]
+        self.mac.cmdline.write_text(CMDLINE + f" asahi.t8122_start=1 air_gpu.oneshot={oneshot_id}\n")
+        proc = self.oneshot("--disarm", check=True)
+        self.assertIn("cleared the one-shot", proc.stdout)
+        self.assertEqual((self.mac.state / "armed").read_text(), armed)
 
     def test_disarm_keeps_the_arming_record_after_the_boot(self):
         # After the armed boot ran (Limine consumed the one-shot), --disarm removes the entry but
@@ -301,17 +361,17 @@ class OneShotTest(unittest.TestCase):
         for p in PARAMS:
             self.assertIn(p.decode()[len("asahi."):], out)
 
-    def test_rehearsal_on_an_m3_pro(self):
+    def test_test_run_on_an_m3_pro(self):
         self.mac.board("j516s")
         proc = self.oneshot("--allow-test-on-m3pro", "start", check=True)
-        self.assertIn("rehearsal on an M3 Pro", proc.stdout)
+        self.assertIn("test run on an M3 Pro", proc.stdout)
         self.assertIn("armed one boot", proc.stdout)
 
-    def test_rehearsal_on_a_kernel_without_the_knobs(self):
-        # 12.0 on the m3pro: the boot mechanics can still be rehearsed.
+    def test_test_run_on_a_kernel_without_the_knobs(self):
+        # A kernel without the knobs (12.0 on an M3 Pro): the boot steps can still be tested.
         self.mac = FakeMac(self, board="j516s", uki_params=[b"asahi.m3_expose"])
         proc = self.oneshot("--allow-test-on-m3pro", "start", check=True)
-        self.assertIn("has no asahi.t8122_start parameter; the rehearsal boot ignores it", proc.stdout)
+        self.assertIn("has no asahi.t8122_start parameter; the test boot ignores it", proc.stdout)
 
     # Refusals: each one changes nothing
 
@@ -326,7 +386,7 @@ class OneShotTest(unittest.TestCase):
         self.assertIsNone(self.armed_block())
 
     def test_refuses_other_macs(self):
-        for board, why in [("j516s", "--allow-test-on-m3pro runs the rehearsal"),
+        for board, why in [("j516s", "--allow-test-on-m3pro tests the boot steps there"),
                            ("j504", "not an M3 MacBook Air"), ("j314s", "not an M3 MacBook Air")]:
             with self.subTest(board=board):
                 self.mac.board(board)
@@ -339,7 +399,7 @@ class OneShotTest(unittest.TestCase):
 
     def test_refuses_bad_knobs(self):
         for args, why in [(["bogus=1"], 'unknown knob "bogus"'),
-                          (["t8122_pstate_cap=6"], "takes"),   # K1 bounds the cap to 1..5
+                          (["t8122_pstate_cap=6"], "takes"),   # the kernel bounds the cap to 1..5
                           (["t8122_pstate_cap=16"], "takes"),
                           (["t8122_clkgen=e2c"], "takes e1c|e5c|none"), (["t8122_start=0"], "takes 1"),
                           (["t8122_unit_mask_a=0x700000003"], "outside what the kernel accepts"),
@@ -352,9 +412,17 @@ class OneShotTest(unittest.TestCase):
             with self.subTest(args=args):
                 self.assert_refused(why, *args)
 
-    def test_accepts_the_largest_u64_initdata(self):
-        proc = self.oneshot("t8122_initdata_version=18446744073709551615", check=True)
-        self.assertIn("asahi.t8122_initdata_version=18446744073709551615", self.armed_block())
+    def test_initdata_version_bounds(self):
+        # The kernel reserves 2^64-1 and 2^64-2; the largest value it takes is 2^64-3. The default,
+        # written as the kernel prints it (a 0 after 0x), is taken.
+        for v in ("18446744073709551615", "18446744073709551614", "0xffffffffffffffff", "0xfffffffffffffffe"):
+            with self.subTest(v=v):
+                self.assert_refused("outside what the kernel accepts", f"t8122_initdata_version={v}")
+        for v in ("18446744073709551613", "0x0c08e21e83800490"):
+            with self.subTest(v=v):
+                self.mac = FakeMac(self)
+                self.oneshot(f"t8122_initdata_version={v}", check=True)
+                self.assertIn(f"asahi.t8122_initdata_version={v}", self.armed_block())
 
     def test_refuses_a_knob_the_kernel_lacks(self):
         self.mac = FakeMac(self, uki_params=[p for p in PARAMS if p != b"asahi.t8122_clkgen"])
@@ -412,14 +480,14 @@ class OneShotTest(unittest.TestCase):
         self.assertEqual(self.mac.oneshot_var(), var(7, utf16z("maclab-j1")))
 
     def test_arms_with_an_unenrolled_binary(self):
-        # A6: the ++CONFIG_B2SUM_SIGNATURE++ marker followed by 128 zeros is the unenrolled state.
+        # The ++CONFIG_B2SUM_SIGNATURE++ marker followed by 128 zeros is the unenrolled state.
         self.mac.esp.joinpath("EFI/BOOT/BOOTAA64.EFI").write_bytes(
             b"\x7fLIMINE...limine.conf...++CONFIG_B2SUM_SIGNATURE++" + b"0" * 128)
         self.oneshot("start", check=True)
         self.assertIsNotNone(self.armed_block())
 
     def test_disarm_resaves_after_a_failed_persist(self):
-        # A7: the first --disarm clears the RAM variable but persist fails; the second must still
+        # The first --disarm clears the RAM variable but persist fails; the second must still
         # save the cleared store, not skip it because the RAM variable is now empty.
         self.oneshot("start", check=True)
         self.assertIn(utf16z("air-gpu-oneshot"), self.mac.store())
@@ -435,7 +503,7 @@ class OneShotTest(unittest.TestCase):
         self.assertNotIn(utf16z("air-gpu-oneshot"), self.mac.varfile.read_bytes())
 
     def test_disarm_removes_a_markerless_entry(self):
-        # A11: a tool dropped the markers but left the entry; --disarm removes it.
+        # A tool dropped the markers but left the entry; --disarm removes it.
         self.mac.conf.write_text(limine_conf(self.mac.path) +
                                  "\n/air-gpu-oneshot\n    comment: x\n    protocol: efi\n    path: y\n    cmdline: z\n")
         proc = self.oneshot("--disarm", check=True)
@@ -456,7 +524,7 @@ class OneShotTest(unittest.TestCase):
 ARMED = CMDLINE + " asahi.t8122_start=1 air_gpu.oneshot=1007-120000"
 DEV = "[    0.10] host kernel: asahi 292400000.gpu: "
 PROBE = DEV + "Probing...\n" + DEV + "G15G: T8122 revision 2.0 identity admitted (10 active / 10 slots)\n"
-K1_ARMED = DEV + ("M3 G15G start: armed (asahi.t8122_start=1, boot loader handoff admitted): "
+KERNEL_ARMED = DEV + ("M3 G15G start: armed (asahi.t8122_start=1, boot loader handoff admitted): "
                   "initdata_version=0x0c08e21e83800490 fender=0x104000 clkgen=e1c(sgx+0xe1c000,ro) sgx_setup=none "
                   "unit_mask_a=0x700000001 unit_mask_b=0x3 pstate_cap=2\n")
 RTKIT = DEV + "RTKit: Initializing (protocol version 12)\n"
@@ -468,7 +536,7 @@ def k1(outcome, rest=""):
     return DEV + f"M3 G15G verdict: {outcome}{rest}\n"
 
 
-RUNNING = PROBE + K1_ARMED + RTKIT + PUBLISH + ACCEPT + k1("firmware-running", ": the firmware accepted the InitData")
+RUNNING = PROBE + KERNEL_ARMED + RTKIT + PUBLISH + ACCEPT + k1("firmware-running", ": the firmware accepted the InitData")
 REC_PASS = "result=pass\nstage=finished\nreached_gpu=yes\nsubmits=480\nfirst_submit_ms=0.41\ndevice=Apple M3 (G15G C0)\n"
 
 
@@ -483,7 +551,7 @@ class CollectVerdictTest(unittest.TestCase):
 
     def verdict(self, log, cmd=ARMED, recs=(), evidence=None, with_src=False):
         # Write each job record and one evidence line per record ("result<TAB>record<TAB>path"),
-        # or take explicit evidence lines; fold them with job_aggregate (A16), then classify.
+        # or take explicit evidence lines; fold them all with job_aggregate, then classify.
         logf = self.mac.tmp / "log.txt"
         logf.write_text(log)
         lines = []
@@ -505,7 +573,7 @@ class CollectVerdictTest(unittest.TestCase):
         for log, recs, want, why in [
             (RUNNING, (), "FW-RUNNING", "firmware-running"),
             (RUNNING + done, (REC_PASS,), "JOB-COMPLETED", "runs completed with correct results"),
-            # A4: the kernel's job-completed line alone, with no CPU-checked record, is not enough.
+            # The kernel's job-completed line alone, with no CPU-checked record, is not enough.
             (RUNNING + done, (), "FW-RUNNING", "no air-gpu-job record checked"),
             (RUNNING + k1("job-accepted-never-dispatched", ": start timestamp 0x0"),
              (rec("fence-timeout"),), "JOB-NOT-DISPATCHED", "job-accepted-never-dispatched"),
@@ -513,21 +581,20 @@ class CollectVerdictTest(unittest.TestCase):
             (RUNNING + done + k1("job-faulted", " (EIO): y"), (REC_PASS,), "JOB-FAILED", "job-faulted"),
             (RUNNING + k1("job-retired-without-timestamps", ": z"), (), "JOB-FAILED",
              "job-retired-without-timestamps"),
-            # A4: kernel says completed, but the record's CPU check failed -> not completed.
+            # The kernel says completed, but the record's CPU check failed -> not completed.
             (RUNNING + done, (rec("wrong-result", error="bad"),), "JOB-FAILED", "wrong-result"),
             # A job that started and recorded no result: its own verdict, never JOB-NOT-DISPATCHED.
             (RUNNING, (rec("running"),), "JOB-NO-RESULT", "no result was recorded"),
             (RUNNING, (rec("no-render-node"),), "FW-RUNNING", "did not reach the GPU"),
             (RUNNING, (REC_PASS,), "JOB-COMPLETED", "air-gpu-job"),
-            (PROBE + K1_ARMED + k1("firmware-boot-failed", " (ENODEV): x"), (), "FW-BOOT-FAILED", "firmware-boot-failed"),
-            (PROBE + K1_ARMED + RTKIT + k1("driver-refused", " (EINVAL): x"), (), "ARMED-NOT-STARTED", "driver-refused"),
-            (PROBE + K1_ARMED + RTKIT + PUBLISH + k1("initdata-rejected", " (ETIMEDOUT): x"), (),
+            (PROBE + KERNEL_ARMED + k1("firmware-boot-failed", " (ENODEV): x"), (), "FW-BOOT-FAILED", "firmware-boot-failed"),
+            (PROBE + KERNEL_ARMED + RTKIT + k1("driver-refused", " (EINVAL): x"), (), "DRIVER-REFUSED", "driver-refused"),
+            (PROBE + KERNEL_ARMED + RTKIT + PUBLISH + k1("initdata-rejected", " (ETIMEDOUT): x"), (),
              "INITDATA-REJECTED", "initdata-rejected"),
-            # New K1 labels (dbdd6c6f).
-            (PROBE + K1_ARMED + RTKIT + k1("publish-failed", " (EIO): x"), (), "FW-BOOT-FAILED", "publish-failed"),
-            (PROBE + K1_ARMED + RTKIT + PUBLISH + k1("device-control-failed", " (ETIMEDOUT): x"), (),
-             "INITDATA-REJECTED", "device-control-failed"),
-            # Dispatched (nonzero start timestamp): never JOB-NOT-DISPATCHED (K1: not the C3 row).
+            (PROBE + KERNEL_ARMED + RTKIT + k1("publish-failed", " (EIO): x"), (), "PUBLISH-FAILED", "publish-failed"),
+            (PROBE + KERNEL_ARMED + RTKIT + PUBLISH + k1("device-control-failed", " (ETIMEDOUT): x"), (),
+             "DEVICE-CONTROL-FAILED", "device-control-failed"),
+            # Dispatched (nonzero start timestamp): never JOB-NOT-DISPATCHED.
             (RUNNING + k1("job-ran-completion-missed", ": GPU start timestamp 0x5"), (), "JOB-FAILED",
              "job-ran-completion-missed"),
             (RUNNING + k1("job-failed-before-wait", " (EIO): x"), (), "JOB-FAILED", "job-failed-before-wait"),
@@ -537,10 +604,14 @@ class CollectVerdictTest(unittest.TestCase):
             # The not-dispatched labels with an unreadable start timestamp prove nothing.
             (RUNNING + k1("job-accepted-never-dispatched", ": GPU start timestamp None"), (), "JOB-FAILED",
              "timestamp None"),
-            # cap-violated and the check-failed crash variant override a success (A2-adjacent).
-            (RUNNING + k1("cap-violated", " (EIO): above the cap"), (REC_PASS,), "FW-CRASHED", "cap-violated"),
-            (RUNNING + k1("firmware-running-check-failed", " (EIO): x"), (), "FW-CRASHED",
-             "firmware-running-check-failed"),
+            # cap-violated and the check-failed crash variant override a success.
+            # The cap violation outranks everything, a completed job included.
+            (RUNNING + k1("job-completed", ": x") + k1("cap-violated", " (EIO): above the cap"), (REC_PASS,),
+             "CAP-VIOLATED", "cap-violated"),
+            (RUNNING + k1("firmware-running-check-failed", " (EIO): then a post-boot control or check failed"),
+             (), "FW-CHECK-FAILED", "firmware-running-check-failed"),
+            (RUNNING + k1("firmware-running-check-failed", " (EIO): then crashed during a post-boot control"),
+             (), "FW-CRASHED", "crashed during"),
         ]:
             with self.subTest(want=want, why=why):
                 verdict, reason = self.verdict(log, recs=recs)
@@ -548,7 +619,7 @@ class CollectVerdictTest(unittest.TestCase):
                 self.assertIn(why, reason)
 
     def test_crash_after_running_overrides(self):
-        # A2: the kernel logged firmware-running (or job-completed), then a crash/fault line.
+        # The kernel logged firmware-running (or job-completed), then a crash/fault line.
         crash = DEV + "RTKit: co-processor has crashed\n"
         fault = DEV + "M3 firmware error event 3 bytes=00\n"
         done = k1("job-completed", ": the first compute job finished")
@@ -584,8 +655,38 @@ class CollectVerdictTest(unittest.TestCase):
         verdict, _ = self.verdict(RUNNING + k1("something-new", ": x"))
         # firmware-running is still present, so the known label wins; a lone unknown is UNKNOWN.
         self.assertEqual(verdict, "FW-RUNNING")
-        verdict, reason = self.verdict(PROBE + K1_ARMED + k1("something-new", ": x"))
+        verdict, reason = self.verdict(PROBE + KERNEL_ARMED + k1("something-new", ": x"))
         self.assertEqual(verdict, "UNKNOWN", reason)
+
+    # Every kernel label, and the verdict it must give (the job evidence gates the two successes).
+    LABELS = {
+        "firmware-running": "FW-RUNNING", "job-completed": "JOB-COMPLETED",
+        "firmware-boot-failed": "FW-BOOT-FAILED", "driver-refused": "DRIVER-REFUSED",
+        "publish-failed": "PUBLISH-FAILED", "device-control-failed": "DEVICE-CONTROL-FAILED",
+        "initdata-rejected": "INITDATA-REJECTED", "firmware-running-check-failed": "FW-CHECK-FAILED",
+        "job-accepted-never-dispatched": "JOB-NOT-DISPATCHED", "job-timed-out-powered": "JOB-NOT-DISPATCHED",
+        "job-timed-out": "JOB-FAILED", "job-ran-completion-missed": "JOB-FAILED", "job-faulted": "JOB-FAILED",
+        "job-retired-without-timestamps": "JOB-FAILED", "job-failed-before-wait": "JOB-FAILED",
+        "cap-violated": "CAP-VIOLATED",
+    }
+
+    def test_every_kernel_label_maps_to_its_verdict(self):
+        src = COLLECT.read_text()
+        table = re.search(r"^KERNEL_VERDICTS='\n(.*?)^'", src, re.M | re.S).group(1)
+        mapped = {l.split()[0]: l.split()[1] for l in table.splitlines() if l.strip()}
+        self.assertEqual(mapped, self.LABELS)
+        for label, want in self.LABELS.items():
+            with self.subTest(label=label):
+                log = PROBE + KERNEL_ARMED + RTKIT + PUBLISH + ACCEPT + k1(label, ": a line")
+                recs = (REC_PASS,) if label == "job-completed" else ()
+                self.assertEqual(self.verdict(log, recs=recs)[0], want)
+
+    @unittest.skipUnless((KERNEL_ASAHI / "t8122_start.rs").exists(), "the kernel tree has no T8122 start experiment")
+    def test_the_table_covers_the_kernels_labels(self):
+        src = (KERNEL_ASAHI / "t8122_start.rs").read_text()
+        labels = set(re.findall(r"M3 G15G verdict: ([a-z-]+)", src))
+        self.assertTrue(labels)
+        self.assertEqual(labels - set(self.LABELS), set())
 
     def test_refusals_before_the_firmware(self):
         for log, why in [
@@ -606,7 +707,7 @@ class CollectVerdictTest(unittest.TestCase):
                 self.assertNotIn("kernel:", reason)
 
     def test_without_the_kernels_verdict_lines(self):
-        # The M3 Pro rehearsal, or a kernel before them: the structure of the log decides.
+        # A test run on an M3 Pro, or a kernel before them: the structure of the log decides.
         crash = DEV + "RTKit: co-processor has crashed\n"
         for log, recs, want in [
             (PROBE + RTKIT, (), "FW-BOOT-FAILED"),
@@ -618,7 +719,7 @@ class CollectVerdictTest(unittest.TestCase):
             (PROBE + RTKIT + PUBLISH + ACCEPT + "[ 9.0] host kernel: M3 scheduler: execution failed ETIMEDOUT\n",
              (rec("fence-timeout"),), "JOB-FAILED"),
             (PROBE + RTKIT + PUBLISH + ACCEPT + crash, (rec("device-lost"),), "JOB-FAILED"),
-            # The P3-8 signature: the GPU read powered down at the failed job.
+            # The not-dispatched signature: the GPU read powered down at the failed job.
             (PROBE + RTKIT + PUBLISH + ACCEPT + DEV + "M3 G15S: GPU is powered down; skipping engine/MMU register snapshot\n",
              (rec("fence-timeout"),), "JOB-NOT-DISPATCHED"),
             (PROBE + RTKIT + PUBLISH + ACCEPT, (rec("running"),), "JOB-NO-RESULT"),
@@ -634,6 +735,7 @@ class CollectVerdictTest(unittest.TestCase):
 JOURNALCTL = r"""#!/bin/bash
 # The fake journal: $FAKE/journal-<boot>.txt (kernel) and $FAKE/jobs-<boot>.txt (the air-gpu-job
 # tag) per boot index, $FAKE/boots for --list-boots. -b takes an index or a boot id.
+echo "$*" >>"$FAKE/journalctl.log"
 b=0 tag=""
 while (($#)); do case $1 in -b) b=$2; shift ;; -t) tag=$2; shift ;; --list-boots) cat "$FAKE/boots"; exit 0 ;; esac; shift; done
 if [[ $b =~ ^[0-9a-f]{32}$ ]]; then b=$(awk -v id="$b" '$2 == id { print $1 }' "$FAKE/boots"); fi
@@ -684,7 +786,10 @@ class CollectRunTest(unittest.TestCase):
     def arm_record(self, oneshot_id):
         (self.statedir / "armed").write_text(f"{oneshot_id} {KREL} cmd air_gpu.oneshot={oneshot_id}\n")
 
-    def collect(self, *args, want_tgz=True):
+    def collect_body(self, extra, *args):
+        return self.collect(*args, extra=extra)
+
+    def collect(self, *args, want_tgz=True, extra=""):
         t = self.mac.tmp
         body = f"""
 DEBUGFS='{t}/debug'
@@ -693,6 +798,7 @@ BOOT_ID='{self.boot_id}'
 STATE_DIR='{self.statedir}'
 EXTRA_HOMES=''
 user_home() {{ echo '{self.home}'; }}
+{extra}
 main {' '.join(args)}
 """
         env_body = f"export FAKE='{self.fake}'\n" + body
@@ -708,8 +814,10 @@ main {' '.join(args)}
         return proc, files
 
     def journal(self, boot, cmd, log):
+        # As journalctl -o short-monotonic prints them: the host name after the timestamp.
         (self.fake / f"journal-{boot}.txt").write_text(
-            f"[    0.00] host kernel: Linux version {KREL}\n[    0.00] host kernel: Kernel command line: {cmd}\n" + log)
+            (f"[    0.00] host kernel: Linux version {KREL}\n[    0.00] host kernel: Kernel command line: {cmd}\n"
+             + log).replace("] host kernel:", "] myhost-4711 kernel:"))
 
     def test_this_boot(self):
         self.mac.cmdline.write_text(ARMED + "\n")
@@ -743,15 +851,15 @@ main {' '.join(args)}
         self.assertIn("m3_render_batch_override=0", files["asahi-params.txt"])
         self.assertIn("completed=3", files["debugfs-asahi-m3.txt"])
         self.assertIn("LoaderEntryOneShot: not set", files["oneshot.txt"])
-        # A15: no hostname in the tgz (uname -srvm, not -a), and no raw coredump.
+        # No host name in the tgz (uname -srvm, not -a), and no raw coredump.
         import socket
         self.assertNotIn(socket.gethostname(), files["system.txt"])
 
     def test_a1_judges_by_the_arming_id(self):
-        # boot 0 carries a different arming; the last arming is in boot -1. A1 analyses -1, not 0.
+        # boot 0 carries a different arming; the last arming is in boot -1. The analysed boot is -1, not 0.
         self.mac.cmdline.write_text(CMDLINE + " asahi.t8122_start=1 air_gpu.oneshot=other\n")
         self.journal(0, CMDLINE + " asahi.t8122_start=1 air_gpu.oneshot=other", RUNNING)
-        self.journal(-1, ARMED, PROBE + K1_ARMED + k1("firmware-boot-failed", " (ENODEV): x"))
+        self.journal(-1, ARMED, PROBE + KERNEL_ARMED + k1("firmware-boot-failed", " (ENODEV): x"))
         self.arm_record("1007-120000")
         proc, _ = self.collect()
         last = proc.stdout.strip().splitlines()[-1]
@@ -801,13 +909,13 @@ main {' '.join(args)}
 
     REC_PATH = "air-gpu-runs/job-20261006-215736-174219586.txt"
 
-    def rehearsal_record(self, boot_id, result, extra=""):
+    def armed_boot_record(self, boot_id, result, extra=""):
         path = self.home / self.REC_PATH
         path.write_text(f"boot_id={boot_id}\noneshot=1007-120000\nresult={result}\n{extra}")
         return path
 
     def test_same_verdict_before_and_after_a_hard_reset(self):
-        # The m3pro rehearsal (2026-10-06): in the armed boot the record said pass; after a hard
+        # A hard reset during an armed boot: in the armed boot the record said pass; after a hard
         # reset the record on disk was the earlier result=running copy, while the journal kept the
         # job's own "result: pass" line (old format, no record path). Both passes must agree.
         rec = str(self.home / self.REC_PATH)
@@ -817,7 +925,7 @@ main {' '.join(args)}
         self.mac.cmdline.write_text(ARMED + "\n")
         self.journal(0, ARMED, PROBE + RTKIT + PUBLISH + ACCEPT)
         (self.fake / "jobs-0.txt").write_text(start + "result: pass (exit 0, 5214 ms, 436 submissions)\n")
-        self.rehearsal_record("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "pass", "submits=436\nfirst_submit_ms=0.4\n")
+        self.armed_boot_record("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "pass", "submits=436\nfirst_submit_ms=0.4\n")
         proc, _ = self.collect()
         first = proc.stdout.strip().splitlines()[-1]
         self.assertTrue(first.startswith("AIR-GPU VERDICT: JOB-COMPLETED | boot 0 | oneshot 1007-120000 | "
@@ -831,7 +939,7 @@ main {' '.join(args)}
         (self.fake / "jobs--1.txt").write_text((self.fake / "jobs-0.txt").read_text())
         self.journal(0, CMDLINE, PROBE)
         (self.fake / "jobs-0.txt").unlink()
-        self.rehearsal_record("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "running")
+        self.armed_boot_record("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "running")
         proc, files = self.collect()
         second = proc.stdout.strip().splitlines()[-1]
         self.assertTrue(second.startswith("AIR-GPU VERDICT: JOB-COMPLETED | boot -1 | oneshot 1007-120000 | "
@@ -845,7 +953,7 @@ main {' '.join(args)}
         self.journal(-1, ARMED, PROBE + RTKIT + PUBLISH + ACCEPT)
         rec = str(self.home / self.REC_PATH)
         (self.fake / "jobs--1.txt").write_text(f"start: 5 s through /p, oneshot 1007-120000, record {rec}\n")
-        self.rehearsal_record("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "running")
+        self.armed_boot_record("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "running")
         proc, _ = self.collect()
         last = proc.stdout.strip().splitlines()[-1]
         self.assertTrue(last.startswith("AIR-GPU VERDICT: JOB-NO-RESULT | boot -1"), last)
@@ -864,11 +972,73 @@ main {' '.join(args)}
         self.assertIn("AIR-GPU VERDICT: JOB-COMPLETED | boot 0 | oneshot 1007-120000 | source: job journal |",
                       proc.stdout)
         # A record and a journal line that disagree: never a success.
-        self.rehearsal_record("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "fence-timeout")
+        self.armed_boot_record("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "fence-timeout")
         proc, _ = self.collect()
         last = proc.stdout.strip().splitlines()[-1]
         self.assertTrue(last.startswith("AIR-GPU VERDICT: JOB-FAILED | boot 0"), last)
         self.assertIn("conflict", last)
+
+    def test_records_are_read_once_and_only_the_copy_is_used(self):
+        # A record swapped (for a symlink, say) after collect read it changes nothing: every check,
+        # and the tgz, use the copy read as the record's owner.
+        self.mac.cmdline.write_text(ARMED + "\n")
+        self.journal(0, ARMED, PROBE + RTKIT + PUBLISH + ACCEPT)
+        rec = self.home / "air-gpu-runs/job-1.txt"
+        rec.write_text("boot_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n" + REC_PASS)
+        secret = self.mac.tmp / "secret.txt"
+        secret.write_text("boot_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nTOP-SECRET\n")
+        body = ("eval \"orig_jrf() $(declare -f job_record_files | tail -n +2)\"\n"
+                f"job_record_files() {{ orig_jrf \"$@\"; rm -f '{rec}'; ln -s '{secret}' '{rec}'; }}\n")
+        proc, files = self.collect_body(body)
+        self.assertTrue(rec.is_symlink())                           # the swap did happen
+        self.assertIn("AIR-GPU VERDICT: JOB-COMPLETED", proc.stdout)
+        self.assertNotIn("TOP-SECRET", "".join(files.values()))
+        self.assertIn("result=pass", files["jobs/job-1.txt"])
+
+    def test_an_unreadable_record_is_left_out(self):
+        # A record the owner cannot read (a link to a root-only file, say) is never copied.
+        self.mac.cmdline.write_text(ARMED + "\n")
+        self.journal(0, ARMED, PROBE + RTKIT + PUBLISH + ACCEPT)
+        secret = self.mac.tmp / "secret.txt"
+        secret.write_text("boot_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nresult=pass\nTOP-SECRET\n")
+        secret.chmod(0)
+        self.addCleanup(secret.chmod, 0o600)
+        (self.home / "air-gpu-runs/job-1.txt").symlink_to(secret)
+        proc, files = self.collect()
+        self.assertNotIn("TOP-SECRET", "".join(files.values()))
+        self.assertIn("AIR-GPU VERDICT: FW-RUNNING", proc.stdout)
+
+    def test_under_sudo_only_the_invoking_users_home(self):
+        other = self.mac.tmp / "otherhome"
+        (other / "air-gpu-runs").mkdir(parents=True)
+        (other / "air-gpu-runs/job-9.txt").write_text("boot_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nresult=pass\n")
+        self.mac.cmdline.write_text(ARMED + "\n")
+        self.journal(0, ARMED, PROBE + RTKIT + PUBLISH + ACCEPT)
+        proc, files = self.collect_body(f"EXTRA_HOMES='{other}'\nexport SUDO_USER=tester\n")
+        self.assertIn("AIR-GPU VERDICT: FW-RUNNING", proc.stdout)
+        self.assertNotIn("jobs/job-9.txt", files)
+        # The journal's job lines are taken from root and that user only.
+        calls = [c for c in (self.fake / "journalctl.log").read_text().splitlines() if "air-gpu-job" in c]
+        self.assertTrue(calls and all("_UID=0" in c for c in calls), calls)
+
+    def test_no_host_or_user_name_in_the_tgz(self):
+        self.mac.cmdline.write_text(ARMED + "\n")
+        self.journal(0, ARMED, PROBE + RTKIT + PUBLISH + ACCEPT)
+        rec = str(self.home / "air-gpu-runs/job-1.txt")
+        (self.fake / "jobs-0.txt").write_text(f"start: 5 s through /home/alice/prefix, record {rec}\n")
+        (self.home / "air-gpu-runs/job-1.txt").write_text(
+            "boot_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nprefix=/home/alice/prefix\nresult=running\n")
+        proc, files = self.collect()
+        text = "".join(files.values())
+        self.assertNotIn("myhost-4711", text)
+        self.assertNotIn("/home/alice/", text)
+        self.assertIn("] host kernel:", files["kernel-log-boot0.txt"])
+
+    def test_an_empty_arming_record_counts_as_none(self):
+        (self.statedir / "armed").write_text("")
+        self.journal(0, CMDLINE, PROBE)
+        proc, _ = self.collect()
+        self.assertIn("AIR-GPU VERDICT: NOT-ARMED | boot 0", proc.stdout)
 
     def test_a_normal_boot(self):
         self.journal(0, CMDLINE, PROBE)
@@ -892,7 +1062,7 @@ main {' '.join(args)}
 
     def test_dmesg_when_the_journal_lacks_the_boot(self):
         self.mac.cmdline.write_text(ARMED + "\n")
-        (self.fake / "dmesg.txt").write_text("[ 0.0] Linux version x\n" + PROBE + K1_ARMED +
+        (self.fake / "dmesg.txt").write_text("[ 0.0] Linux version x\n" + PROBE + KERNEL_ARMED +
                                              k1("firmware-boot-failed", " (ENODEV): x"))
         proc, files = self.collect()
         self.assertIn("AIR-GPU VERDICT: FW-BOOT-FAILED", proc.stdout.strip().splitlines()[-1])
@@ -1022,9 +1192,9 @@ exit 0
         self.assertNotIn("result:", (self.mac.tmp / "logger.log").read_text())
 
     def test_stuck_before_submitting_records_the_stage(self):
-        # A3: the job opened (or was opening) the device, then got stuck; the record says so, so
+        # The job opened (or was opening) the device, then got stuck; the record says so, so
         # collect never reads it as a clean run.
-        proc, _ = self.job(str(self.prefix), mode="stuck-open", limit=2)
+        proc, _ = self.job(str(self.prefix), mode="stuck-open", limit=4)
         self.assertEqual(proc.returncode, 7)   # killed at the limit
         rec = self.record()
         self.assertEqual(rec["result"], "killed")
@@ -1032,7 +1202,7 @@ exit 0
         self.assertEqual(rec["reached_gpu"], "no")
 
     def test_refuses_a_symlinked_record_dir(self):
-        # A13: the record directory is a symlink to a place the user cannot write; the job refuses
+        # The record directory is a symlink to a place the user cannot write; the job refuses
         # rather than force a write (a root run would otherwise follow it).
         ro = self.mac.tmp / "ro"
         ro.mkdir()
@@ -1165,12 +1335,59 @@ class GpuExperimentFlagTest(Base):
         for name, _ in SCRIPTS:
             shutil.copy(TOOLS / name, self.tmp / "pkgs" / name)
         self.bin = self.tmp / "usr-local-bin"
-        # --uninstall runs the installed air-gpu-oneshot.sh --disarm, which logs.
         (self.tmp / "bin/logger").write_text("#!/bin/sh\nexit 0\n")
         (self.tmp / "bin/logger").chmod(0o755)
+        # The installed one-shot script needs root and a Mac; here a stand-in records each call
+        # and exits with $ONESHOT_RC.
+        self.oneshot_rc = 0
 
     def sh(self, body, check=True, flag=1):
-        return self.run_sh(f"M3_GPU_BIN='{self.bin}'\nM3_GPU_EXPERIMENT={flag}\n{body}", check=check)
+        stub = (f"m3_gpu_oneshot() {{ echo \"air-gpu-oneshot.sh $*\" >>\"$FAKE/log\"; return {self.oneshot_rc}; }}\n")
+        return self.run_sh(f"M3_GPU_BIN='{self.bin}'\nM3_GPU_EXPERIMENT={flag}\n{stub}{body}", check=check)
+
+    def test_a_rerun_disarms_before_the_kernel_is_replaced(self):
+        # An armed entry pins the UKI an install rebuilds: the rerun clears it before anything changes.
+        self.mac("j613")
+        self.sh("M3_TRY=0\ninstall_all")
+        self.assertNotIn("air-gpu-oneshot.sh --disarm", self.log())   # nothing installed yet to disarm
+        self.sh("M3_TRY=0\ninstall_all", flag=0)
+        log = self.log()
+        self.assertIn("air-gpu-oneshot.sh --disarm", log)
+        self.assertLess(log.rindex("air-gpu-oneshot.sh --disarm"), log.rindex("pacman -U"))
+
+    def test_a_failed_disarm_stops_the_install(self):
+        self.mac("j613")
+        self.sh("M3_TRY=0\ninstall_all")
+        before_log = self.log()
+        self.oneshot_rc = 1
+        proc = self.sh("M3_TRY=0\ninstall_all", flag=0, check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("air-gpu-oneshot.sh --disarm failed", proc.stderr)
+        self.assertIn("Nothing was installed", proc.stderr)
+        self.assertNotIn("pacman -U", self.log()[len(before_log):])
+
+    def test_uninstall_disarms_first_and_stops_if_it_fails(self):
+        self.mac("j613")
+        self.sh("M3_TRY=0\ninstall_all")
+        self.oneshot_rc = 1
+        before_log = self.log()
+        proc = self.sh("uninstall_all", flag=0, check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("Nothing was uninstalled", proc.stderr)
+        self.assertNotIn("pacman -Sy", self.log()[len(before_log):])
+        self.assertTrue((self.bin / "air-gpu-oneshot.sh").exists())
+        self.oneshot_rc = 0
+        self.sh("uninstall_all", flag=0)
+        log = self.log()[len(before_log):]
+        self.assertLess(log.rindex("air-gpu-oneshot.sh --disarm"), log.index("pacman -Sy"))
+
+    def test_the_agent_prompt_states_the_first_arming(self):
+        prompt = SRC[SRC.index("The GPU start experiment, only when the maintainer"):]
+        prompt = " ".join(prompt[:1500].split())
+        self.assertIn("tested on an M3 Pro only", prompt)
+        self.assertIn("sudo air-gpu-oneshot.sh t8122_pstate_cap=1", prompt)
+        self.assertIn('"ubootefi.var: does not name air-gpu-oneshot"', prompt)
+        self.assertNotIn("is the normal one", prompt)
 
     def test_air_gets_the_scripts_and_nothing_is_armed(self):
         self.mac("j613")
