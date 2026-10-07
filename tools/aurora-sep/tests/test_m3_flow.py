@@ -276,6 +276,9 @@ M1N1_BIN_SHA={self.bin_shas[self.m1n1_pkg]}
 M3_PRO_MESA_PACKAGE="{self.pro_mesa + ' ' + self.shas[self.pro_mesa] if self.pro_mesa else ''}"
 M3_PRO_MESA_NEEDS="{PRO_MESA_NEEDS}"
 M3_PRO_MESA_DISABLE='{self.tmp}/etc/mesa-m3/disable'
+M3_PRO_MESA_DETECTOR='{self.tmp}/opt/mesa-m3/libexec/mesa-m3-user-setup'
+M3_PRO_MESA_SETUP_LIST='/opt/mesa-m3/share/mesa-m3/user-setup.list'
+M3_PRO_MESA_SETUP_ROOT='{self.tmp}/sysroot'
 m3_pro_mesa_user_home() {{ echo '{self.home}'; }}
 esp_bootbin() {{ echo '{self.boot}'; }}
 version_notice() {{ :; }}; sep_write_notice() {{ :; }}; ane_dkms_notice() {{ :; }}

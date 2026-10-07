@@ -198,6 +198,10 @@ case ${BASH_SOURCE[0]:-} in
     fi
     ;;
 esac
+# This run's id, for the M3 Pro's Mesa record and the summary line that names it, so a check can
+# match the record to the output of the run that wrote it.
+RUN_ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null) || RUN_ID=""
+[[ $RUN_ID =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || RUN_ID=unavailable
 
 # The kernel package version and the release tag move independently: a release
 # that only changes m1n1 reuses the previous kernel packages unchanged.
@@ -529,6 +533,47 @@ M3_PRO_MESA_NEEDS="PENDING-U1-INVENTORY"
 # The package's own switch-offs, read only to say so in the summary: this file, the user's
 # ~/.config/mesa-m3/disable, or mesa_m3=off on the kernel command line.
 M3_PRO_MESA_DISABLE=/etc/mesa-m3/disable
+# mesa-m3's own user-setup detector and the list file it reads: what counts as a user's own Mesa
+# setup, for the session hook and for this script alike. Once mesa-m3 is installed the record's
+# user_setup comes from that detector (m3_pro_mesa_detector).
+# PLACEHOLDER: the release guard test fails, and an M3 Pro install stops before any download.
+M3_PRO_MESA_DETECTOR="PENDING-U1-DETECTOR"
+M3_PRO_MESA_SETUP_LIST="PENDING-U1-SETUP-LIST"
+# The same list built in, "kind item" per line in the list file's order (fill-m3-pro-mesa.sh
+# refuses a package whose list file says anything else), for runs without mesa-m3 installed.
+# m3_pro_mesa_builtin_setup says what each kind means.
+M3_PRO_MESA_SETUP_RULES="variable CHONKSTEP_M3_MESA_PREFIX
+variable VK_ICD_FILENAMES
+variable VK_DRIVER_FILES
+variable VK_ADD_DRIVER_FILES
+variable LIBGL_DRIVERS_PATH
+variable MESA_LOADER_DRIVER_OVERRIDE
+variable GALLIUM_DRIVER
+variable LIBGL_ALWAYS_SOFTWARE
+variable __EGL_VENDOR_LIBRARY_FILENAMES
+variable __EGL_VENDOR_LIBRARY_DIRS
+variable GBM_BACKENDS_PATH
+variable GBM_ALWAYS_SOFTWARE
+variable DRIRC_CONFIGDIR
+ldpath LD_LIBRARY_PATH
+envfile {config}/environment.d/*.conf
+envfile {config}/uwsm/env
+envfile {config}/uwsm/env-*
+envfile {config}/uwsm/env.d/*
+envfile {config}/uwsm/env-*.d/*
+envfile {config}/uwsm/default
+envfile {config}/hypr/*.conf
+envfile {config}/hypr/*.lua
+envfile /etc/xdg/uwsm/env
+envfile /etc/xdg/uwsm/env-*
+envfile /etc/xdg/uwsm/env.d/*
+envfile /etc/environment
+drirc ~/.drirc
+drirc {config}/drirc
+drirc /etc/drirc
+chonkstep {config}/chonkstep/m3gpu-session.env"
+# Where the built-in check finds the system's files (/etc/...); tests point it elsewhere.
+M3_PRO_MESA_SETUP_ROOT=""
 # 0 with --no-m3-mesa.
 M3_PRO_MESA=1
 # What happened on this run (m3_pro_mesa_plan/_install): "" (not an M3 Pro, or no package in
@@ -538,6 +583,9 @@ M3_PRO_MESA_RESULT=""
 # (m3_pro_mesa_record says what is in it).
 M3_PRO_MESA_RECORD_NAME="m3-pro-mesa"
 M3_PRO_MESA_SCHEMA="aurora.m3-pro-mesa-state/1"
+# How this run's record write went (m3_pro_mesa_record), and the result it holds.
+M3_PRO_MESA_RECORD_WRITE=""
+M3_PRO_MESA_RECORD_RESULT=""
 # The handoff is tested with one macOS system-firmware stub only, 14.8.3 (GPU
 # firmware 14.8.3, DCP 14.7), which the Omarchy installer gives every M3. m1n1
 # reports the stub's iBoot as asahi,iboot2-version.
@@ -1404,36 +1452,176 @@ m3_pro_mesa_installed() { pacman -Q "$M3_PRO_MESA_NAME" 2>/dev/null | cut -d' ' 
 m3_pro_mesa_user() { echo "${SUDO_USER:-$(id -un)}"; }
 m3_pro_mesa_user_home() { getent passwd "$1" 2>/dev/null | cut -d: -f6; }
 
-# An M3 Mesa setup of the user's own: a session that already points at another Mesa prefix
-# (chonkstep's CHONKSTEP_M3_MESA_PREFIX, or Vulkan, EGL, GL driver variables in the user's
-# environment.d, uwsm or Hyprland files), or a drirc. Printed as NUL-terminated pairs, the file's
-# path then what it holds, so any path comes through whole. It is left exactly as it is; this
-# only reports it. Only the invoking user's home is read.
-m3_pro_mesa_user_setup() {
-  local home f v
-  home=$(m3_pro_mesa_user_home "$(m3_pro_mesa_user)")
-  [[ -n $home && -d $home ]] || return 0
-  f=$home/.config/chonkstep/m3gpu-session.env
-  if [[ -f $f ]]; then
-    v=$(sed -n -E 's/^[[:space:]]*(export[[:space:]]+)?CHONKSTEP_M3_MESA_PREFIX=//p' "$f" 2>/dev/null | tail -1)
-    v=${v//[\"\']/}
-    if [[ -n $v && $v != "$M3_PRO_MESA_PREFIX" ]]; then printf '%s\0%s\0' "$f" "CHONKSTEP_M3_MESA_PREFIX=$v"; fi
-  fi
-  for f in "$home"/.config/environment.d/*.conf "$home"/.config/uwsm/env "$home"/.config/uwsm/env-hyprland \
-    "$home"/.config/hypr/*.conf; do
-    [[ -f $f ]] || continue
-    if grep -Eq '(VK_ICD_FILENAMES|VK_DRIVER_FILES|LIBGL_DRIVERS_PATH|__EGL_VENDOR_LIBRARY_FILENAMES|GBM_BACKENDS_PATH)[[:space:]]*[=,]' "$f" 2>/dev/null &&
-      ! grep -Eq "(VK_ICD_FILENAMES|VK_DRIVER_FILES|LIBGL_DRIVERS_PATH|__EGL_VENDOR_LIBRARY_FILENAMES|GBM_BACKENDS_PATH)[[:space:]]*[=,][^#]*${M3_PRO_MESA_PREFIX//\//\\/}" "$f" 2>/dev/null; then
-      printf '%s\0%s\0' "$f" "Mesa driver variables"
-    fi
+# DIR holds Mesa libraries (the list's ldpath rule).
+m3_pro_mesa_has_mesa() {
+  local f
+  for f in "$1"/libgallium* "$1"/libEGL_mesa* "$1"/libvulkan_asahi* "$1"/dri/*_dri.so; do
+    if [[ -e $f ]]; then return 0; fi
   done
-  for f in "$home"/.drirc "$home"/.config/drirc; do
-    if [[ -f $f ]]; then printf '%s\0%s\0' "$f" "a drirc file"; fi
+  return 1
+}
+
+# VALUE points into the prefix (after spaces and quotes are trimmed).
+m3_pro_mesa_ours() {
+  local v=$1
+  while [[ $v == [[:space:]\"\']* ]]; do v=${v:1}; done
+  while [[ $v == *[[:space:]\"\'] ]]; do v=${v%?}; done
+  [[ $v == "$M3_PRO_MESA_PREFIX" || $v == "$M3_PRO_MESA_PREFIX"/* ]]
+}
+
+# This script's own copy of mesa-m3's user-setup check (mesa-m3-user-setup, files only), from
+# M3_PRO_MESA_SETUP_RULES, for the home HOME. It prints NUL-terminated pairs, a path then what it
+# holds, one per file in the list's order, so any path comes through whole. This script's own
+# environment is not the session's, so only files count. "~" is HOME, "{config}" is HOME/.config,
+# and other paths are under M3_PRO_MESA_SETUP_ROOT (tests).
+#   variable V         an envfile line (not a comment, # or --) naming V, without the prefix
+#                      ("PREFIX/" in it, or the line ending in PREFIX)
+#   ldpath V           an envfile line naming V with a directory, other than PREFIX/lib, that
+#                      holds libgallium*, libEGL_mesa*, libvulkan_asahi* or dri/*_dri.so
+#   envfile GLOB       a file searched for those two
+#   drirc FILE         a drirc file with a dri_driver option
+#   chonkstep FILE     chonkstep's M3 settings: the last CHONKSTEP_M3_MESA_PREFIX names another
+#                      prefix, or there is none (chonkstep then uses its own default prefix)
+# It changes nothing. fill-m3-pro-mesa.sh keeps the list the package's.
+m3_pro_mesa_builtin_setup() {
+  local LC_ALL=C home=$1 kind item path fixed rest f line v t d hit vre lre
+  local vars=() ldvars=() items=()
+  local -A seen=()
+  [[ -n $home && -d $home ]] || return 0
+  while read -r kind item; do
+    case $kind in
+      variable) vars+=("$item") ;;
+      ldpath) ldvars+=("$item") ;;
+      *) items+=("$kind $item") ;;
+    esac
+  done <<<"$M3_PRO_MESA_SETUP_RULES"
+  vre="(^|[^A-Za-z0-9_])($(IFS='|'; echo "${vars[*]}"))([^A-Za-z0-9_]|\$)"
+  lre="(^|[^A-Za-z0-9_])($(IFS='|'; echo "${ldvars[*]}"))([^A-Za-z0-9_]|\$)"
+  for item in "${items[@]}"; do
+    kind=${item%% *} item=${item#* }
+    case $item in
+      "~"/*) path=$home/${item#"~/"} ;;
+      "{config}"/*) path=$home/.config/${item#"{config}/"} ;;
+      *) path=$M3_PRO_MESA_SETUP_ROOT$item ;;
+    esac
+    # Before the list's first glob the path may hold spaces; the glob part is the list's own.
+    fixed=$path rest=""
+    while [[ $fixed == *[*?[]* ]]; do rest=${fixed##*/}${rest:+/$rest} fixed=${fixed%/*}; done
+    # shellcheck disable=SC2086 # the list's glob, unquoted on purpose
+    for f in "$fixed"${rest:+/}$rest; do
+      [[ -f $f && -r $f && -z ${seen[$f]:-} ]] || continue
+      seen[$f]=1 hit=""
+      case $kind in
+        envfile)
+          while IFS= read -r line || [[ -n $line ]]; do
+            [[ $line =~ ^[[:space:]]*(#|--) ]] && continue
+            if [[ $line =~ $vre ]]; then
+              v=${BASH_REMATCH[2]} t=$line
+              while [[ $t == *[[:space:]\"\'] ]]; do t=${t%?}; done
+              if [[ $line != *"$M3_PRO_MESA_PREFIX/"* && $t != *"$M3_PRO_MESA_PREFIX" ]]; then
+                hit="sets $v"
+                break
+              fi
+            fi
+            if [[ $line =~ $lre ]]; then
+              line=${line//\$\{HOME\}/$home} line=${line//\$HOME/$home} line=${line//\~\//$home/}
+              while [[ $line =~ (/[^:\"\'\ ,\;\)]+)(.*) ]]; do
+                d=${BASH_REMATCH[1]} line=${BASH_REMATCH[2]}
+                while [[ $d == */ && $d != / ]]; do d=${d%/}; done
+                [[ $d != "$M3_PRO_MESA_PREFIX/lib" ]] || continue
+                [[ $d == "$home"/* ]] || d=$M3_PRO_MESA_SETUP_ROOT$d
+                if m3_pro_mesa_has_mesa "$d"; then
+                  hit="puts another Mesa in LD_LIBRARY_PATH (${d#"$M3_PRO_MESA_SETUP_ROOT"})"
+                  break 2
+                fi
+              done
+            fi
+          done <"$f"
+          ;;
+        drirc)
+          if grep -Eq 'name[[:space:]]*=[[:space:]]*"dri_driver"' "$f" 2>/dev/null; then
+            hit="chooses a driver (dri_driver)"
+          fi
+          ;;
+        chonkstep)
+          v=$(sed -n -E 's/^[[:space:]]*(export[[:space:]]+)?CHONKSTEP_M3_MESA_PREFIX=//p' "$f" 2>/dev/null | tail -n 1)
+          v=${v%% #*}
+          while [[ $v == [[:space:]\"\']* ]]; do v=${v:1}; done
+          while [[ $v == *[[:space:]\"\'] ]]; do v=${v%?}; done
+          if [[ -z $v ]]; then
+            hit="sets no CHONKSTEP_M3_MESA_PREFIX: chonkstep's M3 launcher uses its own default prefix"
+          elif ! m3_pro_mesa_ours "$v"; then
+            hit="CHONKSTEP_M3_MESA_PREFIX=$v"
+          fi
+          ;;
+      esac
+      if [[ -n $hit ]]; then printf '%s\0%s\0' "$f" "$hit"; fi
+    done
   done
   return 0
 }
 
-# The package's switch-offs that are set, as NUL-terminated pairs like m3_pro_mesa_user_setup's
+# mesa-m3's own detector for HOME (mesa-m3-user-setup --home HOME: files only), its answer as
+# the same pairs as m3_pro_mesa_builtin_setup's. Returns non-zero when it fails (its exit 2, or
+# anything but 0 for none and 1 for present) or answers in another form.
+m3_pro_mesa_detector() {
+  local out rc=0 line want p d w paths=() details=()
+  out=$("$M3_PRO_MESA_DETECTOR" --home "$1" 2>/dev/null) || rc=$?
+  ((rc == 0 || rc == 1)) || return "$rc"
+  [[ ${out%%$'\n'*} == "schema=aurora.mesa-m3-user-setup/1" ]] || return 3
+  want=none
+  while IFS= read -r line; do
+    case $line in
+      user_setup=*) want=${line#*=} ;;
+      user_setup_path=*) paths+=("${line#*=}") ;;
+      user_setup_detail=*) details+=("${line#*=}") ;;
+    esac
+  done <<<"$out"
+  if ((${#paths[@]})); then
+    [[ $want == present && $rc == 1 ]] || return 3
+  else
+    [[ $want == none && $rc == 0 ]] || return 3
+  fi
+  for p in "${paths[@]}"; do
+    w=""
+    for d in "${details[@]}"; do
+      if [[ $d == "$p"* ]]; then
+        w=${d#"$p"} w=${w#:} w=${w# }
+        break
+      fi
+    done
+    printf '%s\0%s\0' "$p" "${w:-a Mesa setup}"
+  done
+}
+
+# The invoking user's own Mesa setup, as pairs in M3_PRO_MESA_SETUP, and where it came from in
+# M3_PRO_MESA_SETUP_SOURCE: package-detector (mesa-m3's detector, once mesa-m3 is installed) or
+# installer-builtin (before that, without the detector, or when the detector failed: one
+# warning). M3_PRO_MESA_SETUP_OK is 0 when no check gave an answer (one warning too).
+M3_PRO_MESA_SETUP=() M3_PRO_MESA_SETUP_SOURCE="" M3_PRO_MESA_SETUP_OK=1
+m3_pro_mesa_setup_collect() {
+  local home rc=0
+  home=$(m3_pro_mesa_user_home "$(m3_pro_mesa_user)")
+  M3_PRO_MESA_SETUP=() M3_PRO_MESA_SETUP_SOURCE=installer-builtin M3_PRO_MESA_SETUP_OK=1
+  if [[ -n $home && -n $(m3_pro_mesa_installed) && -x $M3_PRO_MESA_DETECTOR ]]; then
+    mapfile -d '' -t M3_PRO_MESA_SETUP < <(m3_pro_mesa_detector "$home")
+    wait $! || rc=$?
+    if ((rc == 0 && ${#M3_PRO_MESA_SETUP[@]} % 2 == 0)); then
+      M3_PRO_MESA_SETUP_SOURCE=package-detector
+      return 0
+    fi
+    warn "$M3_PRO_MESA_DETECTOR failed (exit $rc); the record's user setup comes from this script's own check"
+  fi
+  rc=0
+  mapfile -d '' -t M3_PRO_MESA_SETUP < <(m3_pro_mesa_builtin_setup "$home")
+  wait $! || rc=$?
+  if ((rc != 0 || ${#M3_PRO_MESA_SETUP[@]} % 2 != 0)); then
+    M3_PRO_MESA_SETUP=() M3_PRO_MESA_SETUP_OK=0
+    warn "this script's own check of $(m3_pro_mesa_user)'s Mesa setup failed (exit $rc); the record says user_setup=unknown"
+  fi
+}
+
+# The package's switch-offs that are set, as NUL-terminated pairs like m3_pro_mesa_builtin_setup's
 # (an empty path for mesa_m3=off on the kernel command line). Left as they are.
 m3_pro_mesa_optout() {
   local home
@@ -1491,6 +1679,9 @@ m3_pro_mesa_plan() {
     die "M3_PRO_MESA_PACKAGE is not \"file sha256\" for $M3_PRO_MESA_NAME (a packaging mistake). Nothing was installed."
   [[ $M3_PRO_MESA_NEEDS =~ ^([A-Za-z0-9._+-]+(\>=[A-Za-z0-9._+:-]+)?[[:space:]]*)+$ && $M3_PRO_MESA_NEEDS != *PENDING* ]] ||
     die "M3_PRO_MESA_NEEDS is not a list of name>=version or name (a packaging mistake). Nothing was installed."
+  [[ $M3_PRO_MESA_DETECTOR =~ ^/[A-Za-z0-9._/+-]+$ && $M3_PRO_MESA_SETUP_LIST =~ ^/[A-Za-z0-9._/+-]+$ &&
+    $M3_PRO_MESA_DETECTOR$M3_PRO_MESA_SETUP_LIST != *PENDING* ]] ||
+    die "M3_PRO_MESA_DETECTOR and M3_PRO_MESA_SETUP_LIST are not mesa-m3's paths (a packaging mistake). Nothing was installed."
   [[ -n $have ]] || return 0
   want=$(m3_pro_mesa_version)
   order=$(vercmp "$have" "$want" 2>/dev/null) || order=""
@@ -1557,19 +1748,20 @@ m3_pro_mesa_install() {
 # The record of this run, on an M3 Pro: $STATE/m3-pro-mesa, one "key=value" per line, for
 # --uninstall and the lab check. Read it as data, never source it. The first line is
 # schema=aurora.m3-pro-mesa-state/1; a record with another first line is not read. Every key
-# appears exactly once, except user_setup_path and opt_out_path (one line per path, each path
-# whole). No value may hold a newline or a carriage return: then nothing is written, the
-# previous record stays and one warning names the value. The keys, in order:
-#   schema, release (this script's tag), written_at (UTC, ISO 8601), boot_id, kernel (uname -r)
-#   and board (the first device-tree compatible string), all of this run;
+# appears exactly once, except user_setup_path, opt_out_path and record_error_key (one line per
+# item, each path whole). The keys, in order:
+#   schema; run_id (this run's, also in its summary line), release (this script's tag),
+#   written_at (UTC, ISO 8601), boot_id, kernel (uname -r) and board (the first device-tree
+#   compatible string), all of this run;
 #   installer_sha256 and installer_source: the sha256 of the script file this run reads and
 #     "file", or "unavailable" and "stdin" when it came through a pipe;
 #   package, version, file, sha256 (this release's mesa-m3 entry) and prefix;
 #   result (below), installed_version (or none), installed_by (below), preexisting (the mesa-m3
 #     version installed before this script first wrote a record on this Mac, or none);
-#   user (the invoking user), user_setup (present or none) and a user_setup_path line per file
-#     of that user's own Mesa setup; opt_out (present or none), an opt_out_path line per
-#     switch-off file and opt_out_cmdline (yes or no); all left as they are;
+#   user (the invoking user); user_setup_source (package-detector or installer-builtin),
+#     user_setup (present, none, or unknown when the check failed) and a user_setup_path line per
+#     file of that user's own Mesa setup; opt_out (present or none), an opt_out_path line per switch-off file and
+#     opt_out_cmdline (yes or no); all left as they are;
 #   created_files: 0, as the package owns every file.
 # result, what this run did:
 #   installed     this run installed the package (none was installed, or an older one)
@@ -1578,18 +1770,28 @@ m3_pro_mesa_install() {
 #   skipped-flag  --no-m3-mesa: left out; one installed earlier stays
 #   skipped-deps  a package it needs is missing or too old: left out (exit status 3)
 #   failed        its pacman -U failed, or its file holds another package (exit status 3)
+#   record-error  this run could not write its record (an error record, below)
 # installed_by, who put the installed mesa-m3 there:
 #   installer     this script's pacman -U. Set by a run that installs it, and kept by later runs
 #                 while the same version stays installed.
 #   owner         anyone else: installed before this script first ran, or replaced or
 #                 installed outside it since (another version than the record's).
 #   none          no mesa-m3 is installed.
+# When a value holds a newline or a carriage return, or the write fails before its rename, the
+# previous run's record must not look current: an error record replaces it (schema, the run's
+# keys from run_id to installer_source, package, result=record-error, record_error (value or
+# write), a record_error_key line per refused key, never its value, and installed_version,
+# installed_by and preexisting, which keep the ownership history). If that write fails too, the
+# previous record is moved aside to m3-pro-mesa.stale-<its written_at> (never over another file),
+# so no record is current. Every failure is in the one warning, and the exit status is 4.
 # --uninstall removes mesa-m3 only when installed_by is installer, the installed version is the
-# record's, and preexisting is none. The lab's positive check: result installed or current,
-# installed_by installer, installed_version the pinned version and sha256 the pinned package's
-# sha256. The record says what this script did, not what renders.
+# record's, preexisting is none, and result is not record-error. The lab's positive check:
+# result installed or current, installed_by installer, installed_version the pinned version,
+# sha256 the pinned package's sha256, and run_id the one in the summary line of the installer
+# run under test. The record says what this script did, not what renders.
 m3_pro_mesa_record() {
-  local have by pre bad="" k v p w setup=() optout=() lines=()
+  local have by pre k v p w rc errs="" cause bad="" keys=() optout=() lines=() head=() elines=()
+  local rec=$STATE/$M3_PRO_MESA_RECORD_NAME
   is_m3_pro && [[ -n $M3_PRO_MESA_PACKAGE ]] || return 0
   have=$(m3_pro_mesa_installed)
   pre=$M3_PRO_MESA_PREEXISTING
@@ -1602,18 +1804,26 @@ m3_pro_mesa_record() {
   else
     by=owner
   fi
-  mapfile -d '' -t setup < <(m3_pro_mesa_user_setup)
+  m3_pro_mesa_setup_collect
   mapfile -d '' -t optout < <(m3_pro_mesa_optout)
-  lines=("schema=$M3_PRO_MESA_SCHEMA" "release=$TAG" "written_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  head=("schema=$M3_PRO_MESA_SCHEMA" "run_id=$RUN_ID" "release=$TAG" "written_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     "boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unavailable)"
     "kernel=$(uname -r)" "board=$(tr '\0' '\n' <"$DT/compatible" 2>/dev/null | sed -n 1p)"
-    "installer_sha256=$SELF_SHA256" "installer_source=$SELF_SOURCE"
-    "package=$M3_PRO_MESA_NAME" "version=$(m3_pro_mesa_version)" "file=$(m3_pro_mesa_file)"
+    "installer_sha256=$SELF_SHA256" "installer_source=$SELF_SOURCE")
+  lines=("${head[@]}" "package=$M3_PRO_MESA_NAME" "version=$(m3_pro_mesa_version)" "file=$(m3_pro_mesa_file)"
     "sha256=${M3_PRO_MESA_PACKAGE#* }" "prefix=$M3_PRO_MESA_PREFIX" "result=$M3_PRO_MESA_RESULT"
     "installed_version=${have:-none}" "installed_by=$by" "preexisting=${pre:-none}"
-    "user=$(m3_pro_mesa_user)")
-  if ((${#setup[@]})); then lines+=(user_setup=present); else lines+=(user_setup=none); fi
-  for ((k = 0; k < ${#setup[@]}; k += 2)); do lines+=("user_setup_path=${setup[k]}"); done
+    "user=$(m3_pro_mesa_user)" "user_setup_source=$M3_PRO_MESA_SETUP_SOURCE")
+  if ((!M3_PRO_MESA_SETUP_OK)); then
+    lines+=(user_setup=unknown)
+  elif ((${#M3_PRO_MESA_SETUP[@]})); then
+    lines+=(user_setup=present)
+  else
+    lines+=(user_setup=none)
+  fi
+  for ((k = 0; k < ${#M3_PRO_MESA_SETUP[@]}; k += 2)); do
+    if [[ -n ${M3_PRO_MESA_SETUP[k]} ]]; then lines+=("user_setup_path=${M3_PRO_MESA_SETUP[k]}"); fi
+  done
   if ((${#optout[@]})); then lines+=(opt_out=present); else lines+=(opt_out=none); fi
   v=no
   for ((k = 0; k < ${#optout[@]}; k += 2)); do
@@ -1622,39 +1832,144 @@ m3_pro_mesa_record() {
   lines+=("opt_out_cmdline=$v" "created_files=0")
   for p in "${lines[@]}"; do
     w=${p#*=}
-    if [[ $w == *[$'\n\r']* ]]; then bad+="${bad:+, }${p%%=*}=$(printf '%q' "$w")"; fi
+    if [[ $w == *[$'\n\r']* ]]; then
+      bad+="${bad:+, }${p%%=*}=$(printf '%q' "$w")"
+      [[ " ${keys[*]} " == *" ${p%%=*} "* ]] || keys+=("${p%%=*}")
+    fi
   done
-  if [[ -n $bad ]]; then
-    warn "did not write $STATE/$M3_PRO_MESA_RECORD_NAME: a value holds a newline or a carriage return
-    ($bad). The previous record, if any, is unchanged."
-    return 0
+
+  M3_PRO_MESA_RECORD_RESULT=$M3_PRO_MESA_RESULT
+  if [[ -z $bad ]]; then
+    rc=0
+    m3_pro_mesa_record_write "${lines[@]}" || rc=$?
+    if ((rc == 0)); then
+      M3_PRO_MESA_RECORD_WRITE=ok
+    elif ((rc == 2)); then
+      M3_PRO_MESA_RECORD_WRITE=unsynced
+      warn "wrote $rec, but its durability is not confirmed: $M3_PRO_MESA_WRITE_ERR"
+    fi
+    if ((rc != 1)); then m3_pro_mesa_record_leftovers; return 0; fi
+    cause=write errs="this run's record: $M3_PRO_MESA_WRITE_ERR"
+  else
+    cause=value errs="a value holds a newline or a carriage return ($bad)"
   fi
-  m3_pro_mesa_record_write "${lines[@]}" || true
+
+  # The error record: the run's keys (a refused one as "unavailable"), never a refused value.
+  for p in "${head[@]}"; do
+    if [[ ${p#*=} == *[$'\n\r']* ]]; then elines+=("${p%%=*}=unavailable"); else elines+=("$p"); fi
+  done
+  elines+=("package=$M3_PRO_MESA_NAME" "result=record-error" "record_error=$cause")
+  for k in "${keys[@]}"; do elines+=("record_error_key=$k"); done
+  elines+=("installed_version=${have:-none}" "installed_by=$by" "preexisting=${pre:-none}")
+  M3_PRO_MESA_RECORD_RESULT="record-error"
+  rc=0
+  m3_pro_mesa_record_write "${elines[@]}" || rc=$?
+  if ((rc == 0)); then
+    M3_PRO_MESA_RECORD_WRITE=error-record
+    warn "did not write this run's record ($errs). An error record (result=record-error) replaces
+    $rec, so no earlier run's record looks current."
+  elif ((rc == 2)); then
+    M3_PRO_MESA_RECORD_WRITE=error-record-unsynced
+    warn "did not write this run's record ($errs). An error record (result=record-error) replaces
+    $rec, but its durability is not confirmed: $M3_PRO_MESA_WRITE_ERR"
+  else
+    errs+="; the error record: $M3_PRO_MESA_WRITE_ERR"
+    M3_PRO_MESA_RECORD_RESULT=""
+    if [[ ! -e $rec ]]; then
+      M3_PRO_MESA_RECORD_WRITE=none
+      warn "could not write this run's record or an error record ($errs). There is no record."
+    elif m3_pro_mesa_record_aside; then
+      M3_PRO_MESA_RECORD_WRITE=none
+      warn "could not write this run's record or an error record ($errs). The previous record is
+      now $M3_PRO_MESA_ASIDE, so no record is current.${M3_PRO_MESA_WRITE_ERR:+ But $M3_PRO_MESA_WRITE_ERR.}"
+    else
+      M3_PRO_MESA_RECORD_WRITE=stale
+      warn "could not write this run's record or an error record ($errs), and could not move the
+      previous record aside ($M3_PRO_MESA_WRITE_ERR): $rec is an earlier run's record, not this
+      run's."
+    fi
+  fi
+  m3_pro_mesa_record_leftovers
 }
 
-# Publishes the record atomically: an exclusive temporary file in $STATE (root's, through $sudo),
-# written in full, mode 0644, fsynced, renamed over the record, then $STATE fsynced. Any failure
-# leaves the previous record as it was, with one warning. Leftovers of an interrupted write go.
+# Writes LINES as the record: an exclusive temporary file in $STATE made through $sudo (so
+# root's), written in full, mode 0644, fsynced, renamed over the record, then $STATE fsynced.
+# Returns 0 when all of that worked; 1 when it failed before the rename (the previous record, if
+# any, is untouched, and only this call's own temporary file is removed); 2 when the new record
+# is in place but the fsync of $STATE failed (written, durability not confirmed).
+# M3_PRO_MESA_WRITE_ERR says what failed.
+M3_PRO_MESA_WRITE_ERR=""
 m3_pro_mesa_record_write() {
   local rec=$STATE/$M3_PRO_MESA_RECORD_NAME tmp
-  $sudo rm -f "$STATE/.$M3_PRO_MESA_RECORD_NAME".??????
+  M3_PRO_MESA_WRITE_ERR=""
   if ! tmp=$($sudo mktemp "$STATE/.$M3_PRO_MESA_RECORD_NAME.XXXXXX"); then
-    warn "could not write $rec (no temporary file in $STATE); the previous record, if any, is unchanged"
+    M3_PRO_MESA_WRITE_ERR="no temporary file could be made in $STATE"
     return 1
   fi
-  if printf '%s\n' "$@" | $sudo tee "$tmp" >/dev/null && $sudo chmod 0644 "$tmp" && $sudo sync "$tmp" &&
-    $sudo mv -f "$tmp" "$rec"; then
-    $sudo sync "$STATE" || true
+  if ! printf '%s\n' "$@" | $sudo tee "$tmp" >/dev/null; then
+    M3_PRO_MESA_WRITE_ERR="writing $tmp failed"
+  elif ! $sudo chmod 0644 "$tmp"; then
+    M3_PRO_MESA_WRITE_ERR="chmod 0644 $tmp failed"
+  elif ! $sudo sync "$tmp"; then
+    M3_PRO_MESA_WRITE_ERR="fsync of $tmp failed"
+  elif ! $sudo mv -f "$tmp" "$rec"; then
+    M3_PRO_MESA_WRITE_ERR="renaming $tmp to $rec failed"
+  elif ! $sudo sync "$STATE"; then
+    M3_PRO_MESA_WRITE_ERR="fsync of $STATE failed after the rename"
+    return 2
+  else
     return 0
   fi
-  $sudo rm -f "$tmp"
-  warn "could not write $rec; the previous record, if any, is unchanged"
+  $sudo rm -f "$tmp" || M3_PRO_MESA_WRITE_ERR+="; $tmp could not be removed"
   return 1
+}
+
+# Moves the previous record aside to m3-pro-mesa.stale-<its written_at> (or .stale-unknown), with
+# .1, .2, ... when that name is taken; never over an existing file. The new name is in
+# M3_PRO_MESA_ASIDE. Returns 1, with M3_PRO_MESA_WRITE_ERR, when it could not; a failed fsync of
+# $STATE afterwards goes in M3_PRO_MESA_WRITE_ERR too.
+M3_PRO_MESA_ASIDE=""
+m3_pro_mesa_record_aside() {
+  local rec=$STATE/$M3_PRO_MESA_RECORD_NAME ts name n=0
+  M3_PRO_MESA_WRITE_ERR="" M3_PRO_MESA_ASIDE=""
+  ts=$(sed -n '/^written_at=/{s/^written_at=//p;q}' "$rec" 2>/dev/null) || ts=""
+  [[ $ts =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || ts=unknown
+  name=$rec.stale-$ts
+  while ((n < 100)); do
+    if [[ ! -e $name && ! -L $name ]]; then
+      $sudo mv -n "$rec" "$name" || true
+      if [[ ! -e $rec && -f $name ]]; then
+        M3_PRO_MESA_ASIDE=$name
+        $sudo sync "$STATE" || M3_PRO_MESA_WRITE_ERR="the fsync of $STATE failed after the move"
+        return 0
+      fi
+      if [[ ! -e $name ]]; then
+        M3_PRO_MESA_WRITE_ERR="moving $rec to $name failed"
+        return 1
+      fi
+    fi
+    n=$((n + 1)) name=$rec.stale-$ts.$n
+  done
+  M3_PRO_MESA_WRITE_ERR="no free name for $rec.stale-$ts"
+  return 1
+}
+
+# Says, in one line, when temporary record files of another or an interrupted run are in
+# $STATE. They are left alone: another run may still be writing one.
+m3_pro_mesa_record_leftovers() {
+  local left=() f
+  for f in "$STATE/.$M3_PRO_MESA_RECORD_NAME".??????; do
+    if [[ -e $f ]]; then left+=("$f"); fi
+  done
+  if ((${#left[@]})); then
+    say "Left alone: ${#left[@]} temporary record file(s) of another or an interrupted run ($STATE/.$M3_PRO_MESA_RECORD_NAME.*)"
+  fi
+  return 0
 }
 
 # What the owner reads at the end of an install on an M3 Pro.
 m3_pro_mesa_notice() {
-  local want have setup optout
+  local want have setup="" optout
   is_m3_pro && [[ -n $M3_PRO_MESA_PACKAGE ]] || return 0
   want=$(m3_pro_mesa_version) have=$(m3_pro_mesa_installed)
   case $M3_PRO_MESA_RESULT in
@@ -1685,7 +2000,7 @@ m3_pro_mesa_notice() {
       echo "   kernel install is complete; until it is installed the desktop renders in software."
       echo "   Run this again to try again. The exit status is 3." ;;
   esac
-  setup=$(m3_pro_mesa_user_setup | m3_pro_mesa_describe)
+  if ((${#M3_PRO_MESA_SETUP[@]})); then setup=$(printf '%s\0' "${M3_PRO_MESA_SETUP[@]}" | m3_pro_mesa_describe); fi
   if [[ -n $setup ]]; then
     echo "   Left as it is: $(m3_pro_mesa_user)'s own M3 Mesa setup ($setup)."
   fi
@@ -1693,11 +2008,25 @@ m3_pro_mesa_notice() {
   if [[ -n $optout && -n $have ]]; then
     echo "   Left as it is: the M3 Pro's Mesa is switched off at login by $optout."
   fi
+  case $M3_PRO_MESA_RECORD_WRITE in
+    ok) ;;
+    unsynced | error-record-unsynced)
+      echo "   This run's record ($STATE/$M3_PRO_MESA_RECORD_NAME) was written, but its durability is not"
+      echo "   confirmed (see the warning above). The exit status is 4." ;;
+    *)
+      echo "   This run could not write its record ($STATE/$M3_PRO_MESA_RECORD_NAME; see the warning above)."
+      echo "   The exit status is 4." ;;
+  esac
+  echo "   m3-pro-mesa record: run_id=$RUN_ID result=${M3_PRO_MESA_RECORD_RESULT:-none} write=${M3_PRO_MESA_RECORD_WRITE:-none}"
   return 0
 }
 
-# Exit status 3 after a complete kernel install when the M3 Pro's Mesa was not installed.
+# After a complete kernel install, on an M3 Pro: exit status 4 when this run's record is not
+# written and durable (whatever happened to the Mesa: the summary line says), else 3 when the
+# M3 Pro's Mesa was not installed.
 m3_pro_mesa_status() {
+  is_m3_pro && [[ -n $M3_PRO_MESA_PACKAGE ]] || return 0
+  [[ $M3_PRO_MESA_RECORD_WRITE == ok ]] || return 4
   case $M3_PRO_MESA_RESULT in skipped-deps | failed) return 3 ;; esac
   return 0
 }
@@ -1714,6 +2043,10 @@ m3_pro_mesa_remove() {
   [[ -n $have ]] || return 0
   if [[ -f $rec ]] && ! m3_pro_mesa_record_ok; then
     warn "keeping $M3_PRO_MESA_NAME $have: $rec is not a record this script reads (its first line is not schema=$M3_PRO_MESA_SCHEMA)"
+    return 0
+  fi
+  if [[ $(m3_pro_mesa_record_get result) == record-error ]]; then
+    say "Keeping $M3_PRO_MESA_NAME $have: the last install could not write its record (result=record-error), so this script can't tell it installed it"
     return 0
   fi
   if [[ $(m3_pro_mesa_record_get installed_by) != installer || $(m3_pro_mesa_record_get installed_version) != "$have" ]]; then
@@ -2417,8 +2750,8 @@ install_all() {
     echo "   The previous kernel stays in the GRUB menu as 'Previous kernel … before aurora-sep'."
   fi
   echo "   To undo everything:    curl -fsSL $PUBLIC_RELEASE_URL/install-aurora-sep.sh | bash -s -- --uninstall"
-  # The kernel install is complete either way; 3 says the M3 Pro's Mesa was not installed.
-  m3_pro_mesa_status || exit 3
+  # The kernel install is complete either way; 3 or 4: the M3 Pro's Mesa or its record.
+  m3_pro_mesa_status || exit $?
 }
 
 uninstall_all() {

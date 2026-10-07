@@ -37,11 +37,15 @@ MKTEMP = re.compile(r"(?:/tmp|" + re.escape(tempfile.gettempdir()) + r")/tmp\.[A
 # The record: its first line, its keys in order (each once), and the keys that repeat (one line
 # per path), which may come after user_setup and opt_out.
 SCHEMA = "aurora.m3-pro-mesa-state/1"
-KEYS = ["schema", "release", "written_at", "boot_id", "kernel", "board", "installer_sha256",
-        "installer_source", "package", "version", "file", "sha256", "prefix", "result",
-        "installed_version", "installed_by", "preexisting", "user", "user_setup", "opt_out",
-        "opt_out_cmdline", "created_files"]
-REPEATED = {"user_setup_path", "opt_out_path"}
+RUN_KEYS = ["schema", "run_id", "release", "written_at", "boot_id", "kernel", "board", "installer_sha256",
+            "installer_source"]
+KEYS = RUN_KEYS + ["package", "version", "file", "sha256", "prefix", "result", "installed_version",
+                   "installed_by", "preexisting", "user", "user_setup_source", "user_setup", "opt_out",
+                   "opt_out_cmdline", "created_files"]
+# An error record: the run's keys, and the ownership history.
+ERROR_KEYS = RUN_KEYS + ["package", "result", "record_error", "installed_version", "installed_by", "preexisting"]
+REPEATED = {"user_setup_path", "opt_out_path", "record_error_key"}
+UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 RESULTS = ["installed", "current", "newer-kept", "skipped-flag", "skipped-deps", "failed"]
 TAG = re.search(r"^TAG=(\S+)$", SRC, re.M).group(1)
 CHONKSTEP_ENV = (b"CHONKSTEP_M3_CLIENTS=gpu\n"
@@ -82,6 +86,16 @@ def tree(tc):
             continue
         out[rel] = p.read_bytes()
     return out
+
+
+def same_commands(tc, before, after):
+    """The two command logs ran the same commands. The $sudo lines and the others are compared
+    each in order, and all lines as a multiset: the two sides of a pipeline such as
+    "pacman -Q ... | $sudo tee ..." log in either order."""
+    a, b = before.splitlines(), after.splitlines()
+    tc.assertEqual(sorted(b), sorted(a))
+    tc.assertEqual([l for l in b if l.startswith("sudo ")], [l for l in a if l.startswith("sudo ")])
+    tc.assertEqual([l for l in b if not l.startswith("sudo ")], [l for l in a if not l.startswith("sudo ")])
 
 
 def run_with(tc, installer, board, run, setup=None):
@@ -130,11 +144,38 @@ def parse_record(tc, data):
             tc.assertNotIn(key, scalars, f"{key} twice")
             scalars[key] = value
             order.append(key)
+    tc.assertRegex(scalars["run_id"], f"^{UUID}$")
+    if scalars["result"] == "record-error":
+        tc.assertEqual(order, ERROR_KEYS)
+        tc.assertIn(scalars["record_error"], ("value", "write"))
+        tc.assertEqual(bool(lists["record_error_key"]), scalars["record_error"] == "value")
+        tc.assertEqual(lists["user_setup_path"] + lists["opt_out_path"], [])
+        return scalars, lists
     tc.assertEqual(order, KEYS)
-    tc.assertEqual(scalars["user_setup"], "present" if lists["user_setup_path"] else "none")
+    tc.assertEqual(lists["record_error_key"], [])
+    tc.assertIn(scalars["user_setup_source"], ("package-detector", "installer-builtin"))
+    if lists["user_setup_path"]:
+        tc.assertEqual(scalars["user_setup"], "present")
+    if scalars["user_setup_source"] == "installer-builtin" and scalars["user_setup"] != "unknown":
+        tc.assertEqual(scalars["user_setup"], "present" if lists["user_setup_path"] else "none")
     tc.assertEqual(scalars["opt_out"],
                    "present" if lists["opt_out_path"] or scalars["opt_out_cmdline"] == "yes" else "none")
     return scalars, lists
+
+
+def record_warnings(proc):
+    """The warnings about the M3 Pro's Mesa record, one string each."""
+    blocks = " ".join(proc.stderr.split()).split("warning:")[1:]
+    return [b for b in blocks if "m3-pro-mesa" in b or "this run's record" in b]
+
+
+def summary_line(tc, proc):
+    """The summary's record line, as {run_id, result, write}."""
+    lines = [l.strip() for l in proc.stdout.splitlines() if l.strip().startswith("m3-pro-mesa record:")]
+    tc.assertEqual(len(lines), 1, proc.stdout)
+    m = re.fullmatch(rf"m3-pro-mesa record: run_id=({UUID}) result=(\S+) write=(\S+)", lines[0])
+    tc.assertTrue(m, lines[0])
+    return dict(zip(("run_id", "result", "write"), m.groups()))
 
 
 class ProMesaTest(flow.M3FlowBase):
@@ -149,6 +190,12 @@ class ProMesaTest(flow.M3FlowBase):
 
     def installed(self):
         return (self.fake / "installed").read_text().split()
+
+    def temps(self):
+        return sorted(p.name for p in self.state.iterdir() if p.name.startswith(".m3-pro-mesa."))
+
+    def stale(self):
+        return sorted(p.name for p in self.state.iterdir() if p.name.startswith("m3-pro-mesa.stale-"))
 
     def mesa_lines(self, since=0):
         # What changes packages (pacman -U, -R...), for the Mesa; not the -Q queries.
@@ -189,10 +236,13 @@ class ProMesaTest(flow.M3FlowBase):
                 self.assertEqual(rec["installed_version"], PRO_MESA_VERSION)
                 self.assertEqual(rec["installed_by"], "installer")
                 self.assertEqual(rec["preexisting"], "none")
+                self.assertEqual(rec["user_setup_source"], "installer-builtin")   # no detector in the fake
                 self.assertEqual(rec["user_setup"], "none")
                 self.assertEqual(rec["opt_out"], "none")
                 self.assertEqual(rec["opt_out_cmdline"], "no")
                 self.assertEqual(rec["created_files"], "0")
+                self.assertEqual(summary_line(self, proc),
+                                 {"run_id": rec["run_id"], "result": "installed", "write": "ok"})
                 out = " ".join(proc.stdout.split())
                 self.assertIn(f"The M3 Pro's Mesa (mesa-m3 {PRO_MESA_VERSION}, in /opt/mesa-m3) is installed.", out)
                 self.assertIn("The new graphics take effect at the next login", out)
@@ -414,7 +464,9 @@ class ProMesaTest(flow.M3FlowBase):
             ".config/environment.d/90-vulkan.conf": b"VK_ICD_FILENAMES=/home/owner/icd.json\n",
             ".config/environment.d/91-ours.conf": b"VK_ICD_FILENAMES=/opt/mesa-m3/share/vulkan/icd.d/x.json\n",
             ".config/hypr/hyprland.conf": b"env = LIBGL_DRIVERS_PATH,/home/owner/dri\n",
-            ".drirc": b"<driconf/>\n",
+            ".drirc": b'<driconf><device><application><option name="dri_driver" value="zink"/>'
+                      b'</application></device></driconf>\n',
+            ".config/drirc": b"<driconf/>\n",                                       # no driver choice
             ".config/mesa-m3/disable": b"",
             "unrelated.txt": b"keep me\n",
         }
@@ -425,17 +477,21 @@ class ProMesaTest(flow.M3FlowBase):
         proc = self.install()
         self.assertEqual(self.record()["result"], "installed")       # still on by default
         out = " ".join(proc.stdout.split())
-        self.assertIn(f"Left as it is: {self.record()['user']}'s own M3 Mesa setup ({home}/.config/chonkstep/"
-                      "m3gpu-session.env: CHONKSTEP_M3_MESA_PREFIX=/home/owner/src/mesa-prefix;", out)
+        self.assertIn(f"Left as it is: {self.record()['user']}'s own M3 Mesa setup ({home}/.config/"
+                      "environment.d/90-vulkan.conf: sets VK_ICD_FILENAMES;", out)
+        self.assertIn(f"{home}/.config/chonkstep/m3gpu-session.env: CHONKSTEP_M3_MESA_PREFIX=/home/owner/src/"
+                      "mesa-prefix).", out)
         for rel in (".config/environment.d/90-vulkan.conf", ".config/hypr/hyprland.conf", ".drirc"):
             self.assertIn(f"{home}/{rel}", out)
         self.assertNotIn("91-ours.conf", out)                          # it points at the package's prefix
+        self.assertNotIn(f"{home}/.config/drirc", out)
         self.assertIn(f"switched off at login by {home}/.config/mesa-m3/disable", out)
         rec, lists = self.record_lists()
         self.assertEqual(rec["user_setup"], "present")
+        self.assertEqual(rec["user_setup_source"], "installer-builtin")
         self.assertEqual(lists["user_setup_path"], [
-            f"{home}/.config/chonkstep/m3gpu-session.env", f"{home}/.config/environment.d/90-vulkan.conf",
-            f"{home}/.config/hypr/hyprland.conf", f"{home}/.drirc"])
+            f"{home}/.config/environment.d/90-vulkan.conf", f"{home}/.config/hypr/hyprland.conf",
+            f"{home}/.drirc", f"{home}/.config/chonkstep/m3gpu-session.env"])
         self.assertEqual(rec["opt_out"], "present")
         self.assertEqual(lists["opt_out_path"], [f"{home}/.config/mesa-m3/disable"])
         self.assertEqual(rec["opt_out_cmdline"], "no")
@@ -463,7 +519,10 @@ class ProMesaTest(flow.M3FlowBase):
                f'M3_PRO_MESA_PACKAGE="{PRO_MESA}"',
                f'M3_PRO_MESA_PACKAGE="mesa-m3-g15g-26.1.4.g15g1-5-aarch64.pkg.tar.zst {"0" * 64}"',
                f'M3_PRO_MESA_PACKAGE="mesa-m3-1-1-aarch64.pkg.tar.zst {"0" * 63}"',
-               'M3_PRO_MESA_NEEDS="glibc>=2.43 ;rm"']
+               'M3_PRO_MESA_NEEDS="glibc>=2.43 ;rm"',
+               'M3_PRO_MESA_DETECTOR="PENDING-U1-DETECTOR"',
+               'M3_PRO_MESA_SETUP_LIST="PENDING-U1-SETUP-LIST"',
+               'M3_PRO_MESA_DETECTOR="relative/path"']
         if "PENDING" in shipped_pkg + shipped_needs:
             bad.append(f'M3_PRO_MESA_PACKAGE="{shipped_pkg}"\nM3_PRO_MESA_NEEDS="{shipped_needs}"')
         for env in bad:
@@ -489,7 +548,7 @@ class ProMesaTest(flow.M3FlowBase):
         # parse_record: the schema first, each scalar key once and in order, only the path keys
         # repeated; for every result, with and without paths to list.
         def setup_paths():
-            (self.home / ".drirc").write_text("x")
+            (self.home / ".drirc").write_text('<option name="dri_driver" value="zink"/>')
             (self.home / ".config/environment.d").mkdir(parents=True, exist_ok=True)
             (self.home / ".config/environment.d/a.conf").write_text("VK_DRIVER_FILES=/x\n")
             (self.tmp / "etc/mesa-m3").mkdir(parents=True, exist_ok=True)
@@ -534,6 +593,11 @@ class ProMesaTest(flow.M3FlowBase):
         self.assertEqual(rec["board"], "apple,j516s")
         self.assertEqual(rec["installer_sha256"], hashlib.sha256(flow.INSTALLER.read_bytes()).hexdigest())
         self.assertEqual(rec["installer_source"], "file")
+        # A new id for every run, the one the summary line names.
+        proc = self.install()
+        again = self.record()
+        self.assertNotEqual(again["run_id"], rec["run_id"])
+        self.assertEqual(summary_line(self, proc)["run_id"], again["run_id"])
         # Through a pipe the script can't be hashed again: no guess.
         self.install(env="SELF_SOURCE=stdin SELF_SHA256=unavailable")
         rec = self.record()
@@ -567,32 +631,138 @@ class ProMesaTest(flow.M3FlowBase):
         rec = str(self.state / "m3-pro-mesa")
         tmp_rx = re.escape(str(self.state)) + r"/\.m3-pro-mesa\.[A-Za-z0-9]{6}"
         lines = [l for l in self.log().splitlines() if l.startswith("sudo ") and "m3-pro-mesa" in l]
-        self.assertEqual(len(lines), 6, lines)
-        self.assertEqual(lines[0], f"sudo rm -f {self.state}/.m3-pro-mesa.??????")
-        self.assertRegex(lines[1], rf"^sudo mktemp {re.escape(str(self.state))}/\.m3-pro-mesa\.XXXXXX$")
-        self.assertRegex(lines[2], rf"^sudo tee {tmp_rx}$")
-        self.assertRegex(lines[3], rf"^sudo chmod 0644 {tmp_rx}$")
-        self.assertRegex(lines[4], rf"^sudo sync {tmp_rx}$")
-        self.assertRegex(lines[5], rf"^sudo mv -f {tmp_rx} {re.escape(rec)}$")
-        self.assertEqual(lines[2].split()[-1], lines[5].split()[-2])
-        self.assertIn(f"sudo sync {self.state}", self.log().splitlines())
+        self.assertEqual(len(lines), 5, lines)
+        self.assertRegex(lines[0], rf"^sudo mktemp {re.escape(str(self.state))}/\.m3-pro-mesa\.XXXXXX$")
+        self.assertRegex(lines[1], rf"^sudo tee {tmp_rx}$")
+        self.assertRegex(lines[2], rf"^sudo chmod 0644 {tmp_rx}$")
+        self.assertRegex(lines[3], rf"^sudo sync {tmp_rx}$")
+        self.assertRegex(lines[4], rf"^sudo mv -f {tmp_rx} {re.escape(rec)}$")
+        self.assertEqual(lines[1].split()[-1], lines[4].split()[-2])
+        log = self.log().splitlines()
+        self.assertEqual(log[log.index(lines[4]) + 1], f"sudo sync {self.state}")
+        self.assertNotIn("sudo rm", "\n".join(l for l in log if "m3-pro-mesa" in l))
         self.assertEqual([p.name for p in self.state.iterdir() if p.name.startswith(".m3-pro-mesa")], [])
 
-    def test_a_failed_write_keeps_the_previous_record(self):
+    # Failures, injected with stubs of the commands the writer runs. FIRST fails only the first
+    # write of the run (this run's record); ALWAYS fails the error record too.
+    FIRST = '[[ ${1:-} == *"/.m3-pro-mesa."* && ! -e $FAKE/failed-once ]] && { touch "$FAKE/failed-once"; %s; }'
+    ALWAYS = '[[ ${1:-} == *"/.m3-pro-mesa."* ]] && { %s; }'
+    STUBS = {
+        "temporary file": ("mktemp", "return 1"),
+        "write": ("tee", 'cat >/dev/null; printf partial >"$1"; return 1'),
+        "fsync": ("sync", "return 1"),
+        "rename": ("mv", "return 1"),
+    }
+
+    def stub(self, name, when):
+        cmd, body = self.STUBS[name]
+        arg = '"${2:-}"' if cmd == "mv" else '"${1:-}"'
+        test = (when % body).replace('${1:-}', arg[1:-1])
+        (self.fake / "failed-once").unlink(missing_ok=True)
+        return f'{cmd}() {{ {test}; command {cmd} "$@"; }}'
+
+    def test_a_failure_before_the_rename_leaves_an_error_record(self):
+        # This run's record fails before its rename, the error record works: the earlier record
+        # is gone, an error record (record_error=write) is current, and the exit status is 4.
+        for name in self.STUBS:
+            with self.subTest(fails=name):
+                reset_mac(self, "j516s")
+                self.install()
+                proc = self.install(env=self.stub(name, self.FIRST) + "\nM3_PRO_MESA=0", check=False)
+                self.assertEqual(proc.returncode, 4, proc.stderr)
+                rec, lists = self.record_lists()
+                self.assertEqual((rec["result"], rec["record_error"]), ("record-error", "write"))
+                self.assertEqual(lists["record_error_key"], [])
+                self.assertEqual((rec["installed_by"], rec["preexisting"]), ("installer", "none"))
+                err = " ".join(proc.stderr.split())
+                self.assertEqual(len(record_warnings(proc)), 1, proc.stderr)
+                self.assertEqual(err.count("did not write this run's record"), 1, proc.stderr)
+                self.assertIn("An error record (result=record-error) replaces", err)
+                self.assertEqual(summary_line(self, proc),
+                                 {"run_id": rec["run_id"], "result": "record-error", "write": "error-record"})
+                self.assertIn("The exit status is 4.", proc.stdout)
+                self.assertEqual(self.temps(), [])
+                self.assertEqual(self.stale(), [])
+
+    def test_when_no_record_can_be_written_the_previous_one_is_moved_aside(self):
+        for name in self.STUBS:
+            with self.subTest(fails=name):
+                reset_mac(self, "j516s")
+                self.install()
+                before = (self.state / "m3-pro-mesa").read_bytes()
+                written = re.search(rb"^written_at=(\S+)$", before, re.M).group(1).decode()
+                proc = self.install(env=self.stub(name, self.ALWAYS) + "\nM3_PRO_MESA=0", check=False)
+                self.assertEqual(proc.returncode, 4, proc.stderr)
+                self.assertFalse((self.state / "m3-pro-mesa").exists())
+                self.assertEqual(self.stale(), [f"m3-pro-mesa.stale-{written}"])
+                self.assertEqual((self.state / f"m3-pro-mesa.stale-{written}").read_bytes(), before)
+                err = " ".join(proc.stderr.split())
+                self.assertEqual(len(record_warnings(proc)), 1, proc.stderr)
+                # Both failures, in the one warning.
+                self.assertIn("this run's record: ", err)
+                self.assertIn("; the error record: ", err)
+                self.assertTrue(err.rstrip().endswith(f"The previous record is now {self.state}/m3-pro-mesa.stale-{written}, "
+                                                      "so no record is current."), err)
+                self.assertEqual(summary_line(self, proc)["write"], "none")
+                self.assertEqual(summary_line(self, proc)["result"], "none")
+                self.assertEqual(self.temps(), [])
+        # With no earlier record: nothing to move, still a warning and 4.
+        reset_mac(self, "j516s")
+        proc = self.install(env=self.stub("rename", self.ALWAYS), check=False)
+        self.assertEqual(proc.returncode, 4)
+        self.assertIn("There is no record.", " ".join(proc.stderr.split()))
+        self.assertEqual(os.listdir(self.state).count("m3-pro-mesa"), 0)
+
+    def test_a_stale_record_is_never_overwritten(self):
         self.mac("j516s")
         self.install()
         before = (self.state / "m3-pro-mesa").read_bytes()
-        for name, stub in (
-                ("rename", 'mv() { [[ ${2:-} == *"/.m3-pro-mesa."* ]] && return 1; command mv "$@"; }'),
-                ("fsync", 'sync() { [[ ${1:-} == *"/.m3-pro-mesa."* ]] && return 1; command sync "$@"; }'),
-                ("write", 'tee() { [[ ${1:-} == *"/.m3-pro-mesa."* ]] && { cat >/dev/null; printf partial >"$1"; return 1; }; command tee "$@"; }'),
-                ("temporary file", 'mktemp() { [[ ${1:-} == *"/.m3-pro-mesa."* ]] && return 1; command mktemp "$@"; }')):
-            with self.subTest(fails=name):
-                proc = self.install(env=stub + "\nM3_PRO_MESA=0")
-                self.assertEqual((self.state / "m3-pro-mesa").read_bytes(), before)
-                self.assertEqual(" ".join(proc.stderr.split()).count("could not write"), 1, proc.stderr)
-                self.assertIn("the previous record, if any, is unchanged", " ".join(proc.stderr.split()))
-                self.assertEqual([p.name for p in self.state.iterdir() if p.name.startswith(".m3-pro-mesa")], [])
+        written = re.search(rb"^written_at=(\S+)$", before, re.M).group(1).decode()
+        taken = {f"m3-pro-mesa.stale-{written}": b"an earlier stale record\n",
+                 f"m3-pro-mesa.stale-{written}.1": b"another\n"}
+        for name, data in taken.items():
+            (self.state / name).write_bytes(data)
+        proc = self.install(env=self.stub("rename", self.ALWAYS) + "\nM3_PRO_MESA=0", check=False)
+        self.assertEqual(proc.returncode, 4)
+        for name, data in taken.items():
+            self.assertEqual((self.state / name).read_bytes(), data)
+        self.assertEqual((self.state / f"m3-pro-mesa.stale-{written}.2").read_bytes(), before)
+        self.assertFalse((self.state / "m3-pro-mesa").exists())
+        # The fsync after the move fails: still said.
+        self.install()
+        stub = self.stub("rename", self.ALWAYS) + '\nsync() { [[ ${1:-} == "$STATE" ]] && return 1; command sync "$@"; }'
+        proc = self.install(env=stub + "\nM3_PRO_MESA=0", check=False)
+        self.assertEqual(proc.returncode, 4)
+        self.assertIn(f"But the fsync of {self.state} failed after the move.", " ".join(proc.stderr.split()))
+        # And when the move itself fails: the earlier record stays, named as an earlier run's.
+        self.install()
+        before = (self.state / "m3-pro-mesa").read_bytes()
+        stub = self.stub("rename", self.ALWAYS) + '\nmv() { [[ ${1:-} == -n ]] && return 1; ' \
+            '[[ ${2:-} == *"/.m3-pro-mesa."* ]] && return 1; command mv "$@"; }'
+        proc = self.install(env=stub + "\nM3_PRO_MESA=0", check=False)
+        self.assertEqual(proc.returncode, 4)
+        self.assertEqual((self.state / "m3-pro-mesa").read_bytes(), before)
+        err = " ".join(proc.stderr.split())
+        self.assertIn("could not move the previous record aside", err)
+        self.assertIn("is an earlier run's record, not this run's", err)
+        self.assertEqual(summary_line(self, proc)["write"], "stale")
+
+    def test_a_failed_directory_fsync_after_the_rename_is_reported(self):
+        # The new record is in place, but its durability is not confirmed: said, and exit 4.
+        self.mac("j516s")
+        self.install()
+        dirsync = 'sync() { [[ ${1:-} == "$STATE" ]] && return 1; command sync "$@"; }'
+        proc = self.install(env=dirsync + "\nM3_PRO_MESA=0", check=False)
+        self.assertEqual(proc.returncode, 4, proc.stderr)
+        rec = self.record()
+        self.assertEqual(rec["result"], "skipped-flag")                 # this run's record, published
+        err = " ".join(proc.stderr.split())
+        self.assertIn(f"wrote {self.state}/m3-pro-mesa, but its durability is not confirmed: fsync of {self.state} "
+                      "failed after the rename", err)
+        self.assertEqual(summary_line(self, proc),
+                         {"run_id": rec["run_id"], "result": "skipped-flag", "write": "unsynced"})
+        self.assertIn("was written, but its durability is not confirmed", " ".join(proc.stdout.split()))
+        # Distinct from a failure before the rename (test above): there no new record exists.
 
     def test_an_interrupted_write_keeps_the_previous_record(self):
         self.mac("j516s")
@@ -604,37 +774,89 @@ class ProMesaTest(flow.M3FlowBase):
                                 'M3_PRO_MESA=0', check=False)
         self.assertEqual(proc.returncode, -9)
         self.assertEqual((self.state / "m3-pro-mesa").read_bytes(), before)
-        left = [p for p in self.state.iterdir() if p.name.startswith(".m3-pro-mesa.")]
+        left = self.temps()
         self.assertEqual(len(left), 1)
-        self.assertIn(b"result=skipped-flag", left[0].read_bytes())
-        # The next run clears the leftover and writes its own record.
-        self.install()
-        self.assertEqual([p for p in self.state.iterdir() if p.name.startswith(".m3-pro-mesa.")], [])
+        leftover = (self.state / left[0]).read_bytes()
+        self.assertIn(b"result=skipped-flag", leftover)
+        # The next run writes its own record and leaves the leftover alone, in one line.
+        proc = self.install()
+        self.assertEqual(self.temps(), left)
+        self.assertEqual((self.state / left[0]).read_bytes(), leftover)
+        self.assertIn("Left alone: 1 temporary record file(s) of another or an interrupted run", proc.stdout)
         self.assertEqual(self.record()["result"], "current")
 
-    def test_a_newline_or_carriage_return_in_any_value_writes_no_record(self):
+    def test_another_runs_temporary_file_is_left_alone(self):
+        self.mac("j516s")
+        other = self.state / ".m3-pro-mesa.AbC123"
+        other.write_bytes(b"schema=aurora.m3-pro-mesa-state/1\nanother writer, still writing\n")
+        proc = self.install()
+        self.assertEqual(other.read_bytes(), b"schema=aurora.m3-pro-mesa-state/1\nanother writer, still writing\n")
+        self.assertEqual(self.temps(), [".m3-pro-mesa.AbC123"])
+        self.assertEqual(self.record()["result"], "installed")
+        self.assertEqual(proc.stdout.count("Left alone: 1 temporary record file(s)"), 1)
+        # Also when this run's own write fails: only its own temporary file goes.
+        proc = self.install(env=self.stub("rename", self.FIRST), check=False)
+        self.assertEqual(self.temps(), [".m3-pro-mesa.AbC123"])
+
+    def test_a_newline_or_carriage_return_in_any_value_gives_an_error_record(self):
         self.mac("j516s")
         self.install()
-        before = (self.state / "m3-pro-mesa").read_bytes()
         bad_file = self.home / ".config/environment.d/a\nuser_setup=none.conf"
         bad_file.parent.mkdir(parents=True)
         bad_file.write_text("VK_ICD_FILENAMES=/x\n")
-        for case, extra, want in (
-                ("a path with a newline", {}, "user_setup_path=$'"),
-                ("a user name with a carriage return", {"SUDO_USER": "own\rer"}, "user=$'own\\rer'")):
+        for case, extra, key, quoted in (
+                ("a path with a newline", {}, "user_setup_path", "user_setup_path=$'"),
+                ("a user name with a carriage return", {"SUDO_USER": "own\rer"}, "user", "user=$'own\\rer'")):
             with self.subTest(case=case):
                 if case.startswith("a user"):
                     bad_file.unlink()
                 self.extra_env.update(extra)
-                proc = self.install(env="M3_PRO_MESA=0")
+                proc = self.install(env="M3_PRO_MESA=0", check=False)
                 for k in extra:
                     self.extra_env.pop(k)
-                self.assertEqual((self.state / "m3-pro-mesa").read_bytes(), before)
+                self.assertEqual(proc.returncode, 4)
+                data = (self.state / "m3-pro-mesa").read_bytes()
+                rec, lists = parse_record(self, data)
+                self.assertEqual((rec["result"], rec["record_error"]), ("record-error", "value"))
+                self.assertEqual(lists["record_error_key"], [key])
+                # Never the refused value.
+                self.assertNotIn(b"user_setup=none.conf", data)
+                self.assertNotIn(b"own", data)
                 err = " ".join(proc.stderr.split())
-                self.assertEqual(err.count("did not write"), 1, proc.stderr)
-                self.assertEqual(err.count("m3-pro-mesa"), 1, proc.stderr)
-                self.assertIn(want, err)
-                self.assertIn("The previous record, if any, is unchanged.", err)
+                self.assertEqual(len(record_warnings(proc)), 1, proc.stderr)
+                self.assertIn("a value holds a newline or a carriage return", err)
+                self.assertIn(quoted, err)
+        # Refused, and the error record fails too: moved aside.
+        self.extra_env["SUDO_USER"] = "own\rer"
+        proc = self.install(env=self.stub("rename", self.ALWAYS) + "\nM3_PRO_MESA=0", check=False)
+        self.extra_env.pop("SUDO_USER")
+        self.assertEqual(proc.returncode, 4)
+        self.assertFalse((self.state / "m3-pro-mesa").exists())
+        self.assertEqual(len(self.stale()), 1)
+
+    def test_after_an_error_record(self):
+        # --uninstall keeps mesa-m3 and says why; the next install keeps the ownership history.
+        self.mac("j516s")
+        self.install()
+        self.extra_env["SUDO_USER"] = "own\rer"
+        self.install(env="M3_PRO_MESA=0", check=False)
+        self.extra_env.pop("SUDO_USER")
+        self.assertEqual(self.record()["result"], "record-error")
+        since = len(self.log())
+        proc = self.uninstall()
+        self.assertEqual(self.mesa_lines(since), [])
+        self.assertIn("the last install could not write its record (result=record-error)", " ".join(proc.stdout.split()))
+        self.assertIn("mesa-m3", self.installed())
+        # Again, with an error record in place: the next good run is this script's again.
+        reset_mac(self, "j516s")
+        self.install()
+        self.extra_env["SUDO_USER"] = "own\rer"
+        self.install(env="M3_PRO_MESA=0", check=False)
+        self.extra_env.pop("SUDO_USER")
+        proc = self.install()
+        rec = self.record()
+        self.assertEqual((rec["result"], rec["installed_by"], rec["preexisting"]), ("current", "installer", "none"))
+        self.assertEqual(proc.returncode, 0)
 
     def test_a_record_of_another_schema_is_not_read(self):
         # Not this schema (an earlier draft, or anything else): never read, never trusted for
@@ -666,6 +888,148 @@ class ProMesaTest(flow.M3FlowBase):
         since = len(self.log())
         self.uninstall()
         self.assertEqual(self.mesa_lines(since), [])
+
+
+    def detector(self, body):
+        path = self.tmp / "opt/mesa-m3/libexec/mesa-m3-user-setup"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/bash\n" + 'echo "$*" >"$FAKE/detector-args"\n' + body)
+        path.chmod(0o755)
+
+    # mesa-m3-user-setup's answer (U1's report, section 4.5): key=value lines; exit 0 none, 1 present.
+    PRESENT = ("echo schema=aurora.mesa-m3-user-setup/1; echo user_setup=present\n"
+               "echo 'user_setup_path=/a path/from the detector'\n"
+               "echo 'user_setup_path=/b'\n"
+               "echo 'user_setup_detail=/a path/from the detector sets GALLIUM_DRIVER'\n"
+               "echo 'user_setup_detail=/b: chonkstep'\\''s M3 Mesa prefix is /x'\nexit 1\n")
+    NONE = "echo schema=aurora.mesa-m3-user-setup/1; echo user_setup=none; exit 0\n"
+
+    def test_the_user_setup_comes_from_the_packages_detector_once_installed(self):
+        self.mac("j516s")
+        self.detector(self.PRESENT)
+        (self.home / ".drirc").write_text('<option name="dri_driver" value="zink"/>')   # the built-in check's
+        proc = self.install()
+        rec, lists = self.record_lists()
+        self.assertEqual((rec["user_setup_source"], rec["user_setup"]), ("package-detector", "present"))
+        self.assertEqual(lists["user_setup_path"], ["/a path/from the detector", "/b"])
+        self.assertEqual((self.fake / "detector-args").read_text().strip(), f"--home {self.home}")
+        out = " ".join(proc.stdout.split())
+        self.assertIn("/a path/from the detector: sets GALLIUM_DRIVER; /b: chonkstep's M3 Mesa prefix is /x", out)
+        self.detector(self.NONE)
+        self.install()
+        rec, lists = self.record_lists()
+        self.assertEqual((rec["user_setup_source"], rec["user_setup"], lists["user_setup_path"]),
+                         ("package-detector", "none", []))
+
+    def test_the_built_in_check_without_mesa_m3_or_its_detector(self):
+        # Not installed (--no-m3-mesa), or installed without a detector, or the detector fails.
+        self.mac("j516s")
+        (self.home / ".drirc").write_text('<option name="dri_driver" value="zink"/>')
+        self.detector(self.NONE)
+        self.install(env="M3_PRO_MESA=0")
+        self.assertFalse((self.fake / "detector-args").exists())
+        rec, lists = self.record_lists()
+        self.assertEqual((rec["user_setup_source"], lists["user_setup_path"]),
+                         ("installer-builtin", [f"{self.home}/.drirc"]))
+        self.detector("exit 2\n")
+        proc = self.install()
+        rec, lists = self.record_lists()
+        self.assertEqual((rec["user_setup_source"], lists["user_setup_path"]),
+                         ("installer-builtin", [f"{self.home}/.drirc"]))
+        self.assertIn("mesa-m3-user-setup failed (exit 2)", " ".join(proc.stderr.split()))
+        for body in ("echo schema=other/1; exit 0\n",                       # another form
+                     "echo schema=aurora.mesa-m3-user-setup/1; echo user_setup=present; exit 0\n",  # inconsistent
+                     self.NONE.replace("exit 0", "exit 1")):
+            with self.subTest(detector=body):
+                self.detector(body)
+                self.install()
+                self.assertEqual(self.record()["user_setup_source"], "installer-builtin")
+        # And when the built-in check fails too: unknown, never "none".
+        proc = self.install(env="m3_pro_mesa_builtin_setup() { return 5; }")
+        rec, lists = self.record_lists()
+        self.assertEqual((rec["user_setup"], lists["user_setup_path"]), ("unknown", []))
+        self.assertIn("own check of", " ".join(proc.stderr.split()))
+
+    def builtin(self, home=None):
+        proc = self.run_sh(f"m3_pro_mesa_builtin_setup '{home or self.home}'")
+        out = proc.stdout.split("\0")
+        self.assertEqual(out[-1], "")
+        return list(zip(out[:-1:2], out[1:-1:2]))
+
+    def test_the_built_in_check_follows_the_list(self):
+        rules = re.search(r'^M3_PRO_MESA_SETUP_RULES="([^"]*)"$', SRC, re.M).group(1).splitlines()
+        variables = [r.split()[1] for r in rules if r.startswith("variable ")]
+        self.assertEqual(len(variables), 13)
+        home, cfg, root = self.home, self.home / ".config", self.tmp / "sysroot"
+        envd = cfg / "environment.d"
+        envd.mkdir(parents=True)
+        # Each variable, set to something else: a finding. Pointing into the prefix, in a comment,
+        # or a longer name: none.
+        for v in variables:
+            (envd / f"{v}.conf").write_text(f"{v}=/somewhere/else\n")
+            (envd / f"ours-{v}.conf").write_text(f"{v}=/opt/mesa-m3/lib/x\n")
+            (envd / f"ours2-{v}.conf").write_text(f'export {v}="/opt/mesa-m3"\n')
+            (envd / f"comment-{v}.conf").write_text(f"# {v}=/somewhere/else\n-- {v}=x\n")
+            (envd / f"longer-{v}.conf").write_text(f"MY_{v}_X=/somewhere/else\n")
+        found = dict(self.builtin())
+        self.assertEqual(found, {f"{envd}/{v}.conf": f"sets {v}" for v in variables})
+        for f in envd.iterdir():
+            f.unlink()
+        # LD_LIBRARY_PATH: a directory with Mesa libraries other than PREFIX/lib.
+        mesa = home / "mesa/lib"
+        (mesa / "dri").mkdir(parents=True)
+        (mesa / "dri/zink_dri.so").write_text("")
+        (home / "empty/lib").mkdir(parents=True)
+        (root / "opt/mesa-m3/lib").mkdir(parents=True)
+        (root / "opt/mesa-m3/lib/libgallium-26.so").write_text("")
+        (root / "usr/local/mesa").mkdir(parents=True)
+        (root / "usr/local/mesa/libEGL_mesa.so.0").write_text("")
+        (envd / "a.conf").write_text("LD_LIBRARY_PATH=$HOME/mesa/lib:/opt/mesa-m3/lib\n")
+        (envd / "b.conf").write_text("LD_LIBRARY_PATH=${HOME}/empty/lib:/opt/mesa-m3/lib\n")
+        (envd / "c.conf").write_text('LD_LIBRARY_PATH="/usr/local/mesa"\n')
+        (cfg / "hypr").mkdir()
+        (cfg / "hypr/envs.lua").write_text('-- LD_LIBRARY_PATH=~/mesa/lib\nhl.env("LD_LIBRARY_PATH", "~/empty/lib")\n')
+        found = self.builtin()
+        self.assertEqual(found, [(f"{envd}/a.conf", f"puts another Mesa in LD_LIBRARY_PATH ({mesa})"),
+                                 (f"{envd}/c.conf", "puts another Mesa in LD_LIBRARY_PATH (/usr/local/mesa)")])
+        for f in list(envd.iterdir()) + [cfg / "hypr/envs.lua"]:
+            f.unlink()
+        # Every envfile of the list, the user's and the system's (under the root).
+        files = [cfg / "uwsm/env", cfg / "uwsm/env-hyprland", cfg / "uwsm/env.d/x", cfg / "uwsm/env-hyprland.d/y",
+                 cfg / "uwsm/default",
+                 cfg / "hypr/a.conf", cfg / "hypr/b.lua", root / "etc/xdg/uwsm/env",
+                 root / "etc/xdg/uwsm/env-x", root / "etc/xdg/uwsm/env.d/y", root / "etc/environment"]
+        for f in files:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("export GALLIUM_DRIVER=zink\n")
+        self.assertEqual([p for p, _ in self.builtin()], [str(f) for f in files])
+        for f in files:
+            f.unlink()
+        # drirc: only with a dri_driver option.
+        for f in (home / ".drirc", cfg / "drirc", root / "etc/drirc"):
+            f.write_text('<option name="dri_driver" value="zink"/>')
+        (cfg / "drirc").write_text("<driconf/>")
+        self.assertEqual(self.builtin(), [(str(home / ".drirc"), "chooses a driver (dri_driver)"),
+                                          (str(root / "etc/drirc"), "chooses a driver (dri_driver)")])
+        for f in (home / ".drirc", cfg / "drirc", root / "etc/drirc"):
+            f.unlink()
+        # chonkstep: another prefix (quoted, commented, CRLF); the package's; none set.
+        chonk = cfg / "chonkstep/m3gpu-session.env"
+        chonk.parent.mkdir(parents=True)
+        for text, want in (('export CHONKSTEP_M3_MESA_PREFIX="/home/x/p" # mine\r\n', "CHONKSTEP_M3_MESA_PREFIX=/home/x/p"),
+                           ("CHONKSTEP_M3_MESA_PREFIX=/home/x/q\nCHONKSTEP_M3_MESA_PREFIX=/home/x/r\n",
+                            "CHONKSTEP_M3_MESA_PREFIX=/home/x/r"),
+                           ("CHONKSTEP_M3_MESA_PREFIX=/opt/mesa-m3\n", None),
+                           ("CHONKSTEP_M3_MESA_PREFIX='/opt/mesa-m3/'\n", None),
+                           ("CHONKSTEP_M3_CLIENTS=gpu\n", "sets no CHONKSTEP_M3_MESA_PREFIX: chonkstep's M3 launcher "
+                                                         "uses its own default prefix")):
+            with self.subTest(chonkstep=text):
+                chonk.write_text(text)
+                self.assertEqual(self.builtin(), [(str(chonk), want)] if want else [])
+        # Nothing for a home with none of it, or no home.
+        chonk.unlink()
+        self.assertEqual(self.builtin(), [])
+        self.assertEqual(self.builtin(self.tmp / "no such home"), [])
 
 
 class FromEarlierReleasesTest(flow.M3FlowBase):
@@ -727,7 +1091,7 @@ class OtherMacsTest(flow.M3FlowBase):
                     before = {k: (v.replace(self.old_version, VERSION) if k == "log" else v)
                               for k, v in before.items()}
                 self.assertEqual(after["codes"], before["codes"])
-                self.assertEqual(after["log"].splitlines(), before["log"].splitlines())
+                same_commands(self, before["log"], after["log"])
                 self.assertEqual(sorted(after["tree"]), sorted(before["tree"]))
                 for path, data in before["tree"].items():
                     self.assertEqual(after["tree"][path], data, path)
@@ -784,17 +1148,18 @@ class ReleaseAssetTest(unittest.TestCase):
         body = SRC[SRC.index("# ---- the M3 Pro's Mesa"):SRC.index("this_board() {")]
         code = [l.strip() for l in body.splitlines() if not l.strip().startswith("#")]
         allowed = {
-            '$sudo rm -f "$STATE/.$M3_PRO_MESA_RECORD_NAME".??????',
             'if ! tmp=$($sudo mktemp "$STATE/.$M3_PRO_MESA_RECORD_NAME.XXXXXX"); then',
-            'if printf \'%s\\n\' "$@" | $sudo tee "$tmp" >/dev/null && $sudo chmod 0644 "$tmp" && $sudo sync "$tmp" &&',
-            '$sudo mv -f "$tmp" "$rec"; then',
-            '$sudo rm -f "$tmp"',
+            'if ! printf \'%s\\n\' "$@" | $sudo tee "$tmp" >/dev/null; then',
+            'elif ! $sudo chmod 0644 "$tmp"; then',
+            'elif ! $sudo mv -f "$tmp" "$rec"; then',
+            '$sudo rm -f "$tmp" || M3_PRO_MESA_WRITE_ERR+="; $tmp could not be removed"',
+            '$sudo mv -n "$rec" "$name" || true',
             'mkdir -p "$work/m3-pro"',
             'mv "$work/$file" "$work/m3-pro/"',
         }
         # Commands in command position (line start, after a pipe, a list operator, if, then or $( ),
         # and redirections into a variable's path.
-        verb = (r"(^|&&|\|\||\||;|\bthen\b|\bif !?|\$\()\s*(\$sudo\s+)?"
+        verb = (r"(^|&&|\|\||\||;|\bthen\b|\b(el)?if !?|\$\()\s*(\$sudo\s+)?"
                 r"(rm|ln|mv|tee|mktemp|chmod|chown|mkdir|cp|install|touch|truncate|dd|sed -i)\b")
         writes = [l for l in code if re.search(verb, l) or re.search(r"[^2]>\s*\"?\$(?!\(|\{?work)", l)]
         self.assertEqual(sorted(set(writes) - allowed), [])

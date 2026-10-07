@@ -1723,7 +1723,7 @@ class GpuExperimentFlagTest(Base):
                         before["log"] = before["log"].replace(old_version, flow.VERSION)
                     self.assertEqual(after["codes"], before["codes"])
                     self.assertEqual(after["codes"], (0, 0))
-                    self.assertEqual(after["log"].splitlines(), before["log"].splitlines())
+                    pro.same_commands(self, before["log"], after["log"])
                     self.assertEqual(after["tree"], before["tree"])
                     self.assertIn(MESA_NAME, after["log"])          # the experiment's own Mesa, as before
                     self.assertNotIn(pro.PRO_MESA, after["log"])

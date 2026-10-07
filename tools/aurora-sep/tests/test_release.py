@@ -63,6 +63,9 @@ def pro_mesa_entries():
 
 
 M3_PRO_MESA_NEEDS = re.search(r'^M3_PRO_MESA_NEEDS="([^"]*)"$', SRC, re.M).group(1)
+M3_PRO_MESA_DETECTOR = re.search(r'^M3_PRO_MESA_DETECTOR="([^"]*)"$', SRC, re.M).group(1)
+M3_PRO_MESA_SETUP_LIST = re.search(r'^M3_PRO_MESA_SETUP_LIST="([^"]*)"$', SRC, re.M).group(1)
+M3_PRO_MESA_SETUP_RULES = re.search(r'^M3_PRO_MESA_SETUP_RULES="([^"]*)"$', SRC, re.M).group(1)
 
 
 def staged(name, env):
@@ -95,8 +98,10 @@ class ReleaseGuardTest(unittest.TestCase):
                    if not re.fullmatch(r"[0-9a-f]{64}", sha) or "PENDING" in f]
         if not re.fullmatch(r"[0-9a-f]{64}", M1N1_BIN_SHA):
             pending.append(f"M1N1_BIN_SHA={M1N1_BIN_SHA}")
-        if "PENDING" in M3_PRO_MESA_NEEDS:
-            pending.append(f"M3_PRO_MESA_NEEDS={M3_PRO_MESA_NEEDS}")
+        for name, value in (("M3_PRO_MESA_NEEDS", M3_PRO_MESA_NEEDS), ("M3_PRO_MESA_DETECTOR", M3_PRO_MESA_DETECTOR),
+                            ("M3_PRO_MESA_SETUP_LIST", M3_PRO_MESA_SETUP_LIST)):
+            if "PENDING" in value:
+                pending.append(f"{name}={value}")
         self.assertEqual(pending, [], "placeholders left in install-aurora-sep.sh")
 
     def test_packages_follow_version(self):
@@ -104,6 +109,70 @@ class ReleaseGuardTest(unittest.TestCase):
         self.assertIn(f"linux-aurora-$VERSION-aarch64.pkg.tar.zst", names)
         self.assertIn(f"linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst", names)
         self.assertEqual(len([n for n in names if n.startswith("m1n1-")]), 1, names)
+
+
+def setup_rules(text):
+    """A user-setup list file as "kind item" lines: no comments or blank lines, one space."""
+    return [" ".join(l.split()) for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+
+
+FILL = Path.home() / "source/aurora-recipes/tests/fill-m3-pro-mesa.sh"
+
+
+@unittest.skipUnless(FILL.is_file() and shutil.which("bsdtar"), "fill-m3-pro-mesa.sh and bsdtar are needed")
+class FillProMesaTest(unittest.TestCase):
+    """fill-m3-pro-mesa.sh on a copy of this script: it fills the package, NEEDS and the detector
+    paths, and refuses a package whose user-setup list says anything else than the built-in
+    copy. Until mesa-m3's detector exists, this is what keeps the two definitions the same."""
+
+    DETECTOR = "/opt/mesa-m3/libexec/mesa-m3-user-setup"
+    LIST = "/opt/mesa-m3/share/mesa-m3/user-setup.list"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.inst = self.tmp / "install-aurora-sep.sh"
+        self.inst.write_text(SRC)
+
+    def package(self, rules_text):
+        root = self.tmp / "root"
+        shutil.rmtree(root, ignore_errors=True)
+        for p, data in ((self.DETECTOR, "#!/bin/sh\n"), (self.LIST, rules_text)):
+            (root / p.lstrip("/")).parent.mkdir(parents=True, exist_ok=True)
+            (root / p.lstrip("/")).write_text(data)
+        (root / ".PKGINFO").write_text("pkgname = mesa-m3\npkgver = 26.1.4.m3.1-1\narch = aarch64\n"
+                                        "depend = glibc>=2.43\n")
+        pkg = self.tmp / "mesa-m3-26.1.4.m3.1-1-aarch64.pkg.tar.zst"
+        subprocess.run(["bsdtar", "--zstd", "-cf", str(pkg), "-C", str(root), ".PKGINFO", "opt"], check=True)
+        return pkg
+
+    def fill(self, pkg):
+        return subprocess.run(["bash", str(FILL), str(self.inst), str(pkg), "glibc>=2.43", self.DETECTOR, self.LIST],
+                              capture_output=True, text=True)
+
+    def test_the_same_list_fills(self):
+        text = "# a comment\n\n" + "\n".join(l.replace(" ", "\t", 1) for l in M3_PRO_MESA_SETUP_RULES.splitlines()) + "\n"
+        proc = self.fill(self.package(text))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        filled = self.inst.read_text()
+        self.assertIn(f'M3_PRO_MESA_DETECTOR="{self.DETECTOR}"', filled)
+        self.assertIn(f'M3_PRO_MESA_SETUP_LIST="{self.LIST}"', filled)
+        self.assertNotIn("PENDING", "".join(l for l in filled.splitlines() if l.startswith("M3_PRO_MESA_")))
+
+    def test_another_list_is_refused(self):
+        rules = M3_PRO_MESA_SETUP_RULES.splitlines()
+        for name, changed in (("one more", rules + ["variable MESA_EXTRA"]), ("one fewer", rules[1:]),
+                              ("reordered", rules[1:] + rules[:1])):
+            with self.subTest(name):
+                proc = self.fill(self.package("\n".join(changed) + "\n"))
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("user-setup list differs", proc.stderr)
+                self.assertEqual(self.inst.read_text(), SRC)
+
+    @unittest.skip("mesa-m3's detector is not built yet: once it is, run it and the built-in copy on the "
+                   "fixture homes of test_m3_pro_mesa and compare their output")
+    def test_the_packages_detector_agrees_with_the_built_in_copy(self):
+        pass
 
 
 class RealProMesaPackageTest(unittest.TestCase):
@@ -149,6 +218,12 @@ class RealProMesaPackageTest(unittest.TestCase):
         # Never over the system Mesa.
         for key in ("provides", "conflict", "replaces"):
             self.assertNotRegex(info, rf"(?m)^{key} = ")
+        # mesa-m3's user-setup detector and its list, the list the same as the built-in one.
+        self.assertIn(M3_PRO_MESA_DETECTOR.lstrip("/"), files)
+        self.assertIn(M3_PRO_MESA_SETUP_LIST.lstrip("/"), files)
+        listed = subprocess.run(["bsdtar", "-xOf", str(path), M3_PRO_MESA_SETUP_LIST.lstrip("/")],
+                                capture_output=True, text=True, check=True).stdout
+        self.assertEqual(setup_rules(listed), M3_PRO_MESA_SETUP_RULES.splitlines())
         # Every dependency is in M3_PRO_MESA_NEEDS, at the package's minimum or above, so the
         # installer's check covers everything its pacman -U could otherwise pull in.
         needs = {}
