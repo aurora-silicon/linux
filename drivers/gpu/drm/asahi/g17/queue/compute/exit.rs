@@ -75,6 +75,13 @@ pub(super) struct Transaction {
     announced: Option<u64>,
 }
 
+impl Transaction {
+    /// The firmware acknowledged the kill and the killed commands were settled.
+    pub(super) fn released(&self) -> bool {
+        self.phase == Phase::Released
+    }
+}
+
 impl Queue {
     pub(crate) fn exit_candidate(&self, context: &Arc<Context>, age: u64) -> bool {
         self.context().is_some_and(|bound| Arc::ptr_eq(bound, context))

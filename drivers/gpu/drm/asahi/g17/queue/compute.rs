@@ -260,6 +260,23 @@ impl Graph {
         Ok(())
     }
 
+    /// A killed queue's ring restarts empty at the firmware's consumer cursor: every
+    /// item slot is cleared and the host producer is set to the consumer. Only
+    /// valid after the firmware acknowledged the kill and no command is pending.
+    fn reset_items(&mut self) -> Result {
+        let cursors = self.cursors()?;
+        if cursors.count != ITEM_RING_ENTRIES || cursors.consumer >= cursors.count {
+            return Err(EIO);
+        }
+        for index in 0..ITEM_RING_ENTRIES as usize {
+            self.graph.dword(ITEMS + index * 8)?.store(0, Ordering::Relaxed);
+        }
+        fence(Ordering::SeqCst);
+        self.graph.word(POINTERS + 0x40)?.store(cursors.consumer, Ordering::Relaxed);
+        self.reclaimed = cursors.consumer;
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
     /// Reclaim only consumed item pointers, with individual aligned stores and a release fence.
     /// This leaves records still named by firmware untouched across arbitrarily many wraps.
     fn recycle(&mut self, cursors: Cursors) -> Result {
@@ -431,6 +448,9 @@ pub(crate) struct Queue {
     /// the installed queue record still names them until the next owner binds.
     retained_owner: Option<crate::g17::context::FirmwarePages>,
     pool_phase: PoolPhase,
+    /// A killed queue was recycled: its pool/ring must be vacated and re-armed
+    /// fresh before any owner binds it (set by `recycle_killed`, cleared by `rearm`).
+    needs_fresh_backing: bool,
     /// Monotonic time the last owner released this queue (vacate order).
     released_at: u64,
     /// Free-list generation of the last published configuration.
@@ -486,6 +506,7 @@ impl Queue {
             owner: Some(owner),
             retained_owner: None,
             pool_phase: PoolPhase::Populated,
+            needs_fresh_backing: false,
             released_at: 0,
             free_list_generation: 0,
             binding: Some(binding),
@@ -1012,6 +1033,8 @@ impl Queue {
         self.installed
             // A pool release in flight must be witnessed before any successor.
             && !matches!(self.pool_phase, PoolPhase::ReleaseSent(_))
+            // A recycled killed queue is offered only once its backing is vacant (re-arm path).
+            && (!self.needs_fresh_backing || self.pool_phase == PoolPhase::Vacant)
             // An issued kill still names this graph even if its commands retire
             // before the acknowledgement. It cannot acquire a successor owner.
             && self.exit.is_none()
@@ -1122,7 +1145,58 @@ impl Queue {
     }
     /// An idle retained queue whose USC backing may be given back.
     pub(crate) fn vacate_candidate(&self) -> bool {
-        self.reusable() && self.pool_phase == PoolPhase::Populated && self.pool.populated()
+        (self.reusable() || self.recycled_pending()) && self.pool_phase == PoolPhase::Populated && self.pool.populated()
+    }
+    /// A recycled killed queue still holding the backing its killed work used.
+    pub(crate) fn recycled_pending(&self) -> bool {
+        self.needs_fresh_backing
+            && self.installed
+            && self.exit.is_none()
+            && self.owner.is_none()
+            && !self.quarantined
+            && self.active.len == 0
+            && self.replays.len == 0
+            && self.previous.is_none()
+    }
+    /// Recycled queues are vacated regardless of the warm cap.
+    pub(crate) fn needs_fresh_backing(&self) -> bool {
+        self.needs_fresh_backing
+    }
+    /// The firmware acknowledged the kill of this queue's closed owner (`ContextKilled`)
+    /// and every killed command was settled: return the QID to service. The item
+    /// ring is reset to empty at the firmware's consumer cursor; the USC pool and
+    /// descriptor ring are vacated and re-armed fresh before the next owner binds.
+    pub(crate) fn recycle_killed(&mut self) -> Result<bool> {
+        if !self.installed
+            || !self.exit.as_ref().is_some_and(|exit| exit.released())
+            || self.active.len != 0
+            || self.replays.len != 0
+            || self.previous.is_some()
+        {
+            return Ok(false);
+        }
+        self.graph.reset_items()?;
+        self.exit = None;
+        self.quarantined = false;
+        self.quarantine_error = None;
+        self.failure_status_pending = false;
+        self.retired_by_teardown = false;
+        self.spared_quarantine = false;
+        self.spared_deferred = false;
+        self.retire_pending = false;
+        self.awaiting_witness = false;
+        self.retirement_proved = false;
+        self.replay_retirement = false;
+        self.replay_error = None;
+        self.replay_prepared = false;
+        self.submitted = 0;
+        self.kick.clear_parent_after_recovery();
+        self.owner = None;
+        self.released = true;
+        self.retirement_ready = true;
+        self.released_at = now_ns();
+        self.needs_fresh_backing = true;
+        Ok(true)
     }
     pub(crate) fn released_at(&self) -> u64 {
         self.released_at
@@ -1179,12 +1253,13 @@ impl Queue {
         pages: crate::g17::freelist::Pages,
         ring: DescriptorRing,
     ) -> Result<(u16, u64)> {
-        if self.pool_phase != PoolPhase::Vacant || !self.reusable() {
+        if self.pool_phase != PoolPhase::Vacant || !(self.reusable() || self.recycled_pending()) {
             return Err(EAGAIN);
         }
         self.graph.rearm_ring(ring)?;
         self.pool.rearm(pages)?;
         self.pool_phase = PoolPhase::Populated;
+        self.needs_fresh_backing = false;
         Ok((self.pool.id(), self.pool.page_list_va()?))
     }
     /// Exact host identity remains valid even when several commands share an ioctl ID.
