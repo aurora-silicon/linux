@@ -98,10 +98,21 @@ properties:
 
   apple,bw-scratch:
     $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: Phandle of the PMGR bandwidth register provider.
+          - description: Index into the provider's reg property.
+          - description: Index in the firmware display register table.
+          - description: Byte offset of the scratch register within the resource.
     description: PMGR bandwidth scratch resource, display index and offset.
 
   apple,bw-doorbell:
     $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: Phandle of the PMGR bandwidth register provider.
+          - description: Index into the provider's reg property.
+          - description: Index in the firmware display register table.
     description: Optional PMGR bandwidth doorbell resource and display index.
 
   apple,iomfb-surfaces:
@@ -269,4 +280,32 @@ allOf:
         resets: false
 
 unevaluatedProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        dcp@231c00000 {
+            compatible = "apple,t8103-dcp", "apple,dcp";
+            reg = <0x2 0x31c00000 0x0 0x4000>,
+                  <0x2 0x30000000 0x0 0x3e8000>,
+                  <0x2 0x31320000 0x0 0x4000>,
+                  <0x2 0x31344000 0x0 0x4000>,
+                  <0x2 0x31800000 0x0 0x800000>,
+                  <0x2 0x3b3d0000 0x0 0x4000>;
+            reg-names = "coproc", "disp-0", "disp-1", "disp-2",
+                        "disp-3", "disp-4";
+            mboxes = <&dcp_mbox>;
+            mbox-names = "mbox";
+            iommus = <&dcp_dart 0>;
+            apple,bw-scratch = <&pmgr_dcp 0 5 0x14>;
+            apple,bw-doorbell = <&pmgr_dcp 1 6>;
+
+            piodma {
+                iommus = <&disp_dart 0>;
+            };
+        };
+    };
 ...
