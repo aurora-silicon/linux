@@ -10,8 +10,8 @@ use super::{
     command::{Parser, UscWindow, Validated},
     completion::{Completion, Destinations, PreparedPublication},
     context::Context,
-    fence::{Outputs, Submission},
-    job::{self, Backend, Engine, Fences, Order, Packet, Scheduler},
+    fence::{self, Outputs, Submission},
+    job::{Backend, Engine, Fences, Order, Packet, Scheduler},
     validation::Proof,
 };
 use crate::{
@@ -143,7 +143,7 @@ impl<B: Backend> Queue<B> {
     fn prune_frontier(&mut self, index: usize) {
         let failure = &mut self.failures[index];
         self.frontiers[index].retain(|(sequence, fences)| {
-            let status = job::fence_status(&fences.completed);
+            let status = fence::completion_status(&fences.completed);
             if status == 0 {
                 return true;
             }
@@ -255,7 +255,7 @@ impl<B: Backend> Queue<B> {
             // Successful completion includes host timestamp publication. Its
             // ready fence adds no ordering and would prevent shallow inline
             // publication. Failed and pending producers still need checking.
-            if job::fence_status(&fences.completed) > 0 {
+            if fence::completion_status(&fences.completed) > 0 {
                 continue;
             }
             dependencies.push(fences.ready.clone(), GFP_KERNEL)?;

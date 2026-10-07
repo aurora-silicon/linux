@@ -7,7 +7,7 @@
 
 use super::context::{Context, WorkStateLease};
 use crate::file::SyncItem;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use kernel::{
     bindings, c_str,
     dma_fence::{Fence, FenceContexts, FenceObject, FenceOps, RawDmaFence, UserFence},
@@ -28,6 +28,26 @@ impl FenceOps for CompletionFence {
     fn get_timeline_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr {
         c_str!("g17-submit")
     }
+}
+
+/// Status of an explicitly signalled `CompletionFence`, without taking its lock.
+/// This is only for our own fences; foreign dependencies still use the DMA-fence API.
+pub(crate) fn completion_status(fence: &Fence) -> i32 {
+    let raw = fence.raw();
+    // SAFETY: the owned reference retains the naturally aligned unsigned-long
+    // flags. DMA-fence updates published flags with atomic bitops; usize matches
+    // unsigned long on the supported architectures. Acquire observes the error,
+    // VM status and host timestamps published before the ordered signal bit.
+    let flags = unsafe { AtomicUsize::from_ptr(core::ptr::addr_of_mut!((*raw).flags).cast()) }
+        .load(Ordering::Acquire);
+    if flags & (1usize << bindings::dma_fence_flag_bits_DMA_FENCE_FLAG_SIGNALED_BIT) == 0 {
+        return 0;
+    }
+    // SAFETY: CompletionFence has no signaled callback. Its error is set before
+    // signalling and is immutable afterwards. The acquired signal bit makes that
+    // write visible; read once, as the DMA-fence status API does under its lock.
+    let error = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*raw).error)) };
+    if error == 0 { 1 } else { error }
 }
 
 /// Give independently retired work a timeline that fence merging cannot subsume.
