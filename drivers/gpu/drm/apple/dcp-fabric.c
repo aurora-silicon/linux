@@ -2102,10 +2102,10 @@ dcp_typec_port_route(struct apple_dcp_typec_port *port, struct apple_dcp *dcp)
  * Is the display of @connector off in @state, or to be shown on @back's
  * pipeline, so that its route may give @crtc's pipeline up for that one?
  */
-static bool dcp_typec_follow_holder_off(struct drm_atomic_state *state,
-					struct drm_crtc *crtc,
-					struct apple_connector *connector,
-					struct apple_dcp *back)
+bool dcp_typec_follow_holder_off(struct drm_atomic_state *state,
+				 struct drm_crtc *crtc,
+				 struct apple_connector *connector,
+				 struct apple_dcp *back)
 {
 	struct drm_connector_state *conn_state = NULL;
 	struct drm_crtc_state *crtc_state;
@@ -2113,10 +2113,11 @@ static bool dcp_typec_follow_holder_off(struct drm_atomic_state *state,
 
 	if (connector) {
 		conn_state = drm_atomic_get_new_connector_state(state, &connector->base);
-		if (!conn_state)
-			conn_state = connector->base.state;
 	}
-	other = conn_state ? conn_state->crtc : NULL;
+	/* Check reserved this holder; never inspect a later commit's live state. */
+	if (!conn_state)
+		return false;
+	other = conn_state->crtc;
 	if (!other)
 		return true;
 	if (other == crtc)
@@ -2124,8 +2125,6 @@ static bool dcp_typec_follow_holder_off(struct drm_atomic_state *state,
 	if (back->crtc && other == &back->crtc->base)
 		return true;
 	crtc_state = drm_atomic_get_new_crtc_state(state, other);
-	if (!crtc_state)
-		crtc_state = other->state;
 	return crtc_state && !crtc_state->active;
 }
 
@@ -2410,8 +2409,25 @@ int dcp_typec_follow_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
 					return PTR_ERR(other_state);
 			}
 		}
+retry_holder:
 		if (!dcp_typec_follow_lock(false))
 			return -EBUSY;
+		if (dcp->active_typec_route && !dcp->active_typec_route->tunnel) {
+			struct apple_connector *holder = dcp->active_typec_route->port->connector;
+
+			if (holder && !drm_atomic_get_new_connector_state(state, &holder->base)) {
+				struct drm_connector_state *holder_state;
+
+				drm_connector_get(&holder->base);
+				dcp_typec_follow_unlock(false);
+				/* Acquire DRM state without holding either fabric mutex. */
+				holder_state = drm_atomic_get_connector_state(state, &holder->base);
+				drm_connector_put(&holder->base);
+				if (IS_ERR(holder_state))
+					return PTR_ERR(holder_state);
+				goto retry_holder;
+			}
+		}
 		ret = dcp_typec_follow_decide(dcp, crtc, state, connector, &follow);
 		if (!ret && !dcp_has_mode(follow.action == DCP_FABRIC_FOLLOW_STAY ?
 					 dcp : follow.from->dcp, mode))

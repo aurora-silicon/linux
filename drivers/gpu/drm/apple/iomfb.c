@@ -568,19 +568,30 @@ u64 dcp_modes_transfer_begin(struct apple_dcp *dcp)
 int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
 		      u64 generation)
 {
+	struct apple_connector *ready = NULL;
 	int ret;
 
-	guard(mutex)(&dcp->modes_lock);
-	if (generation != dcp->modes_generation)
-		return -ESTALE;
-	ret = replace_modes(handle, &dcp->modes, &dcp->nr_modes,
-			    dcp->width_mm, dcp->height_mm, dcp->notch_height,
-			    dcp->fixed_connector_type == DRM_MODE_CONNECTOR_eDP);
-	if (!ret) {
-		dcp->modes_admitted = true;
-		dcp->modes_provisional = false;
-		apple_connector_invalidate_edid(dcp->connector);
+	scoped_guard(mutex, &dcp->modes_lock) {
+		bool provisional = dcp->modes_provisional;
+
+		if (generation != dcp->modes_generation)
+			return -ESTALE;
+		ret = replace_modes(handle, &dcp->modes, &dcp->nr_modes,
+				    dcp->width_mm, dcp->height_mm, dcp->notch_height,
+				    dcp->fixed_connector_type == DRM_MODE_CONNECTOR_eDP);
+		if (!ret) {
+			dcp->modes_admitted = true;
+			dcp->modes_provisional = false;
+			apple_connector_invalidate_edid(dcp->connector);
+			if (provisional && dcp->connector && dcp->dev &&
+			    dcp_modes_for_connector(dcp, dcp->connector) &&
+			    READ_ONCE(dcp->connector->dcp) == to_platform_device(dcp->dev))
+				ready = dcp->connector;
+		}
 	}
+	/* RX lifetime is drained before connector cleanup; work rechecks ownership. */
+	if (ready)
+		dcp_queue_hotplug(ready);
 	return ret;
 }
 
@@ -826,10 +837,11 @@ bool dcp_crtc_route_ready(struct drm_crtc *crtc, struct drm_atomic_state *state,
 			  bool fresh)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
-	struct drm_connector_state *conn_state;
+	struct drm_connector_list_iter iter;
 	struct drm_crtc_state *crtc_state;
 	struct drm_connector *conn;
-	int i;
+	u64 mask, seen = 0;
+	bool ready = true, owned = false;
 
 	if (!dcp_typec_follows_crtc(dcp))
 		return true;
@@ -837,30 +849,37 @@ bool dcp_crtc_route_ready(struct drm_crtc *crtc, struct drm_atomic_state *state,
 	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 	if (!crtc_state)
 		crtc_state = crtc->state;
-	/* Plane-only updates need the complete effective assignment as well. */
-	if (crtc_state && crtc_state->connector_mask && dcp->active_typec_route &&
-	    (!dcp->connector ||
-	     !(crtc_state->connector_mask & drm_connector_mask(&dcp->connector->base)) ||
-	     READ_ONCE(dcp->connector->dcp) != to_apple_crtc(crtc)->dcp))
-		return false;
-	for_each_new_connector_in_state(state, conn, conn_state, i) {
+	mask = crtc_state ? crtc_state->connector_mask : 0;
+	if (!mask)
+		return !dcp->connector || !dcp->connector->port_encoder;
+	/* The mask is the complete assignment, even on a plane-only commit. */
+	drm_connector_list_iter_begin(crtc->dev, &iter);
+	drm_for_each_connector_iter(conn, &iter) {
 		struct apple_connector *connector = to_apple_connector(conn);
-		struct platform_device *owner = READ_ONCE(connector->dcp);
+		struct platform_device *owner;
+		struct drm_connector_state *assignment;
 
-		if (conn_state->crtc != crtc || !connector->port_encoder)
+		if (!(mask & drm_connector_mask(conn)))
 			continue;
-		/* Unrouted resume retains its existing deferred-flush behaviour. */
+		seen |= drm_connector_mask(conn);
+		owner = READ_ONCE(connector->dcp);
+		/* Preserve the unrouted, disconnected resume/deferred-flush path. */
 		if (!owner && !READ_ONCE(connector->connected))
 			continue;
-		if (owner != to_apple_crtc(crtc)->dcp ||
-		    READ_ONCE(dcp->connector) != connector)
-			return false;
+		owned = true;
+		assignment = drm_atomic_get_new_connector_state(state, conn);
+		if (!assignment)
+			assignment = conn->state;
+		if (!assignment || assignment->crtc != crtc ||
+		    owner != to_apple_crtc(crtc)->dcp || dcp->connector != connector)
+			ready = false;
 	}
-	if (fresh && dcp->typec_follow_start &&
-	    dcp->typec_follow_gen == dcp->typec_generation &&
-	    !dcp_modes_for_connector(dcp, dcp->connector))
+	drm_connector_list_iter_end(&iter);
+	if (!ready || seen != mask)
 		return false;
-	return !fresh || !dcp->modes_provisional;
+	if (fresh && owned)
+		return dcp_modes_for_connector(dcp, dcp->connector) && !dcp->modes_provisional;
+	return true;
 }
 
 /* Does the display @dcp drives offer @mode? */

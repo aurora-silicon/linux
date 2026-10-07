@@ -67,6 +67,8 @@ void dcp_typec_port_set_connector(unsigned int idx, bool secondary,
 bool dcp_typec_dual_stream(void);
 void dcp_typec_reorder(void);
 bool dcp_typec_follows_crtc(struct apple_dcp *dcp);
+bool dcp_typec_follow_holder_off(struct drm_atomic_state *state, struct drm_crtc *crtc,
+				 struct apple_connector *connector, struct apple_dcp *back);
 int dcp_typec_follow_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
 			   struct drm_atomic_state *state,
 			   const struct drm_display_mode *mode);
