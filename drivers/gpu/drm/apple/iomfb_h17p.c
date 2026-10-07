@@ -539,6 +539,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 
 void iomfb_start_h17p(struct apple_dcp *dcp)
 {
+	WRITE_ONCE(dcp->pipe_enabled_h17p, false);
 	dcp->cb_handlers = cb_handlers;
 	dcp_start_signal(dcp, false, dcp_started, NULL);
 }

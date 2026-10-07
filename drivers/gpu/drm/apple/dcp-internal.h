@@ -272,6 +272,8 @@ struct apple_dcp {
 
 	/* Is the DCP booted? */
 	bool active;
+	/* A successful initial enable keeps the H17P pipe running across DPMS. */
+	bool pipe_enabled_h17p;
 
 	/* eDP display without DP-HDMI conversion */
 	bool main_display;

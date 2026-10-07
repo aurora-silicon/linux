@@ -1497,6 +1497,16 @@ void dcp_poweron(struct platform_device *pdev)
 	int ret;
 
 	if (dcp_uses_soft_dpms(dcp)) {
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+		    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+		    !READ_ONCE(dcp->pipe_enabled_h17p)) {
+			iomfb_poweron_h17p(dcp);
+			if (!READ_ONCE(dcp->pipe_enabled_h17p)) {
+				dev_err(dcp->dev, "initial display pipe enable failed\n");
+				WRITE_ONCE(dcp->crashed, true);
+				return;
+			}
+		}
 		ret = dcp_backlight_dpms(dcp, true);
 		if (ret)
 			dev_warn(dcp->dev, "backlight restore unavailable: %d\n", ret);
