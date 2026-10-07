@@ -145,8 +145,12 @@
 # GPU is up. It is installed in a pacman transaction of its own after the
 # kernel. If it can't be (a package it needs is missing or too old, or pacman
 # fails), the kernel install still completes, the summary says so and the
-# exit status is 3. --no-m3-mesa leaves it out; --uninstall removes it. M1,
-# M2, the M3 Max and the M3 MacBook Air download and install nothing of it.
+# exit status is 3. Its udev rule gives the GPU's render node to group render,
+# so the desktop user goes into that group (from the next login). The summary
+# says how to see why the GPU graphics are on or off at a login and how to
+# switch them off. --no-m3-mesa leaves it out; --uninstall removes it, and
+# takes the user out of render only if this script put them there. M1, M2,
+# the M3 Max and the M3 MacBook Air download and install nothing of it.
 # Also in 12.3, for every M3: --m3-report writes one bring-up report with the
 # host name, user names, serial numbers and MAC addresses masked, including an
 # allowlist of the boot loader's device tree (read once through the phram
@@ -531,7 +535,7 @@ M3_GPU_MESA_DONE=0
 # never over the system Mesa, plus the files that make a login session use that prefix on an
 # M3 Pro. It is a release asset of its own, never one of the PACKAGES every Mac gets, and is
 # installed in its own pacman transaction once the kernel install is done (m3_pro_mesa_install).
-M3_PRO_MESA_PACKAGE="mesa-m3-26.1.4.m3.1-1-aarch64.pkg.tar.zst 13c175162d5d7a6dc98aaa6bfe8aaafd1cebf744fc3c8c40e84a3b471d4666b8"
+M3_PRO_MESA_PACKAGE="mesa-m3-26.1.4.m3.1-3-aarch64.pkg.tar.zst d7074aa9580566d2e64afc92f22f62c0cf2350b1ac4facfc37cca57e141101fb"
 M3_PRO_MESA_PREFIX="/opt/mesa-m3"
 # The package's name, as its .PKGINFO gives it; --uninstall removes it by this exact name.
 M3_PRO_MESA_NAME="mesa-m3"
@@ -539,50 +543,32 @@ M3_PRO_MESA_NAME="mesa-m3"
 # or a bare "name": each must be satisfied already (pacman -T: by name or by what a package
 # provides), or the package is left out, so its pacman -U never pulls in an upgrade of the C
 # library or the compiler runtime alone, or a new package.
-M3_PRO_MESA_NEEDS="expat glibc>=2.43 libdisplay-info libdrm libgcc>=3.0 libglvnd libstdc++>=11.1 libx11 libxcb libxext libxshmfence libxxf86vm python spirv-tools>=1:1.4.357.0 systemd-libs vulkan-icd-loader wayland xcb-util-keysyms zlib zstd"
+M3_PRO_MESA_NEEDS="expat glibc>=2.43 libdisplay-info libdrm libgcc>=3.0 libglvnd libstdc++>=11.1 libx11 libxcb libxext libxshmfence libxxf86vm python spirv-tools>=1:1.4.357.0 systemd systemd-libs util-linux vulkan-icd-loader wayland xcb-util-keysyms zlib zstd"
 # The package's own switch-offs, read only to say so in the summary: this file, the user's
 # ~/.config/mesa-m3/disable, or mesa_m3=off on the kernel command line.
 M3_PRO_MESA_DISABLE=/etc/mesa-m3/disable
 # mesa-m3's own user-setup detector and the list file it reads: what counts as a user's own Mesa
 # setup, for the session hook and for this script alike. Once mesa-m3 is installed the record's
-# user_setup comes from that detector (m3_pro_mesa_detector).
+# user_setup comes from that detector; before that (or without it) from this script's byte copies
+# of the same two files (m3_pro_mesa_builtin_detector and _list), whose sha256 are these.
+# fill-m3-pro-mesa.sh fills all four from the package and refuses copies that differ from it.
 M3_PRO_MESA_DETECTOR="/opt/mesa-m3/libexec/mesa-m3-user-setup"
 M3_PRO_MESA_SETUP_LIST="/opt/mesa-m3/share/mesa-m3/user-setup.list"
-# The same list built in, "kind item" per line in the list file's order (fill-m3-pro-mesa.sh
-# refuses a package whose list file says anything else), for runs without mesa-m3 installed.
-# m3_pro_mesa_builtin_setup says what each kind means.
-M3_PRO_MESA_SETUP_RULES="variable CHONKSTEP_M3_MESA_PREFIX
-variable VK_ICD_FILENAMES
-variable VK_DRIVER_FILES
-variable VK_ADD_DRIVER_FILES
-variable LIBGL_DRIVERS_PATH
-variable MESA_LOADER_DRIVER_OVERRIDE
-variable GALLIUM_DRIVER
-variable LIBGL_ALWAYS_SOFTWARE
-variable __EGL_VENDOR_LIBRARY_FILENAMES
-variable __EGL_VENDOR_LIBRARY_DIRS
-variable GBM_BACKENDS_PATH
-variable GBM_ALWAYS_SOFTWARE
-variable DRIRC_CONFIGDIR
-ldpath LD_LIBRARY_PATH
-envfile {config}/environment.d/*.conf
-envfile {config}/uwsm/env
-envfile {config}/uwsm/env-*
-envfile {config}/uwsm/env.d/*
-envfile {config}/uwsm/env-*.d/*
-envfile {config}/uwsm/default
-envfile {config}/hypr/*.conf
-envfile {config}/hypr/*.lua
-envfile /etc/xdg/uwsm/env
-envfile /etc/xdg/uwsm/env-*
-envfile /etc/xdg/uwsm/env.d/*
-envfile /etc/environment
-drirc ~/.drirc
-drirc {config}/drirc
-drirc /etc/drirc
-chonkstep {config}/chonkstep/m3gpu-session.env"
-# Where the built-in check finds the system's files (/etc/...); tests point it elsewhere.
+M3_PRO_MESA_DETECTOR_SHA256=4520c38109773a1d2e76a42d9b648cb7fd47551e9ce7223610e36593f93c62e2
+M3_PRO_MESA_SETUP_LIST_SHA256=8f19ebea2b8e669a764d7c4b40ecbc11e8234acfc3a2bfe7910e22de0b64a49d
+# Where the user-setup and switch-off checks find the Mac's files (the detector's --root); tests
+# point it elsewhere. Paths in the record and the summary are the Mac's, without it.
 M3_PRO_MESA_SETUP_ROOT=""
+# The package's own files that make a login session use the prefix, keep the GPU's render node
+# from the greeter, and confirm a session came up, for the record (fill-m3-pro-mesa.sh checks
+# that the package has each of them). The package owns them: pacman -R mesa-m3 removes them.
+M3_PRO_MESA_INTEGRATION="/usr/share/uwsm/env.d/50-mesa-m3
+/usr/lib/udev/rules.d/72-mesa-m3-render-node.rules
+/usr/lib/systemd/user/mesa-m3-session-confirm.service
+/usr/lib/systemd/user/graphical-session.target.wants/mesa-m3-session-confirm.service"
+# The group the package's udev rule gives the M3 Pro's render node to (mode 0660). This script adds
+# the desktop user to it, and --uninstall takes them out only if this script added them.
+M3_PRO_MESA_RENDER_GROUP=render
 # 0 with --no-m3-mesa.
 M3_PRO_MESA=1
 # What happened on this run (m3_pro_mesa_plan/_install): "" (not an M3 Pro, or no package in
@@ -592,6 +578,8 @@ M3_PRO_MESA_RESULT=""
 # (m3_pro_mesa_record says what is in it).
 M3_PRO_MESA_RECORD_NAME="m3-pro-mesa"
 M3_PRO_MESA_SCHEMA="aurora.m3-pro-mesa-state/1"
+# What this run did about the render group (m3_pro_mesa_render).
+M3_PRO_MESA_RENDER_ADDED=no M3_PRO_MESA_RENDER_NOTE=""
 # How this run's record write went (m3_pro_mesa_record), and the result it holds.
 M3_PRO_MESA_RECORD_WRITE=""
 M3_PRO_MESA_RECORD_RESULT=""
@@ -1461,124 +1449,15 @@ m3_pro_mesa_installed() { pacman -Q "$M3_PRO_MESA_NAME" 2>/dev/null | cut -d' ' 
 m3_pro_mesa_user() { echo "${SUDO_USER:-$(id -un)}"; }
 m3_pro_mesa_user_home() { getent passwd "$1" 2>/dev/null | cut -d: -f6; }
 
-# DIR holds Mesa libraries (the list's ldpath rule).
-m3_pro_mesa_has_mesa() {
-  local f
-  for f in "$1"/libgallium* "$1"/libEGL_mesa* "$1"/libvulkan_asahi* "$1"/dri/*_dri.so; do
-    if [[ -e $f ]]; then return 0; fi
-  done
-  return 1
-}
-
-# VALUE points into the prefix (after spaces and quotes are trimmed).
-m3_pro_mesa_ours() {
-  local v=$1
-  while [[ $v == [[:space:]\"\']* ]]; do v=${v:1}; done
-  while [[ $v == *[[:space:]\"\'] ]]; do v=${v%?}; done
-  [[ $v == "$M3_PRO_MESA_PREFIX" || $v == "$M3_PRO_MESA_PREFIX"/* ]]
-}
-
-# This script's own copy of mesa-m3's user-setup check (mesa-m3-user-setup, files only), from
-# M3_PRO_MESA_SETUP_RULES, for the home HOME. It prints NUL-terminated pairs, a path then what it
-# holds, one per file in the list's order, so any path comes through whole. This script's own
-# environment is not the session's, so only files count. "~" is HOME, "{config}" is HOME/.config,
-# and other paths are under M3_PRO_MESA_SETUP_ROOT (tests).
-#   variable V         an envfile line (not a comment, # or --) naming V, without the prefix
-#                      ("PREFIX/" in it, or the line ending in PREFIX)
-#   ldpath V           an envfile line naming V with a directory, other than PREFIX/lib, that
-#                      holds libgallium*, libEGL_mesa*, libvulkan_asahi* or dri/*_dri.so
-#   envfile GLOB       a file searched for those two
-#   drirc FILE         a drirc file with a dri_driver option
-#   chonkstep FILE     chonkstep's M3 settings: the last CHONKSTEP_M3_MESA_PREFIX names another
-#                      prefix, or there is none (chonkstep then uses its own default prefix)
-# It changes nothing. fill-m3-pro-mesa.sh keeps the list the package's.
-m3_pro_mesa_builtin_setup() {
-  local LC_ALL=C home=$1 kind item path fixed rest f line v t d hit vre lre
-  local vars=() ldvars=() items=()
-  local -A seen=()
-  [[ -n $home && -d $home ]] || return 0
-  while read -r kind item; do
-    case $kind in
-      variable) vars+=("$item") ;;
-      ldpath) ldvars+=("$item") ;;
-      *) items+=("$kind $item") ;;
-    esac
-  done <<<"$M3_PRO_MESA_SETUP_RULES"
-  vre="(^|[^A-Za-z0-9_])($(IFS='|'; echo "${vars[*]}"))([^A-Za-z0-9_]|\$)"
-  lre="(^|[^A-Za-z0-9_])($(IFS='|'; echo "${ldvars[*]}"))([^A-Za-z0-9_]|\$)"
-  for item in "${items[@]}"; do
-    kind=${item%% *} item=${item#* }
-    case $item in
-      "~"/*) path=$home/${item#"~/"} ;;
-      "{config}"/*) path=$home/.config/${item#"{config}/"} ;;
-      *) path=$M3_PRO_MESA_SETUP_ROOT$item ;;
-    esac
-    # Before the list's first glob the path may hold spaces; the glob part is the list's own.
-    fixed=$path rest=""
-    while [[ $fixed == *[*?[]* ]]; do rest=${fixed##*/}${rest:+/$rest} fixed=${fixed%/*}; done
-    # shellcheck disable=SC2086 # the list's glob, unquoted on purpose
-    for f in "$fixed"${rest:+/}$rest; do
-      [[ -f $f && -r $f && -z ${seen[$f]:-} ]] || continue
-      seen[$f]=1 hit=""
-      case $kind in
-        envfile)
-          while IFS= read -r line || [[ -n $line ]]; do
-            [[ $line =~ ^[[:space:]]*(#|--) ]] && continue
-            if [[ $line =~ $vre ]]; then
-              v=${BASH_REMATCH[2]} t=$line
-              while [[ $t == *[[:space:]\"\'] ]]; do t=${t%?}; done
-              if [[ $line != *"$M3_PRO_MESA_PREFIX/"* && $t != *"$M3_PRO_MESA_PREFIX" ]]; then
-                hit="sets $v"
-                break
-              fi
-            fi
-            if [[ $line =~ $lre ]]; then
-              line=${line//\$\{HOME\}/$home} line=${line//\$HOME/$home} line=${line//\~\//$home/}
-              while [[ $line =~ (/[^:\"\'\ ,\;\)]+)(.*) ]]; do
-                d=${BASH_REMATCH[1]} line=${BASH_REMATCH[2]}
-                while [[ $d == */ && $d != / ]]; do d=${d%/}; done
-                [[ $d != "$M3_PRO_MESA_PREFIX/lib" ]] || continue
-                [[ $d == "$home"/* ]] || d=$M3_PRO_MESA_SETUP_ROOT$d
-                if m3_pro_mesa_has_mesa "$d"; then
-                  hit="puts another Mesa in LD_LIBRARY_PATH (${d#"$M3_PRO_MESA_SETUP_ROOT"})"
-                  break 2
-                fi
-              done
-            fi
-          done <"$f"
-          ;;
-        drirc)
-          if grep -Eq 'name[[:space:]]*=[[:space:]]*"dri_driver"' "$f" 2>/dev/null; then
-            hit="chooses a driver (dri_driver)"
-          fi
-          ;;
-        chonkstep)
-          v=$(sed -n -E 's/^[[:space:]]*(export[[:space:]]+)?CHONKSTEP_M3_MESA_PREFIX=//p' "$f" 2>/dev/null | tail -n 1)
-          v=${v%% #*}
-          while [[ $v == [[:space:]\"\']* ]]; do v=${v:1}; done
-          while [[ $v == *[[:space:]\"\'] ]]; do v=${v%?}; done
-          if [[ -z $v ]]; then
-            hit="sets no CHONKSTEP_M3_MESA_PREFIX: chonkstep's M3 launcher uses its own default prefix"
-          elif ! m3_pro_mesa_ours "$v"; then
-            hit="CHONKSTEP_M3_MESA_PREFIX=$v"
-          fi
-          ;;
-      esac
-      if [[ -n $hit ]]; then printf '%s\0%s\0' "$f" "$hit"; fi
-    done
-  done
-  return 0
-}
-
-# mesa-m3's own detector for HOME (mesa-m3-user-setup --home HOME: files only), its answer as
-# the same pairs as m3_pro_mesa_builtin_setup's. Returns non-zero when it fails (its exit 2, or
-# anything but 0 for none and 1 for present) or answers in another form.
-m3_pro_mesa_detector() {
-  local out rc=0 line want p d w paths=() details=()
-  out=$("$M3_PRO_MESA_DETECTOR" --home "$1" 2>/dev/null) || rc=$?
-  ((rc == 0 || rc == 1)) || return "$rc"
-  [[ ${out%%$'\n'*} == "schema=aurora.mesa-m3-user-setup/1" ]] || return 3
-  want=none
+# mesa-m3-user-setup's answer (schema 2) as NUL-terminated pairs, a path then what was found
+# there, one per place, from DETECTOR and its arguments. Exit status 0: none, 1: present,
+# 3: unknown (an unreadable or unresolvable setting: never "none"); anything else, or an answer
+# that does not match its exit status, is a failure (2).
+m3_pro_mesa_setup_run() {
+  local out rc=0 line want="" p d w paths=() details=()
+  out=$("$@" 2>/dev/null) || rc=$?
+  case $rc in 0 | 1 | 3) ;; *) return 2 ;; esac
+  [[ ${out%%$'\n'*} == "schema=aurora.mesa-m3-user-setup/2" ]] || return 2
   while IFS= read -r line; do
     case $line in
       user_setup=*) want=${line#*=} ;;
@@ -1586,57 +1465,659 @@ m3_pro_mesa_detector() {
       user_setup_detail=*) details+=("${line#*=}") ;;
     esac
   done <<<"$out"
-  if ((${#paths[@]})); then
-    [[ $want == present && $rc == 1 ]] || return 3
-  else
-    [[ $want == none && $rc == 0 ]] || return 3
-  fi
+  case $rc:$want in 0:none) ((${#paths[@]} == 0)) || return 2 ;; 1:present) ((${#paths[@]})) || return 2 ;; 3:unknown) ;; *) return 2 ;; esac
   for p in "${paths[@]}"; do
     w=""
     for d in "${details[@]}"; do
-      if [[ $d == "$p"* ]]; then
-        w=${d#"$p"} w=${w#:} w=${w# }
-        break
-      fi
+      if [[ $d == "$p"[:\ ]* ]]; then w=${d#"$p"}; break; fi
     done
-    printf '%s\0%s\0' "$p" "${w:-a Mesa setup}"
+    printf '%s\0%s\0' "$p" "${w:- (no detail)}"
   done
+  return "$rc"
 }
 
-# The invoking user's own Mesa setup, as pairs in M3_PRO_MESA_SETUP, and where it came from in
-# M3_PRO_MESA_SETUP_SOURCE: package-detector (mesa-m3's detector, once mesa-m3 is installed) or
-# installer-builtin (before that, without the detector, or when the detector failed: one
-# warning). M3_PRO_MESA_SETUP_OK is 0 when no check gave an answer (one warning too).
-M3_PRO_MESA_SETUP=() M3_PRO_MESA_SETUP_SOURCE="" M3_PRO_MESA_SETUP_OK=1
+# This script's byte copies of mesa-m3's detector and list, run for HOME: the same answer as the
+# installed detector's (m3_pro_mesa_setup_run). They are written to a private temporary
+# directory, checked against their sha256 and run with python3; a mismatch or no python3 is a
+# failure (2).
+m3_pro_mesa_builtin_setup() {
+  local dir rc=0
+  [[ $M3_PRO_MESA_DETECTOR_SHA256 =~ ^[0-9a-f]{64}$ ]] && command -v python3 >/dev/null || return 2
+  dir=$(mktemp -d) || return 2
+  m3_pro_mesa_builtin_detector >"$dir/mesa-m3-user-setup"
+  m3_pro_mesa_builtin_list >"$dir/user-setup.list"
+  if [[ $(sha256sum <"$dir/mesa-m3-user-setup" | cut -d' ' -f1) == "$M3_PRO_MESA_DETECTOR_SHA256" &&
+    $(sha256sum <"$dir/user-setup.list" | cut -d' ' -f1) == "$M3_PRO_MESA_SETUP_LIST_SHA256" ]]; then
+    m3_pro_mesa_setup_run python3 "$dir/mesa-m3-user-setup" --home "$1" --list "$dir/user-setup.list" \
+      ${M3_PRO_MESA_SETUP_ROOT:+--root "$M3_PRO_MESA_SETUP_ROOT"} || rc=$?
+  else
+    rc=2
+  fi
+  rm -rf "$dir"
+  return "$rc"
+}
+
+# The invoking user's own Mesa setup, as pairs in M3_PRO_MESA_SETUP, its answer in
+# M3_PRO_MESA_SETUP_ANSWER (present, none or unknown), and where it came from in
+# M3_PRO_MESA_SETUP_SOURCE: package-detector (mesa-m3's installed detector) or installer-builtin
+# (this script's byte copies: before mesa-m3 is installed, or when the installed one failed, with
+# one warning). When neither answers: unknown, with a warning.
+M3_PRO_MESA_SETUP=() M3_PRO_MESA_SETUP_SOURCE="" M3_PRO_MESA_SETUP_ANSWER=""
 m3_pro_mesa_setup_collect() {
   local home rc=0
   home=$(m3_pro_mesa_user_home "$(m3_pro_mesa_user)")
-  M3_PRO_MESA_SETUP=() M3_PRO_MESA_SETUP_SOURCE=installer-builtin M3_PRO_MESA_SETUP_OK=1
-  if [[ -n $home && -n $(m3_pro_mesa_installed) && -x $M3_PRO_MESA_DETECTOR ]]; then
-    mapfile -d '' -t M3_PRO_MESA_SETUP < <(m3_pro_mesa_detector "$home")
+  M3_PRO_MESA_SETUP=() M3_PRO_MESA_SETUP_SOURCE=installer-builtin M3_PRO_MESA_SETUP_ANSWER=unknown
+  if [[ -z $home || $home != /* ]]; then
+    warn "no home directory for $(m3_pro_mesa_user); the record says user_setup=unknown"
+    return 0
+  fi
+  if [[ -n $(m3_pro_mesa_installed) && -x $M3_PRO_MESA_DETECTOR ]]; then
+    mapfile -d '' -t M3_PRO_MESA_SETUP < <(m3_pro_mesa_setup_run "$M3_PRO_MESA_DETECTOR" --home "$home" \
+      ${M3_PRO_MESA_SETUP_ROOT:+--root "$M3_PRO_MESA_SETUP_ROOT"})
     wait $! || rc=$?
-    if ((rc == 0 && ${#M3_PRO_MESA_SETUP[@]} % 2 == 0)); then
+    if ((rc != 2 && ${#M3_PRO_MESA_SETUP[@]} % 2 == 0)); then
       M3_PRO_MESA_SETUP_SOURCE=package-detector
+      case $rc in 0) M3_PRO_MESA_SETUP_ANSWER=none ;; 1) M3_PRO_MESA_SETUP_ANSWER=present ;; esac
       return 0
     fi
-    warn "$M3_PRO_MESA_DETECTOR failed (exit $rc); the record's user setup comes from this script's own check"
+    warn "$M3_PRO_MESA_DETECTOR failed; the record's user setup comes from this script's copy of it"
   fi
   rc=0
   mapfile -d '' -t M3_PRO_MESA_SETUP < <(m3_pro_mesa_builtin_setup "$home")
   wait $! || rc=$?
-  if ((rc != 0 || ${#M3_PRO_MESA_SETUP[@]} % 2 != 0)); then
-    M3_PRO_MESA_SETUP=() M3_PRO_MESA_SETUP_OK=0
-    warn "this script's own check of $(m3_pro_mesa_user)'s Mesa setup failed (exit $rc); the record says user_setup=unknown"
+  if ((rc == 2 || ${#M3_PRO_MESA_SETUP[@]} % 2 != 0)); then
+    M3_PRO_MESA_SETUP=()
+    warn "this script's copy of mesa-m3's user-setup check failed (no python3, or not the release's bytes);
+    the record says user_setup=unknown"
+    return 0
   fi
+  case $rc in 0) M3_PRO_MESA_SETUP_ANSWER=none ;; 1) M3_PRO_MESA_SETUP_ANSWER=present ;; esac
 }
 
-# The package's switch-offs that are set, as NUL-terminated pairs like m3_pro_mesa_builtin_setup's
+# Byte copies of mesa-m3's /opt/mesa-m3/libexec/mesa-m3-user-setup and its user-setup.list
+# (MIT), from the package this release names. fill-m3-pro-mesa.sh --embed writes them.
+m3_pro_mesa_builtin_detector() {
+  cat <<'M3_PRO_MESA_USER_SETUP_PY'
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""mesa-m3-user-setup: does this user (or the administrator) have an own Mesa setup?
+
+    mesa-m3-user-setup --home HOME [--config-home DIR] [--env | --environ FILE]
+                       [--list FILE] [--root DIR]
+
+The one definition of "the user's own M3 Mesa setup", used by the mesa-m3
+session hook at every login and by the installer. What counts is listed in
+--list (default: share/mesa-m3/user-setup.list next to this program's prefix);
+see the comments there.
+
+  --home HOME        the user's home ("~" in the list)
+  --config-home DIR  the user's XDG_CONFIG_HOME ("{config}"; default HOME/.config)
+  --env              also check this process's own environment
+  --environ FILE     also check a NUL-separated environment file (such as
+                     /proc/PID/environ, which is that process's initial one)
+  --root DIR         prefix every path with DIR (tests)
+
+Nothing is sourced or evaluated. Files are read as text and split into words
+the way a POSIX shell would (quotes, backslashes, comments, ";"), with no
+expansion except $HOME, ${HOME} and a leading ~ in LD_LIBRARY_PATH entries.
+
+A setting counts as a user setup when it chooses a Mesa outside /opt/mesa-m3:
+every component of a list value (":"-separated) must lie in /opt/mesa-m3,
+except a reference to the variable's own previous value. A value that cannot
+be resolved (another $variable, a command substitution) cannot be cleared and
+makes the result "unknown", as does a candidate file or directory that exists
+but cannot be read.
+
+Output, key=value lines:
+  schema=aurora.mesa-m3-user-setup/2
+  user_setup=present|unknown|none
+  user_setup_path=P      once per place involved: an absolute file or directory
+                         path, or environment:NAME for the environment checked
+  user_setup_detail=T    once per finding: the place, the variable, why
+"present" wins over "unknown": one sure finding is enough. No value holds a
+carriage return or a newline: a path that would is refused (exit 2).
+Exit status: 0 none, 1 present, 3 unknown, 2 error (usage, unreadable list,
+refused path).
+"""
+import glob, os, re, stat, sys
+
+PREFIX = '/opt/mesa-m3'
+SCHEMA = 'aurora.mesa-m3-user-setup/2'
+HERE = os.path.dirname(os.path.realpath(__file__))
+DEFAULT_LIST = os.path.normpath(os.path.join(HERE, '..', 'share', 'mesa-m3', 'user-setup.list'))
+NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]*$')
+KINDS = ('variable', 'flag', 'prefix', 'ldpath', 'envfile', 'envfile-before', 'envfile-hookdir', 'drirc',
+         'chonkstep')
+HOOK = '50-mesa-m3'  # the session hook's own name in /usr/share/uwsm/env.d
+
+
+def fail(msg):
+    print(f'mesa-m3-user-setup: {msg}', file=sys.stderr)
+    sys.exit(2)
+
+
+def parse_args(argv):
+    opts = {'home': None, 'config': None, 'env': False, 'environ': None, 'list': DEFAULT_LIST, 'root': ''}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == '--env':
+            opts['env'] = True
+            i += 1
+            continue
+        if a in ('--home', '--config-home', '--environ', '--list', '--root') and i + 1 < len(argv):
+            key = {'--home': 'home', '--config-home': 'config', '--environ': 'environ',
+                   '--list': 'list', '--root': 'root'}[a]
+            opts[key] = argv[i + 1]
+            i += 2
+            continue
+        fail(f'unknown or incomplete option {a!r}')
+    if not opts['home'] or not opts['home'].startswith('/'):
+        fail('--home must be an absolute path')
+    if opts['env'] and opts['environ']:
+        fail('--env and --environ exclude each other')
+    opts['config'] = opts['config'] or os.path.join(opts['home'], '.config')
+    return opts
+
+
+def read_list(path):
+    items = []
+    try:
+        lines = open(path, encoding='utf-8').read().splitlines()
+    except OSError as e:
+        fail(f'cannot read the list {path}: {e.strerror}')
+    for n, line in enumerate(lines, 1):
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        parts = line.split('\t')
+        if len(parts) != 2 or parts[0] not in KINDS:
+            fail(f'{path}:{n}: not KIND<TAB>ITEM')
+        items.append((parts[0], parts[1]))
+    return items
+
+
+def shell_words(line):
+    """Split one line into words the way a POSIX shell does, without any
+    expansion: quotes and backslashes are removed, a "#" that starts a word
+    starts a comment, and ; & | ( ) < > separate words. None when a quote is
+    left open."""
+    words, word, started, i, n = [], [], False, 0, len(line)
+    while i < n:
+        c = line[i]
+        if c in ' \t':
+            if started:
+                words.append(''.join(word))
+                word, started = [], False
+            i += 1
+        elif c == '#' and not started:
+            break
+        elif c in ';&|()<>':
+            if started:
+                words.append(''.join(word))
+                word, started = [], False
+            words.append(c)
+            i += 1
+        elif c == '\\':
+            started = True
+            if i + 1 < n:
+                word.append(line[i + 1])
+            i += 2
+        elif c == "'":
+            j = line.find("'", i + 1)
+            if j < 0:
+                return None
+            word.append(line[i + 1:j])
+            started = True
+            i = j + 1
+        elif c == '"':
+            started = True
+            i += 1
+            while True:
+                if i >= n:
+                    return None
+                c = line[i]
+                if c == '"':
+                    i += 1
+                    break
+                if c == '\\' and i + 1 < n and line[i + 1] in '"\\$`':
+                    word.append(line[i + 1])
+                    i += 2
+                    continue
+                word.append(c)
+                i += 1
+        else:
+            word.append(c)
+            started = True
+            i += 1
+    if started:
+        words.append(''.join(word))
+    return words
+
+
+def shell_assignments(line):
+    """The NAME=VALUE words of one line of shell, environment.d or
+    /etc/environment text. None when the line cannot be split."""
+    words = shell_words(line)
+    if words is None:
+        return None
+    out = []
+    for w in words:
+        m = re.match(r'([A-Za-z_][A-Za-z0-9_]*)=(.*)$', w, re.S)
+        if m:
+            out.append((m.group(1), m.group(2)))
+    return out
+
+
+def hyprlang_assignments(line):
+    """`env = NAME,VALUE` of a Hyprland .conf line ("#" starts a comment,
+    "##" is a literal "#")."""
+    text = line.replace('##', '\0')
+    if '#' in text:
+        text = text[:text.index('#')]
+    text = text.replace('\0', '#').strip()
+    m = re.match(r'env\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*,(.*)$', text)
+    return [(m.group(1), m.group(2).strip())] if m else []
+
+
+def lua_strip_comment(line):
+    """The line without a trailing Lua comment ("--" outside a string)."""
+    quote = None
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if quote:
+            if c == '\\':
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c in '"\'':
+            quote = c
+        elif line.startswith('--', i):
+            return line[:i]
+        i += 1
+    return line
+
+
+def lua_assignments(line):
+    """env("NAME", "VALUE") calls of a Hyprland .lua line (hl.env and the
+    like). A value that is not one string literal is returned as None."""
+    text = lua_strip_comment(line)
+    out = []
+    for m in re.finditer(r'''env\s*\(\s*(["'])([A-Za-z_][A-Za-z0-9_]*)\1\s*,\s*''', text):
+        rest = text[m.end():]
+        lit = re.match(r'''(["'])((?:\\.|(?!\1).)*)\1\s*\)''', rest)
+        out.append((m.group(2), lit.group(2) if lit else None))
+    return out
+
+
+class Finder:
+    def __init__(self, opts, items):
+        self.o, self.items = opts, items
+        self.paths, self.details = [], []
+        self.present = self.unknown = False
+        self.kind = {}
+        for k, i in items:
+            if k in ('variable', 'flag', 'prefix', 'ldpath'):
+                self.kind[i] = k
+
+    def real(self, p):
+        return self.o['root'] + p
+
+    def expand(self, item):
+        if item.startswith('~/'):
+            return os.path.join(self.o['home'], item[2:])
+        if item.startswith('{config}/'):
+            return os.path.join(self.o['config'], item[9:])
+        return item
+
+    def note(self, place, detail, sure=True):
+        if '\n' in place or '\r' in place:
+            fail(f'refusing a path with a line break: {place!r}')
+        if sure:
+            self.present = True
+        else:
+            self.unknown = True
+        if place not in self.paths:
+            self.paths.append(place)
+        detail = detail.replace('\r', ' ').replace('\n', ' ')
+        if detail not in self.details:
+            self.details.append(detail)
+
+    def ours(self, path):
+        p = os.path.normpath(path) if path.startswith('/') else path
+        return p == PREFIX or p.startswith(PREFIX + '/')
+
+    def holds_mesa(self, d):
+        r = self.real(d)
+        pats = ('libgallium*', 'libEGL_mesa*', 'libvulkan_asahi*', 'dri/*_dri.so')
+        return any(glob.glob(os.path.join(glob.escape(r), p)) for p in pats)
+
+    def expand_home(self, s):
+        h = self.o['home']
+        s = s.replace('${HOME}', h).replace('$HOME', h)
+        return h + s[1:] if s == '~' or s.startswith('~/') else s
+
+    def judge(self, place, name, value, label, from_file=False):
+        """One setting of a listed variable, from the environment or a file."""
+        kind = self.kind.get(name)
+        if value is None:
+            self.note(place, f'{label} sets {name} to a value that is not a plain string', sure=False)
+            return
+        if kind == 'flag':
+            if value != '':
+                self.note(place, f'{label} sets {name}')
+            return
+        if kind == 'prefix':
+            v = value.rstrip('/') or value
+            if v == '':
+                self.note(place, f'{label} sets {name} empty (the default prefix is used)')
+            elif '$' in v or '`' in v:
+                self.note(place, f'{label} sets {name} to an unresolved value', sure=False)
+            elif not self.ours(v) or v.rstrip('/') != PREFIX:
+                self.note(place, f'{label} sets {name} to {v}')
+            return
+        if kind == 'ldpath':
+            if from_file and not re.search(r'\$\{?' + re.escape(name) + r'(?![A-Za-z0-9_])', value):
+                # A later file that replaces the variable drops /opt/mesa-m3/lib
+                # while the other Mesa variables still point into the prefix.
+                self.note(place, f'{label} replaces {name} (without ${name})')
+                return
+            # Drop the references to the previous value (also ${NAME:+:$NAME}).
+            rest = re.sub(r'\$\{' + re.escape(name) + r'(?::?[-+=?][^}]*)?\}|\$' + re.escape(name) + r'(?![A-Za-z0-9_])',
+                          '', value)
+            for comp in rest.split(':'):
+                comp = self.expand_home(comp.strip())
+                if comp == '':
+                    continue
+                if '$' in comp or '`' in comp:
+                    self.note(place, f'{label} puts an unresolved entry in {name} ({comp})', sure=False)
+                elif comp.startswith('/') and not self.ours(comp) and self.holds_mesa(os.path.normpath(comp)):
+                    self.note(place, f'{label} puts another Mesa in {name} ({os.path.normpath(comp)})')
+            return
+        # A path variable: every component must lie in /opt/mesa-m3.
+        comps = [c.strip() for c in value.split(':')]
+        if all(c == '' for c in comps):
+            self.note(place, f'{label} sets {name} empty')
+            return
+        for comp in comps:
+            if comp in ('', '$' + name, '${' + name + '}'):
+                continue
+            if '$' in comp or '`' in comp:
+                self.note(place, f'{label} sets {name} to an unresolved entry ({comp})', sure=False)
+            elif not self.ours(comp):
+                self.note(place, f'{label} sets {name} ({comp})')
+
+    def check_env(self, env, label):
+        ours_fallback = env.get('MESA_M3_FALLBACK') == 'software'
+        for name, kind in self.kind.items():
+            if name not in env:
+                continue
+            if ours_fallback and name == 'LIBGL_ALWAYS_SOFTWARE' and env[name] == '1':
+                continue  # the session hook's own software fallback
+            self.judge(f'environment:{name}', name, env[name], label)
+
+    def readable(self, path):
+        """Text of a candidate file; None (and a finding) if it can't be read."""
+        try:
+            with open(self.real(path), encoding='utf-8', errors='replace') as f:
+                return f.read()
+        except OSError as e:
+            self.note(path, f'{path} cannot be read ({e.strerror})', sure=False)
+            return None
+
+    def glob(self, pattern):
+        root = self.o['root']
+        hits = (glob.glob(glob.escape(root) + pattern, recursive=True) if root
+                else glob.glob(pattern, recursive=True))
+        return sorted(h[len(root):] if root else h for h in hits)
+
+    def candidates(self, pattern):
+        """Existing regular files matching pattern. A directory or file on the
+        way that exists but cannot be examined or listed is reported (unknown)
+        instead of skipped; a missing one or a dangling link sets nothing."""
+        base = pattern
+        while any(ch in base for ch in '*?['):
+            base = os.path.dirname(base)
+        try:
+            st = os.stat(self.real(base))
+        except (FileNotFoundError, NotADirectoryError):
+            return []
+        except OSError as e:
+            self.note(base, f'{base} cannot be examined ({e.strerror})', sure=False)
+            return []
+        if base == pattern:
+            return [pattern] if stat.S_ISREG(st.st_mode) else []
+        if not stat.S_ISDIR(st.st_mode):
+            return []
+        # Every directory a match could be in must be listable.
+        parent = os.path.dirname(pattern)
+        if '**' in pattern:
+            root = self.o['root']
+            def unlistable(err):
+                d = err.filename[len(root):] if root else err.filename
+                self.note(d, f'{d} cannot be listed', sure=False)
+            dirs = [base]
+            for d, _, _ in os.walk(self.real(base), onerror=unlistable):
+                dirs.append(d[len(root):] if root else d)
+        elif any(ch in parent for ch in '*?['):
+            dirs = self.glob(parent)
+        else:
+            dirs = [parent]
+        for d in dirs:
+            rd = self.real(d)
+            if os.path.isdir(rd) and not os.access(rd, os.R_OK | os.X_OK):
+                self.note(d, f'{d} cannot be listed', sure=False)
+        out = []
+        for path in self.glob(pattern):
+            if '\n' in path or '\r' in path:
+                fail(f'refusing a path with a line break: {path!r}')
+            try:
+                st = os.stat(self.real(path))
+            except FileNotFoundError:
+                continue  # a dangling link sets nothing
+            except OSError as e:
+                self.note(path, f'{path} cannot be examined ({e.strerror})', sure=False)
+                continue
+            if stat.S_ISREG(st.st_mode):
+                out.append(path)
+        return out
+
+    def check_envfile(self, path, text, after):
+        names = set(self.kind)
+        is_lua = path.endswith('.lua')
+        is_hypr = path.endswith('.conf') and '/hypr/' in path
+        for n, line in enumerate(text.splitlines(), 1):
+            s = line.strip()
+            if not s or s.startswith('#') or (is_lua and s.startswith('--')):
+                continue
+            if is_lua:
+                found = lua_assignments(line)
+            elif is_hypr:
+                found = hyprlang_assignments(line)
+            else:
+                found = shell_assignments(line)
+                if found is None:
+                    if any(re.search(rf'(?<![A-Za-z0-9_]){re.escape(v)}(?![A-Za-z0-9_])', line) for v in names):
+                        self.note(path, f'{path}:{n} cannot be split (unbalanced quotes)', sure=False)
+                    continue
+            for name, value in found:
+                if name in names:
+                    self.judge(path, name, value, f'{path}:{n}', from_file=after)
+
+    def check_drirc(self, path, text):
+        body = re.sub(r'<!--.*?-->', '', text, flags=re.S)
+        if re.search(r'''name\s*=\s*["']dri_driver["']''', body):
+            self.note(path, f'{path} chooses a driver (dri_driver)')
+
+    def check_chonkstep(self, path, text, env_prefix):
+        last = None
+        for line in text.splitlines():
+            found = shell_assignments(line)
+            if found is None:
+                if 'CHONKSTEP_M3_MESA_PREFIX' in line:
+                    self.note(path, f'{path} cannot be split around CHONKSTEP_M3_MESA_PREFIX', sure=False)
+                continue
+            for name, value in found:
+                if name == 'CHONKSTEP_M3_MESA_PREFIX':
+                    last = value
+        if last is not None:
+            self.judge(path, 'CHONKSTEP_M3_MESA_PREFIX', last, path)
+        elif not (env_prefix is not None and env_prefix.rstrip('/') == PREFIX):
+            self.note(path, f"{path} sets no CHONKSTEP_M3_MESA_PREFIX: chonkstep's M3 launcher "
+                            'uses its own default prefix')
+
+    def run(self, env):
+        if env is not None:
+            self.check_env(env, 'the environment')
+        env_prefix = env.get('CHONKSTEP_M3_MESA_PREFIX') if env else None
+        for kind, item in self.items:
+            if kind in ('variable', 'flag', 'prefix', 'ldpath'):
+                continue
+            for path in self.candidates(self.expand(item)):
+                text = self.readable(path)
+                if text is None:
+                    continue
+                if kind == 'envfile':
+                    self.check_envfile(path, text, after=True)
+                elif kind == 'envfile-before':
+                    self.check_envfile(path, text, after=False)
+                elif kind == 'envfile-hookdir':
+                    if os.path.basename(path) != HOOK:
+                        self.check_envfile(path, text, after=os.path.basename(path) > HOOK)
+                elif kind == 'drirc':
+                    self.check_drirc(path, text)
+                elif kind == 'chonkstep':
+                    self.check_chonkstep(path, text, env_prefix)
+        return self
+
+
+def main():
+    o = parse_args(sys.argv[1:])
+    items = read_list(o['list'])
+    env = None
+    if o['env']:
+        env = dict(os.environ)
+    elif o['environ']:
+        try:
+            raw = open(o['environ'], 'rb').read()
+        except OSError as e:
+            fail(f'cannot read {o["environ"]}: {e.strerror}')
+        env = {}
+        for entry in raw.split(b'\0'):
+            k, sep, v = entry.decode('utf-8', 'replace').partition('=')
+            if sep:
+                env[k] = v
+    f = Finder(o, items).run(env)
+    state = 'present' if f.present else 'unknown' if f.unknown else 'none'
+    lines = [f'schema={SCHEMA}', f'user_setup={state}']
+    lines += [f'user_setup_path={p}' for p in f.paths]
+    lines += [f'user_setup_detail={d}' for d in f.details]
+    for line in lines:
+        if '\n' in line or '\r' in line:
+            fail('refusing a value with a line break')
+    print('\n'.join(lines))
+    sys.exit({'present': 1, 'unknown': 3, 'none': 0}[state])
+
+
+try:
+    main()
+except SystemExit:
+    raise
+except BaseException as e:  # never let a crash read as "present"
+    print(f'mesa-m3-user-setup: internal error: {type(e).__name__}: {e}'.replace('\n', ' '), file=sys.stderr)
+    sys.exit(2)
+M3_PRO_MESA_USER_SETUP_PY
+}
+m3_pro_mesa_builtin_list() {
+  cat <<'M3_PRO_MESA_USER_SETUP_LIST'
+# mesa-m3: what counts as a user's (or administrator's) own Mesa setup.
+# Read by /opt/mesa-m3/libexec/mesa-m3-user-setup; the session hook and the
+# installer both use that one detector. Format: KIND<TAB>ITEM, one per line.
+#
+# variable  a path variable that chooses a Mesa. A finding when it is set (in
+#           the environment checked, or in one of the files below) and any
+#           ":"-separated component lies outside /opt/mesa-m3, or when it is
+#           set empty. A reference to its own previous value is allowed.
+# flag      a variable that forces a driver choice: a finding when set to any
+#           non-empty value.
+# prefix    chonkstep's M3 Mesa prefix: a finding unless it is /opt/mesa-m3.
+# ldpath    LD_LIBRARY_PATH: a finding for an entry, other than
+#           /opt/mesa-m3/lib, that holds libgallium*, libEGL_mesa*,
+#           libvulkan_asahi* or a dri/ directory with *_dri.so; and, in a
+#           file, for an assignment that replaces it (does not keep
+#           $LD_LIBRARY_PATH), since that drops /opt/mesa-m3/lib after the
+#           session hook ran. Unrelated entries added to it are no finding.
+# envfile   a file that sets session variables, searched for the variables
+#           above. Shell, environment.d and /etc/environment lines are split
+#           like a POSIX shell (quotes, comments, "export", ";"); Hyprland
+#           .conf lines as "env = NAME,VALUE"; Hyprland .lua lines as
+#           env("NAME", "VALUE"). "~" is the user's home; a "{config}" path
+#           is under XDG_CONFIG_HOME (default ~/.config); "**" matches any
+#           depth of subdirectories. envfile: read after the session hook
+#           (uwsm env files and Hyprland's own); envfile-before: applied before
+#           it (environment.d, /etc/environment, the system uwsm env); and
+#           envfile-hookdir: the hook's own directory, where a file sorting
+#           after 50-mesa-m3 is read after it. Replacing LD_LIBRARY_PATH counts
+#           only after the hook.
+# drirc     a drirc file: a finding when it contains a dri_driver option
+#           outside XML comments.
+# chonkstep chonkstep's M3 session settings: a finding when the file exists and
+#           its last CHONKSTEP_M3_MESA_PREFIX names a prefix other than
+#           /opt/mesa-m3, or when it sets none (chonkstep's M3 launcher then
+#           uses its own default prefix) and the environment checked does not
+#           set it to /opt/mesa-m3 either.
+# A candidate that exists but cannot be read, or a value that cannot be
+# resolved, makes the result "unknown" (never "none").
+variable	VK_ICD_FILENAMES
+variable	VK_DRIVER_FILES
+variable	VK_ADD_DRIVER_FILES
+variable	LIBGL_DRIVERS_PATH
+variable	__EGL_VENDOR_LIBRARY_FILENAMES
+variable	__EGL_VENDOR_LIBRARY_DIRS
+variable	GBM_BACKENDS_PATH
+variable	DRIRC_CONFIGDIR
+flag	MESA_LOADER_DRIVER_OVERRIDE
+flag	GALLIUM_DRIVER
+flag	LIBGL_ALWAYS_SOFTWARE
+flag	GBM_ALWAYS_SOFTWARE
+prefix	CHONKSTEP_M3_MESA_PREFIX
+ldpath	LD_LIBRARY_PATH
+envfile-before	{config}/environment.d/*.conf
+envfile	{config}/uwsm/env
+envfile	{config}/uwsm/env-*
+envfile	{config}/uwsm/env.d/*
+envfile	{config}/uwsm/env-*.d/*
+envfile-before	{config}/uwsm/default
+envfile	{config}/hypr/**/*.conf
+envfile	{config}/hypr/**/*.lua
+envfile	/etc/xdg/uwsm/env
+envfile	/etc/xdg/uwsm/env-*
+envfile	/etc/xdg/uwsm/env.d/*
+envfile	/etc/xdg/uwsm/env-*.d/*
+envfile	/usr/local/share/uwsm/env
+envfile	/usr/local/share/uwsm/env-*
+envfile	/usr/local/share/uwsm/env.d/*
+envfile	/usr/local/share/uwsm/env-*.d/*
+envfile-before	/usr/share/uwsm/env
+envfile	/usr/share/uwsm/env-*
+envfile-hookdir	/usr/share/uwsm/env.d/*
+envfile	/usr/share/uwsm/env-*.d/*
+envfile-before	/etc/environment
+drirc	~/.drirc
+drirc	{config}/drirc
+drirc	/etc/drirc
+chonkstep	{config}/chonkstep/m3gpu-session.env
+M3_PRO_MESA_USER_SETUP_LIST
+}
+
+# The package's switch-offs that are set, as NUL-terminated pairs like m3_pro_mesa_setup_run's
 # (an empty path for mesa_m3=off on the kernel command line). Left as they are.
 m3_pro_mesa_optout() {
-  local home
+  local home r=$M3_PRO_MESA_SETUP_ROOT
   home=$(m3_pro_mesa_user_home "$(m3_pro_mesa_user)")
-  if [[ -e $M3_PRO_MESA_DISABLE ]]; then printf '%s\0%s\0' "$M3_PRO_MESA_DISABLE" "off for every user"; fi
-  if [[ -n $home && -e $home/.config/mesa-m3/disable ]]; then
+  if [[ -e $r$M3_PRO_MESA_DISABLE ]]; then printf '%s\0%s\0' "$M3_PRO_MESA_DISABLE" "off for every user"; fi
+  if [[ -n $home && -e $r$home/.config/mesa-m3/disable ]]; then
     printf '%s\0%s\0' "$home/.config/mesa-m3/disable" "off for $(m3_pro_mesa_user)"
   fi
   if [[ " $(cat /proc/cmdline 2>/dev/null) " == *" mesa_m3=off "* ]]; then
@@ -1651,9 +2132,18 @@ m3_pro_mesa_describe() {
   local p w out=""
   while IFS= read -r -d '' p && IFS= read -r -d '' w; do
     if [[ $p == *[$'\n\r']* ]]; then p=$(printf '%q' "$p"); fi
-    out+="${out:+; }${p:+$p: }$w"
+    # The detector's detail goes on from its path (":3 sets X"); the switch-offs' is a phrase.
+    if [[ -n $p && $w == [:\ ]* ]]; then out+="${out:+; }$p$w"; else out+="${out:+; }${p:+$p: }$w"; fi
   done
   echo "$out"
+}
+
+# The user the record's render keys are about: render_user in an error record, else user.
+m3_pro_mesa_record_user() {
+  local u
+  u=$(m3_pro_mesa_record_get render_user)
+  if [[ -z $u ]]; then u=$(m3_pro_mesa_record_get user); fi
+  echo "$u"
 }
 
 # A scalar value of this Mac's record, read as data, never sourced. Nothing when there is no
@@ -1663,6 +2153,11 @@ m3_pro_mesa_record_ok() {
   [[ -f $rec ]] || return 1
   IFS= read -r first <"$rec" || true
   [[ $first == "schema=$M3_PRO_MESA_SCHEMA" ]]
+}
+# Every value of a repeated KEY of this Mac's record, one per line (nothing without a record).
+m3_pro_mesa_record_list() {
+  m3_pro_mesa_record_ok || return 0
+  sed -n "s/^$1=//p" "$STATE/$M3_PRO_MESA_RECORD_NAME"
 }
 m3_pro_mesa_record_get() {
   m3_pro_mesa_record_ok || return 0
@@ -1689,7 +2184,7 @@ m3_pro_mesa_plan() {
   [[ $M3_PRO_MESA_NEEDS =~ ^([A-Za-z0-9._+-]+(\>=[A-Za-z0-9._+:-]+)?[[:space:]]*)+$ && $M3_PRO_MESA_NEEDS != *PENDING* ]] ||
     die "M3_PRO_MESA_NEEDS is not a list of name>=version or name (a packaging mistake). Nothing was installed."
   [[ $M3_PRO_MESA_DETECTOR =~ ^/[A-Za-z0-9._/+-]+$ && $M3_PRO_MESA_SETUP_LIST =~ ^/[A-Za-z0-9._/+-]+$ &&
-    $M3_PRO_MESA_DETECTOR$M3_PRO_MESA_SETUP_LIST != *PENDING* ]] ||
+    $M3_PRO_MESA_DETECTOR_SHA256 =~ ^[0-9a-f]{64}$ && $M3_PRO_MESA_SETUP_LIST_SHA256 =~ ^[0-9a-f]{64}$ ]] ||
     die "M3_PRO_MESA_DETECTOR and M3_PRO_MESA_SETUP_LIST are not mesa-m3's paths (a packaging mistake). Nothing was installed."
   [[ -n $have ]] || return 0
   want=$(m3_pro_mesa_version)
@@ -1777,22 +2272,75 @@ m3_pro_mesa_install() {
   M3_PRO_MESA_RESULT=installed
 }
 
+# USER is in GROUP (by the group database, as at the user's next login): 0 yes, 1 no, 2 unknown.
+m3_pro_mesa_in_group() {
+  local groups
+  groups=$(id -nG -- "$1" 2>/dev/null) || return 2
+  [[ " $groups " == *" $2 "* ]]
+}
+
+# On an M3 Pro with mesa-m3 installed after this run (installed, current or newer-kept): the
+# package's udev rule gives the GPU's render node to group render, so the desktop user (the
+# invoking user, never root) goes into it, from the next login. Sets M3_PRO_MESA_RENDER_ADDED and
+# a summary line; m3_pro_mesa_record records it, and whether the user was in the group before
+# this script first ran. A failure is a warning, and the exit status is 3.
+m3_pro_mesa_render() {
+  local user g=$M3_PRO_MESA_RENDER_GROUP rc=0
+  M3_PRO_MESA_RENDER_ADDED=no M3_PRO_MESA_RENDER_NOTE=""
+  is_m3_pro && [[ -n $M3_PRO_MESA_PACKAGE ]] || return 0
+  case $M3_PRO_MESA_RESULT in installed | current | newer-kept) ;; *) return 0 ;; esac
+  user=$(m3_pro_mesa_user)
+  if [[ $user == root ]]; then
+    M3_PRO_MESA_RENDER_NOTE="This ran as root, so no desktop user was added to the $g group the M3 Pro's GPU now
+   needs: add yours with  sudo gpasswd -a <user> $g  and log in again."
+    return 0
+  fi
+  if [[ ! $user =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || ! getent group "$g" >/dev/null 2>&1; then
+    warn "could not add $(printf '%q' "$user") to the $g group: no such group, or not a user name this script handles.
+    Until the user is in it, the desktop renders in software."
+    M3_PRO_MESA_RENDER_NOTE="$(printf '%q' "$user") is not in the $g group the M3 Pro's GPU now needs (see the warning above);
+   until then the desktop renders in software. The exit status is 3."
+    M3_PRO_MESA_RENDER_ADDED=failed
+    return 0
+  fi
+  m3_pro_mesa_in_group "$user" "$g" || rc=$?
+  ((rc != 0)) || return 0
+  if $sudo gpasswd -a "$user" "$g" >/dev/null && m3_pro_mesa_in_group "$user" "$g"; then
+    M3_PRO_MESA_RENDER_ADDED=yes
+    M3_PRO_MESA_RENDER_NOTE="Added $user to the $g group, which the M3 Pro's GPU now needs. That takes effect at the
+   next login: the reboot does that."
+  else
+    M3_PRO_MESA_RENDER_ADDED=failed
+    warn "could not add $user to the $g group. Until $user is in it, the desktop renders in software: add
+    them with  sudo gpasswd -a $user $g  and log in again."
+    M3_PRO_MESA_RENDER_NOTE="$user is not in the $g group the M3 Pro's GPU now needs (see the warning above). The exit
+   status is 3."
+  fi
+}
+
 # The record of this run, on an M3 Pro: $STATE/m3-pro-mesa, one "key=value" per line, for
 # --uninstall and the lab check. Read it as data, never source it. The first line is
 # schema=aurora.m3-pro-mesa-state/1; a record with another first line is not read. Every key
-# appears exactly once, except user_setup_path, opt_out_path and record_error_key (one line per
-# item, each path whole). The keys, in order:
+# appears exactly once, except integration_path, render_added_user, user_setup_path, opt_out_path
+# and record_error_key (one line per item, each path whole). The keys, in order:
 #   schema; run_id (this run's, also in its summary line), release (this script's tag),
 #   written_at (UTC, ISO 8601), boot_id, kernel (uname -r) and board (the first device-tree
 #   compatible string), all of this run;
 #   installer_sha256 and installer_source: the sha256 of the script file this run reads and
 #     "file", or "unavailable" and "stdin" when it came through a pipe;
-#   package, version, file, sha256 (this release's mesa-m3 entry) and prefix;
+#   package, version, file, sha256 (this release's mesa-m3 entry) and prefix, and an
+#     integration_path line per file of the package that ties it into the system;
 #   result (below), installed_version (or none), installed_by (below), preexisting (the mesa-m3
 #     version installed before this script first wrote a record on this Mac, or none);
-#   user (the invoking user); user_setup_source (package-detector or installer-builtin),
-#     user_setup (present, none, or unknown when the check failed) and a user_setup_path line per
-#     file of that user's own Mesa setup; opt_out (present or none), an opt_out_path line per switch-off file and
+#   user (the invoking user); render_member (yes, no or unknown: in group render, as at the next
+#     login), render_preexisting (yes or no: in it before this script first ran; unknown when
+#     not known), render_added (yes, no or failed: by this run), render_by_installer (yes when
+#     a run of this script added this user and they are still in it), and a render_added_user
+#     line per user any run of this script added who is still in it (this one and earlier
+#     invoking users): --uninstall takes out only those;
+#   user_setup_source (package-detector or installer-builtin: mesa-m3's detector, or this
+#     script's byte copy of it), user_setup (present, none, or unknown when a setting could not
+#     be ruled out or the check failed) and a user_setup_path line per place it named; opt_out (present or none), an opt_out_path line per switch-off file and
 #     opt_out_cmdline (yes or no); all left as they are;
 #   created_files: 0, as the package owns every file.
 # result, what this run did:
@@ -1813,16 +2361,20 @@ m3_pro_mesa_install() {
 # previous run's record must not look current: an error record replaces it (schema, the run's
 # keys from run_id to installer_source, package, result=record-error, record_error (value or
 # write), a record_error_key line per refused key, never its value, and installed_version,
-# installed_by and preexisting, which keep the ownership history). If that write fails too, the
+# installed_by, preexisting, render_user (the user, or none when refused), render_preexisting,
+# render_by_installer and the render_added_user lines, which keep the ownership history). If that write fails too, the
 # previous record is moved aside to m3-pro-mesa.stale-<its written_at> (never over another file),
 # so no record is current. Every failure is in the one warning, and the exit status is 4.
 # --uninstall removes mesa-m3 only when installed_by is installer, the installed version is the
-# record's, preexisting is none, and result is not record-error. The lab's positive check:
+# record's, preexisting is none, and result is not record-error; and takes a user out of group
+# render only when a render_added_user line names them, they are still in it, and result is not
+# record-error. The lab's positive check:
 # result installed or current, installed_by installer, installed_version the pinned version,
 # sha256 the pinned package's sha256, and run_id the one in the summary line of the installer
 # run under test. The record says what this script did, not what renders.
 m3_pro_mesa_record() {
   local have by pre k v p w rc errs="" cause bad="" keys=() optout=() lines=() head=() elines=()
+  local user rmember rpre rby u added=()
   local rec=$STATE/$M3_PRO_MESA_RECORD_NAME
   is_m3_pro && [[ -n $M3_PRO_MESA_PACKAGE ]] || return 0
   have=$(m3_pro_mesa_installed)
@@ -1838,21 +2390,39 @@ m3_pro_mesa_record() {
   fi
   m3_pro_mesa_setup_collect
   mapfile -d '' -t optout < <(m3_pro_mesa_optout)
+  # The render group: as at the next login, before this script first ran, and whose doing it is.
+  user=$(m3_pro_mesa_user) rc=0
+  if [[ $user =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then m3_pro_mesa_in_group "$user" "$M3_PRO_MESA_RENDER_GROUP" || rc=$?; else rc=2; fi
+  case $rc in 0) rmember=yes ;; 1) rmember=no ;; *) rmember=unknown ;; esac
+  rpre=$(m3_pro_mesa_record_get render_preexisting)
+  if [[ -z $rpre || $rpre == unknown || $(m3_pro_mesa_record_user) != "$user" ]]; then
+    case $M3_PRO_MESA_RENDER_ADDED:$rmember in yes:*) rpre=no ;; *:yes) rpre=yes ;; *:no) rpre=no ;; *) rpre=unknown ;; esac
+  fi
+  # The users a run of this script added and who are still in the group: this run's, and the
+  # earlier ones the record names.
+  rby=no
+  while IFS= read -r u; do
+    [[ $u =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || continue
+    if [[ $u == "$user" ]]; then
+      [[ $rmember == yes ]] && rby=yes
+    elif m3_pro_mesa_in_group "$u" "$M3_PRO_MESA_RENDER_GROUP"; then
+      added+=("$u")
+    fi
+  done < <(m3_pro_mesa_record_list render_added_user)
+  if [[ $rmember == yes && $M3_PRO_MESA_RENDER_ADDED == yes ]]; then rby=yes; fi
+  if [[ $rby == yes ]]; then added+=("$user"); fi
   head=("schema=$M3_PRO_MESA_SCHEMA" "run_id=$RUN_ID" "release=$TAG" "written_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     "boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unavailable)"
     "kernel=$(uname -r)" "board=$(tr '\0' '\n' <"$DT/compatible" 2>/dev/null | sed -n 1p)"
     "installer_sha256=$SELF_SHA256" "installer_source=$SELF_SOURCE")
   lines=("${head[@]}" "package=$M3_PRO_MESA_NAME" "version=$(m3_pro_mesa_version)" "file=$(m3_pro_mesa_file)"
-    "sha256=${M3_PRO_MESA_PACKAGE#* }" "prefix=$M3_PRO_MESA_PREFIX" "result=$M3_PRO_MESA_RESULT"
-    "installed_version=${have:-none}" "installed_by=$by" "preexisting=${pre:-none}"
-    "user=$(m3_pro_mesa_user)" "user_setup_source=$M3_PRO_MESA_SETUP_SOURCE")
-  if ((!M3_PRO_MESA_SETUP_OK)); then
-    lines+=(user_setup=unknown)
-  elif ((${#M3_PRO_MESA_SETUP[@]})); then
-    lines+=(user_setup=present)
-  else
-    lines+=(user_setup=none)
-  fi
+    "sha256=${M3_PRO_MESA_PACKAGE#* }" "prefix=$M3_PRO_MESA_PREFIX")
+  while IFS= read -r p; do lines+=("integration_path=$p"); done <<<"$M3_PRO_MESA_INTEGRATION"
+  lines+=("result=$M3_PRO_MESA_RESULT" "installed_version=${have:-none}" "installed_by=$by" "preexisting=${pre:-none}"
+    "user=$user" "render_member=$rmember" "render_preexisting=$rpre" "render_added=$M3_PRO_MESA_RENDER_ADDED"
+    "render_by_installer=$rby")
+  for u in "${added[@]}"; do lines+=("render_added_user=$u"); done
+  lines+=("user_setup_source=$M3_PRO_MESA_SETUP_SOURCE" "user_setup=$M3_PRO_MESA_SETUP_ANSWER")
   for ((k = 0; k < ${#M3_PRO_MESA_SETUP[@]}; k += 2)); do
     if [[ -n ${M3_PRO_MESA_SETUP[k]} ]]; then lines+=("user_setup_path=${M3_PRO_MESA_SETUP[k]}"); fi
   done
@@ -1893,6 +2463,9 @@ m3_pro_mesa_record() {
   elines+=("package=$M3_PRO_MESA_NAME" "result=record-error" "record_error=$cause")
   for k in "${keys[@]}"; do elines+=("record_error_key=$k"); done
   elines+=("installed_version=${have:-none}" "installed_by=$by" "preexisting=${pre:-none}")
+  if [[ $user =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then elines+=("render_user=$user"); else elines+=("render_user=none"); fi
+  elines+=("render_preexisting=$rpre" "render_by_installer=$rby")
+  for u in "${added[@]}"; do elines+=("render_added_user=$u"); done
   M3_PRO_MESA_RECORD_RESULT="record-error"
   rc=0
   m3_pro_mesa_record_write "${elines[@]}" || rc=$?
@@ -2032,6 +2605,8 @@ m3_pro_mesa_notice() {
       echo "   kernel install is complete; until it is installed the desktop renders in software."
       echo "   Run this again to try again. The exit status is 3." ;;
   esac
+  if [[ -n $M3_PRO_MESA_RENDER_NOTE ]]; then echo "   $M3_PRO_MESA_RENDER_NOTE"; fi
+  if [[ -n $have ]]; then m3_pro_mesa_recovery; fi
   if ((${#M3_PRO_MESA_SETUP[@]})); then setup=$(printf '%s\0' "${M3_PRO_MESA_SETUP[@]}" | m3_pro_mesa_describe); fi
   if [[ -n $setup ]]; then
     echo "   Left as it is: $(m3_pro_mesa_user)'s own M3 Mesa setup ($setup)."
@@ -2053,13 +2628,34 @@ m3_pro_mesa_notice() {
   return 0
 }
 
+# How to see and undo what the M3 Pro's Mesa does at login (mesa-m3's state file, journal and
+# switch-off), for the summary when mesa-m3 is installed.
+m3_pro_mesa_recovery() {
+  cat <<'M3_PRO_MESA_RECOVERY'
+   Each login records whether the GPU graphics are on and why:
+     cat /run/user/$(id -u)/mesa-m3-session.state     (or: journalctl -b -t mesa-m3)
+   Reasons: active, opt-out, not-t6030, no-gpu, no-display, no-access, incomplete-prefix,
+   user-setup, user-setup-ldpath, user-setup-unknown, missing-soname, load-failed,
+   log-unreadable, gpu-fault, previous-failed. When off, the desktop renders in software.
+   If the desktop does not come up: Ctrl+Alt+F3, log in, run
+     mkdir -p ~/.config/mesa-m3 && touch ~/.config/mesa-m3/disable
+   and reboot, or add mesa_m3=off to the kernel command line at the boot menu. To turn it
+   back on: rm ~/.config/mesa-m3/disable and log in again. After a GPU login that did not
+   come up, the rest of that boot stays in software (previous-failed); to try again:
+     rm /run/user/$(id -u)/mesa-m3-attempt   and log in again (or reboot).
+   GPU graphics need the account in the render group and able to read the kernel log
+   (the wheel or adm group).
+M3_PRO_MESA_RECOVERY
+}
+
 # After a complete kernel install, on an M3 Pro: exit status 4 when this run's record is not
 # written and durable (whatever happened to the Mesa: the summary line says), else 3 when the
-# M3 Pro's Mesa was not installed.
+# M3 Pro's Mesa was not installed or the desktop user could not be added to group render.
 m3_pro_mesa_status() {
   is_m3_pro && [[ -n $M3_PRO_MESA_PACKAGE ]] || return 0
   [[ $M3_PRO_MESA_RECORD_WRITE == ok ]] || return 4
   case $M3_PRO_MESA_RESULT in skipped-deps | failed) return 3 ;; esac
+  [[ $M3_PRO_MESA_RENDER_ADDED != failed ]] || return 3
   return 0
 }
 
@@ -2069,8 +2665,9 @@ m3_pro_mesa_status() {
 # since) stays, and so does one this script has no readable record of. This script created no
 # other file for it.
 m3_pro_mesa_remove() {
-  local rec=$STATE/$M3_PRO_MESA_RECORD_NAME have
+  local rec=$STATE/$M3_PRO_MESA_RECORD_NAME have pre
   is_m3_pro || [[ -f $rec ]] || return 0
+  m3_pro_mesa_render_remove
   have=$(m3_pro_mesa_installed)
   [[ -n $have ]] || return 0
   if [[ -f $rec ]] && ! m3_pro_mesa_record_ok; then
@@ -2085,7 +2682,6 @@ m3_pro_mesa_remove() {
     say "Keeping $M3_PRO_MESA_NAME $have: this script did not install it"
     return 0
   fi
-  local pre
   pre=$(m3_pro_mesa_record_get preexisting)
   if [[ $pre != none ]]; then
     say "Keeping $M3_PRO_MESA_NAME $have: a $M3_PRO_MESA_NAME (${pre:-of unknown version}) was installed before this script first ran"
@@ -2096,6 +2692,27 @@ m3_pro_mesa_remove() {
   else
     warn "could not remove $M3_PRO_MESA_NAME; remove it with: sudo pacman -R $M3_PRO_MESA_NAME"
   fi
+}
+
+# --uninstall: takes a user out of group render only when the record (readable, and not an error
+# record) names them as added by a run of this script and they are still in it. Never otherwise.
+m3_pro_mesa_render_remove() {
+  local u g=$M3_PRO_MESA_RENDER_GROUP users=()
+  m3_pro_mesa_record_ok || return 0
+  mapfile -t users < <(m3_pro_mesa_record_list render_added_user)
+  ((${#users[@]})) || return 0
+  if [[ $(m3_pro_mesa_record_get result) == record-error ]]; then
+    say "Keeping ${users[*]} in the $g group: the last install could not write its record (result=record-error)"
+    return 0
+  fi
+  for u in "${users[@]}"; do
+    if [[ ! $u =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || ! m3_pro_mesa_in_group "$u" "$g"; then continue; fi
+    if $sudo gpasswd -d "$u" "$g" >/dev/null; then
+      say "Took $u out of the $g group, which this script had added them to (from the next login)"
+    else
+      warn "could not take $u out of the $g group; do it with: sudo gpasswd -d $u $g"
+    fi
+  done
 }
 
 this_board() {
@@ -2733,6 +3350,7 @@ install_all() {
   if is_neo; then neo_radio_notice; fi
   m3_gpu_mesa_install
   m3_pro_mesa_install
+  m3_pro_mesa_render
   m3_pro_mesa_record
   pacman -Q linux-aurora libfprint aurora-touchid
   echo
@@ -4824,8 +5442,10 @@ fingerprint.
       m1n1/boot.bin.before-<version> on the EFI partition), and at the end:
         m1n1's boot.bin is this release's m1n1 with the M3 Pro handoff switches
       Every M3 Pro also gets the M3 Pro's Mesa (mesa-m3, in /opt/mesa-m3),
-      installed on its own after the kernel. The summary says:
+      installed on its own after the kernel, and the desktop user goes into
+      the render group, which the GPU now needs. The summary says:
         The M3 Pro's Mesa (mesa-m3 <version>, in /opt/mesa-m3) is installed.
+        Added <user> to the render group, ... (unless already a member)
       If it says "The M3 Pro's Mesa was NOT installed" instead (exit status
       3), quote the warning above it: the kernel install is complete, and the
       desktop renders in software until a rerun installs it. (--no-m3-mesa
@@ -4833,8 +5453,9 @@ fingerprint.
       Reboot with the owner watching. Expected within about a minute: the
       Omarchy logo, the boot menu, then the desktop on the built-in display
       at 3456x2234, GPU accelerated. After login, quote
-        cat "$XDG_RUNTIME_DIR/mesa-m3/session-status"
-      (the Mesa's login check: decision=on, or why it stayed off). Then run
+        cat /run/user/$(id -u)/mesa-m3-session.state
+      (the Mesa's login check: decision=active, or the reason it stayed off,
+      such as user-setup when the owner has a Mesa of their own). Then run
       the checks below and report.
       External displays: try each USB-C port and the HDMI port, one at a
       time and then HDMI with one USB-C display, and say which port, which
