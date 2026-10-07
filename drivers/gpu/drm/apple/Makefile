@@ -26,3 +26,4 @@ appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += parser-test.o
 appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += dpavservep-edid-test.o
 appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += connector-edid-test.o
 appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += hotplug-test.o
+appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += external-hold-test.o

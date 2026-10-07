@@ -504,7 +504,7 @@ static int dcp_v14_query(struct apple_dcp_v14 *v14, u32 tag)
  * The attached display came or went, as the firmware's display description
  * shows it. Mirrors the hotplug callback of the M1/M2 firmware.
  */
-static void dcp_v14_external_hotplug(struct apple_dcp *dcp, bool connected)
+void dcp_v14_external_hotplug(struct apple_dcp *dcp, bool connected)
 {
 	struct apple_connector *connector = READ_ONCE(dcp->connector);
 	unsigned int action;
@@ -525,6 +525,9 @@ static void dcp_v14_external_hotplug(struct apple_dcp *dcp, bool connected)
 	/* A description that outlives its cable is stale. */
 	if (connected && dcp_is_typec_output(dcp) && !READ_ONCE(dcp->typec_cable_connected))
 		return;
+	/* Described again: a connector kept connected meanwhile is current. */
+	if (connected)
+		atomic_set(&dcp->external_held, 0);
 	if (connected && dcp_is_typec_output(dcp))
 		complete_all(&dcp->typec_iomfb_hpd_ready);
 	if (!connected)
@@ -539,6 +542,75 @@ static void dcp_v14_external_hotplug(struct apple_dcp *dcp, bool connected)
 	if (!dcp->crtc)
 		action &= ~DCP_HOTPLUG_VBLANK;
 	dcp_handle_hotplug_actions(dcp, action);
+}
+
+/*
+ * The firmware withdrew the description of a connected display on a direct
+ * Type-C route whose port still has HPD, and a retry is queued that redoes
+ * the link if the description does not come back. Shortly after an attach
+ * the firmware can do this and describe the display again a fraction of a
+ * second later. Reporting the connector disconnected for that window lets a
+ * compositor that found it connected a moment before read it back with no
+ * modes and no EDID, and keep that empty output once the display is back.
+ * Keep it connected with the modes and EDID it has, until the description is
+ * back or the retry finds it is not (iomfb_v14_7_external_release()). A mode
+ * set meanwhile waits for the description (dcp_v14_external_settle()). Only
+ * the first withdrawal of a connection is held; later ones disconnect, so a
+ * display that keeps being withdrawn is reported as it was before.
+ */
+static bool dcp_v14_external_hold(struct apple_dcp *dcp)
+{
+	struct apple_connector *connector = READ_ONCE(dcp->connector);
+	u64 connection = READ_ONCE(dcp->typec_generation) + 1;
+	unsigned int action;
+
+	if (!dcp->external_native || READ_ONCE(dcp->external_detached) ||
+	    !dcp_is_typec_output(dcp) || dcp_is_usb4_output(dcp) ||
+	    !READ_ONCE(dcp->typec_cable_connected) || READ_ONCE(dcp->typec_crtc_off) ||
+	    !connector || !READ_ONCE(connector->connected) ||
+	    READ_ONCE(dcp->external_held_connection) == connection ||
+	    !delayed_work_pending(&dcp->external_retry_wq))
+		return false;
+	WRITE_ONCE(dcp->external_held_connection, connection);
+	atomic_set(&dcp->external_held, 1);
+	action = dcp_mode_withdraw(&dcp->mode_state);
+	if (!dcp->crtc)
+		action &= ~DCP_HOTPLUG_VBLANK;
+	dcp_handle_hotplug_actions(dcp, action);
+	dev_info(dcp->dev, "display withdrawn on a Type-C route with HPD: kept connected until it is described again\n");
+	return true;
+}
+
+/*
+ * The firmware withdrew the timings of the attached display. An HPD bounce
+ * withdraws the description, and the firmware describes the display again
+ * once its link is back. If that does not happen while the port still holds
+ * the display, redo the link.
+ */
+void iomfb_v14_7_external_withdrawn(struct apple_dcp *dcp)
+{
+	if (READ_ONCE(dcp->typec_cable_connected) && !READ_ONCE(dcp->typec_crtc_off))
+		dcp_external_retry(dcp, "display withdrawn while its port has HPD",
+				   0, DCP_V14_DESC_RELINK_MS);
+	if (!dcp_v14_external_hold(dcp))
+		dcp_v14_external_hotplug(dcp, false);
+}
+
+/*
+ * The retry found the display of a connector kept connected by
+ * dcp_v14_external_hold() not described again: report it disconnected.
+ * Returns whether it did.
+ */
+bool iomfb_v14_7_external_release(struct apple_dcp *dcp)
+{
+	struct apple_connector *connector = READ_ONCE(dcp->connector);
+
+	if (!atomic_xchg(&dcp->external_held, 0) || !connector ||
+	    !READ_ONCE(connector->connected))
+		return false;
+	dev_info(dcp->dev, "display not described again: reporting it disconnected\n");
+	dcp_v14_external_hotplug(dcp, false);
+	return true;
 }
 
 /*
@@ -603,16 +675,7 @@ static void dcp_v14_external_published(struct apple_dcp_v14 *v14, const char *ke
 
 	if (!strcmp(key, "TimingElements")) {
 		if (removed) {
-			dcp_v14_external_hotplug(dcp, false);
-			/*
-			 * An HPD bounce withdraws the description, and the
-			 * firmware describes the display again once its link is
-			 * back. If that does not happen while the port still
-			 * holds the display, redo the link.
-			 */
-			if (READ_ONCE(dcp->typec_cable_connected) && !READ_ONCE(dcp->typec_crtc_off))
-				dcp_external_retry(dcp, "display withdrawn while its port has HPD",
-						   0, DCP_V14_DESC_RELINK_MS);
+			iomfb_v14_7_external_withdrawn(dcp);
 			return;
 		}
 		ret = parse(raw->data, raw->size, &ctx);

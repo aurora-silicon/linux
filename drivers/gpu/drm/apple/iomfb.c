@@ -582,7 +582,14 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
 		if (!ret) {
 			dcp->modes_admitted = true;
 			dcp->modes_provisional = false;
-			apple_connector_invalidate_edid(dcp->connector);
+			/*
+			 * Described again after a withdrawal it was kept
+			 * connected through, the same display keeps its EDID,
+			 * unless that is a placeholder being retried.
+			 */
+			if (!atomic_read(&dcp->external_held) ||
+			    READ_ONCE(dcp->placeholder_retried))
+				apple_connector_invalidate_edid(dcp->connector);
 			if (provisional && dcp->connector && dcp->dev &&
 			    dcp_modes_for_connector(dcp, dcp->connector) &&
 			    READ_ONCE(dcp->connector->dcp) == to_platform_device(dcp->dev))
