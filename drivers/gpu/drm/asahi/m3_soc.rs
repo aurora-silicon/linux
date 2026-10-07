@@ -158,6 +158,11 @@ pub(crate) struct Soc {
     /// The highest GPU power target, in mW, while the boot loader's power model is a stand-in:
     /// the operating points' powers are scaled down together so that the highest is this.
     pub(crate) power_target_cap_mw: Option<u32>,
+    /// Words of the generated HwData object (offset into the object, value) that this SoC's
+    /// firmware takes with other values than the shared builder writes.
+    pub(crate) hwdata_words: &'static [(usize, u32)],
+    /// The same for the Globals object.
+    pub(crate) globals_words: &'static [(usize, u32)],
 }
 
 impl Soc {
@@ -302,6 +307,8 @@ pub(crate) static T6030: Soc = Soc {
     registers: RegisterSet::G15S,
     ut_engagement: 1,
     power_target_cap_mw: None,
+    hwdata_words: &[],
+    globals_words: &[],
 };
 
 /// T8122 (M3, G15G): one die, one cluster of ten core slots (eight or ten of them active).
@@ -397,7 +404,40 @@ pub(crate) static T8122: Soc = Soc {
     // operating point is about 30 W). Until each Mac's fused leakage gives a real one, scale it
     // to a 22 W target, about the GPU power budget of an M3 MacBook Air.
     power_target_cap_mw: Some(22_000),
+    hwdata_words: &T8122_HWDATA_WORDS,
+    globals_words: &T8122_GLOBALS_WORDS,
 };
+
+/// The T8122 HwData words that differ from the shared builder's (offsets into the object;
+/// HwDataA starts at +0x4580):
+/// - HwDataB +0xa30 and +0xa34: 0 and 4 (T6030: 1 and 0);
+/// - HwDataB +0x17e0..+0x1860: the G15G firmware's flag words (T6030 has 1 at +0x17e8,
+///   +0x1804, +0x1814 and +0x1860 and all-ones at +0x1848);
+/// - HwDataA +0x11e0: 30 (T6030: 40), a word of the shader-engine controller block;
+/// - HwDataA +0x1290: 125, and HwDataA +0x424c: 24000000, the 24 MHz reference clock.
+static T8122_HWDATA_WORDS: [(usize, u32); 17] = [
+    (0xa30, 0),
+    (0xa34, 4),
+    (0x17e0, 1),
+    (0x17e8, 0),
+    (0x17f4, 1),
+    (0x17f8, 1),
+    (0x1804, 0),
+    (0x180c, 1),
+    (0x1814, 0),
+    (0x181c, 0xffff_ffff),
+    (0x1848, 0),
+    (0x184c, 0),
+    (0x1858, 1),
+    (0x1860, 0),
+    (0x4580 + 0x11e0, 30),
+    (0x4580 + 0x1290, 125),
+    (0x4580 + 0x424c, 24_000_000),
+];
+
+/// The T8122 Globals words that differ from the shared builder's: +0x9bc, the CDM backoff
+/// timeout (4) with the three bytes after it 0 (T6030: 1, 0, 0).
+static T8122_GLOBALS_WORDS: [(usize, u32); 1] = [(0x9bc, 4)];
 
 /// The T8122 HwData object's firmware VA: 0x8a80 bytes before the end of the fixed allocation's
 /// last page.

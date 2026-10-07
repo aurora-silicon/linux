@@ -782,6 +782,10 @@ fn build_images(
             m.alarm
         );
     }
+    // The SoC's own values for words the shared builder writes otherwise.
+    for &(at, value) in soc.hwdata_words {
+        write(&mut hwdata, at, &value.to_le_bytes())?;
+    }
     // On T8122, log and require the two HwDataB words the firmware's power management depends
     // on: it powers the GPU cores up for a job only when +0xa38 and +0xa40 are both nonzero.
     if core::ptr::eq(soc, &crate::m3_soc::T8122) {
@@ -805,6 +809,18 @@ fn build_images(
     // The gate of the firmware's frequency-feedback cap, per SoC.
     let (ut, given) = m3_params::ut_engagement(soc);
     write(&mut globals, offset_of!(raw::GlobalsG15V14_8_3, ut_engagement), &ut.to_le_bytes())?;
+    for &(at, value) in soc.globals_words {
+        write(&mut globals, at, &value.to_le_bytes())?;
+    }
+    if !soc.hwdata_words.is_empty() || !soc.globals_words.is_empty() {
+        dev_info!(
+            dev,
+            "M3: {} HwData and {} Globals words set from the {} table\n",
+            soc.hwdata_words.len(),
+            soc.globals_words.len(),
+            soc.name
+        );
+    }
     if ut != 1 || given {
         dev_info!(
             dev,
