@@ -235,7 +235,7 @@ class M3ProAs123Test(flow.M3FlowBase):
     RUN = re.compile(r"run_id=[0-9a-f-]{36}")
 
     def test_only_the_reason_names_differ(self):
-        old, _ = pro.old_installer(self, REL_12_3, "install-12.3.sh")
+        old, old_version = pro.old_installer(self, REL_12_3, "install-12.3.sh")
         for board, try_ in (("j516s", 0), ("j514s", 0), ("j514s", 1)):
             with self.subTest(board=board, try_=try_):
                 outs = []
@@ -246,7 +246,9 @@ class M3ProAs123Test(flow.M3FlowBase):
                         proc = self.run_sh(f"M3_TRY={try_}\ninstall_all")
                     finally:
                         self.installer = flow.INSTALLER
-                    outs.append(self.RUN.sub("run_id=<id>", pro.MKTEMP.sub("<tmp>", proc.stdout)).splitlines())
+                    out = self.RUN.sub("run_id=<id>", pro.MKTEMP.sub("<tmp>", proc.stdout))
+                    # 12.3's release number read as this one's (its packages, tag and boot.bin copy).
+                    outs.append(out.replace(old_version, flow.VERSION).splitlines())
                 changed = [l for l in difflib.unified_diff(outs[0], outs[1], lineterm="", n=0)
                            if l[:1] in "+-" and not l.startswith(("+++", "---"))]
                 self.assertEqual(changed, ["-" + l for l in air_default.REASONS_123.splitlines()]

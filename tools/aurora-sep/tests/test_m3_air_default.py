@@ -327,7 +327,18 @@ class SameAs123Test(flow.M3FlowBase):
         outs, installed = [], []
         before = pro.run_with(self, self.old, board, run, setup)
         after = pro.run_with(self, flow.INSTALLER, board, run, setup)
-        self.assertEqual(self.old_version, flow.VERSION)
+        # 12.3's runs with its release number read as this one's: a release names its own packages,
+        # tag and boot.bin copy, and nothing else may differ.
+        if self.old_version != flow.VERSION:
+            before = pro.as_this_release(before, self.old_version, flow.VERSION)
+            installed[0] = {k.replace(self.old_version, flow.VERSION):
+                            v.replace(self.old_version.encode(), flow.VERSION.encode())
+                            for k, v in installed[0].items()}
+            # The kernel release the NEXT STEPS box names follows VERSION too (7.1.12-2-<rel>-sep-ARCH).
+            krel = lambda v: f"-2-{v.rsplit('-', 1)[1]}-sep-ARCH"
+            outs[0] = tuple(x.replace(self.old_version, flow.VERSION).replace(krel(self.old_version),
+                                                                          krel(flow.VERSION)) if x else x
+                            for x in outs[0])
         self.assertEqual(after["codes"], before["codes"])
         pro.same_commands(self, self.norm(before["log"]), self.norm(after["log"]))
         # The files after the install, and after the uninstall.
@@ -352,13 +363,16 @@ class SameAs123Test(flow.M3FlowBase):
             self.assertIn(want, seen)
 
     def test_an_air_with_an_earlier_opt_in(self):
-        # A J615 (and a J613) that opted in on 12.3 runs the plain one-liner: as on 12.3.
+        # A J615 (and a J613) that opted in on 12.3 runs the plain one-liner: as on 12.3. The opt-in
+        # is made under an earlier release number, so both one-liners are a new release there (each
+        # keeps its own boot.bin copy), as 12.3's own one-liner was before 12.4 existed.
         for board in ("j615", "j613"):
             with self.subTest(board=board):
                 def setup():
                     self.installer = self.old
                     try:
-                        self.run_sh("M3_TRY=1\ninstall_all")
+                        self.run_sh("VERSION=7.1.12.aurora2-12.2.99\nTAG=sep-7.1.12.aurora2-12.2.99\n"
+                                    "M3_TRY=1\ninstall_all")
                     finally:
                         self.installer = flow.INSTALLER
                     (self.fake / "log").write_text("")

@@ -167,8 +167,10 @@ class RollbackTest(flow.M3FlowBase):
         self.put_back()
         self.install()
         self.assertEqual(self.failed(), [self.sha])
-        # The next release ships another m1n1.
-        newer = "m1n1-aurora-1.6.1.aurora13-1-aarch64.pkg.tar.zst"
+        # The next release ships another m1n1 (a name no release has used, so it never equals this
+        # release's own).
+        newer = "m1n1-aurora-1.6.1.aurora99-1-aarch64.pkg.tar.zst"
+        self.assertNotEqual(newer, flow.M1N1_PKG)
         self.fixture(newer, None, flow.SWITCH_NAMES)
         self.m1n1_pkg = newer
         restored = self.boot.read_bytes()
@@ -181,7 +183,7 @@ class RollbackTest(flow.M3FlowBase):
         self.update_conf.write_text(self.update_conf.read_text().replace(FREEZE, ""))
         self.install(try_=1)
         boot = self.boot.read_bytes()
-        self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora13-1\n"), boot[:80])
+        self.assertTrue(boot.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora99-1\n"), boot[:80])
         self.assertTrue(boot.endswith(flow.SWITCHES))
 
     def test_agent_prompt_steps_match_the_printed_ones(self):
