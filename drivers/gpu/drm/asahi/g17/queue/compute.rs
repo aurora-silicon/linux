@@ -49,10 +49,13 @@ static_assert!(core::mem::offset_of!(GraphLayout, items) == ITEMS);
 
 /// Aliases are destroyed before the logical root they name. Superseded bindings remain owned
 /// until the first exact successful publication under their replacement has retired.
-/// Backing of a vacated pool, freed outside the device mutex.
+/// Backing of a vacated pool and descriptor ring, freed outside the device
+/// mutex. Field order drops each client alias before the storage it names.
 pub(crate) struct Vacated {
     _alias: Option<mmu::KernelMapping>,
     _pages: Option<crate::g17::freelist::Pages>,
+    _descriptors: Option<mmu::KernelMapping>,
+    _ring: Option<DescriptorRing>,
 }
 
 pub(crate) struct Binding {
@@ -60,7 +63,9 @@ pub(crate) struct Binding {
     /// Client alias of the USC pool pages; dropped when the pool is vacated and
     /// recreated when an owner binds a re-armed pool (it pins the backing).
     pool_alias: Option<mmu::KernelMapping>,
-    _descriptors: mmu::KernelMapping,
+    /// Client alias of the descriptor ring; dropped with the ring when the queue
+    /// is vacated and recreated when an owner binds a re-armed queue.
+    descriptors: Option<mmu::KernelMapping>,
     preempt: mmu::KernelMapping,
     usage: mmu::KernelMapping,
     operand: mmu::KernelMapping,
@@ -68,10 +73,34 @@ pub(crate) struct Binding {
     context: Arc<Context>,
 }
 
+/// Descriptor ring of one compute QID with its kernel-VM alias. Built without
+/// the device mutex; installed into a vacant graph before an owner binds.
+pub(crate) struct DescriptorRing {
+    object: KernelObject,
+    high: mmu::KernelMapping,
+}
+
+impl DescriptorRing {
+    pub(crate) fn new(alloc: &Allocator<'_>) -> Result<Self> {
+        let page = mmu::UAT_PGSZ as u64;
+        let prot = mmu::PROT_GPU_FW_SHARED_RW;
+        let object = alloc.lower(
+            DESCRIPTORS * COMPUTE_DESCRIPTOR_SIZE,
+            page,
+            prot,
+            CpuMap::WriteCombined,
+        )?;
+        let mut high = alloc.uat.geometry().kernel_range();
+        high.start += dynamic::KERNEL_OFFSET;
+        let high = object.alias_in(alloc.uat.kernel_vm(), high, page, prot)?;
+        Ok(Self { object, high })
+    }
+}
+
 /// Firmware-shared storage of one compute QID, separate from its common kick ring.
+/// `ring` is `None` while the queue is vacant (idle, no owner, pool given back).
 struct Graph {
-    descriptor_high: mmu::KernelMapping,
-    descriptors: KernelObject,
+    ring: Option<DescriptorRing>,
     preempt: KernelObject,
     usage: KernelObject,
     operand: KernelObject,
@@ -89,10 +118,7 @@ impl Graph {
         let page = mmu::UAT_PGSZ as u64;
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
         let cpu = CpuMap::WriteCombined;
-        let descriptors = alloc.lower(DESCRIPTORS * COMPUTE_DESCRIPTOR_SIZE, page, prot, cpu)?;
-        let mut high = alloc.uat.geometry().kernel_range();
-        high.start += dynamic::KERNEL_OFFSET;
-        let descriptor_high = descriptors.alias_in(alloc.uat.kernel_vm(), high, page, prot)?;
+        let ring = DescriptorRing::new(alloc)?;
         let preempt = alloc.kernel(0x4000, page, prot, cpu)?;
         let usage = alloc.kernel(mmu::UAT_PGSZ, page, prot, cpu)?;
         let operand = alloc.lower(0x14000, page, prot, cpu)?;
@@ -120,8 +146,7 @@ impl Graph {
         let context_high = alloc.kernel(CONTEXT_SIZE, page, prot, cpu)?;
         let records = alloc.kernel(RECORD_SLOTS * RECORD_STRIDE, page, prot, cpu)?;
         Ok(Self {
-            descriptor_high,
-            descriptors,
+            ring: Some(ring),
             preempt,
             usage,
             operand,
@@ -147,9 +172,7 @@ impl Graph {
         }
         let vm = context.vm();
         vm.install_job_context_aliases()?;
-        let descriptors =
-            self.descriptors
-                .map_alias(vm, self.descriptors.gpu_va(), mmu::PROT_GPU_SHARED_RO)?;
+        let descriptors = self.descriptor_alias(vm)?;
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
         let page = mmu::UAT_PGSZ as u64;
         let preempt = self
@@ -165,7 +188,7 @@ impl Graph {
         Ok(Binding {
             _kick_alias: kick_alias,
             pool_alias: Some(pool_alias),
-            _descriptors: descriptors,
+            descriptors: Some(descriptors),
             preempt,
             usage,
             operand,
@@ -203,12 +226,29 @@ impl Graph {
         fence(Ordering::Acquire);
         Ok(self.support.word(STAMP)?.load(Ordering::Relaxed))
     }
-    fn descriptor_vas(&self, slot: u8) -> (u64, u64) {
+    /// EAGAIN while the queue is vacant: the owner must re-arm it first.
+    fn descriptor_vas(&self, slot: u8) -> Result<(u64, u64)> {
+        let ring = self.ring.as_ref().ok_or(EAGAIN)?;
         let offset = u64::from(slot) * COMPUTE_DESCRIPTOR_SIZE as u64;
-        (
-            self.descriptor_high.iova() + offset,
-            self.descriptors.gpu_va() + offset,
-        )
+        Ok((ring.high.iova() + offset, ring.object.gpu_va() + offset))
+    }
+    fn descriptor_alias(&self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
+        let ring = self.ring.as_ref().ok_or(EAGAIN)?;
+        ring.object
+            .map_alias(vm, ring.object.gpu_va(), mmu::PROT_GPU_SHARED_RO)
+    }
+    /// Detaches the descriptor ring of an idle vacant queue; the caller frees it
+    /// off-lock. The job list and the context item only name consumed
+    /// descriptors at this point.
+    fn vacate_ring(&mut self) -> Option<DescriptorRing> {
+        self.ring.take()
+    }
+    fn rearm_ring(&mut self, ring: DescriptorRing) -> Result {
+        if self.ring.is_some() {
+            return Err(EBUSY);
+        }
+        self.ring = Some(ring);
+        Ok(())
     }
     fn ensure_record_slot(&self, slot: usize) -> Result {
         if let Some(end) = *self.record_ends.get(slot).ok_or(EINVAL)? {
@@ -1000,6 +1040,9 @@ impl Queue {
                 // The same VM takes back a re-armed pool: alias the new backing.
                 binding.pool_alias = Some(self.pool.map_client(context.vm())?);
             }
+            if binding.descriptors.is_none() {
+                binding.descriptors = Some(self.graph.descriptor_alias(context.vm())?);
+            }
             self.graph.set_owner(&context)?;
             binding.context = context.clone();
             self.previous = Some(Previous {
@@ -1119,15 +1162,27 @@ impl Queue {
         // first (the owner has exited; `reusable()` proved no previous binding).
         let alias = self.binding.as_mut().and_then(|binding| binding.pool_alias.take());
         let pages = self.pool.take_pages();
+        let descriptors = self.binding.as_mut().and_then(|binding| binding.descriptors.take());
+        let ring = self.graph.vacate_ring();
         self.pool_phase = PoolPhase::Vacant;
-        Ok(Some(Vacated { _alias: alias, _pages: pages }))
+        Ok(Some(Vacated {
+            _alias: alias,
+            _pages: pages,
+            _descriptors: descriptors,
+            _ring: ring,
+        }))
     }
     /// Installs fresh backing into a vacant pool; returns the descriptor row data
     /// the caller writes before binding an owner.
-    pub(crate) fn rearm(&mut self, pages: crate::g17::freelist::Pages) -> Result<(u16, u64)> {
+    pub(crate) fn rearm(
+        &mut self,
+        pages: crate::g17::freelist::Pages,
+        ring: DescriptorRing,
+    ) -> Result<(u16, u64)> {
         if self.pool_phase != PoolPhase::Vacant || !self.reusable() {
             return Err(EAGAIN);
         }
+        self.graph.rearm_ring(ring)?;
         self.pool.rearm(pages)?;
         self.pool_phase = PoolPhase::Populated;
         Ok((self.pool.id(), self.pool.page_list_va()?))
@@ -1405,7 +1460,7 @@ impl Queue {
         let qid = self.qid();
         let ordinal = self.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
         let (descriptor_high, descriptor_low) =
-            self.graph.descriptor_vas(kick_timestamp.slot() as u8);
+            self.graph.descriptor_vas(kick_timestamp.slot() as u8)?;
         let first = !self.installed && self.ordinal == 0;
         let entry_signal = first
             || dependencies
@@ -1510,10 +1565,15 @@ impl Queue {
         let result = (|| -> Result {
             work.add_submitted_kicks(1)?;
             accounted = true;
-            self.graph.descriptors.initialize::<ComputeDescriptor>(
-                kick_timestamp.slot() * COMPUTE_DESCRIPTOR_SIZE,
-                |descriptor| descriptor.write(&args),
-            )?;
+            self.graph
+                .ring
+                .as_mut()
+                .ok_or(EAGAIN)?
+                .object
+                .initialize::<ComputeDescriptor>(
+                    kick_timestamp.slot() * COMPUTE_DESCRIPTOR_SIZE,
+                    |descriptor| descriptor.write(&args),
+                )?;
             if first {
                 self.graph.context_high.write(
                     0x200,
