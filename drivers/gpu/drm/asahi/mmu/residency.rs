@@ -18,7 +18,7 @@ const RESTORE_BACKOFF_FACTOR: u64 = 16;
 /// A VM whose last job, binding or other residency user ended (or which was
 /// created) more recently than this is in use: a submitting or loading client
 /// would restore whatever reclaim released, synchronously in its next job.
-const RECLAIM_QUIET_NS: u64 = 500_000_000;
+const RECLAIM_QUIET_NS: u64 = 2000000000;
 
 fn now_ns() -> u64 {
     <kernel::time::Monotonic as kernel::time::ClockSource>::ktime_get() as u64
