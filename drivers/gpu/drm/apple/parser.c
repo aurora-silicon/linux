@@ -370,7 +370,15 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 	dcp_parse_foreach_in_array(handle, outer_it) {
 		struct iterator it;
 		bool is_virtual = true;
-		struct color_mode cmode;
+		struct color_mode cmode = {
+			.colorimetry = -1,
+			.depth = -1,
+			.dynamic_range = -1,
+			.eotf = -1,
+			.id = -1,
+			.pixel_encoding = -1,
+			.score = -1,
+		};
 
 		dcp_parse_foreach_in_dict(handle, it) {
 			char *key = parse_string(it.handle);
@@ -447,12 +455,20 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 {
 	int ret = 0;
 	struct iterator it;
-	struct dimension horiz, vert;
+	struct dimension horiz = {}, vert = {};
 	s64 min_vrr = 0, max_vrr = 0;
 	s64 id = -1;
 	s64 best_color_mode = -1;
 	bool is_virtual = false;
 	struct drm_display_mode *mode = &out->mode;
+
+	*out = (struct dcp_display_mode) {
+		.sdr_rgb.score = -1,
+		.sdr_444.score = -1,
+		.sdr.score = -1,
+		.best.score = -1,
+	};
+	*score = -1;
 
 	dcp_parse_foreach_in_dict(handle, it) {
 		char *key = parse_string(it.handle);
@@ -583,7 +599,7 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 	if (ret)
 		return ERR_PTR(ret);
 
-	/* Start with a worst case allocation; parse_mode() only sets vrr. */
+	/* Start with a worst case allocation. */
 	modes = kcalloc(it.len, sizeof(*modes), GFP_KERNEL);
 	*count = 0;
 
