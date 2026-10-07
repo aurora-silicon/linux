@@ -29,6 +29,13 @@
 
 struct apple_dcp;
 struct apple_dcp_afkep;
+
+/* One operation, including all of its nested replies and present completion. */
+struct iomfb_transaction {
+	struct list_head link;
+	void (*start)(struct apple_dcp *dcp, struct iomfb_transaction *transaction);
+	void (*release)(struct iomfb_transaction *transaction);
+};
 struct apple_dcp_typec_port;
 
 struct apple_dcp_typec_route {
@@ -353,7 +360,25 @@ struct apple_dcp {
 	/* Staging wire record; serialization never mutates the atomic inputs. */
 	struct dcp_present_h17p present_h17p;
 	struct dcp_present_state_h17p present_state_h17p;
+
+	/* Serializes H17P transmit preparation with RTKit receive callbacks. */
+	struct {
+		/* Protects queue, channel stacks, and the current owner. */
+		struct mutex lock;
+		struct list_head pending;
+		struct iomfb_transaction *active;
+		struct task_struct *owner;
+		struct work_struct work;
+		struct delayed_work timeout;
+		unsigned long deadline;
+		unsigned int queued;
+		bool stopped;
+	} iomfb;
 };
+
+void iomfb_queue_init(struct apple_dcp *dcp);
+void iomfb_queue_stop(struct apple_dcp *dcp);
+int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction);
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
 

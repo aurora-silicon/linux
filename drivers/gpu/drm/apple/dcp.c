@@ -2193,6 +2193,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	if (dcp->shmem)
 		iomfb_shutdown(dcp);
 
+	iomfb_queue_stop(dcp);
 	dcp_release_piodma_iommu_dev(dcp);
 
 	if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
@@ -2242,6 +2243,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&dcp->swapped_out_fbs);
 	mutex_init(&dcp->swapped_out_fbs_lock);
 	spin_lock_init(&dcp->backlight.lock);
+	iomfb_queue_init(dcp);
 
 	dcp->fw_compat = fw_compat;
 	dcp->dev = dev;

@@ -14,6 +14,7 @@
 #include <linux/of_device.h>
 #include <linux/ratelimit.h>
 #include <linux/slab.h>
+#include <linux/sched.h>
 #include <linux/soc/apple/rtkit.h>
 
 #include <drm/drm_atomic_helper.h>
@@ -156,12 +157,209 @@ static u8 dcp_pop_depth(u8 *depth)
 	return --(*depth);
 }
 
+/* Older firmware and the H17G method profile retain their existing transport. */
+static bool iomfb_uses_queue(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	       dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G;
+}
+
+static bool iomfb_channels_idle(struct apple_dcp *dcp)
+{
+	return !dcp->ch_cmd.depth && !dcp->ch_cb.depth &&
+	       !dcp->ch_oobcmd.depth && !dcp->ch_oobcb.depth &&
+	       !dcp->ch_async.depth && !dcp->ch_oobasync.depth;
+}
+
+static void iomfb_discard_pending(struct apple_dcp *dcp)
+{
+	struct iomfb_transaction *transaction, *next;
+
+	lockdep_assert_held(&dcp->iomfb.lock);
+	list_for_each_entry_safe(transaction, next, &dcp->iomfb.pending, link) {
+		list_del(&transaction->link);
+		dcp->iomfb.queued--;
+		transaction->release(transaction);
+	}
+}
+
+static void iomfb_queue_advance(struct apple_dcp *dcp)
+{
+	struct iomfb_transaction *transaction = dcp->iomfb.active;
+
+	lockdep_assert_held(&dcp->iomfb.lock);
+	if (READ_ONCE(dcp->crashed) || dcp->iomfb.stopped) {
+		iomfb_discard_pending(dcp);
+		/* The active operation may still be visible to firmware. */
+		return;
+	}
+	if (!iomfb_channels_idle(dcp) || dcp->present_state_h17p.pending)
+		return;
+
+	if (transaction) {
+		dcp->iomfb.active = NULL;
+		cancel_delayed_work(&dcp->iomfb.timeout);
+		transaction->release(transaction);
+	}
+	if (!list_empty(&dcp->iomfb.pending))
+		schedule_work(&dcp->iomfb.work);
+}
+
+static void iomfb_queue_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp, iomfb.work);
+	struct iomfb_transaction *transaction;
+
+	mutex_lock(&dcp->iomfb.lock);
+	if (READ_ONCE(dcp->crashed) || dcp->iomfb.stopped) {
+		iomfb_discard_pending(dcp);
+		goto unlock;
+	}
+	if (dcp->iomfb.active || !iomfb_channels_idle(dcp) ||
+	    dcp->present_state_h17p.pending || list_empty(&dcp->iomfb.pending))
+		goto unlock;
+
+	transaction = list_first_entry(&dcp->iomfb.pending,
+				       struct iomfb_transaction, link);
+	list_del(&transaction->link);
+	dcp->iomfb.queued--;
+	dcp->iomfb.active = transaction;
+	WRITE_ONCE(dcp->iomfb.owner, current);
+	dcp->iomfb.deadline = jiffies + msecs_to_jiffies(10000);
+	mod_delayed_work(system_wq, &dcp->iomfb.timeout, msecs_to_jiffies(10000));
+	transaction->start(dcp, transaction);
+	WRITE_ONCE(dcp->iomfb.owner, NULL);
+	iomfb_queue_advance(dcp);
+unlock:
+	mutex_unlock(&dcp->iomfb.lock);
+}
+
+static void iomfb_queue_timeout(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work),
+					  struct apple_dcp, iomfb.timeout);
+
+	mutex_lock(&dcp->iomfb.lock);
+	if (dcp->iomfb.active && time_before(jiffies, dcp->iomfb.deadline)) {
+		mod_delayed_work(system_wq, &dcp->iomfb.timeout,
+				 dcp->iomfb.deadline - jiffies);
+	} else if (dcp->iomfb.active) {
+		WRITE_ONCE(dcp->crashed, true);
+		dev_err(dcp->dev, "IOMFB transaction timed out\n");
+		iomfb_discard_pending(dcp);
+		schedule_work(&dcp->vblank_wq);
+	}
+	mutex_unlock(&dcp->iomfb.lock);
+}
+
+void iomfb_queue_init(struct apple_dcp *dcp)
+{
+	mutex_init(&dcp->iomfb.lock);
+	INIT_LIST_HEAD(&dcp->iomfb.pending);
+	INIT_WORK(&dcp->iomfb.work, iomfb_queue_work);
+	INIT_DELAYED_WORK(&dcp->iomfb.timeout, iomfb_queue_timeout);
+}
+
+void iomfb_queue_stop(struct apple_dcp *dcp)
+{
+	if (!iomfb_uses_queue(dcp))
+		return;
+
+	mutex_lock(&dcp->iomfb.lock);
+	dcp->iomfb.stopped = true;
+	iomfb_discard_pending(dcp);
+	mutex_unlock(&dcp->iomfb.lock);
+	cancel_work_sync(&dcp->iomfb.work);
+	cancel_delayed_work_sync(&dcp->iomfb.timeout);
+}
+
+int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction)
+{
+	int ret = 0;
+
+	mutex_lock(&dcp->iomfb.lock);
+	if (READ_ONCE(dcp->crashed) || dcp->iomfb.stopped) {
+		ret = -EIO;
+	} else if (dcp->iomfb.queued >= 32) {
+		ret = -EBUSY;
+	} else {
+		dcp->iomfb.queued++;
+		list_add_tail(&transaction->link, &dcp->iomfb.pending);
+		schedule_work(&dcp->iomfb.work);
+	}
+	mutex_unlock(&dcp->iomfb.lock);
+	return ret;
+}
+
+struct iomfb_command {
+	struct iomfb_transaction transaction;
+	struct dcp_method_entry method;
+	dcp_callback_t callback;
+	void *cookie;
+	u32 in_len;
+	u32 out_len;
+	bool oob;
+	u8 data[];
+};
+
+static void iomfb_command_start(struct apple_dcp *dcp,
+				struct iomfb_transaction *transaction)
+{
+	struct iomfb_command *command = container_of(transaction,
+						    struct iomfb_command, transaction);
+
+	dcp_push(dcp, command->oob, &command->method, command->in_len,
+		 command->out_len, command->data, command->callback, command->cookie);
+}
+
+static void iomfb_command_release(struct iomfb_transaction *transaction)
+{
+	kfree(container_of(transaction, struct iomfb_command, transaction));
+}
+
+static int iomfb_queue_command(struct apple_dcp *dcp, bool oob,
+			       const struct dcp_method_entry *method,
+			       u32 in_len, u32 out_len, void *data,
+			       dcp_callback_t callback, void *cookie)
+{
+	struct iomfb_command *command;
+	int ret;
+
+	if ((u64)sizeof(struct dcp_packet_header) + in_len + out_len > 0x8000)
+		return -EMSGSIZE;
+	command = kzalloc(struct_size(command, data, in_len), GFP_KERNEL);
+	if (!command)
+		return -ENOMEM;
+	command->transaction.start = iomfb_command_start;
+	command->transaction.release = iomfb_command_release;
+	command->method = *method;
+	command->callback = callback;
+	command->cookie = cookie;
+	command->in_len = in_len;
+	command->out_len = out_len;
+	command->oob = oob;
+	if (in_len)
+		memcpy(command->data, data, in_len);
+	ret = iomfb_queue(dcp, &command->transaction);
+	if (ret)
+		iomfb_command_release(&command->transaction);
+	return ret;
+}
+
 /* Call a DCP function given by a tag */
 void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *call,
 		     u32 in_len, u32 out_len, void *data, dcp_callback_t cb,
 		     void *cookie)
 {
 	struct dcp_method_entry resolved = *call;
+
+	/* Reply chains stay on the serialized receiver; callers enqueue copies. */
+	if (iomfb_uses_queue(dcp) && READ_ONCE(dcp->iomfb.owner) != current) {
+		if (iomfb_queue_command(dcp, oob, call, in_len, out_len,
+					data, cb, cookie))
+			WRITE_ONCE(dcp->crashed, true);
+		return;
+	}
 
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P && READ_ONCE(dcp->crashed))
 		return;
@@ -185,8 +383,21 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 		.tag[3] = call->tag[0],
 	};
 
-	u8 depth = dcp_push_depth(&ch->depth);
-	u16 offset = dcp_packet_start(ch, depth);
+	u8 depth;
+	u16 offset;
+
+	if (iomfb_uses_queue(dcp) &&
+	    (!ch || ch->depth >= DCP_MAX_CALL_DEPTH ||
+	     (u64)sizeof(header) + in_len + out_len > 0x8000 ||
+	     dcp_packet_start(ch, ch->depth) >
+		0x8000 - ALIGN(sizeof(header) + in_len + out_len,
+			       DCP_PACKET_ALIGNMENT))) {
+		dev_err(dcp->dev, "invalid IOMFB command envelope\n");
+		WRITE_ONCE(dcp->crashed, true);
+		return;
+	}
+	depth = dcp_push_depth(&ch->depth);
+	offset = dcp_packet_start(ch, depth);
 
 	void *out = dcp->shmem + dcp_tx_offset(context) + offset;
 	void *out_data = out + sizeof(header);
@@ -647,10 +858,62 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 }
 
 
+struct iomfb_atomic_transaction {
+	struct iomfb_transaction transaction;
+	struct drm_atomic_state *state;
+	struct drm_crtc *crtc;
+};
+
+static void iomfb_atomic_start(struct apple_dcp *dcp,
+			       struct iomfb_transaction *transaction)
+{
+	struct iomfb_atomic_transaction *atomic = container_of(transaction,
+					 struct iomfb_atomic_transaction, transaction);
+
+	if (dcp->valid_mode && dcp->connector && dcp->connector->connected)
+		iomfb_flush_h17p(dcp, atomic->crtc, atomic->state);
+	else
+		schedule_work(&dcp->vblank_wq);
+}
+
+static void iomfb_atomic_release(struct iomfb_transaction *transaction)
+{
+	struct iomfb_atomic_transaction *atomic = container_of(transaction,
+					 struct iomfb_atomic_transaction, transaction);
+
+	drm_atomic_state_put(atomic->state);
+	kfree(atomic);
+}
+
+static void iomfb_queue_atomic(struct apple_dcp *dcp, struct drm_crtc *crtc,
+			       struct drm_atomic_state *state)
+{
+	struct iomfb_atomic_transaction *atomic;
+
+	atomic = kzalloc_obj(*atomic);
+	if (!atomic)
+		goto failed;
+	atomic->transaction.start = iomfb_atomic_start;
+	atomic->transaction.release = iomfb_atomic_release;
+	atomic->state = drm_atomic_state_get(state);
+	atomic->crtc = crtc;
+	if (!iomfb_queue(dcp, &atomic->transaction))
+		return;
+	iomfb_atomic_release(&atomic->transaction);
+failed:
+	WRITE_ONCE(dcp->crashed, true);
+	schedule_work(&dcp->vblank_wq);
+}
+
 void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 {
 	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (iomfb_uses_queue(dcp)) {
+		iomfb_queue_atomic(dcp, crtc, state);
+		return;
+	}
 
 	/*
 	 * DCP does not complete swaps after a link loss.  A plane-only commit
@@ -723,7 +986,7 @@ bool dcp_is_initialized(struct platform_device *pdev)
 	return dcp->active;
 }
 
-void iomfb_recv_msg(struct apple_dcp *dcp, u64 message)
+static void iomfb_recv_message(struct apple_dcp *dcp, u64 message)
 {
 	enum dcpep_type type = FIELD_GET(IOMFB_MESSAGE_TYPE, message);
 
@@ -748,10 +1011,36 @@ void iomfb_recv_msg(struct apple_dcp *dcp, u64 message)
 		dev_warn(dcp->dev, "Ignoring unknown message %llx\n", message);
 }
 
+void iomfb_recv_msg(struct apple_dcp *dcp, u64 message)
+{
+	if (!iomfb_uses_queue(dcp)) {
+		iomfb_recv_message(dcp, message);
+		return;
+	}
+
+	mutex_lock(&dcp->iomfb.lock);
+	WRITE_ONCE(dcp->iomfb.owner, current);
+	if (!dcp->iomfb.stopped)
+		iomfb_recv_message(dcp, message);
+	WRITE_ONCE(dcp->iomfb.owner, NULL);
+	iomfb_queue_advance(dcp);
+	mutex_unlock(&dcp->iomfb.lock);
+}
+
 int iomfb_start_rtkit(struct apple_dcp *dcp)
 {
 	dma_addr_t shmem_iova;
 	int ret;
+
+	if (iomfb_uses_queue(dcp)) {
+		mutex_lock(&dcp->iomfb.lock);
+		if (dcp->iomfb.active) {
+			mutex_unlock(&dcp->iomfb.lock);
+			return -EBUSY;
+		}
+		dcp->iomfb.stopped = false;
+		mutex_unlock(&dcp->iomfb.lock);
+	}
 
 	/*
 	 * H17P firmware expects the remote allocator endpoint to be started
