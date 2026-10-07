@@ -7,7 +7,9 @@
 #include <linux/export.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/folio_batch.h>
 #include <linux/shmem_fs.h>
+#include <linux/swap.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 
@@ -165,9 +167,17 @@ EXPORT_SYMBOL_GPL(drm_gem_shmem_create);
  * This function cleans up the GEM object state, but does not free the memory used to store the
  * object itself. This function is meant to be a dedicated helper for the Rust GEM bindings.
  */
+static void drm_gem_shmem_put_cpu_pages_locked(struct drm_gem_shmem_object *shmem);
+
 void drm_gem_shmem_release(struct drm_gem_shmem_object *shmem)
 {
 	struct drm_gem_object *obj = &shmem->base;
+
+	if (shmem->cpu_pages) {
+		dma_resv_lock(obj->resv, NULL);
+		drm_gem_shmem_put_cpu_pages_locked(shmem);
+		dma_resv_unlock(obj->resv);
+	}
 
 	if (drm_gem_is_imported(obj)) {
 		drm_prime_gem_destroy(obj, shmem->sgt);
@@ -492,6 +502,154 @@ int drm_gem_shmem_madvise_locked(struct drm_gem_shmem_object *shmem, int madv)
 }
 EXPORT_SYMBOL_GPL(drm_gem_shmem_madvise_locked);
 
+/*
+ * Revocable CPU mappings populate pages one at a time, so touching a few
+ * bytes of a large object neither materializes nor pins the whole object.
+ * The device path keeps using the full @pages array; both may coexist and
+ * reference the same page-cache pages.
+ */
+static struct page *drm_gem_shmem_cpu_page_locked(struct drm_gem_shmem_object *shmem,
+						  pgoff_t index)
+{
+	struct drm_gem_object *obj = &shmem->base;
+	struct address_space *mapping = file_inode(obj->filp)->i_mapping;
+	struct page *page;
+
+	dma_resv_assert_held(obj->resv);
+
+	if (!shmem->cpu_pages) {
+		shmem->cpu_pages = kvcalloc(obj->size >> PAGE_SHIFT,
+					    sizeof(*shmem->cpu_pages), GFP_KERNEL);
+		if (!shmem->cpu_pages)
+			return ERR_PTR(-ENOMEM);
+	}
+	page = shmem->cpu_pages[index];
+	if (page)
+		return page;
+	/*
+	 * PFN mappings have no rmap, so reclaim could write the page to swap
+	 * and later drop it while the PTE still names it. Keep the mapping
+	 * unevictable while sparse pages exist, as drm_gem_get_pages() does
+	 * for the device array; the flag is cleared when the last holder goes.
+	 */
+	mapping_set_unevictable(mapping);
+	page = shmem_read_mapping_page(mapping, index);
+	if (IS_ERR(page))
+		return page;
+	shmem->cpu_pages[index] = page;
+	shmem->cpu_pages_count++;
+	return page;
+}
+
+static void drm_gem_shmem_put_cpu_pages_locked(struct drm_gem_shmem_object *shmem)
+{
+	struct drm_gem_object *obj = &shmem->base;
+	unsigned long i, npages = obj->size >> PAGE_SHIFT;
+	struct folio_batch fbatch;
+
+	dma_resv_assert_held(obj->resv);
+
+	if (!shmem->cpu_pages)
+		return;
+	/* A device array still holding these pages keeps the mapping unevictable. */
+	if (!shmem->pages)
+		mapping_clear_unevictable(file_inode(obj->filp)->i_mapping);
+	folio_batch_init(&fbatch);
+	for (i = 0; i < npages && shmem->cpu_pages_count; i++) {
+		struct folio *folio;
+
+		if (!shmem->cpu_pages[i])
+			continue;
+		folio = page_folio(shmem->cpu_pages[i]);
+		folio_mark_dirty(folio);
+		folio_mark_accessed(folio);
+		shmem->cpu_pages_count--;
+		if (!folio_batch_add(&fbatch, folio)) {
+			check_move_unevictable_folios(&fbatch);
+			__folio_batch_release(&fbatch);
+		}
+	}
+	if (folio_batch_count(&fbatch)) {
+		check_move_unevictable_folios(&fbatch);
+		__folio_batch_release(&fbatch);
+	}
+	kvfree(shmem->cpu_pages);
+	shmem->cpu_pages = NULL;
+}
+
+static struct page *drm_gem_shmem_present_page(struct drm_gem_shmem_object *shmem,
+					       pgoff_t index)
+{
+	if (shmem->pages && shmem->pages[index])
+		return shmem->pages[index];
+	if (shmem->cpu_pages)
+		return shmem->cpu_pages[index];
+	return NULL;
+}
+
+bool drm_gem_shmem_idle_pages_releasable_locked(struct drm_gem_shmem_object *shmem)
+{
+	struct drm_gem_object *obj = &shmem->base;
+
+	dma_resv_assert_held(obj->resv);
+	return shmem->sgt && !drm_gem_is_imported(obj) && !obj->dma_buf &&
+		shmem->madv >= 0 && !refcount_read(&shmem->pages_pin_count) &&
+		!refcount_read(&shmem->vmap_use_count) &&
+		refcount_read(&shmem->pages_use_count) == 1 &&
+		dma_resv_test_signaled(obj->resv, DMA_RESV_USAGE_BOOKKEEP);
+}
+EXPORT_SYMBOL_GPL(drm_gem_shmem_idle_pages_releasable_locked);
+
+/**
+ * drm_gem_shmem_release_idle_pages_locked - Release idle backing without purging
+ * @shmem: shmem GEM object whose device mappings have been removed
+ *
+ * Drop the cached SG table and the page array of an object that no device
+ * mapping, pin, vmap or SG-table borrower uses, so ordinary shmem reclaim can
+ * swap its contents. Revocable CPU VMAs are zapped first and refault later.
+ * The caller holds the reservation lock, has removed every device mapping
+ * including cached translations, and excludes new device access. A later
+ * drm_gem_shmem_get_pages_sgt() may return different DMA addresses.
+ *
+ * Returns: 0 on success, -EBUSY if backing is still in use, -EINVAL for an
+ * imported, exported or purged object.
+ */
+int drm_gem_shmem_release_idle_pages_locked(struct drm_gem_shmem_object *shmem)
+{
+	struct drm_gem_object *obj = &shmem->base;
+
+	dma_resv_assert_held(obj->resv);
+
+	if (drm_gem_is_imported(obj) || obj->dma_buf || shmem->madv < 0)
+		return -EINVAL;
+
+	if (refcount_read(&shmem->pages_pin_count) ||
+	    refcount_read(&shmem->vmap_use_count) ||
+	    refcount_read(&shmem->pages_use_count) != !!shmem->sgt ||
+	    !dma_resv_test_signaled(obj->resv, DMA_RESV_USAGE_BOOKKEEP))
+		return -EBUSY;
+
+	/* Zap revocable PFNs under resv so no fault can reinsert them. */
+	if (shmem->reclaimable_cpu_mappings && refcount_read(&shmem->cpu_vma_count)) {
+		drm_vma_node_unmap(&obj->vma_node, obj->dev->anon_inode->i_mapping);
+		drm_gem_shmem_put_cpu_pages_locked(shmem);
+	}
+
+	if (!shmem->sgt)
+		return 0;
+
+	dma_unmap_sgtable(obj->dev->dev, shmem->sgt, DMA_BIDIRECTIONAL, 0);
+	sg_free_table(shmem->sgt);
+	kfree(shmem->sgt);
+	shmem->sgt = NULL;
+
+	shmem->pages_mark_dirty_on_put = true;
+	drm_gem_shmem_put_pages_locked(shmem);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(drm_gem_shmem_release_idle_pages_locked);
+
 void drm_gem_shmem_purge_locked(struct drm_gem_shmem_object *shmem)
 {
 	struct drm_gem_object *obj = &shmem->base;
@@ -501,16 +659,19 @@ void drm_gem_shmem_purge_locked(struct drm_gem_shmem_object *shmem)
 
 	drm_WARN_ON(obj->dev, !drm_gem_shmem_is_purgeable(shmem));
 
-	dma_unmap_sgtable(dev->dev, shmem->sgt, DMA_BIDIRECTIONAL, 0);
-	sg_free_table(shmem->sgt);
-	kfree(shmem->sgt);
-	shmem->sgt = NULL;
-
-	drm_gem_shmem_put_pages_locked(shmem);
-
+	/* Revoke PFNs and complete the TLB flush while backing is still pinned. */
 	shmem->madv = -1;
-
 	drm_vma_node_unmap(&obj->vma_node, dev->anon_inode->i_mapping);
+
+	if (shmem->sgt) {
+		dma_unmap_sgtable(dev->dev, shmem->sgt, DMA_BIDIRECTIONAL, 0);
+		sg_free_table(shmem->sgt);
+		kfree(shmem->sgt);
+		shmem->sgt = NULL;
+		drm_gem_shmem_put_pages_locked(shmem);
+	}
+	drm_gem_shmem_put_cpu_pages_locked(shmem);
+
 	drm_gem_free_mmap_offset(obj);
 
 	/* Our goal here is to return as much of the memory as
@@ -572,11 +733,16 @@ static void drm_gem_shmem_record_mkwrite(struct vm_fault *vmf)
 	loff_t num_pages = obj->size >> PAGE_SHIFT;
 	pgoff_t page_offset = drm_gem_shmem_object_offset(obj, vmf->pgoff);
 
-	if (drm_WARN_ON(obj->dev, !shmem->pages || page_offset >= num_pages))
+	struct page *page;
+
+	if (drm_WARN_ON(obj->dev, page_offset >= num_pages))
+		return;
+	page = drm_gem_shmem_present_page(shmem, page_offset);
+	if (drm_WARN_ON(obj->dev, !page))
 		return;
 
 	file_update_time(vma->vm_file);
-	folio_mark_dirty(page_folio(shmem->pages[page_offset]));
+	folio_mark_dirty(page_folio(page));
 }
 
 /*
@@ -631,7 +797,7 @@ static vm_fault_t drm_gem_shmem_any_fault(struct vm_fault *vmf, unsigned int ord
 	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
 	loff_t num_pages = obj->size >> PAGE_SHIFT;
 	vm_fault_t ret = VM_FAULT_SIGBUS;
-	struct page **pages = shmem->pages;
+	struct page **pages;
 	pgoff_t page_offset = drm_gem_shmem_object_offset(obj, vmf->pgoff);
 	struct page *page;
 	struct folio *folio;
@@ -642,13 +808,28 @@ static vm_fault_t drm_gem_shmem_any_fault(struct vm_fault *vmf, unsigned int ord
 
 	dma_resv_lock(obj->resv, NULL);
 
-	if (page_offset >= num_pages || drm_WARN_ON_ONCE(dev, !shmem->pages) ||
-	    shmem->madv < 0)
+	if (page_offset >= num_pages || shmem->madv < 0)
 		goto out;
 
-	page = pages[page_offset];
-	if (drm_WARN_ON_ONCE(dev, !page))
-		goto out;
+	if (shmem->reclaimable_cpu_mappings && !shmem->pages) {
+		/* Per-page population; huge mappings need the full array. */
+		if (order) {
+			ret = VM_FAULT_FALLBACK;
+			goto out;
+		}
+		page = drm_gem_shmem_cpu_page_locked(shmem, page_offset);
+		if (IS_ERR(page)) {
+			ret = vmf_error(PTR_ERR(page));
+			goto out;
+		}
+	} else {
+		pages = shmem->pages;
+		if (drm_WARN_ON_ONCE(dev, !pages))
+			goto out;
+		page = pages[page_offset];
+		if (drm_WARN_ON_ONCE(dev, !page))
+			goto out;
+	}
 	folio = page_folio(page);
 
 	pfn = page_to_pfn(page);
@@ -682,8 +863,11 @@ static void drm_gem_shmem_vm_open(struct vm_area_struct *vma)
 	 * mmap'd, vm_open() just grabs an additional reference for the new
 	 * mm the vma is getting copied into (ie. on fork()).
 	 */
-	drm_WARN_ON_ONCE(obj->dev,
-			 !refcount_inc_not_zero(&shmem->pages_use_count));
+	if (shmem->reclaimable_cpu_mappings)
+		refcount_inc(&shmem->cpu_vma_count);
+	else
+		drm_WARN_ON_ONCE(obj->dev,
+				 !refcount_inc_not_zero(&shmem->pages_use_count));
 
 	dma_resv_unlock(shmem->base.resv);
 
@@ -696,7 +880,12 @@ static void drm_gem_shmem_vm_close(struct vm_area_struct *vma)
 	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
 
 	dma_resv_lock(shmem->base.resv, NULL);
-	drm_gem_shmem_put_pages_locked(shmem);
+	if (shmem->reclaimable_cpu_mappings) {
+		if (refcount_dec_and_test(&shmem->cpu_vma_count))
+			drm_gem_shmem_put_cpu_pages_locked(shmem);
+	} else {
+		drm_gem_shmem_put_pages_locked(shmem);
+	}
 	dma_resv_unlock(shmem->base.resv);
 
 	drm_gem_vm_close(vma);
@@ -704,8 +893,23 @@ static void drm_gem_shmem_vm_close(struct vm_area_struct *vma)
 
 static vm_fault_t drm_gem_shmem_pfn_mkwrite(struct vm_fault *vmf)
 {
-	drm_gem_shmem_record_mkwrite(vmf);
-	return 0;
+	struct drm_gem_object *obj = vmf->vma->vm_private_data;
+	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
+	vm_fault_t ret = 0;
+
+	if (!shmem->reclaimable_cpu_mappings) {
+		drm_gem_shmem_record_mkwrite(vmf);
+		return 0;
+	}
+
+	/* A revoked PFN must refault rather than be marked writable. */
+	dma_resv_lock(obj->resv, NULL);
+	if (!drm_gem_shmem_present_page(shmem, drm_gem_shmem_object_offset(obj, vmf->pgoff)))
+		ret = VM_FAULT_NOPAGE;
+	else
+		drm_gem_shmem_record_mkwrite(vmf);
+	dma_resv_unlock(obj->resv);
+	return ret;
 }
 
 const struct vm_operations_struct drm_gem_shmem_vm_ops = {
@@ -766,8 +970,19 @@ int drm_gem_shmem_mmap(struct drm_gem_shmem_object *shmem, struct vm_area_struct
 			return -EINVAL;
 	}
 
+	/* Revocation zaps the device anon mapping only. */
+	if (shmem->reclaimable_cpu_mappings &&
+	    (!vma->vm_file || vma->vm_file->f_mapping != obj->dev->anon_inode->i_mapping))
+		return -EINVAL;
+
 	dma_resv_lock(shmem->base.resv, NULL);
-	ret = drm_gem_shmem_get_pages_locked(shmem);
+	if (shmem->reclaimable_cpu_mappings) {
+		if (!refcount_inc_not_zero(&shmem->cpu_vma_count))
+			refcount_set(&shmem->cpu_vma_count, 1);
+		ret = 0;
+	} else {
+		ret = drm_gem_shmem_get_pages_locked(shmem);
+	}
 	dma_resv_unlock(shmem->base.resv);
 
 	if (ret)
