@@ -1,0 +1,93 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * T8122 power management processor, added by the display gate when it
+ * enables the internal display, on any T8122 board whose boot loader passes
+ * that Mac's PMP values in /chosen/asahi,t8122-pmp.
+ *
+ * The layout is the T6030 overlay's: the PMP, its DART, its mailbox and its
+ * report, at the T8122 addresses and interrupts, which are the same on every
+ * T8122 board. It carries none of the per-Mac values; the gate copies those
+ * from /chosen/asahi,t8122-pmp onto the PMP node (apple,board-id,
+ * apple,dram-vendor-id and every apple,tunable-* value, including
+ * apple,tunable-uuid).
+ *
+ * The report seeds the display request (DISP, soc-device id 8, request bit
+ * 7) and the storage request (ANS, soc-device id 18, request bit 17). The
+ * PMP, its DART and its mailbox stay disabled here; the PMP report driver
+ * starts the PMP when the display driver first asks for it.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	fragment@0 {
+		target-path = "/soc";
+
+		__overlay__ {
+			#address-cells = <2>;
+			#size-cells = <2>;
+
+			pmp_report: pmp-report@2d03c0000 {
+				compatible = "apple,t8122-pmp-v2-report";
+				/* PTD read aperture and update page */
+				reg = <0x2 0xd03c0000 0x0 0x14000>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+				apple,pmp = <&pmp>;
+
+				/*
+				 * The gate points the DCP at this entry (apple,pmp-report)
+				 * through the phandle; the overlay itself does not refer to it.
+				 */
+				pmp_report_disp: report@7 {
+					compatible = "apple,t6000-pmp-v2-report-entry";
+					reg = <0x7>;
+					label = "pmp-disp";
+					#power-domain-cells = <0>;
+					apple,always-on;
+					phandle = <0x100>;
+				};
+
+				pmp_report_ans: report@11 {
+					compatible = "apple,t6000-pmp-v2-report-entry";
+					reg = <0x11>;
+					label = "pmp-ans";
+					#power-domain-cells = <0>;
+					apple,always-on;
+					/* The PMP does not acknowledge storage requests. */
+					apple,no-ack;
+				};
+			};
+
+			pmp_dart: iommu@2d0300000 {
+				compatible = "apple,t8122-dart", "apple,t8110-dart";
+				reg = <0x2 0xd0300000 0x0 0x4000>;
+				#iommu-cells = <1>;
+				interrupts = <0 625 4>;
+				status = "disabled";
+			};
+
+			pmp_mbox: mailbox@2d0c08000 {
+				compatible = "apple,t8122-asc-mailbox", "apple,asc-mailbox-v4";
+				reg = <0x2 0xd0c08000 0x0 0x4000>;
+				interrupts = <0 621 4>, <0 622 4>, <0 623 4>, <0 624 4>;
+				interrupt-names = "send-empty", "send-not-empty",
+						  "recv-empty", "recv-not-empty";
+				#mbox-cells = <0>;
+				status = "disabled";
+			};
+
+			pmp: pmp@2d0500000 {
+				compatible = "apple,t8122-pmp-v2", "apple,t6000-pmp-v2";
+				reg = <0x2 0xd0500000 0x0 0x80000>,
+				      <0x2 0xd0c00000 0x0 0x4000>;
+				reg-names = "pmp", "asc";
+				mboxes = <&pmp_mbox>;
+				mbox-names = "mbox";
+				iommus = <&pmp_dart 0>;
+				status = "disabled";
+			};
+		};
+	};
+};
