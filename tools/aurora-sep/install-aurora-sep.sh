@@ -524,7 +524,7 @@ M3_GPU_MESA_DONE=0
 # never over the system Mesa, plus the files that make a login session use that prefix on an
 # M3 Pro. It is a release asset of its own, never one of the PACKAGES every Mac gets, and is
 # installed in its own pacman transaction once the kernel install is done (m3_pro_mesa_install).
-M3_PRO_MESA_PACKAGE="mesa-m3-26.1.4.m3.1-3-aarch64.pkg.tar.zst d7074aa9580566d2e64afc92f22f62c0cf2350b1ac4facfc37cca57e141101fb"
+M3_PRO_MESA_PACKAGE="mesa-m3-26.1.4.m3.1-4-aarch64.pkg.tar.zst 8f5f9ccbd0b9f3b8b22870d74949f25bb30803242727536669ce6686745116eb"
 M3_PRO_MESA_PREFIX="/opt/mesa-m3"
 # The package's name, as its .PKGINFO gives it; --uninstall removes it by this exact name.
 M3_PRO_MESA_NAME="mesa-m3"
