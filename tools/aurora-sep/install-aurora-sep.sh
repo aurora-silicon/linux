@@ -233,8 +233,8 @@ RELEASES_API=${AURORA_RELEASES_API:-$PUBLIC_RELEASES_API}
 # Where to always get the current script, whatever this copy turns out to be.
 LATEST_URL=https://github.com/iconidentify/aurora-linux/releases/latest/download/install-aurora-sep.sh
 PACKAGES=(
-  "linux-aurora-$VERSION-aarch64.pkg.tar.zst PENDING-12.3-LAB-BUILD"
-  "linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst PENDING-12.3-LAB-BUILD"
+  "linux-aurora-$VERSION-aarch64.pkg.tar.zst 2905b644fdec2e335bc226906099a7c828f5e552f228ca6250596468ce0b7308"
+  "linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst 4ff0a9869f6006a12a2bd074d62c0f0d3670498ee0a45a9b07abc65c4c07c668"
   "libfprint-1.94.100-1.1-aarch64.pkg.tar.zst bc7d9762db6644f2cfb58ddb209602c1d513845eb1498c098e01f12600fcbdf9"
   "aurora-touchid-20261003-1-any.pkg.tar.zst 29b0360fac8c257d754e64bd1b9c33c487eb2595dd3c31e9138d7a476afa3d64"
 )
