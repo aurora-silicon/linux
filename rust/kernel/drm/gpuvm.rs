@@ -706,6 +706,12 @@ impl<T: DriverGpuVm> GpuVm<T> {
         unsafe { bindings::drm_gpuvm_is_extobj(self.gpuvm() as *mut _, gem) }
     }
 
+    /// Validate against the immutable address-space bounds and kernel cutout.
+    pub fn range_valid(&self, addr: u64, range: u64) -> bool {
+        // SAFETY: the borrowed VM retains its immutable geometry.
+        unsafe { bindings::drm_gpuvm_range_valid(self.gpuvm() as *mut _, addr, range) }
+    }
+
     pub fn bo_deferred_cleanup(&self) {
         unsafe { bindings::drm_gpuvm_bo_deferred_cleanup(self.gpuvm() as *mut _) }
     }
@@ -802,6 +808,29 @@ pub struct GpuVmInnerGuard<'a, T: DriverGpuVm> {
 }
 
 impl<T: DriverGpuVm> GpuVmInnerGuard<'_, T> {
+    /// Run immediate-mode unmap steps without allocating an exec context.
+    ///
+    /// # Safety
+    /// The driver's unmap/remap callbacks must touch only VM metadata and
+    /// translations protected by this reservation. They must not access
+    /// external BO backing that requires its own reservation. Any split-node
+    /// storage must already be owned by `ctx`; callbacks must defer BO puts.
+    pub unsafe fn sm_unmap_inner(
+        &mut self, ctx: &mut T::StepContext, addr: u64, range: u64,
+    ) -> Result {
+        let vm = self.gpuvm.gpuvm() as *mut bindings::drm_gpuvm;
+        // SAFETY: this guard retains the VM and its shared reservation.
+        if unsafe { (*vm).flags } & bindings::drm_gpuvm_flags_DRM_GPUVM_IMMEDIATE_MODE == 0 {
+            return Err(EINVAL);
+        }
+        let mut ctx = StepContext { gpuvm: self.gpuvm, ctx };
+        // SAFETY: caller supplies the callback contract above. Immediate-mode
+        // link/unlink acquire the separate GEM GPUVA-list mutex themselves.
+        to_result(unsafe {
+            bindings::drm_gpuvm_sm_unmap(vm, &mut ctx as *mut _ as *mut _, addr, range)
+        })
+    }
+
     /// Remove every driver GPUVA in an immediate-mode VM, preserving its kernel cutout.
     ///
     /// `unmap` must remove the GPU translation for each complete GPUVA before
@@ -813,6 +842,25 @@ impl<T: DriverGpuVm> GpuVmInnerGuard<'_, T> {
     /// when a callback fails after earlier mappings have already been removed.
     pub fn unmap_all(
         &mut self,
+        unmap: impl FnMut(&mut T, &GpuVa<T>) -> Result,
+    ) -> Result {
+        self.unmap_matching(None, unmap)
+    }
+
+    /// Allocation-free whole-node removal for one GEM in an immediate-mode VM.
+    /// Uses the same translation-removal and deferred-put contract as unmap_all.
+    /// This scans the VM list and is intended for low-memory cleanup fallback.
+    pub fn unmap_object(
+        &mut self,
+        object: &Object<T>,
+        unmap: impl FnMut(&mut T, &GpuVa<T>) -> Result,
+    ) -> Result {
+        self.unmap_matching(Some(object), unmap)
+    }
+
+    fn unmap_matching(
+        &mut self,
+        object: Option<&Object<T>>,
         mut unmap: impl FnMut(&mut T, &GpuVa<T>) -> Result,
     ) -> Result {
         let vm = self.gpuvm.gpuvm() as *mut bindings::drm_gpuvm;
@@ -830,6 +878,9 @@ impl<T: DriverGpuVm> GpuVmInnerGuard<'_, T> {
                 entry = (*entry).next;
                 // This node is embedded in the C GPUVM, not a driver GpuVa<T>.
                 if core::ptr::eq(va, &raw const (*vm).kernel_alloc_node) {
+                    continue;
+                }
+                if object.is_some_and(|object| (*va).gem.obj != object.as_raw()) {
                     continue;
                 }
                 let driver_va = crate::container_of!(va, GpuVa<T>, gpuva);
