@@ -1208,19 +1208,66 @@ static int apple_dart_check_fw_map(struct apple_dart_domain *domain, u64 dva,
 	return 0;
 }
 
+static phys_addr_t
+apple_dart_inherited_phys(struct apple_dart_domain *domain, dma_addr_t address)
+{
+	struct apple_dart_atomic_stream_map *map;
+	phys_addr_t result = 0;
+	int i, sid;
+
+	for_each_stream_map(i, domain, map) {
+		struct apple_dart *dart = map->dart;
+		unsigned long flags;
+		size_t entries = dart->pgsize / sizeof(u64);
+		size_t page = (address / dart->pgsize) % entries;
+		size_t slot = address / dart->pgsize / entries;
+
+		if (!dart->locked || !dart->fw_mirror || slot >= entries)
+			return 0;
+		spin_lock_irqsave(&dart->lock, flags);
+		for (sid = 0; sid < dart->num_streams; sid++) {
+			struct apple_dart_fw_root *fw;
+			phys_addr_t phys;
+			int prot;
+
+			if (!(atomic_long_read(&map->sidmap[BIT_WORD(sid)]) & BIT_MASK(sid)))
+				continue;
+			fw = dart->locked_fw[sid][0];
+			if (!apple_dart_fw_slot_owned(fw, dart->locked_ttbr[sid][0], slot) ||
+			    !apple_dart_fw_leaf_decode(READ_ONCE(fw->leaf[slot][page]),
+						       address, &phys, &prot) ||
+			    (result && result != phys)) {
+				spin_unlock_irqrestore(&dart->lock, flags);
+				return 0;
+			}
+			result = phys;
+		}
+		spin_unlock_irqrestore(&dart->lock, flags);
+	}
+	return result;
+}
+
 static phys_addr_t apple_dart_iova_to_phys(struct iommu_domain *domain,
 					   dma_addr_t iova)
 {
 	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
 	struct io_pgtable_ops *ops = dart_domain->pgtbl_ops;
+	struct io_pgtable_cfg *cfg;
+	phys_addr_t phys;
+	dma_addr_t address;
 
 	if (!ops)
 		return 0;
 
-	/* Reserved firmware mappings are also represented in this software table. */
-	return ops->iova_to_phys(ops,
-				 (iova + dart_domain->dma_offset) &
-				 dart_domain->mask);
+	address = (iova + dart_domain->dma_offset) & dart_domain->mask;
+	phys = ops->iova_to_phys(ops, address);
+	if (phys)
+		return phys;
+	cfg = &io_pgtable_ops_to_pgtable(ops)->cfg;
+	if (cfg->apple_dart_cfg.n_levels != 3)
+		return 0;
+	/* Existing firmware translations need no replacement software mapping. */
+	return apple_dart_inherited_phys(dart_domain, address);
 }
 
 static int apple_dart_map_pages(struct iommu_domain *domain, unsigned long iova,
@@ -1425,6 +1472,25 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 	dart_domain->domain.geometry.aperture_end = dma_max;
 	dart_domain->domain.geometry.force_aperture = true;
 	dart_domain->dma_offset = dart->dma_offset;
+
+	if (pgtbl_cfg.apple_dart_cfg.n_levels == 3) {
+		struct apple_dart_stream_map *stream;
+		int index;
+
+		/* Make inherited translations visible before core reservation setup. */
+		for_each_stream_map(i, cfg, stream) {
+			if (!stream->dart->locked || !stream->dart->fw_mirror)
+				continue;
+			for (index = 0; index < pgtbl_cfg.apple_dart_cfg.n_ttbrs; index++) {
+				ret = apple_dart_hw_map_locked_ttbr(stream, index);
+				if (ret) {
+					free_io_pgtable_ops(dart_domain->pgtbl_ops);
+					dart_domain->pgtbl_ops = NULL;
+					goto done;
+				}
+			}
+		}
+	}
 
 	dart_domain->finalized = true;
 
