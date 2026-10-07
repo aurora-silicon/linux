@@ -197,7 +197,6 @@ impl Queue {
         self.spared_quarantine = false;
         self.retire_pending = false;
         self.retirement_ready = false;
-        self.update_slot_accounting();
         Ok(())
     }
 }
