@@ -771,17 +771,20 @@ void dcp_external_retry_work(struct work_struct *work)
 					     external_retry_wq);
 	struct apple_connector *connector = READ_ONCE(dcp->connector);
 	u64 generation = READ_ONCE(dcp->external_retry_generation);
+	bool released;
 
 	if (READ_ONCE(dcp->typec_generation) != generation) {
 		dev_info(dcp->dev, "display retry: the display was attached or detached since; dropped\n");
 		return;
 	}
+	/* Kept connected through a withdrawal, and not described again. */
+	released = iomfb_v14_7_external_release(dcp);
 	if (iomfb_v14_7_external_failed(dcp)) {
 		dev_err(dcp->dev, "display retry: the external display processor stopped; no retry until reboot\n");
 		return;
 	}
 	/* Described again: re-apply the mode if it is not set. */
-	if (connector && READ_ONCE(connector->connected)) {
+	if (!released && connector && READ_ONCE(connector->connected)) {
 		if (READ_ONCE(dcp->mode_state.valid)) {
 			dev_info(dcp->dev, "display retry: the display is back and set\n");
 			return;

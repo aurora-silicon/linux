@@ -107,6 +107,47 @@ static void dcp_mode_disconnected_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, state.valid);
 }
 
+/* A withdrawn mode keeps the connector connected and flushes vblanks once. */
+static void dcp_mode_withdraw_idle_test(struct kunit *test)
+{
+	struct dcp_mode_state state = { .valid = true };
+	bool connected = true;
+
+	spin_lock_init(&state.lock);
+	KUNIT_EXPECT_EQ(test, dcp_mode_withdraw(&state), (unsigned int)DCP_HOTPLUG_VBLANK);
+	KUNIT_EXPECT_TRUE(test, connected);
+	KUNIT_EXPECT_FALSE(test, state.valid);
+	/* Described again: no state change, so no notification from here. */
+	KUNIT_EXPECT_EQ(test, dcp_mode_hotplug(&state, true, &connected), 0U);
+	KUNIT_EXPECT_TRUE(test, connected);
+	KUNIT_EXPECT_FALSE(test, state.valid);
+	/* Not described again: the disconnect notifies once. */
+	KUNIT_EXPECT_EQ(test, dcp_mode_hotplug(&state, false, &connected),
+			(unsigned int)(DCP_HOTPLUG_VBLANK | DCP_HOTPLUG_NOTIFY));
+	KUNIT_EXPECT_FALSE(test, connected);
+	KUNIT_EXPECT_EQ(test, dcp_mode_hotplug(&state, false, &connected),
+			(unsigned int)DCP_HOTPLUG_VBLANK);
+}
+
+/* During a modeset the withdrawal is deferred: one notification, mode invalid. */
+static void dcp_mode_withdraw_modeset_test(struct kunit *test)
+{
+	struct dcp_mode_state state = { };
+	bool connected = true;
+
+	spin_lock_init(&state.lock);
+	dcp_mode_begin(&state);
+	KUNIT_EXPECT_EQ(test, dcp_mode_withdraw(&state), 0U);
+	KUNIT_EXPECT_EQ(test, dcp_mode_finish(&state, true, &connected),
+			(unsigned int)DCP_HOTPLUG_NOTIFY);
+	KUNIT_EXPECT_TRUE(test, connected);
+	KUNIT_EXPECT_FALSE(test, state.valid);
+	/* The replay that notification asks for can then succeed. */
+	dcp_mode_begin(&state);
+	KUNIT_EXPECT_EQ(test, dcp_mode_finish(&state, true, &connected), 0U);
+	KUNIT_EXPECT_TRUE(test, state.valid);
+}
+
 static struct kunit_case dcp_mode_cases[] = {
 	KUNIT_CASE(dcp_mode_success_test),
 	KUNIT_CASE(dcp_mode_failure_test),
@@ -115,6 +156,8 @@ static struct kunit_case dcp_mode_cases[] = {
 	KUNIT_CASE(dcp_mode_transient_disconnect_test),
 	KUNIT_CASE(dcp_mode_invalidation_order_test),
 	KUNIT_CASE(dcp_mode_disconnected_test),
+	KUNIT_CASE(dcp_mode_withdraw_idle_test),
+	KUNIT_CASE(dcp_mode_withdraw_modeset_test),
 	{ }
 };
 

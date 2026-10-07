@@ -165,6 +165,13 @@ struct apple_dcp {
 	/* typec_generation when the pending retry was queued */
 	u64 external_retry_generation;
 	/*
+	 * Native: the connector is kept connected while the display is
+	 * described again, until the pending retry, once per connection
+	 * (typec_generation + 1 of the last hold); see iomfb_v14_7.c.
+	 */
+	atomic_t external_held;
+	u64 external_held_connection;
+	/*
 	 * Native: DRM unbound this pipe; firmware callbacks leave its
 	 * connector and CRTC alone. Set under the session lock.
 	 */

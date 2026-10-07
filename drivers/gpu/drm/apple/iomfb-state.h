@@ -52,6 +52,26 @@ static inline void dcp_mode_invalidate(struct dcp_mode_state *state)
 	spin_unlock_irqrestore(&state->lock, flags);
 }
 
+/*
+ * The display's mode went away while its connector stays connected. A
+ * modeset in flight finishes invalid and notifies once (dcp_mode_finish());
+ * otherwise the vblanks waiting on the mode are flushed.
+ */
+static inline unsigned int dcp_mode_withdraw(struct dcp_mode_state *state)
+{
+	unsigned long flags;
+	unsigned int action = DCP_HOTPLUG_NONE;
+
+	spin_lock_irqsave(&state->lock, flags);
+	state->valid = false;
+	if (state->changing)
+		state->invalidated = true;
+	else
+		action = DCP_HOTPLUG_VBLANK;
+	spin_unlock_irqrestore(&state->lock, flags);
+	return action;
+}
+
 /* The caller holds state->lock. */
 static inline unsigned int
 dcp_mode_apply_hotplug(struct dcp_mode_state *state, bool connected,
