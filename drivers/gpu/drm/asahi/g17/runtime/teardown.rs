@@ -32,6 +32,7 @@ impl Reclaim {
             Self::Binding(binding) => drop(binding),
             Self::Context(context) => {
                 context.release_execution();
+                drop(context.take_render_pool());
                 drop(context);
             }
         }

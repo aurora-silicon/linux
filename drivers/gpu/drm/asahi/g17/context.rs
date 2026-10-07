@@ -273,6 +273,12 @@ impl Context {
         *render = Some(pool.clone());
         Ok(pool)
     }
+    /// Drops the pool once its free-list release is consumed and the closed
+    /// scheduler is detached. Installed compute bindings may retain the
+    /// context itself until replacement; they never use the render pool.
+    pub(crate) fn take_render_pool(&self) -> Option<Arc<RenderPool>> {
+        self.render.lock().take()
+    }
     pub(crate) fn render_pools_released(&self, released: impl Fn(u32, u64) -> bool) -> bool {
         self.render
             .lock()
