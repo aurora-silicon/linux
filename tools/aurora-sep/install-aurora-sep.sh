@@ -470,7 +470,7 @@ M3_GPU_EXPERIMENT=0
 M3_GPU_BIN=/usr/local/bin
 M3_GPU_SCRIPTS=(
   "air-gpu-oneshot.sh d0259869b8519439a4dbcdae08ef1b0e17fdcaf84ac746fca61febf6a325f8aa"
-  "air-gpu-collect.sh ac11914e55a8f3a4652b7796ce423f17364e26725e5edd78a9d4d2136adc76de"
+  "air-gpu-collect.sh face8fac811b59c31a8e98e6ca704a2cb33eceada8bc37986397cb393b050b30"
   "air-gpu-job.sh f76e57154e96165daf8834508975a98f745519ab1b51ac2edae4f5710edae349"
 )
 # The G15G Mesa build: its prefix package as "file sha256" (a pacman package that installs Mesa

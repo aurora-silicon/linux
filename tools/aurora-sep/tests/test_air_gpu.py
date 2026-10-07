@@ -1037,6 +1037,59 @@ main {' '.join(args)}
         self.assertNotIn("/home/alice/", text)
         self.assertIn("] host kernel:", files["kernel-log-boot0.txt"])
 
+    def test_no_host_name_anywhere_in_the_archive(self):
+        # The host name (and its FQDN, and a name an earlier boot had) planted in every kind of
+        # file the tgz holds: kernel log (journal host column and systemd's "Hostname set to"),
+        # dmesg, the GPU and firmware logs, the job journal lines, a job record, debugfs, and a
+        # raw dump. None of them may survive anywhere in the archive.
+        names = (b"myhost-4711", b"oldname-99", b"/home/alice/")
+        host = ("host_names() { printf '%s\\n' myhost-4711.example.lan myhost-4711; }\n")
+        armed_log = (PROBE + RTKIT + PUBLISH + ACCEPT
+                     + "[ 0.5] host systemd[1]: Hostname set to <myhost-4711>.\n"
+                     + DEV + "M3 firmware readiness: on myhost-4711.example.lan\n")
+        self.journal(-1, ARMED, armed_log.replace("] host ", "] oldname-99 "))
+        self.journal(0, CMDLINE, PROBE)
+        (self.fake / "dmesg.txt").write_text("[ 0.4] systemd[1]: Hostname set to <myhost-4711>.\n"
+                                             "[ 0.5] myhost-4711.example.lan: a message\n")
+        rec = self.home / "air-gpu-runs/job-1.txt"
+        rec.write_text("boot_id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nprefix=/home/alice/p\nnote=myhost-4711\n" + REC_PASS)
+        (self.fake / "jobs--1.txt").write_text(
+            f"start: 5 s through /home/alice/p on myhost-4711, record {rec}\n"
+            f"result: pass (exit 0, 5000 ms, 400 submissions) stage finished record {rec}\n")
+        (self.mac.tmp / "debug/asahi-m3/progress").write_text("version=1 host=myhost-4711\n")
+        dcd = self.mac.tmp / "sys/class/devcoredump/devcd3/data"
+        dcd.parent.mkdir(parents=True)
+        dcd.write_bytes(b"\0dump myhost-4711 \0" * 4)
+        self.arm_record("1007-120000")
+        proc = self.mac.run(COLLECT, f"export FAKE='{self.fake}'\n" + f"""
+DEBUGFS='{self.mac.tmp}/debug'
+SYS='{self.mac.tmp}/sys'
+BOOT_ID='{self.boot_id}'
+STATE_DIR='{self.statedir}'
+EXTRA_HOMES=''
+user_home() {{ echo '{self.home}'; }}
+{host}main --include-dumps
+""", check=True)
+        self.assertIn("AIR-GPU VERDICT: JOB-COMPLETED | boot -1", proc.stdout)
+        for n in names:
+            self.assertNotIn(n.decode(), proc.stdout)
+        tgz = list(self.home.glob("air-gpu-collect-*.tgz"))
+        self.assertEqual(len(tgz), 1)
+        with tarfile.open(tgz[0]) as tf:
+            members = [m for m in tf.getmembers() if m.isfile()]
+            kinds = {m.name.split("/", 1)[1] for m in members}
+            for m in members:
+                data = tf.extractfile(m).read()
+                for n in names:
+                    with self.subTest(member=m.name, name=n):
+                        self.assertNotIn(n, data)
+                        self.assertNotIn(n.decode(), m.name)
+        # Every kind of file the test planted the name in is in the archive.
+        for k in ("kernel-log-boot-1.txt", "dmesg-boot0.txt", "gpu-log.txt", "firmware-log.txt",
+                  "jobs/journal.txt", "jobs/job-1.txt", "jobs/evidence.tsv", "debugfs-asahi-m3.txt",
+                  "devcd3.bin", "summary.txt", "system.txt"):
+            self.assertIn(k, kinds)
+
     def test_an_empty_arming_record_counts_as_none(self):
         (self.statedir / "armed").write_text("")
         self.journal(0, CMDLINE, PROBE)

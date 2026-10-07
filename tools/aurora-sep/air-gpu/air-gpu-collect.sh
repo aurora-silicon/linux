@@ -502,6 +502,61 @@ crash_override() { # LOG
   VERDICT=FW-CRASHED VERDICT_SRC="kernel-log (crash line)"
 }
 
+# ---- privacy ---------------------------------------------------------------------------------
+
+# The host names to mask: this boot's (uname), the static and transient ones, and the FQDN, each
+# with its short form; longest first. Generic names (localhost, the distribution's default) and
+# names under 3 characters are left alone: masking them would garble unrelated text. Only names
+# made of letters, digits, '.' and '-' are used, so none needs escaping beyond the '.'.
+host_names() {
+  local n
+  {
+    uname -n 2>/dev/null
+    cat /etc/hostname 2>/dev/null
+    hostnamectl hostname 2>/dev/null
+    hostnamectl --static 2>/dev/null
+    hostname -f 2>/dev/null
+  } | tr -d '[:blank:]\r' | while IFS= read -r n; do
+    [[ -n $n ]] || continue
+    echo "$n"
+    echo "${n%%.*}"
+  done | grep -E '^[A-Za-z0-9][A-Za-z0-9.-]{2,}$' | grep -vixE 'localhost|localhost\.localdomain|archlinux|omarchy|localdomain' |
+    awk '{ print length, $0 }' | sort -rn | cut -d' ' -f2- | awk '!seen[$0]++'
+  return 0
+}
+
+# Masks host and user names in every file under DIR, as the last step before the tgz is built:
+#   - every occurrence of a name from host_names becomes "host" (in a binary dump, the same
+#     number of 'x' bytes, so its layout is kept);
+#   - "Hostname set to <...>" (systemd's line) becomes "Hostname set to <host>", whatever the name
+#     was in the boot the line comes from;
+#   - in the journal-format files (the kernel log and the two files grep makes from it), the host
+#     column after the timestamp becomes "host" on every line (an earlier boot may have had
+#     another name);
+#   - home directories become /home/USER/.
+mask_tree() { # DIR [journal-format files in it...]
+  local dir=$1 f n esc
+  shift
+  local -a text=() bin=()
+  while IFS= read -r n; do
+    esc=${n//./\\.}
+    text+=(-e "s/$esc/host/g")
+    bin+=(-e "s/$esc/$(printf '%*s' "${#n}" '' | tr ' ' x)/g")
+  done < <(host_names)
+  text+=(-e 's/Hostname set to <[^>]*>/Hostname set to <host>/g' -e 's#/home/[^/[:space:]]+/#/home/USER/#g')
+  while IFS= read -r -d '' f; do
+    if [[ $f == *.bin ]]; then
+      ((${#bin[@]} == 0)) || sed -i -E "${bin[@]}" -- "$f"
+    else
+      sed -i -E "${text[@]}" -- "$f"
+    fi
+  done < <(find "$dir" -type f -print0)
+  for f in "$@"; do
+    [[ -f $f ]] && sed -i -E 's/^(\[ *[0-9.]+\]) [^ ]+ /\1 host /' -- "$f"
+  done
+  return 0
+}
+
 # ---- collection ------------------------------------------------------------------------------
 
 smc_keys_file() { find "$DEBUGFS" -maxdepth 3 -name keys -path '*smc*' 2>/dev/null | head -1; }
@@ -691,13 +746,13 @@ main() {
     echo "jobs: $(awk 'NF' "$d/jobs/evidence.tsv" | wc -l) (record files ${#recs[@]}, state $JOB_STATE${JOB_SRC:+, from $JOB_SRC}); kernel log from the $KLOG_SRC"
   } >"$d/summary.txt"
 
-  # No host name or user name in the tgz (it is meant for a public issue): the journal's host field
-  # becomes "host", and home directories become /home/USER.
-  local t
-  for t in "$d"/*.txt "$d"/jobs/*; do
-    [[ -f $t ]] || continue
-    sed -i -E 's/^(\[ *[0-9.]+\]) [^ ]+ kernel:/\1 host kernel:/; s#/home/[^/ ]+/#/home/USER/#g' "$t"
-  done
+  # No host name or user name in the tgz (it is meant for a public issue): a last pass over every
+  # file staged for it.
+  if [[ $KLOG_SRC == journal ]]; then
+    mask_tree "$d" "$log" "$d/gpu-log.txt" "$d/firmware-log.txt"
+  else
+    mask_tree "$d"
+  fi
   # Build the tgz in the work dir (root-owned temp), then copy it out as the user.
   local base summary
   base=$(basename "$out")
