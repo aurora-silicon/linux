@@ -14,6 +14,13 @@ use kernel::{
 };
 
 const ADMISSION_WAIT_MS: u32 = 1000;
+/// A VM whose last accepted job ended more recently than this is still in
+/// use: evicting its backing would be restored by its next job.
+const RECLAIM_QUIET_NS: u64 = 500_000_000;
+
+fn now_ns() -> u64 {
+    <kernel::time::Monotonic as kernel::time::ClockSource>::ktime_get() as u64
+}
 
 pub(super) struct DriverMappings {
     mappings: KVec<KernelMapping>,
@@ -49,6 +56,8 @@ impl DriverMappings {
 
 struct State {
     active: usize,
+    /// Monotonic time the VM last had no accepted job (0 = never had one).
+    quiet_since: u64,
     commits: usize,
     blocked: bool,
     quarantined: bool,
@@ -76,13 +85,15 @@ impl VmLifetime {
             state.active == 0 && state.commits == 0
                 && !state.blocked && !state.quarantined && !state.draining
                 && !state.closed && !state.cleanup_failed
+                && (state.quiet_since == 0
+                    || now_ns().saturating_sub(state.quiet_since) >= RECLAIM_QUIET_NS)
         })
     }
 
     pub(super) fn new() -> Result<Arc<Self>> {
         Arc::pin_init(
             pin_init!(Self {
-                state <- new_mutex!(State { active:0, commits:0, blocked:false,
+                state <- new_mutex!(State { active:0, quiet_since:0, commits:0, blocked:false,
                     quarantined:false, draining:false, closed:false, cleanup_failed:false, close_ranges:None,
                     unmaps:KVec::new(), objects:KVec::new() }, "VM job lifetime"),
                 changed <- new_condvar!("VM mapping admission"),
@@ -569,6 +580,7 @@ impl Drop for VmJobGuard {
         if state.active != 0 {
             return;
         }
+        state.quiet_since = now_ns();
         state.draining = true;
         drop(state);
         self.vm.drain_mappings(lifetime);
