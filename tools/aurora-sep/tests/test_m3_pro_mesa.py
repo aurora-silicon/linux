@@ -98,6 +98,18 @@ def same_commands(tc, before, after):
     tc.assertEqual([l for l in b if not l.startswith("sudo ")], [l for l in a if not l.startswith("sudo ")])
 
 
+def as_this_release(run, old, new):
+    """A run of an earlier release's script with its release number read as this one's. A release
+    names its own packages, tag and boot.bin copy; nothing else may differ."""
+    if old == new:
+        return run
+    ob, nb = old.encode(), new.encode()
+    out = dict(run)
+    out["log"] = run["log"].replace(old, new)
+    out["tree"] = {k.replace(old, new): v.replace(ob, nb) for k, v in run["tree"].items()}
+    return out
+
+
 def run_with(tc, installer, board, run, setup=None):
     """Runs `run` with `installer` on a fresh fake `board` (after `setup`), and returns what is
     compared: the exit statuses, the command log and every file a run can touch."""
@@ -1230,9 +1242,7 @@ class OtherMacsTest(flow.M3FlowBase):
             with self.subTest(board=board):
                 before = run_with(self, self.old, board, run, setup)
                 after = run_with(self, flow.INSTALLER, board, run, setup)
-                if self.old_version != VERSION:
-                    before = {k: (v.replace(self.old_version, VERSION) if k == "log" else v)
-                              for k, v in before.items()}
+                before = as_this_release(before, self.old_version, VERSION)
                 self.assertEqual(after["codes"], before["codes"])
                 same_commands(self, before["log"], after["log"])
                 self.assertEqual(sorted(after["tree"]), sorted(before["tree"]))

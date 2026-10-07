@@ -1233,6 +1233,18 @@ class SameAs122Test(MaxBase):
             self.skipTest(f"git can't show 12.2's script ({REL_12_2})")
         self.old = self.tmp / "install-12.2.sh"
         self.old.write_bytes(old.stdout)
+        self.old_version = re.search(rb"^VERSION=(\S+)$", old.stdout, re.M).group(1).decode()
+
+    def as_this_release(self, run):
+        # 12.2's run with its release number read as this one's: a release names its own packages,
+        # tag and boot.bin copy, and nothing else may differ.
+        old, new = self.old_version, VERSION
+        if old == new:
+            return run
+        ob, nb = old.encode(), new.encode()
+        return {"codes": run["codes"], "log": run["log"].replace(old, new),
+                "tree": {k.replace(old, new): v.replace(ob, nb) for k, v in run["tree"].items()},
+                "out": [x.replace(old, new) if x else x for x in run["out"]]}
 
     def boards(self):
         for board, compat in flow.BOARDS.items():
@@ -1276,7 +1288,7 @@ class SameAs122Test(MaxBase):
         seen = []
         for board in self.boards():
             with self.subTest(board=board):
-                before = self.run_with(self.old, board)
+                before = self.as_this_release(self.run_with(self.old, board))
                 after = self.run_with(flow.INSTALLER, board)
                 seen.append(board)
                 self.assertEqual(after["codes"], before["codes"])
