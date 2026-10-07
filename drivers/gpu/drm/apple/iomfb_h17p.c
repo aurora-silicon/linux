@@ -258,17 +258,12 @@ static bool trampoline_swap_info_h17p(struct apple_dcp *dcp, int tag,
 }
 
 /*
- * D400 (get_property) is left unhandled: the zeroed reply means "no such
- * property". The firmware then runs without a panel power model, as it does
- * for its other optional power properties.
+ * D400 has a measured size but no admitted property-reply semantics. It stays
+ * unhandled, so the measured H17P profile stops instead of guessing a reply.
+ * H17G retains its existing missing-property response.
  */
 
-/*
- * H17P callback numbering.  It is not a uniform shift of the v13.5 table: the
- * service-creation block is D108..D113 exactly as on v13.5, and the swap
- * completion is D590.  A callback with no entry here is answered with a
- * zeroed reply by dcpep_handle_cb().
- */
+/* H17P callback numbering is not a uniform shift of the v13.5 table. */
 static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[0] = dcpep_cb_d000_h17p, /* acked after a nested A033 */
 	[1] = trampoline_true,
