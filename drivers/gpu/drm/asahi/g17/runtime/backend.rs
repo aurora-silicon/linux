@@ -138,12 +138,6 @@ impl job::Backend for Backend {
                 Engine::Render => self.render_packet(&packet, &mut deferred),
             }
         };
-        if result.as_ref().is_err_and(|error| *error == ENOSPC) {
-            crate::g17::queue_stats::note_submit_enospc(match packet.engine() {
-                Engine::Compute => "compute-publish",
-                Engine::Render => "render-publish",
-            });
-        }
         self.release_backlog(&packet);
         self.finish_publication(&packet, result, &mut deferred)
     }

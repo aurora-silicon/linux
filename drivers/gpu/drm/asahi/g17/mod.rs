@@ -44,7 +44,6 @@ mod runtime;
 pub(crate) mod status;
 mod teardown;
 mod timeout;
-mod queue_stats;
 mod validation;
 
 use core::any::Any;

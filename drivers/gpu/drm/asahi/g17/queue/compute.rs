@@ -364,7 +364,6 @@ impl Backing {
 /// Installed graph and its exact logical owner. A released idle graph may change owners only
 /// after a retirement witness. Failed work retains its pointers independently of fence state.
 pub(crate) struct Queue {
-    slot_accounting: crate::g17::queue_stats::ComputeAccount,
     owner: Option<u64>,
     binding: Binding,
     previous: Option<Previous>,
@@ -414,7 +413,6 @@ impl Queue {
         context.mark_published();
         Ok(Self {
             owner: Some(owner),
-            slot_accounting: crate::g17::queue_stats::ComputeAccount::new(),
             binding,
             previous: None,
             kick,
@@ -449,11 +447,6 @@ impl Queue {
     pub(crate) fn qid(&self) -> u8 {
         self.kick.id().qid()
     }
-    fn update_slot_accounting(&mut self) {
-        self.slot_accounting.update(self.owner.is_some(), self.released,
-            self.quarantined, self.retired_by_teardown);
-    }
-
     pub(crate) fn owner(&self) -> Option<u64> {
         self.owner
     }
@@ -601,7 +594,6 @@ impl Queue {
             self.failure_status_pending = true;
             self.retirement_proved = false;
             self.retired_by_teardown = false;
-            self.update_slot_accounting();
             let all_spared =
                 self.active.len != 0 && self.active.iter().all(|a| a.packet.completion.spared());
             self.spared_quarantine = all_spared && error == ENODATA;
@@ -707,7 +699,6 @@ impl Queue {
                     self.retirement_ready = self.active.len == 0;
                     if self.released && self.retirement_ready {
                         self.owner = None;
-                        self.update_slot_accounting();
                     }
                 }
                 Ok(None) | Err(EAGAIN) => {
@@ -814,7 +805,6 @@ impl Queue {
             self.submitted = 0;
             self.kick.clear_parent_after_recovery();
             self.quarantined = false;
-            self.update_slot_accounting();
             self.retire_pending = false;
             self.retirement_ready = true;
             if self
@@ -826,7 +816,6 @@ impl Queue {
             }
             if self.released {
                 self.owner = None;
-                self.update_slot_accounting();
             }
         }
         Ok(())
@@ -969,7 +958,6 @@ impl Queue {
         self.released = false;
         self.retirement_ready = false;
         self.retired_by_teardown = false;
-        self.update_slot_accounting();
         Ok(())
     }
     /// True allows the registry to cancel the never-published QID and drop this graph. An
@@ -979,13 +967,11 @@ impl Queue {
             return Ok(true);
         }
         self.released = true;
-        self.update_slot_accounting();
         if self.active.len == 0 && !self.quarantined {
             if let Some(previous) = self.previous.as_ref().filter(|p| p.publication.is_none()) {
                 if let Err(error) = self.graph.set_owner(&previous.context) {
                     self.quarantined = true;
                     self.retired_by_teardown = true;
-                    self.update_slot_accounting();
                     return Err(error);
                 }
                 let mut previous = self.previous.take().ok_or(EIO)?;
@@ -998,7 +984,6 @@ impl Queue {
             }
             if self.retirement_ready {
                 self.owner = None;
-                self.update_slot_accounting();
             }
         }
         Ok(false)
@@ -1066,7 +1051,6 @@ impl Queue {
         }
         self.released = true;
         self.retired_by_teardown = true;
-        self.update_slot_accounting();
         if let Some(active) = self
             .active
             .iter_mut()
