@@ -717,6 +717,14 @@ class AdtTest(MaxBase):
         self.assertEqual(self.modprobes(), ["modprobe phram", "modprobe -r phram"])
         self.assert_restored(check)
 
+    def test_an_oversized_region_is_not_loaded(self):
+        n = self.tmp / "dt/reserved-memory/flash@10003528000/reg"
+        n.write_bytes(n.read_bytes()[:8] + u32(0) + u32(0x2000000))
+        allow, check = self.files()
+        self.assertIn("the adt region is 33554432 bytes, not 1 to 16777216", allow)
+        self.assertEqual(self.modprobes(), [])
+        self.assertIn("restored: yes", check)
+
     def test_a_device_bound_to_another_node_is_not_read(self):
         self.platform("10003528000.flash", "reserved-memory/flash@108d994c000")
         allow, check = self.files()

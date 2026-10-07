@@ -2426,6 +2426,8 @@ m3_adt_reader() {
   echo "$M3_WORK/$file"
 }
 
+# The largest adt region the report reads (an ADT is well under 1 MiB).
+M3_ADT_MAX_BYTES=$((16 * 1024 * 1024))
 # The on-demand ADT read's state, for the traps: whether this run loaded phram, and the reader.
 M3_PHRAM_LOADED=0
 M3_ADT_PID=""
@@ -2529,6 +2531,9 @@ m3_report_adt() { # DIR
     if [[ $reg =~ ^0x[0-9a-f]+\+0x([0-9a-f]{1,15})$ ]]; then
       want=$((16#${BASH_REMATCH[1]}))
       echo "region: ${node#"$DT"} reg $reg ($want bytes)" >>"$log"
+      if ((want == 0 || want > M3_ADT_MAX_BYTES)); then
+        why="the adt region is $want bytes, not 1 to $M3_ADT_MAX_BYTES, so the ADT was not read"
+      fi
     else
       why="the adt region's reg ($reg) is not one address and size, so the ADT was not read"
     fi
