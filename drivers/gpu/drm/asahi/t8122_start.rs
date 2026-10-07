@@ -14,7 +14,7 @@
 //! |---|---|---|
 //! | `asahi.t8122_initdata_version` | `0x0c08e21e83800490`, the G15 14.8.3 version | any |
 //! | `asahi.t8122_fender` | `0x104000` (`rule`) | `0x12c000` (`adt`) |
-//! | `asahi.t8122_clkgen` | `e5c`: SGX+0xe5c000, read-only | `e1c`: SGX+0xe1c000, read-only; `none` |
+//! | `asahi.t8122_clkgen` | `e1c`: SGX+0xe1c000, read-only | `e5c`: SGX+0xe5c000, read-only; `none` |
 //! | `asahi.t8122_sgx_setup` | `none` | `t6030`: SGX+0xd14000 = 0x70001 |
 //! | `asahi.t8122_unit_mask_a` | `0x700000001` | nonzero, within `0x700000001` |
 //! | `asahi.t8122_unit_mask_b` | `0x3` | nonzero, within `0x7` |
@@ -71,7 +71,7 @@ const fn mappings(fender: u32, clock_gen: u64) -> [IoMapping; 12] {
 /// The runtime IO maps, laid out once for the larger Fender window so that no slot's firmware
 /// VA depends on the parameters.
 const LAYOUT: [IoMap; 12] =
-    storage::pack_iomaps(&mappings(FENDER_ADT, CLOCK_GEN_E5C), storage::IOMAP_BASE);
+    storage::pack_iomaps(&mappings(FENDER_ADT, CLOCK_GEN_E1C), storage::IOMAP_BASE);
 
 const fn iomaps(fender: u32, clock_gen: u64) -> [IoMap; 12] {
     let mut m = LAYOUT;
@@ -279,8 +279,8 @@ pub(crate) fn arm(dev: &device::Device, soc: &Soc) -> Result<Option<Experiment>>
         v.initdata_version,
         v.fender,
         match v.clock_gen {
-            ClockGen::At(CLOCK_GEN_E5C) => "e5c(sgx+0xe5c000,ro)",
-            ClockGen::At(_) => "e1c(sgx+0xe1c000,ro)",
+            ClockGen::At(CLOCK_GEN_E1C) => "e1c(sgx+0xe1c000,ro)",
+            ClockGen::At(_) => "e5c(sgx+0xe5c000,ro)",
             ClockGen::Absent => "none",
         },
         match v.sgx_setup {

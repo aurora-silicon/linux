@@ -13,9 +13,10 @@ pub(crate) const INVALID: u64 = u64::MAX - 1;
 /// the whole ADT sgx reg[1].
 pub(crate) const FENDER_RULE: u32 = 0x10_4000;
 pub(crate) const FENDER_ADT: u32 = 0x12_c000;
-/// The GPU clock-generator offsets in SGX: the T6030 one, and the ported T8122 table's.
-pub(crate) const CLOCK_GEN_E5C: u64 = 0xe5_c000;
+/// The GPU clock-generator offsets in SGX: the ported T8122 table's (the default), and the
+/// T6030 one.
 pub(crate) const CLOCK_GEN_E1C: u64 = 0xe1_c000;
+pub(crate) const CLOCK_GEN_E5C: u64 = 0xe5_c000;
 /// The SGX setup write of T6030 (offset, value).
 pub(crate) const T6030_SGX_SETUP: (usize, u32) = (0xd1_4000, 0x7_0001);
 /// The default unit masks: each T6030 mask (0x7_0000_0003, 0x7) with one bit cleared, values a
@@ -56,7 +57,7 @@ pub(crate) fn parse_fender(text: &str) -> u64 {
 }
 
 pub(crate) fn parse_clkgen(text: &str) -> u64 {
-    parse(text, &[("e5c", CLOCK_GEN_E5C), ("e1c", CLOCK_GEN_E1C), ("none", 0)])
+    parse(text, &[("e1c", CLOCK_GEN_E1C), ("e5c", CLOCK_GEN_E5C), ("none", 0)])
 }
 
 pub(crate) fn parse_sgx_setup(text: &str) -> u64 {
@@ -172,10 +173,10 @@ pub(crate) fn resolve(raw: &Raw) -> Result<Values, Refusal> {
         Some(v) if v == FENDER_RULE as u64 || v == FENDER_ADT as u64 => v as u32,
         _ => return Err(refuse("t8122_fender", "0x104000 or rule, 0x12c000 or adt")),
     };
-    let clock_gen = match given(raw.clkgen, CLOCK_GEN_E5C) {
+    let clock_gen = match given(raw.clkgen, CLOCK_GEN_E1C) {
         Some(0) => ClockGen::Absent,
-        Some(v) if v == CLOCK_GEN_E5C || v == CLOCK_GEN_E1C => ClockGen::At(v),
-        _ => return Err(refuse("t8122_clkgen", "e5c, e1c or none")),
+        Some(v) if v == CLOCK_GEN_E1C || v == CLOCK_GEN_E5C => ClockGen::At(v),
+        _ => return Err(refuse("t8122_clkgen", "e1c, e5c or none")),
     };
     let sgx_setup = match given(raw.sgx_setup, 0) {
         Some(0) => None,
@@ -230,7 +231,7 @@ mod tests {
         let v = resolve(&with(|_| {})).unwrap();
         assert_eq!(v.initdata_version, 0x0c08_e21e_8380_0490);
         assert_eq!(v.fender, 0x10_4000);
-        assert_eq!(v.clock_gen, ClockGen::At(0xe5_c000));
+        assert_eq!(v.clock_gen, ClockGen::At(0xe1_c000));
         assert_eq!(v.sgx_setup, None);
         assert_eq!((v.unit_mask_a, v.unit_mask_b), (0x7_0000_0001, 3));
         assert_eq!(v.pstate_cap, 2);
@@ -241,7 +242,7 @@ mod tests {
         let v = resolve(&with(|r| {
             r.initdata_version = parse_number("0x123456789abcdef0");
             r.fender = parse_fender("adt");
-            r.clkgen = parse_clkgen("e1c");
+            r.clkgen = parse_clkgen("e5c");
             r.sgx_setup = parse_sgx_setup("t6030");
             r.unit_mask_a = parse_number("1");
             r.unit_mask_b = parse_number("0x1");
@@ -250,7 +251,7 @@ mod tests {
         .unwrap();
         assert_eq!(v.initdata_version, 0x1234_5678_9abc_def0);
         assert_eq!(v.fender, 0x12_c000);
-        assert_eq!(v.clock_gen, ClockGen::At(0xe1_c000));
+        assert_eq!(v.clock_gen, ClockGen::At(0xe5_c000));
         assert_eq!(v.sgx_setup, Some((0xd1_4000, 0x7_0001)));
         assert_eq!((v.unit_mask_a, v.unit_mask_b, v.pstate_cap), (1, 1, 8));
         let v = resolve(&with(|r| r.clkgen = parse_clkgen("none"))).unwrap();
@@ -259,6 +260,7 @@ mod tests {
         assert_eq!(parse_fender("0x104000"), parse_fender("rule"));
         assert_eq!(parse_fender(" 0x12C000 "), parse_fender("adt"));
         assert_eq!(parse_clkgen("0xe5c000"), parse_clkgen("e5c"));
+        assert_eq!(parse_clkgen("0xe1c000"), parse_clkgen("e1c"));
         assert_eq!(parse_clkgen("0"), parse_clkgen("none"));
         assert_eq!(parse_sgx_setup("1"), parse_sgx_setup("t6030"));
     }

@@ -516,7 +516,7 @@ m3_param!("t8122_initdata_version", T8122_INITDATA_VERSION, parse_t8122_number);
 /// `asahi.t8122_fender=0x104000|0x12c000` (`rule`, `adt`): the Fender window size.
 static T8122_FENDER: AtomicU64 = AtomicU64::new(T8122_UNSET);
 m3_param!("t8122_fender", T8122_FENDER, parse_t8122_fender);
-/// `asahi.t8122_clkgen=e5c|e1c|none`: the GPU clock-generator IO mapping.
+/// `asahi.t8122_clkgen=e1c|e5c|none`: the GPU clock-generator IO mapping.
 static T8122_CLKGEN: AtomicU64 = AtomicU64::new(T8122_UNSET);
 m3_param!("t8122_clkgen", T8122_CLKGEN, parse_t8122_clkgen);
 /// `asahi.t8122_sgx_setup=none|t6030`: the SGX write made before the firmware starts.
