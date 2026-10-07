@@ -121,6 +121,20 @@
 # both inert for now, and the M2 Max Neural Engine cleans up after a failed
 # probe (iconidentify/aurora-linux#37, Joshua Warren). M1, M2 and the Neo
 # keep their boot loaders.
+# 12.1: on M1 and M2, a direct USB-C display's route follows the display
+# pipeline the desktop gives it (iconidentify/aurora-linux#39;
+# appledrm.typec_follow_crtc=0 turns it off). Its boot loader and device
+# trees are 12.0's.
+# 12.2 is 12.1 plus a GPU start experiment for the M3 MacBook Air, off unless
+# the Air's owner asks for it. The kernel starts the Air's GPU firmware only
+# with asahi.t8122_start=1 on the kernel command line. --m3-gpu-experiment
+# (Air only) installs the scripts that arm that for one boot and collect the
+# result, with a separate G15G Mesa build in /opt/mesa-m3-g15g; it arms
+# nothing itself. Every Mac moves to m1n1-aurora aurora12.1: aurora12 plus a
+# stand-in power model for the Air's GPU handoff, which stays off unless
+# /etc/m1n1.conf has both chosen.asahi,t8122-gpu=1 and
+# chosen.asahi,t8122-gpu-power-standin=1. This script writes neither line.
+# Without them every Mac boots as it did with aurora12 (12.0 and 12.1).
 # It replaces linux-asahi (or linux-aurora) as a pacman package,
 # so mkinitcpio and update-m1n1 run from their own hooks; on a GRUB Mac this
 # script regenerates grub.cfg and keeps the previous kernel as a fallback entry.
@@ -137,6 +151,8 @@
 # warm-registration guard and preboot-UUID forwarding from aurora-silicon/m1n1,
 # the usb4-N-pcie-adapter alias fallback (aurora-silicon/m1n1#4), and the M3
 # display and GPU handoff, which stays off unless /etc/m1n1.conf arms it.
+# From aurora12.1 it also carries the M3 Air GPU handoff's stand-in power
+# model, off unless /etc/m1n1.conf arms it too.
 # Before boot.bin is rebuilt with it, the boot.bin the Mac booted with is kept
 # on the EFI partition (keep_bootbin_on_esp). A MacBook Neo keeps its own m1n1
 # unless NEO_AURORA_M1N1 is 1.
@@ -159,8 +175,8 @@ set -euo pipefail
 
 # The kernel package version and the release tag move independently: a release
 # that only changes m1n1 reuses the previous kernel packages unchanged.
-VERSION=7.1.12.aurora2-12.1
-TAG=sep-7.1.12.aurora2-12.1
+VERSION=7.1.12.aurora2-12.2
+TAG=sep-7.1.12.aurora2-12.2
 # Packages are fetched from this script's own tag, never from "latest": the
 # checksums below belong to this release and nothing else.
 PUBLIC_RELEASE_URL=https://github.com/iconidentify/aurora-linux/releases/download/$TAG
@@ -176,20 +192,20 @@ RELEASES_API=${AURORA_RELEASES_API:-$PUBLIC_RELEASES_API}
 # Where to always get the current script, whatever this copy turns out to be.
 LATEST_URL=https://github.com/iconidentify/aurora-linux/releases/latest/download/install-aurora-sep.sh
 PACKAGES=(
-  "linux-aurora-$VERSION-aarch64.pkg.tar.zst 4755db7fc371257229d80de68417ba6fff49192b383d8c5a28c5115a8a84d4ee"
-  "linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst ffd923a7420a5e8d664168ed1a74e39ee647998b60afa3782ecc2a94c3570e91"
+  "linux-aurora-$VERSION-aarch64.pkg.tar.zst PENDING-12.2-LAB-BUILD"
+  "linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst PENDING-12.2-LAB-BUILD"
   "libfprint-1.94.100-1.1-aarch64.pkg.tar.zst bc7d9762db6644f2cfb58ddb209602c1d513845eb1498c098e01f12600fcbdf9"
   "aurora-touchid-20261003-1-any.pkg.tar.zst 29b0360fac8c257d754e64bd1b9c33c487eb2595dd3c31e9138d7a476afa3d64"
 )
 # The one m1n1 for every Mac, as "file sha256": M1 and M2, an M3 on the handoff
 # path (see m3_plan), and the MacBook Neo once NEO_AURORA_M1N1 is 1. Macs differ
 # only in the switches /etc/m1n1.conf arms (m3_switches), never in the binary.
-M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora12-1-aarch64.pkg.tar.zst c3df0896ca925feb73ca4d9768596fe2b1cf3b8972f68866a79da8485444f2fd"
+M1N1_PACKAGE="m1n1-aurora-1.6.1.aurora12.1-2-aarch64.pkg.tar.zst 2c223ef9a36410039f823c171c982296eb1dbd5b0de48f2cf6fc87b2160d12c8"
 # The sha256 of the m1n1.bin in M1N1_PACKAGE: the bytes update-m1n1 puts at
 # the start of boot.bin. The script tells m1n1 builds apart by these bytes,
 # never by the version string they report: aurora8.5-1 and 8.5-2 both reported
 # v1.6.1-omarchy.aurora8.5.
-M1N1_BIN_SHA=f727705e6b7b4906b4cbe016995a4561a6daa5c13a525e09910a6b3df4199820
+M1N1_BIN_SHA=557d4825ac2e0f0a2c87d75098e5ca04f5932532b9da7845f7c0f70d0cd07aaa
 # 0: a MacBook Neo keeps its own m1n1 (its M1N1= and U_BOOT= in
 # /etc/default/update-m1n1), as before 12.0. 1: it gets M1N1_PACKAGE like every
 # other Mac, and update-m1n1 builds its boot.bin from that m1n1 and the Neo's
@@ -409,6 +425,9 @@ M3_SWITCHES="chosen.asahi,t6030-gpu=1 chosen.asahi,t6030-dcp=1 chosen.asahi,t603
 # changes with each m1n1 that changes what a Pro boots: a J514S that opted in
 # on an earlier release (t6030: aurora7 or 8.x) moves to this release's m1n1
 # only with a new --m3-handoff. A listed Pro moves with the release.
+# aurora12.1 boots an M3 Pro exactly as aurora12 does (its additions are for
+# the T8122 only), so the name stays t6030-12: a Pro that opted in on 12.0
+# or 12.1 moves to aurora12.1 on a plain run, as it would have on 12.0.
 M3_PRO_VARIANT="t6030-12"
 # The M3 MacBook Air's handoff switches, for a later build that starts the
 # Air's GPU (M3_AIR_DRY_RUN=0): the GPU alone, or with M3_AIR_DCP=1 the
@@ -433,6 +452,11 @@ M3_AIR_DCP=0
 # that changes what an Air boots: an Air on an earlier test build's boot loader
 # (air-display-handoff, aurora8.3 and 8.4) moves to this one only with a new
 # --m3-handoff.
+# aurora12.1 boots an Air with these switches exactly as aurora12 does: its
+# GPU stand-in needs chosen.asahi,t8122-gpu=1 and
+# chosen.asahi,t8122-gpu-power-standin=1, which no variant here sets. So the
+# name stays air-display-handoff-12, and an Air that opted in on 12.0 or 12.1
+# moves to aurora12.1 on a plain run with the same switches.
 M3_AIR_DISPLAY_HANDOFF=1
 M3_AIR_DISPLAY_VARIANT="air-display-handoff-12"
 M3_AIR_DRY_RUN=1
@@ -449,11 +473,12 @@ M3_GPU_SCRIPTS=(
   "air-gpu-collect.sh ac11914e55a8f3a4652b7796ce423f17364e26725e5edd78a9d4d2136adc76de"
   "air-gpu-job.sh f76e57154e96165daf8834508975a98f745519ab1b51ac2edae4f5710edae349"
 )
-# PLACEHOLDER until the G15G Mesa build exists: its prefix package as "file sha256" (a pacman
-# package that installs Mesa into a prefix of its own, never over the system Mesa), and that
-# prefix, for air-gpu-job.sh. Empty: this release has none, and the flag installs the scripts.
-M3_GPU_MESA_PACKAGE=""
-M3_GPU_MESA_PREFIX=""
+# The G15G Mesa build: its prefix package as "file sha256" (a pacman package that installs Mesa
+# into a prefix of its own, never over the system Mesa), and that prefix, for air-gpu-job.sh.
+# mesa-m3-g15g installs only /opt/mesa-m3-g15g; its G15G support is opt-in there too
+# (ASAHI_M3_G15G=1, which air-gpu-job.sh and the prefix's bin/g15g-run set).
+M3_GPU_MESA_PACKAGE="mesa-m3-g15g-26.1.4.g15g1-5-aarch64.pkg.tar.zst 1dd4c3876a26edf0cc3ad1b23eba79a66d99fd4c3cb9d2683f346e7bca1fa904"
+M3_GPU_MESA_PREFIX="/opt/mesa-m3-g15g"
 # What the Mesa package depends on with a minimum version, as "name>=version". Each must be
 # installed already, at that version or newer, or m3_gpu_mesa_install leaves the package out:
 # its pacman -U must never pull in an upgrade of the C library or the compiler runtime alone.
@@ -627,7 +652,7 @@ m1n1_for_this_mac() {
   fi
 }
 
-# M1N1_PACKAGE's version, as pacman prints it: 1.6.1.aurora12-1.
+# M1N1_PACKAGE's version, as pacman prints it: 1.6.1.aurora12.1-2.
 m1n1_version() {
   local file=${M1N1_PACKAGE%% *}
   file=${file#m1n1-aurora-}

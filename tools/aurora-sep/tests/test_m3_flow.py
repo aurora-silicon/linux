@@ -39,6 +39,7 @@ BOARDS = {
     "j504": ["apple,j504", "apple,t8122", "apple,arm-platform"],
     "j314s": ["apple,j314s", "apple,t6000", "apple,arm-platform"],
     "j293": ["apple,j293", "apple,t8103", "apple,arm-platform"],
+    "j313": ["apple,j313", "apple,t8103", "apple,arm-platform"],
     "j314c": ["apple,j314c", "apple,t6001", "apple,arm-platform"],
     "j414s": ["apple,j414s", "apple,t6020", "apple,arm-platform"],
     "j700": ["apple,j700", "apple,t8140", "apple,arm-platform"],

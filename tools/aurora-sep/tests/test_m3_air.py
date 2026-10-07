@@ -321,9 +321,10 @@ class M3AirDryRunTest(M3AirTest):
         self.assertEqual(self.sh("m3_switches").stdout.strip(), shell_value("M3_SWITCHES"))
 
     def test_shipped_settings(self):
-        # A release decision: change this test with it. 12.0 ships the Air
-        # display handoff with the dry run's switches, opt-in only, from the
-        # same m1n1 as the M3 Pros, under a variant name no test build used.
+        # A release decision: change this test with it. 12.0 and 12.1 ship
+        # the Air display handoff with the dry run's switches, opt-in only,
+        # from the same m1n1 as the M3 Pros, under a variant name no test
+        # build used.
         self.assertEqual(DRY_RUN, ["chosen.asahi,t8122-gpu-diag=1",
                                    "chosen.asahi,t8122-gpu-handoff-diag=1",
                                    "chosen.asahi,t8122-gpu-power-diag=1",

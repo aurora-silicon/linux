@@ -46,6 +46,8 @@ BOARDS = {
     "j504": ["apple,j504", "apple,t8122", "apple,arm-platform"],
     "j516s": ["apple,j516s", "apple,t6030", "apple,arm-platform"],
     "j314s": ["apple,j314s", "apple,t6000", "apple,arm-platform"],
+    "j313": ["apple,j313", "apple,t8103", "apple,arm-platform"],
+    "j293": ["apple,j293", "apple,t8103", "apple,arm-platform"],
 }
 MACLAB = ("# maclab: begin. Managed by lab-agent: staged test kernels, booted once via LoaderEntryOneShot.\n"
           "# maclab: end\n")
@@ -387,7 +389,8 @@ class OneShotTest(unittest.TestCase):
 
     def test_refuses_other_macs(self):
         for board, why in [("j516s", "--allow-test-on-m3pro tests the boot steps there"),
-                           ("j504", "not an M3 MacBook Air"), ("j314s", "not an M3 MacBook Air")]:
+                           ("j504", "not an M3 MacBook Air"), ("j314s", "not an M3 MacBook Air"),
+                           ("j313", "not an M3 MacBook Air"), ("j293", "not an M3 MacBook Air")]:
             with self.subTest(board=board):
                 self.mac.board(board)
                 self.assert_refused(why, "start")
@@ -1301,6 +1304,19 @@ except ImportError:  # pragma: no cover
 
 SRC = (HERE.parent / "install-aurora-sep.sh").read_text()
 SCRIPTS = re.findall(r'^  "(air-gpu-[a-z]+\.sh) ([0-9a-f]{64})"$', SRC, re.M)
+MESA_ENTRY = re.search(r'^M3_GPU_MESA_PACKAGE="([^"]*)"$', SRC, re.M).group(1)
+MESA_PREFIX = re.search(r'^M3_GPU_MESA_PREFIX="([^"]*)"$', SRC, re.M).group(1)
+MESA_NAME = MESA_ENTRY.split(" ")[0]
+
+
+def staged_mesa():
+    """The shipped Mesa package, when it is at hand (AURORA_MESA_PKG, or the release staging directory)."""
+    version = re.search(r"^VERSION=(\S+)$", SRC, re.M).group(1)
+    stage = Path.home() / "source/aurora-recipes" / f"stage-{version.split('-')[-1]}"
+    for c in (os.environ.get("AURORA_MESA_PKG", ""), str(stage / MESA_NAME)):
+        if c and Path(c).is_file() and Path(c).name == MESA_NAME:
+            return Path(c)
+    return None
 
 
 class GpuExperimentReleaseTest(unittest.TestCase):
@@ -1313,12 +1329,38 @@ class GpuExperimentReleaseTest(unittest.TestCase):
                                  f"update {name}'s sha256 in M3_GPU_SCRIPTS")
 
     def test_mesa_placeholder(self):
-        mesa = re.search(r'^M3_GPU_MESA_PACKAGE="([^"]*)"$', SRC, re.M).group(1)
-        prefix = re.search(r'^M3_GPU_MESA_PREFIX="([^"]*)"$', SRC, re.M).group(1)
-        # Empty until the G15G Mesa build exists; then both are set, the package as "file sha256".
-        if mesa or prefix:
-            self.assertRegex(mesa, r"^\S+\.pkg\.tar\.zst [0-9a-f]{64}$")
-            self.assertTrue(prefix.startswith("/"), prefix)
+        # Empty until the G15G Mesa build exists; then both are set, the package as "file sha256"
+        # (a PENDING-* checksum until the lab build; ReleaseGuardTest fails on it).
+        if MESA_ENTRY or MESA_PREFIX:
+            self.assertRegex(MESA_ENTRY, r"^\S+\.pkg\.tar\.zst ([0-9a-f]{64}|PENDING-\S+)$")
+            self.assertTrue(MESA_PREFIX.startswith("/"), MESA_PREFIX)
+
+    def test_the_shipped_mesa_package(self):
+        # A release decision: change this test with it. The release ships the G15G prefix build.
+        self.assertRegex(MESA_NAME, r"^mesa-m3-g15g-\S+-aarch64\.pkg\.tar\.zst$")
+        self.assertEqual(MESA_PREFIX, "/opt/mesa-m3-g15g")
+        path = staged_mesa()
+        if path is None:
+            self.skipTest(f"{MESA_NAME} is not at hand (set AURORA_MESA_PKG)")
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), MESA_ENTRY.split(" ")[1])
+        out = subprocess.run(["bsdtar", "-tf", str(path)], capture_output=True, text=True, check=True).stdout
+        names = [n for n in out.splitlines() if n]
+        info = subprocess.run(["bsdtar", "-xOf", str(path), ".PKGINFO"], capture_output=True, text=True,
+                              check=True).stdout
+        self.assertIn("pkgname = mesa-m3-g15g\n", info)
+        self.assertNotRegex(info, r"(?m)^(provides|conflict|replaces) = ")
+        # Nothing outside its prefix but its licence directory: system Mesa is untouched.
+        outside = [n for n in names if not n.startswith(".")
+                   and not n.startswith(MESA_PREFIX.lstrip("/") + "/")
+                   and not n.startswith("usr/share/licenses/mesa-m3-g15g")
+                   and n not in ("opt/", "usr/", "usr/share/", "usr/share/licenses/")]
+        self.assertEqual(outside, [])
+        # Its versioned dependencies are exactly the ones the installer checks first.
+        needs = re.search(r'^M3_GPU_MESA_NEEDS="([^"]*)"$', SRC, re.M).group(1).split()
+        self.assertEqual(sorted(re.findall(r"(?m)^depend = (\S+>=\S+)$", info)), sorted(needs))
+        # air-gpu-job.sh needs exactly one Vulkan driver file in the prefix.
+        icds = [n for n in names if n.startswith(MESA_PREFIX.lstrip("/") + "/share/vulkan/icd.d/") and n.endswith(".json")]
+        self.assertEqual(len(icds), 1, icds)
 
     def test_off_by_default(self):
         self.assertRegex(SRC, r"(?m)^M3_GPU_EXPERIMENT=0$")
@@ -1340,10 +1382,21 @@ class GpuExperimentFlagTest(Base):
         # The installed one-shot script needs root and a Mac; here a stand-in records each call
         # and exits with $ONESHOT_RC.
         self.oneshot_rc = 0
+        # A stand-in for the shipped Mesa package, by its shipped name.
+        self.mesa_sha = self.mesa_fixture(MESA_NAME, "mesa-m3-g15g", MESA_PREFIX) if MESA_NAME else ""
+
+    def mesa_fixture(self, name, pkgname, prefix):
+        root = self.tmp / ("root-" + name)
+        (root / prefix.lstrip("/") / "lib").mkdir(parents=True)
+        (root / ".PKGINFO").write_text(f"pkgname = {pkgname}\npkgver = 1-1\n")
+        subprocess.run(["bsdtar", "--zstd", "-cf", str(self.tmp / "pkgs" / name), "-C", str(root), ".PKGINFO", "opt"],
+                       check=True)
+        return hashlib.sha256((self.tmp / "pkgs" / name).read_bytes()).hexdigest()
 
     def sh(self, body, check=True, flag=1):
         stub = (f"m3_gpu_oneshot() {{ echo \"air-gpu-oneshot.sh $*\" >>\"$FAKE/log\"; return {self.oneshot_rc}; }}\n")
-        return self.run_sh(f"M3_GPU_BIN='{self.bin}'\nM3_GPU_EXPERIMENT={flag}\n{stub}{body}", check=check)
+        mesa = f'M3_GPU_MESA_PACKAGE="{MESA_NAME} {self.mesa_sha}"\n' if MESA_NAME else ""
+        return self.run_sh(f"M3_GPU_BIN='{self.bin}'\nM3_GPU_EXPERIMENT={flag}\n{stub}{mesa}{body}", check=check)
 
     def test_a_rerun_disarms_before_the_kernel_is_replaced(self):
         # An armed entry pins the UKI an install rebuilds: the rerun clears it before anything changes.
@@ -1398,16 +1451,24 @@ class GpuExperimentFlagTest(Base):
                 self.assertIn(name, self.downloaded())
                 self.assertTrue(os.access(self.bin / name, os.X_OK))
                 self.assertEqual((self.bin / name).read_bytes(), (TOOLS / name).read_bytes())
-        self.assertIn("--m3-gpu-experiment: installing the M3 Air GPU experiment's scripts", proc.stderr)
+        self.assertIn("--m3-gpu-experiment: installing the M3 Air GPU experiment's scripts with the kernel, "
+                      "and its Mesa prefix once the kernel is in", proc.stderr)
         self.assertIn("Nothing is armed", proc.stdout)
-        self.assertIn("no G15G Mesa prefix yet", proc.stdout)
+        # The shipped Mesa prefix goes on after the kernel, in a pacman -U of its own.
+        self.assertIn(MESA_NAME, self.downloaded())
+        kernel, mesa = self.transactions()
+        self.assertIn("linux-aurora-", kernel)
+        self.assertNotIn(MESA_NAME, kernel)
+        self.assertTrue(mesa.endswith("/m3-gpu/" + MESA_NAME), mesa)
+        self.assertIn(f"The G15G Mesa prefix for air-gpu-job.sh: {MESA_PREFIX}", proc.stdout)
         self.assertIn("does not hand the GPU over", proc.stdout)
         self.assertIn("pacman -S --needed --noconfirm python vulkan-icd-loader", self.log())
         # The kernel-only Air keeps its boot.bin; nothing in /etc/m1n1.conf.
         self.assertEqual(self.boot.read_bytes(), before)
         self.assertFalse(self.m1n1_conf.exists())
         rec = (self.state / "m3-gpu-experiment").read_text().splitlines()
-        self.assertEqual(sorted(l.split()[1] for l in rec), sorted(n for n, _ in SCRIPTS))
+        self.assertEqual(sorted(l.split()[1] for l in rec if l.startswith("script ")), sorted(n for n, _ in SCRIPTS))
+        self.assertIn("mesa mesa-m3-g15g", rec)
 
         # A plain rerun keeps them and says so.
         proc = self.sh("M3_TRY=0\ninstall_all", flag=0)
@@ -1417,7 +1478,16 @@ class GpuExperimentFlagTest(Base):
         self.sh("uninstall_all", flag=0)
         for name, _ in SCRIPTS:
             self.assertFalse((self.bin / name).exists(), name)
+        self.assertIn("pacman -Rns --noconfirm mesa-m3-g15g", self.log())
         self.assertFalse(self.state.exists())
+
+    def test_without_a_mesa_package(self):
+        # A release with no Mesa build installs the scripts alone and says so.
+        self.mac("j613")
+        proc = self.sh('M3_GPU_MESA_PACKAGE=""\nM3_GPU_MESA_PREFIX=""\nM3_TRY=0\ninstall_all')
+        self.assertFalse([d for d in self.downloaded() if d.startswith("mesa-")])
+        self.assertIn("no G15G Mesa prefix yet", proc.stdout)
+        self.assertNotIn("mesa ", (self.state / "m3-gpu-experiment").read_text())
 
     def test_with_the_handoff(self):
         self.mac("j613")
@@ -1426,17 +1496,26 @@ class GpuExperimentFlagTest(Base):
         self.assertEqual((self.state / "m3-mode").read_text().split()[0], "handoff")
 
     def test_other_macs_get_nothing(self):
-        for board in ("j516s", "j314s", "j504"):
-            with self.subTest(board=board):
-                self.mac(board)
-                before = self.boot.read_bytes()
-                proc = self.sh("M3_TRY=0\ninstall_all", check=False)
-                self.assertNotEqual(proc.returncode, 0)
-                self.assertIn("--m3-gpu-experiment is for the M3 MacBook Air (j613, j615) only", proc.stderr)
-                self.assertIn("Nothing was installed", proc.stderr)
-                self.assertEqual(self.downloaded(), [])
-                self.assertEqual(self.boot.read_bytes(), before)
-                self.assertFalse(self.bin.exists())
+        # The MacBook Air M1 (j313, the lab's m1air), the 13" MacBook Pro M1 (j293), the 16" M3
+        # Pro (j516s), an M1 Pro and the 14" MacBook Pro M3 (j504, a T8122 that is not an Air).
+        for board in ("j313", "j293", "j516s", "j314s", "j504"):
+            for try_ in (0, 1):
+                with self.subTest(board=board, m3_handoff=try_):
+                    self.fresh_state()
+                    self.mac(board)
+                    before = self.boot.read_bytes()
+                    proc = self.sh(f"M3_TRY={try_}\ninstall_all", check=False)
+                    self.assertNotEqual(proc.returncode, 0)
+                    if not try_ or board == "j516s":
+                        self.assertIn("--m3-gpu-experiment is for the M3 MacBook Air (j613, j615) only",
+                                      proc.stderr)
+                    self.assertIn("Nothing was installed", proc.stderr)
+                    self.assertEqual(self.downloaded(), [])
+                    # Queries only: nothing installed, synced or removed.
+                    self.assertNotRegex(self.log(), r"(?m)^pacman -[USR]")
+                    self.assertEqual(self.boot.read_bytes(), before)
+                    self.assertFalse(self.bin.exists())
+                    self.assertFalse((self.state / "m3-gpu-experiment").exists())
 
     def test_a_changed_script_is_refused(self):
         self.mac("j613")
@@ -1561,7 +1640,7 @@ class GpuExperimentFlagTest(Base):
     def test_without_the_flag_nothing_changes(self):
         self.mac("j613")
         self.sh("M3_TRY=0\ninstall_all", flag=0)
-        self.assertFalse([d for d in self.downloaded() if d.startswith("air-gpu-")])
+        self.assertFalse([d for d in self.downloaded() if d.startswith(("air-gpu-", "mesa-"))])
         self.assertFalse(self.bin.exists())
         self.assertFalse((self.state / "m3-gpu-experiment").exists())
 

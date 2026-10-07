@@ -12,7 +12,8 @@ download and checksum loop, and the commands an install prints name the
 public release. Only a newer release number is named, and under an override
 with no command to run. PublicDownloadTest keeps the public release's own message
 for a missing file. UpgradeTest runs 11.38's own script on the fake Mac of
-test_m3_flow, then this one, as an owner updating would.
+test_m3_flow, then this one, as an owner updating would; Upgrade120Test and
+Upgrade121Test do the same from 12.0's and 12.1's.
 """
 from pathlib import Path
 import hashlib
@@ -31,14 +32,24 @@ VERSION = flow.VERSION
 M1N1_PACKAGE = re.search(r'^M1N1_PACKAGE="(\S+) (\S+)"$', SRC, re.M)
 M1N1_BIN_SHA = re.search(r"^M1N1_BIN_SHA=(\S+)$", SRC, re.M).group(1)
 # Every m1n1 a release put on a Mac before this one.
-EARLIER_M1N1 = ["1.6.1.aurora3-1", "1.6.1.aurora7-1", "1.6.1.aurora8.4-1", "1.6.1.aurora8.5-2"]
+EARLIER_M1N1 = ["1.6.1.aurora3-1", "1.6.1.aurora7-1", "1.6.1.aurora8.4-1", "1.6.1.aurora8.5-2", "1.6.1.aurora12-1"]
 
 
 def package_entries():
-    """Every "file sha256" this script downloads."""
+    """Every "file sha256" this script downloads (PACKAGES and M1N1_PACKAGE)."""
     block = re.search(r"^PACKAGES=\(\n(.*?)^\)", SRC, re.M | re.S).group(1)
     entries = re.findall(r'^\s*"(\S+) (\S+)"$', block, re.M)
     entries.append((M1N1_PACKAGE.group(1), M1N1_PACKAGE.group(2)))
+    return entries
+
+
+def gpu_entries():
+    """What --m3-gpu-experiment downloads: M3_GPU_SCRIPTS and M3_GPU_MESA_PACKAGE (when set)."""
+    block = re.search(r"^M3_GPU_SCRIPTS=\(\n(.*?)^\)", SRC, re.M | re.S)
+    entries = re.findall(r'^\s*"(\S+) (\S+)"$', block.group(1), re.M) if block else []
+    mesa = re.search(r'^M3_GPU_MESA_PACKAGE="(\S+) (\S+)"$', SRC, re.M)
+    if mesa:
+        entries.append((mesa.group(1), mesa.group(2)))
     return entries
 
 
@@ -58,7 +69,8 @@ class ReleaseGuardTest(unittest.TestCase):
         # PENDING-* stands in for a lab build's sha256 until it exists. The
         # script refuses such a download, so nothing installs; this test is
         # what stops the release from being cut with one.
-        pending = [f"{f} {sha}" for f, sha in package_entries() if not re.fullmatch(r"[0-9a-f]{64}", sha)]
+        pending = [f"{f} {sha}" for f, sha in package_entries() + gpu_entries()
+                   if not re.fullmatch(r"[0-9a-f]{64}", sha)]
         if not re.fullmatch(r"[0-9a-f]{64}", M1N1_BIN_SHA):
             pending.append(f"M1N1_BIN_SHA={M1N1_BIN_SHA}")
         self.assertEqual(pending, [], "placeholders left in install-aurora-sep.sh")
@@ -483,6 +495,136 @@ class UpgradeTest(flow.M3FlowBase):
         self.assertEqual(self.boot.read_bytes(), image_1138)
         self.assertFalse(self.kept(VERSION).exists())
         self.assertNotIn("m1n1-aurora", " ".join(self.downloaded()))
+
+
+class Upgrade120Test(flow.M3FlowBase):
+    """12.0's own script, then this one: a Mac on aurora12 moves to this release's m1n1 as it
+    would have moved within 12.0, with nothing asked again."""
+
+    OLD_REV = "df0c4330"
+
+    def setUp(self):
+        super().setUp()
+        old = subprocess.run(["git", "show", f"{self.OLD_REV}:tools/aurora-sep/install-aurora-sep.sh"],
+                             cwd=flow.INSTALLER.parent, capture_output=True)
+        if old.returncode:
+            self.skipTest(f"git can't show the earlier script ({self.OLD_REV})")
+        self.old = self.tmp / f"install-{self.OLD_REV}.sh"
+        self.old.write_bytes(old.stdout)
+        self.old_version = re.search(rb"^VERSION=(\S+)$", old.stdout, re.M).group(1).decode()
+        # A stand-in for 12.0's one m1n1, aurora12, with every switch name.
+        self.aurora12 = "m1n1-aurora-1.6.1.aurora12-1-aarch64.pkg.tar.zst"
+        self.assertNotEqual(self.aurora12, flow.M1N1_PKG)
+        self.fixture(self.aurora12, None, flow.SWITCH_NAMES)
+
+    def install_120(self, try_=0):
+        self.installer, self.m1n1_pkg = self.old, self.aurora12
+        try:
+            return self.run_sh(f"M3_TRY={try_}\ninstall_all")
+        finally:
+            self.installer, self.m1n1_pkg = flow.INSTALLER, flow.M1N1_PKG
+
+    def kept(self, version):
+        return self.boot.parent / f"boot.bin.before-{version}"
+
+    def chosen(self):
+        return [l for l in self.m1n1_conf.read_text().splitlines() if l.startswith("chosen.")]
+
+    def assert_moved(self, image_120):
+        boot = self.boot.read_bytes()
+        self.assertTrue(boot.startswith(b"M1N1:" + flow.M1N1_BASE.encode() + b"\n"), boot[:80])
+        self.assertEqual(self.kept(VERSION).read_bytes(), image_120)
+        self.assertEqual((self.state / "m1n1-installed").read_text().split()[0], self.bin_shas[flow.M1N1_PKG])
+        return boot
+
+    def test_j516s_from_12_0(self):
+        self.mac("j516s")
+        self.install_120()
+        image_120 = self.boot.read_bytes()
+        self.assertTrue(image_120.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora12-1\n"))
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff t6030-12")
+        self.install()
+        boot = self.assert_moved(image_120)
+        self.assertTrue(boot.endswith(flow.SWITCHES))
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff t6030-12")
+
+    def test_j514s_opted_in_on_12_0(self):
+        # Unlike a J514S on 11.38's aurora7: aurora12.1 boots a Pro as aurora12 does, so the
+        # opt-in carries over.
+        self.mac("j514s")
+        self.install_120(try_=1)
+        image_120 = self.boot.read_bytes()
+        proc = self.install()
+        self.assertNotIn("Nothing was installed", proc.stdout + proc.stderr)
+        boot = self.assert_moved(image_120)
+        self.assertTrue(boot.endswith(flow.SWITCHES))
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff t6030-12")
+
+    def test_air_opted_in_on_12_0(self):
+        self.mac("j613")
+        self.install_120(try_=1)
+        image_120 = self.boot.read_bytes()
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff air-display-handoff-12")
+        switches_120 = self.chosen()
+        proc = self.install()
+        self.assertNotIn("Run this again with --m3-handoff", proc.stderr)
+        self.assert_moved(image_120)
+        self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff air-display-handoff-12")
+        # The same switches: none of them starts the GPU or its stand-in.
+        self.assertEqual(self.chosen(), switches_120)
+        self.assertNotIn("chosen.asahi,t8122-gpu=1", self.chosen())
+        self.assertNotIn("chosen.asahi,t8122-gpu-power-standin=1", self.chosen())
+
+    def test_air_kernel_only_on_12_0(self):
+        self.mac("j613")
+        self.install_120()
+        image_120 = self.boot.read_bytes()
+        self.install()
+        self.assertEqual(self.boot.read_bytes(), image_120)
+        self.assertNotIn("m1n1-aurora", " ".join(self.downloaded()))
+
+    def test_m1_from_12_0(self):
+        self.mac("j314s")
+        self.install_120()
+        image_120 = self.boot.read_bytes()
+        self.assertTrue(image_120.startswith(b"M1N1:m1n1-aurora-1.6.1.aurora12-1\n"))
+        self.install()
+        boot = self.assert_moved(image_120)
+        self.assertNotIn(b"chosen.", boot)
+
+    def test_m1_whose_aurora12_failed(self):
+        # The restore steps of 12.0: the old boot.bin back, updates frozen, aurora12 recorded.
+        # The record names aurora12's bytes, not aurora12.1's; the freeze keeps boot.bin.
+        self.mac("j314s")
+        self.install_120()
+        restored = self.kept(self.old_version).read_bytes()
+        self.boot.write_bytes(restored)
+        with open(self.update_conf, "a") as f:
+            f.write("M1N1_UPDATE_DISABLED=1\n")
+        (self.state / "m1n1-failed").write_text(f"{self.bin_shas[self.aurora12]} aurora12\n")
+        proc = self.install()
+        self.assertEqual(self.boot.read_bytes(), restored)
+        self.assertIn("sets M1N1_UPDATE_DISABLED, so m1n1's boot.bin was not rebuilt", proc.stderr)
+
+    def test_m3_pro_whose_aurora12_failed(self):
+        # On an M3 any recorded failure keeps a plain run kernel-only.
+        self.mac("j516s")
+        self.install_120()
+        restored = self.kept(self.old_version).read_bytes()
+        self.boot.write_bytes(restored)
+        with open(self.update_conf, "a") as f:
+            f.write("M1N1_UPDATE_DISABLED=1\n")
+        (self.state / "m1n1-failed").write_text(f"{self.bin_shas[self.aurora12]} aurora12\n")
+        proc = self.install()
+        self.assertIn("an m1n1 from this script failed on this Mac before", proc.stdout)
+        self.assertEqual(self.boot.read_bytes(), restored)
+        self.assertNotIn(flow.M1N1_PKG, self.downloaded())
+
+
+class Upgrade121Test(Upgrade120Test):
+    """12.1's own script (the same aurora12 and switches as 12.0), then this one."""
+
+    OLD_REV = "1d41e1b7"
 
 
 if __name__ == "__main__":
