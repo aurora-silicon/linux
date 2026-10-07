@@ -338,6 +338,13 @@ static void dcp_fill_dfb_surface(struct apple_dcp *dcp, u8 *s)
 	s[0x035] = 0x02;
 	s[0x051] = 0x01;
 	s[0x149] = 0x01;
+
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		/* Internal H17P default registration differs from the older profile. */
+		memcpy(s + 11, "ARGB", 4);
+		put_unaligned_le32(0x00e44000, s + 41);
+		s[53] = BIT(2);
+	}
 }
 
 /*
