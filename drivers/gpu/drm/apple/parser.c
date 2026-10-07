@@ -181,7 +181,7 @@ static char *parse_string(struct dcp_parse_ctx *handle)
 static int parse_int_bound(struct dcp_parse_ctx *handle, s64 *value, s64 min, s64 max)
 {
 	const void *tag = parse_tag_of_type(handle, DCP_TYPE_INT64);
-	const s64 *in;
+	const void *in;
 
 	if (IS_ERR(tag))
 		return PTR_ERR(tag);
