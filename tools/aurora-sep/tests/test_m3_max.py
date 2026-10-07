@@ -1457,7 +1457,14 @@ class SameAs122Test(MaxBase):
                 after = self.run_with(flow.INSTALLER, board)
                 seen.append(board)
                 self.assertEqual(after["codes"], before["codes"])
-                self.assertEqual(after["log"].splitlines(), before["log"].splitlines())
+                # The same commands: as a multiset, and in order among the $sudo lines and among
+                # the others. The two sides of a pipeline such as "pacman -Q ... | $sudo tee ..."
+                # log in either order (test_m3_pro_mesa.same_commands).
+                a, b = before["log"].splitlines(), after["log"].splitlines()
+                self.assertEqual(sorted(b), sorted(a))
+                self.assertEqual([l for l in b if l.startswith("sudo ")], [l for l in a if l.startswith("sudo ")])
+                self.assertEqual([l for l in b if not l.startswith("sudo ")],
+                                 [l for l in a if not l.startswith("sudo ")])
                 self.assertEqual(sorted(after["tree"]), sorted(before["tree"]))
                 for path, data in before["tree"].items():
                     self.assertEqual(after["tree"][path], data, path)
