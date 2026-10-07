@@ -257,11 +257,100 @@ static bool trampoline_swap_info_h17p(struct apple_dcp *dcp, int tag,
 	return true;
 }
 
-/*
- * D400 has a measured size but no admitted property-reply semantics. It stays
- * unhandled, so the measured H17P profile stops instead of guessing a reply.
- * H17G retains its existing missing-property response.
- */
+struct dcp_h17p_provider_request {
+	u8 scope[4];
+	char name[64];
+	__le32 capacity;
+	u8 reserved[4];
+} __packed;
+
+struct dcp_h17p_provider_reply {
+	u8 data[0xc00];
+	__le32 length;
+} __packed;
+
+struct dcp_h17p_provider_property {
+	const char *name;
+	const char *dt_name;
+	u32 length;
+};
+
+static_assert(sizeof(struct dcp_h17p_provider_request) == 0x4c);
+static_assert(sizeof(struct dcp_h17p_provider_reply) == 0xc04);
+
+/* Only these provider transfers have been measured against the disp0 ADT. */
+static const struct dcp_h17p_provider_property provider_properties[] = {
+	{ "power-lut-data-x", "apple,power-lut-data-x", 4 },
+	{ "power-lut-data-y", "apple,power-lut-data-y", 4 },
+	{ "power-lut-data-xindex", "apple,power-lut-data-xindex", 52 },
+	{ "power-lut-data-yindex", "apple,power-lut-data-yindex", 4 },
+	{ "power-lut-data-lut", "apple,power-lut-data-lut", 52 },
+	{ "power-lut-vbatt-cur-nominal", "apple,power-lut-vbatt-cur-nominal", 0 },
+};
+
+static const struct dcp_h17p_provider_property *
+dcp_provider_property_h17p(const struct dcp_h17p_provider_request *request)
+{
+	unsigned int i;
+
+	if (memcmp(request->scope, "VORP", sizeof(request->scope)) ||
+	    le32_to_cpu(request->capacity) !=
+				 sizeof_field(struct dcp_h17p_provider_reply, data) ||
+	    memchr_inv(request->reserved, 0, sizeof(request->reserved)) ||
+	    strnlen(request->name, sizeof(request->name)) == sizeof(request->name))
+		return NULL;
+
+	/* Bytes following the first NUL were not initialized by the firmware. */
+	for (i = 0; i < ARRAY_SIZE(provider_properties); i++)
+		if (!strcmp(request->name, provider_properties[i].name))
+			return &provider_properties[i];
+	return NULL;
+}
+
+static bool trampoline_provider_property_h17p(struct apple_dcp *dcp, int tag,
+					      void *out, void *in)
+{
+	const struct dcp_h17p_provider_property *property;
+	struct dcp_h17p_provider_reply *reply = out;
+	struct device_node *node = dcp->dev->of_node;
+	int length, ret;
+
+	/* The dispatcher already cleared the exact H17G output length. */
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
+		return true;
+
+	trace_iomfb_callback(dcp, tag, __func__);
+	property = dcp_provider_property_h17p(in);
+	if (!property) {
+		dev_err(dcp->dev, "unqualified D400 provider property request\n");
+		goto fail;
+	}
+
+	length = of_property_count_u8_elems(node, property->dt_name);
+	if (!property->length) {
+		/* Only this absent property has a measured empty reply. */
+		if (of_property_present(node, property->dt_name))
+			goto fail;
+	} else if (length != (int)property->length) {
+		dev_err(dcp->dev, "invalid provider property %s: %d bytes\n",
+			property->dt_name, length);
+		goto fail;
+	}
+
+	memset(reply, 0, sizeof(*reply));
+	if (property->length) {
+		ret = of_property_read_u8_array(node, property->dt_name,
+						reply->data, property->length);
+		if (ret)
+			goto fail;
+	}
+	reply->length = cpu_to_le32(property->length);
+	return true;
+
+fail:
+	WRITE_ONCE(dcp->crashed, true);
+	return false;
+}
 
 /* H17P callback numbering is not a uniform shift of the v13.5 table. */
 static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
@@ -302,6 +391,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[208] = trampoline_nop, /* update_backlight_factor_prop */
 	[209] = trampoline_get_time, /* get_calendar_time_ms */
 	[300] = trampoline_pr_publish,
+	[400] = trampoline_provider_property_h17p,
 	[401] = trampoline_get_uint_prop, /* get_uint_prop */
 	[404] = trampoline_nop, /* set_uint_prop */
 	[406] = trampoline_set_fx_prop, /* set_fx_prop */
