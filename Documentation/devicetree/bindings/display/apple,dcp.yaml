@@ -123,6 +123,49 @@ properties:
       enum: [0, 1]
     description: Per-slot enable flags, in slot order.
 
+  apple,power-lut-data-x:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 4
+    maxItems: 4
+    description: |
+      First dimension of the display firmware power lookup table. The
+      bootloader copies the disp0 ADT property verbatim, as a little-endian
+      32-bit word, for transfer to the display firmware.
+
+  apple,power-lut-data-y:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 4
+    maxItems: 4
+    description: |
+      Second dimension of the display firmware power lookup table, copied
+      verbatim from disp0 in the ADT as a little-endian 32-bit word.
+
+  apple,power-lut-data-xindex:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 52
+    maxItems: 52
+    description: |
+      First-axis indices of the display firmware power lookup table, copied
+      verbatim from disp0 in the ADT as thirteen little-endian 32-bit words.
+      These are firmware table inputs, not a Linux backlight range.
+
+  apple,power-lut-data-yindex:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 4
+    maxItems: 4
+    description: |
+      Second-axis index of the display firmware power lookup table, copied
+      verbatim from disp0 in the ADT as a little-endian 32-bit word.
+
+  apple,power-lut-data-lut:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 52
+    maxItems: 52
+    description: |
+      Display firmware power lookup table, copied verbatim from disp0 in
+      the ADT as thirteen little-endian 32-bit words. Linux passes these
+      values to the firmware without interpreting or changing them.
+
   apple,firmware-version:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     minItems: 3
@@ -270,6 +313,19 @@ required:
   - apple,bw-scratch
 
 allOf:
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              const: apple,t8140-dcp
+    then:
+      properties:
+        apple,power-lut-data-x: false
+        apple,power-lut-data-y: false
+        apple,power-lut-data-xindex: false
+        apple,power-lut-data-yindex: false
+        apple,power-lut-data-lut: false
   - if:
       properties:
         compatible:
