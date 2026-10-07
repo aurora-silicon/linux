@@ -17,15 +17,13 @@ pub(crate) const FENDER_ADT: u32 = 0x12_c000;
 /// and the T6030 one.
 pub(crate) const CLOCK_GEN_E1C: u64 = 0xe1_c000;
 pub(crate) const CLOCK_GEN_E5C: u64 = 0xe5_c000;
-/// The SGX setup write of T6030 (offset, value).
+/// The SGX setup write of T6030 and T8122 (offset, value).
 pub(crate) const T6030_SGX_SETUP: (usize, u32) = (0xd1_4000, 0x7_0001);
-/// The default unit masks: each T6030 mask (0x7_0000_0003, 0x7) with one bit cleared, values a
-/// T6030 ran with.
-pub(crate) const UNIT_MASK_A: u64 = 0x7_0000_0001;
-pub(crate) const UNIT_MASK_B: u32 = 0x3;
-/// No unit-mask bit outside these is accepted: T6030's masks, without the second cluster's bit
-/// of mask A (T8122 has one cluster).
-pub(crate) const UNIT_MASK_A_LIMIT: u64 = 0x7_0000_0001;
+/// The default unit masks: the T8122 table's (`m3_soc::T8122_HWDATA_B`), which are T6030's.
+pub(crate) const UNIT_MASK_A: u64 = 0x7_0000_0003;
+pub(crate) const UNIT_MASK_B: u32 = 0x7;
+/// No unit-mask bit outside these is accepted: the default masks.
+pub(crate) const UNIT_MASK_A_LIMIT: u64 = 0x7_0000_0003;
 pub(crate) const UNIT_MASK_B_LIMIT: u64 = 0x7;
 /// The default performance-state ceiling: the lowest two states.
 pub(crate) const PSTATE_CAP: u32 = 2;
@@ -186,14 +184,14 @@ pub(crate) fn resolve(raw: &Raw) -> Result<Values, Refusal> {
         Some(v) if v == CLOCK_GEN_E1C || v == CLOCK_GEN_E5C => ClockGen::At(v),
         _ => return Err(refuse("t8122_clkgen", "e1c, e5c or none")),
     };
-    let sgx_setup = match given(raw.sgx_setup, 0) {
+    let sgx_setup = match given(raw.sgx_setup, 1) {
         Some(0) => None,
         Some(1) => Some(T6030_SGX_SETUP),
         _ => return Err(refuse("t8122_sgx_setup", "none or t6030")),
     };
     let unit_mask_a = given(raw.unit_mask_a, UNIT_MASK_A)
         .filter(|v| *v != 0 && *v & !UNIT_MASK_A_LIMIT == 0)
-        .ok_or(refuse("t8122_unit_mask_a", "nonzero, no bits outside 0x700000001"))?;
+        .ok_or(refuse("t8122_unit_mask_a", "nonzero, no bits outside 0x700000003"))?;
     let unit_mask_b = given(raw.unit_mask_b, UNIT_MASK_B as u64)
         .filter(|v| *v != 0 && *v & !UNIT_MASK_B_LIMIT == 0)
         .ok_or(refuse("t8122_unit_mask_b", "nonzero, no bits outside 0x7"))? as u32;
@@ -240,8 +238,8 @@ mod tests {
         assert_eq!(v.initdata_version, 0x0c08_e21e_8380_0490);
         assert_eq!(v.fender, 0x10_4000);
         assert_eq!(v.clock_gen, ClockGen::At(0xe1_c000));
-        assert_eq!(v.sgx_setup, None);
-        assert_eq!((v.unit_mask_a, v.unit_mask_b), (0x7_0000_0001, 3));
+        assert_eq!(v.sgx_setup, Some((0xd1_4000, 0x7_0001)));
+        assert_eq!((v.unit_mask_a, v.unit_mask_b), (0x7_0000_0003, 7));
         assert_eq!(v.pstate_cap, 2);
     }
 
@@ -251,7 +249,7 @@ mod tests {
             r.initdata_version = parse_number("0x123456789abcdef0");
             r.fender = parse_fender("adt");
             r.clkgen = parse_clkgen("e5c");
-            r.sgx_setup = parse_sgx_setup("t6030");
+            r.sgx_setup = parse_sgx_setup("none");
             r.unit_mask_a = parse_number("1");
             r.unit_mask_b = parse_number("0x1");
             r.pstate_cap = parse_number("5");
@@ -260,7 +258,7 @@ mod tests {
         assert_eq!(v.initdata_version, 0x1234_5678_9abc_def0);
         assert_eq!(v.fender, 0x12_c000);
         assert_eq!(v.clock_gen, ClockGen::At(0xe5_c000));
-        assert_eq!(v.sgx_setup, Some((0xd1_4000, 0x7_0001)));
+        assert_eq!(v.sgx_setup, None);
         assert_eq!((v.unit_mask_a, v.unit_mask_b, v.pstate_cap), (1, 1, 5));
         let v = resolve(&with(|r| r.clkgen = parse_clkgen("none"))).unwrap();
         assert_eq!(v.clock_gen, ClockGen::Absent);
@@ -283,7 +281,7 @@ mod tests {
             (|r| r.clkgen = parse_clkgen("0xe00000"), "t8122_clkgen"),
             (|r| r.clkgen = parse_clkgen("e5"), "t8122_clkgen"),
             (|r| r.sgx_setup = parse_sgx_setup("2"), "t8122_sgx_setup"),
-            (|r| r.unit_mask_a = parse_number("0x700000003"), "t8122_unit_mask_a"),
+            (|r| r.unit_mask_a = parse_number("0x700000007"), "t8122_unit_mask_a"),
             (|r| r.unit_mask_a = 0, "t8122_unit_mask_a"),
             (|r| r.unit_mask_b = parse_number("0xf"), "t8122_unit_mask_b"),
             (|r| r.unit_mask_b = 0, "t8122_unit_mask_b"),
@@ -326,10 +324,10 @@ mod tests {
     }
 
     #[test]
-    fn default_masks_are_within_the_limits_and_below_t6030() {
+    fn default_masks_are_within_the_limits() {
         assert_eq!(UNIT_MASK_A & !UNIT_MASK_A_LIMIT, 0);
         assert_eq!(u64::from(UNIT_MASK_B) & !UNIT_MASK_B_LIMIT, 0);
-        assert_eq!(UNIT_MASK_A_LIMIT | 0x2, 0x7_0000_0003);
+        assert_eq!(UNIT_MASK_A_LIMIT, 0x7_0000_0003);
         assert_eq!(UNIT_MASK_B_LIMIT, 0x7);
     }
 }

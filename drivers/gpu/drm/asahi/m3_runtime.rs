@@ -246,7 +246,13 @@ impl Runtime {
         while command_index<packet.commands.len() {
             let control=packet.commands[command_index];
             let batch_count=if matches!(control,crate::m3_submit::Command::Render{..}) {
-                packet.commands[command_index..].iter().take(render_batch_size)
+                // The first render draw initializes the shared buffer manager and opens both
+                // render queues: publish it alone. Draws appended to it would advance the shared
+                // manager and event counters it starts from.
+                let started=Option::as_ref(&*guard).ok_or(ENODEV)?.inner.jobs.iter()
+                    .any(|job| matches!(job,NativeJob::Render(j) if j.started()));
+                let limit=if started {render_batch_size} else {1};
+                packet.commands[command_index..].iter().take(limit)
                     .take_while(|c|matches!(c,crate::m3_submit::Command::Render{..})).count()
             } else {
                 packet.commands[command_index..].iter().take(compute_batch_size)
@@ -260,8 +266,9 @@ impl Runtime {
             let index=found.unwrap_or(inner.jobs.len());
             if found.is_none() {
                 let job=match control {
-                    crate::m3_submit::Command::Compute(c)=>NativeJob::Compute(crate::m3_compute::Compute::new(&inner.drm,&inner.uat,&packet.vm,inner.config.stats_region()?,c)?),
-                    crate::m3_submit::Command::Render{..}=>NativeJob::Render(crate::m3_render::Render::new(&inner.drm,&inner.uat,&packet.vm,inner.config.stats_region()?)?),
+                    crate::m3_submit::Command::Compute(c)=>NativeJob::Compute(crate::m3_compute::Compute::new(&inner.drm,&inner.uat,&packet.vm,inner.config.stats_region()?,c,inner.device.soc().registers)?),
+                    crate::m3_submit::Command::Render{..}=>NativeJob::Render(crate::m3_render::Render::new(&inner.drm,&inner.uat,&packet.vm,inner.config.stats_region()?,inner.device.soc().clusters,
+                        inner.device.soc().registers)?),
                 };
                 inner.jobs.push(job,GFP_KERNEL)?;
             } else {
@@ -346,9 +353,15 @@ impl Runtime {
                 if let Some(t)=poll_start {polling_ns+=t.elapsed().as_nanos();polls+=1;}
                 if complete {
                     let retire_start=measure.then(Instant::<Monotonic>::now);
-                    match inner.device.check_idle() {
+                    let retire_mmio=crate::m3_params::retire_mmio(inner.device.soc());
+                    match inner.device.check_idle_parts(
+                        retire_mmio&crate::m3_params::RETIRE_MMIO_BUSY!=0,
+                        retire_mmio&crate::m3_params::RETIRE_MMIO_FAULTS!=0) {
                         Ok(()) if inner.config.pipes_idle()?=>{
-                            if let Err(e)=inner.config.check_pstate(&inner.drm,&inner.device,"after a job") {
+                            let pstate=if retire_mmio&crate::m3_params::RETIRE_MMIO_PSTATE!=0 {
+                                inner.config.check_pstate(&inner.drm,&inner.device,"after a job")
+                            } else {Ok(())};
+                            if let Err(e)=pstate {
                                 inner.state.health.mark_failed();
                                 if crate::t8122_start::is_t8122(inner.device.soc()) {
                                     crate::t8122_start::cap_violated_verdict(inner.drm.as_ref(),e);

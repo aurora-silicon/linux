@@ -3,6 +3,8 @@ use crate::{m3_pool_layout::GpuRegion, m3_queue_layout::{Error, FirmwareVa}};
 pub(crate) const SIZE: usize = 0x893;
 pub(crate) const REGISTERS: usize = 0x20;
 pub(crate) const REGISTER_COUNT: usize = 22;
+/// G15G takes the same list without its last two registers (0xa599, 0xd411).
+pub(crate) const G15G_REGISTER_COUNT: usize = 20;
 pub(crate) const REGISTER_STRIDE: usize = 12;
 pub(crate) const CONTEXT: usize = 0x10;
 pub(crate) const COUNTER: usize = 4;
@@ -17,6 +19,13 @@ fn word(out: &mut [u8], off: usize, value: u32) { out[off..off+4].copy_from_slic
 fn pointer(out: &mut [u8], off: usize, value: u64) { out[off..off+8].copy_from_slice(&value.to_le_bytes()); }
 /// A four-byte-aligned byte address in the G15 lower 42-bit GPU root. This
 /// accepts subobjects (including packed register data), unlike page owners.
+/// The register lists a GPU's firmware expects in its commands: G15S's, or G15G's, which drop
+/// some G15S registers and keep the order, entry layout and placement of the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RegisterSet {
+    G15S,
+    G15G,
+}
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GpuVa(u64);
 impl GpuVa {
@@ -49,6 +58,7 @@ pub(crate) struct Command {
     pub(crate) tail_scratch: FirmwareVa,
     /// Old fixture is zero; prepare_completion requests one before dispatch.
     pub(crate) flush_stamps: bool,
+    pub(crate) register_set: RegisterSet,
 }
 impl Command {
     /// Validate before any output mutation. Encoding operates on ordinary host
@@ -77,13 +87,17 @@ impl Command {
         pointer(bytes, COUNTER, u64::from(self.counter));
         word(bytes, CONTEXT, self.context);
         pointer(bytes, 0x14, self.notifier.get());
-        for (n, (register, value)) in values.into_iter().enumerate() {
+        let count = match self.register_set {
+            RegisterSet::G15S => REGISTER_COUNT,
+            RegisterSet::G15G => G15G_REGISTER_COUNT,
+        };
+        for (n, (register, value)) in values.into_iter().take(count).enumerate() {
             word(bytes, REGISTERS+n*REGISTER_STRIDE, register);
             pointer(bytes, REGISTERS+n*REGISTER_STRIDE+4, value);
         }
         pointer(bytes, 0x720, registers.get());
-        bytes[0x728..0x72a].copy_from_slice(&(REGISTER_COUNT as u16).to_le_bytes());
-        bytes[0x72a..0x72c].copy_from_slice(&((REGISTER_COUNT*REGISTER_STRIDE) as u16).to_le_bytes());
+        bytes[0x728..0x72a].copy_from_slice(&(count as u16).to_le_bytes());
+        bytes[0x72a..0x72c].copy_from_slice(&((count*REGISTER_STRIDE) as u16).to_le_bytes());
         pointer(bytes, 0x760, self.microsequence.get());
         word(bytes, 0x768, self.microsequence_size);
         // ComputeInfo2 mirrors the preemption buffer, inclusive CDM end and

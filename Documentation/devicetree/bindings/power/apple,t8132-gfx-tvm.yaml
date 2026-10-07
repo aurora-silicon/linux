@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/apple,t8132-gfx-tvm.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8132 GFX TVM gate
+
+maintainers:
+  - Eryk Wieliczko <github@wieliczko.ninja>
+
+description: |
+  The T8132 GFX TVM enable bit must be set before powering the PMGR GFX
+  domain. It is described as a parent domain so the generic power-domain
+  framework orders power-on and power-off around PMGR and its consumers.
+  The resource covers the GFX control word only; adjacent TVM registers
+  and display power gates are not part of this device.
+
+allOf:
+  - $ref: power-domain.yaml#
+
+properties:
+  compatible:
+    oneOf:
+      - const: apple,t8132-gfx-tvm
+      - items:
+          - const: apple,t8122-gfx-tvm
+          - const: apple,t8132-gfx-tvm
+
+  reg:
+    maxItems: 1
+
+  '#power-domain-cells':
+    const: 0
+
+required:
+  - compatible
+  - reg
+  - '#power-domain-cells'
+
+additionalProperties: false

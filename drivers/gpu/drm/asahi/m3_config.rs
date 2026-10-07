@@ -90,10 +90,18 @@ impl Config {
         let mut objects = KVec::new();
         let mut iomaps = KVec::new();
         for index in 0..storage::COUNT {
-            let a=storage::allocation(index).map_err(|_|EINVAL)?;
+            let mut a=storage::allocation(index).map_err(|_|EINVAL)?;
             let image=contents.initial(index,&a)?;
             if a.initial!=storage::Initial::Zero && image.len()!=a.size {return Err(EINVAL);}
-            let mut b=Buffer::at(dev,uat.kernel_vm(),None,Some(a.address),a.size,a.gpu_shared)?;
+            // The SoC may place the HwData object elsewhere and have it mapped cacheable
+            // (`Soc::hwdata_object`); the records and the upload check use the live address.
+            let object=if index==HARDWARE_DATA {contents.hwdata_object} else {None};
+            if let Some(o)=object {a.address=o.address;}
+            let mut b=match object {
+                Some(o) if o.cached=>Buffer::at_prot(dev,uat.kernel_vm(),None,Some(a.address),a.size,
+                    prot::PROT_FW_PRIV_RW,prot::PROT_GPU_SHARED_RW)?,
+                _=>Buffer::at(dev,uat.kernel_vm(),None,Some(a.address),a.size,a.gpu_shared)?,
+            };
             b.write(0,image)?;objects.push(b,GFP_KERNEL)?;
         }
         for io in contents.iomaps {

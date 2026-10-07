@@ -1,29 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! The T8122 (M3, G15G) start experiment, `asahi.t8122_start=1`.
+//! The T8122 (M3, G15G) start, `asahi.t8122_start=1`.
 //!
-//! The T8122 table (`m3_soc::T8122`) lacks the InitData version of its firmware image, the
-//! runtime IO maps, the SGX setup write, the runtime HwDataB words and unit masks, the runtime
-//! allocation layout and a conservative performance-state ceiling, so the runtime refuses the
-//! SoC. With `asahi.t8122_start=1`, on a T8122 whose GPU the boot loader handed over (resource
-//! admission passed), the runtime starts it with the experiment values below instead. None of
-//! them is validated on G15G. Each value that is not known is a parameter, so that another
-//! value can be tried by rebooting:
+//! The T8122 table (`m3_soc::T8122`) is complete, but the runtime has not passed on an M3
+//! MacBook Air yet, so the SoC is refused unless `asahi.t8122_start=1` arms the start. On a T8122
+//! whose GPU the boot loader handed over (resource admission passed), an armed start uses the
+//! table's values, with a performance-state cap. Each value can be overridden for a lab A/B by
+//! rebooting with a parameter:
 //!
 //! | Parameter | Default | Others |
 //! |---|---|---|
 //! | `asahi.t8122_initdata_version` | `0x0c08e21e83800490`, the G15 14.8.3 version | any |
 //! | `asahi.t8122_fender` | `0x104000` (`rule`) | `0x12c000` (`adt`) |
 //! | `asahi.t8122_clkgen` | `e1c`: SGX+0xe1c000, read-only | `e5c`: SGX+0xe5c000, read-only; `none` |
-//! | `asahi.t8122_sgx_setup` | `none` | `t6030`: SGX+0xd14000 = 0x70001 |
-//! | `asahi.t8122_unit_mask_a` | `0x700000001` | nonzero, within `0x700000001` |
-//! | `asahi.t8122_unit_mask_b` | `0x3` | nonzero, within `0x7` |
-//! | `asahi.t8122_pstate_cap` | `2` | 1 to 15 (at or above the table's highest state: all of it) |
+//! | `asahi.t8122_sgx_setup` | `t6030`: SGX+0xd14000 = 0x70001 | `none` |
+//! | `asahi.t8122_unit_mask_a` | `0x700000003` | nonzero, within `0x700000003` |
+//! | `asahi.t8122_unit_mask_b` | `0x7` | nonzero, within `0x7` |
+//! | `asahi.t8122_pstate_cap` | `2` | 1 to 5 |
 //!
-//! The other HwDataB words, the runtime allocation layout and the fixed control words are the
-//! T6030 ones. A parameter given with a value it does not accept refuses the start. Without
-//! `asahi.t8122_start=1` nothing here runs, and T8122 is refused as before. Nothing here applies
-//! to any other SoC.
+//! The defaults are the T8122 table's values. A parameter given with a value it does not accept
+//! refuses the start. Without `asahi.t8122_start=1` nothing here runs, and T8122 is refused.
+//! Nothing here applies to any other SoC.
 
 use core::mem::offset_of;
 
@@ -34,7 +31,7 @@ use crate::{
     initdata::G15RuntimeHwDataB,
     m3_adt_config::T8122_IO_MAPPINGS,
     m3_init_storage::{self as storage, IoMap},
-    m3_soc::{IoMapping, Soc, T6030_HWDATA_B},
+    m3_soc::{IoMapping, Soc, T8122_HWDATA_B},
     pgtable::{prot, Prot},
     t8122_knobs::{
         self as knobs, ClockGen, Start, Values, CLOCK_GEN_E1C, CLOCK_GEN_E5C, FENDER_ADT,
@@ -50,13 +47,6 @@ const CLOCK_GEN: usize = 11;
 /// The HwDataB slot of the GPU clock generator.
 const CLOCK_GEN_SLOT: usize = 29;
 
-/// The runtime HwDataB words of the experiment: T6030's, with the default unit masks of
-/// `t8122_knobs`. The unit masks uploaded are the parameters' ([`Experiment::unit_masks`]).
-pub(crate) static T8122_HWDATA_B: G15RuntimeHwDataB = G15RuntimeHwDataB {
-    unit_mask_a: knobs::UNIT_MASK_A,
-    unit_mask_b: knobs::UNIT_MASK_B,
-    ..T6030_HWDATA_B
-};
 
 /// The firmware IO mappings with the Fender window `fender` and the clock generator at
 /// SGX + `clock_gen`.
@@ -114,6 +104,14 @@ const fn maps_cover(mappings: &[IoMapping; 12], maps: &[IoMap; 12]) -> bool {
 }
 
 const _: () = {
+    // The default variant's IO mappings are the T8122 table's.
+    let defaults = mappings(FENDER_RULE, CLOCK_GEN_E1C);
+    let mut j = 0;
+    while j < 12 {
+        let (a, b) = (defaults[j], T8122_IO_MAPPINGS[j]);
+        assert!(a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.3 == b.3 && a.4 == b.4);
+        j += 1;
+    }
     // The T8122 table: the Fender window at the rule size, the clock generator last, at
     // SGX+0xe1c000, 16 KiB, read-only.
     assert!(T8122_IO_MAPPINGS[FENDER].0 == 0 && T8122_IO_MAPPINGS[FENDER].1 == SGX + 0xd0_0000);
@@ -133,15 +131,16 @@ const _: () = {
         assert!(maps_cover(&IO_MAPPINGS[i], &IOMAPS[i]));
         i += 1;
     }
-    // The unit-mask limits are T6030's masks, less the second cluster's bit of mask A.
-    assert!(T6030_HWDATA_B.unit_mask_a == knobs::UNIT_MASK_A_LIMIT | 0x2);
-    assert!(T6030_HWDATA_B.unit_mask_b as u64 == knobs::UNIT_MASK_B_LIMIT);
+    // The default unit masks are the T8122 table's, and the limits allow them.
+    assert!(T8122_HWDATA_B.unit_mask_a == knobs::UNIT_MASK_A);
+    assert!(T8122_HWDATA_B.unit_mask_b == knobs::UNIT_MASK_B);
+    assert!(knobs::UNIT_MASK_A & !knobs::UNIT_MASK_A_LIMIT == 0);
+    assert!(knobs::UNIT_MASK_B as u64 & !knobs::UNIT_MASK_B_LIMIT == 0);
     assert!(offset_of!(raw::HwDataBG15V14_8_3, unit_mask_a) == 0x17c0);
     assert!(offset_of!(raw::HwDataBG15V14_8_3, unit_mask_b) == 0x17c8);
-    // An armed start skips `require_complete`, so the experiment stands in for exactly the two
-    // `unported` items the T8122 table lists. If a third is added, this fails the build until the
-    // experiment accounts for it.
-    assert!(crate::m3_soc::T8122.unported.len() == 2);
+    // An armed start skips `require_complete`. The only `unported` item of the T8122 table is the
+    // opt-in itself; if another is added, this fails the build until the start accounts for it.
+    assert!(crate::m3_soc::T8122.unported.len() == 1);
 };
 
 /// The values of one armed boot.
@@ -179,8 +178,12 @@ impl Experiment {
         &IO_MAPPINGS[self.variant()][..self.mapping_count()]
     }
 
-    /// The runtime's mapping of each of them.
+    /// The runtime's mapping of each of them. With the default Fender window and clock generator
+    /// they are the T8122 table's own IO maps.
     pub(crate) fn iomaps(&self) -> &'static [IoMap] {
+        if self.0.fender == FENDER_RULE && self.0.clock_gen == ClockGen::At(CLOCK_GEN_E1C) {
+            return &crate::m3_adt_config::T8122_IOMAPS;
+        }
         &IOMAPS[self.variant()][..self.mapping_count()]
     }
 
@@ -201,7 +204,8 @@ impl Experiment {
         }
     }
 
-    /// The runtime HwDataB words. The unit masks are written over them ([`Self::unit_masks`]).
+    /// The runtime HwDataB words: the T8122 table's. The unit masks are written over them
+    /// ([`Self::unit_masks`]).
     pub(crate) fn hwdata_b(&self) -> &'static G15RuntimeHwDataB {
         &T8122_HWDATA_B
     }
@@ -293,7 +297,7 @@ pub(crate) fn arm(dev: &device::Device, soc: &Soc) -> Result<Option<Experiment>>
     );
     dev_warn!(
         dev,
-        "M3 G15G start: unvalidated on G15G: {} IO mappings at firmware VA {:#x}; the other HwDataB words, the runtime allocation layout and the fixed control words are T6030's\n",
+        "M3 G15G start: the T8122 table's InitData words, HwData placement and register lists; {} IO mappings at firmware VA {:#x}\n",
         e.mapping_count(),
         storage::IOMAP_BASE
     );

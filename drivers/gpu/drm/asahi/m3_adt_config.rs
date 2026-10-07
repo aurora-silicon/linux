@@ -12,6 +12,7 @@ use kernel::{
 };
 
 use crate::{
+    float::F32,
     fw::initdata::raw,
     hw, initdata,
     initdata::{G15Layout, G15Options},
@@ -66,24 +67,29 @@ pub(crate) const T6030_IO_MAPPINGS: [IoMapping; 15] = [
 ];
 
 /// The T8122 firmware IO mappings of the runtime backend, in the same form: the blocks of
-/// `hw::t8122`, each with the total size of its instances and the size of one. The AIC timer
-/// entry is the T6030 one, the same register on every SoC. Before writing them,
-/// `fill_io_mappings` checks every entry against the runtime's IO maps of the SoC, which T8122
-/// does not have yet (`m3_soc::T8122.iomaps`).
+/// `hw::t8122`, with the exact register, total size and element size the G15G firmware takes in
+/// each slot. The AIC timer entry is the T6030 one, the same register on every SoC.
+/// `fill_io_mappings` checks every entry against the runtime's IO maps of the SoC
+/// ([`T8122_IOMAPS`]) before writing it.
 pub(crate) const T8122_IO_MAPPINGS: [IoMapping; 12] = [
     (0, 0x2_90d0_0000, 0x10_4000, 0x10_4000, true), // Fender
     (1, 0x2_0e10_1000, 1, 1, false),                // AIC timer
-    (2, 0x2_d101_4000, 0x4000, 0x4000, true),       // AIC software interrupts
+    (2, 0x2_d101_4048, 1, 1, true),                 // AIC software interrupt register
     (3, 0x2_9000_0000, 0x2_0000, 0x2_0000, true),   // RGX
     (9, 0x2_90e0_8000, 0x8000, 0x8000, true),       // metrology sensors
     (10, 0x2_90d0_d000, 0x1000, 0x1000, true),      // GM GIFAF registers
-    (11, 0x2_2000_0000, 0xb_0000, 0x5_8000, true),  // memory cache, two instances
+    (11, 0x2_2000_0000, 0xa_a000, 0x5_5000, true),  // memory cache, two instances
     (18, 0x2_d03d_0000, 0x1000, 0x1000, true),      // telemetry dashboard
     (19, 0x2_d03c_0000, 0x2000, 0x2000, false),     // telemetry dashboard (read)
-    (25, 0x3_1145_c000, 0x4000, 0x4000, true),      // ANE doorbell
+    (25, 0x3_1145_c000, 1, 1, true),                // ANE doorbell
     (26, 0x2_d028_0000, 0x8000, 0x8000, false),     // PMS metrology sensors
     (29, 0x2_90e1_c000, 0x4000, 0x4000, false),     // GPU clock generator
 ];
+
+/// The T8122 runtime's IO maps (`m3_soc::T8122.iomaps`): its IO mappings, laid out as the T6030
+/// ones are.
+pub(crate) static T8122_IOMAPS: [storage::IoMap; 12] =
+    storage::pack_iomaps(&T8122_IO_MAPPINGS, storage::IOMAP_BASE);
 
 /// Whether every entry of `mappings` is a whole number of elements in the HwConfig block of the
 /// same slot, with the same writability: the check `fill_io_mappings` makes when it builds the
@@ -251,6 +257,8 @@ pub(crate) struct Contents {
     /// The HwDataB slots whose IO maps the firmware gets read-only, as a bit mask. 0 (every IO
     /// map read-write) except in the T8122 start experiment.
     pub(crate) read_only_slots: u32,
+    /// The HwData object's placement and mapping (`Soc::hwdata_object`).
+    pub(crate) hwdata_object: Option<crate::m3_soc::HwDataObject>,
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
@@ -344,7 +352,7 @@ impl Contents {
             pstates.max_mhz
         );
         let read_only_slots = experiment.map_or(0, |e| e.read_only_slots());
-        Ok(Contents { images, pstates, iomaps, table, read_only_slots })
+        Ok(Contents { images, pstates, iomaps, table, read_only_slots, hwdata_object: soc.hwdata_object })
     }
 
     /// Check the contents before they are uploaded.
@@ -642,6 +650,78 @@ pub(crate) fn check_upload(
     Ok(())
 }
 
+/// The whole part of a positive `F32`, for logs.
+fn whole(v: F32) -> u32 {
+    let bits = v.to_bits();
+    match ((bits >> 23) & 0xff) as i32 - 127 {
+        e if e < 0 => 0,
+        e if e > 31 => u32::MAX,
+        e if e > 23 => ((bits & 0x7f_ffff) | 0x80_0000) << (e - 23),
+        e => ((bits & 0x7f_ffff) | 0x80_0000) >> (23 - e),
+    }
+}
+
+/// The boot loader's decoded GPU leakage fuse values (`Soc::leak_fuse`), logged when it exported
+/// them. Returns them when the boot loader's switch is set. With the switch set and no two
+/// valid values, refuses: the boot loader then used neither the fuse nor the stand-in.
+fn leak_fuse(dev: &device::Device, lf: &crate::m3_soc::LeakFuse) -> Result<Option<[F32; 2]>> {
+    let chosen = kernel::of::chosen();
+    let switch = chosen
+        .as_ref()
+        .and_then(|c| c.get_property::<KVec<u8>>(lf.switch).ok())
+        .is_some_and(|v| v.as_slice() == b"1\0");
+    let values: Option<KVec<F32>> = chosen.as_ref().and_then(|c| c.get_property(lf.values).ok());
+    // Positive, finite, nonzero.
+    let valid = |v: &F32| {
+        let b = v.to_bits();
+        b != 0 && b >> 31 == 0 && (b >> 23) & 0xff != 0xff
+    };
+    let pair = values
+        .as_ref()
+        .filter(|v| v.len() == 2 && v.iter().all(valid))
+        .map(|v| [v[0], v[1]]);
+    let names = (lf.values.to_str().unwrap_or("?"), lf.switch.to_str().unwrap_or("?"));
+    match (pair, switch) {
+        (Some([a, b]), true) => {
+            dev_info!(
+                dev,
+                "M3: GPU leakage from the boot loader's fuse values: {} and {} (/chosen/{}, {} set)\n",
+                whole(a),
+                whole(b),
+                names.0,
+                names.1
+            );
+            Ok(Some([a, b]))
+        }
+        (Some([a, b]), false) => {
+            dev_info!(
+                dev,
+                "M3: the boot loader's GPU leakage fuse values are {} and {} (/chosen/{}); not used: {} is not set\n",
+                whole(a),
+                whole(b),
+                names.0,
+                names.1
+            );
+            Ok(None)
+        }
+        (None, true) => {
+            dev_err!(
+                dev,
+                "M3: {} is set, but /chosen/{} does not hold two valid values; GPU startup disabled\n",
+                names.1,
+                names.0
+            );
+            Err(EINVAL)
+        }
+        (None, false) => {
+            if values.is_some() {
+                dev_warn!(dev, "M3: /chosen/{} is malformed; ignored\n", names.0);
+            }
+            Ok(None)
+        }
+    }
+}
+
 /// A zeroed image of owner `index`.
 fn zeroed(index: usize) -> Result<KVVec<u8>> {
     let size = storage::allocation(index).map_err(|_| EINVAL)?.size;
@@ -668,9 +748,48 @@ fn build_images(
         Some(e) => e.hwdata_b(),
         None => soc.hwdata_b.ok_or(ENODEV)?,
     };
-    let pwr = hw::PwrConfig::load(dev, cfg).inspect_err(|e| {
+    let mut pwr = hw::PwrConfig::load(dev, cfg).inspect_err(|e| {
         dev_err!(dev, "M3: cannot read the GPU power configuration from the device tree ({:?})\n", e)
     })?;
+    // The boot loader's decoded leakage fuse, when its switch makes it this boot's leakage: value
+    // 1 is the core leakage coefficient (the boot loader then writes it as apple,core-leak-coef
+    // too), value 2 goes to HwDataA's third leakage table below.
+    let fuse = match soc.leak_fuse {
+        Some(lf) => leak_fuse(dev, &lf)?,
+        None => None,
+    };
+    if let Some([core, _]) = fuse {
+        match pwr.core_leak_coef.first_mut() {
+            Some(c) if c.to_bits() != core.to_bits() => {
+                dev_info!(
+                    dev,
+                    "M3: core leakage {} replaces the device tree's {}\n",
+                    whole(core),
+                    whole(*c)
+                );
+                *c = core;
+            }
+            Some(_) => {}
+            None => return Err(EINVAL),
+        }
+    }
+    // A SoC whose power model is still a stand-in caps the power target: every operating point's
+    // power is scaled by the same factor, so the relative powers stay the boot loader's.
+    if let Some(cap) = soc.power_target_cap_mw {
+        let max = pwr.max_power_mw;
+        if max > cap {
+            for ps in pwr.perf_states.iter_mut() {
+                ps.pwr_mw = (u64::from(ps.pwr_mw) * u64::from(cap) / u64::from(max)) as u32;
+            }
+            pwr.max_power_mw = pwr.perf_states.iter().map(|ps| ps.pwr_mw).max().unwrap_or(cap);
+            dev_info!(
+                dev,
+                "M3: GPU power target capped at {} mW (the device tree's operating points reach {} mW)\n",
+                pwr.max_power_mw,
+                max
+            );
+        }
+    }
     let node = dev.of_node().ok_or(ENODEV)?;
     let dyncfg = hw::DynConfig {
         uat_ttb_base: firmware.resources.regions[0].base,
@@ -744,20 +863,30 @@ fn build_images(
         HWDATA_A + offset_of!(raw::HwDataAG15V14_8_3, init_timestamp),
         &now.to_le_bytes(),
     )?;
-    // A SoC whose power configuration comes from the boot loader takes this machine's fast-die
-    // sensor mask from it too (the ADT's gpu-fast-die0-sensor-mask, required at admission), in
-    // both HwDataA copies, instead of the HwConfig's.
-    if soc.power_from_boot_loader {
-        let mask: u64 = node.get_property(c_str!("apple,fast-die0-sensor-mask")).inspect_err(|_| {
-            dev_err!(dev, "M3: cannot read apple,fast-die0-sensor-mask from the device tree\n")
-        })?;
-        for at in [
-            offset_of!(raw::HwDataAG15V14_8_3, fast_die0_sensor_mask),
-            offset_of!(raw::HwDataAG15V14_8_3, fast_die0_sensor_mask_2),
-        ] {
-            write(&mut hwdata, HWDATA_A + at, &mask.to_le_bytes())?;
+    // The SoC's MTR sensor masks, where its table gives them.
+    if let Some(m) = soc.mtr_masks {
+        type A = raw::HwDataAG15V14_8_3;
+        for at in [offset_of!(A, fast_die0_sensor_mask), offset_of!(A, fast_die0_sensor_mask_2)] {
+            write(&mut hwdata, HWDATA_A + at, &m.fast_die.to_le_bytes())?;
         }
-        dev_info!(dev, "M3: fast-die sensor mask {:#x}, from the boot loader\n", mask);
+        write(&mut hwdata, HWDATA_A + offset_of!(A, fast_die0_sensor_mask_alt), &m.alarm.to_le_bytes())?;
+        dev_info!(
+            dev,
+            "M3: MTR sensor masks: fast-die {:#x}, alarm {:#x}\n",
+            m.fast_die,
+            m.alarm
+        );
+    }
+    // The second leakage fuse value: the first entry of HwDataA's third leakage table (the first
+    // table holds the core coefficient, from the builder).
+    if let Some([_, second]) = fuse {
+        type A = raw::HwDataAG15V14_8_3;
+        let at = HWDATA_A + offset_of!(A, cluster_tables) + 2 * size_of::<[u32; 8]>();
+        write(&mut hwdata, at, &second.to_bits().to_le_bytes())?;
+    }
+    // The SoC's own values for words the shared builder writes otherwise.
+    for &(at, value) in soc.hwdata_words {
+        write(&mut hwdata, at, &value.to_le_bytes())?;
     }
     // On T8122, log and require the two HwDataB words the firmware's power management depends
     // on: it powers the GPU cores up for a job only when +0xa38 and +0xa40 are both nonzero.
@@ -779,6 +908,29 @@ fn build_images(
 
     let mut globals = zeroed(GLOBALS)?;
     write(&mut globals, 0, initdata::raw_bytes(&*c.globals))?;
+    // The gate of the firmware's frequency-feedback cap, per SoC.
+    let (ut, given) = m3_params::ut_engagement(soc);
+    write(&mut globals, offset_of!(raw::GlobalsG15V14_8_3, ut_engagement), &ut.to_le_bytes())?;
+    for &(at, value) in soc.globals_words {
+        write(&mut globals, at, &value.to_le_bytes())?;
+    }
+    if !soc.hwdata_words.is_empty() || !soc.globals_words.is_empty() {
+        dev_info!(
+            dev,
+            "M3: {} HwData and {} Globals words set from the {} table\n",
+            soc.hwdata_words.len(),
+            soc.globals_words.len(),
+            soc.name
+        );
+    }
+    if ut != 1 || given {
+        dev_info!(
+            dev,
+            "M3: Globals ut_engagement={}{}\n",
+            ut,
+            if given { " (asahi.m3_ut_engagement)" } else { "" }
+        );
+    }
     images[GLOBALS] = Some(globals);
 
     let mut power = zeroed(GLOBALS_POWER)?;

@@ -123,9 +123,9 @@ pub(crate) const HWCONFIG_T8122: super::HwConfig = HwConfig {
     // Idle-off standby timer when the device tree gives none: the J613 ADT has no
     // gpu-idleoff-standby-timer.
     idle_off_standby_timer_default: 700,
-    // No smart idle-off curve; those Globals words stay 0.
-    unk_hws2_4: None,
-    unk_hws2_24: 0,
+    // The smart idle-off curve and count, the same as T6030's.
+    unk_hws2_4: Some(f32!([1.0, 0.8, 0.2, 0.9, 0.1, 0.25, 0.7, 0.9])),
+    unk_hws2_24: 6,
     // The M3 runtime writes 0xffff to this Globals word in any case.
     global_unk_54: 0,
     // SRAM power scale 1.02 for every performance state, as on T6030.

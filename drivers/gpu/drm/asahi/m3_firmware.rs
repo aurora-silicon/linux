@@ -44,7 +44,8 @@ pub(crate) static KNOWN_IMAGES: [KnownImage; 2] = [
     },
 ];
 
-/// The G15 InitData version of firmware-compat 14.8.3: the version of both T6030 images.
+/// The G15 InitData version of firmware-compat 14.8.3: the version of both T6030 images and of
+/// the T8122 image.
 pub(crate) const G15_V14_8_3_INITDATA: u64 = 0x0c08_e21e_8380_0490;
 
 /// The image-info UUID of the T8122 C0 firmware-compat 14.8.3 image.
@@ -52,18 +53,17 @@ const T8122_C0_UUID: [u8; 16] = [
     0xdf, 0x69, 0x7f, 0x05, 0xf6, 0xb5, 0x33, 0xef, 0xa1, 0x37, 0x61, 0xc4, 0xa7, 0x3d, 0x66, 0x6a,
 ];
 
-/// T8122 C0, firmware-compat 14.8.3. Identity and segment layout are recorded, but the
-/// InitData version is not validated, so this record cannot admit runtime startup.
+/// T8122 C0, firmware-compat 14.8.3: the image the macOS 14.8.3 system firmware loads on the
+/// M3 MacBook Airs. It takes the G15 14.8.3 InitData version.
 pub(crate) static KNOWN_IMAGES_T8122: [KnownImage; 1] = [KnownImage {
     name: "T8122 C0 firmware-compat 14.8.3",
     uuid: Some(T8122_C0_UUID),
     stkg_sha256: None,
-    initdata_magic: None,
+    initdata_magic: Some(G15_V14_8_3_INITDATA),
 }];
 
 /// The same T8122 image for the start experiment (`t8122_start`, only with
-/// `asahi.t8122_start=1`). Its InitData version is the G15 14.8.3 one, not validated on G15G:
-/// the firmware accepting the InitData is the check. `asahi.t8122_initdata_version` replaces it.
+/// `asahi.t8122_start=1`), where `asahi.t8122_initdata_version` may replace the version.
 pub(crate) static KNOWN_IMAGES_T8122_EXPERIMENT: [KnownImage; 1] = [KnownImage {
     name: "T8122 C0 firmware-compat 14.8.3 (start experiment)",
     uuid: Some(T8122_C0_UUID),

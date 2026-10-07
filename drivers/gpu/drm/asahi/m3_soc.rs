@@ -7,11 +7,12 @@
 //! Admission rejects either before reading firmware, mapping GPU registers or starting the
 //! GPU coprocessor ([`Soc::require_complete`]).
 
-use kernel::{device, prelude::*};
+use kernel::{c_str, device, prelude::*};
 
 use crate::{
     hw,
     initdata::G15RuntimeHwDataB,
+    m3_compute_layout::RegisterSet,
     m3_board::KnownImage,
     m3_firmware::Layout,
     m3_init_storage::IoMap, //
@@ -59,6 +60,39 @@ pub(crate) struct Features {
     pub(crate) compute_wide_visibility: bool,
     /// `DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY`, while `asahi.m3_early_tiling` is set.
     pub(crate) fragment_dependency: bool,
+}
+
+/// The MTR temperature-sensor masks of the runtime's HwDataA, where the SoC table sets them
+/// instead of the hardware configuration.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct MtrMasks {
+    /// The fast-die sensor mask, in both HwDataA copies (+0x8ac and +0x1288).
+    pub(crate) fast_die: u64,
+    /// The mask the firmware matches an MTR alarm against (HwDataA +0x1a98). An alarm from a
+    /// sensor outside it, or any alarm while it is 0, is fatal to the firmware.
+    pub(crate) alarm: u64,
+}
+
+/// Where the boot loader exports a SoC's decoded GPU leakage fuse values, in `/chosen`, and the
+/// boot loader switch that makes them this boot's leakage.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct LeakFuse {
+    /// Two cells, value 1 then value 2, encoded as `apple,core-leak-coef` is.
+    pub(crate) values: &'static CStr,
+    /// The switch: the boot loader uses the values exactly when it holds the string "1" (the
+    /// two bytes `1\0`), the form it copies from its configuration line.
+    pub(crate) switch: &'static CStr,
+}
+
+/// Where the runtime places the HwData object (`m3_init_storage::HARDWARE_DATA`), when it is not
+/// the fixed allocation's address, and how the firmware maps it.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct HwDataObject {
+    /// Firmware VA of the object.
+    pub(crate) address: u64,
+    /// Map the object cacheable for the firmware (its atomic updates need cacheable memory)
+    /// instead of uncached.
+    pub(crate) cached: bool,
 }
 
 /// One firmware IO mapping of the runtime's InitData: HwDataB slot, physical address, total
@@ -120,6 +154,28 @@ pub(crate) struct Soc {
     pub(crate) power_from_boot_loader: bool,
     /// Code the runtime runs after admission that still holds another SoC's values.
     pub(crate) unported: &'static [&'static str],
+    /// The GPU registers read after every job by default (`asahi.m3_retire_mmio` bits).
+    pub(crate) retire_mmio: u64,
+    /// The MTR sensor masks, when they are not the hardware configuration's.
+    pub(crate) mtr_masks: Option<MtrMasks>,
+    /// The HwData object's placement and mapping, when they are not the fixed allocation's.
+    pub(crate) hwdata_object: Option<HwDataObject>,
+    /// The register lists the GPU's firmware expects in compute and render commands.
+    pub(crate) registers: RegisterSet,
+    /// Globals +0x7d0, which gates the firmware's frequency-feedback cap: the firmware measures
+    /// the GPU clock against the requested performance state and, while this is 1, caps the
+    /// state on a shortfall (`asahi.m3_ut_engagement` overrides it).
+    pub(crate) ut_engagement: u32,
+    /// The highest GPU power target, in mW, while the boot loader's power model is a stand-in:
+    /// the operating points' powers are scaled down together so that the highest is this.
+    pub(crate) power_target_cap_mw: Option<u32>,
+    /// Words of the generated HwData object (offset into the object, value) that this SoC's
+    /// firmware takes with other values than the shared builder writes.
+    pub(crate) hwdata_words: &'static [(usize, u32)],
+    /// The same for the Globals object.
+    pub(crate) globals_words: &'static [(usize, u32)],
+    /// The boot loader's decoded GPU leakage fuse, when it exports one for this SoC.
+    pub(crate) leak_fuse: Option<LeakFuse>,
 }
 
 impl Soc {
@@ -186,6 +242,17 @@ pub(crate) static T6030_HWDATA_B: G15RuntimeHwDataB = G15RuntimeHwDataB {
     unk_1818: 1,
 };
 
+/// The HwDataB configuration words and unit masks of the T8122 runtime InitData: T6030's, except
+/// for four words the G15G firmware takes with other values (+0xa2c, the chip revision's major
+/// number; +0xb20, the core slots; +0x17b8; +0x1818). The unit masks are T6030's.
+pub(crate) static T8122_HWDATA_B: G15RuntimeHwDataB = G15RuntimeHwDataB {
+    unk_454: 2,
+    unk_b20: 0x0a,
+    unk_17b8: 4,
+    unk_1818: 0xffff_ffff,
+    ..T6030_HWDATA_B
+};
+
 /// Every SoC the M3 runtime has a table for.
 pub(crate) static SOCS: [&Soc; 2] = [&T6030, &T8122];
 
@@ -244,6 +311,19 @@ pub(crate) static T6030: Soc = Soc {
     },
     power_from_boot_loader: false,
     unported: &[],
+    // Engine-busy, fault banks and performance state.
+    retire_mmio: 7,
+    // The hardware configuration's fast-die mask; no alarm mask.
+    mtr_masks: None,
+    // The fixed allocation, uncached.
+    hwdata_object: None,
+    registers: RegisterSet::G15S,
+    ut_engagement: 1,
+    power_target_cap_mw: None,
+    hwdata_words: &[],
+    globals_words: &[],
+    // The boot loader reads the T6030 leakage fuse itself and writes apple,core-leak-coef.
+    leak_fuse: None,
 };
 
 /// T8122 (M3, G15G): one die, one cluster of ten core slots (eight or ten of them active).
@@ -252,9 +332,10 @@ pub(crate) static T6030: Soc = Soc {
 /// the one the T8122 identity gate admits (`t8122_admission`: family 7, variant 2, revision 0x20,
 /// core slots in the first core-mask word only), with the die count of the AGX3 identification
 /// table (`hw::agx3::T8122`). The hardware configuration is `hw::t8122`; power configuration
-/// comes from the boot loader. The runtime rejects the SoC while the rest of its configuration is
-/// missing, before accessing the GPU, unless `asahi.t8122_start=1` arms the start experiment
-/// (`t8122_start`), whose values then stand in for the missing ones.
+/// comes from the boot loader. The rest of the runtime configuration is complete, but until the
+/// runtime has passed on an M3 MacBook Air the SoC is refused, before the GPU is accessed, unless
+/// `asahi.t8122_start=1` arms the start (`t8122_start`), which uses this table's values and adds a
+/// performance-state cap.
 pub(crate) static T8122: Soc = Soc {
     name: "T8122",
     gpu_name: "G15G",
@@ -292,11 +373,12 @@ pub(crate) static T8122: Soc = Soc {
     firmware: Some(&crate::m3_firmware::T8122_LAYOUT),
     hwcfg: Some(&hw::t8122::HWCONFIG_T8122),
     io_mappings: Some(&crate::m3_adt_config::T8122_IO_MAPPINGS),
-    iomaps: None,
+    iomaps: Some(&crate::m3_adt_config::T8122_IOMAPS),
     // The boot loader's ladder from this machine's ADT (J613: eight voltages, up to 1338 MHz).
     pstates: PstateTable::DeviceTree,
-    sgx_setup: None,
-    hwdata_b: None,
+    // The same SGX setup write as on T6030.
+    sgx_setup: Some((0xd14000, 0x70001)),
+    hwdata_b: Some(&T8122_HWDATA_B),
     // Neither is validated on G15G yet; userspace keeps its default ordering and visibility.
     features: Features {
         compute_wide_visibility: false,
@@ -304,7 +386,90 @@ pub(crate) static T8122: Soc = Soc {
     },
     power_from_boot_loader: true,
     unported: &[
-        "T8122 runtime allocation layout and fixed control words",
-        "T8122 conservative performance-state ceiling",
+        "a pass on an M3 MacBook Air: until then the GPU starts only with asahi.t8122_start=1",
     ],
+    // The performance state only. On the single-cluster G15G, reading the engine-busy or the
+    // fault-bank registers after every job hangs the SoC within seconds at about 1000 jobs/s;
+    // the performance-state read alone does not, and a per-frame readback saw no job retired
+    // before its writes were visible.
+    retire_mmio: 4,
+    // The fast-die controller's sensors (0x4248, both copies), and every sensor the MTR block
+    // enables as the alarm mask (sensors 3, 6, 8, 9, 11 and 14: 0x4b48, the upper half of the
+    // block's configuration word 0x4b480003). With the second fast-die copy at 0, or an alarm
+    // mask without sensor 8, the firmware stopped on its first MTR alarm.
+    mtr_masks: Some(MtrMasks {
+        fast_die: 0x4248,
+        alarm: 0x4b48,
+    }),
+    // The firmware's MTR alarm handler does a 64-bit atomic update of HwDataA +0x4350. The fixed
+    // allocation ends the 0x8a04-byte object at its page end, leaving HwDataA (+0x4580) only
+    // 4-byte aligned, and the update took an alignment fault. Starting the object 0x8a80 bytes
+    // before the same page end puts HwDataA on a 16-byte boundary. Aligned, the update then
+    // faulted as an unsupported atomic on the uncached mapping: map it cacheable.
+    hwdata_object: Some(HwDataObject {
+        address: T8122_HWDATA_ADDRESS,
+        cached: true,
+    }),
+    registers: RegisterSet::G15G,
+    // On a T8122 with the 14.8.3 system firmware the shader clock runs at 3/4 of every requested
+    // state, so with the cap engaged the GPU stays at state 2 (462 MHz effective) under any load.
+    // With 0 it reaches the requested states (state 8: about 1000 MHz effective).
+    ut_engagement: 0,
+    // The boot loader's T8122 power model is a stand-in that overstates the power (its highest
+    // operating point is about 30 W). Until each Mac's fused leakage gives a real one, scale it
+    // to a 22 W target, about the GPU power budget of an M3 MacBook Air.
+    power_target_cap_mw: Some(22_000),
+    hwdata_words: &T8122_HWDATA_WORDS,
+    globals_words: &T8122_GLOBALS_WORDS,
+    // Exported on a J613 on every boot; used only with the boot loader's switch, which also makes
+    // value 1 its apple,core-leak-coef and the base of its operating points' powers.
+    leak_fuse: Some(LeakFuse {
+        values: c_str!("asahi,t8122-gpu-leak-fuse"),
+        switch: c_str!("asahi,t8122-gpu-fuse-leakage"),
+    }),
+};
+
+/// The T8122 HwData words that differ from the shared builder's (offsets into the object;
+/// HwDataA starts at +0x4580):
+/// - HwDataB +0xa30 and +0xa34: 0 and 4 (T6030: 1 and 0);
+/// - HwDataB +0x17e0..+0x1860: the G15G firmware's flag words (T6030 has 1 at +0x17e8,
+///   +0x1804, +0x1814 and +0x1860 and all-ones at +0x1848);
+/// - HwDataA +0x11e0: 30 (T6030: 40), a word of the shader-engine controller block;
+/// - HwDataA +0x1290: 125, and HwDataA +0x424c: 24000000, the 24 MHz reference clock.
+static T8122_HWDATA_WORDS: [(usize, u32); 17] = [
+    (0xa30, 0),
+    (0xa34, 4),
+    (0x17e0, 1),
+    (0x17e8, 0),
+    (0x17f4, 1),
+    (0x17f8, 1),
+    (0x1804, 0),
+    (0x180c, 1),
+    (0x1814, 0),
+    (0x181c, 0xffff_ffff),
+    (0x1848, 0),
+    (0x184c, 0),
+    (0x1858, 1),
+    (0x1860, 0),
+    (0x4580 + 0x11e0, 30),
+    (0x4580 + 0x1290, 125),
+    (0x4580 + 0x424c, 24_000_000),
+];
+
+/// The T8122 Globals words that differ from the shared builder's: +0x9bc, the CDM backoff
+/// timeout (4) with the three bytes after it 0 (T6030: 1, 0, 0).
+static T8122_GLOBALS_WORDS: [(usize, u32); 1] = [(0x9bc, 4)];
+
+/// The T8122 HwData object's firmware VA: 0x8a80 bytes before the end of the fixed allocation's
+/// last page.
+const T8122_HWDATA_ADDRESS: u64 = 0xffff_fc20_4070_4000 - 0x8a80;
+
+// The fixed HwData allocation (`m3_init_storage::allocation`): 0x8a04 bytes ending at the page
+// end 0xfffffc2040704000. The moved object stays inside the same pages, and HwDataA is 16-byte
+// aligned.
+const _: () = {
+    let (fixed, size) = (0xffff_fc20_406f_b5fc_u64, 0x8a04_u64);
+    assert!(T8122_HWDATA_ADDRESS & !0x3fff == fixed & !0x3fff);
+    assert!(T8122_HWDATA_ADDRESS + size <= (fixed + size + 0x3fff) & !0x3fff);
+    assert!((T8122_HWDATA_ADDRESS + crate::m3_adt_config::HWDATA_A as u64) % 16 == 0);
 };

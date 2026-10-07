@@ -36,10 +36,13 @@ pub(crate) struct Compute {
     slot: usize,
     batch_count: usize,
     checkpoint: (u64,u16,usize),
+    /// The register lists of the SoC's GPU (`m3_soc::Soc::registers`).
+    registers: command::RegisterSet,
 }
 impl Compute {
     pub(crate) fn new(dev: &driver::AsahiDevice, uat: &mmu::Uat, vm: &mmu::Vm,
-        stats: Region, control: crate::agx_compute::Control) -> Result<Self> {
+        stats: Region, control: crate::agx_compute::Control,
+        registers: command::RegisterSet) -> Result<Self> {
         let binding=uat.bind(vm)?;
         let mut objects=KVec::new();
         let mut client_command=None;
@@ -60,7 +63,7 @@ impl Compute {
             if matches!(a.mapping,Mapping::CommandAlias(_)) {client_command=Some(b.map_gpu_view(vm)?);}
             objects.push(b,GFP_KERNEL)?;
         }
-        Self::encode_command(&mut objects, &mut command_bytes, binding.slot(), control, 1, 0)?;
+        Self::encode_command(&mut objects, &mut command_bytes, binding.slot(), control, 1, 0, registers)?;
         Self::encode_sequence(&mut objects, &mut sequence_bytes, stats, binding.slot(), timeline::stamp(0xc1000000,1), 0)?;
         UMA_POOL.initialize(&mut objects)?;
         Self::initialize_state(&mut objects, binding.slot())?;
@@ -96,10 +99,11 @@ impl Compute {
         // the invalidation.
         crate::mem::sync();crate::mem::tlbi_all();crate::mem::sync();
         unsafe {core::arch::asm!("isb",options(nostack,preserves_flags))};
-        Ok(Self {_client_command:client_command.ok_or(EINVAL)?,objects,command_bytes,sequence_bytes,_binding:binding,stats,last_progress_ns:0,sequence:1,head:1,cached_views:KVec::new(),slot:0,batch_count:1,checkpoint:(0,0,0)})
+        Ok(Self {_client_command:client_command.ok_or(EINVAL)?,objects,command_bytes,sequence_bytes,_binding:binding,stats,last_progress_ns:0,sequence:1,head:1,cached_views:KVec::new(),slot:0,batch_count:1,checkpoint:(0,0,0),registers})
     }
     fn encode_command(objects: &mut [Buffer], bytes: &mut [u8], context: u32,
-        control: crate::agx_compute::Control, sequence: u64, slot: usize) -> Result {
+        control: crate::agx_compute::Control, sequence: u64, slot: usize,
+        register_set: command::RegisterSet) -> Result {
         let offset = |owner:usize| storage::slot_offset(owner,slot).map_err(|_|EINVAL);
         let fw = |owner: usize| queue::FirmwareVa::new(objects[owner].va()+offset(owner)? as u64).map_err(|_| EINVAL);
         let preemption = &objects[PREEMPTION];
@@ -114,6 +118,7 @@ impl Compute {
             stamp_value: timeline::stamp(0xc1000000,sequence),
             timestamps: [fw(TIMESTAMPS[0])?, fw(TIMESTAMPS[1])?],
             pool: fw(storage::POOL)?, tail_scratch: fw(TAIL_SCRATCH)?, flush_stamps: false,
+            register_set,
         };
         value.encode(bytes).map_err(|_| EINVAL)?;
         objects[storage::COMMAND].write(offset(storage::COMMAND)?, bytes)
@@ -214,7 +219,7 @@ impl Compute {
         }
         self.objects[NOTIFIER].u32(state::NOTIFIER_CONTEXT,self._binding.slot())?;
         self.sequence=self.sequence.checked_add(1).ok_or(EOVERFLOW)?;
-        Self::encode_command(&mut self.objects,&mut self.command_bytes,self._binding.slot(),control,self.sequence,self.slot)?;
+        Self::encode_command(&mut self.objects,&mut self.command_bytes,self._binding.slot(),control,self.sequence,self.slot,self.registers)?;
         let stamp=self.stamp();
         Self::encode_sequence(&mut self.objects,&mut self.sequence_bytes,self.stats,self._binding.slot(),stamp,self.slot)?;
         self.objects[storage::EVENT].u32(0,self.sequence as u32)?;

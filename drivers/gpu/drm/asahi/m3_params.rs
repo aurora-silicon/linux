@@ -364,6 +364,48 @@ pub(crate) fn unlocked_wait() -> bool {
     M3_UNLOCKED_WAIT.load(Ordering::Relaxed) != 0
 }
 
+/// `asahi.m3_ut_engagement=0|1`: Globals +0x7d0, the gate of the firmware's frequency-feedback
+/// cap. Unset: the SoC's default ([`crate::m3_soc::Soc::ut_engagement`]).
+static M3_UT_ENGAGEMENT: AtomicU64 = AtomicU64::new(UT_ENGAGEMENT_UNSET);
+const UT_ENGAGEMENT_UNSET: u64 = u64::MAX;
+fn parse_ut_engagement(text: &str) -> Option<u64> {
+    parse_u64(text).filter(|v| *v <= 1)
+}
+m3_param!("m3_ut_engagement", M3_UT_ENGAGEMENT, parse_ut_engagement);
+
+/// The frequency-feedback gate for `soc`, and whether `asahi.m3_ut_engagement` set it.
+pub(crate) fn ut_engagement(soc: &crate::m3_soc::Soc) -> (u32, bool) {
+    match M3_UT_ENGAGEMENT.load(Ordering::Relaxed) {
+        UT_ENGAGEMENT_UNSET => (soc.ut_engagement, false),
+        v => (v as u32, true),
+    }
+}
+
+/// Bits of `asahi.m3_retire_mmio`.
+pub(crate) const RETIRE_MMIO_BUSY: u64 = 1 << 0;
+pub(crate) const RETIRE_MMIO_FAULTS: u64 = 1 << 1;
+pub(crate) const RETIRE_MMIO_PSTATE: u64 = 1 << 2;
+const RETIRE_MMIO_UNSET: u64 = u64::MAX;
+
+fn parse_retire_mmio(text: &str) -> Option<u64> {
+    parse_u64(text).filter(|v| *v <= 7)
+}
+
+/// `asahi.m3_retire_mmio`, writable at runtime: the GPU registers the host reads after every
+/// job before retiring it. Bit 0 reads the engine-busy registers (SGX+0xc020/0xc120), bit 1
+/// selects and reads each cluster's fault bank (0xd800/0xd8c0), bit 2 reads the performance
+/// state (0xe01000). Unset: the SoC's default ([`crate::m3_soc::Soc::retire_mmio`]).
+static M3_RETIRE_MMIO: AtomicU64 = AtomicU64::new(RETIRE_MMIO_UNSET);
+m3_param!("m3_retire_mmio", M3_RETIRE_MMIO, parse_retire_mmio, 0o644, Some(get_atomic_param));
+
+/// The `asahi.m3_retire_mmio` mask for `soc`.
+pub(crate) fn retire_mmio(soc: &crate::m3_soc::Soc) -> u64 {
+    match M3_RETIRE_MMIO.load(Ordering::Relaxed) {
+        RETIRE_MMIO_UNSET => soc.retire_mmio,
+        mask => mask,
+    }
+}
+
 /// `asahi.m3_thermal` values.
 const THERMAL_OFF: u64 = 0;
 const THERMAL_HOLD: u64 = 1;
