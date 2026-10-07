@@ -877,8 +877,11 @@ bool dcp_crtc_route_ready(struct drm_crtc *crtc, struct drm_atomic_state *state,
 	drm_connector_list_iter_end(&iter);
 	if (!ready || seen != mask)
 		return false;
-	if (fresh && owned)
-		return dcp_modes_for_connector(dcp, dcp->connector) && !dcp->modes_provisional;
+	if (fresh && dcp->modes_provisional)
+		return false;
+	if (fresh && owned && READ_ONCE(dcp->typec_follow_start) &&
+	    READ_ONCE(dcp->typec_follow_gen) == READ_ONCE(dcp->typec_generation))
+		return dcp_modes_for_connector(dcp, dcp->connector);
 	return true;
 }
 

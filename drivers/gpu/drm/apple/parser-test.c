@@ -774,6 +774,11 @@ static void parser_route_programming_guard(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, dcp_crtc_route_ready(&crtc->base, &state, true));
 	crtc_state.connector_mask = BIT_ULL(0);
 	dcp->modes_admitted = false;
+	dcp->typec_follow_start = false;
+	/* Paired reattachment keeps baseline power-on while lookup rejects modes. */
+	KUNIT_EXPECT_TRUE(test, dcp_crtc_route_ready(&crtc->base, &state, true));
+	dcp->typec_follow_start = true;
+	/* A current handoff must acquire its own admitted destination catalog. */
 	KUNIT_EXPECT_FALSE(test, dcp_crtc_route_ready(&crtc->base, &state, true));
 	dcp->modes_admitted = true;
 	KUNIT_EXPECT_TRUE(test, dcp_crtc_route_ready(&crtc->base, &state, true));
