@@ -301,6 +301,34 @@ class ProMesaTest(flow.M3FlowBase):
         self.assertIn("The M3 Pro's Mesa was NOT installed: it needs newer packages", out)
         self.assertIn("The exit status is 3.", out)
 
+    def test_split_libgcc_and_libstdcxx(self):
+        # Current Arch Linux ARM ships libgcc and libstdc++ as packages of their own; an older
+        # system may have them from a package that provides them. pacman -T decides either way.
+        self.mac("j516s")
+        for case, env, unmet in (
+                ("separate packages", {}, None),
+                ("provided by another package", {"FAKE_LIBGCC": "", "FAKE_LIBSTDCXX": "",
+                                                 "FAKE_PROVIDES": "libgcc=15.2.1-1 libstdc++=15.2.1-1"}, None),
+                ("missing", {"FAKE_LIBGCC": "", "FAKE_PROVIDES": "libstdc++=15.2.1-1"},
+                 "libgcc not installed (needs 3.0 or newer)"),
+                ("too old", {"FAKE_LIBSTDCXX": "10.2.0-1"}, "libstdc++ 10.2.0-1 (needs 11.1 or newer)")):
+            with self.subTest(case):
+                reset_mac(self, "j516s")
+                self.extra_env.update(env)
+                try:
+                    proc = self.install(check=False)
+                finally:
+                    for k in env:
+                        self.extra_env.pop(k)
+                if unmet is None:
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(self.record()["result"], "installed")
+                else:
+                    self.assertEqual(proc.returncode, 3)
+                    self.assertEqual(self.record()["result"], "skipped-deps")
+                    self.assertIn(unmet, " ".join(proc.stderr.split()))
+                    self.assertIn(f"sudo pacman -Syu {unmet.split()[0]})", " ".join(proc.stderr.split()))
+
     def test_a_bare_name_needs_only_to_be_installed(self):
         self.mac("j516s")
         self.extra_env.update(FAKE_SPIRV_TOOLS="")
@@ -1030,6 +1058,121 @@ class ProMesaTest(flow.M3FlowBase):
         chonk.unlink()
         self.assertEqual(self.builtin(), [])
         self.assertEqual(self.builtin(self.tmp / "no such home"), [])
+
+
+def pro_mesa_package():
+    """This release's mesa-m3 package, when at hand: AURORA_PRO_MESA_PKG, the release staging
+    directory or its build directory."""
+    m = re.search(r'^M3_PRO_MESA_PACKAGE="(\S+) (\S+)"$', SRC, re.M)
+    if not m or "PENDING" in m.group(0):
+        return None
+    name, sha = m.groups()
+    recipes = Path.home() / "source/aurora-recipes"
+    for c in (os.environ.get("AURORA_PRO_MESA_PKG", ""), recipes / f"stage-{VERSION.split('-')[-1]}" / name,
+              recipes / "builds" / name.removesuffix("-aarch64.pkg.tar.zst") / name):
+        c = Path(c) if c else None
+        if c and c.is_file() and c.name == name and hashlib.sha256(c.read_bytes()).hexdigest() == sha:
+            return c
+    return None
+
+
+@unittest.skipUnless(pro_mesa_package() and shutil.which("python3") and shutil.which("bsdtar"),
+                     "this release's mesa-m3 package (AURORA_PRO_MESA_PKG), python3 and bsdtar are needed")
+class DetectorAgreementTest(flow.M3FlowBase):
+    """mesa-m3's own detector (mesa-m3-user-setup, from the package, with its own list) and this
+    script's built-in copy, on the same homes: the same answer, the same paths in the same order.
+    The session hook yields on the detector's answer; the record before mesa-m3 is installed
+    comes from the built-in copy."""
+
+    HOME = "/home/u"
+
+    def setUp(self):
+        super().setUp()
+        self.root = self.tmp / "sysroot"
+        self.root.mkdir(exist_ok=True)
+        pkg = pro_mesa_package()
+        detector = re.search(r'^M3_PRO_MESA_DETECTOR="([^"]*)"$', SRC, re.M).group(1)
+        listed = re.search(r'^M3_PRO_MESA_SETUP_LIST="([^"]*)"$', SRC, re.M).group(1)
+        self.pkgroot = self.tmp / "pkgroot"
+        self.pkgroot.mkdir()
+        subprocess.run(["bsdtar", "-xf", str(pkg), "-C", str(self.pkgroot), detector.lstrip("/"), listed.lstrip("/")],
+                       check=True)
+        self.detector_bin = self.pkgroot / detector.lstrip("/")
+        self.home = self.root / self.HOME.lstrip("/")
+
+    def answers(self):
+        """(detector paths, built-in paths), both as paths on the Mac (without the test root)."""
+        proc = subprocess.run(["python3", str(self.detector_bin), "--home", self.HOME, "--root", str(self.root)],
+                              capture_output=True, text=True)
+        self.assertIn(proc.returncode, (0, 1), proc.stderr)
+        lines = proc.stdout.splitlines()
+        self.assertEqual(lines[0], "schema=aurora.mesa-m3-user-setup/1")
+        theirs = [l.split("=", 1)[1] for l in lines if l.startswith("user_setup_path=")]
+        self.assertEqual(lines[1], "user_setup=" + ("present" if theirs else "none"))
+        self.assertEqual(proc.returncode, 1 if theirs else 0)
+        out = self.run_sh(f"m3_pro_mesa_builtin_setup '{self.home}'").stdout.split("\0")
+        ours = [p[len(str(self.root)):] if p.startswith(str(self.root)) else p for p in out[:-1:2]]
+        return theirs, ours
+
+    def write(self, files):
+        for rel, data in files.items():
+            path = self.root / rel.lstrip("/")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(data)
+
+    def scenarios(self):
+        h, c = self.HOME, f"{self.HOME}/.config"
+        variables = [l.split()[1] for l in
+                     re.search(r'^M3_PRO_MESA_SETUP_RULES="([^"]*)"$', SRC, re.M).group(1).splitlines()
+                     if l.startswith("variable ")]
+        yield "empty home", {}
+        yield "the lab m3pro today", {f"{c}/chonkstep/m3gpu-session.env": CHONKSTEP_ENV.decode(),
+                                      f"{c}/hypr/hyprland.conf": "monitor=,preferred,auto,1\n"}
+        yield "the m3pro after the switch-over", {f"{c}/chonkstep/m3gpu-session.env":
+                                                  "CHONKSTEP_M3_CLIENTS=gpu\nCHONKSTEP_M3_MESA_PREFIX=/opt/mesa-m3\n"}
+        yield "chonkstep without a prefix", {f"{c}/chonkstep/m3gpu-session.env": "CHONKSTEP_M3_CLIENTS=gpu\n"}
+        yield "chonkstep quoted, commented, CRLF", {f"{c}/chonkstep/m3gpu-session.env":
+                                                    'export CHONKSTEP_M3_MESA_PREFIX="/x/p" # mine\r\n'}
+        for v in variables:
+            yield f"{v} elsewhere", {f"{c}/environment.d/{v}.conf": f"{v}=/somewhere/else\n"}
+            yield f"{v} in the prefix", {f"{c}/environment.d/{v}.conf": f"{v}=/opt/mesa-m3/lib/x\n",
+                                         f"{c}/uwsm/env": f'export {v}="/opt/mesa-m3"\n'}
+            yield f"{v} commented", {f"{c}/hypr/a.conf": f"# env = {v},/x\n", f"{c}/hypr/b.lua": f"-- {v}=/x\n"}
+            yield f"{v} as part of a longer name", {f"{c}/uwsm/env-hyprland": f"MY_{v}_X=/x\n"}
+        yield "Hyprland env lines", {f"{c}/hypr/envs.conf": "env = GBM_BACKENDS_PATH,/home/u/gbm\n",
+                                     f"{c}/hypr/envs.lua": 'hl.env("LIBGL_DRIVERS_PATH", "/x")\n'}
+        yield "LD_LIBRARY_PATH", {f"{h}/mesa/lib/libgallium-26.so": "", f"{h}/plain/lib/libfoo.so": "",
+                                  "/opt/mesa-m3/lib/libgallium-26.so": "", "/usr/local/m/libEGL_mesa.so.0": "",
+                                  f"{h}/drm/dri/zink_dri.so": "",
+                                  f"{c}/uwsm/env": "export LD_LIBRARY_PATH=$HOME/plain/lib:/opt/mesa-m3/lib\n",
+                                  f"{c}/uwsm/env.d/a": "LD_LIBRARY_PATH=${HOME}/mesa/lib\n",
+                                  f"{c}/uwsm/env-x.d/b": 'LD_LIBRARY_PATH="/usr/local/m"\n',
+                                  f"{c}/hypr/c.conf": "env = LD_LIBRARY_PATH,~/drm\n",
+                                  f"{c}/hypr/d.conf": "# LD_LIBRARY_PATH=~/mesa/lib\n"}
+        yield "system files", {"/etc/xdg/uwsm/env": "export VK_ICD_FILENAMES=/x.json\n",
+                               "/etc/xdg/uwsm/env-hyprland": "export GALLIUM_DRIVER=zink\n",
+                               "/etc/xdg/uwsm/env.d/z": "MESA_LOADER_DRIVER_OVERRIDE=zink\n",
+                               "/etc/environment": "LIBGL_ALWAYS_SOFTWARE=1\n",
+                               "/etc/drirc": '<option name="dri_driver" value="zink"/>'}
+        yield "drirc", {f"{h}/.drirc": '<option name = "dri_driver" value="zink"/>', f"{c}/drirc": "<driconf/>"}
+        yield "everything at once", {f"{c}/environment.d/1.conf": "VK_DRIVER_FILES=/x\n",
+                                     f"{c}/uwsm/default": "GBM_ALWAYS_SOFTWARE=1\n",
+                                     f"{c}/hypr/x.conf": "env = DRIRC_CONFIGDIR,/x\n",
+                                     f"{h}/.drirc": '<option name="dri_driver" value="zink"/>',
+                                     f"{c}/chonkstep/m3gpu-session.env": "CHONKSTEP_M3_MESA_PREFIX=/home/u/p\n"}
+
+    def test_the_detector_and_the_built_in_copy_agree(self):
+        n = 0
+        for name, files in self.scenarios():
+            with self.subTest(name):
+                shutil.rmtree(self.root)
+                self.root.mkdir()
+                self.home.mkdir(parents=True)
+                self.write(files)
+                theirs, ours = self.answers()
+                self.assertEqual(ours, theirs)
+                n += bool(theirs)
+        self.assertGreater(n, 20)            # most scenarios have findings
 
 
 class FromEarlierReleasesTest(flow.M3FlowBase):

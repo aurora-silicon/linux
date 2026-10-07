@@ -72,6 +72,8 @@ def staged(name, env):
     candidates = [os.environ.get(env, "")]
     stage = Path.home() / "source/aurora-recipes" / f"stage-{VERSION.split('-')[-1]}"
     candidates.append(str(stage / name))
+    # A package built and not yet staged.
+    candidates.append(str(Path.home() / "source/aurora-recipes/builds" / name.removesuffix("-aarch64.pkg.tar.zst") / name))
     for c in candidates:
         if c and Path(c).is_file() and Path(c).name == name:
             return Path(c)
@@ -169,10 +171,7 @@ class FillProMesaTest(unittest.TestCase):
                 self.assertIn("user-setup list differs", proc.stderr)
                 self.assertEqual(self.inst.read_text(), SRC)
 
-    @unittest.skip("mesa-m3's detector is not built yet: once it is, run it and the built-in copy on the "
-                   "fixture homes of test_m3_pro_mesa and compare their output")
-    def test_the_packages_detector_agrees_with_the_built_in_copy(self):
-        pass
+    # The package's own detector against the built-in copy: test_m3_pro_mesa.DetectorAgreementTest.
 
 
 class RealProMesaPackageTest(unittest.TestCase):

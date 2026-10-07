@@ -520,25 +520,23 @@ M3_GPU_MESA_DONE=0
 # never over the system Mesa, plus the files that make a login session use that prefix on an
 # M3 Pro. It is a release asset of its own, never one of the PACKAGES every Mac gets, and is
 # installed in its own pacman transaction once the kernel install is done (m3_pro_mesa_install).
-# PLACEHOLDER: the release guard test fails, and an M3 Pro install stops before any download.
-M3_PRO_MESA_PACKAGE="mesa-m3-PENDING-aarch64.pkg.tar.zst PENDING-U1-PACKAGE-BUILD"
+M3_PRO_MESA_PACKAGE="mesa-m3-26.1.4.m3.1-1-aarch64.pkg.tar.zst 13c175162d5d7a6dc98aaa6bfe8aaafd1cebf744fc3c8c40e84a3b471d4666b8"
 M3_PRO_MESA_PREFIX="/opt/mesa-m3"
 # The package's name, as its .PKGINFO gives it; --uninstall removes it by this exact name.
 M3_PRO_MESA_NAME="mesa-m3"
-# What the package depends on, as "name>=version" or a bare "name": each must be installed
-# already (at that version or newer), or the package is left out, so its pacman -U never pulls
-# in an upgrade of the C library or the compiler runtime alone, or a new package.
-# PLACEHOLDER: the release guard test fails, and an M3 Pro install stops before any download.
-M3_PRO_MESA_NEEDS="PENDING-U1-INVENTORY"
+# What the package depends on (its own depends, derived from its ELF files), as "name>=version"
+# or a bare "name": each must be satisfied already (pacman -T: by name or by what a package
+# provides), or the package is left out, so its pacman -U never pulls in an upgrade of the C
+# library or the compiler runtime alone, or a new package.
+M3_PRO_MESA_NEEDS="expat glibc>=2.43 libdisplay-info libdrm libgcc>=3.0 libglvnd libstdc++>=11.1 libx11 libxcb libxext libxshmfence libxxf86vm python spirv-tools>=1:1.4.357.0 systemd-libs vulkan-icd-loader wayland xcb-util-keysyms zlib zstd"
 # The package's own switch-offs, read only to say so in the summary: this file, the user's
 # ~/.config/mesa-m3/disable, or mesa_m3=off on the kernel command line.
 M3_PRO_MESA_DISABLE=/etc/mesa-m3/disable
 # mesa-m3's own user-setup detector and the list file it reads: what counts as a user's own Mesa
 # setup, for the session hook and for this script alike. Once mesa-m3 is installed the record's
 # user_setup comes from that detector (m3_pro_mesa_detector).
-# PLACEHOLDER: the release guard test fails, and an M3 Pro install stops before any download.
-M3_PRO_MESA_DETECTOR="PENDING-U1-DETECTOR"
-M3_PRO_MESA_SETUP_LIST="PENDING-U1-SETUP-LIST"
+M3_PRO_MESA_DETECTOR="/opt/mesa-m3/libexec/mesa-m3-user-setup"
+M3_PRO_MESA_SETUP_LIST="/opt/mesa-m3/share/mesa-m3/user-setup.list"
 # The same list built in, "kind item" per line in the list file's order (fill-m3-pro-mesa.sh
 # refuses a package whose list file says anything else), for runs without mesa-m3 installed.
 # m3_pro_mesa_builtin_setup says what each kind means.
@@ -1710,6 +1708,29 @@ m3_pro_mesa_set_aside() {
   mv "$work/$file" "$work/m3-pro/"
 }
 
+# The M3_PRO_MESA_NEEDS entries this Mac does not satisfy, one "name version (needs min or
+# newer)" per line; nothing when all are. pacman -T decides, as pacman -U would: by name or by
+# what a package provides, so the separate libgcc and libstdc++ of current Arch Linux ARM count,
+# and so does an older package that provides them. When pacman -T itself fails, one line says so.
+m3_pro_mesa_needs_unmet() {
+  local out rc=0 need name min have needs=()
+  read -ra needs <<<"$M3_PRO_MESA_NEEDS"
+  out=$(pacman -T "${needs[@]}" 2>/dev/null) || rc=$?
+  if ((rc == 0)); then return 0; fi
+  if ((rc != 127)); then
+    echo "pacman -T could not check them (exit $rc)"
+    return 0
+  fi
+  while IFS= read -r need; do
+    [[ -n $need ]] || continue
+    name=${need%%[<>=]*} min=""
+    if [[ $need == *">="* ]]; then min=${need#*>=}; fi
+    have=$(pacman -Q "$name" 2>/dev/null | cut -d' ' -f2) || have=""
+    echo "$name ${have:-not installed}${min:+ (needs $min or newer)}"
+  done <<<"$out"
+  return 0
+}
+
 # Once the kernel install is done, on an M3 Pro: the package in a pacman transaction of its own,
 # so a problem with it can't stop the kernel install halfway. It is left out when a package it
 # needs is missing or too old, rather than letting it pull an upgrade in. Any failure is a
@@ -1718,13 +1739,13 @@ m3_pro_mesa_install() {
   local file old name
   file=$work/m3-pro/$(m3_pro_mesa_file)
   [[ -n $M3_PRO_MESA_PACKAGE && -f $file ]] || return 0
-  old=$(mesa_needs_too_old "$M3_PRO_MESA_NEEDS")
+  old=$(m3_pro_mesa_needs_unmet)
   if [[ -n $old ]]; then
     M3_PRO_MESA_RESULT=skipped-deps
     warn "left out the M3 Pro's Mesa ($M3_PRO_MESA_NAME), because it needs newer packages than this
     Mac has: $(paste -sd ';' <<<"$old" | sed 's/;/; /g'). Nothing of it was installed, and the
-    kernel install is complete. Update them (sudo pacman -Syu $(cut -d' ' -f1 <<<"$old" | paste -sd' ')),
-    then run this again."
+    kernel install is complete. Update them (sudo pacman -Syu $(cut -d' ' -f1 <<<"$old" | grep -v '^pacman$' |
+      paste -sd' ')), then run this again."
     return 0
   fi
   name=$(bsdtar -xOf "$file" .PKGINFO 2>/dev/null | sed -n 's/^pkgname = //p' | head -1) || name=""

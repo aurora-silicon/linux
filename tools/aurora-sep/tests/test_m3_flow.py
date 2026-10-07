@@ -60,7 +60,9 @@ OUR_FREEZE = (
 # The M3 Pro's Mesa package of the fake release, and what it needs.
 PRO_MESA_VERSION = "26.1.4.g15s1-1"
 PRO_MESA = f"mesa-m3-{PRO_MESA_VERSION}-aarch64.pkg.tar.zst"
-PRO_MESA_NEEDS = "glibc>=2.43 gcc-libs>=11 spirv-tools>=1:1.4.357.0"
+PRO_MESA_NEEDS = ("expat glibc>=2.43 libdisplay-info libdrm libgcc>=3.0 libglvnd libstdc++>=11.1 libx11 libxcb libxext "
+                  "libxshmfence libxxf86vm python spirv-tools>=1:1.4.357.0 systemd-libs vulkan-icd-loader wayland "
+                  "xcb-util-keysyms zlib zstd")
 # An older M3 m1n1 that knows only the M3 Pro's switches.
 AURORA6 = "m1n1-aurora-1.6.1.aurora6-1-aarch64.pkg.tar.zst"
 OTHERS = [
@@ -72,25 +74,46 @@ OTHERS = [
 
 PACMAN = r"""#!/bin/bash
 echo "pacman $*" >>"$FAKE/log"
+# The installed version of a package, or nothing when it is not installed.
+ver() {
+  case $1 in
+    linux-aurora | linux-asahi) grep -qx "$1" "$FAKE/installed" && echo 1-1 ;;
+    m1n1-aurora) grep -q '^m1n1-aurora' "$FAKE/m1n1" && echo 1-1 ;;
+    m1n1) grep -q '^m1n1-stock' "$FAKE/m1n1" && echo 1-1 ;;
+    # The Mesa packages' versioned dependencies; FAKE_<NAME>="" means not installed.
+    glibc) echo "${FAKE_GLIBC-2.43+r9+g1-1}" ;;
+    gcc-libs) echo "${FAKE_GCC_LIBS-15.2.1+r22-1}" ;;
+    libgcc) echo "${FAKE_LIBGCC-16.1.1+r12-1}" ;;
+    libstdc++) echo "${FAKE_LIBSTDCXX-16.1.1+r12-1}" ;;
+    spirv-tools) echo "${FAKE_SPIRV_TOOLS-1:1.4.357.0-1}" ;;
+    # A Mesa package has the version its .PKGINFO had when -U installed it.
+    mesa-*) grep -qx "$1" "$FAKE/installed" &&
+      awk -v p="$1" '$1 == p { v = $2 } END { print v ? v : "1-1" }' "$FAKE/versions" 2>/dev/null ;;
+    *) echo 1-1 ;;
+  esac
+  return 0
+}
 op=$1; shift
 case $op in
   -Q)
     for p in "$@"; do
-      case $p in
-        linux-aurora | linux-asahi) grep -qx "$p" "$FAKE/installed" || exit 1 ;;
-        m1n1-aurora) grep -q '^m1n1-aurora' "$FAKE/m1n1" || exit 1 ;;
-        m1n1) grep -q '^m1n1-stock' "$FAKE/m1n1" || exit 1 ;;
-        # The Mesa package's versioned dependencies; FAKE_<NAME>="" means not installed.
-        glibc) [[ -n ${FAKE_GLIBC-2.43+r9+g1-1} ]] || exit 1; echo "glibc ${FAKE_GLIBC-2.43+r9+g1-1}"; continue ;;
-        gcc-libs) [[ -n ${FAKE_GCC_LIBS-15.2.1+r22-1} ]] || exit 1; echo "gcc-libs ${FAKE_GCC_LIBS-15.2.1+r22-1}"; continue ;;
-        spirv-tools) [[ -n ${FAKE_SPIRV_TOOLS-1:1.4.357.0-1} ]] || exit 1; echo "spirv-tools ${FAKE_SPIRV_TOOLS-1:1.4.357.0-1}"; continue ;;
-        # A Mesa package prints the version its .PKGINFO had when -U installed it.
-        mesa-*) grep -qx "$p" "$FAKE/installed" || exit 1
-          echo "$p $(awk -v p="$p" '$1 == p { v = $2 } END { print v ? v : "1-1" }' "$FAKE/versions" 2>/dev/null)"
-          continue ;;
-      esac
-      echo "$p 1-1"
+      v=$(ver "$p")
+      [[ -n $v ]] || exit 1
+      echo "$p $v"
     done ;;
+  -T)
+    # As pacman: the dependencies not satisfied, by name or by FAKE_PROVIDES ("name=version ...").
+    rc=0
+    for d in "$@"; do
+      n=${d%%[<>=]*} m=""
+      [[ $d == *">="* ]] && m=${d#*>=}
+      v=$(ver "$n")
+      if [[ -z $v ]]; then
+        for pv in ${FAKE_PROVIDES:-}; do [[ ${pv%%=*} == "$n" ]] && v=${pv#*=}; done
+      fi
+      if [[ -z $v ]] || { [[ -n $m ]] && [[ $(vercmp "$v" "$m") == -1 ]]; }; then echo "$d"; rc=127; fi
+    done
+    exit $rc ;;
   -Qq) exit 1 ;;
   -Qlq)
     [[ $1 == linux-aurora ]] && grep -qx linux-aurora "$FAKE/installed" &&
