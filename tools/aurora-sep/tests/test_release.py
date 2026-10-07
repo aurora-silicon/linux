@@ -246,9 +246,11 @@ class RealProMesaPackageTest(unittest.TestCase):
             for line in script.splitlines():
                 with self.subTest(line=line):
                     self.assertRegex(line.strip(), self.SCRIPTLET)
-        # Never over the system Mesa.
-        for key in ("provides", "conflict", "replaces"):
-            self.assertNotRegex(info, rf"(?m)^{key} = ")
+        # Never over the system Mesa: it provides nothing, and conflicts with and replaces only
+        # the earlier experiment-only mesa-m3-g15g (12.4 on), which the installer removes first.
+        self.assertNotRegex(info, r"(?m)^provides = ")
+        for key in ("conflict", "replaces"):
+            self.assertEqual(re.findall(rf"(?m)^{key} = (.*)$", info), ["mesa-m3-g15g"], key)
         # mesa-m3's user-setup detector and its list, the list the same as the built-in one.
         self.assertIn(M3_PRO_MESA_DETECTOR.lstrip("/"), files)
         self.assertIn(M3_PRO_MESA_SETUP_LIST.lstrip("/"), files)

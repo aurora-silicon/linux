@@ -94,6 +94,11 @@ ver() {
 op=$1; shift
 case $op in
   -Q)
+    # Without a name: every package in $FAKE/installed, with its version.
+    if (($# == 0)); then
+      while read -r p; do [[ -n $p ]] && echo "$p $(ver "$p")"; done <"$FAKE/installed"
+      exit 0
+    fi
     for p in "$@"; do
       v=$(ver "$p")
       [[ -n $v ]] || exit 1

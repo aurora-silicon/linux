@@ -27,10 +27,11 @@
 set -euo pipefail
 
 # ---- the Mesa prefix environment (keep in step with the prefix package) ----------------------
-# The Vulkan loader sees only the prefix's driver; implicit layers stay off. The G15G prefix
-# (mesa-m3-g15g, /opt/mesa-m3-g15g) opens a G15G only with ASAHI_M3_G15G=1 on top of
-# ASAHI_M3_EXPERIMENTAL=1, as its bin/g15g-run sets; on any other chip that variable changes
-# nothing. Its shader binaries depend on the stall count, so no cached binary is reused.
+# The Vulkan loader sees only the prefix's driver; implicit layers stay off. The prefix is
+# mesa-m3's (/opt/mesa-m3, from 12.4), which opens a G15G with ASAHI_M3_EXPERIMENTAL=1.
+# ASAHI_M3_G15G=1 is what the earlier mesa-m3-g15g prefix also needed; mesa-m3 ignores it, and
+# on any other chip it changes nothing. G15G shader binaries depend on the stall count, so no
+# cached binary is reused.
 mesa_env() {
   local p=$1 icd=$2
   printf '%s\n' \

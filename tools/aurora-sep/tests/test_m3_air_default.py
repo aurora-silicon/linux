@@ -275,9 +275,23 @@ class AirDefaultTest(flow.M3FlowBase):
         self.assertTrue(self.boot.read_bytes().endswith(flow.SWITCHES))
 
 
+# 12.4's recovery text names the hook's reasons as mesa-m3 26.1.4.m3.1-6 does: not-t6030 is
+# now not-supported, and experimental is new (the M3 Air's GPU without its opt-in).
+REASONS_123 = ("   Reasons: active, opt-out, not-t6030, no-gpu, no-display, no-access, incomplete-prefix,\n"
+               "   user-setup, user-setup-ldpath, user-setup-unknown, missing-soname, load-failed,\n"
+               "   log-unreadable, gpu-fault, previous-failed. When off, the desktop renders in software.\n")
+REASONS_124 = ("   Reasons: active, opt-out, not-supported, experimental, no-gpu, no-display, no-access,\n"
+               "   incomplete-prefix, user-setup, user-setup-ldpath, user-setup-unknown, missing-soname,\n"
+               "   load-failed, log-unreadable, gpu-fault, previous-failed. When off, the desktop renders in software.\n")
+AIRS = re.search(r'^M3_AIR_BOARDS="([^"]*)"$', flow.SRC, re.M).group(1).split()
+
+
 class SameAs123Test(flow.M3FlowBase):
     """12.3's script and this one on every board but the J613's plain run: the same commands in
-    the same order, the same files, the same exit status and the same output."""
+    the same order, the same files, the same exit status and the same output. The M3 Pro's output
+    differs only in the recovery text's reason names (REASONS_124). The M3 Airs, which get mesa-m3
+    from 12.4 on (test_m3_air_mesa), run here without a mesa-m3 entry: everything else of theirs,
+    m1n1's handoff above all, is as on 12.3."""
 
     def setUp(self):
         super().setUp()
@@ -290,6 +304,7 @@ class SameAs123Test(flow.M3FlowBase):
     RECORD_RUN = re.compile(rb"(?m)^(run_id|written_at|boot_id|installer_sha256)=.*\n")
 
     def norm(self, text):
+        text = text.replace(REASONS_124, REASONS_123)
         return self.RUN_ID.sub("run_id=<id>", self.TEMP.sub(r"\1<tmp>", pro.MKTEMP.sub("<tmp>", text)))
 
     def snapshot(self):
@@ -299,10 +314,12 @@ class SameAs123Test(flow.M3FlowBase):
         return tree
 
     def run_pair(self, board, try_, setup=None):
+        no_mesa = 'M3_PRO_MESA_PACKAGE=""\n' if board in AIRS else ""
+
         def run():
-            a = self.run_sh(pro.SUDO_LOG + f"M3_TRY={try_}\ninstall_all", check=False)
+            a = self.run_sh(pro.SUDO_LOG + no_mesa + f"M3_TRY={try_}\ninstall_all", check=False)
             installed.append(self.snapshot())
-            b = self.run_sh(pro.SUDO_LOG + "uninstall_all", check=False) if a.returncode == 0 else None
+            b = self.run_sh(pro.SUDO_LOG + no_mesa + "uninstall_all", check=False) if a.returncode == 0 else None
             outs.append(tuple(self.norm(x) if x else x for x in (a.stdout, a.stderr, b and b.stdout,
                                                                  b and b.stderr)))
             return (a.returncode, b and b.returncode)
