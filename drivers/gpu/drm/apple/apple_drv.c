@@ -411,6 +411,8 @@ static int apple_probe_per_dcp(struct device *dev,
 
 	supports_xrgb2101010 = dcp_data->fw_compat != DCP_FIRMWARE_H17P ||
 		dcp_data->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G;
+	if (bitmap_empty(iomfb_surfaces, DCP_MAX_PLANES))
+		return dev_err_probe(dev, -EINVAL, "No usable display surfaces\n");
 
 	for_each_set_bit(surf, iomfb_surfaces, DCP_MAX_PLANES) {
 		plane_type = (zpos == 0) ? DRM_PLANE_TYPE_PRIMARY : DRM_PLANE_TYPE_OVERLAY;
@@ -435,6 +437,8 @@ static int apple_probe_per_dcp(struct device *dev,
 	 * knows what to do with overlays.
 	 */
 	crtc = kzalloc(sizeof(*crtc), GFP_KERNEL);
+	if (!crtc)
+		return -ENOMEM;
 	ret = drm_crtc_init_with_planes(drm, &crtc->base, planes[0], NULL,
 					&apple_crtc_funcs, NULL);
 	if (ret)
