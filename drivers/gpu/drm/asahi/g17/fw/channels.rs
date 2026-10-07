@@ -15,7 +15,7 @@
 use kernel::prelude::*;
 
 use super::kick::QID_MAX;
-use super::queue::{DataMaster, QUEUE_PRIORITY};
+use super::queue::DataMaster;
 
 /// Size of a device-control record.
 pub(crate) const DEVICE_CONTROL_RECORD_SIZE: usize = 0x40;
@@ -448,10 +448,13 @@ pub(crate) const WORK_RING_SLOTS: u32 = 256;
 /// Number of engines with a work ring per priority.
 const WORK_RINGS_PER_PRIORITY: usize = 3;
 
-/// Index in the channel table of the work ring for `data_master` at the
-/// priority of every driver-created queue.
-pub(crate) const fn work_ring_index(data_master: DataMaster) -> usize {
-    QUEUE_PRIORITY as usize * WORK_RINGS_PER_PRIORITY + data_master as usize
+/// Index in the channel table of the work ring for `data_master` at priority
+/// class `priority`, or `None` if `priority` is not a class.
+pub(crate) const fn work_ring_index(priority: u8, data_master: DataMaster) -> Option<usize> {
+    if priority >= super::queue::Policy::PRIORITIES {
+        return None;
+    }
+    Some(priority as usize * WORK_RINGS_PER_PRIORITY + data_master as usize)
 }
 
 /// One work-ring slot: a request to run a queue's newly published commands.
@@ -467,7 +470,9 @@ pub(crate) struct WorkSlot {
     pub(crate) items_end: u16,
     /// Queue to run.
     pub(crate) qid: u8,
-    /// One in the first slot naming this queue on this ring.
+    /// One in the first slot naming this queue on this ring. Each priority
+    /// class has its own rings, so a queue whose class changed names the new
+    /// ring with a first slot again.
     pub(crate) first: u8,
 }
 

@@ -137,6 +137,7 @@ impl Graph {
                 job_list_va: context.work_head_va(),
                 scheduler_va: context.scheduler_va(),
                 owner_pid: context.owner_pid(),
+                policy: context.policy(),
             });
             view.pointers = PointerBlock::new();
             view.jobs = JobListHead::new(graph_va + 0x200);
@@ -210,6 +211,7 @@ impl Graph {
                 context.work_head_va(),
                 context.scheduler_va(),
                 context.owner_pid(),
+                context.policy(),
             )
         };
         Ok(())
@@ -468,7 +470,8 @@ pub(crate) struct Queue {
     replay_prepared: bool,
     exit: Option<exit::Transaction>,
     installed: bool,
-    outer_started: bool,
+    /// Bit `p` set once a work slot of priority class `p` named this queue.
+    outer_started: u8,
     published_config: Option<ConfigIdentity>,
     ordinal: u32,
     submitted: u32,
@@ -521,7 +524,7 @@ impl Queue {
             replay_prepared: false,
             exit: None,
             installed: false,
-            outer_started: false,
+            outer_started: 0,
             published_config: None,
             ordinal: 0,
             submitted: 0,
@@ -1459,10 +1462,16 @@ pub(crate) trait Host {
     fn next_compute_publication(&mut self) -> Result<u64>;
     fn epoch(&self) -> Result<(u64, u32)>;
     fn prepare_compute_shared(&mut self) -> Result;
-    fn qos_publish(&mut self, owner: qos::Owner, scheduler: u64) -> Result<qos::Publication>;
+    fn qos_publish(
+        &mut self,
+        owner: qos::Owner,
+        scheduler: u64,
+        policy: crate::g17::fw::queue::Policy,
+    ) -> Result<qos::Publication>;
     fn qos_cancel(&mut self, publication: qos::Publication) -> Result;
     fn publish_qid(&mut self, id: kick::Id) -> Result;
-    fn publish_outer(&mut self, slot: &crate::g17::fw::channels::WorkSlot) -> Result;
+    fn publish_outer(&mut self, priority: u8, slot: &crate::g17::fw::channels::WorkSlot)
+        -> Result;
     fn notify(&mut self, message: u64) -> Result;
     fn note_submission(&mut self) -> Result;
 }
@@ -1580,6 +1589,8 @@ impl Queue {
             context: packet.context.id(),
         };
         self.free_list_generation = u64::from(packet.context.scheduler_generation());
+        let policy = packet.context.policy();
+        let ring = 1u8 << policy.priority();
         let config = QueueConfig::new(&QueueConfigArgs {
             target: QueueConfigTarget::Compute,
             kick_ring_va: self.kick.low_va(),
@@ -1594,6 +1605,7 @@ impl Queue {
                 slot: u32::from(self.pool.id()),
             },
             scheduler_va: identity.scheduler,
+            policy,
             qos_slot: identity.qos,
             qos_update: self
                 .published_config
@@ -1603,7 +1615,8 @@ impl Queue {
                 .published_config
                 .is_none_or(|p| p.scheduler != identity.scheduler || p.context != identity.context),
         })?;
-        let announce = KickAnnounce::new(qid, DataMaster::Compute, kick_timestamp)?;
+        let announce =
+            KickAnnounce::new(qid, DataMaster::Compute, kick_timestamp, policy.priority())?;
         let predecessor = KickPredecessor::new(qid, kick_parent)?;
         let kick_args = KickArgs {
             qid,
@@ -1620,6 +1633,7 @@ impl Queue {
             event_mask: COMPUTE_KICK_EVENT_MASK,
             register_arrays: ComputeDescriptor::register_bindings(descriptor_low, *scratch)?,
             compute_scratch: scratch.enabled(),
+            priority: policy.priority(),
         };
         let published = host.next_compute_publication()?;
         self.active
@@ -1690,6 +1704,7 @@ impl Queue {
                         data_master: 2,
                     },
                     identity.scheduler,
+                    policy,
                 )?;
                 self.active.back_mut().ok_or(EIO)?.qos_pending = true;
                 let target = self.pool.reserve_submission().or_else(|error| {
@@ -1725,6 +1740,7 @@ impl Queue {
                         data_master: 2,
                     },
                     identity.scheduler,
+                    policy,
                 )?;
                 self.active.back_mut().ok_or(EIO)?.qos_pending = true;
                 producer = self
@@ -1754,15 +1770,18 @@ impl Queue {
                 self.graph.record_ends[slot] = Some(producer);
             }
             host.publish_qid(self.kick.id())?;
-            host.publish_outer(&WorkSlot::new(
-                DataMaster::Compute,
-                self.graph.graph.gpu_va(),
-                qid,
-                producer.try_into()?,
-                !self.outer_started,
-            )?)?;
-            let notify_activation = !self.outer_started;
-            self.outer_started = true;
+            host.publish_outer(
+                policy.priority(),
+                &WorkSlot::new(
+                    DataMaster::Compute,
+                    self.graph.graph.gpu_va(),
+                    qid,
+                    producer.try_into()?,
+                    self.outer_started & ring == 0,
+                )?,
+            )?;
+            let notify_activation = self.outer_started & ring == 0;
+            self.outer_started |= ring;
             self.installed = true;
             self.published_config = Some(identity);
             self.ordinal = ordinal;
@@ -1791,7 +1810,8 @@ impl Queue {
             }
             if notify_activation {
                 fence(Ordering::SeqCst);
-                host.notify((0x83 << 48) | 0x0a)?;
+                // Pipe 2 (compute) in bits 1:0, priority class in bits 3:2.
+                host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
             }
             fence(Ordering::SeqCst);
             host.notify((0x83 << 48) | 0x10)?;

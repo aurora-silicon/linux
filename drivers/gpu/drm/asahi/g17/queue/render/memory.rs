@@ -32,6 +32,9 @@ pub(super) const JOB_LIST: usize = 0xa000;
 pub(super) const CONFIG: [usize; 2] = [0, 0x4000];
 pub(super) const CONFIG_STRIDE: usize = 0x180;
 const DEPTH: usize = queues::RENDER_DEPTH as usize;
+/// Offsets of the priority pair and the policy word in a queue record.
+const PRIORITY: usize = core::mem::offset_of!(queue::QueueRecord, priority);
+const POLICY: usize = core::mem::offset_of!(queue::QueueRecord, policy);
 
 struct Aliases {
     client: mmu::KernelMapping,
@@ -147,6 +150,7 @@ impl Graph {
                     job_list_va: context.work_head_va(),
                     scheduler_va: context.scheduler_va(),
                     owner_pid: context.owner_pid(),
+                    policy: context.policy(),
                 }),
             )?;
             queues.initialize::<queue::PointerBlock>(POINTERS[stage], |view| {
@@ -665,6 +669,9 @@ impl Memory {
         Ok(())
     }
 
+    /// Retargets both retired queue records to `context`. A context of another
+    /// scheduling profile also replaces the priority and policy words, after
+    /// the owner fields; the same profile leaves them untouched.
     pub(super) fn set_owner(&self, qids: [u8; 2], context: &Context) -> Result {
         let offsets = qids.map(|qid| usize::from(qid) * size_of::<queue::QueueRecord>());
         let base = self.graph.queues.pointer(0, GRAPH_SIZE)?;
@@ -674,7 +681,10 @@ impl Memory {
             self.graph.queues.pointer(at + 0x10, 8)?;
             self.graph.queues.pointer(at + 0x48, 4)?;
             self.graph.queues.pointer(at + 0x9c, 8)?;
+            self.graph.queues.pointer(at + PRIORITY, 8)?;
+            self.graph.queues.pointer(at + POLICY, 4)?;
         }
+        let policy = context.policy();
         // SAFETY: Both queues are retired before retargeting. Complete byte
         // views were checked above; packed scheduler words use unaligned stores.
         unsafe {
@@ -692,6 +702,17 @@ impl Memory {
                 base.add(at + 0x9c)
                     .cast::<u64>()
                     .write_unaligned(context.scheduler_va());
+            }
+            for at in offsets {
+                let words = base.add(at + PRIORITY).cast::<[u32; 2]>();
+                let priority = [u32::from(policy.priority()); 2];
+                if words.read_unaligned() != priority {
+                    words.write_unaligned(priority);
+                }
+                let word = base.add(at + POLICY).cast::<u32>();
+                if word.read_unaligned() != u32::from(policy.policy()) {
+                    word.write_unaligned(u32::from(policy.policy()));
+                }
             }
         }
         Ok(())

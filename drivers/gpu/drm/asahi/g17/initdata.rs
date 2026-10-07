@@ -416,14 +416,20 @@ impl InitData {
     /// The sole host publisher holds the device mutex through the following
     /// inner and outer publication. Firmware consumers can only free capacity;
     /// neither this check nor waiting for room reserves or limits other queues.
-    pub(super) fn work_ready(&self, engine: super::fw::queue::DataMaster) -> Result<bool> {
-        let [consumer, consumer_b, producer] = self.work_cursors(engine)?;
+    /// `priority` selects the engine's ring of that priority class.
+    pub(super) fn work_ready(
+        &self,
+        priority: u8,
+        engine: super::fw::queue::DataMaster,
+    ) -> Result<bool> {
+        let [consumer, consumer_b, producer] = self.work_cursors(priority, engine)?;
         let next = (producer + 1) % super::fw::channels::WORK_RING_SLOTS;
         Ok(next != consumer && next != consumer_b)
     }
 
     fn work_publication<'a>(
         &'a self,
+        priority: u8,
         record: &'a super::fw::channels::WorkSlot,
     ) -> Result<WorkPublication<'a>> {
         use super::fw::{channels, queue::DataMaster};
@@ -433,8 +439,8 @@ impl InitData {
             2 => DataMaster::Compute,
             _ => return Err(EINVAL),
         };
-        let channel = channels::work_ring_index(engine);
-        let [consumer, consumer_b, producer] = self.work_cursors(engine)?;
+        let channel = channels::work_ring_index(priority, engine).ok_or(EINVAL)?;
+        let [consumer, consumer_b, producer] = self.work_cursors(priority, engine)?;
         let next = (producer + 1) % channels::WORK_RING_SLOTS;
         if next == consumer || next == consumer_b {
             return Err(EINVAL);
@@ -457,9 +463,13 @@ impl InitData {
     }
 
     /// Two firmware consumers and the host producer, sampled in that order.
-    pub(super) fn work_cursors(&self, engine: super::fw::queue::DataMaster) -> Result<[u32; 3]> {
+    pub(super) fn work_cursors(
+        &self,
+        priority: u8,
+        engine: super::fw::queue::DataMaster,
+    ) -> Result<[u32; 3]> {
         use super::fw::channels;
-        let channel = channels::work_ring_index(engine);
+        let channel = channels::work_ring_index(priority, engine).ok_or(EINVAL)?;
         let base = Self::state_offset(Role::Primary) + abi::work_state_offset(channel);
         let state = self.object(self.cluster)?;
         let mut values = [0; 3];
@@ -481,8 +491,12 @@ impl InitData {
 
     /// Inner queue records must be visible before this outer publication. The returned
     /// producer is the retained consumer witness for this slot.
-    pub(super) fn publish_work(&self, record: &super::fw::channels::WorkSlot) -> Result<u32> {
-        Ok(self.work_publication(record)?.commit())
+    pub(super) fn publish_work(
+        &self,
+        priority: u8,
+        record: &super::fw::channels::WorkSlot,
+    ) -> Result<u32> {
+        Ok(self.work_publication(priority, record)?.commit())
     }
 
     /// Validate both destinations before exposing fragment, then tiling. The accounting token
@@ -490,6 +504,7 @@ impl InitData {
     /// Deferred pairs retain both slot bodies without exposing either producer.
     pub(super) fn publish_work_pair(
         &self,
+        priority: u8,
         fragment: &super::fw::channels::WorkSlot,
         tiling: &super::fw::channels::WorkSlot,
         deferred: bool,
@@ -502,8 +517,8 @@ impl InitData {
         {
             return Err(EINVAL);
         }
-        let fragment = self.work_publication(fragment)?;
-        let tiling = self.work_publication(tiling)?;
+        let fragment = self.work_publication(priority, fragment)?;
+        let tiling = self.work_publication(priority, tiling)?;
         fragment.copy_record();
         commit_accounting()?;
         fence(Ordering::SeqCst);
@@ -522,6 +537,7 @@ impl InitData {
 
     fn retained_work_publication<'a>(
         &'a self,
+        priority: u8,
         record: &'a super::fw::channels::WorkSlot,
         next: u32,
     ) -> Result<WorkPublication<'a>> {
@@ -531,7 +547,7 @@ impl InitData {
             1 => DataMaster::Fragment,
             _ => return Err(EINVAL),
         };
-        let channel = channels::work_ring_index(engine);
+        let channel = channels::work_ring_index(priority, engine).ok_or(EINVAL)?;
         let producer = self.object(self.cluster)?.word(
             Self::state_offset(Role::Primary)
                 + abi::work_state_offset(channel)
@@ -558,6 +574,7 @@ impl InitData {
     /// witnesses before either copy; both bodies precede the fragment and tiling publications.
     pub(super) fn publish_retained_work_pair(
         &self,
+        priority: u8,
         fragment: &super::fw::channels::WorkSlot,
         tiling: &super::fw::channels::WorkSlot,
         next: [u32; 2],
@@ -568,8 +585,8 @@ impl InitData {
         {
             return Err(EINVAL);
         }
-        let fragment = self.retained_work_publication(fragment, next[0])?;
-        let tiling = self.retained_work_publication(tiling, next[1])?;
+        let fragment = self.retained_work_publication(priority, fragment, next[0])?;
+        let tiling = self.retained_work_publication(priority, tiling, next[1])?;
         fragment.copy_record();
         tiling.copy_record();
         fence(Ordering::SeqCst);

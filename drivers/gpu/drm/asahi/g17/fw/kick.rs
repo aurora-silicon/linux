@@ -20,7 +20,7 @@
 
 use kernel::prelude::*;
 
-use super::queue::QUEUE_PRIORITY;
+use super::queue::Policy;
 
 /// Number of entries in a kick ring.
 pub(crate) const KICK_SLOTS: usize = 256;
@@ -371,6 +371,8 @@ pub(crate) struct KickArgs<'a> {
     pub(crate) register_arrays: [Option<RegisterArrayBinding>; 4],
     /// The compute register program includes a shader-context scratch request.
     pub(crate) compute_scratch: bool,
+    /// Priority class of the queue.
+    pub(crate) priority: u8,
 }
 
 /// One kick ring entry.
@@ -436,13 +438,14 @@ impl KickEntry {
         if args.qid > QID_MAX
             || barriers > KICK_BARRIERS_MAX
             || args.qos.class > Self::QOS_CLASS_MAX
+            || args.priority >= Policy::PRIORITIES
         {
             return Err(EINVAL);
         }
 
         let mut header = args.timestamp.get() << Self::TIMESTAMP_SHIFT
             | (args.qid as u64) << Self::QID_SHIFT
-            | (QUEUE_PRIORITY as u64) << Self::PRIORITY_SHIFT;
+            | (args.priority as u64) << Self::PRIORITY_SHIFT;
         if args.compute_scratch {
             header |= Self::COMPUTE_SCRATCH;
         }
@@ -506,9 +509,10 @@ impl RenderRegistration {
 
     /// Validates both queues without touching MMIO. The resulting transaction
     /// writes fragment configuration and validity before tiling configuration
-    /// and validity. Each validity mask is stored high before low.
-    pub(crate) fn new(fragment: (u8, u64), tiling: (u8, u64)) -> Result<Self> {
-        if fragment.0 == tiling.0 {
+    /// and validity. Each validity mask is stored high before low. Both queues
+    /// are registered at priority class `priority`.
+    pub(crate) fn new(fragment: (u8, u64), tiling: (u8, u64), priority: u8) -> Result<Self> {
+        if fragment.0 == tiling.0 || priority >= Policy::PRIORITIES {
             return Err(EINVAL);
         }
         let mut writes = [(0, 0); 8];
@@ -522,7 +526,7 @@ impl RenderRegistration {
             if qid > QID_MAX || va & !Self::ADDRESS_MASK != 0 {
                 return Err(EINVAL);
             }
-            let completion = (3 * (4 - u64::from(QUEUE_PRIORITY)) + 0x3fe).wrapping_shl(54);
+            let completion = (3 * (4 - u64::from(priority)) + 0x3fe).wrapping_shl(54);
             let payload = ((engine as u64 + 1) << 60) | va | completion;
             let (low, high) = if qid < 64 {
                 (1u64 << qid, 0)

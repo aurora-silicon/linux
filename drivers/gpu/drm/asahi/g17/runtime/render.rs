@@ -377,12 +377,14 @@ impl crate::g17::queue::render::Host for Host<'_> {
         &mut self,
         owner: crate::g17::qos::Owner,
         scheduler: u64,
+        policy: crate::g17::fw::queue::Policy,
     ) -> Result<crate::g17::qos::Publication> {
         use crate::g17::qos;
         self.firmware.queues.accounting.publish(
             &qos::View::new(self.firmware.init.qos()?)?,
             owner,
             scheduler,
+            policy,
             qos::clock,
         )
     }
@@ -418,6 +420,7 @@ impl crate::g17::queue::render::Host for Host<'_> {
     }
     fn publish_outer_pair(
         &mut self,
+        priority: u8,
         fragment: &crate::g17::fw::channels::WorkSlot,
         tiling: &crate::g17::fw::channels::WorkSlot,
         commit: impl FnOnce() -> Result,
@@ -425,7 +428,7 @@ impl crate::g17::queue::render::Host for Host<'_> {
     ) -> Result<[u32; 2]> {
         self.firmware
             .init
-            .publish_work_pair(fragment, tiling, true, commit, late_tiling)
+            .publish_work_pair(priority, fragment, tiling, true, commit, late_tiling)
     }
     fn activate_render_pool(&mut self, id: u16, generation: u64) -> Result {
         self.release_registration();
@@ -437,6 +440,7 @@ impl crate::g17::queue::render::Host for Host<'_> {
     }
     fn publish_retained_pair(
         &mut self,
+        priority: u8,
         fragment: &crate::g17::fw::channels::WorkSlot,
         tiling: &crate::g17::fw::channels::WorkSlot,
         next: [u32; 2],
@@ -444,18 +448,19 @@ impl crate::g17::queue::render::Host for Host<'_> {
         let result = self
             .firmware
             .init
-            .publish_retained_work_pair(fragment, tiling, next);
+            .publish_retained_work_pair(priority, fragment, tiling, next);
         if result.is_err() {
             self.firmware.primary.state.shared.lose_device_quietly();
         }
         result
     }
-    fn notify_render(&mut self) -> Result {
+    /// Pipe 0 (tiling) in bits 1:0, priority class in bits 3:2.
+    fn notify_render(&mut self, priority: u8) -> Result {
         self.release_registration();
         let result = self
             .firmware
             .primary
-            .notify((0x83 << crate::g17::MSG_TYPE_SHIFT) | 0x08);
+            .notify((0x83 << crate::g17::MSG_TYPE_SHIFT) | u64::from(priority) << 2);
         if result.is_err() {
             self.firmware.primary.state.shared.lose_device_quietly();
         }

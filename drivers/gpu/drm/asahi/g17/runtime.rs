@@ -368,6 +368,7 @@ impl Backend {
         shared: &Arc<super::Shared>,
         vm: &crate::mmu::Vm,
         owner: u64,
+        policy: super::fw::queue::Policy,
     ) -> Result<(Arc<Self>, admission::QueueSlot)> {
         let lease = shared.preparations.enter(true)?;
         let dev = shared.drm()?;
@@ -394,7 +395,7 @@ impl Backend {
         let owner_pid =
             u32::try_from(kernel::current!().group_leader().pid()).map_err(|_| EOVERFLOW)?;
         let context = Arc::new(
-            Context::new(&alloc, &pool, &qos, execution, owner_pid)?,
+            Context::new(&alloc, &pool, &qos, execution, owner_pid, policy)?,
             GFP_KERNEL,
         )?;
         let state = shared.state.lock();
@@ -776,11 +777,17 @@ impl compute::Host for ComputeHost<'_> {
     fn prepare_compute_shared(&mut self) -> Result {
         self.init.activate_compute()
     }
-    fn qos_publish(&mut self, owner: qos::Owner, scheduler: u64) -> Result<qos::Publication> {
+    fn qos_publish(
+        &mut self,
+        owner: qos::Owner,
+        scheduler: u64,
+        policy: super::fw::queue::Policy,
+    ) -> Result<qos::Publication> {
         self.accounting.publish(
             &qos::View::new(self.init.qos()?)?,
             owner,
             scheduler,
+            policy,
             qos::clock,
         )
     }
@@ -791,8 +798,8 @@ impl compute::Host for ComputeHost<'_> {
     fn publish_qid(&mut self, id: kick::Id) -> Result {
         self.qids.publish(id)
     }
-    fn publish_outer(&mut self, slot: &super::fw::channels::WorkSlot) -> Result {
-        self.init.publish_work(slot).map(|_| ())
+    fn publish_outer(&mut self, priority: u8, slot: &super::fw::channels::WorkSlot) -> Result {
+        self.init.publish_work(priority, slot).map(|_| ())
     }
     fn notify(&mut self, message: u64) -> Result {
         self.primary.notify(message)
@@ -816,7 +823,10 @@ impl super::Firmware {
         }
         // No descriptor, accounting or inner producer changes precede this
         // capacity check. The same device lock covers queue.publish below.
-        if !self.init.work_ready(DataMaster::Compute)? {
+        if !self
+            .init
+            .work_ready(packet.context.policy().priority(), DataMaster::Compute)?
+        {
             return Err(EAGAIN);
         }
         let queues = &mut self.queues;

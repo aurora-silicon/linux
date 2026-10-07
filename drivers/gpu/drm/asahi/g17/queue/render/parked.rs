@@ -28,8 +28,8 @@ pub(crate) struct ParkedPair {
     descriptor_flags: [u32; 2],
     installed: [bool; 2],
     recovery_generation: u64,
-    registered: bool,
-    outer_started: bool,
+    registered: Option<u8>,
+    outer_started: u8,
     previous: Option<RetiredBinding>,
 }
 
