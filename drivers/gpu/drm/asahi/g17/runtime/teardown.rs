@@ -158,9 +158,6 @@ impl Host for Service<'_> {
                 context.id(),
                 error
             ),
-            Failure::Stalled => {
-                dev_warn!(dev, "Scheduler {} release is still pending\n", context.id())
-            }
         }
     }
 }
@@ -197,7 +194,6 @@ impl Firmware {
             .take_consumed(consumer, producer, &mut service)?
             .is_some()
         {}
-        teardown.report_stalled(super::now_ns(), &mut service);
         Ok(())
     }
 }
