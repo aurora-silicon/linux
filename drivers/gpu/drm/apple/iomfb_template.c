@@ -249,6 +249,8 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 		dcp->crashed = true;
 		return;
 	}
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		iomfb_scanout_complete_h17p(dcp);
 #endif
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
 	dcp->last_swap_id = resp->swap_id;

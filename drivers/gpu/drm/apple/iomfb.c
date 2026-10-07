@@ -858,10 +858,105 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 }
 
 
+static void iomfb_scanout_release_h17p(struct iomfb_scanout_h17p *scanout)
+{
+	unsigned int i;
+
+	if (!scanout)
+		return;
+	for (i = 0; i < SWAP_SURFACES; i++)
+		if (scanout->fb[i])
+			drm_framebuffer_put(scanout->fb[i]);
+	kfree(scanout);
+}
+
+static struct iomfb_scanout_h17p *
+iomfb_scanout_prepare_h17p(struct apple_dcp *dcp, struct drm_crtc *crtc,
+			   struct drm_atomic_state *state)
+{
+	struct iomfb_scanout_h17p *scanout;
+	struct drm_plane *plane;
+	struct drm_plane_state *old_state, *new_state;
+	unsigned int i, slot;
+	int index;
+
+	lockdep_assert_held(&dcp->iomfb.lock);
+	scanout = kzalloc_obj(*scanout);
+	if (!scanout)
+		return NULL;
+	if (dcp->iomfb.scanout) {
+		scanout->request = dcp->iomfb.scanout->request;
+		for (i = 0; i < SWAP_SURFACES; i++) {
+			scanout->fb[i] = dcp->iomfb.scanout->fb[i];
+			if (scanout->fb[i])
+				drm_framebuffer_get(scanout->fb[i]);
+		}
+	}
+
+	for_each_oldnew_plane_in_state(state, plane, old_state, new_state, index) {
+		if (old_state->crtc != crtc && new_state->crtc != crtc)
+			continue;
+		slot = to_apple_plane(plane)->iomfb_surf;
+		if (slot >= SWAP_SURFACES) {
+			iomfb_scanout_release_h17p(scanout);
+			return NULL;
+		}
+		if (scanout->fb[slot])
+			drm_framebuffer_put(scanout->fb[slot]);
+		scanout->fb[slot] = NULL;
+		if (new_state->crtc == crtc && new_state->visible && new_state->fb) {
+			scanout->fb[slot] = new_state->fb;
+			drm_framebuffer_get(new_state->fb);
+		}
+	}
+	return scanout;
+}
+
+void iomfb_scanout_complete_h17p(struct apple_dcp *dcp)
+{
+	struct iomfb_scanout_h17p *scanout = dcp->iomfb.next_scanout;
+	struct iomfb_scanout_h17p *previous = dcp->iomfb.scanout;
+	struct dcp_swap_submit_req_h17p *request = &dcp->swap.h17p;
+	unsigned int i;
+
+	lockdep_assert_held(&dcp->iomfb.lock);
+	if (!scanout)
+		return;
+
+	/* Keep common present arguments, including the null output pointers. */
+	scanout->request = *request;
+	/* Preserve unchanged planes when only a subset was presented. */
+	for (i = 0; i < SWAP_SURFACES; i++) {
+		if (!(request->swap.swap_enabled & BIT(i)) && previous) {
+			scanout->request.surf[i] = previous->request.surf[i];
+			scanout->request.surf_iova[i] = previous->request.surf_iova[i];
+			scanout->request.swap.src_rect[i] = previous->request.swap.src_rect[i];
+			scanout->request.swap.dst_rect[i] = previous->request.swap.dst_rect[i];
+			scanout->request.swap.surf_ids[i] = previous->request.swap.surf_ids[i];
+			scanout->request.swap.surf_flags[i] = previous->request.swap.surf_flags[i];
+			scanout->request.swap.surf_unk[i] = previous->request.swap.surf_unk[i];
+		}
+		scanout->request.surf_null[i] = !scanout->fb[i];
+	}
+	/* Brightness re-presents all pinned surfaces with a fresh swap ID. */
+	scanout->request.swap.swap_enabled = IOMFB_SET_BACKGROUND;
+	for (i = 0; i < SWAP_SURFACES; i++)
+		if (scanout->fb[i])
+			scanout->request.swap.swap_enabled |= BIT(i);
+	scanout->request.swap.swap_completed = scanout->request.swap.swap_enabled;
+	if (!(request->swap.swap_enabled & IOMFB_SET_BACKGROUND) && previous)
+		scanout->request.swap.bg_color = previous->request.swap.bg_color;
+	dcp->iomfb.scanout = scanout;
+	dcp->iomfb.next_scanout = NULL;
+	iomfb_scanout_release_h17p(previous);
+}
+
 struct iomfb_atomic_transaction {
 	struct iomfb_transaction transaction;
 	struct drm_atomic_state *state;
 	struct drm_crtc *crtc;
+	struct apple_dcp *dcp;
+	struct iomfb_scanout_h17p *scanout;
 };
 
 static void iomfb_atomic_start(struct apple_dcp *dcp,
@@ -870,10 +965,18 @@ static void iomfb_atomic_start(struct apple_dcp *dcp,
 	struct iomfb_atomic_transaction *atomic = container_of(transaction,
 					 struct iomfb_atomic_transaction, transaction);
 
-	if (dcp->valid_mode && dcp->connector && dcp->connector->connected)
-		iomfb_flush_h17p(dcp, atomic->crtc, atomic->state);
-	else
+	if (!dcp->valid_mode || !dcp->connector || !dcp->connector->connected) {
 		schedule_work(&dcp->vblank_wq);
+		return;
+	}
+	atomic->scanout = iomfb_scanout_prepare_h17p(dcp, atomic->crtc, atomic->state);
+	if (!atomic->scanout) {
+		WRITE_ONCE(dcp->crashed, true);
+		schedule_work(&dcp->vblank_wq);
+		return;
+	}
+	dcp->iomfb.next_scanout = atomic->scanout;
+	iomfb_flush_h17p(dcp, atomic->crtc, atomic->state);
 }
 
 static void iomfb_atomic_release(struct iomfb_transaction *transaction)
@@ -881,6 +984,11 @@ static void iomfb_atomic_release(struct iomfb_transaction *transaction)
 	struct iomfb_atomic_transaction *atomic = container_of(transaction,
 					 struct iomfb_atomic_transaction, transaction);
 
+	if (atomic->scanout && atomic->dcp->iomfb.scanout != atomic->scanout) {
+		if (atomic->dcp->iomfb.next_scanout == atomic->scanout)
+			atomic->dcp->iomfb.next_scanout = NULL;
+		iomfb_scanout_release_h17p(atomic->scanout);
+	}
 	drm_atomic_state_put(atomic->state);
 	kfree(atomic);
 }
@@ -897,6 +1005,7 @@ static void iomfb_queue_atomic(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	atomic->transaction.release = iomfb_atomic_release;
 	atomic->state = drm_atomic_state_get(state);
 	atomic->crtc = crtc;
+	atomic->dcp = dcp;
 	if (!iomfb_queue(dcp, &atomic->transaction))
 		return;
 	iomfb_atomic_release(&atomic->transaction);
@@ -1034,7 +1143,7 @@ int iomfb_start_rtkit(struct apple_dcp *dcp)
 
 	if (iomfb_uses_queue(dcp)) {
 		mutex_lock(&dcp->iomfb.lock);
-		if (dcp->iomfb.active) {
+		if (dcp->iomfb.active || dcp->iomfb.scanout) {
 			mutex_unlock(&dcp->iomfb.lock);
 			return -EBUSY;
 		}

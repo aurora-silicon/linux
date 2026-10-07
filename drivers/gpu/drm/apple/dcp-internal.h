@@ -30,6 +30,12 @@
 struct apple_dcp;
 struct apple_dcp_afkep;
 
+/* Snapshot of a completed present, independent of the latest DRM state. */
+struct iomfb_scanout_h17p {
+	struct dcp_swap_submit_req_h17p request;
+	struct drm_framebuffer *fb[SWAP_SURFACES];
+};
+
 /* One operation, including all of its nested replies and present completion. */
 struct iomfb_transaction {
 	struct list_head link;
@@ -373,9 +379,12 @@ struct apple_dcp {
 		unsigned long deadline;
 		unsigned int queued;
 		bool stopped;
+		struct iomfb_scanout_h17p *scanout;
+		struct iomfb_scanout_h17p *next_scanout;
 	} iomfb;
 };
 
+void iomfb_scanout_complete_h17p(struct apple_dcp *dcp);
 void iomfb_queue_init(struct apple_dcp *dcp);
 void iomfb_queue_stop(struct apple_dcp *dcp);
 int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction);
