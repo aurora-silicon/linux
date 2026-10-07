@@ -955,7 +955,12 @@ void iomfb_scanout_complete_h17p(struct apple_dcp *dcp)
 		scanout->request.surf_null[i] = !scanout->fb[i];
 	}
 	/* Brightness re-presents all pinned surfaces with a fresh swap ID. */
-	scanout->request.swap.swap_enabled = IOMFB_SET_BACKGROUND;
+	/* Replay only a background established by a completed present. */
+	scanout->request.swap.swap_enabled =
+		request->swap.swap_enabled & IOMFB_SET_BACKGROUND;
+	if (previous)
+		scanout->request.swap.swap_enabled |=
+			previous->request.swap.swap_enabled & IOMFB_SET_BACKGROUND;
 	for (i = 0; i < SWAP_SURFACES; i++)
 		if (scanout->fb[i])
 			scanout->request.swap.swap_enabled |= BIT(i);
