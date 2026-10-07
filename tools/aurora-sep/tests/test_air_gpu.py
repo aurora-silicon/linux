@@ -687,6 +687,17 @@ main {' '.join(args)}
         self.assertIn("start:", (self.mac.tmp / "logger.log").read_text())
         self.assertIn("result: pass", (self.mac.tmp / "logger.log").read_text())
 
+    def test_the_g15g_prefix_environment(self):
+        # The G15G prefix opens a G15G only with both opt-ins, as its bin/g15g-run sets them.
+        icd = self.prefix / "share/vulkan/icd.d/asahi_icd.aarch64.json"
+        proc = self.mac.run(JOB, f"mesa_env '{self.prefix}' '{icd}'", check=True)
+        env = dict(l.split("=", 1) for l in proc.stdout.splitlines())
+        self.assertEqual(env["ASAHI_M3_EXPERIMENTAL"], "1")
+        self.assertEqual(env["ASAHI_M3_G15G"], "1")
+        self.assertEqual(env["MESA_SHADER_CACHE_DISABLE"], "true")
+        self.assertEqual(env["VK_DRIVER_FILES"], str(icd))
+        self.assertEqual(env["LD_LIBRARY_PATH"], f"{self.prefix}/lib")
+
     def test_first_submission_never_completes(self):
         proc, _ = self.job(str(self.prefix), mode="timeout")
         self.assertEqual(proc.returncode, 3)

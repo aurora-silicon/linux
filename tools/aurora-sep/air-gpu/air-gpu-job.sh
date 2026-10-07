@@ -23,7 +23,10 @@
 set -euo pipefail
 
 # ---- the Mesa prefix environment (keep in step with the prefix package) ----------------------
-# The Vulkan loader sees only the prefix's driver; implicit layers stay off.
+# The Vulkan loader sees only the prefix's driver; implicit layers stay off. The G15G prefix
+# (mesa-m3-g15g, /opt/mesa-m3-g15g) opens a G15G only with ASAHI_M3_G15G=1 on top of
+# ASAHI_M3_EXPERIMENTAL=1, as its bin/g15g-run sets; on any other chip that variable changes
+# nothing. Its shader binaries depend on the stall count, so no cached binary is reused.
 mesa_env() {
   local p=$1 icd=$2
   printf '%s\n' \
@@ -32,7 +35,9 @@ mesa_env() {
     "VK_ICD_FILENAMES=$icd" \
     "VK_LOADER_LAYERS_DISABLE=~implicit~" \
     "ASAHI_M3_EXPERIMENTAL=1" \
-    "AGX_MESA_DEBUG=nopromote"
+    "ASAHI_M3_G15G=1" \
+    "AGX_MESA_DEBUG=nopromote" \
+    "MESA_SHADER_CACHE_DISABLE=true"
 }
 # The render node must belong to this driver, and the Vulkan device's name must contain this.
 RENDER_DRIVER=${AIR_GPU_JOB_RENDER_DRIVER:-asahi}
