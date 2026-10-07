@@ -301,9 +301,10 @@ pub(crate) static T6030: Soc = Soc {
 /// the one the T8122 identity gate admits (`t8122_admission`: family 7, variant 2, revision 0x20,
 /// core slots in the first core-mask word only), with the die count of the AGX3 identification
 /// table (`hw::agx3::T8122`). The hardware configuration is `hw::t8122`; power configuration
-/// comes from the boot loader. The runtime rejects the SoC while the rest of its configuration is
-/// missing, before accessing the GPU, unless `asahi.t8122_start=1` arms the start experiment
-/// (`t8122_start`), whose values then stand in for the missing ones.
+/// comes from the boot loader. The rest of the runtime configuration is complete, but until the
+/// runtime has passed on an M3 MacBook Air the SoC is refused, before the GPU is accessed, unless
+/// `asahi.t8122_start=1` arms the start (`t8122_start`), which uses this table's values and adds a
+/// performance-state cap.
 pub(crate) static T8122: Soc = Soc {
     name: "T8122",
     gpu_name: "G15G",
@@ -354,8 +355,7 @@ pub(crate) static T8122: Soc = Soc {
     },
     power_from_boot_loader: true,
     unported: &[
-        "T8122 runtime allocation layout and fixed control words",
-        "T8122 conservative performance-state ceiling",
+        "a pass on an M3 MacBook Air: until then the GPU starts only with asahi.t8122_start=1",
     ],
     // The performance state only. On the single-cluster G15G, reading the engine-busy or the
     // fault-bank registers after every job hangs the SoC within seconds at about 1000 jobs/s;
