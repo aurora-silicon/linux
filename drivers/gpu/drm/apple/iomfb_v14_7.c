@@ -24,6 +24,7 @@
 #include <linux/workqueue.h>
 
 #include <drm/drm_atomic.h>
+#include <drm/drm_color_mgmt.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
@@ -85,6 +86,12 @@ struct dcp_v14_board {
 	u32 panel_width, panel_height;
 	/* The panel may have a 120 Hz timing besides 60 Hz. */
 	bool promotion;
+	/*
+	 * The colour matrix setter and getter of this board's firmware image;
+	 * 0: the matrix is not sent. Method numbers differ between firmware
+	 * releases, so they are only set where tested.
+	 */
+	u32 ctm_set, ctm_get;
 };
 
 static const struct dcp_v14_board dcp_v14_board_t6030 = {
@@ -110,6 +117,8 @@ static const struct dcp_v14_board dcp_v14_board_j613 = {
 	.panel_width = 2560,
 	.panel_height = 1664,
 	.promotion = false,
+	.ctm_set = A(421),
+	.ctm_get = A(420),
 };
 
 static const struct dcp_v14_board *const dcp_v14_boards[] = {
@@ -150,6 +159,11 @@ struct apple_dcp_v14 {
 
 	/* Owns the RPC stream: start, swaps and idle callbacks. */
 	struct mutex lock;
+	/* The colour matrix the firmware holds matches the CRTC's. */
+	bool ctm_valid;
+	u64 ctm_calls;
+	u32 ctm_status, ctm_get_status;
+	u64 ctm_readback[9];
 	struct work_struct idle_work;
 	/* External: reports the display gone once the session stopped. */
 	struct work_struct stopped_work;
@@ -2089,6 +2103,7 @@ static int dcp_v14_status_show(struct seq_file *m, void *unused)
 {
 	struct apple_dcp_v14 *v14 = m->private;
 	struct drm_framebuffer *fb;
+	unsigned int i;
 	int ret;
 
 	ret = mutex_lock_interruptible(&v14->lock);
@@ -2102,6 +2117,10 @@ static int dcp_v14_status_show(struct seq_file *m, void *unused)
 	seq_printf(m, "panel %ux%u\nboot_fb %ux%u stride %u\nclock %llu\n",
 		   v14->panel_width, v14->panel_height, v14->fb_width, v14->fb_height,
 		   v14->stride, v14->clock_rate);
+	seq_printf(m, "ctm valid %d calls %llu setter %#x getter %#x\n", v14->ctm_valid,
+		   v14->ctm_calls, v14->ctm_status, v14->ctm_get_status);
+	for (i = 0; i < 9; i++)
+		seq_printf(m, "ctm_readback[%u] %#llx\n", i, v14->ctm_readback[i]);
 	seq_printf(m, "buffers %u bytes %llu\nproperties %u raw %u\nanalytics %llu\n",
 		   v14->buffer_count, v14->buffer_bytes, v14->property_count, v14->raw_count,
 		   v14->analytics);
@@ -2231,11 +2250,74 @@ fail:
 	return ret;
 }
 
-/* Swap start, then the swap; returns once the firmware completed that swap. */
-static int dcp_v14_swap(struct apple_dcp_v14 *v14, const u8 *surface, u64 iova,
-			u32 width, u32 height, u32 dst_y)
+/*
+ * Sends the CRTC's colour matrix, then reads it back, under the RPC lock and
+ * before the swap that should show it. Only on a board whose firmware image
+ * has tested matrix methods; elsewhere the matrix is not sent.
+ *
+ * Request: location (9) at 0, nine unaligned 64-bit coefficients at 4, a
+ * null flag at 76, 3 bytes of padding (80 bytes in, 4 out). Readback: 80 in,
+ * 76 out, coefficients at 0 and the status at 72. The firmware takes signed
+ * two's-complement Q32 coefficients; DRM gives sign-magnitude S31.32, so
+ * negative ones are converted. No matrix means identity.
+ */
+static int dcp_v14_ctm_locked(struct apple_dcp_v14 *v14,
+			      const struct drm_crtc_state *state)
 {
-	__le32 start[4] = {}, started[2], result[3];
+	u8 request[80] = {}, readback[76] = {};
+	const struct drm_color_ctm *ctm;
+	__le32 status = 0;
+	int i, ret;
+
+	if (!v14->board || !v14->board->ctm_set || !state ||
+	    (v14->ctm_valid && !state->color_mgmt_changed &&
+	     !state->mode_changed && !state->active_changed))
+		return 0;
+	ctm = state->ctm ? state->ctm->data : NULL;
+	put_unaligned_le32(9, request);
+	for (i = 0; i < 9; i++) {
+		u64 coefficient = ctm ? ctm->matrix[i] :
+				  ((i == 0 || i == 4 || i == 8) ? 1ULL << 32 : 0);
+		u64 magnitude = coefficient & ~(1ULL << 63);
+		u64 signed_q32 = coefficient & (1ULL << 63) ? -magnitude : magnitude;
+
+		put_unaligned_le64(signed_q32, request + 4 + 8 * i);
+	}
+	ret = dcp_v14_call(v14, v14->board->ctm_set, request, sizeof(request),
+			   &status, sizeof(status), 0);
+	v14->ctm_calls++;
+	v14->ctm_status = le32_to_cpu(status);
+	v14->ctm_valid = false;
+	if (ret || v14->ctm_status) {
+		dev_err(v14->dev, "CTM setter transport=%d status=%#x\n",
+			ret, v14->ctm_status);
+		return ret ? ret : -EIO;
+	}
+	/* Read back before the swap, under the same lock. */
+	memset(request + 4, 0, 76);
+	ret = dcp_v14_call(v14, v14->board->ctm_get, request, sizeof(request),
+			   readback, sizeof(readback), 0);
+	v14->ctm_get_status = get_unaligned_le32(readback + 72);
+	for (i = 0; i < 9; i++)
+		v14->ctm_readback[i] = get_unaligned_le64(readback + i * 8);
+	dev_info(v14->dev, "CTM call %llu setter=%#x getter_transport=%d getter=%#x diagonal=%#llx,%#llx,%#llx\n",
+		 v14->ctm_calls, v14->ctm_status, ret, v14->ctm_get_status,
+		 v14->ctm_readback[0], v14->ctm_readback[4], v14->ctm_readback[8]);
+	if (ret || v14->ctm_get_status)
+		return ret ? ret : -EIO;
+	v14->ctm_valid = true;
+	return 0;
+}
+
+/*
+ * Swap start, then the swap; returns once the firmware completed that swap.
+ * @ctm_state, if set, carries the colour matrix to send first.
+ */
+static int dcp_v14_swap(struct apple_dcp_v14 *v14, const u8 *surface, u64 iova,
+			u32 width, u32 height, u32 dst_y,
+			const struct drm_crtc_state *ctm_state)
+{
+	__le32 start[4] = {}, started[2] = {}, result[3];
 	u8 *swap;
 	u32 id;
 	int ret;
@@ -2248,7 +2330,10 @@ static int dcp_v14_swap(struct apple_dcp_v14 *v14, const u8 *surface, u64 iova,
 		return -ENOMEM;
 
 	mutex_lock(&v14->lock);
-	ret = dcp_v14_call(v14, A(406), start, sizeof(start), started, sizeof(started), 0);
+	ret = dcp_v14_ctm_locked(v14, ctm_state);
+	if (!ret)
+		ret = dcp_v14_call(v14, A(406), start, sizeof(start), started,
+				   sizeof(started), 0);
 	if (!ret && le32_to_cpu(started[1]))
 		ret = -EIO;
 	id = le32_to_cpu(started[0]);
@@ -2277,11 +2362,13 @@ static int dcp_v14_swap(struct apple_dcp_v14 *v14, const u8 *surface, u64 iova,
 }
 
 /*
- * Shows the top-left @width x @height of @fb (or only the black background)
+ * Shows the top-left @width x @height of @fb (or only the black background),
+ * after the colour matrix of @ctm_state if that is set,
  * and keeps @fb until the next swap.
  */
 static bool dcp_v14_present(struct apple_dcp_v14 *v14, struct drm_framebuffer *fb,
-			    u32 width, u32 height, u32 dst_y)
+			    u32 width, u32 height, u32 dst_y,
+			    const struct drm_crtc_state *ctm_state)
 {
 	u8 surface[DCP_V14_SURFACE_SIZE];
 	struct drm_framebuffer *old;
@@ -2298,7 +2385,7 @@ static bool dcp_v14_present(struct apple_dcp_v14 *v14, struct drm_framebuffer *f
 	}
 	start = ktime_get_ns();
 	ret = dcp_v14_swap(v14, fb ? surface : NULL, iova, fb ? width : 0,
-			   fb ? height : 0, dst_y);
+			   fb ? height : 0, dst_y, ctm_state);
 	elapsed = ktime_get_ns() - start;
 	if (ret && v14->external && !READ_ONCE(v14->failed)) {
 		/* Refused before it was taken: the old framebuffer stays on screen. */
@@ -2598,10 +2685,13 @@ void iomfb_v14_7_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		       struct drm_atomic_state *state)
 {
 	struct drm_plane_state *p = drm_atomic_get_new_plane_state(state, crtc->primary);
+	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(state, crtc);
 	struct drm_framebuffer *fb;
 
 	if (!p)
 		p = crtc->primary->state;
+	if (!cs)
+		cs = crtc->state;
 	fb = p && p->visible ? p->fb : NULL;
 	/*
 	 * No swaps while an external display is off, unset, unplugged, or
@@ -2618,7 +2708,7 @@ void iomfb_v14_7_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	if (dcp->v14 && dcp_v14_present(dcp->v14, fb,
 					 fb ? (dcp->external ? p->src_w >> 16 : fb->width) : 0,
 					 fb ? (dcp->external ? p->src_h >> 16 : fb->height) : 0,
-					 dcp->notch_height))
+					 dcp->notch_height, cs))
 		dcp_drm_crtc_page_flip(dcp, ktime_get());
 	else
 		dcp_v14_cancel_event(dcp);
@@ -2646,5 +2736,5 @@ void iomfb_v14_7_poweroff(struct apple_dcp *dcp)
 	}
 	/* Blank to black; the panel and the DCP stay powered. */
 	if (v14 && v14->started)
-		dcp_v14_present(v14, NULL, 0, 0, 0);
+		dcp_v14_present(v14, NULL, 0, 0, 0, NULL);
 }
