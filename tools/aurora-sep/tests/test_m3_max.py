@@ -144,11 +144,19 @@ esac
 exit 0
 """,
     # A pinned busy loop stands in as a sleep: its pid is recorded, so a test can see it end.
-    # With FAKE_HOT, the first load makes the SMC's P-cluster key read 101 C.
+    # With FAKE_HOT, the first load makes the SMC's P-cluster key read 101 C. The first load can
+    # also break the sampler: FAKE_KILL_SAMPLER kills it, FAKE_KEYS_HANG makes its next read of
+    # the key list hang (a FIFO nobody writes), FAKE_KEYS_GONE makes that read fail.
     "taskset": r"""#!/bin/bash
 echo "taskset $*" >>"$FAKE/log"
 echo $$ >>"$FAKE/load-pids"
-if [[ -n ${FAKE_HOT:-} ]]; then sed -i 's/ Tp0a flt    4 80 45000$/ Tp0a flt    4 80 101000/' "$M3T/debug/macsmc-hwmon/keys"; fi
+keys=$M3T/debug/macsmc-hwmon/keys
+if [[ -n ${FAKE_HOT:-} ]]; then sed -i 's/ Tp0a flt    4 80 45000$/ Tp0a flt    4 80 101000/' "$keys"; fi
+if mkdir "$FAKE/first-load" 2>/dev/null; then
+  if [[ -n ${FAKE_KILL_SAMPLER:-} ]]; then pkill -KILL -f -- "$keys"; fi
+  if [[ -n ${FAKE_KEYS_HANG:-} ]]; then rm -f "$keys"; mkfifo "$keys"; fi
+  if [[ -n ${FAKE_KEYS_GONE:-} ]]; then rm -f "$keys"; fi
+fi
 exec sleep 60
 """,
 }
@@ -1091,7 +1099,7 @@ class SurveyTest(MaxBase):
         self.assertRegex(SRC, r"(?m)^M3_SURVEY_WAIT_S=10 ")
         body = SRC[SRC.index("m3_power_survey() {"):]
         self.assertLess(body.index('sleep "$M3_SURVEY_WAIT_S"'), body.index("m3_survey_sampler_start"))
-        self.assertLess(body.index("trap 'm3_survey_cleanup; warn"), body.index('sleep "$M3_SURVEY_WAIT_S"'))
+        self.assertLess(body.index("trap 'm3_survey_interrupted' INT TERM HUP"), body.index('sleep "$M3_SURVEY_WAIT_S"'))
 
     def popen(self, extra="", **env):
         captured = {}
@@ -1215,8 +1223,151 @@ class SurveyTest(MaxBase):
         self.assertIn("--m3-report | --m3-power-survey) return 1", SRC)
 
 
+class SurveyFailureTest(SurveyTest):
+    """Dave's round 1: a load runs only under a running sampler with current, valid die samples,
+    and nothing is called restored unless it reads back."""
+
+    test_refused_on_m1_and_m2 = test_phases_in_order_with_a_backlight = test_without_a_backlight = None
+    test_the_wait_comes_first = test_ctrl_c_stops_the_load = test_a_signal_during_the_backlight_puts_it_back = None
+    test_ctrl_c_in_the_wait_changes_nothing = test_too_hot_stops_early = test_a_hot_thermal_zone_stops_it_too = None
+    test_implausible_readings_do_not_stop_it = test_t6034_without_smc_keys = None
+    test_t6034_with_a_die_zone_runs_the_loads = test_options = None
+
+    def assert_failed(self, proc, tgz, files, why, loads):
+        self.assertNotEqual(proc.returncode, 0)
+        errors = [l for l in ANSI.sub("", proc.stderr).splitlines() if l.startswith("error:")]
+        self.assertEqual(len(errors), 1, proc.stderr)
+        self.assertIn(f"the survey failed: {why}", errors[0])
+        self.assertEqual(len(tgz), 1, proc.stderr)
+        self.assertIn(f"result: failed: {why}", files["summary.txt"])
+        self.assertNotIn("result: completed", files["summary.txt"])
+        self.assertNotIn("Checked:", proc.stdout)
+        self.assertNotIn("back as it was", proc.stdout + proc.stderr)
+        self.assertEqual(len(self.loads()), loads)
+        self.assertEqual((self.tmp / "sys/class/backlight/apple-panel-bl/brightness").read_text(), "321\n")
+        self.assert_loads_ended()
+
+    # Dave's reproduction: the die sensors exist, and the sampler is missing or dead.
+
+    def test_an_empty_sampler_runs_no_load(self):
+        self.max_mac("j514c", backlight=True)
+        proc, tgz, files = self.survey("m3_survey_sampler_start() { :; }\n", check=False)
+        self.assert_failed(proc, tgz, files, "the temperature sampler is not running (during rest-before-idle)", 0)
+        self.assertEqual(files["samples.txt"], "")
+
+    def test_a_dead_sampler_runs_no_load(self):
+        self.max_mac("j514c", backlight=True)
+        proc, tgz, files = self.survey("m3_survey_sampler_start() { true & M3_SURVEY_SAMPLER=$!; "
+                                       "M3_SURVEY_STARTED=$(date +%s.%N); }\n", check=False)
+        self.assert_failed(proc, tgz, files, "the temperature sampler is not running (during rest-before-idle)", 0)
+
+    def test_a_silent_sampler_runs_no_load(self):
+        # Running, but no sample: refused before the first load.
+        self.max_mac("j514c", backlight=True)
+        proc, tgz, files = self.survey("m3_survey_sampler_start() { sleep 30 & M3_SURVEY_SAMPLER=$!; "
+                                       "M3_SURVEY_STARTED=$(date +%s.%N); }\n", check=False)
+        self.assert_failed(proc, tgz, files,
+                           "there is no valid CPU or SoC die temperature sample yet (before cpu-all)", 0)
+        self.assertNotIn("cpu-all", self.phases(files))
+
+    def test_only_implausible_die_samples_run_no_load(self):
+        self.max_mac("j514c", backlight=True)
+        keys = self.tmp / "debug/macsmc-hwmon/keys"
+        keys.write_text(SMC_KEYS.replace(" 45000\n", " 990000\n").replace(" 40000\n", " -99000\n")
+                        .replace(" -2850\n", " 400000\n"))
+        proc, tgz, files = self.survey(check=False)
+        self.assert_failed(proc, tgz, files,
+                           "there is no valid CPU or SoC die temperature sample yet (before cpu-all)", 0)
+
+    # The sampler breaks during the load: the load stops at once.
+
+    def test_a_sampler_that_dies_during_the_load(self):
+        self.max_mac("j514c", backlight=True)
+        proc, tgz, files = self.survey("M3_SURVEY_PHASE_S=30\n", check=False, FAKE_KILL_SAMPLER="1")
+        self.assert_failed(proc, tgz, files, "the temperature sampler is not running (during cpu-all)", 16)
+        self.assertEqual(self.phases(files)[-1], "cpu-all")
+
+    def test_a_stale_sampler_during_the_load(self):
+        self.max_mac("j514c", backlight=True)
+        proc, tgz, files = self.survey("M3_SURVEY_PHASE_S=60\nM3_SURVEY_STALE_S=1\n", check=False,
+                                       FAKE_KEYS_HANG="1")
+        self.assert_failed(proc, tgz, files,
+                           "no valid CPU or SoC die temperature sample for more than 1 s (during cpu-all)", 16)
+
+    def test_a_sampler_that_cannot_read_the_keys(self):
+        self.max_mac("j514c", backlight=True)
+        proc, tgz, files = self.survey("M3_SURVEY_PHASE_S=30\n", check=False, FAKE_KEYS_GONE="1")
+        self.assert_failed(proc, tgz, files,
+                           "the temperature sampler could not read the SMC key list (during cpu-all)", 16)
+
+    def test_no_load_without_a_watched_temperature(self):
+        # The idle-only run's guard: m3_survey_load itself refuses.
+        self.max_mac("j514m", smc=False)
+        proc = self.run_sh(f"{self.env_body()}M3_SURVEY_WATCH_RE=''\n"
+                           "if m3_survey_load 0 1 2; then echo loaded; else echo \"refused: $M3_SURVEY_FAIL\"; fi")
+        self.assertEqual(proc.stdout.strip(), "refused: no CPU or SoC die temperature is watched, so no load may run")
+        self.assertEqual(self.loads(), [])
+
+    # Dave's reproduction: the original brightness (321) can't be written back.
+
+    TEE = """#!/bin/bash
+v=$(cat)
+if [[ -n ${FAKE_TEE_FAIL:-} && $v == "$FAKE_TEE_FAIL" ]]; then echo "tee: write error" >&2; exit 1; fi
+printf '%s\\n' "$v" | exec /usr/bin/tee "$@"
+"""
+
+    def failing_tee(self):
+        (self.tmp / "bin/tee").write_text(self.TEE)
+        (self.tmp / "bin/tee").chmod(0o755)
+
+    def test_a_failed_brightness_restore(self):
+        self.max_mac("j514c", backlight=True)
+        self.failing_tee()
+        bl = self.tmp / "sys/class/backlight/apple-panel-bl"
+        proc, tgz, files = self.survey(check=False, FAKE_TEE_FAIL="321")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual((bl / "brightness").read_text(), "1\n")
+        command = f"echo 321 | sudo tee {bl}/brightness"
+        self.assertIn(f"not restored: the backlight (apple-panel-bl) reads 1, not its original 321; "
+                      f"restore it with: {command}", proc.stderr)
+        self.assertIn("error: the survey could not put everything back", ANSI.sub("", proc.stderr))
+        self.assertNotIn("Checked:", proc.stdout)
+        self.assertNotIn("back as it was", proc.stdout + proc.stderr)
+        self.assertNotIn("reads 321 again", proc.stdout + proc.stderr)
+        self.assertEqual(len(tgz), 1)
+        self.assertIn("result: completed", files["summary.txt"])
+        self.assertIn("restore: FAILED\n  not restored: the backlight (apple-panel-bl) reads 1", files["summary.txt"])
+        self.assert_loads_ended()
+        # The command it prints puts it back.
+        subprocess.run(["bash", "-c", command.replace("sudo ", "")], check=True, capture_output=True)
+        self.assertEqual((bl / "brightness").read_text(), "321\n")
+
+    def test_a_failed_brightness_restore_after_ctrl_c(self):
+        self.max_mac("j514c", backlight=True)
+        self.failing_tee()
+        bl = self.tmp / "sys/class/backlight/apple-panel-bl/brightness"
+        p = self.popen("M3_SURVEY_PHASE_S=12\n", FAKE_TEE_FAIL="321")
+        self.wait_for(lambda: bl.read_text() == "1\n", "the backlight at its minimum")
+        os.killpg(p.pid, signal.SIGINT)
+        out, err = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 130, err)
+        self.assertIn("interrupted. Nothing was written, and not everything is back as it was", err)
+        self.assertIn(f"restore it with: echo 321 | sudo tee {bl}", err)
+        self.assertNotIn("(checked)", err)
+        self.assertEqual(bl.read_text(), "1\n")
+        self.assert_loads_ended()
+
+    def test_a_verified_restore_says_so(self):
+        self.max_mac("j514c", backlight=True)
+        proc, tgz, files = self.survey()
+        self.assertIn("Checked: the load and the sampler have stopped, and the backlight reads 321 again.", proc.stdout)
+        self.assertIn("restore: checked: the load and the sampler have stopped, the backlight reads 321 again",
+                      files["summary.txt"])
+
+
 # ---- the install path against 12.2 ---------------------------------------------------------------
 
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
 MKTEMP = re.compile(r"(?:/tmp|" + re.escape(tempfile.gettempdir()) + r")/tmp\.[A-Za-z0-9]{6,}")
 SUDO_LOG = 'fake_sudo() { echo "sudo $*" >>"$FAKE/log"; "$@"; }\nsudo=fake_sudo\n'
 
