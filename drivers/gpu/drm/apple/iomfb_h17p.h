@@ -16,6 +16,46 @@ static_assert(sizeof(struct dcp_surface_h17p) == 0x22c);
 static_assert(sizeof(struct dcp_swap_submit_req_h17p) == 0xe9c);
 static_assert(sizeof(struct dcp_swap_submit_resp_h17p) == 0x0c);
 
+/* Owned by the RTKit receive thread, independently of DRM state lifetime. */
+struct dcp_present_state_h17p {
+	u32 swap_id;
+	bool pending;
+	bool accepted;
+};
+
+static inline bool
+dcp_present_begin_h17p(struct dcp_present_state_h17p *state, u32 swap_id)
+{
+	if (state->pending)
+		return false;
+	state->swap_id = swap_id;
+	state->pending = true;
+	state->accepted = false;
+	return true;
+}
+
+static inline bool
+dcp_present_submit_h17p(struct dcp_present_state_h17p *state, u32 swap_id,
+			bool accepted)
+{
+	if (!state->pending || state->accepted || state->swap_id != swap_id)
+		return false;
+	state->accepted = accepted;
+	if (!accepted)
+		state->pending = false;
+	return true;
+}
+
+static inline bool
+dcp_present_complete_h17p(struct dcp_present_state_h17p *state, u32 swap_id)
+{
+	if (!state->pending || !state->accepted || state->swap_id != swap_id)
+		return false;
+	state->pending = false;
+	state->accepted = false;
+	return true;
+}
+
 /* The H17P swap boundary is independent of the template's native layout. */
 struct dcp_present_h17p {
 	u8 swap[0x588];
