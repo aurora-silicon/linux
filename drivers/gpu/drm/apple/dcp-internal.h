@@ -172,6 +172,10 @@ struct apple_dcp_hw_data {
 	 */
 	bool adopt_live_session;
 	enum dcp_firmware_version firmware_compat;
+	/* Firmware-visible clock aperture, independent of the AP PMGR window. */
+	const struct resource *firmware_clock;
+	u32 firmware_scratch;
+	u32 firmware_request;
 };
 
 /* TODO: move IOMFB members to its own struct */
