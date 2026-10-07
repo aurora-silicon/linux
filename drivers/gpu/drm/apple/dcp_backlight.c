@@ -85,7 +85,24 @@ static u32 brightness_part2[] = {
 bool dcp_backlight_active(struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_H17P &&
+		dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 		READ_ONCE(dcp->backlight.state.ready);
+}
+
+int dcp_backlight_takeover(struct apple_dcp *dcp, u32 millinits)
+{
+	u32 maximum, nits;
+	int ret;
+
+	if (dcp_backlight_active(dcp))
+		return 0;
+	maximum = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
+	ret = dcp_bl_takeover_nits(maximum, millinits, &nits);
+	if (ret)
+		return ret;
+
+	/* Keep the first bounded hint. Later reports are not user requests. */
+	return iomfb_configure_backlight_h17p(dcp, maximum, true, nits, false, 0);
 }
 
 static int dcp_get_brightness(struct backlight_device *bd)
@@ -306,6 +323,9 @@ int dcp_backlight_update(struct apple_dcp *dcp)
 		dcp_backlight_kick(dcp);
 		return 0;
 	}
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		return -ENODATA;
 
 	/*
 	 * Do not actively try to change brightness if no mode is set.
@@ -382,6 +402,10 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 		.scale = BACKLIGHT_SCALE_LINEAR,
 	};
 	props.max_brightness = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+	    !dcp_backlight_active(dcp))
+		return -ENODATA;
 	if (dcp_backlight_active(dcp)) {
 		spin_lock_irqsave(&dcp->backlight.lock, flags);
 		if (!dcp->backlight.state.ready) {

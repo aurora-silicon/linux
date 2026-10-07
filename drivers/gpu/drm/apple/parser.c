@@ -1192,6 +1192,8 @@ int parse_system_log_mnits(struct dcp_parse_ctx *handle, struct dcp_system_ev_mn
 
 	if (!type_match ||  mnits < 0 || idac < 0 || timestamp < 0)
 		return -EINVAL;
+	if (mnits > U32_MAX)
+		return -ERANGE;
 
 	entry->millinits = mnits;
 	entry->idac = idac;

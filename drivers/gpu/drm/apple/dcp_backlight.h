@@ -29,6 +29,17 @@ struct dcp_backlight_present {
 	u32 nits;
 };
 
+/* Public powerlog reports use millinits; validate before rounding to nits. */
+static inline int dcp_bl_takeover_nits(u32 maximum, u32 millinits, u32 *nits)
+{
+	if (!maximum || maximum > INT_MAX)
+		return -EINVAL;
+	if ((u64)millinits > (u64)maximum * 1000)
+		return -ERANGE;
+	*nits = millinits / 1000;
+	return 0;
+}
+
 /* Inputs must come from admitted panel/loader records, never a guess. */
 static inline int dcp_bl_init(struct dcp_backlight_state *state, u32 maximum,
 			      bool inherited_valid, u32 inherited,
@@ -151,6 +162,7 @@ struct apple_dcp;
  * Configure before registration and keep the callback valid until teardown.
  */
 bool dcp_backlight_active(struct apple_dcp *dcp);
+int dcp_backlight_takeover(struct apple_dcp *dcp, u32 millinits);
 int dcp_backlight_configure(struct apple_dcp *dcp, u32 maximum,
 			    bool inherited_valid, u32 inherited,
 			    bool default_valid, u32 default_nits,

@@ -439,8 +439,8 @@ static void iomfb_cb_pr_publish(struct apple_dcp *dcp, struct iomfb_property *pr
 	case IOMFB_PROPERTY_NITS:
 	{
 #if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
-		/* Configured H17P takeover uses only the admitted sample interface. */
-		if (dcp_backlight_active(dcp))
+		/* Measured H17P takeover comes from the powerlog hint interface. */
+		if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 			break;
 #endif
 		if (dcp_has_panel(dcp)) {

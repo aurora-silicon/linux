@@ -6,6 +6,34 @@
 
 #include "dcp_backlight.h"
 
+static void backlight_millinits_takeover_test(struct kunit *test)
+{
+	struct dcp_backlight_state state;
+	u32 nits = 123;
+
+	KUNIT_EXPECT_EQ(test, dcp_bl_takeover_nits(0, 100000, &nits), -EINVAL);
+	KUNIT_EXPECT_EQ(test, dcp_bl_takeover_nits(U32_MAX, 100000, &nits), -EINVAL);
+	KUNIT_EXPECT_EQ(test, dcp_bl_takeover_nits(509, 509001, &nits), -ERANGE);
+	KUNIT_EXPECT_EQ(test, dcp_bl_takeover_nits(509, U32_MAX, &nits), -ERANGE);
+	KUNIT_EXPECT_EQ(test, nits, 123U);
+	KUNIT_ASSERT_EQ(test, dcp_bl_takeover_nits(509, 100999, &nits), 0);
+	KUNIT_EXPECT_EQ(test, nits, 100U);
+	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 509, true, nits, false, 0), 0);
+	KUNIT_EXPECT_EQ(test, state.actual, 100U);
+	KUNIT_EXPECT_FALSE(test, state.dirty);
+	/* Registration freezes the hint before exposing the controls. */
+	state.controlled = true;
+	KUNIT_EXPECT_FALSE(test, dcp_bl_seed(&state, 400));
+	KUNIT_EXPECT_FALSE(test, dcp_bl_seed(&state, 0));
+	KUNIT_EXPECT_EQ(test, state.target, 100U);
+	KUNIT_ASSERT_EQ(test, dcp_bl_takeover_nits(509, 0, &nits), 0);
+	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 509, true, nits, false, 0), 0);
+	KUNIT_EXPECT_EQ(test, state.target, 0U);
+	KUNIT_EXPECT_FALSE(test, state.dirty);
+	KUNIT_ASSERT_EQ(test, dcp_bl_takeover_nits(509, 509000, &nits), 0);
+	KUNIT_EXPECT_EQ(test, nits, 509U);
+}
+
 static void backlight_takeover_test(struct kunit *test)
 {
 	struct dcp_backlight_state state = {};
@@ -187,6 +215,7 @@ static void backlight_inflight_dpms_test(struct kunit *test)
 }
 
 static struct kunit_case backlight_cases[] = {
+	KUNIT_CASE(backlight_millinits_takeover_test),
 	KUNIT_CASE(backlight_takeover_test),
 	KUNIT_CASE(backlight_range_test),
 	KUNIT_CASE(backlight_dpms_cycles_test),
