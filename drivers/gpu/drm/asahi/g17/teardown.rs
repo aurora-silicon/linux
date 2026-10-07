@@ -23,6 +23,7 @@ struct Entry {
     phase: Phase,
     armed: u64,
     warned: bool,
+    announce_pending: bool,
 }
 
 /// Publication and announcement errors retain the entry. A stalled release is reported once;
@@ -88,6 +89,7 @@ impl Pending {
                 phase,
                 armed: now,
                 warned: false,
+                announce_pending: false,
             })
             .map_err(|_| ENOSPC)
     }
@@ -130,9 +132,21 @@ impl Pending {
 
     /// Publish in insertion order. Mandatory control replies and a full control ring stop this
     /// pass; an error for one page leaves it retained while other ready releases may progress.
-    pub(crate) fn publish_ready(&mut self, host: &mut impl Host, recovery: bool) -> Result {
+    pub(crate) fn publish_ready(&mut self, host: &mut impl Host, recovery: bool, now: u64) -> Result {
         if !recovery {
             for entry in self.entries.iter_mut() {
+                // The ring record is already published. Retry only its doorbell;
+                // never duplicate a scheduler release after a transport error.
+                if matches!(entry.phase, Phase::Released(_)) {
+                    if entry.announce_pending && host.notify().is_ok() {
+                        entry.announce_pending = false;
+                        // One successful retry starts its consumption window.
+                        // Failed retries never slide the polling deadline.
+                        entry.armed = now;
+                        entry.warned = false;
+                    }
+                    continue;
+                }
                 if entry.phase != Phase::Draining
                     || !host.render_idle(&entry.context)?
                     || !host.flists_released(&entry.context)
@@ -160,9 +174,15 @@ impl Pending {
                     }
                 };
                 entry.phase = Phase::Released(next);
+                // A long command drain must not consume the acknowledgement
+                // polling window before this release exists on the control ring.
+                entry.armed = now;
+                entry.warned = false;
+                entry.announce_pending = true;
                 fence(Ordering::SeqCst);
-                if let Err(error) = host.notify() {
-                    host.report(&entry.context, Failure::Announcement(error));
+                match host.notify() {
+                    Ok(()) => entry.announce_pending = false,
+                    Err(error) => host.report(&entry.context, Failure::Announcement(error)),
                 }
             }
         }
@@ -200,8 +220,9 @@ impl Pending {
         Ok(None)
     }
 
-    /// Poll quickly only during the initial release window; late arrivals still settle when
-    /// serviced. Time passage never substitutes for a firmware-consumption witness.
+    /// Poll for a bounded window at close and again at actual release publication.
+    /// Failed announcements remain retryable on later service even after polling
+    /// expires. Time passage never substitutes for a firmware-consumption witness.
     pub(crate) fn polling(&self, now: u64) -> bool {
         self.entries.iter().any(|entry| {
             entry.phase != Phase::Deferred && now.saturating_sub(entry.armed) < POLL_NS

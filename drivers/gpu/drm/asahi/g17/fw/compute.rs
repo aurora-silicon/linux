@@ -24,6 +24,62 @@ pub(crate) const COMPUTE_QOS_CLASS: u8 = 0x08;
 pub(crate) const COMPUTE_KICK_EVENT_MASK: [u64; 4] = [0, 0, 4, 0];
 
 const COMPUTE_REGISTERS: usize = 40;
+const COMPUTE_REGISTERS_MAX: usize = COMPUTE_REGISTERS + 1;
+
+/// Validated per-command shader-context scratch request.
+#[derive(Clone, Copy)]
+pub(crate) struct ScratchRequest {
+    pages: u16,
+}
+
+impl ScratchRequest {
+    const FIXED_BYTES: u64 = 0x58000;
+    const THREADS_PER_CLIQUE: u64 = 32;
+    const BYTES_PER_STACK_ENTRY: u64 = 8;
+    const PAGE_SHIFT: u32 = 12;
+    const PAGE_SIZE: u64 = 1 << Self::PAGE_SHIFT;
+    const PAGES_PER_MIB: u64 = 1 << (20 - Self::PAGE_SHIFT);
+    const WINDOW_ENABLED: u64 = 1 << 24;
+
+    /// Payload-free layouts request no scratch even if depth/cliques are set.
+    /// Otherwise round the fixed and per-thread sections and add a guard page.
+    pub(crate) fn new(layout: u64) -> Result<Self> {
+        let depth = layout & u16::MAX as u64;
+        let cliques = (layout >> 24) & u8::MAX as u64;
+        let user = (layout >> 32) & u16::MAX as u64;
+        let driver = (layout >> 48) & u16::MAX as u64;
+        if user == 0 && driver == 0 {
+            return Ok(Self { pages: 0 });
+        }
+        let threads = cliques.checked_mul(Self::THREADS_PER_CLIQUE).ok_or(EINVAL)?;
+        let per_thread = depth.checked_mul(Self::BYTES_PER_STACK_ENTRY)
+            .and_then(|bytes| bytes.checked_add(user))
+            .and_then(|bytes| bytes.checked_add(driver)).ok_or(EINVAL)?;
+        let bytes = threads.checked_mul(per_thread)
+            .and_then(|bytes| bytes.checked_add(Self::FIXED_BYTES))
+            .and_then(|bytes| bytes.checked_add(2 * Self::PAGE_SIZE - 1))
+            .ok_or(EINVAL)?;
+        let pages = bytes >> Self::PAGE_SHIFT;
+        Ok(Self { pages: u16::try_from(pages).map_err(|_| EINVAL)? })
+    }
+
+    pub(crate) fn enabled(self) -> bool {
+        self.pages != 0
+    }
+
+    fn size_word(self) -> u64 {
+        let pages = u64::from(self.pages);
+        pages | (pages.div_ceil(Self::PAGES_PER_MIB) << 16)
+    }
+
+    fn window_word(self) -> u64 {
+        if self.enabled() { Self::WINDOW_ENABLED } else { UNK_10791 }
+    }
+
+    fn checkpoints(self) -> [u16; 4] {
+        CHECKPOINTS.map(|count| count + u16::from(self.enabled()))
+    }
+}
 const ALT_REGISTERS: usize = 4;
 
 /// Object IDs of every compute kick.
@@ -54,6 +110,8 @@ const CHECKPOINTS: [u16; 4] = [38, 39, 39, COMPUTE_REGISTERS as u16];
 
 /// Inputs of one compute descriptor.
 pub(crate) struct ComputeArgs {
+    /// Scratch request validated with the userspace command.
+    pub(crate) scratch: ScratchRequest,
     /// Base of the queue's USC window.
     pub(crate) usc_base: u64,
     /// GPU address of the control stream.
@@ -103,13 +161,14 @@ pub(crate) struct ComputeArgs {
     pub(crate) timestamp_va: u64,
 }
 
-fn compute_registers(args: &ComputeArgs) -> Result<[RegisterWrite; COMPUTE_REGISTERS]> {
+fn compute_registers(args: &ComputeArgs) -> Result<[RegisterWrite; COMPUTE_REGISTERS_MAX]> {
     let preempt = args.preempt_va;
     let operand = args.operand_state_va;
     let key = work_key(args.context_id, args.work_state);
     let ids = OBJECT_IDS.word();
 
     Ok([
+        RegisterWrite::new(0x017d9, 1),
         RegisterWrite::new(0x1a510, preempt),
         RegisterWrite::new(0x1a420, args.cdm_va),
         RegisterWrite::new(0x1a4d0, offset_va(preempt, PREEMPT_STATE[0])?),
@@ -130,10 +189,10 @@ fn compute_registers(args: &ComputeArgs) -> Result<[RegisterWrite; COMPUTE_REGIS
         RegisterWrite::new(0x1a061, 0),
         RegisterWrite::new(0x1a0b9, 0),
         RegisterWrite::new(0x1a0c1, 0),
-        RegisterWrite::new(0x101d1, 0),
+        RegisterWrite::new(0x101d1, args.scratch.size_word()),
         RegisterWrite::new(0x0d479, 0),
         RegisterWrite::new(0x1a0e9, UNK_1A0E9),
-        RegisterWrite::new(0x107a1, UNK_10791),
+        RegisterWrite::new(0x107a1, args.scratch.window_word()),
         RegisterWrite::new(0x0a599, UNK_0A599),
         RegisterWrite::new(0x0d411, UNK_0D411),
         RegisterWrite::new(0x1a540, ids),
@@ -287,8 +346,11 @@ impl ComputeDescriptor {
         self.tag = CommandTag::Compute as u32;
         self.context_id = args.context_id.into();
         self.work_state_va = args.work_state_va;
-        self.checkpoints = CHECKPOINTS;
-        self.registers.set(registers_va, &registers)?;
+        self.checkpoints = args.scratch.checkpoints();
+        // The enabled program prepends one register; disabled descriptors keep
+        // the same forty writes, trailer count and resume checkpoints.
+        let first = usize::from(!args.scratch.enabled());
+        self.registers.set(registers_va, &registers[first..])?;
         self.alt_registers.set(alt_registers_va, &alt_registers)?;
         self.preempt_va = args.preempt_va;
         self.cdm_end_va = args.cdm_end_va;
@@ -321,10 +383,11 @@ impl ComputeDescriptor {
     /// the descriptor's address as seen by the work's VM.
     pub(crate) fn register_bindings(
         descriptor_va: u64,
+        scratch: ScratchRequest,
     ) -> Result<[Option<RegisterArrayBinding>; 4]> {
         let registers = RegisterArrayBinding::new(
             offset_va(descriptor_va, Self::REGISTERS_OFFSET)?,
-            CHECKPOINTS[0] as u8,
+            scratch.checkpoints()[0] as u8,
         )?;
         let alt_registers = RegisterArrayBinding::new(
             offset_va(descriptor_va, Self::ALT_REGISTERS_OFFSET)?,

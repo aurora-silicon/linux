@@ -59,6 +59,7 @@ impl Vm {
         prot: Prot,
         single_page: bool,
     ) -> Result<PreparedUserMap> {
+        gem::validate_vm_binding(gem, self)?;
         let context = self.prepare_context_binding(addr, size, offset)?;
         let mut ctx = StepContext {
             new_va: Some(gpuvm::GpuVa::<VmInner>::new(pin_init::default())?),
@@ -69,21 +70,29 @@ impl Vm {
         };
         let vm_bo = self.inner.obtain_bo(gem)?;
         {
-            let mut bo = vm_bo.inner().inner.lock();
-            if bo.sgt.is_none() {
+            let needs_sgt = vm_bo.inner().inner.lock().sgt.is_none();
+            if needs_sgt {
+                // Pin without the BO mutex: alias construction can hold the GEM
+                // reservation while acquiring this mutex.
                 let sgt = gem.owned_sg_table()?;
-                if bo.sg_vec.is_none() {
-                    let mut segments = KVVec::new();
-                    let mut offset = 0;
-                    for range in sgt.iter() {
-                        let address = range.dma_address() as usize;
-                        let length = range.dma_len() as usize;
-                        segments.push((offset, address..address + length), GFP_KERNEL)?;
-                        offset += length;
+                let mut bo = vm_bo.inner().inner.lock();
+                if bo.sgt.is_none() {
+                    if bo.sg_vec.is_none() {
+                        let mut segments = KVVec::new();
+                        let mut offset = 0;
+                        for range in sgt.iter() {
+                            let address = range.dma_address() as usize;
+                            let length = range.dma_len() as usize;
+                            segments.push((offset, address..address + length), GFP_KERNEL)?;
+                            offset += length;
+                        }
+                        bo.sg_vec = Some(segments);
                     }
-                    bo.sg_vec = Some(segments);
+                    bo.sgt = Some(sgt);
                 }
-                bo.sgt = Some(sgt);
+                // Release the mutex before a losing initializer drops its SG
+                // owner. The declaration order also preserves this on errors.
+                drop(bo);
             }
         }
         ctx.vm_bo = Some(vm_bo);

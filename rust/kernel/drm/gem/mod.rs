@@ -469,12 +469,17 @@ impl<T: IntoGEMObject> DmaBuf<T> {
     }
 }
 
-pub(super) const fn create_fops() -> bindings::file_operations {
+pub(super) const fn create_fops(
+    module: Option<&'static crate::ThisModule>,
+) -> bindings::file_operations {
     // SAFETY: As by the type invariant, it is safe to initialize `bindings::file_operations`
     // zeroed.
     let mut fops: bindings::file_operations = unsafe { core::mem::zeroed() };
 
-    fops.owner = core::ptr::null_mut();
+    fops.owner = match module {
+        Some(module) => module.as_ptr(),
+        None => core::ptr::null_mut(),
+    };
     fops.open = Some(bindings::drm_open);
     fops.release = Some(bindings::drm_release);
     fops.unlocked_ioctl = Some(bindings::drm_ioctl);

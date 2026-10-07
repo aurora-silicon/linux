@@ -394,12 +394,18 @@ impl UatPageTable {
         let end = ((iova_range.end - 1) & self.ias_mask) + 1;
 
         let mut pt_addr: [Option<PhysicalAddr>; UAT_LEVELS] = Default::default();
+        // For every child table, retain the parent page and entry that names it.
+        // Children are detached before their parents are freed, so these borrowed
+        // parent pages remain valid while the descriptor is cleared.
+        let mut pt_parent: [Option<(PhysicalAddr, usize)>; UAT_LEVELS - 1] = Default::default();
         pt_addr[UAT_LEVELS - 1] = Some(self.ttb);
 
         'outer: while iova < end {
             mod_pr_debug!("UATPageTable::with_pages: iova={:#x}\n", iova);
             let addr_diff = last_iova ^ iova;
-            for level in (0..UAT_LEVELS - 1).rev() {
+            // Detach leaves before intermediate tables. The old order freed a
+            // parent first and could leave its descriptor naming a freed child.
+            for level in 0..UAT_LEVELS - 1 {
                 // If the iova has changed at this level or above, invalidate the physaddr
                 if addr_diff & !((1 << (UAT_PGBIT + (level + 1) * UAT_LVBIT)) - 1) != 0 {
                     if let Some(phys) = pt_addr[level].take() {
@@ -409,7 +415,10 @@ impl UatPageTable {
                                 level,
                                 phys
                             );
-                            self.free_table(phys);
+                            let parent = pt_parent[level].take();
+                            self.free_table(phys, parent)?;
+                        } else {
+                            pt_parent[level] = None;
                         }
                         mod_pr_debug!("UATPageTable::with_pages: invalidate level {}\n", level);
                     }
@@ -460,6 +469,9 @@ impl UatPageTable {
                                 Ok(None)
                             }
                         })?;
+                    if pt_addr[level].is_some() {
+                        pt_parent[level] = Some((phys, upidx));
+                    }
                     mod_pr_debug!(
                         "UATPageTable::with_pages: level {} PT {:#x?}\n",
                         level,
@@ -509,14 +521,16 @@ impl UatPageTable {
         }
 
         if free {
-            for level in (0..UAT_LEVELS - 1).rev() {
+            // The final path is detached bottom-up for the same reason as the
+            // boundary transitions above.
+            for level in 0..UAT_LEVELS - 1 {
                 if let Some(phys) = pt_addr[level] {
                     mod_pr_debug!(
                         "UATPageTable::with_pages: free level {} {:#x?}\n",
                         level,
                         phys
                     );
-                    self.free_table(phys);
+                    self.free_table(phys, pt_parent[level].take())?;
                 }
             }
         }
@@ -525,18 +539,50 @@ impl UatPageTable {
     }
 
     /// Free a page table, unless it was not allocated by the driver.
-    fn free_table(&mut self, phys: PhysicalAddr) {
-        if let Some(tables) = self.driver_tables.as_mut() {
+    fn free_table(
+        &mut self,
+        phys: PhysicalAddr,
+        parent: Option<(PhysicalAddr, usize)>,
+    ) -> Result {
+        let owned = if let Some(tables) = self.driver_tables.as_ref() {
             match tables.iter().position(|&table| table == phys) {
-                Some(index) => {
-                    tables.swap_remove(index);
-                }
-                None => return,
+                Some(_) => true,
+                None => false,
             }
+        } else {
+            true
+        };
+        if !owned {
+            return Ok(());
+        }
+        if let Some((parent_phys, parent_index)) = parent {
+            // SAFETY: The bottom-up traversal keeps the parent allocated while
+            // its child descriptor is detached. A changed descriptor indicates
+            // an ownership violation; fail closed instead of freeing a table
+            // that may still be reachable.
+            let page = unsafe { Page::borrow_phys(&parent_phys) }.ok_or(EIO)?;
+            page.with_pointer_into_page(parent_index * PTE_SIZE, PTE_SIZE, |p| {
+                let pte = unsafe { &*(p as *const AtomicU64) };
+                let current = pte.load(Ordering::Acquire);
+                let expected = phys & self.oas_mask & (!UAT_PGMSK as u64);
+                if current & self.oas_mask & (!UAT_PGMSK as u64) != expected {
+                    return Err(EIO);
+                }
+                pte.store(0, Ordering::Release);
+                Ok(())
+            })?;
+        }
+        if let Some(tables) = self.driver_tables.as_mut() {
+            let index = tables
+                .iter()
+                .position(|&table| table == phys)
+                .ok_or(EIO)?;
+            tables.swap_remove(index);
         }
         // SAFETY: Page tables allocated by the driver always come from Page::into_phys(). Without
         // `driver_tables`, every child table belongs to the driver.
         unsafe { Page::from_phys(phys) };
+        Ok(())
     }
 
     /// Checks every page, including holes skipped by the page-table walker.
@@ -595,6 +641,22 @@ impl UatPageTable {
     pub(crate) fn alloc_pages(&mut self, iova_range: Range<u64>) -> Result {
         mod_pr_debug!("UATPageTable::alloc_pages: {:#x?}\n", iova_range);
         self.with_pages(iova_range, true, false, |_, _| Ok(()))
+    }
+
+    /// Reserve all tables for a fixed mapping before publishing any leaves.
+    /// GPUVM and the fixed-address allocator may share a page table, so check
+    /// that neither owns a destination leaf before allowing failure rollback.
+    pub(crate) fn prepare_map(&mut self, range: Range<u64>) -> Result {
+        if range.is_empty() || (range.start | range.end) & UAT_PGMSK as u64 != 0 {
+            return Err(EINVAL);
+        }
+        self.with_pages(range.clone(), false, false, |_, ptes| {
+            if ptes.iter().any(|pte| pte.load(Ordering::Acquire) != 0) {
+                return Err(EBUSY);
+            }
+            Ok(())
+        })?;
+        self.alloc_pages(range)
     }
 
     fn pte_bits(&self) -> u64 {

@@ -24,8 +24,9 @@ use kernel::{
 };
 
 struct Destination {
-    mapping: Arc<mmu::KernelMapping>,
-    offset: usize,
+    // Keep the existing GPU alias alive along with its prepared CPU view.
+    _mapping: Arc<mmu::KernelMapping>,
+    cpu: mmu::TimestampMapping,
 }
 
 impl Destination {
@@ -46,7 +47,8 @@ impl Destination {
         if offset.checked_add(size_of::<u64>()).ok_or(EINVAL)? > mapping.size() {
             return Err(ERANGE);
         }
-        Ok(Some(Self { mapping, offset }))
+        let cpu = mapping.timestamp_mapping(offset)?;
+        Ok(Some(Self { _mapping: mapping, cpu }))
     }
 
     fn write(&self, ticks: u64) -> Result {
@@ -56,9 +58,42 @@ impl Destination {
             .wrapping_add(
                 ticks % cfg::COMMAND_TIMESTAMP_HZ * NSEC_PER_SEC / cfg::COMMAND_TIMESTAMP_HZ,
             );
-        self.mapping.write_timestamp(self.offset, ns)?;
+        self.cpu.write(ns);
         barrier(Ordering::Release);
         Ok(())
+    }
+}
+
+/// Timestamp mappings resolved and retained before any command is enqueued.
+pub(crate) struct Destinations(Option<crate::cleanup::Deferred<[Option<Destination>; 4]>>);
+
+impl Destinations {
+    pub(crate) fn resolve(
+        objects: Pin<&xarray::XArray<KBox<file::Object>>>,
+        timestamps: &[uapi::drm_asahi_timestamps],
+    ) -> Result<Self> {
+        if timestamps.is_empty() || timestamps.len() > 2 {
+            return Err(EINVAL);
+        }
+        let mut destinations = core::array::from_fn(|_| None);
+        for (index, timestamp) in timestamps.iter().enumerate() {
+            destinations[2 * index] = Destination::resolve(objects, timestamp.start)?;
+            destinations[2 * index + 1] = Destination::resolve(objects, timestamp.end)?;
+        }
+        // Empty submissions need no cleanup allocation. Timestamped commands
+        // prepare the unique work item before any output fence is published.
+        let retained = if destinations.iter().any(Option::is_some) {
+            Some(crate::cleanup::Deferred::new(destinations)?)
+        } else {
+            None
+        };
+        Ok(Self(retained))
+    }
+
+    fn iter(&self) -> core::slice::Iter<'_, Option<Destination>> {
+        let destinations: &[Option<Destination>] =
+            self.0.as_deref().map_or(&[], |destinations| destinations.as_slice());
+        destinations.iter()
     }
 }
 
@@ -87,7 +122,7 @@ pub(crate) struct Completion {
     status: Arc<VmStatus>,
     fence: UserFence<CompletionFence>,
     member: Member,
-    destinations: [Option<Destination>; 4],
+    destinations: Destinations,
     compute: Option<ComputeTimestamps>,
     feed: Option<Arc<super::feed::Feed>>,
     #[pin]
@@ -95,6 +130,8 @@ pub(crate) struct Completion {
     #[pin]
     render: Mutex<Option<super::queue::admission::RenderLease>>,
     signalled: AtomicBool,
+    retirement_queued: AtomicBool,
+    accepted: AtomicBool,
     timeout_error: AtomicI32,
     replays: AtomicU8,
     replay_timeout: AtomicBool,
@@ -109,19 +146,10 @@ impl Completion {
         context: &Arc<Context>,
         member: Member,
         vm_job: mmu::VmJobGuard,
-        objects: Pin<&xarray::XArray<KBox<file::Object>>>,
-        timestamps: &[uapi::drm_asahi_timestamps],
+        destinations: Destinations,
         compute: bool,
         feed: Option<Arc<super::feed::Feed>>,
     ) -> Result<Arc<Self>> {
-        if timestamps.len() != if compute { 1 } else { 2 } {
-            return Err(EINVAL);
-        }
-        let mut destinations = core::array::from_fn(|_| None);
-        for (index, timestamp) in timestamps.iter().enumerate() {
-            destinations[2 * index] = Destination::resolve(objects, timestamp.start)?;
-            destinations[2 * index + 1] = Destination::resolve(objects, timestamp.end)?;
-        }
         let fence = fence::independent(contexts)?;
         let compute = if compute {
             Some(ComputeTimestamps::new(dev, context.vm())?)
@@ -139,6 +167,8 @@ impl Completion {
                 vm_job <- new_mutex!(Some(vm_job), "G17 command VM pin"),
                 render <- new_mutex!(None, "G17 command render lease"),
                 signalled: AtomicBool::new(false),
+                retirement_queued: AtomicBool::new(false),
+                accepted: AtomicBool::new(false),
                 timeout_error: AtomicI32::new(0),
                 replays: AtomicU8::new(0),
                 replay_timeout: AtomicBool::new(false),
@@ -151,6 +181,11 @@ impl Completion {
 
     pub(crate) fn fence(&self) -> Fence {
         Fence::from_fence(&self.fence)
+    }
+    /// All fallible scheduler setup has succeeded. Failures from this point
+    /// must be visible through VM_STATUS before the accepted job's fence.
+    pub(crate) fn mark_accepted(&self) {
+        self.accepted.store(true, Ordering::Release);
     }
     pub(crate) fn status(&self) -> &Arc<VmStatus> {
         &self.status
@@ -227,6 +262,16 @@ impl Completion {
         end.store(0, Ordering::Relaxed);
         barrier(Ordering::SeqCst);
         Ok(())
+    }
+
+    /// A retirement witness has been accepted by an off-lock completion batch.
+    /// This is separate from fence signalling and from a failure still owned by firmware.
+    pub(crate) fn note_retirement_queued(&self) {
+        self.retirement_queued.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn retirement_queued(&self) -> bool {
+        self.retirement_queued.load(Ordering::Acquire)
     }
 
     /// The first timeout request retains its errno while the physical graph is
@@ -342,6 +387,9 @@ impl Completion {
             return;
         }
         self.status.record_if_device_loss(error);
+        if self.accepted.load(Ordering::Acquire) {
+            self.status.report_failure(error);
+        }
         self.fence.set_error(error);
         self.release_healthy();
         self.fence.signal();

@@ -8,7 +8,7 @@ pub(crate) mod render;
 
 use super::{
     command::{Parser, UscWindow, Validated},
-    completion::Completion,
+    completion::{Completion, Destinations},
     context::Context,
     fence::{Outputs, Submission},
     job::{self, Backend, Engine, Fences, Order, Packet, Scheduler},
@@ -21,7 +21,7 @@ use crate::{
 use core::ops::Range;
 use kernel::{
     c_str,
-    dma_fence::{FenceContexts, RawDmaFence},
+    dma_fence::{Fence, FenceContexts, RawDmaFence},
     prelude::*,
     sync::{Arc, LockClassKey},
     xarray,
@@ -53,6 +53,7 @@ impl Identities {
 /// Validated frontend state prepared before allocating a logical execution context.
 pub(crate) struct Frontend {
     fences: FenceContexts,
+    allocation_failure: Fence,
     range: Range<u64>,
     window: UscWindow,
 }
@@ -64,8 +65,10 @@ impl Frontend {
         }
         let window = UscWindow::new(usc_base, range.clone())?;
         let fences = FenceContexts::new(1, c_str!("asahi_g17_queue"), FENCE_KEY)?;
+        let allocation_failure = super::fence::allocation_failure(&fences)?;
         Ok(Self {
             fences,
+            allocation_failure,
             range,
             window,
         })
@@ -79,11 +82,13 @@ pub(crate) struct Queue<B: Backend> {
     render: Option<Scheduler<B>>,
     compute: Option<Scheduler<B>>,
     fences: FenceContexts,
+    allocation_failure: Fence,
     range: Range<u64>,
     window: UscWindow,
     proof: Proof,
     sequence: [u64; 2],
     frontiers: [KVec<(u64, Fences)>; 2],
+    failures: [Option<(u64, Fence)>; 2],
     // Closing the userspace queue releases admission even if firmware still
     // retains one of its execution contexts or installed physical graphs.
     _slot: admission::QueueSlot,
@@ -99,6 +104,7 @@ impl<B: Backend> Queue<B> {
     ) -> Result<Self> {
         let Frontend {
             fences,
+            allocation_failure,
             range,
             window,
         } = frontend;
@@ -110,11 +116,13 @@ impl<B: Backend> Queue<B> {
             render,
             compute: None,
             fences,
+            allocation_failure,
             range,
             window,
             proof: Proof::new(),
             sequence: [0; 2],
             frontiers: core::array::from_fn(|_| KVec::new()),
+            failures: [None, None],
             _slot: slot,
         })
     }
@@ -132,6 +140,22 @@ impl<B: Backend> Queue<B> {
         Ok(())
     }
 
+    fn prune_frontier(&mut self, index: usize) {
+        let failure = &mut self.failures[index];
+        self.frontiers[index].retain(|(sequence, fences)| {
+            let status = job::fence_status(&fences.completed);
+            if status == 0 {
+                return true;
+            }
+            // One earliest failed ordinal covers every later prefix without
+            // retaining its packet, mappings, or every failed fence.
+            if status < 0 && failure.as_ref().is_none_or(|(first, _)| *sequence < *first) {
+                *failure = Some((*sequence, fences.completed.clone()));
+            }
+            false
+        });
+    }
+
     fn enqueue(
         &mut self,
         id: u64,
@@ -140,62 +164,30 @@ impl<B: Backend> Queue<B> {
         guard: mmu::VmJobGuard,
         aggregate: &Arc<Submission>,
         inputs: &[file::SyncItem],
-        objects: Pin<&xarray::XArray<KBox<file::Object>>>,
+        destinations: Destinations,
     ) -> Result {
         let engine = match &command {
             Validated::Render { .. } => Engine::Render,
             Validated::Compute { .. } => Engine::Compute,
         };
         let index = engine.index();
-        // One earliest failed timestamp covers every prefix containing a later
-        // failure, without retaining the producer's packet or mappings.
-        let mut retained_timestamp_failure = false;
-        self.frontiers[index].retain(|(_, fences)| {
-            let status = job::fence_status(&fences.completed);
-            if status == 0 {
-                return true;
-            }
-            if engine == Engine::Compute
-                && status < 0
-                && fences.ready.raw() == fences.completed.raw()
-                && !retained_timestamp_failure
-            {
-                retained_timestamp_failure = true;
-                return true;
-            }
-            false
-        });
+        self.prune_frontier(index);
         self.frontiers[index].reserve(1, GFP_KERNEL)?;
         if engine == Engine::Compute {
             self.ensure_compute()?;
         }
-        let completion = match &command {
-            Validated::Render { timestamps, .. } => Completion::new(
-                &self.dev,
-                &self.fences,
-                &self.context,
-                aggregate.member(),
-                guard,
-                objects,
-                timestamps,
-                false,
-                self.backend.feed(),
-            )?,
-            Validated::Compute { timestamps, .. } => Completion::new(
-                &self.dev,
-                &self.fences,
-                &self.context,
-                aggregate.member(),
-                guard,
-                objects,
-                core::slice::from_ref(timestamps),
-                true,
-                None,
-            )?,
-        };
+        let completion = Completion::new(
+            &self.dev,
+            &self.fences,
+            &self.context,
+            aggregate.member(),
+            guard,
+            destinations,
+            engine == Engine::Compute,
+            if engine == Engine::Render { self.backend.feed() } else { None },
+        )?;
         if engine == Engine::Compute {
-            self.frontiers[Engine::Render.index()]
-                .retain(|(_, fences)| job::fence_status(&fences.completed) == 0);
+            self.prune_frontier(Engine::Render.index());
         }
         let other = 1 - index;
         let prefix = order.wait_through[other];
@@ -222,10 +214,21 @@ impl<B: Backend> Queue<B> {
             .iter()
             .filter(|(_, fences)| fences.ready.raw() == fences.completed.raw())
             .count();
+        let failures: [Option<&Fence>; 2] = core::array::from_fn(|index| {
+            self.failures[index].as_ref().and_then(|(sequence, fence)| {
+                Order::contains(order.wait_through[index], *sequence).then_some(fence)
+            })
+        });
+        let failure_count = failures.iter().flatten().count();
         let mut dependencies =
-            KVec::with_capacity(inputs.len() + count + timestamp_count, GFP_KERNEL)?;
-        let mut checked_inputs = KVec::with_capacity(inputs.len() + timestamp_count, GFP_KERNEL)?;
+            KVec::with_capacity(inputs.len() + count + timestamp_count + failure_count, GFP_KERNEL)?;
+        let mut checked_inputs =
+            KVec::with_capacity(inputs.len() + timestamp_count + failure_count, GFP_KERNEL)?;
         let mut firmware = KVec::with_capacity(count, GFP_KERNEL)?;
+        for fence in failures.into_iter().flatten() {
+            checked_inputs.push(fence.clone(), GFP_KERNEL)?;
+            dependencies.push(fence.clone(), GFP_KERNEL)?;
+        }
         // Same-engine parents order GPU execution, not the host's timestamp
         // writes. Only timestamp publishers need these completion waits and
         // status checks; ordinary compute keeps its existing queue ordering.
@@ -285,7 +288,8 @@ impl<B: Backend> Queue<B> {
     fn prepare_submission(
         &mut self,
         bytes: &[u8],
-    ) -> Result<(KVec<(Validated, Order)>, KVec<mmu::VmJobGuard>)> {
+        objects: Pin<&xarray::XArray<KBox<file::Object>>>,
+    ) -> Result<(KVec<(Validated, Order, Destinations)>, KVec<mmu::VmJobGuard>)> {
         let parse_guard = self.context.vm().retain_first_job()?;
         let mut parser = Parser::new(bytes);
         // All historical ordinals use the same entry counters; publication
@@ -312,7 +316,13 @@ impl<B: Backend> Queue<B> {
                 engine,
             )?;
             preceding[engine.index()] += 1;
-            pending.push((payload, order), GFP_KERNEL)?;
+            let destinations = match &payload {
+                Validated::Render { timestamps, .. } => Destinations::resolve(objects, timestamps)?,
+                Validated::Compute { timestamps, .. } => {
+                    Destinations::resolve(objects, core::slice::from_ref(timestamps))?
+                }
+            };
+            pending.push((payload, order, destinations), GFP_KERNEL)?;
         }
         parser.finish()?;
         // Every accepted command pins the VM before any command is enqueued.
@@ -338,15 +348,20 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
         bytes: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result {
-        let mut outputs = Outputs::new(&self.fences, syncs, input_count)?;
+        let mut outputs = Outputs::new(
+            &self.fences,
+            syncs,
+            input_count,
+            &self.allocation_failure,
+        )?;
         let result = (|| {
             if self.context.status().get() != 0 {
                 return Err(EIO);
             }
-            let (pending, guards) = self.prepare_submission(bytes)?;
+            let (pending, guards) = self.prepare_submission(bytes, objects)?;
             let mut guards = guards.into_iter();
             let aggregate = outputs.publish(self.context.clone())?;
-            for (command, order) in pending {
+            for (command, order, destinations) in pending {
                 let guard = guards.next().ok_or(EIO)?;
                 self.enqueue(
                     id,
@@ -355,7 +370,7 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                     guard,
                     &aggregate,
                     outputs.inputs(),
-                    objects,
+                    destinations,
                 )?;
             }
             Ok(())

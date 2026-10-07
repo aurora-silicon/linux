@@ -1165,6 +1165,7 @@ static inline void drm_gpuva_init_from_op(struct drm_gpuva *va,
 	va->va.range = op->va.range;
 	va->gem.obj = op->gem.obj;
 	va->gem.offset = op->gem.offset;
+	va->gem.range = op->gem.range;
 }
 
 /**

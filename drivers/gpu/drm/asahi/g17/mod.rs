@@ -56,7 +56,7 @@ use core::sync::atomic::{
 
 use kernel::{
     c_str,
-    device::Core,
+    device::{self, Core},
     drm::gem::shmem,
     impl_has_delayed_work, impl_has_work,
     iosys_map::IoSysMapRef,
@@ -64,6 +64,7 @@ use kernel::{
     prelude::*,
     soc::apple::rtkit,
     sync::{
+        aref::ARef,
         Arc,
         CondVar,
         Mutex, //
@@ -466,6 +467,7 @@ struct Firmware {
     rings: channel::Rings,
     recovery: recovery::State,
     effort: power::Effort,
+    registration_power_release_pending: bool,
     queues: runtime::Registry,
     pool: Arc<object::Pool>,
     render_ids: Arc<freelist::RenderIds>,
@@ -569,6 +571,12 @@ impl power::Control for Firmware {
     fn wait_tick(&self) {
         fsleep(Delta::from_millis(1));
     }
+    fn registration_release_failed(&mut self) {
+        self.registration_power_release_pending = true;
+    }
+    fn registration_release_succeeded(&mut self) {
+        self.registration_power_release_pending = false;
+    }
 }
 
 /// Event work item ID.
@@ -583,7 +591,12 @@ const FEED_WORK: u64 = 5;
 /// Device state shared with the coprocessor callbacks and the event worker.
 #[pin_data]
 struct Shared {
-    dev: AsahiDevRef,
+    /// Diagnostics may outlive shutdown without retaining the DRM data graph.
+    dev: ARef<device::Device>,
+    /// Allocation users take independent references before reserving resources.
+    /// Shutdown removes this owning backedge after joining device work.
+    #[pin]
+    drm: Mutex<Option<AsahiDevRef>>,
     clusters: u32,
     descriptor_flags: [u32; 2],
     crashed: AtomicBool,
@@ -604,7 +617,11 @@ struct Shared {
     /// Nests inside the device mutex; detached mappings are dropped after both unlock.
     #[pin]
     reclaim: Mutex<runtime::teardown::ReclaimBatch>,
-    /// The device lock. `None` before boot completes and after teardown.
+    /// Serializes detached firmware destruction with unbind. Stop paths only;
+    /// normal publication and RTKit/fence handlers never acquire this lock.
+    #[pin]
+    stop: Mutex<()>,
+    /// The device lock. `None` before boot completes and after detachment.
     #[pin]
     state: Mutex<Option<KBox<Firmware>>>,
     #[pin]
@@ -687,6 +704,17 @@ impl WorkItem<EVENT_WORK> for Shared {
 }
 
 impl Shared {
+    fn drm(&self) -> Result<AsahiDevRef> {
+        self.drm.lock().as_ref().cloned().ok_or(ENODEV)
+    }
+
+    fn release_drm(&self) {
+        // The final put may call device-release callbacks. Never run those with
+        // the reference-slot mutex held.
+        let retired = self.drm.lock().take();
+        drop(retired);
+    }
+
     /// Queues the event worker. Callable from any context.
     fn queue_events(self: &Arc<Self>) {
         // Already queued if this fails, which is just as good.
@@ -849,7 +877,8 @@ impl Gpu {
         let feed = feed::Feed::new()?;
         let shared = Arc::pin_init(
             pin_init!(Shared {
-                dev: dev.into(),
+                drm <- new_mutex!(Some(dev.into()), "g17::Shared::drm"),
+                dev: dev.as_ref().into(),
                 clusters: id.num_clusters,
                 descriptor_flags: [id.perf_control, id.perf_map[0]],
                 crashed: AtomicBool::new(false),
@@ -862,6 +891,7 @@ impl Gpu {
                 grow <- new_work!("g17::Shared::grow"),
                 reclaim_work <- new_work!("g17::Shared::reclaim_work"),
                 reclaim <- new_mutex!(reclaim, "g17::Shared::reclaim"),
+                stop <- new_mutex!((), "g17::Shared::stop"),
                 state <- new_mutex!(None, "g17::Shared::state"),
                 changed <- new_condvar!("g17::Shared::changed"),
             }),
@@ -948,6 +978,7 @@ impl Gpu {
                 rings: channel::Rings::new(),
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
+                registration_power_release_pending: false,
                 queues <- runtime::Registry::new(shared.clusters, shared.descriptor_flags),
                 pool: object::Pool::new()?,
                 render_ids: Arc::new(freelist::RenderIds::new(), GFP_KERNEL)?,
@@ -1025,6 +1056,7 @@ impl Gpu {
         self.shared.disable_work(&self.shared.feed_work);
         self.shared.feed.shutdown();
         self.shared.drain_reclaims();
+        self.shared.release_drm();
     }
 }
 
@@ -1129,6 +1161,7 @@ impl gpu::Gpu for Gpu {
         priority: u32,
         usc_exec_base: u64,
     ) -> Result<KBox<dyn crate::queue::Queue>> {
+        let dev = self.shared.drm()?;
         let owner = self.ids.queue.next();
         let frontend =
             queue::Frontend::new(priority, usc_exec_base, self.geometry.user_usable_range())?;
@@ -1139,7 +1172,7 @@ impl gpu::Gpu for Gpu {
             }
         };
         let frontend = match queue::Queue::new(
-            &self.shared.dev,
+            &dev,
             backend.context.clone(),
             backend.clone(),
             frontend,

@@ -206,11 +206,14 @@ pub(crate) struct RenderPass {
     pub(crate) bg: UscProgram,
     /// Partial-render background program.
     pub(crate) partial_bg: UscProgram,
-    /// Tagged USC offset of the end-of-tile program. Its resource specifier
-    /// is always written as zero.
+    /// Tagged USC offset of the end-of-tile program.
     pub(crate) eot_offset: u32,
+    /// Resource specifier of the end-of-tile program.
+    pub(crate) eot_rsrc_spec: u64,
     /// Tagged USC offset of the partial-render end-of-tile program.
     pub(crate) partial_eot_offset: u32,
+    /// Resource specifier of the partial-render end-of-tile program.
+    pub(crate) partial_eot_rsrc_spec: u64,
     /// The resource specifiers have their high 32 bits.
     pub(crate) rsrc_spec_hi: bool,
 }
@@ -383,7 +386,9 @@ struct PassWords {
     partial_bg_rsrc_spec: u64,
     partial_bg_va: u64,
     eot_va: u64,
+    eot_rsrc_spec: u64,
     partial_eot_va: u64,
+    partial_eot_rsrc_spec: u64,
 }
 
 impl PassWords {
@@ -446,7 +451,9 @@ impl PassWords {
             partial_bg_rsrc_spec: rsrc_spec(pass.partial_bg.rsrc_spec),
             partial_bg_va: usc(pass.partial_bg.offset)?,
             eot_va: usc(pass.eot_offset)?,
+            eot_rsrc_spec: rsrc_spec(pass.eot_rsrc_spec),
             partial_eot_va: usc(pass.partial_eot_offset)?,
+            partial_eot_rsrc_spec: rsrc_spec(pass.partial_eot_rsrc_spec),
         })
     }
 }
@@ -580,7 +587,7 @@ fn fragment_registers(
         RegisterWrite::new(0x01739, 1),
         RegisterWrite::new(0x10009, w.utile_config),
         // End-of-tile resource specifier.
-        RegisterWrite::new(0x15379, 0),
+        RegisterWrite::new(0x15379, w.eot_rsrc_spec),
         RegisterWrite::new(0x15381, w.eot_va),
         RegisterWrite::new(0x15369, w.bg_rsrc_spec),
         RegisterWrite::new(0x15371, w.bg_va),
@@ -676,7 +683,7 @@ fn partial_store_registers(
 ) -> [RegisterWrite; PARTIAL_STORE_REGISTERS] {
     [
         // End-of-tile resource specifier.
-        RegisterWrite::new(0x15379, 0),
+        RegisterWrite::new(0x15379, w.partial_eot_rsrc_spec),
         RegisterWrite::new(0x15381, w.partial_eot_va),
         RegisterWrite::new(0x10039, w.tile_config),
         RegisterWrite::new(0x15359, UNK_15359_PARTIAL),
@@ -701,7 +708,7 @@ fn partial_resume_registers(
 ) -> [RegisterWrite; PARTIAL_RESUME_REGISTERS] {
     [
         // End-of-tile resource specifier.
-        RegisterWrite::new(0x15379, 0),
+        RegisterWrite::new(0x15379, w.partial_eot_rsrc_spec),
         RegisterWrite::new(0x15381, w.partial_eot_va),
         RegisterWrite::new(0x15369, w.partial_bg_rsrc_spec),
         RegisterWrite::new(0x15371, w.partial_bg_va),
@@ -1036,12 +1043,14 @@ pub(crate) struct FragmentDescriptor {
     pub(crate) unk_1f50: u64,
     /// Tile configuration.
     pub(crate) tile_config: u64,
-    /// Ends with the end-of-tile resource specifier, which is zero.
-    pub(crate) unk_1f60: [u8; 0x1c],
+    pub(crate) unk_1f60: [u8; 0x18],
+    /// Low word of the end-of-tile resource specifier.
+    pub(crate) eot_rsrc_spec: u32,
     /// GPU address of the end-of-tile program.
     pub(crate) eot_va: u64,
-    /// Ends with the partial end-of-tile resource specifier, which is zero.
-    pub(crate) unk_1f84: [u8; 0x18],
+    pub(crate) unk_1f84: [u8; 0x14],
+    /// Low word of the partial-render end-of-tile resource specifier.
+    pub(crate) partial_eot_rsrc_spec: u32,
     /// GPU address of the partial-render end-of-tile program.
     pub(crate) partial_eot_va: u64,
     pub(crate) unk_1fa4: u32,
@@ -1228,7 +1237,9 @@ impl FragmentSlot {
         desc.height = pass.height;
         desc.unk_1f50 = UNK_15049;
         desc.tile_config = words.tile_config;
+        desc.eot_rsrc_spec = words.eot_rsrc_spec as u32;
         desc.eot_va = words.eot_va;
+        desc.partial_eot_rsrc_spec = words.partial_eot_rsrc_spec as u32;
         desc.partial_eot_va = words.partial_eot_va;
         desc.depth_clear = pass.depth_clear;
         desc.unk_1fac = words.tib_blocks << Self::UNK_1FAC_TIB_SHIFT | Self::UNK_1FAC_BASE;

@@ -413,6 +413,15 @@ impl InitData {
         Ok(())
     }
 
+    /// The sole host publisher holds the device mutex through the following
+    /// inner and outer publication. Firmware consumers can only free capacity;
+    /// neither this check nor waiting for room reserves or limits other queues.
+    pub(super) fn work_ready(&self, engine: super::fw::queue::DataMaster) -> Result<bool> {
+        let [consumer, consumer_b, producer] = self.work_cursors(engine)?;
+        let next = (producer + 1) % super::fw::channels::WORK_RING_SLOTS;
+        Ok(next != consumer && next != consumer_b)
+    }
+
     fn work_publication<'a>(
         &'a self,
         record: &'a super::fw::channels::WorkSlot,
@@ -1231,14 +1240,14 @@ impl super::recovery::Memory for InitData {
             .dword(abi::private::STATUS_B + abi::PrimaryStatusB::RECOVERY_SLOT_MASK)?
             .load(Ordering::Relaxed);
         let mut sources = super::recovery::Sources::sample(mask as u32, |slot| {
-            let key = super::recovery::slot_key(slot).unwrap_or(0);
+            let key = super::recovery::slot_key(slot)?;
             let monitor = self.recovery_view_words::<6>(abi::recovery::PROGRESS_VIEW,
                 abi::recovery::PROGRESS_START + slot * abi::recovery::PROGRESS_STRIDE)
-                .map(|words| words[0]).unwrap_or(0);
-            (key, monitor)
+                .ok().map(|words| words[0])?;
+            Some((key, monitor))
         });
         sources.reason = self.recovery_view_words::<1>(abi::recovery::REPORT_VIEW, abi::recovery::REASON)
-            .map(|words| words[0]).unwrap_or(0);
+            .ok().map(|words| words[0]);
         Ok(sources)
     }
 
@@ -1290,30 +1299,17 @@ impl super::recovery::Memory for InitData {
         Ok(())
     }
 
-    fn entries(
-        &self,
-        out: &mut [super::recovery::Entry; super::recovery::MAX_ENTRIES],
-    ) -> Result<usize> {
+    fn entries(&self) -> Result<super::recovery::Entries> {
         let cluster = self.object(self.cluster)?;
         let base = abi::private::STATUS_B + abi::PrimaryStatusB::RECOVERY_INFO;
         fence(Ordering::Acquire);
-        let mut used = 0;
+        let mut entries = super::recovery::Entries::default();
         for index in 0..256 {
-            if used == out.len() {
-                break;
-            }
             let offset = base + index * core::mem::size_of::<abi::RecoveryInfoEntry>();
             let flags = cluster.word(offset)?.load(Ordering::Relaxed);
-            if flags & 1 == 0 {
-                continue;
-            }
-            let stamp = cluster.word(offset + 4)?.load(Ordering::Relaxed);
-            if let Some(entry) = super::recovery::Entry::decode(flags, stamp) {
-                out[used] = entry;
-                used += 1;
-            }
+            entries.include(flags);
         }
-        Ok(used)
+        Ok(entries)
     }
 
     fn wait_tick(&self) {

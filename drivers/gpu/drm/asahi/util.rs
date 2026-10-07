@@ -108,23 +108,24 @@ impl<'a> Reader<'a> {
         Reader { buffer, offset: 0 }
     }
 
-    pub(crate) fn read_up_to<T: AnyBitPattern>(&mut self, max_size: usize) -> Result<T> {
+    pub(crate) fn read_up_to<T: AnyBitPattern>(&mut self, declared_size: usize) -> Result<T> {
         let mut obj: T = Default::default();
-        let size: usize = core::mem::size_of::<T>().min(max_size);
-        let range = self.offset..self.offset + size;
+        let size: usize = core::mem::size_of::<T>().min(declared_size);
+        let end = self.offset.checked_add(declared_size).ok_or(EINVAL)?;
+        let range = self.offset..end;
         let src = self.buffer.get(range).ok_or(EINVAL)?;
 
         // SAFETY: The output pointer is valid, and the size does not exceed
         // the type size, and all bit patterns are valid.
         let dst = unsafe { core::slice::from_raw_parts_mut(&mut obj as *mut _ as *mut u8, size) };
 
-        dst.copy_from_slice(src);
-        self.offset += size;
+        dst.copy_from_slice(&src[..size]);
+        self.offset = end;
         Ok(obj)
     }
 
     pub(crate) fn read<T: Default + AnyBitPattern>(&mut self) -> Result<T> {
-        self.read_up_to(!0)
+        self.read_up_to(core::mem::size_of::<T>())
     }
 
     pub(crate) fn is_empty(&self) -> bool {

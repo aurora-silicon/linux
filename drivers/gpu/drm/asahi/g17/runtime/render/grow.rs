@@ -194,6 +194,7 @@ impl crate::g17::Shared {
     pub(in crate::g17) fn grow_render(&self) -> Result {
         loop {
             let lease = self.preparations.enter(false)?;
+            let dev = self.drm()?;
             let (request, slot, mut pair) = {
                 let mut state = self.state.lock();
                 let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
@@ -246,7 +247,7 @@ impl crate::g17::Shared {
                         Err(EFAULT)
                     } else {
                         manager.prepare_growth(
-                            &self.dev,
+                            &dev,
                             &vm,
                             crate::g17::buffer::firmware_growth_target(before),
                             None,

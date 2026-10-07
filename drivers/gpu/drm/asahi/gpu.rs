@@ -1172,8 +1172,9 @@ impl GpuManager::ver {
             .with(|raw, _inner| raw.pending_submissions.fetch_add(1, Ordering::Acquire));
 
         mod_dev_dbg!(self.dev, "OP start (pending: {})\n", val + 1);
+        let guard = OpGuard(self.clone());
         self.kick_firmware()?;
-        Ok(OpGuard(self.clone()))
+        Ok(guard)
     }
 
     fn invalidate_context(

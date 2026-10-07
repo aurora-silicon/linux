@@ -13,7 +13,7 @@ use kernel::{
     sync::Arc,
 };
 
-const TIMEOUT_MS: kernel::time::Msecs = 2000;
+pub(super) const TIMEOUT_MS: kernel::time::Msecs = 2000;
 const RENDER_CREDITS: u32 = 32;
 const COMPUTE_CREDITS: u32 = 16;
 
@@ -272,6 +272,8 @@ impl<B: Backend> Drop for Job<B> {
 }
 
 impl<B: Backend> sched::JobImpl for Job<B> {
+    const MODULE: Option<&'static kernel::ThisModule> = Some(&crate::THIS_MODULE);
+
     fn false_timeout(job: &mut sched::Job<Self>) -> bool {
         if job.is_finished() || job.packet.completion.take_replay_timeout() {
             return true;
@@ -351,6 +353,7 @@ impl<B: Backend> Scheduler<B> {
             job.add_dependency(dependency)?;
         }
         let mut job = job.arm();
+        packet.completion.mark_accepted();
         let ready = if host_timestamps {
             completed.clone()
         } else {

@@ -111,7 +111,7 @@ impl<T: drm::Driver> Device<T> {
         fops: &Self::GEM_FOPS,
     };
 
-    const GEM_FOPS: bindings::file_operations = drm::gem::create_fops();
+    const GEM_FOPS: bindings::file_operations = drm::gem::create_fops(T::MODULE);
 
     /// Create a new `drm::Device` for a `drm::Driver`.
     pub fn new(dev: &device::Device, data: impl PinInit<T::Data, Error>) -> Result<ARef<Self>> {
@@ -210,13 +210,12 @@ impl<T: drm::Driver> Device<T> {
         // SAFETY: `ptr` is a valid pointer to a `struct drm_device` and embedded in `Self`.
         let this = unsafe { Self::from_drm_device(ptr) };
 
-        // SAFETY:
-        // - When `release` runs it is guaranteed that there is no further access to `this`.
-        // - `this` is valid for dropping.
-        // unsafe { core::ptr::drop_in_place(this) };
-        // HACK: data might be uninitialized so leak the DRM device instead. The expected number
-        //       of times the asahi device gets released is once at poweroff or reboot.
-        let _ = core::mem::ManuallyDrop::new(this);
+        // SAFETY: new() installs this callback only after data.__pinned_init
+        // succeeds. Initialization failures use the temporary release=None
+        // table instead. The final DRM reference excludes further data users.
+        // Drop only the Rust data: drm_dev_release still owns the embedded C
+        // device and subsequently runs its managed cleanup and final kfree.
+        unsafe { ptr::drop_in_place(ptr::addr_of_mut!((*this).data)) };
     }
 }
 

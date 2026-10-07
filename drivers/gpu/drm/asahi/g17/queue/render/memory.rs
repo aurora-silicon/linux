@@ -47,12 +47,14 @@ impl Aliases {
         let mut range = dynamic::LOWER;
         let size = (source.end - source.start) as u64;
         loop {
+            // Descriptor aliases are read-only to GPU consumers; the canonical
+            // firmware mapping remains writable for command state updates.
             let global = object.map_range(
                 alloc.uat.kernel_lower_vm(),
                 source.clone(),
                 range.clone(),
                 mmu::UAT_PGSZ as u64,
-                mmu::PROT_GPU_FW_SHARED_RW,
+                mmu::PROT_GPU_SHARED_RO,
                 0,
             )?;
             let address = global.iova();
@@ -62,7 +64,7 @@ impl Aliases {
                 source.clone(),
                 address..end,
                 mmu::UAT_PGSZ as u64,
-                mmu::PROT_GPU_FW_SHARED_RW,
+                mmu::PROT_GPU_SHARED_RO,
                 0,
             ) {
                 Ok(client) => {

@@ -313,7 +313,7 @@ struct Active {
     ticket: Option<Ticket>,
     observed: Option<Observation>,
     failure_deferred: bool,
-    qos_completed: bool,
+    qos_pending: bool,
 }
 struct Previous {
     binding: Option<Binding>,
@@ -511,6 +511,12 @@ impl Queue {
             data_master: DataMaster::Compute as u8,
         }
     }
+    /// A completion hint can require a second visibility/recordless pass even
+    /// when firmware has no more events to send. Do not poll idle or failed queues.
+    pub(crate) fn retirement_polling(&self) -> bool {
+        !self.quarantined && self.retire_pending
+    }
+
     fn selected(&self, masks: Option<[u64; 2]>) -> bool {
         self.retired_by_teardown
             || self.retire_pending
@@ -681,9 +687,9 @@ impl Queue {
             match result {
                 Ok(Some(timestamps)) => {
                     let submitted = self.submitted.checked_sub(1).ok_or(EIO)?;
-                    if !front.qos_completed {
+                    if front.qos_pending {
                         complete_qos(self.qos_owner())?;
-                        self.active.iter_mut().next().ok_or(EIO)?.qos_completed = true;
+                        self.active.iter_mut().next().ok_or(EIO)?.qos_pending = false;
                     }
                     let front = self.active.front().ok_or(EIO)?;
                     self.retire_pending = true;
@@ -783,9 +789,9 @@ impl Queue {
             self.retirement_proved = true;
         }
         while let Some(front) = self.active.front() {
-            if self.spared_quarantine && !front.qos_completed {
+            if front.qos_pending {
                 complete_qos(self.qos_owner())?;
-                self.active.iter_mut().next().ok_or(EIO)?.qos_completed = true;
+                self.active.iter_mut().next().ok_or(EIO)?.qos_pending = false;
             }
             let front = self.active.front().ok_or(EIO)?;
             let completion = front.packet.completion.clone();
@@ -1242,6 +1248,7 @@ impl Queue {
             return Err(EIO);
         }
         let crate::g17::command::Validated::Compute {
+            scratch,
             usc_base,
             cdm_va,
             cdm_end_va,
@@ -1275,6 +1282,7 @@ impl Queue {
             self.graph.ensure_record_slot(slot)?;
         }
         let args = ComputeArgs {
+            scratch: *scratch,
             usc_base: *usc_base,
             cdm_va: *cdm_va,
             cdm_end_va: *cdm_end_va,
@@ -1345,7 +1353,8 @@ impl Queue {
             },
             mcache: None,
             event_mask: COMPUTE_KICK_EVENT_MASK,
-            register_arrays: ComputeDescriptor::register_bindings(descriptor_low)?,
+            register_arrays: ComputeDescriptor::register_bindings(descriptor_low, *scratch)?,
+            compute_scratch: scratch.enabled(),
         };
         let published = host.next_compute_publication()?;
         self.active
@@ -1356,7 +1365,7 @@ impl Queue {
                 ticket: None,
                 observed: None,
                 failure_deferred: false,
-                qos_completed: false,
+                qos_pending: false,
             })
             .map_err(|_| EBUSY)?;
         self.retirement_ready = false;
@@ -1411,8 +1420,10 @@ impl Queue {
                     },
                     identity.scheduler,
                 )?;
+                self.active.back_mut().ok_or(EIO)?.qos_pending = true;
                 let target = self.pool.reserve_submission().or_else(|error| {
                     host.qos_cancel(qos)?;
+                    self.active.back_mut().ok_or(EIO)?.qos_pending = false;
                     Err(error)
                 })?;
                 producer = self
@@ -1421,6 +1432,7 @@ impl Queue {
                     .or_else(|error| {
                         self.pool.cancel_unpublished(target)?;
                         host.qos_cancel(qos)?;
+                        self.active.back_mut().ok_or(EIO)?.qos_pending = false;
                         Err(error)
                     })?;
             } else {
@@ -1443,11 +1455,13 @@ impl Queue {
                     },
                     identity.scheduler,
                 )?;
+                self.active.back_mut().ok_or(EIO)?.qos_pending = true;
                 producer = self
                     .graph
                     .append(producer, config_va, || {})
                     .or_else(|error| {
                         host.qos_cancel(qos)?;
+                        self.active.back_mut().ok_or(EIO)?.qos_pending = false;
                         Err(error)
                     })?;
             }
