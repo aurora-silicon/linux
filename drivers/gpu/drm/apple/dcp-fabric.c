@@ -1149,13 +1149,17 @@ dcp_typec_rebalance_locked(struct apple_dcp_typec_port *arriving, unsigned int d
 	dcp_fabric_run_rebalance(&dcp_rebalance_ops, &ctx);
 	return ctx.planned;
 }
+
+static bool dcp_typec_hdmi_reclaim(struct apple_dcp *dcp);
+
 /*
  * A display is plugged into the HDMI port while its pipeline, the hybrid,
  * drives a Type-C port.  Without dual-stream docks nothing moves for it: a
  * compositor keeps its connector-to-CRTC pairing and could miss a moved
- * display's brief unplug, and a Thunderbolt tunnel never moves.  The HDMI
- * display waits and is handed the hybrid when the Type-C display lets it go
- * (see dcp_typec_route_deactivate()).
+ * display's brief unplug.  The HDMI display waits and is handed the hybrid
+ * when the Type-C display lets it go (see dcp_typec_route_deactivate()),
+ * unless the Type-C display can be moved out of its way (see
+ * dcp_typec_hdmi_reclaim()).
  */
 static void dcp_typec_hdmi_waits(struct apple_dcp *dcp)
 {
@@ -1163,6 +1167,8 @@ static void dcp_typec_hdmi_waits(struct apple_dcp *dcp)
 
 	lockdep_assert_held(&dcp_typec_fabric_lock);
 
+	if (owner && dcp_typec_hdmi_reclaim(dcp))
+		return;
 	if (owner)
 		dev_info(dcp->dev, "HDMI display waits: its pipeline drives the %s on %pOF\n",
 			 owner->tunnel ? "Thunderbolt display" : "display",
@@ -2308,11 +2314,10 @@ static int dcp_follow_detach(void *data, unsigned int index, bool destination)
 	return dcp_follow_release(destination ? slot->to : slot->from);
 }
 
-static int dcp_follow_attach(void *data, unsigned int index, bool restore)
+/* Route @slot's display through @route, a tunnel with its binding. */
+static int dcp_follow_activate(struct apple_dcp_typec_route *route,
+			       struct dcp_typec_follow_slot *slot)
 {
-	struct dcp_typec_follow_context *ctx = data;
-	struct dcp_typec_follow_slot *slot = &ctx->slots[index];
-	struct apple_dcp_typec_route *route = restore ? slot->from : slot->to;
 	struct apple_dcp *dcp = route->dcp;
 	struct mux_control *ctl = route->xbar;
 	int ret;
@@ -2343,10 +2348,24 @@ static int dcp_follow_attach(void *data, unsigned int index, bool restore)
 	}
 	if (slot->tunnel)
 		dcp_tunnel_prepare(route, ctl);
-	slot->attachment_generation = dcp_modes_transfer_begin(dcp);
 	slot->port->owner = route;
 	slot->port->preferred_route = route;
 	slot->port->dp_release_deadline = 0;
+	return 0;
+}
+
+static int dcp_follow_attach(void *data, unsigned int index, bool restore)
+{
+	struct dcp_typec_follow_context *ctx = data;
+	struct dcp_typec_follow_slot *slot = &ctx->slots[index];
+	struct apple_dcp_typec_route *route = restore ? slot->from : slot->to;
+	struct apple_dcp *dcp = route->dcp;
+	int ret;
+
+	ret = dcp_follow_activate(route, slot);
+	if (ret)
+		return ret;
+	slot->attachment_generation = dcp_modes_transfer_begin(dcp);
 	scoped_guard(mutex, &dcp->hpd_mutex) {
 		WRITE_ONCE(dcp->typec_cable_connected, true);
 		dcp->typec_generation++;
@@ -3163,6 +3182,103 @@ static void dcp_hdmi_connect_fixed(void *ctx)
 	else
 		ret = dcp_dptx_connect(dcp, 0);
 	dcp_hdmi_connect_failed(dcp, ret);
+}
+
+/*
+ * An HDMI display has arrived, and stayed, while its hybrid drives a
+ * Type-C display that another free pipeline can drive too.  Where routes
+ * follow their CRTC, hand the hybrid back: the Type-C display goes, the
+ * HDMI display connects, and the Type-C display returns on the other
+ * pipeline.  The compositor sees an unplug and a replug, drops the CRTC it
+ * gave the Type-C display, and finds the HDMI display there before the
+ * Type-C display is back to be paired with the other CRTC.  In the other
+ * order it would pair the returning display with the hybrid's CRTC again.
+ * Without such a pipeline, or on dual-stream machines, the HDMI display
+ * waits as before.
+ */
+#define DCP_RECLAIM_HDMI_MS	3000
+
+static bool dcp_typec_hdmi_reclaim(struct apple_dcp *dcp)
+{
+	struct apple_dcp_typec_route *owner = dcp->active_typec_route;
+	struct dcp_typec_follow_slot slot = {};
+	struct apple_dcp_typec_route *route, *target = NULL;
+	struct apple_connector *connector, *hdmi;
+	struct apple_dcp_typec_port *port;
+	unsigned long timeout;
+	struct apple_dcp *to;
+	int ret;
+
+	lockdep_assert_held(&dcp_typec_fabric_lock);
+	if (!owner || dcp_typec_dual_stream())
+		return false;
+	port = owner->port;
+	if (port->owner != owner || !dcp_typec_port_follows(port))
+		return false;
+	list_for_each_entry(route, &port->routes, port_link) {
+		if (route == owner || !route->dcp->crtc ||
+		    !dcp_typec_route_available(route) ||
+		    (owner->tunnel && !dcp_typec_tunnel_ctl(route, owner->tunnel_dpin)))
+			continue;
+		target = route;
+		break;
+	}
+	if (!target)
+		return false;
+
+	/* not a blink */
+	msleep(500);
+	if (gpiod_get_value_cansleep(dcp->hdmi_hpd) <= 0)
+		return false;
+
+	connector = dcp->typec_connector;
+	slot.port = port;
+	slot.connector = connector;
+	slot.tunnel = owner->tunnel;
+	slot.dpin = owner->tunnel_dpin;
+	if (slot.tunnel) {
+		scoped_guard(mutex, &dcp->tb_lock) {
+			slot.tunnel_generation = owner->tunnel_generation;
+			slot.set_active = dcp->tb_dpin_set_active;
+			slot.binding = dcp->tb_dpin_ctx;
+		}
+		if (!slot.tunnel_generation || !slot.set_active)
+			return false;
+	}
+	to = target->dcp;
+	dev_info(dcp->dev, "HDMI display takes its pipeline back, %s on %pOF moves to %s\n",
+		 connector ? connector->base.name : "the display",
+		 port->connector_np, dev_name(to->dev));
+	ret = dcp_follow_release(owner);
+	if (ret)
+		dev_warn(dcp->dev, "route not released cleanly: %d\n", ret);
+	if (connector) {
+		WRITE_ONCE(connector->connected, false);
+		apple_connector_set_pipeline(connector, NULL);
+		dcp_queue_hotplug(connector);
+	}
+
+	dcp_hdmi_connect_fixed(dcp);
+	hdmi = dcp->fixed_connector;
+	timeout = jiffies + msecs_to_jiffies(DCP_RECLAIM_HDMI_MS);
+	while (hdmi && !READ_ONCE(hdmi->connected) && time_before(jiffies, timeout))
+		msleep(20);
+
+	ret = dcp_follow_activate(target, &slot);
+	if (ret) {
+		dev_err(to->dev, "could not take the display on %pOF: %d\n",
+			port->connector_np, ret);
+		return true;
+	}
+	/* A new display on its pipeline, connected now: no CRTC is on yet. */
+	scoped_guard(mutex, &to->hpd_mutex) {
+		WRITE_ONCE(to->typec_cable_connected, true);
+		to->typec_generation++;
+		to->typec_follow_start = false;
+		WRITE_ONCE(to->typec_crtc_off, false);
+	}
+	dcp_dptx_connect_oob(to_platform_device(to->dev), 0);
+	return true;
 }
 
 /*
