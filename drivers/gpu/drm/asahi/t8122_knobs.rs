@@ -13,8 +13,8 @@ pub(crate) const INVALID: u64 = u64::MAX - 1;
 /// the whole ADT sgx reg[1].
 pub(crate) const FENDER_RULE: u32 = 0x10_4000;
 pub(crate) const FENDER_ADT: u32 = 0x12_c000;
-/// The GPU clock-generator offsets in SGX: the ported T8122 table's (the default), and the
-/// T6030 one.
+/// The GPU clock-generator offsets in SGX: the T8122 table's (`T8122_IO_MAPPINGS`, the default),
+/// and the T6030 one.
 pub(crate) const CLOCK_GEN_E1C: u64 = 0xe1_c000;
 pub(crate) const CLOCK_GEN_E5C: u64 = 0xe5_c000;
 /// The SGX setup write of T6030 (offset, value).
@@ -29,11 +29,19 @@ pub(crate) const UNIT_MASK_A_LIMIT: u64 = 0x7_0000_0001;
 pub(crate) const UNIT_MASK_B_LIMIT: u64 = 0x7;
 /// The default performance-state ceiling: the lowest two states.
 pub(crate) const PSTATE_CAP: u32 = 2;
+/// The highest performance-state ceiling the experiment accepts. The same as the driver's own
+/// limit when the fast-die temperature controller is off (`m3_adt_config::ADT_MAX_PSTATE_LIMIT`):
+/// J613/J615 have no SoC die temperature zone yet, so there is no thermal feedback above it.
+pub(crate) const PSTATE_CAP_MAX: u32 = 5;
 
-/// Parse a decimal or `0x`-prefixed hexadecimal `u64`.
+/// Parse a decimal or `0x`-prefixed hexadecimal `u64`. A leading sign is not accepted.
 fn number(text: &str) -> Option<u64> {
+    if text.starts_with(['+', '-']) {
+        return None;
+    }
     match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        Some(hex) if !hex.starts_with(['+', '-']) => u64::from_str_radix(hex, 16).ok(),
+        Some(_) => None,
         None => text.parse::<u64>().ok(),
     }
 }
@@ -168,7 +176,7 @@ pub(crate) fn resolve(raw: &Raw) -> Result<Values, Refusal> {
     let refuse = |name, accepts| Refusal { name, accepts };
     let initdata_version = given(raw.initdata_version, crate::m3_firmware::G15_V14_8_3_INITDATA)
         .filter(|v| *v != 0)
-        .ok_or(refuse("t8122_initdata_version", "a nonzero 64-bit number"))?;
+        .ok_or(refuse("t8122_initdata_version", "a nonzero number, at most 0xfffffffffffffffd"))?;
     let fender = match given(raw.fender, FENDER_RULE as u64) {
         Some(v) if v == FENDER_RULE as u64 || v == FENDER_ADT as u64 => v as u32,
         _ => return Err(refuse("t8122_fender", "0x104000 or rule, 0x12c000 or adt")),
@@ -190,8 +198,8 @@ pub(crate) fn resolve(raw: &Raw) -> Result<Values, Refusal> {
         .filter(|v| *v != 0 && *v & !UNIT_MASK_B_LIMIT == 0)
         .ok_or(refuse("t8122_unit_mask_b", "nonzero, no bits outside 0x7"))? as u32;
     let pstate_cap = given(raw.pstate_cap, PSTATE_CAP as u64)
-        .filter(|v| (1..16).contains(v))
-        .ok_or(refuse("t8122_pstate_cap", "1 to 15"))? as u32;
+        .filter(|v| (1..=u64::from(PSTATE_CAP_MAX)).contains(v))
+        .ok_or(refuse("t8122_pstate_cap", "1 to 5"))? as u32;
     Ok(Values {
         initdata_version,
         fender,
@@ -246,14 +254,14 @@ mod tests {
             r.sgx_setup = parse_sgx_setup("t6030");
             r.unit_mask_a = parse_number("1");
             r.unit_mask_b = parse_number("0x1");
-            r.pstate_cap = parse_number("8");
+            r.pstate_cap = parse_number("5");
         }))
         .unwrap();
         assert_eq!(v.initdata_version, 0x1234_5678_9abc_def0);
         assert_eq!(v.fender, 0x12_c000);
         assert_eq!(v.clock_gen, ClockGen::At(0xe5_c000));
         assert_eq!(v.sgx_setup, Some((0xd1_4000, 0x7_0001)));
-        assert_eq!((v.unit_mask_a, v.unit_mask_b, v.pstate_cap), (1, 1, 8));
+        assert_eq!((v.unit_mask_a, v.unit_mask_b, v.pstate_cap), (1, 1, 5));
         let v = resolve(&with(|r| r.clkgen = parse_clkgen("none"))).unwrap();
         assert_eq!(v.clock_gen, ClockGen::Absent);
         // Numbers and names give the same values.
@@ -267,7 +275,7 @@ mod tests {
 
     #[test]
     fn unaccepted_values_refuse_and_name_the_parameter() {
-        let cases: [(fn(&mut Raw), &str); 14] = [
+        let cases: [(fn(&mut Raw), &str); 15] = [
             (|r| r.initdata_version = parse_number("g15s"), "t8122_initdata_version"),
             (|r| r.initdata_version = 0, "t8122_initdata_version"),
             (|r| r.fender = parse_fender("0x144000"), "t8122_fender"),
@@ -280,12 +288,32 @@ mod tests {
             (|r| r.unit_mask_b = parse_number("0xf"), "t8122_unit_mask_b"),
             (|r| r.unit_mask_b = 0, "t8122_unit_mask_b"),
             (|r| r.pstate_cap = 0, "t8122_pstate_cap"),
+            (|r| r.pstate_cap = 6, "t8122_pstate_cap"),
             (|r| r.pstate_cap = 16, "t8122_pstate_cap"),
             (|r| r.pstate_cap = parse_number("-1"), "t8122_pstate_cap"),
         ];
         for (edit, name) in cases {
             assert_eq!(resolve(&with(edit)).unwrap_err().name, name);
         }
+    }
+
+    #[test]
+    fn pstate_cap_accepts_one_to_five_only() {
+        for cap in 1..=PSTATE_CAP_MAX {
+            assert_eq!(resolve(&with(|r| r.pstate_cap = u64::from(cap))).unwrap().pstate_cap, cap);
+        }
+        for cap in [0u64, 6, 8, 15, 16] {
+            assert!(resolve(&with(|r| r.pstate_cap = cap)).is_err(), "cap {cap}");
+        }
+        assert_eq!(PSTATE_CAP_MAX, 5);
+    }
+
+    #[test]
+    fn a_leading_sign_is_rejected() {
+        for text in ["+1", "-1", "0x+1", "0x-1", "+0x10"] {
+            assert_eq!(parse_number(text), INVALID, "{text:?}");
+        }
+        assert!(resolve(&with(|r| r.pstate_cap = parse_number("+3"))).is_err());
     }
 
     #[test]

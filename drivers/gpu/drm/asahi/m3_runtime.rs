@@ -15,6 +15,7 @@ struct GeometryTiming {
 impl NativeJob {
     fn complete(&mut self)->Result<bool> {match self {Self::Compute(j)=>j.complete(),Self::Render(j)=>j.complete()}}
     fn log(&mut self,dev:&driver::AsahiDevice)->Result {match self {Self::Compute(j)=>j.log(dev),Self::Render(j)=>j.log(dev)}}
+    fn batch_gpu_span(&mut self)->Result<[u64;2]> {match self {Self::Compute(j)=>j.batch_gpu_span(),Self::Render(j)=>j.batch_gpu_span()}}
 }
 struct Inner {
     transport: rtkit::RtKit<m3_rtkit::Operations>,
@@ -27,6 +28,11 @@ struct Inner {
     render_batches: [u64;crate::m3_pass_layout::SLOTS],
     geometry: [GeometryTiming; 32],
     geometry_overflow: u64,
+    /// Whether a T8122 job verdict line was already emitted for the current job, so the
+    /// execute-path fallback does not add a second one. T8122 only.
+    t8122_verdict: bool,
+    /// The step the firmware boot sequence has reached, for the T8122 boot verdict. T8122 only.
+    boot_step: crate::t8122_start::BootStep,
     config: Config,
     uat: mmu::Uat,
     drm: driver::AsahiDevRef,
@@ -52,7 +58,11 @@ impl Inner {
         self.capture_fault(primary);
         if crate::t8122_start::is_t8122(self.device.soc()) {
             let pstate=self.device.pstate_register().ok();
-            crate::t8122_start::job_failed_verdict(self.drm.as_ref(),primary,pstate,self.state.health.crashed());
+            // The job's first GPU start timestamp: nonzero means the firmware dispatched it,
+            // whatever the power state reads at the timeout.
+            let start_stamp=self.jobs[index].batch_gpu_span().ok().map(|span| span[0]);
+            crate::t8122_start::job_failed_verdict(self.drm.as_ref(),primary,start_stamp,pstate,self.state.health.crashed());
+            self.t8122_verdict=true;
         }
         let events=self.state.event_messages.load(Ordering::Acquire);
         if let Err(e) = self.jobs[index].log(&self.drm) {
@@ -116,14 +126,19 @@ pub(crate) struct Runtime { inner: ManuallyDrop<KBox<Inner>> }
 impl Runtime {
     #[inline(never)]
     pub(crate) fn new(pdev: &platform::Device<Core>, device: Device, contents: crate::m3_adt_config::Contents) -> Result<Self> {
-        device.require_stopped(pdev)?;
+        // On an armed T8122, name a setup failure before the GPU coprocessor is started (RTKit
+        // state, mailbox transport, the DRM device). Captured as a Copy bool so the closure does
+        // not borrow `device`, which is moved into Inner below.
+        let t8122 = crate::t8122_start::is_t8122(device.soc());
+        let coproc_refused = |e: &Error| if t8122 { crate::t8122_start::coproc_setup_refused(pdev.as_ref(), *e); };
+        device.require_stopped(pdev).inspect_err(coproc_refused)?;
         // Reserve before starting ASC. ENOMEM must not drop firmware owners
         // while the coprocessor may still access them. Writing the completed
         // graph into this allocation is infallible.
         let owner = KBox::<Inner>::new_uninit(GFP_KERNEL)?;
-        let drm: driver::AsahiDevRef = kernel::drm::Device::new(pdev.as_ref(), driver::AsahiData::new(pdev, None, true))?;
-        let state = m3_rtkit::State::new(pdev, drm.clone(), device.firmware().resources.regions[5])?;
-        let mut transport = rtkit::RtKit::new(pdev.as_ref(), None, 0, state.clone())?;
+        let drm: driver::AsahiDevRef = kernel::drm::Device::new(pdev.as_ref(), driver::AsahiData::new(pdev, None, true)).inspect_err(coproc_refused)?;
+        let state = m3_rtkit::State::new(pdev, drm.clone(), device.firmware().resources.regions[5]).inspect_err(coproc_refused)?;
+        let mut transport = rtkit::RtKit::new(pdev.as_ref(), None, 0, state.clone()).inspect_err(coproc_refused)?;
         if crate::m3_adt_config::stop_before_asc(pdev.as_ref()) { return Err(ENODEV); }
         // Whether the coprocessor runs and offers its endpoints, for the T8122 verdict.
         let mut started=false;
@@ -159,7 +174,8 @@ impl Runtime {
         };
         Ok(Self { inner: ManuallyDrop::new(owner.write(Inner { transport, state, config, uat, drm, device,
             jobs:KVec::new(),packets:KVec::new(),gpu_pending:false,fault_captured:false,timing:[[0;7];2],render_batches:[0;crate::m3_pass_layout::SLOTS],
-            geometry:[GeometryTiming::default();32],geometry_overflow:0 })) })
+            geometry:[GeometryTiming::default();32],geometry_overflow:0,t8122_verdict:false,
+            boot_step:crate::t8122_start::BootStep::Publish })) })
     }
     pub(crate) fn drm(&self) -> driver::AsahiDevRef { self.inner.drm.clone() }
     pub(crate) fn health(&self) -> Arc<m3_rtkit::Health> { self.inner.state.health.clone() }
@@ -186,7 +202,18 @@ impl Runtime {
         let result = Self::execute_inner(shared, packet);
         if let Err(error) = result {
             if let Some(runtime) = Option::as_mut(&mut *shared.lock()) {
-                if runtime.inner.gpu_pending { runtime.inner.capture_fault(error); }
+                let inner = &mut runtime.inner;
+                if inner.gpu_pending {
+                    // A job was submitted but execution returned an error without one of the
+                    // paths above (fail() or the cap check) reaching a T8122 verdict: a submit,
+                    // doorbell or post-completion read failed. Name it so no job outcome is
+                    // reported as success.
+                    if crate::t8122_start::is_t8122(inner.device.soc()) && !inner.t8122_verdict {
+                        crate::t8122_start::job_setup_failed_verdict(inner.drm.as_ref(), error);
+                        inner.t8122_verdict = true;
+                    }
+                    inner.capture_fault(error);
+                }
             }
         }
         result
@@ -209,6 +236,7 @@ impl Runtime {
             }
             inner.packets.clear();
             inner.packets.push(packet.clone(), GFP_KERNEL)?;
+            inner.t8122_verdict=false;
             inner.state.events.clone()
         };
         // Snapshot once per packet. A root policy write cannot change ownership
@@ -320,7 +348,14 @@ impl Runtime {
                     let retire_start=measure.then(Instant::<Monotonic>::now);
                     match inner.device.check_idle() {
                         Ok(()) if inner.config.pipes_idle()?=>{
-                            if let Err(e)=inner.config.check_pstate(&inner.drm,&inner.device,"after a job") {inner.state.health.mark_failed();return Err(e);}
+                            if let Err(e)=inner.config.check_pstate(&inner.drm,&inner.device,"after a job") {
+                                inner.state.health.mark_failed();
+                                if crate::t8122_start::is_t8122(inner.device.soc()) {
+                                    crate::t8122_start::cap_violated_verdict(inner.drm.as_ref(),e);
+                                    inner.t8122_verdict=true;
+                                }
+                                return Err(e);
+                            }
                             let observed_tick=if boundary_profile {physical_counter()} else {0};
                             // Stamps, both queue indices, required events,
                             // firmware health, engines and pipes are verified.
@@ -466,29 +501,43 @@ impl Runtime {
     }
 
     pub(crate) fn boot(&mut self, pdev: &platform::Device<Core>) -> Result {
+        let is_t8122 = crate::t8122_start::is_t8122(self.inner.device.soc());
+        self.inner.boot_step = crate::t8122_start::BootStep::Publish;
         let result = self.boot_inner(pdev);
-        if let Err(error) = result { self.inner.capture_fault(error); }
-        if crate::t8122_start::is_t8122(self.inner.device.soc()) {
+        if let Err(error) = result {
+            // Log the firmware readiness words on every boot failure, so the verdict's "see M3
+            // firmware readiness" always has a line to point at.
+            if is_t8122 {
+                let inner: &mut Inner = &mut *self.inner;
+                let _ = inner.config.log_ready(&inner.drm);
+            }
+            self.inner.capture_fault(error);
+        }
+        if is_t8122 {
             let accepted = result.is_ok() || self.inner.config.ready().unwrap_or(false);
             crate::t8122_start::boot_verdict(pdev.as_ref(), self.inner.device.firmware().initdata_magic,
-                accepted, self.inner.state.health.crashed(), result);
+                self.inner.boot_step, accepted, self.inner.state.health.crashed(), result);
         }
         result
     }
     fn boot_inner(&mut self, pdev: &platform::Device<Core>) -> Result {
+        use crate::t8122_start::BootStep;
         let root = self.inner.config.root();
         dev_info!(pdev.as_ref(), "M3: publishing owned initdata {:#x}\n", root);
+        self.inner.boot_step = BootStep::Publish;
         Pin::new(&mut self.inner.transport).send_message(0x20, 0x0081000000000000 | (root & ((1u64<<44)-1)))?;
+        self.inner.boot_step = BootStep::DeviceControl;
         self.send_control(0x13)?;
         self.send_control(9)?;
+        self.inner.boot_step = BootStep::AwaitReady;
         let start = Instant::<Monotonic>::now();
         while !self.inner.config.ready()? {
             if start.elapsed() >= Delta::from_secs(2) || !self.inner.state.healthy() {
-                let inner: &mut Inner=&mut *self.inner;let _=inner.config.log_ready(&inner.drm);
                 return Err(ETIMEDOUT);
             }
             fsleep(Delta::from_millis(1));
         }
+        self.inner.boot_step = BootStep::PostReady;
         // Import the configured idle policy again after initial power-up.
         self.send_control(0x13)?;
         let inner: &mut Inner = &mut *self.inner;

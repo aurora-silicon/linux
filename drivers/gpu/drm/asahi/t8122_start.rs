@@ -114,7 +114,7 @@ const fn maps_cover(mappings: &[IoMapping; 12], maps: &[IoMap; 12]) -> bool {
 }
 
 const _: () = {
-    // The ported table: the Fender window at the rule size, the clock generator last, at
+    // The T8122 table: the Fender window at the rule size, the clock generator last, at
     // SGX+0xe1c000, 16 KiB, read-only.
     assert!(T8122_IO_MAPPINGS[FENDER].0 == 0 && T8122_IO_MAPPINGS[FENDER].1 == SGX + 0xd0_0000);
     assert!(T8122_IO_MAPPINGS[FENDER].2 == FENDER_RULE);
@@ -138,6 +138,10 @@ const _: () = {
     assert!(T6030_HWDATA_B.unit_mask_b as u64 == knobs::UNIT_MASK_B_LIMIT);
     assert!(offset_of!(raw::HwDataBG15V14_8_3, unit_mask_a) == 0x17c0);
     assert!(offset_of!(raw::HwDataBG15V14_8_3, unit_mask_b) == 0x17c8);
+    // An armed start skips `require_complete`, so the experiment stands in for exactly the two
+    // `unported` items the T8122 table lists. If a third is added, this fails the build until the
+    // experiment accounts for it.
+    assert!(crate::m3_soc::T8122.unported.len() == 2);
 };
 
 /// The values of one armed boot.
@@ -278,11 +282,7 @@ pub(crate) fn arm(dev: &device::Device, soc: &Soc) -> Result<Option<Experiment>>
         "M3 G15G start: armed (asahi.t8122_start=1, boot loader handoff admitted): initdata_version={:#018x} fender={:#x} clkgen={} sgx_setup={} unit_mask_a={:#x} unit_mask_b={:#x} pstate_cap={}\n",
         v.initdata_version,
         v.fender,
-        match v.clock_gen {
-            ClockGen::At(CLOCK_GEN_E1C) => "e1c(sgx+0xe1c000,ro)",
-            ClockGen::At(_) => "e5c(sgx+0xe5c000,ro)",
-            ClockGen::Absent => "none",
-        },
+        clkgen_label(v.clock_gen, v.fender),
         match v.sgx_setup {
             Some(_) => "t6030(sgx+0xd14000=0x70001)",
             None => "none",
@@ -297,7 +297,43 @@ pub(crate) fn arm(dev: &device::Device, soc: &Soc) -> Result<Option<Experiment>>
         e.mapping_count(),
         storage::IOMAP_BASE
     );
+    // J613/J615 have no SoC die temperature zone yet, so a cap above the no-feedback limit runs
+    // the fanless GPU without any temperature feedback (`m3_thermal` holds the cap but gets no
+    // reading). The runtime cap and the firmware ceiling stay equal, because the cap is at most
+    // the no-feedback limit.
+    if v.pstate_cap > knobs::PSTATE_CAP {
+        dev_warn!(
+            dev,
+            "M3 G15G start: pstate_cap={} is above {}: no SoC die temperature zone on this board, so states up to {} run with no temperature feedback\n",
+            v.pstate_cap,
+            knobs::PSTATE_CAP,
+            v.pstate_cap
+        );
+    }
     Ok(Some(e))
+}
+
+/// The armed line's clock-generator field. It says `ro` for the firmware's own slot-29 mapping,
+/// and adds that the Fender window reaches the block read-write when the chosen window covers it
+/// (SGX+0xe1c000 lies under the 0x12c000 window but not the 0x104000 one; SGX+0xe5c000 under
+/// neither).
+fn clkgen_label(clock_gen: ClockGen, fender: u32) -> &'static str {
+    let fender_end = 0xd0_0000u64 + u64::from(fender);
+    let reaches = |off: u64| off + 0x4000 <= fender_end;
+    match clock_gen {
+        ClockGen::At(CLOCK_GEN_E1C) if reaches(CLOCK_GEN_E1C) => {
+            "e1c(sgx+0xe1c000,ro; also rw in the fender window)"
+        }
+        ClockGen::At(CLOCK_GEN_E1C) => "e1c(sgx+0xe1c000,ro)",
+        ClockGen::At(_) if reaches(CLOCK_GEN_E5C) => {
+            "e5c(sgx+0xe5c000,ro; also rw in the fender window)"
+        }
+        ClockGen::At(_) => "e5c(sgx+0xe5c000,ro)",
+        ClockGen::Absent if reaches(CLOCK_GEN_E1C) => {
+            "none (but the fender window reaches sgx+0xe1c000 rw)"
+        }
+        ClockGen::Absent => "none",
+    }
 }
 
 /// Log, in an armed start, that the probe stopped at `stage` before the firmware started.
@@ -347,45 +383,128 @@ pub(crate) fn prepare_verdict(dev: &device::Device, soc: &Soc, started: bool, er
     }
 }
 
+/// The step the firmware boot sequence reached (`m3_runtime::Runtime::boot_inner`). The verdict
+/// uses it to name a failure as a publish, a device-control or an InitData-acknowledgement
+/// problem, rather than lumping them all under "initdata-rejected".
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BootStep {
+    /// About to send, or sending, the InitData publish message (endpoint 0x20).
+    Publish,
+    /// A device-control message (0x13 or 9) before the firmware signalled ready.
+    DeviceControl,
+    /// Waiting (up to 2 s) for the firmware to write its ready words.
+    AwaitReady,
+    /// The firmware signalled ready; a control or check after that.
+    PostReady,
+}
+
 /// The firmware's answer to the published InitData (`m3_runtime::Runtime::boot`). `accepted`:
-/// the firmware wrote its ready words.
+/// the firmware wrote its ready words. `step`: the furthest step the boot reached.
 pub(crate) fn boot_verdict(
     dev: &device::Device,
     version: u64,
+    step: BootStep,
     accepted: bool,
     crashed: bool,
     result: Result,
 ) {
-    match result {
-        Ok(()) => dev_info!(
+    let Err(e) = result else {
+        dev_info!(
             dev,
             "M3 G15G verdict: firmware-running: the firmware accepted the InitData (version {:#x}) and the device controls; no job has run yet\n",
             version
-        ),
-        Err(e) if accepted => dev_err!(
+        );
+        return;
+    };
+    // The firmware signalled ready, then a later control or check failed: the InitData was
+    // accepted, so this is not a rejection.
+    if accepted || step == BootStep::PostReady {
+        if crashed {
+            dev_err!(
+                dev,
+                "M3 G15G verdict: firmware-running-check-failed ({:?}): the firmware accepted the InitData (version {:#x}) then crashed during a post-boot control or check; see the crash lines above\n",
+                e,
+                version
+            );
+        } else {
+            dev_err!(
+                dev,
+                "M3 G15G verdict: firmware-running-check-failed ({:?}): the firmware accepted the InitData (version {:#x}), then a post-boot control or check failed (see above)\n",
+                e,
+                version
+            );
+        }
+        return;
+    }
+    match step {
+        BootStep::Publish => dev_err!(
             dev,
-            "M3 G15G verdict: firmware-running-check-failed ({:?}): the firmware accepted the InitData (version {:#x}), then a check after boot failed (see above)\n",
+            "M3 G15G verdict: publish-failed ({:?}): the InitData publish message (endpoint 0x20) could not be sent; the firmware was not told about the InitData (version {:#x})\n",
             e,
             version
         ),
-        Err(e) if crashed => dev_err!(
+        BootStep::DeviceControl => dev_err!(
+            dev,
+            "M3 G15G verdict: device-control-failed ({:?}): a device-control message was not acknowledged within 2 s after the InitData (version {:#x}) was published\n",
+            e,
+            version
+        ),
+        // AwaitReady (and PostReady is handled above).
+        _ if crashed => dev_err!(
             dev,
             "M3 G15G verdict: initdata-rejected ({:?}): the firmware crashed after the InitData (version {:#x}) was published; see the crash lines above\n",
             e,
             version
         ),
-        Err(e) => dev_err!(
+        _ => dev_err!(
             dev,
-            "M3 G15G verdict: initdata-rejected ({:?}): the firmware did not accept the InitData (version {:#x}) within 2 s; see M3 firmware readiness above\n",
+            "M3 G15G verdict: initdata-rejected ({:?}): the firmware did not acknowledge the InitData (version {:#x}) within 2 s (its ready words stayed unset); see M3 firmware readiness above\n",
             e,
             version
         ),
     }
 }
 
-/// A job that failed (`m3_runtime::Inner::fail`): `primary` is ETIMEDOUT when it did not finish
-/// within the runtime's 2 s bound; `pstate` is the GPU performance-state register, if readable.
-pub(crate) fn job_failed_verdict(dev: &device::Device, primary: Error, pstate: Option<u32>, crashed: bool) {
+/// A GPU coprocessor setup step failed before the firmware could be started
+/// (`m3_runtime::Runtime::new`): the RTKit state, the mailbox transport or the DRM device.
+pub(crate) fn coproc_setup_refused(dev: &device::Device, error: Error) {
+    dev_err!(
+        dev,
+        "M3 G15G start: refused at the GPU coprocessor setup (RTKit/mailbox) ({:?}); the firmware was not started\n",
+        error
+    );
+}
+
+/// The firmware ran a job above the performance-state cap (`m3_runtime`, the after-job pstate
+/// check). The `M3: firmware ... stays above the cap ...` line precedes this.
+pub(crate) fn cap_violated_verdict(dev: &device::Device, error: Error) {
+    dev_err!(
+        dev,
+        "M3 G15G verdict: cap-violated ({:?}): after a job the firmware reported a performance state above the cap; the GPU was marked failed (see the 'stays above the cap' line above)\n",
+        error
+    );
+}
+
+/// A job-path step failed outside the completion wait (`m3_runtime::Runtime::execute`): a submit,
+/// a doorbell, or a post-completion read. No dispatch outcome was determined.
+pub(crate) fn job_setup_failed_verdict(dev: &device::Device, error: Error) {
+    dev_err!(
+        dev,
+        "M3 G15G verdict: job-failed-before-wait ({:?}): a submit, doorbell or diagnostic step failed, so no dispatch outcome was determined; see the lines above\n",
+        error
+    );
+}
+
+/// A job that failed (`m3_runtime::Inner::fail`). `primary` is ETIMEDOUT when it did not retire
+/// within the runtime's per-batch bound; `start_stamp` is the job's first GPU start (CDM
+/// dispatch) timestamp, if readable; `pstate` is the GPU performance-state register, if readable.
+pub(crate) fn job_failed_verdict(
+    dev: &device::Device,
+    primary: Error,
+    start_stamp: Option<u64>,
+    pstate: Option<u32>,
+    crashed: bool,
+) {
     if primary != ETIMEDOUT || crashed {
         dev_err!(
             dev,
@@ -394,20 +513,35 @@ pub(crate) fn job_failed_verdict(dev: &device::Device, primary: Error, pstate: O
         );
         return;
     }
+    // A nonzero start timestamp means the firmware dispatched the job on the GPU, so this was not
+    // a dispatch gap however the power state reads now (the GPU may have idled off since). The
+    // stamp and pstate print as `Some(hex)` or `None`.
+    if start_stamp.is_some_and(|start| start != 0) {
+        dev_err!(
+            dev,
+            "M3 G15G verdict: job-ran-completion-missed: the job was dispatched (GPU start timestamp {:x?}) but its completion was not seen within the per-batch bound (pstate register {:x?})\n",
+            start_stamp,
+            pstate
+        );
+        return;
+    }
+    // The GPU start timestamp is 0 (or unreadable): the job was not dispatched.
     match pstate {
         Some(p) if p & 0xf == 0 => dev_err!(
             dev,
-            "M3 G15G verdict: job-accepted-never-dispatched: the job did not finish within 2 s and the GPU reads powered down (pstate register {:#x})\n",
+            "M3 G15G verdict: job-accepted-never-dispatched: the job was not dispatched (GPU start timestamp {:x?}) and the GPU reads powered down (pstate register {:#x})\n",
+            start_stamp,
             p
         ),
         Some(p) => dev_err!(
             dev,
-            "M3 G15G verdict: job-timed-out-powered: the job did not finish within 2 s with the GPU powered (pstate register {:#x}); see the engine snapshot below\n",
-            p
+            "M3 G15G verdict: job-timed-out-powered: the job did not retire with the GPU powered (pstate register {:#x}, GPU start timestamp {:x?}); see the engine snapshot below\n",
+            p,
+            start_stamp
         ),
         None => dev_err!(
             dev,
-            "M3 G15G verdict: job-timed-out: the job did not finish within 2 s (pstate register unreadable)\n"
+            "M3 G15G verdict: job-timed-out: the job did not retire (pstate register and GPU start timestamp both unreadable)\n"
         ),
     }
 }
@@ -416,23 +550,26 @@ pub(crate) fn job_failed_verdict(dev: &device::Device, primary: Error, pstate: O
 /// `span` is its first start and last end GPU timestamp (24 MHz ticks), if readable.
 pub(crate) fn job_completed_verdict(dev: &device::Device, kind: usize, gpu_ns: u64, span: Option<[u64; 2]>) {
     let what = if kind == 0 { "render" } else { "compute" };
-    let [start, end] = span.unwrap_or([0, 0]);
-    if start != 0 && end != 0 {
-        dev_info!(
+    match span {
+        Some([start, end]) if start != 0 && end != 0 => dev_info!(
             dev,
             "M3 G15G verdict: job-completed: the first {} job finished, GPU timestamps {:#x}..{:#x}, {} ns of GPU time\n",
             what,
             start,
             end,
             gpu_ns
-        );
-    } else {
-        dev_err!(
+        ),
+        Some([start, end]) => dev_err!(
             dev,
             "M3 G15G verdict: job-retired-without-timestamps: the first {} job retired, but its GPU timestamps are {:#x}..{:#x}\n",
             what,
             start,
             end
-        );
+        ),
+        None => dev_err!(
+            dev,
+            "M3 G15G verdict: job-retired-without-timestamps: the first {} job retired, but its GPU timestamps are unreadable\n",
+            what
+        ),
     }
 }
