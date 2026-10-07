@@ -2648,43 +2648,70 @@ m3_pro_mesa_status() {
   return 0
 }
 
+# --uninstall, when mesa-m3 stays (or was not there to remove): the users a run of this script
+# added to group render stay in it; one line says so.
+m3_pro_mesa_render_kept() {
+  local u users=()
+  m3_pro_mesa_record_ok || return 0
+  while IFS= read -r u; do
+    if [[ $u =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] && m3_pro_mesa_in_group "$u" "$M3_PRO_MESA_RENDER_GROUP"; then users+=("$u"); fi
+  done < <(m3_pro_mesa_record_list render_added_user)
+  ((${#users[@]})) || return 0
+  say "Keeping ${users[*]} in the $M3_PRO_MESA_RENDER_GROUP group: this run did not remove $M3_PRO_MESA_NAME, and while it
+    is installed its GPU render node is for that group (take them out with: sudo gpasswd -d <user> $M3_PRO_MESA_RENDER_GROUP)"
+}
+
 # --uninstall, on an M3 Pro (or a Mac with a record): removes mesa-m3 by its exact name when the
 # record says this script installed the version that is installed and no mesa-m3 was there
 # before this script first ran. The owner's own (installed by them, there before, or changed
 # since) stays, and so does one this script has no readable record of. This script created no
 # other file for it.
 m3_pro_mesa_remove() {
-  local rec=$STATE/$M3_PRO_MESA_RECORD_NAME have pre
+  local rec=$STATE/$M3_PRO_MESA_RECORD_NAME
   is_m3_pro || [[ -f $rec ]] || return 0
-  m3_pro_mesa_render_remove
+  # The render group only goes with the package: while mesa-m3 stays, its udev rule keeps the
+  # GPU's render node for that group, and a user taken out of it would lose the GPU.
+  if m3_pro_mesa_remove_package; then
+    m3_pro_mesa_render_remove
+  else
+    m3_pro_mesa_render_kept
+  fi
+}
+
+# Removes mesa-m3 when this script installed it (see m3_pro_mesa_remove); 0 only when this run's
+# pacman -Rn removed it.
+m3_pro_mesa_remove_package() {
+  local rec=$STATE/$M3_PRO_MESA_RECORD_NAME have pre
   have=$(m3_pro_mesa_installed)
-  [[ -n $have ]] || return 0
+  [[ -n $have ]] || return 1
   if [[ -f $rec ]] && ! m3_pro_mesa_record_ok; then
     warn "keeping $M3_PRO_MESA_NAME $have: $rec is not a record this script reads (its first line is not schema=$M3_PRO_MESA_SCHEMA)"
-    return 0
+    return 1
   fi
   if [[ $(m3_pro_mesa_record_get result) == record-error ]]; then
     say "Keeping $M3_PRO_MESA_NAME $have: the last install could not write its record (result=record-error), so this script can't tell it installed it"
-    return 0
+    return 1
   fi
   if [[ $(m3_pro_mesa_record_get installed_by) != installer || $(m3_pro_mesa_record_get installed_version) != "$have" ]]; then
     say "Keeping $M3_PRO_MESA_NAME $have: this script did not install it"
-    return 0
+    return 1
   fi
   pre=$(m3_pro_mesa_record_get preexisting)
   if [[ $pre != none ]]; then
     say "Keeping $M3_PRO_MESA_NAME $have: a $M3_PRO_MESA_NAME (${pre:-of unknown version}) was installed before this script first ran"
-    return 0
+    return 1
   fi
   if $sudo pacman -Rn --noconfirm "$M3_PRO_MESA_NAME"; then
     say "Removed the M3 Pro's Mesa ($M3_PRO_MESA_NAME $have)"
-  else
-    warn "could not remove $M3_PRO_MESA_NAME; remove it with: sudo pacman -R $M3_PRO_MESA_NAME"
+    return 0
   fi
+  warn "could not remove $M3_PRO_MESA_NAME; remove it with: sudo pacman -R $M3_PRO_MESA_NAME"
+  return 1
 }
 
-# --uninstall: takes a user out of group render only when the record (readable, and not an error
-# record) names them as added by a run of this script and they are still in it. Never otherwise.
+# --uninstall, after this run's pacman -Rn removed mesa-m3: takes a user out of group render only
+# when the record (readable, and not an error record) names them as added by a run of this script
+# and they are still in it. Never otherwise.
 m3_pro_mesa_render_remove() {
   local u g=$M3_PRO_MESA_RENDER_GROUP users=()
   m3_pro_mesa_record_ok || return 0

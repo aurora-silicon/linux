@@ -1140,6 +1140,38 @@ class ProMesaTest(flow.M3FlowBase):
                 if case == "error record":
                     self.assertIn("Keeping " + me + " in the render group", proc.stdout)
 
+    def test_render_stays_while_mesa_m3_stays(self):
+        # The package's udev rule keeps the render node for group render as long as mesa-m3 is
+        # installed: --uninstall takes nobody out of render unless its own pacman -Rn removed it.
+        me = self.me()
+        for case in ("the owner replaced it", "installed before this script", "error record",
+                     "pacman -Rn fails", "removed by hand before"):
+            with self.subTest(case):
+                reset_mac(self, "j516s")
+                if case == "installed before this script":
+                    self.owner_has("26.0.0-1")
+                self.install()
+                self.assertIn(f"{me} render", self.groups())
+                body = "uninstall_all"
+                if case == "the owner replaced it":
+                    self.owner_has("26.1.4.mine-1")
+                elif case == "error record":
+                    self.extra_env["SUDO_USER"] = "own\rer"
+                    self.install(env="M3_PRO_MESA=0", check=False)
+                    self.extra_env.pop("SUDO_USER")
+                elif case == "pacman -Rn fails":
+                    body = 'pacman() { [[ $1 == -Rn ]] && return 1; command pacman "$@"; }\nuninstall_all'
+                elif case == "removed by hand before":
+                    (self.fake / "installed").write_text(
+                        "".join(l + "\n" for l in self.installed() if l != "mesa-m3"))
+                since = len(self.log())
+                proc = self.run_sh(body)
+                self.assertNotIn("gpasswd", self.log()[since:])
+                self.assertIn(f"{me} render", self.groups())
+                self.assertEqual("mesa-m3" in self.installed(), case != "removed by hand before")
+                self.assertIn(f"Keeping {me} in the render group: this run did not remove mesa-m3",
+                              " ".join(proc.stdout.split()))
+
     def test_a_root_run_adds_no_one(self):
         self.mac("j516s")
         proc = self.install(env="m3_pro_mesa_user() { echo root; }")
