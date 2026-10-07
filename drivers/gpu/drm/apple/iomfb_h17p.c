@@ -352,6 +352,25 @@ fail:
 	return false;
 }
 
+static bool trampoline_luma_span_h17p(struct apple_dcp *dcp, int tag,
+				      void *out, void *in)
+{
+	/* Preserve the older profile's already-cleared unknown-callback reply. */
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
+		return true;
+
+	trace_iomfb_callback(dcp, tag, __func__);
+	if (get_unaligned_le32(in)) {
+		dev_err(dcp->dev, "unqualified D574 range selector\n");
+		WRITE_ONCE(dcp->crashed, true);
+		return false;
+	}
+
+	/* Selector zero receives binary32 219.0 followed by a zero word. */
+	put_unaligned_le64(0x435b0000, out);
+	return true;
+}
+
 static bool trampoline_get_uint_prop_h17p(struct apple_dcp *dcp, int tag,
 					  void *out, void *in)
 {
@@ -476,6 +495,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[565] = trampoline_true,
 	[567] = trampoline_true,
 	[572] = trampoline_zero, /* powerUpDART */
+	[574] = trampoline_luma_span_h17p,
 	[575] = trampoline_hotplug_h17p,
 	[576] = trampoline_nop,
 	[582] = iomfbep_cb_create_dfb_surface, /* create_default_fb_surface */
