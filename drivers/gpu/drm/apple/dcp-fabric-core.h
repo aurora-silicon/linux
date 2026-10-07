@@ -59,6 +59,8 @@ struct dcp_fabric_port {
 
 struct dcp_fabric_policy {
 	bool dual_stream;
+	/* routes follow the CRTC a modeset pairs them with */
+	bool follow;
 };
 
 enum dcp_fabric_wiring {
