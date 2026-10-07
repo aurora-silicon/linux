@@ -157,8 +157,8 @@ set -euo pipefail
 
 # The kernel package version and the release tag move independently: a release
 # that only changes m1n1 reuses the previous kernel packages unchanged.
-VERSION=7.1.12.aurora2-12.0
-TAG=sep-7.1.12.aurora2-12.0
+VERSION=7.1.12.aurora2-12.1
+TAG=sep-7.1.12.aurora2-12.1
 # Packages are fetched from this script's own tag, never from "latest": the
 # checksums below belong to this release and nothing else.
 PUBLIC_RELEASE_URL=https://github.com/iconidentify/aurora-linux/releases/download/$TAG
