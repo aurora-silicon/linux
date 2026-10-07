@@ -15,6 +15,10 @@ use kernel::{new_condvar, sync::CondVar};
 const RESTORE_BACKOFF_MIN_NS: u64 = 1_000_000_000;
 const RESTORE_BACKOFF_MAX_NS: u64 = 30_000_000_000;
 const RESTORE_BACKOFF_FACTOR: u64 = 16;
+/// A VM whose last job, binding or other residency user ended (or which was
+/// created) more recently than this is in use: a submitting or loading client
+/// would restore whatever reclaim released, synchronously in its next job.
+const RECLAIM_QUIET_NS: u64 = 500_000_000;
 
 fn now_ns() -> u64 {
     <kernel::time::Monotonic as kernel::time::ClockSource>::ktime_get() as u64
@@ -29,10 +33,17 @@ struct State {
     /// Monotonic time the last restoration finished and its duration.
     restored_at: u64,
     restore_cost: u64,
+    /// Monotonic time the last residency user (job, binding, retirement)
+    /// released its lease; the gate's creation time before the first one.
+    last_active: u64,
 }
 
 impl State {
-    fn in_restore_backoff(&self, now: u64) -> bool {
+    /// Reclaim skips a VM that is in use, was recently used or recently restored.
+    fn reclaim_deferred(&self, now: u64) -> bool {
+        if now.saturating_sub(self.last_active) < RECLAIM_QUIET_NS {
+            return true;
+        }
         if self.restored_at == 0 {
             return false;
         }
@@ -65,7 +76,10 @@ impl Gate {
     pub(crate) fn new() -> Result<Arc<Self>> {
         Arc::pin_init(
             pin_init!(Self {
-                state <- new_mutex!(State::default(), "Asahi residency"),
+                state <- new_mutex!(
+                    State { last_active: now_ns(), ..State::default() },
+                    "Asahi residency"
+                ),
                 ready <- new_condvar!("Asahi residency ready"),
             }),
             GFP_KERNEL,
@@ -154,7 +168,7 @@ impl Gate {
     /// The busy gate continues to exclude restoration and metadata changes.
     pub(crate) fn try_reclaim(gate: &Arc<Self>) -> Option<Reclaim> {
         let mut state = gate.state.try_lock()?;
-        if state.users != 0 || state.busy || state.closed || state.in_restore_backoff(now_ns()) {
+        if state.users != 0 || state.busy || state.closed || state.reclaim_deferred(now_ns()) {
             return None;
         }
         state.busy = true;
@@ -177,7 +191,7 @@ impl Gate {
             state.users == 0
                 && !state.busy
                 && !state.closed
-                && !state.in_restore_backoff(now_ns())
+                && !state.reclaim_deferred(now_ns())
         })
     }
 
@@ -210,6 +224,7 @@ impl Drop for Lease {
         let mut state = self.gate.state.lock();
         debug_assert!(state.users != 0);
         state.users -= 1;
+        state.last_active = now_ns();
         if state.users == 0 {
             drop(state);
             self.gate.ready.notify_all();
