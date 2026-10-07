@@ -16,6 +16,20 @@ static_assert(sizeof(struct dcp_surface_h17p) == 0x22c);
 static_assert(sizeof(struct dcp_swap_submit_req_h17p) == 0xe9c);
 static_assert(sizeof(struct dcp_swap_submit_resp_h17p) == 0x0c);
 
+/* The H17P swap boundary is independent of the template's native layout. */
+struct dcp_present_h17p {
+	u8 swap[0x588];
+	struct dcp_surface_h17p surf[SWAP_SURFACES];
+	u8 tail[0x64];
+} __packed;
+
+static_assert(sizeof(struct dcp_present_h17p) == 0xe9c);
+static_assert(offsetof(struct dcp_present_h17p, surf) == 0x588);
+static_assert(offsetof(struct dcp_present_h17p, tail) == 0xe38);
+
+void iomfb_serialize_present_h17p(struct dcp_present_h17p *wire,
+				  const struct dcp_swap_submit_req_h17p *request);
+
 #undef DCP_FW_VER
 #undef DCP_FW
 

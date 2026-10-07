@@ -61,9 +61,26 @@ IOMFB_THUNK_INOUT(get_color_remap_mode);
 IOMFB_THUNK_INOUT(last_client_close);
 IOMFB_THUNK_INOUT(abort_swaps_dcp);
 
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
+			    struct dcp_swap_submit_req_h17p *request,
+			    dcp_callback_t cb, void *cookie)
+{
+	const void *data = request;
+
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		iomfb_serialize_present_h17p(&dcp->present_h17p, request);
+		data = &dcp->present_h17p;
+	}
+
+	dcp_push(dcp, oob, &dcp_methods[dcpep_swap_submit], sizeof(*request),
+		 sizeof(struct dcp_swap_submit_resp_h17p), (void *)data, cb, cookie);
+}
+#else
 DCP_THUNK_INOUT(dcp_swap_submit, dcpep_swap_submit,
 		struct DCP_FW_NAME(dcp_swap_submit_req),
 		struct DCP_FW_NAME(dcp_swap_submit_resp));
+#endif
 
 DCP_THUNK_INOUT(dcp_swap_start, dcpep_swap_start, struct DCP_FW_NAME(dcp_swap_start_req),
 		struct DCP_FW_NAME(dcp_swap_start_resp));
@@ -1160,9 +1177,10 @@ static void release_swap_cookie(struct kref *ref)
  * format two bytes late and its surface check rejects the swap as an
  * unsupported format.
  *
- * Shift each surface's tail down by two rather than fork the shared struct.
+ * H17G retains this public packing path. The measured H17P profile uses
+ * a separate wire record with the SPEC's 0x588 swap boundary.
  */
-static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp)
+static void dcp_h17p_prepare_swap(struct apple_dcp *dcp)
 {
 	struct DCP_FW_NAME(dcp_swap_submit_req) *req = &DCP_FW_UNION(dcp->swap);
 	unsigned int i;
@@ -1181,6 +1199,10 @@ static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp)
 	 */
 	req->swap.h17p_pre_swap_id[0x00] = 2;
 	req->swap.h17p_pre_swap_id[0x28] = 3;
+
+	/* The measured H17P layout is serialized without shifting its surfaces. */
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		return;
 
 	for (i = 0; i < SWAP_SURFACES; i++) {
 		u8 *p = (u8 *)&req->surf[i];
@@ -1211,7 +1233,7 @@ static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp)
 	}
 }
 #else
-static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp) { }
+static void dcp_h17p_prepare_swap(struct apple_dcp *dcp) { }
 #endif
 
 static void dcp_swap_cleared(struct apple_dcp *dcp, void *data, void *cookie)
@@ -1254,7 +1276,7 @@ static void dcp_swap_clear_started(struct apple_dcp *dcp, void *data,
 	if (info)
 		info->swap_id = resp->swap_id;
 
-	dcp_h17p_fix_swap_surfaces(dcp);
+	dcp_h17p_prepare_swap(dcp);
 	dcp_swap_submit(dcp, false, &DCP_FW_UNION(dcp->swap), dcp_swap_cleared, cookie);
 }
 
@@ -1740,7 +1762,7 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 	dcp_arm_retained_framebuffers(dcp, resp->swap_id);
 
 	trace_iomfb_swap_submit(dcp, resp->swap_id);
-	dcp_h17p_fix_swap_surfaces(dcp);
+	dcp_h17p_prepare_swap(dcp);
 	dcp_swap_submit(dcp, false, &DCP_FW_UNION(dcp->swap), dcp_swapped, NULL);
 }
 

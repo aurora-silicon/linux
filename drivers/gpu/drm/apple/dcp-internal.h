@@ -228,6 +228,8 @@ struct apple_dcp {
 		struct dcp_swap_submit_req_v13_3 v13_3;
 		struct dcp_swap_submit_req_h17p h17p;
 	} swap;
+	/* Staging wire record; serialization never mutates the atomic inputs. */
+	struct dcp_present_h17p present_h17p;
 
 	/* swap id of the last completed swap */
 	u32 last_swap_id;

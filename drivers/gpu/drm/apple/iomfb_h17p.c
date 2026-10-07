@@ -88,6 +88,24 @@ static_assert(sizeof(struct dcp_h17p_swap_info_request) == 0xe4);
 static_assert(sizeof(struct dc_swap_complete_resp_h17p) == 0x730);
 static_assert(offsetof(struct dc_swap_complete_resp_h17p, swap_id) == 0);
 
+void iomfb_serialize_present_h17p(struct dcp_present_h17p *wire,
+				  const struct dcp_swap_submit_req_h17p *request)
+{
+	size_t tail_offset = offsetof(struct dcp_swap_submit_req_h17p, surf_iova);
+	size_t tail_size = sizeof(*request) - tail_offset;
+
+	static_assert(sizeof(request->swap) == sizeof(wire->swap) + 2);
+	static_assert(sizeof(request->surf) == sizeof(wire->surf));
+	static_assert(sizeof(*request) -
+		      offsetof(struct dcp_swap_submit_req_h17p, surf_iova) ==
+		      sizeof(wire->tail) - 2);
+
+	memcpy(wire->swap, &request->swap, sizeof(wire->swap));
+	memcpy(wire->surf, request->surf, sizeof(wire->surf));
+	memcpy(wire->tail, (const u8 *)request + tail_offset, tail_size);
+	memset(wire->tail + tail_size, 0, sizeof(wire->tail) - tail_size);
+}
+
 static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A000", dcpep_late_init_signal),
 	IOMFB_METHOD_H17("A025", "A029", dcpep_setup_video_limits), /* (0,0) */
