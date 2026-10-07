@@ -179,6 +179,8 @@ static void iomfb_discard_pending(struct apple_dcp *dcp)
 	list_for_each_entry_safe(transaction, next, &dcp->iomfb.pending, link) {
 		list_del(&transaction->link);
 		dcp->iomfb.queued--;
+		if (transaction->brightness_only)
+			dcp->iomfb.backlight_queued = false;
 		transaction->release(transaction);
 	}
 }
@@ -199,6 +201,11 @@ static void iomfb_queue_advance(struct apple_dcp *dcp)
 	if (transaction) {
 		dcp->iomfb.active = NULL;
 		cancel_delayed_work(&dcp->iomfb.timeout);
+		if (transaction->brightness_only)
+			dcp->iomfb.backlight_queued = false;
+		/* A new level requested during a successful present stays pending. */
+		if (transaction->completed && dcp_backlight_pending(dcp))
+			schedule_work(&dcp->bl_update_wq);
 		transaction->release(transaction);
 	}
 	if (!list_empty(&dcp->iomfb.pending))
@@ -280,9 +287,13 @@ int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction)
 	mutex_lock(&dcp->iomfb.lock);
 	if (READ_ONCE(dcp->crashed) || dcp->iomfb.stopped) {
 		ret = -EIO;
+	} else if (transaction->brightness_only && dcp->iomfb.backlight_queued) {
+		ret = -EALREADY;
 	} else if (dcp->iomfb.queued >= 32) {
 		ret = -EBUSY;
 	} else {
+		if (transaction->brightness_only)
+			dcp->iomfb.backlight_queued = true;
 		dcp->iomfb.queued++;
 		list_add_tail(&transaction->link, &dcp->iomfb.pending);
 		schedule_work(&dcp->iomfb.work);
@@ -949,6 +960,115 @@ void iomfb_scanout_complete_h17p(struct apple_dcp *dcp)
 	dcp->iomfb.scanout = scanout;
 	dcp->iomfb.next_scanout = NULL;
 	iomfb_scanout_release_h17p(previous);
+}
+
+bool iomfb_present_brightness_only_h17p(struct apple_dcp *dcp)
+{
+	return dcp->iomfb.active && dcp->iomfb.active->brightness_only;
+}
+
+bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
+				const struct dcp_swap_submit_req_h17p *request,
+				struct dcp_present_h17p *wire)
+{
+	struct iomfb_transaction *transaction = dcp->iomfb.active;
+	struct dcp_backlight_present present;
+	bool have_surface = false;
+	unsigned int i;
+	int ret;
+
+	lockdep_assert_held(&dcp->iomfb.lock);
+	if (!dcp_backlight_active(dcp))
+		return true;
+	if (!transaction)
+		return false;
+	for (i = 0; i < SWAP_SURFACES; i++)
+		have_surface |= !request->surf_null[i];
+	ret = dcp_backlight_prepare(dcp, have_surface, &present);
+	if (ret && ret != -EALREADY)
+		return false;
+	if (!ret) {
+		transaction->backlight = present;
+		transaction->backlight_reserved = true;
+	}
+	iomfb_encode_backlight_h17p(wire, present.nits);
+	return true;
+}
+
+void iomfb_present_failed_h17p(struct apple_dcp *dcp)
+{
+	struct iomfb_transaction *transaction = dcp->iomfb.active;
+
+	if (transaction && transaction->backlight_reserved) {
+		dcp_backlight_complete(dcp, transaction->backlight.sequence, false);
+		transaction->backlight_reserved = false;
+	}
+}
+
+bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
+{
+	struct iomfb_transaction *transaction = dcp->iomfb.active;
+
+	lockdep_assert_held(&dcp->iomfb.lock);
+	if (transaction) {
+		transaction->completed = true;
+		if (transaction->backlight_reserved) {
+			dcp_backlight_complete(dcp, transaction->backlight.sequence, true);
+			transaction->backlight_reserved = false;
+		}
+		if (transaction->brightness_only)
+			return false;
+	}
+	iomfb_scanout_complete_h17p(dcp);
+	return true;
+}
+
+static void iomfb_backlight_start(struct apple_dcp *dcp,
+				  struct iomfb_transaction *transaction)
+{
+	struct iomfb_scanout_h17p *scanout = dcp->iomfb.scanout;
+	bool have_surface = false;
+	unsigned int i;
+
+	if (!dcp_backlight_pending(dcp) || !dcp->valid_mode || !scanout ||
+	    !dcp->connector || !dcp->connector->connected)
+		return;
+	for (i = 0; i < SWAP_SURFACES; i++)
+		have_surface |= !!scanout->fb[i];
+	if (!have_surface)
+		return;
+
+	dcp->swap.h17p = scanout->request;
+	iomfb_present_backlight_h17p(dcp);
+}
+
+static void iomfb_backlight_release(struct iomfb_transaction *transaction)
+{
+	kfree(transaction);
+}
+
+static void iomfb_backlight_kick(struct apple_dcp *dcp)
+{
+	struct iomfb_transaction *transaction;
+
+	transaction = kzalloc_obj(*transaction);
+	if (!transaction)
+		return;
+	transaction->start = iomfb_backlight_start;
+	transaction->release = iomfb_backlight_release;
+	transaction->brightness_only = true;
+	if (iomfb_queue(dcp, transaction))
+		kfree(transaction);
+}
+
+int iomfb_configure_backlight_h17p(struct apple_dcp *dcp, u32 maximum,
+				   bool inherited_valid, u32 inherited,
+				   bool default_valid, u32 default_nits)
+{
+	if (!iomfb_uses_queue(dcp))
+		return -EINVAL;
+	return dcp_backlight_configure(dcp, maximum, inherited_valid, inherited,
+				       default_valid, default_nits, iomfb_backlight_kick);
 }
 
 struct iomfb_atomic_transaction {

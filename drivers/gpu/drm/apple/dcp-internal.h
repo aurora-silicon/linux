@@ -41,6 +41,10 @@ struct iomfb_transaction {
 	struct list_head link;
 	void (*start)(struct apple_dcp *dcp, struct iomfb_transaction *transaction);
 	void (*release)(struct iomfb_transaction *transaction);
+	struct dcp_backlight_present backlight;
+	bool backlight_reserved;
+	bool brightness_only;
+	bool completed;
 };
 struct apple_dcp_typec_port;
 
@@ -379,12 +383,23 @@ struct apple_dcp {
 		unsigned long deadline;
 		unsigned int queued;
 		bool stopped;
+		bool backlight_queued;
 		struct iomfb_scanout_h17p *scanout;
 		struct iomfb_scanout_h17p *next_scanout;
 	} iomfb;
 };
 
 void iomfb_scanout_complete_h17p(struct apple_dcp *dcp);
+void iomfb_present_backlight_h17p(struct apple_dcp *dcp);
+bool iomfb_present_brightness_only_h17p(struct apple_dcp *dcp);
+bool iomfb_present_complete_h17p(struct apple_dcp *dcp);
+void iomfb_present_failed_h17p(struct apple_dcp *dcp);
+bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
+				const struct dcp_swap_submit_req_h17p *request,
+				struct dcp_present_h17p *wire);
+int iomfb_configure_backlight_h17p(struct apple_dcp *dcp, u32 maximum,
+				   bool inherited_valid, u32 inherited,
+				   bool default_valid, u32 default_nits);
 void iomfb_queue_init(struct apple_dcp *dcp);
 void iomfb_queue_stop(struct apple_dcp *dcp);
 int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction);

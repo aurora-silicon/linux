@@ -70,6 +70,11 @@ static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
 		iomfb_serialize_present_h17p(&dcp->present_h17p, request);
+		if (!iomfb_apply_backlight_h17p(dcp, request, &dcp->present_h17p)) {
+			if (cb)
+				cb(dcp, NULL, cookie);
+			return;
+		}
 		data = &dcp->present_h17p;
 	}
 
@@ -241,6 +246,7 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 				   struct DCP_FW_NAME(dc_swap_complete_resp) *resp)
 {
 	ktime_t now = ktime_get();
+	bool retire = true;
 
 #if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
@@ -250,13 +256,14 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 		return;
 	}
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
-		iomfb_scanout_complete_h17p(dcp);
+		retire = iomfb_present_complete_h17p(dcp);
 #endif
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
 	dcp->last_swap_id = resp->swap_id;
-	dcp_release_retained_framebuffers(dcp, resp->swap_id);
-
-	dcp_drm_crtc_page_flip(dcp, now);
+	if (retire) {
+		dcp_release_retained_framebuffers(dcp, resp->swap_id);
+		dcp_drm_crtc_page_flip(dcp, now);
+	}
 	if (dcp->crc_enabled) {
 		u32 crc32 = 0;
 		drm_crtc_add_crc_entry(&dcp->crtc->base, true, resp->swap_id, &crc32);
@@ -1247,6 +1254,23 @@ static void dcp_h17p_prepare_swap(struct apple_dcp *dcp)
 static void dcp_h17p_prepare_swap(struct apple_dcp *dcp) { }
 #endif
 
+static bool dcp_present_retires(struct apple_dcp *dcp)
+{
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		return !iomfb_present_brightness_only_h17p(dcp);
+#endif
+	return true;
+}
+
+static void dcp_present_failed(struct apple_dcp *dcp)
+{
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		iomfb_present_failed_h17p(dcp);
+#endif
+}
+
 static bool dcp_present_begin(struct apple_dcp *dcp, u32 swap_id)
 {
 #if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
@@ -1273,6 +1297,43 @@ static bool dcp_present_submit(struct apple_dcp *dcp, u32 swap_id, bool accepted
 	return true;
 }
 
+static void dcp_prepare_clear_swap(struct apple_dcp *dcp, void *request)
+{
+	typeof(DCP_FW_UNION(dcp->swap)) *swap = request;
+
+	/* Clear surfaces. */
+	memset(swap, 0, sizeof(*swap));
+
+	swap->swap.swap_enabled =
+		swap->swap.swap_completed = IOMFB_SET_BACKGROUND | 0x7;
+	swap->swap.bg_color = 0xFF000000;
+
+	/*
+	 * Turn off the backlight. This matters because the DCP's idea of
+	 * backlight brightness gets desynced after a power change, and it
+	 * needs to be told it's going to turn off so it will consider the
+	 * subsequent update on poweron an actual change and restore the
+	 * brightness.
+	 */
+	if (dcp_has_panel(dcp)) {
+		swap->swap.bl_unk = 1;
+		swap->swap.bl_value = 0;
+		swap->swap.bl_power = 0;
+	}
+
+	/* Null all surfaces */
+	for (int l = 0; l < SWAP_SURFACES; l++)
+		swap->surf_null[l] = true;
+#if DCP_FW_VERSION(13, 2, 0) <= DCP_FW_VER
+#if DCP_FW_VERSION(26, 0, 0) > DCP_FW_VER
+	for (int l = 0; l < 5; l++)
+		swap->surf2_null[l] = true;
+#endif
+	swap->unknown_pointer_null = true;
+	swap->unknown_output_null = true;
+#endif
+}
+
 static void dcp_swap_cleared(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	struct DCP_FW_NAME(dcp_swap_submit_resp) *resp = data;
@@ -1285,8 +1346,11 @@ static void dcp_swap_cleared(struct apple_dcp *dcp, void *data, void *cookie)
 
 	if (status) {
 		dev_err(dcp->dev, "swap_clear failed! status %u\n", status);
-		dcp_unarm_retained_framebuffers(dcp, swap_id);
-		dcp_drm_crtc_vblank(dcp->crtc);
+		dcp_present_failed(dcp);
+		if (dcp_present_retires(dcp)) {
+			dcp_unarm_retained_framebuffers(dcp, swap_id);
+			dcp_drm_crtc_vblank(dcp->crtc);
+		}
 	}
 	if (info) {
 		WRITE_ONCE(info->status, status);
@@ -1319,8 +1383,13 @@ static void dcp_swap_clear_started(struct apple_dcp *dcp, void *data,
 		dcp_drm_crtc_vblank(dcp->crtc);
 		return;
 	}
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		dcp_prepare_clear_swap(dcp, &DCP_FW_UNION(dcp->swap));
+#endif
 	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
-	dcp_arm_retained_framebuffers(dcp, resp->swap_id);
+	if (dcp_present_retires(dcp))
+		dcp_arm_retained_framebuffers(dcp, resp->swap_id);
 
 	if (info)
 		info->swap_id = resp->swap_id;
@@ -1471,7 +1540,7 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	struct dcp_swap_cookie *cookie;
 	struct dcp_wait_cookie *poff_cookie;
 	struct DCP_FW_NAME(dcp_swap_start_req) swap_req = { 0 };
-	struct DCP_FW_NAME(dcp_swap_submit_req) *swap = &DCP_FW_UNION(dcp->swap);
+	typeof(DCP_FW_UNION(dcp->swap)) *swap = &DCP_FW_UNION(dcp->swap);
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie)
@@ -1482,36 +1551,11 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	/* increase refcount to ensure the receiver has a reference */
 	kref_get(&cookie->refcount);
 
-	// clear surfaces
-	memset(swap, 0, sizeof(*swap));
-
-	swap->swap.swap_enabled =
-		swap->swap.swap_completed = IOMFB_SET_BACKGROUND | 0x7;
-	swap->swap.bg_color = 0xFF000000;
-
-	/*
-	 * Turn off the backlight. This matters because the DCP's idea of
-	 * backlight brightness gets desynced after a power change, and it
-	 * needs to be told it's going to turn off so it will consider the
-	 * subsequent update on poweron an actual change and restore the
-	 * brightness.
-	 */
-	if (dcp_has_panel(dcp)) {
-		swap->swap.bl_unk = 1;
-		swap->swap.bl_value = 0;
-		swap->swap.bl_power = 0;
-	}
-
-	/* Null all surfaces */
-	for (int l = 0; l < SWAP_SURFACES; l++)
-		swap->surf_null[l] = true;
-#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-#if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
-	for (int l = 0; l < 5; l++)
-		swap->surf2_null[l] = true;
-#endif
-	swap->unkU32Ptr_null = true;
-	swap->unkU32out_null = true;
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
+		dcp_prepare_clear_swap(dcp, swap);
+#else
+	dcp_prepare_clear_swap(dcp, swap);
 #endif
 
 	dcp_swap_start(dcp, false, &swap_req, dcp_swap_clear_started, cookie);
@@ -1798,8 +1842,11 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 
 	if (status) {
 		dev_err(dcp->dev, "swap failed! status %u\n", status);
-		dcp_unarm_retained_framebuffers(dcp, swap_id);
-		dcp_drm_crtc_vblank(dcp->crtc);
+		dcp_present_failed(dcp);
+		if (dcp_present_retires(dcp)) {
+			dcp_unarm_retained_framebuffers(dcp, swap_id);
+			dcp_drm_crtc_vblank(dcp->crtc);
+		}
 		return;
 	}
 	dcp->swap_start = ktime_get();
@@ -1812,15 +1859,18 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 
 	if (!resp || resp->ret) {
 		dev_err(dcp->dev, "swap_start was rejected\n");
-		dcp_drm_crtc_vblank(dcp->crtc);
+		if (dcp_present_retires(dcp))
+			dcp_drm_crtc_vblank(dcp->crtc);
 		return;
 	}
 	if (!dcp_present_begin(dcp, resp->swap_id)) {
-		dcp_drm_crtc_vblank(dcp->crtc);
+		if (dcp_present_retires(dcp))
+			dcp_drm_crtc_vblank(dcp->crtc);
 		return;
 	}
 	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
-	dcp_arm_retained_framebuffers(dcp, resp->swap_id);
+	if (dcp_present_retires(dcp))
+		dcp_arm_retained_framebuffers(dcp, resp->swap_id);
 
 	trace_iomfb_swap_submit(dcp, resp->swap_id);
 	dcp_h17p_prepare_swap(dcp);
@@ -1843,6 +1893,13 @@ static void do_swap(struct apple_dcp *dcp, void *data, void *cookie)
  * H17P expects A428 between set_matrix and swap_start, with 0x10000 (1.0 in
  * 16.16 fixed point), the same identity value the D006 reply carries.
  */
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+void iomfb_present_backlight_h17p(struct apple_dcp *dcp)
+{
+	do_swap(dcp, NULL, NULL);
+}
+#endif
+
 static void dcp_pre_swap_a428(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	u32 identity = 0x10000;
@@ -2029,8 +2086,8 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	for (l = 0; l < 5; l++)
 		req->surf2_null[l] = true;
 #endif
-	req->unkU32Ptr_null = true;
-	req->unkU32out_null = true;
+	req->unknown_pointer_null = true;
+	req->unknown_output_null = true;
 #endif
 
 	/*

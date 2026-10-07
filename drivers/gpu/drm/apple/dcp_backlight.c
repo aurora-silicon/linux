@@ -174,6 +174,9 @@ int dcp_backlight_prepare(struct apple_dcp *dcp, bool have_surface,
 
 	spin_lock_irqsave(&dcp->backlight.lock, flags);
 	ret = dcp_bl_prepare(&dcp->backlight.state, have_surface, present);
+	/* No reservation: carry the last completed level on an ordinary present. */
+	if (ret == -EALREADY)
+		present->nits = dcp->backlight.state.actual;
 	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
 	return ret;
 }

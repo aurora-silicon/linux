@@ -119,8 +119,8 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 #endif
 	u8 unkoutbool_null;
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-	u8 unkU32Ptr_null;
-	u8 unkU32out_null;
+	u8 unknown_pointer_null;
+	u8 unknown_output_null;
 #endif
 #if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
 	u8 padding[1];
