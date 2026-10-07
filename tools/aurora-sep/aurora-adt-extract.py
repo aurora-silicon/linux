@@ -13,8 +13,9 @@ property anywhere in the ADT. Numbers are printed in hex. The last line sums up 
 
 It never writes: every device and file is opened O_RDONLY. Before it reads a device it checks
 that the device is the read-only node of the MTD device named adt, and that this MTD device is
-the running device tree's reserved-memory region labelled adt, with the same size. The output is
-built in memory and printed only when everything succeeded.
+the running device tree's reserved-memory region labelled adt, with the same size. It reads at
+most MAX_ADT_BYTES, from a device or a file. The output is built in memory and printed only when
+everything succeeded.
 
 Usage:
   aurora-adt-extract.py [PATH]          print the allowlist (as root, for a device)
@@ -98,7 +99,10 @@ MAX_PRINTED_VALUE = 64 * 1024
 
 MTD_CHAR_MAJOR = 90
 ADT_LABEL = "adt"
-MAX_FILE_BYTES = 16 * 1024 * 1024
+# The most this reads, from a device region or a file. m1n1 sizes the adt region as the ADT rounded
+# up to 16 KiB, and the ADT is well under 1 MiB (the M3 Pro's region is 0x7c000 bytes), so 16 MiB
+# leaves wide room while bounding the memory a bad device tree or file can make this use.
+MAX_ADT_BYTES = 16 * 1024 * 1024
 
 # --- The ADT format --------------------------------------------------------------------------
 # A node: u32 property count, u32 child count, the properties, then the children.
@@ -445,6 +449,9 @@ def find_region(host):
         size = (size << 32) | c
     if size == 0:
         raise Refused(f"the adt region {os.path.basename(node)} has size 0")
+    if size > MAX_ADT_BYTES:
+        raise Refused(f"the adt region {os.path.basename(node)} has {size} bytes, more than an ADT "
+                      f"({MAX_ADT_BYTES})")
     return Region(os.path.realpath(node), base, size)
 
 
@@ -524,6 +531,8 @@ def _read_exact(fd, size):
 
 
 def read_device(binding, host):
+    if not 0 < binding.region.size <= MAX_ADT_BYTES:
+        raise Refused(f"the adt region has {binding.region.size} bytes, more than an ADT ({MAX_ADT_BYTES})")
     fd = os.open(binding.dev, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
         st = host.fstat(fd)
@@ -540,8 +549,8 @@ def read_file(path):
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise Refused(f"{path} is not a regular file")
-        if st.st_size > MAX_FILE_BYTES:
-            raise Refused(f"{path} has {st.st_size} bytes, more than an ADT ({MAX_FILE_BYTES})")
+        if st.st_size > MAX_ADT_BYTES:
+            raise Refused(f"{path} has {st.st_size} bytes, more than an ADT ({MAX_ADT_BYTES})")
         return _read_exact(fd, st.st_size)
     finally:
         os.close(fd)

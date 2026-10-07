@@ -423,7 +423,9 @@ class FakeMac:
         self.dev.mkdir()
         self.add_mtd(0, "nvram", "nor", 0x100000, None)
         self.add_mtd(1, "adt", "ram", size, self.region)
-        self.blob = padded(build_m3max_adt(), size)
+        # The device holds the ADT and the region's padding (only the ADT for a region too large
+        # to read, which the reader must refuse before it opens the device).
+        self.blob = padded(build_m3max_adt(), min(size, 0x7c000))
         (self.dev / "mtd1ro").write_bytes(self.blob)
 
     def add_region(self, name, compatible, label, base, size):
@@ -573,6 +575,70 @@ class DeviceTest(unittest.TestCase):
         self.assertEqual(code, 1, err)
         self.assertIn("short read", err)
         self.assertEqual(out, "")
+
+
+class RegionSizeTest(unittest.TestCase):
+    """The device region is capped at MAX_ADT_BYTES before the device is opened."""
+
+    def opens(self, mac, argv):
+        seen = []
+        real_open = os.open
+
+        def tracking(path, flags, *a, **k):
+            seen.append(os.fspath(path))
+            return real_open(path, flags, *a, **k)
+
+        adt.os.open = tracking
+        try:
+            result = run(argv, mac.host())
+        finally:
+            adt.os.open = real_open
+        return result, [p for p in seen if p.startswith(str(mac.dev))]
+
+    def test_oversized_region_refused_before_open(self):
+        size = 17 * 1024 * 1024
+        self.assertGreater(size, adt.MAX_ADT_BYTES)
+        with tempfile.TemporaryDirectory() as tmp:
+            mac = FakeMac(tmp, size=size)
+            for argv in ([], [str(mac.dev / "mtd1ro")], ["--check"]):
+                with self.subTest(argv=argv):
+                    (code, out, err), opened = self.opens(mac, argv)
+                    self.assertEqual(code, 3, err)
+                    self.assertEqual(out, "")
+                    self.assertIn(f"the adt region flash@10003528000 has {size} bytes, more than an ADT "
+                                  f"({adt.MAX_ADT_BYTES})", err)
+                    self.assertEqual(opened, [])
+
+    def test_huge_region_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mac = FakeMac(tmp, size=0xFFFFFFFF00000000)
+            code, out, err = run([], mac.host())
+            self.assertEqual(code, 3, err)
+            self.assertIn("more than an ADT", err)
+
+    def test_cap_itself_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mac = FakeMac(tmp, size=adt.MAX_ADT_BYTES)
+            (code, out, err), opened = self.opens(mac, ["--check"])
+            self.assertEqual(code, 0, err)
+            self.assertIn(f"{adt.MAX_ADT_BYTES} bytes", out)
+            self.assertEqual(opened, [])
+
+    def test_read_device_checks_the_cap_too(self):
+        region = adt.Region("/nonexistent", 0, adt.MAX_ADT_BYTES + 1)
+        binding = adt.Binding("/nonexistent-device", 0, "mtd1", region)
+        with self.assertRaises(adt.Refused):
+            adt.read_device(binding, adt.Host())
+
+    def test_oversized_file_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "big.bin")
+            with open(path, "wb") as f:
+                f.truncate(adt.MAX_ADT_BYTES + 1)
+            code, out, err = run([str(path)])
+            self.assertEqual(code, 3, err)
+            self.assertEqual(out, "")
+            self.assertIn("more than an ADT", err)
 
 
 if __name__ == "__main__":
