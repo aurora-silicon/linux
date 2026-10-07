@@ -256,6 +256,11 @@ pub(crate) trait Backend: Send + Sync {
 
 struct Job<B: Backend> {
     backend: Arc<B>,
+    packet: Arc<Packet>,
+}
+
+struct Timeout<B: Backend> {
+    backend: Arc<B>,
     victim_renewals: u8,
     packet: Arc<Packet>,
 }
@@ -272,10 +277,19 @@ impl<B: Backend> Drop for Job<B> {
 }
 
 impl<B: Backend> sched::JobImpl for Job<B> {
+    type TimeoutData = Timeout<B>;
     const MODULE: Option<&'static kernel::ThisModule> = Some(&crate::THIS_MODULE);
 
-    fn false_timeout(job: &mut sched::Job<Self>) -> bool {
-        if job.is_finished() || job.packet.completion.take_replay_timeout() {
+    fn timeout_data(&self) -> Timeout<B> {
+        Timeout {
+            backend: self.backend.clone(),
+            victim_renewals: 0,
+            packet: self.packet.clone(),
+        }
+    }
+
+    fn false_timeout(job: &mut Timeout<B>, finished: bool) -> bool {
+        if finished || job.packet.completion.take_replay_timeout() {
             return true;
         }
         let deferred = job.backend.defer_timeout(&job.packet, job.victim_renewals);
@@ -285,22 +299,22 @@ impl<B: Backend> sched::JobImpl for Job<B> {
         deferred
     }
 
-    fn prepare(job: &mut sched::Job<Self>) -> Option<Fence> {
+    fn prepare(job: &mut Self) -> Option<Fence> {
         job.backend.prepare(&job.packet)
     }
-    fn run(job: &mut sched::Job<Self>) -> Result<Option<Fence>> {
+    fn run(job: &mut Self) -> Result<Option<Fence>> {
         job.backend.publish(job.packet.clone()).map(Some)
     }
-    fn timed_out(job: &mut sched::Job<Self>) -> sched::Status {
+    fn timed_out(job: &mut Timeout<B>, finished: bool) -> sched::Status {
         // The scheduler retains the detached job throughout this callback. Keep
         // its parent callback intact while the driver settles the exact owner;
         // reinsertion also handles completion racing with timeout observation.
-        if !job.is_finished() {
+        if !finished {
             job.backend.timed_out(job.packet.clone());
         }
         sched::Status::NoHang
     }
-    fn cancel(job: &mut sched::Job<Self>) {
+    fn cancel(job: &mut Self) {
         job.backend.cancel(job.packet.clone());
     }
 }
@@ -355,7 +369,6 @@ impl<B: Backend> Scheduler<B> {
             1,
             Job {
                 backend: self.backend.clone(),
-                victim_renewals: 0,
                 packet: packet.clone(),
             },
         )?;
