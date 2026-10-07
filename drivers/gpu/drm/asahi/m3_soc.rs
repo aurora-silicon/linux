@@ -155,6 +155,9 @@ pub(crate) struct Soc {
     /// the GPU clock against the requested performance state and, while this is 1, caps the
     /// state on a shortfall (`asahi.m3_ut_engagement` overrides it).
     pub(crate) ut_engagement: u32,
+    /// The highest GPU power target, in mW, while the boot loader's power model is a stand-in:
+    /// the operating points' powers are scaled down together so that the highest is this.
+    pub(crate) power_target_cap_mw: Option<u32>,
 }
 
 impl Soc {
@@ -298,6 +301,7 @@ pub(crate) static T6030: Soc = Soc {
     hwdata_object: None,
     registers: RegisterSet::G15S,
     ut_engagement: 1,
+    power_target_cap_mw: None,
 };
 
 /// T8122 (M3, G15G): one die, one cluster of ten core slots (eight or ten of them active).
@@ -389,6 +393,10 @@ pub(crate) static T8122: Soc = Soc {
     // state, so with the cap engaged the GPU stays at state 2 (462 MHz effective) under any load.
     // With 0 it reaches the requested states (state 8: about 1000 MHz effective).
     ut_engagement: 0,
+    // The boot loader's T8122 power model is a stand-in that overstates the power (its highest
+    // operating point is about 30 W). Until each Mac's fused leakage gives a real one, scale it
+    // to a 22 W target, about the GPU power budget of an M3 MacBook Air.
+    power_target_cap_mw: Some(22_000),
 };
 
 /// The T8122 HwData object's firmware VA: 0x8a80 bytes before the end of the fixed allocation's

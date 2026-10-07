@@ -675,9 +675,26 @@ fn build_images(
         Some(e) => e.hwdata_b(),
         None => soc.hwdata_b.ok_or(ENODEV)?,
     };
-    let pwr = hw::PwrConfig::load(dev, cfg).inspect_err(|e| {
+    let mut pwr = hw::PwrConfig::load(dev, cfg).inspect_err(|e| {
         dev_err!(dev, "M3: cannot read the GPU power configuration from the device tree ({:?})\n", e)
     })?;
+    // A SoC whose power model is still a stand-in caps the power target: every operating point's
+    // power is scaled by the same factor, so the relative powers stay the boot loader's.
+    if let Some(cap) = soc.power_target_cap_mw {
+        let max = pwr.max_power_mw;
+        if max > cap {
+            for ps in pwr.perf_states.iter_mut() {
+                ps.pwr_mw = (u64::from(ps.pwr_mw) * u64::from(cap) / u64::from(max)) as u32;
+            }
+            pwr.max_power_mw = pwr.perf_states.iter().map(|ps| ps.pwr_mw).max().unwrap_or(cap);
+            dev_info!(
+                dev,
+                "M3: GPU power target capped at {} mW (the device tree's operating points reach {} mW)\n",
+                pwr.max_power_mw,
+                max
+            );
+        }
+    }
     let node = dev.of_node().ok_or(ENODEV)?;
     let dyncfg = hw::DynConfig {
         uat_ttb_base: firmware.resources.regions[0].base,
