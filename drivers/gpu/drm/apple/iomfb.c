@@ -560,6 +560,7 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	int tag;
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 	u8 depth;
+	bool handled;
 
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
 	    (length < sizeof(*hdr) || !ch || ch->depth >= DCP_MAX_CALL_DEPTH ||
@@ -570,9 +571,13 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	}
 
 	tag = dcp_parse_tag(hdr->tag);
+	handled = tag >= 0 && tag < IOMFB_MAX_CB && dcp->cb_handlers &&
+		  dcp->cb_handlers[tag];
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
-	    ((u64)sizeof(*hdr) + hdr->in_len + hdr->out_len != length ||
+	    (tag < 0 || tag >= IOMFB_MAX_CB ||
+	     (u64)sizeof(*hdr) + hdr->in_len + hdr->out_len != length ||
 	     (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+	      handled &&
 	      !iomfb_validate_callback_h17p(tag, hdr->in_len, hdr->out_len)))) {
 		dev_err(dev, "unqualified IOMFB callback %d (%u, %u)\n",
 			tag, hdr->in_len, hdr->out_len);
@@ -583,15 +588,11 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	in = data + sizeof(*hdr);
 	out = in + hdr->in_len;
 
-	if (tag < 0 || tag >= IOMFB_MAX_CB || !dcp->cb_handlers ||
-	    !dcp->cb_handlers[tag]) {
-		dev_warn(dev, "received unknown callback %c%c%c%c\n",
-			 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0]);
-		if (iomfb_uses_queue(dcp)) {
-			/* A measured size does not establish a safe reply payload. */
-			WRITE_ONCE(dcp->crashed, true);
-			return;
-		}
+	if (!handled) {
+		if (!iomfb_uses_queue(dcp) ||
+		    !test_and_set_bit(tag, dcp->unknown_callbacks))
+			dev_warn(dev, "received unknown callback %c%c%c%c\n",
+				 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0]);
 		/*
 		 * Leaving a callback unanswered wedges the coprocessor: it
 		 * waits for the ack forever and the outer call never returns.
