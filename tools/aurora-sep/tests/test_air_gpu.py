@@ -1496,7 +1496,7 @@ class GpuExperimentFlagTest(Base):
         self.assertNotIn("is the normal one", prompt)
 
     def test_air_gets_the_scripts_and_nothing_is_armed(self):
-        self.mac("j613")
+        self.mac("j615")  # a kernel-only Air (the J613 gets the display handoff by default)
         before = self.boot.read_bytes()
         proc = self.sh("M3_TRY=0\ninstall_all")
         for name, _ in SCRIPTS:
@@ -1593,7 +1593,7 @@ class GpuExperimentFlagTest(Base):
         return [l for l in self.log().splitlines() if l.startswith("pacman -U ")]
 
     def test_the_mesa_package(self):
-        self.mac("j613")
+        self.mac("j615")  # a kernel-only Air (the J613 gets the display handoff by default)
         name, entry = self.mesa()
         proc = self.sh(entry + "M3_TRY=0\ninstall_all")
         self.assertIn(name, self.downloaded())
@@ -1621,7 +1621,7 @@ class GpuExperimentFlagTest(Base):
         self.assertEqual((self.state / "m3-mode").read_text().split()[0], "handoff")
 
     def test_a_mesa_failure_leaves_the_kernel_install(self):
-        self.mac("j613")
+        self.mac("j615")  # a kernel-only Air (the J613 gets the display handoff by default)
         name, entry = self.mesa()
         before = self.boot.read_bytes()
         self.extra_env["FAKE_FAIL_U_FOR"] = "mesa-*"
@@ -1658,7 +1658,7 @@ class GpuExperimentFlagTest(Base):
                          ({"FAKE_SPIRV_TOOLS": ""}, "spirv-tools not installed (needs 1:1.4.357.0 or newer)")]:
             with self.subTest(env=env):
                 self.fresh_state()
-                self.mac("j613")
+                self.mac("j615")  # a kernel-only Air
                 before = self.boot.read_bytes()
                 self.extra_env = dict(env)
                 proc = self.sh(entry + "M3_TRY=0\ninstall_all")
@@ -1714,7 +1714,9 @@ class GpuExperimentFlagTest(Base):
                 f.write("mesa-m3\n")
             (self.fake / "versions").write_text("mesa-m3 26.0.0.owner-1\n")
 
-        for board in ("j613", "j615"):
+        # A plain run: the J615, a kernel-only Air as on 12.2 (the J613 gets m1n1's display
+        # handoff by default from this release on).
+        for board in ("j615",):
             for setup in (None, owner):
                 with self.subTest(board=board, owner=bool(setup)):
                     before = pro.run_with(self, old, board, run, setup)

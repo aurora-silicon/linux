@@ -770,7 +770,8 @@ class Upgrade120Test(flow.M3FlowBase):
         self.assertNotIn("chosen.asahi,t8122-gpu-power-standin=1", self.chosen())
 
     def test_air_kernel_only_on_12_0(self):
-        self.mac("j613")
+        # The J615 stays kernel-only; a J613 moves to the display handoff (test_m3_air_default).
+        self.mac("j615")
         self.install_120()
         image_120 = self.boot.read_bytes()
         self.install()

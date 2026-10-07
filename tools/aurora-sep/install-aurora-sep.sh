@@ -450,9 +450,13 @@ is_m3_air() {
 #            three M3_SWITCHES lines; update-m1n1 copies chosen.* lines from
 #            /etc/m1n1.conf into every rebuild, so they survive updates.
 #            An M3 MacBook Air takes the same path with the same m1n1 and its
-#            own switches (m3_switches): the display handoff with GPU
-#            diagnostics, and only with --m3-handoff until its board is in
-#            M3_HANDOFF_BOARDS.
+#            own switches (m3_switches). A J613, which is in M3_HANDOFF_BOARDS,
+#            gets the display handoff and the GPU firmware description
+#            (M3_AIR_SWITCHES) by default; with --m3-handoff, and on the J615
+#            only with it, an Air gets the display handoff with GPU
+#            diagnostics (M3_AIR_DRY_RUN_SWITCHES). An owner can switch any
+#            Air switch off for good with a chosen.<name>=0 line of their own
+#            in /etc/m1n1.conf (m3_air_switch_off).
 # M1 and M2 get the same M1N1_PACKAGE with no switches; the Neo keeps its own
 # m1n1 unless NEO_AURORA_M1N1 is 1.
 UPDATE_M1N1_CONF=/etc/default/update-m1n1
@@ -462,8 +466,10 @@ M3_FROZEN_BY=""
 M3_BOOTBIN_SHA=""
 # Models the handoff has been booted on, by us or by a tester's report. Only
 # an M3 Pro (t6030) or an M3 MacBook Air (M3_AIR_BOARDS) listed here gets it
-# by default; no Air is listed yet.
-M3_HANDOFF_BOARDS="j516s"
+# by default. The J613 is listed: aurora8.3 and later published m1n1's display
+# handoff on a J613 (11.111-test), with Linux on the boot framebuffer, and an
+# Air listed here gets M3_AIR_SWITCHES by default. The J615 is not listed.
+M3_HANDOFF_BOARDS="j516s j613"
 M3_SWITCHES="chosen.asahi,t6030-gpu=1 chosen.asahi,t6030-dcp=1 chosen.asahi,t6030-dcpext=1"
 # The M3 Pro handoff's name in $STATE/m3-mode. A plain run keeps the handoff on
 # an M3 Pro that is not in M3_HANDOFF_BOARDS only while this matches, so it
@@ -506,6 +512,19 @@ M3_AIR_DISPLAY_HANDOFF=1
 M3_AIR_DISPLAY_VARIANT="air-display-handoff-12"
 M3_AIR_DRY_RUN=1
 M3_AIR_DRY_RUN_SWITCHES="chosen.asahi,t8122-gpu-diag=1 chosen.asahi,t8122-gpu-handoff-diag=1 chosen.asahi,t8122-gpu-power-diag=1 chosen.asahi,t8122-dcp=1"
+# The default for an Air in M3_HANDOFF_BOARDS (m3_air_default): m1n1's display
+# handoff (chosen.asahi,t8122-dcp=1) and the GPU firmware description
+# (chosen.asahi,t8122-gpu-handoff-diag=1: the GPU's firmware and page-table
+# memory reserved and described for Linux, the GPU and its mailbox left
+# disabled). Both ran on a J613 in 11.110-test and 11.111-test. The GPU
+# diagnostics (chosen.asahi,t8122-gpu-diag=1, chosen.asahi,t8122-gpu-power-diag=1,
+# which powers the GPU for a short identity read) stay opt-in: --m3-handoff
+# gives an Air M3_AIR_DRY_RUN_SWITCHES instead, and an Air that has those from
+# an earlier --m3-handoff keeps them. No variant writes the GPU start,
+# chosen.asahi,t8122-gpu=1.
+M3_AIR_SWITCHES="chosen.asahi,t8122-dcp=1 chosen.asahi,t8122-gpu-handoff-diag=1"
+# Its name in $STATE/m3-mode: aurora12.1's m1n1 with M3_AIR_SWITCHES.
+M3_AIR_DEFAULT_VARIANT="air-handoff-12"
 # --m3-gpu-experiment (M3 MacBook Air only) installs the GPU start experiment's tools with the
 # kernel: three scripts in M3_GPU_BIN, from this release (M3_GPU_SCRIPTS, checked like the
 # packages), and the G15G Mesa prefix package once there is one. It arms nothing and changes
@@ -631,6 +650,13 @@ M3_MODE=none
 # Set by --m3-handoff: the owner asks for the handoff on an M3 Pro or M3
 # MacBook Air model that isn't in M3_HANDOFF_BOARDS yet.
 M3_TRY=0
+# Whether the owner gave --m3-handoff on this run (m3_plan copies M3_TRY before
+# it keeps an earlier install's handoff). On an Air it asks for the GPU
+# diagnostics too.
+M3_ASKED=0
+# 1 or 0 once m3_plan has decided whether this Air gets M3_AIR_SWITCHES
+# (m3_air_default); empty before that.
+M3_AIR_DEFAULT=""
 # 1 when this run keeps the boot.bin this Mac has because an m1n1 from this
 # script failed on it before ($STATE/m1n1-failed): set by m3_plan and
 # m1n1_keep_plan.
@@ -727,11 +753,41 @@ is_m3_handoff_board() {
   { is_m3_pro || is_m3_air; } && [[ -n $board && " $M3_HANDOFF_BOARDS " == *" $board "* ]]
 }
 
-# The switch lines this Mac's handoff needs, separated by spaces: the T6030
-# ones, or the M3 Air's.
-m3_switches() {
-  if ! is_m3_air; then
-    echo "$M3_SWITCHES"
+# Whether this Air gets the default profile, M3_AIR_SWITCHES: a board in
+# M3_HANDOFF_BOARDS, with the display handoff build (M3_AIR_DISPLAY_HANDOFF=1),
+# whose owner did not ask for the GPU diagnostics, with --m3-handoff on this run
+# or on an earlier install that is still recorded with that variant. m3_plan
+# decides it (M3_AIR_DEFAULT) before the install records this run's variant.
+m3_air_default() {
+  if [[ -n $M3_AIR_DEFAULT ]]; then
+    [[ $M3_AIR_DEFAULT == 1 ]]
+    return
+  fi
+  [[ $M3_AIR_DISPLAY_HANDOFF == 1 ]] && is_m3_air && is_m3_handoff_board && ((M3_ASKED == 0)) || return 1
+  [[ $(m3_recorded_mode) != handoff || $(m3_recorded_variant) != "$M3_AIR_DISPLAY_VARIANT" ]]
+}
+
+# The Air's per-Mac off switch: a line "chosen.<name>=0" of the owner's in
+# /etc/m1n1.conf, outside this script's block, keeps switch $1 (chosen.<name>=1)
+# out of the block. m1n1 then reads only the owner's 0, and arms a switch only
+# when it reads 1. The line stays when this script rewrites its block.
+m3_air_switch_off() {
+  m1n1_conf_without_switches | grep -qxF "${1%%=*}=0"
+}
+
+# The Air switches this Mac's owner switched off, separated by spaces.
+m3_air_switches_off() {
+  local s off=()
+  for s in $(m3_air_switch_set); do
+    if m3_air_switch_off "$s"; then off+=("${s%%=*}"); fi
+  done
+  echo "${off[*]}"
+}
+
+# The Air's switches before its owner's off switches.
+m3_air_switch_set() {
+  if m3_air_default; then
+    echo "$M3_AIR_SWITCHES"
   elif [[ $M3_AIR_DRY_RUN == 1 ]]; then
     echo "$M3_AIR_DRY_RUN_SWITCHES"
   elif [[ $M3_AIR_DCP == 1 ]]; then
@@ -739,6 +795,34 @@ m3_switches() {
   else
     echo "$M3_AIR_GPU_SWITCH"
   fi
+}
+
+# How to switch an Air switch off on this Mac, and which ones are off. With
+# "quiet", only a list of the ones that are off, if there are any.
+m3_air_off_notice() {
+  local off
+  off=$(m3_air_switches_off)
+  if [[ -n $off ]]; then say "Switched off on this Mac in $M1N1_CONF: ${off// /, }"; fi
+  [[ ${1:-} == quiet ]] && return 0
+  say "To switch one of m1n1's M3 Air switches off on this Mac, add it with =0 on a line at the end
+    of $M1N1_CONF (chosen.asahi,t8122-dcp=0 for the display handoff,
+    chosen.asahi,t8122-gpu-handoff-diag=0 for the GPU firmware description), then run:
+      sudo update-m1n1
+    Later runs of this script keep it off. Delete the line to switch it back on."
+}
+
+# The switch lines this Mac's handoff needs, separated by spaces: the T6030
+# ones, or the M3 Air's without those its owner switched off.
+m3_switches() {
+  local s on=()
+  if ! is_m3_air; then
+    echo "$M3_SWITCHES"
+    return 0
+  fi
+  for s in $(m3_air_switch_set); do
+    if ! m3_air_switch_off "$s"; then on+=("$s"); fi
+  done
+  echo "${on[*]}"
 }
 
 # Whether this run puts M1N1_PACKAGE on this Mac: M1 and M2, an M3 on the
@@ -765,6 +849,8 @@ m1n1_version() {
 m3_handoff_name() {
   if ! is_m3_air; then
     echo "M3 Pro display and GPU handoff"
+  elif m3_air_default; then
+    echo "M3 Air display handoff"
   elif [[ $M3_AIR_DISPLAY_HANDOFF == 1 ]]; then
     echo "M3 Air display handoff with GPU diagnostics"
   elif [[ $M3_AIR_DRY_RUN == 1 ]]; then
@@ -1042,6 +1128,7 @@ m3_recorded_mode() {
 # into a GPU start) without a new --m3-handoff.
 m3_variant() {
   if ! is_m3_air; then echo "$M3_PRO_VARIANT"
+  elif m3_air_default; then echo "$M3_AIR_DEFAULT_VARIANT"
   elif [[ $M3_AIR_DISPLAY_HANDOFF == 1 ]]; then echo "$M3_AIR_DISPLAY_VARIANT"
   elif [[ $M3_AIR_DRY_RUN == 1 ]]; then echo air-dry-run
   elif [[ $M3_AIR_DCP == 1 ]]; then echo air-gpu-dcp
@@ -1070,6 +1157,8 @@ m3_kept_refusal() {
 m3_plan() {
   local board problem failed variant again="run this again" air=0 kept=0
   M3_MODE=none
+  M3_ASKED=$M3_TRY M3_AIR_DEFAULT=""
+  if m3_air_default; then M3_AIR_DEFAULT=1; else M3_AIR_DEFAULT=0; fi
   if ! is_m3; then
     ((M3_TRY == 0)) || die "--m3-handoff is for an M3 Pro or an M3 MacBook Air, and this Mac isn't an M3. Nothing was installed."
     return 0
@@ -1107,7 +1196,9 @@ m3_plan() {
     loader from this script failed on this Mac, please report it at $ISSUE_URL"
       return 0
     fi
-    if ((air)) && [[ $(m3_recorded_variant) != "$(m3_variant)" ]]; then
+    # An Air that gets the default profile (m3_air_default) moves with the
+    # release, as a listed M3 Pro does.
+    if ((air)) && ! m3_air_default && [[ $(m3_recorded_variant) != "$(m3_variant)" ]]; then
       die "M3 MacBook Air ($board): this Mac has an earlier test build's boot loader
     ($(m3_recorded_variant)), and this release's Air boot loader is a different one: the
     $(m3_handoff_name) ($(m3_variant)). Run this again with --m3-handoff to switch to it.
@@ -1130,9 +1221,9 @@ m3_plan() {
   fi
   M3_MODE=kernel
   if ((air)); then
-    # Never by default: a plain run gives an Air the handoff only once its
-    # board is in M3_HANDOFF_BOARDS.
-    if ! is_m3_handoff_board && ((M3_TRY == 0)); then
+    # A plain run gives an Air only the default profile (m3_air_default: a board
+    # in M3_HANDOFF_BOARDS, M3_AIR_SWITCHES); everything else needs --m3-handoff.
+    if ! m3_air_default && ((M3_TRY == 0)); then
       say "M3 MacBook Air ($board): installing the kernel only, and boot.bin stays as it is. m1n1's
     $(m3_handoff_name) for the Air is being tested and is not on by default. To help test it
     (it replaces this Mac's boot loader), see case D in the M3 section of: bash -s -- --agent-prompt"
@@ -1187,7 +1278,7 @@ m3_plan() {
     say "M3 ($board): this Mac has m1n1's display and GPU handoff from an earlier install; keeping it"
   fi
   if ((air)); then
-    if is_m3_handoff_board; then
+    if m3_air_default; then
       say "M3 MacBook Air ($board, macOS $M3_STUB_VERSION stub): installing m1n1 with the $(m3_handoff_name)"
     elif ((kept)); then
       # Its owner asked with --m3-handoff when it was installed.
@@ -3478,7 +3569,14 @@ install_all() {
   m3_pro_mesa_record
   pacman -Q linux-aurora libfprint aurora-touchid
   echo
-  if [[ $M3_MODE == handoff ]] && is_m3_air && [[ $M3_AIR_DISPLAY_HANDOFF == 1 ]]; then
+  if [[ $M3_MODE == handoff ]] && m3_air_default; then
+    say "Done. Reboot: expect the Omarchy logo, the boot menu, then the same desktop on the boot
+    framebuffer. m1n1 now hands the built-in display over and describes the GPU firmware for
+    Linux; the kernel keeps the boot framebuffer until it can drive the display, and nothing
+    starts the GPU. Touch ID is not supported on M3 yet."
+    m3_air_off_notice
+  elif [[ $M3_MODE == handoff ]] && is_m3_air && [[ $M3_AIR_DISPLAY_HANDOFF == 1 ]]; then
+    m3_air_off_notice quiet
     say "Done. Reboot with the serial recorder running and someone watching: expect the Omarchy
     logo, the boot menu, then the same desktop on the boot framebuffer. Check the serial log
     for the T8122 handoff result and the \"PMP: T8122:\" lines.
@@ -5654,9 +5752,15 @@ fingerprint.
       aurora-m3-power-<board>-<date>.tgz.
 
    D. apple,j613 or apple,j615 + apple,t8122 (MacBook Air 13" or 15" M3):
-      KERNEL ONLY BY DEFAULT. THE BOOT LOADER TEST IS OPT-IN.
+      J613: THE PLAIN ONE-LINER INSTALLS m1n1's DISPLAY HANDOFF BY DEFAULT.
+      It says "installing m1n1 with the M3 Air display handoff", replaces
+      the boot loader (the restore steps are printed), and the desktop stays
+      on the boot framebuffer. Run the checks below after its first boot and
+      report them. The install's summary says how the owner switches a part
+      of it off on this Mac (a chosen.<name>=0 line in /etc/m1n1.conf).
+      J615: KERNEL ONLY BY DEFAULT. THE BOOT LOADER TEST IS OPT-IN.
       The plain one-liner installs the kernel only, as in case C, and says so:
-        M3 MacBook Air (j613): installing the kernel only ...
+        M3 MacBook Air (j615): installing the kernel only ...
       Run the checks below on that first and report it: it is the baseline
       every later Air test is compared with.
       Then, to try m1n1's display handoff with GPU diagnostics on this Air:

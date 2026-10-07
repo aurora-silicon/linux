@@ -101,13 +101,14 @@ class M3AirTest(flow.M3FlowBase):
         self.assertEqual(shell_value("M3_AIR_GPU_SWITCH"), "chosen.asahi,t8122-gpu=1")
         self.assertEqual(shell_value("M3_AIR_DCP_SWITCH"), "chosen.asahi,t8122-dcp=1")
 
-    def test_no_air_on_by_default(self):
-        # Every Air needs --m3-handoff until a tester's report adds its board.
-        # Listing one is a release decision: change this test with it.
+    def test_only_the_j613_on_by_default(self):
+        # An Air needs --m3-handoff until a tester's report adds its board. The J613 is listed
+        # (its display handoff was published in 11.111-test); the J615 is not. Listing one is a
+        # release decision: change this test with it. test_m3_air_default covers what it gets.
         listed = shell_value("M3_HANDOFF_BOARDS").split()
         airs = shell_value("M3_AIR_BOARDS").split()
         self.assertEqual(sorted(airs), ["j613", "j615"])
-        self.assertFalse(set(listed) & set(airs), listed)
+        self.assertEqual(set(listed) & set(airs), {"j613"}, listed)
 
 
 
@@ -119,7 +120,9 @@ class M3AirTest(flow.M3FlowBase):
             ("j615", "14.8.3", 0, None, None, "kernel"),
             ("j613", "14.8.3", 1, None, None, "handoff"),       # the owner asked
             ("j615", "14.8.3", 1, None, None, "handoff"),
-            ("j613", "14.8.3", 0, None, "j516s j613", "handoff"),   # listed later
+            # Listed, but a plain run gives an Air only the default profile, which needs the
+            # display handoff build (M3_AIR_DISPLAY_HANDOFF=1, test_m3_air_default).
+            ("j613", "14.8.3", 0, None, "j516s j613", "kernel"),
             ("j613", "15.6", 0, None, "j516s j613", "kernel"),      # listed, other stub
         ]:
             with self.subTest(board=board, stub=stub, try_=try_, pkg=pkg, boards=boards):
@@ -487,7 +490,8 @@ class M3AirDryRunTest(M3AirTest):
     # The display handoff (M3_AIR_DISPLAY_HANDOFF=1)
 
     def test_display_handoff_needs_fresh_opt_in_and_keeps_restore(self):
-        self.mac("j613")
+        # The J615: a J613 is listed and moves with the release (test_m3_air_default).
+        self.mac("j615")
         self.air_install(try_=1)
         before = self.boot.read_bytes()
         before_conf = self.m1n1_conf.read_bytes()
@@ -527,10 +531,11 @@ class M3AirDryRunTest(M3AirTest):
         self.assertEqual(self.plan(try_=1, display=1), "handoff")
 
     def test_test_build_display_handoff_does_not_move_silently(self):
-        # Scott's path: an Air on 11.111.1-test's display handoff (variant
-        # air-display-handoff, aurora8.4) runs this release's plain one-liner.
-        # It must stop before downloading anything; --m3-handoff moves it.
-        self.mac("j613")
+        # An Air on 11.111.1-test's display handoff (variant air-display-handoff,
+        # aurora8.4) runs this release's plain one-liner. On a J615 it must stop
+        # before downloading anything; --m3-handoff moves it. (A J613 is listed and
+        # moves to the default profile: test_m3_air_default.)
+        self.mac("j615")
         self.air_install(try_=1, display=1, variant="air-display-handoff")
         self.assertEqual((self.state / "m3-mode").read_text().strip(), "handoff air-display-handoff")
         before = self.boot.read_bytes()

@@ -1506,7 +1506,9 @@ class OtherMacsTest(flow.M3FlowBase):
     """Every Mac but the M3 Pro, with this script and with 12.2's: the same commands, in the same
     order, with the same results on disk."""
 
-    BOARDS = [b for b, compat in flow.BOARDS.items() if "apple,t6030" not in compat]
+    # Not the J613 either: from this release on it gets m1n1's display handoff by default
+    # (test_m3_air_default compares everything else with 12.3).
+    BOARDS = [b for b, compat in flow.BOARDS.items() if "apple,t6030" not in compat and b != "j613"]
 
     def setUp(self):
         super().setUp()
@@ -1559,7 +1561,7 @@ class OtherMacsTest(flow.M3FlowBase):
         # The option is taken on every Mac (one release, one set of options) and does nothing there.
         def run():
             return self.run_sh(SUDO_LOG + "M3_TRY=0\nM3_PRO_MESA=0\ninstall_all", check=False).returncode
-        for board, after in self.same(run, boards=["j314s", "j613", "j516c"]):
+        for board, after in self.same(run, boards=["j314s", "j615", "j516c"]):
             self.assertNotIn("--no-m3-mesa", after["log"])
 
 

@@ -462,7 +462,8 @@ class M3FlowTest(M3FlowBase):
         self.assert_kernel_only("j514s")
 
     def test_m3_is_kernel_only(self):
-        self.assert_kernel_only("j613")
+        # The J615; the J613 gets the display handoff by default (test_m3_air_default).
+        self.assert_kernel_only("j615")
 
     def test_listed_m3_pro_on_another_stub_is_kernel_only(self):
         self.assert_kernel_only("j516s", stub="15.6")
