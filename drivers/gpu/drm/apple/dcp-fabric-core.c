@@ -121,8 +121,15 @@ unsigned int dcp_fabric_score(const struct dcp_fabric_pipeline *pipeline,
 {
 	if (!pipeline->bound)
 		return UINT_MAX - 1;
+	/*
+	 * Without dual-stream docks a hybrid comes last, kept for an HDMI
+	 * display arriving later.  Not where routes follow their CRTC: a
+	 * compositor pairs a new display with the lowest free CRTC, and its
+	 * route would only follow it there.
+	 */
 	return pipeline->crtc_index +
-	       (!policy->dual_stream && pipeline->has_fixed ? 100 : 0);
+	       (!policy->dual_stream && !policy->follow && pipeline->has_fixed ?
+		100 : 0);
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_score);
 

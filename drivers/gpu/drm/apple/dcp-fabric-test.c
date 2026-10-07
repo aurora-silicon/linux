@@ -706,6 +706,29 @@ static void fabric_follow_test(struct kunit *test)
 			DCP_FABRIC_FOLLOW_SWAP);
 }
 
+static void fabric_follow_arrival_test(struct kunit *test)
+{
+	struct fabric_fixture f;
+
+	/* Where routes follow their CRTC, streams arrive on the lowest CRTC. */
+	fabric_init(&f, false);
+	KUNIT_EXPECT_PTR_EQ(test, dcp_fabric_free_route(&f.port[0], &f.policy),
+			    &f.route[0][1]);
+	f.policy.follow = true;
+	KUNIT_EXPECT_PTR_EQ(test, dcp_fabric_free_route(&f.port[0], &f.policy),
+			    &f.route[0][0]);
+	/* still not on a hybrid whose HDMI display is live */
+	f.pipeline[0].fixed_busy = true;
+	KUNIT_EXPECT_PTR_EQ(test, dcp_fabric_free_route(&f.port[0], &f.policy),
+			    &f.route[0][1]);
+	/* dual-stream ranking is unchanged */
+	fabric_init(&f, true);
+	f.policy.follow = true;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_score(&f.pipeline[0], &f.policy),
+			dcp_fabric_score(&f.pipeline[0], &(struct dcp_fabric_policy){
+				.dual_stream = true }));
+}
+
 static void fabric_follow_recent_fixed(struct kunit *test)
 {
 	struct fabric_fixture f;
@@ -1939,6 +1962,7 @@ static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE(fabric_deactivate_failure_test),
 	KUNIT_CASE(fabric_unbound_and_mask_test),
 	KUNIT_CASE(fabric_follow_test),
+	KUNIT_CASE(fabric_follow_arrival_test),
 	KUNIT_CASE(fabric_follow_recent_fixed),
 	KUNIT_CASE(fabric_follow_effect_swap),
 	KUNIT_CASE(fabric_follow_effect_oom),

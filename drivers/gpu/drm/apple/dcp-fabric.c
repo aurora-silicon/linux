@@ -177,6 +177,17 @@ bool dcp_typec_follows_crtc(struct apple_dcp *dcp)
 		dcp->fw_compat == DCP_FIRMWARE_V_13_5);
 }
 
+/* Do all pipelines that can drive @port let its routes follow their CRTC? */
+static bool dcp_typec_port_follows(struct apple_dcp_typec_port *port)
+{
+	struct apple_dcp_typec_route *route;
+
+	list_for_each_entry(route, &port->routes, port_link)
+		if (!dcp_typec_follows_crtc(route->dcp))
+			return false;
+	return !list_empty(&port->routes);
+}
+
 /* Is a routed port's possible_crtcs narrowed to the pipeline driving it? */
 static bool dcp_typec_narrows(struct apple_dcp *dcp)
 {
@@ -904,13 +915,16 @@ static void dcp_typec_port_attach(struct apple_dcp_typec_port *port)
  * free, as a compositor keeps a reconnected connector's CRTC, otherwise the
  * best-ranked free one.  Without dual-stream docks a free Type-C-only
  * pipeline comes first even when the port last had the hybrid, which an HDMI
- * display needs.
+ * display needs, unless the route would only follow its CRTC to the hybrid
+ * (see dcp_fabric_score()).
  */
 static struct apple_dcp_typec_route *
 dcp_typec_free_route(struct apple_dcp_typec_port *port)
 {
-	struct dcp_fabric_policy policy = { .dual_stream =
-						    dcp_typec_dual_stream() };
+	struct dcp_fabric_policy policy = {
+		.dual_stream = dcp_typec_dual_stream(),
+		.follow = dcp_typec_port_follows(port),
+	};
 
 	dcp_fabric_snapshot_port(port, false);
 	return dcp_fabric_real_route(dcp_fabric_free_route(&port->core,
@@ -1768,7 +1782,8 @@ static int dcp_tb_candidate(void *data)
 
 	{
 		struct dcp_fabric_policy policy = {
-			.dual_stream = dcp_typec_dual_stream()
+			.dual_stream = dcp_typec_dual_stream(),
+			.follow = dcp_typec_port_follows(port),
 		};
 		struct dcp_fabric_route *chosen;
 		bool connector_present = dpin ? !!port->secondary_connector : !!port->connector;
