@@ -744,21 +744,6 @@ fn build_images(
         HWDATA_A + offset_of!(raw::HwDataAG15V14_8_3, init_timestamp),
         &now.to_le_bytes(),
     )?;
-    // A SoC whose power configuration comes from the boot loader takes this machine's fast-die
-    // sensor mask from it too (the ADT's gpu-fast-die0-sensor-mask, required at admission), in
-    // both HwDataA copies, instead of the HwConfig's.
-    if soc.power_from_boot_loader {
-        let mask: u64 = node.get_property(c_str!("apple,fast-die0-sensor-mask")).inspect_err(|_| {
-            dev_err!(dev, "M3: cannot read apple,fast-die0-sensor-mask from the device tree\n")
-        })?;
-        for at in [
-            offset_of!(raw::HwDataAG15V14_8_3, fast_die0_sensor_mask),
-            offset_of!(raw::HwDataAG15V14_8_3, fast_die0_sensor_mask_2),
-        ] {
-            write(&mut hwdata, HWDATA_A + at, &mask.to_le_bytes())?;
-        }
-        dev_info!(dev, "M3: fast-die sensor mask {:#x}, from the boot loader\n", mask);
-    }
     // On T8122, log and require the two HwDataB words the firmware's power management depends
     // on: it powers the GPU cores up for a job only when +0xa38 and +0xa40 are both nonzero.
     if core::ptr::eq(soc, &crate::m3_soc::T8122) {
