@@ -38,6 +38,7 @@ use core::{
         DerefMut, //
     },
     ptr::NonNull,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 use gem::{
     BaseObject,
@@ -55,11 +56,18 @@ pub struct ObjectConfig<'a, T: DriverObject> {
     /// Whether to set the write-combine map flag.
     pub map_wc: bool,
 
+    /// Opt in to revocable CPU VMAs, with driver-controlled idle eviction.
+    pub reclaimable_cpu_mappings: bool,
+
     /// Reuse the DMA reservation from another GEM object.
     ///
     /// The newly created [`Object`] will hold an owned refcount to `parent_resv_obj` if specified.
     pub parent_resv_obj: Option<&'a Object<T>>,
 }
+
+const SGT_PERMANENT: usize = 1 << (usize::BITS - 1);
+const SGT_RECLAIMING: usize = 1 << (usize::BITS - 2);
+const SGT_USERS: usize = SGT_RECLAIMING - 1;
 
 /// A shmem-backed GEM object.
 ///
@@ -74,6 +82,8 @@ pub struct Object<T: DriverObject> {
     obj: Opaque<bindings::drm_gem_shmem_object>,
     /// Parent object that owns this object's DMA reservation object.
     parent_resv_obj: Option<ARef<Object<T>>>,
+    /// Owned SGT readers, or permanent borrowed access, exclude backing eviction.
+    sgt_access: AtomicUsize,
     #[pin]
     inner: T,
 }
@@ -130,6 +140,7 @@ impl<T: DriverObject> Object<T> {
             try_pin_init!(Self {
                 obj <- Opaque::init_zeroed(),
                 parent_resv_obj: config.parent_resv_obj.map(|p| p.into()),
+                sgt_access: AtomicUsize::new(0),
                 inner <- T::new(dev, size, args),
             }),
             GFP_KERNEL,
@@ -158,6 +169,7 @@ impl<T: DriverObject> Object<T> {
         // to have exclusive access - thus making this safe to hold a mutable reference to.
         let shmem = unsafe { &mut *obj.as_raw_shmem() };
         shmem.set_map_wc(config.map_wc);
+        shmem.reclaimable_cpu_mappings = config.reclaimable_cpu_mappings;
 
         Ok(obj)
     }
@@ -196,6 +208,33 @@ impl<T: DriverObject> Object<T> {
     /// This will pin the object in memory.
     #[inline]
     pub fn sg_table(&self) -> Result<&scatterlist::SGTable> {
+        // The borrowed reference can outlive any lock, so pin permanently.
+        self.acquire_sgt_access(true)?;
+        self.sg_table_resident()
+    }
+
+    fn acquire_sgt_access(&self, permanent: bool) -> Result {
+        let mut state = self.sgt_access.load(Ordering::Acquire);
+        loop {
+            if state & SGT_RECLAIMING != 0 {
+                return Err(EBUSY);
+            }
+            let next = if permanent {
+                state | SGT_PERMANENT
+            } else {
+                if state & SGT_USERS == SGT_USERS { return Err(EOVERFLOW); }
+                state + 1
+            };
+            match self.sgt_access.compare_exchange_weak(
+                state, next, Ordering::AcqRel, Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(current) => state = current,
+            }
+        }
+    }
+
+    fn sg_table_resident(&self) -> Result<&scatterlist::SGTable> {
         // SAFETY:
         // - drm_gem_shmem_get_pages_sgt is thread-safe.
         // - drm_gem_shmem_get_pages_sgt returns either a valid pointer to a scatterlist, or an
@@ -218,12 +257,44 @@ impl<T: DriverObject> Object<T> {
     ///
     /// [`shmem::SGTable`]: SGTable
     pub fn owned_sg_table(&self) -> Result<SGTable<T>> {
-        Ok(SGTable {
-            sgt: self.sg_table()?.into(),
-            // INVARIANT: We take an owned refcount to `self` here, ensuring that `sgt` remains
-            // valid for as long as this `SGTable`.
-            _owner: self.into(),
-        })
+        self.acquire_sgt_access(false)?;
+        let sgt = match self.sg_table_resident() {
+            Ok(sgt) => sgt.into(),
+            Err(error) => {
+                self.sgt_access.fetch_sub(1, Ordering::Release);
+                return Err(error);
+            }
+        };
+        Ok(SGTable { sgt, _owner: self.into() })
+    }
+
+    /// Whether the caller's sole SG lease is the last user of the backing.
+    ///
+    /// # Safety
+    /// The caller holds the object's DMA reservation lock.
+    pub unsafe fn sole_sg_lease_releasable_locked(&self) -> bool {
+        self.sgt_access.load(Ordering::Acquire) == 1 &&
+            // SAFETY: The caller establishes the reservation-lock contract.
+            unsafe { bindings::drm_gem_shmem_idle_pages_releasable_locked(self.as_raw_shmem()) }
+    }
+
+    /// Release idle backing without discarding contents. A later
+    /// `owned_sg_table()` may return different DMA addresses.
+    ///
+    /// # Safety
+    ///
+    /// The caller holds this object's DMA reservation lock, has removed and
+    /// invalidated every device mapping, and excludes new device access.
+    pub unsafe fn release_idle_pages_locked(&self) -> Result {
+        self.sgt_access.compare_exchange(
+            0, SGT_RECLAIMING, Ordering::AcqRel, Ordering::Acquire,
+        ).map_err(|_| EBUSY)?;
+        // SAFETY: The caller's contract plus the exclusive state above.
+        let result = to_result(unsafe {
+            bindings::drm_gem_shmem_release_idle_pages_locked(self.as_raw_shmem())
+        });
+        self.sgt_access.store(0, Ordering::Release);
+        result
     }
 
     /// Attempt to create a [`RawIoSysMap`] from the gem object.
@@ -438,7 +509,8 @@ unsafe impl<D: DriverObject, T: AsBytes + FromBytes> Sync for VMap<D, T> {}
 ///
 /// # Invariants
 ///
-/// - `sgt` is kept alive by `_owner`, ensuring it remains valid for as long as `Self`.
+/// - `_owner` retains both the GEM object and one counted SG-table lease; eviction
+///   cannot begin until every lease has been released.
 /// - `sgt` corresponds to the owned object in `_owner`.
 /// - This object is only exposed in situations where we know the underlying `SGTable` will not be
 ///   modified for the lifetime of this object. Thus, it is safe to send/access this type across
@@ -452,6 +524,12 @@ pub struct SGTable<T: DriverObject> {
 unsafe impl<T: DriverObject> Send for SGTable<T> {}
 // SAFETY: This object is thread-safe via our type invariants.
 unsafe impl<T: DriverObject> Sync for SGTable<T> {}
+
+impl<T: DriverObject> Drop for SGTable<T> {
+    fn drop(&mut self) {
+        self._owner.sgt_access.fetch_sub(1, Ordering::Release);
+    }
+}
 
 impl<T: DriverObject> Deref for SGTable<T> {
     type Target = scatterlist::SGTable;

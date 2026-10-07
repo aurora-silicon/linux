@@ -12,3 +12,9 @@ __rust_helper void rust_helper_dma_resv_unlock(struct dma_resv *obj)
 {
 	dma_resv_unlock(obj);
 }
+
+__rust_helper
+bool rust_helper_dma_resv_trylock(struct dma_resv *obj)
+{
+	return dma_resv_trylock(obj);
+}
