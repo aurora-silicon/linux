@@ -15,9 +15,9 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/mailbox.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/workqueue.h>
-#include "mailbox.h"
 
 #define APPLE_RTKIT_APP_ENDPOINT_START 0x20
 #define APPLE_RTKIT_MAX_ENDPOINTS 0x100
@@ -39,6 +39,7 @@ struct apple_rtkit {
 	unsigned int iop_power_state;
 	unsigned int ap_power_state;
 	bool crashed;
+	bool shutting_down;
 
 	DECLARE_BITMAP(endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 
@@ -50,6 +51,9 @@ struct apple_rtkit {
 	char *syslog_msg_buffer;
 	size_t syslog_n_entries;
 	size_t syslog_msg_size;
+	/* Session inherited from the bootloader: INIT geometry never observed. */
+	bool syslog_inherited;
+	bool crashlog_inherited;
 
 	struct workqueue_struct *wq;
 };

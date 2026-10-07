@@ -200,7 +200,7 @@ use crate::{
     time::Jiffies,
     types::Opaque,
 };
-use core::{marker::PhantomData, ptr::NonNull};
+use core::{marker::PhantomData, ops::Deref, ptr::NonNull};
 
 /// Creates a [`Work`] initialiser with the given name and a newly-created lock class.
 #[macro_export]
@@ -371,6 +371,108 @@ impl<T: FnOnce()> WorkItem for ClosureWork<T> {
         }
     }
 }
+
+/// A work queue owned by the caller.
+///
+/// Wraps a `struct workqueue_struct` allocated with `alloc_ordered_workqueue()`. It dereferences
+/// to a [`Queue`], so work items are enqueued on it exactly like on the system queues. Dropping it
+/// calls `destroy_workqueue()`, which waits for every pending work item to finish first.
+///
+/// An owned queue gives a driver two things the system queues do not: its work items run one at a
+/// time in queueing order, and the driver can wait for all of them at once (see [`drain`]) before
+/// it tears down the state they use.
+///
+/// # Invariants
+///
+/// The pointer is valid and points at a workqueue allocated by `alloc_ordered_workqueue()`.
+///
+/// # Examples
+///
+/// ```
+/// use kernel::sync::Arc;
+/// use kernel::workqueue::{self, impl_has_work, new_work, OwnedQueue, Work, WorkItem};
+///
+/// #[pin_data]
+/// struct MyStruct {
+///     value: i32,
+///     #[pin]
+///     work: Work<MyStruct>,
+/// }
+///
+/// impl_has_work! {
+///     impl HasWork<Self> for MyStruct { self.work }
+/// }
+///
+/// impl WorkItem for MyStruct {
+///     type Pointer = Arc<MyStruct>;
+///
+///     fn run(this: Arc<MyStruct>) {
+///         pr_info!("The value is: {}\n", this.value);
+///     }
+/// }
+///
+/// let queue = OwnedQueue::new_ordered(c"my_queue")?;
+/// let item = Arc::pin_init(pin_init!(MyStruct {
+///     value: 42,
+///     work <- new_work!("MyStruct::work"),
+/// }), GFP_KERNEL)?;
+/// let _ = queue.enqueue(item);
+/// // Dropping `queue` waits for the work item to finish.
+/// # Ok::<(), Error>(())
+/// ```
+///
+/// [`drain`]: OwnedQueue::drain
+pub struct OwnedQueue(NonNull<bindings::workqueue_struct>);
+
+impl OwnedQueue {
+    /// Allocates an ordered workqueue named `name`.
+    ///
+    /// The work items of an ordered workqueue are executed one at a time, in the order in which
+    /// they were queued, by an unbound worker. The name is copied by the kernel and appears in the
+    /// worker's thread name.
+    pub fn new_ordered(name: &CStr) -> Result<Self> {
+        // SAFETY: `name` is a valid NUL-terminated string; the C side copies it.
+        let ptr = unsafe { bindings::alloc_ordered_workqueue(name.as_char_ptr(), 0) };
+
+        // INVARIANT: `alloc_ordered_workqueue()` returns a valid workqueue or NULL.
+        Ok(Self(NonNull::new(ptr).ok_or(ENOMEM)?))
+    }
+
+    /// Waits until the workqueue is empty.
+    ///
+    /// Work items that are pending or running when this is called may still enqueue further work
+    /// on this queue and that work is waited for too, but anything else that enqueues on a
+    /// draining queue is refused (with a warning) and its work item is not run. Callers therefore
+    /// stop every other producer before draining. Must be called from a context that may sleep.
+    pub fn drain(&self) {
+        // SAFETY: The pointer is valid by the type invariant.
+        unsafe { bindings::drain_workqueue(self.0.as_ptr()) };
+    }
+}
+
+impl Deref for OwnedQueue {
+    type Target = Queue;
+
+    fn deref(&self) -> &Queue {
+        // SAFETY: The pointer is valid by the type invariant and stays valid for as long as `self`
+        // does, which bounds the returned reference.
+        unsafe { Queue::from_raw(self.0.as_ptr()) }
+    }
+}
+
+impl Drop for OwnedQueue {
+    fn drop(&mut self) {
+        // SAFETY: The pointer is valid by the type invariant. `destroy_workqueue()` drains the
+        // queue before freeing it, so no work item can run on a freed queue.
+        unsafe { bindings::destroy_workqueue(self.0.as_ptr()) };
+    }
+}
+
+// SAFETY: The workqueue API is thread-safe; an `OwnedQueue` only holds a pointer to the C object.
+unsafe impl Send for OwnedQueue {}
+
+// SAFETY: The workqueue API is thread-safe; an `OwnedQueue` only holds a pointer to the C object.
+unsafe impl Sync for OwnedQueue {}
 
 /// A raw work item.
 ///

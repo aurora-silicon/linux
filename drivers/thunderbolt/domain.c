@@ -319,12 +319,15 @@ const struct bus_type tb_bus_type = {
 static void tb_domain_release(struct device *dev)
 {
 	struct tb *tb = container_of(dev, struct tb, dev);
+	struct tb_nhi *nhi = tb->nhi;
 
 	tb_ctl_free(tb->ctl);
 	destroy_workqueue(tb->wq);
 	ida_free(&tb_domain_ida, tb->index);
 	mutex_destroy(&tb->lock);
 	kfree(tb);
+
+	complete(&nhi->domain_released);
 }
 
 const struct device_type tb_domain_type = {
@@ -402,7 +405,7 @@ struct tb *tb_domain_alloc(struct tb_nhi *nhi, int timeout_msec, size_t privsize
 	if (!tb->ctl)
 		goto err_destroy_wq;
 
-	tb->dev.parent = &nhi->pdev->dev;
+	tb->dev.parent = nhi->dev;
 	tb->dev.bus = &tb_bus_type;
 	tb->dev.type = &tb_domain_type;
 	tb->dev.groups = domain_attr_groups;
@@ -489,6 +492,7 @@ err_ctl_stop:
 
 	return ret;
 }
+EXPORT_SYMBOL_NS_GPL(tb_domain_add, "USB4");
 
 /**
  * tb_domain_remove() - Removes and releases a domain
@@ -513,6 +517,7 @@ void tb_domain_remove(struct tb *tb)
 
 	device_unregister(&tb->dev);
 }
+EXPORT_SYMBOL_NS_GPL(tb_domain_remove, "USB4");
 
 /**
  * tb_domain_suspend_noirq() - Suspend a domain
@@ -540,6 +545,7 @@ int tb_domain_suspend_noirq(struct tb *tb)
 
 	return ret;
 }
+EXPORT_SYMBOL_NS_GPL(tb_domain_suspend_noirq, "USB4");
 
 /**
  * tb_domain_resume_noirq() - Resume a domain
@@ -562,11 +568,13 @@ int tb_domain_resume_noirq(struct tb *tb)
 
 	return ret;
 }
+EXPORT_SYMBOL_NS_GPL(tb_domain_resume_noirq, "USB4");
 
 int tb_domain_suspend(struct tb *tb)
 {
 	return tb->cm_ops->suspend ? tb->cm_ops->suspend(tb) : 0;
 }
+EXPORT_SYMBOL_NS_GPL(tb_domain_suspend, "USB4");
 
 int tb_domain_freeze_noirq(struct tb *tb)
 {
@@ -581,6 +589,7 @@ int tb_domain_freeze_noirq(struct tb *tb)
 
 	return ret;
 }
+EXPORT_SYMBOL_NS_GPL(tb_domain_freeze_noirq, "USB4");
 
 int tb_domain_thaw_noirq(struct tb *tb)
 {
@@ -594,12 +603,14 @@ int tb_domain_thaw_noirq(struct tb *tb)
 
 	return ret;
 }
+EXPORT_SYMBOL_NS_GPL(tb_domain_thaw_noirq, "USB4");
 
 void tb_domain_complete(struct tb *tb)
 {
 	if (tb->cm_ops->complete)
 		tb->cm_ops->complete(tb);
 }
+EXPORT_SYMBOL_NS_GPL(tb_domain_complete, "USB4");
 
 int tb_domain_runtime_suspend(struct tb *tb)
 {

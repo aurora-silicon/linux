@@ -10,3 +10,4 @@ Contents:
 
    intel/ipw2100
    intel/ipw2200
+   mt7932-neo

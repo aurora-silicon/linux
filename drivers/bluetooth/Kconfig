@@ -23,6 +23,18 @@ config BT_MTK
 	tristate
 	select FW_LOADER
 
+config BT_MTK7932_PCIE
+	bool "J700 MT7932 PCIe Bluetooth experiment"
+	depends on BT=y && PCI && ARCH_APPLE && IOMMU_DMA
+	depends on !PM_SLEEP && !KEXEC_CORE
+	select FW_LOADER
+	help
+	  Build the standalone J700 MT7932 transport experiment. Its probe gate
+	  defaults closed so board firmware can remain on the real root filesystem.
+	  It retains all DMA memory after activation, including terminal failures,
+	  until a full external reset. Unbind and automatic recovery are excluded.
+	  This does not qualify suspend or physical removal.
+
 config BT_HCIBTUSB
 	tristate "HCI USB driver"
 	depends on USB

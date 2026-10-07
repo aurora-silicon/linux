@@ -14,7 +14,7 @@ description: |+
   Resolution Table which provides a mandatory layer of address
   translations for various masters.
 
-  Each DART instance is capable of handling up to 16 different streams
+  Depending on the generation, a DART instance handles up to 256 streams
   with individual pagetables and page-level read/write protection flags.
 
   This DART IOMMU also raises interrupts in response to various
@@ -29,7 +29,16 @@ properties:
           - apple,t8110-dart
           - apple,t6000-dart
       - items:
-          - const: apple,t6020-dart
+          - enum:
+              - apple,t6000-dart
+              - apple,t8112-dart
+          - const: apple,t8110-dart
+      - items:
+          - enum:
+              - apple,t6020-dart
+              - apple,t8122-dart
+              - apple,t8140-dart
+              - apple,t8142-dart
           - const: apple,t8110-dart
 
   reg:
@@ -44,19 +53,79 @@ properties:
       Optional since not all IOMMUs are attached to a clock gate.
 
   '#iommu-cells':
-    const: 1
+    enum: [1, 5]
     description:
-      Has to be one. The single cell describes the stream id emitted by
-      a master to the IOMMU.
+      Usually one cell describing the stream id emitted by a master. The
+      T6020 NHI DART uses five cells to describe a stream range and its
+      device-visible DMA window.
 
   power-domains:
     maxItems: 1
+
+  apple,dma-range:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 2
+    maxItems: 2
+    description: >
+      Device-visible DMA aperture encoded as a base and a nonzero size. The
+      IOMMU DMA allocator restricts mappings to this range; high address bits
+      may select a firmware-visible alias of the translation aperture.
+      A consumer may further specify its own aperture in its binding.
+
+  apple,dma-offset:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    description: >
+      Offset added to device-visible DMA addresses when indexing the DART page
+      tables. This models host bridges which alias a low PCI bus aperture into
+      a high DART translation window.
+
+  apple,tunable:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset
+        - description: Mask to be applied to the register value
+        - description: Bits to be set after applying the mask
+    description: >
+      List of (register offset, mask, value) tuples copied from Apple's Device
+      Tree by the bootloader and required to initialize dynamically powered
+      DART instances.
+
+  apple,remap-streams:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    minItems: 1
+    maxItems: 256
+    items:
+      items:
+        - description: Source stream ID, unique within this list.
+          maximum: 255
+        - description: Destination stream ID, which must not itself be remapped.
+          maximum: 15
+    description:
+      T8110 stream remaps. A source uses the destination stream's translation
+      and filtering state without a separate page-table root. Source and
+      destination must differ, and both must exist on the controller.
 
 required:
   - compatible
   - reg
   - '#iommu-cells'
   - interrupts
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6020-dart
+    then:
+      properties:
+        '#iommu-cells':
+          enum: [1, 5]
+    else:
+      properties:
+        '#iommu-cells':
+          const: 1
 
 additionalProperties: false
 

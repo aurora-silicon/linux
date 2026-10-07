@@ -5,6 +5,9 @@ TEST_INCLUDES := $(wildcard lib/py/*.py) \
 		 $(wildcard lib/sh/*.sh) \
 		 ../../net/lib.sh \
 
+# Manual physical-radio test; requires an explicitly selected saved network.
+TEST_FILES += mt7932_e2e.py
+
 TEST_GEN_FILES := \
 	napi_id_helper \
 	so_txtime \

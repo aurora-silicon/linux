@@ -6,6 +6,7 @@
  * Copyright (C) 2019, Intel Corporation
  */
 
+#include <linux/export.h>
 #include <linux/slab.h>
 #include <linux/errno.h>
 #include <linux/delay.h>
@@ -15,6 +16,7 @@
 #include "tb.h"
 #include "tb_regs.h"
 #include "tunnel.h"
+#include "nhi.h"
 
 #define TB_TIMEOUT		100	/* ms */
 #define TB_RELEASE_BW_TIMEOUT	10000	/* ms */
@@ -3005,6 +3007,21 @@ static int tb_start(struct tb *tb, bool reset)
 	/* All USB4 routers support runtime PM */
 	tb->root_switch->rpm = tb_switch_is_usb4(tb->root_switch);
 
+	/*
+	 * Apple Silicon machines have a separate, proprietary mechanism for
+	 * loading and updating firmware. Skip the DMA port initialization on
+	 * these machines.
+	 */
+	tb->root_switch->no_dma_port = tb->nhi->quirks & QUIRK_NO_DMA_PORT;
+
+	/*
+	 * Apple Silicon host routers do not implement the USB3 bandwidth
+	 * allocation registers: the CMR/HCA handshake is never acked and
+	 * times out. Bandwidth for USB3 tunnels is only booked in software
+	 * on these machines.
+	 */
+	tb->root_switch->no_usb3_bw_alloc = tb->nhi->quirks & QUIRK_NO_USB3_BW_ALLOC;
+
 	ret = tb_switch_configure(tb->root_switch);
 	if (ret) {
 		tb_switch_put(tb->root_switch);
@@ -3304,13 +3321,14 @@ static const struct tb_cm_ops tb_cm_ops = {
  */
 static bool tb_apple_add_links(struct tb_nhi *nhi)
 {
+	struct pci_dev *nhi_pdev = to_pci_dev(nhi->dev);
 	struct pci_dev *upstream, *pdev;
 	bool ret;
 
 	if (!x86_apple_machine)
 		return false;
 
-	switch (nhi->pdev->device) {
+	switch (nhi_pdev->device) {
 	case PCI_DEVICE_ID_INTEL_LIGHT_RIDGE:
 	case PCI_DEVICE_ID_INTEL_CACTUS_RIDGE_4C:
 	case PCI_DEVICE_ID_INTEL_FALCON_RIDGE_2C_NHI:
@@ -3320,7 +3338,7 @@ static bool tb_apple_add_links(struct tb_nhi *nhi)
 		return false;
 	}
 
-	upstream = pci_upstream_bridge(nhi->pdev);
+	upstream = pci_upstream_bridge(nhi_pdev);
 	while (upstream) {
 		if (!pci_is_pcie(upstream))
 			return false;
@@ -3347,15 +3365,15 @@ static bool tb_apple_add_links(struct tb_nhi *nhi)
 		    !pdev->is_pciehp)
 			continue;
 
-		link = device_link_add(&pdev->dev, &nhi->pdev->dev,
+		link = device_link_add(&pdev->dev, nhi->dev,
 				       DL_FLAG_AUTOREMOVE_SUPPLIER |
 				       DL_FLAG_PM_RUNTIME);
 		if (link) {
-			dev_dbg(&nhi->pdev->dev, "created link from %s\n",
+			dev_dbg(nhi->dev, "created link from %s\n",
 				dev_name(&pdev->dev));
 			ret = true;
 		} else {
-			dev_warn(&nhi->pdev->dev, "device link creation from %s failed\n",
+			dev_warn(nhi->dev, "device link creation from %s failed\n",
 				 dev_name(&pdev->dev));
 		}
 	}
@@ -3397,3 +3415,4 @@ struct tb *tb_probe(struct tb_nhi *nhi)
 
 	return tb;
 }
+EXPORT_SYMBOL_NS_GPL(tb_probe, "USB4");

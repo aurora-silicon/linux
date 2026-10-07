@@ -3516,6 +3516,10 @@ struct drm_connector *drm_connector_find_by_fwnode(struct fwnode_handle *fwnode)
  * muxes the DisplayPort data and aux-lines but does not pass the altmode HPD
  * status bit to the GPU's DP HPD pin.
  *
+ * A caller may report &connector_status_unknown when a shared display route
+ * changed without a logical HPD transition and the connector should recheck or
+ * retrain its existing link.
+ *
  * This function can be used to report these out-of-band events after obtaining
  * a drm_connector reference through calling drm_connector_find_by_fwnode().
  */

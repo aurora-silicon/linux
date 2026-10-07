@@ -1,0 +1,239 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/* Copyright The Asahi Linux Contributors */
+
+#include "dcp-link.h"
+#include "iomfb_h17p.h"
+#include "iomfb_v12_3.h"
+#include "iomfb_v13_3.h"
+#include "version_utils.h"
+
+struct dcp_h17p_hotplug_request {
+	__le64 connected;
+	u8 tiled_display[0x4c];
+	u8 tiled_display_null;
+	u8 padding[3];
+} __packed;
+
+struct dcp_h17p_swap_info_request {
+	u8 swap_info[0xe0];
+	u8 swap_info_null;
+	u8 padding[3];
+} __packed;
+
+static_assert(sizeof(struct dcp_h17p_hotplug_request) == 0x58);
+static_assert(sizeof(struct dcp_h17p_swap_info_request) == 0xe4);
+/* D590 swap_complete_ap_gated is 0x730 bytes on the wire. */
+static_assert(sizeof(struct dc_swap_complete_resp_h17p) == 0x730);
+static_assert(offsetof(struct dc_swap_complete_resp_h17p, swap_id) == 0);
+
+static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
+	IOMFB_METHOD("A000", dcpep_late_init_signal),
+	IOMFB_METHOD_H17("A025", "A029", dcpep_setup_video_limits), /* (0,0) */
+	IOMFB_METHOD("A131", iomfbep_a131_pmu_service_matched), /* nested in D206 */
+	IOMFB_METHOD("A132", iomfbep_a132_backlight_service_matched), /* nested in D207 */
+	IOMFB_METHOD("A385", dcpep_set_create_dfb), /* first call inside D121; (0,0) */
+	IOMFB_METHOD("A386", iomfbep_a358_vi_set_temperature_hint), /* nested in D100 */
+	IOMFB_METHOD("A401", dcpep_start_signal),
+	IOMFB_METHOD("A406", dcpep_swap_start),
+	/*
+	 * swap_start moved A407 -> A406 on H17P, but swap_submit did not move
+	 * with it: every swap is A406 followed by A408, A407 is unused, and the
+	 * A408 response is 0x0c bytes (dcp_swap_submit_resp_h17p).
+	 */
+	IOMFB_METHOD("A408", dcpep_swap_submit),
+	IOMFB_METHOD("A411", dcpep_set_display_device),
+	IOMFB_METHOD("A412", dcpep_is_main_display),
+	IOMFB_METHOD("A413", dcpep_set_digital_out_mode),
+	IOMFB_METHOD("A423", iomfbep_set_matrix),
+	IOMFB_METHOD("A427", iomfbep_get_color_remap_mode),
+	IOMFB_METHOD("A442", dcpep_set_parameter_dcp), /* (0x28, 0x4) */
+	IOMFB_METHOD("A446", dcpep_create_default_fb), /* follows A385 in D121 */
+	/*
+	 * The default-framebuffer block the firmware expects inside D121,
+	 * straight after A446 and before A025.  Sizes are (in, out).
+	 */
+	IOMFB_METHOD_H17("A035", "A039", dcpep_get_dfb_compression_info), /* (0x8, 0x8) */
+	IOMFB_METHOD_H17("A034", "A038", dcpep_get_dfb_info), /* (0x2c, 0x2c) */
+	IOMFB_METHOD("A103", dcpep_get_dfb_layout),           /* (0xc, 0x8) */
+	IOMFB_METHOD("A445", dcpep_get_dfb_state),            /* (0x4, 0x8) */
+	IOMFB_METHOD("A104", dcpep_set_dfb_dimensions),       /* (0x8, 0) w,h */
+	IOMFB_METHOD("A105", dcpep_commit_dfb_info),          /* (0, 0) */
+	IOMFB_METHOD_H17("A033", "A037", dcpep_dfb_query),    /* (0, 0x4) */
+	IOMFB_METHOD("A380", dcpep_dfb_ready_query),          /* (0, 0x4) */
+	IOMFB_METHOD("A415", dcpep_pipe_cfg_415),             /* (0xc, 0xc) zeros */
+	/* update_notify_clients_dcp */
+	IOMFB_METHOD_H17("A031", "A035", dcpep_pipe_cfg_031), /* (0x6c, 0) */
+	IOMFB_METHOD("A414", dcpep_pipe_cfg_414),             /* (0x8, 0x8) zeros */
+	IOMFB_METHOD("A478", dcpep_pipe_query_478),           /* (0, 0x4) */
+	IOMFB_METHOD("A474", dcpep_pipe_query_474),           /* (0, 0x4) */
+	IOMFB_METHOD("A476", dcpep_pipe_set_476),             /* (0x4, 0) in 1 */
+	IOMFB_METHOD("A428", dcpep_pipe_set_428),             /* (0x4, 0x4) 0x10000 */
+	IOMFB_METHOD("A450", dcpep_enable_disable_video_power_savings), /* in = u32 0 */
+	IOMFB_METHOD("A457", dcpep_first_client_open), /* (0, 0) */
+	/* D561 (displayMinRefreshInterval) arrives while A465 is in flight */
+	IOMFB_METHOD("A465", dcpep_set_display_refresh_properties),
+	IOMFB_METHOD("A468", dcpep_flush_supports_power), /* follows A025 in D121, in = 1 */
+	/*
+	 * iomfbep_last_client_close and iomfbep_abort_swaps_dcp are deliberately
+	 * absent: their H17P numbers are unverified, so the teardown paths skip
+	 * them (DCP_HAS_CLIENT_TEARDOWN in iomfb_template.c).
+	 */
+	IOMFB_METHOD("A473", dcpep_set_power_state), /* out-of-band; out 0x8 */
+	IOMFB_METHOD("A472", dcpep_register_dfb_surface), /* default FB surface, nested in D582 */
+};
+
+#define DCP_FW h17p
+#define DCP_FW_VER DCP_FW_VERSION(26, 6, 0)
+
+#include "iomfb_template.c"
+
+static bool trampoline_rt_bandwidth_h17p(struct apple_dcp *dcp, int tag,
+					 void *out, void *in)
+{
+	/*
+	 * The bandwidth scratch and doorbell come from the DCP's DT node; the
+	 * apple,bw-doorbell binding has no offset cell.
+	 */
+	u64 scratch = dcp->disp_bw_scratch_res.start +
+		      dcp->disp_bw_scratch_offset;
+	u64 clock_request = dcp->disp_bw_doorbell_res.start;
+
+	trace_iomfb_callback(dcp, tag, __func__);
+	if (apple_dcp_h17p_rt_bw_encode_reply(in, out, scratch, clock_request))
+		dev_warn(dcp->dev, "D003 bandwidth request is malformed\n");
+	return true;
+}
+
+static bool trampoline_get_frequency_h17p(struct apple_dcp *dcp, int tag,
+					   void *out, void *in)
+{
+	const struct apple_dcp_h17p_clock_request *request = in;
+	u64 rate;
+	int ret;
+
+	trace_iomfb_callback(dcp, tag, __func__);
+	ret = apple_dcp_h17p_clock_rate(request, clk_get_rate(dcp->clk),
+					  clk_get_rate(dcp->clk_194), &rate);
+	if (ret) {
+		dev_warn(dcp->dev, "unknown display clock ID %#x\n",
+			 le32_to_cpu(request->clock_id));
+		rate = 0;
+	}
+
+	*(__le64 *)out = cpu_to_le64(rate);
+	return true;
+}
+
+static bool trampoline_hotplug_h17p(struct apple_dcp *dcp, int tag,
+				    void *out, void *in)
+{
+	const struct dcp_h17p_hotplug_request *request = in;
+
+	if (!(request->tiled_display_null & 1))
+		memcpy(out, request->tiled_display,
+		       sizeof(request->tiled_display));
+	return trampoline_hotplug(dcp, tag, out, in);
+}
+
+static bool trampoline_swap_info_h17p(struct apple_dcp *dcp, int tag,
+				      void *out, void *in)
+{
+	const struct dcp_h17p_swap_info_request *request = in;
+
+	trace_iomfb_callback(dcp, tag, __func__);
+	if (!(request->swap_info_null & 1))
+		memcpy(out, request->swap_info, sizeof(request->swap_info));
+	return true;
+}
+
+/*
+ * D400 (get_property) is left unhandled: the zeroed reply means "no such
+ * property". The firmware then runs without a panel power model, as it does
+ * for its other optional power properties.
+ */
+
+/*
+ * H17P callback numbering.  It is not a uniform shift of the v13.5 table: the
+ * service-creation block is D108..D113 exactly as on v13.5, and the swap
+ * completion is D590.  A callback with no entry here is answered with a
+ * zeroed reply by dcpep_handle_cb().
+ */
+static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
+	[0] = dcpep_cb_d000_h17p, /* acked after a nested A033 */
+	[1] = trampoline_true,
+	[2] = trampoline_nop,
+	[3] = trampoline_rt_bandwidth_h17p,
+	[6] = trampoline_set_frame_sync_props_h17p, /* 0x54/0x50, identity scale */
+	[100] = iomfbep_cb_match_pmu_service, /* match_pmu_service */
+	[101] = trampoline_zero,
+	[102] = trampoline_nop, /* set_number_property */
+	[104] = trampoline_nop, /* set_boolean_property */
+	[107] = trampoline_nop,
+	[108] = trampoline_true, /* create_provider_service */
+	[109] = trampoline_true, /* create_product_service */
+	[110] = trampoline_true, /* create_PMU_service */
+	[111] = trampoline_true, /* create_iomfb_service */
+	[112] = trampoline_create_backlight_service, /* create_backlight_service */
+	[113] = trampoline_true, /* create_nvram_service */
+	[114] = trampoline_zero, /* CoreAnalyticsSendEvent */
+	[117] = trampoline_nop, /* set_idle_caching_state_ap */
+	[118] = trampoline_zero, /* upload_trace_start */
+	[119] = trampoline_zero, /* upload_trace_chunk */
+	[120] = trampoline_zero, /* upload_trace_end */
+	[121] = dcpep_cb_boot_1, /* start_hardware_boot */
+	[122] = trampoline_false, /* is_dark_boot */
+	[123] = trampoline_false, /* is_waking_from_hibernate */
+	[124] = trampoline_zero, /* detect_fastsim */
+	[125] = trampoline_read_edt_data, /* read_edt_data */
+	[127] = trampoline_prop_start, /* setDCPAVPropStart */
+	[128] = trampoline_prop_chunk, /* setDCPAVPropChunk */
+	[129] = trampoline_prop_end, /* setDCPAVPropEnd */
+	[130] = trampoline_allocate_bandwidth, /* allocate_bandwidth */
+	[201] = trampoline_map_piodma, /* map_buf */
+	[202] = trampoline_unmap_piodma, /* unmap_buf */
+	[206] = iomfbep_cb_match_pmu_service_2, /* match_pmu_service */
+	[207] = iomfbep_cb_match_backlight_service, /* match_backlight_service */
+	[208] = trampoline_nop, /* update_backlight_factor_prop */
+	[209] = trampoline_get_time, /* get_calendar_time_ms */
+	[300] = trampoline_pr_publish,
+	[401] = trampoline_get_uint_prop, /* get_uint_prop */
+	[404] = trampoline_nop, /* set_uint_prop */
+	[406] = trampoline_set_fx_prop, /* set_fx_prop */
+	[408] = trampoline_get_frequency_h17p, /* getClockFrequency */
+	[411] = trampoline_map_reg, /* mapDeviceMemoryWithIndex */
+	[413] = trampoline_true, /* setProperty */
+	[414] = trampoline_sr_set_property_int, /* setProperty */
+	[415] = trampoline_true, /* setProperty */
+	[451] = trampoline_allocate_buffer, /* allocate_buffer */
+	[452] = trampoline_map_physical, /* prepare */
+	[454] = trampoline_release_mem_desc, /* release_descriptor */
+	[552] = trampoline_true,
+	[561] = trampoline_true,
+	[563] = trampoline_true,
+	[565] = trampoline_true,
+	[567] = trampoline_true,
+	[572] = trampoline_zero, /* powerUpDART */
+	[575] = trampoline_hotplug_h17p,
+	[576] = trampoline_nop,
+	[582] = iomfbep_cb_create_dfb_surface, /* create_default_fb_surface */
+	[583] = trampoline_nop, /* clear_default_surface */
+	[584] = trampoline_nop, /* swap_notify_gated */
+	[585] = trampoline_swap_info_h17p, /* swap_info_notify_dispatch */
+	[590] = trampoline_swap_complete, /* swap_complete_ap_gated */
+	[592] = trampoline_swap_complete_intent_gated, /* swap_complete_intent_gated */
+	[593] = trampoline_abort_swap_ap_gated, /* abort_swap_ap_gated */
+	[594] = trampoline_enable_backlight_message_ap_gated,
+	[595] = trampoline_nop, /* setSystemConsoleMode */
+	[597] = trampoline_false, /* isDFBAllocated */
+	[598] = trampoline_false,
+	[599] = trampoline_nop, /* find_swap_function_gated */
+};
+
+void iomfb_start_h17p(struct apple_dcp *dcp)
+{
+	dcp->cb_handlers = cb_handlers;
+	dcp_start_signal(dcp, false, dcp_started, NULL);
+}
+
+#undef DCP_FW_VER
+#undef DCP_FW

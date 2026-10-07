@@ -1,0 +1,323 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+#include <dt-bindings/phy/phy.h>
+#include <dt-bindings/spmi/spmi.h>
+
+/ {
+	aliases {
+		atcphy0 = &atcphy0;
+		usb0 = &dwc3_0;
+		atcphy1 = &atcphy1;
+		usb1 = &dwc3_1;
+	};
+};
+
+&pmgr {
+	ps_atc0_common: power-controller@2c8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2c8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0-common";
+	};
+};
+
+&{/soc} {
+	pmgr_nub: power-management@388280000 {
+		compatible = "apple,t8142-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		reg = <3 0x88280000 0 0x4000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		ps_nub_spmi_a0: power-controller@70 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x70 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "nub-spmi-a0";
+		};
+
+		ps_atc0_usb_aon: power-controller@c8 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0xc8 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "atc0-usb-aon";
+		};
+
+		ps_atc0_usb: power-controller@d0 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0xd0 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			power-domains = <&ps_atc0_common>, <&ps_atc0_usb_aon>;
+			label = "atc0-usb";
+		};
+	};
+
+	nub_spmi_a0: spmi@388908000 {
+		compatible = "apple,t8142-spmi";
+		reg = <3 0x88908000 0 0x4000>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		power-domains = <&ps_nub_spmi_a0>;
+
+		hpm0: usb-pd@c {
+			compatible = "apple,sn201202x";
+			reg = <0xc SPMI_USID>;
+
+			typec0: connector {
+				compatible = "usb-c-connector";
+				label = "USB-C Left-front";
+				power-role = "dual";
+				data-role = "host";
+
+				ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					port@0 {
+						reg = <0>;
+						typec0_hs: endpoint {
+							remote-endpoint = <&dwc3_0_hs>;
+						};
+					};
+
+					port@1 {
+						reg = <1>;
+						typec0_ss: endpoint {
+							remote-endpoint = <&atcphy0_typec>;
+						};
+					};
+				};
+			};
+		};
+	};
+
+	dwc3_0: usb@402280000 {
+		compatible = "apple,t8142-dwc3", "apple,t8103-dwc3";
+		reg = <4 0x02280000 0 0xcd00>, <4 0x0228cd00 0 0x4b00>;
+		reg-names = "dwc3-core", "dwc3-apple";
+		interrupts = <AIC_IRQ 1511 IRQ_TYPE_LEVEL_HIGH>;
+		dr_mode = "host";
+		usb-role-switch;
+		role-switch-default-mode = "host";
+		iommus = <&dwc3_0_dart_0 0>, <&dwc3_0_dart_1 1>;
+		power-domains = <&ps_atc0_usb>;
+		resets = <&atcphy0>;
+		phys = <&atcphy0 PHY_TYPE_USB2>, <&atcphy0 PHY_TYPE_USB3>;
+		phy-names = "usb2-phy", "usb3-phy";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			port@0 {
+				reg = <0>;
+				dwc3_0_hs: endpoint {
+					remote-endpoint = <&typec0_hs>;
+				};
+			};
+			port@1 {
+				reg = <1>;
+				dwc3_0_ss: endpoint {
+					remote-endpoint = <&atcphy0_usb>;
+				};
+			};
+		};
+	};
+
+	dwc3_0_dart_0: iommu@402f00000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <4 0x02f00000 0 0xc000>;
+		interrupts = <AIC_IRQ 1515 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc0_usb>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x4000 0 0xffff0000>;
+	};
+
+	dwc3_0_dart_1: iommu@402f80000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <4 0x02f80000 0 0xc000>;
+		interrupts = <AIC_IRQ 1515 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc0_usb>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x4000 0 0xffff0000>;
+	};
+
+	atcphy0: phy@403000000 {
+		compatible = "apple,t8142-atcphy";
+		reg = <4 0x03000000 0 0x4c000>,
+		      <4 0x03050000 0 0x8000>,
+		      <4 0x00000000 0 0x8000>,
+		      <4 0x02a90000 0 0x4000>,
+		      <4 0x02a84000 0 0x4000>;
+		reg-names = "core", "lpdptx", "axi2af", "usb2phy", "pipehandler";
+		#phy-cells = <1>;
+		#reset-cells = <0>;
+		orientation-switch;
+		mode-switch;
+		power-domains = <&ps_atc0_usb>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			port@0 {
+				reg = <0>;
+				atcphy0_typec: endpoint {
+					remote-endpoint = <&typec0_ss>;
+				};
+			};
+			port@1 {
+				reg = <1>;
+				atcphy0_usb: endpoint {
+					remote-endpoint = <&dwc3_0_ss>;
+				};
+			};
+		};
+	};
+};
+
+&pmgr {
+	ps_atc1_common: power-controller@2d0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2d0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc1-common";
+	};
+};
+
+&pmgr_nub {
+	ps_atc1_usb_aon: power-controller@d8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xd8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc1-usb-aon";
+	};
+
+	ps_atc1_usb: power-controller@e0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xe0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc1_common>, <&ps_atc1_usb_aon>;
+		label = "atc1-usb";
+	};
+};
+
+&nub_spmi_a0 {
+	hpm1: usb-pd@a {
+		compatible = "apple,sn201202x";
+		reg = <0xa SPMI_USID>;
+
+		typec1: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left-rear";
+			power-role = "dual";
+			data-role = "host";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec1_hs: endpoint {
+						remote-endpoint = <&dwc3_1_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec1_ss: endpoint {
+						remote-endpoint = <&atcphy1_typec>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&{/soc} {
+	dwc3_1: usb@40a280000 {
+		compatible = "apple,t8142-dwc3", "apple,t8103-dwc3";
+		reg = <4 0x0a280000 0 0xcd00>, <4 0x0a28cd00 0 0x4b00>;
+		reg-names = "dwc3-core", "dwc3-apple";
+		interrupts = <AIC_IRQ 1574 IRQ_TYPE_LEVEL_HIGH>;
+		dr_mode = "host";
+		usb-role-switch;
+		role-switch-default-mode = "host";
+		iommus = <&dwc3_1_dart_0 0>, <&dwc3_1_dart_1 1>;
+		power-domains = <&ps_atc1_usb>;
+		resets = <&atcphy1>;
+		phys = <&atcphy1 PHY_TYPE_USB2>, <&atcphy1 PHY_TYPE_USB3>;
+		phy-names = "usb2-phy", "usb3-phy";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			port@0 {
+				reg = <0>;
+				dwc3_1_hs: endpoint {
+					remote-endpoint = <&typec1_hs>;
+				};
+			};
+			port@1 {
+				reg = <1>;
+				dwc3_1_ss: endpoint {
+					remote-endpoint = <&atcphy1_usb>;
+				};
+			};
+		};
+	};
+
+	dwc3_1_dart_0: iommu@40af00000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <4 0x0af00000 0 0xc000>;
+		interrupts = <AIC_IRQ 1578 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc1_usb>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x4000 0 0xffff0000>;
+	};
+
+	dwc3_1_dart_1: iommu@40af80000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <4 0x0af80000 0 0xc000>;
+		interrupts = <AIC_IRQ 1578 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc1_usb>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x4000 0 0xffff0000>;
+	};
+
+	atcphy1: phy@40b000000 {
+		compatible = "apple,t8142-atcphy";
+		reg = <4 0x0b000000 0 0x4c000>,
+		      <4 0x0b050000 0 0x8000>,
+		      <4 0x08000000 0 0x8000>,
+		      <4 0x0aa90000 0 0x4000>,
+		      <4 0x0aa84000 0 0x4000>;
+		reg-names = "core", "lpdptx", "axi2af", "usb2phy", "pipehandler";
+		#phy-cells = <1>;
+		#reset-cells = <0>;
+		orientation-switch;
+		mode-switch;
+		power-domains = <&ps_atc1_usb>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			port@0 {
+				reg = <0>;
+				atcphy1_typec: endpoint {
+					remote-endpoint = <&typec1_ss>;
+				};
+			};
+			port@1 {
+				reg = <1>;
+				atcphy1_usb: endpoint {
+					remote-endpoint = <&dwc3_1_ss>;
+				};
+			};
+		};
+	};
+};

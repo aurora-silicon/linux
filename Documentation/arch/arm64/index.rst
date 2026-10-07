@@ -9,6 +9,7 @@ ARM64 Architecture
 
     acpi_object_usage
     amu
+    apple-j813
     arm-acpi
     arm-cca
     asymmetric-32bit

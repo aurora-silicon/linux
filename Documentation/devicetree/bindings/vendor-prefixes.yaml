@@ -205,6 +205,8 @@ patternProperties:
     description: Atmel Corporation
   "^auo,.*":
     description: AU Optronics Corporation
+  "^aurora,.*":
+    description: Aurora Silicon
   "^auvidea,.*":
     description: Auvidea GmbH
   "^avago,.*":

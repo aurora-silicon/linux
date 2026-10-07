@@ -53,6 +53,10 @@ static const struct mfd_cell apple_smc_devs[] = {
 	MFD_CELL_OF("macsmc-rtc", NULL, NULL, 0, 0, "apple,smc-rtc"),
 };
 
+/* The second GPIO bank ('gp' keys) only exists on some SMCs. */
+static const struct mfd_cell apple_smc_low_gpio_dev =
+	MFD_CELL_OF("macsmc-low-gpio", NULL, NULL, 0, 0, "apple,smc-low-gpio");
+
 static int apple_smc_cmd_locked(struct apple_smc *smc, u64 cmd, u64 arg,
 				  u64 size, u64 wsize, u32 *ret_data)
 {
@@ -409,8 +413,9 @@ static void apple_smc_disable_notifications(void *data)
 static int apple_smc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	struct device_node *np;
 	struct apple_smc *smc;
-	u32 count;
+	__be32 count;
 	int ret;
 
 	smc = devm_kzalloc(dev, sizeof(*smc), GFP_KERNEL);
@@ -461,8 +466,10 @@ static int apple_smc_probe(struct platform_device *pdev)
 	dev_set_drvdata(&pdev->dev, smc);
 	BLOCKING_INIT_NOTIFIER_HEAD(&smc->event_handlers);
 
-	ret = apple_smc_read_u32(smc, SMC_KEY(#KEY), &count);
-	if (ret)
+	ret = apple_smc_read(smc, SMC_KEY(#KEY), &count, sizeof(count));
+	if (ret >= 0 && ret != sizeof(count))
+		ret = -EINVAL;
+	if (ret < 0)
 		return dev_err_probe(smc->dev, ret, "Failed to get key count");
 	smc->key_count = be32_to_cpu(count);
 
@@ -478,6 +485,20 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(smc->dev, ret, "Failed to register sub-devices");
 
+	/*
+	 * Register the second GPIO bank only where the device tree describes
+	 * it: the MFD core would otherwise create an unbound device and warn
+	 * that it found no node on every SMC without one.
+	 */
+	np = of_get_compatible_child(dev->of_node, "apple,smc-low-gpio");
+	if (np) {
+		of_node_put(np);
+		ret = devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
+					   &apple_smc_low_gpio_dev, 1, NULL, 0, NULL);
+		if (ret)
+			return dev_err_probe(smc->dev, ret,
+					     "Failed to register the second GPIO bank");
+	}
 
 	return 0;
 }

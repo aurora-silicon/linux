@@ -1,0 +1,296 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple MacBook Air (13-inch, M5, 2026), J813.
+ *
+ * Initial RAM boot resources measured from the J813 Apple Device Tree.
+ * The loader supplies usable memory, CPU release addresses and framebuffer
+ * geometry. Peripheral power management is left with the boot firmware.
+ */
+/dts-v1/;
+
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	compatible = "apple,j813", "apple,t8142", "apple,arm-platform";
+	model = "Apple MacBook Air (13-inch, M5, 2026)";
+
+	#address-cells = <2>;
+	#size-cells = <2>;
+	interrupt-parent = <&aic>;
+
+	aliases {
+		serial0 = &dockchannel;
+		serial1 = &serial0;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		stdout-path = "serial0:1500000n8";
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* Filled by the loader. */
+			status = "disabled";
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		/* Filled by the loader. */
+	};
+
+	memory@10000000000 {
+		device_type = "memory";
+		reg = <0x100 0 0x4 0>; /* Filled by the loader. */
+	};
+
+	cpus {
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		cpu0: cpu@0 {
+			compatible = "apple,t8142-e";
+			device_type = "cpu";
+			reg = <0 0x0>;
+			operating-points-v2 = <&ecluster_opp>;
+			performance-domains = <&cpufreq_e>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+		};
+
+		cpu1: cpu@1 {
+			compatible = "apple,t8142-e";
+			device_type = "cpu";
+			reg = <0 0x1>;
+			operating-points-v2 = <&ecluster_opp>;
+			performance-domains = <&cpufreq_e>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+		};
+
+		cpu2: cpu@2 {
+			compatible = "apple,t8142-e";
+			device_type = "cpu";
+			reg = <0 0x2>;
+			operating-points-v2 = <&ecluster_opp>;
+			performance-domains = <&cpufreq_e>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+		};
+
+		cpu3: cpu@3 {
+			compatible = "apple,t8142-e";
+			device_type = "cpu";
+			reg = <0 0x3>;
+			operating-points-v2 = <&ecluster_opp>;
+			performance-domains = <&cpufreq_e>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+		};
+
+		cpu4: cpu@4 {
+			compatible = "apple,t8142-e";
+			device_type = "cpu";
+			reg = <0 0x4>;
+			operating-points-v2 = <&ecluster_opp>;
+			performance-domains = <&cpufreq_e>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+		};
+
+		cpu5: cpu@5 {
+			compatible = "apple,t8142-e";
+			device_type = "cpu";
+			reg = <0 0x5>;
+			operating-points-v2 = <&ecluster_opp>;
+			performance-domains = <&cpufreq_e>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+		};
+
+		cpu6: cpu@10100 {
+			compatible = "apple,t8142-p";
+			device_type = "cpu";
+			reg = <0 0x10100>;
+			operating-points-v2 = <&pcluster_opp>;
+			performance-domains = <&cpufreq_p>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+		};
+
+		cpu7: cpu@10101 {
+			compatible = "apple,t8142-p";
+			device_type = "cpu";
+			reg = <0 0x10101>;
+			operating-points-v2 = <&pcluster_opp>;
+			performance-domains = <&cpufreq_p>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+		};
+
+		cpu8: cpu@10102 {
+			compatible = "apple,t8142-p";
+			device_type = "cpu";
+			reg = <0 0x10102>;
+			operating-points-v2 = <&pcluster_opp>;
+			performance-domains = <&cpufreq_p>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+		};
+
+		cpu9: cpu@10103 {
+			compatible = "apple,t8142-p";
+			device_type = "cpu";
+			reg = <0 0x10103>;
+			operating-points-v2 = <&pcluster_opp>;
+			performance-domains = <&cpufreq_p>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+		};
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupts = <AIC_FIQ AIC_TMR_GUEST_PHYS IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_GUEST_VIRT IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_HV_PHYS IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "phys", "virt", "hyp-phys", "hyp-virt";
+	};
+
+	/* State 1 is 300 MHz; firmware SRAM OPP tables begin at state 2. */
+	/* Cap each cluster at its measured J813 firmware handoff state. */
+	ecluster_opp: opp-table-0 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-300000000 {
+			opp-hz = /bits/ 64 <300000000>;
+			opp-level = <1>;
+		};
+
+		opp-972000000 {
+			opp-hz = /bits/ 64 <972000000>;
+			opp-level = <2>;
+		};
+	};
+
+	pcluster_opp: opp-table-1 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-300000000 {
+			opp-hz = /bits/ 64 <300000000>;
+			opp-level = <1>;
+		};
+
+		opp-1308000000 {
+			opp-hz = /bits/ 64 <1308000000>;
+			opp-level = <2>;
+		};
+
+		opp-1608000000 {
+			opp-hz = /bits/ 64 <1608000000>;
+			opp-level = <3>;
+		};
+
+		opp-1932000000 {
+			opp-hz = /bits/ 64 <1932000000>;
+			opp-level = <4>;
+		};
+
+		opp-2220000000 {
+			opp-hz = /bits/ 64 <2220000000>;
+			opp-level = <5>;
+		};
+
+		opp-2508000000 {
+			opp-hz = /bits/ 64 <2508000000>;
+			opp-level = <6>;
+		};
+
+		opp-2820000000 {
+			opp-hz = /bits/ 64 <2820000000>;
+			opp-level = <7>;
+		};
+
+		opp-3072000000 {
+			opp-hz = /bits/ 64 <3072000000>;
+			opp-level = <8>;
+		};
+
+		opp-3300000000 {
+			opp-hz = /bits/ 64 <3300000000>;
+			opp-level = <9>;
+		};
+
+		opp-3516000000 {
+			opp-hz = /bits/ 64 <3516000000>;
+			opp-level = <10>;
+		};
+	};
+
+	clkref: clock-ref {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		nonposted-mmio;
+
+		cpufreq_e: performance-controller@210e20000 {
+			compatible = "apple,t8142-cluster-cpufreq";
+			reg = <0x2 0x10e20000 0 0x1000>;
+			#performance-domain-cells = <0>;
+		};
+
+		cpufreq_p: performance-controller@211e20000 {
+			compatible = "apple,t8142-cluster-cpufreq";
+			reg = <0x2 0x11e20000 0 0x1000>;
+			#performance-domain-cells = <0>;
+		};
+
+		aic: interrupt-controller@381000000 {
+			compatible = "apple,t8142-aic3", "apple,t8122-aic3";
+			interrupt-controller;
+			#interrupt-cells = <3>;
+			reg = <3 0x81000000 0 0x1cc000>,
+			      <3 0x81040000 0 0x4000>;
+			reg-names = "core", "event";
+		};
+
+		serial0: serial@3a5200000 {
+			compatible = "apple,s5l-uart";
+			reg = <3 0xa5200000 0 0x4000>;
+			reg-io-width = <4>;
+			interrupts = <AIC_IRQ 1231 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			status = "disabled";
+		};
+
+		dockchannel: serial@38812c000 {
+			compatible = "apple,dockchannel-uart";
+			reg = <3 0x8812c000 0 0x4000>,
+			      <3 0x88128000 0 0x4000>,
+			      <3 0x8810c000 0 0x1000>;
+			reg-names = "data", "config", "irq";
+			interrupts = <AIC_IRQ 571 IRQ_TYPE_LEVEL_HIGH>;
+		};
+	};
+};
+
+#include "t8142-j813-display.dtsi"
+#include "t8142-j813-peripherals.dtsi"
+#include "t8142-j813-usb.dtsi"

@@ -1,0 +1,249 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple Mac mini (M6), J873g.
+ *
+ * Initial RAM boot resources measured on J873g/T8152.
+ * The loader supplies usable memory, CPU release addresses and framebuffer
+ * geometry. Peripheral power management is left with the boot firmware.
+ */
+/dts-v1/;
+
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	compatible = "apple,j873g", "apple,t8152", "apple,arm-platform";
+	model = "Apple Mac mini (M6)";
+
+	#address-cells = <2>;
+	#size-cells = <2>;
+	interrupt-parent = <&aic>;
+
+	/* Request the m1n1 RAM-only handoff, without PCIe/DAPF setup. */
+	aurora,minimal-boot;
+
+	aliases {
+		serial0 = &dockchannel;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		stdout-path = "serial0:1500000n8";
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* Filled by the loader. */
+			status = "disabled";
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		/* Filled by the loader. */
+	};
+
+	memory@10000000000 {
+		device_type = "memory";
+		reg = <0x100 0 0 0>; /* Filled by the loader. */
+	};
+
+	cpus {
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		cpu0: cpu@0 {
+			compatible = "apple,t8152-e";
+			device_type = "cpu";
+			reg = <0 0x0>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			operating-points-v2 = <&m6_e_opp>;
+			performance-domains = <&m6_e_cpufreq>;
+		};
+
+		cpu1: cpu@1 {
+			compatible = "apple,t8152-e";
+			device_type = "cpu";
+			reg = <0 0x1>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			operating-points-v2 = <&m6_e_opp>;
+			performance-domains = <&m6_e_cpufreq>;
+		};
+
+		cpu2: cpu@2 {
+			compatible = "apple,t8152-e";
+			device_type = "cpu";
+			reg = <0 0x2>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			operating-points-v2 = <&m6_e_opp>;
+			performance-domains = <&m6_e_cpufreq>;
+		};
+
+		cpu3: cpu@3 {
+			compatible = "apple,t8152-e";
+			device_type = "cpu";
+			reg = <0 0x3>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			operating-points-v2 = <&m6_e_opp>;
+			performance-domains = <&m6_e_cpufreq>;
+		};
+
+		cpu4: cpu@4 {
+			compatible = "apple,t8152-e";
+			device_type = "cpu";
+			reg = <0 0x4>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			operating-points-v2 = <&m6_e_opp>;
+			performance-domains = <&m6_e_cpufreq>;
+		};
+
+		cpu5: cpu@5 {
+			compatible = "apple,t8152-e";
+			device_type = "cpu";
+			reg = <0 0x5>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			operating-points-v2 = <&m6_e_opp>;
+			performance-domains = <&m6_e_cpufreq>;
+		};
+
+		cpu6: cpu@10100 {
+			compatible = "apple,t8152-p";
+			device_type = "cpu";
+			reg = <0 0x10100>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			operating-points-v2 = <&m6_pm_opp>;
+			performance-domains = <&m6_pm_cpufreq>;
+		};
+
+		cpu7: cpu@10101 {
+			compatible = "apple,t8152-p";
+			device_type = "cpu";
+			reg = <0 0x10101>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			operating-points-v2 = <&m6_pm_opp>;
+			performance-domains = <&m6_pm_cpufreq>;
+		};
+
+		cpu8: cpu@40102 {
+			compatible = "apple,t8152-m";
+			device_type = "cpu";
+			reg = <0 0x40102>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			operating-points-v2 = <&m6_pm_opp>;
+			performance-domains = <&m6_pm_cpufreq>;
+		};
+
+		cpu9: cpu@40103 {
+			compatible = "apple,t8152-m";
+			device_type = "cpu";
+			reg = <0 0x40103>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			operating-points-v2 = <&m6_pm_opp>;
+			performance-domains = <&m6_pm_cpufreq>;
+		};
+
+		cpu10: cpu@40104 {
+			compatible = "apple,t8152-m";
+			device_type = "cpu";
+			reg = <0 0x40104>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			operating-points-v2 = <&m6_pm_opp>;
+			performance-domains = <&m6_pm_cpufreq>;
+		};
+
+		cpu11: cpu@40105 {
+			compatible = "apple,t8152-m";
+			device_type = "cpu";
+			reg = <0 0x40105>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			operating-points-v2 = <&m6_pm_opp>;
+			performance-domains = <&m6_pm_cpufreq>;
+		};
+	};
+
+	m6_e_opp: opp-table-e {
+		compatible = "operating-points-v2";
+		opp-shared;
+		opp-972000000 {
+			opp-hz = /bits/ 64 <972000000>;
+			opp-level = <2>;
+		};
+		opp-1152000000 {
+			opp-hz = /bits/ 64 <1152000000>;
+			opp-level = <3>;
+		};
+	};
+	m6_pm_opp: opp-table-pm {
+		compatible = "operating-points-v2";
+		opp-shared;
+		opp-1440000000 {
+			opp-hz = /bits/ 64 <1440000000>;
+			opp-level = <2>;
+		};
+		opp-1728000000 {
+			opp-hz = /bits/ 64 <1728000000>;
+			opp-level = <3>;
+		};
+	};
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupts = <AIC_FIQ AIC_TMR_GUEST_PHYS IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_GUEST_VIRT IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_HV_PHYS IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "phys", "virt", "hyp-phys", "hyp-virt";
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		nonposted-mmio;
+
+		aic: interrupt-controller@301000000 {
+			compatible = "apple,t8152-aic3", "apple,t8122-aic3";
+			interrupt-controller;
+			#interrupt-cells = <3>;
+			reg = <3 0x01000000 0 0x1cc000>,
+			      <3 0x01040000 0 0x4000>;
+			reg-names = "core", "event";
+		};
+
+		m6_e_cpufreq: performance-controller@210e20000 {
+			compatible = "apple,t8152-cluster-cpufreq";
+			reg = <2 0x10e20000 0 0x1000>;
+			#performance-domain-cells = <0>;
+		};
+		m6_pm_cpufreq: performance-controller@211e20000 {
+			compatible = "apple,t8152-cluster-cpufreq";
+			reg = <2 0x11e20000 0 0x1000>;
+			#performance-domain-cells = <0>;
+		};
+
+		dockchannel: serial@30812c000 {
+			compatible = "apple,dockchannel-uart";
+			reg = <3 0x0812c000 0 0x4000>,
+			      <3 0x08128000 0 0x4000>,
+			      <3 0x0810c000 0 0x1000>;
+			reg-names = "data", "config", "irq";
+			interrupts = <AIC_IRQ 662 IRQ_TYPE_LEVEL_HIGH>;
+		};
+	};
+};

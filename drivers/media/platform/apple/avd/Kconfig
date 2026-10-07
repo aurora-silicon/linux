@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config VIDEO_APPLE_AVD
+	tristate "Apple Silicon Video Decoding driver"
+	depends on VIDEO_DEV
+	depends on MEDIA_CONTROLLER
+	depends on ARCH_APPLE || (COMPILE_TEST && 64BIT)
+	depends on OF_ADDRESS
+	depends on V4L_PLATFORM_DRIVERS
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	select V4L2_H264
+	select V4L2_VP9
+	help
+	  Support the Apple Silicon stateless video decoder.
+
+	  Build the decoder firmware from https://github.com/aurora-silicon/avd-fw
+	  and install it under /lib/firmware/apple/. J700/T8140 uses the
+	  avd-fw-v5-t0.bin image. Firmware is supplied separately from this driver.

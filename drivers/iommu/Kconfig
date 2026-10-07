@@ -305,6 +305,7 @@ config APPLE_DART
 	tristate "Apple DART IOMMU Support"
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on !GENERIC_ATOMIC64	# for IOMMU_IO_PGTABLE_DART
+	select APPLE_TUNABLE
 	select IOMMU_API
 	select IOMMU_IO_PGTABLE_DART
 	help

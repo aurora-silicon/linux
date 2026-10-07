@@ -753,6 +753,10 @@ usb_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
 			len += sysfs_emit_at(buf, len, "%s ", usb_modes[i]);
 	}
 
+	/* Nothing was written, so there is no trailing separator to replace. */
+	if (!len)
+		return sysfs_emit(buf, "\n");
+
 	sysfs_emit_at(buf, len - 1, "\n");
 
 	return len;
@@ -1541,6 +1545,10 @@ usb_capability_show(struct device *dev, struct device_attribute *attr, char *buf
 		else
 			len += sysfs_emit_at(buf, len, "%s ", usb_modes[i]);
 	}
+
+	/* Nothing was written, so there is no trailing separator to replace. */
+	if (!len)
+		return sysfs_emit(buf, "\n");
 
 	sysfs_emit_at(buf, len - 1, "\n");
 

@@ -260,6 +260,7 @@ struct aic_info {
 	/* Features */
 	bool fast_ipi;
 	bool local_fast_ipi;
+	bool vm_timer_fiq_readonly;
 };
 
 static const struct aic_info aic1_info __initconst = {
@@ -306,7 +307,19 @@ static const struct aic_info aic3_info __initconst = {
 	.local_fast_ipi = true,
 };
 
+static const struct aic_info aic3_t8142_info __initconst = {
+	.version = 3,
+	.irq_cfg = AIC3_IRQ_CFG,
+	.fast_ipi = true,
+	.local_fast_ipi = true,
+	.vm_timer_fiq_readonly = true,
+};
+
 static const struct of_device_id aic_info_match[] = {
+	{
+		.compatible = "apple,t8142-aic3",
+		.data = &aic3_t8142_info,
+	},
 	{
 		.compatible = "apple,t8103-aic",
 		.data = &aic1_local_fipi_info,
@@ -497,16 +510,38 @@ static unsigned long aic_fiq_get_idx(struct irq_data *d)
 	return AIC_HWIRQ_IRQ(irqd_to_hwirq(d));
 }
 
+/*
+ * T8142 traps writes to VM_TMR_FIQ_ENA_EL2. Mask the guest timers through
+ * their architectural EL02 controls instead, leaving the older SoCs alone.
+ */
+static void aic_vm_timer_mask(u64 timers, bool mask)
+{
+	if (!aic_irqc->info.vm_timer_fiq_readonly) {
+		sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2,
+				   mask ? timers : 0, mask ? 0 : timers);
+		return;
+	}
+
+	if (timers & VM_TMR_FIQ_ENABLE_P)
+		sysreg_clear_set_s(SYS_CNTP_CTL_EL02,
+			mask ? 0 : ARCH_TIMER_CTRL_IT_MASK,
+			mask ? ARCH_TIMER_CTRL_IT_MASK : 0);
+	if (timers & VM_TMR_FIQ_ENABLE_V)
+		sysreg_clear_set_s(SYS_CNTV_CTL_EL02,
+			mask ? 0 : ARCH_TIMER_CTRL_IT_MASK,
+			mask ? ARCH_TIMER_CTRL_IT_MASK : 0);
+}
+
 static void aic_fiq_set_mask(struct irq_data *d)
 {
 	/* Only the guest timers have real mask bits, unfortunately. */
 	switch (aic_fiq_get_idx(d)) {
 	case AIC_TMR_EL02_PHYS:
-		sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENABLE_P, 0);
+		aic_vm_timer_mask(VM_TMR_FIQ_ENABLE_P, true);
 		isb();
 		break;
 	case AIC_TMR_EL02_VIRT:
-		sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENABLE_V, 0);
+		aic_vm_timer_mask(VM_TMR_FIQ_ENABLE_V, true);
 		isb();
 		break;
 	default:
@@ -518,11 +553,11 @@ static void aic_fiq_clear_mask(struct irq_data *d)
 {
 	switch (aic_fiq_get_idx(d)) {
 	case AIC_TMR_EL02_PHYS:
-		sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, 0, VM_TMR_FIQ_ENABLE_P);
+		aic_vm_timer_mask(VM_TMR_FIQ_ENABLE_P, false);
 		isb();
 		break;
 	case AIC_TMR_EL02_VIRT:
-		sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, 0, VM_TMR_FIQ_ENABLE_V);
+		aic_vm_timer_mask(VM_TMR_FIQ_ENABLE_V, false);
 		isb();
 		break;
 	default:
@@ -584,7 +619,9 @@ static void __exception_irq_entry aic_handle_fiq(struct pt_regs *regs)
 					  AIC_FIQ_HWIRQ(AIC_TMR_EL0_VIRT));
 
 	if (is_kernel_in_hyp_mode()) {
-		uint64_t enabled = read_sysreg_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2);
+		uint64_t enabled = aic_irqc->info.vm_timer_fiq_readonly ?
+			VM_TMR_FIQ_ENABLE_P | VM_TMR_FIQ_ENABLE_V :
+			read_sysreg_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2);
 
 		if ((enabled & VM_TMR_FIQ_ENABLE_P) &&
 		    TIMER_FIRING(read_sysreg_s(SYS_CNTP_CTL_EL02)))
@@ -871,8 +908,7 @@ static int aic_init_cpu(unsigned int cpu)
 	/* EL2-only (VHE mode) IRQ sources */
 	if (is_kernel_in_hyp_mode()) {
 		/* Guest timers */
-		sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2,
-				   VM_TMR_FIQ_ENABLE_V | VM_TMR_FIQ_ENABLE_P, 0);
+		aic_vm_timer_mask(VM_TMR_FIQ_ENABLE_V | VM_TMR_FIQ_ENABLE_P, true);
 
 		/* vGIC maintenance IRQ */
 		sysreg_clear_set_s(SYS_ICH_HCR_EL2, ICH_HCR_EL2_En, 0);

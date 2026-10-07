@@ -473,6 +473,7 @@ struct tb_regs_port_header {
 
 /* PCIe adapter registers */
 #define ADP_PCIE_CS_0				0x00
+#define ADP_PCIE_CS_0_LA			BIT(16)
 #define ADP_PCIE_CS_0_PE			BIT(31)
 #define ADP_PCIE_CS_1				0x01
 #define ADP_PCIE_CS_1_EE			BIT(0)

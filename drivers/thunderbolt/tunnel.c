@@ -324,9 +324,46 @@ static int tb_pci_set_ext_encapsulation(struct tb_tunnel *tunnel, bool enable)
 	return 0;
 }
 
+static int tb_pci_pre_activate(struct tb_tunnel *tunnel)
+{
+	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
+
+	if (ops && ops->pci_tunnel_pre_activate)
+		return ops->pci_tunnel_pre_activate(tunnel->tb->nhi);
+	return 0;
+}
+
+static int tb_pci_post_activate(struct tb_tunnel *tunnel)
+{
+	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
+
+	if (ops && ops->pci_tunnel_post_activate)
+		return ops->pci_tunnel_post_activate(tunnel->tb->nhi);
+	return 0;
+}
+
+static int tb_pci_deactivate(struct tb_tunnel *tunnel)
+{
+	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
+
+	if (ops && ops->pci_tunnel_deactivate)
+		return ops->pci_tunnel_deactivate(tunnel->tb->nhi);
+	return 0;
+}
+
 static int tb_pci_activate(struct tb_tunnel *tunnel, bool activate)
 {
 	int res;
+
+	/*
+	 * Let the host drop its view of the tunnel before the paths go, while
+	 * what is behind it can still be reached.
+	 */
+	if (!activate) {
+		res = tb_pci_deactivate(tunnel);
+		if (res)
+			return res;
+	}
 
 	if (activate) {
 		res = tb_pci_set_ext_encapsulation(tunnel, activate);
@@ -341,17 +378,18 @@ static int tb_pci_activate(struct tb_tunnel *tunnel, bool activate)
 	if (res)
 		return res;
 
-
 	if (activate) {
 		res = tb_pci_port_enable(tunnel->src_port, activate);
 		if (res)
 			return res;
+
+		return tb_pci_post_activate(tunnel);
 	} else {
 		/* Downstream router could be unplugged */
 		tb_pci_port_enable(tunnel->dst_port, activate);
 	}
 
-	return activate ? 0 : tb_pci_set_ext_encapsulation(tunnel, activate);
+	return tb_pci_set_ext_encapsulation(tunnel, activate);
 }
 
 static int tb_pci_init_credits(struct tb_path_hop *hop)
@@ -429,6 +467,7 @@ struct tb_tunnel *tb_tunnel_discover_pci(struct tb *tb, struct tb_port *down,
 		return NULL;
 
 	tunnel->activate = tb_pci_activate;
+	tunnel->pre_activate = tb_pci_pre_activate;
 	tunnel->src_port = down;
 
 	/*
@@ -506,6 +545,7 @@ struct tb_tunnel *tb_tunnel_alloc_pci(struct tb *tb, struct tb_port *up,
 		return NULL;
 
 	tunnel->activate = tb_pci_activate;
+	tunnel->pre_activate = tb_pci_pre_activate;
 	tunnel->src_port = down;
 	tunnel->dst_port = up;
 
@@ -2226,24 +2266,40 @@ struct tb_tunnel *tb_tunnel_discover_usb3(struct tb *tb, struct tb_port *down,
 	if (!tb_route(down->sw)) {
 		int ret;
 
-		/*
-		 * Read the initial bandwidth allocation for the first
-		 * hop tunnel.
-		 */
-		ret = usb4_usb3_port_allocated_bandwidth(down,
-			&tunnel->allocated_up, &tunnel->allocated_down);
-		if (ret)
-			goto err_deactivate;
+		tunnel->consumed_bandwidth = tb_usb3_consumed_bandwidth;
+
+		if (down->sw->no_usb3_bw_alloc) {
+			/*
+			 * The host router does not implement the bandwidth
+			 * allocation registers and nothing can be read back
+			 * here. Book 90% of the maximum link rate in software
+			 * instead.
+			 */
+			ret = tb_usb3_max_link_rate(tunnel->dst_port, down);
+			if (ret < 0)
+				goto err_deactivate;
+
+			tunnel->allocated_up = ret * 90 / 100;
+			tunnel->allocated_down = tunnel->allocated_up;
+		} else {
+			/*
+			 * Read the initial bandwidth allocation for the first
+			 * hop tunnel.
+			 */
+			ret = usb4_usb3_port_allocated_bandwidth(down,
+				&tunnel->allocated_up, &tunnel->allocated_down);
+			if (ret)
+				goto err_deactivate;
+
+			tunnel->pre_activate = tb_usb3_pre_activate;
+			tunnel->release_unused_bandwidth =
+				tb_usb3_release_unused_bandwidth;
+			tunnel->reclaim_available_bandwidth =
+				tb_usb3_reclaim_available_bandwidth;
+		}
 
 		tb_tunnel_dbg(tunnel, "currently allocated bandwidth %d/%d Mb/s\n",
 			      tunnel->allocated_up, tunnel->allocated_down);
-
-		tunnel->pre_activate = tb_usb3_pre_activate;
-		tunnel->consumed_bandwidth = tb_usb3_consumed_bandwidth;
-		tunnel->release_unused_bandwidth =
-			tb_usb3_release_unused_bandwidth;
-		tunnel->reclaim_available_bandwidth =
-			tb_usb3_reclaim_available_bandwidth;
 	}
 
 	tb_tunnel_dbg(tunnel, "discovered\n");
@@ -2323,12 +2379,15 @@ struct tb_tunnel *tb_tunnel_alloc_usb3(struct tb *tb, struct tb_port *up,
 		tunnel->allocated_up = min(max_rate, max_up);
 		tunnel->allocated_down = min(max_rate, max_down);
 
-		tunnel->pre_activate = tb_usb3_pre_activate;
 		tunnel->consumed_bandwidth = tb_usb3_consumed_bandwidth;
-		tunnel->release_unused_bandwidth =
-			tb_usb3_release_unused_bandwidth;
-		tunnel->reclaim_available_bandwidth =
-			tb_usb3_reclaim_available_bandwidth;
+
+		if (!down->sw->no_usb3_bw_alloc) {
+			tunnel->pre_activate = tb_usb3_pre_activate;
+			tunnel->release_unused_bandwidth =
+				tb_usb3_release_unused_bandwidth;
+			tunnel->reclaim_available_bandwidth =
+				tb_usb3_reclaim_available_bandwidth;
+		}
 	}
 
 	return tunnel;
