@@ -7,7 +7,7 @@
 use crate::{
     alloc::flags::*,
     bindings,
-    error::{to_result, Result},
+    error::{code::EINVAL, to_result, Result},
     sync::{new_mutex, Arc, Mutex, UniqueArc},
     types::Opaque,
 };
@@ -17,7 +17,7 @@ use crate::prelude::KBox;
 
 use core::{
     marker::{PhantomData, PhantomPinned},
-    ops::Deref,
+    ops::{Deref, Range},
     pin::Pin,
 };
 
@@ -161,6 +161,40 @@ pub struct Allocator<A: AllocInner<T>, T> {
 }
 
 impl<A: AllocInner<T>, T> Allocator<A, T> {
+    /// Return the first allocator reservation intersecting an address range.
+    /// Unlike a page-table walk, this includes unmapped guard space retained
+    /// inside a node. The interval query and its result are protected by the
+    /// allocator mutex; no probe node is inserted into the live VA space.
+    pub fn first_overlap(&self, range: Range<u64>) -> Result<Option<Range<u64>>> {
+        if range.start >= range.end {
+            return Err(EINVAL);
+        }
+        let guard = self.mm.lock();
+        // The DRM interval query requires both endpoints to lie inside its
+        // allocator. head_node is the end sentinel; its wrapping size is the
+        // negated allocator span.
+        let head = unsafe { &(*guard.0.get()).head_node };
+        let allocator_start = head.start.wrapping_add(head.size);
+        if range.start < allocator_start || range.end > head.start {
+            return Err(EINVAL);
+        }
+        // SAFETY: The allocator is initialized for the lifetime of `self`.
+        // Its mutex prevents node removal while the returned pointer is read.
+        // drm_mm returns its end sentinel when no interval intersects.
+        let node = unsafe {
+            bindings::__drm_mm_interval_first(
+                guard.0.get(), range.start, range.end - 1,
+            )
+        };
+        // SAFETY: drm_mm_interval_first returns a valid node or the allocator
+        // end sentinel, both of which remain live while `guard` is held.
+        let node = unsafe { node.as_ref().ok_or(EINVAL)? };
+        if node.start >= range.end {
+            return Ok(None);
+        }
+        Ok(Some(node.start..node.start.saturating_add(node.size)))
+    }
+
     /// Create a new range allocator for the given start and size range of addresses.
     ///
     /// The user may optionally provide an inner object representing allocator state, which will

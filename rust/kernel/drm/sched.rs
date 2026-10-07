@@ -11,7 +11,6 @@ use crate::{
     prelude::*,
     sync::{Arc, UniqueArc},
     time::{self, msecs_to_jiffies},
-    types::Opaque,
 };
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
@@ -25,10 +24,7 @@ pub enum Status {
     Nominal = bindings::drm_gpu_sched_stat_DRM_GPU_SCHED_STAT_RESET,
     /// Device is no longer available
     NoDevice = bindings::drm_gpu_sched_stat_DRM_GPU_SCHED_STAT_ENODEV,
-    /// The job is not hung, or the driver dealt with the timeout without a scheduler reset.
-    ///
-    /// The job goes back to the pending list and the timeout is rearmed. The job is freed once
-    /// it has finished, as usual.
+    /// Reinsert the job and rearm its timeout without resetting the scheduler.
     NoHang = bindings::drm_gpu_sched_stat_DRM_GPU_SCHED_STAT_NO_HANG,
 }
 
@@ -47,12 +43,20 @@ pub enum Priority {
 
 /// Trait to be implemented by driver job objects.
 pub trait JobImpl: Sized {
-    /// Reconsider a timeout before the backend starts recovery. Returning true
-    /// reinserts this job and rearms its timeout without changing its fences.
-    /// The callback must not stop or restart the scheduler.
-    fn false_timeout(_job: &mut Job<Self>) -> bool {
-        false
-    }
+    /// Handle a scoped timeout without resetting the C scheduler.
+    ///
+    /// The backend must settle/quarantine its exact hardware work, or retain
+    /// that owner until an in-progress host transaction can classify it. It
+    /// must not invoke drm_sched_stop/start or replay scheduler jobs. The core
+    /// reinserts the detached guilty job through NO_HANG, preserving every
+    /// parent callback and the backend's actual success/error fence result.
+    const MANAGED_TIMEOUT_RECOVERY: bool = false;
+
+    /// Reconsider a timeout before stopping the scheduler or settling fences.
+    /// Returning true asks the core to reinsert the retained job and rearm.
+    /// The backend must not stop/start the scheduler from this hook.
+    fn false_timeout(_job: &mut Job<Self>) -> bool { false }
+
 
     /// Called when the scheduler is considering scheduling this job next, to get another Fence
     /// for this job to block on. Once it returns None, run() may be called.
@@ -66,9 +70,6 @@ pub trait JobImpl: Sized {
     fn run(job: &mut Job<Self>) -> Result<Option<Fence>>;
 
     /// Called when a job has taken too long to execute, to trigger GPU recovery.
-    ///
-    /// A driver that handles timeouts without a scheduler reset returns [`Status::NoHang`].
-    /// [`Job::is_finished`] tells whether the job completed after the timeout fired.
     ///
     /// This method is called in a workqueue context.
     fn timed_out(job: &mut Job<Self>) -> Status;
@@ -112,19 +113,49 @@ unsafe extern "C" fn timedout_job_cb<T: JobImpl>(
     // SAFETY: All of our jobs are Job<T>.
     let p = unsafe { crate::container_of!(sched_job, Job<T>, job) as *mut Job<T> };
 
-    // SAFETY: The timeout worker retains this detached Job<T> until this
-    // callback returns, including when its parent fence signals concurrently.
+    // The C timeout worker owns this job outside pending_list until return.
+    // Free work cannot release it even if its parent signals concurrently.
+    if T::MANAGED_TIMEOUT_RECOVERY {
+        let finished = unsafe { addr_of_mut!((*(*sched_job).s_fence).finished) };
+        if unsafe { bindings::dma_fence_get_status(finished) } != 0 {
+            return bindings::drm_gpu_sched_stat_DRM_GPU_SCHED_STAT_NO_HANG;
+        }
+    }
+    // SAFETY: the C core retains the detached job across both callbacks.
     if T::false_timeout(unsafe { &mut *p }) {
         return bindings::drm_gpu_sched_stat_DRM_GPU_SCHED_STAT_NO_HANG;
     }
-    // SAFETY: The same retained job remains valid after the first callback.
-    T::timed_out(unsafe { &mut *p }) as bindings::drm_gpu_sched_stat
+    let status = T::timed_out(unsafe { &mut *p });
+    if T::MANAGED_TIMEOUT_RECOVERY {
+        // This is scoped fence handling, not C reset recovery. stop would
+        // detach and discard healthy parents; start would cancel those jobs.
+        // NO_HANG reinserts the exact job and queues free work if it completed
+        // during the callback. It does not change the parent's error or replay
+        // work. A deferred exact owner remains eligible for its real callback.
+        bindings::drm_gpu_sched_stat_DRM_GPU_SCHED_STAT_NO_HANG
+    } else {
+        status as bindings::drm_gpu_sched_stat
+    }
 }
 
 unsafe extern "C" fn free_job_cb<T: JobImpl>(sched_job: *mut bindings::drm_sched_job) {
     // SAFETY: All of our jobs are Job<T>.
     let p = unsafe { crate::container_of!(sched_job, Job<T>, job) as *mut Job<T> };
 
+    // Fault-only ownership witness: this callback is where the core returns
+    // ownership of an errored job. A signalled fence alone is not that proof.
+    // SAFETY: A job reaching free_job has a live scheduler fence; its error
+    // was fixed before signal and the core's completion callback has finished.
+    if T::MANAGED_TIMEOUT_RECOVERY
+        && unsafe { (*(*sched_job).s_fence).finished.error } == ETIMEDOUT.to_errno()
+    {
+        // Use numeric identity: the fmt adapter borrows arguments, and
+        // Pointer formatting of that reference can print a stack address.
+        pr_info!("DRM Rust scheduler: released timed-out job={:#x} context={} seqno={}\n",
+            sched_job as usize,
+            unsafe { (*(*sched_job).s_fence).finished.context },
+            unsafe { (*(*sched_job).s_fence).finished.seqno });
+    }
     // Convert the job back to a Box and drop it
     // SAFETY: All of our Job<T>s are created inside a box.
     unsafe { drop(KBox::from_raw(p)) };
@@ -133,71 +164,70 @@ unsafe extern "C" fn free_job_cb<T: JobImpl>(sched_job: *mut bindings::drm_sched
 unsafe extern "C" fn cancel_job_cb<T: JobImpl>(sched_job: *mut bindings::drm_sched_job) {
     // SAFETY: All of our jobs are Job<T>.
     let p = unsafe { crate::container_of!(sched_job, Job<T>, job) as *mut Job<T> };
-    // SAFETY: A job on the pending list has a valid scheduler fence.
+
+    // fini has stopped/synchronized submission and timeout workers. A parent
+    // callback can still run on the device completion thread. The scheduler
+    // fence retains the parent reference while we remove its callback under
+    // the parent's lock; that also waits for an already-running callback.
     let s_fence = unsafe { (*sched_job).s_fence };
-    // SAFETY: `s_fence` is valid and holds a reference to its parent, if any.
     let parent = unsafe { (*s_fence).parent };
-    // SAFETY: `s_fence` is valid.
-    let finished = unsafe { addr_of_mut!((*s_fence).finished) };
+    let removed_parent_callback = if !parent.is_null() {
+        // SAFETY: run_job installed (or attempted to install on an already
+        // signaled parent) this callback before fini synchronized submit work.
+        unsafe { bindings::dma_fence_remove_callback(parent, addr_of_mut!((*sched_job).cb)) }
+    } else { false };
+    let finish_here = removed_parent_callback || (parent.is_null()
+        && unsafe { bindings::dma_fence_get_status(addr_of_mut!((*s_fence).finished)) == 0 });
+    // Null/error run_job calls job_done before submit work returns, so its
+    // finished fence is already signaled. NULL+unfinished can instead survive
+    // a legacy backend's prior reset stop: C stop dropped the parent and its
+    // credits, but not its score. Do not subtract those credits twice.
 
-    // drm_sched_fini() has stopped the scheduler workers, but the hardware fence can still
-    // signal concurrently. Fence callbacks run under the fence lock, so removing ours either
-    // disarms it or waits until it has completed the job.
-    let callback_removed = !parent.is_null()
-        // SAFETY: run_job() armed `cb` on `parent` before the submission worker was stopped.
-        && unsafe { bindings::dma_fence_remove_callback(parent, addr_of_mut!((*sched_job).cb)) };
-
-    // A job without a parent either completed when run_job() returned, or had its parent
-    // detached by drm_sched_stop(), which also returned its credits.
-    let complete_here = callback_removed
-        // SAFETY: `finished` is a valid, initialized fence.
-        || (parent.is_null() && unsafe { bindings::dma_fence_get_status(finished) } == 0);
-
-    // SAFETY: All of our jobs are Job<T>.
+    // SAFETY: cancellation cannot race a scheduler callback using this job
+    // after the removal/parent-lock synchronization above. The backend must
+    // retain any still-hardware-owned resources independently of Job storage.
     T::cancel(unsafe { &mut *p });
 
-    if complete_here {
-        // Account for the job exactly as drm_sched_job_done() would have.
-        //
-        // SAFETY: The job belongs to the scheduler being torn down, which is still valid.
+    if finish_here {
+        // Match drm_sched_job_done's accounting exactly once, only when its
+        // callback did not do it. Submission/free work is stopped, so fini
+        // itself unlinks and frees this job; no workqueue rearm is appropriate.
+        let sched = unsafe { (*sched_job).sched };
         unsafe {
-            let sched = (*s_fence).sched;
-            if callback_removed {
-                bindings::atomic_sub(
-                    (*sched_job).credits as i32,
-                    addr_of_mut!((*sched).credit_count),
-                );
+            if removed_parent_callback {
+                bindings::atomic_sub((*sched_job).credits as i32,
+                    addr_of_mut!((*sched).credit_count));
             }
-            bindings::atomic_dec((*sched).score);
+            bindings::atomic_sub(1, (*sched).score);
         }
-
-        // SAFETY: `finished` is a valid fence.
-        let fence = unsafe { Fence::get_raw(finished) };
+        let fence = unsafe { Fence::get_raw(addr_of_mut!((*s_fence).finished)) };
         fence.set_error(ECANCELED);
-        fence.signal();
+        let _ = fence.signal();
     }
+    // Do not clear/put parent here: s_fence still owns that reference and its
+    // normal release path drops it. A completed callback's result is retained.
 }
 
 /// A DRM scheduler job.
 pub struct Job<T: JobImpl> {
     job: bindings::drm_sched_job,
     inner: T,
-    // Destroying an entity can leave its queued jobs to deferred work that still dereferences
-    // `job->sched` after the scheduler has been finalized. Keep the scheduler allocation alive
-    // for as long as any job references it; this does not delay finalization.
+    // Entity destruction can leave kill_jobs_work queued on the system
+    // workqueue or waiting for a dependency. That work still dereferences
+    // job->sched->ops after drm_sched_fini has stopped the scheduler workers.
+    // Retain only the allocation: retaining SchedulerOwner here would keep
+    // fini from running while pending jobs still need its cancellation.
     _scheduler: Arc<SchedulerInner<T>>,
 }
 
 impl<T: JobImpl> Job<T> {
-    /// Returns whether the job has finished, successfully or not.
+    /// Returns whether an armed job has finished, successfully or not.
     pub fn is_finished(&self) -> bool {
-        // The finished fence is initialized when the job is armed, which also assigns its
-        // scheduler.
         if self.job.sched.is_null() {
             return false;
         }
-
-        // SAFETY: The job is armed, so its scheduler fence is valid and initialized.
+        // SAFETY: An armed job has an initialized scheduler fence, retained
+        // for its lifetime, including while the timeout worker owns the job.
         unsafe { bindings::dma_fence_get_status(addr_of_mut!((*self.job.s_fence).finished)) != 0 }
     }
 }
@@ -320,8 +350,8 @@ struct EntityInner<T: JobImpl> {
 
 impl<T: JobImpl> Drop for EntityInner<T> {
     fn drop(&mut self) {
-        // SAFETY: The EntityInner is initialized. This will cancel/free all jobs, possibly from
-        // deferred work. Each job keeps the scheduler allocation alive until it is freed.
+        // SAFETY: The EntityInner is initialized. Jobs removed from the entity
+        // may still await kill_jobs_work; each retains the scheduler allocation.
         unsafe { bindings::drm_sched_entity_destroy(&mut self.entity) };
     }
 }
@@ -340,7 +370,7 @@ impl<T: JobImpl> Entity<T> {
         let mut entity: KBox<MaybeUninit<EntityInner<T>>> =
             KBox::new_uninit(GFP_KERNEL | __GFP_ZERO)?;
 
-        let mut sched_ptr = sched.0.allocation.sched.get();
+        let mut sched_ptr = &sched.0.allocation.sched as *const _ as *mut _;
 
         // SAFETY: The Box is allocated above and valid.
         unsafe {
@@ -384,9 +414,13 @@ impl<T: JobImpl> Entity<T> {
         // SAFETY: The Box pointer is valid, and this initializes the inner member.
         unsafe { addr_of_mut!((*job.as_mut_ptr()).inner).write(inner) };
 
-        // SAFETY: The Box pointer is valid, and this initializes the scheduler reference.
+        // SAFETY: The job allocation is valid and this initializes its last
+        // field. Arc::clone is infallible and the entity still owns the live
+        // scheduler, so every successfully initialized job retains its C
+        // callback target before it can be armed or submitted.
         unsafe {
-            addr_of_mut!((*job.as_mut_ptr())._scheduler).write(self.0.sched.allocation.clone())
+            addr_of_mut!((*job.as_mut_ptr())._scheduler)
+                .write(self.0.as_ref().get_ref().sched.allocation.clone())
         };
 
         // SAFETY: All fields of the Job<T> are now initialized.
@@ -394,32 +428,35 @@ impl<T: JobImpl> Entity<T> {
     }
 }
 
-/// DRM scheduler allocation, kept alive by the scheduler owner and by every job.
+/// DRM scheduler allocation, retained by live owners and deferred job callbacks.
 pub struct SchedulerInner<T: JobImpl> {
-    sched: Opaque<bindings::drm_gpu_scheduler>,
+    sched: bindings::drm_gpu_scheduler,
     _p: PhantomData<T>,
 }
 
-// SAFETY: TODO
-unsafe impl<T: JobImpl> Sync for SchedulerInner<T> {}
-// SAFETY: TODO
-unsafe impl<T: JobImpl> Send for SchedulerInner<T> {}
-
-/// Owner of an initialized DRM scheduler, shared by the scheduler handle and its entities.
-///
-/// Jobs only reference the allocation, so that pending jobs cannot keep the scheduler from
-/// being finalized.
+// Only public scheduler/entity handles keep this owner alive. Jobs retain
+// SchedulerInner instead, so outstanding work cannot prevent finalization.
 struct SchedulerOwner<T: JobImpl> {
     allocation: Arc<SchedulerInner<T>>,
 }
 
 impl<T: JobImpl> Drop for SchedulerOwner<T> {
     fn drop(&mut self) {
-        // SAFETY: The scheduler is valid. drm_sched_fini() stops the scheduler workers, then
-        // cancels and frees all remaining jobs through `cancel_job_cb()`.
-        unsafe { bindings::drm_sched_fini(self.allocation.sched.get()) };
+        // SAFETY: fini stops submission, synchronizes the timeout worker and
+        // cancels/frees remaining jobs through our synchronized cancel callback.
+        // The C contract explicitly prohibits drm_sched_stop before fini.
+        // Deferred entity-kill callbacks are on a different workqueue and may
+        // survive this call. Their job guards retain allocation through cleanup.
+        unsafe {
+            bindings::drm_sched_fini(addr_of!(self.allocation.sched).cast_mut())
+        };
     }
 }
+
+// SAFETY: TODO
+unsafe impl<T: JobImpl> Sync for SchedulerInner<T> {}
+// SAFETY: TODO
+unsafe impl<T: JobImpl> Send for SchedulerInner<T> {}
 
 /// A DRM Scheduler
 pub struct Scheduler<T: JobImpl>(Arc<SchedulerOwner<T>>);
@@ -444,16 +481,15 @@ impl<T: JobImpl> Scheduler<T> {
     ) -> Result<Scheduler<T>> {
         let mut sched: UniqueArc<MaybeUninit<SchedulerInner<T>>> =
             UniqueArc::new_uninit(GFP_KERNEL)?;
-        // Allocate the owner up front: nothing may fail once the scheduler is initialized.
-        let owner: UniqueArc<MaybeUninit<SchedulerOwner<T>>> = UniqueArc::new_uninit(GFP_KERNEL)?;
-
-        // SAFETY: `sched` was just allocated and is valid for writes.
-        let sched_ptr = Opaque::cast_into(unsafe { addr_of!((*sched.as_mut_ptr()).sched) });
+        // Allocate the owner before starting C workers: no fallible allocation
+        // may abandon an initialized scheduler without running drm_sched_fini.
+        let owner: UniqueArc<MaybeUninit<SchedulerOwner<T>>> =
+            UniqueArc::new_uninit(GFP_KERNEL)?;
 
         // SAFETY: zero sched->sched_rq as drm_sched_init() uses it to exit early withoput initialisation
         // TODO: allocate sched zzeroed instead
         unsafe {
-            (*sched_ptr).sched_rq = core::ptr::null_mut();
+            (*sched.as_mut_ptr()).sched.sched_rq = core::ptr::null_mut();
         };
 
         let init_ops = bindings::drm_sched_init_args {
@@ -471,9 +507,15 @@ impl<T: JobImpl> Scheduler<T> {
 
         // SAFETY: The drm_sched pointer is valid and pinned as it was just allocated above.
         //         `device` is valid by its type invarants
-        to_result(unsafe { bindings::drm_sched_init(sched_ptr, addr_of!(init_ops)) })?;
+        to_result(unsafe {
+            bindings::drm_sched_init(
+                addr_of_mut!((*sched.as_mut_ptr()).sched),
+                addr_of!(init_ops),
+            )
+        })?;
 
-        // SAFETY: All fields of SchedulerInner are now initialized.
+        // SAFETY: C initialized sched and PhantomData has no stored state.
+        // No fallible operation follows successful initialization.
         let allocation = unsafe { sched.assume_init() }.into();
         Ok(Scheduler(owner.write(SchedulerOwner { allocation }).into()))
     }
