@@ -505,9 +505,12 @@ impl Runtime {
         self.inner.boot_step = crate::t8122_start::BootStep::Publish;
         let result = self.boot_inner(pdev);
         if let Err(error) = result {
-            // Log the firmware readiness words on every boot failure, so the verdict's "see M3
-            // firmware readiness" always has a line to point at.
-            if is_t8122 {
+            // On T8122, log the firmware readiness words on every boot failure, so the verdict's
+            // "see M3 firmware readiness" always has a line to point at. The ready-wait timeout in
+            // boot_inner already logs them (on every SoC, as in 12.0), so skip that case here.
+            let logged = self.inner.boot_step == crate::t8122_start::BootStep::AwaitReady
+                && error == ETIMEDOUT;
+            if is_t8122 && !logged {
                 let inner: &mut Inner = &mut *self.inner;
                 let _ = inner.config.log_ready(&inner.drm);
             }
@@ -533,6 +536,7 @@ impl Runtime {
         let start = Instant::<Monotonic>::now();
         while !self.inner.config.ready()? {
             if start.elapsed() >= Delta::from_secs(2) || !self.inner.state.healthy() {
+                let inner: &mut Inner=&mut *self.inner;let _=inner.config.log_ready(&inner.drm);
                 return Err(ETIMEDOUT);
             }
             fsleep(Delta::from_millis(1));
