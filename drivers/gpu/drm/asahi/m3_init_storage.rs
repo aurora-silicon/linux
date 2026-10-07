@@ -139,6 +139,49 @@ pub(crate) fn validate_iomaps(iomaps: &[IoMap]) -> Result<(), Error> {
     Ok(())
 }
 
+/// Firmware VA of the first runtime IO map.
+pub(crate) const IOMAP_BASE: u64 = 0xfffffc2068000000;
+
+/// The runtime IO maps of `mappings` (HwDataB slot, physical address, total size, element size,
+/// writable), laid out as [`T6030_IOMAPS`] is: each map is the 16 KiB pages that hold its
+/// mapping, with the subpage offset kept, and starts at the end of the previous map plus a
+/// 16 KiB gap, the first at `base`.
+pub(crate) const fn pack_iomaps<const N: usize>(
+    mappings: &[(usize, u64, u32, u32, bool); N],
+    base: u64,
+) -> [IoMap; N] {
+    let mut maps = [IoMap { slot: 0, physical: 0, size: 0, address: 0, offset: 0 }; N];
+    let mut address = base;
+    let mut i = 0;
+    while i < N {
+        let (slot, physical, total, _, _) = mappings[i];
+        let offset = (physical & 0x3fff) as usize;
+        let size = (offset + total as usize + 0x3fff) & !0x3fff;
+        maps[i] = IoMap { slot, physical: physical & !0x3fff, size, address, offset };
+        address += size as u64 + 0x4000;
+        i += 1;
+    }
+    maps
+}
+
+/// Whether two IO-map tables are the same, entry by entry.
+pub(crate) const fn same_iomaps(a: &[IoMap], b: &[IoMap]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        let (x, y) = (a[i], b[i]);
+        if x.slot != y.slot || x.physical != y.physical || x.size != y.size
+            || x.address != y.address || x.offset != y.offset
+        {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// The T6030 runtime's IO maps (`m3_soc::T6030.iomaps`), one per entry of
 /// `m3_adt_config::T6030_IO_MAPPINGS`: the page-aligned CPU physical block and
 /// the fixed firmware VA of each slot.
@@ -197,6 +240,37 @@ mod iomap_tests {
         maps[1].address = allocation(HARDWARE_DATA).unwrap().address & !0x3fff;
         assert!(validate_iomaps(&maps).is_err());
         assert!(validate_iomaps(&[]).is_err());
+    }
+
+    #[test]
+    fn packing_keeps_subpage_offsets_and_leaves_a_page_between_maps() {
+        let maps = pack_iomaps(
+            &[
+                (0, 0x2_90d0_0000, 0x10_4000, 0x10_4000, true),
+                (1, 0x2_0e10_1000, 1, 1, false),
+                (10, 0x2_90d0_d000, 0x1000, 0x1000, true),
+                (11, 0x2_2000_0000, 0xb_0000, 0x5_8000, true),
+            ],
+            IOMAP_BASE,
+        );
+        assert_eq!(validate_iomaps(&maps), Ok(()));
+        let expect = [
+            (0, 0x2_90d0_0000, 0x10_4000, IOMAP_BASE, 0),
+            (1, 0x2_0e10_0000, 0x4000, IOMAP_BASE + 0x10_8000, 0x1000),
+            (10, 0x2_90d0_c000, 0x4000, IOMAP_BASE + 0x11_0000, 0x1000),
+            (11, 0x2_2000_0000, 0xb_0000, IOMAP_BASE + 0x11_8000, 0),
+        ];
+        for (io, (slot, physical, size, address, offset)) in maps.iter().zip(expect) {
+            assert_eq!((io.slot, io.physical, io.size, io.address, io.offset),
+                (slot, physical, size, address, offset));
+        }
+        assert!(maps[1].covers(0x2_0e10_1000, 1));
+        assert!(maps[2].covers(0x2_90d0_d000, 0x1000));
+        assert!(same_iomaps(&maps, &maps));
+        assert!(!same_iomaps(&maps, &maps[..3]));
+        let mut moved = maps;
+        moved[3].address += 0x4000;
+        assert!(!same_iomaps(&maps, &moved));
     }
 
     #[test]

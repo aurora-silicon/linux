@@ -106,6 +106,12 @@ const fn same_blocks(mappings: &[IoMapping], cfg: &hw::HwConfig) -> bool {
 
 const _: () = assert!(same_blocks(&T8122_IO_MAPPINGS, &hw::t8122::HWCONFIG_T8122));
 
+// The T6030 IO maps are the packed IO maps of its IO mappings (`storage::pack_iomaps`).
+const _: () = assert!(storage::same_iomaps(
+    &storage::pack_iomaps(&T6030_IO_MAPPINGS, storage::IOMAP_BASE),
+    &storage::T6030_IOMAPS
+));
+
 /// Highest performance state device-tree InitData may use without the driver's thermal limit
 /// (`asahi.m3_thermal=off`), and the runtime cap the thermal limit starts at and falls back to
 /// (the "safe cap"). The InitData's fast-die temperature controller words stay 0, so the
