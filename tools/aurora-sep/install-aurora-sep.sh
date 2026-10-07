@@ -454,6 +454,12 @@ M3_GPU_SCRIPTS=(
 # prefix, for air-gpu-job.sh. Empty: this release has none, and the flag installs the scripts.
 M3_GPU_MESA_PACKAGE=""
 M3_GPU_MESA_PREFIX=""
+# What the Mesa package depends on with a minimum version, as "name>=version". Each must be
+# installed already, at that version or newer, or m3_gpu_mesa_install leaves the package out:
+# its pacman -U must never pull in an upgrade of the C library or the compiler runtime alone.
+M3_GPU_MESA_NEEDS="glibc>=2.43 gcc-libs>=11 spirv-tools>=1:1.4.357.0"
+# 1 once m3_gpu_mesa_install has installed the Mesa package on this run.
+M3_GPU_MESA_DONE=0
 # The handoff is tested with one macOS system-firmware stub only, 14.8.3 (GPU
 # firmware 14.8.3, DCP 14.7), which the Omarchy installer gives every M3. m1n1
 # reports the stub's iBoot as asahi,iboot2-version.
@@ -1137,7 +1143,7 @@ m3_gpu_plan() {
     $(this_board) ($(this_soc)). Nothing was installed."
   [[ -z $M3_GPU_MESA_PACKAGE || $M3_GPU_MESA_PACKAGE =~ ^[A-Za-z0-9._+-]+\.pkg\.tar\.zst\ [0-9a-f]{64}$ ]] ||
     die "M3_GPU_MESA_PACKAGE is not \"file sha256\" (a packaging mistake). Nothing was installed."
-  warn "--m3-gpu-experiment: installing the M3 Air GPU experiment's scripts$([[ -n $M3_GPU_MESA_PACKAGE ]] && echo " and Mesa prefix") with the kernel.
+  warn "--m3-gpu-experiment: installing the M3 Air GPU experiment's scripts with the kernel$([[ -n $M3_GPU_MESA_PACKAGE ]] && echo ", and its Mesa prefix once the kernel is in").
     They arm nothing: every boot stays as it is until air-gpu-oneshot.sh arms one."
 }
 
@@ -1149,24 +1155,82 @@ m3_gpu_files() {
   return 0
 }
 
-# After pacman -U (which installed the Mesa package with the kernel): the scripts, what they
-# need, and $STATE/m3-gpu-experiment, which --uninstall reads.
+# After the download loop: keep the Mesa package out of the kernel's pacman -U
+# ("$work"/*.pkg.tar.zst). m3_gpu_mesa_install installs it on its own, after the kernel.
+m3_gpu_set_aside() {
+  if ((M3_GPU_EXPERIMENT)) && [[ -n $M3_GPU_MESA_PACKAGE ]]; then
+    mkdir -p "$work/m3-gpu"
+    mv "$work/${M3_GPU_MESA_PACKAGE%% *}" "$work/m3-gpu/"
+  fi
+  return 0
+}
+
+# After the kernel's pacman -U: the scripts, what they need, and $STATE/m3-gpu-experiment,
+# which --uninstall reads. The Mesa package's line is added only once it is installed.
 m3_gpu_install() {
-  local entry file name record=""
+  local entry file record=""
   ((M3_GPU_EXPERIMENT)) || return 0
   for entry in "${M3_GPU_SCRIPTS[@]}"; do
     file=${entry%% *}
     $sudo install -D -m 0755 "$work/$file" "$M3_GPU_BIN/$file"
     record+="script $file ${entry#* }"$'\n'
   done
-  if [[ -n $M3_GPU_MESA_PACKAGE ]]; then
-    name=$(bsdtar -xOf "$work/${M3_GPU_MESA_PACKAGE%% *}" .PKGINFO 2>/dev/null | sed -n 's/^pkgname = //p' | head -1)
-    [[ -n $name ]] && record+="mesa $name"$'\n'
-  fi
   # air-gpu-job.sh runs its job through Python and the Vulkan loader.
   $sudo pacman -S --needed --noconfirm python vulkan-icd-loader ||
     warn "could not install python and vulkan-icd-loader; air-gpu-job.sh needs them"
   printf '%s' "$record" | $sudo tee "$STATE/m3-gpu-experiment" >/dev/null
+}
+
+# The M3_GPU_MESA_NEEDS packages that are missing or older than their minimum, one
+# "name version (needs min or newer)" per line; nothing when all are new enough.
+m3_gpu_mesa_too_old() {
+  local need name min have order
+  for need in $M3_GPU_MESA_NEEDS; do
+    name=${need%%>=*} min=${need#*>=} order=""
+    have=$(pacman -Q "$name" 2>/dev/null | cut -d' ' -f2) || have=""
+    if [[ -n $have ]]; then order=$(vercmp "$have" "$min" 2>/dev/null) || order=""; fi
+    # vercmp prints -1, 0 or 1.
+    [[ $order =~ ^[0-9]+$ ]] || echo "$name ${have:-not installed} (needs $min or newer)"
+  done
+  return 0
+}
+
+# Once the kernel install is done, on an Air with --m3-gpu-experiment: the G15G Mesa package
+# in a pacman transaction of its own, so a problem with it can't stop the kernel install
+# halfway. It is left out when a package it needs is missing or too old (M3_GPU_MESA_NEEDS),
+# rather than letting it pull an upgrade in. Any failure is reported, and the kernel install
+# stays as it is.
+m3_gpu_mesa_install() {
+  local file name old
+  ((M3_GPU_EXPERIMENT)) && [[ -n $M3_GPU_MESA_PACKAGE ]] && is_m3_air || return 0
+  file=$work/m3-gpu/${M3_GPU_MESA_PACKAGE%% *}
+  old=$(m3_gpu_mesa_too_old)
+  if [[ -n $old ]]; then
+    warn "--m3-gpu-experiment: left out the G15G Mesa prefix, because it needs newer packages than
+    this Mac has: $(paste -sd ';' <<<"$old" | sed 's/;/; /g'). Nothing of it was installed, and the
+    kernel install is complete. Update the system and install them
+    (sudo pacman -Syu glibc gcc-libs spirv-tools), then run this again with --m3-gpu-experiment."
+    return 0
+  fi
+  name=$(bsdtar -xOf "$file" .PKGINFO 2>/dev/null | sed -n 's/^pkgname = //p' | head -1) || name=""
+  if [[ ! $name =~ ^[A-Za-z0-9._+-]+$ ]]; then
+    warn "--m3-gpu-experiment: left out the G15G Mesa prefix: ${file##*/} names no package. The
+    kernel install is complete. Please report it at https://github.com/iconidentify/aurora-linux/issues"
+    return 0
+  fi
+  say "Installing the G15G Mesa prefix ($name) on its own, now that the kernel is in"
+  if ! $sudo pacman -U --noconfirm "$file"; then
+    warn "--m3-gpu-experiment: could not install the G15G Mesa prefix ($name); pacman says why
+    above. The kernel install is complete and stays as it is. To try again, run this again with
+    --m3-gpu-experiment."
+    # An earlier run's copy stays installed: keep it in the record, so --uninstall removes it.
+    if pacman -Q "$name" >/dev/null 2>&1; then
+      echo "mesa $name" | $sudo tee -a "$STATE/m3-gpu-experiment" >/dev/null
+    fi
+    return 0
+  fi
+  echo "mesa $name" | $sudo tee -a "$STATE/m3-gpu-experiment" >/dev/null
+  M3_GPU_MESA_DONE=1
 }
 
 # What the owner reads at the end of an install with the flag, or of a plain run that keeps
@@ -1177,8 +1241,11 @@ m3_gpu_notice() {
     air-gpu-collect.sh and air-gpu-job.sh. Nothing is armed; every boot stays normal until
       sudo air-gpu-oneshot.sh start
     arms the next boot only (sudo air-gpu-oneshot.sh --check first says whether it can)."
-    if [[ -n $M3_GPU_MESA_PREFIX ]]; then
+    if ((M3_GPU_MESA_DONE)); then
       echo "   The G15G Mesa prefix for air-gpu-job.sh: $M3_GPU_MESA_PREFIX"
+    elif [[ -n $M3_GPU_MESA_PACKAGE ]]; then
+      echo "   The G15G Mesa prefix was not installed (see the warning above), so air-gpu-job.sh has"
+      echo "   nothing to run with yet."
     else
       echo "   This release has no G15G Mesa prefix yet, so air-gpu-job.sh has nothing to run with."
     fi
@@ -1735,6 +1802,7 @@ install_all() {
     fi
     [[ $(sha256sum "$work/$file" | cut -d' ' -f1) == "$sha" ]] || die "$file does not match its published checksum"
   done
+  m3_gpu_set_aside
   if m1n1_for_this_mac; then
     sha=$(m1n1_pkg_sha "$work/${M1N1_PACKAGE%% *}")
     [[ $sha == "$M1N1_BIN_SHA" ]] ||
@@ -1852,6 +1920,7 @@ install_all() {
   $sudo systemctl daemon-reload
   sep_policy
   if is_neo; then neo_radio_notice; fi
+  m3_gpu_mesa_install
   pacman -Q linux-aurora libfprint aurora-touchid
   echo
   if [[ $M3_MODE == handoff ]] && is_m3_air && [[ $M3_AIR_DISPLAY_HANDOFF == 1 ]]; then

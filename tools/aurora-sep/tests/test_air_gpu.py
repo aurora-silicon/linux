@@ -1230,23 +1230,109 @@ class GpuExperimentFlagTest(Base):
         self.assertFalse(self.bin.exists())
         self.assertNotIn("pacman -U", self.log())
 
-    def test_the_mesa_package(self):
-        self.mac("j613")
+    def mesa(self):
         name = "mesa-aurora-g15g-26.3.0-1-aarch64.pkg.tar.zst"
         root = self.tmp / "root-mesa"
-        (root / "opt/aurora-mesa-g15g/lib").mkdir(parents=True)
+        (root / "opt/aurora-mesa-g15g/lib").mkdir(parents=True, exist_ok=True)
         (root / ".PKGINFO").write_text("pkgname = mesa-aurora-g15g\npkgver = 26.3.0-1\n")
         subprocess.run(["bsdtar", "--zstd", "-cf", str(self.tmp / "pkgs" / name), "-C", str(root), ".PKGINFO", "opt"],
                        check=True)
         sha = hashlib.sha256((self.tmp / "pkgs" / name).read_bytes()).hexdigest()
-        proc = self.sh(f'M3_GPU_MESA_PACKAGE="{name} {sha}"\nM3_GPU_MESA_PREFIX=/opt/aurora-mesa-g15g\n'
-                       "M3_TRY=0\ninstall_all")
+        return name, f'M3_GPU_MESA_PACKAGE="{name} {sha}"\nM3_GPU_MESA_PREFIX=/opt/aurora-mesa-g15g\n'
+
+    def transactions(self):
+        return [l for l in self.log().splitlines() if l.startswith("pacman -U ")]
+
+    def test_the_mesa_package(self):
+        self.mac("j613")
+        name, entry = self.mesa()
+        proc = self.sh(entry + "M3_TRY=0\ninstall_all")
         self.assertIn(name, self.downloaded())
-        self.assertRegex(self.log(), rf"pacman -U .*{re.escape(name)}")
+        # In a transaction of its own, after the kernel's and after boot.bin was checked.
+        kernel, mesa = self.transactions()
+        self.assertIn("linux-aurora-", kernel)
+        self.assertNotIn(name, kernel)
+        self.assertRegex(mesa, rf"^pacman -U --noconfirm \S*/m3-gpu/{re.escape(name)}$")
+        log = self.log()
+        self.assertLess(log.index("update-m1n1 frozen"), log.index(mesa))
         self.assertIn("The G15G Mesa prefix for air-gpu-job.sh: /opt/aurora-mesa-g15g", proc.stdout)
         self.assertIn("mesa mesa-aurora-g15g", (self.state / "m3-gpu-experiment").read_text())
         self.sh("uninstall_all", flag=0)
         self.assertIn("pacman -Rns --noconfirm mesa-aurora-g15g", self.log())
+
+    def test_the_mesa_package_on_the_handoff(self):
+        self.mac("j613")
+        name, entry = self.mesa()
+        self.sh(entry + "M3_TRY=1\ninstall_all")
+        kernel, mesa = self.transactions()
+        self.assertNotIn(name, kernel)
+        self.assertIn(name, mesa)
+        log = self.log()
+        self.assertLess(log.index("update-m1n1 rebuilt"), log.index(mesa))
+        self.assertEqual((self.state / "m3-mode").read_text().split()[0], "handoff")
+
+    def test_a_mesa_failure_leaves_the_kernel_install(self):
+        self.mac("j613")
+        name, entry = self.mesa()
+        before = self.boot.read_bytes()
+        self.extra_env["FAKE_FAIL_U_FOR"] = "mesa-*"
+        proc = self.sh(entry + "M3_TRY=0\ninstall_all")
+        self.assertIn("could not install the G15G Mesa prefix (mesa-aurora-g15g)", proc.stderr)
+        self.assertIn("The kernel install is complete and stays as it is", proc.stderr)
+        self.assertIn("was not installed (see the warning above)", proc.stdout)
+        self.assertIn("linux-aurora", (self.fake / "installed").read_text().split())
+        self.assertEqual(self.boot.read_bytes(), before)
+        self.assertTrue((self.bin / "air-gpu-oneshot.sh").exists())
+        rec = (self.state / "m3-gpu-experiment").read_text()
+        self.assertNotIn("mesa ", rec)
+        self.assertIn("script air-gpu-job.sh", rec)
+        # The pin and the boot entry were set up before it.
+        self.assertIn("Done.", proc.stdout)
+
+    def test_a_mesa_failure_keeps_an_earlier_copy_in_the_record(self):
+        self.mac("j613")
+        name, entry = self.mesa()
+        self.sh(entry + "M3_TRY=0\ninstall_all")
+        self.extra_env["FAKE_FAIL_U_FOR"] = "mesa-*"
+        self.sh(entry + "M3_TRY=0\ninstall_all")
+        self.assertIn("mesa mesa-aurora-g15g", (self.state / "m3-gpu-experiment").read_text())
+
+    def test_old_dependencies_leave_mesa_out(self):
+        # The package's versioned dependencies must be installed and new enough already.
+        name, entry = self.mesa()
+        for env, why in [({"FAKE_GLIBC": "2.42+r3-1"}, "glibc 2.42+r3-1 (needs 2.43 or newer)"),
+                         ({"FAKE_GLIBC": ""}, "glibc not installed (needs 2.43 or newer)"),
+                         ({"FAKE_GCC_LIBS": "10.2.0-6"}, "gcc-libs 10.2.0-6 (needs 11 or newer)"),
+                         ({"FAKE_SPIRV_TOOLS": "1:1.4.356.0-2"}, "spirv-tools 1:1.4.356.0-2 (needs 1:1.4.357.0 or newer)"),
+                         # Without the epoch the version is older, whatever its digits.
+                         ({"FAKE_SPIRV_TOOLS": "2025.1-1"}, "spirv-tools 2025.1-1 (needs 1:1.4.357.0 or newer)"),
+                         ({"FAKE_SPIRV_TOOLS": ""}, "spirv-tools not installed (needs 1:1.4.357.0 or newer)")]:
+            with self.subTest(env=env):
+                self.fresh_state()
+                self.mac("j613")
+                before = self.boot.read_bytes()
+                self.extra_env = dict(env)
+                proc = self.sh(entry + "M3_TRY=0\ninstall_all")
+                err = " ".join(proc.stderr.split())
+                self.assertIn("left out the G15G Mesa prefix, because it needs newer packages", err)
+                self.assertIn(why, err)
+                self.assertIn("Nothing of it was installed, and the kernel install is complete", err)
+                # One transaction, the kernel's; nothing of Mesa installed or recorded.
+                self.assertEqual(len(self.transactions()), 1)
+                self.assertNotIn(name, self.transactions()[0])
+                self.assertNotIn("mesa-aurora-g15g", (self.fake / "installed").read_text().split())
+                self.assertNotIn("mesa ", (self.state / "m3-gpu-experiment").read_text())
+                self.assertIn("linux-aurora", (self.fake / "installed").read_text().split())
+                self.assertEqual(self.boot.read_bytes(), before)
+                self.assertIn("was not installed (see the warning above)", proc.stdout)
+
+    def test_dependencies_at_their_minimum_are_enough(self):
+        self.mac("j613")
+        name, entry = self.mesa()
+        self.extra_env = {"FAKE_GLIBC": "2.43-1", "FAKE_GCC_LIBS": "11.1.0-1", "FAKE_SPIRV_TOOLS": "1:1.4.357.0-1"}
+        self.sh(entry + "M3_TRY=0\ninstall_all")
+        self.assertEqual(len(self.transactions()), 2)
+        self.assertIn("mesa mesa-aurora-g15g", (self.state / "m3-gpu-experiment").read_text())
 
     def test_a_malformed_mesa_entry_stops_first(self):
         self.mac("j613")

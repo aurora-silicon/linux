@@ -73,6 +73,11 @@ case $op in
         linux-aurora | linux-asahi) grep -qx "$p" "$FAKE/installed" || exit 1 ;;
         m1n1-aurora) grep -q '^m1n1-aurora' "$FAKE/m1n1" || exit 1 ;;
         m1n1) grep -q '^m1n1-stock' "$FAKE/m1n1" || exit 1 ;;
+        # The Mesa package's versioned dependencies; FAKE_<NAME>="" means not installed.
+        glibc) [[ -n ${FAKE_GLIBC-2.43+r9+g1-1} ]] || exit 1; echo "glibc ${FAKE_GLIBC-2.43+r9+g1-1}"; continue ;;
+        gcc-libs) [[ -n ${FAKE_GCC_LIBS-15.2.1+r22-1} ]] || exit 1; echo "gcc-libs ${FAKE_GCC_LIBS-15.2.1+r22-1}"; continue ;;
+        spirv-tools) [[ -n ${FAKE_SPIRV_TOOLS-1:1.4.357.0-1} ]] || exit 1; echo "spirv-tools ${FAKE_SPIRV_TOOLS-1:1.4.357.0-1}"; continue ;;
+        mesa-*) grep -qx "$p" "$FAKE/installed" || exit 1 ;;
       esac
       echo "$p 1-1"
     done ;;
@@ -83,16 +88,25 @@ case $op in
     exit 0 ;;
   -U)
     if [[ -n ${FAKE_FAIL_U:-} ]]; then echo "error: failed to commit transaction" >&2; exit 1; fi
+    # FAKE_FAIL_U_FOR: a glob; a transaction with a package whose file name matches it fails.
+    for f in "$@"; do
+      case $(basename -- "$f") in ${FAKE_FAIL_U_FOR:-/}) echo "error: failed to commit transaction (fake)" >&2; exit 1 ;; esac
+    done
+    hook=0
     for f in "$@"; do
       [[ $f == -* || $f == 4 ]] && continue
       b=$(basename "$f")
       case $b in
-        m1n1-aurora-*) echo "${b%-aarch64.pkg.tar.zst}" >"$FAKE/m1n1"; bsdtar -xOf "$f" usr/lib/asahi-boot/m1n1.bin >"$FAKE/m1n1.bin" ;;
+        m1n1-aurora-*) echo "${b%-aarch64.pkg.tar.zst}" >"$FAKE/m1n1"; bsdtar -xOf "$f" usr/lib/asahi-boot/m1n1.bin >"$FAKE/m1n1.bin"; hook=1 ;;
         linux-aurora-headers-*) ;;
-        linux-aurora-*) sed -i '/^linux-asahi$/d' "$FAKE/installed"; echo linux-aurora >>"$FAKE/installed" ;;
+        linux-aurora-*) sed -i '/^linux-asahi$/d' "$FAKE/installed"; echo linux-aurora >>"$FAKE/installed"; hook=1 ;;
+        mesa-*) bsdtar -xOf "$f" .PKGINFO | sed -n 's/^pkgname = //p' >>"$FAKE/installed" ;;
       esac
     done
-    update-m1n1 hook ;;
+    # As the real hooks: only a kernel or m1n1 package rebuilds boot.bin.
+    if ((hook)); then update-m1n1 hook; fi ;;
+  -Rns)
+    for p in "$@"; do [[ $p == -* ]] || sed -i "/^$p\$/d" "$FAKE/installed"; done ;;
   -S | -Sy)
     hook=0
     for p in "$@"; do
