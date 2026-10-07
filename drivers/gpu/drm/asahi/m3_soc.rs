@@ -79,7 +79,8 @@ pub(crate) struct MtrMasks {
 pub(crate) struct LeakFuse {
     /// Two cells, value 1 then value 2, encoded as `apple,core-leak-coef` is.
     pub(crate) values: &'static CStr,
-    /// The switch, present with value 1 when the boot loader uses the values.
+    /// The switch: the boot loader uses the values exactly when it holds the string "1" (the
+    /// two bytes `1\0`), the form it copies from its configuration line.
     pub(crate) switch: &'static CStr,
 }
 

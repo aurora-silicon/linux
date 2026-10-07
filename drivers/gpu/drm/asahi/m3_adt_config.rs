@@ -669,7 +669,7 @@ fn leak_fuse(dev: &device::Device, lf: &crate::m3_soc::LeakFuse) -> Result<Optio
     let switch = chosen
         .as_ref()
         .and_then(|c| c.get_property::<KVec<u8>>(lf.switch).ok())
-        .is_some_and(|v| matches!(v.as_slice(), b"1\0" | b"1" | [0, 0, 0, 1]));
+        .is_some_and(|v| v.as_slice() == b"1\0");
     let values: Option<KVec<F32>> = chosen.as_ref().and_then(|c| c.get_property(lf.values).ok());
     // Positive, finite, nonzero.
     let valid = |v: &F32| {
