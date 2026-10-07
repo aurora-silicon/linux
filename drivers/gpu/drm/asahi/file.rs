@@ -71,6 +71,11 @@ impl Drop for Vm {
     fn drop(&mut self) {
         self.shrinker = None;
         self.vm.close_idle_reclaim();
+        if let Some(status) = self.vm.status() {
+            // Retained graphs may keep this status alive; the client's mirror
+            // object must not outlive the client's VM handle.
+            status.release_mirror();
+        }
         if self.vm.status().is_some() {
             // Tracked jobs can outlive their file's VM handle. Their last guard performs
             // these unmaps once no accepted work can still dereference the mappings.

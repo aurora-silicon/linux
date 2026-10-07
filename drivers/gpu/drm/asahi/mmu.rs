@@ -1617,7 +1617,7 @@ impl Vm {
 
     /// Attach a status before sharing a newly created user VM with queues.
     pub(crate) fn with_status(mut self) -> Result<Self> {
-        self.status = Some(Arc::new(crate::g17::status::VmStatus::new(), GFP_KERNEL)?);
+        self.status = Some(Arc::pin_init(crate::g17::status::VmStatus::new(), GFP_KERNEL)?);
         self.lifetime = Some(lifetime::VmLifetime::new()?);
         self.residency = Some(residency::Gate::new()?);
         self.context_bindings = Some(context::ContextBindings::new()?);
