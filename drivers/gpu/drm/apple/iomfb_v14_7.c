@@ -161,6 +161,8 @@ struct apple_dcp_v14 {
 	struct mutex lock;
 	/* The colour matrix the firmware holds matches the CRTC's. */
 	bool ctm_valid;
+	/* The firmware refused a matrix: none is sent until reboot. */
+	bool ctm_disabled;
 	u64 ctm_calls;
 	u32 ctm_status, ctm_get_status;
 	u64 ctm_readback[9];
@@ -2117,8 +2119,9 @@ static int dcp_v14_status_show(struct seq_file *m, void *unused)
 	seq_printf(m, "panel %ux%u\nboot_fb %ux%u stride %u\nclock %llu\n",
 		   v14->panel_width, v14->panel_height, v14->fb_width, v14->fb_height,
 		   v14->stride, v14->clock_rate);
-	seq_printf(m, "ctm valid %d calls %llu setter %#x getter %#x\n", v14->ctm_valid,
-		   v14->ctm_calls, v14->ctm_status, v14->ctm_get_status);
+	seq_printf(m, "ctm valid %d disabled %d calls %llu setter %#x getter %#x\n",
+		   v14->ctm_valid, v14->ctm_disabled, v14->ctm_calls, v14->ctm_status,
+		   v14->ctm_get_status);
 	for (i = 0; i < 9; i++)
 		seq_printf(m, "ctm_readback[%u] %#llx\n", i, v14->ctm_readback[i]);
 	seq_printf(m, "buffers %u bytes %llu\nproperties %u raw %u\nanalytics %llu\n",
@@ -2269,7 +2272,7 @@ static int dcp_v14_ctm_locked(struct apple_dcp_v14 *v14,
 	__le32 status = 0;
 	int i, ret;
 
-	if (!v14->board || !v14->board->ctm_set || !state ||
+	if (!v14->board || !v14->board->ctm_set || !state || v14->ctm_disabled ||
 	    (v14->ctm_valid && !state->color_mgmt_changed &&
 	     !state->mode_changed && !state->active_changed))
 		return 0;
@@ -2289,8 +2292,9 @@ static int dcp_v14_ctm_locked(struct apple_dcp_v14 *v14,
 	v14->ctm_status = le32_to_cpu(status);
 	v14->ctm_valid = false;
 	if (ret || v14->ctm_status) {
-		dev_err(v14->dev, "CTM setter transport=%d status=%#x\n",
+		dev_err(v14->dev, "CTM setter transport=%d status=%#x; colour matrix off until reboot\n",
 			ret, v14->ctm_status);
+		v14->ctm_disabled = true;
 		return ret ? ret : -EIO;
 	}
 	/* Read back before the swap, under the same lock. */
@@ -2300,11 +2304,14 @@ static int dcp_v14_ctm_locked(struct apple_dcp_v14 *v14,
 	v14->ctm_get_status = get_unaligned_le32(readback + 72);
 	for (i = 0; i < 9; i++)
 		v14->ctm_readback[i] = get_unaligned_le64(readback + i * 8);
-	dev_info(v14->dev, "CTM call %llu setter=%#x getter_transport=%d getter=%#x diagonal=%#llx,%#llx,%#llx\n",
+	dev_info_ratelimited(v14->dev, "CTM call %llu setter=%#x getter_transport=%d getter=%#x diagonal=%#llx,%#llx,%#llx\n",
 		 v14->ctm_calls, v14->ctm_status, ret, v14->ctm_get_status,
 		 v14->ctm_readback[0], v14->ctm_readback[4], v14->ctm_readback[8]);
-	if (ret || v14->ctm_get_status)
+	if (ret || v14->ctm_get_status) {
+		dev_err(v14->dev, "CTM getter failed; colour matrix off until reboot\n");
+		v14->ctm_disabled = true;
 		return ret ? ret : -EIO;
+	}
 	v14->ctm_valid = true;
 	return 0;
 }
@@ -2330,10 +2337,12 @@ static int dcp_v14_swap(struct apple_dcp_v14 *v14, const u8 *surface, u64 iova,
 		return -ENOMEM;
 
 	mutex_lock(&v14->lock);
-	ret = dcp_v14_ctm_locked(v14, ctm_state);
-	if (!ret)
-		ret = dcp_v14_call(v14, A(406), start, sizeof(start), started,
-				   sizeof(started), 0);
+	/*
+	 * A colour matrix the firmware refuses costs night light, not the
+	 * frame: present anyway, and stop sending it (ctm_disabled).
+	 */
+	dcp_v14_ctm_locked(v14, ctm_state);
+	ret = dcp_v14_call(v14, A(406), start, sizeof(start), started, sizeof(started), 0);
 	if (!ret && le32_to_cpu(started[1]))
 		ret = -EIO;
 	id = le32_to_cpu(started[0]);
