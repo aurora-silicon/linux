@@ -393,12 +393,15 @@ impl crate::g17::queue::render::Host for Host<'_> {
             .accounting
             .cancel(&qos::View::new(self.firmware.init.qos()?)?, publication)
     }
+    /// Idle descent is held for the whole first install. A point-in-time power
+    /// check let the firmware gate the cores between the host's configuration
+    /// writes while several clients installed their first pairs at once.
     fn install_pair(&mut self, registration: &crate::g17::fw::kick::RenderRegistration) -> Result {
+        if !self.registration_powered {
+            self.firmware.acquire_registration_power()?;
+            self.registration_powered = true;
+        }
         for _ in 0..3 {
-            if !self.firmware.bridge.regs.g17_configuration_powered() {
-                self.firmware.acquire_registration_power()?;
-                self.registration_powered = true;
-            }
             if self
                 .firmware
                 .bridge
