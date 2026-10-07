@@ -177,26 +177,25 @@ impl Registry {
         owner: u64,
         packet: &Arc<Packet>,
         state: u32,
-        dependencies: &mut [crate::g17::fw::kick::KickDependency; 3],
-    ) -> Result<usize> {
-        let mut count = 0;
+    ) -> Result<crate::g17::queue::render::RenderDependencies> {
+        let mut dependencies = crate::g17::queue::render::RenderDependencies::EMPTY;
         let frontier = self.render_prefix(owner, packet)?;
         for dependency in frontier.as_slice() {
-            *dependencies.get_mut(count).ok_or(EOVERFLOW)? = *dependency;
-            count += 1;
+            *dependencies
+                .render
+                .get_mut(dependencies.render_count)
+                .ok_or(EOVERFLOW)? = *dependency;
+            dependencies.render_count += 1;
         }
         if let Some(queue) = self.compute(owner) {
-            if let Some(dependency) = queue.dependency(
+            dependencies.compute = queue.dependency(
                 owner,
                 packet.completion.status(),
                 packet.order.wait_through[1],
                 state,
-            )? {
-                *dependencies.get_mut(count).ok_or(EOVERFLOW)? = dependency;
-                count += 1;
-            }
+            )?;
         }
-        Ok(count)
+        Ok(dependencies)
     }
 }
 
@@ -266,7 +265,7 @@ impl crate::g17::Firmware {
         packet: &Arc<Packet>,
         deferred: &mut DeferredBatch,
     ) -> Result {
-        use crate::g17::{fw::kick::KickDependency, queue::render::PublicationLease};
+        use crate::g17::queue::render::PublicationLease;
         let state = crate::g17::recovery::Memory::recovery_state(&self.init)?;
         if self.recovery.pending() || state != 0 {
             return Err(EAGAIN);
@@ -281,10 +280,7 @@ impl crate::g17::Firmware {
         {
             return Err(EBUSY);
         }
-        let mut dependencies = [KickDependency::ZERO; 3];
-        let count = self
-            .queues
-            .render_dependencies(owner, packet, state, &mut dependencies)?;
+        let dependencies = self.queues.render_dependencies(owner, packet, state)?;
         let pair = self.queues.render.entry(slot)?.pair.as_ref().ok_or(EIO)?;
         let pool = pair.pool().clone();
         let buffer_id = pair.buffer_id();
@@ -303,7 +299,7 @@ impl crate::g17::Firmware {
         let result = self.with_render(usize::from(slot), |pair, host| {
             pair.publish(
                 packet.clone(),
-                &dependencies[..count],
+                &dependencies,
                 lease,
                 host,
                 &mut |event| deferred.push(event),
