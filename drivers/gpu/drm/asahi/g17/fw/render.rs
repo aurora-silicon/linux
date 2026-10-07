@@ -85,6 +85,8 @@ const TILE_CONFIG_BASE: u64 = 0x280;
 const TILE_CONFIG_LAYERED: u64 = 1 << 0;
 const TILE_CONFIG_PROCESS_EMPTY_TILES: u64 = 1 << 16;
 const AUX_FB_FLAGS_BASE: u64 = 0xc000;
+/// The pass rasterizes at most four known primitives (userspace's promise).
+const AUX_FB_FLAGS_FEW_PRIMITIVES: u64 = 1 << 0;
 const AUX_FB_FLAGS_DBIAS_INT: u64 = 1 << 18;
 /// Tiling layer mode: layer count less one, bit 15, and for layered targets
 /// bit 14 plus the empty-tile policy. The second copy keeps only the count and
@@ -178,6 +180,8 @@ pub(crate) struct RenderPass {
     pub(crate) depth_bias_va: u64,
     /// Depth-bias values are integers.
     pub(crate) depth_bias_is_int: bool,
+    /// At most four known primitives; sets the auxiliary framebuffer bit 0.
+    pub(crate) few_primitives: bool,
     /// GPU address of the occlusion-query results, or zero.
     pub(crate) occlusion_query_va: u64,
     /// GPU address of the sampler heap, or zero.
@@ -423,10 +427,13 @@ impl PassWords {
             partial_zls_control |= ZLS_PARTIAL_STENCIL;
         }
 
-        let aux_fb_flags = match pass.depth_bias_is_int {
-            true => AUX_FB_FLAGS_BASE | AUX_FB_FLAGS_DBIAS_INT,
-            false => AUX_FB_FLAGS_BASE,
-        };
+        let mut aux_fb_flags = AUX_FB_FLAGS_BASE;
+        if pass.depth_bias_is_int {
+            aux_fb_flags |= AUX_FB_FLAGS_DBIAS_INT;
+        }
+        if pass.few_primitives {
+            aux_fb_flags |= AUX_FB_FLAGS_FEW_PRIMITIVES;
+        }
         let rsrc_spec = |spec: u64| match pass.rsrc_spec_hi {
             true => spec,
             false => spec & u32::MAX as u64,
