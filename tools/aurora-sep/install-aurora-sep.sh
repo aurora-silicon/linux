@@ -2456,6 +2456,11 @@ m3_mtd_inventory() {
   return 0
 }
 
+# The device names in an m3_mtd_inventory, one per line, sorted.
+m3_mtd_names() {
+  sed -n 's/^mtd[0-9]* name=\([^ ]*\) .*/\1/p' | LC_ALL=C sort
+}
+
 # The reserved-memory node phram makes the adt MTD device from: label adt, compatible phram.
 m3_adt_dt_node() {
   local d
@@ -2482,22 +2487,40 @@ m3_mtd_named() {
   return 0
 }
 
-# Unloads phram if this run loaded it. Returns 1 when that fails.
+# Waits (up to 10 s) until udev has handled every event, such as its own probe of a new MTD
+# node, which holds the node open for a moment.
+m3_udev_settle() {
+  if command -v udevadm >/dev/null; then udevadm settle --timeout=10 2>/dev/null || true; fi
+}
+
+# Unloads phram if this run loaded it: after the reader has stopped and udev has settled, and
+# once more after a short wait if phram is still in use. Never forced. Returns 1 when phram
+# stays loaded; M3_PHRAM_LOADED is then 0 all the same, since the owner was told.
 m3_adt_unload() {
+  local try
   ((M3_PHRAM_LOADED)) || return 0
   if [[ -n $M3_ADT_PID ]]; then
     kill "$M3_ADT_PID" 2>/dev/null || true
     wait "$M3_ADT_PID" 2>/dev/null || true
     M3_ADT_PID=""
   fi
-  $sudo modprobe -r phram 2>/dev/null || return 1
+  for try in 1 2; do
+    m3_udev_settle
+    if $sudo modprobe -r phram 2>/dev/null; then
+      M3_PHRAM_LOADED=0
+      return 0
+    fi
+    ((try == 2)) || sleep 2
+  done
   M3_PHRAM_LOADED=0
+  warn "phram, which this report loaded, is still loaded (modprobe -r phram failed: in use). Unload it later with: sudo modprobe -r phram"
+  return 1
 }
 
 # The report's traps: the reader stopped, phram unloaded if this run loaded it, the work
 # directory removed.
 m3_report_cleanup() {
-  m3_adt_unload || warn "could not unload phram, which this report loaded: run  sudo modprobe -r phram"
+  m3_adt_unload || true
   if [[ -n $M3_PARTIAL ]]; then rm -f "$M3_PARTIAL"; fi
   if [[ -n $M3_WORK ]]; then rm -rf "$M3_WORK"; fi
   M3_WORK=""
@@ -2512,6 +2535,7 @@ m3_report_cleanup() {
 # once its size and device-tree node match the region's and the reader's own --check agrees.
 m3_report_adt() { # DIR
   local out=$1/adt-allowlist.txt log=$1/adt-check.txt reader node want reg mtd dev i rc=0 why="" before after
+  local loaded new
   is_m3 || return 0
   before=$(m3_mtd_inventory)
   printf '== before\n%s\n' "$before" >"$log"
@@ -2544,9 +2568,17 @@ m3_report_adt() { # DIR
       why="no phram module on this kernel (it comes with 12.3), so the ADT was not read"
     else
       M3_PHRAM_LOADED=1
-      echo "loaded: phram" >>"$log"
+      m3_udev_settle
+      loaded=$(m3_mtd_inventory)
+      printf 'loaded: phram\n== with phram\n%s\n' "$loaded" >>"$log"
+      # Exactly the two regions' devices are new: adt and m1n1_stage2.log.
+      new=$(diff <(m3_mtd_names <<<"$before") <(m3_mtd_names <<<"$loaded") | sed -n 's/^> //p' | paste -sd' ') || true
       mtd=$(m3_mtd_named adt)
-      if [[ -z $mtd ]]; then
+      if [[ -z $new ]]; then
+        why="phram made no MTD device, so the ADT was not read"
+      elif [[ $new != "adt m1n1_stage2.log" ]]; then
+        why="phram made the MTD devices $new, not exactly adt and m1n1_stage2.log, so the ADT was not read"
+      elif [[ -z $mtd ]]; then
         why="phram made no MTD device named adt, so the ADT was not read"
       elif [[ $(m3_attr "$M3_SYSFS/class/mtd/$mtd/size") != "$want" ||
         $(m3_mtd_of_node "$mtd") != "$(readlink -f "$node")" ]]; then
@@ -2572,8 +2604,14 @@ m3_report_adt() { # DIR
     fi
   fi
   if [[ -n $why ]]; then echo "$why" >"$out"; echo "stopped: $why" >>"$log"; else echo "read: done" >>"$log"; fi
+  local unload=ok
   if ((M3_PHRAM_LOADED)); then
-    if m3_adt_unload; then echo "unloaded: phram" >>"$log"; else echo "unload FAILED: phram stays loaded" >>"$log"; fi
+    if m3_adt_unload; then
+      echo "unloaded: phram" >>"$log"
+    else
+      unload=failed
+      echo "unload FAILED: phram stays loaded (in use after udev settled, twice; not forced)" >>"$log"
+    fi
   fi
   after=$(m3_mtd_inventory)
   printf '== after\n%s\n' "$after" >>"$log"
@@ -2581,8 +2619,8 @@ m3_report_adt() { # DIR
     echo "restored: yes (the MTD inventory and phram's state match the before-state)" >>"$log"
   else
     echo "restored: NO (the MTD inventory or phram's state differs from the before-state)" >>"$log"
-    warn "the ADT step did not leave the MTD devices or phram as it found them: see adt-check.txt in the
-    report. To unload phram: sudo modprobe -r phram"
+    # A failed unload has said so already, in one line.
+    [[ $unload == failed ]] || warn "the ADT step left the MTD devices or phram not as it found them: see adt-check.txt in the report"
   fi
   return 0
 }

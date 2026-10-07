@@ -108,6 +108,7 @@ STUBS = {
                'alice:x:1000:1000:Alice:/home/alice:/bin/bash\\nbob:x:1001:1001::/home/bob:/bin/bash\\n'
                'nobody:x:65534:65534::/:/usr/bin/nologin\\n"; exit 0; }\nexec /usr/bin/getent "$@"\n'),
     "id": '#!/bin/sh\n[ "$*" = -un ] && { echo alice; exit 0; }\nexec /usr/bin/id "$@"\n',
+    "udevadm": '#!/bin/sh\necho "udevadm $*" >>"$FAKE/log"\n',
     # phram as the kernel's: loading it binds the two reserved-memory regions and makes their MTD
     # devices (mtd1 adt, mtd2 m1n1_stage2.log) and nodes; unloading removes them. As in the
     # kernel, an MTD device has its own of_node link and no parent device (FAKE_ADT_NODE binds adt
@@ -130,10 +131,15 @@ case "$*" in
       ln -sfn "$M3T/dt/reserved-memory/flash@$addr" "$m/of_node"
       touch "$M3T/dev/mtd$n" "$M3T/dev/mtd${n}ro"
       n=$((n + 1))
-    done ;;
+    done
+    # FAKE_ADT_FILE: what the adt region holds, seen through its read-only node.
+    [[ -n ${FAKE_ADT_FILE:-} ]] && cp "$FAKE_ADT_FILE" "$M3T/dev/mtd1ro"
+    if [[ -n ${FAKE_EXTRA_MTD:-} ]]; then
+      mkdir -p "$S/class/mtd/mtd3"; echo other >"$S/class/mtd/mtd3/name"
+    fi ;;
   "-r phram")
     if [[ -n ${FAKE_FAIL_UNLOAD:-} ]]; then echo "modprobe: FATAL: Module phram is in use." >&2; exit 1; fi
-    rm -rf "$S/module/phram" "$S"/class/mtd/mtd[12] "$S"/class/mtd/mtd[12]ro "$M3T"/dev/mtd[12] "$M3T"/dev/mtd[12]ro ;;
+    rm -rf "$S/module/phram" "$S"/class/mtd/mtd[123] "$S"/class/mtd/mtd[12]ro "$M3T"/dev/mtd[12] "$M3T"/dev/mtd[12]ro ;;
 esac
 exit 0
 """,
@@ -181,6 +187,39 @@ def fdt(board, chip):
     body = f"apple,{board}\0apple,{chip}\0apple,arm-platform\0".encode() + b"\0" * 7
     head = b"\xd0\x0d\xfe\xed" + u32(40 + len(body)) + u32(40) * 3 + u32(17) + u32(16) + u32(0) * 3
     return head + body
+
+
+def adt_prop(name, value):
+    if isinstance(value, int):
+        value = struct.pack("<I", value)
+    elif isinstance(value, str):
+        value = value.encode() + b"\0"
+    return name.encode().ljust(32, b"\0") + struct.pack("<I", len(value)) + value + b"\0" * (-len(value) % 4)
+
+
+def adt_node(name, props=(), children=()):
+    props = [("name", name)] + list(props)
+    return (struct.pack("<II", len(props), len(children)) + b"".join(adt_prop(k, v) for k, v in props)
+            + b"".join(children))
+
+
+# A small ADT in the format the reader parses, with an allowed GPU node and things it must leave out.
+ADT = adt_node("device-tree", [("#address-cells", 2), ("#size-cells", 2), ("serial-number", SERIAL)], [
+    adt_node("arm-io", [("compatible", "arm-io,t6031"), ("#address-cells", 2), ("#size-cells", 2)], [
+        adt_node("sgx", [("compatible", "gpu,t6031"), ("gpu-num-clusters", 4), ("unique-id", "0123456789abcdef")]),
+        adt_node("wlan", [("local-mac-address", bytes.fromhex(MAC.replace(":", "")))]),
+    ]),
+]) + b"\0" * 64
+
+
+def k2_reader():
+    """The ADT reader: the tree's, or the one its branch added (commit 2ca6ff6e)."""
+    here = flow.INSTALLER.parent / "aurora-adt-extract.py"
+    if here.exists():
+        return here.read_bytes()
+    got = subprocess.run(["git", "show", "2ca6ff6e:tools/aurora-sep/aurora-adt-extract.py"],
+                         cwd=flow.INSTALLER.parent, capture_output=True)
+    return got.stdout if got.returncode == 0 else None
 
 
 class MaxBase(flow.M3FlowBase):
@@ -672,6 +711,11 @@ class AdtTest(MaxBase):
     def modprobes(self):
         return [l for l in self.log().splitlines() if l.startswith("modprobe ")]
 
+    LOAD_UNLOAD = ["modprobe phram", "udevadm settle --timeout=10", "udevadm settle --timeout=10", "modprobe -r phram"]
+
+    def steps(self):
+        return [l for l in self.log().splitlines() if l.startswith(("modprobe ", "udevadm "))]
+
     def assert_restored(self, check):
         before = check.split("== before\n")[1].split("\n==")[0].split("\nregion:")[0].split("\nstopped:")[0]
         after = check.split("== after\n")[1].split("\nrestored:")[0]
@@ -683,7 +727,11 @@ class AdtTest(MaxBase):
     def test_read_and_restore(self):
         allow, check = self.files()
         self.assertIn("/arm-io/sgx compatible = gpu,t6031", allow)
-        self.assertEqual(self.modprobes(), ["modprobe phram", "modprobe -r phram"])
+        # udev settles after the load and before the unload.
+        self.assertEqual(self.steps(), self.LOAD_UNLOAD)
+        self.assertIn("== with phram\nphram: loaded\nmtd0 name=nvram", check)
+        self.assertIn("mtd1 name=adt type=ram size=507904", check)
+        self.assertIn("mtd2 name=m1n1_stage2.log type=ram size=16384", check)
         # Only the read-only node of the device named adt.
         reader = [l for l in self.log().splitlines() if l.startswith("reader ")]
         self.assertEqual(reader, [f"reader --check {self.tmp}/dev/mtd1ro", f"reader {self.tmp}/dev/mtd1ro"])
@@ -716,7 +764,7 @@ class AdtTest(MaxBase):
         self.assertIn("the adt MTD device (mtd1, 4096 bytes) does not match its reserved-memory region "
                       "(flash@10003528000, 507904 bytes)", allow)
         self.assertNotIn("reader ", self.log())
-        self.assertEqual(self.modprobes(), ["modprobe phram", "modprobe -r phram"])
+        self.assertEqual(self.steps(), self.LOAD_UNLOAD)
         self.assert_restored(check)
 
     def test_an_oversized_region_is_not_loaded(self):
@@ -739,14 +787,14 @@ class AdtTest(MaxBase):
         self.assertIn("not 'ram' (phram)", allow)
         reader = [l for l in self.log().splitlines() if l.startswith("reader ")]
         self.assertEqual(reader, [f"reader --check {self.tmp}/dev/mtd1ro"])
-        self.assertEqual(self.modprobes(), ["modprobe phram", "modprobe -r phram"])
+        self.assertEqual(self.steps(), self.LOAD_UNLOAD)
         self.assert_restored(check)
 
     def test_an_error_mid_read_still_unloads(self):
         allow, check = self.files(FAKE_READER="fail")
         self.assertIn("the ADT reader failed (exit 3), so its output was left out: adt: a node runs past", allow)
         self.assertNotIn("compatible = apple,j514c", allow)
-        self.assertEqual(self.modprobes(), ["modprobe phram", "modprobe -r phram"])
+        self.assertEqual(self.steps(), self.LOAD_UNLOAD)
         self.assert_restored(check)
 
     def test_an_interruption_mid_read_still_unloads(self):
@@ -770,14 +818,49 @@ class AdtTest(MaxBase):
         out, err = p.communicate(timeout=30)
         self.assertEqual(p.returncode, 130, err)
         self.assertIn("interrupted", err)
-        self.assertEqual(self.modprobes(), ["modprobe phram", "modprobe -r phram"])
+        self.assertEqual(self.steps(), self.LOAD_UNLOAD)
         self.assertFalse((self.tmp / "sys/module/phram").exists())
         self.assertEqual(list(self.out.iterdir()), [])
 
     def test_a_failed_unload_shows(self):
-        allow, check = self.files(FAKE_FAIL_UNLOAD="1")
-        self.assertIn("unload FAILED: phram stays loaded", check)
+        # Settled and tried twice, never forced; one line on the terminal, and the record in the tgz.
+        proc, files = self.report_files(env={"FAKE_FAIL_UNLOAD": "1"})
+        check = self.text(files, "adt-check.txt")
+        self.assertIn("unload FAILED: phram stays loaded (in use after udev settled, twice; not forced)", check)
         self.assertIn("restored: NO", check)
+        self.assertEqual(self.steps(), ["modprobe phram", "udevadm settle --timeout=10", "udevadm settle --timeout=10",
+                                        "modprobe -r phram", "udevadm settle --timeout=10", "modprobe -r phram"])
+        self.assertNotRegex(self.log(), r"modprobe .*(-f|--force)")
+        lines = [l for l in proc.stderr.splitlines() if "phram" in l]
+        self.assertEqual(len(lines), 1, proc.stderr)
+        self.assertIn("still loaded", lines[0])
+
+    def test_exactly_the_two_regions_devices(self):
+        allow, check = self.files(FAKE_EXTRA_MTD="1")
+        self.assertIn("phram made the MTD devices adt m1n1_stage2.log other, not exactly adt and m1n1_stage2.log", allow)
+        self.assertNotIn("reader ", self.log())
+        self.assertEqual(self.steps(), self.LOAD_UNLOAD)
+        self.assert_restored(check)
+
+    def test_with_the_real_reader(self):
+        # The reader from the kernel branch, on the fake region (a regular file in place of the node:
+        # the reader then checks no device and parses the file).
+        src = k2_reader()
+        if src is None:
+            self.skipTest("the ADT reader is not in this tree, and git can't show 2ca6ff6e")
+        self.reader.write_bytes(src)
+        adt = self.tmp / "adt.bin"
+        adt.write_bytes(ADT)
+        allow, check = self.files(FAKE_ADT_FILE=str(adt))
+        self.assertIn("a regular file, no device to check", check)
+        self.assertIn("/arm-io/sgx", allow)
+        self.assertIn("gpu-num-clusters", allow)
+        self.assertIn("# summary:", allow)
+        self.assertNotIn("wlan", allow)
+        self.assertNotIn("0123456789abcdef", allow)
+        self.assertNotIn(SERIAL, allow)
+        self.assertNotIn("SERIAL", allow)  # left out by the reader, so there was nothing to mask
+        self.assert_restored(check)
 
     def test_no_phram_module(self):
         allow, check = self.files(FAKE_NO_PHRAM="1")
@@ -792,8 +875,8 @@ class AdtTest(MaxBase):
 
     def test_no_adt_device(self):
         allow, check = self.files(FAKE_NO_ADT_MTD="1")
-        self.assertIn("phram made no MTD device named adt", allow)
-        self.assertEqual(self.modprobes(), ["modprobe phram", "modprobe -r phram"])
+        self.assertIn("phram made no MTD device, so the ADT was not read", allow)
+        self.assertEqual(self.steps(), self.LOAD_UNLOAD)
         self.assertIn("restored: yes", check)
 
     def test_not_an_m3(self):
@@ -808,7 +891,15 @@ class AdtTest(MaxBase):
         return proc
 
     def test_this_release_has_no_reader(self):
-        proc = self.reader_path('M3_ADT_READER=""')
+        # Run from a copy with no reader next to it (a checkout may have one).
+        d = self.tmp / "alone"
+        d.mkdir()
+        shutil.copy(flow.INSTALLER, d / "install-aurora-sep.sh")
+        self.installer = d / "install-aurora-sep.sh"
+        try:
+            proc = self.reader_path('M3_ADT_READER=""')
+        finally:
+            self.installer = flow.INSTALLER
         self.assertEqual(proc.returncode, 1)
         self.assertIn("has no ADT reader", proc.stdout)
 
