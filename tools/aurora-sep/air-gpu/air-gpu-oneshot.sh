@@ -1,0 +1,535 @@
+#!/bin/bash
+# air-gpu-oneshot.sh: arm ONE boot of this M3 MacBook Air with the GPU start switch
+# (asahi.t8122_start=1) and the given asahi knobs on the kernel command line.
+#
+#   sudo air-gpu-oneshot.sh start                    arm one boot with the kernel's defaults
+#   sudo air-gpu-oneshot.sh <knob>=<value> ...       arm one boot with these knobs as well
+#   sudo air-gpu-oneshot.sh --check [knobs]          say whether this Mac can arm; changes nothing
+#   sudo air-gpu-oneshot.sh --status                 what is armed, and what this boot ran with
+#   sudo air-gpu-oneshot.sh --disarm                 clear the one-shot and remove its boot entry
+#   air-gpu-oneshot.sh --list-knobs                  the knobs this script accepts
+#   --allow-test-on-m3pro                            also run on an M3 Pro (t6030): a rehearsal
+#
+# Knobs are written without the "asahi." prefix (t8122_pstate_cap=2); the prefix is accepted too.
+#
+# How it works. The asahi GPU driver is built into the kernel (CONFIG_DRM_ASAHI=y), and it
+# starts the GPU at kernel init, before the initramfs runs. Module options in /etc/modprobe.d
+# never reach it, and no userspace step runs before it. So the knobs go on the kernel command
+# line of one extra Limine entry, "air-gpu-oneshot", which boots the same UKI as the normal
+# linux-aurora entry, with that entry's command line plus the knobs. The entry is chosen for one
+# boot only, through the Boot Loader Interface variable LoaderEntryOneShot. Limine deletes that
+# variable as it reads it, before it starts the kernel, and U-Boot writes the deletion to its
+# variable file on the EFI partition straight away. Whatever happens in the armed boot, the next
+# boot (a reboot, a reset, a power cycle) is the normal default entry.
+#
+# Every change is made under the Limine tools' locks, checked after it is made, and undone if
+# a check fails. Each run prints one line saying what it did or why it refused.
+set -euo pipefail
+
+# ---------------------------------------------------------------------------------------------
+# The knobs this script accepts: name, the values it takes (an extended regex for the whole
+# value), and what the knob sets. They are the kernel's (air/t8122-gpu-start: t8122_knobs.rs and
+# m3_params.rs), with the values the kernel accepts; knob_ok below adds the checks a regex can't
+# make. A knob must also be a parameter of the kernel the armed entry boots: the script looks for
+# the string "asahi.<name>" in that kernel image (the UKI) and refuses one it does not find.
+KNOBS='
+t8122_start             1                                  the T8122 start experiment (always set by this script)
+t8122_initdata_version  0x[0-9a-fA-F]{1,16}|[0-9]{1,20}    InitData version for the firmware (default 0x0c08e21e83800490)
+t8122_fender            rule|adt|0x104000|0x12c000         Fender window: rule 0x104000 (default) or adt 0x12c000
+t8122_clkgen            e1c|e5c|none                       clock-generator slot: SGX+0xe1c000 (default), SGX+0xe5c000, none
+t8122_sgx_setup         none|t6030                         SGX write before the firmware starts: none (default) or T6030 0x70001
+t8122_unit_mask_a       0x[0-9a-fA-F]{1,9}|[0-9]{1,11}     HwDataB unit mask A: nonzero, within 0x700000001 (default)
+t8122_unit_mask_b       0x[1-7]|[1-7]                      HwDataB unit mask B: nonzero, within 0x7 (default 0x3)
+t8122_pstate_cap        [1-9]|1[0-5]                       highest GPU performance state, 1 to 15 (default 2)
+m3_expose               -1|0|1                             render node: -1 auto (on for J613/J615, the default), 0 off, 1 on
+m3_timeout_nohang       0|1                                on a job timeout, fail the job without the hang path
+'
+
+# The checks on a knob value that the regex can't make, as the kernel makes them.
+knob_ok() { # name value
+  local v
+  case $1 in
+    t8122_initdata_version | t8122_unit_mask_a | t8122_unit_mask_b) v=$(($2)) ;;
+    *) return 0 ;;
+  esac
+  case $1 in
+    t8122_initdata_version) ((v != 0)) ;;
+    t8122_unit_mask_a) ((v != 0 && (v & ~0x700000001) == 0)) ;;
+    t8122_unit_mask_b) ((v != 0 && (v & ~0x7) == 0)) ;;
+  esac
+}
+# ---------------------------------------------------------------------------------------------
+
+PROG=air-gpu-oneshot
+ENTRY=air-gpu-oneshot
+# The normal entry whose UKI and command line the armed entry copies (limine-entry-tool names
+# it after the kernel package, linux-aurora, under the OS directory).
+SOURCE_ENTRY=linux-aurora
+BEGIN_MARK="# >>> air-gpu-oneshot: one experiment boot, chosen only through LoaderEntryOneShot (remove with: air-gpu-oneshot.sh --disarm)"
+END_MARK="# <<< air-gpu-oneshot"
+# The tag on the armed command line: the arming id. air-gpu-collect.sh reads it.
+TAG=air_gpu.oneshot
+AIR_BOARDS="j613 j615"
+DT=/proc/device-tree
+EFIVARS=/sys/firmware/efi/efivars
+CMDLINE=/proc/cmdline
+BLI_GUID=4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+UBOOT_GUID=b2ac5fc9-92b7-4acd-aeac-11e818c3130c
+GLOBAL_GUID=8be4df61-93ca-11d2-aa0d-00e098032b8c
+# Omarchy's Limine tools take one of these before they touch the EFI partition (newer ones the
+# first, older ones the second); maclab takes both in this order, and so does this script.
+LOCKS="/run/lock/boot-partition.lock /tmp/limine-global.lock"
+STATE_DIR=/var/lib/air-gpu
+# limine-entry-tool's settings; ENABLE_ENROLL_LIMINE_CONFIG=yes there makes Limine check a hash
+# of limine.conf enrolled into its EFI binary, so an edited limine.conf would not boot.
+LIMINE_DEFAULTS=/etc/default/limine
+KREL=$(uname -r)
+ALLOW_M3PRO=0
+# Where Limine looks for its configuration on the partition it was loaded from, in its order.
+CONF_PATHS="EFI/BOOT/limine.conf boot/limine/limine.conf boot/limine.conf limine/limine.conf limine.conf"
+
+is_root() { ((EUID == 0)); }
+say() { printf '%s: %s\n' "$PROG" "$*"; }
+# --check and --status write nothing, not even a journal line.
+QUIET_LOG=0
+log() { ((QUIET_LOG)) || logger -t "$PROG" -- "$*" 2>/dev/null || true; }
+refuse() {
+  printf '%s: refused: %s Nothing was changed.\n' "$PROG" "$*" >&2
+  log "refused: $*"
+  exit 1
+}
+
+# ---- what this Mac is ------------------------------------------------------------------------
+
+compatibles() { tr '\0' '\n' <"$DT/compatible" 2>/dev/null || true; }
+board() { compatibles | sed -n 's/^apple,\(j[0-9a-z]*\)$/\1/p' | head -1; }
+is_air() {
+  local b
+  compatibles | grep -qx 'apple,t8122' || return 1
+  b=$(board)
+  [[ -n $b && " $AIR_BOARDS " == *" $b "* ]]
+}
+is_m3pro() { compatibles | grep -qx 'apple,t6030'; }
+
+check_board() {
+  if is_air; then return 0; fi
+  if is_m3pro && ((ALLOW_M3PRO)); then
+    say "rehearsal on an M3 Pro ($(board)): the t8122 knobs do nothing on this GPU"
+    return 0
+  fi
+  if is_m3pro; then
+    refuse "this is an M3 Pro ($(board)), not an M3 MacBook Air (j613, j615); --allow-test-on-m3pro runs the rehearsal."
+  fi
+  refuse "this Mac ($(board), $(compatibles | sed -n 's/^apple,\(t[0-9]*\)$/\1/p' | head -1)) is not an M3 MacBook Air (j613, j615)."
+}
+
+# ---- knobs -----------------------------------------------------------------------------------
+
+knob_line() { printf '%s\n' "$KNOBS" | awk -v n="$1" '$1 == n { print; exit }'; }
+
+list_knobs() {
+  echo "knob               values                         sets"
+  printf '%s\n' "$KNOBS" | sed '/^$/d'
+}
+
+# Fills PARAMS ("asahi.name=value" words, t8122_start first) from the arguments, or refuses.
+PARAMS=()
+parse_knobs() {
+  local arg name value line re seen=" "
+  PARAMS=("asahi.t8122_start=1")
+  for arg in "$@"; do
+    [[ $arg == start ]] && continue
+    [[ $arg == *=* ]] || refuse "\"$arg\" is not a knob=value (or start)."
+    name=${arg%%=*} value=${arg#*=}
+    name=${name#asahi.}
+    line=$(knob_line "$name")
+    [[ -n $line ]] || refuse "unknown knob \"$name\" (air-gpu-oneshot.sh --list-knobs lists them)."
+    re=$(awk '{ print $2 }' <<<"$line")
+    [[ $value =~ ^($re)$ ]] || refuse "$name=$value: $name takes $re."
+    knob_ok "$name" "$value" ||
+      refuse "$name=$value is outside what the kernel accepts ($(knob_line "$name" | awk '{ $1 = $2 = ""; sub(/^ +/, ""); print }'))."
+    [[ $seen != *" $name "* ]] || refuse "$name is given twice."
+    seen+="$name "
+    [[ $name == t8122_start ]] && continue
+    PARAMS+=("asahi.$name=$value")
+  done
+}
+
+# ---- the EFI partition and Limine ------------------------------------------------------------
+
+ESP=""
+CONF=""
+find_esp() {
+  local d
+  [[ -n $ESP ]] && return 0
+  for d in /boot/efi /efi /boot; do
+    if [[ $(findmnt -no TARGET "$d" 2>/dev/null) == "$d" && $(findmnt -no FSTYPE "$d" 2>/dev/null) == vfat ]]; then
+      ESP=$d
+      return 0
+    fi
+  done
+  return 1
+}
+
+find_conf() {
+  local p
+  for p in $CONF_PATHS; do
+    if [[ -f $ESP/$p ]]; then CONF=$ESP/$p; return 0; fi
+  done
+  return 1
+}
+
+# The source entry's keys, as "key value" lines: protocol, path, cmdline, kver, and count (how
+# many entries matched).
+entry_keys() {
+  awk -v name="$SOURCE_ENTRY" '
+    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+    /^[ \t]*\// { inent = ($0 ~ "^[ \t]*//" name "[ \t\r]*$"); if (inent) n++; next }
+    !inent || n != 1 { next }
+    /^[ \t]*protocol:/ { v = $0; sub(/^[ \t]*protocol:/, "", v); print "protocol " trim(v) }
+    /^[ \t]*path:/ { v = $0; sub(/^[ \t]*path:/, "", v); print "path " trim(v) }
+    /^[ \t]*(kernel_)?cmdline:/ { v = $0; sub(/^[ \t]*(kernel_)?cmdline:/, "", v); print "cmdline " trim(v) }
+    /^[ \t]*comment:[ \t]*Kernel version:/ { v = $0; sub(/^[ \t]*comment:[ \t]*Kernel version:/, "", v); print "kver " trim(v) }
+    END { print "count " n + 0 }
+  ' "$CONF"
+}
+key() { awk -v k="$1" '$1 == k { sub(/^[^ ]+ /, ""); print; exit }' <<<"$KEYS"; }
+
+# A Limine path such as boot():/EFI/Linux/x.efi#<blake2b> as a file on the ESP.
+limine_file() {
+  local p=${1%%#*}
+  [[ $p == *"):"* ]] && p=${p#*):}
+  p=${p#/}
+  printf '%s/%s\n' "$ESP" "$p"
+}
+
+# ---- EFI variables ---------------------------------------------------------------------------
+
+var_path() { printf '%s/%s-%s\n' "$EFIVARS" "$1" "$2"; }
+# A variable's data (without its 4 attribute bytes) as text: UTF-16LE when $3 is utf16.
+var_text() {
+  local f
+  f=$(var_path "$1" "$2")
+  [[ -e $f ]] || return 1
+  if [[ ${3:-} == utf16 ]]; then
+    tail -c +5 "$f" | iconv -f UTF-16LE -t UTF-8 2>/dev/null | tr -d '\0'
+  else
+    tail -c +5 "$f" | tr -d '\0'
+  fi
+}
+utf16z() { printf '%s' "$1" | iconv -f UTF-8 -t UTF-16LE; printf '\0\0'; }
+armed_name() { var_text LoaderEntryOneShot "$BLI_GUID" utf16 || true; }
+
+# U-Boot keeps EFI variables in RAM while Linux runs and loads them from a file on the ESP at
+# boot (RTStorageVolatile names it). VarToFile is the whole store in that file's format.
+VAR_FILE=""
+find_var_file() {
+  local name
+  VAR_FILE=""
+  name=$(var_text RTStorageVolatile "$UBOOT_GUID") || return 0
+  [[ -n $name && $name != *..* && $name != */* ]] || return 1
+  VAR_FILE=$ESP/$name
+}
+uboot_store() { tail -c +5 "$(var_path VarToFile "$UBOOT_GUID")"; }
+
+# Writes U-Boot's store to its file on the ESP, atomically, and syncs it.
+persist() {
+  local tmp
+  [[ -n $VAR_FILE ]] || return 0
+  tmp=$VAR_FILE.air-gpu.tmp
+  uboot_store >"$tmp" || { rm -f "$tmp"; return 1; }
+  if [[ $(head -c 15 "$tmp" | tail -c 7) != UbEfiVa ]]; then rm -f "$tmp"; return 1; fi
+  sync "$tmp" && mv -f "$tmp" "$VAR_FILE" && sync "$(dirname "$VAR_FILE")"
+}
+# Whether a variable file names the entry (UTF-16LE: compared with its zero bytes removed).
+file_has_name() { LC_ALL=C tr -d '\0' <"$1" 2>/dev/null | grep -qaF "$ENTRY"; }
+
+set_oneshot() {
+  local f tmp
+  f=$(var_path LoaderEntryOneShot "$BLI_GUID")
+  tmp=$(mktemp)
+  # Non-volatile, boot service and runtime access, then the UTF-16LE name: one write.
+  { printf '\x07\x00\x00\x00'; utf16z "$ENTRY"; } >"$tmp"
+  if [[ -e $f ]]; then chattr -i "$f" 2>/dev/null || true; rm -f "$f"; fi
+  dd if="$tmp" of="$f" bs=4096 conv=notrunc status=none 2>/dev/null || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+}
+clear_oneshot() {
+  local f
+  f=$(var_path LoaderEntryOneShot "$BLI_GUID")
+  [[ -e $f ]] || return 0
+  chattr -i "$f" 2>/dev/null || true
+  rm -f "$f"
+}
+
+# ---- locks -----------------------------------------------------------------------------------
+
+take_locks() {
+  local l fd
+  for l in $LOCKS; do
+    mkdir -p "$(dirname "$l")"
+    [[ ! -L $l ]] || refuse "$l is a symbolic link; not taking the Limine lock through it."
+    exec {fd}<>"$l" || refuse "could not open the Limine lock $l."
+    flock -w 60 "$fd" || refuse "$l has been held by another tool for over 60 s (limine-snapper-sync?)."
+  done
+}
+
+# ---- limine.conf -----------------------------------------------------------------------------
+
+# limine.conf without this script's block, and without the one blank line written before it.
+# Fails (and prints nothing) if a block has no end marker: then the file is not edited.
+conf_without_block() {
+  awk -v b="$BEGIN_MARK" -v e="$END_MARK" '
+    { line[NR] = $0 }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (line[i] == b) { inb = 1; if (out > 0 && kept[out] == "") out--; continue }
+        if (inb) { if (line[i] == e) inb = 0; continue }
+        kept[++out] = line[i]
+      }
+      if (inb) exit 3
+      for (i = 1; i <= out; i++) print kept[i]
+    }' "$CONF"
+}
+
+# Replaces limine.conf with $1 (plus a final newline), atomically, and syncs it.
+write_conf() {
+  local tmp=$CONF.air-gpu.tmp
+  printf '%s\n' "$1" >"$tmp" || { rm -f "$tmp"; return 1; }
+  sync "$tmp" && mv -f "$tmp" "$CONF" && sync "$(dirname "$CONF")"
+}
+
+block() {
+  printf '%s\n/%s\n    comment: M3 Air GPU experiment, one boot (%s)\n    protocol: efi\n    path: %s\n    cmdline: %s\n%s\n' \
+    "$BEGIN_MARK" "$ENTRY" "$1" "$2" "$3" "$END_MARK"
+}
+conf_has_block() { grep -qxF "$BEGIN_MARK" "$CONF" 2>/dev/null; }
+
+# ---- the checks every arming makes -----------------------------------------------------------
+
+KEYS="" UKI="" SRC_PATH="" SRC_CMDLINE="" NEW_CMDLINE="" ID=""
+WARNINGS=()
+preflight() {
+  local protocol pin sum w p kver
+  WARNINGS=()
+  find_esp || refuse "no FAT EFI partition mounted at /boot/efi, /efi or /boot."
+  grep -qaF limine.conf "$ESP/EFI/BOOT/BOOTAA64.EFI" 2>/dev/null ||
+    refuse "the EFI loader ($ESP/EFI/BOOT/BOOTAA64.EFI) is not Limine; this script arms through Limine only."
+  find_conf || refuse "Limine is the EFI loader but there is no limine.conf on $ESP."
+  if grep -Eq '^[[:space:]]*ENABLE_ENROLL_LIMINE_CONFIG=["'"'"']?yes' "$LIMINE_DEFAULTS" 2>/dev/null; then
+    refuse "$LIMINE_DEFAULTS has ENABLE_ENROLL_LIMINE_CONFIG=yes: Limine checks an enrolled hash of limine.conf, so adding an entry would stop this Mac booting."
+  fi
+  if grep -Eiq '^[[:space:]]*remember_last_entry:[[:space:]]*yes' "$CONF"; then
+    refuse "$CONF has remember_last_entry: yes, so Limine would boot the armed entry again after it."
+  fi
+  KEYS=$(entry_keys)
+  [[ $(key count) == 1 ]] ||
+    refuse "$CONF has $(key count) //$SOURCE_ENTRY entries; this script needs exactly one to copy."
+  protocol=$(key protocol) SRC_PATH=$(key path) SRC_CMDLINE=$(key cmdline) kver=$(key kver)
+  [[ $protocol == efi && -n $SRC_PATH ]] ||
+    refuse "the //$SOURCE_ENTRY entry is not an efi entry with a path (protocol: ${protocol:-none})."
+  [[ -n $SRC_CMDLINE && $SRC_CMDLINE == *root=* ]] ||
+    refuse "the //$SOURCE_ENTRY entry has no cmdline: with root= to copy."
+  [[ $SRC_CMDLINE != *'"'* && $SRC_CMDLINE != *"'"* ]] ||
+    refuse "the //$SOURCE_ENTRY command line has quotes, which this script does not rewrite."
+  [[ ! " $SRC_CMDLINE " =~ \ asahi\.t8122_start= ]] ||
+    refuse "the normal //$SOURCE_ENTRY entry already sets asahi.t8122_start, so every boot would start the GPU. Remove it from /etc/default/limine first."
+  UKI=$(limine_file "$SRC_PATH")
+  [[ -f $UKI ]] || refuse "the //$SOURCE_ENTRY entry's UKI $UKI does not exist."
+  if [[ $SRC_PATH == *#* ]]; then
+    pin=${SRC_PATH#*#}
+    sum=$(b2sum "$UKI" | cut -d' ' -f1)
+    [[ $sum == "$pin" ]] || refuse "$UKI measures BLAKE2b $sum, but its entry pins $pin."
+  fi
+  if [[ -n $kver && $kver != "$KREL" ]]; then
+    refuse "the //$SOURCE_ENTRY entry boots $kver, but this boot runs $KREL. Reboot into the installed kernel first."
+  fi
+  grep -qaF "$KREL" "$UKI" || refuse "$UKI is not the kernel this boot runs ($KREL). Reboot into the installed kernel first."
+  for p in "${PARAMS[@]}"; do
+    p=${p%%=*}
+    if ! grep -qaF "$p" "$UKI"; then
+      if is_m3pro && ((ALLOW_M3PRO)); then
+        WARNINGS+=("this kernel has no $p parameter; the rehearsal boot ignores it")
+      else
+        refuse "the kernel the armed entry boots ($KREL) has no $p parameter."
+      fi
+    fi
+  done
+  [[ -e $(var_path LoaderInfo "$BLI_GUID") ]] ||
+    refuse "no Boot Loader Interface variables at $EFIVARS (LoaderInfo); the one-shot needs them."
+  if [[ $(var_text LoaderInfo "$BLI_GUID" utf16 2>/dev/null) != Limine* ]]; then
+    refuse "this boot's loader did not report itself as Limine (LoaderInfo), so LoaderEntryOneShot may not be honoured."
+  fi
+  if [[ $(tail -c 1 "$(var_path SecureBoot "$GLOBAL_GUID")" 2>/dev/null | od -An -tu1 | tr -d ' ') == 1 ]]; then
+    refuse "Secure Boot is on, so the UKI would ignore the armed command line."
+  fi
+  find_var_file || refuse "U-Boot names an unusable variable file in RTStorageVolatile."
+  if [[ -n $VAR_FILE ]]; then
+    [[ -e $(var_path VarToFile "$UBOOT_GUID") ]] ||
+      refuse "U-Boot keeps EFI variables in RAM, but VarToFile is missing, so the one-shot could not be saved."
+    [[ $(uboot_store | head -c 15 | tail -c 7) == UbEfiVa ]] ||
+      refuse "U-Boot's VarToFile does not hold a variable file."
+    [[ -f $VAR_FILE ]] || refuse "U-Boot's variable file $VAR_FILE does not exist."
+  fi
+  w=$(armed_name)
+  [[ -z $w || $w == "$ENTRY" ]] ||
+    refuse "another one-shot boot is armed ($w): not replacing it."
+  gpu_node_note
+}
+
+# The GPU only starts when the boot loader hands it over; say so when this boot's did not.
+gpu_node_note() {
+  local d status
+  for d in "$DT"/soc/gpu@*; do
+    [[ -e $d/compatible ]] || continue
+    grep -qaE 'apple,agx-t(8122|6030)' "$d/compatible" || continue
+    status=$(tr -d '\0' <"$d/status" 2>/dev/null || echo okay)
+    if [[ $status != okay ]]; then
+      WARNINGS+=("this boot's GPU node is $status (the boot loader did not hand the GPU over); unless the next boot's does, the armed boot ends ARMED-NOT-STARTED")
+    fi
+    return 0
+  done
+  WARNINGS+=("this boot's device tree has no M3 GPU node")
+}
+
+new_cmdline() {
+  local w out=() p name skip
+  for w in $SRC_CMDLINE; do
+    skip=0
+    [[ $w == asahi.t8122_* || $w == "$TAG"=* ]] && skip=1
+    for p in "${PARAMS[@]}"; do
+      name=${p%%=*}
+      [[ $w == "$name" || $w == "$name"=* ]] && skip=1
+    done
+    ((skip)) || out+=("$w")
+  done
+  printf '%s\n' "${out[*]} ${PARAMS[*]} $TAG=$ID"
+}
+
+# ---- actions ---------------------------------------------------------------------------------
+
+do_arm() {
+  local before w rest
+  is_root || refuse "run as root (sudo)."
+  check_board
+  # Every refusal comes from this first pass, before anything is touched. The second pass reads
+  # limine.conf again under the Limine tools' locks, so none of them rewrites it in between.
+  preflight
+  take_locks
+  preflight
+  ID=$(date +%m%d-%H%M%S)
+  NEW_CMDLINE=$(new_cmdline)
+  mkdir -p "$STATE_DIR"
+  before=$STATE_DIR/limine.conf.before-$ID
+  cp -p "$CONF" "$before"
+  rest=$(conf_without_block) || refuse "$CONF has an air-gpu-oneshot block without its end marker; fix it by hand."
+  write_conf "$rest"$'\n\n'"$(block "$ID" "$SRC_PATH" "$NEW_CMDLINE")" || refuse "could not write $CONF."
+  if ! grep -qxF "/$ENTRY" "$CONF" || ! grep -qxF "    cmdline: $NEW_CMDLINE" "$CONF"; then
+    cp -p "$before" "$CONF"; sync
+    refuse "$CONF did not read back with the armed entry; it was put back."
+  fi
+  if ! set_oneshot || [[ $(armed_name) != "$ENTRY" ]] || ! persist ||
+    { [[ -n $VAR_FILE ]] && ! file_has_name "$VAR_FILE"; }; then
+    clear_oneshot; persist || true
+    write_conf "$rest" || cp -p "$before" "$CONF"
+    sync
+    refuse "the one-shot variable did not read back from the firmware store; it was cleared and the entry removed."
+  fi
+  sync
+  printf '%s\n' "$ID $KREL $NEW_CMDLINE" >"$STATE_DIR/armed"
+  for w in "${WARNINGS[@]}"; do say "warning: $w"; done
+  say "armed one boot ($ID): the next boot only runs $KREL with ${PARAMS[*]}; every boot after it is the normal entry. Reboot when ready, then run: sudo air-gpu-collect.sh"
+  log "armed one boot ($ID): $KREL ${PARAMS[*]}"
+}
+
+do_check() {
+  local w
+  is_root || refuse "run as root (sudo)."
+  check_board
+  preflight
+  ID=check
+  NEW_CMDLINE=$(new_cmdline)
+  for w in "${WARNINGS[@]}"; do say "warning: $w"; done
+  say "check passed: this Mac can arm one boot of $KREL from $CONF (entry //$SOURCE_ENTRY, variable file ${VAR_FILE:-none}) with: ${PARAMS[*]}. Nothing was changed."
+}
+
+do_disarm() {
+  local armed rest changed=""
+  is_root || refuse "run as root (sudo)."
+  find_esp || refuse "no FAT EFI partition mounted at /boot/efi, /efi or /boot."
+  find_var_file || refuse "U-Boot names an unusable variable file in RTStorageVolatile."
+  take_locks
+  armed=$(armed_name)
+  if [[ $armed == "$ENTRY" ]]; then
+    clear_oneshot
+    persist || refuse "could not save the cleared one-shot to $VAR_FILE; run --disarm again."
+    changed+="cleared the one-shot; "
+  elif [[ -n $armed ]]; then
+    say "another one-shot is armed ($armed); leaving it alone"
+  fi
+  if find_conf && conf_has_block; then
+    rest=$(conf_without_block) || refuse "$CONF has an air-gpu-oneshot block without its end marker; fix it by hand."
+    write_conf "$rest" || refuse "could not write $CONF."
+    changed+="removed the air-gpu-oneshot entry from $CONF; "
+  fi
+  rm -f "$STATE_DIR/armed"
+  sync
+  say "disarmed: ${changed:-nothing was armed.}"
+  log "disarmed: ${changed:-nothing was armed}"
+}
+
+do_status() {
+  local cmd id a
+  cmd=$(cat "$CMDLINE" 2>/dev/null || true)
+  id=$(tr ' ' '\n' <<<"$cmd" | sed -n "s/^${TAG//./\\.}=//p" | head -1)
+  if [[ -n $id ]]; then
+    say "this boot is armed boot $id: $(tr ' ' '\n' <<<"$cmd" | grep '^asahi\.' | tr '\n' ' ')"
+  else
+    say "this boot is a normal boot (no $TAG= on the command line)"
+  fi
+  if [[ -d $EFIVARS ]]; then
+    a=$(armed_name)
+    say "one-shot variable: ${a:-not set}"
+  fi
+  if find_esp; then
+    find_var_file || true
+    if [[ -n $VAR_FILE && -f $VAR_FILE ]]; then
+      if file_has_name "$VAR_FILE"; then say "$VAR_FILE: names $ENTRY (the next boot is armed)"
+      else say "$VAR_FILE: does not name $ENTRY"; fi
+    fi
+    if find_conf; then
+      if conf_has_block; then say "$CONF: has the $ENTRY entry ($(grep -m1 '    comment: M3 Air GPU experiment' "$CONF" | sed 's/.*(\(.*\))/\1/'))"
+      else say "$CONF: no $ENTRY entry"; fi
+    fi
+  fi
+}
+
+main() {
+  local action=arm args=() a
+  for a in "$@"; do
+    case $a in
+      --allow-test-on-m3pro) ALLOW_M3PRO=1 ;;
+      --check) action=check QUIET_LOG=1 ;;
+      --status) action=status QUIET_LOG=1 ;;
+      --disarm) action=disarm ;;
+      --list-knobs) action=list ;;
+      -h | --help) sed -n '2,11p' "$0"; exit 0 ;;
+      -*) refuse "unknown option $a." ;;
+      *) args+=("$a") ;;
+    esac
+  done
+  case $action in
+    list) list_knobs ;;
+    status) do_status ;;
+    disarm) ((${#args[@]} == 0)) || refuse "--disarm takes no knobs."; do_disarm ;;
+    check) parse_knobs "${args[@]}"; do_check ;;
+    arm)
+      ((${#args[@]} > 0)) || refuse "say what to arm: start, or knob=value ... (--help)."
+      parse_knobs "${args[@]}"
+      do_arm
+      ;;
+  esac
+}
+
+if [[ ${AIR_GPU_SOURCE_ONLY:-} == 1 ]]; then return 0; fi
+main "$@"
