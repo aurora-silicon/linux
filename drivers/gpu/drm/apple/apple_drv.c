@@ -65,9 +65,30 @@ static int apple_drm_gem_dumb_create(struct drm_file *file_priv,
 	return drm_gem_dma_dumb_create_internal(file_priv, drm, args);
 }
 
+static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
+				 struct drm_fb_helper_surface_size *sizes)
+{
+	struct drm_crtc *crtc;
+
+	drm_for_each_crtc(crtc, helper->dev) {
+		struct apple_dcp *dcp;
+
+		dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+		    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+			/* H17P applies the stored fourth byte as straight alpha. */
+			sizes->surface_bpp = 32;
+			sizes->surface_depth = 32;
+			break;
+		}
+	}
+
+	return drm_fbdev_dma_driver_fbdev_probe(helper, sizes);
+}
+
 static const struct drm_driver apple_drm_driver = {
 	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(apple_drm_gem_dumb_create),
-	DRM_FBDEV_DMA_DRIVER_OPS,
+	.fbdev_probe		= apple_drm_fbdev_probe,
 	.name			= DRIVER_NAME,
 	.desc			= DRIVER_DESC,
 	.major			= 1,
