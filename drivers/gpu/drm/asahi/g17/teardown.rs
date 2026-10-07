@@ -5,10 +5,12 @@
 //! The device mutex serializes this state with the Registry's displaced graph ownership.
 
 use super::{context::Context, freelist::control_consumed, fw::channels::SchedulerStateRelease};
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{fence, AtomicBool, Ordering};
 use kernel::{prelude::*, sync::Arc};
 
+/// Entries preallocated at device start; a burst of closes beyond it grows the table.
 const CAPACITY: usize = 128;
+static GREW: AtomicBool = AtomicBool::new(false);
 const POLL_NS: u64 = 2_000_000_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -80,15 +82,23 @@ impl Pending {
             .position(|entry| Arc::ptr_eq(&entry.context, context))
     }
 
+    /// Closes outpacing firmware release consumption grow the table instead of
+    /// failing the close: a failed close stops the device for every client.
     fn insert(&mut self, context: &Arc<Context>, phase: Phase, now: u64) -> Result {
-        self.entries
-            .push_within_capacity(Entry {
-                context: context.clone(),
-                phase,
-                armed: now,
-                announce_pending: false,
-            })
-            .map_err(|_| ENOSPC)
+        let entry = Entry {
+            context: context.clone(),
+            phase,
+            armed: now,
+            announce_pending: false,
+        };
+        if self.entries.len() >= CAPACITY && !GREW.swap(true, Ordering::Relaxed) {
+            pr_info!(
+                "asahi: G17 scheduler-release table grew past {} pending contexts\n",
+                CAPACITY
+            );
+        }
+        self.entries.push(entry, GFP_KERNEL)?;
+        Ok(())
     }
 
     /// Call before replacing a graph's logical owner. Failure leaves that graph with its
