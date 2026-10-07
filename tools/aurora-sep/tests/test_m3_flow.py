@@ -202,7 +202,9 @@ class M3FlowBase(unittest.TestCase):
         # The M3 Pro's Mesa package of this fake release (a stand-in by the shipped name's form).
         self.pro_mesa = PRO_MESA
         self.pro_mesa_fixture(PRO_MESA, "mesa-m3", PRO_MESA_VERSION, "opt/mesa-m3")
-        (self.tmp / "home").mkdir(exist_ok=True)
+        # The invoking user's home, as getent would give it.
+        self.home = self.tmp / "home"
+        self.home.mkdir(exist_ok=True)
         # The m1n1 package every Mac gets in this fake release.
         self.m1n1_pkg = M1N1_PKG
         # The script under test; a test can run an earlier release's first.
@@ -274,7 +276,7 @@ M1N1_BIN_SHA={self.bin_shas[self.m1n1_pkg]}
 M3_PRO_MESA_PACKAGE="{self.pro_mesa + ' ' + self.shas[self.pro_mesa] if self.pro_mesa else ''}"
 M3_PRO_MESA_NEEDS="{PRO_MESA_NEEDS}"
 M3_PRO_MESA_DISABLE='{self.tmp}/etc/mesa-m3/disable'
-m3_pro_mesa_user_home() {{ echo '{self.tmp}/home'; }}
+m3_pro_mesa_user_home() {{ echo '{self.home}'; }}
 esp_bootbin() {{ echo '{self.boot}'; }}
 version_notice() {{ :; }}; sep_write_notice() {{ :; }}; ane_dkms_notice() {{ :; }}
 snapshot() {{ :; }}; add_pin() {{ :; }}; remove_pin() {{ :; }}
