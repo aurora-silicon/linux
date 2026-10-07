@@ -166,7 +166,7 @@ bool dcp_typec_dual_stream(void)
 
 /*
  * Do the Type-C routes of @dcp follow the CRTC a modeset pairs them with
- * (see dcp_typec_follow_crtc())? This capability applies to direct routes
+ * (see dcp_typec_follow_crtc())? Direct routes and Thunderbolt tunnels,
  * on 12.3/13.5 only.
  */
 bool dcp_typec_follows_crtc(struct apple_dcp *dcp)
@@ -178,10 +178,9 @@ bool dcp_typec_follows_crtc(struct apple_dcp *dcp)
 }
 
 /* Is a routed port's possible_crtcs narrowed to the pipeline driving it? */
-static bool dcp_typec_narrows(struct apple_dcp *dcp, bool tunnel)
+static bool dcp_typec_narrows(struct apple_dcp *dcp)
 {
-	return !dcp_typec_dual_stream() &&
-	       (tunnel || !dcp_typec_follows_crtc(dcp));
+	return !dcp_typec_dual_stream() && !dcp_typec_follows_crtc(dcp);
 }
 
 bool dcp_is_typec_only(struct platform_device *pdev)
@@ -292,7 +291,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 		 * the pairing is the compositor's to make there.
 		 */
 		if (connector->port_encoder && dcp->crtc &&
-		    dcp_typec_narrows(dcp, xbar != route->xbar))
+		    dcp_typec_narrows(dcp))
 			connector->port_encoder->possible_crtcs =
 				dcp_fabric_connector_mask(false,
 							  true, true,
@@ -2007,8 +2006,10 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
 EXPORT_SYMBOL_GPL(apple_dcp_tb_dp_tunnel);
 
 /*
- * Direct DP-alt routes follow the CRTC selected by a modeset on 12.3/13.5.
- * Tunnels keep their existing masks, binding lifetime and routing policy.
+ * Direct DP-alt routes and Thunderbolt tunnels follow the CRTC selected by
+ * a modeset on 12.3/13.5.  A tunnel keeps its Thunderbolt binding: only the
+ * crossbar output of its DP IN changes pipeline, and the binding is revoked
+ * on the pipeline it leaves before it is installed on the one it joins.
  * Firmware 14.7 and native external processors keep their existing path.
  */
 struct dcp_typec_follow {
@@ -2032,6 +2033,12 @@ struct dcp_typec_follow_slot {
 	u64 attachment_generation;
 	bool was_active;
 	bool restored;
+	/* a tunnel's DP IN and Thunderbolt binding, carried along */
+	bool tunnel;
+	unsigned int dpin;
+	u64 tunnel_generation;
+	int (*set_active)(void *binding, bool active);
+	void *binding;
 };
 
 struct dcp_typec_follow_context {
@@ -2158,14 +2165,13 @@ static int dcp_typec_follow_decide(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	if (!from || !READ_ONCE(connector->connected))
 		return -ENOENT;
 	/* A dock's second stream has one pipeline, and the plan rules first. */
-	if (secondary || from->tunnel ||
-	    !dcp_typec_follows_crtc(from->dcp) ||
+	if (secondary || !dcp_typec_follows_crtc(from->dcp) ||
 	    READ_ONCE(from->dcp->tb_retiring) || dcp_typec_keep_order())
 		return -EINVAL;
 	holder = dcp->active_typec_route;
 	if (holder) {
 		other = holder->port;
-		if (holder != other->owner || holder->tunnel)
+		if (holder != other->owner)
 			return -EINVAL;
 		back = dcp_typec_port_route(other, from->dcp);
 		off = dcp_typec_follow_holder_off(state, crtc, other->connector,
@@ -2183,7 +2189,11 @@ static int dcp_typec_follow_decide(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	follow->action = dcp_fabric_follow(&from->core, to ? &to->core : NULL,
 					   holder ? &holder->core : NULL,
 					   back ? &back->core : NULL, off, &policy);
-	if (follow->action == DCP_FABRIC_FOLLOW_REFUSE)
+	/* A tunnel's DP IN must reach the pipeline it is given. */
+	if (follow->action == DCP_FABRIC_FOLLOW_REFUSE ||
+	    (from->tunnel && !dcp_typec_tunnel_ctl(to, from->tunnel_dpin)) ||
+	    (follow->action == DCP_FABRIC_FOLLOW_SWAP && holder->tunnel &&
+	     !dcp_typec_tunnel_ctl(back, holder->tunnel_dpin)))
 		return -EINVAL;
 	follow->port = port;
 	follow->from = from;
@@ -2200,6 +2210,19 @@ static int dcp_follow_prepare(void *data, unsigned int index)
 
 	slot->port = slot->from->port;
 	slot->connector = slot->from->dcp->typec_connector;
+	slot->tunnel = slot->from->tunnel;
+	slot->dpin = slot->from->tunnel_dpin;
+	if (slot->tunnel) {
+		struct apple_dcp *dcp = slot->from->dcp;
+
+		scoped_guard(mutex, &dcp->tb_lock) {
+			slot->tunnel_generation = slot->from->tunnel_generation;
+			slot->set_active = dcp->tb_dpin_set_active;
+			slot->binding = dcp->tb_dpin_ctx;
+		}
+		if (!slot->tunnel_generation || !slot->set_active)
+			return -ESTALE;
+	}
 	{
 		struct drm_crtc *crtc = &slot->from->dcp->crtc->base;
 		struct drm_crtc_state *old = drm_atomic_get_old_crtc_state(ctx->state, crtc);
@@ -2235,6 +2258,7 @@ static int dcp_follow_validate(void *data, unsigned int index)
 static int dcp_follow_release(struct apple_dcp_typec_route *route)
 {
 	struct apple_dcp *dcp = route->dcp;
+	bool tunnel = route->tunnel;
 	int ret;
 
 	/* Revoked sessions cannot touch the new route after a reconnect wait. */
@@ -2243,9 +2267,19 @@ static int dcp_follow_release(struct apple_dcp_typec_route *route)
 	dcp_modes_begin_attachment(dcp);
 	dcp->typec_connector = NULL;
 	WRITE_ONCE(dcp->connector, dcp->fixed_connector);
+	/* The binding moves on: no callback may reach it through here. */
+	if (tunnel) {
+		WRITE_ONCE(dcp->tb_retiring, true);
+		scoped_guard(mutex, &dcp->tb_lock) {
+			dcp->tb_generation = 0;
+			dcp->tb_dpin_set_active = NULL;
+			dcp->tb_dpin_ctx = NULL;
+		}
+	}
 	scoped_guard(mutex, &dcp->hpd_mutex)
 		WRITE_ONCE(dcp->typec_cable_connected, false);
 	ret = dcp_typec_route_deactivate(route);
+	WRITE_ONCE(dcp->tb_retiring, false);
 	if (route->port->owner == route)
 		route->port->owner = NULL;
 	return ret;
@@ -2265,11 +2299,35 @@ static int dcp_follow_attach(void *data, unsigned int index, bool restore)
 	struct dcp_typec_follow_slot *slot = &ctx->slots[index];
 	struct apple_dcp_typec_route *route = restore ? slot->from : slot->to;
 	struct apple_dcp *dcp = route->dcp;
+	struct mux_control *ctl = route->xbar;
 	int ret;
 
-	ret = dcp_typec_route_activate(route, route->xbar);
-	if (ret)
+	if (slot->tunnel) {
+		ctl = dcp_typec_tunnel_ctl(route, slot->dpin);
+		if (!ctl)
+			return -EOPNOTSUPP;
+		scoped_guard(mutex, &dcp->tb_lock) {
+			dcp->tb_dpin_set_active = slot->set_active;
+			dcp->tb_dpin_ctx = slot->binding;
+			dcp->tb_generation = slot->tunnel_generation;
+			route->tunnel_generation = slot->tunnel_generation;
+		}
+		route->tunnel_dpin = slot->dpin;
+	}
+	ret = dcp_typec_route_activate(route, ctl);
+	if (ret) {
+		if (slot->tunnel) {
+			scoped_guard(mutex, &dcp->tb_lock) {
+				dcp->tb_dpin_set_active = NULL;
+				dcp->tb_dpin_ctx = NULL;
+				dcp->tb_generation = 0;
+				route->tunnel_generation = 0;
+			}
+		}
 		return ret;
+	}
+	if (slot->tunnel)
+		dcp_tunnel_prepare(route, ctl);
 	slot->attachment_generation = dcp_modes_transfer_begin(dcp);
 	slot->port->owner = route;
 	slot->port->preferred_route = route;
@@ -2412,7 +2470,7 @@ int dcp_typec_follow_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
 retry_holder:
 		if (!dcp_typec_follow_lock(false))
 			return -EBUSY;
-		if (dcp->active_typec_route && !dcp->active_typec_route->tunnel) {
+		if (dcp->active_typec_route) {
 			struct apple_connector *holder = dcp->active_typec_route->port->connector;
 
 			if (holder && !drm_atomic_get_new_connector_state(state, &holder->base)) {
@@ -2468,8 +2526,7 @@ static bool dcp_typec_direct_commit(struct drm_crtc *crtc,
 			continue;
 		}
 		route = READ_ONCE(source->active_typec_route);
-		if (route && !READ_ONCE(route->tunnel) &&
-		    dcp_typec_follows_crtc(source))
+		if (route && dcp_typec_follows_crtc(source))
 			return true;
 	}
 	return false;
@@ -2666,7 +2723,7 @@ void dcp_typec_port_set_connector(unsigned int idx, bool secondary,
 	if (owner) {
 		struct apple_dcp *dcp = owner->dcp;
 
-		if (dcp->crtc && connector->port_encoder && dcp_typec_narrows(dcp, owner->tunnel))
+		if (dcp->crtc && connector->port_encoder && dcp_typec_narrows(dcp))
 			connector->port_encoder->possible_crtcs =
 				dcp_fabric_connector_mask(false,
 							  true, true,

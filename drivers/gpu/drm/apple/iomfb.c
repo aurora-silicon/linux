@@ -828,7 +828,7 @@ bool dcp_crtc_needs_route_start(struct apple_dcp *dcp)
 {
 	struct apple_dcp_typec_route *route = READ_ONCE(dcp->active_typec_route);
 
-	return dcp_typec_follows_crtc(dcp) && route && !READ_ONCE(route->tunnel) &&
+	return dcp_typec_follows_crtc(dcp) && route &&
 	       READ_ONCE(dcp->typec_crtc_off) && READ_ONCE(dcp->typec_follow_start) &&
 	       READ_ONCE(dcp->typec_follow_gen) == READ_ONCE(dcp->typec_generation);
 }

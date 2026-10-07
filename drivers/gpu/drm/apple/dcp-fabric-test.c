@@ -631,7 +631,10 @@ static void fabric_follow_test(struct kunit *test)
 						&f.policy),
 			DCP_FABRIC_FOLLOW_REFUSE);
 
-	/* Existing fixed-output busy/settling policy also applies to a move. */
+	/*
+	 * A live HDMI display keeps the hybrid.  The settling sample taken at
+	 * probe does not; a recent HDMI edge does (fabric_follow_recent_fixed).
+	 */
 	f.pipeline[0].fixed_busy = true;
 	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(lg, hybrid, NULL, NULL, false,
 						&f.policy),
@@ -640,8 +643,15 @@ static void fabric_follow_test(struct kunit *test)
 	f.pipeline[0].presence = DCP_FABRIC_SETTLING;
 	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(lg, hybrid, NULL, NULL, false,
 						&f.policy),
-			DCP_FABRIC_FOLLOW_REFUSE);
+			DCP_FABRIC_FOLLOW_MOVE);
 	f.pipeline[0].presence = DCP_FABRIC_ABSENT;
+
+	/* #39 on the M1 Pro: a Thunderbolt display alone follows to the hybrid. */
+	lg->tunnel = true;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(lg, hybrid, NULL, NULL, false,
+						&f.policy),
+			DCP_FABRIC_FOLLOW_MOVE);
+	lg->tunnel = false;
 
 	/* Owned with no route to swap with (a retiring tunnel), unbound, not up. */
 	f.pipeline[0].owned = true;
@@ -682,18 +692,18 @@ static void fabric_follow_test(struct kunit *test)
 						&f.route[1][0], &f.route[1][0],
 						true, &f.policy),
 			DCP_FABRIC_FOLLOW_REFUSE);
-	/* A direct route must never move into or swap a tunnel binding. */
+	/* Tunnels follow and swap like direct routes, keeping their binding. */
 	f.route[1][0].tunnel = true;
 	KUNIT_EXPECT_EQ(test,
 			dcp_fabric_follow(&f.route[0][1], &f.route[0][0],
 					  &f.route[1][0], &f.route[1][1], true, &f.policy),
-			DCP_FABRIC_FOLLOW_REFUSE);
+			DCP_FABRIC_FOLLOW_SWAP);
 	f.route[1][0].tunnel = false;
 	f.route[0][1].tunnel = true;
 	KUNIT_EXPECT_EQ(test,
 			dcp_fabric_follow(&f.route[0][1], &f.route[0][0],
-					  NULL, NULL, false, &f.policy),
-			DCP_FABRIC_FOLLOW_REFUSE);
+					  &f.route[1][0], &f.route[1][1], true, &f.policy),
+			DCP_FABRIC_FOLLOW_SWAP);
 }
 
 static void fabric_follow_recent_fixed(struct kunit *test)
