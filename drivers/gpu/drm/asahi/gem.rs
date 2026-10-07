@@ -58,6 +58,17 @@ pub(crate) struct AsahiObject {
 /// Type alias for the shmem GEM object type for this driver.
 pub(crate) type Object = shmem::Object<AsahiObject>;
 
+/// VM-private BOs share their assigned VM's reservation object. Validate this
+/// before acquiring mapping state; generic GPUVM accepts external shareable BOs.
+pub(crate) fn validate_vm_binding(gem: &Object, vm: &mmu::Vm) -> Result {
+    if gem.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0
+        && vm.is_extobj(gem)
+    {
+        return Err(EINVAL);
+    }
+    Ok(())
+}
+
 unsafe impl Send for AsahiObject {}
 unsafe impl Sync for AsahiObject {}
 
@@ -124,11 +135,7 @@ impl ObjectRef {
         if obj_range.end > self.gem.size() {
             return Err(EINVAL);
         }
-        if self.gem.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0
-            && vm.is_extobj(&*self.gem)
-        {
-            return Err(EINVAL);
-        }
+        validate_vm_binding(&self.gem, vm)?;
         vm.map_in_range(&self.gem, obj_range, alignment, range, prot, guard)
     }
 
@@ -142,11 +149,7 @@ impl ObjectRef {
         prot: mmu::Prot,
         guard: bool,
     ) -> Result<crate::mmu::KernelMapping> {
-        if self.gem.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0
-            && vm.is_extobj(&*self.gem)
-        {
-            return Err(EINVAL);
-        }
+        validate_vm_binding(&self.gem, vm)?;
 
         vm.map_at(addr, self.gem.size(), self.gem.clone(), prot, guard)
     }

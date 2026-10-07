@@ -9,46 +9,17 @@ use kernel::{prelude::*, sync::Arc};
 pub(crate) const POLL_NS: u64 = 2_500_000_000;
 const QUARANTINED_DELAY_NS: u64 = 250_000_000;
 const CANCELLED_DELAY_NS: u64 = 2_000_000_000;
-const ACK_SLOTS: usize = 16;
 
 // Firmware-visible cookie namespace persists for the loaded module's lifetime.
 static NEXT_COOKIE: AtomicU32 = AtomicU32::new(1);
 
-pub(crate) fn next_cookie() -> u64 {
-    loop {
-        let cookie = NEXT_COOKIE.fetch_add(1, Ordering::Relaxed);
-        if cookie != 0 {
-            return cookie.into();
-        }
-    }
-}
-
-pub(crate) struct Acks([u64; ACK_SLOTS]);
-impl Acks {
-    pub(crate) fn new() -> Self {
-        Self([0; ACK_SLOTS])
-    }
-    pub(crate) fn note(&mut self, cookie: u64) {
-        if cookie == 0 || self.contains(cookie) {
-            return;
-        }
-        if let Some(slot) = self.0.iter_mut().find(|slot| **slot == 0) {
-            *slot = cookie;
-        }
-    }
-    pub(crate) fn contains(&self, cookie: u64) -> bool {
-        cookie != 0 && self.0.contains(&cookie)
-    }
-    pub(crate) fn forget(&mut self, cookie: u64) {
-        for slot in &mut self.0 {
-            if *slot == cookie {
-                *slot = 0;
-            }
-        }
-    }
-    pub(crate) fn snapshot(&self) -> [u64; ACK_SLOTS] {
-        self.0
-    }
+pub(crate) fn next_cookie() -> Result<u64> {
+    // Never reuse an identity while a delayed firmware ACK can still exist.
+    // The final counter value is an exhaustion marker, not a wrapping cookie.
+    NEXT_COOKIE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+        .map(u64::from)
+        .map_err(|_| EOVERFLOW)
 }
 
 pub(crate) struct State {
@@ -101,6 +72,7 @@ pub(super) struct Transaction {
     cookie: u64,
     published: u64,
     phase: Phase,
+    announced: Option<u64>,
 }
 
 impl Queue {
@@ -136,32 +108,50 @@ impl Queue {
             cookie,
             published: now,
             phase: Phase::Published,
+            announced: None,
         });
+    }
+    /// A failed doorbell does not undo the published kill or consume its retry.
+    /// The caller retries under the device mutex; only the original record exists.
+    pub(crate) fn announce_exit(&mut self, now: u64, notify: impl FnOnce() -> Result) -> Result {
+        let Some(exit) = self.exit.as_mut() else {
+            return Ok(());
+        };
+        if exit.phase != Phase::Published || exit.announced.is_some() {
+            return Ok(());
+        }
+        notify()?;
+        exit.announced = Some(now);
+        Ok(())
     }
     pub(crate) fn exit_polling(&self, now: u64) -> bool {
         self.exit.as_ref().is_some_and(|exit| {
-            exit.phase == Phase::Published && now.saturating_sub(exit.published) < POLL_NS
+            exit.phase == Phase::Published
+                && now.saturating_sub(exit.announced.unwrap_or(exit.published)) < POLL_NS
         })
     }
-    pub(crate) fn exit_cookie(&self) -> Option<u64> {
-        self.exit
-            .as_ref()
-            .filter(|exit| matches!(exit.phase, Phase::Published | Phase::Acknowledged))
-            .map(|exit| exit.cookie)
+    /// Event consumption and record_exit are serialized by the device mutex.
+    /// A kill pins this exact queue transaction through its final witness;
+    /// duplicate, unknown and terminal cookies cannot acknowledge another owner.
+    pub(crate) fn acknowledge_exit(&mut self, cookie: u64) -> bool {
+        let Some(exit) = self.exit.as_mut() else {
+            return false;
+        };
+        if cookie == 0 || exit.cookie != cookie || exit.phase != Phase::Published {
+            return false;
+        }
+        exit.phase = Phase::Acknowledged;
+        true
     }
     pub(crate) fn settle_exit(
         &mut self,
-        acks: &Acks,
         recovery_closed: bool,
+        complete_qos: &mut impl FnMut(crate::g17::qos::Owner) -> Result,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
-        let Some(cookie) = self.exit_cookie() else {
-            return Ok(());
-        };
-        if !acks.contains(cookie) {
+        if !self.exit.as_ref().is_some_and(|exit| exit.phase == Phase::Acknowledged) {
             return Ok(());
         }
-        self.exit.as_mut().ok_or(EIO)?.phase = Phase::Acknowledged;
         if self.active.len != 0 {
             if !recovery_closed {
                 return Ok(());
@@ -185,6 +175,11 @@ impl Queue {
             }
         }
         while let Some(active) = self.active.front() {
+            if active.qos_pending {
+                complete_qos(self.qos_owner())?;
+                self.active.iter_mut().next().ok_or(EIO)?.qos_pending = false;
+            }
+            let active = self.active.front().ok_or(EIO)?;
             defer(Deferred::Retired(
                 active.packet.completion.clone(),
                 Err(if self.spared_deferred {
@@ -202,6 +197,7 @@ impl Queue {
         self.spared_quarantine = false;
         self.retire_pending = false;
         self.retirement_ready = false;
+        self.update_slot_accounting();
         Ok(())
     }
 }

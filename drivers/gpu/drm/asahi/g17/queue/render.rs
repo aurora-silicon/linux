@@ -512,6 +512,7 @@ impl Pair {
             mcache,
             event_mask: abi::RENDER_KICK_EVENT_MASK,
             register_arrays: arrays,
+            compute_scratch: false,
         };
         let ta_args = args(
             0,
@@ -789,7 +790,7 @@ impl Pair {
     }
 
     pub(crate) fn needs_drain(&self) -> bool {
-        self.quarantined && self.in_flight()
+        self.quarantined
     }
 
     pub(crate) fn oldest_spared(&self) -> Option<bool> {

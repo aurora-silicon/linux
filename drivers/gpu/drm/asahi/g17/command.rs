@@ -3,6 +3,7 @@
 //! Decode a submission and validate its user resources before publishing any work.
 
 use super::fw::{
+    compute::ScratchRequest,
     kick::WriteRange,
     render::{RenderPass, UscProgram, ZlsSurface},
 };
@@ -279,6 +280,7 @@ pub(crate) enum Validated {
         timestamps: [uapi::drm_asahi_timestamps; 2],
     },
     Compute {
+        scratch: ScratchRequest,
         usc_base: u64,
         cdm_va: u64,
         cdm_end_va: u64,
@@ -395,7 +397,11 @@ impl Payload {
                             | (u64::from(cmd.bg_partial_rsrc_spec_hi) << 32),
                     },
                     eot_offset: cmd.eot.usc,
+                    eot_rsrc_spec: u64::from(cmd.eot.rsrc_spec)
+                        | (u64::from(cmd.bg_eot_rsrc_spec_hi) << 32),
                     partial_eot_offset: cmd.partial_eot.usc,
+                    partial_eot_rsrc_spec: u64::from(cmd.partial_eot.rsrc_spec)
+                        | (u64::from(cmd.bg_eot_partial_rsrc_spec_hi) << 32),
                     rsrc_spec_hi: cmd.flags & RSRC_SPEC_HI != 0,
                 };
                 Ok(Validated::Render {
@@ -406,7 +412,6 @@ impl Payload {
             }
             Self::Compute(cmd, attachments) => {
                 if cmd.flags != 0
-                    || cmd.scs_layout != 0
                     || cmd.cdm_ctrl_stream_base & 3 != 0
                     || cmd.cdm_ctrl_stream_end & 3 != 0
                     || cmd.cdm_ctrl_stream_end <= cmd.cdm_ctrl_stream_base
@@ -423,6 +428,7 @@ impl Payload {
                 sampler(space, cmd.sampler_heap, cmd.sampler_count)?;
                 attachments.validate(space)?;
                 Ok(Validated::Compute {
+                    scratch: ScratchRequest::new(cmd.scs_layout)?,
                     usc_base: window.base,
                     cdm_va: cmd.cdm_ctrl_stream_base,
                     cdm_end_va: cmd.cdm_ctrl_stream_end - 4,

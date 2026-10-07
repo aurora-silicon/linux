@@ -29,6 +29,7 @@ use kernel::{prelude::*, sync::Arc};
 const QIDS: usize = 128;
 const FIRST_COMPUTE_QID: u8 = 4;
 const RECOVERY_SETTLE_POLLS: usize = 200;
+const WORK_RING_WAIT_NS: u64 = super::job::TIMEOUT_MS as u64 * 1_000_000;
 
 /// A reservation remains identifiable while its backing is built without the
 /// device mutex. Failed construction returns the slot, never its host identity.
@@ -56,10 +57,10 @@ pub(super) struct Registry {
     compute: KVec<Option<ComputeEntry>>,
     pub(super) compute_building: bool,
     compute_scheduler_building: bool,
+    replay_outer_wait: Option<u64>,
     pub(super) observations: compute::retirement::Batch,
     worker_deferred: Option<DeferredBatch>,
     teardown: super::teardown::Pending,
-    exit_acks: compute::exit::Acks,
 }
 
 impl Registry {
@@ -91,10 +92,10 @@ impl Registry {
             },
             compute_building: false,
             compute_scheduler_building: false,
+            replay_outer_wait: None,
             observations: compute::retirement::Batch::new()?,
             worker_deferred: Some(DeferredBatch::worker()?),
             teardown: super::teardown::Pending::new()?,
-            exit_acks: compute::exit::Acks::new(),
         })
     }
 
@@ -235,6 +236,7 @@ impl Backend {
         owner: u64,
     ) -> Result<(Arc<Self>, admission::QueueSlot)> {
         let lease = shared.preparations.enter(true)?;
+        let dev = shared.drm()?;
         let (uat, pool, qos, execution, slot) = {
             let mut state = shared.state.lock();
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
@@ -252,7 +254,7 @@ impl Backend {
             )
         };
         let alloc = super::object::Allocator {
-            dev: &shared.dev,
+            dev: &dev,
             uat: &uat,
         };
         let owner_pid =
@@ -285,6 +287,7 @@ impl Backend {
     fn shared_compute(&self) -> Result {
         loop {
             let lease = self.shared.preparations.enter(false)?;
+            let dev = self.shared.drm()?;
             let uat = {
                 let mut state = self.shared.state.lock();
                 loop {
@@ -310,7 +313,7 @@ impl Backend {
                 }
             };
             let alloc = super::object::Allocator {
-                dev: &self.shared.dev,
+                dev: &dev,
                 uat: &uat,
             };
             let mut built = Some(super::initdata::ComputeShared::new(&alloc));
@@ -406,6 +409,7 @@ impl Backend {
         }
         loop {
             let lease = self.shared.preparations.enter(false)?;
+            let dev = self.shared.drm()?;
             let (uat, reservation) = {
                 let mut state = self.shared.state.lock();
                 let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
@@ -423,7 +427,7 @@ impl Backend {
                 (firmware.uat.clone(), reservation)
             };
             let alloc = super::object::Allocator {
-                dev: &self.shared.dev,
+                dev: &dev,
                 uat: &uat,
             };
             let built = (|| {
@@ -527,7 +531,19 @@ impl DeferredBatch {
                 completion.status().record(*error);
             }
         }
-        self.values.push_within_capacity(value).map_err(|_| EIO)
+        self.values.push_within_capacity(value).map_err(|_| EIO)?;
+        // A later publisher can borrow this pair before finish signals its old
+        // fence. Publish the exact completion's witness only after collection
+        // succeeds; failure fences and rejected events are not retirement.
+        if let Some(
+            Deferred::Retired(completion, _)
+            | Deferred::Drained(completion, _)
+            | Deferred::Release(completion),
+        ) = self.values.last()
+        {
+            completion.note_retirement_queued();
+        }
+        Ok(())
     }
     /// Called only after releasing the device mutex.
     pub(super) fn finish(&mut self) {
@@ -594,6 +610,11 @@ impl super::Firmware {
         deferred: &mut DeferredBatch,
     ) -> Result {
         if self.recovery.pending() {
+            return Err(EAGAIN);
+        }
+        // No descriptor, accounting or inner producer changes precede this
+        // capacity check. The same device lock covers queue.publish below.
+        if !self.init.work_ready(DataMaster::Compute)? {
             return Err(EAGAIN);
         }
         let queues = &mut self.queues;
@@ -751,13 +772,15 @@ impl Backend {
             deferred.finish();
             let pending = pending?;
             if !pending {
-                break;
+                return self.build_compute();
             }
             // Other owners continue submitting while this owner gives its
             // queue-local drain witness time to arrive.
             fsleep(Delta::from_millis(1));
         }
-        self.build_compute()
+        // No new command has been accepted. Keep the spared queue and its
+        // retained work intact until a later admission observes its witness.
+        Err(EBUSY)
     }
 
     /// Called after taking this packet's publication claim. All waits and work
@@ -769,6 +792,7 @@ impl Backend {
     ) -> Result {
         packet.check_dependencies()?;
         let mut recovery_polls = 0;
+        let mut outer_wait = None;
         loop {
             if packet.completion.status().get() != 0 {
                 return Err(EIO);
@@ -826,6 +850,20 @@ impl Backend {
                 kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
                 continue;
             }
+            if matches!(result, Err(EAGAIN)) && !packet.is_published() {
+                let now = now_ns();
+                let since = *outer_wait.get_or_insert(now);
+                if now.saturating_sub(since) >= WORK_RING_WAIT_NS {
+                    return Err(EBUSY);
+                }
+                // Backpressure owns no firmware-visible attempt. Other queues
+                // can submit and the event worker can retire while we sleep.
+                drop(state);
+                drop(lease);
+                self.shared.queue_events();
+                kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+                continue;
+            }
             return result;
         }
     }
@@ -863,12 +901,15 @@ impl super::Firmware {
 }
 
 impl super::Shared {
-    /// Joins construction and serializes the stop writes with detachment.
-    /// After installation, seeing no owner proves that an earlier stop caller
-    /// has already stopped both processors. Callbacks and destruction follow
-    /// outside the device mutex.
+    /// Joins construction and complete host teardown, including RTKit drops.
+    /// The stop-only mutex outlives detached firmware destruction, so unbind
+    /// cannot return while another stop caller still owns mailbox clients.
+    /// Completion callbacks remain outside the device mutex. Direct handlers
+    /// do not synchronously request or join stop; this path does not join
+    /// scheduler workers.
     pub(super) fn stop_queues(&self) {
         self.preparations.wait_drained();
+        let _stopping = self.stop.lock();
         let firmware = {
             let mut state = self.state.lock();
             if let Some(firmware) = (*state).as_deref_mut() {
@@ -879,6 +920,8 @@ impl super::Shared {
         };
         if let Some(mut firmware) = firmware {
             firmware.finish_stopped_queues();
+            // RTKit destruction still dereferences the mailbox provider.
+            drop(firmware);
         }
     }
 }

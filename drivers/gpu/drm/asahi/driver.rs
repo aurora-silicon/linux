@@ -75,6 +75,7 @@ impl drm::driver::Driver for AsahiDriver {
     type Object = drm::gem::shmem::Object<AsahiObject>;
 
     const INFO: drm::driver::DriverInfo = INFO;
+    const MODULE: Option<&'static kernel::ThisModule> = Some(&crate::THIS_MODULE);
     const FEATURES: u32 = drm::driver::FEAT_GEM
         | drm::driver::FEAT_RENDER
         | drm::driver::FEAT_SYNCOBJ

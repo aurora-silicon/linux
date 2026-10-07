@@ -22,29 +22,30 @@ use kernel::{prelude::*, sync::Arc};
 const QIDS: u8 = 128;
 const GUILTY: u8 = 1 << 1;
 const CANCELLED: u8 = 1 << 2;
-/// Retained valid entries, in firmware table order.
-pub(super) const MAX_ENTRIES: usize = 64;
 const MAX_GUILTY_VMS: usize = 8;
 const RECOVERY_POLLS: usize = 500;
 
-/// One valid entry from the firmware's 256-entry recovery table.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub(super) struct Entry {
-    pub(super) qid: u8,
-    pub(super) flags: u8,
-    pub(super) stamp: u32,
+/// Per-QID classifications from the complete firmware recovery table.
+/// Multiple records for a queue contribute all of their classification bits.
+#[derive(Default)]
+pub(super) struct Entries {
+    guilty: u128,
+    cancelled: u128,
 }
 
-impl Entry {
-    pub(super) const fn decode(flags: u32, stamp: u32) -> Option<Self> {
+impl Entries {
+    pub(super) fn include(&mut self, flags: u32) {
         if flags & 1 == 0 {
-            return None;
+            return;
         }
-        Some(Self {
-            qid: ((flags >> 4) & 0x7f) as u8,
-            flags: (flags & 0xf) as u8,
-            stamp: stamp >> 8,
-        })
+        let qid = (flags >> 4) & 0x7f;
+        let bit = 1u128 << qid;
+        if flags & u32::from(GUILTY) != 0 {
+            self.guilty |= bit;
+        }
+        if flags & u32::from(CANCELLED) != 0 {
+            self.cancelled |= bit;
+        }
     }
 }
 
@@ -83,7 +84,7 @@ pub(super) trait Memory {
     fn fault_sources(&self) -> Result<Sources>;
     fn transition(&self, expected: u32, next: u32) -> Result;
     fn clear_timestamps(&self) -> Result;
-    fn entries(&self, out: &mut [Entry; MAX_ENTRIES]) -> Result<usize>;
+    fn entries(&self) -> Result<Entries>;
     /// One millisecond wait; this is polled because the firmware sends no state-3 notification.
     fn wait_tick(&self);
 }
@@ -163,10 +164,31 @@ pub(super) fn service<H: Host>(
     crashed: impl Fn() -> bool,
 ) -> Result<ServiceResult> {
     let request = host.recovery().pending.ok_or(EINVAL)?;
-    if host.recovery_state()? != 1
-        || request.generation != host.recovery().accepted
-        || host.host_recovery()? != 0
-    {
+    if request.generation != host.recovery().accepted || host.host_recovery()? != 0 {
+        return Err(EIO);
+    }
+    // The restart record is published before firmware announces state 1.
+    // Its ring cursor is already consumed; wait only for that readiness word,
+    // without advancing the host generation or acknowledging an early event.
+    let mut ready = false;
+    for _ in 0..RECOVERY_POLLS {
+        if crashed() {
+            return Err(EIO);
+        }
+        match host.recovery_state()? {
+            1 => {
+                ready = true;
+                break;
+            }
+            0 => host.wait_tick(),
+            _ => return Err(EIO),
+        }
+    }
+    if !ready {
+        return Err(ETIMEDOUT);
+    }
+    // Recheck ownership after the off-CPU waits, before any handshake mutation.
+    if host.host_recovery()? != 0 {
         return Err(EIO);
     }
     host.recovery_mut().accepted = host.recovery().accepted.wrapping_add(1);
@@ -190,16 +212,15 @@ pub(super) fn service<H: Host>(
     if !recovered {
         return Err(ETIMEDOUT);
     }
-    let mut entries = [Entry::default(); MAX_ENTRIES];
     // A failed table read leaves only the explicit blamed QID as evidence of guilt.
-    let count = host.entries(&mut entries).unwrap_or(0).min(MAX_ENTRIES);
+    let entries = host.entries().unwrap_or_default();
     host.transition(3, 0)?;
     if host.recovery_state()? != 0 {
         return Err(EIO);
     }
     host.recovery_mut().pending = None;
 
-    let cancelled = classify(host, &entries[..count], request.blamed, &mut sources);
+    let cancelled = classify(host, entries, request.blamed, &mut sources);
     if let Some(qid) = request.blamed {
         host.settle_blamed_render(qid, EIO);
     }
@@ -214,17 +235,9 @@ pub(super) fn service<H: Host>(
 /// Resolves guilty QIDs before changing any completion's classification. Unknown ownership or
 /// too many distinct guilty VMs leaves all prior classifications intact. The oldest spared work
 /// of a QID makes later blame collateral to its previous recovery, rather than new VM guilt.
-fn classify<Q: Queues>(queues: &mut Q, entries: &[Entry], blamed: Option<u8>, sources: &mut Sources) -> u128 {
-    let mut guilty_qids = blamed.map_or(0, |qid| 1u128 << qid);
-    let mut cancelled = 0u128;
-    for entry in entries {
-        if entry.flags & GUILTY != 0 {
-            guilty_qids |= 1u128 << entry.qid;
-        }
-        if entry.flags & CANCELLED != 0 {
-            cancelled |= 1u128 << entry.qid;
-        }
-    }
+fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, sources: &mut Sources) -> u128 {
+    let mut guilty_qids = entries.guilty | blamed.map_or(0, |qid| 1u128 << qid);
+    let cancelled = entries.cancelled;
     let attribution = sources.attribute(blamed, |qid, stamp| queues.render_pass_started(qid, stamp));
     match attribution {
         Attribution::Firmware => {}

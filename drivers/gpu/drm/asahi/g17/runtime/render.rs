@@ -239,6 +239,17 @@ impl Registry {
         Ok(())
     }
 
+    /// Only an optional sibling's unpublished QID-capacity refusal is soft.
+    /// ensure_render_ids cancels a first ID if the second cannot be reserved;
+    /// validation, identity overflow, and cancellation errors still propagate.
+    fn prepare_render_ids(&mut self, slot: u8, owner: u64, optional: bool) -> Result<bool> {
+        match self.ensure_render_ids(slot, owner) {
+            Ok(()) => Ok(true),
+            Err(error) if optional && error == ENOSPC => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     fn reserve_render(&mut self, slot: u8, owner: u64) -> Result<Reservation> {
         self.ensure_render_ids(slot, owner)?;
         let entry = self.render.entry(slot)?;
@@ -318,7 +329,7 @@ impl Registry {
             }
             if let Some(pair) = entry.pair.as_mut() {
                 pair.quarantine(error, &mut |event| deferred.push(event))?;
-            } else if entry.preparing.is_some() {
+            } else if entry.preparing.is_some() || entry.growing {
                 entry.pending_error = Some((status.clone(), error));
             }
         }
@@ -332,7 +343,7 @@ struct Host<'a> {
 }
 impl Host<'_> {
     fn release_registration(&mut self) {
-        if !core::mem::take(&mut self.registration_powered) {
+        if !self.registration_powered && !self.firmware.registration_power_release_pending {
             return;
         }
         if let Err(error) = self.firmware.release_registration_power() {
@@ -341,6 +352,8 @@ impl Host<'_> {
                 "Could not restore render idle policy: {:?}\n",
                 error
             );
+        } else {
+            self.registration_powered = false;
         }
     }
 }
@@ -647,7 +660,10 @@ impl Registry {
             let active = entry
                 .pair
                 .as_ref()
-                .map_or(entry.borrowed_active, |pair| pair.published_in_flight());
+                .map_or(
+                    (entry.preparing.is_some() || entry.growing) && entry.borrowed_active,
+                    |pair| pair.published_in_flight(),
+                );
             active
                 && entry.reservation.ids.into_iter().all(|id| {
                     let qid = usize::from(id.qid());
@@ -660,6 +676,12 @@ impl Registry {
         packet: &Arc<Packet>,
         error: Error,
     ) -> bool {
+        // Its tracker may already be gone while off-lock completion still
+        // owns the fence and admission lease. A loan for a subsequent packet
+        // cannot turn this exact accepted retirement into a missing-owner error.
+        if packet.completion.retirement_queued() {
+            return true;
+        }
         let Some(slot) = packet.completion.render_slot() else {
             return false;
         };

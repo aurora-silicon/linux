@@ -520,40 +520,19 @@ impl Vm {
         self.unmap_user_ranges_now(user, kernel)
     }
 
-    fn unmap_user_ranges_now(&self, user: Range<u64>, kernel: Range<u64>) -> Result {
-        let driver = self
-            .lifetime
-            .as_ref()
-            .map(|lifetime| lifetime.driver.lock());
-        let mut cursor = user.start;
-        while cursor < user.end {
-            let mut next = user.end;
-            let mut covered = cursor;
-            for range in Iterator::chain(
-                core::iter::once(kernel.clone()),
-                driver
-                    .as_ref()
-                    .and_then(|guard| guard.as_ref())
-                    .into_iter()
-                    .flat_map(DriverMappings::ranges),
-            ) {
-                if range.contains(&cursor) {
-                    covered = covered.max(range.end);
-                } else if cursor < range.start {
-                    next = next.min(range.start);
-                }
-            }
-            if covered != cursor {
-                cursor = covered.min(user.end);
-                continue;
-            }
-            if next <= cursor {
-                return Err(EIO);
-            }
-            self.unmap_range_now(cursor, next - cursor)?;
-            cursor = next;
+    fn unmap_user_ranges_now(&self, user: Range<u64>, _kernel: Range<u64>) -> Result {
+        // User mappings alone have GPUVA nodes. Kernel and driver aliases use
+        // mm::Node and are untouched; GPUVM's embedded kernel cutout is skipped.
+        // Closed admission and zero accepted jobs make whole-node teardown safe.
+        let mut inner = self.inner.lock_inner();
+        let result = inner.unmap_all(VmInner::unmap_gpuva);
+        if result.is_ok() {
+            self.untrack_shared_range(user.start, user.end - user.start);
         }
-        Ok(())
+        drop(inner);
+        // Final GEM/SG-table destruction may acquire reservations itself.
+        self.bo_deferred_cleanup();
+        result
     }
 }
 

@@ -39,6 +39,15 @@ pub(crate) fn independent(contexts: &FenceContexts) -> Result<UserFence<Completi
     Ok(fence.into())
 }
 
+/// An immutable failure fence allocated before the queue is exposed to ioctls.
+/// Reusing it for rejected submissions cannot retain or subsume accepted work.
+pub(crate) fn allocation_failure(contexts: &FenceContexts) -> Result<Fence> {
+    let fence = independent(contexts)?;
+    fence.set_error(ENOMEM);
+    fence.signal();
+    Ok(Fence::from_fence(&fence))
+}
+
 /// All command members of an ioctl share its work-state node and aggregate fence.
 /// The initial member keeps the aggregate unsignalled until enqueue finishes.
 #[pin_data]
@@ -165,14 +174,25 @@ pub(crate) struct Outputs {
 impl Outputs {
     pub(crate) fn new(
         contexts: &FenceContexts,
-        syncs: KVec<SyncItem>,
+        mut syncs: KVec<SyncItem>,
         input_count: usize,
+        allocation_failure: &Fence,
     ) -> Result<Self> {
         if input_count > syncs.len() {
             return Err(EINVAL);
         }
+        let fallback = match independent(contexts) {
+            Ok(fence) => fence,
+            Err(error) => {
+                // Syncobjs and timeline-chain storage are already resolved.
+                // No work has been accepted; publish the pre-signaled ENOMEM
+                // fence without another allocation before returning the error.
+                install(syncs.drain(input_count..), allocation_failure);
+                return Err(error);
+            }
+        };
         Ok(Self {
-            fallback: independent(contexts)?,
+            fallback,
             syncs,
             input_count,
             submission: None,

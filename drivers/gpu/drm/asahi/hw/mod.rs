@@ -548,14 +548,13 @@ impl PwrConfig {
             return Err(EINVAL);
         }
 
-        let pz_count = pz_data.len() / 3;
         let mut power_zones = KVec::new();
-        for i in (0..pz_count).step_by(3) {
+        for zone in pz_data.chunks_exact(3) {
             power_zones.push(
                 PowerZone {
-                    target: pz_data[i],
-                    target_offset: pz_data[i + 1],
-                    filter_tc: pz_data[i + 2],
+                    target: zone[0],
+                    target_offset: zone[1],
+                    filter_tc: zone[2],
                 },
                 GFP_KERNEL,
             )?;

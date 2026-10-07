@@ -70,6 +70,8 @@ pub(super) trait Control {
     fn counters(&self) -> kernel::error::Result<[u32; 3]>;
     fn set_idle(&mut self, enabled: bool) -> kernel::error::Result<u32>;
     fn wait_tick(&self);
+    fn registration_release_failed(&mut self) {}
+    fn registration_release_succeeded(&mut self) {}
 }
 
 fn wait<C: Control>(control: &C, target: u32, require_powered: bool) -> kernel::error::Result {
@@ -113,13 +115,25 @@ pub(super) fn acquire<C: Control>(control: &mut C) -> kernel::error::Result {
         }
         Err(EAGAIN)
     })();
-    if result.is_err() {
-        let _ = release(control);
+    if result.is_err() && release(control).is_err() {
+        control.registration_release_failed();
     }
     result
 }
 
 pub(super) fn release<C: Control>(control: &mut C) -> kernel::error::Result {
-    let target = control.set_idle(true)?;
-    wait(control, target, false)
+    let target = match control.set_idle(true) {
+        Ok(target) => target,
+        Err(error) => {
+            control.registration_release_failed();
+            return Err(error);
+        }
+    };
+    let result = wait(control, target, false);
+    if result.is_ok() {
+        control.registration_release_succeeded();
+    } else {
+        control.registration_release_failed();
+    }
+    result
 }

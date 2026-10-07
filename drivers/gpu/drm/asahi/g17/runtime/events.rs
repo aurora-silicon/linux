@@ -64,7 +64,7 @@ impl event::Host for Service<'_> {
 
 impl event::Queues for Service<'_> {
     fn context_killed(&mut self, cookie: u64) {
-        self.firmware.queues.exit_acks.note(cookie);
+        self.firmware.queues.acknowledge_compute_exit(cookie);
     }
     fn flush_tvb_reply(&mut self) -> Result<bool> {
         self.firmware.flush_tvb_reply()
@@ -125,8 +125,8 @@ impl recovery::Memory for Service<'_> {
     fn clear_timestamps(&self) -> Result {
         self.firmware.init.clear_timestamps()
     }
-    fn entries(&self, out: &mut [recovery::Entry; recovery::MAX_ENTRIES]) -> Result<usize> {
-        self.firmware.init.entries(out)
+    fn entries(&self) -> Result<recovery::Entries> {
+        self.firmware.init.entries()
     }
     fn wait_tick(&self) {
         self.firmware.init.wait_tick();
@@ -395,8 +395,16 @@ impl crate::g17::Shared {
         }
         let backpressured = firmware.render_control_backpressured();
         let polling = backpressured
+            || firmware.queues.replay_outer_wait.is_some()
             || firmware.queues.teardown.polling(now)
-            || firmware.compute_exit_polling(now);
+            || firmware.compute_exit_polling(now)
+            || firmware
+                .queues
+                .compute
+                .iter()
+                .flatten()
+                .filter_map(|entry| entry.queue.as_deref())
+                .any(|queue| queue.retirement_polling());
         if polling {
             self.queue_poll();
         }

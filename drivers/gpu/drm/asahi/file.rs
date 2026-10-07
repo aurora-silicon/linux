@@ -178,11 +178,11 @@ impl SyncItem {
         in_count: u32,
         out_count: u32,
     ) -> Result<KVec<SyncItem>> {
-        let count = in_count + out_count;
-        let mut vec = KVec::with_capacity(count as usize, GFP_KERNEL)?;
+        let count = in_count.checked_add(out_count).ok_or(EOVERFLOW)?;
 
         const STRIDE: usize = core::mem::size_of::<uapi::drm_asahi_sync>();
-        let size = STRIDE * count as usize;
+        let size = STRIDE.checked_mul(count as usize).ok_or(EOVERFLOW)?;
+        let mut vec = KVec::with_capacity(count as usize, GFP_KERNEL)?;
 
         // SAFETY: We only read this once, so there are no TOCTOU issues.
         let mut reader = UserSlice::new(UserPtr::from_addr(ptr as _), size).reader();
@@ -655,7 +655,9 @@ impl File {
         let vm_id = data.vm_id.try_into()?;
 
         let mut vec = KVec::new();
-        let size = (data.stride * data.num_binds) as usize;
+        let size = usize::try_from(data.stride)?
+            .checked_mul(usize::try_from(data.num_binds)?)
+            .ok_or(EOVERFLOW)?;
         let reader = UserSlice::new(UserPtr::from_addr(data.userptr as _), size).reader();
         reader.read_all(&mut vec, GFP_KERNEL)?;
         let mut reader = Reader::new(&vec);
@@ -761,6 +763,9 @@ impl File {
         data: &uapi::drm_asahi_gem_bind_op,
         file: &DrmFile,
     ) -> Result<u32> {
+        if data.range == 0 {
+            return Err(EINVAL);
+        }
         if (data.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_UNBIND) != 0 {
             Self::do_gem_unbind(vm_id, data, file)
         } else {
@@ -1033,7 +1038,10 @@ impl File {
             .inner()
             .objects()
             .lock()
-            .insert_limit(1..=u32::MAX, obj, GFP_KERNEL)? as u64;
+            .insert_limit(1..=u32::MAX, obj, GFP_KERNEL);
+        // StoreError owns the rejected object. Convert it only after the
+        // temporary XArray guard is gone: dropping a mapping may sleep.
+        let handle = handle? as u64;
 
         data.object_handle = handle as u32;
         Ok(0)

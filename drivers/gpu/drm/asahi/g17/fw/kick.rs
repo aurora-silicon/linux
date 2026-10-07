@@ -369,6 +369,8 @@ pub(crate) struct KickArgs<'a> {
     pub(crate) event_mask: [u64; 4],
     /// Register arrays bound to the kick.
     pub(crate) register_arrays: [Option<RegisterArrayBinding>; 4],
+    /// The compute register program includes a shader-context scratch request.
+    pub(crate) compute_scratch: bool,
 }
 
 /// One kick ring entry.
@@ -379,7 +381,7 @@ pub(crate) struct KickArgs<'a> {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct KickEntry {
     /// Timestamp in bits 41:2, QID in bits 48:42, MCache table present in bit
-    /// 58 and queue priority in bits 60:59.
+    /// 58, queue priority in bits 60:59 and compute scratch enabled in bit 61.
     pub(crate) header: u64,
     /// MCache table: address >> 5 in bits 43:6, count - 1 in bits 59:54.
     pub(crate) mcache: u64,
@@ -419,6 +421,7 @@ impl KickEntry {
     const QID_SHIFT: u32 = 42;
     const MCACHE_PRESENT: u64 = 1 << 58;
     const PRIORITY_SHIFT: u32 = 59;
+    const COMPUTE_SCRATCH: u64 = 1 << 61;
     const QOS_SLOT_SHIFT: u32 = 32;
     const QOS_CLASS_SHIFT: u32 = 40;
     const QOS_CLASS_MAX: u8 = 0x1f;
@@ -440,6 +443,9 @@ impl KickEntry {
         let mut header = args.timestamp.get() << Self::TIMESTAMP_SHIFT
             | (args.qid as u64) << Self::QID_SHIFT
             | (QUEUE_PRIORITY as u64) << Self::PRIORITY_SHIFT;
+        if args.compute_scratch {
+            header |= Self::COMPUTE_SCRATCH;
+        }
         let mcache = match args.mcache {
             Some(table) => {
                 header |= Self::MCACHE_PRESENT;

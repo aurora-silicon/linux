@@ -82,7 +82,8 @@ pub(crate) fn tlbi_range(asid: Asid, va: usize, len: usize) {
     let start_pg = va >> mmu::UAT_PGBIT;
     let end_pg = (va + len + mmu::UAT_PGMSK) >> mmu::UAT_PGBIT;
 
-    let mut val: u64 = ((asid as u64) << 48) | (2 << 46) | (start_pg as u64 & 0x1fffffffff);
+    const BADDR_MASK: u64 = (1 << 37) - 1;
+    let mut val: u64 = ((asid as u64) << 48) | (2 << 46) | (start_pg as u64 & BADDR_MASK);
     let pages = end_pg - start_pg;
 
     // Guess? It's possible that the page count is in terms of 4K pages
@@ -124,6 +125,10 @@ pub(crate) fn tlbi_range(asid: Asid, va: usize, len: usize) {
             );
         }
         base -= 32;
+        // Each full operation covers 32 units of 2 << bits GPU granules.
+        // Advance only the base-address field, preserving the ASID and scale.
+        let next = (val & BADDR_MASK) + (32u64 << (bits + 1));
+        val = (val & !BADDR_MASK) | (next & BADDR_MASK);
     }
 
     // SAFETY: tlbi is always safe by definition

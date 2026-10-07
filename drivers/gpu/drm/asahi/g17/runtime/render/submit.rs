@@ -260,6 +260,13 @@ impl crate::g17::Firmware {
         if packet.completion.status().get() != 0 {
             return Err(EIO);
         }
+        // Both outer destinations must have room before pool accounting or
+        // either inner queue becomes visible. All host producers share this lock.
+        if !self.init.work_ready(crate::g17::fw::queue::DataMaster::Fragment)?
+            || !self.init.work_ready(crate::g17::fw::queue::DataMaster::Tiling)?
+        {
+            return Err(EBUSY);
+        }
         let mut dependencies = [KickDependency::ZERO; 3];
         let count = self
             .queues

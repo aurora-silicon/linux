@@ -40,6 +40,7 @@ pub(crate) struct AGXDumpInfo {
     gpu_rev: hw::GpuRevision,
     total_active_cores: u32,
     firmware_version: [u32; 6],
+    reserved: u32,
 }
 
 struct ELFNote {
@@ -104,6 +105,7 @@ impl CrashDumpBuilder {
             gpu_rev: dyncfg.id.gpu_rev,
             total_active_cores: dyncfg.id.total_active_cores,
             firmware_version: [0; 6],
+            reserved: 0,
             initdata_address,
         };
         info.firmware_version[..dyncfg.firmware_version.len().min(6)]

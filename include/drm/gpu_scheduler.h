@@ -538,6 +538,14 @@ struct drm_sched_backend_ops {
 	 * drm_sched_backend_ops.free_job.
 	 */
 	void (*cancel_job)(struct drm_sched_job *sched_job);
+
+	/**
+	 * @owner: Optional module implementing these callbacks. The caller must
+	 * retain this module through entity destruction. Detached entity-kill
+	 * work takes its own reference before leaving that boundary and releases
+	 * it only after free_job returns to the scheduler core.
+	 */
+	struct module *owner;
 };
 
 /**

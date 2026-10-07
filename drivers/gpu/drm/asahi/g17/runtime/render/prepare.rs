@@ -60,15 +60,18 @@ enum Build {
 }
 
 impl super::super::Backend {
-    fn build_render_pair(&self, slot: u8, first: &Arc<Packet>) -> Result {
+    fn build_render_pair(&self, slot: u8, first: &Arc<Packet>, optional: bool) -> Result {
         let lease = self.shared.preparations.enter(false)?;
+        let dev = self.shared.drm()?;
         let (resources, build) = {
             let mut state = self.shared.state.lock();
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
             if !lease.is_current() {
                 return Err(EAGAIN);
             }
-            firmware.queues.ensure_render_ids(slot, self.owner)?;
+            if !firmware.queues.prepare_render_ids(slot, self.owner, optional)? {
+                return Ok(());
+            }
             let resources = BuildResources::new(firmware)?;
             let build =
                 if let Some(entry) = firmware.queues.render.entries[usize::from(slot)].as_ref() {
@@ -159,7 +162,7 @@ impl super::super::Backend {
             (resources, build)
         };
         let alloc = Allocator {
-            dev: &self.shared.dev,
+            dev: &dev,
             uat: &resources.uat,
         };
         let fresh_graph = match &build {
@@ -458,7 +461,7 @@ impl super::super::Backend {
     }
 
     pub(super) fn ensure_render(&self, packet: &Arc<Packet>, slot: u8) -> Result {
-        self.build_render_pair(slot, packet)?;
+        self.build_render_pair(slot, packet, false)?;
         let sibling = {
             let state = self.shared.state.lock();
             (*state)
@@ -469,7 +472,12 @@ impl super::super::Backend {
                 .warmable_sibling(self.owner, slot)
         };
         if let Some(sibling) = sibling {
-            self.build_render_pair(sibling, packet)?;
+            // An optional sibling may be borrowed or waiting for recovery.
+            // The selected pair is revalidated by prepare_render before publication.
+            match self.build_render_pair(sibling, packet, true) {
+                Err(error) if error == EBUSY || error == EAGAIN => {}
+                result => result?,
+            }
         }
         Ok(())
     }
@@ -481,6 +489,7 @@ impl super::super::Backend {
         deferred: &mut super::super::DeferredBatch,
     ) -> Result {
         let lease = self.shared.preparations.enter(false)?;
+        let dev = self.shared.drm()?;
         let (uat, mut pair, addresses, growth_target) = {
             let mut state = self.shared.state.lock();
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
@@ -535,7 +544,7 @@ impl super::super::Backend {
             (firmware.uat.clone(), pair, addresses, growth_target)
         };
         let alloc = Allocator {
-            dev: &self.shared.dev,
+            dev: &dev,
             uat: &uat,
         };
         let mut growth = None;
@@ -543,7 +552,7 @@ impl super::super::Backend {
             if let Some((target, descriptor)) = growth_target {
                 let vm = pair.context().vm().clone();
                 growth = pair.manager().prepare_growth(
-                    &self.shared.dev,
+                    &dev,
                     &vm,
                     target,
                     Some(descriptor),

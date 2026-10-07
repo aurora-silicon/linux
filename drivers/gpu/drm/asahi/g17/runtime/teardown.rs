@@ -30,7 +30,10 @@ impl Reclaim {
     pub(in crate::g17) fn finish(self) {
         match self {
             Self::Binding(binding) => drop(binding),
-            Self::Context(context) => drop(context),
+            Self::Context(context) => {
+                context.release_execution();
+                drop(context);
+            }
         }
     }
 }
@@ -187,7 +190,7 @@ impl Firmware {
             primary: &mut self.primary,
             reclaim,
         };
-        teardown.publish_ready(&mut service, recovery)?;
+        teardown.publish_ready(&mut service, recovery, super::now_ns())?;
         let consumer = self.init.control_consumer()?.load(Ordering::Relaxed);
         let producer = self.init.control_producer()?.load(Ordering::Relaxed);
         while teardown

@@ -1422,6 +1422,15 @@ void drm_sched_fini(struct drm_gpu_scheduler *sched)
 	int i;
 
 	drm_sched_wqueue_stop(sched);
+	/*
+	 * wqueue_stop() cancels work that is already queued, but the completion
+	 * callback can pass its pause check concurrently and queue either item
+	 * after cancel_work_sync() returns. Finalization never restarts this
+	 * scheduler, so permanently disable and drain both work items before
+	 * touching scheduler-owned queues or destroying the workqueue.
+	 */
+	disable_work_sync(&sched->work_run_job);
+	disable_work_sync(&sched->work_free_job);
 
 	for (i = DRM_SCHED_PRIORITY_KERNEL; i < sched->num_rqs; i++)
 		kfree(sched->sched_rq[i]);

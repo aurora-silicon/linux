@@ -9,9 +9,7 @@
 //! empty slot and orders the record, power tally and producer together.
 
 use core::sync::atomic::{fence, Ordering};
-use kernel::prelude::*;
-
-use crate::driver::AsahiDevice;
+use kernel::{device::Device, prelude::*};
 
 use super::fw::{channels::*, initdata::status};
 use super::initdata::InitData;
@@ -57,15 +55,15 @@ impl Rings {
         }
     }
 
-    pub(crate) fn drain_trace(&mut self, dev: &AsahiDevice, init: &InitData, role: Role) {
+    pub(crate) fn drain_trace(&mut self, dev: &Device, init: &InitData, role: Role) {
         self.drain_report(dev, init, role, ReportRing::Trace);
     }
 
-    pub(crate) fn drain_statistics(&mut self, dev: &AsahiDevice, init: &InitData, role: Role) {
+    pub(crate) fn drain_statistics(&mut self, dev: &Device, init: &InitData, role: Role) {
         self.drain_report(dev, init, role, ReportRing::Statistics);
     }
 
-    fn drain_report(&mut self, dev: &AsahiDevice, init: &InitData, role: Role, ring: ReportRing) {
+    fn drain_report(&mut self, dev: &Device, init: &InitData, role: Role, ring: ReportRing) {
         let quarantined = &mut self.quarantined[role as usize][ring as usize];
         if *quarantined {
             return;
@@ -176,7 +174,7 @@ impl Events {
         }
     }
 
-    pub(crate) fn next(&mut self, dev: &AsahiDevice, init: &InitData) -> Result<Option<Event>> {
+    pub(crate) fn next(&mut self, dev: &Device, init: &InitData) -> Result<Option<Event>> {
         let role = self.role;
         let state = status::EVENT_STATE as usize;
         let consumer_word = init.status_word(role, state)?;

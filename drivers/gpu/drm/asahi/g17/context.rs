@@ -213,6 +213,11 @@ impl Context {
     pub(crate) fn scheduler_owner(&self) -> Arc<KernelObject> {
         self.scheduler.clone()
     }
+    /// Scheduler release and command retirement have both been witnessed.
+    /// Keep installed storage alive while returning the finite TTBAT identity.
+    pub(crate) fn release_execution(&self) {
+        self.execution.release();
+    }
     pub(crate) fn scheduler_generation(&self) -> u32 {
         self.scheduler_generation
     }

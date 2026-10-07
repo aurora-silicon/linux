@@ -6,6 +6,7 @@
 mod alloc;
 mod buffer;
 mod channel;
+mod cleanup;
 #[cfg(CONFIG_DEV_COREDUMP)]
 mod crashdump;
 mod debug;
@@ -33,8 +34,31 @@ mod util;
 mod vm;
 mod workqueue;
 
-kernel::module_platform_driver! {
-    type: driver::AsahiDriver,
+use kernel::prelude::*;
+
+#[pin_data]
+struct DriverModule {
+    // Field drop order unregisters/joins driver producers before queue teardown.
+    #[pin]
+    _driver: kernel::driver::Registration<kernel::platform::Adapter<driver::AsahiDriver>>,
+    _cleanup: cleanup::QueueOwner,
+}
+
+impl kernel::InPlaceModule for DriverModule {
+    fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+        try_pin_init!(Self {
+            // Initialize the queue first, before registration can invoke probe.
+            _cleanup: cleanup::QueueOwner::new()?,
+            _driver <- kernel::driver::Registration::new(
+                <Self as kernel::ModuleMetadata>::NAME,
+                module,
+            ),
+        })
+    }
+}
+
+module! {
+    type: DriverModule,
     name: "asahi",
     description: "AGX GPU driver for Apple silicon SoCs",
     license: "Dual MIT/GPL",
