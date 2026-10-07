@@ -1409,6 +1409,13 @@ class SameAs122Test(MaxBase):
             # An M3 Pro gets the M3 Pro's Mesa once that is merged (test_m3_pro_mesa compares the rest).
             if "apple,t6030" in compat and "M3_PRO_MESA_PACKAGE" in SRC:
                 continue
+            # From 12.4 the M3 Airs get it too (test_m3_air_mesa, test_m3_air_default).
+            if board in ("j613", "j615") and "m3_mesa_mac() { is_m3_pro || is_m3_air; }" in SRC:
+                continue
+            # The J613 gets m1n1's display handoff by default from this release on
+            # (test_m3_air_default compares every other board with 12.3).
+            if board == "j613" and "j613" in re.search(r'^M3_HANDOFF_BOARDS="([^"]*)"$', SRC, re.M).group(1).split():
+                continue
             yield board
 
     def reset(self, board):
@@ -1467,7 +1474,11 @@ class SameAs122Test(MaxBase):
                 else:
                     self.assertEqual(extra, "")
                 self.assertEqual(after["out"][1:], before["out"][1:])
-        for board in ("j514c", "j516c", "j514m", "j516m", "j504", "j433", "j613", "j314s", "j700"):
+        # The M3 Airs get mesa-m3 from 12.4 on: test_m3_air_default compares them with 12.3.
+        airs_have_mesa = "m3_mesa_mac() { is_m3_pro || is_m3_air; }" in SRC
+        for board in ("j514c", "j516c", "j514m", "j516m", "j504", "j433", "j615", "j314s", "j700"):
+            if board == "j615" and airs_have_mesa:
+                continue
             self.assertIn(board, seen)
 
 

@@ -43,6 +43,7 @@ BOARDS = {
     "j514c": ["apple,j514c", "apple,t6031", "apple,arm-platform"],
     "j293": ["apple,j293", "apple,t8103", "apple,arm-platform"],
     "j613": ["apple,j613", "apple,t8122", "apple,arm-platform"],
+    "j615": ["apple,j615", "apple,t8122", "apple,arm-platform"],
     "j504": ["apple,j504", "apple,t8122", "apple,arm-platform"],
     "j314s": ["apple,j314s", "apple,t6000", "apple,arm-platform"],
     "j700": ["apple,j700", "apple,t8140", "apple,arm-platform"],
@@ -111,7 +112,7 @@ esp_bootbin() {{ [[ -f '{self.esp}/m1n1/boot.bin' ]] && echo '{self.esp}/m1n1/bo
     # Boards
 
     def test_board_classes(self):
-        expect = {"j516s": "m3 handoff", "j514s": "m3 off", "j613": "m3 off",
+        expect = {"j516s": "m3 handoff", "j514s": "m3 off", "j613": "m3 handoff", "j615": "m3 off",
                   "j514c": "m3 off", "j314s": "not-m3", "j700": "not-m3 neo"}
         for board, want in expect.items():
             with self.subTest(board=board):
@@ -201,7 +202,8 @@ esp_bootbin() {{ [[ -f '{self.esp}/m1n1/boot.bin' ]] && echo '{self.esp}/m1n1/bo
 
     def test_plan_modes(self):
         for board, stub, want in [("j516s", "14.8.3", "handoff"), ("j516s", "15.6", "kernel"),
-                                  ("j514s", "14.8.3", "kernel"), ("j613", "14.8.3", "kernel"),
+                                  ("j514s", "14.8.3", "kernel"), ("j613", "14.8.3", "handoff"),
+                                  ("j615", "14.8.3", "kernel"), ("j613", "15.6", "kernel"),
                                   ("j514c", "14.8.3", "kernel"),
                                   ("j314s", "13.5", "none"), ("j700", "26.4", "none")]:
             with self.subTest(board=board, stub=stub):
@@ -382,7 +384,8 @@ esp_bootbin() {{ [[ -f '{self.esp}/m1n1/boot.bin' ]] && echo '{self.esp}/m1n1/bo
 
     def test_packages_per_mac(self):
         for board, stub, try_, want in [("j314s", "13.5", 0, M1N1), ("j293", "13.5", 0, M1N1),
-                                        ("j700", "26.4", 0, None), ("j613", "14.8.3", 0, None),
+                                        ("j700", "26.4", 0, None), ("j613", "14.8.3", 0, M1N1),
+                                        ("j615", "14.8.3", 0, None),
                                         ("j514c", "14.8.3", 0, None), ("j514s", "14.8.3", 0, None),
                                         ("j516s", "15.6", 0, None), ("j516s", "14.8.3", 0, M1N1),
                                         ("j514s", "14.8.3", 1, M1N1)]:

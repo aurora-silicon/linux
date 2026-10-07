@@ -46,13 +46,16 @@ KEYS = RUN_KEYS + ["package", "version", "file", "sha256", "prefix", "result", "
 # An error record: the run's keys, and the ownership history.
 ERROR_KEYS = RUN_KEYS + ["package", "result", "record_error", "installed_version", "installed_by", "preexisting",
                          "render_user", "render_preexisting", "render_by_installer"]
-REPEATED = {"integration_path", "render_added_user", "user_setup_path", "user_setup_ignored", "opt_out_path",
-            "record_error_key"}
+REPEATED = {"integration_path", "replaced_package", "render_added_user", "user_setup_path", "user_setup_ignored",
+            "opt_out_path", "record_error_key"}
 INTEGRATION = re.search(r'^M3_PRO_MESA_INTEGRATION="([^"]*)"$', SRC, re.M).group(1).splitlines()
 # The reasons a login gives in mesa-m3's state file (its report, section 4.3).
-REASONS = ["active", "opt-out", "not-t6030", "no-gpu", "no-display", "no-access", "incomplete-prefix", "user-setup",
+REASONS = ["active", "opt-out", "not-supported", "experimental", "no-gpu", "no-display", "no-access",
+           "incomplete-prefix", "user-setup",
            "user-setup-ldpath", "user-setup-unknown", "missing-soname", "load-failed", "log-unreadable", "gpu-fault",
            "previous-failed"]
+# The M3 Airs (M3_AIR_BOARDS), which get mesa-m3 from 12.4 on.
+AIRS = re.search(r'^M3_AIR_BOARDS="([^"]*)"$', SRC, re.M).group(1).split()
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 RESULTS = ["installed", "current", "newer-kept", "skipped-flag", "skipped-deps", "failed"]
 TAG = re.search(r"^TAG=(\S+)$", SRC, re.M).group(1)
@@ -1295,7 +1298,7 @@ class ProMesaTest(flow.M3FlowBase):
         words = " ".join(block.split())
         self.assertIn("Reasons: " + ", ".join(REASONS) + ".", words)
         self.assertLessEqual(len(block.splitlines()), 15)
-        self.assertTrue(all(len(l) <= 100 for l in block.splitlines()))
+        self.assertTrue(all(len(l) <= 105 for l in block.splitlines()))
         # Not when mesa-m3 is not installed.
         reset_mac(self, "j516s")
         proc = self.install(env="M3_PRO_MESA=0")
@@ -1506,7 +1509,10 @@ class OtherMacsTest(flow.M3FlowBase):
     """Every Mac but the M3 Pro, with this script and with 12.2's: the same commands, in the same
     order, with the same results on disk."""
 
-    BOARDS = [b for b, compat in flow.BOARDS.items() if "apple,t6030" not in compat]
+    # Not the J613 either: from this release on it gets m1n1's display handoff by default
+    # (test_m3_air_default compares everything else with 12.3).
+    # Not the M3 Pro, nor the M3 Airs, which get mesa-m3 from 12.4 on (test_m3_air_mesa).
+    BOARDS = [b for b, compat in flow.BOARDS.items() if "apple,t6030" not in compat and b not in AIRS]
 
     def setUp(self):
         super().setUp()
@@ -1559,7 +1565,7 @@ class OtherMacsTest(flow.M3FlowBase):
         # The option is taken on every Mac (one release, one set of options) and does nothing there.
         def run():
             return self.run_sh(SUDO_LOG + "M3_TRY=0\nM3_PRO_MESA=0\ninstall_all", check=False).returncode
-        for board, after in self.same(run, boards=["j314s", "j613", "j516c"]):
+        for board, after in self.same(run, boards=["j314s", "j504", "j516c"]):
             self.assertNotIn("--no-m3-mesa", after["log"])
 
 
@@ -1575,7 +1581,7 @@ class ReleaseAssetTest(unittest.TestCase):
         # The package owns the session integration: this script never writes, links or deletes
         # anything under the prefix, the package's switch-offs or a home directory. Its only
         # writes are the set-aside in its work directory and the record's publication in $STATE.
-        body = SRC[SRC.index("# ---- the M3 Pro's Mesa"):SRC.index("this_board() {")]
+        body = SRC[SRC.index("# ---- the M3's Mesa"):SRC.index("this_board() {")]
         # Without the byte copies of mesa-m3's files and the recovery text (heredocs, printed only).
         body = re.sub(r"cat <<'(M3_PRO_MESA_[A-Z_]+)'\n.*?\n\1\n", "", body, flags=re.S)
         code = [l.strip() for l in body.splitlines() if not l.strip().startswith("#")]

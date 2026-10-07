@@ -159,6 +159,15 @@
 # CPU and backlight loads (opt-in). An M3 that stays kernel-only (the M3 Max,
 # and an M3 that is not an Air) ends its install with a NEXT STEPS box. The
 # kernel reads the 14-core M3 Max's (t6034) SMC sensors as an M3's.
+# 12.4: the M3 MacBook Air (j613, j615) gets mesa-m3 too, the same package and
+# asset as the M3 Pro (now built for both GPUs), with its desktop user added to
+# group render, recorded and undone as on the M3 Pro. Its login hook leaves the
+# Air's GPU off (reason "experimental", software rendering) unless
+# /etc/mesa-m3/t8122-gpu-experiment exists, which only --m3-gpu-experiment
+# writes (and --uninstall removes). The experiment's own Mesa, mesa-m3-g15g,
+# is gone: an Air that has it loses it, recorded, just before mesa-m3 goes on,
+# and air-gpu-job.sh runs with /opt/mesa-m3. The hook's reason not-t6030 is now
+# not-supported. On the M3 Pro, nothing else changes.
 # It replaces linux-asahi (or linux-aurora) as a pacman package,
 # so mkinitcpio and update-m1n1 run from their own hooks; on a GRUB Mac this
 # script regenerates grub.cfg and keeps the previous kernel as a fallback entry.
@@ -185,8 +194,8 @@
 # three chosen.asahi,t6030-* lines in /etc/m1n1.conf switch its display and
 # GPU handoff on. Every other M3 keeps m1n1's boot.bin exactly as it is: no
 # m1n1-aurora, no update-m1n1 run, and a freeze on update-m1n1 unless one is
-# in place already (see m3_plan). Every M3 Pro also gets mesa-m3 (see the
-# M3 Pro's Mesa below, m3_pro_mesa_*).
+# in place already (see m3_plan). Every M3 Pro and M3 MacBook Air also gets
+# mesa-m3 (see the M3's Mesa below, m3_pro_mesa_*).
 # On M2 and later the platform hands Linux an already-running Secure
 # Enclave, and the driver attaches to it with one registration that can only be
 # sent once per boot. Stock m1n1 asks the enclave for randomness on the way up,
@@ -450,9 +459,13 @@ is_m3_air() {
 #            three M3_SWITCHES lines; update-m1n1 copies chosen.* lines from
 #            /etc/m1n1.conf into every rebuild, so they survive updates.
 #            An M3 MacBook Air takes the same path with the same m1n1 and its
-#            own switches (m3_switches): the display handoff with GPU
-#            diagnostics, and only with --m3-handoff until its board is in
-#            M3_HANDOFF_BOARDS.
+#            own switches (m3_switches). A J613, which is in M3_HANDOFF_BOARDS,
+#            gets the display handoff and the GPU firmware description
+#            (M3_AIR_SWITCHES) by default; with --m3-handoff, and on the J615
+#            only with it, an Air gets the display handoff with GPU
+#            diagnostics (M3_AIR_DRY_RUN_SWITCHES). An owner can switch any
+#            Air switch off for good with a chosen.<name>=0 line of their own
+#            in /etc/m1n1.conf (m3_air_switch_off).
 # M1 and M2 get the same M1N1_PACKAGE with no switches; the Neo keeps its own
 # m1n1 unless NEO_AURORA_M1N1 is 1.
 UPDATE_M1N1_CONF=/etc/default/update-m1n1
@@ -462,8 +475,10 @@ M3_FROZEN_BY=""
 M3_BOOTBIN_SHA=""
 # Models the handoff has been booted on, by us or by a tester's report. Only
 # an M3 Pro (t6030) or an M3 MacBook Air (M3_AIR_BOARDS) listed here gets it
-# by default; no Air is listed yet.
-M3_HANDOFF_BOARDS="j516s"
+# by default. The J613 is listed: aurora8.3 and later published m1n1's display
+# handoff on a J613 (11.111-test), with Linux on the boot framebuffer, and an
+# Air listed here gets M3_AIR_SWITCHES by default. The J615 is not listed.
+M3_HANDOFF_BOARDS="j516s j613"
 M3_SWITCHES="chosen.asahi,t6030-gpu=1 chosen.asahi,t6030-dcp=1 chosen.asahi,t6030-dcpext=1"
 # The M3 Pro handoff's name in $STATE/m3-mode. A plain run keeps the handoff on
 # an M3 Pro that is not in M3_HANDOFF_BOARDS only while this matches, so it
@@ -506,36 +521,51 @@ M3_AIR_DISPLAY_HANDOFF=1
 M3_AIR_DISPLAY_VARIANT="air-display-handoff-12"
 M3_AIR_DRY_RUN=1
 M3_AIR_DRY_RUN_SWITCHES="chosen.asahi,t8122-gpu-diag=1 chosen.asahi,t8122-gpu-handoff-diag=1 chosen.asahi,t8122-gpu-power-diag=1 chosen.asahi,t8122-dcp=1"
+# The default for an Air in M3_HANDOFF_BOARDS (m3_air_default): m1n1's display
+# handoff (chosen.asahi,t8122-dcp=1) and the GPU firmware description
+# (chosen.asahi,t8122-gpu-handoff-diag=1: the GPU's firmware and page-table
+# memory reserved and described for Linux, the GPU and its mailbox left
+# disabled). Both ran on a J613 in 11.110-test and 11.111-test. The GPU
+# diagnostics (chosen.asahi,t8122-gpu-diag=1, chosen.asahi,t8122-gpu-power-diag=1,
+# which powers the GPU for a short identity read) stay opt-in: --m3-handoff
+# gives an Air M3_AIR_DRY_RUN_SWITCHES instead, and an Air that has those from
+# an earlier --m3-handoff keeps them. No variant writes the GPU start,
+# chosen.asahi,t8122-gpu=1.
+M3_AIR_SWITCHES="chosen.asahi,t8122-dcp=1 chosen.asahi,t8122-gpu-handoff-diag=1"
+# Its name in $STATE/m3-mode: aurora12.1's m1n1 with M3_AIR_SWITCHES.
+M3_AIR_DEFAULT_VARIANT="air-handoff-12"
 # --m3-gpu-experiment (M3 MacBook Air only) installs the GPU start experiment's tools with the
 # kernel: three scripts in M3_GPU_BIN, from this release (M3_GPU_SCRIPTS, checked like the
-# packages), and the G15G Mesa prefix package once there is one. It arms nothing and changes
-# no boot setting: air-gpu-oneshot.sh arms one boot at a time, only when its owner runs it.
-# Their sources are tools/aurora-sep/air-gpu/ in this repository.
+# packages), and the opt-in file M3_GPU_OPTIN that lets mesa-m3's login hook use the Air's GPU.
+# It arms nothing and changes no boot setting: air-gpu-oneshot.sh arms one boot at a time, only
+# when its owner runs it. Their sources are tools/aurora-sep/air-gpu/ in this repository. The
+# Mesa they run with is mesa-m3, which every M3 Air gets (see the M3's Mesa below).
 M3_GPU_EXPERIMENT=0
 M3_GPU_BIN=/usr/local/bin
 M3_GPU_SCRIPTS=(
   "air-gpu-oneshot.sh d0259869b8519439a4dbcdae08ef1b0e17fdcaf84ac746fca61febf6a325f8aa"
   "air-gpu-collect.sh face8fac811b59c31a8e98e6ca704a2cb33eceada8bc37986397cb393b050b30"
-  "air-gpu-job.sh f76e57154e96165daf8834508975a98f745519ab1b51ac2edae4f5710edae349"
+  "air-gpu-job.sh 9a0eb9aab52fd099488054e4ed4846c579b19fc9f78144245242b6975a40da1d"
 )
-# The G15G Mesa build: its prefix package as "file sha256" (a pacman package that installs Mesa
-# into a prefix of its own, never over the system Mesa), and that prefix, for air-gpu-job.sh.
-# mesa-m3-g15g installs only /opt/mesa-m3-g15g; its G15G support is opt-in there too
-# (ASAHI_M3_G15G=1, which air-gpu-job.sh and the prefix's bin/g15g-run set).
-M3_GPU_MESA_PACKAGE="mesa-m3-g15g-26.1.4.g15g1-5-aarch64.pkg.tar.zst 1dd4c3876a26edf0cc3ad1b23eba79a66d99fd4c3cb9d2683f346e7bca1fa904"
-M3_GPU_MESA_PREFIX="/opt/mesa-m3-g15g"
-# What the Mesa package depends on with a minimum version, as "name>=version". Each must be
-# installed already, at that version or newer, or m3_gpu_mesa_install leaves the package out:
-# its pacman -U must never pull in an upgrade of the C library or the compiler runtime alone.
-M3_GPU_MESA_NEEDS="glibc>=2.43 gcc-libs>=11 spirv-tools>=1:1.4.357.0"
-# 1 once m3_gpu_mesa_install has installed the Mesa package on this run.
-M3_GPU_MESA_DONE=0
-# The M3 Pro's Mesa (t6030 only, on by default; --no-m3-mesa leaves it out): a pacman package,
-# "file sha256", that installs Mesa with the M3 Pro (G15S) GPU driver into a prefix of its own,
-# never over the system Mesa, plus the files that make a login session use that prefix on an
-# M3 Pro. It is a release asset of its own, never one of the PACKAGES every Mac gets, and is
-# installed in its own pacman transaction once the kernel install is done (m3_pro_mesa_install).
-M3_PRO_MESA_PACKAGE="mesa-m3-26.1.4.m3.1-5-aarch64.pkg.tar.zst 6eb4e4c3eb85604501ffc00eb1548675332ef3042137148455c5c488f8ab5b01"
+# The Mesa prefix air-gpu-job.sh runs with: mesa-m3's (12.4 on; it replaces the separate
+# mesa-m3-g15g of 12.2 and 12.3, which this script removes before mesa-m3's pacman -U).
+M3_GPU_MESA_PREFIX="/opt/mesa-m3"
+# The earlier experiment-only Mesa package, removed from an Air before mesa-m3 goes on: mesa-m3
+# conflicts with it, and pacman --noconfirm does not remove a conflicting package by itself.
+M3_GPU_OLD_MESA="mesa-m3-g15g"
+# mesa-m3's opt-in for the T8122 GPU: its login hook uses an Air's GPU only when this file exists
+# (otherwise the reason is "experimental"). Written, root's and 0644, only by
+# --m3-gpu-experiment on an Air, recorded in $STATE/m3-gpu-experiment, removed by --uninstall.
+M3_GPU_OPTIN=/etc/mesa-m3/t8122-gpu-experiment
+# The M3's Mesa (the M3 Pro, t6030, and the M3 MacBook Air, M3_AIR_BOARDS; on by default;
+# --no-m3-mesa leaves it out): a pacman package, "file sha256", that installs Mesa with the M3
+# Pro (G15S) and M3 (G15G) GPU drivers into a prefix of its own, never over the system Mesa,
+# plus the files that make a login session use that prefix: on an M3 Pro by default, on an Air
+# only with M3_GPU_OPTIN. It is a release asset of its own, never one of the PACKAGES every Mac
+# gets, and is installed in its own pacman transaction once the kernel install is done
+# (m3_pro_mesa_install). The names keep "M3_PRO_MESA" and "m3_pro_mesa" from 12.3, when only
+# the M3 Pro had it: the record, $STATE/m3-pro-mesa, keeps its name and schema on both.
+M3_PRO_MESA_PACKAGE="mesa-m3-26.1.4.m3.1-6-aarch64.pkg.tar.zst 2ad015a06c9cdbee670be5e8af485893f0a6c673e887e152d62f1690cdeb33dd"
 M3_PRO_MESA_PREFIX="/opt/mesa-m3"
 # The package's name, as its .PKGINFO gives it; --uninstall removes it by this exact name.
 M3_PRO_MESA_NAME="mesa-m3"
@@ -631,6 +661,13 @@ M3_MODE=none
 # Set by --m3-handoff: the owner asks for the handoff on an M3 Pro or M3
 # MacBook Air model that isn't in M3_HANDOFF_BOARDS yet.
 M3_TRY=0
+# Whether the owner gave --m3-handoff on this run (m3_plan copies M3_TRY before
+# it keeps an earlier install's handoff). On an Air it asks for the GPU
+# diagnostics too.
+M3_ASKED=0
+# 1 or 0 once m3_plan has decided whether this Air gets M3_AIR_SWITCHES
+# (m3_air_default); empty before that.
+M3_AIR_DEFAULT=""
 # 1 when this run keeps the boot.bin this Mac has because an m1n1 from this
 # script failed on it before ($STATE/m1n1-failed): set by m3_plan and
 # m1n1_keep_plan.
@@ -727,11 +764,41 @@ is_m3_handoff_board() {
   { is_m3_pro || is_m3_air; } && [[ -n $board && " $M3_HANDOFF_BOARDS " == *" $board "* ]]
 }
 
-# The switch lines this Mac's handoff needs, separated by spaces: the T6030
-# ones, or the M3 Air's.
-m3_switches() {
-  if ! is_m3_air; then
-    echo "$M3_SWITCHES"
+# Whether this Air gets the default profile, M3_AIR_SWITCHES: a board in
+# M3_HANDOFF_BOARDS, with the display handoff build (M3_AIR_DISPLAY_HANDOFF=1),
+# whose owner did not ask for the GPU diagnostics, with --m3-handoff on this run
+# or on an earlier install that is still recorded with that variant. m3_plan
+# decides it (M3_AIR_DEFAULT) before the install records this run's variant.
+m3_air_default() {
+  if [[ -n $M3_AIR_DEFAULT ]]; then
+    [[ $M3_AIR_DEFAULT == 1 ]]
+    return
+  fi
+  [[ $M3_AIR_DISPLAY_HANDOFF == 1 ]] && is_m3_air && is_m3_handoff_board && ((M3_ASKED == 0)) || return 1
+  [[ $(m3_recorded_mode) != handoff || $(m3_recorded_variant) != "$M3_AIR_DISPLAY_VARIANT" ]]
+}
+
+# The Air's per-Mac off switch: a line "chosen.<name>=0" of the owner's in
+# /etc/m1n1.conf, outside this script's block, keeps switch $1 (chosen.<name>=1)
+# out of the block. m1n1 then reads only the owner's 0, and arms a switch only
+# when it reads 1. The line stays when this script rewrites its block.
+m3_air_switch_off() {
+  m1n1_conf_without_switches | grep -qxF "${1%%=*}=0"
+}
+
+# The Air switches this Mac's owner switched off, separated by spaces.
+m3_air_switches_off() {
+  local s off=()
+  for s in $(m3_air_switch_set); do
+    if m3_air_switch_off "$s"; then off+=("${s%%=*}"); fi
+  done
+  echo "${off[*]}"
+}
+
+# The Air's switches before its owner's off switches.
+m3_air_switch_set() {
+  if m3_air_default; then
+    echo "$M3_AIR_SWITCHES"
   elif [[ $M3_AIR_DRY_RUN == 1 ]]; then
     echo "$M3_AIR_DRY_RUN_SWITCHES"
   elif [[ $M3_AIR_DCP == 1 ]]; then
@@ -739,6 +806,34 @@ m3_switches() {
   else
     echo "$M3_AIR_GPU_SWITCH"
   fi
+}
+
+# How to switch an Air switch off on this Mac, and which ones are off. With
+# "quiet", only a list of the ones that are off, if there are any.
+m3_air_off_notice() {
+  local off
+  off=$(m3_air_switches_off)
+  if [[ -n $off ]]; then say "Switched off on this Mac in $M1N1_CONF: ${off// /, }"; fi
+  [[ ${1:-} == quiet ]] && return 0
+  say "To switch one of m1n1's M3 Air switches off on this Mac, add it with =0 on a line at the end
+    of $M1N1_CONF (chosen.asahi,t8122-dcp=0 for the display handoff,
+    chosen.asahi,t8122-gpu-handoff-diag=0 for the GPU firmware description), then run:
+      sudo update-m1n1
+    Later runs of this script keep it off. Delete the line to switch it back on."
+}
+
+# The switch lines this Mac's handoff needs, separated by spaces: the T6030
+# ones, or the M3 Air's without those its owner switched off.
+m3_switches() {
+  local s on=()
+  if ! is_m3_air; then
+    echo "$M3_SWITCHES"
+    return 0
+  fi
+  for s in $(m3_air_switch_set); do
+    if ! m3_air_switch_off "$s"; then on+=("$s"); fi
+  done
+  echo "${on[*]}"
 }
 
 # Whether this run puts M1N1_PACKAGE on this Mac: M1 and M2, an M3 on the
@@ -765,6 +860,8 @@ m1n1_version() {
 m3_handoff_name() {
   if ! is_m3_air; then
     echo "M3 Pro display and GPU handoff"
+  elif m3_air_default; then
+    echo "M3 Air display handoff"
   elif [[ $M3_AIR_DISPLAY_HANDOFF == 1 ]]; then
     echo "M3 Air display handoff with GPU diagnostics"
   elif [[ $M3_AIR_DRY_RUN == 1 ]]; then
@@ -1042,6 +1139,7 @@ m3_recorded_mode() {
 # into a GPU start) without a new --m3-handoff.
 m3_variant() {
   if ! is_m3_air; then echo "$M3_PRO_VARIANT"
+  elif m3_air_default; then echo "$M3_AIR_DEFAULT_VARIANT"
   elif [[ $M3_AIR_DISPLAY_HANDOFF == 1 ]]; then echo "$M3_AIR_DISPLAY_VARIANT"
   elif [[ $M3_AIR_DRY_RUN == 1 ]]; then echo air-dry-run
   elif [[ $M3_AIR_DCP == 1 ]]; then echo air-gpu-dcp
@@ -1070,6 +1168,8 @@ m3_kept_refusal() {
 m3_plan() {
   local board problem failed variant again="run this again" air=0 kept=0
   M3_MODE=none
+  M3_ASKED=$M3_TRY M3_AIR_DEFAULT=""
+  if m3_air_default; then M3_AIR_DEFAULT=1; else M3_AIR_DEFAULT=0; fi
   if ! is_m3; then
     ((M3_TRY == 0)) || die "--m3-handoff is for an M3 Pro or an M3 MacBook Air, and this Mac isn't an M3. Nothing was installed."
     return 0
@@ -1107,7 +1207,9 @@ m3_plan() {
     loader from this script failed on this Mac, please report it at $ISSUE_URL"
       return 0
     fi
-    if ((air)) && [[ $(m3_recorded_variant) != "$(m3_variant)" ]]; then
+    # An Air that gets the default profile (m3_air_default) moves with the
+    # release, as a listed M3 Pro does.
+    if ((air)) && ! m3_air_default && [[ $(m3_recorded_variant) != "$(m3_variant)" ]]; then
       die "M3 MacBook Air ($board): this Mac has an earlier test build's boot loader
     ($(m3_recorded_variant)), and this release's Air boot loader is a different one: the
     $(m3_handoff_name) ($(m3_variant)). Run this again with --m3-handoff to switch to it.
@@ -1130,9 +1232,9 @@ m3_plan() {
   fi
   M3_MODE=kernel
   if ((air)); then
-    # Never by default: a plain run gives an Air the handoff only once its
-    # board is in M3_HANDOFF_BOARDS.
-    if ! is_m3_handoff_board && ((M3_TRY == 0)); then
+    # A plain run gives an Air only the default profile (m3_air_default: a board
+    # in M3_HANDOFF_BOARDS, M3_AIR_SWITCHES); everything else needs --m3-handoff.
+    if ! m3_air_default && ((M3_TRY == 0)); then
       say "M3 MacBook Air ($board): installing the kernel only, and boot.bin stays as it is. m1n1's
     $(m3_handoff_name) for the Air is being tested and is not on by default. To help test it
     (it replaces this Mac's boot loader), see case D in the M3 section of: bash -s -- --agent-prompt"
@@ -1187,7 +1289,7 @@ m3_plan() {
     say "M3 ($board): this Mac has m1n1's display and GPU handoff from an earlier install; keeping it"
   fi
   if ((air)); then
-    if is_m3_handoff_board; then
+    if m3_air_default; then
       say "M3 MacBook Air ($board, macOS $M3_STUB_VERSION stub): installing m1n1 with the $(m3_handoff_name)"
     elif ((kept)); then
       # Its owner asked with --m3-handoff when it was installed.
@@ -1268,32 +1370,19 @@ m3_gpu_plan() {
   ((M3_GPU_EXPERIMENT)) || return 0
   is_m3_air || die "--m3-gpu-experiment is for the M3 MacBook Air (j613, j615) only, and this Mac is
     $(this_board) ($(this_soc)). Nothing was installed."
-  [[ -z $M3_GPU_MESA_PACKAGE || $M3_GPU_MESA_PACKAGE =~ ^[A-Za-z0-9._+-]+\.pkg\.tar\.zst\ [0-9a-f]{64}$ ]] ||
-    die "M3_GPU_MESA_PACKAGE is not \"file sha256\" (a packaging mistake). Nothing was installed."
-  warn "--m3-gpu-experiment: installing the M3 Air GPU experiment's scripts with the kernel$([[ -n $M3_GPU_MESA_PACKAGE ]] && echo ", and its Mesa prefix once the kernel is in").
-    They arm nothing: every boot stays as it is until air-gpu-oneshot.sh arms one."
+  warn "--m3-gpu-experiment: installing the M3 Air GPU experiment's scripts with the kernel, and
+    $M3_GPU_OPTIN, which lets mesa-m3's login hook use the GPU. They arm nothing: every boot
+    stays as it is until air-gpu-oneshot.sh arms one."
 }
 
 # The experiment's files for the download loop, "file sha256" per line (none without the flag).
 m3_gpu_files() {
   ((M3_GPU_EXPERIMENT)) || return 0
   printf '%s\n' "${M3_GPU_SCRIPTS[@]}"
-  if [[ -n $M3_GPU_MESA_PACKAGE ]]; then echo "$M3_GPU_MESA_PACKAGE"; fi
-  return 0
 }
 
-# After the download loop: keep the Mesa package out of the kernel's pacman -U
-# ("$work"/*.pkg.tar.zst). m3_gpu_mesa_install installs it on its own, after the kernel.
-m3_gpu_set_aside() {
-  if ((M3_GPU_EXPERIMENT)) && [[ -n $M3_GPU_MESA_PACKAGE ]]; then
-    mkdir -p "$work/m3-gpu"
-    mv "$work/${M3_GPU_MESA_PACKAGE%% *}" "$work/m3-gpu/"
-  fi
-  return 0
-}
-
-# After the kernel's pacman -U: the scripts, what they need, and $STATE/m3-gpu-experiment,
-# which --uninstall reads. The Mesa package's line is added only once it is installed.
+# After the kernel's pacman -U: the scripts, what they need, the opt-in file, and
+# $STATE/m3-gpu-experiment, which --uninstall reads.
 m3_gpu_install() {
   local entry file record=""
   ((M3_GPU_EXPERIMENT)) || return 0
@@ -1305,12 +1394,35 @@ m3_gpu_install() {
   # air-gpu-job.sh runs its job through Python and the Vulkan loader.
   $sudo pacman -S --needed --noconfirm python vulkan-icd-loader ||
     warn "could not install python and vulkan-icd-loader; air-gpu-job.sh needs them"
+  record+=$(m3_gpu_optin)
+  if [[ -n $record && $record != *$'\n' ]]; then record+=$'\n'; fi
   printf '%s' "$record" | $sudo tee "$STATE/m3-gpu-experiment" >/dev/null
 }
 
-# The M3_GPU_MESA_NEEDS packages that are missing or older than their minimum, one
-# "name version (needs min or newer)" per line; nothing when all are new enough.
-m3_gpu_mesa_too_old() { mesa_needs_too_old "$M3_GPU_MESA_NEEDS"; }
+# --m3-gpu-experiment on an Air: writes M3_GPU_OPTIN (and its directory, 0755, when missing),
+# root's and 0644, and prints its record lines ("optin PATH", and "optin-dir DIR" when this
+# script made the directory, now or in an earlier run). An opt-in file this script did not
+# write (the owner's) is left as it is and not recorded, so --uninstall leaves it too.
+m3_gpu_optin() {
+  local dir=${M3_GPU_OPTIN%/*} rec=$STATE/m3-gpu-experiment ours=0 made=0
+  if [[ -f $rec ]] && grep -qxF "optin $M3_GPU_OPTIN" "$rec"; then ours=1; fi
+  if [[ -f $rec ]] && grep -qxF "optin-dir $dir" "$rec" && [[ -d $dir ]]; then made=1; fi
+  if [[ -e $M3_GPU_OPTIN || -L $M3_GPU_OPTIN ]] && ((!ours)); then
+    if ((made)); then printf 'optin-dir %s\n' "$dir"; fi
+    return 0
+  fi
+  if [[ ! -d $dir ]]; then
+    if $sudo install -d -m 0755 "$dir"; then made=1; else warn "could not make $dir"; fi
+  fi
+  if printf '# Written by install-aurora-sep.sh --m3-gpu-experiment on %s: mesa-m3 uses this M3 GPU only\n# while this file exists. --uninstall removes it.\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | $sudo tee "$M3_GPU_OPTIN" >/dev/null && $sudo chmod 0644 "$M3_GPU_OPTIN"; then
+    printf 'optin %s\n' "$M3_GPU_OPTIN"
+  else
+    warn "could not write $M3_GPU_OPTIN; until it exists, mesa-m3 leaves this Air's GPU off at login"
+    if ((ours)); then printf 'optin %s\n' "$M3_GPU_OPTIN"; fi
+  fi
+  if ((made)); then printf 'optin-dir %s\n' "$dir"; fi
+}
 
 # The packages of NEEDS ("name>=version" words) that are missing or older than their minimum,
 # one "name version (needs min or newer)" per line; nothing when all are new enough.
@@ -1329,44 +1441,6 @@ mesa_needs_too_old() {
   return 0
 }
 
-# Once the kernel install is done, on an Air with --m3-gpu-experiment: the G15G Mesa package
-# in a pacman transaction of its own, so a problem with it can't stop the kernel install
-# halfway. It is left out when a package it needs is missing or too old (M3_GPU_MESA_NEEDS),
-# rather than letting it pull an upgrade in. Any failure is reported, and the kernel install
-# stays as it is.
-m3_gpu_mesa_install() {
-  local file name old
-  ((M3_GPU_EXPERIMENT)) && [[ -n $M3_GPU_MESA_PACKAGE ]] && is_m3_air || return 0
-  file=$work/m3-gpu/${M3_GPU_MESA_PACKAGE%% *}
-  old=$(m3_gpu_mesa_too_old)
-  if [[ -n $old ]]; then
-    warn "--m3-gpu-experiment: left out the G15G Mesa prefix, because it needs newer packages than
-    this Mac has: $(paste -sd ';' <<<"$old" | sed 's/;/; /g'). Nothing of it was installed, and the
-    kernel install is complete. Update the system and install them
-    (sudo pacman -Syu glibc gcc-libs spirv-tools), then run this again with --m3-gpu-experiment."
-    return 0
-  fi
-  name=$(bsdtar -xOf "$file" .PKGINFO 2>/dev/null | sed -n 's/^pkgname = //p' | head -1) || name=""
-  if [[ ! $name =~ ^[A-Za-z0-9._+-]+$ ]]; then
-    warn "--m3-gpu-experiment: left out the G15G Mesa prefix: ${file##*/} names no package. The
-    kernel install is complete. Please report it at https://github.com/iconidentify/aurora-linux/issues"
-    return 0
-  fi
-  say "Installing the G15G Mesa prefix ($name) on its own, now that the kernel is in"
-  if ! $sudo pacman -U --noconfirm "$file"; then
-    warn "--m3-gpu-experiment: could not install the G15G Mesa prefix ($name); pacman says why
-    above. The kernel install is complete and stays as it is. To try again, run this again with
-    --m3-gpu-experiment."
-    # An earlier run's copy stays installed: keep it in the record, so --uninstall removes it.
-    if pacman -Q "$name" >/dev/null 2>&1; then
-      echo "mesa $name" | $sudo tee -a "$STATE/m3-gpu-experiment" >/dev/null
-    fi
-    return 0
-  fi
-  echo "mesa $name" | $sudo tee -a "$STATE/m3-gpu-experiment" >/dev/null
-  M3_GPU_MESA_DONE=1
-}
-
 # What the owner reads at the end of an install with the flag, or of a plain run that keeps
 # the tools of an earlier one.
 m3_gpu_notice() {
@@ -1375,13 +1449,16 @@ m3_gpu_notice() {
     air-gpu-collect.sh and air-gpu-job.sh. Nothing is armed; every boot stays normal until
       sudo air-gpu-oneshot.sh start
     arms the next boot only (sudo air-gpu-oneshot.sh --check first says whether it can)."
-    if ((M3_GPU_MESA_DONE)); then
-      echo "   The G15G Mesa prefix for air-gpu-job.sh: $M3_GPU_MESA_PREFIX"
-    elif [[ -n $M3_GPU_MESA_PACKAGE ]]; then
-      echo "   The G15G Mesa prefix was not installed (see the warning above), so air-gpu-job.sh has"
-      echo "   nothing to run with yet."
+    if [[ -f $M3_GPU_OPTIN ]]; then
+      echo "   mesa-m3's opt-in for this Air's GPU is in place: $M3_GPU_OPTIN"
     else
-      echo "   This release has no G15G Mesa prefix yet, so air-gpu-job.sh has nothing to run with."
+      echo "   mesa-m3's opt-in for this Air's GPU is NOT in place ($M3_GPU_OPTIN; see above)."
+    fi
+    if [[ -n $(m3_pro_mesa_installed) ]]; then
+      echo "   The Mesa prefix for air-gpu-job.sh: $M3_GPU_MESA_PREFIX (mesa-m3)"
+    else
+      echo "   mesa-m3 is not installed (see above), so air-gpu-job.sh has nothing to run with yet"
+      echo "   ($M3_GPU_MESA_PREFIX)."
     fi
     if [[ " $(m3_switches 2>/dev/null) " != *" $M3_AIR_GPU_SWITCH "* ]]; then
       echo "   This Mac's boot loader does not hand the GPU over ($M3_AIR_GPU_SWITCH is not armed), so an"
@@ -1410,14 +1487,16 @@ m3_gpu_disarm() {
 }
 
 m3_gpu_remove() {
-  local kind name leftover=0
+  local kind name leftover=0 optin_dir=""
   [[ -f $STATE/m3-gpu-experiment ]] || return 0
   # uninstall_all already cleared any armed boot, before the kernel was replaced.
-  while read -r kind name _; do
+  while read -r kind name _ || [[ -n ${kind:-} ]]; do
     case $kind in
       script) [[ $name =~ ^air-gpu-[a-z]+\.sh$ ]] && $sudo rm -f "$M3_GPU_BIN/$name" ;;
-      mesa) [[ $name =~ ^[A-Za-z0-9._+-]+$ ]] && { $sudo pacman -Rns --noconfirm "$name" ||
-        warn "could not remove $name"; } ;;
+      mesa) [[ $name =~ ^[A-Za-z0-9._+-]+$ ]] && pacman -Q "$name" >/dev/null 2>&1 &&
+        { $sudo pacman -Rns --noconfirm "$name" || warn "could not remove $name"; } ;;
+      optin) [[ $name == "$M3_GPU_OPTIN" ]] && { $sudo rm -f "$name" || warn "could not remove $name"; } ;;
+      optin-dir) [[ $name == "${M3_GPU_OPTIN%/*}" ]] && optin_dir=$name ;;
     esac
   done <"$STATE/m3-gpu-experiment"
   # Any Mesa package still installed under a name a later release renamed (the record is
@@ -1426,17 +1505,27 @@ m3_gpu_remove() {
     $sudo pacman -Rns --noconfirm "$name" 2>/dev/null && leftover=1 || true
   done
   ((leftover == 0)) || warn "removed a leftover G15G Mesa package"
+  # The opt-in's directory, when this script made it, and only while it is empty (the owner's
+  # own /etc/mesa-m3/disable, say, keeps it).
+  if [[ -n $optin_dir && -d $optin_dir ]]; then $sudo rmdir "$optin_dir" 2>/dev/null || true; fi
   $sudo rm -rf /var/lib/air-gpu
   say "Removed the M3 Air GPU experiment's scripts"
 }
 
-# ---- the M3 Pro's Mesa (t6030, on by default) --------------------------------------------------
-# On an M3 Pro, the release's mesa-m3 package is downloaded and checked with the other release
-# assets, then installed in a pacman transaction of its own once the kernel install is done.
-# Everything that makes a login session use its prefix belongs to the package itself, so
-# pacman -R mesa-m3 undoes it all; this script writes no file of its own for it. It writes one
-# record, $STATE/m3-pro-mesa, which --uninstall and the lab check read. Every other Mac (M1, M2,
-# the M3 Max, the M3 MacBook Air) never downloads, installs or records anything of it.
+# ---- the M3's Mesa (t6030 and the M3 Air, on by default) ---------------------------------------
+# On an M3 Pro or an M3 MacBook Air, the release's mesa-m3 package is downloaded and checked
+# with the other release assets, then installed in a pacman transaction of its own once the
+# kernel install is done. Everything that makes a login session use its prefix belongs to the
+# package itself, so pacman -R mesa-m3 undoes it all; this script writes no file of its own for
+# it (on an Air, --m3-gpu-experiment's opt-in file is the experiment's: m3_gpu_optin). It writes
+# one record, $STATE/m3-pro-mesa (the name from 12.3, kept so an M3 Pro's history carries over;
+# its board line says which Mac), which --uninstall and the lab check read. Every other Mac (M1,
+# M2, the M3 Max, the other T8122 Macs) never downloads, installs or records anything of it.
+
+# The Macs that get it, and what the summary calls their Mesa and GPU.
+m3_mesa_mac() { is_m3_pro || is_m3_air; }
+m3_mesa_name() { if is_m3_air; then echo "M3 MacBook Air's Mesa"; else echo "M3 Pro's Mesa"; fi; }
+m3_mesa_gpu() { if is_m3_air; then echo "M3 MacBook Air's GPU"; else echo "M3 Pro's GPU"; fi; }
 
 m3_pro_mesa_file() { echo "${M3_PRO_MESA_PACKAGE%% *}"; }
 # The package's version (pkgver-pkgrel) from its file name, <name>-<version>-<arch>.pkg.tar.zst.
@@ -2253,13 +2342,13 @@ m3_pro_mesa_record_get() {
 M3_PRO_MESA_PREEXISTING=""
 m3_pro_mesa_plan() {
   local have want order
-  is_m3_pro && [[ -n $M3_PRO_MESA_PACKAGE ]] || return 0
+  m3_mesa_mac && [[ -n $M3_PRO_MESA_PACKAGE ]] || return 0
   have=$(m3_pro_mesa_installed)
   # Before the first record (or with one this script can't read): what was installed before.
   if ! m3_pro_mesa_record_ok; then M3_PRO_MESA_PREEXISTING=${have:-none}; fi
   if ((!M3_PRO_MESA)); then
     M3_PRO_MESA_RESULT=skipped-flag
-    say "--no-m3-mesa: leaving out the M3 Pro's Mesa ($M3_PRO_MESA_NAME)${have:+; the $have installed earlier stays as it is}"
+    say "--no-m3-mesa: leaving out the $(m3_mesa_name) ($M3_PRO_MESA_NAME)${have:+; the $have installed earlier stays as it is}"
     return 0
   fi
   [[ $M3_PRO_MESA_PACKAGE =~ ^${M3_PRO_MESA_NAME}-[A-Za-z0-9._+:]+-[0-9.]+-(aarch64|any)\.pkg\.tar\.zst\ [0-9a-f]{64}$ &&
@@ -2275,7 +2364,7 @@ m3_pro_mesa_plan() {
   order=$(vercmp "$have" "$want" 2>/dev/null) || order=""
   if [[ $order == 0 ]]; then
     M3_PRO_MESA_RESULT=current
-    say "The M3 Pro's Mesa ($M3_PRO_MESA_NAME $have) is installed already; nothing new to install"
+    say "The $(m3_mesa_name) ($M3_PRO_MESA_NAME $have) is installed already; nothing new to install"
   elif [[ $order == 1 ]]; then
     M3_PRO_MESA_RESULT=newer-kept
     say "A newer $M3_PRO_MESA_NAME ($have) than this release's ($want) is installed; keeping it"
@@ -2285,7 +2374,7 @@ m3_pro_mesa_plan() {
 
 # The package for the download loop, "file sha256" (only when this run installs it).
 m3_pro_mesa_files() {
-  is_m3_pro && [[ -n $M3_PRO_MESA_PACKAGE ]] && ((M3_PRO_MESA)) && [[ -z $M3_PRO_MESA_RESULT ]] || return 0
+  m3_mesa_mac && [[ -n $M3_PRO_MESA_PACKAGE ]] && ((M3_PRO_MESA)) && [[ -z $M3_PRO_MESA_RESULT ]] || return 0
   echo "$M3_PRO_MESA_PACKAGE"
 }
 
@@ -2332,7 +2421,7 @@ m3_pro_mesa_install() {
   old=$(m3_pro_mesa_needs_unmet)
   if [[ -n $old ]]; then
     M3_PRO_MESA_RESULT=skipped-deps
-    warn "left out the M3 Pro's Mesa ($M3_PRO_MESA_NAME), because it needs newer packages than this
+    warn "left out the $(m3_mesa_name) ($M3_PRO_MESA_NAME), because it needs newer packages than this
     Mac has: $(paste -sd ';' <<<"$old" | sed 's/;/; /g'). Nothing of it was installed, and the
     kernel install is complete. Update them (sudo pacman -Syu $(cut -d' ' -f1 <<<"$old" | grep -v '^pacman$' |
       paste -sd' ')), then run this again."
@@ -2341,19 +2430,43 @@ m3_pro_mesa_install() {
   name=$(bsdtar -xOf "$file" .PKGINFO 2>/dev/null | sed -n 's/^pkgname = //p' | head -1) || name=""
   if [[ $name != "$M3_PRO_MESA_NAME" ]]; then
     M3_PRO_MESA_RESULT=failed
-    warn "left out the M3 Pro's Mesa: ${file##*/} names the package \"$name\", not $M3_PRO_MESA_NAME.
+    warn "left out the $(m3_mesa_name): ${file##*/} names the package \"$name\", not $M3_PRO_MESA_NAME.
     The kernel install is complete. Please report it at https://github.com/iconidentify/aurora-linux/issues"
     return 0
   fi
-  say "Installing the M3 Pro's Mesa ($name $(m3_pro_mesa_version)) on its own, now that the kernel is in"
+  if is_m3_air && ! m3_pro_mesa_replace_old; then
+    M3_PRO_MESA_RESULT=failed
+    return 0
+  fi
+  say "Installing the $(m3_mesa_name) ($name $(m3_pro_mesa_version)) on its own, now that the kernel is in"
   if ! $sudo pacman -U --noconfirm "$file"; then
     M3_PRO_MESA_RESULT=failed
-    warn "could not install the M3 Pro's Mesa ($name); pacman says why above. Nothing of it was
+    warn "could not install the $(m3_mesa_name) ($name); pacman says why above. Nothing of it was
     installed by this run, and the kernel install is complete and stays as it is. Run this again
     to try again."
     return 0
   fi
   M3_PRO_MESA_RESULT=installed
+}
+
+# On an Air, before mesa-m3's pacman -U: removes the experiment's earlier Mesa package
+# (M3_GPU_OLD_MESA, the 12.2 and 12.3 --m3-gpu-experiment's), which mesa-m3 replaces and
+# conflicts with, and adds "name version" to M3_PRO_MESA_REPLACED for the record. Returns 1, with
+# a warning, when it stays: then mesa-m3 is left out (pacman would refuse it).
+M3_PRO_MESA_REPLACED=()
+m3_pro_mesa_replace_old() {
+  local name ver
+  while read -r name ver; do
+    [[ $name == "$M3_GPU_OLD_MESA" || $name == "$M3_GPU_OLD_MESA"-* ]] || continue
+    say "Removing $name $ver: mesa-m3 replaces it"
+    if ! $sudo pacman -Rns --noconfirm "$name"; then
+      warn "could not remove $name, which mesa-m3 replaces; so the $(m3_mesa_name) was left out.
+    The kernel install is complete. Remove it (sudo pacman -Rns $name), then run this again."
+      return 1
+    fi
+    M3_PRO_MESA_REPLACED+=("$name $ver")
+  done < <(pacman -Q 2>/dev/null || true)
+  return 0
 }
 
 # USER is in GROUP (by the group database, as at the user's next login): 0 yes, 1 no, 2 unknown.
@@ -2371,18 +2484,18 @@ m3_pro_mesa_in_group() {
 m3_pro_mesa_render() {
   local user g=$M3_PRO_MESA_RENDER_GROUP rc=0
   M3_PRO_MESA_RENDER_ADDED=no M3_PRO_MESA_RENDER_NOTE=""
-  is_m3_pro && [[ -n $M3_PRO_MESA_PACKAGE ]] || return 0
+  m3_mesa_mac && [[ -n $M3_PRO_MESA_PACKAGE ]] || return 0
   case $M3_PRO_MESA_RESULT in installed | current | newer-kept) ;; *) return 0 ;; esac
   user=$(m3_pro_mesa_user)
   if [[ $user == root ]]; then
-    M3_PRO_MESA_RENDER_NOTE="This ran as root, so no desktop user was added to the $g group the M3 Pro's GPU now
+    M3_PRO_MESA_RENDER_NOTE="This ran as root, so no desktop user was added to the $g group the $(m3_mesa_gpu) now
    needs: add yours with  sudo gpasswd -a <user> $g  and log in again."
     return 0
   fi
   if [[ ! $user =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || ! getent group "$g" >/dev/null 2>&1; then
     warn "could not add $(printf '%q' "$user") to the $g group: no such group, or not a user name this script handles.
     Until the user is in it, the desktop renders in software."
-    M3_PRO_MESA_RENDER_NOTE="$(printf '%q' "$user") is not in the $g group the M3 Pro's GPU now needs (see the warning above);
+    M3_PRO_MESA_RENDER_NOTE="$(printf '%q' "$user") is not in the $g group the $(m3_mesa_gpu) now needs (see the warning above);
    until then the desktop renders in software. The exit status is 3."
     M3_PRO_MESA_RENDER_ADDED=failed
     return 0
@@ -2391,13 +2504,13 @@ m3_pro_mesa_render() {
   ((rc != 0)) || return 0
   if $sudo gpasswd -a "$user" "$g" >/dev/null && m3_pro_mesa_in_group "$user" "$g"; then
     M3_PRO_MESA_RENDER_ADDED=yes
-    M3_PRO_MESA_RENDER_NOTE="Added $user to the $g group, which the M3 Pro's GPU now needs. That takes effect at the
+    M3_PRO_MESA_RENDER_NOTE="Added $user to the $g group, which the $(m3_mesa_gpu) now needs. That takes effect at the
    next login: the reboot does that."
   else
     M3_PRO_MESA_RENDER_ADDED=failed
     warn "could not add $user to the $g group. Until $user is in it, the desktop renders in software: add
     them with  sudo gpasswd -a $user $g  and log in again."
-    M3_PRO_MESA_RENDER_NOTE="$user is not in the $g group the M3 Pro's GPU now needs (see the warning above). The exit
+    M3_PRO_MESA_RENDER_NOTE="$user is not in the $g group the $(m3_mesa_gpu) now needs (see the warning above). The exit
    status is 3."
   fi
 }
@@ -2405,15 +2518,18 @@ m3_pro_mesa_render() {
 # The record of this run, on an M3 Pro: $STATE/m3-pro-mesa, one "key=value" per line, for
 # --uninstall and the lab check. Read it as data, never source it. The first line is
 # schema=aurora.m3-pro-mesa-state/1; a record with another first line is not read. Every key
-# appears exactly once, except integration_path, render_added_user, user_setup_path,
-# user_setup_ignored, opt_out_path and record_error_key (one line per item, each path whole). The keys, in order:
+# appears exactly once, except integration_path, replaced_package, render_added_user,
+# user_setup_path, user_setup_ignored, opt_out_path and record_error_key (one line per item,
+# each path whole). The keys, in order:
 #   schema; run_id (this run's, also in its summary line), release (this script's tag),
 #   written_at (UTC, ISO 8601), boot_id, kernel (uname -r) and board (the first device-tree
 #   compatible string), all of this run;
 #   installer_sha256 and installer_source: the sha256 of the script file this run reads and
 #     "file", or "unavailable" and "stdin" when it came through a pipe;
-#   package, version, file, sha256 (this release's mesa-m3 entry) and prefix, and an
-#     integration_path line per file of the package that ties it into the system;
+#   package, version, file, sha256 (this release's mesa-m3 entry) and prefix, an
+#     integration_path line per file of the package that ties it into the system, and on an Air
+#     a replaced_package line ("name version") per earlier Mesa package a run of this script
+#     removed for it (mesa-m3-g15g);
 #   result (below), installed_version (or none), installed_by (below), preexisting (the mesa-m3
 #     version installed before this script first wrote a record on this Mac, or none);
 #   user (the invoking user); render_member (yes, no or unknown: in group render, as at the next
@@ -2465,7 +2581,7 @@ m3_pro_mesa_record() {
   local have by pre k v p w rc errs="" cause bad="" keys=() optout=() lines=() head=() elines=()
   local user rmember rpre rby u added=()
   local rec=$STATE/$M3_PRO_MESA_RECORD_NAME
-  is_m3_pro && [[ -n $M3_PRO_MESA_PACKAGE ]] || return 0
+  m3_mesa_mac && [[ -n $M3_PRO_MESA_PACKAGE ]] || return 0
   have=$(m3_pro_mesa_installed)
   pre=$M3_PRO_MESA_PREEXISTING
   if [[ -z $pre ]]; then pre=$(m3_pro_mesa_record_get preexisting); fi
@@ -2507,6 +2623,10 @@ m3_pro_mesa_record() {
   lines=("${head[@]}" "package=$M3_PRO_MESA_NAME" "version=$(m3_pro_mesa_version)" "file=$(m3_pro_mesa_file)"
     "sha256=${M3_PRO_MESA_PACKAGE#* }" "prefix=$M3_PRO_MESA_PREFIX")
   while IFS= read -r p; do lines+=("integration_path=$p"); done <<<"$M3_PRO_MESA_INTEGRATION"
+  for p in "${M3_PRO_MESA_REPLACED[@]}"; do lines+=("replaced_package=$p"); done
+  while IFS= read -r p; do
+    if [[ -n $p && " ${M3_PRO_MESA_REPLACED[*]} " != *" $p "* ]]; then lines+=("replaced_package=$p"); fi
+  done < <(m3_pro_mesa_record_list replaced_package)
   lines+=("result=$M3_PRO_MESA_RESULT" "installed_version=${have:-none}" "installed_by=$by" "preexisting=${pre:-none}"
     "user=$user" "render_member=$rmember" "render_preexisting=$rpre" "render_added=$M3_PRO_MESA_RENDER_ADDED"
     "render_by_installer=$rby")
@@ -2665,38 +2785,40 @@ m3_pro_mesa_record_leftovers() {
 
 # What the owner reads at the end of an install on an M3 Pro.
 m3_pro_mesa_notice() {
-  local want have setup="" optout
-  is_m3_pro && [[ -n $M3_PRO_MESA_PACKAGE ]] || return 0
+  local want have setup="" optout p
+  m3_mesa_mac && [[ -n $M3_PRO_MESA_PACKAGE ]] || return 0
   want=$(m3_pro_mesa_version) have=$(m3_pro_mesa_installed)
   case $M3_PRO_MESA_RESULT in
     installed)
-      echo "   The M3 Pro's Mesa ($M3_PRO_MESA_NAME $want, in $M3_PRO_MESA_PREFIX) is installed. The new"
+      echo "   The $(m3_mesa_name) ($M3_PRO_MESA_NAME $want, in $M3_PRO_MESA_PREFIX) is installed. The new"
       echo "   graphics take effect at the next login: the reboot does that."
-      if [[ $M3_MODE != handoff ]]; then
+      if is_m3_pro && [[ $M3_MODE != handoff ]]; then
         echo "   This M3 Pro boots kernel-only (no GPU handoff), so at login the package finds no GPU,"
         echo "   leaves itself off and the desktop keeps rendering in software."
       fi ;;
     current)
-      echo "   The M3 Pro's Mesa ($M3_PRO_MESA_NAME $have) was installed already; nothing new was installed." ;;
+      echo "   The $(m3_mesa_name) ($M3_PRO_MESA_NAME $have) was installed already; nothing new was installed." ;;
     newer-kept)
       echo "   A newer $M3_PRO_MESA_NAME ($have) than this release's ($want) is installed and was kept." ;;
     skipped-flag)
       if [[ -n $have ]]; then
-        echo "   --no-m3-mesa: this run left the M3 Pro's Mesa out; the $M3_PRO_MESA_NAME $have installed"
+        echo "   --no-m3-mesa: this run left the $(m3_mesa_name) out; the $M3_PRO_MESA_NAME $have installed"
         echo "   earlier stays installed (sudo pacman -R $M3_PRO_MESA_NAME removes it)."
       else
-        echo "   --no-m3-mesa: the M3 Pro's Mesa was not installed, so the desktop renders in software."
+        echo "   --no-m3-mesa: the $(m3_mesa_name) was not installed, so the desktop renders in software."
       fi ;;
     skipped-deps)
-      echo "   The M3 Pro's Mesa was NOT installed: it needs newer packages (see the warning above)."
+      echo "   The $(m3_mesa_name) was NOT installed: it needs newer packages (see the warning above)."
       echo "   The kernel install is complete; until it is installed the desktop renders in software."
       echo "   Update the packages the warning names, then run this again. The exit status is 3." ;;
     failed)
-      echo "   The M3 Pro's Mesa was NOT installed: pacman could not install it (see above). The"
+      echo "   The $(m3_mesa_name) was NOT installed: pacman could not install it (see above). The"
       echo "   kernel install is complete; until it is installed the desktop renders in software."
       echo "   Run this again to try again. The exit status is 3." ;;
   esac
   if [[ -n $M3_PRO_MESA_RENDER_NOTE ]]; then echo "   $M3_PRO_MESA_RENDER_NOTE"; fi
+  for p in "${M3_PRO_MESA_REPLACED[@]}"; do echo "   Removed ${p% *} ${p##* }, which mesa-m3 replaces."; done
+  if is_m3_air && [[ -n $have ]]; then m3_pro_mesa_air_notice; fi
   if [[ -n $have ]]; then m3_pro_mesa_recovery; fi
   if ((${#M3_PRO_MESA_SETUP[@]})); then setup=$(printf '%s\0' "${M3_PRO_MESA_SETUP[@]}" | m3_pro_mesa_describe); fi
   if [[ -n $setup ]]; then
@@ -2708,7 +2830,7 @@ m3_pro_mesa_notice() {
   fi
   optout=$(m3_pro_mesa_optout | m3_pro_mesa_describe)
   if [[ -n $optout && -n $have ]]; then
-    echo "   Left as it is: the M3 Pro's Mesa is switched off at login by $optout."
+    echo "   Left as it is: the $(m3_mesa_name) is switched off at login by $optout."
   fi
   case $M3_PRO_MESA_RECORD_WRITE in
     ok) ;;
@@ -2723,15 +2845,26 @@ m3_pro_mesa_notice() {
   return 0
 }
 
-# How to see and undo what the M3 Pro's Mesa does at login (mesa-m3's state file, journal and
+# On an Air with mesa-m3: whether its login hook may use the GPU (M3_GPU_OPTIN), for the summary.
+m3_pro_mesa_air_notice() {
+  if [[ -f $M3_GPU_OPTIN ]]; then
+    echo "   $M3_GPU_OPTIN is present: a login uses this Air's GPU, which is experimental, when"
+    echo "   the GPU is started (sudo air-gpu-oneshot.sh start arms one boot); otherwise it renders in software."
+  else
+    echo "   This Air's GPU is experimental: GPU sessions need --m3-gpu-experiment (it writes"
+    echo "   $M3_GPU_OPTIN). Until then each login says experimental and renders in software."
+  fi
+}
+
+# How to see and undo what the M3's Mesa does at login (mesa-m3's state file, journal and
 # switch-off), for the summary when mesa-m3 is installed.
 m3_pro_mesa_recovery() {
   cat <<'M3_PRO_MESA_RECOVERY'
    Each login records whether the GPU graphics are on and why:
      cat /run/user/$(id -u)/mesa-m3-session.state     (or: journalctl -b -t mesa-m3)
-   Reasons: active, opt-out, not-t6030, no-gpu, no-display, no-access, incomplete-prefix,
-   user-setup, user-setup-ldpath, user-setup-unknown, missing-soname, load-failed,
-   log-unreadable, gpu-fault, previous-failed. When off, the desktop renders in software.
+   Reasons: active, opt-out, not-supported, experimental, no-gpu, no-display, no-access,
+   incomplete-prefix, user-setup, user-setup-ldpath, user-setup-unknown, missing-soname,
+   load-failed, log-unreadable, gpu-fault, previous-failed. When off, the desktop renders in software.
    If the desktop does not come up: Ctrl+Alt+F3, log in, run
      mkdir -p ~/.config/mesa-m3 && touch ~/.config/mesa-m3/disable
    and reboot, or add mesa_m3=off to the kernel command line at the boot menu. To turn it
@@ -2747,9 +2880,9 @@ M3_PRO_MESA_RECOVERY
 
 # After a complete kernel install, on an M3 Pro: exit status 4 when this run's record is not
 # written and durable (whatever happened to the Mesa: the summary line says), else 3 when the
-# M3 Pro's Mesa was not installed or the desktop user could not be added to group render.
+# M3's Mesa was not installed or the desktop user could not be added to group render.
 m3_pro_mesa_status() {
-  is_m3_pro && [[ -n $M3_PRO_MESA_PACKAGE ]] || return 0
+  m3_mesa_mac && [[ -n $M3_PRO_MESA_PACKAGE ]] || return 0
   [[ $M3_PRO_MESA_RECORD_WRITE == ok ]] || return 4
   case $M3_PRO_MESA_RESULT in skipped-deps | failed) return 3 ;; esac
   [[ $M3_PRO_MESA_RENDER_ADDED != failed ]] || return 3
@@ -2776,6 +2909,8 @@ m3_pro_mesa_render_kept() {
 # other file for it.
 m3_pro_mesa_remove() {
   local rec=$STATE/$M3_PRO_MESA_RECORD_NAME
+  # An M3 Pro as in 12.3; an Air only with a record (from 12.4 on), so an Air this script never
+  # gave mesa-m3 runs --uninstall as before.
   is_m3_pro || [[ -f $rec ]] || return 0
   # The render group only goes with the package: while mesa-m3 stays, its udev rule keeps the
   # GPU's render node for that group, and a user taken out of it would lose the GPU.
@@ -2810,7 +2945,7 @@ m3_pro_mesa_remove_package() {
     return 1
   fi
   if $sudo pacman -Rn --noconfirm "$M3_PRO_MESA_NAME"; then
-    say "Removed the M3 Pro's Mesa ($M3_PRO_MESA_NAME $have)"
+    say "Removed the $(m3_mesa_name) ($M3_PRO_MESA_NAME $have)"
     return 0
   fi
   warn "could not remove $M3_PRO_MESA_NAME; remove it with: sudo pacman -R $M3_PRO_MESA_NAME"
@@ -3351,7 +3486,6 @@ install_all() {
     fi
     [[ $(sha256sum "$work/$file" | cut -d' ' -f1) == "$sha" ]] || die "$file does not match its published checksum"
   done
-  m3_gpu_set_aside
   m3_pro_mesa_set_aside
   if m1n1_for_this_mac; then
     sha=$(m1n1_pkg_sha "$work/${M1N1_PACKAGE%% *}")
@@ -3472,13 +3606,19 @@ install_all() {
   $sudo systemctl daemon-reload
   sep_policy
   if is_neo; then neo_radio_notice; fi
-  m3_gpu_mesa_install
   m3_pro_mesa_install
   m3_pro_mesa_render
   m3_pro_mesa_record
   pacman -Q linux-aurora libfprint aurora-touchid
   echo
-  if [[ $M3_MODE == handoff ]] && is_m3_air && [[ $M3_AIR_DISPLAY_HANDOFF == 1 ]]; then
+  if [[ $M3_MODE == handoff ]] && m3_air_default; then
+    say "Done. Reboot: expect the Omarchy logo, the boot menu, then the same desktop on the boot
+    framebuffer. m1n1 now hands the built-in display over and describes the GPU firmware for
+    Linux; the kernel keeps the boot framebuffer until it can drive the display, and nothing
+    starts the GPU. Touch ID is not supported on M3 yet."
+    m3_air_off_notice
+  elif [[ $M3_MODE == handoff ]] && is_m3_air && [[ $M3_AIR_DISPLAY_HANDOFF == 1 ]]; then
+    m3_air_off_notice quiet
     say "Done. Reboot with the serial recorder running and someone watching: expect the Omarchy
     logo, the boot menu, then the same desktop on the boot framebuffer. Check the serial log
     for the T8122 handoff result and the \"PMP: T8122:\" lines.
@@ -5654,9 +5794,15 @@ fingerprint.
       aurora-m3-power-<board>-<date>.tgz.
 
    D. apple,j613 or apple,j615 + apple,t8122 (MacBook Air 13" or 15" M3):
-      KERNEL ONLY BY DEFAULT. THE BOOT LOADER TEST IS OPT-IN.
+      J613: THE PLAIN ONE-LINER INSTALLS m1n1's DISPLAY HANDOFF BY DEFAULT.
+      It says "installing m1n1 with the M3 Air display handoff", replaces
+      the boot loader (the restore steps are printed), and the desktop stays
+      on the boot framebuffer. Run the checks below after its first boot and
+      report them. The install's summary says how the owner switches a part
+      of it off on this Mac (a chosen.<name>=0 line in /etc/m1n1.conf).
+      J615: KERNEL ONLY BY DEFAULT. THE BOOT LOADER TEST IS OPT-IN.
       The plain one-liner installs the kernel only, as in case C, and says so:
-        M3 MacBook Air (j613): installing the kernel only ...
+        M3 MacBook Air (j615): installing the kernel only ...
       Run the checks below on that first and report it: it is the baseline
       every later Air test is compared with.
       Then, to try m1n1's display handoff with GPU diagnostics on this Air:
@@ -5719,14 +5865,20 @@ fingerprint.
         - Later plain runs keep the display handoff on this Air. To go back,
           use the printed restore lines; ask the maintainer before using
           --uninstall on an Air.
+        - Every Air also gets mesa-m3 (in /opt/mesa-m3), with the desktop
+          user added to the render group. It leaves the GPU off at login
+          (the state file says "experimental") until the opt-in file
+          /etc/mesa-m3/t8122-gpu-experiment exists, which only
+          --m3-gpu-experiment writes. Quote the summary's mesa-m3 lines.
         - The GPU start experiment, only when the maintainer asks for it:
           --m3-gpu-experiment ("bash -s -- --m3-gpu-experiment", with
           --m3-handoff if the Air needs it) installs air-gpu-oneshot.sh,
-          air-gpu-collect.sh and air-gpu-job.sh in /usr/local/bin and arms
-          nothing. "sudo air-gpu-oneshot.sh start" (or knob=value ...) arms
-          the next boot only. Limine clears the one-shot before that boot
-          starts, so the boots after it, a power cycle included, should be
-          the normal entry; this has been tested on an M3 Pro only. So the
+          air-gpu-collect.sh and air-gpu-job.sh in /usr/local/bin, and the
+          opt-in file, and arms nothing. "sudo air-gpu-oneshot.sh start"
+          (or knob=value ...) arms the next boot only. Limine clears the
+          one-shot before that boot starts, so the boots after it, a power
+          cycle included, should be the normal entry; this has been tested
+          on an M3 Pro only. So the
           first arming on each Air is the harmless one,
             sudo air-gpu-oneshot.sh t8122_pstate_cap=1
           and in that armed boot "sudo air-gpu-oneshot.sh --status" must say
