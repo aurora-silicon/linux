@@ -7,7 +7,7 @@
 //! Admission rejects either before reading firmware, mapping GPU registers or starting the
 //! GPU coprocessor ([`Soc::require_complete`]).
 
-use kernel::{device, prelude::*};
+use kernel::{c_str, device, prelude::*};
 
 use crate::{
     hw,
@@ -71,6 +71,16 @@ pub(crate) struct MtrMasks {
     /// The mask the firmware matches an MTR alarm against (HwDataA +0x1a98). An alarm from a
     /// sensor outside it, or any alarm while it is 0, is fatal to the firmware.
     pub(crate) alarm: u64,
+}
+
+/// Where the boot loader exports a SoC's decoded GPU leakage fuse values, in `/chosen`, and the
+/// boot loader switch that makes them this boot's leakage.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct LeakFuse {
+    /// Two cells, value 1 then value 2, encoded as `apple,core-leak-coef` is.
+    pub(crate) values: &'static CStr,
+    /// The switch, present with value 1 when the boot loader uses the values.
+    pub(crate) switch: &'static CStr,
 }
 
 /// Where the runtime places the HwData object (`m3_init_storage::HARDWARE_DATA`), when it is not
@@ -163,6 +173,8 @@ pub(crate) struct Soc {
     pub(crate) hwdata_words: &'static [(usize, u32)],
     /// The same for the Globals object.
     pub(crate) globals_words: &'static [(usize, u32)],
+    /// The boot loader's decoded GPU leakage fuse, when it exports one for this SoC.
+    pub(crate) leak_fuse: Option<LeakFuse>,
 }
 
 impl Soc {
@@ -309,6 +321,8 @@ pub(crate) static T6030: Soc = Soc {
     power_target_cap_mw: None,
     hwdata_words: &[],
     globals_words: &[],
+    // The boot loader reads the T6030 leakage fuse itself and writes apple,core-leak-coef.
+    leak_fuse: None,
 };
 
 /// T8122 (M3, G15G): one die, one cluster of ten core slots (eight or ten of them active).
@@ -406,6 +420,12 @@ pub(crate) static T8122: Soc = Soc {
     power_target_cap_mw: Some(22_000),
     hwdata_words: &T8122_HWDATA_WORDS,
     globals_words: &T8122_GLOBALS_WORDS,
+    // Exported on a J613 on every boot; used only with the boot loader's switch, which also makes
+    // value 1 its apple,core-leak-coef and the base of its operating points' powers.
+    leak_fuse: Some(LeakFuse {
+        values: c_str!("asahi,t8122-gpu-leak-fuse"),
+        switch: c_str!("asahi,t8122-gpu-fuse-leakage"),
+    }),
 };
 
 /// The T8122 HwData words that differ from the shared builder's (offsets into the object;

@@ -12,6 +12,7 @@ use kernel::{
 };
 
 use crate::{
+    float::F32,
     fw::initdata::raw,
     hw, initdata,
     initdata::{G15Layout, G15Options},
@@ -649,6 +650,78 @@ pub(crate) fn check_upload(
     Ok(())
 }
 
+/// The whole part of a positive `F32`, for logs.
+fn whole(v: F32) -> u32 {
+    let bits = v.to_bits();
+    match ((bits >> 23) & 0xff) as i32 - 127 {
+        e if e < 0 => 0,
+        e if e > 31 => u32::MAX,
+        e if e > 23 => ((bits & 0x7f_ffff) | 0x80_0000) << (e - 23),
+        e => ((bits & 0x7f_ffff) | 0x80_0000) >> (23 - e),
+    }
+}
+
+/// The boot loader's decoded GPU leakage fuse values (`Soc::leak_fuse`), logged when it exported
+/// them. Returns them when the boot loader's switch is set. With the switch set and no two
+/// valid values, refuses: the boot loader then used neither the fuse nor the stand-in.
+fn leak_fuse(dev: &device::Device, lf: &crate::m3_soc::LeakFuse) -> Result<Option<[F32; 2]>> {
+    let chosen = kernel::of::chosen();
+    let switch = chosen
+        .as_ref()
+        .and_then(|c| c.get_property::<KVec<u8>>(lf.switch).ok())
+        .is_some_and(|v| matches!(v.as_slice(), b"1\0" | b"1" | [0, 0, 0, 1]));
+    let values: Option<KVec<F32>> = chosen.as_ref().and_then(|c| c.get_property(lf.values).ok());
+    // Positive, finite, nonzero.
+    let valid = |v: &F32| {
+        let b = v.to_bits();
+        b != 0 && b >> 31 == 0 && (b >> 23) & 0xff != 0xff
+    };
+    let pair = values
+        .as_ref()
+        .filter(|v| v.len() == 2 && v.iter().all(valid))
+        .map(|v| [v[0], v[1]]);
+    let names = (lf.values.to_str().unwrap_or("?"), lf.switch.to_str().unwrap_or("?"));
+    match (pair, switch) {
+        (Some([a, b]), true) => {
+            dev_info!(
+                dev,
+                "M3: GPU leakage from the boot loader's fuse values: {} and {} (/chosen/{}, {} set)\n",
+                whole(a),
+                whole(b),
+                names.0,
+                names.1
+            );
+            Ok(Some([a, b]))
+        }
+        (Some([a, b]), false) => {
+            dev_info!(
+                dev,
+                "M3: the boot loader's GPU leakage fuse values are {} and {} (/chosen/{}); not used: {} is not set\n",
+                whole(a),
+                whole(b),
+                names.0,
+                names.1
+            );
+            Ok(None)
+        }
+        (None, true) => {
+            dev_err!(
+                dev,
+                "M3: {} is set, but /chosen/{} does not hold two valid values; GPU startup disabled\n",
+                names.1,
+                names.0
+            );
+            Err(EINVAL)
+        }
+        (None, false) => {
+            if values.is_some() {
+                dev_warn!(dev, "M3: /chosen/{} is malformed; ignored\n", names.0);
+            }
+            Ok(None)
+        }
+    }
+}
+
 /// A zeroed image of owner `index`.
 fn zeroed(index: usize) -> Result<KVVec<u8>> {
     let size = storage::allocation(index).map_err(|_| EINVAL)?.size;
@@ -678,6 +751,28 @@ fn build_images(
     let mut pwr = hw::PwrConfig::load(dev, cfg).inspect_err(|e| {
         dev_err!(dev, "M3: cannot read the GPU power configuration from the device tree ({:?})\n", e)
     })?;
+    // The boot loader's decoded leakage fuse, when its switch makes it this boot's leakage: value
+    // 1 is the core leakage coefficient (the boot loader then writes it as apple,core-leak-coef
+    // too), value 2 goes to HwDataA's third leakage table below.
+    let fuse = match soc.leak_fuse {
+        Some(lf) => leak_fuse(dev, &lf)?,
+        None => None,
+    };
+    if let Some([core, _]) = fuse {
+        match pwr.core_leak_coef.first_mut() {
+            Some(c) if c.to_bits() != core.to_bits() => {
+                dev_info!(
+                    dev,
+                    "M3: core leakage {} replaces the device tree's {}\n",
+                    whole(core),
+                    whole(*c)
+                );
+                *c = core;
+            }
+            Some(_) => {}
+            None => return Err(EINVAL),
+        }
+    }
     // A SoC whose power model is still a stand-in caps the power target: every operating point's
     // power is scaled by the same factor, so the relative powers stay the boot loader's.
     if let Some(cap) = soc.power_target_cap_mw {
@@ -781,6 +876,13 @@ fn build_images(
             m.fast_die,
             m.alarm
         );
+    }
+    // The second leakage fuse value: the first entry of HwDataA's third leakage table (the first
+    // table holds the core coefficient, from the builder).
+    if let Some([_, second]) = fuse {
+        type A = raw::HwDataAG15V14_8_3;
+        let at = HWDATA_A + offset_of!(A, cluster_tables) + 2 * size_of::<[u32; 8]>();
+        write(&mut hwdata, at, &second.to_bits().to_le_bytes())?;
     }
     // The SoC's own values for words the shared builder writes otherwise.
     for &(at, value) in soc.hwdata_words {
