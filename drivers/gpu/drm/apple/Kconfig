@@ -34,7 +34,8 @@ config DRM_APPLE_KUNIT_TEST
 	depends on KUNIT
 	default KUNIT_ALL_TESTS
 	help
-	  Build tests for the Apple display driver's AFK ring parser.
+	  Build tests for the Apple display driver's AFK ring parser and
+	  backlight policy (takeover, DPMS, suspend and present completion).
 	  The tests cover the header strides used by older firmware and
 	  larger rings, as well as malformed ring size combinations.
 	  This option is intended for developer test kernels.
