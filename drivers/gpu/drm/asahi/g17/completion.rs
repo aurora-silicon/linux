@@ -13,7 +13,7 @@ use super::{
     recovery::Class,
     status::VmStatus,
 };
-use crate::{driver::AsahiDevice, file, hw::t8140::resources as cfg, mmu};
+use crate::{driver::AsahiDevice, file, hw::t8140::{dynamic, resources as cfg}, mmu};
 use core::sync::atomic::{fence as barrier, AtomicBool, AtomicI32, AtomicU8, Ordering};
 use kernel::{
     dma_fence::{Fence, FenceContexts, RawDmaFence, UserFence},
@@ -156,7 +156,9 @@ impl ComputeTimestamps {
         let object = KernelObject::backing(dev, mmu::UAT_PGSZ, CpuMap::WriteCombined)?;
         let mapping = object.alias_in(
             vm,
-            cfg::TIMESTAMPS,
+            // Canonical shared queue aliases may be installed in this VM later.
+            // Private timestamp pages must never occupy their retained addresses.
+            dynamic::CLIENT_LOWER,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
