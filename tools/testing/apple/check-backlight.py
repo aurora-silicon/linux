@@ -79,7 +79,7 @@ struct apple_dcp {
     int bl_register_mutex,bl_register_wq;
     struct { u32 maximum;u32 nits;struct backlight_device *bl_dev;u32 dac; } brightness;
     struct { int lock;struct dcp_backlight_state state;void (*kick)(struct apple_dcp *); } backlight;
-    struct { int lock;struct iomfb_transaction *active; } iomfb;
+    struct { int lock;struct iomfb_transaction *active;int opaque_x_state; } iomfb;
 };
 static int schedule_count,register_count,retire_count,dac_count;
 static struct backlight_properties registered;
@@ -100,6 +100,10 @@ static struct backlight_device *devm_backlight_device_register(struct device *de
 static void put_unaligned_le64(u64 v,void *p) { for(int i=0;i<8;i++)((u8 *)p)[i]=v>>(8*i); }
 static void put_unaligned_le32(u32 v,void *p) { for(int i=0;i<4;i++)((u8 *)p)[i]=v>>(8*i); }
 static void put_unaligned_le16(uint16_t v,void *p) { for(int i=0;i<2;i++)((u8 *)p)[i]=v>>(8*i); }
+enum { IOMFB_OPAQUE_X_WAITING, IOMFB_OPAQUE_X_NEEDED };
+static int atomic_cmpxchg(int *value,int expected,int desired) {
+ int old=*value;if(old==expected)*value=desired;return old;
+}
 int iomfb_configure_backlight_h17p(struct apple_dcp *,u32,bool,u32,bool,u32);
 '''
 functions = [
@@ -194,6 +198,7 @@ int main(int argc,char **argv) {
     assert(dcp_bl_request(&dcp.backlight.state,140,false,false)==0);
     assert(!iomfb_present_complete_h17p(&dcp));
     assert(dcp.backlight.state.actual==400 && dcp.backlight.state.dirty && !retire_count);
+    assert(dcp.iomfb.opaque_x_state==IOMFB_OPAQUE_X_WAITING);
     assert(iomfb_apply_backlight_h17p(&dcp,&request,&wire));
     assert(level(&wire)==140);
     iomfb_present_failed_h17p(&dcp);
@@ -237,6 +242,12 @@ int main(int argc,char **argv) {
     struct apple_dcp zero=fixture();
     assert(dcp_backlight_takeover(&zero,0)==0);
     assert(zero.backlight.state.target==0 && !zero.backlight.state.dirty);
+    transaction = (struct iomfb_transaction){.brightness_only=false};
+    dcp.iomfb.active = &transaction;
+    dcp.iomfb.opaque_x_state = IOMFB_OPAQUE_X_WAITING;
+    assert(iomfb_present_complete_h17p(&dcp));
+    assert(dcp.iomfb.opaque_x_state == IOMFB_OPAQUE_X_NEEDED);
+
     puts("Actual takeover/registration/reservation/accepted completion/rejection/20 DPMS cycles passed");
     return 0;
 }

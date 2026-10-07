@@ -1463,6 +1463,11 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 	u32 handle;
 	dev_info(dcp->dev, "dcp_poweron() starting\n");
 
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		iomfb_opaque_x_reset_h17p(dcp);
+#endif
+
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie)
 		return;

@@ -67,6 +67,21 @@ static_assert(sizeof(struct dcp_present_h17p) == 0xe9c);
 static_assert(offsetof(struct dcp_present_h17p, surf) == 0x588);
 static_assert(offsetof(struct dcp_present_h17p, tail) == 0xe38);
 
+struct dcp_apply_property_h17p {
+	u32 property;
+	u32 value;
+} __packed;
+
+static_assert(sizeof(struct dcp_apply_property_h17p) == 0x8);
+
+static inline struct dcp_apply_property_h17p dcp_opaque_x_property_h17p(void)
+{
+	return (struct dcp_apply_property_h17p) {
+		.property = 0x49,
+		.value = 0,
+	};
+}
+
 void iomfb_encode_backlight_h17p(struct dcp_present_h17p *wire, u32 nits,
 				 u32 maximum, bool update);
 

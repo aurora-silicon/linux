@@ -391,6 +391,7 @@ struct apple_dcp {
 		unsigned int queued;
 		bool stopped;
 		bool backlight_queued;
+		atomic_t opaque_x_state;
 		struct iomfb_scanout_h17p *scanout;
 		struct iomfb_scanout_h17p *next_scanout;
 	} iomfb;
@@ -404,6 +405,9 @@ void iomfb_present_failed_h17p(struct apple_dcp *dcp);
 bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 				const struct dcp_swap_submit_req_h17p *request,
 				struct dcp_present_h17p *wire);
+void iomfb_apply_opaque_x_h17p(struct apple_dcp *dcp, dcp_callback_t callback,
+			       void *cookie);
+void iomfb_opaque_x_reset_h17p(struct apple_dcp *dcp);
 int iomfb_configure_backlight_h17p(struct apple_dcp *dcp, u32 maximum,
 				   bool inherited_valid, u32 inherited,
 				   bool default_valid, u32 default_nits);

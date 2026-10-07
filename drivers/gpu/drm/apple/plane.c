@@ -430,6 +430,23 @@ static const u32 dcp_primary_formats[] = {
 #endif
 };
 
+/* H17P 10-bit XRGB alpha semantics have not been qualified. */
+static const u32 dcp_primary_formats_h17p[] = {
+	DRM_FORMAT_ARGB2101010,
+	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_ARGB8888,
+	DRM_FORMAT_XBGR8888,
+	DRM_FORMAT_ABGR8888,
+	DRM_FORMAT_NV12,
+	DRM_FORMAT_NV16,
+	DRM_FORMAT_NV24,
+	DRM_FORMAT_P010,
+	DRM_FORMAT_P210,
+#if defined(DRM_FORMAT_P410)
+	DRM_FORMAT_P410,
+#endif
+};
+
 static const u32 dcp_overlay_formats[] = {
 	DRM_FORMAT_ARGB2101010,
 	DRM_FORMAT_ARGB8888,
@@ -484,6 +501,7 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 				   unsigned long possible_crtcs,
 				   u32 iomfb_surf,
 				   bool supports_l10r,
+				   bool supports_xrgb2101010,
 				   enum drm_plane_type type)
 {
 	struct apple_plane *plane;
@@ -492,9 +510,12 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 
 	switch (type) {
 	case DRM_PLANE_TYPE_PRIMARY:
-		if (supports_l10r) {
+		if (supports_l10r && supports_xrgb2101010) {
 			fmts = dcp_primary_formats;
 			num_fmts = ARRAY_SIZE(dcp_primary_formats);
+		} else if (supports_l10r) {
+			fmts = dcp_primary_formats_h17p;
+			num_fmts = ARRAY_SIZE(dcp_primary_formats_h17p);
 		} else {
 			fmts = dcp_primary_formats_12_x;
 			num_fmts = ARRAY_SIZE(dcp_primary_formats_12_x);

@@ -171,6 +171,46 @@ static bool iomfb_channels_idle(struct apple_dcp *dcp)
 	       !dcp->ch_async.depth && !dcp->ch_oobasync.depth;
 }
 
+enum iomfb_opaque_x_state {
+	IOMFB_OPAQUE_X_WAITING,
+	IOMFB_OPAQUE_X_NEEDED,
+	IOMFB_OPAQUE_X_QUEUED,
+	IOMFB_OPAQUE_X_READY,
+};
+
+struct iomfb_opaque_x_transaction {
+	struct iomfb_transaction transaction;
+};
+
+static void iomfb_opaque_x_start(struct apple_dcp *dcp,
+				 struct iomfb_transaction *transaction);
+static void iomfb_opaque_x_release(struct iomfb_transaction *transaction);
+
+static int iomfb_enqueue_opaque_x(struct apple_dcp *dcp)
+{
+	struct iomfb_opaque_x_transaction *opaque;
+
+	lockdep_assert_held(&dcp->iomfb.lock);
+	if (atomic_read(&dcp->iomfb.opaque_x_state) != IOMFB_OPAQUE_X_NEEDED)
+		return 0;
+	if (dcp->iomfb.queued >= 32)
+		return -EBUSY;
+	opaque = kzalloc_obj(*opaque);
+	if (!opaque)
+		return -ENOMEM;
+	if (atomic_cmpxchg(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_NEEDED,
+			   IOMFB_OPAQUE_X_QUEUED) != IOMFB_OPAQUE_X_NEEDED) {
+		kfree(opaque);
+		return 0;
+	}
+
+	opaque->transaction.start = iomfb_opaque_x_start;
+	opaque->transaction.release = iomfb_opaque_x_release;
+	dcp->iomfb.queued++;
+	list_add(&opaque->transaction.link, &dcp->iomfb.pending);
+	return 0;
+}
+
 static void iomfb_discard_pending(struct apple_dcp *dcp)
 {
 	struct iomfb_transaction *transaction, *next;
@@ -207,6 +247,12 @@ static void iomfb_queue_advance(struct apple_dcp *dcp)
 		if (transaction->completed && dcp_backlight_pending(dcp))
 			schedule_work(&dcp->bl_update_wq);
 		transaction->release(transaction);
+	}
+	if (iomfb_enqueue_opaque_x(dcp)) {
+		WRITE_ONCE(dcp->crashed, true);
+		iomfb_discard_pending(dcp);
+		schedule_work(&dcp->vblank_wq);
+		return;
 	}
 	if (!list_empty(&dcp->iomfb.pending))
 		schedule_work(&dcp->iomfb.work);
@@ -259,12 +305,48 @@ static void iomfb_queue_timeout(struct work_struct *work)
 	mutex_unlock(&dcp->iomfb.lock);
 }
 
+static void iomfb_opaque_x_complete(struct apple_dcp *dcp, void *out,
+				    void *cookie)
+{
+	u32 status = out ? *(u32 *)out : ~0U;
+
+	(void)cookie;
+
+	if (status) {
+		dev_err(dcp->dev, "opaque X property failed: %u\n", status);
+		WRITE_ONCE(dcp->crashed, true);
+		schedule_work(&dcp->vblank_wq);
+		return;
+	}
+
+	atomic_set(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_READY);
+}
+
+static void iomfb_opaque_x_start(struct apple_dcp *dcp,
+				 struct iomfb_transaction *transaction)
+{
+	(void)transaction;
+	iomfb_apply_opaque_x_h17p(dcp, iomfb_opaque_x_complete, NULL);
+}
+
+static void iomfb_opaque_x_release(struct iomfb_transaction *transaction)
+{
+	kfree(container_of(transaction, struct iomfb_opaque_x_transaction,
+			   transaction));
+}
+
+void iomfb_opaque_x_reset_h17p(struct apple_dcp *dcp)
+{
+	atomic_set(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_WAITING);
+}
+
 void iomfb_queue_init(struct apple_dcp *dcp)
 {
 	mutex_init(&dcp->iomfb.lock);
 	INIT_LIST_HEAD(&dcp->iomfb.pending);
 	INIT_WORK(&dcp->iomfb.work, iomfb_queue_work);
 	INIT_DELAYED_WORK(&dcp->iomfb.timeout, iomfb_queue_timeout);
+	atomic_set(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_WAITING);
 }
 
 void iomfb_queue_stop(struct apple_dcp *dcp)
@@ -1038,6 +1120,8 @@ bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
 		if (transaction->brightness_only)
 			return false;
 	}
+	atomic_cmpxchg(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_WAITING,
+		       IOMFB_OPAQUE_X_NEEDED);
 	iomfb_scanout_complete_h17p(dcp);
 	return true;
 }

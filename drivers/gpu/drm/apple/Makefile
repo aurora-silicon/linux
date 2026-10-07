@@ -11,6 +11,7 @@ appledrm-y += ibootep.o
 appledrm-y += iomfb_v12_3.o
 appledrm-y += iomfb_v13_3.o
 appledrm-y += iomfb_h17p.o
+appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb_h17p_test.o
 appledrm-y += epic/dpavservep.o
 appledrm-y += plane.o
 

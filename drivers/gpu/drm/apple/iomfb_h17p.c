@@ -210,6 +210,19 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 
 #include "iomfb_template.c"
 
+void iomfb_apply_opaque_x_h17p(struct apple_dcp *dcp, dcp_callback_t callback,
+			       void *cookie)
+{
+	static const struct dcp_method_entry method = {
+		.name = "apply_property",
+		.tag = { 'A', '3', '5', '2' },
+	};
+	struct dcp_apply_property_h17p property = dcp_opaque_x_property_h17p();
+
+	dcp_push(dcp, false, &method, sizeof(property), sizeof(u32), &property,
+		 callback, cookie);
+}
+
 static bool trampoline_rt_bandwidth_h17p(struct apple_dcp *dcp, int tag,
 					 void *out, void *in)
 {
