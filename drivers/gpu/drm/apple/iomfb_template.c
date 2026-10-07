@@ -904,8 +904,12 @@ static void boot_5(struct apple_dcp *dcp, void *out, void *cookie)
 static void boot_4b(struct apple_dcp *dcp, void *out, void *cookie)
 {
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-	u32 v_true = 1;
-	dcp_late_init_signal(dcp, false, &v_true, boot_5, NULL);
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	u32 value = dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G;
+#else
+	u32 value = 1;
+#endif
+	dcp_late_init_signal(dcp, false, &value, boot_5, NULL);
 #else
 	dcp_late_init_signal(dcp, false, boot_5, NULL);
 #endif
