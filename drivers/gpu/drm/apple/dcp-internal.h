@@ -17,6 +17,7 @@
 #include <linux/usb/typec_mux.h>
 
 #include "dptxep.h"
+#include "dcp_backlight.h"
 #include "iomfb.h"
 #include "iomfb_h17p.h"
 #include "iomfb_v12_3.h"
@@ -340,6 +341,14 @@ struct apple_dcp {
 	struct apple_connector *fixed_connector;
 	struct apple_connector *typec_connector;
 	int hdmi_hpd_irq;
+
+	/* H17P policy shared by backlight, commit, and reply workers. */
+	struct {
+		/* Protects state and callback installation. */
+		spinlock_t lock;
+		struct dcp_backlight_state state;
+		void (*kick)(struct apple_dcp *dcp);
+	} backlight;
 };
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
