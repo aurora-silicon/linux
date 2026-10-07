@@ -7,6 +7,7 @@
 #include <linux/kconfig.h>
 #include <linux/of_platform.h>
 #include <linux/slab.h>
+#include <linux/unaligned.h>
 #include <linux/workqueue.h>
 #include <linux/soc/apple/rtkit.h>
 
@@ -554,6 +555,14 @@ static void afk_recv_handle_std_service(struct apple_dcp_afkep *ep, u32 channel,
 				   payload_size, true);
 }
 
+static bool afk_validate_h17p_header(const u8 *data, size_t size)
+{
+	/* The measured length counts bytes after the first eight header bytes. */
+	return size >= sizeof(struct epic_hdr) +
+		       sizeof(struct epic_sub_hdr_h17p) &&
+	       get_unaligned_le32(data + 4) == size - 8;
+}
+
 static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 			    u8 *data, size_t data_size)
 {
@@ -574,6 +583,13 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 		hdr_len = sizeof(*ehdr) + sizeof(*c);
 		if (data_size < hdr_len)
 			goto too_small;
+		if (ep->dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+		    !afk_validate_h17p_header(data, data_size)) {
+			dev_err(ep->dcp->dev,
+				"AFK[ep:%02x]: invalid compact message length\n",
+				ep->endpoint);
+			return;
+		}
 
 		/*
 		 * H17P multiplexes every service of an endpoint onto queue
