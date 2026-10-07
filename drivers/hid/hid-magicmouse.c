@@ -268,6 +268,13 @@ struct effect_job {
  * @haptics: Haptic device state of an MTP trackpad, NULL otherwise.
  * @taptic_hdev: Actuator HID device of an MTP trackpad, if resolved.
  * @haptic_effects: Uploaded haptic effects of an MTP trackpad.
+ * @haptic_press_work: Plays the press waveform of a host-driven click.
+ * @haptic_release_work: Plays the release waveform, or hands the actuator back.
+ * @haptic_deep_work: Plays the waveform of a deep click.
+ * @haptic_deep_release_work: Plays the release waveform on leaving a deep click.
+ * @force_input: Input device for the deep-click key, NULL if none.
+ * @haptic_button_down: The host-derived button is pressed.
+ * @haptic_deep_down: The host-derived click is in its deep stage.
  * @hdev: Pointer to the underlying HID device.
  * @work: Workqueue to handle initialization retry for quirky devices.
  * @battery_timer: Timer for obtaining battery level information.
