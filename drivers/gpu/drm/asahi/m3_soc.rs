@@ -253,7 +253,8 @@ pub(crate) static T6030: Soc = Soc {
 /// core slots in the first core-mask word only), with the die count of the AGX3 identification
 /// table (`hw::agx3::T8122`). The hardware configuration is `hw::t8122`; power configuration
 /// comes from the boot loader. The runtime rejects the SoC while the rest of its configuration is
-/// missing, before accessing the GPU.
+/// missing, before accessing the GPU, unless `asahi.t8122_start=1` arms the start experiment
+/// (`t8122_start`), whose values then stand in for the missing ones.
 pub(crate) static T8122: Soc = Soc {
     name: "T8122",
     gpu_name: "G15G",

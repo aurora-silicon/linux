@@ -87,14 +87,21 @@ pub(crate) struct Registered {
 }
 impl Registered {
     pub(crate) fn start(pdev: &platform::Device<Core>, soc: &'static crate::m3_soc::Soc) -> Result<Self> {
-        let resources = crate::m3_resources::from_device(pdev, soc)?;
+        let resources = crate::m3_resources::from_device(pdev, soc)
+            .inspect_err(|_| crate::t8122_start::not_admitted(pdev.as_ref(), soc))?;
         dev_info!(pdev.as_ref(), "M3: resource admission complete\n");
-        soc.require_complete(pdev.as_ref())?;
-        let firmware = crate::m3_firmware::identify_loaded(pdev, soc, resources)?;
+        // On a T8122 armed with asahi.t8122_start=1, the start experiment's values stand in for
+        // the table's missing ones; any other SoC, or an unarmed T8122, needs a complete table.
+        let experiment = crate::t8122_start::arm(pdev.as_ref(), soc)?;
+        if experiment.is_none() {
+            soc.require_complete(pdev.as_ref())?;
+        }
+        let experiment = experiment.as_ref();
+        let firmware = crate::m3_firmware::identify_loaded(pdev, soc, resources, experiment)?;
         dev_info!(pdev.as_ref(), "M3: firmware identity accepted\n");
         // InitData source and contents, before any GPU register access.
-        let contents = crate::m3_adt_config::Contents::select(pdev, &firmware, soc)?;
-        let device = crate::m3_device::Device::new(pdev, firmware, soc)?;
+        let contents = crate::m3_adt_config::Contents::select(pdev, &firmware, soc, experiment)?;
+        let device = crate::m3_device::Device::new(pdev, firmware, soc, experiment)?;
         device.check_drm(pdev)?;
         let core_mask = device.core_mask();
         let max_frequency_khz = 1000 * contents.pstates.reported_max_mhz();

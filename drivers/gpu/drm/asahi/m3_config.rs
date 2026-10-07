@@ -97,7 +97,10 @@ impl Config {
             b.write(0,image)?;objects.push(b,GFP_KERNEL)?;
         }
         for io in contents.iomaps {
-            let map=uat.kernel_vm().map_io(io.address,io.physical.try_into()?,io.size,prot::PROT_FW_MMIO_RW)?;
+            // Read-write unless the contents say otherwise (only the T8122 start experiment).
+            let protection=if contents.read_only_slots==0 {prot::PROT_FW_MMIO_RW}
+                else {crate::t8122_start::mmio_prot(contents.read_only_slots,io.slot)};
+            let map=uat.kernel_vm().map_io(io.address,io.physical.try_into()?,io.size,protection)?;
             let owned=init::Region::new(map.iova(),io.size).map_err(|_|EINVAL)?;
             let field=io.pointer_field().map_err(|_|EINVAL)?;
             objects[HARDWARE_DATA].u64(field,io.pointer(owned).map_err(|_|EINVAL)?)?;
@@ -107,6 +110,12 @@ impl Config {
         // unlike the firmware virtual references in the IOMapping records.
         objects[HARDWARE_DATA].u64(storage::GPU_REGION_PHYSICAL,firmware.resources.regions[0].base)?;
         Self::initialize_records(&mut objects)?;
+        // The root record carries the G15 14.8.3 InitData version, which is every T6030
+        // image's. Only the T8122 start experiment gives the firmware another one
+        // (`asahi.t8122_initdata_version`).
+        if firmware.initdata_magic!=crate::m3_firmware::G15_V14_8_3_INITDATA {
+            objects[storage::ROOT].u64(0,firmware.initdata_magic)?;
+        }
         // Vertex/tessellation loops need not retire a primitive at every
         // firmware progress poll. The inherited interval of 10 falsely
         // declares a valid 35.7 ms TA job stuck on J514S. Keep progress

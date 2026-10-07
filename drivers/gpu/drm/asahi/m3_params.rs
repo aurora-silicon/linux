@@ -484,3 +484,65 @@ pub(crate) fn t6030_backend(pdev: &platform::Device<Core>) -> T6030Backend {
         }
     }
 }
+
+fn parse_t8122_number(text: &str) -> Option<u64> {
+    Some(crate::t8122_knobs::parse_number(text))
+}
+
+fn parse_t8122_fender(text: &str) -> Option<u64> {
+    Some(crate::t8122_knobs::parse_fender(text))
+}
+
+fn parse_t8122_clkgen(text: &str) -> Option<u64> {
+    Some(crate::t8122_knobs::parse_clkgen(text))
+}
+
+fn parse_t8122_sgx_setup(text: &str) -> Option<u64> {
+    Some(crate::t8122_knobs::parse_sgx_setup(text))
+}
+
+// The T8122 start experiment (`t8122_start`). Each parameter is stored as given, unset or with a
+// value its parser does not accept (`t8122_knobs`), so that the experiment can refuse rather
+// than fall back to a default.
+use crate::t8122_knobs::UNSET as T8122_UNSET;
+
+/// `asahi.t8122_start=1`: start the M3 runtime on a T8122 with the start experiment's values.
+/// Only with a boot loader that handed the GPU over.
+static T8122_START: AtomicU64 = AtomicU64::new(T8122_UNSET);
+m3_param!("t8122_start", T8122_START, parse_t8122_number);
+/// `asahi.t8122_initdata_version=<u64>`: the InitData version given to the T8122 firmware.
+static T8122_INITDATA_VERSION: AtomicU64 = AtomicU64::new(T8122_UNSET);
+m3_param!("t8122_initdata_version", T8122_INITDATA_VERSION, parse_t8122_number);
+/// `asahi.t8122_fender=0x104000|0x12c000` (`rule`, `adt`): the Fender window size.
+static T8122_FENDER: AtomicU64 = AtomicU64::new(T8122_UNSET);
+m3_param!("t8122_fender", T8122_FENDER, parse_t8122_fender);
+/// `asahi.t8122_clkgen=e5c|e1c|none`: the GPU clock-generator IO mapping.
+static T8122_CLKGEN: AtomicU64 = AtomicU64::new(T8122_UNSET);
+m3_param!("t8122_clkgen", T8122_CLKGEN, parse_t8122_clkgen);
+/// `asahi.t8122_sgx_setup=none|t6030`: the SGX write made before the firmware starts.
+static T8122_SGX_SETUP: AtomicU64 = AtomicU64::new(T8122_UNSET);
+m3_param!("t8122_sgx_setup", T8122_SGX_SETUP, parse_t8122_sgx_setup);
+/// `asahi.t8122_unit_mask_a=<u64>`: HwDataB unit mask A (+0x17c0).
+static T8122_UNIT_MASK_A: AtomicU64 = AtomicU64::new(T8122_UNSET);
+m3_param!("t8122_unit_mask_a", T8122_UNIT_MASK_A, parse_t8122_number);
+/// `asahi.t8122_unit_mask_b=<u32>`: HwDataB unit mask B (+0x17c8).
+static T8122_UNIT_MASK_B: AtomicU64 = AtomicU64::new(T8122_UNSET);
+m3_param!("t8122_unit_mask_b", T8122_UNIT_MASK_B, parse_t8122_number);
+/// `asahi.t8122_pstate_cap=N`: the highest performance state the T8122 firmware may use.
+static T8122_PSTATE_CAP: AtomicU64 = AtomicU64::new(T8122_UNSET);
+m3_param!("t8122_pstate_cap", T8122_PSTATE_CAP, parse_t8122_number);
+
+/// The T8122 start-experiment parameters of this boot, as given.
+pub(crate) fn t8122_params() -> crate::t8122_knobs::Raw {
+    let get = |p: &AtomicU64| p.load(Ordering::Relaxed);
+    crate::t8122_knobs::Raw {
+        start: get(&T8122_START),
+        initdata_version: get(&T8122_INITDATA_VERSION),
+        fender: get(&T8122_FENDER),
+        clkgen: get(&T8122_CLKGEN),
+        sgx_setup: get(&T8122_SGX_SETUP),
+        unit_mask_a: get(&T8122_UNIT_MASK_A),
+        unit_mask_b: get(&T8122_UNIT_MASK_B),
+        pstate_cap: get(&T8122_PSTATE_CAP),
+    }
+}

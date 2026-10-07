@@ -22,6 +22,7 @@ use crate::{
     m3_memory::Buffer,
     m3_params::{self, G15Debug, InitDataParam, ThermalMode},
     m3_soc::{IoMapping, PstateTable, Soc},
+    t8122_start::Experiment,
 };
 
 /// Owner indices (`m3_init_storage`) of the objects the typed builders generate.
@@ -106,7 +107,8 @@ const fn same_blocks(mappings: &[IoMapping], cfg: &hw::HwConfig) -> bool {
 
 const _: () = assert!(same_blocks(&T8122_IO_MAPPINGS, &hw::t8122::HWCONFIG_T8122));
 
-// The T6030 IO maps are the packed IO maps of its IO mappings (`storage::pack_iomaps`).
+// The T6030 IO maps are the packed IO maps of its IO mappings, the layout the T8122 start
+// experiment derives its own from (`storage::pack_iomaps`).
 const _: () = assert!(storage::same_iomaps(
     &storage::pack_iomaps(&T6030_IO_MAPPINGS, storage::IOMAP_BASE),
     &storage::T6030_IOMAPS
@@ -157,8 +159,9 @@ impl PstatePolicy {
     }
 
     /// Clamp the `asahi.m3_max_pstate` and `asahi.m3_boot_pstate` settings to the published table
-    /// of `hwdata` (the generated HwData object image).
-    fn new(dev: &device::Device, hwdata: &[u8]) -> Result<Self> {
+    /// of `hwdata` (the generated HwData object image), and to `ceiling` when given (the T8122
+    /// start experiment's `asahi.t8122_pstate_cap`).
+    fn new(dev: &device::Device, hwdata: &[u8], ceiling: Option<u32>) -> Result<Self> {
         let hwb_max = offset_of!(raw::HwDataBG15V14_8_3, max_pstate);
         let hwb_freq = offset_of!(raw::HwDataBG15V14_8_3, frequencies);
         let table_max = read_u32(hwdata, hwb_max)?;
@@ -192,6 +195,17 @@ impl PstatePolicy {
                 ADT_MAX_PSTATE_LIMIT
             );
             max = ADT_MAX_PSTATE_LIMIT;
+        }
+        if let Some(ceiling) = ceiling {
+            if max > ceiling {
+                dev_info!(
+                    dev,
+                    "M3 G15G start: performance cap {} lowered to {} (asahi.t8122_pstate_cap)\n",
+                    max,
+                    ceiling
+                );
+                max = ceiling;
+            }
         }
         // Without the thermal limit the runtime cap is the ceiling; with it, the runtime cap
         // starts at (and never goes below) the cap used without it.
@@ -234,6 +248,9 @@ pub(crate) struct Contents {
     /// The accepted performance-state table (`Soc::pstates`): states above the off state, and
     /// the frequency of the highest one in MHz.
     pub(crate) table: (u32, u32),
+    /// The HwDataB slots whose IO maps the firmware gets read-only, as a bit mask. 0 (every IO
+    /// map read-write) except in the T8122 start experiment.
+    pub(crate) read_only_slots: u32,
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
@@ -252,15 +269,26 @@ fn write(bytes: &mut [u8], offset: usize, data: &[u8]) -> Result {
 impl Contents {
     /// Build the InitData contents from this board's device tree (`asahi.m3_initdata`), before
     /// any GPU register is touched.
-    pub(crate) fn select(pdev: &platform::Device<Core>, firmware: &Firmware, soc: &Soc) -> Result<Self> {
+    ///
+    /// `experiment` is the T8122 start experiment's values (`t8122_start`), on an armed T8122
+    /// only; it then stands in for the SoC table's missing ones.
+    pub(crate) fn select(
+        pdev: &platform::Device<Core>,
+        firmware: &Firmware,
+        soc: &Soc,
+        experiment: Option<&Experiment>,
+    ) -> Result<Self> {
         let dev = pdev.as_ref();
         let param = m3_params::initdata_param();
-        check_version(dev, firmware)?;
-        let iomaps = soc.iomaps.ok_or(ENODEV)?;
+        check_version(dev, firmware, experiment)?;
+        let iomaps = match experiment {
+            Some(e) => e.iomaps(),
+            None => soc.iomaps.ok_or(ENODEV)?,
+        };
         storage::validate_iomaps(iomaps).map_err(|_| EINVAL)?;
-        let images = build_images(dev, firmware, soc, iomaps)?;
+        let images = build_images(dev, firmware, soc, experiment, iomaps)?;
         let hwdata = images.get(HWDATA).and_then(|i| i.as_deref()).ok_or(EINVAL)?;
-        let pstates = PstatePolicy::new(dev, hwdata)?;
+        let pstates = PstatePolicy::new(dev, hwdata, experiment.map(|e| e.pstate_cap()))?;
         let table = match soc.pstates {
             PstateTable::Fixed { states, top_mhz } => (states, top_mhz),
             PstateTable::DeviceTree => crate::m3_board::opp_table_shape(pdev, soc).ok_or_else(|| {
@@ -315,7 +343,8 @@ impl Contents {
             pstates.max,
             pstates.max_mhz
         );
-        Ok(Contents { images, pstates, iomaps, table })
+        let read_only_slots = experiment.map_or(0, |e| e.read_only_slots());
+        Ok(Contents { images, pstates, iomaps, table, read_only_slots })
     }
 
     /// Check the contents before they are uploaded.
@@ -359,9 +388,19 @@ pub(crate) fn constructed_version() -> Result<u64> {
 }
 
 /// Refuse to go on when the InitData root the runtime constructs carries another version than
-/// the loaded firmware expects.
-fn check_version(dev: &device::Device, firmware: &Firmware) -> Result {
+/// the loaded firmware expects. The T8122 start experiment gives the firmware the version of
+/// `asahi.t8122_initdata_version` instead (`m3_config::Config::new` writes it into the root).
+fn check_version(dev: &device::Device, firmware: &Firmware, experiment: Option<&Experiment>) -> Result {
     let version = constructed_version()?;
+    if version != firmware.initdata_magic && experiment.is_some() {
+        dev_warn!(
+            dev,
+            "M3 G15G start: InitData version {:#x} (asahi.t8122_initdata_version) replaces the constructed {:#x}\n",
+            firmware.initdata_magic,
+            version
+        );
+        return Ok(());
+    }
     if version != firmware.initdata_magic {
         dev_err!(
             dev,
@@ -473,6 +512,7 @@ fn check_layout() -> Result {
 fn fill_io_mappings(
     dev: &device::Device,
     cfg: &'static hw::HwConfig,
+    experiment: Option<&Experiment>,
     mappings: &[IoMapping],
     iomaps: &[storage::IoMap],
     hwdata: &mut [u8],
@@ -485,7 +525,8 @@ fn fill_io_mappings(
         let virt = entry + offset_of!(raw::IOMapping, virt_addr);
         // The same register block as the manager's table.
         let same_block = cfg.io_mappings.get(slot).and_then(|m| m.as_ref()).is_some_and(|m| {
-            m.base as u64 & !0x3fff == phys & !0x3fff && m.writable == writable
+            let base = experiment.map_or(m.base as u64, |e| e.io_block(slot, m.base as u64));
+            base & !0x3fff == phys & !0x3fff && m.writable == writable
         });
         let covered = iomaps.iter().any(|io| {
             io.slot == slot
@@ -612,13 +653,21 @@ fn build_images(
     dev: &device::Device,
     firmware: &Firmware,
     soc: &Soc,
+    experiment: Option<&Experiment>,
     iomaps: &[storage::IoMap],
 ) -> Result<KVec<Option<KVVec<u8>>>> {
     check_layout().inspect_err(|_| {
         dev_err!(dev, "M3: the constructed InitData records do not match the G15 InitData structures\n")
     })?;
     let cfg: &'static hw::HwConfig = soc.hwcfg.ok_or(ENODEV)?;
-    let io_mappings = soc.io_mappings.ok_or(ENODEV)?;
+    let io_mappings = match experiment {
+        Some(e) => e.io_mappings(),
+        None => soc.io_mappings.ok_or(ENODEV)?,
+    };
+    let runtime_hwdata_b = match experiment {
+        Some(e) => e.hwdata_b(),
+        None => soc.hwdata_b.ok_or(ENODEV)?,
+    };
     let pwr = hw::PwrConfig::load(dev, cfg).inspect_err(|e| {
         dev_err!(dev, "M3: cannot read the GPU power configuration from the device tree ({:?})\n", e)
     })?;
@@ -641,7 +690,7 @@ fn build_images(
         cap: None,
         timestamp_base: Some(crate::agx_memory::TIMESTAMP_RANGE.start),
         reference_ppm: true,
-        runtime_hwdata_b: Some(soc.hwdata_b.ok_or(ENODEV)?),
+        runtime_hwdata_b: Some(runtime_hwdata_b),
     };
     let c = initdata::InitDataBuilderG15V14_8_3::g15_contents(cfg, &dyncfg, &g15).inspect_err(|e| {
         dev_err!(dev, "M3: cannot build InitData from the device tree ({:?})\n", e)
@@ -676,6 +725,14 @@ fn build_images(
     // HwData: HwDataB, then HwDataA.
     let mut hwdata = zeroed(HWDATA)?;
     write(&mut hwdata, 0, initdata::raw_bytes(&*c.hwdata_b))?;
+    // The T8122 start experiment's unit masks (`asahi.t8122_unit_mask_a`/`_b`).
+    if let Some(e) = experiment {
+        type B = raw::HwDataBG15V14_8_3;
+        let (a, b) = e.unit_masks();
+        write(&mut hwdata, offset_of!(B, unit_mask_a), &a.to_le_bytes())?;
+        write(&mut hwdata, offset_of!(B, unit_mask_b), &b.to_le_bytes())?;
+        dev_info!(dev, "M3 G15G start: HwDataB unit masks +0x17c0 {:#x}, +0x17c8 {:#x}\n", a, b);
+    }
     write(&mut hwdata, HWDATA_A, initdata::raw_bytes(&*c.hwdata_a))?;
     // The system counter value at InitData creation, the base of the firmware's first power and
     // energy interval.
@@ -717,7 +774,7 @@ fn build_images(
             return Err(EINVAL);
         }
     }
-    fill_io_mappings(dev, cfg, io_mappings, iomaps, &mut hwdata)?;
+    fill_io_mappings(dev, cfg, experiment, io_mappings, iomaps, &mut hwdata)?;
     images[HWDATA] = Some(hwdata);
 
     let mut globals = zeroed(GLOBALS)?;

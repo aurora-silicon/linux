@@ -34,7 +34,10 @@ pub(crate) struct Device {
 }
 
 impl Device {
-    pub(crate) fn new(pdev: &platform::Device<Core>, firmware: Firmware, soc: &'static Soc) -> Result<Self> {
+    /// `experiment` is the T8122 start experiment's values, on an armed T8122 only: it decides
+    /// the SGX setup write, which the T8122 table lacks.
+    pub(crate) fn new(pdev: &platform::Device<Core>, firmware: Firmware, soc: &'static Soc,
+        experiment: Option<&crate::t8122_start::Experiment>) -> Result<Self> {
         // Map ASC before taking a vote. The larger SGX aperture contains
         // this control window and the separate mailbox provider, so it is
         // mapped without a conflicting claim over those child resources.
@@ -92,8 +95,21 @@ impl Device {
         {
             return Err(ENODEV);
         }
-        let (setup_offset, setup_value) = soc.sgx_setup.ok_or(ENODEV)?;
-        registers.try_write32(setup_value, setup_offset)?;
+        let setup = match experiment {
+            Some(e) => {
+                match e.sgx_setup() {
+                    Some((offset, value)) => dev_warn!(pdev.as_ref(),
+                        "M3 G15G start: SGX setup write: SGX+{:#x} = {:#x} (asahi.t8122_sgx_setup=t6030)\n", offset, value),
+                    None => dev_info!(pdev.as_ref(),
+                        "M3 G15G start: no SGX setup write (asahi.t8122_sgx_setup=none)\n"),
+                }
+                e.sgx_setup()
+            }
+            None => Some(soc.sgx_setup.ok_or(ENODEV)?),
+        };
+        if let Some((setup_offset, setup_value)) = setup {
+            registers.try_write32(setup_value, setup_offset)?;
+        }
         device.core_mask = core_mask;
         Ok(device)
     }

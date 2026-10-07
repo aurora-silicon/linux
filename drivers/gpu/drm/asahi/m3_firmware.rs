@@ -31,7 +31,7 @@ pub(crate) static KNOWN_IMAGES: [KnownImage; 2] = [
         name: "J514S RTKit-2419.140.12",
         uuid: None,
         stkg_sha256: Some(crate::m3_firmware::TEXT_SHA256),
-        initdata_magic: Some(0x0c08_e21e_8380_0490),
+        initdata_magic: Some(G15_V14_8_3_INITDATA),
     },
     KnownImage {
         name: "g15s build b0 (firmware 14.8.3) RTKit-2419.140.12",
@@ -40,20 +40,35 @@ pub(crate) static KNOWN_IMAGES: [KnownImage; 2] = [
             0x18, 0x78, 0x29, 0x55,
         ]),
         stkg_sha256: None,
-        initdata_magic: Some(0x0c08_e21e_8380_0490),
+        initdata_magic: Some(G15_V14_8_3_INITDATA),
     },
+];
+
+/// The G15 InitData version of firmware-compat 14.8.3: the version of both T6030 images.
+pub(crate) const G15_V14_8_3_INITDATA: u64 = 0x0c08_e21e_8380_0490;
+
+/// The image-info UUID of the T8122 C0 firmware-compat 14.8.3 image.
+const T8122_C0_UUID: [u8; 16] = [
+    0xdf, 0x69, 0x7f, 0x05, 0xf6, 0xb5, 0x33, 0xef, 0xa1, 0x37, 0x61, 0xc4, 0xa7, 0x3d, 0x66, 0x6a,
 ];
 
 /// T8122 C0, firmware-compat 14.8.3. Identity and segment layout are recorded, but the
 /// InitData version is not validated, so this record cannot admit runtime startup.
 pub(crate) static KNOWN_IMAGES_T8122: [KnownImage; 1] = [KnownImage {
     name: "T8122 C0 firmware-compat 14.8.3",
-    uuid: Some([
-        0xdf, 0x69, 0x7f, 0x05, 0xf6, 0xb5, 0x33, 0xef, 0xa1, 0x37, 0x61, 0xc4, 0xa7, 0x3d, 0x66,
-        0x6a,
-    ]),
+    uuid: Some(T8122_C0_UUID),
     stkg_sha256: None,
     initdata_magic: None,
+}];
+
+/// The same T8122 image for the start experiment (`t8122_start`, only with
+/// `asahi.t8122_start=1`). Its InitData version is the G15 14.8.3 one, not validated on G15G:
+/// the firmware accepting the InitData is the check. `asahi.t8122_initdata_version` replaces it.
+pub(crate) static KNOWN_IMAGES_T8122_EXPERIMENT: [KnownImage; 1] = [KnownImage {
+    name: "T8122 C0 firmware-compat 14.8.3 (start experiment)",
+    uuid: Some(T8122_C0_UUID),
+    stkg_sha256: None,
+    initdata_magic: Some(G15_V14_8_3_INITDATA),
 }];
 
 const IMAGE_INFO_OFFSET: usize = 0x4200;
@@ -168,6 +183,7 @@ pub(crate) fn identify_loaded(
     pdev: &kernel::platform::Device<kernel::device::Core>,
     soc: &'static crate::m3_soc::Soc,
     resources: agx_resources::Resources,
+    experiment: Option<&crate::t8122_start::Experiment>,
 ) -> kernel::error::Result<Firmware> {
     use kernel::{
         bindings, c_str,
@@ -196,8 +212,16 @@ pub(crate) fn identify_loaded(
     // SAFETY: the initialized private copy and distinct digest live for the
     // synchronous SHA-256 call. Normalization never writes loaded firmware.
     unsafe { bindings::sha256(canonical.as_ptr(), canonical.len(), digest.as_mut_ptr()) };
-    let image = crate::m3_board::identify(pdev.as_ref(), bytes, &digest, soc.images).ok_or(ENODEV)?;
-    let initdata_magic = image.initdata_magic.ok_or(ENODEV)?;
+    // The T8122 start experiment identifies the same image, with its own InitData version.
+    let images = match experiment {
+        Some(_) => &KNOWN_IMAGES_T8122_EXPERIMENT[..],
+        None => soc.images,
+    };
+    let image = crate::m3_board::identify(pdev.as_ref(), bytes, &digest, images).ok_or(ENODEV)?;
+    let initdata_magic = match experiment {
+        Some(experiment) => experiment.initdata_version(),
+        None => image.initdata_magic.ok_or(ENODEV)?,
+    };
     Ok(Firmware { resources, initdata_magic, layout })
 }
 
@@ -293,6 +317,19 @@ mod tests {
         assert_eq!(image_info(&text).unwrap().uuid, image.uuid.unwrap());
         assert!(image.initdata_magic.is_none());
         assert!(!admits_text(image, &text, &[0; 32]));
+    }
+
+    #[test]
+    fn t8122_experiment_record_identifies_the_same_image_with_the_g15_version() {
+        let image = &KNOWN_IMAGES_T8122_EXPERIMENT[0];
+        assert_eq!(image.uuid, KNOWN_IMAGES_T8122[0].uuid);
+        assert_eq!(image.stkg_sha256, None);
+        assert_eq!(image.initdata_magic, Some(G15_V14_8_3_INITDATA));
+        assert!(KNOWN_IMAGES.iter().all(|i| i.initdata_magic == Some(G15_V14_8_3_INITDATA)));
+        let text = image_header(image.uuid.unwrap());
+        assert!(admits_text(image, &text, &[0; 32]));
+        assert!(!admits_text(image, &image_header(KNOWN_IMAGES[1].uuid.unwrap()), &[0; 32]));
+        assert!(!admits_text(&KNOWN_IMAGES[1], &text, &[0; 32]));
     }
 
     #[test]
