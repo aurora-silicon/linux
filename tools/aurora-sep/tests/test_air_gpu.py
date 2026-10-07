@@ -127,20 +127,25 @@ class FakeMac:
         return p.read_bytes() if p.exists() else None
 
     def store(self):
-        """U-Boot's store as VarToFile gives it: a header, then every variable (name and data)."""
+        """U-Boot's store as VarToFile gives it: a header, then each variable's UTF-16 name, its
+        terminator and its data (U-Boot's entry header is left out)."""
         out = b"\0" * 8 + b"UbEfiVa\0"
         for f in sorted(self.efivars.iterdir()):
             if f.name.startswith("VarToFile-"):
                 continue
-            out += f.name.encode() + b"\0" + f.read_bytes()[4:]
+            out += b"HDR" + utf16z(f.name.rsplit("-", 5)[0]) + f.read_bytes()[4:]
         return out
 
     def limine_boots(self):
-        """What Limine and U-Boot do at the next boot: read and delete the one-shot, save the store."""
+        """What Limine and U-Boot do at the next boot: read and delete the one-shot, record the
+        entry booted as LimineLastBootedEntry, save the store."""
         armed = self.oneshot_var()
         p = self.efivars / f"LoaderEntryOneShot-{BLI}"
         if p.exists():
             p.unlink()
+        booted = armed[4:].decode("utf-16-le").rstrip("\0") if armed else "Omarchy/linux-aurora"
+        # Limine stores this one as ASCII (seen in the m3pro's ubootefi.var).
+        self.setvar("LimineLastBootedEntry", "513ee0d0-6e43-cb05-b272-f146a2fcb88a", var(7, booted.encode() + b"\0"))
         self.varfile.write_bytes(self.store())
         return armed
 
@@ -161,13 +166,15 @@ LOCKS='{self.tmp}/run/boot-partition.lock {self.tmp}/run/limine-global.lock'
 LIMINE_DEFAULTS='{self.tmp}/etc/limine'
 KREL='{KREL}'
 is_root() {{ {'true' if root else 'false'}; }}
-# U-Boot regenerates VarToFile from its store; here it is built from the variable files.
+# U-Boot regenerates VarToFile from its store; here it is built from the variable files, as
+# FakeMac.store lays them out.
 uboot_store() {{
   printf '\\0\\0\\0\\0\\0\\0\\0\\0UbEfiVa\\0'
-  local f
+  local f n
   for f in "$EFIVARS"/*; do
     [[ ${{f##*/}} == VarToFile-* ]] && continue
-    printf '%s\\0' "${{f##*/}}"; tail -c +5 "$f"
+    n=${{f##*/}}; n=${{n%-*-*-*-*-*}}
+    printf 'HDR'; printf '%s' "$n" | iconv -f UTF-8 -t UTF-16LE; printf '\\0\\0'; tail -c +5 "$f"
   done
 }}
 """
@@ -218,7 +225,7 @@ class OneShotTest(unittest.TestCase):
         self.assertIn(MACLAB, text)
         # The one-shot: non-volatile, boot and runtime access, the entry's name; and on the ESP.
         self.assertEqual(self.mac.oneshot_var(), var(7, utf16z("air-gpu-oneshot")))
-        self.assertIn(b"air-gpu-oneshot", self.mac.varfile.read_bytes().replace(b"\0", b""))
+        self.assertIn(utf16z("LoaderEntryOneShot") + utf16z("air-gpu-oneshot"), self.mac.varfile.read_bytes())
         self.assertTrue((self.mac.state / "armed").exists())
         self.assertIn("armed one boot", (self.mac.tmp / "logger.log").read_text())
 
@@ -227,6 +234,8 @@ class OneShotTest(unittest.TestCase):
         status = self.oneshot("--status", check=True).stdout
         self.assertIn("one-shot variable: not set", status)
         self.assertIn("does not name air-gpu-oneshot", status)
+        # Limine recorded the armed entry as the last booted one; that is not an armed one-shot.
+        self.assertIn(b"air-gpu-oneshot\0", self.mac.varfile.read_bytes())
 
         proc = self.oneshot("--disarm", check=True)
         self.assertIn("removed the air-gpu-oneshot entry", proc.stdout)

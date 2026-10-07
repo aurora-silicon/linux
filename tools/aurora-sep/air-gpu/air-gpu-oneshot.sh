@@ -241,8 +241,16 @@ persist() {
   if [[ $(head -c 15 "$tmp" | tail -c 7) != UbEfiVa ]]; then rm -f "$tmp"; return 1; fi
   sync "$tmp" && mv -f "$tmp" "$VAR_FILE" && sync "$(dirname "$VAR_FILE")"
 }
-# Whether a variable file names the entry (UTF-16LE: compared with its zero bytes removed).
-file_has_name() { LC_ALL=C tr -d '\0' <"$1" 2>/dev/null | grep -qaF "$ENTRY"; }
+# Whether U-Boot's variable file holds LoaderEntryOneShot naming the entry. U-Boot stores each
+# variable's UTF-16LE name, its terminator, then its data; the bytes are compared as hex words so
+# that LimineLastBootedEntry, which Limine sets to the armed entry during that boot, never counts.
+hex_bytes() { od -An -v -tx1 | tr -s ' \n' ' '; }
+file_has_name() {
+  local want
+  want=$({ printf 'LoaderEntryOneShot' | iconv -f UTF-8 -t UTF-16LE; printf '\0\0'; utf16z "$ENTRY"; } | hex_bytes)
+  want=${want# } want=${want% }
+  [[ " $(hex_bytes <"$1" 2>/dev/null) " == *" $want "* ]]
+}
 
 set_oneshot() {
   local f tmp
