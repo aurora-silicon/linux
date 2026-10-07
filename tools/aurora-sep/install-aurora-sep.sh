@@ -147,6 +147,14 @@
 # fails), the kernel install still completes, the summary says so and the
 # exit status is 3. --no-m3-mesa leaves it out; --uninstall removes it. M1,
 # M2, the M3 Max and the M3 MacBook Air download and install nothing of it.
+# Also in 12.3, for every M3: --m3-report writes one bring-up report with the
+# host name, user names, serial numbers and MAC addresses masked, including an
+# allowlist of the boot loader's device tree (read once through the phram
+# driver, which the kernel now builds but never loads at boot);
+# --m3-power-survey samples the SMC's temperature and power keys through short
+# CPU and backlight loads (opt-in). An M3 that stays kernel-only (the M3 Max,
+# and an M3 that is not an Air) ends its install with a NEXT STEPS box. The
+# kernel reads the 14-core M3 Max's (t6034) SMC sensors as an M3's.
 # It replaces linux-asahi (or linux-aurora) as a pacman package,
 # so mkinitcpio and update-m1n1 run from their own hooks; on a GRUB Mac this
 # script regenerates grub.cfg and keeps the previous kernel as a fallback entry.
@@ -208,8 +216,8 @@ RUN_ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null) || RUN_ID=""
 
 # The kernel package version and the release tag move independently: a release
 # that only changes m1n1 reuses the previous kernel packages unchanged.
-VERSION=7.1.12.aurora2-12.2
-TAG=sep-7.1.12.aurora2-12.2
+VERSION=7.1.12.aurora2-12.3
+TAG=sep-7.1.12.aurora2-12.3
 # Packages are fetched from this script's own tag, never from "latest": the
 # checksums below belong to this release and nothing else.
 PUBLIC_RELEASE_URL=https://github.com/iconidentify/aurora-linux/releases/download/$TAG
@@ -225,8 +233,8 @@ RELEASES_API=${AURORA_RELEASES_API:-$PUBLIC_RELEASES_API}
 # Where to always get the current script, whatever this copy turns out to be.
 LATEST_URL=https://github.com/iconidentify/aurora-linux/releases/latest/download/install-aurora-sep.sh
 PACKAGES=(
-  "linux-aurora-$VERSION-aarch64.pkg.tar.zst c1139905a60237066d7c322e1cc9f95884b1b0c727e9ec7288d90b416922086d"
-  "linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst 3f1c3f0c32b65cf1520dd4ece9146e34d9535c57ecb14247f78d5fba31be8a34"
+  "linux-aurora-$VERSION-aarch64.pkg.tar.zst PENDING-12.3-LAB-BUILD"
+  "linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst PENDING-12.3-LAB-BUILD"
   "libfprint-1.94.100-1.1-aarch64.pkg.tar.zst bc7d9762db6644f2cfb58ddb209602c1d513845eb1498c098e01f12600fcbdf9"
   "aurora-touchid-20261003-1-any.pkg.tar.zst 29b0360fac8c257d754e64bd1b9c33c487eb2595dd3c31e9138d7a476afa3d64"
 )
@@ -3023,9 +3031,9 @@ M3_WORK=""
 # --m3-report downloads and checks like M3_GPU_SCRIPTS, unless the script runs from a directory
 # that has its own copy (a checkout). It reads the boot loader's copy of the ADT through the
 # read-only node of the phram MTD device named adt and prints an allowlist of it;
-# "--check <node>" checks the node and what it is bound to, and reads nothing. Empty: this
-# release has none, and the report says so.
-M3_ADT_READER=""
+# "--check <node>" checks the node and what it is bound to, and reads nothing. Empty: a
+# release with none, and the report says so.
+M3_ADT_READER="aurora-adt-extract.py 3563a3bb7ff832bf94401a9ec751afa0424156ac8a1b160813cdfa96d592a72b"
 
 # A file's first line, or "-" when it can't be read. No fork: the report reads a few thousand.
 m3_attr() {
