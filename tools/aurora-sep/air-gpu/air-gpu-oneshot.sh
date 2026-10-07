@@ -34,22 +34,34 @@ set -euo pipefail
 # the string "asahi.<name>" in that kernel image (the UKI) and refuses one it does not find.
 KNOBS='
 t8122_start             1                                  the T8122 start experiment (always set by this script)
-t8122_initdata_version  0x[0-9a-fA-F]{1,16}|[0-9]{1,20}    InitData version for the firmware (default 0x0c08e21e83800490)
+t8122_initdata_version  0x[1-9a-fA-F][0-9a-fA-F]{0,15}|[1-9][0-9]{0,19}  InitData version for the firmware (default 0x0c08e21e83800490)
 t8122_fender            rule|adt|0x104000|0x12c000         Fender window: rule 0x104000 (default) or adt 0x12c000
 t8122_clkgen            e1c|e5c|none                       clock-generator slot: SGX+0xe1c000 (default), SGX+0xe5c000, none
 t8122_sgx_setup         none|t6030                         SGX write before the firmware starts: none (default) or T6030 0x70001
-t8122_unit_mask_a       0x[0-9a-fA-F]{1,9}|[0-9]{1,11}     HwDataB unit mask A: nonzero, within 0x700000001 (default)
+t8122_unit_mask_a       0x[1-9a-fA-F][0-9a-fA-F]{0,8}|[1-9][0-9]{0,10}  HwDataB unit mask A: nonzero, within 0x700000001 (default)
 t8122_unit_mask_b       0x[1-7]|[1-7]                      HwDataB unit mask B: nonzero, within 0x7 (default 0x3)
-t8122_pstate_cap        [1-9]|1[0-5]                       highest GPU performance state, 1 to 15 (default 2)
+t8122_pstate_cap        [1-5]                              highest GPU performance state, 1 to 5 (default 2; above 2 has no temperature feedback yet)
 m3_expose               -1|0|1                             render node: -1 auto (on for J613/J615, the default), 0 off, 1 on
 m3_timeout_nohang       0|1                                on a job timeout, fail the job without the hang path
 '
 
+# Whether a decimal or 0x-hex string is a nonzero value that fits in 64 bits. The regexes bound
+# hex to 16 digits (<= 2^64-1) and forbid a leading zero (so no octal and no $(( )) parse error);
+# this bounds a decimal to 2^64-1 before any arithmetic, which would otherwise wrap silently.
+u64_ok() {
+  local t=$1
+  [[ $t == 0x* || $t == 0X* ]] && return 0
+  (( ${#t} < 20 )) && return 0
+  # A 20-digit decimal (both strings 20 chars, so a lexical compare is the numeric one): <= 2^64-1.
+  # shellcheck disable=SC2071  # a string compare is wanted: equal-length digit strings
+  (( ${#t} == 20 )) && [[ ! $t > 18446744073709551615 ]]
+}
+
 # The checks on a knob value that the regex can't make, as the kernel makes them.
 knob_ok() { # name value
-  local v
+  local v=$2
   case $1 in
-    t8122_initdata_version | t8122_unit_mask_a | t8122_unit_mask_b) v=$(($2)) ;;
+    t8122_initdata_version | t8122_unit_mask_a | t8122_unit_mask_b) u64_ok "$v" || return 1; v=$((v)) ;;
     *) return 0 ;;
   esac
   case $1 in
@@ -274,12 +286,30 @@ clear_oneshot() {
 
 take_locks() {
   local l fd
+  # Short waits, and never hold one lock while blocking on the next: the Limine tools wait only
+  # ~10 s and then carry on without the lock, so holding one for a minute makes a race more
+  # likely, not less (A8). If a lock can't be taken quickly, back off and refuse; the operator
+  # retries. The write itself is still guarded by a compare-before-rename.
+  LOCK_FDS=()
   for l in $LOCKS; do
     mkdir -p "$(dirname "$l")"
-    [[ ! -L $l ]] || refuse "$l is a symbolic link; not taking the Limine lock through it."
-    exec {fd}<>"$l" || refuse "could not open the Limine lock $l."
-    flock -w 60 "$fd" || refuse "$l has been held by another tool for over 60 s (limine-snapper-sync?)."
+    if [[ -L $l ]]; then release_locks; refuse "$l is a symbolic link; not taking the Limine lock through it."; fi
+    exec {fd}<>"$l" || { release_locks; refuse "could not open the Limine lock $l."; }
+    if ! flock -w 5 "$fd"; then
+      release_locks
+      refuse "$l is held by another tool (limine-snapper-sync?); try again in a moment."
+    fi
+    LOCK_FDS+=("$fd")
   done
+}
+LOCK_FDS=()
+release_locks() {
+  local fd
+  # Unlock each held lock; the fds themselves close when the script exits. (Closing them here with
+  # exec {fd}>&- is fragile, and keeping them open until exit is harmless.)
+  for fd in ${LOCK_FDS[@]+"${LOCK_FDS[@]}"}; do flock -u "$fd" 2>/dev/null || true; done
+  LOCK_FDS=()
+  return 0
 }
 
 # ---- limine.conf -----------------------------------------------------------------------------
@@ -300,9 +330,32 @@ conf_without_block() {
     }' "$CONF"
 }
 
-# Replaces limine.conf with $1 (plus a final newline), atomically, and syncs it.
+# limine.conf without our marked block AND without any stray top-level /air-gpu-oneshot entry
+# (its lines, up to the next top-level entry or a blank line), for --disarm. Fails if a block
+# has no end marker.
+strip_all_entries() {
+  awk -v b="$BEGIN_MARK" -v e="$END_MARK" -v entry="/$ENTRY" '
+    { line[NR] = $0 }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (line[i] == b) { inb = 1; if (out > 0 && kept[out] == "") out--; continue }
+        if (inb) { if (line[i] == e) inb = 0; continue }
+        if (line[i] == entry) { ins = 1; if (out > 0 && kept[out] == "") out--; continue }
+        if (ins) { if (line[i] == "" || line[i] ~ /^\//) ins = 0; else continue }
+        if (ins) continue
+        kept[++out] = line[i]
+      }
+      if (inb) exit 3
+      for (i = 1; i <= out; i++) print kept[i]
+    }' "$CONF"
+}
+
+# Replaces limine.conf with $1 (plus a final newline), atomically, and syncs it. $2 is the bytes
+# the edit was based on: just before the rename, the file on disk must still be those bytes, or a
+# Limine tool rewrote it since (A8) and the edit is abandoned, so a stale UKI pin can't be written.
 write_conf() {
   local tmp=$CONF.air-gpu.tmp
+  if [[ -n ${2:-} && $(cat "$CONF") != "$2" ]]; then return 2; fi
   printf '%s\n' "$1" >"$tmp" || { rm -f "$tmp"; return 1; }
   sync "$tmp" && mv -f "$tmp" "$CONF" && sync "$(dirname "$CONF")"
 }
@@ -312,6 +365,33 @@ block() {
     "$BEGIN_MARK" "$ENTRY" "$1" "$2" "$3" "$END_MARK"
 }
 conf_has_block() { grep -qxF "$BEGIN_MARK" "$CONF" 2>/dev/null; }
+# Any top-level /air-gpu-oneshot entry, inside a marked block or not.
+conf_entry_count() { grep -cxF "/$ENTRY" "$CONF" 2>/dev/null || true; }
+# A /air-gpu-oneshot entry left in the file with no marked block around it (a tool dropped the
+# markers, or a hand edit): conf_without_block can't remove it, so neither --disarm nor a re-arm
+# would be clean (A10/A11).
+conf_has_stray_entry() {
+  local n b
+  n=$(conf_entry_count)
+  b=0
+  conf_has_block && b=1
+  (( n > b ))
+}
+
+# Whether Limine's own EFI binary has a config hash enrolled (A6): the 128 bytes after the
+# ++CONFIG_B2SUM_SIGNATURE++ marker are all '0' in the unenrolled state. An enrolled binary
+# rejects any edited limine.conf on every boot, so arming would brick the Mac until the ESP is
+# fixed from outside. On any SoC this version of limine-mkinitcpio-hook enrolls only on x86_64,
+# so the /etc/default/limine setting can be off while the binary is enrolled.
+limine_config_enrolled() {
+  local loader=$ESP/EFI/BOOT/BOOTAA64.EFI off sig
+  [[ -f $loader ]] || return 2
+  off=$({ grep -aob -- '++CONFIG_B2SUM_SIGNATURE++' "$loader" 2>/dev/null || true; } | head -1 | cut -d: -f1)
+  [[ -n $off ]] || return 1   # no marker: an old Limine with no config-hash feature
+  sig=$(dd if="$loader" bs=1 skip=$((off + 26)) count=128 status=none 2>/dev/null | tr -d '\0')
+  [[ $sig != *[!0]* && ${#sig} -eq 128 ]] && return 1   # all zeros: unenrolled
+  return 0   # a non-zero hash, or an unreadable one: treat as enrolled
+}
 
 # ---- the checks every arming makes -----------------------------------------------------------
 
@@ -327,8 +407,14 @@ preflight() {
   if grep -Eq '^[[:space:]]*ENABLE_ENROLL_LIMINE_CONFIG=["'"'"']?yes' "$LIMINE_DEFAULTS" 2>/dev/null; then
     refuse "$LIMINE_DEFAULTS has ENABLE_ENROLL_LIMINE_CONFIG=yes: Limine checks an enrolled hash of limine.conf, so adding an entry would stop this Mac booting."
   fi
+  if limine_config_enrolled; then
+    refuse "$ESP/EFI/BOOT/BOOTAA64.EFI has a config hash enrolled (or an unreadable one): Limine would reject an edited limine.conf and this Mac would not boot. Reset it (limine enroll-config --reset) before arming."
+  fi
   if grep -Eiq '^[[:space:]]*remember_last_entry:[[:space:]]*yes' "$CONF"; then
     refuse "$CONF has remember_last_entry: yes, so Limine would boot the armed entry again after it."
+  fi
+  if conf_has_stray_entry; then
+    refuse "$CONF has a /$ENTRY entry with no air-gpu-oneshot markers around it (a Limine tool or a hand edit dropped them). Remove it by hand, then arm again."
   fi
   KEYS=$(entry_keys)
   [[ $(key count) == 1 ]] ||
@@ -340,7 +426,8 @@ preflight() {
     refuse "the //$SOURCE_ENTRY entry has no cmdline: with root= to copy."
   [[ $SRC_CMDLINE != *'"'* && $SRC_CMDLINE != *"'"* ]] ||
     refuse "the //$SOURCE_ENTRY command line has quotes, which this script does not rewrite."
-  [[ ! " $SRC_CMDLINE " =~ \ asahi\.t8122_start= ]] ||
+  # The kernel reads - and _ alike in a parameter name, and a bare asahi.t8122_start means =1.
+  [[ ! " $SRC_CMDLINE " =~ \ asahi\.t8122[_-]start([=\ ]) ]] ||
     refuse "the normal //$SOURCE_ENTRY entry already sets asahi.t8122_start, so every boot would start the GPU. Remove it from /etc/default/limine first."
   UKI=$(limine_file "$SRC_PATH")
   [[ -f $UKI ]] || refuse "the //$SOURCE_ENTRY entry's UKI $UKI does not exist."
@@ -401,23 +488,29 @@ gpu_node_note() {
 }
 
 new_cmdline() {
-  local w out=() p name skip
-  for w in $SRC_CMDLINE; do
+  local w out=() p name skip words
+  # No glob expansion against the current directory: a * on the normal command line stays literal.
+  set -f
+  read -ra words <<<"$SRC_CMDLINE"
+  set +f
+  for w in "${words[@]}"; do
     skip=0
-    [[ $w == asahi.t8122_* || $w == "$TAG"=* ]] && skip=1
+    [[ $w == asahi.t8122[_-]* || $w == "$TAG"=* || $w == panic=* ]] && skip=1
     for p in "${PARAMS[@]}"; do
       name=${p%%=*}
       [[ $w == "$name" || $w == "$name"=* ]] && skip=1
     done
     ((skip)) || out+=("$w")
   done
-  printf '%s\n' "${out[*]} ${PARAMS[*]} $TAG=$ID"
+  # panic=10 so a panic in the armed boot reboots itself into the normal entry (the one-shot is
+  # already consumed), instead of waiting for a power-button hold.
+  printf '%s\n' "${out[*]} ${PARAMS[*]} panic=10 $TAG=$ID"
 }
 
 # ---- actions ---------------------------------------------------------------------------------
 
 do_arm() {
-  local before w rest
+  local before w rest current
   is_root || refuse "run as root (sudo)."
   check_board
   # Every refusal comes from this first pass, before anything is touched. The second pass reads
@@ -430,20 +523,28 @@ do_arm() {
   mkdir -p "$STATE_DIR"
   before=$STATE_DIR/limine.conf.before-$ID
   cp -p "$CONF" "$before"
-  rest=$(conf_without_block) || refuse "$CONF has an air-gpu-oneshot block without its end marker; fix it by hand."
-  write_conf "$rest"$'\n\n'"$(block "$ID" "$SRC_PATH" "$NEW_CMDLINE")" || refuse "could not write $CONF."
+  current=$(cat "$CONF")
+  rest=$(conf_without_block) || { release_locks; refuse "$CONF has an air-gpu-oneshot block without its end marker; fix it by hand."; }
+  # write_conf returns 2 if limine.conf changed under us since this read; then nothing was written.
+  write_conf "$rest"$'\n\n'"$(block "$ID" "$SRC_PATH" "$NEW_CMDLINE")" "$current"
+  case $? in
+    0) ;;
+    2) release_locks; refuse "$CONF changed while arming (a Limine tool ran); try again." ;;
+    *) release_locks; refuse "could not write $CONF." ;;
+  esac
   if ! grep -qxF "/$ENTRY" "$CONF" || ! grep -qxF "    cmdline: $NEW_CMDLINE" "$CONF"; then
-    cp -p "$before" "$CONF"; sync
+    cp -p "$before" "$CONF"; sync; release_locks
     refuse "$CONF did not read back with the armed entry; it was put back."
   fi
   if ! set_oneshot || [[ $(armed_name) != "$ENTRY" ]] || ! persist ||
     { [[ -n $VAR_FILE ]] && ! file_has_name "$VAR_FILE"; }; then
     clear_oneshot; persist || true
     write_conf "$rest" || cp -p "$before" "$CONF"
-    sync
+    sync; release_locks
     refuse "the one-shot variable did not read back from the firmware store; it was cleared and the entry removed."
   fi
   sync
+  release_locks
   printf '%s\n' "$ID $KREL $NEW_CMDLINE" >"$STATE_DIR/armed"
   for w in "${WARNINGS[@]}"; do say "warning: $w"; done
   say "armed one boot ($ID): the next boot only runs $KREL with ${PARAMS[*]}; every boot after it is the normal entry. Reboot when ready, then run: sudo air-gpu-collect.sh"
@@ -468,20 +569,28 @@ do_disarm() {
   find_var_file || refuse "U-Boot names an unusable variable file in RTStorageVolatile."
   take_locks
   armed=$(armed_name)
-  if [[ $armed == "$ENTRY" ]]; then
+  # Persist whenever the variable file still names the entry, even if the RAM variable is already
+  # clear: a first --disarm may have cleared the variable but failed to save (A7), and a second
+  # run must finish the save rather than skip it because armed_name is now empty.
+  if [[ $armed == "$ENTRY" ]] || { [[ -n $VAR_FILE ]] && file_has_name "$VAR_FILE"; }; then
     clear_oneshot
-    persist || refuse "could not save the cleared one-shot to $VAR_FILE; run --disarm again."
+    if ! persist; then release_locks; refuse "could not save the cleared one-shot to $VAR_FILE; run --disarm again."; fi
+    if [[ -n $VAR_FILE ]] && file_has_name "$VAR_FILE"; then
+      release_locks; refuse "$VAR_FILE still names $ENTRY after saving; run --disarm again."
+    fi
     changed+="cleared the one-shot; "
   elif [[ -n $armed ]]; then
     say "another one-shot is armed ($armed); leaving it alone"
   fi
-  if find_conf && conf_has_block; then
-    rest=$(conf_without_block) || refuse "$CONF has an air-gpu-oneshot block without its end marker; fix it by hand."
-    write_conf "$rest" || refuse "could not write $CONF."
+  # Remove a marked block, and also a markerless /air-gpu-oneshot entry a tool left behind (A11).
+  if find_conf && { conf_has_block || conf_has_stray_entry; }; then
+    rest=$(strip_all_entries) || { release_locks; refuse "$CONF has an air-gpu-oneshot block without its end marker; fix it by hand."; }
+    write_conf "$rest" || { release_locks; refuse "could not write $CONF."; }
     changed+="removed the air-gpu-oneshot entry from $CONF; "
   fi
   rm -f "$STATE_DIR/armed"
   sync
+  release_locks
   say "disarmed: ${changed:-nothing was armed.}"
   log "disarmed: ${changed:-nothing was armed}"
 }

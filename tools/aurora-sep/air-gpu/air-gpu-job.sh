@@ -259,10 +259,14 @@ out("device", name)
 prio = C.c_float(1.0)
 qci = QueueCI(2, None, 0, family, 1, C.pointer(prio))
 dev = P()
+# vkCreateDevice opens a GPU context through the firmware; if that hangs, the wrapper records how
+# far we got. A hang here is a GPU-side hang, never a clean FW-RUNNING (collect reads this).
+out("opened_device", "attempting")
 check(vkCreateDevice(phys, C.byref(DeviceCI(3, None, 0, 1, C.pointer(qci), 0, None, 0, None, None)), None,
                      C.byref(dev)), "vkCreateDevice")
 queue = P()
 vkGetDeviceQueue(dev, family, 0, C.byref(queue))
+out("opened_device", "yes")
 
 size = N * 4
 buf = U64()
@@ -373,9 +377,20 @@ out("loop_ms", int((time.monotonic() - loop_start) * 1000))
 finish(0, "pass")
 PY
 
+# Run as the invoking user when we are root under sudo; otherwise run directly. User-side files
+# (the record, its directory) are written this way, never as root, so a symlink a local user
+# planted in their home can't redirect a root write or a chown (A13).
+runu() {
+  if [[ $(id -u) == 0 && -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
+    runuser -u "$SUDO_USER" -- "$@"
+  else
+    "$@"
+  fi
+}
+
 main() {
-  local seconds=5 prefix="" a icd icds start deadline out rec home user boot oneshot pid rc result
-  local reached elapsed submits first device err budget
+  local seconds=5 prefix="" a icd icds start deadline out rec recdir home user boot oneshot pid rc result
+  local reached elapsed submits first device err budget work stage
   start=$(now_ms)
   while (($#)); do
     case $1 in
@@ -401,14 +416,26 @@ main() {
   # The record, in the user's home: under sudo, the invoking user's.
   user=${SUDO_USER:-$(id -un)}
   home=$(user_home "$user")
-  mkdir -p "$home/air-gpu-runs"
-  rec=$home/air-gpu-runs/job-$(date +%Y%m%d-%H%M%S).txt
+  recdir=$home/air-gpu-runs
+  # Created as the user (A13), so a symlink there can only point where the user may already write.
+  runu mkdir -p "$recdir" 2>/dev/null ||
+    { say "refused: could not create $recdir as $user (is it a symlink?)."; exit 2; }
+  rec=$recdir/job-$(date +%Y%m%d-%H%M%S-%N).txt
   boot=$(tr -d '-' <"$BOOT_ID")
   oneshot=$(tr ' ' '\n' <"$CMDLINE" | sed -n "s/^${TAG//./\\.}=//p" | head -1)
-  out=$(mktemp)
-  write_record() { # key=value lines on stdin; the record is replaced atomically and synced
-    cat >"$rec.tmp" && mv -f "$rec.tmp" "$rec" && sync "$rec" 2>/dev/null || true
-    [[ $(id -u) != 0 || $user == root ]] || chown "$user": "$rec" "$home/air-gpu-runs" 2>/dev/null || true
+  work=$(mktemp -d)
+  trap 'rm -rf "${work:-}"' EXIT
+  out=$work/job.out
+  write_record() { # key=value lines on stdin; staged world-readable, then written as the user (A13)
+    local pub
+    cat >"$work/rec"
+    # The user can't read the root-only work dir, so copy through a world-readable temp (the
+    # record has no secrets) and let the user write their own file: no root write via a symlink.
+    pub=$(mktemp --tmpdir "air-gpu-job.XXXXXX")
+    cp -f "$work/rec" "$pub"
+    chmod 0644 "$pub"
+    runu cp -f "$pub" "$rec" 2>/dev/null || true
+    rm -f "$pub"
   }
   header() {
     printf '%s\n' "boot_id=$boot" "oneshot=${oneshot:-none}" "kernel=$(uname -r)" "started=$(date -Is)" \
@@ -435,7 +462,7 @@ main() {
   ((budget > 0)) || budget=0
   (
     while read -r a; do export "${a?}"; done < <(mesa_env "$prefix" "$icd")
-    exec python3 -c "$JOB_PY" "$seconds" "$((budget / 1000)).$(printf '%03d' $((budget % 1000)))" \
+    exec python3 -I -c "$JOB_PY" "$seconds" "$((budget / 1000)).$(printf '%03d' $((budget % 1000)))" \
       "$DEVICE_MATCH" 0.01
   ) >"$out" 2>&1 &
   pid=$!
@@ -460,10 +487,19 @@ main() {
   first=$(sed -n 's/^first_submit_ms=//p' "$out" | tail -1)
   device=$(sed -n 's/^device=//p' "$out" | tail -1)
   err=$(sed -n 's/^error=//p' "$out" | tail -1)
+  # How far the job got, for collect: a job that started but did not finish is never a clean
+  # FW-RUNNING or JOB-COMPLETED (A3).
+  stage=none
+  grep -q '^opened_device=' "$out" && stage="opening-device"
+  grep -q '^opened_device=yes' "$out" && stage="opened-device"
+  grep -q '^reached_gpu=yes' "$out" && stage="reached-gpu"
+  grep -q '^first_submit_ms=' "$out" && stage="submitted"
+  grep -q '^loop_ms=' "$out" && stage="finished"
   {
     header
-    printf '%s\n' "reached_gpu=${reached:-no}" "result=$result" "exit=$rc" "elapsed_ms=$elapsed" \
-      "submits=${submits:-0}" "first_submit_ms=${first:--}" "device=${device:--}" "error=${err:-}"
+    printf '%s\n' "reached_gpu=${reached:-no}" "result=$result" "stage=$stage" "exit=$rc" \
+      "elapsed_ms=$elapsed" "submits=${submits:-0}" "first_submit_ms=${first:--}" \
+      "device=${device:--}" "error=${err:-}"
     echo "--- job output"
     head -c 16384 "$out"
   } | write_record

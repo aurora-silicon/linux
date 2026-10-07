@@ -445,9 +445,9 @@ M3_AIR_DRY_RUN_SWITCHES="chosen.asahi,t8122-gpu-diag=1 chosen.asahi,t8122-gpu-ha
 M3_GPU_EXPERIMENT=0
 M3_GPU_BIN=/usr/local/bin
 M3_GPU_SCRIPTS=(
-  "air-gpu-oneshot.sh 072d135755fddf1c510bb6dc623b9c89f976f938a25529041708831769254ff5"
-  "air-gpu-collect.sh b79d765caa47f93b18797d2e6ef2e595e943a3c6a261185cae43c345535fa10c"
-  "air-gpu-job.sh c96b0a2ff00fe2c420efdb5ad5f3b116b5f7424ad9bf39b63d2a0dee5bdd5ce3"
+  "air-gpu-oneshot.sh a0c1361037f5e92d95dd8872166313421814c07e9c9491125bcf0f6309da8b14"
+  "air-gpu-collect.sh a9a11f291a46d84621b237c7b9ce99402c00ef6b07d48bf4f6f7d51fb5b77996"
+  "air-gpu-job.sh fbdc109ffe6563157dd1015c0e8e2b2cf9c1f6c9a06e01aeff3a128557d09698"
 )
 # PLACEHOLDER until the G15G Mesa build exists: its prefix package as "file sha256" (a pacman
 # package that installs Mesa into a prefix of its own, never over the system Mesa), and that
@@ -1194,13 +1194,19 @@ m3_gpu_notice() {
 }
 
 # --uninstall: clears an armed experiment boot, then removes what m3_gpu_install recorded.
+# Clear any armed experiment boot. Run BEFORE the kernel is replaced (A10): disarming after the
+# UKI the armed entry pins is gone would leave the one-shot naming a stale entry. Safe to call
+# when nothing is armed, and when the experiment was never installed.
+m3_gpu_disarm() {
+  [[ -f $STATE/m3-gpu-experiment && -x $M3_GPU_BIN/air-gpu-oneshot.sh ]] || return 0
+  $sudo "$M3_GPU_BIN/air-gpu-oneshot.sh" --disarm ||
+    warn "air-gpu-oneshot.sh --disarm failed: check limine.conf for an air-gpu-oneshot entry"
+}
+
 m3_gpu_remove() {
-  local kind name
+  local kind name leftover=0
   [[ -f $STATE/m3-gpu-experiment ]] || return 0
-  if [[ -x $M3_GPU_BIN/air-gpu-oneshot.sh ]]; then
-    $sudo "$M3_GPU_BIN/air-gpu-oneshot.sh" --disarm ||
-      warn "air-gpu-oneshot.sh --disarm failed: check limine.conf for an air-gpu-oneshot entry"
-  fi
+  m3_gpu_disarm
   while read -r kind name _; do
     case $kind in
       script) [[ $name =~ ^air-gpu-[a-z]+\.sh$ ]] && $sudo rm -f "$M3_GPU_BIN/$name" ;;
@@ -1208,6 +1214,13 @@ m3_gpu_remove() {
         warn "could not remove $name"; } ;;
     esac
   done <"$STATE/m3-gpu-experiment"
+  # Any Mesa package still installed under a name a later release renamed (the record is
+  # overwritten by a plain rerun), plus the state dir's own leftovers.
+  for name in $(pacman -Qq 2>/dev/null | grep -E '^mesa-m3-g15g' || true); do
+    $sudo pacman -Rns --noconfirm "$name" 2>/dev/null && leftover=1 || true
+  done
+  ((leftover == 0)) || warn "removed a leftover G15G Mesa package"
+  $sudo rm -rf /var/lib/air-gpu
   say "Removed the M3 Air GPU experiment's scripts"
 }
 
@@ -1925,6 +1938,9 @@ uninstall_all() {
     say "Reinstalling $previous, the stock m1n1 and the stock libfprint"
   fi
   $sudo pacman -Rdd --noconfirm aurora-touchid 2>/dev/null || true
+  # Clear any armed experiment boot before the kernel (and its UKI) is replaced, so the one-shot
+  # never names an entry whose kernel image is about to change (A10).
+  m3_gpu_disarm
   # The stock m1n1 has no M3 handoff; drop the switches before its rebuild.
   m3_switches_remove
   $sudo pacman -Sy --noconfirm --ask 4 "$previous" "$previous-headers" libfprint $m1n1
