@@ -111,7 +111,7 @@ class M3ReportTest(Base):
 
     def test_report_needs_no_preflight(self):
         src = flow.INSTALLER.read_text()
-        self.assertIn("--agent-prompt | --reset-touchid | --m3-report) return 1", src)
+        self.assertIn("--agent-prompt | --reset-touchid | --m3-report | --m3-power-survey) return 1", src)
 
 
 if __name__ == "__main__":

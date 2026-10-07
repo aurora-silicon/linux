@@ -5,6 +5,9 @@
 #   ... | bash -s -- --read-only      install, but never let the driver write to the enclave
 #   ... | bash -s -- --uninstall      go back to the kernel this Mac had before
 #   ... | bash -s -- --reset-touchid  start Touch ID over: new keybag, enrol again
+#   ... | bash -s -- --m3-report      M3: write a bring-up report to attach to an issue (read-only)
+#   ... | bash -s -- --m3-power-survey   M3: sample the SMC's temperature and power keys through
+#                                         short CPU and backlight loads (opt-in, about 5 minutes)
 #   ... | bash -s -- --m3-gpu-experiment   M3 MacBook Air only: install the GPU start
 #                                         experiment's scripts with the kernel (arms nothing)
 #   ... | bash -s -- --no-m3-mesa     M3 Pro: leave out the M3 Pro's Mesa (installed by default)
@@ -2771,6 +2774,7 @@ install_all() {
     echo "   The previous kernel stays in the GRUB menu as 'Previous kernel … before aurora-sep'."
   fi
   echo "   To undo everything:    curl -fsSL $PUBLIC_RELEASE_URL/install-aurora-sep.sh | bash -s -- --uninstall"
+  m3_next_steps
   # The kernel install is complete either way; 3 or 4: the M3 Pro's Mesa or its record.
   m3_pro_mesa_status || exit $?
 }
@@ -2994,19 +2998,701 @@ m3_report_m1n1() {
   printf 'm1n1-installed: '; cat "$STATE/m1n1-installed" 2>/dev/null || echo -
 }
 
-# Printed by --agent-prompt, and pointed at from the end of a successful
-# install. This is written for an agent driving the test on a real Mac: it says
-# what to establish, what counts as a pass, and how to write it up.
-# --m3-report: one file with what an M3 test report needs, in the current
-# directory. It reads only: the boot loader's /chosen entries, a kernel log
-# filtered to the M3 bring-up, USB-C and display state. Lines naming a USB
-# serial number are dropped and MAC addresses are masked.
-M3_REPORT_DMESG='asahi|agx|gpu|g15|dcp|dart|t8122|t6030|reserved|iommu|mailbox|pmp|simpledrm|m1n1|tipd|typec|sn201202|atc|usb|xhci|dwc3|thermal|macsmc'
+# ---- the M3 bring-up report (--m3-report) ------------------------------------------------------
+# --m3-report: one file with what bringing up an M3 needs, in the current directory, to attach to
+# an issue. It works on every M3 (t8122, t6030, t6031, t6034) and only reads: who this Mac is, the
+# boot loader's /chosen entries, every device-tree node, which devices got a driver, the whole
+# kernel log of this boot, the SMC's temperature and power keys, the CPUs, and the state of each
+# kind of device a bring-up checks. The host name, user names, serial numbers and MAC addresses
+# are masked (m3_privacy_mask), and the finished file is checked for them (m3_privacy_check):
+# a file that still has any is not kept.
+M3_REPORT_DMESG='asahi|agx|gpu|g15|dcp|dart|t8122|t6030|t6031|t6034|reserved|iommu|mailbox|pmp|simpledrm|m1n1|tipd|typec|sn201202|atc|usb|xhci|dwc3|thermal|macsmc'
+# The M3 chips whose /chosen/asahi,<chip>-* entries (the boot loader's facts and switches) the
+# report copies whole.
+M3_CHOSEN_SOCS="t8122 t6030 t6031 t6034"
+# Where the report and the power survey read the running system; tests point them at a fake Mac.
+M3_SYSFS=/sys
+M3_PROCFS=/proc
+M3_DEBUGFS=/sys/kernel/debug
+M3_ETC=/etc
+M3_MODULES=/usr/lib/modules
+M3_DEVFS=/dev
+# The report's (or survey's) work directory, removed on exit.
+M3_WORK=""
+# The ADT reader (tools/aurora-sep/aurora-adt-extract.py), as "file sha256": a release asset that
+# --m3-report downloads and checks like M3_GPU_SCRIPTS, unless the script runs from a directory
+# that has its own copy (a checkout). It reads the boot loader's copy of the ADT through the
+# read-only node of the phram MTD device named adt and prints an allowlist of it;
+# "--check <node>" checks the node and what it is bound to, and reads nothing. Empty: this
+# release has none, and the report says so.
+M3_ADT_READER=""
+
+# A file's first line, or "-" when it can't be read. No fork: the report reads a few thousand.
+m3_attr() {
+  local v=""
+  { IFS= read -r v || [[ -n $v ]]; } 2>/dev/null <"$1" || { printf -- '-'; return 0; }
+  printf '%s' "$v"
+}
+
+# A device-tree property's strings, separated by spaces, or "-".
+m3_dt_words() {
+  local -a w=()
+  { mapfile -d '' -t w; } 2>/dev/null <"$1" || true
+  if ((${#w[@]})); then printf '%s' "${w[*]}"; else printf -- '-'; fi
+}
+
+# A device-tree cell (big-endian 32 bits) as a number, or "-".
+m3_dt_u32() {
+  local v
+  v=$(od -An -tu4 --endian=big -N4 "$1" 2>/dev/null | tr -d ' ') || v=""
+  printf '%s' "${v:--}"
+}
+
+# Who this Mac is and what it runs: appended to system.txt after the lines earlier releases wrote.
+m3_report_identity() {
+  local f
+  echo "model: $(m3_dt_words "$DT/model")"
+  echo "compatible: $(m3_dt_words "$DT/compatible")"
+  echo "memory: $(awk '/^MemTotal:/ { printf "%.1f GiB (MemTotal %s kB)", $2 / 1048576, $2 }' "$M3_PROCFS/meminfo" 2>/dev/null)"
+  echo "uname: $(uname -srvm)"
+  echo "cmdline: $(m3_attr "$M3_PROCFS/cmdline")"
+  for f in "$DT"/chosen/framebuffer*; do
+    [[ -d $f ]] || continue
+    echo "boot framebuffer ${f##*/}: $(m3_dt_u32 "$f/width")x$(m3_dt_u32 "$f/height"), stride $(m3_dt_u32 "$f/stride"), format $(m3_dt_words "$f/format")"
+  done
+  echo "packages:"
+  pacman -Q 2>/dev/null | grep -E '^(linux-(aurora|asahi)|m1n1|uboot-asahi|asahi-|mesa|vulkan-|libfprint|fprintd|aurora-|limine|omarchy-mac|alsa-ucm|speakersafetyd|tiny-dfr|libva|avd-fw|linux-firmware)' ||
+    echo -
+}
+
+# A device-tree reg property as "address+size" pairs in hex, with the parent's cell counts.
+m3_dt_reg() { # FILE ADDRESS-CELLS SIZE-CELLS
+  local ac=$2 sc=$3
+  [[ $ac =~ ^[0-9]+$ ]] || ac=2
+  [[ $sc =~ ^[0-9]+$ ]] || sc=2
+  [[ -f $1 ]] || { printf -- '-'; return 0; }
+  od -An -tx4 --endian=big -v "$1" 2>/dev/null |
+    awk -v ac="$ac" -v sc="$sc" '
+      { for (i = 1; i <= NF; i++) w[n++] = $i }
+      END {
+        for (i = 0; i + ac + sc <= n; i += ac + sc) {
+          a = ""; s = ""
+          for (j = 0; j < ac; j++) a = a w[i + j]
+          for (j = 0; j < sc; j++) s = s w[i + ac + j]
+          sub(/^0+/, "", a); sub(/^0+/, "", s)
+          printf "%s0x%s+0x%s", (i ? " " : ""), (a == "" ? "0" : a), (s == "" ? "0" : s)
+        }
+      }'
+}
+
+# The reserved-memory nodes: each one's name, compatible, label, reg and status (the addresses,
+# never what is in them), and whether the boot loader's ADT and log nodes are there.
+m3_report_reserved() {
+  local rm=$DT/reserved-memory d ac sc label adt="" log=""
+  ac=$(m3_dt_u32 "$rm/#address-cells") sc=$(m3_dt_u32 "$rm/#size-cells")
+  echo "# $rm: node, compatible, label, reg (address+size), status, no-map"
+  for d in "$rm"/*/; do
+    d=${d%/}
+    [[ -d $d ]] || continue
+    label=$(m3_dt_words "$d/label")
+    printf '%s\tcompatible=%s\tlabel=%s\treg=%s\tstatus=%s\tno-map=%s\n' "${d##*/}" "$(m3_dt_words "$d/compatible")" \
+      "$label" "$(m3_dt_reg "$d/reg" "$ac" "$sc")" "$(m3_dt_words "$d/status")" "$([[ -e $d/no-map ]] && echo yes || echo no)"
+    [[ $label == adt ]] && adt=${d##*/}
+    [[ $label == m1n1_stage2.log ]] && log=${d##*/}
+  done
+  echo "adt node (the boot loader's copy of the ADT): ${adt:-absent}"
+  echo "m1n1_stage2.log node (m1n1's log of this boot): ${log:-absent}"
+}
+
+# A device-tree property as text (strings joined by " | "), or its size when it isn't text.
+m3_dt_text() {
+  local v
+  v=$(tr '\0' '\n' <"$1" 2>/dev/null | sed '/^$/d' | paste -sd'|' | sed 's/|/ | /g')
+  if [[ -n $v ]] && ! LC_ALL=C grep -q '[^[:print:]]' <<<"$v"; then
+    printf '%s' "$v"
+  else
+    printf '<%s bytes>' "$(stat -c %s "$1" 2>/dev/null || echo ?)"
+  fi
+}
+
+# The macOS system-firmware stub's version, from the installer's stub_info.json.
+m3_report_stub_version() {
+  local bootbin v=""
+  if bootbin=$(esp_bootbin); then
+    v=$($sudo cat "${bootbin%/m1n1/boot.bin}/asahi/stub_info.json" 2>/dev/null |
+      grep -o '"ProductVersion": *"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/') || v=""
+  fi
+  echo "${v:--}"
+}
+
+# Which device tree this Mac boots: the running tree's model and compatible, the boot loader's
+# asahi,* entries in /chosen, and the device trees in m1n1's boot.bin, each by its first board
+# and chip compatible; this board's is matched by its bytes against the installed kernels'.
+m3_report_boot_dt() {
+  local board f target bin=$M3_WORK/boot.bin off size ver j t n=0 sha match="" dtbs
+  board=$(this_board)
+  echo "running device tree: model $(m3_dt_words "$DT/model"); compatible $(m3_dt_words "$DT/compatible")"
+  echo "system-firmware stub (stub_info.json ProductVersion): $(m3_report_stub_version)"
+  echo "== $DT/chosen asahi,* entries"
+  for f in "$DT"/chosen/asahi,*; do
+    [[ -e $f ]] || continue
+    if [[ -d $f ]]; then echo "${f##*/}/ (a node)"; else echo "${f##*/}: $(m3_dt_text "$f")"; fi
+  done
+  echo "== the device trees in m1n1's boot.bin"
+  if ! target=$(esp_bootbin) || ! $sudo cat "$target" >"$bin" 2>/dev/null; then
+    echo "boot.bin: not found or not readable"
+    return 0
+  fi
+  while IFS=: read -r off _; do
+    # A device tree's header: the magic, its total size, ..., and version 17 at byte 20.
+    size=$(od -An -tu4 --endian=big -j "$((off + 4))" -N4 "$bin" 2>/dev/null | tr -d ' ')
+    ver=$(od -An -tu4 --endian=big -j "$((off + 20))" -N4 "$bin" 2>/dev/null | tr -d ' ')
+    if ! [[ $size =~ ^[0-9]+$ && $ver == 17 ]] || ((size < 64 || size > 4194304)); then continue; fi
+    tail -c +"$((off + 1))" "$bin" | head -c "$size" >"$M3_WORK/dtb.$n"
+    j=$(LC_ALL=C grep -aoE 'apple,j[0-9a-z]+' "$M3_WORK/dtb.$n" | head -1)
+    t=$(LC_ALL=C grep -aoE 'apple,t[0-9]{4}' "$M3_WORK/dtb.$n" | head -1)
+    echo "dtb $n at byte $off, $size bytes: ${j:--} ${t:--}"
+    if [[ -n $board && ${j#apple,} == "$board" ]]; then
+      sha=$(sha256sum <"$M3_WORK/dtb.$n" | cut -d' ' -f1)
+      dtbs=$(for f in "$M3_MODULES"/*/dtbs/*-"$board".dtb "$M3_MODULES"/*/dtbs/*/*-"$board".dtb; do
+        [[ -f $f && $(sha256sum <"$f" | cut -d' ' -f1) == "$sha" ]] && echo "${f#"$M3_MODULES"/}"
+      done | paste -sd' ')
+      match+="dtb $n (sha256 $sha) is ${dtbs:-none of the device trees of the installed kernels}"$'\n'
+    fi
+    n=$((n + 1))
+  done < <(LC_ALL=C grep -obUaP '\xd0\x0d\xfe\xed' "$bin" 2>/dev/null)
+  echo "device trees in boot.bin: $n"
+  if [[ -n $match ]]; then printf '%s' "$match"; else echo "no device tree in boot.bin names this board (${board:-?})"; fi
+}
+
+# The ADT reader to run. With M3_ADT_READER set, only bytes with its sha256: the copy next to
+# this script when it has them, else this release's, downloaded and checked. Without it (a
+# checkout before a release names one), the copy next to this script. Prints its path; or,
+# returning 1, why there is none.
+m3_adt_reader() {
+  local self=${BASH_SOURCE[0]:-} local_copy="" file sha got
+  if [[ -n $self && -f $self && -f $(dirname "$self")/aurora-adt-extract.py ]]; then
+    local_copy=$(dirname "$self")/aurora-adt-extract.py
+  fi
+  if [[ -z $M3_ADT_READER ]]; then
+    if [[ -n $local_copy ]]; then echo "$local_copy"; return 0; fi
+    echo "this release ($TAG) has no ADT reader, so the ADT was not read"
+    return 1
+  fi
+  read -r file sha <<<"$M3_ADT_READER"
+  if [[ -n $local_copy && $(sha256sum "$local_copy" | cut -d' ' -f1) == "$sha" ]]; then
+    echo "$local_copy"
+    return 0
+  fi
+  if ! (release_source >/dev/null 2>&1); then
+    echo "AURORA_RELEASE_URL or AURORA_RELEASES_API is not a URL this takes, so the ADT was not read"
+    return 1
+  fi
+  if ! curl -fsSL --retry 3 -o "$M3_WORK/$file" "$RELEASE_URL/$file" 2>/dev/null; then
+    echo "could not download $file from $TAG, so the ADT was not read"
+    return 1
+  fi
+  got=$(sha256sum "$M3_WORK/$file" | cut -d' ' -f1)
+  if [[ $got != "$sha" ]]; then
+    echo "$file does not match its published checksum, so the ADT was not read"
+    return 1
+  fi
+  echo "$M3_WORK/$file"
+}
+
+# The largest adt region the report reads (an ADT is well under 1 MiB).
+M3_ADT_MAX_BYTES=$((16 * 1024 * 1024))
+# The on-demand ADT read's state, for the traps: whether this run loaded phram, and the reader.
+M3_PHRAM_LOADED=0
+M3_ADT_PID=""
+
+# Whether phram is loaded (or built in).
+m3_phram_loaded() {
+  [[ -d $M3_SYSFS/module/phram ]] || grep -q '^phram ' "$M3_PROCFS/modules" 2>/dev/null
+}
+
+# The MTD inventory and phram's state, as compared before and after the ADT read: one line per
+# MTD device (not its read-only twin) with its number, name, type, size, erase size, device
+# number and /dev/mtd/by-name link.
+m3_mtd_inventory() {
+  local m l by devfs
+  devfs=$(readlink -f "$M3_DEVFS")
+  if m3_phram_loaded; then echo "phram: loaded"; else echo "phram: not loaded"; fi
+  for m in "$M3_SYSFS"/class/mtd/mtd*; do
+    [[ ${m##*/} =~ ^mtd[0-9]+$ ]] || continue
+    by=-
+    for l in "$M3_DEVFS"/mtd/by-name/*; do
+      [[ -L $l && $(readlink -f "$l") == "$devfs/${m##*/}" ]] && by=${l##*/}
+    done
+    printf '%s name=%s type=%s size=%s erasesize=%s dev=%s by-name=%s\n' "${m##*/}" "$(m3_attr "$m/name")" \
+      "$(m3_attr "$m/type")" "$(m3_attr "$m/size")" "$(m3_attr "$m/erasesize")" "$(m3_attr "$m/dev")" "$by"
+  done | sort -V
+  return 0
+}
+
+# The device names in an m3_mtd_inventory, one per line, sorted.
+m3_mtd_names() {
+  sed -n 's/^mtd[0-9]* name=\([^ ]*\) .*/\1/p' | LC_ALL=C sort
+}
+
+# The reserved-memory node phram makes the adt MTD device from: label adt, compatible phram.
+m3_adt_dt_node() {
+  local d
+  for d in "$DT"/reserved-memory/*/; do
+    d=${d%/}
+    [[ $(m3_dt_words "$d/label") == adt && " $(m3_dt_words "$d/compatible") " == *" phram "* ]] &&
+      { echo "$d"; return 0; }
+  done
+  return 0
+}
+
+# The device-tree node an MTD device (mtdN) was made from: its own of_node, or its device's.
+m3_mtd_of_node() {
+  local m=$M3_SYSFS/class/mtd/$1
+  if [[ -e $m/of_node ]]; then readlink -f "$m/of_node"; else readlink -f "$m/device/of_node"; fi
+}
+
+# The MTD device (mtdN) named NAME, or nothing.
+m3_mtd_named() {
+  local m
+  for m in "$M3_SYSFS"/class/mtd/mtd*; do
+    [[ ${m##*/} =~ ^mtd[0-9]+$ && $(m3_attr "$m/name") == "$1" ]] && { echo "${m##*/}"; return 0; }
+  done
+  return 0
+}
+
+# Waits (up to 10 s) until udev has handled every event, such as its own probe of a new MTD
+# node, which holds the node open for a moment.
+m3_udev_settle() {
+  if command -v udevadm >/dev/null; then udevadm settle --timeout=10 2>/dev/null || true; fi
+}
+
+# Unloads phram if this run loaded it: after the reader has stopped and udev has settled, and
+# once more after a short wait if phram is still in use. Never forced. Returns 1 when phram
+# stays loaded; M3_PHRAM_LOADED is then 0 all the same, since the owner was told.
+m3_adt_unload() {
+  local try
+  ((M3_PHRAM_LOADED)) || return 0
+  if [[ -n $M3_ADT_PID ]]; then
+    kill "$M3_ADT_PID" 2>/dev/null || true
+    wait "$M3_ADT_PID" 2>/dev/null || true
+    M3_ADT_PID=""
+  fi
+  for try in 1 2; do
+    m3_udev_settle
+    if $sudo modprobe -r phram 2>/dev/null; then
+      M3_PHRAM_LOADED=0
+      return 0
+    fi
+    ((try == 2)) || sleep 2
+  done
+  M3_PHRAM_LOADED=0
+  warn "phram, which this report loaded, is still loaded (modprobe -r phram failed: in use). Unload it later with: sudo modprobe -r phram"
+  return 1
+}
+
+# The report's traps: the reader stopped, phram unloaded if this run loaded it, the work
+# directory removed.
+m3_report_cleanup() {
+  m3_adt_unload || true
+  if [[ -n $M3_PARTIAL ]]; then rm -f "$M3_PARTIAL"; fi
+  if [[ -n $M3_WORK ]]; then rm -rf "$M3_WORK"; fi
+  M3_WORK=""
+}
+
+# The on-demand ADT read, on an M3. adt-allowlist.txt gets the reader's output, or one line
+# saying why there is none; adt-check.txt records each step, and the MTD inventory and phram's
+# state before and after, which must match. phram is loaded only when it isn't (an owner's
+# phram is left alone, and the step stops), only when the device tree has the adt region, and
+# only when no MTD device but nvram is present; it is unloaded on every path (the traps cover
+# an interruption). The reader gets only the read-only node /dev/mtdNro of the device named adt,
+# once its size and device-tree node match the region's and the reader's own --check agrees.
+m3_report_adt() { # DIR
+  local out=$1/adt-allowlist.txt log=$1/adt-check.txt reader node want reg mtd dev i rc=0 why="" before after
+  local loaded new
+  is_m3 || return 0
+  before=$(m3_mtd_inventory)
+  printf '== before\n%s\n' "$before" >"$log"
+  if ! reader=$(m3_adt_reader); then
+    why=$reader
+  elif ! command -v python3 >/dev/null; then
+    why="python3 is not installed, so the ADT was not read"
+  elif m3_phram_loaded; then
+    why="phram is already loaded on this Mac, not by this report, so the ADT step stopped and phram stays loaded"
+  elif grep -v '^phram:' <<<"$before" | grep -vq ' name=nvram '; then
+    why="an MTD device other than nvram is present, so the ADT step stopped (see adt-check.txt)"
+  elif ! node=$(m3_adt_dt_node) || [[ -z $node ]]; then
+    why="no adt region in the device tree: this boot's m1n1 reserved none, so the ADT was not read"
+  fi
+  if [[ -z $why ]]; then
+    reg=$(m3_dt_reg "$node/reg" "$(m3_dt_u32 "$DT/reserved-memory/#address-cells")" "$(m3_dt_u32 "$DT/reserved-memory/#size-cells")")
+    if [[ $reg =~ ^0x[0-9a-f]+\+0x([0-9a-f]{1,15})$ ]]; then
+      want=$((16#${BASH_REMATCH[1]}))
+      echo "region: ${node#"$DT"} reg $reg ($want bytes)" >>"$log"
+      if ((want == 0 || want > M3_ADT_MAX_BYTES)); then
+        why="the adt region is $want bytes, not 1 to $M3_ADT_MAX_BYTES, so the ADT was not read"
+      fi
+    else
+      why="the adt region's reg ($reg) is not one address and size, so the ADT was not read"
+    fi
+  fi
+  if [[ -z $why ]]; then
+    say "Reading the boot loader's copy of the ADT: phram is loaded for it, and unloaded again"
+    if ! $sudo modprobe phram 2>>"$log"; then
+      why="no phram module on this kernel (it comes with 12.3), so the ADT was not read"
+    else
+      M3_PHRAM_LOADED=1
+      m3_udev_settle
+      loaded=$(m3_mtd_inventory)
+      printf 'loaded: phram\n== with phram\n%s\n' "$loaded" >>"$log"
+      # Exactly the two regions' devices are new: adt and m1n1_stage2.log.
+      new=$(diff <(m3_mtd_names <<<"$before") <(m3_mtd_names <<<"$loaded") | sed -n 's/^> //p' | paste -sd' ') || true
+      mtd=$(m3_mtd_named adt)
+      if [[ -z $new ]]; then
+        why="phram made no MTD device, so the ADT was not read"
+      elif [[ $new != "adt m1n1_stage2.log" ]]; then
+        why="phram made the MTD devices $new, not exactly adt and m1n1_stage2.log, so the ADT was not read"
+      elif [[ -z $mtd ]]; then
+        why="phram made no MTD device named adt, so the ADT was not read"
+      elif [[ $(m3_attr "$M3_SYSFS/class/mtd/$mtd/size") != "$want" ||
+        $(m3_mtd_of_node "$mtd") != "$(readlink -f "$node")" ]]; then
+        why="the adt MTD device ($mtd, $(m3_attr "$M3_SYSFS/class/mtd/$mtd/size") bytes) does not match its reserved-memory region (${node##*/}, $want bytes), so the ADT was not read"
+      else
+        dev=$M3_DEVFS/${mtd}ro
+        for ((i = 0; i < 10; i++)); do [[ -e $dev ]] && break; sleep 0.5; done
+        if [[ ! -e $dev ]]; then
+          why="no read-only device node $dev, so the ADT was not read"
+        elif ! $sudo python3 "$reader" --check "$dev" >>"$log" 2>"$M3_WORK/adt.err"; then
+          why="the ADT reader's check refused $dev, so the ADT was not read: $(tail -1 "$M3_WORK/adt.err" 2>/dev/null | cut -c1-200 || true)"
+        else
+          echo "read: $dev with ${reader##*/}" >>"$log"
+          $sudo python3 "$reader" "$dev" >"$out" 2>"$M3_WORK/adt.err" &
+          M3_ADT_PID=$!
+          wait "$M3_ADT_PID" || rc=$?
+          M3_ADT_PID=""
+          if ((rc)); then
+            why="the ADT reader failed (exit $rc), so its output was left out: $(tail -1 "$M3_WORK/adt.err" 2>/dev/null | cut -c1-200 || true)"
+          fi
+        fi
+      fi
+    fi
+  fi
+  if [[ -n $why ]]; then echo "$why" >"$out"; echo "stopped: $why" >>"$log"; else echo "read: done" >>"$log"; fi
+  local unload=ok
+  if ((M3_PHRAM_LOADED)); then
+    if m3_adt_unload; then
+      echo "unloaded: phram" >>"$log"
+    else
+      unload=failed
+      echo "unload FAILED: phram stays loaded (in use after udev settled, twice; not forced)" >>"$log"
+    fi
+  fi
+  after=$(m3_mtd_inventory)
+  printf '== after\n%s\n' "$after" >>"$log"
+  if [[ $after == "$before" ]]; then
+    echo "restored: yes (the MTD inventory and phram's state match the before-state)" >>"$log"
+  else
+    echo "restored: NO (the MTD inventory or phram's state differs from the before-state)" >>"$log"
+    # A failed unload has said so already, in one line.
+    [[ $unload == failed ]] || warn "the ADT step left the MTD devices or phram not as it found them: see adt-check.txt in the report"
+  fi
+  return 0
+}
+
+# Every device-tree node, one per line: its path, compatible and status.
+m3_report_dt_nodes() {
+  local d rel
+  echo "# every node of $DT: path, compatible, status (- when the node has none)"
+  while IFS= read -r -d '' d; do
+    rel=${d#"$DT"}
+    printf '%s\tcompatible=%s\tstatus=%s\n' "/${rel#/}" "$(m3_dt_words "$d/compatible")" "$(m3_dt_words "$d/status")"
+  done < <(find -H "$DT" -type d -print0 2>/dev/null | LC_ALL=C sort -z)
+}
+
+# Which devices got a driver and which didn't, the enabled SoC nodes no device was made for, the
+# probes still deferred, the power domains and the loaded modules.
+m3_report_drivers() {
+  local dev bus drv node dt d c s tsv=$M3_WORK/devices.tsv
+  dt=$(readlink -f "$DT")
+  for dev in "$M3_SYSFS"/bus/*/devices/*; do
+    [[ -e $dev/of_node ]] || continue
+    bus=${dev#"$M3_SYSFS"/bus/}
+    bus=${bus%%/*}
+    drv=-
+    if [[ -e $dev/driver ]]; then drv=$(basename "$(readlink -f "$dev/driver")"); fi
+    node=$(readlink -f "$dev/of_node")
+    node=${node#"$dt"}
+    printf '%s\t%s\t%s\t/%s\n' "$bus" "${dev##*/}" "$drv" "${node#/}"
+  done | LC_ALL=C sort >"$tsv"
+  echo "== devices with a device-tree node and a driver: bus, device, driver, node"
+  awk -F'\t' '$3 != "-"' "$tsv"
+  echo "== devices with a device-tree node and no driver: bus, device, node"
+  awk -F'\t' '$3 == "-" { print $1 "\t" $2 "\t" $4 }' "$tsv"
+  echo "== enabled SoC nodes with a compatible and no device"
+  for d in "$DT"/soc/*/; do
+    d=${d%/}
+    [[ -f $d/compatible ]] || continue
+    s=$(m3_dt_words "$d/status")
+    [[ $s == - || $s == okay || $s == ok ]] || continue
+    c=/${d#"$DT"/}
+    awk -F'\t' -v n="$c" '$4 == n { found = 1 } END { exit !found }' "$tsv" ||
+      printf '%s\tcompatible=%s\n' "$c" "$(m3_dt_words "$d/compatible")"
+  done
+  echo "== deferred probes ($M3_DEBUGFS/devices_deferred)"
+  $sudo cat "$M3_DEBUGFS/devices_deferred" 2>/dev/null || echo "(not readable)"
+  echo "== power domains ($M3_DEBUGFS/pm_genpd/pm_genpd_summary)"
+  $sudo cat "$M3_DEBUGFS/pm_genpd/pm_genpd_summary" 2>/dev/null || echo "(not readable)"
+  echo "== loaded modules ($M3_PROCFS/modules)"
+  cat "$M3_PROCFS/modules" 2>/dev/null || echo "(not readable)"
+}
+
+# Kernel log lines without the ones naming a serial number, and MAC addresses masked.
+m3_report_scrub() {
+  { LC_ALL=C grep -aviE 'serialnumber|serial number|serial-number|serial_number' || true; } |
+    LC_ALL=C sed -E 's/([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}/xx:xx:xx:xx:xx:xx/g'
+}
+
+# This boot's whole kernel log into OUT: from the journal when it has the start of the boot
+# (as this user, then through sudo), else the kernel's buffer (DMESG, read already). Prints the
+# source: journal or dmesg.
+m3_report_klog() { # DMESG OUT
+  local j=$M3_WORK/journal.raw
+  journalctl -k -b 0 -o short-monotonic --no-pager >"$j" 2>/dev/null || true
+  if ! LC_ALL=C grep -qaE 'Linux version|Kernel command line:' "$j" && [[ -n $sudo ]]; then
+    $sudo journalctl -k -b 0 -o short-monotonic --no-pager >"$j" 2>/dev/null || true
+  fi
+  if LC_ALL=C grep -qaE 'Linux version|Kernel command line:' "$j"; then
+    m3_report_scrub <"$j" >"$2"
+    echo journal
+  else
+    m3_report_scrub <"$1" >"$2"
+    echo dmesg
+  fi
+}
+
+# The CPUs: each one's capacity, cluster and core ID, the cpufreq policies, cpuidle, cpuinfo.
+m3_report_cpus() {
+  local c p f
+  echo "== CPUs: cpu, online, capacity, cluster, package, core, cluster CPUs, MIDR"
+  for c in "$M3_SYSFS"/devices/system/cpu/cpu[0-9]*; do
+    printf '%s online=%s capacity=%s cluster=%s package=%s core=%s cluster_cpus=%s midr=%s\n' "${c##*/}" \
+      "$(m3_attr "$c/online")" "$(m3_attr "$c/cpu_capacity")" "$(m3_attr "$c/topology/cluster_id")" \
+      "$(m3_attr "$c/topology/physical_package_id")" "$(m3_attr "$c/topology/core_id")" \
+      "$(m3_attr "$c/topology/cluster_cpus_list")" "$(m3_attr "$c/regs/identification/midr_el1")"
+  done | sort -V
+  echo "== cpufreq policies"
+  for p in "$M3_SYSFS"/devices/system/cpu/cpufreq/policy*; do
+    [[ -d $p ]] || continue
+    echo "${p##*/}:"
+    for f in affected_cpus related_cpus scaling_driver scaling_governor cpuinfo_min_freq cpuinfo_max_freq \
+      cpuinfo_transition_latency scaling_min_freq scaling_max_freq scaling_cur_freq \
+      scaling_available_frequencies scaling_available_governors; do
+      [[ -e $p/$f ]] && echo "  $f: $(m3_attr "$p/$f")"
+    done
+  done
+  echo "== cpuidle: driver $(m3_attr "$M3_SYSFS/devices/system/cpu/cpuidle/current_driver"), governor $(m3_attr "$M3_SYSFS/devices/system/cpu/cpuidle/current_governor")"
+  for f in "$M3_SYSFS"/devices/system/cpu/cpu0/cpuidle/state*; do
+    [[ -d $f ]] && echo "cpu0 ${f##*/}: $(m3_attr "$f/name") latency $(m3_attr "$f/latency") us, residency $(m3_attr "$f/residency") us, disabled $(m3_attr "$f/disable")"
+  done
+  echo "== $M3_PROCFS/cpuinfo"
+  cat "$M3_PROCFS/cpuinfo" 2>/dev/null || echo "(not readable)"
+}
+
+# Every readable attribute of a sysfs directory (one level), but its uevent, as "  name: value".
+m3_report_attrs() {
+  local f
+  for f in "$1"/*; do
+    [[ -f $f && ${f##*/} != uevent ]] && echo "  ${f##*/}: $(m3_attr "$f")"
+  done
+  return 0
+}
+
+# A sysfs device's driver, or "-".
+m3_report_driver_of() {
+  if [[ -e $1/driver ]]; then basename "$(readlink -f "$1/driver")"; else echo -; fi
+}
+
+# PCI and USB.
+m3_report_buses() {
+  echo "== lspci -nnk"
+  lspci -nnk 2>&1 || echo "(lspci not installed)"
+  echo "== lsusb"
+  lsusb 2>&1 || echo "(lsusb not installed)"
+  echo "== lsusb -t"
+  lsusb -t 2>&1 || echo "(lsusb not installed)"
+}
+
+# USB-C ports, partners, cables and alternate modes (not a partner's identity).
+m3_report_typec() {
+  local d
+  for d in "$M3_SYSFS"/class/typec/* "$M3_SYSFS"/class/typec/*/*.[0-9]*; do
+    [[ -d $d ]] || continue
+    echo "== ${d#"$M3_SYSFS"/class/typec/}"
+    m3_report_attrs "$d"
+  done
+  for d in "$M3_SYSFS"/class/usb_power_delivery/*; do
+    [[ -d $d ]] && echo "== usb_power_delivery ${d##*/}"
+  done
+  return 0
+}
+
+# DRM cards and connectors with their modes, and the backlight (never a display's EDID).
+m3_report_display() {
+  local c
+  echo "== /dev/dri"
+  ls -l "$M3_DEVFS/dri" 2>&1 || true
+  for c in "$M3_SYSFS"/class/drm/card*; do
+    [[ -d $c ]] || continue
+    if [[ ${c##*/} == card+([0-9]) ]]; then
+      echo "== ${c##*/}: driver $(m3_report_driver_of "$c/device")"
+    else
+      echo "== ${c##*/}: status $(m3_attr "$c/status"), enabled $(m3_attr "$c/enabled"), dpms $(m3_attr "$c/dpms")"
+      [[ -r $c/modes ]] && echo "  modes: $(tr '\n' ' ' <"$c/modes" 2>/dev/null)"
+    fi
+  done
+  for c in "$M3_SYSFS"/class/backlight/*; do
+    [[ -d $c ]] || continue
+    echo "== backlight ${c##*/}: driver $(m3_report_driver_of "$c/device")"
+    m3_report_attrs "$c"
+  done
+  return 0
+}
+
+# Power supplies (without their serial numbers), thermal zones, cooling devices and hwmon.
+m3_report_power() {
+  local d f
+  for d in "$M3_SYSFS"/class/power_supply/*; do
+    [[ -d $d ]] || continue
+    echo "== power_supply ${d##*/}"
+    { grep -viE 'serial' "$d/uevent" 2>/dev/null || true; } | sed 's/^/  /'
+  done
+  for d in "$M3_SYSFS"/class/thermal/thermal_zone*; do
+    [[ -d $d ]] || continue
+    echo "== ${d##*/}: type $(m3_attr "$d/type"), temp $(m3_attr "$d/temp"), mode $(m3_attr "$d/mode"), policy $(m3_attr "$d/policy")"
+    for f in "$d"/trip_point_*_type; do
+      [[ -e $f ]] && echo "  ${f##*/}: $(m3_attr "$f") at $(m3_attr "${f%_type}_temp")"
+    done
+  done
+  for d in "$M3_SYSFS"/class/thermal/cooling_device*; do
+    [[ -d $d ]] && echo "== ${d##*/}: type $(m3_attr "$d/type"), state $(m3_attr "$d/cur_state") of $(m3_attr "$d/max_state")"
+  done
+  for d in "$M3_SYSFS"/class/hwmon/hwmon*; do
+    [[ -d $d ]] || continue
+    echo "== ${d##*/}: $(m3_attr "$d/name"), driver $(m3_report_driver_of "$d/device")"
+    for f in "$d"/*_input; do
+      [[ -e $f ]] || continue
+      f=${f##*/}
+      echo "  ${f%_input}: $(m3_attr "$d/${f%_input}_label") = $(m3_attr "$d/$f")"
+    done
+  done
+  return 0
+}
+
+# Sound cards and input devices (a device's unique ID masked).
+m3_report_sound_input() {
+  echo "== $M3_PROCFS/asound/cards"
+  cat "$M3_PROCFS/asound/cards" 2>/dev/null || echo "(none)"
+  echo "== $M3_PROCFS/asound/pcm"
+  cat "$M3_PROCFS/asound/pcm" 2>/dev/null || echo "(none)"
+  echo "== $M3_PROCFS/bus/input/devices"
+  sed -E 's/^(U: Uniq=).+/\1(masked)/' "$M3_PROCFS/bus/input/devices" 2>/dev/null || echo "(not readable)"
+}
+
+# Network interfaces and their drivers (never an address), Bluetooth controllers and rfkill.
+m3_report_network() {
+  local d
+  for d in "$M3_SYSFS"/class/net/*; do
+    [[ -e $d ]] || continue
+    echo "${d##*/}: driver $(m3_report_driver_of "$d/device"), type $(m3_attr "$d/type"), operstate $(m3_attr "$d/operstate"), mtu $(m3_attr "$d/mtu")"
+  done
+  for d in "$M3_SYSFS"/class/bluetooth/*; do
+    [[ -e $d ]] && echo "${d##*/}: driver $(m3_report_driver_of "$d/device")"
+  done
+  for d in "$M3_SYSFS"/class/rfkill/rfkill*; do
+    [[ -e $d ]] && echo "${d##*/}: $(m3_attr "$d/name") $(m3_attr "$d/type") soft $(m3_attr "$d/soft") hard $(m3_attr "$d/hard")"
+  done
+  return 0
+}
+
+# The SMC's key list in debugfs (macsmc-hwmon), or nothing.
+m3_smc_keys_file() {
+  $sudo find "$M3_DEBUGFS" -maxdepth 3 -name keys -path '*smc*' 2>/dev/null | head -1 || true
+}
+
+# Why there is no SMC key list, in one line. This kernel's SMC driver makes the list on the M3s
+# it knows, and t6034 is not one of them yet.
+m3_smc_missing() {
+  if [[ $(this_soc) == t6034 ]]; then
+    echo "no SMC key list on this kernel (t6034 not yet supported)"
+  else
+    echo "no SMC key list on this kernel (no $M3_DEBUGFS/*smc*/keys: debugfs is not mounted, or the SMC driver did not start)"
+  fi
+}
+
+# The SMC's key list: its header line and every T* (temperature, mC) and P* (power, mW) key.
+m3_report_smc() {
+  local kf
+  kf=$(m3_smc_keys_file)
+  if [[ -n $kf ]]; then
+    # shellcheck disable=SC2016 # awk's fields
+    $sudo awk 'NR == 1 || $2 ~ /^[TP]/' "$kf" 2>/dev/null || echo "(could not read $kf)"
+  else
+    m3_smc_missing
+  fi
+}
+
+# The physical memory map: only the System RAM and reserved ranges. The addresses need root.
+m3_report_iomem() {
+  echo "# $M3_PROCFS/iomem, System RAM and reserved ranges only$([[ $EUID != 0 && -z $sudo ]] && echo " (not root: the kernel shows every address as 0)")"
+  $sudo grep -E ': (System RAM|reserved)$' "$M3_PROCFS/iomem" 2>/dev/null || echo "(none, or not readable)"
+}
+
+# What the report holds, for whoever opens it.
+m3_report_readme() {
+  cat <<EOF
+aurora-sep --m3-report ($TAG), $(date -u +%Y-%m-%dT%H:%M:%SZ)
+Read-only. The host name is replaced by "host", user names by "user", serial numbers by
+SERIAL and MAC addresses by xx:xx:xx:xx:xx:xx; kernel log lines naming a USB serial are left out.
+  system.txt        who this Mac is, its boot loader, kernel, command line and packages
+  dt-nodes.txt      every device-tree node: path, compatible, status
+  drivers.txt       devices with and without a driver, deferred probes, power domains, modules
+  kernel-log.txt    this boot's whole kernel log
+  dmesg-m3.txt      the kernel log lines of the M3 bring-up
+  smc-keys.txt      the SMC's temperature (T*, mC) and power (P*, mW) keys
+  cpu.txt           CPU topology, cpufreq policies, cpuidle, cpuinfo
+  buses.txt         lspci -nnk, lsusb, lsusb -t
+  typec.txt         USB-C ports, partners and alternate modes
+  display.txt       DRM connectors and modes, backlight
+  power.txt         power supplies, thermal zones, cooling devices, hwmon
+  sound-input.txt   sound cards and input devices
+  network.txt       network interfaces and their drivers, Bluetooth, rfkill
+  reserved-memory.txt  the reserved-memory nodes (name, compatible, label, reg, status), and
+                    whether the boot loader's adt and m1n1_stage2.log nodes are there
+  boot-dt.txt       which device tree this Mac boots: model, compatible, the /chosen asahi,*
+                    entries, the stub's version, the device trees in boot.bin
+  adt-allowlist.txt the ADT reader's allowlist of the boot loader's ADT (on an M3), or why
+                    there is none
+  adt-check.txt     the ADT read's steps, and the MTD devices and phram's state before and after
+  interrupts.txt    $M3_PROCFS/interrupts
+  iomem.txt         $M3_PROCFS/iomem, its System RAM and reserved ranges only
+  usb-display.txt   USB tree, USB-C roles and DRM connector states (as in earlier reports)
+  chosen/           the boot loader's /chosen entries for the M3 chips
+EOF
+}
+
 m3_report() {
-  local dir out board soc f
+  local dir out board soc f s src
   board=$(this_board) soc=$(this_soc)
+  [[ -w $PWD ]] || die "can't write to $PWD. Change to a directory you can write to (cd ~) and run this
+    again. Nothing was written."
   out=$PWD/aurora-m3-report-${board:-mac}-$(date +%Y%m%d-%H%M%S).tgz
-  dir=$(mktemp -d)
+  M3_WORK=$(mktemp -d)
+  trap 'm3_report_cleanup' EXIT
+  trap 'm3_report_cleanup; warn "interrupted: nothing was written"; exit 130' INT TERM HUP
+  dir=$M3_WORK/report
+  mkdir "$dir"
+  # What must not leave this Mac, gathered first (m3_privacy_mask, m3_privacy_check).
+  m3_privacy_secrets >"$M3_WORK/secrets"
   {
     echo "board: ${board:-?} soc: ${soc:-?}"
     echo "kernel: $(uname -r)"
@@ -3019,32 +3705,678 @@ m3_report() {
     echo "m1n1.conf switches:"; grep '^chosen\.' "$M1N1_CONF" 2>/dev/null || echo -
     printf 'm1n1-oslog-overlap: '; if [[ -e $DT/$M3_OSLOG_OVERLAP ]]; then echo present; else echo absent; fi
     echo "reserved display logs:"; ls -d "$DT"/reserved-memory/dcp-oslog@* 2>/dev/null || echo -
+    ( set +e +o pipefail; m3_report_identity )
   } >"$dir/system.txt"
-  { dmesg 2>/dev/null || $sudo dmesg; } | grep -iE "$M3_REPORT_DMESG" | grep -viE 'serialnumber|serial number' |
+  { dmesg 2>/dev/null || $sudo dmesg; } >"$M3_WORK/dmesg.raw" 2>/dev/null || true
+  grep -iE "$M3_REPORT_DMESG" "$M3_WORK/dmesg.raw" | grep -viE 'serialnumber|serial number' |
     sed -E 's/([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}/xx:xx:xx:xx:xx:xx/g' >"$dir/dmesg-m3.txt" || true
+  src=$(m3_report_klog "$M3_WORK/dmesg.raw" "$dir/kernel-log.txt")
   mkdir -p "$dir/chosen"
-  for f in "$DT"/chosen/asahi,t8122-* "$DT"/chosen/asahi,t6030-* "$DT/$M3_OSLOG_OVERLAP"; do
-    [[ -e $f ]] && cp -r "$f" "$dir/chosen/"
+  for s in $M3_CHOSEN_SOCS; do
+    for f in "$DT"/chosen/asahi,"$s"-*; do
+      [[ -e $f ]] && cp -r "$f" "$dir/chosen/"
+    done
   done
+  if [[ -e $DT/$M3_OSLOG_OVERLAP ]]; then cp -r "$DT/$M3_OSLOG_OVERLAP" "$dir/chosen/"; fi
   {
     echo "== lsusb -t"; lsusb -t 2>/dev/null || echo "(lsusb not installed)"
     echo "== /sys/class/typec"
-    for f in /sys/class/typec/port*; do
+    for f in "$M3_SYSFS"/class/typec/port*; do
       [[ -d $f ]] || continue
       echo "$(basename "$f"): data_role=$(cat "$f/data_role" 2>/dev/null) power_role=$(cat "$f/power_role" 2>/dev/null)"
     done
-    echo "== /dev/dri"; ls -l /dev/dri 2>/dev/null || true
+    echo "== /dev/dri"; ls -l "$M3_DEVFS/dri" 2>/dev/null || true
     echo "== drm connectors"
-    for f in /sys/class/drm/card*-*/status; do [[ -e $f ]] && echo "$f: $(cat "$f")"; done
+    for f in "$M3_SYSFS"/class/drm/card*-*/status; do [[ -e $f ]] && echo "$f: $(cat "$f")"; done
   } >"$dir/usb-display.txt" 2>&1
-  tar czf "$out" -C "$dir" . && rm -rf "$dir"
+  # Each part reads on through anything it can't read; none of them writes.
+  ( set +e +o pipefail; m3_report_dt_nodes ) >"$dir/dt-nodes.txt" 2>&1
+  ( set +e +o pipefail; m3_report_drivers ) >"$dir/drivers.txt" 2>&1
+  ( set +e +o pipefail; m3_report_smc ) >"$dir/smc-keys.txt" 2>&1
+  ( set +e +o pipefail; m3_report_cpus ) >"$dir/cpu.txt" 2>&1
+  ( set +e +o pipefail; m3_report_buses ) >"$dir/buses.txt" 2>&1
+  ( set +e +o pipefail; m3_report_typec ) >"$dir/typec.txt" 2>&1
+  ( set +e +o pipefail; m3_report_display ) >"$dir/display.txt" 2>&1
+  ( set +e +o pipefail; m3_report_power ) >"$dir/power.txt" 2>&1
+  ( set +e +o pipefail; m3_report_sound_input ) >"$dir/sound-input.txt" 2>&1
+  ( set +e +o pipefail; m3_report_network ) >"$dir/network.txt" 2>&1
+  ( set +e +o pipefail; m3_report_reserved ) >"$dir/reserved-memory.txt" 2>&1
+  ( set +e +o pipefail; m3_report_boot_dt ) >"$dir/boot-dt.txt" 2>&1
+  # In this shell, not a subshell: the traps must see whether it loaded phram.
+  m3_report_adt "$dir"
+  cat "$M3_PROCFS/interrupts" >"$dir/interrupts.txt" 2>&1 || true
+  ( set +e +o pipefail; m3_report_iomem ) >"$dir/iomem.txt" 2>&1
+  m3_report_readme >"$dir/README.txt"
+  if [[ $src == journal ]]; then
+    m3_privacy_pack "$dir" "$out" "$M3_WORK/secrets" "$dir/kernel-log.txt" || die "the report was not kept (see above). Nothing was written.
+    Please tell us at https://github.com/iconidentify/aurora-linux/issues what this printed, without any file."
+  else
+    m3_privacy_pack "$dir" "$out" "$M3_WORK/secrets" || die "the report was not kept (see above). Nothing was written.
+    Please tell us at https://github.com/iconidentify/aurora-linux/issues what this printed, without any file."
+  fi
   m3_oslog_overlap_check
+  [[ -n $(m3_smc_keys_file) ]] || warn "$(m3_smc_missing): the report has no SMC keys."
   say "Report written to $out
-    Attach it to your issue at https://github.com/iconidentify/aurora-linux/issues, together
-    with the serial log if you recorded one. It has no full kernel log, no USB serial numbers
-    and no MAC addresses."
+    It only read this Mac. The host name, user names, serial numbers and MAC addresses in it
+    are masked, and the file was checked for them before it was kept.
+    Attach it to an issue at https://github.com/iconidentify/aurora-linux/issues (drag the file
+    into the comment box), together with the serial log if you recorded one."
 }
 
+# ---- privacy: what a report or survey file must not carry --------------------------------------
+# This Mac's host names, as air-gpu-collect.sh finds them: this boot's, the static and transient
+# ones and the FQDN, each with its short form. Generic names and names under 3 characters are
+# left alone.
+m3_privacy_hosts() {
+  local n
+  {
+    uname -n 2>/dev/null
+    cat "$M3_ETC/hostname" 2>/dev/null
+    timeout 5 hostnamectl hostname 2>/dev/null
+    timeout 5 hostnamectl --static 2>/dev/null
+    timeout 5 hostname -f 2>/dev/null
+  } | tr -d '[:blank:]\r' | while IFS= read -r n; do
+    [[ -n $n ]] || continue
+    echo "$n"
+    echo "${n%%.*}"
+  done | grep -E '^[A-Za-z0-9][A-Za-z0-9.-]{2,}$' |
+    grep -vixE 'localhost|localhost\.localdomain|archlinux|omarchy|localdomain|host|user' || true
+}
+
+# The user names: whoever runs this, the sudo caller, and every regular account (uid 1000 to
+# 59999). Root, one-character names and the mask words are left alone (a home directory is
+# masked whatever its name).
+m3_privacy_users() {
+  {
+    printf '%s\n' "${USER:-}" "${LOGNAME:-}" "${SUDO_USER:-}"
+    id -un 2>/dev/null
+    getent passwd 2>/dev/null | awk -F: '$3 >= 1000 && $3 < 60000 { print $1 }'
+  } | grep -E '^[A-Za-z0-9._-]{2,}$' | grep -vixE 'root|nobody|host|user' || true
+}
+
+# This Mac's serial numbers, as the device tree (m1n1's root and SMBIOS entries), the firmware
+# tables, USB devices, the battery and the SSD give them. Six characters or more.
+m3_privacy_serials() {
+  local f
+  {
+    while IFS= read -r -d '' f; do
+      [[ ${f#"$DT"} == /aliases/* ]] && continue
+      tr -d '\0' <"$f" 2>/dev/null
+      echo
+    done < <(find -H "$DT" -type f \( -name serial-number -o -name serial -o -name '*-serial-number' \
+      -o -name '*serial_number' \) -print0 2>/dev/null)
+    for f in "$M3_SYSFS"/class/dmi/id/product_serial "$M3_SYSFS"/class/dmi/id/board_serial \
+      "$M3_SYSFS"/class/dmi/id/chassis_serial; do
+      if [[ -e $f ]]; then $sudo cat "$f" 2>/dev/null; echo; fi
+    done
+    for f in "$M3_SYSFS"/bus/usb/devices/*/serial; do
+      # A root hub's "serial" is its controller's name.
+      [[ ${f%/serial} == */usb[0-9]* ]] || { cat "$f" 2>/dev/null; echo; }
+    done
+    for f in "$M3_SYSFS"/class/power_supply/*/serial_number "$M3_SYSFS"/class/nvme/*/serial; do
+      [[ -e $f ]] && { cat "$f" 2>/dev/null; echo; }
+    done
+  } | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -E '^[A-Za-z0-9._-]{6,}$' |
+    grep -vE '^[0.]+$' || true
+}
+
+# This Mac's MAC and Bluetooth addresses as 12 lowercase hex digits: from the device tree (as
+# the boot loader passes them, in both byte orders) and from every network interface.
+m3_privacy_macs() {
+  local f h
+  {
+    while IFS= read -r -d '' f; do
+      [[ $(stat -c %s "$f" 2>/dev/null) == 6 ]] || continue
+      h=$(od -An -tx1 -v "$f" 2>/dev/null | tr -d ' \n')
+      echo "$h"
+      echo "${h:10:2}${h:8:2}${h:6:2}${h:4:2}${h:2:2}${h:0:2}"
+    done < <(find -H "$DT" -type f \( -name local-mac-address -o -name mac-address -o -name local-bd-address \) \
+      -print0 2>/dev/null)
+    for f in "$M3_SYSFS"/class/net/*/address "$M3_SYSFS"/class/bluetooth/*/address; do
+      [[ -e $f ]] && tr -d ':\n' <"$f" 2>/dev/null && echo
+    done
+  } | tr 'A-F' 'a-f' | grep -xE '[0-9a-f]{12}' | grep -vxE '0{12}|f{12}' || true
+}
+
+# What m3_privacy_mask masks and m3_privacy_check looks for: "host NAME", "user NAME",
+# "serial VALUE" and "mac HEX12" lines, longest first within each kind, each once.
+m3_privacy_secrets() {
+  local kind
+  for kind in host user serial mac; do
+    "m3_privacy_${kind}s" 2>/dev/null | awk -v k="$kind" 'NF { print length($0), k, $0 }' |
+      sort -k1,1nr | awk '!seen[tolower($3)]++ { print $2, $3 }' || true
+  done
+}
+
+# The sed script m3_privacy_mask runs over a text file (MODE text) or a binary one (MODE bin): a
+# binary file keeps its length, with x in place of every masked byte. A name is masked where it
+# stands alone (not inside a longer word); a MAC address wherever it has the shape of one.
+m3_privacy_sed() { # SECRETS MODE
+  local kind value re rep n=0
+  while read -r kind value; do
+    [[ -n $value ]] || continue
+    n=$((n + 1))
+    re=${value//./\\.}
+    case $kind in
+      host) rep=host ;;
+      user) rep=user ;;
+      serial) rep=SERIAL ;;
+      mac) rep=xxxxxxxxxxxx ;;
+      *) continue ;;
+    esac
+    [[ $2 == text ]] || rep=$(printf '%*s' "${#value}" '' | tr ' ' x)
+    if [[ $kind == mac ]]; then
+      printf ':m%d\ns/(^|[^[:xdigit:]])%s([^[:xdigit:]]|$)/\\1%s\\2/I\ntm%d\n' "$n" "$re" "$rep" "$n"
+    else
+      printf ':m%d\ns/(^|[^[:alnum:]])%s([^[:alnum:]]|$)/\\1%s\\2/I\ntm%d\n' "$n" "$re" "$rep" "$n"
+    fi
+  done <"$1"
+  echo 's/([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}/xx:xx:xx:xx:xx:xx/g'
+  if [[ $2 == text ]]; then
+    printf '%s\n' 's/(serial[ _-]?(number|num|no)\b[^[:alnum:]]{0,4})[[:alnum:]][[:alnum:]._-]{3,}/\1SERIAL/gI' \
+      's#/home/[^/[:space:]]+/#/home/USER/#g' 's/Hostname set to <[^>]*>/Hostname set to <host>/g'
+  fi
+}
+
+# Masks every file under DIR in place (see m3_privacy_sed). Each JOURNAL file is a kernel log in
+# the journal's format, whose host column is masked on every line.
+m3_privacy_mask() { # DIR SECRETS [JOURNAL...]
+  local dir=$1 secrets=$2 f
+  shift 2
+  m3_privacy_sed "$secrets" text >"$secrets.text.sed" || return 1
+  m3_privacy_sed "$secrets" bin >"$secrets.bin.sed" || return 1
+  for f in "$@"; do
+    [[ -f $f ]] || continue
+    LC_ALL=C sed -i -E 's/^(\[ *[0-9.]+\]) [^ ]+ /\1 host /' -- "$f" || return 1
+  done
+  while IFS= read -r -d '' f; do
+    if LC_ALL=C grep -qI . "$f"; then
+      LC_ALL=C sed -i -E -f "$secrets.text.sed" -- "$f" || return 1
+    else
+      LC_ALL=C sed -i -E -f "$secrets.bin.sed" -- "$f" || return 1
+    fi
+  done < <(find "$dir" -type f -print0)
+}
+
+# Looks for what m3_privacy_mask masks in the finished tgz: in every file it holds, in the file
+# list (only the files packed) and in the owner fields (numeric, 0). Prints one line per finding,
+# naming the kind and the file, never the value. Returns 1 when anything is found.
+m3_privacy_check() { # TGZ SECRETS LIST
+  local tgz=$1 secrets=$2 list=$3 x kind value what f found=0
+  x=$(mktemp -d)
+  if ! tar -tzf "$tgz" >"$x/names" 2>/dev/null || ! tar --numeric-owner -tvzf "$tgz" >"$x/long" 2>/dev/null ||
+    ! mkdir "$x/files" || ! tar -xzf "$tgz" -C "$x/files" 2>/dev/null; then
+    echo "the file could not be read back"
+    rm -rf "$x"
+    return 1
+  fi
+  sed 's#^\./##' "$x/names" | grep -v '/$' | grep -vx '\.\?' | LC_ALL=C sort | cmp -s - "$list" ||
+    { echo "the file list differs from what was collected"; found=1; }
+  awk '$2 != "0/0" { bad = 1 } END { exit !bad }' "$x/long" && { echo "the file names an owner"; found=1; }
+  for kind in host user serial mac; do
+    while read -r what value; do
+      [[ $what == "$kind" && -n $value ]] || continue
+      if [[ $kind == mac ]]; then
+        printf '(^|[^[:xdigit:]])%s([^[:xdigit:]]|$)\n' "$value"
+      else
+        printf '(^|[^[:alnum:]])%s([^[:alnum:]]|$)\n' "${value//./\\.}"
+      fi
+    done <"$secrets" >"$x/$kind.re"
+  done
+  while IFS= read -r -d '' f; do
+    for kind in host user serial mac; do
+      [[ -s $x/$kind.re ]] || continue
+      if LC_ALL=C grep -qaiE -f "$x/$kind.re" "$f"; then
+        case $kind in
+          host) what="the host name" ;;
+          user) what="a user name" ;;
+          serial) what="a serial number" ;;
+          mac) what="a MAC address" ;;
+        esac
+        echo "$what in ${f#"$x/files/"}"
+        found=1
+      fi
+    done
+    if LC_ALL=C grep -aoiE '([0-9a-f]{2}[:-]){5}[0-9a-f]{2}' "$f" | grep -q .; then
+      echo "a MAC address in ${f#"$x/files/"}"
+      found=1
+    fi
+    if LC_ALL=C grep -aoiE 'serial[ _-]?(number|num|no)\b[^[:alnum:]]{0,4}[[:alnum:]][[:alnum:]._-]{3,}' "$f" |
+      grep -vq 'SERIAL$'; then
+      echo "a serial number in ${f#"$x/files/"}"
+      found=1
+    fi
+  done < <(find "$x/files" -type f -print0)
+  rm -rf "$x"
+  return $((found))
+}
+
+# Masks DIR's files, packs them into a tgz in the work directory and checks it
+# (m3_privacy_check). Only a file that passed is copied to OUT (through OUT.partial, which the
+# traps remove); one that didn't is removed, and it returns 1.
+M3_PARTIAL=""
+m3_privacy_pack() { # DIR OUT SECRETS [JOURNAL...]
+  local dir=$1 out=$2 secrets=$3 list tgz problems
+  shift 3
+  list=$secrets.list tgz=$secrets.tgz
+  m3_privacy_mask "$dir" "$secrets" "$@" || { warn "could not mask the collected files"; return 1; }
+  (cd "$dir" && find . -type f -printf '%P\n') | LC_ALL=C sort >"$list"
+  if ! tar --owner=0 --group=0 --numeric-owner -czf "$tgz" -C "$dir" .; then
+    warn "could not pack the collected files"
+    return 1
+  fi
+  if ! problems=$(m3_privacy_check "$tgz" "$secrets" "$list"); then
+    rm -f "$tgz"
+    warn "the privacy check found what should have been masked, so the file was removed:
+    ${problems//$'\n'/$'\n'    }"
+    return 1
+  fi
+  M3_PARTIAL=$out.partial
+  if ! { cp "$tgz" "$M3_PARTIAL" && mv -f "$M3_PARTIAL" "$out"; }; then
+    rm -f "$M3_PARTIAL"
+    M3_PARTIAL=""
+    warn "could not write $out (run this from a directory you can write to, such as your home)"
+    return 1
+  fi
+  M3_PARTIAL=""
+}
+
+# ---- the M3 power survey (--m3-power-survey) ---------------------------------------------------
+# Opt-in, on any M3: which SMC temperature (T*) and power (P*) keys follow the CPU clusters and
+# the display. It samples every T* and P* key about once a second while it runs short, fixed
+# loads, each after a rest: idle, all CPUs busy, P-cores only, E-cores only, and, when the Mac has
+# a backlight, the backlight at maximum and at minimum. The load is plain busy loops, one pinned
+# to each CPU. The traps stop them and put the backlight back on any exit, Ctrl-C included, and
+# each loop ends on its own (timeout) shortly after its phase anyway. It stops early when a CPU or
+# SoC die temperature key reads M3_SURVEY_LIMIT_MC or more. One masked tgz in the current
+# directory. It is the M3 Air survey of issue #35 (air-smc-rails.sh), for every M3.
+M3_SURVEY_PHASE_S=30   # seconds of each phase
+M3_SURVEY_REST_S=10    # seconds at rest before each phase, so it starts from the floor
+M3_SURVEY_WAIT_S=10    # seconds to press Ctrl-C after the plan is printed
+M3_SURVEY_TICK=1       # the length of a second (tests shorten it)
+M3_SURVEY_GAP=0.2      # pause between two reads of the key list; a read takes about a second
+# The CPU and SoC die temperature keys: Tp* and Te*, the P- and E-cluster dies (as this kernel's
+# T8140 hwmon node labels them); Tf*, the M3 family's CPU and GPU die keys (macsmc-hwmon's J516S
+# list); Tg*, the GPU. A reading outside -40..150 C is not taken as a temperature, as
+# macsmc-hwmon's SoC die zone does not.
+M3_SURVEY_DIE_KEYS='^T[pefg]'
+M3_SURVEY_LIMIT_MC=100000
+M3_SURVEY_MIN_MC=-40000
+M3_SURVEY_MAX_MC=150000
+# The run's state, for the traps.
+M3_SURVEY_PIDS=()
+M3_SURVEY_P=()
+M3_SURVEY_E=()
+M3_SURVEY_SAMPLER=""
+M3_SURVEY_BL=""
+M3_SURVEY_BL_START=""
+M3_SURVEY_SEEN=0
+M3_SURVEY_HOT=""
+M3_SURVEY_STOP=""
+
+# The CPUs split by capacity, as the Air survey split them: those with the highest cpu_capacity
+# are the P-cores (M3_SURVEY_P), the others the E-cores (M3_SURVEY_E). Offline CPUs are left out.
+m3_survey_cpus() {
+  local c n cap max=0
+  local -a cpus=()
+  M3_SURVEY_P=() M3_SURVEY_E=()
+  for c in "$M3_SYSFS"/devices/system/cpu/cpu[0-9]*; do
+    [[ -d $c && $(m3_attr "$c/online") != 0 ]] || continue
+    cpus+=("${c##*/cpu}")
+    cap=$(m3_attr "$c/cpu_capacity")
+    if [[ $cap =~ ^[0-9]+$ ]] && ((cap > max)); then max=$cap; fi
+  done
+  while read -r n; do
+    [[ -n $n ]] || continue
+    cap=$(m3_attr "$M3_SYSFS/devices/system/cpu/cpu$n/cpu_capacity")
+    # A CPU without a capacity counts as a P-core, as in the Air survey.
+    if [[ ! $cap =~ ^[0-9]+$ ]] || ((cap == max)); then M3_SURVEY_P+=("$n"); else M3_SURVEY_E+=("$n"); fi
+  done < <(printf '%s\n' ${cpus[@]+"${cpus[@]}"} | sort -n)
+}
+
+# The panel's backlight: of the backlight devices, the one with the largest range; or nothing.
+m3_survey_backlight() {
+  local b m best="" bm=-1
+  for b in "$M3_SYSFS"/class/backlight/*; do
+    m=$(m3_attr "$b/max_brightness")
+    [[ $m =~ ^[0-9]+$ ]] || continue
+    if ((m > bm)); then best=$b bm=$m; fi
+  done
+  echo "$best"
+}
+
+m3_survey_bl_set() { echo "$1" | $sudo tee "$M3_SURVEY_BL/brightness" >/dev/null; }
+
+# One busy loop pinned to each CPU given, each ending on its own shortly after a phase.
+m3_survey_load() {
+  local n max
+  max=$(awk -v s="$M3_SURVEY_PHASE_S" -v t="$M3_SURVEY_TICK" 'BEGIN { printf "%d", s * t + 15 }')
+  for n in "$@"; do
+    timeout "$max" taskset -c "$n" sh -c 'while :; do :; done' &
+    M3_SURVEY_PIDS+=("$!")
+  done
+}
+
+m3_survey_stop_load() {
+  if ((${#M3_SURVEY_PIDS[@]})); then
+    kill "${M3_SURVEY_PIDS[@]}" 2>/dev/null || true
+    wait "${M3_SURVEY_PIDS[@]}" 2>/dev/null || true
+  fi
+  M3_SURVEY_PIDS=()
+}
+
+# The thermal zones to sample, as "path tz:<type>" lines.
+m3_survey_zones() {
+  local z
+  for z in "$M3_SYSFS"/class/thermal/thermal_zone*; do
+    [[ -r $z/temp ]] && echo "$z tz:$(m3_attr "$z/type" | tr -c 'A-Za-z0-9_.\n-' _)"
+  done
+  return 0
+}
+
+# The sampler, as root: while $M3_WORK/run exists it reads the SMC key list (KEYS, when there is
+# one) and every thermal zone, back to back, and labels each read with the phase in
+# $M3_WORK/phase. samples.txt gets "time phase key value" lines; a thermal zone's key is
+# tz:<type>.
+m3_survey_sampler_start() { # KEYS SECONDS
+  : >"$M3_WORK/run"
+  echo start >"$M3_WORK/phase"
+  # shellcheck disable=SC2016 # expanded by that bash
+  $sudo timeout "$2" bash -c '
+    while [ -e "$2" ]; do
+      ts=$(date +%s.%N)
+      read -r ph <"$3" || ph=unknown
+      if [ -n "$1" ]; then
+        awk -v ts="$ts" -v ph="$ph" '\''$2 ~ /^[TP]/ && NF == 6 && $6 ~ /^-?[0-9]+$/ { print ts, ph, $2, $6 }'\'' "$1"
+      fi
+      while read -r z k; do
+        read -r v <"$z/temp" 2>/dev/null && echo "$ts $ph $k $v"
+      done <"$4"
+      sleep "$5"
+    done' _ "$1" "$M3_WORK/run" "$M3_WORK/phase" "$M3_WORK/zones" "$M3_SURVEY_GAP" >>"$M3_WORK/out/samples.txt" \
+    2>>"$M3_WORK/sampler.err" &
+  M3_SURVEY_SAMPLER=$!
+}
+
+m3_survey_sampler_stop() {
+  [[ -n $M3_WORK ]] && rm -f "$M3_WORK/run"
+  if [[ -n $M3_SURVEY_SAMPLER ]]; then
+    kill "$M3_SURVEY_SAMPLER" 2>/dev/null || true
+    wait "$M3_SURVEY_SAMPLER" 2>/dev/null || true
+  fi
+  M3_SURVEY_SAMPLER=""
+}
+
+# Everything a run started or changed, put back: on every exit, and before the tgz is made.
+m3_survey_restore() {
+  m3_survey_stop_load
+  m3_survey_sampler_stop
+  if [[ -n $M3_SURVEY_BL && -n $M3_SURVEY_BL_START ]]; then
+    m3_survey_bl_set "$M3_SURVEY_BL_START" 2>/dev/null || true
+    M3_SURVEY_BL_START=""
+  fi
+}
+
+m3_survey_cleanup() {
+  m3_survey_restore
+  if [[ -n $M3_PARTIAL ]]; then rm -f "$M3_PARTIAL"; fi
+  if [[ -n $M3_WORK ]]; then rm -rf "$M3_WORK"; fi
+  M3_WORK=""
+}
+
+# Sets M3_SURVEY_HOT to "<key> read <C> C" when a die key or a thermal zone read
+# M3_SURVEY_LIMIT_MC or more in a sample taken since the last call (complete lines only), else to
+# nothing.
+m3_survey_hot() {
+  local raw=$M3_WORK/out/samples.txt n
+  n=$(wc -l <"$raw")
+  M3_SURVEY_HOT=$(awk -v from="$M3_SURVEY_SEEN" -v to="$n" -v re="$M3_SURVEY_DIE_KEYS" \
+    -v lim="$M3_SURVEY_LIMIT_MC" -v hi="$M3_SURVEY_MAX_MC" '
+    NR > to { exit }
+    NR > from && ($3 ~ re || $3 ~ /^tz:/) && $4 ~ /^-?[0-9]+$/ && $4 + 0 >= lim && $4 + 0 <= hi {
+      printf "%s read %.1f C", $3, $4 / 1000; exit
+    }' "$raw")
+  M3_SURVEY_SEEN=$n
+}
+
+# One stretch of sampling under a phase NAME, for SECONDS. Returns 1 when a die key read too
+# hot: the load is stopped at once and M3_SURVEY_STOP says why.
+m3_survey_sample() { # NAME SECONDS
+  local i tmp=$M3_WORK/phase.new
+  echo "$1" >"$tmp" && mv -f "$tmp" "$M3_WORK/phase"
+  echo "$1 $(date +%s.%N) start" >>"$M3_WORK/out/phases.txt"
+  for ((i = 0; i < $2; i++)); do
+    sleep "$M3_SURVEY_TICK"
+    m3_survey_hot
+    if [[ -n $M3_SURVEY_HOT ]]; then
+      m3_survey_stop_load
+      M3_SURVEY_STOP="$M3_SURVEY_HOT during $1"
+      echo "$1 $(date +%s.%N) stopped: $M3_SURVEY_STOP" >>"$M3_WORK/out/phases.txt"
+      return 1
+    fi
+  done
+  echo "$1 $(date +%s.%N) end" >>"$M3_WORK/out/phases.txt"
+}
+
+# A rest, then the phase NAME: idle, a CPU load (on CPUS), or a backlight setting.
+m3_survey_phase() { # NAME [CPUS...]
+  local name=$1
+  shift
+  m3_survey_stop_load
+  m3_survey_sample "rest-before-$name" "$M3_SURVEY_REST_S" || return 1
+  case $name in
+    idle) ;;
+    backlight-max) m3_survey_bl_set "$(m3_attr "$M3_SURVEY_BL/max_brightness")" ;;
+    backlight-min) m3_survey_bl_set 1 ;;
+    *) m3_survey_load "$@" ;;
+  esac
+  m3_survey_sample "$name" "$M3_SURVEY_PHASE_S" || return 1
+  m3_survey_stop_load
+}
+
+# summary.txt: each key's mean per phase (T* in C, P* in W), the hottest die key per phase, and
+# how the run ended.
+m3_survey_summary() { # PHASES...
+  local out=$M3_WORK/out
+  printf '%-6s' "#key"
+  printf ' %13s' "$@"
+  printf '   (T* and tz:* in C, P* in W; mean per phase)\n'
+  awk -v order="$*" '
+    BEGIN { np = split(order, o, " ") }
+    $2 !~ /^rest-/ { s[$3, $2] += $4; n[$3, $2]++; keys[$3] = 1 }
+    END {
+      for (k in keys) {
+        line = sprintf("%-6s", k)
+        for (i = 1; i <= np; i++) line = line sprintf(" %13.2f", n[k, o[i]] ? s[k, o[i]] / n[k, o[i]] / 1000 : 0)
+        print line
+      }
+    }' "$out/samples.txt" | LC_ALL=C sort
+  echo
+  echo "hottest CPU or SoC die key (${M3_SURVEY_DIE_KEYS}) or thermal zone per phase, C:"
+  awk -v re="$M3_SURVEY_DIE_KEYS" -v lo="$M3_SURVEY_MIN_MC" -v hi="$M3_SURVEY_MAX_MC" '
+    ($3 ~ re || $3 ~ /^tz:/) && $4 + 0 >= lo && $4 + 0 <= hi && (!($2 in m) || $4 + 0 > m[$2]) { m[$2] = $4 + 0; k[$2] = $3 }
+    END { for (p in m) printf "  %-22s %7.1f (%s)\n", p, m[p] / 1000, k[p] }' "$out/samples.txt" | LC_ALL=C sort
+  echo
+  if [[ -n $M3_SURVEY_STOP ]]; then
+    echo "result: stopped early: $M3_SURVEY_STOP (limit $((M3_SURVEY_LIMIT_MC / 1000)) C); the later phases did not run"
+  else
+    echo "result: completed"
+  fi
+}
+
+m3_power_survey() {
+  local board soc keys out tool total n bl_name="" smc_note="" watch="" plan
+  local -a phases=()
+  board=$(this_board) soc=$(this_soc)
+  is_m3 || die "--m3-power-survey is for an M3 Mac (M3, M3 Pro or M3 Max), and this Mac is ${board:-?} (${soc:-?}).
+    Nothing was run."
+  for tool in taskset timeout; do
+    command -v "$tool" >/dev/null || die "--m3-power-survey needs $tool. Nothing was run."
+  done
+  if [[ -n $sudo ]]; then
+    $sudo true || die "--m3-power-survey needs root (sudo) to read the SMC keys. Nothing was run."
+  fi
+  [[ -w $PWD ]] || die "can't write to $PWD. Change to a directory you can write to (cd ~) and run this
+    again. Nothing was run."
+  m3_survey_cpus
+  ((${#M3_SURVEY_P[@]})) || die "found no CPUs in $M3_SYSFS/devices/system/cpu. Nothing was run."
+  out=$PWD/aurora-m3-power-${board:-mac}-$(date +%Y%m%d-%H%M%S).tgz
+  M3_WORK=$(mktemp -d)
+  mkdir "$M3_WORK/out"
+  trap 'm3_survey_cleanup' EXIT
+  trap 'm3_survey_cleanup; warn "interrupted: the load is stopped and anything changed is put back. Nothing was written."; exit 130' INT TERM HUP
+  keys=$(m3_smc_keys_file)
+  if [[ -n $keys ]]; then
+    # shellcheck disable=SC2016 # awk's fields
+    $sudo awk 'NR == 1 || $2 ~ /^[TP]/' "$keys" >"$M3_WORK/out/smc-keys.txt" 2>/dev/null || true
+  else
+    smc_note=$(m3_smc_missing)
+    echo "$smc_note" >"$M3_WORK/out/smc-keys.txt"
+    warn "$smc_note. The survey records the CPU topology and the thermal zones only."
+  fi
+  m3_survey_zones >"$M3_WORK/zones"
+  # A load runs only while a die temperature is watched: an SMC die key, or a thermal zone of the
+  # SoC or the CPUs.
+  n=$(awk -v re="$M3_SURVEY_DIE_KEYS" '$2 ~ re && NF == 6 && $6 ~ /^-?[0-9]+$/' "$M3_WORK/out/smc-keys.txt" | wc -l)
+  if ((n)); then watch="$n SMC die keys (Tp*, Te*, Tf*, Tg*)"; fi
+  n=$(awk '$2 ~ /^tz:.*(die|cpu|soc|hotspot)/' "$M3_WORK/zones" | wc -l)
+  if ((n)); then watch+="${watch:+ and }$n SoC thermal zones"; fi
+  M3_SURVEY_BL=$(m3_survey_backlight)
+  if [[ -z $watch ]]; then
+    phases=(idle)
+    plan="idle only: there is no CPU or SoC die temperature to watch on this kernel, so the load
+      and backlight phases are left out."
+  else
+    phases=(idle cpu-all cpu-p)
+    plan="idle;
+      all CPUs busy (${M3_SURVEY_P[*]} ${M3_SURVEY_E[*]});
+      the P-cores only (${M3_SURVEY_P[*]});"
+    if ((${#M3_SURVEY_E[@]})); then
+      phases+=(cpu-e)
+      plan+=$'\n'"      the E-cores only (${M3_SURVEY_E[*]});"
+    else
+      plan+=$'\n'"      (no E-cores found: that phase is left out);"
+    fi
+    if [[ -n $M3_SURVEY_BL ]]; then
+      phases+=(backlight-max backlight-min) bl_name=${M3_SURVEY_BL##*/}
+      plan+=$'\n'"      the backlight ($bl_name) at maximum, then at minimum, then back as it was."
+    else
+      plan+=$'\n'"      no backlight device, so the backlight phases are left out."
+    fi
+    plan+=$'\n'"    It stops early if a watched temperature ($watch, or any thermal zone)
+    reads $((M3_SURVEY_LIMIT_MC / 1000)) C."
+  fi
+  total=$(awk -v n="${#phases[@]}" -v p="$M3_SURVEY_PHASE_S" -v r="$M3_SURVEY_REST_S" -v t="$M3_SURVEY_TICK" \
+    'BEGIN { printf "%d", n * (p + r) * t }')
+  say "M3 power survey on this ${board:-Mac} (${soc:-?}): about $(((total + 59) / 60)) minutes.
+    It samples the SMC's temperature (T*) and power (P*) keys and the thermal zones about once a
+    second through short, fixed phases, each $M3_SURVEY_PHASE_S s after $M3_SURVEY_REST_S s at rest:
+      $plan
+    The load stops and the backlight goes back at the end, on an error and on Ctrl-C.
+    Nothing else changes. It writes one file in this directory: $out
+    Close other programs, keep the display on and the Mac on power."
+  say "Starting in $M3_SURVEY_WAIT_S seconds. Press Ctrl-C now to cancel."
+  sleep "$M3_SURVEY_WAIT_S"
+  m3_privacy_secrets >"$M3_WORK/secrets"
+  {
+    echo "board: ${board:-?} soc: ${soc:-?}"
+    echo "model: $(m3_dt_words "$DT/model")"
+    echo "uname: $(uname -srvm)"
+    echo "installer: $TAG"
+    echo "phases: ${phases[*]}; $M3_SURVEY_PHASE_S s each after $M3_SURVEY_REST_S s at rest (one second = $M3_SURVEY_TICK s)"
+    echo "watched: ${watch:-nothing (no load phases)}; stop at $M3_SURVEY_LIMIT_MC mC on a die key (${M3_SURVEY_DIE_KEYS}) or any thermal zone"
+    echo "smc: ${smc_note:-key list $keys}"
+  } >"$M3_WORK/out/system.txt"
+  {
+    echo "P-cores: ${M3_SURVEY_P[*]}"
+    echo "E-cores: ${M3_SURVEY_E[*]:-none}"
+    for n in "${M3_SURVEY_P[@]}" ${M3_SURVEY_E[@]+"${M3_SURVEY_E[@]}"}; do
+      echo "cpu$n capacity $(m3_attr "$M3_SYSFS/devices/system/cpu/cpu$n/cpu_capacity") cluster $(m3_attr "$M3_SYSFS/devices/system/cpu/cpu$n/topology/cluster_id")"
+    done
+    for n in "$M3_SYSFS"/devices/system/cpu/cpufreq/policy*; do
+      [[ -d $n ]] && echo "${n##*/}: cpus $(m3_attr "$n/related_cpus"), $(m3_attr "$n/cpuinfo_min_freq")-$(m3_attr "$n/cpuinfo_max_freq") kHz, $(m3_attr "$n/scaling_driver")"
+    done
+    echo "thermal zones: $(awk '{ print $2 }' "$M3_WORK/zones" | paste -sd' ')"
+    if [[ -n $bl_name ]]; then
+      echo "backlight: $bl_name, max_brightness $(m3_attr "$M3_SURVEY_BL/max_brightness")"
+    elif [[ -n $watch ]]; then
+      echo "no backlight device: backlight phases skipped"
+    fi
+  } >"$M3_WORK/out/cpus.txt"
+  : >"$M3_WORK/out/samples.txt"
+  : >"$M3_WORK/out/phases.txt"
+  if [[ -n $bl_name ]]; then M3_SURVEY_BL_START=$(m3_attr "$M3_SURVEY_BL/brightness"); fi
+  [[ $M3_SURVEY_BL_START != - ]] || M3_SURVEY_BL_START=""
+  m3_survey_sampler_start "$keys" "$((total + 60))"
+  for n in "${phases[@]}"; do
+    case $n in
+      cpu-all) m3_survey_phase "$n" "${M3_SURVEY_P[@]}" ${M3_SURVEY_E[@]+"${M3_SURVEY_E[@]}"} ;;
+      cpu-p) m3_survey_phase "$n" "${M3_SURVEY_P[@]}" ;;
+      cpu-e) m3_survey_phase "$n" "${M3_SURVEY_E[@]}" ;;
+      *) m3_survey_phase "$n" ;;
+    esac || break
+  done
+  m3_survey_restore
+  {
+    m3_survey_summary "${phases[@]}"
+    if [[ -n $smc_note ]]; then echo "smc: $smc_note"; fi
+    if [[ -z $watch ]]; then echo "loads: none (no CPU or SoC die temperature to watch on this kernel)"; fi
+  } >"$M3_WORK/out/summary.txt"
+  cp "$M3_WORK/sampler.err" "$M3_WORK/out/sampler-errors.txt" 2>/dev/null || true
+  m3_privacy_pack "$M3_WORK/out" "$out" "$M3_WORK/secrets" ||
+    die "the survey's file was not kept (see above). Please tell us at
+    https://github.com/iconidentify/aurora-linux/issues what this printed, without any file."
+  m3_survey_cleanup
+  trap - EXIT INT TERM HUP
+  if [[ -n $M3_SURVEY_STOP ]]; then
+    warn "the survey stopped early: $M3_SURVEY_STOP, at or over the $((M3_SURVEY_LIMIT_MC / 1000)) C limit.
+    The load stopped at once; the phases after it did not run."
+  fi
+  if [[ -n $smc_note ]]; then warn "$smc_note: the file has the CPU topology and the thermal zones only."; fi
+  say "Power survey written to $out
+    Everything it changed is back as it was. The host name, user names, serial numbers and MAC
+    addresses in it are masked, and the file was checked for them before it was kept.
+    Attach it to your issue at https://github.com/iconidentify/aurora-linux/issues (drag the file
+    into the comment box)."
+}
+
+# ---- the end of an install on an M3 with no handoff path yet -----------------------------------
+# The M3 Max (t6031, t6034) and the T8122 Macs that are not an Air (J504, J433, J434): case C of
+# the test plan. m3_plan always keeps them kernel-only.
+is_m3_kernel_only_chip() {
+  tr '\0' '\n' <"$DT/compatible" 2>/dev/null | grep -Eqx 'apple,(t6031|t6034)' && return 0
+  tr '\0' '\n' <"$DT/compatible" 2>/dev/null | grep -qx 'apple,t8122' && ! is_m3_air
+}
+
+# The release of this script's kernel as uname -r prints it (VERSION 7.1.12.aurora2-12.2 is
+# 7.1.12-2-12.2-sep-ARCH), or nothing when VERSION has another form.
+m3_kernel_release() {
+  [[ $VERSION =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.aurora([0-9]+)-(.+)$ ]] || return 0
+  echo "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}-sep-ARCH"
+}
+
+# The last block of an install's summary on those Macs: what to do next, in order.
+m3_next_steps() {
+  local rel
+  [[ $M3_MODE == kernel ]] && is_m3_kernel_only_chip || return 0
+  rel=$(m3_kernel_release)
+  echo
+  echo "======================== NEXT STEPS: M3 BRING-UP ($(this_board)) ========================"
+  echo "  1. Reboot."
+  echo "  2. Check that the Mac runs the new kernel:"
+  echo "       uname -r"
+  echo "     It should print ${rel:-a version that ends in -sep-ARCH}."
+  echo "  3. Write the bring-up report. It only reads, and writes one file in the current"
+  echo "     directory, aurora-m3-report-$(this_board)-<date>.tgz, with the host name, user names,"
+  echo "     serial numbers and MAC addresses masked:"
+  echo "       curl -fsSL $LATEST_URL | bash -s -- --m3-report"
+  echo "  4. Attach that file to an issue at https://github.com/iconidentify/aurora-linux/issues"
+  echo "=========================================================================================="
+}
+
+# Printed by --agent-prompt, and pointed at from the end of a successful
+# install. This is written for an agent driving the test on a real Mac: it says
+# what to establish, what counts as a pass, and how to write it up.
 agent_prompt() {
   cat <<'PROMPT'
 You are testing an experimental Secure Enclave / Touch ID kernel on an Apple
@@ -3396,6 +4728,20 @@ fingerprint.
       what does not: Wi-Fi, Bluetooth, keyboard, trackpad, audio, USB and
       Thunderbolt, suspend/resume, battery. These reports decide which chip
       gets the handoff next.
+      The install ends with a NEXT STEPS block. After the reboot, check that
+      "uname -r" names this release's kernel, then run the one-liner with
+      --m3-report ("bash -s -- --m3-report"). It only reads, and writes one
+      file in the current directory, aurora-m3-report-<board>-<date>.tgz,
+      with the host name, user names, serial numbers and MAC addresses
+      masked; a file that still has any is not kept. On an M3 it also
+      loads the phram module for a moment, to read the boot loader's copy
+      of the ADT through a read-only node, and unloads it again (one it
+      did not load stays as it is). Attach the file to the issue.
+      Only when the maintainer asks: --m3-power-survey (about five minutes,
+      needs sudo) runs short CPU and backlight loads while it samples the
+      SMC's temperature and power keys, stops early if a CPU or SoC die
+      key reads 100 C, puts everything back, and writes
+      aurora-m3-power-<board>-<date>.tgz.
 
    D. apple,j613 or apple,j615 + apple,t8122 (MacBook Air 13" or 15" M3):
       KERNEL ONLY BY DEFAULT. THE BOOT LOADER TEST IS OPT-IN.
@@ -3531,7 +4877,7 @@ PROMPT
 }
 
 # A reset needs none of the kernel and boot checks; it checks for itself.
-preflight_needed() { case ${1:-} in --agent-prompt | --reset-touchid | --m3-report) return 1 ;; *) return 0 ;; esac; }
+preflight_needed() { case ${1:-} in --agent-prompt | --reset-touchid | --m3-report | --m3-power-survey) return 1 ;; *) return 0 ;; esac; }
 
 # Tests source this file for its functions only.
 if [[ ${AURORA_SEP_SOURCE_ONLY:-} == 1 ]]; then return 0; fi
@@ -3569,6 +4915,7 @@ case ${1:-} in
   --uninstall) uninstall_all ;;
   --reset-touchid) shift; reset_touchid "$@" ;;
   --m3-report) m3_report ;;
+  --m3-power-survey) m3_power_survey ;;
   --agent-prompt) release_source >&2; prompt_notice; agent_prompt ;;
-  *) die "unknown option $1 (--read-only, --uninstall, --reset-touchid, --agent-prompt, --m3-report, --m3-handoff, --m3-gpu-experiment or --no-m3-mesa)" ;;
+  *) die "unknown option $1 (--read-only, --uninstall, --reset-touchid, --agent-prompt, --m3-report, --m3-power-survey, --m3-handoff, --m3-gpu-experiment or --no-m3-mesa)" ;;
 esac
