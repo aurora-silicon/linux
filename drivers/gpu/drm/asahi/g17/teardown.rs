@@ -22,17 +22,15 @@ struct Entry {
     context: Arc<Context>,
     phase: Phase,
     armed: u64,
-    warned: bool,
     announce_pending: bool,
 }
 
-/// Publication and announcement errors retain the entry. A stalled release is reported once;
-/// its timeout never authorizes freeing memory still owned by firmware.
+/// Publication and announcement errors retain the entry; no timeout frees
+/// memory the firmware may still own.
 #[derive(Clone, Copy)]
 pub(crate) enum Failure {
     Publication(Error),
     Announcement(Error),
-    Stalled,
 }
 
 /// Borrowed device operations. Readiness covers every matching installed and displaced graph,
@@ -88,7 +86,6 @@ impl Pending {
                 context: context.clone(),
                 phase,
                 armed: now,
-                warned: false,
                 announce_pending: false,
             })
             .map_err(|_| ENOSPC)
@@ -143,7 +140,6 @@ impl Pending {
                         // One successful retry starts its consumption window.
                         // Failed retries never slide the polling deadline.
                         entry.armed = now;
-                        entry.warned = false;
                     }
                     continue;
                 }
@@ -177,7 +173,6 @@ impl Pending {
                 // A long command drain must not consume the acknowledgement
                 // polling window before this release exists on the control ring.
                 entry.armed = now;
-                entry.warned = false;
                 entry.announce_pending = true;
                 fence(Ordering::SeqCst);
                 match host.notify() {
@@ -227,17 +222,5 @@ impl Pending {
         self.entries.iter().any(|entry| {
             entry.phase != Phase::Deferred && now.saturating_sub(entry.armed) < POLL_NS
         })
-    }
-
-    pub(crate) fn report_stalled(&mut self, now: u64, host: &mut impl Host) {
-        for entry in self.entries.iter_mut() {
-            if entry.phase != Phase::Deferred
-                && !entry.warned
-                && now.saturating_sub(entry.armed) >= POLL_NS
-            {
-                entry.warned = true;
-                host.report(&entry.context, Failure::Stalled);
-            }
-        }
     }
 }
