@@ -378,6 +378,17 @@ pub(crate) mod qos {
     pub(crate) const CLOCK_HZ: u64 = 24_000_000;
 }
 
+/// Firmware scheduling profiles of the DRM queue priorities. Native user
+/// queues use priority class 2 with policy 2.
+pub(crate) mod scheduling {
+    use crate::g17::fw::queue::Policy;
+
+    /// `DRM_ASAHI_PRIORITY_MEDIUM`.
+    pub(crate) const MEDIUM: Policy = Policy::new(2, 2, super::qos::CLASS, super::qos::SHARE);
+    /// `DRM_ASAHI_PRIORITY_LOW`.
+    pub(crate) const LOW: Policy = Policy::new(3, 2, super::qos::CLASS, super::qos::SHARE);
+}
+
 /// Physical workqueue capacity and logical-owner admission limits.
 pub(crate) mod queues {
     pub(crate) const RENDER_SLOTS: usize = 64;

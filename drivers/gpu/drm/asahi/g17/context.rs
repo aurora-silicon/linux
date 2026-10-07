@@ -9,7 +9,7 @@
 mod identity;
 use super::{
     freelist::{RenderIds, RenderPool},
-    fw::context as fw,
+    fw::{context as fw, queue::Policy},
     object::{Allocator, CpuMap, Family, KernelObject, Pool, PooledObject},
     status::VmStatus,
 };
@@ -120,6 +120,9 @@ pub(crate) struct Context {
     work: Arc<Mutex<WorkStorage>>,
     work_base: u64,
     render: Arc<Mutex<Option<Arc<RenderPool>>>>,
+    /// Fixed for the context's life. Physical queues bound to it carry this
+    /// profile in every record, ring, doorbell and registration.
+    policy: Policy,
 }
 impl Context {
     pub(crate) fn new(
@@ -128,6 +131,7 @@ impl Context {
         qos: &Arc<QosIds>,
         execution: Arc<ExecutionContext>,
         owner_pid: u32,
+        policy: Policy,
     ) -> Result<Self> {
         let status = execution.vm().status().ok_or(EINVAL)?.clone();
         let qos = qos.acquire()?;
@@ -188,6 +192,7 @@ impl Context {
             work,
             work_base,
             render,
+            policy,
         })
     }
     pub(crate) fn vm(&self) -> &Vm {
@@ -208,6 +213,9 @@ impl Context {
     }
     pub(crate) fn owner_pid(&self) -> u32 {
         self.owner_pid
+    }
+    pub(crate) fn policy(&self) -> Policy {
+        self.policy
     }
     pub(crate) fn qos_id(&self) -> u8 {
         self.qos.id

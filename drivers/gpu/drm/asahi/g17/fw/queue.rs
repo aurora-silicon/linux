@@ -22,14 +22,59 @@ use kernel::prelude::*;
 
 use super::kick::{KickTimestamp, QID_MAX};
 
-/// Priority of every queue the driver creates.
+/// Firmware scheduling profile of a queue.
 ///
-/// The same value appears in the queue record, [`QueueConfig`],
-/// [`KickAnnounce`] and the kick entry header; the work rings it selects are
-/// listed in `channels.rs`.
-pub(crate) const QUEUE_PRIORITY: u8 = 2;
-/// Scheduling policy of every queue the driver creates.
-pub(crate) const QUEUE_POLICY: u16 = 2;
+/// Every record that names a queue repeats its priority class: the queue
+/// record (twice), [`QueueConfig`], [`KickAnnounce`], the kick entry header,
+/// the work ring the queue is published on (`channels.rs`), the doorbell and
+/// the render registration token. The queue record and [`QueueConfig`] also
+/// carry the scheduling policy word; the QoS row and share word carry the QoS
+/// class and share. All of them must agree for one queue.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Policy {
+    priority: u8,
+    policy: u16,
+    qos_class: u8,
+    qos_share: u32,
+}
+
+impl Policy {
+    /// Number of firmware priority classes.
+    pub(crate) const PRIORITIES: u8 = 4;
+
+    /// Returns the profile with priority class `priority`, policy word
+    /// `policy`, QoS class `qos_class` and QoS share `qos_share`.
+    pub(crate) const fn new(priority: u8, policy: u16, qos_class: u8, qos_share: u32) -> Self {
+        assert!(priority < Self::PRIORITIES);
+        Self {
+            priority,
+            policy,
+            qos_class,
+            qos_share,
+        }
+    }
+
+    /// Priority class, below [`Self::PRIORITIES`].
+    pub(crate) const fn priority(&self) -> u8 {
+        self.priority
+    }
+
+    /// Scheduling policy word.
+    pub(crate) const fn policy(&self) -> u16 {
+        self.policy
+    }
+
+    /// QoS class byte of the queue's QoS row.
+    pub(crate) const fn qos_class(&self) -> u8 {
+        self.qos_class
+    }
+
+    /// QoS share word of the owner's QoS slot.
+    pub(crate) const fn qos_share(&self) -> u32 {
+        self.qos_share
+    }
+}
+
 /// Number of work pointers in a queue's item ring.
 pub(crate) const ITEM_RING_ENTRIES: u32 = 0x500;
 
@@ -173,13 +218,15 @@ pub(crate) struct QueueRecordArgs {
     pub(crate) scheduler_va: u64,
     /// Thread-group ID of the owning process (0 while unowned).
     pub(crate) owner_pid: u32,
+    /// Scheduling profile of the owning logical queue.
+    pub(crate) policy: Policy,
 }
 
 /// Description of one hardware queue, named by its work-ring slots.
 ///
 /// The host writes it whole at queue creation and changes the owner fields of
-/// an idle queue with [`QueueRecord::set_owner`] or
-/// [`QueueRecord::set_compute_owner`].
+/// an idle queue with [`QueueRecord::set_compute_owner`] or, for render
+/// queues, field by field (`render/memory.rs`).
 #[repr(C, packed)]
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct QueueRecord {
@@ -224,12 +271,12 @@ impl QueueRecord {
             job_list_va: args.job_list_va,
             unk_18: [0; 0xc],
             unk_24: u32::MAX,
-            priority: [QUEUE_PRIORITY as u32; 2],
+            priority: [args.policy.priority() as u32; 2],
             unk_30: [0; 6],
             unk_36: u16::MAX,
             unk_38: 0,
             unk_3c: 0,
-            policy: QUEUE_POLICY as u32,
+            policy: args.policy.policy() as u32,
             unk_44: u32::MAX,
             owner_pid: args.owner_pid,
             unk_4c: [0; 0x50],
@@ -241,16 +288,32 @@ impl QueueRecord {
     /// Hands an idle compute queue to a new owner.
     ///
     /// Replaces the job head, process identity and scheduler page, and clears `unk_38`.
+    /// The priority and policy words are written only when `policy` differs from the
+    /// profile the record holds.
     pub(crate) fn set_compute_owner(
         &mut self,
         job_list_va: u64,
         scheduler_va: u64,
         owner_pid: u32,
+        policy: Policy,
     ) {
         self.job_list_va = job_list_va;
         self.unk_38 = 0;
         self.owner_pid = owner_pid;
         self.scheduler_va = scheduler_va;
+        self.set_policy(policy);
+    }
+
+    /// Replaces the priority and policy words of an idle queue's record when they differ
+    /// from `policy`.
+    pub(crate) fn set_policy(&mut self, policy: Policy) {
+        let priority = [policy.priority() as u32; 2];
+        if { self.priority } != priority {
+            self.priority = priority;
+        }
+        if { self.policy } != policy.policy() as u32 {
+            self.policy = policy.policy() as u32;
+        }
     }
 }
 
@@ -310,6 +373,8 @@ pub(crate) struct QueueConfigArgs {
     pub(crate) free_list: FreeListBinding,
     /// GPU address of the owner's scheduler-state page.
     pub(crate) scheduler_va: u64,
+    /// Scheduling profile of the owning logical queue.
+    pub(crate) policy: Policy,
     /// QoS buffer slot of the logical queue.
     pub(crate) qos_slot: u8,
     /// The QoS identity or queue membership changed since the last update.
@@ -429,7 +494,7 @@ impl QueueConfig {
             qid: args.qid as u16,
             install: args.install as u16,
             unk_1c: 0,
-            priority: QUEUE_PRIORITY as u16,
+            priority: args.policy.priority() as u16,
             unk_20: 0,
             data_master: data_master as u16,
             unk_24: 0,
@@ -445,7 +510,7 @@ impl QueueConfig {
             qos_slot: args.qos_slot as u16,
             unk_58: 0,
             owner_pid: args.owner_pid,
-            policy: QUEUE_POLICY,
+            policy: args.policy.policy(),
             unk_60: 0,
             context_update: args.context_update as u16,
             unk_64: 0,
@@ -486,16 +551,22 @@ static_assert!(core::mem::offset_of!(KickAnnounce, timestamp) == 0x09);
 static_assert!(core::mem::offset_of!(KickAnnounce, data_master) == 0x11);
 
 impl KickAnnounce {
-    /// Announces the entry of queue `qid` written at `timestamp`.
-    pub(crate) fn new(qid: u8, data_master: DataMaster, timestamp: KickTimestamp) -> Result<Self> {
-        if qid > QID_MAX {
+    /// Announces the entry of queue `qid` at priority class `priority`,
+    /// written at `timestamp`.
+    pub(crate) fn new(
+        qid: u8,
+        data_master: DataMaster,
+        timestamp: KickTimestamp,
+        priority: u8,
+    ) -> Result<Self> {
+        if qid > QID_MAX || priority >= Policy::PRIORITIES {
             return Err(EINVAL);
         }
         Ok(Self {
             tag: CommandTag::KickAnnounce as u32,
             qid: qid as u16,
             count: 1,
-            priority: QUEUE_PRIORITY,
+            priority,
             timestamp: timestamp.get(),
             data_master: data_master as u32,
             unk_15: [0; 3],

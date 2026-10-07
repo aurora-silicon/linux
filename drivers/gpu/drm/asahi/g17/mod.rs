@@ -1172,8 +1172,9 @@ impl gpu::Gpu for Gpu {
         let owner = self.ids.queue.next();
         let frontend =
             queue::Frontend::new(priority, usc_exec_base, self.geometry.user_usable_range())?;
+        let policy = scheduling_policy(priority)?;
         let (backend, slot) = loop {
-            match runtime::Backend::new(&self.shared, &vm, owner) {
+            match runtime::Backend::new(&self.shared, &vm, owner, policy) {
                 Err(error) if error == EAGAIN => continue,
                 result => break result?,
             }
@@ -1211,6 +1212,17 @@ impl gpu::Gpu for Gpu {
             mmu::PROT_FW_SHARED_RW,
             false,
         )
+    }
+}
+
+/// Scheduling profile of a new logical queue. `file.rs` passes
+/// `DRM_ASAHI_PRIORITY_REALTIME - priority` and refuses HIGH and REALTIME, so
+/// MEDIUM arrives as 2 and LOW as 3.
+fn scheduling_policy(priority: u32) -> Result<fw::queue::Policy> {
+    match priority {
+        2 => Ok(hw::t8140::scheduling::MEDIUM),
+        3 => Ok(hw::t8140::scheduling::LOW),
+        _ => Err(EINVAL),
     }
 }
 

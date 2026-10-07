@@ -6,13 +6,16 @@
 //! precedes submitted counters; retiring a final owner clears only its two row
 //! bytes. Cancellation balances host references without rewinding shared counts.
 
-use super::{fw::qos as fw, object::KernelObject};
+use super::{
+    fw::{qos as fw, queue::Policy},
+    object::KernelObject,
+};
+use crate::hw::t8140::qos as cfg;
 use core::{
     mem::{offset_of, size_of},
     sync::atomic::{fence, AtomicU32, AtomicU64, AtomicU8, Ordering},
 };
 use kernel::prelude::*;
-use crate::hw::t8140::qos as cfg;
 
 /// Atomic views retain the allocation borrow and never borrow firmware words
 /// as ordinary mutable memory. The arrays are disjoint apart from the explicit
@@ -97,11 +100,13 @@ impl Accounting {
 
     /// Called under the device publication lock immediately before exposing
     /// the work record. The clock is sampled only when its engine becomes busy.
+    /// The row's class and the owner's share come from the owner's `policy`.
     pub(crate) fn publish(
         &mut self,
         view: &View<'_>,
         owner: Owner,
         scheduler: u64,
+        policy: Policy,
         clock: impl FnOnce() -> (u64, u64),
     ) -> Result<Publication> {
         let (qid, qos, dm) = owner.indices()?;
@@ -124,10 +129,10 @@ impl Accounting {
             return Err(EBUSY);
         }
         view.rows[qid][0].store(owner.qos, Ordering::Relaxed);
-        view.rows[qid][1].store(cfg::CLASS, Ordering::Relaxed);
+        view.rows[qid][1].store(policy.qos_class(), Ordering::Relaxed);
         let record = view.row(qid);
         view.scheduler[qos].store(scheduler, Ordering::Relaxed);
-        view.share[qos].store(cfg::SHARE, Ordering::Relaxed);
+        view.share[qos].store(policy.qos_share(), Ordering::Relaxed);
         if self.in_flight[qid] == 0 {
             fence(Ordering::SeqCst);
         }

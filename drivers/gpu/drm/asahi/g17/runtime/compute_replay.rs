@@ -56,7 +56,10 @@ impl Firmware {
                     break;
                 };
                 let owner = queue.owner();
-                let outer_ready = self.init.work_ready(crate::g17::fw::queue::DataMaster::Compute)?;
+                let outer_ready = self.init.work_ready(
+                    packet.context.policy().priority(),
+                    crate::g17::fw::queue::DataMaster::Compute,
+                )?;
                 if !outer_ready {
                     let now = super::now_ns();
                     let since = *self.queues.replay_outer_wait.get_or_insert(now);

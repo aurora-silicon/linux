@@ -74,12 +74,18 @@ pub(crate) struct PublicationLease {
 pub(crate) trait Host {
     fn epoch(&self) -> Result<(u64, u32)>;
     fn stamps(&self, qids: [u8; 2]) -> Result<[u32; 2]>;
-    fn qos_publish(&mut self, owner: qos::Owner, scheduler: u64) -> Result<qos::Publication>;
+    fn qos_publish(
+        &mut self,
+        owner: qos::Owner,
+        scheduler: u64,
+        policy: crate::g17::fw::queue::Policy,
+    ) -> Result<qos::Publication>;
     fn qos_cancel(&mut self, publication: qos::Publication) -> Result;
     fn install_pair(&mut self, registration: &RenderRegistration) -> Result;
     fn publish_qid(&mut self, id: kick::Id) -> Result;
     fn publish_outer_pair(
         &mut self,
+        priority: u8,
         fragment: &crate::g17::fw::channels::WorkSlot,
         tiling: &crate::g17::fw::channels::WorkSlot,
         commit: impl FnOnce() -> Result,
@@ -88,11 +94,12 @@ pub(crate) trait Host {
     fn activate_render_pool(&mut self, id: u16, generation: u64) -> Result;
     fn publish_retained_pair(
         &mut self,
+        priority: u8,
         fragment: &WorkSlot,
         tiling: &WorkSlot,
         next: [u32; 2],
     ) -> Result;
-    fn notify_render(&mut self) -> Result;
+    fn notify_render(&mut self, priority: u8) -> Result;
     fn note_submission(&mut self) -> Result;
     fn complete_render(
         &mut self,
@@ -141,8 +148,11 @@ pub(crate) struct Pair {
     configs: [Option<crate::g17::fw::queue::QueueConfig>; 2],
     cursors: [u32; 2],
     recovery_generation: u64,
-    registered: bool,
-    outer_started: bool,
+    /// Priority class of the pair's installed registration, if any. A pair
+    /// rebound to an owner of another class is registered again.
+    registered: Option<u8>,
+    /// Bit `p` set once a work slot of priority class `p` named the pair.
+    outer_started: u8,
     quarantined: bool,
     terminal: Option<(Arc<VmStatus>, Error)>,
     previous: Option<RetiredBinding>,
@@ -223,8 +233,8 @@ impl Pair {
             configs: [None; 2],
             cursors: [0; 2],
             recovery_generation: 0,
-            registered: false,
-            outer_started: false,
+            registered: None,
+            outer_started: 0,
             quarantined: false,
             terminal: None,
             previous: None,
@@ -434,6 +444,12 @@ impl Pair {
         if packet.completion.status().get() != 0 {
             return Err(EIO);
         }
+        let policy = packet.context.policy();
+        // A registration of another class can only follow a rebind, which
+        // requires the pair to have drained.
+        if self.registered.is_some_and(|class| class != policy.priority()) && self.in_flight() {
+            return Err(EIO);
+        }
         let ordinal = self.ordinal;
         let next_ordinal = ordinal.checked_add(1).ok_or(EOVERFLOW)?;
         let mcache = prepared.mcache;
@@ -450,6 +466,7 @@ impl Pair {
         self.memory
             .completion_links(ordinal, kicks, payload, !covered[1])?;
         let context = &packet.context;
+        let ring = 1u8 << policy.priority();
         let qos = context.qos_id();
         let qos_owners = [
             qos::Owner {
@@ -492,6 +509,7 @@ impl Pair {
                     slot: self.free_list.id().into(),
                 },
                 scheduler_va: context.scheduler_va(),
+                policy,
                 qos_slot: qos,
                 qos_update: self.context_update,
                 owner_pid: context.owner_pid(),
@@ -561,6 +579,7 @@ impl Pair {
             event_mask: abi::RENDER_KICK_EVENT_MASK,
             register_arrays: arrays,
             compute_scratch: false,
+            priority: policy.priority(),
         };
         let ta_args = args(
             0,
@@ -579,6 +598,7 @@ impl Pair {
         let registration = RenderRegistration::new(
             (qids[1], self.kicks[1].low_va()),
             (qids[0], self.kicks[0].low_va()),
+            policy.priority(),
         )?;
         let [tiling_kick, fragment_kick] = &mut self.kicks;
         let tiling_kick = tiling_kick.prepare_entry(&ta_args)?;
@@ -620,14 +640,14 @@ impl Pair {
             queues[1],
             qids[1],
             windows[1].target().try_into()?,
-            !self.outer_started,
+            self.outer_started & ring == 0,
         )?;
         let tiling_slot = WorkSlot::new(
             DataMaster::Tiling,
             queues[0],
             qids[0],
             windows[0].target().try_into()?,
-            !self.outer_started,
+            self.outer_started & ring == 0,
         )?;
         let event_slot = memory
             .graph
@@ -664,16 +684,20 @@ impl Pair {
         tiling_kick.commit();
         let mut qos_publications = [None; 2];
         let result = (|| {
-            qos_publications[1] = Some(host.qos_publish(qos_owners[1], context.scheduler_va())?);
-            qos_publications[0] = Some(host.qos_publish(qos_owners[0], context.scheduler_va())?);
-            if !self.registered {
+            qos_publications[1] =
+                Some(host.qos_publish(qos_owners[1], context.scheduler_va(), policy)?);
+            qos_publications[0] =
+                Some(host.qos_publish(qos_owners[0], context.scheduler_va(), policy)?);
+            // A class change happens only at a rebind, after the pair drained.
+            if self.registered != Some(policy.priority()) {
                 host.install_pair(&registration)?;
-                self.registered = true;
+                self.registered = Some(policy.priority());
             }
             for kick in &self.kicks {
                 host.publish_qid(kick.id())?;
             }
             host.publish_outer_pair(
+                policy.priority(),
                 &fragment_slot,
                 &tiling_slot,
                 || {
@@ -720,16 +744,16 @@ impl Pair {
         }
         self.recovery_generation = epoch;
         self.installed = [true; 2];
-        self.outer_started = true;
+        self.outer_started |= ring;
         if let Some(previous) = self.previous.as_mut().filter(|p| p.publication.is_none()) {
             previous.publication = Some(ordinal);
         }
         packet.context.mark_published();
         let publish = (|| {
             host.activate_render_pool(self.free_list.id(), lease.free_list_generation)?;
-            host.publish_retained_pair(&fragment_slot, &tiling_slot, outer_next)?;
+            host.publish_retained_pair(policy.priority(), &fragment_slot, &tiling_slot, outer_next)?;
             self.active.back_mut().ok_or(EIO)?.outer_published = true;
-            host.notify_render()?;
+            host.notify_render(policy.priority())?;
             host.note_submission()
         })();
         if let Err(error) = publish {

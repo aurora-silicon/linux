@@ -275,8 +275,9 @@ impl crate::g17::Firmware {
         }
         // Both outer destinations must have room before pool accounting or
         // either inner queue becomes visible. All host producers share this lock.
-        if !self.init.work_ready(crate::g17::fw::queue::DataMaster::Fragment)?
-            || !self.init.work_ready(crate::g17::fw::queue::DataMaster::Tiling)?
+        let priority = packet.context.policy().priority();
+        if !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Fragment)?
+            || !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Tiling)?
         {
             return Err(EBUSY);
         }
