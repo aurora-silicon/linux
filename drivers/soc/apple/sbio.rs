@@ -2179,7 +2179,8 @@ impl SepData {
             return self.bio_attest(arg);
         }
         if cmd == bio::IOC_SBIO_PROBE {
-            return self.bio_sbio_probe(arg);
+            // Arbitrary firmware commands bypass command policy and capture state.
+            return Err(kernel::error::code::EOPNOTSUPP);
         }
         let handled = {
             let mut session = self.bio_session.lock();
@@ -2217,44 +2218,6 @@ impl SepData {
             self.bio_wake();
         }
         Ok(handled)
-    }
-
-    /// Diagnostics: perform one raw sbio transfer on behalf of userspace.
-    fn bio_sbio_probe(&self, arg: usize) -> Result<bio::Handled> {
-        let user = kernel::uaccess::UserPtr::from_addr(arg);
-        let mut req: bio::SbioProbe =
-            kernel::uaccess::UserSlice::new(user, core::mem::size_of::<bio::SbioProbe>())
-                .reader()
-                .read()?;
-        let n = (req.len as usize).min(SBIO_MAX_PAYLOAD).min(req.payload.len());
-        let done = self.sbio_transfer_raw(req.opcode, c"PROBE", &req.payload[..n])?;
-        req.status = match done.status.answered() {
-            Some(v) => v as i32,
-            None => i32::MIN,
-        };
-        let m = done.payload.len().min(req.reply.len());
-        req.reply = [0u8; 256];
-        req.reply[..m].copy_from_slice(&done.payload[..m]);
-        req.reply_len = done.payload.len() as u32;
-        dev_info!(
-            self.dev,
-            "sbio: PROBE opcode {:#x} len {} -> status {:?}, reply {} bytes\n",
-            req.opcode,
-            n,
-            done.status.answered(),
-            done.payload.len()
-        );
-        kernel::uaccess::UserSlice::new(user, core::mem::size_of::<bio::SbioProbe>())
-            .writer()
-            .write(&req)?;
-        Ok(bio::Handled {
-            ret: 0,
-            wake: false,
-            start_enrol: false,
-            start_verify: false,
-            delete_identity: None,
-            delete_identities: KVec::new(),
-        })
     }
 
     fn bio_attest(&self, arg: usize) -> Result<bio::Handled> {
