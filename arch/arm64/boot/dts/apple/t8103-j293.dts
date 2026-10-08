@@ -110,6 +110,13 @@
 
 &mesa {
 	status = "okay";
+	/*
+	 * This board's sensor answers in SPI mode 2 (CPOL=1, CPHA=0), not the
+	 * mode 1 t8103.dtsi describes: in mode 1 it binds, but the enclave then
+	 * lists no identities and matching stays off.
+	 */
+	/delete-property/ spi-cpha;
+	spi-cpol;
 	enable-gpios = <&pinctrl_ap 108 GPIO_ACTIVE_HIGH>;
 	spi-cs-setup-delay-ns = <20>;
 	spi-cs-hold-delay-ns = <20>;
