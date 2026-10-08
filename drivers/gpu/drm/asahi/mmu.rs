@@ -1739,7 +1739,6 @@ impl Vm {
     }
 
     /// Reserves a whole-page unmapped guard without adding it to the mapped backing.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn map_in_range_with_guard_size(
         &self,
         gem: &gem::Object,
