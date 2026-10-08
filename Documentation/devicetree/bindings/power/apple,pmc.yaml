@@ -1,0 +1,131 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/apple,pmc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple SoC PMC voter interface
+
+maintainers:
+  - Diljit Singh <hey@djdev.me>
+
+description: |
+  The PMC arbitrates the performance states of shared rails, such as the
+  DRAM controller and the SoC fabric, between voter agents. Each agent has a
+  perf-state floor word with one 4-bit state per rail, and each rail has an
+  interface enable word with one bit per agent. The PMC only honours an
+  agent's floor on rails where its interface is enabled.
+
+  Static agents are enabled for as long as the PMC is bound. A dynamic
+  agent is a power domain: it is enabled after its parent domain powers on
+  and disabled before its parent domain powers off. The host performance
+  controller's agent is described by a child node that raises its floor
+  while the CPU clusters or the GPU are busy.
+
+properties:
+  compatible:
+    const: apple,t8140-pmc
+
+  reg:
+    items:
+      - description: Perf-state floor words of the voter agents
+      - description: Rail state and interface enable words
+
+  reg-names:
+    items:
+      - const: voters
+      - const: rails
+
+  power-domains:
+    maxItems: 1
+
+  '#address-cells':
+    const: 1
+
+  '#size-cells':
+    const: 0
+
+  apple,static-voters:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Voter agents to enable on every rail.
+
+patternProperties:
+  '^voter@[0-9a-f]+$':
+    type: object
+    description: A dynamic voter agent, provided as a power domain.
+    additionalProperties: false
+
+    properties:
+      reg:
+        maxItems: 1
+        description: Voter agent index.
+
+      label:
+        description: Name of the power domain.
+
+      '#power-domain-cells':
+        const: 0
+
+      power-domains:
+        maxItems: 1
+        description: Domain that must be powered while the agent is enabled.
+
+    required:
+      - reg
+      - '#power-domain-cells'
+
+  '^performance-controller@[0-9a-f]+$':
+    type: object
+    description: The host performance controller's voter agent.
+    additionalProperties: false
+
+    properties:
+      compatible:
+        const: apple,t8140-clpc
+
+      reg:
+        maxItems: 1
+        description: Voter agent index.
+
+      apple,gpu-power-state:
+        $ref: /schemas/types.yaml#/definitions/phandle
+        description: PMGR power state of the GPU, used as a demand input.
+
+    required:
+      - compatible
+      - reg
+
+required:
+  - compatible
+  - reg
+  - reg-names
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        power-management@302800000 {
+            compatible = "apple,t8140-pmc";
+            reg = <0x3 0x02800000 0x0 0x10000>,
+                  <0x3 0x028aa000 0x0 0x3000>;
+            reg-names = "voters", "rails";
+            #address-cells = <1>;
+            #size-cells = <0>;
+            apple,static-voters = <0 1 3>;
+
+            performance-controller@1 {
+                compatible = "apple,t8140-clpc";
+                reg = <1>;
+            };
+
+            voter@2 {
+                reg = <2>;
+                label = "gfx";
+                #power-domain-cells = <0>;
+            };
+        };
+    };
