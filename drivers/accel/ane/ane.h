@@ -17,6 +17,15 @@
 
 #include "ane_stats.h"
 
+#define ANE_DART_MAX 3
+#define ANE_DART_SCRATCH_MAX 16
+
+struct ane_dart_scratch {
+	u64 iova;
+	struct page *page;
+	struct drm_mm_node *node;
+};
+
 struct ane_device {
 	struct drm_device drm;
 	struct device *dev;
@@ -62,6 +71,9 @@ struct ane_device {
 	 * nodes (see ane_reclaim_preserved). Registered under engine_lock.
 	 */
 	struct list_head preserved_list;
+	/* Fault-drain DMA backing, retained until completion or a safe reset. */
+	struct ane_dart_scratch scratch[ANE_DART_SCRATCH_MAX];
+	int scratch_pages;
 	bool removed;
 
 	/*
@@ -146,15 +158,6 @@ int ane_boost_init(struct ane_device *ane);
 void ane_boost_exit(struct ane_device *ane);
 void ane_boost_begin(struct ane_device *ane);
 void ane_boost_end(struct ane_device *ane);
-
-#define ANE_DART_MAX 3
-#define ANE_DART_SCRATCH_MAX 16
-
-struct ane_dart_scratch {
-	u64 iova;
-	struct page *page;
-	struct drm_mm_node *node;
-};
 
 int ane_dart_init(struct ane_device *ane);
 void ane_dart_mask(struct ane_device *ane);

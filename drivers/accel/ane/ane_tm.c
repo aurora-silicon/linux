@@ -265,8 +265,7 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 	u32 finished = 0;
 	u32 fault_status = 0;
 	u64 fault_iova = 0;
-	struct ane_dart_scratch scratch[ANE_DART_SCRATCH_MAX];
-	int scratch_pages = 0;
+	struct ane_dart_scratch *scratch = ane->scratch;
 	bool faulted = false;
 	int err, status;
 
@@ -298,10 +297,10 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 			err = status;
 		if (ane_dart_faulted(ane, &fault_iova, &fault_status)) {
 			faulted = true;
-			if (scratch_pages >= ANE_DART_SCRATCH_MAX)
+			if (ane->scratch_pages >= ANE_DART_SCRATCH_MAX)
 				break;
 			if (ane_dart_drain_fault(ane, fault_iova, scratch,
-						 &scratch_pages))
+						 &ane->scratch_pages))
 				break;
 			/* The retried transaction now completes; poll on. */
 			continue;
@@ -321,7 +320,7 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 		if (err || ane_dart_faulted(ane, NULL, NULL)) {
 			/* Drain failed or the drained program never reached
 			 * completion: the engine is not idle and access is
-			 * off the table. wedge releases the scratch.
+			 * off the table. Retain scratch backing until reset.
 			 */
 			err = err ?: -EIO;
 			goto wedge;
@@ -334,11 +333,12 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 		 */
 		rmb();
 		tq_write32(ane, TQ_STATUS(req->qid), 0x0);
-		ane_dart_release_scratch(ane, scratch, scratch_pages);
+		ane_dart_release_scratch(ane, scratch, ane->scratch_pages);
 		ane_dart_unmask(ane);
 		dev_err(ane->dev,
 			"DART fault contained: status=%#x iova=%#llx scratch=%d\n",
-			fault_status, fault_iova, scratch_pages);
+			fault_status, fault_iova, ane->scratch_pages);
+		ane->scratch_pages = 0;
 		return -EIO;
 	}
 	if (err)
@@ -356,7 +356,6 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 	return 0;
 
 wedge:
-	ane_dart_release_scratch(ane, scratch, scratch_pages);
 	ane_dart_unmask(ane);
 	if (atomic_xchg(&ane->wedged, 1) == 0) {
 		__module_get(THIS_MODULE);
@@ -644,4 +643,3 @@ int ane_tm_recover(struct ane_device *ane)
 	}
 	return 0;
 }
-
