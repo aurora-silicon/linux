@@ -6,6 +6,7 @@
 use super::{Config, Reservation};
 use crate::g17::{
     buffer::MetricsLease,
+    preparation::Lease,
     job::Packet,
     object::{Allocator, KernelObject, Pool},
     queue::render::{Pair, RenderAddresses},
@@ -57,6 +58,17 @@ enum Build {
         pm_generation: Option<u64>,
         metrics: Option<MetricsLease>,
     },
+}
+
+/// What every build step needs besides its variant: the preparation lease, the allocator,
+/// the device resources, the slot and the first packet.
+#[derive(Clone, Copy)]
+struct BuildContext<'a> {
+    lease: &'a Lease,
+    alloc: &'a Allocator<'a>,
+    resources: &'a BuildResources,
+    slot: u8,
+    first: &'a Arc<Packet>,
 }
 
 impl super::super::Backend {
@@ -178,264 +190,339 @@ impl super::super::Backend {
             Build::Fresh(..) | Build::Parked { .. } => true,
             Build::Rebind { buffer, .. } => buffer.is_some(),
         };
-        let result = match build {
+        let ctx = BuildContext {
+            lease: &lease,
+            alloc: &alloc,
+            resources: &resources,
+            slot,
+            first,
+        };
+        match build {
             Build::Fresh(reservation, pm_generation, metrics) => {
-                let built = (|| -> Result<KBox<Pair>> {
-                    let free_list =
-                        self.context
-                            .render_pool(&alloc, &resources.ids, &resources.global)?;
-                    Pair::new(
-                        &alloc,
-                        &resources.objects,
-                        reservation.ids,
-                        slot,
-                        self.owner,
-                        self.context.clone(),
-                        free_list,
-                        metrics,
-                        reservation.buffer,
-                        pm_generation,
-                        first,
-                        resources.config.clusters,
-                        resources.config.descriptor_flags,
-                    )
-                })();
-                let (mut built, error) = match built {
-                    Ok(pair) => (Some(pair), None),
-                    Err(error) => (None, Some(error)),
-                };
-                let result = (|| {
-                    let mut state = self.shared.state.lock();
-                    let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
-                    if !lease.is_current() {
-                        return Err(EAGAIN);
-                    }
-                    if let Some(error) = error {
-                        return Err(error);
-                    }
-                    if !self.context.is_current() || self.context.status().get() != 0 {
-                        return Err(EFAULT);
-                    }
-                    if firmware.queues.render.reserved(reservation)?.closed {
-                        return Err(ECANCELED);
-                    }
-                    built
-                        .as_mut()
-                        .ok_or(EIO)?
-                        .finish_install(&alloc, firmware.init.pb_descriptor_table()?)?;
-                    firmware.queues.install_render(reservation, &mut built)
-                })();
-                // Fresh backing disappears before its temporary PB reference returns.
-                drop(built);
-                if result.is_err() {
-                    let mut state = self.shared.state.lock();
-                    (*state)
-                        .as_deref_mut()
-                        .ok_or(ENODEV)?
-                        .queues
-                        .cancel_render_reservation(reservation)?;
-                }
-                result
+                self.install_fresh_pair(&ctx, reservation, pm_generation, metrics)?
             }
             Build::Parked {
-                mut parked,
+                parked,
                 buffer,
                 pm_generation,
                 metrics,
-            } => {
-                let built = (|| -> Result<_> {
-                    let free_list =
-                        self.context
-                            .render_pool(&alloc, &resources.ids, &resources.global)?;
-                    let prepared = parked.prepare(
-                        &alloc,
-                        &resources.objects,
-                        self.owner,
-                        self.context.clone(),
-                        free_list,
-                        metrics,
-                        buffer,
-                        pm_generation,
-                        first,
-                    )?;
-                    let storage = KBox::<Pair>::new_uninit(GFP_KERNEL)?;
-                    Ok((prepared, storage))
-                })();
-                let (mut prepared, mut storage, error) = match built {
-                    Ok((prepared, storage)) => (Some(prepared), Some(storage), None),
-                    Err(error) => (None, None, Some(error)),
-                };
-                let result = {
-                    let mut state = self.shared.state.lock();
-                    let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
-                    (|| {
-                        if !lease.is_current() {
-                            return Err(EAGAIN);
-                        }
-                        if let Some(error) = error {
-                            return Err(error);
-                        }
-                        if !self.context.is_current() || self.context.status().get() != 0 {
-                            return Err(EFAULT);
-                        }
-                        let entry = firmware.queues.render.entry(slot)?;
-                        if entry.pending_owner != Some(self.owner)
-                            || entry.pending_owner_closed
-                            || entry.pair.is_some()
-                            || entry.parked.is_some()
-                        {
-                            return Err(ECANCELED);
-                        }
-                        let storage = storage.take().ok_or(EIO)?;
-                        firmware.queues.buffers.can_release(buffer.0)?;
-                        prepared.as_mut().ok_or(EIO)?.finish_install(
-                            &parked,
-                            &alloc,
-                            firmware.init.pb_descriptor_table()?,
-                        )?;
-                        let pair = parked.commit(&mut prepared, storage)?;
-                        firmware.queues.buffers.reserve_owner(buffer.0)?;
-                        firmware.queues.buffers.release(buffer.0)?;
-                        let entry = firmware.queues.render.entry_mut(slot)?;
-                        entry.reservation.owner = self.owner;
-                        entry.reservation.buffer = buffer;
-                        entry.context = Some(self.context.clone());
-                        entry.pool = Some(pair.pool().clone());
-                        entry.pair = Some(pair);
-                        entry.closed = false;
-                        entry.published = false;
-                        Ok(())
-                    })()
-                };
-                // Rejected candidate mappings disappear before the PB identity
-                // returns, while the original installed kick owner stays live.
-                drop(prepared);
-                drop(storage);
-                let grow_ready = {
-                    let mut state = self.shared.state.lock();
-                    let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
-                    if result.is_err() {
-                        firmware.queues.render.entry_mut(slot)?.parked = Some(parked);
-                        firmware.queues.buffers.release(buffer.0)?;
-                    } else {
-                        drop(state);
-                        drop(parked);
-                        state = self.shared.state.lock();
-                    }
-                    let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
-                    let entry = firmware.queues.render.entry_mut(slot)?;
-                    entry.preparing = None;
-                    entry.pending_owner = None;
-                    entry.pending_owner_closed = false;
-                    firmware.render_grow_ready()
-                };
-                self.shared.changed.notify_all();
-                if grow_ready {
-                    self.shared.queue_grow();
-                }
-                result
-            }
+            } => self.install_parked_pair(&ctx, parked, buffer, pm_generation, metrics)?,
             Build::Rebind {
-                mut pair,
+                pair,
                 buffer,
                 pm_generation,
                 metrics,
-            } => {
-                let prepared = (|| {
-                    let free_list =
-                        self.context
-                            .render_pool(&alloc, &resources.ids, &resources.global)?;
-                    pair.prepare_bind(
-                        &alloc,
-                        &resources.objects,
-                        self.owner,
-                        self.context.clone(),
-                        free_list,
-                        metrics,
-                        buffer,
-                        pm_generation,
-                        first,
-                    )
-                })();
-                let (mut prepared, error) = match prepared {
-                    Ok(binding) => (Some(binding), None),
-                    Err(error) => (None, Some(error)),
-                };
-                let (result, grow_ready) = {
-                    let mut state = self.shared.state.lock();
-                    let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
-                    let result = (|| {
-                        if !lease.is_current() {
-                            return Err(EAGAIN);
-                        }
-                        if let Some(error) = error {
-                            return Err(error);
-                        }
-                        if !self.context.is_current() || self.context.status().get() != 0 {
-                            return Err(EFAULT);
-                        }
-                        let entry = firmware.queues.render.entry(slot)?;
-                        if entry.pending_owner != Some(self.owner) || entry.pending_owner_closed {
-                            return Err(ECANCELED);
-                        }
-                        if firmware.queues.render.retired.len()
-                            == firmware.queues.render.retired.capacity()
-                        {
-                            return Err(ENOSPC);
-                        }
-                        firmware.queues.teardown.displace(
-                            pair.context(),
-                            true,
-                            super::super::now_ns(),
-                        )?;
-                        pair.bind_owner(
-                            prepared.as_mut().ok_or(EIO)?,
-                            &alloc,
-                            firmware.init.pb_descriptor_table()?,
-                        )?;
-                        if let Some((id, _)) = buffer {
-                            firmware.queues.buffers.reserve_owner(id)?;
-                            firmware.queues.buffers.release(id)?;
-                        }
-                        let entry = firmware.queues.render.entry_mut(slot)?;
-                        entry.reservation.owner = self.owner;
-                        if let Some(buffer) = buffer {
-                            entry.reservation.buffer = buffer;
-                        }
-                        entry.context = Some(self.context.clone());
-                        entry.pool = Some(pair.pool().clone());
-                        entry.closed = false;
-                        Ok(())
-                    })();
-                    // The original installed pair remains owned on every error.
-                    let entry = firmware.queues.render.entry_mut(slot)?;
-                    entry.preparing = None;
-                    entry.pending_owner = None;
-                    entry.pending_owner_closed = false;
-                    entry.pair = Some(pair);
-                    entry.borrowed_dependencies = None;
-                    (result, firmware.render_grow_ready())
-                };
-                drop(prepared);
-                if result.is_err() {
-                    if let Some((id, _)) = buffer {
-                        let mut state = self.shared.state.lock();
-                        (*state)
-                            .as_deref_mut()
-                            .ok_or(ENODEV)?
-                            .queues
-                            .buffers
-                            .release(id)?;
-                    }
-                }
-                self.shared.changed.notify_all();
-                if grow_ready {
-                    self.shared.queue_grow();
-                }
-                result
-            }
+            } => self.rebind_pair(&ctx, pair, buffer, pm_generation, metrics)?,
+        }
+        self.finish_render_build(&lease, slot, fresh_graph)
+    }
+
+    /// Inlined into build_render_pair(): as a separate frame this step deepens the scheduler
+    /// run_job stack path, which is close to its budget.
+    #[inline(always)]
+    /// Off-lock construction of a fresh pair, then its device-locked install.
+    fn install_fresh_pair(
+        &self,
+        ctx: &BuildContext<'_>,
+        reservation: Reservation,
+        pm_generation: u64,
+        metrics: MetricsLease,
+    ) -> Result {
+        let BuildContext {
+            lease,
+            alloc,
+            resources,
+            slot,
+            first,
+        } = *ctx;
+        let built = (|| -> Result<KBox<Pair>> {
+            let free_list =
+                self.context
+                    .render_pool(&alloc, &resources.ids, &resources.global)?;
+            Pair::new(
+                &alloc,
+                &resources.objects,
+                reservation.ids,
+                slot,
+                self.owner,
+                self.context.clone(),
+                free_list,
+                metrics,
+                reservation.buffer,
+                pm_generation,
+                first,
+                resources.config.clusters,
+                resources.config.descriptor_flags,
+            )
+        })();
+        let (mut built, error) = match built {
+            Ok(pair) => (Some(pair), None),
+            Err(error) => (None, Some(error)),
         };
-        result?;
+        let result = (|| {
+            let mut state = self.shared.state.lock();
+            let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+            if !lease.is_current() {
+                return Err(EAGAIN);
+            }
+            if let Some(error) = error {
+                return Err(error);
+            }
+            if !self.context.is_current() || self.context.status().get() != 0 {
+                return Err(EFAULT);
+            }
+            if firmware.queues.render.reserved(reservation)?.closed {
+                return Err(ECANCELED);
+            }
+            built
+                .as_mut()
+                .ok_or(EIO)?
+                .finish_install(&alloc, firmware.init.pb_descriptor_table()?)?;
+            firmware.queues.install_render(reservation, &mut built)
+        })();
+        // Fresh backing disappears before its temporary PB reference returns.
+        drop(built);
+        if result.is_err() {
+            let mut state = self.shared.state.lock();
+            (*state)
+                .as_deref_mut()
+                .ok_or(ENODEV)?
+                .queues
+                .cancel_render_reservation(reservation)?;
+        }
+        result
+    }
+
+    /// Inlined into build_render_pair(): as a separate frame this step deepens the scheduler
+    /// run_job stack path, which is close to its budget.
+    #[inline(always)]
+    /// Off-lock preparation of a parked pair for its new owner, then its device-locked
+    /// commit; the pair returns to its parked state on failure.
+    fn install_parked_pair(
+        &self,
+        ctx: &BuildContext<'_>,
+        mut parked: crate::g17::queue::render::parked::ParkedPair,
+        buffer: (u8, u64),
+        pm_generation: u64,
+        metrics: MetricsLease,
+    ) -> Result {
+        let BuildContext {
+            lease,
+            alloc,
+            resources,
+            slot,
+            first,
+        } = *ctx;
+        let built = (|| -> Result<_> {
+            let free_list =
+                self.context
+                    .render_pool(&alloc, &resources.ids, &resources.global)?;
+            let prepared = parked.prepare(
+                &alloc,
+                &resources.objects,
+                self.owner,
+                self.context.clone(),
+                free_list,
+                metrics,
+                buffer,
+                pm_generation,
+                first,
+            )?;
+            let storage = KBox::<Pair>::new_uninit(GFP_KERNEL)?;
+            Ok((prepared, storage))
+        })();
+        let (mut prepared, mut storage, error) = match built {
+            Ok((prepared, storage)) => (Some(prepared), Some(storage), None),
+            Err(error) => (None, None, Some(error)),
+        };
+        let result = {
+            let mut state = self.shared.state.lock();
+            let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+            (|| {
+                if !lease.is_current() {
+                    return Err(EAGAIN);
+                }
+                if let Some(error) = error {
+                    return Err(error);
+                }
+                if !self.context.is_current() || self.context.status().get() != 0 {
+                    return Err(EFAULT);
+                }
+                let entry = firmware.queues.render.entry(slot)?;
+                if entry.pending_owner != Some(self.owner)
+                    || entry.pending_owner_closed
+                    || entry.pair.is_some()
+                    || entry.parked.is_some()
+                {
+                    return Err(ECANCELED);
+                }
+                let storage = storage.take().ok_or(EIO)?;
+                firmware.queues.buffers.can_release(buffer.0)?;
+                prepared.as_mut().ok_or(EIO)?.finish_install(
+                    &parked,
+                    &alloc,
+                    firmware.init.pb_descriptor_table()?,
+                )?;
+                let pair = parked.commit(&mut prepared, storage)?;
+                firmware.queues.buffers.reserve_owner(buffer.0)?;
+                firmware.queues.buffers.release(buffer.0)?;
+                let entry = firmware.queues.render.entry_mut(slot)?;
+                entry.reservation.owner = self.owner;
+                entry.reservation.buffer = buffer;
+                entry.context = Some(self.context.clone());
+                entry.pool = Some(pair.pool().clone());
+                entry.pair = Some(pair);
+                entry.closed = false;
+                entry.published = false;
+                Ok(())
+            })()
+        };
+        // Rejected candidate mappings disappear before the PB identity
+        // returns, while the original installed kick owner stays live.
+        drop(prepared);
+        drop(storage);
+        let grow_ready = {
+            let mut state = self.shared.state.lock();
+            let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+            if result.is_err() {
+                firmware.queues.render.entry_mut(slot)?.parked = Some(parked);
+                firmware.queues.buffers.release(buffer.0)?;
+            } else {
+                drop(state);
+                drop(parked);
+                state = self.shared.state.lock();
+            }
+            let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+            let entry = firmware.queues.render.entry_mut(slot)?;
+            entry.preparing = None;
+            entry.pending_owner = None;
+            entry.pending_owner_closed = false;
+            firmware.render_grow_ready()
+        };
+        self.shared.changed.notify_all();
+        if grow_ready {
+            self.shared.queue_grow();
+        }
+        result
+    }
+
+    /// Inlined into build_render_pair(): as a separate frame this step deepens the scheduler
+    /// run_job stack path, which is close to its budget.
+    #[inline(always)]
+    /// Off-lock preparation of an installed pair's rebinding, then its device-locked
+    /// owner change; the original pair stays installed on failure.
+    fn rebind_pair(
+        &self,
+        ctx: &BuildContext<'_>,
+        mut pair: KBox<Pair>,
+        buffer: Option<(u8, u64)>,
+        pm_generation: Option<u64>,
+        metrics: Option<MetricsLease>,
+    ) -> Result {
+        let BuildContext {
+            lease,
+            alloc,
+            resources,
+            slot,
+            first,
+        } = *ctx;
+        let prepared = (|| {
+            let free_list =
+                self.context
+                    .render_pool(&alloc, &resources.ids, &resources.global)?;
+            pair.prepare_bind(
+                &alloc,
+                &resources.objects,
+                self.owner,
+                self.context.clone(),
+                free_list,
+                metrics,
+                buffer,
+                pm_generation,
+                first,
+            )
+        })();
+        let (mut prepared, error) = match prepared {
+            Ok(binding) => (Some(binding), None),
+            Err(error) => (None, Some(error)),
+        };
+        let (result, grow_ready) = {
+            let mut state = self.shared.state.lock();
+            let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+            let result = (|| {
+                if !lease.is_current() {
+                    return Err(EAGAIN);
+                }
+                if let Some(error) = error {
+                    return Err(error);
+                }
+                if !self.context.is_current() || self.context.status().get() != 0 {
+                    return Err(EFAULT);
+                }
+                let entry = firmware.queues.render.entry(slot)?;
+                if entry.pending_owner != Some(self.owner) || entry.pending_owner_closed {
+                    return Err(ECANCELED);
+                }
+                if firmware.queues.render.retired.len()
+                    == firmware.queues.render.retired.capacity()
+                {
+                    return Err(ENOSPC);
+                }
+                firmware.queues.teardown.displace(
+                    pair.context(),
+                    true,
+                    super::super::now_ns(),
+                )?;
+                pair.bind_owner(
+                    prepared.as_mut().ok_or(EIO)?,
+                    &alloc,
+                    firmware.init.pb_descriptor_table()?,
+                )?;
+                if let Some((id, _)) = buffer {
+                    firmware.queues.buffers.reserve_owner(id)?;
+                    firmware.queues.buffers.release(id)?;
+                }
+                let entry = firmware.queues.render.entry_mut(slot)?;
+                entry.reservation.owner = self.owner;
+                if let Some(buffer) = buffer {
+                    entry.reservation.buffer = buffer;
+                }
+                entry.context = Some(self.context.clone());
+                entry.pool = Some(pair.pool().clone());
+                entry.closed = false;
+                Ok(())
+            })();
+            // The original installed pair remains owned on every error.
+            let entry = firmware.queues.render.entry_mut(slot)?;
+            entry.preparing = None;
+            entry.pending_owner = None;
+            entry.pending_owner_closed = false;
+            entry.pair = Some(pair);
+            entry.borrowed_dependencies = None;
+            (result, firmware.render_grow_ready())
+        };
+        drop(prepared);
+        if result.is_err() {
+            if let Some((id, _)) = buffer {
+                let mut state = self.shared.state.lock();
+                (*state)
+                    .as_deref_mut()
+                    .ok_or(ENODEV)?
+                    .queues
+                    .buffers
+                    .release(id)?;
+            }
+        }
+        self.shared.changed.notify_all();
+        if grow_ready {
+            self.shared.queue_grow();
+        }
+        result
+    }
+
+    /// Under the device mutex: the graph is complete and retained; rebase a fresh graph's
+    /// cursors and warm its pool.
+    fn finish_render_build(&self, lease: &Lease, slot: u8, fresh_graph: bool) -> Result {
         let mut state = self.shared.state.lock();
         let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
         if !lease.is_current() {
