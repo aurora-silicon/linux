@@ -20,4 +20,16 @@ config APPLE_PMP_REPORT
 	depends on PM
 	select PM_GENERIC_DOMAINS
 
+config APPLE_PMC
+	bool "Apple PMC voter interface"
+	depends on OF
+	depends on PM
+	select PM_GENERIC_DOMAINS
+	help
+	  The PMC in some Apple SoCs arbitrates the performance states of
+	  shared rails, such as the DRAM controller and the SoC fabric,
+	  between voter agents. This driver enables the static agents and
+	  provides power domains that enable a dynamic agent, such as the
+	  GPU, while its device is powered on.
+
 endif
