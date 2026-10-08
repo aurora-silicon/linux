@@ -663,15 +663,12 @@ static int apple_drm_init_dcp(struct device *dev)
 
 	for_each_matching_node(np, apple_dcp_id_tbl) {
 		bool dcp_ext;
-		if (!apple_dcp_usable(np)) {
-			of_node_put(np);
+		if (!apple_dcp_usable(np))
 			continue;
-		}
 		dcp_ext = of_device_is_compatible(np, "apple,dcpext") ||
 		          of_property_present(np, "phys");
 
 		dcp[num_dcp] = of_find_device_by_node(np);
-		of_node_put(np);
 		if (!dcp[num_dcp])
 			continue;
 
@@ -875,7 +872,6 @@ static int add_dcp_components(struct device *dev,
 				of_node_put(port);
 			}
 		}
-		of_node_put(np);
 	}
 
 	return num;

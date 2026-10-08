@@ -292,6 +292,31 @@ static void backlight_fallback_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, present.nits, 262U);
 }
 
+static void backlight_seed_known_test(struct kunit *test)
+{
+	struct dcp_backlight_state state;
+	struct dcp_backlight_present present;
+
+	/* A loader sample seeded over a registration default is known. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 525, false, 0, true, 262), 0);
+	KUNIT_EXPECT_FALSE(test, state.level_known);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_seed(&state, 180));
+	KUNIT_EXPECT_TRUE(test, state.level_known);
+	state.controlled = true;
+	KUNIT_EXPECT_TRUE(test, dcp_bl_resend(&state));
+	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
+	KUNIT_EXPECT_EQ(test, present.nits, 180U);
+
+	/* A refused sample leaves the default unknown. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 525, false, 0, true, 262), 0);
+	KUNIT_EXPECT_FALSE(test, dcp_bl_seed(&state, 526));
+	KUNIT_EXPECT_FALSE(test, state.level_known);
+	state.controlled = true;
+	KUNIT_EXPECT_FALSE(test, dcp_bl_seed(&state, 180));
+	KUNIT_EXPECT_FALSE(test, state.level_known);
+	KUNIT_EXPECT_FALSE(test, dcp_bl_resend(&state));
+}
+
 static struct kunit_case backlight_cases[] = {
 	KUNIT_CASE(backlight_millinits_takeover_test),
 	KUNIT_CASE(backlight_takeover_test),
@@ -304,6 +329,7 @@ static struct kunit_case backlight_cases[] = {
 	KUNIT_CASE(backlight_inflight_dpms_test),
 	KUNIT_CASE(backlight_resend_test),
 	KUNIT_CASE(backlight_fallback_test),
+	KUNIT_CASE(backlight_seed_known_test),
 	{}
 };
 
