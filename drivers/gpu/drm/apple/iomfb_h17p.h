@@ -88,6 +88,10 @@ void iomfb_encode_backlight_h17p(struct dcp_present_h17p *wire, u32 nits,
 void iomfb_serialize_present_h17p(struct dcp_present_h17p *wire,
 				  const struct dcp_swap_submit_req_h17p *request);
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
+int iomfb_h17p_first_unbounded_callback(void);
+#endif
+
 #undef DCP_FW_VER
 #undef DCP_FW
 

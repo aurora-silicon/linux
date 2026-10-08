@@ -14,18 +14,32 @@ struct dcp_callback_size {
 	u32 in_len;
 	u32 out_len;
 	bool valid;
+	/* Lengths bound what the handler reads and writes; no capture exists. */
+	bool minimum;
 };
+
+/*
+ * Callbacks that only arrive after startup: present notifications, swap
+ * aborts, the backlight re-send request, wall-clock and clock-rate queries.
+ * Their record lengths are not in the startup observations, so accept any
+ * record that holds what the handler reads and the reply it writes.  The
+ * dispatcher zeroes the rest of a longer reply.
+ */
+#define DCP_CB_AT_LEAST(in, out) \
+	{ .in_len = (in), .out_len = (out), .valid = true, .minimum = true }
 
 /* R-IOMFB-startup-run21 and R-ANALYTICS Linux boundary observations. */
 static const struct dcp_callback_size callback_sizes[IOMFB_MAX_CB] = {
 	[0] = { 0x0, 0x4, true },
 	[1] = { 0x0, 0x4, true },
+	[2] = DCP_CB_AT_LEAST(0x0, 0x0),
 	[3] = { 0x4, 0x14, true },
 	[6] = { 0x54, 0x50, true },
 	[100] = { 0x0, 0x0, true },
 	[101] = { 0x0, 0x4, true },
 	[102] = { 0x44, 0x0, true },
 	[104] = { 0x44, 0x0, true },
+	[107] = DCP_CB_AT_LEAST(0x0, 0x0),
 	[108] = { 0x0, 0x4, true },
 	[109] = { 0x0, 0x4, true },
 	[110] = { 0x0, 0x4, true },
@@ -33,34 +47,58 @@ static const struct dcp_callback_size callback_sizes[IOMFB_MAX_CB] = {
 	[112] = { 0x0, 0x4, true },
 	[113] = { 0x0, 0x4, true },
 	[114] = { 0x1044, 0x1004, true },
+	[117] = DCP_CB_AT_LEAST(0x0, 0x0),
+	[118] = DCP_CB_AT_LEAST(0x0, 0x4),
+	[119] = DCP_CB_AT_LEAST(0x0, 0x4),
+	[120] = DCP_CB_AT_LEAST(0x0, 0x4),
 	[121] = { 0x0, 0x4, true },
+	[122] = DCP_CB_AT_LEAST(0x0, 0x1),
 	[123] = { 0x0, 0x4, true },
+	[124] = DCP_CB_AT_LEAST(0x0, 0x4),
 	[125] = { 0x64, 0x24, true },
 	[127] = { 0x4, 0x4, true },
 	[128] = { 0x1008, 0x4, true },
 	[129] = { 0x40, 0x4, true },
+	[130] = DCP_CB_AT_LEAST(0x22, 0x14),
 	[201] = { 0xc, 0x10, true },
 	[202] = { 0x1a, 0x0, true },
 	[206] = { 0x0, 0x4, true },
 	[207] = { 0x0, 0x4, true },
+	[208] = DCP_CB_AT_LEAST(0x0, 0x0),
+	[209] = DCP_CB_AT_LEAST(0x0, 0x8),
 	[300] = { 0x10, 0x0, true },
 	[400] = { 0x4c, 0xc04, true },
 	[401] = { 0x50, 0xc, true },
+	[404] = DCP_CB_AT_LEAST(0x0, 0x0),
 	[406] = { 0x48, 0x0, true },
+	[408] = DCP_CB_AT_LEAST(0x8, 0x8),
 	[411] = { 0x10, 0x1c, true },
 	[413] = { 0x1048, 0x4, true },
 	[414] = { 0x50, 0x4, true },
 	[415] = { 0x4c, 0x4, true },
 	[451] = { 0x14, 0x1c, true },
+	[452] = DCP_CB_AT_LEAST(0x18, 0x14),
 	[454] = { 0x4, 0x1, true },
 	[552] = { 0x1044, 0x4, true },
 	[561] = { 0x1044, 0x4, true },
 	[563] = { 0x4c, 0x4, true },
 	[565] = { 0x48, 0x4, true },
+	[567] = DCP_CB_AT_LEAST(0x0, 0x1),
+	[572] = DCP_CB_AT_LEAST(0x0, 0x4),
 	[574] = { 0x4, 0x8, true },
 	[575] = { 0x58, 0x4c, true },
+	[576] = DCP_CB_AT_LEAST(0x0, 0x0),
 	[582] = { 0x8, 0x4, true },
+	[583] = DCP_CB_AT_LEAST(0x0, 0x0),
+	[584] = DCP_CB_AT_LEAST(0x0, 0x0),
+	[585] = DCP_CB_AT_LEAST(0xe4, 0xe0),
 	[590] = { 0x730, 0x0, true },
+	[592] = DCP_CB_AT_LEAST(0x11, 0x0),
+	[593] = DCP_CB_AT_LEAST(0x4, 0x0),
+	[594] = DCP_CB_AT_LEAST(0x1, 0x0),
+	[595] = DCP_CB_AT_LEAST(0x0, 0x0),
+	[597] = DCP_CB_AT_LEAST(0x0, 0x1),
+	[598] = DCP_CB_AT_LEAST(0x0, 0x1),
 	[599] = { 0x0, 0x0, true },
 };
 
@@ -71,7 +109,11 @@ bool iomfb_validate_callback_h17p(int tag, u32 in_len, u32 out_len)
 	if (tag < 0 || tag >= ARRAY_SIZE(callback_sizes))
 		return false;
 	size = &callback_sizes[tag];
-	return size->valid && size->in_len == in_len && size->out_len == out_len;
+	if (!size->valid)
+		return false;
+	if (size->minimum)
+		return in_len >= size->in_len && out_len >= size->out_len;
+	return size->in_len == in_len && size->out_len == out_len;
 }
 
 struct dcp_h17p_hotplug_request {
@@ -658,6 +700,19 @@ void iomfb_start_h17p(struct apple_dcp *dcp)
 	dcp->cb_handlers = cb_handlers;
 	dcp_start_signal(dcp, false, dcp_started, NULL);
 }
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
+/* Returns the first handled tag without reply bounds, or -1. */
+int iomfb_h17p_first_unbounded_callback(void)
+{
+	int tag;
+
+	for (tag = 0; tag < IOMFB_MAX_CB; tag++)
+		if (cb_handlers[tag] && !callback_sizes[tag].valid)
+			return tag;
+	return -1;
+}
+#endif
 
 #undef DCP_FW_VER
 #undef DCP_FW
