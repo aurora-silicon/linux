@@ -24,6 +24,7 @@ use super::{
     kick, qos,
     queue::{self, admission, compute},
 };
+use core::sync::atomic::{fence, Ordering};
 use kernel::{prelude::*, sync::Arc};
 
 const QIDS: usize = 128;
@@ -117,21 +118,127 @@ impl Registry {
 
     /// An installed idle queue keeps its original QID and backing. Mapping a
     /// replacement context must succeed before its old binding is displaced.
-    pub(super) fn rebind_compute(&mut self, owner: u64, context: &Arc<Context>) -> Result<bool> {
+    /// A vacant queue (USC backing given back) is offered for re-arming only
+    /// when no populated idle queue exists.
+    pub(super) fn rebind_compute(&mut self, owner: u64, context: &Arc<Context>) -> Result<Rebind> {
         if let Some(queue) = self.compute(owner) {
-            return queue.matches(owner, queue.qid(), context);
+            return Ok(if queue.matches(owner, queue.qid(), context)? {
+                Rebind::Done
+            } else {
+                Rebind::Fresh
+            });
         }
-        let Some(queue) = self
+        let mut vacant = None;
+        for queue in self
             .compute
             .iter_mut()
             .flatten()
             .filter_map(|entry| entry.queue.as_deref_mut())
-            .find(|queue| queue.reusable())
-        else {
-            return Ok(false);
-        };
-        queue.bind_owner(owner, context.clone())?;
-        Ok(true)
+            .filter(|queue| queue.reusable())
+        {
+            if queue.pool_vacant() {
+                vacant.get_or_insert(queue.qid());
+                continue;
+            }
+            queue.bind_owner(owner, context.clone())?;
+            return Ok(Rebind::Done);
+        }
+        Ok(vacant.map_or(Rebind::Fresh, Rebind::Rearm))
+    }
+
+    /// Installs fresh USC backing into the vacant queue `qid`; the caller writes
+    /// the returned descriptor row before binding. EAGAIN if the queue was taken.
+    pub(super) fn rearm_compute(
+        &mut self,
+        qid: u8,
+        pages: crate::g17::freelist::Pages,
+    ) -> Result<(u16, u64)> {
+        let queue = self
+            .compute
+            .iter_mut()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref_mut())
+            .find(|queue| queue.qid() == qid)
+            .ok_or(EAGAIN)?;
+        queue.rearm(pages)
+    }
+
+    pub(super) fn bind_rearmed(&mut self, qid: u8, owner: u64, context: &Arc<Context>) -> Result {
+        let queue = self
+            .compute
+            .iter_mut()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref_mut())
+            .find(|queue| queue.qid() == qid && queue.reusable())
+            .ok_or(EAGAIN)?;
+        queue.bind_owner(owner, context.clone())
+    }
+
+    /// Publishes releases for the oldest idle retained pools beyond `cap`, at
+    /// most four per pass. Returns the number published.
+    pub(super) fn vacate_idle_pools(
+        &mut self,
+        init: &super::initdata::InitData,
+        cap: usize,
+    ) -> Result<usize> {
+        // Count first: event turns are frequent and the steady state has no excess.
+        let count = self
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .filter(|queue| queue.vacate_candidate())
+            .count();
+        if count <= cap {
+            return Ok(0);
+        }
+        let mut candidates: KVec<(u64, u8)> = KVec::with_capacity(count, GFP_KERNEL)?;
+        for queue in self
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .filter(|queue| queue.vacate_candidate())
+        {
+            candidates.push((queue.released_at(), queue.qid()), GFP_KERNEL)?;
+        }
+        candidates.sort_unstable();
+        let excess = candidates.len() - cap;
+        let mut published = 0;
+        for (_, qid) in candidates.iter().take(excess.min(4)) {
+            let queue = self
+                .compute
+                .iter_mut()
+                .flatten()
+                .filter_map(|entry| entry.queue.as_deref_mut())
+                .find(|queue| queue.qid() == *qid)
+                .ok_or(EIO)?;
+            match queue.vacate(init) {
+                Err(error) if error == EAGAIN => break,
+                result => result?,
+            }
+            published += 1;
+        }
+        Ok(published)
+    }
+
+    /// Frees the backing of every pool whose release the firmware consumed.
+    pub(super) fn observe_pool_releases(&mut self, init: &super::initdata::InitData) -> Result<usize> {
+        fence(Ordering::Acquire);
+        let consumer = init.control_consumer()?.load(Ordering::Relaxed);
+        let producer = init.control_producer()?.load(Ordering::Relaxed);
+        let mut freed = 0;
+        for queue in self
+            .compute
+            .iter_mut()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref_mut())
+        {
+            if queue.observe_vacancy(consumer, producer)? {
+                freed += 1;
+            }
+        }
+        Ok(freed)
     }
 
     pub(super) fn reserve_compute(&mut self, owner: u64) -> Result<ComputeReservation> {
@@ -218,6 +325,17 @@ impl Registry {
         }
         Ok(())
     }
+}
+
+/// Outcome of offering an owner a retained compute queue.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum Rebind {
+    /// The owner now holds an installed, populated queue.
+    Done,
+    /// Only a vacant queue is available; re-arm `qid` with fresh backing.
+    Rearm(u8),
+    /// No retained queue suits the owner: reserve a fresh QID.
+    Fresh,
 }
 
 /// An immutable logical owner shared by its two scheduler entities. Installed
@@ -420,15 +538,40 @@ impl Backend {
                 {
                     return Err(EIO);
                 }
-                if firmware.queues.rebind_compute(self.owner, &self.context)? {
-                    return Ok(());
+                match firmware.queues.rebind_compute(self.owner, &self.context)? {
+                    Rebind::Done => return Ok(()),
+                    Rebind::Rearm(qid) => (firmware.uat.clone(), Err(qid)),
+                    Rebind::Fresh => {
+                        let reservation = firmware.queues.reserve_compute(self.owner)?;
+                        (firmware.uat.clone(), Ok(reservation))
+                    }
                 }
-                let reservation = firmware.queues.reserve_compute(self.owner)?;
-                (firmware.uat.clone(), reservation)
             };
             let alloc = super::object::Allocator {
                 dev: &dev,
                 uat: &uat,
+            };
+            let reservation = match reservation {
+                Ok(reservation) => reservation,
+                Err(qid) => {
+                    // Fresh zeroed backing is built without the device mutex; the
+                    // queue may have been taken or re-armed by another owner since.
+                    let pages = crate::g17::freelist::Pages::compute(&alloc)?;
+                    let mut state = self.shared.state.lock();
+                    let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+                    if !lease.is_current() {
+                        continue;
+                    }
+                    let (slot, page_list) = match firmware.queues.rearm_compute(qid, pages) {
+                        Err(error) if error == EAGAIN => continue,
+                        result => result?,
+                    };
+                    // The firmware consumed this slot's release before the backing
+                    // was dropped; the row is rewritten before the queue is kicked.
+                    firmware.init.initialize_compute_pool(slot, page_list)?;
+                    firmware.queues.bind_rearmed(qid, self.owner, &self.context)?;
+                    return Ok(());
+                }
             };
             let built = (|| {
                 let pool = compute::PoolBacking::new(&alloc, reservation.id)?;
@@ -439,7 +582,7 @@ impl Backend {
                         return Err(EAGAIN);
                     }
                     firmware.queues.reserved(reservation)?;
-                    let (slot, page_list) = pool.pool_descriptor();
+                    let (slot, page_list) = pool.pool_descriptor()?;
                     firmware.init.initialize_compute_pool(slot, page_list)?;
                 }
                 let backing = compute::Backing::new(&alloc, pool)?;
@@ -923,6 +1066,27 @@ impl super::Shared {
             // RTKit destruction still dereferences the mailbox provider.
             drop(firmware);
         }
+    }
+}
+
+/// Idle retained compute queues that keep their USC pool populated; older idle
+/// pools give their backing back.
+const COMPUTE_WARM_CAP: usize = 4;
+
+impl super::Firmware {
+    /// Event-worker service step: witness consumed pool releases, then release the
+    /// oldest idle retained pools beyond the warm cap.
+    pub(in crate::g17) fn service_compute_pools(&mut self) -> Result {
+        self.queues.observe_pool_releases(&self.init)?;
+        if self.render_control_backpressured() {
+            return Ok(());
+        }
+        let published = self.queues.vacate_idle_pools(&self.init, COMPUTE_WARM_CAP)?;
+        if published != 0 {
+            fence(Ordering::SeqCst);
+            self.primary.notify(crate::g17::MSG_CONTROL_NOTIFY)?;
+        }
+        Ok(())
     }
 }
 

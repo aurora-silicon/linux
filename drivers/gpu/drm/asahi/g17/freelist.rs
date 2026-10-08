@@ -65,7 +65,7 @@ impl Drop for RenderId {
     }
 }
 
-struct Pages {
+pub(crate) struct Pages {
     backing: KernelObject,
     blocks: usize,
     layout: RunLayout,
@@ -85,6 +85,10 @@ impl Pages {
             blocks,
             layout,
         })
+    }
+    /// Fresh zeroed compute backing, built without the device mutex.
+    pub(crate) fn compute(alloc: &Allocator<'_>) -> Result<Self> {
+        Self::new(alloc, COMPUTE_BLOCKS, RunLayout::Compute)
     }
     fn page_list_va(&self) -> u64 {
         self.backing.gpu_va()
@@ -324,8 +328,11 @@ impl Submitted<'_> {
 }
 
 /// A pool owned by one physical compute queue, with fixed QID-derived slot.
+/// Idle retained queues may give their USC backing back (`pages` is `None`)
+/// once the firmware consumed the pool's release; the control and state
+/// objects the queue record names stay until processor stop.
 pub(crate) struct ComputePool {
-    pages: Pages,
+    pages: Option<Pages>,
     control: KernelObject,
     state: KernelObject,
     id: u16,
@@ -362,7 +369,7 @@ impl ComputePool {
         )?;
         fence(Ordering::SeqCst);
         Ok(Self {
-            pages,
+            pages: Some(pages),
             control,
             state,
             id,
@@ -371,15 +378,58 @@ impl ComputePool {
     pub(crate) fn id(&self) -> u16 {
         self.id
     }
-    pub(crate) fn page_list_va(&self) -> u64 {
-        self.pages.page_list_va()
+    /// EAGAIN while the pool is vacant: the owner must re-arm it first.
+    pub(crate) fn page_list_va(&self) -> Result<u64> {
+        self.pages.as_ref().map(Pages::page_list_va).ok_or(EAGAIN)
     }
     pub(crate) fn control_va(&self) -> u64 {
         self.control.gpu_va()
     }
+    pub(crate) fn populated(&self) -> bool {
+        self.pages.is_some()
+    }
+    /// The release record for this pool's buffer slot under the free-list
+    /// generation the queue last published.
+    pub(crate) fn release_record(&self, generation: u64) -> super::fw::channels::FreeListRelease {
+        super::fw::channels::FreeListRelease::new(generation, u32::from(self.id))
+    }
+    /// The caller has observed the firmware consume this pool's release.
+    pub(crate) fn drop_pages(&mut self) {
+        self.pages = None;
+    }
+    /// Rewrites the shared control header for fresh backing. The caller then
+    /// rewrites the page-pool descriptor row before the queue is kicked again.
+    /// As render repopulation does, the firmware-completed counter is carried
+    /// over so it stays consistent with the host submitted counter in `state`.
+    pub(crate) fn rearm(&mut self, pages: Pages) -> Result {
+        if self.pages.is_some() {
+            return Err(EBUSY);
+        }
+        let completed = self.control.pointer(FreeListControl::COMPLETED, 8)?;
+        let mut bytes = [0; 8];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            // SAFETY: The checked eight-byte range stays mapped; byte accesses
+            // match the unaligned packed counter the firmware writes.
+            *byte = unsafe { completed.add(index).read_volatile() };
+        }
+        let mut header = FreeListControl::compute(&FreeListArgs {
+            buffer_slot: u32::from(self.id),
+            class: FreeListClass::One,
+            page_list_va: pages.page_list_va(),
+            run_list_va: pages.run_list_va(),
+            blocks: COMPUTE_BLOCKS as u32,
+            state_va: self.state.gpu_va(),
+        });
+        header.unk_54[..8].copy_from_slice(&bytes);
+        self.control.write(0, header)?;
+        fence(Ordering::SeqCst);
+        self.pages = Some(pages);
+        Ok(())
+    }
     pub(crate) fn map_client(&mut self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
-        let address = self.pages.page_list_va();
-        self.pages
+        let pages = self.pages.as_mut().ok_or(EAGAIN)?;
+        let address = pages.page_list_va();
+        pages
             .backing
             .map_alias(vm, address, mmu::PROT_GPU_SHARED_RW)
     }

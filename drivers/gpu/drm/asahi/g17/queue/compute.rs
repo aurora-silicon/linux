@@ -7,14 +7,19 @@ pub(crate) mod exit;
 pub(crate) mod retirement;
 
 use crate::g17::{
+    channel::Rings,
     context::Context,
-    fw::{compute::COMPUTE_DESCRIPTOR_SIZE, queue::*},
+    fw::{channels::ControlRecord, compute::COMPUTE_DESCRIPTOR_SIZE, queue::*},
     object::{Allocator, CpuMap, KernelObject},
 };
 use crate::{hw::t8140::dynamic, mmu};
 use core::sync::atomic::{fence, Ordering};
 use kernel::{prelude::*, sync::Arc};
 use retirement::{Cursors, RECORD_SLOTS};
+
+fn now_ns() -> u64 {
+    <kernel::time::Monotonic as kernel::time::ClockSource>::ktime_get() as u64
+}
 
 const DESCRIPTORS: usize = 256;
 const GRAPH_SIZE: usize = 0x8000;
@@ -48,7 +53,9 @@ static_assert!(core::mem::offset_of!(GraphLayout, items) == ITEMS);
 /// until the first exact successful publication under their replacement has retired.
 struct Binding {
     _kick_alias: mmu::KernelMapping,
-    _pool_alias: mmu::KernelMapping,
+    /// Client alias of the USC pool pages; dropped when the pool is vacated and
+    /// recreated when an owner binds a re-armed pool (it pins the backing).
+    pool_alias: Option<mmu::KernelMapping>,
     _descriptors: mmu::KernelMapping,
     preempt: mmu::KernelMapping,
     usage: mmu::KernelMapping,
@@ -153,7 +160,7 @@ impl Graph {
             .alias_in(vm, dynamic::CLIENT_LOWER, page, prot)?;
         Ok(Binding {
             _kick_alias: kick_alias,
-            _pool_alias: pool_alias,
+            pool_alias: Some(pool_alias),
             _descriptors: descriptors,
             preempt,
             usage,
@@ -341,8 +348,8 @@ impl PoolBacking {
     }
 
     /// Fresh page-pool row data, installed once while the QID is still unpublished.
-    pub(crate) fn pool_descriptor(&self) -> (u16, u64) {
-        (self.pool.id(), self.pool.page_list_va())
+    pub(crate) fn pool_descriptor(&self) -> Result<(u16, u64)> {
+        Ok((self.pool.id(), self.pool.page_list_va()?))
     }
 }
 
@@ -363,8 +370,22 @@ impl Backing {
 
 /// Installed graph and its exact logical owner. A released idle graph may change owners only
 /// after a retirement witness. Failed work retains its pointers independently of fence state.
+/// USC pool backing of a retained queue. A release is published only for an idle
+/// queue without an owner; the backing is dropped once the firmware consumed it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PoolPhase {
+    Populated,
+    ReleaseSent(u32),
+    Vacant,
+}
+
 pub(crate) struct Queue {
     owner: Option<u64>,
+    pool_phase: PoolPhase,
+    /// Monotonic time the last owner released this queue (vacate order).
+    released_at: u64,
+    /// Free-list generation of the last published configuration.
+    free_list_generation: u64,
     binding: Binding,
     previous: Option<Previous>,
     kick: kick::Queue,
@@ -413,6 +434,9 @@ impl Queue {
         context.mark_published();
         Ok(Self {
             owner: Some(owner),
+            pool_phase: PoolPhase::Populated,
+            released_at: 0,
+            free_list_generation: 0,
             binding,
             previous: None,
             kick,
@@ -914,6 +938,8 @@ impl Queue {
     }
     pub(crate) fn reusable(&self) -> bool {
         self.installed
+            // A pool release in flight must be witnessed before any successor.
+            && !matches!(self.pool_phase, PoolPhase::ReleaseSent(_))
             // An issued kill still names this graph even if its commands retire
             // before the acknowledgement. It cannot acquire a successor owner.
             && self.exit.is_none()
@@ -934,6 +960,10 @@ impl Queue {
         }
         let old = self.binding.context.clone();
         if Arc::ptr_eq(old.status(), context.status()) && old.is_current() {
+            if self.binding.pool_alias.is_none() {
+                // The same VM takes back a re-armed pool: alias the new backing.
+                self.binding.pool_alias = Some(self.pool.map_client(context.vm())?);
+            }
             self.graph.set_owner(&context)?;
             self.binding.context = context.clone();
             self.previous = Some(Previous {
@@ -984,9 +1014,60 @@ impl Queue {
             }
             if self.retirement_ready {
                 self.owner = None;
+                self.released_at = now_ns();
             }
         }
         Ok(false)
+    }
+    /// An idle retained queue whose USC backing may be given back.
+    pub(crate) fn vacate_candidate(&self) -> bool {
+        self.reusable() && self.pool_phase == PoolPhase::Populated && self.pool.populated()
+    }
+    pub(crate) fn released_at(&self) -> u64 {
+        self.released_at
+    }
+    pub(crate) fn pool_vacant(&self) -> bool {
+        self.pool_phase == PoolPhase::Vacant
+    }
+    /// Publishes the release of this idle queue's free list. The caller holds the
+    /// device mutex and rings the control doorbell afterwards.
+    pub(crate) fn vacate(&mut self, init: &crate::g17::initdata::InitData) -> Result {
+        if !self.vacate_candidate() {
+            return Err(EBUSY);
+        }
+        let record = ControlRecord::FreeListRelease(
+            self.pool.release_record(self.free_list_generation),
+        );
+        let cursor = Rings::publish_control(init, &record)?;
+        self.pool_phase = PoolPhase::ReleaseSent(cursor);
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+    /// Drops the USC backing once the firmware's control consumer passed the
+    /// release. Returns true when the backing was freed by this call.
+    pub(crate) fn observe_vacancy(&mut self, consumer: u32, producer: u32) -> Result<bool> {
+        let PoolPhase::ReleaseSent(cursor) = self.pool_phase else {
+            return Ok(false);
+        };
+        if !crate::g17::freelist::control_consumed(consumer, producer, cursor)? {
+            return Ok(false);
+        }
+        // The retained owner binding's client alias pins the backing: drop it
+        // first (the owner has exited; `reusable()` proved no previous binding).
+        self.binding.pool_alias = None;
+        self.pool.drop_pages();
+        self.pool_phase = PoolPhase::Vacant;
+        Ok(true)
+    }
+    /// Installs fresh backing into a vacant pool; returns the descriptor row data
+    /// the caller writes before binding an owner.
+    pub(crate) fn rearm(&mut self, pages: crate::g17::freelist::Pages) -> Result<(u16, u64)> {
+        if self.pool_phase != PoolPhase::Vacant || !self.reusable() {
+            return Err(EAGAIN);
+        }
+        self.pool.rearm(pages)?;
+        self.pool_phase = PoolPhase::Populated;
+        Ok((self.pool.id(), self.pool.page_list_va()?))
     }
     /// Exact host identity remains valid even when several commands share an ioctl ID.
     pub(crate) fn owns_packet(&self, packet: &Arc<Packet>) -> bool {
@@ -1299,6 +1380,7 @@ impl Queue {
             qos: packet.context.qos_id(),
             context: packet.context.id(),
         };
+        self.free_list_generation = u64::from(packet.context.scheduler_generation());
         let config = QueueConfig::new(&QueueConfigArgs {
             target: QueueConfigTarget::Compute,
             kick_ring_va: self.kick.low_va(),
