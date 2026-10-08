@@ -853,6 +853,14 @@
 		pinctrl-names = "default";
 		power-domains = <&ps_spi2>;
 		status = "disabled";
+
+		mesa: fingerprint@0 {
+			compatible = "apple,mesa-fingerprint";
+			reg = <0>;
+			spi-max-frequency = <8000000>;
+			spi-cpol;
+			status = "disabled";
+		};
 	};
 
 	spi4: spi@39b110000 {

@@ -900,6 +900,14 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 			status = "disabled";
+
+			mesa: fingerprint@0 {
+				compatible = "apple,mesa-fingerprint";
+				reg = <0>;
+				spi-max-frequency = <8000000>;
+				spi-cpha;
+				status = "disabled";
+			};
 		};
 
 		spi3: spi@23510c000 {
@@ -1670,12 +1678,17 @@
 
 		};
 
+		/*
+		 * iBoot hands over a running SEP. Keep Linux off its DART at boot;
+		 * apple_sep sets the DMA range and enables it, as on t602x.
+		 */
 		sep_dart: iommu@25d2c0000 {
 			compatible = "apple,t8112-dart", "apple,t8110-dart";
 			reg = <0x2 0x5d2c0000 0x0 0x4000>;
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 282 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
 		};
 
 		sep: sep@25e400000 {

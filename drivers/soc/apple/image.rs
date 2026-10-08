@@ -59,18 +59,24 @@ static_assert!(HEADER_WIRE == 4 + HEADER_SIZE as usize);
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Version {
     V1,
+    /// Negotiated from the `0x4d` capability word. Laid out as version 1, but
+    /// `__payload_hash` (0xfffffe000996b970) digests the header through the
+    /// trailer (0x…ba68-ba80) where version 1 stops before it (0x…ba84-ba90).
+    V2,
 }
 
 impl Version {
     pub(crate) const fn wire(self) -> u32 {
         match self {
             Version::V1 => 1,
+            Version::V2 => 2,
         }
     }
 
     const fn digest_end(self) -> usize {
         match self {
             Version::V1 => OFF_TRAILER,
+            Version::V2 => HEADER_SIZE as usize,
         }
     }
 }

@@ -20,15 +20,21 @@ state. Do not enable it on other installations without equivalent checks.
   locator failure: the highest-scoring window begins 90 APFS blocks after the
   true file start and extends beyond `.gl`. This proves ambiguity in that
   locator, **not** the cause of the previously damaged installation.
+- Static inspection of the macOS 27.2 AppleSEPManager kernel collection found
+  `gl_rec_write` allocating a fresh 0x9000-byte slot, writing it, then clearing
+  0x1000 bytes at the former slot. The low-level write path also calls a disk
+  cache-synchronization ioctl. `gl_fixup_rev_init` validates records and
+  handles duplicates during open. These observations do not prove that our
+  APFS ownership and failure ordering match macOS.
 
 ## Before authorizing writes
 
-1. Confirm the raw-device access and extent-locking behaviour on hardware,
+1. Confirm the exact macOS vnode/raw-device and extent-locking contract,
    including whether any APFS copy-on-write, snapshot, encryption, or remap
    state can invalidate the physical mapping during Linux's lifetime.
 2. Verify record ordering, duplicate selection, failed-write recovery,
-   barriers/cache synchronization, and revision behavior in controlled
-   non-production tests.
+   barriers/cache synchronization, and revision behavior against both macOS
+   code and controlled non-production tests.
 3. Compare a pre/post macOS-and-Linux power-cycle trace, with APFS checksums,
    `.gl` mapping and records checked before and after. Keep a recoverable image
    of the iBoot partition before the first write experiment.

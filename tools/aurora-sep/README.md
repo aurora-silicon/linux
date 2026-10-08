@@ -3,6 +3,11 @@
 These files connect the Apple SEP kernel driver to the shared APFS xART
 gigalocker and the desktop fingerprint stack.
 
+See [M1-SUPPORT.md](M1-SUPPORT.md) for the T8103 firmware requirements,
+reboot-persistent enrollment fixes, reference-key recovery caveats and current
+validation boundaries. The historical bring-up results below describe the
+individual builds at the time they were tested.
+
 Install the driver service:
 
 ```sh

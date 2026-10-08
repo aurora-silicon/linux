@@ -40,11 +40,7 @@ const STATE_COMMITTED_BAG_UUID: u32 = 3;
 
 /// Only an `AsGenerated` UUID may be repaired on a mismatch; adopting one for a
 /// read-back record would point it at a different bag and strand the real one.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UuidProvenance {
-    AsGenerated,
-    ReadBackFromBag,
-}
+pub(crate) use crate::keybag_identity::{SnapshotIdentity, UuidProvenance};
 
 impl UuidProvenance {
     fn state(self) -> u32 {
@@ -266,6 +262,26 @@ pub(crate) fn write_bag_uuid(
     )
 }
 
+/// Commits a bag named by the host-generated UUID it was created with: the
+/// 13.5 enclave keeps an identity bag itself and loads it by that UUID.
+pub(crate) fn write_generated_uuid(
+    slot: Slot,
+    wrapped: &[u8],
+    uuid: &[u8; UUID_LEN],
+    secret: &[u8],
+) -> Result<()> {
+    if wrapped.is_empty() || wrapped.len() > MAX_WRAPPED || secret.len() > MAX_WRAPPED {
+        return Err(EINVAL);
+    }
+    write_record(
+        slot,
+        UuidProvenance::AsGenerated.state(),
+        wrapped,
+        uuid,
+        secret,
+    )
+}
+
 /// Replaces only the wrapped blob. The enclave ratchets bag material while a bag
 /// is active, so this snapshot must be re-taken at the catacomb-save commit or
 /// the enclave answers a later restore empty.
@@ -273,6 +289,7 @@ pub(crate) fn replace_wrapped(
     slot: Slot,
     fresh: &[u8],
     snapshot_uuid: &[u8; UUID_LEN],
+    identity: &SnapshotIdentity,
 ) -> Result<()> {
     if fresh.is_empty() || fresh.len() > MAX_WRAPPED {
         return Err(EINVAL);
@@ -281,8 +298,9 @@ pub(crate) fn replace_wrapped(
         State::Present(stored) => stored,
         State::Absent(_) => return Err(ENOENT),
     };
-    if stored.uuid() != snapshot_uuid {
-        // A snapshot of a different bag would strand the stored one.
+    if !identity.accepts(stored.uuid(), stored.uuid_provenance(), snapshot_uuid) {
+        // Reject a different bag or changed host identity. The generated
+        // Sepos13 lookup UUID is not the UUID returned by COPY_KEYBAG_UUID.
         return Err(EPERM);
     }
     write_record(
