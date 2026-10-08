@@ -401,6 +401,47 @@ impl Pair {
     }
 }
 
+/// Kick barriers of one render. The fragment kick always waits for its own tiling kick;
+/// with the fragment-barriers flag the resolved prefix orders the fragment kick too and the
+/// tiling kick keeps only its implicit parent, otherwise the prefix orders the tiling kick.
+/// A compute dependency always orders the tiling kick.
+struct RenderBarriers {
+    tiling: [KickDependency; 3],
+    tiling_count: usize,
+    fragment: [KickDependency; 3],
+    fragment_count: usize,
+}
+
+fn render_barriers(
+    fragment_stage: bool,
+    dependencies: &RenderDependencies,
+    own_tiling: KickDependency,
+) -> RenderBarriers {
+    let mut tiling_barriers = [KickDependency::ZERO; 3];
+    let mut tiling_count = 0;
+    let mut fragment_barriers = [own_tiling; 3];
+    let mut fragment_count = 1;
+    for dependency in dependencies.render() {
+        if fragment_stage {
+            fragment_barriers[fragment_count] = *dependency;
+            fragment_count += 1;
+        } else {
+            tiling_barriers[tiling_count] = *dependency;
+            tiling_count += 1;
+        }
+    }
+    if let Some(compute) = dependencies.compute {
+        tiling_barriers[tiling_count] = compute;
+        tiling_count += 1;
+    }
+    RenderBarriers {
+        tiling: tiling_barriers,
+        tiling_count,
+        fragment: fragment_barriers,
+        fragment_count,
+    }
+}
+
 impl Pair {
     /// All descriptor bytes and retained allocations are ready before entry.
     /// The first inner producer establishes firmware ownership, including on
@@ -422,37 +463,9 @@ impl Pair {
             },
         };
         use core::sync::atomic::{fence, Ordering};
-        if self.pending_aliases.is_some() || self.kick_aliases.is_some() {
-            return Err(EBUSY);
-        }
-        let (epoch, recovery_state) = host.epoch()?;
-        if recovery_state != 0
-            || self.quarantined
-            || !self.active.room()
-            || packet.completion.render_slot() != Some(self.slot)
-        {
-            return Err(EBUSY);
-        }
-        let prepared = self.prepared.as_ref().ok_or(EINVAL)?;
-        if !Arc::ptr_eq(&prepared.packet, &packet)
-            || prepared.ordinal != self.ordinal
-            || !self.memory.owns(self.ordinal)
-            || !packet.context.is_current()
-        {
-            return Err(EIO);
-        }
-        if packet.completion.status().get() != 0 {
-            return Err(EIO);
-        }
-        let policy = packet.context.policy();
-        // A registration of another class can only follow a rebind, which
-        // requires the pair to have drained.
-        if self.registered.is_some_and(|class| class != policy.priority()) && self.in_flight() {
-            return Err(EIO);
-        }
+        let (epoch, mcache, policy) = self.publication_preflight(&packet, host)?;
         let ordinal = self.ordinal;
         let next_ordinal = ordinal.checked_add(1).ok_or(EOVERFLOW)?;
-        let mcache = prepared.mcache;
         let qids = self.qids();
         let kicks = self.kicks.each_ref().map(kick::Queue::timestamp);
         let parents = self.kicks.each_ref().map(kick::Queue::parent);
@@ -534,32 +547,12 @@ impl Pair {
             self.memory.graph.queues.gpu_va()
                 + u64::from(qid) * size_of::<queue::QueueRecord>() as u64
         });
-        // The fragment kick always waits for its own tiling kick. With the
-        // fragment-barriers flag the resolved prefix orders the fragment kick
-        // too, and the tiling kick keeps only its implicit parent, so vertex
-        // work overlaps the predecessors' fragment work as on the native stack.
         let Validated::Render { pass, .. } = &packet.command else {
             return Err(EINVAL);
         };
         let own_tiling = KickDependency::new(qids[0], kicks[0]).ok_or(EINVAL)?;
-        let mut tiling_barriers = [KickDependency::ZERO; 3];
-        let mut tiling_count = 0;
-        let mut fragment_barriers = [own_tiling; 3];
-        let mut fragment_count = 1;
-        for dependency in dependencies.render() {
-            if pass.fragment_barriers {
-                fragment_barriers[fragment_count] = *dependency;
-                fragment_count += 1;
-            } else {
-                tiling_barriers[tiling_count] = *dependency;
-                tiling_count += 1;
-            }
-        }
-        if let Some(compute) = dependencies.compute {
-            tiling_barriers[tiling_count] = compute;
-            tiling_count += 1;
-        }
-        let tiling_barriers = &tiling_barriers[..tiling_count];
+        let barriers = render_barriers(pass.fragment_barriers, dependencies, own_tiling);
+        let tiling_barriers = &barriers.tiling[..barriers.tiling_count];
         let args = |stage: usize, barriers, arrays, mcache| KickArgs {
             qid: qids[stage],
             timestamp: kicks[stage],
@@ -589,7 +582,7 @@ impl Pair {
         );
         let fragment_args = args(
             1,
-            &fragment_barriers[..fragment_count],
+            &barriers.fragment[..barriers.fragment_count],
             abi::FragmentDescriptor::register_bindings(
                 self.memory.graph.descriptor_client(1, ordinal),
             )?,
@@ -727,11 +720,7 @@ impl Pair {
                 }
                 self.active.back_mut().ok_or(EIO)?.qos_completed = true;
                 self.quarantined = true;
-                if !packet.completion.spared() && self.terminal.is_none() {
-                    self.terminal = Some((packet.completion.status().clone(), error));
-                }
-                defer(Deferred::FailedOwned(packet.completion.clone(), error))?;
-                self.active.back_mut().ok_or(EIO)?.failed = true;
+                self.record_publication_failure(&packet, error, defer)?;
                 return Err(error);
             }
         };
@@ -749,11 +738,89 @@ impl Pair {
             previous.publication = Some(ordinal);
         }
         packet.context.mark_published();
+        self.announce_publication(
+            host,
+            (&fragment_slot, &tiling_slot, outer_next),
+            lease.free_list_generation,
+            policy.priority(),
+            &packet,
+            defer,
+        )
+    }
+
+    /// Everything that must hold before a publication changes any state: no alias work
+    /// pending, a healthy device epoch, room in the active ring, this slot's packet, the
+    /// prepared descriptors for this ordinal, a clean completion status and a registration
+    /// class the pair can still take. Returns the epoch, the prepared memory-cache setting
+    /// and the owner's policy.
+    fn publication_preflight(
+        &self,
+        packet: &Arc<Packet>,
+        host: &mut impl Host,
+    ) -> Result<(u64, Option<McacheTable>, crate::g17::fw::queue::Policy)> {
+        if self.pending_aliases.is_some() || self.kick_aliases.is_some() {
+            return Err(EBUSY);
+        }
+        let (epoch, recovery_state) = host.epoch()?;
+        if recovery_state != 0
+            || self.quarantined
+            || !self.active.room()
+            || packet.completion.render_slot() != Some(self.slot)
+        {
+            return Err(EBUSY);
+        }
+        let prepared = self.prepared.as_ref().ok_or(EINVAL)?;
+        if !Arc::ptr_eq(&prepared.packet, packet)
+            || prepared.ordinal != self.ordinal
+            || !self.memory.owns(self.ordinal)
+            || !packet.context.is_current()
+        {
+            return Err(EIO);
+        }
+        if packet.completion.status().get() != 0 {
+            return Err(EIO);
+        }
+        let policy = packet.context.policy();
+        // A registration of another class can only follow a rebind, which
+        // requires the pair to have drained.
+        if self.registered.is_some_and(|class| class != policy.priority()) && self.in_flight() {
+            return Err(EIO);
+        }
+        Ok((epoch, prepared.mcache, policy))
+    }
+
+    /// Records a failed publication on the retained active entry: the terminal status
+    /// (once), the deferred failure and the entry's failed flag.
+    fn record_publication_failure(
+        &mut self,
+        packet: &Arc<Packet>,
+        error: Error,
+        defer: &mut impl FnMut(Deferred) -> Result,
+    ) -> Result {
+        if !packet.completion.spared() && self.terminal.is_none() {
+            self.terminal = Some((packet.completion.status().clone(), error));
+        }
+        defer(Deferred::FailedOwned(packet.completion.clone(), error))?;
+        self.active.back_mut().ok_or(EIO)?.failed = true;
+        Ok(())
+    }
+
+    /// Activates the pool lease and announces the retained pair to the firmware; a failure
+    /// here quarantines the pair with the packet still retained for recovery.
+    fn announce_publication(
+        &mut self,
+        host: &mut impl Host,
+        (fragment_slot, tiling_slot, outer_next): (&WorkSlot, &WorkSlot, [u32; 2]),
+        free_list_generation: u64,
+        priority: u8,
+        packet: &Arc<Packet>,
+        defer: &mut impl FnMut(Deferred) -> Result,
+    ) -> Result {
         let publish = (|| {
-            host.activate_render_pool(self.free_list.id(), lease.free_list_generation)?;
-            host.publish_retained_pair(policy.priority(), &fragment_slot, &tiling_slot, outer_next)?;
+            host.activate_render_pool(self.free_list.id(), free_list_generation)?;
+            host.publish_retained_pair(priority, fragment_slot, tiling_slot, outer_next)?;
             self.active.back_mut().ok_or(EIO)?.outer_published = true;
-            host.notify_render(policy.priority())?;
+            host.notify_render(priority)?;
             host.note_submission()
         })();
         if let Err(error) = publish {
@@ -764,11 +831,7 @@ impl Pair {
                 .packet
                 .completion
                 .quarantine_render();
-            if !packet.completion.spared() && self.terminal.is_none() {
-                self.terminal = Some((packet.completion.status().clone(), error));
-            }
-            defer(Deferred::FailedOwned(packet.completion.clone(), error))?;
-            self.active.back_mut().ok_or(EIO)?.failed = true;
+            self.record_publication_failure(packet, error, defer)?;
             return Err(error);
         }
         Ok(())
