@@ -6384,28 +6384,33 @@ static void map_anon_folio_pte_pf(struct folio *folio, pte_t *pte,
 /* One native-window batch, initialized and locked before PTE publication. */
 static int anon_subpage_prealloc_mask(struct mm_struct *mm,
 				      struct vm_area_struct *vma, unsigned long addr,
-				      unsigned long mask, bool use_pool, bool *pooled,
-				      struct mm_subpage **slots)
+				      unsigned long mask, bool use_pool, bool any_offset,
+				      bool *pooled, struct mm_subpage **slots)
 {
 	struct mm_subpage_pool *pool;
 	struct folio *folio;
+	unsigned int count = hweight_long(mask);
+	bool arbitrary;
 	int err;
 
 retry_private:
 	pool = use_pool ? mm_subpage_cow_pool_get(mm, vma, addr) : NULL;
 	*pooled = pool != NULL;
+	arbitrary = *pooled && any_offset;
 	if (!pool)
 		pool = mm_subpage_pool_create_granule(GFP_KERNEL, mm_page_shift(mm));
 	if (!pool)
 		return -ENOMEM;
 	for (;;) {
-		err = mm_subpage_alloc_mask_locked(pool, mask, slots);
+		err = arbitrary ? mm_subpage_alloc_any_mask_locked(pool, mask, slots) :
+			mm_subpage_alloc_mask_locked(pool, mask, slots);
 		if (err != -EAGAIN)
 			break;
 		folio = NULL;
 		if (*pooled) {
 			folio = cow_subpage_speculative_folio(mm, vma, addr);
-			if (!folio && mm_subpage_cow_wait_busy_mask(pool, mask)) {
+			if (!folio && (arbitrary ? mm_subpage_cow_wait_busy_count(pool, count) :
+			     mm_subpage_cow_wait_busy_mask(pool, mask))) {
 				cond_resched();
 				continue;
 			}
@@ -6422,15 +6427,20 @@ retry_private:
 			use_pool = false;
 			goto retry_private;
 		}
-		err = mm_subpage_pool_add_folio_mask(pool, folio, mask,
+		err = arbitrary ? mm_subpage_pool_add_folio_count(pool, folio, count,
+					 GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN) :
+			mm_subpage_pool_add_folio_mask(pool, folio, mask,
 			*pooled ? GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN : GFP_KERNEL);
 		if (*pooled && err == -ENOMEM) {
-			if (mm_subpage_cow_wait_busy_mask(pool, mask)) {
+			if (arbitrary ? mm_subpage_cow_wait_busy_count(pool, count) :
+			    mm_subpage_cow_wait_busy_mask(pool, mask)) {
 				folio_put(folio);
 				cond_resched();
 				continue;
 			}
-			err = mm_subpage_pool_add_folio_mask(pool, folio, mask, GFP_KERNEL);
+			err = arbitrary ?
+				mm_subpage_pool_add_folio_count(pool, folio, count, GFP_KERNEL) :
+				mm_subpage_pool_add_folio_mask(pool, folio, mask, GFP_KERNEL);
 		}
 		if (err) {
 			folio_put(folio);
@@ -6493,8 +6503,9 @@ retry:
 	pte_unmap(vmf->pte);
 	vmf->pte = NULL;
 	err = anon_subpage_prealloc_mask(mm, vma, vmf->address, mask,
-		mask != window_mask && !force_private && !userfaultfd_armed(vma),
-		&pooled, slots);
+		(mask != window_mask || nr < (PAGE_SIZE >> mm_page_shift(mm))) &&
+		!force_private && !userfaultfd_armed(vma),
+		nr < (PAGE_SIZE >> mm_page_shift(mm)), &pooled, slots);
 	if (err)
 		return VM_FAULT_OOM;
 	folio = mm_subpage_folio(slots[__ffs(mask)]);
@@ -7092,7 +7103,9 @@ static vm_fault_t finish_user_page_fault(struct vm_fault *vmf)
 	struct mm_subpage *slot = vmf->cow_subpage;
 	bool is_cow = (vmf->flags & FAULT_FLAG_WRITE) && !(vma->vm_flags & VM_SHARED);
 	struct folio *folio = page_folio(is_cow ? vmf->cow_page : vmf->page);
+	bool fresh = false;
 	vm_fault_t ret;
+	int err;
 	pte_t entry;
 
 	if (!(vma->vm_flags & VM_SHARED)) {
@@ -7106,10 +7119,18 @@ static vm_fault_t finish_user_page_fault(struct vm_fault *vmf)
 		else if (pte_alloc(mm, vmf->pmd))
 			return VM_FAULT_OOM;
 	}
-	/* The private destination is not yet visible through a PTE. */
+	/* A reserved destination slot is private; sibling slots may be published. */
 	if (is_cow) {
 		folio_get(folio);
 		folio_lock(folio);
+		if (slot) {
+			fresh = !mm_subpage_anon_root(slot);
+			err = mm_subpage_prepare_anon_rmap(slot, vma, vmf->address);
+			if (err) {
+				ret = err == -ENOMEM ? VM_FAULT_OOM : VM_FAULT_SIGBUS;
+				goto unlock_folio;
+			}
+		}
 	}
 	vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);
 	ret = VM_FAULT_NOPAGE;
@@ -7121,7 +7142,9 @@ static vm_fault_t finish_user_page_fault(struct vm_fault *vmf)
 	}
 	if (slot) {
 		mm_subpage_set_exclusive(slot);
-		if (WARN_ON_ONCE(mm_subpage_add_new_anon_rmap(slot, vma, vmf->address))) {
+		err = fresh ? mm_subpage_add_new_anon_rmap(slot, vma, vmf->address) :
+			mm_subpage_add_anon_rmap(slot, vma, vmf->address);
+		if (WARN_ON_ONCE(err)) {
 			ret = VM_FAULT_SIGBUS;
 			goto unlock;
 		}
@@ -7129,7 +7152,8 @@ static vm_fault_t finish_user_page_fault(struct vm_fault *vmf)
 		entry = maybe_mkwrite(pte_mkdirty(pte_sw_mkyoung(entry)), vma);
 		if (vmf_orig_pte_uffd_wp(vmf))
 			entry = pte_mkuffd_wp(entry);
-		subpage_add_new_lru(folio, vma, 1);
+		if (fresh)
+			subpage_add_new_lru(folio, vma, 1);
 		set_pte_at(mm, vmf->address, vmf->pte, entry);
 		update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
 		inc_mm_counter(mm, MM_ANONPAGES);
@@ -7476,6 +7500,10 @@ static vm_fault_t do_cow_fault(struct vm_fault *vmf)
 	struct vm_area_struct *vma = vmf->vma;
 	struct folio *folio;
 	vm_fault_t ret;
+#ifdef CONFIG_MM_SUBPAGE
+	bool pooled = false, force_private = false;
+	vm_fault_t earlier = 0;
+#endif
 
 	ret = vmf_can_call_fault(vmf);
 	if (!ret)
@@ -7484,11 +7512,24 @@ static vm_fault_t do_cow_fault(struct vm_fault *vmf)
 		return ret;
 
 #ifdef CONFIG_MM_SUBPAGE
+retry_subpage:
 	if (mm_page_size(vma->vm_mm) < PAGE_SIZE) {
-		vmf->cow_subpage = anon_subpage_prealloc(vma->vm_mm, vma, vmf->address);
+		/* Known callbacks only supply a locked source page for the core.
+		 * Custom/DAX callbacks may fill a native cow_page or finish COW.
+		 */
+		if (!force_private && !userfaultfd_armed(vma) &&
+		    (vma->vm_ops->fault == filemap_fault || vma_is_shmem(vma))) {
+			vmf->cow_subpage = cow_subpage_prealloc(vma->vm_mm, vma,
+					vmf->address, NULL, false, &pooled);
+			if (!IS_ERR(vmf->cow_subpage))
+				folio_unlock(mm_subpage_folio(vmf->cow_subpage));
+		} else {
+			pooled = false;
+			vmf->cow_subpage = anon_subpage_prealloc(vma->vm_mm, vma, vmf->address);
+		}
 		if (IS_ERR(vmf->cow_subpage)) {
 			vmf->cow_subpage = NULL;
-			return VM_FAULT_OOM;
+			return earlier | VM_FAULT_OOM;
 		}
 		folio = mm_subpage_folio(vmf->cow_subpage);
 		goto allocated;
@@ -7513,12 +7554,22 @@ allocated:
 
 #ifdef CONFIG_MM_SUBPAGE
 	if (vmf->cow_subpage) {
-		if (copy_user_subpage_range(vmf->cow_page, mm_subpage_offset(vmf->cow_subpage),
-				     vmf->page, vma_page_offset_at(vma, vmf->address).offset,
-				     mm_page_size(vma->vm_mm))) {
+		int err;
+
+		/* No destination lock crosses the source fault callback or retry. */
+		if (pooled)
+			folio_lock(folio);
+		err = copy_user_subpage_range(vmf->cow_page, mm_subpage_offset(vmf->cow_subpage),
+				vmf->page, vma_page_offset_at(vma, vmf->address).offset,
+				mm_page_size(vma->vm_mm));
+		if (pooled)
+			folio_unlock(folio);
+		if (err) {
 			ret = VM_FAULT_HWPOISON;
 			goto unlock;
 		}
+		/* Preserve concurrent sibling lock/LRU/waiter flag updates. */
+		folio_mark_uptodate(folio);
 		goto copied;
 	}
 #endif
@@ -7539,21 +7590,36 @@ allocated:
 			goto unlock;
 		}
 	}
+	__folio_mark_uptodate(folio);
 #ifdef CONFIG_MM_SUBPAGE
 copied:
 #endif
-
-	__folio_mark_uptodate(folio);
 
 	ret |= finish_fault(vmf);
 unlock:
 	unlock_page(vmf->page);
 	put_page(vmf->page);
+#ifdef CONFIG_MM_SUBPAGE
+	vmf->page = NULL;
+	/* Publication OOM left the PTE untouched. Retry with private metadata,
+	 * outside the source lock; never loop internally on callback RETRY.
+	 */
+	if (pooled && (ret & VM_FAULT_OOM)) {
+		mm_subpage_put(vmf->cow_subpage);
+		vmf->cow_subpage = NULL;
+		vmf->cow_page = NULL;
+		earlier |= ret & VM_FAULT_MAJOR;
+		force_private = true;
+		goto retry_subpage;
+	}
+	ret |= earlier;
+#endif
 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
 		goto uncharge_out;
 	return ret;
 uncharge_out:
 #ifdef CONFIG_MM_SUBPAGE
+	ret |= earlier;
 	if (vmf->cow_subpage) {
 		mm_subpage_put(vmf->cow_subpage);
 		vmf->cow_subpage = NULL;
