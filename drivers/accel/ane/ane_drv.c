@@ -360,6 +360,8 @@ void ane_reclaim_preserved(struct ane_device *ane)
 	unsigned long count = 0;
 
 	lockdep_assert_held(&ane->engine_lock);
+	ane_dart_release_scratch(ane, ane->scratch, ane->scratch_pages);
+	ane->scratch_pages = 0;
 
 	list_for_each_entry_safe(p, tmp, &ane->preserved_list, list) {
 		u64 iova = p->mm->start;
