@@ -2581,7 +2581,6 @@ F:	Documentation/devicetree/bindings/power/reset/apple,smc-reboot.yaml
 F:	Documentation/devicetree/bindings/pwm/apple,s5l-fpwm.yaml
 F:	Documentation/devicetree/bindings/reset/apple,t8103-cio-reset.yaml
 F:	Documentation/devicetree/bindings/rtc/apple,smc-rtc.yaml
-F:	Documentation/devicetree/bindings/spi/apple,qspi.yaml
 F:	Documentation/devicetree/bindings/spi/apple,spi.yaml
 F:	Documentation/devicetree/bindings/spmi/apple,spmi.yaml
 F:	Documentation/devicetree/bindings/thunderbolt/apple,t8103-usb4-acio.yaml
@@ -2617,7 +2616,6 @@ F:	drivers/pwm/pwm-apple.c
 F:	drivers/reset/reset-apple-cio.c
 F:	drivers/rtc/rtc-macsmc.c
 F:	drivers/soc/apple/*
-F:	drivers/spi/spi-apple-qspi.c
 F:	drivers/spi/spi-apple.c
 F:	drivers/spmi/spmi-apple-controller.c
 F:	drivers/thunderbolt/apple.c
@@ -2633,6 +2631,13 @@ F:	tools/testing/selftests/drivers/apple/
 F:	include/uapi/drm/asahi_drm.h
 F:	net/bluetooth/brcm.c
 F:	net/bluetooth/brcm.h
+
+ARM/APPLE QSPIMC DRIVER
+M:	Ryan Murray <ryan@aurorasilicon.org>
+L:	asahi@lists.linux.dev
+S:	Maintained
+F:	Documentation/devicetree/bindings/spi/apple,qspi.yaml
+F:	drivers/spi/spi-apple-qspi.c
 
 ARM/ARTPEC MACHINE SUPPORT
 M:	Jesper Nilsson <jesper.nilsson@axis.com>
