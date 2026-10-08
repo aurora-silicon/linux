@@ -1364,14 +1364,18 @@ retry_private:
 	if (!pool)
 		return ERR_PTR(-ENOMEM);
 	for (;;) {
-		slot = source ? mm_subpage_copy_at_locked(pool, source, offset) :
-			mm_subpage_alloc_at_locked(pool, offset);
+		if (*pooled)
+			slot = source ? mm_subpage_copy_locked(pool, source) :
+				mm_subpage_alloc_locked(pool);
+		else
+			slot = source ? mm_subpage_copy_at_locked(pool, source, offset) :
+				mm_subpage_alloc_at_locked(pool, offset);
 		if (!IS_ERR(slot) || PTR_ERR(slot) != -EAGAIN)
 			break;
 		folio = NULL;
 		if (*pooled) {
 			folio = cow_subpage_speculative_folio(mm, vma, addr);
-			if (!folio && mm_subpage_cow_wait_busy_at(pool, offset)) {
+			if (!folio && mm_subpage_cow_wait_busy(pool)) {
 				cond_resched();
 				continue;
 			}
@@ -1392,15 +1396,16 @@ retry_private:
 			force_private = true;
 			goto retry_private;
 		}
-		err = mm_subpage_pool_add_folio_at(pool, folio, offset,
-			*pooled ? GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN : GFP_KERNEL);
+		err = *pooled ? mm_subpage_pool_add_folio(pool, folio,
+				GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN) :
+			mm_subpage_pool_add_folio_at(pool, folio, offset, GFP_KERNEL);
 		if (*pooled && err == -ENOMEM) {
-			if (mm_subpage_cow_wait_busy_at(pool, offset)) {
+			if (mm_subpage_cow_wait_busy(pool)) {
 				folio_put(folio);
 				cond_resched();
 				continue;
 			}
-			err = mm_subpage_pool_add_folio_at(pool, folio, offset, GFP_KERNEL);
+			err = mm_subpage_pool_add_folio(pool, folio, GFP_KERNEL);
 		}
 		if (err) {
 			folio_put(folio);
@@ -4639,7 +4644,6 @@ static vm_fault_t wp_subpage_copy(struct vm_fault *vmf)
 	struct mmu_notifier_range range;
 	bool copied = false, unshare = vmf->flags & FAULT_FLAG_UNSHARE;
 	bool force_private = false, pooled, fresh, retry_private = false;
-	unsigned int offset;
 	vm_fault_t ret = VM_FAULT_SIGBUS;
 	pte_t entry;
 	int err;
@@ -4689,7 +4693,6 @@ static vm_fault_t wp_subpage_copy(struct vm_fault *vmf)
 	ret = vmf_anon_prepare(vmf);
 	if (ret)
 		goto out;
-	offset = vma_page_offset_at(vma, vmf->address).offset;
 	ret = VM_FAULT_OOM;
 retry_copy:
 	dest = cow_subpage_prealloc(mm, vma, vmf->address, source, force_private, &pooled);
@@ -4701,7 +4704,7 @@ retry_copy:
 	}
 	new = mm_subpage_folio(dest);
 	if (old && !source) {
-		err = copy_user_subpage_range(&new->page, offset, vmf->page,
+		err = copy_user_subpage_range(&new->page, mm_subpage_offset(dest), vmf->page,
 					pte_phys_mm(mm, vmf->orig_pte) & ~PAGE_MASK,
 					mm_page_size(mm));
 		if (err) {
@@ -4726,13 +4729,11 @@ retry_copy:
 	 * slot identity before taking PTL, with a fresh-folio fallback on ENOMEM.
 	 */
 	fresh = !mm_subpage_anon_root(dest);
-	if (!fresh) {
-		err = mm_subpage_bind_rmap(dest, vma, vmf->address);
-		if (err) {
-			ret = err == -ENOMEM ? VM_FAULT_OOM : VM_FAULT_SIGBUS;
-			retry_private = pooled && err == -ENOMEM;
-			goto unlock_folio;
-		}
+	err = mm_subpage_prepare_anon_rmap(dest, vma, vmf->address);
+	if (err) {
+		ret = err == -ENOMEM ? VM_FAULT_OOM : VM_FAULT_SIGBUS;
+		retry_private = pooled && err == -ENOMEM;
+		goto unlock_folio;
 	}
 	vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);
 	if (!vmf->pte)
@@ -5550,6 +5551,11 @@ static vm_fault_t do_swap_subpage(struct vm_fault *vmf, swp_entry_t entry)
 		slot = NULL;
 		if (err != -EAGAIN)
 			ret = err == -ENOMEM ? VM_FAULT_OOM : VM_FAULT_SIGBUS;
+		goto unlock_folio;
+	}
+	err = mm_subpage_prepare_anon_rmap(slot, vma, vmf->address);
+	if (err) {
+		ret = err == -ENOMEM ? VM_FAULT_OOM : VM_FAULT_SIGBUS;
 		goto unlock_folio;
 	}
 	folio_throttle_swaprate(folio, GFP_KERNEL);
@@ -6501,17 +6507,15 @@ retry:
 	/* Existing owners may need nonlinear identities. Allocate metadata before
 	 * PTL and keep the established fresh-folio fallback on metadata ENOMEM.
 	 */
-	if (!fresh) {
-		for_each_set_bit(index, &mask, ARRAY_SIZE(slots)) {
-			unsigned long address = start +
-				((index - first_offset) << mm_page_shift(mm));
+	for_each_set_bit(index, &mask, ARRAY_SIZE(slots)) {
+		unsigned long address = start +
+			((index - first_offset) << mm_page_shift(mm));
 
-			err = mm_subpage_bind_rmap(slots[index], vma, address);
-			if (err) {
-				ret = err == -ENOMEM ? VM_FAULT_OOM : VM_FAULT_SIGBUS;
-				retry_private = pooled && err == -ENOMEM;
-				goto unlock_folio;
-			}
+		err = mm_subpage_prepare_anon_rmap(slots[index], vma, address);
+		if (err) {
+			ret = err == -ENOMEM ? VM_FAULT_OOM : VM_FAULT_SIGBUS;
+			retry_private = pooled && err == -ENOMEM;
+			goto unlock_folio;
 		}
 	}
 	vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);

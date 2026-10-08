@@ -10,6 +10,8 @@ TEST_GEN_FILES += compat-shm-probe compat-perf-probe compat-numa-probe compat-nu
 TEST_GEN_PROGS_EXTENDED += anon-hole-refill anon-hole-refill-race anon-hole-refill-reclaim
 TEST_FILES += README.hole-refill README.hole-refill-race README.hole-refill-reclaim
 TEST_FILES += compat-script runtime-app.py
+TEST_GEN_PROGS_EXTENDED += same-quarter file-cow-consumers same-native
+TEST_FILES += README.any-quarter check-any-quarter.py
 include ../../lib.mk
 
 $(OUTPUT)/page-contract: page-contract.c x18-probe.S
