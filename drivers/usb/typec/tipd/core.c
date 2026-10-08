@@ -1167,6 +1167,41 @@ static void cd321x_resume_reverify(struct tps6598x *tps)
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
 }
 
+/*
+ * A CD321x can reset itself, as some Thunderbolt devices make it do when
+ * they are unplugged.  It comes back running its application firmware, but
+ * in its default system power state and with its default interrupt mask,
+ * and says so only through an event outside the mask probe set.  The port
+ * then reports no further plug, and a DP alt-mode adapter gets no power,
+ * until the driver is bound again.  Set the controller up again as probe
+ * does when an event outside the mask arrives and the setup is gone.
+ */
+static void cd321x_check_setup(struct cd321x *cd321x, u64 event)
+{
+	struct tps6598x *tps = &cd321x->tps;
+	u64 mask;
+	u8 state;
+
+	lockdep_assert_held(&tps->lock);
+	if (!(event & ~tps->data->irq_mask1) ||
+	    cd321x->pm.phase == CD321X_PM_PREPARED ||
+	    cd321x->pm.phase == CD321X_PM_REMOVED)
+		return;
+	if (tps6598x_read8(tps, TPS_REG_SYSTEM_POWER_STATE, &state) ||
+	    tps6598x_read64(tps, TPS_REG_INT_MASK1, &mask))
+		return;
+	if (state == TPS_SYSTEM_POWER_STATE_S0 && mask == tps->data->irq_mask1)
+		return;
+
+	dev_warn(tps->dev,
+		 "controller lost its setup (power state %u, interrupt mask %016llx), setting it up again\n",
+		 state, mask);
+	if (tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0))
+		dev_err(tps->dev, "could not return the controller to S0\n");
+	if (tps6598x_write64(tps, TPS_REG_INT_MASK1, tps->data->irq_mask1))
+		dev_err(tps->dev, "could not restore the interrupt mask\n");
+}
+
 static irqreturn_t cd321x_interrupt(int irq, void *data)
 {
 	struct tps6598x *tps = data;
@@ -1187,6 +1222,7 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 		goto err_unlock;
 
 	tps6598x_write64(tps, TPS_REG_INT_CLEAR1, event);
+	cd321x_check_setup(container_of(tps, struct cd321x, tps), event);
 
 	if (!tps6598x_read_status(tps, &status))
 		goto err_unlock;
