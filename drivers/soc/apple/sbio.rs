@@ -3017,6 +3017,9 @@ impl SepData {
         // verification available on the preliminary Catacomb proof alone;
         // complete_bringup finishes the proof and sets templates_restored.
         self.templates_restored.store(false, Relaxed);
+        // The nonce path synced the view before COMPLETE_INIT to refresh SCRD.
+        // Re-arm the final proof and its bounded retry on every cold restore.
+        self.device_view_synced.store(false, Relaxed);
         if !candidate {
             dev_err!(
                 self.dev,
