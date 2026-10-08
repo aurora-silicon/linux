@@ -340,21 +340,17 @@ pub(crate) struct Tvb {
     extensions: KVec<KernelObject>,
 }
 impl Tvb {
+    /// Blocks are packed in the backing; only their VA placement keeps the
+    /// stride and its trailing guard.
     fn bytes(blocks: usize) -> Result<usize> {
-        blocks
-            .checked_sub(1)
-            .and_then(|v| v.checked_mul(cfg::TVB_BLOCK_STRIDE as usize))
-            .and_then(|v| v.checked_add(cfg::TVB_BLOCK_SIZE))
-            .ok_or(EOVERFLOW)
+        blocks.checked_mul(cfg::TVB_BLOCK_SIZE).ok_or(EOVERFLOW)
     }
     fn map_block(
         object: &KernelObject,
         vm: &mmu::Vm,
         relative: usize,
     ) -> Result<mmu::KernelMapping> {
-        let start = relative
-            .checked_mul(cfg::TVB_BLOCK_STRIDE as usize)
-            .ok_or(EOVERFLOW)?;
+        let start = relative.checked_mul(cfg::TVB_BLOCK_SIZE).ok_or(EOVERFLOW)?;
         let source = start..start.checked_add(cfg::TVB_BLOCK_SIZE).ok_or(EOVERFLOW)?;
         let mapping = compact_alias(
             object,
