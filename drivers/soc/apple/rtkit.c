@@ -670,18 +670,21 @@ int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_start_ep);
 
-static void apple_rtkit_claim_rx(struct apple_rtkit *rtk)
+static int apple_rtkit_claim_rx(struct apple_rtkit *rtk)
 {
 	struct apple_mbox *mbox = rtk->mbox;
 	unsigned long flags;
 
 	spin_lock_irqsave(&mbox->rx_lock, flags);
-	if (mbox->rx || mbox->cookie)
-		dev_warn(rtk->dev,
-			 "RTKit: mailbox receiver already claimed, taking it over\n");
+	if (mbox->rx || mbox->cookie) {
+		spin_unlock_irqrestore(&mbox->rx_lock, flags);
+		return -EBUSY;
+	}
 	mbox->cookie = rtk;
 	mbox->rx = apple_rtkit_rx;
 	spin_unlock_irqrestore(&mbox->rx_lock, flags);
+
+	return 0;
 }
 
 static void apple_rtkit_detach_rx(struct apple_rtkit *rtk)
@@ -759,7 +762,9 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 		goto free_rtk;
 	}
 
-	apple_rtkit_claim_rx(rtk);
+	ret = apple_rtkit_claim_rx(rtk);
+	if (ret)
+		goto destroy_wq;
 
 	ret = apple_mbox_start(rtk->mbox);
 	if (ret)
@@ -770,6 +775,9 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 stop_rx:
 	apple_rtkit_stop_rx(rtk);
 	apple_rtkit_release_rx(rtk);
+	goto free_rtk;
+destroy_wq:
+	destroy_workqueue(rtk->wq);
 free_rtk:
 	kfree(rtk);
 	return ERR_PTR(ret);
