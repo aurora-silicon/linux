@@ -1318,7 +1318,12 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 		 */
 		if (dcp->typec_connector && dcp->external_native)
 			dcp_external_sink_irq(dcp);
-		else if (dcp->typec_connector)
+		else if (dcp->typec_connector &&
+			 !READ_ONCE(dcp->typec_connector->connected)) {
+			ret = dcp_dptx_recover_irq(dcp);
+			if (ret)
+				return ret;
+		} else if (dcp->typec_connector)
 			dcp_retrain_oob(dcp->typec_connector);
 	}
 	port->hpd = hpd;

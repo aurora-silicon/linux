@@ -463,6 +463,17 @@ static bool dcp_session_valid_locked(struct apple_dcp *dcp,
 					READ_ONCE(dcp->typec_follow_retiring));
 }
 
+/* Recovery must not wake a deliberately parked or disabled output. */
+static bool dcp_connect_session_valid_locked(struct apple_dcp *dcp,
+					    struct dcp_fabric_session session,
+					    bool cable, bool recovery)
+{
+	return (!recovery || (dcp->typec_work_enabled &&
+			     !READ_ONCE(dcp->typec_crtc_off) &&
+			     !READ_ONCE(dcp->crashed))) &&
+	       dcp_session_valid_locked(dcp, session, cable);
+}
+
 /* Capture at enqueue, not when a stale worker eventually starts running. */
 void dcp_queue_typec_reconnect(struct apple_dcp *dcp, unsigned long delay)
 {
@@ -476,7 +487,8 @@ void dcp_queue_typec_reconnect(struct apple_dcp *dcp, unsigned long delay)
 }
 
 static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
-				    struct dcp_fabric_session session, bool cable)
+				    struct dcp_fabric_session session, bool cable,
+				    bool recovery)
 {
 	unsigned long timeout;
 	int ret = 0;
@@ -499,7 +511,7 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 		 dcp->connector_type, dcp->dptxport[port].connected);
 
 	mutex_lock(&dcp->hpd_mutex);
-	if (!dcp_session_valid_locked(dcp, session, cable)) {
+	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
 		ret = -ESTALE;
 		goto out_unlock;
 	}
@@ -530,7 +542,7 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 		goto out_unlock;
 	}
 
-	if (!dcp_session_valid_locked(dcp, session, cable)) {
+	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
 		ret = -ESTALE;
 		goto out_unlock;
 	}
@@ -545,7 +557,7 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 		goto out_unlock;
 	}
 
-	if (!dcp_session_valid_locked(dcp, session, cable)) {
+	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
 		ret = -ESTALE;
 		goto out_unlock;
 	}
@@ -556,7 +568,7 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 			ret);
 		goto out_release;
 	}
-	if (!dcp_session_valid_locked(dcp, session, cable)) {
+	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
 		ret = -ESTALE;
 		goto out_release;
 	}
@@ -594,7 +606,7 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 					  timeout);
 	mutex_lock(&dcp->hpd_mutex);
 	/* A revoked wait must not disconnect or publish readiness for a new session. */
-	if (!dcp_session_valid_locked(dcp, session, cable)) {
+	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
 		ret = -ESTALE;
 		goto out_unlock;
 	}
@@ -610,7 +622,7 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 		jiffies_to_msecs(timeout - ret));
 
 	usleep_range(5, 10);
-	if (!dcp_session_valid_locked(dcp, session, cable)) {
+	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
 		ret = -ESTALE;
 		goto out_unlock;
 	}
@@ -620,7 +632,7 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 		if (ret && dcp->external)
 			goto out_disconnect;
 	}
-	if (!dcp_session_valid_locked(dcp, session, cable)) {
+	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
 		ret = -ESTALE;
 		goto out_unlock;
 	}
@@ -868,7 +880,7 @@ int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 
 	scoped_guard(mutex, &dcp->hpd_mutex)
 		session = dcp_session_locked(dcp);
-	return dcp_dptx_connect_session(dcp, port, session, !!session.cookie);
+	return dcp_dptx_connect_session(dcp, port, session, !!session.cookie, false);
 }
 
 static bool dcp_edid_is_placeholder(const struct drm_edid *drm_edid)
@@ -962,7 +974,7 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 		    !dcp_session_valid_locked(dcp, session, true))
 			return;
 	}
-	ret = dcp_dptx_connect_session(dcp, 0, session, true);
+	ret = dcp_dptx_connect_session(dcp, 0, session, true, false);
 	guard(mutex)(&dcp->hpd_mutex);
 	if (!dcp_session_valid_locked(dcp, session, true))
 		return;
@@ -1079,6 +1091,64 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 	}
 
 	return dcp_dptx_disconnect_drained(dcp, port);
+}
+
+/* A delivered sink IRQ can follow a firmware unplug with cable HPD still high. */
+int dcp_dptx_recover_irq(struct apple_dcp *dcp)
+{
+	struct dcp_fabric_session session;
+	int ret;
+
+	mutex_lock(&dcp->hpd_mutex);
+	if (dcp->external_native || !dcp_is_typec_output(dcp) ||
+	    dcp_is_usb4_output(dcp) || !dcp->typec_connector ||
+	    READ_ONCE(dcp->typec_connector->connected) ||
+	    READ_ONCE(dcp->typec_crtc_off)) {
+		ret = 0;
+		goto out_unlock;
+	}
+	if (!dcp->typec_work_enabled || READ_ONCE(dcp->crashed) ||
+	    !dcp->dptxport[0].enabled) {
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
+	session = dcp_session_locked(dcp);
+	if (!dcp_connect_session_valid_locked(dcp, session, true, true)) {
+		ret = -ESTALE;
+		goto out_unlock;
+	}
+
+	/* Revoke older reconnect waits without changing physical cable state. */
+	dcp->typec_generation++;
+	session = dcp_session_locked(dcp);
+	cancel_delayed_work(&dcp->typec_reconnect_wq);
+	cancel_delayed_work(&dcp->placeholder_edid_wq);
+	if (dcp->avep)
+		av_service_disconnect(dcp);
+	ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
+	if (ret)
+		goto out_unlock;
+	if (!dcp_connect_session_valid_locked(dcp, session, true, true)) {
+		ret = -ESTALE;
+		goto out_unlock;
+	}
+	/* A failed earlier connect may also have left an unconfirmed release. */
+	ret = dptxport_release_display(dcp->dptxport[0].service);
+	if (ret)
+		goto out_unlock;
+	if (!dcp_connect_session_valid_locked(dcp, session, true, true)) {
+		ret = -ESTALE;
+		goto out_unlock;
+	}
+	dcp->dptxport[0].connected = false;
+	mutex_unlock(&dcp->hpd_mutex);
+
+	/* Another delivered IRQ must confirm release before a failed attempt retries. */
+	return dcp_dptx_connect_session(dcp, 0, session, true, true);
+
+out_unlock:
+	mutex_unlock(&dcp->hpd_mutex);
+	return ret;
 }
 
 /*
@@ -1816,6 +1886,7 @@ static int dcp_connector_type_from_dt(struct device_node *np)
 static void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
 {
 	scoped_guard(mutex, &dcp->hpd_mutex) {
+		dcp->typec_work_enabled = false;
 		if (release_cable)
 			WRITE_ONCE(dcp->typec_cable_connected, false);
 		dcp->typec_generation++;
@@ -1835,6 +1906,8 @@ static void dcp_enable_typec_work(struct apple_dcp *dcp)
 	enable_delayed_work(&dcp->hdmi_settle_wq);
 	enable_delayed_work(&dcp->hdmi_recheck_wq);
 	dcp_hdmi_enable(dcp);
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		dcp->typec_work_enabled = true;
 	/* A cable can be routed before the DRM component binds. */
 	if (READ_ONCE(dcp->typec_cable_connected))
 		dcp_queue_typec_reconnect(dcp, 0);
