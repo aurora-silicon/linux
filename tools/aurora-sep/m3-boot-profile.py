@@ -10,7 +10,6 @@ from pathlib import Path
 import re
 import shutil
 import stat
-import subprocess
 import tempfile
 
 BEGIN = '# >>> aurora-sep: persistent experimental M3 GPU'
@@ -64,7 +63,7 @@ def without_block(text):
         raise ValueError('malformed persistent boot block')
     return re.sub(r'\n?' + re.escape(BEGIN) + r'\n.*?' + re.escape(END) + r'\n?', '\n', text, flags=re.S)
 
-def entry(text, kernel, depth=2, require_cmdline=True):
+def entry(text, kernel, depth=2):
     lines = text.splitlines(keepends=True)
     matches = []
     for i, line in enumerate(lines):
@@ -78,8 +77,7 @@ def entry(text, kernel, depth=2, require_cmdline=True):
                 if m[1] in fields: raise ValueError('duplicate entry field')
                 fields[m[1]] = (j, m[2])
         matches.append(fields)
-    required = ('protocol', 'path', 'cmdline') if require_cmdline else ('protocol', 'path')
-    if len(matches) != 1 or any(k not in matches[0] for k in required):
+    if len(matches) != 1 or any(k not in matches[0] for k in ('protocol', 'path', 'cmdline')):
         raise ValueError(f'exactly one complete {"/" * depth}{kernel} entry is required')
     if matches[0]['protocol'][1] != 'efi': raise ValueError('only EFI UKI entries are supported')
     return lines, matches[0]
@@ -138,25 +136,24 @@ def limine(args):
                 saved = dict(path='boot():' + rel + '#' + digest,
                              cmdline=cmdline(fields['cmdline'][1], False), release=args.release)
                 atomic(state_path, (json.dumps(saved, sort_keys=True) + '\n').encode())
-            # A top-level custom EFI node survives limine-entry-tool's kernel
-            # replacement. Register it before any package hook can run. We
-            # already hold both tool locks; recursive hooks/mutex are disabled.
-            target = args.esp / saved['path'].split('#')[0].removeprefix('boot():/')
-            subprocess.run([str(args.entry_tool), '--add-efi', FALLBACK, str(target),
-                            '--comment', 'Aurora retained kernel; GPU disabled',
-                            '--priority', '90', '--overwrite', '--no-mutex',
-                            '--no-hooks', '--quiet'], check=True)
-            text = regular(conf).read_text()
-            lines, fields = entry(text, FALLBACK, 1, require_cmdline=False)
-            uki_path(args.esp, fields['path'][1])
-            j, _ = fields['path']
-            lines[j] = '    path: ' + saved['path'] + '\n'
-            if 'cmdline' in fields:
-                j, _ = fields['cmdline']; lines[j] = '    cmdline: ' + saved['cmdline'] + '\n'
+            # Publish a custom top-level EFI node under both locks. Kernel
+            # regeneration owns only the OS's kernel children; the custom
+            # node has no machine-id/kernel-id and survives that writer.
+            # The 1.37.1 --add-efi CLI requires x86_64, so it cannot register
+            # this entry on the Air. Publish the same custom menu format here.
+            if re.search(r'^\s*/' + re.escape(FALLBACK) + r'\s*$', clean, re.M):
+                _, fields = entry(clean, FALLBACK, 1)
+                if fields['path'][1] != saved['path'] or fields['cmdline'][1] != saved['cmdline']:
+                    raise ValueError('existing custom fallback differs from retained entry')
+                output = clean
             else:
-                lines.insert(j + 1, '    cmdline: ' + saved['cmdline'] + '\n')
+                output = (clean.rstrip() + '\n\n/' + FALLBACK + '\n'
+                          '    # Aurora retained kernel; GPU disabled\n'
+                          '    # order-priority=90\n'
+                          '    protocol: efi\n    path: ' + saved['path'] + '\n'
+                          '    cmdline: ' + saved['cmdline'] + '\n')
             if regular(conf).read_text() != text: raise ValueError('Limine configuration changed during retain')
-            atomic(conf, ''.join(lines).encode())
+            atomic(conf, output.encode())
             return
         saved = json.loads(regular(state_path).read_text())
         uki_path(args.esp, saved['path'])
@@ -181,11 +178,10 @@ def main():
     p.add_argument('--kernel', default='linux-aurora')
     p.add_argument('--release', default=os.uname().release)
     p.add_argument('--modules', type=Path, default=Path('/usr/lib/modules'))
-    p.add_argument('--entry-tool', type=Path, default=Path('/usr/bin/limine-entry-tool'))
     p.add_argument('--lock', type=Path, action='append')
     args = p.parse_args()
     args.lock = args.lock or [Path('/run/lock/boot-partition.lock'), Path('/tmp/limine-global.lock')]
     try: limine(args)
-    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as e: p.exit(1, f'M3 boot profile refused: {e}\n')
+    except (OSError, ValueError, KeyError) as e: p.exit(1, f'M3 boot profile refused: {e}\n')
 
 if __name__ == '__main__': main()

@@ -1458,12 +1458,20 @@ class GpuExperimentFlagTest(Base):
         self.assertLess(log.rindex("air-gpu-oneshot.sh --disarm"), log.index("pacman -Sy"))
 
     def test_the_agent_prompt_states_the_first_arming(self):
-        prompt = SRC[SRC.index("The GPU start experiment, only when the maintainer"):]
-        prompt = " ".join(prompt[:1500].split())
+        prompt = SRC[SRC.index("The optional\n      --m3-gpu-experiment"):]
+        prompt = " ".join(prompt[:1800].split())
         self.assertIn("tested on an M3 Pro only", prompt)
         self.assertIn("sudo air-gpu-oneshot.sh t8122_pstate_cap=1", prompt)
         self.assertIn('"ubootefi.var: does not name air-gpu-oneshot"', prompt)
         self.assertNotIn("is the normal one", prompt)
+
+    def test_matched_persistent_prompt_does_not_require_one_shot_or_migration(self):
+        prompt = SRC[SRC.index("J613 experimental acceleration with the matched installer:"):]
+        prompt = " ".join(prompt[:2400].split())
+        self.assertIn('bash install-aurora-sep.sh --m3-gpu-persistent',prompt)
+        self.assertIn('bash install-aurora-sep.sh --m3-profile=j613-25g83',prompt)
+        self.assertIn('It does not require a firmware migration or a separate one-shot arming command',prompt)
+        self.assertIn('Linux14 cannot select this profile',prompt)
 
     def test_air_gets_the_scripts_and_nothing_is_armed(self):
         self.mac("j615")  # a kernel-only Air (the J613 gets the display handoff by default)

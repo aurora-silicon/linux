@@ -31,6 +31,13 @@ class Persistent(test_m3_handoff.M3PathTest):
         setup=self.setup_profile('j613-25g83','v1.6.1')
         self.assertIn('stage 1 is v1.6.1',self.run_sh(setup+'m3_stage1_problem').stdout)
 
+    def test_scott_dirty_stage1_stub1483_os147_current14_admitted(self):
+        setup=self.setup_profile(stage1='v1.6.1-dirty')
+        (self.dt/'chosen/asahi,os-fw-version').write_bytes(b'14.7\0')
+        out=self.run_sh(setup+'m3_plan\nm3_persistent_preflight\necho "$M3_MODE"').stdout
+        self.assertIn('handoff',out)
+        self.assertEqual(self.run_sh(setup+'m3_stub_problem\nm3_stage1_problem').stdout,'')
+
     def test_persistent25_uses_own_fw_and_sourcebuilt_stage1(self):
         setup=self.setup_profile('j613-25g83','source-built-25')
         out=self.run_sh(setup+'m3_plan\nm3_persistent_preflight\necho "$M3_MODE"\nm3_switches').stdout

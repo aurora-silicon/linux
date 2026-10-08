@@ -23,26 +23,10 @@ class BootProfile(unittest.TestCase):
         (modules/'pkgbase').write_text('linux-aurora\n');(modules/'modules.dep').write_text('fixture\n')
         (modules/'dtbs').mkdir();(modules/'dtbs/wrong.dtb').touch()
         self.lock1=self.root/'lock1';self.lock2=self.root/'lock2'
-        # Model the documented custom-EFI API, without mounting a FAT ESP or
-        # invoking the host's boot tool. Kernel regeneration below preserves
-        # this top-level entry, as the production tool's tree writer does.
-        self.tool=self.root/'entry-tool'
-        self.tool.write_text('''#!/usr/bin/env python3
-import os, sys
-from pathlib import Path
-args=sys.argv[1:]
-assert args[0]=='--add-efi' and '--no-mutex' in args and '--no-hooks' in args
-assert '--overwrite' in args and args[args.index('--priority')+1]=='90'
-esp=Path(os.environ['FIXTURE_ESP']); conf=esp/'EFI/BOOT/limine.conf'
-text=conf.read_text(); name='/'+args[1]
-if name in text: text=text[:text.index(name)].rstrip()+'\\n'
-path=Path(args[2]).relative_to(esp)
-conf.write_text(text+'\\n'+name+'\\n    protocol: efi\\n    path: boot():/'+str(path)+'\\n')
-''')
-        self.tool.chmod(0o755)
     def run_helper(self,action,ok=True):
-        import os
-        result=subprocess.run(['python3',str(HELPER),action,'--esp',str(self.esp),'--state',str(self.state),'--defaults',str(self.defaults),'--modules',str(self.root/'modules'),'--release','6.12-test','--entry-tool',str(self.tool),'--lock',str(self.lock1),'--lock',str(self.lock2)],capture_output=True,text=True,env={**os.environ,'FIXTURE_ESP':str(self.esp)})
+        import os, shlex
+        runner=shlex.split(os.environ.get("M3_TEST_PYTHON", "python3"))
+        result=subprocess.run(runner+[str(HELPER),action,'--esp',str(self.esp),'--state',str(self.state),'--defaults',str(self.defaults),'--modules',str(self.root/'modules'),'--release','6.12-test','--lock',str(self.lock1),'--lock',str(self.lock2)],capture_output=True,text=True)
         if ok:self.assertEqual(result.returncode,0,result.stderr)
         else:self.assertNotEqual(result.returncode,0)
         return result
