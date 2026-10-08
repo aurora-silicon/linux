@@ -2645,6 +2645,7 @@ static struct pci_driver bcm4377_pci_driver = {
 	.probe = bcm4377_probe,
 	.driver.pm = &bcm4377_ops,
 };
+
 static int __init bcm4377_init(void)
 {
 	int ret;
