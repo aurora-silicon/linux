@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Carve the per-device Mesa calibration from an Apple iBoot System Container."""
+"""Carve the per-device Mesa calibration from an Apple iBoot System Container.
+
+Most Macs keep it as a comb record wrapping an FSCl IMG4. The MacBook Neo
+(J700) keeps it as a standalone IMG4 whose IM4P type is FSC2. Manifest
+presence is checked; cryptographic signatures are not verified.
+"""
 
 import argparse
 import hashlib
@@ -15,6 +20,8 @@ SYS_BLOCK = Path("/sys/class/block")
 DEV_ROOT = Path("/dev")
 SCAN_CHUNK_SIZE = 4 * 1024 * 1024
 SCAN_OVERLAP = 4 * 1024 * 1024
+DER_MAX_DEPTH = 32
+DER_MAX_NODES = 16384
 
 
 class DERError(ValueError):
@@ -22,24 +29,45 @@ class DERError(ValueError):
 
 
 class TLV:
-    def __init__(self, data, start):
+    def __init__(self, data, start, require_complete=True, allow_high_tag=False):
+        if start < 0:
+            raise DERError("negative DER offset")
         self.start = start
         try:
             self.tag = data[start]
-            first_length = data[start + 1]
         except IndexError as error:
             raise DERError("truncated DER header") from error
 
+        length_at = start + 1
+        if allow_high_tag and self.tag & 0x1f == 0x1f:
+            number = 0
+            for width in range(5):
+                if length_at >= len(data):
+                    raise DERError("truncated DER identifier")
+                part = data[length_at]
+                length_at += 1
+                if width == 0 and part == 0x80:
+                    raise DERError("non-minimal DER identifier")
+                number = (number << 7) | (part & 0x7f)
+                if not part & 0x80:
+                    break
+            else:
+                raise DERError("unreasonably large DER identifier")
+            if number < 31:
+                raise DERError("non-minimal DER identifier")
+        if length_at >= len(data):
+            raise DERError("truncated DER header")
+        first_length = data[length_at]
         if first_length < 0x80:
             length = first_length
-            header_length = 2
+            header_length = length_at - start + 1
         else:
             length_bytes = first_length & 0x7f
             if length_bytes == 0:
                 raise DERError("indefinite DER length")
             if length_bytes > 4:
                 raise DERError("unreasonably large DER length")
-            length_start = start + 2
+            length_start = length_at + 1
             length_end = length_start + length_bytes
             if length_end > len(data):
                 raise DERError("truncated DER length")
@@ -49,21 +77,21 @@ class TLV:
             length = int.from_bytes(encoded, "big")
             if length < 0x80:
                 raise DERError("non-minimal DER length")
-            header_length = 2 + length_bytes
+            header_length = length_at - start + 1 + length_bytes
 
         self.content_start = start + header_length
         self.end = self.content_start + length
-        if self.end > len(data):
+        if require_complete and self.end > len(data):
             raise DERError("DER value extends beyond input")
 
     def content(self, data):
         return data[self.content_start:self.end]
 
 
-def child_tlvs(data, container):
+def child_tlvs(data, container, allow_high_tag=False):
     offset = container.content_start
     while offset < container.end:
-        child = TLV(data, offset)
+        child = TLV(data, offset, allow_high_tag=allow_high_tag)
         if child.end > container.end:
             raise DERError("DER child extends beyond its container")
         yield child
@@ -127,7 +155,7 @@ def validate_calibration(data, start):
     if b"CALB" not in payload[:64]:
         raise DERError("FSCl payload lacks its CALB header")
 
-    # A signed calibration has an IM4M manifest following the IM4P. Requiring
+    # An FSCl calibration has IM4M manifest markers after the IM4P. Requiring
     # both markers avoids accepting an arbitrary, truncated FSCl object.
     remainder = data[im4p.end:img4.end]
     if b"IM4M" not in remainder or b"FSCl" not in remainder:
@@ -136,7 +164,110 @@ def validate_calibration(data, start):
     return outer.end
 
 
+def validate_der_tree(data, value, budget, depth=0):
+    """Bound constructed DER fields; primitive payload bytes remain opaque."""
+    if depth > DER_MAX_DEPTH or budget[0] <= 0:
+        raise DERError("DER constructed fields exceed validation limits")
+    budget[0] -= 1
+    if value.tag & 0x20:
+        for child in child_tlvs(data, value, allow_high_tag=True):
+            validate_der_tree(data, child, budget, depth + 1)
+
+
+def validate_fsc2_image(data, start):
+    """Validate an FSC2 IMG4 structure and manifest presence, not its signature."""
+    img4 = TLV(data, start)
+    if img4.tag != 0x30:
+        raise DERError("IMG4 is not a sequence")
+    img4_children = child_tlvs(data, img4)
+    take_child(data, img4_children, 0x16, b"IMG4")
+
+    im4p = take_child(data, img4_children, 0x30)
+    im4p_children = child_tlvs(data, im4p, allow_high_tag=True)
+    take_child(data, im4p_children, 0x16, b"IM4P")
+    take_child(data, im4p_children, 0x16, b"FSC2")
+    take_child(data, im4p_children, 0x16)
+    payload = take_child(data, im4p_children, 0x04).content(data)
+    if b"CALB" not in payload[:256]:
+        raise DERError("FSC2 payload lacks its CALB header")
+
+    # Optional IM4P fields must still be bounded DER objects.
+    budget = [DER_MAX_NODES]
+    for field in im4p_children:
+        validate_der_tree(data, field, budget)
+    manifest = take_child(data, img4_children, 0xA0)
+    manifest_children = child_tlvs(data, manifest)
+    im4m = take_child(data, manifest_children, 0x30)
+    im4m_children = child_tlvs(data, im4m)
+    take_child(data, im4m_children, 0x16, b"IM4M")
+    validate_der_tree(data, im4m, budget)
+    if next(manifest_children, None) is not None:
+        raise DERError("manifest wrapper contains more than one IM4M")
+    if next(img4_children, None) is not None:
+        raise DERError("unexpected data after FSC2 manifest")
+    return img4.end
+
+
+def find_container_ranges(data, name):
+    """Recognize enclosing ranges even when a body spans scan windows."""
+    ranges = set()
+    signature = b"\x16" + bytes([len(name)]) + name
+    search_at = 0
+    while True:
+        marker = data.find(signature, search_at)
+        if marker < 0:
+            break
+        for header_length in range(2, 7):
+            start = marker - header_length
+            if start < 0 or data[start] != 0x30:
+                continue
+            try:
+                outer = TLV(data, start, require_complete=False)
+                if outer.content_start != marker:
+                    continue
+                child = TLV(data, marker)
+                if child.end > outer.end:
+                    continue
+            except DERError:
+                continue
+            ranges.add((start, outer.end))
+        search_at = marker + 1
+    return ranges
+
+
+def find_comb_ranges(data):
+    return find_container_ranges(data, b"comb")
+
+
 def find_calibrations(data):
+    results = find_comb_calibrations(data)
+    container_ranges = find_comb_ranges(data) | find_container_ranges(data, b"IMG4")
+    # Reject nested images even when their enclosing IMG4 is malformed.
+    signature = b"\x16\x04IMG4"
+    search_at = 0
+    while True:
+        marker = data.find(signature, search_at)
+        if marker < 0:
+            break
+        for header_length in range(2, 7):
+            start = marker - header_length
+            if start < 0 or data[start] != 0x30:
+                continue
+            if (any(begin < start < end for begin, end in container_ranges)
+                    or any(begin <= start < end for begin, end in results)):
+                continue
+            try:
+                end = validate_fsc2_image(data, start)
+            except DERError:
+                continue
+            candidate = (start, end)
+            if candidate not in results:
+                results.append(candidate)
+        search_at = marker + 1
+    return results
+
+
+def find_comb_calibrations(data):
     results = []
     signature = b"\x16\x04comb"
     search_at = 0
@@ -221,6 +352,8 @@ def scan_input(path):
         raise RuntimeError(f"{path} is not a regular file or block device")
 
     candidates = {}
+    comb_ranges = set()
+    image_ranges = set()
     overlap = b""
     total = 0
     with path.open("rb", buffering=0) as source:
@@ -231,11 +364,22 @@ def scan_input(path):
             total += len(chunk)
             window = overlap + chunk
             window_start = total - len(window)
+            comb_ranges.update((window_start + start, window_start + end)
+                               for start, end in find_comb_ranges(window))
+            image_ranges.update((window_start + start, window_start + end)
+                                for start, end in find_container_ranges(window, b"IMG4"))
             for start, end in find_calibrations(window):
                 absolute_start = window_start + start
                 candidates.setdefault(absolute_start, bytes(window[start:end]))
             overlap = window[-SCAN_OVERLAP:]
-    return sorted(candidates.items())
+    # A nested image can be complete before its enclosing object is complete.
+    enclosing_ranges = comb_ranges | image_ranges | {(start, start + len(blob))
+                                      for start, blob in candidates.items()}
+    # Keep every legacy comb candidate, including pre-existing ambiguity.
+    comb_starts = {begin for begin, _ in comb_ranges}
+    return sorted((start, blob) for start, blob in candidates.items()
+                  if start in comb_starts
+                  or not any(begin < start < end for begin, end in enclosing_ranges))
 
 
 def write_private(path, blob):
@@ -307,7 +451,7 @@ def main():
                 candidates.append((input_path, offset, blob))
         if not candidates:
             raise RuntimeError(
-                "no signed Mesa FSCl/CALB calibration found; expected the raw "
+                "no manifest-marked Mesa FSCl or FSC2 calibration found; expected the raw "
                 "iBoot System Container (Apple Silicon boot partition)"
             )
         blobs = {}
