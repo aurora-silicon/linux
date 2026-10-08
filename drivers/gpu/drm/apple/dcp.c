@@ -2839,8 +2839,14 @@ static void dcp_work_register_backlight(struct work_struct *work)
 	if (ret == -ENODATA)
 		goto out_unlock;
 	if (ret) {
-		dev_err(dcp->dev, "Unable to register backlight device\n");
-		dcp->brightness.maximum = 0;
+		dev_err(dcp->dev, "Unable to register backlight device: %d\n", ret);
+		/*
+		 * The H17P policy encodes the panel ceiling into every present
+		 * and keeps working without a class device; only older
+		 * firmware stops sending brightness here.
+		 */
+		if (!dcp_backlight_active(dcp))
+			dcp->brightness.maximum = 0;
 	}
 
 out_unlock:
