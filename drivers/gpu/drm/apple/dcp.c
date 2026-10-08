@@ -2442,6 +2442,24 @@ static void dcp_platform_remove(struct platform_device *pdev)
 
 static void dcp_platform_shutdown(struct platform_device *pdev)
 {
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (dcp && dcp->hw.adopt_live_session &&
+	    dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		/*
+		 * This firmware keeps scanning across soft DPMS and has no
+		 * qualified stop sequence. Component unbind releases the RTKit
+		 * devres group and the piodma domain while firmware may still
+		 * access them. Stop host submissions but keep the component and
+		 * its DMA resources alive until the system resets.
+		 */
+		iomfb_queue_stop(dcp);
+		cancel_work_sync(&dcp->bl_register_wq);
+		cancel_work_sync(&dcp->bl_update_wq);
+		return;
+	}
+
 	component_del(&pdev->dev, &dcp_comp_ops);
 }
 
