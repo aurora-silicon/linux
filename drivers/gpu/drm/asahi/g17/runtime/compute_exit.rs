@@ -97,7 +97,7 @@ impl Firmware {
         for entry in self.queues.compute.iter().flatten() {
             if let Some(queue) = entry.queue.as_deref() {
                 let bit = 1u128 << queue.qid();
-                if Arc::ptr_eq(queue.context(), context) {
+                if queue.context().is_some_and(|bound| Arc::ptr_eq(bound, context)) {
                     own |= bit;
                 } else {
                     foreign |= bit;
