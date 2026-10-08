@@ -124,12 +124,22 @@ static struct cpuidle_driver apple_idle_driver = {
 
 static int apple_cpuidle_probe(struct platform_device *pdev)
 {
+	/* A T8140 CPU PD opt-in hung J700; expose only WFI. */
+	if (of_machine_is_compatible("apple,t8140"))
+		apple_idle_driver.state_count = STATE_WFI + 1;
+
 	return cpuidle_register(&apple_idle_driver, NULL);
 }
+
+static const struct of_device_id apple_cpuidle_of_match[] = {
+	{ .compatible = "apple,t8140-cpuidle" },
+	{ }
+};
 
 static struct platform_driver apple_cpuidle_driver = {
 	.driver = {
 		.name = "cpuidle-apple",
+		.of_match_table = apple_cpuidle_of_match,
 	},
 	.probe = apple_cpuidle_probe,
 };
@@ -137,11 +147,19 @@ static struct platform_driver apple_cpuidle_driver = {
 static int __init apple_cpuidle_init(void)
 {
 	struct platform_device *pdev;
+	struct device_node *np;
 	int ret;
 
 	ret = platform_driver_register(&apple_cpuidle_driver);
 	if (ret)
 		return ret;
+
+	/* DT-described systems are populated by the OF platform code. */
+	np = of_find_matching_node(NULL, apple_cpuidle_of_match);
+	if (np) {
+		of_node_put(np);
+		return 0;
+	}
 
 	if (!of_machine_is_compatible("apple,arm-platform"))
 		return 0;
