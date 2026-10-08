@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 // Copyright 2026 Dj
+// Copyright 2026 Ryan Murray
 //! Driver for the Apple SEP (Secure Enclave Processor): attaches to a running
 //! SEP over the AP mailbox, drives Touch ID enrol/verify via `/dev/sep-bio`,
 //! and registers a hwrng and a SEP-backed `trusted` key source.
@@ -577,6 +578,7 @@ struct SepData {
     templates_restored: Atomic<bool>,
 
     sensor_calibrated: Atomic<bool>,
+    sensor_key_loaded: Atomic<bool>,
 
     enrol_open: Atomic<bool>,
 
@@ -787,6 +789,7 @@ impl SepData {
                 touchid_failed: Atomic::new(false),
                 enrol_open: Atomic::new(false),
                 sensor_calibrated: Atomic::new(false),
+                sensor_key_loaded: Atomic::new(false),
                 templates_restored: Atomic::new(false),
                 enrol_material <- new_mutex!(None),
                 enrol_identity_candidates <- new_mutex!(KVec::new()),

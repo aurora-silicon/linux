@@ -1992,6 +1992,7 @@ F:	drivers/iio/common/aop_sensors/
 F:	drivers/soc/apple/aop.rs
 F:	drivers/thermal/apple-smc-cpu-thermal.c
 F:	drivers/tty/serial/apple_dockchannel*
+F:	include/uapi/linux/apple-sep.h
 F:	include/linux/soc/apple/smc-thermal.h
 F:	rust/kernel/iio/common/aop_sensors.rs
 F:	rust/kernel/soc/apple/aop.rs
@@ -2639,7 +2640,6 @@ F:	include/linux/mfd/macsmc.h
 F:	include/linux/soc/apple/*
 F:	tools/testing/selftests/drivers/apple/
 F:	include/uapi/drm/asahi_drm.h
-F:	include/uapi/linux/apple-sep.h
 F:	net/bluetooth/brcm.c
 F:	net/bluetooth/brcm.h
 
