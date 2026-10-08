@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/rtc/apple,j700-pmu-rtc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple J700 Baku PMU real-time clock
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description: |
+  Baku exposes a 65536 Hz counter and an alarm comparator over SPMI.
+  The clock's whole-second offset is shared with the SMC RTC through an
+  eight-byte little-endian NVMEM cell. This function is a child of the
+  PMIC NVMEM provider and uses that provider's SPMI register map.
+
+allOf:
+  - $ref: rtc.yaml#
+
+properties:
+  compatible:
+    const: apple,j700-pmu-rtc
+
+  interrupts:
+    maxItems: 1
+
+  nvmem-cells:
+    maxItems: 1
+    description: The shared eight-byte whole-second RTC offset.
+
+  nvmem-cell-names:
+    items:
+      - const: rtc_offset
+
+  wakeup-source: true
+
+required:
+  - compatible
+  - interrupts
+  - nvmem-cells
+  - nvmem-cell-names
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+    #include <dt-bindings/spmi/spmi.h>
+
+    pmic@e {
+        compatible = "apple,baku-pmic", "apple,spmi-nvmem";
+        reg = <0xe SPMI_USID>;
+
+        rtc {
+            compatible = "apple,j700-pmu-rtc";
+            interrupt-parent = <&spmi>;
+            interrupts = <2 IRQ_TYPE_EDGE_RISING>;
+            nvmem-cells = <&rtc_offset>;
+            nvmem-cell-names = "rtc_offset";
+            wakeup-source;
+        };
+    };
