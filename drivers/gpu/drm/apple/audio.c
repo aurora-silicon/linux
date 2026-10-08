@@ -766,7 +766,7 @@ static struct platform_driver dcpaud_driver = {
 
 int __init dcp_audio_register(void)
 {
-        return platform_driver_register(&dcpaud_driver);
+	return platform_driver_register(&dcpaud_driver);
 }
 
 void __exit dcp_audio_unregister(void)

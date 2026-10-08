@@ -1179,8 +1179,8 @@ static int dcp_v26_status_show(struct seq_file *m, void *unused)
 		   !!READ_ONCE(v26->bl_dev), v26->bl_max, v26->bl_nits, v26->bl_sent,
 		   v26->bl_owned, v26->bl_off, v26->bl_pending, v26->bl_swaps);
 	seq_printf(m, "ctm valid %d calls %llu setter %#x getter %#x\n", v26->ctm_valid, v26->ctm_calls, v26->ctm_status, v26->ctm_get_status);
-        for (i = 0; i < 9; i++)
-                seq_printf(m, "ctm_readback[%u] %#llx\n", i, v26->ctm_readback[i]);
+	for (i = 0; i < 9; i++)
+		seq_printf(m, "ctm_readback[%u] %#llx\n", i, v26->ctm_readback[i]);
 	mutex_unlock(&v26->lock);
 	return 0;
 }
@@ -1473,55 +1473,55 @@ static void dcp_v26_brightness_done(struct apple_dcp_v26 *v26, u64 token)
  */
 /* Matched UUID ABI: location 9, packed 80-byte request, signed Q32. */
 static int dcp_v26_ctm_locked(struct apple_dcp_v26 *v26,
-                          const struct drm_crtc_state *state)
+			  const struct drm_crtc_state *state)
 {
-        u8 request[80] = {}, readback[76] = {};
-        __le32 status = 0;
-        const struct drm_color_ctm *ctm;
-        int i, ret;
+	u8 request[80] = {}, readback[76] = {};
+	__le32 status = 0;
+	const struct drm_color_ctm *ctm;
+	int i, ret;
 
-        if (!state || (v26->ctm_valid && !state->color_mgmt_changed &&
-                       !state->mode_changed && !state->active_changed))
-                return 0;
-        ctm = state->ctm ? state->ctm->data : NULL;
-        put_unaligned_le32(9, request);
-        for (i = 0; i < 9; i++) {
-                u64 coefficient = ctm ? ctm->matrix[i] :
-                                  ((i == 0 || i == 4 || i == 8) ? 1ULL << 32 : 0);
-                u64 magnitude = coefficient & ~(1ULL << 63);
-                u64 signed_q32 = coefficient & (1ULL << 63) ? -magnitude : magnitude;
+	if (!state || (v26->ctm_valid && !state->color_mgmt_changed &&
+		       !state->mode_changed && !state->active_changed))
+		return 0;
+	ctm = state->ctm ? state->ctm->data : NULL;
+	put_unaligned_le32(9, request);
+	for (i = 0; i < 9; i++) {
+		u64 coefficient = ctm ? ctm->matrix[i] :
+				  ((i == 0 || i == 4 || i == 8) ? 1ULL << 32 : 0);
+		u64 magnitude = coefficient & ~(1ULL << 63);
+		u64 signed_q32 = coefficient & (1ULL << 63) ? -magnitude : magnitude;
 
-                put_unaligned_le64(signed_q32, request + 4 + 8 * i);
-        }
-        ret = dcp_v26_call(v26, A(423), request, sizeof(request),
-                       &status, sizeof(status), 0);
-        v26->ctm_calls++;
-        v26->ctm_status = le32_to_cpu(status);
-        v26->ctm_valid = false;
-        if (ret || v26->ctm_status) {
-                dev_err(v26->dev, "CTM setter transport=%d status=%#x\n",
-                        ret, v26->ctm_status);
-                return ret ? ret : -EIO;
-        }
-        /* Independent firmware getter, before the swap and on the same lock. */
-        memset(request + 4, 0, 76);
-        ret = dcp_v26_call(v26, A(422), request, sizeof(request),
-                       readback, sizeof(readback), 0);
-        v26->ctm_get_status = get_unaligned_le32(readback + 72);
-        for (i = 0; i < 9; i++)
-                v26->ctm_readback[i] = get_unaligned_le64(readback + i * 8);
-        dev_info(v26->dev, "CTM call %llu setter=%#x getter_transport=%d getter=%#x diagonal=%#llx,%#llx,%#llx\n",
-                 v26->ctm_calls, v26->ctm_status, ret, v26->ctm_get_status,
-                 v26->ctm_readback[0], v26->ctm_readback[4], v26->ctm_readback[8]);
-        if (ret || v26->ctm_get_status)
-                return ret ? ret : -EIO;
-        v26->ctm_valid = true;
-        return 0;
+		put_unaligned_le64(signed_q32, request + 4 + 8 * i);
+	}
+	ret = dcp_v26_call(v26, A(423), request, sizeof(request),
+		       &status, sizeof(status), 0);
+	v26->ctm_calls++;
+	v26->ctm_status = le32_to_cpu(status);
+	v26->ctm_valid = false;
+	if (ret || v26->ctm_status) {
+		dev_err(v26->dev, "CTM setter transport=%d status=%#x\n",
+			ret, v26->ctm_status);
+		return ret ? ret : -EIO;
+	}
+	/* Independent firmware getter, before the swap and on the same lock. */
+	memset(request + 4, 0, 76);
+	ret = dcp_v26_call(v26, A(422), request, sizeof(request),
+		       readback, sizeof(readback), 0);
+	v26->ctm_get_status = get_unaligned_le32(readback + 72);
+	for (i = 0; i < 9; i++)
+		v26->ctm_readback[i] = get_unaligned_le64(readback + i * 8);
+	dev_info(v26->dev, "CTM call %llu setter=%#x getter_transport=%d getter=%#x diagonal=%#llx,%#llx,%#llx\n",
+		 v26->ctm_calls, v26->ctm_status, ret, v26->ctm_get_status,
+		 v26->ctm_readback[0], v26->ctm_readback[4], v26->ctm_readback[8]);
+	if (ret || v26->ctm_get_status)
+		return ret ? ret : -EIO;
+	v26->ctm_valid = true;
+	return 0;
 }
 
 static int dcp_v26_swap(struct apple_dcp_v26 *v26, const u8 *surface, u64 iova,
 			u32 width, u32 height, u32 dst_y, ktime_t *completed,
-                        const struct drm_crtc_state *ctm_state)
+			const struct drm_crtc_state *ctm_state)
 {
 	struct dcp_v26_present_record rec = {};
 	__le32 start[4] = {}, started[2] = {}, result[3];
