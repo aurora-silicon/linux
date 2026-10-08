@@ -4,7 +4,8 @@ MT7932 radio bring-up on the MacBook Neo
 ======================================
 
 J700 MT7932 Wi-Fi uses cfg80211 and NetworkManager with firmware-managed
-WPA2-CCMP authentication. Bluetooth uses an opt-in PCIe transport.
+WPA2-CCMP authentication. Bluetooth uses a transport on the radio's second
+PCIe function.
 
 The Wi-Fi import is pinned to
 ``aurora-silicon/linux-neo-cleanroom-eryk-with-wifi``, commit
@@ -49,14 +50,17 @@ ASPM and clock power management on its link before starting the device,
 matching the tested admission sequence, which used the PCIe ASPM
 performance policy.
 
-``mt7932_bt_pcie`` probes the cold ``14c3:793b`` function when it loads and
-rejects a function that is not cold; ``enable=0`` leaves it unbound. Its
-module soft dependency loads ``mt7932-fullmac`` first, so the Bluetooth
-firmware starts after the Wi-Fi firmware, as in the tested sequence. The
-transport also disables ASPM on the shared link. Like the Wi-Fi driver, it
-reads its firmware while probing, so build it as a module.
-Do not reprobe after a failed or uncertain Bluetooth admission. The tested
-Wi-Fi driver owns function 0 and Bluetooth owns function 1.
+``mt7932_bt_pcie`` defers its probe until ``mt7932-fullmac`` is bound to
+function 0, so the Bluetooth firmware always starts after the Wi-Fi firmware,
+as in the tested sequence, however the drivers are loaded. Bluetooth therefore
+stays unbound while the Wi-Fi driver is missing or has failed. A device link
+makes the driver core unbind Bluetooth before Wi-Fi; unloading
+``mt7932_bt_pcie`` does not affect Wi-Fi. The probe rejects a function that is
+not cold, which is what now prevents a reprobe after a failed or uncertain
+admission; ``enable=0`` leaves the function unbound. The transport also
+disables ASPM on the shared link. Like the Wi-Fi driver, it reads its firmware
+while probing, so build it as a module. The tested Wi-Fi driver owns function
+0 and Bluetooth owns function 1.
 
 Use a saved NetworkManager WPA2 profile matching the current interface.
 KDE audio requires BlueZ, PipeWire, its PulseAudio compatibility service,
