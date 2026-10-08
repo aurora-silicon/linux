@@ -1790,7 +1790,7 @@ static void ane_rtclient_post_boot(struct work_struct *w)
 }
 
 /* Start each announced application endpoint (>= 0x20); flag bit 1 enables it. */
-static void ane_rtclient_start_app_eps(struct ane_rtclient *ane)
+static int ane_rtclient_start_app_eps(struct ane_rtclient *ane)
 {
 	int ep;
 
@@ -1802,7 +1802,10 @@ static void ane_rtclient_start_app_eps(struct ane_rtclient *ane)
 		ret = apple_rtkit_start_ep(ane->rtk, ep);
 		dev_dbg(ane->dev, "mailbox management: STARTEP app ep %#x -> %pe\n",
 			ep, ERR_PTR(ret));
+		if (ret)
+			return ret;
 	}
+	return 0;
 }
 
 /* Multi-domain genpd attach, ownership-correct and idempotent. */
@@ -2193,9 +2196,14 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 					 apple_rtkit_is_running(ane->rtk),
 					 apple_rtkit_is_crashed(ane->rtk));
 				if (!hello_ret) {
+					if (start_app_eps) {
+						ret = ane_rtclient_start_app_eps(ane);
+						if (ret) {
+							cancel_delayed_work_sync(&ane->poll_work);
+							goto err_pm_or_hold;
+						}
+					}
 					ane->boot_done = true;
-					if (start_app_eps)
-						ane_rtclient_start_app_eps(ane);
 				} else {
 					cancel_delayed_work_sync(&ane->poll_work);
 				}
@@ -2290,9 +2298,14 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 			ret = boot_ret;
 			goto err_pm_or_hold;
 		}
+		if (start_app_eps) {
+			ret = ane_rtclient_start_app_eps(ane);
+			if (ret) {
+				cancel_delayed_work_sync(&ane->poll_work);
+				goto err_pm_or_hold;
+			}
+		}
 		ane->boot_done = true;
-		if (start_app_eps)
-			ane_rtclient_start_app_eps(ane);
 	}
 
 	if (!ane->chman_ok) {
