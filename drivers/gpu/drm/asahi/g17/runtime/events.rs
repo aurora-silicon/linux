@@ -389,7 +389,7 @@ impl crate::g17::Shared {
         let idle = firmware.idle_check(now, in_flight)?;
         firmware.reclaim_drained_renders(deferred)?;
         firmware.service_compute_exit(deferred)?;
-        firmware.service_compute_pools(deferred)?;
+        let pools = firmware.service_compute_pools(deferred, now)?;
         let mut shrinking = false;
         if !firmware.recovery.pending() {
             firmware
@@ -427,6 +427,11 @@ impl crate::g17::Shared {
             Some(idle.map_or(SHRINK_WAKE_NS, |delay| delay.min(SHRINK_WAKE_NS)))
         } else {
             idle
+        };
+        // A retained compute pool gives its backing back when it expires.
+        let idle = match (idle, pools) {
+            (Some(delay), Some(expiry)) => Some(delay.min(expiry)),
+            (delay, expiry) => delay.or(expiry),
         };
         if let Some(delay) = idle {
             self.queue_idle(delay);
