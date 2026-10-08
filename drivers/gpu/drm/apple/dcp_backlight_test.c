@@ -13,9 +13,14 @@ static void backlight_millinits_takeover_test(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test, dcp_bl_takeover_nits(0, 100000, &nits), -EINVAL);
 	KUNIT_EXPECT_EQ(test, dcp_bl_takeover_nits(U32_MAX, 100000, &nits), -EINVAL);
-	KUNIT_EXPECT_EQ(test, dcp_bl_takeover_nits(509, 509001, &nits), -ERANGE);
-	KUNIT_EXPECT_EQ(test, dcp_bl_takeover_nits(509, U32_MAX, &nits), -ERANGE);
 	KUNIT_EXPECT_EQ(test, nits, 123U);
+	/* Reports above the panel ceiling clamp to it. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_takeover_nits(525, 525999, &nits), 0);
+	KUNIT_EXPECT_EQ(test, nits, 525U);
+	KUNIT_ASSERT_EQ(test, dcp_bl_takeover_nits(509, 509001, &nits), 0);
+	KUNIT_EXPECT_EQ(test, nits, 509U);
+	KUNIT_ASSERT_EQ(test, dcp_bl_takeover_nits(509, U32_MAX, &nits), 0);
+	KUNIT_EXPECT_EQ(test, nits, 509U);
 	KUNIT_ASSERT_EQ(test, dcp_bl_takeover_nits(509, 100999, &nits), 0);
 	KUNIT_EXPECT_EQ(test, nits, 100U);
 	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 509, true, nits, false, 0), 0);

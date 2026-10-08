@@ -96,7 +96,8 @@ int dcp_backlight_takeover(struct apple_dcp *dcp, u32 millinits)
 
 	if (dcp_backlight_active(dcp))
 		return 0;
-	maximum = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
+	/* H17P takes nits up to the panel ceiling, not the older DAC table's. */
+	maximum = dcp->brightness.maximum;
 	ret = dcp_bl_takeover_nits(maximum, millinits, &nits);
 	if (ret)
 		return ret;

@@ -6,6 +6,7 @@
 
 #include <linux/errno.h>
 #include <linux/limits.h>
+#include <linux/minmax.h>
 #include <linux/types.h>
 
 /* Commanded nits, independent of firmware encoding. No fade policy. */
@@ -30,14 +31,15 @@ struct dcp_backlight_present {
 	u32 nits;
 };
 
-/* Public powerlog reports use millinits; validate before rounding to nits. */
+/*
+ * Public powerlog reports use millinits.  A report above the panel ceiling
+ * describes the brightest level the panel can show, so clamp it.
+ */
 static inline int dcp_bl_takeover_nits(u32 maximum, u32 millinits, u32 *nits)
 {
 	if (!maximum || maximum > INT_MAX)
 		return -EINVAL;
-	if ((u64)millinits > (u64)maximum * 1000)
-		return -ERANGE;
-	*nits = millinits / 1000;
+	*nits = min(millinits / 1000, maximum);
 	return 0;
 }
 
