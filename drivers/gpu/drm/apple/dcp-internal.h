@@ -125,8 +125,8 @@ struct dcp_channel {
 	dcp_callback_t callbacks[DCP_MAX_CALL_DEPTH];
 	void *cookies[DCP_MAX_CALL_DEPTH];
 	void *output[DCP_MAX_CALL_DEPTH];
-	u32 in_len[DCP_MAX_CALL_DEPTH];
-	u32 out_len[DCP_MAX_CALL_DEPTH];
+	/* Header of each pending AP command record, as dcp_push() wrote it */
+	struct dcp_packet_header header[DCP_MAX_CALL_DEPTH];
 	u16 end[DCP_MAX_CALL_DEPTH];
 
 	/* Current depth of the call stack. Less than DCP_MAX_CALL_DEPTH */

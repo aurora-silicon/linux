@@ -603,8 +603,7 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 	ch->callbacks[depth] = cb;
 	ch->cookies[depth] = cookie;
 	ch->output[depth] = out + sizeof(header) + in_len;
-	ch->in_len[depth] = in_len;
-	ch->out_len[depth] = out_len;
+	ch->header[depth] = header;
 	ch->end[depth] = offset + ALIGN(data_len, DCP_PACKET_ALIGNMENT);
 
 	dcp_send_message(dcp, IOMFB_ENDPOINT,
@@ -817,12 +816,10 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 		dcp_ack(dcp, context);
 }
 
-static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context,
-			     void *data, u32 length)
+static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context)
 {
-	struct dcp_packet_header *header = data;
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
-	bool h17p = dcp->fw_compat == DCP_FIRMWARE_H17P;
+	const struct dcp_packet_header *record, *sent;
 	void *cookie, *out;
 	dcp_callback_t cb;
 
@@ -831,7 +828,7 @@ static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context,
 		return;
 	}
 
-	if (h17p && !ch->depth) {
+	if (!ch->depth) {
 		dev_warn(dcp->dev, "ignoring ack on idle context %X\n", context);
 		return;
 	}
@@ -840,27 +837,35 @@ static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context,
 
 	cb = ch->callbacks[ch->depth];
 	cookie = ch->cookies[ch->depth];
+	out = ch->output[ch->depth];
+	sent = &ch->header[ch->depth];
 
 	ch->callbacks[ch->depth] = NULL;
 	ch->cookies[ch->depth] = NULL;
+	ch->output[ch->depth] = NULL;
 
-	if (h17p) {
-		/*
-		 * H17P acks carry no payload and offset zero, including for
-		 * nested calls, so the output cannot be located from the ack
-		 * message.  It is in the original AP command record, whose
-		 * address dcp_push() saved.
-		 */
-		out = ch->output[ch->depth];
-		ch->output[ch->depth] = NULL;
-	} else {
-		if (header->in_len != ch->in_len[ch->depth] ||
-		    header->out_len != ch->out_len[ch->depth]) {
-			dev_err(dcp->dev, "invalid command response lengths\n");
-			dcp->crashed = true;
+	/*
+	 * An ack completes the innermost pending command on its context.  The
+	 * firmware writes the reply in place into that AP command record, whose
+	 * address dcp_push() saved; the ack itself carries neither offset nor
+	 * length on any firmware.  A command sent from within a callback is
+	 * acked on the callback context, whose receive area holds the callback
+	 * record rather than the reply, so the ack cannot be used to find it.
+	 *
+	 * Older firmware leaves the record header untouched.  If it no longer
+	 * matches what was sent, the record was overwritten and its output
+	 * cannot be trusted.
+	 */
+	if (dcp->fw_compat != DCP_FIRMWARE_H17P) {
+		record = out - sent->in_len - sizeof(*record);
+		if (memcmp(record, sent, sizeof(*record))) {
+			dev_err(dcp->dev,
+				"corrupt %c%c%c%c command record on context %X\n",
+				sent->tag[3], sent->tag[2], sent->tag[1],
+				sent->tag[0], context);
+			WRITE_ONCE(dcp->crashed, true);
 			return;
 		}
-		out = data + sizeof(*header) + header->in_len;
 	}
 
 	if (cb)
@@ -889,7 +894,7 @@ static void dcpep_got_msg(struct apple_dcp *dcp, u64 message)
 	data = dcp->shmem + channel_offset + offset;
 
 	if (FIELD_GET(IOMFB_MSG_ACK, message))
-		dcpep_handle_ack(dcp, ctx_id, data, length);
+		dcpep_handle_ack(dcp, ctx_id);
 	else
 		dcpep_handle_cb(dcp, ctx_id, data, length, offset);
 }
