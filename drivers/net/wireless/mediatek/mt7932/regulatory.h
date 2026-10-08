@@ -104,9 +104,9 @@ static inline int mt7932_policy_parse(struct mt7932_policy *out,
 
 /* Every entry of a validated package starts with its channel number and is
  * followed by per-rate power limits. A country that does not permit a
- * channel leaves all of that channel's limits at this byte.
+ * channel sets all of that channel's limits to this marker.
  */
-#define MT7932_POLICY_NO_LIMIT 0xc4
+#define MT7932_POLICY_NOT_PERMITTED 0xc4
 
 static inline bool mt7932_policy_permits(const struct mt7932_policy *policy,
 					 unsigned int channel)
@@ -122,7 +122,7 @@ static inline bool mt7932_policy_permits(const struct mt7932_policy *policy,
 			if (entry[0] != channel)
 				continue;
 			for (k = 1; k < 122; k++)
-				if (entry[k] != MT7932_POLICY_NO_LIMIT)
+				if (entry[k] != MT7932_POLICY_NOT_PERMITTED)
 					return true;
 			return false;
 		}
