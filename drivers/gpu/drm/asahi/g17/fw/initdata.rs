@@ -1533,8 +1533,7 @@ const TEMP_KP: u32 = 0x41a2_b852;
 const TEMP_KI: u32 = 0x4116_0419;
 
 /// Nonzero 32-bit words of a firmware object the host builds from constants: (byte offset, value, repeat).
-/// Every other word is zero. Generated from the previously field-by-field builders; the fwdump harness
-/// (`neo-smooth-20261007/kernel/fwdump`) verifies the objects byte for byte.
+/// Every other word is zero. The table is the sole definition of the object's constant contents.
 type Words = &'static [(usize, u32, usize)];
 
 fn fill_words(bytes: &mut [u8], words: Words) {
