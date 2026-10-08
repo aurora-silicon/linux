@@ -47,7 +47,8 @@ def assemble(template, manifest, directory):
     if b'j613-25g83-hal200' not in hook: raise ValueError('Mesa hook selector differs')
     member(resolved['mesa'],'opt/mesa-m3/libexec/mesa-m3-abi-check')
     listing = subprocess.check_output(['bsdtar','-tf',str(resolved['kernel'])],text=True).splitlines()
-    dtbs = [p for p in listing if p.endswith('/apple/t8122-j613-25g83.dtb')]
+    dt_path = re.compile(r'usr/lib/modules/[^/]+/dtbs/(?:apple/)?t8122-j613-25g83\.dtb')
+    dtbs = [p for p in listing if dt_path.fullmatch(p)]
     if len(dtbs) != 1: raise ValueError('kernel must supply exactly one separate J61325 DTB')
     dt = member(resolved['kernel'],dtbs[0])
     for marker in (b'apple,j613-25g83-profile\0', b'apple,firmware-compat\0'):

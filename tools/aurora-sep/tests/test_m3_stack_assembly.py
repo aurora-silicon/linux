@@ -26,7 +26,7 @@ class Assembly(unittest.TestCase):
                               'opt/mesa-m3/share/mesa-m3/user-setup.list':b'list'})
             self.package(role,name,files)
     def package(self,role,name,files):
-        tree=self.root/role;tree.mkdir()
+        tree=self.root/role;tree.mkdir(exist_ok=True)
         for path,data in files.items():
             p=tree/path;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(data)
         path=self.root/f'{name}-candidate-1-aarch64.pkg.tar.zst'
@@ -42,6 +42,23 @@ class Assembly(unittest.TestCase):
         self.assertNotIn('mesa-m3-26.1.4.m3.1-6',script)
         output=self.root/'candidate.sh';output.write_text(script)
         subprocess.run(['bash','-n',str(output)],check=True)
+    def kernel_dtbs(self,paths):
+        files={'.PKGINFO':b'pkgname = linux-aurora\npkgver = candidate-1\narch = aarch64\n'}
+        files.update({p:b'apple,j613-25g83-profile\0apple,firmware-compat\0' for p in paths})
+        self.package('kernel','linux-aurora',files)
+    def test_flat_release_recipe_layout_is_accepted(self):
+        self.kernel_dtbs(['usr/lib/modules/test/dtbs/t8122-j613-25g83.dtb'])
+        self.assemble()
+    def test_missing_profile_dtb_is_rejected(self):
+        self.kernel_dtbs(['usr/lib/modules/test/dtbs/t8122-j613.dtb'])
+        with self.assertRaisesRegex(ValueError,'exactly one'):self.assemble()
+    def test_flat_and_nested_duplicates_are_rejected(self):
+        self.kernel_dtbs(['usr/lib/modules/test/dtbs/t8122-j613-25g83.dtb',
+                          'usr/lib/modules/test/dtbs/apple/t8122-j613-25g83.dtb'])
+        with self.assertRaisesRegex(ValueError,'exactly one'):self.assemble()
+    def test_profile_outside_modules_dtbs_is_rejected(self):
+        self.kernel_dtbs(['boot/apple/t8122-j613-25g83.dtb'])
+        with self.assertRaisesRegex(ValueError,'exactly one'):self.assemble()
     def test_missing_artifact_refuses(self):
         (self.root/self.manifest['packages']['mesa']['file']).unlink()
         with self.assertRaises(FileNotFoundError):self.assemble()
