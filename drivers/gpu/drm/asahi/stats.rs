@@ -6,7 +6,7 @@
 //! (see `fw::channels.rs::StatsMsg`) and exposes them to the sysfs file
 //! `agx_stats` (registered from `sysfs.c`).
 //!
-//! The snapshot is process-local and process-private. The firmware-stat
+//! The snapshot belongs to one GPU manager. The firmware-stat
 //! decoder that feeds it lives in `StatsChannel::poll` (`channel.rs`), inside
 //! the versioned context where `StatsMsg` is nameable; `note_job()` is called
 //! from the `recv_message` rtkit callback (so the firmware mailbox IRQ
@@ -35,12 +35,10 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-/// Process-wide snapshot of AGX firmware stats.
+/// Per-device snapshot of AGX firmware stats.
 ///
-/// Lives in the `GpuManager`; the C static `asahi_stats_snapshot_ptr` (see
-/// `sysfs.c`) holds its address for the C `show` callback, so the field
-/// layout is a cross-language contract: `#[repr(C)]` makes the declaration
-/// order binding and `sysfs.c` asserts the offsets at build time.
+/// The manager and bound driver retain Arcs. The driver's Arc outlives the
+/// per-device C sysfs registration; repr(C) establishes the shared layout.
 #[derive(Default)]
 #[repr(C)]
 pub(crate) struct StatsSnapshot {
@@ -62,12 +60,13 @@ pub(crate) struct StatsSnapshot {
     pub(crate) jobs: AtomicU64,
 }
 
-/// Pointer to the live snapshot: the C static `asahi_stats_snapshot_ptr`
-/// (see `sysfs.c`) is the single storage location, written through
-/// `sysfs_exports::set_snapshot_ptr` and read by the C `show` callback via
-/// `READ_ONCE`. The pointer is established before the DRM device registers
-/// and removed on unregister; the pointed-to fields are `AtomicU*` and carry
-/// the data races themselves.
+// Keep the Rust half of the C sysfs layout contract checked as well.
+const _: () = {
+    assert!(core::mem::offset_of!(StatsSnapshot, pstate) == 16);
+    assert!(core::mem::offset_of!(StatsSnapshot, busy_ns) == 40);
+    assert!(core::mem::offset_of!(StatsSnapshot, jobs) == 48);
+    assert!(core::mem::size_of::<StatsSnapshot>() == 56);
+};
 
 impl StatsSnapshot {
     /// Bump the completed-submission counter (called from the queue

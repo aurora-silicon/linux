@@ -1,46 +1,37 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! FFI declarations for the C `sysfs.c` shim.
-//!
-//! The Rust driver keeps the firmware stats in [`crate::stats::StatsSnapshot`]
-//! and uses these shims to register / unregister the sysfs file and to publish
-//! the snapshot pointer for the C-side `show` callback.
+//! Per-device sysfs registration. The caller retains the snapshot Arc until
+//! unregister has drained active readers and freed the C attribute wrapper.
 
-use core::ffi::{c_int, c_ulonglong};
+use core::ffi::{c_int, c_void};
+use crate::stats::StatsSnapshot;
 
 extern "C" {
-    /// Register the `agx_stats` sysfs file on `dev`; `export_enabled` 0
-    /// makes the file print `unsupported`. Returns 0 on success.
-    fn asahi_sysfs_register(dev: *mut kernel::bindings::device, export_enabled: c_int) -> c_int;
-
-    /// Unregister the `agx_stats` sysfs file and clear the snapshot pointer.
-    fn asahi_sysfs_unregister(dev: *mut kernel::bindings::device);
-
-    /// Publish the snapshot pointer for the C-side `show` callback (the C
-    /// static `asahi_stats_snapshot_ptr` is the single storage location).
-    fn asahi_stats_set_snapshot_ptr(p: c_ulonglong);
+    fn asahi_sysfs_register(
+        dev: *mut kernel::bindings::device,
+        snapshot: *const StatsSnapshot,
+        export_enabled: c_int,
+        handle: *mut *mut c_void,
+    ) -> c_int;
+    fn asahi_sysfs_unregister(dev: *mut kernel::bindings::device, handle: *mut c_void);
 }
 
-/// Register the sysfs file. Safe to call from `AsahiDriver::probe` after the
-/// DRM device has been registered.
+/// Register only after initialization succeeds, keeping the snapshot Arc alive.
 pub(crate) fn register(
     dev: *mut kernel::bindings::device,
+    snapshot: *const StatsSnapshot,
     export_enabled: bool,
-) -> kernel::error::Result {
-    let ret = unsafe { asahi_sysfs_register(dev, export_enabled as c_int) };
+) -> kernel::error::Result<*mut c_void> {
+    let mut handle = core::ptr::null_mut();
+    let ret = unsafe { asahi_sysfs_register(dev, snapshot, export_enabled as c_int, &mut handle) };
     if ret < 0 {
         Err(kernel::error::Error::from_errno(ret))
     } else {
-        Ok(())
+        Ok(handle)
     }
 }
 
-/// Unregister the sysfs file. Safe to call from the device release path.
-pub(crate) fn unregister(dev: *mut kernel::bindings::device) {
-    unsafe { asahi_sysfs_unregister(dev) };
-}
-
-/// Publish the address of the live `StatsSnapshot` to the C shim.
-pub(crate) fn set_snapshot_ptr(ptr: *const crate::stats::StatsSnapshot) {
-    unsafe { asahi_stats_set_snapshot_ptr(ptr as c_ulonglong) };
+/// Drain readers before the caller drops its snapshot Arc.
+pub(crate) fn unregister(dev: *mut kernel::bindings::device, handle: *mut c_void) {
+    unsafe { asahi_sysfs_unregister(dev, handle) };
 }

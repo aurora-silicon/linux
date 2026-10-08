@@ -51,6 +51,10 @@ pub(crate) struct AsahiDriver {
     /// Raw `struct device *` of the platform device. Stored once at probe
     /// time so the `Drop` impl can find the sysfs file on unregister.
     raw_dev: *mut bindings::device,
+    raw_stats: *mut core::ffi::c_void,
+    // Own the allocation until unregister has drained all sysfs readers.
+    #[expect(unused)]
+    stats: Arc<crate::stats::StatsSnapshot>,
 }
 
 unsafe impl Send for AsahiDriver {}
@@ -61,7 +65,7 @@ impl Drop for AsahiDriver {
         // SAFETY: `self.raw_dev` was set in `probe` from the platform
         // device's `as_raw()`, valid for the lifetime of the bound driver.
         if !self.raw_dev.is_null() {
-            crate::sysfs_exports::unregister(self.raw_dev);
+            crate::sysfs_exports::unregister(self.raw_dev, self.raw_stats);
         }
     }
 }
@@ -250,8 +254,13 @@ impl platform::Driver for AsahiDriver {
         // Register the sysfs file on the platform device. Must happen after
         // the DRM device is registered so the device is fully bound.
         let raw_dev = pdev.as_ref().as_raw();
-        crate::sysfs_exports::register(raw_dev, *module_parameters::stats_export.value() != 0)?;
+        let stats = (*drm).gpu.stats_snapshot();
+        let raw_stats = crate::sysfs_exports::register(
+            raw_dev,
+            Arc::as_ptr(&stats),
+            *module_parameters::stats_export.value() != 0,
+        )?;
 
-        Ok(Self { drm, raw_dev })
+        Ok(Self { drm, raw_dev, raw_stats, stats })
     }
 }
