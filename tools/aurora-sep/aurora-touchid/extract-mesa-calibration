@@ -20,6 +20,8 @@ SYS_BLOCK = Path("/sys/class/block")
 DEV_ROOT = Path("/dev")
 SCAN_CHUNK_SIZE = 4 * 1024 * 1024
 SCAN_OVERLAP = 4 * 1024 * 1024
+DER_MAX_DEPTH = 32
+DER_MAX_NODES = 16384
 
 
 class DERError(ValueError):
@@ -27,26 +29,45 @@ class DERError(ValueError):
 
 
 class TLV:
-    def __init__(self, data, start, require_complete=True):
+    def __init__(self, data, start, require_complete=True, allow_high_tag=False):
         if start < 0:
             raise DERError("negative DER offset")
         self.start = start
         try:
             self.tag = data[start]
-            first_length = data[start + 1]
         except IndexError as error:
             raise DERError("truncated DER header") from error
 
+        length_at = start + 1
+        if allow_high_tag and self.tag & 0x1f == 0x1f:
+            number = 0
+            for width in range(5):
+                if length_at >= len(data):
+                    raise DERError("truncated DER identifier")
+                part = data[length_at]
+                length_at += 1
+                if width == 0 and part == 0x80:
+                    raise DERError("non-minimal DER identifier")
+                number = (number << 7) | (part & 0x7f)
+                if not part & 0x80:
+                    break
+            else:
+                raise DERError("unreasonably large DER identifier")
+            if number < 31:
+                raise DERError("non-minimal DER identifier")
+        if length_at >= len(data):
+            raise DERError("truncated DER header")
+        first_length = data[length_at]
         if first_length < 0x80:
             length = first_length
-            header_length = 2
+            header_length = length_at - start + 1
         else:
             length_bytes = first_length & 0x7f
             if length_bytes == 0:
                 raise DERError("indefinite DER length")
             if length_bytes > 4:
                 raise DERError("unreasonably large DER length")
-            length_start = start + 2
+            length_start = length_at + 1
             length_end = length_start + length_bytes
             if length_end > len(data):
                 raise DERError("truncated DER length")
@@ -56,7 +77,7 @@ class TLV:
             length = int.from_bytes(encoded, "big")
             if length < 0x80:
                 raise DERError("non-minimal DER length")
-            header_length = 2 + length_bytes
+            header_length = length_at - start + 1 + length_bytes
 
         self.content_start = start + header_length
         self.end = self.content_start + length
@@ -67,10 +88,10 @@ class TLV:
         return data[self.content_start:self.end]
 
 
-def child_tlvs(data, container):
+def child_tlvs(data, container, allow_high_tag=False):
     offset = container.content_start
     while offset < container.end:
-        child = TLV(data, offset)
+        child = TLV(data, offset, allow_high_tag=allow_high_tag)
         if child.end > container.end:
             raise DERError("DER child extends beyond its container")
         yield child
@@ -143,6 +164,16 @@ def validate_calibration(data, start):
     return outer.end
 
 
+def validate_der_tree(data, value, budget, depth=0):
+    """Bound constructed DER fields; primitive payload bytes remain opaque."""
+    if depth > DER_MAX_DEPTH or budget[0] <= 0:
+        raise DERError("DER constructed fields exceed validation limits")
+    budget[0] -= 1
+    if value.tag & 0x20:
+        for child in child_tlvs(data, value, allow_high_tag=True):
+            validate_der_tree(data, child, budget, depth + 1)
+
+
 def validate_fsc2_image(data, start):
     """Validate an FSC2 IMG4 structure and manifest presence, not its signature."""
     img4 = TLV(data, start)
@@ -152,7 +183,7 @@ def validate_fsc2_image(data, start):
     take_child(data, img4_children, 0x16, b"IMG4")
 
     im4p = take_child(data, img4_children, 0x30)
-    im4p_children = child_tlvs(data, im4p)
+    im4p_children = child_tlvs(data, im4p, allow_high_tag=True)
     take_child(data, im4p_children, 0x16, b"IM4P")
     take_child(data, im4p_children, 0x16, b"FSC2")
     take_child(data, im4p_children, 0x16)
@@ -161,15 +192,15 @@ def validate_fsc2_image(data, start):
         raise DERError("FSC2 payload lacks its CALB header")
 
     # Optional IM4P fields must still be bounded DER objects.
-    for _ in im4p_children:
-        pass
+    budget = [DER_MAX_NODES]
+    for field in im4p_children:
+        validate_der_tree(data, field, budget)
     manifest = take_child(data, img4_children, 0xA0)
     manifest_children = child_tlvs(data, manifest)
     im4m = take_child(data, manifest_children, 0x30)
     im4m_children = child_tlvs(data, im4m)
     take_child(data, im4m_children, 0x16, b"IM4M")
-    for _ in im4m_children:
-        pass
+    validate_der_tree(data, im4m, budget)
     if next(manifest_children, None) is not None:
         raise DERError("manifest wrapper contains more than one IM4M")
     if next(img4_children, None) is not None:

@@ -23,7 +23,8 @@ def tlv(tag, content):
     else:
         width = (length.bit_length() + 7) // 8
         encoded_length = bytes([0x80 | width]) + length.to_bytes(width, "big")
-    return bytes([tag]) + encoded_length + content
+    identifier = bytes([tag]) if isinstance(tag, int) else tag
+    return identifier + encoded_length + content
 
 
 def ia5(value):
@@ -56,6 +57,15 @@ def synthetic_fsc2_image(kind=b"FSC2", with_manifest=True, payload=None,
 def wrap_comb(image):
     fdrd = tlv(0x30, ia5(b"fdrd") + tlv(0x04, image))
     return tlv(0x30, ia5(b"comb") + fdrd + tlv(0x30, ia5(b"secb")))
+
+
+def private_tag(number):
+    parts = [number & 0x7f]
+    number >>= 7
+    while number:
+        parts.append(0x80 | (number & 0x7f))
+        number >>= 7
+    return b"\xff" + bytes(reversed(parts))
 
 
 class CalibrationExtractorTests(unittest.TestCase):
@@ -108,6 +118,65 @@ class CalibrationExtractorTests(unittest.TestCase):
         contents = (ia5(b"IM4M") + tlv(0x02, b"\x00") + tlv(0x31, b"")
                     + tlv(0x04, b"synthetic") + tlv(0x30, b""))
         image = synthetic_fsc2_image(manifest=tlv(0xA0, tlv(0x30, contents)))
+        self.assertEqual(extractor.find_calibrations(image), [(0, len(image))])
+
+    def test_rejects_malformed_nested_manifest_der(self):
+        contents = ia5(b"IM4M") + tlv(0x30, b"\x04\x05x")
+        image = synthetic_fsc2_image(manifest=tlv(0xA0, tlv(0x30, contents)))
+        self.assertEqual(extractor.find_calibrations(image), [])
+        self.assert_cli_rejects_without_write(image)
+
+    def test_rejects_malformed_nested_optional_im4p_der(self):
+        image = synthetic_fsc2_image(im4p_tail=tlv(0x30, b"\x04\x05x"))
+        self.assertEqual(extractor.find_calibrations(image), [])
+        self.assert_cli_rejects_without_write(image)
+
+    def assert_cli_rejects_without_write(self, image):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "synthetic.der"
+            output = Path(directory) / "calibration.bin"
+            source.write_bytes(image)
+            with patch("sys.argv", [str(SCRIPT), str(source), "-o", str(output)]), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(extractor.main(), 1)
+            self.assertFalse(output.exists())
+
+    def test_accepts_bounded_private_high_tag_manifest_properties(self):
+        manp = tlv(private_tag(int.from_bytes(b"MANP", "big")),
+                   tlv(0x30, ia5(b"MANP") + tlv(0x31, b"")))
+        manb = tlv(private_tag(int.from_bytes(b"MANB", "big")),
+                   tlv(0x30, ia5(b"MANB") + tlv(0x31, manp)))
+        contents = ia5(b"IM4M") + tlv(0x02, b"\x00") + tlv(0x31, manb)
+        image = synthetic_fsc2_image(manifest=tlv(0xA0, tlv(0x30, contents)))
+        self.assertEqual(extractor.find_calibrations(image), [(0, len(image))])
+
+    def test_rejects_malformed_high_tag_identifiers(self):
+        for field in (b"\xff\x80\x01\x00", b"\xff\x01\x00", b"\xff\x81",
+                      b"\xff" + b"\x81" * 6):
+            with self.subTest(field=field):
+                contents = ia5(b"IM4M") + tlv(0x31, field)
+                image = synthetic_fsc2_image(manifest=tlv(0xA0, tlv(0x30, contents)))
+                self.assertEqual(extractor.find_calibrations(image), [])
+
+    def test_rejects_constructed_depth_beyond_limit(self):
+        field = tlv(0x02, b"\x00")
+        for _ in range(40):
+            field = tlv(0x30, field)
+        image = synthetic_fsc2_image(im4p_tail=field)
+        self.assertEqual(extractor.find_calibrations(image), [])
+        self.assert_cli_rejects_without_write(image)
+
+    def test_constructed_node_budget_is_bounded(self):
+        contents = ia5(b"IM4M") + tlv(0x31, tlv(0x02, b"\x00") * 8)
+        image = synthetic_fsc2_image(manifest=tlv(0xA0, tlv(0x30, contents)))
+        with patch.object(extractor, "DER_MAX_NODES", 4):
+            self.assertEqual(extractor.find_calibrations(image), [])
+        self.assertEqual(extractor.find_calibrations(image), [(0, len(image))])
+
+    def test_primitive_payload_and_signature_bytes_remain_opaque(self):
+        malformed = b"\x30\x03\x04\x05x"
+        contents = ia5(b"IM4M") + tlv(0x04, malformed)
+        image = synthetic_fsc2_image(payload=b"CALB" + malformed,
+                                     manifest=tlv(0xA0, tlv(0x30, contents)))
         self.assertEqual(extractor.find_calibrations(image), [(0, len(image))])
 
     def test_rejects_truncated_im4p_tail(self):

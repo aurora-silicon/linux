@@ -16,7 +16,7 @@ source=('aurora-touchid-setup'
         'wait-for-display'
         'sddm-wait-display.conf')
 sha256sums=('406da23baf0127dd5ba116c2f83808fb10d979315a17227a78731c5d3081efe4'
-            'ef89c96fcb6a7aad56db73eb9f29f430c7a70a2d5427e5b89fc66e56f533e7bc'
+            '8ea463818718f664b11273aeaca979f8fe2311a1a0e4937e7d4224b3fe63b44b'
             '4f7b8a97e35e3511afa482ee8aedd019e960b1a67320675bd347f534feab49c3'
             '2f4b265a4c2180a9e0e4926c53ec77c3dbb074ddc3e083d7925d58db10a576b9'
             'e1b1152e576e9588cc134b09291b3a2306ac686d9a47be6f128670608da535fc'
