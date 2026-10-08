@@ -46,6 +46,8 @@ static inline bool cd321x_pm_ready(struct cd321x_pm_state *pm)
 		return false;
 	pm->phase = CD321X_PM_REVALIDATE;
 	pm->attempts_left = CD321X_RESUME_ATTEMPTS;
+	if (pm->setup_pending)
+		pm->setup_attempts_left = CD321X_RESUME_ATTEMPTS;
 	return true;
 }
 

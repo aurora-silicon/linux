@@ -1208,13 +1208,13 @@ static int cd321x_check_setup(struct cd321x *cd321x, u64 event)
 	int ret;
 
 	lockdep_assert_held(&tps->lock);
-	if (cd321x->pm.phase == CD321X_PM_INITIALIZING ||
-	    cd321x->pm.phase == CD321X_PM_REMOVED ||
+	if (cd321x->pm.phase == CD321X_PM_REMOVED ||
 	    (!cd321x->pm.setup_pending && !(event & ~tps->data->irq_mask1)))
 		return 0;
 	ret = cd321x_setup_run(&cd321x->pm, event, tps->data->irq_mask1,
 			       &cd321x_setup_ops, cd321x);
-	if (cd321x->pm.phase == CD321X_PM_PREPARED)
+	if (cd321x->pm.phase == CD321X_PM_PREPARED ||
+	    cd321x->pm.phase == CD321X_PM_INITIALIZING)
 		return 0;
 	if (ret < 0) {
 		if (cd321x->pm.setup_attempts_left)

@@ -22,17 +22,19 @@ static inline int cd321x_setup_run(struct cd321x_pm_state *pm, u64 event,
 	int ret;
 	bool changed;
 
-	if (pm->phase == CD321X_PM_INITIALIZING || pm->phase == CD321X_PM_REMOVED)
+	if (pm->phase == CD321X_PM_REMOVED)
 		return 0;
 	if (!pm->setup_pending) {
 		if (!(event & ~expected_mask))
 			return 0;
 		pm->setup_pending = true;
-		pm->setup_attempts_left = pm->phase == CD321X_PM_PREPARED ? 0 :
-					   CD321X_RESUME_ATTEMPTS;
+		pm->setup_attempts_left =
+			pm->phase == CD321X_PM_PREPARED ||
+			pm->phase == CD321X_PM_INITIALIZING ? 0 :
+			CD321X_RESUME_ATTEMPTS;
 	}
 	/* IRQs can still arrive between prepare and device suspend. */
-	if (pm->phase == CD321X_PM_PREPARED)
+	if (pm->phase == CD321X_PM_PREPARED || pm->phase == CD321X_PM_INITIALIZING)
 		return 0;
 	if (!pm->setup_attempts_left)
 		return -EIO;
