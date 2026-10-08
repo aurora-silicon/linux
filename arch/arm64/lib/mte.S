@@ -80,6 +80,52 @@ SYM_FUNC_START(mte_copy_page_tags)
 	ret
 SYM_FUNC_END(mte_copy_page_tags)
 
+#ifdef CONFIG_MM_SUBPAGE
+/* Copy one aligned power-of-two extent, preserving neighbouring tags. */
+SYM_FUNC_START(mte_copy_subpage_tags_range)
+	mov	x6, x2
+	add	x2, x0, x2
+	multitag_transfer_size x4, x5
+	cmp	x4, x6
+	b.hi	2f
+1:	ldgm	x3, [x1]
+	stgm	x3, [x0]
+	add	x0, x0, x4
+	add	x1, x1, x4
+	cmp	x0, x2
+	b.ne	1b
+	ret
+2:	mov	x3, xzr
+3:	ldg	x3, [x1]
+	stg	x3, [x0]
+	add	x0, x0, #MTE_GRANULE_SIZE
+	add	x1, x1, #MTE_GRANULE_SIZE
+	cmp	x0, x2
+	b.ne	3b
+	ret
+SYM_FUNC_END(mte_copy_subpage_tags_range)
+
+/* Clear an aligned extent without changing data or neighbouring tags. */
+SYM_FUNC_START(mte_clear_subpage_tags_range)
+	mov	x4, x1
+	add	x1, x0, x1
+	multitag_transfer_size x2, x3
+	cmp	x2, x4
+	b.hi	2f
+1:	stgm	xzr, [x0]
+	add	x0, x0, x2
+	cmp	x0, x1
+	b.ne	1b
+	ret
+2:	mov	x2, xzr
+3:	stg	x2, [x0]
+	add	x0, x0, #MTE_GRANULE_SIZE
+	cmp	x0, x1
+	b.ne	3b
+	ret
+SYM_FUNC_END(mte_clear_subpage_tags_range)
+#endif
+
 /*
  * Read tags from a user buffer (one tag per byte) and set the corresponding
  * tags at the given kernel address. Used by PTRACE_POKEMTETAGS.

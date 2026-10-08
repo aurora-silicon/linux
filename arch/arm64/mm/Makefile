@@ -12,6 +12,9 @@ obj-$(CONFIG_TRANS_TABLE)	+= trans_pgd-asm.o
 obj-$(CONFIG_DEBUG_VIRTUAL)	+= physaddr.o
 obj-$(CONFIG_ARM64_MTE)		+= mteswap.o
 obj-$(CONFIG_ARM64_GCS)		+= gcs.o
+obj-$(CONFIG_ARM64_USER4K_KUNIT_TEST) += user4k-test.o user4k-tlb-test.o
+obj-$(CONFIG_ARM64_USER4K_DATA_KUNIT_TEST) += user4k-data-test.o
+obj-$(CONFIG_ARM64_USER4K_EXPERIMENTAL) += user4k-pgalloc.o
 KASAN_SANITIZE_physaddr.o	+= n
 
 obj-$(CONFIG_KASAN)		+= kasan_init.o

@@ -12,6 +12,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/mm_types.h>
+#include <linux/mm_granule.h>
 #include <linux/sched.h>
 #include <linux/mmu_notifier.h>
 #include <asm/cputype.h>
@@ -56,8 +57,8 @@
 	})
 
 /*
- * Get translation granule of the system, which is decided by
- * PAGE_SIZE.  Used by TTL.
+ * Encode a translation granule for TTL and range operands. Native kernel
+ * and stage-2 callers use PAGE_SHIFT; userspace callers use their mm.
  *  - 4KB	: 1
  *  - 16KB	: 2
  *  - 64KB	: 3
@@ -66,18 +67,23 @@
 #define TLBI_TTL_TG_16K		2
 #define TLBI_TTL_TG_64K		3
 
-static inline unsigned long get_trans_granule(void)
+static inline unsigned long get_trans_granule_shift(unsigned int page_shift)
 {
-	switch (PAGE_SIZE) {
-	case SZ_4K:
+	switch (page_shift) {
+	case 12:
 		return TLBI_TTL_TG_4K;
-	case SZ_16K:
+	case 14:
 		return TLBI_TTL_TG_16K;
-	case SZ_64K:
+	case 16:
 		return TLBI_TTL_TG_64K;
 	default:
 		return 0;
 	}
+}
+
+static inline unsigned long get_trans_granule(void)
+{
+	return get_trans_granule_shift(PAGE_SHIFT);
 }
 
 #ifdef CONFIG_ARM64_ERRATUM_4193714
@@ -175,18 +181,25 @@ static __always_inline void ipas2e1is(u64 arg)
 	__tlbi(ipas2e1is, arg);
 }
 
-static __always_inline void __tlbi_level_asid(tlbi_op op, u64 addr, u32 level,
-					      u16 asid)
+static __always_inline void __tlbi_level_asid_granule(tlbi_op op, u64 addr,
+						    u32 level, u16 asid,
+						    unsigned int page_shift)
 {
 	u64 arg = __TLBI_VADDR(addr, asid);
 
 	if (alternative_has_cap_unlikely(ARM64_HAS_ARMv8_4_TTL) && level <= 3) {
-		u64 ttl = level | (get_trans_granule() << 2);
+		u64 ttl = level | (get_trans_granule_shift(page_shift) << 2);
 
 		FIELD_MODIFY(TLBI_TTL_MASK, &arg, ttl);
 	}
 
 	op(arg);
+}
+
+static __always_inline void __tlbi_level_asid(tlbi_op op, u64 addr, u32 level,
+					   u16 asid)
+{
+	__tlbi_level_asid_granule(op, addr, level, asid, PAGE_SHIFT);
 }
 
 static inline void __tlbi_level(tlbi_op op, u64 addr, u32 level)
@@ -471,36 +484,45 @@ static __always_inline void ripas2e1is(u64 arg)
 	__tlbi(ripas2e1is, arg);
 }
 
-static __always_inline void __tlbi_range(tlbi_op op, u64 addr,
-					 u16 asid, int scale, int num,
-					 u32 level, bool lpa2)
+static __always_inline void __tlbi_range_granule(tlbi_op op, u64 addr,
+					       u16 asid, int scale, int num,
+					       u32 level, bool lpa2,
+					       unsigned int page_shift)
 {
 	u64 arg = 0;
 
-	arg |= FIELD_PREP(TLBIR_BADDR_MASK, addr >> (lpa2 ? 16 : PAGE_SHIFT));
+	arg |= FIELD_PREP(TLBIR_BADDR_MASK, addr >> (lpa2 ? 16 : page_shift));
 	arg |= FIELD_PREP(TLBIR_TTL_MASK, level > 3 ? 0 : level);
 	arg |= FIELD_PREP(TLBIR_NUM_MASK, num);
 	arg |= FIELD_PREP(TLBIR_SCALE_MASK, scale);
-	arg |= FIELD_PREP(TLBIR_TG_MASK, get_trans_granule());
+	arg |= FIELD_PREP(TLBIR_TG_MASK, get_trans_granule_shift(page_shift));
 	arg |= FIELD_PREP(TLBIR_ASID_MASK, asid);
 
 	op(arg);
 }
 
-static __always_inline void __flush_tlb_range_op(tlbi_op lop, tlbi_op rop,
+/*
+ * Production callers supply the constant system_supports_tlb_range function,
+ * which inlines to the existing alternative branch inside the loop. Do not
+ * evaluate it into a bool outside the loop: that adds runtime flag handling
+ * to the native path. Recording tests supply constant true/false predicates.
+ */
+static __always_inline void __flush_tlb_range_op_granule(tlbi_op lop, tlbi_op rop,
 						 u64 start, size_t pages,
 						 u64 stride, u16 asid,
-						 u32 level, bool lpa2)
+						 u32 level, bool lpa2,
+						 unsigned int page_shift,
+						 bool (*range_supported)(void))
 {
-	u64 addr = start, end = start + pages * PAGE_SIZE;
+	u64 addr = start, end = start + (pages << page_shift);
 	int scale = 3;
 
 	while (addr != end) {
 		int num;
 
-		pages = (end - addr) >> PAGE_SHIFT;
+		pages = (end - addr) >> page_shift;
 
-		if (!system_supports_tlb_range() || pages == 1)
+		if (!range_supported() || pages == 1)
 			goto invalidate_one;
 
 		if (lpa2 && !IS_ALIGNED(addr, SZ_64K))
@@ -508,16 +530,26 @@ static __always_inline void __flush_tlb_range_op(tlbi_op lop, tlbi_op rop,
 
 		num = __TLBI_RANGE_NUM(pages, scale);
 		if (num >= 0) {
-			__tlbi_range(rop, addr, asid, scale, num, level, lpa2);
-			addr += __TLBI_RANGE_PAGES(num, scale) << PAGE_SHIFT;
+			__tlbi_range_granule(rop, addr, asid, scale, num, level,
+					     lpa2, page_shift);
+			addr += __TLBI_RANGE_PAGES(num, scale) << page_shift;
 		}
 
 		scale--;
 		continue;
 invalidate_one:
-		__tlbi_level_asid(lop, addr, level, asid);
+		__tlbi_level_asid_granule(lop, addr, level, asid, page_shift);
 		addr += stride;
 	}
+}
+
+static __always_inline void __flush_tlb_range_op(tlbi_op lop, tlbi_op rop,
+					       u64 start, size_t pages,
+					       u64 stride, u16 asid,
+					       u32 level, bool lpa2)
+{
+	__flush_tlb_range_op_granule(lop, rop, start, pages, stride, asid,
+				   level, lpa2, PAGE_SHIFT, system_supports_tlb_range);
 }
 
 #define __flush_s1_tlb_range_op(op, start, pages, stride, asid, tlb_level) \
@@ -526,8 +558,13 @@ invalidate_one:
 #define __flush_s2_tlb_range_op(op, start, pages, stride, tlb_level) \
 	__flush_tlb_range_op(op, r##op, start, pages, stride, 0, tlb_level, kvm_lpa2_is_enabled())
 
-static inline bool __flush_tlb_range_limit_excess(unsigned long pages,
-						  unsigned long stride)
+#define __flush_user_tlb_range_op(op, start, pages, stride, asid, level, shift) \
+	__flush_tlb_range_op_granule(op, r##op, start, pages, stride, asid, \
+				   level, lpa2_is_enabled(), shift, system_supports_tlb_range)
+
+static inline bool __flush_tlb_range_limit_excess_granule(unsigned long pages,
+							unsigned long stride,
+							unsigned int page_shift)
 {
 	/*
 	 * Assume that the worst case number of DVM ops required to flush a
@@ -538,7 +575,13 @@ static inline bool __flush_tlb_range_limit_excess(unsigned long pages,
 	if (system_supports_tlb_range())
 		return pages > MAX_TLBI_RANGE_PAGES;
 
-	return pages >= (MAX_DVM_OPS * stride) >> PAGE_SHIFT;
+	return pages >= (MAX_DVM_OPS * stride) >> page_shift;
+}
+
+static inline bool __flush_tlb_range_limit_excess(unsigned long pages,
+						unsigned long stride)
+{
+	return __flush_tlb_range_limit_excess_granule(pages, stride, PAGE_SHIFT);
 }
 
 typedef unsigned __bitwise tlbf_t;
@@ -565,10 +608,11 @@ static __always_inline void __do_flush_tlb_range(struct vm_area_struct *vma,
 {
 	struct mm_struct *mm = vma->vm_mm;
 	unsigned long asid, pages;
+	unsigned int page_shift = mm_page_shift(mm);
 
-	pages = (end - start) >> PAGE_SHIFT;
+	pages = (end - start) >> page_shift;
 
-	if (__flush_tlb_range_limit_excess(pages, stride)) {
+	if (__flush_tlb_range_limit_excess_granule(pages, stride, page_shift)) {
 		flush_tlb_mm(mm);
 		return;
 	}
@@ -582,20 +626,20 @@ static __always_inline void __do_flush_tlb_range(struct vm_area_struct *vma,
 
 	switch (flags & (TLBF_NOWALKCACHE | TLBF_NOBROADCAST)) {
 	case TLBF_NONE:
-		__flush_s1_tlb_range_op(vae1is, start, pages, stride,
-					asid, tlb_level);
+		__flush_user_tlb_range_op(vae1is, start, pages, stride,
+					 asid, tlb_level, page_shift);
 		break;
 	case TLBF_NOWALKCACHE:
-		__flush_s1_tlb_range_op(vale1is, start, pages, stride,
-					asid, tlb_level);
+		__flush_user_tlb_range_op(vale1is, start, pages, stride,
+					 asid, tlb_level, page_shift);
 		break;
 	case TLBF_NOBROADCAST:
 		/* Combination unused */
 		BUG();
 		break;
 	case TLBF_NOWALKCACHE | TLBF_NOBROADCAST:
-		__flush_s1_tlb_range_op(vale1, start, pages, stride,
-					asid, tlb_level);
+		__flush_user_tlb_range_op(vale1, start, pages, stride,
+					 asid, tlb_level, page_shift);
 		break;
 	}
 
@@ -629,16 +673,18 @@ static inline void flush_tlb_range(struct vm_area_struct *vma,
 	 * Set the tlb_level to TLBI_TTL_UNKNOWN because we can not get enough
 	 * information here.
 	 */
-	__flush_tlb_range(vma, start, end, PAGE_SIZE, TLBI_TTL_UNKNOWN, TLBF_NONE);
+	__flush_tlb_range(vma, start, end, mm_page_size(vma->vm_mm),
+			  TLBI_TTL_UNKNOWN, TLBF_NONE);
 }
 
 static inline void __flush_tlb_page(struct vm_area_struct *vma,
 				    unsigned long uaddr, tlbf_t flags)
 {
-	unsigned long start = round_down(uaddr, PAGE_SIZE);
-	unsigned long end = start + PAGE_SIZE;
+	unsigned long page_size = mm_page_size(vma->vm_mm);
+	unsigned long start = round_down(uaddr, page_size);
+	unsigned long end = start + page_size;
 
-	__do_flush_tlb_range(vma, start, end, PAGE_SIZE, 3,
+	__do_flush_tlb_range(vma, start, end, page_size, 3,
 			     TLBF_NOWALKCACHE | flags);
 }
 
@@ -688,7 +734,7 @@ static inline void arch_tlbbatch_add_pending(struct arch_tlbflush_unmap_batch *b
 {
 	struct vm_area_struct vma = { .vm_mm = mm, .vm_flags = 0 };
 
-	__flush_tlb_range(&vma, start, end, PAGE_SIZE, 3,
+	__flush_tlb_range(&vma, start, end, mm_page_size(mm), 3,
 			  TLBF_NOWALKCACHE | TLBF_NOSYNC);
 }
 

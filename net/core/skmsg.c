@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright (c) 2017 - 2018 Covalent IO, Inc. http://covalent.io */
 
+#include <linux/mm.h>
+#include <linux/mm_subpage.h>
 #include <linux/skmsg.h>
 #include <linux/skbuff.h>
 #include <linux/scatterlist.h>
@@ -23,6 +25,65 @@ static bool sk_msg_try_coalesce_ok(struct sk_msg *msg, int elem_first_coalesce)
 
 	return false;
 }
+
+#ifdef CONFIG_MM_SUBPAGE
+static bool sk_msg_keeps_subpage(const struct mm_subpage *slot, void *context)
+{
+	struct sk_msg *msg = context;
+	phys_addr_t phys = mm_subpage_phys(slot);
+	phys_addr_t end = phys + mm_subpage_size(slot);
+	u32 i = msg->sg.start;
+
+	if (!msg->sg.size)
+		return false;
+	while (i != msg->sg.end) {
+		struct scatterlist *sg = &msg->sg.data[i];
+
+		if (sg->length) {
+			phys_addr_t start = page_to_phys(sg_page(sg)) + sg->offset;
+
+			if (start < end && phys < start + sg->length)
+				return true;
+		}
+		sk_msg_iter_var_next(i);
+	}
+	return false;
+}
+
+int sk_msg_subpages_add(struct sk_msg *msg, struct page *page, u32 offset, u32 len)
+{
+	int ret;
+
+	ret = mm_subpage_refs_prune(&msg->subpage_refs, sk_msg_keeps_subpage, msg, GFP_ATOMIC);
+	if (ret)
+		return ret;
+	return mm_subpage_refs_add(&msg->subpage_refs, page, offset, len, GFP_ATOMIC);
+}
+EXPORT_SYMBOL_GPL(sk_msg_subpages_add);
+
+/* Called after a borrowed descriptor copy whose source remains live. */
+void sk_msg_subpages_get(struct sk_msg *msg)
+{
+	mm_subpage_refs_get(msg->subpage_refs);
+}
+EXPORT_SYMBOL_GPL(sk_msg_subpages_get);
+
+void sk_msg_subpages_share(struct sk_msg *dst, const struct sk_msg *src)
+{
+	WARN_ON_ONCE(dst->subpage_refs);
+	dst->subpage_refs = mm_subpage_refs_get(src->subpage_refs);
+}
+EXPORT_SYMBOL_GPL(sk_msg_subpages_share);
+
+void sk_msg_subpages_release(struct sk_msg *msg)
+{
+	struct mm_subpage_refs *refs = msg->subpage_refs;
+
+	msg->subpage_refs = NULL;
+	mm_subpage_refs_put(refs);
+}
+EXPORT_SYMBOL_GPL(sk_msg_subpages_release);
+#endif
 
 int sk_msg_alloc(struct sock *sk, struct sk_msg *msg, int len,
 		 int elem_first_coalesce)
@@ -88,7 +149,7 @@ EXPORT_SYMBOL_GPL(sk_msg_alloc);
 int sk_msg_clone(struct sock *sk, struct sk_msg *dst, struct sk_msg *src,
 		 u32 off, u32 len)
 {
-	int i = src->sg.start;
+	int i = src->sg.start, ret;
 	struct scatterlist *sge = sk_msg_elem(src, i);
 	struct scatterlist *sgd = NULL;
 	u32 sge_len, sge_off;
@@ -114,11 +175,16 @@ int sk_msg_clone(struct sock *sk, struct sk_msg *dst, struct sk_msg *src,
 		if (sgd &&
 		    (sg_page(sge) == sg_page(sgd)) &&
 		    (sg_virt(sge) + off == sg_virt(sgd) + sgd->length)) {
+			ret = sk_msg_subpages_add(dst, sg_page(sge), sge->offset + off, sge_len);
+			if (ret)
+				return ret;
 			sgd->length += sge_len;
 			dst->sg.size += sge_len;
 		} else if (!sk_msg_full(dst)) {
 			sge_off = sge->offset + off;
-			sk_msg_page_add(dst, sg_page(sge), sge_len, sge_off);
+			ret = sk_msg_page_add(dst, sg_page(sge), sge_len, sge_off);
+			if (ret)
+				return ret;
 		} else {
 			return -ENOSPC;
 		}
@@ -205,6 +271,7 @@ static int __sk_msg_free(struct sock *sk, struct sk_msg *msg, u32 i,
 		sk_msg_check_to_free(msg, i, msg->sg.size);
 		sge = sk_msg_elem(msg, i);
 	}
+	sk_msg_subpages_release(msg);
 	consume_skb(msg->skb);
 	sk_msg_init(msg);
 	return freed;
@@ -248,6 +315,7 @@ static void __sk_msg_free_partial(struct sock *sk, struct sk_msg *msg,
 		sk_msg_check_to_free(msg, i, bytes);
 	}
 	msg->sg.start = i;
+	sk_msg_subpages_drop_empty(msg);
 }
 
 void sk_msg_free_partial(struct sock *sk, struct sk_msg *msg, u32 bytes)
@@ -267,6 +335,7 @@ void sk_msg_trim(struct sock *sk, struct sk_msg *msg, int len)
 	int trim = msg->sg.size - len;
 	u32 i = msg->sg.end;
 
+	sk_msg_subpages_drop_empty(msg);
 	if (trim <= 0) {
 		WARN_ON(trim < 0);
 		return;
@@ -299,6 +368,7 @@ out:
 	 * does not require an update.
 	 */
 	if (!msg->sg.size) {
+		sk_msg_subpages_release(msg);
 		msg->sg.curr = msg->sg.start;
 		msg->sg.copybreak = 0;
 	} else if (sk_msg_iter_dist(msg->sg.start, msg->sg.curr) >=
@@ -334,11 +404,19 @@ int sk_msg_zerocopy_from_iter(struct sock *sk, struct iov_iter *from,
 			goto out;
 		}
 
-		bytes -= copied;
-		msg->sg.size += copied;
-
 		while (copied) {
 			use = min_t(int, copied, PAGE_SIZE - offset);
+			ret = sk_msg_subpages_add(msg, pages[i], offset, use);
+			if (ret) {
+				unsigned int nr = DIV_ROUND_UP(offset + copied, PAGE_SIZE);
+
+				while (nr--)
+					put_page(pages[i++]);
+				iov_iter_revert(from, copied);
+				goto out;
+			}
+			bytes -= use;
+			msg->sg.size += use;
 			sg_set_page(&msg->sg.data[msg->sg.end],
 				    pages[i], use, offset);
 			sg_unmark_end(&msg->sg.data[msg->sg.end]);

@@ -449,7 +449,7 @@ TRACE_EVENT(rss_stat,
 		__entry->curr = current->mm == mm && !(current->flags & PF_KTHREAD);
 		__entry->member = member;
 		__entry->size = (percpu_counter_sum_positive(&mm->rss_stat[member])
-							    << PAGE_SHIFT);
+							    << mm_page_shift(mm));
 	),
 
 	TP_printk("mm_id=%u curr=%d type=%s size=%ldB",

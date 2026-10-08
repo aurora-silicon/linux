@@ -289,7 +289,10 @@ static int io_region_mmap(struct io_ring_ctx *ctx,
 	unsigned long nr_pages = min(mr->nr_pages, max_pages);
 
 	vm_flags_set(vma, VM_DONTEXPAND);
-	return vm_insert_pages(vma, vma->vm_start, mr->pages, &nr_pages);
+	if (mm_page_size(vma->vm_mm) == PAGE_SIZE)
+		return vm_insert_pages(vma, vma->vm_start, mr->pages, &nr_pages);
+	return vm_insert_pages_range(vma, vma->vm_start, mr->pages, nr_pages, 0,
+		min_t(unsigned long, vma->vm_end - vma->vm_start, nr_pages << PAGE_SHIFT));
 }
 
 __cold int io_uring_mmap(struct file *file, struct vm_area_struct *vma)
@@ -300,6 +303,9 @@ __cold int io_uring_mmap(struct file *file, struct vm_area_struct *vma)
 	unsigned int page_limit = UINT_MAX;
 	struct io_mapped_region *region;
 	void *ptr;
+
+	if (vma_subpage_offset(vma))
+		return -EINVAL;
 
 	guard(mutex)(&ctx->mmap_lock);
 

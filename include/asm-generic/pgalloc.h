@@ -81,7 +81,7 @@ static inline pgtable_t __pte_alloc_one_noprof(struct mm_struct *mm, gfp_t gfp)
 		return NULL;
 	}
 
-	return ptdesc_page(ptdesc);
+	return pgtable_from_page(ptdesc_page(ptdesc));
 }
 #define __pte_alloc_one(...)	alloc_hooks(__pte_alloc_one_noprof(__VA_ARGS__))
 
@@ -111,17 +111,18 @@ static inline pgtable_t pte_alloc_one_noprof(struct mm_struct *mm)
  * @mm: the mm_struct of the current context
  * @pte_page: the `struct page` referencing the ptdesc
  */
-static inline void pte_free(struct mm_struct *mm, struct page *pte_page)
+#ifndef __HAVE_ARCH_PTE_FREE
+static inline void pte_free(struct mm_struct *mm, pgtable_t pte_page)
 {
-	struct ptdesc *ptdesc = page_ptdesc(pte_page);
+	struct ptdesc *ptdesc = page_ptdesc(pgtable_to_page(pte_page));
 
 	pagetable_dtor_free(ptdesc);
 }
+#endif
 
 
 #if CONFIG_PGTABLE_LEVELS > 2
 
-#ifndef __HAVE_ARCH_PMD_ALLOC_ONE
 /**
  * pmd_alloc_one - allocate memory for a PMD-level page table
  * @mm: the mm_struct of the current context
@@ -133,7 +134,7 @@ static inline void pte_free(struct mm_struct *mm, struct page *pte_page)
  *
  * Return: pointer to the allocated memory or %NULL on error
  */
-static inline pmd_t *pmd_alloc_one_noprof(struct mm_struct *mm, unsigned long addr)
+static inline pmd_t *__pmd_alloc_one_noprof(struct mm_struct *mm, unsigned long addr)
 {
 	struct ptdesc *ptdesc;
 	gfp_t gfp = GFP_PGTABLE_USER;
@@ -152,6 +153,12 @@ static inline pmd_t *pmd_alloc_one_noprof(struct mm_struct *mm, unsigned long ad
 		ptdesc_set_kernel(ptdesc);
 
 	return ptdesc_address(ptdesc);
+}
+
+#ifndef __HAVE_ARCH_PMD_ALLOC_ONE
+static inline pmd_t *pmd_alloc_one_noprof(struct mm_struct *mm, unsigned long addr)
+{
+	return __pmd_alloc_one_noprof(mm, addr);
 }
 #define pmd_alloc_one(...)	alloc_hooks(pmd_alloc_one_noprof(__VA_ARGS__))
 #endif

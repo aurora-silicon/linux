@@ -5,6 +5,7 @@
 #ifndef __IO_PAGETABLE_H
 #define __IO_PAGETABLE_H
 
+#include <linux/mm_granule.h>
 #include <linux/dma-buf.h>
 #include <linux/interval_tree.h>
 #include <linux/kref.h>
@@ -45,6 +46,7 @@ struct iopt_area {
 	struct iommu_domain *storage_domain;
 	/* How many bytes into the first page the area starts */
 	unsigned int page_offset;
+	u8 page_shift;
 	/* IOMMU_READ, IOMMU_WRITE, etc */
 	int iommu_prot;
 	bool prevent_access : 1;
@@ -107,8 +109,8 @@ static inline size_t iopt_area_length(struct iopt_area *area)
 
 /*
  * Number of bytes from the start of the iopt_pages that the iova begins.
- * iopt_area_start_byte() / PAGE_SIZE encodes the starting page index
- * iopt_area_start_byte() % PAGE_SIZE encodes the offset within that page
+ * iopt_area_start_byte() >> area->page_shift encodes the starting page index
+ * iopt_area_start_byte() % (1UL << area->page_shift) encodes the offset within that page
  */
 static inline unsigned long iopt_area_start_byte(struct iopt_area *area,
 						 unsigned long iova)
@@ -117,13 +119,13 @@ static inline unsigned long iopt_area_start_byte(struct iopt_area *area,
 		WARN_ON(iova < iopt_area_iova(area) ||
 			iova > iopt_area_last_iova(area));
 	return (iova - iopt_area_iova(area)) + area->page_offset +
-	       iopt_area_index(area) * PAGE_SIZE;
+	       (iopt_area_index(area) << area->page_shift);
 }
 
 static inline unsigned long iopt_area_iova_to_index(struct iopt_area *area,
 						    unsigned long iova)
 {
-	return iopt_area_start_byte(area, iova) / PAGE_SIZE;
+	return iopt_area_start_byte(area, iova) >> area->page_shift;
 }
 
 #define __make_iopt_iter(name)                                                 \
@@ -214,7 +216,7 @@ struct iopt_pages_dmabuf {
  * io_pagetable's, through their iopt_area's, can share a single iopt_pages
  * which avoids multi-pinning and double accounting of page consumption.
  *
- * indexes in this structure are measured in PAGE_SIZE units, are 0 based from
+ * Indexes use (1UL << page_shift) units and are 0 based from
  * the start of the uptr and extend to npages. pages are pinned dynamically
  * according to the intervals in the access_itree and domains_itree, npinned
  * records the current number of pages pinned.
@@ -222,6 +224,8 @@ struct iopt_pages_dmabuf {
 struct iopt_pages {
 	struct kref kref;
 	struct mutex mutex;
+	/* Logical indices use page_shift; pin accounting remains native pages. */
+	u8 page_shift;
 	size_t npages;
 	size_t npinned;
 	size_t last_npinned;
@@ -242,11 +246,72 @@ struct iopt_pages {
 	u8 account_mode;
 
 	struct xarray pinned_pfns;
+#ifdef CONFIG_MM_SUBPAGE
+	/* Exact fragment pins, indexed independently of device translations. */
+	struct xarray fragments;
+	/* Native physical PFN -> fragment count, for pin accounting. */
+	struct xarray fragment_pages;
+#endif
 	/* Of iopt_pages_access::node */
 	struct rb_root_cached access_itree;
 	/* Of iopt_area::pages_node */
 	struct rb_root_cached domains_itree;
 };
+
+static inline bool iopt_pages_use_fragments(struct iopt_pages *pages)
+{
+	return IS_ENABLED(CONFIG_MM_SUBPAGE) && pages->type == IOPT_ADDRESS_USER &&
+	       mm_page_size(pages->source_mm) != PAGE_SIZE;
+}
+
+#ifdef CONFIG_MM_SUBPAGE
+int iopt_fragments_fill_domain(struct iopt_area *area, struct iopt_pages *pages,
+			       struct iommu_domain *domain);
+int iopt_fragments_fill_domains(struct iopt_area *area, struct iopt_pages *pages);
+void iopt_fragments_unfill_domain(struct iopt_area *area, struct iopt_pages *pages,
+				 struct iommu_domain *domain);
+int iopt_fragments_add_access(struct iopt_area *area, unsigned long first,
+			      unsigned long last, struct page **out_pages,
+			      bool lock_area);
+int iopt_fragments_add_phys_access(struct iopt_area *area, unsigned long start_byte,
+				   unsigned long length, phys_addr_t *out_phys);
+void iopt_fragments_unfill_access(struct iopt_pages *pages, unsigned long first,
+				 unsigned long last);
+int iopt_fragments_rw(struct iopt_pages *pages, unsigned long start_byte,
+		      void *data, unsigned long length, unsigned int flags);
+#else
+static inline int iopt_fragments_fill_domain(struct iopt_area *area,
+		struct iopt_pages *pages, struct iommu_domain *domain)
+{
+	return -EOPNOTSUPP;
+}
+static inline int iopt_fragments_fill_domains(struct iopt_area *area,
+		struct iopt_pages *pages)
+{
+	return -EOPNOTSUPP;
+}
+static inline void iopt_fragments_unfill_domain(struct iopt_area *area,
+		struct iopt_pages *pages, struct iommu_domain *domain) { }
+static inline int iopt_fragments_add_access(struct iopt_area *area,
+		unsigned long first, unsigned long last, struct page **out_pages,
+		bool lock_area)
+{
+	return -EOPNOTSUPP;
+}
+static inline int iopt_fragments_add_phys_access(struct iopt_area *area,
+		unsigned long start_byte, unsigned long length, phys_addr_t *out_phys)
+{
+	return -EOPNOTSUPP;
+}
+static inline void iopt_fragments_unfill_access(struct iopt_pages *pages,
+		unsigned long first, unsigned long last) { }
+static inline int iopt_fragments_rw(struct iopt_pages *pages,
+		unsigned long start_byte, void *data, unsigned long length,
+		unsigned int flags)
+{
+	return -EOPNOTSUPP;
+}
+#endif
 
 static inline bool iopt_is_dmabuf(struct iopt_pages *pages)
 {
@@ -290,6 +355,8 @@ void iopt_pages_unfill_xarray(struct iopt_pages *pages, unsigned long start,
 int iopt_area_add_access(struct iopt_area *area, unsigned long start,
 			 unsigned long last, struct page **out_pages,
 			 unsigned int flags, bool lock_area);
+int iopt_area_add_phys_access(struct iopt_area *area, unsigned long start_byte,
+			      unsigned long length, phys_addr_t *out_phys);
 void iopt_area_remove_access(struct iopt_area *area, unsigned long start,
 			     unsigned long last, bool unlock_area);
 int iopt_pages_rw_access(struct iopt_pages *pages, unsigned long start_byte,

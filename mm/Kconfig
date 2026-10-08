@@ -1164,6 +1164,28 @@ config IDLE_PAGE_TRACKING
 	  See Documentation/admin-guide/mm/idle_page_tracking.rst for
 	  more details.
 
+config ARCH_HAS_MM_PGTABLE
+	bool
+	help
+	  Architecture supplies target-mm page-table geometry and accessors.
+	  This does not change the native physical allocation granule.
+
+config ARCH_HAS_USER_PAGE_SIZE
+	bool
+	help
+	  Architecture supports selecting the user mapping granule at exec.
+	  It supplies arch_exec_page_size_shift() to validate requests, and
+	  integrates the selected granule into mm allocation and binary loading.
+
+config MM_SUBPAGE
+	bool
+	select PAGE_EXTENSION
+	select XARRAY_MULTI
+	help
+	  Reference-counted user data slots smaller than a native folio.
+	  Architectures must integrate rmap, faults, reclaim and pins before
+	  exposing these backing primitives to userspace.
+
 # Architectures which implement cpu_dcache_is_aliasing() to query
 # whether the data caches are aliased (VIVT or VIPT with dcache
 # aliasing) need to select this.
@@ -1439,9 +1461,15 @@ config ARCH_HAS_USER_SHADOW_STACK
 config HAVE_ARCH_TLB_REMOVE_TABLE
 	def_bool n
 
+config ARCH_SUPPORTS_PT_RECLAIM
+	bool
+	help
+	  The architecture's custom table-free callback supports PTE reclamation.
+
 config PT_RECLAIM
 	def_bool y
-	depends on MMU_GATHER_RCU_TABLE_FREE && !HAVE_ARCH_TLB_REMOVE_TABLE
+	depends on MMU_GATHER_RCU_TABLE_FREE
+	depends on !HAVE_ARCH_TLB_REMOVE_TABLE || ARCH_SUPPORTS_PT_RECLAIM
 	help
 	  Try to reclaim empty user page table pages in paths other than munmap
 	  and exit_mmap path.

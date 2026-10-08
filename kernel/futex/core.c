@@ -44,6 +44,7 @@
 #include <linux/prctl.h>
 #include <linux/mempolicy.h>
 #include <linux/mmap_lock.h>
+#include <linux/mm_subpage.h>
 #include <linux/wait_bit.h>
 
 #include "futex.h"
@@ -512,6 +513,44 @@ static u64 get_inode_sequence_number(struct inode *inode)
 	}
 }
 
+/* Keep a typed slot reference alive until the mapping identity is sampled. */
+struct futex_page_ref {
+	struct page *page;
+#ifdef CONFIG_MM_SUBPAGE
+	struct user_page_fragment fragment;
+#endif
+};
+
+static int futex_get_page_ref(struct mm_struct *mm, unsigned long address,
+		unsigned long uaddr, unsigned int size, unsigned int flags,
+		struct futex_page_ref *ref)
+{
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(mm) != PAGE_SIZE) {
+		int ret = get_user_fragments_remote(mm, uaddr, size, flags,
+						   &ref->fragment, 1);
+
+		if (ret != 1)
+			return ret ?: -EFAULT;
+		ref->page = folio_page(ref->fragment.folio,
+				      ref->fragment.offset >> PAGE_SHIFT);
+		return 1;
+	}
+#endif
+	return get_user_pages_fast(address, 1, flags, &ref->page);
+}
+
+static void futex_put_page_ref(struct futex_page_ref *ref)
+{
+#ifdef CONFIG_MM_SUBPAGE
+	if (ref->fragment.folio) {
+		release_user_fragments(&ref->fragment, 1, false);
+		return;
+	}
+#endif
+	put_page(ref->page);
+}
+
 /**
  * get_futex_key() - Get parameters which are the keys for a futex
  * @uaddr:	virtual address of the futex
@@ -545,6 +584,7 @@ int get_futex_key(u32 __user *uaddr, unsigned int flags, union futex_key *key,
 	unsigned long address = (unsigned long)uaddr;
 	struct mm_struct *mm = current->mm;
 	struct page *page;
+	struct futex_page_ref ref = {};
 	struct folio *folio;
 	struct address_space *mapping;
 	int node, err, size, ro = 0;
@@ -629,13 +669,13 @@ again:
 	if (unlikely(should_fail_futex(true)))
 		return -EFAULT;
 
-	err = get_user_pages_fast(address, 1, FOLL_WRITE, &page);
+	err = futex_get_page_ref(mm, address, (unsigned long)uaddr, size, FOLL_WRITE, &ref);
 	/*
 	 * If write access is not required (eg. FUTEX_WAIT), try
 	 * and get read-only access.
 	 */
 	if (err == -EFAULT && rw == FUTEX_READ) {
-		err = get_user_pages_fast(address, 1, 0, &page);
+		err = futex_get_page_ref(mm, address, (unsigned long)uaddr, size, 0, &ref);
 		ro = 1;
 	}
 	if (err < 0)
@@ -660,6 +700,7 @@ again:
 	 * filesystem-backed pages, the precise page is required as the
 	 * index of the page determines the key.
 	 */
+	page = ref.page;
 	folio = page_folio(page);
 	mapping = READ_ONCE(folio->mapping);
 
@@ -689,7 +730,7 @@ again:
 		folio_lock(folio);
 		shmem_swizzled = folio_test_swapcache(folio) || folio->mapping;
 		folio_unlock(folio);
-		folio_put(folio);
+		futex_put_page_ref(&ref);
 
 		if (shmem_swizzled)
 			goto again;
@@ -739,7 +780,7 @@ again:
 
 		if (READ_ONCE(folio->mapping) != mapping) {
 			rcu_read_unlock();
-			folio_put(folio);
+			futex_put_page_ref(&ref);
 
 			goto again;
 		}
@@ -747,11 +788,15 @@ again:
 		inode = READ_ONCE(mapping->host);
 		if (!inode) {
 			rcu_read_unlock();
-			folio_put(folio);
+			futex_put_page_ref(&ref);
 
 			goto again;
 		}
 
+#ifdef CONFIG_MM_SUBPAGE
+		if (ref.fragment.folio)
+			key->both.offset = offset_in_page(ref.fragment.offset);
+#endif
 		key->both.offset |= FUT_OFF_INODE; /* inode-based key */
 		key->shared.i_seq = get_inode_sequence_number(inode);
 		key->shared.pgoff = page_pgoff(folio, page);
@@ -759,7 +804,7 @@ again:
 	}
 
 out:
-	folio_put(folio);
+	futex_put_page_ref(&ref);
 	return err;
 }
 

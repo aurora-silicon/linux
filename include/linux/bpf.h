@@ -263,6 +263,11 @@ struct btf_record {
 	int wq_off;
 	int refcount_off;
 	int task_work_off;
+#ifdef CONFIG_MM_SUBPAGE
+	/* Private ownership pointer appended to task-storage values with UPTRs. */
+	u32 uptr_pins_off;
+	u32 uptr_extra_size;
+#endif
 	struct btf_field fields[];
 };
 
@@ -563,6 +568,15 @@ static inline void copy_map_value_long(struct bpf_map *map, void *dst, void *src
 	bpf_obj_memcpy(map->record, dst, src, map->value_size, true);
 }
 
+static inline u32 bpf_obj_uptr_extra_size(const struct btf_record *rec)
+{
+#ifdef CONFIG_MM_SUBPAGE
+	return IS_ERR_OR_NULL(rec) ? 0 : rec->uptr_extra_size;
+#else
+	return 0;
+#endif
+}
+
 static inline void bpf_obj_swap_uptrs(const struct btf_record *rec, void *dst, void *src)
 {
 	unsigned long *src_uptr, *dst_uptr;
@@ -580,6 +594,14 @@ static inline void bpf_obj_swap_uptrs(const struct btf_record *rec, void *dst, v
 		dst_uptr = dst + field->offset;
 		swap(*src_uptr, *dst_uptr);
 	}
+#ifdef CONFIG_MM_SUBPAGE
+	if (rec->uptr_extra_size) {
+		void **src_pins = src + rec->uptr_pins_off;
+		void **dst_pins = dst + rec->uptr_pins_off;
+
+		swap(*src_pins, *dst_pins);
+	}
+#endif
 }
 
 static inline void bpf_obj_memzero(struct btf_record *rec, void *dst, u32 size)

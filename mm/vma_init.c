@@ -46,7 +46,10 @@ static void vm_area_init_from(const struct vm_area_struct *src,
 	dest->vm_start = src->vm_start;
 	dest->vm_end = src->vm_end;
 	dest->anon_vma = src->anon_vma;
-	dest->vm_pgoff = src->vm_pgoff;
+	vma_set_page_offset(dest, (struct vm_page_offset) {
+		.index = src->vm_pgoff,
+		.offset = vma_subpage_offset(src),
+	});
 	dest->vm_file = src->vm_file;
 	dest->vm_private_data = src->vm_private_data;
 	vm_flags_init(dest, src->vm_flags);

@@ -4,6 +4,7 @@
 #include <linux/fdtable.h>
 #include <linux/freezer.h>
 #include <linux/mm.h>
+#include <linux/mm_subpage.h>
 #include <linux/stat.h>
 #include <linux/fcntl.h>
 #include <linux/swap.h>
@@ -884,7 +885,8 @@ static bool coredump_file(struct core_name *cn, struct coredump_params *cprm,
 	struct file *file __free(fput) = NULL;
 	int open_flags = O_CREAT | O_WRONLY | O_NOFOLLOW | O_LARGEFILE | O_EXCL;
 
-	if (cprm->limit < binfmt->min_coredump)
+	if (cprm->limit < (binfmt->min_coredump_size ?
+			    binfmt->min_coredump_size() : binfmt->min_coredump))
 		return false;
 
 	if (coredump_force_suid_safe(cprm) && cn->corename[0] != '/') {
@@ -1278,7 +1280,8 @@ void dump_skip(struct coredump_params *cprm, size_t nr)
 EXPORT_SYMBOL(dump_skip);
 
 #ifdef CONFIG_ELF_CORE
-static int dump_emit_page(struct coredump_params *cprm, struct page *page)
+static int dump_emit_page(struct coredump_params *cprm, struct page *page,
+			  unsigned int offset, unsigned int size)
 {
 	struct bio_vec bvec;
 	struct iov_iter iter;
@@ -1294,19 +1297,19 @@ static int dump_emit_page(struct coredump_params *cprm, struct page *page)
 			return 0;
 		cprm->to_skip = 0;
 	}
-	if (cprm->written + PAGE_SIZE > cprm->limit)
+	if (cprm->written + size > cprm->limit)
 		return 0;
 	if (dump_interrupted())
 		return 0;
 	pos = file->f_pos;
-	bvec_set_page(&bvec, page, PAGE_SIZE, 0);
-	iov_iter_bvec(&iter, ITER_SOURCE, &bvec, 1, PAGE_SIZE);
+	bvec_set_page(&bvec, page, size, offset);
+	iov_iter_bvec(&iter, ITER_SOURCE, &bvec, 1, size);
 	n = __kernel_write_iter(cprm->file, &iter, &pos);
-	if (n != PAGE_SIZE)
+	if (n != size)
 		return 0;
 	file->f_pos = pos;
-	cprm->written += PAGE_SIZE;
-	cprm->pos += PAGE_SIZE;
+	cprm->written += size;
+	cprm->pos += size;
 
 	return 1;
 }
@@ -1321,10 +1324,11 @@ static int dump_emit_page(struct coredump_params *cprm, struct page *page)
 
 #define dump_page_alloc() alloc_page(GFP_KERNEL)
 #define dump_page_free(x) __free_page(x)
-static struct page *dump_page_copy(struct page *src, struct page *dst)
+static struct page *dump_page_copy(struct page *src, struct page *dst,
+				   unsigned int offset, unsigned int size)
 {
 	void *buf = kmap_local_page(src);
-	size_t left = copy_mc_to_kernel(page_address(dst), buf, PAGE_SIZE);
+	size_t left = copy_mc_to_kernel(page_address(dst) + offset, buf + offset, size);
 	kunmap_local(buf);
 	return left ? NULL : dst;
 }
@@ -1334,9 +1338,48 @@ static struct page *dump_page_copy(struct page *src, struct page *dst)
 /* We just want to return non-NULL; it's never used. */
 #define dump_page_alloc() ERR_PTR(-EINVAL)
 #define dump_page_free(x) ((void)(x))
-static inline struct page *dump_page_copy(struct page *src, struct page *dst)
+static inline struct page *dump_page_copy(struct page *src, struct page *dst,
+				   unsigned int offset, unsigned int size)
 {
 	return src;
+}
+#endif
+
+#ifdef CONFIG_MM_SUBPAGE
+static int dump_subpage_range(struct coredump_params *cprm, unsigned long start,
+			      unsigned long len)
+{
+	unsigned long size = mm_user_fragment_size(current->mm), addr;
+	struct page *scratch = dump_page_alloc();
+	int ret = 0;
+
+	if (!scratch)
+		return 0;
+	for (addr = start; addr < start + len; addr += size) {
+		struct user_page_fragment fragment;
+
+		if (get_dump_fragment(addr, &fragment) == 1) {
+			struct page *page = folio_page(fragment.folio,
+						     fragment.offset >> PAGE_SHIFT);
+			unsigned int offset = offset_in_page(fragment.offset);
+			int emitted;
+
+			emitted = dump_emit_page(cprm,
+				dump_page_copy(page, scratch, offset, size), offset, size);
+			release_user_fragments(&fragment, 1, false);
+			if (!emitted)
+				goto out;
+		} else {
+			dump_skip(cprm, size);
+		}
+		if (dump_interrupted())
+			goto out;
+		cond_resched();
+	}
+	ret = 1;
+out:
+	dump_page_free(scratch);
+	return ret;
 }
 #endif
 
@@ -1347,6 +1390,10 @@ int dump_user_range(struct coredump_params *cprm, unsigned long start,
 	struct page *dump_page;
 	int locked, ret;
 
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(current->mm) != PAGE_SIZE)
+		return dump_subpage_range(cprm, start, len);
+#endif
 	dump_page = dump_page_alloc();
 	if (!dump_page)
 		return 0;
@@ -1375,7 +1422,8 @@ int dump_user_range(struct coredump_params *cprm, unsigned long start,
 				mmap_read_unlock(current->mm);
 				locked = 0;
 			}
-			int stop = !dump_emit_page(cprm, dump_page_copy(page, dump_page));
+			int stop = !dump_emit_page(cprm,
+				dump_page_copy(page, dump_page, 0, PAGE_SIZE), 0, PAGE_SIZE);
 			put_page(page);
 			if (stop)
 				goto out;
@@ -1652,9 +1700,10 @@ static unsigned long vma_dump_size(struct vm_area_struct *vma,
 	 * dump the first page to aid in determining what was mapped here.
 	 */
 	if (FILTER(ELF_HEADERS) &&
-	    vma->vm_pgoff == 0 && (vma->vm_flags & VM_READ)) {
+	    vma->vm_pgoff == 0 && !vma_subpage_offset(vma) &&
+	    (vma->vm_flags & VM_READ)) {
 		if ((READ_ONCE(file_inode(vma->vm_file)->i_mode) & 0111) != 0)
-			return PAGE_SIZE;
+			return min(mm_page_size(vma->vm_mm), vma->vm_end - vma->vm_start);
 
 		/*
 		 * ELF libraries aren't always executable.
@@ -1754,7 +1803,7 @@ static bool dump_vma_snapshot(struct coredump_params *cprm)
 		m->end = vma->vm_end;
 		m->flags = vma->vm_flags;
 		m->dump_size = vma_dump_size(vma, cprm->mm_flags);
-		m->pgoff = vma->vm_pgoff;
+		m->pgoff = core_vma_pgoff(vma);
 		m->file = vma->vm_file;
 		if (m->file)
 			get_file(m->file);
@@ -1773,7 +1822,7 @@ static bool dump_vma_snapshot(struct coredump_params *cprm)
 					memcmp(elfmag, ELFMAG, SELFMAG) != 0) {
 				m->dump_size = 0;
 			} else {
-				m->dump_size = PAGE_SIZE;
+				m->dump_size = min(mm_page_size(mm), m->end - m->start);
 			}
 		}
 

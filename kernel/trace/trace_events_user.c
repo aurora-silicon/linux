@@ -20,6 +20,7 @@
 #include <linux/types.h>
 #include <linux/uaccess.h>
 #include <linux/highmem.h>
+#include <linux/mm_subpage.h>
 #include <linux/init.h>
 #include <linux/user_events.h>
 #include "trace_dynevent.h"
@@ -554,6 +555,11 @@ static int user_event_enabler_write(struct user_event_mm *mm,
 	unsigned long uaddr = enabler->addr;
 	unsigned long *ptr;
 	struct page *page;
+#ifdef CONFIG_MM_SUBPAGE
+	struct user_page_fragment fragment;
+	struct vm_area_struct *vma;
+	bool alternative = mm_page_size(mm->mm) != PAGE_SIZE;
+#endif
 	void *kaddr;
 	int bit = ENABLE_BIT(enabler);
 	int ret;
@@ -573,8 +579,14 @@ static int user_event_enabler_write(struct user_event_mm *mm,
 
 	align_addr_bit(&uaddr, &bit, ENABLE_BITOPS(enabler));
 
-	ret = pin_user_pages_remote(mm->mm, uaddr, 1, FOLL_WRITE | FOLL_NOFAULT,
-				    &page, NULL);
+#ifdef CONFIG_MM_SUBPAGE
+	if (alternative)
+		ret = pin_user_fragment_vma_remote(mm->mm, uaddr, sizeof(long),
+				FOLL_WRITE | FOLL_NOFAULT, &fragment, &vma);
+	else
+#endif
+		ret = pin_user_pages_remote(mm->mm, uaddr, 1, FOLL_WRITE | FOLL_NOFAULT,
+					    &page, NULL);
 
 	if (unlikely(ret <= 0)) {
 		if (!fixup_fault)
@@ -586,8 +598,17 @@ static int user_event_enabler_write(struct user_event_mm *mm,
 		return -EFAULT;
 	}
 
-	kaddr = kmap_local_page(page);
-	ptr = kaddr + (uaddr & ~PAGE_MASK);
+#ifdef CONFIG_MM_SUBPAGE
+	if (alternative) {
+		/* align_addr_bit() keeps the complete atomic word in this fragment. */
+		kaddr = kmap_local_folio(fragment.folio, fragment.offset);
+		ptr = kaddr;
+	} else
+#endif
+	{
+		kaddr = kmap_local_page(page);
+		ptr = kaddr + (uaddr & ~PAGE_MASK);
+	}
 
 	/* Update bit atomically, user tracers must be atomic as well */
 	if (enabler->event && enabler->event->status)
@@ -596,7 +617,12 @@ static int user_event_enabler_write(struct user_event_mm *mm,
 		clear_bit(bit, ptr);
 
 	kunmap_local(kaddr);
-	unpin_user_pages_dirty_lock(&page, 1, true);
+#ifdef CONFIG_MM_SUBPAGE
+	if (alternative)
+		release_user_fragments(&fragment, 1, true);
+	else
+#endif
+		unpin_user_pages_dirty_lock(&page, 1, true);
 
 	return 0;
 }

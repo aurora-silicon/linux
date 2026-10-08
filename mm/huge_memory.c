@@ -2715,7 +2715,8 @@ int change_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
 			goto unlock;
 
 		if (!folio_can_map_prot_numa(pmd_folio(*pmd), vma,
-					     vma_is_single_threaded_private(vma)))
+					     vma_is_single_threaded_private(vma),
+					     folio_maybe_mapped_shared(pmd_folio(*pmd))))
 			goto unlock;
 	}
 	/*
@@ -4118,6 +4119,12 @@ static int __folio_split(struct folio *folio, unsigned int new_order,
 		}
 		anon_vma_lock_write(anon_vma);
 		mapping = NULL;
+#ifdef CONFIG_MM_SUBPAGE
+		if (new_order < anon_vma->min_folio_order) {
+			ret = -EBUSY;
+			goto out_unlock;
+		}
+#endif
 	} else {
 		unsigned int min_order;
 		gfp_t gfp;
@@ -4394,7 +4401,7 @@ int folio_split(struct folio *folio, unsigned int new_order,
 unsigned int min_order_for_split(struct folio *folio)
 {
 	if (folio_test_anon(folio))
-		return 0;
+		return folio_anon_min_order(folio);
 
 	/*
 	 * If the folio got truncated, we don't know the previous mapping and

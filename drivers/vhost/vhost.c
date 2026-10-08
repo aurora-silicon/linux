@@ -14,6 +14,7 @@
 #include <linux/vhost.h>
 #include <linux/uio.h>
 #include <linux/mm.h>
+#include <linux/mm_subpage.h>
 #include <linux/miscdevice.h>
 #include <linux/mutex.h>
 #include <linux/poll.h>
@@ -2435,6 +2436,26 @@ static int set_bit_to_user(int nr, void __user *addr)
 	void *base;
 	int bit = nr + (log % PAGE_SIZE) * 8;
 	int r;
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(current->mm) != PAGE_SIZE) {
+		struct user_page_fragment fragment;
+		unsigned long word = log & ~(sizeof(unsigned long) - 1);
+
+		/* Pin the complete atomic word, which stays inside one leaf.
+		 * A relocated leaf's physical offset need not match its VA.
+		 */
+		r = pin_user_fragments_remote(current->mm, word,
+				sizeof(unsigned long), FOLL_WRITE, &fragment, 1);
+		if (r != 1)
+			return r < 0 ? r : -EFAULT;
+		base = kmap_local_folio(fragment.folio, fragment.offset);
+		set_bit(nr + (log - word) * 8, base);
+		kunmap_local(base);
+		release_user_fragments(&fragment, 1, true);
+		return 0;
+	}
+#endif
 
 	r = pin_user_pages_fast(log, 1, FOLL_WRITE, &page);
 	if (r < 0)

@@ -1,0 +1,20 @@
+LIBRARY KERNEL32.dll
+EXPORTS
+VirtualAlloc
+VirtualFree
+VirtualProtect
+VirtualQuery
+GetSystemInfo
+GetStdHandle
+WriteFile
+ExitProcess
+GetLastError
+AddVectoredExceptionHandler
+RemoveVectoredExceptionHandler
+CreateThread
+WaitForSingleObject
+GetExitCodeThread
+CloseHandle
+CreateFileMappingA
+MapViewOfFile
+UnmapViewOfFile

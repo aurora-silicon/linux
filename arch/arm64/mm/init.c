@@ -368,8 +368,9 @@ void __init arch_mm_preinit(void)
 	 * Selected page table levels should match when derived from
 	 * scratch using the virtual address range and page size.
 	 */
-	BUILD_BUG_ON(ARM64_HW_PGTABLE_LEVELS(CONFIG_ARM64_VA_BITS) !=
-		     CONFIG_PGTABLE_LEVELS);
+	BUILD_BUG_ON(CONFIG_PGTABLE_LEVELS !=
+		     (IS_ENABLED(CONFIG_ARM64_USER4K_EXPERIMENTAL) ? 4 :
+		      ARM64_HW_PGTABLE_LEVELS(CONFIG_ARM64_VA_BITS)));
 
 	if (PAGE_SIZE >= 16384 && get_num_physpages() <= 128) {
 		extern int sysctl_overcommit_memory;

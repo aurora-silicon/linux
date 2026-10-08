@@ -8,6 +8,7 @@
 
 #include <linux/blkdev.h>
 #include <linux/mm.h>
+#include <linux/mm_subpage.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
 #include <linux/hugetlb.h>
@@ -329,17 +330,22 @@ offset_to_swap_extent(struct swap_info_struct *sis, unsigned long offset)
 	BUG();
 }
 
+/* The extent tree is immutable while the swap entry is owned. */
+sector_t swap_extent_sector(swp_entry_t entry, unsigned long *nr_pages)
+{
+	struct swap_info_struct *sis = __swap_entry_to_info(entry);
+	pgoff_t offset = swp_offset(entry);
+	struct swap_extent *se = offset_to_swap_extent(sis, offset);
+
+	*nr_pages = min(*nr_pages, se->start_page + se->nr_pages - offset);
+	return (se->start_block + offset - se->start_page) << (PAGE_SHIFT - 9);
+}
+
 sector_t swap_folio_sector(struct folio *folio)
 {
-	struct swap_info_struct *sis = __swap_entry_to_info(folio->swap);
-	struct swap_extent *se;
-	sector_t sector;
-	pgoff_t offset;
+	unsigned long nr = folio_nr_pages(folio);
 
-	offset = swp_offset(folio->swap);
-	se = offset_to_swap_extent(sis, offset);
-	sector = se->start_block + (offset - se->start_page);
-	return sector << (PAGE_SHIFT - 9);
+	return swap_extent_sector(folio->swap, &nr);
 }
 
 /*
@@ -479,6 +485,16 @@ static void swap_cluster_free_table(struct swap_cluster_info *ci)
 	lockdep_assert_held(&ci->lock);
 	table = (void *)rcu_dereference_protected(ci->table, true);
 	rcu_assign_pointer(ci->table, NULL);
+#ifdef CONFIG_MM_SUBPAGE
+	if (ci->subpage_counts) {
+		unsigned int i;
+
+		for (i = 0; i < SWAPFILE_CLUSTER * (PAGE_SIZE / MM_SUBPAGE_SIZE); i++)
+			VM_WARN_ON_ONCE(ci->subpage_counts[i]);
+		kfree(ci->subpage_counts);
+		ci->subpage_counts = NULL;
+	}
+#endif
 
 	swap_table_free(table);
 }
@@ -1067,6 +1083,19 @@ static void swap_reclaim_work(struct work_struct *work)
 	swap_reclaim_full_clusters(si, true);
 }
 
+static bool swap_folio_alloc_allowed(struct swap_info_struct *si, struct folio *folio)
+{
+	unsigned int flags;
+
+	if (!folio || !folio_order(folio))
+		return true;
+	flags = READ_ONCE(si->flags);
+	if (flags & SWP_BLKDEV)
+		return true;
+	/* Filesystem swap_rw implementations retain their existing contract. */
+	return si->bdev && !(flags & SWP_FS_OPS) && folio_anon_min_order(folio);
+}
+
 /*
  * Try to allocate swap entries with specified order and try set a new
  * cluster for current CPU too.
@@ -1078,11 +1107,7 @@ static unsigned long cluster_alloc_swap_entry(struct swap_info_struct *si,
 	unsigned int order = likely(folio) ? folio_order(folio) : 0;
 	unsigned int offset = SWAP_ENTRY_INVALID, found = SWAP_ENTRY_INVALID;
 
-	/*
-	 * Swapfile is not block device so unable
-	 * to allocate large entries.
-	 */
-	if (order && !(si->flags & SWP_BLKDEV))
+	if (!swap_folio_alloc_allowed(si, folio))
 		return 0;
 
 	if (!(si->flags & SWP_SOLIDSTATE)) {
@@ -1361,6 +1386,10 @@ static bool swap_alloc_fast(struct folio *folio)
 	offset = this_cpu_read(percpu_swap_cluster.offset[order]);
 	if (!si || !offset || !get_swap_device_info(si))
 		return false;
+	if (!swap_folio_alloc_allowed(si, folio)) {
+		put_swap_device(si);
+		return false;
+	}
 
 	ci = swap_cluster_lock(si, offset);
 	if (cluster_is_usable(ci, order)) {
@@ -1543,7 +1572,7 @@ static void __swap_cluster_put_entry(struct swap_cluster_info *ci,
  */
 static void swap_put_entries_cluster(struct swap_info_struct *si,
 				     pgoff_t offset, int nr,
-				     bool reclaim_cache)
+				     bool reclaim_cache, int subpage)
 {
 	struct swap_cluster_info *ci;
 	unsigned int ci_off, ci_end;
@@ -1556,6 +1585,17 @@ static void swap_put_entries_cluster(struct swap_info_struct *si,
 	ci = swap_cluster_lock(si, offset);
 	ci_off = offset % SWAPFILE_CLUSTER;
 	ci_end = ci_off + nr;
+#ifdef CONFIG_MM_SUBPAGE
+	if (subpage >= 0) {
+		unsigned int index = ci_off * (PAGE_SIZE / MM_SUBPAGE_SIZE) + subpage;
+
+		if (WARN_ON_ONCE(nr != 1 || !ci->subpage_counts || !ci->subpage_counts[index])) {
+			swap_cluster_unlock(ci);
+			return;
+		}
+		ci->subpage_counts[index]--;
+	}
+#endif
 	do {
 		swp_tb = __swap_table_get(ci, ci_off);
 		if (swp_tb_get_count(swp_tb) == 1) {
@@ -1649,7 +1689,7 @@ static int __swap_cluster_dup_entry(struct swap_cluster_info *ci,
  * and failed to allocate an extended table, -EINVAL if any entry is bad entry.
  */
 static int swap_dup_entries_cluster(struct swap_info_struct *si,
-				    pgoff_t offset, int nr)
+				    pgoff_t offset, int nr, int subpage)
 {
 	int err;
 	struct swap_cluster_info *ci;
@@ -1659,6 +1699,25 @@ static int swap_dup_entries_cluster(struct swap_info_struct *si,
 	ci_end = ci_start + nr;
 	ci_off = ci_start;
 	ci = swap_cluster_lock(si, offset);
+#ifdef CONFIG_MM_SUBPAGE
+	if (subpage >= 0) {
+		unsigned int index = ci_start * (PAGE_SIZE / MM_SUBPAGE_SIZE) + subpage;
+
+		VM_BUG_ON(nr != 1);
+		if (!ci->subpage_counts)
+			ci->subpage_counts = kcalloc(SWAPFILE_CLUSTER,
+				(PAGE_SIZE / MM_SUBPAGE_SIZE) * sizeof(*ci->subpage_counts),
+				GFP_ATOMIC | __GFP_NOWARN);
+		if (!ci->subpage_counts) {
+			err = -ENOMEM;
+			goto failed;
+		}
+		if (ci->subpage_counts[index] == UINT_MAX) {
+			err = -EOVERFLOW;
+			goto failed;
+		}
+	}
+#endif
 restart:
 	do {
 		err = __swap_cluster_dup_entry(ci, ci_off);
@@ -1673,6 +1732,10 @@ restart:
 			goto failed;
 		}
 	} while (++ci_off < ci_end);
+#ifdef CONFIG_MM_SUBPAGE
+	if (subpage >= 0)
+		ci->subpage_counts[ci_start * (PAGE_SIZE / MM_SUBPAGE_SIZE) + subpage]++;
+#endif
 	swap_cluster_unlock(ci);
 	return 0;
 failed:
@@ -1681,6 +1744,132 @@ failed:
 	swap_extend_table_try_free(ci);
 	swap_cluster_unlock(ci);
 	return err;
+}
+
+#ifdef CONFIG_MM_SUBPAGE
+static bool swap_subpage_offset_valid(unsigned int offset)
+{
+	return offset < PAGE_SIZE && IS_ALIGNED(offset, MM_SUBPAGE_SIZE);
+}
+
+int swap_subpage_dup(swp_entry_t entry, unsigned int offset)
+{
+	struct swap_info_struct *si = swap_entry_to_info(entry);
+
+	if (WARN_ON_ONCE(!si || !swap_subpage_offset_valid(offset)))
+		return -EINVAL;
+	/* A locked swap-cache folio also permits the initial zero-to-one ref. */
+	return swap_dup_entries_cluster(si, swp_offset(entry), 1, offset >> MM_SUBPAGE_SHIFT);
+}
+
+void swap_subpage_put(swp_entry_t entry, unsigned int offset, bool reclaim_cache)
+{
+	struct swap_info_struct *si;
+
+	if (WARN_ON_ONCE(!swap_subpage_offset_valid(offset)))
+		return;
+	si = get_swap_device(entry);
+	if (WARN_ON_ONCE(!si))
+		return;
+	swap_put_entries_cluster(si, swp_offset(entry), 1, reclaim_cache,
+				 offset >> MM_SUBPAGE_SHIFT);
+	put_swap_device(si);
+}
+
+unsigned int swap_subpage_count(swp_entry_t entry, unsigned int offset)
+{
+	struct swap_cluster_info *ci;
+	struct swap_info_struct *si;
+	unsigned int count = 0;
+
+	if (!swap_subpage_offset_valid(offset))
+		return 0;
+	si = get_swap_device(entry);
+	if (!si)
+		return 0;
+	ci = swap_cluster_lock(si, swp_offset(entry));
+	if (ci->subpage_counts)
+		count = ci->subpage_counts[swp_cluster_offset(entry) *
+			(PAGE_SIZE / MM_SUBPAGE_SIZE) + (offset >> MM_SUBPAGE_SHIFT)];
+	swap_cluster_unlock(ci);
+	put_swap_device(si);
+	return count;
+}
+#endif
+
+/*
+ * Optional THPs can split if their order-specific cluster lists have no room.
+ * A mandatory base user page cannot: find a free aligned group without keeping
+ * the per-CPU or device allocation lock held over a device-wide scan.
+ */
+static void swap_alloc_required_from_device(struct swap_info_struct *si,
+					   struct folio *folio)
+{
+	unsigned int order = folio_order(folio), nr = folio_nr_pages(folio);
+	unsigned long start;
+
+	if (!swap_folio_alloc_allowed(si, folio))
+		return;
+	for (start = 0; start < si->max; start += SWAPFILE_CLUSTER) {
+		struct swap_cluster_info *ci = __swap_offset_to_cluster(si, start);
+		unsigned long offset, end = min(start + SWAPFILE_CLUSTER, si->max);
+		bool found = false;
+
+		if (!(READ_ONCE(si->flags) & SWP_WRITEOK))
+			break;
+		if (!spin_trylock(&ci->lock))
+			goto next;
+		/* Order zero's usability test permits occupied clusters of any order. */
+		if (!cluster_is_usable(ci, 0) || ci->count + nr > SWAPFILE_CLUSTER)
+			goto unlock;
+		for (offset = start; offset + nr <= end; offset += nr) {
+			bool need_reclaim = false;
+
+			/* Only genuinely free slots qualify; retain every existing owner. */
+			if (!cluster_scan_range(si, ci, offset, nr, &need_reclaim) || need_reclaim)
+				continue;
+			if (!__swap_cluster_alloc_entries(si, ci, folio, offset - start))
+				break;
+			ci->order = order;
+			if (ci->count < SWAPFILE_CLUSTER && ci->flags == CLUSTER_FLAG_FRAG) {
+				/* Same flag, different order: relocate the list explicitly. */
+				spin_lock(&si->lock);
+				list_move_tail(&ci->list, &si->frag_clusters[order]);
+				spin_unlock(&si->lock);
+			} else {
+				relocate_cluster(si, ci);
+			}
+			found = true;
+			break;
+		}
+unlock:
+		swap_cluster_unlock(ci);
+		if (found)
+			return;
+next:
+		cond_resched();
+	}
+}
+
+static void swap_alloc_required(struct folio *folio)
+{
+	struct swap_info_struct *devices[MAX_SWAPFILES], *si;
+	unsigned int count = 0, i;
+
+	if (get_nr_swap_pages() < folio_nr_pages(folio))
+		return;
+	/* Pin a bounded snapshot in the allocator's existing priority order. */
+	spin_lock(&swap_avail_lock);
+	plist_for_each_entry(si, &swap_avail_head, avail_list) {
+		if (get_swap_device_info(si))
+			devices[count++] = si;
+	}
+	spin_unlock(&swap_avail_lock);
+	for (i = 0; i < count; i++) {
+		if (!folio_test_swapcache(folio))
+			swap_alloc_required_from_device(devices[i], folio);
+		put_swap_device(devices[i]);
+	}
 }
 
 /**
@@ -1697,16 +1886,17 @@ int folio_alloc_swap(struct folio *folio)
 {
 	unsigned int order = folio_order(folio);
 	unsigned int size = 1 << order;
+	bool mandatory = order && folio_anon_min_order(folio);
 
 	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
 	VM_BUG_ON_FOLIO(!folio_test_uptodate(folio), folio);
 
 	if (order) {
 		/*
-		 * Reject large allocation when THP_SWAP is disabled,
-		 * the caller should split the folio and try again.
+		 * Optional THP backing may split when THP_SWAP is disabled.
+		 * A larger base user page must retain contiguous swap ownership.
 		 */
-		if (!IS_ENABLED(CONFIG_THP_SWAP))
+		if (!IS_ENABLED(CONFIG_THP_SWAP) && !mandatory)
 			return -EAGAIN;
 
 		/*
@@ -1724,6 +1914,9 @@ again:
 	if (!swap_alloc_fast(folio))
 		swap_alloc_slow(folio);
 	local_unlock(&percpu_swap_cluster.lock);
+
+	if (mandatory && unlikely(!folio_test_swapcache(folio)))
+		swap_alloc_required(folio);
 
 	if (!order && unlikely(!folio_test_swapcache(folio))) {
 		if (swap_sync_discard())
@@ -1757,6 +1950,24 @@ again:
  * swap_put_entries_direct on its swap entry before this helper returns, or
  * the swap count may underflow.
  */
+int folio_dup_swap_range(struct folio *folio, struct page *page, unsigned int nr)
+{
+	swp_entry_t entry = page_swap_entry(page);
+
+	VM_BUG_ON_FOLIO(!folio_test_locked(folio) || !folio_test_swapcache(folio), folio);
+	VM_BUG_ON_FOLIO(!nr || folio_page_idx(folio, page) + nr > folio_nr_pages(folio), folio);
+	return swap_dup_entries_cluster(swap_entry_to_info(entry), swp_offset(entry), nr, -1);
+}
+
+void folio_put_swap_range(struct folio *folio, struct page *page, unsigned int nr)
+{
+	swp_entry_t entry = page_swap_entry(page);
+
+	VM_BUG_ON_FOLIO(!folio_test_locked(folio) || !folio_test_swapcache(folio), folio);
+	VM_BUG_ON_FOLIO(!nr || folio_page_idx(folio, page) + nr > folio_nr_pages(folio), folio);
+	swap_put_entries_cluster(__swap_entry_to_info(entry), swp_offset(entry), nr, false, -1);
+}
+
 int folio_dup_swap(struct folio *folio, struct page *subpage)
 {
 	swp_entry_t entry = folio->swap;
@@ -1771,7 +1982,7 @@ int folio_dup_swap(struct folio *folio, struct page *subpage)
 	}
 
 	return swap_dup_entries_cluster(swap_entry_to_info(entry),
-					swp_offset(entry), nr_pages);
+					swp_offset(entry), nr_pages, -1);
 }
 
 /**
@@ -1797,7 +2008,7 @@ void folio_put_swap(struct folio *folio, struct page *subpage)
 		nr_pages = 1;
 	}
 
-	swap_put_entries_cluster(si, swp_offset(entry), nr_pages, false);
+	swap_put_entries_cluster(si, swp_offset(entry), nr_pages, false, -1);
 }
 
 /*
@@ -2070,7 +2281,7 @@ void swap_put_entries_direct(swp_entry_t entry, int nr)
 	offset = start_offset;
 	do {
 		cluster_end = min(round_up(offset + 1, SWAPFILE_CLUSTER), end_offset);
-		swap_put_entries_cluster(si, offset, cluster_end - offset, true);
+		swap_put_entries_cluster(si, offset, cluster_end - offset, true, -1);
 		offset = cluster_end;
 	} while (offset < end_offset);
 out:
@@ -2239,14 +2450,80 @@ static inline int pte_same_as_swp(pte_t pte, pte_t swp_pte)
 	return pte_same(pte_swp_clear_flags(pte), swp_pte);
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+/* Caller holds the swap-cache folio lock and the VMA's mmap read lock. */
+static int unuse_subpage(struct vm_area_struct *vma, pmd_t *pmd,
+			unsigned long addr, swp_entry_t entry, struct folio *folio,
+			unsigned int offset)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	struct mm_subpage *slot = NULL;
+	spinlock_t *ptl;
+	pte_t *ptep, old, pte;
+	bool poisoned = PageHWPoison(&folio->page) || !folio_test_uptodate(folio);
+	int ret = 0;
+
+	if (folio_order(folio) || folio_test_ksm(folio))
+		return -EOPNOTSUPP;
+	if (!poisoned) {
+		arch_swap_restore(folio_swap(entry, folio), folio);
+		/* Allocate metadata before taking the PTE spinlock. */
+		slot = mm_subpage_restore_granule(folio, offset, mm_page_shift(mm), GFP_KERNEL);
+		if (IS_ERR(slot))
+			return PTR_ERR(slot) == -EAGAIN ? 0 : PTR_ERR(slot);
+	}
+	ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	if (!ptep)
+		goto out;
+	old = ptep_get(ptep);
+	if (softleaf_from_pte(old).val != entry.val)
+		goto unlock;
+	/* A moved swap PTE retains its backing offset, not its VMA offset. */
+	if (pte_swp_subpage_offset(old) != offset)
+		goto unlock;
+	if (poisoned) {
+		pte = swp_entry_to_pte(PageHWPoison(&folio->page) ?
+			make_hwpoison_entry(&folio->page) : make_poisoned_swp_entry());
+	} else {
+		ret = mm_subpage_add_anon_rmap(slot, vma, addr);
+		if (ret)
+			goto unlock;
+		/* unuse_pte_range() waited for writeback and holds the folio lock. */
+		VM_BUG_ON_FOLIO(folio_test_writeback(folio), folio);
+		if (pte_swp_exclusive(old))
+			mm_subpage_set_exclusive(slot);
+		else if (swap_subpage_count(entry, offset) == 1)
+			mm_subpage_try_reuse_swap(slot);
+		pte = pte_mkold(phys_pte_mm(mm, mm_subpage_phys(slot), vma->vm_page_prot));
+		if (pte_swp_soft_dirty(old))
+			pte = pte_mksoft_dirty(pte);
+		if (pte_swp_uffd_wp(old))
+			pte = pte_mkuffd_wp(pte);
+		inc_mm_counter(mm, MM_ANONPAGES);
+		slot = NULL;
+		ret = 1;
+	}
+	dec_mm_counter(mm, MM_SWAPENTS);
+	set_pte_at(mm, addr, ptep, pte);
+	swap_subpage_put(entry, offset, false);
+unlock:
+	pte_unmap_unlock(ptep, ptl);
+out:
+	if (slot)
+		mm_subpage_put(slot);
+	return ret;
+}
+#endif
+
 /*
  * No need to decide whether this PTE shares the swap entry with others,
  * just let do_wp_page work it out if a write is requested later - to
  * force COW, vm_page_prot omits write permission from any private vma.
  */
 static int unuse_pte(struct vm_area_struct *vma, pmd_t *pmd,
-		unsigned long addr, swp_entry_t entry, struct folio *folio)
+		unsigned long addr, pte_t orig_pte, struct folio *folio)
 {
+	swp_entry_t entry = softleaf_from_pte(orig_pte);
 	struct page *page;
 	struct folio *swapcache;
 	spinlock_t *ptl;
@@ -2260,6 +2537,12 @@ static int unuse_pte(struct vm_area_struct *vma, pmd_t *pmd,
 	 */
 	if (!folio_matches_swap_entry(folio, entry))
 		return 0;
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(vma->vm_mm) < PAGE_SIZE)
+		return unuse_subpage(vma, pmd, addr, entry, folio,
+				     pte_swp_subpage_offset(orig_pte));
+#endif
 
 	swapcache = folio;
 	folio = ksm_might_need_to_copy(folio, vma, addr);
@@ -2366,7 +2649,7 @@ static int unuse_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 		pte_t ptent;
 
 		if (!pte++) {
-			pte = pte_offset_map(pmd, addr);
+			pte = pte_offset_map_mm(vma->vm_mm, pmd, addr);
 			if (!pte)
 				break;
 		}
@@ -2381,6 +2664,22 @@ static int unuse_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 
 		pte_unmap(pte);
 		pte = NULL;
+
+#ifdef CONFIG_MM_SUBPAGE
+		if (mm_page_size(vma->vm_mm) > PAGE_SIZE) {
+			struct vm_fault vmf = {
+				.vma = vma, .address = addr, .real_address = addr,
+				.pmd = pmd, .orig_pte = ptent,
+			};
+			vm_fault_t fault = do_swap_coarse_page(&vmf);
+
+			if (fault & VM_FAULT_OOM)
+				return -ENOMEM;
+			if (fault & VM_FAULT_ERROR)
+				return -EIO;
+			continue;
+		}
+#endif
 
 		folio = swap_cache_get_folio(entry);
 		if (!folio) {
@@ -2404,7 +2703,7 @@ static int unuse_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 
 		folio_lock(folio);
 		folio_wait_writeback(folio);
-		ret = unuse_pte(vma, pmd, addr, entry, folio);
+		ret = unuse_pte(vma, pmd, addr, ptent, folio);
 		if (ret < 0) {
 			folio_unlock(folio);
 			folio_put(folio);
@@ -2414,7 +2713,7 @@ static int unuse_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 		folio_free_swap(folio);
 		folio_unlock(folio);
 		folio_put(folio);
-	} while (addr += PAGE_SIZE, addr != end);
+	} while (addr += mm_page_size(vma->vm_mm), addr != end);
 
 	if (pte)
 		pte_unmap(pte);
@@ -2429,10 +2728,10 @@ static inline int unuse_pmd_range(struct vm_area_struct *vma, pud_t *pud,
 	unsigned long next;
 	int ret;
 
-	pmd = pmd_offset(pud, addr);
+	pmd = pmd_offset_mm(vma->vm_mm, pud, addr);
 	do {
 		cond_resched();
-		next = pmd_addr_end(addr, end);
+		next = pmd_addr_end_mm(vma->vm_mm, addr, end);
 		ret = unuse_pte_range(vma, pmd, addr, next, type);
 		if (ret)
 			return ret;
@@ -2448,9 +2747,9 @@ static inline int unuse_pud_range(struct vm_area_struct *vma, p4d_t *p4d,
 	unsigned long next;
 	int ret;
 
-	pud = pud_offset(p4d, addr);
+	pud = pud_offset_mm(vma->vm_mm, p4d, addr);
 	do {
-		next = pud_addr_end(addr, end);
+		next = pud_addr_end_mm(vma->vm_mm, addr, end);
 		if (pud_none_or_clear_bad(pud))
 			continue;
 		ret = unuse_pmd_range(vma, pud, addr, next, type);
@@ -2468,10 +2767,10 @@ static inline int unuse_p4d_range(struct vm_area_struct *vma, pgd_t *pgd,
 	unsigned long next;
 	int ret;
 
-	p4d = p4d_offset(pgd, addr);
+	p4d = p4d_offset_mm(vma->vm_mm, pgd, addr);
 	do {
-		next = p4d_addr_end(addr, end);
-		if (p4d_none_or_clear_bad(p4d))
+		next = p4d_addr_end_mm(vma->vm_mm, addr, end);
+		if (p4d_none_or_clear_bad_mm(vma->vm_mm, p4d))
 			continue;
 		ret = unuse_pud_range(vma, p4d, addr, next, type);
 		if (ret)
@@ -2491,7 +2790,7 @@ static int unuse_vma(struct vm_area_struct *vma, unsigned int type)
 
 	pgd = pgd_offset(vma->vm_mm, addr);
 	do {
-		next = pgd_addr_end(addr, end);
+		next = pgd_addr_end_mm(vma->vm_mm, addr, end);
 		if (pgd_none_or_clear_bad(pgd))
 			continue;
 		ret = unuse_p4d_range(vma, pgd, addr, next, type);
@@ -2798,10 +3097,15 @@ static int setup_swap_extents(struct swap_info_struct *sis,
 			destroy_swap_extents(sis, swap_file);
 			return -ENOMEM;
 		}
-		return ret;
+	} else {
+		ret = generic_swapfile_activate(sis, swap_file, span);
 	}
-
-	return generic_swapfile_activate(sis, swap_file, span);
+	if (ret >= 0 && sis->bdev &&
+	    !(sis->flags & SWP_FS_OPS) && swap_extent_io_init()) {
+		destroy_swap_extents(sis, swap_file);
+		return -ENOMEM;
+	}
+	return ret;
 }
 
 static void _enable_swap_info(struct swap_info_struct *si)
@@ -3708,7 +4012,7 @@ void si_swapinfo(struct sysinfo *val)
  * Also the swap entry must have a count >= 1. Otherwise folio_dup_swap should
  * be used.
  */
-int swap_dup_entry_direct(swp_entry_t entry)
+int swap_dup_entries_direct(swp_entry_t entry, unsigned int nr)
 {
 	struct swap_info_struct *si;
 
@@ -3725,7 +4029,14 @@ int swap_dup_entry_direct(swp_entry_t entry)
 	 */
 	VM_WARN_ON_ONCE(!swap_entry_swapped(si, entry));
 
-	return swap_dup_entries_cluster(si, swp_offset(entry), 1);
+	if (WARN_ON_ONCE(!nr || swp_cluster_offset(entry) + nr > SWAPFILE_CLUSTER))
+		return -EINVAL;
+	return swap_dup_entries_cluster(si, swp_offset(entry), nr, -1);
+}
+
+int swap_dup_entry_direct(swp_entry_t entry)
+{
+	return swap_dup_entries_direct(entry, 1);
 }
 
 #if defined(CONFIG_MEMCG) && defined(CONFIG_BLK_CGROUP)

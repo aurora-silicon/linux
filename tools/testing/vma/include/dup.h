@@ -533,6 +533,9 @@ struct vm_area_desc {
 
 	/* Mutable fields. Populated with initial state. */
 	pgoff_t pgoff;
+#ifdef CONFIG_MM_SUBPAGE
+	unsigned int subpage_offset;
+#endif
 	struct file *vm_file;
 	vma_flags_t vma_flags;
 	pgprot_t page_prot;
@@ -1300,6 +1303,9 @@ static inline void compat_set_desc_from_vma(struct vm_area_desc *desc,
 	desc->end = vma->vm_end;
 
 	desc->pgoff = vma->vm_pgoff;
+#ifdef CONFIG_MM_SUBPAGE
+	desc->subpage_offset = vma->vm_subpage_offset;
+#endif
 	desc->vm_file = vma->vm_file;
 	desc->vma_flags = vma->flags;
 	desc->page_prot = vma->vm_page_prot;
@@ -1307,6 +1313,117 @@ static inline void compat_set_desc_from_vma(struct vm_area_desc *desc,
 	/* Default. */
 	desc->action.type = MMAP_NOTHING;
 }
+
+static inline unsigned int mm_page_shift(const struct mm_struct *mm)
+{
+	return PAGE_SHIFT;
+}
+
+static inline unsigned long mm_page_size(const struct mm_struct *mm)
+{
+	return PAGE_SIZE;
+}
+
+static inline unsigned long mm_page_mask(const struct mm_struct *mm)
+{
+	return PAGE_MASK;
+}
+
+static inline unsigned long mm_page_align(const struct mm_struct *mm, unsigned long size)
+{
+	return PAGE_ALIGN(size);
+}
+
+static inline unsigned long vma_user_pages(const struct vm_area_struct *vma)
+{
+	return (vma->vm_end - vma->vm_start) >> PAGE_SHIFT;
+}
+
+#define mm_account_memory(mm, policy_mm, pages) security_vm_enough_memory_mm(policy_mm, pages)
+#define mm_unacct_memory(mm, pages) vm_unacct_memory(pages)
+
+/* File-cache indices remain native-page units even for a 4K VMA. */
+struct vm_page_offset {
+	pgoff_t index;
+	unsigned int offset;
+};
+
+static inline struct vm_page_offset vm_page_offset_add(struct vm_page_offset pos,
+						       unsigned long bytes)
+{
+	unsigned long low = pos.offset + (bytes & ~PAGE_MASK);
+
+	pos.index += (bytes >> PAGE_SHIFT) + (low >> PAGE_SHIFT);
+	pos.offset = low & ~PAGE_MASK;
+	return pos;
+}
+
+static inline struct vm_page_offset vm_page_offset_sub(struct vm_page_offset pos,
+						       unsigned long bytes)
+{
+	unsigned long low = bytes & ~PAGE_MASK;
+
+	pos.index -= (bytes >> PAGE_SHIFT) + (low > pos.offset);
+	pos.offset = (pos.offset - low) & ~PAGE_MASK;
+	return pos;
+}
+
+static inline bool vm_page_offset_equal(struct vm_page_offset a, struct vm_page_offset b)
+{
+	return a.index == b.index && a.offset == b.offset;
+}
+
+static inline unsigned int vma_subpage_offset(const struct vm_area_struct *vma)
+{
+#ifdef CONFIG_MM_SUBPAGE
+	return vma->vm_subpage_offset;
+#else
+	return 0;
+#endif
+}
+
+/* address must be >= vm_start; vm_end computes the next contiguous offset. */
+static inline struct vm_page_offset vma_page_offset_at(const struct vm_area_struct *vma,
+						      unsigned long address)
+{
+	unsigned long delta = address - vma->vm_start;
+	unsigned long low = (delta & ~PAGE_MASK) + vma_subpage_offset(vma);
+
+	return (struct vm_page_offset) {
+		.index = vma->vm_pgoff + (delta >> PAGE_SHIFT) + (low >> PAGE_SHIFT),
+		.offset = low & ~PAGE_MASK,
+	};
+}
+
+static inline void vma_set_page_offset(struct vm_area_struct *vma, struct vm_page_offset pos)
+{
+	vma->vm_pgoff = pos.index;
+#ifdef CONFIG_MM_SUBPAGE
+	vma->vm_subpage_offset = pos.offset;
+#endif
+}
+
+/* Inverse lookup of a single byte; an offset outside the VMA is not clamped. */
+static inline unsigned long vma_address_at_offset(const struct vm_area_struct *vma,
+						 struct vm_page_offset pos)
+{
+	unsigned long len = vma->vm_end - vma->vm_start;
+	unsigned long index, delta, last;
+	unsigned int offset = vma_subpage_offset(vma);
+
+	if (!len || pos.index < vma->vm_pgoff || pos.offset >= PAGE_SIZE)
+		return -EFAULT;
+	index = pos.index - vma->vm_pgoff;
+	last = ((len - 1) >> PAGE_SHIFT) +
+		((((len - 1) & ~PAGE_MASK) + offset) >> PAGE_SHIFT);
+	if (index > last)
+		return -EFAULT;
+	delta = (index << PAGE_SHIFT) + pos.offset;
+	if (delta < offset || delta - offset >= len)
+		return -EFAULT;
+	return vma->vm_start + delta - offset;
+}
+
 
 static inline unsigned long vma_pages(const struct vm_area_struct *vma)
 {

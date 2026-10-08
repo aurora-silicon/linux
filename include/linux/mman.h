@@ -83,6 +83,17 @@ static inline void vm_unacct_memory(long pages)
 	vm_acct_memory(-pages);
 }
 
+/* VMA reservations use user granules; shmem/physical reservations use pages. */
+#ifdef CONFIG_MM_SUBPAGE
+int mm_account_memory(struct mm_struct *mm, struct mm_struct *policy_mm, long pages);
+void mm_acct_memory(struct mm_struct *mm, long pages);
+void mm_unacct_memory(struct mm_struct *mm, unsigned long pages);
+#else
+#define mm_account_memory(mm, policy_mm, pages) security_vm_enough_memory_mm(policy_mm, pages)
+#define mm_acct_memory(mm, pages) vm_acct_memory(pages)
+#define mm_unacct_memory(mm, pages) vm_unacct_memory(pages)
+#endif
+
 /*
  * Allow architectures to handle additional protection and flag bits. The
  * overriding macros must be defined in the arch-specific asm/mman.h file.

@@ -1261,6 +1261,11 @@ static inline int ksys_fadvise64_64(int fd, loff_t offset, loff_t len,
 unsigned long ksys_mmap_pgoff(unsigned long addr, unsigned long len,
 			      unsigned long prot, unsigned long flags,
 			      unsigned long fd, unsigned long pgoff);
+#ifdef CONFIG_MM_SUBPAGE
+unsigned long ksys_mmap_user(unsigned long addr, unsigned long len,
+		unsigned long prot, unsigned long flags, unsigned long fd, unsigned long offset);
+#endif
+
 ssize_t ksys_readahead(int fd, loff_t offset, size_t count);
 int ksys_ipc(unsigned int call, int first, unsigned long second,
 	unsigned long third, void __user * ptr, long fifth);

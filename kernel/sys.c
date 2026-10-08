@@ -1927,7 +1927,7 @@ out_thread:
 	}
 
 out_children:
-	r->ru_maxrss = maxrss * (PAGE_SIZE / 1024); /* convert pages to KBs */
+	r->ru_maxrss = maxrss; /* signal and mm high-water maxima are in kB */
 	r->ru_utime = ns_to_kernel_old_timeval(utime);
 	r->ru_stime = ns_to_kernel_old_timeval(stime);
 }
@@ -2532,6 +2532,40 @@ static int prctl_set_thp_disable(bool thp_disable, unsigned long flags,
 	return 0;
 }
 
+static int prctl_page_size_get(struct task_struct *task, bool persistent)
+{
+#ifdef CONFIG_ARCH_HAS_USER_PAGE_SIZE
+	unsigned int shift = persistent ? task->default_exec_page_shift :
+					 task->exec_page_shift;
+
+	return shift ? 1U << shift : 0;
+#else
+	return -EINVAL;
+#endif
+}
+
+static int prctl_page_size_set(struct task_struct *task, unsigned long size,
+			       bool persistent)
+{
+#ifdef CONFIG_ARCH_HAS_USER_PAGE_SIZE
+	int shift = arch_exec_page_size_shift(size);
+
+	if (shift < 0)
+		return shift;
+	if (persistent) {
+		task->default_exec_page_shift = shift;
+	} else {
+		/* A native request overrides an inherited default for one exec. */
+		if (!shift && task->default_exec_page_shift)
+			shift = PAGE_SHIFT;
+		task->exec_page_shift = shift;
+	}
+	return 0;
+#else
+	return -EINVAL;
+#endif
+}
+
 int __weak arch_prctl_mem_model_get(struct task_struct *t)
 {
 	return -EINVAL;
@@ -2555,6 +2589,22 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 
 	error = 0;
 	switch (option) {
+	case PR_AURORA_GET_EXEC_PAGE_SIZE:
+		if (arg2 || arg3 || arg4 || arg5)
+			return -EINVAL;
+		return prctl_page_size_get(me, false);
+	case PR_AURORA_SET_EXEC_PAGE_SIZE:
+		if (arg3 || arg4 || arg5)
+			return -EINVAL;
+		return prctl_page_size_set(me, arg2, false);
+	case PR_AURORA_GET_DEFAULT_PAGE_SIZE:
+		if (arg2 || arg3 || arg4 || arg5)
+			return -EINVAL;
+		return prctl_page_size_get(me, true);
+	case PR_AURORA_SET_DEFAULT_PAGE_SIZE:
+		if (arg3 || arg4 || arg5)
+			return -EINVAL;
+		return prctl_page_size_set(me, arg2, true);
 	case PR_GET_MEM_MODEL:
 		if (arg2 || arg3 || arg4 || arg5)
 			return -EINVAL;

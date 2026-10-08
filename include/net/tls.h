@@ -34,6 +34,7 @@
 #ifndef _TLS_OFFLOAD_H
 #define _TLS_OFFLOAD_H
 
+#include <linux/llist.h>
 #include <linux/types.h>
 #include <asm/byteorder.h>
 #include <linux/crypto.h>
@@ -139,6 +140,9 @@ struct tls_sw_context_rx {
 	struct tls_strparser strp;
 
 	atomic_t decrypt_pending;
+#ifdef CONFIG_MM_SUBPAGE
+	struct llist_head subpage_cleanup;
+#endif
 	struct sk_buff_head async_hold;
 	struct wait_queue_head wq;
 };
@@ -148,6 +152,9 @@ struct tls_record_info {
 	u32 end_seq;
 	int len;
 	int num_frags;
+#ifdef CONFIG_MM_SUBPAGE
+	struct mm_subpage_refs *subpage_refs;
+#endif
 	skb_frag_t frags[MAX_SKB_FRAGS];
 };
 

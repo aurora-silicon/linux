@@ -21,3 +21,94 @@ config ARM64_RELOC_TEST
 	tristate "Relocation testing module"
 
 source "drivers/hwtracing/coresight/Kconfig"
+
+config ARM64_USER4K_EXPERIMENTAL
+	bool "Experimental mixed-granule userspace"
+	select ARCH_HAS_MM_PGTABLE
+	select ARCH_HAS_USER_PAGE_SIZE
+	select MM_SUBPAGE
+	select MM_ID
+	select HAVE_ARCH_TLB_REMOVE_TABLE
+	select ARCH_SUPPORTS_PT_RECLAIM
+	depends on (ARM64_16K_PAGES || ARM64_64K_PAGES) && ARM64_VA_BITS_48 && ARM64_PA_BITS_48
+	depends on !ARM64_LPA2 && !NO_PAGE_MAPCOUNT
+	default n
+	help
+	  Build the in-development MM support for alternative 4K user tables
+	  on 16K/64K kernels and 16K user tables on 64K kernels.
+	  Ordinary address spaces and kernel tables retain the native granule. An experimental
+	  one-shot prctl selects a supported granule for the next exec.
+	  This is a development ABI: several MM interfaces and device mappings
+	  still require integration and validation. The private prctl numbers
+	  are not upstream assignments or a stable ABI promise.
+	  Say N for normal kernels.
+
+config ARM64_USER4K_KUNIT_TEST
+	bool "Test mixed userspace granules with larger kernel pages"
+	depends on KUNIT=y && ARM64_USER4K_EXPERIMENTAL
+	depends on ARM64_PA_BITS_48
+	select ARM64_USER4K_DATA_KUNIT_TEST
+	select IOMMUFD
+	select IOMMUFD_DRIVER
+	default n
+	help
+	  Exercise independent TTBR0 translation granules, subpage permissions
+	  and invalidation while TTBR1 retains the normal native kernel tables.
+	  Hardware translation/uaccess fixtures require arm64.user4k_test=1
+	  as a second opt-in and are disabled with KASAN. Software MM fixtures
+	  can run with KASAN without borrowing or replacing TTBR0.
+	  Run only in a disposable test VM. This regression harness does not
+	  establish hardware qualification or production ABI readiness.
+	  Say N for normal kernels.
+
+config ARM64_USER4K_IOMMUFD_TEST
+	bool "IOMMUFD ioctl harness for mixed userspace granules"
+	depends on ARM64_USER4K_EXPERIMENTAL && DEBUG_KERNEL
+	depends on FAULT_INJECTION && RUNTIME_TESTING_MENU
+	select GENERIC_PT
+	select IOMMU_PT
+	select IOMMU_PT_AMDV1
+	select IOMMUFD
+	select IOMMUFD_TEST
+	default n
+	help
+	  Enable the IOMMUFD mock-device ioctls and generic AMDv1 page tables
+	  for the mixed-granule userspace ioctl fixture. This exposes privileged
+	  test interfaces; use only in a disposable test VM.
+	  Say N for normal kernels.
+
+config ARM64_USER4K_VFIO_ACCOUNT_TEST
+	bool "VFIO type1 pinning harness for mixed userspace granules"
+	depends on ARM64_USER4K_EXPERIMENTAL && KUNIT=y
+	select VFIO
+	select VFIO_GROUP
+	select VFIO_CONTAINER
+	select VFIO_IOMMU_TYPE1
+	select VFIO_TYPE1_ACCOUNT_KUNIT_TEST
+	default n
+	help
+	  Enable built-in VFIO type1 accounting and retained-fragment tests
+	  in a disposable mixed-granule guest. Recorded IOMMU translations
+	  do not establish physical-device DMA support.
+	  Say N for normal kernels.
+
+config ARM64_USER4K_VFIO_IOCTL_TEST
+	bool "Private VFIO type1 ioctl harness for mixed userspace granules"
+	depends on ARM64_USER4K_EXPERIMENTAL && KUNIT=y && DEBUG_KERNEL
+	depends on RUNTIME_TESTING_MENU
+	select ARM64_USER4K_VFIO_ACCOUNT_TEST
+	default n
+	help
+	  Expose a root-only disposable-guest misc device forwarding real EL0
+	  arguments to type1 ioctls and supplying recording IOMMU domains.
+	  These privileged test controls perform no physical device DMA.
+	  Say N for normal kernels.
+
+config ARM64_USER4K_DATA_KUNIT_TEST
+	bool "Test packed userspace allocation ownership"
+	depends on KUNIT=y && ARM64_USER4K_EXPERIMENTAL
+	default n
+	help
+	  Exercise packed allocation, slot reuse, copying and deferred lifetime.
+	  These tests use native kernel addresses without changing TTBR0, and
+	  can run with KASAN even when the architectural tests are disabled.

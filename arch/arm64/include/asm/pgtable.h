@@ -467,6 +467,8 @@ static inline pte_t pte_advance_pfn(pte_t pte, unsigned long nr)
 	return pfn_pte(pte_pfn(pte) + nr, pte_pgprot(pte));
 }
 
+#include <asm/user-pte.h>
+
 /*
  * Hugetlb definitions.
  */
@@ -711,6 +713,23 @@ static inline void __set_ptes_anysz(struct mm_struct *mm, unsigned long addr,
 static inline void __set_ptes(struct mm_struct *mm, unsigned long addr,
 			      pte_t *ptep, pte_t pte, unsigned int nr)
 {
+	if (arm64_mm_alt_granule(mm)) {
+		unsigned int native_pages = DIV_ROUND_UP((pte_phys_mm(mm, pte) & ~PAGE_MASK) +
+							((unsigned long)nr << mm_page_shift(mm)), PAGE_SIZE);
+
+		page_table_check_ptes_set(mm, addr, ptep, pte, nr);
+		__sync_cache_and_tags(pte, native_pages);
+		for (;;) {
+			__check_safe_pte_update(mm, ptep, pte);
+			__set_pte_nosync(ptep, pte);
+			if (--nr == 0)
+				break;
+			ptep++;
+			pte = pte_advance_pfn_mm(mm, pte, 1);
+		}
+		__set_pte_complete(pte);
+		return;
+	}
 	__set_ptes_anysz(mm, addr, ptep, pte, nr, PAGE_SIZE);
 }
 
@@ -946,6 +965,8 @@ static inline pmd_t *pud_pgtable(pud_t pud)
 
 static __always_inline bool pgtable_l4_enabled(void)
 {
+	if (IS_ENABLED(CONFIG_ARM64_64K_PAGES))
+		return false;
 	if (CONFIG_PGTABLE_LEVELS > 4 || !IS_ENABLED(CONFIG_ARM64_LPA2))
 		return true;
 	if (!alternative_has_cap_likely(ARM64_ALWAYS_BOOT))
@@ -955,6 +976,8 @@ static __always_inline bool pgtable_l4_enabled(void)
 
 static inline bool mm_pud_folded(const struct mm_struct *mm)
 {
+	if (arm64_mm_alt_granule(mm))
+		return mm_page_shift(mm) == 16;
 	return !pgtable_l4_enabled();
 }
 #define mm_pud_folded  mm_pud_folded
@@ -994,6 +1017,8 @@ static inline phys_addr_t p4d_page_paddr(p4d_t p4d)
 
 static inline pud_t *p4d_to_folded_pud(p4d_t *p4dp, unsigned long addr)
 {
+	if (IS_ENABLED(CONFIG_ARM64_64K_PAGES))
+		return (pud_t *)p4dp;
 	/* Ensure that 'p4dp' indexes a page table according to 'addr' */
 	VM_BUG_ON(((addr >> P4D_SHIFT) ^ ((u64)p4dp >> 3)) % PTRS_PER_P4D);
 
@@ -1216,6 +1241,8 @@ p4d_t *p4d_offset_lockless_folded(pgd_t *pgdp, pgd_t pgd, unsigned long addr)
 
 #endif  /* CONFIG_PGTABLE_LEVELS > 4 */
 
+#include <asm/user-pgtable.h>
+
 #define pgd_ERROR(e)	\
 	pr_err("%s:%d: bad pgd %016llx.\n", __FILE__, __LINE__, pgd_val(e))
 
@@ -1261,7 +1288,7 @@ static inline int __ptep_set_access_flags(struct vm_area_struct *vma,
 					  pte_t entry, int dirty)
 {
 	return __ptep_set_access_flags_anysz(vma, address, ptep, entry, dirty,
-					     PAGE_SIZE);
+					     mm_page_size(vma->vm_mm));
 }
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
@@ -1389,7 +1416,7 @@ static inline void __clear_full_ptes(struct mm_struct *mm, unsigned long addr,
 		if (--nr == 0)
 			break;
 		ptep++;
-		addr += PAGE_SIZE;
+		addr += mm_page_size(mm);
 	}
 }
 
@@ -1402,7 +1429,7 @@ static inline pte_t __get_and_clear_full_ptes(struct mm_struct *mm,
 	pte = __ptep_get_and_clear(mm, addr, ptep);
 	while (--nr) {
 		ptep++;
-		addr += PAGE_SIZE;
+		addr += mm_page_size(mm);
 		tmp_pte = __ptep_get_and_clear(mm, addr, ptep);
 		if (pte_dirty(tmp_pte))
 			pte = pte_mkdirty(pte);
@@ -1450,7 +1477,7 @@ static inline void __wrprotect_ptes(struct mm_struct *mm, unsigned long address,
 {
 	unsigned int i;
 
-	for (i = 0; i < nr; i++, address += PAGE_SIZE, ptep++)
+	for (i = 0; i < nr; i++, address += mm_page_size(mm), ptep++)
 		__ptep_set_wrprotect(mm, address, ptep);
 }
 
@@ -1490,7 +1517,7 @@ static inline void __clear_young_dirty_ptes(struct vm_area_struct *vma,
 		if (--nr == 0)
 			break;
 		ptep++;
-		addr += PAGE_SIZE;
+		addr += mm_page_size(vma->vm_mm);
 	}
 }
 
@@ -1516,9 +1543,11 @@ static inline pmd_t pmdp_establish(struct vm_area_struct *vma,
  *	bits 0-1:	present (must be zero)
  *	bits 2:		remember PG_anon_exclusive
  *	bit  3:		remember uffd-wp state
+ *	bits 4-5:	4K slot offset within a native swap page (MM_SUBPAGE)
  *	bits 6-10:	swap type
  *	bit  11:	PTE_PRESENT_INVALID (must be zero)
  *	bits 12-61:	swap offset
+ *	bits 62-63:	high 4K slot offset bits (MM_SUBPAGE, up to 64K)
  */
 #define __SWP_TYPE_SHIFT	6
 #define __SWP_TYPE_BITS		5
@@ -1688,11 +1717,11 @@ static __always_inline void contpte_try_fold(struct mm_struct *mm,
 	 * We can't fold special mappings, because there is no associated folio.
 	 */
 
-	const unsigned long contmask = CONT_PTES - 1;
-	bool valign = ((addr >> PAGE_SHIFT) & contmask) == contmask;
+	const unsigned long contmask = cont_ptes_mm(mm) - 1;
+	bool valign = ((addr >> mm_page_shift(mm)) & contmask) == contmask;
 
 	if (unlikely(valign)) {
-		bool palign = (pte_pfn(pte) & contmask) == contmask;
+		bool palign = ((pte_phys_mm(mm, pte) >> mm_page_shift(mm)) & contmask) == contmask;
 
 		if (unlikely(palign &&
 		    pte_valid(pte) && !pte_cont(pte) && !pte_special(pte)))
@@ -1713,7 +1742,11 @@ static inline unsigned int pte_batch_hint(pte_t *ptep, pte_t pte)
 	if (!pte_valid_cont(pte))
 		return 1;
 
-	return CONT_PTES - (((unsigned long)ptep >> 3) & (CONT_PTES - 1));
+	{
+		unsigned int nr = arm64_cont_ptes(arm64_ptep_page_shift(ptep));
+
+		return nr - (((unsigned long)ptep >> 3) & (nr - 1));
+	}
 }
 
 /*

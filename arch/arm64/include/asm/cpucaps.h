@@ -19,6 +19,11 @@ cpucap_is_possible(const unsigned int cap)
 			   "cap must be < ARM64_NCAPS");
 
 	switch (cap) {
+	case ARM64_HAS_USER16K_GRANULE:
+		return IS_ENABLED(CONFIG_ARM64_USER4K_EXPERIMENTAL) &&
+		       IS_ENABLED(CONFIG_ARM64_64K_PAGES);
+	case ARM64_HAS_USER4K_GRANULE:
+		return IS_ENABLED(CONFIG_ARM64_USER4K_EXPERIMENTAL);
 	case ARM64_HAS_EPAN:
 		return IS_ENABLED(CONFIG_ARM64_EPAN);
 	case ARM64_SVE:

@@ -12,9 +12,20 @@ struct core_vma_metadata {
 	unsigned long start, end;
 	vm_flags_t flags;
 	unsigned long dump_size;
-	unsigned long pgoff;
+	unsigned long pgoff; /* File offset in the dumped mm's page units. */
 	struct file   *file;
 };
+
+/* NT_FILE offsets are expressed in the dumped process's page units. */
+static inline unsigned long core_vma_pgoff(const struct vm_area_struct *vma)
+{
+	unsigned int shift = mm_page_shift(vma->vm_mm);
+
+	if (shift > PAGE_SHIFT)
+		return vma->vm_pgoff >> (shift - PAGE_SHIFT);
+	return (vma->vm_pgoff << (PAGE_SHIFT - shift)) +
+		(vma_subpage_offset(vma) >> shift);
+}
 
 struct coredump_params {
 	const kernel_siginfo_t *siginfo;

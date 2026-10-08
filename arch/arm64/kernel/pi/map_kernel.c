@@ -243,7 +243,7 @@ asmlinkage void __init early_map_kernel(u64 boot_status, phys_addr_t fdt)
 	static char const chosen_str[] __initconst = "/chosen";
 	u64 va_base, pa_base = (u64)&_text;
 	u64 kaslr_offset = pa_base % MIN_KIMG_ALIGN;
-	int root_level = 4 - CONFIG_PGTABLE_LEVELS;
+	int root_level = 4 - ARM64_NATIVE_PGTABLE_LEVELS;
 	int va_bits = VA_BITS;
 	int chosen;
 	void *fdt_mapped = map_fdt(fdt);

@@ -5,6 +5,11 @@
 #include <asm/mmu_context.h>
 #include <asm/mmu.h>
 
+/* Select immutable exec geometry before allocating any page tables. */
+#ifndef arch_mm_init_exec
+static inline void arch_mm_init_exec(struct mm_struct *mm, unsigned int page_shift) { }
+#endif
+
 /* Architectures that care about IRQ state in switch_mm can override this. */
 #ifndef switch_mm_irqs_off
 # define switch_mm_irqs_off switch_mm

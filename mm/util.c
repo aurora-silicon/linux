@@ -344,21 +344,22 @@ unsigned long randomize_stack_top(unsigned long stack_top)
 
 	if (current->flags & PF_RANDOMIZE) {
 		random_variable = get_random_long();
-		random_variable &= STACK_RND_MASK;
-		random_variable <<= PAGE_SHIFT;
+		random_variable &= mm_aslr_mask(current->mm, STACK_RND_MASK);
+		random_variable <<= mm_page_shift(current->mm);
 	}
 #ifdef CONFIG_STACK_GROWSUP
-	return PAGE_ALIGN(stack_top) + random_variable;
+	return mm_page_align(current->mm, stack_top) + random_variable;
 #else
-	return PAGE_ALIGN(stack_top) - random_variable;
+	return mm_page_align(current->mm, stack_top) - random_variable;
 #endif
 }
 
 /**
- * randomize_page - Generate a random, page aligned address
+ * randomize_page_shift - Generate a random, granule aligned address
  * @start:	The smallest acceptable address the caller will take.
  * @range:	The size of the area, starting at @start, within which the
  *		random address must fall.
+ * @shift:	Log2 of the required address alignment.
  *
  * If @start + @range would overflow, @range is capped.
  *
@@ -368,22 +369,31 @@ unsigned long randomize_stack_top(unsigned long stack_top)
  * Return: A page aligned address within [start, start + range).  On error,
  * @start is returned.
  */
-unsigned long randomize_page(unsigned long start, unsigned long range)
+static unsigned long randomize_page_shift(unsigned long start,
+		unsigned long range, unsigned int shift)
 {
-	if (!PAGE_ALIGNED(start)) {
-		range -= PAGE_ALIGN(start) - start;
-		start = PAGE_ALIGN(start);
+	unsigned long page_size = 1UL << shift;
+
+	if (!IS_ALIGNED(start, page_size)) {
+		range -= ALIGN(start, page_size) - start;
+		start = ALIGN(start, page_size);
 	}
 
 	if (start > ULONG_MAX - range)
 		range = ULONG_MAX - start;
 
-	range >>= PAGE_SHIFT;
+	range >>= shift;
 
 	if (range == 0)
 		return start;
 
-	return start + (get_random_long() % range << PAGE_SHIFT);
+	return start + (get_random_long() % range << shift);
+}
+
+/* Existing callers retain native-page alignment. */
+unsigned long randomize_page(unsigned long start, unsigned long range)
+{
+	return randomize_page_shift(start, range, PAGE_SHIFT);
 }
 
 #ifdef CONFIG_ARCH_WANT_DEFAULT_TOPDOWN_MMAP_LAYOUT
@@ -391,23 +401,25 @@ unsigned long __weak arch_randomize_brk(struct mm_struct *mm)
 {
 	/* Is the current task 32bit ? */
 	if (!IS_ENABLED(CONFIG_64BIT) || is_compat_task())
-		return randomize_page(mm->brk, SZ_32M);
+		return randomize_page_shift(mm->brk, SZ_32M, mm_page_shift(mm));
 
-	return randomize_page(mm->brk, SZ_1G);
+	return randomize_page_shift(mm->brk, SZ_1G, mm_page_shift(mm));
 }
 
 unsigned long arch_mmap_rnd(void)
 {
-	unsigned long rnd;
+	unsigned int bits;
+	unsigned long mask;
 
 #ifdef CONFIG_HAVE_ARCH_MMAP_RND_COMPAT_BITS
 	if (is_compat_task())
-		rnd = get_random_long() & ((1UL << mmap_rnd_compat_bits) - 1);
+		bits = mmap_rnd_compat_bits;
 	else
 #endif /* CONFIG_HAVE_ARCH_MMAP_RND_COMPAT_BITS */
-		rnd = get_random_long() & ((1UL << mmap_rnd_bits) - 1);
+		bits = mmap_rnd_bits;
 
-	return rnd << PAGE_SHIFT;
+	mask = mm_aslr_mask(current->mm, (1UL << bits) - 1);
+	return (get_random_long() & mask) << mm_page_shift(current->mm);
 }
 
 static int mmap_is_legacy(const struct rlimit *rlim_stack)
@@ -440,14 +452,15 @@ static unsigned long mmap_base(const unsigned long rnd, const struct rlimit *rli
 	 * task. mmap_base starts directly below the stack and grows
 	 * downwards.
 	 */
-	return PAGE_ALIGN_DOWN(mmap_upper_limit(rlim_stack) - rnd);
+	return (mmap_upper_limit(rlim_stack) - rnd) & mm_page_mask(current->mm);
 #else
 	unsigned long gap = rlim_stack->rlim_cur;
 	unsigned long pad = stack_guard_gap;
 
 	/* Account for stack randomization if necessary */
 	if (current->flags & PF_RANDOMIZE)
-		pad += (STACK_RND_MASK << PAGE_SHIFT);
+		pad += mm_aslr_mask(current->mm, STACK_RND_MASK) <<
+			mm_page_shift(current->mm);
 
 	/* Values close to RLIM_INFINITY can overflow. */
 	if (gap + pad > gap)
@@ -458,7 +471,7 @@ static unsigned long mmap_base(const unsigned long rnd, const struct rlimit *rli
 	else if (gap > MAX_GAP)
 		gap = MAX_GAP;
 
-	return PAGE_ALIGN(STACK_TOP - gap - rnd);
+	return mm_page_align(current->mm, STACK_TOP - gap - rnd);
 #endif
 }
 
@@ -491,7 +504,7 @@ EXPORT_SYMBOL_IF_KUNIT(arch_pick_mmap_layout);
 /**
  * __account_locked_vm - account locked pages to an mm's locked_vm
  * @mm:          mm to account against
- * @pages:       number of pages to account
+ * @pages:       number of native physical pages to account
  * @inc:         %true if @pages should be considered positive, %false if not
  * @task:        task used to check RLIMIT_MEMLOCK
  * @bypass_rlim: %true if checking RLIMIT_MEMLOCK should be skipped
@@ -507,27 +520,35 @@ int __account_locked_vm(struct mm_struct *mm, unsigned long pages, bool inc,
 			const struct task_struct *task, bool bypass_rlim)
 {
 	unsigned long locked_vm, limit;
+	unsigned int shift = PAGE_SHIFT - MM_ACCOUNT_SHIFT;
 	int ret = 0;
 
 	mmap_assert_write_locked(mm);
 
+	/* This exported API receives native physical-page counts. */
+	if (pages > ULONG_MAX >> shift)
+		return -ENOMEM;
+	pages <<= shift;
 	locked_vm = mm->locked_vm;
 	if (inc) {
 		if (!bypass_rlim) {
-			limit = task_rlimit(task, RLIMIT_MEMLOCK) >> PAGE_SHIFT;
-			if (locked_vm + pages > limit)
+			limit = task_rlimit(task, RLIMIT_MEMLOCK) >> MM_ACCOUNT_SHIFT;
+			if (pages > limit || locked_vm > limit - pages)
 				ret = -ENOMEM;
 		}
+		if (!ret && pages > ULONG_MAX - locked_vm)
+			ret = -ENOMEM;
 		if (!ret)
 			mm->locked_vm = locked_vm + pages;
 	} else {
-		WARN_ON_ONCE(pages > locked_vm);
+		if (WARN_ON_ONCE(pages > locked_vm))
+			return -EINVAL;
 		mm->locked_vm = locked_vm - pages;
 	}
 
 	pr_debug("%s: [%d] caller %ps %c%lu %lu/%lu%s\n", __func__, task->pid,
-		 (void *)_RET_IP_, (inc) ? '+' : '-', pages << PAGE_SHIFT,
-		 locked_vm << PAGE_SHIFT, task_rlimit(task, RLIMIT_MEMLOCK),
+		 (void *)_RET_IP_, (inc) ? '+' : '-', pages << MM_ACCOUNT_SHIFT,
+		 locked_vm << MM_ACCOUNT_SHIFT, task_rlimit(task, RLIMIT_MEMLOCK),
 		 ret ? " - exceeded" : "");
 
 	return ret;
@@ -562,11 +583,11 @@ int account_locked_vm(struct mm_struct *mm, unsigned long pages, bool inc)
 }
 EXPORT_SYMBOL_GPL(account_locked_vm);
 
-unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
+static unsigned long vm_mmap_offset_internal(struct file *file, unsigned long addr,
 	unsigned long len, unsigned long prot,
-	unsigned long flag, unsigned long pgoff)
+	unsigned long flag, struct vm_page_offset pos)
 {
-	loff_t off = (loff_t)pgoff << PAGE_SHIFT;
+	loff_t off = ((loff_t)pos.index << PAGE_SHIFT) | pos.offset;
 	unsigned long ret;
 	struct mm_struct *mm = current->mm;
 	unsigned long populate;
@@ -578,14 +599,24 @@ unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
 	if (!ret) {
 		if (mmap_write_lock_killable(mm))
 			return -EINTR;
-		ret = do_mmap(file, addr, len, prot, flag, 0, pgoff, &populate,
-			      &uf);
+#ifdef CONFIG_MM_SUBPAGE
+		ret = do_mmap_offset(file, addr, len, prot, flag, 0, pos, &populate, &uf);
+#else
+		ret = do_mmap(file, addr, len, prot, flag, 0, pos.index, &populate, &uf);
+#endif
 		mmap_write_unlock(mm);
 		userfaultfd_unmap_complete(mm, &uf);
 		if (populate)
 			mm_populate(ret, populate);
 	}
 	return ret;
+}
+
+unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
+		unsigned long len, unsigned long prot, unsigned long flag, unsigned long pgoff)
+{
+	return vm_mmap_offset_internal(file, addr, len, prot, flag,
+				       (struct vm_page_offset) { pgoff, 0 });
 }
 
 /*
@@ -609,12 +640,13 @@ unsigned long vm_mmap(struct file *file, unsigned long addr,
 	unsigned long len, unsigned long prot,
 	unsigned long flag, unsigned long offset)
 {
-	if (unlikely(offset + PAGE_ALIGN(len) < offset))
+	if (unlikely(offset + mm_page_align(current->mm, len) < offset))
 		return -EINVAL;
-	if (unlikely(offset_in_page(offset)))
+	if (unlikely(offset & ~mm_page_mask(current->mm)))
 		return -EINVAL;
 
-	return vm_mmap_pgoff(file, addr, len, prot, flag, offset >> PAGE_SHIFT);
+	return vm_mmap_offset_internal(file, addr, len, prot, flag,
+		(struct vm_page_offset) { offset >> PAGE_SHIFT, offset & ~PAGE_MASK });
 }
 EXPORT_SYMBOL(vm_mmap);
 
@@ -988,7 +1020,8 @@ int __vm_enough_memory(const struct mm_struct *mm, long pages, int cap_sys_admin
 	if (mm) {
 		long reserve = sysctl_user_reserve_kbytes >> (PAGE_SHIFT - 10);
 
-		allowed -= min_t(long, mm->total_vm / 32, reserve);
+		allowed -= min_t(long,
+			mm_pages_to_bytes(mm, mm->total_vm) >> (PAGE_SHIFT + 5), reserve);
 	}
 
 	if (percpu_counter_read_positive(&vm_committed_as) < allowed)
@@ -1189,6 +1222,9 @@ void compat_set_desc_from_vma(struct vm_area_desc *desc,
 	desc->end = vma->vm_end;
 
 	desc->pgoff = vma->vm_pgoff;
+#ifdef CONFIG_MM_SUBPAGE
+	desc->subpage_offset = vma->vm_subpage_offset;
+#endif
 	desc->vm_file = vma->vm_file;
 	desc->vma_flags = vma->flags;
 	desc->page_prot = vma->vm_page_prot;

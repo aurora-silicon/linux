@@ -93,6 +93,8 @@ struct linux_binfmt {
 #ifdef CONFIG_COREDUMP
 	int (*core_dump)(struct coredump_params *cprm);
 	unsigned long min_coredump;	/* minimal dump size */
+	/* Optional per-mm replacement for formats with a variable page ABI. */
+	unsigned long (*min_coredump_size)(void);
 #endif
 } __randomize_layout;
 
@@ -120,6 +122,10 @@ static inline void insert_binfmt(struct linux_binfmt *fmt)
 }
 
 extern void unregister_binfmt(struct linux_binfmt *);
+
+#ifdef CONFIG_MM_SUBPAGE
+int bprm_set_page_shift(struct linux_binprm *bprm, unsigned int page_shift);
+#endif
 
 extern int __must_check remove_arg_zero(struct linux_binprm *);
 extern int begin_new_exec(struct linux_binprm * bprm);

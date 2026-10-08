@@ -97,6 +97,9 @@ struct vma_merge_struct {
 	unsigned long start;
 	unsigned long end;
 	pgoff_t pgoff;
+#ifdef CONFIG_MM_SUBPAGE
+	unsigned int subpage_offset;
+#endif
 
 	union {
 		/* Temporary while VMA flags are being converted. */
@@ -234,8 +237,33 @@ static inline bool vmg_nomem(struct vma_merge_struct *vmg)
 static inline pgoff_t vma_pgoff_offset(struct vm_area_struct *vma,
 				       unsigned long addr)
 {
-	return vma->vm_pgoff + PHYS_PFN(addr - vma->vm_start);
+	return vma_page_offset_at(vma, addr).index;
 }
+
+static inline struct vm_page_offset vmg_page_offset(const struct vma_merge_struct *vmg)
+{
+	return (struct vm_page_offset) {
+		.index = vmg->pgoff,
+#ifdef CONFIG_MM_SUBPAGE
+		.offset = vmg->subpage_offset,
+#endif
+	};
+}
+
+static inline void vmg_set_page_offset(struct vma_merge_struct *vmg, struct vm_page_offset pos)
+{
+	vmg->pgoff = pos.index;
+#ifdef CONFIG_MM_SUBPAGE
+	vmg->subpage_offset = pos.offset;
+#endif
+}
+
+#ifdef CONFIG_MM_SUBPAGE
+#define VMG_SUBPAGE_STATE(vma, start) \
+	.subpage_offset = vma_page_offset_at(vma, start).offset,
+#else
+#define VMG_SUBPAGE_STATE(vma, start)
+#endif
 
 #define VMG_STATE(name, mm_, vmi_, start_, end_, vma_flags_, pgoff_)	\
 	struct vma_merge_struct name = {				\
@@ -259,6 +287,7 @@ static inline pgoff_t vma_pgoff_offset(struct vm_area_struct *vma,
 		.end = end_,					\
 		.vm_flags = vma_->vm_flags,			\
 		.pgoff = vma_pgoff_offset(vma_, start_),	\
+		VMG_SUBPAGE_STATE(vma_, start_)		\
 		.file = vma_->vm_file,				\
 		.anon_vma = vma_->anon_vma,			\
 		.policy = vma_policy(vma_),			\
@@ -276,7 +305,7 @@ void validate_mm(struct mm_struct *mm);
 __must_check int vma_expand(struct vma_merge_struct *vmg);
 __must_check int vma_shrink(struct vma_iterator *vmi,
 		struct vm_area_struct *vma,
-		unsigned long start, unsigned long end, pgoff_t pgoff);
+		unsigned long start, unsigned long end, struct vm_page_offset pos);
 
 static inline int vma_iter_store_gfp(struct vma_iterator *vmi,
 			struct vm_area_struct *vma, gfp_t gfp)
@@ -311,6 +340,9 @@ static inline void compat_set_vma_from_desc(struct vm_area_struct *vma,
 
 	/* Mutable fields. Populated with initial state. */
 	vma->vm_pgoff = desc->pgoff;
+#ifdef CONFIG_MM_SUBPAGE
+	vma->vm_subpage_offset = desc->subpage_offset;
+#endif
 	if (desc->vm_file != vma->vm_file)
 		vma_set_file(vma, desc->vm_file);
 	vma->flags = desc->vma_flags;
@@ -448,7 +480,7 @@ void unlink_file_vma_batch_add(struct unlink_vma_file_batch *vb,
 			       struct vm_area_struct *vma);
 
 struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
-	unsigned long addr, unsigned long len, pgoff_t pgoff,
+	unsigned long addr, unsigned long len, struct vm_page_offset pos,
 	bool *need_rmap_locks);
 
 struct anon_vma *find_mergeable_anon_vma(struct vm_area_struct *vma);
@@ -460,7 +492,7 @@ int mm_take_all_locks(struct mm_struct *mm);
 void mm_drop_all_locks(struct mm_struct *mm);
 
 unsigned long mmap_region(struct file *file, unsigned long addr,
-		unsigned long len, vm_flags_t vm_flags, unsigned long pgoff,
+		unsigned long len, vm_flags_t vm_flags, struct vm_page_offset pos,
 		struct list_head *uf);
 
 int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *brkvma,

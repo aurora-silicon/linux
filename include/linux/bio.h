@@ -389,11 +389,19 @@ static inline void bio_wouldblock_error(struct bio *bio)
  * pointed by @iter. If @iter is backed by bvec it's going to be reused
  * instead of allocating a new one.
  */
+#ifdef CONFIG_MM_SUBPAGE
+int bio_iov_user_vecs(const struct iov_iter *iter, int max_vecs);
+#endif
+
 static inline int bio_iov_vecs_to_alloc(struct iov_iter *iter, int max_segs)
 {
 	if (iov_iter_is_bvec(iter))
 		return 0;
+#ifdef CONFIG_MM_SUBPAGE
+	return bio_iov_user_vecs(iter, max_segs);
+#else
 	return iov_iter_npages(iter, max_segs);
+#endif
 }
 
 /**

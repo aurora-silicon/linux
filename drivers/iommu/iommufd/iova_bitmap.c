@@ -6,6 +6,7 @@
 #include <linux/highmem.h>
 #include <linux/iova_bitmap.h>
 #include <linux/mm.h>
+#include <linux/mm_subpage.h>
 #include <linux/slab.h>
 
 #define BITS_PER_PAGE (PAGE_SIZE * BITS_PER_BYTE)
@@ -44,11 +45,16 @@ struct iova_bitmap_map {
 	/* page offset of the first user page pinned */
 	unsigned long pgoff;
 
-	/* number of pages pinned */
+	/* number of native pages or typed fragments pinned */
 	unsigned long npages;
 
 	/* pinned pages representing the bitmap data */
 	struct page **pages;
+#ifdef CONFIG_MM_SUBPAGE
+	/* Exact byte ranges, including offsets unrelated to the user VA. */
+	struct user_page_fragment *fragments;
+	unsigned long pinned_bytes;
+#endif
 };
 
 /*
@@ -63,7 +69,10 @@ struct iova_bitmap_map {
  * The bitmap object uses one base page to store all the pinned pages
  * pointers related to the bitmap. For sizeof(struct page*) == 8 it stores
  * 512 struct page pointers which, if the base page size is 4K, it means
- * 2M of bitmap data is pinned at a time. If the iova_bitmap page size is
+ * 2M of bitmap data is pinned at a time. Alternative-granule processes use
+ * one native page of fragment descriptors instead, retaining each physical
+ * byte offset and bounding the window by the sum of fragment lengths.
+ * If the iova_bitmap page size is
  * also 4K then the range window to iterate is 64G.
  *
  * For example iterating on a total IOVA range of 4G..128G, it will walk
@@ -116,6 +125,9 @@ struct iova_bitmap {
 
 	/* length of the IOVA range for the whole bitmap */
 	size_t length;
+
+	/* First lazy pin/write error during an iteration. */
+	int error;
 };
 
 /*
@@ -192,6 +204,26 @@ static int iova_bitmap_get(struct iova_bitmap *bitmap)
 	npages = min(npages + !!offset_in_page(addr),
 		     PAGE_SIZE / sizeof(struct page *));
 
+#ifdef CONFIG_MM_SUBPAGE
+	if (mapped->fragments) {
+		unsigned long bytes = bitmap->mapped_total_index - bitmap->mapped_base_index;
+		unsigned long i;
+
+		ret = pin_user_fragments_remote(current->mm, (unsigned long)addr,
+				bytes, FOLL_WRITE, mapped->fragments,
+				PAGE_SIZE / sizeof(*mapped->fragments));
+		if (ret <= 0)
+			return -EFAULT;
+		mapped->npages = ret;
+		mapped->pinned_bytes = 0;
+		for (i = 0; i < mapped->npages; i++)
+			mapped->pinned_bytes += mapped->fragments[i].length;
+		mapped->pgoff = 0;
+		mapped->iova = iova_bitmap_mapped_iova(bitmap);
+		mapped->length = iova_bitmap_mapped_length(bitmap);
+		return 0;
+	}
+#endif
 	ret = pin_user_pages_fast((unsigned long)addr, npages,
 				  FOLL_WRITE, mapped->pages);
 	if (ret <= 0)
@@ -221,7 +253,13 @@ static void iova_bitmap_put(struct iova_bitmap *bitmap)
 	struct iova_bitmap_map *mapped = &bitmap->mapped;
 
 	if (mapped->npages) {
-		unpin_user_pages(mapped->pages, mapped->npages);
+#ifdef CONFIG_MM_SUBPAGE
+		if (mapped->fragments) {
+			release_user_fragments(mapped->fragments, mapped->npages, true);
+			mapped->pinned_bytes = 0;
+		} else
+#endif
+			unpin_user_pages_dirty_lock(mapped->pages, mapped->npages, true);
 		mapped->npages = 0;
 	}
 }
@@ -259,6 +297,16 @@ struct iova_bitmap *iova_bitmap_alloc(unsigned long iova, size_t length,
 	bitmap->iova = iova;
 	bitmap->length = length;
 	mapped->iova = iova;
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(current->mm) != PAGE_SIZE) {
+		mapped->fragments = (void *)__get_free_page(GFP_KERNEL);
+		if (!mapped->fragments) {
+			rc = -ENOMEM;
+			goto err;
+		}
+		return bitmap;
+	}
+#endif
 	mapped->pages = (struct page **)__get_free_page(GFP_KERNEL);
 	if (!mapped->pages) {
 		rc = -ENOMEM;
@@ -291,6 +339,10 @@ void iova_bitmap_free(struct iova_bitmap *bitmap)
 		mapped->pages = NULL;
 	}
 
+#ifdef CONFIG_MM_SUBPAGE
+	if (mapped->fragments)
+		free_page((unsigned long)mapped->fragments);
+#endif
 	kfree(bitmap);
 }
 EXPORT_SYMBOL_NS_GPL(iova_bitmap_free, "IOMMUFD");
@@ -303,7 +355,12 @@ static unsigned long iova_bitmap_mapped_remaining(struct iova_bitmap *bitmap)
 {
 	unsigned long remaining, bytes;
 
-	bytes = (bitmap->mapped.npages << PAGE_SHIFT) - bitmap->mapped.pgoff;
+#ifdef CONFIG_MM_SUBPAGE
+	if (bitmap->mapped.fragments)
+		bytes = bitmap->mapped.pinned_bytes;
+	else
+#endif
+		bytes = (bitmap->mapped.npages << PAGE_SHIFT) - bitmap->mapped.pgoff;
 
 	remaining = bitmap->mapped_total_index - bitmap->mapped_base_index;
 	remaining = min_t(unsigned long, remaining,
@@ -356,16 +413,21 @@ static int iova_bitmap_advance_to(struct iova_bitmap *bitmap,
 				  unsigned long iova)
 {
 	unsigned long index;
+	int ret = -EINVAL;
 
 	index = iova_bitmap_offset_to_index(bitmap, iova - bitmap->iova);
 	if (index >= bitmap->mapped_total_index)
-		return -EINVAL;
+		goto out;
 	bitmap->mapped_base_index = index;
 
 	iova_bitmap_put(bitmap);
 
 	/* Pin the next set of bitmap pages */
-	return iova_bitmap_get(bitmap);
+	ret = iova_bitmap_get(bitmap);
+out:
+	if (ret && !bitmap->error)
+		bitmap->error = ret;
+	return ret;
 }
 
 /**
@@ -379,14 +441,57 @@ static int iova_bitmap_advance_to(struct iova_bitmap *bitmap,
  * mapped bitmap user pages into IOVA ranges to process.
  *
  * Return: 0 on success, and an error on failure either upon
- * iteration or when the callback returns an error.
+ * iteration, a lazy bitmap write, or when the callback returns an error.
  */
 int iova_bitmap_for_each(struct iova_bitmap *bitmap, void *opaque,
 			 iova_bitmap_fn_t fn)
 {
-	return fn(bitmap, bitmap->iova, bitmap->length, opaque);
+	int ret;
+
+	bitmap->error = 0;
+	ret = fn(bitmap, bitmap->iova, bitmap->length, opaque);
+	return ret ?: bitmap->error;
 }
 EXPORT_SYMBOL_NS_GPL(iova_bitmap_for_each, "IOMMUFD");
+
+#ifdef CONFIG_MM_SUBPAGE
+static void iova_bitmap_set_fragments(struct iova_bitmap *bitmap,
+				      unsigned long iova, size_t length)
+{
+	struct iova_bitmap_map *mapped = &bitmap->mapped;
+	unsigned long bit = (iova - bitmap->iova) >> mapped->pgshift;
+	unsigned long end = ((iova + length - 1 - bitmap->iova) >> mapped->pgshift) + 1;
+
+	while (bit < end) {
+		unsigned long base, relative, i;
+
+		iova = bitmap->iova + (bit << mapped->pgshift);
+		if (!iova_bitmap_mapped_range(mapped, iova, 1) &&
+		    iova_bitmap_advance_to(bitmap, iova))
+			return;
+		base = bitmap->mapped_base_index * BITS_PER_BYTE;
+		relative = bit - base;
+		for (i = 0; i < mapped->npages && bit < end; i++) {
+			struct user_page_fragment *fragment = &mapped->fragments[i];
+			unsigned long bits = fragment->length * BITS_PER_BYTE;
+			unsigned long count;
+			void *addr;
+
+			if (relative >= bits) {
+				relative -= bits;
+				continue;
+			}
+			count = min(end - bit, bits - relative);
+			addr = kmap_local_folio(fragment->folio, fragment->offset & PAGE_MASK);
+			bitmap_set(addr, offset_in_page(fragment->offset) * BITS_PER_BYTE +
+				   relative, count);
+			kunmap_local(addr);
+			bit += count;
+			relative = 0;
+		}
+	}
+}
+#endif
 
 /**
  * iova_bitmap_set() - Records an IOVA range in bitmap
@@ -395,7 +500,8 @@ EXPORT_SYMBOL_NS_GPL(iova_bitmap_for_each, "IOMMUFD");
  * @length: IOVA range length
  *
  * Set the bits corresponding to the range [iova .. iova+length-1] in
- * the user bitmap.
+ * the user bitmap. A lazy pin failure is retained for the enclosing
+ * iova_bitmap_for_each() to report; successful prefix writes are not undone.
  *
  */
 void iova_bitmap_set(struct iova_bitmap *bitmap,
@@ -403,6 +509,13 @@ void iova_bitmap_set(struct iova_bitmap *bitmap,
 {
 	struct iova_bitmap_map *mapped = &bitmap->mapped;
 	unsigned long cur_bit, last_bit, last_page_idx;
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (mapped->fragments) {
+		iova_bitmap_set_fragments(bitmap, iova, length);
+		return;
+	}
+#endif
 
 update_indexes:
 	if (unlikely(!iova_bitmap_mapped_range(mapped, iova, length))) {

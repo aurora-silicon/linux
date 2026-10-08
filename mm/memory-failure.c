@@ -67,6 +67,9 @@
 
 #include "swap.h"
 #include "internal.h"
+#ifdef CONFIG_MM_SUBPAGE
+#include "user-subpage-internal.h"
+#endif
 
 static int sysctl_memory_failure_early_kill __read_mostly;
 
@@ -539,6 +542,37 @@ struct task_struct *task_early_kill(struct task_struct *tsk, int force_early)
 	return find_early_kill_thread(tsk);
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+struct subpage_collect_procs {
+	const struct page *page;
+	struct list_head *to_kill;
+	int force_early;
+};
+
+static bool collect_procs_subpage(struct folio *folio, struct vm_area_struct *vma,
+				  struct rmap_walk_range range, void *arg)
+{
+	struct subpage_collect_procs *args = arg;
+	DEFINE_FOLIO_RMAP_WALK(walk, folio, vma, range, PVMW_SYNC);
+	struct task_struct *tsk;
+	unsigned long address;
+
+	if (!page_vma_mapped_walk(&walk))
+		return true;
+	address = walk.address;
+	page_vma_mapped_walk_done(&walk);
+	rcu_read_lock();
+	for_each_process(tsk) {
+		struct task_struct *t = task_early_kill(tsk, args->force_early);
+
+		if (t && t->mm == vma->vm_mm)
+			add_to_kill_anon_file(t, args->page, vma, args->to_kill, address);
+	}
+	rcu_read_unlock();
+	return true;
+}
+#endif
+
 /*
  * Collect processes when the error hit an anonymous page.
  */
@@ -549,6 +583,17 @@ static void collect_procs_anon(const struct folio *folio,
 	struct task_struct *tsk;
 	struct anon_vma *av;
 	pgoff_t pgoff;
+#ifdef CONFIG_MM_SUBPAGE
+	struct subpage_collect_procs args = { page, to_kill, force_early };
+	struct rmap_walk_control rwc = {
+		.rmap_one = collect_procs_subpage,
+		.arg = &args,
+	};
+
+	if (!folio_test_large(folio) &&
+	    rmap_walk_subpages((struct folio *)folio, &rwc, false))
+		return;
+#endif
 
 	av = folio_lock_anon_vma_read(folio, NULL);
 	if (av == NULL)	/* Not actually mapped anymore */

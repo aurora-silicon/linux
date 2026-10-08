@@ -228,7 +228,7 @@ enum {
  */
 #define SWAP_ENTRY_INVALID	0
 
-#ifdef CONFIG_THP_SWAP
+#if defined(CONFIG_THP_SWAP) || defined(CONFIG_MM_SUBPAGE)
 #define SWAP_NR_ORDERS		(PMD_ORDER + 1)
 #else
 #define SWAP_NR_ORDERS		1
@@ -443,6 +443,7 @@ extern int swp_swapcount(swp_entry_t entry);
 struct backing_dev_info;
 extern struct swap_info_struct *get_swap_device(swp_entry_t entry);
 sector_t swap_folio_sector(struct folio *folio);
+sector_t swap_extent_sector(swp_entry_t entry, unsigned long *nr_pages);
 
 /*
  * If there is an existing swap slot reference (swap entry) and the caller
@@ -455,6 +456,13 @@ sector_t swap_folio_sector(struct folio *folio);
  * a swap count > 1. See comments of folio_*_swap helpers for more info.
  */
 int swap_dup_entry_direct(swp_entry_t entry);
+int swap_dup_entries_direct(swp_entry_t entry, unsigned int nr);
+#ifdef CONFIG_MM_SUBPAGE
+/* Offset is bytes within one native swap entry; caller owns a PTE/cache ref. */
+int swap_subpage_dup(swp_entry_t entry, unsigned int offset);
+void swap_subpage_put(swp_entry_t entry, unsigned int offset, bool reclaim_cache);
+unsigned int swap_subpage_count(swp_entry_t entry, unsigned int offset);
+#endif
 void swap_put_entries_direct(swp_entry_t entry, int nr);
 
 /*
@@ -498,7 +506,23 @@ static inline void free_swap_cache(struct folio *folio)
 {
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+static inline int swap_subpage_dup(swp_entry_t entry, unsigned int offset)
+{
+	return -EINVAL;
+}
+static inline void swap_subpage_put(swp_entry_t entry, unsigned int offset, bool reclaim_cache) { }
+static inline unsigned int swap_subpage_count(swp_entry_t entry, unsigned int offset)
+{
+	return 0;
+}
+#endif
 static inline int swap_dup_entry_direct(swp_entry_t ent)
+{
+	return 0;
+}
+
+static inline int swap_dup_entries_direct(swp_entry_t ent, unsigned int nr)
 {
 	return 0;
 }
