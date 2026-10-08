@@ -822,7 +822,11 @@ impl Registry {
             .flatten()
             .filter_map(|entry| entry.queue.as_deref_mut())
         {
-            if queue.in_flight() && Arc::ptr_eq(queue.context().status(), status) {
+            if queue.in_flight()
+                && queue
+                    .context()
+                    .is_some_and(|context| Arc::ptr_eq(context.status(), status))
+            {
                 queue.quarantine(error, &mut |event| deferred.push(event))?;
             }
         }
@@ -1077,6 +1081,15 @@ impl super::Firmware {
     /// Event-worker service step: witness consumed pool releases, then release the
     /// oldest idle retained pools beyond the warm cap.
     pub(in crate::g17) fn service_compute_pools(&mut self) -> Result {
+        for queue in self
+            .queues
+            .compute
+            .iter_mut()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref_mut())
+        {
+            queue.detach_exited_owner();
+        }
         self.queues.observe_pool_releases(&self.init)?;
         if self.render_control_backpressured() {
             return Ok(());

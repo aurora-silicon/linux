@@ -101,6 +101,13 @@ impl WorkStorage {
     }
 }
 
+/// Firmware-visible pages of a context, retained by an installed queue whose
+/// last owner has exited (see [`Context::retain_firmware_pages`]).
+pub(crate) struct FirmwarePages {
+    _scheduler: Arc<KernelObject>,
+    _work: Arc<Mutex<WorkStorage>>,
+}
+
 pub(crate) struct Context {
     execution: Arc<ExecutionContext>,
     status: Arc<VmStatus>,
@@ -220,6 +227,15 @@ impl Context {
     }
     pub(crate) fn scheduler_generation(&self) -> u32 {
         self.scheduler_generation
+    }
+    /// The pages an installed queue record of this context still names: the
+    /// scheduler page and the work storage holding the job-list head. A retained
+    /// physical queue keeps these after dropping the context itself.
+    pub(crate) fn retain_firmware_pages(&self) -> FirmwarePages {
+        FirmwarePages {
+            _scheduler: self.scheduler.clone(),
+            _work: self.work.clone(),
+        }
     }
     pub(crate) fn work_head_va(&self) -> u64 {
         self.work_base + (UAT_PGSZ + 0x400) as u64

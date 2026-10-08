@@ -77,7 +77,7 @@ pub(super) struct Transaction {
 
 impl Queue {
     pub(crate) fn exit_candidate(&self, context: &Arc<Context>, age: u64) -> bool {
-        Arc::ptr_eq(self.context(), context)
+        self.context().is_some_and(|bound| Arc::ptr_eq(bound, context))
             && self.released
             && self.active.len != 0
             && self.exit.is_none()
@@ -156,7 +156,10 @@ impl Queue {
             if !recovery_closed {
                 return Ok(());
             }
-            let state = match State::read(self.context()) {
+            let Some(context) = self.context() else {
+                return Ok(());
+            };
+            let state = match State::read(context) {
                 Ok(state) => state,
                 Err(_) => return Ok(()),
             };

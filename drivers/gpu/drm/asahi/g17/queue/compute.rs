@@ -381,12 +381,16 @@ pub(crate) enum PoolPhase {
 
 pub(crate) struct Queue {
     owner: Option<u64>,
+    /// Scheduler/work pages of an exited last owner whose context was dropped;
+    /// the installed queue record still names them until the next owner binds.
+    retained_owner: Option<crate::g17::context::FirmwarePages>,
     pool_phase: PoolPhase,
     /// Monotonic time the last owner released this queue (vacate order).
     released_at: u64,
     /// Free-list generation of the last published configuration.
     free_list_generation: u64,
-    binding: Binding,
+    /// `None` after an exited owner was detached; a new owner binds afresh.
+    binding: Option<Binding>,
     previous: Option<Previous>,
     kick: kick::Queue,
     pool: ComputePool,
@@ -434,10 +438,11 @@ impl Queue {
         context.mark_published();
         Ok(Self {
             owner: Some(owner),
+            retained_owner: None,
             pool_phase: PoolPhase::Populated,
             released_at: 0,
             free_list_generation: 0,
-            binding,
+            binding: Some(binding),
             previous: None,
             kick,
             pool,
@@ -474,12 +479,14 @@ impl Queue {
     pub(crate) fn owner(&self) -> Option<u64> {
         self.owner
     }
-    pub(crate) fn context(&self) -> &Arc<Context> {
-        &self.binding.context
+    /// The bound owner's context; `None` once an exited owner was detached.
+    pub(crate) fn context(&self) -> Option<&Arc<Context>> {
+        self.binding.as_ref().map(|binding| &binding.context)
     }
     /// Quarantined commands still retain the scheduler until their retirement witness.
     pub(crate) fn idle_for_context(&self, context: &Arc<Context>) -> bool {
-        !Arc::ptr_eq(self.context(), context) || (self.active.len == 0 && self.replays.len == 0)
+        !self.context().is_some_and(|bound| Arc::ptr_eq(bound, context))
+            || (self.active.len == 0 && self.replays.len == 0)
     }
     pub(crate) fn in_flight(&self) -> bool {
         self.active.len != 0 && !self.quarantined
@@ -524,7 +531,9 @@ impl Queue {
     fn qos_owner(&self) -> qos::Owner {
         qos::Owner {
             qid: self.qid(),
-            qos: self.binding.context.qos_id(),
+            // Accounting completes only for bound owners; a detached queue has no
+            // pending work and never reaches this.
+            qos: self.binding.as_ref().map_or(0, |binding| binding.context.qos_id()),
             data_master: DataMaster::Compute as u8,
         }
     }
@@ -598,7 +607,10 @@ impl Queue {
             || self.owner != Some(ticket.owner)
             || active.packet.order.sequence != ticket.submission
             || active.packet.context.id() != ticket.context_id
-            || active.packet.context.id() != self.binding.context.id()
+            || self
+                .binding
+                .as_ref()
+                .is_none_or(|binding| active.packet.context.id() != binding.context.id())
         {
             return Err(EIO);
         }
@@ -929,7 +941,10 @@ impl Queue {
         if self.released
             || self.quarantined
             || self.qid() != qid
-            || !Arc::ptr_eq(&self.binding.context, context)
+            || !self
+                .binding
+                .as_ref()
+                .is_some_and(|binding| Arc::ptr_eq(&binding.context, context))
             || !context.is_current()
         {
             return Err(EIO);
@@ -958,17 +973,21 @@ impl Queue {
         if !context.is_current() {
             return Err(EFAULT);
         }
-        let old = self.binding.context.clone();
-        if Arc::ptr_eq(old.status(), context.status()) && old.is_current() {
-            if self.binding.pool_alias.is_none() {
+        let old = self.binding.as_ref().map(|binding| binding.context.clone());
+        let same_vm = old
+            .as_ref()
+            .is_some_and(|old| Arc::ptr_eq(old.status(), context.status()) && old.is_current());
+        if same_vm {
+            let binding = self.binding.as_mut().ok_or(EIO)?;
+            if binding.pool_alias.is_none() {
                 // The same VM takes back a re-armed pool: alias the new backing.
-                self.binding.pool_alias = Some(self.pool.map_client(context.vm())?);
+                binding.pool_alias = Some(self.pool.map_client(context.vm())?);
             }
             self.graph.set_owner(&context)?;
-            self.binding.context = context.clone();
+            binding.context = context.clone();
             self.previous = Some(Previous {
                 binding: None,
-                context: old,
+                context: old.ok_or(EIO)?,
                 publication: None,
             });
         } else {
@@ -976,12 +995,15 @@ impl Queue {
             let pool_alias = self.pool.map_client(context.vm())?;
             let binding = self.graph.bind(context.clone(), kick_alias, pool_alias)?;
             self.graph.set_owner(&context)?;
-            let old_binding = core::mem::replace(&mut self.binding, binding);
-            self.previous = Some(Previous {
-                binding: Some(old_binding),
+            let old_binding = self.binding.replace(binding);
+            // A detached queue (exited owner already dropped) has nothing to supersede;
+            // the new owner's record fields replace the retained pages' references.
+            self.previous = old.map(|old| Previous {
+                binding: old_binding,
                 context: old,
                 publication: None,
             });
+            self.retained_owner = None;
         }
         context.mark_published();
         self.owner = Some(owner);
@@ -1006,9 +1028,9 @@ impl Queue {
                 }
                 let mut previous = self.previous.take().ok_or(EIO)?;
                 if let Some(binding) = previous.binding.take() {
-                    self.binding = binding;
+                    self.binding = Some(binding);
                 } else {
-                    self.binding.context = previous.context;
+                    self.binding.as_mut().ok_or(EIO)?.context = previous.context;
                 }
                 self.retirement_ready = true;
             }
@@ -1018,6 +1040,25 @@ impl Queue {
             }
         }
         Ok(false)
+    }
+    /// The last owner's file and VM are gone: its execution root was released
+    /// after the scheduler-state release and command retirement were witnessed
+    /// (`Context::release_execution`), and this queue is idle without an owner.
+    /// Drop the binding (every alias into that VM) and the context, keeping only
+    /// the scheduler page and work storage the installed queue record names.
+    pub(crate) fn detach_exited_owner(&mut self) -> bool {
+        if !self.reusable() {
+            return false;
+        }
+        let Some(binding) = self.binding.as_ref() else {
+            return false;
+        };
+        if binding.context.is_current() {
+            return false;
+        }
+        self.retained_owner = Some(binding.context.retain_firmware_pages());
+        self.binding = None;
+        true
     }
     /// An idle retained queue whose USC backing may be given back.
     pub(crate) fn vacate_candidate(&self) -> bool {
@@ -1054,7 +1095,9 @@ impl Queue {
         }
         // The retained owner binding's client alias pins the backing: drop it
         // first (the owner has exited; `reusable()` proved no previous binding).
-        self.binding.pool_alias = None;
+        if let Some(binding) = self.binding.as_mut() {
+            binding.pool_alias = None;
+        }
         self.pool.drop_pages();
         self.pool_phase = PoolPhase::Vacant;
         Ok(true)
@@ -1306,9 +1349,15 @@ impl Queue {
         {
             return Err(EBUSY);
         }
-        if !packet.context.is_current() || !Arc::ptr_eq(&packet.context, &self.binding.context) {
+        if !packet.context.is_current()
+            || !self
+                .binding
+                .as_ref()
+                .is_some_and(|binding| Arc::ptr_eq(&packet.context, &binding.context))
+        {
             return Err(EFAULT);
         }
+        let binding = self.binding.as_ref().ok_or(EFAULT)?;
         if packet.completion.status().get() != 0 {
             return Err(EIO);
         }
@@ -1361,9 +1410,9 @@ impl Queue {
             qid,
             kick_count: self.ordinal,
             kick: kick_timestamp,
-            preempt_va: self.binding.preempt.iova(),
-            operand_state_va: self.binding.operand.iova(),
-            usage_va: self.binding.usage.iova(),
+            preempt_va: binding.preempt.iova(),
+            operand_state_va: binding.operand.iova(),
+            usage_va: binding.usage.iova(),
             usage_fw_va: self.graph.usage.gpu_va(),
             free_list_slot: u32::from(self.pool.id()),
             free_list_control_va: self.pool.control_va(),
