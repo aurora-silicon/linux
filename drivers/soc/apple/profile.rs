@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 // Copyright 2026 Dj
+// Copyright 2026 Ryan Murray
 
 //! Typed platform profiles for the SEP driver.
 //!
@@ -124,6 +125,8 @@ pub(crate) struct PlatformProfile {
     pub(crate) firmware_region: &'static CStr,
     /// Identity keybag CREATE_KEYBAG field encoding (per-SoC; see [`KeybagCreate`]).
     pub(crate) keybag_create: KeybagCreate,
+    /// Require nonce authentication and signed sensor material before capture.
+    pub(crate) nonce_session: bool,
 }
 
 const T8103: PlatformProfile = PlatformProfile {
@@ -151,6 +154,7 @@ const T8103: PlatformProfile = PlatformProfile {
         bag_type: 0x20000,
         arg: 0,
     },
+    nonce_session: false,
 };
 
 const T6020: PlatformProfile = PlatformProfile {
@@ -178,6 +182,7 @@ const T6020: PlatformProfile = PlatformProfile {
         bag_type: 0,
         arg: -1,
     },
+    nonce_session: false,
 };
 
 /// MacBook Neo. The J700 ADT records a pre-booted SEP, a spi2 Mesa sensor
@@ -209,6 +214,7 @@ const T8140: PlatformProfile = PlatformProfile {
         bag_type: 0,
         arg: -1,
     },
+    nonce_session: true,
 };
 
 static_assert!(T8103.shmem_capacity == 0x30000);

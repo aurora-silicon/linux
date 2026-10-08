@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 // Copyright 2026 Dj
+// Copyright 2026 Ryan Murray
 
 //! The fingerprint sensor over SPI.
 
@@ -579,6 +580,17 @@ pub(crate) fn read_sensor_serial() -> Result<SensorSerial> {
     let mut serial = [0u8; SENSOR_SERIAL_LEN];
     read_framed_verified(SENSOR_SERIAL_REPLY_LEN, SENSOR_SERIAL_AT, &mut serial)?;
     Ok(SensorSerial(serial))
+}
+
+/// Read the nonce as one frame; a separate acknowledgment would consume it.
+pub(crate) fn session_nonce() -> Result<[u8; 32]> {
+    command(&[0x80, 0x35, 0, 7, 0, 0, 0])?;
+    let mut value = [0; 32];
+    read_framed_verified(9 + value.len() + CRC_LEN, 9, &mut value)?;
+    if value.iter().all(|byte| *byte == 0) {
+        return Err(EIO);
+    }
+    Ok(value)
 }
 
 pub(crate) fn read_session_reply() -> Result<[u8; SESSION_SHARE_LEN]> {

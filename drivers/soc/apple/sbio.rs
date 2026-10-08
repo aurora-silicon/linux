@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 // Copyright 2026 Dj
+// Copyright 2026 Ryan Murray
 //! Touch ID: the biometric endpoint (SBIO) and its `/dev/sep-bio` interface.
 //! The enclave matches; no biometric image ever crosses to userspace.
 
@@ -367,12 +368,9 @@ impl SepData {
             }
         }
 
-        // The J414s owner exported successfully from state 0x3 in a bounded
-        // no-finger probe, although an earlier pre-UUID boot saw the master
-        // refuse an early save from the same state. Keep this path opt-in
-        // until a new enrollment and reboot prove that the owner blob belongs
-        // to the new user context.
-        if *module_parameters::j414s_persistent_enrol.value() != 0 {
+        // J700 needs the owner component even when state 0x3 has no
+        // save-pending bit. Retain the opt-in policy on older profiles.
+        if self.profile.nonce_session || *module_parameters::j414s_persistent_enrol.value() != 0 {
             if owner_initial_state == Some(0x3)
                 && !self.save_catacomb(
                     crate::sbio::CatacombUser::OWNER,
@@ -761,7 +759,7 @@ impl SepData {
     }
 
     fn save_all_components(&self, user: crate::sbio::UserId) -> bool {
-        if *module_parameters::j414s_persistent_enrol.value() != 0 {
+        if self.profile.nonce_session || *module_parameters::j414s_persistent_enrol.value() != 0 {
             return self.save_all_components_user_first(user);
         }
         // On m2fix11, a completed enrollment marked both master and user 0x7,
@@ -1006,10 +1004,42 @@ impl SepData {
         self.register_ool(&self.ool_sbio)?;
 
         self.sbio_ready.store(true, Relaxed);
+        if self.profile.nonce_session {
+            let word = 6u32;
+            // Communication must be initialized before restoring biometric state.
+            let result = self.sbio_transfer_raw(
+                0x73, c"INIT_SBIO_COMMUNICATION", &word.to_le_bytes(),
+            );
+            match result {
+                Ok(done) if done.status.is_ok() => {
+                    dev_info!(self.dev, "sbio: communication initialization accepted\n");
+                }
+                Ok(done) => {
+                    self.sbio_ready.store(false, Relaxed);
+                    dev_err!(self.dev, "sbio: communication init refused: status {}, {} bytes\n",
+                        done.status, done.payload.len());
+                    return Err(EIO);
+                }
+                Err(e) => {
+                    self.sbio_ready.store(false, Relaxed);
+                    dev_err!(self.dev, "sbio: communication init transport failed: {:?}\n", e);
+                    return Err(e);
+                }
+            }
+        }
         Ok(())
     }
 
     fn attach_bringup(&self) {
+        if self.profile.nonce_session {
+            if !self.bring_sensor_online() {
+                dev_warn!(
+                    self.dev,
+                    "sensor: authenticated attach incomplete; capture unavailable\n"
+                );
+            }
+            return;
+        }
         if !sensor::is_bound() {
             dev_warn!(
                 self.dev,
@@ -1033,18 +1063,34 @@ impl SepData {
             return false;
         };
 
+        // Newer sensors require the encrypted parameters and transparent
+        // channel before the calibration challenge can be serviced.
+        let parameters = if self.profile.nonce_session {
+            match self.apply_sensor_parameters() {
+                Some(parameters) => Some(parameters),
+                None => return false,
+            }
+        } else {
+            None
+        };
+
         if !self.sensor_calibrated.load(Relaxed) {
             if !self.calibrate_sensor() {
                 return false;
             }
             self.sensor_calibrated.store(true, Relaxed);
-            let Some(reloaded_patch) = self.wake_sensor() else {
-                return false;
-            };
-            patch = reloaded_patch;
+            if parameters.is_none() {
+                let Some(reloaded_patch) = self.wake_sensor() else {
+                    return false;
+                };
+                patch = reloaded_patch;
+            }
         }
 
-        let ok = self.complete_bringup(patch);
+        let ok = match parameters {
+            Some(parameters) => self.finish_sensor_setup(patch, parameters),
+            None => self.complete_bringup(patch),
+        };
         // The sensor is patched and idle here -- the only safe moment to
         // configure the data-ready interrupt, which is then left alone for the
         // driver's life. Interrupt capture is the default; a machine that does
@@ -1457,6 +1503,22 @@ impl SepData {
         let stage = self.bringup.load(Relaxed);
         dev_info!(self.dev, "sbio: registering sensor at bring-up stage {}\n", stage);
 
+        if self.profile.nonce_session {
+            // J700 needs identification before CLEAR_STATE on every reset.
+            let platform = match Self::sensor_platform_identity() {
+                Ok(platform) => platform,
+                Err(error) => {
+                    dev_err!(self.dev, "sensor: platform identity unavailable: {:?}\n", error);
+                    return false;
+                }
+            };
+            if !self.sensor_session_request(0x48, c"PLATFORM_IDENTITY", &platform)
+                || self.sbio_expect_ok(&crate::sbio::sbio_register_sensor(id)).is_none()
+            {
+                return false;
+            }
+        }
+
         if stage >= BRINGUP_ESTABLISHED {
             let _ = self.log_identity_count(c"before CLEAR_STATE for sensor re-registration");
             if self
@@ -1468,7 +1530,7 @@ impl SepData {
             let _ = self.log_identity_count(c"after CLEAR_STATE for sensor re-registration");
         }
 
-        if stage == BRINGUP_FRESH {
+        if stage == BRINGUP_FRESH && !self.profile.nonce_session {
             let op = crate::sbio::sbio_register_sensor(id);
             match self.sbio_call(&op) {
                 SbioOutcome::Ok(_payload) => {
@@ -1490,12 +1552,79 @@ impl SepData {
         let op = crate::sbio::sbio_register_sensor_serial(&serial);
         match self.sbio_call(&op) {
             SbioOutcome::Ok(_payload) => {
+                if self.profile.nonce_session && !self.authenticate_sensor_session() {
+                    return false;
+                }
                 self.bringup.store(BRINGUP_ESTABLISHED, Relaxed);
                 let _ = self.log_identity_count(c"after sensor serial registration");
                 true
             }
             _ => false,
         }
+    }
+
+    fn sensor_platform_identity() -> Result<[u8; 12]> {
+        let node = kernel::of::root().ok_or(ENODEV)?;
+        let property: KVec<u8> = node.get_property(c"serial-number")?;
+        let length = property.iter().position(|byte| *byte == 0).ok_or(EINVAL)?;
+        let mut identity = [0; 12];
+        if length == 0 || length > identity.len() || property.len() != length + 1 {
+            return Err(EINVAL);
+        }
+        identity[..length].copy_from_slice(&property[..length]);
+        Ok(identity)
+    }
+
+    fn sensor_session_request(&self, opcode: u16, name: &'static CStr, bytes: &[u8]) -> bool {
+        match self.sbio_transfer_raw(opcode, name, bytes) {
+            Ok(reply) if reply.status.is_ok() => true,
+            Ok(reply) => {
+                dev_err!(self.dev, "sensor: {} refused with status {}\n", name, reply.status);
+                false
+            }
+            Err(error) => {
+                dev_err!(self.dev, "sensor: {} transfer failed: {:?}\n", name, error);
+                false
+            }
+        }
+    }
+
+    fn authenticate_sensor_session(&self) -> bool {
+        let nonce = match sensor::session_nonce() {
+            Ok(nonce) => nonce,
+            Err(error) => {
+                dev_err!(self.dev, "sensor: nonce read failed: {:?}\n", error);
+                return false;
+            }
+        };
+        if !self.sensor_session_request(0x81, c"SENSOR_NONCE", &nonce) {
+            return false;
+        }
+
+        if !self.sensor_key_loaded.load(Relaxed) {
+            let firmware = match kernel::firmware::Firmware::request(
+                c"apple/msrk-j700.bin", &self.dev,
+            ) {
+                Ok(firmware) => firmware,
+                Err(error) => {
+                    dev_err!(
+                        self.dev,
+                        "sensor: signed root-key container unavailable: {:?}\n",
+                        error
+                    );
+                    return false;
+                }
+            };
+            if firmware.data().is_empty()
+                || !self.sensor_session_request(0x86, c"SENSOR_ROOT_KEY", firmware.data())
+            {
+                return false;
+            }
+            self.sensor_key_loaded.store(true, Relaxed);
+        }
+        // Each identification starts a new sensor-side exchange, even though
+        // the signed key remains loaded for the lifetime of the enclave.
+        self.establish_session()
     }
 
     fn wake_sensor(&self) -> Option<PatchLoaded> {
@@ -1607,22 +1736,16 @@ impl SepData {
             return false;
         };
 
-        let request = match crate::sbio::SbioCalibration::new(&blob) {
+        let source = if self.profile.nonce_session { 6 } else { SBIO_CALIBRATION_SOURCE };
+        let request = match crate::sbio::SbioCalibration::new(&blob, source) {
             Ok(request) => request,
             Err(_) => {
                 return false;
             }
         };
-        if self
-            .sbio_transfer_raw(request.opcode(), request.name(), request.payload())
-            .ok()
-            .filter(|done| done.status.is_ok())
-            .is_none()
-        {
-            dev_err!(
-                self.dev,
-                "sensor: 0x5b LOAD_CALIBRATION failed. Without it every capture is refused with status 1.\n"
-            );
+        if !self.sensor_session_request(request.opcode(), request.name(), request.payload()) {
+            dev_err!(self.dev, "sensor: calibration refused (source {}, {} bytes)\n",
+                source, request.payload().len());
             return false;
         }
 
@@ -1636,6 +1759,10 @@ impl SepData {
             return false;
         };
 
+        self.finish_sensor_setup(patch, params)
+    }
+
+    fn finish_sensor_setup(&self, patch: PatchLoaded, params: ParametersApplied) -> bool {
         let op = crate::sbio::sbio_complete_init(patch, params);
         if self.sbio_expect_ok(&op).is_none() {
             dev_err!(
@@ -2542,6 +2669,17 @@ impl SepData {
 
         let restored = self.restore_all_components();
         dev_info!(self.dev, "sbio: cold-match preparation {}, component restore {}\n", prepared, restored);
+        // Restore can replace the credential and the device's identity view.
+        // Refresh both after loading J700's persistent components, before
+        // admitting a verify operation.
+        let match_context = if self.profile.nonce_session {
+            let synced = restored && self.sync_device_view();
+            self.device_view_synced.store(synced, Relaxed);
+            synced && crate::sbio::UserId::new(SBIO_PROBE_USER_ID)
+                .is_some_and(|user| self.establish_scrd_match_context(user))
+        } else {
+            match_context
+        };
         let identities = self.log_identity_count(c"after Catacomb restore with sensor registered");
         let identity_ready = matches!(identities, Some(n) if n > 0);
         let ready = prepared && match_context && restored && identity_ready
@@ -2949,10 +3087,10 @@ pub(crate) const SBIO_CALIBRATION_SOURCE: u32 = 3;
 pub(crate) struct SbioCalibration(KVec<u8>);
 
 impl SbioCalibration {
-    pub(crate) fn new(blob: &crate::CalibrationBlob) -> Result<SbioCalibration> {
+    pub(crate) fn new(blob: &crate::CalibrationBlob, source: u32) -> Result<SbioCalibration> {
         let bytes = blob.bytes();
         let mut body = KVec::new();
-        body.extend_from_slice(&SBIO_CALIBRATION_SOURCE.to_le_bytes(), GFP_KERNEL)?;
+        body.extend_from_slice(&source.to_le_bytes(), GFP_KERNEL)?;
         body.extend_from_slice(bytes, GFP_KERNEL)?;
         Ok(SbioCalibration(body))
     }
