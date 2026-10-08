@@ -51,7 +51,13 @@ static_assert!(core::mem::offset_of!(GraphLayout, items) == ITEMS);
 
 /// Aliases are destroyed before the logical root they name. Superseded bindings remain owned
 /// until the first exact successful publication under their replacement has retired.
-struct Binding {
+/// Backing of a vacated pool, freed outside the device mutex.
+pub(crate) struct Vacated {
+    _alias: Option<mmu::KernelMapping>,
+    _pages: Option<crate::g17::freelist::Pages>,
+}
+
+pub(crate) struct Binding {
     _kick_alias: mmu::KernelMapping,
     /// Client alias of the USC pool pages; dropped when the pool is vacated and
     /// recreated when an owner binds a re-armed pool (it pins the backing).
@@ -1046,19 +1052,19 @@ impl Queue {
     /// (`Context::release_execution`), and this queue is idle without an owner.
     /// Drop the binding (every alias into that VM) and the context, keeping only
     /// the scheduler page and work storage the installed queue record names.
-    pub(crate) fn detach_exited_owner(&mut self) -> bool {
+    /// The returned binding (aliases into the exited VM and the last reference
+    /// to its context) is dropped by the caller after the device mutex is
+    /// released: unmapping and VM teardown must not delay other clients.
+    pub(crate) fn detach_exited_owner(&mut self) -> Option<Binding> {
         if !self.reusable() {
-            return false;
+            return None;
         }
-        let Some(binding) = self.binding.as_ref() else {
-            return false;
-        };
-        if binding.context.is_current() {
-            return false;
+        if self.binding.as_ref()?.context.is_current() {
+            return None;
         }
+        let binding = self.binding.take()?;
         self.retained_owner = Some(binding.context.retain_firmware_pages());
-        self.binding = None;
-        true
+        Some(binding)
     }
     /// An idle retained queue whose USC backing may be given back.
     pub(crate) fn vacate_candidate(&self) -> bool {
@@ -1084,23 +1090,26 @@ impl Queue {
         fence(Ordering::SeqCst);
         Ok(())
     }
-    /// Drops the USC backing once the firmware's control consumer passed the
-    /// release. Returns true when the backing was freed by this call.
-    pub(crate) fn observe_vacancy(&mut self, consumer: u32, producer: u32) -> Result<bool> {
+    /// Detaches the USC backing once the firmware's control consumer passed the
+    /// release. The caller frees the returned backing after releasing the
+    /// device mutex.
+    pub(crate) fn observe_vacancy(
+        &mut self,
+        consumer: u32,
+        producer: u32,
+    ) -> Result<Option<Vacated>> {
         let PoolPhase::ReleaseSent(cursor) = self.pool_phase else {
-            return Ok(false);
+            return Ok(None);
         };
         if !crate::g17::freelist::control_consumed(consumer, producer, cursor)? {
-            return Ok(false);
+            return Ok(None);
         }
-        // The retained owner binding's client alias pins the backing: drop it
+        // The retained owner binding's client alias pins the backing: detach it
         // first (the owner has exited; `reusable()` proved no previous binding).
-        if let Some(binding) = self.binding.as_mut() {
-            binding.pool_alias = None;
-        }
-        self.pool.drop_pages();
+        let alias = self.binding.as_mut().and_then(|binding| binding.pool_alias.take());
+        let pages = self.pool.take_pages();
         self.pool_phase = PoolPhase::Vacant;
-        Ok(true)
+        Ok(Some(Vacated { _alias: alias, _pages: pages }))
     }
     /// Installs fresh backing into a vacant pool; returns the descriptor row data
     /// the caller writes before binding an owner.

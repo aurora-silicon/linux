@@ -393,9 +393,10 @@ impl ComputePool {
     pub(crate) fn release_record(&self, generation: u64) -> super::fw::channels::FreeListRelease {
         super::fw::channels::FreeListRelease::new(generation, u32::from(self.id))
     }
-    /// The caller has observed the firmware consume this pool's release.
-    pub(crate) fn drop_pages(&mut self) {
-        self.pages = None;
+    /// The caller has observed the firmware consume this pool's release and
+    /// frees the returned backing after releasing the device mutex.
+    pub(crate) fn take_pages(&mut self) -> Option<Pages> {
+        self.pages.take()
     }
     /// Rewrites the shared control header for fresh backing. The caller then
     /// rewrites the page-pool descriptor row before the queue is kicked again.
