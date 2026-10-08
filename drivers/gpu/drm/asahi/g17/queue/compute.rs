@@ -19,7 +19,9 @@ use retirement::{Cursors, RECORD_SLOTS};
 
 use crate::g17::now_ns;
 
-const DESCRIPTORS: usize = 256;
+/// Descriptor slots per queue. A kick's descriptor is rewritten when the kick 32 slots later
+/// is published; with IN_FLIGHT kicks outstanding at most, that kick has completed by then.
+const DESCRIPTORS: usize = 32;
 const GRAPH_SIZE: usize = 0x8000;
 const CONTEXT_SIZE: usize = 0x20000;
 const RECORD_STRIDE: usize = 0x1000;
@@ -231,7 +233,7 @@ impl Graph {
     /// EAGAIN while the queue is vacant: the owner must re-arm it first.
     fn descriptor_vas(&self, slot: u8) -> Result<(u64, u64)> {
         let ring = self.ring.as_ref().ok_or(EAGAIN)?;
-        let offset = u64::from(slot) * COMPUTE_DESCRIPTOR_SIZE as u64;
+        let offset = (usize::from(slot) % DESCRIPTORS * COMPUTE_DESCRIPTOR_SIZE) as u64;
         Ok((ring.high.iova() + offset, ring.object.gpu_va() + offset))
     }
     fn descriptor_alias(&self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
@@ -1620,7 +1622,7 @@ impl Queue {
                 .ok_or(EAGAIN)?
                 .object
                 .initialize::<ComputeDescriptor>(
-                    kick_timestamp.slot() * COMPUTE_DESCRIPTOR_SIZE,
+                    kick_timestamp.slot() % DESCRIPTORS * COMPUTE_DESCRIPTOR_SIZE,
                     |descriptor| descriptor.write(&args),
                 )?;
             if first {
