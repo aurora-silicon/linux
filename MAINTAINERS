@@ -1965,9 +1965,9 @@ L:	linux-hwmon@vger.kernel.org
 S:	Odd fixes
 F:	drivers/hwmon/applesmc.c
 
-APPLE T8140 PMP SUPPORT
+APPLE T8140 SOC AND J700 (MACBOOK NEO) SUPPORT
 M:	Ryan Murray <ryan@aurorasilicon.org>
-L:	asahi@lists.linux.dev
+W:	https://aurora-silicon.github.io
 S:	Maintained
 F:	Documentation/devicetree/bindings/cpufreq/apple,cluster-cpufreq.yaml
 F:	Documentation/devicetree/bindings/power/apple,t8140-pmp-report.yaml
@@ -1975,11 +1975,6 @@ F:	Documentation/devicetree/bindings/soc/apple/apple,pmp.yaml
 F:	drivers/pmdomain/apple/pmp-report.c
 F:	drivers/soc/apple/pmp.rs
 F:	include/linux/soc/apple/pmp-report.h
-
-APPLE T8140 SOC AND J700 (MACBOOK NEO) SUPPORT
-M:	Ryan Murray <ryan@aurorasilicon.org>
-W:	https://aurora-silicon.github.io
-S:	Maintained
 F:	Documentation/devicetree/bindings/iio/light/apple,t8140-aop-als.yaml
 F:	Documentation/devicetree/bindings/input/apple,dockchannel-hid.yaml
 F:	Documentation/devicetree/bindings/media/apple,t8140-isp.yaml
