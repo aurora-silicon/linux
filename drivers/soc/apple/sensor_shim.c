@@ -218,7 +218,15 @@ static int sep_acquire_power(struct spi_device *spi)
 	    of_property_present(spi->dev.of_node, "apple,smc-power-key"))
 		return sep_acquire_smc_power(spi);
 
-	sep_power = gpiod_get_index(&spi->dev, NULL, 0, GPIOD_OUT_LOW);
+	sep_power = gpiod_get(&spi->dev, "enable", GPIOD_OUT_LOW);
+	if (IS_ERR(sep_power) && PTR_ERR(sep_power) == -ENOENT)
+		sep_power = gpiod_get_index(&spi->dev, NULL, 0, GPIOD_OUT_LOW);
+	if (IS_ERR(sep_power) && PTR_ERR(sep_power) != -ENOENT) {
+		int error = PTR_ERR(sep_power);
+
+		sep_power = NULL;
+		return error;
+	}
 	if (!IS_ERR(sep_power)) {
 		sep_power_source = SEP_POWER_NODE_PROPERTY;
 		dev_info(&spi->dev,
@@ -230,12 +238,12 @@ static int sep_acquire_power(struct spi_device *spi)
 	/*
 	 * The fallback below is the j414s power line; a sibling board's sensor sits
 	 * on a different pin, so only j414s may use it. Every other machine must
-	 * describe the power GPIO in its device node (the gpiod_get_index path).
+	 * describe enable-gpios in its device node.
 	 */
 	if (!of_machine_is_compatible("apple,j414s")) {
 		dev_warn(&spi->dev,
-			 "sep sensor: no power GPIO in the device node; describe gpios in DT\n");
-		return 0;
+			 "sep sensor: no power GPIO in the device node; describe enable-gpios in DT\n");
+		return -ENODEV;
 	}
 
 	np = of_find_node_by_path(SEP_SENSOR_GPIO_NODE);
@@ -243,7 +251,7 @@ static int sep_acquire_power(struct spi_device *spi)
 		dev_warn(&spi->dev,
 			 "sep sensor: no DT node at %s, no power line\n",
 			 SEP_SENSOR_GPIO_NODE);
-		return 0;
+		return -ENODEV;
 	}
 
 	gdev = gpio_device_find_by_fwnode(of_fwnode_handle(np));
@@ -252,7 +260,7 @@ static int sep_acquire_power(struct spi_device *spi)
 		dev_warn(&spi->dev,
 			 "sep sensor: %s has no registered GPIO device\n",
 			 SEP_SENSOR_GPIO_NODE);
-		return 0;
+		return -EPROBE_DEFER;
 	}
 
 	gc = gpio_device_get_chip(gdev);
@@ -269,7 +277,7 @@ static int sep_acquire_power(struct spi_device *spi)
 			 SEP_SENSOR_GPIO_LINE, SEP_SENSOR_GPIO_NODE,
 			 gpio_device_get_label(gdev));
 		gpio_device_put(gdev);
-		return 0;
+		return -ENODEV;
 	}
 
 	sep_power_source = SEP_POWER_CHIP_LINE;
