@@ -605,6 +605,85 @@ brcmf_cfg80211_update_proto_addr_mode(struct wireless_dev *wdev)
  *
  * Return: pointer to new vif on success, ERR_PTR(-errno) if not
  */
+static void brcmf_awdl_cleanup_locked(struct brcmf_cfg80211_info *cfg)
+{
+	struct brcmf_cfg80211_vif *vif;
+	struct brcmf_if *ifp;
+
+	spin_lock(&cfg->vif_event.vif_event_lock);
+	ifp = cfg->awdl_failed_ifp;
+	vif = cfg->awdl_vif;
+	cfg->awdl_failed_ifp = NULL;
+	cfg->awdl_vif = NULL;
+	WRITE_ONCE(cfg->awdl_pending, false);
+	cfg->awdl_attaching = false;
+	if (cfg->vif_event.vif == vif) {
+		cfg->vif_event.vif = NULL;
+		cfg->vif_event.action = 0;
+	}
+	spin_unlock(&cfg->vif_event.vif_event_lock);
+
+	if (ifp) {
+		brcmf_fil_iovar_data_set(ifp, "interface_remove", NULL, 0);
+		brcmf_proto_del_if(cfg->pub, ifp);
+		ifp->vif = NULL;
+	}
+	if (vif)
+		brcmf_free_vif(vif);
+	if (ifp) {
+		if (ifp->ndev) {
+			ifp->ndev->ieee80211_ptr = NULL;
+			free_netdev(ifp->ndev);
+		} else {
+			kfree(ifp);
+		}
+	}
+}
+
+static void brcmf_awdl_cleanup(struct wiphy *wiphy, struct wiphy_work *work)
+{
+	struct brcmf_cfg80211_info *cfg =
+		container_of(work, struct brcmf_cfg80211_info, awdl_cleanup);
+
+	brcmf_awdl_cleanup_locked(cfg);
+}
+
+void brcmf_cfg80211_awdl_stop(struct brcmf_cfg80211_info *cfg)
+{
+	wiphy_lock(cfg->wiphy);
+	wiphy_delayed_work_cancel(cfg->wiphy, &cfg->awdl_timeout);
+	wiphy_work_cancel(cfg->wiphy, &cfg->awdl_cleanup);
+	brcmf_awdl_cleanup_locked(cfg);
+	wiphy_unlock(cfg->wiphy);
+}
+
+static void brcmf_awdl_timeout(struct wiphy *wiphy, struct wiphy_work *work)
+{
+	struct brcmf_cfg80211_info *cfg =
+		container_of(work, struct brcmf_cfg80211_info, awdl_timeout.work);
+	struct brcmf_cfg80211_vif *vif;
+
+	spin_lock(&cfg->vif_event.vif_event_lock);
+	vif = cfg->awdl_vif;
+	/* IF_ADD has already claimed the vif; its worker owns completion. */
+	if (!cfg->awdl_pending || cfg->awdl_attaching ||
+	    (vif && vif->ifp)) {
+		spin_unlock(&cfg->vif_event.vif_event_lock);
+		return;
+	}
+	cfg->awdl_vif = NULL;
+	WRITE_ONCE(cfg->awdl_pending, false);
+	if (cfg->vif_event.vif == vif) {
+		cfg->vif_event.vif = NULL;
+		cfg->vif_event.action = 0;
+	}
+	spin_unlock(&cfg->vif_event.vif_event_lock);
+
+	brcmf_err("AWDL interface creation timed out\n");
+	if (vif)
+		brcmf_free_vif(vif);
+}
+
 /**
  * brcmf_awdl_add_vif() - create an AWDL interface and give it a netdev.
  *
@@ -621,7 +700,7 @@ brcmf_cfg80211_update_proto_addr_mode(struct wireless_dev *wdev)
  * valid type for its bookkeeping; the firmware side is what actually decides
  * the interface behaviour, from the iftype passed to interface_create.
  *
- * Return: pointer to the new vif on success, ERR_PTR(-errno) on failure.
+ * Return: 0 when requested, or a negative error code.
  */
 int brcmf_awdl_add_vif(struct wiphy *wiphy, const char *name)
 {
@@ -630,7 +709,10 @@ int brcmf_awdl_add_vif(struct wiphy *wiphy, const char *name)
 	struct brcmf_cfg80211_vif *vif;
 	int err;
 
-	if (brcmf_cfg80211_vif_event_armed(cfg) || cfg->awdl_pending)
+	if (cfg->pub->bus_if->state != BRCMF_BUS_UP)
+		return -ENODEV;
+	if (brcmf_cfg80211_vif_event_armed(cfg) ||
+	    READ_ONCE(cfg->awdl_pending))
 		return -EBUSY;
 
 	vif = brcmf_alloc_vif(cfg, NL80211_IFTYPE_STATION);
@@ -650,13 +732,17 @@ int brcmf_awdl_add_vif(struct wiphy *wiphy, const char *name)
 	 *
 	 */
 	strscpy(cfg->awdl_ifname, name, sizeof(cfg->awdl_ifname));
-	cfg->awdl_pending = true;
+	spin_lock(&cfg->vif_event.vif_event_lock);
+	cfg->awdl_vif = vif;
+	WRITE_ONCE(cfg->awdl_pending, true);
+	spin_unlock(&cfg->vif_event.vif_event_lock);
+	wiphy_delayed_work_queue(wiphy, &cfg->awdl_timeout,
+				 BRCMF_VIF_EVENT_TIMEOUT);
 
 	err = brcmf_cfg80211_request_awdl_if(ifp, NULL);
 	if (err) {
-		cfg->awdl_pending = false;
-		brcmf_cfg80211_arm_vif_event(cfg, NULL);
-		brcmf_free_vif(vif);
+		/* An IF_ADD may already be in flight: retire under the same lock. */
+		wiphy_delayed_work_queue(wiphy, &cfg->awdl_timeout, 0);
 		return err;
 	}
 
@@ -688,31 +774,54 @@ void brcmf_cfg80211_awdl_attach_pending(struct brcmf_if *ifp)
 	struct brcmf_cfg80211_vif *vif;
 	int err;
 
-	if (!cfg || !cfg->awdl_pending)
+	if (!cfg)
 		return;
-	cfg->awdl_pending = false;
-	vif = ifp->vif;
+	spin_lock(&cfg->vif_event.vif_event_lock);
+	vif = cfg->awdl_vif;
+	if (!cfg->awdl_pending || cfg->awdl_attaching || !vif ||
+	    ifp->vif != vif) {
+		spin_unlock(&cfg->vif_event.vif_event_lock);
+		return;
+	}
+	cfg->awdl_attaching = true;
+	spin_unlock(&cfg->vif_event.vif_event_lock);
 
-	if (!ifp->ndev || !vif) {
-		bphy_err(ifp->drvr, "AWDL if event without netdev/vif\n");
-		goto done;
+	if (!ifp->ndev) {
+		bphy_err(ifp->drvr, "AWDL if event without netdev\n");
+		goto fail;
 	}
 
-	/* Must be set before brcmf_net_attach(), which picks netdev_ops. */
 	ifp->is_awdl = true;
 	strscpy(ifp->ndev->name, cfg->awdl_ifname, sizeof(ifp->ndev->name));
 	err = brcmf_net_attach(ifp, false);
 	if (err) {
 		bphy_err(ifp->drvr, "registering AWDL netdevice failed\n");
-		free_netdev(ifp->ndev);
-		brcmf_free_vif(vif);
-		goto done;
+		goto fail;
 	}
 
+	spin_lock(&cfg->vif_event.vif_event_lock);
+	cfg->awdl_vif = NULL;
+	WRITE_ONCE(cfg->awdl_pending, false);
+	cfg->awdl_attaching = false;
+	if (cfg->vif_event.vif == vif) {
+		cfg->vif_event.vif = NULL;
+		cfg->vif_event.action = 0;
+	}
+	spin_unlock(&cfg->vif_event.vif_event_lock);
 	brcmf_info("AWDL interface %s created (bsscfgidx %d)\n",
 		   ifp->ndev->name, ifp->bsscfgidx);
-done:
-	brcmf_cfg80211_arm_vif_event(cfg, NULL);
+	return;
+
+fail:
+	/* Do not free a vif while an event or wiphy operation can still see it. */
+	spin_lock(&cfg->vif_event.vif_event_lock);
+	if (cfg->pub->iflist[ifp->bsscfgidx] == ifp)
+		cfg->pub->iflist[ifp->bsscfgidx] = NULL;
+	cfg->awdl_failed_ifp = ifp;
+	cfg->vif_event.vif = NULL;
+	cfg->vif_event.action = 0;
+	spin_unlock(&cfg->vif_event.vif_event_lock);
+	wiphy_work_queue(cfg->wiphy, &cfg->awdl_cleanup);
 }
 
 /**
@@ -730,6 +839,9 @@ int brcmf_awdl_del_vif(struct wiphy *wiphy, struct wireless_dev *wdev)
 						      wdev);
 	struct brcmf_if *ifp = vif->ifp;
 	int err;
+
+	if (wdev->wiphy != wiphy || !ifp || !ifp->is_awdl)
+		return -ENODEV;
 
 	/* Asymmetric with the rest of brcmfmac on purpose, for the same reason
 	 * brcmf_awdl_add_vif() does not call brcmf_net_attach(): nl80211 calls
@@ -8711,6 +8823,8 @@ struct brcmf_cfg80211_info *brcmf_cfg80211_attach(struct brcmf_pub *drvr,
 	cfg->wiphy = wiphy;
 	cfg->pub = drvr;
 	init_vif_event(&cfg->vif_event);
+	wiphy_delayed_work_init(&cfg->awdl_timeout, brcmf_awdl_timeout);
+	wiphy_work_init(&cfg->awdl_cleanup, brcmf_awdl_cleanup);
 	INIT_LIST_HEAD(&cfg->vif_list);
 	cfg->force_band_setup = true;
 
