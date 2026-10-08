@@ -88,6 +88,7 @@
 
 #include "pgalloc-track.h"
 #include <linux/mm_subpage.h>
+#include "user-subpage-internal.h"
 
 #include "internal.h"
 #include "swap.h"
@@ -1325,6 +1326,98 @@ static inline struct folio *folio_prealloc(struct mm_struct *src_mm,
 }
 
 #ifdef CONFIG_MM_SUBPAGE
+/* Skipping a busy owner must not trigger an avoidable global or memcg OOM. */
+static struct folio *cow_subpage_speculative_folio(struct mm_struct *mm,
+		struct vm_area_struct *vma, unsigned long addr)
+{
+	gfp_t alloc_gfp = GFP_HIGHUSER_MOVABLE | __GFP_NORETRY | __GFP_NOWARN;
+	gfp_t charge_gfp = GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN;
+	unsigned int order = max_t(unsigned int, mm_page_shift(mm), PAGE_SHIFT) - PAGE_SHIFT;
+	struct folio *folio = vma_alloc_folio(alloc_gfp, order, vma, addr);
+
+	if (!folio)
+		return NULL;
+	if (mem_cgroup_charge(folio, mm, charge_gfp)) {
+		folio_put(folio);
+		return NULL;
+	}
+	folio_throttle_swaprate(folio, charge_gfp);
+	return folio;
+}
+
+/* The returned initialized slot owns a reference and has its folio locked. */
+static struct mm_subpage *cow_subpage_prealloc(struct mm_struct *mm,
+		struct vm_area_struct *vma, unsigned long addr,
+		struct mm_subpage *source, bool force_private, bool *pooled)
+{
+	struct mm_subpage_pool *pool;
+	struct mm_subpage *slot;
+	struct folio *folio;
+	unsigned int offset = vma_page_offset_at(vma, addr).offset;
+	int err;
+
+retry_private:
+	pool = force_private ? NULL : mm_subpage_cow_pool_get(mm, vma, addr);
+	*pooled = pool != NULL;
+	if (!pool)
+		pool = mm_subpage_pool_create_granule(GFP_KERNEL, mm_page_shift(mm));
+	if (!pool)
+		return ERR_PTR(-ENOMEM);
+	for (;;) {
+		slot = source ? mm_subpage_copy_at_locked(pool, source, offset) :
+			mm_subpage_alloc_at_locked(pool, offset);
+		if (!IS_ERR(slot) || PTR_ERR(slot) != -EAGAIN)
+			break;
+		folio = NULL;
+		if (*pooled) {
+			folio = cow_subpage_speculative_folio(mm, vma, addr);
+			if (!folio && mm_subpage_cow_wait_busy_at(pool, offset)) {
+				cond_resched();
+				continue;
+			}
+		}
+		/* No reusable owner exists after speculative allocation failed.
+		 * Ordinary allocation/charge semantics are now appropriate.
+		 */
+		if (!folio)
+			folio = folio_prealloc(mm, vma, addr, false);
+		if (!folio) {
+			slot = ERR_PTR(-ENOMEM);
+			break;
+		}
+		/* A concurrent cgroup move may change the fresh folio's charge. */
+		if (*pooled && !mm_subpage_cow_folio_matches(pool, folio)) {
+			folio_put(folio);
+			mm_subpage_pool_put(pool);
+			force_private = true;
+			goto retry_private;
+		}
+		err = mm_subpage_pool_add_folio_at(pool, folio, offset,
+			*pooled ? GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN : GFP_KERNEL);
+		if (*pooled && err == -ENOMEM) {
+			if (mm_subpage_cow_wait_busy_at(pool, offset)) {
+				folio_put(folio);
+				cond_resched();
+				continue;
+			}
+			err = mm_subpage_pool_add_folio_at(pool, folio, offset, GFP_KERNEL);
+		}
+		if (err) {
+			folio_put(folio);
+			if (err == -EEXIST) {
+				cond_resched();
+				continue;
+			}
+			slot = ERR_PTR(err);
+			break;
+		}
+	}
+	if (!*pooled)
+		mm_subpage_pool_close(pool);
+	mm_subpage_pool_put(pool);
+	return slot;
+}
+
 static struct mm_subpage *anon_subpage_prealloc(struct mm_struct *mm,
 		struct vm_area_struct *vma, unsigned long addr)
 {
@@ -4541,11 +4634,11 @@ static vm_fault_t wp_subpage_copy(struct vm_fault *vmf)
 	struct vm_area_struct *vma = vmf->vma;
 	struct mm_struct *mm = vma->vm_mm;
 	struct mm_subpage *source = NULL, *dest = NULL;
-	struct mm_subpage_pool *pool = NULL;
 	struct folio *old = vmf->page ? page_folio(vmf->page) : NULL;
 	struct folio *new = NULL;
 	struct mmu_notifier_range range;
 	bool copied = false, unshare = vmf->flags & FAULT_FLAG_UNSHARE;
+	bool force_private = false, pooled, fresh, retry_private = false;
 	unsigned int offset;
 	vm_fault_t ret = VM_FAULT_SIGBUS;
 	pte_t entry;
@@ -4598,35 +4691,29 @@ static vm_fault_t wp_subpage_copy(struct vm_fault *vmf)
 		goto out;
 	offset = vma_page_offset_at(vma, vmf->address).offset;
 	ret = VM_FAULT_OOM;
-	pool = mm_subpage_pool_create_granule(GFP_KERNEL, mm_page_shift(mm));
-	if (!pool)
-		goto out;
-	new = folio_prealloc(mm, vma, vmf->address, false);
-	if (!new)
-		goto out;
-	err = mm_subpage_pool_add_folio(pool, new, GFP_KERNEL);
-	if (err) {
-		folio_put(new);
-		goto out;
-	}
-	dest = source ? mm_subpage_copy_at(pool, source, offset) :
-		mm_subpage_alloc_at(pool, offset);
+retry_copy:
+	dest = cow_subpage_prealloc(mm, vma, vmf->address, source, force_private, &pooled);
 	if (IS_ERR(dest)) {
 		if (PTR_ERR(dest) == -EHWPOISON)
 			ret = VM_FAULT_HWPOISON;
 		dest = NULL;
 		goto out;
 	}
+	new = mm_subpage_folio(dest);
 	if (old && !source) {
 		err = copy_user_subpage_range(&new->page, offset, vmf->page,
 					pte_phys_mm(mm, vmf->orig_pte) & ~PAGE_MASK,
 					mm_page_size(mm));
 		if (err) {
+			folio_unlock(new);
 			ret = VM_FAULT_HWPOISON;
 			goto out;
 		}
 	}
-	mm_subpage_pool_close(pool);
+	/* Initialisation is complete; the slot reference prevents migration/free.
+	 * Do not carry a folio lock through MMU notifier callbacks.
+	 */
+	folio_unlock(new);
 	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, mm,
 				vmf->address, vmf->address + mm_page_size(mm));
 	mmu_notifier_invalidate_range_start(&range);
@@ -4634,6 +4721,19 @@ static vm_fault_t wp_subpage_copy(struct vm_fault *vmf)
 	folio_get(new);
 	folio_lock(new);
 	ret = 0;
+	/* A different fault may publish this owner's first PTE while we wait.
+	 * Only the first publisher establishes folio rmap/LRU. Preflight nonlinear
+	 * slot identity before taking PTL, with a fresh-folio fallback on ENOMEM.
+	 */
+	fresh = !mm_subpage_anon_root(dest);
+	if (!fresh) {
+		err = mm_subpage_bind_rmap(dest, vma, vmf->address);
+		if (err) {
+			ret = err == -ENOMEM ? VM_FAULT_OOM : VM_FAULT_SIGBUS;
+			retry_private = pooled && err == -ENOMEM;
+			goto unlock_folio;
+		}
+	}
 	vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);
 	if (!vmf->pte)
 		goto unlock_folio;
@@ -4642,7 +4742,8 @@ static vm_fault_t wp_subpage_copy(struct vm_fault *vmf)
 		goto unlock_pte;
 	}
 	mm_subpage_set_exclusive(dest);
-	err = mm_subpage_add_new_anon_rmap(dest, vma, vmf->address);
+	err = fresh ? mm_subpage_add_new_anon_rmap(dest, vma, vmf->address) :
+		mm_subpage_add_anon_rmap(dest, vma, vmf->address);
 	if (WARN_ON_ONCE(err)) {
 		ret = VM_FAULT_SIGBUS;
 		goto unlock_pte;
@@ -4660,7 +4761,8 @@ static vm_fault_t wp_subpage_copy(struct vm_fault *vmf)
 	flush_cache_page(vma, vmf->address, pte_pfn(vmf->orig_pte));
 	/* Break-before-make also orders removal of the old slot's rmap. */
 	ptep_clear_flush(vma, vmf->address, vmf->pte);
-	subpage_add_new_lru(new, vma, 1);
+	if (fresh)
+		subpage_add_new_lru(new, vma, 1);
 	set_pte_at(mm, vmf->address, vmf->pte, entry);
 	update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
 	if (source) {
@@ -4683,13 +4785,17 @@ unlock_folio:
 	folio_unlock(new);
 	folio_put(new);
 	mmu_notifier_invalidate_range_end(&range);
-out:
-	if (pool) {
-		mm_subpage_pool_close(pool);
-		if (dest)
-			mm_subpage_put(dest);
-		mm_subpage_pool_put(pool);
+	if (retry_private) {
+		mm_subpage_put(dest);
+		dest = NULL;
+		force_private = true;
+		retry_private = false;
+		ret = VM_FAULT_OOM;
+		goto retry_copy;
 	}
+out:
+	if (dest)
+		mm_subpage_put(dest);
 	if (source) {
 		if (copied)
 			mm_subpage_put(source); /* Retired PTE reference, after TLBI. */

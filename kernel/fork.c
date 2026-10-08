@@ -32,6 +32,7 @@
 #include <linux/completion.h>
 #include <linux/personality.h>
 #include <linux/mempolicy.h>
+#include <linux/mm_subpage.h>
 #include <linux/sem.h>
 #include <linux/file.h>
 #include <linux/fdtable.h>
@@ -1097,6 +1098,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	mm->map_count = 0;
 #ifdef CONFIG_MM_SUBPAGE
 	mm->committed_user_pages = 0;
+	mm->cow_subpage_pool = NULL;
 #endif
 	mm->locked_vm = 0;
 	atomic64_set(&mm->pinned_vm, 0);
@@ -1212,6 +1214,7 @@ static inline void __mmput(struct mm_struct *mm)
 	ksm_exit(mm);
 	khugepaged_exit(mm); /* must run before exit_mmap */
 	exit_mmap(mm);
+	mm_subpage_cow_pool_exit(mm);
 	mm_put_huge_zero_folio(mm);
 	set_mm_exe_file(mm, NULL);
 	if (!list_empty(&mm->mmlist)) {

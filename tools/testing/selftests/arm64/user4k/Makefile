@@ -2,7 +2,7 @@
 TEST_GEN_PROGS := page-contract proc-args
 TEST_GEN_PROGS_EXTENDED := iommufd-init coarse-shmem-init bpf-uptr-init vhost-log-init uprobes-init user-events-init uffd-move-init swap-fixture-init exec-fixture-init mixed-process memory-interfaces advice reclaim-advice proc-pages proc-memory core-fixture-init context-stress-init mlock-fixture-init lazyfree-fixture-init thread-fixture-init splice-fixture-init dio-fixture-init uring-fixture-init gem-fixture-init compat-fixture-init granule-proc-init granule-swap-init aslr-fixture-init cpu-granule-init user16k-smoke-init cpu-granule16-init granule-threeway-init compat-mlock-init mglru-granule-init memcg-pressure-init memcg-accounting-init runtime-app-init fex-contract-init exec-policy-init uffd-wp-init shmem-uffd-swap-init compat-uffd-init shmem-hole-init shmem-thp-init shmem-collapse-init shmem-pin-init shmem-race-init shmem-pressure-init
 TEST_GEN_PROGS_EXTENDED += vfio-fixture-init sysv-shm-init perf-ring-init
-TEST_GEN_PROGS_EXTENDED += aio-ring-init numa-policy-init numa-balancing-init
+TEST_GEN_PROGS_EXTENDED += aio-ring-init numa-policy-init numa-balancing-init cow-pool
 CFLAGS += -Wall -Wextra -O2 -ffixed-x18
 TEST_GEN_FILES += compat-probe-4k compat-probe-64k compat-probe-dynamic compat-interp32 compat-aslr-probe compat-mlock-probe
 TEST_GEN_FILES += fex-x86-contract libfex-abi.so compat-policy-probe compat-uffd-probe compat-vfio-probe
@@ -12,7 +12,7 @@ include ../../lib.mk
 
 $(OUTPUT)/page-contract: page-contract.c x18-probe.S
 
-$(OUTPUT)/thread-fixture-init $(OUTPUT)/user16k-smoke-init: LDLIBS += -pthread
+$(OUTPUT)/thread-fixture-init $(OUTPUT)/user16k-smoke-init $(OUTPUT)/cow-pool: LDLIBS += -pthread
 
 # Freestanding ELF32 probes exercise the compat ABI without an armhf sysroot.
 AARCH32_CC ?= clang --target=arm-linux-gnueabihf
