@@ -5,10 +5,12 @@
  * Copyright The Asahi Linux Contributors
  */
 
+#include <linux/debugfs.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/seq_file.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
@@ -21,6 +23,10 @@ struct apple_pmp_report_offsets {
 	u32 actual;
 	u32 status;
 };
+
+struct apple_pmp_report;
+
+static int apple_pmp_dvfs_create(struct apple_pmp_report *report);
 
 struct apple_pmp_report {
 	struct device *dev;
@@ -47,6 +53,10 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 		return PTR_ERR(rep->base);
 	rep->offsets = of_device_get_match_data(dev);
 	dev_set_drvdata(dev, rep);
+	ret = apple_pmp_dvfs_create(rep);
+	if (ret)
+		return ret;
+
 	ret = of_platform_populate(np, NULL, NULL, dev);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to create child devices\n");
@@ -133,6 +143,76 @@ static int apple_pmp_report_entry_power_on(struct generic_pm_domain *genpd)
 static int apple_pmp_report_entry_power_off(struct generic_pm_domain *genpd)
 {
 	return apple_pmp_report_set_state(genpd, false);
+}
+
+/* ADT DVFS-STATE: four 16-byte entries beginning at entry 8. */
+#define APPLE_PMP_DVFS_OFFSET	0x80
+#define APPLE_PMP_DVFS_STRIDE	16
+#define APPLE_PMP_DVFS_COUNT	4
+
+static int apple_pmp_dvfs_show(struct seq_file *seq, void *unused)
+{
+	struct apple_pmp_report *report = seq->private;
+	u64 values[APPLE_PMP_DVFS_COUNT][2];
+	unsigned int index;
+
+	if (!(readl(report->base + report->offsets->status) & PMP_REPORT_READY))
+		return -EAGAIN;
+
+	for (index = 0; index < ARRAY_SIZE(values); index++) {
+		void __iomem *entry = report->base + APPLE_PMP_DVFS_OFFSET +
+				     index * APPLE_PMP_DVFS_STRIDE;
+
+		values[index][0] = readq(entry);
+		values[index][1] = readq(entry + sizeof(values[index][0]));
+	}
+
+	if (!(readl(report->base + report->offsets->status) & PMP_REPORT_READY))
+		return -EAGAIN;
+
+	for (index = 0; index < ARRAY_SIZE(values); index++)
+		seq_printf(seq, "entry%u: 0x%016llx 0x%016llx\n", index + 8,
+			   values[index][0], values[index][1]);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(apple_pmp_dvfs);
+
+static void apple_pmp_dvfs_remove(void *directory)
+{
+	debugfs_remove_recursive(directory);
+}
+
+static int apple_pmp_dvfs_create(struct apple_pmp_report *report)
+{
+	struct device *dev = report->dev;
+	struct resource *resource;
+	struct dentry *directory;
+	char *name;
+	int ret;
+
+	if (!of_device_is_compatible(dev->of_node, "apple,t8140-pmp-v2-report"))
+		return 0;
+
+	resource = platform_get_resource(to_platform_device(dev), IORESOURCE_MEM, 0);
+	if (resource_size(resource) < APPLE_PMP_DVFS_OFFSET +
+				      APPLE_PMP_DVFS_COUNT * APPLE_PMP_DVFS_STRIDE)
+		return dev_err_probe(dev, -EINVAL, "DVFS report exceeds resource\n");
+
+	name = devm_kasprintf(dev, GFP_KERNEL, "apple-pmp-%s", dev_name(dev));
+	if (!name)
+		return -ENOMEM;
+
+	directory = debugfs_create_dir(name, NULL);
+	if (IS_ERR(directory))
+		return 0;
+
+	ret = devm_add_action_or_reset(dev, apple_pmp_dvfs_remove, directory);
+	if (ret)
+		return ret;
+
+	debugfs_create_file("dvfs", 0400, directory, report, &apple_pmp_dvfs_fops);
+	return 0;
 }
 
 static int apple_pmp_report_entry_probe(struct platform_device *pdev)
