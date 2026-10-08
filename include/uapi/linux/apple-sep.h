@@ -112,7 +112,7 @@ struct sep_bio_delete {
 struct sep_bio_attest {
 	__u32 sig_len;                              /* out: DER signature length */
 	__u8  challenge[SEP_BIO_CHALLENGE_LEN];  /* in */
-	__u8  public[SEP_BIO_ATTEST_PUB_LEN];    /* out: P-256 point, 04||X||Y */
+	__u8  public_key[SEP_BIO_ATTEST_PUB_LEN]; /* out: P-256 point, 04||X||Y */
 	__u8  signature[SEP_BIO_ATTEST_SIG_MAX]; /* out: DER SEQUENCE{r,s} */
 	__u8  reserved[3];
 };

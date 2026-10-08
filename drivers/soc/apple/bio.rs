@@ -149,7 +149,7 @@ pub(crate) struct Attest {
     /// in: challenge to sign.
     pub(crate) challenge: [u8; ATTEST_CHALLENGE_LEN],
     /// out: ref-key public point.
-    pub(crate) public: [u8; ATTEST_PUB_LEN],
+    pub(crate) public_key: [u8; ATTEST_PUB_LEN],
     /// out: DER signature, zero-padded to `ATTEST_SIG_MAX`.
     pub(crate) signature: [u8; ATTEST_SIG_MAX],
     pub(crate) reserved: [u8; 3],

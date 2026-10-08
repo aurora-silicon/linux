@@ -2948,11 +2948,11 @@ impl SepData {
         let mut out = bio::Attest {
             sig_len: sig.len() as u32,
             challenge: req.challenge,
-            public: [0u8; bio::ATTEST_PUB_LEN],
+            public_key: [0u8; bio::ATTEST_PUB_LEN],
             signature: [0u8; bio::ATTEST_SIG_MAX],
             reserved: [0u8; 3],
         };
-        out.public.copy_from_slice(&pubk);
+        out.public_key.copy_from_slice(&pubk);
         out.signature[..sig.len()].copy_from_slice(&sig);
         kernel::uaccess::UserSlice::new(user, core::mem::size_of::<bio::Attest>())
             .writer()
