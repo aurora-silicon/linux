@@ -1351,6 +1351,8 @@ impl Drop for Runtime {
             dev_err!(self.inner.drm.as_ref(), "G16G: ASC failed to stop; retaining runtime backing ({:?})\n", error);
             return;
         }
+        // SAFETY: no GPU work is pending, and stop_asc succeeded above.
+        unsafe { self.inner.uat.disarm_g16_flushes_after_stop() };
         dev_info!(self.inner.drm.as_ref(), "G16G: ASC stopped before RTKit transport cleanup\n");
         // SAFETY: ASC is stopped and any submitted engine work retired.
         // Incomplete or failed jobs retain Inner above. Callbacks drain before UAT and power are released.

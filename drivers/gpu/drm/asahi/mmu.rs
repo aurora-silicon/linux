@@ -2658,6 +2658,14 @@ impl Uat {
         Ok(())
     }
 
+    /// Cached firmware objects can be released after firmware ownership ends.
+    ///
+    /// # Safety
+    /// The 25G83 owner has verified ASC stopped and all submitted GPU work retired.
+    pub(crate) unsafe fn disarm_g16_flushes_after_stop(&self) {
+        self.inner.firmware_cache_flush_ready.store(false, Ordering::Release);
+    }
+
     /// The M3 runtime's UAT on the SoC of `cfg` (`m3_soc::Soc::hwcfg`).
     ///
     /// # Safety
