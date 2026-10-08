@@ -23,6 +23,9 @@ struct dcp_present_state_h17p {
 	bool accepted;
 	/* The firmware aborted the present before its submit reply. */
 	bool aborted;
+	/* The most recent aborted present, whose late completion is ignored. */
+	bool has_last_aborted;
+	u32 last_aborted;
 };
 
 static inline bool
@@ -64,7 +67,17 @@ dcp_present_abort_h17p(struct dcp_present_state_h17p *state, u32 swap_id)
 	} else {
 		state->aborted = true;
 	}
+	state->has_last_aborted = true;
+	state->last_aborted = swap_id;
 	return true;
+}
+
+/* Whether the firmware aborted @swap_id; a completion for it is stale. */
+static inline bool
+dcp_present_was_aborted_h17p(const struct dcp_present_state_h17p *state,
+			     u32 swap_id)
+{
+	return state->has_last_aborted && state->last_aborted == swap_id;
 }
 
 static inline bool

@@ -252,6 +252,18 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 #if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 	    !dcp_present_complete_h17p(&dcp->present_state_h17p, resp->swap_id)) {
+		/*
+		 * Abort semantics are not captured on H17P.  If an aborted
+		 * present completes after all, its framebuffers were already
+		 * unarmed and its event signalled; record it and carry on.
+		 */
+		if (dcp_present_was_aborted_h17p(&dcp->present_state_h17p,
+						 resp->swap_id)) {
+			dev_warn_ratelimited(dcp->dev,
+					     "completion for aborted present %u ignored\n",
+					     resp->swap_id);
+			return;
+		}
 		dev_err(dcp->dev, "unexpected present completion %u\n", resp->swap_id);
 		dcp->crashed = true;
 		return;
@@ -1398,7 +1410,8 @@ static bool dcp_present_submit(struct apple_dcp *dcp, u32 swap_id, bool accepted
 	/* An abort received before this reply turns acceptance into failure. */
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 	    accepted && dcp->present_state_h17p.aborted) {
-		dev_warn(dcp->dev, "firmware aborted present %u\n", swap_id);
+		dev_warn_ratelimited(dcp->dev, "firmware aborted present %u\n",
+				     swap_id);
 		return false;
 	}
 #endif
@@ -1866,15 +1879,18 @@ dcpep_cb_swap_complete_intent_gated(struct apple_dcp *dcp,
 static void dcp_present_aborted(struct apple_dcp *dcp, u32 swap_id)
 {
 	if (!dcp_present_abort_h17p(&dcp->present_state_h17p, swap_id)) {
-		dev_warn(dcp->dev, "abort for present %u, which is not in flight\n",
-			 swap_id);
+		dev_warn_ratelimited(dcp->dev,
+				     "abort for present %u, which is not in flight\n",
+				     swap_id);
 		return;
 	}
 	/* The submit reply has not arrived; it finishes the present. */
 	if (dcp->present_state_h17p.pending)
 		return;
 
-	dev_warn(dcp->dev, "firmware aborted present %u\n", swap_id);
+	dev_warn_ratelimited(dcp->dev, "firmware aborted present %u\n", swap_id);
+	/* No completion follows, so the swap watchdog must not wait for one. */
+	dcp_swap_watchdog_complete(dcp);
 	dcp_present_failed(dcp);
 	if (dcp_present_retires(dcp)) {
 		dcp_unarm_retained_framebuffers(dcp, swap_id);

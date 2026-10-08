@@ -104,9 +104,13 @@ static void h17p_present_abort_test(struct kunit *test)
 	KUNIT_ASSERT_TRUE(test, dcp_present_submit_h17p(&state, 7, true));
 	KUNIT_EXPECT_FALSE(test, dcp_present_abort_h17p(&state, 6));
 	KUNIT_EXPECT_TRUE(test, state.pending);
+	KUNIT_EXPECT_FALSE(test, dcp_present_was_aborted_h17p(&state, 7));
 	KUNIT_EXPECT_TRUE(test, dcp_present_abort_h17p(&state, 7));
 	KUNIT_EXPECT_FALSE(test, state.pending);
 	KUNIT_EXPECT_FALSE(test, dcp_present_complete_h17p(&state, 7));
+	/* A late completion for it is recognisable as stale, not unexpected. */
+	KUNIT_EXPECT_TRUE(test, dcp_present_was_aborted_h17p(&state, 7));
+	KUNIT_EXPECT_FALSE(test, dcp_present_was_aborted_h17p(&state, 6));
 	KUNIT_EXPECT_FALSE(test, dcp_present_abort_h17p(&state, 7));
 
 	/* An abort before the submit reply leaves the reply to finish it. */
@@ -123,8 +127,13 @@ static void h17p_present_abort_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, state.aborted);
 	KUNIT_ASSERT_TRUE(test, dcp_present_submit_h17p(&state, 9, true));
 	KUNIT_EXPECT_TRUE(test, state.pending);
+	/* A stale completion for 8 neither matches nor disturbs present 9. */
+	KUNIT_EXPECT_FALSE(test, dcp_present_complete_h17p(&state, 8));
+	KUNIT_EXPECT_TRUE(test, dcp_present_was_aborted_h17p(&state, 8));
+	KUNIT_EXPECT_TRUE(test, state.pending);
 	KUNIT_EXPECT_TRUE(test, dcp_present_complete_h17p(&state, 9));
 	KUNIT_EXPECT_FALSE(test, state.pending);
+	KUNIT_EXPECT_FALSE(test, dcp_present_was_aborted_h17p(&state, 9));
 }
 
 static struct kunit_case h17p_present_cases[] = {
