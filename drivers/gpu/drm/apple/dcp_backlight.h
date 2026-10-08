@@ -80,13 +80,17 @@ static inline int dcp_bl_init(struct dcp_backlight_state *state, u32 maximum,
 	return 0;
 }
 
-/* A decoded powerlog sample can seed takeover only before Linux control. */
+/*
+ * A decoded powerlog sample can seed takeover only before Linux control.
+ * It reports the level the panel shows, so the level is then known.
+ */
 static inline bool dcp_bl_seed(struct dcp_backlight_state *state, u32 nits)
 {
 	if (!state->ready || state->controlled || nits > state->maximum)
 		return false;
 	state->target = nits;
 	state->actual = nits;
+	state->level_known = true;
 	return true;
 }
 
