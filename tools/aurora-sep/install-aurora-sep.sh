@@ -3787,7 +3787,7 @@ install_all() {
   if [[ $chain == grub ]]; then
     echo "   The previous kernel stays in the GRUB menu as 'Previous kernel … before aurora-sep'."
   fi
-  echo "   To undo everything:    curl -fsSL $PUBLIC_RELEASE_URL/install-aurora-sep.sh | bash -s -- --uninstall"
+  echo "   To undo the kernel install: curl -fsSL $PUBLIC_RELEASE_URL/install-aurora-sep.sh | bash -s -- --uninstall"
   m3_next_steps
   # The kernel install is complete either way; 3 or 4: the M3 Pro's Mesa or its record.
   m3_pro_mesa_status || exit $?
