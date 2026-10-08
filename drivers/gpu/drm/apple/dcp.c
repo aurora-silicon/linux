@@ -2707,8 +2707,9 @@ void dcp_poweron(struct platform_device *pdev)
 			}
 			/* The powerlog takeover report normally precedes this. */
 			if (dcp_has_panel(dcp))
-				schedule_delayed_work(&dcp->bl_fallback_wq,
-						      DCP_BL_FALLBACK_DELAY);
+				queue_delayed_work(system_freezable_wq,
+						   &dcp->bl_fallback_wq,
+						   DCP_BL_FALLBACK_DELAY);
 		}
 		ret = dcp_backlight_dpms(dcp, true);
 		if (ret)
@@ -3836,15 +3837,24 @@ static void dcp_drain_for_sleep(struct apple_dcp *dcp)
 	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
 		return;
 
-	/* A completed present can schedule one more brightness present. */
-	for (pass = 0; pass < 2; pass++) {
+	/*
+	 * A completed present can schedule one more brightness present, and a
+	 * rejected one a delayed retry; run a pending retry now instead of
+	 * letting it fire after the mailbox has suspended.  Four passes cover
+	 * the first attempt and the policy's three retries.
+	 */
+	for (pass = 0; pass < 4; pass++) {
+		flush_delayed_work(&dcp->iomfb.backlight_retry);
 		if (dcp_has_panel(dcp))
 			flush_work(&dcp->bl_update_wq);
 		if (!iomfb_queue_drain(dcp, msecs_to_jiffies(500))) {
 			dev_warn(dcp->dev, "display updates still pending at suspend\n");
 			return;
 		}
+		if (!dcp_backlight_active(dcp) || !dcp_backlight_pending(dcp))
+			return;
 	}
+	dev_warn(dcp->dev, "brightness change still pending at suspend\n");
 }
 
 static int dcp_platform_suspend(struct device *dev)
