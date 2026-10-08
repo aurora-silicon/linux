@@ -3844,6 +3844,12 @@ static void dcp_drain_for_sleep(struct apple_dcp *dcp)
 	 * the first attempt and the policy's three retries.
 	 */
 	for (pass = 0; pass < 4; pass++) {
+		/*
+		 * A crashed or stopped DCP takes no more presents, so a level
+		 * still pending there can never be sent and is not waited for.
+		 */
+		if (READ_ONCE(dcp->crashed) || READ_ONCE(dcp->iomfb.stopped))
+			return;
 		flush_delayed_work(&dcp->iomfb.backlight_retry);
 		if (dcp_has_panel(dcp))
 			flush_work(&dcp->bl_update_wq);
