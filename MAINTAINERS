@@ -1985,9 +1985,12 @@ F:	arch/arm64/include/asm/apple-idle.h
 F:	arch/arm64/kernel/idle-apple.S
 F:	drivers/hid/dockchannel-hid/dockchannel-hid-protocol*
 F:	drivers/iio/common/aop_sensors/
+F:	drivers/pmdomain/apple/pmp-report.c
 F:	drivers/soc/apple/aop.rs
+F:	drivers/soc/apple/pmp.rs
 F:	drivers/thermal/apple-smc-cpu-thermal.c
 F:	drivers/tty/serial/apple_dockchannel*
+F:	include/linux/soc/apple/pmp-report.h
 F:	include/linux/soc/apple/smc-thermal.h
 F:	rust/kernel/iio/common/aop_sensors.rs
 F:	rust/kernel/soc/apple/aop.rs
