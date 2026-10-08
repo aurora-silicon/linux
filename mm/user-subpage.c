@@ -328,8 +328,8 @@ static void owner_free(struct mm_subpage_owner *owner, bool put_folio)
 		/* Last slot reference, or wholly unissued supply. */
 		folio_put(owner->folio);
 	}
-	if (owner->rmap) {
-		/* Historical roots can have no live VMA; their final put may sleep. */
+	if (owner->anon_root || owner->rmap) {
+		/* Any final anon-vma put can sleep, including a linear owner's. */
 		INIT_WORK(&owner->free_work, owner_free_work);
 		queue_work(system_unbound_wq, &owner->free_work);
 	} else {
