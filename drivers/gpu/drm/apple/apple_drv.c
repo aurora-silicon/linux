@@ -752,7 +752,7 @@ static void apple_drm_uninit(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
-	drm_dev_unregister(&apple->drm);
+	drm_dev_unplug(&apple->drm);
 	drm_atomic_helper_shutdown(&apple->drm);
 
 	component_unbind_all(dev, NULL);

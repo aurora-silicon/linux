@@ -4,6 +4,7 @@
 #include <linux/bitfield.h>
 #include <linux/debugfs.h>
 #include <linux/dma-mapping.h>
+#include <linux/err.h>
 #include <linux/kconfig.h>
 #include <linux/of_platform.h>
 #include <linux/slab.h>
@@ -54,13 +55,22 @@ static void afk_send(struct apple_dcp_afkep *ep, u64 message)
 	dcp_send_message(ep->dcp, ep->endpoint, message);
 }
 
+static void afk_release_context(void *data)
+{
+	struct apple_dcp_afkep *afkep = data;
+
+	afk_quiesce(afkep);
+	if (!afkep->dcp->retain_dma)
+		kfree(afkep);
+}
+
 struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 				 const struct apple_epic_service_ops *ops)
 {
 	struct apple_dcp_afkep *afkep;
 	int ret;
 
-	afkep = devm_kzalloc(dcp->dev, sizeof(*afkep), GFP_KERNEL);
+	afkep = kzalloc_obj(*afkep);
 	if (!afkep)
 		return ERR_PTR(-ENOMEM);
 
@@ -74,17 +84,30 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 		goto out_free_afkep;
 	}
 
-	// TODO: devm_ for wq
-
 	init_completion(&afkep->started);
 	init_completion(&afkep->stopped);
 	spin_lock_init(&afkep->lock);
+	ret = devm_add_action_or_reset(dcp->dev, afk_release_context, afkep);
+	if (ret)
+		return ERR_PTR(ret);
 
 	return afkep;
 
 out_free_afkep:
-	devm_kfree(dcp->dev, afkep);
+	kfree(afkep);
 	return ERR_PTR(ret);
+}
+
+void afk_quiesce(struct apple_dcp_afkep *afkep)
+{
+	if (IS_ERR_OR_NULL(afkep))
+		return;
+	if (afkep->wq) {
+		destroy_workqueue(afkep->wq);
+		afkep->wq = NULL;
+	}
+	debugfs_remove_recursive(afkep->debugfs_entry);
+	afkep->debugfs_entry = NULL;
 }
 
 void afk_shutdown(struct apple_dcp_afkep *afkep)
@@ -97,7 +120,7 @@ void afk_shutdown(struct apple_dcp_afkep *afkep)
 		dev_err(afkep->dcp->dev, "Timed out shutting down AFK endpoint %02x", afkep->endpoint);
 	}
 
-	destroy_workqueue(afkep->wq);
+	afk_quiesce(afkep);
 }
 
 int afk_start(struct apple_dcp_afkep *ep)
@@ -131,8 +154,11 @@ static void afk_getbuf(struct apple_dcp_afkep *ep, u64 message)
 		return;
 	}
 
-	ep->bfr = dmam_alloc_coherent(ep->dcp->dev, size, &ep->bfr_dma,
-				      GFP_KERNEL);
+	/* An unstopped adopted session owns this ring until the machine resets. */
+	if (READ_ONCE(ep->dcp->retain_dma))
+		ep->bfr = dma_alloc_coherent(ep->dcp->dev, size, &ep->bfr_dma, GFP_KERNEL);
+	else
+		ep->bfr = dmam_alloc_coherent(ep->dcp->dev, size, &ep->bfr_dma, GFP_KERNEL);
 	if (!ep->bfr) {
 		dev_err(ep->dcp->dev, "Failed to allocate %d bytes buffer\n",
 			size);
@@ -1010,6 +1036,9 @@ int afk_send_command(struct apple_epic_service *service, u8 type,
 	u16 tag;
 	struct apple_dcp_afkep *ep = service->ep;
 	DECLARE_COMPLETION_ONSTACK(completion);
+
+	if (READ_ONCE(ep->dcp->quiescing))
+		return -ENODEV;
 
 	rxbuf = dma_alloc_coherent(ep->dcp->dev, output_len, &rxbuf_dma,
 				   GFP_KERNEL);

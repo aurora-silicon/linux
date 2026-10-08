@@ -20,6 +20,7 @@
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
+#include <linux/property.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/string.h>
@@ -29,6 +30,7 @@
 #include <linux/workqueue.h>
 
 #include <drm/drm_fb_dma_helper.h>
+#include <drm/drm_drv.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_module.h>
@@ -45,6 +47,83 @@
 
 #define APPLE_DCP_COPROC_CPU_CONTROL	 0x44
 #define APPLE_DCP_COPROC_CPU_CONTROL_RUN BIT(4)
+
+struct dcp_session_ref {
+	struct list_head link;
+	struct device *dev;
+	struct iommu_group *group;
+};
+
+static LIST_HEAD(dcp_retained_sessions);
+static DEFINE_MUTEX(dcp_retained_sessions_lock);
+
+static bool dcp_session_retained(struct device *dev)
+{
+	struct dcp_session_ref *session;
+	bool retained = false;
+
+	mutex_lock(&dcp_retained_sessions_lock);
+	list_for_each_entry(session, &dcp_retained_sessions, link) {
+		if (dev_fwnode(session->dev) == dev_fwnode(dev)) {
+			retained = true;
+			break;
+		}
+	}
+	mutex_unlock(&dcp_retained_sessions_lock);
+	return retained;
+}
+
+static int dcp_pin_live_session(struct apple_dcp *dcp)
+{
+	struct dcp_session_ref *session;
+
+	if (!dcp->hw.adopt_live_session || dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G || dcp->retain_dma)
+		return 0;
+	session = kzalloc_obj(*session);
+	if (!session)
+		return -ENOMEM;
+
+	/* Keep the DMA device, domain usage and driver code valid until reset. */
+	session->dev = get_device(dcp->dev);
+	session->group = iommu_group_get(dcp->dev);
+	__module_get(THIS_MODULE);
+	WRITE_ONCE(dcp->retain_dma, true);
+	mutex_lock(&dcp_retained_sessions_lock);
+	list_add_tail(&session->link, &dcp_retained_sessions);
+	mutex_unlock(&dcp_retained_sessions_lock);
+	dev_info(dcp->dev, "live H17P DMA resources retained until reboot; rebind unsupported\n");
+	return 0;
+}
+
+static void dcp_release_dma_domain(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	if (!dcp->retain_dma)
+		iommu_device_unuse_default_domain(dcp->dev);
+}
+
+static void dcp_release_context(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	if (!dcp->retain_dma)
+		kfree(dcp);
+}
+
+static void dcp_release_rtkit(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	if (dcp->retain_dma) {
+		WRITE_ONCE(dcp->quiescing, true);
+		apple_rtkit_free_retaining_buffers(dcp->rtk);
+	} else {
+		apple_rtkit_free(dcp->rtk);
+	}
+	dcp->rtk = NULL;
+}
 
 #define DCP_BOOT_TIMEOUT msecs_to_jiffies(1000)
 
@@ -850,6 +929,9 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 	struct apple_dcp *dcp = cookie;
 	struct apple_dcp_afkep *ep;
 
+	if (READ_ONCE(dcp->quiescing))
+		return;
+
 	trace_dcp_recv_msg(dcp, endpoint, message);
 
 	/*
@@ -900,6 +982,9 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_size)
 {
 	struct apple_dcp *dcp = cookie;
+
+	if (READ_ONCE(dcp->quiescing))
+		return;
 
 	dcp->crashed = true;
 	dev_err(dcp->dev, "DCP has crashed\n");
@@ -1004,6 +1089,8 @@ static struct apple_rtkit_ops rtkit_ops = {
 
 void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
 {
+	if (READ_ONCE(dcp->quiescing))
+		return;
 	trace_dcp_send_msg(dcp, endpoint, message);
 	apple_rtkit_send_message(dcp->rtk, endpoint, message, NULL,
 				 true);
@@ -1639,6 +1726,10 @@ static void dcp_work_update_backlight(struct work_struct *work)
 
 static void dcp_release_piodma_iommu_dev(struct apple_dcp *dcp)
 {
+	if (dcp->retain_dma) {
+		WRITE_ONCE(dcp->quiescing, true);
+		return;
+	}
 	if (dcp->piodma) {
 		if (dcp->piodma_created)
 			of_platform_device_destroy(&dcp->piodma->dev, NULL);
@@ -2045,6 +2136,10 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	u32 cpu_ctrl;
 	int ret;
 
+	if (READ_ONCE(dcp->quiescing))
+		return dev_err_probe(dev, -EBUSY,
+				     "Live DCP session cannot be rebound; reboot required\n");
+
 	/* A timed-out prior session may still scan these mappings. */
 	mutex_lock(&dcp->swapped_out_fbs_lock);
 	ret = list_empty(&dcp->swapped_out_fbs) ? 0 : -EBUSY;
@@ -2162,12 +2257,19 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 			       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
 	}
 
-	dcp->rtk = devm_apple_rtkit_init(dev, dcp, "mbox", 0, &rtkit_ops);
+	/* Registering the mailbox can already expose RTKit buffer requests. */
+	ret = dcp_pin_live_session(dcp);
+	if (ret)
+		goto err_piodma;
+	dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0, &rtkit_ops);
 	if (IS_ERR(dcp->rtk)) {
 		ret = dev_err_probe(dev, PTR_ERR(dcp->rtk),
 				    "Failed to initialize RTKit\n");
 		goto err_piodma;
 	}
+	ret = devm_add_action_or_reset(dev, dcp_release_rtkit, dcp);
+	if (ret)
+		goto err_piodma;
 
 	if (dcp->hw.adopt_live_session)
 		dev_info(dev, "negotiating RTKit with the running DCP\n");
@@ -2194,6 +2296,34 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 
 	if (!dcp)
 		return;
+
+	if (dcp->retain_dma) {
+		/* No firmware stop is acknowledged: detach host users, never DMA. */
+		WRITE_ONCE(dcp->quiescing, true);
+		if (dcp->crtc && !dcp->drm_retained) {
+			drm_dev_get(dcp->crtc->base.dev);
+			dcp->drm_retained = true;
+		}
+		iomfb_queue_stop(dcp);
+		afk_quiesce(dcp->avep);
+		afk_quiesce(dcp->dptxep);
+		afk_quiesce(dcp->ibootep);
+		afk_quiesce(dcp->systemep);
+		afk_quiesce(dcp->dcpavservep);
+		if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
+			cancel_work_sync(&dcp->bl_register_wq);
+			cancel_work_sync(&dcp->bl_update_wq);
+		}
+		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+		cancel_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
+		cancel_work_sync(&dcp->vblank_wq);
+		if (dcp->connector)
+			cancel_work_sync(&dcp->connector->hotplug_wq);
+		if (dcp->typec_connector && dcp->typec_connector != dcp->connector)
+			cancel_work_sync(&dcp->typec_connector->hotplug_wq);
+		dev_warn(dev, "retaining live DCP DMA resources after unbind; reboot required\n");
+		return;
+	}
 
 	if (dcp->hdmi_hpd_irq)
 		disable_irq(dcp->hdmi_hpd_irq);
@@ -2261,6 +2391,9 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	u32 surf_en;
 	u32 mux_index;
 
+	if (dcp_session_retained(dev))
+		return dev_err_probe(dev, -EBUSY, "Previous live DCP session requires a reboot\n");
+
 	fw_compat = dcp_check_firmware_version(dev);
 	if (fw_compat == DCP_FIRMWARE_UNKNOWN)
 		return -ENODEV;
@@ -2274,9 +2407,12 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, -ENODEV, "Incompatible devicetree! "
 			"Use devicetree matching this kernel.\n");
 
-	dcp = devm_kzalloc(dev, sizeof(*dcp), GFP_KERNEL);
+	dcp = kzalloc_obj(*dcp);
 	if (!dcp)
 		return -ENOMEM;
+	ret = devm_add_action_or_reset(dev, dcp_release_context, dcp);
+	if (ret)
+		return ret;
 
 	INIT_LIST_HEAD(&dcp->swapped_out_fbs);
 	mutex_init(&dcp->swapped_out_fbs_lock);
@@ -2286,6 +2422,14 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	dcp->fw_compat = fw_compat;
 	dcp->dev = dev;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+
+	/* The domain use must survive driver-core DMA cleanup for a live session. */
+	ret = iommu_device_use_default_domain(dev);
+	if (ret)
+		return ret;
+	ret = devm_add_action_or_reset(dev, dcp_release_dma_domain, dcp);
+	if (ret)
+		return ret;
 	dcp->fixed_connector_type = dcp_connector_type_from_dt(dev->of_node);
 	dcp->connector_type = dcp->fixed_connector_type;
 	of_property_read_u32(dev->of_node, "apple,dcp-index", &dcp->index);
@@ -2556,6 +2700,7 @@ static const struct of_device_id of_match[] = {
 MODULE_DEVICE_TABLE(of, of_match);
 
 static struct platform_driver apple_platform_driver = {
+	.driver_managed_dma = true,
 	.probe		= dcp_platform_probe,
 	.remove		= dcp_platform_remove,
 	.shutdown	= dcp_platform_shutdown,

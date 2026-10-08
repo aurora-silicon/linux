@@ -180,6 +180,10 @@ struct apple_dcp_hw_data {
 
 /* TODO: move IOMFB members to its own struct */
 struct apple_dcp {
+	/* An adopted session has no confirmed firmware DMA stop boundary. */
+	bool retain_dma;
+	bool quiescing;
+	bool drm_retained;
 	struct device *dev;
 	struct platform_device *piodma;
 	bool piodma_created;
