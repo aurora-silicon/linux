@@ -95,10 +95,43 @@ static void h17p_callback_bounds_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, iomfb_validate_callback_h17p(IOMFB_MAX_CB, 0x0, 0x0));
 }
 
+static void h17p_present_abort_test(struct kunit *test)
+{
+	struct dcp_present_state_h17p state = {};
+
+	/* An abort after acceptance ends the present without a completion. */
+	KUNIT_ASSERT_TRUE(test, dcp_present_begin_h17p(&state, 7));
+	KUNIT_ASSERT_TRUE(test, dcp_present_submit_h17p(&state, 7, true));
+	KUNIT_EXPECT_FALSE(test, dcp_present_abort_h17p(&state, 6));
+	KUNIT_EXPECT_TRUE(test, state.pending);
+	KUNIT_EXPECT_TRUE(test, dcp_present_abort_h17p(&state, 7));
+	KUNIT_EXPECT_FALSE(test, state.pending);
+	KUNIT_EXPECT_FALSE(test, dcp_present_complete_h17p(&state, 7));
+	KUNIT_EXPECT_FALSE(test, dcp_present_abort_h17p(&state, 7));
+
+	/* An abort before the submit reply leaves the reply to finish it. */
+	KUNIT_ASSERT_TRUE(test, dcp_present_begin_h17p(&state, 8));
+	KUNIT_EXPECT_TRUE(test, dcp_present_abort_h17p(&state, 8));
+	KUNIT_EXPECT_TRUE(test, state.pending);
+	KUNIT_EXPECT_TRUE(test, state.aborted);
+	KUNIT_ASSERT_TRUE(test, dcp_present_submit_h17p(&state, 8, true));
+	KUNIT_EXPECT_FALSE(test, state.pending);
+	KUNIT_EXPECT_FALSE(test, dcp_present_complete_h17p(&state, 8));
+
+	/* The next present starts clean and completes normally. */
+	KUNIT_ASSERT_TRUE(test, dcp_present_begin_h17p(&state, 9));
+	KUNIT_EXPECT_FALSE(test, state.aborted);
+	KUNIT_ASSERT_TRUE(test, dcp_present_submit_h17p(&state, 9, true));
+	KUNIT_EXPECT_TRUE(test, state.pending);
+	KUNIT_EXPECT_TRUE(test, dcp_present_complete_h17p(&state, 9));
+	KUNIT_EXPECT_FALSE(test, state.pending);
+}
+
 static struct kunit_case h17p_present_cases[] = {
 	KUNIT_CASE(h17p_surface_wire_test),
 	KUNIT_CASE(h17p_opaque_x_parameter_test),
 	KUNIT_CASE(h17p_callback_bounds_test),
+	KUNIT_CASE(h17p_present_abort_test),
 	{}
 };
 

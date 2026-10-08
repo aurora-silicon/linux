@@ -1386,6 +1386,12 @@ static bool dcp_present_submit(struct apple_dcp *dcp, u32 swap_id, bool accepted
 		dcp->crashed = true;
 		return false;
 	}
+	/* An abort received before this reply turns acceptance into failure. */
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+	    accepted && dcp->present_state_h17p.aborted) {
+		dev_warn(dcp->dev, "firmware aborted present %u\n", swap_id);
+		return false;
+	}
 #endif
 	return true;
 }
@@ -1842,10 +1848,40 @@ dcpep_cb_swap_complete_intent_gated(struct apple_dcp *dcp,
 		info->width, info->height);
 }
 
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+/*
+ * An aborted H17P present never completes.  Finish it like a rejected one:
+ * keep the displaced framebuffers for the next completed present and signal
+ * the DRM event, so neither the queue nor userspace waits for a completion.
+ */
+static void dcp_present_aborted(struct apple_dcp *dcp, u32 swap_id)
+{
+	if (!dcp_present_abort_h17p(&dcp->present_state_h17p, swap_id)) {
+		dev_warn(dcp->dev, "abort for present %u, which is not in flight\n",
+			 swap_id);
+		return;
+	}
+	/* The submit reply has not arrived; it finishes the present. */
+	if (dcp->present_state_h17p.pending)
+		return;
+
+	dev_warn(dcp->dev, "firmware aborted present %u\n", swap_id);
+	dcp_present_failed(dcp);
+	if (dcp_present_retires(dcp)) {
+		dcp_unarm_retained_framebuffers(dcp, swap_id);
+		dcp_drm_crtc_vblank(dcp->crtc);
+	}
+}
+#endif
+
 static void
 dcpep_cb_abort_swap_ap_gated(struct apple_dcp *dcp, u32 *swap_id)
 {
 	trace_iomfb_abort_swap_ap_gated(dcp, *swap_id);
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		dcp_present_aborted(dcp, *swap_id);
+#endif
 }
 
 static struct dcpep_get_tiling_state_resp

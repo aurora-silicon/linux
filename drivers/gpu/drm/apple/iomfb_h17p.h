@@ -21,6 +21,8 @@ struct dcp_present_state_h17p {
 	u32 swap_id;
 	bool pending;
 	bool accepted;
+	/* The firmware aborted the present before its submit reply. */
+	bool aborted;
 };
 
 static inline bool
@@ -31,6 +33,7 @@ dcp_present_begin_h17p(struct dcp_present_state_h17p *state, u32 swap_id)
 	state->swap_id = swap_id;
 	state->pending = true;
 	state->accepted = false;
+	state->aborted = false;
 	return true;
 }
 
@@ -41,8 +44,26 @@ dcp_present_submit_h17p(struct dcp_present_state_h17p *state, u32 swap_id,
 	if (!state->pending || state->accepted || state->swap_id != swap_id)
 		return false;
 	state->accepted = accepted;
-	if (!accepted)
+	if (!accepted || state->aborted)
 		state->pending = false;
+	return true;
+}
+
+/*
+ * An aborted present never completes.  Before its submit reply, the abort is
+ * recorded and the reply ends the present instead.
+ */
+static inline bool
+dcp_present_abort_h17p(struct dcp_present_state_h17p *state, u32 swap_id)
+{
+	if (!state->pending || state->swap_id != swap_id)
+		return false;
+	if (state->accepted) {
+		state->pending = false;
+		state->accepted = false;
+	} else {
+		state->aborted = true;
+	}
 	return true;
 }
 
