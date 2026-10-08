@@ -110,7 +110,9 @@ static int apple_rtkit_management_send(struct apple_rtkit *rtk, u8 type,
 	ret = apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_MGMT, msg, NULL, false);
 
 	if (ret)
-		dev_err(rtk->dev, "RTKit: Failed to send management message: %d\n", ret);
+		dev_err(rtk->dev,
+			"RTKit: Failed to send management message type 0x%02x: %d\n",
+			type, ret);
 
 	return ret;
 }
@@ -154,7 +156,7 @@ abort_boot:
 
 static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 {
-	int i, ep;
+	int i, ep, ret;
 	u64 reply;
 	unsigned long bitmap = FIELD_GET(APPLE_RTKIT_MGMT_EPMAP_BITMAP, msg);
 	u32 base = FIELD_GET(APPLE_RTKIT_MGMT_EPMAP_BASE, msg);
@@ -195,7 +197,12 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		case APPLE_RTKIT_EP_TRACEKIT:
 			dev_dbg(rtk->dev,
 				"RTKit: Starting system endpoint 0x%02x\n", ep);
-			apple_rtkit_start_ep(rtk, ep);
+			ret = apple_rtkit_start_ep(rtk, ep);
+			if (ret) {
+				rtk->boot_result = ret;
+				complete_all(&rtk->epmap_completion);
+				return;
+			}
 			break;
 
 		default:
@@ -727,6 +734,7 @@ EXPORT_SYMBOL_GPL(apple_rtkit_has_endpoint);
 int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 {
 	u64 msg;
+	int ret;
 
 	if (!test_bit(endpoint, rtk->endpoints))
 		return -EINVAL;
@@ -736,9 +744,14 @@ int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 
 	msg = FIELD_PREP(APPLE_RTKIT_MGMT_STARTEP_EP, endpoint);
 	msg |= APPLE_RTKIT_MGMT_STARTEP_FLAG;
-	apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_STARTEP, msg);
-
-	return 0;
+	ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_STARTEP, msg);
+	/* A mailbox FIFO timeout returns before either message word is written. */
+	if (ret == -ETIMEDOUT) {
+		dev_warn(rtk->dev, "RTKit: Retrying unsent endpoint start 0x%02x\n",
+			 endpoint);
+		ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_STARTEP, msg);
+	}
+	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_start_ep);
 
