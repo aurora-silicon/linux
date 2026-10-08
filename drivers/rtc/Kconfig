@@ -2100,6 +2100,17 @@ config RTC_DRV_WILCO_EC
 	  This can also be built as a module. If so, the module will
 	  be named "rtc_wilco_ec".
 
+config RTC_DRV_APPLE_PMU
+	tristate "Apple J700 Baku PMU RTC alarm"
+	depends on ARCH_APPLE && NVMEM_APPLE_SPMI && PM_SLEEP
+	help
+	  Read the Baku PMU clock and use alarms with retained-power
+	  suspend-to-idle. The module requires experimental=1. Alarms are
+	  limited to one hour; deeper suspend states are not supported.
+	  Continue setting the shared clock through the SMC RTC.
+
+	  This driver can be built as the module rtc-apple-pmu.
+
 config RTC_DRV_MACSMC
 	tristate "Apple Mac System Management Controller RTC"
 	depends on MFD_MACSMC
