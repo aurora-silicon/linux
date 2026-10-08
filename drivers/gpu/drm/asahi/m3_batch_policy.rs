@@ -13,6 +13,11 @@ pub(crate) fn pending_position(urgencies: impl Iterator<Item=u8>, incoming:u8) -
     len
 }
 
+/// Compare waiting work with the running batch, not the sorted pending head.
+pub(crate) fn urgent_waiting(urgencies: impl Iterator<Item=u8>, active:u8) -> bool {
+    urgencies.into_iter().any(|p|p>active)
+}
+
 pub(crate) const fn may_join(render:bool, next:usize, same_vm:bool, same_urgency:bool) -> bool {
     render && next==0 && same_vm && same_urgency
 }

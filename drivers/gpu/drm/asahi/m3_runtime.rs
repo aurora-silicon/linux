@@ -235,7 +235,8 @@ impl Inner {
         let Some(room)=policy::pipeline_room(crate::m3_params::pipeline_depth(self.device.soc()),
             self.active.len(),in_flight,last.base,last.entries.len()) else {return Ok(None);};
         // Yield at the next retirement when more urgent work is already waiting.
-        if self.pending.iter().any(|(p,_)|p.urgency>packet.urgency) {return Ok(None);}
+        if policy::urgent_waiting(self.pending.iter().map(|(p,_)|p.urgency),
+            last.entries[0].0.urgency) {return Ok(None);}
         if !policy::within_budget(self.pass_cost.get(packet.vm.id()),
             crate::m3_params::render_batch_budget_ns(self.device.soc()),in_flight) {return Ok(None);}
         if !policy::overlap_ready(self.render_initialized,true,true,true,

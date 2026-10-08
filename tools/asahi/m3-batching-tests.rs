@@ -26,6 +26,11 @@ fn priority_fifo_and_partial_packet_yields() {
     assert!(!may_join(true,0,false,true));
     assert!(!may_join(false,0,true,true));
     assert!(may_join(true,0,true,true));
+    // A sorted pending head cannot detect its own urgency advantage. Compare
+    // with the active batch so same-VM urgent work also stops extending it.
+    assert!(urgent_waiting([3,0].into_iter(),0));
+    assert!(!urgent_waiting([3,0].into_iter(),3));
+    assert!(!urgent_waiting([0,0].into_iter(),0));
 }
 
 #[test]
