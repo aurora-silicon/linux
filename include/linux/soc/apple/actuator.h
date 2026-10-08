@@ -19,7 +19,7 @@ static inline bool apple_taptic_is_actuator(struct hid_device *hdev)
 	       !strcmp(hdev->name, "Apple SPI Actuator");
 }
 
-#if IS_REACHABLE(CONFIG_HID_APPLE_MTP_HAPTIC)
+#if IS_ENABLED(CONFIG_HID_APPLE_MTP_HAPTIC)
 int apple_taptic_send(struct hid_device *hdev, u16 effect_type, u8 strength, u8 softness);
 int apple_taptic_switch_modes(struct hid_device *hdev, bool host_controlled);
 

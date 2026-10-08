@@ -1402,7 +1402,7 @@ static int magicmouse_input_mapping(struct hid_device *hdev,
 static int magicmouse_init_haptics(struct magicmouse_sc *msc,
 				   struct hid_device *hdev);
 
-#if IS_REACHABLE(CONFIG_HID_APPLE_MTP_HAPTIC)
+#if IS_ENABLED(CONFIG_HID_APPLE_MTP_HAPTIC)
 static int match_actuator(struct device *dev, const void *data)
 {
 	struct hid_device *hdev;
@@ -1880,7 +1880,7 @@ static void magicmouse_battery_timer_tick(struct timer_list *t)
 	}
 }
 
-#if IS_REACHABLE(CONFIG_HID_APPLE_MTP_HAPTIC)
+#if IS_ENABLED(CONFIG_HID_APPLE_MTP_HAPTIC)
 static bool magicmouse_effect_is_deep(const struct ff_effect *effect)
 {
 	return effect->u.haptic.hid_usage ==
