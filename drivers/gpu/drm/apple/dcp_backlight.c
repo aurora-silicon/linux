@@ -224,6 +224,17 @@ bool dcp_backlight_pending(struct apple_dcp *dcp)
 	return pending;
 }
 
+unsigned int dcp_backlight_retry_delay(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	unsigned int delay;
+
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	delay = dcp_bl_retry_delay(&dcp->backlight.state);
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	return delay;
+}
+
 #define SCALE_FACTOR (1 << 10)
 
 static u32 interpolate(int val, int min, int max, u32 *tbl, size_t tbl_size)

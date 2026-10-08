@@ -244,8 +244,20 @@ static void iomfb_queue_advance(struct apple_dcp *dcp)
 		if (transaction->brightness_only)
 			dcp->iomfb.backlight_queued = false;
 		/* A new level requested during a successful present stays pending. */
-		if (transaction->completed && dcp_backlight_pending(dcp))
-			schedule_work(&dcp->bl_update_wq);
+		if (dcp_backlight_pending(dcp)) {
+			if (transaction->completed) {
+				schedule_work(&dcp->bl_update_wq);
+			} else if (transaction->backlight_failed) {
+				unsigned int delay = dcp_backlight_retry_delay(dcp);
+
+				if (delay)
+					mod_delayed_work(system_wq, &dcp->iomfb.backlight_retry,
+							 msecs_to_jiffies(delay));
+				else
+					dev_warn_ratelimited(dcp->dev,
+							     "backlight retry limit reached\n");
+			}
+		}
 		transaction->release(transaction);
 	}
 	if (iomfb_enqueue_opaque_x(dcp)) {
@@ -340,12 +352,23 @@ void iomfb_opaque_x_reset_h17p(struct apple_dcp *dcp)
 	atomic_set(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_WAITING);
 }
 
+static void iomfb_backlight_retry(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work), struct apple_dcp,
+					  iomfb.backlight_retry);
+
+	if (!READ_ONCE(dcp->crashed) && !READ_ONCE(dcp->iomfb.stopped) &&
+	    dcp_backlight_pending(dcp))
+		schedule_work(&dcp->bl_update_wq);
+}
+
 void iomfb_queue_init(struct apple_dcp *dcp)
 {
 	mutex_init(&dcp->iomfb.lock);
 	INIT_LIST_HEAD(&dcp->iomfb.pending);
 	INIT_WORK(&dcp->iomfb.work, iomfb_queue_work);
 	INIT_DELAYED_WORK(&dcp->iomfb.timeout, iomfb_queue_timeout);
+	INIT_DELAYED_WORK(&dcp->iomfb.backlight_retry, iomfb_backlight_retry);
 	atomic_set(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_WAITING);
 }
 
@@ -360,6 +383,7 @@ void iomfb_queue_stop(struct apple_dcp *dcp)
 	mutex_unlock(&dcp->iomfb.lock);
 	cancel_work_sync(&dcp->iomfb.work);
 	cancel_delayed_work_sync(&dcp->iomfb.timeout);
+	cancel_delayed_work_sync(&dcp->iomfb.backlight_retry);
 }
 
 int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction)
@@ -1103,6 +1127,7 @@ void iomfb_present_failed_h17p(struct apple_dcp *dcp)
 	if (transaction && transaction->backlight_reserved) {
 		dcp_backlight_complete(dcp, transaction->backlight.sequence, false);
 		transaction->backlight_reserved = false;
+		transaction->backlight_failed = true;
 	}
 }
 

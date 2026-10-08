@@ -15,6 +15,7 @@ struct dcp_backlight_state {
 	u32 actual;
 	u32 sent_nits;
 	u64 sequence;
+	u8 retries;
 	bool ready;
 	bool controlled;
 	bool dpms_off;
@@ -89,6 +90,7 @@ static inline int dcp_bl_request(struct dcp_backlight_state *state, u32 nits,
 	if (nits > state->maximum)
 		return -ERANGE;
 	state->controlled = true;
+	state->retries = 0;
 	if (state->target != nits || state->core_blank != core_blank ||
 	    state->suspended != suspended) {
 		state->target = nits;
@@ -104,6 +106,7 @@ static inline int dcp_bl_dpms(struct dcp_backlight_state *state, bool on)
 	if (!state->ready)
 		return -ENODATA;
 	state->controlled = true;
+	state->retries = 0;
 	if (state->dpms_off != !on) {
 		state->dpms_off = !on;
 		state->dirty = true;
@@ -147,11 +150,24 @@ static inline bool dcp_bl_complete(struct dcp_backlight_state *state,
 	if (!state->in_flight || sequence != state->sequence)
 		return false;
 	state->in_flight = false;
-	if (accepted)
+	if (accepted) {
 		state->actual = state->sent_nits;
-	else
+		state->retries = 0;
+	} else {
 		state->dirty = true;
+		if (state->retries < 4)
+			state->retries++;
+	}
 	return true;
+}
+
+/* Three deferred retries per user request; a permanent rejection stays dirty. */
+static inline unsigned int dcp_bl_retry_delay(const struct dcp_backlight_state *state)
+{
+	if (!state->ready || !state->dirty || state->in_flight ||
+	    !state->retries || state->retries > 3)
+		return 0;
+	return 100U << (state->retries - 1);
 }
 
 struct apple_dcp;
@@ -173,5 +189,6 @@ int dcp_backlight_prepare(struct apple_dcp *dcp, bool have_surface,
 			  struct dcp_backlight_present *present);
 bool dcp_backlight_complete(struct apple_dcp *dcp, u64 sequence, bool accepted);
 bool dcp_backlight_pending(struct apple_dcp *dcp);
+unsigned int dcp_backlight_retry_delay(struct apple_dcp *dcp);
 
 #endif /* __APPLE_DCP_BACKLIGHT_H__ */

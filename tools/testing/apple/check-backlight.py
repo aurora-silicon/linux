@@ -71,7 +71,7 @@ struct dcp_present_h17p { u8 swap[0x588];u8 guard[32]; };
 struct dcp_swap_submit_req_h17p { u8 surf_null[SWAP_SURFACES]; };
 struct iomfb_transaction {
     struct dcp_backlight_present backlight;
-    bool backlight_reserved,brightness_only,completed;
+    bool backlight_reserved,backlight_failed,brightness_only,completed;
 };
 struct apple_dcp {
     int fw_compat;struct { int iomfb_method_profile; } hw;
