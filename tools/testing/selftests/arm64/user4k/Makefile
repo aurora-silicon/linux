@@ -14,6 +14,8 @@ TEST_GEN_PROGS_EXTENDED += same-quarter file-cow-consumers same-native
 TEST_FILES += README.any-quarter check-any-quarter.py
 TEST_GEN_PROGS_EXTENDED += first-write clipped-firstwrite
 TEST_FILES += README.first-write
+TEST_GEN_PROGS_EXTENDED += pinned-fork
+TEST_FILES += README.pinned-fork
 include ../../lib.mk
 
 $(OUTPUT)/page-contract: page-contract.c x18-probe.S
