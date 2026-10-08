@@ -433,6 +433,7 @@ impl Completion {
 
     /// Exact retirement permits the physical lease and VM pin to be released
     /// before waking userspace. A failure fence alone never establishes this.
+    #[track_caller]
     pub(crate) fn complete(&self, result: Result<[u64; 4]>) {
         if self.signalled.swap(true, Ordering::AcqRel) {
             return;
@@ -453,6 +454,7 @@ impl Completion {
     }
 
     /// A rejected, never-published command cannot poison the VM for contention.
+    #[track_caller]
     pub(crate) fn fail_unpublished(&self, error: Error) {
         if self.signalled.swap(true, Ordering::AcqRel) {
             return;
@@ -468,6 +470,7 @@ impl Completion {
 
     /// The physical queue must already be quarantined. Keep mappings pinned while
     /// waking waiters, even if queue destruction requested cancellation.
+    #[track_caller]
     pub(crate) fn fail_while_owned(&self, error: Error) {
         if self.signalled.swap(true, Ordering::AcqRel) {
             return;
