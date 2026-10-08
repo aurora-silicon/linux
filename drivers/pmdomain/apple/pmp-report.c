@@ -884,7 +884,8 @@ int apple_pmp_report_wait_ready(struct device_node *entry, unsigned long timeout
 		return -EINVAL;
 	}
 	/* Only M3 reports publish state under the startup lifetime lock. */
-	if (!of_device_is_compatible(parent, "apple,t6030-pmp-v2-report")) {
+	if (!of_device_is_compatible(parent, "apple,t6030-pmp-v2-report") &&
+	    !of_device_is_compatible(parent, "apple,t8122-pmp-v2-report")) {
 		of_node_put(parent);
 		return -EINVAL;
 	}
@@ -902,6 +903,10 @@ int apple_pmp_report_wait_ready(struct device_node *entry, unsigned long timeout
 		}
 		if (rep->stopping) {
 			ret = -ENODEV;
+			goto out_put;
+		}
+		if (!rep->offsets->starts_pmp) {
+			ret = -EINVAL;
 			goto out_put;
 		}
 		rep->waiters++;
