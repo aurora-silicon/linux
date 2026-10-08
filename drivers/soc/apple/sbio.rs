@@ -232,7 +232,9 @@ impl SepData {
         let filed = {
             let mut session = self.bio_session.lock();
             let mut index = self.bio_index.lock();
-            bio::enrol_finish(&mut session, &mut index, outcome)
+            bio::enrol_finish(
+                &mut session, self.capture_epoch.load(Relaxed), &mut index, outcome,
+            )
         };
         if !filed {
             return;
@@ -1357,7 +1359,7 @@ impl SepData {
         let mut identity: Option<[u8; bio::UUID_LEN]> = None;
 
         let outcome = loop {
-            if !bio::enrol_is_live(&self.bio_session.lock()) {
+            if !bio::enrol_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed)) {
                 break None;
             }
             if counter >= ENROL_MAX_CAPTURES {
@@ -1374,6 +1376,7 @@ impl SepData {
                     counter = counter.saturating_add(1);
                     let woke = bio::enrol_advance(
                         &mut self.bio_session.lock(),
+                        self.capture_epoch.load(Relaxed),
                         stage,
                         percent,
                         bio::Guidance::LiftAndMove,
@@ -1395,7 +1398,10 @@ impl SepData {
                     // The capture did not take (partial/unusable contact). Nudge
                     // the person to hold still and press again rather than
                     // silently re-capturing with no feedback.
-                    if bio::capture_guide(&mut self.bio_session.lock(), bio::Guidance::HoldStill) {
+                    if bio::capture_guide(
+                        &mut self.bio_session.lock(), self.capture_epoch.load(Relaxed),
+                        bio::Guidance::HoldStill,
+                    ) {
                         self.bio_wake();
                     }
                 }
@@ -2025,7 +2031,7 @@ impl SepData {
         );
         let mut attempt: u32 = 0;
         loop {
-            if !bio::capture_is_live(&self.bio_session.lock()) {
+            if !bio::capture_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed)) {
                 return CaptureWait::Abandon;
             }
 
@@ -2050,7 +2056,9 @@ impl SepData {
                 _ => None,
             };
             if let Some(guide) = guide {
-                if bio::capture_guide(&mut self.bio_session.lock(), guide) {
+                if bio::capture_guide(
+                    &mut self.bio_session.lock(), self.capture_epoch.load(Relaxed), guide,
+                ) {
                     self.bio_wake();
                 }
             }
@@ -2375,15 +2383,24 @@ impl SepData {
     }
 
     pub(crate) fn queue_enrolment(this: Arc<SepData>) {
+        let Some(epoch) = bio::queued_epoch(&this.bio_session.lock()) else {
+            return;
+        };
+        this.capture_epoch.store(epoch, Relaxed);
         if workqueue::system()
             .enqueue::<Arc<SepData>, ENROL_WORK_ID>(this.clone())
             .is_err()
         {
             this.finish_enrolment(Err(ENROL_STATUS_SENSOR));
+            bio::worker_stopped(&mut this.bio_session.lock(), epoch);
         }
     }
 
     pub(crate) fn queue_verify(this: Arc<SepData>) {
+        let Some(epoch) = bio::queued_epoch(&this.bio_session.lock()) else {
+            return;
+        };
+        this.capture_epoch.store(epoch, Relaxed);
         if workqueue::system()
             .enqueue::<Arc<SepData>, VERIFY_WORK_ID>(this.clone())
             .is_err()
@@ -2392,11 +2409,14 @@ impl SepData {
                 bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR),
                 [0u8; bio::TOKEN_LEN],
             );
+            bio::worker_stopped(&mut this.bio_session.lock(), epoch);
         }
     }
 
     fn finish_verify(&self, outcome: bio::VerifyOutcome, token_bytes: [u8; bio::TOKEN_LEN]) {
-        let filed = bio::verify_finish(&mut self.bio_session.lock(), outcome, token_bytes);
+        let filed = bio::verify_finish(
+            &mut self.bio_session.lock(), self.capture_epoch.load(Relaxed), outcome, token_bytes,
+        );
         if filed {
             self.bio_wake();
         }

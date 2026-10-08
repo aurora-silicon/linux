@@ -659,6 +659,7 @@ struct SepData {
     registered: Atomic<bool>,
 
     shutting_down: Atomic<bool>,
+    capture_epoch: Atomic<u64>,
 
     #[pin]
     rx_work: Work<SepData>,
@@ -824,6 +825,7 @@ impl SepData {
                 settle_idle_ticks: Atomic::new(0),
                 registered: Atomic::new(false),
                 shutting_down: Atomic::new(false),
+                capture_epoch: Atomic::new(0),
                 rx_work <- new_work!("SepData::rx_work"),
                 enrol_work <- new_work!("SepData::enrol_work"),
                 verify_work <- new_work!("SepData::verify_work"),
@@ -2114,10 +2116,11 @@ impl WorkItem<ENROL_WORK_ID> for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
-        if this.shutting_down.load(Relaxed) {
-            return;
+        let epoch = this.capture_epoch.load(Relaxed);
+        if !this.shutting_down.load(Relaxed) {
+            this.run_enrolment();
         }
-        this.run_enrolment();
+        bio::worker_stopped(&mut this.bio_session.lock(), epoch);
     }
 }
 
@@ -2125,10 +2128,11 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
-        if this.shutting_down.load(Relaxed) {
-            return;
+        let epoch = this.capture_epoch.load(Relaxed);
+        if !this.shutting_down.load(Relaxed) {
+            this.run_verify();
         }
-        this.run_verify();
+        bio::worker_stopped(&mut this.bio_session.lock(), epoch);
     }
 }
 

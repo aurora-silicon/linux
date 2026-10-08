@@ -417,6 +417,8 @@ impl Op {
 }
 
 pub(crate) struct Session {
+    generation: u64,
+    worker_epoch: Option<u64>,
     open: bool,
     op: Op,
     unseen: bool,
@@ -427,6 +429,8 @@ pub(crate) struct Session {
 impl Session {
     pub(crate) fn new() -> Session {
         Session {
+            generation: 0,
+            worker_epoch: None,
             open: false,
             op: Op::Idle,
             unseen: false,
@@ -436,11 +440,21 @@ impl Session {
     }
 
     fn reset(&mut self) {
+        self.generation = self.generation.saturating_add(1);
         self.open = false;
         self.op = Op::Idle;
         self.unseen = false;
         self.enrol_stage_unseen = false;
         self.token = None;
+    }
+
+    fn start_worker(&mut self) -> Result<()> {
+        if self.worker_epoch.is_some() {
+            return Err(EBUSY);
+        }
+        self.generation = self.generation.checked_add(1).ok_or(EOVERFLOW)?;
+        self.worker_epoch = Some(self.generation);
+        Ok(())
     }
 
     pub(crate) fn ready(&self) -> bool {
@@ -560,7 +574,7 @@ fn enrol_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     }
     require_sensor(ctx.sensor_present)?;
 
-    if !ctx.session.op.may_start() {
+    if ctx.session.worker_epoch.is_some() || !ctx.session.op.may_start() {
         return Err(EBUSY);
     }
     if matches!(ctx.live_identity_count, Some(count) if count >= SEP_USER_CAPACITY)
@@ -569,6 +583,7 @@ fn enrol_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         return Err(ENOSPC);
     }
 
+    ctx.session.start_worker()?;
     ctx.session.op = Op::Enrol {
         label: request.label,
         stage: 0,
@@ -590,10 +605,14 @@ fn enrol_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
 
 pub(crate) fn enrol_advance(
     session: &mut Session,
+    epoch: u64,
     completed: u32,
     percent_now: u32,
     guide: Guidance,
 ) -> bool {
+    if !worker_is_current(session, epoch) {
+        return false;
+    }
     if let Op::Enrol {
         stage,
         terminal,
@@ -614,7 +633,10 @@ pub(crate) fn enrol_advance(
     false
 }
 
-pub(crate) fn capture_guide(session: &mut Session, guide: Guidance) -> bool {
+pub(crate) fn capture_guide(session: &mut Session, epoch: u64, guide: Guidance) -> bool {
+    if !worker_is_current(session, epoch) {
+        return false;
+    }
     let changed = match &mut session.op {
         Op::Enrol { terminal, guidance, .. } => {
             if terminal.is_none() && *guidance != guide {
@@ -642,9 +664,13 @@ pub(crate) fn capture_guide(session: &mut Session, guide: Guidance) -> bool {
 
 pub(crate) fn enrol_finish(
     session: &mut Session,
+    epoch: u64,
     index: &mut IdentityIndex,
     outcome: core::result::Result<[u8; UUID_LEN], u32>,
 ) -> bool {
+    if !worker_is_current(session, epoch) {
+        return false;
+    }
     let Op::Enrol {
         label, terminal, ..
     } = &mut session.op
@@ -670,8 +696,8 @@ pub(crate) fn enrol_finish(
     true
 }
 
-pub(crate) fn enrol_is_live(session: &Session) -> bool {
-    matches!(&session.op, Op::Enrol { terminal: None, .. }) && session.open
+pub(crate) fn enrol_is_live(session: &Session, epoch: u64) -> bool {
+    worker_is_current(session, epoch) && matches!(&session.op, Op::Enrol { terminal: None, .. })
 }
 
 fn enrol_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
@@ -732,7 +758,7 @@ fn verify_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     }
     require_sensor(ctx.sensor_present)?;
 
-    if !ctx.session.op.may_start() {
+    if ctx.session.worker_epoch.is_some() || !ctx.session.op.may_start() {
         return Err(EBUSY);
     }
 
@@ -754,6 +780,7 @@ fn verify_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         });
     }
 
+    ctx.session.start_worker()?;
     ctx.session.token = None;
     ctx.session.op = Op::Verify {
         nonce: request.nonce,
@@ -772,9 +799,13 @@ fn verify_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
 
 pub(crate) fn verify_finish(
     session: &mut Session,
+    epoch: u64,
     outcome: VerifyOutcome,
     token_bytes: [u8; TOKEN_LEN],
 ) -> bool {
+    if !worker_is_current(session, epoch) {
+        return false;
+    }
     let Op::Verify { nonce, terminal, .. } = &mut session.op else {
         return false;
     };
@@ -793,12 +824,26 @@ pub(crate) fn verify_finish(
     true
 }
 
-pub(crate) fn verify_is_live(session: &Session) -> bool {
-    matches!(&session.op, Op::Verify { terminal: None, .. }) && session.open
+pub(crate) fn verify_is_live(session: &Session, epoch: u64) -> bool {
+    worker_is_current(session, epoch) && matches!(&session.op, Op::Verify { terminal: None, .. })
 }
 
-pub(crate) fn capture_is_live(session: &Session) -> bool {
-    enrol_is_live(session) || verify_is_live(session)
+pub(crate) fn capture_is_live(session: &Session, epoch: u64) -> bool {
+    enrol_is_live(session, epoch) || verify_is_live(session, epoch)
+}
+
+pub(crate) fn queued_epoch(session: &Session) -> Option<u64> {
+    session.worker_epoch
+}
+
+fn worker_is_current(session: &Session, epoch: u64) -> bool {
+    session.open && session.generation == epoch && session.worker_epoch == Some(epoch)
+}
+
+pub(crate) fn worker_stopped(session: &mut Session, epoch: u64) {
+    if session.worker_epoch == Some(epoch) {
+        session.worker_epoch = None;
+    }
 }
 
 fn verify_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
@@ -868,6 +913,7 @@ fn cancel(ctx: &mut Context<'_>) -> Result<Handled> {
         Op::Verify { terminal, .. } => *terminal = Some(VerifyOutcome::Failed(STATUS_LOCAL)),
     }
 
+    ctx.session.generation = ctx.session.generation.saturating_add(1);
     ctx.session.token = None;
     ctx.session.unseen = true;
 
@@ -940,7 +986,7 @@ fn delete_all(ctx: &mut Context<'_>) -> Result<Handled> {
 }
 
 pub(crate) fn open(session: &mut Session) -> Result<()> {
-    if session.open {
+    if session.open || session.worker_epoch.is_some() {
         return Err(EBUSY);
     }
     session.reset();
