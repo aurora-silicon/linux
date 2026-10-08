@@ -453,6 +453,7 @@ int iomfb_configure_backlight_h17p(struct apple_dcp *dcp, u32 maximum,
 void iomfb_queue_init(struct apple_dcp *dcp);
 void iomfb_queue_stop(struct apple_dcp *dcp);
 int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction);
+void iomfb_queue_crc_h17p(struct apple_dcp *dcp, u32 swap_id);
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
 void dcp_handle_hotplug_actions(struct apple_dcp *dcp, unsigned int action);
