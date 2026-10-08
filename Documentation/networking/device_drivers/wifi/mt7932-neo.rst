@@ -28,10 +28,17 @@ sleep. The separately selected bootstrap provider has its own lifecycle
 restrictions. Kexec is excluded while either retained experiment is enabled.
 Use the ordinary cfg80211 regulatory database and applicable country policy.
 The validated first-admission fallback is kernel country 00 with firmware XZ.
+A modular cfg80211 loads ``regulatory.db`` from the root filesystem; a
+built-in one tries before the root filesystem is mounted and then needs
+``iw reg reload``.
 
-After the root filesystem and the local firmware packages are available,
-select PCIe ASPM performance policy before loading ``mt7932-fullmac``. This
-matches the tested admission sequence. Bluetooth's gate defaults closed;
+The radio functions appear while the kernel boots, before the root
+filesystem is mounted, and ``mt7932-fullmac`` reads its firmware while
+probing. Build it as a module so that udev loads it from the root
+filesystem, or provide its firmware in the initramfs. The driver disables
+ASPM and clock power management on its link before starting the device,
+matching the tested admission sequence, which used the PCIe ASPM
+performance policy. Bluetooth's gate defaults closed;
 validate the cold, unbound ``14c3:793b`` function, then load
 ``mt7932_bt_pcie`` with ``enable=1`` after its local inputs are installed.
 A built-in transport can instead open its enable parameter before requesting

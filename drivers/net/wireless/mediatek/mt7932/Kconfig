@@ -9,6 +9,8 @@ config MT7932_FULLMAC
 	  WPA2-CCMP station operation on 2.4 GHz and channels 36..48 at 20 MHz.
 	  Requires original firmware, own calibration and original-derived
 	  country policy packages in addition to the cfg80211 regulatory database.
+	  The device is probed before the root filesystem is mounted, so say M
+	  unless those files are in the initramfs.
 	  Requires a trained retained PCI link and a translated SID1 DMA domain.
 	  Firmware, runtime DMA and calibration negotiation start automatically;
 	  cfg80211 and userspace select the country and network. No test boot
