@@ -25,7 +25,7 @@ void sep_cancel_delayed_work_sync(void *work);
 
 /* -- pm_shim.c ---------------------------------------------------------- */
 
-int sep_pm_register(void (*event)(bool entering));
+int sep_pm_register(int (*event)(bool entering));
 void sep_pm_unregister(void);
 
 /* -- hwrng_shim.c ------------------------------------------------------- */

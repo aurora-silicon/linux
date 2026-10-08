@@ -10,12 +10,12 @@
 
 #include "shim.h"
 
-static void (*sep_pm_event)(bool entering);
+static int (*sep_pm_event)(bool entering);
 
 static int sep_pm_notify(struct notifier_block *nb, unsigned long action,
 			 void *data)
 {
-	void (*event)(bool entering) = READ_ONCE(sep_pm_event);
+	int (*event)(bool entering) = READ_ONCE(sep_pm_event);
 
 	if (!event)
 		return NOTIFY_DONE;
@@ -24,8 +24,7 @@ static int sep_pm_notify(struct notifier_block *nb, unsigned long action,
 	case PM_SUSPEND_PREPARE:
 	case PM_HIBERNATION_PREPARE:
 	case PM_RESTORE_PREPARE:
-		event(true);
-		return NOTIFY_OK;
+		return notifier_from_errno(event(true));
 	case PM_POST_SUSPEND:
 	case PM_POST_HIBERNATION:
 	case PM_POST_RESTORE:
@@ -40,7 +39,7 @@ static struct notifier_block sep_pm_nb = {
 	.notifier_call = sep_pm_notify,
 };
 
-int sep_pm_register(void (*event)(bool entering))
+int sep_pm_register(int (*event)(bool entering))
 {
 	int ret;
 
