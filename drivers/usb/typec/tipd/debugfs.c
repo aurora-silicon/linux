@@ -163,8 +163,20 @@ static ssize_t tipd_debugfs_command_write(struct file *file,
 		return -EINVAL;
 	if (!memcmp(cmd->cmd, "DVEn", 4) && len % 4)
 		return -EINVAL;
+	if (!memcmp(cmd->cmd, "DBMa", 4) && buf[4] > 1)
+		return -EINVAL;
 
 	mutex_lock(&tps->lock);
+
+	/* Preserve inherited mode and the leases held by other open files. */
+	if ((!memcmp(cmd->cmd, "DBMa", 4) && !buf[4] &&
+	     (tps->dbma_at_probe ||
+	      tps->debugfs->dbma_holders > (unsigned int)f->holds_dbma)) ||
+	    (!memcmp(cmd->cmd, "LOCK", 4) && !memchr_inv(buf + 4, 0, 4) &&
+	     (tps->dbma_at_probe || tps->debugfs->dbma_holders))) {
+		ret = -EBUSY;
+		goto out;
+	}
 
 	ret = tps6598x_exec_cmd_tmo(tps, cmd->cmd, len, len ? &buf[4] : NULL,
 				    sizeof(out), out, cmd->timeout_ms, 0);
@@ -186,6 +198,7 @@ static ssize_t tipd_debugfs_command_write(struct file *file,
 		}
 	}
 
+out:
 	mutex_unlock(&tps->lock);
 
 	return ret ? ret : count;
@@ -195,12 +208,17 @@ static ssize_t tipd_debugfs_command_read(struct file *file, char __user *ubuf,
 					 size_t count, loff_t *ppos)
 {
 	struct tipd_debugfs_file *f = file->private_data;
+	ssize_t ret;
 
+	mutex_lock(&f->tps->lock);
 	if (!f->have_result)
-		return -ENODATA;
+		ret = -ENODATA;
+	else
+		ret = simple_read_from_buffer(ubuf, count, ppos, f->result,
+					      sizeof(f->result));
+	mutex_unlock(&f->tps->lock);
 
-	return simple_read_from_buffer(ubuf, count, ppos, f->result,
-				       sizeof(f->result));
+	return ret;
 }
 
 static const struct file_operations tipd_debugfs_command_fops = {
