@@ -653,6 +653,8 @@ pub(super) struct DeferredBatch {
     /// of vacated pools: unmapping and freeing happen in `finish`, off-lock.
     bindings: KVVec<super::queue::compute::Binding>,
     vacated: KVVec<super::queue::compute::Vacated>,
+    /// Backing of render pools vacated for evicted idle clients.
+    render: KVVec<super::freelist::RenderBacking>,
 }
 impl DeferredBatch {
     const DEPTH: usize = if crate::hw::t8140::queues::RENDER_DEPTH as usize
@@ -677,6 +679,10 @@ impl DeferredBatch {
             values: KVVec::with_capacity(capacity, GFP_KERNEL)?,
             bindings: KVVec::with_capacity(detached, GFP_KERNEL)?,
             vacated: KVVec::with_capacity(detached, GFP_KERNEL)?,
+            render: KVVec::with_capacity(
+                if detached != 0 { crate::hw::t8140::queues::RENDER_SLOTS } else { 0 },
+                GFP_KERNEL,
+            )?,
         })
     }
     /// Keeps the detached owner's unmapping and VM teardown out of the device
@@ -684,6 +690,15 @@ impl DeferredBatch {
     pub(super) fn defer_binding(&mut self, binding: super::queue::compute::Binding) {
         if let Err(binding) = self.bindings.push_within_capacity(binding) {
             drop(binding);
+        }
+    }
+    /// Room for one more vacated render backing; the worker vacates no more.
+    pub(super) fn render_backing_room(&self) -> bool {
+        self.render.len() < self.render.capacity()
+    }
+    pub(super) fn defer_render_backing(&mut self, backing: super::freelist::RenderBacking) {
+        if let Err(backing) = self.render.push_within_capacity(backing) {
+            drop(backing);
         }
     }
     pub(super) fn defer_vacated(&mut self, vacated: super::queue::compute::Vacated) {
@@ -733,6 +748,9 @@ impl DeferredBatch {
         }
         for vacated in self.vacated.drain_all() {
             drop(vacated);
+        }
+        for backing in self.render.drain_all() {
+            drop(backing);
         }
     }
 }

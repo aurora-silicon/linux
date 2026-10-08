@@ -107,7 +107,16 @@ impl super::super::Backend {
                     } else {
                         let pair = entry.pair.as_ref().ok_or(EBUSY)?;
                         if pair.matches(self.owner, &self.context)? {
-                            return Ok(());
+                            if !pair.pool().vacant() {
+                                return Ok(());
+                            }
+                            let pool = pair.pool().clone();
+                            drop(state);
+                            let alloc = Allocator {
+                                dev: &dev,
+                                uat: &resources.uat,
+                            };
+                            return pool.ensure_backing(&alloc, &resources.global, self.context.vm());
                         }
                         if !pair.reusable()? {
                             return Err(EBUSY);

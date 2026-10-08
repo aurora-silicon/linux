@@ -280,6 +280,8 @@ impl Context {
         }
         let mut render = self.render.lock();
         if let Some(pool) = &*render {
+            // A pool vacated under memory pressure is re-armed before reuse.
+            pool.ensure_backing(alloc, render_global, self.vm())?;
             return Ok(pool.clone());
         }
         let pool = Arc::new(

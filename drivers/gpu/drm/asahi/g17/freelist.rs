@@ -12,7 +12,11 @@ use super::fw::initdata::{FreeListArgs, FreeListClass, FreeListControl, FREE_LIS
 use super::object::{Allocator, CpuMap, KernelObject};
 use crate::mmu;
 use core::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
-use kernel::{prelude::*, sync::Arc};
+use kernel::{
+    new_mutex,
+    prelude::*,
+    sync::{Arc, Mutex},
+};
 
 /// Render pools occupy 129..255; compute uses its QID plus one, in 1..128.
 /// First-free allocation keeps the shared firmware namespace deterministic.
@@ -115,12 +119,50 @@ impl Pages {
 /// Pool-object identities are independent of recycled firmware IDs and VAs.
 static RENDER_POOL_SERIAL: AtomicU64 = AtomicU64::new(0);
 
-/// A render pool retained by a logical context and every graph referencing it.
-pub(crate) struct RenderPool {
-    // Remove all aliases before dropping the backing or returning the ID.
+/// The USC backing of a render pool and its two aliases. Field order drops
+/// both aliases before the backing.
+pub(crate) struct RenderBacking {
     _client: mmu::KernelMapping,
     _global: mmu::KernelMapping,
     pages: Pages,
+}
+
+impl RenderBacking {
+    /// Fresh populated backing, built without the device mutex.
+    pub(crate) fn new(
+        alloc: &Allocator<'_>,
+        render_global: &mmu::Vm,
+        client: &mmu::Vm,
+    ) -> Result<Self> {
+        let pages = Pages::new(alloc, RENDER_BLOCKS, RunLayout::Render)?;
+        let address = pages.page_list_va();
+        let global = pages
+            .backing
+            .map_alias(render_global, address, mmu::PROT_GPU_SHARED_RW)?;
+        let client = pages
+            .backing
+            .map_alias(client, address, mmu::PROT_GPU_SHARED_RW)?;
+        Ok(Self {
+            _client: client,
+            _global: global,
+            pages,
+        })
+    }
+}
+
+/// A render pool retained by a logical context and every graph referencing it.
+/// Its backing can be given back while the pool's free-list release has been
+/// consumed and the client VM is evicted; a fresh backing is installed before
+/// the pool is staged again.
+pub(crate) struct RenderPool {
+    backing: Arc<Mutex<Option<RenderBacking>>>,
+    /// Page-list VA of the installed backing; zero while vacant.
+    page_list: AtomicU64,
+    /// Counts installed backings, so a re-armed backing is a new free-list
+    /// owner even if its addresses repeat.
+    epoch: AtomicU64,
+    /// Residency of the client VM the backing is aliased into.
+    client_residency: Option<Arc<mmu::ResidencyGate>>,
     control: KernelObject,
     state: KernelObject,
     served: AtomicBool,
@@ -136,14 +178,9 @@ impl RenderPool {
         client: &mmu::Vm,
     ) -> Result<Self> {
         let id = RenderId::new(ids)?;
-        let pages = Pages::new(alloc, RENDER_BLOCKS, RunLayout::Render)?;
-        let address = pages.page_list_va();
-        let global = pages
-            .backing
-            .map_alias(render_global, address, mmu::PROT_GPU_SHARED_RW)?;
-        let client = pages
-            .backing
-            .map_alias(client, address, mmu::PROT_GPU_SHARED_RW)?;
+        let backing = RenderBacking::new(alloc, render_global, client)?;
+        let address = backing.pages.page_list_va();
+        let run_list_va = backing.pages.run_list_va();
         let state = alloc.kernel(
             CONTROL_SIZE,
             mmu::UAT_PGSZ as u64,
@@ -163,7 +200,7 @@ impl RenderPool {
                     buffer_slot: u32::from(id.slot),
                     class: FreeListClass::Two,
                     page_list_va: address,
-                    run_list_va: pages.run_list_va(),
+                    run_list_va,
                     blocks: RENDER_BLOCKS as u32,
                     state_va: state.gpu_va(),
                 },
@@ -174,10 +211,15 @@ impl RenderPool {
         let serial = RENDER_POOL_SERIAL
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
             .map_err(|_| EOVERFLOW)? + 1;
+        let backing = Arc::pin_init(
+            new_mutex!(Some(backing), "G17 render pool backing"),
+            GFP_KERNEL,
+        )?;
         Ok(Self {
-            _client: client,
-            _global: global,
-            pages,
+            backing,
+            page_list: AtomicU64::new(address),
+            epoch: AtomicU64::new(0),
+            client_residency: client.residency_gate(),
             control,
             state,
             served: AtomicBool::new(false),
@@ -186,8 +228,59 @@ impl RenderPool {
         })
     }
 
+    /// No backing is installed: the pool must be re-armed before staging.
+    pub(crate) fn vacant(&self) -> bool {
+        self.page_list.load(Ordering::Acquire) == 0
+    }
+    /// Pressure reclaim evicted the client VM, which is idle.
+    pub(crate) fn client_evicted(&self) -> bool {
+        self.client_residency.as_ref().is_some_and(|gate| gate.evicted())
+    }
+    /// Removes the backing. The caller holds the device mutex and observed this
+    /// pool's free-list release consumed, so no firmware reference remains; the
+    /// next staging requires a re-armed backing. The caller drops the result
+    /// after releasing the device mutex.
+    pub(crate) fn vacate(&self) -> Option<RenderBacking> {
+        let backing = self.backing.lock().take();
+        if backing.is_some() {
+            self.page_list.store(0, Ordering::Release);
+        }
+        backing
+    }
+    /// Installs fresh backing into a vacant pool, unless another caller did.
+    /// The next staging rewrites the control header and descriptor row for it
+    /// (its run-list address changes the free-list owner identity).
+    pub(crate) fn rearm(&self, fresh: RenderBacking) -> Result {
+        let mut backing = self.backing.lock();
+        if backing.is_some() {
+            return Ok(());
+        }
+        let address = fresh.pages.page_list_va();
+        *backing = Some(fresh);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.served.store(true, Ordering::Release);
+        self.page_list.store(address, Ordering::Release);
+        Ok(())
+    }
+    /// Re-arms a vacant pool with fresh backing built here, without the device
+    /// mutex. `client` is the VM of the context that owns this pool.
+    pub(crate) fn ensure_backing(
+        &self,
+        alloc: &Allocator<'_>,
+        render_global: &mmu::Vm,
+        client: &mmu::Vm,
+    ) -> Result {
+        if !self.vacant() {
+            return Ok(());
+        }
+        self.rearm(RenderBacking::new(alloc, render_global, client)?)
+    }
+
     pub(crate) fn serial(&self) -> u64 {
         self.serial
+    }
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
     }
     pub(crate) fn id(&self) -> u16 {
         self.id.slot
@@ -195,11 +288,12 @@ impl RenderPool {
     pub(crate) fn control_va(&self) -> u64 {
         self.control.gpu_va()
     }
+    /// Zero while vacant.
     pub(crate) fn page_list_va(&self) -> u64 {
-        self.pages.page_list_va()
+        self.page_list.load(Ordering::Acquire)
     }
     pub(crate) fn run_list_va(&self) -> u64 {
-        self.pages.run_list_va()
+        self.page_list_va() + PAGE_LIST_SIZE as u64
     }
     pub(crate) fn end_va(&self) -> u64 {
         self.run_list_va()
@@ -234,7 +328,12 @@ impl RenderPool {
                 .write_unaligned(header)
         };
         let control = self.control.pointer(0, CONTROL_SIZE)?.cast::<u64>();
-        self.pages.repopulate()?;
+        let backing = self.backing.lock();
+        let pages = &backing.as_ref().ok_or(EAGAIN)?.pages;
+        if pages.page_list_va() != self.page_list_va() {
+            return Err(EIO);
+        }
+        pages.repopulate()?;
         for (index, value) in image.iter().enumerate() {
             // SAFETY: The entire retained page was checked before any store;
             // the allocation is page-aligned and release excludes the firmware.
@@ -462,6 +561,8 @@ impl ComputePool {
 pub(crate) struct Owner {
     /// Identifies the host pool object even when every firmware address recycles.
     pub(crate) serial: u64,
+    /// Identifies the pool's installed backing (render pools are re-armed).
+    pub(crate) epoch: u64,
     pub(crate) buffer_slot: u32,
     pub(crate) control_va: u64,
     pub(crate) ring_va: u64,

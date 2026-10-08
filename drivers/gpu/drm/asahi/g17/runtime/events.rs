@@ -387,6 +387,11 @@ impl crate::g17::Shared {
         firmware.reclaim_drained_renders(deferred)?;
         firmware.service_compute_exit(deferred)?;
         firmware.service_compute_pools(deferred)?;
+        if !firmware.recovery.pending() {
+            firmware
+                .queues
+                .vacate_evicted_render_pools(&firmware.init, deferred)?;
+        }
         {
             let mut reclaim = self.reclaim.lock();
             firmware.service_teardown(&mut reclaim)?;
