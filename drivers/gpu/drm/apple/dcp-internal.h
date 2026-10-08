@@ -335,6 +335,8 @@ struct apple_dcp {
 	struct mutex bl_register_mutex;
 	/* Workqueue for updating the brightness */
 	struct work_struct bl_update_wq;
+	/* Registers the H17P backlight when the loader reports no level. */
+	struct delayed_work bl_fallback_wq;
 
 	/* integrated panel if present */
 	struct dcp_panel panel;
