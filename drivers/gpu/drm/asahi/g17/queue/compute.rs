@@ -392,6 +392,13 @@ struct Previous {
     context: Arc<Context>,
     publication: Option<(u64, u64)>,
 }
+/// Per-queue addresses of the bound owner, read under the publication preflight.
+struct BindingAddresses {
+    preempt: u64,
+    operand: u64,
+    usage: u64,
+}
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 struct ConfigIdentity {
     scheduler: u64,
@@ -1495,31 +1502,7 @@ impl Queue {
             compute::{ComputeArgs, ComputeDescriptor, COMPUTE_KICK_EVENT_MASK, COMPUTE_QOS_CLASS},
             kick::{KickArgs, KickQos},
         };
-        let (epoch, state) = host.epoch()?;
-        if state != 0 {
-            return Err(EBUSY);
-        }
-        let replay_front = self
-            .replays
-            .front()
-            .is_some_and(|front| Arc::ptr_eq(front, &packet));
-        if !self.room()
-            && !(replay_front && !self.quarantined && !self.released && self.active.len < IN_FLIGHT)
-        {
-            return Err(EBUSY);
-        }
-        if !packet.context.is_current()
-            || !self
-                .binding
-                .as_ref()
-                .is_some_and(|binding| Arc::ptr_eq(&packet.context, &binding.context))
-        {
-            return Err(EFAULT);
-        }
-        let binding = self.binding.as_ref().ok_or(EFAULT)?;
-        if packet.completion.status().get() != 0 {
-            return Err(EIO);
-        }
+        let (epoch, addresses) = self.publication_preflight(&packet, host)?;
         let crate::g17::command::Validated::Compute {
             scratch,
             usc_base,
@@ -1569,9 +1552,9 @@ impl Queue {
             qid,
             kick_count: self.ordinal,
             kick: kick_timestamp,
-            preempt_va: binding.preempt.iova(),
-            operand_state_va: binding.operand.iova(),
-            usage_va: binding.usage.iova(),
+            preempt_va: addresses.preempt,
+            operand_state_va: addresses.operand,
+            usage_va: addresses.usage,
             usage_fw_va: self.graph.usage.gpu_va(),
             free_list_slot: u32::from(self.pool.id()),
             free_list_control_va: self.pool.control_va(),
@@ -1591,30 +1574,7 @@ impl Queue {
         self.free_list_generation = u64::from(packet.context.scheduler_generation());
         let policy = packet.context.policy();
         let ring = 1u8 << policy.priority();
-        let config = QueueConfig::new(&QueueConfigArgs {
-            target: QueueConfigTarget::Compute,
-            kick_ring_va: self.kick.low_va(),
-            kick_ring_fw_va: self.kick.firmware_va(),
-            qid,
-            install: first,
-            completion_seed: None,
-            context_id: args.context_id,
-            free_list: FreeListBinding {
-                va: self.pool.control_va(),
-                generation: u64::from(packet.context.scheduler_generation()),
-                slot: u32::from(self.pool.id()),
-            },
-            scheduler_va: identity.scheduler,
-            policy,
-            qos_slot: identity.qos,
-            qos_update: self
-                .published_config
-                .is_none_or(|p| p.scheduler != identity.scheduler || p.qos != identity.qos),
-            owner_pid: packet.context.owner_pid(),
-            context_update: self
-                .published_config
-                .is_none_or(|p| p.scheduler != identity.scheduler || p.context != identity.context),
-        })?;
+        let config = self.queue_config(&identity, first, args.context_id, policy, &packet)?;
         let announce =
             KickAnnounce::new(qid, DataMaster::Compute, kick_timestamp, policy.priority())?;
         let predecessor = KickPredecessor::new(qid, kick_parent)?;
@@ -1833,6 +1793,86 @@ impl Queue {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Everything that must hold before a publication changes any state: a healthy device
+    /// epoch, room in the active ring (or this packet at the replay front), the bound
+    /// owner's current context and a clean completion status. Returns the epoch and the
+    /// bound owner's per-queue addresses.
+    fn publication_preflight(
+        &self,
+        packet: &Arc<Packet>,
+        host: &mut impl Host,
+    ) -> Result<(u64, BindingAddresses)> {
+        let (epoch, state) = host.epoch()?;
+        if state != 0 {
+            return Err(EBUSY);
+        }
+        let replay_front = self
+            .replays
+            .front()
+            .is_some_and(|front| Arc::ptr_eq(front, packet));
+        if !self.room()
+            && !(replay_front && !self.quarantined && !self.released && self.active.len < IN_FLIGHT)
+        {
+            return Err(EBUSY);
+        }
+        if !packet.context.is_current()
+            || !self
+                .binding
+                .as_ref()
+                .is_some_and(|binding| Arc::ptr_eq(&packet.context, &binding.context))
+        {
+            return Err(EFAULT);
+        }
+        let binding = self.binding.as_ref().ok_or(EFAULT)?;
+        if packet.completion.status().get() != 0 {
+            return Err(EIO);
+        }
+        Ok((
+            epoch,
+            BindingAddresses {
+                preempt: binding.preempt.iova(),
+                operand: binding.operand.iova(),
+                usage: binding.usage.iova(),
+            },
+        ))
+    }
+
+    /// The queue configuration record for this publication: a fresh install on the first
+    /// one, and QoS/context updates only when the identity changed since the last publication.
+    fn queue_config(
+        &self,
+        identity: &ConfigIdentity,
+        first: bool,
+        context_id: u16,
+        policy: crate::g17::fw::queue::Policy,
+        packet: &Arc<Packet>,
+    ) -> Result<QueueConfig> {
+        QueueConfig::new(&QueueConfigArgs {
+            target: QueueConfigTarget::Compute,
+            kick_ring_va: self.kick.low_va(),
+            kick_ring_fw_va: self.kick.firmware_va(),
+            qid: self.qid(),
+            install: first,
+            completion_seed: None,
+            context_id,
+            free_list: FreeListBinding {
+                va: self.pool.control_va(),
+                generation: u64::from(packet.context.scheduler_generation()),
+                slot: u32::from(self.pool.id()),
+            },
+            scheduler_va: identity.scheduler,
+            policy,
+            qos_slot: identity.qos,
+            qos_update: self
+                .published_config
+                .is_none_or(|p| p.scheduler != identity.scheduler || p.qos != identity.qos),
+            owner_pid: packet.context.owner_pid(),
+            context_update: self
+                .published_config
+                .is_none_or(|p| p.scheduler != identity.scheduler || p.context != identity.context),
+        })
     }
 }
 
