@@ -3,6 +3,7 @@
 #include <linux/module.h>
 
 #include "cd321x-pm.h"
+#include "cd321x-setup.h"
 
 static void cd321x_resume_requires_snapshot_test(struct kunit *test)
 {
@@ -544,7 +545,197 @@ static void cd321x_ready_during_apply_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, pm.link_events_left, (unsigned int)CD321X_LINK_EVENTS);
 }
 
+struct cd321x_setup_fixture {
+	u8 state;
+	u64 mask;
+	unsigned int reads, writes;
+	unsigned int fail_read, fail_s0, fail_mask;
+};
+
+static int cd321x_fake_read_state(void *ctx, u8 *state)
+{
+	struct cd321x_setup_fixture *f = ctx;
+
+	f->reads++;
+	if (f->fail_read) {
+		f->fail_read--;
+		return -EIO;
+	}
+	*state = f->state;
+	return 0;
+}
+
+static int cd321x_fake_read_mask(void *ctx, u64 *mask)
+{
+	struct cd321x_setup_fixture *f = ctx;
+
+	f->reads++;
+	*mask = f->mask;
+	return 0;
+}
+
+static int cd321x_fake_set_s0(void *ctx)
+{
+	struct cd321x_setup_fixture *f = ctx;
+
+	f->writes++;
+	if (f->fail_s0) {
+		f->fail_s0--;
+		return -EIO;
+	}
+	f->state = 0;
+	return 0;
+}
+
+static int cd321x_fake_set_mask(void *ctx, u64 mask)
+{
+	struct cd321x_setup_fixture *f = ctx;
+
+	f->writes++;
+	if (f->fail_mask) {
+		f->fail_mask--;
+		return -EIO;
+	}
+	f->mask = mask;
+	return 0;
+}
+
+static const struct cd321x_setup_ops cd321x_fake_setup_ops = {
+	.read_state = cd321x_fake_read_state,
+	.read_mask = cd321x_fake_read_mask,
+	.set_s0 = cd321x_fake_set_s0,
+	.set_mask = cd321x_fake_set_mask,
+};
+
+static void cd321x_reset_setup_retry_test(struct kunit *test)
+{
+	unsigned int failure;
+
+	for (failure = 0; failure < 3; failure++) {
+		struct cd321x_pm_state pm = {};
+		struct cd321x_setup_fixture f = { .state = 7, .mask = 0x0507 };
+
+		if (!failure)
+			f.fail_read = 1;
+		else if (failure == 1)
+			f.fail_s0 = 1;
+		else
+			f.fail_mask = 1;
+		KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 1, 0x602,
+						    &cd321x_fake_setup_ops, &f), -EIO);
+		KUNIT_EXPECT_FALSE(test, cd321x_pm_can_update(&pm));
+		/* No further interrupt follows the cleared reset event. */
+		KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 0, 0x602,
+						    &cd321x_fake_setup_ops, &f), 1);
+		KUNIT_EXPECT_EQ(test, f.state, (u8)0);
+		KUNIT_EXPECT_EQ(test, f.mask, (u64)0x602);
+		KUNIT_EXPECT_FALSE(test, pm.setup_pending);
+	}
+}
+
+static void cd321x_reset_setup_bound_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+	struct cd321x_setup_fixture f = { .state = 7, .mask = 0x0507, .fail_s0 = 99 };
+	unsigned int i;
+
+	for (i = 0; i < 10; i++)
+		KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 1, 0x602,
+						    &cd321x_fake_setup_ops, &f), -EIO);
+	KUNIT_EXPECT_EQ(test, f.writes, (unsigned int)CD321X_RESUME_ATTEMPTS);
+	KUNIT_EXPECT_EQ(test, pm.setup_attempts_left, 0U);
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_can_update(&pm));
+}
+
+static void cd321x_reset_setup_pm_fence_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+	struct cd321x_setup_fixture f = { .state = 7, .mask = 0x0507, .fail_mask = 1 };
+
+	KUNIT_ASSERT_EQ(test, cd321x_setup_run(&pm, 1, 0x602,
+						    &cd321x_fake_setup_ops, &f), -EIO);
+	cd321x_pm_prepare(&pm);
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 1, 0x602,
+						    &cd321x_fake_setup_ops, &f), 0);
+	KUNIT_EXPECT_EQ(test, f.writes, 2U);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_resume(&pm));
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 0, 0x602,
+						    &cd321x_fake_setup_ops, &f), 1);
+	KUNIT_EXPECT_FALSE(test, pm.setup_pending);
+	cd321x_pm_remove(&pm);
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 1, 0x602,
+						    &cd321x_fake_setup_ops, &f), 0);
+	KUNIT_EXPECT_EQ(test, f.writes, 4U);
+	cd321x_pm_init(&pm);
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 1, 0x602,
+						    &cd321x_fake_setup_ops, &f), 0);
+	KUNIT_EXPECT_EQ(test, f.writes, 4U);
+}
+
+static void cd321x_reset_setup_healthy_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+	struct cd321x_setup_fixture f = { .mask = 0x602 };
+
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 0x602, 0x602,
+						    &cd321x_fake_setup_ops, &f), 0);
+	KUNIT_EXPECT_EQ(test, f.reads, 0U);
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 1, 0x602,
+						    &cd321x_fake_setup_ops, &f), 0);
+	KUNIT_EXPECT_EQ(test, f.reads, 2U);
+	KUNIT_EXPECT_EQ(test, f.writes, 0U);
+	KUNIT_EXPECT_FALSE(test, pm.setup_pending);
+}
+
+static void cd321x_reset_first_irq_during_prepare_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+	struct cd321x_setup_fixture f = { .state = 7, .mask = 0x0507 };
+
+	cd321x_pm_prepare(&pm);
+	/* The IRQ is cleared before suspend has disabled the controller IRQ. */
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 1, 0x602,
+						    &cd321x_fake_setup_ops, &f), 0);
+	KUNIT_EXPECT_TRUE(test, pm.setup_pending);
+	KUNIT_EXPECT_EQ(test, f.reads, 0U);
+	KUNIT_EXPECT_EQ(test, f.writes, 0U);
+	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_PREPARED);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_resume(&pm));
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 0, 0x602,
+						    &cd321x_fake_setup_ops, &f), 1);
+	KUNIT_EXPECT_EQ(test, f.state, (u8)0);
+	KUNIT_EXPECT_EQ(test, f.mask, (u64)0x602);
+	KUNIT_EXPECT_FALSE(test, pm.setup_pending);
+}
+
+static void cd321x_reset_first_irq_before_ready_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+	struct cd321x_setup_fixture f = { .state = 7, .mask = 0x0507 };
+
+	cd321x_pm_init(&pm);
+	/* The IRQ is registered before port initialization publishes ready. */
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 1, 0x602,
+						    &cd321x_fake_setup_ops, &f), 0);
+	KUNIT_EXPECT_TRUE(test, pm.setup_pending);
+	KUNIT_EXPECT_EQ(test, f.reads, 0U);
+	KUNIT_EXPECT_EQ(test, f.writes, 0U);
+	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_INITIALIZING);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_ready(&pm));
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 0, 0x602,
+						    &cd321x_fake_setup_ops, &f), 1);
+	KUNIT_EXPECT_EQ(test, f.state, (u8)0);
+	KUNIT_EXPECT_EQ(test, f.mask, (u64)0x602);
+	KUNIT_EXPECT_FALSE(test, pm.setup_pending);
+}
+
 static struct kunit_case cd321x_pm_cases[] = {
+	KUNIT_CASE(cd321x_reset_first_irq_before_ready_test),
+	KUNIT_CASE(cd321x_reset_first_irq_during_prepare_test),
+	KUNIT_CASE(cd321x_reset_setup_retry_test),
+	KUNIT_CASE(cd321x_reset_setup_bound_test),
+	KUNIT_CASE(cd321x_reset_setup_pm_fence_test),
+	KUNIT_CASE(cd321x_reset_setup_healthy_test),
 	KUNIT_CASE(cd321x_completion_failure_sequence_test),
 	KUNIT_CASE(cd321x_ready_keeps_failed_recovery_bounded_test),
 	KUNIT_CASE(cd321x_ready_preserves_failure_and_lifecycle_test),

@@ -631,7 +631,10 @@ static void fabric_follow_test(struct kunit *test)
 						&f.policy),
 			DCP_FABRIC_FOLLOW_REFUSE);
 
-	/* Existing fixed-output busy/settling policy also applies to a move. */
+	/*
+	 * A live HDMI display keeps the hybrid.  The settling sample taken at
+	 * probe does not; a recent HDMI edge does (fabric_follow_recent_fixed).
+	 */
 	f.pipeline[0].fixed_busy = true;
 	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(lg, hybrid, NULL, NULL, false,
 						&f.policy),
@@ -640,8 +643,15 @@ static void fabric_follow_test(struct kunit *test)
 	f.pipeline[0].presence = DCP_FABRIC_SETTLING;
 	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(lg, hybrid, NULL, NULL, false,
 						&f.policy),
-			DCP_FABRIC_FOLLOW_REFUSE);
+			DCP_FABRIC_FOLLOW_MOVE);
 	f.pipeline[0].presence = DCP_FABRIC_ABSENT;
+
+	/* #39 on the M1 Pro: a Thunderbolt display alone follows to the hybrid. */
+	lg->tunnel = true;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(lg, hybrid, NULL, NULL, false,
+						&f.policy),
+			DCP_FABRIC_FOLLOW_MOVE);
+	lg->tunnel = false;
 
 	/* Owned with no route to swap with (a retiring tunnel), unbound, not up. */
 	f.pipeline[0].owned = true;
@@ -682,18 +692,41 @@ static void fabric_follow_test(struct kunit *test)
 						&f.route[1][0], &f.route[1][0],
 						true, &f.policy),
 			DCP_FABRIC_FOLLOW_REFUSE);
-	/* A direct route must never move into or swap a tunnel binding. */
+	/* Tunnels follow and swap like direct routes, keeping their binding. */
 	f.route[1][0].tunnel = true;
 	KUNIT_EXPECT_EQ(test,
 			dcp_fabric_follow(&f.route[0][1], &f.route[0][0],
 					  &f.route[1][0], &f.route[1][1], true, &f.policy),
-			DCP_FABRIC_FOLLOW_REFUSE);
+			DCP_FABRIC_FOLLOW_SWAP);
 	f.route[1][0].tunnel = false;
 	f.route[0][1].tunnel = true;
 	KUNIT_EXPECT_EQ(test,
 			dcp_fabric_follow(&f.route[0][1], &f.route[0][0],
-					  NULL, NULL, false, &f.policy),
-			DCP_FABRIC_FOLLOW_REFUSE);
+					  &f.route[1][0], &f.route[1][1], true, &f.policy),
+			DCP_FABRIC_FOLLOW_SWAP);
+}
+
+static void fabric_follow_arrival_test(struct kunit *test)
+{
+	struct fabric_fixture f;
+
+	/* Where routes follow their CRTC, streams arrive on the lowest CRTC. */
+	fabric_init(&f, false);
+	KUNIT_EXPECT_PTR_EQ(test, dcp_fabric_free_route(&f.port[0], &f.policy),
+			    &f.route[0][1]);
+	f.policy.follow = true;
+	KUNIT_EXPECT_PTR_EQ(test, dcp_fabric_free_route(&f.port[0], &f.policy),
+			    &f.route[0][0]);
+	/* still not on a hybrid whose HDMI display is live */
+	f.pipeline[0].fixed_busy = true;
+	KUNIT_EXPECT_PTR_EQ(test, dcp_fabric_free_route(&f.port[0], &f.policy),
+			    &f.route[0][1]);
+	/* dual-stream ranking is unchanged */
+	fabric_init(&f, true);
+	f.policy.follow = true;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_score(&f.pipeline[0], &f.policy),
+			dcp_fabric_score(&f.pipeline[0], &(struct dcp_fabric_policy){
+				.dual_stream = true }));
 }
 
 static void fabric_follow_recent_fixed(struct kunit *test)
@@ -1913,7 +1946,102 @@ static void fabric_rebind_presence_test(struct kunit *test)
 	}
 }
 
+struct reclaim_fixture {
+	int release_error, move_error, restore_error;
+	unsigned int events[8], count;
+	int owner;
+	bool reported_lost;
+};
+
+static int reclaim_release(void *data)
+{
+	struct reclaim_fixture *f = data;
+
+	f->events[f->count++] = 1;
+	f->owner = -1;
+	return f->release_error;
+}
+
+static void reclaim_unplug(void *data)
+{
+	struct reclaim_fixture *f = data;
+
+	f->events[f->count++] = 2;
+}
+
+static void reclaim_hdmi(void *data)
+{
+	struct reclaim_fixture *f = data;
+
+	f->events[f->count++] = 3;
+}
+
+static int reclaim_activate(void *data, bool restore)
+{
+	struct reclaim_fixture *f = data;
+	int ret = restore ? f->restore_error : f->move_error;
+
+	f->events[f->count++] = restore ? 5 : 4;
+	if (!ret)
+		f->owner = restore ? 0 : 1;
+	return ret;
+}
+
+static void reclaim_publish(void *data, bool restore)
+{
+	struct reclaim_fixture *f = data;
+
+	f->events[f->count++] = restore ? 7 : 6;
+}
+
+static void reclaim_lost(void *data)
+{
+	struct reclaim_fixture *f = data;
+
+	f->events[f->count++] = 8;
+	f->reported_lost = true;
+}
+
+static const struct dcp_fabric_reclaim_ops reclaim_ops = {
+	.release = reclaim_release,
+	.unplug = reclaim_unplug,
+	.connect_hdmi = reclaim_hdmi,
+	.activate = reclaim_activate,
+	.publish = reclaim_publish,
+	.lost = reclaim_lost,
+};
+
+static void fabric_reclaim_transaction_test(struct kunit *test)
+{
+	struct reclaim_fixture success = {}, move = { .move_error = -EIO };
+	struct reclaim_fixture release = { .release_error = -EIO };
+	struct reclaim_fixture lost = { .move_error = -EIO, .restore_error = -EIO };
+	unsigned int i;
+	const unsigned int expected[] = { 1, 2, 3, 4, 6 };
+
+	KUNIT_EXPECT_EQ(test, dcp_fabric_reclaim_execute(&reclaim_ops, &success), 0);
+	KUNIT_ASSERT_EQ(test, success.count, (unsigned int)ARRAY_SIZE(expected));
+	for (i = 0; i < ARRAY_SIZE(expected); i++)
+		KUNIT_EXPECT_EQ(test, success.events[i], expected[i]);
+	KUNIT_EXPECT_EQ(test, success.owner, 1);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_reclaim_execute(&reclaim_ops, &move), -EIO);
+	KUNIT_EXPECT_EQ(test, move.owner, 0);
+	KUNIT_EXPECT_EQ(test, move.events[4], 5U);
+	KUNIT_EXPECT_EQ(test, move.events[5], 7U);
+	KUNIT_EXPECT_FALSE(test, move.reported_lost);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_reclaim_execute(&reclaim_ops, &release), -EIO);
+	KUNIT_EXPECT_EQ(test, release.owner, 0);
+	KUNIT_ASSERT_EQ(test, release.count, 4U);
+	KUNIT_EXPECT_EQ(test, release.events[2], 5U);
+	KUNIT_EXPECT_EQ(test, release.events[3], 7U);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_reclaim_execute(&reclaim_ops, &lost), -EIO);
+	KUNIT_EXPECT_EQ(test, lost.owner, -1);
+	KUNIT_EXPECT_TRUE(test, lost.reported_lost);
+	KUNIT_EXPECT_EQ(test, lost.events[5], 8U);
+}
+
 static struct kunit_case fabric_tests[] = {
+	KUNIT_CASE(fabric_reclaim_transaction_test),
 	KUNIT_CASE_PARAM(fabric_shared_wiring_test, fabric_wiring_gen_params),
 	KUNIT_CASE(fabric_rebind_presence_test),
 	KUNIT_CASE(fabric_nonhybrid_hdmi_resume_test),
@@ -1929,6 +2057,7 @@ static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE(fabric_deactivate_failure_test),
 	KUNIT_CASE(fabric_unbound_and_mask_test),
 	KUNIT_CASE(fabric_follow_test),
+	KUNIT_CASE(fabric_follow_arrival_test),
 	KUNIT_CASE(fabric_follow_recent_fixed),
 	KUNIT_CASE(fabric_follow_effect_swap),
 	KUNIT_CASE(fabric_follow_effect_oom),

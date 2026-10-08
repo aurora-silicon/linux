@@ -121,8 +121,15 @@ unsigned int dcp_fabric_score(const struct dcp_fabric_pipeline *pipeline,
 {
 	if (!pipeline->bound)
 		return UINT_MAX - 1;
+	/*
+	 * Without dual-stream docks a hybrid comes last, kept for an HDMI
+	 * display arriving later.  Not where routes follow their CRTC: a
+	 * compositor pairs a new display with the lowest free CRTC, and its
+	 * route would only follow it there.
+	 */
 	return pipeline->crtc_index +
-	       (!policy->dual_stream && pipeline->has_fixed ? 100 : 0);
+	       (!policy->dual_stream && !policy->follow && pipeline->has_fixed ?
+		100 : 0);
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_score);
 
@@ -326,11 +333,14 @@ EXPORT_SYMBOL_GPL(dcp_fabric_tunnel_candidate);
  * pipeline its port reaches through @to (NULL: none).  Stay, move the
  * route there, swap it with @holder, the route of another port holding
  * that pipeline, or refuse the modeset.  A move needs a pipeline that is
- * free but for its CRTC: no live fixed output and its services up.  A
- * fixed-output settling window follows the existing fabric policy.
- * A swap needs a holder whose own display is off, or about to be
- * shown on @from's pipeline, and that can reach @from's pipeline through
- * @holder_back.
+ * free but for its CRTC: no live fixed output and its services up, and
+ * no recent HDMI edge, which may be a display coming back.  The HDMI
+ * presence sample taken at probe or resume is no edge: the compositor has
+ * paired the display already, and refusing would leave it dark.  Direct
+ * routes and Thunderbolt tunnels follow alike; the caller checks that a
+ * tunnel's DP IN can reach the pipeline.  A swap needs a holder whose own
+ * display is off, or about to be shown on @from's pipeline, and that can
+ * reach @from's pipeline through @holder_back.
  */
 enum dcp_fabric_follow
 dcp_fabric_follow(const struct dcp_fabric_route *from,
@@ -341,14 +351,13 @@ dcp_fabric_follow(const struct dcp_fabric_route *from,
 {
 	const struct dcp_fabric_pipeline *pipeline;
 
-	if (!from || !to || from->tunnel || (holder && holder->tunnel))
+	if (!from || !to)
 		return DCP_FABRIC_FOLLOW_REFUSE;
 	if (from == to)
 		return DCP_FABRIC_FOLLOW_STAY;
 	pipeline = to->pipeline;
 	if (!pipeline->bound || pipeline->fixed_busy || pipeline->terminal ||
-	    !pipeline->services_ready ||
-	    (!policy->dual_stream && pipeline->presence != DCP_FABRIC_ABSENT))
+	    !pipeline->services_ready)
 		return DCP_FABRIC_FOLLOW_REFUSE;
 	if (!holder)
 		return pipeline->owned || pipeline->fixed_recent ? DCP_FABRIC_FOLLOW_REFUSE :

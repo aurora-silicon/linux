@@ -24,6 +24,7 @@
 #include <linux/firmware.h>
 
 #include "tps6598x.h"
+#include "cd321x-setup.h"
 #include "trace.h"
 
 /* Register offsets */
@@ -1087,6 +1088,8 @@ static int cd321x_connect(struct tps6598x *tps, u32 status)
  * provider to validate the resumed session. Preserve a healthy connection;
  * only a real cable change or a failed read/apply requests forced recovery.
  */
+static int cd321x_check_setup(struct cd321x *cd321x, u64 event);
+
 static void cd321x_resume_work(struct work_struct *work)
 {
 	struct cd321x *cd321x = container_of(to_delayed_work(work),
@@ -1100,6 +1103,9 @@ static void cd321x_resume_work(struct work_struct *work)
 	if (cd321x->pm.phase == CD321X_PM_INITIALIZING ||
 	    cd321x->pm.phase == CD321X_PM_PREPARED ||
 	    cd321x->pm.phase == CD321X_PM_REMOVED)
+		return;
+
+	if (cd321x->pm.setup_pending && cd321x_check_setup(cd321x, 0) < 0)
 		return;
 
 	fault = atomic_xchg(&cd321x->link_event, 0);
@@ -1159,6 +1165,77 @@ static void cd321x_resume_reverify(struct tps6598x *tps)
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
 }
 
+static int cd321x_setup_read_state(void *ctx, u8 *state)
+{
+	struct cd321x *cd321x = ctx;
+
+	return tps6598x_read8(&cd321x->tps, TPS_REG_SYSTEM_POWER_STATE, state);
+}
+
+static int cd321x_setup_read_mask(void *ctx, u64 *mask)
+{
+	struct cd321x *cd321x = ctx;
+
+	return tps6598x_read64(&cd321x->tps, TPS_REG_INT_MASK1, mask);
+}
+
+static int cd321x_setup_set_s0(void *ctx)
+{
+	struct cd321x *cd321x = ctx;
+	struct tps6598x *tps = &cd321x->tps;
+
+	return tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
+}
+
+static int cd321x_setup_set_mask(void *ctx, u64 mask)
+{
+	struct cd321x *cd321x = ctx;
+
+	return tps6598x_write64(&cd321x->tps, TPS_REG_INT_MASK1, mask);
+}
+
+static const struct cd321x_setup_ops cd321x_setup_ops = {
+	.read_state = cd321x_setup_read_state,
+	.read_mask = cd321x_setup_read_mask,
+	.set_s0 = cd321x_setup_set_s0,
+	.set_mask = cd321x_setup_set_mask,
+};
+
+/* Restore a reset controller even if the sole reset IRQ has been cleared. */
+static int cd321x_check_setup(struct cd321x *cd321x, u64 event)
+{
+	struct tps6598x *tps = &cd321x->tps;
+	int ret;
+
+	lockdep_assert_held(&tps->lock);
+	if (cd321x->pm.phase == CD321X_PM_REMOVED ||
+	    (!cd321x->pm.setup_pending && !(event & ~tps->data->irq_mask1)))
+		return 0;
+	ret = cd321x_setup_run(&cd321x->pm, event, tps->data->irq_mask1,
+			       &cd321x_setup_ops, cd321x);
+	if (cd321x->pm.phase == CD321X_PM_PREPARED ||
+	    cd321x->pm.phase == CD321X_PM_INITIALIZING)
+		return 0;
+	if (ret < 0) {
+		if (cd321x->pm.setup_attempts_left)
+			mod_delayed_work(system_freezable_wq, &cd321x->resume_work,
+					 msecs_to_jiffies(CD321X_DEBOUNCE_DELAY_MS));
+		else
+			dev_err(tps->dev, "controller setup recovery exhausted: %d\n", ret);
+		return ret;
+	}
+	if (ret)
+		dev_warn(tps->dev, "restored controller power state and interrupt mask\n");
+	/* Only a fresh snapshot may be applied after restoring the controller. */
+	cd321x->state_valid = false;
+	cd321x->pm.phase = CD321X_PM_REVALIDATE;
+	cd321x->pm.attempts_left = CD321X_RESUME_ATTEMPTS;
+	cd321x->pm.force_reconnect |= ret > 0;
+	cd321x->pm.provider_busy = false;
+	mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
+	return 0;
+}
+
 static irqreturn_t cd321x_interrupt(int irq, void *data)
 {
 	struct tps6598x *tps = data;
@@ -1179,6 +1256,8 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 		goto err_unlock;
 
 	tps6598x_write64(tps, TPS_REG_INT_CLEAR1, event);
+	if (cd321x_check_setup(container_of(tps, struct cd321x, tps), event) < 0)
+		goto err_unlock;
 
 	if (!tps6598x_read_status(tps, &status))
 		goto err_unlock;
