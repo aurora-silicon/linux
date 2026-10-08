@@ -83,7 +83,6 @@ use crate::{
     queue,
     regs,
     stats,
-    sysfs_exports,
     workqueue, //
 };
 
@@ -267,6 +266,8 @@ pub(crate) struct GpuManager {
 
 /// Trait used to abstract the firmware/GPU-dependent variants of the GpuManager.
 pub(crate) trait GpuManager: Send + Sync {
+    fn stats_snapshot(&self) -> Arc<stats::StatsSnapshot>;
+
     /// Cast as an Any type.
     fn as_any(&self) -> &dyn Any;
     /// Cast Arc<Self> as an Any type.
@@ -732,10 +733,6 @@ impl GpuManager::ver {
         let event_manager_clone = event_manager.clone();
         let buffer_mgr_clone = buffer_mgr.clone();
         let stats_snap = Arc::new(stats::StatsSnapshot::default(), GFP_KERNEL)?;
-        // Publish the snapshot pointer to the C sysfs shim. It is cleared
-        // (by the same shim) on registration removal; until then readers see
-        // a stable pointer and AtomicU* races that govern.
-        sysfs_exports::set_snapshot_ptr(Arc::as_ptr(&stats_snap));
         let stats_snap_clone = stats_snap.clone();
         let alloc_ref = &mut alloc;
         let rx_channels = KBox::init(
@@ -1252,6 +1249,10 @@ impl GpuManager::ver {
 
 #[versions(AGX)]
 impl GpuManager for GpuManager::ver {
+    fn stats_snapshot(&self) -> Arc<stats::StatsSnapshot> {
+        self.stats.clone()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
