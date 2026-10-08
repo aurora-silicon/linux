@@ -167,6 +167,18 @@ class CalibrationExtractorTests(unittest.TestCase):
             with patch.object(extractor, "SCAN_CHUNK_SIZE", 64), patch.object(extractor, "SCAN_OVERLAP", 1024):
                 self.assertEqual(extractor.scan_input(source), [(110, record)])
 
+    def test_preserves_nested_legacy_comb_candidates(self):
+        nested = synthetic_record()
+        im4p = tlv(0x30, ia5(b"IM4P") + ia5(b"FSCl") + ia5(b"test")
+                    + tlv(0x04, b"CALB" + nested + b"x" * 320))
+        record = wrap_comb(tlv(0x30, ia5(b"IMG4") + im4p + ia5(b"IM4M") + ia5(b"FSCl")))
+        offset = record.index(nested)
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "synthetic.der"
+            source.write_bytes(record)
+            with patch.object(extractor, "SCAN_CHUNK_SIZE", 64), patch.object(extractor, "SCAN_OVERLAP", 1024):
+                self.assertEqual(extractor.scan_input(source), [(0, record), (offset, nested)])
+
     def test_standalone_fsc2_across_chunk_and_der_header_boundaries(self):
         image = synthetic_fsc2_image()
         with tempfile.TemporaryDirectory() as directory:

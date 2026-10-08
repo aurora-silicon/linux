@@ -337,8 +337,11 @@ def scan_input(path):
     # A nested image can be complete before its enclosing object is complete.
     enclosing_ranges = comb_ranges | {(start, start + len(blob))
                                       for start, blob in candidates.items()}
+    # Keep every legacy comb candidate, including pre-existing ambiguity.
+    comb_starts = {begin for begin, _ in comb_ranges}
     return sorted((start, blob) for start, blob in candidates.items()
-                  if not any(begin < start < end for begin, end in enclosing_ranges))
+                  if start in comb_starts
+                  or not any(begin < start < end for begin, end in enclosing_ranges))
 
 
 def write_private(path, blob):
