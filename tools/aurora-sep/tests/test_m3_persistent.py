@@ -99,3 +99,151 @@ class Persistent(test_m3_handoff.M3PathTest):
         text=entry.read_text()
         self.assertNotIn('asahi.t8122-start=1',text)
         self.assertIn('asahi.t8122_start=0 mesa_m3=off',text)
+
+    def transaction_paths(self):
+        defaults=self.etc/'default/limine'
+        defaults.write_text('KERNEL_CMDLINE[default]="root=UUID=abc rw"\n')
+        (self.etc/'m1n1.conf').write_text('# owner setting\n')
+        work=self.tmp/'work';work.mkdir()
+        (work/'matched.pkg.tar.zst').touch()
+        return self.selection()+f'''
+chain=limine
+work="{work}"
+M3_LIMINE_DEFAULTS="{defaults}"
+M3_GRUB_DEFAULTS="{self.etc}/default/grub"
+M3_PROFILE_HOOK="{self.etc}/hooks/profile.hook"
+M3_PROFILE_UPDATE="{self.etc}/libexec/profile-update"
+trap 'm3_install_cleanup' EXIT
+'''
+
+    def test_pacman_failure_restores_owned_switches_and_bootbin(self):
+        import test_m3_boot_profile
+        fixture=test_m3_boot_profile.BootProfile();fixture.setUp();self.addCleanup(fixture.doCleanups)
+        fixture.run_helper('retain')
+        setup=self.setup_profile()+self.transaction_paths()
+        bootbin=self.esp/'m1n1/boot.bin';before=bootbin.read_bytes()
+        result=self.run_sh(setup+f'''
+m3_persistent_transaction_begin "$chain"
+m3_switches_write
+printf 'package hook changed boot.bin' > "{bootbin}"
+pacman() {{ return 23; }}
+m3_install_packages
+''',check=False)
+        self.assertEqual(result.returncode,23,result.stderr)
+        self.assertEqual((self.etc/'m1n1.conf').read_text(),'# owner setting\n')
+        self.assertEqual(bootbin.read_bytes(),before)
+        self.assertNotIn('asahi.t8122_start=1',(self.etc/'default/limine').read_text())
+        self.assertFalse((self.state/'m3-gpu-persistent').exists())
+        self.assertFalse((self.state/'m3-persistent-transaction.json').exists())
+        self.assertIn('/Aurora previous (GPU off)',fixture.conf.read_text())
+        self.assertIn('asahi.t8122_start=0 mesa_m3=off',fixture.conf.read_text())
+
+    def test_native_marker_after_package_failure_rolls_back_before_arming(self):
+        setup=self.setup_profile('j613-25g83','source-built-25')+self.transaction_paths()
+        result=self.run_sh(setup+'''
+m3_persistent_transaction_begin "$chain"
+m3_switches_write
+pacman() { return 0; }
+m3_install_packages
+''',check=False)
+        self.assertNotEqual(result.returncode,0)
+        self.assertNotIn('asahi.t8122_start=1',(self.etc/'default/limine').read_text())
+        self.assertFalse((self.etc/'intent').exists())
+        self.assertFalse((self.etc/'profile').exists())
+
+    def test_remove_cleans_owned_defaults_without_final_state(self):
+        self.run_sh(self.transaction_paths()+'''
+m3_persistent_cmdline limine
+m3_persistent_remove
+''')
+        self.assertNotIn('asahi.t8122_start=1',(self.etc/'default/limine').read_text())
+        self.assertFalse((self.state/'m3-gpu-persistent').exists())
+
+    def test_post_generation_publish_lock_failure_rolls_back_real_helper(self):
+        import fcntl
+        import test_m3_boot_profile
+        fixture=test_m3_boot_profile.BootProfile();fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture.run_helper('retain')
+        setup=self.setup_profile()+self.transaction_paths()
+        # Execute the production helper after a package hook replaces the main
+        # UKI. Its custom EFI fallback survives that regeneration.
+        fixture.regenerate()
+        fixture.lock2.touch()
+        with fixture.lock2.open('r+') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            result=self.run_sh(setup+f'''
+m3_persistent_transaction_begin "$chain"
+m3_switches_write
+pacman() {{ return 0; }}
+m3_persistent_keep_entry() {{
+  python3 "{test_m3_boot_profile.HELPER}" "$1" --esp "{fixture.esp}" --state "{fixture.state}" --defaults "{fixture.defaults}" --lock "{fixture.lock1}" --lock "{fixture.lock2}"
+}}
+m3_install_packages
+''',check=False)
+        self.assertNotEqual(result.returncode,0)
+        text=fixture.conf.read_text()
+        self.assertIn('/Aurora previous (GPU off)',text)
+        self.assertIn('asahi.t8122_start=0 mesa_m3=off',text)
+        self.assertNotIn('asahi.t8122_start=1',text)
+        self.assertNotIn('asahi.t8122_start=1',(self.etc/'default/limine').read_text())
+        self.assertEqual((self.etc/'m1n1.conf').read_text(),'# owner setting\n')
+        self.assertFalse((self.etc/'intent').exists())
+        self.assertFalse((self.state/'m3-gpu-persistent').exists())
+
+    def test_matched_transaction_commits14_and25_only_after_validation(self):
+        import test_m3_boot_profile
+        for profile in ('legacy','j613-25g83'):
+            with self.subTest(profile=profile):
+                fixture=test_m3_boot_profile.BootProfile();fixture.setUp()
+                try:
+                    fixture.run_helper('retain');fixture.regenerate()
+                    setup=self.setup_profile(profile,'source-built-25' if profile!='legacy' else 'v1.6.1-dirty')
+                    # Reuse isolated transaction files across the two cases.
+                    work=self.tmp/'work'
+                    if work.exists():
+                        import shutil
+                        shutil.rmtree(work)
+                    setup+=self.transaction_paths()
+                    (self.tmp/'native-marker').write_text('j613-25g83-gl-only\n')
+                    self.run_sh(setup+f'''
+m3_persistent_transaction_begin "$chain"
+m3_switches_write
+pacman() {{ return 0; }}
+m3_persistent_keep_entry() {{
+  python3 "{test_m3_boot_profile.HELPER}" "$1" --esp "{fixture.esp}" --state "{fixture.state}" --defaults "{fixture.defaults}" --lock "{fixture.lock1}" --lock "{fixture.lock2}"
+}}
+m3_install_packages
+[[ -f "$STATE/m3-persistent-transaction.json" ]]
+# The caller commits only after its boot.bin and remaining install checks.
+m3_persistent_transaction_commit
+''')
+                    self.assertEqual((self.etc/'intent').read_text(),'1\n')
+                    self.assertEqual((self.state/'m3-gpu-persistent').read_text(),profile+'\n')
+                    self.assertFalse((self.state/'m3-persistent-transaction.json').exists())
+                    self.assertIn('asahi.t8122_start=1',(self.etc/'default/limine').read_text())
+                    self.assertIn('asahi.t8122_start=1',fixture.conf.read_text())
+                    self.assertIn('/Aurora previous (GPU off)',fixture.conf.read_text())
+                    if profile=='j613-25g83': self.assertEqual((self.etc/'profile').read_text(),'j613-25g83-hal200\n')
+                finally: fixture.doCleanups()
+
+    def test_failure_after_publication_disarms_main_and_restores_intent(self):
+        import test_m3_boot_profile
+        fixture=test_m3_boot_profile.BootProfile();fixture.setUp();self.addCleanup(fixture.doCleanups)
+        fixture.run_helper('retain');fixture.regenerate()
+        result=self.run_sh(self.setup_profile()+self.transaction_paths()+f'''
+m3_persistent_transaction_begin "$chain"
+pacman() {{ return 0; }}
+m3_persistent_keep_entry() {{
+  python3 "{test_m3_boot_profile.HELPER}" "$1" --esp "{fixture.esp}" --state "{fixture.state}" --defaults "{fixture.defaults}" --lock "{fixture.lock1}" --lock "{fixture.lock2}"
+}}
+m3_install_packages
+# Model a later boot.bin validation failure, before the caller's commit.
+false
+''',check=False)
+        self.assertNotEqual(result.returncode,0)
+        self.assertNotIn('asahi.t8122_start=1',fixture.conf.read_text())
+        self.assertIn('/Aurora previous (GPU off)',fixture.conf.read_text())
+        self.assertFalse((self.etc/'intent').exists())
+        self.assertFalse((self.state/'m3-gpu-persistent').exists())
+        self.assertFalse((self.etc/'hooks/profile.hook').exists())

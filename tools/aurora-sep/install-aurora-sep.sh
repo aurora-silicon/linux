@@ -567,6 +567,12 @@ M3_MESA_NATIVE_MARKER=/opt/mesa-m3/25g83/share/mesa-m3/profile
 M3_PROFILE_SELECTOR=j613-25g83-hal200
 M3_BOOT_PROFILE_HELPER=/usr/local/libexec/aurora-m3-boot-profile
 M3_GPU_PROFILE_FILE=/etc/mesa-m3/t8122-profile
+M3_GRUB_DEFAULTS=/etc/default/grub
+M3_LIMINE_DEFAULTS=/etc/default/limine
+M3_PROFILE_HOOK=/etc/pacman.d/hooks/zzzz-aurora-m3-profile.hook
+M3_PROFILE_UPDATE=/usr/local/libexec/aurora-m3-profile-update
+M3_PERSISTENT_TRANSACTION_ACTIVE=0
+M3_PERSISTENT_MAIN_ARMED=0
 M3_GPU_BIN=/usr/local/bin
 M3_GPU_SCRIPTS=(
   "air-gpu-oneshot.sh d0259869b8519439a4dbcdae08ef1b0e17fdcaf84ac746fca61febf6a325f8aa"
@@ -3558,7 +3564,7 @@ install_all() {
   fi
   m1n1_keep_plan
   work=$(mktemp -d)
-  trap 'rm -rf "${work:-}"' EXIT
+  trap 'm3_install_cleanup' EXIT
   if is_neo && ! m1n1_for_this_mac; then say "Keeping this MacBook Neo's own m1n1 (m1n1-aurora has no T8140 support)"; fi
   if [[ $M3_MODE == kernel ]]; then say "Keeping this M3's own m1n1 and boot.bin"; fi
   mapfile -t entries < <(packages_for_this_mac; m3_gpu_files; m3_pro_mesa_files)
@@ -3605,7 +3611,7 @@ install_all() {
   fi
   if ((M3_GPU_PERSISTENT)); then
     m3_persistent_keep_entry
-    m3_persistent_cmdline "$chain"
+    m3_persistent_transaction_begin "$chain"
   fi
   # The kernel this Mac had before the first install; an update keeps it.
   if [[ ! -f $STATE/previous-package ]]; then
@@ -3637,13 +3643,7 @@ install_all() {
 
   say "Installing the aurora-sep kernel, libfprint with the Apple SEP driver, fprintd and aurora-touchid"
   # --ask 4 accepts replacing linux-asahi (and its headers), which linux-aurora conflicts with.
-  $sudo pacman -U --noconfirm --ask 4 "$work"/*.pkg.tar.zst
-  if ((M3_GPU_PERSISTENT)); then
-    M3_PRO_MESA_RESULT=installed
-    if [[ $chain == grub ]]; then $sudo grub-mkconfig -o /boot/grub/grub.cfg; fi
-    m3_persistent_keep_entry publish
-    m3_persistent_select
-  fi
+  m3_install_packages
   $sudo pacman -S --needed --noconfirm fprintd
   # linux-aurora carries the Apple video decoder, whose firmware linux-asahi
   # installs never needed; without it the decoder fails to load at boot.
@@ -3713,6 +3713,7 @@ install_all() {
   m3_pro_mesa_render
   m3_pro_mesa_record
   pacman -Q linux-aurora libfprint aurora-touchid
+  if ((M3_GPU_PERSISTENT)); then m3_persistent_transaction_commit; fi
   echo
   if [[ $M3_MODE == handoff ]] && m3_air_default; then
     say "Done. Reboot: expect the Omarchy logo, the boot menu, then the same desktop on the boot
@@ -6069,10 +6070,103 @@ m3_persistent_preflight() {
   done
 }
 
+m3_install_cleanup() {
+  local status=$?
+  if ((M3_PERSISTENT_TRANSACTION_ACTIVE)); then
+    m3_persistent_transaction_rollback || warn "could not restore experimental activation settings; use the retained GPU-off entry"
+    if ((M3_PERSISTENT_MAIN_ARMED)); then
+      if [[ $chain == grub ]]; then
+        $sudo grub-mkconfig -o /boot/grub/grub.cfg || warn "could not disarm the main entry; use the retained GPU-off entry"
+      else
+        (m3_persistent_keep_entry disarm) || warn "could not disarm the main entry; use the retained GPU-off entry"
+      fi
+    fi
+  fi
+  rm -rf "${work:-}"
+  return "$status"
+}
+
+m3_persistent_transaction_begin() {
+  local defaults=$M3_LIMINE_DEFAULTS target
+  [[ $1 != grub ]] || defaults=$M3_GRUB_DEFAULTS
+  target=$(esp_bootbin) || die "persistent GPU requires the mounted boot.bin"
+  $sudo python3 - "$STATE/m3-persistent-transaction.json" "$defaults" "$M1N1_CONF" "$target" \
+    "$M3_GPU_OPTIN" "$M3_GPU_PROFILE_FILE" "$STATE/m3-gpu-persistent" "$STATE/m3-mode" \
+    "$M3_PROFILE_HOOK" "$M3_PROFILE_UPDATE" <<'M3_TRANSACTION_BEGIN'
+import base64, json, os, stat, sys
+from pathlib import Path
+snapshot=Path(sys.argv[1])
+rows=[]
+for name in sys.argv[2:]:
+    path=Path(name)
+    if path.exists() or path.is_symlink():
+        info=path.lstat()
+        if not stat.S_ISREG(info.st_mode): raise SystemExit('transaction path must be a regular file: '+name)
+        rows.append(dict(path=name, data=base64.b64encode(path.read_bytes()).decode(), mode=stat.S_IMODE(info.st_mode)))
+    else: rows.append(dict(path=name, data=None))
+with snapshot.open('x') as out:
+    json.dump(rows,out); out.flush(); os.fsync(out.fileno())
+os.chmod(snapshot,0o600)
+M3_TRANSACTION_BEGIN
+  M3_PERSISTENT_TRANSACTION_ACTIVE=1
+}
+
+m3_persistent_transaction_rollback() {
+  $sudo python3 - "$STATE/m3-persistent-transaction.json" <<'M3_TRANSACTION_ROLLBACK'
+import base64, json, os, stat, sys, tempfile
+from pathlib import Path
+snapshot=Path(sys.argv[1])
+for row in json.loads(snapshot.read_text()):
+    path=Path(row['path'])
+    if path.exists() or path.is_symlink():
+        if not stat.S_ISREG(path.lstat().st_mode): raise SystemExit('refusing nonregular rollback path: '+str(path))
+    if row['data'] is None: path.unlink(missing_ok=True)
+    else:
+        fd,name=tempfile.mkstemp(prefix=path.name+'.',dir=path.parent)
+        try:
+            with os.fdopen(fd,'wb') as out:
+                out.write(base64.b64decode(row['data'])); out.flush(); os.fsync(out.fileno())
+            os.chmod(name,row['mode']); os.replace(name,path)
+        finally:
+            if os.path.exists(name): os.unlink(name)
+snapshot.unlink()
+M3_TRANSACTION_ROLLBACK
+  local status=$?
+  ((status == 0)) || return "$status"
+  M3_PERSISTENT_TRANSACTION_ACTIVE=0
+}
+
+m3_persistent_transaction_commit() {
+  $sudo rm -f "$STATE/m3-persistent-transaction.json"
+  M3_PERSISTENT_TRANSACTION_ACTIVE=0
+  M3_PERSISTENT_MAIN_ARMED=0
+}
+
+m3_install_packages() {
+  # The generated main UKI remains unarmed until the matched transaction has
+  # succeeded. The custom GPU-off entry was registered before this call.
+  $sudo pacman -U --noconfirm --ask 4 "$work"/*.pkg.tar.zst
+  if ((M3_GPU_PERSISTENT)); then
+    M3_PRO_MESA_RESULT=installed
+    if [[ $M3_GPU_PROFILE == j613-25g83 ]]; then
+      [[ $(cat "$M3_MESA_NATIVE_MARKER" 2>/dev/null) == j613-25g83-gl-only ]] ||
+        die "matched Mesa native profile marker is missing; activation was not published"
+    fi
+    m3_persistent_cmdline "$chain"
+    if [[ $chain == grub ]]; then
+      M3_PERSISTENT_MAIN_ARMED=1
+      $sudo grub-mkconfig -o /boot/grub/grub.cfg
+    fi
+    m3_persistent_keep_entry publish
+    M3_PERSISTENT_MAIN_ARMED=1
+    m3_persistent_select
+  fi
+}
+
 m3_persistent_cmdline() {
   local chain=$1 path
-  if [[ $chain == grub ]]; then path=/etc/default/grub
-  else path=/etc/default/limine; fi
+  if [[ $chain == grub ]]; then path=$M3_GRUB_DEFAULTS
+  else path=$M3_LIMINE_DEFAULTS; fi
   [[ -f $STATE/m3-defaults.saved ]] || $sudo cp -p "$path" "$STATE/m3-defaults.saved"
   $sudo python3 - "$path" "$chain" <<'M3_CMDLINE_PY'
 import os, re, sys, tempfile
@@ -6123,11 +6217,13 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import subprocess
 import tempfile
 
 BEGIN = '# >>> aurora-sep: persistent experimental M3 GPU'
 END = '# <<< aurora-sep: persistent experimental M3 GPU'
 CONF_PATHS = ('EFI/BOOT/limine.conf', 'boot/limine/limine.conf', 'boot/limine.conf', 'limine/limine.conf', 'limine.conf')
+FALLBACK = 'Aurora previous (GPU off)'
 
 def regular(path):
     if not stat.S_ISREG(path.lstat().st_mode):
@@ -6175,11 +6271,11 @@ def without_block(text):
         raise ValueError('malformed persistent boot block')
     return re.sub(r'\n?' + re.escape(BEGIN) + r'\n.*?' + re.escape(END) + r'\n?', '\n', text, flags=re.S)
 
-def entry(text, kernel):
+def entry(text, kernel, depth=2, require_cmdline=True):
     lines = text.splitlines(keepends=True)
     matches = []
     for i, line in enumerate(lines):
-        if line.strip() != '//' + kernel: continue
+        if line.strip() != '/' * depth + kernel: continue
         end = i + 1
         while end < len(lines) and not lines[end].lstrip().startswith('/'): end += 1
         fields = {}
@@ -6189,8 +6285,9 @@ def entry(text, kernel):
                 if m[1] in fields: raise ValueError('duplicate entry field')
                 fields[m[1]] = (j, m[2])
         matches.append(fields)
-    if len(matches) != 1 or any(k not in matches[0] for k in ('protocol', 'path', 'cmdline')):
-        raise ValueError(f'exactly one complete //{kernel} entry is required')
+    required = ('protocol', 'path', 'cmdline') if require_cmdline else ('protocol', 'path')
+    if len(matches) != 1 or any(k not in matches[0] for k in required):
+        raise ValueError(f'exactly one complete {"/" * depth}{kernel} entry is required')
     if matches[0]['protocol'][1] != 'efi': raise ValueError('only EFI UKI entries are supported')
     return lines, matches[0]
 
@@ -6230,52 +6327,73 @@ def limine(args):
                 uki_path(args.esp, saved['path'])
                 if not (args.state / ('modules-' + saved['release']) / 'modules.dep').is_file():
                     raise ValueError('retained modules missing')
-                return
-            _, fields = entry(clean, args.kernel)
-            data, digest = uki_path(args.esp, fields['path'][1])
-            if not args.release or args.release.encode() + b'\0' not in data:
-                raise ValueError('UKI does not identify the running kernel')
-            modules = args.modules / args.release
-            if regular(modules / 'pkgbase').read_text().strip() != args.kernel:
-                raise ValueError('running modules do not match boot entry package')
-            regular(modules / 'modules.dep')
-            dest = args.state / ('modules-' + args.release)
-            if dest.exists(): raise ValueError('unrecorded fallback modules exist')
-            shutil.copytree(modules, dest, symlinks=True)
-            shutil.rmtree(dest / 'dtbs', ignore_errors=True)
-            rel = '/EFI/Linux/aurora-m3-previous-' + digest[:16] + '.efi'
-            target = args.esp / rel.lstrip('/')
-            atomic(target, data)
-            saved = dict(path='boot():' + rel + '#' + digest,
-                         cmdline=cmdline(fields['cmdline'][1], False), release=args.release)
-            atomic(state_path, (json.dumps(saved, sort_keys=True) + '\n').encode())
+            else:
+                _, fields = entry(clean, args.kernel)
+                data, digest = uki_path(args.esp, fields['path'][1])
+                if not args.release or args.release.encode() + b'\0' not in data:
+                    raise ValueError('UKI does not identify the running kernel')
+                modules = args.modules / args.release
+                if regular(modules / 'pkgbase').read_text().strip() != args.kernel:
+                    raise ValueError('running modules do not match boot entry package')
+                regular(modules / 'modules.dep')
+                dest = args.state / ('modules-' + args.release)
+                if dest.exists(): raise ValueError('unrecorded fallback modules exist')
+                shutil.copytree(modules, dest, symlinks=True)
+                shutil.rmtree(dest / 'dtbs', ignore_errors=True)
+                rel = '/EFI/Linux/aurora-m3-previous-' + digest[:16] + '.efi'
+                atomic(args.esp / rel.lstrip('/'), data)
+                saved = dict(path='boot():' + rel + '#' + digest,
+                             cmdline=cmdline(fields['cmdline'][1], False), release=args.release)
+                atomic(state_path, (json.dumps(saved, sort_keys=True) + '\n').encode())
+            # A top-level custom EFI node survives limine-entry-tool's kernel
+            # replacement. Register it before any package hook can run. We
+            # already hold both tool locks; recursive hooks/mutex are disabled.
+            target = args.esp / saved['path'].split('#')[0].removeprefix('boot():/')
+            subprocess.run([str(args.entry_tool), '--add-efi', FALLBACK, str(target),
+                            '--comment', 'Aurora retained kernel; GPU disabled',
+                            '--priority', '90', '--overwrite', '--no-mutex',
+                            '--no-hooks', '--quiet'], check=True)
+            text = regular(conf).read_text()
+            lines, fields = entry(text, FALLBACK, 1, require_cmdline=False)
+            uki_path(args.esp, fields['path'][1])
+            j, _ = fields['path']
+            lines[j] = '    path: ' + saved['path'] + '\n'
+            if 'cmdline' in fields:
+                j, _ = fields['cmdline']; lines[j] = '    cmdline: ' + saved['cmdline'] + '\n'
+            else:
+                lines.insert(j + 1, '    cmdline: ' + saved['cmdline'] + '\n')
+            if regular(conf).read_text() != text: raise ValueError('Limine configuration changed during retain')
+            atomic(conf, ''.join(lines).encode())
             return
         saved = json.loads(regular(state_path).read_text())
         uki_path(args.esp, saved['path'])
+        _, fallback = entry(clean, FALLBACK, 1)
+        if fallback['path'][1] != saved['path'] or fallback['cmdline'][1] != saved['cmdline']:
+            raise ValueError('registered GPU-off fallback differs')
         lines, fields = entry(clean, 'linux-aurora')
         # Validate the newly generated UKI before changing its activation line.
         uki_path(args.esp, fields['path'][1])
         j, old = fields['cmdline']
-        lines[j] = re.match(r'\s*', lines[j])[0] + 'cmdline: ' + cmdline(old, True) + '\n'
-        block = '\n' + BEGIN + '\n/Aurora previous (GPU off)\n    protocol: efi\n    path: ' + saved['path'] + '\n    cmdline: ' + saved['cmdline'] + '\n' + END + '\n'
-        output = ''.join(lines).rstrip() + '\n' + block
+        lines[j] = re.match(r'\s*', lines[j])[0] + 'cmdline: ' + cmdline(old, args.action == 'publish') + '\n'
+        output = ''.join(lines).rstrip() + '\n'
         if regular(conf).read_text() != text: raise ValueError('Limine configuration changed during update')
         atomic(conf, output.encode())
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('action', choices=('retain', 'publish'))
+    p.add_argument('action', choices=('retain', 'publish', 'disarm'))
     p.add_argument('--esp', type=Path, required=True)
     p.add_argument('--state', type=Path, required=True)
     p.add_argument('--defaults', type=Path, default=Path('/etc/default/limine'))
     p.add_argument('--kernel', default='linux-aurora')
     p.add_argument('--release', default=os.uname().release)
     p.add_argument('--modules', type=Path, default=Path('/usr/lib/modules'))
+    p.add_argument('--entry-tool', type=Path, default=Path('/usr/bin/limine-entry-tool'))
     p.add_argument('--lock', type=Path, action='append')
     args = p.parse_args()
     args.lock = args.lock or [Path('/run/lock/boot-partition.lock'), Path('/tmp/limine-global.lock')]
     try: limine(args)
-    except (OSError, ValueError, KeyError) as e: p.exit(1, f'M3 boot profile refused: {e}\n')
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as e: p.exit(1, f'M3 boot profile refused: {e}\n')
 
 if __name__ == '__main__': main()
 M3_BOOT_PROFILE_PY
@@ -6342,10 +6460,8 @@ m3_persistent_keep_entry() {
   fi
 }
 
-m3_persistent_remove() {
-  [[ -f $STATE/m3-gpu-persistent ]] || return 0
-  $sudo rm -f "$M3_GPU_OPTIN" "$M3_GPU_PROFILE_FILE" /etc/pacman.d/hooks/zzzz-aurora-m3-profile.hook /usr/local/libexec/aurora-m3-profile-update "$M3_BOOT_PROFILE_HELPER"
-  $sudo python3 - /etc/default/grub /etc/default/limine <<'M3_REMOVE_CMDLINE'
+m3_persistent_cmdline_remove() {
+  $sudo python3 - "$M3_GRUB_DEFAULTS" "$M3_LIMINE_DEFAULTS" <<'M3_REMOVE_CMDLINE'
 from pathlib import Path
 import re, sys
 begin, end = '# >>> aurora-sep: M3 GPU cmdline', '# <<< aurora-sep: M3 GPU cmdline'
@@ -6357,12 +6473,21 @@ for name in sys.argv[1:]:
     if text.count(begin)!=1 or text.count(end)!=1: raise SystemExit('malformed owned M3 cmdline block')
     path.write_text(re.sub(re.escape(begin)+r'\n.*?'+re.escape(end)+r'\n?','',text,flags=re.S))
 M3_REMOVE_CMDLINE
+}
+
+m3_persistent_remove() {
+  if [[ -f $STATE/m3-persistent-transaction.json ]]; then m3_persistent_transaction_rollback; fi
+  # An interrupted first install may own a defaults block without having
+  # reached the final profile-state write. Remove that block independently.
+  m3_persistent_cmdline_remove
+  [[ -f $STATE/m3-gpu-persistent ]] || return 0
+  $sudo rm -f "$M3_GPU_OPTIN" "$M3_GPU_PROFILE_FILE" "$M3_PROFILE_HOOK" "$M3_PROFILE_UPDATE" "$M3_BOOT_PROFILE_HELPER"
   $sudo rm -f "$STATE/m3-gpu-persistent"
 }
 
 m3_persistent_hook() {
-  $sudo install -d -m 0755 /etc/pacman.d/hooks
-  $sudo tee /etc/pacman.d/hooks/zzzz-aurora-m3-profile.hook >/dev/null <<EOF
+  $sudo install -d -m 0755 "${M3_PROFILE_HOOK%/*}" "${M3_PROFILE_UPDATE%/*}"
+  $sudo tee "$M3_PROFILE_HOOK" >/dev/null <<EOF
 [Trigger]
 Operation = Install
 Operation = Upgrade
@@ -6372,9 +6497,9 @@ Target = limine-mkinitcpio-hook
 [Action]
 Description = Retain the Aurora GPU-off boot entry
 When = PostTransaction
-Exec = /usr/local/libexec/aurora-m3-profile-update
+Exec = $M3_PROFILE_UPDATE
 EOF
-  $sudo tee /usr/local/libexec/aurora-m3-profile-update >/dev/null <<EOF
+  $sudo tee "$M3_PROFILE_UPDATE" >/dev/null <<EOF
 #!/bin/bash
 set -eu
 [[ -f $STATE/m3-gpu-persistent ]] || exit 0
@@ -6384,7 +6509,7 @@ for esp in /boot/efi /boot; do
 done
 exit 1
 EOF
-  $sudo chmod 0755 /usr/local/libexec/aurora-m3-profile-update
+  $sudo chmod 0755 "$M3_PROFILE_UPDATE"
 }
 
 m3_persistent_select() {

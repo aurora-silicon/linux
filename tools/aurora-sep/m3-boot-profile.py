@@ -10,11 +10,13 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import subprocess
 import tempfile
 
 BEGIN = '# >>> aurora-sep: persistent experimental M3 GPU'
 END = '# <<< aurora-sep: persistent experimental M3 GPU'
 CONF_PATHS = ('EFI/BOOT/limine.conf', 'boot/limine/limine.conf', 'boot/limine.conf', 'limine/limine.conf', 'limine.conf')
+FALLBACK = 'Aurora previous (GPU off)'
 
 def regular(path):
     if not stat.S_ISREG(path.lstat().st_mode):
@@ -62,11 +64,11 @@ def without_block(text):
         raise ValueError('malformed persistent boot block')
     return re.sub(r'\n?' + re.escape(BEGIN) + r'\n.*?' + re.escape(END) + r'\n?', '\n', text, flags=re.S)
 
-def entry(text, kernel):
+def entry(text, kernel, depth=2, require_cmdline=True):
     lines = text.splitlines(keepends=True)
     matches = []
     for i, line in enumerate(lines):
-        if line.strip() != '//' + kernel: continue
+        if line.strip() != '/' * depth + kernel: continue
         end = i + 1
         while end < len(lines) and not lines[end].lstrip().startswith('/'): end += 1
         fields = {}
@@ -76,8 +78,9 @@ def entry(text, kernel):
                 if m[1] in fields: raise ValueError('duplicate entry field')
                 fields[m[1]] = (j, m[2])
         matches.append(fields)
-    if len(matches) != 1 or any(k not in matches[0] for k in ('protocol', 'path', 'cmdline')):
-        raise ValueError(f'exactly one complete //{kernel} entry is required')
+    required = ('protocol', 'path', 'cmdline') if require_cmdline else ('protocol', 'path')
+    if len(matches) != 1 or any(k not in matches[0] for k in required):
+        raise ValueError(f'exactly one complete {"/" * depth}{kernel} entry is required')
     if matches[0]['protocol'][1] != 'efi': raise ValueError('only EFI UKI entries are supported')
     return lines, matches[0]
 
@@ -117,51 +120,72 @@ def limine(args):
                 uki_path(args.esp, saved['path'])
                 if not (args.state / ('modules-' + saved['release']) / 'modules.dep').is_file():
                     raise ValueError('retained modules missing')
-                return
-            _, fields = entry(clean, args.kernel)
-            data, digest = uki_path(args.esp, fields['path'][1])
-            if not args.release or args.release.encode() + b'\0' not in data:
-                raise ValueError('UKI does not identify the running kernel')
-            modules = args.modules / args.release
-            if regular(modules / 'pkgbase').read_text().strip() != args.kernel:
-                raise ValueError('running modules do not match boot entry package')
-            regular(modules / 'modules.dep')
-            dest = args.state / ('modules-' + args.release)
-            if dest.exists(): raise ValueError('unrecorded fallback modules exist')
-            shutil.copytree(modules, dest, symlinks=True)
-            shutil.rmtree(dest / 'dtbs', ignore_errors=True)
-            rel = '/EFI/Linux/aurora-m3-previous-' + digest[:16] + '.efi'
-            target = args.esp / rel.lstrip('/')
-            atomic(target, data)
-            saved = dict(path='boot():' + rel + '#' + digest,
-                         cmdline=cmdline(fields['cmdline'][1], False), release=args.release)
-            atomic(state_path, (json.dumps(saved, sort_keys=True) + '\n').encode())
+            else:
+                _, fields = entry(clean, args.kernel)
+                data, digest = uki_path(args.esp, fields['path'][1])
+                if not args.release or args.release.encode() + b'\0' not in data:
+                    raise ValueError('UKI does not identify the running kernel')
+                modules = args.modules / args.release
+                if regular(modules / 'pkgbase').read_text().strip() != args.kernel:
+                    raise ValueError('running modules do not match boot entry package')
+                regular(modules / 'modules.dep')
+                dest = args.state / ('modules-' + args.release)
+                if dest.exists(): raise ValueError('unrecorded fallback modules exist')
+                shutil.copytree(modules, dest, symlinks=True)
+                shutil.rmtree(dest / 'dtbs', ignore_errors=True)
+                rel = '/EFI/Linux/aurora-m3-previous-' + digest[:16] + '.efi'
+                atomic(args.esp / rel.lstrip('/'), data)
+                saved = dict(path='boot():' + rel + '#' + digest,
+                             cmdline=cmdline(fields['cmdline'][1], False), release=args.release)
+                atomic(state_path, (json.dumps(saved, sort_keys=True) + '\n').encode())
+            # A top-level custom EFI node survives limine-entry-tool's kernel
+            # replacement. Register it before any package hook can run. We
+            # already hold both tool locks; recursive hooks/mutex are disabled.
+            target = args.esp / saved['path'].split('#')[0].removeprefix('boot():/')
+            subprocess.run([str(args.entry_tool), '--add-efi', FALLBACK, str(target),
+                            '--comment', 'Aurora retained kernel; GPU disabled',
+                            '--priority', '90', '--overwrite', '--no-mutex',
+                            '--no-hooks', '--quiet'], check=True)
+            text = regular(conf).read_text()
+            lines, fields = entry(text, FALLBACK, 1, require_cmdline=False)
+            uki_path(args.esp, fields['path'][1])
+            j, _ = fields['path']
+            lines[j] = '    path: ' + saved['path'] + '\n'
+            if 'cmdline' in fields:
+                j, _ = fields['cmdline']; lines[j] = '    cmdline: ' + saved['cmdline'] + '\n'
+            else:
+                lines.insert(j + 1, '    cmdline: ' + saved['cmdline'] + '\n')
+            if regular(conf).read_text() != text: raise ValueError('Limine configuration changed during retain')
+            atomic(conf, ''.join(lines).encode())
             return
         saved = json.loads(regular(state_path).read_text())
         uki_path(args.esp, saved['path'])
+        _, fallback = entry(clean, FALLBACK, 1)
+        if fallback['path'][1] != saved['path'] or fallback['cmdline'][1] != saved['cmdline']:
+            raise ValueError('registered GPU-off fallback differs')
         lines, fields = entry(clean, 'linux-aurora')
         # Validate the newly generated UKI before changing its activation line.
         uki_path(args.esp, fields['path'][1])
         j, old = fields['cmdline']
-        lines[j] = re.match(r'\s*', lines[j])[0] + 'cmdline: ' + cmdline(old, True) + '\n'
-        block = '\n' + BEGIN + '\n/Aurora previous (GPU off)\n    protocol: efi\n    path: ' + saved['path'] + '\n    cmdline: ' + saved['cmdline'] + '\n' + END + '\n'
-        output = ''.join(lines).rstrip() + '\n' + block
+        lines[j] = re.match(r'\s*', lines[j])[0] + 'cmdline: ' + cmdline(old, args.action == 'publish') + '\n'
+        output = ''.join(lines).rstrip() + '\n'
         if regular(conf).read_text() != text: raise ValueError('Limine configuration changed during update')
         atomic(conf, output.encode())
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('action', choices=('retain', 'publish'))
+    p.add_argument('action', choices=('retain', 'publish', 'disarm'))
     p.add_argument('--esp', type=Path, required=True)
     p.add_argument('--state', type=Path, required=True)
     p.add_argument('--defaults', type=Path, default=Path('/etc/default/limine'))
     p.add_argument('--kernel', default='linux-aurora')
     p.add_argument('--release', default=os.uname().release)
     p.add_argument('--modules', type=Path, default=Path('/usr/lib/modules'))
+    p.add_argument('--entry-tool', type=Path, default=Path('/usr/bin/limine-entry-tool'))
     p.add_argument('--lock', type=Path, action='append')
     args = p.parse_args()
     args.lock = args.lock or [Path('/run/lock/boot-partition.lock'), Path('/tmp/limine-global.lock')]
     try: limine(args)
-    except (OSError, ValueError, KeyError) as e: p.exit(1, f'M3 boot profile refused: {e}\n')
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as e: p.exit(1, f'M3 boot profile refused: {e}\n')
 
 if __name__ == '__main__': main()
