@@ -395,7 +395,7 @@ static int apple_mbox_probe(struct platform_device *pdev)
 	mbox->irq_recv_not_empty =
 		platform_get_irq_byname(pdev, "recv-not-empty");
 	if (mbox->irq_recv_not_empty < 0)
-		return -ENODEV;
+		return mbox->irq_recv_not_empty;
 
 	/*
 	 * Some coprocessors (e.g. the T6021 ANE ASC) have no send-empty line.
@@ -404,7 +404,7 @@ static int apple_mbox_probe(struct platform_device *pdev)
 	mbox->irq_send_empty =
 		platform_get_irq_byname_optional(pdev, "send-empty");
 	if (mbox->irq_send_empty < 0 && mbox->irq_send_empty != -ENXIO)
-		return -ENODEV;
+		return mbox->irq_send_empty;
 
 	spin_lock_init(&mbox->rx_lock);
 	spin_lock_init(&mbox->tx_lock);
