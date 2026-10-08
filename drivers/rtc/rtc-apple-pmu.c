@@ -126,8 +126,10 @@ static int baku_rtc_validate_alarm(struct baku_rtc *baku, u64 comparator)
 	error = baku_rtc_seconds(baku, &counter);
 	if (error)
 		return error;
-	if (comparator <= counter || comparator - counter > BAKU_RTC_MAX_DELAY)
+	if (comparator <= counter)
 		return -ETIME;
+	if (comparator - counter > BAKU_RTC_MAX_DELAY)
+		return -ERANGE;
 	return 0;
 }
 
@@ -314,6 +316,7 @@ static int baku_rtc_probe(struct platform_device *pdev)
 	baku->clock->ops = &baku_rtc_ops;
 	baku->clock->range_min = 0;
 	baku->clock->range_max = RTC_TIMESTAMP_END_9999;
+	baku->clock->alarm_offset_max = BAKU_RTC_MAX_DELAY;
 	clear_bit(RTC_FEATURE_UPDATE_INTERRUPT, baku->clock->features);
 	error = device_init_wakeup(dev, true);
 	if (error)
