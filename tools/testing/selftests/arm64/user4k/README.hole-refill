@@ -1,0 +1,29 @@
+Anonymous hole-refill regression
+================================
+
+Run anon-hole-refill through the platform's 4K userspace ABI launcher on a
+kernel with a native 16K page size. The test does not change its page ABI.
+
+  <userpages4k launcher> ./anon-hole-refill
+  sudo <userpages4k launcher> ./anon-hole-refill --native-16k
+
+The optional --native-16k argument enables physical density checks and requires
+visible pagemap PFNs (CAP_SYS_ADMIN). Without it, four density results are
+skipped. Do not use it with a different native page size. Pagemap must be
+readable even without privileged PFNs: present bits verify neighbor prefault.
+
+The test owns 16 MiB of logical data. It discards individual 4K leaves and
+writes before reading them, exercising missing-PTE refill rather than zero-page
+COW. It checks zero initialization, all retained data and neighboring mappings.
+Two phased rounds check slot reuse. A two-hole case checks that one fault
+prefaults both missing neighbors before the second is accessed.
+
+Initial backing must be within one native page of 16 MiB. Final backing after
+each refill sequence must be at most 20 MiB, allowing bounded pool slack. The
+old fresh-private-folio path consumes 64 MiB after single-hole refill rounds
+and 32 MiB after the paired-hole sequence. Temporary coexistence of original
+and replacement backing is allowed; the test does not require 16 MiB at every
+intermediate step.
+
+Expect eight TAP results. A 30-second alarm bounds the test. It does not fork,
+induce pressure or test concurrent faults; see the companion lifetime tests.

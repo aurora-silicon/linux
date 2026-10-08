@@ -7,12 +7,14 @@ CFLAGS += -Wall -Wextra -O2 -ffixed-x18
 TEST_GEN_FILES += compat-probe-4k compat-probe-64k compat-probe-dynamic compat-interp32 compat-aslr-probe compat-mlock-probe
 TEST_GEN_FILES += fex-x86-contract libfex-abi.so compat-policy-probe compat-uffd-probe compat-vfio-probe
 TEST_GEN_FILES += compat-shm-probe compat-perf-probe compat-numa-probe compat-numa-balancing-probe
+TEST_GEN_PROGS_EXTENDED += anon-hole-refill anon-hole-refill-race anon-hole-refill-reclaim
+TEST_FILES += README.hole-refill README.hole-refill-race README.hole-refill-reclaim
 TEST_FILES += compat-script runtime-app.py
 include ../../lib.mk
 
 $(OUTPUT)/page-contract: page-contract.c x18-probe.S
 
-$(OUTPUT)/thread-fixture-init $(OUTPUT)/user16k-smoke-init $(OUTPUT)/cow-pool: LDLIBS += -pthread
+$(OUTPUT)/thread-fixture-init $(OUTPUT)/user16k-smoke-init $(OUTPUT)/cow-pool $(OUTPUT)/anon-hole-refill-race $(OUTPUT)/anon-hole-refill-reclaim: LDLIBS += -pthread
 
 # Freestanding ELF32 probes exercise the compat ABI without an armhf sysroot.
 AARCH32_CC ?= clang --target=arm-linux-gnueabihf
