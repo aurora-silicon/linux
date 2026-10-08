@@ -258,6 +258,23 @@ class CalibrationExtractorTests(unittest.TestCase):
                         source.write_bytes(b"x" * offset + image + b"x" * 300)
                         self.assertEqual(extractor.scan_input(source), [(offset, image)])
 
+    def test_rejected_parent_img4_cannot_expose_a_nested_fsc2(self):
+        inner = synthetic_fsc2_image(payload=b"CALBinner")
+        malformed = tlv(0xA0, tlv(0x30, ia5(b"IM4M") + tlv(0x30, b"\x04\x05x")))
+        outer = synthetic_fsc2_image(payload=b"CALB" + inner, manifest=malformed)
+        self.assertEqual(extractor.find_calibrations(outer), [])
+        self.assert_cli_rejects_without_write(outer)
+
+    def test_incomplete_parent_img4_across_chunks_cannot_expose_nested_fsc2(self):
+        inner = synthetic_fsc2_image(payload=b"CALBinner")
+        outer = synthetic_fsc2_image(payload=b"CALB" + inner + b"x" * 320)[:-1]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "synthetic.der"
+            source.write_bytes(outer)
+            with patch.object(extractor, "SCAN_CHUNK_SIZE", 64), patch.object(extractor, "SCAN_OVERLAP", 1024):
+                self.assertEqual(extractor.scan_input(source), [])
+        self.assert_cli_rejects_without_write(outer)
+
     def test_nested_standalone_image_is_not_carved_twice(self):
         nested = synthetic_fsc2_image()
         outer = synthetic_fsc2_image(payload=b"CALB" + nested + b"x" * 320)

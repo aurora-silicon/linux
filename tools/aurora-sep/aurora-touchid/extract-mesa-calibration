@@ -208,10 +208,10 @@ def validate_fsc2_image(data, start):
     return img4.end
 
 
-def find_comb_ranges(data):
-    """Recognize comb ranges, including a body split across scan windows."""
+def find_container_ranges(data, name):
+    """Recognize enclosing ranges even when a body spans scan windows."""
     ranges = set()
-    signature = b"\x16\x04comb"
+    signature = b"\x16" + bytes([len(name)]) + name
     search_at = 0
     while True:
         marker = data.find(signature, search_at)
@@ -235,10 +235,14 @@ def find_comb_ranges(data):
     return ranges
 
 
+def find_comb_ranges(data):
+    return find_container_ranges(data, b"comb")
+
+
 def find_calibrations(data):
     results = find_comb_calibrations(data)
-    comb_ranges = find_comb_ranges(data)
-    # A standalone FSC2 IMG4 must not be carved out of a comb container.
+    container_ranges = find_comb_ranges(data) | find_container_ranges(data, b"IMG4")
+    # Reject nested images even when their enclosing IMG4 is malformed.
     signature = b"\x16\x04IMG4"
     search_at = 0
     while True:
@@ -249,7 +253,7 @@ def find_calibrations(data):
             start = marker - header_length
             if start < 0 or data[start] != 0x30:
                 continue
-            if (any(begin < start < end for begin, end in comb_ranges)
+            if (any(begin < start < end for begin, end in container_ranges)
                     or any(begin <= start < end for begin, end in results)):
                 continue
             try:
@@ -349,6 +353,7 @@ def scan_input(path):
 
     candidates = {}
     comb_ranges = set()
+    image_ranges = set()
     overlap = b""
     total = 0
     with path.open("rb", buffering=0) as source:
@@ -361,12 +366,14 @@ def scan_input(path):
             window_start = total - len(window)
             comb_ranges.update((window_start + start, window_start + end)
                                for start, end in find_comb_ranges(window))
+            image_ranges.update((window_start + start, window_start + end)
+                                for start, end in find_container_ranges(window, b"IMG4"))
             for start, end in find_calibrations(window):
                 absolute_start = window_start + start
                 candidates.setdefault(absolute_start, bytes(window[start:end]))
             overlap = window[-SCAN_OVERLAP:]
     # A nested image can be complete before its enclosing object is complete.
-    enclosing_ranges = comb_ranges | {(start, start + len(blob))
+    enclosing_ranges = comb_ranges | image_ranges | {(start, start + len(blob))
                                       for start, blob in candidates.items()}
     # Keep every legacy comb candidate, including pre-existing ambiguity.
     comb_starts = {begin for begin, _ in comb_ranges}
