@@ -27,6 +27,10 @@
 		serial0 = &serial0;
 		pmp = &pmp;
 		wifi0 = &wifi0;
+		/* used by the loader to hand over the display */
+		dcp = &dcp;
+		disp0 = &display;
+		disp0-piodma = &disp0_piodma;
 	};
 
 	chosen {
@@ -43,6 +47,7 @@
 		framebuffer0: framebuffer@0 {
 			compatible = "apple,simple-framebuffer", "simple-framebuffer";
 			reg = <0 0 0 0>; /* To be filled by loader */
+			power-domains = <&ps_disp_cpu>;
 			/* Format properties will be added by loader */
 			status = "disabled";
 		};
@@ -451,6 +456,20 @@
 				reg = <0x24000 0x1d0000>;
 			};
 		};
+	};
+};
+
+&dcp_mbox {
+	status = "okay";
+};
+
+&dcp {
+	/* 2408x1506 at 219 ppi; 525 nits peak from the backlight node */
+	panel: panel {
+		compatible = "apple,panel-j700", "apple,panel";
+		width-mm = <279>;
+		height-mm = <175>;
+		apple,max-brightness = <525>;
 	};
 };
 
