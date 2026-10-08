@@ -2052,7 +2052,8 @@ static void apple_taptic_destroy(struct ff_device *ff)
 	{
 		guard(mutex)(&haptic_dev->auto_trigger_mutex);
 		if (msc->haptics && READ_ONCE(msc->haptics->mode) == HID_HAPTIC_MODE_HOST) {
-			ret = magicmouse_switch_mode(msc->haptics->input_dev, HID_HAPTIC_MODE_DEVICE);
+			ret = magicmouse_switch_mode(msc->haptics->input_dev,
+						     HID_HAPTIC_MODE_DEVICE);
 			if (ret)
 				hid_warn(msc->hdev,
 					 "failed to switch back to device-controlled mode: %d\n",
