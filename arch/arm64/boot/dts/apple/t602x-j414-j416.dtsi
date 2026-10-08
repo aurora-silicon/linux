@@ -25,6 +25,7 @@
 		disp0 = &display;
 		disp0_piodma = &disp0_piodma;
 		keyboard = &keyboard;
+		sep = &sep;
 		sio = &sio;
 		/* m1n1 writes this machine's Thunderbolt calibration onto these
 		 * aliases. usb4-N-* is current m1n1; usb4_N_* is the 1.6.1 bootloader.

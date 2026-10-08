@@ -61,13 +61,134 @@ DEFINE_STATIC_CALL_NULL(trusted_key_get_random,
 static void (*trusted_key_exit)(void);
 static unsigned char migratable;
 
+static DEFINE_MUTEX(trusted_key_source_lock);
+static bool trusted_key_source_active;
+static struct trusted_key_source *trusted_key_source_registered;
+
+/* Defined below; registration needs it before its definition. */
+static int kernel_get_random(unsigned char *key, size_t key_len);
+
+/*
+ * Dispatch targets for when no source is registered. The call sites use
+ * static_call() directly, so the pointers must always be valid code; a NULL
+ * target would fault instead of returning an error.
+ */
+static int trusted_key_absent_seal(struct trusted_key_payload *p, char *datablob)
+{
+	return -ENODEV;
+}
+
+static int trusted_key_absent_unseal(struct trusted_key_payload *p, char *datablob)
+{
+	return -ENODEV;
+}
+
+static int trusted_key_absent_get_random(unsigned char *key, size_t key_len)
+{
+	return -ENODEV;
+}
+
+/**
+ * register_trusted_key_source - offer a trust source from a module
+ * @src: the source. Must outlive its registration.
+ *
+ * Returns 0 on success, -EBUSY if a source is already active, -ENODEV if
+ * trusted.source= names a different one, or the source's own init() error.
+ */
+int register_trusted_key_source(struct trusted_key_source *src)
+{
+	int (*get_random)(unsigned char *key, size_t key_len);
+	int ret;
+
+	if (!src || !src->name || !src->ops || !src->ops->init ||
+	    !src->ops->seal || !src->ops->unseal)
+		return -EINVAL;
+
+	/* An explicit trusted.source= names one source; honour it. */
+	if (trusted_key_source && strcmp(trusted_key_source, src->name))
+		return -ENODEV;
+
+	mutex_lock(&trusted_key_source_lock);
+
+	if (trusted_key_source_active) {
+		mutex_unlock(&trusted_key_source_lock);
+		return -EBUSY;
+	}
+
+	get_random = src->ops->get_random;
+	if (trusted_rng && strcmp(trusted_rng, "default")) {
+		if (!strcmp(trusted_rng, "kernel")) {
+			get_random = kernel_get_random;
+		} else if (strcmp(trusted_rng, src->name) || !get_random) {
+			mutex_unlock(&trusted_key_source_lock);
+			return -EINVAL;
+		}
+	}
+	if (!get_random)
+		get_random = kernel_get_random;
+
+	ret = src->ops->init();
+	if (ret) {
+		mutex_unlock(&trusted_key_source_lock);
+		return ret;
+	}
+
+	static_call_update(trusted_key_seal, src->ops->seal);
+	static_call_update(trusted_key_unseal, src->ops->unseal);
+	static_call_update(trusted_key_get_random, get_random);
+	trusted_key_exit = src->ops->exit;
+	migratable = src->ops->migratable;
+	trusted_key_source_active = true;
+	trusted_key_source_registered = src;
+
+	mutex_unlock(&trusted_key_source_lock);
+	pr_info("trusted_key: source '%s' registered\n", src->name);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(register_trusted_key_source);
+
+/**
+ * unregister_trusted_key_source - withdraw a previously registered source
+ * @src: the source that was registered.
+ *
+ * Keys sealed by @src stay in the keyring and stop being usable, which is the
+ * intended outcome: the thing that could unseal them is gone.
+ */
+void unregister_trusted_key_source(struct trusted_key_source *src)
+{
+	mutex_lock(&trusted_key_source_lock);
+
+	/* Only the source that registered may withdraw itself. */
+	if (!trusted_key_source_active || src != trusted_key_source_registered) {
+		mutex_unlock(&trusted_key_source_lock);
+		return;
+	}
+
+	static_call_update(trusted_key_seal, trusted_key_absent_seal);
+	static_call_update(trusted_key_unseal, trusted_key_absent_unseal);
+	static_call_update(trusted_key_get_random, trusted_key_absent_get_random);
+
+	if (trusted_key_exit)
+		trusted_key_exit();
+	trusted_key_exit = NULL;
+	migratable = 0;
+	trusted_key_source_active = false;
+	trusted_key_source_registered = NULL;
+
+	mutex_unlock(&trusted_key_source_lock);
+	pr_info("trusted_key: source '%s' unregistered\n",
+		src && src->name ? src->name : "?");
+}
+EXPORT_SYMBOL_GPL(unregister_trusted_key_source);
+
 enum {
 	Opt_err,
-	Opt_new, Opt_load, Opt_update,
+	Opt_new, Opt_import, Opt_load, Opt_update,
 };
 
 static const match_table_t key_tokens = {
 	{Opt_new, "new"},
+	{Opt_import, "import"},
 	{Opt_load, "load"},
 	{Opt_update, "update"},
 	{Opt_err, NULL}
@@ -103,6 +224,19 @@ static int datablob_parse(char **datablob, struct trusted_key_payload *p)
 			return -EINVAL;
 		p->key_len = keylen;
 		ret = Opt_new;
+		break;
+	case Opt_import:
+		c = strsep(datablob, " \t");
+		if (!c || strlen(c) % 2)
+			return -EINVAL;
+		keylen = strlen(c) / 2;
+		if (keylen < MIN_KEY_SIZE || keylen > MAX_KEY_SIZE)
+			return -EINVAL;
+		ret = hex2bin(p->key, c, keylen);
+		if (ret < 0)
+			return -EINVAL;
+		p->key_len = keylen;
+		ret = Opt_import;
 		break;
 	case Opt_load:
 		/* first argument is sealed blob */
@@ -205,6 +339,11 @@ static int trusted_instantiate(struct key *key,
 			goto out;
 		}
 
+		ret = static_call(trusted_key_seal)(payload, datablob);
+		if (ret < 0)
+			pr_info("key_seal failed (%d)\n", ret);
+		break;
+	case Opt_import:
 		ret = static_call(trusted_key_seal)(payload, datablob);
 		if (ret < 0)
 			pr_info("key_seal failed (%d)\n", ret);
@@ -337,7 +476,10 @@ static int kernel_get_random(unsigned char *key, size_t key_len)
 static int __init init_trusted(void)
 {
 	int (*get_random)(unsigned char *key, size_t key_len);
-	int i, ret = 0;
+	/* -ENODEV when the built-in array is empty or nothing matches, so a
+	 * later module source can still register instead of hitting -EBUSY.
+	 */
+	int i, ret = -ENODEV;
 
 	for (i = 0; i < ARRAY_SIZE(trusted_key_sources); i++) {
 		if (trusted_key_source &&
@@ -385,8 +527,21 @@ static int __init init_trusted(void)
 	 * encrypted_keys.ko depends on successful load of this module even if
 	 * trusted key implementation is not found.
 	 */
-	if (ret == -ENODEV)
+	if (ret == -ENODEV) {
+		/*
+		 * No built-in source. Leave the dispatch pointing at code that
+		 * fails rather than at NULL, so a seal attempted before any
+		 * module registers returns an error instead of faulting.
+		 */
+		static_call_update(trusted_key_seal, trusted_key_absent_seal);
+		static_call_update(trusted_key_unseal, trusted_key_absent_unseal);
+		static_call_update(trusted_key_get_random,
+				   trusted_key_absent_get_random);
 		return 0;
+	}
+
+	if (!ret)
+		trusted_key_source_active = true;
 
 	return ret;
 }

@@ -385,6 +385,43 @@
 			#performance-domain-cells = <0>;
 		};
 
+		sep_dart: iommu@280b80000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x2 0x80b80000 0x0 0x20000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 353 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			/*
+			 * The SEP only accepts IOVAs in this window, which already
+			 * carries the BIT(40) alias the DART translates.
+			 */
+			apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
+			apple,dma-offset = /bits/ 64 <0x0>;
+		};
+
+		sep: sep@282600000 {
+			compatible = "apple,sep";
+			reg = <0x2 0x82600000 0x0 0x88000>;
+			mboxes = <&sep_mbox>;
+			mbox-names = "mbox";
+			iommus = <&sep_dart 0>;
+			power-domains = <&ps_sep>;
+			status = "disabled";
+		};
+
+		sep_mbox: mailbox@282608000 {
+			compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x2 0x82608000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 343 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 344 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 345 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 346 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+		};
+
 		pmgr: power-management@300700000 {
 			compatible = "apple,t8140-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
 			#address-cells = <1>;
@@ -960,6 +997,18 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 			power-domains = <&ps_i2c0>;
+			status = "disabled";
+		};
+
+		spi2: spi@385108000 {
+			compatible = "apple,t8140-spi", "apple,t8103-spi";
+			reg = <0x3 0x85108000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1102 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>;
+			power-domains = <&ps_spi2>;
+			#address-cells = <1>;
+			#size-cells = <0>;
 			status = "disabled";
 		};
 

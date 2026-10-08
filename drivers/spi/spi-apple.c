@@ -99,12 +99,32 @@
 
 #define APPLE_SPI_DELAY_PRE		0x160
 #define APPLE_SPI_DELAY_POST		0x168
+#define APPLE_SPI_DELAY_POST_CYCLES	0x194
 #define APPLE_SPI_DELAY_ENABLE		BIT(0)
 #define APPLE_SPI_DELAY_NO_INTERBYTE	BIT(1)
 #define APPLE_SPI_DELAY_SET_SCK		BIT(4)
+#define APPLE_SPI_DELAY_SET_CS		BIT(5)
 #define APPLE_SPI_DELAY_SET_MOSI	BIT(6)
 #define APPLE_SPI_DELAY_SCK_VAL		BIT(8)
+#define APPLE_SPI_DELAY_CS_VAL		BIT(10)
+#define APPLE_SPI_DELAY_PRE_ARM		BIT(11)
 #define APPLE_SPI_DELAY_MOSI_VAL	BIT(12)
+#define APPLE_SPI_DELAY_CYCLES		GENMASK(31, 16)
+
+/*
+ * These are the values used by AppleSPIMCController's hardware-delay path.
+ * The pre-delay asserts active-low CS and the post-delay releases it. The
+ * otherwise undocumented bit 11 is named for its observed role rather than
+ * assigning it a speculative electrical meaning.
+ */
+#define APPLE_SPI_DELAY_PRE_FLAGS	(APPLE_SPI_DELAY_PRE_ARM | \
+					 APPLE_SPI_DELAY_SET_CS | \
+					 APPLE_SPI_DELAY_NO_INTERBYTE | \
+					 APPLE_SPI_DELAY_ENABLE)
+#define APPLE_SPI_DELAY_POST_FLAGS	(APPLE_SPI_DELAY_CS_VAL | \
+					 APPLE_SPI_DELAY_SET_CS | \
+					 APPLE_SPI_DELAY_NO_INTERBYTE | \
+					 APPLE_SPI_DELAY_ENABLE)
 
 #define APPLE_SPI_FIFO_DEPTH		16
 
@@ -168,6 +188,7 @@ static void apple_spi_init(struct apple_spi *spi)
 	/* Disable delays */
 	reg_write(spi, APPLE_SPI_DELAY_PRE, 0);
 	reg_write(spi, APPLE_SPI_DELAY_POST, 0);
+	reg_write(spi, APPLE_SPI_DELAY_POST_CYCLES, 0);
 }
 
 static int apple_spi_prepare_message(struct spi_controller *ctlr, struct spi_message *msg)
@@ -191,6 +212,71 @@ static void apple_spi_set_cs(struct spi_device *device, bool is_high)
 	struct apple_spi *spi = spi_controller_get_devdata(device->controller);
 
 	reg_mask(spi, APPLE_SPI_PIN, APPLE_SPI_PIN_CS, is_high ? APPLE_SPI_PIN_CS : 0);
+}
+
+static int apple_spi_delay_cycles(struct apple_spi *spi, struct spi_delay *delay,
+				  u32 *cycles)
+{
+	u64 value;
+	int ns;
+
+	ns = spi_delay_to_ns(delay, NULL);
+	if (ns < 0)
+		return ns;
+
+	value = DIV_ROUND_UP_ULL((u64)clk_get_rate(spi->clk) * ns,
+				  1000000000ULL);
+	if (value > FIELD_MAX(APPLE_SPI_DELAY_CYCLES))
+		return -ERANGE;
+
+	*cycles = value;
+	return 0;
+}
+
+static int apple_spi_set_cs_timing(struct spi_device *device)
+{
+	struct apple_spi *spi = spi_controller_get_devdata(device->controller);
+	u32 setup_cycles, hold_cycles;
+	int ret;
+
+	/* This controller path has no hardware representation for inactive time. */
+	if (device->cs_inactive.value)
+		return -EOPNOTSUPP;
+
+	ret = apple_spi_delay_cycles(spi, &device->cs_setup, &setup_cycles);
+	if (ret)
+		return ret;
+	ret = apple_spi_delay_cycles(spi, &device->cs_hold, &hold_cycles);
+	if (ret)
+		return ret;
+
+	if (!setup_cycles && !hold_cycles) {
+		reg_mask(spi, APPLE_SPI_SHIFTCFG,
+			 APPLE_SPI_SHIFTCFG_OVERRIDE_CS, 0);
+		reg_write(spi, APPLE_SPI_DELAY_PRE, 0);
+		reg_write(spi, APPLE_SPI_DELAY_POST, 0);
+		reg_write(spi, APPLE_SPI_DELAY_POST_CYCLES, 0);
+		return 0;
+	}
+
+	reg_write(spi, APPLE_SPI_DELAY_PRE,
+		  FIELD_PREP(APPLE_SPI_DELAY_CYCLES, setup_cycles) |
+		  APPLE_SPI_DELAY_PRE_FLAGS);
+	reg_write(spi, APPLE_SPI_DELAY_POST_CYCLES, hold_cycles);
+	reg_write(spi, APPLE_SPI_DELAY_POST,
+		  FIELD_PREP(APPLE_SPI_DELAY_CYCLES, hold_cycles) |
+		  APPLE_SPI_DELAY_POST_FLAGS);
+	reg_mask(spi, APPLE_SPI_SHIFTCFG, 0,
+		 APPLE_SPI_SHIFTCFG_OVERRIDE_CS);
+
+	dev_dbg(&device->dev,
+		"hardware CS setup=%u hold=%u cycles: pre=%#08x post=%#08x post_cycles=%#08x shiftcfg=%#08x\n",
+		setup_cycles, hold_cycles,
+		reg_read(spi, APPLE_SPI_DELAY_PRE),
+		reg_read(spi, APPLE_SPI_DELAY_POST),
+		reg_read(spi, APPLE_SPI_DELAY_POST_CYCLES),
+		reg_read(spi, APPLE_SPI_SHIFTCFG));
+	return 0;
 }
 
 static bool apple_spi_prep_transfer(struct apple_spi *spi, struct spi_transfer *t)
@@ -491,6 +577,7 @@ static int apple_spi_probe(struct platform_device *pdev)
 	ctlr->bits_per_word_mask = SPI_BPW_RANGE_MASK(1, 32);
 	ctlr->prepare_message = apple_spi_prepare_message;
 	ctlr->set_cs = apple_spi_set_cs;
+	ctlr->set_cs_timing = apple_spi_set_cs_timing;
 	ctlr->transfer_one = apple_spi_transfer_one;
 	ctlr->use_gpio_descriptors = true;
 	ctlr->auto_runtime_pm = true;
