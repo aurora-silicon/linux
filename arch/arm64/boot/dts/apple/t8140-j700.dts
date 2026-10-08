@@ -17,7 +17,6 @@
 	model = "Apple MacBook Neo";
 
 	aliases {
-		pmp = &pmp;
 		nvram = &nvram;
 		spi0 = &qspi;
 		i2c2 = &i2c2;
