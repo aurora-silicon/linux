@@ -27,6 +27,9 @@ properties:
   reg:
     maxItems: 1
 
+  rtc:
+    $ref: /schemas/rtc/apple,j700-pmu-rtc.yaml#
+
 required:
   - compatible
   - reg

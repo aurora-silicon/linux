@@ -9,6 +9,7 @@
 #include <linux/module.h>
 #include <linux/nvmem-provider.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/spmi.h>
 #include <linux/regmap.h>
 
@@ -37,6 +38,7 @@ static int apple_spmi_nvmem_write(void *priv, unsigned int offset, void *val,
 static int apple_spmi_nvmem_probe(struct spmi_device *sdev)
 {
 	struct regmap *regmap;
+	struct nvmem_device *provider;
 	struct nvmem_config nvmem_cfg = {
 		.dev = &sdev->dev,
 		.name = "spmi_nvmem",
@@ -54,7 +56,13 @@ static int apple_spmi_nvmem_probe(struct spmi_device *sdev)
 
 	nvmem_cfg.priv = regmap;
 
-	return PTR_ERR_OR_ZERO(devm_nvmem_register(&sdev->dev, &nvmem_cfg));
+	provider = devm_nvmem_register(&sdev->dev, &nvmem_cfg);
+	if (IS_ERR(provider))
+		return PTR_ERR(provider);
+	if (!of_device_is_compatible(sdev->dev.of_node, "apple,baku-pmic"))
+		return 0;
+
+	return devm_of_platform_populate(&sdev->dev);
 }
 
 static const struct of_device_id apple_spmi_nvmem_id_table[] = {
