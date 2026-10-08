@@ -16,8 +16,8 @@ Platform and configuration
 --------------------------
 
 Use the separately reviewed T8140 PCIe bootstrap described in
-``Documentation/PCI/controller/apple-t8140.rst``. Its explicit kernel opt-in is
-``pcie_apple_piodma_diag.enumerate=1``. Public m1n1 must populate the J700
+``Documentation/PCI/controller/apple-t8140.rst``. It runs during boot when
+``CONFIG_PCIE_APPLE_PIODMA_DIAG=y``. Public m1n1 must populate the J700
 ``wifi0`` endpoint's own ``local-mac-address``; a zero placeholder is rejected.
 
 The tested configuration includes ``CONFIG_MT7932_FULLMAC=m``,

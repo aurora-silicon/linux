@@ -7,10 +7,13 @@ The J700 path trains port 0, validates a bounded PIODMA bootstrap request,
 and enables native ECAM for the MediaTek Wi-Fi and Bluetooth functions.
 The root bridge forwards their BARs and DART translates endpoint DMA.
 
-This is an opt-in bring-up implementation, not general T8140 PCIe support.
-Build ``CONFIG_PCIE_APPLE_PIODMA_DIAG=y`` and pass
-``pcie_apple_piodma_diag.enumerate=1`` to the kernel. Without the opt-in, the
-root-only diagnostic path continues to reject downstream configuration access.
+This is a bring-up implementation, not general T8140 PCIe support.
+Build ``CONFIG_PCIE_APPLE_PIODMA_DIAG=y``. The board device tree selects the
+bootstrap by pointing the host's ``apple,piodma`` property at the engine, and
+the kernel then runs it during the host probe. Passing
+``pcie_apple_piodma_diag.enumerate=0`` keeps the root-only diagnostic path,
+which rejects downstream configuration access. A kernel built without the
+option always uses that root-only path.
 Build the host and its DART in as well: the supplier retains published DMA
 and has no removal contract. Keeping the supplier and host built in avoids
 a module dependency on a provider whose lifetime cannot end at unload.
