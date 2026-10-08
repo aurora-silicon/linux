@@ -195,6 +195,15 @@ impl Gate {
         })
     }
 
+    /// Pressure reclaim released this VM's backing and no user has entered
+    /// since: its next job restores first. Never blocks; a contended gate
+    /// reads as not evicted.
+    pub(crate) fn evicted(&self) -> bool {
+        self.state
+            .try_lock()
+            .is_some_and(|state| state.evicted && !state.busy && state.users == 0)
+    }
+
     /// A page-table mutation happened outside a `Reclaim` (the purge path runs
     /// on busy VMs). The next `enter` restores every INVALIDATED mapping.
     pub(crate) fn note_evicted(&self) {
@@ -311,6 +320,11 @@ impl Vm {
 
     pub(crate) fn residency_reclaim_enabled(&self) -> bool {
         self.residency.is_some()
+    }
+
+    /// The residency gate of a user VM, for observers that must not keep the VM.
+    pub(crate) fn residency_gate(&self) -> Option<Arc<Gate>> {
+        self.residency.clone()
     }
 
     pub(super) fn enter_residency_metadata(&self) -> Result<Option<Lease>> {

@@ -642,6 +642,37 @@ impl Registry {
             || !self.render.retired.is_empty()
             || !self.teardown.is_empty()
     }
+    /// Gives back the USC backing of render pools whose client VM pressure
+    /// reclaim evicted (an idle VM) and whose final free-list release was
+    /// consumed. The vacated backings go to the worker's deferred batch, which
+    /// frees them after the device mutex; a later job of that client re-arms
+    /// the pool first.
+    pub(in crate::g17) fn vacate_evicted_render_pools(
+        &mut self,
+        init: &crate::g17::initdata::InitData,
+        deferred: &mut super::DeferredBatch,
+    ) -> Result {
+        let render = &mut self.render;
+        render.pools.observe(init)?;
+        for entry in render.entries.iter().flatten() {
+            if !deferred.render_backing_room() {
+                break;
+            }
+            if entry.constructing || entry.growing || entry.preparing.is_some() {
+                continue;
+            }
+            let Some(pool) = entry.pool.as_ref() else {
+                continue;
+            };
+            if pool.vacant() || !render.pools.idle(pool.id()) || !pool.client_evicted() {
+                continue;
+            }
+            if let Some(backing) = pool.vacate() {
+                deferred.defer_render_backing(backing);
+            }
+        }
+        Ok(())
+    }
     pub(in crate::g17) fn render_in_flight(&self) -> bool {
         self.render.entries.iter().flatten().any(|entry| {
             entry.pair.as_ref().map_or(

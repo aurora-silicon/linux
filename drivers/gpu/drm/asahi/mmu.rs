@@ -94,7 +94,7 @@ mod context;
 mod shared;
 mod lifetime;
 mod residency;
-pub(crate) use residency::VmShrinker;
+pub(crate) use residency::{Gate as ResidencyGate, VmShrinker};
 pub(crate) use bind::PreparedUserBindBatch;
 pub(crate) use lifetime::VmJobGuard;
 

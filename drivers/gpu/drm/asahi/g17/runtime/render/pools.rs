@@ -52,11 +52,21 @@ impl Pools {
     fn owner(pool: &RenderPool) -> Owner {
         Owner {
             serial: pool.serial(),
+            epoch: pool.epoch(),
             buffer_slot: u32::from(pool.id()),
             control_va: pool.control_va(),
             ring_va: pool.run_list_va(),
             cookie: pool.end_va(),
         }
+    }
+
+    /// The pool's registration has a consumed final release and no references:
+    /// the firmware holds nothing of its backing.
+    pub(super) fn idle(&self, id: u16) -> bool {
+        Self::slot(id)
+            .ok()
+            .and_then(|slot| self.leases[slot])
+            .is_some_and(|lease| lease.released())
     }
 
     pub(super) fn released(&self, id: u32, _control: u64) -> bool {
@@ -68,6 +78,10 @@ impl Pools {
     /// Install both engine references before either inner queue becomes
     /// visible. Warm overlap keeps the existing generation and pool contents.
     pub(super) fn prepare(&mut self, init: &InitData, pool: &RenderPool) -> Result<Preparation> {
+        // A vacated pool is re-armed by the submission path before it retries.
+        if pool.vacant() {
+            return Err(EAGAIN);
+        }
         self.observe(init)?;
         let slot = Self::slot(pool.id())?;
         let owner = Self::owner(pool);
@@ -92,6 +106,9 @@ impl Pools {
     /// Warming validates the incoming owner and stages its descriptor without
     /// acquiring command references or publishing an asynchronous request.
     pub(super) fn warm(&self, init: &InitData, pool: &RenderPool) -> Result {
+        if pool.vacant() {
+            return Err(EAGAIN);
+        }
         let previous = self.leases[Self::slot(pool.id())?];
         let owner = Self::owner(pool);
         if previous.is_some_and(|lease| lease.owner() == owner) {
