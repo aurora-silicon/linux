@@ -640,6 +640,17 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
 	{},
 };
 
+/*
+ * The T8140 external display coprocessor needs firmware support this driver
+ * does not have yet.  Leave it out of the display subsystem, so that an
+ * enabled node cannot hold back the internal panel's component master.
+ */
+static bool apple_dcp_usable(struct device_node *np)
+{
+	return of_device_is_available(np) &&
+	       !of_device_is_compatible(np, "apple,t8140-dcpext");
+}
+
 static int apple_drm_init_dcp(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
@@ -652,7 +663,7 @@ static int apple_drm_init_dcp(struct device *dev)
 
 	for_each_matching_node(np, apple_dcp_id_tbl) {
 		bool dcp_ext;
-		if (!of_device_is_available(np)) {
+		if (!apple_dcp_usable(np)) {
 			of_node_put(np);
 			continue;
 		}
@@ -831,7 +842,7 @@ static int add_dcp_components(struct device *dev,
 	int num = 0;
 
 	for_each_matching_node(np, apple_dcp_id_tbl) {
-		if (of_device_is_available(np)) {
+		if (apple_dcp_usable(np)) {
 			drm_of_component_match_add(dev, matchptr,
 						   component_compare_of, np);
 			num++;

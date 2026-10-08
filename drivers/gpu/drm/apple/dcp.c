@@ -3570,6 +3570,12 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	if (dcp_session_retained(dev))
 		return dev_err_probe(dev, -EBUSY, "Previous live DCP session requires a reboot\n");
 
+	/* Not part of the display subsystem yet; see apple_dcp_usable(). */
+	if (of_device_is_compatible(dev->of_node, "apple,t8140-dcpext")) {
+		dev_info(dev, "external display coprocessor not supported yet\n");
+		return -ENODEV;
+	}
+
 	fw_compat = dcp_check_firmware_version(dev);
 	if (fw_compat == DCP_FIRMWARE_UNKNOWN)
 		return -ENODEV;
