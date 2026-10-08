@@ -299,8 +299,9 @@ void mm_subpage_pool_put(struct mm_subpage_pool *pool)
  * Policy-sensitive, locked, droppable and multi-node faults keep fresh backing.
  * An mm can move cgroups; old charged slots must not satisfy its new faults.
  */
-struct mm_subpage_pool *mm_subpage_cow_pool_get(struct mm_struct *mm,
-			struct vm_area_struct *vma, unsigned long address)
+struct mm_subpage_pool *mm_subpage_cow_pool_get_charged(struct mm_struct *mm,
+			struct mm_struct *charge_mm, struct vm_area_struct *vma,
+			unsigned long address)
 {
 	struct mm_subpage_cow_pools *pools, *new_pools;
 	struct mm_subpage_pool *pool, *new;
@@ -334,7 +335,7 @@ struct mm_subpage_pool *mm_subpage_cow_pool_get(struct mm_struct *mm,
 		else
 			kfree(new_pools);
 	}
-	memcg = get_mem_cgroup_from_mm(mm);
+	memcg = get_mem_cgroup_from_mm(charge_mm);
 	/* Acquire the immutable charge domain published with this bucket. */
 	pool = smp_load_acquire(&pools->pool[bucket]);
 	if (!pool) {
@@ -373,6 +374,12 @@ struct mm_subpage_pool *mm_subpage_cow_pool_get(struct mm_struct *mm,
 		return NULL;
 	mm_subpage_pool_get(pool);
 	return pool;
+}
+
+struct mm_subpage_pool *mm_subpage_cow_pool_get(struct mm_struct *mm,
+			struct vm_area_struct *vma, unsigned long address)
+{
+	return mm_subpage_cow_pool_get_charged(mm, mm, vma, address);
 }
 
 bool mm_subpage_cow_folio_matches(struct mm_subpage_pool *pool, struct folio *folio)

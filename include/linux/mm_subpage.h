@@ -49,6 +49,10 @@ void mm_subpage_pool_close(struct mm_subpage_pool *pool);
 /* Optional per-mm pool: default policy, one memory node, matching memcg. */
 struct mm_subpage_pool *mm_subpage_cow_pool_get(struct mm_struct *mm,
 					     struct vm_area_struct *vma, unsigned long address);
+/* Fork's child owns the pool before it joins a cgroup; charge the source mm. */
+struct mm_subpage_pool *mm_subpage_cow_pool_get_charged(struct mm_struct *mm,
+			struct mm_struct *charge_mm, struct vm_area_struct *vma,
+			unsigned long address);
 void mm_subpage_cow_pool_exit(struct mm_struct *mm);
 bool mm_subpage_cow_folio_matches(struct mm_subpage_pool *pool, struct folio *folio);
 bool mm_subpage_cow_wait_busy_at(struct mm_subpage_pool *pool, unsigned int offset);
