@@ -17,6 +17,7 @@
 #include <linux/pm_domain.h>
 #include <linux/rculist.h>
 #include <linux/seq_file.h>
+#include <linux/slab.h>
 #include <linux/soc/apple/pmp-report.h>
 
 #define PMP_REPORT_READY 0x1
@@ -50,12 +51,10 @@ struct apple_pmp_report {
 	void __iomem *base;
 	spinlock_t lock;
 	struct list_head list;
+	struct dentry *debugfs;
 };
 
-/*
- * Bound report regions, for apple_pmp_report_fast_die_effort().  Regions are
- * added once they are set up and never removed: the driver cannot be unbound.
- */
+/* Bound report regions, protected by RCU until managed teardown drains readers. */
 static LIST_HEAD(apple_pmp_reports);
 static DEFINE_MUTEX(apple_pmp_reports_lock);
 static struct dentry *apple_pmp_report_debugfs;
@@ -132,6 +131,21 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(apple_pmp_report_status);
 
+static void apple_pmp_report_release(void *data)
+{
+	struct apple_pmp_report *rep = data;
+
+	/* Withdraw child providers while their power callbacks can still use MMIO. */
+	of_platform_depopulate(rep->dev);
+	mutex_lock(&apple_pmp_reports_lock);
+	if (!list_empty(&rep->list))
+		list_del_rcu(&rep->list);
+	mutex_unlock(&apple_pmp_reports_lock);
+	synchronize_rcu();
+	/* The debugfs proxy drains active reads and rejects subsequent accesses. */
+	debugfs_remove(rep->debugfs);
+}
+
 static int apple_pmp_report_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -154,17 +168,24 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	ret = of_platform_populate(np, NULL, NULL, dev);
+	INIT_LIST_HEAD(&rep->list);
+	ret = devm_add_action_or_reset(dev, apple_pmp_report_release, rep);
 	if (ret)
-		return dev_err_probe(dev, ret, "failed to create child devices\n");
+		return ret;
 
 	mutex_lock(&apple_pmp_reports_lock);
 	list_add_tail_rcu(&rep->list, &apple_pmp_reports);
 	mutex_unlock(&apple_pmp_reports_lock);
 
 	if (rep->offsets->fast_die)
-		debugfs_create_file(dev_name(dev), 0400, apple_pmp_report_debugfs,
-				    rep, &apple_pmp_report_status_fops);
+		rep->debugfs = debugfs_create_file(dev_name(dev), 0400,
+						   apple_pmp_report_debugfs, rep,
+						   &apple_pmp_report_status_fops);
+
+	/* Publish the region before child power callbacks start looking it up. */
+	ret = of_platform_populate(np, NULL, NULL, dev);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to create child devices\n");
 
 	return 0;
 }
@@ -213,28 +234,26 @@ static struct platform_driver apple_pmp_report_driver = {
 	.driver = {
 		.name = "apple-pmp-report",
 		.of_match_table = apple_pmp_report_of_match,
-		/*
-		 * Its child power domains and the region list keep using the
-		 * mapping, and nothing tears them down.
-		 */
+		/* Power-domain providers are not intended for manual unbinding. */
 		.suppress_bind_attrs = true,
 	},
 };
 
 struct apple_pmp_report_entry {
-	struct device *dev;
+	struct device_node *node;
+	struct device_node *report_node;
 	struct generic_pm_domain genpd;
 	u32 id;
+	bool removed;
 };
 
 #define genpd_to_apple_pmp_report_entry(_genpd) \
 	container_of(_genpd, struct apple_pmp_report_entry, genpd)
 
-static int apple_pmp_report_set_state(struct generic_pm_domain *genpd, bool enable)
+static int apple_pmp_report_set_state(struct apple_pmp_report *rep, u32 id,
+				      bool enable)
 {
-	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);
-	struct apple_pmp_report *rep = dev_get_drvdata(ent->dev->parent);
-	u64 bit_val = 1 << ent->id;
+	u64 bit_val = BIT_ULL(id);
 	u64 val;
 	unsigned long flags;
 
@@ -256,14 +275,34 @@ static int apple_pmp_report_set_state(struct generic_pm_domain *genpd, bool enab
 		50000);
 }
 
+static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, bool enable)
+{
+	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);
+	struct apple_pmp_report *rep;
+	int ret = -ENODEV;
+
+	if (READ_ONCE(ent->removed))
+		return ret;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+		if (rep->dev->of_node == ent->report_node) {
+			ret = apple_pmp_report_set_state(rep, ent->id, enable);
+			break;
+		}
+	}
+	rcu_read_unlock();
+	return ret;
+}
+
 static int apple_pmp_report_entry_power_on(struct generic_pm_domain *genpd)
 {
-	return apple_pmp_report_set_state(genpd, true);
+	return apple_pmp_report_entry_set_state(genpd, true);
 }
 
 static int apple_pmp_report_entry_power_off(struct generic_pm_domain *genpd)
 {
-	return apple_pmp_report_set_state(genpd, false);
+	return apple_pmp_report_entry_set_state(genpd, false);
 }
 
 /* ADT DVFS-STATE: four 16-byte entries beginning at entry 8. */
@@ -336,6 +375,28 @@ static int apple_pmp_dvfs_create(struct apple_pmp_report *report)
 	return 0;
 }
 
+static void apple_pmp_report_entry_free(struct apple_pmp_report_entry *ent)
+{
+	of_node_put(ent->report_node);
+	of_node_put(ent->node);
+	kfree(ent->genpd.name);
+	kfree(ent);
+}
+
+static void apple_pmp_report_entry_remove(struct platform_device *pdev)
+{
+	struct apple_pmp_report_entry *ent = platform_get_drvdata(pdev);
+
+	WRITE_ONCE(ent->removed, true);
+	of_genpd_del_provider(ent->node);
+	if (pm_genpd_remove(&ent->genpd)) {
+		/* The core still owns this domain. Keep its now inert storage alive. */
+		dev_warn(&pdev->dev, "retaining busy power domain %s\n", ent->genpd.name);
+		return;
+	}
+	apple_pmp_report_entry_free(ent);
+}
+
 static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -345,36 +406,53 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	const char *name;
 	struct of_phandle_iterator it;
 
-	ent = devm_kzalloc(dev, sizeof(*ent), GFP_KERNEL);
+	ent = kzalloc_obj(*ent);
 	if (!ent)
 		return -ENOMEM;
 
-	ent->dev = dev;
+	ent->node = of_node_get(node);
+	ent->report_node = of_node_get(dev->parent->of_node);
 
 	ret = of_property_read_u32(node, "reg", &ent->id);
-	if (ret)
-		return dev_err_probe(dev, ret, "missing reg property\n");
+	if (ret) {
+		ret = dev_err_probe(dev, ret, "missing reg property\n");
+		goto err_free;
+	}
+	if (ent->id >= 64) {
+		ret = -EINVAL;
+		goto err_free;
+	}
 
 	ret = of_property_read_string(node, "label", &name);
-	if (ret < 0)
-		return dev_err_probe(dev, ret, "missing label property\n");
+	if (ret < 0) {
+		ret = dev_err_probe(dev, ret, "missing label property\n");
+		goto err_free;
+	}
+	ent->genpd.name = kstrdup(name, GFP_KERNEL);
+	if (!ent->genpd.name) {
+		ret = -ENOMEM;
+		goto err_free;
+	}
 
 	if (of_property_read_bool(node, "apple,always-on")) {
 		ent->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
-		apple_pmp_report_set_state(&ent->genpd, true);
+		apple_pmp_report_entry_set_state(&ent->genpd, true);
 	}
 
-	ent->genpd.name = name;
 	ent->genpd.power_on = apple_pmp_report_entry_power_on;
 	ent->genpd.power_off = apple_pmp_report_entry_power_off;
 
 	ret = pm_genpd_init(&ent->genpd, NULL, true);
-	if (ret)
-		return dev_err_probe(dev, ret, "pm_genpd_init failed\n");
+	if (ret) {
+		ret = dev_err_probe(dev, ret, "pm_genpd_init failed\n");
+		goto err_free;
+	}
 
 	ret = of_genpd_add_provider_simple(node, &ent->genpd);
-	if (ret)
-		return dev_err_probe(dev, ret, "of_genpd_add_provider_simple failed\n");
+	if (ret) {
+		ret = dev_err_probe(dev, ret, "of_genpd_add_provider_simple failed\n");
+		goto err_remove_domain;
+	}
 
 	of_for_each_phandle(&it, ret, node, "power-domains", "#power-domain-cells", -1) {
 		struct of_phandle_args parent, child;
@@ -397,11 +475,19 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	}
 
 	pm_genpd_remove_device(dev);
+	platform_set_drvdata(pdev, ent);
 
 	return 0;
 err_remove:
 	of_genpd_del_provider(node);
-	pm_genpd_remove(&ent->genpd);
+err_remove_domain:
+	WRITE_ONCE(ent->removed, true);
+	if (pm_genpd_remove(&ent->genpd)) {
+		dev_warn(dev, "retaining busy power domain %s\n", ent->genpd.name);
+		return ret;
+	}
+err_free:
+	apple_pmp_report_entry_free(ent);
 	return ret;
 }
 
@@ -412,6 +498,7 @@ static const struct of_device_id apple_pmp_report_entry_of_match[] = {
 
 static struct platform_driver apple_pmp_report_entry_driver = {
 	.probe = apple_pmp_report_entry_probe,
+	.remove = apple_pmp_report_entry_remove,
 	.driver = {
 		.name = "apple-pmp-report-entry",
 		.of_match_table = apple_pmp_report_entry_of_match,
