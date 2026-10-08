@@ -2711,6 +2711,13 @@ int apple_pcie_tunnel_prepare(struct device *dev, struct device_node *tunnel)
 	if (!np)
 		return 0;
 
+	/* A qualified bootloader handoff needs no cold initialization. */
+	if (!of_property_read_u32(np, "apple,pciec-preinit-status", &stat) &&
+	    stat == 1) {
+		ret = 0;
+		goto out_np;
+	}
+
 	match = of_match_node(apple_pcie_of_match, np);
 	if (!match) {
 		ret = -ENODEV;
