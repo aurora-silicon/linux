@@ -11,11 +11,13 @@
 #include <linux/dma-mapping.h>
 #include <linux/dmi.h>
 #include <linux/firmware.h>
+#include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/msi.h>
 #include <linux/of.h>
 #include <linux/pci.h>
 #include <linux/printk.h>
+#include <linux/property.h>
 
 #include <linux/unaligned.h>
 
@@ -582,6 +584,10 @@ struct bcm4377_data {
 	char stepping[BCM4377_OTP_MAX_PARAM_LEN];
 	char vendor[BCM4377_OTP_MAX_PARAM_LEN];
 	const char *board_type;
+
+	bool needs_reset;
+	bool cal_needed;
+	bdaddr_t bdaddr;
 
 	struct completion event;
 
@@ -1304,9 +1310,86 @@ static int bcm4378_send_ptb(struct bcm4377_data *bcm4377,
 	return 0;
 }
 
-static int bcm4377_hci_open(struct hci_dev *hdev)
+static void bcm4377_disable_aspm(struct bcm4377_data *bcm4377);
+static int bcm4377_init_cfg(struct bcm4377_data *bcm4377);
+static int bcm4377_boot(struct bcm4377_data *bcm4377);
+static int bcm4377_setup_rti(struct bcm4377_data *bcm4377);
+
+static int bcm4377_pci_reset(struct bcm4377_data *bcm4377)
 {
-	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+	int ret;
+	int irq;
+
+	dev_info(&bcm4377->pdev->dev, "performing hardware reset recovery\n");
+
+	irq = pci_irq_vector(bcm4377->pdev, 0);
+	if (irq > 0)
+		disable_irq(irq);
+
+	if (bcm4377->hw->disable_aspm)
+		bcm4377_disable_aspm(bcm4377);
+
+	ret = pci_reset_function(bcm4377->pdev);
+	if (ret)
+		dev_warn(&bcm4377->pdev->dev,
+			 "function level reset failed with %d; trying to continue anyway\n",
+			 ret);
+
+	msleep(100);
+
+	pci_set_master(bcm4377->pdev);
+
+	ret = bcm4377_init_cfg(bcm4377);
+	if (ret) {
+		dev_err(&bcm4377->pdev->dev,
+			"failed to reinitialize PCI config: %d\n", ret);
+		goto out_irq;
+	}
+
+	bcm4377->bootstage = 0;
+	bcm4377->rti_status = 0;
+	reinit_completion(&bcm4377->event);
+
+	memset(bcm4377->ring_state, 0, sizeof(*bcm4377->ring_state));
+	bcm4377->control_h2d_ring.generation = 0;
+	bcm4377->control_ack_ring.enabled = false;
+	bitmap_zero(bcm4377->control_h2d_ring.msgids,
+		    bcm4377->control_h2d_ring.n_entries);
+	if (bcm4377->control_h2d_ring.events)
+		memset(bcm4377->control_h2d_ring.events, 0,
+		       bcm4377->control_h2d_ring.n_entries *
+			       sizeof(*bcm4377->control_h2d_ring.events));
+
+	if (irq > 0)
+		enable_irq(irq);
+
+	ret = bcm4377_boot(bcm4377);
+	if (ret) {
+		dev_err(&bcm4377->pdev->dev, "failed to reboot firmware: %d\n",
+			ret);
+		return ret;
+	}
+
+	ret = bcm4377_setup_rti(bcm4377);
+	if (ret) {
+		dev_err(&bcm4377->pdev->dev, "failed to re-setup RTI: %d\n",
+			ret);
+		return ret;
+	}
+
+	bcm4377->needs_reset = false;
+	dev_info(&bcm4377->pdev->dev,
+		 "hardware reset recovery completed successfully\n");
+	return 0;
+
+out_irq:
+	if (irq > 0)
+		enable_irq(irq);
+	return ret;
+}
+
+static int bcm4377_hci_open_rings(struct bcm4377_data *bcm4377)
+{
 	int ret;
 
 	dev_dbg(&bcm4377->pdev->dev, "creating rings\n");
@@ -1374,23 +1457,92 @@ destroy_hci_acl_ack:
 	return ret;
 }
 
+static int bcm4377_hci_open(struct hci_dev *hdev)
+{
+	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+	int ret;
+
+	if (bcm4377->needs_reset) {
+		dev_info(&bcm4377->pdev->dev,
+			 "device marked for reset, reinitializing hardware before open\n");
+		ret = bcm4377_pci_reset(bcm4377);
+		if (ret)
+			return ret;
+		bcm4377->cal_needed = true;
+	}
+
+	ret = bcm4377_hci_open_rings(bcm4377);
+	if (ret && !bcm4377->needs_reset) {
+		dev_warn(&bcm4377->pdev->dev,
+			 "creating rings failed (%d); attempting hardware reset recovery\n",
+			 ret);
+		ret = bcm4377_pci_reset(bcm4377);
+		if (ret) {
+			bcm4377->needs_reset = true;
+			return ret;
+		}
+		bcm4377->cal_needed = true;
+		ret = bcm4377_hci_open_rings(bcm4377);
+		if (ret)
+			bcm4377->needs_reset = true;
+	}
+
+	return ret;
+}
+
 static int bcm4377_hci_close(struct hci_dev *hdev)
 {
 	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
 
 	dev_dbg(&bcm4377->pdev->dev, "destroying rings in hci_close\n");
 
-	bcm4377_destroy_transfer_ring(bcm4377, &bcm4377->acl_d2h_ring);
-	bcm4377_destroy_transfer_ring(bcm4377, &bcm4377->acl_h2d_ring);
-	bcm4377_destroy_transfer_ring(bcm4377, &bcm4377->sco_d2h_ring);
-	bcm4377_destroy_transfer_ring(bcm4377, &bcm4377->sco_h2d_ring);
-	bcm4377_destroy_transfer_ring(bcm4377, &bcm4377->hci_d2h_ring);
-	bcm4377_destroy_transfer_ring(bcm4377, &bcm4377->hci_h2d_ring);
+	if (!bcm4377->needs_reset) {
+		if (bcm4377_destroy_transfer_ring(bcm4377, &bcm4377->acl_d2h_ring))
+			bcm4377->needs_reset = true;
+		if (!bcm4377->needs_reset &&
+		    bcm4377_destroy_transfer_ring(bcm4377, &bcm4377->acl_h2d_ring))
+			bcm4377->needs_reset = true;
+		if (!bcm4377->needs_reset &&
+		    bcm4377_destroy_transfer_ring(bcm4377, &bcm4377->sco_d2h_ring))
+			bcm4377->needs_reset = true;
+		if (!bcm4377->needs_reset &&
+		    bcm4377_destroy_transfer_ring(bcm4377, &bcm4377->sco_h2d_ring))
+			bcm4377->needs_reset = true;
+		if (!bcm4377->needs_reset &&
+		    bcm4377_destroy_transfer_ring(bcm4377, &bcm4377->hci_d2h_ring))
+			bcm4377->needs_reset = true;
+		if (!bcm4377->needs_reset &&
+		    bcm4377_destroy_transfer_ring(bcm4377, &bcm4377->hci_h2d_ring))
+			bcm4377->needs_reset = true;
 
-	bcm4377_destroy_completion_ring(bcm4377, &bcm4377->sco_event_ring);
-	bcm4377_destroy_completion_ring(bcm4377, &bcm4377->sco_ack_ring);
-	bcm4377_destroy_completion_ring(bcm4377, &bcm4377->hci_acl_event_ring);
-	bcm4377_destroy_completion_ring(bcm4377, &bcm4377->hci_acl_ack_ring);
+		if (!bcm4377->needs_reset &&
+		    bcm4377_destroy_completion_ring(bcm4377, &bcm4377->sco_event_ring))
+			bcm4377->needs_reset = true;
+		if (!bcm4377->needs_reset &&
+		    bcm4377_destroy_completion_ring(bcm4377, &bcm4377->sco_ack_ring))
+			bcm4377->needs_reset = true;
+		if (!bcm4377->needs_reset &&
+		    bcm4377_destroy_completion_ring(bcm4377, &bcm4377->hci_acl_event_ring))
+			bcm4377->needs_reset = true;
+		if (!bcm4377->needs_reset &&
+		    bcm4377_destroy_completion_ring(bcm4377, &bcm4377->hci_acl_ack_ring))
+			bcm4377->needs_reset = true;
+	}
+
+	if (bcm4377->needs_reset) {
+		dev_warn(&bcm4377->pdev->dev,
+			 "ring teardown failed; marking device for reset on next open\n");
+		bcm4377->acl_d2h_ring.enabled = false;
+		bcm4377->acl_h2d_ring.enabled = false;
+		bcm4377->sco_d2h_ring.enabled = false;
+		bcm4377->sco_h2d_ring.enabled = false;
+		bcm4377->hci_d2h_ring.enabled = false;
+		bcm4377->hci_h2d_ring.enabled = false;
+		bcm4377->sco_event_ring.enabled = false;
+		bcm4377->sco_ack_ring.enabled = false;
+		bcm4377->hci_acl_event_ring.enabled = false;
+		bcm4377->hci_acl_ack_ring.enabled = false;
+	}
 
 	return 0;
 }
@@ -1467,6 +1619,67 @@ static int bcm4377_hci_setup(struct hci_dev *hdev)
 	return bcm4377_check_bdaddr(bcm4377);
 }
 
+static int bcm4377_hci_set_bdaddr(struct hci_dev *hdev, const bdaddr_t *bdaddr)
+{
+	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+	struct sk_buff *skb;
+	int err;
+
+	skb = __hci_cmd_sync(hdev, 0xfc01, 6, bdaddr, HCI_INIT_TIMEOUT);
+	if (IS_ERR(skb)) {
+		err = PTR_ERR(skb);
+		dev_err(&bcm4377->pdev->dev,
+			"Change address command failed (%d)", err);
+		return err;
+	}
+	kfree_skb(skb);
+
+	bacpy(&bcm4377->bdaddr, bdaddr);
+	return 0;
+}
+
+static int bcm4377_hci_post_init(struct hci_dev *hdev)
+{
+	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+	const bdaddr_t *bda = NULL;
+	int ret;
+
+	if (!bcm4377->cal_needed)
+		return 0;
+
+	dev_info(&bcm4377->pdev->dev,
+		 "reloading calibration and PTB after hardware reset\n");
+
+	ret = bcm4377_hci_setup(hdev);
+	if (ret) {
+		dev_err(&bcm4377->pdev->dev,
+			"failed to reload calibration/PTB: %d\n", ret);
+		return ret;
+	}
+
+	if (bacmp(&bcm4377->bdaddr, BDADDR_ANY))
+		bda = &bcm4377->bdaddr;
+	else if (bacmp(&hdev->setup_addr, BDADDR_ANY))
+		bda = &hdev->setup_addr;
+	else if (bacmp(&hdev->public_addr, BDADDR_ANY))
+		bda = &hdev->public_addr;
+
+	if (bda) {
+		dev_info(&bcm4377->pdev->dev,
+			 "restoring BD_ADDR %pMR after hardware reset\n", bda);
+		ret = bcm4377_hci_set_bdaddr(hdev, bda);
+		if (ret) {
+			dev_err(&bcm4377->pdev->dev,
+				"failed to restore BD_ADDR: %d\n", ret);
+			return ret;
+		}
+		bacpy(&hdev->bdaddr, bda);
+	}
+
+	bcm4377->cal_needed = false;
+	return 0;
+}
+
 static int bcm4377_hci_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
 {
 	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
@@ -1502,24 +1715,6 @@ static int bcm4377_hci_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
 	hdev->stat.byte_tx += skb->len;
 	kfree_skb(skb);
 	return ret;
-}
-
-static int bcm4377_hci_set_bdaddr(struct hci_dev *hdev, const bdaddr_t *bdaddr)
-{
-	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
-	struct sk_buff *skb;
-	int err;
-
-	skb = __hci_cmd_sync(hdev, 0xfc01, 6, bdaddr, HCI_INIT_TIMEOUT);
-	if (IS_ERR(skb)) {
-		err = PTR_ERR(skb);
-		dev_err(&bcm4377->pdev->dev,
-			"Change address command failed (%d)", err);
-		return err;
-	}
-	kfree_skb(skb);
-
-	return 0;
 }
 
 static int bcm4377_alloc_transfer_ring(struct bcm4377_data *bcm4377,
@@ -2241,6 +2436,9 @@ static int bcm4377_probe_of(struct bcm4377_data *bcm4377)
 		return -ENOENT;
 	}
 
+	device_property_read_u8_array(&bcm4377->pdev->dev, "local-bd-address",
+				      (u8 *)&bcm4377->bdaddr, 6);
+
 	return 0;
 }
 
@@ -2387,6 +2585,7 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	hdev->send = bcm4377_hci_send_frame;
 	hdev->set_bdaddr = bcm4377_hci_set_bdaddr;
 	hdev->setup = bcm4377_hci_setup;
+	hdev->post_init = bcm4377_hci_post_init;
 
 	if (bcm4377->hw->broken_mws_transport_config)
 		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_MWS_TRANSPORT_CONFIG);
