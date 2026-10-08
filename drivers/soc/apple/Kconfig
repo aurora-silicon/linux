@@ -133,6 +133,8 @@ config APPLE_SEP
 	  opt-in is accepted only when the driver validates narrow physical
 	  extent ownership invariants; this does not prove all macOS-compatible
 	  update behavior. Keep it off until the target machine has been checked.
+	  With writes off the driver still attaches, but refuses Touch ID enrol
+	  and verify: the enclave saves anti-replay state after every match.
 
 	  Say Y here if you have an Apple silicon Mac.
 

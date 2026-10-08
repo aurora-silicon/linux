@@ -18,6 +18,8 @@ mod fv;
 mod hwrng;
 mod image;
 mod keybag;
+mod keybag_identity;
+mod pm;
 mod profile;
 mod proto;
 mod refkey;
@@ -106,6 +108,11 @@ const OOL_SIZE_SCRD: usize = 0x4000;
 
 const SBIO_TIMEOUT_MS: time::Msecs = 5000;
 
+// How long going to sleep waits for an ended capture to stop: one enclave
+// request in flight, plus the capture loop's interrupt-wait backstop.
+const SLEEP_DRAIN_MS: u32 = 6000;
+static_assert!(SLEEP_DRAIN_MS as u64 > SBIO_TIMEOUT_MS as u64);
+
 const SKS_ALLOC: usize = 0x8000;
 
 const SKS_SECRET_LEN: usize = 32;
@@ -116,6 +123,8 @@ const SCRD_MAX_CAPTURE: usize = 8;
 const SCRD_TIMEOUT_MS: time::Msecs = 2000;
 
 const SKS_TIMEOUT_MS: time::Msecs = 2000;
+/// The 13.5 kext's per-try key-store wait.
+const SKS_TIMEOUT_13_MS: time::Msecs = 6000;
 
 const SKS_TIMEOUT_PER_KIB_MS: time::Msecs = 6000;
 
@@ -258,6 +267,7 @@ impl CalibrationBlob {
 struct EnrolMaterial {
     special: crate::sks::SpecialHandle,
     secret: Secret,
+    snapshot_identity: Option<keybag::SnapshotIdentity>,
 }
 
 struct ImageContext<'a> {
@@ -555,6 +565,12 @@ struct SepData {
 
     sks_seq: Atomic<u32>,
 
+    // IPC header version negotiated by the 13.5 endpoint init; 1 otherwise.
+    sks_header_version: Atomic<u32>,
+
+    // The 13.5 endpoint init (0x4d, set_env) completed.
+    sks_initialized: Atomic<bool>,
+
     // u32, not u8: the kernel's Rust atomics have no u8 AtomicType
     phase: Atomic<u32>,
 
@@ -576,11 +592,18 @@ struct SepData {
     sbio_ready: Atomic<bool>,
 
     templates_restored: Atomic<bool>,
+    // Provisional cold restore; COMPLETE_INIT must still prove the device view.
+    cold_restore_candidate: Atomic<bool>,
 
     sensor_calibrated: Atomic<bool>,
     sensor_key_loaded: Atomic<bool>,
 
     enrol_open: Atomic<bool>,
+
+    // One warning each per boot: an xART write refused because writes are
+    // off, and a Touch ID capture refused for the same reason.
+    xart_refusal_logged: Atomic<bool>,
+    capture_refusal_logged: Atomic<bool>,
 
     #[pin]
     enrol_material: Mutex<Option<EnrolMaterial>>,
@@ -662,6 +685,16 @@ struct SepData {
 
     shutting_down: Atomic<bool>,
     capture_epoch: Atomic<u64>,
+
+    // The system is going to sleep: no capture may start. Changed under the
+    // bio session lock; `sleep_over` is signalled when it clears.
+    suspending: Atomic<bool>,
+
+    #[pin]
+    sleep_over: CondVar,
+
+    // Enrol and verify work items between `capture_begin` and `capture_end`.
+    captures_running: Atomic<u32>,
 
     #[pin]
     rx_work: Work<SepData>,
@@ -781,6 +814,8 @@ impl SepData {
                 control <- new_mutex!(control::ControlState::new()),
                 control_wq <- new_condvar!("SepData::control_wq"),
                 sks_seq: Atomic::new(0),
+                sks_header_version: Atomic::new(1),
+                sks_initialized: Atomic::new(false),
                 sks_wedged: Atomic::new(0),
                 bringup: Atomic::new(BRINGUP_FRESH),
                 keybag_designated: Atomic::new(false),
@@ -788,9 +823,12 @@ impl SepData {
                 touchid_started: Atomic::new(false),
                 touchid_failed: Atomic::new(false),
                 enrol_open: Atomic::new(false),
+                xart_refusal_logged: Atomic::new(false),
+                capture_refusal_logged: Atomic::new(false),
                 sensor_calibrated: Atomic::new(false),
                 sensor_key_loaded: Atomic::new(false),
                 templates_restored: Atomic::new(false),
+                cold_restore_candidate: Atomic::new(false),
                 enrol_material <- new_mutex!(None),
                 enrol_identity_candidates <- new_mutex!(KVec::new()),
                 last_capture_end_ns: Atomic::new(0),
@@ -829,6 +867,9 @@ impl SepData {
                 registered: Atomic::new(false),
                 shutting_down: Atomic::new(false),
                 capture_epoch: Atomic::new(0),
+                suspending: Atomic::new(false),
+                sleep_over <- new_condvar!("SepData::sleep_over"),
+                captures_running: Atomic::new(0),
                 rx_work <- new_work!("SepData::rx_work"),
                 enrol_work <- new_work!("SepData::enrol_work"),
                 verify_work <- new_work!("SepData::verify_work"),
@@ -1120,11 +1161,15 @@ impl SepData {
     }
 
     fn survey_hwrng(&self) -> Result<()> {
-        // A working control endpoint must answer four consecutive draws before
-        // it is exposed to the kernel RNG core. Early attach can beat the SEP
-        // endpoint exchange, so this runs only after that exchange settles.
+        // Successful transport is not proof of entropy: J313/13.5 has returned
+        // four zero words here. Do not advertise that source to the RNG core.
+        // This is a minimal sanity check, not a complete RNG health test.
+        let mut any_bits = 0u32;
         for _ in 0..4 {
-            let _ = self.get_entropy_word()?;
+            any_bits |= self.get_entropy_word()?;
+        }
+        if any_bits == 0 {
+            return Err(EIO);
         }
         self.register_hwrng()
     }
@@ -1234,6 +1279,16 @@ impl SepData {
         store.as_mut().map(f)
     }
 
+    /// Whether the enclave's xART writes reach the store.
+    pub(crate) fn xart_writable(&self) -> bool {
+        self.with_store(|store| store.writes_enabled())
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn capture_refusal_logged(&self) -> &Atomic<bool> {
+        &self.capture_refusal_logged
+    }
+
     fn with_host_store<R>(&self, f: impl FnOnce(&mut store::Store) -> R) -> Option<R> {
         let mut guard = self.host_store.lock();
         let store: &mut Option<store::Store> = &mut guard;
@@ -1315,19 +1370,32 @@ impl SepData {
 
         let os_uuid = self.xarm.lock().os_uuid;
         let serviced = self.with_store(|store| {
-            xarm::service(
+            let done = xarm::service(
                 req,
                 &payload,
                 &mut staging,
                 store,
                 PROTECTED_DATA_AVAILABLE,
                 os_uuid,
-            )
+            );
+            (done, store.writes_enabled())
         });
-        let Some(done) = serviced else {
+        let Some((done, writable)) = serviced else {
             self.fail_xarm(req.tag);
             return;
         };
+
+        if !writable
+            && xarm::is_write(req.opcode)
+            && done.reply.status != xarm::STATUS_OK
+            && !self.xart_refusal_logged.xchg(true, Relaxed)
+        {
+            dev_warn!(
+                self.dev,
+                "xART: refused the enclave's write (op 0x{:02x}): writes are disabled (xart_writes=0)\n",
+                req.opcode
+            );
+        }
 
         if *module_parameters::xarm_trace.value() != 0 {
             dev_info!(
@@ -1792,8 +1860,11 @@ impl SepData {
     fn tick_attach(this: &Arc<SepData>) {
         let now = this.rx_count.load(Relaxed);
 
-        // HW: the SEP takes ~265 ms to answer a registration
-        if now == 0 {
+        // HW: the SEP takes ~265 ms to answer a warm registration, and on the
+        // cold-boot path J316s starts discovery ~370 ms after the IMG4 ack.
+        // The boot acks count as traffic, so wait for the first endpoint, not
+        // the first message, or a quiet gap after IMG4 ends the attach early.
+        if this.endpoint_count() == 0 {
             let ticks = this.settle_idle_ticks.load(Relaxed).wrapping_add(1);
             this.settle_idle_ticks.store(ticks, Relaxed);
             if ticks.saturating_mul(u64::from(SETTLE_MS)) < u64::from(FIRST_RESPONSE_MS) {
@@ -1809,9 +1880,20 @@ impl SepData {
         }
 
         if this.endpoint_count() == 0 {
+            dev_err!(
+                this.dev,
+                "attach: {} messages received but no endpoint advertised; xART and key store cannot run\n",
+                now
+            );
             this.phase.store(PHASE_READY, Relaxed);
             return;
         }
+        dev_info!(
+            this.dev,
+            "attach: {} endpoints advertised in {} messages\n",
+            this.endpoint_count(),
+            now
+        );
 
         this.prepare_os_uuid();
 
@@ -1895,7 +1977,7 @@ impl SepData {
 
             proto::EP_BOOT => self.on_boot(msg),
 
-            _ep => {},
+            ep => dev_info!(self.dev, "rx: unhandled endpoint {:#04x} (msg0 {:#018x})\n", ep, msg.msg0),
         }
     }
 
@@ -1916,13 +1998,21 @@ impl SepData {
         }
     }
 
-    fn on_discovery(&self, _msg: Message, f: proto::Fields) {
+    fn on_discovery(&self, msg: Message, f: proto::Fields) {
         let mut table = self.endpoints.lock();
         match f.ty {
             proto::DISCOVER_TYPE_DESCRIPTOR | proto::DISCOVER_TYPE_CONFIG => {
                 let _ = table.slot(f.param);
+                dev_info!(
+                    self.dev,
+                    "discover: endpoint {:#04x} (type {}, msg0 {:#018x}); {} known\n",
+                    f.param,
+                    f.ty,
+                    msg.msg0,
+                    table.eps.len()
+                );
             }
-            _ => {}
+            ty => dev_info!(self.dev, "discover: other type {} (msg0 {:#018x})\n", ty, msg.msg0),
         }
     }
 
@@ -1935,6 +2025,10 @@ impl SepData {
         self.sbio_wq.notify_all();
         self.sks_wq.notify_all();
         self.scrd_wq.notify_all();
+        pm::unregister();
+        // Release any capture start still held for a resume that will not be
+        // reported now.
+        self.sleep_finished();
         trusted::unregister();
         self.unregister_fv_kernel();
 
@@ -2120,8 +2214,9 @@ impl WorkItem<ENROL_WORK_ID> for SepData {
 
     fn run(this: Arc<SepData>) {
         let epoch = this.capture_epoch.load(Relaxed);
-        if !this.shutting_down.load(Relaxed) {
+        if !this.shutting_down.load(Relaxed) && this.capture_begin() {
             this.run_enrolment();
+            this.capture_end();
         }
         bio::worker_stopped(&mut this.bio_session.lock(), epoch);
     }
@@ -2132,8 +2227,9 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
 
     fn run(this: Arc<SepData>) {
         let epoch = this.capture_epoch.load(Relaxed);
-        if !this.shutting_down.load(Relaxed) {
+        if !this.shutting_down.load(Relaxed) && this.capture_begin() {
             this.run_verify();
+            this.capture_end();
         }
         bio::worker_stopped(&mut this.bio_session.lock(), epoch);
     }
@@ -2192,6 +2288,10 @@ impl platform::Driver for SepDriver {
             dev_warn!(data.dev, "trusted-keys: registration failed ({:?})\n", e);
         }
 
+        if let Err(e) = pm::register(data.clone()) {
+            dev_warn!(data.dev, "sleep notifier registration failed ({:?}); a capture may run into a suspend\n", e);
+        }
+
         if data.registered.load(Relaxed) {
             SepData::arm_settle(&data);
         }
@@ -2223,10 +2323,18 @@ impl kernel::InPlaceModule for SepModule {
             // changeset; the cold-boot target describes them statically (its DART
             // is enabled before probe), so no changeset runs there.
             _dt: {
-                if let Ok(p) = profile::detect() {
-                    if matches!(p.bootstrap, profile::Bootstrap::WarmRegister) {
-                        dt::enable_sep_and_dart()?;
+                match profile::detect() {
+                    Ok(p) => {
+                        if matches!(p.bootstrap, profile::Bootstrap::WarmRegister) {
+                            dt::enable_sep_and_dart()?;
+                        }
                     }
+                    // Without this the module loads, probes nothing and logs
+                    // nothing on an unlisted SoC, which is indistinguishable
+                    // from a driver that started correctly.
+                    Err(_) => pr_info!(
+                        "no platform profile for this SoC; the SEP stays disabled\n"
+                    ),
                 }
             },
 
@@ -2246,7 +2354,7 @@ module! {
     params: {
         xart_writes: u8 {
             default: 0,
-            description: "Opt in to shared xART writes only if APFS proves a single unsnapshotted .gl extent",
+            description: "Opt in to shared xART writes only if APFS proves a single unsnapshotted .gl extent; Touch ID enrol and verify need it",
         },
         xart_start_sector: u64 {
             default: 0,
@@ -2271,6 +2379,10 @@ module! {
         probe_owner_export: u8 {
             default: 0,
             description: "Opt-in J414s diagnostic: with zero live identities, select the system context and try saving the missing owner Catacomb",
+        },
+        refkey_v2: u8 {
+            default: 0,
+            description: "Explicit recovery slot for a new identity-bag context; preserves the original machine ref-key",
         },
         j414s_persistent_enrol: u8 {
             default: 0,

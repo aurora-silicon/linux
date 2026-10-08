@@ -927,6 +927,29 @@ fn cancel(ctx: &mut Context<'_>) -> Result<Handled> {
     })
 }
 
+/// Ends a live enrolment or verify the way a CANCEL does, for the system going
+/// to sleep: userspace sees a failure it can retry after resume. Returns
+/// whether a waiter needs waking.
+pub(crate) fn abort_capture(session: &mut Session) -> bool {
+    match &mut session.op {
+        Op::Enrol { terminal, .. } if terminal.is_none() => {
+            *terminal = Some(EnrolOutcome::Failed(STATUS_LOCAL))
+        }
+        Op::Verify { terminal, .. } if terminal.is_none() => {
+            *terminal = Some(VerifyOutcome::Failed(STATUS_LOCAL))
+        }
+        _ => return false,
+    }
+    session.token = None;
+    session.unseen = true;
+    true
+}
+
+/// The ioctls that start a sensor capture.
+pub(crate) fn starts_capture(cmd: u32) -> bool {
+    cmd == IOC_ENROL_START || cmd == IOC_VERIFY_START
+}
+
 fn delete(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     require_admin()?;
     let request: Delete = UserSlice::new(user, core::mem::size_of::<Delete>())

@@ -20,7 +20,6 @@
 #include <linux/unaligned.h>
 
 #include <linux/mutex.h>
-#include <linux/slab.h>
 
 #include "shim.h"
 

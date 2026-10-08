@@ -36,6 +36,37 @@ impl SepData {
         }
     }
 
+    // A match step whose refusal ends the verify. libfprint reports every
+    // failed verify as the same unspecified error, so the enclave's exact
+    // answer has to be recorded here or nowhere. Success is decided as in
+    // `sbio_call`.
+    fn sbio_verify_step(&self, op: &crate::sbio::SbioOp) -> Option<KVec<u8>> {
+        let done = match self.sbio_transfer(op) {
+            Ok(done) => done,
+            Err(e) => {
+                dev_err!(
+                    self.dev,
+                    "verify: {} transfer failed ({:?})\n",
+                    op.name(),
+                    e
+                );
+                return None;
+            }
+        };
+        match done.status.answered() {
+            Some(err) if err as u16 == crate::sbio::SBIO_STATUS_OK => Some(done.payload),
+            _ => {
+                dev_err!(
+                    self.dev,
+                    "verify: {} answered status {}\n",
+                    op.name(),
+                    done.status
+                );
+                None
+            }
+        }
+    }
+
     pub(crate) fn sbio_call(&self, op: &crate::sbio::SbioOp) -> SbioOutcome {
         let done = match self.sbio_transfer(op) {
             Ok(done) => done,
@@ -368,9 +399,11 @@ impl SepData {
             }
         }
 
-        // J700 needs the owner component even when state 0x3 has no
-        // save-pending bit. Retain the opt-in policy on older profiles.
-        if self.profile.nonce_session || *module_parameters::j414s_persistent_enrol.value() != 0 {
+        // The owner Catacomb must be exported even though state 0x3 has no
+        // save-pending bit. J313, J414s and J314s each restored a fresh
+        // enrollment after this export and user-before-master completion.
+        // Every profile now does this.
+        if self.profile.persistent_enrol || *module_parameters::j414s_persistent_enrol.value() != 0 {
             if owner_initial_state == Some(0x3)
                 && !self.save_catacomb(
                     crate::sbio::CatacombUser::OWNER,
@@ -759,7 +792,7 @@ impl SepData {
     }
 
     fn save_all_components(&self, user: crate::sbio::UserId) -> bool {
-        if self.profile.nonce_session || *module_parameters::j414s_persistent_enrol.value() != 0 {
+        if self.profile.persistent_enrol || *module_parameters::j414s_persistent_enrol.value() != 0 {
             return self.save_all_components_user_first(user);
         }
         // On m2fix11, a completed enrollment marked both master and user 0x7,
@@ -826,9 +859,8 @@ impl SepData {
             dev_err!(self.dev, "enrol: opt-in completion has no owner Catacomb file\n");
             return false;
         }
-        // Post-match persistence saves the user before the master because the
-        // user save can change system material. Test that order for a completed
-        // J414s enrollment, without changing the default path on other Macs.
+        // Saving the user can change system material. Persist it before the
+        // master, as in the reboot-tested J313/J414s enrollment paths.
         for (who, kind, what) in [
             (
                 crate::sbio::CatacombUser::enrolling(user),
@@ -1004,14 +1036,20 @@ impl SepData {
         self.register_ool(&self.ool_sbio)?;
 
         self.sbio_ready.store(true, Relaxed);
-        if self.profile.nonce_session {
-            let word = 6u32;
-            // Communication must be initialized before restoring biometric state.
+        let init_word = if self.profile.nonce_session {
+            Some(6u32)
+        } else if matches!(self.profile.key_store, profile::KeyStore::Sepos13 { .. }) {
+            Some(1u32)
+        } else {
+            None
+        };
+        if let Some(word) = init_word {
             let result = self.sbio_transfer_raw(
                 0x73, c"INIT_SBIO_COMMUNICATION", &word.to_le_bytes(),
             );
             match result {
-                Ok(done) if done.status.is_ok() => {
+                Ok(done) if done.status.is_ok()
+                    && (self.profile.nonce_session || done.payload.is_empty()) => {
                     dev_info!(self.dev, "sbio: communication initialization accepted\n");
                 }
                 Ok(done) => {
@@ -1022,7 +1060,7 @@ impl SepData {
                 }
                 Err(e) => {
                     self.sbio_ready.store(false, Relaxed);
-                    dev_err!(self.dev, "sbio: communication init transport failed: {:?}\n", e);
+                    dev_err!(self.dev, "sbio: communication init transport failed {:?}; aborting Touch ID setup\n", e);
                     return Err(e);
                 }
             }
@@ -1048,6 +1086,10 @@ impl SepData {
             return;
         }
         let Some(patch) = self.wake_sensor() else {
+            dev_warn!(
+                self.dev,
+                "sbio: the sensor did not wake at attach; the next verify retries the bring-up\n"
+            );
             return;
         };
         if !self.complete_bringup(patch) {
@@ -1114,6 +1156,13 @@ impl SepData {
         }
         if let Err(e) = self.enable_sks() {
             dev_warn!(self.dev, "bringup: could not enable the key store ({:?}); keybag and ref-key operations are unavailable\n", e);
+            return;
+        }
+        if !self.sks_init_endpoint() {
+            dev_err!(
+                self.dev,
+                "bringup: key-store endpoint init failed; the key store stays closed\n"
+            );
             return;
         }
         if *module_parameters::provision_keybag.value() != 0 {
@@ -1206,12 +1255,34 @@ impl SepData {
         })?;
         self.sks_designate_user_keybag(handle, stored.secret());
         self.sks_machine_refkey(handle, stored.secret());
-        let prepared = self.cold_match_continue(handle, uuid);
-        self.attach_bringup();
+        let prepared = self.cold_match_continue(handle, uuid, stored.uuid_provenance());
         self.ensure_restored_after(prepared);
+        self.attach_bringup();
         self.probe_owner_export();
+        self.refresh_match_credential();
         self.touchid_started.store(true, Relaxed);
         Ok(())
+    }
+
+    // The SCRD credential set up before the Catacomb restore does not survive
+    // the rest of activation: J414c (variant-5 key store) and J314s (13.5 key
+    // store) answered every cold-boot MATCH_RESULT with 0x1 on a usable image,
+    // and a J313 showed the same symptom. Setting it up once more here was
+    // enough for every match that boot, including verifies that re-register
+    // the sensor with CLEAR_STATE. It runs on every profile.
+    fn refresh_match_credential(&self) {
+        if !self.templates_restored.load(Relaxed) {
+            return;
+        }
+        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            return;
+        };
+        if !self.establish_scrd_match_context(user) {
+            dev_warn!(
+                self.dev,
+                "Touch ID: the match credential did not re-establish after the restore; the enclave may refuse matches this boot\n"
+            );
+        }
     }
 
     fn prepare_bio_open(&self) -> Result<()> {
@@ -1227,7 +1298,41 @@ impl SepData {
         Ok(())
     }
 
+    // The attach-time bring-up can fail after the Catacomb restore (the
+    // sensor patch step has no retry), which leaves the device-view proof
+    // undone and every verify refused until reboot. The restore itself is
+    // still a valid candidate, so bring the sensor up once more and let
+    // complete_bringup() finish the proof before refusing.
+    fn retry_restore_proof(&self) {
+        if self.templates_restored.load(Relaxed)
+            || !self.cold_restore_candidate.load(Relaxed)
+            || self.device_view_synced.load(Relaxed)
+        {
+            return;
+        }
+        dev_warn!(
+            self.dev,
+            "verify: attach-time bring-up left the device-view proof undone; retrying the sensor bring-up\n"
+        );
+        if !self.bring_sensor_online() {
+            // After a failed first patch, the enclave can refuse the serial
+            // re-registration that follows CLEAR_STATE, while a reboot's
+            // fresh registration works. Retry once from the fresh stage.
+            dev_warn!(
+                self.dev,
+                "verify: retrying the sensor bring-up from a fresh registration\n"
+            );
+            self.bringup.store(BRINGUP_FRESH, Relaxed);
+            if !self.bring_sensor_online() {
+                dev_err!(self.dev, "verify: the retried sensor bring-up failed\n");
+            }
+        }
+        let _ = sensor::idle();
+        self.refresh_match_credential();
+    }
+
     pub(crate) fn run_verify(&self) {
+        self.retry_restore_proof();
         if !self.templates_restored.load(Relaxed) {
             dev_err!(
                 self.dev,
@@ -1241,6 +1346,7 @@ impl SepData {
         }
 
         let Some(token_bytes) = self.mint_token_bytes() else {
+            dev_err!(self.dev, "verify: could not draw a result token\n");
             self.finish_verify(
                 bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE),
                 [0u8; bio::TOKEN_LEN],
@@ -1252,6 +1358,7 @@ impl SepData {
 
         // The enclave refuses a capture from an uncalibrated sensor (0x65 answers 1).
         if !self.bring_sensor_online() {
+            dev_err!(self.dev, "verify: the sensor did not come back online\n");
             self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR), token_bytes);
             let _ = sensor::idle();
             return;
@@ -1287,40 +1394,81 @@ impl SepData {
         self.finish_verify(outcome, token_bytes);
     }
 
+    // Every exit that fails a live verify logs why: userspace sees only a bare
+    // "unspecified error", which cannot tell a sensor fault from a refused
+    // match step.
     fn verify_one_image(&self) -> bio::VerifyOutcome {
         let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            dev_err!(self.dev, "verify: invalid probe user id\n");
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
 
-        if sensor::start_capture().is_err() {
+        if let Err(e) = sensor::start_capture() {
+            dev_err!(self.dev, "verify: could not start the capture ({:?})\n", e);
             return bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR);
         }
         let advertised = match self.await_capture() {
             CaptureWait::Ready(n) => n,
             CaptureWait::Timeout => {
+                dev_warn!(self.dev, "verify: the capture ended without a frame\n");
                 return bio::VerifyOutcome::Failed(ENROL_STATUS_TIMEOUT);
             }
-            CaptureWait::Fault(_state) => {
+            CaptureWait::Fault(state) => {
+                dev_err!(
+                    self.dev,
+                    "verify: the sensor fell to state {} during the capture\n",
+                    state
+                );
                 return bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR);
             }
-            CaptureWait::Abandon => return bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR),
+            CaptureWait::Abandon => {
+                // A cancelled verify also abandons; only a live one is a fault.
+                if bio::verify_is_live(
+                    &self.bio_session.lock(), self.capture_epoch.load(Relaxed),
+                ) {
+                    dev_err!(
+                        self.dev,
+                        "verify: the sensor status became unreadable during the capture\n"
+                    );
+                }
+                return bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR);
+            }
         };
 
         let capture = match sensor::read_capture(advertised) {
             Ok(capture) => capture,
-            Err(sensor::CaptureError::Checksum { .. }) | Err(sensor::CaptureError::Length(_)) => {
+            Err(sensor::CaptureError::Checksum {
+                advertised: sent,
+                computed,
+            }) => {
+                dev_warn!(
+                    self.dev,
+                    "verify: frame checksum mismatch (sensor sent {:#06x}, computed {:#06x})\n",
+                    sent,
+                    computed
+                );
                 return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
             }
-            Err(sensor::CaptureError::Bus(_)) => {
+            Err(sensor::CaptureError::Length(n)) => {
+                dev_warn!(
+                    self.dev,
+                    "verify: the sensor advertised an unusable frame length {}\n",
+                    n
+                );
+                return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
+            }
+            Err(sensor::CaptureError::Bus(e)) => {
+                dev_err!(self.dev, "verify: reading the frame failed ({:?})\n", e);
                 return bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR);
             }
             Err(sensor::CaptureError::NoMemory) => {
-                return bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR)
+                dev_err!(self.dev, "verify: no memory for the frame\n");
+                return bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR);
             }
         };
 
         if self
-            .sbio_expect_ok(&crate::sbio::sbio_prepare_image_processing())
+            .sbio_verify_step(&crate::sbio::sbio_prepare_image_processing())
             .is_none()
         {
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
@@ -1336,7 +1484,7 @@ impl SepData {
             user,
             crate::shim::monotonic_ns(),
         );
-        if self.sbio_expect_ok(&init).is_none() {
+        if self.sbio_verify_step(&init).is_none() {
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
 
@@ -1350,21 +1498,35 @@ impl SepData {
         }
         drop(capture);
 
-        let Some(assessment) = self.sbio_expect_ok(&crate::sbio::sbio_image_assessment()) else {
+        let Some(assessment) = self.sbio_verify_step(&crate::sbio::sbio_image_assessment()) else {
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
         if assessment.len() <= crate::sbio::ASSESS_USABLE_MATCH {
+            dev_err!(
+                self.dev,
+                "verify: image assessment is {} bytes, too short to read\n",
+                assessment.len()
+            );
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
 
         if assessment[crate::sbio::ASSESS_USABLE_MATCH] == 0 {
+            dev_warn!(
+                self.dev,
+                "verify: the image is not usable for matching (partial contact)\n"
+            );
             return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
         }
 
-        let Some(result) = self.sbio_expect_ok(&crate::sbio::sbio_match_result()) else {
+        let Some(result) = self.sbio_verify_step(&crate::sbio::sbio_match_result()) else {
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
         let Some(parsed) = crate::sbio::MatchResult::parse(&result) else {
+            dev_err!(
+                self.dev,
+                "verify: the {}-byte match result did not parse\n",
+                result.len()
+            );
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
 
@@ -1377,6 +1539,11 @@ impl SepData {
         let known = self.bio_index.lock().contains_uuid(&identity);
 
         if !known {
+            dev_err!(
+                self.dev,
+                "verify: the enclave matched identity {}, which the host index does not hold\n",
+                Hex(&identity)
+            );
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
 
@@ -1433,6 +1600,13 @@ impl SepData {
                     // completion is the flag at offset 0xbfe, not a derived stage count
                     if complete {
                         if !has_template {
+                            dev_err!(
+                                self.dev,
+                                "enrol: enclave flags completion after {} capture(s) (stage {}, {}%) but reports no template\n",
+                                counter,
+                                stage,
+                                percent
+                            );
                             break Some(Err(ENROL_STATUS_ENCLAVE));
                         }
                         enrolment_completed = true;
@@ -1530,7 +1704,13 @@ impl SepData {
             let _ = self.log_identity_count(c"after CLEAR_STATE for sensor re-registration");
         }
 
-        if stage == BRINGUP_FRESH && !self.profile.nonce_session {
+        if stage == BRINGUP_FRESH
+            && matches!(self.profile.key_store, profile::KeyStore::Sepos13 { .. })
+        {
+            // The 13.5 J313 flow begins with REGISTER_SENSOR_SERIAL (0x17).
+            // The newer REGISTER_SENSOR (0x80) returned 0x16 on this firmware.
+            self.bringup.store(BRINGUP_IDENTIFIED, Relaxed);
+        } else if stage == BRINGUP_FRESH && !self.profile.nonce_session {
             let op = crate::sbio::sbio_register_sensor(id);
             match self.sbio_call(&op) {
                 SbioOutcome::Ok(_payload) => {
@@ -1646,6 +1826,7 @@ impl SepData {
             let st = match sensor::status() {
                 Ok(st) => st,
                 Err(_) => {
+                    dev_warn!(self.dev, "sensor: status read failed on wake\n");
                     return None;
                 }
             };
@@ -1669,6 +1850,7 @@ impl SepData {
                 continue;
             };
             if !self.register_sensor(&id) {
+                dev_warn!(self.dev, "sensor: the enclave did not register the sensor\n");
                 return None;
             }
 
@@ -1781,7 +1963,9 @@ impl SepData {
                 Some(0) => {
                     self.templates_restored.store(false, Relaxed);
                 }
-                Some(n) if self.templates_restored.load(Relaxed) && self.prove_restore() => {
+                Some(n) if (self.templates_restored.load(Relaxed)
+                    || self.cold_restore_candidate.load(Relaxed)) && self.prove_restore() => {
+                    self.templates_restored.store(true, Relaxed);
                     dev_warn!(
                         self.dev,
                         "Touch ID: restored {} enrolled identity/identities; enrolment survived reboot\n",
@@ -1907,48 +2091,63 @@ impl SepData {
         }
     }
 
+    // Each failure names its step: a report that only says "sequence counter
+    // init failed" cannot tell the enclave side from the sensor side.
     fn init_sequence_counter(&self) -> bool {
         let challenge = match self.sbio_call(&crate::sbio::sbio_request_challenge()) {
             SbioOutcome::Ok(c) => c,
             SbioOutcome::PrerequisiteMissing => {
                 if !self.establish_session() {
+                    dev_warn!(self.dev, "sequence counter: session setup failed\n");
                     return false;
                 }
                 match self.sbio_call(&crate::sbio::sbio_request_challenge()) {
                     SbioOutcome::Ok(c) => c,
                     _ => {
+                        dev_warn!(self.dev, "sequence counter: challenge request failed after session setup\n");
                         return false;
                     }
                 }
             }
             SbioOutcome::Status16 => {
+                dev_warn!(self.dev, "sequence counter: challenge request answered status 16\n");
                 return false;
             }
             SbioOutcome::Other => {
+                dev_warn!(self.dev, "sequence counter: challenge request failed\n");
                 return false;
             }
         };
         if challenge.len() < sensor::CHALLENGE_LEN {
+            dev_warn!(self.dev, "sequence counter: short challenge ({} bytes)\n", challenge.len());
             return false;
         }
         let mut out = [0u8; sensor::CHALLENGE_LEN];
         out.copy_from_slice(&challenge[..sensor::CHALLENGE_LEN]);
 
         if sensor::send_challenge(&out).is_err() {
+            dev_warn!(self.dev, "sequence counter: sending the challenge to the sensor failed\n");
             return false;
         }
 
         let reply = match sensor::read_challenge_reply() {
             Ok(r) => r,
             Err(_) => {
+                dev_warn!(self.dev, "sequence counter: the sensor did not answer the challenge\n");
                 return false;
             }
         };
 
         match self.sbio_transfer(&crate::sbio::sbio_commit_challenge(&reply)) {
             Ok(done) if done.status.is_ok() => true,
-            Ok(_) => false,
-            Err(_) => false,
+            Ok(done) => {
+                dev_warn!(self.dev, "sequence counter: the enclave refused the sensor's reply, status {}\n", done.status);
+                false
+            }
+            Err(e) => {
+                dev_warn!(self.dev, "sequence counter: committing the reply failed {:?}\n", e);
+                false
+            }
         }
     }
 
@@ -1957,36 +2156,50 @@ impl SepData {
             SbioOutcome::Ok(b) => b,
             SbioOutcome::PrerequisiteMissing => {
                 if !self.init_sequence_counter() {
+                    dev_warn!(
+                        self.dev,
+                        "sensor patch: sequence counter init failed before the patch fetch\n"
+                    );
                     return None;
                 }
                 match self.sbio_call(&crate::sbio::sbio_fetch_patch()) {
                     SbioOutcome::Ok(b) => b,
                     _ => {
+                        dev_warn!(
+                            self.dev,
+                            "sensor patch: patch fetch failed after the sequence counter init\n"
+                        );
                         return None;
                     }
                 }
             }
             SbioOutcome::Status16 => {
+                dev_warn!(self.dev, "sensor patch: patch fetch answered status 16\n");
                 return None;
             }
             SbioOutcome::Other => {
+                dev_warn!(self.dev, "sensor patch: patch fetch failed\n");
                 return None;
             }
         };
         if blob.is_empty() {
+            dev_warn!(self.dev, "sensor patch: the enclave returned an empty patch\n");
             return None;
         }
 
         // enable command is mandatory; skipping it leaves the sensor in state 9
         if sensor::setup_patch_enable().is_err() {
+            dev_warn!(self.dev, "sensor patch: the patch enable command failed on the bus\n");
             return None;
         }
 
         if !self.await_sensor_state(sensor::STATE_IDLE, c"idle, before sending the patch") {
+            dev_warn!(self.dev, "sensor patch: the sensor did not reach idle before the patch\n");
             return None;
         }
 
         if sensor::send_patch(&blob).is_err() {
+            dev_warn!(self.dev, "sensor patch: sending the patch failed on the bus\n");
             return None;
         }
 
@@ -1996,12 +2209,20 @@ impl SepData {
             let st = match sensor::status() {
                 Ok(st) => st,
                 Err(_) => {
+                    dev_warn!(
+                        self.dev,
+                        "sensor patch: status read failed while waiting for the acknowledgment\n"
+                    );
                     return None;
                 }
             };
             if st.patch_ack() == sensor::PATCH_ACCEPTED {
                 if let Ok(after) = sensor::status() {
                     if after.state == sensor::STATE_NEEDS_PATCH {
+                        dev_warn!(
+                            self.dev,
+                            "sensor patch: acknowledged, but the sensor still asks for a patch\n"
+                        );
                         return None;
                     }
                 }
@@ -2010,6 +2231,11 @@ impl SepData {
         }
 
         let _ = sensor::status();
+        dev_warn!(
+            self.dev,
+            "sensor patch: no acknowledgment after {} polls\n",
+            PATCH_POLL_ATTEMPTS
+        );
         None
     }
 
@@ -2509,6 +2735,82 @@ impl SepData {
         }
     }
 
+    /// Called by the enrol and verify work items before they touch the sensor.
+    /// Returns false if the system is going to sleep; the session has then
+    /// been ended and the capture must not start. A true return must be
+    /// paired with [`Self::capture_end`].
+    pub(crate) fn capture_begin(&self) -> bool {
+        let mut session = self.bio_session.lock();
+        if self.suspending.load(Relaxed) {
+            let woke = bio::abort_capture(&mut session);
+            drop(session);
+            if woke {
+                self.bio_wake();
+            }
+            return false;
+        }
+        self.captures_running.fetch_add(1, Relaxed);
+        true
+    }
+
+    pub(crate) fn capture_end(&self) {
+        self.captures_running.fetch_sub(1, Relaxed);
+    }
+
+    /// The system is about to suspend. End any capture in progress, hold new
+    /// ones, and wait for the enrol or verify work to stop touching the sensor
+    /// before devices go down.
+    pub(crate) fn sleep_prepare(&self) -> Result<()> {
+        let woke = {
+            let mut session = self.bio_session.lock();
+            self.suspending.store(true, Relaxed);
+            bio::abort_capture(&mut session)
+        };
+        if woke {
+            dev_info!(
+                self.dev,
+                "Touch ID: ending the capture in progress before sleep\n"
+            );
+            self.bio_wake();
+        }
+
+        let mut waited: u32 = 0;
+        while self.captures_running.load(Relaxed) != 0 {
+            if waited >= SLEEP_DRAIN_MS {
+                dev_warn!(
+                    self.dev,
+                    "Touch ID: capture did not drain within {} ms; aborting suspend\n",
+                    SLEEP_DRAIN_MS
+                );
+                return Err(EBUSY);
+            }
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
+            waited += 10;
+        }
+        Ok(())
+    }
+
+    /// The system has resumed, or the suspend was aborted.
+    pub(crate) fn sleep_finished(&self) {
+        let _session = self.bio_session.lock();
+        self.suspending.store(false, Relaxed);
+        self.sleep_over.notify_all();
+    }
+
+    /// Holds a capture start until the system is awake. Userspace is thawed
+    /// before the driver hears of the resume, so a lock screen that retries at
+    /// once would otherwise be refused. A start made just before the system
+    /// sleeps is interrupted by the freezer and restarted after resume.
+    fn wait_until_awake(&self) -> Result<()> {
+        let mut session = self.bio_session.lock();
+        while self.suspending.load(Relaxed) {
+            if self.sleep_over.wait_interruptible(&mut session) {
+                return Err(ERESTARTSYS);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn queue_enrolment(this: Arc<SepData>) {
         let Some(epoch) = bio::queued_epoch(&this.bio_session.lock()) else {
             return;
@@ -2551,13 +2853,13 @@ impl SepData {
 
     fn mint_token_bytes(&self) -> Option<[u8; bio::TOKEN_LEN]> {
         let mut bytes = [0u8; bio::TOKEN_LEN];
-        for chunk in bytes.chunks_mut(4) {
-            match self.get_entropy_word() {
-                Ok(word) => chunk.copy_from_slice(&word.to_le_bytes()[..chunk.len()]),
-                Err(_) => {
-                    return None;
-                }
-            }
+        // This is a host-issued, per-operation capability, not SEP match
+        // evidence. Use the initialized kernel CSPRNG, as for other host
+        // secrets, rather than trusting firmware control replies as entropy.
+        // J313/13.5 answered those draws with zero and caused valid matches
+        // to carry an invalid all-zero token to userspace.
+        if shim::random_bytes(&mut bytes).is_err() || bytes.iter().all(|b| *b == 0) {
+            return None;
         }
         Some(bytes)
     }
@@ -2568,6 +2870,24 @@ impl SepData {
         }
         if cmd == bio::IOC_ATTEST {
             return self.bio_attest(arg);
+        }
+        // With xART writes off the enclave cannot persist what an enrolment or
+        // a match changes. It saves anti-replay state after every match, and a
+        // refused save has left it unresponsive until reboot. Refuse the
+        // capture instead; attach and the read-only ioctls still work.
+        if bio::starts_capture(cmd) && !self.xart_writable() {
+            if !self.capture_refusal_logged().xchg(true, Relaxed) {
+                dev_warn!(
+                    self.dev,
+                    "Touch ID: enrol and verify need xart_writes=1; the enclave saves anti-replay state after every match and stops responding when that save is refused\n"
+                );
+            }
+            return Err(EROFS);
+        }
+        // A capture started while the system goes to sleep would run into the
+        // suspend; `capture_begin` repeats this check under the session lock.
+        if bio::starts_capture(cmd) {
+            self.wait_until_awake()?;
         }
         // Query SEP outside the bio session/index locks. A host index can
         // outlive its SEP identity after a failed cold restore; userspace
@@ -2656,9 +2976,18 @@ impl SepData {
             if let Some(user) = crate::sks::DesignateUser::new(SBIO_PROBE_USER_ID) {
                 let special = user.special_handle();
                 if let Ok(keybag::State::Present(stored)) = keybag::read(keybag::Slot::Identity) {
-                    unlocked = self.sks_step(crate::sks::SKS_LOCK_STATE_NAME, |healthy| {
-                        self.sks_req_unlock_special(special, stored.secret(), healthy)
-                    }).is_some();
+                    unlocked = match self.profile.key_store {
+                        profile::KeyStore::Sepos13 { .. } => self
+                            .sks_step(c"DEVICE_STATE_TRANSITION", |healthy| {
+                                self.sks_req_unlock_special(special, stored.secret(), healthy)
+                            })
+                            .is_some(),
+                        profile::KeyStore::Variant5 => self
+                            .sks_step(crate::sks::SKS_LOCK_STATE_NAME, |healthy| {
+                                self.sks_req_unlock_special(special, stored.secret(), healthy)
+                            })
+                            .is_some(),
+                    };
                 }
             }
         }
@@ -2682,17 +3011,20 @@ impl SepData {
         };
         let identities = self.log_identity_count(c"after Catacomb restore with sensor registered");
         let identity_ready = matches!(identities, Some(n) if n > 0);
-        let ready = prepared && match_context && restored && identity_ready
-            && self.device_view_synced.load(Relaxed) && self.prove_restore();
-        self.templates_restored.store(ready, Relaxed);
-        if !ready {
+        let candidate = prepared && match_context && restored && identity_ready;
+        self.cold_restore_candidate.store(candidate, Relaxed);
+        // COMPLETE_INIT has not synchronized the device view yet. Never make
+        // verification available on the preliminary Catacomb proof alone;
+        // complete_bringup finishes the proof and sets templates_restored.
+        self.templates_restored.store(false, Relaxed);
+        if !candidate {
             dev_err!(
                 self.dev,
-                "matching unavailable this boot: cold-match preparation, SCRD credential, Catacomb restore, device view, or identity proof did not complete; template state is unproven\n"
+                "matching unavailable this boot: cold-match preparation, SCRD credential, Catacomb restore, or identity proof did not complete; template state is unproven\n"
             );
             return;
         }
-        self.reconcile_identities();
+        dev_info!(self.dev, "sbio: cold restore candidate ready; waiting for device-view proof\n");
 
     }
 
@@ -2700,6 +3032,7 @@ impl SepData {
         &self,
         source: crate::sks::KeyBagHandle,
         uuid: [u8; keybag::UUID_LEN],
+        provenance: keybag::UuidProvenance,
     ) -> bool {
         if !self.keybag_designated.load(Relaxed) {
             return false;
@@ -2711,32 +3044,47 @@ impl SepData {
         let special = user.special_handle();
         self.log_identity_count(c"before the cold-match preparation");
 
+        let Some(source_uuid) = self.sks_read_uuid(source) else {
+            return false;
+        };
+        let generated_lookup = matches!(self.profile.key_store, profile::KeyStore::Sepos13 { .. })
+            && provenance == keybag::UuidProvenance::AsGenerated;
+        let Some(identity) = keybag::SnapshotIdentity::from_loaded(
+            uuid, provenance, source_uuid, generated_lookup,
+        ) else {
+            dev_err!(self.dev, "sks: recovered source bag does not match its stored identity\n");
+            return false;
+        };
         let uuid_ok = self
             .sks_send(self.sks_req_copy_uuid_special(special))
             .and_then(|out| self.sks_uuid_from_reply(&out));
-        match uuid_ok {
-            Some(got) if got == uuid => {}
-            Some(_) => {
-                return false;
-            }
-            None => {
-                return false;
-            }
+        if !uuid_ok.is_some_and(|got| identity.accepts(&uuid, provenance, &got)) {
+            dev_err!(self.dev, "sks: designated bag does not match the recovered source bag\n");
+            return false;
         }
 
         if self.sks_send(self.sks_req_unload_keybag(source)).is_none() {
             return false;
         }
 
+        let mut material = self.enrol_material.lock();
+        let Some(material) = &mut *material else {
+            return false;
+        };
+        material.snapshot_identity = Some(identity);
+        dev_info!(self.dev, "sks: snapshot identity bound to recovered and designated bag; generated lookup {}\n", generated_lookup);
+
         true
     }
 
     pub(crate) fn sep_random(&self, buf: &mut [u8]) -> Result<()> {
-        for chunk in buf.chunks_mut(4) {
-            let word = self.get_entropy_word()?;
-            let bytes = word.to_le_bytes();
-            let take = chunk.len();
-            chunk.copy_from_slice(&bytes[..take]);
+        // The trusted-key framework asks for a fresh plaintext key before
+        // passing it to SEP for sealing. The host CSPRNG is appropriate for
+        // that key; J313/13.5's unverified SEP control entropy replies have
+        // returned all zeros and must not be used as key material.
+        shim::random_bytes(buf)?;
+        if !buf.is_empty() && buf.iter().all(|b| *b == 0) {
+            return Err(EIO);
         }
         Ok(())
     }

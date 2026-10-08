@@ -161,4 +161,3 @@ int sep_p256_sender(const void *peer_pub_be, void *eph_pub_be_out,
 {
 	return p256_agree(NULL, peer_pub_be, eph_pub_be_out, shared_be_out);
 }
-
