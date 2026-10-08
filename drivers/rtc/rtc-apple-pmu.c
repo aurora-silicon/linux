@@ -19,7 +19,6 @@
 #define BAKU_RTC_COMPARE	0xf808
 #define BAKU_RTC_EVENT		0xf80c
 #define BAKU_RTC_MASK		0xf80e
-#define BAKU_RTC_RUN		BIT(0)
 #define BAKU_RTC_ARM		BIT(6)
 #define BAKU_RTC_ALARM		BIT(0)
 #define BAKU_RTC_HZ_SHIFT	16
@@ -113,8 +112,7 @@ static int baku_rtc_start_alarm(struct baku_rtc *baku)
 		error = regmap_update_bits(baku->map, BAKU_RTC_MASK, BAKU_RTC_ALARM, 0);
 	if (!error)
 		error = regmap_update_bits(baku->map, BAKU_RTC_CONTROL,
-					   BAKU_RTC_RUN | BAKU_RTC_ARM,
-					   BAKU_RTC_RUN | BAKU_RTC_ARM);
+					   BAKU_RTC_ARM, BAKU_RTC_ARM);
 	if (error)
 		baku_rtc_stop_alarm(baku);
 	return error;
