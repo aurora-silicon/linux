@@ -1981,6 +1981,7 @@ F:	Documentation/devicetree/bindings/sound/apple,t8140-aop-audio.yaml
 F:	Documentation/devicetree/bindings/usb/vialab,vl122.yaml
 F:	Documentation/hid/apple-j700-multitouch.rst
 F:	arch/arm64/boot/dts/apple/t8140*
+F:	arch/arm64/configs/j700-radio.config
 F:	arch/arm64/include/asm/apple-idle.h
 F:	arch/arm64/kernel/idle-apple.S
 F:	drivers/hid/dockchannel-hid/dockchannel-hid-protocol*
