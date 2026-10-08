@@ -876,6 +876,9 @@ static __always_inline void apple_nvme_unmap_rq(struct request *req)
 
 	if (blk_rq_nr_phys_segments(req))
 		apple_nvme_unmap_data(anv, req);
+	if (!anv->hw->has_lsq_nvmmu)
+		return;
+
 	tag = nvme_tag_from_cid(iod->cmd.common.command_id);
 	tcb = &iod->q->tcbs[tag];
 	if (unlikely(tcb->dma_flags & BIT(2))) {
