@@ -238,6 +238,40 @@ impl Vm {
         Ok(())
     }
 
+    /// Moves the aliases of the last `blocks - kept` heap blocks of the exact
+    /// cached owner into `out`, which the caller drops after its locks. The
+    /// growth path appends one alias per added block, so these are the
+    /// blocks a shrink removed. Nothing moves unless all of them fit in `out`.
+    pub(crate) fn truncate_render_pool_mappings(
+        &self,
+        slot: u8,
+        id: u64,
+        blocks: usize,
+        kept: usize,
+        out: &mut KVec<KernelMapping>,
+    ) -> Result {
+        let count = blocks.checked_sub(kept).ok_or(EINVAL)?;
+        if id == 0 || count == 0 || out.capacity() - out.len() < count {
+            return Err(EINVAL);
+        }
+        let lifetime = self.lifetime.as_ref().ok_or(EINVAL)?;
+        let mut driver = lifetime.driver.lock();
+        let pool = Option::as_mut(&mut *driver)
+            .and_then(|driver| driver.render.get_mut(usize::from(slot)))
+            .and_then(Option::as_mut)
+            .filter(|pool| pool.id == id)
+            .ok_or(EINVAL)?;
+        if pool.blocks != blocks || pool.mappings.len() < count {
+            return Err(EBUSY);
+        }
+        for _ in 0..count {
+            let mapping = pool.mappings.pop().ok_or(EIO)?;
+            out.push_within_capacity(mapping).map_err(|_| EIO)?;
+        }
+        pool.blocks = kept;
+        Ok(())
+    }
+
     /// A delayed teardown must not remove a successor generation. Remove
     /// under the cache lock, then unmap after dropping that lock.
     pub(crate) fn clear_render_pool_mappings_if_owner(&self, slot: u8, id: u64) {

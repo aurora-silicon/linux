@@ -909,6 +909,7 @@ impl Pair {
             return Err(EINVAL);
         };
         let required = target::Layout::new(pass, self.clusters)?.tvb_blocks;
+        self.memory.manager.note_required(required, crate::g17::now_ns());
         if self.in_flight() {
             return Ok(None);
         }

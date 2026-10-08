@@ -13,6 +13,9 @@ use crate::g17::{
 };
 use kernel::{prelude::*, sync::Arc};
 
+/// Wake interval while a tiler heap may still shrink: the native check period.
+const SHRINK_WAKE_NS: u64 = 1_000_000_000;
+
 struct Service<'a> {
     firmware: &'a mut Firmware,
     deferred: &'a mut DeferredBatch,
@@ -387,10 +390,14 @@ impl crate::g17::Shared {
         firmware.reclaim_drained_renders(deferred)?;
         firmware.service_compute_exit(deferred)?;
         firmware.service_compute_pools(deferred)?;
+        let mut shrinking = false;
         if !firmware.recovery.pending() {
             firmware
                 .queues
                 .vacate_evicted_render_pools(&firmware.init, deferred)?;
+            shrinking = firmware
+                .queues
+                .shrink_render_heaps(&firmware.init, now, deferred);
         }
         {
             let mut reclaim = self.reclaim.lock();
@@ -414,6 +421,13 @@ impl crate::g17::Shared {
         if polling {
             self.queue_poll();
         }
+        // A heap with growth to give back is re-evaluated at least once per
+        // shrink period, also while the device is otherwise idle.
+        let idle = if shrinking {
+            Some(idle.map_or(SHRINK_WAKE_NS, |delay| delay.min(SHRINK_WAKE_NS)))
+        } else {
+            idle
+        };
         if let Some(delay) = idle {
             self.queue_idle(delay);
         }

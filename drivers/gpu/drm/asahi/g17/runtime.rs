@@ -656,6 +656,8 @@ pub(super) struct DeferredBatch {
     vacated: KVVec<super::queue::compute::Vacated>,
     /// Backing of render pools vacated for evicted idle clients.
     render: KVVec<super::freelist::RenderBacking>,
+    /// Tiler-heap extensions removed from idle heaps, with their aliases.
+    tvb: KVVec<super::buffer::TvbRelease>,
 }
 impl DeferredBatch {
     const DEPTH: usize = if crate::hw::t8140::queues::RENDER_DEPTH as usize
@@ -676,14 +678,17 @@ impl DeferredBatch {
         Self::with_capacity(2 * Self::DEPTH, 0)
     }
     fn with_capacity(capacity: usize, detached: usize) -> Result<Self> {
+        let render_slots = if detached != 0 {
+            crate::hw::t8140::queues::RENDER_SLOTS
+        } else {
+            0
+        };
         Ok(Self {
             values: KVVec::with_capacity(capacity, GFP_KERNEL)?,
             bindings: KVVec::with_capacity(detached, GFP_KERNEL)?,
             vacated: KVVec::with_capacity(detached, GFP_KERNEL)?,
-            render: KVVec::with_capacity(
-                if detached != 0 { crate::hw::t8140::queues::RENDER_SLOTS } else { 0 },
-                GFP_KERNEL,
-            )?,
+            render: KVVec::with_capacity(render_slots, GFP_KERNEL)?,
+            tvb: KVVec::with_capacity(render_slots, GFP_KERNEL)?,
         })
     }
     /// Keeps the detached owner's unmapping and VM teardown out of the device
@@ -700,6 +705,14 @@ impl DeferredBatch {
     pub(super) fn defer_render_backing(&mut self, backing: super::freelist::RenderBacking) {
         if let Err(backing) = self.render.push_within_capacity(backing) {
             drop(backing);
+        }
+    }
+    pub(super) fn tvb_room(&self) -> bool {
+        self.tvb.len() < self.tvb.capacity()
+    }
+    pub(super) fn defer_tvb(&mut self, release: super::buffer::TvbRelease) {
+        if let Err(release) = self.tvb.push_within_capacity(release) {
+            drop(release);
         }
     }
     pub(super) fn defer_vacated(&mut self, vacated: super::queue::compute::Vacated) {
@@ -752,6 +765,9 @@ impl DeferredBatch {
         }
         for backing in self.render.drain_all() {
             drop(backing);
+        }
+        for release in self.tvb.drain_all() {
+            drop(release);
         }
     }
 }
