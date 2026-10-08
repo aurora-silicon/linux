@@ -31,7 +31,9 @@ The station uses 2.4 GHz channels 1-13 and the 5 GHz channels 36-64,
 channels stay passive: the firmware listens on them while the station is not
 associated, but never probes or joins an access point there, and scans made
 while associated skip them. A channel whose restrictions the driver cannot
-apply (reduced power, no OFDM, PSD limits) is disabled rather than used.
+apply (reduced power, no OFDM, PSD limits) is disabled rather than used, and
+so is a channel the country package does not permit: every power limit of
+that channel in ``policy/<CC>.bin`` is left undefined.
 
 Use the ordinary cfg80211 regulatory database and applicable country policy.
 The validated first-admission fallback is kernel country 00 with firmware XZ.

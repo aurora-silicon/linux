@@ -1,4 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <linux/rtnetlink.h>
+
 #include "mt7932.h"
 
 static int mt_stock_config(struct mt7932 *m);
@@ -221,6 +223,28 @@ static int mt_startup_once(struct mt7932 *m)
 	return ret;
 }
 
+/* Keep cfg80211's channel list in step with the channels the country
+ * package leaves out of the firmware domain. cfg80211 recomputes the flags
+ * on its next regulatory change, which runs this again.
+ */
+static void mt_policy_disable(struct mt7932 *m, const struct mt7932_policy *policy)
+{
+	unsigned int i;
+
+	rtnl_lock();
+	wiphy_lock(m->wiphy);
+	for (i = 0; i < MT7932_CHANNELS; i++) {
+		struct ieee80211_channel *channel = i < MT7932_CHANNELS_2G ?
+			&m->channels[i] : &m->channels5[i - MT7932_CHANNELS_2G];
+
+		if (!(channel->flags & IEEE80211_CHAN_DISABLED) &&
+		    !mt7932_policy_permits(policy, channel->hw_value))
+			channel->flags |= IEEE80211_CHAN_DISABLED;
+	}
+	wiphy_unlock(m->wiphy);
+	rtnl_unlock();
+}
+
 static void mt_startup_work(struct work_struct *work)
 {
 	struct mt7932 *m = container_of(work, struct mt7932, startup_work);
@@ -275,6 +299,10 @@ static void mt_startup_work(struct work_struct *work)
 		}
 		if (!ret)
 			ret = mt7932_policy_parse(&policy, file->data, file->size, reg.domain);
+		if (!ret) {
+			mt7932_policy_filter(&reg, &policy);
+			mt_policy_disable(m, &policy);
+		}
 		mutex_lock(&m->command_mutex);
 		if (READ_ONCE(m->stopping) || generation != READ_ONCE(m->reg_generation))
 			goto next;
