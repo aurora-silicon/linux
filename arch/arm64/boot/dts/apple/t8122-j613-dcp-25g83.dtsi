@@ -1,0 +1,100 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* J613 25G83: inherit the hardware wiring, select a separate firmware ABI.
+ * No board tunables or DMA mappings are embedded. The boot loader passes
+ * this Mac's PMP values and validates the running display's mappings.
+ */
+/ {
+	aliases {
+		pmp = &pmp;
+	};
+};
+
+&dcp {
+	apple,j613-25g83-profile = <1>;
+	apple,firmware-compat = <26 6 2>;
+	apple,pmp = <&pmp>;
+	/delete-property/ clocks;
+	status = "disabled";
+};
+
+&disp0_piodma {
+	status = "disabled";
+};
+
+&{/soc} {
+	pmp_report: pmp-report@2d03c0000 {
+		compatible = "apple,j613-25g83-pmp-report";
+		reg = <0x2 0xd03c0000 0x0 0x14000>;
+		power-domains = <&ps_pms_sram>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+
+		pmp_report_disp: report@7 {
+			compatible = "apple,t6000-pmp-v2-report-entry";
+			reg = <7>;
+			label = "pmp-disp";
+			#power-domain-cells = <0>;
+			apple,always-on;
+		};
+		pmp_report_ans: report@11 {
+			compatible = "apple,t6000-pmp-v2-report-entry";
+			reg = <17>;
+			label = "pmp-ans";
+			#power-domain-cells = <0>;
+			apple,always-on;
+		};
+	};
+
+	pmp_dart: iommu@2d0300000 {
+		compatible = "apple,t8122-dart", "apple,t8110-dart";
+		reg = <0x2 0xd0300000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 625 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_pmp>;
+		status = "disabled";
+	};
+
+	pmp_mbox: mailbox@2d0c08000 {
+		compatible = "apple,t8122-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0xd0c08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 621 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 622 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 623 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 624 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_pmp>, <&ps_pms_sram>,
+				<&pmp_report_disp>, <&pmp_report_ans>;
+		status = "disabled";
+	};
+
+	pmp: pmp@2d0500000 {
+		compatible = "apple,t8122-pmp-v2", "apple,t6000-pmp-v2";
+		reg = <0x2 0xd0500000 0x0 0x80000>,
+		      <0x2 0xd0c00000 0x0 0x4000>;
+		reg-names = "pmp", "asc";
+		mboxes = <&pmp_mbox>;
+		mbox-names = "mbox";
+		iommus = <&pmp_dart 0>;
+		power-domains = <&ps_pmp>;
+		apple,pmp-report = <&pmp_report>;
+		status = "disabled";
+	};
+};
+
+/* The 25G83 GPU uses the native ASC mailbox and the same PMP supplier.
+ * Firmware mappings and calibration are supplied by the boot loader.
+ */
+&agx_mbox {
+	compatible = "apple,t8122-agx-asc-mailbox", "apple,asc-mailbox-v4";
+	status = "disabled";
+};
+
+&gpu {
+	apple,pmp = <&pmp>;
+	status = "disabled";
+};
