@@ -2360,6 +2360,17 @@ static int usb4_usb3_port_read_consumed_bandwidth(struct tb_port *port,
 	return 0;
 }
 
+int usb4_usb3_port_consumed_bandwidth(struct tb_port *port, int *upstream_bw,
+				      int *downstream_bw)
+{
+	if (!tb_port_is_usb3_up(port))
+		return -EINVAL;
+
+	/* Device-router USB3 UP adapters expose these counters without CMR. */
+	return usb4_usb3_port_read_consumed_bandwidth(port, upstream_bw,
+						     downstream_bw);
+}
+
 static int usb4_usb3_port_write_allocated_bandwidth(struct tb_port *port,
 						    int upstream_bw,
 						    int downstream_bw)

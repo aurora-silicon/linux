@@ -36,6 +36,16 @@ description: |
   distributed over the root ports as the OS sees fit by programming
   the PCIe controller's port registers.
 
+$defs:
+  tunable:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset
+        - description: Mask of bits to clear
+        - description: Bits to set
+    description: Register initialization tuples for one controller region.
+
 properties:
   compatible:
     oneOf:
@@ -85,7 +95,33 @@ properties:
   power-domains:
     maxItems: 1
 
+  resets:
+    description:
+      Reset of a tunneled (PCIe-C) controller and its DART, for controllers
+      the kernel initializes itself.
+    maxItems: 1
+
   dma-coherent: true
+
+  apple,pciec-kernel-init:
+    type: boolean
+    description: The kernel initializes the tunneled controller from reset.
+
+  apple,tunable-rc:
+    $ref: '#/$defs/tunable'
+    description: Root-complex register initialization tuples.
+
+  apple,tunable-fabric:
+    $ref: '#/$defs/tunable'
+    description: Initialization tuples for the fabric register region.
+
+  apple,tunable-debug:
+    $ref: '#/$defs/tunable'
+    description: Initialization tuples for the debug register region.
+
+  apple,tunable-oe-fabric:
+    $ref: '#/$defs/tunable'
+    description: Initialization tuples for the oe-fabric register region.
 
   apple,piodma:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -107,6 +143,10 @@ patternProperties:
         maxItems: 1
 
       interrupt-controller: true
+
+      apple,tunable:
+        $ref: '#/$defs/tunable'
+        description: Initialization tuples relative to this port's registers.
 
     required:
       - interrupt-controller
@@ -189,7 +229,7 @@ allOf:
                 - const: fabric
                 - const: debug
                 - const: ltssm
-                - const: intr2axi
+                - enum: [intr2axi, oe-fabric]
         interrupts:
           maxItems: 1
         ranges:
@@ -197,6 +237,12 @@ allOf:
           maxItems: 3
     else:
       properties:
+        resets: false
+        apple,pciec-kernel-init: false
+        apple,tunable-rc: false
+        apple,tunable-fabric: false
+        apple,tunable-debug: false
+        apple,tunable-oe-fabric: false
         ranges:
           maxItems: 2
       allOf:
@@ -239,6 +285,8 @@ allOf:
                   - const: phy3
       patternProperties:
         "^pci@":
+          properties:
+            apple,tunable: false
           required:
             - reset-gpios
 

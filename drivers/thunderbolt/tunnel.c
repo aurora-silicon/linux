@@ -7,10 +7,14 @@
  */
 
 #include <linux/delay.h>
+#include <linux/export.h>
 #include <linux/slab.h>
 #include <linux/list.h>
 #include <linux/ktime.h>
+#include <linux/of.h>
+#include <linux/string.h>
 #include <linux/string_helpers.h>
+#include <linux/soc/apple/dp-tunnel.h>
 
 #include "tunnel.h"
 #include "tb.h"
@@ -97,6 +101,27 @@ static bool bw_alloc_mode = true;
 module_param(bw_alloc_mode, bool, 0444);
 MODULE_PARM_DESC(bw_alloc_mode,
 		 "enable bandwidth allocation mode if supported (default: true)");
+
+static bool dp_video_counter;
+module_param(dp_video_counter, bool, 0444);
+MODULE_PARM_DESC(dp_video_counter,
+		 "diagnostic: count packets on the DP video path's DP IN hop and its downstream (hub-side) hop (Apple M2 Pro/Max laptop right ACIO route only; read via debugfs port counters); default: false");
+
+static void tb_dp_dump_apple(struct tb_tunnel *tunnel);
+static int tb_apple_nhi_typec_index(struct tb_nhi *nhi);
+
+static bool tb_nhi_is_apple(const struct tb_nhi *nhi)
+{
+	struct device_node *np;
+
+	if (!nhi || !nhi->dev || !nhi->ops ||
+	    !nhi->ops->dp_tunnel_post_activate)
+		return false;
+	np = nhi->dev->of_node;
+	if (!np && nhi->dev->parent)
+		np = nhi->dev->parent->of_node;
+	return np && of_device_is_compatible(np, "apple,t8103-usb4-nhi");
+}
 
 static const char * const tb_tunnel_names[] = { "PCI", "DP", "DMA", "USB3" };
 
@@ -328,27 +353,42 @@ static int tb_pci_pre_activate(struct tb_tunnel *tunnel)
 {
 	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
 
+	/* Only the tunnel starting at the host owns its native PCIe port. */
+	if (tb_route(tunnel->src_port->sw))
+		return 0;
 	if (ops && ops->pci_tunnel_pre_activate)
 		return ops->pci_tunnel_pre_activate(tunnel->tb->nhi);
 	return 0;
 }
 
-static int tb_pci_post_activate(struct tb_tunnel *tunnel)
+int tb_pci_tunnel_activate_host(struct tb_tunnel *tunnel)
 {
 	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
 
-	if (ops && ops->pci_tunnel_post_activate)
+	if (tb_route(tunnel->src_port->sw))
+		return 0;
+	if (ops && ops->pci_tunnel_post_activate) {
+		/* Also unwind a hook that fails after partial host setup. */
+		tunnel->host_pci_activated = true;
 		return ops->pci_tunnel_post_activate(tunnel->tb->nhi);
+	}
 	return 0;
 }
 
-static int tb_pci_deactivate(struct tb_tunnel *tunnel)
+int tb_pci_tunnel_deactivate_host(struct tb_tunnel *tunnel)
 {
-	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
+	const struct tb_nhi_ops *ops;
+	int ret = 0;
 
+	/* Firmware tunnels discovered during resume do not own host state. */
+	if (!tunnel->host_pci_activated)
+		return 0;
+	ops = tunnel->tb->nhi->ops;
 	if (ops && ops->pci_tunnel_deactivate)
-		return ops->pci_tunnel_deactivate(tunnel->tb->nhi);
-	return 0;
+		ret = ops->pci_tunnel_deactivate(tunnel->tb->nhi);
+	if (!ret)
+		tunnel->host_pci_activated = false;
+	return ret;
 }
 
 static int tb_pci_activate(struct tb_tunnel *tunnel, bool activate)
@@ -360,7 +400,7 @@ static int tb_pci_activate(struct tb_tunnel *tunnel, bool activate)
 	 * what is behind it can still be reached.
 	 */
 	if (!activate) {
-		res = tb_pci_deactivate(tunnel);
+		res = tb_pci_tunnel_deactivate_host(tunnel);
 		if (res)
 			return res;
 	}
@@ -383,7 +423,7 @@ static int tb_pci_activate(struct tb_tunnel *tunnel, bool activate)
 		if (res)
 			return res;
 
-		return tb_pci_post_activate(tunnel);
+		return tb_pci_tunnel_activate_host(tunnel);
 	} else {
 		/* Downstream router could be unplugged */
 		tb_pci_port_enable(tunnel->dst_port, activate);
@@ -907,7 +947,8 @@ static int tb_dp_xchg_caps(struct tb_tunnel *tunnel)
 	 * SET_CONFIG with SET_LTTPR_MODE set. This causes problems with
 	 * DP tunneling.
 	 */
-	if (tb_route(out->sw) && tb_switch_is_titan_ridge(out->sw)) {
+	if (tb_route(out->sw) && tb_switch_is_titan_ridge(out->sw) &&
+	    !tb_port_is_apple_host_dpin(in)) {
 		out_dp_cap |= DP_COMMON_CAP_LTTPR_NS;
 		tb_tunnel_dbg(tunnel, "disabling LTTPR\n");
 	}
@@ -916,9 +957,31 @@ static int tb_dp_xchg_caps(struct tb_tunnel *tunnel)
 			     in->cap_adap + DP_REMOTE_CAP, 1);
 }
 
+/* Right-hand ACIO DP IN adapter of the Apple M2 Pro and M2 Max laptops only;
+ * shared by the diagnostic packet counter and the bandwidth-grant workaround
+ * below.
+ */
+static bool tb_dp_is_apple_t602x_right_dpin(const struct tb_port *in)
+{
+	if (!tb_port_is_dpin(in))
+		return false;
+	if (!in->sw->tb || !tb_nhi_is_apple(in->sw->tb->nhi))
+		return false;
+	if (!apple_dp_tunnel_t602x())
+		return false;
+
+	/* Right-hand USB-C ports only ("f01f" NHI); see tb_apple_nhi_typec_index(). */
+	return tb_apple_nhi_typec_index(in->sw->tb->nhi) == 2;
+}
+
+static bool tb_dp_apple_dpin_needs_bw_grant(const struct tb_port *in)
+{
+	return tb_dp_is_apple_t602x_right_dpin(in);
+}
+
 static int tb_dp_bandwidth_alloc_mode_enable(struct tb_tunnel *tunnel)
 {
-	int ret, estimated_bw, granularity, tmp;
+	int ret, estimated_bw, granularity, tmp, non_reduced_bw;
 	struct tb_port *out = tunnel->dst_port;
 	struct tb_port *in = tunnel->src_port;
 	u32 out_dp_cap, out_rate, out_lanes;
@@ -958,6 +1021,7 @@ static int tb_dp_bandwidth_alloc_mode_enable(struct tb_tunnel *tunnel)
 	rate = min(in_rate, out_rate);
 	lanes = min(in_lanes, out_lanes);
 	tmp = tb_dp_bandwidth(rate, lanes);
+	non_reduced_bw = tmp;
 
 	tb_tunnel_dbg(tunnel, "non-reduced bandwidth %u Mb/s x%u = %u Mb/s\n",
 		      rate, lanes, tmp);
@@ -1009,8 +1073,21 @@ static int tb_dp_bandwidth_alloc_mode_enable(struct tb_tunnel *tunnel)
 	if (ret)
 		return ret;
 
-	/* Initial allocation should be 0 according the spec */
-	ret = usb4_dp_port_allocate_bandwidth(in, 0);
+	/*
+	 * Initial allocation should be 0 according the spec, which relies
+	 * on the DP IN adapter later raising it via a bandwidth request
+	 * notification. The Apple M2 Pro right-hand ACIO DP IN adapter has
+	 * never been observed to generate that notification: link training
+	 * and a full DCP frame complete with this field (DP_STATUS
+	 * allocated-bandwidth) still reading 0 and no picture.
+	 * On that one route only, grant the already-computed non-reduced
+	 * bandwidth immediately, capped at what the connection manager
+	 * already reserved for this tunnel (estimated_bw), instead of
+	 * waiting indefinitely for a request that does not arrive.
+	 */
+	tmp = tb_dp_apple_dpin_needs_bw_grant(in) ?
+	      min(non_reduced_bw, estimated_bw) : 0;
+	ret = usb4_dp_port_allocate_bandwidth(in, tmp);
 	if (ret)
 		return ret;
 
@@ -1095,8 +1172,13 @@ static void tb_dp_dprx_work(struct work_struct *work)
 	struct tb_tunnel *tunnel = container_of(work, typeof(*tunnel), dprx_work.work);
 	struct tb *tb = tunnel->tb;
 
+	/* Teardown cancels this worker while holding the domain lock. */
+	if (!mutex_trylock(&tb->lock)) {
+		queue_delayed_work(tb->wq, &tunnel->dprx_work,
+				   msecs_to_jiffies(TB_DPRX_POLL_DELAY));
+		return;
+	}
 	if (!tunnel->dprx_canceled) {
-		mutex_lock(&tb->lock);
 		if (tb_dp_is_usb4(tunnel->src_port->sw) &&
 		    tb_dp_wait_dprx(tunnel, TB_DPRX_WAIT_TIMEOUT)) {
 			if (ktime_before(ktime_get(), tunnel->dprx_timeout)) {
@@ -1105,28 +1187,38 @@ static void tb_dp_dprx_work(struct work_struct *work)
 				mutex_unlock(&tb->lock);
 				return;
 			}
+			if (tb_nhi_is_apple(tb->nhi)) {
+				tb_tunnel_warn(tunnel,
+					       "Apple: DPRX timeout, keeping DP tunnel\n");
+				tb_dp_dump_apple(tunnel);
+				tb_tunnel_set_active(tunnel, true);
+			}
 		} else {
 			tb_tunnel_set_active(tunnel, true);
 		}
-		mutex_unlock(&tb->lock);
 	}
 
+	tunnel->dprx_started = false;
 	if (tunnel->callback)
 		tunnel->callback(tunnel, tunnel->callback_data);
+	/* Paths still reference router ports, so release them before teardown. */
 	tb_tunnel_put(tunnel);
+	mutex_unlock(&tb->lock);
 }
 
 static int tb_dp_dprx_start(struct tb_tunnel *tunnel)
 {
-	/*
-	 * Bump up the reference to keep the tunnel around. It will be
-	 * dropped in tb_dp_dprx_stop() once the tunnel is deactivated.
-	 */
-	tb_tunnel_get(tunnel);
-
-	tunnel->dprx_started = true;
+	if (tb_nhi_is_apple(tunnel->tb->nhi)) {
+		tb_tunnel_warn(tunnel,
+			       "Apple: DP tunnel paths up, not waiting for DPRX\n");
+		tb_tunnel_set_active(tunnel, true);
+	}
 
 	if (tunnel->callback) {
+		/* The worker or cancellation drops this reference exactly once. */
+		tb_tunnel_get(tunnel);
+		tunnel->dprx_started = true;
+		tunnel->dprx_canceled = false;
 		tunnel->dprx_timeout = dprx_timeout_to_ktime(dprx_timeout);
 		queue_delayed_work(tunnel->tb->wq, &tunnel->dprx_work, 0);
 		return -EINPROGRESS;
@@ -1139,11 +1231,71 @@ static int tb_dp_dprx_start(struct tb_tunnel *tunnel)
 static void tb_dp_dprx_stop(struct tb_tunnel *tunnel)
 {
 	if (tunnel->dprx_started) {
+		lockdep_assert_held(&tunnel->tb->lock);
 		tunnel->dprx_started = false;
 		tunnel->dprx_canceled = true;
-		if (cancel_delayed_work(&tunnel->dprx_work))
-			tb_tunnel_put(tunnel);
+		cancel_delayed_work_sync(&tunnel->dprx_work);
+		/* The callback also owns resources, including its domain reference. */
+		if (tunnel->callback)
+			tunnel->callback(tunnel, tunnel->callback_data);
+		tb_tunnel_put(tunnel);
 	}
+}
+
+/*
+ * The host DP IN adapter has no physical DP connector. Pulse HPD propagation
+ * after enabling the tunnel and allow time for the adapter to report HPD.
+ * Failure is diagnostic: leave the tunnel available for display recovery.
+ */
+static void tb_dp_apple_pulse_hpd(struct tb_port *in)
+{
+	int i, hpd = 0;
+	u32 v;
+
+	if (!in->cap_adap)
+		return;
+	if (tb_port_read(in, &v, TB_CFG_PORT, in->cap_adap + ADP_DP_CS_3, 1)) {
+		tb_port_warn(in, "Apple: cannot read DP adapter state, HPD not pulsed\n");
+		return;
+	}
+	/* HPDC may still be set from a previous tunnel's teardown */
+	v &= ~ADP_DP_CS_3_HPDC;
+	v |= ADP_DP_CS_3_HPD_PROPAGATE;
+	if (tb_port_write(in, &v, TB_CFG_PORT, in->cap_adap + ADP_DP_CS_3, 1)) {
+		tb_port_warn(in, "Apple: cannot pulse HPD propagation\n");
+		return;
+	}
+	usleep_range(10000, 11000);
+	v &= ~ADP_DP_CS_3_HPD_PROPAGATE;
+	if (tb_port_write(in, &v, TB_CFG_PORT, in->cap_adap + ADP_DP_CS_3, 1))
+		tb_port_warn(in, "Apple: cannot end HPD propagation pulse\n");
+	for (i = 0; i < 200; i++) {
+		hpd = tb_dp_port_hpd_is_active(in);
+		if (hpd)
+			break;
+		usleep_range(10000, 11000);
+	}
+	if (hpd < 0)
+		tb_port_warn(in, "Apple: cannot read HPD status: %d\n", hpd);
+	else if (!hpd)
+		tb_port_warn(in, "Apple: HPD did not propagate\n");
+	else
+		tb_port_info(in, "Apple: HPD propagated\n");
+}
+
+/* Release display-side state while the host router is still accessible. */
+void tb_dp_tunnel_deactivate_host(struct tb_tunnel *tunnel)
+{
+	const struct tb_nhi_ops *ops;
+
+	tb_dp_dprx_stop(tunnel);
+	if (!tunnel->host_dp_activated)
+		return;
+	tunnel->host_dp_activated = false;
+	ops = tunnel->tb->nhi->ops;
+	if (ops && ops->dp_tunnel_deactivate)
+		ops->dp_tunnel_deactivate(tunnel->tb->nhi, tunnel->src_port,
+					  tunnel->dst_port);
 }
 
 static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
@@ -1152,6 +1304,7 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 
 	if (active) {
 		struct tb_path **paths;
+		const struct tb_nhi_ops *ops;
 		int last;
 
 		paths = tunnel->paths;
@@ -1166,8 +1319,17 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 			paths[TB_DP_VIDEO_PATH_OUT]->hops[last].next_hop_index,
 			paths[TB_DP_AUX_PATH_IN]->hops[0].in_hop_index,
 			paths[TB_DP_AUX_PATH_OUT]->hops[last].next_hop_index);
+
+		ops = tunnel->tb->nhi->ops;
+		if (ops && ops->dp_tunnel_pre_activate) {
+			ret = ops->dp_tunnel_pre_activate(
+				tunnel->tb->nhi, tunnel->src_port,
+				tunnel->dst_port);
+			if (ret)
+				return ret;
+		}
 	} else {
-		tb_dp_dprx_stop(tunnel);
+		tb_dp_tunnel_deactivate_host(tunnel);
 		tb_dp_port_hpd_clear(tunnel->src_port);
 		tb_dp_port_set_hops(tunnel->src_port, 0, 0, 0);
 		if (tb_port_is_dpout(tunnel->dst_port))
@@ -1175,13 +1337,60 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 	}
 
 	ret = tb_dp_port_enable(tunnel->src_port, active);
-	if (ret)
+	/* A departed adapter must not prevent disabling the remaining adapter. */
+	if (ret && active)
 		return ret;
 
 	if (tb_port_is_dpout(tunnel->dst_port)) {
-		ret = tb_dp_port_enable(tunnel->dst_port, active);
-		if (ret)
+		struct tb_port *out = tunnel->dst_port;
+		bool apple_dpin = (tb_nhi_is_apple(tunnel->tb->nhi) ||
+				  tb_port_is_apple_host_dpin(tunnel->src_port)) &&
+				  tb_port_is_dpin(tunnel->src_port) &&
+				  out->cap_adap;
+		u32 v;
+
+		/*
+		 * Apple silicon host: the sink link is trained by the
+		 * host's DPTX through the tunnel; keep this DP OUT adapter
+		 * from starting link training on its own, and hand it back
+		 * once the tunnel is gone.
+		 */
+		if (active && apple_dpin &&
+		    !tb_port_read(out, &v, TB_CFG_PORT, out->cap_adap + ADP_DP_CS_3, 1)) {
+			v |= ADP_DP_CS_3_NO_AUTO_LT;
+			if (tb_port_write(out, &v, TB_CFG_PORT, out->cap_adap + ADP_DP_CS_3, 1))
+				tb_port_warn(out, "Apple: cannot hold off DP link training\n");
+		}
+		ret = tb_dp_port_enable(out, active);
+		/* hand link training back even if the disable failed */
+		if (!active && apple_dpin &&
+		    !tb_port_read(out, &v, TB_CFG_PORT, out->cap_adap + ADP_DP_CS_3, 1)) {
+			v &= ~ADP_DP_CS_3_NO_AUTO_LT;
+			if (tb_port_write(out, &v, TB_CFG_PORT, out->cap_adap + ADP_DP_CS_3, 1))
+				tb_port_warn(out, "Apple: cannot restore DP link training\n");
+		}
+		if (ret && active)
 			return ret;
+	}
+
+	if (active && tb_nhi_is_apple(tunnel->tb->nhi)) {
+		if (tb_port_is_dpin(tunnel->src_port))
+			tb_dp_apple_pulse_hpd(tunnel->src_port);
+		tb_dp_dump_apple(tunnel);
+	}
+
+	if (active) {
+		const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
+
+		if (ops && ops->dp_tunnel_post_activate) {
+			/* Also unwind a hook that fails after partial setup. */
+			tunnel->host_dp_activated = true;
+			ret = ops->dp_tunnel_post_activate(tunnel->tb->nhi,
+							   tunnel->src_port,
+							   tunnel->dst_port);
+			if (ret)
+				return ret;
+		}
 	}
 
 	return active ? tb_dp_dprx_start(tunnel) : 0;
@@ -1490,6 +1699,14 @@ static int tb_dp_init_video_credits(struct tb_path_hop *hop)
 	struct tb_port *port = hop->in_port;
 	struct tb_switch *sw = port->sw;
 
+	/*
+	 * Apple silicon host DP IN adapters require five NFC video credits.
+	 */
+	if (tb_port_needs_host_dp_credits(port)) {
+		hop->nfc_credits = 5;
+		return 0;
+	}
+
 	if (tb_port_use_credit_allocation(port)) {
 		unsigned int nfc_credits;
 		size_t max_dp_streams;
@@ -1514,6 +1731,14 @@ static int tb_dp_init_video_credits(struct tb_path_hop *hop)
 	return 0;
 }
 
+static bool tb_dp_video_counter_wanted(const struct tb_path *path)
+{
+	if (!dp_video_counter || !path->path_length)
+		return false;
+
+	return tb_dp_is_apple_t602x_right_dpin(path->hops[0].in_port);
+}
+
 static int tb_dp_init_video_path(struct tb_path *path, bool pm_support)
 {
 	struct tb_path_hop *hop;
@@ -1524,6 +1749,27 @@ static int tb_dp_init_video_path(struct tb_path *path, bool pm_support)
 	path->ingress_shared_buffer = TB_PATH_NONE;
 	path->priority = TB_DP_VIDEO_PRIORITY;
 	path->weight = TB_DP_VIDEO_WEIGHT;
+
+	if (tb_dp_video_counter_wanted(path)) {
+		struct tb_path_hop *last = &path->hops[path->path_length - 1];
+
+		path->hops[0].in_counter_index = 0;
+		tb_port_dbg(path->hops[0].in_port,
+			   "dp_video_counter: enabling counter 0 on DP IN hop\n");
+
+		/*
+		 * Second checkpoint: the downstream router's ingress side of
+		 * the same path (e.g. the hub's upstream link), so comparing
+		 * its counter against the first checkpoint can show whether
+		 * DP-IN traffic actually crosses into the far end, not just
+		 * leaves the host.
+		 */
+		if (last != &path->hops[0]) {
+			last->in_counter_index = 0;
+			tb_port_dbg(last->in_port,
+				   "dp_video_counter: enabling counter 0 on downstream hop\n");
+		}
+	}
 
 	tb_path_for_each_hop(path, hop) {
 		int ret;
@@ -1536,6 +1782,59 @@ static int tb_dp_init_video_path(struct tb_path *path, bool pm_support)
 	}
 
 	return 0;
+}
+
+static void tb_dp_dump_apple_adapter(struct tb_port *port, const char *tag)
+{
+	u32 w[9];
+	int i, ret;
+
+	for (i = 0; i <= 8; i++) {
+		ret = tb_port_read(port, &w[i], TB_CFG_PORT,
+				   port->cap_adap + i, 1);
+		if (ret)
+			w[i] = 0xffffffff;
+	}
+	tb_port_dbg(port,
+		    "%s CS0=%08x CS1=%08x CS2=%08x CS3=%08x LOCAL=%08x REMOTE=%08x STAT=%08x COMMON=%08x CS8=%08x VE=%u AE=%u HPD=%u DPRX=%u\n",
+		    tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8],
+		    !!(w[0] & ADP_DP_CS_0_VE), !!(w[0] & ADP_DP_CS_0_AE),
+		    !!(w[2] & ADP_DP_CS_2_HPD),
+		    !!(w[7] & DP_COMMON_CAP_DPRX_DONE));
+}
+
+static int tb_apple_nhi_typec_index(struct tb_nhi *nhi)
+{
+	const char *name;
+
+	if (!nhi || !nhi->dev)
+		return -1;
+	name = dev_name(nhi->dev);
+	if (strstr(name, "701f"))
+		return 0;
+	if (strstr(name, "b01f"))
+		return 1;
+	if (strstr(name, "f01f"))
+		return 2;
+	return -1;
+}
+
+static void tb_dp_dump_apple(struct tb_tunnel *tunnel)
+{
+	u32 cs2 = 0;
+	int hpd;
+
+	tb_dp_dump_apple_adapter(tunnel->src_port, "DP IN");
+	if (tb_port_is_dpout(tunnel->dst_port))
+		tb_dp_dump_apple_adapter(tunnel->dst_port, "DP OUT");
+
+	if (!tb_port_read(tunnel->src_port, &cs2, TB_CFG_PORT,
+			  tunnel->src_port->cap_adap + ADP_DP_CS_2, 1)) {
+		hpd = !!(cs2 & ADP_DP_CS_2_HPD);
+		tb_tunnel_dbg(tunnel,
+			      "Apple: DP IN HPD=%d typec=%d (DPTX should use this adapter, not ATC)\n",
+			      hpd, tb_apple_nhi_typec_index(tunnel->tb->nhi));
+	}
 }
 
 static void tb_dp_dump(struct tb_tunnel *tunnel)
@@ -1688,7 +1987,8 @@ err_free:
  * after tb_tunnel_activate() once the tunnel has been fully activated.
  * It can call tb_tunnel_is_active() to check if activation was
  * successful (or if it returns %false there was some sort of issue).
- * The @callback is called without @tb->lock held.
+ * The @callback is called with @tb->lock held. If DPRX was canceled, it
+ * must release its private resources without accessing the tunnel's ports.
  *
  * Return: Pointer to @struct tb_tunnel or %NULL in case of failure.
  */
@@ -2075,14 +2375,41 @@ static int tb_usb3_consumed_bandwidth(struct tb_tunnel *tunnel,
 {
 	struct tb_port *port = tb_upstream_port(tunnel->dst_port->sw);
 	int pcie_weight = tb_acpi_may_tunnel_pcie() ? TB_PCI_WEIGHT : 0;
+	int allocated_up = tunnel->allocated_up;
+	int allocated_down = tunnel->allocated_down;
+	int ret;
+
+	if (tunnel->src_port->sw->no_usb3_bw_alloc) {
+		/*
+		 * Apple's host USB3 adapter cannot acknowledge bandwidth
+		 * allocation requests. Its software-only initial allocation is a
+		 * maximum, not bandwidth actually occupied by USB3. The device
+		 * router's USB3 UP adapter still reports consumed bandwidth; use
+		 * that live value for DP admission without limiting USB3 bulk
+		 * traffic or writing the unsupported host registers.
+		 */
+		ret = usb4_usb3_port_consumed_bandwidth(tunnel->dst_port,
+						    &allocated_up, &allocated_down);
+		if (ret) {
+			/* Preserve the conservative allocation-based estimate when
+			 * a downstream adapter lacks readable consumed counters.
+			 */
+			allocated_up = tunnel->allocated_up;
+			allocated_down = tunnel->allocated_down;
+		} else {
+			/* Leave headroom for new isochronous USB3 transfers. */
+			allocated_up = max(allocated_up, 900);
+			allocated_down = max(allocated_down, 900);
+		}
+	}
 
 	/*
 	 * PCIe tunneling, if enabled, affects the USB3 bandwidth so
 	 * take that into account here.
 	 */
-	*consumed_up = tunnel->allocated_up *
+	*consumed_up = allocated_up *
 		(TB_USB3_WEIGHT + pcie_weight) / TB_USB3_WEIGHT;
-	*consumed_down = tunnel->allocated_down *
+	*consumed_down = allocated_down *
 		(TB_USB3_WEIGHT + pcie_weight) / TB_USB3_WEIGHT;
 
 	if (tb_port_get_link_generation(port) >= 4) {

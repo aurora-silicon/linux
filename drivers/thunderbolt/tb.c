@@ -10,6 +10,7 @@
 #include <linux/slab.h>
 #include <linux/errno.h>
 #include <linux/delay.h>
+#include <linux/of.h>
 #include <linux/pm_runtime.h>
 #include <linux/platform_data/x86/apple.h>
 
@@ -1704,6 +1705,9 @@ static void tb_discover_tunnels(struct tb *tb)
 		if (tb_tunnel_is_pci(tunnel)) {
 			struct tb_switch *parent = tunnel->dst_port->sw;
 
+			/* Adopt host state only for tunnels retained by this domain. */
+			if (tb_pci_tunnel_activate_host(tunnel))
+				tb_tunnel_warn(tunnel, "failed to adopt PCIe host state\n");
 			while (parent != tunnel->src_port->sw) {
 				parent->boot = true;
 				parent = tb_switch_parent(parent);
@@ -1721,6 +1725,65 @@ static void tb_discover_tunnels(struct tb *tb)
 	}
 }
 
+/*
+ * On some hosts (Apple silicon) the display engine has to be routed to a
+ * DP IN adapter of the host router by hand. Tell the NHI glue when a DP
+ * tunnel starting at one of those adapters comes or goes.
+ */
+static void tb_dp_tunnel_notify(struct tb_tunnel *tunnel, bool active)
+{
+	struct tb_port *in = tunnel->src_port;
+
+	/*
+	 * Only undo what was announced: a tunnel can be released twice (at
+	 * tb_stop() and by a late DPRX failure), the second time after the
+	 * host router is gone.
+	 */
+	if (!active && !tunnel->host_dp_notified)
+		return;
+	if (!tb_tunnel_is_dp(tunnel) || !tb_port_is_apple_host_dpin(in))
+		return;
+	/*
+	 * After both DP adapters are enabled, pulse the DP IN adapter's HPD
+	 * propagation bit for 10 ms and wait up to 2 s for its HPD status, so
+	 * HPD has reached the host before the display side starts. This runs
+	 * under tb->lock; HPD normally follows at once, 2 s is the worst case.
+	 */
+	if (active && in->cap_adap) {
+		int i, hpd = 0;
+		u32 v;
+
+		if (tb_port_read(in, &v, TB_CFG_PORT, in->cap_adap + ADP_DP_CS_3, 1)) {
+			tb_port_warn(in, "cannot read DP adapter state, HPD not pulsed\n");
+		} else {
+			/* HPDC may still be set from a previous tunnel's teardown */
+			v &= ~ADP_DP_CS_3_HPDC;
+			v |= ADP_DP_CS_3_HPD_PROPAGATE;
+			if (tb_port_write(in, &v, TB_CFG_PORT, in->cap_adap + ADP_DP_CS_3, 1)) {
+				tb_port_warn(in, "cannot pulse HPD propagation\n");
+				goto notify;
+			}
+			usleep_range(10000, 11000);
+			v &= ~ADP_DP_CS_3_HPD_PROPAGATE;
+			if (tb_port_write(in, &v, TB_CFG_PORT, in->cap_adap + ADP_DP_CS_3, 1))
+				tb_port_warn(in, "cannot end HPD propagation pulse\n");
+			for (i = 0; i < 200; i++) {
+				hpd = tb_dp_port_hpd_is_active(in);
+				if (hpd)
+					break;
+				usleep_range(10000, 11000);
+			}
+			if (hpd < 0)
+				tb_port_warn(in, "cannot read HPD status: %d\n", hpd);
+			else if (!hpd)
+				tb_port_warn(in, "HPD did not propagate\n");
+		}
+	}
+notify:
+	tunnel->host_dp_notified = active;
+	tunnel->tb->nhi->ops->dp_tunnel_changed(tunnel->tb->nhi, in->port, active);
+}
+
 static void tb_deactivate_and_free_tunnel(struct tb_tunnel *tunnel)
 {
 	struct tb_port *src_port, *dst_port;
@@ -1729,6 +1792,7 @@ static void tb_deactivate_and_free_tunnel(struct tb_tunnel *tunnel)
 	if (!tunnel)
 		return;
 
+	tb_dp_tunnel_notify(tunnel, false);
 	tb_tunnel_deactivate(tunnel);
 	list_del(&tunnel->list);
 
@@ -1911,7 +1975,9 @@ static void tb_dp_tunnel_active(struct tb_tunnel *tunnel, void *data)
 	struct tb_port *out = tunnel->dst_port;
 	struct tb *tb = data;
 
-	mutex_lock(&tb->lock);
+	lockdep_assert_held(&tb->lock);
+	if (tunnel->dprx_canceled)
+		goto out;
 	if (tb_tunnel_is_active(tunnel)) {
 		int consumed_up, consumed_down, ret;
 
@@ -1953,20 +2019,12 @@ static void tb_dp_tunnel_active(struct tb_tunnel *tunnel, void *data)
 		 * happens either because there is no graphics driver
 		 * loaded or not all DP cables where connected to the
 		 * discrete router.
-		 *
-		 * In both cases we remove the DP IN adapter from the
-		 * available resources as it is not usable. This will
-		 * also tear down the tunnel and try to re-use the
-		 * released DP OUT.
-		 *
-		 * It will be added back only if there is hotplug for
-		 * the DP IN again.
 		 */
 		tb_tunnel_warn(tunnel, "not active, tearing down\n");
-		tb_dp_resource_unavailable(tb, in, "DPRX negotiation failed");
+		tb_dp_resource_unavailable(tb, in,
+					   "DPRX negotiation failed");
 	}
-	mutex_unlock(&tb->lock);
-
+out:
 	tb_domain_put(tb);
 }
 
@@ -2044,6 +2102,7 @@ static void tb_tunnel_one_dp(struct tb *tb, struct tb_port *in,
 		goto err_free;
 	}
 
+	tb_dp_tunnel_notify(tunnel, true);
 	return;
 
 err_free:
@@ -2884,6 +2943,8 @@ static void tb_handle_notification(struct tb *tb, u64 route,
 	case TB_CFG_ERROR_PCIE_WAKE:
 	case TB_CFG_ERROR_DP_CON_CHANGE:
 	case TB_CFG_ERROR_DPTX_DISCOVERY:
+		tb_info(tb, "DPTX discovery notification route=%llx port=%u\n",
+			route, error->port);
 		if (tb_cfg_ack_notification(tb->ctl, route, error))
 			tb_warn(tb, "could not ack notification on %llx\n",
 				route);
@@ -2948,6 +3009,11 @@ static void tb_stop(struct tb *tb)
 		 */
 		if (tb_tunnel_is_dma(tunnel))
 			tb_tunnel_deactivate(tunnel);
+		/* the host side of a DP tunnel goes away with us */
+		else if (tb_tunnel_is_dp(tunnel)) {
+			tb_dp_tunnel_notify(tunnel, false);
+			tb_dp_tunnel_deactivate_host(tunnel);
+		}
 		tb_tunnel_put(tunnel);
 	}
 	tb_switch_remove(tb->root_switch);
@@ -3086,7 +3152,12 @@ static int tb_suspend_noirq(struct tb *tb)
 	struct tb_cm *tcm = tb_priv(tb);
 
 	tb_dbg(tb, "suspending...\n");
-	tb_disconnect_and_release_dp(tb);
+	/*
+	 * Kept tunnels survive the sleep. Keep DP ones as well, so a display
+	 * behind a dock is only powered down, not reported as unplugged.
+	 */
+	if (!(tb->nhi->quirks & QUIRK_KEEP_TUNNELS))
+		tb_disconnect_and_release_dp(tb);
 	tb_switch_exit_redrive(tb->root_switch);
 	tb_switch_suspend(tb->root_switch, false);
 	tcm->hotplug_active = false; /* signal tb_handle_hotplug to quit */
@@ -3149,6 +3220,15 @@ static int tb_resume_noirq(struct tb *tb)
 	tb_restore_children(tb->root_switch);
 
 	/*
+	 * Routers that stayed awake still carry our tunnels. Restarting them
+	 * would take down links the hosts kept up through the sleep.
+	 */
+	if (tb->nhi->quirks & QUIRK_KEEP_TUNNELS) {
+		tb_dbg(tb, "tunnels kept across sleep\n");
+		goto out;
+	}
+
+	/*
 	 * If we get here from suspend to disk the boot firmware or the
 	 * restore kernel might have created tunnels of its own. Since
 	 * we cannot be sure they are usable for us we find and tear
@@ -3180,6 +3260,7 @@ static int tb_resume_noirq(struct tb *tb)
 		tb_dbg(tb, "tunnels restarted, sleeping for 100ms\n");
 		msleep(100);
 	}
+out:
 	tb_switch_enter_redrive(tb->root_switch);
 	 /* Allow tb_handle_hotplug to progress events */
 	tcm->hotplug_active = true;
@@ -3226,6 +3307,43 @@ static int tb_thaw_noirq(struct tb *tb)
 	return 0;
 }
 
+static bool tb_dp_resource_listed(struct tb *tb, struct tb_port *port)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+	struct tb_port *p;
+
+	list_for_each_entry(p, &tcm->dp_resources, list) {
+		if (p == port)
+			return true;
+	}
+	return false;
+}
+
+static void tb_restore_dp_resources(struct tb_switch *sw)
+{
+	struct tb_cm *tcm = tb_priv(sw->tb);
+	struct tb_port *port;
+
+	if (sw->is_unplugged)
+		return;
+
+	tb_switch_for_each_port(sw, port) {
+		if (tb_port_has_remote(port)) {
+			tb_restore_dp_resources(port->remote->sw);
+		} else if (tb_port_is_dpin(port)) {
+			if (tb_dp_resource_listed(sw->tb, port) ||
+			    !tb_switch_query_dp_resource(sw, port))
+				continue;
+			tb_port_dbg(port, "DP IN resource available after resume\n");
+			list_add_tail(&port->list, &tcm->dp_resources);
+		} else if (tb_port_is_dpout(port) &&
+			   tb_dp_port_hpd_is_active(port) == 1 &&
+			   !tb_dp_port_is_enabled(port)) {
+			tb_dp_resource_available(sw->tb, port);
+		}
+	}
+}
+
 static void tb_complete(struct tb *tb)
 {
 	/*
@@ -3236,6 +3354,14 @@ static void tb_complete(struct tb *tb)
 	mutex_lock(&tb->lock);
 	if (tb_free_unplugged_xdomains(tb->root_switch))
 		tb_scan_switch(tb->root_switch);
+	/*
+	 * Routers kept awake through system sleep send no plug events for
+	 * the DP resources released at suspend, so pair them up again here.
+	 */
+	if (tb->nhi->quirks & QUIRK_NO_SYSTEM_SLEEP) {
+		tb_restore_dp_resources(tb->root_switch);
+		tb_tunnel_dp(tb);
+	}
 	mutex_unlock(&tb->lock);
 }
 

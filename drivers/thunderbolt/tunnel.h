@@ -62,8 +62,11 @@ enum tb_tunnel_state {
  * @allocated_down: Allocated downstream bandwidth (only for USB3)
  * @bw_mode: DP bandwidth allocation mode registers can be used to
  *	     determine consumed and allocated bandwidth
- * @dprx_started: DPRX negotiation was started (tb_dp_dprx_start() was called for it)
+ * @dprx_started: DPRX has an outstanding worker reference and callback
  * @dprx_canceled: Was DPRX capabilities read poll canceled
+ * @host_dp_notified: The NHI glue was told this DP tunnel is up (Apple hosts)
+ * @host_dp_activated: The NHI post-activation hook owns display-side state
+ * @host_pci_activated: The NHI post-activation hook owns PCIe host state
  * @dprx_timeout: If set DPRX capabilities read poll work will timeout after this passes
  * @dprx_work: Worker that is scheduled to poll completion of DPRX capabilities read
  * @callback: Optional callback called when DP tunnel is fully activated
@@ -102,6 +105,9 @@ struct tb_tunnel {
 	bool bw_mode;
 	bool dprx_started;
 	bool dprx_canceled;
+	bool host_dp_notified;
+	bool host_dp_activated;
+	bool host_pci_activated;
 	ktime_t dprx_timeout;
 	struct delayed_work dprx_work;
 	void (*callback)(struct tb_tunnel *tunnel, void *data);
@@ -114,6 +120,8 @@ struct tb_tunnel *tb_tunnel_discover_pci(struct tb *tb, struct tb_port *down,
 					 bool alloc_hopid);
 struct tb_tunnel *tb_tunnel_alloc_pci(struct tb *tb, struct tb_port *up,
 				      struct tb_port *down);
+int tb_pci_tunnel_activate_host(struct tb_tunnel *tunnel);
+int tb_pci_tunnel_deactivate_host(struct tb_tunnel *tunnel);
 bool tb_tunnel_reserved_pci(struct tb_port *port, int *reserved_up,
 			    int *reserved_down);
 struct tb_tunnel *tb_tunnel_discover_dp(struct tb *tb, struct tb_port *in,
@@ -136,6 +144,7 @@ struct tb_tunnel *tb_tunnel_alloc_usb3(struct tb *tb, struct tb_port *up,
 				       int max_down);
 
 void tb_tunnel_put(struct tb_tunnel *tunnel);
+void tb_dp_tunnel_deactivate_host(struct tb_tunnel *tunnel);
 int tb_tunnel_activate(struct tb_tunnel *tunnel);
 void tb_tunnel_deactivate(struct tb_tunnel *tunnel);
 

@@ -582,6 +582,55 @@ int typec_thunderbolt_switch_set(struct typec_thunderbolt_switch *sw,
 }
 EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_set);
 
+/**
+ * typec_thunderbolt_switch_register_notifier - Watch provider health changes
+ * @sw: USB4/Thunderbolt switch held by the consumer
+ * @nb: Atomic notifier, which must not sleep or call the switch's set method
+ *
+ * Notifications request fresh state validation in consumer work context.
+ * Unregister the notifier before releasing @sw or its callback data.
+ */
+int typec_thunderbolt_switch_register_notifier(struct typec_thunderbolt_switch *sw,
+					       struct notifier_block *nb)
+{
+	if (IS_ERR_OR_NULL(sw))
+		return 0;
+
+	return atomic_notifier_chain_register(&sw->sw_dev->notifiers, nb);
+}
+EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_register_notifier);
+
+/**
+ * typec_thunderbolt_switch_unregister_notifier - Stop provider notifications
+ * @sw: USB4/Thunderbolt switch held by the consumer
+ * @nb: Previously registered notifier
+ *
+ * Drains callbacks. Call in process context, outside callback/worker locks,
+ * before cancelling work queued by the callback.
+ */
+void typec_thunderbolt_switch_unregister_notifier(struct typec_thunderbolt_switch *sw,
+						  struct notifier_block *nb)
+{
+	if (!IS_ERR_OR_NULL(sw))
+		atomic_notifier_chain_unregister(&sw->sw_dev->notifiers, nb);
+}
+EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_unregister_notifier);
+
+/**
+ * typec_thunderbolt_switch_notify - Request consumer revalidation
+ * @sw: Registered provider switch
+ *
+ * May be called from interrupt context. No connection state is passed: a
+ * delayed notification must validate the current connection, not reset it
+ * using details from an earlier session. Stop notifications before unregister.
+ */
+void typec_thunderbolt_switch_notify(struct typec_thunderbolt_switch_dev *sw)
+{
+	atomic_notifier_call_chain(&sw->notifiers,
+				   TYPEC_THUNDERBOLT_SWITCH_REVALIDATE, NULL);
+}
+EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_notify);
+
 static void typec_thunderbolt_switch_release(struct device *dev)
 {
 	kfree(to_typec_thunderbolt_switch_dev(dev));
@@ -622,6 +671,7 @@ typec_thunderbolt_switch_register(struct device *parent,
 	sw_dev->dev.fwnode = desc->fwnode;
 	sw_dev->dev.class = &typec_mux_class;
 	sw_dev->dev.type = &typec_thunderbolt_switch_dev_type;
+	ATOMIC_INIT_NOTIFIER_HEAD(&sw_dev->notifiers);
 	sw_dev->dev.driver_data = desc->drvdata;
 	ret = dev_set_name(&sw_dev->dev, "%s-thunderbolt-switch",
 			   desc->name ? desc->name : dev_name(parent));

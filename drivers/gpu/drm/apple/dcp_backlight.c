@@ -349,7 +349,7 @@ int dcp_backlight_update(struct apple_dcp *dcp)
 	 *       defer this hopefully until it becomes irrelevant due to proper
 	 *       drm integrated backlight handling
 	 */
-	if (!dcp->valid_mode)
+	if (!READ_ONCE(dcp->mode_state.valid))
 		return 0;
 
 	/* Wait 1 vblank cycle in the hope an atomic swap has already updated

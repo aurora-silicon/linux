@@ -39,3 +39,4 @@ config DRM_APPLE_KUNIT_TEST
 	  The tests cover the header strides used by older firmware and
 	  larger rings, as well as malformed ring size combinations.
 	  This option is intended for developer test kernels.
+	  Also test the Type-C modeset, hotplug and service ownership state.

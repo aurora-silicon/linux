@@ -15,6 +15,7 @@ struct typec_switch;
 struct typec_switch_dev;
 struct typec_altmode;
 struct fwnode_handle;
+struct notifier_block;
 
 typedef int (*typec_switch_set_fn_t)(struct typec_switch_dev *sw,
 				     enum typec_orientation orientation);
@@ -145,6 +146,9 @@ static inline struct typec_mux *typec_mux_get(struct device *dev)
 struct typec_thunderbolt_switch;
 struct typec_thunderbolt_switch_dev;
 
+/* Recheck fresh cable data and provider health; not a request to reset. */
+#define TYPEC_THUNDERBOLT_SWITCH_REVALIDATE 1
+
 enum typec_thunderbolt_switch_state {
 	TYPEC_THUNDERBOLT_SWITCH_OFF,
 	TYPEC_THUNDERBOLT_SWITCH_TBT,
@@ -192,6 +196,11 @@ fwnode_typec_thunderbolt_switch_get(struct fwnode_handle *fwnode);
 void typec_thunderbolt_switch_put(struct typec_thunderbolt_switch *sw);
 int typec_thunderbolt_switch_set(struct typec_thunderbolt_switch *sw,
 				 const struct typec_thunderbolt_switch_data *data);
+int typec_thunderbolt_switch_register_notifier(struct typec_thunderbolt_switch *sw,
+					       struct notifier_block *nb);
+void typec_thunderbolt_switch_unregister_notifier(struct typec_thunderbolt_switch *sw,
+						  struct notifier_block *nb);
+void typec_thunderbolt_switch_notify(struct typec_thunderbolt_switch_dev *sw);
 
 struct typec_thunderbolt_switch_dev *
 typec_thunderbolt_switch_register(struct device *parent,
@@ -228,6 +237,24 @@ typec_thunderbolt_switch_register(struct device *parent,
 				  const struct typec_thunderbolt_switch_desc *desc)
 {
 	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static inline int
+typec_thunderbolt_switch_register_notifier(struct typec_thunderbolt_switch *sw,
+					   struct notifier_block *nb)
+{
+	return 0;
+}
+
+static inline void
+typec_thunderbolt_switch_unregister_notifier(struct typec_thunderbolt_switch *sw,
+					     struct notifier_block *nb)
+{
+}
+
+static inline void
+typec_thunderbolt_switch_notify(struct typec_thunderbolt_switch_dev *sw)
+{
 }
 
 static inline void

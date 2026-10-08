@@ -6,9 +6,11 @@
  * Author: Heikki Krogerus <heikki.krogerus@linux.intel.com>
  */
 
+#include <linux/atomic.h>
 #include <linux/bits.h>
 #include <linux/bitfield.h>
 #include <linux/interrupt.h>
+#include <linux/notifier.h>
 #include <linux/power_supply.h>
 #include <linux/usb/typec.h>
 #include <linux/usb/typec_mux.h>
@@ -17,6 +19,7 @@
 #define __TPS6598X_H__
 
 #define TPS_REG_MODE			0x03
+#include "cd321x-pm.h"
 
 #define TPS_FIELD_GET(_mask, _reg) ((typeof(_mask))(((_reg) & (_mask)) >> __bf_shf(_mask)))
 
@@ -276,6 +279,16 @@
 #define TPS_65981_2_6_INTEVENT_LEN             8
 #define TPS_65987_8_INTEVENT_LEN               11
 
+/*
+ * Max data bytes for Data1, Data2, and other registers. See ch 1.3.2:
+ * https://www.ti.com/lit/ug/slvuan1a/slvuan1a.pdf
+ */
+#define TPS_MAX_LEN	64
+
+/* Standard Task return codes */
+#define TPS_TASK_TIMEOUT		1
+#define TPS_TASK_REJECTED		3
+
 struct tps6598x;
 
 struct tipd_data {
@@ -285,6 +298,7 @@ struct tipd_data {
 	void (*remove)(struct tps6598x *tps);
 	int (*register_port)(struct tps6598x *tps, struct fwnode_handle *node);
 	void (*unregister_port)(struct tps6598x *tps);
+	void (*ready)(struct tps6598x *tps);
 	void (*trace_data_status)(u32 status);
 	void (*trace_power_status)(u16 status);
 	void (*trace_status)(u32 status);
@@ -294,6 +308,8 @@ struct tipd_data {
 	bool (*read_data_status)(struct tps6598x *tps);
 	int (*reset)(struct tps6598x *tps);
 	int (*connect)(struct tps6598x *tps, u32 status);
+	void (*suspend_prepare)(struct tps6598x *tps);
+	void (*resume_reverify)(struct tps6598x *tps);
 };
 
 struct tps6598x {
@@ -302,6 +318,7 @@ struct tps6598x {
 	struct mutex lock; /* device lock */
 	int irq;
 	u8 i2c_protocol:1;
+	u8 dbma_at_probe:1; /* Apple "DBMa" debug mode was active at probe */
 
 	struct gpio_desc *reset;
 	struct typec_port *port;
@@ -321,6 +338,8 @@ struct tps6598x {
 	struct delayed_work	wq_poll;
 
 	const struct tipd_data *data;
+
+	struct tipd_debugfs *debugfs;
 };
 
 /* TPS_REG_USB4_STATUS */
@@ -371,14 +390,21 @@ struct cd321x {
 
 	struct typec_mux *mux;
 	struct typec_mux_state state;
+	bool state_valid;
 	u32 dp_status;
 	u32 dp_conf;
 	struct typec_thunderbolt_switch *tbt_switch;
+	struct notifier_block tbt_notifier;
+	bool tbt_notifier_registered;
+	atomic_t link_event;
 	bool display_route_active;
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;
+	struct delayed_work resume_work;
+	struct cd321x_pm_state pm;
 	struct usb_pd_identity cur_partner_identity;
+	bool cur_partner_is_pd;
 
 	struct fwnode_handle *connector_fwnode;
 };
@@ -400,7 +426,26 @@ extern const struct regmap_config tps6598x_regmap_config;
 
 int tipd_init(struct tps6598x *tps);
 void tipd_remove(struct tps6598x *tps);
+int tipd_prepare(struct device *dev);
+void tipd_complete(struct device *dev);
 int tipd_suspend(struct tps6598x *tps);
 int tipd_resume(struct tps6598x *tps);
+
+/* Internal to tps6598x-core */
+int tps6598x_block_read(struct tps6598x *tps, u8 reg, void *val, size_t len);
+int tps6598x_exec_cmd_tmo(struct tps6598x *tps, const char *cmd,
+			  size_t in_len, const u8 *in_data,
+			  size_t out_len, u8 *out_data,
+			  u32 cmd_timeout_ms, u32 res_delay_ms);
+
+#ifdef CONFIG_DEBUG_FS
+void tipd_debugfs_register(struct tps6598x *tps);
+void tipd_debugfs_unregister(struct tps6598x *tps);
+void tipd_debugfs_exit(void);
+#else
+static inline void tipd_debugfs_register(struct tps6598x *tps) { }
+static inline void tipd_debugfs_unregister(struct tps6598x *tps) { }
+static inline void tipd_debugfs_exit(void) { }
+#endif
 
 #endif /* __TPS6598X_H__ */

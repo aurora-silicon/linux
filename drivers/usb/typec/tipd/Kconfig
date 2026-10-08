@@ -26,3 +26,13 @@ config TYPEC_SN201202X
 
 	  If you choose to build this driver as a dynamically linked module, the
 	  module will be called sn201202x.ko.
+
+config TYPEC_TIPD_KUNIT_TEST
+	tristate "KUnit tests for CD321x resume state" if !KUNIT_ALL_TESTS
+	depends on KUNIT && TYPEC_TPS6598X_CORE
+	default KUNIT_ALL_TESTS
+	help
+	  Test suspend gating, fresh cable-state revalidation, bounded retries
+	  and removal during resume. The tests exercise the state transitions
+	  shared with the driver, including aborted and repeated sleep cycles.
+	  These tests run without accessing a physical Type-C controller.

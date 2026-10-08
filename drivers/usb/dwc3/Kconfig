@@ -223,6 +223,20 @@ config USB_DWC3_APPLE
 	  mode on these machines.
 	  Say 'Y' or 'M' if you have such device.
 
+config USB_DWC3_APPLE_KUNIT_TEST
+	tristate "KUnit tests for the Apple Silicon DWC3 glue" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test the helper with which the Apple Silicon DWC3 glue chooses
+	  the USB2 PHY mode it selects before the core leaves reset:
+	  device mode, never host mode, and nothing for other states.
+	  The tests need no Apple hardware or platform support. They are
+	  built under USB_DWC3, so UML without DMA emulation cannot run
+	  them.
+
+	  If unsure, say N.
+
 config USB_DWC3_GOOGLE
 	tristate "Google Platform"
 	help
