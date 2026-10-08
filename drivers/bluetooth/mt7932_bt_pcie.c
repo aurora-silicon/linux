@@ -4,9 +4,9 @@
  * protocol contracts and public Linux interfaces. Original transport research:
  * DJ (DjDeveloperr), Ace (Acelogic), and Ryan Murray.
  *
- * The built-in driver retains every device-visible allocation after mastering
- * is enabled, including all terminal failures. No unbind, retry, suspend or
- * quiescence claim is made. Firmware and board inputs are supplied locally.
+ * Firmware and board inputs are supplied locally. System sleep preserves the
+ * transport arena and uses the firmware quiesce/restore handshake. Unload
+ * releases DMA only after the PCI function has stopped bus mastering.
  */
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
@@ -19,6 +19,7 @@
 #include <linux/of.h>
 #include <linux/overflow.h>
 #include <linux/pci.h>
+#include <linux/pm.h>
 #include <linux/pm_runtime.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
@@ -94,6 +95,13 @@ struct bt7932_ring {
 	u16 previous;
 };
 
+enum bt7932_pm_state {
+	BT7932_RUNNING,
+	BT7932_QUIESCING,
+	BT7932_QUIESCED,
+	BT7932_RESTORING,
+};
+
 struct bt7932 {
 	struct pci_dev *pdev;
 	void __iomem *bar;
@@ -121,6 +129,8 @@ struct bt7932 {
 	int irq;
 	bool enabled, regions, vectors, irq_requested, retained;
 	bool ipc_ready, opened, awake, waking, fault, registered;
+	bool stopping, runtime_forbidden;
+	enum bt7932_pm_state pm_state;
 	u64 tx_packets, rx_packets, diagnostics;
 };
 
@@ -395,6 +405,13 @@ static int bt7932_arena(struct bt7932 *bt)
 	return 0;
 }
 
+/* Serialize control requests with sleep notifications and ring publication. */
+static void bt7932_request_sleep(struct bt7932 *bt, u32 control)
+{
+	writel(control, bt->bar + BT7932_SLEEP);
+	bt7932_ring_doorbell(bt, 12);
+}
+
 /* Caller owns lock; no HCI command wait can run from the IRQ thread. */
 static int bt7932_sleep_locked(struct bt7932 *bt)
 {
@@ -403,21 +420,46 @@ static int bt7932_sleep_locked(struct bt7932 *bt)
 
 	dma_rmb();
 	value = le32_to_cpu(READ_ONCE(*notification));
+	if (value == 3) {
+		if (bt->pm_state == BT7932_QUIESCING) {
+			WRITE_ONCE(bt->pm_state, BT7932_QUIESCED);
+			WRITE_ONCE(bt->awake, false);
+			wake_up_all(&bt->wake_wait);
+		} else if (bt->pm_state != BT7932_QUIESCED &&
+			   bt->pm_state != BT7932_RESTORING) {
+			return -EPROTO;
+		}
+		return 0;
+	}
 	if (value > 1)
 		return -EPROTO;
-	if (!value) {
-		if (bt->last_sleep != value || bt->waking) {
-			writel(0, bt->bar + BT7932_SLEEP);
-			bt7932_ring_doorbell(bt, 12);
+	/* A previous host-sleep notification must not cancel control 3. */
+	if (bt->pm_state == BT7932_QUIESCING)
+		return 0;
+	if (bt->pm_state == BT7932_QUIESCED)
+		return -EPROTO;
+	if (bt->pm_state == BT7932_RESTORING) {
+		if (value) {
+			if (!bt->waking) {
+				bt->waking = true;
+				bt7932_request_sleep(bt, 1);
+				bt7932_request_sleep(bt, 2);
+			}
+			return 0;
 		}
+		bt->waking = true;
+		WRITE_ONCE(bt->pm_state, BT7932_RUNNING);
+	}
+	if (!value) {
+		if (bt->last_sleep != value || bt->waking)
+			bt7932_request_sleep(bt, 0);
 		WRITE_ONCE(bt->awake, true);
 		bt->waking = false;
 		wake_up_all(&bt->wake_wait);
 	} else {
 		WRITE_ONCE(bt->awake, false);
 		if (!bt->waking && bt->last_sleep != value) {
-			writel(1, bt->bar + BT7932_SLEEP);
-			bt7932_ring_doorbell(bt, 12);
+			bt7932_request_sleep(bt, 1);
 		}
 	}
 	bt->last_sleep = value;
@@ -425,7 +467,7 @@ static int bt7932_sleep_locked(struct bt7932 *bt)
 }
 
 /* On success returns with lock held, covering the final check/publication. */
-static int bt7932_wake_and_lock(struct bt7932 *bt)
+static int bt7932_wake_and_lock(struct bt7932 *bt, bool require_open)
 {
 	unsigned long deadline = jiffies + HZ;
 	unsigned long now;
@@ -433,9 +475,10 @@ static int bt7932_wake_and_lock(struct bt7932 *bt)
 
 	for (;;) {
 		mutex_lock(&bt->lock);
-		if (bt->fault || !bt->opened) {
+		if (bt->fault || bt->stopping || bt->pm_state != BT7932_RUNNING ||
+		    (require_open && !bt->opened)) {
 			mutex_unlock(&bt->lock);
-			return -EIO;
+			return -EHOSTDOWN;
 		}
 		ret = bt7932_sleep_locked(bt);
 		if (ret)
@@ -444,8 +487,7 @@ static int bt7932_wake_and_lock(struct bt7932 *bt)
 			return 0;
 		if (!bt->waking) {
 			bt->waking = true;
-			writel(2, bt->bar + BT7932_SLEEP);
-			bt7932_ring_doorbell(bt, 12);
+			bt7932_request_sleep(bt, 2);
 		}
 		mutex_unlock(&bt->lock);
 		now = jiffies;
@@ -455,7 +497,9 @@ static int bt7932_wake_and_lock(struct bt7932 *bt)
 			goto fail;
 		}
 		wait_event_timeout(bt->wake_wait,
-				   READ_ONCE(bt->awake) || READ_ONCE(bt->fault) || !READ_ONCE(bt->opened),
+				   READ_ONCE(bt->awake) || READ_ONCE(bt->fault) ||
+				   READ_ONCE(bt->stopping) ||
+				   (require_open && !READ_ONCE(bt->opened)),
 				   min_t(unsigned long, msecs_to_jiffies(10), deadline - now));
 	}
 fail:
@@ -499,7 +543,7 @@ static void bt7932_tx_work(struct work_struct *work)
 		u16 consumer;
 		u8 *descriptor;
 
-		if (bt7932_wake_and_lock(bt)) {
+		if (bt7932_wake_and_lock(bt, true)) {
 			kfree_skb(skb);
 			skb_queue_purge(&bt->tx_queue);
 			return;
@@ -601,7 +645,7 @@ static irqreturn_t bt7932_irq_thread(int irq, void *data)
 	int channel, ret;
 
 	mutex_lock(&bt->lock);
-	if (!bt->ipc_ready || bt->fault)
+	if (!bt->ipc_ready || bt->fault || bt->stopping)
 		goto out;
 	if (READ_ONCE(*(u8 *)(bt->arena + bt->peripheral + 4)) == 4) {
 		bt7932_fault_locked(bt, "firmware entered fault state4");
@@ -612,6 +656,9 @@ static irqreturn_t bt7932_irq_thread(int irq, void *data)
 		bt7932_fault_locked(bt, "invalid sleep notification");
 		goto out;
 	}
+	/* Drain the old offers until quiescence, then stop all publication. */
+	if (bt->pm_state == BT7932_QUIESCED || bt->pm_state == BT7932_RESTORING)
+		goto out;
 	producer = bt7932_counter(bt, bt->cr_producer, 0);
 	if (producer != bt->cr_previous) {
 		/* Counter retirement only; no invented per-record ACK interpretation. */
@@ -778,8 +825,9 @@ static int bt7932_open(struct hci_dev *hdev)
 	int ret = 0;
 
 	mutex_lock(&bt->lock);
-	if (bt->fault || !bt->ipc_ready)
-		ret = -EIO;
+	if (bt->fault || !bt->ipc_ready || bt->stopping ||
+	    bt->pm_state != BT7932_RUNNING)
+		ret = -EHOSTDOWN;
 	else
 		WRITE_ONCE(bt->opened, true);
 	mutex_unlock(&bt->lock);
@@ -811,8 +859,9 @@ static int bt7932_send(struct hci_dev *hdev, struct sk_buff *skb)
 	unsigned long flags;
 	int ret;
 
-	if (READ_ONCE(bt->fault) || !READ_ONCE(bt->opened))
-		return -EIO;
+	if (READ_ONCE(bt->fault) || !READ_ONCE(bt->opened) ||
+	    READ_ONCE(bt->stopping) || READ_ONCE(bt->pm_state) != BT7932_RUNNING)
+		return -EHOSTDOWN;
 	if (channel < 0 || skb->len > geometry[channel].payload)
 		return -EMSGSIZE;
 	ret = skb_linearize(skb);
@@ -821,6 +870,10 @@ static int bt7932_send(struct hci_dev *hdev, struct sk_buff *skb)
 	if (!bt7932_hci_length(hci_skb_pkt_type(skb), skb->data, skb->len))
 		return -EINVAL;
 	spin_lock_irqsave(&bt->tx_queue.lock, flags);
+	if (READ_ONCE(bt->stopping) || READ_ONCE(bt->pm_state) != BT7932_RUNNING) {
+		spin_unlock_irqrestore(&bt->tx_queue.lock, flags);
+		return -EHOSTDOWN;
+	}
 	if (bt->tx_queue.qlen >= BT7932_TX_QUEUE_MAX) {
 		spin_unlock_irqrestore(&bt->tx_queue.lock, flags);
 		return -EBUSY;
@@ -954,10 +1007,8 @@ static int bt7932_iommu(struct bt7932 *bt)
 	return ret;
 }
 
-static void bt7932_unpublished_cleanup(struct bt7932 *bt)
+static void bt7932_cleanup(struct bt7932 *bt, bool release_dma)
 {
-	if (WARN_ON_ONCE(bt->retained))
-		return;
 	if (bt->irq_requested)
 		free_irq(bt->irq, bt);
 	if (bt->vectors)
@@ -966,9 +1017,9 @@ static void bt7932_unpublished_cleanup(struct bt7932 *bt)
 		hci_free_dev(bt->hdev);
 	if (bt->tx_wq)
 		destroy_workqueue(bt->tx_wq);
-	if (bt->arena)
+	if (release_dma && bt->arena)
 		dma_free_coherent(&bt->pdev->dev, bt->arena_size, bt->arena, bt->arena_dma);
-	if (bt->image)
+	if (release_dma && bt->image)
 		dma_free_coherent(&bt->pdev->dev, bt->image_size, bt->image, bt->image_dma);
 	kfree_sensitive(bt->calibration);
 	kfree_sensitive(bt->ptx);
@@ -976,6 +1027,8 @@ static void bt7932_unpublished_cleanup(struct bt7932 *bt)
 		pci_iounmap(bt->pdev, bt->bar);
 	if (bt->regions)
 		pci_release_regions(bt->pdev);
+	if (bt->runtime_forbidden)
+		pm_runtime_allow(&bt->pdev->dev);
 	if (bt->enabled)
 		pci_disable_device(bt->pdev);
 	kfree_sensitive(bt);
@@ -1089,7 +1142,8 @@ static int bt7932_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	bt->irq_requested = true;
 	pci_set_drvdata(pdev, bt);
 	pm_runtime_forbid(&pdev->dev);
-	/* Every later outcome stays bound and retains all published ownership. */
+	bt->runtime_forbidden = true;
+	/* Failed admission remains bound until removal or a full reset. */
 	bt->retained = true;
 	pci_set_master(pdev);
 	ret = bt7932_download(bt);
@@ -1115,21 +1169,163 @@ retained_fault:
 	return 0;
 fail:
 	dev_err(&pdev->dev, "BT_ADMISSION_FAILED error=%d; no DMA published\n", ret);
-	bt7932_unpublished_cleanup(bt);
+	bt7932_cleanup(bt, true);
 	return ret;
 }
 
-static void bt7932_shutdown(struct pci_dev *pdev)
+/* Poll coherent notifications as well as IRQs, including a lost final edge. */
+static int bt7932_wait_pm(struct bt7932 *bt, enum bt7932_pm_state target)
 {
-	struct bt7932 *bt = pci_get_drvdata(pdev);
+	unsigned long limit = jiffies + HZ;
+	int ret;
 
-	WRITE_ONCE(bt->opened, false);
+	for (;;) {
+		mutex_lock(&bt->lock);
+		ret = bt->fault || bt->stopping ? -EIO : bt7932_sleep_locked(bt);
+		if (!ret && bt->pm_state == target) {
+			mutex_unlock(&bt->lock);
+			return 0;
+		}
+		mutex_unlock(&bt->lock);
+		if (ret)
+			return ret;
+		if (time_after_eq(jiffies, limit))
+			return -ETIMEDOUT;
+		usleep_range(1000, 2000);
+	}
+}
+
+static int bt7932_quiesce(struct bt7932 *bt)
+{
+	int ret;
+
+	ret = bt7932_wake_and_lock(bt, false);
+	if (ret)
+		return ret;
+	WRITE_ONCE(bt->pm_state, BT7932_QUIESCING);
+	WRITE_ONCE(bt->awake, false);
+	bt7932_request_sleep(bt, 3);
+	mutex_unlock(&bt->lock);
 	wake_up_all(&bt->wake_wait);
 	cancel_work_sync(&bt->tx_work);
 	skb_queue_purge(&bt->tx_queue);
+	return bt7932_wait_pm(bt, BT7932_QUIESCED);
+}
+
+static int bt7932_restore_transport(struct bt7932 *bt)
+{
+	int ret;
+
 	mutex_lock(&bt->lock);
-	bt7932_fault_locked(bt, "shutdown retains DMA until external reset");
+	if (bt->fault || bt->stopping) {
+		mutex_unlock(&bt->lock);
+		return -EIO;
+	}
+	WRITE_ONCE(bt->pm_state, BT7932_RESTORING);
+	bt->waking = false;
+	bt7932_request_sleep(bt, 0);
 	mutex_unlock(&bt->lock);
+	ret = bt7932_wait_pm(bt, BT7932_RUNNING);
+	if (ret) {
+		mutex_lock(&bt->lock);
+		bt7932_fault_locked(bt, "system sleep restoration failed");
+		mutex_unlock(&bt->lock);
+	}
+	return ret;
+}
+
+static int bt7932_suspend(struct device *dev)
+{
+	struct bt7932 *bt = pci_get_drvdata(to_pci_dev(dev));
+	int ret;
+
+	if (READ_ONCE(bt->fault))
+		return -EIO;
+	if (!bt->registered)
+		return 0;
+	ret = hci_suspend_dev(bt->hdev);
+	if (ret)
+		return ret;
+	ret = bt7932_quiesce(bt);
+	if (!ret) {
+		dev_dbg(dev, "system sleep quiesce acknowledged\n");
+		return 0;
+	}
+	dev_warn(dev, "system sleep quiesce failed: %d\n", ret);
+	/* Undo our request before the PM core rolls back the rest of the bus. */
+	if (!READ_ONCE(bt->fault))
+		bt7932_restore_transport(bt);
+	hci_resume_dev(bt->hdev);
+	return ret;
+}
+
+static int bt7932_resume(struct device *dev)
+{
+	struct bt7932 *bt = pci_get_drvdata(to_pci_dev(dev));
+	int ret;
+
+	if (READ_ONCE(bt->fault))
+		return -EIO;
+	if (!bt->registered)
+		return 0;
+	if (READ_ONCE(bt->pm_state) != BT7932_RUNNING) {
+		ret = bt7932_restore_transport(bt);
+		if (ret)
+			return ret;
+	}
+	dev_dbg(dev, "transport restored after system sleep\n");
+	return hci_resume_dev(bt->hdev);
+}
+
+static int bt7932_freeze(struct device *dev)
+{
+	struct bt7932 *bt = pci_get_drvdata(to_pci_dev(dev));
+
+	/* A restored image cannot adopt the running firmware's DMA pointers. */
+	return bt->retained ? -EOPNOTSUPP : 0;
+}
+
+static const struct dev_pm_ops bt7932_pm_ops = {
+	.suspend = bt7932_suspend,
+	.resume = bt7932_resume,
+	.freeze = bt7932_freeze,
+	.thaw = bt7932_resume,
+	.poweroff = bt7932_freeze,
+	.restore = bt7932_resume,
+};
+
+static void bt7932_remove(struct pci_dev *pdev)
+{
+	struct bt7932 *bt = pci_get_drvdata(pdev);
+	u16 command = U16_MAX;
+	bool quiesced, drained;
+
+	/* Closing HCI may send Reset: keep the transport and IRQ alive for it. */
+	if (bt->registered)
+		hci_unregister_dev(bt->hdev);
+	quiesced = bt->ipc_ready && !READ_ONCE(bt->fault) && !bt7932_quiesce(bt);
+	mutex_lock(&bt->lock);
+	WRITE_ONCE(bt->stopping, true);
+	WRITE_ONCE(bt->opened, false);
+	mutex_unlock(&bt->lock);
+	wake_up_all(&bt->wake_wait);
+	cancel_work_sync(&bt->tx_work);
+	skb_queue_purge(&bt->tx_queue);
+	if (bt->irq_requested) {
+		free_irq(bt->irq, bt);
+		bt->irq_requested = false;
+	}
+	pci_clear_master(pdev);
+	drained = quiesced && !pci_read_config_word(pdev, PCI_COMMAND, &command) &&
+		  command != U16_MAX && !(command & PCI_COMMAND_MASTER) &&
+		  pci_wait_for_pending_transaction(pdev);
+	if (!drained && bt->retained) {
+		/* Keep the DMA allocations and their device alive until reset. */
+		get_device(&pdev->dev);
+		dev_err(&pdev->dev, "PCI drain unconfirmed; DMA retained until reset\n");
+	}
+	pci_set_drvdata(pdev, NULL);
+	bt7932_cleanup(bt, drained || !bt->retained);
 }
 
 static const struct pci_device_id bt7932_ids[] = {
@@ -1142,9 +1338,10 @@ static struct pci_driver bt7932_driver = {
 	.name = "mt7932_bt_pcie",
 	.id_table = bt7932_ids,
 	.probe = bt7932_probe,
-	.shutdown = bt7932_shutdown,
+	.remove = bt7932_remove,
+	.shutdown = bt7932_remove,
 	.driver = {
-		.suppress_bind_attrs = true,
+		.pm = pm_sleep_ptr(&bt7932_pm_ops),
 	},
 };
 module_pci_driver(bt7932_driver);
