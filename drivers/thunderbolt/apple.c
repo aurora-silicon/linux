@@ -2775,14 +2775,17 @@ static int apple_cio_probe(struct platform_device *pdev)
 		.drvdata = acio,
 	};
 	/* A consumer cannot start a host before its failure listener is ready. */
-	guard(mutex)(&acio->lock);
-	acio->tbt_switch = typec_thunderbolt_switch_register(dev, &desc);
-	if (IS_ERR(acio->tbt_switch))
-		return dev_err_probe(dev, PTR_ERR(acio->tbt_switch),
-				     "Unable to register thunderbolt switch\n");
+	scoped_guard(mutex, &acio->lock) {
+		acio->tbt_switch = typec_thunderbolt_switch_register(dev, &desc);
+		if (IS_ERR(acio->tbt_switch))
+			return dev_err_probe(dev, PTR_ERR(acio->tbt_switch),
+					     "Unable to register thunderbolt switch\n");
 
-	acio->pcie_notifier.notifier_call = apple_cio_pcie_notify;
-	ret = apple_pcie_tunnel_register_notifier(&acio->pcie_notifier);
+		acio->pcie_notifier.notifier_call = apple_cio_pcie_notify;
+		ret = apple_pcie_tunnel_register_notifier(&acio->pcie_notifier);
+		if (ret)
+			acio->removing = true;
+	}
 	if (ret) {
 		typec_thunderbolt_switch_unregister(acio->tbt_switch);
 		return ret;
@@ -2795,22 +2798,17 @@ static void apple_cio_remove(struct platform_device *pdev)
 {
 	struct apple_cio *acio = platform_get_drvdata(pdev);
 
-	/*
-	 * Wait for an in-flight set; from here on, sets start no new work. That
-	 * only holds while the ACIO exists: it does not revoke the switch
-	 * handles consumers keep, so a set arriving after remove returns still
-	 * reaches freed memory, as it did before (only a manual unbind gets
-	 * there).
-	 */
+	/* Refuse new activation before draining callbacks and workers. */
 	scoped_guard(mutex, &acio->lock)
 		acio->removing = true;
 
 	apple_pcie_tunnel_unregister_notifier(&acio->pcie_notifier);
 
-	guard(mutex)(&acio->lock);
 	/* The worker can notify this switch; stop current and future enqueues. */
 	disable_delayed_work_sync(&acio->pcie_tunnel_work);
+	/* A set may hold the switch read lock while waiting for acio->lock. */
 	typec_thunderbolt_switch_unregister(acio->tbt_switch);
+	guard(mutex)(&acio->lock);
 	if (acio->current_cable_info)
 		apple_cio_stop(acio);
 }

@@ -185,6 +185,8 @@ typec_switch_register(struct device *parent,
 	if (!sw_dev)
 		return ERR_PTR(-ENOMEM);
 
+	init_rwsem(&sw_dev->set_lock);
+	sw_dev->owner = parent->driver->owner;
 	sw_dev->set = desc->set;
 
 	device_initialize(&sw_dev->dev);
@@ -540,7 +542,11 @@ fwnode_typec_thunderbolt_switch_get(struct fwnode_handle *fwnode)
 	}
 
 	sw->sw_dev = sw_dev;
-	WARN_ON(!try_module_get(sw_dev->dev.parent->driver->owner));
+	if (!try_module_get(sw_dev->owner)) {
+		put_device(&sw_dev->dev);
+		kfree(sw);
+		return ERR_PTR(-ENODEV);
+	}
 
 	return sw;
 }
@@ -557,7 +563,7 @@ void typec_thunderbolt_switch_put(struct typec_thunderbolt_switch *sw)
 	if (IS_ERR_OR_NULL(sw))
 		return;
 
-	module_put(sw->sw_dev->dev.parent->driver->owner);
+	module_put(sw->sw_dev->owner);
 	put_device(&sw->sw_dev->dev);
 	kfree(sw);
 }
@@ -578,6 +584,9 @@ int typec_thunderbolt_switch_set(struct typec_thunderbolt_switch *sw,
 	if (IS_ERR_OR_NULL(sw))
 		return 0;
 
+	guard(rwsem_read)(&sw->sw_dev->set_lock);
+	if (!sw->sw_dev->set)
+		return -ENODEV;
 	return sw->sw_dev->set(sw->sw_dev, data);
 }
 EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_set);
@@ -678,6 +687,8 @@ typec_thunderbolt_switch_register(struct device *parent,
 	if (!sw_dev)
 		return ERR_PTR(-ENOMEM);
 
+	init_rwsem(&sw_dev->set_lock);
+	sw_dev->owner = parent->driver->owner;
 	sw_dev->set = desc->set;
 
 	device_initialize(&sw_dev->dev);
@@ -714,8 +725,13 @@ EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_register);
  */
 void typec_thunderbolt_switch_unregister(struct typec_thunderbolt_switch_dev *sw_dev)
 {
-	if (!IS_ERR_OR_NULL(sw_dev))
-		device_unregister(&sw_dev->dev);
+	if (IS_ERR_OR_NULL(sw_dev))
+		return;
+
+	/* Drain callbacks before the parent releases its private data. */
+	scoped_guard(rwsem_write, &sw_dev->set_lock)
+		sw_dev->set = NULL;
+	device_unregister(&sw_dev->dev);
 }
 EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_unregister);
 
