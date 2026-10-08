@@ -14,7 +14,6 @@
 #include <linux/interrupt.h>
 #include <linux/iopoll.h>
 #include <linux/io.h>
-#include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
@@ -354,47 +353,40 @@ static int apple_qspi_set_frequency(struct apple_qspi *qspi,
 	return 0;
 }
 
+static bool apple_qspi_poll_complete(struct apple_qspi *qspi)
+{
+	unsigned long flags;
+	u32 queue_irqs, command_irqs;
+
+	spin_lock_irqsave(&qspi->lock, flags);
+	queue_irqs = apple_qspi_p_read(qspi, APPLE_QSPI_P_IRQ_STATUS);
+	command_irqs = apple_qspi_c_read(qspi, APPLE_QSPI_C_IRQ_STATUS);
+	apple_qspi_p_write(qspi, APPLE_QSPI_P_IRQ_STATUS, queue_irqs);
+	apple_qspi_c_write(qspi, APPLE_QSPI_C_IRQ_STATUS, command_irqs);
+	if (qspi->active) {
+		apple_qspi_drain_rx(qspi);
+		apple_qspi_fill_tx(qspi);
+	}
+	spin_unlock_irqrestore(&qspi->lock, flags);
+
+	return (command_irqs & APPLE_QSPI_C_IRQ_COMPLETE) ||
+	       try_wait_for_completion(&qspi->done);
+}
+
 static bool apple_qspi_wait_complete(struct apple_qspi *qspi)
 {
-	unsigned long deadline = jiffies +
-		msecs_to_jiffies(APPLE_QSPI_TIMEOUT_MS);
-	unsigned long flags;
-	u32 p_status, c_status;
+	bool finished;
 
-	do {
-		if (try_wait_for_completion(&qspi->done))
-			return true;
-
-		/*
-		 * TX-only commands do not reliably raise the wired interrupt on
-		 * T8140, although the completion bit is latched in the controller.
-		 * Poll both status banks as a fallback and service the FIFOs so a
-		 * page program larger than the TX FIFO can continue making progress.
-		 */
-		p_status = apple_qspi_p_read(qspi, APPLE_QSPI_P_IRQ_STATUS);
-		c_status = apple_qspi_c_read(qspi, APPLE_QSPI_C_IRQ_STATUS);
-		if (p_status)
-			apple_qspi_p_write(qspi, APPLE_QSPI_P_IRQ_STATUS, p_status);
-		if (c_status)
-			apple_qspi_c_write(qspi, APPLE_QSPI_C_IRQ_STATUS, c_status);
-
-		spin_lock_irqsave(&qspi->lock, flags);
-		if (qspi->active) {
-			apple_qspi_drain_rx(qspi);
-			apple_qspi_fill_tx(qspi);
-		}
-		spin_unlock_irqrestore(&qspi->lock, flags);
-
-		if (c_status & APPLE_QSPI_C_IRQ_COMPLETE)
-			return true;
-		if (time_after_eq(jiffies, deadline))
-			break;
-
-		if (wait_for_completion_timeout(&qspi->done, 1))
-			return true;
-	} while (time_before(jiffies, deadline));
-
-	return false;
+	/*
+	 * T8140 can latch completion without delivering the wired IRQ, and
+	 * the RX threshold IRQ does not reliably drain the FIFO. A jiffy
+	 * between polls throttles reads to one FIFO per scheduler tick.
+	 * Service the FIFOs at microsecond intervals while retaining the
+	 * bounded transfer deadline and IRQ completion path.
+	 */
+	return !read_poll_timeout(apple_qspi_poll_complete, finished, finished,
+				 20, APPLE_QSPI_TIMEOUT_MS * USEC_PER_MSEC,
+				 false, qspi);
 }
 
 static int apple_qspi_exec_op(struct spi_mem *mem,
