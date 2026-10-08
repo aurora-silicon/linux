@@ -56,7 +56,6 @@ impl PreparedUserBindBatch {
 
 impl Vm {
     /// Prepares host state without taking DMA reservations or changing any leaf.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_bind_object(
         &self,
         gem: &gem::Object,
