@@ -52,8 +52,9 @@
 #define PIODMA_IRQ_LIMIT		16
 
 /*
- * The board DT opts in by pointing the host's "apple,piodma" at this engine.
- * enumerate=0 keeps the host on its root-port-only path for diagnosis.
+ * The board DT opts in by pointing the host's "apple,piodma" at this engine;
+ * a host without that property stays root-port-only. enumerate=0 keeps every
+ * host on its root-port-only path for diagnosis.
  */
 static bool enumerate = true;
 module_param(enumerate, bool, 0400);

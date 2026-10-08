@@ -1613,10 +1613,10 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	if (pcie->hw->tunneled)
 		WRITE_ONCE(port->started, true);
 	if (pcie->hw->root_bus_only)
-		dev_info(pcie->dev,
-			 "port %pOF RUN=%#x link=%#x; downstream config blocked\n",
+		dev_info(pcie->dev, "port %pOF RUN=%#x link=%#x; downstream config %s\n",
 			 np, apple_pcie_port_readl(port, PORT_STATUS),
-			 apple_pcie_port_readl(port, PORT_LINKSTS));
+			 apple_pcie_port_readl(port, PORT_LINKSTS),
+			 pcie->piodma_supplier ? "waits for the bootstrap" : "blocked");
 
 	return 0;
 
@@ -2335,7 +2335,9 @@ static int apple_pcie_probe(struct platform_device *pdev)
 		}
 	}
 
-	if (hw->root_bus_only && apple_piodma_bootstrap_enabled()) {
+	/* Only a host that the board links to a bootstrap engine opens bus 1. */
+	if (hw->root_bus_only && apple_piodma_bootstrap_enabled() &&
+	    of_property_present(dev->of_node, "apple,piodma")) {
 		ret = apple_piodma_bootstrap_get(dev, &piodma_supplier);
 		if (ret)
 			return dev_err_probe(dev, ret, "PIODMA supplier unavailable\n");
