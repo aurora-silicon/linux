@@ -2305,7 +2305,7 @@ static int dcp_follow_activate(struct apple_dcp_typec_route *route,
 		dcp_tunnel_prepare(route, ctl);
 	slot->port->owner = route;
 	slot->port->preferred_route = route;
-return 0;
+	return 0;
 }
 
 static int dcp_follow_attach(void *data, unsigned int index, bool restore)
@@ -3152,16 +3152,102 @@ static void dcp_hdmi_connect_fixed(void *ctx)
  */
 #define DCP_RECLAIM_HDMI_MS	3000
 
+struct dcp_hdmi_reclaim_context {
+	struct apple_dcp *from;
+	struct apple_dcp_typec_route *owner;
+	struct apple_dcp_typec_route *target;
+	struct dcp_typec_follow_slot slot;
+};
+
+static int dcp_reclaim_release(void *data)
+{
+	struct dcp_hdmi_reclaim_context *ctx = data;
+
+	return dcp_follow_release(ctx->owner);
+}
+
+static void dcp_reclaim_unplug(void *data)
+{
+	struct dcp_hdmi_reclaim_context *ctx = data;
+	struct apple_connector *connector = ctx->slot.connector;
+
+	if (connector) {
+		WRITE_ONCE(connector->connected, false);
+		apple_connector_set_pipeline(connector, NULL);
+		dcp_queue_hotplug(connector);
+	}
+}
+
+static void dcp_reclaim_connect_hdmi(void *data)
+{
+	struct dcp_hdmi_reclaim_context *ctx = data;
+	struct apple_dcp *dcp = ctx->from;
+	struct apple_connector *hdmi = dcp->fixed_connector;
+	unsigned long timeout;
+
+	/* Park revoked the old attachment before this fixed output starts. */
+	WRITE_ONCE(dcp->typec_follow_retiring, false);
+	dcp_hdmi_connect_fixed(dcp);
+	timeout = jiffies + msecs_to_jiffies(DCP_RECLAIM_HDMI_MS);
+	while (hdmi && !READ_ONCE(hdmi->connected) && time_before(jiffies, timeout))
+		msleep(20);
+}
+
+static int dcp_reclaim_activate(void *data, bool restore)
+{
+	struct dcp_hdmi_reclaim_context *ctx = data;
+	struct apple_dcp_typec_route *route = restore ? ctx->owner : ctx->target;
+	int ret = dcp_follow_activate(route, &ctx->slot);
+
+	if (ret)
+		dev_err(route->dcp->dev, "could not %s display route on %pOF: %d\n",
+			 restore ? "restore" : "move", ctx->slot.port->connector_np, ret);
+	return ret;
+}
+
+static void dcp_reclaim_publish(void *data, bool restore)
+{
+	struct dcp_hdmi_reclaim_context *ctx = data;
+	struct apple_dcp *to = (restore ? ctx->owner : ctx->target)->dcp;
+
+	/* Connected on a fresh attachment; no CRTC is on yet. */
+	scoped_guard(mutex, &to->hpd_mutex) {
+		WRITE_ONCE(to->typec_cable_connected, true);
+		to->typec_generation++;
+		to->typec_follow_start = false;
+		WRITE_ONCE(to->typec_crtc_off, false);
+	}
+	WRITE_ONCE(ctx->owner->dcp->typec_follow_retiring, false);
+	WRITE_ONCE(ctx->target->dcp->typec_follow_retiring, false);
+	dcp_dptx_connect_oob(to_platform_device(to->dev), 0);
+}
+
+static void dcp_reclaim_lost(void *data)
+{
+	struct dcp_hdmi_reclaim_context *ctx = data;
+
+	if (ctx->slot.connector)
+		dcp_route_failure_notify(ctx->slot.connector);
+}
+
+static const struct dcp_fabric_reclaim_ops dcp_reclaim_ops = {
+	.release = dcp_reclaim_release,
+	.unplug = dcp_reclaim_unplug,
+	.connect_hdmi = dcp_reclaim_connect_hdmi,
+	.activate = dcp_reclaim_activate,
+	.publish = dcp_reclaim_publish,
+	.lost = dcp_reclaim_lost,
+};
+
 static bool dcp_typec_hdmi_reclaim(struct apple_dcp *dcp)
 {
 	struct apple_dcp_typec_route *owner = dcp->active_typec_route;
 	struct dcp_typec_follow_slot slot = {};
 	struct apple_dcp_typec_route *route, *target = NULL;
-	struct apple_connector *connector, *hdmi;
+	struct apple_connector *connector;
 	struct apple_dcp_typec_port *port;
-	unsigned long timeout;
 	struct apple_dcp *to;
-	int ret;
+	struct dcp_hdmi_reclaim_context ctx;
 
 	lockdep_assert_held(&dcp_typec_fabric_lock);
 	if (!owner || dcp_typec_dual_stream())
@@ -3203,35 +3289,14 @@ static bool dcp_typec_hdmi_reclaim(struct apple_dcp *dcp)
 	dev_info(dcp->dev, "HDMI display takes its pipeline back, %s on %pOF moves to %s\n",
 		 connector ? connector->base.name : "the display",
 		 port->connector_np, dev_name(to->dev));
-	ret = dcp_follow_release(owner);
-	if (ret)
-		dev_warn(dcp->dev, "route not released cleanly: %d\n", ret);
-	if (connector) {
-		WRITE_ONCE(connector->connected, false);
-		apple_connector_set_pipeline(connector, NULL);
-		dcp_queue_hotplug(connector);
-	}
-
-	dcp_hdmi_connect_fixed(dcp);
-	hdmi = dcp->fixed_connector;
-	timeout = jiffies + msecs_to_jiffies(DCP_RECLAIM_HDMI_MS);
-	while (hdmi && !READ_ONCE(hdmi->connected) && time_before(jiffies, timeout))
-		msleep(20);
-
-	ret = dcp_follow_activate(target, &slot);
-	if (ret) {
-		dev_err(to->dev, "could not take the display on %pOF: %d\n",
-			port->connector_np, ret);
-		return true;
-	}
-	/* A new display on its pipeline, connected now: no CRTC is on yet. */
-	scoped_guard(mutex, &to->hpd_mutex) {
-		WRITE_ONCE(to->typec_cable_connected, true);
-		to->typec_generation++;
-		to->typec_follow_start = false;
-		WRITE_ONCE(to->typec_crtc_off, false);
-	}
-	dcp_dptx_connect_oob(to_platform_device(to->dev), 0);
+	ctx = (struct dcp_hdmi_reclaim_context) {
+		.from = dcp, .owner = owner, .target = target, .slot = slot,
+	};
+	WRITE_ONCE(dcp->typec_follow_retiring, true);
+	WRITE_ONCE(to->typec_follow_retiring, true);
+	dcp_fabric_reclaim_execute(&dcp_reclaim_ops, &ctx);
+	WRITE_ONCE(dcp->typec_follow_retiring, false);
+	WRITE_ONCE(to->typec_follow_retiring, false);
 	return true;
 }
 

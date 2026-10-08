@@ -1946,7 +1946,102 @@ static void fabric_rebind_presence_test(struct kunit *test)
 	}
 }
 
+struct reclaim_fixture {
+	int release_error, move_error, restore_error;
+	unsigned int events[8], count;
+	int owner;
+	bool reported_lost;
+};
+
+static int reclaim_release(void *data)
+{
+	struct reclaim_fixture *f = data;
+
+	f->events[f->count++] = 1;
+	f->owner = -1;
+	return f->release_error;
+}
+
+static void reclaim_unplug(void *data)
+{
+	struct reclaim_fixture *f = data;
+
+	f->events[f->count++] = 2;
+}
+
+static void reclaim_hdmi(void *data)
+{
+	struct reclaim_fixture *f = data;
+
+	f->events[f->count++] = 3;
+}
+
+static int reclaim_activate(void *data, bool restore)
+{
+	struct reclaim_fixture *f = data;
+	int ret = restore ? f->restore_error : f->move_error;
+
+	f->events[f->count++] = restore ? 5 : 4;
+	if (!ret)
+		f->owner = restore ? 0 : 1;
+	return ret;
+}
+
+static void reclaim_publish(void *data, bool restore)
+{
+	struct reclaim_fixture *f = data;
+
+	f->events[f->count++] = restore ? 7 : 6;
+}
+
+static void reclaim_lost(void *data)
+{
+	struct reclaim_fixture *f = data;
+
+	f->events[f->count++] = 8;
+	f->reported_lost = true;
+}
+
+static const struct dcp_fabric_reclaim_ops reclaim_ops = {
+	.release = reclaim_release,
+	.unplug = reclaim_unplug,
+	.connect_hdmi = reclaim_hdmi,
+	.activate = reclaim_activate,
+	.publish = reclaim_publish,
+	.lost = reclaim_lost,
+};
+
+static void fabric_reclaim_transaction_test(struct kunit *test)
+{
+	struct reclaim_fixture success = {}, move = { .move_error = -EIO };
+	struct reclaim_fixture release = { .release_error = -EIO };
+	struct reclaim_fixture lost = { .move_error = -EIO, .restore_error = -EIO };
+	unsigned int i;
+	const unsigned int expected[] = { 1, 2, 3, 4, 6 };
+
+	KUNIT_EXPECT_EQ(test, dcp_fabric_reclaim_execute(&reclaim_ops, &success), 0);
+	KUNIT_ASSERT_EQ(test, success.count, (unsigned int)ARRAY_SIZE(expected));
+	for (i = 0; i < ARRAY_SIZE(expected); i++)
+		KUNIT_EXPECT_EQ(test, success.events[i], expected[i]);
+	KUNIT_EXPECT_EQ(test, success.owner, 1);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_reclaim_execute(&reclaim_ops, &move), -EIO);
+	KUNIT_EXPECT_EQ(test, move.owner, 0);
+	KUNIT_EXPECT_EQ(test, move.events[4], 5U);
+	KUNIT_EXPECT_EQ(test, move.events[5], 7U);
+	KUNIT_EXPECT_FALSE(test, move.reported_lost);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_reclaim_execute(&reclaim_ops, &release), -EIO);
+	KUNIT_EXPECT_EQ(test, release.owner, 0);
+	KUNIT_ASSERT_EQ(test, release.count, 4U);
+	KUNIT_EXPECT_EQ(test, release.events[2], 5U);
+	KUNIT_EXPECT_EQ(test, release.events[3], 7U);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_reclaim_execute(&reclaim_ops, &lost), -EIO);
+	KUNIT_EXPECT_EQ(test, lost.owner, -1);
+	KUNIT_EXPECT_TRUE(test, lost.reported_lost);
+	KUNIT_EXPECT_EQ(test, lost.events[5], 8U);
+}
+
 static struct kunit_case fabric_tests[] = {
+	KUNIT_CASE(fabric_reclaim_transaction_test),
 	KUNIT_CASE_PARAM(fabric_shared_wiring_test, fabric_wiring_gen_params),
 	KUNIT_CASE(fabric_rebind_presence_test),
 	KUNIT_CASE(fabric_nonhybrid_hdmi_resume_test),

@@ -137,6 +137,37 @@ struct dcp_fabric_deactivate_ops {
 	void (*connect_fixed)(void *ctx);
 };
 
+struct dcp_fabric_reclaim_ops {
+	int (*release)(void *ctx);
+	void (*unplug)(void *ctx);
+	void (*connect_hdmi)(void *ctx);
+	int (*activate)(void *ctx, bool restore);
+	void (*publish)(void *ctx, bool restore);
+	void (*lost)(void *ctx);
+};
+
+/* A failed handoff must restore the old display or report its loss. */
+static inline int
+dcp_fabric_reclaim_execute(const struct dcp_fabric_reclaim_ops *ops, void *ctx)
+{
+	int ret = ops->release(ctx);
+
+	ops->unplug(ctx);
+	if (!ret) {
+		ops->connect_hdmi(ctx);
+		ret = ops->activate(ctx, false);
+		if (!ret) {
+			ops->publish(ctx, false);
+			return 0;
+		}
+	}
+	if (!ops->activate(ctx, true))
+		ops->publish(ctx, true);
+	else
+		ops->lost(ctx);
+	return ret;
+}
+
 /* True discards the cached remainder and re-enters with a new snapshot. */
 static inline bool
 dcp_fabric_run_deactivate(const struct dcp_fabric_deactivate_ops *ops, void *ctx)
