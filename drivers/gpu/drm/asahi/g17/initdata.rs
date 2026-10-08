@@ -23,7 +23,6 @@ const CONTEXT_SIZE: usize = 0x20000;
 const REGION_A_SIZE: usize = core::mem::size_of::<abi::RegionA>();
 const REGION_C_SIZE: usize = 0x1000;
 
-const COMPUTE_BLOCKS_ALLOCATED: usize = 23;
 const COMPUTE_BLOCKS_MAPPED: usize = 22;
 const COMPUTE_BLOCKS_POPULATED: usize = 21;
 const COMPUTE_CONTROL_BLOCKS: u32 = 25;
@@ -65,8 +64,8 @@ impl ComputeShared {
             KernelObject::backing(alloc.dev, low::RENDER_PAGE_LIST_SIZE, CpuMap::WriteCombined)?;
         let runs =
             KernelObject::backing(alloc.dev, low::RENDER_RUN_LIST_SIZE, CpuMap::WriteCombined)?;
-        let mut blocks = KVec::with_capacity(COMPUTE_BLOCKS_ALLOCATED, GFP_KERNEL)?;
-        for _ in 0..COMPUTE_BLOCKS_ALLOCATED {
+        let mut blocks = KVec::with_capacity(COMPUTE_BLOCKS_MAPPED, GFP_KERNEL)?;
+        for _ in 0..COMPUTE_BLOCKS_MAPPED {
             blocks.push(
                 KernelObject::backing(alloc.dev, abi::FREE_LIST_BLOCK_SIZE, CpuMap::WriteCombined)?,
                 GFP_KERNEL,
@@ -867,9 +866,6 @@ impl InitData {
         let compute_state = self.add(KernelObject::backing(env.dev, mmu::UAT_PGSZ, WB)?)?;
         self.object_mut(compute_state)?
             .write(0, abi::FreeListState::COMPUTE)?;
-        for _ in &low::COMPUTE_ZERO_BLOCKS {
-            self.add(KernelObject::backing(env.dev, abi::FREE_LIST_BLOCK_SIZE, WB)?)?;
-        }
         let compute_runs = self.add(KernelObject::new(
             env.dev,
             env.lower,
