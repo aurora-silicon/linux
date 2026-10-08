@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/mux/apple,display-crossbar.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple display crossbar
+
+maintainers:
+  - Sven Peter <sven@svenpeter.dev>
+
+description:
+  Routes display pipelines to the DisplayPort transmitters and inputs
+  of an Apple Type-C PHY. Each crossbar exposes three mux controls,
+  selected by the consumer's mux specifier.
+
+allOf:
+  - $ref: mux-controller.yaml#
+
+properties:
+  compatible:
+    enum:
+      - apple,t8103-display-crossbar
+      - apple,t8112-display-crossbar
+      - apple,t6000-display-crossbar
+      - apple,t6020-display-crossbar
+
+  reg:
+    maxItems: 1
+
+  '#mux-control-cells':
+    const: 1
+
+required:
+  - compatible
+  - reg
+  - '#mux-control-cells'
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    mux-controller@b04c000 {
+        compatible = "apple,t6020-display-crossbar";
+        reg = <0xb04c000 0x4000>;
+        #mux-control-cells = <1>;
+    };
