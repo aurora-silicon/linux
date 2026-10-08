@@ -44,7 +44,10 @@ def assemble(template, manifest, directory):
     native = member(resolved['mesa'],'opt/mesa-m3/25g83/share/mesa-m3/profile')
     if native != b'j613-25g83-gl-only\n': raise ValueError('native Mesa marker differs')
     hook = member(resolved['mesa'],'usr/share/uwsm/env.d/50-mesa-m3')
-    if b'j613-25g83-hal200' not in hook: raise ValueError('Mesa hook selector differs')
+    if not re.search(rb'(?m)^[ \t]*\.[ \t]+/opt/mesa-m3/libexec/mesa-m3-session-env[ \t]*$', hook):
+        raise ValueError('Mesa hook session delegation differs')
+    session = member(resolved['mesa'],'opt/mesa-m3/libexec/mesa-m3-session-env')
+    if b'j613-25g83-hal200' not in session: raise ValueError('Mesa session selector differs')
     member(resolved['mesa'],'opt/mesa-m3/libexec/mesa-m3-abi-check')
     listing = subprocess.check_output(['bsdtar','-tf',str(resolved['kernel'])],text=True).splitlines()
     dt_path = re.compile(r'usr/lib/modules/[^/]+/dtbs/(?:apple/)?t8122-j613-25g83\.dtb')

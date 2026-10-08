@@ -20,7 +20,8 @@ class Assembly(unittest.TestCase):
             if role=='kernel':files['usr/lib/modules/test/dtbs/apple/t8122-j613-25g83.dtb']=b'apple,j613-25g83-profile\0apple,firmware-compat\0'
             if role=='mesa':
                 files.update({'opt/mesa-m3/25g83/share/mesa-m3/profile':b'j613-25g83-gl-only\n',
-                              'usr/share/uwsm/env.d/50-mesa-m3':b'j613-25g83-hal200',
+                              'usr/share/uwsm/env.d/50-mesa-m3':b'. /opt/mesa-m3/libexec/mesa-m3-session-env\n',
+                              'opt/mesa-m3/libexec/mesa-m3-session-env':b'profile=j613-25g83-hal200\n',
                               'opt/mesa-m3/libexec/mesa-m3-abi-check':b'helper',
                               'opt/mesa-m3/libexec/mesa-m3-user-setup':b'detector',
                               'opt/mesa-m3/share/mesa-m3/user-setup.list':b'list'})
@@ -71,3 +72,21 @@ class Assembly(unittest.TestCase):
     def test_missing_stage1_qualification_refuses(self):
         self.manifest['stage1_25_versions']=[]
         with self.assertRaisesRegex(ValueError,'stage1'):self.assemble()
+    def mesa_member(self,name,data):
+        files={str(p.relative_to(self.root/'mesa')):p.read_bytes()
+               for p in (self.root/'mesa').rglob('*') if p.is_file()}
+        if data is None:del files[name]
+        else:files[name]=data
+        self.package('mesa','mesa-m3',files)
+    def test_wrong_session_delegation_refuses(self):
+        self.mesa_member('usr/share/uwsm/env.d/50-mesa-m3',b'. /tmp/mesa-m3-session-env\n')
+        with self.assertRaisesRegex(ValueError,'delegation'):self.assemble()
+    def test_commented_delegation_refuses(self):
+        self.mesa_member('usr/share/uwsm/env.d/50-mesa-m3',b'# . /opt/mesa-m3/libexec/mesa-m3-session-env\n')
+        with self.assertRaisesRegex(ValueError,'delegation'):self.assemble()
+    def test_missing_delegated_session_refuses(self):
+        self.mesa_member('opt/mesa-m3/libexec/mesa-m3-session-env',None)
+        with self.assertRaises(subprocess.CalledProcessError):self.assemble()
+    def test_wrong_delegated_selector_refuses(self):
+        self.mesa_member('opt/mesa-m3/libexec/mesa-m3-session-env',b'profile=legacy\n')
+        with self.assertRaisesRegex(ValueError,'selector'):self.assemble()
