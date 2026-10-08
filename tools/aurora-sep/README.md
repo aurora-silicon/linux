@@ -121,3 +121,11 @@ On Omarchy, run `omarchy-apply-lock` once after enrollment. The Quickshell
 lock screen then selects `omarchy-lock-fingerprint` automatically and accepts
 Touch ID through fprintd. Hyprlock's separate fingerprint switch is not used
 by the Quickshell lock screen.
+
+## Biometric userspace header
+
+The canonical ioctl ABI is `include/uapi/linux/apple-sep.h`. Export this
+checkout's headers with `make headers_install INSTALL_HDR_PATH=<directory>`
+and add that directory's `include` to the libfprint build include path. The
+libfprint patch uses `<linux/apple-sep.h>` directly; it has no copied ABI
+header. Interface version, ioctl numbers and fixed-width layouts are unchanged.
