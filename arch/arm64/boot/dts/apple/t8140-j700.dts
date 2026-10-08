@@ -19,6 +19,7 @@
 		atcphy0 = &atcphy0;
 		keyboard = &keyboard;
 		serial0 = &serial0;
+		pmp = &pmp;
 		wifi0 = &wifi0;
 	};
 
@@ -57,6 +58,22 @@
 #include "isp-imx558.dtsi"
 
 &serial0 {
+	status = "okay";
+};
+
+&pmp_dart {
+	status = "okay";
+};
+
+&pmp_mbox {
+	status = "okay";
+};
+
+&pmp_report {
+	status = "okay";
+};
+
+&pmp {
 	status = "okay";
 };
 

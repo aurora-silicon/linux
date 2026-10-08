@@ -280,12 +280,45 @@
 			compatible = "apple,t8140-cluster-cpufreq";
 			reg = <0x2 0x10e20000 0x0 0x1000>;
 			#performance-domain-cells = <0>;
+			/* E lane follows the ADT ordering; no changing sample yet. */
+			apple,fast-die-effort = <&pmp_report 0>;
 		};
 
 		cpufreq_p: cpufreq@211e20000 {
 			compatible = "apple,t8140-cluster-cpufreq";
 			reg = <0x2 0x11e20000 0x0 0x1000>;
-			#performance-domain-cells = <0>;
+			/* P lane has been observed under Linux CPU load. */
+			apple,fast-die-effort = <&pmp_report 1>;
+		};
+
+		pmp_dart: iommu@300300000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x3 0x00300000 0x0 0xc000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 827 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			power-domains = <&ps_pmp>;
+			apple,dma-range = <0x100 0x0 0x0 0xbff00000>;
+			status = "disabled";
+		};
+
+		pmp_report: pmp-report@3003c0000 {
+			compatible = "apple,t8140-pmp-v2-report";
+			reg = <0x3 0x003c0000 0x0 0x14000>;
+			power-domains = <&ps_pms_sram>;
+			status = "disabled";
+		};
+
+		pmp: pmp@300500000 {
+			compatible = "apple,t8140-pmp-v2", "apple,t6000-pmp-v2";
+			reg = <0x3 0x00500000 0x0 0xa0000>,
+			      <0x3 0x00e00000 0x0 0x4000>;
+			reg-names = "pmp", "asc";
+			mboxes = <&pmp_mbox>;
+			mbox-names = "mbox";
+			iommus = <&pmp_dart 0>;
+			power-domains = <&ps_pmp>;
+			status = "disabled";
 		};
 
 		pmgr: power-management@300700000 {
@@ -294,6 +327,21 @@
 			#size-cells = <1>;
 			reg = <0x3 0x700000 0 0x14000>;
 			/* child nodes are added in t8140-pmgr.dtsi */
+		};
+
+		pmp_mbox: mailbox@300e08000 {
+			compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x3 0x00e08000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 823 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 824 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 825 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 826 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			power-domains = <&ps_pmp>;
+			status = "disabled";
 		};
 
 		aic: interrupt-controller@301000000 {
