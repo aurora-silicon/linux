@@ -33,3 +33,5 @@ obj-$(CONFIG_APPLE_PMP) += pmp.o
 
 obj-$(CONFIG_APPLE_MCC) += apple-mcc.o
 apple-mcc-y := mcc.o
+
+obj-$(CONFIG_APPLE_CLPC) += clpc.o
