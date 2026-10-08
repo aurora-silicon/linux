@@ -10,6 +10,10 @@
 #                                         short CPU and backlight loads (opt-in, about 5 minutes)
 #   ... | bash -s -- --m3-gpu-experiment   M3 MacBook Air only: install the GPU start
 #                                         experiment's scripts with the kernel (arms nothing)
+#   ... | bash -s -- --m3-gpu-persistent   J613 on current14: install the matched stack and
+#                                         select experimental GPU acceleration for later boots
+#   ... | bash -s -- --m3-profile=j613-25g83   J613 already on exact25G83: select the matched
+#                                              experimental native OpenGL profile (no migration)
 #   ... | bash -s -- --no-m3-mesa     M3 Pro: leave out the M3 Pro's Mesa (installed by default)
 #
 # Kernel: iconidentify/aurora-linux custom/sep (dbbfb92908ba), aurora-silicon/linux aurora-wip plus the
@@ -2936,7 +2940,12 @@ m3_pro_mesa_notice() {
 
 # On an Air with mesa-m3: whether its login hook may use the GPU (M3_GPU_OPTIN), for the summary.
 m3_pro_mesa_air_notice() {
-  if [[ -f $M3_GPU_OPTIN ]]; then
+  if ((M3_GPU_PERSISTENT)); then
+    echo "   Experimental GPU profile $M3_GPU_PROFILE is persistent; each login checks the GPU before selecting Mesa."
+    if [[ $M3_GPU_PROFILE == j613-25g83 ]]; then
+      echo "   Native OpenGL uses /opt/mesa-m3/25g83; Vulkan hardware support is unavailable."
+    fi
+  elif [[ -f $M3_GPU_OPTIN ]]; then
     echo "   $M3_GPU_OPTIN is present: a login uses this Air's GPU, which is experimental, when"
     echo "   the GPU is started (sudo air-gpu-oneshot.sh start arms one boot); otherwise it renders in software."
   else
@@ -3715,7 +3724,11 @@ install_all() {
   pacman -Q linux-aurora libfprint aurora-touchid
   if ((M3_GPU_PERSISTENT)); then m3_persistent_transaction_commit; fi
   echo
-  if [[ $M3_MODE == handoff ]] && m3_air_default; then
+  if ((M3_GPU_PERSISTENT)); then
+    say "Done. The matched kernel, Mesa and bootloader are installed with experimental GPU
+    profile $M3_GPU_PROFILE selected for subsequent boots. The retained previous entry stays
+    in the boot menu with GPU start disabled and Mesa off. Touch ID is not supported on M3 yet."
+  elif [[ $M3_MODE == handoff ]] && m3_air_default; then
     say "Done. Reboot: expect the Omarchy logo, the boot menu, then the same desktop on the boot
     framebuffer. m1n1 now hands the built-in display over and describes the GPU firmware for
     Linux; the kernel keeps the boot framebuffer until it can drive the display, and nothing
@@ -5914,12 +5927,12 @@ fingerprint.
       Then, to try m1n1's display handoff with GPU diagnostics on this Air:
         - What it does: it replaces this Mac's boot loader (m1n1) with one
           that hands the built-in display over and publishes its checked
-          state for Linux, and reads the Air's GPU, PMP and display clock
-          details and reports them: on the serial console, and under
+          state for Linux, and reports this boot's GPU, PMP and display clock
+          details: on the serial console, and under
           /proc/device-tree/chosen in Linux. It powers the GPU only for a
-          short identity read and does not start it. Native display still
-          needs T8122 PMP support in the kernel, so the desktop stays on the
-          boot framebuffer and renders in software, as in the baseline.
+          short identity read and does not start it. Display activation requires the matching PMP and display
+          handoff; a missing handoff keeps the boot framebuffer. The ordinary
+          display handoff leaves GPU startup to explicit experimental intent.
         - Only with the owner's explicit agreement, with the owner at the
           Mac for the first boot, with the Aurora maintainer told first and
           reachable while it runs, and only if the owner can start macOS on
@@ -5971,29 +5984,33 @@ fingerprint.
         - Later plain runs keep the display handoff on this Air. To go back,
           use the printed restore lines; ask the maintainer before using
           --uninstall on an Air.
-        - Every Air also gets mesa-m3 (in /opt/mesa-m3), with the desktop
-          user added to the render group. It leaves the GPU off at login
-          (the state file says "experimental") until the opt-in file
-          /etc/mesa-m3/t8122-gpu-experiment exists, which only
-          --m3-gpu-experiment writes. Quote the summary's mesa-m3 lines.
-        - The GPU start experiment, only when the maintainer asks for it:
-          --m3-gpu-experiment ("bash -s -- --m3-gpu-experiment", with
-          --m3-handoff if the Air needs it) installs air-gpu-oneshot.sh,
-          air-gpu-collect.sh and air-gpu-job.sh in /usr/local/bin, and the
-          opt-in file, and arms nothing. "sudo air-gpu-oneshot.sh start"
-          (or knob=value ...) arms the next boot only. Limine clears the
-          one-shot before that boot starts, so the boots after it, a power
-          cycle included, should be the normal entry; this has been tested
-          on an M3 Pro only. So the
-          first arming on each Air is the harmless one,
-            sudo air-gpu-oneshot.sh t8122_pstate_cap=1
-          and in that armed boot "sudo air-gpu-oneshot.sh --status" must say
-          "ubootefi.var: does not name air-gpu-oneshot" before any other
-          knob is tried. If the experiment ever boots twice, pick the normal
-          entry in the boot menu and report it. After the armed boot (or the
-          boot after it, if it hung) run "sudo air-gpu-collect.sh" and
-          attach its tgz with the last line it prints, "AIR-GPU VERDICT:
-          ...". Stop and report on any crash or panic.
+        - J613 experimental acceleration with the matched installer:
+          Current14 and exact25G83 are separate profiles. On a J613 already
+          using the supported current14 firmware, run the matched installer:
+            bash install-aurora-sep.sh --m3-gpu-persistent
+          This installs the matching kernel, Mesa and unified bootloader
+          together, retains a reachable GPU-off previous entry, and selects
+          the experimental GPU for subsequent boots. It does not require a
+          firmware migration or a separate one-shot arming command.
+          On a J613 already booted from its own exact26.6.2/25G83 volume group,
+          with the source-qualified stage1 named by the matched installer:
+            bash install-aurora-sep.sh --m3-profile=j613-25g83
+          This selects native experimental OpenGL under /opt/mesa-m3/25g83;
+          hardware Vulkan is unavailable. The installed selector is
+          /etc/mesa-m3/t8122-profile=j613-25g83-hal200. Firmware and loaded
+          GPU identity checks must pass. Linux14 cannot select this profile;
+          neither command migrates stage1 or macOS firmware.
+          A refusal leaves activation unchanged. If installation fails,
+          use 'Aurora previous (GPU off)' in Limine, or the retained previous
+          kernel in GRUB. Quote the failure and keep the boot report.
+          Plain later installs preserve the selected persistent profile.
+        - Every Air also gets mesa-m3 under /opt/mesa-m3. Ordinary J613/J615
+          installs retain their existing activation behavior. The optional
+          --m3-gpu-experiment installs air-gpu-oneshot.sh, air-gpu-collect.sh
+          and air-gpu-job.sh for a single-boot experiment; it arms nothing
+          by itself. It is separate from the persistent matched profiles.
+          After the first accelerated boot, run --m3-report and record
+          /run/user/$(id -u)/mesa-m3-session.state and the kernel GPU log.
 
    Checks for every M3 (quote the output; on a kernel-only M3 the handoff
    lines are expected to be missing, so say so):
