@@ -14,6 +14,8 @@ description:
   It provides a high-dynamic range, stereo DAC for audio playback and a mono
   high-dynamic-range ADC for audio capture. There is an integrated headset
   detection block.
+  CS42L83 systems may have platform-managed supplies without regulator
+  phandles, as on Apple Silicon boards.
 
 properties:
   compatible:
@@ -192,11 +194,18 @@ properties:
 required:
   - compatible
   - reg
-  - VP-supply
-  - VCP-supply
-  - VD_FILT-supply
-  - VL-supply
-  - VA-supply
+allOf:
+  - if:
+      properties:
+        compatible:
+          const: cirrus,cs42l42
+    then:
+      required:
+        - VP-supply
+        - VCP-supply
+        - VD_FILT-supply
+        - VL-supply
+        - VA-supply
 
 additionalProperties: false
 

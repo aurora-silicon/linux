@@ -17,6 +17,10 @@
 	model = "Apple MacBook Neo";
 
 	aliases {
+		pmp = &pmp;
+		nvram = &nvram;
+		spi0 = &qspi;
+		i2c2 = &i2c2;
 		atcphy0 = &atcphy0;
 		gpu = &gpu;
 		keyboard = &keyboard;
@@ -380,6 +384,77 @@
 };
 
 &pinctrl_ap {
+	status = "okay";
+};
+
+&jpeg_dart {
+	status = "okay";
+};
+
+&apr_dart {
+	status = "okay";
+};
+
+&pmp_dart {
+	status = "okay";
+};
+
+&pmp_report {
+	status = "okay";
+};
+
+&pmp_mbox {
+	status = "okay";
+};
+
+&pmp {
+	status = "okay";
+};
+
+&i2c2 {
+	status = "okay";
+};
+
+&qspi {
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <25000000>;
+		spi-rx-bus-width = <4>;
+		spi-tx-bus-width = <4>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			nvram: partition@24000 {
+				label = "nvram";
+				reg = <0x24000 0x1d0000>;
+			};
+		};
+	};
+};
+
+&dispext0_dart {
+	status = "okay";
+};
+
+&dcpext0_dart {
+	status = "okay";
+};
+
+&dcpext_mbox {
+	status = "okay";
+};
+
+&dpxbar0 {
+	status = "okay";
+};
+
+&cpuidle {
 	status = "okay";
 };
 
@@ -1726,7 +1801,7 @@
 };
 
 &pinctrl_ap {
-	pcie0_clkreq: pcie0-clkreq {
+	pcie0_clkreq: pcie0-clkreq-pins {
 		pinmux = <APPLE_PINMUX(101, 2)>;
 	};
 };
@@ -1738,7 +1813,7 @@
 };
 
 / {
-	pcie0_piodma_diag: dma-controller@390030000 {
+	pcie0_piodma_diag: piodma@390030000 {
 		compatible = "apple,t8140-piodma-diagnostic";
 		reg = <0x3 0x90030000 0x0 0x4000>,
 		      <0x3 0x90034000 0x0 0x4000>,

@@ -18,6 +18,18 @@
 	#address-cells = <2>;
 	#size-cells = <2>;
 
+	cpuidle: cpuidle {
+		compatible = "apple,t8140-cpuidle";
+		status = "disabled";
+	};
+
+	clk_200m: clock-200m {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <200000000>;
+		clock-output-names = "clk_200m";
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -408,16 +420,152 @@
 		nonposted-mmio;
 		ranges;
 
+		jpeg_dart: iommu@28d020000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x2 0x8d020000 0x0 0xc000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1041 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			apple,dma-range = /bits/ 64 <0x10000000000 0x30000000000>;
+			power-domains = <&ps_jpg>;
+			status = "disabled";
+		};
+
+		apr_dart: iommu@295020000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x2 0x95020000 0x0 0x20000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1257 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			apple,dma-range = /bits/ 64 <0x10000000000 0x30000000000>;
+			power-domains = <&ps_prores>;
+			status = "disabled";
+		};
+
+		pmp_dart: iommu@300300000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x3 0x00300000 0x0 0xc000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 827 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			apple,dma-range = /bits/ 64 <0x10000000000 0xbff00000>;
+			power-domains = <&ps_pmp>;
+			status = "disabled";
+		};
+
+		pmp_report: pmp-report@3003c0000 {
+			compatible = "apple,t8140-pmp-v2-report";
+			reg = <0x3 0x003c0000 0x0 0x14000>;
+			power-domains = <&ps_pms_sram>;
+			status = "disabled";
+		};
+
+		pmp: pmp@300500000 {
+			compatible = "apple,t8140-pmp-v2", "apple,t6000-pmp-v2";
+			reg = <0x3 0x00500000 0x0 0xa0000>,
+			      <0x3 0x00e00000 0x0 0x4000>;
+			reg-names = "pmp", "asc";
+			mboxes = <&pmp_mbox>;
+			mbox-names = "mbox";
+			iommus = <&pmp_dart 0>;
+			power-domains = <&ps_pmp>;
+			status = "disabled";
+		};
+
+		pmp_mbox: mailbox@300e08000 {
+			compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x3 0x00e08000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 823 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 824 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 825 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 826 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			power-domains = <&ps_pmp>;
+			status = "disabled";
+		};
+
+		dispext0_dart: iommu@416300000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x4 0x16300000 0x0 0xc000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 770 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			status = "disabled";
+		};
+
+		dcpext0_dart: iommu@416340000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x4 0x16340000 0x0 0xc000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 770 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			status = "disabled";
+		};
+
+		dcpext_mbox: mailbox@416e08000 {
+			compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x4 0x16e08000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 751 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 752 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 753 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 754 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			power-domains = <&ps_dispext0_cpu>;
+			status = "disabled";
+		};
+
+		i2c2: i2c@385018000 {
+			compatible = "apple,t8140-i2c", "apple,t8103-i2c";
+			reg = <0x3 0x85018000 0x0 0x4000>;
+			clocks = <&clkref>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1110 IRQ_TYPE_LEVEL_HIGH>;
+			pinctrl-0 = <&i2c2_pins>;
+			pinctrl-names = "default";
+			#address-cells = <1>;
+			#size-cells = <0>;
+			power-domains = <&ps_i2c2>;
+			status = "disabled";
+		};
+
+		qspi: spi@385110000 {
+			compatible = "apple,t8140-qspi";
+			/* Union of the overlapping controller and FIFO ADT windows. */
+			reg = <0x3 0x85110000 0x0 0x4800>;
+			clocks = <&clk_200m>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1106 IRQ_TYPE_LEVEL_HIGH>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			power-domains = <&ps_qspi>;
+			status = "disabled";
+		};
+
+		dpxbar0: display-crossbar@40b04c000 {
+			compatible = "apple,t6020-display-crossbar";
+			reg = <0x4 0x0b04c000 0x0 0x4000>;
+			#mux-control-cells = <1>;
+			status = "disabled";
+		};
+
 		cpufreq_e: cpufreq@210e20000 {
 			compatible = "apple,t8140-cluster-cpufreq";
 			reg = <0x2 0x10e20000 0x0 0x1000>;
 			#performance-domain-cells = <0>;
+			apple,fast-die-effort = <&pmp_report 0>;
 		};
 
 		cpufreq_p: cpufreq@211e20000 {
 			compatible = "apple,t8140-cluster-cpufreq";
 			reg = <0x2 0x11e20000 0x0 0x1000>;
 			#performance-domain-cells = <0>;
+			apple,fast-die-effort = <&pmp_report 1>;
 		};
 
 		sep_dart: iommu@280b80000 {
@@ -1031,6 +1179,11 @@
 			/* ADT no-restore-gpio-pins entries: 50 and 134. */
 			gpio-reserved-ranges = <50 1>, <134 1>;
 			status = "disabled";
+
+			i2c2_pins: i2c2-pins {
+				pinmux = <APPLE_PINMUX(164, 1)>,
+					 <APPLE_PINMUX(165, 1)>;
+			};
 
 			i2c0_pins: i2c0-pins {
 				pinmux = <APPLE_PINMUX(170, 1)>,
