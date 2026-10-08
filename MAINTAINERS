@@ -2634,7 +2634,7 @@ F:	net/bluetooth/brcm.h
 
 ARM/APPLE QSPIMC DRIVER
 M:	Ryan Murray <ryan@aurorasilicon.org>
-L:	asahi@lists.linux.dev
+W:	https://aurora-silicon.github.io
 S:	Maintained
 F:	Documentation/devicetree/bindings/spi/apple,qspi.yaml
 F:	drivers/spi/spi-apple-qspi.c
