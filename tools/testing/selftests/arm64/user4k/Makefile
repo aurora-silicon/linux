@@ -12,11 +12,13 @@ TEST_FILES += README.hole-refill README.hole-refill-race README.hole-refill-recl
 TEST_FILES += compat-script runtime-app.py
 TEST_GEN_PROGS_EXTENDED += same-quarter file-cow-consumers same-native
 TEST_FILES += README.any-quarter check-any-quarter.py
+TEST_GEN_PROGS_EXTENDED += first-write clipped-firstwrite
+TEST_FILES += README.first-write
 include ../../lib.mk
 
 $(OUTPUT)/page-contract: page-contract.c x18-probe.S
 
-$(OUTPUT)/thread-fixture-init $(OUTPUT)/user16k-smoke-init $(OUTPUT)/cow-pool $(OUTPUT)/anon-hole-refill-race $(OUTPUT)/anon-hole-refill-reclaim: LDLIBS += -pthread
+$(OUTPUT)/first-write $(OUTPUT)/thread-fixture-init $(OUTPUT)/user16k-smoke-init $(OUTPUT)/cow-pool $(OUTPUT)/anon-hole-refill-race $(OUTPUT)/anon-hole-refill-reclaim: LDLIBS += -pthread
 
 # Freestanding ELF32 probes exercise the compat ABI without an armhf sysroot.
 AARCH32_CC ?= clang --target=arm-linux-gnueabihf

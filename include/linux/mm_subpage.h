@@ -68,6 +68,15 @@ int mm_subpage_alloc_mask_locked(struct mm_subpage_pool *pool, unsigned long mas
 int mm_subpage_pool_add_folio_mask(struct mm_subpage_pool *pool, struct folio *folio,
 				 unsigned long mask, gfp_t gfp);
 bool mm_subpage_cow_wait_busy_mask(struct mm_subpage_pool *pool, unsigned long mask);
+/* Arbitrary physical offsets, one owner/folio lock for the whole logical mask.
+ * Output slots are indexed by logical mask bits; use each slot's actual offset.
+ * Count-aware supply/wait must accompany this allocation to guarantee progress.
+ */
+int mm_subpage_alloc_any_mask_locked(struct mm_subpage_pool *pool, unsigned long mask,
+				    struct mm_subpage **slots);
+int mm_subpage_pool_add_folio_count(struct mm_subpage_pool *pool, struct folio *folio,
+				  unsigned int count, gfp_t gfp);
+bool mm_subpage_cow_wait_busy_count(struct mm_subpage_pool *pool, unsigned int count);
 /* Return an initialized slot with its folio locked; may wait without a pool lock. */
 struct mm_subpage *mm_subpage_alloc_at_locked(struct mm_subpage_pool *pool,
 					    unsigned int offset);
