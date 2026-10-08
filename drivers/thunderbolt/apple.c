@@ -208,6 +208,7 @@ struct apple_cio {
 	struct delayed_work pcie_tunnel_work;
 	bool pcie_tunnel_requested;
 	bool pcie_tunnel_populated;
+	unsigned int pcie_bind_retries; /* protected by pcie_tunnel_lock */
 	bool pcie_tunnel_stopping;
 	bool pcie_pm_prepared;
 	bool pcie_resume_expected;
@@ -1151,6 +1152,24 @@ static int apple_cio_populate_pcie_tunnel(struct apple_cio *acio)
 				    acio->dev);
 }
 
+/* The host must have finished probing before activation can be announced. */
+static int apple_cio_pcie_tunnel_ready_locked(struct apple_cio *acio)
+{
+	struct platform_device *pdev;
+	int ret;
+
+	lockdep_assert_held(&acio->pcie_tunnel_lock);
+	pdev = apple_cio_find_pcie_tunnel(acio);
+	if (!pdev)
+		return -EAGAIN;
+
+	ret = apple_pcie_tunnel_restore(&pdev->dev);
+	if (!ret)
+		ret = apple_pcie_tunnel_check_state(&pdev->dev);
+	put_device(&pdev->dev);
+	return ret;
+}
+
 static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 {
 	int ret = 0;
@@ -1164,22 +1183,8 @@ static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 	 * The host survives a tunnel teardown, quiesced with its hierarchy
 	 * removed. Bring that one back rather than populating a second.
 	 */
-	if (acio->pcie_tunnel_populated) {
-		struct platform_device *pcie_pdev;
-
-		pcie_pdev = apple_cio_find_pcie_tunnel(acio);
-		if (pcie_pdev) {
-			ret = apple_pcie_tunnel_restore(&pcie_pdev->dev);
-			if (ret)
-				dev_warn(acio->dev,
-					 "failed to restore PCIe-C after tunnel activation: %d\n",
-					 ret);
-			put_device(&pcie_pdev->dev);
-		} else {
-			ret = -EAGAIN;
-		}
-		return ret;
-	}
+	if (acio->pcie_tunnel_populated)
+		return apple_cio_pcie_tunnel_ready_locked(acio);
 	if (!acio->pcie_tunnel_preinitialized)
 		return dev_err_probe(acio->dev, -ENODEV,
 				     "PCIe-C is not initialized by m1n1 or the kernel\n");
@@ -1196,7 +1201,7 @@ static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 	acio->pcie_tunnel_populated = true;
 	dev_info(acio->dev,
 		 "PCIe-C populated after USB4 PCIe tunnel adapter enable\n");
-	return 0;
+	return apple_cio_pcie_tunnel_ready_locked(acio);
 }
 
 static int apple_cio_quiesce_pcie_tunnel_locked(struct apple_cio *acio)
@@ -1215,12 +1220,15 @@ static int apple_cio_quiesce_pcie_tunnel_locked(struct apple_cio *acio)
 	return ret;
 }
 
+#define APPLE_CIO_PCIE_BIND_RETRIES	20
+#define APPLE_CIO_PCIE_BIND_WAIT_MS	250
+
 static void apple_cio_pcie_tunnel_work(struct work_struct *work)
 {
 	struct apple_cio *acio =
 		container_of(to_delayed_work(work), struct apple_cio,
 			     pcie_tunnel_work);
-	bool activated = false;
+	bool activated = false, failed = false;
 	int ret = 0;
 
 	mutex_lock(&acio->pcie_tunnel_lock);
@@ -1233,13 +1241,26 @@ static void apple_cio_pcie_tunnel_work(struct work_struct *work)
 	}
 	if (READ_ONCE(acio->pcie_tunnel_requested)) {
 		ret = apple_cio_activate_pcie_tunnel_locked(acio);
-		activated = !ret;
+		activated = !ret && acio->pcie_tunnel_populated;
+		if (ret == -EAGAIN) {
+			if (acio->pcie_bind_retries) {
+				acio->pcie_bind_retries--;
+				mod_delayed_work(system_freezable_wq,
+						 &acio->pcie_tunnel_work,
+						 msecs_to_jiffies(APPLE_CIO_PCIE_BIND_WAIT_MS));
+			} else {
+				ret = -ETIMEDOUT;
+			}
+		}
+		failed = ret && ret != -EAGAIN;
 	}
 unlock:
 	mutex_unlock(&acio->pcie_tunnel_lock);
 	/* Wake a deferred Type-C check after asynchronous PCIe setup finishes. */
 	if (activated)
 		typec_thunderbolt_switch_notify_ready(acio->tbt_switch);
+	else if (failed)
+		typec_thunderbolt_switch_notify(acio->tbt_switch);
 	if (ret && ret != -EAGAIN)
 		dev_err(acio->dev, "deferred PCIe-C transition failed: %d\n", ret);
 }
@@ -1295,6 +1316,7 @@ static int apple_nhi_pci_tunnel_post_activate(struct tb_nhi *nhi)
 		return -ESHUTDOWN;
 	}
 	WRITE_ONCE(acio->pcie_tunnel_requested, true);
+	acio->pcie_bind_retries = APPLE_CIO_PCIE_BIND_RETRIES;
 	/* No PCI removal or rescan until system resume has finished. */
 	mod_delayed_work(system_freezable_wq, &acio->pcie_tunnel_work, 0);
 	mutex_unlock(&acio->pcie_tunnel_lock);
@@ -2510,9 +2532,11 @@ static int apple_cio_check_connection(struct apple_cio *acio)
 		return -EAGAIN;
 	pdev = apple_cio_find_pcie_tunnel(acio);
 	if (!pdev)
-		return -ENODEV;
+		return acio->pcie_bind_retries ? -EAGAIN : -ENODEV;
 	ret = apple_pcie_tunnel_check_state(&pdev->dev);
 	put_device(&pdev->dev);
+	if (ret == -ENODEV && acio->pcie_bind_retries)
+		return -EAGAIN;
 	if (!ret)
 		acio->pcie_resume_expected = false;
 	return ret;

@@ -2902,11 +2902,15 @@ EXPORT_SYMBOL_GPL(apple_pcie_tunnel_quiesce);
  */
 int apple_pcie_tunnel_restore(struct device *dev)
 {
-	struct pci_host_bridge *bridge = dev_get_drvdata(dev);
+	struct pci_host_bridge *bridge;
 	struct apple_pcie *pcie;
 	struct apple_pcie_port *port;
 	int ret = 0;
 
+	guard(device)(dev);
+	if (!device_is_bound(dev))
+		return -EAGAIN;
+	bridge = dev_get_drvdata(dev);
 	if (!bridge || !bridge->bus)
 		return -ENODEV;
 
