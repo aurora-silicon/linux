@@ -168,9 +168,9 @@ void sep_bio_unregister(void *dev)
 	mutex_lock(&d->lock);
 	d->ctx = NULL;
 	free_now = (d->open_count == 0);
-	mutex_unlock(&d->lock);
-
+	/* The last close may free d as soon as the lifetime lock is dropped. */
 	wake_up_interruptible(&d->wq);
+	mutex_unlock(&d->lock);
 
 	if (free_now) {
 		mutex_destroy(&d->lock);
