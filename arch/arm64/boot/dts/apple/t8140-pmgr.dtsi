@@ -96,7 +96,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "disp_sys";
-		status = "disabled";
 	};
 
 	ps_dispext0_sys: power-controller@288 {
@@ -149,7 +148,6 @@
 		#reset-cells = <0>;
 		label = "disp_fe";
 		power-domains = <&ps_disp_sys>;
-		status = "disabled";
 	};
 
 	ps_dispext0_fe: power-controller@320 {
@@ -373,7 +371,11 @@
 		#reset-cells = <0>;
 		label = "disp_cpu";
 		power-domains = <&ps_disp_fe>;
-		status = "disabled";
+		/*
+		 * The display coprocessor is handed over running and its
+		 * firmware owns this state; writing it faults.
+		 */
+		apple,always-on;
 	};
 
 
@@ -801,13 +803,18 @@
 		status = "okay";
 	};
 
+	/*
+	 * The external display coprocessor has no Linux consumer yet. Its
+	 * firmware keeps it running, so leave these three states to it:
+	 * powering dispext0_cpu down underneath that firmware faults.
+	 */
 	ps_dispext0_sys: power-controller@288 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x288 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "dispext0_sys";
-		status = "okay";
+		status = "disabled";
 	};
 
 	ps_ane_sys: power-controller@290 {
@@ -945,7 +952,7 @@
 		#reset-cells = <0>;
 		label = "dispext0_fe";
 		power-domains = <&ps_dispext0_sys>;
-		status = "okay";
+		status = "disabled";
 	};
 
 	ps_dispext0_cpu: power-controller@328 {
@@ -955,7 +962,7 @@
 		#reset-cells = <0>;
 		label = "dispext0_cpu";
 		power-domains = <&ps_dispext0_fe>;
-		status = "okay";
+		status = "disabled";
 	};
 
 	ps_spi0: power-controller@330 {

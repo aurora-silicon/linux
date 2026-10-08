@@ -454,18 +454,6 @@
 	};
 };
 
-&dispext0_dart {
-	status = "okay";
-};
-
-&dcpext0_dart {
-	status = "okay";
-};
-
-&dcpext_mbox {
-	status = "okay";
-};
-
 &dpxbar0 {
 	status = "okay";
 };
