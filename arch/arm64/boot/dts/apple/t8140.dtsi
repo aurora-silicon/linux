@@ -558,6 +558,7 @@
 			compatible = "apple,t8140-cluster-cpufreq";
 			reg = <0x2 0x10e20000 0x0 0x1000>;
 			#performance-domain-cells = <0>;
+			/* E lane follows the ADT ordering; no changing sample yet. */
 			apple,fast-die-effort = <&pmp_report 0>;
 		};
 
@@ -565,6 +566,7 @@
 			compatible = "apple,t8140-cluster-cpufreq";
 			reg = <0x2 0x11e20000 0x0 0x1000>;
 			#performance-domain-cells = <0>;
+			/* P lane has been observed under Linux CPU load. */
 			apple,fast-die-effort = <&pmp_report 1>;
 		};
 
@@ -613,6 +615,7 @@
 			/* child nodes are added in t8140-pmgr.dtsi */
 		};
 
+
 		aic: interrupt-controller@301000000 {
 			compatible = "apple,t8140-aic3", "apple,t8122-aic3";
 			#interrupt-cells = <3>;
@@ -653,6 +656,15 @@
 			pmic@e {
 				compatible = "apple,baku-pmic", "apple,spmi-nvmem";
 				reg = <0xe SPMI_USID>;
+
+				pmu_rtc: rtc {
+					compatible = "apple,j700-pmu-rtc";
+					interrupt-parent = <&nub_spmi0>;
+					interrupts = <2 IRQ_TYPE_EDGE_RISING>;
+					nvmem-cells = <&rtc_offset>;
+					nvmem-cell-names = "rtc_offset";
+					wakeup-source;
+				};
 
 				nvmem-layout {
 					compatible = "fixed-layout";
@@ -1594,6 +1606,52 @@
 					<&ps_isp_be>, <&ps_isp_clr>, <&ps_isp_cvd>,
 					<&ps_isp_cvm>;
 			apple,dart-vm-size = <0x0 0xa0000000>;
+			status = "disabled";
+		};
+
+		ane_dart0: iommu@401800000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x4 0x01800000 0x0 0xc000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 656 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_ane_sys>;
+			apple,dma-range = <0x100 0x0 0x300 0x0>;
+			status = "disabled";
+		};
+
+		ane_dart1: iommu@401820000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x4 0x01820000 0x0 0x20000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 656 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_ane_sys>;
+			apple,dma-range = <0x100 0x0 0x300 0x0>;
+			status = "disabled";
+		};
+
+		ane_dart2: iommu@401840000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x4 0x01840000 0x0 0x20000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 656 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_ane_sys>;
+			apple,dma-range = <0x100 0x0 0x300 0x0>;
+			status = "disabled";
+		};
+
+		/* The T8140 firmware and child power sequence need their own backend. */
+		ane: ane@400000000 {
+			compatible = "apple,t8140-ane";
+			reg = <0x4 0x0 0x0 0x2000000>;
+			reg-names = "engine";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 655 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 668 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
+			power-domains = <&ps_ane_sys>;
 			status = "disabled";
 		};
 };

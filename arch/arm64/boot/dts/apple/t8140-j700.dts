@@ -26,6 +26,7 @@
 		keyboard = &keyboard;
 		sep = &sep;
 		serial0 = &serial0;
+		pmp = &pmp;
 		wifi0 = &wifi0;
 	};
 
@@ -380,6 +381,22 @@
 };
 
 &serial0 {
+	status = "okay";
+};
+
+&pmp_dart {
+	status = "okay";
+};
+
+&pmp_mbox {
+	status = "okay";
+};
+
+&pmp_report {
+	status = "okay";
+};
+
+&pmp {
 	status = "okay";
 };
 
