@@ -970,7 +970,14 @@ int dcp_get_modes(struct drm_connector *connector)
 		const struct drm_edid *edid;
 		edid = dcpavserv_copy_edid(dcp);
 		if (IS_ERR_OR_NULL(edid)) {
-			dev_info(dcp->dev, "copy_edid failed: %pe\n", edid);
+			/*
+			 * An internal panel has no AV service and so no EDID;
+			 * do not report that on every mode probe.
+			 */
+			if (dcp_has_panel(dcp) && PTR_ERR(edid) == -ENODEV)
+				dev_dbg(dcp->dev, "no EDID source for the panel\n");
+			else
+				dev_info(dcp->dev, "copy_edid failed: %pe\n", edid);
 		} else {
 			drm_edid_free(apple_connector->drm_edid);
 			apple_connector->drm_edid = edid;
