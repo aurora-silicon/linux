@@ -420,6 +420,8 @@ struct apple_dcp {
 	struct dcp_present_h17p present_h17p;
 	struct dcp_present_state_h17p present_state_h17p;
 	DECLARE_BITMAP(unknown_callbacks, IOMFB_MAX_CB);
+	/* Runtime callbacks whose record size has been reported once. */
+	DECLARE_BITMAP(sized_callbacks, IOMFB_MAX_CB);
 
 	/* Serializes H17P transmit preparation with RTKit receive callbacks. */
 	struct {

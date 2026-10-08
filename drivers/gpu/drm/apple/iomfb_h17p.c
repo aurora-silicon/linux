@@ -694,6 +694,28 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[599] = trampoline_nop, /* find_swap_function_gated */
 };
 
+/*
+ * Validate a callback record and, the first time each runtime callback whose
+ * length is only bounded arrives with a different length, report the length
+ * actually seen.  Those reports are the first capture of these records.
+ */
+bool iomfb_check_callback_h17p(struct apple_dcp *dcp, int tag, u32 in_len,
+			       u32 out_len)
+{
+	const struct dcp_callback_size *size;
+
+	if (!iomfb_validate_callback_h17p(tag, in_len, out_len))
+		return false;
+	size = &callback_sizes[tag];
+	if (size->minimum &&
+	    (in_len != size->in_len || out_len != size->out_len) &&
+	    !test_and_set_bit(tag, dcp->sized_callbacks))
+		dev_info(dcp->dev,
+			 "callback D%03d record is %#x/%#x bytes; its handler uses %#x/%#x\n",
+			 tag, in_len, out_len, size->in_len, size->out_len);
+	return true;
+}
+
 void iomfb_start_h17p(struct apple_dcp *dcp)
 {
 	WRITE_ONCE(dcp->pipe_enabled_h17p, false);
