@@ -687,7 +687,29 @@ static void cd321x_reset_setup_healthy_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, pm.setup_pending);
 }
 
+static void cd321x_reset_first_irq_during_prepare_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+	struct cd321x_setup_fixture f = { .state = 7, .mask = 0x0507 };
+
+	cd321x_pm_prepare(&pm);
+	/* The IRQ is cleared before suspend has disabled the controller IRQ. */
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 1, 0x602,
+						    &cd321x_fake_setup_ops, &f), 0);
+	KUNIT_EXPECT_TRUE(test, pm.setup_pending);
+	KUNIT_EXPECT_EQ(test, f.reads, 0U);
+	KUNIT_EXPECT_EQ(test, f.writes, 0U);
+	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_PREPARED);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_resume(&pm));
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 0, 0x602,
+						    &cd321x_fake_setup_ops, &f), 1);
+	KUNIT_EXPECT_EQ(test, f.state, (u8)0);
+	KUNIT_EXPECT_EQ(test, f.mask, (u64)0x602);
+	KUNIT_EXPECT_FALSE(test, pm.setup_pending);
+}
+
 static struct kunit_case cd321x_pm_cases[] = {
+	KUNIT_CASE(cd321x_reset_first_irq_during_prepare_test),
 	KUNIT_CASE(cd321x_reset_setup_retry_test),
 	KUNIT_CASE(cd321x_reset_setup_bound_test),
 	KUNIT_CASE(cd321x_reset_setup_pm_fence_test),
