@@ -447,12 +447,25 @@ static int mt_set_mac_address(struct net_device *netdev, void *address)
 
 	/* No live-MAC change: the next BSS activation and connect commands use
 	 * this address together. A failed retirement must not change identity.
+	 * NetworkManager takes the interface down before changing the address,
+	 * which cancels any scan; let that scan retire instead of failing.
 	 */
+	if (!netif_running(netdev)) {
+		unsigned long deadline = jiffies + msecs_to_jiffies(2000);
+
+		mt_scan_quiesce(m);
+		while (READ_ONCE(m->retired_scan_seq) && time_before(jiffies, deadline))
+			wait_for_completion_timeout(&m->scan_done, msecs_to_jiffies(100));
+	}
 	mutex_lock(&m->command_mutex);
 	spin_lock_irqsave(&m->response_lock, flags);
 	if (m->stopping || m->link_failed || m->bss_active || m->connecting ||
 	    m->connected || m->disconnecting || m->peer_valid ||
 	    m->scan_request || m->retired_scan_seq || m->discovering) {
+		dev_dbg(&m->pdev->dev,
+			"address change refused: bss=%u connecting=%u connected=%u peer=%u scan=%u retired=%u\n",
+			m->bss_active, m->connecting, m->connected, m->peer_valid,
+			!!m->scan_request, m->retired_scan_seq);
 		ret = -EBUSY;
 	} else {
 		ret = eth_mac_addr(netdev, address);
