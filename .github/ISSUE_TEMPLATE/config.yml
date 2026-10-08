@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Reporting guide and existing per-Mac reports
+    url: https://github.com/iconidentify/aurora-linux/issues/6
+    about: Check how to report results and append to an existing report for your Mac.
+  - name: Aurora Linux bug-fix roadmap
+    url: https://github.com/iconidentify/aurora-linux/issues/57
+    about: Find priorities and canonical issue links before opening a duplicate.

@@ -1,0 +1,57 @@
+name: Aurora Linux per-Mac test report
+description: Record results for one Mac; append later tests to the same issue.
+title: "[board] (Mac model): test results"
+labels: [test-report]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keep one broad test-report issue per Mac and append later results as comments. Add detailed evidence for known bugs to their existing issues and link them here.
+        See [reporting guidance](https://github.com/iconidentify/aurora-linux/blob/custom/sep/CONTRIBUTING.md), [#6](https://github.com/iconidentify/aurora-linux/issues/6), and the [roadmap #57](https://github.com/iconidentify/aurora-linux/issues/57).
+        Never attach serials, addresses, keys, fingerprints, calibration bytes, raw device trees, per-unit firmware images, or core dumps. Review logs for private data.
+  - type: textarea
+    id: environment
+    attributes:
+      label: Mac and installed build
+      description: Model, board/SoC from /proc/device-tree/compatible, exact installed Aurora tag, uname -r, bootloader/package versions, distribution, and local changes. Say unavailable where necessary.
+    validations:
+      required: true
+  - type: textarea
+    id: firmware
+    attributes:
+      label: Both firmware versions and provisioning
+      description: Read both fields from /proc/device-tree/chosen/. Report own-Mac provisioning status if relevant, never calibration contents.
+      placeholder: |
+        asahi,os-fw-version:
+        asahi,system-fw-version:
+        Own-Mac provisioning status (if relevant):
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Actions and results
+      description: List pass/fail/not tested per action. Distinguish Touch ID enrolment/verification/after reboot, display coldplug/hotplug and connection/port/mode, and actual Bluetooth/audio operation. A loaded driver or successful compile is not a pass.
+      placeholder: |
+        Feature / action | pass, fail, or not tested | details
+        For failures: steps, frequency, last known-good / first bad build, related bug link.
+    validations:
+      required: true
+  - type: textarea
+    id: session
+    attributes:
+      label: Graphics and session details
+      description: Mesa version and active renderer, GPU profile/opt-in, compositor/lock-screen versions, and relevant apps. If suspend was tested, was the session locked before authentication, and did it resume or restart? Give executable, signal, and timestamp for crashes. Say not tested or unavailable where appropriate.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs and related reports
+      description: Literal error lines with nearby context, or no errors observed. Trim and redact logs; avoid whole journals or dmesg dumps. Link canonical bugs, code examples, and earlier results.
+      render: text
+  - type: textarea
+    id: untested
+    attributes:
+      label: Untested features and limitations
+      description: Be explicit about unavailable peripherals, untested ports, firmware combinations, or suspend/crash checks.
+    validations:
+      required: true

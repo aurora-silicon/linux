@@ -1,0 +1,66 @@
+name: Aurora Linux bug
+description: Report one reproducible problem with machine, build, and error details.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues first. Add evidence for a known bug there and link related issues or code examples. For broad testing, use the test-report form and keep one report per Mac.
+        See [reporting guidance](https://github.com/iconidentify/aurora-linux/blob/custom/sep/CONTRIBUTING.md), [#6](https://github.com/iconidentify/aurora-linux/issues/6), and the [roadmap #57](https://github.com/iconidentify/aurora-linux/issues/57).
+        Never attach serials, addresses, keys, fingerprints, calibration bytes, raw device trees, per-unit firmware images, or core dumps. Review logs for private data.
+  - type: textarea
+    id: environment
+    attributes:
+      label: Mac and installed build
+      description: Exact installed release tag, running kernel, bootloader/package versions, distribution, and any local changes. If boot fails, give what is available.
+      placeholder: |
+        Model / board / SoC: MacBook Pro M3 Pro / apple,j516s / apple,t6031
+        Installed Aurora tag:
+        uname -r:
+        Bootloader and relevant package versions:
+        Distribution / local patches:
+    validations:
+      required: true
+  - type: textarea
+    id: firmware
+    attributes:
+      label: Both firmware versions and provisioning
+      description: Read both fields from /proc/device-tree/chosen/. Say unavailable if not accessible. For calibration problems, state provisioning status and whether data came from this Mac; do not upload it.
+      placeholder: |
+        asahi,os-fw-version:
+        asahi,system-fw-version:
+        Own-Mac provisioning status (if relevant):
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction, expected result, and actual result
+      description: Include the shortest steps, frequency, and last known-good / first bad build if known. For display failures, give dock/display, port, connection type, and mode.
+    validations:
+      required: true
+  - type: textarea
+    id: session
+    attributes:
+      label: Graphics or session details (if relevant)
+      description: Mesa version and active renderer, GPU profile/opt-in, compositor and lock-screen versions, and relevant app version. For resume, was it locked before authentication, and did the session/compositor restart? For a crash, give executable, signal, and timestamp.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant error lines
+      description: Quote literal errors with nearby context. Trim and redact logs; avoid whole journals, dmesg dumps, or core dumps. State if logs could not be collected.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: related
+    attributes:
+      label: Related issues, pull requests, or code examples
+      description: Link references and explain which behavior matches. Include any workaround already tried.
+  - type: textarea
+    id: untested
+    attributes:
+      label: What was not tested
+      description: For example, no dock available, only one port tested, or no suspend test. A build or module probe alone is not a runtime pass.
+    validations:
+      required: true
