@@ -591,6 +591,13 @@ struct bcm4377_data {
 
 	struct completion event;
 
+	/* Set once a recovery reprobe has been queued for this binding. */
+	unsigned long reset_pending;
+
+	/* System sleep: firmware quiesced, or kept running to wake us. */
+	bool quiesced;
+	bool wake_armed;
+
 	struct bcm4377_context *ctx;
 	dma_addr_t ctx_dma;
 
@@ -2469,6 +2476,66 @@ static void bcm4377_hci_free_dev(void *data)
 	hci_free_dev(data);
 }
 
+static bool bcm4377_hci_wakeup(struct hci_dev *hdev)
+{
+	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+
+	return device_may_wakeup(&bcm4377->pdev->dev);
+}
+
+static struct workqueue_struct *bcm4377_reset_wq;
+
+struct bcm4377_reset_work {
+	struct work_struct work;
+	struct pci_dev *pdev;
+};
+
+static void bcm4377_reset_work(struct work_struct *work)
+{
+	struct bcm4377_reset_work *rw =
+		container_of(work, struct bcm4377_reset_work, work);
+
+	/*
+	 * Remove and probe again: probe resets the function and boots the
+	 * firmware from scratch. device_reprobe() frees the old bcm4377_data,
+	 * which is why this work and its device reference live outside it.
+	 */
+	if (device_reprobe(&rw->pdev->dev))
+		dev_err(&rw->pdev->dev, "reprobe after command timeout failed\n");
+
+	pci_dev_put(rw->pdev);
+	kfree(rw);
+}
+
+/*
+ * Called by the HCI core (from process context) on a command timeout. After
+ * some system resumes the controller stops answering commands for good:
+ * every later command times out until the module is reloaded. Recover the
+ * same way, by rebinding the driver.
+ */
+static void bcm4377_hci_reset(struct hci_dev *hdev)
+{
+	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+	struct bcm4377_reset_work *rw;
+
+	/* A timeout while still setting up would only loop probe failures. */
+	if (hci_dev_test_flag(hdev, HCI_SETUP))
+		return;
+	if (test_and_set_bit(0, &bcm4377->reset_pending))
+		return;
+
+	rw = kzalloc_obj(*rw);
+	if (!rw) {
+		clear_bit(0, &bcm4377->reset_pending);
+		return;
+	}
+
+	bt_dev_err(hdev, "controller not responding, rebinding the driver");
+	rw->pdev = pci_dev_get(bcm4377->pdev);
+	INIT_WORK(&rw->work, bcm4377_reset_work);
+	queue_work(bcm4377_reset_wq, &rw->work);
+}
+
 static void bcm4377_hci_unregister_dev(void *data)
 {
 	hci_unregister_dev(data);
@@ -2588,6 +2655,8 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	hdev->send = bcm4377_hci_send_frame;
 	hdev->set_bdaddr = bcm4377_hci_set_bdaddr;
 	hdev->setup = bcm4377_hci_setup;
+	hdev->reset = bcm4377_hci_reset;
+	hdev->wakeup = bcm4377_hci_wakeup;
 	hdev->post_init = bcm4377_hci_post_init;
 
 	if (bcm4377->hw->broken_mws_transport_config)
@@ -2626,12 +2695,28 @@ static int bcm4377_suspend(struct device *dev)
 	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
 	int ret;
 
+	/* With wakeup allowed this programs the event filter and scan. */
 	ret = hci_suspend_dev(bcm4377->hdev);
 	if (ret)
 		return ret;
 
+	if (device_may_wakeup(dev)) {
+		/*
+		 * Remote wakeup: leave the firmware running and the function
+		 * in D0, so a connection attempt from a wake-allowed device
+		 * raises an interrupt. Saving the state here stops the PCI
+		 * core from putting the function into D3hot.
+		 */
+		pci_save_state(pdev);
+		bcm4377->wake_armed = !enable_irq_wake(pdev->irq);
+		return 0;
+	}
+
 	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_QUIESCE,
 		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
+	/* Flush the posted write before the system goes to sleep. */
+	ioread32(bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
+	bcm4377->quiesced = true;
 
 	return 0;
 }
@@ -2641,8 +2726,18 @@ static int bcm4377_resume(struct device *dev)
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
 
-	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE,
-		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
+	if (bcm4377->wake_armed) {
+		disable_irq_wake(pdev->irq);
+		bcm4377->wake_armed = false;
+	}
+
+	if (bcm4377->quiesced) {
+		iowrite32(BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE,
+			  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
+		/* The firmware must see UNQUIESCE before the resume commands. */
+		ioread32(bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
+		bcm4377->quiesced = false;
+	}
 
 	return hci_resume_dev(bcm4377->hdev);
 }
@@ -2752,7 +2847,30 @@ static struct pci_driver bcm4377_pci_driver = {
 	.probe = bcm4377_probe,
 	.driver.pm = &bcm4377_ops,
 };
-module_pci_driver(bcm4377_pci_driver);
+
+static int __init bcm4377_init(void)
+{
+	int ret;
+
+	bcm4377_reset_wq = alloc_workqueue("bcm4377-reset", WQ_UNBOUND, 0);
+	if (!bcm4377_reset_wq)
+		return -ENOMEM;
+
+	ret = pci_register_driver(&bcm4377_pci_driver);
+	if (ret)
+		destroy_workqueue(bcm4377_reset_wq);
+
+	return ret;
+}
+module_init(bcm4377_init);
+
+static void __exit bcm4377_exit(void)
+{
+	/* Unregister HCI devices before draining the callbacks they queued. */
+	pci_unregister_driver(&bcm4377_pci_driver);
+	destroy_workqueue(bcm4377_reset_wq);
+}
+module_exit(bcm4377_exit);
 
 MODULE_AUTHOR("Sven Peter <sven@svenpeter.dev>");
 MODULE_DESCRIPTION("Bluetooth support for Broadcom 4377/4378/4387/4388 devices");
