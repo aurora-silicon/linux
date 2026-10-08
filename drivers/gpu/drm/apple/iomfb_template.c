@@ -2293,10 +2293,15 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 static void res_is_main_display(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct apple_connector *connector;
-	int result = *(int *)out;
+	/*
+	 * The reply is a one-byte boolean.  The firmware leaves the rest of
+	 * the 32-bit slot alone, and dcp_push() fills that with 0xff.
+	 */
+	bool result = *(u8 *)out;
+
 	dev_info(dcp->dev, "DCP is_main_display: %d\n", result);
 
-	dcp->main_display = result != 0;
+	dcp->main_display = result;
 
 	connector = dcp->connector;
 	if (connector) {
