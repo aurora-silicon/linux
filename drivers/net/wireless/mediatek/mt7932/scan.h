@@ -5,6 +5,9 @@
 #include "protocol.h"
 #include "channels.h"
 
+/* CID03 carries this many band/channel slots, from 0xa0 up to 0xe0. */
+#define MT7932_SCAN_CHANNELS 32
+
 /* Selected ordinary TX17/fullmac wildcard scan, not a pre-RF gate.
  * Caller must own BSS0 and filter cfg80211 DISABLED channels first. NO_IR
  * channels require mt7932_scan_passive() before submission.
@@ -17,7 +20,7 @@ static inline int mt7932_scan_body(u8 *body, size_t capacity, u8 seq,
 				0x6b,7,0x0f,0xff,0xff,0xff,0xff,0xff,0xff};
 	unsigned int i, j;
 
-	if (capacity < 0x4d4 || !seq || seq > 127 || !count || count > 13)
+	if (capacity < 0x4d4 || !seq || seq > 127 || !count || count > MT7932_SCAN_CHANNELS)
 		return -EINVAL;
 	for (i = 0; i < count; i++) {
 		if (!mt7932_channel_band(channels[i]) ||

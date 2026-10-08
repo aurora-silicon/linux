@@ -5,6 +5,8 @@
 /* Private, versioned packaging of original-derived country policy. This is
  * not firmware code and does not replace cfg80211's regulatory database.
  */
+#include "channels.h"
+
 #define MT7932_POLICY_TABLES 13
 #define MT7932_POLICY_MODES 3
 
@@ -20,12 +22,12 @@ struct mt7932_reg_snapshot {
 	 * profile. Stock unknown-country startup uses XZ while Linux stays 00.
 	 */
 	u8 alpha2[2];
-	u8 domain[148];
+	u8 domain[12 + 8 * MT7932_CHANNELS];
 	u16 length;
 	/* Keep numeric limits in equality checks even though CID0f contains only
 	 * flags. An unsupported reduction must not be mistaken for no change.
 	 */
-	s32 power[17];
+	s32 power[MT7932_CHANNELS];
 	int error;
 };
 

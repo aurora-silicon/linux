@@ -26,6 +26,13 @@ The tested configuration includes ``CONFIG_MT7932_FULLMAC=m``,
 The Bluetooth transport can be built with modular Bluetooth and system
 sleep. The separately selected bootstrap provider has its own lifecycle
 restrictions. Kexec is excluded while either retained experiment is enabled.
+The station uses 2.4 GHz channels 1-13 and the 5 GHz channels 36-64,
+100-144 and 149-165 that the cfg80211 regulatory domain permits. Radar (DFS)
+channels stay passive: the firmware listens on them while the station is not
+associated, but never probes or joins an access point there, and scans made
+while associated skip them. A channel whose restrictions the driver cannot
+apply (reduced power, no OFDM, PSD limits) is disabled rather than used.
+
 Use the ordinary cfg80211 regulatory database and applicable country policy.
 The validated first-admission fallback is kernel country 00 with firmware XZ.
 A modular cfg80211 loads ``regulatory.db`` from the root filesystem; a
