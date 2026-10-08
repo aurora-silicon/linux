@@ -278,12 +278,10 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 		 * Offering it the choice makes it pair the port with a pipeline
 		 * holding a different monitor's mode list, and the modeset is
 		 * rejected with no way for it to recover.  The hotplug that
-		 * follows makes it re-read this.  Dual-stream machines keep
-		 * fixed possible_crtcs instead: compositors that read them once
-		 * (e.g. aquamarine/Hyprland) never see the narrowing.
+		 * follows publishes the actual binding on dual-stream machines
+		 * too. Clients must re-read encoder topology after a hotplug.
 		 */
-		if (connector->port_encoder && dcp->crtc &&
-		    !dcp_typec_dual_stream())
+		if (connector->port_encoder && dcp->crtc)
 			connector->port_encoder->possible_crtcs =
 				drm_crtc_mask(&dcp->crtc->base);
 	}
@@ -368,7 +366,7 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 		WRITE_ONCE(connector->dcp, NULL);
 
 		/* Unrouted: the port could go to any of its pipelines again. */
-		if (connector->port_encoder && !dcp_typec_dual_stream())
+		if (connector->port_encoder)
 			connector->port_encoder->possible_crtcs =
 				connector->candidate_crtcs;
 	}
@@ -651,9 +649,7 @@ dcp_typec_lowest_free(struct apple_dcp_typec_port *port)
 		if (!dcp_typec_route_available(candidate))
 			continue;
 		/*
-		 * Lowest free CRTC index first: on dual-stream machines that
-		 * is what a compositor picks from the port's fixed
-		 * possible_crtcs.
+		 * Prefer the lowest free CRTC index for a stable allocation order.
 		 */
 		score = dcp_typec_route_score(candidate);
 		if (score < best_score) {
@@ -693,17 +689,12 @@ static void dcp_typec_route_waiting(void)
 }
 
 /*
- * Keep the Type-C routes where a compositor starting now expects them.
- * Dual-stream machines keep possible_crtcs fixed, and compositors read
- * them once and pair connectors with CRTCs themselves: aquamarine
- * (Hyprland) walks the CRTCs in index order and gives each to the first
- * connected connector, in connector order, that can use it.  A connector
- * paired with a pipeline other than the one routed to its display has its
- * modes checked against the other display's list, so its modesets fail.
- * The Type-C and Thunderbolt events that route the ports come in no
- * particular order, so until a compositor owns the display (see
- * dcp_typec_frozen()) every route change re-runs that pairing from
- * scratch (dcp_typec_plan()) and follows it.
+ * Prefer connector order when placing Type-C streams before a DRM master
+ * starts. This is an allocation policy, not a promise about the CRTC that
+ * userspace must choose: each connected encoder advertises only its actual
+ * route, and atomic encoder selection checks that ownership. Route changes
+ * publish the new mask through hotplug; the plan uses candidate_crtcs so
+ * narrowing the advertised mask does not remove hardware routing choices.
  *
  * Only direct DP-alt routes move: each goes to exactly its planned
  * pipeline.  A Thunderbolt tunnel never moves once set up, so where one
@@ -1448,8 +1439,7 @@ void dcp_typec_port_set_connector(unsigned int idx, bool secondary,
 	if (owner) {
 		struct apple_dcp *dcp = owner->dcp;
 
-		if (dcp->crtc && connector->port_encoder &&
-		    !dcp_typec_dual_stream())
+		if (dcp->crtc && connector->port_encoder)
 			connector->port_encoder->possible_crtcs =
 				drm_crtc_mask(&dcp->crtc->base);
 

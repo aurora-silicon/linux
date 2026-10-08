@@ -279,16 +279,21 @@ apple_connector_atomic_best_encoder(struct drm_connector *conn,
 				    struct drm_atomic_state *state)
 {
 	struct apple_connector *apple_connector = to_apple_connector(conn);
+	struct drm_connector_state *conn_state;
 	struct drm_encoder *encoder;
 
 	/*
-	 * A Type-C port has one encoder, whose possible_crtcs either already
-	 * names the pipeline the fabric routed the port to or, on dual-stream
-	 * machines, the fixed set the fabric only routes within, so it is the
-	 * only answer there is.
+	 * Type-C tunnels are routed before the modeset and cannot move here.
+	 * Reject stale topology and explicit assignments to another pipeline.
 	 */
-	if (apple_connector->port_encoder)
+	if (apple_connector->port_encoder) {
+		conn_state = drm_atomic_get_new_connector_state(state, conn);
+		if (!conn_state || !conn_state->crtc ||
+		    READ_ONCE(apple_connector->dcp) !=
+		    to_apple_crtc(conn_state->crtc)->dcp)
+			return NULL;
 		return apple_connector->port_encoder;
+	}
 
 	drm_connector_for_each_possible_encoder(conn, encoder)
 		return encoder;
