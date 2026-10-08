@@ -223,7 +223,11 @@ impl Registry {
     }
 
     /// Frees the backing of every pool whose release the firmware consumed.
-    pub(super) fn observe_pool_releases(&mut self, init: &super::initdata::InitData) -> Result<usize> {
+    pub(super) fn observe_pool_releases(
+        &mut self,
+        init: &super::initdata::InitData,
+        deferred: &mut DeferredBatch,
+    ) -> Result<usize> {
         fence(Ordering::Acquire);
         let consumer = init.control_consumer()?.load(Ordering::Relaxed);
         let producer = init.control_producer()?.load(Ordering::Relaxed);
@@ -234,7 +238,8 @@ impl Registry {
             .flatten()
             .filter_map(|entry| entry.queue.as_deref_mut())
         {
-            if queue.observe_vacancy(consumer, producer)? {
+            if let Some(vacated) = queue.observe_vacancy(consumer, producer)? {
+                deferred.defer_vacated(vacated);
                 freed += 1;
             }
         }
@@ -632,6 +637,10 @@ impl Backend {
 /// Collection failure leaves the engine's Active owner intact for a stopped retry.
 pub(super) struct DeferredBatch {
     values: KVVec<super::completion::Deferred>,
+    /// Exited owners detached from idle retained compute queues and the backing
+    /// of vacated pools: unmapping and freeing happen in `finish`, off-lock.
+    bindings: KVVec<super::queue::compute::Binding>,
+    vacated: KVVec<super::queue::compute::Vacated>,
 }
 impl DeferredBatch {
     const DEPTH: usize = if crate::hw::t8140::queues::RENDER_DEPTH as usize
@@ -644,17 +653,31 @@ impl DeferredBatch {
 
     /// Reused by the sole event work item; no allocation on a completion pass.
     fn worker() -> Result<Self> {
-        Self::with_capacity(2 * QIDS * Self::DEPTH)
+        Self::with_capacity(2 * QIDS * Self::DEPTH, QIDS)
     }
     /// One publication can quarantine only its selected physical queue/pair.
     /// VM-wide settlement is a separate transaction before publishing its error.
     fn publication() -> Result<Self> {
-        Self::with_capacity(2 * Self::DEPTH)
+        Self::with_capacity(2 * Self::DEPTH, 0)
     }
-    fn with_capacity(capacity: usize) -> Result<Self> {
+    fn with_capacity(capacity: usize, detached: usize) -> Result<Self> {
         Ok(Self {
             values: KVVec::with_capacity(capacity, GFP_KERNEL)?,
+            bindings: KVVec::with_capacity(detached, GFP_KERNEL)?,
+            vacated: KVVec::with_capacity(detached, GFP_KERNEL)?,
         })
+    }
+    /// Keeps the detached owner's unmapping and VM teardown out of the device
+    /// mutex. Without reserved room the binding is dropped here instead.
+    pub(super) fn defer_binding(&mut self, binding: super::queue::compute::Binding) {
+        if let Err(binding) = self.bindings.push_within_capacity(binding) {
+            drop(binding);
+        }
+    }
+    pub(super) fn defer_vacated(&mut self, vacated: super::queue::compute::Vacated) {
+        if let Err(vacated) = self.vacated.push_within_capacity(vacated) {
+            drop(vacated);
+        }
     }
     /// A recovery pass can fail and retire each retained command at most once.
     /// Reserve before changing queues, plus a full publication for its caller.
@@ -692,6 +715,12 @@ impl DeferredBatch {
     pub(super) fn finish(&mut self) {
         for value in self.values.drain_all() {
             value.finish();
+        }
+        for binding in self.bindings.drain_all() {
+            drop(binding);
+        }
+        for vacated in self.vacated.drain_all() {
+            drop(vacated);
         }
     }
 }
@@ -1080,7 +1109,12 @@ const COMPUTE_WARM_CAP: usize = 4;
 impl super::Firmware {
     /// Event-worker service step: witness consumed pool releases, then release the
     /// oldest idle retained pools beyond the warm cap.
-    pub(in crate::g17) fn service_compute_pools(&mut self) -> Result {
+    /// Detached owner bindings and vacated pool backing go to `deferred`, which
+    /// the worker finishes after releasing the device mutex.
+    pub(in crate::g17) fn service_compute_pools(
+        &mut self,
+        deferred: &mut DeferredBatch,
+    ) -> Result {
         for queue in self
             .queues
             .compute
@@ -1088,9 +1122,11 @@ impl super::Firmware {
             .flatten()
             .filter_map(|entry| entry.queue.as_deref_mut())
         {
-            queue.detach_exited_owner();
+            if let Some(binding) = queue.detach_exited_owner() {
+                deferred.defer_binding(binding);
+            }
         }
-        self.queues.observe_pool_releases(&self.init)?;
+        self.queues.observe_pool_releases(&self.init, deferred)?;
         if self.render_control_backpressured() {
             return Ok(());
         }

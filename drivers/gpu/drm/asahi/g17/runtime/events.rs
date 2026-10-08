@@ -386,7 +386,7 @@ impl crate::g17::Shared {
         let idle = firmware.idle_check(now, in_flight)?;
         firmware.reclaim_drained_renders(deferred)?;
         firmware.service_compute_exit(deferred)?;
-        firmware.service_compute_pools()?;
+        firmware.service_compute_pools(deferred)?;
         {
             let mut reclaim = self.reclaim.lock();
             firmware.service_teardown(&mut reclaim)?;
