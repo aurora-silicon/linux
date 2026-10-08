@@ -372,6 +372,7 @@ struct apple_dcp {
 	struct delayed_work typec_reconnect_wq;
 	u32 typec_reconnect_tries;
 	struct dcp_fabric_session typec_reconnect_session; /* hpd_mutex */
+	bool typec_work_enabled; /* hpd_mutex; IRQ recovery admission */
 
 	struct gpio_desc *hdmi_hpd;
 	struct gpio_desc *hdmi_pwren;
