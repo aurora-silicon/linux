@@ -28,3 +28,14 @@ config DRM_APPLE_DEBUG
 	bool "Enable additional driver debugging"
 	depends on DRM_APPLE
 	depends on EXPERT # only for developers
+
+config DRM_APPLE_KUNIT_TEST
+	tristate "KUnit tests for Apple display controller" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Build tests for the Apple display driver's AFK ring parser and
+	  backlight policy (takeover, DPMS, suspend and present completion).
+	  The tests cover the header strides used by older firmware and
+	  larger rings, as well as malformed ring size combinations.
+	  This option is intended for developer test kernels.

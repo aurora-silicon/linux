@@ -65,9 +65,36 @@ static int apple_drm_gem_dumb_create(struct drm_file *file_priv,
 	return drm_gem_dma_dumb_create_internal(file_priv, drm, args);
 }
 
+#ifdef CONFIG_DRM_FBDEV_EMULATION
+static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
+				 struct drm_fb_helper_surface_size *sizes)
+{
+	struct drm_crtc *crtc;
+
+	drm_for_each_crtc(crtc, helper->dev) {
+		struct apple_dcp *dcp;
+
+		dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+		    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+			/* H17P applies the stored fourth byte as straight alpha. */
+			sizes->surface_bpp = 32;
+			sizes->surface_depth = 32;
+			break;
+		}
+	}
+
+	return drm_fbdev_dma_driver_fbdev_probe(helper, sizes);
+}
+#endif
+
 static const struct drm_driver apple_drm_driver = {
 	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(apple_drm_gem_dumb_create),
+#ifdef CONFIG_DRM_FBDEV_EMULATION
+	.fbdev_probe		= apple_drm_fbdev_probe,
+#else
 	DRM_FBDEV_DMA_DRIVER_OPS,
+#endif
 	.name			= DRIVER_NAME,
 	.desc			= DRIVER_DESC,
 	.major			= 1,
@@ -122,10 +149,11 @@ static void apple_crtc_atomic_disable(struct drm_crtc *crtc,
 				      struct drm_atomic_state *state)
 {
 	struct drm_crtc_state *crtc_state;
+	struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
+
 	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 
 	if (crtc_state->active_changed && !crtc_state->active) {
-		struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
 		dcp_poweroff(apple_crtc->dcp);
 	}
 
@@ -230,8 +258,29 @@ static const struct drm_mode_config_funcs apple_mode_config_funcs = {
 	.fb_create		= drm_gem_fb_create,
 };
 
+static void apple_atomic_commit_tail(struct drm_atomic_state *state)
+{
+	struct drm_plane *plane;
+	struct drm_plane_state *old, *new;
+	int i;
+
+	/* Retain displaced scanout even when the CRTC stays inactive. */
+	for_each_oldnew_plane_in_state(state, plane, old, new, i) {
+		struct apple_plane_state *apple_state = to_apple_plane_state(new);
+		struct dcp_fb_reference *entry = apple_state->retirement;
+
+		if (!entry)
+			continue;
+
+		apple_state->retirement = NULL;
+		dcp_retain_framebuffer(to_apple_crtc(old->crtc)->dcp, entry);
+	}
+
+	drm_atomic_helper_commit_tail_rpm(state);
+}
+
 static const struct drm_mode_config_helper_funcs apple_mode_config_helpers = {
-	.atomic_commit_tail	= drm_atomic_helper_commit_tail_rpm,
+	.atomic_commit_tail	= apple_atomic_commit_tail,
 };
 
 static void appledrm_connector_cleanup(struct drm_connector *connector)
@@ -362,12 +411,21 @@ static int apple_probe_per_dcp(struct device *dev,
 	u32 surf;
 	int zpos = 0;
 	bool supports_l10r = !dcp_fw_compat_is_12_x(dcp);
+	struct apple_dcp *dcp_data = platform_get_drvdata(dcp);
+	bool supports_xrgb2101010;
 	enum drm_plane_type plane_type;
+
+	supports_xrgb2101010 = dcp_data->fw_compat != DCP_FIRMWARE_H17P ||
+		dcp_data->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G;
+	if (bitmap_empty(iomfb_surfaces, DCP_MAX_PLANES))
+		return dev_err_probe(dev, -EINVAL, "No usable display surfaces\n");
 
 	for_each_set_bit(surf, iomfb_surfaces, DCP_MAX_PLANES) {
 		plane_type = (zpos == 0) ? DRM_PLANE_TYPE_PRIMARY : DRM_PLANE_TYPE_OVERLAY;
 		planes[zpos] = apple_plane_init(drm, 1U << num, surf,
-						supports_l10r, plane_type);
+						supports_l10r,
+						supports_xrgb2101010,
+						plane_type);
 		if (IS_ERR(planes[zpos]))
 			return PTR_ERR(planes[zpos]);
 
@@ -385,6 +443,8 @@ static int apple_probe_per_dcp(struct device *dev,
 	 * knows what to do with overlays.
 	 */
 	crtc = kzalloc(sizeof(*crtc), GFP_KERNEL);
+	if (!crtc)
+		return -ENOMEM;
 	ret = drm_crtc_init_with_planes(drm, &crtc->base, planes[0], NULL,
 					&apple_crtc_funcs, NULL);
 	if (ret)
@@ -698,7 +758,7 @@ static void apple_drm_uninit(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
-	drm_dev_unregister(&apple->drm);
+	drm_dev_unplug(&apple->drm);
 	drm_atomic_helper_shutdown(&apple->drm);
 
 	component_unbind_all(dev, NULL);

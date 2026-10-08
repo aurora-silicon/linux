@@ -40,6 +40,10 @@
 
 #include "dma-iommu.h"
 
+#if IS_ENABLED(CONFIG_KUNIT) && !defined(MODULE)
+#include <kunit/test.h>
+#endif
+
 #define DART_MAX_STREAMS 256
 #define DART_MAX_TTBR 4
 #define MAX_DARTS_PER_DEVICE 8
@@ -516,6 +520,28 @@ static bool apple_dart_fw_slot_owned(const struct apple_dart_fw_root *fw,
 	return fw && fw->leaf[i] && READ_ONCE(live[i]) == fw->entry[i];
 }
 
+static bool apple_dart_fw_leaf_decode(u64 pte, dma_addr_t iova,
+				      phys_addr_t *phys, int *prot)
+{
+	if (!(pte & BIT_ULL(0)) || (pte & GENMASK_ULL(63, 52)) ||
+	    (pte & GENMASK_ULL(51, 40)) != GENMASK_ULL(51, 40))
+		return false;
+
+	*phys = ((pte & GENMASK_ULL(37, 10)) << 4) | (iova & (SZ_16K - 1));
+	*prot = (!(pte & BIT_ULL(3)) ? IOMMU_READ : 0) |
+		(!(pte & BIT_ULL(2)) ? IOMMU_WRITE : 0) |
+		(!(pte & BIT_ULL(1)) ? IOMMU_CACHE : 0);
+	return true;
+}
+
+static bool apple_dart_fw_mapping_matches(phys_addr_t phys, int prot,
+					  phys_addr_t expected, int required)
+{
+	const int mask = IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE;
+
+	return phys == expected && (prot & mask) == (required & mask);
+}
+
 /*
  * A root slot firmware already uses can still back Linux mappings when the
  * firmware's leaf table translates every page Linux mapped there to the same
@@ -536,11 +562,16 @@ static bool apple_dart_fw_slot_mirrors(const struct apple_dart *dart,
 		u64 ours = READ_ONCE(ours_leaf[j]);
 		u64 theirs = READ_ONCE(fw_leaf[j]);
 
+		phys_addr_t ours_phys, fw_phys;
+		int ours_prot, fw_prot;
+
 		if (!(ours & APPLE_DART_PTE_VALID))
 			continue;
-		if (!(theirs & APPLE_DART_PTE_VALID) ||
-		    apple_dart_pte_to_paddr(dart, ours) !=
-		    apple_dart_pte_to_paddr(dart, theirs))
+
+		if (!apple_dart_fw_leaf_decode(ours, 0, &ours_phys, &ours_prot) ||
+		    !apple_dart_fw_leaf_decode(theirs, 0, &fw_phys, &fw_prot) ||
+		    !apple_dart_fw_mapping_matches(fw_phys, fw_prot,
+					   ours_phys, ours_prot))
 			return false;
 	}
 	return true;
@@ -751,7 +782,8 @@ apple_dart_hw_unmap_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx
 
 static int
 apple_dart_hw_sync_locked(struct io_pgtable_cfg *cfg,
-			 struct apple_dart_stream_map *stream_map)
+			 struct apple_dart_stream_map *stream_map,
+			 bool defer_unknown)
 {
 	struct apple_dart *dart = stream_map->dart;
 	unsigned long flags;
@@ -759,6 +791,20 @@ apple_dart_hw_sync_locked(struct io_pgtable_cfg *cfg,
 
 	spin_lock_irqsave(&dart->lock, flags);
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
+		bool ready = true;
+
+		if (defer_unknown) {
+			for (idx = 0; idx < cfg->apple_dart_cfg.n_ttbrs; idx++) {
+				if (!dart->locked_ttbr[sid][idx] ||
+				    !dart->locked_owned[sid][idx]) {
+					ready = false;
+					break;
+				}
+			}
+			if (!ready)
+				continue;
+		}
+
 		for (idx = 0; idx < cfg->apple_dart_cfg.n_ttbrs; idx++) {
 			u64 *live = dart->locked_ttbr[sid][idx];
 			u64 *owned = dart->locked_owned[sid][idx];
@@ -1052,7 +1098,8 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 				"failed to power DART for TLB synchronization: %d\n", ret);
 			return ret;
 		}
-		ret = stream.dart->locked ? apple_dart_hw_sync_locked(cfg, &stream) : 0;
+		ret = stream.dart->locked ?
+			apple_dart_hw_sync_locked(cfg, &stream, true) : 0;
 		if (ret)
 			dev_err_ratelimited(stream.dart->dev,
 				"failed to publish host page-table entries: %d\n", ret);
@@ -1099,90 +1146,105 @@ static int apple_dart_iotlb_sync_map(struct iommu_domain *domain,
 }
 
 /*
- * Look up a domain address in the firmware-owned slots of its locked roots.
- * Returns true if a firmware slot covers @dva; *phys is then the firmware's
- * translation of that page, or 0 if the firmware leaves it unmapped.
+ * Hardware continues to use every firmware-owned slot. Accept a private
+ * software mapping only when every stream using such a slot agrees on the
+ * full-page translation and its protection/cache attributes.
  */
-static bool apple_dart_fw_lookup(struct apple_dart_domain *domain, u64 dva,
-				 phys_addr_t *phys)
+static int apple_dart_check_fw_map(struct apple_dart_domain *domain, u64 dva,
+				   phys_addr_t paddr, size_t size, int prot)
 {
 	struct apple_dart_atomic_stream_map *map;
-	bool owned = false;
-	int i, sid;
+	int i, sid, ret = 0;
 
-	*phys = 0;
 	for_each_stream_map(i, domain, map) {
 		struct apple_dart *dart = map->dart;
 		u32 entries = dart->pgsize / sizeof(u64);
 		u32 pgshift = ilog2(dart->pgsize);
 		u32 bits = ilog2(entries);
-		u64 leaf = (dva >> pgshift) & (entries - 1);
-		u64 slot = (dva >> (pgshift + bits)) & (entries - 1);
-		u64 idx = dva >> (pgshift + 2 * bits);
 		unsigned long flags;
+		size_t off;
 
-		if (!dart->fw_mirror || idx >= DART_MAX_TTBR)
+		if (!dart->fw_mirror)
 			continue;
 
 		spin_lock_irqsave(&dart->lock, flags);
-		for (sid = 0; sid < dart->num_streams && !owned; sid++) {
-			const struct apple_dart_fw_root *fw;
-			u64 pte;
+		for (off = 0; off < size; off += dart->pgsize) {
+			u64 addr = dva + off;
+			u64 leaf = (addr >> pgshift) & (entries - 1);
+			u64 slot = (addr >> (pgshift + bits)) & (entries - 1);
+			u64 idx = addr >> (pgshift + 2 * bits);
 
-			if (!(atomic_long_read(&map->sidmap[BIT_WORD(sid)]) &
-			      BIT_MASK(sid)))
+			if (idx >= DART_MAX_TTBR)
 				continue;
-			fw = dart->locked_fw[sid][idx];
-			if (!dart->locked_ttbr[sid][idx] ||
-			    !apple_dart_fw_slot_owned(fw, dart->locked_ttbr[sid][idx],
-						      slot))
-				continue;
-			owned = true;
-			pte = READ_ONCE(fw->leaf[slot][leaf]);
-			if (pte & APPLE_DART_PTE_VALID)
-				*phys = apple_dart_pte_to_paddr(dart, pte);
+			for (sid = 0; sid < dart->num_streams; sid++) {
+				const struct apple_dart_fw_root *fw;
+				phys_addr_t phys;
+				u64 pte;
+				int fw_prot;
+
+				if (!(atomic_long_read(&map->sidmap[BIT_WORD(sid)]) &
+				      BIT_MASK(sid)))
+					continue;
+				fw = dart->locked_fw[sid][idx];
+				if (!dart->locked_ttbr[sid][idx] ||
+				    !apple_dart_fw_slot_owned(fw,
+						dart->locked_ttbr[sid][idx], slot))
+					continue;
+				pte = READ_ONCE(fw->leaf[slot][leaf]);
+				if (!apple_dart_fw_leaf_decode(pte, addr,
+							       &phys, &fw_prot) ||
+				    !apple_dart_fw_mapping_matches(phys, fw_prot,
+							   paddr + off, prot)) {
+					ret = -EBUSY;
+					goto unlock;
+				}
+			}
 		}
+ unlock:
 		spin_unlock_irqrestore(&dart->lock, flags);
-		if (owned)
-			return true;
-	}
-	return false;
-}
-
-/*
- * Firmware buffers the coprocessor later shares with the host live in the
- * firmware's own tables, not in Linux's; resolve them there.
- */
-static phys_addr_t apple_dart_fw_iova_to_phys(struct apple_dart_domain *domain,
-					      u64 dva)
-{
-	phys_addr_t phys;
-	u32 pgsize = domain->domain.pgsize_bitmap;
-
-	if (!apple_dart_fw_lookup(domain, dva, &phys) || !phys)
-		return 0;
-	return phys | (dva & (pgsize - 1));
-}
-
-/*
- * Linux mappings into a firmware-owned slot are never published; the
- * hardware keeps walking the firmware's table. Only accept them where the
- * firmware already provides the same translation.
- */
-static int apple_dart_check_fw_map(struct apple_dart_domain *domain, u64 dva,
-				   phys_addr_t paddr, size_t size)
-{
-	u32 pgsize = domain->domain.pgsize_bitmap;
-	size_t off;
-
-	for (off = 0; off < size; off += pgsize) {
-		phys_addr_t phys;
-
-		if (apple_dart_fw_lookup(domain, dva + off, &phys) &&
-		    phys != paddr + off)
-			return -EBUSY;
+		if (ret)
+			return ret;
 	}
 	return 0;
+}
+
+static phys_addr_t
+apple_dart_inherited_phys(struct apple_dart_domain *domain, dma_addr_t address)
+{
+	struct apple_dart_atomic_stream_map *map;
+	phys_addr_t result = 0;
+	int i, sid;
+
+	for_each_stream_map(i, domain, map) {
+		struct apple_dart *dart = map->dart;
+		unsigned long flags;
+		size_t entries = dart->pgsize / sizeof(u64);
+		size_t page = (address / dart->pgsize) % entries;
+		size_t slot = address / dart->pgsize / entries;
+
+		if (!dart->locked || !dart->fw_mirror || slot >= entries)
+			return 0;
+		spin_lock_irqsave(&dart->lock, flags);
+		for (sid = 0; sid < dart->num_streams; sid++) {
+			struct apple_dart_fw_root *fw;
+			phys_addr_t phys;
+			int prot;
+
+			if (!(atomic_long_read(&map->sidmap[BIT_WORD(sid)]) & BIT_MASK(sid)))
+				continue;
+			fw = dart->locked_fw[sid][0];
+			if (!apple_dart_fw_slot_owned(fw, dart->locked_ttbr[sid][0], slot) ||
+			    !apple_dart_fw_leaf_decode(READ_ONCE(fw->leaf[slot][page]),
+						       address, &phys, &prot) ||
+			    (result && result != phys)) {
+				spin_unlock_irqrestore(&dart->lock, flags);
+				return 0;
+			}
+			result = phys;
+		}
+		spin_unlock_irqrestore(&dart->lock, flags);
+	}
+	return result;
 }
 
 static phys_addr_t apple_dart_iova_to_phys(struct iommu_domain *domain,
@@ -1190,19 +1252,22 @@ static phys_addr_t apple_dart_iova_to_phys(struct iommu_domain *domain,
 {
 	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
 	struct io_pgtable_ops *ops = dart_domain->pgtbl_ops;
-
+	struct io_pgtable_cfg *cfg;
 	phys_addr_t phys;
-	u64 dva;
+	dma_addr_t address;
 
 	if (!ops)
 		return 0;
 
-	dva = (iova + dart_domain->dma_offset) & dart_domain->mask;
-	phys = ops->iova_to_phys(ops, dva);
+	address = (iova + dart_domain->dma_offset) & dart_domain->mask;
+	phys = ops->iova_to_phys(ops, address);
 	if (phys)
 		return phys;
-
-	return apple_dart_fw_iova_to_phys(dart_domain, dva);
+	cfg = &io_pgtable_ops_to_pgtable(ops)->cfg;
+	if (cfg->apple_dart_cfg.n_levels != 3)
+		return 0;
+	/* Existing firmware translations need no replacement software mapping. */
+	return apple_dart_inherited_phys(dart_domain, address);
 }
 
 static int apple_dart_map_pages(struct iommu_domain *domain, unsigned long iova,
@@ -1220,7 +1285,8 @@ static int apple_dart_map_pages(struct iommu_domain *domain, unsigned long iova,
 		return -ENODEV;
 
 	dva = (iova + dart_domain->dma_offset) & dart_domain->mask;
-	ret = apple_dart_check_fw_map(dart_domain, dva, paddr, pgsize * pgcount);
+	ret = apple_dart_check_fw_map(dart_domain, dva, paddr, pgsize * pgcount,
+				      prot);
 	if (ret)
 		return ret;
 
@@ -1280,7 +1346,7 @@ apple_dart_setup_translation_locked(struct apple_dart_domain *domain,
 		if (ret)
 			goto unmap;
 	}
-	ret = apple_dart_hw_sync_locked(cfg, stream_map);
+	ret = apple_dart_hw_sync_locked(cfg, stream_map, false);
 	if (!ret)
 		ret = stream_map->dart->hw->invalidate_tlb(stream_map);
 	if (!ret)
@@ -1406,6 +1472,25 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 	dart_domain->domain.geometry.aperture_end = dma_max;
 	dart_domain->domain.geometry.force_aperture = true;
 	dart_domain->dma_offset = dart->dma_offset;
+
+	if (pgtbl_cfg.apple_dart_cfg.n_levels == 3) {
+		struct apple_dart_stream_map *stream;
+		int index;
+
+		/* Make inherited translations visible before core reservation setup. */
+		for_each_stream_map(i, cfg, stream) {
+			if (!stream->dart->locked || !stream->dart->fw_mirror)
+				continue;
+			for (index = 0; index < pgtbl_cfg.apple_dart_cfg.n_ttbrs; index++) {
+				ret = apple_dart_hw_map_locked_ttbr(stream, index);
+				if (ret) {
+					free_io_pgtable_ops(dart_domain->pgtbl_ops);
+					dart_domain->pgtbl_ops = NULL;
+					goto done;
+				}
+			}
+		}
+	}
 
 	dart_domain->finalized = true;
 
@@ -1855,8 +1940,9 @@ static int apple_dart_def_domain_type(struct device *dev)
 static void apple_dart_get_resv_regions(struct device *dev,
 					struct list_head *head)
 {
+	struct iommu_resv_region *region;
+
 	if (IS_ENABLED(CONFIG_PCIE_APPLE) && dev_is_pci(dev)) {
-		struct iommu_resv_region *region;
 		int prot = IOMMU_WRITE | IOMMU_NOEXEC | IOMMU_MMIO;
 
 		region = iommu_alloc_resv_region(DOORBELL_ADDR,
@@ -1868,6 +1954,10 @@ static void apple_dart_get_resv_regions(struct device *dev,
 		list_add_tail(&region->list, head);
 	}
 
+	/* Keep translated regions so the core retains their software mappings
+	 * and the device's translated-domain requirement. Locked-root publication
+	 * validates them against every live firmware stream without replacing it.
+	 */
 	iommu_dma_get_resv_regions(dev, head);
 }
 
@@ -2387,9 +2477,10 @@ params_done:
 		dart->locked = false;
 	else
 		dart->locked = apple_dart_is_locked(dart);
-	/* T8142 loaders re-export the firmware's own display translations. */
+	/* These loaders re-export the firmware's own display translations. */
 	dart->fw_mirror = dart->locked &&
-		of_device_is_compatible(pdev->dev.of_node, "apple,t8142-dart");
+		(of_device_is_compatible(pdev->dev.of_node, "apple,t8140-dart") ||
+		 of_device_is_compatible(pdev->dev.of_node, "apple,t8142-dart"));
 	if (!dart->locked) {
 		ret = apple_dart_hw_reset(dart);
 		if (ret)
@@ -2635,6 +2726,48 @@ static struct platform_driver apple_dart_driver = {
 };
 
 module_platform_driver(apple_dart_driver);
+
+#if IS_ENABLED(CONFIG_KUNIT) && !defined(MODULE)
+static void apple_dart_fw_leaf_test(struct kunit *test)
+{
+	const u64 leaf = GENMASK_ULL(51, 40) |
+			 ((u64)(0x280000 >> 4) & GENMASK_ULL(37, 10)) |
+			 BIT_ULL(0);
+	const int rwc = IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE;
+	phys_addr_t phys;
+	int prot;
+	bool valid, matched;
+
+	valid = apple_dart_fw_leaf_decode(0, 0x4000, &phys, &prot);
+	KUNIT_EXPECT_FALSE(test, valid);
+	valid = apple_dart_fw_leaf_decode(BIT_ULL(0), 0x4000,
+					  &phys, &prot);
+	KUNIT_EXPECT_FALSE(test, valid);
+	valid = apple_dart_fw_leaf_decode(leaf, 0x4000, &phys, &prot);
+	KUNIT_ASSERT_TRUE(test, valid);
+	matched = apple_dart_fw_mapping_matches(phys, prot, 0x280000, rwc);
+	KUNIT_EXPECT_TRUE(test, matched);
+	matched = apple_dart_fw_mapping_matches(phys, prot, 0x284000, rwc);
+	KUNIT_EXPECT_FALSE(test, matched);
+	valid = apple_dart_fw_leaf_decode(leaf | BIT_ULL(2), 0x4000,
+					  &phys, &prot);
+	KUNIT_ASSERT_TRUE(test, valid);
+	matched = apple_dart_fw_mapping_matches(phys, prot, 0x280000, rwc);
+	KUNIT_EXPECT_FALSE(test, matched);
+}
+
+static struct kunit_case apple_dart_fw_cases[] = {
+	KUNIT_CASE(apple_dart_fw_leaf_test),
+	{}
+};
+
+static struct kunit_suite apple_dart_fw_suite = {
+	.name = "apple-dart-firmware-leaf",
+	.test_cases = apple_dart_fw_cases,
+};
+
+kunit_test_suite(apple_dart_fw_suite);
+#endif
 
 MODULE_DESCRIPTION("IOMMU API for Apple's DART");
 MODULE_AUTHOR("Sven Peter <sven@svenpeter.dev>");

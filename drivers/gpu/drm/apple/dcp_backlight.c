@@ -82,11 +82,157 @@ static u32 brightness_part2[] = {
 };
 
 
+bool dcp_backlight_active(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_H17P &&
+		dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+		READ_ONCE(dcp->backlight.state.ready);
+}
+
+int dcp_backlight_takeover(struct apple_dcp *dcp, u32 millinits)
+{
+	u32 maximum, nits;
+	int ret;
+
+	if (dcp_backlight_active(dcp))
+		return 0;
+	maximum = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
+	ret = dcp_bl_takeover_nits(maximum, millinits, &nits);
+	if (ret)
+		return ret;
+
+	/* Keep the first bounded hint. Later reports are not user requests. */
+	return iomfb_configure_backlight_h17p(dcp, maximum, true, nits, false, 0);
+}
+
 static int dcp_get_brightness(struct backlight_device *bd)
 {
 	struct apple_dcp *dcp = bl_get_data(bd);
+	unsigned long flags;
+	u32 actual;
+
+	if (READ_ONCE(dcp->quiescing))
+		return -ENODEV;
+
+	if (dcp_backlight_active(dcp)) {
+		spin_lock_irqsave(&dcp->backlight.lock, flags);
+		actual = dcp->backlight.state.actual;
+		spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+		return actual;
+	}
 
 	return dcp->brightness.nits;
+}
+
+int dcp_backlight_configure(struct apple_dcp *dcp, u32 maximum,
+			    bool inherited_valid, u32 inherited,
+			    bool default_valid, u32 default_nits,
+			    void (*kick)(struct apple_dcp *dcp))
+{
+	unsigned long flags;
+	int ret;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_H17P || !dcp_has_panel(dcp) ||
+	    !dcp->crtc || !kick)
+		return -EINVAL;
+
+	mutex_lock(&dcp->bl_register_mutex);
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	if (dcp->backlight.state.ready || dcp->brightness.bl_dev) {
+		ret = -EBUSY;
+	} else {
+		ret = dcp_bl_init(&dcp->backlight.state, maximum,
+				  inherited_valid, inherited,
+				  default_valid, default_nits);
+		if (!ret)
+			dcp->backlight.kick = kick;
+	}
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	mutex_unlock(&dcp->bl_register_mutex);
+	if (!ret)
+		schedule_work(&dcp->bl_register_wq);
+	return ret;
+}
+
+bool dcp_backlight_seed(struct apple_dcp *dcp, u32 nits)
+{
+	unsigned long flags;
+	bool seeded;
+
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	seeded = dcp_bl_seed(&dcp->backlight.state, nits);
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	return seeded;
+}
+
+static void dcp_backlight_kick(struct apple_dcp *dcp)
+{
+	void (*kick)(struct apple_dcp *dcp) = READ_ONCE(dcp->backlight.kick);
+
+	if (kick)
+		kick(dcp);
+}
+
+int dcp_backlight_dpms(struct apple_dcp *dcp, bool on)
+{
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	ret = dcp_bl_dpms(&dcp->backlight.state, on);
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	if (!ret)
+		dcp_backlight_kick(dcp);
+	return ret;
+}
+
+int dcp_backlight_prepare(struct apple_dcp *dcp, bool have_surface,
+			  struct dcp_backlight_present *present)
+{
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	ret = dcp_bl_prepare(&dcp->backlight.state, have_surface, present);
+	/* No reservation: carry the last completed level on an ordinary present. */
+	if (ret == -EALREADY)
+		present->nits = dcp->backlight.state.actual;
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	return ret;
+}
+
+bool dcp_backlight_complete(struct apple_dcp *dcp, u64 sequence, bool accepted)
+{
+	unsigned long flags;
+	bool completed;
+
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	completed = dcp_bl_complete(&dcp->backlight.state, sequence, accepted);
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	/* Queue retries after the central queue has finished this transaction. */
+	return completed;
+}
+
+bool dcp_backlight_pending(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	bool pending;
+
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	pending = dcp->backlight.state.dirty && !dcp->backlight.state.in_flight;
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	return pending;
+}
+
+unsigned int dcp_backlight_retry_delay(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	unsigned int delay;
+
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	delay = dcp_bl_retry_delay(&dcp->backlight.state);
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	return delay;
 }
 
 #define SCALE_FACTOR (1 << 10)
@@ -144,45 +290,59 @@ static int drm_crtc_set_brightness(struct apple_dcp *dcp)
 	struct drm_crtc *crtc = &dcp->crtc->base;
 	int ret = 0;
 
-	drm_modeset_acquire_init(&ctx, DRM_MODESET_ACQUIRE_INTERRUPTIBLE);
-	ret = drm_modeset_lock(&crtc->mutex, &ctx);
-	if (ret == -EDEADLK) {
-		drm_modeset_backoff(&ctx);
-		return -EDEADLK;
-	} else if (ret == -ERESTARTSYS) {
-		return -ERESTARTSYS;
-	}
-
-	if (!dcp->brightness.update)
-		goto done;
-
 	state = drm_atomic_state_alloc(crtc->dev);
-	if (!state) {
-		ret = -ENOMEM;
-		goto done;
-	}
+	if (!state)
+		return -ENOMEM;
 
+	drm_modeset_acquire_init(&ctx, DRM_MODESET_ACQUIRE_INTERRUPTIBLE);
 	state->acquire_ctx = &ctx;
+
+retry:
 	crtc_state = drm_atomic_get_crtc_state(state, crtc);
 	if (IS_ERR(crtc_state)) {
 		ret = PTR_ERR(crtc_state);
-		goto fail;
+		goto out;
 	}
+
+	if (!dcp->brightness.update)
+		goto out;
+
+	/* Re-present the current scanout when brightness is the only change. */
+	ret = drm_atomic_add_affected_planes(state, crtc);
+	if (ret)
+		goto out;
 
 	crtc_state->color_mgmt_changed |= true;
 
 	ret = drm_atomic_commit(state);
 
-fail:
+out:
+	if (ret == -EDEADLK) {
+		drm_atomic_state_clear(state);
+		ret = drm_modeset_backoff(&ctx);
+		if (!ret)
+			goto retry;
+	}
+
 	drm_atomic_state_put(state);
-done:
 	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
 
 	return ret;
 }
 
 int dcp_backlight_update(struct apple_dcp *dcp)
 {
+	if (READ_ONCE(dcp->quiescing))
+		return -ENODEV;
+	if (dcp_backlight_active(dcp)) {
+		dcp_backlight_kick(dcp);
+		return 0;
+	}
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		return -ENODATA;
+
 	/*
 	 * Do not actively try to change brightness if no mode is set.
 	 * TODO: should this be reflected the in backlight's power property?
@@ -203,42 +363,80 @@ static int dcp_set_brightness(struct backlight_device *bd)
 {
 	int ret = 0;
 	struct apple_dcp *dcp = bl_get_data(bd);
-	struct drm_modeset_acquire_ctx ctx;
 	int brightness = backlight_get_brightness(bd);
+	unsigned long flags;
 
-	drm_modeset_acquire_init(&ctx, DRM_MODESET_ACQUIRE_INTERRUPTIBLE);
-	ret = drm_modeset_lock(&dcp->crtc->base.mutex, &ctx);
-	if (ret == -EDEADLK) {
-		drm_modeset_backoff(&ctx);
-		return -EDEADLK;
-	} else if (ret == -ERESTARTSYS) {
-		return -ERESTARTSYS;
+	if (READ_ONCE(dcp->quiescing))
+		return -ENODEV;
+
+	if (dcp_backlight_active(dcp)) {
+		/* Preserve the requested level even while the core forces zero. */
+		spin_lock_irqsave(&dcp->backlight.lock, flags);
+		ret = dcp_bl_request(&dcp->backlight.state,
+				     bd->props.brightness,
+				     backlight_is_blank(bd),
+				     bd->props.state & BL_CORE_SUSPENDED);
+		spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+		if (!ret)
+			dcp_backlight_kick(dcp);
+		return ret;
 	}
+
+	ret = drm_modeset_lock_single_interruptible(&dcp->crtc->base.mutex);
+	if (ret)
+		return ret;
 
 	dcp->brightness.dac = calculate_dac(dcp, brightness);
 	dcp->brightness.update = true;
 
-	drm_modeset_drop_locks(&ctx);
+	drm_modeset_unlock(&dcp->crtc->base.mutex);
 
 	return dcp_backlight_update(dcp);
+}
+
+static bool dcp_backlight_controls_device(struct backlight_device *bd,
+					  struct device *display_dev)
+{
+	struct apple_dcp *dcp = bl_get_data(bd);
+
+	return !display_dev || display_dev == dcp->dev ||
+		(dcp->crtc && display_dev == dcp->crtc->base.dev->dev);
 }
 
 static const struct backlight_ops dcp_backlight_ops = {
 	.options = BL_CORE_SUSPENDRESUME,
 	.get_brightness = dcp_get_brightness,
 	.update_status = dcp_set_brightness,
+	.controls_device = dcp_backlight_controls_device,
 };
 
 int dcp_backlight_register(struct apple_dcp *dcp)
 {
 	struct device *dev = dcp->dev;
 	struct backlight_device *bl_dev;
+	unsigned long flags;
 	struct backlight_properties props = {
 		.type = BACKLIGHT_PLATFORM,
 		.brightness = dcp->brightness.nits,
 		.scale = BACKLIGHT_SCALE_LINEAR,
 	};
 	props.max_brightness = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+	    !dcp_backlight_active(dcp))
+		return -ENODATA;
+	if (dcp_backlight_active(dcp)) {
+		spin_lock_irqsave(&dcp->backlight.lock, flags);
+		if (!dcp->backlight.state.ready) {
+			spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+			return -ENODATA;
+		}
+		/* Freeze takeover before userspace can discover the device. */
+		dcp->backlight.state.controlled = true;
+		props.brightness = dcp->backlight.state.target;
+		props.max_brightness = dcp->backlight.state.maximum;
+		spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	}
 
 	bl_dev = devm_backlight_device_register(dev, "apple-panel-bl", dev, dcp,
 						&dcp_backlight_ops, &props);
@@ -246,7 +444,8 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 		return PTR_ERR(bl_dev);
 
 	dcp->brightness.bl_dev = bl_dev;
-	dcp->brightness.dac = calculate_dac(dcp, dcp->brightness.nits);
+	if (!dcp_backlight_active(dcp))
+		dcp->brightness.dac = calculate_dac(dcp, dcp->brightness.nits);
 
 	return 0;
 }

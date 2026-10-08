@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/apple,display-subsystem.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple display subsystem
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description:
+  Component master for one or more Apple display coprocessors. Each IOMMU
+  entry describes a scanout DART stream owned by a DCP instance.
+
+properties:
+  compatible:
+    const: apple,display-subsystem
+
+  iommus:
+    minItems: 1
+    maxItems: 8
+
+required:
+  - compatible
+  - iommus
+
+unevaluatedProperties: false
+...

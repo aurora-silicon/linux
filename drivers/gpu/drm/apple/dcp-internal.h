@@ -17,6 +17,7 @@
 #include <linux/usb/typec_mux.h>
 
 #include "dptxep.h"
+#include "dcp_backlight.h"
 #include "iomfb.h"
 #include "iomfb_h17p.h"
 #include "iomfb_v12_3.h"
@@ -28,6 +29,24 @@
 
 struct apple_dcp;
 struct apple_dcp_afkep;
+
+/* Snapshot of a completed present, independent of the latest DRM state. */
+struct iomfb_scanout_h17p {
+	struct dcp_swap_submit_req_h17p request;
+	struct drm_framebuffer *fb[SWAP_SURFACES];
+};
+
+/* One operation, including all of its nested replies and present completion. */
+struct iomfb_transaction {
+	struct list_head link;
+	void (*start)(struct apple_dcp *dcp, struct iomfb_transaction *transaction);
+	void (*release)(struct iomfb_transaction *transaction);
+	struct dcp_backlight_present backlight;
+	bool backlight_reserved;
+	bool backlight_failed;
+	bool brightness_only;
+	bool completed;
+};
 struct apple_dcp_typec_port;
 
 struct apple_dcp_typec_route {
@@ -94,6 +113,8 @@ struct dcp_channel {
 	dcp_callback_t callbacks[DCP_MAX_CALL_DEPTH];
 	void *cookies[DCP_MAX_CALL_DEPTH];
 	void *output[DCP_MAX_CALL_DEPTH];
+	u32 in_len[DCP_MAX_CALL_DEPTH];
+	u32 out_len[DCP_MAX_CALL_DEPTH];
 	u16 end[DCP_MAX_CALL_DEPTH];
 
 	/* Current depth of the call stack. Less than DCP_MAX_CALL_DEPTH */
@@ -152,12 +173,21 @@ struct apple_dcp_hw_data {
 	 */
 	bool adopt_live_session;
 	enum dcp_firmware_version firmware_compat;
+	/* Firmware-visible clock aperture, independent of the AP PMGR window. */
+	const struct resource *firmware_clock;
+	u32 firmware_scratch;
+	u32 firmware_request;
 };
 
 /* TODO: move IOMFB members to its own struct */
 struct apple_dcp {
+	/* An adopted session has no confirmed firmware DMA stop boundary. */
+	bool retain_dma;
+	bool quiescing;
+	bool drm_retained;
 	struct device *dev;
 	struct platform_device *piodma;
+	bool piodma_created;
 	struct iommu_domain *iommu_dom;
 	/* which of the nine cumulative A031 notify-client states to send next */
 	unsigned int a031_step;
@@ -247,6 +277,8 @@ struct apple_dcp {
 
 	/* Is the DCP booted? */
 	bool active;
+	/* A successful initial enable keeps the H17P pipe running across DPMS. */
+	bool pipe_enabled_h17p;
 
 	/* eDP display without DP-HDMI conversion */
 	bool main_display;
@@ -273,16 +305,12 @@ struct apple_dcp {
 	/* Workqueue for sending vblank events when a dcp swap is not possible */
 	struct work_struct vblank_wq;
 
-	/* List of referenced drm_framebuffers which can be unreferenced
-	 * on the next successfully completed swap.
+	/* List of referenced framebuffers pending a completed replacement swap.
+	 * The commit and RTKit work queues share it under this lock.
 	 */
 	struct list_head swapped_out_fbs;
-	/*
-	 * Protects swapped_out_fbs, which is appended to from the DRM atomic
-	 * commit (dcp_flush -> .atomic_flush) and armed/drained from the RTKit
-	 * workqueue that runs the DCP callbacks.
-	 */
-	spinlock_t swapped_out_lock;
+	/* Protects swapped_out_fbs. */
+	struct mutex swapped_out_fbs_lock;
 
 	struct dcp_brightness brightness;
 	/* Workqueue for updating the initial brightness */
@@ -341,7 +369,57 @@ struct apple_dcp {
 	struct apple_connector *fixed_connector;
 	struct apple_connector *typec_connector;
 	int hdmi_hpd_irq;
+
+	/* H17P policy shared by backlight, commit, and reply workers. */
+	struct {
+		/* Protects state and callback installation. */
+		spinlock_t lock;
+		struct dcp_backlight_state state;
+		void (*kick)(struct apple_dcp *dcp);
+	} backlight;
+
+	/* Staging wire record; serialization never mutates the atomic inputs. */
+	struct dcp_present_h17p present_h17p;
+	struct dcp_present_state_h17p present_state_h17p;
+	DECLARE_BITMAP(unknown_callbacks, IOMFB_MAX_CB);
+
+	/* Serializes H17P transmit preparation with RTKit receive callbacks. */
+	struct {
+		/* Protects queue, channel stacks, and the current owner. */
+		struct mutex lock;
+		struct list_head pending;
+		struct iomfb_transaction *active;
+		struct task_struct *owner;
+		struct work_struct work;
+		struct delayed_work timeout;
+		struct delayed_work backlight_retry;
+		unsigned long deadline;
+		unsigned int queued;
+		bool stopped;
+		bool backlight_queued;
+		atomic_t opaque_x_state;
+		struct iomfb_scanout_h17p *scanout;
+		struct iomfb_scanout_h17p *next_scanout;
+	} iomfb;
 };
+
+void iomfb_scanout_complete_h17p(struct apple_dcp *dcp);
+void iomfb_present_backlight_h17p(struct apple_dcp *dcp);
+bool iomfb_present_brightness_only_h17p(struct apple_dcp *dcp);
+bool iomfb_present_complete_h17p(struct apple_dcp *dcp);
+void iomfb_present_failed_h17p(struct apple_dcp *dcp);
+bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
+				const struct dcp_swap_submit_req_h17p *request,
+				struct dcp_present_h17p *wire);
+void iomfb_apply_opaque_x_h17p(struct apple_dcp *dcp, dcp_callback_t callback,
+			       void *cookie);
+void iomfb_opaque_x_reset_h17p(struct apple_dcp *dcp);
+int iomfb_configure_backlight_h17p(struct apple_dcp *dcp, u32 maximum,
+				   bool inherited_valid, u32 inherited,
+				   bool default_valid, u32 default_nits);
+void iomfb_queue_init(struct apple_dcp *dcp);
+void iomfb_queue_stop(struct apple_dcp *dcp);
+int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction);
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
 

@@ -20,6 +20,7 @@
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
+#include <linux/property.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/string.h>
@@ -29,6 +30,7 @@
 #include <linux/workqueue.h>
 
 #include <drm/drm_fb_dma_helper.h>
+#include <drm/drm_drv.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_module.h>
@@ -45,6 +47,83 @@
 
 #define APPLE_DCP_COPROC_CPU_CONTROL	 0x44
 #define APPLE_DCP_COPROC_CPU_CONTROL_RUN BIT(4)
+
+struct dcp_session_ref {
+	struct list_head link;
+	struct device *dev;
+	struct iommu_group *group;
+};
+
+static LIST_HEAD(dcp_retained_sessions);
+static DEFINE_MUTEX(dcp_retained_sessions_lock);
+
+static bool dcp_session_retained(struct device *dev)
+{
+	struct dcp_session_ref *session;
+	bool retained = false;
+
+	mutex_lock(&dcp_retained_sessions_lock);
+	list_for_each_entry(session, &dcp_retained_sessions, link) {
+		if (dev_fwnode(session->dev) == dev_fwnode(dev)) {
+			retained = true;
+			break;
+		}
+	}
+	mutex_unlock(&dcp_retained_sessions_lock);
+	return retained;
+}
+
+static int dcp_pin_live_session(struct apple_dcp *dcp)
+{
+	struct dcp_session_ref *session;
+
+	if (!dcp->hw.adopt_live_session || dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G || dcp->retain_dma)
+		return 0;
+	session = kzalloc_obj(*session);
+	if (!session)
+		return -ENOMEM;
+
+	/* Keep the DMA device, domain usage and driver code valid until reset. */
+	session->dev = get_device(dcp->dev);
+	session->group = iommu_group_get(dcp->dev);
+	__module_get(THIS_MODULE);
+	WRITE_ONCE(dcp->retain_dma, true);
+	mutex_lock(&dcp_retained_sessions_lock);
+	list_add_tail(&session->link, &dcp_retained_sessions);
+	mutex_unlock(&dcp_retained_sessions_lock);
+	dev_info(dcp->dev, "live H17P DMA resources retained until reboot; rebind unsupported\n");
+	return 0;
+}
+
+static void dcp_release_dma_domain(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	if (!dcp->retain_dma)
+		iommu_device_unuse_default_domain(dcp->dev);
+}
+
+static void dcp_release_context(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	if (!dcp->retain_dma)
+		kfree(dcp);
+}
+
+static void dcp_release_rtkit(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	if (dcp->retain_dma) {
+		WRITE_ONCE(dcp->quiescing, true);
+		apple_rtkit_free_retaining_buffers(dcp->rtk);
+	} else {
+		apple_rtkit_free(dcp->rtk);
+	}
+	dcp->rtk = NULL;
+}
 
 #define DCP_BOOT_TIMEOUT msecs_to_jiffies(1000)
 
@@ -848,6 +927,10 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 {
 	struct apple_dcp *dcp = cookie;
+	struct apple_dcp_afkep *ep;
+
+	if (READ_ONCE(dcp->quiescing))
+		return;
 
 	trace_dcp_recv_msg(dcp, endpoint, message);
 
@@ -867,28 +950,41 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 	case IOMFB_ENDPOINT:
 		return iomfb_recv_msg(dcp, message);
 	case AV_ENDPOINT:
-		afk_receive_message(dcp->avep, message);
-		return;
+		ep = dcp->avep;
+		break;
 	case SYSTEM_ENDPOINT:
-		afk_receive_message(dcp->systemep, message);
-		return;
+		ep = dcp->systemep;
+		break;
 	case DISP0_ENDPOINT:
-		afk_receive_message(dcp->ibootep, message);
-		return;
+		ep = dcp->ibootep;
+		break;
 	case DPAVSERV_ENDPOINT:
-		afk_receive_message(dcp->dcpavservep, message);
-		return;
+		ep = dcp->dcpavservep;
+		break;
 	case DPTX_ENDPOINT:
-		afk_receive_message(dcp->dptxep, message);
-		return;
+		ep = dcp->dptxep;
+		break;
 	default:
-		WARN(endpoint, "unknown DCP endpoint %hhu\n", endpoint);
+		ep = NULL;
+		break;
 	}
+
+	if (!ep) {
+		dev_warn_ratelimited(dcp->dev,
+				     "dropping message for unhandled endpoint %#x\n",
+				     endpoint);
+		return;
+	}
+
+	afk_receive_message(ep, message);
 }
 
 static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_size)
 {
 	struct apple_dcp *dcp = cookie;
+
+	if (READ_ONCE(dcp->quiescing))
+		return;
 
 	dcp->crashed = true;
 	dev_err(dcp->dev, "DCP has crashed\n");
@@ -951,8 +1047,8 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 			return ret;
 		}
 
-		// TODO: verify phy_addr, cache attribute
-		bfr->buffer = memremap(phy_addr, bfr->size, MEMREMAP_WB);
+		/* Firmware writes without CPU cache maintenance. */
+		bfr->buffer = memremap(phy_addr, bfr->size, MEMREMAP_WC);
 		if (!bfr->buffer)
 			return -ENOMEM;
 
@@ -993,6 +1089,8 @@ static struct apple_rtkit_ops rtkit_ops = {
 
 void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
 {
+	if (READ_ONCE(dcp->quiescing))
+		return;
 	trace_dcp_send_msg(dcp, endpoint, message);
 	apple_rtkit_send_message(dcp->rtk, endpoint, message, NULL,
 				 true);
@@ -1307,6 +1405,9 @@ int dcp_start(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
 
+	if (!dcp->rtk)
+		return -ENODEV;
+
 	init_completion(&dcp->start_done);
 
 	/*
@@ -1469,10 +1570,35 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 	}
 }
 
+static bool dcp_uses_soft_dpms(struct apple_dcp *dcp)
+{
+	return (dcp_backlight_active(dcp) && dcp_has_panel(dcp)) ||
+	       (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+		dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+		dcp->connector_type == DRM_MODE_CONNECTOR_eDP);
+}
+
 void dcp_poweron(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
+
+	if (dcp_uses_soft_dpms(dcp)) {
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+		    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+		    !READ_ONCE(dcp->pipe_enabled_h17p)) {
+			iomfb_poweron_h17p(dcp);
+			if (!READ_ONCE(dcp->pipe_enabled_h17p)) {
+				dev_err(dcp->dev, "initial display pipe enable failed\n");
+				WRITE_ONCE(dcp->crashed, true);
+				return;
+			}
+		}
+		ret = dcp_backlight_dpms(dcp, true);
+		if (ret)
+			dev_warn(dcp->dev, "backlight restore unavailable: %d\n", ret);
+		return;
+	}
 
 	if (dcp_is_typec_output(dcp)) {
 		WRITE_ONCE(dcp->typec_crtc_off, false);
@@ -1522,6 +1648,14 @@ void dcp_poweroff(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
 
+	/* Internal H17P DPMS is a brightness present, never a pipe stop. */
+	if (dcp_uses_soft_dpms(dcp)) {
+		ret = dcp_backlight_dpms(dcp, false);
+		if (ret)
+			dev_warn(dcp->dev, "backlight blank unavailable: %d\n", ret);
+		return;
+	}
+
 	if (dcp->avep)
 		av_service_disconnect(dcp);
 
@@ -1570,6 +1704,8 @@ static void dcp_work_register_backlight(struct work_struct *work)
 
 	/* try to register backlight device, */
 	ret = dcp_backlight_register(dcp);
+	if (ret == -ENODATA)
+		goto out_unlock;
 	if (ret) {
 		dev_err(dcp->dev, "Unable to register backlight device\n");
 		dcp->brightness.maximum = 0;
@@ -1588,6 +1724,94 @@ static void dcp_work_update_backlight(struct work_struct *work)
 	dcp_backlight_update(dcp);
 }
 
+static void dcp_release_piodma_iommu_dev(struct apple_dcp *dcp)
+{
+	if (dcp->retain_dma) {
+		WRITE_ONCE(dcp->quiescing, true);
+		return;
+	}
+	if (dcp->piodma) {
+		if (dcp->piodma_created)
+			of_platform_device_destroy(&dcp->piodma->dev, NULL);
+		else
+			put_device(&dcp->piodma->dev);
+	}
+	dcp->piodma = NULL;
+	dcp->iommu_dom = NULL;
+	dcp->piodma_created = false;
+}
+
+void dcp_retain_framebuffer(struct platform_device *pdev,
+			    struct dcp_fb_reference *entry)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	mutex_lock(&dcp->swapped_out_fbs_lock);
+	list_add_tail(&entry->head, &dcp->swapped_out_fbs);
+	mutex_unlock(&dcp->swapped_out_fbs_lock);
+}
+
+void dcp_arm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id)
+{
+	struct dcp_fb_reference *entry;
+
+	mutex_lock(&dcp->swapped_out_fbs_lock);
+	list_for_each_entry(entry, &dcp->swapped_out_fbs, head) {
+		if (entry->armed)
+			continue;
+		entry->swap_id = swap_id;
+		entry->armed = true;
+	}
+	mutex_unlock(&dcp->swapped_out_fbs_lock);
+}
+
+void dcp_unarm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id)
+{
+	struct dcp_fb_reference *entry;
+
+	mutex_lock(&dcp->swapped_out_fbs_lock);
+	list_for_each_entry(entry, &dcp->swapped_out_fbs, head)
+		if (entry->armed && entry->swap_id == swap_id)
+			entry->armed = false;
+	mutex_unlock(&dcp->swapped_out_fbs_lock);
+}
+
+void dcp_release_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id)
+{
+	struct dcp_fb_reference *entry, *tmp;
+	LIST_HEAD(completed);
+
+	mutex_lock(&dcp->swapped_out_fbs_lock);
+	list_for_each_entry_safe(entry, tmp, &dcp->swapped_out_fbs, head) {
+		if (!entry->armed || entry->swap_id != swap_id)
+			continue;
+		list_move_tail(&entry->head, &completed);
+	}
+	mutex_unlock(&dcp->swapped_out_fbs_lock);
+
+	list_for_each_entry_safe(entry, tmp, &completed, head) {
+		list_del(&entry->head);
+		drm_framebuffer_put(entry->fb);
+		kfree(entry);
+	}
+}
+
+void dcp_release_all_retained_framebuffers(struct apple_dcp *dcp)
+{
+	struct dcp_fb_reference *entry, *tmp;
+	LIST_HEAD(completed);
+
+	mutex_lock(&dcp->swapped_out_fbs_lock);
+	list_splice_init(&dcp->swapped_out_fbs, &completed);
+	mutex_unlock(&dcp->swapped_out_fbs_lock);
+
+	list_for_each_entry_safe(entry, tmp, &completed, head) {
+		list_del(&entry->head);
+		drm_framebuffer_put(entry->fb);
+		kfree(entry);
+	}
+}
+
 static int dcp_create_piodma_iommu_dev(struct apple_dcp *dcp)
 {
 	int ret;
@@ -1597,31 +1821,13 @@ static int dcp_create_piodma_iommu_dev(struct apple_dcp *dcp)
 		return dev_err_probe(dcp->dev, -ENODEV,
 				     "Failed to get piodma child DT node\n");
 
-	dcp->piodma = of_platform_device_create(node, NULL, dcp->dev);
-	if (!dcp->piodma) {
-		/*
-		 * of_platform_device_create() returns NULL when the node already
-		 * has a platform device, which happens whenever a previous bind
-		 * attempt created it and then failed further down (the caller's
-		 * later error paths do not destroy it).  Probe is retried - a
-		 * deferral, or a component re-bind - and would then fail here
-		 * forever with -ENODEV even though nothing is actually wrong.
-		 * Adopt the existing device instead of giving up.
-		 */
-		dcp->piodma = of_find_device_by_node(node);
-		if (!dcp->piodma)
-			return dev_err_probe(dcp->dev, -ENODEV,
-					     "Failed to create piodma pdev for %pOF\n",
-					     node);
-		/*
-		 * Drop the lookup reference: the device stays registered until
-		 * of_platform_device_destroy(), exactly like one created above,
-		 * and that call only releases the registration reference.
-		 */
-		put_device(&dcp->piodma->dev);
-		dev_info(dcp->dev, "reusing existing piodma pdev for %pOF\n",
-			 node);
-	}
+	dcp->piodma = of_find_device_by_node(node);
+	dcp->piodma_created = !dcp->piodma;
+	if (dcp->piodma_created)
+		dcp->piodma = of_platform_device_create(node, NULL, dcp->dev);
+	if (!dcp->piodma)
+		return dev_err_probe(dcp->dev, -ENODEV,
+				     "Failed to create piodma pdev for %pOF\n", node);
 
 	ret = dma_set_mask_and_coherent(&dcp->piodma->dev, DMA_BIT_MASK(42));
 	if (ret)
@@ -1645,7 +1851,7 @@ static int dcp_create_piodma_iommu_dev(struct apple_dcp *dcp)
 
 	return 0;
 err_destroy_pdev:
-	of_platform_device_destroy(&dcp->piodma->dev, NULL);
+	dcp_release_piodma_iommu_dev(dcp);
 	return ret;
 }
 
@@ -1746,67 +1952,63 @@ err_of_node_put:
 	return ret;
 }
 
-/*
- * Count the "disp-*" entries in reg-names.
- *
- * The positional form below assumes the reg layout is [coproc, disp-0 ...],
- * i.e. exactly one non-disp register, and derives the count as
- * num_resources - 1.  DCPs with H17-generation firmware list a trailing
- * "iop-vbar" register after the display apertures, which would inflate that
- * count, bind the last disp_registers[] entry to iop-vbar and make the
- * "apple,bw-scratch" disp_reg index check reject a valid device tree.
- *
- * Returns a negative errno when reg-names is absent, so callers fall back.
- */
-static int dcp_count_disp_regs(struct device *dev)
-{
-	int n = of_property_count_strings(dev->of_node, "reg-names");
-	const char *name;
-	int i, count = 0;
-
-	if (n <= 0)
-		return -EINVAL;
-
-	for (i = 0; i < n; ++i) {
-		if (of_property_read_string_index(dev->of_node, "reg-names", i,
-						  &name))
-			return -EINVAL;
-		if (!strncmp(name, "disp-", 5))
-			count++;
-	}
-
-	return count ? count : -EINVAL;
-}
-
 static int dcp_get_disp_regs(struct apple_dcp *dcp)
 {
 	struct platform_device *pdev = to_platform_device(dcp->dev);
-	int count = dcp_count_disp_regs(dcp->dev);
-	bool by_name = count > 0;
+	int count = 0;
 	int i, ret;
+	char name[16];
+	const char *reg_name;
+	struct resource *res;
 
-	/* Device trees without reg-names keep the historical positional form. */
-	if (!by_name)
+	if (of_property_present(dcp->dev->of_node, "reg-names")) {
+		ret = of_property_count_strings(dcp->dev->of_node, "reg-names");
+		if (ret < 0)
+			return ret;
+
+		for (i = 0; i < ret; i++) {
+			if (of_property_read_string_index(dcp->dev->of_node,
+							  "reg-names", i, &reg_name))
+				return -EINVAL;
+			if (!strncmp(reg_name, "disp-", 5))
+				count++;
+		}
+	} else {
 		count = pdev->num_resources - 1;
+	}
 
 	if (count <= 0 || count > MAX_DISP_REGISTERS)
 		return -EINVAL;
 
 	for (i = 0; i < count; ++i) {
-		if (by_name) {
-			char name[8];
-
+		if (of_property_present(dcp->dev->of_node, "reg-names")) {
 			snprintf(name, sizeof(name), "disp-%d", i);
-			dcp->disp_registers[i] = platform_get_resource_byname(
-				pdev, IORESOURCE_MEM, name);
+			res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+							   name);
 		} else {
-			dcp->disp_registers[i] = platform_get_resource(
-				pdev, IORESOURCE_MEM, 1 + i);
+			res = platform_get_resource(pdev, IORESOURCE_MEM, 1 + i);
 		}
-		if (!dcp->disp_registers[i]) {
-			dev_err(dcp->dev, "missing display register %d\n", i);
+		if (!res)
 			return -EINVAL;
-		}
+		dcp->disp_registers[i] = res;
+	}
+
+	if (dcp->hw.firmware_clock) {
+		/* The internal firmware's last aperture follows five display windows. */
+		if (count != 5 || resource_size(dcp->hw.firmware_clock) < 4 ||
+		    dcp->hw.firmware_scratch > resource_size(dcp->hw.firmware_clock) - 4 ||
+		    dcp->hw.firmware_request > resource_size(dcp->hw.firmware_clock) - 4)
+			return -EINVAL;
+
+		dcp->disp_bw_scratch_res = *dcp->hw.firmware_clock;
+		dcp->disp_bw_scratch_index = count;
+		dcp->disp_bw_scratch_offset = dcp->hw.firmware_scratch;
+		dcp->disp_bw_doorbell_res = dcp->disp_bw_scratch_res;
+		dcp->disp_bw_doorbell_res.start += dcp->hw.firmware_request;
+		dcp->disp_bw_doorbell_res.end = dcp->disp_bw_doorbell_res.start + 3;
+		dcp->disp_registers[count] = &dcp->disp_bw_scratch_res;
+		dcp->nr_disp_registers = count + 1;
+		return 0;
 	}
 
 	/* load pmgr bandwidth scratch resource and offset */
@@ -1934,6 +2136,18 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	u32 cpu_ctrl;
 	int ret;
 
+	if (READ_ONCE(dcp->quiescing))
+		return dev_err_probe(dev, -EBUSY,
+				     "Live DCP session cannot be rebound; reboot required\n");
+
+	/* A timed-out prior session may still scan these mappings. */
+	mutex_lock(&dcp->swapped_out_fbs_lock);
+	ret = list_empty(&dcp->swapped_out_fbs) ? 0 : -EBUSY;
+	mutex_unlock(&dcp->swapped_out_fbs_lock);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "Previous scanout has not been stopped\n");
+
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
 	if (ret)
 		return ret;
@@ -2002,34 +2216,39 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	}
 
 	ret = dcp_create_piodma_iommu_dev(dcp);
-	if (ret || !dcp->iommu_dom)
+	if (ret)
 		return dev_err_probe(dev, ret,
-				"Failed to created PIODMA iommu child device");
+				     "Failed to create PIODMA iommu child device\n");
+	if (!dcp->iommu_dom) {
+		ret = dev_err_probe(dev, -EPROBE_DEFER,
+				    "PIODMA iommu domain is unavailable\n");
+		goto err_piodma;
+	}
 
 	ret = dcp_get_disp_regs(dcp);
 	if (ret) {
 		dev_err(dev, "failed to find display registers\n");
-		return ret;
+		goto err_piodma;
 	}
 
 	dcp->clk = devm_clk_get(dev, NULL);
-	if (IS_ERR(dcp->clk))
-		return dev_err_probe(dev, PTR_ERR(dcp->clk),
-				     "Unable to find clock\n");
+	if (IS_ERR(dcp->clk)) {
+		ret = dev_err_probe(dev, PTR_ERR(dcp->clk),
+				    "Unable to find clock\n");
+		goto err_piodma;
+	}
 	dcp->clk_194 = devm_clk_get_optional(dev, "clock-194");
-	if (IS_ERR(dcp->clk_194))
-		return dev_err_probe(dev, PTR_ERR(dcp->clk_194),
-				     "Unable to find clock 0x194\n");
+	if (IS_ERR(dcp->clk_194)) {
+		ret = dev_err_probe(dev, PTR_ERR(dcp->clk_194),
+				    "Unable to find clock 0x194\n");
+		goto err_piodma;
+	}
 
 	bitmap_zero(dcp->memdesc_map, DCP_MAX_MAPPINGS);
 	// TDOD: mem_desc IDs start at 1, for simplicity just skip '0' entry
 	set_bit(0, dcp->memdesc_map);
 
 	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
-
-	dcp->swapped_out_fbs =
-		(struct list_head)LIST_HEAD_INIT(dcp->swapped_out_fbs);
-	spin_lock_init(&dcp->swapped_out_lock);
 
 	if (!dcp->hw.adopt_live_session) {
 		cpu_ctrl =
@@ -2038,18 +2257,32 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 			       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
 	}
 
-	dcp->rtk = devm_apple_rtkit_init(dev, dcp, "mbox", 0, &rtkit_ops);
-	if (IS_ERR(dcp->rtk))
-		return dev_err_probe(dev, PTR_ERR(dcp->rtk),
-				     "Failed to initialize RTKit\n");
+	/* Registering the mailbox can already expose RTKit buffer requests. */
+	ret = dcp_pin_live_session(dcp);
+	if (ret)
+		goto err_piodma;
+	dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0, &rtkit_ops);
+	if (IS_ERR(dcp->rtk)) {
+		ret = dev_err_probe(dev, PTR_ERR(dcp->rtk),
+				    "Failed to initialize RTKit\n");
+		goto err_piodma;
+	}
+	ret = devm_add_action_or_reset(dev, dcp_release_rtkit, dcp);
+	if (ret)
+		goto err_piodma;
 
 	if (dcp->hw.adopt_live_session)
 		dev_info(dev, "negotiating RTKit with the running DCP\n");
 
 	ret = apple_rtkit_wake(dcp->rtk);
-	if (ret)
-		return dev_err_probe(dev, ret,
-				     "Failed to boot RTKit: %d\n", ret);
+	if (ret) {
+		ret = dev_err_probe(dev, ret, "Failed to boot RTKit: %d\n", ret);
+		goto err_piodma;
+	}
+	return 0;
+
+err_piodma:
+	dcp_release_piodma_iommu_dev(dcp);
 	return ret;
 }
 
@@ -2063,6 +2296,34 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 
 	if (!dcp)
 		return;
+
+	if (dcp->retain_dma) {
+		/* No firmware stop is acknowledged: detach host users, never DMA. */
+		WRITE_ONCE(dcp->quiescing, true);
+		if (dcp->crtc && !dcp->drm_retained) {
+			drm_dev_get(dcp->crtc->base.dev);
+			dcp->drm_retained = true;
+		}
+		iomfb_queue_stop(dcp);
+		afk_quiesce(dcp->avep);
+		afk_quiesce(dcp->dptxep);
+		afk_quiesce(dcp->ibootep);
+		afk_quiesce(dcp->systemep);
+		afk_quiesce(dcp->dcpavservep);
+		if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
+			cancel_work_sync(&dcp->bl_register_wq);
+			cancel_work_sync(&dcp->bl_update_wq);
+		}
+		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+		cancel_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
+		cancel_work_sync(&dcp->vblank_wq);
+		if (dcp->connector)
+			cancel_work_sync(&dcp->connector->hotplug_wq);
+		if (dcp->typec_connector && dcp->typec_connector != dcp->connector)
+			cancel_work_sync(&dcp->typec_connector->hotplug_wq);
+		dev_warn(dev, "retaining live DCP DMA resources after unbind; reboot required\n");
+		return;
+	}
 
 	if (dcp->hdmi_hpd_irq)
 		disable_irq(dcp->hdmi_hpd_irq);
@@ -2098,11 +2359,8 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	if (dcp->shmem)
 		iomfb_shutdown(dcp);
 
-	if (dcp->piodma) {
-		dcp->iommu_dom = NULL;
-		of_platform_device_destroy(&dcp->piodma->dev, NULL);
-		dcp->piodma = NULL;
-	}
+	iomfb_queue_stop(dcp);
+	dcp_release_piodma_iommu_dev(dcp);
 
 	if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
 		cancel_work_sync(&dcp->bl_register_wq);
@@ -2125,12 +2383,16 @@ static const struct component_ops dcp_comp_ops = {
 
 static int dcp_platform_probe(struct platform_device *pdev)
 {
+	const struct apple_dcp_hw_data *hw = of_device_get_match_data(&pdev->dev);
 	enum dcp_firmware_version fw_compat;
 	struct device *dev = &pdev->dev;
 	struct apple_dcp *dcp;
 	int ret, surf, num_surfs;
 	u32 surf_en;
 	u32 mux_index;
+
+	if (dcp_session_retained(dev))
+		return dev_err_probe(dev, -EBUSY, "Previous live DCP session requires a reboot\n");
 
 	fw_compat = dcp_check_firmware_version(dev);
 	if (fw_compat == DCP_FIRMWARE_UNKNOWN)
@@ -2140,17 +2402,34 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	 * device trees. This prevents replacing simpledrm and ending up without
 	 * display.
 	 */
-	if (!of_property_present(dev->of_node, "apple,bw-scratch"))
+	if (!of_property_present(dev->of_node, "apple,bw-scratch") &&
+	    !hw->firmware_clock)
 		return dev_err_probe(dev, -ENODEV, "Incompatible devicetree! "
 			"Use devicetree matching this kernel.\n");
 
-	dcp = devm_kzalloc(dev, sizeof(*dcp), GFP_KERNEL);
+	dcp = kzalloc_obj(*dcp);
 	if (!dcp)
 		return -ENOMEM;
+	ret = devm_add_action_or_reset(dev, dcp_release_context, dcp);
+	if (ret)
+		return ret;
+
+	INIT_LIST_HEAD(&dcp->swapped_out_fbs);
+	mutex_init(&dcp->swapped_out_fbs_lock);
+	spin_lock_init(&dcp->backlight.lock);
+	iomfb_queue_init(dcp);
 
 	dcp->fw_compat = fw_compat;
 	dcp->dev = dev;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+
+	/* The domain use must survive driver-core DMA cleanup for a live session. */
+	ret = iommu_device_use_default_domain(dev);
+	if (ret)
+		return ret;
+	ret = devm_add_action_or_reset(dev, dcp_release_dma_domain, dcp);
+	if (ret)
+		return ret;
 	dcp->fixed_connector_type = dcp_connector_type_from_dt(dev->of_node);
 	dcp->connector_type = dcp->fixed_connector_type;
 	of_property_read_u32(dev->of_node, "apple,dcp-index", &dcp->index);
@@ -2196,6 +2475,13 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			set_bit(surf, dcp->iomfb_surfaces);
 		surf++;
 	}
+	/* The qualified J700 loader names surface zero rather than enabling it. */
+	if (of_machine_is_compatible("apple,j700") &&
+	    of_device_is_compatible(dev->of_node, "apple,t8140-dcp") &&
+	    num_surfs == 1 &&
+	    !of_property_read_u32(dev->of_node, "apple,iomfb-surfaces", &surf_en) &&
+	    surf_en == 0)
+		set_bit(0, dcp->iomfb_surfaces);
 
 	if (dcp->phy) {
 		int ret;
@@ -2300,6 +2586,24 @@ static void dcp_platform_remove(struct platform_device *pdev)
 
 static void dcp_platform_shutdown(struct platform_device *pdev)
 {
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (dcp && dcp->hw.adopt_live_session &&
+	    dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		/*
+		 * This firmware keeps scanning across soft DPMS and has no
+		 * qualified stop sequence. Component unbind releases the RTKit
+		 * devres group and the piodma domain while firmware may still
+		 * access them. Stop host submissions but keep the component and
+		 * its DMA resources alive until the system resets.
+		 */
+		iomfb_queue_stop(dcp);
+		cancel_work_sync(&dcp->bl_register_wq);
+		cancel_work_sync(&dcp->bl_update_wq);
+		return;
+	}
+
 	component_del(&pdev->dev, &dcp_comp_ops);
 }
 
@@ -2352,6 +2656,19 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8112 = {
 	.num_dptx_ports = 2,
 };
 
+/* The internal T8140 endpoint uses the measured H17P method profile. */
+static const struct resource t8140_firmware_clock =
+	DEFINE_RES_MEM(0x302800000, 0xbc000);
+
+static const struct apple_dcp_hw_data apple_dcp_hw_t8140 = {
+	.num_dptx_ports = 0,
+	.adopt_live_session = true,
+	.firmware_compat = DCP_FIRMWARE_H17P,
+	.firmware_clock = &t8140_firmware_clock,
+	.firmware_scratch = 0x20000,
+	.firmware_request = 0x68000,
+};
+
 /*
  * M5 (T8142) runs H17-generation DCP firmware with the H17G method numbering
  * and is left running by the bootloader.
@@ -2374,6 +2691,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_dcpext = {
 static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t6020-dcp", .data = &apple_dcp_hw_t6020,  },
 	{ .compatible = "apple,t8112-dcp", .data = &apple_dcp_hw_t8112,  },
+	{ .compatible = "apple,t8140-dcp", .data = &apple_dcp_hw_t8140,  },
 	{ .compatible = "apple,t8142-dcp", .data = &apple_dcp_hw_t8142,  },
 	{ .compatible = "apple,dcp",       .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,dcpext",    .data = &apple_dcp_hw_dcpext, },
@@ -2382,6 +2700,7 @@ static const struct of_device_id of_match[] = {
 MODULE_DEVICE_TABLE(of, of_match);
 
 static struct platform_driver apple_platform_driver = {
+	.driver_managed_dma = true,
 	.probe		= dcp_platform_probe,
 	.remove		= dcp_platform_remove,
 	.shutdown	= dcp_platform_shutdown,

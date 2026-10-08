@@ -1,0 +1,369 @@
+# SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/apple,dcp.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple display coprocessor
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description:
+  Apple's Display Co-Processor (DCP) drives internal and external displays
+  through an RTKit mailbox. Its piodma child uses a separate display DART
+  stream from the coprocessor itself.
+
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - enum:
+              - apple,t8103-dcp
+              - apple,t8112-dcp
+              - apple,t6000-dcp
+              - apple,t6020-dcp
+              - apple,t8140-dcp
+              - apple,t8142-dcp
+          - const: apple,dcp
+      - items:
+          - enum:
+              - apple,t8103-dcpext
+              - apple,t8112-dcpext
+              - apple,t6000-dcpext
+              - apple,t6020-dcpext
+          - const: apple,dcpext
+      - items:
+          - const: apple,t8140-dcpext
+          - const: apple,dcp
+
+  reg:
+    minItems: 2
+    maxItems: 7
+
+  reg-names:
+    minItems: 2
+    items:
+      - const: coproc
+      - const: disp-0
+      - enum: [disp-1, iop-vbar]
+      - enum: [disp-2, iop-vbar]
+      - enum: [disp-3, iop-vbar]
+      - enum: [disp-4, iop-vbar]
+      - const: iop-vbar
+
+  mboxes:
+    maxItems: 1
+
+  mbox-names:
+    items:
+      - const: mbox
+
+  iommus:
+    maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+  resets:
+    maxItems: 1
+
+  clocks:
+    minItems: 1
+    maxItems: 2
+
+  clock-names:
+    minItems: 1
+    items:
+      - const: clock-154
+      - const: clock-194
+
+  memory-region:
+    minItems: 1
+    maxItems: 64
+
+  memory-region-names:
+    minItems: 1
+    maxItems: 64
+
+  phys:
+    minItems: 1
+    maxItems: 8
+
+  phy-names:
+    minItems: 1
+    maxItems: 8
+    items:
+      pattern: '^(dp-phy|typec[0-9]+)$'
+
+  apple,bw-scratch:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: Phandle of the PMGR bandwidth register provider.
+          - description: Index into the provider's reg property.
+          - description: Index in the firmware display register table.
+          - description: Byte offset of the scratch register within the resource.
+    description: PMGR bandwidth scratch resource, display index and offset.
+
+  apple,bw-doorbell:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: Phandle of the PMGR bandwidth register provider.
+          - description: Index into the provider's reg property.
+          - description: Index in the firmware display register table.
+    description: Optional PMGR bandwidth doorbell resource and display index.
+
+  apple,iomfb-surfaces:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 4
+    items:
+      enum: [0, 1]
+    description: |
+      Per-slot enable flags, in slot order. The legacy J700 bootloader
+      supplies a single zero to select surface zero instead.
+
+  apple,power-lut-data-x:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 4
+    maxItems: 4
+    description: |
+      First dimension of the display firmware power lookup table. The
+      bootloader copies the disp0 ADT property verbatim, as a little-endian
+      32-bit word, for transfer to the display firmware.
+
+  apple,power-lut-data-y:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 4
+    maxItems: 4
+    description: |
+      Second dimension of the display firmware power lookup table, copied
+      verbatim from disp0 in the ADT as a little-endian 32-bit word.
+
+  apple,power-lut-data-xindex:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 52
+    maxItems: 52
+    description: |
+      First-axis indices of the display firmware power lookup table, copied
+      verbatim from disp0 in the ADT as thirteen little-endian 32-bit words.
+      These are firmware table inputs, not a Linux backlight range.
+
+  apple,power-lut-data-yindex:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 4
+    maxItems: 4
+    description: |
+      Second-axis index of the display firmware power lookup table, copied
+      verbatim from disp0 in the ADT as a little-endian 32-bit word.
+
+  apple,power-lut-data-lut:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 52
+    maxItems: 52
+    description: |
+      Display firmware power lookup table, copied verbatim from disp0 in
+      the ADT as thirteen little-endian 32-bit words. Linux passes these
+      values to the firmware without interpreting or changing them.
+
+  apple,firmware-version:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 3
+    maxItems: 5
+    description: Version reported by the loaded display firmware.
+
+  apple,firmware-compat:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 3
+    maxItems: 5
+    description: Loader-provided firmware ABI version used for IOMFB selection.
+
+  apple,connector-type:
+    enum: [HDMI-A, DP, USB-C]
+
+  apple,dcp-index:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Display coprocessor index on multi-DCP systems.
+
+  apple,dptx-phy:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: DisplayPort transmitter PHY selector.
+
+  apple,dptx-die:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Die containing the DisplayPort transmitter.
+
+  apple,notch-height:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Height in pixels reserved for the display notch.
+
+  apple,typec-mux-indices:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 4
+    description: Crossbar state for each Type-C display route.
+
+  apple,typec-dptx-phys:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 4
+    description: DisplayPort PHY index for each Type-C display route.
+
+  mux-controls:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 1
+    maxItems: 8
+
+  mux-control-names:
+    minItems: 1
+    maxItems: 8
+    items:
+      pattern: '^(dp-xbar|typec[0-9]+)$'
+
+  mux-index:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Crossbar state for a fixed output.
+
+  hdmi-hpd-gpios:
+    maxItems: 1
+
+  hdmi-pwren-gpios:
+    maxItems: 1
+
+  dp2hdmi-pwren-gpios:
+    maxItems: 1
+
+  '#address-cells':
+    const: 2
+
+  '#size-cells':
+    const: 2
+
+  piodma:
+    type: object
+    properties:
+      iommus:
+        maxItems: 1
+    required:
+      - iommus
+    additionalProperties: false
+
+  panel:
+    type: object
+    properties:
+      compatible:
+        oneOf:
+          - const: apple,panel
+          - items:
+              - pattern: '^apple,panel-j[0-9]+$'
+              - const: apple,panel
+          - items:
+              - pattern: '^apple,panel-j[0-9]+$'
+              - const: apple,panel-mini-led
+              - const: apple,panel
+      width-mm:
+        description: Physical panel width.
+      height-mm:
+        description: Physical panel height.
+      adj-height-mm:
+        description: Visible height below the notch.
+      apple,max-brightness:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Maximum firmware backlight level.
+    required:
+      - compatible
+    additionalProperties: false
+
+  typec-routes:
+    type: object
+    properties:
+      '#address-cells':
+        const: 1
+      '#size-cells':
+        const: 0
+    patternProperties:
+      '^route@[0-3]$':
+        type: object
+        properties:
+          reg:
+            maxItems: 1
+          mode-switch:
+            type: boolean
+          port:
+            $ref: /schemas/graph.yaml#/properties/port
+        required:
+          - reg
+          - mode-switch
+          - port
+        additionalProperties: false
+    required:
+      - '#address-cells'
+      - '#size-cells'
+    additionalProperties: false
+
+  ports:
+    $ref: /schemas/graph.yaml#/properties/ports
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - mboxes
+  - iommus
+  - apple,bw-scratch
+
+allOf:
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              const: apple,t8140-dcp
+    then:
+      properties:
+        apple,power-lut-data-x: false
+        apple,power-lut-data-y: false
+        apple,power-lut-data-xindex: false
+        apple,power-lut-data-yindex: false
+        apple,power-lut-data-lut: false
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum: ['apple,t8140-dcp', 'apple,t8140-dcpext']
+    then:
+      properties:
+        resets: false
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        dcp@231c00000 {
+            compatible = "apple,t8103-dcp", "apple,dcp";
+            reg = <0x2 0x31c00000 0x0 0x4000>,
+                  <0x2 0x30000000 0x0 0x3e8000>,
+                  <0x2 0x31320000 0x0 0x4000>,
+                  <0x2 0x31344000 0x0 0x4000>,
+                  <0x2 0x31800000 0x0 0x800000>,
+                  <0x2 0x3b3d0000 0x0 0x4000>;
+            reg-names = "coproc", "disp-0", "disp-1", "disp-2",
+                        "disp-3", "disp-4";
+            mboxes = <&dcp_mbox>;
+            mbox-names = "mbox";
+            iommus = <&dcp_dart 0>;
+            apple,bw-scratch = <&pmgr_dcp 0 5 0x14>;
+            apple,bw-doorbell = <&pmgr_dcp 1 6>;
+
+            piodma {
+                iommus = <&disp_dart 0>;
+            };
+        };
+    };
+...

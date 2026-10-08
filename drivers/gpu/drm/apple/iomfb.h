@@ -206,6 +206,8 @@ struct dcp_method_entry {
 };
 
 #define IOMFB_MAX_CB (1000)
+
+bool iomfb_validate_callback_h17p(int tag, u32 in_len, u32 out_len);
 struct apple_dcp;
 
 typedef bool (*iomfb_cb_handler)(struct apple_dcp *, int, void *, void *);

@@ -15,6 +15,7 @@
 #include <linux/kref.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
+#include <linux/overflow.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 
@@ -41,6 +42,7 @@ static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), flags1) == 0x40);
 struct dcp_wait_cookie {
 	struct kref refcount;
 	struct completion done;
+	u32 status;
 };
 
 static void release_wait_cookie(struct kref *ref)
@@ -60,9 +62,31 @@ IOMFB_THUNK_INOUT(get_color_remap_mode);
 IOMFB_THUNK_INOUT(last_client_close);
 IOMFB_THUNK_INOUT(abort_swaps_dcp);
 
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
+			    struct dcp_swap_submit_req_h17p *request,
+			    dcp_callback_t cb, void *cookie)
+{
+	const void *data = request;
+
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		iomfb_serialize_present_h17p(&dcp->present_h17p, request);
+		if (!iomfb_apply_backlight_h17p(dcp, request, &dcp->present_h17p)) {
+			if (cb)
+				cb(dcp, NULL, cookie);
+			return;
+		}
+		data = &dcp->present_h17p;
+	}
+
+	dcp_push(dcp, oob, &dcp_methods[dcpep_swap_submit], sizeof(*request),
+		 sizeof(struct dcp_swap_submit_resp_h17p), (void *)data, cb, cookie);
+}
+#else
 DCP_THUNK_INOUT(dcp_swap_submit, dcpep_swap_submit,
 		struct DCP_FW_NAME(dcp_swap_submit_req),
 		struct DCP_FW_NAME(dcp_swap_submit_resp));
+#endif
 
 DCP_THUNK_INOUT(dcp_swap_start, dcpep_swap_start, struct DCP_FW_NAME(dcp_swap_start_req),
 		struct DCP_FW_NAME(dcp_swap_start_resp));
@@ -76,7 +100,7 @@ DCP_THUNK_INOUT(dcp_set_power_state, dcpep_set_power_state,
  * channel.  Sent on the ordinary command channel it is never answered, which
  * strands the power transition and every later call behind it.
  */
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
 #define DCP_POWER_OOB	true
 #else
 #define DCP_POWER_OOB	false
@@ -219,108 +243,28 @@ static u32 dcpep_cb_zero(struct apple_dcp *dcp)
 	return 0;
 }
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-/*
- * Bind every framebuffer displaced by the commit that produced this swap to
- * that swap's id.
- *
- * The id only exists once the firmware answers swap_start, after the atomic
- * commit has queued its entries, so they are queued unarmed and stamped here.
- * Swap-start requests are serialized by the DCP command stack.
- */
-static void dcp_arm_swapped_out_fbs(struct apple_dcp *dcp, u32 swap_id)
-{
-	struct dcp_fb_reference *entry;
-	unsigned long flags;
-
-	spin_lock_irqsave(&dcp->swapped_out_lock, flags);
-	list_for_each_entry(entry, &dcp->swapped_out_fbs, head) {
-		if (entry->armed)
-			continue;
-		entry->swap_id = swap_id;
-		entry->armed = true;
-	}
-	spin_unlock_irqrestore(&dcp->swapped_out_lock, flags);
-}
-
-/*
- * Drop framebuffers whose unbinding swap has completed.
- *
- * Entries must be keyed to the swap that unbinds them, rather than the last
- * swap that happened to have completed when the atomic commit ran.  A later
- * successful completion also retires entries whose own completion was lost;
- * the signed difference keeps that comparison valid across a 32-bit wrap.
- */
-static void dcp_release_swapped_out_fbs(struct apple_dcp *dcp)
-{
-	struct dcp_fb_reference *entry, *tmp;
-	unsigned long flags;
-	LIST_HEAD(done);
-
-	/*
-	 * last_swap_id / have_swap_complete are only ever touched by the RTKit
-	 * worker, which is also the only caller of this function, so the lock
-	 * is here for the list alone.
-	 */
-	spin_lock_irqsave(&dcp->swapped_out_lock, flags);
-	while (!list_empty(&dcp->swapped_out_fbs)) {
-		entry = list_first_entry(&dcp->swapped_out_fbs,
-					 struct dcp_fb_reference, head);
-
-		/* Newest entries; their swap has not been started yet. */
-		if (!entry->armed)
-			break;
-		/* last_swap_id is 0 from kzalloc until a swap really lands. */
-		if (!dcp->have_swap_complete)
-			break;
-		/* Hold the old framebuffer for one additional completed swap. */
-		if ((s32)(dcp->last_swap_id - entry->swap_id) <= 0)
-			break;
-
-		list_move_tail(&entry->head, &done);
-	}
-	spin_unlock_irqrestore(&dcp->swapped_out_lock, flags);
-
-	/* drm_framebuffer_put() can sleep, so never call it under the lock. */
-	list_for_each_entry_safe(entry, tmp, &done, head) {
-		if (entry->fb)
-			drm_framebuffer_put(entry->fb);
-		list_del(&entry->head);
-		kfree(entry);
-	}
-}
-#else
-static void dcp_arm_swapped_out_fbs(struct apple_dcp *dcp, u32 swap_id) { }
-
-static void dcp_release_swapped_out_fbs(struct apple_dcp *dcp)
-{
-	while (!list_empty(&dcp->swapped_out_fbs)) {
-		struct dcp_fb_reference *entry;
-
-		entry = list_first_entry(&dcp->swapped_out_fbs,
-					 struct dcp_fb_reference, head);
-		if (entry->swap_id == dcp->last_swap_id)
-			break;
-		if (entry->fb)
-			drm_framebuffer_put(entry->fb);
-		list_del(&entry->head);
-		kfree(entry);
-	}
-}
-#endif
-
 static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 				   struct DCP_FW_NAME(dc_swap_complete_resp) *resp)
 {
 	ktime_t now = ktime_get();
+	bool retire = true;
+
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+	    !dcp_present_complete_h17p(&dcp->present_state_h17p, resp->swap_id)) {
+		dev_err(dcp->dev, "unexpected present completion %u\n", resp->swap_id);
+		dcp->crashed = true;
+		return;
+	}
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		retire = iomfb_present_complete_h17p(dcp);
+#endif
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
 	dcp->last_swap_id = resp->swap_id;
-
-	dcp_drm_crtc_page_flip(dcp, now);
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-	dcp->have_swap_complete = true;
-	dcp_release_swapped_out_fbs(dcp);
-#endif
+	if (retire) {
+		dcp_release_retained_framebuffers(dcp, resp->swap_id);
+		dcp_drm_crtc_page_flip(dcp, now);
+	}
 	if (dcp->crc_enabled) {
 		u32 crc32 = 0;
 		drm_crtc_add_crc_entry(&dcp->crtc->base, true, resp->swap_id, &crc32);
@@ -394,6 +338,13 @@ static void dcp_fill_dfb_surface(struct apple_dcp *dcp, u8 *s)
 	s[0x035] = 0x02;
 	s[0x051] = 0x01;
 	s[0x149] = 0x01;
+
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		/* Internal H17P default registration differs from the older profile. */
+		memcpy(s + 11, "ARGB", 4);
+		put_unaligned_le32(0x00e44000, s + 41);
+		s[53] = BIT(2);
+	}
 }
 
 /*
@@ -487,6 +438,11 @@ static void iomfb_cb_pr_publish(struct apple_dcp *dcp, struct iomfb_property *pr
 	switch (prop->id) {
 	case IOMFB_PROPERTY_NITS:
 	{
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+		/* Measured H17P takeover comes from the powerlog hint interface. */
+		if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+			break;
+#endif
 		if (dcp_has_panel(dcp)) {
 			dcp->brightness.nits = prop->value / dcp->brightness.scale;
 			/* notify backlight device of the initial brightness */
@@ -546,11 +502,13 @@ static void iomfbep_cb_set_fx_prop(struct apple_dcp *dcp, struct iomfb_set_fx_pr
  * PIODMA is separate from the main DCP and uses own IOVA space on a dedicated
  * stream of the display DART, rather than the expected DCP DART.
  */
-static struct DCP_FW_NAME(dcp_map_buf_resp) dcpep_cb_map_piodma(struct apple_dcp *dcp,
-						   struct dcp_map_buf_req *req)
+static bool dcpep_map_piodma(struct apple_dcp *dcp,
+			     struct dcp_map_buf_req *req,
+			     struct DCP_FW_NAME(dcp_map_buf_resp) * resp)
 {
 	struct dcp_mem_descriptor *memdesc;
 	struct sg_table *map;
+	size_t size;
 	ssize_t ret;
 
 	if (req->buffer >= ARRAY_SIZE(dcp->memdesc))
@@ -558,81 +516,112 @@ static struct DCP_FW_NAME(dcp_map_buf_resp) dcpep_cb_map_piodma(struct apple_dcp
 
 	memdesc = &dcp->memdesc[req->buffer];
 	map = &memdesc->map;
+	size = ALIGN(memdesc->size, SZ_16K);
 
-	if (!map->sgl)
+	if (!test_bit(req->buffer, dcp->memdesc_map) || !map->sgl ||
+	    memdesc->piodma_mapped || !dcp->iommu_dom)
 		goto reject;
 
 	/* use the piodma iommu domain to map against the right IOMMU */
 	ret = iommu_map_sgtable(dcp->iommu_dom, memdesc->dva, map,
 				IOMMU_READ | IOMMU_WRITE);
 
-	/* HACK: expect size to be 16K aligned since the iommu API only maps
-	 *       full pages
-	 */
-	if (ret < 0 || ret != ALIGN(memdesc->size, SZ_16K)) {
-		dev_err(dcp->dev, "iommu_map_sgtable() returned %zd instead of expected buffer size of %zu\n", ret, memdesc->size);
+	if (ret != (ssize_t)size) {
+		dev_err(dcp->dev,
+			"iommu_map_sgtable() returned %zd instead of %zu\n",
+			ret, size);
+		if (ret > 0)
+			iommu_unmap(dcp->iommu_dom, memdesc->dva, ret);
 		goto reject;
 	}
 
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-	/* remembered so release_mem_desc() can tear a stale mapping down */
 	memdesc->piodma_mapped = true;
 
 	/* the H17P reply echoes the buffer index */
-	return (struct DCP_FW_NAME(dcp_map_buf_resp)){
+	*resp = (struct DCP_FW_NAME(dcp_map_buf_resp)) {
 		.buffer = req->buffer,
 		.dva = memdesc->dva,
 	};
 #else
-	return (struct DCP_FW_NAME(dcp_map_buf_resp)){ .dva = memdesc->dva };
+	*resp = (struct DCP_FW_NAME(dcp_map_buf_resp)) { .dva = memdesc->dva };
 #endif
+	return true;
 
 reject:
 	dev_err(dcp->dev, "denying map of invalid buffer %llx for piodma\n",
 		req->buffer);
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-	return (struct DCP_FW_NAME(dcp_map_buf_resp)){
-		.buffer = req->buffer,
-		.dva = 0,
-	};
-#else
-	return (struct DCP_FW_NAME(dcp_map_buf_resp)){ .ret = EINVAL };
-#endif
+	return false;
 }
 
-static void dcpep_cb_unmap_piodma(struct apple_dcp *dcp,
-				  struct dcp_unmap_buf_resp *resp)
+static struct DCP_FW_NAME(dcp_map_buf_resp) dcpep_cb_map_piodma(struct apple_dcp *dcp,
+						   struct dcp_map_buf_req *req)
+{
+	struct DCP_FW_NAME(dcp_map_buf_resp) resp = { 0 };
+
+	if (dcpep_map_piodma(dcp, req, &resp))
+		return resp;
+
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+	resp.buffer = req->buffer;
+#else
+	resp.ret = EINVAL;
+#endif
+	return resp;
+}
+
+static bool dcpep_unmap_piodma(struct apple_dcp *dcp,
+			       struct dcp_unmap_buf_resp *request)
 {
 	struct dcp_mem_descriptor *memdesc;
+	size_t size, unmapped;
 
-	if (resp->buffer >= ARRAY_SIZE(dcp->memdesc)) {
+	if (request->buffer >= ARRAY_SIZE(dcp->memdesc)) {
 		dev_warn(dcp->dev, "unmap request for out of range buffer %llu\n",
-			 resp->buffer);
-		return;
+			 request->buffer);
+		return false;
 	}
 
-	memdesc = &dcp->memdesc[resp->buffer];
+	memdesc = &dcp->memdesc[request->buffer];
 
-	if (!memdesc->buf) {
+	if (!test_bit(request->buffer, dcp->memdesc_map) || !memdesc->buf ||
+	    !dcp->iommu_dom)
+		goto not_mapped;
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (!memdesc->piodma_mapped)
+		goto not_mapped;
+#endif
+
+	if (memdesc->dva != request->dva) {
 		dev_warn(dcp->dev,
-			 "unmap for non-mapped buffer %llu iova:0x%08llx\n",
-			 resp->buffer, resp->dva);
-		return;
-	}
-
-	if (memdesc->dva != resp->dva) {
-		dev_warn(dcp->dev, "unmap buffer %llu address mismatch "
-			 "memdesc.dva:%llx dva:%llx\n", resp->buffer,
-			 memdesc->dva, resp->dva);
-		return;
+			 "unmap buffer %llu address mismatch memdesc.dva:%llx dva:%llx\n",
+			 request->buffer,
+			 memdesc->dva, request->dva);
+		return false;
 	}
 
 	/* use the piodma iommu domain to unmap from the right IOMMU */
-	/* HACK: expect size to be 16K aligned since the iommu API only maps
-	 *       full pages
-	 */
-	iommu_unmap(dcp->iommu_dom, memdesc->dva, ALIGN(memdesc->size, SZ_16K));
+	size = ALIGN(memdesc->size, SZ_16K);
+	unmapped = iommu_unmap(dcp->iommu_dom, memdesc->dva, size);
+	if (unmapped != size) {
+		dev_err(dcp->dev, "iommu_unmap() returned %zu instead of %zu\n",
+			unmapped, size);
+		return false;
+	}
 	memdesc->piodma_mapped = false;
+	return true;
+
+not_mapped:
+	dev_warn(dcp->dev,
+		 "unmap for non-mapped buffer %llu iova:0x%08llx\n",
+		 request->buffer, request->dva);
+	return false;
+}
+
+static void dcpep_cb_unmap_piodma(struct apple_dcp *dcp,
+				  struct dcp_unmap_buf_resp *request)
+{
+	dcpep_unmap_piodma(dcp, request);
 }
 
 /*
@@ -645,44 +634,53 @@ dcpep_cb_allocate_buffer(struct apple_dcp *dcp,
 			 struct dcp_allocate_buffer_req *req)
 {
 	struct dcp_allocate_buffer_resp resp = { 0 };
-	struct dcp_mem_descriptor *memdesc;
-	size_t size;
+	struct dcp_mem_descriptor allocated = { 0 };
+	size_t size, rounded;
 	u32 id;
+	int ret;
 
-	resp.dva_size = ALIGN(req->size, 4096);
-	resp.mem_desc_id =
-		find_first_zero_bit(dcp->memdesc_map, DCP_MAX_MAPPINGS);
+	/* Validate both wire-size and IOMMU-page rounding before allocating. */
+	if (!req->size || req->size > SIZE_MAX ||
+	    check_add_overflow((size_t)req->size, (size_t)4095, &rounded))
+		return resp;
+	allocated.size = round_down(rounded, 4096);
+	if (check_add_overflow(allocated.size, (size_t)SZ_16K - 1, &rounded))
+		return resp;
+	size = round_down(rounded, SZ_16K);
 
-	if (resp.mem_desc_id >= DCP_MAX_MAPPINGS) {
+	id = find_first_zero_bit(dcp->memdesc_map, DCP_MAX_MAPPINGS);
+
+	if (id >= DCP_MAX_MAPPINGS) {
 		dev_warn(dcp->dev, "DCP overflowed mapping table, ignoring\n");
-		resp.dva_size = 0;
-		resp.mem_desc_id = 0;
 		return resp;
 	}
-	id = resp.mem_desc_id;
+
+	allocated.buf = dma_alloc_coherent(dcp->dev, size, &allocated.dva,
+					   GFP_KERNEL);
+	if (!allocated.buf)
+		return resp;
+
+	ret = dma_get_sgtable(dcp->dev, &allocated.map, allocated.buf,
+			      allocated.dva, size);
+	if (ret) {
+		dma_free_coherent(dcp->dev, size, allocated.buf, allocated.dva);
+		return resp;
+	}
+
+	/* Callbacks are serialized; publish only a fully initialized descriptor. */
+	dcp->memdesc[id] = allocated;
 	set_bit(id, dcp->memdesc_map);
-
-	memdesc = &dcp->memdesc[id];
-
-	memdesc->piodma_mapped = false;
-	memdesc->size = resp.dva_size;
-	/* HACK: align size to 16K since the iommu API only maps full pages */
-	size = ALIGN(resp.dva_size, SZ_16K);
-	memdesc->buf = dma_alloc_coherent(dcp->dev, size,
-					  &memdesc->dva, GFP_KERNEL);
-
-	dma_get_sgtable(dcp->dev, &memdesc->map, memdesc->buf, memdesc->dva,
-			size);
-	resp.dva = memdesc->dva;
+	resp.mem_desc_id = id;
+	resp.dva_size = allocated.size;
+	resp.dva = allocated.dva;
 
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 	/*
-	 * H17P firmware also needs the physical address: it loads the APT M3
-	 * microcode through it, and with a zero paddr the timing sequencer
-	 * comes up and is powered straight back down.
+	 * Linux allocation traces correlate the first H17P reply address with
+	 * the first SG page. The remaining pages need not be contiguous.
 	 */
-	if (memdesc->map.sgl)
-		resp.paddr = sg_phys(memdesc->map.sgl);
+	if (allocated.map.sgl)
+		resp.paddr = sg_phys(allocated.map.sgl);
 #endif
 
 	return resp;
@@ -691,7 +689,7 @@ dcpep_cb_allocate_buffer(struct apple_dcp *dcp,
 static u8 dcpep_cb_release_mem_desc(struct apple_dcp *dcp, u32 *mem_desc_id)
 {
 	struct dcp_mem_descriptor *memdesc;
-	size_t size;
+	size_t size, unmapped;
 	u32 id = *mem_desc_id;
 
 	if (id >= DCP_MAX_MAPPINGS) {
@@ -700,7 +698,7 @@ static u8 dcpep_cb_release_mem_desc(struct apple_dcp *dcp, u32 *mem_desc_id)
 		return 0;
 	}
 
-	if (!test_and_clear_bit(id, dcp->memdesc_map)) {
+	if (!test_bit(id, dcp->memdesc_map)) {
 		dev_warn(dcp->dev, "unmap request for unused mem_desc_id %u\n",
 			 id);
 		return 0;
@@ -721,11 +719,21 @@ static u8 dcpep_cb_release_mem_desc(struct apple_dcp *dcp, u32 *mem_desc_id)
 		dev_warn(dcp->dev,
 			 "releasing buffer %u while still mapped for piodma; unmapping first\n",
 			 id);
-		iommu_unmap(dcp->iommu_dom, memdesc->dva, size);
+		if (!dcp->iommu_dom)
+			return 0;
+		unmapped = iommu_unmap(dcp->iommu_dom, memdesc->dva, size);
+		if (unmapped != size) {
+			dev_err(dcp->dev,
+				"failed to unmap buffer %u before release: %zu of %zu\n",
+				id, unmapped, size);
+			return 0;
+		}
 		memdesc->piodma_mapped = false;
 	}
+	clear_bit(id, dcp->memdesc_map);
 
 	if (memdesc->buf) {
+		sg_free_table(&memdesc->map);
 		dma_free_coherent(dcp->dev, size, memdesc->buf, memdesc->dva);
 		memdesc->buf = NULL;
 		memset(&memdesc->map, 0, sizeof(memdesc->map));
@@ -991,8 +999,12 @@ static void boot_5(struct apple_dcp *dcp, void *out, void *cookie)
 static void boot_4b(struct apple_dcp *dcp, void *out, void *cookie)
 {
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-	u32 v_true = 1;
-	dcp_late_init_signal(dcp, false, &v_true, boot_5, NULL);
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	u32 value = dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G;
+#else
+	u32 value = 1;
+#endif
+	dcp_late_init_signal(dcp, false, &value, boot_5, NULL);
 #else
 	dcp_late_init_signal(dcp, false, boot_5, NULL);
 #endif
@@ -1220,6 +1232,7 @@ static u64 dcpep_cb_get_time(struct apple_dcp *dcp)
 struct dcp_swap_cookie {
 	struct kref refcount;
 	struct completion done;
+	u32 status;
 	u32 swap_id;
 };
 
@@ -1242,9 +1255,10 @@ static void release_swap_cookie(struct kref *ref)
  * format two bytes late and its surface check rejects the swap as an
  * unsupported format.
  *
- * Shift each surface's tail down by two rather than fork the shared struct.
+ * H17G retains this public packing path. The measured H17P profile uses
+ * a separate wire record with the SPEC's 0x588 swap boundary.
  */
-static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp)
+static void dcp_h17p_prepare_swap(struct apple_dcp *dcp)
 {
 	struct DCP_FW_NAME(dcp_swap_submit_req) *req = &DCP_FW_UNION(dcp->swap);
 	unsigned int i;
@@ -1263,6 +1277,10 @@ static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp)
 	 */
 	req->swap.h17p_pre_swap_id[0x00] = 2;
 	req->swap.h17p_pre_swap_id[0x28] = 3;
+
+	/* The measured H17P layout is serialized without shifting its surfaces. */
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		return;
 
 	for (i = 0; i < SWAP_SURFACES; i++) {
 		u8 *p = (u8 *)&req->surf[i];
@@ -1293,47 +1311,162 @@ static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp)
 	}
 }
 #else
-static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp) { }
+static void dcp_h17p_prepare_swap(struct apple_dcp *dcp) { }
 #endif
+
+static bool dcp_present_retires(struct apple_dcp *dcp)
+{
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		return !iomfb_present_brightness_only_h17p(dcp);
+#endif
+	return true;
+}
+
+static void dcp_present_failed(struct apple_dcp *dcp)
+{
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		iomfb_present_failed_h17p(dcp);
+#endif
+}
+
+static bool dcp_present_begin(struct apple_dcp *dcp, u32 swap_id)
+{
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+	    !dcp_present_begin_h17p(&dcp->present_state_h17p, swap_id)) {
+		dev_err(dcp->dev, "overlapping present %u\n", swap_id);
+		dcp->crashed = true;
+		return false;
+	}
+#endif
+	return true;
+}
+
+static bool dcp_present_submit(struct apple_dcp *dcp, u32 swap_id, bool accepted)
+{
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+	    !dcp_present_submit_h17p(&dcp->present_state_h17p, swap_id, accepted)) {
+		dev_err(dcp->dev, "unexpected present submission %u\n", swap_id);
+		dcp->crashed = true;
+		return false;
+	}
+#endif
+	return true;
+}
+
+static void dcp_prepare_clear_swap(struct apple_dcp *dcp, void *request)
+{
+	typeof(DCP_FW_UNION(dcp->swap)) *swap = request;
+
+	/* Clear surfaces. */
+	memset(swap, 0, sizeof(*swap));
+
+	swap->swap.swap_enabled =
+		swap->swap.swap_completed = IOMFB_SET_BACKGROUND | 0x7;
+	swap->swap.bg_color = 0xFF000000;
+
+	/*
+	 * Turn off the backlight. This matters because the DCP's idea of
+	 * backlight brightness gets desynced after a power change, and it
+	 * needs to be told it's going to turn off so it will consider the
+	 * subsequent update on poweron an actual change and restore the
+	 * brightness.
+	 */
+	if (dcp_has_panel(dcp)) {
+		swap->swap.bl_unk = 1;
+		swap->swap.bl_value = 0;
+		swap->swap.bl_power = 0;
+	}
+
+	/* Null all surfaces */
+	for (int l = 0; l < SWAP_SURFACES; l++)
+		swap->surf_null[l] = true;
+#if DCP_FW_VERSION(13, 2, 0) <= DCP_FW_VER
+#if DCP_FW_VERSION(26, 0, 0) > DCP_FW_VER
+	for (int l = 0; l < 5; l++)
+		swap->surf2_null[l] = true;
+#endif
+	swap->unknown_pointer_null = true;
+	swap->unknown_output_null = true;
+#endif
+}
 
 static void dcp_swap_cleared(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	struct DCP_FW_NAME(dcp_swap_submit_resp) *resp = data;
+	struct dcp_swap_cookie *info = cookie;
+	u32 swap_id = DCP_FW_UNION(dcp->swap).swap.swap_id;
+	u32 status = resp ? resp->ret : ~0U;
 
-	if (cookie) {
-		struct dcp_swap_cookie *info = cookie;
+	if (!dcp_present_submit(dcp, swap_id, !status))
+		status = ~0U;
+
+	if (status) {
+		dev_err(dcp->dev, "swap_clear failed! status %u\n", status);
+		dcp_present_failed(dcp);
+		if (dcp_present_retires(dcp)) {
+			dcp_unarm_retained_framebuffers(dcp, swap_id);
+			dcp_drm_crtc_vblank(dcp->crtc);
+		}
+	}
+	if (info) {
+		WRITE_ONCE(info->status, status);
 		complete(&info->done);
 		kref_put(&info->refcount, release_swap_cookie);
 	}
-
-	if (resp->ret) {
-		dev_err(dcp->dev, "swap_clear failed! status %u\n", resp->ret);
-		dcp_drm_crtc_vblank(dcp->crtc);
-		return;
-	}
-
-	dcp_release_swapped_out_fbs(dcp);
 }
 
 static void dcp_swap_clear_started(struct apple_dcp *dcp, void *data,
 				   void *cookie)
 {
 	struct DCP_FW_NAME(dcp_swap_start_resp) *resp = data;
-	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
-	dcp_arm_swapped_out_fbs(dcp, resp->swap_id);
+	struct dcp_swap_cookie *info = cookie;
 
-	if (cookie) {
-		struct dcp_swap_cookie *info = cookie;
-		info->swap_id = resp->swap_id;
+	if (!resp || resp->ret) {
+		if (info) {
+			WRITE_ONCE(info->status, resp ? resp->ret : ~0U);
+			complete(&info->done);
+			kref_put(&info->refcount, release_swap_cookie);
+		}
+		dcp_drm_crtc_vblank(dcp->crtc);
+		return;
 	}
+	if (!dcp_present_begin(dcp, resp->swap_id)) {
+		if (info) {
+			WRITE_ONCE(info->status, ~0U);
+			complete(&info->done);
+			kref_put(&info->refcount, release_swap_cookie);
+		}
+		dcp_drm_crtc_vblank(dcp->crtc);
+		return;
+	}
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		dcp_prepare_clear_swap(dcp, &DCP_FW_UNION(dcp->swap));
+#endif
+	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
+	if (dcp_present_retires(dcp))
+		dcp_arm_retained_framebuffers(dcp, resp->swap_id);
 
-	dcp_h17p_fix_swap_surfaces(dcp);
+	if (info)
+		info->swap_id = resp->swap_id;
+
+	dcp_h17p_prepare_swap(dcp);
 	dcp_swap_submit(dcp, false, &DCP_FW_UNION(dcp->swap), dcp_swap_cleared, cookie);
 }
 
 static void dcp_on_final(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct dcp_wait_cookie *wait = cookie;
+
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+	    out && get_unaligned_le64(out) == 1)
+		WRITE_ONCE(dcp->pipe_enabled_h17p, true);
+#endif
 
 	if (wait) {
 		complete(&wait->done);
@@ -1372,10 +1505,16 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 	u32 handle;
 	dev_info(dcp->dev, "dcp_poweron() starting\n");
 
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		iomfb_opaque_x_reset_h17p(dcp);
+#endif
+
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie)
 		return;
 
+	cookie->status = ~0U;
 	init_completion(&cookie->done);
 	kref_init(&cookie->refcount);
 	/* increase refcount to ensure the receiver has a reference */
@@ -1425,12 +1564,24 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 static void complete_set_powerstate(struct apple_dcp *dcp, void *out,
 				    void *cookie)
 {
+	struct dcp_set_power_state_resp *resp = out;
 	struct dcp_wait_cookie *wait = cookie;
 
 	if (wait) {
+		WRITE_ONCE(wait->status, resp ? resp->ret : ~0U);
 		complete(&wait->done);
 		kref_put(&wait->refcount, release_wait_cookie);
 	}
+}
+
+static bool dcp_power_stop_confirmed(struct dcp_wait_cookie *cookie)
+{
+	/* H17P stop semantics still require hardware qualification. */
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	return false;
+#else
+	return READ_ONCE(cookie->status) == 0;
+#endif
 }
 
 static void last_client_closed_poff(struct apple_dcp *dcp, void *out, void *cookie)
@@ -1460,52 +1611,36 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	struct dcp_swap_cookie *cookie;
 	struct dcp_wait_cookie *poff_cookie;
 	struct DCP_FW_NAME(dcp_swap_start_req) swap_req = { 0 };
-	struct DCP_FW_NAME(dcp_swap_submit_req) *swap = &DCP_FW_UNION(dcp->swap);
+	typeof(DCP_FW_UNION(dcp->swap)) *swap = &DCP_FW_UNION(dcp->swap);
+
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	/* The measured profile has no safe pipe-off or surface-free transition. */
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		return;
+#endif
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie)
 		return;
+	cookie->status = ~0U;
 	init_completion(&cookie->done);
 	kref_init(&cookie->refcount);
 	/* increase refcount to ensure the receiver has a reference */
 	kref_get(&cookie->refcount);
 
-	// clear surfaces
-	memset(swap, 0, sizeof(*swap));
-
-	swap->swap.swap_enabled =
-		swap->swap.swap_completed = IOMFB_SET_BACKGROUND | 0x7;
-	swap->swap.bg_color = 0xFF000000;
-
-	/*
-	 * Turn off the backlight. This matters because the DCP's idea of
-	 * backlight brightness gets desynced after a power change, and it
-	 * needs to be told it's going to turn off so it will consider the
-	 * subsequent update on poweron an actual change and restore the
-	 * brightness.
-	 */
-	if (dcp_has_panel(dcp)) {
-		swap->swap.bl_unk = 1;
-		swap->swap.bl_value = 0;
-		swap->swap.bl_power = 0;
-	}
-
-	/* Null all surfaces */
-	for (int l = 0; l < SWAP_SURFACES; l++)
-		swap->surf_null[l] = true;
-#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-#if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
-	for (int l = 0; l < 5; l++)
-		swap->surf2_null[l] = true;
-#endif
-	swap->unkU32Ptr_null = true;
-	swap->unkU32out_null = true;
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
+		dcp_prepare_clear_swap(dcp, swap);
+#else
+	dcp_prepare_clear_swap(dcp, swap);
 #endif
 
 	dcp_swap_start(dcp, false, &swap_req, dcp_swap_clear_started, cookie);
 
 	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(50));
 	swap_id = cookie->swap_id;
+	if (READ_ONCE(cookie->status))
+		ret = 0;
 	kref_put(&cookie->refcount, release_swap_cookie);
 	if (ret <= 0) {
 		dcp->crashed = true;
@@ -1517,6 +1652,7 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	poff_cookie = kzalloc(sizeof(*poff_cookie), GFP_KERNEL);
 	if (!poff_cookie)
 		return;
+	poff_cookie->status = ~0U;
 	init_completion(&poff_cookie->done);
 	kref_init(&poff_cookie->refcount);
 	/* increase refcount to ensure the receiver has a reference */
@@ -1535,10 +1671,15 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 
 	if (ret == 0)
 		dev_warn(dcp->dev, "setPowerState(0) timeout %u ms\n", 1000);
-	else if (ret > 0)
+	else if (ret > 0) {
 		dev_dbg(dcp->dev,
 			"setPowerState(0) finished with %d ms to spare",
 			jiffies_to_msecs(ret));
+		if (dcp_power_stop_confirmed(poff_cookie))
+			dcp_release_all_retained_framebuffers(dcp);
+		else
+			dev_warn(dcp->dev, "scanout stop was not confirmed\n");
+	}
 
 	kref_put(&poff_cookie->refcount, release_wait_cookie);
 
@@ -1570,9 +1711,15 @@ void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp)
 
 	struct dcp_wait_cookie *cookie;
 
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		return;
+#endif
+
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie)
 		return;
+	cookie->status = ~0U;
 	init_completion(&cookie->done);
 	kref_init(&cookie->refcount);
 	/* increase refcount to ensure the receiver has a reference */
@@ -1765,27 +1912,50 @@ TRAMPOLINE_OUT(trampoline_create_backlight_service, dcpep_cb_create_backlight_se
 static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	struct DCP_FW_NAME(dcp_swap_submit_resp) *resp = data;
+	u32 swap_id = DCP_FW_UNION(dcp->swap).swap.swap_id;
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	u32 status = resp ? resp->ret : ~0U;
+#else
+	u32 status = resp->ret;
+#endif
 
-	if (resp->ret) {
-		dev_err(dcp->dev, "swap failed! status %u\n", resp->ret);
-		dcp_drm_crtc_vblank(dcp->crtc);
+	if (!dcp_present_submit(dcp, swap_id, !status))
+		status = ~0U;
+
+	if (status) {
+		dev_err(dcp->dev, "swap failed! status %u\n", status);
+		dcp_present_failed(dcp);
+		if (dcp_present_retires(dcp)) {
+			dcp_unarm_retained_framebuffers(dcp, swap_id);
+			dcp_drm_crtc_vblank(dcp->crtc);
+		}
 		return;
 	}
 	dcp->swap_start = ktime_get();
 	dcp->swap_submit_timestamp = arch_timer_read_counter();
-
-	dcp_release_swapped_out_fbs(dcp);
 }
 
 static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	struct DCP_FW_NAME(dcp_swap_start_resp) *resp = data;
 
+	if (!resp || resp->ret) {
+		dev_err(dcp->dev, "swap_start was rejected\n");
+		if (dcp_present_retires(dcp))
+			dcp_drm_crtc_vblank(dcp->crtc);
+		return;
+	}
+	if (!dcp_present_begin(dcp, resp->swap_id)) {
+		if (dcp_present_retires(dcp))
+			dcp_drm_crtc_vblank(dcp->crtc);
+		return;
+	}
 	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
-	dcp_arm_swapped_out_fbs(dcp, resp->swap_id);
+	if (dcp_present_retires(dcp))
+		dcp_arm_retained_framebuffers(dcp, resp->swap_id);
 
 	trace_iomfb_swap_submit(dcp, resp->swap_id);
-	dcp_h17p_fix_swap_surfaces(dcp);
+	dcp_h17p_prepare_swap(dcp);
 	dcp_swap_submit(dcp, false, &DCP_FW_UNION(dcp->swap), dcp_swapped, NULL);
 }
 
@@ -1805,6 +1975,13 @@ static void do_swap(struct apple_dcp *dcp, void *data, void *cookie)
  * H17P expects A428 between set_matrix and swap_start, with 0x10000 (1.0 in
  * 16.16 fixed point), the same identity value the D006 reply carries.
  */
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+void iomfb_present_backlight_h17p(struct apple_dcp *dcp)
+{
+	do_swap(dcp, NULL, NULL);
+}
+#endif
+
 static void dcp_pre_swap_a428(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	u32 identity = 0x10000;
@@ -1900,6 +2077,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		return -ENOMEM;
 	}
 
+	cookie->status = ~0U;
 	init_completion(&cookie->done);
 	kref_init(&cookie->refcount);
 	/* increase refcount to ensure the receiver has a reference */
@@ -1977,6 +2155,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	struct DCP_FW_NAME(dcp_swap_submit_req) *req = &DCP_FW_UNION(dcp->swap);
 	int plane_idx, l;
 	int has_surface = 0;
+	bool update_brightness;
 
 	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 
@@ -1989,8 +2168,8 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	for (l = 0; l < 5; l++)
 		req->surf2_null[l] = true;
 #endif
-	req->unkU32Ptr_null = true;
-	req->unkU32out_null = true;
+	req->unknown_pointer_null = true;
+	req->unknown_output_null = true;
 #endif
 
 	/*
@@ -2013,44 +2192,6 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 		l = apl_plane->iomfb_surf;
 		req->swap.swap_enabled |= BIT(l);
-
-		if (old_state->fb && new_state->fb != old_state->fb) {
-			/*
-			 * Race condition between a framebuffer unbind getting
-			 * swapped out and GEM unreferencing a framebuffer. If
-			 * we lose the race, the display gets IOVA faults and
-			 * the DCP crashes. We need to extend the lifetime of
-			 * the drm_framebuffer (and hence the GEM object) until
-			 * after we get a swap complete for the swap unbinding
-			 * it.
-			 */
-			struct dcp_fb_reference *entry =
-				kzalloc(sizeof(*entry), GFP_KERNEL);
-			if (entry) {
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-				unsigned long flags;
-
-				entry->fb = old_state->fb;
-				/*
-				 * Left unarmed: the id of the swap that
-				 * unbinds this framebuffer is not known until
-				 * the firmware answers swap_start.
-				 */
-				spin_lock_irqsave(&dcp->swapped_out_lock,
-						  flags);
-				list_add_tail(&entry->head,
-					      &dcp->swapped_out_fbs);
-				spin_unlock_irqrestore(&dcp->swapped_out_lock,
-						       flags);
-#else
-				entry->fb = old_state->fb;
-				entry->swap_id = dcp->last_swap_id;
-				list_add_tail(&entry->head,
-					      &dcp->swapped_out_fbs);
-#endif
-			}
-			drm_framebuffer_get(old_state->fb);
-		}
 
 		if (!new_state->fb || !new_state->visible) {
 			continue;
@@ -2116,7 +2257,12 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	req->swap.swap_completed = req->swap.swap_enabled;
 
 	/* update brightness if changed */
-	if (dcp_has_panel(dcp) && dcp->brightness.update) {
+	update_brightness = dcp_has_panel(dcp) && dcp->brightness.update;
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	update_brightness = update_brightness &&
+			    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G;
+#endif
+	if (update_brightness) {
 		req->swap.bl_unk = 1;
 		req->swap.bl_value = dcp->brightness.dac;
 		req->swap.bl_power = 0x40;
@@ -2331,6 +2477,28 @@ void DCP_FW_NAME(iomfb_shutdown)(struct apple_dcp *dcp)
 	struct DCP_FW_NAME(dcp_set_power_state_req) req = {
 		/* defaults are ok */
 	};
+	struct dcp_wait_cookie *cookie;
+	int ret;
 
-	dcp_set_power_state(dcp, DCP_POWER_OOB, &req, NULL, NULL);
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		iomfb_queue_stop(dcp);
+		return;
+	}
+#endif
+
+	cookie = kzalloc_obj(*cookie);
+	if (!cookie)
+		return;
+	cookie->status = ~0U;
+	init_completion(&cookie->done);
+	kref_init(&cookie->refcount);
+	kref_get(&cookie->refcount);
+	dcp_set_power_state(dcp, DCP_POWER_OOB, &req, complete_set_powerstate, cookie);
+	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(1000));
+	if (ret > 0 && dcp_power_stop_confirmed(cookie))
+		dcp_release_all_retained_framebuffers(dcp);
+	else
+		dev_warn(dcp->dev, "shutdown scanout stop was not confirmed\n");
+	kref_put(&cookie->refcount, release_wait_cookie);
 }

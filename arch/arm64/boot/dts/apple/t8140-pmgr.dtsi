@@ -73,6 +73,24 @@
 		apple,always-on; /* handed over running, cannot be reset */
 	};
 
+	ps_disp_sys: power-controller@280 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x280 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "disp_sys";
+		status = "disabled";
+	};
+
+	ps_dispext0_sys: power-controller@288 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x288 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dispext0_sys";
+		status = "disabled";
+	};
+
 	ps_apcie_sys_gp: power-controller@2a0 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x2a0 4>;
@@ -97,6 +115,36 @@
 		#reset-cells = <0>;
 		label = "apcie_st";
 		power-domains = <&ps_ans>;
+	};
+
+	ps_disp_fe: power-controller@318 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x318 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "disp_fe";
+		power-domains = <&ps_disp_sys>;
+		status = "disabled";
+	};
+
+	ps_dispext0_fe: power-controller@320 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x320 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dispext0_fe";
+		power-domains = <&ps_dispext0_sys>;
+		status = "disabled";
+	};
+
+	ps_dispext0_cpu: power-controller@328 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x328 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dispext0_cpu";
+		power-domains = <&ps_dispext0_fe>;
+		status = "disabled";
 	};
 
 	ps_apcie_sys_st: power-controller@3a0 {
@@ -275,6 +323,16 @@
 		#reset-cells = <0>;
 		label = "isp_cvm";
 	};
+	ps_disp_cpu: power-controller@10000 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x10000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "disp_cpu";
+		power-domains = <&ps_disp_fe>;
+		status = "disabled";
+	};
+
 };
 
 &pmgr_mini {

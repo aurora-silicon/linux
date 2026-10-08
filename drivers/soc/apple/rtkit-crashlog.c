@@ -8,7 +8,6 @@
 #define FOURCC(a, b, c, d) \
 	(((u32)(a) << 24) | ((u32)(b) << 16) | ((u32)(c) << 8) | ((u32)(d)))
 
-#define APPLE_RTKIT_CRASHLOG_HEADER FOURCC('C', 'L', 'H', 'E')
 #define APPLE_RTKIT_CRASHLOG_STR FOURCC('C', 's', 't', 'r')
 #define APPLE_RTKIT_CRASHLOG_VERSION FOURCC('C', 'v', 'e', 'r')
 #define APPLE_RTKIT_CRASHLOG_MBOX FOURCC('C', 'm', 'b', 'x')
@@ -24,15 +23,6 @@
 #define PSR_MODE_EL2h	0x00000009
 #define PSR_MODE_MASK	0x0000000f
 #endif
-
-struct apple_rtkit_crashlog_header {
-	u32 fourcc;
-	u32 version;
-	u32 size;
-	u32 flags;
-	u8 _unk[16];
-};
-static_assert(sizeof(struct apple_rtkit_crashlog_header) == 0x20);
 
 struct apple_rtkit_crashlog_mbox_entry {
 	u64 msg0;
@@ -190,7 +180,7 @@ void apple_rtkit_crashlog_dump(struct apple_rtkit *rtk, u8 *bfr, size_t size)
 	struct apple_rtkit_crashlog_header header;
 
 	memcpy(&header, bfr, sizeof(header));
-	if (header.fourcc != APPLE_RTKIT_CRASHLOG_HEADER) {
+	if (header.fourcc != APPLE_RTKIT_CRASHLOG_HEADER_FOURCC) {
 		dev_warn(rtk->dev, "RTKit: Expected crashlog header but got %x",
 			 header.fourcc);
 		return;
@@ -210,7 +200,7 @@ void apple_rtkit_crashlog_dump(struct apple_rtkit *rtk, u8 *bfr, size_t size)
 		memcpy(&section_size, bfr + offset + 12, 4);
 
 		switch (section_fourcc) {
-		case APPLE_RTKIT_CRASHLOG_HEADER:
+		case APPLE_RTKIT_CRASHLOG_HEADER_FOURCC:
 			dev_dbg(rtk->dev, "RTKit: End of crashlog reached");
 			return;
 		case APPLE_RTKIT_CRASHLOG_STR:

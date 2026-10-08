@@ -52,6 +52,12 @@ void dcp_link(struct platform_device *pdev, struct apple_crtc *apple,
 int dcp_start(struct platform_device *pdev);
 int dcp_wait_ready(struct platform_device *pdev, u64 timeout);
 void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state);
+void dcp_retain_framebuffer(struct platform_device *pdev,
+			    struct dcp_fb_reference *entry);
+void dcp_arm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id);
+void dcp_unarm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id);
+void dcp_release_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id);
+void dcp_release_all_retained_framebuffers(struct apple_dcp *dcp);
 bool dcp_is_initialized(struct platform_device *pdev);
 void apple_crtc_vblank(struct apple_crtc *apple);
 void dcp_drm_crtc_vblank(struct apple_crtc *crtc);
