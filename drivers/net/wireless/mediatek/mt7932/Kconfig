@@ -2,13 +2,17 @@
 config MT7932_FULLMAC
 	tristate "Experimental J700 MT7932 fullmac wireless support"
 	depends on PCI && OF && ARM64 && IOMMU_DMA
+	depends on CFG80211
 	select FW_LOADER
-	select CFG80211
 	help
 	  Native support for the built-in J700 Wi-Fi endpoint: managed
-	  WPA2-CCMP station operation on 2.4 GHz and channels 36..48 at 20 MHz.
+	  WPA2-CCMP station operation on 2.4 GHz and on the 5 GHz UNII-1, -2,
+	  -2e and -3 channels that the regulatory domain permits. Radar (DFS)
+	  channels are scanned passively but not joined.
 	  Requires original firmware, own calibration and original-derived
 	  country policy packages in addition to the cfg80211 regulatory database.
+	  The device is probed before the root filesystem is mounted, so say M
+	  unless those files are in the initramfs.
 	  Requires a trained retained PCI link and a translated SID1 DMA domain.
 	  Firmware, runtime DMA and calibration negotiation start automatically;
 	  cfg80211 and userspace select the country and network. No test boot

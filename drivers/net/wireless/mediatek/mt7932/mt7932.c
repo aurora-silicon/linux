@@ -1181,6 +1181,10 @@ static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	domain = iommu_get_domain_for_dev(&pdev->dev);
 	if (!domain || (domain->type != IOMMU_DOMAIN_DMA && domain->type != IOMMU_DOMAIN_DMA_FQ))
 		return dev_err_probe(&pdev->dev, -EINVAL, "translated DMA domain required\n");
+	/* Station operation was qualified with ASPM and clock PM off on this link. */
+	ret = pci_disable_link_state(pdev, PCIE_LINK_STATE_ALL);
+	if (ret)
+		dev_warn(&pdev->dev, "link power management left as found: %d\n", ret);
 	ret = pcim_enable_device(pdev);
 	if (ret)
 		return ret;

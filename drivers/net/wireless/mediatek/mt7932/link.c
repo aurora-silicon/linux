@@ -343,7 +343,7 @@ void mt_connect_work(struct work_struct *work)
 			goto free;
 	}
 	if (m->connect_bss->channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_IR |
-					    IEEE80211_CHAN_NO_20MHZ)) {
+					    IEEE80211_CHAN_NO_20MHZ | IEEE80211_CHAN_RADAR)) {
 		ret = -EINVAL;
 		goto free;
 	}

@@ -64,9 +64,9 @@
 #define BT7932_CAL "mediatek/j700-mt7932-btcal.bin"
 #define BT7932_ADDR "mediatek/j700-mt7932-bdaddr.bin"
 
-static bool enable;
+static bool enable = true;
 module_param(enable, bool, 0600);
-MODULE_PARM_DESC(enable, "Diagnostic late-probe gate; default closed, no effect on an already bound device");
+MODULE_PARM_DESC(enable, "Probe the transport (default: on); no effect on an already bound device");
 
 struct bt7932_geometry {
 	u16 stride;
@@ -1034,6 +1034,28 @@ static void bt7932_cleanup(struct bt7932 *bt, bool release_dma)
 	kfree_sensitive(bt);
 }
 
+/*
+ * Admission was only qualified with the Wi-Fi function already running its
+ * firmware. Wait until mt7932-fullmac is bound to function 0, then link the
+ * two functions so that the driver core unbinds this one first.
+ */
+static int bt7932_wait_for_wifi(struct pci_dev *pdev)
+{
+	struct pci_dev *wifi = pci_get_slot(pdev->bus, PCI_DEVFN(0, 0));
+	int ret = 0;
+
+	if (!wifi)
+		return -ENODEV;
+	if (!device_is_bound(&wifi->dev) ||
+	    strcmp(dev_driver_string(&wifi->dev), "mt7932-fullmac"))
+		ret = dev_err_probe(&pdev->dev, -EPROBE_DEFER,
+				    "waiting for the Wi-Fi function\n");
+	else if (!device_link_add(&pdev->dev, &wifi->dev, DL_FLAG_AUTOREMOVE_CONSUMER))
+		ret = -EINVAL;
+	pci_dev_put(wifi);
+	return ret;
+}
+
 static int bt7932_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct bt7932 *bt;
@@ -1041,13 +1063,20 @@ static int bt7932_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	u16 command;
 	int ret;
 
-	/* The coordinator opens this only after the real root has its inputs. */
+	/* enable=0 leaves the function unbound for diagnosis. */
 	if (!READ_ONCE(enable))
 		return -ENODEV;
 	if (!of_machine_is_compatible("apple,j700") ||
 	    !of_machine_is_compatible("apple,t8140") ||
 	    pci_domain_nr(pdev->bus) || pdev->bus->number != 1 || pdev->devfn != PCI_DEVFN(0, 1))
 		return -ENODEV;
+	ret = bt7932_wait_for_wifi(pdev);
+	if (ret)
+		return ret;
+	/* Admission was qualified with ASPM and clock PM off on this link. */
+	ret = pci_disable_link_state(pdev, PCIE_LINK_STATE_ALL);
+	if (ret)
+		dev_warn(&pdev->dev, "link power management left as found: %d\n", ret);
 	bt = kzalloc_obj(*bt);
 	if (!bt)
 		return -ENOMEM;

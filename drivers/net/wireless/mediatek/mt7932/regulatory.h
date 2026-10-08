@@ -5,6 +5,8 @@
 /* Private, versioned packaging of original-derived country policy. This is
  * not firmware code and does not replace cfg80211's regulatory database.
  */
+#include "channels.h"
+
 #define MT7932_POLICY_TABLES 13
 #define MT7932_POLICY_MODES 3
 
@@ -20,12 +22,12 @@ struct mt7932_reg_snapshot {
 	 * profile. Stock unknown-country startup uses XZ while Linux stays 00.
 	 */
 	u8 alpha2[2];
-	u8 domain[148];
+	u8 domain[12 + 8 * MT7932_CHANNELS];
 	u16 length;
 	/* Keep numeric limits in equality checks even though CID0f contains only
 	 * flags. An unsupported reduction must not be mistaken for no change.
 	 */
-	s32 power[17];
+	s32 power[MT7932_CHANNELS];
 	int error;
 };
 
@@ -98,6 +100,56 @@ static inline int mt7932_policy_parse(struct mt7932_policy *out,
 		at += n;
 	}
 	return at == size ? 0 : -EINVAL;
+}
+
+/* Every entry of a validated package starts with its channel number and is
+ * followed by per-rate power limits. A country that does not permit a
+ * channel leaves all of that channel's limits at this byte.
+ */
+#define MT7932_POLICY_NO_LIMIT 0xc4
+
+static inline bool mt7932_policy_permits(const struct mt7932_policy *policy,
+					 unsigned int channel)
+{
+	unsigned int i, j, k;
+
+	for (i = 1; i <= 9; i++) {
+		const u8 *table = policy->table[i];
+
+		for (j = 0; j < table[4]; j++) {
+			const u8 *entry = table + 44 + j * 122;
+
+			if (entry[0] != channel)
+				continue;
+			for (k = 1; k < 122; k++)
+				if (entry[k] != MT7932_POLICY_NO_LIMIT)
+					return true;
+			return false;
+		}
+	}
+	return false;
+}
+
+/* Remove the channels the country package forbids from a CID0f domain. */
+static inline void mt7932_policy_filter(struct mt7932_reg_snapshot *reg,
+					const struct mt7932_policy *policy)
+{
+	unsigned int i, kept = 0, count = (reg->length - 12) / 8;
+
+	reg->domain[8] = 0;
+	reg->domain[9] = 0;
+	for (i = 0; i < count; i++) {
+		const u8 *entry = reg->domain + 12 + i * 8;
+		unsigned int channel = get_unaligned_le16(entry);
+
+		if (!mt7932_policy_permits(policy, channel))
+			continue;
+		memmove(reg->domain + 12 + kept * 8, entry, 8);
+		reg->domain[channel <= 14 ? 8 : 9]++;
+		kept++;
+	}
+	memset(reg->domain + 12 + kept * 8, 0, (count - kept) * 8);
+	reg->length = 12 + kept * 8;
 }
 
 #endif

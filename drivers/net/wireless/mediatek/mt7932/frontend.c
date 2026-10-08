@@ -145,7 +145,7 @@ static int mt_scan_submit_next(struct mt7932 *m)
 {
 	struct cfg80211_scan_request *request = m->scan_request;
 	const struct cfg80211_ssid *ssid = NULL;
-	u8 body[0x4d4], channels[13];
+	u8 body[0x4d4], channels[MT7932_CHANNELS_5G];
 	unsigned int count = 0, i;
 	unsigned long flags;
 	bool passive = false;
@@ -159,11 +159,15 @@ static int mt_scan_submit_next(struct mt7932 *m)
 		passive = !(m->scan_batch & 1);
 		for (i = 0; i < request->n_channels; i++) {
 			struct ieee80211_channel *channel = request->channels[i];
-			bool listen = !request->n_ssids ||
+			bool radar = channel->flags & IEEE80211_CHAN_RADAR;
+			bool listen = !request->n_ssids || radar ||
 				      (channel->flags & IEEE80211_CHAN_NO_IR);
 
+			/* Radar channels are never joined; while associated,
+			 * a passive dwell there only delays the home channel.
+			 */
 			if (mt7932_channel_band(channel->hw_value) != m->scan_band ||
-			    listen != passive)
+			    listen != passive || (radar && m->scan_home_channel))
 				continue;
 			if (channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_20MHZ) ||
 			    count == ARRAY_SIZE(channels))
@@ -215,7 +219,7 @@ static int mt_scan_submit_next(struct mt7932 *m)
  */
 int mt_connect_discover(struct mt7932 *m)
 {
-	u8 body[0x4d4], channels[13], cancel[4] = {};
+	u8 body[0x4d4], channels[MT7932_CHANNELS_5G], cancel[4] = {};
 	unsigned long flags;
 	unsigned int attempt, band, i, count;
 	int ret = 0;
@@ -236,7 +240,8 @@ int mt_connect_discover(struct mt7932 *m)
 
 			if (m->connect_channel_req && channel != m->connect_channel_req)
 				continue;
-			if (channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_20MHZ))
+			if (channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_20MHZ |
+					      IEEE80211_CHAN_RADAR))
 				continue;
 			passive |= !!(channel->flags & IEEE80211_CHAN_NO_IR);
 			channels[count++] = channel->hw_value;
@@ -328,7 +333,10 @@ int mt_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 	dev_info(&m->pdev->dev, "SCAN_REQUEST: channels=%u ssids=%d ies=%zu flags=%08x duration=%u/%u\n",
 		 request->n_channels, request->n_ssids, request->ie_len, request->flags,
 		 request->duration, request->duration_mandatory);
-	if (!request->n_channels || request->n_channels > 17 || request->ie_len > 600 ||
+	/* cfg80211 lists each advertised channel at most once. */
+	if (request->n_channels > MT7932_CHANNELS)
+		return -EOPNOTSUPP;
+	if (!request->n_channels || request->ie_len > 600 ||
 	    request->duration_mandatory ||
 	    (request->flags & ~(NL80211_SCAN_FLAG_FLUSH | NL80211_SCAN_FLAG_COLOCATED_6GHZ)) || request->n_ssids > 1 ||
 	    (request->n_ssids && request->ssids[0].ssid_len > 32))
@@ -362,6 +370,9 @@ int mt_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 		spin_unlock_irqrestore(&m->response_lock, flags);
 		cancel_delayed_work(&m->scan_timeout_work);
 	} else {
+		/* Nothing eligible to submit: complete the request. */
+		if (ret)
+			schedule_work(&m->scan_finish_work);
 		ret = 0;
 	}
 out:
@@ -436,12 +447,25 @@ static int mt_set_mac_address(struct net_device *netdev, void *address)
 
 	/* No live-MAC change: the next BSS activation and connect commands use
 	 * this address together. A failed retirement must not change identity.
+	 * NetworkManager takes the interface down before changing the address,
+	 * which cancels any scan; let that scan retire instead of failing.
 	 */
+	if (!netif_running(netdev)) {
+		unsigned long deadline = jiffies + msecs_to_jiffies(2000);
+
+		mt_scan_quiesce(m);
+		while (READ_ONCE(m->retired_scan_seq) && time_before(jiffies, deadline))
+			wait_for_completion_timeout(&m->scan_done, msecs_to_jiffies(100));
+	}
 	mutex_lock(&m->command_mutex);
 	spin_lock_irqsave(&m->response_lock, flags);
 	if (m->stopping || m->link_failed || m->bss_active || m->connecting ||
 	    m->connected || m->disconnecting || m->peer_valid ||
 	    m->scan_request || m->retired_scan_seq || m->discovering) {
+		dev_dbg(&m->pdev->dev,
+			"address change refused: bss=%u connecting=%u connected=%u peer=%u scan=%u retired=%u\n",
+			m->bss_active, m->connecting, m->connected, m->peer_valid,
+			!!m->scan_request, m->retired_scan_seq);
 		ret = -EBUSY;
 	} else {
 		ret = eth_mac_addr(netdev, address);

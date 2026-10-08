@@ -94,8 +94,8 @@ struct mt7932 {
 	struct ieee80211_supported_band band2;
 	struct cfg80211_chan_def connect_chandef;
 	u8 connect_center;
-	struct ieee80211_channel channels[13];
-	struct ieee80211_channel channels5[4];
+	struct ieee80211_channel channels[MT7932_CHANNELS_2G];
+	struct ieee80211_channel channels5[MT7932_CHANNELS_5G];
 	struct ieee80211_supported_band band5;
 	u8 scan_band, scan_batch;
 	struct ieee80211_rate rates[12];

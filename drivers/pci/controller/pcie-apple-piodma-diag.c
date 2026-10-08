@@ -7,7 +7,7 @@
  * to the reviewed Aurora reference and fresh ADT observations.
  *
  * This built-in driver deliberately retains its coherent arena and device
- * power reference until a coordinator-controlled full hardware reset. There
+ * power reference until a full hardware reset. There
  * is no unbind interface, kexec or retry. Suspend-to-idle sleep preserves the
  * arena and restores the register banks without resubmitting its request.
  * Native ECAM is only
@@ -51,9 +51,14 @@
 #define PIODMA_FIFO_MASK		GENMASK(5, 0)
 #define PIODMA_IRQ_LIMIT		16
 
-static bool enumerate;
+/*
+ * The board DT opts in by pointing the host's "apple,piodma" at this engine;
+ * a host without that property stays root-port-only. enumerate=0 keeps every
+ * host on its root-port-only path for diagnosis.
+ */
+static bool enumerate = true;
 module_param(enumerate, bool, 0400);
-MODULE_PARM_DESC(enumerate, "Prime once, validate native ECAM, and enumerate the two Neo functions");
+MODULE_PARM_DESC(enumerate, "Prime once, validate native ECAM, and enumerate the two Neo functions (default: on)");
 
 struct apple_piodma_request {
 	u16 offset;

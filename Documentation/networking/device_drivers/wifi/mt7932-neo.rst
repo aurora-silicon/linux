@@ -4,7 +4,8 @@ MT7932 radio bring-up on the MacBook Neo
 ======================================
 
 J700 MT7932 Wi-Fi uses cfg80211 and NetworkManager with firmware-managed
-WPA2-CCMP authentication. Bluetooth uses an opt-in PCIe transport.
+WPA2-CCMP authentication. Bluetooth uses a transport on the radio's second
+PCIe function.
 
 The Wi-Fi import is pinned to
 ``aurora-silicon/linux-neo-cleanroom-eryk-with-wifi``, commit
@@ -16,28 +17,50 @@ Platform and configuration
 --------------------------
 
 Use the separately reviewed T8140 PCIe bootstrap described in
-``Documentation/PCI/controller/apple-t8140.rst``. Its explicit kernel opt-in is
-``pcie_apple_piodma_diag.enumerate=1``. Public m1n1 must populate the J700
+``Documentation/PCI/controller/apple-t8140.rst``. It runs during boot when
+``CONFIG_PCIE_APPLE_PIODMA_DIAG=y``. Public m1n1 must populate the J700
 ``wifi0`` endpoint's own ``local-mac-address``; a zero placeholder is rejected.
 
 The tested configuration includes ``CONFIG_MT7932_FULLMAC=m``,
-``CONFIG_CFG80211=y``, ``CONFIG_BT_MTK7932_PCIE=m``, ``CONFIG_BT_BREDR=y``,
+``CONFIG_CFG80211=m``, ``CONFIG_BT_MTK7932_PCIE=m``, ``CONFIG_BT_BREDR=y``,
 ``CONFIG_BT_LE=y``, ``CONFIG_CRYPTO_AES=y`` and ``CONFIG_CRYPTO_CMAC=y``.
 The Bluetooth transport can be built with modular Bluetooth and system
 sleep. The separately selected bootstrap provider has its own lifecycle
 restrictions. Kexec is excluded while either retained experiment is enabled.
+The station uses 2.4 GHz channels 1-13 and the 5 GHz channels 36-64,
+100-144 and 149-165 that the cfg80211 regulatory domain permits. Radar (DFS)
+channels stay passive: the firmware listens on them while the station is not
+associated, but never probes or joins an access point there, and scans made
+while associated skip them. A channel whose restrictions the driver cannot
+apply (reduced power, no OFDM, PSD limits) is disabled rather than used, and
+so is a channel the country package does not permit: every power limit of
+that channel in ``policy/<CC>.bin`` is left undefined.
+
 Use the ordinary cfg80211 regulatory database and applicable country policy.
 The validated first-admission fallback is kernel country 00 with firmware XZ.
+A modular cfg80211 loads ``regulatory.db`` from the root filesystem; a
+built-in one tries before the root filesystem is mounted and then needs
+``iw reg reload``.
 
-After the root filesystem and the local firmware packages are available,
-select PCIe ASPM performance policy before loading ``mt7932-fullmac``. This
-matches the tested admission sequence. Bluetooth's gate defaults closed;
-validate the cold, unbound ``14c3:793b`` function, then load
-``mt7932_bt_pcie`` with ``enable=1`` after its local inputs are installed.
-A built-in transport can instead open its enable parameter before requesting
-the PCI probe.
-Do not reprobe after a failed or uncertain Bluetooth admission. The tested
-Wi-Fi driver owns function 0 and Bluetooth owns function 1.
+The radio functions appear while the kernel boots, before the root
+filesystem is mounted, and ``mt7932-fullmac`` reads its firmware while
+probing. Build it as a module so that udev loads it from the root
+filesystem, or provide its firmware in the initramfs. The driver disables
+ASPM and clock power management on its link before starting the device,
+matching the tested admission sequence, which used the PCIe ASPM
+performance policy.
+
+``mt7932_bt_pcie`` defers its probe until ``mt7932-fullmac`` is bound to
+function 0, so the Bluetooth firmware always starts after the Wi-Fi firmware,
+as in the tested sequence, however the drivers are loaded. Bluetooth therefore
+stays unbound while the Wi-Fi driver is missing or has failed. A device link
+makes the driver core unbind Bluetooth before Wi-Fi; unloading
+``mt7932_bt_pcie`` does not affect Wi-Fi. The probe rejects a function that is
+not cold, which is what now prevents a reprobe after a failed or uncertain
+admission; ``enable=0`` leaves the function unbound. The transport also
+disables ASPM on the shared link. Like the Wi-Fi driver, it reads its firmware
+while probing, so build it as a module. The tested Wi-Fi driver owns function
+0 and Bluetooth owns function 1.
 
 Use a saved NetworkManager WPA2 profile matching the current interface.
 KDE audio requires BlueZ, PipeWire, its PulseAudio compatibility service,
