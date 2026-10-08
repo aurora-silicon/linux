@@ -383,6 +383,9 @@ struct apple_dart_atomic_stream_map {
  * @finalized: true if the domain has been completely initialized
  * @init_lock: protects domain initialization
  * @stream_maps: streams attached to this domain (valid for DMA/UNMANAGED only)
+ * @fw_sidmap: streams whose locked firmware roots the domain imported at
+ *             finalization, per entry of @stream_maps; unlike @stream_maps
+ *             they are known before any device is attached
  * @domain: core iommu domain pointer
  */
 struct apple_dart_domain {
@@ -396,6 +399,7 @@ struct apple_dart_domain {
 	dma_addr_t dma_offset;
 	struct mutex init_lock;
 	struct apple_dart_atomic_stream_map stream_maps[MAX_DARTS_PER_DEVICE];
+	DECLARE_BITMAP(fw_sidmap[MAX_DARTS_PER_DEVICE], DART_MAX_STREAMS);
 
 	struct iommu_domain domain;
 };
@@ -831,7 +835,8 @@ apple_dart_hw_sync_locked(struct io_pgtable_cfg *cfg,
 			 * before attachment, so replace the old root entries.
 			 * T8110 v2.2+ instead retains firmware-owned entries.
 			 */
-			if (dart->hw->type != DART_T8110 || dart->version < 0x0202) {
+			if (!dart->fw_mirror &&
+			    (dart->hw->type != DART_T8110 || dart->version < 0x0202)) {
 				size_t entry;
 
 				dma_wmb();
@@ -1181,6 +1186,20 @@ static int apple_dart_iotlb_sync_map(struct iommu_domain *domain,
 }
 
 /*
+ * The core installs reserved mappings before it attaches the first device,
+ * while the attached-stream map is still empty. A locked stream whose
+ * firmware root the domain imported keeps its inherited translations from
+ * then on, so treat it as part of the domain for firmware lookups.
+ */
+static bool apple_dart_domain_uses_fw(struct apple_dart_domain *domain, int i,
+				      struct apple_dart_atomic_stream_map *map,
+				      int sid)
+{
+	return test_bit(sid, domain->fw_sidmap[i]) ||
+	       (atomic_long_read(&map->sidmap[BIT_WORD(sid)]) & BIT_MASK(sid));
+}
+
+/*
  * Hardware continues to use every firmware-owned slot. Accept a private
  * software mapping only when every stream using such a slot agrees on the
  * full-page translation and its protection/cache attributes.
@@ -1217,8 +1236,7 @@ static int apple_dart_check_fw_map(struct apple_dart_domain *domain, u64 dva,
 				u64 pte;
 				int fw_prot;
 
-				if (!(atomic_long_read(&map->sidmap[BIT_WORD(sid)]) &
-				      BIT_MASK(sid)))
+				if (!apple_dart_domain_uses_fw(domain, i, map, sid))
 					continue;
 				fw = dart->locked_fw[sid][idx];
 				if (!dart->locked_ttbr[sid][idx] ||
@@ -1265,7 +1283,7 @@ apple_dart_inherited_phys(struct apple_dart_domain *domain, dma_addr_t address)
 			phys_addr_t phys;
 			int prot;
 
-			if (!(atomic_long_read(&map->sidmap[BIT_WORD(sid)]) & BIT_MASK(sid)))
+			if (!apple_dart_domain_uses_fw(domain, i, map, sid))
 				continue;
 			fw = dart->locked_fw[sid][0];
 			if (!apple_dart_fw_slot_owned(fw, dart->locked_ttbr[sid][0], slot) ||
@@ -1524,6 +1542,8 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 					goto done;
 				}
 			}
+			bitmap_copy(dart_domain->fw_sidmap[i], stream->sidmap,
+				    stream->dart->num_streams);
 		}
 	}
 
