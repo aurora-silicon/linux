@@ -1663,6 +1663,8 @@ impl HandoffFlush {
 }
 
 impl Vm {
+    /// Whether `other` is the same DRM VM.
+    pub(crate) fn same(&self, other: &Vm) -> bool { self.id == other.id }
     pub(crate) fn status(&self) -> Result<&Arc<crate::agx_status::VmStatus>> { self.status.as_ref().ok_or(EINVAL) }
     pub(crate) fn is_m3(&self) -> bool { self.fault.is_some() }
 

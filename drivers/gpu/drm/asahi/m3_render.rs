@@ -30,8 +30,10 @@ pub(crate) struct Render {
     last_progress_ns:i64,
     draw:u64, heads:[u16;2], cached_views:KVec<CachedViews>,
     slot:usize, batch_count:usize, early_count:u32,
-    checkpoint:(u64,[u16;2],usize,usize,u32),
-    /// GPU clusters: tiler accelerators (TPC storage) and preemption buffers.
+    /// First pass slot of the current batch; its passes use base..base+batch_count mod SLOTS.
+    base:usize,
+    checkpoint:(u64,[u16;2],usize,usize,u32,usize),
+    /// GPU clusters of the board: tiler accelerators (TPC storage) and preemption buffers.
     clusters:u32,
     /// The register lists of the SoC's GPU (`m3_soc::Soc::registers`).
     registers:crate::m3_compute_layout::RegisterSet,
@@ -87,7 +89,7 @@ impl Render {
         tiler_bytes.resize(tiler::SIZE,0u8,GFP_KERNEL)?;
         let mut fragment_bytes=KVec::new();
         fragment_bytes.resize(fragment::SIZE,0u8,GFP_KERNEL)?;
-        let mut job=Self{passes,init_bm,stats,sequence_bytes,tiler_bytes,fragment_bytes,objects,_aliases:aliases,_binding:binding,last_progress_ns:0,draw:0,heads:[0;2],cached_views:KVec::new(),slot:0,batch_count:0,early_count:0,checkpoint:(0,[0;2],0,0,0),clusters,registers};
+        let mut job=Self{passes,init_bm,stats,sequence_bytes,tiler_bytes,fragment_bytes,objects,_aliases:aliases,_binding:binding,last_progress_ns:0,draw:0,heads:[0;2],cached_views:KVec::new(),slot:0,batch_count:0,early_count:0,base:0,checkpoint:(0,[0;2],0,0,0,0),clusters,registers};
         // Lists and the matching manager are built before InitBM publication.
         job.initialize_parameter_buffer()?;
         for pool in &UMA_POOLS { pool.initialize(&mut job.objects)?; }
@@ -344,28 +346,36 @@ impl Render {
         }
         crate::agx_memory::publish();Ok(())
     }
-    pub(crate) fn gpu_ns(&mut self)->Result<u64> {
-        let start=self.passes[0].get_mut(P::TilerStart).read_u64(0)?;
-        let end=self.passes[self.batch_count-1].get_mut(P::FragmentEnd).read_u64(0)?;
+    fn at(base:usize,index:usize)->usize {(base+index)%pass_layout::SLOTS}
+    /// GPU time of the batch of `count` passes starting at pass slot `base`.
+    pub(crate) fn gpu_ns(&mut self,base:usize,count:usize)->Result<u64> {
+        let start=self.passes[base].get_mut(P::TilerStart).read_u64(0)?;
+        let end=self.passes[Self::at(base,count-1)].get_mut(P::FragmentEnd).read_u64(0)?;
         Ok(if start!=0 && end>=start {(end-start)*1000/24} else {0})
+    }
+    /// The batch's first tiler start and last fragment end, in 24 MHz GPU timestamp ticks.
+    pub(crate) fn gpu_ticks(&mut self,base:usize,count:usize)->Result<(u64,u64)> {
+        Ok((self.passes[base].get_mut(P::TilerStart).read_u64(0)?,
+            self.passes[Self::at(base,count-1)].get_mut(P::FragmentEnd).read_u64(0)?))
     }
     /// Read retained timestamps only after exact batch retirement. The first
     /// TA and final fragment delimit the batch in the shared 24 MHz counter.
     pub(crate) fn batch_gpu_span(&mut self)->Result<[u64;2]> {
         if self.batch_count == 0 {return Err(EINVAL);}
-        Ok([self.passes[0].get_mut(P::TilerStart).read_u64(0)?,
-            self.passes[self.batch_count-1].get_mut(P::FragmentEnd).read_u64(0)?])
+        Ok([self.passes[self.base].get_mut(P::TilerStart).read_u64(0)?,
+            self.passes[Self::at(self.base,self.batch_count-1)].get_mut(P::FragmentEnd).read_u64(0)?])
     }
-    pub(crate) fn stage_ns(&mut self)->Result<[u64;3]> {
+    pub(crate) fn stage_ns(&mut self,base:usize,count:usize)->Result<[u64;3]> {
         let mut total=[0;3];
-        for slot in 0..self.batch_count {
-            let stages=self.slot_stage_ns(slot)?;
+        for index in 0..count {
+            let stages=self.slot_stage_ns(base,count,index)?;
             for i in 0..3 {total[i]+=stages[i];}
         }
         Ok(total)
     }
-    pub(crate) fn slot_stage_ns(&mut self,slot:usize)->Result<[u64;3]> {
-        if slot>=self.batch_count {return Err(EINVAL);}
+    pub(crate) fn slot_stage_ns(&mut self,base:usize,count:usize,index:usize)->Result<[u64;3]> {
+        if index>=count {return Err(EINVAL);}
+        let slot=Self::at(base,index);
         let duration=|a:u64,b:u64| if a!=0 && b>=a {(b-a)*1000/24} else {0};
         let fs_start=self.passes[slot].get_mut(P::FragmentStart).read_u64(0)?;
         let fs_end=self.passes[slot].get_mut(P::FragmentEnd).read_u64(0)?;
@@ -376,12 +386,38 @@ impl Render {
     pub(crate) fn early_count(&self)->u32 {self.early_count}
     pub(crate) fn heads(&self)->[u16;2] {self.heads}
     pub(crate) fn ordinal(&self)->u64 {self.draw}
+    /// The current batch: first pass slot, pass count and last draw number.
+    pub(crate) fn batch(&self)->(usize,usize,u64) {(self.base,self.batch_count,self.draw)}
+    /// Whether draws 1..=`draw` have completed both stages (TA and fragment stamps, host and
+    /// firmware copies, have reached `draw`'s values). Use signed modular ordering
+    /// across stamp wrap; the runtime bounds outstanding passes to SLOTS.
+    pub(crate) fn complete_through(&mut self,draw:u64)->Result<bool> {
+        if draw==0 {return Ok(true);}
+        for (stamp,fw,value) in [(s::TA_STAMP,s::TA_FW_STAMP,timeline::stamp(s::STAMP_TA-256,draw)),
+            (s::FRAGMENT_STAMP,s::FRAGMENT_FW_STAMP,timeline::stamp(s::STAMP_FRAGMENT-256,draw))] {
+            if !timeline::reached(self.objects[stamp].read_u32(0)?,value) || !timeline::reached(self.objects[fw].read_u32(0)?,value) {return Ok(false);}
+        }
+        Ok(true)
+    }
     /// Whether any draw has been published (the first one initializes the buffer manager).
     pub(crate) fn started(&self)->bool {self.draw>0}
     pub(crate) fn first(&self)->bool {self.draw==self.batch_count as u64}
+    /// Start a batch in pass slots `base..`. With `overlap`, earlier batches may still run: then
+    /// the VM must already be bound, no storage may grow and the slots must not be in flight
+    /// (the caller keeps the in-flight passes plus this batch within SLOTS).
     pub(crate) fn begin_batch(&mut self,dev:&driver::AsahiDevice,uat:&mmu::Uat,vm:&mmu::Vm,
-        commands:&[crate::m3_submit::Command])->Result {
-        if !self.complete()? {return Err(EBUSY);}
+        commands:&[crate::m3_submit::Command],base:usize,overlap:bool)->Result {
+        if base>=pass_layout::SLOTS || (!overlap && !self.complete()?) {return Err(EBUSY);}
+        if overlap {
+            if !self._binding.matches(vm) {return Err(EBUSY);}
+            for (index,&command) in commands.iter().enumerate() {
+                let crate::m3_submit::Command::Render{command:r,..}=command else {return Err(EINVAL);};
+                let g=Self::geometry(r,self.clusters)?;
+                let slot=Self::at(base,index);
+                if g.tpc_bytes>self.passes[slot].get(P::Tpc).size() as u64
+                    || g.tilemap_bytes>self.passes[slot].get(P::Tilemap).size() as u64 {return Err(EBUSY);}
+            }
+        }
         if commands.is_empty() || commands.len()>pass_layout::SLOTS {return Err(E2BIG);}
         self.draw.checked_add(commands.len() as u64).ok_or(EOVERFLOW)?;
         // Validate every pass before changing any queue or completion state.
@@ -428,7 +464,8 @@ impl Render {
         // Cached VM mappings must be dropped before freeing the old backing.
         // Partial allocation failure leaves retired queue/stamp state intact;
         // already-grown buffers are reusable on the next submission.
-        for (slot,&command) in commands.iter().enumerate() {
+        for (index,&command) in commands.iter().enumerate() {
+            let slot=Self::at(base,index);
             let crate::m3_submit::Command::Render{command:r,..}=command else {return Err(EINVAL);};
             let g=Self::geometry(r,self.clusters)?;
             for (field,base,bytes) in [(P::Tpc,s::TPC_LABEL,g.tpc_bytes),(P::Tilemap,s::TILEMAP_LABEL,g.tilemap_bytes)] {
@@ -442,14 +479,15 @@ impl Render {
                 }
             }
         }
-        self.checkpoint=(self.draw,self.heads,self.batch_count,self.slot,self.early_count);
+        self.checkpoint=(self.draw,self.heads,self.batch_count,self.slot,self.early_count,self.base);
         self.batch_count=0;
+        self.base=base;
         Ok(())
     }
     /// Preparation never rings a firmware doorbell. Restore shared producer
     /// state if a later descriptor/timestamp check fails before publication.
     pub(crate) fn abort_batch(&mut self)->Result {
-        (self.draw,self.heads,self.batch_count,self.slot,self.early_count)=self.checkpoint;
+        (self.draw,self.heads,self.batch_count,self.slot,self.early_count,self.base)=self.checkpoint;
         self.objects[s::BM_COUNTER].u32(0,self.draw as u32)?;
         self.objects[s::EVENT_COUNT].u32(0,timeline::events(self.draw,2))?;
         for (stage,pointers) in [s::TA_POINTERS,s::FRAGMENT_POINTERS].into_iter().enumerate() {
@@ -458,7 +496,7 @@ impl Render {
         crate::agx_memory::publish();
         Ok(())
     }
-    /// Called only while the shared queues are fully retired and unpublished.
+    /// Append only into the caller-reserved free pass slots of an unpublished batch.
     /// Each append selects disjoint host-mutated pass storage. A TA dependency
     /// retains full fragment-to-next-TA ordering for arbitrary resource hazards.
     pub(crate) fn append(&mut self,r:agx_uapi::UapiRenderCommand,usc:u64)->Result {
@@ -467,11 +505,11 @@ impl Render {
                 self.batch_count,pass_layout::SLOTS);
             return Err(E2BIG);
         }
-        self.slot=self.batch_count;
-        // Copy M4's conservative stage-scope permission. Packet/compute
-        // boundaries start at slot zero and therefore never overlap. Explicit
+        self.slot=Self::at(self.base,self.batch_count);
+        // Retain the conservative stage-scope permission. Only a pass after the
+        // first of its batch may overlap its predecessor's stages. Explicit
         // start timestamps keep the original full-order execution boundary.
-        let early=self.slot>0 && *crate::module_parameters::m3_early_tiling.value()!=0
+        let early=self.batch_count>0 && *crate::module_parameters::m3_early_tiling.value()!=0
             && r.flags&(1<<5)!=0 && r.vertex_timestamps.start.handle==0
             && r.fragment_timestamps.start.handle==0;
         if early {self.early_count+=1;}
@@ -564,7 +602,8 @@ impl Render {
             }
         }
         dev_info!(dev.as_ref(),"M3 fault render VM={} slot={} root={:#x} draw={} batch={}\n",self._binding.vm_id(),self._binding.slot(),self._binding.root(),self.draw,self.batch_count);
-        for slot in 0..self.batch_count {
+        for index in 0..self.batch_count {
+            let slot=Self::at(self.base,index);
             let command=self.passes[slot].get_mut(P::TilerCommand);
             for index in 0..tiler::REGISTER_COUNT {
                 let offset=tiler::REGISTERS+index*tiler::REGISTER_STRIDE;

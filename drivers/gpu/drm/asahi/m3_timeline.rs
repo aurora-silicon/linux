@@ -24,3 +24,8 @@ pub(crate) const fn previous(ordinal: u64) -> u32 {
 pub(crate) const fn events(ordinal: u64, stages: u32) -> u32 {
     (ordinal as u32).wrapping_mul(stages)
 }
+
+/// Signed modular ordering, valid for the bounded set of outstanding draws.
+pub(crate) const fn reached(observed: u32, expected: u32) -> bool {
+    observed.wrapping_sub(expected) as i32 >= 0
+}

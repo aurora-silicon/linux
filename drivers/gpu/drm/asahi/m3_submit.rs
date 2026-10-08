@@ -43,6 +43,8 @@ pub(crate) struct Packet {
     pub(crate) wide_visibility:KVec<bool>,
     completion:UserFence<Completion>,
     finish_claimed: AtomicBool,
+    /// Queue urgency (3 = UAPI realtime .. 0 = UAPI low): more urgent packets are published first.
+    pub(crate) urgency:u8,
     vm_job:Pin<KBox<Mutex<Option<mmu::M3VmJobGuard>>>>,
 }
 impl Packet {
@@ -53,7 +55,10 @@ impl Packet {
         core::array::from_fn(|stage| core::array::from_fn(|i|
             self.timestamps[index][stage*2+i].as_ref().map_or(0,Destination::firmware_address)))
     }
-    fn finish(&self,result:Result) {
+    /// Called only after all published commands retired or before any publication.
+    pub(crate) fn release_guard(&self) {drop(self.vm_job.lock().take());}
+    pub(crate) fn retired(&self) {self.release_guard();self.finish(Ok(()));}
+    pub(crate) fn finish(&self,result:Result) {
         // Retirement, cancellation and a queued scheduler timeout can race.
         // Claim error/signal ownership once; this flag is NOT proof that the
         // fence is signaled or that hardware DMA has stopped.
@@ -64,25 +69,26 @@ impl Packet {
         // nonzero: GEM closes otherwise accumulate across completed frames.
         // On failure the runtime quarantines this guard with the packet until
         // firmware has provably stopped; signalling an error is not retirement.
-        if result.is_ok() {
-            let retired = self.vm_job.lock().take();
-            core::mem::drop(retired);
-        }
         crate::agx_memory::publish();self.completion.signal();
     }
 }
 pub(crate) struct Job {shared:Shared,packet:Arc<Packet>}
 impl sched::JobImpl for Job {
     fn run(job:&mut sched::Job<Self>)->Result<Option<Fence>> {
-        let result=crate::m3_runtime::Runtime::execute(&job.shared, job.packet.clone());
-        if let Err(e)=result {pr_err!("M3 scheduler: execution failed {:?}\n",e);}
-        job.packet.finish(result);
+        // Queue the packet and return its fence; the completion worker publishes and retires
+        // it, so the scheduler can hand over further ready jobs meanwhile.
+        if let Err(e)=crate::m3_runtime::Runtime::submit(&job.shared,job.packet.clone()) {
+            pr_err!("M3 scheduler: submission failed {:?}\n",e);
+            // submit() failed before this packet could be published.
+            job.packet.release_guard();job.packet.finish(Err(e));
+        }
         Ok(Some(Fence::from_fence(&job.packet.completion)))
     }
     fn timed_out(job:&mut sched::Job<Self>)->sched::Status {
         // Retain the publishing branch's explicit diagnostic override.
         if !crate::m3_params::timeout_nohang() {
             if let Some(r)=Option::as_mut(&mut *job.shared.lock()) {r.health().mark_failed();}
+            crate::m3_runtime::Runtime::withdraw(&job.shared,&job.packet);
             job.packet.finish(Err(ETIMEDOUT));return sched::Status::NoDevice;
         }
         let guard=job.shared.lock();
@@ -90,16 +96,20 @@ impl sched::JobImpl for Job {
             job.packet.finish(Err(ENODEV));
             return sched::Status::NoDevice;
         };
-        // The scheduler's deadline covers the whole packet, not one batch.
-        // execute() owns each batch's bounded hardware-completion checks;
-        // waiting for its mutex can itself cross the scheduler deadline.
-        // Reinsert a healthy packet instead of turning a late timeout into
-        // a global device loss or corrupting an already signaled fence.
+        // The scheduler's deadline covers the whole packet, including time queued behind
+        // other batches. The completion worker owns each batch's bounded hardware-completion
+        // checks. Reinsert a healthy packet instead of turning a late timeout into a global
+        // device loss or corrupting an already signaled fence.
         if runtime.health().healthy() { return sched::Status::NoHang; }
+        drop(guard);
+        crate::m3_runtime::Runtime::withdraw(&job.shared,&job.packet);
         job.packet.finish(Err(EIO));
         sched::Status::NoDevice
     }
-    fn cancel(job:&mut sched::Job<Self>) {job.packet.finish(Err(ECANCELED));}
+    fn cancel(job:&mut sched::Job<Self>) {
+        crate::m3_runtime::Runtime::withdraw(&job.shared,&job.packet);
+        job.packet.finish(Err(ECANCELED));
+    }
 }
 struct AddressSpace<'a>(&'a mmu::Vm);
 impl agx_uapi::GpuAddressSpace for AddressSpace<'_> {
@@ -116,17 +126,19 @@ pub(crate) struct Queue {
     shared:Shared,vm:mmu::Vm,usc:u64,fences:FenceContexts,
     /// Whether the SoC advertises early tiling (`m3_soc::Features::fragment_dependency`).
     early_tiling:bool,
+    urgency:u8,
 }
 impl Queue {
     pub(crate) fn new(shared:Shared,scheduler:Arc<sched::Scheduler<Job>>,vm:mmu::Vm,priority:u32,usc:u64,
         early_tiling:bool)->Result<Self> {
         agx_uapi::QueueUscWindow{base:usc,user_start:0x4000,user_end:(1u64<<42)-0x8000}.validate().map_err(|_|EINVAL)?;
         // file.rs passes REALTIME - UAPI priority: 3 is UAPI LOW, 0 is UAPI REALTIME.
+        let urgency=3u8.saturating_sub(priority.min(3) as u8);
         let priority=match priority {3=>sched::Priority::Low,2=>sched::Priority::Normal,
             1=>sched::Priority::High,0=>sched::Priority::Kernel,_=>return Err(EINVAL)};
         Ok(Self {entity:sched::Entity::new(&scheduler,priority)?,_scheduler:scheduler,
             shared,vm,usc,fences:FenceContexts::new(1,c_str!("asahi_m3_queue"),kernel::static_lock_class!())?,
-            early_tiling})
+            early_tiling,urgency})
     }
 }
 impl queue::Queue for Queue {
@@ -177,7 +189,7 @@ impl queue::Queue for Queue {
         parser.finish().map_err(|_|EINVAL)?;
         let packet=Arc::new(Packet{vm:self.vm.clone(),commands,timestamps,attachments:flushes,wide_visibility:visibility,
             completion:self.fences.new_fence(0,Completion)?.into(),
-            finish_claimed:AtomicBool::new(false),
+            finish_claimed:AtomicBool::new(false),urgency:self.urgency,
             vm_job:KBox::pin_init(new_mutex!(Some(vm_job)),GFP_KERNEL)?},GFP_KERNEL)?;
         let mut job=self.entity.new_job(1,Job{shared:self.shared.clone(),packet})?;
         for sync in syncs.drain(0..in_sync_count) {if let Some(f)=sync.fence {job.add_dependency(f)?;}}

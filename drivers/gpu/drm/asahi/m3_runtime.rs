@@ -4,13 +4,30 @@ use kernel::{device::Core, platform, prelude::*, soc::apple::rtkit, sync::Arc,
     time::{Instant, Monotonic, Delta, delay::fsleep}};
 use crate::{driver, mmu, m3_device::Device, m3_config::Config, m3_rtkit};
 
+#[path = "m3_batch_policy.rs"]
+pub(crate) mod policy;
+const _: () = assert!(policy::SLOTS == crate::m3_pass_layout::SLOTS);
+
 enum NativeJob {Compute(crate::m3_compute::Compute),Render(crate::m3_render::Render)}
+/// Completion-worker outcome.
+pub(crate) enum Service {Idle,Progress,Waiting(u64)}
+/// The published batch: its commands in order, as (packet, command index).
+struct Batch {
+    entries: KVec<(Arc<crate::m3_submit::Packet>,usize)>,
+    index: usize, kind: usize, first: crate::m3_submit::Command,
+    preparation_ns: i64, previous_events: u64, expected_events: u64,
+    start: Instant<Monotonic>, measure: bool, doorbell_counter_ns: i64,
+    /// Render: first pass slot and the batch's last draw number.
+    base: usize, last_draw: u64, publication_tick:u64,
+    polling_ns: i64, polls: u64, stamp_ns: i64, first_event_ns: i64, events_ns: i64,
+}
 #[derive(Clone, Copy, Default)]
 struct GeometryTiming {
     width: u16, height: u16, samples: u8, count: u64,
     prepare_ns: i64, active_ns: i64, gpu_ns: u64,
     tiling_ns: u64, fragment_ns: u64, max_fragment_ns: u64,
     polling_ns: i64, retirement_ns: i64, sleeping_ns: i64, polls: u64,
+    stamp_ns:i64, first_event_ns:i64, events_ns:i64, pickup_ns:i64, tail_ns:i64,
 }
 impl NativeJob {
     fn complete(&mut self)->Result<bool> {match self {Self::Compute(j)=>j.complete(),Self::Render(j)=>j.complete()}}
@@ -22,6 +39,10 @@ struct Inner {
     state: Arc<m3_rtkit::State>,
     jobs: KVec<NativeJob>,
     packets: KVec<Arc<crate::m3_submit::Packet>>,
+    /// Packets not yet (fully) published: (packet, next command index), most urgent first.
+    pending: KVec<(Arc<crate::m3_submit::Packet>,usize)>,
+    /// Published batches, oldest first. More than one only with asahi.m3_pipeline_depth > 1.
+    active: KVec<Batch>,
     gpu_pending: bool,
     fault_captured: bool,
     timing: [[i64;7];2],
@@ -33,6 +54,12 @@ struct Inner {
     t8122_verdict: bool,
     /// The step the firmware boot sequence has reached, for the T8122 boot verdict. T8122 only.
     boot_step: crate::t8122_start::BootStep,
+    /// Packets that joined a batch started by an earlier packet (debug summary).
+    coalesced_packets: u64,
+    /// Recent measured render GPU time per pass by VM. Smoothed over batches;
+    /// replacing the least recently measured VM does not retain its mappings.
+    /// Latched only after the isolated InitBM draw fully retired.
+    render_initialized: bool,
     config: Config,
     uat: mmu::Uat,
     drm: driver::AsahiDevRef,
@@ -119,6 +146,463 @@ impl Inner {
         self.config.log_recovery_state(&self.drm,events)
     }
 }
+impl Inner {
+    /// Fail every packet that was never published. Their fences signal with the error.
+    fn fail_pending(&mut self, error: Error) {
+        for (packet,_) in self.pending.drain_all() {packet.finish(Err(error));}
+    }
+    /// A published batch failed or never retired: latch the fault, log it, and fail its
+    /// packets. The packets stay retained (with their VM job guards) until teardown, because
+    /// the firmware has not provably stopped using their memory.
+    fn fail_active(&mut self, error: Error) {
+        if let Some((index,vm))=self.active.first().map(|b|(b.index,b.entries[0].0.vm.clone())) {
+            self.fail(index,&vm,error);
+        } else {self.capture_fault(error);}
+        for batch in self.active.drain_all() {Self::finish_all(&batch.entries,Err(error));}
+        self.fail_pending(error);
+    }
+    /// Hardware completion is separate from fence signaling: cancellation can win the
+    /// signal race while the DMA guard must survive until its final published batch retires.
+    fn packet_active(&self, packet:&Arc<crate::m3_submit::Packet>)->bool {
+        self.active.iter().any(|b|b.entries.iter().any(|(p,_)|Arc::ptr_eq(p,packet)))
+    }
+    fn retire_packets(&mut self,entries:&[(Arc<crate::m3_submit::Packet>,usize)]) {
+        for (packet,_) in entries {
+            let pending=self.pending.iter().any(|(p,_)|Arc::ptr_eq(p,packet));
+            if policy::packet_retired(pending,self.packet_active(packet)) {packet.retired();}
+        }
+        // Keep exactly active DMA owners. Successful retirement may precede a VM switch.
+        self.packets.retain(|p| self.active.iter().any(|b|b.entries.iter().any(|(q,_)|Arc::ptr_eq(p,q))));
+    }
+    fn fail_front(&mut self,error:Error) {
+        if let Ok((packet,_))=self.pending.remove(0) {
+            if !self.packet_active(&packet) && !self.fault_captured {packet.release_guard();}
+            packet.finish(Err(error));
+        }
+    }
+    /// Signal every packet of `entries` (packets that continue past the batch included).
+    fn finish_all(entries:&[(Arc<crate::m3_submit::Packet>,usize)],result:Result) {
+        for (packet,_) in entries {packet.finish(result);}
+    }
+    /// Choose the next batch from the front of `pending`: the front packet's next commands of
+    /// one engine, and for render also the leading render commands of following packets of the
+    /// same VM, up to the ordered-batch limit.
+    fn next_batch(&self,max:usize)->Result<KVec<(Arc<crate::m3_submit::Packet>,usize)>> {
+        let mut entries=KVec::new();
+        let Some((packet,next))=self.pending.first() else {return Ok(entries);};
+        let render=matches!(packet.commands[*next],crate::m3_submit::Command::Render{..});
+        let limit=if render {
+            // The first render draw initializes the shared buffer manager (InitBM) and opens
+            // both queues. Publish it alone: appending later draws first advances the shared
+            // manager and event counters it starts from, and on J613 the second pass's
+            // fragment then fails with firmware error event 4 (draw=2 batch=2).
+            let started=self.jobs.iter().any(|job| matches!(job,NativeJob::Render(j) if j.started()));
+            if started {crate::m3_params::render_batch_size().min(max).max(1)} else {1}
+        } else {
+            crate::m3_params::compute_batch_size()
+                .clamp(1,crate::m3_compute_storage::SLOTS)
+        };
+        let same_engine=|c:&crate::m3_submit::Command| render==matches!(c,crate::m3_submit::Command::Render{..});
+        for (position,(candidate,start)) in self.pending.iter().enumerate() {
+            // Later packets join only render batches, only from their first command, and only
+            // for the VM the batch is bound to, while the batch's expected GPU time is within
+            // the budget.
+            if position>0 && !policy::may_join(render,*start,candidate.vm.same(&packet.vm),candidate.urgency==packet.urgency) {break;}
+            let mut index=*start;
+            while index<candidate.commands.len() && entries.len()<limit && same_engine(&candidate.commands[index]) {
+                entries.push((candidate.clone(),index),GFP_KERNEL)?;
+                index+=1;
+            }
+            // Stop at the batch limit or where a packet continues with other commands.
+            if entries.len()>=limit || index<candidate.commands.len() {break;}
+        }
+        Ok(entries)
+    }
+    /// Whether the front pending work may be published behind the in-flight batches, and if so
+    /// in which pass slot it starts and how many passes it may use.
+    fn pipeline_slot(&mut self)->Result<Option<(usize,usize)>> {
+        Ok(self.active.is_empty().then_some((0,crate::m3_pass_layout::SLOTS)))
+    }
+    /// Publish pending batches while allowed: one when none is active, more behind it with
+    /// asahi.m3_pipeline_depth > 1. Returns whether anything was published or failed.
+    fn publish_next(&mut self)->bool {
+        let mut progress=false;
+        while !self.pending.is_empty() && self.state.healthy() {
+            let overlap=!self.active.is_empty();
+            let (base,max)=match self.pipeline_slot() {
+                Ok(Some(slot))=>slot,
+                Ok(None)=>break,
+                Err(error)=>{self.fail_active(error);return true;}
+            };
+            let entries=match self.next_batch(max) {
+                Ok(entries) if !entries.is_empty()=>entries,
+                _=>{self.fail_front(ENOMEM);progress=true;continue;},
+            };
+            match self.publish(&entries,base,overlap) {
+                Ok(batch)=>{
+                    // Consume the published commands from `pending`.
+                    let Some((last,last_index))=entries.last().map(|(p,i)|(p.clone(),*i)) else {break;};
+                    while let Some((packet,_))=self.pending.first() {
+                        if Arc::ptr_eq(packet,&last) {
+                            if last_index+1==last.commands.len() {let _=self.pending.remove(0);}
+                            else {self.pending[0].1=last_index+1;}
+                            break;
+                        }
+                        let _=self.pending.remove(0);
+                    }
+                    if self.active.push(batch,GFP_KERNEL).is_err() {
+                        // Published but untracked: it can never be retired.
+                        self.capture_fault(ENOMEM);Self::finish_all(&entries,Err(ENOMEM));
+                        self.fail_active(ENOMEM);return true;
+                    }
+                    progress=true;
+                }
+                Err((error,published))=>{
+                    if published {
+                        if crate::t8122_start::is_t8122(self.device.soc()) && !self.t8122_verdict {
+                            crate::t8122_start::job_setup_failed_verdict(self.drm.as_ref(),error);
+                            self.t8122_verdict=true;
+                        }
+                        // A doorbell may have been rung: latch the fault, keep the packets
+                        // retained (self.packets) and fail them and everything in flight.
+                        self.capture_fault(error);
+                        Self::finish_all(&entries,Err(error));
+                        self.fail_active(error);
+                        self.fail_pending(error);
+                        return true;
+                    } else if overlap && error==EBUSY {
+                        // Not publishable behind the running batch (new VM binding or storage
+                        // growth): wait for it to retire.
+                        break;
+                    } else {
+                        // Nothing reached the firmware: fail only the front packet, as a failed
+                        // execute() did before publication.
+                        self.fail_front(error);
+                        progress=true;
+                    }
+                }
+            }
+        }
+        progress
+    }
+    /// Prepare and publish one batch. On error, reports whether a doorbell may have been rung.
+    fn publish(&mut self,entries:&[(Arc<crate::m3_submit::Packet>,usize)],base:usize,overlap:bool)->core::result::Result<Batch,(Error,bool)> {
+        let early=|e:Error|(e,false);
+        let (packet,first_index)=(&entries[0].0,entries[0].1);
+        let control=packet.commands[first_index];
+        let batch_count=entries.len();
+        let prepare=Instant::<Monotonic>::now();
+        // All host bookkeeping is reserved before mutating shared producer state.
+        // No allocation may fail after publication and lose a DMA owner.
+        self.active.reserve(1,GFP_KERNEL).map_err(|_|early(ENOMEM))?;
+        self.packets.reserve(entries.len(),GFP_KERNEL).map_err(|_|early(ENOMEM))?;
+        let mut owned=KVec::with_capacity(batch_count,GFP_KERNEL).map_err(|_|early(ENOMEM))?;
+        for (p,i) in entries {owned.push((p.clone(),*i),GFP_KERNEL).map_err(|_|early(ENOMEM))?;}
+
+        // Retain the batch's packets (and their VM job guards) until it retires; with batches
+        // in flight, also those of the earlier ones.
+        if !overlap {self.packets.clear();}
+        for (p,_) in entries {
+            if !self.packets.iter().any(|q| Arc::ptr_eq(q,p)) {self.packets.push(p.clone(),GFP_KERNEL).map_err(|_|early(ENOMEM))?;}
+        }
+        let found=self.jobs.iter().position(|job| matches!((job,control),
+            (NativeJob::Compute(_),crate::m3_submit::Command::Compute(_)) |
+            (NativeJob::Render(_),crate::m3_submit::Command::Render{..})));
+        let index=found.unwrap_or(self.jobs.len());
+        if found.is_none() {
+            let job=match control {
+                crate::m3_submit::Command::Compute(c)=>NativeJob::Compute(crate::m3_compute::Compute::new(&self.drm,&self.uat,&packet.vm,self.config.stats_region().map_err(early)?,c,self.device.soc().registers).map_err(early)?),
+                crate::m3_submit::Command::Render{..}=>NativeJob::Render(crate::m3_render::Render::new(&self.drm,&self.uat,&packet.vm,self.config.stats_region().map_err(early)?,self.device.soc().clusters,self.device.soc().registers).map_err(early)?),
+            };
+            self.jobs.push(job,GFP_KERNEL).map_err(|_|early(ENOMEM))?;
+        } else {
+            match (&mut self.jobs[index],control) {
+                (NativeJob::Render(_),crate::m3_submit::Command::Render{..})=>{},
+                (NativeJob::Compute(j),crate::m3_submit::Command::Compute(c))=>j.replay(&self.uat,&packet.vm,c).map_err(early)?,
+                _=>return Err(early(ENOTSUPP)),
+            }
+        }
+        if let NativeJob::Compute(j)=&mut self.jobs[index] {
+            let prepared=(||->Result {
+                for (slot,(p,next)) in entries.iter().enumerate() {
+                    if slot!=0 {
+                        let crate::m3_submit::Command::Compute(c)=p.commands[*next] else {return Err(EINVAL);};
+                        j.append(c)?;
+                    }
+                    let timestamps=p.timestamp_addresses(*next);
+                    let coalesce=crate::m3_compute_storage::coalesce_stamp_flush(
+                        p.wide_visibility[*next],timestamps,slot+1==batch_count);
+                    j.prepare_completion(coalesce)?;
+                    j.set_user_timestamps(timestamps)?;
+                    j.set_attachments(&p.attachments[*next])?;
+                }
+                Ok(())
+            })();
+            if let Err(error)=prepared {
+                j.abort_batch().map_err(|e|(e,true))?;
+                if found.is_none() {drop(self.jobs.remove(index).map_err(|_|early(EIO))?);}
+                return Err(early(error));
+            }
+        }
+        if let NativeJob::Render(j)=&mut self.jobs[index] {
+            let mut commands=KVec::with_capacity(batch_count,GFP_KERNEL).map_err(|_|early(ENOMEM))?;
+            for (p,next) in entries {commands.push(p.commands[*next],GFP_KERNEL).map_err(|_|early(ENOMEM))?;}
+            j.begin_batch(&self.drm,&self.uat,&packet.vm,&commands,base,overlap).map_err(early)?;
+            let prepared=(||->Result {
+                for (p,next) in entries {
+                    let crate::m3_submit::Command::Render{command,usc}=p.commands[*next] else {return Err(EINVAL);};
+                    j.append(command,usc)?;
+                    j.set_user_timestamps(p.render_timestamp_addresses(*next))?;
+                }
+                Ok(())
+            })();
+            if let Err(error)=prepared {j.abort_batch().map_err(|e|(e,true))?;return Err(early(error));}
+        }
+        let preparation_ns=prepare.elapsed().as_nanos();
+        self.t8122_verdict=false;
+        let previous_events=self.config.completed_events;
+        let publication_tick=if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {physical_counter()} else {0};
+        self.state.health.set_gpu_pending(true);
+        self.gpu_pending = true;
+        let late=|e:Error|(e,true);
+        let expected_events=match &self.jobs[index] {
+            NativeJob::Compute(j)=>{
+                self.config.submit_queue(2,j.queue(),j.head(),2,j.first()).map_err(late)?;
+                Pin::new(&mut self.transport).send_message(0x21,0x0083000000000002).map_err(late)?;1
+            },
+            NativeJob::Render(j)=>{
+                if j.first() {self.config.render_pb().map_err(late)?;}
+                let queues=j.queues();
+                self.config.submit_queue(1,queues[1],j.heads()[1],1,j.first()).map_err(late)?;
+                Pin::new(&mut self.transport).send_message(0x21,0x0083000000000001).map_err(late)?;
+                self.config.submit_queue(0,queues[0],j.heads()[0],0,j.first()).map_err(late)?;
+                Pin::new(&mut self.transport).send_message(0x21,0x0083000000000000).map_err(late)?;2
+            },
+        };
+        let measure=crate::debug::debug_enabled(crate::debug::DebugFlags::M3SubmitSummary);
+        let (base,last_draw)=match &self.jobs[index] {NativeJob::Render(j)=>{let (b,_,d)=j.batch();(b,d)},_=>(0,0)};
+        Ok(Batch { entries:owned, index, kind:usize::from(matches!(control,crate::m3_submit::Command::Compute(_))),
+            first:control, preparation_ns, previous_events, expected_events,
+            start:Instant::<Monotonic>::now(), measure, doorbell_counter_ns:if measure {physical_counter() as i64 * 1000 / 24} else {0},
+            polling_ns:0, polls:0, stamp_ns:-1, first_event_ns:-1, events_ns:-1, base, last_draw, publication_tick })
+    }
+    /// Check the active batch once. Ok(true): retired (its packets are signalled).
+    fn poll_active(&mut self)->Result<bool> {
+        let Some((index,measure,last_draw))=self.active.first().map(|b|(b.index,b.measure,b.last_draw)) else {return Ok(false);};
+        let poll_start=measure.then(Instant::<Monotonic>::now);
+        if !self.state.healthy() || self.config.drain(&self.drm).is_err() {
+            self.fail_active(EIO);return Err(EIO);
+        }
+        // With later batches in flight, the oldest retires once its own last draw's stamps
+        // have arrived; the last one is also checked for exact queue, event and engine idle.
+        if self.active.len()>1 {
+            let done=match &mut self.jobs[index] {NativeJob::Render(j)=>j.complete_through(last_draw),_=>Err(EINVAL)};
+            match done {
+                Ok(true)=>{
+                    let batch=self.active.remove(0).map_err(|_|EIO)?;
+                    if let Err(e)=self.retire(&batch) {
+                        self.capture_fault(e);Self::finish_all(&batch.entries,Err(e));
+                        self.fail_active(e);return Err(e);
+                    }
+                    self.retire_packets(&batch.entries);
+                    return Ok(true);
+                }
+                Ok(false)=>{
+                    let (expired,previous)=self.active.first().map(|b|(b.start.elapsed()>=Delta::from_secs(2),b.previous_events)).ok_or(EIO)?;
+                    if expired {
+                        dev_err!(self.drm.as_ref(),"M3 pipelined completion events={} previous={}\n",self.config.completed_events,previous);
+                        self.fail_active(ETIMEDOUT);return Err(ETIMEDOUT);
+                    }
+                    return Ok(false);
+                }
+                Err(e)=>{self.fail_active(e);return Err(e);}
+            }
+        }
+        let stamped=match self.jobs[index].complete() {Ok(v)=>v,Err(e)=>{self.fail_active(e);return Err(e);}};
+        let completed=self.config.completed_events;
+        let (evented,expired,previous)={
+            let batch=self.active.first_mut().ok_or(EIO)?;
+            let evented=completed>=batch.previous_events+batch.expected_events;
+            if batch.measure {
+                let at=batch.start.elapsed().as_nanos();
+                if stamped && batch.stamp_ns<0 {batch.stamp_ns=at;}
+                if completed>batch.previous_events && batch.first_event_ns<0 {batch.first_event_ns=at;}
+                if evented && batch.events_ns<0 {batch.events_ns=at;}
+            }
+            if let Some(t)=poll_start {batch.polling_ns+=t.elapsed().as_nanos();batch.polls+=1;}
+            (evented,batch.start.elapsed()>=Delta::from_secs(2),batch.previous_events)
+        };
+        if stamped && evented {
+            let retire_mmio=crate::m3_params::retire_mmio(self.device.soc());
+            match self.device.check_idle_parts(
+                retire_mmio&crate::m3_params::RETIRE_MMIO_BUSY!=0,
+                retire_mmio&crate::m3_params::RETIRE_MMIO_FAULTS!=0) {
+                Ok(())=>match self.config.pipes_idle() {
+                    Ok(true)=>{
+                        if retire_mmio&crate::m3_params::RETIRE_MMIO_PSTATE!=0 {
+                            if let Err(e)=self.config.check_pstate(&self.drm,&self.device,"after a job") {
+                                if crate::t8122_start::is_t8122(self.device.soc()) {
+                                    crate::t8122_start::cap_violated_verdict(self.drm.as_ref(),e);
+                                    self.t8122_verdict=true;
+                                }
+                                self.fail_active(e);return Err(e);
+                            }
+                        }
+                        // Stamps, both queue indices, required events,
+                        // firmware health, engines and pipes are verified.
+                        let batch=self.active.remove(0).map_err(|_|EIO)?;
+                        if let Err(e)=self.retire(&batch) {
+                            self.capture_fault(e);
+                            Self::finish_all(&batch.entries,Err(e));
+                            self.fail_pending(e);
+                            return Err(e);
+                        }
+                        // Signal every packet whose last command was in this batch. A packet
+                        // that continues with other commands is still at the front of `pending`.
+                        self.retire_packets(&batch.entries);
+                        return Ok(true);
+                    },
+                    Ok(false)=>{}, // Firmware must consume every submitted queue message.
+                    Err(e)=>{self.fail_active(e);return Err(e);}
+                },
+                Err(e) if e==EBUSY=>{}, // Retirement can trail the event.
+                Err(e)=>{self.fail_active(e);return Err(e);}
+            }
+        }
+        if expired {
+            dev_err!(self.drm.as_ref(),"M3 completion events={} previous={}\n",completed,previous);
+            self.fail_active(ETIMEDOUT);return Err(ETIMEDOUT);
+        }
+        Ok(false)
+    }
+    /// Bookkeeping for a retired batch, then signal its completed packets.
+    fn retire(&mut self,batch:&Batch)->Result {
+        let retire_start=batch.measure.then(Instant::<Monotonic>::now);
+        let index=batch.index;let batch_count=batch.entries.len();let control=batch.first;
+        self.state.health.record_completion();
+        if self.active.is_empty() {
+            match &mut self.jobs[index] {
+                NativeJob::Compute(j)=>j.progress(&self.drm)?,
+                NativeJob::Render(j)=>j.progress(&self.drm)?,
+            }
+        }
+        let retired_counter_ns=if batch.measure {physical_counter() as i64 * 1000 / 24} else {0};
+        let ticks=match &mut self.jobs[index] {
+            NativeJob::Render(j) if batch.measure=>Some(j.gpu_ticks(batch.base,batch_count)?),
+            _=>None,
+        };
+        let stages=match &mut self.jobs[index] {
+            NativeJob::Render(j)=>j.stage_ns(batch.base,batch_count)?,
+            _=>[0;3],
+        };
+        let (kind,gpu_ns)=match &mut self.jobs[index] {
+            NativeJob::Compute(j)=>(1,j.gpu_ns()?),
+            NativeJob::Render(j)=>(0,j.gpu_ns(batch.base,batch_count)?),
+        };
+        if kind==0 {
+            self.render_batches[batch_count-1]+=1;
+            self.render_initialized=true;
+        }
+        if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {
+            let observed_tick=physical_counter();
+            let (cs,span)=match (&mut self.jobs[index],control) {
+                (NativeJob::Compute(j),crate::m3_submit::Command::Compute(c))=>(c.base,j.batch_gpu_span()?),
+                (NativeJob::Render(j),crate::m3_submit::Command::Render{command:r,..})=>{let (a,b)=j.gpu_ticks(batch.base,batch_count)?;(r.vdm_base,[a,b])},
+                _=>return Err(EINVAL),
+            };
+            let valid=batch.publication_tick!=0 && span[0]>=batch.publication_tick && span[1]>=span[0] && observed_tick>=span[1];
+            dev_info!(self.drm.as_ref(),"M3_BATCH_BOUNDARY cs={:#x} batch={} publication_tick={} gpu_start_tick={} gpu_end_tick={} observed_tick={} counter_hz=24000000 valid={}\n",
+                cs,batch_count,batch.publication_tick,span[0],span[1],observed_tick,u32::from(valid));
+            if let NativeJob::Compute(j)=&mut self.jobs[index] {
+                for (slot,(p,next)) in batch.entries.iter().enumerate() {
+                    let crate::m3_submit::Command::Compute(c)=p.commands[*next] else {return Err(EINVAL);};
+                    let ns=j.slot_gpu_ns(slot)?;
+                    dev_info!(self.drm.as_ref(),"M3_COMPUTE_SLOT slot={} batch={} cdm={:#x} end={:#x} usc={:#x} gpu_ns={}\n",slot,batch_count,c.base,c.end,c.usc_base,ns);
+                }
+            }
+            if let NativeJob::Render(j)=&mut self.jobs[index] {
+                for (slot,(p,next)) in batch.entries.iter().enumerate() {
+                    let crate::m3_submit::Command::Render{command:r,..}=p.commands[*next] else {return Err(EINVAL);};
+                    let s=j.slot_stage_ns(batch.base,batch_count,slot)?;
+                    dev_info!(self.drm.as_ref(),"M3_PASS_SLOT slot={} batch={} vdm={:#x} width={} height={} samples={} ta_ns={} fragment_ns={} gap_ns={}\n",slot,batch_count,r.vdm_base,r.width,r.height,r.samples,s[0],s[1],s[2]);
+                }
+            }
+        }
+        let preparation_ns=batch.preparation_ns;
+        let active_ns=batch.start.elapsed().as_nanos();
+        self.state.health.timing.record(kind==0, batch_count as u64,
+            preparation_ns, active_ns, gpu_ns, stages);
+        let retirement_ns=retire_start.map_or(0,|t|t.elapsed().as_nanos());
+        if batch.measure {
+            if let crate::m3_submit::Command::Render {command:r,..}=control {
+                if batch_count>1 {self.geometry_overflow+=1;} else {
+                if let Some(g)=self.geometry.iter_mut().find(|g|
+                    g.count==0 || (g.width==r.width && g.height==r.height && g.samples==r.samples)) {
+                    g.width=r.width;g.height=r.height;g.samples=r.samples;
+                    g.count+=1;g.prepare_ns+=preparation_ns;g.active_ns+=active_ns;
+                    g.gpu_ns+=gpu_ns;g.tiling_ns+=stages[0];g.fragment_ns+=stages[1];
+                    g.max_fragment_ns=g.max_fragment_ns.max(stages[1]);
+                    g.polling_ns+=batch.polling_ns;g.retirement_ns+=retirement_ns;
+                    g.polls+=batch.polls;
+                    g.stamp_ns+=batch.stamp_ns;g.first_event_ns+=batch.first_event_ns;g.events_ns+=batch.events_ns;
+                    if let Some((ta,fe))=ticks {
+                        g.pickup_ns+=(ta as i64)*1000/24-batch.doorbell_counter_ns;
+                        g.tail_ns+=retired_counter_ns-(fe as i64)*1000/24;
+                    }
+                } else {
+                    self.geometry_overflow+=1;
+                }
+                }
+            }
+        }
+        if crate::debug::debug_enabled(crate::debug::DebugFlags::SubmitTiming) {
+            match control {
+                crate::m3_submit::Command::Render {command:r,..}=>
+                    dev_info!(self.drm.as_ref(),"M3_PASS kind=render batch={} vdm={:#x} width={} height={} samples={} prepare_ns={} active_ns={} gpu_ns={} ta_ns={} fragment_ns={} gap_ns={}\n",batch_count,r.vdm_base,r.width,r.height,r.samples,preparation_ns,active_ns,gpu_ns,stages[0],stages[1],stages[2]),
+                crate::m3_submit::Command::Compute(_)=>
+                    dev_info!(self.drm.as_ref(),"M3_PASS kind=compute prepare_ns={} active_ns={} gpu_ns={}\n",preparation_ns,active_ns,gpu_ns),
+            }
+        }
+        let t=&mut self.timing[kind];
+        t[0]+=1;t[1]+=preparation_ns;t[2]+=active_ns;t[3]+=gpu_ns as i64;
+        for i in 0..3 {t[4+i]+=stages[i] as i64;}
+        // Running totals are in debugfs `timing`; the periodic line is a SubmitTiming diagnostic.
+        if t[0]==1 && crate::t8122_start::is_t8122(self.device.soc()) {
+            let span=match &mut self.jobs[index] {
+                NativeJob::Compute(j)=>j.batch_gpu_span().ok(),
+                NativeJob::Render(j)=>j.gpu_ticks(batch.base,batch_count).ok().map(|(a,b)|[a,b]),
+            };
+            crate::t8122_start::job_completed_verdict(self.drm.as_ref(),kind,gpu_ns,span);
+        }
+        if t[0]%128==0 && crate::debug::debug_enabled(crate::debug::DebugFlags::SubmitTiming) {
+            dev_info!(self.drm.as_ref(),"M3_TIMING kind={} count={} prepare_ns={} active_ns={} gpu_ns={} ta_ns={} fragment_ns={} gap_ns={} ordinal={}\n",kind,t[0],t[1],t[2],t[3],t[4],t[5],t[6],
+                match &self.jobs[index] {NativeJob::Render(j)=>j.ordinal(),NativeJob::Compute(j)=>j.ordinal()});
+        }
+        if kind==0 && t[0]%512==0 &&
+            crate::debug::debug_enabled(crate::debug::DebugFlags::M3SubmitSummary) {
+            let early=match &self.jobs[index] {NativeJob::Render(j)=>j.early_count(),_=>0};
+            dev_info!(self.drm.as_ref(),"M3_ORDERED_BATCHES depths={:?} early={} packets={}\n", self.render_batches,early,self.coalesced_packets);
+            let now=<Monotonic as kernel::time::ClockSource>::ktime_get();
+            dev_info!(self.drm.as_ref(),"M3_GEOMETRY_BATCH ns={} render_count={} overflow={}\n",
+                now,t[0],self.geometry_overflow);
+            self.geometry_overflow=0;
+            for g in &mut self.geometry {
+                if g.count==0 {continue;}
+                dev_info!(self.drm.as_ref(),"M3_GEOMETRY ns={} width={} height={} samples={} count={} prepare_ns={} active_ns={} gpu_ns={} tiling_ns={} fragment_ns={} max_fragment_ns={} polling_ns={} retirement_ns={} sleeping_ns={} polls={} stamp_ns={} first_event_ns={} events_ns={} pickup_ns={} tail_ns={}\n",
+                    now,g.width,g.height,g.samples,g.count,g.prepare_ns,g.active_ns,g.gpu_ns,g.tiling_ns,g.fragment_ns,g.max_fragment_ns,g.polling_ns,g.retirement_ns,g.sleeping_ns,g.polls,g.stamp_ns,g.first_event_ns,g.events_ns,g.pickup_ns,g.tail_ns);
+                *g=GeometryTiming::default();
+            }
+        }
+        if self.active.is_empty() {
+            self.gpu_pending = false;
+            self.state.health.set_gpu_pending(false);
+        }
+        for pair in batch.entries.windows(2) {
+            if !Arc::ptr_eq(&pair[0].0,&pair[1].0) {self.coalesced_packets+=1;}
+        }
+        Ok(())
+    }
+}
 // Keep the large graph on the heap: returning and moving it through probe,
 // Registration and Mutex initialization otherwise duplicates it on the bounded
 // kernel stack. ManuallyDrop retains the whole allocation on failed ASC stop.
@@ -173,8 +657,8 @@ impl Runtime {
             }
         };
         Ok(Self { inner: ManuallyDrop::new(owner.write(Inner { transport, state, config, uat, drm, device,
-            jobs:KVec::new(),packets:KVec::new(),gpu_pending:false,fault_captured:false,timing:[[0;7];2],render_batches:[0;crate::m3_pass_layout::SLOTS],
-            geometry:[GeometryTiming::default();32],geometry_overflow:0,t8122_verdict:false,
+            jobs:KVec::new(),packets:KVec::new(),pending:KVec::new(),active:KVec::new(),gpu_pending:false,fault_captured:false,timing:[[0;7];2],render_batches:[0;crate::m3_pass_layout::SLOTS],
+            geometry:[GeometryTiming::default();32],geometry_overflow:0,coalesced_packets:0,render_initialized:false,t8122_verdict:false,
             boot_step:crate::t8122_start::BootStep::Publish })) })
     }
     pub(crate) fn drm(&self) -> driver::AsahiDevRef { self.inner.drm.clone() }
@@ -194,325 +678,64 @@ impl Runtime {
         bo.map_range_into_range(self.inner.uat.kernel_vm(),range,crate::agx_memory::TIMESTAMP_RANGE,
             mmu::UAT_PGSZ as u64,mmu::PROT_FW_SHARED_RW,false)
     }
-    /// The DRM scheduler's single run-job worker owns execution. Release only
-    /// the runtime mutex during bounded waits so independent CPU VM/timestamp
-    /// preparation can overlap GPU work; no second packet or pass is published.
-    pub(crate) fn execute(shared: &crate::m3_drm::Shared,
-                          packet: Arc<crate::m3_submit::Packet>) -> Result {
-        let result = Self::execute_inner(shared, packet);
-        if let Err(error) = result {
-            if let Some(runtime) = Option::as_mut(&mut *shared.lock()) {
-                let inner = &mut runtime.inner;
-                if inner.gpu_pending {
-                    // A job was submitted but execution returned an error without one of the
-                    // paths above (fail() or the cap check) reaching a T8122 verdict: a submit,
-                    // doorbell or post-completion read failed. Name it so no job outcome is
-                    // reported as success.
-                    if crate::t8122_start::is_t8122(inner.device.soc()) && !inner.t8122_verdict {
-                        crate::t8122_start::job_setup_failed_verdict(inner.drm.as_ref(), error);
-                        inner.t8122_verdict = true;
-                    }
-                    inner.capture_fault(error);
-                }
-            }
-        }
-        result
-    }
-    fn execute_inner(shared: &crate::m3_drm::Shared,
-                     packet: Arc<crate::m3_submit::Packet>) -> Result {
+    /// Queue a packet and return its fence at once. The scheduler can hand over further
+    /// ready jobs up to its credit limit while the GPU runs. Only the completion worker
+    /// publishes: it coalesces render commands of one VM and urgency, and may keep bounded
+    /// same-VM batches in flight after InitBM retirement. VM/engine changes wait for full
+    /// retirement. A burst can therefore share a firmware round trip across packets.
+    pub(crate) fn submit(shared:&crate::m3_drm::Shared,packet:Arc<crate::m3_submit::Packet>)->Result {
         crate::debug::update_debug_flags();
-        let render_batch_size=crate::m3_params::render_batch_size();
-        let compute_batch_size=crate::m3_params::compute_batch_size();
-        let mut guard = shared.lock();
-        let events = {
-            let inner: &mut Inner = &mut *Option::as_mut(&mut *guard).ok_or(ENODEV)?.inner;
-            if !inner.state.healthy() { return Err(EIO); }
-            // A future second executor must fail closed, never reset storage
-            // or clear retained owners of the scheduler's in-flight packet.
-            if inner.gpu_pending { return Err(EBUSY); }
-            if packet.commands.is_empty() || packet.commands.len() > 256 {
-                pr_err!("M3 submit limit: commands={} maximum=256\n", packet.commands.len());
-                return Err(E2BIG);
-            }
-            inner.packets.clear();
-            inner.packets.push(packet.clone(), GFP_KERNEL)?;
-            inner.t8122_verdict=false;
-            inner.state.events.clone()
-        };
-        // Snapshot once per packet. A root policy write cannot change ownership
-        // halfway through it. The initial value preserves m3_unlocked_wait.
-        let overlap_cpu = events.cpu_overlap();
-        let mut command_index=0;
-        while command_index<packet.commands.len() {
-            let control=packet.commands[command_index];
-            let batch_count=if matches!(control,crate::m3_submit::Command::Render{..}) {
-                // The first render draw initializes the shared buffer manager and opens both
-                // render queues: publish it alone. Draws appended to it would advance the shared
-                // manager and event counters it starts from.
-                let started=Option::as_ref(&*guard).ok_or(ENODEV)?.inner.jobs.iter()
-                    .any(|job| matches!(job,NativeJob::Render(j) if j.started()));
-                let limit=if started {render_batch_size} else {1};
-                packet.commands[command_index..].iter().take(limit)
-                    .take_while(|c|matches!(c,crate::m3_submit::Command::Render{..})).count()
-            } else {
-                packet.commands[command_index..].iter().take(compute_batch_size)
-                    .take_while(|c|matches!(c,crate::m3_submit::Command::Compute(_))).count()
-            };
-            let prepare=Instant::<Monotonic>::now();
-            let inner: &mut Inner=&mut *Option::as_mut(&mut *guard).ok_or(ENODEV)?.inner;
-            let found=inner.jobs.iter().position(|job| matches!((job,control),
-                (NativeJob::Compute(_),crate::m3_submit::Command::Compute(_)) |
-                (NativeJob::Render(_),crate::m3_submit::Command::Render{..})));
-            let index=found.unwrap_or(inner.jobs.len());
-            if found.is_none() {
-                let job=match control {
-                    crate::m3_submit::Command::Compute(c)=>NativeJob::Compute(crate::m3_compute::Compute::new(&inner.drm,&inner.uat,&packet.vm,inner.config.stats_region()?,c,inner.device.soc().registers)?),
-                    crate::m3_submit::Command::Render{..}=>NativeJob::Render(crate::m3_render::Render::new(&inner.drm,&inner.uat,&packet.vm,inner.config.stats_region()?,inner.device.soc().clusters,
-                        inner.device.soc().registers)?),
-                };
-                inner.jobs.push(job,GFP_KERNEL)?;
-            } else {
-                match (&mut inner.jobs[index],control) {
-                    (NativeJob::Render(_),crate::m3_submit::Command::Render{..})=>{},
-                    (NativeJob::Compute(j),crate::m3_submit::Command::Compute(c))=>j.replay(&inner.uat,&packet.vm,c)?,
-                    _=>return Err(ENOTSUPP),
-                }
-            }
-            if let NativeJob::Compute(j)=&mut inner.jobs[index] {
-                let prepared=(||->Result {
-                    for next in command_index..command_index+batch_count {
-                        if next!=command_index {
-                            let crate::m3_submit::Command::Compute(c)=packet.commands[next] else {return Err(EINVAL);};
-                            j.append(c)?;
-                        }
-                        let timestamps=packet.timestamp_addresses(next);
-                        let coalesce=crate::m3_compute_storage::coalesce_stamp_flush(
-                            packet.wide_visibility[next],timestamps,next+1==command_index+batch_count);
-                        j.prepare_completion(coalesce)?;
-                        j.set_user_timestamps(timestamps)?;
-                        j.set_attachments(&packet.attachments[next])?;
-                    }
-                    Ok(())
-                })();
-                if let Err(error)=prepared {
-                    j.abort_batch()?;
-                    if found.is_none() {drop(inner.jobs.remove(index).map_err(|_|EIO)?);}
-                    return Err(error);
-                }
-            }
-            if let NativeJob::Render(j)=&mut inner.jobs[index] {
-                j.begin_batch(&inner.drm,&inner.uat,&packet.vm,
-                    &packet.commands[command_index..command_index+batch_count])?;
-                let prepared=(||->Result {
-                    for next in command_index..command_index+batch_count {
-                        let crate::m3_submit::Command::Render{command,usc}=packet.commands[next] else {return Err(EINVAL);};
-                        j.append(command,usc)?;
-                        j.set_user_timestamps(packet.render_timestamp_addresses(next))?;
-                    }
-                    Ok(())
-                })();
-                if let Err(error)=prepared {j.abort_batch()?;return Err(error);}
-            }
-            let preparation_ns=prepare.elapsed().as_nanos();
-            let previous_events=inner.config.completed_events;
-            inner.state.health.set_gpu_pending(true);
-            inner.gpu_pending = true;
-            // Diagnostic only: publication precedes queue writes/doorbells.
-            // Never compare an unscaled AP counter to firmware timestamps.
-            let boundary_profile=crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming);
-            let publication_tick=if boundary_profile {physical_counter()} else {0};
-            let expected_events=match &inner.jobs[index] {
-                NativeJob::Compute(j)=>{
-                    inner.config.submit_queue(2,j.queue(),j.head(),2,j.first())?;
-                    Pin::new(&mut inner.transport).send_message(0x21,0x0083000000000002)?;1
-                },
-                NativeJob::Render(j)=>{
-                    if j.first() {inner.config.render_pb()?;}
-                    let queues=j.queues();
-                    inner.config.submit_queue(1,queues[1],j.heads()[1],1,j.first())?;
-                    Pin::new(&mut inner.transport).send_message(0x21,0x0083000000000001)?;
-                    inner.config.submit_queue(0,queues[0],j.heads()[0],0,j.first())?;
-                    Pin::new(&mut inner.transport).send_message(0x21,0x0083000000000000)?;2
-                },
-            };
-            let start=Instant::<Monotonic>::now();
-            let mut trailing=0;
-            let mut waited_at=u64::MAX;
-            let measure=crate::debug::debug_enabled(crate::debug::DebugFlags::M3SubmitSummary);
-            let (mut polling_ns,mut retirement_ns,mut sleeping_ns,mut polls)=(0,0,0,0);
-            loop {
-                // Unbind may remove the runtime while unlocked. Drop either
-                // proves ASC stopped or quarantines all pending DMA owners.
-                let inner: &mut Inner=&mut *Option::as_mut(&mut *guard).ok_or(ENODEV)?.inner;
-                let poll_start=measure.then(Instant::<Monotonic>::now);
-                let messages=inner.state.event_messages.load(Ordering::Acquire);
-                if !inner.state.healthy() || inner.config.drain(&inner.drm).is_err() {
-                    inner.fail(index, &packet.vm, EIO);return Err(EIO);
-                }
-                let complete=inner.jobs[index].complete()? && inner.config.completed_events>=previous_events+expected_events;
-                if let Some(t)=poll_start {polling_ns+=t.elapsed().as_nanos();polls+=1;}
-                if complete {
-                    let retire_start=measure.then(Instant::<Monotonic>::now);
-                    let retire_mmio=crate::m3_params::retire_mmio(inner.device.soc());
-                    match inner.device.check_idle_parts(
-                        retire_mmio&crate::m3_params::RETIRE_MMIO_BUSY!=0,
-                        retire_mmio&crate::m3_params::RETIRE_MMIO_FAULTS!=0) {
-                        Ok(()) if inner.config.pipes_idle()?=>{
-                            let pstate=if retire_mmio&crate::m3_params::RETIRE_MMIO_PSTATE!=0 {
-                                inner.config.check_pstate(&inner.drm,&inner.device,"after a job")
-                            } else {Ok(())};
-                            if let Err(e)=pstate {
-                                inner.state.health.mark_failed();
-                                if crate::t8122_start::is_t8122(inner.device.soc()) {
-                                    crate::t8122_start::cap_violated_verdict(inner.drm.as_ref(),e);
-                                    inner.t8122_verdict=true;
-                                }
-                                return Err(e);
-                            }
-                            let observed_tick=if boundary_profile {physical_counter()} else {0};
-                            // Stamps, both queue indices, required events,
-                            // firmware health, engines and pipes are verified.
-                            inner.state.health.record_completion();
-                            match &mut inner.jobs[index] {
-                                NativeJob::Compute(j)=>j.progress(&inner.drm)?,
-                                NativeJob::Render(j)=>j.progress(&inner.drm)?,
-                            }
-                            let stages=match &mut inner.jobs[index] {
-                                NativeJob::Render(j)=>j.stage_ns()?,
-                                _=>[0;3],
-                            };
-                            let (kind,gpu_ns)=match &mut inner.jobs[index] {
-                                NativeJob::Compute(j)=>(1,j.gpu_ns()?),
-                                NativeJob::Render(j)=>(0,j.gpu_ns()?),
-                            };
-                            if kind==0 {inner.render_batches[batch_count-1]+=1;}
-                            if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {
-                                let (cs,span)=match (&mut inner.jobs[index],control) {
-                                    (NativeJob::Compute(j),crate::m3_submit::Command::Compute(c))=>(c.base,j.batch_gpu_span()?),
-                                    (NativeJob::Render(j),crate::m3_submit::Command::Render{command:r,..})=>(r.vdm_base,j.batch_gpu_span()?),
-                                    _=>return Err(EINVAL),
-                                };
-                                let valid=publication_tick!=0 && span[0]>=publication_tick &&
-                                    span[1]>=span[0] && observed_tick>=span[1];
-                                dev_info!(inner.drm.as_ref(),"M3_BATCH_BOUNDARY cs={:#x} batch={} publication_tick={} gpu_start_tick={} gpu_end_tick={} observed_tick={} counter_hz=24000000 valid={}\n",
-                                    cs,batch_count,publication_tick,span[0],span[1],observed_tick,u32::from(valid));
-                                if let NativeJob::Compute(j)=&mut inner.jobs[index] {
-                                    for slot in 0..batch_count {
-                                        let crate::m3_submit::Command::Compute(c)=packet.commands[command_index+slot] else {return Err(EINVAL);};
-                                        let ns=j.slot_gpu_ns(slot)?;
-                                        dev_info!(inner.drm.as_ref(),"M3_COMPUTE_SLOT slot={} batch={} cdm={:#x} end={:#x} usc={:#x} gpu_ns={}\n",slot,batch_count,c.base,c.end,c.usc_base,ns);
-                                    }
-                                }
-                                if let NativeJob::Render(j)=&mut inner.jobs[index] {
-                                    for slot in 0..batch_count {
-                                        let crate::m3_submit::Command::Render{command:r,..}=packet.commands[command_index+slot] else {return Err(EINVAL);};
-                                        let s=j.slot_stage_ns(slot)?;
-                                        dev_info!(inner.drm.as_ref(),"M3_PASS_SLOT slot={} batch={} vdm={:#x} width={} height={} samples={} ta_ns={} fragment_ns={} gap_ns={}\n",slot,batch_count,r.vdm_base,r.width,r.height,r.samples,s[0],s[1],s[2]);
-                                    }
-                                }
-                            }
-                            let t=&mut inner.timing[kind];
-                            let active_ns=start.elapsed().as_nanos();
-                            inner.state.health.timing.record(kind==0, batch_count as u64,
-                                preparation_ns, active_ns, gpu_ns, stages);
-                            if let Some(t)=retire_start {retirement_ns+=t.elapsed().as_nanos();}
-                            if crate::debug::debug_enabled(crate::debug::DebugFlags::M3SubmitSummary) {
-                                if let crate::m3_submit::Command::Render {command:r,..}=control {
-                                    if batch_count>1 {inner.geometry_overflow+=1;} else {
-                                    if let Some(g)=inner.geometry.iter_mut().find(|g|
-                                        g.count==0 || (g.width==r.width && g.height==r.height && g.samples==r.samples)) {
-                                        g.width=r.width;g.height=r.height;g.samples=r.samples;
-                                        g.count+=1;g.prepare_ns+=preparation_ns;g.active_ns+=active_ns;
-                                        g.gpu_ns+=gpu_ns;g.tiling_ns+=stages[0];g.fragment_ns+=stages[1];
-                                        g.max_fragment_ns=g.max_fragment_ns.max(stages[1]);
-                                        g.polling_ns+=polling_ns;g.retirement_ns+=retirement_ns;
-                                        g.sleeping_ns+=sleeping_ns;g.polls+=polls;
-                                    } else {
-                                        inner.geometry_overflow+=1;
-                                    }
-                                    }
-                                }
-                            }
-                            if crate::debug::debug_enabled(crate::debug::DebugFlags::SubmitTiming) {
-                                match control {
-                                    crate::m3_submit::Command::Render {command:r,..}=>
-                                        dev_info!(inner.drm.as_ref(),"M3_PASS kind=render vdm={:#x} width={} height={} samples={} prepare_ns={} active_ns={} gpu_ns={} ta_ns={} fragment_ns={} gap_ns={}\n",r.vdm_base,r.width,r.height,r.samples,preparation_ns,start.elapsed().as_nanos(),gpu_ns,stages[0],stages[1],stages[2]),
-                                    crate::m3_submit::Command::Compute(_)=>
-                                        dev_info!(inner.drm.as_ref(),"M3_PASS kind=compute prepare_ns={} active_ns={} gpu_ns={}\n",preparation_ns,start.elapsed().as_nanos(),gpu_ns),
-                                }
-                            }
-                            t[0]+=1;t[1]+=preparation_ns;t[2]+=active_ns;t[3]+=gpu_ns as i64;
-                            for i in 0..3 {t[4+i]+=stages[i] as i64;}
-                            if t[0]==1 && crate::t8122_start::is_t8122(inner.device.soc()) {
-                                let span=match &mut inner.jobs[index] {
-                                    NativeJob::Compute(j)=>j.batch_gpu_span().ok(),
-                                    NativeJob::Render(j)=>j.batch_gpu_span().ok(),
-                                };
-                                crate::t8122_start::job_completed_verdict(inner.drm.as_ref(),kind,gpu_ns,span);
-                            }
-                            if t[0]%128==0 {
-                                dev_info!(inner.drm.as_ref(),"M3_TIMING kind={} count={} prepare_ns={} active_ns={} gpu_ns={} ta_ns={} fragment_ns={} gap_ns={} ordinal={}\n",kind,t[0],t[1],t[2],t[3],t[4],t[5],t[6],
-                                    match &inner.jobs[index] {NativeJob::Render(j)=>j.ordinal(),NativeJob::Compute(j)=>j.ordinal()});
-                            }
-                            if kind==0 && t[0]%512==0 &&
-                                crate::debug::debug_enabled(crate::debug::DebugFlags::M3SubmitSummary) {
-                                let early=match &inner.jobs[index] {NativeJob::Render(j)=>j.early_count(),_=>0};
-                                dev_info!(inner.drm.as_ref(),"M3_ORDERED_BATCHES depths={:?} early={}\n", inner.render_batches,early);
-                                let now=<Monotonic as kernel::time::ClockSource>::ktime_get();
-                                dev_info!(inner.drm.as_ref(),"M3_GEOMETRY_BATCH ns={} render_count={} overflow={}\n",
-                                    now,t[0],inner.geometry_overflow);
-                                inner.geometry_overflow=0;
-                                for g in &mut inner.geometry {
-                                    if g.count==0 {continue;}
-                                    dev_info!(inner.drm.as_ref(),"M3_GEOMETRY ns={} width={} height={} samples={} count={} prepare_ns={} active_ns={} gpu_ns={} tiling_ns={} fragment_ns={} max_fragment_ns={} polling_ns={} retirement_ns={} sleeping_ns={} polls={}\n",
-                                        now,g.width,g.height,g.samples,g.count,g.prepare_ns,g.active_ns,g.gpu_ns,g.tiling_ns,g.fragment_ns,g.max_fragment_ns,g.polling_ns,g.retirement_ns,g.sleeping_ns,g.polls);
-                                    *g=GeometryTiming::default();
-                                }
-                            }
-                            inner.gpu_pending = false;
-                            inner.state.health.set_gpu_pending(false);break;
-                        },
-                        Ok(())=>{}, // Firmware must consume every submitted queue message.
-                        Err(e) if e==EBUSY=>{}, // Retirement can trail the event.
-                        Err(e)=>{inner.fail(index, &packet.vm, e);return Err(e);}
-                    }
-                }
-                if start.elapsed()>=Delta::from_secs(2) {
-                    dev_err!(inner.drm.as_ref(),"M3 completion events={} previous={}\n",inner.config.completed_events,previous_events);
-                    inner.fail(index, &packet.vm, ETIMEDOUT);return Err(ETIMEDOUT);
-                }
-                // Four bounded 5us polls cover stamps written just after an
-                // event without paying a scheduler round-trip for each poll.
-                // fsleep uses udelay at <=10us. Longer waits still sleep until
-                // an IRQ or the bounded resnapshot timer; retirement checks remain above.
-                // Wait without the runtime lock, so that VM creation, timestamp
-                // mapping and the completion worker's event drain are not held
-                // up for the duration of a job.
-                let sleep_start=measure.then(Instant::<Monotonic>::now);
-                if messages!=waited_at {waited_at=messages;trailing=0;}
-                let mut wait=|| {
-                    if trailing<4 {trailing+=1;fsleep(Delta::from_micros(5));}
-                    else {events.wait_past(messages);trailing=0;}
-                };
-                if overlap_cpu { drop(guard); wait(); guard=shared.lock(); }
-                else { wait(); }
-                if let Some(t)=sleep_start {sleeping_ns+=t.elapsed().as_nanos();}
-            }
-            command_index+=batch_count;
+        let mut guard=shared.lock();
+        let inner=&mut *Option::as_mut(&mut *guard).ok_or(ENODEV)?.inner;
+        if !inner.state.healthy() {return Err(EIO);}
+        if packet.commands.is_empty() || packet.commands.len()>256 {
+            pr_err!("M3 submit limit: commands={} maximum=256\n",packet.commands.len());
+            return Err(E2BIG);
         }
+        // Higher urgency first, FIFO within one urgency, including unfinished packets.
+        // More urgent work can overtake a continuation between retired batches.
+        // Packets of one queue share an urgency, so their order is kept.
+        let urgency=packet.urgency;
+        let at=policy::pending_position(inner.pending.iter().map(|(p,_)|p.urgency),urgency);
+        if inner.pending.len()>=policy::MAX_PACKETS {return Err(EBUSY);}
+        inner.pending.reserve(1,GFP_KERNEL)?;
+        inner.pending.insert_within_capacity(at,(packet,0)).map_err(|_|ENOMEM)?;
+        let drm=inner.drm.clone();
+        drop(guard);
+        crate::m3_completion::queue(&drm);
         Ok(())
     }
-    pub(crate) fn completion_wait(&self) -> Arc<m3_rtkit::EventWait> {
-        self.inner.state.events.clone()
+    /// Withdraw a packet's unpublished remainder on cancellation or timeout. Its active
+    /// commands remain owned until retirement; error signaling cannot release a DMA guard.
+    pub(crate) fn withdraw(shared:&crate::m3_drm::Shared,packet:&Arc<crate::m3_submit::Packet>)->bool {
+        let mut guard=shared.lock();
+        let Some(runtime)=Option::as_mut(&mut *guard) else {return false;};
+        let inner: &mut Inner=&mut runtime.inner;
+        let removed=inner.pending.iter().position(|(p,_)|Arc::ptr_eq(p,packet))
+            .is_some_and(|i|inner.pending.remove(i).is_ok());
+        if !inner.packet_active(packet) && !inner.fault_captured {packet.release_guard();}
+        removed
     }
-    pub(crate) fn service_events(&mut self) {
+    pub(crate) fn completion_wait(&self) -> Arc<m3_rtkit::EventWait> { self.inner.state.events.clone() }
+    pub(crate) fn events(&self)->Arc<m3_rtkit::EventWait> {self.inner.state.events.clone()}
+    /// One completion-worker step: retire the active batch if it has completed, then publish
+    /// the next one. The worker drops the runtime lock between steps.
+    pub(crate) fn service_job(&mut self)->Service {
         let inner: &mut Inner=&mut *self.inner;
-        if inner.fault_captured { return; }
-        let result = if inner.state.healthy() { inner.config.drain(&inner.drm) }
-            else { Err(EIO) };
-        if let Err(error) = result { inner.capture_fault(error); }
+        if inner.active.is_empty() {
+            if inner.fault_captured || !inner.state.healthy() {inner.fail_pending(EIO);return Service::Idle;}
+            if let Err(error)=inner.config.drain(&inner.drm) {
+                inner.capture_fault(error);inner.fail_pending(EIO);return Service::Idle;
+            }
+            return if inner.publish_next() {Service::Progress} else {Service::Idle};
+        }
+        let messages=inner.state.event_messages.load(Ordering::Acquire);
+        match inner.poll_active() {
+            Ok(true)=>{inner.publish_next();Service::Progress},
+            Ok(false)=>if inner.publish_next() {Service::Progress} else {Service::Waiting(messages)},
+            Err(_)=>{inner.fail_pending(EIO);Service::Idle},
+        }
     }
-
     pub(crate) fn boot(&mut self, pdev: &platform::Device<Core>) -> Result {
         let is_t8122 = crate::t8122_start::is_t8122(self.inner.device.soc());
         self.inner.boot_step = crate::t8122_start::BootStep::Publish;
@@ -582,7 +805,11 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.inner.state.health.mark_failed();
-        if self.inner.device.stop_asc().is_err() || self.inner.gpu_pending {
+        // Unpublished packets never reach the firmware; a published batch's packets stay
+        // retained below if the GPU may still use them, but their fences must not hang.
+        self.inner.fail_pending(ENODEV);
+        for batch in self.inner.active.iter() {Inner::finish_all(&batch.entries,Err(ENODEV));}
+        if policy::retain_runtime(self.inner.device.stop_asc().is_err(),self.inner.gpu_pending) {
             // SAFETY: a live module reference pins callbacks with retained DMA.
             unsafe { kernel::bindings::__module_get(crate::THIS_MODULE.as_ptr()) };
             return;

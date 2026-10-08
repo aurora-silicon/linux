@@ -149,8 +149,8 @@ static M3_RENDER_BATCH_OVERRIDE: AtomicU64 = AtomicU64::new(0);
 m3_param!("m3_render_batch_override", M3_RENDER_BATCH_OVERRIDE,
     parse_render_batch_override, 0o644, Some(get_atomic_param));
 
-/// Snapshot once per packet. A live change affects later packets, never the
-/// batch storage, ordering or retirement checks of work already being executed.
+/// Snapshot once per batch. A live change affects later publications, never the
+/// storage, ordering or retirement checks of work already on the firmware queues.
 pub(crate) fn render_batch_size() -> usize {
     let override_size = M3_RENDER_BATCH_OVERRIDE.load(Ordering::Relaxed);
     let size = if override_size == 0 {
