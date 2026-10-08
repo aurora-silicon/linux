@@ -2453,33 +2453,50 @@ static inline int pte_same_as_swp(pte_t pte, pte_t swp_pte)
 #ifdef CONFIG_MM_SUBPAGE
 /* Caller holds the swap-cache folio lock and the VMA's mmap read lock. */
 static int unuse_subpage(struct vm_area_struct *vma, pmd_t *pmd,
-			unsigned long addr, swp_entry_t entry, struct folio *folio,
-			unsigned int offset)
+			unsigned long addr, swp_entry_t entry, struct folio *folio)
 {
 	struct mm_struct *mm = vma->vm_mm;
+	unsigned int offset;
 	struct mm_subpage *slot = NULL;
 	spinlock_t *ptl;
-	pte_t *ptep, old, pte;
+	pte_t *ptep, old, snapshot, pte;
 	bool poisoned = PageHWPoison(&folio->page) || !folio_test_uptodate(folio);
 	int ret = 0;
 
 	if (folio_order(folio) || folio_test_ksm(folio))
 		return -EOPNOTSUPP;
+	/* A swap PTE records the physical quarter, independently of the VMA.
+	 * Snapshot under PTL, then allocate metadata while only folio is locked.
+	 */
+	ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	if (!ptep)
+		return 0;
+	snapshot = ptep_get(ptep);
+	if (!softleaf_is_swap(softleaf_from_pte(snapshot)) ||
+	    softleaf_from_pte(snapshot).val != entry.val) {
+		pte_unmap_unlock(ptep, ptl);
+		return 0;
+	}
+	offset = pte_swp_subpage_offset(snapshot);
+	pte_unmap_unlock(ptep, ptl);
+	if (offset >= PAGE_SIZE || !IS_ALIGNED(offset, mm_page_size(mm)))
+		return -EINVAL;
 	if (!poisoned) {
 		arch_swap_restore(folio_swap(entry, folio), folio);
 		/* Allocate metadata before taking the PTE spinlock. */
 		slot = mm_subpage_restore_granule(folio, offset, mm_page_shift(mm), GFP_KERNEL);
 		if (IS_ERR(slot))
 			return PTR_ERR(slot) == -EAGAIN ? 0 : PTR_ERR(slot);
+		ret = mm_subpage_prepare_anon_rmap(slot, vma, addr);
+		if (ret)
+			goto out;
 	}
 	ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
 	if (!ptep)
 		goto out;
 	old = ptep_get(ptep);
-	if (softleaf_from_pte(old).val != entry.val)
-		goto unlock;
-	/* A moved swap PTE retains its backing offset, not its VMA offset. */
-	if (pte_swp_subpage_offset(old) != offset)
+	/* Includes quarter and flag changes while metadata was prepared. */
+	if (!pte_same(old, snapshot))
 		goto unlock;
 	if (poisoned) {
 		pte = swp_entry_to_pte(PageHWPoison(&folio->page) ?
@@ -2540,8 +2557,7 @@ static int unuse_pte(struct vm_area_struct *vma, pmd_t *pmd,
 
 #ifdef CONFIG_MM_SUBPAGE
 	if (mm_page_size(vma->vm_mm) < PAGE_SIZE)
-		return unuse_subpage(vma, pmd, addr, entry, folio,
-				     pte_swp_subpage_offset(orig_pte));
+		return unuse_subpage(vma, pmd, addr, entry, folio);
 #endif
 
 	swapcache = folio;

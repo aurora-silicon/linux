@@ -52,6 +52,13 @@ struct mm_subpage_pool *mm_subpage_cow_pool_get(struct mm_struct *mm,
 void mm_subpage_cow_pool_exit(struct mm_struct *mm);
 bool mm_subpage_cow_folio_matches(struct mm_subpage_pool *pool, struct folio *folio);
 bool mm_subpage_cow_wait_busy_at(struct mm_subpage_pool *pool, unsigned int offset);
+/* COW slots may use any physical quarter; rmap retains the virtual position. */
+bool mm_subpage_cow_wait_busy(struct mm_subpage_pool *pool);
+struct mm_subpage *mm_subpage_alloc_locked(struct mm_subpage_pool *pool);
+struct mm_subpage *mm_subpage_copy_locked(struct mm_subpage_pool *pool,
+					const struct mm_subpage *source);
+int mm_subpage_prepare_anon_rmap(struct mm_subpage *slot,
+			       struct vm_area_struct *vma, unsigned long address);
 /* Exact physical-slot mask, one owner and folio lock for the entire batch.
  * slots is indexed by physical offset >> pool shift; only mask bits are set.
  * Success returns initialized owned slots; errors leave slots untouched.

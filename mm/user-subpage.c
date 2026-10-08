@@ -630,6 +630,22 @@ unlock:
 	return ret;
 }
 
+/* Preflight publication without making an unexposed owner look published.
+ * A fresh linear slot needs no sidecar: add_new_anon_rmap will set its anchor.
+ * Otherwise bind the independent virtual position before any PTE lock.
+ */
+int mm_subpage_prepare_anon_rmap(struct mm_subpage *slot,
+			       struct vm_area_struct *vma, unsigned long address)
+{
+	struct mm_subpage_owner *owner = slot->owner;
+
+	VM_BUG_ON_FOLIO(!folio_test_locked(owner->folio), owner->folio);
+	if (!owner->anon_root && !owner->rmap &&
+	    mm_subpage_offset(slot) == vma_page_offset_at(vma, address).offset)
+		return 0;
+	return mm_subpage_bind_rmap(slot, vma, address);
+}
+
 static bool subpage_move_allowed(struct mm_subpage *slot, bool swap)
 {
 	lockdep_assert_held(&slot->owner->pool->lock);
@@ -870,6 +886,11 @@ static bool cow_wait_busy(struct mm_subpage_pool *pool, unsigned long eligible,
 		return true;
 	}
 	return false;
+}
+
+bool mm_subpage_cow_wait_busy(struct mm_subpage_pool *pool)
+{
+	return cow_wait_busy(pool, pool->all_slots, false);
 }
 
 bool mm_subpage_cow_wait_busy_at(struct mm_subpage_pool *pool, unsigned int offset)
@@ -1259,6 +1280,17 @@ struct mm_subpage *mm_subpage_copy_at_locked(struct mm_subpage_pool *pool,
 	unsigned long eligible = offset_mask(pool->shift, offset);
 
 	return eligible ? subpage_copy(pool, source, eligible, true) : ERR_PTR(-EINVAL);
+}
+
+struct mm_subpage *mm_subpage_alloc_locked(struct mm_subpage_pool *pool)
+{
+	return subpage_alloc(pool, pool->all_slots, true);
+}
+
+struct mm_subpage *mm_subpage_copy_locked(struct mm_subpage_pool *pool,
+					const struct mm_subpage *source)
+{
+	return subpage_copy(pool, source, pool->all_slots, true);
 }
 
 /* The page-extension RCU section also protects the pool until its lock is held. */
