@@ -63,6 +63,7 @@ elif a[:1]==['-Qql']:
 elif a[:1]==['-Qi']:print('Provides : libaquamarine.so='+s['abi']+'-64')
 elif a[:1]==['-T']:
  print(s['dep_output'],end='');sys.exit(s['dep_status'])
+elif a[:1]==['-U'] and os.environ.get('DESKTOP_FAIL_TRANSACTION')=='1':sys.exit(42)
 '''); (self.bin/'pacman').chmod(0o755)
   (self.bin/'curl').write_text('''#!/usr/bin/env python3
 import os,sys,shutil
@@ -176,7 +177,7 @@ shutil.copyfile(src,dst)
   if old:
    source=self.base/'old-installer.sh';source.write_bytes(subprocess.check_output(['git','show','05d6db:tools/aurora-sep/install-aurora-sep.sh'],cwd=ROOT))
   names=re.findall(r'^([a-zA-Z0-9_]+)\(\) \{',source.read_text(),re.M)
-  keep={'install_all','m3_install_packages','say','warn','die'}|{n for n in names if n.startswith('desktop_fixes_')}
+  keep={'install_all','m3_install_packages','m3_install_cleanup','say','warn','die'}|{n for n in names if n.startswith('desktop_fixes_')}
   stubs='\n'.join(n+'() { :; }' for n in names if n not in keep)
   kernel=self.assets/'linux-aurora-candidate-aarch64.pkg.tar.zst';kernel.write_bytes(b'kernel')
   body=stubs+f'''
@@ -213,5 +214,17 @@ install_all
   log=self.log.read_text();self.assertIn('FIRST_WRITE',log)
   tx=[l for l in log.splitlines() if l.startswith('pacman -U')]
   self.assertEqual(len(tx),1);self.assertNotIn('omarchy-',tx[0])
+ def test_failed_kernel_transaction_retains_pam_and_lock_intent(self):
+  marker=self.root/'home/user/.local/state/omarchy/session-guard/locked'
+  self.write(marker,b'locked-generation\n')
+  pam=self.root/'etc/pam.d/sddm';before=pam.read_bytes()
+  self.env['DESKTOP_FAIL_TRANSACTION']='1';r=self.install()
+  self.assertEqual(r.returncode,42,r.stderr)
+  self.assertEqual(marker.read_bytes(),b'locked-generation\n');self.assertEqual(pam.read_bytes(),before)
+ def test_kernel_uninstall_body_is_unchanged(self):
+  current=(ROOT/'install-aurora-sep.sh').read_text()
+  old=subprocess.check_output(['git','show','05d6db:tools/aurora-sep/install-aurora-sep.sh'],cwd=ROOT,text=True)
+  pattern=r'^uninstall_all\(\) \{.*?^\}'
+  self.assertEqual(re.search(pattern,current,re.M|re.S).group(),re.search(pattern,old,re.M|re.S).group())
 
 if __name__=='__main__':unittest.main()
