@@ -2127,7 +2127,7 @@ static int apple_taptic_init_mtp(struct magicmouse_sc *msc,
 		return -ENOMEM;
 	}
 
-	haptic_dev->wq = create_singlethread_workqueue("Apple trackpad haptics workqueue");
+	haptic_dev->wq = create_singlethread_workqueue("apple-trackpad-haptics");
 	if (!haptic_dev->wq) {
 		dev_err(&trackpad_hdev->dev, "Cannot allocate haptic workqueue\n");
 		kfree(msc->haptic_effects);
