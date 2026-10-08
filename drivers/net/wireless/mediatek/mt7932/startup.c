@@ -227,11 +227,23 @@ static int mt_startup_once(struct mt7932 *m)
  * package leaves out of the firmware domain. cfg80211 recomputes the flags
  * on its next regulatory change, which runs this again.
  */
-static void mt_policy_disable(struct mt7932 *m, const struct mt7932_policy *policy)
+static void mt_policy_disable(struct mt7932 *m, const struct mt7932_policy *policy,
+			      u32 generation)
 {
 	unsigned int i;
 
 	rtnl_lock();
+	/* cfg80211 recomputes the channel flags for a new country under RTNL
+	 * and only then calls the notifier, which starts a new generation.
+	 * Once that has happened this package belongs to an older request,
+	 * and applying it would disable channels on top of the new country's
+	 * flags until the next regulatory change. The newer generation runs
+	 * its own pass.
+	 */
+	if (generation != READ_ONCE(m->reg_generation)) {
+		rtnl_unlock();
+		return;
+	}
 	wiphy_lock(m->wiphy);
 	for (i = 0; i < MT7932_CHANNELS; i++) {
 		struct ieee80211_channel *channel = i < MT7932_CHANNELS_2G ?
@@ -301,7 +313,7 @@ static void mt_startup_work(struct work_struct *work)
 			ret = mt7932_policy_parse(&policy, file->data, file->size, reg.domain);
 		if (!ret) {
 			mt7932_policy_filter(&reg, &policy);
-			mt_policy_disable(m, &policy);
+			mt_policy_disable(m, &policy, generation);
 		}
 		mutex_lock(&m->command_mutex);
 		if (READ_ONCE(m->stopping) || generation != READ_ONCE(m->reg_generation))
