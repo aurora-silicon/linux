@@ -420,6 +420,10 @@
 	status = "okay";
 };
 
+&pmc {
+	status = "okay";
+};
+
 &pinctrl_ap {
 	status = "okay";
 };

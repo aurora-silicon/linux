@@ -32,6 +32,15 @@
 		label = "gpio";
 	};
 
+	ps_pmc: power-controller@138 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x138 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pmc";
+		apple,always-on;
+	};
+
 	ps_afggfxni0: power-controller@1b8 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x1b8 4>;

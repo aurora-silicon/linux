@@ -485,7 +485,19 @@
 			compatible = "apple,t8140-pmp-v2-report";
 			reg = <0x3 0x003c0000 0x0 0x14000>;
 			power-domains = <&ps_pms_sram>;
+			#address-cells = <1>;
+			#size-cells = <0>;
 			status = "disabled";
+
+			/* PMP soc-device 9, which the PMP acknowledges */
+			pmp_report_gfx: report@9 {
+				compatible = "apple,t8140-pmp-v2-report-entry",
+					     "apple,t6000-pmp-v2-report-entry";
+				reg = <0x9>;
+				label = "pmp-gfx";
+				#power-domain-cells = <0>;
+				power-domains = <&ps_gfx>;
+			};
 		};
 
 		pmp: pmp@300500000 {
@@ -1123,7 +1135,7 @@
 			      <0x4 0x80000000 0x0 0x4000000>;
 			reg-names = "asc", "sgx";
 			mboxes = <&gfx_mbox>, <&gfx1_mbox>;
-			power-domains = <&ps_gfx>;
+			power-domains = <&pmc_gfx>;
 			memory-region = <&uat_ttbs>, <&uat_pagetables>,
 					<&uat_handoff>;
 			memory-region-names = "ttbs", "pagetables", "handoff";
@@ -1208,6 +1220,37 @@
 			#mbox-cells = <0>;
 			power-domains = <&ps_disp_cpu>;
 			status = "disabled";
+		};
+
+		/*
+		 * Perf-state floors of voter agents 0-3, and the rail state and
+		 * interface enable words, in the PMC window at 0x302800000.
+		 */
+		pmc: power-management@302800000 {
+			compatible = "apple,t8140-pmc";
+			reg = <0x3 0x02800000 0x0 0x10000>,
+			      <0x3 0x028aa000 0x0 0x3000>;
+			reg-names = "voters", "rails";
+			power-domains = <&ps_pmc>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			/* PMP, CLPC and AP agents */
+			apple,static-voters = <0 1 3>;
+			status = "disabled";
+
+			clpc: performance-controller@1 {
+				compatible = "apple,t8140-clpc";
+				reg = <1>;
+				apple,gpu-power-state = <&ps_gfx>;
+			};
+
+			/* Dynamic agent of the GFX PMGR device */
+			pmc_gfx: voter@2 {
+				reg = <2>;
+				label = "gfx";
+				#power-domain-cells = <0>;
+				power-domains = <&pmp_report_gfx>;
+			};
 		};
 
 		/*
