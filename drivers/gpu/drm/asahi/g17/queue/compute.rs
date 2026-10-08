@@ -925,24 +925,25 @@ impl Queue {
         self.retirement_proved = false;
         self.replay_retirement = false;
         self.spared_deferred = false;
-        if self.spared_quarantine {
-            self.spared_quarantine = false;
-            self.quarantine_error = None;
-            self.submitted = 0;
-            self.kick.clear_parent_after_recovery();
-            self.quarantined = false;
-            self.retire_pending = false;
-            self.retirement_ready = true;
-            if self
-                .previous
-                .as_ref()
-                .is_some_and(|p| p.publication.is_some())
-            {
-                drop(self.previous.take());
-            }
-            if self.released {
-                self.owner = None;
-            }
+        // The complete retirement witness also covers guilty work. Keep its
+        // VM status failed, but let logical close return the retained physical
+        // queue to service instead of consuming another QID for its successor.
+        self.spared_quarantine = false;
+        self.quarantine_error = None;
+        self.submitted = 0;
+        self.kick.clear_parent_after_recovery();
+        self.quarantined = false;
+        self.retire_pending = false;
+        self.retirement_ready = true;
+        if self
+            .previous
+            .as_ref()
+            .is_some_and(|p| p.publication.is_some())
+        {
+            drop(self.previous.take());
+        }
+        if self.released {
+            self.owner = None;
         }
         Ok(())
     }
