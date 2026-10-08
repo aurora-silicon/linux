@@ -214,6 +214,36 @@ static void backlight_inflight_dpms_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, present.nits, 140U);
 }
 
+static void backlight_resend_test(struct kunit *test)
+{
+	struct dcp_backlight_state state;
+	struct dcp_backlight_present present;
+
+	/* Nothing is re-sent before Linux controls the level. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 525, true, 140, false, 0), 0);
+	KUNIT_EXPECT_FALSE(test, dcp_bl_resend(&state));
+	KUNIT_EXPECT_FALSE(test, state.dirty);
+
+	state.controlled = true;
+	KUNIT_EXPECT_TRUE(test, dcp_bl_resend(&state));
+	KUNIT_EXPECT_FALSE(test, dcp_bl_resend(&state));
+	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
+	KUNIT_EXPECT_EQ(test, present.nits, 140U);
+	/* The present in flight already carries the level. */
+	KUNIT_EXPECT_FALSE(test, dcp_bl_resend(&state));
+	KUNIT_EXPECT_TRUE(test, dcp_bl_complete(&state, present.sequence, true));
+	KUNIT_EXPECT_FALSE(test, state.dirty);
+
+	/* A blanked panel is re-sent dark, keeping the restore target. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_dpms(&state, false), 0);
+	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_complete(&state, present.sequence, true));
+	KUNIT_EXPECT_TRUE(test, dcp_bl_resend(&state));
+	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
+	KUNIT_EXPECT_EQ(test, present.nits, 0U);
+	KUNIT_EXPECT_EQ(test, state.target, 140U);
+}
+
 static struct kunit_case backlight_cases[] = {
 	KUNIT_CASE(backlight_millinits_takeover_test),
 	KUNIT_CASE(backlight_takeover_test),
@@ -224,6 +254,7 @@ static struct kunit_case backlight_cases[] = {
 	KUNIT_CASE(backlight_surface_and_busy_test),
 	KUNIT_CASE(backlight_reject_test),
 	KUNIT_CASE(backlight_inflight_dpms_test),
+	KUNIT_CASE(backlight_resend_test),
 	{}
 };
 

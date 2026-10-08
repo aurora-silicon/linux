@@ -224,6 +224,30 @@ bool dcp_backlight_pending(struct apple_dcp *dcp)
 	return pending;
 }
 
+/*
+ * Called from the receive path, which must not queue a transaction itself;
+ * the caller schedules the update worker when this returns true.  Requests
+ * are honoured at most once per second, so a firmware that repeats the
+ * request after every brightness present cannot keep the queue busy.
+ */
+bool dcp_backlight_resend(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	bool resend = false;
+
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	if (!dcp->backlight.resent ||
+	    time_after(jiffies, dcp->backlight.resent_at + HZ)) {
+		resend = dcp_bl_resend(&dcp->backlight.state);
+		if (resend) {
+			dcp->backlight.resent = true;
+			dcp->backlight.resent_at = jiffies;
+		}
+	}
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	return resend;
+}
+
 unsigned int dcp_backlight_retry_delay(struct apple_dcp *dcp)
 {
 	unsigned long flags;

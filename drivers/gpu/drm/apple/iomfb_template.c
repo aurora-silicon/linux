@@ -873,6 +873,15 @@ dcpep_cb_read_edt_data(struct apple_dcp *dcp, struct dcp_read_edt_data_req *req)
 static void iomfbep_cb_enable_backlight_message_ap_gated(struct apple_dcp *dcp,
 							 u8 *enabled)
 {
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	/* H17P carries the level only in presents; ask for one more. */
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		if (dcp_has_panel(dcp) && dcp_backlight_active(dcp) &&
+		    dcp_backlight_resend(dcp))
+			schedule_work(&dcp->bl_update_wq);
+		return;
+	}
+#endif
 	/*
 	 * update backlight brightness on next swap, on non mini-LED displays
 	 * DCP seems to set an invalid iDAC value after coming out of DPMS.

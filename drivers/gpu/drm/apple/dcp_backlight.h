@@ -115,6 +115,19 @@ static inline int dcp_bl_dpms(struct dcp_backlight_state *state, bool on)
 }
 
 /*
+ * The firmware asked for the level again.  Re-send the effective level once
+ * Linux controls it, unless a present already carries or will carry it.
+ */
+static inline bool dcp_bl_resend(struct dcp_backlight_state *state)
+{
+	if (!state->ready || !state->controlled || state->dirty ||
+	    state->in_flight)
+		return false;
+	state->dirty = true;
+	return true;
+}
+
+/*
  * Called by the single outbound queue, with a pinned, accepted scanout or a
  * prepared replacement. Soft-off never releases it. A brightness-only present
  * must use the last accepted surface, not a rejected replacement's DRM state.
@@ -189,6 +202,7 @@ int dcp_backlight_prepare(struct apple_dcp *dcp, bool have_surface,
 			  struct dcp_backlight_present *present);
 bool dcp_backlight_complete(struct apple_dcp *dcp, u64 sequence, bool accepted);
 bool dcp_backlight_pending(struct apple_dcp *dcp);
+bool dcp_backlight_resend(struct apple_dcp *dcp);
 unsigned int dcp_backlight_retry_delay(struct apple_dcp *dcp);
 
 #endif /* __APPLE_DCP_BACKLIGHT_H__ */

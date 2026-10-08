@@ -409,6 +409,9 @@ struct apple_dcp {
 		spinlock_t lock;
 		struct dcp_backlight_state state;
 		void (*kick)(struct apple_dcp *dcp);
+		/* Rate limit for firmware re-send requests. */
+		unsigned long resent_at;
+		bool resent;
 	} backlight;
 
 	/* Staging wire record; serialization never mutates the atomic inputs. */
