@@ -2234,23 +2234,39 @@ static int apple_pcie_neo_check_cold(struct apple_pcie *pcie, struct pci_dev *ro
 	u16 command;
 	int function, ret = 0;
 
-	for (function = 0; function < 2 && !ret; function++) {
+	/* Check and quiesce both functions; keep the first error. */
+	for (function = 0; function < 2; function++) {
 		endpoint = pci_get_slot(root->subordinate, PCI_DEVFN(0, function));
-		if (!endpoint)
-			return -ENODEV;
+		if (!endpoint) {
+			ret = ret ?: -ENODEV;
+			continue;
+		}
 		if (pci_read_config_word(endpoint, PCI_COMMAND, &command)) {
-			ret = -EIO;
+			ret = ret ?: -EIO;
 		} else {
 			dev_info(pcie->dev, "enumerated %s id=%04x:%04x command=%#x\n",
 				 pci_name(endpoint), endpoint->vendor, endpoint->device, command);
 			if (command & PCI_COMMAND_MASTER) {
 				pci_clear_master(endpoint);
-				ret = -EIO;
+				ret = ret ?: -EIO;
 			}
 		}
 		pci_dev_put(endpoint);
 	}
 	return ret;
+}
+
+/*
+ * Rescan lock held, downstream config still open. Remove functions that were
+ * scanned but will not be published, so that a later rescan cannot publish
+ * them after config access has been closed again.
+ */
+static void apple_pcie_neo_unscan(struct pci_dev *root)
+{
+	struct pci_dev *dev, *tmp;
+
+	list_for_each_entry_safe_reverse(dev, tmp, &root->subordinate->devices, bus_list)
+		pci_stop_and_remove_bus_device(dev);
 }
 
 static int apple_pcie_neo_enumerate(struct pci_host_bridge *bridge)
@@ -2293,8 +2309,10 @@ static int apple_pcie_neo_enumerate(struct pci_host_bridge *bridge)
 		goto close_config;
 	pci_bus_add_devices(root->subordinate);
 close_config:
-	if (ret)
+	if (ret) {
+		apple_pcie_neo_unscan(root);
 		WRITE_ONCE(pcie->neo_config_ready, false);
+	}
 	pci_unlock_rescan_remove();
 	if (!ret)
 		dev_info(pcie->dev, "radio functions 0/1 published\n");
