@@ -416,22 +416,6 @@
 	status = "okay";
 };
 
-&pmp_dart {
-	status = "okay";
-};
-
-&pmp_report {
-	status = "okay";
-};
-
-&pmp_mbox {
-	status = "okay";
-};
-
-&pmp {
-	status = "okay";
-};
-
 &i2c2 {
 	status = "okay";
 };

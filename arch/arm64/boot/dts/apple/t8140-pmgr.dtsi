@@ -98,6 +98,12 @@
 		label = "disp_sys";
 	};
 
+	/*
+	 * The external display coprocessor has no Linux consumer yet. Its
+	 * firmware keeps it running, so leave its three states, dispext0_sys,
+	 * dispext0_fe and dispext0_cpu, to it: powering dispext0_cpu down
+	 * underneath that firmware faults.
+	 */
 	ps_dispext0_sys: power-controller@288 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x288 4>;
@@ -130,6 +136,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "spi_p";
+		status = "okay";
 	};
 
 	ps_apcie_st: power-controller@310 {
@@ -803,20 +810,6 @@
 		status = "okay";
 	};
 
-	/*
-	 * The external display coprocessor has no Linux consumer yet. Its
-	 * firmware keeps it running, so leave these three states to it:
-	 * powering dispext0_cpu down underneath that firmware faults.
-	 */
-	ps_dispext0_sys: power-controller@288 {
-		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x288 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "dispext0_sys";
-		status = "disabled";
-	};
-
 	ps_ane_sys: power-controller@290 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x290 4>;
@@ -908,15 +901,6 @@
 		status = "okay";
 	};
 
-	ps_spi_p: power-controller@2f0 {
-		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x2f0 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "spi_p";
-		status = "okay";
-	};
-
 	ps_uart_p: power-controller@2f8 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x2f8 4>;
@@ -943,26 +927,6 @@
 		#reset-cells = <0>;
 		label = "aes";
 		status = "okay";
-	};
-
-	ps_dispext0_fe: power-controller@320 {
-		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x320 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "dispext0_fe";
-		power-domains = <&ps_dispext0_sys>;
-		status = "disabled";
-	};
-
-	ps_dispext0_cpu: power-controller@328 {
-		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x328 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "dispext0_cpu";
-		power-domains = <&ps_dispext0_fe>;
-		status = "disabled";
 	};
 
 	ps_spi0: power-controller@330 {
