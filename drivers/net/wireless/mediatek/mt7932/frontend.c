@@ -137,6 +137,24 @@ int mt_scan_quiesce(struct mt7932 *m)
 	return READ_ONCE(m->retired_scan_seq) ? -EBUSY : 0;
 }
 
+/* Wait at most @timeout in total for a cancelled scan to retire. Callers
+ * may hold RTNL, so this never waits longer than asked. A stopping driver
+ * completes scan_done for good, which would turn the wait into a spin.
+ */
+static void mt_scan_retire_wait(struct mt7932 *m, unsigned long timeout)
+{
+	unsigned long deadline = jiffies + timeout;
+	long left;
+
+	mt_abort_scan(m->wiphy, &m->wdev);
+	flush_work(&m->scan_finish_work);
+	while (READ_ONCE(m->retired_scan_seq) && !READ_ONCE(m->stopping)) {
+		left = (long)(deadline - jiffies);
+		if (left <= 0 || !wait_for_completion_timeout(&m->scan_done, left))
+			break;
+	}
+}
+
 /* command_mutex held: one RF-band/type batch at a time, with matching EID0d
  * completion before the next batch. A request without SSIDs is passive;
  * active requests must also listen passively on NO_IR channels.
@@ -450,13 +468,8 @@ static int mt_set_mac_address(struct net_device *netdev, void *address)
 	 * NetworkManager takes the interface down before changing the address,
 	 * which cancels any scan; let that scan retire instead of failing.
 	 */
-	if (!netif_running(netdev)) {
-		unsigned long deadline = jiffies + msecs_to_jiffies(2000);
-
-		mt_scan_quiesce(m);
-		while (READ_ONCE(m->retired_scan_seq) && time_before(jiffies, deadline))
-			wait_for_completion_timeout(&m->scan_done, msecs_to_jiffies(100));
-	}
+	if (!netif_running(netdev))
+		mt_scan_retire_wait(m, msecs_to_jiffies(2000));
 	mutex_lock(&m->command_mutex);
 	spin_lock_irqsave(&m->response_lock, flags);
 	if (m->stopping || m->link_failed || m->bss_active || m->connecting ||
