@@ -7,3 +7,5 @@ same-native
 first-write
 clipped-firstwrite
 pinned-fork
+pagetable-retention
+pagetable-concurrent

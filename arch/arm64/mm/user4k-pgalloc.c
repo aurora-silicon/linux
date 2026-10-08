@@ -98,12 +98,30 @@ void *arm64_user_pt_alloc_granule(struct mm_struct *mm,
 	atomic_set(&pt->pt_frag_refcount, 1);
 	table = ptdesc_address(pt);
 	spin_lock(&mm->page_table_lock);
-	if (nr_fragments > 1 && !mm->context.user4k_pt_frag[level]) {
-		atomic_set(&pt->pt_frag_refcount, nr_fragments);
-		mm->context.user4k_pt_frag[level] = table + frag_size;
+	if (nr_fragments > 1) {
+		next = mm->context.user4k_pt_frag[level];
+		if (next) {
+			/* Another allocator supplied backing while we constructed
+			 * a table owner. Consume its unused fragment rather than
+			 * stranding the rest of our new native page.
+			 */
+			if (virt_to_ptdesc(next)->pt_frag_shift != shift) {
+				spin_unlock(&mm->page_table_lock);
+				fragment_owner_free(pt);
+				return NULL;
+			}
+			table = next;
+			next += frag_size;
+			mm->context.user4k_pt_frag[level] =
+				((unsigned long)next & ~PAGE_MASK) ? next : NULL;
+		} else {
+			atomic_set(&pt->pt_frag_refcount, nr_fragments);
+			mm->context.user4k_pt_frag[level] = table + frag_size;
+		}
 	}
-	/* A racing allocation may own the cache; this page then has one user. */
 	spin_unlock(&mm->page_table_lock);
+	if (table != ptdesc_address(pt))
+		fragment_owner_free(pt);
 	return table;
 }
 

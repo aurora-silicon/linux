@@ -1,0 +1,33 @@
+Page-table physical backing and fragment retention
+==================================================
+
+These bounded fixtures reserve 2 GiB of virtual address space and write one
+4 KiB leaf in each of 1,024 distinct 2 MiB table windows. Native payload
+backing is at most 16 MiB, with approximately 4 MiB of logical PTE tables.
+The concurrent variant uses 32 threads, 32 synchronized fault rounds and
+128 KiB thread stacks. Both verify all payload bytes across six checkpoints:
+baseline, full, quarter_survivors, refilled, quarter_survivors_again, unmapped.
+
+Run through the 4 KiB ABI launcher on a native 16 KiB kernel. Each JSON
+checkpoint requires one byte 'c' on stdin before continuing. For contents
+only, with no physical charge observation:
+
+  yes c | userpages 4k ./pagetable-retention --native-16k
+  yes c | userpages 4k ./pagetable-concurrent --native-16k
+
+For physical accounting, run each fixture alone in a fresh uncapped cgroup.
+At each checkpoint verify the fixture is the only member, record memory.stat
+pagetables and memory.swap.current, and sample at 0, 1 and 3 seconds before
+acknowledging. Record logical VmPTE separately: it is not physical backing.
+Use an external service lifetime below the fixture's 60-second alarm and
+verify all processes exit. Do not change memory.max/high or force reclaim.
+
+Compare the same complete fixture across kernels. Concurrent thread stacks
+and upper-level tables contribute to the measurements; do not subtract them
+as though they were pure payload. Deferred table releases can occur between
+samples. Contents PASS does not assert a density or performance result.
+
+The allocation-race fix reduces initial concurrent physical backing. It does
+not reclaim partially occupied table owners or reuse issued fragments after
+unmap. Retention/refill checkpoints deliberately preserve that separate
+coverage gap rather than declaring it fixed.
