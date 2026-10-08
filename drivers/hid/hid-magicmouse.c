@@ -18,6 +18,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
 #include <linux/soc/apple/actuator.h>
@@ -247,6 +248,9 @@ struct magicmouse_input_ops {
 
 struct effect_job {
 	struct work_struct work;
+	struct magicmouse_sc *msc;
+	/* Protects effect parameters shared with the worker. */
+	spinlock_t lock;
 	struct hid_device *taptic_hdev;
 	u16 effect_type;
 	u8 strength;
@@ -1264,7 +1268,8 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
 
 	__set_bit(INPUT_PROP_BUTTONPAD, input->propbit);
-	__set_bit(INPUT_PROP_PRESSUREPAD, input->propbit);
+	if (!msc->mtp_c1fe)
+		__set_bit(INPUT_PROP_PRESSUREPAD, input->propbit);
 	__clear_bit(BTN_0, input->keybit);
 	__clear_bit(BTN_RIGHT, input->keybit);
 	__clear_bit(BTN_MIDDLE, input->keybit);
@@ -1272,7 +1277,9 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 	__clear_bit(REL_X, input->relbit);
 	__clear_bit(REL_Y, input->relbit);
 
-	mt_flags = INPUT_MT_POINTER | INPUT_MT_DROP_UNUSED | INPUT_MT_TRACK | INPUT_MT_TOTAL_FORCE;
+	mt_flags = INPUT_MT_POINTER | INPUT_MT_DROP_UNUSED | INPUT_MT_TRACK;
+	if (!msc->mtp_c1fe)
+		mt_flags |= INPUT_MT_TOTAL_FORCE;
 
 	/*
 	 * The C1FE report carries positions and the button only; advertise
@@ -1445,6 +1452,7 @@ static int magicmouse_switch_mode(struct input_dev *trackpad_idev, int mode)
 static u8 magicmouse_haptic_softness(struct hid_device *hdev, bool deep);
 static u8 magicmouse_haptic_strength(struct hid_device *hdev, bool deep);
 static void magicmouse_haptic_release_mode(struct magicmouse_sc *msc);
+static void magicmouse_haptic_release_mode_locked(struct magicmouse_sc *msc);
 
 /*
  * Play the waveform @pulses times, @haptic_pulse_gap_ms apart. A failure here
@@ -1454,13 +1462,16 @@ static void magicmouse_haptic_release_mode(struct magicmouse_sc *msc);
 static void magicmouse_haptic_pulses(struct magicmouse_sc *msc, u16 usage,
 				     bool deep, u8 pulses)
 {
-	struct hid_device *actuator = magicmouse_get_actuator(msc);
+	struct hid_device *actuator;
 	u8 strength, softness, gap;
 	unsigned int i;
 	int ret;
 
 	if (!pulses)
 		return;
+
+	guard(mutex)(&msc->haptics->auto_trigger_mutex);
+	actuator = magicmouse_get_actuator(msc);
 
 	if (!actuator) {
 		hid_warn(msc->hdev,
@@ -1469,7 +1480,7 @@ static void magicmouse_haptic_pulses(struct magicmouse_sc *msc, u16 usage,
 		return;
 	}
 
-	if (msc->haptics->mode != HID_HAPTIC_MODE_HOST) {
+	if (READ_ONCE(msc->haptics->mode) != HID_HAPTIC_MODE_HOST) {
 		ret = apple_taptic_switch_modes(actuator, HID_HAPTIC_MODE_HOST);
 		if (ret) {
 			hid_warn(msc->hdev,
@@ -1478,7 +1489,7 @@ static void magicmouse_haptic_pulses(struct magicmouse_sc *msc, u16 usage,
 			haptic_press = false;
 			return;
 		}
-		msc->haptics->mode = HID_HAPTIC_MODE_HOST;
+		WRITE_ONCE(msc->haptics->mode, HID_HAPTIC_MODE_HOST);
 		hid_info(msc->hdev, "host-driven click feedback active\n");
 	}
 
@@ -1494,7 +1505,7 @@ static void magicmouse_haptic_pulses(struct magicmouse_sc *msc, u16 usage,
 				 "click waveform failed (%d); returning click feedback to the firmware\n",
 				 ret);
 			haptic_press = false;
-			magicmouse_haptic_release_mode(msc);
+			magicmouse_haptic_release_mode_locked(msc);
 			return;
 		}
 		hid_dbg(msc->hdev, "played %s pulse %u/%u at strength 0x%02x\n",
@@ -1510,24 +1521,30 @@ static void magicmouse_haptic_pulses(struct magicmouse_sc *msc, u16 usage,
  * Hand click feedback back to the actuator's firmware, unless userspace still
  * has effects uploaded and so still wants host-controlled mode.
  */
-static void magicmouse_haptic_release_mode(struct magicmouse_sc *msc)
+static void magicmouse_haptic_release_mode_locked(struct magicmouse_sc *msc)
 {
 	struct hid_device *actuator;
 	unsigned int i;
 
-	if (msc->haptics->mode != HID_HAPTIC_MODE_HOST)
+	if (READ_ONCE(msc->haptics->mode) != HID_HAPTIC_MODE_HOST)
 		return;
 
 	if (msc->haptic_effects) {
 		for (i = 0; i < FF_MAX_EFFECTS; i++)
-			if (msc->haptic_effects[i].effect_type)
+			if (READ_ONCE(msc->haptic_effects[i].effect_type))
 				return;
 	}
 
 	actuator = magicmouse_get_actuator(msc);
 	if (actuator && !apple_taptic_switch_modes(actuator,
 						   HID_HAPTIC_MODE_DEVICE))
-		msc->haptics->mode = HID_HAPTIC_MODE_DEVICE;
+		WRITE_ONCE(msc->haptics->mode, HID_HAPTIC_MODE_DEVICE);
+}
+
+static void magicmouse_haptic_release_mode(struct magicmouse_sc *msc)
+{
+	guard(mutex)(&msc->haptics->auto_trigger_mutex);
+	magicmouse_haptic_release_mode_locked(msc);
 }
 
 static void magicmouse_press_worker(struct work_struct *ws)
@@ -1615,7 +1632,7 @@ static bool magicmouse_haptic_click(struct magicmouse_sc *msc, u32 pressure,
 	if (!msc->haptics || !msc->haptics->wq)
 		return firmware_button;
 
-	host_mode = msc->haptics->mode == HID_HAPTIC_MODE_HOST;
+	host_mode = READ_ONCE(msc->haptics->mode) == HID_HAPTIC_MODE_HOST;
 
 	if (!haptic_press && !host_mode) {
 		/* The firmware owns the actuator and reports the button. */
@@ -1689,7 +1706,7 @@ static void magicmouse_haptic_forget_mode(struct magicmouse_sc *msc)
 	if (!msc->haptics)
 		return;
 
-	msc->haptics->mode = HID_HAPTIC_MODE_DEVICE;
+	WRITE_ONCE(msc->haptics->mode, HID_HAPTIC_MODE_DEVICE);
 	msc->haptic_button_down = false;
 	if (msc->haptic_deep_down) {
 		msc->haptic_deep_down = false;
@@ -1901,6 +1918,10 @@ static int apple_upload_effects(struct input_dev *trackpad_idev,
 	struct magicmouse_sc *msc = hid_get_drvdata(trackpad_hdev);
 	struct hid_haptic_device *haptics = msc->haptics;
 	struct hid_device *actuator;
+	struct effect_job *job = &msc->haptic_effects[effect->id];
+	unsigned long flags;
+	u8 strength, softness;
+	bool deep;
 	int ret;
 
 	switch (effect->u.haptic.hid_usage) {
@@ -1912,30 +1933,31 @@ static int apple_upload_effects(struct input_dev *trackpad_idev,
 		return -EINVAL;
 	}
 
+	guard(mutex)(&haptics->auto_trigger_mutex);
 	actuator = magicmouse_get_actuator(msc);
 	if (!actuator)
 		return -ENODEV;
 
-	msc->haptic_effects[effect->id].taptic_hdev = actuator;
-	msc->haptic_effects[effect->id].effect_type = (effect->u.haptic.hid_usage) & HID_USAGE;
-	msc->haptic_effects[effect->id].strength =
-		(min(100, (effect->u.haptic.intensity)) *
-		 magicmouse_haptic_strength(trackpad_hdev,
-					    magicmouse_effect_is_deep(effect))) / 100;
-	msc->haptic_effects[effect->id].softness =
-		magicmouse_haptic_softness(trackpad_hdev,
-					   magicmouse_effect_is_deep(effect));
+	deep = magicmouse_effect_is_deep(effect);
+	strength = min_t(u16, 100, effect->u.haptic.intensity) *
+		magicmouse_haptic_strength(trackpad_hdev, deep) / 100;
+	softness = magicmouse_haptic_softness(trackpad_hdev, deep);
 
 	/* The actuator may have been rebound or reset since the last upload. */
 	ret = magicmouse_switch_mode(trackpad_idev, HID_HAPTIC_MODE_HOST);
 	if (ret) {
 		dev_err(&msc->hdev->dev,
 			"failed to switch to host-controlled mode: %d\n", ret);
-		msc->haptic_effects[effect->id].effect_type = 0;
 		return ret;
 	}
 
-	haptics->mode = HID_HAPTIC_MODE_HOST;
+	spin_lock_irqsave(&job->lock, flags);
+	job->taptic_hdev = actuator;
+	job->strength = strength;
+	job->softness = softness;
+	WRITE_ONCE(job->effect_type, effect->u.haptic.hid_usage & HID_USAGE);
+	spin_unlock_irqrestore(&job->lock, flags);
+	WRITE_ONCE(haptics->mode, HID_HAPTIC_MODE_HOST);
 
 	hid_dbg(trackpad_hdev, "uploaded haptic effect %d\n", effect->id);
 	return 0;
@@ -1944,11 +1966,32 @@ static int apple_upload_effects(struct input_dev *trackpad_idev,
 static void haptic_playback_worker(struct work_struct *ws)
 {
 	struct effect_job *job = container_of(ws, struct effect_job, work);
+	struct hid_device *actuator;
+	unsigned long flags;
+	u16 type;
+	u8 strength, softness;
+	int ret;
 
-	if (job->effect_type &&
-	    apple_taptic_send(job->taptic_hdev, job->effect_type,
-			      job->strength, job->softness))
-		hid_warn(job->taptic_hdev, "cannot play the haptic effect\n");
+	spin_lock_irqsave(&job->lock, flags);
+	actuator = job->taptic_hdev;
+	type = READ_ONCE(job->effect_type);
+	strength = job->strength;
+	softness = job->softness;
+	spin_unlock_irqrestore(&job->lock, flags);
+
+	if (!type)
+		return;
+	guard(mutex)(&job->msc->haptics->auto_trigger_mutex);
+	if (READ_ONCE(job->msc->haptics->mode) != HID_HAPTIC_MODE_HOST) {
+		ret = apple_taptic_switch_modes(actuator, HID_HAPTIC_MODE_HOST);
+		if (ret) {
+			hid_warn(actuator, "cannot take host-controlled mode (%d)\n", ret);
+			return;
+		}
+		WRITE_ONCE(job->msc->haptics->mode, HID_HAPTIC_MODE_HOST);
+	}
+	if (apple_taptic_send(actuator, type, strength, softness))
+		hid_warn(actuator, "cannot play the haptic effect\n");
 }
 
 static int apple_taptic_playback(struct input_dev *trackpad_idev, int effect_id, int value)
@@ -1968,16 +2011,19 @@ static int apple_taptic_erase(struct input_dev *trackpad_idev, int effect_id)
 	struct magicmouse_sc *msc = hid_get_drvdata(trackpad_hdev);
 	int i, ret = 0;
 
-	msc->haptic_effects[effect_id].effect_type = 0;
+	cancel_work_sync(&msc->haptic_effects[effect_id].work);
+	WRITE_ONCE(msc->haptic_effects[effect_id].effect_type, 0);
 
 	for (i = 0; i < FF_MAX_EFFECTS; i++) {
-		if (msc->haptic_effects[i].effect_type != 0)
+		if (READ_ONCE(msc->haptic_effects[i].effect_type) != 0)
 			return 0;
 	}
 
+	/* Drain workers before taking the mutex they need. */
+	flush_workqueue(msc->haptics->wq);
+	guard(mutex)(&msc->haptics->auto_trigger_mutex);
 	/* Return to device-controlled mode if there are no effects left */
-	if (msc->haptics->mode == HID_HAPTIC_MODE_HOST) {
-		flush_workqueue(msc->haptics->wq);
+	if (READ_ONCE(msc->haptics->mode) == HID_HAPTIC_MODE_HOST) {
 		ret = magicmouse_switch_mode(trackpad_idev, HID_HAPTIC_MODE_DEVICE);
 
 		if (ret) {
@@ -1987,7 +2033,7 @@ static int apple_taptic_erase(struct input_dev *trackpad_idev, int effect_id)
 			return ret;
 		}
 
-		msc->haptics->mode = HID_HAPTIC_MODE_DEVICE;
+		WRITE_ONCE(msc->haptics->mode, HID_HAPTIC_MODE_DEVICE);
 	}
 
 	return 0;
@@ -2002,15 +2048,18 @@ static void apple_taptic_destroy(struct ff_device *ff)
 	/* ff->private is devm-allocated; do not let ff-core kfree() it. */
 	ff->private = NULL;
 
-	if (msc->haptics && msc->haptics->mode == HID_HAPTIC_MODE_HOST) {
-		flush_workqueue(msc->haptics->wq);
-		ret = magicmouse_switch_mode(msc->haptics->input_dev, HID_HAPTIC_MODE_DEVICE);
-		if (ret)
-			hid_warn(msc->hdev,
-				 "failed to switch back to device-controlled mode: %d\n",
-				 ret);
-		else
-			msc->haptics->mode = HID_HAPTIC_MODE_DEVICE;
+	flush_workqueue(haptic_dev->wq);
+	{
+		guard(mutex)(&haptic_dev->auto_trigger_mutex);
+		if (msc->haptics && READ_ONCE(msc->haptics->mode) == HID_HAPTIC_MODE_HOST) {
+			ret = magicmouse_switch_mode(msc->haptics->input_dev, HID_HAPTIC_MODE_DEVICE);
+			if (ret)
+				hid_warn(msc->hdev,
+					 "failed to switch back to device-controlled mode: %d\n",
+					 ret);
+			else
+				WRITE_ONCE(msc->haptics->mode, HID_HAPTIC_MODE_DEVICE);
+		}
 	}
 
 	destroy_workqueue(haptic_dev->wq);
@@ -2069,6 +2118,7 @@ static int apple_taptic_init_mtp(struct magicmouse_sc *msc,
 
 	haptic_dev->hdev = trackpad_hdev;
 	haptic_dev->input_dev = msc->input;
+	mutex_init(&haptic_dev->auto_trigger_mutex);
 
 	msc->haptic_effects = kzalloc_objs(struct effect_job, FF_MAX_EFFECTS);
 	if (!msc->haptic_effects) {
@@ -2084,8 +2134,11 @@ static int apple_taptic_init_mtp(struct magicmouse_sc *msc,
 		return -ENOMEM;
 	}
 
-	for (i = 0; i < FF_MAX_EFFECTS; i++)
+	for (i = 0; i < FF_MAX_EFFECTS; i++) {
+		msc->haptic_effects[i].msc = msc;
+		spin_lock_init(&msc->haptic_effects[i].lock);
 		INIT_WORK(&msc->haptic_effects[i].work, haptic_playback_worker);
+	}
 
 	INIT_WORK(&msc->haptic_press_work, magicmouse_press_worker);
 	INIT_WORK(&msc->haptic_release_work, magicmouse_release_worker);
@@ -2137,7 +2190,8 @@ static int magicmouse_init_haptics(struct magicmouse_sc *msc, struct hid_device 
 	struct hid_haptic_device *haptics;
 	int ret;
 
-	if (msc->haptics)
+	/* C1FE has no pressure data to emulate clicks in host mode. */
+	if (msc->haptics || msc->mtp_c1fe)
 		return 0;
 
 	/*
