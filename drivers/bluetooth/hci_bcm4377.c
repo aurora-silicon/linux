@@ -18,6 +18,7 @@
 #include <linux/pci.h>
 #include <linux/printk.h>
 #include <linux/property.h>
+#include <linux/workqueue.h>
 
 #include <linux/unaligned.h>
 
@@ -587,6 +588,11 @@ struct bcm4377_data {
 
 	bool needs_reset;
 	bool cal_needed;
+	bool cal_loaded;
+	bool setup_retry_used;
+	bool setup_retry_pending;
+	bool setup_retry_blocked;
+	struct delayed_work setup_retry_work;
 	bdaddr_t bdaddr;
 
 	struct completion event;
@@ -1457,6 +1463,42 @@ destroy_hci_acl_ack:
 	return ret;
 }
 
+static bool bcm4377_setup_retry_allowed(struct bcm4377_data *bcm4377)
+{
+	struct hci_dev *hdev = bcm4377->hdev;
+
+	return hci_dev_test_flag(hdev, HCI_SETUP) &&
+	       hci_dev_test_flag(hdev, HCI_AUTO_OFF) &&
+	       !hci_dev_test_flag(hdev, HCI_UNREGISTER) &&
+	       !hci_dev_test_flag(hdev, HCI_USER_CHANNEL);
+}
+
+static void bcm4377_queue_setup_retry(struct bcm4377_data *bcm4377)
+{
+	if (READ_ONCE(bcm4377->setup_retry_pending) &&
+	    !READ_ONCE(bcm4377->setup_retry_blocked) &&
+	    bcm4377_setup_retry_allowed(bcm4377))
+		mod_delayed_work(system_freezable_wq, &bcm4377->setup_retry_work, 0);
+}
+
+static void bcm4377_setup_retry_work(struct work_struct *work)
+{
+	struct bcm4377_data *bcm4377 = container_of(to_delayed_work(work),
+						 struct bcm4377_data, setup_retry_work);
+	struct hci_dev *hdev = bcm4377->hdev;
+
+	if (READ_ONCE(bcm4377->setup_retry_blocked) ||
+	    !READ_ONCE(bcm4377->setup_retry_pending))
+		return;
+	WRITE_ONCE(bcm4377->setup_retry_pending, false);
+	if (!bcm4377_setup_retry_allowed(bcm4377))
+		return;
+
+	dev_warn(&bcm4377->pdev->dev, "retrying initial setup once after transport timeout\n");
+	/* The ordered core worker first finishes failed-init queue cleanup. */
+	queue_work(hdev->req_workqueue, &hdev->power_on);
+}
+
 static int bcm4377_hci_open(struct hci_dev *hdev)
 {
 	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
@@ -1469,6 +1511,7 @@ static int bcm4377_hci_open(struct hci_dev *hdev)
 		if (ret)
 			return ret;
 		bcm4377->cal_needed = true;
+		bcm4377->cal_loaded = false;
 	}
 
 	ret = bcm4377_hci_open_rings(bcm4377);
@@ -1482,6 +1525,7 @@ static int bcm4377_hci_open(struct hci_dev *hdev)
 			return ret;
 		}
 		bcm4377->cal_needed = true;
+		bcm4377->cal_loaded = false;
 		ret = bcm4377_hci_open_rings(bcm4377);
 		if (ret)
 			bcm4377->needs_reset = true;
@@ -1531,7 +1575,7 @@ static int bcm4377_hci_close(struct hci_dev *hdev)
 
 	if (bcm4377->needs_reset) {
 		dev_warn(&bcm4377->pdev->dev,
-			 "ring teardown failed; marking device for reset on next open\n");
+			 "transport needs hardware reset on next open\n");
 		bcm4377->acl_d2h_ring.enabled = false;
 		bcm4377->acl_h2d_ring.enabled = false;
 		bcm4377->sco_d2h_ring.enabled = false;
@@ -1543,6 +1587,7 @@ static int bcm4377_hci_close(struct hci_dev *hdev)
 		bcm4377->hci_acl_event_ring.enabled = false;
 		bcm4377->hci_acl_ack_ring.enabled = false;
 	}
+	bcm4377_queue_setup_retry(bcm4377);
 
 	return 0;
 }
@@ -1593,7 +1638,7 @@ static int bcm4377_check_bdaddr(struct bcm4377_data *bcm4377)
 	return 0;
 }
 
-static int bcm4377_hci_setup(struct hci_dev *hdev)
+static int bcm4377_hci_setup_once(struct hci_dev *hdev)
 {
 	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
 	const struct firmware *fw;
@@ -1617,6 +1662,25 @@ static int bcm4377_hci_setup(struct hci_dev *hdev)
 		return ret;
 
 	return bcm4377_check_bdaddr(bcm4377);
+}
+
+static int bcm4377_hci_setup(struct hci_dev *hdev)
+{
+	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+	int ret = bcm4377_hci_setup_once(hdev);
+
+	if (!ret) {
+		/* Initial setup already loaded the data needed after an open reset. */
+		bcm4377->cal_loaded = true;
+		WRITE_ONCE(bcm4377->setup_retry_pending, false);
+	} else if (ret == -ETIMEDOUT) {
+		bcm4377->needs_reset = true;
+		if (!bcm4377->setup_retry_used && bcm4377_setup_retry_allowed(bcm4377)) {
+			bcm4377->setup_retry_used = true;
+			WRITE_ONCE(bcm4377->setup_retry_pending, true);
+		}
+	}
+	return ret;
 }
 
 static int bcm4377_hci_set_bdaddr(struct hci_dev *hdev, const bdaddr_t *bdaddr)
@@ -1647,14 +1711,16 @@ static int bcm4377_hci_post_init(struct hci_dev *hdev)
 	if (!bcm4377->cal_needed)
 		return 0;
 
-	dev_info(&bcm4377->pdev->dev,
-		 "reloading calibration and PTB after hardware reset\n");
-
-	ret = bcm4377_hci_setup(hdev);
-	if (ret) {
-		dev_err(&bcm4377->pdev->dev,
-			"failed to reload calibration/PTB: %d\n", ret);
-		return ret;
+	if (!bcm4377->cal_loaded) {
+		dev_info(&bcm4377->pdev->dev,
+			 "reloading calibration and PTB after hardware reset\n");
+		ret = bcm4377_hci_setup_once(hdev);
+		if (ret) {
+			dev_err(&bcm4377->pdev->dev,
+				 "failed to reload calibration/PTB: %d\n", ret);
+			return ret;
+		}
+		bcm4377->cal_loaded = true;
 	}
 
 	if (bacmp(&bcm4377->bdaddr, BDADDR_ANY))
@@ -2468,7 +2534,14 @@ static void bcm4377_hci_free_dev(void *data)
 
 static void bcm4377_hci_unregister_dev(void *data)
 {
-	hci_unregister_dev(data);
+	struct hci_dev *hdev = data;
+	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+
+	WRITE_ONCE(bcm4377->setup_retry_blocked, true);
+	cancel_delayed_work_sync(&bcm4377->setup_retry_work);
+	hci_unregister_dev(hdev);
+	/* Close may have admitted a retry before the first cancellation. */
+	cancel_delayed_work_sync(&bcm4377->setup_retry_work);
 }
 
 static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
@@ -2488,6 +2561,7 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	bcm4377->pdev = pdev;
 	bcm4377->hw = &bcm4377_hw_variants[id->driver_data];
 	init_completion(&bcm4377->event);
+	INIT_DELAYED_WORK(&bcm4377->setup_retry_work, bcm4377_setup_retry_work);
 
 	ret = bcm4377_prepare_rings(bcm4377);
 	if (ret)
@@ -2623,9 +2697,16 @@ static int bcm4377_suspend(struct device *dev)
 	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
 	int ret;
 
+	WRITE_ONCE(bcm4377->setup_retry_blocked, true);
+	cancel_delayed_work_sync(&bcm4377->setup_retry_work);
+	/* A retry queued before this fence must finish before PCI quiesces. */
+	flush_work(&bcm4377->hdev->power_on);
 	ret = hci_suspend_dev(bcm4377->hdev);
-	if (ret)
+	if (ret) {
+		WRITE_ONCE(bcm4377->setup_retry_blocked, false);
+		bcm4377_queue_setup_retry(bcm4377);
 		return ret;
+	}
 
 	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_QUIESCE,
 		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
@@ -2637,11 +2718,16 @@ static int bcm4377_resume(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
+	int ret;
 
 	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE,
 		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
 
-	return hci_resume_dev(bcm4377->hdev);
+	ret = hci_resume_dev(bcm4377->hdev);
+	WRITE_ONCE(bcm4377->setup_retry_blocked, false);
+	if (!ret)
+		bcm4377_queue_setup_retry(bcm4377);
+	return ret;
 }
 
 static DEFINE_SIMPLE_DEV_PM_OPS(bcm4377_ops, bcm4377_suspend, bcm4377_resume);
