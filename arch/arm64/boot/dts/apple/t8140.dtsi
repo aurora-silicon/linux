@@ -337,6 +337,15 @@
 				compatible = "apple,baku-pmic", "apple,spmi-nvmem";
 				reg = <0xe SPMI_USID>;
 
+				pmu_rtc: rtc {
+					compatible = "apple,j700-pmu-rtc";
+					interrupt-parent = <&nub_spmi0>;
+					interrupts = <2 IRQ_TYPE_EDGE_RISING>;
+					nvmem-cells = <&rtc_offset>;
+					nvmem-cell-names = "rtc_offset";
+					wakeup-source;
+				};
+
 				nvmem-layout {
 					compatible = "fixed-layout";
 					#address-cells = <1>;
