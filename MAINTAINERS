@@ -1969,13 +1969,23 @@ APPLE T8140 SOC AND J700 (MACBOOK NEO) SUPPORT
 M:	Ryan Murray <ryan@aurorasilicon.org>
 W:	https://aurora-silicon.github.io
 S:	Maintained
+F:	Documentation/devicetree/bindings/cpu/apple,t8140-cpuidle.yaml
+F:	Documentation/devicetree/bindings/cpufreq/apple,cluster-cpufreq.yaml
+F:	Documentation/devicetree/bindings/power/apple,t8140-pmp-report.yaml
+F:	Documentation/devicetree/bindings/soc/apple/apple,pmp.yaml
+F:	drivers/pmdomain/apple/pmp-report.c
+F:	drivers/soc/apple/pmp.rs
+F:	include/linux/soc/apple/pmp-report.h
 F:	Documentation/devicetree/bindings/chosen/apple,dcp-rtkit-quiesced.yaml
 F:	Documentation/devicetree/bindings/display/apple,dcp.yaml
 F:	Documentation/devicetree/bindings/display/apple,display-subsystem.yaml
 F:	Documentation/devicetree/bindings/iio/light/apple,t8140-aop-als.yaml
 F:	Documentation/devicetree/bindings/input/apple,dockchannel-hid.yaml
+F:	Documentation/devicetree/bindings/mailbox/apple,ascwrap-v6.yaml
 F:	Documentation/devicetree/bindings/media/apple,t8140-isp.yaml
+F:	Documentation/devicetree/bindings/mux/apple,display-crossbar.yaml
 F:	Documentation/devicetree/bindings/reserved-memory/apple,asc-mem.yaml
+F:	Documentation/devicetree/bindings/rtc/apple,j700-pmu-rtc.yaml
 F:	Documentation/devicetree/bindings/serial/apple,dockchannel-uart.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,dockchannel.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,rtk-helper-asc4.yaml
@@ -1984,16 +1994,16 @@ F:	Documentation/devicetree/bindings/sound/apple,t8140-aop-audio.yaml
 F:	Documentation/devicetree/bindings/usb/vialab,vl122.yaml
 F:	Documentation/gpu/apple-dcp-backlight.rst
 F:	Documentation/hid/apple-j700-multitouch.rst
+F:	Documentation/soc/apple/t8140-pmp-dvfs.rst
 F:	arch/arm64/boot/dts/apple/t8140*
+F:	arch/arm64/configs/j700-radio.config
 F:	arch/arm64/include/asm/apple-idle.h
 F:	arch/arm64/kernel/idle-apple.S
 F:	drivers/hid/dockchannel-hid/dockchannel-hid-protocol*
 F:	drivers/iio/common/aop_sensors/
+F:	drivers/rtc/rtc-apple-pmu.c
 F:	drivers/soc/apple/aop.rs
-F:	drivers/thermal/apple-smc-cpu-thermal.c
 F:	drivers/tty/serial/apple_dockchannel*
-F:	include/uapi/linux/apple-sep.h
-F:	include/linux/soc/apple/smc-thermal.h
 F:	rust/kernel/iio/common/aop_sensors.rs
 F:	rust/kernel/soc/apple/aop.rs
 F:	sound/soc/apple/t8140_aop_audio.rs
@@ -2577,6 +2587,7 @@ F:	Documentation/devicetree/bindings/leds/backlight/apple,dwi-bl.yaml
 F:	Documentation/devicetree/bindings/mailbox/apple,mailbox.yaml
 F:	Documentation/devicetree/bindings/mfd/apple,smc.yaml
 F:	Documentation/devicetree/bindings/net/bluetooth/brcm,bcm4377-bluetooth.yaml
+F:	Documentation/devicetree/bindings/npu/apple,ane.yaml
 F:	Documentation/devicetree/bindings/nvme/apple,nvme-ans.yaml
 F:	Documentation/devicetree/bindings/nvmem/apple,efuses.yaml
 F:	Documentation/devicetree/bindings/nvmem/apple,spmi-nvmem.yaml
@@ -2640,8 +2651,16 @@ F:	include/linux/mfd/macsmc.h
 F:	include/linux/soc/apple/*
 F:	tools/testing/selftests/drivers/apple/
 F:	include/uapi/drm/asahi_drm.h
+F:	include/uapi/linux/apple-sep.h
 F:	net/bluetooth/brcm.c
 F:	net/bluetooth/brcm.h
+
+ARM/APPLE QSPIMC DRIVER
+M:	Ryan Murray <ryan@aurorasilicon.org>
+W:	https://aurora-silicon.github.io
+S:	Maintained
+F:	Documentation/devicetree/bindings/spi/apple,qspi.yaml
+F:	drivers/spi/spi-apple-qspi.c
 
 ARM/ARTPEC MACHINE SUPPORT
 M:	Jesper Nilsson <jesper.nilsson@axis.com>
@@ -7908,6 +7927,16 @@ L:	linux-pm@vger.kernel.org
 S:	Maintained
 F:	drivers/soc/ti/smartreflex.c
 F:	include/linux/power/smartreflex.h
+
+DRM ACCEL DRIVER FOR APPLE NEURAL ENGINE
+M:	Joshua Warren <816217+joshuaswarren@users.noreply.github.com>
+L:	asahi@lists.linux.dev
+L:	dri-devel@lists.freedesktop.org
+S:	Maintained
+F:	Documentation/ABI/testing/sysfs-class-accel-ane
+F:	Documentation/devicetree/bindings/npu/apple,ane.yaml
+F:	drivers/accel/ane/
+F:	include/uapi/drm/ane_accel.h
 
 DRM ACCEL DRIVERS FOR INTEL VPU
 M:	Maciej Falkowski <maciej.falkowski@linux.intel.com>

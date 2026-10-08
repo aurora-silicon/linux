@@ -59,6 +59,7 @@
 			d-cache-size = <0x10000>;
 			operating-points-v2 = <&ecluster_opp>;
 			performance-domains = <&cpufreq_e>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e1: cpu@1 {
@@ -72,6 +73,7 @@
 			d-cache-size = <0x10000>;
 			operating-points-v2 = <&ecluster_opp>;
 			performance-domains = <&cpufreq_e>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e2: cpu@2 {
@@ -85,6 +87,7 @@
 			d-cache-size = <0x10000>;
 			operating-points-v2 = <&ecluster_opp>;
 			performance-domains = <&cpufreq_e>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e3: cpu@3 {
@@ -98,6 +101,7 @@
 			d-cache-size = <0x10000>;
 			operating-points-v2 = <&ecluster_opp>;
 			performance-domains = <&cpufreq_e>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p0: cpu@10100 {
@@ -111,6 +115,7 @@
 			d-cache-size = <0x20000>;
 			operating-points-v2 = <&pcluster_opp>;
 			performance-domains = <&cpufreq_p>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p1: cpu@10101 {
@@ -124,6 +129,7 @@
 			d-cache-size = <0x20000>;
 			operating-points-v2 = <&pcluster_opp>;
 			performance-domains = <&cpufreq_p>;
+			#cooling-cells = <2>;
 		};
 
 		l2_cache_0: l2-cache-0 {
@@ -154,26 +160,32 @@
 		opp01 {
 			opp-hz = /bits/ 64 <816000000>;
 			opp-level = <1>;
+			opp-microwatt = <48800>;
 		};
 		opp02 {
 			opp-hz = /bits/ 64 <1140000000>;
 			opp-level = <2>;
+			opp-microwatt = <68900>;
 		};
 		opp03 {
 			opp-hz = /bits/ 64 <1464000000>;
 			opp-level = <3>;
+			opp-microwatt = <88100>;
 		};
 		opp04 {
 			opp-hz = /bits/ 64 <1788000000>;
 			opp-level = <4>;
+			opp-microwatt = <129600>;
 		};
 		opp05 {
 			opp-hz = /bits/ 64 <2112000000>;
 			opp-level = <5>;
+			opp-microwatt = <172600>;
 		};
 		opp06 {
 			opp-hz = /bits/ 64 <2424000000>;
 			opp-level = <6>;
+			opp-microwatt = <243500>;
 		};
 	};
 
@@ -184,70 +196,87 @@
 		opp01 {
 			opp-hz = /bits/ 64 <744000000>;
 			opp-level = <1>;
+			opp-microwatt = <188800>;
 		};
 		opp02 {
 			opp-hz = /bits/ 64 <1260000000>;
 			opp-level = <2>;
+			opp-microwatt = <368900>;
 		};
 		opp03 {
 			opp-hz = /bits/ 64 <1620000000>;
 			opp-level = <3>;
+			opp-microwatt = <491000>;
 		};
 		opp04 {
 			opp-hz = /bits/ 64 <1944000000>;
 			opp-level = <4>;
+			opp-microwatt = <607600>;
 		};
 		opp05 {
 			opp-hz = /bits/ 64 <2196000000>;
 			opp-level = <5>;
+			opp-microwatt = <707300>;
 		};
 		opp06 {
 			opp-hz = /bits/ 64 <2472000000>;
 			opp-level = <6>;
+			opp-microwatt = <935100>;
 		};
 		opp07 {
 			opp-hz = /bits/ 64 <2688000000>;
 			opp-level = <7>;
+			opp-microwatt = <1114000>;
 		};
 		opp08 {
 			opp-hz = /bits/ 64 <2916000000>;
 			opp-level = <8>;
+			opp-microwatt = <1324800>;
 		};
 		opp09 {
 			opp-hz = /bits/ 64 <3144000000>;
 			opp-level = <9>;
+			opp-microwatt = <1772600>;
 		};
 		opp10 {
 			opp-hz = /bits/ 64 <3336000000>;
 			opp-level = <10>;
+			opp-microwatt = <2045700>;
 		};
 		opp11 {
 			opp-hz = /bits/ 64 <3504000000>;
 			opp-level = <11>;
+			opp-microwatt = <2329300>;
 		};
 		opp12 {
 			opp-hz = /bits/ 64 <3648000000>;
 			opp-level = <12>;
+			opp-microwatt = <2621600>;
 		};
 		opp13 {
 			opp-hz = /bits/ 64 <3756000000>;
 			opp-level = <13>;
+			opp-microwatt = <2803500>;
 		};
 		opp14 {
 			opp-hz = /bits/ 64 <3864000000>;
 			opp-level = <14>;
+			opp-microwatt = <3064600>;
 		};
 		opp15 {
 			opp-hz = /bits/ 64 <3924000000>;
 			opp-level = <15>;
+			opp-microwatt = <3223300>;
 		};
 		opp16 {
 			opp-hz = /bits/ 64 <3972000000>;
 			opp-level = <16>;
+			opp-microwatt = <3342600>;
 		};
 		opp17 {
 			opp-hz = /bits/ 64 <4044000000>;
 			opp-level = <17>;
+			opp-microwatt = <3424900>;
 		};
 	};
 
@@ -536,11 +565,12 @@
 
 			smc_hwmon: hwmon {
 				compatible = "apple,smc-hwmon";
+				#thermal-sensor-cells = <1>;
 
 				/*
-				 * CPU cluster die temperatures. Keep these
-				 * first: the J700 CPU thermal policy reads
-				 * the first six temperature channels.
+				 * CPU cluster die temperatures. Board thermal
+				 * zones refer to these by channel index, so
+				 * keep them first and in this order.
 				 */
 				temperature-Te05 {
 					apple,key-id = "Te05";

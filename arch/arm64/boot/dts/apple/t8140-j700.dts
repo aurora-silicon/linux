@@ -10,6 +10,7 @@
 /dts-v1/;
 
 #include "t8140.dtsi"
+#include <dt-bindings/thermal/thermal.h>
 
 / {
 	compatible = "apple,j700", "apple,t8140", "apple,arm-platform";
@@ -53,6 +54,310 @@
 	memory@10000000000 {
 		device_type = "memory";
 		reg = <0x100 0 0x2 0>; /* To be filled by loader */
+	};
+
+	/*
+	 * The J700 is fanless: the CPUs are the only cooling devices.  Every
+	 * die sensor gets a zone that throttles both clusters, since they share
+	 * one die and one heat spreader.  The power allocator splits the budget
+	 * by the energy models, with the E cluster weighted three to one: its
+	 * cores do several times more work per watt, so all-core loads keep
+	 * them at full speed and trim the P cores instead.
+	 *
+	 * The SMC refreshes these readings about once a second and the die
+	 * settles within that time, so the loop carries a full sample of delay,
+	 * and the power a core draws per energy-model watt varies about 2.7x
+	 * between integer and floating-point work.  The governor derives its
+	 * gains from sustainable-power and the switch-on to control gap; 1.5 W
+	 * over 37 C gives 40/81/8 mW per C, which held the clock within one
+	 * P-state on both kinds of load (higher gains oscillate on the heavy
+	 * one).  1.5 W lies inside the sustainable range measured at ~93 C:
+	 * 1.1 W for floating-point and 2.5 W for integer loads.  The switch-on
+	 * trip sits above the idle temperature (48-53 C), so the controller,
+	 * and with it any integral wind-up, resets whenever the machine rests.
+	 */
+	thermal-zones {
+		cpu-e0-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 0>;	/* Te05 */
+			sustainable-power = <1500>;
+
+			trips {
+				cpu_e0_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_e0_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <110000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_e0_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_e0_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <3072>;
+				};
+			};
+		};
+
+		cpu-e1-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 1>;	/* Te0S */
+			sustainable-power = <1500>;
+
+			trips {
+				cpu_e1_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_e1_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <110000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_e1_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_e1_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <3072>;
+				};
+			};
+		};
+
+		cpu-p0-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 2>;	/* Tp01 */
+			sustainable-power = <1500>;
+
+			trips {
+				cpu_p0_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p0_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <110000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p0_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_p0_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <3072>;
+				};
+			};
+		};
+
+		cpu-p1-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 3>;	/* Tp05 */
+			sustainable-power = <1500>;
+
+			trips {
+				cpu_p1_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p1_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <110000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p1_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_p1_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <3072>;
+				};
+			};
+		};
+
+		cpu-p2-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 4>;	/* Tp09 */
+			sustainable-power = <1500>;
+
+			trips {
+				cpu_p2_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p2_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <110000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p2_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_p2_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <3072>;
+				};
+			};
+		};
+
+		cpu-p3-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 5>;	/* Tp0D */
+			sustainable-power = <1500>;
+
+			trips {
+				cpu_p3_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p3_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <110000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p3_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_p3_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <3072>;
+				};
+			};
+		};
 	};
 };
 
@@ -195,12 +500,10 @@
 };
 
 &smc_hwmon {
-	/* interim J700 CPU thermal policy over the CPU die channels */
-	apple,cpu-thermal-policy;
-
 	/*
-	 * Reporting-only channels. They follow the six CPU die temperatures
-	 * in t8140.dtsi, which the CPU thermal policy samples by position.
+	 * Further channels, reported to userspace. They follow the six CPU
+	 * die temperatures in t8140.dtsi, which the thermal zones above
+	 * refer to by index.
 	 * Every key below is in the J700 SMC's key table as a read-only
 	 * float, reads 10-99 C and moves between samples. The names follow
 	 * the SMC key groups and are not otherwise verified.
