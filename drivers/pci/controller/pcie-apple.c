@@ -2174,6 +2174,13 @@ int apple_pcie_tunnel_prepare(struct device *dev, struct device_node *tunnel)
 	if (!np)
 		return 0;
 
+	/* A qualified bootloader handoff does not require experimental init. */
+	if (!of_property_read_u32(np, "apple,pciec-preinit-status", &stat) &&
+	    stat == 1) {
+		ret = 0;
+		goto out;
+	}
+
 	if (!apple_pcie_tunnel_kernel_init_enabled()) {
 		dev_err(dev, "PCIe-C %pOF: kernel init disabled (pcie_apple.tunnel_kernel_init=0)\n",
 			np);

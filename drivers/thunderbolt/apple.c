@@ -206,6 +206,22 @@ static bool apple_cio_pcie_tunnel_kernel_init(struct device_node *parent)
 	return false;
 }
 
+static bool apple_cio_pcie_tunnel_has_handoff(struct device_node *parent)
+{
+	for_each_available_child_of_node_scoped(parent, child) {
+		u32 status;
+
+		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
+		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+			continue;
+
+		return !of_property_read_u32(child, "apple,pciec-preinit-status",
+					    &status) && status == 1;
+	}
+
+	return false;
+}
+
 static bool
 apple_cio_pcie_tunnel_is_preinitialized(struct device_node *parent)
 {
@@ -559,7 +575,8 @@ static int apple_cio_populate_pcie_tunnel(struct apple_cio *acio)
 
 	/* Experimental: don't touch a cold PCIe-C port unless opted in. */
 	if (acio->pcie_tunnel_kernel_init &&
-	    !apple_pcie_tunnel_kernel_init_enabled())
+	    !apple_pcie_tunnel_kernel_init_enabled() &&
+	    !apple_cio_pcie_tunnel_has_handoff(acio->pcie_tunnel_np))
 		return dev_err_probe(acio->dev, -EPERM,
 				     "PCIe-C kernel init disabled (pcie_apple.tunnel_kernel_init=0)\n");
 
