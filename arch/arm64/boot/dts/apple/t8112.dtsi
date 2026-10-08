@@ -1680,7 +1680,8 @@
 
 		/*
 		 * iBoot hands over a running SEP. Keep Linux off its DART at boot;
-		 * apple_sep sets the DMA range and enables it, as on t602x.
+		 * apple_sep enables it at module initialization. This DART has a
+		 * 32-bit input aperture and does not use a high DMA alias.
 		 */
 		sep_dart: iommu@25d2c0000 {
 			compatible = "apple,t8112-dart", "apple,t8110-dart";
@@ -1688,6 +1689,8 @@
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 282 IRQ_TYPE_LEVEL_HIGH>;
+			apple,dma-offset = <0x0 0x0>;
+			apple,dma-range = <0x0 0x4000 0x0 0xffff0000>;
 			status = "disabled";
 		};
 
