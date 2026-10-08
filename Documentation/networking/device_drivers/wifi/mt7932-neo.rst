@@ -38,11 +38,14 @@ probing. Build it as a module so that udev loads it from the root
 filesystem, or provide its firmware in the initramfs. The driver disables
 ASPM and clock power management on its link before starting the device,
 matching the tested admission sequence, which used the PCIe ASPM
-performance policy. Bluetooth's gate defaults closed;
-validate the cold, unbound ``14c3:793b`` function, then load
-``mt7932_bt_pcie`` with ``enable=1`` after its local inputs are installed.
-A built-in transport can instead open its enable parameter before requesting
-the PCI probe.
+performance policy.
+
+``mt7932_bt_pcie`` probes the cold ``14c3:793b`` function when it loads and
+rejects a function that is not cold; ``enable=0`` leaves it unbound. Its
+module soft dependency loads ``mt7932-fullmac`` first, so the Bluetooth
+firmware starts after the Wi-Fi firmware, as in the tested sequence. The
+transport also disables ASPM on the shared link. Like the Wi-Fi driver, it
+reads its firmware while probing, so build it as a module.
 Do not reprobe after a failed or uncertain Bluetooth admission. The tested
 Wi-Fi driver owns function 0 and Bluetooth owns function 1.
 

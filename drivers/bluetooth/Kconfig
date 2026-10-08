@@ -30,7 +30,8 @@ config BT_MTK7932_PCIE
 	select FW_LOADER
 	help
 	  Support the J700 Bluetooth PCIe function with locally installed firmware
-	  and calibration. The late-probe enable parameter defaults off.
+	  and calibration. The function is probed when the driver loads; the
+	  enable=0 parameter leaves it unbound.
 	  System suspend uses the firmware sleep handshake and preserves DMA
 	  storage. Hibernation and automatic firmware recovery are unsupported.
 	  Removal drains the PCI function before releasing device-visible memory;

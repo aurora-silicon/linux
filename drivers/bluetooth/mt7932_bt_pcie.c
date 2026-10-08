@@ -64,9 +64,9 @@
 #define BT7932_CAL "mediatek/j700-mt7932-btcal.bin"
 #define BT7932_ADDR "mediatek/j700-mt7932-bdaddr.bin"
 
-static bool enable;
+static bool enable = true;
 module_param(enable, bool, 0600);
-MODULE_PARM_DESC(enable, "Diagnostic late-probe gate; default closed, no effect on an already bound device");
+MODULE_PARM_DESC(enable, "Probe the transport (default: on); no effect on an already bound device");
 
 struct bt7932_geometry {
 	u16 stride;
@@ -1041,13 +1041,15 @@ static int bt7932_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	u16 command;
 	int ret;
 
-	/* The coordinator opens this only after the real root has its inputs. */
+	/* enable=0 leaves the function unbound for diagnosis. */
 	if (!READ_ONCE(enable))
 		return -ENODEV;
 	if (!of_machine_is_compatible("apple,j700") ||
 	    !of_machine_is_compatible("apple,t8140") ||
 	    pci_domain_nr(pdev->bus) || pdev->bus->number != 1 || pdev->devfn != PCI_DEVFN(0, 1))
 		return -ENODEV;
+	/* Admission was qualified with ASPM and clock PM off on this link. */
+	pci_disable_link_state(pdev, PCIE_LINK_STATE_ALL);
 	bt = kzalloc_obj(*bt);
 	if (!bt)
 		return -ENOMEM;
@@ -1349,6 +1351,8 @@ module_pci_driver(bt7932_driver);
 
 MODULE_DESCRIPTION("Experimental standalone J700 MT7932 Bluetooth PCIe transport");
 MODULE_LICENSE("GPL");
+/* Admission was qualified after the Wi-Fi function had started its firmware. */
+MODULE_SOFTDEP("pre: mt7932_fullmac");
 MODULE_FIRMWARE(BT7932_FW_B0);
 MODULE_FIRMWARE(BT7932_FW_B1);
 MODULE_FIRMWARE(BT7932_FW_B1_FALLBACK);
