@@ -221,7 +221,19 @@ impl Inner {
     /// Whether the front pending work may be published behind the in-flight batches, and if so
     /// in which pass slot it starts and how many passes it may use.
     fn pipeline_slot(&mut self)->Result<Option<(usize,usize)>> {
-        Ok(self.active.is_empty().then_some((0,crate::m3_pass_layout::SLOTS)))
+        let Some(last)=self.active.last() else {return Ok(Some((0,crate::m3_pass_layout::SLOTS)));};
+        if !self.render_initialized {return Ok(None);}
+        let Some((packet,next))=self.pending.first() else {return Ok(None);};
+        if !matches!(packet.commands[*next],crate::m3_submit::Command::Render{..})
+            || self.active.iter().any(|b| b.kind!=0) || !packet.vm.same(&last.entries[0].0.vm) {return Ok(None);}
+        let in_flight:usize=self.active.iter().map(|b|b.entries.len()).sum();
+        let Some(room)=policy::pipeline_room(crate::m3_params::pipeline_depth(self.device.soc()),
+            self.active.len(),in_flight,last.base,last.entries.len()) else {return Ok(None);};
+        // Yield at the next retirement when more urgent work is already waiting.
+        if self.pending.iter().any(|(p,_)|p.urgency>packet.urgency) {return Ok(None);}
+        if !policy::overlap_ready(self.render_initialized,true,true,true,
+            self.config.pipe_free(0)? && self.config.pipe_free(1)?) {return Ok(None);}
+        Ok(Some(room))
     }
     /// Publish pending batches while allowed: one when none is active, more behind it with
     /// asahi.m3_pipeline_depth > 1. Returns whether anything was published or failed.

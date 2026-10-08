@@ -221,6 +221,11 @@ impl Config {
         agx_memory::publish();
         Ok(())
     }
+    /// Whether the firmware has consumed every message on pipe `kind` (0 TA, 1 3D, 2 compute).
+    pub(crate) fn pipe_free(&mut self, kind:usize) -> Result<bool> {
+        if kind>2 {return Err(EINVAL);}
+        Ok(self.objects[kind*2].read_u32(0)? == self.objects[kind*2].read_u32(0x20)?)
+    }
     pub(crate) fn pipes_idle(&mut self) -> Result<bool> {
         for state in [0,2,4] {
             if self.objects[state].read_u32(0)? != self.objects[state].read_u32(0x20)? {

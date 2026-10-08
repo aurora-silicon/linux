@@ -17,6 +17,21 @@ pub(crate) const fn may_join(render:bool, next:usize, same_vm:bool, same_urgency
     render && next==0 && same_vm && same_urgency
 }
 
+pub(crate) const fn default_depth(_t8122:bool) -> usize {1}
+
+pub(crate) const fn overlap_ready(initialized:bool, render:bool, all_render:bool,
+    same_vm:bool, pipes_consumed:bool) -> bool {
+    initialized && render && all_render && same_vm && pipes_consumed
+}
+
+/// The circular free tail of contiguous, ordered active batches.
+pub(crate) fn pipeline_room(depth: usize, batches: usize, passes: usize,
+    last_base: usize, last_count: usize) -> Option<(usize, usize)> {
+    if batches >= depth || passes >= SLOTS || last_base >= SLOTS
+        || last_count == 0 || last_count > passes { return None; }
+    Some(((last_base + last_count) % SLOTS, SLOTS - passes))
+}
+
 /// A signaled cancellation is not proof that firmware stopped using the packet.
 pub(crate) const fn packet_retired(pending: bool, active: bool) -> bool {
     !pending && !active

@@ -381,6 +381,26 @@ pub(crate) fn ut_engagement(soc: &crate::m3_soc::Soc) -> (u32, bool) {
     }
 }
 
+/// `asahi.m3_pipeline_depth`: writable at runtime. How many render batches may be in flight on
+/// the firmware's render queues. Zero selects the SoC default: 2 on the explicitly enabled
+/// experimental T8122 runtime, 1 on T6030. Depth 1 publishes only after the previous batch has
+/// fully retired. Larger values publish the next render batch of the same VM while earlier
+/// ones still run, in disjoint pass slots, ordered by the existing cross-pass barriers.
+static M3_PIPELINE_DEPTH: AtomicU64 = AtomicU64::new(0);
+m3_param!("m3_pipeline_depth", M3_PIPELINE_DEPTH, parse_pipeline_depth, 0o644, Some(get_atomic_param));
+
+fn parse_pipeline_depth(text: &str) -> Option<u64> {
+    parse_u64(text).filter(|v| *v<=crate::m3_pass_layout::SLOTS as u64)
+}
+
+/// Effective depth; changing it never releases already published pass slots.
+pub(crate) fn pipeline_depth(soc: &crate::m3_soc::Soc) -> usize {
+    match M3_PIPELINE_DEPTH.load(Ordering::Relaxed) {
+        0 => crate::m3_runtime::policy::default_depth(crate::t8122_start::is_t8122(soc)),
+        v => v.clamp(1,crate::m3_pass_layout::SLOTS as u64) as usize,
+    }
+}
+
 /// Bits of `asahi.m3_retire_mmio`.
 pub(crate) const RETIRE_MMIO_BUSY: u64 = 1 << 0;
 pub(crate) const RETIRE_MMIO_FAULTS: u64 = 1 << 1;
