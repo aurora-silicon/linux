@@ -328,6 +328,10 @@
 #undef DIE
 #undef DIE_NO
 
+&ane {
+	compatible = "apple,t6022-ane";
+};
+
 &aic {
 	affinities {
 		e-core-pmu-affinity {

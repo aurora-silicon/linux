@@ -1,0 +1,50 @@
+What:		/sys/class/accel/accel<idx>/device/ane_stats
+Date:		October 2026
+KernelVersion:	7.1
+Contact:	Joshua Warren <816217+joshuaswarren@users.noreply.github.com>
+Description:
+		Cumulative Apple Neural Engine (ANE) producer counters for
+		this device, one ASCII "key value" pair per line, mode
+		0444 (readable without root):
+
+		busy_ns: nanoseconds the engine was busy since the
+		device was bound, sampled with a consistent
+		close/open snapshot. A busy period opens
+		when the first submission lands on an idle
+		engine and closes when the last one
+		completes; its whole span folds once at
+		close, and overlapping submissions share
+		the period, so a serialized engine
+		(ane.ko, behind engine_lock) reports
+		sum(end - start) and a parallel engine
+		(ane_t6021) reports the union, never the
+		sum. The show callback adds the live tail
+		of the still-open period, so the value
+		advances while engine work is in flight.
+
+		jobs: completed engine submissions since the
+		device was bound. On ane.ko every ANE_SUBMIT
+		counts (one per libane ane_exec, N per
+		ane_exec_loop). On ane_t6021 only
+		CSNE_CMD_PROCEDURE_CALL counts (one per
+		engine PROCEDURE_CALL); the control-plane
+		exchanges that ride the same path
+		(LOAD_PROGRAM, CREATE_PROCESS,
+		CH_PROPERTY_WRITE, install-time CONFIG_GET)
+		and the boot transport are not engine
+		work and are not counted. A submission
+		that completes with an error still
+		completes its begin/complete pair, so the
+		counter stays balanced.
+
+		Neither counter resets while the device is bound.
+
+		The file exists only when the module parameter
+		ane.stats / ane_t6021.stats (default 1) is set at
+		probe. With stats=0 the driver creates no stats files
+		and the submission hot path skips the counters.
+
+Users:		performance samplers that compute engine utilization
+		and job rate from the two counters.
+
+

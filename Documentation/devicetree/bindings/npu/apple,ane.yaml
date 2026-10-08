@@ -1,0 +1,198 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/npu/apple,ane.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple Neural Engine
+
+maintainers:
+  - Joshua Warren <816217+joshuaswarren@users.noreply.github.com>
+
+description:
+  The Apple Neural Engine (ANE) is the neural network accelerator of Apple
+  SoCs. It accesses memory through three DARTs. On T8103 and T6000 the host
+  drives the engine through its register window. On T602x and T8112 a
+  coprocessor runs the ANE firmware and the host talks to it through an ASC
+  mailbox.
+
+properties:
+  compatible:
+    enum:
+      - apple,t8103-ane
+      - apple,t6000-ane
+      - apple,t6020-ane
+      - apple,t6021-ane
+      - apple,t6022-ane
+      - apple,t8112-ane
+
+  reg:
+    minItems: 1
+    items:
+      - description: Engine registers. On T602x and T8112 this is the whole
+          ANE block, including the coprocessor.
+      - description: Power manager (PMGR) registers of the ANE
+      - description: ANE power state registers in the PMGR
+      - description: eFuse words that give the SoC revision to the ANE
+          firmware
+
+  reg-names:
+    minItems: 1
+    items:
+      - const: engine
+      - const: pmgr
+      - const: set
+      - const: fuse
+
+  interrupts:
+    maxItems: 1
+
+  interrupt-names:
+    items:
+      - const: ane
+
+  iommus:
+    maxItems: 3
+
+  power-domains:
+    description:
+      The power states the engine needs, five on T8103 and T6000, eight on
+      T602x and seven on T8112.
+    minItems: 5
+    maxItems: 8
+
+  resets:
+    maxItems: 1
+    description: Reset of the ANE coprocessor
+
+  mboxes:
+    maxItems: 1
+    description: Mailbox of the ANE coprocessor
+
+  memory-region:
+    maxItems: 1
+    description:
+      IOVA-only reservation of the firmware entry alias in the ANE DART
+      address space.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - interrupt-names
+  - iommus
+  - power-domains
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8103-ane
+              - apple,t6000-ane
+    then:
+      properties:
+        reg:
+          maxItems: 1
+        reg-names:
+          maxItems: 1
+        power-domains:
+          maxItems: 5
+        resets: false
+        mboxes: false
+        memory-region: false
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t6020-ane
+              - apple,t6021-ane
+              - apple,t6022-ane
+    then:
+      properties:
+        reg:
+          minItems: 3
+          maxItems: 3
+        reg-names:
+          minItems: 3
+          maxItems: 3
+        power-domains:
+          minItems: 8
+      required:
+        - resets
+        - mboxes
+        - memory-region
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8112-ane
+    then:
+      properties:
+        reg:
+          minItems: 4
+        reg-names:
+          minItems: 4
+        power-domains:
+          minItems: 7
+          maxItems: 7
+        resets: false
+        memory-region: false
+      required:
+        - mboxes
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        ane@26bc04000 {
+            compatible = "apple,t8103-ane";
+            reg = <0x2 0x6bc04000 0x0 0x24000>;
+            reg-names = "engine";
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 416 IRQ_TYPE_LEVEL_HIGH>;
+            interrupt-names = "ane";
+            iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
+            power-domains = <&ps_ane_set1>, <&ps_ane_set2>,
+                            <&ps_ane_set3>, <&ps_ane_set4>, <&ps_ane_set5>;
+        };
+    };
+
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        ane@284000000 {
+            compatible = "apple,t6021-ane";
+            reg = <0x2 0x84000000 0x0 0x2000000>,
+                  <0x2 0x8e080000 0x0 0x4034>,
+                  <0x2 0x8e08c000 0x0 0x4000>;
+            reg-names = "engine", "pmgr", "set";
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 0 884 IRQ_TYPE_LEVEL_HIGH>;
+            interrupt-names = "ane";
+            iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
+            power-domains = <&ps_ane_sys_mpm>, <&ps_ane_td>,
+                            <&ps_ane_base>, <&ps_ane_set1>, <&ps_ane_set2>,
+                            <&ps_ane_set3>, <&ps_ane_set4>, <&ps_ane_cpu>;
+            resets = <&ps_ane_cpu>;
+            mboxes = <&ane_mbox>;
+            memory-region = <&ane_alias_iova>;
+        };
+    };
