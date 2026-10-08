@@ -247,9 +247,22 @@ impl SepData {
 
     pub(crate) fn refkey_seal_trusted(&self, key: &[u8]) -> Result<KVec<u8>> {
         self.ensure_machine_refkey()?;
-        let guard = self.machine_refkey.lock();
-        let mk = guard.as_ref().ok_or(ENODEV)?;
-        refkey_seal::ecies_seal(&mk.pub_raw, key)
+        let sealed = {
+            let guard = self.machine_refkey.lock();
+            let mk = guard.as_ref().ok_or(ENODEV)?;
+            refkey_seal::ecies_seal(&mk.pub_raw, key)?
+        };
+
+        // The cached public key can still encrypt after the identity bag
+        // stops admitting its private ref-key. Do not return a new trusted
+        // blob unless this bag can recover it. Release the cache lock before
+        // unsealing, which acquires that lock again.
+        let recovered = crate::Secret(self.refkey_unseal_trusted(&sealed)?);
+        if &*recovered != key {
+            dev_err!(self.dev, "trusted-keys: refusing a new blob whose private-key round trip failed\n");
+            return Err(EIO);
+        }
+        Ok(sealed)
     }
 
     pub(crate) fn refkey_unseal_trusted(&self, sealed: &[u8]) -> Result<KVec<u8>> {

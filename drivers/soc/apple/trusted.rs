@@ -3,8 +3,8 @@
 
 //! A Linux trusted-key source backed by the SEP reference-key seal.
 //!
-//! Seal is a host-side ECIES encrypt to the machine ref-key's public point (no
-//! enclave round trip). Unseal asks the enclave to ECIES-decrypt (op 0x22
+//! Seal encrypts to the machine ref-key's public point and checks private-key
+//! recovery before returning the blob. Unseal asks the enclave to ECIES-decrypt (op 0x22
 //! `"oecd"`) with the in-enclave private, which needs the login key bag reloaded
 //! and unlocked first. The ref-key lifecycle lives on [`SepData`]; this is the
 //! keyring glue. The config-dependent payload ABI is in `trusted_shim.c`.
