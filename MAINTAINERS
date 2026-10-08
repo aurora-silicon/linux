@@ -1969,6 +1969,9 @@ APPLE T8140 PMP SUPPORT
 M:	Ryan Murray <ryan@aurorasilicon.org>
 L:	asahi@lists.linux.dev
 S:	Maintained
+F:	Documentation/devicetree/bindings/cpufreq/apple,cluster-cpufreq.yaml
+F:	Documentation/devicetree/bindings/power/apple,t8140-pmp-report.yaml
+F:	Documentation/devicetree/bindings/soc/apple/apple,pmp.yaml
 F:	drivers/pmdomain/apple/pmp-report.c
 F:	drivers/soc/apple/pmp.rs
 F:	include/linux/soc/apple/pmp-report.h

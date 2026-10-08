@@ -45,6 +45,18 @@ properties:
   reg:
     maxItems: 1
 
+  apple,fast-die-effort:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    description: |
+      PMP report region and cluster effort lane. Increasing firmware effort
+      imposes a maximum-frequency QoS constraint alongside thermal cooling.
+      If the PMP is unavailable, cpufreq retains its fallback ceiling.
+    items:
+      - items:
+          - description: PMP report region
+          - description: Cluster lane (0 for E, 1 for P on T8140)
+            enum: [0, 1]
+
   '#performance-domain-cells':
     const: 0
 
