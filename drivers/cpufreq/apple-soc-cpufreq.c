@@ -650,7 +650,8 @@ static int apple_fast_die_init(struct cpufreq_policy *policy,
 
 	parsed = of_parse_phandle_with_fixed_args(cluster, "apple,fast-die-effort",
 						  1, 0, &args);
-	if (parsed == -ENOENT)
+	/* Required thermal admission must fail closed with an older DT. */
+	if (parsed == -ENOENT && !priv->info->needs_thermal_policy)
 		return 0;
 
 	while (policy->freq_table[n].frequency != CPUFREQ_TABLE_END)
