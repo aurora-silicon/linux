@@ -310,13 +310,30 @@ mod tests {
     }
 
     #[test]
-    fn t8122_identity_cannot_admit_an_unvalidated_initdata_version() {
-        assert!(KNOWN_IMAGES.iter().all(|image| image.initdata_magic.is_some()));
+    fn t8122_admission_requires_qualified_initdata_and_matching_image_identity() {
         let image = &KNOWN_IMAGES_T8122[0];
+        assert_eq!(image.initdata_magic, Some(G15_V14_8_3_INITDATA));
         let text = image_header(image.uuid.unwrap());
         assert_eq!(image_info(&text).unwrap().uuid, image.uuid.unwrap());
-        assert!(image.initdata_magic.is_none());
-        assert!(!admits_text(image, &text, &[0; 32]));
+        assert!(admits_text(image, &text, &[0; 32]));
+
+        // A qualified version does not admit an unknown or another chip's image.
+        for wrong_uuid in [[0; 16], KNOWN_IMAGES[1].uuid.unwrap()] {
+            assert!(!admits_text(image, &image_header(wrong_uuid), &[0; 32]));
+        }
+        assert!(!image.accepts_runtime(None, &[0; 32]));
+
+        // Matching identity still cannot admit an unqualified InitData layout.
+        let unqualified = KnownImage {
+            name: image.name, uuid: image.uuid, stkg_sha256: image.stkg_sha256,
+            initdata_magic: None,
+        };
+        assert!(!admits_text(&unqualified, &text, &[0; 32]));
+        let unidentified = KnownImage {
+            name: "unknown", uuid: None, stkg_sha256: None,
+            initdata_magic: image.initdata_magic,
+        };
+        assert!(!admits_text(&unidentified, &text, &[0; 32]));
     }
 
     #[test]
