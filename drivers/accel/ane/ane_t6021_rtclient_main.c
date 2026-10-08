@@ -1314,11 +1314,12 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 				       const struct drm_ane_exec *user)
 {
 	struct drm_ane_exec_io *ios;
+	struct ane_t6021_bo **exec_bos;
 	struct ane_legacy_buffer *command;
 	struct ane_t6021_fd *fd = file->driver_priv;
 	size_t ios_size;
 	size_t cmd_size;
-	int ret, i;
+	int ret, i, pinned = 0;
 
 	if (user->pad || user->count < 1 || user->count > DRM_ANE_MAX_BINDS ||
 	    user->priority < 2 || user->priority > 7 || !fd)
@@ -1346,17 +1347,21 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 		return -E2BIG;
 	}
 
+	exec_bos = kcalloc(user->count, sizeof(*exec_bos), GFP_KERNEL);
+	if (!exec_bos) {
+		kfree(ios);
+		return -ENOMEM;
+	}
+
 	mutex_lock(&ane_t6021_fw_lock);
 	if (atomic_read(&ane_t6021_quarantined)) {
-		mutex_unlock(&ane_t6021_fw_lock);
-		kfree(ios);
-		return -ETIMEDOUT;
+		ret = -ETIMEDOUT;
+		goto unlock;
 	}
 	command = ane->cmd_buf;
 	if (!command) {
-		mutex_unlock(&ane_t6021_fw_lock);
-		kfree(ios);
-		return -ENODEV;
+		ret = -ENODEV;
+		goto unlock;
 	}
 	memset(command->cpu, 0, SZ_16K);
 	{
@@ -1385,11 +1390,9 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 				ret = -EINVAL;
 				goto unlock;
 			}
-			/* The IOVA below is about to be published to the
-			 * firmware, so mark the BO before the exchange.
-			 * Under bo_lock the handle reference cannot go
-			 * away, so no kref is needed here.
-			 */
+			/* Keep this IO element out of the reuse pool until completion. */
+			kref_get(&bo->refcount);
+			exec_bos[pinned++] = bo;
 			bo->fw_ref = true;
 			iova = bo->dma;
 			mutex_unlock(&ane_t6021_bo_lock);
@@ -1416,6 +1419,10 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 							       user->timeout_ms : 5000);
 	}
 unlock:
+	/* Command failures latch quarantine before these final puts. */
+	while (pinned)
+		kref_put(&exec_bos[--pinned]->refcount, ane_t6021_bo_release);
+	kfree(exec_bos);
 	mutex_unlock(&ane_t6021_fw_lock);
 	kfree(ios);
 	return ret;
