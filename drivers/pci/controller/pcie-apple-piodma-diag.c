@@ -8,7 +8,9 @@
  *
  * This built-in driver deliberately retains its coherent arena and device
  * power reference until a coordinator-controlled full hardware reset. There
- * is no unbind interface, suspend, kexec or retry. Native ECAM is only
+ * is no unbind interface, kexec or retry. Suspend-to-idle sleep preserves the
+ * arena and restores the register banks without resubmitting its request.
+ * Native ECAM is only
  * opened by the host after a successful bootstrap and typed read checks.
  */
 #include <linux/bitfield.h>
@@ -29,6 +31,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/suspend.h>
 
 #include "pcie-apple-piodma-diag.h"
 
@@ -92,6 +95,7 @@ struct apple_piodma_diag {
 	u64 pointer_prefix;
 	u8 secondary_bus;
 	bool retained;
+	bool ready;
 };
 
 static int apple_piodma_diag_root(struct apple_piodma_diag *diag, struct pci_dev *root)
@@ -532,11 +536,13 @@ int apple_piodma_bootstrap_prime(struct device *supplier, struct pci_dev *root)
 	ret = apple_piodma_diag_initialize(diag);
 	if (!ret)
 		ret = apple_piodma_diag_submit(diag, 0);
-	if (ret)
+	if (ret) {
 		dev_err(supplier, "bootstrap failure=%d; retained ownership; no retry\n", ret);
-	else
+	} else {
+		WRITE_ONCE(diag->ready, true);
 		dev_info(supplier, "BOOTSTRAP_VALIDATED word=%#x; one retained slot\n",
 			 diag->slots[0].result);
+	}
 	return ret;
 }
 
@@ -597,6 +603,59 @@ static void apple_piodma_diag_shutdown(struct platform_device *pdev)
 	dev_warn(&pdev->dev, "diagnostic arena retained; require full hardware reset\n");
 }
 
+/* No new request is permitted once the host has admitted its endpoints. */
+static int apple_piodma_diag_sleep_check(struct apple_piodma_diag *diag)
+{
+	if (!READ_ONCE(diag->ready) || READ_ONCE(diag->irq_fault))
+		return -EIO;
+	if (readl(diag->engine + 0x54) & BIT(0))
+		return -EBUSY;
+	if ((readl(diag->engine + 0x0c) & PIODMA_FIFO_MASK) != 16)
+		return -EBUSY;
+	return apple_piodma_diag_check_slots(diag);
+}
+
+static int apple_piodma_diag_suspend_noirq(struct device *dev)
+{
+	struct apple_piodma_diag *diag = dev_get_drvdata(dev);
+
+	if (!diag->retained)
+		return 0;
+	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
+		return -EOPNOTSUPP;
+	return apple_piodma_diag_sleep_check(diag);
+}
+
+static int apple_piodma_diag_resume_noirq(struct device *dev)
+{
+	struct apple_piodma_diag *diag = dev_get_drvdata(dev);
+	int ret;
+
+	if (!diag->retained)
+		return 0;
+	if (!READ_ONCE(diag->ready) || READ_ONCE(diag->irq_fault))
+		return -EIO;
+	/* Genpd may gate this island; restore configuration, never a command. */
+	ret = apple_piodma_diag_initialize(diag);
+	if (ret)
+		return ret;
+	return apple_piodma_diag_sleep_check(diag);
+}
+
+static int apple_piodma_diag_freeze(struct device *dev)
+{
+	struct apple_piodma_diag *diag = dev_get_drvdata(dev);
+
+	return diag->retained ? -EOPNOTSUPP : 0;
+}
+
+static const struct dev_pm_ops apple_piodma_diag_pm_ops = {
+	.suspend_noirq = apple_piodma_diag_suspend_noirq,
+	.resume_noirq = apple_piodma_diag_resume_noirq,
+	.freeze = apple_piodma_diag_freeze,
+	.poweroff = apple_piodma_diag_freeze,
+};
+
 static const struct of_device_id apple_piodma_diag_match[] = {
 	{ .compatible = "apple,t8140-piodma-diagnostic" },
 	{ }
@@ -608,6 +667,7 @@ static struct platform_driver apple_piodma_diag_driver = {
 	.driver = {
 		.name = "apple-piodma-diag",
 		.of_match_table = apple_piodma_diag_match,
+		.pm = pm_sleep_ptr(&apple_piodma_diag_pm_ops),
 		.suppress_bind_attrs = true,
 	},
 };
