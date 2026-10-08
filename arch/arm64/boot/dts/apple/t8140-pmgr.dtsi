@@ -471,4 +471,17 @@
 		label = "smc_i2cm2";
 		apple,always-on; /* used by the SMC firmware */
 	};
+
+};
+
+&pmgr {
+
+	ps_ane_sys: power-controller@290 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x290 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ane_sys";
+		status = "okay";
+	};
 };
