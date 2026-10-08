@@ -777,23 +777,36 @@ static bool is_disp_register(struct apple_dcp *dcp, u64 start, u64 end)
 static struct dcp_map_physical_resp
 dcpep_cb_map_physical(struct apple_dcp *dcp, struct dcp_map_physical_req *req)
 {
-	int size = ALIGN(req->size, 4096);
+	u64 size, end;
 	dma_addr_t dva;
 	u32 id;
 
-	if (!is_disp_register(dcp, req->paddr, req->paddr + size - 1)) {
+	/* Both values come from the coprocessor; reject wrapping ranges. */
+	if (!req->size || check_add_overflow(req->size, 4095ULL, &size) ||
+	    check_add_overflow(req->paddr, round_down(size, 4096) - 1, &end) ||
+	    !is_disp_register(dcp, req->paddr, end)) {
 		dev_err(dcp->dev, "refusing to map phys address %llx size %llx\n",
 			req->paddr, req->size);
 		return (struct dcp_map_physical_resp){};
 	}
+	size = round_down(size, 4096);
 
 	id = find_first_zero_bit(dcp->memdesc_map, DCP_MAX_MAPPINGS);
+	if (id >= DCP_MAX_MAPPINGS) {
+		dev_warn(dcp->dev, "DCP overflowed mapping table, ignoring\n");
+		return (struct dcp_map_physical_resp){};
+	}
+
+	dva = dma_map_resource(dcp->dev, req->paddr, size, DMA_BIDIRECTIONAL, 0);
+	if (dma_mapping_error(dcp->dev, dva)) {
+		dev_err(dcp->dev, "failed to map phys address %llx size %llx\n",
+			req->paddr, size);
+		return (struct dcp_map_physical_resp){};
+	}
+
 	set_bit(id, dcp->memdesc_map);
 	dcp->memdesc[id].size = size;
 	dcp->memdesc[id].reg = req->paddr;
-
-	dva = dma_map_resource(dcp->dev, req->paddr, size, DMA_BIDIRECTIONAL, 0);
-	WARN_ON(dva == DMA_MAPPING_ERROR);
 
 	return (struct dcp_map_physical_resp){
 		.dva_size = size,
