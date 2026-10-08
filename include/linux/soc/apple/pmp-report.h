@@ -11,9 +11,11 @@
 #include <linux/errno.h>
 
 struct device_node;
+struct device;
 
 #if IS_ENABLED(CONFIG_APPLE_PMP_REPORT)
 int apple_pmp_report_wait_ready(struct device_node *entry, unsigned long timeout);
+int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int timeout_ms);
 #else
 static inline int apple_pmp_report_wait_ready(struct device_node *entry,
 					      unsigned long timeout)

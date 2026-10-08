@@ -37,4 +37,5 @@ apple-sep-y := sep.o hwrng_shim.o store_shim.o bio_shim.o sha_shim.o \
 		crypto_shim.o sensor_shim.o p256_shim.o trusted_shim.o work_shim.o \
 		pm_shim.o diag_shim.o
 
-obj-$(CONFIG_APPLE_PMP) += pmp.o
+obj-$(CONFIG_APPLE_PMP) += apple-pmp.o
+apple-pmp-y := pmp.o pmp-export.o
