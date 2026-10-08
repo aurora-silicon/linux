@@ -1028,10 +1028,7 @@ static int tbnet_open(struct net_device *dev)
 	tb_ring_throttling(net->tx_ring.ring, TBNET_THROTTLING);
 	tb_ring_throttling(net->rx_ring.ring, TBNET_THROTTLING);
 
-	mutex_lock(&net->connection_lock);
-	napi_enable(&net->napi);
-	net->napi_enabled = true;
-	mutex_unlock(&net->connection_lock);
+	/* connected_work enables NAPI after priming both rings. */
 	start_login(net);
 
 	return 0;
