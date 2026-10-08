@@ -21,18 +21,13 @@
 
 #include "shim.h"
 
-/*
- * 8 MHz, SPI mode 2 (CPOL=1 CPHA=0), 8-bit words. Mode 3 returns sixteen zero
- * bytes, else identical. Must agree with the node's spi-cpol / absent spi-cpha,
- * which is what spi_setup() applies.
- */
+/* The board selects the SPI mode; an override is diagnostic only. */
 #define SEP_SENSOR_HZ		8000000
 #define SEP_SENSOR_BITS		8
-static unsigned int sep_sensor_mode = SPI_MODE_2;
+static unsigned int sep_sensor_mode = ~0U;
 module_param_named(sensor_spi_mode, sep_sensor_mode, uint, 0444);
 MODULE_PARM_DESC(sensor_spi_mode,
-		 "SPI mode for the sensor: 2 (CPOL=1 CPHA=0, the default and the only mode this sensor answers under) or 3 (CPOL=1 CPHA=1, reads all-zero). For comparison only.");
-#define SEP_SENSOR_MODE		sep_sensor_mode
+		 "Diagnostic SPI mode override (0-3); default retains the board mode");
 
 /* Chip-select setup and hold, in ns. */
 #define SEP_SENSOR_CS_NS		20
@@ -340,11 +335,15 @@ static int sep_apply_cs_timing(struct spi_device *spi)
 	 * select. spi_setup() takes the controller io_mutex, not the bus lock,
 	 * so no deadlock.
 	 */
+	if (sep_sensor_mode != ~0U && sep_sensor_mode > SPI_MODE_3)
+		return -EINVAL;
+
 	rc = spi_bus_lock(ctlr);
 	if (rc)
 		return rc;
 
-	spi->mode = SEP_SENSOR_MODE;
+	if (sep_sensor_mode != ~0U)
+		spi->mode = sep_sensor_mode;
 	spi->bits_per_word = SEP_SENSOR_BITS;
 	spi->max_speed_hz = SEP_SENSOR_HZ;
 	spi->cs_setup.value = SEP_SENSOR_CS_NS;
