@@ -2,6 +2,7 @@
 config USB4_NET
 	tristate "Networking over USB4 and Thunderbolt cables"
 	depends on USB4 && INET
+	select PAGE_POOL
 	help
 	  Select this if you want to create network between two computers
 	  over a USB4 and Thunderbolt cables. The driver supports Apple
