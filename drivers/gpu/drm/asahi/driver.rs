@@ -202,15 +202,9 @@ impl platform::Driver for AsahiDriver {
             .property_read_array_vec(c_str!("apple,firmware-compat"), 3)?
             .required_by(pdev.as_ref())?;
 
-        // TODO: This is very temporary
-        // SAFETY: This should be safe as data is not touched by the driver
-        // untill it gets fully initialised.
-        // Additionally drm::device::Device::release() will not drop data and
-        // leaks instead.
-        let uninit = unsafe {
-            pin_init::pin_init_from_closure::<AsahiData, kernel::error::Error>(|_slot| Ok(()))
-        };
-        let drm: ARef<AsahiDevice> = drm::device::Device::new(pdev.as_ref(), uninit)?;
+        // SAFETY: GPU construction uses the DRM allocation but not its driver data.
+        // No userspace or driver-data work is published before init_data() succeeds.
+        let drm: ARef<AsahiDevice> = unsafe { drm::device::Device::new_uninit(pdev.as_ref())? };
 
         let gpu = match (cfg.gpu_gen, cfg.gpu_variant, compat.as_slice()) {
             (hw::GpuGen::G13, _, &[12, 3, 0]) => {
@@ -246,10 +240,8 @@ impl platform::Driver for AsahiDriver {
             resources: res,
         });
 
-        let ptr: *const AsahiData = &raw const **drm;
-        unsafe {
-            data.__pinned_init(ptr as *mut AsahiData)?;
-        }
+        // SAFETY: This is the sole initializer; driver data has not been accessed yet.
+        unsafe { drm.init_data(data)? };
 
         (*drm).gpu.init()?;
 
@@ -264,12 +256,9 @@ impl AsahiDriver {
         // SAFETY: The GPU performs DMA through a UAT whose output width is part of the SoC config.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
         let res = regs::Resources::new(pdev)?;
-        // SAFETY: As in the legacy probe, the data is inaccessible until the fully initialized
-        // manager is installed below and the DRM device is registered.
-        // If construction fails, drm::device::Device::release leaves the data
-        // untouched rather than dropping an uninitialized AsahiData.
-        let uninit = unsafe { pin_init::pin_init_from_closure::<AsahiData, Error>(|_slot| Ok(())) };
-        let drm: ARef<AsahiDevice> = drm::device::Device::new(pdev.as_ref(), uninit)?;
+        // SAFETY: GPU construction cannot access driver data before init_data().
+        // Failed construction releases the allocation without dropping uninitialized data.
+        let drm: ARef<AsahiDevice> = unsafe { drm::device::Device::new_uninit(pdev.as_ref())? };
         let gpu = g17::Gpu::new(pdev, &drm, cfg, res.clone())?;
         let data_gpu = gpu.clone() as Arc<dyn gpu::Gpu>;
         let data = try_pin_init!(AsahiData {
@@ -277,9 +266,8 @@ impl AsahiDriver {
             pdev: pdev.into(),
             resources: res,
         });
-        let ptr = &raw const **drm;
-        // SAFETY: The allocation is pinned and its data slot has not been initialized yet.
-        if let Err(error) = unsafe { data.__pinned_init(ptr as *mut AsahiData) } {
+        // SAFETY: This is the sole initializer; no driver-data users have been published.
+        if let Err(error) = unsafe { drm.init_data(data) } {
             gpu.shutdown();
             return Err(error);
         }

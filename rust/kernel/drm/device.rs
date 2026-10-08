@@ -27,12 +27,14 @@ use crate::{
 };
 use core::{
     alloc::Layout,
-    mem,
+    cell::UnsafeCell,
+    mem::{self, MaybeUninit},
     ops::Deref,
     ptr::{
         self,
         NonNull, //
     },
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 #[cfg(CONFIG_DRM_LEGACY)]
@@ -73,10 +75,13 @@ macro_rules! drm_legacy_fields {
 /// # Invariants
 ///
 /// `self.dev` is a valid instance of a `struct device`.
+/// When `data_initialized` is true, `data` owns initialized, pinned driver data.
+/// Otherwise, driver data must not be accessed.
 #[repr(C)]
 pub struct Device<T: drm::Driver> {
     dev: Opaque<bindings::drm_device>,
-    data: T::Data,
+    data: UnsafeCell<MaybeUninit<T::Data>>,
+    data_initialized: AtomicBool,
 }
 
 impl<T: drm::Driver> Device<T> {
@@ -111,57 +116,67 @@ impl<T: drm::Driver> Device<T> {
         fops: &Self::GEM_FOPS,
     };
 
+    const ALLOC_VTABLE: bindings::drm_driver = bindings::drm_driver {
+        release: None,
+        ..Self::VTABLE
+    };
+
     const GEM_FOPS: bindings::file_operations = drm::gem::create_fops(T::MODULE);
 
     /// Create a new `drm::Device` for a `drm::Driver`.
     pub fn new(dev: &device::Device, data: impl PinInit<T::Data, Error>) -> Result<ARef<Self>> {
-        // `__drm_dev_alloc` uses `kmalloc()` to allocate memory, hence ensure a `kmalloc()`
-        // compatible `Layout`.
+        // SAFETY: The device remains private until its data is initialized below.
+        let drm = unsafe { Self::new_uninit(dev)? };
+        // SAFETY: This is the only initializer, and no references to the data exist yet.
+        unsafe { drm.init_data(data)? };
+        Ok(drm)
+    }
+
+    /// Allocate a DRM device whose driver data will be initialized separately.
+    ///
+    /// # Safety
+    ///
+    /// The caller must not access driver data, publish the device to userspace, or
+    /// schedule work that accesses driver data before calling [`Self::init_data`].
+    pub unsafe fn new_uninit(dev: &device::Device) -> Result<ARef<Self>> {
         let layout = Kmalloc::aligned_layout(Layout::new::<Self>());
-
-        // Use a temporary vtable without a `release` callback until `data` is initialized, so
-        // init failure can release the DRM device without dropping uninitialized fields.
-        let alloc_vtable = bindings::drm_driver {
-            release: None,
-            ..Self::VTABLE
-        };
-
-        // SAFETY:
-        // - `alloc_vtable` reference remains valid until no longer used,
-        // - `dev` is valid by its type invarants,
+        // Allocation failure must not inspect fields that we have not initialized yet.
         let raw_drm: *mut Self = unsafe {
             bindings::__drm_dev_alloc(
                 dev.as_raw(),
-                &alloc_vtable,
+                const { &Self::ALLOC_VTABLE },
                 layout.size(),
                 mem::offset_of!(Self, dev),
             )
         }
         .cast();
         let raw_drm = NonNull::new(from_err_ptr(raw_drm)?).ok_or(ENOMEM)?;
-
-        // SAFETY: `raw_drm` is a valid pointer to `Self`, given that `__drm_dev_alloc` was
-        // successful.
+        // SAFETY: Allocation succeeded, and these fields have no previous value.
+        unsafe {
+            ptr::addr_of_mut!((*raw_drm.as_ptr()).data)
+                .write(UnsafeCell::new(MaybeUninit::uninit()));
+            ptr::addr_of_mut!((*raw_drm.as_ptr()).data_initialized).write(AtomicBool::new(false));
+        }
+        // SAFETY: The allocation is private and its release state is now initialized.
         let drm_dev = unsafe { Self::into_drm_device(raw_drm) };
-
-        // SAFETY: `raw_drm` is a valid pointer to `Self`.
-        let raw_data = unsafe { ptr::addr_of_mut!((*raw_drm.as_ptr()).data) };
-
-        // SAFETY:
-        // - `raw_data` is a valid pointer to uninitialized memory.
-        // - `raw_data` will not move until it is dropped.
-        unsafe { data.__pinned_init(raw_data) }.inspect_err(|_| {
-            // SAFETY: `__drm_dev_alloc()` was successful, hence `drm_dev` must be valid and the
-            // refcount must be non-zero.
-            unsafe { bindings::drm_dev_put(drm_dev) };
-        })?;
-
-        // SAFETY: `drm_dev` is still private to this function.
         unsafe { (*drm_dev).driver = const { &Self::VTABLE } };
-
-        // SAFETY: The reference count is one, and now we take ownership of that reference as a
-        // `drm::Device`.
+        // SAFETY: We own the initial DRM reference; uninitialized data is behind UnsafeCell.
         Ok(unsafe { ARef::from_raw(raw_drm) })
+    }
+
+    /// Initialize the pinned driver data of a device allocated by [`Self::new_uninit`].
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the only initializer, the data must be uninitialized, and
+    /// no driver-data users may run until this method returns successfully.
+    pub unsafe fn init_data(&self, data: impl PinInit<T::Data, Error>) -> Result {
+        let raw_data = self.data.get().cast::<T::Data>();
+        // SAFETY: The caller guarantees exclusive initialization of this pinned slot.
+        unsafe { data.__pinned_init(raw_data) }?;
+        // Publish destructor ownership only after the real initializer succeeded.
+        self.data_initialized.store(true, Ordering::Release);
+        Ok(())
     }
 
     pub(crate) fn as_raw(&self) -> *mut bindings::drm_device {
@@ -210,12 +225,13 @@ impl<T: drm::Driver> Device<T> {
         // SAFETY: `ptr` is a valid pointer to a `struct drm_device` and embedded in `Self`.
         let this = unsafe { Self::from_drm_device(ptr) };
 
-        // SAFETY: new() installs this callback only after data.__pinned_init
-        // succeeds. Initialization failures use the temporary release=None
-        // table instead. The final DRM reference excludes further data users.
-        // Drop only the Rust data: drm_dev_release still owns the embedded C
-        // device and subsequently runs its managed cleanup and final kfree.
-        unsafe { ptr::drop_in_place(ptr::addr_of_mut!((*this).data)) };
+        // SAFETY: new_uninit() initialized this flag before enabling this callback.
+        // A failed initializer unwinds its own partial fields and never sets the flag.
+        if unsafe { (*this).data_initialized.load(Ordering::Acquire) } {
+            // SAFETY: Successful initialization published ownership of pinned driver data.
+            // DRM still owns the embedded C device and its final managed cleanup/kfree.
+            unsafe { ptr::drop_in_place((*this).data.get().cast::<T::Data>()) };
+        }
     }
 }
 
@@ -223,7 +239,10 @@ impl<T: drm::Driver> Deref for Device<T> {
     type Target = T::Data;
 
     fn deref(&self) -> &Self::Target {
-        &self.data
+        debug_assert!(self.data_initialized.load(Ordering::Acquire));
+        // SAFETY: Safe constructors initialize data; new_uninit() requires callers
+        // to prevent data access until init_data() succeeds.
+        unsafe { &*self.data.get().cast::<T::Data>() }
     }
 }
 
@@ -289,7 +308,7 @@ where
 {
     unsafe fn raw_get_work(ptr: *mut Self) -> *mut Work<Device<T>, ID> {
         // SAFETY: The caller promises that `ptr` points to a valid `Device<T>`.
-        let data_ptr = unsafe { &raw mut (*ptr).data };
+        let data_ptr = unsafe { (&raw mut (*ptr).data).cast::<T::Data>() };
 
         // SAFETY: `data_ptr` is a valid pointer to `T::Data`.
         unsafe { T::Data::raw_get_work(data_ptr) }
@@ -298,7 +317,8 @@ where
     unsafe fn work_container_of(ptr: *mut Work<Device<T>, ID>) -> *mut Self {
         // SAFETY: The caller promises that `ptr` points at a `Work` field in
         // `T::Data`.
-        let data_ptr = unsafe { T::Data::work_container_of(ptr) };
+        let data_ptr = unsafe { T::Data::work_container_of(ptr) }
+            .cast::<UnsafeCell<MaybeUninit<T::Data>>>();
 
         // SAFETY: `T::Data` is stored as the `data` field in `Device<T>`.
         unsafe { crate::container_of!(data_ptr, Self, data) }
