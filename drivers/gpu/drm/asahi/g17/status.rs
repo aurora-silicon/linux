@@ -44,6 +44,7 @@ impl VmStatus {
     }
 
     /// Record permanent admission failure and report it to the client.
+    #[track_caller]
     pub(crate) fn record(&self, error: Error) {
         self.report_failure(error);
         let _ = self.error.compare_exchange(
@@ -61,6 +62,10 @@ impl VmStatus {
     /// Report failed accepted work without preventing recovery of the VM.
     /// Every reporter publishes the first error before returning: a losing
     /// reporter may signal its fence before the winning reporter resumes.
+    ///
+    /// The first failure reported to a VM is logged once, with the reporting site: the client treats
+    /// any reported failure as a lost device, and nothing else in the kernel log names it.
+    #[track_caller]
     pub(crate) fn report_failure(&self, error: Error) {
         let error = match self.reported_error.compare_exchange(
             0,
@@ -68,7 +73,16 @@ impl VmStatus {
             Ordering::SeqCst,
             Ordering::SeqCst,
         ) {
-            Ok(_) => error.to_errno(),
+            Ok(_) => {
+                let at = core::panic::Location::caller();
+                pr_warn!(
+                    "GPU work of a client failed ({:?}, reported at {}:{}); the client sees a lost device\n",
+                    error,
+                    at.file().rsplit("asahi/").next().unwrap_or(at.file()),
+                    at.line()
+                );
+                error.to_errno()
+            }
             Err(first) => first,
         };
         let mirror = self.mirror.lock();
@@ -80,6 +94,7 @@ impl VmStatus {
     }
 
     /// Rejected submissions and contention leave the VM usable.
+    #[track_caller]
     pub(crate) fn record_if_device_loss(&self, error: Error) {
         if error == EIO || error == ETIMEDOUT || error == ENODEV {
             self.record(error);
