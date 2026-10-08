@@ -27,6 +27,51 @@ properties:
   power-domains:
     maxItems: 1
 
+  '#address-cells':
+    const: 1
+
+  '#size-cells':
+    const: 0
+
+patternProperties:
+  '^report@[0-9a-f]+$':
+    type: object
+    description: |
+      A device whose power state the host reports to the PMP, provided as a
+      power domain. The host sets the device's request bit after its parent
+      domain powers on and clears it before the parent powers off, and waits
+      for the PMP to acknowledge while the PMP runs.
+    additionalProperties: false
+
+    properties:
+      compatible:
+        items:
+          - const: apple,t8140-pmp-v2-report-entry
+          - const: apple,t6000-pmp-v2-report-entry
+
+      reg:
+        maxItems: 1
+        description: PMP soc-device index of the device.
+
+      label:
+        description: Name of the power domain.
+
+      '#power-domain-cells':
+        const: 0
+
+      power-domains:
+        maxItems: 1
+
+      apple,always-on:
+        type: boolean
+        description: Report the device as on from probe.
+
+    required:
+      - compatible
+      - reg
+      - label
+      - '#power-domain-cells'
+
 required:
   - compatible
   - reg
@@ -42,5 +87,15 @@ examples:
         pmp-report@3003c0000 {
             compatible = "apple,t8140-pmp-v2-report";
             reg = <3 0x003c0000 0 0x14000>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            report@9 {
+                compatible = "apple,t8140-pmp-v2-report-entry",
+                             "apple,t6000-pmp-v2-report-entry";
+                reg = <0x9>;
+                label = "pmp-gfx";
+                #power-domain-cells = <0>;
+            };
         };
     };
