@@ -2540,6 +2540,8 @@ static void bcm4377_hci_unregister_dev(void *data)
 	WRITE_ONCE(bcm4377->setup_retry_blocked, true);
 	cancel_delayed_work_sync(&bcm4377->setup_retry_work);
 	hci_unregister_dev(hdev);
+	/* Close may have admitted a retry before the first cancellation. */
+	cancel_delayed_work_sync(&bcm4377->setup_retry_work);
 }
 
 static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
