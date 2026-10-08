@@ -17,6 +17,7 @@ mod feed;
 mod render;
 pub(super) mod teardown;
 
+pub(super) use super::now_ns;
 use super::{
     buffer::{BufferIds, MetricsIds},
     context::{Context, QosIds},
@@ -1139,7 +1140,3 @@ impl super::Firmware {
     }
 }
 
-/// One monotonic domain for recovery grace, idle effort and control retirement.
-fn now_ns() -> u64 {
-    <kernel::time::Monotonic as kernel::time::ClockSource>::ktime_get() as u64
-}

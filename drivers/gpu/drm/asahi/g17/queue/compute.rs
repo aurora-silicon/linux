@@ -17,9 +17,7 @@ use core::sync::atomic::{fence, Ordering};
 use kernel::{prelude::*, sync::Arc};
 use retirement::{Cursors, RECORD_SLOTS};
 
-fn now_ns() -> u64 {
-    <kernel::time::Monotonic as kernel::time::ClockSource>::ktime_get() as u64
-}
+use crate::g17::now_ns;
 
 const DESCRIPTORS: usize = 256;
 const GRAPH_SIZE: usize = 0x8000;

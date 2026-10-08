@@ -104,6 +104,12 @@ use object::{
 };
 
 /// Expected identification of a G17 GPU.
+/// One monotonic domain for recovery grace, idle effort, pool retention and
+/// control-ring retirement.
+pub(crate) fn now_ns() -> u64 {
+    <kernel::time::Monotonic as kernel::time::ClockSource>::ktime_get() as u64
+}
+
 pub(crate) struct Identity {
     /// GPU family field of the ID register.
     pub(crate) family: u8,
