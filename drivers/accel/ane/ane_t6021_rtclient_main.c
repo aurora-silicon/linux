@@ -2358,13 +2358,13 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 			drm_debugfs_add_file(&adrm->drm, "ane_timeline",
 					     ane_timeline_show,
 					     &ane->stats_ring);
-		WRITE_ONCE(ane_t6021_perf_ane, ane);
 		drmret = drm_dev_register(&adrm->drm, 0);
 		if (drmret) {
 			dev_err_probe(dev, drmret, "drm_dev_register\n");
 			ret = drmret;
 			goto err_pm_or_hold;
 		}
+		WRITE_ONCE(ane_t6021_perf_ane, ane);
 		dev_info(dev,
 			 "loaded ane_t6021 (DRM major %d minor %d; ABI 2; legacy_only=%u channel_table_valid=%u booted=%u; state %s; BO cap %u MiB)\n",
 			 DRM_ANE_ABI_V2, 0,
@@ -2404,6 +2404,8 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 	if (ret) {
 		struct ane_rtclient *ane = platform_get_drvdata(pdev);
 
+		if (ane)
+			cancel_delayed_work_sync(&ane->poll_work);
 		if (hardware_touched) {
 			ane_rtclient_probe_failed_dirty = true;
 			dev_err(&pdev->dev,
