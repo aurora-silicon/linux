@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Carve the per-device Mesa calibration from an Apple iBoot System Container.
 
-Most Macs keep it as a comb record wrapping a signed FSCl IMG4. The MacBook
-Neo (J700) keeps it as a standalone signed IMG4 whose IM4P type is FSC2.
+Most Macs keep it as a comb record wrapping an FSCl IMG4. The MacBook Neo
+(J700) keeps it as a standalone IMG4 whose IM4P type is FSC2. Manifest
+presence is checked; cryptographic signatures are not verified.
 """
 
 import argparse
@@ -26,7 +27,9 @@ class DERError(ValueError):
 
 
 class TLV:
-    def __init__(self, data, start):
+    def __init__(self, data, start, require_complete=True):
+        if start < 0:
+            raise DERError("negative DER offset")
         self.start = start
         try:
             self.tag = data[start]
@@ -57,7 +60,7 @@ class TLV:
 
         self.content_start = start + header_length
         self.end = self.content_start + length
-        if self.end > len(data):
+        if require_complete and self.end > len(data):
             raise DERError("DER value extends beyond input")
 
     def content(self, data):
@@ -131,7 +134,7 @@ def validate_calibration(data, start):
     if b"CALB" not in payload[:64]:
         raise DERError("FSCl payload lacks its CALB header")
 
-    # A signed calibration has an IM4M manifest following the IM4P. Requiring
+    # An FSCl calibration has IM4M manifest markers after the IM4P. Requiring
     # both markers avoids accepting an arbitrary, truncated FSCl object.
     remainder = data[im4p.end:img4.end]
     if b"IM4M" not in remainder or b"FSCl" not in remainder:
@@ -141,7 +144,7 @@ def validate_calibration(data, start):
 
 
 def validate_fsc2_image(data, start):
-    """Return the end offset if data[start:] is a standalone signed FSC2 IMG4."""
+    """Validate an FSC2 IMG4 structure and manifest presence, not its signature."""
     img4 = TLV(data, start)
     if img4.tag != 0x30:
         raise DERError("IMG4 is not a sequence")
@@ -157,16 +160,54 @@ def validate_fsc2_image(data, start):
     if b"CALB" not in payload[:256]:
         raise DERError("FSC2 payload lacks its CALB header")
 
-    # As for FSCl, a signed calibration carries an IM4M manifest after the IM4P.
+    # Optional IM4P fields must still be bounded DER objects.
+    for _ in im4p_children:
+        pass
     manifest = take_child(data, img4_children, 0xA0)
-    if b"IM4M" not in manifest.content(data):
-        raise DERError("IMG4 lacks an FSC2 manifest")
+    manifest_children = child_tlvs(data, manifest)
+    im4m = take_child(data, manifest_children, 0x30)
+    im4m_children = child_tlvs(data, im4m)
+    take_child(data, im4m_children, 0x16, b"IM4M")
+    for _ in im4m_children:
+        pass
+    if next(manifest_children, None) is not None:
+        raise DERError("manifest wrapper contains more than one IM4M")
+    if next(img4_children, None) is not None:
+        raise DERError("unexpected data after FSC2 manifest")
     return img4.end
+
+
+def find_comb_ranges(data):
+    """Recognize comb ranges, including a body split across scan windows."""
+    ranges = set()
+    signature = b"\x16\x04comb"
+    search_at = 0
+    while True:
+        marker = data.find(signature, search_at)
+        if marker < 0:
+            break
+        for header_length in range(2, 7):
+            start = marker - header_length
+            if start < 0 or data[start] != 0x30:
+                continue
+            try:
+                outer = TLV(data, start, require_complete=False)
+                if outer.content_start != marker:
+                    continue
+                child = TLV(data, marker)
+                if child.end > outer.end:
+                    continue
+            except DERError:
+                continue
+            ranges.add((start, outer.end))
+        search_at = marker + 1
+    return ranges
 
 
 def find_calibrations(data):
     results = find_comb_calibrations(data)
-    # A standalone FSC2 IMG4 never sits inside a comb record already found.
+    comb_ranges = find_comb_ranges(data)
+    # A standalone FSC2 IMG4 must not be carved out of a comb container.
     signature = b"\x16\x04IMG4"
     search_at = 0
     while True:
@@ -177,7 +218,8 @@ def find_calibrations(data):
             start = marker - header_length
             if start < 0 or data[start] != 0x30:
                 continue
-            if any(begin <= start < end for begin, end in results):
+            if (any(begin < start < end for begin, end in comb_ranges)
+                    or any(begin <= start < end for begin, end in results)):
                 continue
             try:
                 end = validate_fsc2_image(data, start)
@@ -275,6 +317,7 @@ def scan_input(path):
         raise RuntimeError(f"{path} is not a regular file or block device")
 
     candidates = {}
+    comb_ranges = set()
     overlap = b""
     total = 0
     with path.open("rb", buffering=0) as source:
@@ -285,11 +328,17 @@ def scan_input(path):
             total += len(chunk)
             window = overlap + chunk
             window_start = total - len(window)
+            comb_ranges.update((window_start + start, window_start + end)
+                               for start, end in find_comb_ranges(window))
             for start, end in find_calibrations(window):
                 absolute_start = window_start + start
                 candidates.setdefault(absolute_start, bytes(window[start:end]))
             overlap = window[-SCAN_OVERLAP:]
-    return sorted(candidates.items())
+    # A nested image can be complete before its enclosing object is complete.
+    enclosing_ranges = comb_ranges | {(start, start + len(blob))
+                                      for start, blob in candidates.items()}
+    return sorted((start, blob) for start, blob in candidates.items()
+                  if not any(begin < start < end for begin, end in enclosing_ranges))
 
 
 def write_private(path, blob):
@@ -361,7 +410,7 @@ def main():
                 candidates.append((input_path, offset, blob))
         if not candidates:
             raise RuntimeError(
-                "no signed Mesa FSCl or FSC2 calibration found; expected the raw "
+                "no manifest-marked Mesa FSCl or FSC2 calibration found; expected the raw "
                 "iBoot System Container (Apple Silicon boot partition)"
             )
         blobs = {}

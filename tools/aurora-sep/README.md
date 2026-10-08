@@ -76,8 +76,9 @@ prove a finger was captured.
 The device-specific `apple/mesa_calibration.bin` on m2 was recovered using
 the bundled [`extract-mesa-calibration.py`](extract-mesa-calibration.py), copied
 from [Gist revision `eb079a8007985d04e75182f20994f1a1c496f12e`](https://gist.github.com/DjDeveloperr/867a1961b861c570442724f48f770158/eb079a8007985d04e75182f20994f1a1c496f12e),
-which scans the local iBoot System Container read-only for an FSCl/CALB record
-with an IM4M manifest. It checks the container structure and markers, **not**
+which scans the local iBoot System Container read-only for an FSCl/CALB `comb`
+record or a standalone FSC2 IMG4 with an IM4M manifest. It checks the container
+structure and markers, **not**
 the manifest's cryptographic signature. Keep this blob private to the machine;
 it is not a generic firmware package. On m2, a premature master
 `SAVE_CATACOMB` returned SEP status `0x6` while its component state was `0x3`
