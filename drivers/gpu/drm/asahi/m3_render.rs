@@ -484,8 +484,8 @@ impl Render {
         self.base=base;
         Ok(())
     }
-    /// Preparation never rings a firmware doorbell. Restore shared producer
-    /// state if a later descriptor/timestamp check fails before publication.
+    /// Restore producer state only when no batch is in flight. Running firmware can
+    /// consume append's WRITE updates without a new doorbell, so overlap cannot abort.
     pub(crate) fn abort_batch(&mut self)->Result {
         (self.draw,self.heads,self.batch_count,self.slot,self.early_count,self.base)=self.checkpoint;
         self.objects[s::BM_COUNTER].u32(0,self.draw as u32)?;
@@ -496,7 +496,8 @@ impl Render {
         crate::agx_memory::publish();
         Ok(())
     }
-    /// Append only into the caller-reserved free pass slots of an unpublished batch.
+    /// Append only into caller-reserved free pass slots. With overlap, WRITE updates
+    /// are immediately visible to running firmware, even before a new doorbell.
     /// Each append selects disjoint host-mutated pass storage. A TA dependency
     /// retains full fragment-to-next-TA ordering for arbitrary resource hazards.
     pub(crate) fn append(&mut self,r:agx_uapi::UapiRenderCommand,usc:u64)->Result {

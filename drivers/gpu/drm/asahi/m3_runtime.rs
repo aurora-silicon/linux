@@ -283,7 +283,7 @@ impl Inner {
                             crate::t8122_start::job_setup_failed_verdict(self.drm.as_ref(),error);
                             self.t8122_verdict=true;
                         }
-                        // A doorbell may have been rung: latch the fault, keep the packets
+                        // A live ring WRITE or doorbell may have been published: keep packets
                         // retained (self.packets) and fail them and everything in flight.
                         self.capture_fault(error);
                         Self::finish_all(&entries,Err(error));
@@ -305,7 +305,7 @@ impl Inner {
         }
         progress
     }
-    /// Prepare and publish one batch. On error, reports whether a doorbell may have been rung.
+    /// Prepare and publish one batch. On error, reports whether firmware may see its writes.
     fn publish(&mut self,entries:&[(Arc<crate::m3_submit::Packet>,usize)],base:usize,overlap:bool)->core::result::Result<Batch,(Error,bool)> {
         let early=|e:Error|(e,false);
         let (packet,first_index)=(&entries[0].0,entries[0].1);
@@ -376,7 +376,15 @@ impl Inner {
                 }
                 Ok(())
             })();
-            if let Err(error)=prepared {j.abort_batch().map_err(|e|(e,true))?;return Err(early(error));}
+            if let Err(error)=prepared {
+                // Running firmware can consume append's WRITE updates without a new doorbell.
+                // Even an append that returns an error may have changed shared counters or one
+                // pipe. Do not rewind live producer state or let the caller release owners and
+                // reuse these slots. Its published-error path stops scheduling and retains them.
+                if overlap {return Err((error,true));}
+                j.abort_batch().map_err(|e|(e,true))?;
+                return Err(early(error));
+            }
         }
         let preparation_ns=prepare.elapsed().as_nanos();
         self.t8122_verdict=false;

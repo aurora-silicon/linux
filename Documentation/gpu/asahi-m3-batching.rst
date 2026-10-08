@@ -31,12 +31,21 @@ commands keep their VM and buffer guards until retirement, even when cancellatio
 won the signal race. Partial publication and failed retirement mark the runtime
 failed and retain uncertain DMA owners. Failed coprocessor stop retains the
 runtime allocation and pins the module. Host bookkeeping is reserved before
-shared producer state changes; preparation failure restores producer state.
+shared producer state changes. With a render batch in flight, append exposes
+queue WRITE indexes and shared counters before the next doorbell. An append or
+timestamp failure therefore stops scheduling and retains the new packet guards
+and pass storage. Producer state is restored only for single-flight preparation
+failures before publication.
 
 The standalone host policy tests run with::
 
     rustc --edition=2021 --test tools/asahi/m3-batching-tests.rs -o /tmp/m3-batching-tests
     /tmp/m3-batching-tests
+
+The publication failure controls execute the production preparation and scheduler
+methods with host driver doubles::
+
+    python3 tools/asahi/m3-publication-tests.py --negative-controls
 
 These tests cover admission and ownership decisions. Actual desktop latency,
 firmware scheduling and fault recovery require the matched GPU stack on hardware.
