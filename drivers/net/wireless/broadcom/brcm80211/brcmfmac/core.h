@@ -250,6 +250,8 @@ enum brcmf_netif_stop_reason {
  * @pend_8021x_cnt: tracks outstanding number of 802.1x frames.
  * @pend_8021x_wait: used for signalling change in count.
  * @fwil_fwerr: flag indicating fwil layer should return firmware error codes.
+ * @is_awdl: interface carries AWDL data frames (SNAP + AWDL data header).
+ * @awdl_tx_seq: sequence number written into the AWDL data header on TX.
  */
 struct brcmf_if {
 	struct brcmf_pub *drvr;
@@ -268,6 +270,8 @@ struct brcmf_if {
 	struct in6_addr ipv6_addr_tbl[NDOL_MAX_ENTRIES];
 	u8 ipv6addr_idx;
 	bool fwil_fwerr;
+	bool is_awdl;
+	u16 awdl_tx_seq;
 };
 
 int brcmf_netdev_wait_pend8021x(struct brcmf_if *ifp);
@@ -284,6 +288,7 @@ void brcmf_txflowblock_if(struct brcmf_if *ifp,
 			  enum brcmf_netif_stop_reason reason, bool state);
 void brcmf_txfinalize(struct brcmf_if *ifp, struct sk_buff *txp, bool success);
 void brcmf_netif_rx(struct brcmf_if *ifp, struct sk_buff *skb);
+__be16 brcmf_rx_eth_type_trans(struct brcmf_if *ifp, struct sk_buff *skb);
 void brcmf_netif_mon_rx(struct brcmf_if *ifp, struct sk_buff *skb);
 void brcmf_net_detach(struct net_device *ndev, bool locked);
 int brcmf_net_mon_attach(struct brcmf_if *ifp);
