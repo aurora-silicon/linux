@@ -1156,7 +1156,8 @@ static int bt7932_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	bt7932_channels(bt);
 	mutex_unlock(&bt->lock);
 	ret = hci_register_dev(bt->hdev);
-	if (ret)
+	/* Registration returns the nonnegative HCI index on success. */
+	if (ret < 0)
 		goto retained_fault;
 	bt->registered = true;
 	dev_info(&pdev->dev, "BT_HCI_REGISTERED; setup/discovery/connection remain separate gates\n");
