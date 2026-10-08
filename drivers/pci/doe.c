@@ -891,3 +891,4 @@ void pci_doe_disconnected(struct pci_dev *pdev)
 	xa_for_each(&pdev->doe_mbs, index, doe_mb)
 		pci_doe_cancel_tasks(doe_mb);
 }
+EXPORT_SYMBOL_GPL(pci_doe_disconnected);
