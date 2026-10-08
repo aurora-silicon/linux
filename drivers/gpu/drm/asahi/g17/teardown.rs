@@ -5,12 +5,11 @@
 //! The device mutex serializes this state with the Registry's displaced graph ownership.
 
 use super::{context::Context, freelist::control_consumed, fw::channels::SchedulerStateRelease};
-use core::sync::atomic::{fence, AtomicBool, Ordering};
+use core::sync::atomic::{fence, Ordering};
 use kernel::{prelude::*, sync::Arc};
 
 /// Entries preallocated at device start; a burst of closes beyond it grows the table.
 const CAPACITY: usize = 128;
-static GREW: AtomicBool = AtomicBool::new(false);
 const POLL_NS: u64 = 2_000_000_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -91,12 +90,6 @@ impl Pending {
             armed: now,
             announce_pending: false,
         };
-        if self.entries.len() >= CAPACITY && !GREW.swap(true, Ordering::Relaxed) {
-            pr_info!(
-                "asahi: G17 scheduler-release table grew past {} pending contexts\n",
-                CAPACITY
-            );
-        }
         self.entries.push(entry, GFP_KERNEL)?;
         Ok(())
     }
