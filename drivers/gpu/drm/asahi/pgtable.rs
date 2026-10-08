@@ -141,6 +141,10 @@ pub(crate) mod prot {
 
     /// Firmware MMIO R/W
     pub(crate) const PROT_FW_MMIO_RW: Prot = PROT_FW_RW.memattr(MEMATTR_DEV);
+    /// Protected firmware register aperture: AP=3, PXN, no GPU access.
+    pub(crate) const PROT_FW_PROTECTED_MMIO: Prot = Prot {
+        memattr: MEMATTR_DEV, ap: 3, high_bits: HIGH_BITS_PXN,
+    };
     /// Firmware MMIO R/O
     pub(crate) const PROT_FW_MMIO_RO: Prot = PROT_FW_RO.memattr(MEMATTR_DEV);
     /// Firmware shared (uncached) RW

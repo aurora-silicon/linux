@@ -121,6 +121,8 @@ pub(crate) enum HandoffMode {
     /// The M3 runtime's RTKit is running before the AP publishes its host mappings (observed
     /// on J514S).
     FirmwareM3,
+    /// 25G83 lazy handoff, initialized while ASC is stopped.
+    FirmwareG16,
 
 }
 
@@ -840,8 +842,8 @@ where
     ranges.any(|range| range.overlaps(target.clone()))
 }
 
-/// Slot data for a [`Vm`] slot (nothing, we only care about the indices).
-pub(crate) struct SlotInner();
+/// Allocation generation of a [`Vm`] hardware slot.
+pub(crate) struct SlotInner { generation: u8 }
 
 impl slotalloc::SlotItem for SlotInner {
     type Data = ();
@@ -851,13 +853,16 @@ impl slotalloc::SlotItem for SlotInner {
 ///
 /// The number of users is counted, and the slot will be freed when it drops to 0.
 #[derive(Debug)]
-pub(crate) struct VmBind(Vm, u32);
+pub(crate) struct VmBind(Vm, u32, u8);
 
 impl VmBind {
     /// Returns the slot that this `Vm` is bound to.
     pub(crate) fn slot(&self) -> u32 {
         self.1
     }
+
+    /// Allocation generation retained with this ASID.
+    pub(crate) fn generation(&self) -> u8 { self.2 }
 
     /// The bound `Vm` itself, for diagnostics that need to walk its tables.
     pub(crate) fn vm(&self) -> &Vm {
@@ -907,7 +912,7 @@ impl Clone for VmBind {
             self.1,
             binding.active_users
         );
-        VmBind(self.0.clone(), self.1)
+        VmBind(self.0.clone(), self.1, self.2)
     }
 }
 
@@ -1518,13 +1523,13 @@ impl Handoff {
         self.magic_ap.store(PPL_MAGIC, Ordering::Relaxed);
         self.cur_slot.store(if m3 && mode != HandoffMode::FirmwareDekker { u32::MAX } else { 0 }, Ordering::Relaxed);
         self.unk3.store(0, Ordering::Relaxed);
-        if mode == HandoffMode::StoppedFirmwareT6030 {
+        if matches!(mode, HandoffMode::StoppedFirmwareT6030 | HandoffMode::FirmwareG16) {
             // This mode is constructed only with ASC stopped. Preserve the
             // firmware magic but initialize the AP producer's lock/flush state.
             self.lock_ap.store(0, Ordering::Relaxed);
             self.lock_fw.store(0, Ordering::Relaxed);
             self.turn.store(0, Ordering::Relaxed);
-            if !m3 && self.magic_fw.load(Ordering::Relaxed) != PPL_MAGIC {
+            if (!m3 || mode == HandoffMode::FirmwareG16) && self.magic_fw.load(Ordering::Relaxed) != PPL_MAGIC {
                 self.unk2.store(1, Ordering::Relaxed);
             }
         }
@@ -2523,7 +2528,7 @@ impl Uat {
                 None
             });
 
-            let slot = self.slots.get(binding.bind_token)?;
+            let mut slot = self.slots.get(binding.bind_token)?;
             if slot.changed() {
                 mod_pr_debug!("Vm Bind [{}]: bind_token={:?}\n", vm.id, slot.token(),);
                 let idx = (slot.slot() as usize) + UAT_USER_CTX_START;
@@ -2553,6 +2558,7 @@ impl Uat {
                 // Make sure all TLB entries from the previous owner of this ASID are gone
                 mem::tlbi_asid(idx as u8);
                 mem::sync();
+                slot.generation = slot.generation.wrapping_add(1).max(1);
             }
 
             binding.bind_token = Some(slot.token());
@@ -2563,7 +2569,7 @@ impl Uat {
 
         let slot = binding.binding.as_ref().unwrap().slot() + UAT_USER_CTX_START as u32;
         mod_pr_debug!("MMU: slot {} active users {}\n", slot, binding.active_users);
-        Ok(VmBind(vm.clone(), slot))
+        Ok(VmBind(vm.clone(), slot, binding.binding.as_ref().unwrap().generation))
     }
 
     /// Creates a new `Vm` linked to this UAT.
@@ -2582,7 +2588,7 @@ impl Uat {
     #[inline(never)]
     fn make_inner(dev: &driver::AsahiDevice, handoff_mode: HandoffMode, m3: bool) -> Result<Arc<UatInner>> {
         let cached = !matches!(
-            handoff_mode, HandoffMode::StoppedFirmwareT6030 | HandoffMode::FirmwareM3
+            handoff_mode, HandoffMode::StoppedFirmwareT6030 | HandoffMode::FirmwareM3 | HandoffMode::FirmwareG16
         );
         let handoff_rgn =
             Self::map_region(dev.as_ref(), c_str!("handoff"), HANDOFF_SIZE, cached, m3)?;
@@ -2623,6 +2629,33 @@ impl Uat {
             }),
             GFP_KERNEL,
         )
+    }
+
+    /// Construct the exact admitted 25G83 UAT while the owner holds ASC stopped.
+    ///
+    /// # Safety
+    /// The caller owns stopped ASC and retains the identified firmware reservations.
+    pub(crate) unsafe fn new_j613_25g83(dev: &driver::AsahiDevice,
+        firmware: &crate::g16_firmware::Firmware) -> Result<Self> {
+        if firmware.board.chip_id != 0x8122 { return Err(ENODEV); }
+        let node = dev.as_ref().of_node().ok_or(ENODEV)?;
+        for (i, name) in [c_str!("ttbs"), c_str!("pagetables"), c_str!("handoff"),
+            c_str!("shared-l2"), c_str!("fw-text"), c_str!("fw-data")].iter().enumerate() {
+            let region = crate::m3_resources::reserved_resource(&node, name)?;
+            if region.start() != firmware.resources.regions[i].base
+                || region.size() != firmware.resources.regions[i].size { return Err(EINVAL); }
+        }
+        Self::new_with_config(dev, UatConfig::m3_runtime(&hw::t8122::HWCONFIG_T8122)?,
+            false, HandoffMode::FirmwareG16)
+    }
+
+    /// After firmware publishes its handoff magic, mapping teardown may flush its caches.
+    pub(crate) fn enable_g16_flushes(&self) -> Result {
+        if !self.cfg.reserved_tables || self.cfg.chip_id != 0x8122 { return Err(EINVAL); }
+        let inner = self.inner.lock();
+        if inner.handoff().magic_fw.load(Ordering::Acquire) != PPL_MAGIC { return Err(EIO); }
+        self.inner.firmware_cache_flush_ready.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// The M3 runtime's UAT on the SoC of `cfg` (`m3_soc::Soc::hwcfg`).
@@ -2683,6 +2716,9 @@ impl Uat {
         let kernel_range = iova_kern_range(cfg)?;
         match handoff_mode {
             HandoffMode::FirmwareM3 => { if !cfg.reserved_tables {return Err(ENODEV);} }
+            HandoffMode::FirmwareG16 => {
+                if !cfg.reserved_tables || cfg.chip_id != 0x8122 { return Err(ENODEV); }
+            }
             HandoffMode::StoppedFirmwareT6030 => {
                 if !cfg.reserved_tables || cfg.chip_id != 0x6030 { return Err(ENODEV); }
             }
@@ -2751,7 +2787,7 @@ impl Uat {
             slots: slotalloc::SlotAllocator::new(
                 UAT_USER_CTX as u32,
                 (),
-                |_inner, _slot| Some(SlotInner()),
+                |_inner, _slot| Some(SlotInner { generation: 0 }),
                 c_str!("Uat::SlotAllocator"),
                 static_lock_class!(),
                 static_lock_class!(),

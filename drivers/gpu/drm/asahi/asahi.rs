@@ -10,6 +10,35 @@ mod channel;
 mod crashdump;
 mod debug;
 mod driver;
+mod g16_attachments;
+mod g16_board;
+mod g16_compute;
+mod g16_config;
+mod g16_device;
+mod g16_dispatch;
+mod g16_drm;
+#[cfg(CONFIG_DEV_COREDUMP)]
+mod g16_fault;
+mod g16_firmware;
+mod g16_initdata;
+mod g16_j613_power;
+mod g16_job;
+mod g16_memory;
+mod g16_owner_cache;
+mod g16_parameter;
+mod g16_power;
+mod g16_queue;
+mod g16_render;
+mod g16_render_command;
+mod g16_render_job;
+mod g16_render_state;
+mod g16_resources;
+mod g16_rtkit;
+mod g16_runtime;
+mod g16_submit;
+mod g16_uapi;
+mod g16_profile;
+
 mod drm_gpu;
 mod event;
 mod file;
@@ -101,6 +130,26 @@ kernel::module_platform_driver! {
     description: "AGX GPU driver for Apple silicon SoCs",
     license: "Dual MIT/GPL",
     params: {
+        g16_packet_commands: u32 {
+            default: 8,
+            description: "25G83 commands per scheduler packet (1..32, at most 16 per engine)",
+        },
+        g16_main_overlay: u32 {
+            default: 1,
+            description: "25G83 fixed controller configuration (1 enabled, 0 diagnostic)",
+        },
+        g16_qualify: u32 {
+            default: 0,
+            description: "25G83 bounded boot compute self-test (0 disabled, 1 enabled)",
+        },
+        g16_trace_mask: u32 {
+            default: 0,
+            description: "25G83 firmware diagnostic trace bits (0 disabled)",
+        },
+        g16_pstate: u32 {
+            default: 2,
+            description: "25G83 performance ceiling: default 2; explicit override bounded by calibrated OPP states",
+        },
         debug_flags: u64 {
             default: 0,
             // permissions: 0o644,

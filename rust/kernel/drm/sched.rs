@@ -294,6 +294,40 @@ impl<T: JobImpl> Entity<T> {
     /// this requires a mutable reference to the entity, ensuring that only one new job can be
     /// in flight at once.
     pub fn new_job(&mut self, credits: u32, inner: T) -> Result<PendingJob<'_, T>> {
+        self.prepare_job(credits, inner)
+    }
+
+    /// Allocate an entire ordered batch before publishing any job.
+    ///
+    /// Input dependencies gate the first job. Each successor explicitly waits
+    /// for its predecessor's finished fence. The driver MUST serialize publication/completion
+    /// in run order and propagate earlier failures to every later job. This
+    /// is not suitable for independently executing hardware queues.
+    /// The caller holds the entity
+    /// exclusively until every job has been pushed, in allocation order.
+    /// Returns the final job's finished fence. An allocation failure publishes
+    /// nothing, including when adding a dependency fails partway through.
+    pub fn submit_serialized_batch(&mut self, credits: u32, inners: KVec<T>,
+        dependencies: KVec<Fence>) -> Result<Fence> {
+        if inners.is_empty() { return Err(crate::error::code::EINVAL); }
+        let mut jobs = KVec::with_capacity(inners.len(), GFP_KERNEL)?;
+        let mut previous = None;
+        let mut dependencies = dependencies;
+        for inner in inners {
+            let mut job = self.prepare_job(credits, inner)?;
+            for fence in dependencies.drain(..) { job.add_dependency(fence)?; }
+            if let Some(fence) = previous.take() { job.add_dependency(fence)?; }
+            let mut job = job.arm();
+            previous = Some(job.fences().finished());
+            jobs.push(job, GFP_KERNEL)?;
+        }
+        let finished = jobs.last_mut().expect("nonempty batch").fences().finished();
+        for job in jobs { job.push(); }
+        Ok(finished)
+    }
+
+    // The exclusive entity borrow prevents allocation/push interleaving.
+    fn prepare_job(&self, credits: u32, inner: T) -> Result<PendingJob<'_, T>> {
         let mut job: KBox<MaybeUninit<Job<T>>> = Box::new_uninit(GFP_KERNEL | __GFP_ZERO)?;
 
         // SAFETY: We hold a reference to the entity (which is a valid pointer),

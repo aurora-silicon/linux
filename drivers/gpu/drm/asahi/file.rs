@@ -14,6 +14,7 @@ use crate::{
     buffer,
     driver,
     gem,
+    hw,
     mmu,
     module_parameters,
     queue,
@@ -328,7 +329,7 @@ impl File {
 
         let facts = gpu.params()?;
         let mut params = uapi::drm_asahi_params_global {
-            features: 0,
+            features: gpu.extra_features(),
 
             gpu_generation: facts.gpu_generation,
             gpu_variant: facts.gpu_variant,
@@ -362,7 +363,8 @@ impl File {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SCHEDULED_QUEUES as u64;
         }
         // The M3 runtime's optional features are per SoC (`m3_soc::Soc::features`).
-        let m3 = crate::m3_soc::by_chip(facts.chip_id);
+        let m3 = (facts.gpu_hal_generation == hw::GpuHalGeneration::Legacy as u32)
+            .then(|| crate::m3_soc::by_chip(facts.chip_id)).flatten();
         if m3.is_some_and(|soc| soc.features.fragment_dependency)
             && *module_parameters::m3_early_tiling.value()!=0
         {
@@ -375,7 +377,7 @@ impl File {
         // parameter. Do not invite speculative invalid accesses until its
         // firmware/MMU soft-fault configuration is implemented and qualified:
         // not on any SoC with an M3 runtime table, nor on the M3 Max or M4.
-        if m3.is_none()
+        if facts.gpu_hal_generation == hw::GpuHalGeneration::Legacy as u32 && m3.is_none()
             && !matches!(facts.chip_id, 0x6031 | 0x6034 | 0x8132)
             && *module_parameters::fault_control.value() == 0xb
         {
@@ -426,7 +428,10 @@ impl File {
         data: &mut uapi::drm_asahi_vm_create,
         file: &DrmFile,
     ) -> Result<u32> {
-        if let Some(gate) = &file.inner().m3_client { gate.admit_vm(device)?; }
+        let hal = device.gpu()?.params()?.gpu_hal_generation;
+        let expected = if hal == 200 { uapi::drm_asahi_vm_create_flags_DRM_ASAHI_VM_CREATE_HAL200 } else { 0 };
+        if data.flags != expected { return Err(EINVAL); }
+        if let Some(gate) = &file.inner().m3_client { gate.admit_vm(device, data.flags)?; }
         let kernel_range = data.kernel_start..data.kernel_end;
         let user_range = device.gpu()?.user_range()?;
 

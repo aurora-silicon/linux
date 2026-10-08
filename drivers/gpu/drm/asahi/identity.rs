@@ -25,6 +25,7 @@ pub(crate) enum GpuVariant {
 #[repr(u32)]
 pub(crate) enum GpuHalGeneration {
     Legacy = 0,
+    Hal200 = 200,
 }
 
 /// Public architecture axes for the G15 ID-register decoder.

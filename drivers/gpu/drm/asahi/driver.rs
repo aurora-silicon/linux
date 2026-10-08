@@ -13,6 +13,7 @@ use kernel::{
     drm::ioctl,
     of,
     platform,
+    workqueue::{self, impl_has_work, new_work, Work, WorkItem},
     prelude::*,
     sync::{
         aref::ARef,
@@ -43,6 +44,8 @@ pub(crate) struct AsahiData {
     pub(crate) completion: SetOnce<Arc<crate::m3_completion::Completion>>,
     pub(crate) pdev: ARef<platform::Device>,
     pub(crate) resources: Option<regs::Resources>,
+    #[pin]
+    g16_completion_work: Work<AsahiDevice, 3>,
 
 }
 
@@ -55,6 +58,7 @@ impl AsahiData {
             completion: SetOnce::new(),
             pdev,
             resources,
+            g16_completion_work <- new_work!("AsahiData::g16_completion_work"),
         })
     }
 
@@ -68,10 +72,22 @@ impl AsahiData {
 unsafe impl Send for AsahiData {}
 unsafe impl Sync for AsahiData {}
 
+impl_has_work! { impl HasWork<AsahiDevice, 3> for AsahiData { self.g16_completion_work } }
+impl WorkItem<3> for AsahiData {
+    type Pointer = ARef<AsahiDevice>;
+    fn run(dev: ARef<AsahiDevice>) {
+        if let Ok(gpu) = dev.gpu() { gpu.service_g16_jobs(); }
+    }
+}
+pub(crate) fn queue_g16_completion_worker(dev: ARef<AsahiDevice>) {
+    let _ = workqueue::system_highpri().enqueue::<ARef<AsahiDevice>, 3>(dev);
+}
+
 #[allow(dead_code)]
 enum AsahiRuntime {
     Legacy(ARef<drm::Device<AsahiDriver>>),
     M3(crate::m3_drm::Registered),
+    G16(crate::g16_drm::Registered),
     G15(crate::g15_probe::G15Manager),
 }
 
@@ -391,8 +407,10 @@ impl platform::Driver for AsahiDriver {
 
     fn unbind(_pdev: &platform::Device<Core>, this: Pin<&Self>) {
 
-        if let AsahiRuntime::M3(runtime) = &this.runtime {
-            runtime.stop();
+        match &this.runtime {
+            AsahiRuntime::M3(runtime) => runtime.stop(),
+            AsahiRuntime::G16(runtime) => runtime.stop(),
+            _ => {},
         }
     }
 
@@ -420,6 +438,12 @@ impl platform::Driver for AsahiDriver {
                 return Ok(Self { runtime: AsahiRuntime::M3(runtime) });
             }
             ProbeConfig::Agx3Diagnostic(soc) if soc.chip_id == 0x8122 => {
+                if crate::g16_profile::selected(pdev)? {
+                    if crate::m3_params::t8122_params().start != 1 { return Err(ENODEV); }
+                    crate::g16_board::initialize(pdev)?;
+                    let runtime = crate::g16_drm::Registered::start(pdev)?;
+                    return Ok(Self { runtime: AsahiRuntime::G16(runtime) });
+                }
                 let runtime = start_t8122(pdev)?;
                 return Ok(Self { runtime: AsahiRuntime::M3(runtime) });
             }

@@ -57,9 +57,9 @@ impl ClientGate {
     }
 
     /// Whether this file may create a VM. Only G15 devices are gated.
-    pub(crate) fn admit_vm(&self, device: &AsahiDevice) -> Result {
+    pub(crate) fn admit_vm(&self, device: &AsahiDevice, flags: u32) -> Result {
         let size = self.params_size.load(Ordering::Relaxed);
-        if size >= AGX3_PARAMS_SIZE {
+        if crate::g16_profile::client_admitted(device.gpu()?.params()?.gpu_hal_generation, flags, size >= AGX3_PARAMS_SIZE) {
             return Ok(());
         }
         let refusals = REFUSALS.fetch_add(1, Ordering::Relaxed).saturating_add(1);

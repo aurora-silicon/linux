@@ -204,8 +204,8 @@ struct drm_asahi_params_global {
 	 * @gpu_hal_generation: Apple GPU HAL/command-stream generation, a value
 	 * of enum drm_asahi_gpu_hal_generation.
 	 *
-	 * This kernel supports G13-G15 only and always reports
-	 * DRM_ASAHI_GPU_HAL_LEGACY.
+	 * G13-G15 on 14.x report DRM_ASAHI_GPU_HAL_LEGACY.
+	 * The exact J613 25G83 runtime reports DRM_ASAHI_GPU_HAL_200.
 	 */
 	__u32 gpu_hal_generation;
 };
@@ -217,7 +217,7 @@ enum drm_asahi_gpu_hal_generation {
 	/** @DRM_ASAHI_GPU_HAL_LEGACY: GPU predates the numbered HAL generations. */
 	DRM_ASAHI_GPU_HAL_LEGACY = 0,
 
-	/** @DRM_ASAHI_GPU_HAL_200: HAL200 command stream. Never reported by this kernel. */
+	/** @DRM_ASAHI_GPU_HAL_200: HAL200 command stream, reported by the J613 25G83 runtime. */
 	DRM_ASAHI_GPU_HAL_200 = 200,
 
 	/** @DRM_ASAHI_GPU_HAL_300: HAL300 command stream. Never reported by this kernel. */
@@ -231,6 +231,18 @@ enum drm_asahi_gpu_hal_generation {
  * version. Most features don't need to be here.
  */
 enum drm_asahi_feature {
+	/** @DRM_ASAHI_FEATURE_RENDER_TIMESTAMP_COPIES: Firmware runtime capability. */
+	DRM_ASAHI_FEATURE_RENDER_TIMESTAMP_COPIES = (1UL) << 4,
+
+	/** @DRM_ASAHI_FEATURE_COMPUTE_TIMESTAMP_COPIES: Firmware runtime capability. */
+	DRM_ASAHI_FEATURE_COMPUTE_TIMESTAMP_COPIES = (1UL) << 5,
+
+	/** @DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY_COMPUTE: Firmware runtime capability. */
+	DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY_COMPUTE = (1UL) << 7,
+
+	/** @DRM_ASAHI_FEATURE_CACHED_PROGRAM_PROBE: Firmware runtime capability. */
+	DRM_ASAHI_FEATURE_CACHED_PROGRAM_PROBE = (1UL) << 9,
+
 	/**
 	 * @DRM_ASAHI_FEATURE_SOFT_FAULTS: GPU has "soft fault" enabled. Shader
 	 * loads of unmapped memory will return zero. Shader stores to unmapped
@@ -267,9 +279,8 @@ enum drm_asahi_feature {
 	DRM_ASAHI_FEATURE_SCHEDULED_QUEUES = (1UL) << 3,
 
 	/*
-	 * Bits 4, 5, 7 and 9 are reserved. These numbers are already in use
-	 * outside this header, so they must not be given another meaning.
-	 * This kernel never sets them.
+	 * Bits 4, 5 and 7 are reported only by the HAL200 runtime.
+	 * Bit 9 remains a diagnostic and is not advertised.
 	 */
 
 	/** @DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY: Render commands may request
@@ -356,6 +367,12 @@ struct drm_asahi_get_params {
 	__u64 size;
 };
 
+/** VM creation flags. */
+enum drm_asahi_vm_create_flags {
+	/** @DRM_ASAHI_VM_CREATE_HAL200: Acknowledge the queried HAL200 command ABI. */
+	DRM_ASAHI_VM_CREATE_HAL200 = (1U << 0),
+};
+
 /**
  * struct drm_asahi_vm_create - Arguments passed to DRM_IOCTL_ASAHI_VM_CREATE
  */
@@ -384,8 +401,8 @@ struct drm_asahi_vm_create {
 	/** @vm_id: Returned VM ID */
 	__u32 vm_id;
 
-	/** @pad: MBZ */
-	__u32 pad;
+	/** @flags: HAL200 acknowledgement; zero on legacy devices. */
+	__u32 flags;
 };
 
 /**
@@ -888,6 +905,10 @@ struct drm_asahi_attachment {
 };
 
 enum drm_asahi_render_flags {
+	/** @DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY_COMPUTE: Requires the corresponding runtime feature. */
+	DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY_COMPUTE = (1U << 6),
+	/** @DRM_ASAHI_RENDER_CACHED_PROGRAM_PROBE: Bounded immutable firmware program diagnostic. */
+	DRM_ASAHI_RENDER_CACHED_PROGRAM_PROBE = (1U << 7),
 	/**
 	 * @DRM_ASAHI_RENDER_VERTEX_SCRATCH: A vertex stage shader uses scratch
 	 * memory.
@@ -929,9 +950,8 @@ enum drm_asahi_render_flags {
 	DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY = (1U << 5),
 
 	/*
-	 * Bits 6 and 7 are reserved. These numbers are already in use outside
-	 * this header, so they must not be given another meaning. This kernel
-	 * rejects render commands that set them.
+	 * Bits 6 and 7 are supported only by the HAL200 runtime.
+	 * The legacy runtime rejects render commands that set them.
 	 */
 
 	/**
@@ -1265,12 +1285,8 @@ struct drm_asahi_cmd_render {
 	/** @bg_partial_rsrc_spec_hi: High dword of @partial_bg.rsrc_spec */
 	__u32 bg_partial_rsrc_spec_hi;
 
-	/*
-	 * The 64 bytes that may follow, room for eight struct
-	 * drm_asahi_timestamp entries, are reserved. That layout is already in
-	 * use outside this header, so a future field must not give this space
-	 * another meaning. This kernel does not interpret it.
-	 */
+	/** @ts_frag_end_copies: End timestamp copies, requiring the corresponding feature bit. */
+	struct drm_asahi_timestamp ts_frag_end_copies[8];
 };
 
 /**
@@ -1309,12 +1325,8 @@ struct drm_asahi_cmd_compute {
 	/** @ts: Timestamps for the compute command */
 	struct drm_asahi_timestamps ts;
 
-	/*
-	 * The 64 bytes that may follow, room for eight struct
-	 * drm_asahi_timestamp entries, are reserved. That layout is already in
-	 * use outside this header, so a future field must not give this space
-	 * another meaning. This kernel does not interpret it.
-	 */
+	/** @ts_end_copies: End timestamp copies, requiring the corresponding feature bit. */
+	struct drm_asahi_timestamp ts_end_copies[8];
 };
 
 /**

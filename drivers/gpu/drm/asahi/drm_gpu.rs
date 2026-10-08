@@ -42,6 +42,8 @@ pub(crate) trait DrmGpu: Send + Sync {
     /// Permanent submission-domain failure; querying must not reset firmware.
     fn submission_error(&self) -> i32 { 0 }
     fn update_globals(&self);
+    fn service_g16_jobs(&self) {}
+    fn extra_features(&self) -> u64 { 0 }
     fn params(&self) -> Result<DrmGpuParams>;
     fn user_range(&self) -> Result<Range<u64>>;
     fn unknown_page(&self) -> Result<u64>;
@@ -75,13 +77,14 @@ pub(crate) trait DrmGpu: Send + Sync {
 pub(crate) enum Backend {
     Legacy(LegacyDrmGpu),
     M3(Arc<dyn DrmGpu>),
+    G16(Arc<dyn DrmGpu>),
 }
 
 impl Backend {
     pub(crate) fn gpu(&self) -> &dyn DrmGpu {
         match self {
             Self::Legacy(manager) => manager,
-            Self::M3(runtime) => &**runtime,
+            Self::M3(runtime) | Self::G16(runtime) => &**runtime,
         }
     }
 }
