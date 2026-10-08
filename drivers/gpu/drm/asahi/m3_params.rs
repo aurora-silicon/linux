@@ -401,6 +401,25 @@ pub(crate) fn pipeline_depth(soc: &crate::m3_soc::Soc) -> usize {
     }
 }
 
+/// `asahi.m3_render_batch_budget_us`: writable at runtime. A render batch takes in later packets
+/// of its VM only while the VM's measured GPU time per pass, times the passes already in the
+/// batch, stays below this budget (4000 µs on experimental T8122, disabled on Pro).
+/// Coalescing a client's heavy frames
+/// otherwise makes every other client's work, the compositor's included, wait for all of them.
+/// 0 disables the budget; u64::MAX restores the SoC default.
+static M3_RENDER_BATCH_BUDGET_US: AtomicU64 = AtomicU64::new(u64::MAX);
+m3_param!("m3_render_batch_budget_us", M3_RENDER_BATCH_BUDGET_US, parse_u64, 0o644, Some(get_atomic_param));
+
+/// The render batch GPU-time budget in ns, or `None` without one.
+pub(crate) fn render_batch_budget_ns(soc: &crate::m3_soc::Soc) -> Option<u64> {
+    let value=M3_RENDER_BATCH_BUDGET_US.load(Ordering::Relaxed);
+    let us=if value==u64::MAX {crate::m3_runtime::policy::default_budget_us(crate::t8122_start::is_t8122(soc))} else {value};
+    match us {
+        0 => None,
+        us => Some(us.saturating_mul(1000)),
+    }
+}
+
 /// Bits of `asahi.m3_retire_mmio`.
 pub(crate) const RETIRE_MMIO_BUSY: u64 = 1 << 0;
 pub(crate) const RETIRE_MMIO_FAULTS: u64 = 1 << 1;

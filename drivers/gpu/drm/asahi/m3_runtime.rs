@@ -58,6 +58,7 @@ struct Inner {
     coalesced_packets: u64,
     /// Recent measured render GPU time per pass by VM. Smoothed over batches;
     /// replacing the least recently measured VM does not retain its mappings.
+    pass_cost: policy::PassCosts,
     /// Latched only after the isolated InitBM draw fully retired.
     render_initialized: bool,
     config: Config,
@@ -203,6 +204,9 @@ impl Inner {
                 .clamp(1,crate::m3_compute_storage::SLOTS)
         };
         let same_engine=|c:&crate::m3_submit::Command| render==matches!(c,crate::m3_submit::Command::Render{..});
+        let per_pass=self.pass_cost.get(packet.vm.id());
+        let budget=crate::m3_params::render_batch_budget_ns(self.device.soc());
+        let in_flight:usize=self.active.iter().map(|b|b.entries.len()).sum();
         for (position,(candidate,start)) in self.pending.iter().enumerate() {
             // Later packets join only render batches, only from their first command, and only
             // for the VM the batch is bound to, while the batch's expected GPU time is within
@@ -210,6 +214,7 @@ impl Inner {
             if position>0 && !policy::may_join(render,*start,candidate.vm.same(&packet.vm),candidate.urgency==packet.urgency) {break;}
             let mut index=*start;
             while index<candidate.commands.len() && entries.len()<limit && same_engine(&candidate.commands[index]) {
+                if render && !policy::within_budget(per_pass,budget,in_flight+entries.len()) {return Ok(entries);}
                 entries.push((candidate.clone(),index),GFP_KERNEL)?;
                 index+=1;
             }
@@ -231,6 +236,8 @@ impl Inner {
             self.active.len(),in_flight,last.base,last.entries.len()) else {return Ok(None);};
         // Yield at the next retirement when more urgent work is already waiting.
         if self.pending.iter().any(|(p,_)|p.urgency>packet.urgency) {return Ok(None);}
+        if !policy::within_budget(self.pass_cost.get(packet.vm.id()),
+            crate::m3_params::render_batch_budget_ns(self.device.soc()),in_flight) {return Ok(None);}
         if !policy::overlap_ready(self.render_initialized,true,true,true,
             self.config.pipe_free(0)? && self.config.pipe_free(1)?) {return Ok(None);}
         Ok(Some(room))
@@ -513,6 +520,8 @@ impl Inner {
         };
         if kind==0 {
             self.render_batches[batch_count-1]+=1;
+            let vm=batch.entries[0].0.vm.id();
+            self.pass_cost.record(vm,gpu_ns/batch_count as u64);
             self.render_initialized=true;
         }
         if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {
@@ -670,7 +679,7 @@ impl Runtime {
         };
         Ok(Self { inner: ManuallyDrop::new(owner.write(Inner { transport, state, config, uat, drm, device,
             jobs:KVec::new(),packets:KVec::new(),pending:KVec::new(),active:KVec::new(),gpu_pending:false,fault_captured:false,timing:[[0;7];2],render_batches:[0;crate::m3_pass_layout::SLOTS],
-            geometry:[GeometryTiming::default();32],geometry_overflow:0,coalesced_packets:0,render_initialized:false,t8122_verdict:false,
+            geometry:[GeometryTiming::default();32],geometry_overflow:0,coalesced_packets:0,pass_cost:policy::PassCosts::default(),render_initialized:false,t8122_verdict:false,
             boot_step:crate::t8122_start::BootStep::Publish })) })
     }
     pub(crate) fn drm(&self) -> driver::AsahiDevRef { self.inner.drm.clone() }
