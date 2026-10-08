@@ -803,10 +803,9 @@
 
 		gpu: gpu@482600000 {
 			compatible = "apple,agx-t8140";
-			reg = <0x4 0x82600000 0x0 0x4000>,
-			      <0x4 0x82e00000 0x0 0x4000>,
+			reg = <0x4 0x82600000 0x0 0x88000>,
 			      <0x4 0x80000000 0x0 0x4000000>;
-			reg-names = "asc", "asc1", "sgx";
+			reg-names = "asc", "sgx";
 			mboxes = <&gfx_mbox>, <&gfx1_mbox>;
 			power-domains = <&ps_gfx>;
 			memory-region = <&uat_ttbs>, <&uat_pagetables>,
@@ -816,31 +815,31 @@
 			status = "disabled";
 		};
 
-		gfx_mbox: mailbox@482608000 {
-			compatible = "apple,t8140-gfx-asc-mailbox", "apple,asc-mailbox-v4";
-			reg = <0x4 0x82608000 0x0 0x4000>;
+		gfx_mbox: mailbox@482600000 {
+			compatible = "apple,t8140-ascwrap-v6";
+			reg = <0x4 0x82600000 0x0 0x88000>,
+			      <0x4 0x82050000 0x0 0x8>;
+			reg-names = "wrapper", "iop-vbar";
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 993 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 994 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 995 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 996 IRQ_TYPE_LEVEL_HIGH>;
-			interrupt-names = "send-empty", "send-not-empty",
-					  "recv-empty", "recv-not-empty";
+			interrupt-names = "send-empty", "recv-not-empty";
+			apple,firmware-role = "GFX";
 			power-domains = <&ps_gfx>;
 			#mbox-cells = <0>;
 			status = "disabled";
 		};
 
-		gfx1_mbox: mailbox@482e08000 {
-			compatible = "apple,t8140-gfx-asc-mailbox", "apple,asc-mailbox-v4";
-			reg = <0x4 0x82e08000 0x0 0x4000>;
+		gfx1_mbox: mailbox@482e00000 {
+			compatible = "apple,t8140-ascwrap-v6";
+			reg = <0x4 0x82e00000 0x0 0x88000>,
+			      <0x4 0x82850000 0x0 0x8>;
+			reg-names = "wrapper", "iop-vbar";
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 997 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 998 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 999 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 1000 IRQ_TYPE_LEVEL_HIGH>;
-			interrupt-names = "send-empty", "send-not-empty",
-					  "recv-empty", "recv-not-empty";
+			interrupt-names = "send-empty", "recv-not-empty";
+			apple,firmware-role = "GFX1";
 			power-domains = <&ps_gfx>;
 			#mbox-cells = <0>;
 			status = "disabled";
