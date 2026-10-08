@@ -5913,104 +5913,38 @@ fingerprint.
       aurora-m3-power-<board>-<date>.tgz.
 
    D. apple,j613 or apple,j615 + apple,t8122 (MacBook Air 13" or 15" M3):
-      J613: THE PLAIN ONE-LINER INSTALLS m1n1's DISPLAY HANDOFF BY DEFAULT.
-      It says "installing m1n1 with the M3 Air display handoff", replaces
-      the boot loader (the restore steps are printed), and the desktop stays
-      on the boot framebuffer. Run the checks below after its first boot and
-      report them. The install's summary says how the owner switches a part
-      of it off on this Mac (a chosen.<name>=0 line in /etc/m1n1.conf).
-      J615: KERNEL ONLY BY DEFAULT. THE BOOT LOADER TEST IS OPT-IN.
-      The plain one-liner installs the kernel only, as in case C, and says so:
-        M3 MacBook Air (j615): installing the kernel only ...
-      Run the checks below on that first and report it: it is the baseline
-      every later Air test is compared with.
-      Then, to try m1n1's display handoff with GPU diagnostics on this Air:
-        - What it does: it replaces this Mac's boot loader (m1n1) with one
-          that hands the built-in display over and publishes its checked
-          state for Linux, and reports this boot's GPU, PMP and display clock
-          details: on the serial console, and under
-          /proc/device-tree/chosen in Linux. It powers the GPU only for a
-          short identity read and does not start it. Display activation requires the matching PMP and display
-          handoff; a missing handoff keeps the boot framebuffer. The ordinary
-          display handoff leaves GPU startup to explicit experimental intent.
-        - Only with the owner's explicit agreement, with the owner at the
-          Mac for the first boot, with the Aurora maintainer told first and
-          reachable while it runs, and only if the owner can start macOS on
-          this Mac (hold the power button at startup). If the new boot
-          loader does not start, macOS on the same Mac is the only way back.
-        - Record the boot on the serial console if the owner has a second
-          Apple Silicon Mac and a USB 3 USB-C cable between the two Macs'
-          DFU ports: tools/aurora-m3/m3-serial.py in this repository
-          ("sudo python3 m3-serial.py reboot" on the second Mac). Most of
-          the display details are only printed there.
-        - Run the one-liner with --m3-handoff, also on an Air that has an
-          earlier test build's boot loader (a plain run there stops with
-          "Run this again with --m3-handoff" and changes nothing):
-            curl -fsSL https://github.com/iconidentify/aurora-linux/releases/latest/download/install-aurora-sep.sh | bash -s -- --m3-handoff
-          It warns "--m3-handoff: trying m1n1's display handoff", then
-          prints the restore steps, from macOS and from Linux: keep them,
-          they name this Mac's EFI partition and boot.bin. Near the end it
-          must print "m1n1's boot.bin is this release's m1n1 with the M3 Air
-          handoff switches". An error ending "Nothing was installed" changed
-          nothing: report it. For any other error, do not reboot: report it
-          first.
-        - Reboot: run sync on the Air, then, if the second Mac records the
-          serial console, start "sudo python3 m3-serial.py reboot" there; it
-          reboots the Air itself. Without one, run "sudo reboot" on the Air.
-          The owner watches the screen. Expected within about a minute: the
-          Omarchy logo, the boot menu, then the same desktop as before. Then
-          report exactly one of:
-          * WORKS: the desktop comes up as before. Run the one-liner with
-            --m3-report ("bash -s -- --m3-report"): it writes one file,
-            aurora-m3-report-<board>-<date>.tgz, in the current directory.
-            Attach that and the serial log, with the line that shows the
-            Mac's serial number removed. A handoff that went through prints
-            "DCP: T8122: handoff published" on the serial console, and Linux
-            keeps the display disabled with "no T8122 PMP description is
-            built in"; if a handoff check refused instead, quote the refusal
-            line (the boot framebuffer is then expected too). The serial log
-            also has "PMP: T8122:" lines, and the report carries
-            /chosen/asahi,t8122-pmp, -pmp-facts and -clock-facts. Give the
-            baseline checks below again too. Title it
-            "<board> (<model>): M3 Air display handoff".
-          * STOPS: m1n1 text and no boot menu, or a black screen for more
-            than two minutes. Follow "IF THE MAC STOPS IN m1n1" above.
-            Report what the screen showed and when, with the serial log if
-            there is one: it says where m1n1 stopped.
-          * WRONG: it boots, but something from the baseline no longer works
-            (keyboard, Wi-Fi, suspend). Collect
-              sudo journalctl -b -k | grep -iE 'asahi|gpu|g15|t8122|dcp|m1n1'
-            then follow the same section from Linux, reboot, and report.
-        - Later plain runs keep the display handoff on this Air. To go back,
-          use the printed restore lines; ask the maintainer before using
-          --uninstall on an Air.
-        - J613 experimental acceleration with the matched installer:
-          Current14 and exact25G83 are separate profiles. On a J613 already
-          using the supported current14 firmware, run the matched installer:
-            bash install-aurora-sep.sh --m3-gpu-persistent
-          This installs the matching kernel, Mesa and unified bootloader
-          together, retains a reachable GPU-off previous entry, and selects
-          the experimental GPU for subsequent boots. It does not require a
-          firmware migration or a separate one-shot arming command.
-          On a J613 already booted from its own exact26.6.2/25G83 volume group,
-          with the source-qualified stage1 named by the matched installer:
-            bash install-aurora-sep.sh --m3-profile=j613-25g83
-          This selects native experimental OpenGL under /opt/mesa-m3/25g83;
-          hardware Vulkan is unavailable. The installed selector is
-          /etc/mesa-m3/t8122-profile=j613-25g83-hal200. Firmware and loaded
-          GPU identity checks must pass. Linux14 cannot select this profile;
-          neither command migrates stage1 or macOS firmware.
-          A refusal leaves activation unchanged. If installation fails,
-          use 'Aurora previous (GPU off)' in Limine, or the retained previous
-          kernel in GRUB. Quote the failure and keep the boot report.
-          Plain later installs preserve the selected persistent profile.
-        - Every Air also gets mesa-m3 under /opt/mesa-m3. Ordinary J613/J615
-          installs retain their existing activation behavior. The optional
-          --m3-gpu-experiment installs air-gpu-oneshot.sh, air-gpu-collect.sh
-          and air-gpu-job.sh for a single-boot experiment; it arms nothing
-          by itself. It is separate from the persistent matched profiles.
-          After the first accelerated boot, run --m3-report and record
-          /run/user/$(id -u)/mesa-m3-session.state and the kernel GPU log.
+      A plain J613 install keeps the ordinary display handoff and GPU
+      activation policy. A plain J615 install keeps the kernel-only path;
+      --m3-handoff remains its optional display/diagnostic handoff.
+      Explicit acceleration below currently supports J613 only.
+
+      J613 experimental acceleration with the matched installer:
+      Current14 and exact25G83 are separate profiles. On a J613 already
+      using the supported current14 firmware, run the matched installer:
+        bash install-aurora-sep.sh --m3-gpu-persistent
+      This installs the matching kernel, Mesa and unified bootloader
+      together, retains a reachable GPU-off previous entry, and selects
+      the experimental GPU for subsequent boots. It does not require a
+      firmware migration or a separate one-shot arming command.
+      On a J613 already booted from its own exact26.6.2/25G83 volume group,
+      with the source-qualified stage1 named by the matched installer:
+        bash install-aurora-sep.sh --m3-profile=j613-25g83
+      This selects native experimental OpenGL under /opt/mesa-m3/25g83;
+      hardware Vulkan is unavailable. The installed selector is
+      /etc/mesa-m3/t8122-profile=j613-25g83-hal200. Firmware and loaded
+      GPU identity checks must pass. Linux14 cannot select this profile;
+      neither command migrates stage1 or macOS firmware.
+      A refusal leaves activation unchanged. If installation fails,
+      use 'Aurora previous (GPU off)' in Limine, or the retained previous
+      kernel in GRUB. Quote the failure and keep the boot report.
+      Plain later installs preserve the selected persistent profile.
+      Every Air also gets mesa-m3 under /opt/mesa-m3. Ordinary J613/J615
+      installs retain their existing activation behavior. The optional
+      --m3-gpu-experiment installs air-gpu-oneshot.sh, air-gpu-collect.sh
+      and air-gpu-job.sh for a single-boot experiment; it arms nothing
+      by itself. It is separate from the persistent matched profiles.
+      After the first accelerated boot, run --m3-report and record
+      /run/user/$(id -u)/mesa-m3-session.state and the kernel GPU log.
 
    Checks for every M3 (quote the output; on a kernel-only M3 the handoff
    lines are expected to be missing, so say so):
