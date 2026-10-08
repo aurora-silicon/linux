@@ -83,6 +83,7 @@ use crate::{
     mmu,
     queue,
     regs,
+    stats,
     workqueue, //
 };
 
@@ -256,6 +257,7 @@ pub(crate) struct GpuManager {
     fwctl_channel: Mutex<channel::FwCtlChannel>,
     pipes: PipeChannels::ver,
     event_manager: Arc<event::EventManager>,
+    stats: Arc<stats::StatsSnapshot>,
     buffer_mgr: buffer::BufferManager::ver,
     ids: SequenceIDs,
     #[allow(clippy::vec_box)]
@@ -265,6 +267,11 @@ pub(crate) struct GpuManager {
 
 /// Operations the DRM driver performs on a GPU, independent of its firmware interface.
 pub(crate) trait Gpu: Send + Sync {
+    /// Return a snapshot only for firmware families with a supported decoder.
+    fn stats_snapshot(&self) -> Option<Arc<stats::StatsSnapshot>> {
+        None
+    }
+
     /// Cast as an Any type.
     fn as_any(&self) -> &dyn Any;
     /// Cast Arc<Self> as an Any type.
@@ -761,6 +768,8 @@ impl GpuManager::ver {
         let buffer_mgr = buffer::BufferManager::ver::new()?;
         let event_manager_clone = event_manager.clone();
         let buffer_mgr_clone = buffer_mgr.clone();
+        let stats_snap = Arc::new(stats::StatsSnapshot::default(), GFP_KERNEL)?;
+        let stats_snap_clone = stats_snap.clone();
         let alloc_ref = &mut alloc;
         let rx_channels = KBox::init(
             try_init!(RxChannels::ver {
@@ -772,7 +781,12 @@ impl GpuManager::ver {
                 )?,
                 fw_log: channel::FwLogChannel::new(dev, alloc_ref)?,
                 ktrace: channel::KTraceChannel::new(dev, alloc_ref)?,
-                stats: channel::StatsChannel::ver::new(dev, alloc_ref)?,
+                stats: channel::StatsChannel::ver::new(
+                    dev,
+                    alloc_ref,
+                    stats_snap_clone,
+                    u64::from(cfg.base_clock_hz),
+                )?,
             }),
             GFP_KERNEL,
         )?;
@@ -797,6 +811,7 @@ impl GpuManager::ver {
                 rtkit <- new_mutex!(None, "rtkit"),
                 crashed: AtomicBool::new(false),
                 event_manager,
+                stats: stats_snap.clone(),
                 alloc <- new_mutex!(alloc, "alloc"),
                 fwctl_channel <- new_mutex!(fwctl_channel, "fwctl_channel"),
                 rx_channels <- new_mutex!(KBox::<RxChannels::ver>::into_inner(rx_channels), "rx_channels"),
@@ -1271,6 +1286,10 @@ impl GpuManager::ver {
 
 #[versions(AGX)]
 impl Gpu for GpuManager::ver {
+    fn stats_snapshot(&self) -> Option<Arc<stats::StatsSnapshot>> {
+        Some(self.stats.clone())
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1365,6 +1384,7 @@ impl Gpu for GpuManager::ver {
                 ualloc,
                 ualloc_priv,
                 self.event_manager.clone(),
+                self.stats.clone(),
                 &self.buffer_mgr,
                 id,
                 priority,

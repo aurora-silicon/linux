@@ -1,0 +1,68 @@
+What:		/sys/class/drm/card*/device/agx_stats
+Date:		October 2026
+Contact:	Asahi Linux GPU driver maintainers
+Description:
+		Read-only dump of the AGX firmware statistics decoded by the
+		drm/asahi driver. The driver already polls the firmware statistics
+		ring (see `drivers/gpu/drm/asahi/channel.rs::StatsChannel::poll`,
+		`drivers/gpu/drm/asahi/fw/channels.rs::StatsMsg`) and exposes the
+		latest values via this file.
+
+		The file is owned by the platform device
+		`/sys/devices/platform/<...>.gpu/`, which is symlinked from the
+		`device` entry of the matching DRM card under `/sys/class/drm/`.
+
+		One `key value` pair per line. Lines are ASCII integer values
+		unless noted. Unknown keys may be appended in future firmware
+		versions and must be ignored by readers.
+
+		Module parameter `asahi.stats_export` (default 1) controls
+		whether the driver retains the values. When 0, the file shows
+		`unsupported` (the firmware messages are still polled but
+		discarded).
+
+		Access: Read-only. Owner-readable (mode 0444).
+
+		busy_ns    cumulative u64; utilization-weighted busy time in
+		           nanoseconds since boot: each Utilization message window
+		           contributes its duration scaled by the busiest subqueue
+		           percentage. Firmware timestamps are base-clock ticks
+		           (HwConfig.base_clock_hz, 24 MHz on every supported SoC)
+		           and are converted to ns by the driver. Monotonic;
+		           bounded by elapsed wall time. MEASURED on T6021
+		           (M2 Max, 13.5): idle desktop fraction ~0.01, saturated
+		           4096^2 fp16 matmul fraction ~1.0 (util1..4 = 100).
+		           T6001 shares the message format and the 24 MHz clock
+		           (fw 13.5); the same idle-vs-matmul check must be run
+		           there before the magnitude claim is repeated.
+
+		jobs       u64; cumulative completed submissions since boot.
+		           Counted on the host at submission completion (when
+		           the last command of a submission completes and its
+		           fence signals), not from a firmware counter.
+
+		pstate     u32; current performance state index (PowerState.pstate).
+
+		power_mw   u32; latest average power reading in milliwatts
+		           (AvgPower.avg_power). May be 0 if the firmware has not
+		           yet reported AvgPower.
+
+		util1..util4   u32; raw `Utilization` fields from the firmware,
+		           unscaled. Semantics (firmware tick vs % vs MHz) are
+		           validated against a controlled MLX load and may
+		           differ per SoC revision. Treat as raw until a per-chip
+		           doc note lands.
+
+		temperature_raw, temperature_scale    u32; latest Temperature
+		           sample and scale (or 0 if Temperature has not yet
+		           arrived).
+
+		Field meanings (units, window, saturation) are documented in
+		`drivers/gpu/drm/asahi/stats.rs` and may evolve with firmware
+		revisions. busy_ns is monotonic non-decreasing while the device
+		is bound (it only accumulates). The snapshot struct is
+		`#[repr(C)]` on the Rust side and its offsets are asserted at
+		build time in `sysfs.c`; readers must parse `key value` lines and
+		must not assume binary layout of this file.
+		G17 firmware has no supported decoder for this snapshot format;
+		its file reports unsupported rather than fabricated zero counters.

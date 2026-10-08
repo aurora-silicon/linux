@@ -23,8 +23,10 @@ use crate::{
     buffer,
     event,
     gpu,
-    mem, //
+    mem,
+    module_parameters, //
 };
+use core::sync::atomic::Ordering;
 use kernel::{
     c_str,
     prelude::*,
@@ -584,11 +586,21 @@ impl KTraceChannel {
 }
 
 /// Statistics channel, reporting power-related statistics to the driver.
-/// Not really implemented other than debug logs yet...
+/// Debug-logs the messages and, when the `stats_export` module parameter
+/// is enabled, also updates the shared `StatsSnapshot` exported via
+/// `/sys/class/drm/card*/device/agx_stats`.
 #[versions(AGX)]
 pub(crate) struct StatsChannel {
     dev: AsahiDevRef,
     ch: RxChannel<ChannelState, RawStatsMsg::ver>,
+    snap: Arc<crate::stats::StatsSnapshot>,
+    /// Rate of firmware stats-message timestamps (Hz). All stats timestamps
+    /// run on the chip base clock (`HwConfig::base_clock_hz`, 24 MHz on every
+    /// supported SoC), not nanoseconds.
+    ts_hz: u64,
+    /// Last `Utilization` message timestamp (raw base-clock ticks), for
+    /// utilization-weighted `busy_ns` integration.
+    last_util_ts: u64,
 }
 
 #[versions(AGX)]
@@ -597,10 +609,15 @@ impl StatsChannel::ver {
     pub(crate) fn new(
         dev: &AsahiDevice,
         alloc: &mut gpu::KernelAllocators,
+        snap: Arc<crate::stats::StatsSnapshot>,
+        ts_hz: u64,
     ) -> Result<StatsChannel::ver> {
         Ok(StatsChannel::ver {
             dev: dev.into(),
             ch: RxChannel::<ChannelState, RawStatsMsg::ver>::new(alloc, 0x100)?,
+            snap,
+            ts_hz,
+            last_util_ts: 0,
         })
     }
 
@@ -620,6 +637,78 @@ impl StatsChannel::ver {
                     // accessing the enum view is valid.
                     let msg = unsafe { msg.msg };
                     cls_dev_dbg!(StatsCh, self.dev, "Stats: {:?}\n", msg);
+                    if *module_parameters::stats_export.value() != 0 {
+                        // Retain the latest values for /sys/class/drm/card*/
+                        // device/agx_stats. Read-only with respect to
+                        // scheduling or power behaviour: the firmware already
+                        // sent the message, we only keep what it said.
+                        match &msg {
+                            StatsMsg::ver::Utilization {
+                                timestamp,
+                                util1,
+                                util2,
+                                util3,
+                                util4,
+                            } => {
+                                self.snap.util1.store(*util1, Ordering::Relaxed);
+                                self.snap.util2.store(*util2, Ordering::Relaxed);
+                                self.snap.util3.store(*util3, Ordering::Relaxed);
+                                self.snap.util4.store(*util4, Ordering::Relaxed);
+                                // busy_ns: utilization-weighted busy time in
+                                // nanoseconds. Each Utilization window
+                                // contributes its duration scaled by the
+                                // busiest subqueue's percentage. MEASURED on
+                                // T6021 (round-3 window): util1..4 read 100
+                                // across a saturated 30 s matmul and 0-2 on
+                                // an idle desktop, while FwBusy timestamp
+                                // deltas (the prior producer) covered 0.17%
+                                // of that matmul. The timestamps are base-
+                                // clock ticks (24 MHz), so convert to ns
+                                // once here. The kernel runtime has no
+                                // 128-bit division, so split whole seconds
+                                // from the tick remainder: whole seconds
+                                // contribute util * 1e7 ns each (1e9 / 100
+                                // exactly), the remainder contributes
+                                // rem * util * 1e9 / (100 * ts_hz), which
+                                // cannot overflow u64 (rem < ts_hz <= 24e6
+                                // on supported SoCs).
+                                let util = [*util1, *util2, *util3, *util4]
+                                    .into_iter()
+                                    .max()
+                                    .unwrap_or(0)
+                                    .min(100) as u64;
+                                let ts = timestamp.0;
+                                if self.last_util_ts != 0 && ts > self.last_util_ts {
+                                    let delta = ts - self.last_util_ts;
+                                    let whole_s = delta / self.ts_hz;
+                                    let rem = delta % self.ts_hz;
+                                    let busy = whole_s
+                                        .saturating_mul(util)
+                                        .saturating_mul(10_000_000)
+                                        .saturating_add(
+                                            rem * util * 1_000_000_000 / (100 * self.ts_hz),
+                                        );
+                                    self.snap.busy_ns.fetch_add(busy, Ordering::Relaxed);
+                                }
+                                self.last_util_ts = ts;
+                            }
+                            StatsMsg::ver::PowerState { pstate, .. } => {
+                                self.snap.pstate.store(*pstate, Ordering::Relaxed);
+                            }
+                            StatsMsg::ver::AvgPower { avg_power, .. } => {
+                                self.snap.avg_power_mw.store(*avg_power, Ordering::Relaxed);
+                            }
+                            StatsMsg::ver::Temperature {
+                                raw_value, scale, ..
+                            } => {
+                                self.snap
+                                    .temperature_raw
+                                    .store(*raw_value, Ordering::Relaxed);
+                                self.snap.temperature_scale.store(*scale, Ordering::Relaxed);
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 _ => {
                     // SAFETY: The raw view is always valid for all bit patterns.
