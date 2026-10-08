@@ -41,6 +41,7 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	rep->dev = dev;
+	spin_lock_init(&rep->lock);
 	rep->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(rep->base))
 		return PTR_ERR(rep->base);

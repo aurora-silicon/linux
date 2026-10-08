@@ -345,6 +345,51 @@
 	apple,pcie-tunnel = <&usb4_2_pcie_tunnel>;
 };
 
+/*
+ * No m1n1 performs the PCIe-C preinit handoff on these machines. Let the
+ * PCIe driver cold-initialize the Thunderbolt PCIe tunnel ports itself, so
+ * PCIe devices behind Thunderbolt 3 docks (e.g. their xHCI) come up.
+ */
+&apciec0 {
+	apple,pciec-kernel-init;
+};
+
+&apciec1 {
+	apple,pciec-kernel-init;
+};
+
+&apciec2 {
+	apple,pciec-kernel-init;
+};
+
+/*
+ * PCIe-C DART tunables. iBoot adds "dart-tunables-instance-0" to the ADT at
+ * boot and m1n1 does not copy it for these DARTs. Values taken from the live
+ * J416c ADT (macOS ioreg), identical for all three ports; offsets are
+ * relative to the DART's reg.
+ */
+#define APCIEC_DART_TUNABLES				\
+	apple,tunable = <0x20c 0xff0000b7 0xe40000b7>,	\
+			<0x220 0x000f0f0f 0x000f0f0f>,	\
+			<0x224 0x00ffffff 0x00080808>,	\
+			<0x300 0x00001f31 0x00000001>,	\
+			<0x308 0x3ffffffc 0x10000000>,	\
+			<0x310 0x3ffffffc 0x3ffffffc>
+
+&apciec0_dart {
+	APCIEC_DART_TUNABLES;
+};
+
+&apciec1_dart {
+	APCIEC_DART_TUNABLES;
+};
+
+&apciec2_dart {
+	APCIEC_DART_TUNABLES;
+};
+
+#undef APCIEC_DART_TUNABLES
+
 /* Keep dptx_phy_ps on until DCP can sequence it during display bring-up. */
 &ps_dptx_phy_ps {
 	apple,always-on;
