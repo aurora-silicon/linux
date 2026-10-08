@@ -119,8 +119,6 @@ static const struct apple_soc_cpufreq_info soc_t8112_info = {
  */
 static const struct apple_soc_cpufreq_info soc_t8140_info = {
 	.verify_transition = true,
-	.needs_thermal_policy = true,
-	.max_unmanaged_pstate = 2,
 	.min_pstate = 1,
 	.max_pstate = 31,
 	.ps1_mask = APPLE_DVFS_CMD_PS1,
@@ -335,6 +333,7 @@ static int apple_soc_cpufreq_find_cluster(struct cpufreq_policy *policy,
 
 static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 {
+	struct cpufreq_frequency_table *p;
 	int ret, i;
 	unsigned int transition_latency;
 	void __iomem *reg_base;
@@ -436,6 +435,16 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 	policy->dvfs_possible_from_any_cpu = true;
 	policy->fast_switch_possible = !info->verify_transition;
 	policy->suspend_freq = freq_table[0].frequency;
+	/* Unqualified SoCs still require protection above their safe ceiling. */
+	if (info->needs_thermal_policy) {
+		cpufreq_for_each_valid_entry(p, policy->freq_table) {
+			if (p->driver_data <= info->max_unmanaged_pstate)
+				continue;
+			dev_err(cpu_dev, "higher P-states require a qualified thermal policy\n");
+			ret = -ENODEV;
+			goto out_free_cpufreq_table;
+		}
+	}
 
 	return 0;
 
