@@ -81,7 +81,7 @@ impl Vm {
             if needs_sgt {
                 // Pin without the BO mutex: alias construction can hold the GEM
                 // reservation while acquiring this mutex.
-                let sgt = gem.owned_sg_table()?;
+                let sgt = crate::gem::held_sg_table(&gem)?;
                 let mut bo = vm_bo.inner().inner.lock();
                 if bo.sgt.is_none() {
                     if bo.sg_vec.is_none() {

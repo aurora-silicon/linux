@@ -1761,7 +1761,7 @@ impl Vm {
         }
         let reserved_size = size.checked_add(guard_size).ok_or(EOVERFLOW)?;
         let _residency = self.enter_residency()?;
-        let sgt = gem.owned_sg_table()?;
+        let sgt = crate::gem::held_sg_table(&gem)?;
         let mut inner = self.inner.exec_lock(Some(gem), false)?;
         let vm_bo = self.inner.obtain_bo(gem)?;
 
@@ -1828,7 +1828,7 @@ impl Vm {
             .checked_add(if guard { UAT_PGSZ } else { 0 })
             .ok_or(EOVERFLOW)?;
         let _residency = self.enter_residency()?;
-        let sgt = gem.owned_sg_table()?;
+        let sgt = crate::gem::held_sg_table(&gem)?;
         let mut inner = self.inner.exec_lock(Some(&gem), false)?;
 
         let vm_bo = self.inner.obtain_bo(&gem)?;
@@ -1907,7 +1907,7 @@ impl Vm {
             if needs_sgt {
                 // Pin without the BO mutex: alias construction can hold the GEM
                 // reservation while acquiring this mutex.
-                let sgt = gem.owned_sg_table()?;
+                let sgt = crate::gem::held_sg_table(&gem)?;
                 let mut vm_bo_guard = vm_bo.inner().inner.lock();
                 if vm_bo_guard.sgt.is_none() {
                     if vm_bo_guard.sg_vec.is_none() {

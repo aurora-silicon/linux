@@ -13,7 +13,8 @@ use kernel::{
         shmem,
         shmem::VMap,
         BaseObject,
-        DriverObject, //
+        DriverObject,
+        IntoGEMObject, //
     },
     error::Result,
     prelude::*,
@@ -24,6 +25,7 @@ use kernel::{
 use core::ops::Range;
 use core::sync::atomic::{
     AtomicU64,
+    AtomicUsize,
     Ordering, //
 };
 
@@ -59,6 +61,50 @@ pub(crate) struct AsahiObject {
 
 /// Type alias for the shmem GEM object type for this driver.
 pub(crate) type Object = shmem::Object<AsahiObject>;
+
+/// Marks whether the pages of `gem` are held for the device.
+///
+/// Populated asahi objects keep their pages referenced (device SG table, kernel vmap or a PFN
+/// CPU mapping), so the pages cannot migrate. Unmarked, the compaction migrate scanner still
+/// isolates them from the unevictable LRU and every migration fails. The shmem mapping of a
+/// held object is therefore marked inaccessible, which compaction and migration check and which
+/// comes with unevictable, as `mapping_set_inaccessible()` sets it; nothing reads or writes a GEM
+/// shmem file through its mapping. Releasing idle backing or purging clears the mark, so the
+/// released pages can be swapped and migrated again.
+pub(crate) fn set_mapping_held(gem: &Object, held: bool) {
+    let raw = gem.as_raw();
+    // SAFETY: `gem` keeps the GEM object alive. A shmem-backed object's `filp` and its
+    // `f_mapping` are set at initialization and never change; imported objects have none.
+    let mapping = unsafe {
+        let filp = (*raw).filp;
+        if filp.is_null() {
+            return;
+        }
+        (*filp).f_mapping
+    };
+    if mapping.is_null() {
+        return;
+    }
+    // SAFETY: `flags` is the aligned flag word of the live mapping. The kernel updates it only
+    // with atomic bit operations on the same word.
+    let flags =
+        unsafe { AtomicUsize::from_ptr(core::ptr::addr_of_mut!((*mapping).flags).cast::<usize>()) };
+    let inaccessible = 1usize << kernel::bindings::mapping_flags_AS_INACCESSIBLE;
+    let unevictable = 1usize << kernel::bindings::mapping_flags_AS_UNEVICTABLE;
+    if held {
+        flags.fetch_or(inaccessible | unevictable, Ordering::Relaxed);
+    } else {
+        flags.fetch_and(!inaccessible, Ordering::Relaxed);
+    }
+}
+
+/// Takes an owned SG table of `gem`, which holds its pages for the device, and marks the
+/// object held (see [`set_mapping_held`]).
+pub(crate) fn held_sg_table(gem: &Object) -> Result<shmem::SGTable<AsahiObject>> {
+    let sgt = gem.owned_sg_table()?;
+    set_mapping_held(gem, true);
+    Ok(sgt)
+}
 
 /// VM-private BOs share their assigned VM's reservation object. Validate this
 /// before acquiring mapping state; generic GPUVM accepts external shareable BOs.
@@ -192,6 +238,7 @@ fn new_kernel_object_mapped(dev: &AsahiDevice, size: usize, map_wc: bool) -> Res
         },
     )?;
 
+    set_mapping_held(&gem, true);
     mod_pr_debug!("AsahiObject new kernel object id={}\n", gem.id);
     Ok(ObjectRef::new(gem))
 }
