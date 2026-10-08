@@ -16,11 +16,13 @@ TEST_GEN_PROGS_EXTENDED += first-write clipped-firstwrite
 TEST_FILES += README.first-write
 TEST_GEN_PROGS_EXTENDED += pinned-fork
 TEST_FILES += README.pinned-fork
+TEST_GEN_PROGS_EXTENDED += pagetable-retention pagetable-concurrent
+TEST_FILES += README.pagetable-backing
 include ../../lib.mk
 
 $(OUTPUT)/page-contract: page-contract.c x18-probe.S
 
-$(OUTPUT)/first-write $(OUTPUT)/thread-fixture-init $(OUTPUT)/user16k-smoke-init $(OUTPUT)/cow-pool $(OUTPUT)/anon-hole-refill-race $(OUTPUT)/anon-hole-refill-reclaim: LDLIBS += -pthread
+$(OUTPUT)/pagetable-concurrent $(OUTPUT)/first-write $(OUTPUT)/thread-fixture-init $(OUTPUT)/user16k-smoke-init $(OUTPUT)/cow-pool $(OUTPUT)/anon-hole-refill-race $(OUTPUT)/anon-hole-refill-reclaim: LDLIBS += -pthread
 
 # Freestanding ELF32 probes exercise the compat ABI without an armhf sysroot.
 AARCH32_CC ?= clang --target=arm-linux-gnueabihf
