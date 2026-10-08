@@ -325,6 +325,8 @@ struct Active {
     work: Arc<WorkStateLease>,
     ticket: Option<Ticket>,
     observed: Option<Observation>,
+    /// Host time the completion record was first observed.
+    observed_at: Option<u64>,
     failure_deferred: bool,
     qos_pending: bool,
 }
@@ -589,6 +591,9 @@ impl Queue {
             };
             if active.observed.is_none() {
                 active.observed = batch.take(&ticket)?;
+                if active.observed.is_some() {
+                    active.observed_at = Some(now_ns());
+                }
             }
         }
         Ok(())
@@ -699,15 +704,23 @@ impl Queue {
                     .iter()
                     .skip(1)
                     .find_map(|a| a.observed.map(|o| o.timestamps[1]));
+                let stamp = self.graph.stamp()?;
+                let record_aged = front
+                    .observed_at
+                    .is_some_and(|at| now_ns().saturating_sub(at) >= retirement::STAMP_GRACE_NS);
                 let timestamps = retirement::poll(
                     &ticket,
                     front.observed,
                     self.graph.cursors()?,
-                    self.graph.stamp()?,
+                    stamp,
                     recordless,
                     self.last_end,
                     next_end,
+                    record_aged,
                 )?;
+                if timestamps.is_some() && !retirement::stamp_covers(stamp, ticket.kick) {
+                    retirement::note_stampless(self.qid(), ticket.kick);
+                }
                 if timestamps.is_some()
                     && self.previous.as_ref().is_some_and(|p| {
                         p.publication != Some((front.packet.order.sequence, ticket.epoch))
@@ -1488,6 +1501,7 @@ impl Queue {
                 work: work.clone(),
                 ticket: None,
                 observed: None,
+                observed_at: None,
                 failure_deferred: false,
                 qos_pending: false,
             })

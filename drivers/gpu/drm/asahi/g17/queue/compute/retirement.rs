@@ -65,8 +65,32 @@ pub(crate) enum Recordless {
     CrossedRecovery,
 }
 
+/// How long a command whose exact completion record is present waits for its completion stamp
+/// before it retires on the record alone. The firmware stores the stamp after the cache
+/// maintenance that follows the record; it occasionally never stores it for a command, most
+/// visibly while a render of the same VM is running.
+pub(crate) const STAMP_GRACE_NS: u64 = 1_000_000;
+
+static STAMPLESS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Counts a command that retired on its record without its completion stamp; logs the first and
+/// every 64th.
+pub(crate) fn note_stampless(qid: u8, kick: u64) {
+    let count = STAMPLESS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    if count == 1 || count % 64 == 0 {
+        pr_info!(
+            "G17: {} compute commands retired on their completion record without a completion stamp (latest: queue {} kick {:#x})\n",
+            count,
+            qid,
+            kick
+        );
+    }
+}
+
 /// A zero-duration record fails before visibility polling. It proves execution did not occur;
 /// ownership still requires a separate retirement witness before mappings can be released.
+/// The command is complete when its stamp covers it, or when its exact completion record has
+/// been present for [`STAMP_GRACE_NS`] (`record_aged`); in both cases its items must be consumed.
 pub(crate) fn poll(
     ticket: &Ticket,
     observed: Option<Observation>,
@@ -75,13 +99,13 @@ pub(crate) fn poll(
     recordless: Recordless,
     floor: u64,
     next_end: Option<u64>,
+    record_aged: bool,
 ) -> Result<Option<[u64; 2]>> {
     if observed.is_some_and(|record| record.timestamps[0] == record.timestamps[1]) {
         return Err(ENODATA);
     }
-    if !stamp_covers(stamp, ticket.kick)
-        || !cursors.consumed(ticket.item_producer, ticket.item_count)?
-    {
+    let completed = stamp_covers(stamp, ticket.kick) || (observed.is_some() && record_aged);
+    if !completed || !cursors.consumed(ticket.item_producer, ticket.item_count)? {
         return Ok(None);
     }
     Ok(Some(match observed {
