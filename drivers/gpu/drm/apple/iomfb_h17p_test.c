@@ -68,9 +68,79 @@ static void h17p_opaque_x_parameter_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, property.value, 0U);
 }
 
+static void h17p_callback_bounds_test(struct kunit *test)
+{
+	/* Every installed handler is reachable without failing the session. */
+	KUNIT_EXPECT_EQ(test, iomfb_h17p_first_unbounded_callback(), -1);
+
+	/* Startup observations stay exact. */
+	KUNIT_EXPECT_TRUE(test, iomfb_validate_callback_h17p(114, 0x1044, 0x1004));
+	KUNIT_EXPECT_FALSE(test, iomfb_validate_callback_h17p(114, 0x1044, 0x1008));
+	KUNIT_EXPECT_FALSE(test, iomfb_validate_callback_h17p(590, 0x734, 0x0));
+
+	/* Runtime callbacks must hold what their handlers read and write. */
+	KUNIT_EXPECT_TRUE(test, iomfb_validate_callback_h17p(209, 0x0, 0x8));
+	KUNIT_EXPECT_TRUE(test, iomfb_validate_callback_h17p(209, 0x4, 0xc));
+	KUNIT_EXPECT_FALSE(test, iomfb_validate_callback_h17p(209, 0x0, 0x4));
+	KUNIT_EXPECT_TRUE(test, iomfb_validate_callback_h17p(593, 0x4, 0x0));
+	KUNIT_EXPECT_FALSE(test, iomfb_validate_callback_h17p(593, 0x2, 0x0));
+	KUNIT_EXPECT_TRUE(test, iomfb_validate_callback_h17p(594, 0x4, 0x0));
+	KUNIT_EXPECT_FALSE(test, iomfb_validate_callback_h17p(594, 0x0, 0x0));
+	KUNIT_EXPECT_TRUE(test, iomfb_validate_callback_h17p(585, 0xe4, 0xe0));
+	KUNIT_EXPECT_FALSE(test, iomfb_validate_callback_h17p(585, 0xe0, 0xe0));
+
+	/* Tags without a handler or out of range never validate. */
+	KUNIT_EXPECT_FALSE(test, iomfb_validate_callback_h17p(5, 0x0, 0x0));
+	KUNIT_EXPECT_FALSE(test, iomfb_validate_callback_h17p(-1, 0x0, 0x0));
+	KUNIT_EXPECT_FALSE(test, iomfb_validate_callback_h17p(IOMFB_MAX_CB, 0x0, 0x0));
+}
+
+static void h17p_present_abort_test(struct kunit *test)
+{
+	struct dcp_present_state_h17p state = {};
+
+	/* An abort after acceptance ends the present without a completion. */
+	KUNIT_ASSERT_TRUE(test, dcp_present_begin_h17p(&state, 7));
+	KUNIT_ASSERT_TRUE(test, dcp_present_submit_h17p(&state, 7, true));
+	KUNIT_EXPECT_FALSE(test, dcp_present_abort_h17p(&state, 6));
+	KUNIT_EXPECT_TRUE(test, state.pending);
+	KUNIT_EXPECT_FALSE(test, dcp_present_was_aborted_h17p(&state, 7));
+	KUNIT_EXPECT_TRUE(test, dcp_present_abort_h17p(&state, 7));
+	KUNIT_EXPECT_FALSE(test, state.pending);
+	KUNIT_EXPECT_FALSE(test, dcp_present_complete_h17p(&state, 7));
+	/* A late completion for it is recognisable as stale, not unexpected. */
+	KUNIT_EXPECT_TRUE(test, dcp_present_was_aborted_h17p(&state, 7));
+	KUNIT_EXPECT_FALSE(test, dcp_present_was_aborted_h17p(&state, 6));
+	KUNIT_EXPECT_FALSE(test, dcp_present_abort_h17p(&state, 7));
+
+	/* An abort before the submit reply leaves the reply to finish it. */
+	KUNIT_ASSERT_TRUE(test, dcp_present_begin_h17p(&state, 8));
+	KUNIT_EXPECT_TRUE(test, dcp_present_abort_h17p(&state, 8));
+	KUNIT_EXPECT_TRUE(test, state.pending);
+	KUNIT_EXPECT_TRUE(test, state.aborted);
+	KUNIT_ASSERT_TRUE(test, dcp_present_submit_h17p(&state, 8, true));
+	KUNIT_EXPECT_FALSE(test, state.pending);
+	KUNIT_EXPECT_FALSE(test, dcp_present_complete_h17p(&state, 8));
+
+	/* The next present starts clean and completes normally. */
+	KUNIT_ASSERT_TRUE(test, dcp_present_begin_h17p(&state, 9));
+	KUNIT_EXPECT_FALSE(test, state.aborted);
+	KUNIT_ASSERT_TRUE(test, dcp_present_submit_h17p(&state, 9, true));
+	KUNIT_EXPECT_TRUE(test, state.pending);
+	/* A stale completion for 8 neither matches nor disturbs present 9. */
+	KUNIT_EXPECT_FALSE(test, dcp_present_complete_h17p(&state, 8));
+	KUNIT_EXPECT_TRUE(test, dcp_present_was_aborted_h17p(&state, 8));
+	KUNIT_EXPECT_TRUE(test, state.pending);
+	KUNIT_EXPECT_TRUE(test, dcp_present_complete_h17p(&state, 9));
+	KUNIT_EXPECT_FALSE(test, state.pending);
+	KUNIT_EXPECT_FALSE(test, dcp_present_was_aborted_h17p(&state, 9));
+}
+
 static struct kunit_case h17p_present_cases[] = {
 	KUNIT_CASE(h17p_surface_wire_test),
 	KUNIT_CASE(h17p_opaque_x_parameter_test),
+	KUNIT_CASE(h17p_callback_bounds_test),
+	KUNIT_CASE(h17p_present_abort_test),
 	{}
 };
 

@@ -6,6 +6,7 @@
 
 #include <linux/errno.h>
 #include <linux/limits.h>
+#include <linux/minmax.h>
 #include <linux/types.h>
 
 /* Commanded nits, independent of firmware encoding. No fade policy. */
@@ -23,6 +24,12 @@ struct dcp_backlight_state {
 	bool suspended;
 	bool dirty;
 	bool in_flight;
+	/*
+	 * The panel shows a level Linux knows: the loader's reported level, or
+	 * one a completed present carried.  A default used for registration
+	 * without a loader report is not known until a present carries a level.
+	 */
+	bool level_known;
 };
 
 struct dcp_backlight_present {
@@ -30,18 +37,25 @@ struct dcp_backlight_present {
 	u32 nits;
 };
 
-/* Public powerlog reports use millinits; validate before rounding to nits. */
+/*
+ * Public powerlog reports use millinits.  A report slightly above the panel
+ * ceiling describes the brightest level the panel can show, so clamp it; one
+ * more than twice the ceiling is not a credible panel level.
+ */
 static inline int dcp_bl_takeover_nits(u32 maximum, u32 millinits, u32 *nits)
 {
-	if (!maximum || maximum > INT_MAX)
+	if (!maximum || maximum > INT_MAX / 2000)
 		return -EINVAL;
-	if ((u64)millinits > (u64)maximum * 1000)
+	if (millinits / 1000 > 2 * maximum)
 		return -ERANGE;
-	*nits = millinits / 1000;
+	*nits = min(millinits / 1000, maximum);
 	return 0;
 }
 
-/* Inputs must come from admitted panel/loader records, never a guess. */
+/*
+ * An inherited level comes from a loader report.  A default level is only
+ * reported to userspace; it is never presented on its own (see level_known).
+ */
 static inline int dcp_bl_init(struct dcp_backlight_state *state, u32 maximum,
 			      bool inherited_valid, u32 inherited,
 			      bool default_valid, u32 default_nits)
@@ -61,6 +75,7 @@ static inline int dcp_bl_init(struct dcp_backlight_state *state, u32 maximum,
 		.target = nits,
 		.actual = nits,
 		.ready = true,
+		.level_known = inherited_valid,
 	};
 	return 0;
 }
@@ -115,6 +130,20 @@ static inline int dcp_bl_dpms(struct dcp_backlight_state *state, bool on)
 }
 
 /*
+ * The firmware asked for the level again.  Re-send the effective level once
+ * Linux controls it and knows it, unless a present already carries or will
+ * carry it.  A default level is never sent this way.
+ */
+static inline bool dcp_bl_resend(struct dcp_backlight_state *state)
+{
+	if (!state->ready || !state->controlled || !state->level_known ||
+	    state->dirty || state->in_flight)
+		return false;
+	state->dirty = true;
+	return true;
+}
+
+/*
  * Called by the single outbound queue, with a pinned, accepted scanout or a
  * prepared replacement. Soft-off never releases it. A brightness-only present
  * must use the last accepted surface, not a rejected replacement's DRM state.
@@ -153,6 +182,7 @@ static inline bool dcp_bl_complete(struct dcp_backlight_state *state,
 	if (accepted) {
 		state->actual = state->sent_nits;
 		state->retries = 0;
+		state->level_known = true;
 	} else {
 		state->dirty = true;
 		if (state->retries < 4)
@@ -189,6 +219,7 @@ int dcp_backlight_prepare(struct apple_dcp *dcp, bool have_surface,
 			  struct dcp_backlight_present *present);
 bool dcp_backlight_complete(struct apple_dcp *dcp, u64 sequence, bool accepted);
 bool dcp_backlight_pending(struct apple_dcp *dcp);
+bool dcp_backlight_resend(struct apple_dcp *dcp);
 unsigned int dcp_backlight_retry_delay(struct apple_dcp *dcp);
 
 #endif /* __APPLE_DCP_BACKLIGHT_H__ */

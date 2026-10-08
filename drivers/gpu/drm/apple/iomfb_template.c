@@ -252,6 +252,18 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 #if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 	    !dcp_present_complete_h17p(&dcp->present_state_h17p, resp->swap_id)) {
+		/*
+		 * Abort semantics are not captured on H17P.  If an aborted
+		 * present completes after all, its framebuffers were already
+		 * unarmed and its event signalled; record it and carry on.
+		 */
+		if (dcp_present_was_aborted_h17p(&dcp->present_state_h17p,
+						 resp->swap_id)) {
+			dev_warn_ratelimited(dcp->dev,
+					     "completion for aborted present %u ignored\n",
+					     resp->swap_id);
+			return;
+		}
 		dev_err(dcp->dev, "unexpected present completion %u\n", resp->swap_id);
 		dcp->crashed = true;
 		return;
@@ -777,23 +789,36 @@ static bool is_disp_register(struct apple_dcp *dcp, u64 start, u64 end)
 static struct dcp_map_physical_resp
 dcpep_cb_map_physical(struct apple_dcp *dcp, struct dcp_map_physical_req *req)
 {
-	int size = ALIGN(req->size, 4096);
+	u64 size, end;
 	dma_addr_t dva;
 	u32 id;
 
-	if (!is_disp_register(dcp, req->paddr, req->paddr + size - 1)) {
+	/* Both values come from the coprocessor; reject wrapping ranges. */
+	if (!req->size || check_add_overflow(req->size, 4095ULL, &size) ||
+	    check_add_overflow(req->paddr, round_down(size, 4096) - 1, &end) ||
+	    !is_disp_register(dcp, req->paddr, end)) {
 		dev_err(dcp->dev, "refusing to map phys address %llx size %llx\n",
 			req->paddr, req->size);
 		return (struct dcp_map_physical_resp){};
 	}
+	size = round_down(size, 4096);
 
 	id = find_first_zero_bit(dcp->memdesc_map, DCP_MAX_MAPPINGS);
+	if (id >= DCP_MAX_MAPPINGS) {
+		dev_warn(dcp->dev, "DCP overflowed mapping table, ignoring\n");
+		return (struct dcp_map_physical_resp){};
+	}
+
+	dva = dma_map_resource(dcp->dev, req->paddr, size, DMA_BIDIRECTIONAL, 0);
+	if (dma_mapping_error(dcp->dev, dva)) {
+		dev_err(dcp->dev, "failed to map phys address %llx size %llx\n",
+			req->paddr, size);
+		return (struct dcp_map_physical_resp){};
+	}
+
 	set_bit(id, dcp->memdesc_map);
 	dcp->memdesc[id].size = size;
 	dcp->memdesc[id].reg = req->paddr;
-
-	dva = dma_map_resource(dcp->dev, req->paddr, size, DMA_BIDIRECTIONAL, 0);
-	WARN_ON(dva == DMA_MAPPING_ERROR);
 
 	return (struct dcp_map_physical_resp){
 		.dva_size = size,
@@ -860,6 +885,15 @@ dcpep_cb_read_edt_data(struct apple_dcp *dcp, struct dcp_read_edt_data_req *req)
 static void iomfbep_cb_enable_backlight_message_ap_gated(struct apple_dcp *dcp,
 							 u8 *enabled)
 {
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	/* H17P carries the level only in presents; ask for one more. */
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		if (dcp_has_panel(dcp) && dcp_backlight_active(dcp) &&
+		    dcp_backlight_resend(dcp))
+			schedule_work(&dcp->bl_update_wq);
+		return;
+	}
+#endif
 	/*
 	 * update backlight brightness on next swap, on non mini-LED displays
 	 * DCP seems to set an invalid iDAC value after coming out of DPMS.
@@ -1373,6 +1407,13 @@ static bool dcp_present_submit(struct apple_dcp *dcp, u32 swap_id, bool accepted
 		dcp->crashed = true;
 		return false;
 	}
+	/* An abort received before this reply turns acceptance into failure. */
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+	    accepted && dcp->present_state_h17p.aborted) {
+		dev_warn_ratelimited(dcp->dev, "firmware aborted present %u\n",
+				     swap_id);
+		return false;
+	}
 #endif
 	return true;
 }
@@ -1829,10 +1870,43 @@ dcpep_cb_swap_complete_intent_gated(struct apple_dcp *dcp,
 		info->width, info->height);
 }
 
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+/*
+ * An aborted H17P present never completes.  Finish it like a rejected one:
+ * keep the displaced framebuffers for the next completed present and signal
+ * the DRM event, so neither the queue nor userspace waits for a completion.
+ */
+static void dcp_present_aborted(struct apple_dcp *dcp, u32 swap_id)
+{
+	if (!dcp_present_abort_h17p(&dcp->present_state_h17p, swap_id)) {
+		dev_warn_ratelimited(dcp->dev,
+				     "abort for present %u, which is not in flight\n",
+				     swap_id);
+		return;
+	}
+	/* The submit reply has not arrived; it finishes the present. */
+	if (dcp->present_state_h17p.pending)
+		return;
+
+	dev_warn_ratelimited(dcp->dev, "firmware aborted present %u\n", swap_id);
+	/* No completion follows, so the swap watchdog must not wait for one. */
+	dcp_swap_watchdog_complete(dcp);
+	dcp_present_failed(dcp);
+	if (dcp_present_retires(dcp)) {
+		dcp_unarm_retained_framebuffers(dcp, swap_id);
+		dcp_drm_crtc_vblank(dcp->crtc);
+	}
+}
+#endif
+
 static void
 dcpep_cb_abort_swap_ap_gated(struct apple_dcp *dcp, u32 *swap_id)
 {
 	trace_iomfb_abort_swap_ap_gated(dcp, *swap_id);
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		dcp_present_aborted(dcp, *swap_id);
+#endif
 }
 
 static struct dcpep_get_tiling_state_resp

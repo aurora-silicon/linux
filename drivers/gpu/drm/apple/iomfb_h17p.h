@@ -21,6 +21,11 @@ struct dcp_present_state_h17p {
 	u32 swap_id;
 	bool pending;
 	bool accepted;
+	/* The firmware aborted the present before its submit reply. */
+	bool aborted;
+	/* The most recent aborted present, whose late completion is ignored. */
+	bool has_last_aborted;
+	u32 last_aborted;
 };
 
 static inline bool
@@ -31,6 +36,7 @@ dcp_present_begin_h17p(struct dcp_present_state_h17p *state, u32 swap_id)
 	state->swap_id = swap_id;
 	state->pending = true;
 	state->accepted = false;
+	state->aborted = false;
 	return true;
 }
 
@@ -41,9 +47,37 @@ dcp_present_submit_h17p(struct dcp_present_state_h17p *state, u32 swap_id,
 	if (!state->pending || state->accepted || state->swap_id != swap_id)
 		return false;
 	state->accepted = accepted;
-	if (!accepted)
+	if (!accepted || state->aborted)
 		state->pending = false;
 	return true;
+}
+
+/*
+ * An aborted present never completes.  Before its submit reply, the abort is
+ * recorded and the reply ends the present instead.
+ */
+static inline bool
+dcp_present_abort_h17p(struct dcp_present_state_h17p *state, u32 swap_id)
+{
+	if (!state->pending || state->swap_id != swap_id)
+		return false;
+	if (state->accepted) {
+		state->pending = false;
+		state->accepted = false;
+	} else {
+		state->aborted = true;
+	}
+	state->has_last_aborted = true;
+	state->last_aborted = swap_id;
+	return true;
+}
+
+/* Whether the firmware aborted @swap_id; a completion for it is stale. */
+static inline bool
+dcp_present_was_aborted_h17p(const struct dcp_present_state_h17p *state,
+			     u32 swap_id)
+{
+	return state->has_last_aborted && state->last_aborted == swap_id;
 }
 
 static inline bool
@@ -87,6 +121,10 @@ void iomfb_encode_backlight_h17p(struct dcp_present_h17p *wire, u32 nits,
 
 void iomfb_serialize_present_h17p(struct dcp_present_h17p *wire,
 				  const struct dcp_swap_submit_req_h17p *request);
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
+int iomfb_h17p_first_unbounded_callback(void);
+#endif
 
 #undef DCP_FW_VER
 #undef DCP_FW

@@ -96,7 +96,8 @@ int dcp_backlight_takeover(struct apple_dcp *dcp, u32 millinits)
 
 	if (dcp_backlight_active(dcp))
 		return 0;
-	maximum = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
+	/* H17P takes nits up to the panel ceiling, not the older DAC table's. */
+	maximum = dcp->brightness.maximum;
 	ret = dcp_bl_takeover_nits(maximum, millinits, &nits);
 	if (ret)
 		return ret;
@@ -222,6 +223,30 @@ bool dcp_backlight_pending(struct apple_dcp *dcp)
 	pending = dcp->backlight.state.dirty && !dcp->backlight.state.in_flight;
 	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
 	return pending;
+}
+
+/*
+ * Called from the receive path, which must not queue a transaction itself;
+ * the caller schedules the update worker when this returns true.  Requests
+ * are honoured at most once per second, so a firmware that repeats the
+ * request after every brightness present cannot keep the queue busy.
+ */
+bool dcp_backlight_resend(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	bool resend = false;
+
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	if (!dcp->backlight.resent ||
+	    time_after(jiffies, dcp->backlight.resent_at + HZ)) {
+		resend = dcp_bl_resend(&dcp->backlight.state);
+		if (resend) {
+			dcp->backlight.resent = true;
+			dcp->backlight.resent_at = jiffies;
+		}
+	}
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	return resend;
 }
 
 unsigned int dcp_backlight_retry_delay(struct apple_dcp *dcp)

@@ -1843,9 +1843,15 @@ static void dcp_delayed_vblank(struct work_struct *work)
 {
 	struct apple_dcp *dcp;
 
+	struct apple_crtc *crtc;
+
 	dcp = container_of(work, struct apple_dcp, vblank_wq);
+	/* RTKit can report a crash before the pipeline has a CRTC. */
+	crtc = READ_ONCE(dcp->crtc);
+	if (!crtc)
+		return;
 	mdelay(5);
-	dcp_drm_crtc_vblank(dcp->crtc);
+	dcp_drm_crtc_vblank(crtc);
 }
 
 static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
@@ -1968,6 +1974,17 @@ static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_
 
 	dcp->crashed = true;
 	dev_err(dcp->dev, "DCP has crashed\n");
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		/* No in-place restart exists; the last scanout stays retained. */
+		dev_err(dcp->dev, "a reboot is required to restore the display\n");
+		/*
+		 * Nothing will complete a present that was in flight.  Before
+		 * the pipeline is linked there is no event to complete.
+		 */
+		if (READ_ONCE(dcp->crtc))
+			schedule_work(&dcp->vblank_wq);
+	}
 	if (dcp->connector) {
 		dcp->connector->connected = 0;
 		drm_edid_free(dcp->connector->drm_edid);
@@ -2459,7 +2476,7 @@ void dcp_link(struct platform_device *pdev, struct apple_crtc *crtc,
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	dcp->crtc = crtc;
+	WRITE_ONCE(dcp->crtc, crtc);
 
 	/*
 	 * Type-C connectors belong to physical ports and are bound by the
@@ -2661,6 +2678,8 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 	}
 }
 
+#define DCP_BL_FALLBACK_DELAY msecs_to_jiffies(2000)
+
 static bool dcp_uses_soft_dpms(struct apple_dcp *dcp)
 {
 	return (dcp_backlight_active(dcp) && dcp_has_panel(dcp)) ||
@@ -2686,6 +2705,11 @@ void dcp_poweron(struct platform_device *pdev)
 				WRITE_ONCE(dcp->crashed, true);
 				return;
 			}
+			/* The powerlog takeover report normally precedes this. */
+			if (dcp_has_panel(dcp))
+				queue_delayed_work(system_freezable_wq,
+						   &dcp->bl_fallback_wq,
+						   DCP_BL_FALLBACK_DELAY);
 		}
 		ret = dcp_backlight_dpms(dcp, true);
 		if (ret)
@@ -2816,8 +2840,14 @@ static void dcp_work_register_backlight(struct work_struct *work)
 	if (ret == -ENODATA)
 		goto out_unlock;
 	if (ret) {
-		dev_err(dcp->dev, "Unable to register backlight device\n");
-		dcp->brightness.maximum = 0;
+		dev_err(dcp->dev, "Unable to register backlight device: %d\n", ret);
+		/*
+		 * The H17P policy encodes the panel ceiling into every present
+		 * and keeps working without a class device; only older
+		 * firmware stops sending brightness here.
+		 */
+		if (!dcp_backlight_active(dcp))
+			dcp->brightness.maximum = 0;
 	}
 
 out_unlock:
@@ -2831,6 +2861,34 @@ static void dcp_work_update_backlight(struct work_struct *work)
 	dcp = container_of(work, struct apple_dcp, bl_update_wq);
 
 	dcp_backlight_update(dcp);
+}
+
+/*
+ * H17P never publishes the panel level, and the loader's level arrives only
+ * as an optional powerlog report.  Without one, register the backlight at
+ * the middle of the panel range.  That value is only reported: no level is
+ * presented until userspace writes one, so the panel keeps the loader's
+ * level.
+ */
+static void dcp_work_backlight_fallback(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work),
+					     struct apple_dcp, bl_fallback_wq);
+	u32 nits = dcp->brightness.maximum / 2;
+	int ret;
+
+	if (READ_ONCE(dcp->quiescing) || READ_ONCE(dcp->crashed) ||
+	    dcp_backlight_active(dcp))
+		return;
+
+	ret = iomfb_configure_backlight_h17p(dcp, dcp->brightness.maximum,
+					     false, 0, true, nits);
+	if (!ret)
+		dev_info(dcp->dev,
+			 "no loader brightness reported; backlight starts at %u nits without a panel change\n",
+			 nits);
+	else if (ret != -EBUSY)
+		dev_warn(dcp->dev, "backlight registration failed: %d\n", ret);
 }
 
 static void dcp_release_piodma_iommu_dev(struct apple_dcp *dcp)
@@ -3443,6 +3501,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		afk_quiesce(dcp->ibootep);
 		afk_quiesce(dcp->systemep);
 		afk_quiesce(dcp->dcpavservep);
+		cancel_delayed_work_sync(&dcp->bl_fallback_wq);
 		if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
 			cancel_work_sync(&dcp->bl_register_wq);
 			cancel_work_sync(&dcp->bl_update_wq);
@@ -3497,6 +3556,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	iomfb_queue_stop(dcp);
 	dcp_release_piodma_iommu_dev(dcp);
 
+	cancel_delayed_work_sync(&dcp->bl_fallback_wq);
 	if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
 		cancel_work_sync(&dcp->bl_register_wq);
 		cancel_work_sync(&dcp->bl_update_wq);
@@ -3527,6 +3587,12 @@ static int dcp_platform_probe(struct platform_device *pdev)
 
 	if (dcp_session_retained(dev))
 		return dev_err_probe(dev, -EBUSY, "Previous live DCP session requires a reboot\n");
+
+	/* Not part of the display subsystem yet; see apple_dcp_usable(). */
+	if (of_device_is_compatible(dev->of_node, "apple,t8140-dcpext")) {
+		dev_info(dev, "external display coprocessor not supported yet\n");
+		return -ENODEV;
+	}
 
 	fw_compat = dcp_check_firmware_version(dev);
 	if (fw_compat == DCP_FIRMWARE_UNKNOWN)
@@ -3585,6 +3651,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			  dcp_placeholder_edid_work);
 	INIT_DELAYED_WORK(&dcp->typec_fabric_retrain_wq,
 			  dcp_typec_retrain_work);
+	INIT_DELAYED_WORK(&dcp->bl_fallback_wq, dcp_work_backlight_fallback);
 	/* Balanced by enable at successful component bind. */
 	disable_delayed_work(&dcp->typec_reconnect_wq);
 	disable_delayed_work(&dcp->placeholder_edid_wq);
@@ -3748,6 +3815,7 @@ static void dcp_platform_shutdown(struct platform_device *pdev)
 		 * its DMA resources alive until the system resets.
 		 */
 		iomfb_queue_stop(dcp);
+		cancel_delayed_work_sync(&dcp->bl_fallback_wq);
 		cancel_work_sync(&dcp->bl_register_wq);
 		cancel_work_sync(&dcp->bl_update_wq);
 		return;
@@ -3756,10 +3824,44 @@ static void dcp_platform_shutdown(struct platform_device *pdev)
 	component_del(&pdev->dev, &dcp_comp_ops);
 }
 
+/*
+ * The display stays powered across system sleep, and the blanking present
+ * queued by the DRM and backlight suspend handlers must reach the firmware
+ * before its mailbox interrupt is suspended.
+ */
+static void dcp_drain_for_sleep(struct apple_dcp *dcp)
+{
+	int pass;
+
+	if (!dcp->hw.adopt_live_session || dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
+		return;
+
+	/*
+	 * A completed present can schedule one more brightness present, and a
+	 * rejected one a delayed retry; run a pending retry now instead of
+	 * letting it fire after the mailbox has suspended.  Four passes cover
+	 * the first attempt and the policy's three retries.
+	 */
+	for (pass = 0; pass < 4; pass++) {
+		flush_delayed_work(&dcp->iomfb.backlight_retry);
+		if (dcp_has_panel(dcp))
+			flush_work(&dcp->bl_update_wq);
+		if (!iomfb_queue_drain(dcp, msecs_to_jiffies(500))) {
+			dev_warn(dcp->dev, "display updates still pending at suspend\n");
+			return;
+		}
+		if (!dcp_backlight_active(dcp) || !dcp_backlight_pending(dcp))
+			return;
+	}
+	dev_warn(dcp->dev, "brightness change still pending at suspend\n");
+}
+
 static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	dcp_drain_for_sleep(dcp);
 	/*
 	 * The Type-C route reports cable removal through
 	 * dcp_dptx_disconnect_oob(). A DP tunnel kept through the sleep stays

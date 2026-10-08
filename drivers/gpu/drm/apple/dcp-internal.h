@@ -335,6 +335,8 @@ struct apple_dcp {
 	struct mutex bl_register_mutex;
 	/* Workqueue for updating the brightness */
 	struct work_struct bl_update_wq;
+	/* Registers the H17P backlight when the loader reports no level. */
+	struct delayed_work bl_fallback_wq;
 
 	/* integrated panel if present */
 	struct dcp_panel panel;
@@ -409,12 +411,17 @@ struct apple_dcp {
 		spinlock_t lock;
 		struct dcp_backlight_state state;
 		void (*kick)(struct apple_dcp *dcp);
+		/* Rate limit for firmware re-send requests. */
+		unsigned long resent_at;
+		bool resent;
 	} backlight;
 
 	/* Staging wire record; serialization never mutates the atomic inputs. */
 	struct dcp_present_h17p present_h17p;
 	struct dcp_present_state_h17p present_state_h17p;
 	DECLARE_BITMAP(unknown_callbacks, IOMFB_MAX_CB);
+	/* Runtime callbacks whose record size has been reported once. */
+	DECLARE_BITMAP(sized_callbacks, IOMFB_MAX_CB);
 
 	/* Serializes H17P transmit preparation with RTKit receive callbacks. */
 	struct {
@@ -452,6 +459,7 @@ int iomfb_configure_backlight_h17p(struct apple_dcp *dcp, u32 maximum,
 				   bool default_valid, u32 default_nits);
 void iomfb_queue_init(struct apple_dcp *dcp);
 void iomfb_queue_stop(struct apple_dcp *dcp);
+bool iomfb_queue_drain(struct apple_dcp *dcp, unsigned long timeout);
 int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction);
 void iomfb_queue_crc_h17p(struct apple_dcp *dcp, u32 swap_id);
 

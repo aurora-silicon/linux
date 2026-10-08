@@ -209,6 +209,8 @@ struct dcp_method_entry {
 
 bool iomfb_validate_callback_h17p(int tag, u32 in_len, u32 out_len);
 struct apple_dcp;
+bool iomfb_check_callback_h17p(struct apple_dcp *dcp, int tag, u32 in_len,
+			       u32 out_len);
 
 typedef bool (*iomfb_cb_handler)(struct apple_dcp *, int, void *, void *);
 
