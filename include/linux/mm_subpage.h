@@ -52,6 +52,15 @@ struct mm_subpage_pool *mm_subpage_cow_pool_get(struct mm_struct *mm,
 void mm_subpage_cow_pool_exit(struct mm_struct *mm);
 bool mm_subpage_cow_folio_matches(struct mm_subpage_pool *pool, struct folio *folio);
 bool mm_subpage_cow_wait_busy_at(struct mm_subpage_pool *pool, unsigned int offset);
+/* Exact physical-slot mask, one owner and folio lock for the entire batch.
+ * slots is indexed by physical offset >> pool shift; only mask bits are set.
+ * Success returns initialized owned slots; errors leave slots untouched.
+ */
+int mm_subpage_alloc_mask_locked(struct mm_subpage_pool *pool, unsigned long mask,
+				struct mm_subpage **slots);
+int mm_subpage_pool_add_folio_mask(struct mm_subpage_pool *pool, struct folio *folio,
+				 unsigned long mask, gfp_t gfp);
+bool mm_subpage_cow_wait_busy_mask(struct mm_subpage_pool *pool, unsigned long mask);
 /* Return an initialized slot with its folio locked; may wait without a pool lock. */
 struct mm_subpage *mm_subpage_alloc_at_locked(struct mm_subpage_pool *pool,
 					    unsigned int offset);

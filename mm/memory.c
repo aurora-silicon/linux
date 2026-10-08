@@ -6375,17 +6375,95 @@ static void map_anon_folio_pte_pf(struct folio *folio, pte_t *pte,
 }
 
 #ifdef CONFIG_MM_SUBPAGE
+/* One native-window batch, initialized and locked before PTE publication. */
+static int anon_subpage_prealloc_mask(struct mm_struct *mm,
+				      struct vm_area_struct *vma, unsigned long addr,
+				      unsigned long mask, bool use_pool, bool *pooled,
+				      struct mm_subpage **slots)
+{
+	struct mm_subpage_pool *pool;
+	struct folio *folio;
+	int err;
+
+retry_private:
+	pool = use_pool ? mm_subpage_cow_pool_get(mm, vma, addr) : NULL;
+	*pooled = pool != NULL;
+	if (!pool)
+		pool = mm_subpage_pool_create_granule(GFP_KERNEL, mm_page_shift(mm));
+	if (!pool)
+		return -ENOMEM;
+	for (;;) {
+		err = mm_subpage_alloc_mask_locked(pool, mask, slots);
+		if (err != -EAGAIN)
+			break;
+		folio = NULL;
+		if (*pooled) {
+			folio = cow_subpage_speculative_folio(mm, vma, addr);
+			if (!folio && mm_subpage_cow_wait_busy_mask(pool, mask)) {
+				cond_resched();
+				continue;
+			}
+		}
+		if (!folio)
+			folio = folio_prealloc(mm, vma, addr, false);
+		if (!folio) {
+			err = -ENOMEM;
+			break;
+		}
+		if (*pooled && !mm_subpage_cow_folio_matches(pool, folio)) {
+			folio_put(folio);
+			mm_subpage_pool_put(pool);
+			use_pool = false;
+			goto retry_private;
+		}
+		err = mm_subpage_pool_add_folio_mask(pool, folio, mask,
+			*pooled ? GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN : GFP_KERNEL);
+		if (*pooled && err == -ENOMEM) {
+			if (mm_subpage_cow_wait_busy_mask(pool, mask)) {
+				folio_put(folio);
+				cond_resched();
+				continue;
+			}
+			err = mm_subpage_pool_add_folio_mask(pool, folio, mask, GFP_KERNEL);
+		}
+		if (err) {
+			folio_put(folio);
+			if (err == -EEXIST) {
+				cond_resched();
+				continue;
+			}
+			break;
+		}
+	}
+	if (!*pooled)
+		mm_subpage_pool_close(pool);
+	mm_subpage_pool_put(pool);
+	return err;
+}
+
+static unsigned long anon_subpage_missing_mask(pte_t *first, unsigned int nr,
+					       unsigned int target, unsigned int offset)
+{
+	unsigned long mask = 0;
+	unsigned int i;
+
+	for (i = 0; i < nr; i++)
+		if (i == target || pte_none(ptep_get(first + i)))
+			mask |= BIT(offset + i);
+	return mask;
+}
+
 static vm_fault_t do_anonymous_subpage(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	struct mm_struct *mm = vma->vm_mm;
 	struct mm_subpage *slots[PAGE_SIZE / MM_SUBPAGE_SIZE] = {};
 	struct vm_page_offset pos = vma_page_offset_at(vma, vmf->address);
-	struct mm_subpage_pool *pool;
 	struct folio *folio;
-	unsigned long start, end, lower;
-	unsigned int first_offset, nr, target, i, mapped = 0;
-	vm_fault_t ret = VM_FAULT_OOM;
+	unsigned long start, end, lower, mask, current_mask, window_mask;
+	unsigned int first_offset, nr, target, i, index, mapped;
+	bool pooled, fresh, force_private = false, retry_private;
+	vm_fault_t ret;
 	pte_t *first;
 	int err;
 
@@ -6394,34 +6472,48 @@ static vm_fault_t do_anonymous_subpage(struct vm_fault *vmf)
 	start = vmf->address - min_t(unsigned long, pos.offset, vmf->address - lower);
 	end = vmf->address + min(PAGE_SIZE - pos.offset,
 		pmd_addr_end_mm(mm, vmf->address, vma->vm_end) - vmf->address);
-	first_offset = pos.offset - (vmf->address - start);
+	first_offset = (pos.offset - (vmf->address - start)) >> mm_page_shift(mm);
 	nr = (end - start) >> mm_page_shift(mm);
 	target = (vmf->address - start) >> mm_page_shift(mm);
-
-	pool = mm_subpage_pool_create_granule(GFP_KERNEL, mm_page_shift(mm));
-	if (!pool)
+	window_mask = GENMASK(first_offset + nr - 1, first_offset);
+retry:
+	/* This optimistic snapshot only selects backing; PTL revalidates it.
+	 * Initial dense faults retain one-folio, whole-window faultaround.
+	 */
+	vmf->pte = pte_offset_map_mm(mm, vmf->pmd, vmf->address);
+	if (!vmf->pte)
+		return 0;
+	mask = anon_subpage_missing_mask(vmf->pte - target, nr, target, first_offset);
+	pte_unmap(vmf->pte);
+	vmf->pte = NULL;
+	err = anon_subpage_prealloc_mask(mm, vma, vmf->address, mask,
+		mask != window_mask && !force_private && !userfaultfd_armed(vma),
+		&pooled, slots);
+	if (err)
 		return VM_FAULT_OOM;
-	/* Supply initialises every byte once, including the unissued slots. */
-	folio = folio_prealloc(mm, vma, vmf->address, false);
-	if (!folio)
-		goto release;
-	err = mm_subpage_pool_add_folio(pool, folio, GFP_KERNEL);
-	if (err) {
-		folio_put(folio);
-		goto release;
-	}
-	for (i = 0; i < nr; i++) {
-		slots[i] = mm_subpage_alloc_at(pool, first_offset + i * mm_page_size(mm));
-		if (IS_ERR(slots[i])) {
-			slots[i] = NULL;
-			goto release;
-		}
-	}
-
+	folio = mm_subpage_folio(slots[__ffs(mask)]);
 	/* PTE references may disappear as soon as we drop the PTL. */
 	folio_get(folio);
-	folio_lock(folio);
+	fresh = !mm_subpage_anon_root(slots[__ffs(mask)]);
+	mapped = 0;
+	retry_private = false;
 	ret = 0;
+	/* Existing owners may need nonlinear identities. Allocate metadata before
+	 * PTL and keep the established fresh-folio fallback on metadata ENOMEM.
+	 */
+	if (!fresh) {
+		for_each_set_bit(index, &mask, ARRAY_SIZE(slots)) {
+			unsigned long address = start +
+				((index - first_offset) << mm_page_shift(mm));
+
+			err = mm_subpage_bind_rmap(slots[index], vma, address);
+			if (err) {
+				ret = err == -ENOMEM ? VM_FAULT_OOM : VM_FAULT_SIGBUS;
+				retry_private = pooled && err == -ENOMEM;
+				goto unlock_folio;
+			}
+		}
+	}
 	vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);
 	if (!vmf->pte)
 		goto unlock_folio;
@@ -6442,20 +6534,30 @@ static vm_fault_t do_anonymous_subpage(struct vm_fault *vmf)
 	}
 
 	first = vmf->pte - target;
+	current_mask = anon_subpage_missing_mask(first, nr, target, first_offset);
+	/* Do not lose newly missing neighbors or publish sparse dense-path supply.
+	 * Return to the fault handler on a racing mask change instead of spinning
+	 * under repeated zaps. No mapping has been published yet.
+	 */
+	if ((current_mask & ~mask) ||
+	    (mask == window_mask && current_mask != mask &&
+	     !force_private && !userfaultfd_armed(vma)))
+		goto unlock_pte;
 	for (i = 0; i < nr; i++) {
 		unsigned long address = start + i * mm_page_size(mm);
 		pte_t entry;
 
-		/* Do not replace existing mappings or userfaultfd markers nearby. */
-		if (i != target && !pte_none(ptep_get(first + i)))
+		index = first_offset + i;
+		if (!(current_mask & BIT(index)))
 			continue;
-		mm_subpage_set_exclusive(slots[i]);
-		err = mm_subpage_add_new_anon_rmap(slots[i], vma, address);
+		mm_subpage_set_exclusive(slots[index]);
+		err = fresh ? mm_subpage_add_new_anon_rmap(slots[index], vma, address) :
+			mm_subpage_add_anon_rmap(slots[index], vma, address);
 		if (WARN_ON_ONCE(err)) {
 			ret = VM_FAULT_SIGBUS;
 			break;
 		}
-		entry = phys_pte_mm(mm, mm_subpage_phys(slots[i]), vma->vm_page_prot);
+		entry = phys_pte_mm(mm, mm_subpage_phys(slots[index]), vma->vm_page_prot);
 		entry = pte_sw_mkyoung(entry);
 		if (vma->vm_flags & VM_WRITE)
 			entry = pte_mkwrite(pte_mkdirty(entry), vma);
@@ -6463,11 +6565,12 @@ static vm_fault_t do_anonymous_subpage(struct vm_fault *vmf)
 			entry = pte_mkuffd_wp(entry);
 		set_pte_at(mm, address, first + i, entry);
 		update_mmu_cache(vma, address, first + i);
-		slots[i] = NULL; /* The PTE now owns the reference. */
+		slots[index] = NULL; /* The PTE now owns the reference. */
 		mapped++;
 	}
 	if (mapped) {
-		subpage_add_new_lru(folio, vma, mapped);
+		if (fresh)
+			subpage_add_new_lru(folio, vma, mapped);
 		add_mm_counter(mm, MM_ANONPAGES, mapped);
 		count_mthp_stat(0, MTHP_STAT_ANON_FAULT_ALLOC);
 	}
@@ -6478,13 +6581,19 @@ unlock_folio:
 	folio_unlock(folio);
 	folio_put(folio);
 release:
-	mm_subpage_pool_close(pool);
-	for (i = 0; i < ARRAY_SIZE(slots); i++)
-		if (slots[i])
+	for (i = 0; i < ARRAY_SIZE(slots); i++) {
+		if (slots[i]) {
 			mm_subpage_put(slots[i]);
-	mm_subpage_pool_put(pool);
+			slots[i] = NULL;
+		}
+	}
+	if (retry_private) {
+		force_private = true;
+		goto retry;
+	}
 	return ret;
 }
+
 #endif
 
 /*

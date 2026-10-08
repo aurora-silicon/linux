@@ -842,16 +842,18 @@ static bool cow_owner_eligible(struct mm_subpage_pool *pool, struct folio *folio
  * normal bounded search, inspect all owners before allowing an OOM-capable
  * allocation: a busy slot farther down the list may require no new charge.
  */
-bool mm_subpage_cow_wait_busy_at(struct mm_subpage_pool *pool, unsigned int offset)
+static bool cow_wait_busy(struct mm_subpage_pool *pool, unsigned long eligible,
+			  bool require_all)
 {
 	struct mm_subpage_owner *owner;
 	struct folio *wait = NULL;
-	unsigned long flags, eligible = offset_mask(pool->shift, offset);
+	unsigned long flags;
 
 	spin_lock_irqsave(&pool->lock, flags);
 	if (!pool->closed && pool->cow_shared && cow_has_free(pool, eligible)) {
 		list_for_each_entry(owner, &pool->available, available) {
 			if (!owner->migrating && (~owner->used & eligible) &&
+			    (!require_all || !(owner->used & eligible)) &&
 			    cow_owner_eligible(pool, owner->folio) &&
 			    !folio_test_swapcache(owner->folio) &&
 			    !folio_test_writeback(owner->folio)) {
@@ -870,8 +872,18 @@ bool mm_subpage_cow_wait_busy_at(struct mm_subpage_pool *pool, unsigned int offs
 	return false;
 }
 
+bool mm_subpage_cow_wait_busy_at(struct mm_subpage_pool *pool, unsigned int offset)
+{
+	return cow_wait_busy(pool, offset_mask(pool->shift, offset), false);
+}
+
+bool mm_subpage_cow_wait_busy_mask(struct mm_subpage_pool *pool, unsigned long mask)
+{
+	return cow_wait_busy(pool, mask, true);
+}
+
 static struct mm_subpage_owner *find_available(struct mm_subpage_pool *pool,
-					      unsigned long eligible)
+					      unsigned long eligible, bool require_all)
 {
 	struct mm_subpage_owner *owner;
 	unsigned int visited = 0;
@@ -893,6 +905,7 @@ static struct mm_subpage_owner *find_available(struct mm_subpage_pool *pool,
 		}
 		/* A nonpresent PTE may still need any of this folio's slot bytes. */
 		if (!owner->migrating && (~owner->used & eligible) &&
+		    (!require_all || !(owner->used & eligible)) &&
 		    (!pool->cow_shared || !folio_test_locked(owner->folio)) &&
 		    cow_owner_eligible(pool, owner->folio) &&
 		    !folio_test_swapcache(owner->folio) &&
@@ -903,7 +916,7 @@ static struct mm_subpage_owner *find_available(struct mm_subpage_pool *pool,
 }
 
 static int pool_add_folio(struct mm_subpage_pool *pool, struct folio *folio,
-			  unsigned long eligible, gfp_t gfp)
+			  unsigned long eligible, bool require_all, gfp_t gfp)
 {
 	struct mm_subpage_owner *owner;
 	unsigned long flags;
@@ -931,7 +944,7 @@ static int pool_add_folio(struct mm_subpage_pool *pool, struct folio *folio,
 	spin_lock_irqsave(&pool->lock, flags);
 	if (pool->closed)
 		ret = -ESHUTDOWN;
-	else if (pool->unissued || find_available(pool, eligible))
+	else if (pool->unissued || find_available(pool, eligible, require_all))
 		/* Another allocator supplied backing while we allocated metadata.
 		 * Preserve the single-unissued-owner invariant even when a shared
 		 * COW lookup skips a concurrently locked or rotating list prefix.
@@ -959,7 +972,7 @@ static int pool_add_folio(struct mm_subpage_pool *pool, struct folio *folio,
 int mm_subpage_pool_add_folio(struct mm_subpage_pool *pool, struct folio *folio,
 			      gfp_t gfp)
 {
-	return pool_add_folio(pool, folio, pool->all_slots, gfp);
+	return pool_add_folio(pool, folio, pool->all_slots, false, gfp);
 }
 
 int mm_subpage_pool_add_folio_at(struct mm_subpage_pool *pool, struct folio *folio,
@@ -969,7 +982,15 @@ int mm_subpage_pool_add_folio_at(struct mm_subpage_pool *pool, struct folio *fol
 
 	if (!eligible)
 		return -EINVAL;
-	return pool_add_folio(pool, folio, eligible, gfp);
+	return pool_add_folio(pool, folio, eligible, false, gfp);
+}
+
+int mm_subpage_pool_add_folio_mask(struct mm_subpage_pool *pool, struct folio *folio,
+				 unsigned long mask, gfp_t gfp)
+{
+	if (!mask || (mask & ~pool->all_slots))
+		return -EINVAL;
+	return pool_add_folio(pool, folio, mask, true, gfp);
 }
 
 unsigned long mm_subpage_pool_backing_pages(struct mm_subpage_pool *pool)
@@ -980,6 +1001,34 @@ unsigned long mm_subpage_pool_backing_pages(struct mm_subpage_pool *pool)
 	pages = pool->backing_pages;
 	spin_unlock_irqrestore(&pool->lock, flags);
 	return pages;
+}
+
+/* Caller holds pool lock; each issued slot owns one native folio reference. */
+static struct mm_subpage *reserve_owner_slot(struct mm_subpage_owner *owner,
+					    unsigned int index, bool *needs_zero)
+{
+	struct mm_subpage_pool *pool = owner->pool;
+	struct mm_subpage *subpage;
+
+	lockdep_assert_held(&pool->lock);
+	if (pool->unissued == owner)
+		/* Transfer the supplied reference to the first reservation. */
+		pool->unissued = NULL;
+	else
+		folio_get(owner->folio);
+	__set_bit(index, &owner->used);
+	cow_update_free(pool, BIT(index), -1);
+	if (needs_zero)
+		*needs_zero = !test_bit(index, &owner->zeroed);
+	__clear_bit(index, &owner->zeroed);
+	if (owner->used == pool->all_slots)
+		list_del_init(&owner->available);
+	subpage = &owner->slots[index];
+	WRITE_ONCE(subpage->lazyfree, false);
+	/* The used bit keeps backing alive while data is initialised. */
+	VM_BUG_ON(refcount_read(&subpage->refs));
+	VM_BUG_ON(atomic_read(&subpage->mapcount));
+	return subpage;
 }
 
 static struct mm_subpage *subpage_reserve(struct mm_subpage_pool *pool,
@@ -996,7 +1045,7 @@ retry:
 		subpage = ERR_PTR(-ESHUTDOWN);
 		goto out;
 	}
-	owner = find_available(pool, eligible);
+	owner = find_available(pool, eligible, false);
 	if (!owner) {
 		subpage = ERR_PTR(-EAGAIN);
 		goto out;
@@ -1029,27 +1078,61 @@ retry:
 			return ERR_PTR(-EAGAIN);
 		}
 	}
-	if (pool->unissued == owner)
-		/* Transfer the supplied reference to the first reservation. */
-		pool->unissued = NULL;
-	else
-		folio_get(owner->folio);
 	index = __ffs(~owner->used & eligible);
-	__set_bit(index, &owner->used);
-	cow_update_free(pool, BIT(index), -1);
-	if (needs_zero)
-		*needs_zero = !test_bit(index, &owner->zeroed);
-	__clear_bit(index, &owner->zeroed);
-	if (owner->used == pool->all_slots)
-		list_del_init(&owner->available);
-	subpage = &owner->slots[index];
-	WRITE_ONCE(subpage->lazyfree, false);
-	/* The used bit keeps backing alive while data is initialised. */
-	VM_BUG_ON(refcount_read(&subpage->refs));
-	VM_BUG_ON(atomic_read(&subpage->mapcount));
+	subpage = reserve_owner_slot(owner, index, needs_zero);
 out:
 	spin_unlock_irqrestore(&pool->lock, flags);
 	return subpage;
+}
+
+/* Reserve one exact-offset batch from one owner, with one folio lock. */
+int mm_subpage_alloc_mask_locked(struct mm_subpage_pool *pool, unsigned long mask,
+				struct mm_subpage **slots)
+{
+	struct mm_subpage_owner *owner;
+	unsigned long flags, zero = 0;
+	unsigned int i;
+	bool needs_zero;
+
+	if (!mask || (mask & ~pool->all_slots))
+		return -EINVAL;
+retry:
+	spin_lock_irqsave(&pool->lock, flags);
+	if (pool->closed) {
+		spin_unlock_irqrestore(&pool->lock, flags);
+		return -ESHUTDOWN;
+	}
+	owner = find_available(pool, mask, true);
+	if (!owner) {
+		spin_unlock_irqrestore(&pool->lock, flags);
+		return -EAGAIN;
+	}
+	if (!folio_trylock(owner->folio)) {
+		/* Parallel faults use another owner rather than queue behind it. */
+		spin_unlock_irqrestore(&pool->lock, flags);
+		cond_resched();
+		goto retry;
+	}
+	if (folio_test_swapcache(owner->folio) || folio_test_writeback(owner->folio) ||
+	    !cow_owner_eligible(pool, owner->folio)) {
+		folio_unlock(owner->folio);
+		spin_unlock_irqrestore(&pool->lock, flags);
+		return -EAGAIN;
+	}
+	for_each_set_bit(i, &mask, SUBPAGES_PER_FOLIO) {
+		slots[i] = reserve_owner_slot(owner, i, &needs_zero);
+		if (needs_zero)
+			zero |= BIT(i);
+	}
+	spin_unlock_irqrestore(&pool->lock, flags);
+	for_each_set_bit(i, &mask, SUBPAGES_PER_FOLIO) {
+		if (zero & BIT(i))
+			clear_user_subpage_range(&owner->folio->page,
+					 i << pool->shift, 1U << pool->shift);
+		/* Zeroing must precede publication, including reused slots. */
+		refcount_set_release(&slots[i]->refs, 1);
+	}
+	return 0;
 }
 
 static struct mm_subpage *subpage_alloc(struct mm_subpage_pool *pool, unsigned long eligible, bool lock_folio)
