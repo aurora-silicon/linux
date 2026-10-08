@@ -388,6 +388,32 @@ void iomfb_queue_stop(struct apple_dcp *dcp)
 	cancel_delayed_work_sync(&dcp->iomfb.backlight_retry);
 }
 
+/*
+ * Wait until every queued transaction, including a present's completion, has
+ * finished.  A stopped or crashed queue has nothing left to deliver.
+ */
+bool iomfb_queue_drain(struct apple_dcp *dcp, unsigned long timeout)
+{
+	unsigned long deadline = jiffies + timeout;
+	bool idle;
+
+	if (!iomfb_uses_queue(dcp))
+		return true;
+
+	for (;;) {
+		mutex_lock(&dcp->iomfb.lock);
+		idle = READ_ONCE(dcp->crashed) || dcp->iomfb.stopped ||
+		       (!dcp->iomfb.active && list_empty(&dcp->iomfb.pending) &&
+			!dcp->present_state_h17p.pending);
+		mutex_unlock(&dcp->iomfb.lock);
+		if (idle)
+			return true;
+		if (time_after(jiffies, deadline))
+			return false;
+		usleep_range(2000, 4000);
+	}
+}
+
 int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction)
 {
 	int ret = 0;
