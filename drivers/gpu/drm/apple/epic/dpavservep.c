@@ -213,8 +213,16 @@ static const struct drm_edid *dcpavserv_read_edid(struct apple_epic_service *ser
 	    data_size > EDID_BUF_SIZE)
 		return ERR_PTR(-EIO);
 
+	/*
+	 * An HDMI 2.x sink using the HF-EEODB announces fewer extension blocks
+	 * in the base block than it sends, so the payload may be longer than
+	 * the base block says. Accept any whole number of blocks at least that
+	 * long and leave the block count to drm_edid, which knows about
+	 * HF-EEODB.
+	 */
 	num_blocks = resp->data[EDID_LEADING_DATA_SIZE + EDID_EXT_BLOCK_COUNT_OFFSET];
-	if ((1 + num_blocks) * EDID_BLOCK_SIZE != data_size - EDID_LEADING_DATA_SIZE)
+	if ((1 + num_blocks) * EDID_BLOCK_SIZE > data_size - EDID_LEADING_DATA_SIZE ||
+	    (data_size - EDID_LEADING_DATA_SIZE) % EDID_BLOCK_SIZE)
 		return ERR_PTR(-EIO);
 
 	return drm_edid_alloc(resp->data + EDID_LEADING_DATA_SIZE,
