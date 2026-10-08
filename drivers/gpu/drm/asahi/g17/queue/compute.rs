@@ -1486,6 +1486,28 @@ pub(crate) trait Host {
 }
 
 impl Queue {
+    /// Snapshot only while publication is closed and firmware is halted.
+    pub(crate) fn recovery_diagnostics(&self) -> impl core::fmt::Debug + '_ {
+        let command = self.active.front().and_then(|active| {
+            if let crate::g17::command::Validated::Compute {
+                cdm_va, cdm_end_va, sampler_count, scratch, ..
+            } = &active.packet.command {
+                Some((*cdm_va, *cdm_end_va, *sampler_count, scratch.enabled()))
+            } else {
+                None
+            }
+        });
+        (
+            self.owner,
+            self.context().map(|context| (context.id(), context.generation())),
+            self.ordinal,
+            self.active.len,
+            self.graph.cursors(),
+            self.graph.stamp(),
+            command,
+        )
+    }
+
     pub(crate) fn spared_pending(&self) -> bool {
         self.quarantined && self.spared_quarantine && self.awaiting_witness
     }
