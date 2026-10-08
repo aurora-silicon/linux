@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Assemble an installer from locally built, hash-matched stack artifacts."""
 import argparse
+import base64
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import re
@@ -13,6 +15,28 @@ HEX = re.compile(r'[0-9a-f]{64}')
 
 def member(path, name):
     return subprocess.check_output(['bsdtar', '-xOf', str(path), name])
+
+def desktop_data(manifest, directory):
+    data = manifest.get('desktop_fixes')
+    if data is None:
+        return ''
+    path = Path(__file__).with_name('desktop-fixes.py')
+    spec = importlib.util.spec_from_file_location('desktop_fixes', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.validate_manifest(data)
+    runtime = {}
+    for name, item in data['packages'].items():
+        module.verify_archive(name, item, directory)
+        if name != 'aquamarine':
+            for path, entry in module.package_contents(directory / item['file']).items():
+                if module.immutable(path):
+                    if path in runtime and runtime[path] != entry:
+                        raise ValueError('paired desktop runtime files conflict')
+                    runtime[path] = entry
+    if runtime != data['omarchy_catalogs']['4.0.4-2']['files']:
+        raise ValueError('guarded runtime catalog differs from the paired package payload')
+    return base64.b64encode(json.dumps(data, sort_keys=True, separators=(',', ':')).encode()).decode()
 
 def assemble(template, manifest, directory):
     if manifest.get('schema') != 'aurora.m3-matched-stack/1': raise ValueError('manifest schema differs')
@@ -63,6 +87,7 @@ def assemble(template, manifest, directory):
     stack_id = hashlib.sha256(json.dumps(manifest,sort_keys=True,separators=(',',':')).encode()).hexdigest()
     s = template
     substitutions = dict(VERSION=manifest['version'],TAG=manifest['tag'],M1N1_BIN_SHA=binary_sha,
+                         DESKTOP_FIXES_DATA=desktop_data(manifest, directory),
                          M3_STACK_ID=stack_id, M3_STAGE1_25_VERSIONS=' '.join(manifest['stage1_25_versions']),
                          M1N1_PACKAGE=pins['m1n1'],M3_PRO_MESA_PACKAGE=pins['mesa'])
     for key,value in substitutions.items():
