@@ -1954,7 +1954,9 @@ T:	git git://anongit.freedesktop.org/drm/drm-misc
 F:	Documentation/devicetree/bindings/chosen/apple,dcp-rtkit-quiesced.yaml
 F:	Documentation/devicetree/bindings/display/apple,dcp.yaml
 F:	Documentation/devicetree/bindings/display/apple,display-subsystem.yaml
+F:	Documentation/gpu/apple-dcp-backlight.rst
 F:	drivers/gpu/drm/apple/
+F:	tools/testing/apple/
 
 APPLE PCIE CONTROLLER DRIVER
 M:	Marc Zyngier <maz@kernel.org>
