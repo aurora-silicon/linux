@@ -1320,6 +1320,8 @@ static int bcm4377_pci_reset(struct bcm4377_data *bcm4377)
 	int ret;
 	int irq;
 
+	/* Keep retrying a full reset if any recovery stage fails. */
+	bcm4377->needs_reset = true;
 	dev_info(&bcm4377->pdev->dev, "performing hardware reset recovery\n");
 
 	irq = pci_irq_vector(bcm4377->pdev, 0);
@@ -1330,10 +1332,11 @@ static int bcm4377_pci_reset(struct bcm4377_data *bcm4377)
 		bcm4377_disable_aspm(bcm4377);
 
 	ret = pci_reset_function(bcm4377->pdev);
-	if (ret)
-		dev_warn(&bcm4377->pdev->dev,
-			 "function level reset failed with %d; trying to continue anyway\n",
-			 ret);
+	if (ret) {
+		dev_err(&bcm4377->pdev->dev,
+			"function level reset failed: %d\n", ret);
+		goto out_irq;
+	}
 
 	msleep(100);
 
