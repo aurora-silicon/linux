@@ -16,6 +16,7 @@
 #include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/unaligned.h>
 
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_drv.h>
@@ -406,6 +407,74 @@ int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction)
 	}
 	mutex_unlock(&dcp->iomfb.lock);
 	return ret;
+}
+
+struct iomfb_crc_transaction {
+	struct iomfb_transaction transaction;
+	u32 swap_id;
+};
+
+static void iomfb_crc_complete(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	struct iomfb_crc_transaction *crc = cookie;
+	struct dcp_packet_header *header;
+	u32 value;
+
+	/* A106 has no input and a single little-endian blend-output CRC. */
+	if (!out)
+		goto invalid;
+	header = out - sizeof(*header);
+	if (header->in_len || header->out_len != sizeof(__le32))
+		goto invalid;
+	value = get_unaligned_le32(out);
+	if (READ_ONCE(dcp->crc_enabled))
+		drm_crtc_add_crc_entry(&dcp->crtc->base, true, crc->swap_id, &value);
+	return;
+
+invalid:
+	dev_err(dcp->dev, "invalid blend CRC response\n");
+	WRITE_ONCE(dcp->crashed, true);
+}
+
+static void iomfb_crc_start(struct apple_dcp *dcp,
+			    struct iomfb_transaction *transaction)
+{
+	static const struct dcp_method_entry method = {
+		.tag = { 'A', '1', '0', '6' },
+		.name = "read_blend_crc",
+	};
+	struct iomfb_crc_transaction *crc = container_of(transaction,
+						       struct iomfb_crc_transaction,
+						       transaction);
+
+	if (READ_ONCE(dcp->crc_enabled))
+		dcp_push(dcp, false, &method, 0, sizeof(__le32), NULL,
+			 iomfb_crc_complete, crc);
+}
+
+static void iomfb_crc_release(struct iomfb_transaction *transaction)
+{
+	kfree(container_of(transaction, struct iomfb_crc_transaction, transaction));
+}
+
+void iomfb_queue_crc_h17p(struct apple_dcp *dcp, u32 swap_id)
+{
+	struct iomfb_crc_transaction *crc;
+
+	lockdep_assert_held(&dcp->iomfb.lock);
+	if (!READ_ONCE(dcp->crc_enabled) || READ_ONCE(dcp->crashed) ||
+	    dcp->iomfb.stopped || dcp->iomfb.queued >= 32)
+		return;
+	crc = kzalloc_obj(*crc);
+	if (!crc)
+		return;
+	crc->swap_id = swap_id;
+	crc->transaction.start = iomfb_crc_start;
+	crc->transaction.release = iomfb_crc_release;
+	/* Read the completed frame before another queued present changes it. */
+	list_add(&crc->transaction.link, &dcp->iomfb.pending);
+	dcp->iomfb.queued++;
+	/* The receiver advances the queue only after acknowledging completion. */
 }
 
 struct iomfb_command {

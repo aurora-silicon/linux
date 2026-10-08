@@ -887,7 +887,7 @@ int dcp_set_crc(struct drm_crtc *crtc, bool enabled)
 	struct apple_crtc *ac = to_apple_crtc(crtc);
 	struct apple_dcp *dcp = platform_get_drvdata(ac->dcp);
 
-	dcp->crc_enabled = enabled;
+	WRITE_ONCE(dcp->crc_enabled, enabled);
 
 	return 0;
 }

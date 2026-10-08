@@ -265,7 +265,13 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 		dcp_release_retained_framebuffers(dcp, resp->swap_id);
 		dcp_drm_crtc_page_flip(dcp, now);
 	}
-	if (dcp->crc_enabled) {
+	if (READ_ONCE(dcp->crc_enabled)) {
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+		if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+			iomfb_queue_crc_h17p(dcp, resp->swap_id);
+			return;
+		}
+#endif
 		u32 crc32 = 0;
 		drm_crtc_add_crc_entry(&dcp->crtc->base, true, resp->swap_id, &crc32);
 	}
