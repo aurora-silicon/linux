@@ -348,7 +348,10 @@ static int apple_qspi_set_frequency(struct apple_qspi *qspi,
 		return -EINVAL;
 
 	divisor = DIV_ROUND_UP(input, requested);
-	divisor = clamp_t(u32, divisor, 2, 256);
+	/* Never exceed the requested clock when it is below our range. */
+	if (divisor > 256)
+		return -EINVAL;
+	divisor = max_t(u32, divisor, 2);
 	apple_qspi_c_write(qspi, APPLE_QSPI_C_CLKDIV, divisor - 1);
 	return 0;
 }
