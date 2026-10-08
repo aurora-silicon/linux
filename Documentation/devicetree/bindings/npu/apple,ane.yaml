@@ -14,7 +14,8 @@ description:
   SoCs. It accesses memory through three DARTs. On T8103 and T6000 the host
   drives the engine through its register window. On T602x and T8112 a
   coprocessor runs the ANE firmware and the host talks to it through an ASC
-  mailbox.
+  mailbox. T8140 has two interrupts and one system power domain; its
+  coprocessor uses a different firmware interface.
 
 properties:
   compatible:
@@ -25,6 +26,7 @@ properties:
       - apple,t6021-ane
       - apple,t6022-ane
       - apple,t8112-ane
+      - apple,t8140-ane
 
   reg:
     minItems: 1
@@ -45,7 +47,8 @@ properties:
       - const: fuse
 
   interrupts:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
 
   interrupt-names:
     items:
@@ -57,8 +60,8 @@ properties:
   power-domains:
     description:
       The power states the engine needs, five on T8103 and T6000, eight on
-      T602x and seven on T8112.
-    minItems: 5
+      T602x, seven on T8112 and one system domain on T8140.
+    minItems: 1
     maxItems: 8
 
   resets:
@@ -80,11 +83,40 @@ required:
   - reg
   - reg-names
   - interrupts
-  - interrupt-names
   - iommus
   - power-domains
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8140-ane
+    then:
+      properties:
+        reg:
+          maxItems: 1
+        reg-names:
+          maxItems: 1
+        interrupts:
+          minItems: 2
+        interrupt-names: false
+        iommus:
+          minItems: 3
+        power-domains:
+          maxItems: 1
+        resets: false
+        mboxes: false
+        memory-region: false
+    else:
+      properties:
+        interrupts:
+          maxItems: 1
+        power-domains:
+          minItems: 5
+      required:
+        - interrupt-names
+
   - if:
       properties:
         compatible:
@@ -149,6 +181,27 @@ allOf:
 additionalProperties: false
 
 examples:
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        ane@400000000 {
+            compatible = "apple,t8140-ane";
+            reg = <0x4 0x0 0x0 0x2000000>;
+            reg-names = "engine";
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 655 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 668 IRQ_TYPE_LEVEL_HIGH>;
+            iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
+            power-domains = <&ps_ane_sys>;
+            status = "disabled";
+        };
+    };
+
   - |
     #include <dt-bindings/interrupt-controller/apple-aic.h>
     #include <dt-bindings/interrupt-controller/irq.h>
