@@ -14,6 +14,7 @@ appledrm-y += dcpext_drm.o
 appledrm-y += iomfb_v12_3.o
 appledrm-y += iomfb_v13_3.o
 appledrm-y += iomfb_v14_7.o iomfb_v14_7_link.o
+appledrm-y += iomfb_v26_6.o iomfb_v26_6_link.o j613_dcp_activate.o
 appledrm-y += epic/dpavservep.o
 appledrm-y += plane.o
 

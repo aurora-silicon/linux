@@ -23,6 +23,7 @@
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
 #include "iomfb_v14_7.h"
+#include "iomfb_v26_6.h"
 #include "epic/dpavservep.h"
 
 #define DCP_MAX_PLANES 4
@@ -41,6 +42,7 @@ enum dcp_firmware_version {
 	DCP_FIRMWARE_V_12_3,
 	DCP_FIRMWARE_V_13_5,
 	DCP_FIRMWARE_V_14_7,
+	DCP_FIRMWARE_V_26_6,
 };
 
 enum {
@@ -180,6 +182,7 @@ struct apple_dcp {
 
 	/* DCP_FIRMWARE_V_14_7 state; outlives this device once RTKit runs. */
 	struct apple_dcp_v14 *v14;
+	struct apple_dcp_v26 *v26;
 
 	/* Coprocessor control register */
 	void __iomem *coproc_reg;

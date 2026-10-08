@@ -815,6 +815,9 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	case DCP_FIRMWARE_V_13_5:
 		ret = iomfb_modeset_v13_3(dcp, crtc_state);
 		break;
+	case DCP_FIRMWARE_V_26_6:
+		ret = iomfb_v26_6_modeset(dcp, crtc_state);
+		break;
 	case DCP_FIRMWARE_V_14_7:
 		ret = iomfb_v14_7_modeset(dcp, crtc_state);
 		break;
@@ -922,6 +925,10 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6) {
+		iomfb_v26_6_flush(dcp, crtc, state);
+		return;
+	}
 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
 		iomfb_v14_7_flush(dcp, crtc, state);
 		return;

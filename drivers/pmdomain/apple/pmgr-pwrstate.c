@@ -48,6 +48,7 @@ struct apple_pmgr_ps {
 	bool force_disable;
 	bool force_reset;
 	bool externally_clocked;
+	bool retained_25g83;
 };
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
@@ -58,6 +59,9 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	int ret;
 	struct apple_pmgr_ps *ps = genpd_to_apple_pmgr_ps(genpd);
 	u32 reg, cur;
+
+	if (ps->retained_25g83)
+		return pstate == APPLE_PMGR_PS_ACTIVE ? 0 : -EBUSY;
 
 	ret = regmap_read(ps->regmap, ps->offset, &reg);
 	if (ret < 0)
@@ -158,6 +162,9 @@ static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned 
 	struct apple_pmgr_ps *ps = rcdev_to_apple_pmgr_ps(rcdev);
 	unsigned long flags;
 
+	if (ps->retained_25g83)
+		return -EBUSY;
+
 	spin_lock_irqsave(&ps->genpd.slock, flags);
 
 	if (ps->genpd.status == GENPD_STATE_OFF)
@@ -180,6 +187,9 @@ static int apple_pmgr_reset_deassert(struct reset_controller_dev *rcdev, unsigne
 {
 	struct apple_pmgr_ps *ps = rcdev_to_apple_pmgr_ps(rcdev);
 	unsigned long flags;
+
+	if (ps->retained_25g83)
+		return -EBUSY;
 
 	spin_lock_irqsave(&ps->genpd.slock, flags);
 
@@ -232,6 +242,25 @@ static int apple_pmgr_reset_xlate(struct reset_controller_dev *rcdev,
 	return 0;
 }
 
+static bool apple_pmgr_retained_25g83(struct device_node *node, u32 offset)
+{
+	struct device_node *dcp;
+	u32 profile, marker;
+	bool retained;
+
+	if (!of_machine_is_compatible("apple,j613") ||
+	    !of_device_is_compatible(node, "apple,t8122-pmgr-pwrstate") ||
+	    (offset != 0x1d8 && offset != 0x208 && offset != 0x10000 &&
+	     offset != 0x450 && offset != 0x458))
+		return false;
+	dcp = of_find_node_by_path("/soc/dcp@28ec00000");
+	retained = dcp &&
+		!of_property_read_u32(dcp, "apple,j613-25g83-profile", &profile) && profile == 1 &&
+		!of_property_read_u32(dcp, "apple,j613-25g83-mapping-handoff", &marker) && marker == 1;
+	of_node_put(dcp);
+	return retained;
+}
+
 static int apple_pmgr_ps_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -266,13 +295,14 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	ps->retained_25g83 = apple_pmgr_retained_25g83(node, ps->offset);
 	ps->genpd.flags |= GENPD_FLAG_IRQ_SAFE;
 	ps->genpd.name = name;
 	ps->genpd.power_on = apple_pmgr_ps_power_on;
 	ps->genpd.power_off = apple_pmgr_ps_power_off;
 
 	ret = of_property_read_u32(node, "apple,min-state", &ps->min_state);
-	if (ret == 0 && ps->min_state <= APPLE_PMGR_PS_ACTIVE)
+	if (!ps->retained_25g83 && ret == 0 && ps->min_state <= APPLE_PMGR_PS_ACTIVE)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_PS_MIN,
 				   FIELD_PREP(APPLE_PMGR_PS_MIN, ps->min_state));
 
@@ -286,6 +316,11 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		ps->externally_clocked = true;
 
 	active = apple_pmgr_ps_is_active(ps);
+	if (ps->retained_25g83) {
+		if (!active)
+			return dev_err_probe(dev, -EBUSY, "inherited domain %s is not active\n", name);
+		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
+	}
 	if (of_property_read_bool(node, "apple,always-on")) {
 		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
 		if (!active) {
@@ -298,7 +333,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	}
 
 	/* Turn on auto-PM if the domain is already on */
-	if (active)
+	if (active && !ps->retained_25g83)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
 				   APPLE_PMGR_AUTO_ENABLE);
 

@@ -1020,16 +1020,32 @@ static struct platform_driver apple_platform_driver = {
 
 static int __init appledrm_register(void)
 {
+	int ret;
 	if (drm_firmware_drivers_only())
 		return -ENODEV;
 
-#if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
-	dcp_audio_register();
-#endif
-	dcp_register();
-	platform_driver_register(&apple_platform_driver);
+	/* A refused experimental profile keeps the boot framebuffer available. */
+	ret = apple_j613_25g83_coldplug();
+	if (ret)
+		pr_info("J613/25G83 display handoff refused: %d; keeping boot framebuffer\n", ret);
 
-	return 0;
+#if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
+	ret = dcp_audio_register();
+	if (ret)
+		return ret;
+#endif
+	ret = dcp_register();
+	if (ret)
+		goto unregister_audio;
+	ret = platform_driver_register(&apple_platform_driver);
+	if (!ret)
+		return 0;
+	dcp_unregister();
+unregister_audio:
+#if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
+	dcp_audio_unregister();
+#endif
+	return ret;
 }
 
 static void __exit appledrm_unregister(void)

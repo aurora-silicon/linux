@@ -93,10 +93,13 @@ int dpavservep_init(struct apple_dcp *dcp);
 int avep_init(struct apple_dcp *dcp);
 
 
-void __init dcp_register(void);
+int __init dcp_register(void);
 void __exit dcp_unregister(void);
 
-void __init dcp_audio_register(void);
+int __init dcp_audio_register(void);
 void __exit dcp_audio_unregister(void);
+
+int apple_j613_25g83_coldplug(void);
+unsigned int apple_j613_25g83_clock_hz(void);
 
 #endif
