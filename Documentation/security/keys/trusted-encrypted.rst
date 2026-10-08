@@ -4,8 +4,10 @@ Trusted and Encrypted Keys
 
 Trusted and Encrypted Keys are two new key types added to the existing kernel
 key ring service.  Both of these new types are variable length symmetric keys,
-and in both cases all keys are created in the kernel, and user space sees,
-stores, and loads only encrypted blobs.  Trusted Keys require the availability
+and keys generated with ``new`` are created in the kernel. User space reads,
+stores, and loads encrypted blobs. The ``import`` command accepts an existing
+plaintext trusted key; see :doc:`apple-sep` for the SEP source and its lifecycle.
+Trusted Keys require the availability
 of a Trust Source for greater security, while Encrypted Keys can be used on any
 system. All user level blobs, are displayed and loaded in hex ASCII for
 convenience, and are integrity verified.
