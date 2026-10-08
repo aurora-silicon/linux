@@ -688,6 +688,9 @@ static void tbnet_connected_work(struct work_struct *work)
 		net->napi_enabled = true;
 	}
 
+	/* An interrupt while NAPI was disabled may have masked the ring. */
+	tb_ring_poll_complete(net->rx_ring.ring);
+
 	ret = tb_xdomain_enable_paths(net->xd, net->local_transmit_path,
 				      net->tx_ring.ring->hop,
 				      net->remote_transmit_path,
