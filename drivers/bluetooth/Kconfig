@@ -27,6 +27,7 @@ config BT_MTK7932_PCIE
 	tristate "J700 MT7932 PCIe Bluetooth transport"
 	depends on BT && PCI && ARCH_APPLE && IOMMU_DMA
 	depends on !KEXEC_CORE
+	depends on MT7932_FULLMAC != n
 	select FW_LOADER
 	help
 	  Support the J700 Bluetooth PCIe function with locally installed firmware
