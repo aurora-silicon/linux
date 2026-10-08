@@ -2224,12 +2224,40 @@ static int apple_pcie_neo_check_memory(struct pci_dev *root)
 	return 0;
 }
 
+/*
+ * Both functions must come out of the bootstrap cold. Check that before they
+ * are published, because publication lets their drivers bind and take over.
+ */
+static int apple_pcie_neo_check_cold(struct apple_pcie *pcie, struct pci_dev *root)
+{
+	struct pci_dev *endpoint;
+	u16 command;
+	int function, ret = 0;
+
+	for (function = 0; function < 2 && !ret; function++) {
+		endpoint = pci_get_slot(root->subordinate, PCI_DEVFN(0, function));
+		if (!endpoint)
+			return -ENODEV;
+		if (pci_read_config_word(endpoint, PCI_COMMAND, &command)) {
+			ret = -EIO;
+		} else {
+			dev_info(pcie->dev, "enumerated %s id=%04x:%04x command=%#x\n",
+				 pci_name(endpoint), endpoint->vendor, endpoint->device, command);
+			if (command & PCI_COMMAND_MASTER) {
+				pci_clear_master(endpoint);
+				ret = -EIO;
+			}
+		}
+		pci_dev_put(endpoint);
+	}
+	return ret;
+}
+
 static int apple_pcie_neo_enumerate(struct pci_host_bridge *bridge)
 {
 	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
-	struct pci_dev *root, *endpoint;
-	u16 command;
-	int function, ret;
+	struct pci_dev *root;
+	int ret;
 
 	root = pci_get_slot(bridge->bus, PCI_DEVFN(0, 0));
 	if (!root)
@@ -2260,37 +2288,16 @@ static int apple_pcie_neo_enumerate(struct pci_host_bridge *bridge)
 		dev_err(pcie->dev, "root memory forwarding unavailable after assignment: %d\n", ret);
 		goto close_config;
 	}
+	ret = apple_pcie_neo_check_cold(pcie, root);
+	if (ret)
+		goto close_config;
 	pci_bus_add_devices(root->subordinate);
-	for (function = 0; function < 2; function++) {
-		endpoint = pci_get_slot(root->subordinate, PCI_DEVFN(0, function));
-		if (!endpoint) {
-			ret = -ENODEV;
-			break;
-		}
-		if (pci_read_config_word(endpoint, PCI_COMMAND, &command)) {
-			ret = -EIO;
-		} else {
-			dev_info(pcie->dev, "enumerated %s id=%04x:%04x command=%#x driver=%s\n",
-				 pci_name(endpoint), endpoint->vendor, endpoint->device, command,
-				 endpoint->driver ? endpoint->driver->name : "unbound");
-			if (command & PCI_COMMAND_MASTER) {
-				/* This experiment never permits endpoint bus mastering. */
-				pci_clear_master(endpoint);
-				ret = -EIO;
-			}
-			if (endpoint->driver)
-				ret = -EBUSY;
-		}
-		pci_dev_put(endpoint);
-		if (ret)
-			break;
-	}
 close_config:
 	if (ret)
 		WRITE_ONCE(pcie->neo_config_ready, false);
 	pci_unlock_rescan_remove();
 	if (!ret)
-		dev_info(pcie->dev, "NEO_ENUMERATION_ONLY_READY; functions0/1 unbound, bus mastering off\n");
+		dev_info(pcie->dev, "radio functions 0/1 published\n");
 out:
 	pci_dev_put(root);
 	return ret;
@@ -2342,7 +2349,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	pcie->dev = dev;
 	pcie->hw = hw;
 	pcie->piodma_supplier = piodma_supplier;
-	if (hw->root_bus_only)
+	if (hw->root_bus_only && !piodma_supplier)
 		dev_info(dev, "root-port probe only; downstream config is blocked\n");
 	pcie->base = devm_platform_ioremap_resource(pdev, 1);
 	if (IS_ERR(pcie->base))
