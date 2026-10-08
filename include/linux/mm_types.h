@@ -1303,6 +1303,8 @@ struct mm_struct {
 #ifdef CONFIG_MM_SUBPAGE
 		/* VM_ACCOUNT granules; global commitment rounds this sum once. */
 		unsigned long committed_user_pages;
+		/* Shared COW slots; never inherited by a forked mm. */
+		struct mm_subpage_cow_pools *cow_subpage_pool;
 #endif
 		unsigned long locked_vm;   /* Locked bytes >> MM_ACCOUNT_SHIFT */
 		atomic64_t    pinned_vm;   /* Pinned native physical pages */

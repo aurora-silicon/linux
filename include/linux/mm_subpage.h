@@ -45,6 +45,21 @@ struct mm_subpage_pool *mm_subpage_pool_create_granule(gfp_t gfp, unsigned int s
 void mm_subpage_pool_get(struct mm_subpage_pool *pool);
 void mm_subpage_pool_put(struct mm_subpage_pool *pool);
 void mm_subpage_pool_close(struct mm_subpage_pool *pool);
+#ifdef CONFIG_MM_SUBPAGE
+/* Optional per-mm pool: default policy, one memory node, matching memcg. */
+struct mm_subpage_pool *mm_subpage_cow_pool_get(struct mm_struct *mm,
+					     struct vm_area_struct *vma, unsigned long address);
+void mm_subpage_cow_pool_exit(struct mm_struct *mm);
+bool mm_subpage_cow_folio_matches(struct mm_subpage_pool *pool, struct folio *folio);
+bool mm_subpage_cow_wait_busy_at(struct mm_subpage_pool *pool, unsigned int offset);
+/* Return an initialized slot with its folio locked; may wait without a pool lock. */
+struct mm_subpage *mm_subpage_alloc_at_locked(struct mm_subpage_pool *pool,
+					    unsigned int offset);
+struct mm_subpage *mm_subpage_copy_at_locked(struct mm_subpage_pool *pool,
+			const struct mm_subpage *source, unsigned int offset);
+#else
+static inline void mm_subpage_cow_pool_exit(struct mm_struct *mm) { }
+#endif
 
 /* Success consumes the folio reference. On error the caller retains it. */
 int mm_subpage_pool_add_folio(struct mm_subpage_pool *pool, struct folio *folio,
