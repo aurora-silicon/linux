@@ -2282,6 +2282,8 @@ static bool bcm4377_hci_wakeup(struct hci_dev *hdev)
 	return device_may_wakeup(&bcm4377->pdev->dev);
 }
 
+static struct workqueue_struct *bcm4377_reset_wq;
+
 struct bcm4377_reset_work {
 	struct work_struct work;
 	struct pci_dev *pdev;
@@ -2330,7 +2332,7 @@ static void bcm4377_hci_reset(struct hci_dev *hdev)
 	bt_dev_err(hdev, "controller not responding, rebinding the driver");
 	rw->pdev = pci_dev_get(bcm4377->pdev);
 	INIT_WORK(&rw->work, bcm4377_reset_work);
-	schedule_work(&rw->work);
+	queue_work(bcm4377_reset_wq, &rw->work);
 }
 
 static void bcm4377_hci_unregister_dev(void *data)
@@ -2643,7 +2645,29 @@ static struct pci_driver bcm4377_pci_driver = {
 	.probe = bcm4377_probe,
 	.driver.pm = &bcm4377_ops,
 };
-module_pci_driver(bcm4377_pci_driver);
+static int __init bcm4377_init(void)
+{
+	int ret;
+
+	bcm4377_reset_wq = alloc_workqueue("bcm4377-reset", WQ_UNBOUND, 0);
+	if (!bcm4377_reset_wq)
+		return -ENOMEM;
+
+	ret = pci_register_driver(&bcm4377_pci_driver);
+	if (ret)
+		destroy_workqueue(bcm4377_reset_wq);
+
+	return ret;
+}
+module_init(bcm4377_init);
+
+static void __exit bcm4377_exit(void)
+{
+	/* Unregister HCI devices before draining the callbacks they queued. */
+	pci_unregister_driver(&bcm4377_pci_driver);
+	destroy_workqueue(bcm4377_reset_wq);
+}
+module_exit(bcm4377_exit);
 
 MODULE_AUTHOR("Sven Peter <sven@svenpeter.dev>");
 MODULE_DESCRIPTION("Bluetooth support for Broadcom 4377/4378/4387/4388 devices");
