@@ -2188,7 +2188,7 @@ impl SepData {
         name: &'static CStr,
         payload: &[u8],
     ) -> Result<transfer::Completed> {
-        if !self.sbio_ready.load(Relaxed) {
+        if self.shutting_down.load(Relaxed) || !self.sbio_ready.load(Relaxed) {
             return Err(ENODEV);
         }
 
@@ -2204,6 +2204,11 @@ impl SepData {
         let mut remaining = time::msecs_to_jiffies(SBIO_TIMEOUT_MS);
         let mut guard = self.sbio_rx.lock();
         loop {
+            if self.shutting_down.load(Relaxed) {
+                guard.abort();
+                let _ = guard.take_done();
+                return Err(ENODEV);
+            }
             if let Some(done) = guard.take_done() {
                 return Ok(done);
             }
@@ -2298,6 +2303,9 @@ impl SepData {
         let mut remaining = time::msecs_to_jiffies(SBIO_TIMEOUT_MS);
         let mut guard = self.sbio_rx.lock();
         loop {
+            if self.shutting_down.load(Relaxed) {
+                return Err(ENODEV);
+            }
             if guard.take_grant() {
                 return Ok(());
             }
@@ -2346,6 +2354,9 @@ impl SepData {
     }
 
     pub(crate) fn bio_open(&self) -> Result<()> {
+        if self.shutting_down.load(Relaxed) {
+            return Err(ENODEV);
+        }
         let mut session = self.bio_session.lock();
         bio::open(&mut session)?;
         drop(session);
@@ -2405,6 +2416,9 @@ impl SepData {
     }
 
     pub(crate) fn bio_ioctl(&self, cmd: u32, arg: usize) -> Result<bio::Handled> {
+        if self.shutting_down.load(Relaxed) {
+            return Err(ENODEV);
+        }
         if cmd == bio::IOC_ATTEST {
             return self.bio_attest(arg);
         }

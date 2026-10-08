@@ -19,6 +19,9 @@
 #include <linux/spi/spi.h>
 #include <linux/unaligned.h>
 
+#include <linux/mutex.h>
+#include <linux/slab.h>
+
 #include "shim.h"
 
 /* The board selects the SPI mode; an override is diagnostic only. */
@@ -34,6 +37,28 @@ MODULE_PARM_DESC(sensor_spi_mode,
 
 #define SEP_SENSOR_OFF_DELAY_MS	10
 #define SEP_SENSOR_ON_DELAY_MS	7
+
+struct sep_sensor_lifetime {
+	/* Serializes sensor operations with this device's resource teardown. */
+	struct mutex lock;
+};
+
+static DEFINE_MUTEX(sep_sensor_registry_lock);
+static struct sep_sensor_lifetime *sep_active_sensor;
+
+static struct sep_sensor_lifetime *sep_lock_sensor(void)
+{
+	struct sep_sensor_lifetime *sensor;
+
+	mutex_lock(&sep_sensor_registry_lock);
+	sensor = sep_active_sensor;
+	if (sensor)
+		mutex_lock(&sensor->lock);
+	mutex_unlock(&sep_sensor_registry_lock);
+	return sensor;
+}
+
+static void sep_sensor_irq_teardown_locked(void);
 
 static struct spi_device *sep_spi;
 static struct gpio_desc *sep_power;
@@ -377,7 +402,7 @@ static int sep_apply_cs_timing(struct spi_device *spi)
 	return 0;
 }
 
-static int sep_sensor_probe(struct spi_device *spi)
+static int sep_sensor_probe_locked(struct spi_device *spi)
 {
 	int rc;
 
@@ -399,11 +424,41 @@ static int sep_sensor_probe(struct spi_device *spi)
 	return 0;
 }
 
+static int sep_sensor_probe(struct spi_device *spi)
+{
+	struct sep_sensor_lifetime *sensor;
+	int error;
+
+	sensor = devm_kzalloc(&spi->dev, sizeof(*sensor), GFP_KERNEL);
+	if (!sensor)
+		return -ENOMEM;
+	mutex_init(&sensor->lock);
+	mutex_lock(&sep_sensor_registry_lock);
+	if (sep_active_sensor) {
+		error = -EBUSY;
+	} else {
+		error = sep_sensor_probe_locked(spi);
+		if (!error) {
+			spi_set_drvdata(spi, sensor);
+			sep_active_sensor = sensor;
+		}
+	}
+	mutex_unlock(&sep_sensor_registry_lock);
+	return error;
+}
+
 static void sep_sensor_remove(struct spi_device *spi)
 {
-	sep_sensor_irq_teardown();
+	struct sep_sensor_lifetime *sensor = spi_get_drvdata(spi);
+
+	mutex_lock(&sep_sensor_registry_lock);
+	mutex_lock(&sensor->lock);
+	sep_active_sensor = NULL;
+	sep_sensor_irq_teardown_locked();
 	sep_release_power();
 	sep_spi = NULL;
+	mutex_unlock(&sensor->lock);
+	mutex_unlock(&sep_sensor_registry_lock);
 }
 
 /*
@@ -460,19 +515,19 @@ void sep_sensor_unregister(void)
 	sep_registered = false;
 }
 
-int sep_sensor_bound(void)
+static int sep_sensor_bound_locked(void)
 {
 	return sep_spi != NULL;
 }
 
 /* Whether those delays reach hardware, are emulated, or are silently bypassed. */
-int sep_sensor_cs_timing_mode(void)
+static int sep_sensor_cs_timing_mode_locked(void)
 {
 	return sep_cs_timing_mode;
 }
 
 /* Power cycle: off, 10 ms, on, 7 ms. -ENODEV if there is no power line. */
-int sep_sensor_power_cycle(void)
+static int sep_sensor_power_cycle_locked(void)
 {
 	if (sep_power_source == SEP_POWER_SMC_RAILS) {
 		int rc = sep_smc_set_power(0);
@@ -497,12 +552,12 @@ int sep_sensor_power_cycle(void)
 }
 
 /* How the power line was obtained: none, the node's property, or chip+line. */
-int sep_sensor_power_source(void)
+static int sep_sensor_power_source_locked(void)
 {
 	return sep_power_source;
 }
 
-int sep_sensor_power_line(void)
+static int sep_sensor_power_line_locked(void)
 {
 	if (sep_power_source == SEP_POWER_SMC_RAILS)
 		return -ENODEV;
@@ -516,7 +571,7 @@ int sep_sensor_power_line(void)
  * the sensor node's "firmware-name" property. NULL when absent, so the caller
  * can fall back to a default.
  */
-const char *sep_sensor_firmware_name(void)
+static const char *sep_sensor_firmware_name_locked(void)
 {
 	const char *name = NULL;
 
@@ -528,7 +583,7 @@ const char *sep_sensor_firmware_name(void)
 }
 
 /* Powers the sensor on/off, holding the hardware settling delay. */
-int sep_sensor_power(int on)
+static int sep_sensor_power_locked(int on)
 {
 	if (sep_power_source == SEP_POWER_SMC_RAILS) {
 		int rc = sep_smc_set_power(on ? 1 : 0);
@@ -567,7 +622,7 @@ static irqreturn_t sep_drdy_isr(int irq, void *dev_id)
  * firmware patch. Returns 0 when an interrupt is available, -errno otherwise
  * (the caller then falls back to polling).
  */
-int sep_sensor_irq_setup(void)
+static int sep_sensor_irq_setup_locked(void)
 {
 	struct device_node *np;
 	struct gpio_device *gdev;
@@ -640,7 +695,7 @@ int sep_sensor_irq_setup(void)
 	return 0;
 }
 
-void sep_sensor_irq_teardown(void)
+static void sep_sensor_irq_teardown_locked(void)
 {
 	if (sep_drdy_irq >= 0) {
 		free_irq(sep_drdy_irq, sep_spi);
@@ -652,14 +707,14 @@ void sep_sensor_irq_teardown(void)
 	}
 }
 
-int sep_sensor_irq_available(void)
+static int sep_sensor_irq_available_locked(void)
 {
 	return sep_drdy_irq >= 0;
 }
 
 /* Clear any stale signal before a capture so the next wait reflects a fresh
  * data-ready edge, not a leftover from the previous frame. */
-void sep_sensor_irq_arm(void)
+static void sep_sensor_irq_arm_locked(void)
 {
 	if (sep_drdy_irq >= 0)
 		reinit_completion(&sep_drdy_done);
@@ -670,7 +725,7 @@ void sep_sensor_irq_arm(void)
  * -ETIMEDOUT = no signal (the caller re-polls status over SPI regardless, so a
  * missed interrupt only costs one poll interval), -ENODEV = no interrupt.
  */
-int sep_sensor_irq_wait(unsigned int timeout_ms)
+static int sep_sensor_irq_wait_locked(unsigned int timeout_ms)
 {
 	if (sep_drdy_irq < 0)
 		return -ENODEV;
@@ -685,7 +740,7 @@ int sep_sensor_irq_wait(unsigned int timeout_ms)
  * `len` transmit bytes (trailing ones as 0xff) rather than relying on the
  * controller running its transmit buffer dry.
  */
-int sep_sensor_xfer(const void *tx, void *rx, size_t len)
+static int sep_sensor_xfer_locked(const void *tx, void *rx, size_t len)
 {
 	struct spi_transfer xfer = {
 		.tx_buf = tx,
@@ -708,7 +763,7 @@ int sep_sensor_xfer(const void *tx, void *rx, size_t len)
  * A simultaneous receive changes the long transfer's pacing and the sensor
  * rejects the patch blob, so the receive must be absent entirely.
  */
-int sep_sensor_xfer_tx(const void *tx, size_t len)
+static int sep_sensor_xfer_tx_locked(const void *tx, size_t len)
 {
 	struct spi_transfer xfer = {
 		.tx_buf = tx,
@@ -730,7 +785,7 @@ int sep_sensor_xfer_tx(const void *tx, size_t len)
  * Two transfers in one chip-select assertion: command out, then read in.
  * Chip-select stays asserted because neither transfer sets cs_change.
  */
-int sep_sensor_xfer2(const void *tx, size_t tx_len, void *rx, size_t rx_len)
+static int sep_sensor_xfer2_locked(const void *tx, size_t tx_len, void *rx, size_t rx_len)
 {
 	struct spi_transfer xfers[2] = {
 		{
@@ -753,4 +808,180 @@ int sep_sensor_xfer2(const void *tx, size_t tx_len, void *rx, size_t rx_len)
 		return -EINVAL;
 
 	return spi_sync_transfer(sep_spi, xfers, 2);
+}
+
+int sep_sensor_bound(void)
+{
+	struct sep_sensor_lifetime *sensor = sep_lock_sensor();
+	int result;
+
+	if (!sensor)
+		return 0;
+	result = sep_sensor_bound_locked();
+	mutex_unlock(&sensor->lock);
+	return result;
+}
+
+int sep_sensor_cs_timing_mode(void)
+{
+	struct sep_sensor_lifetime *sensor = sep_lock_sensor();
+	int result;
+
+	if (!sensor)
+		return 0;
+	result = sep_sensor_cs_timing_mode_locked();
+	mutex_unlock(&sensor->lock);
+	return result;
+}
+
+int sep_sensor_power_cycle(void)
+{
+	struct sep_sensor_lifetime *sensor = sep_lock_sensor();
+	int result;
+
+	if (!sensor)
+		return -ENODEV;
+	result = sep_sensor_power_cycle_locked();
+	mutex_unlock(&sensor->lock);
+	return result;
+}
+
+int sep_sensor_power_source(void)
+{
+	struct sep_sensor_lifetime *sensor = sep_lock_sensor();
+	int result;
+
+	if (!sensor)
+		return 0;
+	result = sep_sensor_power_source_locked();
+	mutex_unlock(&sensor->lock);
+	return result;
+}
+
+int sep_sensor_power_line(void)
+{
+	struct sep_sensor_lifetime *sensor = sep_lock_sensor();
+	int result;
+
+	if (!sensor)
+		return -ENODEV;
+	result = sep_sensor_power_line_locked();
+	mutex_unlock(&sensor->lock);
+	return result;
+}
+
+const char *sep_sensor_firmware_name(void)
+{
+	struct sep_sensor_lifetime *sensor = sep_lock_sensor();
+	const char *result;
+
+	if (!sensor)
+		return NULL;
+	result = sep_sensor_firmware_name_locked();
+	mutex_unlock(&sensor->lock);
+	return result;
+}
+
+int sep_sensor_power(int on)
+{
+	struct sep_sensor_lifetime *sensor = sep_lock_sensor();
+	int result;
+
+	if (!sensor)
+		return -ENODEV;
+	result = sep_sensor_power_locked(on);
+	mutex_unlock(&sensor->lock);
+	return result;
+}
+
+int sep_sensor_irq_setup(void)
+{
+	struct sep_sensor_lifetime *sensor = sep_lock_sensor();
+	int result;
+
+	if (!sensor)
+		return -ENODEV;
+	result = sep_sensor_irq_setup_locked();
+	mutex_unlock(&sensor->lock);
+	return result;
+}
+
+void sep_sensor_irq_teardown(void)
+{
+	struct sep_sensor_lifetime *sensor = sep_lock_sensor();
+
+	if (!sensor)
+		return;
+	sep_sensor_irq_teardown_locked();
+	mutex_unlock(&sensor->lock);
+}
+
+int sep_sensor_irq_available(void)
+{
+	struct sep_sensor_lifetime *sensor = sep_lock_sensor();
+	int result;
+
+	if (!sensor)
+		return 0;
+	result = sep_sensor_irq_available_locked();
+	mutex_unlock(&sensor->lock);
+	return result;
+}
+
+void sep_sensor_irq_arm(void)
+{
+	struct sep_sensor_lifetime *sensor = sep_lock_sensor();
+
+	if (!sensor)
+		return;
+	sep_sensor_irq_arm_locked();
+	mutex_unlock(&sensor->lock);
+}
+
+int sep_sensor_irq_wait(unsigned int timeout_ms)
+{
+	struct sep_sensor_lifetime *sensor = sep_lock_sensor();
+	int result;
+
+	if (!sensor)
+		return -ENODEV;
+	result = sep_sensor_irq_wait_locked(timeout_ms);
+	mutex_unlock(&sensor->lock);
+	return result;
+}
+
+int sep_sensor_xfer(const void *tx, void *rx, size_t len)
+{
+	struct sep_sensor_lifetime *sensor = sep_lock_sensor();
+	int result;
+
+	if (!sensor)
+		return -ENODEV;
+	result = sep_sensor_xfer_locked(tx, rx, len);
+	mutex_unlock(&sensor->lock);
+	return result;
+}
+
+int sep_sensor_xfer_tx(const void *tx, size_t len)
+{
+	struct sep_sensor_lifetime *sensor = sep_lock_sensor();
+	int result;
+
+	if (!sensor)
+		return -ENODEV;
+	result = sep_sensor_xfer_tx_locked(tx, len);
+	mutex_unlock(&sensor->lock);
+	return result;
+}
+
+int sep_sensor_xfer2(const void *tx, size_t tx_len, void *rx, size_t rx_len)
+{
+	struct sep_sensor_lifetime *sensor = sep_lock_sensor();
+	int result;
+
+	if (!sensor)
+		return -ENODEV;
+	result = sep_sensor_xfer2_locked(tx, tx_len, rx, rx_len);
+	mutex_unlock(&sensor->lock);
+	return result;
 }

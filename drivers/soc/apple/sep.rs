@@ -1005,6 +1005,9 @@ impl SepData {
     }
 
     fn send(&self, msg: Message) -> Result<()> {
+        if self.shutting_down.load(Relaxed) {
+            return Err(ENODEV);
+        }
         self.mbox.lock().as_ref().ok_or(ENODEV)?.send(msg, false)
     }
 
@@ -1021,6 +1024,10 @@ impl SepData {
         let mut remaining = time::msecs_to_jiffies(op.timeout_ms());
         let mut guard = self.control.lock();
         loop {
+            if self.shutting_down.load(Relaxed) {
+                guard.abandon(idx);
+                return Err(ENODEV);
+            }
             if let Some(reply) = guard.take_reply(idx) {
                 guard.release(idx);
                 drop(guard);
@@ -1448,7 +1455,8 @@ impl SepData {
         let mut remaining = time::msecs_to_jiffies(ms);
         let mut guard = self.scrd_probe.lock();
         loop {
-            if guard.captured.len() >= until || remaining == 0 {
+            if self.shutting_down.load(Relaxed)
+                || guard.captured.len() >= until || remaining == 0 {
                 return;
             }
             match self
@@ -1916,16 +1924,16 @@ impl SepData {
 
     fn remove(&self) {
         self.shutting_down.store(true, Relaxed);
-        self.release_firmware_mapping();
+        bio::release(&mut self.bio_session.lock());
+        self.rng_shutdown.store(true, Relaxed);
+        self.control_wq.notify_all();
+        self.sbio_wq.notify_all();
+        self.sks_wq.notify_all();
+        self.scrd_wq.notify_all();
         trusted::unregister();
         self.unregister_fv_kernel();
 
         let dev = self.bio_dev.lock().take();
-        if dev.is_some() {
-            bio::release(&mut self.bio_session.lock());
-            sensor::power(false);
-            sensor::unregister_driver();
-        }
         drop(dev);
 
         self.rng_shutdown.store(true, Relaxed);
@@ -1949,6 +1957,10 @@ impl SepData {
                 DelayedWork::raw_as_work(core::ptr::addr_of!(self.settle_work)).cast(),
             );
         }
+
+        sensor::power(false);
+        sensor::unregister_driver();
+        self.release_firmware_mapping();
 
         let _ = self.store.lock().take();
         let _ = self.host_store.lock().take();

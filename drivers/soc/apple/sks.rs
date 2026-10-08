@@ -884,7 +884,8 @@ impl SepData {
         let mut remaining = time::msecs_to_jiffies(ms);
         let mut guard = self.sks_probe.lock();
         loop {
-            if guard.captured.len() >= until || remaining == 0 {
+            if self.shutting_down.load(Relaxed)
+                || guard.captured.len() >= until || remaining == 0 {
                 return;
             }
             match self
