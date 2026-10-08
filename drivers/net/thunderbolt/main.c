@@ -387,12 +387,11 @@ static void tbnet_disable_napi(struct tbnet *net)
 
 static void tbnet_tear_down(struct tbnet *net, bool send_logout)
 {
-	netif_carrier_off(net->dev);
-	netif_stop_queue(net->dev);
-
 	stop_login(net);
 
 	mutex_lock(&net->connection_lock);
+	netif_carrier_off(net->dev);
+	netif_stop_queue(net->dev);
 
 	if (net->rings_started) {
 		int ret, retries = TBNET_LOGOUT_RETRIES;
