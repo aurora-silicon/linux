@@ -1333,7 +1333,7 @@ impl Drop for Runtime {
             self.fail_all(ENODEV);
         }
         self.inner.state.health.mark_failed();
-        if self.inner.gpu_pending {
+        if !crate::g16_profile::may_release_runtime(self.inner.gpu_pending, true) {
             // Stopping ASC alone does not stop GPU DMA. Keep the complete
             // transport, mappings, GEM objects and PMP vote until reboot.
             // The leaked callback graph must pin the module's code too.
@@ -1345,10 +1345,11 @@ impl Drop for Runtime {
             dev_err!(self.inner.drm.as_ref(), "G16G: GPU retirement unproven; retaining runtime until reboot\n");
             return;
         }
-        if let Err(error) = self.inner.device.stop_asc() {
+        let stopped = self.inner.device.stop_asc();
+        if !crate::g16_profile::may_release_runtime(self.inner.gpu_pending, stopped.is_ok()) {
             // SAFETY: same retained callback/code lifetime as the DMA case.
             unsafe { kernel::bindings::__module_get(crate::THIS_MODULE.as_ptr()) };
-            dev_err!(self.inner.drm.as_ref(), "G16G: ASC failed to stop; retaining runtime backing ({:?})\n", error);
+            dev_err!(self.inner.drm.as_ref(), "G16G: ASC failed to stop; retaining runtime backing ({:?})\n", stopped);
             return;
         }
         // SAFETY: no GPU work is pending, and stop_asc succeeded above.

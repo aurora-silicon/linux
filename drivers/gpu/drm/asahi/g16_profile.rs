@@ -37,6 +37,11 @@ pub(crate) fn selected(pdev: &kernel::platform::Device<kernel::device::Core>) ->
     Ok(true)
 }
 
+/// Only a stopped ASC with proven GPU retirement may release firmware backing.
+pub(crate) fn may_release_runtime(gpu_pending: bool, asc_stopped: bool) -> bool {
+    !gpu_pending && asc_stopped
+}
+
 /// Positive acknowledgement of the command ABI, in addition to GET_PARAMS coverage.
 pub(crate) fn client_admitted(hal: u32, flags: u32, covered: bool) -> bool {
     covered && flags == if hal == 200 { 1 } else { 0 }
@@ -121,6 +126,13 @@ pub(crate) fn calibration_words<E>(tables: &Tables, sram_k: u32, base: usize,
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_stop_or_unproven_retirement_retains_firmware_ownership() {
+        assert!(may_release_runtime(false,true));
+        assert!(!may_release_runtime(false,false));
+        assert!(!may_release_runtime(true,true));
+        assert!(!may_release_runtime(true,false));
+    }
     #[test]
     fn client_acknowledgement_is_profile_specific() {
         assert!(client_admitted(200,1,true));
