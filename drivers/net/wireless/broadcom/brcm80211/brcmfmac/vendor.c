@@ -64,25 +64,14 @@ static int brcmf_cfg80211_vndr_cmds_dcmd_handler(struct wiphy *wiphy,
 		*(char *)(dcmd_buf + len)  = '\0';
 	}
 
-	/* Return the firmware's own BCME_* code instead of the -EBADE that
-	 * brcmf_fil_cmd_data() collapses every failure to. Without this a
-	 * probe cannot tell "no such iovar" from "bad argument" from "not
-	 * up", which is most of what a probe needs to know.
-	 */
-	ifp->fwil_fwerr = true;
 	if (cmdhdr->set)
 		ret = brcmf_fil_cmd_data_set(ifp, cmdhdr->cmd, dcmd_buf,
 					     ret_len);
 	else
 		ret = brcmf_fil_cmd_data_get(ifp, cmdhdr->cmd, dcmd_buf,
 					     ret_len);
-	ifp->fwil_fwerr = false;
-	if (ret != 0) {
-		brcmf_err("dcmd %u ifidx=%d %s: firmware error %d\n",
-			  cmdhdr->cmd, ifp->ifidx,
-			  cmdhdr->set ? "set" : "get", ret);
+	if (ret != 0)
 		goto exit;
-	}
 
 	wr_pointer = dcmd_buf;
 	while (ret_len > 0) {
@@ -124,6 +113,7 @@ static int brcmf_cfg80211_vndr_cmds_awdl_handler(struct wiphy *wiphy,
 	struct net_device *ndev;
 	struct wireless_dev *awdl_wdev;
 	u32 op;
+	int err;
 
 	if (len < sizeof(op))
 		return -EINVAL;
@@ -146,10 +136,13 @@ static int brcmf_cfg80211_vndr_cmds_awdl_handler(struct wiphy *wiphy,
 		if (!ndev)
 			return -ENODEV;
 		awdl_wdev = ndev->ieee80211_ptr;
-		dev_put(ndev);
-		if (!awdl_wdev)
+		if (!awdl_wdev || awdl_wdev->wiphy != wiphy) {
+			dev_put(ndev);
 			return -ENODEV;
-		return brcmf_awdl_del_vif(wiphy, awdl_wdev);
+		}
+		err = brcmf_awdl_del_vif(wiphy, awdl_wdev);
+		dev_put(ndev);
+		return err;
 	default:
 		return -EINVAL;
 	}

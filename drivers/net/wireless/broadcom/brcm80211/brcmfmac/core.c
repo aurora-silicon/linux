@@ -333,13 +333,15 @@ __be16 brcmf_rx_eth_type_trans(struct brcmf_if *ifp, struct sk_buff *skb)
  * already carrying a length field (raw AF_PACKET senders that build the
  * encapsulation themselves) pass unchanged. Caller guarantees headroom.
  */
-static void brcmf_awdl_encap(struct brcmf_if *ifp, struct sk_buff *skb)
+static int brcmf_awdl_encap(struct brcmf_if *ifp, struct sk_buff *skb)
 {
 	const struct ethhdr *eh = (const struct ethhdr *)skb->data;
 	u8 *hdr;
 
 	if (ntohs(eh->h_proto) < ETH_P_802_3_MIN)
-		return;
+		return 0;
+	if (skb->len - ETH_HLEN + BRCMF_AWDL_ENCAP_LEN > ETH_DATA_LEN)
+		return -EMSGSIZE;
 
 	hdr = skb_push(skb, BRCMF_AWDL_ENCAP_LEN);
 	memmove(hdr, hdr + BRCMF_AWDL_ENCAP_LEN, 2 * ETH_ALEN);
@@ -349,6 +351,7 @@ static void brcmf_awdl_encap(struct brcmf_if *ifp, struct sk_buff *skb)
 			   hdr + ETH_HLEN + sizeof(brcmf_awdl_snap));
 	hdr[ETH_HLEN + sizeof(brcmf_awdl_snap) + 2] = 0;
 	hdr[ETH_HLEN + sizeof(brcmf_awdl_snap) + 3] = 0;
+	return 0;
 }
 
 static netdev_tx_t brcmf_netdev_start_xmit(struct sk_buff *skb,
@@ -430,8 +433,13 @@ static netdev_tx_t brcmf_netdev_start_xmit(struct sk_buff *skb,
 	/* set pacing shift for packet aggregation */
 	sk_pacing_shift_update(skb->sk, 8);
 
-	if (ifp->is_awdl)
-		brcmf_awdl_encap(ifp, skb);
+	if (ifp->is_awdl) {
+		ret = brcmf_awdl_encap(ifp, skb);
+		if (ret) {
+			brcmf_txfinalize(ifp, skb, false);
+			goto done;
+		}
+	}
 
 	ret = brcmf_proto_tx_queue_data(drvr, ifp->ifidx, skb);
 	if (ret < 0)
@@ -772,8 +780,12 @@ int brcmf_net_attach(struct brcmf_if *ifp, bool locked)
 					: &brcmf_netdev_ops_pri;
 
 	ndev->needed_headroom += drvr->hdrlen;
-	if (ifp->is_awdl)
+	if (ifp->is_awdl) {
 		ndev->needed_headroom += BRCMF_AWDL_ENCAP_LEN;
+		/* The 802.3 length includes the AWDL envelope. */
+		ndev->max_mtu = ETH_DATA_LEN - BRCMF_AWDL_ENCAP_LEN;
+		ndev->mtu = ndev->max_mtu;
+	}
 	ndev->ethtool_ops = &brcmf_ethtool_ops;
 
 	/* set the mac address & netns */
@@ -1612,14 +1624,18 @@ void brcmf_detach(struct device *dev)
 #endif
 
 	brcmf_bus_change_state(bus_if, BRCMF_BUS_DOWN);
+	/* Stop event producers before draining their worker. */
+	brcmf_bus_stop(drvr->bus_if);
+	/* Drain IF events before their interfaces and protocol state go away. */
+	brcmf_fweh_detach(drvr);
+	if (drvr->config)
+		brcmf_cfg80211_awdl_stop(drvr->config);
 	/* make sure primary interface removed last */
 	for (i = BRCMF_MAX_IFS - 1; i > -1; i--) {
 		if (drvr->iflist[i])
 			brcmf_remove_interface(drvr->iflist[i], false);
 	}
-	brcmf_bus_stop(drvr->bus_if);
 
-	brcmf_fweh_detach(drvr);
 	brcmf_proto_detach(drvr);
 
 	if (drvr->mon_if) {
