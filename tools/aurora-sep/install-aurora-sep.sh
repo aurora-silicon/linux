@@ -559,6 +559,14 @@ M3_AIR_DEFAULT_VARIANT="air-handoff-12"
 # when its owner runs it. Their sources are tools/aurora-sep/air-gpu/ in this repository. The
 # Mesa they run with is mesa-m3, which every M3 Air gets (see the M3's Mesa below).
 M3_GPU_EXPERIMENT=0
+M3_GPU_PERSISTENT=0
+M3_GPU_PROFILE=legacy
+M3_STACK_ID=""
+M3_STAGE1_25_VERSIONS=""
+M3_MESA_NATIVE_MARKER=/opt/mesa-m3/25g83/share/mesa-m3/profile
+M3_PROFILE_SELECTOR=j613-25g83-hal200
+M3_BOOT_PROFILE_HELPER=/usr/local/libexec/aurora-m3-boot-profile
+M3_GPU_PROFILE_FILE=/etc/mesa-m3/t8122-profile
 M3_GPU_BIN=/usr/local/bin
 M3_GPU_SCRIPTS=(
   "air-gpu-oneshot.sh d0259869b8519439a4dbcdae08ef1b0e17fdcaf84ac746fca61febf6a325f8aa"
@@ -815,6 +823,14 @@ m3_air_switches_off() {
 
 # The Air's switches before its owner's off switches.
 m3_air_switch_set() {
+  if ((M3_GPU_PERSISTENT)); then
+    if [[ $M3_GPU_PROFILE == j613-25g83 ]]; then
+      echo "chosen.asahi,t8122-dcp=1 chosen.asahi,t8122-gpu=1"
+    else
+      echo "chosen.asahi,t8122-dcp=1 chosen.asahi,t8122-gpu=1 chosen.asahi,t8122-gpu-power-standin=1 chosen.asahi,t8122-gpu-fuse-leakage=1"
+    fi
+    return 0
+  fi
   if m3_air_default; then
     echo "$M3_AIR_SWITCHES"
   elif [[ $M3_AIR_DRY_RUN == 1 ]]; then
@@ -876,6 +892,7 @@ m1n1_version() {
 
 # What the handoff does on this Mac, for messages.
 m3_handoff_name() {
+  if ((M3_GPU_PERSISTENT)); then echo "experimental J613 $M3_GPU_PROFILE GPU/display handoff"; return; fi
   if ! is_m3_air; then
     echo "M3 Pro display and GPU handoff"
   elif m3_air_default; then
@@ -895,6 +912,7 @@ m3_handoff_name() {
 # with; nothing when it is. The installer's stub_info.json names the stub's
 # macOS version, and m1n1 reports the stub's iBoot.
 m3_stub_problem() {
+  if [[ $M3_GPU_PROFILE == j613-25g83 ]]; then m3_25_boot_problem; return; fi
   local iboot bootbin info="" version=""
   iboot=$({ tr -d '\0' <"$DT/chosen/asahi,iboot2-version"; } 2>/dev/null) || iboot=""
   if bootbin=$(esp_bootbin); then
@@ -912,12 +930,29 @@ m3_stub_problem() {
 
 # Why this Mac's m1n1 stage 1 isn't one the M3 m1n1 is checked with (see
 # M3_STAGE1_VERSIONS); nothing when it is.
+# Clean v1.6.1 has the same base/entry/BootArgs chainload ABI as aurora13.
+# This source-qualified exception is confined to the existing J613 14.8.3 path.
+m3_clean_stage1_14_qualified() {
+  local fw target version
+  [[ $M3_GPU_PROFILE == legacy && $(this_board) == j613 && $(this_soc) == t8122 ]] || return 1
+  [[ ! -e $DT/$M3_OSLOG_OVERLAP ]] || return 1
+  fw=$({ tr -d '\0' <"$DT/chosen/asahi,os-fw-version"; } 2>/dev/null) || return 1
+  [[ $fw == 14.8.3 && -z $(m3_stub_problem) ]] || return 1
+  target=$(esp_bootbin) || return 1
+  version=$($sudo cat "${target%/m1n1/boot.bin}/asahi/stub_info.json" 2>/dev/null |
+    grep -o '"ProductVersion": *"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/') || return 1
+  [[ $version == 14.8.3 ]]
+}
+
 m3_stage1_problem() {
-  local stage1
+  local stage1 allowed=$M3_STAGE1_VERSIONS
+  [[ $M3_GPU_PROFILE != j613-25g83 ]] || allowed=$M3_STAGE1_25_VERSIONS
   stage1=$({ tr -d '\0' <"$DT/chosen/asahi,m1n1-stage1-version"; } 2>/dev/null) || stage1=""
   if [[ -z $stage1 ]]; then
     echo "its m1n1 reports no stage 1 version"
-  elif [[ " $M3_STAGE1_VERSIONS " != *" $stage1 "* ]]; then
+  elif [[ $stage1 == v1.6.1 ]] && m3_clean_stage1_14_qualified; then
+    :
+  elif [[ " $allowed " != *" $stage1 "* ]]; then
     echo "its m1n1 stage 1 is $stage1"
   fi
   return 0
@@ -1041,6 +1076,11 @@ m1n1_pkg_has_handoff() {
     s=${s%%=*}
     ((rc == 0)) && ! grep -qaxF "$s" "$bin" && rc=1
   done
+  if [[ $M3_GPU_PROFILE == j613-25g83 ]]; then
+    for s in apple,j613-25g83-profile apple,j613-25g83-mapping-handoff apple,j613-25g83-gpu-handoff; do
+      ((rc == 0)) && ! grep -qaxF "$s" "$bin" && rc=1
+    done
+  fi
   rm -f "$bin"
   return "$rc"
 }
@@ -1156,6 +1196,7 @@ m3_recorded_mode() {
 # so a later release never turns one kind of Air test into another (a dry run
 # into a GPU start) without a new --m3-handoff.
 m3_variant() {
+  if ((M3_GPU_PERSISTENT)); then echo "air-gpu-persistent-$M3_GPU_PROFILE"; return; fi
   if ! is_m3_air; then echo "$M3_PRO_VARIANT"
   elif m3_air_default; then echo "$M3_AIR_DEFAULT_VARIANT"
   elif [[ $M3_AIR_DISPLAY_HANDOFF == 1 ]]; then echo "$M3_AIR_DISPLAY_VARIANT"
@@ -1184,6 +1225,13 @@ m3_kept_refusal() {
 # Decide the M3 path before anything is downloaded, so a Mac this release can't
 # set up as asked stops with nothing changed.
 m3_plan() {
+  if [[ -f $STATE/m3-gpu-persistent ]] && ((M3_GPU_PERSISTENT == 0)); then
+    local saved
+    saved=$(cat "$STATE/m3-gpu-persistent")
+    if [[ $saved == legacy || $saved == j613-25g83 ]]; then
+      M3_GPU_PERSISTENT=1; M3_GPU_PROFILE=$saved; M3_TRY=1
+    fi
+  fi
   local board problem failed variant again="run this again" air=0 kept=0
   M3_MODE=none
   M3_ASKED=$M3_TRY M3_AIR_DEFAULT=""
@@ -1270,6 +1318,9 @@ m3_plan() {
     Mac's boot loader), see the M3 section of: bash -s -- --agent-prompt"
     return 0
   fi
+  if ((M3_GPU_PERSISTENT)) && [[ $M3_GPU_PROFILE == j613-25g83 ]]; then
+    [[ -z $(m3_25_boot_problem) ]] || die "$(m3_25_boot_problem). Firmware migration is separate from a Linux package update."
+  fi
   problem=$(m3_stub_problem)
   if [[ -n $problem ]]; then
     if ((kept)); then m3_kept_refusal "the macOS $M3_STUB_VERSION system-firmware stub" "$problem"; fi
@@ -1306,7 +1357,9 @@ m3_plan() {
   elif ((kept)); then
     say "M3 ($board): this Mac has m1n1's display and GPU handoff from an earlier install; keeping it"
   fi
-  if ((air)); then
+  if ((M3_GPU_PERSISTENT)); then
+    say "J613: installing matched experimental GPU profile $M3_GPU_PROFILE; current OS firmware is retained"
+  elif ((air)); then
     if m3_air_default; then
       say "M3 MacBook Air ($board, macOS $M3_STUB_VERSION stub): installing m1n1 with the $(m3_handoff_name)"
     elif ((kept)); then
@@ -1385,7 +1438,12 @@ UNPROVEN_SEP_BOARDS="j314c j316c j413"
 # --m3-gpu-experiment: stops before anything is downloaded on a Mac that is not an M3 Air, or
 # when the Mesa entry is malformed.
 m3_gpu_plan() {
-  ((M3_GPU_EXPERIMENT)) || return 0
+  ((M3_GPU_EXPERIMENT || M3_GPU_PERSISTENT)) || return 0
+  if ((M3_GPU_PERSISTENT)); then
+    m3_persistent_preflight
+    warn "Persistent M3 GPU activation is experimental. This run retains a known boot entry and installs the matched kernel, Mesa and unified bootloader together."
+    return 0
+  fi
   is_m3_air || die "--m3-gpu-experiment is for the M3 MacBook Air (j613, j615) only, and this Mac is
     $(this_board) ($(this_soc)). Nothing was installed."
   warn "--m3-gpu-experiment: installing the M3 Air GPU experiment's scripts with the kernel, and
@@ -1462,6 +1520,11 @@ mesa_needs_too_old() {
 # What the owner reads at the end of an install with the flag, or of a plain run that keeps
 # the tools of an earlier one.
 m3_gpu_notice() {
+  if ((M3_GPU_PERSISTENT)); then
+    say "Experimental GPU profile $M3_GPU_PROFILE is selected for subsequent boots with the matched kernel, Mesa and bootloader. The retained previous entry uses asahi.t8122_start=0 and mesa_m3=off."
+    [[ $M3_GPU_PROFILE != j613-25g83 ]] || say "25G83 native OpenGL is experimental; Vulkan hardware support is unavailable."
+    return 0
+  fi
   if ((M3_GPU_EXPERIMENT)); then
     say "The M3 Air GPU experiment's scripts are in $M3_GPU_BIN: air-gpu-oneshot.sh,
     air-gpu-collect.sh and air-gpu-job.sh. Nothing is armed; every boot stays normal until
@@ -2398,6 +2461,7 @@ m3_pro_mesa_files() {
 
 # After the download loop: keep the package out of the kernel's pacman -U ("$work"/*.pkg.tar.zst).
 m3_pro_mesa_set_aside() {
+  ((M3_GPU_PERSISTENT)) && return 0
   local file
   file=$(m3_pro_mesa_file)
   [[ -n $M3_PRO_MESA_PACKAGE && -f $work/$file ]] || return 0
@@ -2434,6 +2498,7 @@ m3_pro_mesa_needs_unmet() {
 # warning, the kernel install stays as it is, and the summary and exit status say so.
 m3_pro_mesa_install() {
   local file old name
+  if ((M3_GPU_PERSISTENT)) && [[ $M3_PRO_MESA_RESULT == installed ]]; then return 0; fi
   file=$work/m3-pro/$(m3_pro_mesa_file)
   [[ -n $M3_PRO_MESA_PACKAGE && -f $file ]] || return 0
   old=$(m3_pro_mesa_needs_unmet)
@@ -3159,6 +3224,10 @@ EOF
   root_uuid=$(findmnt -no UUID /)
   subvol=$(findmnt -no FSROOT /)
   cmdline=$(sed -e 's/BOOT_IMAGE=[^ ]*//' /proc/cmdline)
+  if ((M3_GPU_PERSISTENT)); then
+    cmdline=$(sed -E 's/(^| )asahi\.t8122[_-]start(=[^ ]*)?//g; s/(^| )mesa_m3=[^ ]*//g' <<<"$cmdline")
+    cmdline+=" asahi.t8122_start=0 mesa_m3=off"
+  fi
   if [[ $(findmnt -no FSTYPE /boot) == vfat ]]; then
     linux=/vmlinuz-aurora-sep-previous initrd=/initramfs-aurora-sep-previous.img
     search="search --no-floppy --fs-uuid --set=root $(findmnt -no UUID /boot)"
@@ -3482,6 +3551,11 @@ install_all() {
   m3_plan
   m3_gpu_plan
   m3_pro_mesa_plan
+  if ((M3_GPU_PERSISTENT)); then
+    [[ $M3_PRO_MESA_RESULT != current ]] || M3_PRO_MESA_RESULT=""
+    [[ -z $M3_PRO_MESA_RESULT ]] || die "persistent GPU needs the matched Mesa package"
+    [[ -z $(m3_pro_mesa_needs_unmet) ]] || die "persistent GPU requires satisfied Mesa dependencies before installation"
+  fi
   m1n1_keep_plan
   work=$(mktemp -d)
   trap 'rm -rf "${work:-}"' EXIT
@@ -3504,6 +3578,7 @@ install_all() {
     fi
     [[ $(sha256sum "$work/$file" | cut -d' ' -f1) == "$sha" ]] || die "$file does not match its published checksum"
   done
+  if ((M3_GPU_PERSISTENT)); then m3_persistent_package_check "$work/${M3_PRO_MESA_PACKAGE%% *}"; fi
   m3_pro_mesa_set_aside
   if m1n1_for_this_mac; then
     sha=$(m1n1_pkg_sha "$work/${M1N1_PACKAGE%% *}")
@@ -3527,6 +3602,10 @@ install_all() {
   snapshot_boot_state
   if [[ ! -f $STATE/previous && $chain == grub ]]; then
     keep_grub_fallback "$kernel"
+  fi
+  if ((M3_GPU_PERSISTENT)); then
+    m3_persistent_keep_entry
+    m3_persistent_cmdline "$chain"
   fi
   # The kernel this Mac had before the first install; an update keeps it.
   if [[ ! -f $STATE/previous-package ]]; then
@@ -3559,6 +3638,12 @@ install_all() {
   say "Installing the aurora-sep kernel, libfprint with the Apple SEP driver, fprintd and aurora-touchid"
   # --ask 4 accepts replacing linux-asahi (and its headers), which linux-aurora conflicts with.
   $sudo pacman -U --noconfirm --ask 4 "$work"/*.pkg.tar.zst
+  if ((M3_GPU_PERSISTENT)); then
+    M3_PRO_MESA_RESULT=installed
+    if [[ $chain == grub ]]; then $sudo grub-mkconfig -o /boot/grub/grub.cfg; fi
+    m3_persistent_keep_entry publish
+    m3_persistent_select
+  fi
   $sudo pacman -S --needed --noconfirm fprintd
   # linux-aurora carries the Apple video decoder, whose firmware linux-asahi
   # installs never needed; without it the decoder fails to load at boot.
@@ -3748,6 +3833,7 @@ uninstall_all() {
     [[ -f $STATE/linux-asahi.preset.saved && ! -f /etc/mkinitcpio.d/linux-asahi.preset ]] &&
       $sudo mv "$STATE/linux-asahi.preset.saved" /etc/mkinitcpio.d/linux-asahi.preset
     [[ -f $STATE/grub.default.saved ]] && $sudo cp "$STATE/grub.default.saved" /etc/default/grub
+    m3_persistent_remove
     if [[ $m3_mode != kernel ]]; then
       if [[ -f $STATE/update-m1n1.default.saved ]]; then
         $sudo cp "$STATE/update-m1n1.default.saved" "$UPDATE_M1N1_CONF"
@@ -3766,6 +3852,7 @@ uninstall_all() {
     handoff) m3_restore_bringup ;;
   esac
   $sudo rm -f "$MODPROBE_CONF"
+  m3_persistent_remove
   m3_gpu_remove
   m3_pro_mesa_remove
   # The m1n1 builds that failed on this Mac stay recorded, so a later install
@@ -5959,6 +6046,366 @@ PROMPT
 # A reset needs none of the kernel and boot checks; it checks for itself.
 preflight_needed() { case ${1:-} in --agent-prompt | --reset-touchid | --m3-report | --m3-power-survey) return 1 ;; *) return 0 ;; esac; }
 
+# Exact stack pins are filled when the installer is assembled from its manifest.
+m3_25_boot_problem() {
+  local osfw
+  osfw=$({ tr -d '\0' <"$DT/chosen/asahi,os-fw-version"; } 2>/dev/null) || osfw=""
+  [[ $(this_board) == j613 && $(this_soc) == t8122 && $osfw == 26.6.2 ]] ||
+    echo "25G83 requires a J613 booted from its own 26.6.2 volume group; this boot is $(this_board) / $osfw"
+}
+
+m3_persistent_preflight() {
+  [[ $(this_board) == j613 && $(this_soc) == t8122 ]] || die "persistent GPU activation currently supports J613 only"
+  [[ $M3_STACK_ID =~ ^[0-9a-f]{64}$ ]] || die "persistent GPU requires an installer assembled from an exact matched stack manifest"
+  ((M3_PRO_MESA)) || die "persistent GPU activation requires matching Mesa"
+  [[ $M3_MODE == handoff ]] || die "persistent GPU requires a validated bootloader handoff"
+  if [[ $M3_GPU_PROFILE == j613-25g83 ]]; then
+    [[ -z $(m3_25_boot_problem) ]] || die "$(m3_25_boot_problem). Firmware migration is separate from a Linux package update."
+  elif [[ $M3_GPU_PROFILE != legacy ]]; then
+    die "unknown M3 GPU profile"
+  fi
+  for s in chosen.asahi,t8122-gpu=1 chosen.asahi,t8122-dcp=1; do
+    ! m3_air_switch_off "$s" || die "persistent GPU conflicts with an explicit owner switch-off: $s"
+  done
+}
+
+m3_persistent_cmdline() {
+  local chain=$1 path
+  if [[ $chain == grub ]]; then path=/etc/default/grub
+  else path=/etc/default/limine; fi
+  [[ -f $STATE/m3-defaults.saved ]] || $sudo cp -p "$path" "$STATE/m3-defaults.saved"
+  $sudo python3 - "$path" "$chain" <<'M3_CMDLINE_PY'
+import os, re, sys, tempfile
+from pathlib import Path
+path, chain = Path(sys.argv[1]), sys.argv[2]
+text = path.read_text()
+begin, end = '# >>> aurora-sep: M3 GPU cmdline', '# <<< aurora-sep: M3 GPU cmdline'
+if text.count(begin) != text.count(end) or text.count(begin) > 1:
+    raise SystemExit('malformed owned M3 cmdline block')
+text = re.sub(re.escape(begin) + r'\n.*?' + re.escape(end) + r'\n?', '', text, flags=re.S)
+if chain == 'grub':
+    setting = 'GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} asahi.t8122_start=1"'
+else:
+    setting = 'KERNEL_CMDLINE[linux-aurora]="${KERNEL_CMDLINE[linux-aurora]:-${KERNEL_CMDLINE[default]}} asahi.t8122_start=1"'
+data = text.rstrip() + '\n\n' + begin + '\n' + setting + '\n' + end + '\n'
+fd, name = tempfile.mkstemp(dir=path.parent, prefix=path.name+'.')
+with os.fdopen(fd, 'w') as out:
+    out.write(data); out.flush(); os.fsync(out.fileno())
+os.chmod(name, 0o644)
+os.replace(name, path)
+M3_CMDLINE_PY
+}
+
+m3_persistent_package_check() {
+  local package=$1 marker
+  [[ -f $package ]] || die "matched Mesa package is missing"
+  if [[ $M3_GPU_PROFILE == j613-25g83 ]]; then
+    marker=$(bsdtar -xOf "$package" opt/mesa-m3/25g83/share/mesa-m3/profile 2>/dev/null) ||
+      die "matched Mesa package has no native profile marker"
+    [[ $marker == j613-25g83-gl-only ]] || die "matched Mesa package native profile marker differs"
+    bsdtar -tf "$package" | grep -qx 'opt/mesa-m3/libexec/mesa-m3-abi-check' ||
+      die "matched Mesa package has no runtime ABI checker"
+  fi
+}
+
+m3_boot_profile_install() {
+  $sudo install -d -m 0755 "${M3_BOOT_PROFILE_HELPER%/*}"
+  $sudo tee "$M3_BOOT_PROFILE_HELPER" >/dev/null <<'M3_BOOT_PROFILE_PY'
+#!/usr/bin/env python3
+"""Retain the running Limine UKI and publish bounded experimental activation."""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import tempfile
+
+BEGIN = '# >>> aurora-sep: persistent experimental M3 GPU'
+END = '# <<< aurora-sep: persistent experimental M3 GPU'
+CONF_PATHS = ('EFI/BOOT/limine.conf', 'boot/limine/limine.conf', 'boot/limine.conf', 'limine/limine.conf', 'limine.conf')
+
+def regular(path):
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise ValueError(f'{path} must be a regular file')
+    return path
+
+def atomic(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() or path.is_symlink(): regular(path)
+    fd, name = tempfile.mkstemp(prefix=path.name + '.', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as out:
+            out.write(data); out.flush(); os.fsync(out.fileno())
+        os.chmod(name, 0o644)
+        os.replace(name, path)
+        dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try: os.fsync(dfd)
+        finally: os.close(dfd)
+    finally:
+        if os.path.exists(name): os.unlink(name)
+
+@contextlib.contextmanager
+def locks(paths):
+    fds = []
+    try:
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+            fds.append(fd)
+            if not stat.S_ISREG(os.fstat(fd).st_mode): raise ValueError('nonregular boot lock')
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        for fd in reversed(fds): os.close(fd)
+
+def cmdline(line, armed):
+    if '"' in line or "'" in line or not any(w.startswith('root=') for w in line.split()):
+        raise ValueError('boot command line must contain root= and have no quotes')
+    words = [w for w in line.split() if not re.match(r'asahi\.t8122[_-]start(?:=|$)', w)
+             and not w.startswith('mesa_m3=') and not w.startswith('air_gpu.oneshot=')]
+    return ' '.join(words + ['asahi.t8122_start=' + ('1' if armed else '0')] + ([] if armed else ['mesa_m3=off']))
+
+def without_block(text):
+    if text.count(BEGIN) != text.count(END) or text.count(BEGIN) > 1:
+        raise ValueError('malformed persistent boot block')
+    return re.sub(r'\n?' + re.escape(BEGIN) + r'\n.*?' + re.escape(END) + r'\n?', '\n', text, flags=re.S)
+
+def entry(text, kernel):
+    lines = text.splitlines(keepends=True)
+    matches = []
+    for i, line in enumerate(lines):
+        if line.strip() != '//' + kernel: continue
+        end = i + 1
+        while end < len(lines) and not lines[end].lstrip().startswith('/'): end += 1
+        fields = {}
+        for j in range(i + 1, end):
+            m = re.match(r'\s*(protocol|path|cmdline):\s*(.*?)\s*$', lines[j])
+            if m:
+                if m[1] in fields: raise ValueError('duplicate entry field')
+                fields[m[1]] = (j, m[2])
+        matches.append(fields)
+    if len(matches) != 1 or any(k not in matches[0] for k in ('protocol', 'path', 'cmdline')):
+        raise ValueError(f'exactly one complete //{kernel} entry is required')
+    if matches[0]['protocol'][1] != 'efi': raise ValueError('only EFI UKI entries are supported')
+    return lines, matches[0]
+
+def uki_path(esp, value):
+    m = re.fullmatch(r'boot\(\):(/[^#]+)(?:#([0-9a-f]{128}))?', value)
+    if not m or '..' in Path(m[1]).parts: raise ValueError('unsupported UKI path')
+    path = esp / m[1].lstrip('/')
+    if not path.resolve().is_relative_to(esp.resolve()): raise ValueError('UKI escapes ESP')
+    for component in (path, *path.parents):
+        if component == esp.parent: break
+        if component.is_symlink(): raise ValueError('symlink in UKI path')
+    data = regular(path).read_bytes()
+    digest = hashlib.blake2b(data).hexdigest()
+    if m[2] and m[2] != digest: raise ValueError('UKI hash pin differs')
+    return data, digest
+
+def limine(args):
+    with locks(args.lock):
+        loader = regular(args.esp / 'EFI/BOOT/BOOTAA64.EFI').read_bytes()
+        if b'limine.conf' not in loader: raise ValueError('EFI loader is not Limine')
+        sig = b'++CONFIG_B2SUM_SIGNATURE++'
+        if sig in loader:
+            value = loader.split(sig, 1)[1][:128]
+            if value != b'0' * 128: raise ValueError('Limine configuration hash is enrolled')
+        defaults = regular(args.defaults).read_text()
+        if re.search(r'^\s*ENABLE_ENROLL_LIMINE_CONFIG=[\"\x27]?yes', defaults, re.M):
+            raise ValueError('Limine configuration enrollment is enabled')
+        conf = next((args.esp / p for p in CONF_PATHS if (args.esp / p).is_file()), None)
+        if conf is None: raise ValueError('Limine configuration missing')
+        text = regular(conf).read_text()
+        clean = without_block(text)
+        state_path = args.state / 'm3-known-entry.json'
+        args.state.mkdir(parents=True, exist_ok=True)
+        if args.action == 'retain':
+            if state_path.exists():
+                saved = json.loads(regular(state_path).read_text())
+                uki_path(args.esp, saved['path'])
+                if not (args.state / ('modules-' + saved['release']) / 'modules.dep').is_file():
+                    raise ValueError('retained modules missing')
+                return
+            _, fields = entry(clean, args.kernel)
+            data, digest = uki_path(args.esp, fields['path'][1])
+            if not args.release or args.release.encode() + b'\0' not in data:
+                raise ValueError('UKI does not identify the running kernel')
+            modules = args.modules / args.release
+            if regular(modules / 'pkgbase').read_text().strip() != args.kernel:
+                raise ValueError('running modules do not match boot entry package')
+            regular(modules / 'modules.dep')
+            dest = args.state / ('modules-' + args.release)
+            if dest.exists(): raise ValueError('unrecorded fallback modules exist')
+            shutil.copytree(modules, dest, symlinks=True)
+            shutil.rmtree(dest / 'dtbs', ignore_errors=True)
+            rel = '/EFI/Linux/aurora-m3-previous-' + digest[:16] + '.efi'
+            target = args.esp / rel.lstrip('/')
+            atomic(target, data)
+            saved = dict(path='boot():' + rel + '#' + digest,
+                         cmdline=cmdline(fields['cmdline'][1], False), release=args.release)
+            atomic(state_path, (json.dumps(saved, sort_keys=True) + '\n').encode())
+            return
+        saved = json.loads(regular(state_path).read_text())
+        uki_path(args.esp, saved['path'])
+        lines, fields = entry(clean, 'linux-aurora')
+        # Validate the newly generated UKI before changing its activation line.
+        uki_path(args.esp, fields['path'][1])
+        j, old = fields['cmdline']
+        lines[j] = re.match(r'\s*', lines[j])[0] + 'cmdline: ' + cmdline(old, True) + '\n'
+        block = '\n' + BEGIN + '\n/Aurora previous (GPU off)\n    protocol: efi\n    path: ' + saved['path'] + '\n    cmdline: ' + saved['cmdline'] + '\n' + END + '\n'
+        output = ''.join(lines).rstrip() + '\n' + block
+        if regular(conf).read_text() != text: raise ValueError('Limine configuration changed during update')
+        atomic(conf, output.encode())
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('action', choices=('retain', 'publish'))
+    p.add_argument('--esp', type=Path, required=True)
+    p.add_argument('--state', type=Path, required=True)
+    p.add_argument('--defaults', type=Path, default=Path('/etc/default/limine'))
+    p.add_argument('--kernel', default='linux-aurora')
+    p.add_argument('--release', default=os.uname().release)
+    p.add_argument('--modules', type=Path, default=Path('/usr/lib/modules'))
+    p.add_argument('--lock', type=Path, action='append')
+    args = p.parse_args()
+    args.lock = args.lock or [Path('/run/lock/boot-partition.lock'), Path('/tmp/limine-global.lock')]
+    try: limine(args)
+    except (OSError, ValueError, KeyError) as e: p.exit(1, f'M3 boot profile refused: {e}\n')
+
+if __name__ == '__main__': main()
+M3_BOOT_PROFILE_PY
+  $sudo chmod 0755 "$M3_BOOT_PROFILE_HELPER"
+}
+
+m3_keep_limine_entry() {
+  local target esp release
+  target=$(esp_bootbin) || die "persistent GPU requires the mounted FAT boot partition"
+  esp=${target%/m1n1/boot.bin}
+  m3_boot_profile_install
+  $sudo python3 "$M3_BOOT_PROFILE_HELPER" "$1" --esp "$esp" --state "$STATE" --kernel "${kernel:-linux-aurora}" ||
+    die "could not retain/publish the checked GPU-off Limine entry"
+  if [[ $1 == retain ]]; then
+    release=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["release"])' "$STATE/m3-known-entry.json")
+    m3_fallback_modules_service "$release"
+  fi
+}
+
+m3_fallback_modules_service() {
+  local release=$1
+  [[ $release =~ ^[A-Za-z0-9._+-]+$ ]] || die "invalid fallback kernel release"
+  $sudo tee /etc/systemd/system/aurora-sep-fallback-modules.service >/dev/null <<EOF
+[Unit]
+Description=Restore modules of the retained Aurora GPU-off kernel
+DefaultDependencies=no
+ConditionKernelVersion=$release
+ConditionPathExists=!/usr/lib/modules/$release/modules.dep
+After=systemd-remount-fs.service
+Before=systemd-modules-load.service systemd-udevd.service systemd-udev-trigger.service linux-modules-cleanup.service
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/cp -a $STATE/modules-$release /usr/lib/modules/$release
+[Install]
+WantedBy=sysinit.target
+EOF
+  $sudo systemctl daemon-reload
+  $sudo systemctl enable aurora-sep-fallback-modules.service
+}
+
+m3_grub_fallback_off() {
+  $sudo python3 - "$1" <<'M3_GRUB_OFF'
+from pathlib import Path
+import re, sys
+path=Path(sys.argv[1]);text=path.read_text()
+lines=text.splitlines(keepends=True)
+indices=[i for i,l in enumerate(lines) if re.match(r'\s*linux\s+\S*vmlinuz-aurora-sep-previous\s',l)]
+if len(indices)!=1: raise SystemExit('retained GRUB entry is missing its unique previous kernel line')
+i=indices[0]
+line=re.sub(r'(^| )asahi\.t8122[_-]start(?:=[^ ]*)?(?= |$)',r'\1',lines[i].rstrip())
+line=re.sub(r'(^| )mesa_m3=[^ ]*',r'\1',line)
+lines[i]=line+' asahi.t8122_start=0 mesa_m3=off\n'
+path.write_text(''.join(lines))
+M3_GRUB_OFF
+}
+
+m3_persistent_keep_entry() {
+  if [[ $chain == grub ]]; then
+    [[ -f /boot/vmlinuz-aurora-sep-previous && -f /boot/initramfs-aurora-sep-previous.img ]] ||
+      die "persistent GPU requires the retained previous GRUB kernel entry"
+    m3_grub_fallback_off /etc/grub.d/42_aurora_sep_previous
+  else
+    m3_keep_limine_entry "${1:-retain}"
+  fi
+}
+
+m3_persistent_remove() {
+  [[ -f $STATE/m3-gpu-persistent ]] || return 0
+  $sudo rm -f "$M3_GPU_OPTIN" "$M3_GPU_PROFILE_FILE" /etc/pacman.d/hooks/zzzz-aurora-m3-profile.hook /usr/local/libexec/aurora-m3-profile-update "$M3_BOOT_PROFILE_HELPER"
+  $sudo python3 - /etc/default/grub /etc/default/limine <<'M3_REMOVE_CMDLINE'
+from pathlib import Path
+import re, sys
+begin, end = '# >>> aurora-sep: M3 GPU cmdline', '# <<< aurora-sep: M3 GPU cmdline'
+for name in sys.argv[1:]:
+    path=Path(name)
+    if not path.is_file(): continue
+    text=path.read_text()
+    if begin not in text: continue
+    if text.count(begin)!=1 or text.count(end)!=1: raise SystemExit('malformed owned M3 cmdline block')
+    path.write_text(re.sub(re.escape(begin)+r'\n.*?'+re.escape(end)+r'\n?','',text,flags=re.S))
+M3_REMOVE_CMDLINE
+  $sudo rm -f "$STATE/m3-gpu-persistent"
+}
+
+m3_persistent_hook() {
+  $sudo install -d -m 0755 /etc/pacman.d/hooks
+  $sudo tee /etc/pacman.d/hooks/zzzz-aurora-m3-profile.hook >/dev/null <<EOF
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = linux-aurora
+Target = limine-mkinitcpio-hook
+[Action]
+Description = Retain the Aurora GPU-off boot entry
+When = PostTransaction
+Exec = /usr/local/libexec/aurora-m3-profile-update
+EOF
+  $sudo tee /usr/local/libexec/aurora-m3-profile-update >/dev/null <<EOF
+#!/bin/bash
+set -eu
+[[ -f $STATE/m3-gpu-persistent ]] || exit 0
+for esp in /boot/efi /boot; do
+  [[ -f \$esp/m1n1/boot.bin && \$(findmnt -no FSTYPE --target "\$esp") == vfat ]] || continue
+  exec python3 $M3_BOOT_PROFILE_HELPER publish --esp "\$esp" --state $STATE
+done
+exit 1
+EOF
+  $sudo chmod 0755 /usr/local/libexec/aurora-m3-profile-update
+}
+
+m3_persistent_select() {
+  local dir=${M3_GPU_OPTIN%/*}
+  if [[ $M3_GPU_PROFILE == j613-25g83 ]]; then
+    [[ $(cat "$M3_MESA_NATIVE_MARKER" 2>/dev/null) == j613-25g83-gl-only ]] ||
+      die "matched Mesa native profile marker is missing; experimental intent remains unchanged"
+  fi
+  $sudo install -d -m 0755 "$dir"
+  if [[ $M3_GPU_PROFILE == j613-25g83 ]]; then
+    printf '%s\n' "$M3_PROFILE_SELECTOR" | $sudo tee "$M3_GPU_PROFILE_FILE" >/dev/null
+  else
+    $sudo rm -f "$M3_GPU_PROFILE_FILE"
+  fi
+  printf '1\n' | $sudo tee "$M3_GPU_OPTIN" >/dev/null
+  printf '%s\n' "$M3_GPU_PROFILE" | $sudo tee "$STATE/m3-gpu-persistent" >/dev/null
+  if [[ ${chain:-} == limine ]]; then m3_persistent_hook; fi
+  $sudo chmod 0644 "$M3_GPU_OPTIN" "$STATE/m3-gpu-persistent"
+  [[ ! -f $M3_GPU_PROFILE_FILE ]] || $sudo chmod 0644 "$M3_GPU_PROFILE_FILE"
+}
+
 # Tests source this file for its functions only.
 if [[ ${AURORA_SEP_SOURCE_ONLY:-} == 1 ]]; then return 0; fi
 
@@ -5969,6 +6416,8 @@ for a in "$@"; do
   case $a in
     --m3-handoff) M3_TRY=1 ;;
     --m3-gpu-experiment) M3_GPU_EXPERIMENT=1 ;;
+    --m3-gpu-persistent) M3_GPU_PERSISTENT=1; M3_TRY=1 ;;
+    --m3-profile=j613-25g83) M3_GPU_PROFILE=j613-25g83; M3_GPU_PERSISTENT=1; M3_TRY=1 ;;
     --no-m3-mesa) M3_PRO_MESA=0 ;;
     *) args+=("$a") ;;
   esac
@@ -5977,7 +6426,7 @@ set -- "${args[@]}"
 if ((M3_TRY)) && [[ -n ${1:-} && $1 != --read-only ]]; then
   die "--m3-handoff goes with an install (alone or with --read-only), not with $1"
 fi
-if ((M3_GPU_EXPERIMENT)) && [[ -n ${1:-} && $1 != --read-only ]]; then
+if ((M3_GPU_EXPERIMENT || M3_GPU_PERSISTENT)) && [[ -n ${1:-} && $1 != --read-only ]]; then
   die "--m3-gpu-experiment goes with an install (alone, with --m3-handoff or with --read-only), not with $1"
 fi
 if ((!M3_PRO_MESA)) && [[ -n ${1:-} && $1 != --read-only ]]; then
@@ -5997,5 +6446,5 @@ case ${1:-} in
   --m3-report) m3_report ;;
   --m3-power-survey) m3_power_survey ;;
   --agent-prompt) release_source >&2; prompt_notice; agent_prompt ;;
-  *) die "unknown option $1 (--read-only, --uninstall, --reset-touchid, --agent-prompt, --m3-report, --m3-power-survey, --m3-handoff, --m3-gpu-experiment or --no-m3-mesa)" ;;
+  *) die "unknown option $1 (--read-only, --uninstall, --reset-touchid, --agent-prompt, --m3-report, --m3-power-survey, --m3-handoff, --m3-gpu-experiment, --m3-gpu-persistent, --m3-profile=j613-25g83 or --no-m3-mesa)" ;;
 esac
