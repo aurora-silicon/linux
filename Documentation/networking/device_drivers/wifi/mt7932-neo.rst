@@ -21,7 +21,7 @@ Use the separately reviewed T8140 PCIe bootstrap described in
 ``wifi0`` endpoint's own ``local-mac-address``; a zero placeholder is rejected.
 
 The tested configuration includes ``CONFIG_MT7932_FULLMAC=m``,
-``CONFIG_CFG80211=y``, ``CONFIG_BT_MTK7932_PCIE=m``, ``CONFIG_BT_BREDR=y``,
+``CONFIG_CFG80211=m``, ``CONFIG_BT_MTK7932_PCIE=m``, ``CONFIG_BT_BREDR=y``,
 ``CONFIG_BT_LE=y``, ``CONFIG_CRYPTO_AES=y`` and ``CONFIG_CRYPTO_CMAC=y``.
 The Bluetooth transport can be built with modular Bluetooth and system
 sleep. The separately selected bootstrap provider has its own lifecycle
