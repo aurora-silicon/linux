@@ -24,6 +24,12 @@ struct dcp_backlight_state {
 	bool suspended;
 	bool dirty;
 	bool in_flight;
+	/*
+	 * The panel shows a level Linux knows: the loader's reported level, or
+	 * one a completed present carried.  A default used for registration
+	 * without a loader report is not known until a present carries a level.
+	 */
+	bool level_known;
 };
 
 struct dcp_backlight_present {
@@ -32,18 +38,24 @@ struct dcp_backlight_present {
 };
 
 /*
- * Public powerlog reports use millinits.  A report above the panel ceiling
- * describes the brightest level the panel can show, so clamp it.
+ * Public powerlog reports use millinits.  A report slightly above the panel
+ * ceiling describes the brightest level the panel can show, so clamp it; one
+ * more than twice the ceiling is not a credible panel level.
  */
 static inline int dcp_bl_takeover_nits(u32 maximum, u32 millinits, u32 *nits)
 {
-	if (!maximum || maximum > INT_MAX)
+	if (!maximum || maximum > INT_MAX / 2000)
 		return -EINVAL;
+	if (millinits / 1000 > 2 * maximum)
+		return -ERANGE;
 	*nits = min(millinits / 1000, maximum);
 	return 0;
 }
 
-/* Inputs must come from admitted panel/loader records, never a guess. */
+/*
+ * An inherited level comes from a loader report.  A default level is only
+ * reported to userspace; it is never presented on its own (see level_known).
+ */
 static inline int dcp_bl_init(struct dcp_backlight_state *state, u32 maximum,
 			      bool inherited_valid, u32 inherited,
 			      bool default_valid, u32 default_nits)
@@ -63,6 +75,7 @@ static inline int dcp_bl_init(struct dcp_backlight_state *state, u32 maximum,
 		.target = nits,
 		.actual = nits,
 		.ready = true,
+		.level_known = inherited_valid,
 	};
 	return 0;
 }
@@ -118,12 +131,13 @@ static inline int dcp_bl_dpms(struct dcp_backlight_state *state, bool on)
 
 /*
  * The firmware asked for the level again.  Re-send the effective level once
- * Linux controls it, unless a present already carries or will carry it.
+ * Linux controls it and knows it, unless a present already carries or will
+ * carry it.  A default level is never sent this way.
  */
 static inline bool dcp_bl_resend(struct dcp_backlight_state *state)
 {
-	if (!state->ready || !state->controlled || state->dirty ||
-	    state->in_flight)
+	if (!state->ready || !state->controlled || !state->level_known ||
+	    state->dirty || state->in_flight)
 		return false;
 	state->dirty = true;
 	return true;
@@ -168,6 +182,7 @@ static inline bool dcp_bl_complete(struct dcp_backlight_state *state,
 	if (accepted) {
 		state->actual = state->sent_nits;
 		state->retries = 0;
+		state->level_known = true;
 	} else {
 		state->dirty = true;
 		if (state->retries < 4)

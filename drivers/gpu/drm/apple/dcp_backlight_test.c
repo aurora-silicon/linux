@@ -19,8 +19,13 @@ static void backlight_millinits_takeover_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, nits, 525U);
 	KUNIT_ASSERT_EQ(test, dcp_bl_takeover_nits(509, 509001, &nits), 0);
 	KUNIT_EXPECT_EQ(test, nits, 509U);
-	KUNIT_ASSERT_EQ(test, dcp_bl_takeover_nits(509, U32_MAX, &nits), 0);
+	KUNIT_ASSERT_EQ(test, dcp_bl_takeover_nits(509, 1018999, &nits), 0);
 	KUNIT_EXPECT_EQ(test, nits, 509U);
+	/* More than twice the ceiling is not a panel level. */
+	nits = 123;
+	KUNIT_EXPECT_EQ(test, dcp_bl_takeover_nits(509, 1019000, &nits), -ERANGE);
+	KUNIT_EXPECT_EQ(test, dcp_bl_takeover_nits(509, U32_MAX, &nits), -ERANGE);
+	KUNIT_EXPECT_EQ(test, nits, 123U);
 	KUNIT_ASSERT_EQ(test, dcp_bl_takeover_nits(509, 100999, &nits), 0);
 	KUNIT_EXPECT_EQ(test, nits, 100U);
 	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 509, true, nits, false, 0), 0);
@@ -249,6 +254,44 @@ static void backlight_resend_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, state.target, 140U);
 }
 
+static void backlight_fallback_test(struct kunit *test)
+{
+	struct dcp_backlight_state state;
+	struct dcp_backlight_present present;
+
+	/* A registration default is reported, never presented on its own. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 525, false, 0, true, 262), 0);
+	KUNIT_EXPECT_FALSE(test, state.level_known);
+	state.controlled = true;
+	KUNIT_EXPECT_FALSE(test, dcp_bl_resend(&state));
+	KUNIT_EXPECT_FALSE(test, state.dirty);
+	KUNIT_EXPECT_EQ(test, dcp_bl_prepare(&state, true, &present), -EALREADY);
+
+	/* A rejected userspace level does not become known. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 300, false, false), 0);
+	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
+	KUNIT_EXPECT_EQ(test, present.nits, 300U);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_complete(&state, present.sequence, false));
+	KUNIT_EXPECT_FALSE(test, state.level_known);
+
+	/* Once a present carrying it completes, the level is re-sendable. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_complete(&state, present.sequence, true));
+	KUNIT_EXPECT_TRUE(test, state.level_known);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_resend(&state));
+
+	/* DPMS has to light the panel at some level: wake uses the default. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 525, false, 0, true, 262), 0);
+	state.controlled = true;
+	KUNIT_ASSERT_EQ(test, dcp_bl_dpms(&state, false), 0);
+	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
+	KUNIT_EXPECT_EQ(test, present.nits, 0U);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_complete(&state, present.sequence, true));
+	KUNIT_ASSERT_EQ(test, dcp_bl_dpms(&state, true), 0);
+	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
+	KUNIT_EXPECT_EQ(test, present.nits, 262U);
+}
+
 static struct kunit_case backlight_cases[] = {
 	KUNIT_CASE(backlight_millinits_takeover_test),
 	KUNIT_CASE(backlight_takeover_test),
@@ -260,6 +303,7 @@ static struct kunit_case backlight_cases[] = {
 	KUNIT_CASE(backlight_reject_test),
 	KUNIT_CASE(backlight_inflight_dpms_test),
 	KUNIT_CASE(backlight_resend_test),
+	KUNIT_CASE(backlight_fallback_test),
 	{}
 };
 
