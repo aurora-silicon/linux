@@ -292,6 +292,41 @@ static void backlight_fallback_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, present.nits, 262U);
 }
 
+static void backlight_fallback_same_level_test(struct kunit *test)
+{
+	struct dcp_backlight_state state;
+	struct dcp_backlight_present present;
+
+	/* A userspace write of the reported default is still presented. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 525, false, 0, true, 262), 0);
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 262, false, false), 0);
+	KUNIT_EXPECT_TRUE(test, state.dirty);
+	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
+	KUNIT_EXPECT_EQ(test, present.nits, 262U);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_complete(&state, present.sequence, true));
+	KUNIT_EXPECT_TRUE(test, state.level_known);
+
+	/* Once the level is known, repeating it presents nothing. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 262, false, false), 0);
+	KUNIT_EXPECT_FALSE(test, state.dirty);
+	KUNIT_EXPECT_EQ(test, dcp_bl_prepare(&state, true, &present), -EALREADY);
+
+	/* A rejected present leaves it unknown, so the same write is retried. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 525, false, 0, true, 262), 0);
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 262, false, false), 0);
+	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_complete(&state, present.sequence, false));
+	KUNIT_EXPECT_FALSE(test, state.level_known);
+	state.dirty = false;
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 262, false, false), 0);
+	KUNIT_EXPECT_TRUE(test, state.dirty);
+
+	/* An inherited level is known from the start. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 525, true, 180, false, 0), 0);
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 180, false, false), 0);
+	KUNIT_EXPECT_FALSE(test, state.dirty);
+}
+
 static void backlight_seed_known_test(struct kunit *test)
 {
 	struct dcp_backlight_state state;
@@ -329,6 +364,7 @@ static struct kunit_case backlight_cases[] = {
 	KUNIT_CASE(backlight_inflight_dpms_test),
 	KUNIT_CASE(backlight_resend_test),
 	KUNIT_CASE(backlight_fallback_test),
+	KUNIT_CASE(backlight_fallback_same_level_test),
 	KUNIT_CASE(backlight_seed_known_test),
 	{}
 };
