@@ -7,6 +7,9 @@ For experimental acceleration on the 13-inch or 15-inch M3 MacBook Air, see
 the [M3 GPU quick start](M3-GPU.md) for the matched activation command and
 desktop GPU check.
 
+For the J413 M2 Air hibernation request, see [HIBERNATION.md](HIBERNATION.md)
+for the current platform blockers and required resume qualification.
+
 See [M1-SUPPORT.md](M1-SUPPORT.md) for the T8103 firmware requirements,
 reboot-persistent enrollment fixes, reference-key recovery caveats and current
 validation boundaries. The historical bring-up results below describe the
