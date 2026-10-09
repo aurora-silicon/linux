@@ -598,6 +598,20 @@
 			apple,fast-die-effort = <&pmp_report 1>;
 		};
 
+		/*
+		 * System level cache planes. Allocation waits for the display, which
+		 * takes over DMA the bootloader left running.
+		 */
+		mcc: memory-controller@220000000 {
+			compatible = "apple,t8140-mcc";
+			reg = <0x2 0x20000000 0x0 0x4000>,
+			      <0x2 0x20040000 0x0 0x4000>,
+			      <0x2 0x20080000 0x0 0x4000>,
+			      <0x2 0x200c0000 0x0 0x4000>;
+			apple,boot-dma-devices = <&display>;
+			status = "disabled";
+		};
+
 		sep_dart: iommu@280b80000 {
 			compatible = "apple,t8140-dart", "apple,t8110-dart";
 			reg = <0x2 0x80b80000 0x0 0x20000>;

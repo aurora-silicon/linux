@@ -412,6 +412,10 @@
 	status = "okay";
 };
 
+&mcc {
+	status = "okay";
+};
+
 &pmp {
 	status = "okay";
 };

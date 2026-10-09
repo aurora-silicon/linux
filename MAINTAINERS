@@ -1990,6 +1990,7 @@ F:	Documentation/devicetree/bindings/serial/apple,dockchannel-uart.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,dockchannel.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,rtk-helper-asc4.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,t8140-aop.yaml
+F:	Documentation/devicetree/bindings/soc/apple/apple,t8140-mcc.yaml
 F:	Documentation/devicetree/bindings/sound/apple,t8140-aop-audio.yaml
 F:	Documentation/devicetree/bindings/usb/vialab,vl122.yaml
 F:	Documentation/gpu/apple-dcp-backlight.rst
@@ -2003,6 +2004,7 @@ F:	drivers/hid/dockchannel-hid/dockchannel-hid-protocol*
 F:	drivers/iio/common/aop_sensors/
 F:	drivers/rtc/rtc-apple-pmu.c
 F:	drivers/soc/apple/aop.rs
+F:	drivers/soc/apple/mcc.c
 F:	drivers/tty/serial/apple_dockchannel*
 F:	rust/kernel/iio/common/aop_sensors.rs
 F:	rust/kernel/soc/apple/aop.rs
