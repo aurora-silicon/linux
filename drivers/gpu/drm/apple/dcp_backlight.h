@@ -110,8 +110,12 @@ static inline int dcp_bl_request(struct dcp_backlight_state *state, u32 nits,
 		return -ERANGE;
 	state->controlled = true;
 	state->retries = 0;
+	/*
+	 * Until a present carries a level, the panel does not show the target,
+	 * so even a request for the reported default has to be presented.
+	 */
 	if (state->target != nits || state->core_blank != core_blank ||
-	    state->suspended != suspended) {
+	    state->suspended != suspended || !state->level_known) {
 		state->target = nits;
 		state->core_blank = core_blank;
 		state->suspended = suspended;
