@@ -502,6 +502,8 @@ static struct platform_driver apple_pmp_report_entry_driver = {
 	.driver = {
 		.name = "apple-pmp-report-entry",
 		.of_match_table = apple_pmp_report_entry_of_match,
+		/* Power-domain providers are not intended for manual unbinding. */
+		.suppress_bind_attrs = true,
 	},
 };
 
