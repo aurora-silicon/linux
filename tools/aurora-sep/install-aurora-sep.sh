@@ -6030,7 +6030,7 @@ PROMPT
 }
 
 # A reset needs none of the kernel and boot checks; it checks for itself.
-preflight_needed() { case ${1:-} in --agent-prompt | --reset-touchid | --m3-report | --m3-power-survey | --m3-gpu-check) return 1 ;; *) return 0 ;; esac; }
+preflight_needed() { case ${1:-} in --agent-prompt | --reset-touchid | --m3-report | --m3-power-survey) return 1 ;; --m3-gpu-check) return 1 ;; *) return 0 ;; esac; }
 
 # Exact stack pins are filled when the installer is assembled from its manifest.
 m3_gpu_firmware_compat() {
