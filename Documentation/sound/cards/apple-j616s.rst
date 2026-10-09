@@ -44,8 +44,8 @@ The rates below are nominal profile values, not clock measurements.
        left/right finite output and passing codec/controller restoration
    * - Speakers (spkr)
      - admac-base-ns, stream 8, TX0; MCA group 0, ms00
-     - Six 24-bit samples in 32-bit slots at 48 kHz; first left/right
-       woofers heard separately and together for five seconds
+     - Six 24-bit samples in 32-bit slots at 48 kHz; all six drivers heard
+       individually, first left/right woofers also paired for five seconds
 
 A trailing space in a FourCC is significant. DMA channel and DART stream
 numbers are not ALSA PCM indices. These tests use separate owned mappings;
@@ -79,7 +79,14 @@ The native speaker provider order and bus addresses are:
      - i2c3:0x3d
 
 All six SN012776 amps passed identity and native protected shutdown
-configuration. The remaining four speakers have no acoustic qualification.
+configuration and now have user-confirmed individual tone output. The second
+woofers use slots 2/3 at 300 Hz; tweeters use slots 4/5 at 2 kHz. Each new test
+lasts one second with peak 0.125 and 20 ms fades. Matching TX reports, zero
+residue/DART faults, mute before TX stop, protected shutdown and exact
+controller/GPIO restoration pass, followed by watchdog recovery. DVC is 0x65
+for the second woofers and left tweeter, 0x78 for the right tweeter. These are
+finite test settings, not calibrated system volume. Simultaneous all-six and
+continuous playback remain unqualified.
 Native feedback describes RX1 with twelve 16-bit slots and sample-width
 field zero. Signedness, packing, I/V order, scales and frame integrity
 still require qualification; this is not an established S16_LE PCM contract.
@@ -125,6 +132,40 @@ completion/error checks and do not continue cleanup after an ambiguous
 transfer. DMA ownership must survive uncertainty until recovery; a timeout
 or frontend idle reply is not permission to free mapped memory.
 
+The shared Python I2C helper now clears only its observed status snapshot
+and rejects XIP before the write. Direct guarded calls pass on both idle
+speaker buses; private bounded amp trials use the same policy with their
+ownership, errors and XEN/no-XIP gates unchanged. Later shutdown and four
+individual playback cleanups pass, but do not prove the intermittent STOP
+fault resolved. Existing generic transfer methods still reset FIFOs before
+this check; the helper change does not make a whole transfer concurrency-safe.
+
+Next kernel integration step
+----------------------------
+
+Add a separate T6040 AOP control-only provider profile and validate service
+discovery before an ALSA audio child can probe. The AOP OF table currently
+has no T6040 match. The required provider is the RTKit/AOP transport with
+42-bit DART mappings, own ADT resources and EPIC version 2; the tested audio
+service is on endpoint 0x22. J700 instead uses EPIC version 4, a setup mailbox
+and audio on endpoint 0x21.
+
+Make boot-argument overrides profile-specific: the qualified J616s startup
+changes only EC0p to the ADT remap address 1 TiB. The existing legacy provider
+also overwrites nCal, alig and AOPt; copying that profile is unqualified.
+Retain firmware and endpoint DMA if shutdown cannot be confirmed.
+
+Keep automatic legacy audio-child probing gated. Its Rust probe uploads a
+632-byte PDM structure, including an explicit alignment byte, and writes
+lpai property 301. The older proxy structure is 631 bytes; own J616s evidence
+reads 626 bytes and identifies 301 as non-writable. A board-specific child
+must instead use
+the proven LP owned-ring/producer-readiness sequence before the three-channel
+HQ Float32 path. This provider/child ABI mismatch is the first integration
+blocker, before Linux card/PCM/control names or userspace profiles can be
+qualified. CS42L84 jack integration and SN012776 I/V protection follow that
+transport; J700 feed-forward protection is not a substitute.
+
 First Linux inventory and acceptance
 ------------------------------------
 
@@ -157,5 +198,5 @@ The published m1n1 bring-up evidence [1]_ and driver contracts [2]_ pin the
 proxy evidence used here. Private recordings, firmware and probe harnesses
 are not included in this documentation.
 
-.. [1] https://github.com/aurora-silicon/m1n1/blob/2480cc5f7def1b7124ffd5d25d56305f57462942/docs/j616s-bringup.md
-.. [2] https://github.com/aurora-silicon/m1n1/blob/2480cc5f7def1b7124ffd5d25d56305f57462942/docs/j616s-driver-contracts.md
+.. [1] https://github.com/aurora-silicon/m1n1/blob/fd360ef69054e42724b975d7a4c61e0242b6b341/docs/j616s-bringup.md
+.. [2] https://github.com/aurora-silicon/m1n1/blob/fd360ef69054e42724b975d7a4c61e0242b6b341/docs/j616s-driver-contracts.md
