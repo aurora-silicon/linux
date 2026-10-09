@@ -6264,6 +6264,7 @@ import re
 import shutil
 import stat
 import tempfile
+import time
 
 BEGIN = '# >>> aurora-sep: persistent experimental M3 GPU'
 END = '# <<< aurora-sep: persistent experimental M3 GPU'
@@ -6291,7 +6292,8 @@ def atomic(path, data):
         if os.path.exists(name): os.unlink(name)
 
 @contextlib.contextmanager
-def locks(paths):
+def locks(paths, timeout=30.0):
+    deadline = time.monotonic() + timeout
     fds = []
     try:
         for path in paths:
@@ -6299,7 +6301,15 @@ def locks(paths):
             fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
             fds.append(fd)
             if not stat.S_ISREG(os.fstat(fd).st_mode): raise ValueError('nonregular boot lock')
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(f'boot partition locks remained busy for {timeout:g} seconds; retry this installer') from None
+                    time.sleep(min(0.05, remaining))
         yield
     finally:
         for fd in reversed(fds): os.close(fd)
@@ -6349,7 +6359,7 @@ def uki_path(esp, value):
     return data, digest
 
 def limine(args):
-    with locks(args.lock):
+    with locks(args.lock, args.lock_timeout):
         loader = regular(args.esp / 'EFI/BOOT/BOOTAA64.EFI').read_bytes()
         if b'limine.conf' not in loader: raise ValueError('EFI loader is not Limine')
         sig = b'++CONFIG_B2SUM_SIGNATURE++'
@@ -6432,7 +6442,10 @@ def main():
     p.add_argument('--release', default=os.uname().release)
     p.add_argument('--modules', type=Path, default=Path('/usr/lib/modules'))
     p.add_argument('--lock', type=Path, action='append')
+    p.add_argument('--lock-timeout', type=float, default=30.0, help='total boot-lock wait, in seconds (0..30)')
     args = p.parse_args()
+    if not 0 <= args.lock_timeout <= 30:
+        p.error('lock timeout must be between 0 and 30 seconds')
     args.lock = args.lock or [Path('/run/lock/boot-partition.lock'), Path('/tmp/limine-global.lock')]
     try: limine(args)
     except (OSError, ValueError, KeyError) as e: p.exit(1, f'M3 boot profile refused: {e}\n')
@@ -6680,7 +6693,7 @@ def verify(root, env, uid, run=subprocess.run):
         remedy = {
             'experimental': 'Run the matched installer with --m3-gpu, then reboot and log in.',
             'no-access': 'Log out and log in again so render-group membership takes effect.',
-            'no-gpu': 'Reboot into the installed Aurora kernel, then retry.',
+            'no-gpu': "Check this boot's GPU startup: journalctl -b -k -g 'asahi|M3 G15G'; report the error with --m3-report in issue #35.",
             'opt-out': 'Review your GPU opt-out setting; this check does not change it.',
             'previous-failed': 'Use the retained GPU-off entry and report the previous failed login.',
         }.get(reason, 'Run the matched installer with --m3-report and include this error.')
@@ -6709,7 +6722,7 @@ def verify(root, env, uid, run=subprocess.run):
         reject('The Air GPU experimental opt-in is absent.', 'Run the matched installer with --m3-gpu, then reboot and log in.')
     nodes = list((root / 'sys/class/drm').glob('renderD*'))
     if len(nodes) != 1:
-        reject('The kernel has no unique M3 render node.', 'Reboot into the installed Aurora kernel, then retry.')
+        reject('The kernel has no unique M3 render node.', "Check this boot's GPU startup: journalctl -b -k -g 'asahi|M3 G15G'; report the error with --m3-report in issue #35.")
     node = nodes[0]
     of_node = node / 'device/of_node'
     if ((node / 'device/driver').resolve().name != 'asahi' or

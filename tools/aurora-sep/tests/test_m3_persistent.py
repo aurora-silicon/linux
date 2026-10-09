@@ -322,7 +322,7 @@ m3_persistent_transaction_begin "$chain"
 m3_switches_write
 pacman() {{ return 0; }}
 m3_persistent_keep_entry() {{
-  python3 "{test_m3_boot_profile.HELPER}" "$1" --esp "{fixture.esp}" --state "{fixture.state}" --defaults "{fixture.defaults}" --lock "{fixture.lock1}" --lock "{fixture.lock2}"
+  python3 "{test_m3_boot_profile.HELPER}" "$1" --esp "{fixture.esp}" --state "{fixture.state}" --defaults "{fixture.defaults}" --lock "{fixture.lock1}" --lock "{fixture.lock2}" --lock-timeout 0.15
 }}
 m3_install_packages
 ''',check=False)

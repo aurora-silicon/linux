@@ -449,7 +449,7 @@ pub(crate) fn boot_verdict(
         ),
         BootStep::DeviceControl => dev_err!(
             dev,
-            "M3 G15G verdict: device-control-failed ({:?}): a device-control message was not acknowledged within 2 s after the InitData (version {:#x}) was published\n",
+            "M3 G15G verdict: device-control-failed ({:?}): a device-control queue, mailbox send or acknowledgement failed after the InitData (version {:#x}) was published; see the device-control diagnostic above\n",
             e,
             version
         ),

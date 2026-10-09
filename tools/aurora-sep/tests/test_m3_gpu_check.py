@@ -109,6 +109,14 @@ class Runtime(unittest.TestCase):
     def test_removed_air_intent_refused(self):
         (self.root/'etc/mesa-m3/t8122-gpu-experiment').unlink()
         with self.assertRaises(CHECK.CheckError):self.verify()
+    def test_no_gpu_reports_this_boot_startup_without_reboot_loop(self):
+        self.state.update(decision='inactive',reason='no-gpu')
+        with self.assertRaises(CHECK.CheckError) as error:self.verify()
+        self.assertIn('journalctl -b -k',error.exception.remedy)
+        self.assertIn('issue #35',error.exception.remedy)
+        self.assertNotIn('Reboot into',error.exception.remedy)
+        self.assertEqual(self.calls,[])
+
     def test_root_refused(self):
         with self.assertRaises(CHECK.CheckError):CHECK.verify(self.root,self.env,0,self.process)
 

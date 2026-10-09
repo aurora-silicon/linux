@@ -819,15 +819,30 @@ impl Runtime {
         Ok(())
     }
     fn send_control(&mut self, opcode: u32) -> Result {
-        let next = self.inner.config.control(opcode)?;
-        Pin::new(&mut self.inner.transport).send_message(0x21, 0x0083000000000011)?;
+        let next = match self.inner.config.control(opcode) {
+            Ok(next) => next,
+            Err(error) => {
+                dev_err!(self.inner.drm.as_ref(), "M3: device control {:#x} queue failed ({:?})\n", opcode, error);
+                return Err(error);
+            }
+        };
+        let send_start = Instant::<Monotonic>::now();
+        if let Err(error) = Pin::new(&mut self.inner.transport).send_message(0x21, 0x0083000000000011) {
+            dev_err!(self.inner.drm.as_ref(), "M3: device control {:#x} mailbox send failed ({:?}), elapsed_ns={}\n",
+                opcode, error, send_start.elapsed().as_nanos());
+            return Err(error);
+        }
         let start = Instant::<Monotonic>::now();
         loop {
             let inner: &mut Inner = &mut *self.inner;
             inner.config.drain(&inner.drm)?;
             if !inner.state.healthy() { return Err(EIO); }
             if inner.config.control_done(next)? { return Ok(()); }
-            if start.elapsed() >= Delta::from_secs(2) { return Err(ETIMEDOUT); }
+            if start.elapsed() >= Delta::from_secs(2) {
+                dev_err!(self.inner.drm.as_ref(), "M3: device control {:#x} acknowledgement timed out, elapsed_ns={}\n",
+                    opcode, start.elapsed().as_nanos());
+                return Err(ETIMEDOUT);
+            }
             fsleep(Delta::from_millis(1));
         }
     }
