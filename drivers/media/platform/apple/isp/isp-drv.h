@@ -277,6 +277,8 @@ struct apple_isp {
 	struct mutex video_lock;
 	unsigned int sequence;
 	bool multiplanar;
+	/* capture rate in frames per second, changes under video_lock */
+	unsigned int frame_rate;
 
 	int pd_count;
 	struct device **pd_dev;
