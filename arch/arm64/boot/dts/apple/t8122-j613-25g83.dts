@@ -2,6 +2,7 @@
 /* J613 with the exact 25G83 firmware profile. */
 #include "t8122-j613.dts"
 #include "t8122-j613-dcp-25g83.dtsi"
+#include "t8122-j613-25g83-qspi.dtsi"
 
 /* The 25G83 MTP_SYS uses GPIO-mediated AFE power sequencing. */
 &mtp_hid {

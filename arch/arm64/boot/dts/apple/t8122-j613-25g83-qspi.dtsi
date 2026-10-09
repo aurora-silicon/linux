@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J613 25G83 (macOS 26.6.2 firmware): the boot NOR and its NVRAM sit
+ * behind the QSPIMC controller, not SPI1.
+ *
+ * ADT /arm-io/qspi: P=0x2a1118000, C=P+0x800, IRQ 771, gate 73;
+ * /arm-io/qspi/spinor/anvram: 0x700000, 1 MiB.
+ *
+ * spi-apple-qspi defaults read-only. Bounded NVRAM writes need an explicit
+ * runtime opt-in. Leave the MTD device openable O_RDWR: asahi-bless opens
+ * it that way for --get-boot without writing.
+ */
+
+/ {
+	aliases {
+		nvram = &nvram_qspi;
+	};
+
+	soc {
+		qspi: spi@2a1118000 {
+			compatible = "apple,t8122-qspi";
+			reg = <0x2 0xa1118000 0x0 0x4800>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 771 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_200m>;
+			power-domains = <&ps_qspi>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			flash@0 {
+				compatible = "jedec,spi-nor";
+				reg = <0>;
+				spi-max-frequency = <10000000>;
+
+				partitions {
+					compatible = "fixed-partitions";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					nvram_qspi: partition@700000 {
+						label = "nvram";
+						reg = <0x700000 0x100000>;
+					};
+				};
+			};
+		};
+	};
+};
+
+/* The M1/M2 SPI1 NVRAM from t8122-jxxx.dtsi is not used on 25G83. */
+&spi1 {
+	status = "disabled";
+};
