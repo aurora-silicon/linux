@@ -25,6 +25,18 @@ config APPLE_MAILBOX
 
 	  Say Y here if you have an Apple SoC.
 
+config APPLE_MCC
+	tristate "Apple T8140 system level cache"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on OF
+	default ARCH_APPLE
+	help
+	  The boot firmware of the Apple T8140 SoC enables the system level
+	  cache without letting it allocate. This driver allows allocation
+	  once the devices that took over DMA from the bootloader are bound.
+
+	  Say 'y' or 'm' here if you have an Apple T8140 SoC.
+
 config APPLE_PMGR_MISC
 	bool "Apple SoC PMGR miscellaneous support"
 	depends on PM
