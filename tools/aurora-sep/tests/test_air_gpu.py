@@ -1466,8 +1466,8 @@ class GpuExperimentFlagTest(Base):
         self.assertNotIn("is the normal one", prompt)
 
     def test_matched_persistent_prompt_does_not_require_one_shot_or_migration(self):
-        prompt = SRC[SRC.index("J613 experimental acceleration with the matched installer:"):]
-        prompt = " ".join(prompt[:2400].split())
+        prompt = SRC[SRC.index("Experimental Air acceleration with the matched installer:"):]
+        prompt = " ".join(prompt[:3200].split())
         self.assertIn('bash install-aurora-sep.sh --m3-gpu-persistent',prompt)
         self.assertIn('bash install-aurora-sep.sh --m3-profile=j613-25g83',prompt)
         self.assertIn('It does not require a firmware migration or a separate one-shot arming command',prompt)
@@ -1621,8 +1621,8 @@ class GpuExperimentFlagTest(Base):
         for args, want in [("--m3-gpu-experiment", "ok 0 1 -"),
                            ("--m3-handoff --m3-gpu-experiment", "ok 1 1 -"),
                            ("--m3-gpu-experiment --read-only", "ok 0 1 --read-only"),
-                           ("--m3-gpu-experiment --uninstall", "error: --m3-gpu-experiment goes with an install"),
-                           ("--m3-report --m3-gpu-experiment", "error: --m3-gpu-experiment goes with an install"),
+                           ("--m3-gpu-experiment --uninstall", "error: M3 GPU options go with an install"),
+                           ("--m3-report --m3-gpu-experiment", "error: M3 GPU options go with an install"),
                            ("--uninstall", "ok 0 0 --uninstall"),
                            ("--no-m3-mesa", "ok 0 0 - 0"),
                            ("--m3-gpu-experiment --no-m3-mesa", "ok 0 1 - 0"),

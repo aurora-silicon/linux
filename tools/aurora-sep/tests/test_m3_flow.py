@@ -118,6 +118,11 @@ case $op in
     done
     exit $rc ;;
   -Qq) exit 1 ;;
+  # Pending upgrades after -Sy, as "name old -> new [ignored]" lines; FAKE_UPGRADES has them.
+  -Qu)
+    if [[ -n ${FAKE_FAIL_QUERY:-} ]]; then echo "error: local database failed" >&2; exit 1; fi
+    [[ -n ${FAKE_UPGRADES:-} ]] || exit 1
+    printf '%s\n' "$FAKE_UPGRADES" ;;
   -Qlq)
     [[ $1 == linux-aurora ]] && grep -qx linux-aurora "$FAKE/installed" &&
       echo /usr/lib/modules/7.1.12-2-11.36-sep-ARCH/dtbs/fake.dtb
@@ -149,6 +154,7 @@ case $op in
     if [[ -n ${FAKE_FAIL_R:-} ]]; then echo "error: failed to remove (fake)" >&2; exit 1; fi
     for p in "$@"; do [[ $p == -* ]] || { sed -i "/^$p\$/d" "$FAKE/installed"; sed -i "/^$p /d" "$FAKE/versions" 2>/dev/null || true; }; done ;;
   -S | -Sy)
+    if [[ $op == -Sy && -n ${FAKE_FAIL_REFRESH:-} ]]; then echo "error: mirror unavailable" >&2; exit 1; fi
     hook=0
     for p in "$@"; do
       case $p in
@@ -800,6 +806,219 @@ class M3FlowTest(M3FlowBase):
         self.assertEqual(self.update_conf.read_text(), conf)
         self.assertTrue(self.boot.read_bytes().startswith(b"M1N1:neo-own\n"))
         self.assertIn("libfprint m1n1", self.log())
+
+    # Package database refresh and pending upgrades
+
+    def test_pending_upgrades_stop_the_install_before_anything_changes(self):
+        self.mac("j516s")
+        self.extra_env["FAKE_UPGRADES"] = "llvm-libs 20.1.8-1 -> 21.1.2-1\nmesa 1:25.2.4-1 -> 1:25.2.5-1"
+        proc = self.install(check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        err = " ".join(proc.stderr.split())
+        self.assertIn("2 package upgrade(s) pending (pacman -Qu; first: llvm-libs mesa)", err)
+        self.assertIn("Nothing was installed", err)
+        log = self.log()
+        self.assertLess(log.index("pacman -Sy --noconfirm"), log.index("pacman -Qu"))
+        self.assertNotIn("pacman -U", log)
+        self.assertNotIn("pacman -S ", log)
+        self.assertEqual(self.downloaded(), [])
+        self.assertEqual(self.boot.read_bytes(), b"M1N1:original\n")
+        self.assertFalse((self.state / "m3-mode").exists())
+
+    def test_held_packages_do_not_count_as_pending(self):
+        self.mac("j516s")
+        self.extra_env["FAKE_UPGRADES"] = "libfprint 1.94.9-1 -> 1.94.10-1 [ignored]"
+        self.install()
+        self.assertIn("pacman -U", self.log())
+
+    def test_database_errors_refuse_before_download_or_install(self):
+        self.mac("j516s")
+        for failure in ("FAKE_FAIL_REFRESH", "FAKE_FAIL_QUERY"):
+            with self.subTest(failure=failure):
+                self.extra_env = {failure: "1"}
+                proc = self.install(check=False)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("Nothing was installed", proc.stderr)
+                self.assertNotIn("pacman -U", self.log())
+                self.assertEqual(self.downloaded(), [])
+                self.assertEqual(self.boot.read_bytes(), b"M1N1:original\n")
+
+    def test_ignored_non_candidate_upgrade_still_requires_full_update(self):
+        self.mac("j516s")
+        self.extra_env["FAKE_UPGRADES"] = "llvm-libs 20.1-1 -> 22.1-1 [ignored]"
+        proc = self.install(check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("omarchy update", proc.stderr)
+        self.assertNotIn("pacman -U", self.log())
+
+    def test_the_refresh_comes_before_any_download(self):
+        self.mac("j516s")
+        self.install()
+        log = self.log()
+        self.assertLess(log.index("pacman -Sy --noconfirm"), log.index("curl "))
+        self.assertEqual(log.count("pacman -Sy --noconfirm\n"), 1)
+
+    # Limine --uninstall after the persistent GPU route retained the previous kernel
+
+    def test_limine_uninstall_removes_the_retained_gpu_off_entry(self):
+        self.mac("j516s")
+        self.install()
+        helper = self.tmp / "bin/fake-boot-profile"
+        # Run as "python3 HELPER remove ...", as the real one is.
+        helper.write_text("import os, sys\n"
+                          "with open(os.environ['FAKE'] + '/log', 'a') as log:\n"
+                          "    print('boot-profile', *sys.argv[1:], file=log)\n")
+        helper.chmod(0o755)
+        (self.state / "m3-known-entry.json").write_text("{}\n")
+        self.run_sh(f"""
+M3_BOOT_PROFILE_HELPER='{helper}'
+m3_boot_profile_install() {{ echo "boot-profile install" >>"$FAKE/log"; }}
+systemctl() {{ echo "systemctl $*" >>"$FAKE/log"; }}
+uninstall_all
+""")
+        log = self.log()
+        self.assertIn(f"boot-profile remove --esp {self.tmp}/esp --state {self.state}\n", log)
+        self.assertLess(log.index("boot-profile install"), log.index("boot-profile remove"))
+        self.assertIn("systemctl disable aurora-sep-fallback-modules.service", log)
+        self.assertFalse(helper.exists())
+        self.assertFalse(self.state.exists())
+
+    def test_failed_limine_remove_check_preserves_packages_and_recovery(self):
+        self.mac("j516s")
+        self.install()
+        (self.state / "m3-known-entry.json").write_text("{}\n")
+        modules = self.state / "modules-kept"
+        modules.mkdir()
+        (modules / "modules.dep").write_text("retained")
+        before = self.boot.read_bytes()
+        (self.fake / "log").write_text("")
+        helper = self.tmp / "bin/failing-boot-profile"
+        helper.write_text("import sys; sys.exit(1)\n")
+        proc = self.run_sh(f"""
+M3_BOOT_PROFILE_HELPER='{helper}'
+m3_boot_profile_install() {{ :; }}
+uninstall_all
+""", check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("recovery state and modules were kept", proc.stderr)
+        self.assertNotRegex(self.log(), r"pacman -(?:S|U|R)")
+        self.assertTrue((self.state / "m3-known-entry.json").exists())
+        self.assertEqual((modules / "modules.dep").read_text(), "retained")
+        self.assertEqual(self.boot.read_bytes(), before)
+
+    def test_limine_fallback_without_ownership_refuses_uninstall(self):
+        self.mac("j516s")
+        self.install()
+        esp=self.tmp / "esp"
+        (esp / "EFI/BOOT").mkdir(parents=True)
+        (esp / "EFI/Linux").mkdir()
+        (esp / "EFI/BOOT/BOOTAA64.EFI").write_bytes(b"limine.conf")
+        conf=esp / "EFI/BOOT/limine.conf"
+        conf.write_text("/Aurora previous (GPU off)\n protocol: efi\n path: boot():/EFI/Linux/aurora-m3-previous-aaaaaaaaaaaaaaaa.efi\n cmdline: root=UUID=abc mesa_m3=off\n")
+        retained=esp / "EFI/Linux/aurora-m3-previous-aaaaaaaaaaaaaaaa.efi"
+        retained.write_bytes(b"retained kernel")
+        defaults=self.tmp / "defaults"
+        defaults.write_text("ENABLE_ENROLL_LIMINE_CONFIG=no\n")
+        before=conf.read_bytes()
+        (self.fake / "log").write_text("")
+        proc=self.run_sh(f"""
+M3_BOOT_PROFILE_HELPER='{INSTALLER.parent / 'm3-boot-profile.py'}'
+m3_boot_profile_install() {{ :; }}
+python3() {{ command python3 "$@" --defaults '{defaults}' --lock '{self.tmp / 'lock1'}' --lock '{self.tmp / 'lock2'}'; }}
+uninstall_all
+""",check=False)
+        self.assertNotEqual(proc.returncode,0)
+        self.assertIn("custom fallback has no saved ownership record",proc.stderr)
+        self.assertNotRegex(self.log(),r"pacman -(?:S|U|R)")
+        self.assertEqual(conf.read_bytes(),before)
+        self.assertEqual(retained.read_bytes(),b"retained kernel")
+        self.assertTrue(self.state.exists())
+        conf.write_text(conf.read_text().replace('/Aurora previous (GPU off)', '/Renamed recovery').replace(' path:', ' PATH:'))
+        before=conf.read_bytes()
+        proc=self.run_sh(f"""
+M3_BOOT_PROFILE_HELPER='{INSTALLER.parent / 'm3-boot-profile.py'}'
+m3_boot_profile_install() {{ :; }}
+python3() {{ command python3 "$@" --defaults '{defaults}' --lock '{self.tmp / 'lock1'}' --lock '{self.tmp / 'lock2'}'; }}
+uninstall_all
+""",check=False)
+        self.assertNotEqual(proc.returncode,0)
+        self.assertIn("custom fallback has no saved ownership record",proc.stderr)
+        self.assertNotRegex(self.log(),r"pacman -(?:S|U|R)")
+        self.assertEqual(conf.read_bytes(),before)
+        self.assertTrue(self.state.exists())
+
+
+    def test_pending_upgrades_refuse_uninstall_before_package_or_boot_changes(self):
+        self.mac("j516s")
+        self.install()
+        before=self.boot.read_bytes()
+        (self.fake / "log").write_text("")
+        self.extra_env["FAKE_UPGRADES"]="llvm-libs 20-1 -> 22-1"
+        proc=self.run_sh("uninstall_all",check=False)
+        self.assertNotEqual(proc.returncode,0)
+        self.assertIn("omarchy update",proc.stderr)
+        self.assertNotRegex(self.log(),r"pacman -(?:S |U|R)")
+        self.assertEqual(self.boot.read_bytes(),before)
+        self.assertTrue(self.state.exists())
+
+    def test_limine_uninstall_without_a_retained_entry_leaves_limine_alone(self):
+        self.mac("j516s")
+        self.install()
+        self.run_sh("""
+m3_boot_profile_install() { echo "boot-profile install" >>"$FAKE/log"; }
+systemctl() { echo "systemctl $*" >>"$FAKE/log"; }
+uninstall_all
+""")
+        self.assertNotIn("boot-profile", self.log())
+        self.assertNotIn("aurora-sep-fallback-modules", self.log())
+
+    # EFI partition space before the persistent GPU route
+
+    def esp_check(self, avail, chain="limine"):
+        return self.run_sh(f"""
+boot_chain() {{ echo {chain}; }}
+df() {{ printf 'Avail\\n%s\\n' {avail}; }}
+m3_esp_space_check
+""", check=False)
+
+    def test_a_full_esp_stops_the_persistent_route(self):
+        self.mac("j613")
+        uki = self.tmp / "esp/EFI/Linux/omarchy_linux-aurora.efi"
+        uki.parent.mkdir(parents=True)
+        with uki.open("wb") as f:
+            f.truncate(60 * 1048576)
+        # Twice the 60 MB UKI (retained and new), twice boot.bin, and 16 MB.
+        proc = self.esp_check(135)
+        self.assertNotEqual(proc.returncode, 0)
+        err = " ".join(proc.stderr.split())
+        self.assertIn(f"The EFI partition ({self.tmp}/esp) has 135 MB free".lower(), err.lower())
+        self.assertIn("about 136 MB", err)
+        self.assertIn("Nothing was installed", err)
+        self.assertEqual(self.esp_check(136).returncode, 0)
+
+    def test_an_esp_without_a_uki_assumes_a_100_mb_kernel(self):
+        self.mac("j613")
+        self.assertNotEqual(self.esp_check(205).returncode, 0)
+        self.assertEqual(self.esp_check(206).returncode, 0)
+
+    def test_grub_needs_esp_room_for_boot_bin_only(self):
+        self.mac("j613")
+        self.assertEqual(self.esp_check(16, chain="grub").returncode, 0)
+        self.assertNotEqual(self.esp_check(15, chain="grub").returncode, 0)
+
+    def test_missing_or_unmeasurable_esp_refuses(self):
+        self.mac("j613")
+        for override in ("esp_bootbin() { return 1; }", "stat() { return 1; }", "find() { return 1; }"):
+            with self.subTest(override=override):
+                proc=self.run_sh(override+"\nm3_esp_space_check",check=False)
+                self.assertNotEqual(proc.returncode,0)
+                self.assertIn("Nothing was installed",proc.stderr)
+
+    def test_unreadable_free_space_refuses(self):
+        self.mac("j613")
+        proc = self.esp_check("''")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("could not read the free space", proc.stderr)
 
 
 if __name__ == "__main__":

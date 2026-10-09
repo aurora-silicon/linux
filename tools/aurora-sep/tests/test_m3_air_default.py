@@ -321,7 +321,7 @@ class SameAs123Test(flow.M3FlowBase):
     RECORD_RUN = re.compile(rb"(?m)^(run_id|written_at|boot_id|installer_sha256)=.*\n")
 
     def norm(self, text):
-        text = normalize_undo_label(text)
+        text = pro.refresh_notice(normalize_undo_label(text))
         text = text.replace(REASONS_124, REASONS_123)
         return self.RUN_ID.sub("run_id=<id>", self.TEMP.sub(r"\1<tmp>", pro.MKTEMP.sub("<tmp>", text)))
 

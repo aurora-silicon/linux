@@ -535,7 +535,7 @@ class StagedCopyTest(flow.M3FlowBase):
         printed = proc.stdout + proc.stderr
         script = f"curl -fsSL {DEFAULT_RELEASE_URL}/install-aurora-sep.sh | bash -s -- "
         self.assertIn(script + "--agent-prompt", printed)
-        self.assertIn("To undo everything:    " + script + "--uninstall", printed)
+        self.assertIn("To undo the kernel install: " + script + "--uninstall", printed)
         commands = [l for l in printed.splitlines() if "curl " in l]
         self.assertTrue(commands)
         for line in commands:

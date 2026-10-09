@@ -145,3 +145,107 @@ class BootProfile(unittest.TestCase):
         self.run_helper('disarm')
         self.assertNotIn('asahi.t8122_start=1',self.conf.read_text())
         self.assertEqual(self.conf.read_text().count('asahi.t8122_start=0 mesa_m3=off'),2)
+
+    def test_remove_drops_gpu_off_entry_and_retained_uki(self):
+        self.run_helper('retain')
+        saved=json.loads((self.state/'m3-known-entry.json').read_text())
+        retained=self.esp/saved['path'].split('#')[0].removeprefix('boot():/')
+        self.assertTrue(retained.exists())
+        self.run_helper('remove')
+        self.assertEqual(self.conf.read_text(),self.original)
+        self.assertFalse(retained.exists())
+        self.assertTrue(self.uki.exists())
+        self.run_helper('remove')
+        self.assertEqual(self.conf.read_text(),self.original)
+
+    def test_remove_after_publish_keeps_the_main_entry(self):
+        self.run_helper('retain');self.run_helper('publish')
+        self.run_helper('remove')
+        text=self.conf.read_text()
+        self.assertNotIn('/Aurora previous (GPU off)',text)
+        self.assertNotIn('mesa_m3=off',text)
+        self.assertIn('  //linux-aurora\n',text)
+        self.assertTrue(self.uki.exists())
+
+    def test_remove_without_retained_entry_changes_nothing(self):
+        self.run_helper('remove')
+        self.assertEqual(self.conf.read_text(),self.original)
+        self.assertEqual(list((self.esp/'EFI/Linux').glob('aurora-m3-previous-*')),[])
+
+    def retained_path(self):
+        saved=json.loads((self.state/'m3-known-entry.json').read_text())
+        return self.esp/saved['path'].split('#')[0].removeprefix('boot():/'),saved
+
+    def test_remove_refuses_corrupt_state_before_publication(self):
+        self.run_helper('retain')
+        retained,_=self.retained_path();before=self.conf.read_bytes()
+        (self.state/'m3-known-entry.json').write_text('{broken')
+        self.run_helper('remove',False)
+        self.assertEqual(self.conf.read_bytes(),before)
+        self.assertTrue(retained.exists())
+
+    def test_remove_refuses_edited_fallback_before_publication(self):
+        self.run_helper('retain')
+        retained,_=self.retained_path()
+        self.conf.write_text(self.conf.read_text().replace('asahi.t8122_start=0 mesa_m3=off','asahi.t8122_start=1'))
+        before=self.conf.read_bytes()
+        self.run_helper('remove',False)
+        self.assertEqual(self.conf.read_bytes(),before)
+        self.assertTrue(retained.exists())
+
+    def test_remove_preserves_snapshot_membership(self):
+        self.run_helper('retain')
+        retained,saved=self.retained_path()
+        original=self.conf.read_text()
+        digest=hashlib.blake2b(retained.read_bytes()).hexdigest()
+        for key in ('path', 'PATH'):
+            for suffix in ('', '#'+digest, '#'+digest.upper()):
+                with self.subTest(key=key,pin=suffix):
+                    self.conf.write_text(original+'\n/Snapshot\n protocol: efi\n '+key+': '+saved['path'].split('#')[0]+suffix+'\n cmdline: root=UUID=abc ro\n')
+                    before=self.conf.read_bytes()
+                    result=self.run_helper('remove',False)
+                    self.assertIn('another boot entry',result.stderr)
+                    self.assertEqual(self.conf.read_bytes(),before)
+                    self.assertTrue(retained.exists())
+
+    def test_remove_preserves_vfat_case_and_dot_alias_membership(self):
+        self.run_helper('retain')
+        retained,saved=self.retained_path()
+        original=self.conf.read_text()
+        path=saved['path'].split('#')[0]
+        for alias in (path.replace('/EFI/Linux/','/efi/linux/').replace('.efi','.EFI'),path+'.'):
+            with self.subTest(alias=alias):
+                self.conf.write_text(original+'\n/Snapshot\n protocol: efi\n path: '+alias+'\n cmdline: root=UUID=abc ro\n')
+                before=self.conf.read_bytes()
+                result=self.run_helper('remove',False)
+                self.assertIn('another boot entry',result.stderr)
+                self.assertEqual(self.conf.read_bytes(),before)
+                self.assertTrue(retained.exists())
+
+    def test_remove_refuses_changed_or_symlinked_uki(self):
+        self.run_helper('retain')
+        retained,_=self.retained_path();before=self.conf.read_bytes()
+        original=retained.read_bytes()
+        retained.write_bytes(b'changed')
+        self.run_helper('remove',False)
+        self.assertEqual(self.conf.read_bytes(),before)
+        retained.unlink();retained.symlink_to(self.uki)
+        self.run_helper('remove',False)
+        self.assertEqual(self.conf.read_bytes(),before)
+        self.assertEqual(self.uki.read_bytes(),original)
+
+    def test_check_remove_validates_without_removing_anything(self):
+        self.run_helper('retain')
+        retained,_=self.retained_path();before=self.conf.read_bytes()
+        self.run_helper('check-remove')
+        self.assertEqual(self.conf.read_bytes(),before)
+        self.assertTrue(retained.exists())
+        self.run_helper('remove')
+        self.assertFalse(retained.exists())
+
+    def test_remove_refuses_a_malformed_gpu_off_entry(self):
+        self.run_helper('retain')
+        broken=self.conf.read_text().replace('    protocol: efi\n    path: boot():/EFI/Linux/aurora-m3-previous','    path: boot():/EFI/Linux/aurora-m3-previous')
+        self.conf.write_text(broken)
+        self.run_helper('remove',False)
+        self.assertEqual(self.conf.read_text(),broken)

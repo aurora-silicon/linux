@@ -3563,6 +3563,31 @@ packages_for_this_mac() {
   return 0
 }
 
+package_database_check() {
+  local pending errors status=0 row name
+  local -a unheld=()
+  say "Refreshing the package database"
+  $sudo pacman -Sy --noconfirm || die "could not refresh the package database. Nothing was installed. Fix the mirror/network error and retry."
+  errors=$(mktemp)
+  pending=$(LC_ALL=C pacman -Qu --color never 2>"$errors") || status=$?
+  # pacman returns 1 for an empty query as well as for a database error.
+  if [[ -s $errors ]] || ((status > 1)) || { ((status == 1)) && [[ -n $pending ]]; }; then
+    cat "$errors" >&2
+    rm -f "$errors"
+    die "could not check pending package upgrades. Nothing was installed. Fix pacman's error and retry."
+  fi
+  rm -f "$errors"
+  while IFS= read -r row; do
+    [[ -n $row ]] || continue
+    name=${row%% *}
+    # Only the release's own pinned packages are replaced by these candidates.
+    if [[ $row == *" [ignored]" && " $PINNED " == *" $name "* ]]; then continue; fi
+    unheld+=("$name")
+  done <<<"$pending"
+  ((${#unheld[@]} == 0)) || die "this Mac has ${#unheld[@]} package upgrade(s) pending (pacman -Qu; first: ${unheld[*]:0:8}).
+    Run 'omarchy update', reboot, then retry. Installing repository dependencies before a full update would be a partial upgrade. Nothing was installed."
+}
+
 install_all() {
   local entry file sha kernel chain
   local -a entries
@@ -3586,6 +3611,9 @@ install_all() {
     [[ -z $(m3_pro_mesa_needs_unmet) ]] || die "persistent GPU requires satisfied Mesa dependencies before installation"
   fi
   m1n1_keep_plan
+  # Repository dependencies must resolve against an up-to-date system.
+  # Install held release candidates together; update other packages first.
+  package_database_check
   if ((!DESKTOP_FIXES)); then work=$(mktemp -d); fi
   trap 'm3_install_cleanup' EXIT
   if is_neo && ! m1n1_for_this_mac; then say "Keeping this MacBook Neo's own m1n1 (m1n1-aurora has no T8140 support)"; fi
@@ -3657,13 +3685,6 @@ install_all() {
     # update-m1n1 is frozen (m1n1_keep_plan): prove boot.bin stays as it is.
     *) if ((M1N1_KEEP)); then M3_BOOTBIN_SHA=$(m3_bootbin_sha); fi ;;
   esac
-
-  # linux-aurora-headers pulls in pahole, and fprintd below comes from the
-  # repositories. On a Mac whose package database has gone stale, pacman
-  # resolves those to versions the mirror no longer carries and the whole
-  # transaction dies with a 404 after the packages are already downloaded.
-  say "Refreshing the package database"
-  $sudo pacman -Sy --noconfirm || warn "could not refresh the package database; continuing"
 
   say "Installing the aurora-sep kernel, libfprint with the Apple SEP driver, fprintd and aurora-touchid"
   # --ask 4 accepts replacing linux-asahi (and its headers), which linux-aurora conflicts with.
@@ -3826,6 +3847,10 @@ uninstall_all() {
   else
     m3_mode=none
   fi
+  if [[ $(boot_chain) == limine ]] && m3_limine_cleanup_needed; then
+    m3_limine_remove_check
+  fi
+  package_database_check
   command -v aurora-touchid-setup >/dev/null && aurora-touchid-setup --remove || true
   $sudo systemctl disable apple-sep.path apple-sep.service 2>/dev/null || true
   remove_pin
@@ -3846,7 +3871,7 @@ uninstall_all() {
   $sudo pacman -Rdd --noconfirm aurora-touchid 2>/dev/null || true
   # The stock m1n1 has no M3 handoff; drop the switches before its rebuild.
   m3_switches_remove
-  $sudo pacman -Sy --noconfirm --ask 4 "$previous" "$previous-headers" libfprint $m1n1
+  $sudo pacman -S --noconfirm --ask 4 "$previous" "$previous-headers" libfprint $m1n1
   # Restore the stock update-m1n1 configuration on either chain before the
   # rebuild below, so boot.bin goes back to the packaged m1n1 and DTBs.
   # A kernel-only M3's boot.bin and update-m1n1 configuration were never
@@ -3883,6 +3908,12 @@ uninstall_all() {
     handoff) m3_restore_bringup ;;
   esac
   $sudo rm -f "$MODPROBE_CONF"
+  # Keep recovery state and modules if the checked entry cannot be removed.
+  if [[ $(boot_chain) == limine ]] && m3_limine_cleanup_needed; then
+    m3_limine_remove_check remove
+    $sudo systemctl disable aurora-sep-fallback-modules.service 2>/dev/null || true
+    $sudo rm -f /etc/systemd/system/aurora-sep-fallback-modules.service
+  fi
   m3_persistent_remove
   m3_gpu_remove
   m3_pro_mesa_remove
@@ -6114,6 +6145,32 @@ m3_persistent_preflight() {
   for s in chosen.asahi,t8122-gpu=1 chosen.asahi,t8122-dcp=1; do
     ! m3_air_switch_off "$s" || die "persistent GPU conflicts with an explicit owner switch-off: $s"
   done
+  m3_esp_space_check
+}
+
+# The persistent route writes to the ESP: a kept copy of boot.bin (keep_bootbin_on_esp)
+# next to the rebuilt one and, on Limine, the retained GPU-off UKI and the new
+# linux-aurora UKI. Asahi ESPs are 500 MB and often hold snapshot UKIs too; refuse
+# before anything changes rather than fail mid-transaction with ENOSPC. GRUB keeps its
+# kernels in /boot, which boot_space checks.
+m3_esp_space_check() {
+  local target esp uki=0 bootbin need free
+  target=$(esp_bootbin) || die "could not find the mounted FAT boot partition. Nothing was installed."
+  esp=${target%/m1n1/boot.bin}
+  bootbin=$($sudo stat -c %s "$target") || die "could not measure boot.bin. Nothing was installed."
+  [[ $bootbin =~ ^[0-9]+$ ]] || die "invalid boot.bin size. Nothing was installed."
+  if [[ $(boot_chain) == limine ]]; then
+    # The largest UKI there stands for the running kernel's; 100 MB when there is none.
+    uki=$($sudo find "$esp" -maxdepth 3 -name '*.efi' -size +8M -printf '%s\n' 2>/dev/null | sort -n | tail -1) || die "could not measure existing EFI kernels. Nothing was installed."
+    uki=${uki:-100000000}
+    [[ $uki =~ ^[0-9]+$ ]] || die "invalid EFI kernel size. Nothing was installed."
+  fi
+  need=$(( (2 * uki + 2 * bootbin) / 1048576 + 16 ))
+  free=$($sudo df -m --output=avail "$esp" 2>/dev/null | tail -1 | tr -d ' ') || free=""
+  [[ $free =~ ^[0-9]+$ ]] || die "could not read the free space on $esp. Nothing was installed."
+  ((free >= need)) || die "the EFI partition ($esp) has ${free} MB free and the persistent GPU route needs
+    about ${need} MB (a kept boot.bin, the retained GPU-off kernel and the new one). Free space there
+    first (old snapshot UKIs, limine_history). Nothing was installed."
 }
 
 m3_install_cleanup() {
@@ -6358,6 +6415,15 @@ def uki_path(esp, value):
     if m[2] and m[2] != digest: raise ValueError('UKI hash pin differs')
     return data, digest
 
+def same_esp_path(left, right):
+    # VFAT names ignore ASCII case and trailing dots in each component.
+    key = lambda path: tuple(part.rstrip('.').lower() for part in path.resolve().parts)
+    if key(left) == key(right): return True
+    try:
+        return os.path.samestat(left.stat(), right.stat())
+    except FileNotFoundError:
+        return False
+
 def limine(args):
     with locks(args.lock, args.lock_timeout):
         loader = regular(args.esp / 'EFI/BOOT/BOOTAA64.EFI').read_bytes()
@@ -6374,9 +6440,49 @@ def limine(args):
         text = regular(conf).read_text()
         clean = without_block(text)
         state_path = args.state / 'm3-known-entry.json'
+        if args.action in ('check-remove', 'remove'):
+            output = clean
+            retained = None
+            has_entry = re.search(r'^\s*/' + re.escape(FALLBACK) + r'\s*$', clean, re.M)
+            if state_path.exists() or state_path.is_symlink():
+                saved = json.loads(regular(state_path).read_text())
+                match = re.fullmatch(r'boot\(\):(/EFI/Linux/aurora-m3-previous-[0-9a-f]{16}\.efi)#([0-9a-f]{128})', saved['path'])
+                if not match or not match[1].endswith(match[2][:16] + '.efi'):
+                    raise ValueError('retained UKI name and hash pin differ')
+                retained = args.esp / match[1].lstrip('/')
+                # An edited or snapshot entry must not lose its kernel or modules.
+                if has_entry:
+                    lines, fields = entry(clean, FALLBACK, 1)
+                    if fields['path'][1] != saved['path'] or fields['cmdline'][1] != saved['cmdline']:
+                        raise ValueError('custom fallback differs from retained entry')
+                    start = next(i for i, line in enumerate(lines) if line.strip() == '/' + FALLBACK)
+                    end = start + 1
+                    while end < len(lines) and not lines[end].lstrip().startswith('/'): end += 1
+                    output = ''.join(lines[:start] + lines[end:]).rstrip() + '\n'
+                for value in re.findall(r'^\s*path:\s*(\S+)', output, re.M | re.I):
+                    reference = re.fullmatch(r'boot\(\):(/[^#]+)(?:#[0-9a-fA-F]{128})?', value)
+                    if reference and same_esp_path(args.esp / reference[1].lstrip('/'), retained):
+                        raise ValueError('another boot entry still uses the retained UKI; remove that entry first')
+                if retained.exists() or retained.is_symlink():
+                    uki_path(args.esp, saved['path'])
+                elif has_entry:
+                    raise ValueError('registered fallback UKI is missing')
+                else:
+                    retained = None
+            else:
+                owned_reference = any(re.fullmatch(r'aurora-m3-previous-[0-9a-f]{16}\.efi',
+                    Path(value.split('#', 1)[0]).name.rstrip('.').lower())
+                    for value in re.findall(r'^\s*path:\s*boot\(\):(/\S+)', clean, re.M | re.I))
+                if has_entry or owned_reference:
+                    raise ValueError('custom fallback has no saved ownership record')
+            if regular(conf).read_text() != text: raise ValueError('Limine configuration changed during remove')
+            if args.action == 'remove':
+                atomic(conf, output.encode())
+                if retained is not None: retained.unlink()
+            return
         args.state.mkdir(parents=True, exist_ok=True)
         if args.action == 'retain':
-            if state_path.exists():
+            if state_path.exists() or state_path.is_symlink():
                 saved = json.loads(regular(state_path).read_text())
                 uki_path(args.esp, saved['path'])
                 if not (args.state / ('modules-' + saved['release']) / 'modules.dep').is_file():
@@ -6434,7 +6540,7 @@ def limine(args):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('action', choices=('retain', 'publish', 'disarm'))
+    p.add_argument('action', choices=('retain', 'publish', 'disarm', 'check-remove', 'remove'))
     p.add_argument('--esp', type=Path, required=True)
     p.add_argument('--state', type=Path, required=True)
     p.add_argument('--defaults', type=Path, default=Path('/etc/default/limine'))
@@ -6453,6 +6559,30 @@ def main():
 if __name__ == '__main__': main()
 M3_BOOT_PROFILE_PY
   $sudo chmod 0755 "$M3_BOOT_PROFILE_HELPER"
+}
+
+m3_limine_cleanup_needed() {
+  local target conf status
+  [[ ! -e $STATE/m3-known-entry.json && ! -L $STATE/m3-known-entry.json ]] || return 0
+  target=$(esp_bootbin) || return 1
+  for conf in EFI/BOOT/limine.conf boot/limine/limine.conf boot/limine.conf limine/limine.conf limine.conf; do
+    conf=${target%/m1n1/boot.bin}/$conf
+    [[ -e $conf || -L $conf ]] || continue
+    status=0
+    $sudo grep -qiE '^[[:space:]]*/Aurora previous \(GPU off\)[[:space:]]*$|^[[:space:]]*path:[[:space:]]*boot\(\):/[^[:space:]]*aurora-m3-previous-[[:xdigit:]]{16}\.efi\.*([#][^[:space:]]*)?[[:space:]]*$' "$conf" || status=$?
+    ((status <= 1)) || die "could not inspect the Limine recovery entry; nothing was uninstalled"
+    return "$status"
+  done
+  return 1
+}
+
+m3_limine_remove_check() {
+  local target
+  target=$(esp_bootbin) || die "cannot check the retained Limine entry without its mounted FAT boot partition; recovery state was kept"
+  m3_boot_profile_install
+  $sudo python3 "$M3_BOOT_PROFILE_HELPER" "${1:-check-remove}" --esp "${target%/m1n1/boot.bin}" --state "$STATE" ||
+    die "could not safely remove the retained Limine entry; its recovery state and modules were kept"
+  if [[ ${1:-} == remove ]]; then $sudo rm -f "$M3_BOOT_PROFILE_HELPER"; fi
 }
 
 m3_keep_limine_entry() {
