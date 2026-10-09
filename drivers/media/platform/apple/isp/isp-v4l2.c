@@ -6,6 +6,8 @@
 
 #include <media/media-device.h>
 #include <media/v4l2-common.h>
+#include <media/v4l2-ctrls.h>
+#include <media/v4l2-event.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-mc.h>
 #include <media/videobuf2-dma-sg.h>
@@ -469,9 +471,14 @@ static int isp_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
 
 	isp->sequence = 0;
 
+	/* The exposure priority is applied when the stream starts. */
+	v4l2_ctrl_grab(isp->exposure_priority, true);
+
 	err = apple_isp_start_streaming(isp);
-	if (err)
+	if (err) {
+		v4l2_ctrl_grab(isp->exposure_priority, false);
 		isp_vb2_release_buffers(isp, VB2_BUF_STATE_QUEUED);
+	}
 
 	return err;
 }
@@ -482,6 +489,7 @@ static void isp_vb2_stop_streaming(struct vb2_queue *q)
 
 	apple_isp_stop_streaming(isp);
 	isp_vb2_release_buffers(isp, VB2_BUF_STATE_ERROR);
+	v4l2_ctrl_grab(isp->exposure_priority, false);
 }
 
 int apple_isp_video_suspend(struct apple_isp *isp)
@@ -941,6 +949,10 @@ static const struct v4l2_ioctl_ops isp_v4l2_ioctl_ops = {
 	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
 	.vidioc_streamon = vb2_ioctl_streamon,
 	.vidioc_streamoff = vb2_ioctl_streamoff,
+
+	.vidioc_log_status = v4l2_ctrl_log_status,
+	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
+	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
 };
 
 static const struct v4l2_file_operations isp_v4l2_fops = {
@@ -1023,10 +1035,25 @@ int apple_isp_setup_video(struct apple_isp *isp)
 
 	isp->multiplanar = multiplanar;
 
+	/*
+	 * Auto exposure is always on. By default it holds the frame rate, as
+	 * V4L2 specifies; with exposure priority it may slow down in low light.
+	 */
+	v4l2_ctrl_handler_init(&isp->ctrl_handler, 1);
+	isp->exposure_priority =
+		v4l2_ctrl_new_std(&isp->ctrl_handler, NULL,
+				  V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0, 1, 1, 0);
+	if (isp->ctrl_handler.error) {
+		err = isp->ctrl_handler.error;
+		dev_err(isp->dev, "failed to create controls: %d\n", err);
+		goto ctrl_free;
+	}
+	isp->v4l2_dev.ctrl_handler = &isp->ctrl_handler;
+
 	err = v4l2_device_register(isp->dev, &isp->v4l2_dev);
 	if (err) {
 		dev_err(isp->dev, "failed to register v4l2 device: %d\n", err);
-		goto media_unregister;
+		goto ctrl_free;
 	}
 
 	vbq->drv_priv = isp;
@@ -1070,7 +1097,8 @@ int apple_isp_setup_video(struct apple_isp *isp)
 
 v4l2_unregister:
 	v4l2_device_unregister(&isp->v4l2_dev);
-media_unregister:
+ctrl_free:
+	v4l2_ctrl_handler_free(&isp->ctrl_handler);
 	media_device_unregister(&isp->mdev);
 media_cleanup:
 	media_device_cleanup(&isp->mdev);
@@ -1084,6 +1112,7 @@ void apple_isp_remove_video(struct apple_isp *isp)
 {
 	vb2_video_unregister_device(&isp->vdev);
 	v4l2_device_unregister(&isp->v4l2_dev);
+	v4l2_ctrl_handler_free(&isp->ctrl_handler);
 	media_device_unregister(&isp->mdev);
 	media_device_cleanup(&isp->mdev);
 }

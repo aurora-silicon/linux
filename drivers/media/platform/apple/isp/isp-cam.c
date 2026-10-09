@@ -379,17 +379,22 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 
 static int isp_ch_configure_frame_rate(struct apple_isp *isp, u32 ch)
 {
+	u32 rate = isp->frame_rate * ISP_FRAME_RATE_SCALE;
+	u32 min_rate = rate;
 	int err;
 
-	err = isp_cmd_ch_ae_frame_rate_max_set(isp, ch,
-					       isp->frame_rate *
-					       ISP_FRAME_RATE_SCALE);
+	/*
+	 * Auto exposure lengthens the frame time in low light only if it may
+	 * vary the frame rate; otherwise it holds the rate and raises the gain.
+	 */
+	if (v4l2_ctrl_g_ctrl(isp->exposure_priority))
+		min_rate = ISP_FRAME_RATE_MIN * ISP_FRAME_RATE_SCALE;
+
+	err = isp_cmd_ch_ae_frame_rate_max_set(isp, ch, rate);
 	if (err)
 		return err;
 
-	return isp_cmd_ch_ae_frame_rate_min_set(isp, ch,
-						ISP_FRAME_RATE_MIN *
-						ISP_FRAME_RATE_SCALE);
+	return isp_cmd_ch_ae_frame_rate_min_set(isp, ch, min_rate);
 }
 
 static int isp_ch_configure_pools(struct apple_isp *isp, u32 ch)
