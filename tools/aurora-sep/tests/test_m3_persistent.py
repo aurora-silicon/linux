@@ -13,6 +13,17 @@ class Persistent(test_m3_handoff.M3PathTest):
         (self.dt/'chosen/asahi,os-fw-version').write_bytes(b'14.8.3\0' if profile=='legacy' else b'26.6.2\0')
         return f'M3_GPU_PERSISTENT=1\nM3_GPU_PROFILE={profile}\nM3_TRY=1\nM3_STACK_ID={"a"*64}\nM3_STAGE1_25_VERSIONS=source-built-25\n'
 
+    def test_matched_j61514_admitted_but_old_bundle_and25_refused(self):
+        setup=self.setup_profile()
+        self.mac('j615')
+        (self.dt/'chosen/asahi,os-fw-version').write_bytes(b'14.7\0')
+        self.assertNotEqual(self.run_sh(setup+'M3_GPU_AUTO=1\nm3_plan',check=False).returncode,0)
+        matched=setup+'M3_PERSISTENT_BOARDS="j613 j615"\nM3_HANDOFF_BOARDS="j516s j613 j615"\nM3_GPU_AUTO=1\n'
+        out=self.run_sh(matched+'m3_plan\nm3_persistent_preflight\necho "$M3_GPU_PROFILE:$M3_MODE"').stdout
+        self.assertIn('legacy:handoff',out)
+        self.gpu_descriptor((26,6,2))
+        self.assertNotEqual(self.run_sh(matched+'m3_plan',check=False).returncode,0)
+
     def test_persistent14_plan_and_switches(self):
         out=self.run_sh(self.setup_profile()+'m3_plan\nm3_persistent_preflight\necho "$M3_MODE"\nm3_switches\nm3_variant').stdout
         self.assertIn('handoff',out)
@@ -28,6 +39,22 @@ class Persistent(test_m3_handoff.M3PathTest):
         (self.dt/'chosen/asahi,m1n1-oslog-overlap').unlink()
         (self.dt/'chosen/asahi,os-fw-version').unlink()
         self.assertIn('stage 1 is v1.6.1',self.run_sh(setup+'m3_stage1_problem').stdout)
+
+    def test_clean161_j615_requires_matching_bundle_and_existing_layout_guards(self):
+        setup=self.setup_profile(stage1='v1.6.1')
+        self.mac('j615',stage1='v1.6.1')
+        (self.dt/'chosen/asahi,os-fw-version').write_bytes(b'14.7\0')
+        self.assertIn('stage 1 is',self.run_sh(setup+'m3_stage1_problem').stdout)
+        setup+='M3_PERSISTENT_BOARDS="j613 j615"\n'
+        self.assertEqual(self.run_sh(setup+'m3_stage1_problem').stdout,'')
+        (self.dt/'chosen/asahi,m1n1-oslog-overlap').write_bytes(bytes(16))
+        self.assertIn('stage 1 is',self.run_sh(setup+'m3_stage1_problem').stdout)
+        (self.dt/'chosen/asahi,m1n1-oslog-overlap').unlink()
+        self.mac('j615',stage1='v1.6.1',stub='14.7')
+        self.assertIn('stage 1 is',self.run_sh(setup+'m3_stage1_problem').stdout)
+        self.mac('j615',stage1='v1.6.1')
+        setup+='M3_GPU_PROFILE=j613-25g83\n'
+        self.assertIn('stage 1 is',self.run_sh(setup+'m3_stage1_problem').stdout)
 
     def test_clean161_never_qualifies25(self):
         setup=self.setup_profile('j613-25g83','v1.6.1')
@@ -174,7 +201,7 @@ class Persistent(test_m3_handoff.M3PathTest):
         self.assertIn('explicit owner switch-off',result.stderr)
 
     def selection(self):
-        return f'M3_GPU_OPTIN="{self.etc}/intent"\nM3_GPU_PROFILE_FILE="{self.etc}/profile"\nM3_MESA_NATIVE_MARKER="{self.tmp}/native-marker"\nchain=grub\n'
+        return f'M3_GPU_OPTIN="{self.etc}/intent"\nM3_GPU_PROFILE_FILE="{self.etc}/profile"\nM3_MESA_NATIVE_MARKER="{self.tmp}/native-marker"\nM3_GPU_CHECK="{self.tmp}/aurora-m3-gpu-check"\nchain=grub\n'
 
     def test_marker_failure_does_not_publish_intent_or_state(self):
         setup=self.setup_profile('j613-25g83','source-built-25')+self.selection()

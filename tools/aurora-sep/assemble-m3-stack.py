@@ -45,6 +45,14 @@ def assemble(template, manifest, directory):
     sources = manifest.get('source_commits', {})
     if any(not re.fullmatch(r'[0-9a-f]{40}', sources.get(k,'')) for k in ('kernel','m1n1')):
         raise ValueError('exact kernel and m1n1 source commits are required')
+    boards = manifest.get('legacy_gpu_boards', ['j613'])
+    if (not isinstance(boards, list) or not boards or len(set(boards)) != len(boards) or
+            any(b not in ('j613', 'j615') for b in boards)):
+        raise ValueError('legacy GPU boards must name supported Air boards once')
+    if 'j615' in boards and sources['kernel'] != '7d5a612eceaa5299131c12f79873db13d969daa9':
+        raise ValueError('J615 legacy GPU requires the matched J615 kernel consumer')
+    if 'j615' in boards and sources['m1n1'] != '74ba6bea52d1f865d204bb3f8168705a148fd5c5':
+        raise ValueError('J615 legacy GPU requires the matched J615 m1n1 producer')
     packages = manifest['packages']
     if set(packages) != set(ROLES): raise ValueError('manifest must name every matched and auxiliary package')
     pins = {}; resolved = {}
@@ -88,7 +96,7 @@ def assemble(template, manifest, directory):
     s = template
     substitutions = dict(VERSION=manifest['version'],TAG=manifest['tag'],M1N1_BIN_SHA=binary_sha,
                          DESKTOP_FIXES_DATA=desktop_data(manifest, directory),
-                         M3_STACK_ID=stack_id, M3_STAGE1_25_VERSIONS=' '.join(manifest['stage1_25_versions']),
+                         M3_STACK_ID=stack_id, M3_PERSISTENT_BOARDS=' '.join(boards), M3_STAGE1_25_VERSIONS=' '.join(manifest['stage1_25_versions']),
                          M1N1_PACKAGE=pins['m1n1'],M3_PRO_MESA_PACKAGE=pins['mesa'])
     for key,value in substitutions.items():
         replacement = key+'="'+value+'"' if key not in ('VERSION','TAG','M1N1_BIN_SHA') else key+'='+value
