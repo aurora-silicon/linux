@@ -379,6 +379,52 @@
 				};
 			};
 		};
+
+		/*
+		 * Once the PMP knows the GPU is on, it votes the DRAM controller
+		 * (DCS) up with GPU load, and the GPU and memory system draw up
+		 * to 2.4 W more. The CPU zones above cannot hold that back: on a
+		 * GPU-bound load the CPUs request little power, so with the
+		 * performance governor the die passed 95 C within 35 s and
+		 * reached 104 C before they throttled. This zone limits the DCS
+		 * vote instead, through the PMC. With it the same load peaks at
+		 * 97 C, as it does without any DCS vote, and a ten-minute
+		 * balanced GPU load loses 1-2% of its throughput.
+		 *
+		 * Tp0t reads at or above every CPU die sensor under GPU load,
+		 * and leads them by about 1 C when the CPUs also run hot. The
+		 * sustainable power is the whole DCS range, so the vote is only
+		 * trimmed above the control trip; the PID gains follow from it
+		 * and the 6 C between the trips.
+		 */
+		soc-dcs-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 6>;	/* Tp0t */
+			sustainable-power = <2407>;
+
+			trips {
+				soc_dcs_alert: trip-alert {
+					temperature = <89000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				soc_dcs_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&soc_dcs_control>;
+					cooling-device =
+						<&pmc THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
 	};
 };
 
@@ -417,6 +463,15 @@
 };
 
 &pmp {
+	status = "okay";
+};
+
+&pmc {
+	/*
+	 * System power above DCS state 0 at each DCS state, measured with
+	 * glmark2's terrain scene, GPU-bound, on the J700.
+	 */
+	apple,dcs-power-microwatt = <0 919000 1453000 2058000 2407000>;
 	status = "okay";
 };
 
@@ -618,6 +673,13 @@
 	 * float, reads 10-99 C and moves between samples. The names follow
 	 * the SMC key groups and are not otherwise verified.
 	 */
+
+	/* Channel 6, the sensor of soc-dcs-thermal: keep it first here. */
+	temperature-Tp0t {
+		apple,key-id = "Tp0t";
+		label = "SMC Tp0t";
+	};
+
 	temperature-TH0p {
 		apple,key-id = "TH0p";
 		label = "Storage (NAND)";
@@ -892,11 +954,6 @@
 	temperature-Tp0q {
 		apple,key-id = "Tp0q";
 		label = "SMC Tp0q";
-	};
-
-	temperature-Tp0t {
-		apple,key-id = "Tp0t";
-		label = "SMC Tp0t";
 	};
 
 	temperature-Tpx0 {

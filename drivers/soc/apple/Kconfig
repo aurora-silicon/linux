@@ -163,6 +163,19 @@ config APPLE_PMP
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_CLPC
+	tristate "Apple host performance controller floors"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on APPLE_PMC && CPU_FREQ
+	select MFD_SYSCON
+	default ARCH_APPLE
+	help
+	  Raises the DRAM controller and SoC fabric performance floors of the
+	  host's PMC voter agent while CPU clusters, and optionally the GPU,
+	  are busy, and releases them at idle.
+
+	  Say 'y' or 'm' here if you have an Apple SoC with a PMC.
+
 endmenu
 
 endif
