@@ -7,7 +7,11 @@ use crate::g16_render::{BuildError, Stage};
 pub(crate) struct Args {
     pub(crate) command: u64, pub sku: u64, pub queue: u64, pub stats: u64,
     pub(crate) pb_slot: u64, pub manager: u64, pub pb_aux: u64,
-    pub(crate) notifier: u64, pub shared_stamp: u64, pub stamp_address: u64,
+    pub(crate) notifier: u64,
+    /// JobMeta first pointer: shared stamp published by the ready notifier.
+    pub(crate) user_stamp: u64,
+    /// JobMeta second pointer and Finalize: internal dependency stamp.
+    pub(crate) fw_stamp: u64,
     pub(crate) uma: u64, pub uma_aux: u64, pub timestamp_storage: u64,
     pub(crate) context: u32, pub generation: u8, pub counter: u64,
     pub(crate) uuid: u32, pub stamp: u32, pub event_slot: u32,
@@ -146,7 +150,7 @@ pub(crate) fn encode(command: &mut [u8], sku: &mut [u8], stage: Stage, a: Args) 
     if a.context >= 64 || a.generation == 0 || a.event_slot >= 128 || a.stamp == 0
         || a.fragment_slot >= 128 || a.fragment_stamp == 0
         || ![a.command, a.sku, a.queue, a.stats, a.pb_slot, a.manager, a.pb_aux,
-              a.notifier, a.shared_stamp, a.stamp_address, a.uma,
+              a.notifier, a.user_stamp, a.fw_stamp, a.uma,
               a.timestamp_storage].iter().all(|p| valid_fw(*p))
         || a.uma_aux == 0 || a.uma_aux >= 1 << 42 {
         return Err(BuildError::Address);
@@ -157,7 +161,7 @@ pub(crate) fn encode(command: &mut [u8], sku: &mut [u8], stage: Stage, a: Args) 
     put(command, 4, a.counter, 8);
     put(command, 0xc, a.context as u64, 4);
     for (off, value, size) in [
-        (0, a.shared_stamp, 8), (8, a.stamp_address, 8), (0x10, a.stamp as u64, 4),
+        (0, a.user_stamp, 8), (8, a.fw_stamp, 8), (0x10, a.stamp as u64, 4),
         (0x14, a.event_slot as u64, 4), (0x20, a.uuid as u64, 4)] {
         put(command, meta + off, value, size);
     }
@@ -226,12 +230,12 @@ pub(crate) fn encode(command: &mut [u8], sku: &mut [u8], stage: Stage, a: Args) 
         for (off,value,size) in [
             (4,a.pb_slot,8), (0xc,a.manager,8), (0x14,a.stats,8), (0x1c,a.queue,8),
             (0x24,a.command+0x85c,8), (0x2c,a.context as u64,4),
-            (0x34,a.command+0x784,8), (0x40,a.uuid as u64,4), (0x48,a.stamp_address,8),
+            (0x34,a.command+0x784,8), (0x40,a.uuid as u64,4), (0x48,a.fw_stamp,8),
             (0x50,a.stamp as u64,4), (wire.finalize_uma_pointer,a.sku+uma as u64,8),
             (wire.finalize_restart,(-(finalize as i32)) as u32 as u64,4), (0x85,a.command+wire.command_status as u64,8)] { put(f,off,value,size); }
     } else {
         for (off,value,size) in [
-            (4,a.uuid as u64,4), (0xc,a.stamp_address,8), (0x14,a.stamp as u64,4),
+            (4,a.uuid as u64,4), (0xc,a.fw_stamp,8), (0x14,a.stamp as u64,4),
             (0x1c,a.pb_slot,8), (0x24,a.manager,8), (0x2c,1,4), (0x30,a.stats,8),
             (0x38,a.command+0xbb0,8), (0x40,a.command+0xbb4,8), (0x48,a.command+0xb70,8),
             (0x50,a.queue,8), (0x58,a.command,8), (0x60,a.context as u64,4),
