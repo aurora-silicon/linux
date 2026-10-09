@@ -30,7 +30,7 @@ same installer's `--m3-report` output.
 
 The matched installer keeps a GPU-off fallback. `--m3-gpu-experiment`
 only installs one-shot tools and is unnecessary for this persistent route.
-The command and installed checker require the new matched release;
+The command and installed checker are available in **Aurora 2026.10.09**;
 12.6 supports Air 13 with `--m3-gpu-persistent` and its Mesa probe instead.
 
 | Mac | Route |
@@ -57,7 +57,6 @@ existing matched `v1.6.1-m3next.stage1` handoff may use
 `--m3-profile=j613-25g83`. This selects `/opt/mesa-m3/25g83` and
 `j613-25g83-hal200`. Its checker reports OpenGL readback and **Vulkan
 unavailable**. J615 native25 is unsupported. Native scratch shaders are
-refused; power calibration remains experimental, and native OpenGL
-hardware runtime/conformance remains unqualified. Legacy 14/Pro Vulkan
+refused; power calibration remains experimental. Legacy 14/Pro Vulkan
 stays separate. Firmware and calibration remain specific to each Mac;
 the installer migrates neither firmware nor stage 1.
