@@ -247,6 +247,32 @@ static irqreturn_t baku_rtc_interrupt(int irq, void *context)
 	return IRQ_HANDLED;
 }
 
+/*
+ * Firmware leaves the alarm armed even when it has no wake scheduled, with
+ * the comparator set close to the end of 32-bit time. Keep an alarm that is
+ * still pending within the supported range, so that the RTC core picks it
+ * up at registration, and disarm anything else.
+ */
+static int baku_rtc_init_alarm(struct baku_rtc *baku)
+{
+	unsigned int control, mask;
+	__le32 comparator;
+	int error;
+
+	error = regmap_read(baku->map, BAKU_RTC_CONTROL, &control);
+	if (!error)
+		error = regmap_read(baku->map, BAKU_RTC_MASK, &mask);
+	if (!error)
+		error = regmap_bulk_read(baku->map, BAKU_RTC_COMPARE,
+					 &comparator, sizeof(comparator));
+	if (error)
+		return error;
+	if ((control & BAKU_RTC_ARM) && !(mask & BAKU_RTC_ALARM) &&
+	    !baku_rtc_validate_alarm(baku, le32_to_cpu(comparator)))
+		return 0;
+	return baku_rtc_stop_alarm(baku);
+}
+
 static const struct rtc_class_ops baku_rtc_ops = {
 	.read_time = baku_rtc_read_time,
 	.read_alarm = baku_rtc_read_alarm,
@@ -284,7 +310,6 @@ static int baku_rtc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct baku_rtc *baku;
-	unsigned int control;
 	int error;
 
 	/* Retention has only been measured on J700 with the explicit opt-in. */
@@ -304,12 +329,6 @@ static int baku_rtc_probe(struct platform_device *pdev)
 		return baku->interrupt;
 	mutex_init(&baku->transaction);
 	platform_set_drvdata(pdev, baku);
-	error = regmap_read(baku->map, BAKU_RTC_CONTROL, &control);
-	if (error)
-		return error;
-	/* Respect an alarm left armed by firmware. */
-	if (control & BAKU_RTC_ARM)
-		return -EBUSY;
 	baku->clock = devm_rtc_allocate_device(dev);
 	if (IS_ERR(baku->clock))
 		return PTR_ERR(baku->clock);
@@ -332,7 +351,7 @@ static int baku_rtc_probe(struct platform_device *pdev)
 					  dev_name(dev), dev);
 	if (error)
 		goto disable_wakeup;
-	error = baku_rtc_stop_alarm(baku);
+	error = baku_rtc_init_alarm(baku);
 	if (error)
 		goto disable_wakeup;
 	error = devm_rtc_register_device(baku->clock);
