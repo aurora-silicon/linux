@@ -164,6 +164,9 @@ struct apple_dcp_v14 {
 	/* The firmware refused a matrix: none is sent until reboot. */
 	bool ctm_disabled;
 	u64 ctm_calls;
+	/* The last firmware backlight correction notification; not a nits target. */
+	u32 backlight_factor;
+	u64 backlight_factor_updates;
 	u32 ctm_status, ctm_get_status;
 	u64 ctm_readback[9];
 	struct work_struct idle_work;
@@ -853,6 +856,16 @@ static int dcp_v14_callback(void *cookie, u32 tag, const void *input, u32 in_siz
 	}
 
 #define SHAPE(i, o) (in_size == (i) && out_size == (o))
+	/*
+	 * Backlight correction notification: one signed 32-bit factor, no
+	 * reply payload. The firmware applies it when the colour matrix
+	 * changes; it is not a host request to set the panel brightness.
+	 */
+	if (tag == D(208) && SHAPE(4, 0)) {
+		v14->backlight_factor = get_unaligned_le32(in);
+		v14->backlight_factor_updates++;
+		return 0;
+	}
 	/* get_time */
 	if (tag == D(209) && SHAPE(0, 8)) {
 		put_unaligned_le64(ktime_to_ms(ktime_get_real()), out);
@@ -2182,6 +2195,8 @@ static int dcp_v14_status_show(struct seq_file *m, void *unused)
 	seq_printf(m, "panel %ux%u\nboot_fb %ux%u stride %u\nclock %llu\n",
 		   v14->panel_width, v14->panel_height, v14->fb_width, v14->fb_height,
 		   v14->stride, v14->clock_rate);
+	seq_printf(m, "backlight factor %#x updates %llu\n",
+		   v14->backlight_factor, v14->backlight_factor_updates);
 	seq_printf(m, "ctm valid %d disabled %d calls %llu setter %#x getter %#x\n",
 		   v14->ctm_valid, v14->ctm_disabled, v14->ctm_calls, v14->ctm_status,
 		   v14->ctm_get_status);
