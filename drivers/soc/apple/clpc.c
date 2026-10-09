@@ -109,7 +109,10 @@ struct apple_clpc {
 	unsigned int agent;
 	struct regmap *gpu_regmap;
 	u32 gpu_offset;
+	/* Samples while a vote is held; idle_work defers to busy CPUs. */
 	struct delayed_work work;
+	struct delayed_work idle_work;
+	bool stopped;
 	struct apple_clpc_cluster clusters[APPLE_CLPC_MAX_CLUSTERS];
 	unsigned int nr_clusters;
 	cpumask_var_t covered;
@@ -262,10 +265,23 @@ static u32 apple_clpc_floor(struct apple_clpc *clpc, const unsigned int *state)
 	return floor;
 }
 
-static void apple_clpc_work(struct work_struct *work)
+static void apple_clpc_queue(struct apple_clpc *clpc, bool idle)
 {
-	struct apple_clpc *clpc = container_of(to_delayed_work(work),
-					       struct apple_clpc, work);
+	if (READ_ONCE(clpc->stopped))
+		return;
+
+	/*
+	 * A held vote has to be sampled on time so that it drops once demand
+	 * stops; with no vote held, sampling can wait for a CPU that wakes up
+	 * anyway rather than waking an idle one every period.
+	 */
+	queue_delayed_work(system_freezable_power_efficient_wq,
+			   idle ? &clpc->idle_work : &clpc->work,
+			   msecs_to_jiffies(sample_ms));
+}
+
+static void apple_clpc_sample(struct apple_clpc *clpc)
+{
 	unsigned int demand[APPLE_CLPC_RAILS] = {};
 	unsigned int state[APPLE_CLPC_RAILS];
 	unsigned long now = jiffies;
@@ -305,8 +321,19 @@ static void apple_clpc_work(struct work_struct *work)
 				   apple_clpc_floor(clpc, state)))
 		clpc->update_errors++;
 
-	queue_delayed_work(system_highpri_wq, &clpc->work,
-			   msecs_to_jiffies(sample_ms));
+	apple_clpc_queue(clpc, !apple_clpc_floor(clpc, state));
+}
+
+static void apple_clpc_work(struct work_struct *work)
+{
+	apple_clpc_sample(container_of(to_delayed_work(work), struct apple_clpc,
+				       work));
+}
+
+static void apple_clpc_idle_work(struct work_struct *work)
+{
+	apple_clpc_sample(container_of(to_delayed_work(work), struct apple_clpc,
+				       idle_work));
 }
 
 static int apple_clpc_status_show(struct seq_file *s, void *unused)
@@ -422,14 +449,33 @@ static void apple_clpc_free_clusters(struct apple_clpc *clpc)
 	free_cpumask_var(clpc->covered);
 }
 
+/* Stop sampling and give the floor back, before suspend and on removal. */
+static void apple_clpc_halt(struct apple_clpc *clpc)
+{
+	unsigned int rail, i;
+
+	/*
+	 * Each pass queues one of the two works unless stopped. A pass that
+	 * began before the flag was set can still queue the other work once,
+	 * which the second round cancels.
+	 */
+	WRITE_ONCE(clpc->stopped, true);
+	for (i = 0; i < 2; i++) {
+		cancel_delayed_work_sync(&clpc->work);
+		cancel_delayed_work_sync(&clpc->idle_work);
+	}
+	apple_pmc_floor_update(clpc->pmc, clpc->agent, clpc->mask,
+			       clpc->saved_floor);
+	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+		clpc->vote[rail].state = 0;
+}
+
 static void apple_clpc_stop(void *data)
 {
 	struct apple_clpc *clpc = data;
 
-	cancel_delayed_work_sync(&clpc->work);
+	apple_clpc_halt(clpc);
 	debugfs_remove_recursive(clpc->debugfs);
-	apple_pmc_floor_update(clpc->pmc, clpc->agent, clpc->mask,
-			       clpc->saved_floor);
 	apple_clpc_free_clusters(clpc);
 }
 
@@ -504,6 +550,7 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	apple_clpc_find_clusters(clpc);
 	clpc->next_scan = jiffies + HZ;
 	INIT_DELAYED_WORK(&clpc->work, apple_clpc_work);
+	INIT_DEFERRABLE_WORK(&clpc->idle_work, apple_clpc_idle_work);
 
 	clpc->debugfs = debugfs_create_dir(dev_name(dev), NULL);
 	debugfs_create_file("status", 0400, clpc->debugfs, clpc,
@@ -515,10 +562,36 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	queue_delayed_work(system_highpri_wq, &clpc->work,
-			   msecs_to_jiffies(sample_ms));
+	platform_set_drvdata(pdev, clpc);
+	apple_clpc_queue(clpc, true);
 	return 0;
 }
+
+/*
+ * Tasks are frozen before devices suspend, and with them the sampling, so
+ * the floor would otherwise stay at whatever the last busy sample asked for
+ * through the whole sleep.
+ */
+static int apple_clpc_suspend(struct device *dev)
+{
+	apple_clpc_halt(dev_get_drvdata(dev));
+	return 0;
+}
+
+static int apple_clpc_resume(struct device *dev)
+{
+	struct apple_clpc *clpc = dev_get_drvdata(dev);
+	unsigned int cpu;
+
+	for_each_possible_cpu(cpu)
+		clpc->wall[cpu] = 0;
+	WRITE_ONCE(clpc->stopped, false);
+	apple_clpc_queue(clpc, true);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(apple_clpc_pm_ops, apple_clpc_suspend,
+				apple_clpc_resume);
 
 /* T8140: DCS states 0-4 on rail 0, fabric states 0-3 on rail 1. */
 static const struct apple_clpc_hw apple_clpc_hw_t8140 = {
@@ -537,6 +610,7 @@ static struct platform_driver apple_clpc_driver = {
 	.driver = {
 		.name = "apple-clpc",
 		.of_match_table = apple_clpc_of_match,
+		.pm = pm_sleep_ptr(&apple_clpc_pm_ops),
 	},
 };
 module_platform_driver(apple_clpc_driver);
