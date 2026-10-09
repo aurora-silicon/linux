@@ -100,11 +100,33 @@ def tree(tc):
     return out
 
 
+def package_check_log(tc, text):
+    lines = text.splitlines()
+    queries = [i for i, line in enumerate(lines) if line == 'pacman -Qu --color never']
+    if queries:
+        tc.assertEqual(len(queries), lines.count('pacman -Sy --noconfirm'))
+        for i in queries:
+            tc.assertGreater(i, 0)
+            tc.assertEqual(lines[i - 1], 'pacman -Sy --noconfirm')
+        downloads = [i for i, line in enumerate(lines) if line.startswith('curl ')]
+        if downloads: tc.assertLess(queries[0], downloads[0])
+    out = []
+    for line in lines:
+        if line in ('pacman -Qu --color never', 'pacman -Sy --noconfirm', 'sudo pacman -Sy --noconfirm'): continue
+        line = line.replace('pacman -Sy --noconfirm --ask 4 ', 'pacman -S --noconfirm --ask 4 ')
+        out.append(line)
+    return out
+
+
+def refresh_notice(text):
+    return re.sub(r'(?m)^(?:\x1b\[[0-9;]*m)*==>(?:\x1b\[[0-9;]*m)* Refreshing the package database\n', '', text)
+
+
 def same_commands(tc, before, after):
     """The two command logs ran the same commands. The $sudo lines and the others are compared
     each in order, and all lines as a multiset: the two sides of a pipeline such as
     "pacman -Q ... | $sudo tee ..." log in either order."""
-    a, b = before.splitlines(), after.splitlines()
+    a, b = package_check_log(tc, before), package_check_log(tc, after)
     tc.assertEqual(sorted(b), sorted(a))
     tc.assertEqual([l for l in b if l.startswith("sudo ")], [l for l in a if l.startswith("sudo ")])
     tc.assertEqual([l for l in b if not l.startswith("sudo ")], [l for l in a if not l.startswith("sudo ")])

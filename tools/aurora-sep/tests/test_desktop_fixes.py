@@ -221,10 +221,31 @@ install_all
   self.env['DESKTOP_FAIL_TRANSACTION']='1';r=self.install()
   self.assertEqual(r.returncode,42,r.stderr)
   self.assertEqual(marker.read_bytes(),b'locked-generation\n');self.assertEqual(pam.read_bytes(),before)
- def test_kernel_uninstall_body_is_unchanged(self):
-  current=(ROOT/'install-aurora-sep.sh').read_text()
-  old=subprocess.check_output(['git','show','05d6db:tools/aurora-sep/install-aurora-sep.sh'],cwd=ROOT,text=True)
-  pattern=r'^uninstall_all\(\) \{.*?^\}'
-  self.assertEqual(re.search(pattern,current,re.M|re.S).group(),re.search(pattern,old,re.M|re.S).group())
+ def test_kernel_uninstall_keeps_desktop_packages_and_activation(self):
+  result=self.shell(f"""
+set -eu
+STATE='{self.base / 'installer-state'}'
+UPDATE_M1N1_CONF='{self.base / 'update-m1n1'}'
+M3_GRUB_DEFAULTS='{self.base / 'grub'}'
+M3_LIMINE_DEFAULTS='{self.base / 'limine'}'
+sudo=record_mutation
+record_mutation() {{ printf '%s\\n' "$*" >>"$DESKTOP_LOG"; }}
+pacman() {{ printf 'pacman %s\\n' "$*" >>"$DESKTOP_LOG"; }}
+require_supported_soc() {{ :; }}
+is_m3() {{ return 1; }}
+is_m3_pro() {{ return 1; }}
+is_neo() {{ return 1; }}
+boot_chain() {{ echo limine; }}
+esp_bootbin() {{ return 1; }}
+m3_gpu_disarm() {{ :; }}
+snapshot() {{ :; }}
+aurora-touchid-setup() {{ :; }}
+uninstall_all
+""")
+  self.assertEqual(result.returncode,0,result.stderr)
+  log=self.log.read_text()
+  self.assertIn('pacman -S --noconfirm --ask 4 linux-asahi linux-asahi-headers libfprint m1n1',log)
+  for name in ('omarchy','omarchy-settings','aquamarine','wayland-sessions','sddm','session-guard'):
+   self.assertNotIn(name,log)
 
 if __name__=='__main__':unittest.main()

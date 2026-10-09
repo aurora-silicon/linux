@@ -30,6 +30,7 @@ import time
 import unittest
 
 import test_m3_flow as flow
+import test_m3_pro_mesa as pro
 from test_m3_air_default import normalize_undo_label
 
 SRC = flow.SRC
@@ -1461,16 +1462,12 @@ class SameAs122Test(MaxBase):
                 # The same commands: as a multiset, and in order among the $sudo lines and among
                 # the others. The two sides of a pipeline such as "pacman -Q ... | $sudo tee ..."
                 # log in either order (test_m3_pro_mesa.same_commands).
-                a, b = before["log"].splitlines(), after["log"].splitlines()
-                self.assertEqual(sorted(b), sorted(a))
-                self.assertEqual([l for l in b if l.startswith("sudo ")], [l for l in a if l.startswith("sudo ")])
-                self.assertEqual([l for l in b if not l.startswith("sudo ")],
-                                 [l for l in a if not l.startswith("sudo ")])
+                pro.same_commands(self, before["log"], after["log"])
                 self.assertEqual(sorted(after["tree"]), sorted(before["tree"]))
                 for path, data in before["tree"].items():
                     self.assertEqual(after["tree"][path], data, path)
                 # Only the undo label and the next-steps block may differ; commands stay exact.
-                old_out, new_out = (normalize_undo_label(run["out"][0]) for run in (before, after))
+                old_out, new_out = (pro.refresh_notice(normalize_undo_label(run["out"][0])) for run in (before, after))
                 self.assertTrue(new_out.startswith(old_out), board)
                 extra = new_out[len(old_out):]
                 compat = flow.BOARDS[board]
@@ -1481,7 +1478,8 @@ class SameAs122Test(MaxBase):
                     self.assertTrue(extra.startswith("\n====="), extra)
                 else:
                     self.assertEqual(extra, "")
-                self.assertEqual(after["out"][1:], before["out"][1:])
+                self.assertEqual([pro.refresh_notice(x) if x else x for x in after["out"][1:]],
+                                 [pro.refresh_notice(x) if x else x for x in before["out"][1:]])
         # The M3 Airs get mesa-m3 from 12.4 on: test_m3_air_default compares them with 12.3.
         airs_have_mesa = "m3_mesa_mac() { is_m3_pro || is_m3_air; }" in SRC
         for board in ("j514c", "j516c", "j514m", "j516m", "j504", "j433", "j615", "j314s", "j700"):

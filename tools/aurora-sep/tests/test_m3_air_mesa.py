@@ -247,7 +247,7 @@ class M3ProAs123Test(flow.M3FlowBase):
                     finally:
                         self.installer = flow.INSTALLER
                     out = self.RUN.sub("run_id=<id>", pro.MKTEMP.sub("<tmp>", proc.stdout))
-                    out = air_default.normalize_undo_label(out)
+                    out = pro.refresh_notice(air_default.normalize_undo_label(out))
                     # 12.3's release number read as this one's (its packages, tag and boot.bin copy).
                     outs.append(out.replace(old_version, flow.VERSION).splitlines())
                 changed = [l for l in difflib.unified_diff(outs[0], outs[1], lineterm="", n=0)

@@ -105,6 +105,15 @@ def uki_path(esp, value):
     if m[2] and m[2] != digest: raise ValueError('UKI hash pin differs')
     return data, digest
 
+def same_esp_path(left, right):
+    # VFAT names ignore ASCII case and trailing dots in each component.
+    key = lambda path: tuple(part.rstrip('.').lower() for part in path.resolve().parts)
+    if key(left) == key(right): return True
+    try:
+        return os.path.samestat(left.stat(), right.stat())
+    except FileNotFoundError:
+        return False
+
 def limine(args):
     with locks(args.lock, args.lock_timeout):
         loader = regular(args.esp / 'EFI/BOOT/BOOTAA64.EFI').read_bytes()
@@ -121,9 +130,49 @@ def limine(args):
         text = regular(conf).read_text()
         clean = without_block(text)
         state_path = args.state / 'm3-known-entry.json'
+        if args.action in ('check-remove', 'remove'):
+            output = clean
+            retained = None
+            has_entry = re.search(r'^\s*/' + re.escape(FALLBACK) + r'\s*$', clean, re.M)
+            if state_path.exists() or state_path.is_symlink():
+                saved = json.loads(regular(state_path).read_text())
+                match = re.fullmatch(r'boot\(\):(/EFI/Linux/aurora-m3-previous-[0-9a-f]{16}\.efi)#([0-9a-f]{128})', saved['path'])
+                if not match or not match[1].endswith(match[2][:16] + '.efi'):
+                    raise ValueError('retained UKI name and hash pin differ')
+                retained = args.esp / match[1].lstrip('/')
+                # An edited or snapshot entry must not lose its kernel or modules.
+                if has_entry:
+                    lines, fields = entry(clean, FALLBACK, 1)
+                    if fields['path'][1] != saved['path'] or fields['cmdline'][1] != saved['cmdline']:
+                        raise ValueError('custom fallback differs from retained entry')
+                    start = next(i for i, line in enumerate(lines) if line.strip() == '/' + FALLBACK)
+                    end = start + 1
+                    while end < len(lines) and not lines[end].lstrip().startswith('/'): end += 1
+                    output = ''.join(lines[:start] + lines[end:]).rstrip() + '\n'
+                for value in re.findall(r'^\s*path:\s*(\S+)', output, re.M | re.I):
+                    reference = re.fullmatch(r'boot\(\):(/[^#]+)(?:#[0-9a-fA-F]{128})?', value)
+                    if reference and same_esp_path(args.esp / reference[1].lstrip('/'), retained):
+                        raise ValueError('another boot entry still uses the retained UKI; remove that entry first')
+                if retained.exists() or retained.is_symlink():
+                    uki_path(args.esp, saved['path'])
+                elif has_entry:
+                    raise ValueError('registered fallback UKI is missing')
+                else:
+                    retained = None
+            else:
+                owned_reference = any(re.fullmatch(r'aurora-m3-previous-[0-9a-f]{16}\.efi',
+                    Path(value.split('#', 1)[0]).name.rstrip('.').lower())
+                    for value in re.findall(r'^\s*path:\s*boot\(\):(/\S+)', clean, re.M | re.I))
+                if has_entry or owned_reference:
+                    raise ValueError('custom fallback has no saved ownership record')
+            if regular(conf).read_text() != text: raise ValueError('Limine configuration changed during remove')
+            if args.action == 'remove':
+                atomic(conf, output.encode())
+                if retained is not None: retained.unlink()
+            return
         args.state.mkdir(parents=True, exist_ok=True)
         if args.action == 'retain':
-            if state_path.exists():
+            if state_path.exists() or state_path.is_symlink():
                 saved = json.loads(regular(state_path).read_text())
                 uki_path(args.esp, saved['path'])
                 if not (args.state / ('modules-' + saved['release']) / 'modules.dep').is_file():
@@ -181,7 +230,7 @@ def limine(args):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('action', choices=('retain', 'publish', 'disarm'))
+    p.add_argument('action', choices=('retain', 'publish', 'disarm', 'check-remove', 'remove'))
     p.add_argument('--esp', type=Path, required=True)
     p.add_argument('--state', type=Path, required=True)
     p.add_argument('--defaults', type=Path, default=Path('/etc/default/limine'))
