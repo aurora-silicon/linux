@@ -107,6 +107,8 @@ struct mt7932 {
 	bool interface_registered, interface_up;
 	u32 reg_generation, reg_attempted;
 	struct mt7932_reg_snapshot reg_desired;
+	/* Channels the applied country package leaves out; under RTNL. */
+	DECLARE_BITMAP(policy_disabled, MT7932_CHANNELS);
 	struct net_device *netdev;
 	struct wireless_dev wdev;
 	struct cfg80211_scan_request *scan_request;
