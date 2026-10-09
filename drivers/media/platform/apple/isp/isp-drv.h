@@ -16,6 +16,10 @@
 #include <media/videobuf2-core.h>
 #include <media/videobuf2-v4l2.h>
 
+#include "isp-buffer.h"
+#include "isp-buffer-pages.h"
+#include "isp-profile.h"
+
 #define APPLE_ISP_DEVICE_NAME "apple-isp"
 #define APPLE_ISP_CARD_NAME "FaceTime HD Camera"
 
@@ -90,7 +94,7 @@ struct isp_surf {
 	void *virt;
 	refcount_t refcount;
 	bool gc;
-	bool submitted;
+	struct isp_buffer_lease lease;
 };
 
 struct isp_message {
@@ -119,6 +123,7 @@ struct isp_channel {
 	struct isp_message req;
 	struct isp_message rsp;
 	const struct isp_chan_ops *ops;
+	bool tx_poisoned;
 };
 
 struct coord {
@@ -261,6 +266,7 @@ struct isp_format {
 struct apple_isp {
 	struct device *dev;
 	const struct apple_isp_hw *hw;
+	const struct isp_profile *profile;
 	enum isp_firmware_version fw_compat;
 	u32 platform_id;
 	u32 temporal_filter;
@@ -314,6 +320,7 @@ struct apple_isp {
 	struct isp_surf *ipc_surf;
 	struct isp_surf *extra_surf;
 	struct isp_surf *data_surf;
+	struct isp_surf *buflist_surf;
 	struct isp_surf *log_surf;
 	struct isp_surf *bt_surf;
 	struct isp_surf *meta_surfs[ISP_MAX_BUFFERS];
@@ -334,21 +341,41 @@ struct apple_isp {
 	wait_queue_head_t wait;
 	dma_addr_t cmd_iova;
 	void *cmd_virt;
+	dma_addr_t ipc_boot_iova;
+	size_t ipc_boot_size;
 
 	unsigned long state;
 	spinlock_t buf_lock;
 	struct list_head bufs_pending;
 	struct list_head bufs_submitted;
+	struct list_head bufs_retiring;
+	struct list_head retained_buffers;
+	u64 next_buffer_tag;
+	bool capture_failed;
+	bool firmware_quiescent;
+	bool video_registered;
+	bool irq_requested;
 };
 
 struct isp_chan_ops {
 	int (*handle)(struct apple_isp *isp, struct isp_channel *chan);
+	void (*acknowledged)(struct apple_isp *isp, struct isp_channel *chan);
+};
+
+/* Separate from vb2's buffer metadata, which close/REQBUFS may destroy. */
+struct isp_buffer_memory {
+	struct list_head link;
+	unsigned int num_planes;
+	struct isp_surf surfs[VB2_MAX_PLANES];
+	struct isp_pinned_pages pins[VB2_MAX_PLANES];
 };
 
 struct isp_buffer {
 	struct vb2_v4l2_buffer vb;
 	struct list_head link;
-	struct isp_surf surfs[VB2_MAX_PLANES];
+	struct isp_buffer_memory *memory;
+	struct isp_buffer_lease lease;
+	bool rendered;
 };
 
 #define to_isp_buffer(x) container_of((x), struct isp_buffer, vb)
@@ -372,8 +399,21 @@ enum {
  */
 #define isp_fw_iova(isp, x)	    ((x) & (isp)->fw_iova_mask)
 #define isp_get_format(isp, ch)	    (&(isp)->fmts[(ch)])
-#define isp_num_capmeta(isp) \
-	((isp)->hw->capture_meta_size ? ISP_CAPMETA_BUFFERS : 0)
+static inline unsigned int isp_num_capmeta(struct apple_isp *isp)
+{
+	return isp->profile ? 0 : (isp->hw->capture_meta_size ? ISP_CAPMETA_BUFFERS : 0);
+}
+
+static inline unsigned int isp_num_meta(struct apple_isp *isp)
+{
+	return isp->profile ? isp->profile->meta_count : ARRAY_SIZE(isp->meta_surfs);
+}
+
+static inline unsigned int isp_max_capture_buffers(struct apple_isp *isp)
+{
+	return isp->profile ? isp->profile->output_count : ISP_MAX_BUFFERS;
+}
+
 #define isp_get_current_format(isp) (isp_get_format(isp, isp->current_ch))
 
 #endif /* __ISP_DRV_H__ */

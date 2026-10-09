@@ -23,6 +23,13 @@ static int cisp_send(struct apple_isp *isp, void *args, u32 insize, u32 outsize,
 	struct isp_message *req = &chan->req;
 	int err;
 
+	mutex_lock(&chan->lock);
+	/* Preserve the published command area after an ambiguous timeout. */
+	if (chan->tx_poisoned) {
+		err = -EIO;
+		goto unlock;
+	}
+
 	req->arg0 = isp->cmd_iova;
 	req->arg1 = insize;
 	req->arg2 = outsize;
@@ -34,23 +41,32 @@ static int cisp_send(struct apple_isp *isp, void *args, u32 insize, u32 outsize,
 		memcpy(&opcode, args, sizeof(opcode));
 		dev_err(isp->dev,
 			"%s: failed to send OPCODE 0x%04llx: [0x%llx, 0x%llx, 0x%llx]\n",
-			chan->name, CISP_OPCODE_GET(opcode), req->arg0,
-			req->arg1, req->arg2);
+			 chan->name, CISP_OPCODE_GET(opcode), req->arg0,
+			 req->arg1, req->arg2);
 	}
+	if (!err && outsize)
+		memcpy(args, isp->cmd_virt, outsize);
 
+unlock:
+	mutex_unlock(&chan->lock);
 	return err;
 }
 
 static int cisp_send_read(struct apple_isp *isp, void *args, u32 insize,
 			  u32 outsize)
 {
-	/* TODO do I need to lock the iova space? */
-	int err = cisp_send(isp, args, insize, outsize, CISP_TIMEOUT);
-	if (err)
-		return err;
+	return cisp_send(isp, args, insize, outsize, CISP_TIMEOUT);
+}
 
-	memcpy(args, isp->cmd_virt, outsize);
-	return 0;
+int isp_cmd_set_dsid_t6040(struct apple_isp *isp, u32 mcc_mask)
+{
+	struct isp_t6040_dsid_command args;
+	int err;
+
+	if (!isp->profile)
+		return -EINVAL;
+	err = isp_profile_t6040_dsid(mcc_mask, &args);
+	return err ?: CISP_SEND_IN(isp, args);
 }
 
 int isp_cmd_start(struct apple_isp *isp, u32 mode)
@@ -345,7 +361,7 @@ int isp_cmd_ch_crop_set(struct apple_isp *isp, u32 chan, u32 x1, u32 y1, u32 x2,
 			u32 y2)
 {
 	struct cmd_ch_crop_set args = {
-		.opcode = CISP_OPCODE(isp->hw->scl1 ? CISP_CMD_CH_CROP_SCL1_SET
+		.opcode = CISP_OPCODE((isp->profile || isp->hw->scl1) ? CISP_CMD_CH_CROP_SCL1_SET
 				      : CISP_CMD_CH_CROP_SET),
 		.chan = chan,
 		.x1 = x1,
@@ -360,7 +376,8 @@ int isp_cmd_ch_output_config_set(struct apple_isp *isp, u32 chan, u32 width,
 				 u32 height, u32 strides[3], u32 colorspace, u32 format)
 {
 	struct cmd_ch_output_config_set args = {
-		.opcode = CISP_OPCODE(isp->hw->scl1 ? CISP_CMD_CH_OUTPUT_CONFIG_SCL1_SET
+		.opcode = CISP_OPCODE((isp->profile || isp->hw->scl1) ?
+				     CISP_CMD_CH_OUTPUT_CONFIG_SCL1_SET
 				      : CISP_CMD_CH_OUTPUT_CONFIG_SET),
 		.chan = chan,
 		.width = width,
@@ -460,9 +477,9 @@ int isp_cmd_ch_buffer_pool_config_set(struct apple_isp *isp, u32 chan, u16 type)
 		.opcode = CISP_OPCODE(CISP_CMD_CH_BUFFER_POOL_CONFIG_SET),
 		.chan = chan,
 		.type = type,
-		.count = ISP_MAX_BUFFERS,
-		.meta_size0 = size,
-		.meta_size1 = size,
+		.count = isp->profile ? isp->profile->meta_count : ISP_MAX_BUFFERS,
+		.meta_size0 = isp->profile ? isp->profile->meta_size : size,
+		.meta_size1 = isp->profile ? isp->profile->meta_size : size,
 		.unk0 = 0,
 		.unk1 = 0,
 		.unk2 = 0,
@@ -481,7 +498,7 @@ int isp_cmd_ch_buffer_pool_config_set_rendered(struct apple_isp *isp, u32 chan,
 	struct cmd_ch_buffer_pool_config_set_rendered args = {
 		.opcode = CISP_OPCODE(CISP_CMD_CH_BUFFER_POOL_CONFIG_SET),
 		.chan = chan,
-		.type = CISP_POOL_TYPE_RENDERED,
+		.type = isp->profile ? CISP_POOL_TYPE_RENDERED_SCL1 : CISP_POOL_TYPE_RENDERED,
 		.count = count,
 		.plane0_size = plane0_size,
 		.plane0_stride = plane0_stride,

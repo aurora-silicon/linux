@@ -5,6 +5,11 @@
 //!
 //! Copyright (C) The Asahi Linux Contributors
 
+#[path = "aop_bootargs.rs"]
+mod bootargs;
+#[path = "aop_shutdown.rs"]
+mod shutdown;
+
 use core::{
     arch::asm,
     cmp,
@@ -46,6 +51,10 @@ use kernel::{
         EPICService,
         FakehidListener,
         ReportListener,
+        ServiceContext,
+        ServiceGate,
+        ServicePlatformData,
+        ServiceABI,
         SourceRing,
         AOP, //
     },
@@ -415,6 +424,9 @@ impl AFKEndpoint {
                 rtkit.send_message(self.index, AFK_MSG_INIT_ACK)?;
             }
             AFK_OPC_GET_BUF => {
+                if client.transport_closing.load(Acquire) {
+                    return Err(ENODEV);
+                }
                 self.recv_get_buf(client.dev.clone(), rtkit, msg)?;
             }
             AFK_OPC_INIT_UNK => {} // no-op
@@ -1088,10 +1100,14 @@ impl WorkItem for SetupRxWork {
 
 /// A service platform device registered by this driver. It is unregistered
 /// explicitly by [`AopData::remove`]; nothing else touches the pointer.
-struct ChildDevice(NonNull<bindings::platform_device>);
+struct ChildDevice(
+    NonNull<bindings::platform_device>,
+    Option<PreparedOverride>,
+    Option<Pin<KBox<ServiceContext>>>,
+);
 
-// SAFETY: The only operation on the pointer is `platform_device_unregister()`,
-// which may be called from any thread.
+// SAFETY: Registered-device lifecycle/override operations are thread-safe;
+// the retirement allocation remains uniquely owned until it is installed.
 unsafe impl Send for ChildDevice {}
 
 /// A driver override that no driver matches: keeps a service device from
@@ -1103,29 +1119,65 @@ const RETIRED_DRIVER_OVERRIDE: &CStr = c_str!("apple-aop-retired");
 /// before a reboot.
 static RETIRED: Atomic<bool> = Atomic::new(false);
 
-impl ChildDevice {
-    /// Keeps the child from binding to any driver again; it stays registered.
-    fn retire(&self) {
-        // SAFETY: The device is registered, so its embedded `struct device` is
-        // valid, and the override string is NUL-terminated.
-        let ret = unsafe {
-            bindings::__device_set_driver_override(
-                ptr::addr_of_mut!((*self.0.as_ptr()).dev),
+/// An owned, preallocated retirement marker. No failure-time allocation is
+/// needed to transfer it into the device, where it survives module reload.
+struct PreparedOverride(NonNull<core::ffi::c_char>);
+
+// SAFETY: This uniquely owns the allocation; it is transferred or freed once.
+unsafe impl Send for PreparedOverride {}
+
+impl PreparedOverride {
+    fn new() -> Result<Self> {
+        // SAFETY: The name is NUL-terminated. The returned allocation is
+        // uniquely owned here until install transfers it to the device.
+        let pointer = unsafe {
+            from_err_ptr(bindings::__device_prepare_driver_override(
                 RETIRED_DRIVER_OVERRIDE.as_char_ptr(),
                 RETIRED_DRIVER_OVERRIDE.to_bytes().len(),
-            )
-        };
-        // Only an allocation failure; the device is unbound either way and
-        // the retired flag keeps the parent from coming back.
-        let _ = ret;
+            ).cast_mut())
+        }?;
+        Ok(Self(NonNull::new(pointer).ok_or(EINVAL)?))
     }
 
+    unsafe fn install(self, dev: *mut bindings::device) {
+        // SAFETY: The caller supplies a registered device. This transfers
+        // the prepared allocation without allocating, and cannot fail.
+        unsafe { bindings::__device_install_driver_override(dev, self.0.as_ptr()) };
+        mem::forget(self);
+    }
+
+    unsafe fn retire_driver(self, dev: *mut bindings::device) {
+        // SAFETY: The child's context was closed and dev is registered.
+        // The core takes attach's lock, installs and unbinds without allocation.
+        unsafe { bindings::__device_retire_driver(dev, self.0.as_ptr()) };
+        mem::forget(self);
+    }
+}
+
+impl Drop for PreparedOverride {
+    fn drop(&mut self) {
+        // SAFETY: Uninstalled allocations are still uniquely owned here.
+        unsafe { bindings::kfree(self.0.as_ptr().cast()) };
+    }
+}
+
+impl ChildDevice {
     /// Unbinds the child's driver while the child stays registered.
-    fn release_driver(&self) {
+    fn release_driver(&mut self) {
         // SAFETY: The pointer came from a successful
         // `platform_device_register_full()` and the device is still
         // registered, so its embedded `struct device` is valid.
-        unsafe { bindings::device_release_driver(ptr::addr_of_mut!((*self.0.as_ptr()).dev)) };
+        let marker = self
+            .1
+            .take()
+            .expect("retirement reserved before child registration");
+        unsafe { marker.retire_driver(ptr::addr_of_mut!((*self.0.as_ptr()).dev)) };
+    }
+
+    fn retain_context(&mut self) {
+        // Its closed lookup gate must remain available even if a match was
+        // queued before the persistent override was installed.
+        mem::forget(self.2.take().expect("child-owned context"));
     }
 
     fn unregister(self) {
@@ -1141,6 +1193,8 @@ struct AopData {
     dev: ARef<device::Device>,
     /// The firmware speaks EPIC with version 4 sub-headers.
     epic_v4: bool,
+    /// Qualified child protocols; framing version is not a child ABI.
+    service_abi: ServiceABI,
     /// Runs the service registrations one at a time; drained on removal.
     registration_queue: OwnedQueue,
     /// Serializes queueing a registration with the start of removal, so that
@@ -1154,6 +1208,14 @@ struct AopData {
     /// The co-processor was started; only then is there anything to shut
     /// down and to retain.
     cpu_started: Atomic<bool>,
+    /// Probe finished handing startup to the firmware. A failed probe may
+    /// already have exposed buffers even if no AFK endpoint started.
+    probe_complete: Atomic<bool>,
+    /// Reserved before the CPU or any endpoint can learn a host address.
+    #[pin]
+    retirement: Mutex<Option<PreparedOverride>>,
+    /// Core-owned admission survives parent drvdata and closes pending lookups.
+    service_gate: Arc<ServiceGate>,
     /// Shut the co-processor down on removal, and if that cannot be
     /// confirmed, retain everything it may still DMA to.
     quiesce_on_unbind: bool,
@@ -1229,14 +1291,23 @@ impl WorkItem for AopServiceRegisterWork {
             .dev
             .fwnode()
             .and_then(|x| x.get_child_by_name(this.name));
+        if this.data.service_abi == ServiceABI::J616sJack {
+            let Some(node) = fwnode.as_ref() else {
+                return;
+            };
+            // SAFETY: This reference holds a valid fwnode during registration.
+            if !unsafe { bindings::fwnode_device_is_available(node.as_raw()) } {
+                return;
+            }
+        }
         let info = bindings::platform_device_info {
             parent: this.data.dev.as_raw(),
             name: this.name.as_ptr() as *const _,
             id: bindings::PLATFORM_DEVID_AUTO,
             res: ptr::null_mut(),
             num_res: 0,
-            data: &this.service as *const EPICService as *const _,
-            size_data: mem::size_of::<EPICService>(),
+            data: ptr::null(),
+            size_data: 0,
             dma_mask: 0,
             fwnode: fwnode
                 .as_ref()
@@ -1259,6 +1330,35 @@ impl WorkItem for AopServiceRegisterWork {
             );
             return;
         }
+        // Registration can synchronously probe the child and publish DMA.
+        // Reserve its persistent barrier first; ENOMEM exposes no child.
+        let retirement = match PreparedOverride::new() {
+            Ok(marker) => marker,
+            Err(e) => {
+                dev_err!(this.data.dev, "Failed to reserve service retirement {:?}", e);
+                return;
+            }
+        };
+        let context = match ServiceContext::new(
+            this.data.clone() as Arc<dyn AOP>,
+            this.data.service_gate.clone(),
+        ) {
+            Ok(context) => context,
+            Err(e) => {
+                dev_err!(this.data.dev, "Failed to allocate service context {:?}", e);
+                return;
+            }
+        };
+        let payload = ServicePlatformData {
+            service: this.service,
+            context: context.as_ref().get_ref() as *const _,
+            abi: this.data.service_abi,
+        };
+        let info = bindings::platform_device_info {
+            data: ptr::addr_of!(payload).cast(),
+            size_data: mem::size_of::<ServicePlatformData>(),
+            ..info
+        };
         // SAFETY: `info` is a valid, fully initialized `platform_device_info`
         // whose pointers outlive the call.
         let pdev = unsafe { from_err_ptr(bindings::platform_device_register_full(&info)) };
@@ -1273,7 +1373,8 @@ impl WorkItem for AopServiceRegisterWork {
                 );
             }
             Ok(pdev) => {
-                if let Err(child) = subdevices.push_within_capacity(ChildDevice(pdev)) {
+                if let Err(child) = subdevices
+                    .push_within_capacity(ChildDevice(pdev, Some(retirement), Some(context))) {
                     // Cannot happen after the reservation above; never leave
                     // a registered device untracked.
                     child.0.unregister();
@@ -1285,6 +1386,13 @@ impl WorkItem for AopServiceRegisterWork {
 
 impl AopData {
     fn new(dev: &platform::Device<Core>, cfg: &AopHwConfig) -> Result<Arc<AopData>> {
+        if cfg.service_abi == ServiceABI::J616sJack && (cfg.epic_v4 || cfg.setup_port) {
+            return Err(EINVAL);
+        }
+        // Abort on ENOMEM before RTKit construction/CPU handoff can publish
+        // buffers. The reserve is unused and freed after confirmed shutdown.
+        let retirement = PreparedOverride::new()?;
+        let service_gate = ServiceGate::new()?;
         let registration_queue = OwnedQueue::new_ordered(c_str!("apple-aop"))?;
         let setup_queue = if cfg.setup_port {
             Some(OwnedQueue::new_ordered(c_str!("apple-aop-setup"))?)
@@ -1296,11 +1404,15 @@ impl AopData {
                 AopData {
                     dev: dev.as_ref().into(),
                     epic_v4: cfg.epic_v4,
+                    service_abi: cfg.service_abi,
                     registration_queue,
                     registration_gate <- new_mutex!(()),
                     removing: Atomic::new(false),
                     transport_closing: Atomic::new(false),
                     cpu_started: Atomic::new(false),
+                    probe_complete: Atomic::new(false),
+                    retirement <- new_mutex!(Some(retirement)),
+                    service_gate,
                     quiesce_on_unbind: cfg.quiesce_on_unbind,
                     required_endpoints: cfg.required_endpoints,
                     setup_queue,
@@ -1371,6 +1483,21 @@ impl AopData {
         channel: u32,
         name: &[u8],
     ) -> Result<()> {
+        if !self.service_abi.publishes_children() {
+            // No sensor/audio child may mutate a control-only firmware profile.
+            dev_dbg!(
+                self.dev, "Discovered {:?} at endpoint {:#x}, channel {}", name, ep.index, channel
+            );
+            return Ok(());
+        }
+        if self.service_abi == ServiceABI::J616sJack {
+            if name != b"aop-audio" {
+                return Ok(());
+            }
+            if ep.index != 0x22 {
+                return Err(EINVAL);
+            }
+        }
         let svc = EPICService {
             channel,
             endpoint: ep.index,
@@ -1427,16 +1554,33 @@ impl AopData {
 
     /// Shuts down every started endpoint, waiting a bounded time for each
     /// acknowledgment. Returns the first error but still tries the rest.
-    fn stop(&self) -> Result<()> {
+    fn stop(&self) -> Result<usize> {
         let mut ret = Ok(());
+        let mut stopped = 0;
         for ep in 0..AFK_ENDPOINT_COUNT as usize {
             {
                 let mut guard = self.rtkit.lock();
-                let mut rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
+                let Some(mut rtk) = guard.as_mut().as_pin_mut() else {
+                    if !self.cpu_started.load(Acquire)
+                        && self.endpoints.iter().all(|endpoint| {
+                            let endpoint = endpoint.lock();
+                            !endpoint.started && endpoint.iomem.is_none()
+                        })
+                    {
+                        return Ok(0);
+                    }
+                    return Err(ENODEV);
+                };
                 let mut ep_guard = self.endpoints[ep].lock();
                 if !ep_guard.started {
+                    if ep_guard.iomem.is_some() {
+                        // A partial endpoint startup published an address
+                        // without reaching the tracked stop state.
+                        ret = ret.and(Err(EIO));
+                    }
                     continue;
                 }
+                stopped += 1;
                 // Whatever happens below, the endpoint is not started again.
                 ep_guard.started = false;
                 self.ep_shutdown[ep].reset();
@@ -1457,7 +1601,7 @@ impl AopData {
                 ret = ret.and(Err(ETIMEDOUT));
             }
         }
-        ret
+        ret.map(|()| stopped)
     }
 
     fn patch_bootargs(
@@ -1468,22 +1612,16 @@ impl AopData {
         let aop_mmio = aop_mmio.relaxed();
         let offset = aop_mmio.read32(BOOTARGS_OFFSET) as usize;
         let size = aop_mmio.read32(BOOTARGS_SIZE) as usize;
+        let end = offset.checked_add(size).ok_or(EINVAL)?;
+        if end > AOP_MMIO_SIZE {
+            return Err(EINVAL);
+        }
         let mut arg_bytes = KVec::<u8>::from_elem(0, size, GFP_KERNEL)?;
         aop_mmio.try_memcpy_fromio(&mut arg_bytes, offset)?;
-        let mut idx = 0;
-        while idx < size {
-            let key = u32::from_le_bytes(arg_bytes[idx..idx + 4].try_into().unwrap());
-            let size = u32::from_le_bytes(arg_bytes[idx + 4..idx + 8].try_into().unwrap()) as usize;
-            idx += 8;
-            for (k, v) in patches.iter() {
-                if *k != key {
-                    continue;
-                }
-                arg_bytes[idx..idx + size].copy_from_slice(&(*v as u64).to_le_bytes()[..size]);
-                break;
-            }
-            idx += size;
-        }
+        bootargs::patch(&mut arg_bytes, patches).map_err(|error| {
+            dev_err!(self.dev, "Invalid AOP boot arguments: {:?}\n", error);
+            EINVAL
+        })?;
         aop_mmio.try_memcpy_toio(offset, &arg_bytes)
     }
 
@@ -1548,6 +1686,14 @@ impl AopData {
 }
 
 impl AOP for AopData {
+    fn protocol_version(&self) -> Result<u32> {
+        if self.removing.load(Acquire) || self.transport_closing.load(Acquire) {
+            return Err(ENODEV);
+        }
+        let guard = self.rtkit.lock();
+        Ok(guard.as_ref().ok_or(ENODEV)?.protocol_version())
+    }
+
     fn epic_call(&self, svc: &EPICService, subtype: u16, msg_bytes: &[u8]) -> Result<u32> {
         if self.transport_closing.load(Acquire) {
             return Err(ENODEV);
@@ -1652,7 +1798,13 @@ impl AOP for AopData {
         false
     }
     fn source_ring(&self, dev: &device::Device<Bound>, size: usize) -> Result<Arc<SourceRing>> {
-        if self.setup_queue.is_none() || self.transport_closing.load(Acquire) {
+        // Serialize address publication with the beginning of removal. A
+        // retained service device must not publish a new ring after closing.
+        let _gate = self.registration_gate.lock();
+        if self.removing.load(Acquire) || self.transport_closing.load(Acquire) {
+            return Err(ENODEV);
+        }
+        if self.setup_queue.is_none() {
             return Err(ENODEV);
         }
         let mut guard = self.source_ring.lock();
@@ -1690,44 +1842,54 @@ impl AOP for AopData {
                 return;
             }
         }
+        // Close before draining queued registrations: those children share
+        // this gate too. Pending lookups finish cloning under its lock.
+        self.service_gate.close();
         // No registration is queued after this point, so once the queue is
         // empty the list of children is complete.
         self.registration_queue.drain();
         // Unbind the children while the transport still works, so that their
         // unbind can talk to their services. Then drop any listener a child
         // left behind: no report may reach a driver that is going away.
-        let children = mem::take(&mut *self.subdevices.lock());
-        for child in &children {
+        let mut children = mem::take(&mut *self.subdevices.lock());
+        // An already admitted probe owns its provider Arc; attach's device
+        // lock serializes its completion before driver release.
+        for child in &mut children {
             child.release_driver();
         }
         self.hid_listeners.lock().clear();
         self.report_listeners.lock().clear();
         self.transport_closing.store(true, Release);
-        if let Err(e) = self.stop() {
-            dev_err!(self.dev, "Failed to stop AOP {:?}", e);
-        }
+        let stopped = self
+            .stop()
+            .map_err(|e| {
+                dev_err!(self.dev, "Failed to stop AOP {:?}", e);
+                e
+            })
+            .ok();
         // Take the handle out of the shared state before dropping it: the
         // drop waits for the RTKit receive worker, which takes the same lock.
         // After it, no callback runs and the device may be unbound.
         let rtkit = self.rtkit.lock().take();
-        let mut quiesced = true;
-        if let Some(mut rtkit) = rtkit {
-            if self.quiesce_on_unbind && self.cpu_started.load(Acquire) {
-                // The co-processor DMAs into the shared buffers until it has
-                // acknowledged the shutdown. If it does not, nothing it may
-                // still write to can be freed.
-                if let Err(e) = Pin::new(&mut rtkit).shutdown() {
+        let quiesced = shutdown::release_rtkit(
+            rtkit,
+            self.cpu_started.load(Acquire),
+            self.probe_complete.load(Acquire),
+            stopped,
+            self.quiesce_on_unbind,
+            |rtkit| {
+                if let Err(e) = Pin::new(rtkit).shutdown() {
                     dev_err!(
                         self.dev,
                         "AOP shutdown unconfirmed ({:?}); retaining its buffers until reboot",
                         e
                     );
-                    rtkit.retain_shared_buffers_on_drop();
-                    quiesced = false;
+                    return false;
                 }
-            }
-            drop(rtkit);
-        }
+                true
+            },
+            |rtkit| rtkit.retain_shared_buffers_on_drop(),
+        );
         // Close the setup port: dropping the mailbox stops its interrupt, and
         // draining the queue finishes the messages that were already taken.
         // Neither may happen under the setup lock, which the queue's work
@@ -1742,8 +1904,13 @@ impl AOP for AopData {
             // mappings the firmware may still use. Keep them from binding
             // again, and this device from probing again, until a reboot.
             self.retain_dma_buffers();
-            for child in &children {
-                child.retire();
+            // The parent stays registered and keeps its IOMMU domain. The
+            // override survives module unload, unlike the in-module latch.
+            let marker = self.retirement.lock().take()
+                .expect("retirement reserved before CPU handoff");
+            unsafe { marker.install(self.dev.as_raw()) };
+            for child in &mut children {
+                child.retain_context();
             }
             RETIRED.store(true, Release);
             dev_err!(
@@ -2187,20 +2354,18 @@ impl rtkit::Operations for AopData {
     }
 }
 
-/// The driver data of the AOP. Children reach the `Arc` through
-/// `AOP::from_child()`, which relies on this being `repr(transparent)` over
-/// it.
+/// The provider's owned driver data. Children use their own service context.
 #[repr(transparent)]
 struct AopDriver(Arc<dyn AOP>);
 
 struct AopHwConfig {
-    ec0p: u64,
-    alig: u64,
-    aopt: u64,
-    /// Complete the firmware's boot arguments before starting it.
-    patch_bootargs: bool,
+    /// Required scalar overrides before startup; an empty profile leaves
+    /// the firmware's boot arguments untouched.
+    bootarg_overrides: &'static [(u32, u64)],
     /// The firmware speaks EPIC with version 4 sub-headers.
     epic_v4: bool,
+    /// Child configuration ABI, qualified separately from EPIC framing.
+    service_abi: ServiceABI,
     /// The firmware boots through a second, "setup", mailbox as well.
     setup_port: bool,
     /// Shut the co-processor down on unbind and retain its buffers if the
@@ -2211,41 +2376,53 @@ struct AopHwConfig {
 }
 
 const HW_CFG_T8103: AopHwConfig = AopHwConfig {
-    ec0p: 0x020000,
-    aopt: 1,
-    alig: 128,
-    patch_bootargs: true,
+    bootarg_overrides: &[
+        (from_fourcc(b"EC0p"), 0x020000),
+        (from_fourcc(b"nCal"), 0),
+        (from_fourcc(b"alig"), 128),
+        (from_fourcc(b"AOPt"), 1),
+    ],
     epic_v4: false,
+    service_abi: ServiceABI::Legacy,
     setup_port: false,
     quiesce_on_unbind: false,
     required_endpoints: &[],
 };
 const HW_CFG_T8112: AopHwConfig = AopHwConfig {
-    ec0p: 0x020000,
-    aopt: 0,
-    alig: 128,
-    patch_bootargs: true,
+    bootarg_overrides: &[
+        (from_fourcc(b"EC0p"), 0x020000),
+        (from_fourcc(b"nCal"), 0),
+        (from_fourcc(b"alig"), 128),
+        (from_fourcc(b"AOPt"), 0),
+    ],
     epic_v4: false,
+    service_abi: ServiceABI::Legacy,
     setup_port: false,
     quiesce_on_unbind: false,
     required_endpoints: &[],
 };
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
-    ec0p: 0x020000,
-    aopt: 0,
-    alig: 64,
-    patch_bootargs: true,
+    bootarg_overrides: &[
+        (from_fourcc(b"EC0p"), 0x020000),
+        (from_fourcc(b"nCal"), 0),
+        (from_fourcc(b"alig"), 64),
+        (from_fourcc(b"AOPt"), 0),
+    ],
     epic_v4: false,
+    service_abi: ServiceABI::Legacy,
     setup_port: false,
     quiesce_on_unbind: false,
     required_endpoints: &[],
 };
 const HW_CFG_T6020: AopHwConfig = AopHwConfig {
-    ec0p: 0x0100_00000000,
-    aopt: 0,
-    alig: 64,
-    patch_bootargs: true,
+    bootarg_overrides: &[
+        (from_fourcc(b"EC0p"), 0x0100_00000000),
+        (from_fourcc(b"nCal"), 0),
+        (from_fourcc(b"alig"), 64),
+        (from_fourcc(b"AOPt"), 0),
+    ],
     epic_v4: false,
+    service_abi: ServiceABI::Legacy,
     setup_port: false,
     quiesce_on_unbind: false,
     required_endpoints: &[],
@@ -2256,11 +2433,9 @@ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
 /// aop-audio, 0x22 aop-voicetrigger, 0x23 als and 0x2b aop-audprov; the rest
 /// are started if they will.
 const HW_CFG_T8140: AopHwConfig = AopHwConfig {
-    ec0p: 0,
-    aopt: 0,
-    alig: 0,
-    patch_bootargs: false,
+    bootarg_overrides: &[],
     epic_v4: true,
+    service_abi: ServiceABI::T8140,
     setup_port: true,
     quiesce_on_unbind: true,
     required_endpoints: &[0x20, 0x21, 0x22, 0x23, 0x2b],
@@ -2289,6 +2464,15 @@ impl platform::Driver for AopDriver {
         info: Option<&Self::IdInfo>,
     ) -> impl PinInit<Self, Error> {
         let cfg = info.ok_or(ENODEV)?;
+        // A legacy fallback compatible must not authorize the incompatible
+        // PDM/channel writers, setup port or EPIC-v4 transport on J616s.
+        // SAFETY: The machine-compatible string is static and NUL-terminated.
+        if unsafe { bindings::of_machine_is_compatible(c_str!("apple,j616s").as_char_ptr()) } != 0
+            && (!matches!(cfg.service_abi, ServiceABI::ControlOnly | ServiceABI::J616sJack)
+                || cfg.epic_v4 || cfg.setup_port)
+        {
+            return Err(ENODEV);
+        }
         if RETIRED.load(Acquire) {
             dev_err!(
                 pdev.as_ref(),
@@ -2306,16 +2490,8 @@ impl platform::Driver for AopDriver {
         // registering; the same teardown as unbind's cleans that up.
         let probe_guard = ScopeGuard::new_with_data(data.clone(), |data| data.remove());
         let aop_mmio = aop_mmio.access(pdev.as_ref())?;
-        if cfg.patch_bootargs {
-            data.patch_bootargs(
-                aop_mmio,
-                &[
-                    (from_fourcc(b"EC0p"), cfg.ec0p),
-                    (from_fourcc(b"nCal"), 0x0),
-                    (from_fourcc(b"alig"), cfg.alig),
-                    (from_fourcc(b"AOPt"), cfg.aopt),
-                ],
-            )?;
+        if !cfg.bootarg_overrides.is_empty() {
+            data.patch_bootargs(aop_mmio, cfg.bootarg_overrides)?;
         }
         let rtkit = rtkit::RtKit::<AopData>::new(pdev.as_ref(), None, 0, data.clone())?;
         *data.rtkit.lock() = Some(rtkit);
@@ -2339,6 +2515,8 @@ impl platform::Driver for AopDriver {
         } else {
             data.start()?;
         }
+        data.probe_complete.store(true, Release);
+        data.service_gate.ready();
         probe_guard.dismiss();
         let data = data as Arc<dyn AOP>;
         Ok(Self(data))

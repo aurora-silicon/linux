@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/apple,isp-profile.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple ISP firmware profile memory preparation
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description: |
+  Version-specific ISP memory and wire preparation. This profile identifies
+  the measured T6040 board6 resident 25G76 image. It does not admit native
+  startup, interrupt delivery, inherited DART ownership or a firmware lifetime
+  transition. The producer keeps this device disabled until those boundaries
+  have been qualified. Firmware physical ranges are supplied at boot.
+
+select:
+  required:
+    - apple,isp-profile
+
+properties:
+  apple,isp-profile:
+    const: t6040-25G76
+
+  apple,isp-firmware-uuid:
+    const: 4C8FBA5E-45CC-308E-9BE5-053518C19D76
+
+  apple,isp-board-id:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    const: 6
+
+  apple,isp-mcc-mask:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    const: 15
+
+  memory-region:
+    minItems: 3
+    maxItems: 3
+
+  memory-region-names:
+    items:
+      - const: firmware-text
+      - const: firmware-data
+      - const: heap
+
+  status:
+    const: disabled
+
+required:
+  - apple,isp-profile
+  - apple,isp-firmware-uuid
+  - apple,isp-board-id
+  - apple,isp-mcc-mask
+  - memory-region
+  - memory-region-names
+  - status
+
+additionalProperties: true

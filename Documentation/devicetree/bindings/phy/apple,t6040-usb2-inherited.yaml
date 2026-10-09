@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/phy/apple,t6040-usb2-inherited.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: J616s inherited USB2 device PHY for RAM experiments
+
+maintainers:
+  - Sven Peter <sven@kernel.org>
+
+description: |
+  Admission for the USB2 device-mode state prepared by m1n1 on J616s.
+  The provider reads its USB2/PIPE state and performs no power, reset or
+  calibration writes. Its caller owns controller/DART handoff and must retain
+  the bootloader's PHY clocks and physical watchdog until cold recovery.
+  This does not describe complete T6040 Type-C, host or SuperSpeed support.
+
+properties:
+  compatible:
+    const: apple,t6040-usb2-inherited
+
+  reg:
+    minItems: 2
+    maxItems: 2
+
+  reg-names:
+    items:
+      - const: usb2phy
+      - const: pipehandler
+
+  '#phy-cells':
+    const: 0
+
+  apple,inherited-handoff:
+    type: boolean
+    description: |
+      The bootloader has retired its DWC3/DART consumers, transferred DMA
+      ownership and retained initialized USB2 PHY clocks and a physical
+      watchdog. This assertion does not perform those operations.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - '#phy-cells'
+  - apple,inherited-handoff
+
+additionalProperties: false

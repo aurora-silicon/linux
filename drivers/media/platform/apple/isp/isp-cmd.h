@@ -261,7 +261,8 @@ int isp_cmd_set_isp_pmu_base(struct apple_isp *isp, u64 pmu_base);
 int isp_cmd_set_dsid_clr_req_base(struct apple_isp *isp, u64 dsid_clr_base,
 				  u32 dsid_clr_range);
 int isp_cmd_set_dsid_clr_multi_bc(struct apple_isp *isp, u64 dsid_clr_base,
-				  u32 dsid_clr_range);
+				u32 dsid_clr_range);
+int isp_cmd_set_dsid_t6040(struct apple_isp *isp, u32 mcc_mask);
 int isp_cmd_set_dsid_clr_req_base2(struct apple_isp *isp, u64 dsid_clr_base0,
 				   u64 dsid_clr_base1, u64 dsid_clr_base2,
 				   u64 dsid_clr_base3, u32 dsid_clr_range0,

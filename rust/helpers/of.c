@@ -3,6 +3,11 @@
 #include <linux/of.h>
 #include <linux/of_device.h>
 
+__rust_helper int rust_helper_of_machine_is_compatible(const char *compatible)
+{
+	return of_machine_is_compatible(compatible);
+}
+
 __rust_helper bool rust_helper_is_of_node(const struct fwnode_handle *fwnode)
 {
 	return is_of_node(fwnode);

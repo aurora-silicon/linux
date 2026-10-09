@@ -5,12 +5,12 @@
 use kernel::{
     device::{Bound, Device},
     dma::Coherent,
+    new_mutex,
     prelude::*,
     sync::{
         atomic::{Atomic, Relaxed},
-        Arc, //
+        Arc, Mutex, //
     },
-    types::ForeignOwnable,
 };
 
 /// Representation of an "EPIC" service.
@@ -21,6 +21,107 @@ pub struct EPICService {
     pub channel: u32,
     /// RTKit endpoint
     pub endpoint: u8,
+}
+
+/// Child protocols qualified by a hardware profile, independently of EPIC framing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ServiceABI {
+    /// Discover firmware services without exposing a child that can configure them.
+    ControlOnly,
+    /// The existing PDM-upload microphone child.
+    Legacy,
+    /// T8140 setup-port and version-4 audio child.
+    T8140,
+    /// J616s EPIC-v2 jack control with retained firmware MCA profiles.
+    J616sJack,
+}
+
+impl ServiceABI {
+    /// Control discovery is independent of child configuration qualification.
+    pub fn publishes_children(self) -> bool {
+        self != Self::ControlOnly
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServiceAdmission {
+    Probing,
+    Ready,
+    Closed,
+}
+
+/// Shared admission gate; closing covers existing and not-yet-registered children.
+#[pin_data]
+pub struct ServiceGate {
+    #[pin]
+    admission: Mutex<ServiceAdmission>,
+}
+
+impl ServiceGate {
+    /// Allocate before the provider hands ownership to hardware.
+    pub fn new() -> Result<Arc<Self>> {
+        Arc::pin_init(
+            pin_init!(Self {
+                admission <- new_mutex!(ServiceAdmission::Probing),
+            }),
+            GFP_KERNEL,
+        )
+    }
+
+    /// Clone a safely owned provider while lookup admission remains open.
+    fn acquire(&self, provider: &Arc<dyn AOP>) -> Result<Arc<dyn AOP>> {
+        let admission = self.admission.lock();
+        match *admission {
+            ServiceAdmission::Probing => Err(EPROBE_DEFER),
+            ServiceAdmission::Closed => Err(ENODEV),
+            ServiceAdmission::Ready => Ok(provider.clone()),
+        }
+    }
+
+    /// The provider completed startup; do not reopen a retired context.
+    pub fn ready(&self) {
+        let mut admission = self.admission.lock();
+        if *admission == ServiceAdmission::Probing {
+            *admission = ServiceAdmission::Ready;
+        }
+    }
+
+    /// Wait for pending lookups to finish cloning, then refuse all new ones.
+    pub fn close(&self) {
+        *self.admission.lock() = ServiceAdmission::Closed;
+    }
+}
+
+/// Stable child-owned context, independent of the parent's driver-data box.
+#[pin_data]
+pub struct ServiceContext {
+    provider: Arc<dyn AOP>,
+    gate: Arc<ServiceGate>,
+}
+
+impl ServiceContext {
+    /// Allocate before child registration can probe or publish a DMA address.
+    pub fn new(provider: Arc<dyn AOP>, gate: Arc<ServiceGate>) -> Result<Pin<KBox<Self>>> {
+        KBox::pin_init(pin_init!(Self { provider, gate }), GFP_KERNEL)
+    }
+
+    /// Cloning is synchronized with provider closing; returned references are owned.
+    pub fn acquire(&self) -> Result<Arc<dyn AOP>> {
+        self.gate.acquire(&self.provider)
+    }
+}
+
+/// Copied into a platform child's data. The service prefix preserves the
+/// existing service reader layout; context storage is owned by that child.
+#[repr(C)]
+pub struct ServicePlatformData {
+    /// Firmware service, not a provider driver-data pointer.
+    pub service: EPICService,
+    /// Stable until unregister; retained closed on unconfirmed shutdown.
+    pub context: *const ServiceContext,
+    /// The hardware profile's child protocol, not inferred from DT or EPIC framing.
+    pub abi: ServiceABI,
 }
 
 /// Listener for the "HID" events sent by aop.
@@ -93,6 +194,10 @@ impl SourceRing {
 
 /// AOP communications manager.
 pub trait AOP: Send + Sync {
+    /// Negotiated RTKit protocol, after startup; no register access is performed.
+    fn protocol_version(&self) -> Result<u32> {
+        Err(ENODEV)
+    }
     /// Calls a method on a specified service
     fn epic_call(&self, svc: &EPICService, subtype: u16, msg_bytes: &[u8]) -> Result<u32>;
     /// Just like epic_call, but also returns a value
@@ -136,29 +241,45 @@ pub trait AOP: Send + Sync {
 }
 
 impl dyn AOP {
+    /// Looks up an audio provider only when its hardware profile allows this ABI.
+    ///
+    /// Checking this before any attach/property write also protects against a
+    /// stale or incorrect child DT compatible. EPIC v2 alone does not qualify
+    /// the legacy PDM upload and low-power channel setters.
+    ///
+    /// # Safety
+    ///
+    /// The same platform-child and lookup lifetime contract as [`Self::from_child`].
+    pub unsafe fn audio_from_child(child: &Device, abi: ServiceABI) -> Result<Arc<dyn AOP>> {
+        // SAFETY: The core owns the copied immutable platform payload during probe/unbind.
+        let data = unsafe { (*child.as_raw()).platform_data.cast::<ServicePlatformData>().as_ref() }
+            .ok_or(ENODEV)?;
+        if abi == ServiceABI::ControlOnly || data.abi != abi {
+            return Err(ENODEV);
+        }
+        // SAFETY: Caller supplies the same registered AOP child as above.
+        unsafe { Self::from_child(child) }
+    }
+
     /// Returns the AOP core that registered the service device `child`.
     ///
-    /// The core registers its service devices from a workqueue while it is still probing, and the
-    /// driver core publishes a driver's data only once its probe has returned, so a child can be
-    /// probed before the core's data exists. This returns `EPROBE_DEFER` in that case; the child's
-    /// probe is retried once the core has bound.
+    /// Initial lookups defer while the provider is probing. Closing synchronizes
+    /// pending lookups before unbind; admitted callers own an Arc independent
+    /// of parent drvdata, and retained children refuse all later lookups.
     ///
     /// # Safety
     ///
     /// `child` must be a platform device that the AOP core driver registered for one of its
-    /// services, and the caller must be probing it or be bound to it. The core unregisters its
-    /// children before it releases its driver data, so that data is valid for the lookup.
+    /// services, and the caller must be probing it or bound to it. Its platform
+    /// data/context remain alive until unregister serializes all child probes.
     pub unsafe fn from_child(child: &Device) -> Result<Arc<dyn AOP>> {
-        let parent = child.parent().ok_or(ENODEV)?;
-        let ptr = parent.get_drvdata::<c_void>();
-        if ptr.is_null() {
-            return Err(EPROBE_DEFER);
-        }
-        // SAFETY: By this function's contract `ptr` is the AOP core's driver data: a pinned box
-        // holding the core's driver type, which is `#[repr(transparent)]` over an `Arc<dyn AOP>`,
-        // and it stays valid while `child` is registered.
-        let aop = unsafe { Pin::<KBox<Arc<dyn AOP>>>::borrow(ptr) };
-        Ok((*aop).clone())
+        // SAFETY: The platform data has the layout/lifetime in this contract.
+        let data = unsafe { (*child.as_raw()).platform_data.cast::<ServicePlatformData>().as_ref() }
+            .ok_or(ENODEV)?;
+        // SAFETY: The child owns this stable context until unregister, or
+        // retains it permanently closed together with its DMA domain.
+        let context = unsafe { data.context.as_ref() }.ok_or(ENODEV)?;
+        context.acquire()
     }
 }
 

@@ -195,6 +195,14 @@ static int apple_isp_init_iommu(struct apple_isp *isp)
 
 	// FIXME: refactor this, maybe use regular iova stuff?
 	isp->iova_size = vm_size - (heap_base & 0xffffffff);
+	/* An earlier failed session may still own this domain's first dynamic
+	 * mapping. Do not create a fresh allocator over retained DMA storage.
+	 */
+	if (iommu_iova_to_phys(isp->domain,
+			       ALIGN(isp->fw.heap_top, 1UL << isp->shift))) {
+		dev_err(dev, "dynamic ISP aperture is still mapped; reboot required\n");
+		return -EBUSY;
+	}
 	drm_mm_init(&isp->iovad, isp->fw.heap_top, isp->iova_size);
 
 	err = apple_isp_map_fw_mmio(isp);
@@ -380,12 +388,41 @@ static int apple_isp_probe(struct platform_device *pdev)
 	if (err)
 		return err;
 
-	isp = devm_kzalloc(dev, sizeof(*isp), GFP_KERNEL);
+	/* Keep this allocation when DMA cannot be quiesced. Its IOVA allocator
+	 * and retained backing records must outlive driver-core devres cleanup.
+	 */
+	isp = kzalloc_obj(*isp);
 	if (!isp)
 		return -ENOMEM;
 
 	isp->dev = dev;
+	isp->firmware_quiescent = true;
+	isp->next_buffer_tag = 1;
 	isp->hw = of_device_get_match_data(dev);
+	if (of_property_present(dev->of_node, "apple,isp-profile")) {
+		const char *name, *uuid;
+		u32 board;
+
+		if (!of_machine_is_compatible("apple,t6040") ||
+		    of_property_read_string(dev->of_node, "apple,isp-profile", &name) ||
+		    of_property_read_string(dev->of_node, "apple,isp-firmware-uuid", &uuid) ||
+		    of_property_read_u32(dev->of_node, "apple,isp-board-id", &board)) {
+			kfree(isp);
+			return -EINVAL;
+		}
+		isp->profile = isp_profile_select(0x6040, board, name, uuid);
+		if (!isp->profile) {
+			kfree(isp);
+			return -ENODEV;
+		}
+		/* Identity/layout qualification alone does not admit native IRQ,
+		 * inherited table ownership or a full-firmware release boundary.
+		 * No T6040 OF match is installed by this preparation patch.
+		 */
+		dev_err(dev, "T6040 profile selected; native ISP handoff remains gated\n");
+		kfree(isp);
+		return -EOPNOTSUPP;
+	}
 	platform_set_drvdata(pdev, isp);
 	dev_set_drvdata(dev, isp);
 
@@ -399,7 +436,7 @@ static int apple_isp_probe(struct platform_device *pdev)
 	if (err) {
 		dev_err(dev, "failed to get 'apple,platform-id' property: %d\n",
 			err);
-		return err;
+		goto free_isp;
 	}
 
 	err = of_property_read_u32(dev->of_node, "apple,temporal-filter",
@@ -410,13 +447,13 @@ static int apple_isp_probe(struct platform_device *pdev)
 	err = apple_isp_init_presets(isp);
 	if (err) {
 		dev_err(dev, "failed to initialize presets\n");
-		return err;
+		goto free_isp;
 	}
 
 	err = apple_isp_attach_genpd(isp);
 	if (err) {
 		dev_err(dev, "failed to attatch power domains\n");
-		return err;
+		goto free_isp;
 	}
 
 	isp->coproc = devm_platform_ioremap_resource_byname(pdev, "coproc");
@@ -483,6 +520,8 @@ static int apple_isp_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&isp->gc);
 	INIT_LIST_HEAD(&isp->bufs_pending);
 	INIT_LIST_HEAD(&isp->bufs_submitted);
+	INIT_LIST_HEAD(&isp->bufs_retiring);
+	INIT_LIST_HEAD(&isp->retained_buffers);
 	isp->wq = alloc_workqueue("apple-isp-wq", WQ_UNBOUND, 0);
 	if (!isp->wq) {
 		dev_err(dev, "failed to create workqueue\n");
@@ -521,6 +560,14 @@ static int apple_isp_probe(struct platform_device *pdev)
 halt_firmware:
 	apple_isp_firmware_halt(isp);
 free_surface:
+	if (!READ_ONCE(isp->firmware_quiescent)) {
+		apple_isp_firmware_retain(isp);
+		destroy_workqueue(isp->wq);
+		/* Keep firmware, tables, backing and power references. The
+		 * retained IOMMU mapping rejects a fresh allocator on rebind.
+		 */
+		return err;
+	}
 	pm_runtime_disable(dev);
 	apple_isp_free_firmware_surface(isp);
 free_iommu:
@@ -529,6 +576,9 @@ destroy_wq:
 	destroy_workqueue(isp->wq);
 detach_genpd:
 	apple_isp_detach_genpd(isp);
+free_isp:
+	platform_set_drvdata(pdev, NULL);
+	kfree(isp);
 	return err;
 }
 
@@ -538,13 +588,19 @@ static void apple_isp_remove(struct platform_device *pdev)
 
 	apple_isp_remove_video(isp);
 	/* Stop resident firmware before freeing what it may still use. */
-	apple_isp_firmware_halt(isp);
+	if (apple_isp_firmware_halt(isp)) {
+		apple_isp_firmware_retain(isp);
+		destroy_workqueue(isp->wq);
+		return;
+	}
 	apple_isp_free_video(isp);
 	pm_runtime_disable(isp->dev);
 	apple_isp_free_firmware_surface(isp);
 	apple_isp_free_iommu(isp);
 	destroy_workqueue(isp->wq);
 	apple_isp_detach_genpd(isp);
+	platform_set_drvdata(pdev, NULL);
+	kfree(isp);
 }
 
 static const struct apple_isp_hw apple_isp_hw_t8103 = {
@@ -794,11 +850,14 @@ static __maybe_unused int apple_isp_runtime_resume(struct device *dev)
 static __maybe_unused int apple_isp_suspend(struct device *dev)
 {
 	struct apple_isp *isp = dev_get_drvdata(dev);
+	int err;
 
 	/* We must restore V4L2 context on system resume. If we were streaming
 	 * before, we (essentially) stop streaming and start streaming again.
 	 */
-	apple_isp_video_suspend(isp);
+	err = apple_isp_video_suspend(isp);
+	if (err)
+		return err;
 
 	/*
 	 * Resident firmware stays up, idle, across suspend-to-idle and
@@ -810,8 +869,11 @@ static __maybe_unused int apple_isp_suspend(struct device *dev)
 static __maybe_unused int apple_isp_freeze(struct device *dev)
 {
 	struct apple_isp *isp = dev_get_drvdata(dev);
+	int err;
 
-	apple_isp_video_suspend(isp);
+	err = apple_isp_video_suspend(isp);
+	if (err)
+		return err;
 
 	/*
 	 * Hibernation hands the system from one kernel to another, and
@@ -823,8 +885,10 @@ static __maybe_unused int apple_isp_freeze(struct device *dev)
 		mutex_lock(&isp->video_lock);
 		if (isp->fw_state == ISP_FW_RUNNING)
 			dev_warn(dev, "stopping the firmware for hibernation, the camera is unavailable until the next boot\n");
-		apple_isp_firmware_halt(isp);
+		err = apple_isp_firmware_halt(isp);
 		mutex_unlock(&isp->video_lock);
+		if (err)
+			return err;
 	}
 
 	return 0;

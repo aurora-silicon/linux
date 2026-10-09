@@ -274,6 +274,20 @@ static int admac_desc_free(struct dma_async_tx_descriptor *tx)
 	return 0;
 }
 
+static bool admac_cyclic_range_valid(dma_addr_t address, size_t bytes,
+				     size_t period)
+{
+	/*
+	 * Each descriptor has a 32-bit byte count; the provider's DMA mask
+	 * is 42 bits. Every period must stay inside the complete owned buffer.
+	 */
+	if (!bytes || !period || period > U32_MAX || period > bytes || bytes % period)
+		return false;
+	if (address > DMA_BIT_MASK(42) || bytes - 1 > DMA_BIT_MASK(42) - address)
+		return false;
+	return true;
+}
+
 static struct dma_async_tx_descriptor *admac_prep_dma_cyclic(
 		struct dma_chan *chan, dma_addr_t buf_addr, size_t buf_len,
 		size_t period_len, enum dma_transfer_direction direction,
@@ -283,6 +297,8 @@ static struct dma_async_tx_descriptor *admac_prep_dma_cyclic(
 	struct admac_tx *adtx;
 
 	if (direction != admac_chan_direction(adchan->no))
+		return NULL;
+	if (!admac_cyclic_range_valid(buf_addr, buf_len, period_len))
 		return NULL;
 
 	adtx = kzalloc_obj(*adtx, GFP_NOWAIT);
