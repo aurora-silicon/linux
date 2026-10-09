@@ -2006,11 +2006,7 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	struct DCP_FW_NAME(dcp_swap_submit_resp) *resp = data;
 	u32 swap_id = DCP_FW_UNION(dcp->swap).swap.swap_id;
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
 	u32 status = resp ? resp->ret : ~0U;
-#else
-	u32 status = resp->ret;
-#endif
 
 	if (!dcp_present_submit(dcp, swap_id, !status))
 		status = ~0U;
@@ -2367,11 +2363,19 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 static void res_is_main_display(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct apple_connector *connector;
+	bool result;
+
+	/* No reply: the DCP is marked crashed, so only end the start-up wait. */
+	if (!out) {
+		complete(&dcp->start_done);
+		return;
+	}
+
 	/*
 	 * The reply is a one-byte boolean.  The firmware leaves the rest of
 	 * the 32-bit slot alone, and dcp_push() fills that with 0xff.
 	 */
-	bool result = *(u8 *)out;
+	result = *(u8 *)out;
 
 	dev_info(dcp->dev, "DCP is_main_display: %d\n", result);
 

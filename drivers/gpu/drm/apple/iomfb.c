@@ -892,7 +892,12 @@ static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context)
 				sent->tag[3], sent->tag[2], sent->tag[1],
 				sent->tag[0], context);
 			WRITE_ONCE(dcp->crashed, true);
-			return;
+			/*
+			 * Still complete the command, without an output, so
+			 * that its callback drops the cookie reference and
+			 * wakes the waiter instead of leaving it to time out.
+			 */
+			out = NULL;
 		}
 	}
 
