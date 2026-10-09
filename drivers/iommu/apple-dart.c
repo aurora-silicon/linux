@@ -1144,10 +1144,12 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 			dev_err_ratelimited(stream.dart->dev,
 				"failed to publish host page-table entries: %d\n", ret);
 		else {
+			/* The range registers take the DVA the device issues. */
 			if (range && stream.dart->locked && stream.dart->version >= 0x0202)
 				ret = apple_dart_t8110_hw_tlb_command_range(&stream,
 					DART_T8110_TLB_CMD_OP_FLUSH_SID, true,
-					first & domain->mask, last & domain->mask);
+					first + domain->dma_offset,
+					last + domain->dma_offset);
 			else
 				ret = stream.dart->hw->invalidate_tlb(&stream);
 		}
