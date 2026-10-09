@@ -3,10 +3,13 @@
 use kernel::prelude::*;
 use crate::m3_init_layout as init;
 use crate::m3_init_storage as storage;
-use storage::{REGION_A,RUNTIME_POINTERS,HARDWARE_DATA,UNKNOWN_PAIR,UNKNOWN_SMALL,
+use storage::{REGION_A,RUNTIME_POINTERS,HARDWARE_DATA,UNKNOWN_PAIR,FWLOG_PAYLOAD,
     UNKNOWN_C0,UNKNOWN_C1,UNKNOWN_C3,GLOBALS,GLOBALS_POWER,CONTROL_REGION,RUNTIME_FLAGS,
     FW_CONTROL_STATE,FW_CONTROL_RING};
 use crate::{driver,agx_memory::{self},m3_memory::Buffer,mmu,pgtable::prot};
+kernel::static_assert!(core::mem::size_of::<crate::fw::channels::RawFwLogMsg>() == init::fwlog::ENTRY_SIZE);
+kernel::static_assert!(core::mem::size_of::<crate::fw::channels::RawFwLogPayloadMsg>() == init::fwlog::PAYLOAD_SIZE);
+kernel::static_assert!(<crate::fw::channels::FwLogChannelState as crate::fw::channels::RxChannelState>::SUB_CHANNELS == init::fwlog::CHANNELS);
 
 /// The root, runtime-pointer and firmware-control records, encoded for the owners
 /// `region` describes. Config uploads them for its own allocations; the device-tree
@@ -26,7 +29,7 @@ impl Records {
             *channel = init::Channel { state: region(index * 2)?, ring: region(index * 2 + 1)? };
         }
         let runtime = init::RuntimePointers { hardware: region(HARDWARE_DATA)?,
-            unknown_pair: region(UNKNOWN_PAIR)?, unknown_small: region(UNKNOWN_SMALL)?,
+            unknown_pair: region(UNKNOWN_PAIR)?, fwlog_payload: region(FWLOG_PAYLOAD)?,
             unknown_c0: region(UNKNOWN_C0)?, unknown_c1: region(UNKNOWN_C1)?,
             unknown_c3: region(UNKNOWN_C3)?, channels };
         let control = init::ControlRegion { channel: init::Channel {
@@ -83,6 +86,7 @@ impl Config {
             ("event-ring", storage::EVENT * 2 + 1),
             ("fwlog-state", storage::FIRMWARE_LOG * 2),
             ("fwlog-ring", storage::FIRMWARE_LOG * 2 + 1),
+            ("fwlog-payload", FWLOG_PAYLOAD),
             ("trace-state", storage::TRACE * 2),
             ("trace-ring", storage::TRACE * 2 + 1),
         ] {
@@ -312,7 +316,7 @@ impl Config {
         for (state, ring, size, count, channels) in [(storage::EVENT*2,storage::EVENT*2+1,0x38,256,1),
             (storage::TRACE*2,storage::TRACE*2+1,0x38,512,1),
             (storage::STATS*2,storage::STATS*2+1,0x40,256,1),
-            (storage::FIRMWARE_LOG*2,storage::FIRMWARE_LOG*2+1,0xd8,256,6)] {
+            (storage::FIRMWARE_LOG*2,storage::FIRMWARE_LOG*2+1,init::fwlog::ENTRY_SIZE,init::fwlog::SLOTS,init::fwlog::CHANNELS)] {
             for channel in 0..channels {
                 let base = channel * 0x30;
                 let mut r = self.objects[state].read_u32(base)? as usize;
@@ -324,6 +328,13 @@ impl Config {
                         let mut raw=[0u8;0xd8];
                         self.objects[ring].read((channel*count+r)*size,&mut raw[..size])?;
                         dev_info!(dev.as_ref(),"M3 fw-channel {} {:02x?}\n",state,&raw[..size]);
+                        if state == storage::FIRMWARE_LOG*2 && self.objects[ring].read_u32((channel*count+r)*size)? == 2 {
+                            let index = self.objects[ring].read_u64((channel*count+r)*size+8)?;
+                            let offset = init::fwlog::payload_offset(channel,index).map_err(|_| EIO)?;
+                            let mut payload = [0u8;init::fwlog::PAYLOAD_SIZE];
+                            self.objects[FWLOG_PAYLOAD].read(offset,&mut payload)?;
+                            dev_info!(dev.as_ref(),"M3 fwlog payload {} {:02x?}\n",channel,payload);
+                        }
                     }
                     if state == storage::EVENT*2 {
                         let kind = self.objects[ring].read_u32(r*size)?;

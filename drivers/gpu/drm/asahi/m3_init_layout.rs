@@ -6,6 +6,21 @@ pub(crate) const CONTROL_SIZE: usize = 0xc3d0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Error { Address, Bounds, Size }
 
+pub(crate) mod fwlog {
+    use super::Error;
+    pub(crate) const CHANNELS: usize = 6;
+    pub(crate) const SLOTS: usize = 256;
+    pub(crate) const ENTRY_SIZE: usize = 0x38;
+    pub(crate) const PAYLOAD_SIZE: usize = 0xd8;
+    pub(crate) const RING_BYTES: usize = CHANNELS * SLOTS * ENTRY_SIZE;
+    pub(crate) const PAYLOAD_BYTES: usize = CHANNELS * SLOTS * PAYLOAD_SIZE;
+
+    pub(crate) fn payload_offset(channel: usize, index: u64) -> Result<usize, Error> {
+        if channel >= CHANNELS || index >= SLOTS as u64 { return Err(Error::Bounds); }
+        Ok((channel * SLOTS + index as usize) * PAYLOAD_SIZE)
+    }
+}
+
 /// An owned firmware region, not a physical, GPU or compact address. Unlike
 /// queue references, byte alignment is intentional here: the qualified runtime
 /// record starts at ...7b4d. Packed references must not become aligned loads.
@@ -97,7 +112,7 @@ mod runtime {
     pub(crate) const HOST_CHANNEL_STRIDE: usize = 0x20;
     pub(crate) const FIRMWARE_CHANNELS: usize = 0x1b8;
     pub(crate) const FIRMWARE_CHANNEL_STRIDE: usize = 0x10;
-    pub(crate) const UNKNOWN_SMALL: usize = 0x1f8;
+    pub(crate) const FWLOG_PAYLOAD: usize = 0x1f8;
     pub(crate) const HARDWARE_B_VIEWS: [usize; 4] = [0x234, 0x23c, 0x244, 0x24c];
     pub(crate) const UNKNOWN_C0: usize = 0x2a8;
     pub(crate) const UNKNOWN_C1: [usize; 2] = [0x2b0, 0x2b8];
@@ -109,7 +124,7 @@ mod runtime {
 pub(crate) struct RuntimePointers {
     pub(crate) hardware: Region,
     pub(crate) unknown_pair: Region,
-    pub(crate) unknown_small: Region,
+    pub(crate) fwlog_payload: Region,
     pub(crate) unknown_c0: Region,
     pub(crate) unknown_c1: Region,
     pub(crate) unknown_c3: Region,
@@ -120,7 +135,7 @@ impl RuntimePointers {
     pub(crate) fn encode(&self, out: &mut [u8]) -> Result<(), Error> {
         let hardware = self.hardware.at(0, 35332)?;
         let pair = self.unknown_pair.at(0, 0x100)?;
-        let small = self.unknown_small.at(0, 0x10)?;
+        let fwlog_payload = self.fwlog_payload.at(0, fwlog::PAYLOAD_BYTES)?;
         let c0 = self.unknown_c0.at(0, 0x1000)?;
         let c1 = self.unknown_c1.at(0, 0x4000)?;
         let c3 = self.unknown_c3.at(0, 0x4000)?;
@@ -143,7 +158,7 @@ impl RuntimePointers {
                 pointer(bytes, start + 8, values[3]);
             }
         }
-        pointer(bytes, runtime::UNKNOWN_SMALL, small);
+        pointer(bytes, runtime::FWLOG_PAYLOAD, fwlog_payload);
         // These are views of the retained hardware data, not new allocations.
         for (offset, delta) in runtime::HARDWARE_B_VIEWS.iter().zip([0x1880u64, 0x24c0, 0x3740, 0x8900]) {
             pointer(bytes, *offset, hardware + delta);

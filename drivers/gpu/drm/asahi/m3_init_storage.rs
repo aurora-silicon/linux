@@ -4,14 +4,14 @@
 //! VAs, packed offsets and permissions follow the qualified setup. Owners marked
 //! Hardware, Globals or Power receive the images m3_adt_config generates from the
 //! device tree; every other owner starts zeroed.
-use crate::m3_init_layout::{Error,Region};
+use crate::m3_init_layout::{Error,Region,fwlog};
 pub(crate) const COUNT:usize=49;
 pub(crate) const ROOT:usize=36;
 pub(crate) const REGION_A:usize=37;
 pub(crate) const RUNTIME_POINTERS:usize=38;
 pub(crate) const HARDWARE_DATA:usize=39;
 pub(crate) const UNKNOWN_PAIR:usize=40;
-pub(crate) const UNKNOWN_SMALL:usize=41;
+pub(crate) const FWLOG_PAYLOAD:usize=41;
 pub(crate) const UNKNOWN_C0:usize=42;
 pub(crate) const UNKNOWN_C1:usize=43;
 pub(crate) const UNKNOWN_C3:usize=44;
@@ -49,7 +49,7 @@ pub(crate) fn allocation(index:usize)->Result<Allocation,Error> {
         26=>(0xfffffc2040377fd0,48,false,Zero), // Events.
         27=>(0xfffffc20403b8800,14336,false,Zero),
         28=>(0xfffffc20403ffee0,288,false,Zero), // Six firmware-log channels.
-        29=>(0xfffffc2040443000,331776,false,Zero),
+        29=>(0xfffffc2040443000,fwlog::RING_BYTES,false,Zero),
         30=>(0xfffffc20404d7fd0,48,false,Zero), // Trace.
         31=>(0xfffffc2040519000,28672,false,Zero),
         32=>(0xfffffc2040563fd0,48,false,Zero), // Statistics.
@@ -61,7 +61,7 @@ pub(crate) fn allocation(index:usize)->Result<Allocation,Error> {
         RUNTIME_POINTERS=>(0xfffffc20406b7b4d,1203,false,Zero),
         HARDWARE_DATA=>(0xfffffc20406fb5fc,35332,false,Hardware),
         UNKNOWN_PAIR=>(0xfffffc2040747f00,256,false,Zero),
-        UNKNOWN_SMALL=>(0xfffffc204078bff0,16,false,Zero),
+        FWLOG_PAYLOAD=>(0xfffffc2040900000,fwlog::PAYLOAD_BYTES,false,Zero),
         UNKNOWN_C0=>(0xfffffc2070003000,4096,true,Zero),
         UNKNOWN_C1=>(0xfffffc2070008000,16384,true,Zero),
         UNKNOWN_C3=>(0xfffffc2070010000,16384,true,Zero),
