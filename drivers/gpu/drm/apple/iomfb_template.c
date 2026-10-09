@@ -756,9 +756,13 @@ static u8 dcpep_cb_release_mem_desc(struct apple_dcp *dcp, u32 *mem_desc_id)
 		dma_free_coherent(dcp->dev, size, memdesc->buf, memdesc->dva);
 		memdesc->buf = NULL;
 		memset(&memdesc->map, 0, sizeof(memdesc->map));
-	} else {
+	} else if (memdesc->size) {
+		/* A register range mapped by map_physical */
+		dma_unmap_resource(dcp->dev, memdesc->dva, memdesc->size,
+				   DMA_BIDIRECTIONAL, 0);
 		memdesc->reg = 0;
 	}
+	memdesc->dva = 0;
 
 	memdesc->size = 0;
 
@@ -819,6 +823,7 @@ dcpep_cb_map_physical(struct apple_dcp *dcp, struct dcp_map_physical_req *req)
 	set_bit(id, dcp->memdesc_map);
 	dcp->memdesc[id].size = size;
 	dcp->memdesc[id].reg = req->paddr;
+	dcp->memdesc[id].dva = dva;
 
 	return (struct dcp_map_physical_resp){
 		.dva_size = size,
