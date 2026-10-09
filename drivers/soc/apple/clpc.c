@@ -183,12 +183,26 @@ static void apple_clpc_sample_cluster(struct apple_clpc *clpc,
 	unsigned int cpu, busy = 0, q, rail;
 
 	for_each_cpu(cpu, cl->cpus) {
-		u64 wall, idle = get_cpu_idle_time(cpu, &wall, 0);
-		u64 dw = wall - clpc->wall[cpu], di = idle - clpc->idle[cpu];
+		u64 wall, idle, dw, di;
+		bool valid;
 
+		/*
+		 * An offline CPU accrues no idle time while the wall clock runs
+		 * on, so it would look fully busy. Skip it, and take a fresh
+		 * baseline once it is back.
+		 */
+		if (!cpu_online(cpu)) {
+			clpc->wall[cpu] = 0;
+			continue;
+		}
+
+		idle = get_cpu_idle_time(cpu, &wall, 0);
+		dw = wall - clpc->wall[cpu];
+		di = idle - clpc->idle[cpu];
+		valid = clpc->wall[cpu];
 		clpc->wall[cpu] = wall;
 		clpc->idle[cpu] = idle;
-		if (dw && di <= dw)
+		if (valid && dw && di <= dw)
 			busy = max_t(unsigned int, busy,
 				     div64_u64((dw - di) * 100, dw));
 	}
