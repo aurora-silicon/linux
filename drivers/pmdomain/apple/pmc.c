@@ -42,7 +42,9 @@
  *	in the "voters" region
  * @agents: number of voter agents
  * @rails: number of rails
- * @rail_state: offset of the per-rail state words in the "rails" region
+ * @agent_state: offset of the per-agent state words in the "rails" region;
+ *	each holds the agent's floor as the PMC honours it: masked by the
+ *	agent's interface enables and clamped to each rail's highest state
  * @rail_enable: offset of the per-rail interface enable words in the
  *	"rails" region
  */
@@ -50,7 +52,7 @@ struct apple_pmc_hw {
 	u32 agent_stride;
 	u32 agents;
 	u32 rails;
-	u32 rail_state;
+	u32 agent_state;
 	u32 rail_enable;
 };
 
@@ -334,12 +336,12 @@ static int apple_pmc_status_show(struct seq_file *s, void *unused)
 
 	seq_printf(s, "static agents: %#x\n", pmc->static_agents);
 	for (i = 0; i < hw->agents; i++)
-		seq_printf(s, "agent%u floor: %#010x\n", i,
-			   readl(pmc->voters + i * hw->agent_stride));
+		seq_printf(s, "agent%u floor: %#010x honoured: %#010x\n", i,
+			   readl(pmc->voters + i * hw->agent_stride),
+			   readl(pmc->rails + hw->agent_state + 4 * i));
 	for (i = 0; i < hw->rails; i++)
-		seq_printf(s, "rail%u state: %#010x enable: %#010x (saved %#010x)\n",
-			   i, readl(pmc->rails + hw->rail_state + 4 * i),
-			   apple_pmc_enable_read(pmc, i), pmc->saved_enable[i]);
+		seq_printf(s, "rail%u enable: %#010x (saved %#010x)\n",
+			   i, apple_pmc_enable_read(pmc, i), pmc->saved_enable[i]);
 
 	return 0;
 }
@@ -461,7 +463,7 @@ static const struct apple_pmc_hw apple_pmc_hw_t8140 = {
 	.agent_stride = 0x4000,
 	.agents = 4,
 	.rails = 4,
-	.rail_state = 0x0,
+	.agent_state = 0x0,
 	.rail_enable = 0x2000,
 };
 
