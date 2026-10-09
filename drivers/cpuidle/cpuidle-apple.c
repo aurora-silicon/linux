@@ -124,7 +124,11 @@ static struct cpuidle_driver apple_idle_driver = {
 
 static int apple_cpuidle_probe(struct platform_device *pdev)
 {
-	/* A T8140 CPU PD opt-in hung J700; expose only WFI. */
+	/*
+	 * CPU PD writes CYC_OVRD, which is an undefined instruction on
+	 * T8140. Its WFI already lets the hardware power-gate idle
+	 * secondary cores, so expose only the WFI state.
+	 */
 	if (of_machine_is_compatible("apple,t8140"))
 		apple_idle_driver.state_count = STATE_WFI + 1;
 

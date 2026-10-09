@@ -10,9 +10,10 @@ maintainers:
   - Ryan Murray <ryan@aurorasilicon.org>
 
 description:
-  Selects the Apple CPU idle driver on T8140 systems. Only the WFI
-  clock-gated state is supported; CPU and cluster power-down states
-  are not enabled on this SoC.
+  Selects the Apple CPU idle driver on T8140 systems. On this SoC the
+  hardware decides when an idle core is power-gated after WFI; software
+  cannot request core or cluster power-down, so WFI is the only idle
+  state.
 
 properties:
   $nodename:
