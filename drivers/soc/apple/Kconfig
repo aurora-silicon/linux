@@ -168,6 +168,7 @@ config APPLE_CLPC
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on APPLE_PMC && CPU_FREQ
 	select MFD_SYSCON
+	default ARCH_APPLE
 	help
 	  Raises the DRAM controller and SoC fabric performance floors of the
 	  host's PMC voter agent while CPU clusters, and optionally the GPU,
