@@ -71,6 +71,14 @@ impl Config {
             ("root", storage::ROOT), ("runtime", RUNTIME_POINTERS),
             ("hardware", HARDWARE_DATA), ("globals", GLOBALS),
             ("control", CONTROL_REGION), ("flags", RUNTIME_FLAGS),
+            // The power-controller block, and the host-to-firmware device-control and
+            // firmware-control queues: their state words show whether the firmware read a
+            // queued control (read index) and what it was sent.
+            ("power", GLOBALS_POWER),
+            ("devctl-state", storage::DEVICE_CONTROL * 2),
+            ("devctl-ring", storage::DEVICE_CONTROL * 2 + 1),
+            ("fwctl-state", storage::FW_CONTROL_STATE),
+            ("fwctl-ring", storage::FW_CONTROL_RING),
             ("event-state", storage::EVENT * 2),
             ("event-ring", storage::EVENT * 2 + 1),
             ("fwlog-state", storage::FIRMWARE_LOG * 2),
