@@ -15,6 +15,7 @@
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
+#include <linux/mt7932.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/overflow.h>
@@ -1050,6 +1051,10 @@ static int bt7932_wait_for_wifi(struct pci_dev *pdev)
 	    strcmp(dev_driver_string(&wifi->dev), "mt7932-fullmac"))
 		ret = dev_err_probe(&pdev->dev, -EPROBE_DEFER,
 				    "waiting for the Wi-Fi function\n");
+	/* Initialization ends before the Wi-Fi probe returns. */
+	else if (!mt7932_fullmac_ready(wifi))
+		ret = dev_err_probe(&pdev->dev, -ENODEV,
+				    "the Wi-Fi function failed to initialize\n");
 	else if (!device_link_add(&pdev->dev, &wifi->dev, DL_FLAG_AUTOREMOVE_CONSUMER))
 		ret = -EINVAL;
 	pci_dev_put(wifi);
