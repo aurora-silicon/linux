@@ -10,6 +10,7 @@
 #include <linux/security.h>
 #include <linux/cpuset.h>
 #include <linux/hash.h>
+#include <linux/rhashtable.h>
 #include <linux/page_ext.h>
 #include <linux/rcupdate.h>
 #include <linux/slab.h>
@@ -213,6 +214,12 @@ struct mm_subpage *mm_subpage_get_from_phys(phys_addr_t phys)
 	return slot;
 }
 
+struct cow_pool_key {
+	struct mem_cgroup *memcg;
+	int nid;
+	u32 bucket;
+};
+
 struct mm_subpage_pool {
 	struct rcu_head rcu;
 	spinlock_t lock;
@@ -230,12 +237,100 @@ struct mm_subpage_pool {
 	bool cow_shared;
 	/* Allocated only for shared COW pools; protected by pool->lock. */
 	unsigned long *cow_free_slots;
+	struct cow_pool_key cow_key;
+	struct rhash_head cow_hash;
+	struct list_head cow_domain;
+	/* Protected by this pool's lock, never used after registry detachment. */
+	struct mm_subpage_cow_pools *cow_registry;
 };
 
 #define COW_POOL_BITS 4
 struct mm_subpage_cow_pools {
-	struct mm_subpage_pool *pool[1U << COW_POOL_BITS];
+	struct rhashtable domains;
+	spinlock_t lock;
+	struct list_head pools;
+	refcount_t refs;
+	struct rcu_head rcu;
+	struct work_struct free_work;
 };
+
+static const struct rhashtable_params cow_domain_params = {
+	.head_offset = offsetof(struct mm_subpage_pool, cow_hash),
+	.key_offset = offsetof(struct mm_subpage_pool, cow_key),
+	.key_len = sizeof(struct cow_pool_key),
+	.nelem_hint = 16,
+	.automatic_shrinking = true,
+};
+
+static void cow_registry_free_work(struct work_struct *work)
+{
+	struct mm_subpage_cow_pools *pools =
+		container_of(work, struct mm_subpage_cow_pools, free_work);
+
+	WARN_ON_ONCE(!list_empty(&pools->pools));
+	rhashtable_destroy(&pools->domains);
+	kfree(pools);
+}
+
+static void cow_registry_free_rcu(struct rcu_head *rcu)
+{
+	struct mm_subpage_cow_pools *pools =
+		container_of(rcu, struct mm_subpage_cow_pools, rcu);
+
+	queue_work(system_unbound_wq, &pools->free_work);
+}
+
+static void cow_registry_put(struct mm_subpage_cow_pools *pools)
+{
+	if (refcount_dec_and_test(&pools->refs))
+		call_rcu(&pools->rcu, cow_registry_free_rcu);
+}
+
+static void pool_put_raw(struct mm_subpage_pool *pool);
+static void owner_remove(struct mm_subpage_owner *owner);
+static void owner_free(struct mm_subpage_owner *owner, bool put_folio);
+
+/* The caller retains a pool reference independently of registry membership. */
+static void cow_pool_detach_locked(struct mm_subpage_pool *pool)
+{
+	struct mm_subpage_cow_pools *pools = pool->cow_registry;
+
+	lockdep_assert_held(&pool->lock);
+	if (!pools)
+		return;
+	pool->cow_registry = NULL;
+	/* A failed prospective insertion may not have entered the hash/list. */
+	rhashtable_remove_fast(&pools->domains, &pool->cow_hash, cow_domain_params);
+	spin_lock(&pools->lock);
+	list_del_init(&pool->cow_domain);
+	spin_unlock(&pools->lock);
+	pool_put_raw(pool); /* Removed (or unpublished prospective) membership. */
+	cow_registry_put(pools);
+}
+
+static void cow_pool_retire_empty(struct mm_subpage_pool *pool)
+{
+	struct mm_subpage_owner *owner = NULL;
+	unsigned long flags;
+
+	if (!pool->cow_shared)
+		return;
+	spin_lock_irqsave(&pool->lock, flags);
+	if (!pool->backing_pages ||
+	    (pool->backing_pages == 1 && pool->unissued)) {
+		pool->closed = true;
+		cow_pool_detach_locked(pool);
+		/* A failed allocation may leave wholly unissued supply, not a
+		 * live domain. Retire it under the same reservation lock.
+		 */
+		owner = pool->unissued;
+		if (owner)
+			owner_remove(owner);
+	}
+	spin_unlock_irqrestore(&pool->lock, flags);
+	if (owner)
+		owner_free(owner, true);
+}
 
 static void owner_init(struct mm_subpage_owner *owner, struct mm_subpage_pool *pool,
 		       struct folio *folio)
@@ -285,7 +380,7 @@ void mm_subpage_pool_get(struct mm_subpage_pool *pool)
 	refcount_inc(&pool->refs);
 }
 
-void mm_subpage_pool_put(struct mm_subpage_pool *pool)
+static void pool_put_raw(struct mm_subpage_pool *pool)
 {
 	if (!refcount_dec_and_test(&pool->refs))
 		return;
@@ -295,19 +390,25 @@ void mm_subpage_pool_put(struct mm_subpage_pool *pool)
 	kfree_rcu(pool, rcu);
 }
 
-/* Keep the first implementation within one unambiguous allocation domain.
- * Policy-sensitive, locked, droppable and multi-node faults keep fresh backing.
- * An mm can move cgroups; old charged slots must not satisfy its new faults.
- */
+void mm_subpage_pool_put(struct mm_subpage_pool *pool)
+{
+	/* Failed allocations must not leave an empty per-domain cache behind. */
+	cow_pool_retire_empty(pool);
+	pool_put_raw(pool);
+}
+
+/* Per-mm pools retain each still-backed charge/node/shard domain separately. */
 struct mm_subpage_pool *mm_subpage_cow_pool_get_charged(struct mm_struct *mm,
 			struct mm_struct *charge_mm, struct vm_area_struct *vma,
 			unsigned long address)
 {
 	struct mm_subpage_cow_pools *pools, *new_pools;
 	struct mm_subpage_pool *pool, *new;
-	unsigned int bucket = hash_long(address >> PAGE_SHIFT, COW_POOL_BITS);
+	struct cow_pool_key key = {};
 	struct mem_cgroup *memcg;
-	bool matches;
+	unsigned long flags;
+	unsigned int attempt;
+	void *result;
 	int nid;
 
 	if ((vma->vm_flags & (VM_LOCKED | VM_DROPPABLE | VM_SPECIAL)) ||
@@ -320,60 +421,85 @@ struct mm_subpage_pool *mm_subpage_cow_pool_get_charged(struct mm_struct *mm,
 	nid = first_node(node_states[N_MEMORY]);
 	if (!node_isset(nid, cpuset_current_mems_allowed))
 		return NULL;
-	/* Publication pairs with cmpxchg: every bucket starts empty. Adjacent
-	 * 4K leaves in one native virtual group always choose the same pool.
-	 * Faulting threads can migrate CPUs without changing that identity.
-	 */
+	/* Acquire initialization published by the mm's cmpxchg below. */
 	pools = smp_load_acquire(&mm->cow_subpage_pool);
 	if (!pools) {
 		new_pools = kzalloc(sizeof(*new_pools), GFP_KERNEL | __GFP_ACCOUNT);
 		if (!new_pools)
 			return NULL;
+		spin_lock_init(&new_pools->lock);
+		INIT_LIST_HEAD(&new_pools->pools);
+		refcount_set(&new_pools->refs, 1);
+		INIT_WORK(&new_pools->free_work, cow_registry_free_work);
+		if (rhashtable_init(&new_pools->domains, &cow_domain_params)) {
+			kfree(new_pools);
+			return NULL;
+		}
 		pools = cmpxchg(&mm->cow_subpage_pool, NULL, new_pools);
 		if (!pools)
 			pools = new_pools;
 		else
-			kfree(new_pools);
+			cow_registry_put(new_pools);
 	}
 	memcg = get_mem_cgroup_from_mm(charge_mm);
-	/* Acquire the immutable charge domain published with this bucket. */
-	pool = smp_load_acquire(&pools->pool[bucket]);
-	if (!pool) {
-		new = mm_subpage_pool_create_granule(GFP_KERNEL, mm_page_shift(mm));
-		if (!new) {
+	key.memcg = memcg;
+	key.nid = nid;
+	key.bucket = hash_long(address >> PAGE_SHIFT, COW_POOL_BITS);
+	for (attempt = 0; attempt < 3; attempt++) {
+		rcu_read_lock();
+		pool = rhashtable_lookup(&pools->domains, &key, cow_domain_params);
+		if (pool && !refcount_inc_not_zero(&pool->refs))
+			pool = NULL;
+		rcu_read_unlock();
+		if (pool) {
 			mem_cgroup_put(memcg);
-			return NULL;
+			return pool;
 		}
+		new = mm_subpage_pool_create_granule(GFP_KERNEL, mm_page_shift(mm));
+		if (!new)
+			break;
 		new->cow_free_slots = kcalloc(SUBPAGES_PER_FOLIO,
 					    sizeof(*new->cow_free_slots),
 					    GFP_KERNEL | __GFP_ACCOUNT);
 		if (!new->cow_free_slots) {
 			mm_subpage_pool_close(new);
 			mm_subpage_pool_put(new);
-			mem_cgroup_put(memcg);
-			return NULL;
+			break;
 		}
+		if (memcg)
+			css_get(&memcg->css);
 		new->cow_memcg = memcg;
 		new->cow_nid = nid;
 		new->cow_shared = true;
-		pool = cmpxchg(&pools->pool[bucket], NULL, new);
-		if (!pool) {
-			pool = new;
-			/* The mm owns the initial pool reference and its memcg ref. */
-			mm_subpage_pool_get(pool);
-			return pool;
+		new->cow_key = key;
+		INIT_LIST_HEAD(&new->cow_domain);
+		new->cow_registry = pools;
+		/* Hold caller, prospective membership and registry lifetime refs
+		 * before a concurrent lookup can observe this pool.
+		 */
+		mm_subpage_pool_get(new);
+		refcount_inc(&pools->refs);
+		spin_lock_irqsave(&new->lock, flags);
+		result = rhashtable_lookup_get_insert_fast(&pools->domains,
+						 &new->cow_hash, cow_domain_params);
+		if (!result) {
+			spin_lock(&pools->lock);
+			list_add_tail(&new->cow_domain, &pools->pools);
+			spin_unlock(&pools->lock);
 		}
-		matches = pool->cow_memcg == memcg && pool->cow_nid == nid;
+		spin_unlock_irqrestore(&new->lock, flags);
+		if (!result) {
+			mem_cgroup_put(memcg);
+			return new;
+		}
+		/* Do not dereference an unreferenced object returned by insert. */
 		mm_subpage_pool_close(new);
 		mm_subpage_pool_put(new);
-	} else {
-		matches = pool->cow_memcg == memcg && pool->cow_nid == nid;
-		mem_cgroup_put(memcg);
+		if (IS_ERR(result))
+			break;
 	}
-	if (!matches)
-		return NULL;
-	mm_subpage_pool_get(pool);
-	return pool;
+	mem_cgroup_put(memcg);
+	return NULL;
 }
 
 struct mm_subpage_pool *mm_subpage_cow_pool_get(struct mm_struct *mm,
@@ -390,18 +516,26 @@ bool mm_subpage_cow_folio_matches(struct mm_subpage_pool *pool, struct folio *fo
 void mm_subpage_cow_pool_exit(struct mm_struct *mm)
 {
 	struct mm_subpage_cow_pools *pools = xchg(&mm->cow_subpage_pool, NULL);
-	unsigned int i;
+	struct mm_subpage_pool *pool;
+	unsigned long flags;
 
-	/* No faults remain once mm_users reaches zero. Slot owners can outlive mm. */
+	/* No faults remain; outstanding owners/callbacks never use this mm. */
 	if (!pools)
 		return;
-	for (i = 0; i < ARRAY_SIZE(pools->pool); i++) {
-		if (!pools->pool[i])
-			continue;
-		mm_subpage_pool_close(pools->pool[i]);
-		mm_subpage_pool_put(pools->pool[i]);
+	for (;;) {
+		spin_lock_irqsave(&pools->lock, flags);
+		pool = list_first_entry_or_null(&pools->pools,
+					       struct mm_subpage_pool, cow_domain);
+		if (pool)
+			mm_subpage_pool_get(pool);
+		spin_unlock_irqrestore(&pools->lock, flags);
+		if (!pool)
+			break;
+		/* Lock order is pool -> registry list, never the reverse. */
+		mm_subpage_pool_close(pool);
+		mm_subpage_pool_put(pool);
 	}
-	kfree(pools);
+	cow_registry_put(pools);
 }
 
 /* Counts include unavailable (busy/migrating) owners, so zero is conclusive.
@@ -443,6 +577,10 @@ static void owner_remove(struct mm_subpage_owner *owner)
 	if (owner->pool->unissued == owner)
 		owner->pool->unissued = NULL;
 	owner->pool->backing_pages--;
+	if (!owner->pool->backing_pages && owner->pool->cow_shared) {
+		owner->pool->closed = true;
+		cow_pool_detach_locked(owner->pool);
+	}
 }
 
 static void owner_free_rmap(struct mm_subpage_owner *owner)
@@ -838,6 +976,7 @@ void mm_subpage_pool_close(struct mm_subpage_pool *pool)
 
 	spin_lock_irqsave(&pool->lock, flags);
 	pool->closed = true;
+	cow_pool_detach_locked(pool);
 	/* At most one newly supplied owner has no issued slots. Close is O(1). */
 	owner = pool->unissued;
 	if (owner)
