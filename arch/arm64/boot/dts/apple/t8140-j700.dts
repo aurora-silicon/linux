@@ -82,8 +82,20 @@
 	 * P-state on both kinds of load (higher gains oscillate on the heavy
 	 * one).  1.5 W lies inside the sustainable range measured at ~93 C:
 	 * 1.1 W for floating-point and 2.5 W for integer loads.  The switch-on
-	 * trip sits above the idle temperature (48-53 C), so the controller,
-	 * and with it any integral wind-up, resets whenever the machine rests.
+	 * trip sits above the idle temperature with schedutil (48-53 C), so the
+	 * controller, and with it any integral wind-up, resets whenever the
+	 * machine rests.
+	 *
+	 * The governor grants no power to a cooling device that requests none,
+	 * so above the switch-on trip an idle E cluster is sent to its lowest
+	 * OPP, and work that wakes there runs at 816 MHz until the next
+	 * evaluation.  With the performance governor the die idles at 58-70 C,
+	 * above that trip, and in a ten-minute idle the E cluster spent 40% of
+	 * its time capped this way.  The E maps therefore stop at cooling
+	 * state 3, 1464 MHz, where the energy model puts the cost of the
+	 * cluster's work within 0.5% of 816 MHz.  The lowest power of both
+	 * clusters, 0.73 W, stays well under the 1.1 W sustainable on
+	 * floating-point loads.
 	 */
 	thermal-zones {
 		cpu-e0-thermal {
@@ -124,10 +136,10 @@
 				map1 {
 					trip = <&cpu_e0_control>;
 					cooling-device =
-						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
 					contribution = <3072>;
 				};
 			};
@@ -171,10 +183,10 @@
 				map1 {
 					trip = <&cpu_e1_control>;
 					cooling-device =
-						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
 					contribution = <3072>;
 				};
 			};
@@ -218,10 +230,10 @@
 				map1 {
 					trip = <&cpu_p0_control>;
 					cooling-device =
-						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
 					contribution = <3072>;
 				};
 			};
@@ -265,10 +277,10 @@
 				map1 {
 					trip = <&cpu_p1_control>;
 					cooling-device =
-						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
 					contribution = <3072>;
 				};
 			};
@@ -312,10 +324,10 @@
 				map1 {
 					trip = <&cpu_p2_control>;
 					cooling-device =
-						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
 					contribution = <3072>;
 				};
 			};
@@ -359,10 +371,10 @@
 				map1 {
 					trip = <&cpu_p3_control>;
 					cooling-device =
-						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
 					contribution = <3072>;
 				};
 			};
