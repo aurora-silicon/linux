@@ -34,6 +34,18 @@ class Assembly(unittest.TestCase):
         subprocess.run(['bsdtar','--zstd','-cf',str(path),'-C',str(tree),*files],check=True)
         self.manifest['packages'][role]=dict(file=path.name,sha256=hashlib.sha256(path.read_bytes()).hexdigest())
     def assemble(self):return mod.assemble((ROOT/'install-aurora-sep.sh').read_text(),self.manifest,self.root)
+    def test_legacy_board_capability_defaults_and_exact_j615_pair(self):
+        self.assertIn('M3_PERSISTENT_BOARDS="j613"',self.assemble()[0])
+        self.manifest['legacy_gpu_boards']=['j613','j615']
+        with self.assertRaisesRegex(ValueError,'kernel consumer'):self.assemble()
+        self.manifest['source_commits']['kernel']='7d5a612eceaa5299131c12f79873db13d969daa9'
+        with self.assertRaisesRegex(ValueError,'m1n1 producer'):self.assemble()
+        self.manifest['source_commits']['m1n1']='74ba6bea52d1f865d204bb3f8168705a148fd5c5'
+        self.assertIn('M3_PERSISTENT_BOARDS="j613 j615"',self.assemble()[0])
+        for bad in [['j615','j615'],['j504'],[], 'j613 j615']:
+            self.manifest['legacy_gpu_boards']=bad
+            with self.assertRaises(ValueError):self.assemble()
+
     def test_complete_artifact_manifest_pins_exact_stack(self):
         script,ident=self.assemble()
         self.assertIn(f'M3_STACK_ID="{ident}"',script)

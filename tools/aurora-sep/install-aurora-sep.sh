@@ -573,11 +573,13 @@ M3_GPU_AUTO=0
 M3_GPU_EXPLICIT_PROFILE=0
 M3_GPU_PROFILE=legacy
 M3_STACK_ID=""
+M3_PERSISTENT_BOARDS="j613"
 M3_STAGE1_25_VERSIONS=""
 M3_MESA_NATIVE_MARKER=/opt/mesa-m3/25g83/share/mesa-m3/profile
 M3_PROFILE_SELECTOR=j613-25g83-hal200
 M3_BOOT_PROFILE_HELPER=/usr/local/libexec/aurora-m3-boot-profile
 M3_GPU_PROFILE_FILE=/etc/mesa-m3/t8122-profile
+M3_GPU_CHECK=/usr/local/bin/aurora-m3-gpu-check
 M3_GRUB_DEFAULTS=/etc/default/grub
 M3_LIMINE_DEFAULTS=/etc/default/limine
 M3_PROFILE_HOOK=/etc/pacman.d/hooks/zzzz-aurora-m3-profile.hook
@@ -948,10 +950,11 @@ m3_stub_problem() {
 # Why this Mac's m1n1 stage 1 isn't one the M3 m1n1 is checked with (see
 # M3_STAGE1_VERSIONS); nothing when it is.
 # Clean v1.6.1 has the same base/entry/BootArgs chainload ABI as aurora13.
-# This source-qualified exception is confined to the existing J613 14.8.3 path.
+# Both supported Air boards use the same T8122 chainload ABI and exact stub.
 m3_clean_stage1_14_qualified() {
   local fw target version
-  [[ $M3_GPU_PROFILE == legacy && $(this_board) == j613 && $(this_soc) == t8122 ]] || return 1
+  [[ $M3_GPU_PROFILE == legacy && ($(this_board) == j613 || $(this_board) == j615) && $(this_soc) == t8122 &&
+      " $M3_PERSISTENT_BOARDS " == *" $(this_board) "* ]] || return 1
   [[ ! -e $DT/$M3_OSLOG_OVERLAP ]] || return 1
   fw=$({ tr -d '\0' <"$DT/chosen/asahi,os-fw-version"; } 2>/dev/null) || return 1
   [[ ($fw == 14.7 || $fw == 14.8.3) && -z $(m3_stub_problem) ]] || return 1
@@ -1540,6 +1543,7 @@ mesa_needs_too_old() {
 m3_gpu_notice() {
   if ((M3_GPU_PERSISTENT)); then
     say "Experimental GPU profile $M3_GPU_PROFILE is selected for subsequent boots with the matched kernel, Mesa and bootloader. The retained previous entry uses asahi.t8122_start=0 and mesa_m3=off."
+    say "Reboot, log into your desktop, then run: aurora-m3-gpu-check"
     [[ $M3_GPU_PROFILE != j613-25g83 ]] || say "25G83 native OpenGL is experimental; Vulkan hardware support is unavailable."
     return 0
   fi
@@ -3574,6 +3578,7 @@ install_all() {
   m1n1_rollback_check
   m3_plan
   m3_gpu_plan
+  if ((M3_GPU_PERSISTENT)); then m3_gpu_check_plan; fi
   m3_pro_mesa_plan
   if ((M3_GPU_PERSISTENT)); then
     [[ $M3_PRO_MESA_RESULT != current ]] || M3_PRO_MESA_RESULT=""
@@ -3732,6 +3737,7 @@ install_all() {
   m3_pro_mesa_render
   m3_pro_mesa_record
   pacman -Q linux-aurora libfprint aurora-touchid
+  if ((M3_GPU_PERSISTENT)); then m3_gpu_check_install; fi
   if ((M3_GPU_PERSISTENT)); then m3_persistent_transaction_commit; fi
   echo
   if ((M3_GPU_PERSISTENT)); then
@@ -3880,6 +3886,7 @@ uninstall_all() {
   m3_persistent_remove
   m3_gpu_remove
   m3_pro_mesa_remove
+  m3_gpu_check_remove
   # The m1n1 builds that failed on this Mac stay recorded, so a later install
   # never puts one of them back.
   local failed=""
@@ -6019,7 +6026,7 @@ PROMPT
 }
 
 # A reset needs none of the kernel and boot checks; it checks for itself.
-preflight_needed() { case ${1:-} in --agent-prompt | --reset-touchid | --m3-report | --m3-power-survey) return 1 ;; *) return 0 ;; esac; }
+preflight_needed() { case ${1:-} in --agent-prompt | --reset-touchid | --m3-report | --m3-power-survey | --m3-gpu-check) return 1 ;; *) return 0 ;; esac; }
 
 # Exact stack pins are filled when the installer is assembled from its manifest.
 m3_gpu_firmware_compat() {
@@ -6062,13 +6069,15 @@ M3_GPU_FIRMWARE
 # must still pass the existing legacy checks before that profile is used.
 m3_gpu_auto_profile() {
   local compat problem
-  [[ $(this_board) == j613 && $(this_soc) == t8122 ]] ||
-    die "--m3-gpu currently supports the 13-inch M3 MacBook Air (J613) only"
+  [[ ($(this_board) == j613 || $(this_board) == j615) && " $M3_PERSISTENT_BOARDS " == *" $(this_board) "* && $(this_soc) == t8122 ]] ||
+    die "--m3-gpu requires a matched bundle supporting this M3 MacBook Air"
   compat=$(m3_gpu_firmware_compat) || die "--m3-gpu cannot read this boot's GPU firmware description. Nothing was installed.
     Run this installer with --m3-report and include the error above."
   case $compat in
     14.8.3) M3_GPU_PROFILE=legacy ;;
-    26.6.2) M3_GPU_PROFILE=j613-25g83 ;;
+    26.6.2)
+      [[ $(this_board) == j613 ]] || die "Native 25G83 OpenGL supports J613 only; J615 requires its supported current14 GPU firmware."
+      M3_GPU_PROFILE=j613-25g83 ;;
     absent)
       M3_GPU_PROFILE=legacy
       problem=$(m3_stub_problem)
@@ -6078,7 +6087,7 @@ m3_gpu_auto_profile() {
     *) die "--m3-gpu does not support GPU firmware compatibility $compat. Nothing was installed.
     Run this installer with --m3-report. This installer does not migrate macOS firmware." ;;
   esac
-  say "J613: selected experimental GPU profile $M3_GPU_PROFILE; bootloader and matched-package checks still apply"
+  say "$(this_board): selected experimental GPU profile $M3_GPU_PROFILE; bootloader and matched-package checks still apply"
 }
 
 m3_25_boot_problem() {
@@ -6089,7 +6098,7 @@ m3_25_boot_problem() {
 }
 
 m3_persistent_preflight() {
-  [[ $(this_board) == j613 && $(this_soc) == t8122 ]] || die "persistent GPU activation currently supports J613 only"
+  [[ ($(this_board) == j613 || $(this_board) == j615) && " $M3_PERSISTENT_BOARDS " == *" $(this_board) "* && $(this_soc) == t8122 ]] || die "persistent GPU activation requires a matched bundle supporting this M3 MacBook Air"
   [[ $M3_STACK_ID =~ ^[0-9a-f]{64}$ ]] || die "persistent GPU requires an installer assembled from an exact matched stack manifest"
   ((M3_PRO_MESA)) || die "persistent GPU activation requires matching Mesa"
   [[ $M3_MODE == handoff ]] || die "persistent GPU requires a validated bootloader handoff"
@@ -6125,7 +6134,7 @@ m3_persistent_transaction_begin() {
   target=$(esp_bootbin) || die "persistent GPU requires the mounted boot.bin"
   $sudo python3 - "$STATE/m3-persistent-transaction.json" "$defaults" "$M1N1_CONF" "$target" \
     "$M3_GPU_OPTIN" "$M3_GPU_PROFILE_FILE" "$STATE/m3-gpu-persistent" "$STATE/m3-mode" \
-    "$M3_PROFILE_HOOK" "$M3_PROFILE_UPDATE" <<'M3_TRANSACTION_BEGIN'
+    "$M3_PROFILE_HOOK" "$M3_PROFILE_UPDATE" "$M3_GPU_CHECK" "$STATE/m3-gpu-check" <<'M3_TRANSACTION_BEGIN'
 import base64, json, os, stat, sys
 from pathlib import Path
 snapshot=Path(sys.argv[1])
@@ -6565,7 +6574,240 @@ m3_persistent_select() {
   [[ ! -f $M3_GPU_PROFILE_FILE ]] || $sudo chmod 0644 "$M3_GPU_PROFILE_FILE"
 }
 
-# Optional desktop packages enter the same pacman transaction as the kernel.
+# The desktop GPU checker is owned by its recorded content hash.
+m3_gpu_check_plan() {
+  local recorded="" current=""
+  if [[ -e $M3_GPU_CHECK || -L $M3_GPU_CHECK ]]; then
+    [[ -f $M3_GPU_CHECK && ! -L $M3_GPU_CHECK ]] || die "$M3_GPU_CHECK is not an installer-owned regular file; it was left unchanged"
+    [[ -f $STATE/m3-gpu-check && ! -L $STATE/m3-gpu-check ]] || die "$M3_GPU_CHECK already exists without an ownership record; it was left unchanged"
+    recorded=$(cat "$STATE/m3-gpu-check")
+    current=$(sha256sum "$M3_GPU_CHECK" | cut -d' ' -f1)
+    [[ $recorded =~ ^[0-9a-f]{64}$ && $current == "$recorded" ]] || die "$M3_GPU_CHECK was changed outside this installer; it was left unchanged"
+  elif [[ -e $STATE/m3-gpu-check || -L $STATE/m3-gpu-check ]]; then
+    [[ -f $STATE/m3-gpu-check && ! -L $STATE/m3-gpu-check ]] || die "GPU check ownership record is not a regular file"
+    [[ $(cat "$STATE/m3-gpu-check") =~ ^[0-9a-f]{64}$ ]] || die "GPU check ownership record is invalid"
+  fi
+}
+
+m3_gpu_check_install() {
+  local sha
+  m3_gpu_check_plan
+  m3_gpu_check_builtin >"$work/aurora-m3-gpu-check"
+  sha=$(sha256sum "$work/aurora-m3-gpu-check" | cut -d' ' -f1)
+  $sudo install -D -m 0755 "$work/aurora-m3-gpu-check" "$M3_GPU_CHECK"
+  printf '%s\n' "$sha" | $sudo tee "$STATE/m3-gpu-check" >/dev/null
+  $sudo chmod 0644 "$STATE/m3-gpu-check"
+}
+
+m3_gpu_check_remove() {
+  [[ -f $STATE/m3-gpu-check && ! -L $STATE/m3-gpu-check ]] || return 0
+  if [[ -e $M3_GPU_CHECK || -L $M3_GPU_CHECK ]]; then
+    if [[ ! -f $M3_GPU_CHECK || -L $M3_GPU_CHECK ||
+          $(sha256sum "$M3_GPU_CHECK" | cut -d' ' -f1) != "$(cat "$STATE/m3-gpu-check")" ]]; then
+      warn "Keeping $M3_GPU_CHECK: it was changed outside this installer"
+      return 0
+    fi
+    $sudo rm -f "$M3_GPU_CHECK"
+  fi
+  $sudo rm -f "$STATE/m3-gpu-check"
+}
+
+m3_gpu_check_run() {
+  ((EUID != 0)) || die "run --m3-gpu-check in your desktop terminal, without sudo"
+  local code
+  code=$(m3_gpu_check_builtin)
+  if [[ -n ${MESA_M3_HOOK_RUN_ID:-} ]]; then
+    python3 -c "$code" --session "$@"
+  else
+    systemd-run --user --pipe --wait --collect --quiet --slice=app-graphical.slice \
+      python3 -c "$code" --session "$@"
+  fi
+}
+
+m3_gpu_check_builtin() {
+  cat <<'AURORA_M3_GPU_CHECK_PY'
+#!/usr/bin/python3
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+
+
+class CheckError(Exception):
+    def __init__(self, message, remedy, details=''):
+        super().__init__(message)
+        self.remedy = remedy
+        self.details = details
+
+
+def reject(message, remedy='Run the matched installer with --m3-report and include this error.', details=''):
+    raise CheckError(message, remedy, details)
+
+
+def fields(text):
+    values = {}
+    for line in text.splitlines():
+        if '=' not in line:
+            reject('The GPU session record is incomplete.', 'Log out and log in again, then retry.')
+        key, value = line.split('=', 1)
+        if key in values:
+            reject('The GPU session record has duplicate fields.', 'Log out and log in again, then retry.')
+        values[key] = value
+    return values
+
+
+def verify(root, env, uid, run=subprocess.run):
+    if uid == 0:
+        reject('The GPU check needs your desktop session.', 'Run aurora-m3-gpu-check without sudo after login.')
+    state_path = root / f'run/user/{uid}/mesa-m3-session.state'
+    try:
+        info = state_path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_size > 16384:
+            raise ValueError('invalid session record')
+        state = fields(state_path.read_text())
+    except (OSError, ValueError):
+        reject('No current GPU session was found.', 'Reboot and log into your desktop, then retry.')
+    if state.get('schema') != 'aurora.mesa-m3-session/2':
+        reject('The GPU session record is unsupported.', 'Install the matched Mesa package and log in again.')
+    if state.get('decision') != 'active' or state.get('reason') != 'active':
+        reason = state.get('reason', 'unknown')
+        remedy = {
+            'experimental': 'Run the matched installer with --m3-gpu, then reboot and log in.',
+            'no-access': 'Log out and log in again so render-group membership takes effect.',
+            'no-gpu': 'Reboot into the installed Aurora kernel, then retry.',
+            'opt-out': 'Review your GPU opt-out setting; this check does not change it.',
+            'previous-failed': 'Use the retained GPU-off entry and report the previous failed login.',
+        }.get(reason, 'Run the matched installer with --m3-report and include this error.')
+        reject(f'Apple GPU is inactive ({reason}).', remedy)
+    boot = (root / 'proc/sys/kernel/random/boot_id').read_text().strip()
+    if (state.get('uid') != str(uid) or state.get('boot_id') != boot or
+            not state.get('hook_run_id') or state['hook_run_id'] != env.get('MESA_M3_HOOK_RUN_ID') or
+            (env.get('XDG_SESSION_ID') and state.get('session_id') != env['XDG_SESSION_ID'])):
+        reject('The GPU session does not match this login.', 'Log out and log in again, then retry.')
+    selector_path = root / 'etc/mesa-m3/t8122-profile'
+    selector = selector_path.read_text().rstrip('\n') if selector_path.exists() else ''
+    native = selector == 'j613-25g83-hal200'
+    if selector not in ('', 'j613-25g83-hal200'):
+        reject('The installed GPU profile is unknown.')
+    prefix = '/opt/mesa-m3/25g83' if native else '/opt/mesa-m3'
+    profile = selector if native else 'legacy'
+    if state.get('prefix') != prefix or env.get('MESA_M3_SESSION') != prefix:
+        reject('The desktop and installed GPU profile differ.', 'Reboot and log in again after the matched installation.')
+    if state.get('fallback') != 'none' or env.get('MESA_M3_FALLBACK') or env.get('LIBGL_ALWAYS_SOFTWARE', '0') not in ('', '0'):
+        reject('This login is using software rendering.', 'Reboot and log in again; if unchanged, run --m3-report.')
+    compatible = (root / 'proc/device-tree/compatible').read_bytes().split(b'\0')
+    soc = 't8122' if b'apple,t8122' in compatible else 't6030' if b'apple,t6030' in compatible else ''
+    if not soc:
+        reject('This Mac has no supported M3 GPU profile.')
+    if soc == 't8122' and not (root / 'etc/mesa-m3/t8122-gpu-experiment').is_file():
+        reject('The Air GPU experimental opt-in is absent.', 'Run the matched installer with --m3-gpu, then reboot and log in.')
+    nodes = list((root / 'sys/class/drm').glob('renderD*'))
+    if len(nodes) != 1:
+        reject('The kernel has no unique M3 render node.', 'Reboot into the installed Aurora kernel, then retry.')
+    node = nodes[0]
+    of_node = node / 'device/of_node'
+    if ((node / 'device/driver').resolve().name != 'asahi' or
+            f'apple,agx-{soc}'.encode() not in (of_node / 'compatible').read_bytes().split(b'\0')):
+        reject('The render node is not this Mac\'s Asahi GPU.')
+    device = root / f'dev/dri/{node.name}'
+    if not os.access(device, os.R_OK | os.W_OK):
+        reject('The GPU render node is not accessible.', 'Log out and log in again so render-group membership takes effect.')
+    if native:
+        if (soc != 't8122' or b'apple,j613' not in compatible or
+                (of_node / 'apple,firmware-compat').read_bytes() != bytes.fromhex('0000001a0000000600000002') or
+                (of_node / 'apple,j613-25g83-gpu-handoff').read_bytes() != bytes.fromhex('00000001') or
+                (root / prefix.lstrip('/') / 'share/mesa-m3/profile').read_text().rstrip('\n') != 'j613-25g83-gl-only'):
+            reject('Native OpenGL requires the exact J613 25G83 handoff.')
+    elif (of_node / 'apple,j613-25g83-gpu-handoff').exists():
+        reject('The native HAL200 handoff cannot use legacy Mesa.')
+    abi = run([str(root / 'opt/mesa-m3/libexec/mesa-m3-abi-check'), profile, str(device)],
+              capture_output=True, text=True, timeout=10)
+    expected_hal = 'HAL200' if native else 'HAL0'
+    if (abi.returncode or 'match=1' not in abi.stdout.split() or
+            expected_hal not in abi.stdout.split() or 'USC3' not in abi.stdout.split()):
+        reject('The running GPU ABI does not match the installed profile.', details=abi.stdout + abi.stderr)
+    probe = run([str(root / prefix.lstrip('/') / 'bin/mesa-m3-probe')],
+                capture_output=True, text=True, timeout=95)
+    text = probe.stdout
+    def value(key):
+        matches = [line[len(key) + 1:] for line in text.splitlines() if line.startswith(key + '=')]
+        if len(matches) != 1:
+            reject('The GPU readback report is incomplete.', details=text + probe.stderr)
+        return matches[0]
+    if probe.returncode or value('result') != 'pass' or value('exit') != '0':
+        reject('The Apple GPU readback did not pass.', details=text + probe.stderr)
+    identities = [line for line in text.splitlines() if line.startswith('pid=')]
+    if (len(identities) != 1 or not re.fullmatch(r'pid=[1-9][0-9]* starttime=[1-9][0-9]* boot_id=' + re.escape(boot), identities[0]) or
+            value('env.MESA_M3_HOOK_RUN_ID') != state['hook_run_id'] or value('env.MESA_M3_SESSION') != prefix):
+        reject('The readback does not match this GPU session.', details=text)
+    renderer = value('gl.renderer')
+    if 'apple m3' not in renderer.lower() or any(name in renderer.lower() for name in ('llvmpipe', 'softpipe', 'lavapipe', 'swrast', 'software')):
+        reject('OpenGL is not using the Apple M3 GPU.', details=text)
+    if native and (not renderer.startswith('Apple M3') or 'zink' in renderer.lower()):
+        reject('The native profile is not using native Apple OpenGL.', details=text)
+    if value('gl.platform') != 'wayland' or value('gl.swap') != 'pass':
+        reject('The GPU probe could not render through your desktop.', 'Run the check after normal desktop login.', text)
+    render = value('gl.render')
+    if not re.fullmatch(r'pass left=255,0,0,\d+ right=0,0,255,\d+ glerror=0x0', render):
+        reject('OpenGL red/blue pixel readback failed.', details=text)
+    if f'node=/dev/dri/{node.name}' not in [part for line in text.splitlines() if line.startswith('fd.dri ') for part in line.split()]:
+        reject('The readback process did not open the admitted GPU node.', details=text)
+    maps = [dict(part.split('=', 1) for part in line.split()[1:] if '=' in part)
+            for line in text.splitlines() if line.startswith('map class=implementation ')]
+    if not maps or any(m.get('same_file') != '1' or m.get('deleted') != '0' or
+                       not m.get('path', '').startswith(prefix + '/') or
+                       (not native and m['path'].startswith('/opt/mesa-m3/25g83/')) for m in maps):
+        reject('The readback loaded a different or replaced Mesa profile.', 'Reboot and log in again after the matched installation.', text)
+    if native:
+        if value('vk.capability') != 'unavailable profile=j613-25g83':
+            reject('The native profile reported an unsupported Vulkan capability.', details=text)
+        vk = 'Vulkan unavailable in the experimental 25G83 profile.'
+    else:
+        if ('apple m3' not in value('vk.device').lower() or value('vk.device_type') != 'integrated-gpu' or
+                value('vk.job') != 'pass words=65536 wrong=0'):
+            reject('Apple GPU Vulkan compute readback failed.', details=text)
+        vk = 'PASS Apple GPU Vulkan (compute readback).'
+    return ['PASS Apple GPU OpenGL (red/blue readback).', vk], text
+
+
+def main():
+    args = sys.argv[1:]
+    if any(arg not in ('--session', '--details') for arg in args):
+        print('usage: aurora-m3-gpu-check [--details]', file=sys.stderr)
+        return 2
+    if '--session' not in args and not os.environ.get('MESA_M3_HOOK_RUN_ID') and os.geteuid() != 0:
+        command = ['systemd-run', '--user', '--pipe', '--wait', '--collect', '--quiet',
+                   '--slice=app-graphical.slice', sys.executable, __file__, '--session']
+        if '--details' in args:
+            command.append('--details')
+        try:
+            return subprocess.run(command).returncode
+        except OSError:
+            print('FAIL: No desktop session launcher was found. Run this check in your desktop terminal.')
+            return 1
+    try:
+        messages, details = verify(Path('/'), os.environ, os.geteuid())
+        print('\n'.join(messages))
+        if '--details' in args:
+            print(details, end='')
+        return 0
+    except CheckError as error:
+        print('FAIL: ' + str(error))
+        print('Next: ' + error.remedy)
+        if '--details' in args and error.details:
+            print(error.details, end='')
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        print('FAIL: GPU check could not complete. Run --m3-report and include this error.')
+    return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+AURORA_M3_GPU_CHECK_PY
+}
+
 desktop_fixes_manifest() { printf '%s' "$DESKTOP_FIXES_DATA" | base64 --decode; }
 desktop_fixes_run() {
   python3 <(desktop_fixes_builtin) "$1" <(desktop_fixes_manifest) "${@:2}"
@@ -6967,8 +7209,8 @@ fi
 if ((!M3_PRO_MESA)) && [[ -n ${1:-} && $1 != --read-only ]]; then
   die "--no-m3-mesa goes with an install (alone, with another install option or with --read-only), not with $1"
 fi
-# One option at a time; only --reset-touchid takes arguments of its own.
-if (($# > 1)) && [[ $1 != --reset-touchid ]]; then
+# One option at a time; these two commands take arguments of their own.
+if (($# > 1)) && [[ $1 != --reset-touchid && $1 != --m3-gpu-check ]]; then
   die "unexpected arguments after $1: ${*:2}"
 fi
 
@@ -6980,6 +7222,7 @@ case ${1:-} in
   --reset-touchid) shift; reset_touchid "$@" ;;
   --m3-report) m3_report ;;
   --m3-power-survey) m3_power_survey ;;
+  --m3-gpu-check) shift; m3_gpu_check_run "$@" ;;
   --agent-prompt) release_source >&2; prompt_notice; agent_prompt ;;
-  *) die "unknown option $1 (--read-only, --uninstall, --reset-touchid, --agent-prompt, --m3-report, --m3-power-survey, --m3-handoff, --m3-gpu, --m3-gpu-experiment, --m3-gpu-persistent, --m3-profile=j613-25g83, --no-m3-mesa or --desktop-fixes)" ;;
+  *) die "unknown option $1 (--read-only, --uninstall, --reset-touchid, --agent-prompt, --m3-report, --m3-power-survey, --m3-handoff, --m3-gpu, --m3-gpu-check, --m3-gpu-experiment, --m3-gpu-persistent, --m3-profile=j613-25g83, --no-m3-mesa or --desktop-fixes)" ;;
 esac
