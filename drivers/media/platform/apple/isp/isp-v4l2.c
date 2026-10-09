@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright 2023 Eileen Yoon <eyn@gmx.com> */
 
+#include <linux/math.h>
 #include <linux/module.h>
 
 #include <media/media-device.h>
 #include <media/v4l2-common.h>
+#include <media/v4l2-ctrls.h>
+#include <media/v4l2-event.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-mc.h>
 #include <media/videobuf2-dma-sg.h>
@@ -21,6 +24,9 @@
 #define ISP_MAX_PIX_FORMATS 2
 #define ISP_BUFFER_TIMEOUT msecs_to_jiffies(1500)
 #define ISP_STRIDE_ALIGNMENT 64
+
+/* Capture rates offered to userspace, in frames per second */
+static const unsigned int isp_frame_rates[] = { 30, 25, 24, 20, 15 };
 
 static bool multiplanar = false;
 module_param(multiplanar, bool, 0644);
@@ -465,9 +471,14 @@ static int isp_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
 
 	isp->sequence = 0;
 
+	/* The exposure priority is applied when the stream starts. */
+	v4l2_ctrl_grab(isp->exposure_priority, true);
+
 	err = apple_isp_start_streaming(isp);
-	if (err)
+	if (err) {
+		v4l2_ctrl_grab(isp->exposure_priority, false);
 		isp_vb2_release_buffers(isp, VB2_BUF_STATE_QUEUED);
+	}
 
 	return err;
 }
@@ -478,6 +489,7 @@ static void isp_vb2_stop_streaming(struct vb2_queue *q)
 
 	apple_isp_stop_streaming(isp);
 	isp_vb2_release_buffers(isp, VB2_BUF_STATE_ERROR);
+	v4l2_ctrl_grab(isp->exposure_priority, false);
 }
 
 int apple_isp_video_suspend(struct apple_isp *isp)
@@ -641,16 +653,54 @@ static int isp_vidioc_enum_framesizes(struct file *file, void *fh,
 	return 0;
 }
 
-static int isp_vidioc_enum_frameintervals(struct file *filp, void *priv,
+static int isp_vidioc_enum_frameintervals(struct file *file, void *fh,
 					  struct v4l2_frmivalenum *interval)
 {
-	if (interval->index != 0)
+	struct apple_isp *isp = video_drvdata(file);
+	int i;
+
+	if (interval->index >= ARRAY_SIZE(isp_frame_rates))
+		return -EINVAL;
+
+	if (interval->pixel_format != V4L2_PIX_FMT_NV12 &&
+	    interval->pixel_format != V4L2_PIX_FMT_NV12M)
+		return -EINVAL;
+
+	for (i = 0; i < isp->num_presets; i++) {
+		if (isp->presets[i].output_dim.x == interval->width &&
+		    isp->presets[i].output_dim.y == interval->height)
+			break;
+	}
+	if (i == isp->num_presets)
 		return -EINVAL;
 
 	interval->type = V4L2_FRMIVAL_TYPE_DISCRETE;
 	interval->discrete.numerator = 1;
-	interval->discrete.denominator = 30;
+	interval->discrete.denominator = isp_frame_rates[interval->index];
 	return 0;
+}
+
+/* Returns the supported rate whose frame interval is closest to @tpf. */
+static unsigned int isp_closest_frame_rate(const struct v4l2_fract *tpf)
+{
+	unsigned int best = isp_frame_rates[0];
+
+	/*
+	 * |n/d - 1/r| = |n * r - d| / (d * r), so the closest rate has the
+	 * smallest |n * r - d| / r; compare those by cross-multiplying.
+	 */
+	for (int i = 1; i < ARRAY_SIZE(isp_frame_rates); i++) {
+		unsigned int rate = isp_frame_rates[i];
+		u64 err = abs_diff((u64)tpf->numerator * rate,
+				   (u64)tpf->denominator);
+		u64 best_err = abs_diff((u64)tpf->numerator * best,
+					(u64)tpf->denominator);
+
+		if (err * best < best_err * rate)
+			best = rate;
+	}
+
+	return best;
 }
 
 static inline void isp_get_sp_pix_format(struct apple_isp *isp,
@@ -836,8 +886,8 @@ static int isp_vidioc_get_param(struct file *file, void *fh,
 
 	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
 	a->parm.capture.readbuffers = ISP_MIN_FRAMES;
-	a->parm.capture.timeperframe.numerator = ISP_FRAME_RATE_NUM;
-	a->parm.capture.timeperframe.denominator = ISP_FRAME_RATE_DEN;
+	a->parm.capture.timeperframe.numerator = 1;
+	a->parm.capture.timeperframe.denominator = isp->frame_rate;
 
 	return 0;
 }
@@ -846,17 +896,27 @@ static int isp_vidioc_set_param(struct file *file, void *fh,
 				struct v4l2_streamparm *a)
 {
 	struct apple_isp *isp = video_drvdata(file);
+	struct v4l2_fract *tpf = &a->parm.capture.timeperframe;
 
 	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE &&
 	    (!isp->multiplanar ||
 	     a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE))
 		return -EINVAL;
 
-	/* Not supporting frame rate sets. No use. Plus floats. */
+	/* The rate is configured when the stream starts. */
+	if (vb2_is_streaming(&isp->vbq))
+		return -EBUSY;
+
+	/* A zero interval selects the nominal rate. */
+	if (!tpf->numerator || !tpf->denominator)
+		isp->frame_rate = ISP_FRAME_RATE_DEFAULT;
+	else
+		isp->frame_rate = isp_closest_frame_rate(tpf);
+
 	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
 	a->parm.capture.readbuffers = ISP_MIN_FRAMES;
-	a->parm.capture.timeperframe.numerator = ISP_FRAME_RATE_NUM;
-	a->parm.capture.timeperframe.denominator = ISP_FRAME_RATE_DEN;
+	tpf->numerator = 1;
+	tpf->denominator = isp->frame_rate;
 
 	return 0;
 }
@@ -889,6 +949,10 @@ static const struct v4l2_ioctl_ops isp_v4l2_ioctl_ops = {
 	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
 	.vidioc_streamon = vb2_ioctl_streamon,
 	.vidioc_streamoff = vb2_ioctl_streamoff,
+
+	.vidioc_log_status = v4l2_ctrl_log_status,
+	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
+	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
 };
 
 static const struct v4l2_file_operations isp_v4l2_fops = {
@@ -933,6 +997,8 @@ int apple_isp_setup_video(struct apple_isp *isp)
 		return err;
 	}
 
+	isp->frame_rate = ISP_FRAME_RATE_DEFAULT;
+
 	for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++) {
 		isp->meta_surfs[i] =
 			isp_alloc_surface_vmap(isp, isp->hw->meta_size);
@@ -969,10 +1035,25 @@ int apple_isp_setup_video(struct apple_isp *isp)
 
 	isp->multiplanar = multiplanar;
 
+	/*
+	 * Auto exposure is always on. By default it holds the frame rate, as
+	 * V4L2 specifies; with exposure priority it may slow down in low light.
+	 */
+	v4l2_ctrl_handler_init(&isp->ctrl_handler, 1);
+	isp->exposure_priority =
+		v4l2_ctrl_new_std(&isp->ctrl_handler, NULL,
+				  V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0, 1, 1, 0);
+	if (isp->ctrl_handler.error) {
+		err = isp->ctrl_handler.error;
+		dev_err(isp->dev, "failed to create controls: %d\n", err);
+		goto ctrl_free;
+	}
+	isp->v4l2_dev.ctrl_handler = &isp->ctrl_handler;
+
 	err = v4l2_device_register(isp->dev, &isp->v4l2_dev);
 	if (err) {
 		dev_err(isp->dev, "failed to register v4l2 device: %d\n", err);
-		goto media_unregister;
+		goto ctrl_free;
 	}
 
 	vbq->drv_priv = isp;
@@ -1016,7 +1097,8 @@ int apple_isp_setup_video(struct apple_isp *isp)
 
 v4l2_unregister:
 	v4l2_device_unregister(&isp->v4l2_dev);
-media_unregister:
+ctrl_free:
+	v4l2_ctrl_handler_free(&isp->ctrl_handler);
 	media_device_unregister(&isp->mdev);
 media_cleanup:
 	media_device_cleanup(&isp->mdev);
@@ -1030,6 +1112,7 @@ void apple_isp_remove_video(struct apple_isp *isp)
 {
 	vb2_video_unregister_device(&isp->vdev);
 	v4l2_device_unregister(&isp->v4l2_dev);
+	v4l2_ctrl_handler_free(&isp->ctrl_handler);
 	media_device_unregister(&isp->mdev);
 	media_device_cleanup(&isp->mdev);
 }
