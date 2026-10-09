@@ -145,7 +145,11 @@ impl Config {
     pub(crate) fn observe_thermal_state(&mut self, dev: &driver::AsahiDevice, state: u32) {
         if state != self.thermal_observed {
             self.thermal_observed = state;
-            dev_info!(dev, "G16G: thermal observed state={} ceiling={} frequency={} MHz\n",
+            // Every observed DVFS transition is normal telemetry, not a
+            // thermal warning. Keep the state tracking, but opt printk in
+            // through the GPU debug class. This is a nominal table value,
+            // not a measurement of the engine clock or gating state.
+            crate::cls_dev_dbg!(Gpu, dev, "G16G: observed pstate={} ceiling={} nominal_frequency={} MHz\n",
                 state, self.thermal_limit, self.board.frequencies_mhz.get(state as usize).copied().unwrap_or(0));
         }
     }
