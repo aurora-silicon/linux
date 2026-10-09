@@ -497,6 +497,7 @@
 				label = "pmp-gfx";
 				#power-domain-cells = <0>;
 				power-domains = <&ps_gfx>;
+				apple,always-on;
 			};
 		};
 
@@ -1135,7 +1136,7 @@
 			      <0x4 0x80000000 0x0 0x4000000>;
 			reg-names = "asc", "sgx";
 			mboxes = <&gfx_mbox>, <&gfx1_mbox>;
-			power-domains = <&pmc_gfx>;
+			power-domains = <&ps_gfx>;
 			memory-region = <&uat_ttbs>, <&uat_pagetables>,
 					<&uat_handoff>;
 			memory-region-names = "ttbs", "pagetables", "handoff";
@@ -1242,14 +1243,6 @@
 				compatible = "apple,t8140-clpc";
 				reg = <1>;
 				apple,gpu-power-state = <&ps_gfx>;
-			};
-
-			/* Dynamic agent of the GFX PMGR device */
-			pmc_gfx: voter@2 {
-				reg = <2>;
-				label = "gfx";
-				#power-domain-cells = <0>;
-				power-domains = <&pmp_report_gfx>;
 			};
 		};
 
