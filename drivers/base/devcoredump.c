@@ -470,7 +470,8 @@ static int __init devcoredump_init(void)
 {
 	return class_register(&devcd_class);
 }
-__initcall(devcoredump_init);
+/* Device probes may publish fault snapshots during their own initcall. */
+subsys_initcall(devcoredump_init);
 
 static void __exit devcoredump_exit(void)
 {
