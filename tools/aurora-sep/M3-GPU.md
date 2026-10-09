@@ -1,7 +1,14 @@
 # M3 GPU quick start
 
 For the **13-inch and 15-inch M3 MacBook Air (J613/J615)** with the supported
-14.8.3 stub, use the matched installer. No 25G83 migration is needed.
+14.8.3 stub, the matched installer prepares the experimental profile.
+
+**Current status:** current14 firmware startup still stalls on reported J613
+installs ([#35](https://github.com/iconidentify/aurora-linux/issues/35)), even
+after correcting PMP power admission. Installation and a working panel do
+not establish acceleration. Native25 remains a separate J613 GL-only route
+requiring its own exact firmware and matched stage1; migration instructions
+are pending.
 
 1. Enable the experimental GPU profile:
 
@@ -17,7 +24,7 @@ For the **13-inch and 15-inch M3 MacBook Air (J613/J615)** with the supported
    aurora-m3-gpu-check
    ```
 
-Expect **PASS Apple GPU OpenGL (red/blue readback)** and, on the legacy
+Successful acceleration must report **PASS Apple GPU OpenGL (red/blue readback)** and, on the legacy
 profile, **PASS Apple GPU Vulkan (compute readback)**. This runs real GPU
 work through the desktop session and checks its current Mesa profile,
 render node and loaded libraries. An installed package or working panel
