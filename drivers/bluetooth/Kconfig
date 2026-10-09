@@ -27,14 +27,15 @@ config BT_MTK7932_PCIE
 	tristate "J700 MT7932 PCIe Bluetooth transport"
 	depends on BT && PCI && ARCH_APPLE && IOMMU_DMA
 	depends on !KEXEC_CORE
-	depends on MT7932_FULLMAC != n
+	depends on MT7932_FULLMAC
 	select FW_LOADER
 	help
 	  Support the J700 Bluetooth PCIe function with locally installed firmware
-	  and calibration. The function is probed once the Wi-Fi function is
-	  bound to the mt7932-fullmac driver; the enable=0 parameter leaves it
-	  unbound. Both functions appear before the root filesystem is mounted
-	  and read their firmware when probed, so say M, like the Wi-Fi driver.
+	  and calibration. The function is probed once the Wi-Fi function has
+	  initialized under the mt7932-fullmac driver; the enable=0 parameter
+	  leaves it unbound. Both functions appear before the root filesystem
+	  is mounted and read their firmware when probed, so say M, like the
+	  Wi-Fi driver.
 	  System suspend uses the firmware sleep handshake and preserves DMA
 	  storage. Hibernation and automatic firmware recovery are unsupported.
 	  Removal drains the PCI function before releasing device-visible memory;

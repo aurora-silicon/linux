@@ -3,6 +3,7 @@
  * Clean-room contract: NEO_MT7932_DOWNLOAD_AND_NIC_CAP_CONTRACT.md.
  * All addresses here are BAR0 offsets, never chip/CPU physical addresses.
  */
+#include <linux/mt7932.h>
 #include "mt7932.h"
 
 #include <linux/pm_wakeup.h>
@@ -1254,6 +1255,8 @@ static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		ret = mt_reset_retained(&m);
 	if (!ret)
 		ret = mt_register_regulatory_gate(m);
+	if (!ret)
+		WRITE_ONCE(m->ready, true);
 retain:
 	if (ret) {
 		int error = ret;
@@ -1316,6 +1319,27 @@ static struct pci_driver mt_driver = {
 	.driver.suppress_bind_attrs = true,
 	.driver.pm = pm_sleep_ptr(&mt_pm_ops),
 };
+
+/**
+ * mt7932_fullmac_ready() - check that the Wi-Fi function is up
+ * @pdev: function 0 of the radio
+ *
+ * A Wi-Fi function whose initialization failed stays bound when its DMA
+ * could not be stopped, so being bound does not mean its firmware runs.
+ *
+ * Return: true if @pdev is bound to this driver and finished initialization.
+ */
+bool mt7932_fullmac_ready(struct pci_dev *pdev)
+{
+	struct mt7932 *m;
+
+	if (!device_is_bound(&pdev->dev) || pdev->dev.driver != &mt_driver.driver)
+		return false;
+	m = pci_get_drvdata(pdev);
+	return m && READ_ONCE(m->ready);
+}
+EXPORT_SYMBOL_GPL(mt7932_fullmac_ready);
+
 module_pci_driver(mt_driver);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("J700 MT7932 firmware-owned cfg80211 station driver");

@@ -53,7 +53,8 @@ performance policy.
 ``mt7932_bt_pcie`` defers its probe until ``mt7932-fullmac`` is bound to
 function 0, so the Bluetooth firmware always starts after the Wi-Fi firmware,
 as in the tested sequence, however the drivers are loaded. Bluetooth therefore
-stays unbound while the Wi-Fi driver is missing or has failed. A device link
+stays unbound while the Wi-Fi driver is missing or has failed, including when
+a failed Wi-Fi function stays bound to keep DMA it could not stop. A device link
 makes the driver core unbind Bluetooth before Wi-Fi; unloading
 ``mt7932_bt_pcie`` does not affect Wi-Fi. The probe rejects a function that is
 not cold, which is what now prevents a reprobe after a failed or uncertain
