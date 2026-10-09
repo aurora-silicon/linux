@@ -17,6 +17,11 @@
  * and models each dynamic agent as a power domain that sits between the
  * device and its PMGR power state, which gives the same ordering.
  *
+ * Under thermal pressure the driver can also limit the DRAM controller
+ * (DCS) rail: it stops honouring the other agents on that rail and votes
+ * on their behalf through the AP's own agent, capped. This bounds the heat
+ * of the PMP's DCS vote, which follows GPU load.
+ *
  * Copyright The Asahi Linux Contributors
  */
 
@@ -32,9 +37,15 @@
 #include <linux/slab.h>
 #include <linux/soc/apple/pmc.h>
 #include <linux/spinlock.h>
+#include <linux/thermal.h>
+#include <linux/workqueue.h>
 
 #define APPLE_PMC_MAX_RAILS	8
 #define APPLE_PMC_MAX_AGENTS	32
+#define APPLE_PMC_MAX_STATES	16
+
+/* How often a DCS limit re-reads the votes it stands in for. */
+#define APPLE_PMC_DCS_POLL_MS	20
 
 /**
  * struct apple_pmc_hw - per-SoC layout of the PMC voter interface
@@ -47,6 +58,10 @@
  *	agent's interface enables and clamped to each rail's highest state
  * @rail_enable: offset of the per-rail interface enable words in the
  *	"rails" region
+ * @dcs_rail: rail of the DRAM controller (DCS)
+ * @dcs_max: highest DCS performance state
+ * @ap_agent: voter agent of the application processor, which a DCS limit
+ *	votes through
  */
 struct apple_pmc_hw {
 	u32 agent_stride;
@@ -54,6 +69,9 @@ struct apple_pmc_hw {
 	u32 rails;
 	u32 agent_state;
 	u32 rail_enable;
+	u32 dcs_rail;
+	u32 dcs_max;
+	u32 ap_agent;
 };
 
 struct apple_pmc {
@@ -61,12 +79,22 @@ struct apple_pmc {
 	const struct apple_pmc_hw *hw;
 	void __iomem *voters;
 	void __iomem *rails;
-	/* Serializes read-modify-write cycles on enable and floor words. */
+	/*
+	 * Serializes read-modify-write cycles on enable and floor words, and
+	 * protects @enable and @dcs_state.
+	 */
 	raw_spinlock_t lock;
 	u32 saved_enable[APPLE_PMC_MAX_RAILS];
+	/* Agents enabled on each rail, before any DCS limit is applied. */
+	u32 enable[APPLE_PMC_MAX_RAILS];
 	u32 static_agents;
 	struct list_head domains;
 	struct dentry *debugfs;
+	/* Cooling state of the DCS limit: 0 is none, dcs_max holds DCS at 0. */
+	unsigned long dcs_state;
+	/* Power cost of each DCS state in mW, if a model is described. */
+	u32 dcs_power[APPLE_PMC_MAX_STATES];
+	struct delayed_work dcs_work;
 };
 
 struct apple_pmc_domain {
@@ -88,14 +116,18 @@ static u32 apple_pmc_enable_read(struct apple_pmc *pmc, unsigned int rail)
 	return readl(pmc->rails + pmc->hw->rail_enable + 4 * rail);
 }
 
-/* Caller holds pmc->lock. Every write is read back, as macOS does. */
-static int apple_pmc_enable_update(struct apple_pmc *pmc, unsigned int rail,
-				   u32 set, u32 clear)
+/*
+ * Caller holds pmc->lock. While the DCS rail is limited, only the AP's agent
+ * is enabled on it. Every write is read back, as macOS does.
+ */
+static int apple_pmc_enable_write(struct apple_pmc *pmc, unsigned int rail)
 {
 	void __iomem *reg = pmc->rails + pmc->hw->rail_enable + 4 * rail;
 	u32 old = readl(reg);
-	u32 val = (old | set) & ~clear;
+	u32 val = pmc->enable[rail];
 
+	if (pmc->dcs_state && rail == pmc->hw->dcs_rail)
+		val = BIT(pmc->hw->ap_agent);
 	if (val == old)
 		return 0;
 
@@ -108,6 +140,15 @@ static int apple_pmc_enable_update(struct apple_pmc *pmc, unsigned int rail,
 	}
 
 	return 0;
+}
+
+/* Caller holds pmc->lock. */
+static int apple_pmc_enable_update(struct apple_pmc *pmc, unsigned int rail,
+				   u32 set, u32 clear)
+{
+	pmc->enable[rail] = (pmc->enable[rail] | set) & ~clear;
+
+	return apple_pmc_enable_write(pmc, rail);
 }
 
 static int apple_pmc_agent_enable(struct apple_pmc *pmc, unsigned int agent,
@@ -226,6 +267,226 @@ int apple_pmc_floor_update(struct device *dev, unsigned int agent, u32 mask,
 }
 EXPORT_SYMBOL_GPL(apple_pmc_floor_update);
 
+/*
+ * Caller holds pmc->lock. The highest DCS state that the agents enabled on
+ * the DCS rail ask for, the AP's own agent excepted.
+ */
+static unsigned int apple_pmc_dcs_demand(struct apple_pmc *pmc)
+{
+	const struct apple_pmc_hw *hw = pmc->hw;
+	unsigned long agents = pmc->enable[hw->dcs_rail] & ~BIT(hw->ap_agent);
+	unsigned int agent, demand = 0;
+	u32 floor;
+
+	for_each_set_bit(agent, &agents, hw->agents) {
+		floor = readl(pmc->voters + agent * hw->agent_stride);
+		demand = max(demand, (floor & APPLE_PMC_RAIL_MASK(hw->dcs_rail)) >>
+				     APPLE_PMC_RAIL_SHIFT(hw->dcs_rail));
+	}
+
+	return min(demand, hw->dcs_max);
+}
+
+/*
+ * Caller holds pmc->lock. Vote through the AP's agent for what the other
+ * agents ask for, capped by the limit; vote nothing without a limit.
+ */
+static void apple_pmc_dcs_vote(struct apple_pmc *pmc)
+{
+	const struct apple_pmc_hw *hw = pmc->hw;
+	void __iomem *reg = pmc->voters + hw->ap_agent * hw->agent_stride;
+	u32 mask = APPLE_PMC_RAIL_MASK(hw->dcs_rail);
+	unsigned int state = 0;
+	u32 old, val;
+
+	if (pmc->dcs_state)
+		state = min_t(unsigned int, apple_pmc_dcs_demand(pmc),
+			      hw->dcs_max - pmc->dcs_state);
+
+	old = readl(reg);
+	val = (old & ~mask) | (state << APPLE_PMC_RAIL_SHIFT(hw->dcs_rail));
+	if (val != old)
+		writel(val, reg);
+}
+
+static void apple_pmc_dcs_work(struct work_struct *work)
+{
+	struct apple_pmc *pmc = container_of(to_delayed_work(work),
+					     struct apple_pmc, dcs_work);
+	unsigned long flags;
+	bool limited;
+
+	raw_spin_lock_irqsave(&pmc->lock, flags);
+	apple_pmc_dcs_vote(pmc);
+	limited = pmc->dcs_state;
+	raw_spin_unlock_irqrestore(&pmc->lock, flags);
+
+	if (limited)
+		queue_delayed_work(system_freezable_power_efficient_wq,
+				   &pmc->dcs_work,
+				   msecs_to_jiffies(APPLE_PMC_DCS_POLL_MS));
+}
+
+static int apple_pmc_dcs_get_max_state(struct thermal_cooling_device *cdev,
+				       unsigned long *state)
+{
+	struct apple_pmc *pmc = cdev->devdata;
+
+	*state = pmc->hw->dcs_max;
+	return 0;
+}
+
+static int apple_pmc_dcs_get_cur_state(struct thermal_cooling_device *cdev,
+				       unsigned long *state)
+{
+	struct apple_pmc *pmc = cdev->devdata;
+
+	*state = READ_ONCE(pmc->dcs_state);
+	return 0;
+}
+
+static int apple_pmc_dcs_set_cur_state(struct thermal_cooling_device *cdev,
+				       unsigned long state)
+{
+	struct apple_pmc *pmc = cdev->devdata;
+	unsigned int rail = pmc->hw->dcs_rail;
+	unsigned long flags;
+	int ret = 0;
+
+	if (state > pmc->hw->dcs_max)
+		return -EINVAL;
+
+	raw_spin_lock_irqsave(&pmc->lock, flags);
+	if (state != pmc->dcs_state) {
+		/*
+		 * Vote the capped demand before the other agents stop being
+		 * honoured, and drop that vote only once they are honoured
+		 * again, so that the rail never dips below either.
+		 */
+		WRITE_ONCE(pmc->dcs_state, state);
+		if (state) {
+			apple_pmc_dcs_vote(pmc);
+			ret = apple_pmc_enable_write(pmc, rail);
+		} else {
+			ret = apple_pmc_enable_write(pmc, rail);
+			apple_pmc_dcs_vote(pmc);
+		}
+	}
+	raw_spin_unlock_irqrestore(&pmc->lock, flags);
+
+	if (state)
+		queue_delayed_work(system_freezable_power_efficient_wq,
+				   &pmc->dcs_work,
+				   msecs_to_jiffies(APPLE_PMC_DCS_POLL_MS));
+	else
+		cancel_delayed_work(&pmc->dcs_work);
+
+	return ret;
+}
+
+static int apple_pmc_dcs_get_requested_power(struct thermal_cooling_device *cdev,
+					     u32 *power)
+{
+	struct apple_pmc *pmc = cdev->devdata;
+	unsigned long flags;
+	unsigned int demand;
+
+	raw_spin_lock_irqsave(&pmc->lock, flags);
+	demand = apple_pmc_dcs_demand(pmc);
+	raw_spin_unlock_irqrestore(&pmc->lock, flags);
+
+	*power = pmc->dcs_power[demand];
+	return 0;
+}
+
+static int apple_pmc_dcs_state2power(struct thermal_cooling_device *cdev,
+				     unsigned long state, u32 *power)
+{
+	struct apple_pmc *pmc = cdev->devdata;
+
+	if (state > pmc->hw->dcs_max)
+		return -EINVAL;
+
+	*power = pmc->dcs_power[pmc->hw->dcs_max - state];
+	return 0;
+}
+
+static int apple_pmc_dcs_power2state(struct thermal_cooling_device *cdev,
+				     u32 power, unsigned long *state)
+{
+	struct apple_pmc *pmc = cdev->devdata;
+	unsigned long s;
+
+	for (s = 0; s < pmc->hw->dcs_max; s++)
+		if (pmc->dcs_power[pmc->hw->dcs_max - s] <= power)
+			break;
+
+	*state = s;
+	return 0;
+}
+
+static const struct thermal_cooling_device_ops apple_pmc_dcs_ops = {
+	.get_max_state = apple_pmc_dcs_get_max_state,
+	.get_cur_state = apple_pmc_dcs_get_cur_state,
+	.set_cur_state = apple_pmc_dcs_set_cur_state,
+};
+
+static const struct thermal_cooling_device_ops apple_pmc_dcs_power_ops = {
+	.get_max_state = apple_pmc_dcs_get_max_state,
+	.get_cur_state = apple_pmc_dcs_get_cur_state,
+	.set_cur_state = apple_pmc_dcs_set_cur_state,
+	.get_requested_power = apple_pmc_dcs_get_requested_power,
+	.state2power = apple_pmc_dcs_state2power,
+	.power2state = apple_pmc_dcs_power2state,
+};
+
+/*
+ * Register the DCS limit as a cooling device. With a power model it is a
+ * power actor that the power allocator governor can drive.
+ */
+static int apple_pmc_dcs_init(struct apple_pmc *pmc)
+{
+	const struct thermal_cooling_device_ops *ops = &apple_pmc_dcs_ops;
+	const struct apple_pmc_hw *hw = pmc->hw;
+	struct device *dev = pmc->dev;
+	struct device_node *np = dev->of_node;
+	struct thermal_cooling_device *cdev;
+	u32 uw[APPLE_PMC_MAX_STATES];
+	unsigned int i;
+	int count, ret;
+
+	if (!IS_ENABLED(CONFIG_THERMAL) ||
+	    !of_property_present(np, "#cooling-cells"))
+		return 0;
+
+	count = of_property_count_u32_elems(np, "apple,dcs-power-microwatt");
+	if (count > 0) {
+		if (count != hw->dcs_max + 1)
+			return dev_err_probe(dev, -EINVAL,
+					     "need %u DCS power values\n",
+					     hw->dcs_max + 1);
+		ret = of_property_read_u32_array(np, "apple,dcs-power-microwatt",
+						 uw, count);
+		if (ret)
+			return ret;
+		for (i = 0; i < count; i++) {
+			pmc->dcs_power[i] = uw[i] / 1000;
+			if (i && pmc->dcs_power[i] < pmc->dcs_power[i - 1])
+				return dev_err_probe(dev, -EINVAL,
+						     "DCS power must not decrease\n");
+		}
+		ops = &apple_pmc_dcs_power_ops;
+	}
+
+	cdev = devm_thermal_of_cooling_device_register(dev, np, "pmc-dcs", pmc,
+						       ops);
+	if (IS_ERR(cdev))
+		return dev_err_probe(dev, PTR_ERR(cdev),
+				     "failed to register the DCS limit\n");
+
+	return 0;
+}
+
 static int apple_pmc_domain_power_on(struct generic_pm_domain *genpd)
 {
 	struct apple_pmc_domain *dom = genpd_to_apple_pmc_domain(genpd);
@@ -342,6 +603,8 @@ static int apple_pmc_status_show(struct seq_file *s, void *unused)
 	for (i = 0; i < hw->rails; i++)
 		seq_printf(s, "rail%u enable: %#010x (saved %#010x)\n",
 			   i, apple_pmc_enable_read(pmc, i), pmc->saved_enable[i]);
+	seq_printf(s, "dcs limit: state %lu of %u\n", READ_ONCE(pmc->dcs_state),
+		   hw->dcs_max);
 
 	return 0;
 }
@@ -361,10 +624,14 @@ static void apple_pmc_release(void *data)
 		apple_pmc_domain_free(dom);
 	}
 
+	/* The cooling device is gone by now; drop any limit it left. */
+	cancel_delayed_work_sync(&pmc->dcs_work);
 	raw_spin_lock_irqsave(&pmc->lock, flags);
 	for (rail = 0; rail < pmc->hw->rails; rail++)
 		writel(pmc->saved_enable[rail],
 		       pmc->rails + pmc->hw->rail_enable + 4 * rail);
+	pmc->dcs_state = 0;
+	apple_pmc_dcs_vote(pmc);
 	raw_spin_unlock_irqrestore(&pmc->lock, flags);
 }
 
@@ -388,8 +655,10 @@ static int apple_pmc_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&pmc->domains);
 
 	if (pmc->hw->rails > APPLE_PMC_MAX_RAILS ||
-	    pmc->hw->agents > APPLE_PMC_MAX_AGENTS)
+	    pmc->hw->agents > APPLE_PMC_MAX_AGENTS ||
+	    pmc->hw->dcs_max >= APPLE_PMC_MAX_STATES)
 		return -EINVAL;
+	INIT_DELAYED_WORK(&pmc->dcs_work, apple_pmc_dcs_work);
 
 	pmc->voters = devm_platform_ioremap_resource_byname(pdev, "voters");
 	if (IS_ERR(pmc->voters))
@@ -404,6 +673,7 @@ static int apple_pmc_probe(struct platform_device *pdev)
 		if (pmc->saved_enable[rail] == ~0U)
 			return dev_err_probe(dev, -ENODEV,
 					     "PMC is not responding\n");
+		pmc->enable[rail] = pmc->saved_enable[rail];
 	}
 
 	count = of_property_count_u32_elems(np, "apple,static-voters");
@@ -448,6 +718,10 @@ static int apple_pmc_probe(struct platform_device *pdev)
 		}
 	}
 
+	ret = apple_pmc_dcs_init(pmc);
+	if (ret)
+		return ret;
+
 	pmc->debugfs = debugfs_create_dir(dev_name(dev), apple_pmc_debugfs_root);
 	debugfs_create_file("status", 0400, pmc->debugfs, pmc,
 			    &apple_pmc_status_fops);
@@ -465,6 +739,9 @@ static const struct apple_pmc_hw apple_pmc_hw_t8140 = {
 	.rails = 4,
 	.agent_state = 0x0,
 	.rail_enable = 0x2000,
+	.dcs_rail = 0,
+	.dcs_max = 4,
+	.ap_agent = 3,
 };
 
 static const struct of_device_id apple_pmc_of_match[] = {
