@@ -24,10 +24,6 @@
 #define BAKU_RTC_HZ_SHIFT	16
 #define BAKU_RTC_MAX_DELAY	3600
 
-static bool experimental;
-module_param(experimental, bool, 0444);
-MODULE_PARM_DESC(experimental, "Enable alarms with retained SPMI/AIC power in s2idle");
-
 struct baku_rtc {
 	struct regmap *map;
 	struct nvmem_cell *offset;
@@ -312,9 +308,6 @@ static int baku_rtc_probe(struct platform_device *pdev)
 	struct baku_rtc *baku;
 	int error;
 
-	/* Retention has only been measured on J700 with the explicit opt-in. */
-	if (!experimental)
-		return -ENODEV;
 	baku = devm_kzalloc(dev, sizeof(*baku), GFP_KERNEL);
 	if (!baku)
 		return -ENOMEM;
