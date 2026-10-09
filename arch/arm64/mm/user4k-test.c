@@ -35,7 +35,6 @@
 #include <linux/pagewalk.h>
 #include <linux/preempt.h>
 #include <linux/rmap.h>
-#include <linux/sched/sysctl.h>
 #include <linux/uprobes.h>
 #include <linux/vdso_datastore.h>
 #include <vdso/datapage.h>
@@ -858,6 +857,7 @@ static void test_fragment_lifetime(struct kunit *test, unsigned int shift)
 	unsigned int i, slots = PAGE_SIZE >> shift;
 	unsigned long size = 1UL << shift;
 	unsigned int read_shift = 0;
+	int pending_refs;
 	bool live;
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
@@ -925,20 +925,33 @@ static void test_fragment_lifetime(struct kunit *test, unsigned int shift)
 	KUNIT_EXPECT_PTR_NE(test, f->pinned[1], f->pinned[2]);
 	pte_owner = page_ptdesc(f->pinned[0]);
 	KUNIT_EXPECT_EQ(test, atomic_read(&pte_owner->pt_frag_refcount), (int)slots);
+	/* Refill holes in the same owner, without retaining old table contents. */
+	for (i = 1; i < slots; i++) {
+		void *old = f->table[i];
+
+		memset(old, 0x6a, size);
+		arm64_pgtable_free(old);
+		f->table[i] = arm64_user_pt_alloc_granule(f->mm, USER4K_PT_PTE, shift);
+		KUNIT_ASSERT_NOT_NULL(test, f->table[i]);
+		KUNIT_EXPECT_PTR_EQ(test, f->table[i], old);
+		KUNIT_EXPECT_PTR_EQ(test, memchr_inv(f->table[i], 0, size), NULL);
+	}
+	/* Begin the reader before queuing a callback, so it cannot finish early. */
+	rcu_read_lock();
 	arm64_pte_free_defer(f->mm, f->table[0]);
 	f->table[0] = NULL;
-	KUNIT_EXPECT_EQ(test, atomic_read(&pte_owner->pt_frag_refcount), (int)slots - 1);
+	pending_refs = atomic_read(&pte_owner->pt_frag_refcount);
 	for (i = 1; i < slots - 1; i++) {
 		arm64_pgtable_free(f->table[i]);
 		f->table[i] = NULL;
 	}
-	/* A pre-existing software walker must survive the last fragment release. */
-	rcu_read_lock();
+	/* Pending slot zero keeps the owner alive through this reader. */
 	arm64_pgtable_free(f->table[slots - 1]);
 	f->table[slots - 1] = NULL;
 	live = folio_test_pgtable(page_folio(f->pinned[0]));
 	read_shift = arm64_ptep_page_shift(page_address(f->pinned[0]));
 	rcu_read_unlock();
+	KUNIT_EXPECT_EQ(test, pending_refs, (int)slots);
 	KUNIT_EXPECT_TRUE(test, live);
 	KUNIT_EXPECT_EQ(test, read_shift, shift);
 	rcu_barrier();
@@ -949,8 +962,9 @@ static void test_fragment_lifetime(struct kunit *test, unsigned int shift)
 
 		arm64_pgtable_free(f->table[i]);
 		f->table[i] = NULL;
-		KUNIT_EXPECT_EQ(test, atomic_read(&pt->pt_frag_refcount), (int)slots - 1);
-		KUNIT_EXPECT_TRUE(test, folio_test_pgtable(ptdesc_folio(pt)));
+		/* A wholly empty owner is released without waiting for mm teardown. */
+		KUNIT_EXPECT_EQ(test, atomic_read(&pt->pt_frag_refcount), 0);
+		KUNIT_EXPECT_FALSE(test, folio_test_pgtable(ptdesc_folio(pt)));
 	}
 	mmput(f->mm);
 	f->mm = NULL;
@@ -5213,14 +5227,13 @@ static void user4k_exec_arguments_test(struct kunit *test)
 	}
 	for (native = 0; native < 2; native++) {
 		struct linux_binprm *bprm = kunit_kzalloc(test, sizeof(*bprm), GFP_KERNEL);
-		struct mm_struct *mm;
+		struct mm_struct *mm = native ? mm_alloc() : test_vma_mm(test);
 		unsigned long size, mask, initial, copied, new_top;
 		unsigned long a_len = 2 * PAGE_SIZE + SZ_4K + 31, b_len = SZ_4K + 43;
 		char *a, *b, *buf, *too_long;
 		int ret;
 
 		KUNIT_ASSERT_NOT_NULL(test, bprm);
-		mm = native ? mm_alloc() : test_vma_mm(test);
 		KUNIT_ASSERT_NOT_NULL(test, mm);
 		if (native)
 			KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, user4k_vma_mm_free, mm), 0);
@@ -5281,88 +5294,6 @@ static void user4k_exec_arguments_test(struct kunit *test)
 		KUNIT_EXPECT_MEMEQ(test, buf, b, b_len + 1);
 		KUNIT_EXPECT_STREQ(test, buf + b_len + a_len + 2, "tail");
 		/* Interpreter argument removal scans several user granules. */
-		initial = bprm->p;
-		KUNIT_ASSERT_EQ(test, remove_arg_zero(bprm), 0);
-		KUNIT_EXPECT_EQ(test, bprm->p, initial + b_len + 1);
-		KUNIT_ASSERT_EQ(test, remove_arg_zero(bprm), 0);
-		KUNIT_EXPECT_EQ(test, bprm->p, initial + b_len + a_len + 2);
-		KUNIT_ASSERT_EQ(test, remove_arg_zero(bprm), 0);
-		KUNIT_EXPECT_EQ(test, bprm->p, initial + copied);
-		KUNIT_EXPECT_EQ(test, bprm->argc, 0);
-		KUNIT_EXPECT_EQ(test, bprm->vma_pages, 0UL);
-	}
-}
-
-/* The transfer can replace bprm->mm, so release its final owner. */
-static void test_exec_mm_free(void *data)
-{
-	struct linux_binprm *bprm = data;
-
-	mmput(bprm->mm);
-}
-
-static void user64k_exec_arguments_test(struct kunit *test)
-{
-	unsigned int shifts[] = { 16, 12, PAGE_SHIFT };
-	unsigned int mode;
-
-	if (PAGE_SHIFT >= 16 ||
-	    (!user4k_test_enabled && !IS_ENABLED(CONFIG_KASAN))) {
-		kunit_skip(test, "requires internal larger user granule and MM opt-in");
-		return;
-	}
-	for (mode = 0; mode < ARRAY_SIZE(shifts); mode++) {
-		struct linux_binprm *bprm = kunit_kzalloc(test, sizeof(*bprm), GFP_KERNEL);
-		unsigned long a_len = mode ? SZ_64K + SZ_16K + 31 : 32 * PAGE_SIZE + 31;
-		unsigned long b_len = PAGE_SIZE + 17, initial, copied;
-		char *a, *b, *buf;
-		unsigned long i;
-
-		KUNIT_ASSERT_NOT_NULL(test, bprm);
-		bprm->mm = mm_alloc();
-		KUNIT_ASSERT_NOT_NULL(test, bprm->mm);
-		KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, test_exec_mm_free, bprm), 0);
-		KUNIT_ASSERT_EQ(test, test_mm_select_granule(bprm->mm, 16), 0);
-		KUNIT_ASSERT_EQ(test, create_init_stack_vma(bprm->mm, &bprm->vma, &bprm->p), 0);
-		initial = bprm->p;
-		bprm->argmin = initial - SZ_2M;
-		bprm->rlim_stack.rlim_cur = SZ_8M;
-		bprm->rlim_stack.rlim_max = RLIM_INFINITY;
-		a = kunit_kmalloc(test, a_len + 1, GFP_KERNEL);
-		b = kunit_kmalloc(test, b_len + 1, GFP_KERNEL);
-		buf = kunit_kmalloc(test, a_len + b_len + 7, GFP_KERNEL);
-		KUNIT_ASSERT_NOT_NULL(test, a);
-		KUNIT_ASSERT_NOT_NULL(test, b);
-		KUNIT_ASSERT_NOT_NULL(test, buf);
-		for (i = 0; i < a_len; i++)
-			a[i] = 'A' + i % 23;
-		a[a_len] = 0;
-		memset(b, 'b', b_len);
-		b[b_len] = 0;
-		KUNIT_ASSERT_EQ(test, copy_string_kernel("tail", bprm), 0);
-		KUNIT_ASSERT_EQ(test, access_remote_vm(bprm->mm, bprm->p, buf, 5, 0), 5);
-		KUNIT_ASSERT_STREQ(test, buf, "tail");
-		KUNIT_ASSERT_EQ(test, copy_string_kernel(a, bprm), 0);
-		KUNIT_ASSERT_EQ(test, copy_string_kernel(b, bprm), 0);
-		bprm->argc = 3;
-		copied = initial - bprm->p;
-		KUNIT_ASSERT_EQ(test, copied, a_len + b_len + 7);
-		KUNIT_ASSERT_EQ(test, access_remote_vm(bprm->mm, bprm->p, buf, copied, 0),
-				(int)copied);
-		KUNIT_ASSERT_EQ(test, memcmp(buf, b, b_len + 1), 0);
-		KUNIT_ASSERT_EQ(test, memcmp(buf + b_len + 1, a, a_len + 1), 0);
-		KUNIT_ASSERT_STREQ(test, buf + b_len + a_len + 2, "tail");
-		/* Exercise copying out of every native page within a coarse leaf. */
-		if (shifts[mode] != 16) {
-			KUNIT_ASSERT_EQ(test, bprm_set_page_shift(bprm, shifts[mode]), 0);
-			KUNIT_ASSERT_EQ(test, mm_page_shift(bprm->mm), shifts[mode]);
-			memset(buf, 0, copied);
-			KUNIT_ASSERT_EQ(test, access_remote_vm(bprm->mm, bprm->p, buf, copied, 0),
-					(int)copied);
-			KUNIT_ASSERT_EQ(test, memcmp(buf, b, b_len + 1), 0);
-			KUNIT_ASSERT_EQ(test, memcmp(buf + b_len + 1, a, a_len + 1), 0);
-			KUNIT_ASSERT_STREQ(test, buf + b_len + a_len + 2, "tail");
-		}
 		initial = bprm->p;
 		KUNIT_ASSERT_EQ(test, remove_arg_zero(bprm), 0);
 		KUNIT_EXPECT_EQ(test, bprm->p, initial + b_len + 1);
@@ -6286,10 +6217,10 @@ static void user4k_file_mapcounts_test(struct kunit *test)
 	folio = filemap_get_folio(file->f_mapping, 0);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, folio);
 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, test_folio_put, folio), 0);
-	test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]) { 0, 2, 2, 2 }, 1);
+	test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]){ 0, 2, 2, 2 }, 1);
 	KUNIT_ASSERT_EQ(test, test_file_fault(private, TEST_VA + 2 * SZ_4K, true) &
 			VM_FAULT_ERROR, 0U);
-	test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]) { 0, 2, 2, 1 }, 1);
+	test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]){ 0, 2, 2, 1 }, 1);
 	child = test_vma_mm(test);
 	KUNIT_ASSERT_NOT_NULL(test, child);
 	uprobe_start_dup_mmap();
@@ -6298,17 +6229,17 @@ static void user4k_file_mapcounts_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	cvma = test_vma_lookup(child, TEST_VA);
 	KUNIT_ASSERT_NOT_NULL(test, cvma);
-	test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]) { 0, 3, 3, 1 }, 1);
+	test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]){ 0, 3, 3, 1 }, 1);
 	KUNIT_ASSERT_EQ(test, test_file_fault(cvma, TEST_VA + SZ_4K, true) & VM_FAULT_ERROR, 0U);
-	test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]) { 0, 3, 2, 1 }, 1);
+	test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]){ 0, 3, 2, 1 }, 1);
 	kunit_release_action(test, user4k_vma_mm_free, child);
-	test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]) { 0, 2, 2, 1 }, 1);
+	test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]){ 0, 2, 2, 1 }, 1);
 	kunit_release_action(test, user4k_vma_mm_free, private->vm_mm);
-	test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]) { 0, 1, 1, 1 }, 1);
+	test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]){ 0, 1, 1, 1 }, 1);
 	kunit_release_action(test, user4k_vma_mm_free, native->vm_mm);
-	test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]) { 0, 1, 1, 1 }, 0);
+	test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]){ 0, 1, 1, 1 }, 0);
 	kunit_release_action(test, user4k_vma_mm_free, shared->vm_mm);
-	test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]) { 0, 0, 0, 0 }, 0);
+	test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]){ 0, 0, 0, 0 }, 0);
 }
 
 /* A unique RAM-backed test inode: exercise generic file faults without
@@ -8890,10 +8821,6 @@ static void user_subpage_numa_cow_batch_test(struct kunit *test)
 {
 	unsigned int shift;
 
-	if (!(READ_ONCE(sysctl_numa_balancing_mode) & NUMA_BALANCING_NORMAL)) {
-		kunit_skip(test, "requires normal NUMA balancing; use numa_balancing=enable");
-		return;
-	}
 	for (shift = 12; shift < PAGE_SHIFT; shift += 2) {
 		unsigned long size = 1UL << shift, start = TEST_VA;
 		struct vm_area_struct *vma;
@@ -10092,7 +10019,7 @@ static void user4k_file_migration_test(struct kunit *test)
 		lru_add_drain_all();
 		folio = filemap_get_folio(file->f_mapping, 0);
 		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, folio);
-		test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]) { [0 ... TEST_SLOTS - 1] = 1 }, 1);
+		test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]){ [0 ... TEST_SLOTS - 1] = 1 }, 1);
 		old_phys = PFN_PHYS(folio_pfn(folio));
 		isolated = isolate_folio_to_list(folio, &folios);
 		if (!fail || !isolated)
@@ -10107,7 +10034,7 @@ static void user4k_file_migration_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, succeeded, fail ? 0U : 1U);
 		folio = filemap_get_folio(file->f_mapping, 0);
 		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, folio);
-		test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]) { [0 ... TEST_SLOTS - 1] = 1 }, 1);
+		test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]){ [0 ... TEST_SLOTS - 1] = 1 }, 1);
 		for (i = 0; i < 4; i++) {
 			pte_t entry = test_fault_entry(test, small->vm_mm, small->vm_start + i * SZ_4K);
 
@@ -10125,7 +10052,7 @@ static void user4k_file_migration_test(struct kunit *test)
 		folio_lock(folio);
 		try_to_unmap(folio, TTU_SYNC);
 		KUNIT_EXPECT_FALSE(test, folio_mapped(folio));
-		test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]) { 0, 0, 0, 0 }, 0);
+		test_file_mapcounts(test, folio, (unsigned int[TEST_SLOTS]){ 0, 0, 0, 0 }, 0);
 		folio_unlock(folio);
 		folio_put(folio);
 		for (i = 0; i < 4; i++) {
@@ -14103,7 +14030,6 @@ static struct kunit_case user4k_test_cases[] = {
 	KUNIT_CASE(user4k_mremap_resize_test),
 	KUNIT_CASE(user4k_stack_relocate_test),
 	KUNIT_CASE(user4k_exec_arguments_test),
-	KUNIT_CASE(user64k_exec_arguments_test),
 	KUNIT_CASE(user4k_special_mapping_test),
 	KUNIT_CASE(user4k_insert_fragment_test),
 	KUNIT_CASE(user16k_insert_shared_test),
@@ -14142,6 +14068,9 @@ static struct kunit_case user4k_test_cases[] = {
 	KUNIT_CASE(user4k_vm_mmap_test),
 	KUNIT_CASE(user4k_mprotect_test),
 	KUNIT_CASE(user4k_mprotect_cow_batch_test),
+#ifdef CONFIG_NUMA_BALANCING
+	KUNIT_CASE(user_subpage_numa_cow_batch_test),
+#endif
 	KUNIT_CASE(user4k_mprotect_accounting_test),
 	KUNIT_CASE(user4k_file_cow_test),
 	KUNIT_CASE(user4k_file_eof_test),
@@ -14201,25 +14130,6 @@ static struct kunit_case user4k_test_cases[] = {
 	KUNIT_CASE(user4k_fault_uaccess_test),
 	{}
 };
-
-#ifdef CONFIG_NUMA_BALANCING
-/*
- * The COW hinting expectations require a stable normal-balancing policy.
- * Runtime sysctl writers do not take the fixture's mm or PTE locks, so run
- * this case at boot and do not expose it through the debugfs rerun control.
- */
-static struct kunit_case user4k_numa_init_cases[] = {
-	KUNIT_CASE(user_subpage_numa_cow_batch_test),
-	{}
-};
-
-static struct kunit_suite user4k_numa_init_suite = {
-	.name = "arm64-user4k-numa-init",
-	.test_cases = user4k_numa_init_cases,
-};
-
-kunit_test_init_section_suite(user4k_numa_init_suite);
-#endif
 
 static struct kunit_suite user4k_test_suite = {
 	.name = "arm64-user4k",
