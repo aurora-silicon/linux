@@ -3,6 +3,8 @@ from pathlib import Path
 import json
 import os
 import subprocess
+import shlex
+import struct
 import test_m3_handoff
 
 class Persistent(test_m3_handoff.M3PathTest):
@@ -30,6 +32,115 @@ class Persistent(test_m3_handoff.M3PathTest):
     def test_clean161_never_qualifies25(self):
         setup=self.setup_profile('j613-25g83','v1.6.1')
         self.assertIn('stage 1 is v1.6.1',self.run_sh(setup+'m3_stage1_problem').stdout)
+
+    def test_clean161_os147_exact_stub1483_persistent_admitted(self):
+        setup=self.setup_profile(stage1='v1.6.1')
+        (self.dt/'chosen/asahi,os-fw-version').write_bytes(b'14.7\0')
+        out=self.run_sh(setup+'m3_plan\nm3_persistent_preflight\necho "$M3_MODE"').stdout
+        self.assertIn('handoff',out)
+
+    def test_clean161_os147_wrong_stub_unknown_fw_and_overlap_refused(self):
+        for cause in ('stub', 'firmware', 'overlap', 'iboot'):
+            with self.subTest(cause=cause):
+                setup=self.setup_profile(stage1='v1.6.1')
+                (self.dt/'chosen/asahi,os-fw-version').write_bytes(b'14.7\0')
+                if cause=='stub':
+                    (self.esp/'asahi/stub_info.json').write_text('{"ProductVersion":"14.7"}')
+                elif cause=='firmware':
+                    (self.dt/'chosen/asahi,os-fw-version').write_bytes(b'14.6\0')
+                elif cause=='overlap':
+                    (self.dt/'chosen/asahi,m1n1-oslog-overlap').write_bytes(bytes(16))
+                else:
+                    (self.dt/'chosen/asahi,iboot2-version').write_bytes(b'iBoot-unknown\0')
+                result=self.run_sh(setup+'m3_plan',check=False)
+                self.assertNotEqual(result.returncode,0)
+                self.assertFalse((self.state/'m3-gpu-persistent').exists())
+                (self.dt/'chosen/asahi,m1n1-oslog-overlap').unlink(missing_ok=True)
+
+    def gpu_descriptor(self, version):
+        (self.dt/'aliases').mkdir(exist_ok=True)
+        (self.dt/'aliases/gpu').write_bytes(b'/soc/gpu@406400000\0')
+        node=self.dt/'soc/gpu@406400000'
+        node.mkdir(parents=True,exist_ok=True)
+        (node/'apple,firmware-compat').write_bytes(struct.pack('>III',*version))
+        return node
+
+    def test_auto_legacy_without_descriptor_ignores_system_fw26(self):
+        setup=self.setup_profile(stage1='v1.6.1')
+        (self.dt/'chosen/asahi,os-fw-version').write_bytes(b'14.7\0')
+        (self.dt/'chosen/asahi,system-fw-version').write_bytes(b'26.6.2\0')
+        out=self.run_sh(setup+'M3_GPU_AUTO=1\nm3_plan\nm3_persistent_preflight\necho "profile=$M3_GPU_PROFILE"').stdout
+        self.assertIn('profile=legacy',out)
+
+    def test_auto_present_exact14_and25_profiles_use_existing_admission(self):
+        for profile,version,stage in [('legacy',(14,8,3),'v1.6.1'),
+                                      ('j613-25g83',(26,6,2),'source-built-25')]:
+            with self.subTest(profile=profile):
+                setup=self.setup_profile(profile,stage)
+                self.gpu_descriptor(version)
+                out=self.run_sh(setup+'M3_GPU_AUTO=1\nm3_plan\nm3_persistent_preflight\necho "profile=$M3_GPU_PROFILE"').stdout
+                self.assertIn('profile='+profile,out)
+
+    def test_auto_no_descriptor_never_infers25_from_os_fw(self):
+        setup=self.setup_profile('j613-25g83','source-built-25')
+        result=self.run_sh(setup+'M3_GPU_AUTO=1\nm3_plan',check=False)
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('no GPU firmware descriptor',result.stderr)
+
+    def test_auto25_still_requires_matching_boot_and_stage1(self):
+        setup=self.setup_profile()
+        self.gpu_descriptor((26,6,2))
+        result=self.run_sh(setup+'M3_GPU_AUTO=1\nm3_plan',check=False)
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('Firmware migration is separate',result.stderr)
+        setup=self.setup_profile('j613-25g83','v1.6.1')
+        result=self.run_sh(setup+'M3_GPU_AUTO=1\nm3_plan',check=False)
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('stage 1',result.stderr)
+
+    def test_auto_unknown_and_malformed_descriptors_refused_without_intent(self):
+        setup=self.setup_profile()
+        node=self.gpu_descriptor((26,6,3))
+        for raw in [struct.pack('>III',26,6,3),b'bad',struct.pack('>II',14,8)]:
+            with self.subTest(raw=raw):
+                (node/'apple,firmware-compat').write_bytes(raw)
+                result=self.run_sh(setup+'M3_GPU_AUTO=1\nm3_plan',check=False)
+                self.assertNotEqual(result.returncode,0)
+                self.assertIn('--m3-report',result.stderr)
+                self.assertFalse((self.state/'m3-gpu-persistent').exists())
+
+    def test_auto_alias_must_resolve_inside_device_tree(self):
+        setup=self.setup_profile()
+        self.gpu_descriptor((14,8,3))
+        for alias in [b'soc/gpu@406400000\0',b'/../outside\0',b'/soc/missing\0',b'/soc/gpu@406400000',b'/soc\0/gpu\0']:
+            with self.subTest(alias=alias):
+                (self.dt/'aliases/gpu').write_bytes(alias)
+                result=self.run_sh(setup+'M3_GPU_AUTO=1\nm3_plan',check=False)
+                self.assertNotEqual(result.returncode,0)
+        (self.dt/'aliases/gpu').write_bytes(b'/outside\0')
+        (self.dt/'outside').symlink_to(self.esp,target_is_directory=True)
+        self.assertNotEqual(self.run_sh(setup+'M3_GPU_AUTO=1\nm3_plan',check=False).returncode,0)
+
+    def test_auto_retains_owner_off_manifest_and_model_guards(self):
+        setup=self.setup_profile()
+        for suffix in ['M3_STACK_ID=""', 'M3_PRO_MESA=0']:
+            self.assertNotEqual(self.run_sh(setup+'M3_GPU_AUTO=1\n'+suffix+'\nm3_plan\nm3_persistent_preflight',check=False).returncode,0)
+        (self.etc/'m1n1.conf').write_text('chosen.asahi,t8122-gpu=0\n')
+        self.assertNotEqual(self.run_sh(setup+'M3_GPU_AUTO=1\nm3_plan\nm3_persistent_preflight',check=False).returncode,0)
+        self.mac('j615')
+        self.assertNotEqual(self.run_sh('M3_GPU_AUTO=1\nm3_plan',check=False).returncode,0)
+
+    def test_real_option_parser_auto_and_conflicting_profiles(self):
+        source=test_m3_handoff.INSTALLER.read_text()
+        tail=source[source.index('\nargs=()\n'):]
+        for args,good in [(['--m3-gpu'],True),(['--m3-gpu','--read-only'],True),
+                          (['--m3-gpu','--m3-gpu-persistent'],False),
+                          (['--m3-profile=j613-25g83','--m3-gpu'],False)]:
+            with self.subTest(args=args):
+                body='preflight() { :; }\ninstall_all() { echo "parsed=$M3_GPU_AUTO:$M3_GPU_PERSISTENT:$M3_TRY"; }\nset -- '+shlex.join(args)+'\n'+tail
+                result=self.run_sh(body,check=False)
+                self.assertEqual(result.returncode==0,good)
+                if good:self.assertIn('parsed=1:1:1',result.stdout)
 
     def test_scott_dirty_stage1_stub1483_os147_current14_admitted(self):
         setup=self.setup_profile(stage1='v1.6.1-dirty')

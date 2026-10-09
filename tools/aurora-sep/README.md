@@ -3,6 +3,10 @@
 These files connect the Apple SEP kernel driver to the shared APFS xART
 gigalocker and the desktop fingerprint stack.
 
+For experimental acceleration on the 13-inch M3 MacBook Air, see the
+[M3 GPU quick start](M3-GPU.md), including the current 12.6 command and
+the firmware checks for persistent activation.
+
 See [M1-SUPPORT.md](M1-SUPPORT.md) for the T8103 firmware requirements,
 reboot-persistent enrollment fixes, reference-key recovery caveats and current
 validation boundaries. The historical bring-up results below describe the

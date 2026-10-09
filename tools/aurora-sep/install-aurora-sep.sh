@@ -12,6 +12,7 @@
 #                                         experiment's scripts with the kernel (arms nothing)
 #   ... | bash -s -- --m3-gpu-persistent   J613 on current14: install the matched stack and
 #                                         select experimental GPU acceleration for later boots
+#   ... | bash -s -- --m3-gpu              J613: detect the supported GPU profile and persist it
 #   ... | bash -s -- --m3-profile=j613-25g83   J613 already on exact25G83: select the matched
 #                                              experimental native OpenGL profile (no migration)
 #   ... | bash -s -- --desktop-fixes  Optional matched stable desktop fixes; unsupported versions are preserved.
@@ -568,6 +569,8 @@ M3_AIR_DEFAULT_VARIANT="air-handoff-12"
 # Mesa they run with is mesa-m3, which every M3 Air gets (see the M3's Mesa below).
 M3_GPU_EXPERIMENT=0
 M3_GPU_PERSISTENT=0
+M3_GPU_AUTO=0
+M3_GPU_EXPLICIT_PROFILE=0
 M3_GPU_PROFILE=legacy
 M3_STACK_ID=""
 M3_STAGE1_25_VERSIONS=""
@@ -951,7 +954,7 @@ m3_clean_stage1_14_qualified() {
   [[ $M3_GPU_PROFILE == legacy && $(this_board) == j613 && $(this_soc) == t8122 ]] || return 1
   [[ ! -e $DT/$M3_OSLOG_OVERLAP ]] || return 1
   fw=$({ tr -d '\0' <"$DT/chosen/asahi,os-fw-version"; } 2>/dev/null) || return 1
-  [[ $fw == 14.8.3 && -z $(m3_stub_problem) ]] || return 1
+  [[ ($fw == 14.7 || $fw == 14.8.3) && -z $(m3_stub_problem) ]] || return 1
   target=$(esp_bootbin) || return 1
   version=$($sudo cat "${target%/m1n1/boot.bin}/asahi/stub_info.json" 2>/dev/null |
     grep -o '"ProductVersion": *"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/') || return 1
@@ -1239,6 +1242,7 @@ m3_kept_refusal() {
 # Decide the M3 path before anything is downloaded, so a Mac this release can't
 # set up as asked stops with nothing changed.
 m3_plan() {
+  if ((M3_GPU_AUTO)); then m3_gpu_auto_profile; fi
   if [[ -f $STATE/m3-gpu-persistent ]] && ((M3_GPU_PERSISTENT == 0)); then
     local saved
     saved=$(cat "$STATE/m3-gpu-persistent")
@@ -5926,6 +5930,12 @@ fingerprint.
       Explicit acceleration below currently supports J613 only.
 
       J613 experimental acceleration with the matched installer:
+      To select the supported profile from this boot's GPU firmware:
+        bash install-aurora-sep.sh --m3-gpu
+      This is an explicit persistent opt-in. A diagnostics-only current14
+      boot may omit the GPU descriptor; the exact stub/iBoot checks still
+      apply. The system-firmware version never selects the GPU profile.
+      For the command, prerequisites and recovery steps, see M3-GPU.md.
       Current14 and exact25G83 are separate profiles. On a J613 already
       using the supported current14 firmware, run the matched installer:
         bash install-aurora-sep.sh --m3-gpu-persistent
@@ -6012,6 +6022,65 @@ PROMPT
 preflight_needed() { case ${1:-} in --agent-prompt | --reset-touchid | --m3-report | --m3-power-survey) return 1 ;; *) return 0 ;; esac; }
 
 # Exact stack pins are filled when the installer is assembled from its manifest.
+m3_gpu_firmware_compat() {
+  python3 - "$DT" <<'M3_GPU_FIRMWARE'
+import pathlib
+import struct
+import sys
+
+try:
+    root = pathlib.Path(sys.argv[1]).resolve()
+    alias = root / 'aliases/gpu'
+    if not alias.exists():
+        print('absent')
+        sys.exit(0)
+    raw = alias.read_bytes()
+    if not raw.endswith(b'\0') or b'\0' in raw[:-1]:
+        raise ValueError('malformed GPU alias')
+    name = raw[:-1].decode('ascii')
+    if not name.startswith('/') or '..' in name.split('/'):
+        raise ValueError('invalid GPU alias path')
+    node = (root / name.lstrip('/')).resolve()
+    if not node.is_relative_to(root) or not node.is_dir():
+        raise ValueError('GPU alias does not resolve inside the device tree')
+    prop = node / 'apple,firmware-compat'
+    if not prop.exists():
+        print('absent')
+    else:
+        raw = prop.read_bytes()
+        if len(raw) != 12:
+            raise ValueError('GPU firmware compatibility must contain three cells')
+        print('.'.join(map(str, struct.unpack('>III', raw))))
+except (OSError, UnicodeError, ValueError) as error:
+    print(str(error), file=sys.stderr)
+    sys.exit(1)
+M3_GPU_FIRMWARE
+}
+
+# GPU firmware is independent of the Mac's system-firmware version. An
+# unarmed current14 boot can omit the GPU descriptor; its stub and iBoot
+# must still pass the existing legacy checks before that profile is used.
+m3_gpu_auto_profile() {
+  local compat problem
+  [[ $(this_board) == j613 && $(this_soc) == t8122 ]] ||
+    die "--m3-gpu currently supports the 13-inch M3 MacBook Air (J613) only"
+  compat=$(m3_gpu_firmware_compat) || die "--m3-gpu cannot read this boot's GPU firmware description. Nothing was installed.
+    Run this installer with --m3-report and include the error above."
+  case $compat in
+    14.8.3) M3_GPU_PROFILE=legacy ;;
+    26.6.2) M3_GPU_PROFILE=j613-25g83 ;;
+    absent)
+      M3_GPU_PROFILE=legacy
+      problem=$(m3_stub_problem)
+      [[ -z $problem ]] || die "--m3-gpu has no GPU firmware descriptor and the supported current14 stub checks failed: $problem.
+    Nothing was installed. Run this installer with --m3-report. The system-firmware version does not select a GPU profile."
+      ;;
+    *) die "--m3-gpu does not support GPU firmware compatibility $compat. Nothing was installed.
+    Run this installer with --m3-report. This installer does not migrate macOS firmware." ;;
+  esac
+  say "J613: selected experimental GPU profile $M3_GPU_PROFILE; bootloader and matched-package checks still apply"
+}
+
 m3_25_boot_problem() {
   local osfw
   osfw=$({ tr -d '\0' <"$DT/chosen/asahi,os-fw-version"; } 2>/dev/null) || osfw=""
@@ -6874,14 +6943,18 @@ for a in "$@"; do
   case $a in
     --m3-handoff) M3_TRY=1 ;;
     --m3-gpu-experiment) M3_GPU_EXPERIMENT=1 ;;
-    --m3-gpu-persistent) M3_GPU_PERSISTENT=1; M3_TRY=1 ;;
-    --m3-profile=j613-25g83) M3_GPU_PROFILE=j613-25g83; M3_GPU_PERSISTENT=1; M3_TRY=1 ;;
+    --m3-gpu) M3_GPU_AUTO=1; M3_GPU_PERSISTENT=1; M3_TRY=1 ;;
+    --m3-gpu-persistent) M3_GPU_EXPLICIT_PROFILE=1; M3_GPU_PERSISTENT=1; M3_TRY=1 ;;
+    --m3-profile=j613-25g83) M3_GPU_EXPLICIT_PROFILE=1; M3_GPU_PROFILE=j613-25g83; M3_GPU_PERSISTENT=1; M3_TRY=1 ;;
     --no-m3-mesa) M3_PRO_MESA=0 ;;
     --desktop-fixes) DESKTOP_FIXES=1 ;;
     *) args+=("$a") ;;
   esac
 done
 set -- "${args[@]}"
+if ((M3_GPU_AUTO && M3_GPU_EXPLICIT_PROFILE)); then
+  die "use --m3-gpu by itself to detect the profile, or choose one explicit GPU profile"
+fi
 if ((DESKTOP_FIXES)) && [[ -n ${1:-} && $1 != --read-only ]]; then
   die "--desktop-fixes goes with an install (alone or with --read-only), not with $1"
 fi
@@ -6889,7 +6962,7 @@ if ((M3_TRY)) && [[ -n ${1:-} && $1 != --read-only ]]; then
   die "--m3-handoff goes with an install (alone or with --read-only), not with $1"
 fi
 if ((M3_GPU_EXPERIMENT || M3_GPU_PERSISTENT)) && [[ -n ${1:-} && $1 != --read-only ]]; then
-  die "--m3-gpu-experiment goes with an install (alone, with --m3-handoff or with --read-only), not with $1"
+  die "M3 GPU options go with an install (alone, with --m3-handoff or with --read-only), not with $1"
 fi
 if ((!M3_PRO_MESA)) && [[ -n ${1:-} && $1 != --read-only ]]; then
   die "--no-m3-mesa goes with an install (alone, with another install option or with --read-only), not with $1"
@@ -6908,5 +6981,5 @@ case ${1:-} in
   --m3-report) m3_report ;;
   --m3-power-survey) m3_power_survey ;;
   --agent-prompt) release_source >&2; prompt_notice; agent_prompt ;;
-  *) die "unknown option $1 (--read-only, --uninstall, --reset-touchid, --agent-prompt, --m3-report, --m3-power-survey, --m3-handoff, --m3-gpu-experiment, --m3-gpu-persistent, --m3-profile=j613-25g83, --no-m3-mesa or --desktop-fixes)" ;;
+  *) die "unknown option $1 (--read-only, --uninstall, --reset-touchid, --agent-prompt, --m3-report, --m3-power-survey, --m3-handoff, --m3-gpu, --m3-gpu-experiment, --m3-gpu-persistent, --m3-profile=j613-25g83, --no-m3-mesa or --desktop-fixes)" ;;
 esac
