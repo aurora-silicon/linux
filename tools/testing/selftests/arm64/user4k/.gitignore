@@ -9,3 +9,5 @@ clipped-firstwrite
 pinned-fork
 pagetable-retention
 pagetable-concurrent
+
+/domain-cycle
