@@ -2,6 +2,7 @@
 /* Copyright 2023 Eileen Yoon <eyn@gmx.com> */
 
 #include "isp-fw.h"
+#include "isp-ipc-layout.h"
 
 #include <asm/io.h>
 #include <linux/delay.h>
@@ -557,6 +558,8 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 	}
 
 	isp->cmd_iova = cmd_iova;
+	isp->ipc_boot_iova = args_iova;
+	isp->ipc_boot_size = args_size + 0x40 + cmd_size;
 	isp->cmd_virt = cmd_virt;
 
 	if (h16)
@@ -619,6 +622,11 @@ static void isp_free_channel_info(struct apple_isp *isp)
 
 static int isp_fill_channel_info(struct apple_isp *isp)
 {
+	struct isp_ipc_extent reserved[ISP_IPC_MAX_CHANNELS + 2];
+	struct isp_ipc_extent ipc = {
+		.iova = isp->ipc_surf->iova,
+		.size = isp->ipc_surf->size,
+	};
 	u64 table_iova = isp_gpio_read32(isp, ISP_GPIO_0) |
 			 ((u64)isp_gpio_read32(isp, ISP_GPIO_1)) << 32;
 	void *table_virt = apple_isp_ipc_translate(
@@ -628,6 +636,18 @@ static int isp_fill_channel_info(struct apple_isp *isp)
 
 	if (!table_virt) {
 		dev_err(isp->dev, "Failed to find channel table\n");
+		return -EIO;
+	}
+	reserved[0].iova = isp_fw_iova(isp, table_iova);
+	reserved[0].size = array_size(sizeof(struct isp_chan_desc),
+				      isp->num_ipc_chans);
+	/* Use the argument/command span already validated by stage 2. */
+	reserved[1].iova = isp->ipc_boot_iova;
+	reserved[1].size = isp->ipc_boot_size;
+	if (!isp_ipc_extent_contains(ipc, reserved[0]) ||
+	    !isp_ipc_extent_contains(ipc, reserved[1]) ||
+	    isp_ipc_extents_overlap(reserved[0], reserved[1])) {
+		isp_err(isp, "invalid ipc channel table or boot storage\n");
 		return -EIO;
 	}
 
@@ -677,6 +697,13 @@ static int isp_fill_channel_info(struct apple_isp *isp)
 			goto out;
 		}
 		chan->doorbell = BIT(chan->src);
+		reserved[i + 2].iova = chan->iova;
+		reserved[i + 2].size = chan->size;
+		if (!isp_ipc_ring_valid(ipc, reserved[i + 2], reserved, i + 2)) {
+			isp_err(isp, "invalid ipc chan %s layout\n",
+				chan->name);
+			goto out;
+		}
 
 		chan->virt =
 			apple_isp_ipc_translate(isp, chan->iova, chan->size);
