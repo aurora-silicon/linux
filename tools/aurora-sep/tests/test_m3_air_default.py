@@ -20,6 +20,23 @@ SRC = flow.SRC
 REL_12_3 = "4f2a68f8"
 
 
+def normalize_undo_label(text):
+    # The uninstall command is unchanged; its label now describes the kernel install.
+    return re.sub(r"(?m)^   To undo everything:    ", "   To undo the kernel install: ", text)
+
+
+class UndoLabelTest(unittest.TestCase):
+    def test_normalization_preserves_command_and_url_differences(self):
+        command = "curl -fsSL https://example.test/install.sh | bash -s -- --uninstall\n"
+        old = "   To undo everything:    " + command
+        current = "   To undo the kernel install: " + command
+        self.assertEqual(normalize_undo_label(old), current)
+        for changed in (current.replace("--uninstall", "--reset-touchid"),
+                        current.replace("example.test", "other.test"),
+                        current.replace("bash -s --", "bash")):
+            self.assertNotEqual(normalize_undo_label(old), normalize_undo_label(changed))
+
+
 def shell_value(name):
     return re.search(rf'^{name}="([^"]*)"$', SRC, re.M).group(1)
 
@@ -289,7 +306,7 @@ AIRS = re.search(r'^M3_AIR_BOARDS="([^"]*)"$', flow.SRC, re.M).group(1).split()
 class SameAs123Test(flow.M3FlowBase):
     """12.3's script and this one on every board but the J613's plain run: the same commands in
     the same order, the same files, the same exit status and the same output. The M3 Pro's output
-    differs only in the recovery text's reason names (REASONS_124). The M3 Airs, which get mesa-m3
+    differs only in the recovery text's reason names (REASONS_124) and the undo label. The M3 Airs, which get mesa-m3
     from 12.4 on (test_m3_air_mesa), run here without a mesa-m3 entry: everything else of theirs,
     m1n1's handoff above all, is as on 12.3."""
 
@@ -304,6 +321,7 @@ class SameAs123Test(flow.M3FlowBase):
     RECORD_RUN = re.compile(rb"(?m)^(run_id|written_at|boot_id|installer_sha256)=.*\n")
 
     def norm(self, text):
+        text = normalize_undo_label(text)
         text = text.replace(REASONS_124, REASONS_123)
         return self.RUN_ID.sub("run_id=<id>", self.TEMP.sub(r"\1<tmp>", pro.MKTEMP.sub("<tmp>", text)))
 
