@@ -388,6 +388,21 @@ config SENSORS_APPLESMC
 	  Say Y here if you have an applicable laptop and want to experience
 	  the awesome power of applesmc.
 
+config SENSORS_APPLE_PMP_J613
+	tristate "Apple J613 (M3 MacBook Air) PMP sensor records"
+	depends on (ARCH_APPLE && OF) || COMPILE_TEST
+	help
+	  Read-only temperature readout from the typed sensor records that
+	  the PMP firmware keeps in its SRAM on the J613 (M3 MacBook Air)
+	  with macOS 26.6.2 (25G83) firmware. It reports six raw channels
+	  and their valid maximum. It never writes to the PMP and does no
+	  thermal or fan control.
+
+	  Build it as a module: it is loaded when the J613 25G83 PMP device
+	  appears, which happens after appledrm enables it. It then polls
+	  for up to two minutes until the PMP firmware has published its
+	  records. The module will be called apple-pmp-j613-hwmon.
+
 config SENSORS_ARM_SCMI
 	tristate "ARM SCMI Sensors"
 	depends on ARM_SCMI_PROTOCOL
