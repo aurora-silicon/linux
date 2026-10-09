@@ -118,10 +118,12 @@ m3_install_packages
         self.assertFalse(called.exists())
 
     def test_assignment_like_argument_refuses_without_dropping_user_options(self):
-        self.defaults.write_text('KERNEL_CMDLINE[linux-aurora]="root=UUID=root systemd.setenv=TEST+=value"\n')
-        before=self.defaults.read_bytes()
-        self.assertNotEqual(self.run_cmdline(check=False).returncode,0)
-        self.assertEqual(self.defaults.read_bytes(),before)
+        for key in ('KERNEL_CMDLINE', 'KERNEL_CMDLINE[default]', 'KERNEL_CMDLINE[linux-aurora]'):
+            with self.subTest(key=key):
+                self.defaults.write_text(key+'="root=UUID=root rd.luks.name=configured=root systemd.setenv=TEST+=value"\n')
+                before=self.defaults.read_bytes()
+                self.assertNotEqual(self.run_cmdline(check=False).returncode,0)
+                self.assertEqual(self.defaults.read_bytes(),before)
         self.defaults.write_text('# use running command line\n')
         (self.proc/'cmdline').write_text('root=UUID=running systemd.setenv=TEST+=value\n')
         before=self.defaults.read_bytes()

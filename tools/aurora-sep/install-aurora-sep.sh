@@ -6293,6 +6293,9 @@ else:
         for line in data.splitlines():
             line = line.strip()
             if not line or line.startswith('#'): continue
+            assignment = re.match(r'^KERNEL_CMDLINE(?:\[[^\]]*\])?\s*(?:\+=|=)(.*)$', line)
+            if assignment and '+=' in assignment[1]:
+                raise SystemExit('Limine cannot preserve += inside command-line arguments; fix ' + str(path) + ' before retrying')
             if '+=' in line: key, value = line.split('+=', 1); append = True
             elif '=' in line: key, value = line.split('=', 1); append = False
             else: continue
