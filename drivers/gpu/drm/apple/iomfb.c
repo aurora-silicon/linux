@@ -878,13 +878,15 @@ static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context)
 	 * acked on the callback context, whose receive area holds the callback
 	 * record rather than the reply, so the ack cannot be used to find it.
 	 *
-	 * Older firmware leaves the record header untouched.  If it no longer
-	 * matches what was sent, the record was overwritten and its output
-	 * cannot be trusted.
+	 * On older firmware the lengths in the record header must still be
+	 * the ones that were sent; otherwise the record was overwritten and
+	 * its output cannot be trusted.  The tag is left out of the check: it
+	 * has only been seen preserved on 13.5 firmware.
 	 */
 	if (dcp->fw_compat != DCP_FIRMWARE_H17P) {
 		record = out - sent->in_len - sizeof(*record);
-		if (memcmp(record, sent, sizeof(*record))) {
+		if (record->in_len != sent->in_len ||
+		    record->out_len != sent->out_len) {
 			dev_err(dcp->dev,
 				"corrupt %c%c%c%c command record on context %X\n",
 				sent->tag[3], sent->tag[2], sent->tag[1],
