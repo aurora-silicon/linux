@@ -56,6 +56,11 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "gfx";
+		/*
+		 * The GPU firmware keeps running across system sleep and
+		 * does not survive this state going off for long.
+		 */
+		apple,always-on;
 	};
 
 	ps_venc0_sys: power-controller@240 {
