@@ -709,6 +709,9 @@ apple_dart_snapshot_fw_root(struct apple_dart *dart, int sid, const u64 *live)
 	return fw;
 }
 
+static int apple_dart_fw_invalidate(struct apple_dart_stream_map *stream_map,
+				    u64 lo, u64 hi);
+
 static int
 apple_dart_hw_map_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx)
 {
@@ -775,14 +778,20 @@ apple_dart_hw_unmap_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx
 		if (!live)
 			continue;
 		apple_dart_retire_root(live, owned, dart->pgsize / sizeof(*live));
+		if (dart->fw_mirror && dart->version >= 0x0202 && !idx) {
+			struct apple_dart_stream_map stream = { .dart = dart };
+
+			__set_bit(sid, stream.sidmap);
+			(void)apple_dart_fw_invalidate(&stream, 0, U64_MAX);
+		}
 		spin_lock_irqsave(&dart->lock, flags);
 		fw = dart->locked_fw[sid][idx];
 		dart->locked_fw[sid][idx] = NULL;
+		dart->locked_ttbr[sid][idx] = NULL;
 		spin_unlock_irqrestore(&dart->lock, flags);
 		apple_dart_free_fw_root(dart, fw);
 		devm_memunmap(dart->dev, live);
 		devm_kfree(dart->dev, owned);
-		dart->locked_ttbr[sid][idx] = NULL;
 		dart->locked_owned[sid][idx] = NULL;
 	}
 	return 0;
@@ -952,6 +961,84 @@ apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 	return ret;
 }
 
+/* A root table is at most 16 KiB of 64-bit entries. */
+#define DART_MAX_ROOT_ENTRIES (SZ_16K / sizeof(u64))
+
+/*
+ * On DARTs that keep firmware roots (T8140 and T8142), the hardware keeps
+ * using the translations behind the firmware-owned root slots, e.g. the
+ * display controller scanning out the boot framebuffer while Linux attaches.
+ * Invalidating those translations, for the whole stream or by DVA range, can
+ * make the scanout fail a translation, and the display coprocessor panics on
+ * the failed read. Linux never changes what those slots resolve to, so only
+ * invalidate the parts of [lo, hi] reached through other root slots.
+ */
+static int apple_dart_fw_invalidate(struct apple_dart_stream_map *stream_map,
+				    u64 lo, u64 hi)
+{
+	const u32 op = DART_T8110_TLB_CMD_OP_FLUSH_SID;
+	struct apple_dart *dart = stream_map->dart;
+	struct apple_dart_stream_map stream = { .dart = dart };
+	size_t entries = dart->pgsize / sizeof(u64);
+	u32 slot_shift = ilog2(dart->pgsize) + ilog2(entries);
+	u64 span = BIT_ULL(slot_shift + ilog2(entries));
+	u64 base = (dart->dma_min + dart->dma_offset) & ~(span - 1);
+	DECLARE_BITMAP(fw_slots, DART_MAX_ROOT_ENTRIES);
+	size_t first, last, i, end;
+	unsigned long flags;
+	int sid, ret = 0;
+
+	if (entries > DART_MAX_ROOT_ENTRIES || hi < base || lo > base + span - 1)
+		return 0;
+	lo = max(lo, base);
+	hi = min(hi, base + span - 1);
+	first = (lo - base) >> slot_shift;
+	last = (hi - base) >> slot_shift;
+
+	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
+		const struct apple_dart_fw_root *fw;
+		const u64 *live;
+
+		__set_bit(sid, stream.sidmap);
+		if (apple_dart_readl(dart, DART_TCR(dart, sid)) &
+		    dart->hw->tcr_4level) {
+			ret = apple_dart_t8110_hw_tlb_command_range(&stream, op,
+								    false, 0, 0);
+			goto next;
+		}
+
+		/* Nothing of Linux reaches the hardware without the root. */
+		bitmap_zero(fw_slots, entries);
+		spin_lock_irqsave(&dart->lock, flags);
+		live = dart->locked_ttbr[sid][0];
+		fw = dart->locked_fw[sid][0];
+		for (i = first; live && i <= last; i++)
+			if (apple_dart_fw_slot_owned(fw, live, i))
+				__set_bit(i, fw_slots);
+		spin_unlock_irqrestore(&dart->lock, flags);
+		if (!live)
+			goto next;
+
+		for (i = find_next_zero_bit(fw_slots, last + 1, first); i <= last;
+		     i = find_next_zero_bit(fw_slots, last + 1, end + 1)) {
+			u64 start, stop;
+
+			end = find_next_bit(fw_slots, last + 1, i) - 1;
+			start = max(lo, base + ((u64)i << slot_shift));
+			stop = min(hi, base + ((u64)(end + 1) << slot_shift) - 1);
+			ret = apple_dart_t8110_hw_tlb_command_range(&stream, op, true,
+								    start, stop);
+			if (ret)
+				break;
+		}
+next:
+		__clear_bit(sid, stream.sidmap);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 static int
 apple_dart_t8020_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
 {
@@ -962,6 +1049,8 @@ apple_dart_t8020_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
 static int
 apple_dart_t8110_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
 {
+	if (stream_map->dart->fw_mirror && stream_map->dart->version >= 0x0202)
+		return apple_dart_fw_invalidate(stream_map, 0, U64_MAX);
 	return apple_dart_t8110_hw_tlb_command_range(
 		stream_map, DART_T8110_TLB_CMD_OP_FLUSH_SID, false, 0, 0);
 }
@@ -1145,7 +1234,10 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 				"failed to publish host page-table entries: %d\n", ret);
 		else {
 			/* The range registers take the DVA the device issues. */
-			if (range && stream.dart->locked && stream.dart->version >= 0x0202)
+			if (range && stream.dart->fw_mirror && stream.dart->version >= 0x0202)
+				ret = apple_dart_fw_invalidate(&stream, first + domain->dma_offset,
+							       last + domain->dma_offset);
+			else if (range && stream.dart->locked && stream.dart->version >= 0x0202)
 				ret = apple_dart_t8110_hw_tlb_command_range(&stream,
 					DART_T8110_TLB_CMD_OP_FLUSH_SID, true,
 					first + domain->dma_offset,
