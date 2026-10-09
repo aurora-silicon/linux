@@ -5934,23 +5934,27 @@ fingerprint.
       A plain J613 install keeps the ordinary display handoff and GPU
       activation policy. A plain J615 install keeps the kernel-only path;
       --m3-handoff remains its optional display/diagnostic handoff.
-      Explicit acceleration below currently supports J613 only.
+      A new matched bundle supports current14 GPU acceleration on both
+      J613 and J615; older bundles remain J613-only.
 
-      J613 experimental acceleration with the matched installer:
+      Experimental Air acceleration with the matched installer:
       To select the supported profile from this boot's GPU firmware:
         bash install-aurora-sep.sh --m3-gpu
       This is an explicit persistent opt-in. A diagnostics-only current14
       boot may omit the GPU descriptor; the exact stub/iBoot checks still
       apply. The system-firmware version never selects the GPU profile.
       For the command, prerequisites and recovery steps, see M3-GPU.md.
-      Current14 and exact25G83 are separate profiles. On a J613 already
-      using the supported current14 firmware, run the matched installer:
+      Current14 and exact25G83 are separate profiles. On a supported Air
+      already using current14 firmware, run the matched installer:
         bash install-aurora-sep.sh --m3-gpu-persistent
       This installs the matching kernel, Mesa and unified bootloader
       together, retains a reachable GPU-off previous entry, and selects
       the experimental GPU for subsequent boots. It does not require a
-      firmware migration or a separate one-shot arming command.
-      On a J613 already booted from its own exact26.6.2/25G83 volume group,
+      firmware migration or a separate one-shot arming command. After
+      reboot and normal desktop login, run:
+        aurora-m3-gpu-check
+      It checks actual Apple GPU OpenGL/Vulkan readback, not just packages.
+      Native25 remains J613-only. On a J613 already booted from its own exact26.6.2/25G83 volume group,
       with the source-qualified stage1 named by the matched installer:
         bash install-aurora-sep.sh --m3-profile=j613-25g83
       This selects native experimental OpenGL under /opt/mesa-m3/25g83;
