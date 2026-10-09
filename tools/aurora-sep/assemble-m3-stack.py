@@ -49,7 +49,7 @@ def assemble(template, manifest, directory):
     if (not isinstance(boards, list) or not boards or len(set(boards)) != len(boards) or
             any(b not in ('j613', 'j615') for b in boards)):
         raise ValueError('legacy GPU boards must name supported Air boards once')
-    if 'j615' in boards and sources['kernel'] != '2cd8be6fbaf8cd91e36197edf161dde44264e171':
+    if 'j615' in boards and sources['kernel'] != '13d19dfa4fc510d3121b52356b68697b3c2cc648':
         raise ValueError('J615 legacy GPU requires the matched J615 kernel consumer')
     if 'j615' in boards and sources['m1n1'] != '74ba6bea52d1f865d204bb3f8168705a148fd5c5':
         raise ValueError('J615 legacy GPU requires the matched J615 m1n1 producer')

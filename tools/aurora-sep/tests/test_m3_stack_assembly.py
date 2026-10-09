@@ -38,7 +38,7 @@ class Assembly(unittest.TestCase):
         self.assertIn('M3_PERSISTENT_BOARDS="j613"',self.assemble()[0])
         self.manifest['legacy_gpu_boards']=['j613','j615']
         with self.assertRaisesRegex(ValueError,'kernel consumer'):self.assemble()
-        self.manifest['source_commits']['kernel']='2cd8be6fbaf8cd91e36197edf161dde44264e171'
+        self.manifest['source_commits']['kernel']='13d19dfa4fc510d3121b52356b68697b3c2cc648'
         with self.assertRaisesRegex(ValueError,'m1n1 producer'):self.assemble()
         self.manifest['source_commits']['m1n1']='74ba6bea52d1f865d204bb3f8168705a148fd5c5'
         self.assertIn('M3_PERSISTENT_BOARDS="j613 j615"',self.assemble()[0])
