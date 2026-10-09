@@ -121,9 +121,25 @@ static const struct dcp_v14_board dcp_v14_board_j613 = {
 	.ctm_get = A(420),
 };
 
+/* J615 (MacBook Air 15", M3): the same DCP image, a 2880x1864 60 Hz panel. */
+static const struct dcp_v14_board dcp_v14_board_j615 = {
+	.name = "J615",
+	.debugfs = "dcp-j615",
+	.dcp_compatible = "apple,t8122-dcp",
+	.machine = "apple,j615",
+	.firmware_uuid = DCP_V14_J613_FIRMWARE_UUID,
+	.handoff = "apple,t8122-handoff",
+	.panel_width = 2880,
+	.panel_height = 1864,
+	.promotion = false,
+	.ctm_set = A(421),
+	.ctm_get = A(420),
+};
+
 static const struct dcp_v14_board *const dcp_v14_boards[] = {
 	&dcp_v14_board_t6030,
 	&dcp_v14_board_j613,
+	&dcp_v14_board_j615,
 };
 
 struct dcp_v14_property {
