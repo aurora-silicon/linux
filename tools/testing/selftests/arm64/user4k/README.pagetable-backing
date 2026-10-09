@@ -27,7 +27,19 @@ and upper-level tables contribute to the measurements; do not subtract them
 as though they were pure payload. Deferred table releases can occur between
 samples. Contents PASS does not assert a density or performance result.
 
-The allocation-race fix reduces initial concurrent physical backing. It does
-not reclaim partially occupied table owners or reuse issued fragments after
-unmap. Retention/refill checkpoints deliberately preserve that separate
-coverage gap rather than declaring it fixed.
+The allocator reuses safely retired fragments, including slots from owners
+that still contain live tables. RCU-pending slots remain unavailable until
+their callback runs; an empty owner is freed. A reused dirty slot is cleared
+before it is returned. This avoids allocating new owners while old ones have
+reusable holes. It does not compact surviving live tables.
+
+On Neo, the serial refill checkpoint fell from 7,421,952 to 4,276,224 bytes of
+physical page tables; the concurrent refill fell from 6,275,072 to 4,276,224.
+The same six-phase contents and post-unmap cleanup passed. Whole-cgroup slab
+usage increased and includes allocator metadata plus other kernel objects.
+Do not report page-table bytes as the complete memory cost.
+
+Seven operation-timed rounds after one warmup had serial/concurrent total
+medians of 15.625/16.865 ms, versus 15.434/16.679 ms before reuse. The ranges
+substantially overlap; a small cost remains possible. These measurements do
+not establish a speedup or zero overhead. They exclude checkpoint I/O.

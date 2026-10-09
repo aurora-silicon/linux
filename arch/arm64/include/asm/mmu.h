@@ -39,7 +39,7 @@ typedef struct {
 	unsigned long	flags;
 	u8		pkey_allocation_map;
 #ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
-	/* Unissued PTE/PMD/PUD fragments; protected by page_table_lock. */
+	/* PTE/PMD/PUD fragment pools; initialized before atomic publication. */
 	void		*user4k_pt_frag[3];
 #endif
 } mm_context_t;
