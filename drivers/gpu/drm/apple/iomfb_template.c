@@ -1398,24 +1398,29 @@ static bool dcp_present_begin(struct apple_dcp *dcp, u32 swap_id)
 	return true;
 }
 
-static bool dcp_present_submit(struct apple_dcp *dcp, u32 swap_id, bool accepted)
+/*
+ * Returns 0 if the submitted present stands, -ECANCELED if the firmware
+ * aborted it before replying (already reported), or -EPROTO if no present
+ * was expecting this reply.
+ */
+static int dcp_present_submit(struct apple_dcp *dcp, u32 swap_id, bool accepted)
 {
 #if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 	    !dcp_present_submit_h17p(&dcp->present_state_h17p, swap_id, accepted)) {
 		dev_err(dcp->dev, "unexpected present submission %u\n", swap_id);
 		dcp->crashed = true;
-		return false;
+		return -EPROTO;
 	}
 	/* An abort received before this reply turns acceptance into failure. */
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 	    accepted && dcp->present_state_h17p.aborted) {
 		dev_warn_ratelimited(dcp->dev, "firmware aborted present %u\n",
 				     swap_id);
-		return false;
+		return -ECANCELED;
 	}
 #endif
-	return true;
+	return 0;
 }
 
 static void dcp_prepare_clear_swap(struct apple_dcp *dcp, void *request)
@@ -1461,12 +1466,16 @@ static void dcp_swap_cleared(struct apple_dcp *dcp, void *data, void *cookie)
 	struct dcp_swap_cookie *info = cookie;
 	u32 swap_id = DCP_FW_UNION(dcp->swap).swap.swap_id;
 	u32 status = resp ? resp->ret : ~0U;
+	int ret;
 
-	if (!dcp_present_submit(dcp, swap_id, !status))
+	ret = dcp_present_submit(dcp, swap_id, !status);
+	if (ret)
 		status = ~0U;
 
 	if (status) {
-		dev_err(dcp->dev, "swap_clear failed! status %u\n", status);
+		/* An aborted present has already been reported. */
+		if (ret != -ECANCELED)
+			dev_err(dcp->dev, "swap_clear failed! status %u\n", status);
 		dcp_present_failed(dcp);
 		if (dcp_present_retires(dcp)) {
 			dcp_unarm_retained_framebuffers(dcp, swap_id);
@@ -2004,6 +2013,7 @@ TRAMPOLINE_OUT(trampoline_create_backlight_service, dcpep_cb_create_backlight_se
 
 static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 {
+	int ret;
 	struct DCP_FW_NAME(dcp_swap_submit_resp) *resp = data;
 	u32 swap_id = DCP_FW_UNION(dcp->swap).swap.swap_id;
 #if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
@@ -2012,11 +2022,14 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 	u32 status = resp->ret;
 #endif
 
-	if (!dcp_present_submit(dcp, swap_id, !status))
+	ret = dcp_present_submit(dcp, swap_id, !status);
+	if (ret)
 		status = ~0U;
 
 	if (status) {
-		dev_err(dcp->dev, "swap failed! status %u\n", status);
+		/* An aborted present has already been reported. */
+		if (ret != -ECANCELED)
+			dev_err(dcp->dev, "swap failed! status %u\n", status);
 		dcp_present_failed(dcp);
 		if (dcp_present_retires(dcp)) {
 			dcp_unarm_retained_framebuffers(dcp, swap_id);
