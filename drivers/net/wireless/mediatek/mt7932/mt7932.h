@@ -76,6 +76,8 @@ struct mt7932 {
 	u64 interrupts, packets;
 	bool running;
 	bool stopping;
+	/* Probe finished initialization; the Bluetooth function may start. */
+	bool ready;
 	bool irq_requested, vectors_allocated, wiphy_registered;
 	bool dma_owned;
 	struct completion reset_retry;

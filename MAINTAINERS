@@ -1975,6 +1975,7 @@ F:	Documentation/devicetree/bindings/power/apple,t8140-pmp-report.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,pmp.yaml
 F:	drivers/pmdomain/apple/pmp-report.c
 F:	drivers/soc/apple/pmp.rs
+F:	include/linux/mt7932.h
 F:	include/linux/soc/apple/pmp-report.h
 F:	Documentation/devicetree/bindings/chosen/apple,dcp-rtkit-quiesced.yaml
 F:	Documentation/devicetree/bindings/display/apple,dcp.yaml
