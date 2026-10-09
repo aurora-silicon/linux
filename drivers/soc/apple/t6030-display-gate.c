@@ -577,6 +577,27 @@ static int __init gate_pmp_copy_values(struct of_changeset *cs, struct device_no
 	return n;
 }
 
+static int __init gate_t8122_gpu_pmp_link(struct of_changeset *cs, struct device_node *pmp)
+{
+	struct device_node *gpu, *linked;
+	int ret = 0;
+
+	if (gate_soc != &gate_t8122)
+		return 0;
+	gpu = of_find_compatible_node(NULL, NULL, "apple,agx-t8122");
+	if (!gpu || !of_device_is_available(gpu))
+		goto out;
+	linked = of_parse_phandle(gpu, "apple,pmp", 0);
+	if (!pmp || !pmp->phandle || (linked && linked != pmp))
+		ret = -EINVAL;
+	else if (!linked)
+		ret = of_changeset_add_prop_u32(cs, gpu, "apple,pmp", pmp->phandle);
+	of_node_put(linked);
+out:
+	of_node_put(gpu);
+	return ret;
+}
+
 static int __init gate_pmp_apply(struct device_node *dcp, struct device_node **ps,
 				 struct device_node *aic)
 {
@@ -617,6 +638,9 @@ static int __init gate_pmp_apply(struct device_node *dcp, struct device_node **p
 	if (!ret)
 		ret = of_changeset_add_prop_u32(&gate_pmp_cs, dcp, "apple,pmp-report",
 						disp->phandle);
+	/* The current14 T8122 GPU needs an inner AGX vote from this Mac's PMP. */
+	if (!ret)
+		ret = gate_t8122_gpu_pmp_link(&gate_pmp_cs, pmp);
 	/* The DART and mailbox interrupt parent lives in the base tree. */
 	if (!ret)
 		ret = of_changeset_add_prop_u32(&gate_pmp_cs, dart, "interrupt-parent",

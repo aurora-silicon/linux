@@ -5,9 +5,10 @@
 //! queues must be stopped before this object is released.
 
 use kernel::{
-    c_str,
+    bindings, c_str,
     device::Core,
     devres::Devres,
+    error::to_result,
     io::{
         mem::IoMem,
         Io,
@@ -31,6 +32,7 @@ pub(crate) struct Device {
     firmware: Firmware,
     core_mask: u32,
     soc: &'static Soc,
+    power_vote: bool,
 }
 
 impl Device {
@@ -59,11 +61,21 @@ impl Device {
         )?;
         dev_info!(pdev.as_ref(), "M3: SGX aperture mapped\n");
         let pmp = crate::m3_board::has_pmp_link(pdev);
-        if pmp {
+        let t8122 = crate::t8122_start::is_t8122(soc);
+        if pmp && !t8122 {
             dev_err!(pdev.as_ref(), "M3: optional apple,pmp GPU link is unsupported\n");
             return Err(ENOTSUPP);
         }
-        dev_info!(pdev.as_ref(), "M3: no apple,pmp link; GPU power is left to its power domain\n");
+        if t8122 && !pmp {
+            dev_err!(pdev.as_ref(), "M3 G15G: current14 GPU requires its PMP supplier link\n");
+            return Err(ENODEV);
+        }
+        if pmp {
+            // SAFETY: the consumer is live; the managed link pins its declared PMP supplier.
+            to_result(unsafe { bindings::apple_pmp_link_device(pdev.as_ref().as_raw()) })?;
+        } else {
+            dev_info!(pdev.as_ref(), "M3: no apple,pmp link; GPU power is left to its power domain\n");
+        }
         if asc.access(pdev.as_ref())?.read32(ASC_CPU_CONTROL) & ASC_CPU_RUN != 0 {
             dev_err!(
                 pdev.as_ref(),
@@ -79,7 +91,18 @@ impl Device {
             firmware,
             core_mask: 0,
             soc,
+            power_vote: false,
         };
+
+        if pmp {
+            // SAFETY: the linked current14 T8122 PMP owns AGX logical device 5. The bridge
+            // waits for firmware readiness and the power-command acknowledgement.
+            // An unacknowledged request may still have enabled AGX. Keep ownership so a
+            // failed acquisition releases it only after the ASC-stopped check in Drop.
+            device.power_vote = true;
+            to_result(unsafe { bindings::apple_pmp_set_device_power(0x0f, 5, 1) })?;
+            dev_info!(pdev.as_ref(), "M3 G15G: PMP GPU device 5 power acknowledged\n");
+        }
 
         let registers = device.sgx.access(pdev.as_ref())?;
         let version = registers.try_read32(0xd04000)?;
@@ -242,4 +265,24 @@ impl Device {
         Ok(())
     }
 
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        if !self.power_vote {
+            return;
+        }
+        // ASC and firmware queues must be stopped before the inner GPU vote is relinquished.
+        match self.asc.try_access() {
+            Some(asc) if asc.read32(ASC_CPU_CONTROL) & ASC_CPU_RUN == 0 => {}
+            _ => {
+                dev_err!(self.dev.as_ref(), "M3 G15G: cannot prove ASC stopped; retaining PMP vote\n");
+                return;
+            }
+        }
+        // SAFETY: the managed consumer link keeps the PMP bound through device removal.
+        if let Err(error) = to_result(unsafe { bindings::apple_pmp_set_device_power(0x0f, 5, 0) }) {
+            dev_err!(self.dev.as_ref(), "M3 G15G: PMP GPU power release failed: {:?}\n", error);
+        }
+    }
 }
