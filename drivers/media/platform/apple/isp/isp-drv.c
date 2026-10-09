@@ -28,8 +28,11 @@ static void apple_isp_detach_genpd(struct apple_isp *isp)
 	for (int i = isp->pd_count - 1; i >= 0; i--) {
 		if (isp->pd_link[i])
 			device_link_del(isp->pd_link[i]);
-		if (!IS_ERR_OR_NULL(isp->pd_dev[i]))
-			dev_pm_domain_detach(isp->pd_dev[i], true);
+		if (IS_ERR_OR_NULL(isp->pd_dev[i]))
+			continue;
+		if (isp->hw->resident_fw)
+			dev_pm_syscore_device(isp->pd_dev[i], false);
+		dev_pm_domain_detach(isp->pd_dev[i], true);
 	}
 
 	return;
@@ -74,6 +77,18 @@ static int apple_isp_attach_genpd(struct apple_isp *isp)
 			apple_isp_detach_genpd(isp);
 			return -EINVAL;
 		}
+
+		/*
+		 * The domains of resident firmware are switched by the
+		 * driver alone, through runtime PM: the firmware does not
+		 * start again once they have been off. System sleep would
+		 * otherwise also have genpd switch them off in the noirq
+		 * phase of suspend and back on in the noirq phase of resume,
+		 * where the CPU core domains of a stopped coprocessor fail
+		 * to reach the active state.
+		 */
+		if (isp->hw->resident_fw)
+			dev_pm_syscore_device(isp->pd_dev[i], true);
 	}
 
 	return 0;
