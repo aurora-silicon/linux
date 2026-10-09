@@ -5,6 +5,9 @@
  */
 #include "mt7932.h"
 
+#include <linux/pm_wakeup.h>
+#include <linux/suspend.h>
+
 static int mt_ring_alloc(struct mt7932 *m, struct mt7932_ring *q,
 			 unsigned int n, bool rx, unsigned int count);
 static void mt_rx_post(struct mt7932_ring *q, unsigned int index);
@@ -1279,6 +1282,25 @@ static void mt_shutdown(struct pci_dev *pdev)
 	/* Storage remains allocated through reset, even if the engine is stuck. */
 }
 
+/*
+ * Stopping the firmware for sleep would take the whole remove and probe
+ * sequence, so leave it running across suspend-to-idle. A saved state keeps
+ * the PCI core from changing the function's power state or command register,
+ * and the awake path keeps the PCIe controller powered until resume.
+ */
+static int mt_suspend(struct device *dev)
+{
+	if (!pm_suspend_no_platform())
+		return -EOPNOTSUPP;
+	pci_save_state(to_pci_dev(dev));
+	device_set_awake_path(dev);
+	return 0;
+}
+
+static const struct dev_pm_ops mt_pm_ops = {
+	.suspend = mt_suspend,
+};
+
 static const struct pci_device_id mt_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_MEDIATEK, 0x7932) },
 	{}
@@ -1292,6 +1314,7 @@ static struct pci_driver mt_driver = {
 	.remove = mt_remove,
 	.shutdown = mt_shutdown,
 	.driver.suppress_bind_attrs = true,
+	.driver.pm = pm_sleep_ptr(&mt_pm_ops),
 };
 module_pci_driver(mt_driver);
 MODULE_LICENSE("GPL");

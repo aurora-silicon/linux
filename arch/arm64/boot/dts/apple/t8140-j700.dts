@@ -26,6 +26,8 @@
 		sep = &sep;
 		serial0 = &serial0;
 		pmp = &pmp;
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
 		wifi0 = &wifi0;
 		/* used by the loader to hand over the display */
 		dcp = &dcp;
