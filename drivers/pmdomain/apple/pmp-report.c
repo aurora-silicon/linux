@@ -941,6 +941,27 @@ out_put:
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_wait_ready);
 
+/* Select one available report entry for the requested PMP bit. */
+static struct device_node *apple_pmp_report_entry(struct device_node *report, u32 id)
+{
+	struct device_node *child, *entry = NULL;
+	u32 reg;
+
+	for_each_available_child_of_node(report, child) {
+		if (!of_device_is_compatible(child, "apple,t6000-pmp-v2-report-entry") ||
+		    of_property_count_u32_elems(child, "reg") != 1 ||
+		    of_property_read_u32(child, "reg", &reg) || reg != id)
+			continue;
+		if (entry) {
+			of_node_put(entry);
+			of_node_put(child);
+			return NULL;
+		}
+		entry = of_node_get(child);
+	}
+	return entry;
+}
+
 /* A current14 T8122 supplier starts through its own display report entry.
  * The entry consumer pins startup/removal and verifies both READY and DISP ACK.
  */
@@ -956,7 +977,8 @@ static int apple_pmp_report_wait_t8122_14(struct device *supplier, unsigned int 
 	if (!report)
 		return -ENODEV;
 	pmp = of_parse_phandle(report, "apple,pmp", 0);
-	entry = of_get_child_by_name(report, "report@7");
+	/* The display request entry: DISP is PMP request bit 7. */
+	entry = apple_pmp_report_entry(report, 7);
 	ret = pmp == supplier->of_node && entry ?
 		apple_pmp_report_wait_ready(entry, msecs_to_jiffies(timeout_ms)) : -ENODEV;
 	of_node_put(entry);
