@@ -582,6 +582,7 @@ M3_GPU_PROFILE_FILE=/etc/mesa-m3/t8122-profile
 M3_GPU_CHECK=/usr/local/bin/aurora-m3-gpu-check
 M3_GRUB_DEFAULTS=/etc/default/grub
 M3_LIMINE_DEFAULTS=/etc/default/limine
+M3_LIMINE_VENDOR_CONF=/usr/share/limine-entry-tool.d
 M3_PROFILE_HOOK=/etc/pacman.d/hooks/zzzz-aurora-m3-profile.hook
 M3_PROFILE_UPDATE=/usr/local/libexec/aurora-m3-profile-update
 M3_PERSISTENT_TRANSACTION_ACTIVE=0
@@ -6248,6 +6249,7 @@ m3_persistent_transaction_commit() {
 m3_install_packages() {
   # The generated main UKI remains unarmed until the matched transaction has
   # succeeded. The custom GPU-off entry was registered before this call.
+  if ((M3_GPU_PERSISTENT)) && [[ $chain == limine ]]; then m3_persistent_cmdline "$chain" 0; fi
   $sudo pacman -U --noconfirm --ask 4 "$work"/*.pkg.tar.zst
   if ((M3_GPU_PERSISTENT)); then
     M3_PRO_MESA_RESULT=installed
@@ -6267,23 +6269,66 @@ m3_install_packages() {
 }
 
 m3_persistent_cmdline() {
-  local chain=$1 path
+  local chain=$1 path armed=${2:-1}
   if [[ $chain == grub ]]; then path=$M3_GRUB_DEFAULTS
   else path=$M3_LIMINE_DEFAULTS; fi
   [[ -f $STATE/m3-defaults.saved ]] || $sudo cp -p "$path" "$STATE/m3-defaults.saved"
-  $sudo python3 - "$path" "$chain" <<'M3_CMDLINE_PY'
+  $sudo python3 - "$path" "$chain" "$armed" "$M3_LIMINE_VENDOR_CONF" "$M3_PROCFS/cmdline" <<'M3_CMDLINE_PY'
 import os, re, sys, tempfile
 from pathlib import Path
 path, chain = Path(sys.argv[1]), sys.argv[2]
+armed = sys.argv[3]
+if armed not in ('0', '1'): raise SystemExit('invalid M3 activation setting')
 text = path.read_text()
 begin, end = '# >>> aurora-sep: M3 GPU cmdline', '# <<< aurora-sep: M3 GPU cmdline'
 if text.count(begin) != text.count(end) or text.count(begin) > 1:
     raise SystemExit('malformed owned M3 cmdline block')
 text = re.sub(re.escape(begin) + r'\n.*?' + re.escape(end) + r'\n?', '', text, flags=re.S)
 if chain == 'grub':
-    setting = 'GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} asahi.t8122_start=1"'
+    setting = 'GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} asahi.t8122_start=' + armed + '"'
 else:
-    setting = 'KERNEL_CMDLINE[linux-aurora]="${KERNEL_CMDLINE[linux-aurora]:-${KERNEL_CMDLINE[default]}} asahi.t8122_start=1"'
+    # Limine reads literal assignments; it does not expand shell variables.
+    values = {}
+    def read_config(data):
+        for line in data.splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'): continue
+            assignment = re.match(r'^KERNEL_CMDLINE(?:\[[^\]]*\])?\s*(?:\+=|=)(.*)$', line)
+            if assignment and '+=' in assignment[1]:
+                raise SystemExit('Limine cannot preserve += inside command-line arguments; fix ' + str(path) + ' before retrying')
+            if '+=' in line: key, value = line.split('+=', 1); append = True
+            elif '=' in line: key, value = line.split('=', 1); append = False
+            else: continue
+            key, value = key.strip(), value.strip()
+            if key == 'KERNEL_CMDLINE': target = 'default'
+            elif key.startswith('KERNEL_CMDLINE[') and ']' in key:
+                target = key[len('KERNEL_CMDLINE['):key.index(']')].strip()
+            else: continue
+            if len(target) >= 2 and target.startswith('"') and target.endswith('"'): target = target[1:-1]
+            target = target or 'default'
+            if len(value) >= 2 and value.startswith('"') and value.endswith('"'): value = value[1:-1]
+            values[target] = value + ' ' + values[target] if append and target in values else value
+    etc = path.parent.parent
+    vendor = Path(sys.argv[4])
+    sources = sorted(vendor.glob('*.conf')) if vendor.is_dir() else []
+    sources += [etc / 'limine-entry-tool.conf']
+    directory = etc / 'limine-entry-tool.d'
+    if directory.is_dir(): sources += sorted(directory.glob('*.conf'))
+    for source in sources:
+        if source.is_file(): read_config(source.read_text())
+    read_config(text)
+    value = values.get('linux-aurora', '').strip() or values.get('default', '').strip()
+    if not value:
+        fallback = etc / 'kernel/cmdline'
+        value = fallback.read_text().replace('\n', ' ').strip() if fallback.is_file() else ''
+        if not value: value = Path(sys.argv[5]).read_text().strip()
+    if any(c in value for c in ('"', "'", '\n', '\r', '`', '${', '$(', '+=')) or not any(w.startswith('root=') for w in value.split()):
+        raise SystemExit('Limine command line must contain literal root= arguments without quotes, shell expressions or += inside arguments; fix ' + str(path) + ' before retrying')
+    words = [w for w in value.split() if not re.match(r'asahi\.t8122[_-]start(?:=|$)', w)
+             and not w.startswith(('mesa_m3=', 'air_gpu.oneshot=', 'BOOT_IMAGE='))]
+    words += ['asahi.t8122_start=' + armed]
+    if armed == '0': words += ['mesa_m3=off']
+    setting = 'KERNEL_CMDLINE[linux-aurora]="' + ' '.join(words) + '"'
 data = text.rstrip() + '\n\n' + begin + '\n' + setting + '\n' + end + '\n'
 fd, name = tempfile.mkstemp(dir=path.parent, prefix=path.name+'.')
 with os.fdopen(fd, 'w') as out:
