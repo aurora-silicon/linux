@@ -30,6 +30,7 @@ import time
 import unittest
 
 import test_m3_flow as flow
+from test_m3_air_default import normalize_undo_label
 
 SRC = flow.SRC
 VERSION = flow.VERSION
@@ -978,7 +979,7 @@ class NextStepsTest(MaxBase):
                 self.assertLess(block.index("Reboot"), block.index("uname -r"))
                 self.assertLess(block.index("uname -r"), block.index("--m3-report"))
                 self.assertLess(block.index("--m3-report"), block.index("/issues"))
-                self.assertLess(out.index("To undo everything"), out.index(self.BLOCK))
+                self.assertLess(out.index("To undo the kernel install"), out.index(self.BLOCK))
 
     def test_other_macs_have_no_block(self):
         for board, try_ in (("j613", 0), ("j516s", 0), ("j514s", 0), ("j514s", 1), ("j314s", 0), ("j414s", 0),
@@ -1468,8 +1469,8 @@ class SameAs122Test(MaxBase):
                 self.assertEqual(sorted(after["tree"]), sorted(before["tree"]))
                 for path, data in before["tree"].items():
                     self.assertEqual(after["tree"][path], data, path)
-                # Only the end of the install's summary may differ: the next-steps block.
-                old_out, new_out = before["out"][0], after["out"][0]
+                # Only the undo label and the next-steps block may differ; commands stay exact.
+                old_out, new_out = (normalize_undo_label(run["out"][0]) for run in (before, after))
                 self.assertTrue(new_out.startswith(old_out), board)
                 extra = new_out[len(old_out):]
                 compat = flow.BOARDS[board]
