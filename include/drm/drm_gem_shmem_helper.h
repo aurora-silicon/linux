@@ -31,6 +31,21 @@ struct drm_gem_shmem_object {
 	 */
 	struct page **pages;
 
+	/** @cpu_vma_count: Revocable CPU VMAs, protected by base.resv. */
+	refcount_t cpu_vma_count;
+
+	/** @reclaimable_cpu_mappings: CPU VMAs may be revoked by the driver. */
+	bool reclaimable_cpu_mappings;
+
+	/**
+	 * @cpu_pages: Pages populated one at a time by CPU faults on revocable
+	 * VMAs while no device mapping holds @pages. Sparse; under base.resv.
+	 */
+	struct page **cpu_pages;
+
+	/** @cpu_pages_count: Populated entries of @cpu_pages. */
+	unsigned long cpu_pages_count;
+
 	/**
 	 * @pages_use_count:
 	 *
@@ -133,6 +148,8 @@ static inline bool drm_gem_shmem_is_purgeable(struct drm_gem_shmem_object *shmem
 		!shmem->base.dma_buf && !drm_gem_is_imported(&shmem->base);
 }
 
+bool drm_gem_shmem_idle_pages_releasable_locked(struct drm_gem_shmem_object *shmem);
+int drm_gem_shmem_release_idle_pages_locked(struct drm_gem_shmem_object *shmem);
 void drm_gem_shmem_purge_locked(struct drm_gem_shmem_object *shmem);
 
 struct sg_table *drm_gem_shmem_get_sg_table(struct drm_gem_shmem_object *shmem);

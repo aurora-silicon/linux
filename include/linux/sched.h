@@ -904,6 +904,8 @@ struct task_struct {
 	 * Must be updated with task_rq_lock() held.
 	 */
 	struct uclamp_se		uclamp[UCLAMP_CNT];
+	/* Current-task kernel scope; separate from userspace clamp requests. */
+	unsigned int		uclamp_scope_min;
 #endif
 
 	struct sched_statistics         stats;
@@ -961,6 +963,11 @@ struct task_struct {
 
 	struct mm_struct		*mm;
 	struct mm_struct		*active_mm;
+#ifdef CONFIG_ARCH_HAS_USER_PAGE_SIZE
+	/* Per-thread exec policy; fork inherits it, the live mm is immutable. */
+	unsigned int			exec_page_shift;
+	unsigned int			default_exec_page_shift;
+#endif
 
 	int				exit_state;
 	int				exit_code;
@@ -1941,6 +1948,14 @@ extern void sched_set_fifo_low(struct task_struct *p);
 extern void sched_set_fifo_secondary(struct task_struct *p);
 extern void sched_set_normal(struct task_struct *p, int nice);
 extern int sched_setattr(struct task_struct *, const struct sched_attr *);
+#ifdef CONFIG_UCLAMP_TASK
+unsigned int sched_util_min_scope_enter(unsigned int value);
+void sched_util_min_scope_exit(unsigned int previous);
+#else
+static inline unsigned int sched_util_min_scope_enter(unsigned int value) { return 0; }
+static inline void sched_util_min_scope_exit(unsigned int previous) { }
+#endif
+
 extern int sched_setattr_nocheck(struct task_struct *, const struct sched_attr *);
 extern struct task_struct *idle_task(int cpu);
 

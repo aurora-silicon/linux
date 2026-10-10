@@ -1,0 +1,398 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+//! Logical queue ownership of scheduler, QoS and work-state identities.
+//!
+//! Installed bindings retain this context until replacement is acknowledged.
+//! A job keeps its work-state lease through exact retirement, even if its error
+//! fence has already been signalled. Context-local accounting never waits for GPU work.
+
+mod identity;
+use super::{
+    freelist::{RenderIds, RenderPool},
+    fw::{context as fw, queue::Policy},
+    object::{Allocator, CpuMap, Family, KernelObject, Pool, PooledObject},
+    status::VmStatus,
+};
+use crate::mmu::{self, ExecutionContext, Vm, UAT_PGSZ};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, Ordering};
+use identity::{RenderSlots, WorkStates, FREE, NODE_STRIDE, STATE_COUNT};
+use kernel::{
+    new_mutex,
+    prelude::*,
+    sync::{Arc, Mutex},
+};
+
+/// QoS IDs belong to one device; the two lowest values are reserved.
+#[pin_data]
+pub(crate) struct QosIds {
+    #[pin]
+    used: Mutex<u128>,
+}
+impl QosIds {
+    pub(crate) fn new() -> Result<Arc<Self>> {
+        Arc::pin_init(
+            pin_init!(Self { used <- new_mutex!(3, "G17 QoS IDs") }),
+            GFP_KERNEL,
+        )
+    }
+    fn acquire(self: &Arc<Self>) -> Result<QosLease> {
+        let mut used = self.used.lock();
+        let id = used.trailing_ones();
+        if id == 128 {
+            return Err(ENOSPC);
+        }
+        *used |= 1u128 << id;
+        Ok(QosLease {
+            ids: self.clone(),
+            id: id as u8,
+        })
+    }
+}
+struct QosLease {
+    ids: Arc<QosIds>,
+    id: u8,
+}
+impl Drop for QosLease {
+    fn drop(&mut self) {
+        *self.ids.used.lock() &= !(1u128 << self.id);
+    }
+}
+
+struct WorkStorage {
+    object: PooledObject,
+    words: [Option<u32>; STATE_COUNT],
+    counts: [u32; STATE_COUNT],
+    render: RenderSlots,
+}
+impl WorkStorage {
+    fn initialize(&mut self, word: u32) -> Result {
+        let slot = (word & 63) as usize;
+        if slot >= STATE_COUNT {
+            return Err(EINVAL);
+        }
+        let counter = UAT_PGSZ + slot * 4;
+        let node = fw::WorkNode::new(self.object.gpu_va() + counter as u64, word).ok_or(EINVAL)?;
+        // The exact work-state lease excludes a previous firmware owner. Only
+        // the node's 0xc8 initialized bytes are replaced; the stride tail is retained.
+        self.object.write(slot * NODE_STRIDE, node)?;
+        self.object.word(counter)?.store(0, Ordering::Relaxed);
+        self.words[slot] = Some(word);
+        self.counts[slot] = 0;
+        fence(Ordering::Release);
+        Ok(())
+    }
+    fn change_count(&mut self, word: u32, kicks: u32, add: bool) -> Result<u32> {
+        let slot = (word & 63) as usize;
+        if self.words.get(slot) != Some(&Some(word)) {
+            return Err(EINVAL);
+        }
+        let value = if add {
+            self.counts[slot].checked_add(kicks)
+        } else {
+            self.counts[slot].checked_sub(kicks)
+        }
+        .ok_or(EOVERFLOW)?;
+        self.object
+            .word(UAT_PGSZ + slot * 4)?
+            .store(value, Ordering::Relaxed);
+        self.counts[slot] = value;
+        fence(Ordering::SeqCst);
+        Ok(value)
+    }
+}
+
+/// Firmware-visible pages of a context, retained by an installed queue whose
+/// last owner has exited (see [`Context::retain_firmware_pages`]).
+pub(crate) struct FirmwarePages {
+    _scheduler: Arc<KernelObject>,
+    _work: Arc<Mutex<WorkStorage>>,
+}
+
+pub(crate) struct Context {
+    execution: Arc<ExecutionContext>,
+    status: Arc<VmStatus>,
+    scheduler: Arc<KernelObject>,
+    scheduler_generation: u32,
+    published: AtomicBool,
+    qos: QosLease,
+    owner_pid: u32,
+    states: WorkStates,
+    work: Arc<Mutex<WorkStorage>>,
+    work_base: u64,
+    render: Arc<Mutex<Option<Arc<RenderPool>>>>,
+    /// Fixed for the context's life. Physical queues bound to it carry this
+    /// profile in every record, ring, doorbell and registration.
+    policy: Policy,
+}
+impl Context {
+    pub(crate) fn new(
+        alloc: &Allocator<'_>,
+        pool: &Arc<Pool>,
+        qos: &Arc<QosIds>,
+        execution: Arc<ExecutionContext>,
+        owner_pid: u32,
+        policy: Policy,
+    ) -> Result<Self> {
+        let status = execution.vm().status().ok_or(EINVAL)?.clone();
+        let qos = qos.acquire()?;
+        let mut scheduler = alloc.kernel(
+            UAT_PGSZ,
+            UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+            CpuMap::WriteCombined,
+        )?;
+        scheduler.initialize::<fw::Scheduler>(0, |value| {
+            value.init();
+            Ok(())
+        })?;
+        fence(Ordering::SeqCst);
+        let scheduler_generation = super::ids::OBJECTS.object()?;
+        let scheduler = Arc::new(scheduler, GFP_KERNEL)?;
+        let mut object = pool.allocate(
+            alloc,
+            Family::WorkState,
+            2 * UAT_PGSZ,
+            UAT_PGSZ,
+            mmu::PROT_GPU_FW_SHARED_RW,
+            CpuMap::WriteCombined,
+        )?;
+        let work_base = object.gpu_va();
+        object.write(
+            UAT_PGSZ + 0x400,
+            fw::WorkHead {
+                next: 0,
+                previous: work_base + (UAT_PGSZ + 0x400) as u64,
+                unk10: 0,
+                unk14: 0,
+            },
+        )?;
+        fence(Ordering::Release);
+        let work = Arc::pin_init(
+            new_mutex!(
+                WorkStorage {
+                    object,
+                    words: [None; STATE_COUNT],
+                    counts: [0; STATE_COUNT],
+                    render: RenderSlots::new()
+                },
+                "G17 work states"
+            ),
+            GFP_KERNEL,
+        )?;
+        let render = Arc::pin_init(new_mutex!(None, "G17 context private memory"), GFP_KERNEL)?;
+        Ok(Self {
+            execution,
+            status,
+            scheduler,
+            scheduler_generation,
+            published: AtomicBool::new(false),
+            qos,
+            owner_pid,
+            states: WorkStates::new(),
+            work,
+            work_base,
+            render,
+            policy,
+        })
+    }
+    pub(crate) fn vm(&self) -> &Vm {
+        self.execution.vm()
+    }
+    pub(crate) fn status(&self) -> &Arc<VmStatus> {
+        &self.status
+    }
+    pub(crate) fn id(&self) -> u32 {
+        self.execution.id()
+    }
+
+    pub(crate) fn generation(&self) -> u8 {
+        self.execution.generation()
+    }
+    pub(crate) fn is_current(&self) -> bool {
+        self.execution.is_current()
+    }
+    pub(crate) fn owner_pid(&self) -> u32 {
+        self.owner_pid
+    }
+    pub(crate) fn policy(&self) -> Policy {
+        self.policy
+    }
+    pub(crate) fn qos_id(&self) -> u8 {
+        self.qos.id
+    }
+    pub(crate) fn scheduler_va(&self) -> u64 {
+        self.scheduler.gpu_va()
+    }
+    /// Installed physical channels retain this page after the logical execution
+    /// context and its VM lease have completed their scheduler release.
+    pub(crate) fn scheduler_owner(&self) -> Arc<KernelObject> {
+        self.scheduler.clone()
+    }
+    /// Scheduler release and command retirement have both been witnessed.
+    /// Keep installed storage alive while returning the finite TTBAT identity.
+    pub(crate) fn release_execution(&self) {
+        self.execution.release();
+    }
+    pub(crate) fn scheduler_generation(&self) -> u32 {
+        self.scheduler_generation
+    }
+    /// The pages an installed queue record of this context still names: the
+    /// scheduler page and the work storage holding the job-list head. A retained
+    /// physical queue keeps these after dropping the context itself.
+    pub(crate) fn retain_firmware_pages(&self) -> FirmwarePages {
+        FirmwarePages {
+            _scheduler: self.scheduler.clone(),
+            _work: self.work.clone(),
+        }
+    }
+    pub(crate) fn work_head_va(&self) -> u64 {
+        self.work_base + (UAT_PGSZ + 0x400) as u64
+    }
+    /// Shared scheduler list head, sampled under the context's storage lock.
+    pub(crate) fn work_head(&self) -> Result<[u64; 2]> {
+        let work = self.work.lock();
+        let head = [
+            work.object.dword(UAT_PGSZ + 0x400)?.load(Ordering::Relaxed),
+            work.object.dword(UAT_PGSZ + 0x408)?.load(Ordering::Relaxed),
+        ];
+        fence(Ordering::Acquire);
+        Ok(head)
+    }
+
+    pub(crate) fn is_published(&self) -> bool {
+        self.published.load(Ordering::Acquire)
+    }
+    pub(crate) fn mark_published(&self) {
+        self.published.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn release_identity(&self) -> Result<[u8; 4]> {
+        let mut result = [0; 4];
+        fence(Ordering::Acquire);
+        for (value, offset) in result.iter_mut().zip([0, 1, 4, 0x26]) {
+            let pointer = self.scheduler.pointer(offset, 1)?;
+            // SAFETY: pointer checked against retained scheduler allocation;
+            // a byte read observes firmware state without borrowing its fields.
+            *value = unsafe { core::ptr::read_volatile(pointer) };
+        }
+        Ok(result)
+    }
+    pub(crate) fn render_pool(
+        &self,
+        alloc: &Allocator<'_>,
+        ids: &Arc<RenderIds>,
+        render_global: &Vm,
+    ) -> Result<Arc<RenderPool>> {
+        if !self.is_current() {
+            return Err(EFAULT);
+        }
+        let mut render = self.render.lock();
+        if let Some(pool) = &*render {
+            // A pool vacated under memory pressure is re-armed before reuse.
+            pool.ensure_backing(alloc, render_global, self.vm())?;
+            return Ok(pool.clone());
+        }
+        let pool = Arc::new(
+            RenderPool::new(alloc, ids, render_global, self.vm())?,
+            GFP_KERNEL,
+        )?;
+        *render = Some(pool.clone());
+        Ok(pool)
+    }
+    /// Drops the pool once its free-list release is consumed and the closed
+    /// scheduler is detached. Installed compute bindings may retain the
+    /// context itself until replacement; they never use the render pool.
+    pub(crate) fn take_render_pool(&self) -> Option<Arc<RenderPool>> {
+        self.render.lock().take()
+    }
+    pub(crate) fn render_pools_released(&self, released: impl Fn(u32, u64) -> bool) -> bool {
+        self.render
+            .lock()
+            .as_ref()
+            .is_none_or(|pool| released(u32::from(pool.id()), pool.control_va()))
+    }
+}
+
+/// Shared by all engines of one ioctl. Queued work initially consumes no node.
+pub(crate) struct WorkStateLease {
+    context: Arc<Context>,
+    word: AtomicU32,
+}
+impl WorkStateLease {
+    pub(crate) fn deferred(context: Arc<Context>) -> Self {
+        Self {
+            context,
+            word: AtomicU32::new(FREE),
+        }
+    }
+    pub(crate) fn acquire(&self) -> Result<u32> {
+        let current = self.word();
+        if current != FREE {
+            return Ok(current);
+        }
+        let Some(candidate) = self.context.states.allocate() else {
+            let current = self.word();
+            return if current != FREE {
+                Ok(current)
+            } else {
+                Err(EBUSY)
+            };
+        };
+        if let Err(error) = self.context.work.lock().initialize(candidate) {
+            self.context.states.release(candidate);
+            return Err(error);
+        }
+        match self
+            .word
+            .compare_exchange(FREE, candidate, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => Ok(candidate),
+            Err(installed) => {
+                self.context.states.release(candidate);
+                Ok(installed)
+            }
+        }
+    }
+    pub(crate) fn word(&self) -> u32 {
+        self.word.load(Ordering::Acquire)
+    }
+    pub(crate) fn node_va(&self) -> Result<u64> {
+        let word = self.word();
+        if word == FREE {
+            return Err(EINVAL);
+        }
+        Ok(self.context.work_base + u64::from(word & 63) * NODE_STRIDE as u64)
+    }
+    pub(crate) fn add_submitted_kicks(&self, kicks: u32) -> Result<u32> {
+        self.context
+            .work
+            .lock()
+            .change_count(self.word(), kicks, true)
+    }
+    pub(crate) fn cancel_unpublished_kicks(&self, kicks: u32) -> Result<u32> {
+        self.context
+            .work
+            .lock()
+            .change_count(self.word(), kicks, false)
+    }
+
+    pub(crate) fn render_slot(&self, pair: u8) -> Result<u32> {
+        self.context.work.lock().render.get(pair).ok_or(ENOSPC)
+    }
+    pub(crate) fn channel_payload(&self, pair: u8, ordinal: u64) -> Result<u8> {
+        self.context
+            .work
+            .lock()
+            .render
+            .payload(pair, ordinal)
+            .ok_or(EINVAL)
+    }
+}
+impl Drop for WorkStateLease {
+    fn drop(&mut self) {
+        let word = self.word();
+        if word != FREE {
+            self.context.states.release(word);
+        }
+    }
+}

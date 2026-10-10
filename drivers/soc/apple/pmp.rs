@@ -20,7 +20,9 @@ use kernel::{
     devres::Devres,
     dma::{
         Coherent,
-        CoherentBox, //
+        CoherentBox,
+        Device as _,
+        DmaMask, //
     },
     io::{
         mem::IoMem,
@@ -494,17 +496,22 @@ impl Drop for PmpDriver {
 kernel::of_device_table!(
     OF_TABLE,
     MODULE_OF_TABLE,
-    (),
-    [(of::DeviceId::new(c"apple,t6000-pmp-v2"), ())]
+    bool,
+    [(of::DeviceId::new(c"apple,t8140-pmp-v2"), true),
+     (of::DeviceId::new(c"apple,t6000-pmp-v2"), false)]
 );
 
 impl platform::Driver for PmpDriver {
-    type IdInfo = ();
+    type IdInfo = bool;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
-    fn probe(pdev: &platform::Device<Core>, _info: Option<&()>) -> impl PinInit<Self, Error> {
+    fn probe(pdev: &platform::Device<Core>, info: Option<&bool>) -> impl PinInit<Self, Error> {
         let dev: ARef<device::Device> = pdev.as_ref().into();
+        if info.copied().unwrap_or(false) {
+            // SAFETY: The T8140 DART accepts 42-bit IOVAs; no DMA allocations exist yet.
+            unsafe { pdev.dma_set_mask_and_coherent(DmaMask::new::<42>())? };
+        }
         let data = PmpData::new(pdev)?;
         let node = dev.fwnode().ok_or(EIO)?;
         let dvid = node

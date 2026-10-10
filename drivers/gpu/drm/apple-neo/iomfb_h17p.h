@@ -1,0 +1,132 @@
+/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
+/* Copyright The Asahi Linux Contributors */
+
+#ifndef __APPLE_IOMFB_H17P_H__
+#define __APPLE_IOMFB_H17P_H__
+
+#include "version_utils.h"
+
+#define DCP_FW h17p
+#define DCP_FW_VER DCP_FW_VERSION(26, 6, 0)
+
+#include "iomfb_template.h"
+
+static_assert(sizeof(struct neo_dcp_swap_h17p) == 0x58a);
+static_assert(sizeof(struct neo_dcp_surface_h17p) == 0x22c);
+static_assert(sizeof(struct neo_dcp_swap_submit_req_h17p) == 0xe9c);
+static_assert(sizeof(struct neo_dcp_swap_submit_resp_h17p) == 0x0c);
+
+/* Owned by the RTKit receive thread, independently of DRM state lifetime. */
+struct neo_dcp_present_state_h17p {
+	u32 swap_id;
+	bool pending;
+	bool accepted;
+	/* The firmware aborted the present before its submit reply. */
+	bool aborted;
+	/* The most recent aborted present, whose late completion is ignored. */
+	bool has_last_aborted;
+	u32 last_aborted;
+};
+
+static inline bool
+neo_dcp_present_begin_h17p(struct neo_dcp_present_state_h17p *state, u32 swap_id)
+{
+	if (state->pending)
+		return false;
+	state->swap_id = swap_id;
+	state->pending = true;
+	state->accepted = false;
+	state->aborted = false;
+	return true;
+}
+
+static inline bool
+neo_dcp_present_submit_h17p(struct neo_dcp_present_state_h17p *state, u32 swap_id,
+			bool accepted)
+{
+	if (!state->pending || state->accepted || state->swap_id != swap_id)
+		return false;
+	state->accepted = accepted;
+	if (!accepted || state->aborted)
+		state->pending = false;
+	return true;
+}
+
+/*
+ * An aborted present never completes.  Before its submit reply, the abort is
+ * recorded and the reply ends the present instead.
+ */
+static inline bool
+neo_dcp_present_abort_h17p(struct neo_dcp_present_state_h17p *state, u32 swap_id)
+{
+	if (!state->pending || state->swap_id != swap_id)
+		return false;
+	if (state->accepted) {
+		state->pending = false;
+		state->accepted = false;
+	} else {
+		state->aborted = true;
+	}
+	state->has_last_aborted = true;
+	state->last_aborted = swap_id;
+	return true;
+}
+
+/* Whether the firmware aborted @swap_id; a completion for it is stale. */
+static inline bool
+neo_dcp_present_was_aborted_h17p(const struct neo_dcp_present_state_h17p *state,
+			     u32 swap_id)
+{
+	return state->has_last_aborted && state->last_aborted == swap_id;
+}
+
+static inline bool
+neo_dcp_present_complete_h17p(struct neo_dcp_present_state_h17p *state, u32 swap_id)
+{
+	if (!state->pending || !state->accepted || state->swap_id != swap_id)
+		return false;
+	state->pending = false;
+	state->accepted = false;
+	return true;
+}
+
+/* The H17P swap boundary is independent of the template's native layout. */
+struct neo_dcp_present_h17p {
+	u8 swap[0x588];
+	struct neo_dcp_surface_h17p surf[SWAP_SURFACES];
+	u8 tail[0x64];
+} __packed;
+
+static_assert(sizeof(struct neo_dcp_present_h17p) == 0xe9c);
+static_assert(offsetof(struct neo_dcp_present_h17p, surf) == 0x588);
+static_assert(offsetof(struct neo_dcp_present_h17p, tail) == 0xe38);
+
+struct neo_dcp_apply_property_h17p {
+	u32 property;
+	u32 value;
+} __packed;
+
+static_assert(sizeof(struct neo_dcp_apply_property_h17p) == 0x8);
+
+static inline struct neo_dcp_apply_property_h17p neo_dcp_opaque_x_property_h17p(void)
+{
+	return (struct neo_dcp_apply_property_h17p) {
+		.property = 0x49,
+		.value = 0,
+	};
+}
+
+void neo_iomfb_encode_backlight_h17p(struct neo_dcp_present_h17p *wire, u32 nits,
+				 u32 maximum, bool update);
+
+void neo_iomfb_serialize_present_h17p(struct neo_dcp_present_h17p *wire,
+				  const struct neo_dcp_swap_submit_req_h17p *request);
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_NEO_KUNIT_TEST)
+int neo_iomfb_h17p_first_unbounded_callback(void);
+#endif
+
+#undef DCP_FW_VER
+#undef DCP_FW
+
+#endif /* __APPLE_IOMFB_H17P_H__ */

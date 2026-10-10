@@ -48,6 +48,9 @@ pub trait Operations {
     /// Type representing an allocated buffer for RTKit.
     type Buffer: Buffer;
 
+    /// Firmware chooses and announces shared-buffer addresses.
+    const COPROC_PLACES_BUFFERS: bool = false;
+
     /// Called when RTKit crashes.
     fn crashed(_data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _crashlog: Option<&[u8]>) {}
 
@@ -218,6 +221,7 @@ unsafe extern "C" fn shmem_destroy_callback<T: Operations>(
 
 impl<T: Operations> RtKit<T> {
     const VTABLE: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
+        flags: if T::COPROC_PLACES_BUFFERS { bindings::APPLE_RTKIT_COPROC_PLACES_BUFFERS } else { 0 },
         crashed: Some(crashed_callback::<T>),
         recv_message: Some(recv_message_callback::<T>),
         recv_message_early: Some(recv_message_early_callback::<T>),

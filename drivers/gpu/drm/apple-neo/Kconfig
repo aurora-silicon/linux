@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+config DRM_APPLE_NEO
+	tristate "DRM Support for the Apple T8140 display controller"
+	depends on DRM && OF && ARM64
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on APPLE_RTKIT
+	depends on OF_ADDRESS
+	select APPLE_PMP_REPORT
+	select DRM_CLIENT_SELECTION
+	select DRM_KMS_HELPER
+	select DRM_KMS_DMA_HELPER
+	select DRM_GEM_DMA_HELPER
+	select VIDEOMODE_HELPERS
+	depends on BACKLIGHT_CLASS_DEVICE
+	select MULTIPLEXER
+	help
+	  Say Y for native display support on the MacBook Neo.
+
+config DRM_APPLE_NEO_AUDIO
+	bool "DisplayPort/HDMI Audio support"
+	default y
+	depends on DRM_APPLE_NEO
+	depends on SND
+	select SND_PCM
+	select SND_DMAENGINE_PCM
+
+config DRM_APPLE_NEO_DEBUG
+	bool "Enable additional driver debugging"
+	depends on DRM_APPLE_NEO
+	depends on EXPERT # only for developers
+
+config DRM_APPLE_NEO_KUNIT_TEST
+	tristate "KUnit tests for Apple display controller" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Build tests for the Apple display driver's AFK ring parser and
+	  backlight policy (takeover, DPMS, suspend and present completion).
+	  The tests cover the header strides used by older firmware and
+	  larger rings, as well as malformed ring size combinations.
+	  This option is intended for developer test kernels.
+	  Also test the Type-C modeset, hotplug and service ownership state.
