@@ -1372,6 +1372,17 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	if (IS_ERR_OR_NULL(dchid->dc)) {
 		return PTR_ERR(dchid->dc);
 	}
+
+	/*
+	 * Keyboard and trackpad input wakes the system. The coprocessor keeps
+	 * running across suspend-to-idle and keeps sending reports through
+	 * the FIFO, so its receive interrupt is the wake interrupt. Without
+	 * it the machine still works, it just cannot be woken from here.
+	 */
+	ret = dockchannel_init_wakeup(dchid->dc);
+	if (ret)
+		dev_warn(dev, "Failed to set up wakeup: %d\n", ret);
+
 	dchid->new_iface_wq = alloc_workqueue("dchid-new", WQ_MEM_RECLAIM, 0);
 	if (!dchid->new_iface_wq)
 		return -ENOMEM;
