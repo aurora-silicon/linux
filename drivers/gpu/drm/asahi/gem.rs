@@ -296,6 +296,16 @@ impl DriverObject for AsahiObject {
         })
     }
 
+    /// Objects the DRM core allocates for us (dma-bufs imported from other devices and dumb
+    /// buffers) are shared user objects, like a GEM_CREATE object without flags.
+    fn core_object_args(_dev: &AsahiDevice, _size: usize) -> Result<Self::Args> {
+        Ok(AsahiObjConfig {
+            flags: 0,
+            exportable: true,
+            kernel: false,
+        })
+    }
+
     /// Callback to drop all mappings for a GEM object owned by a given `File`
     fn close(obj: &<Self::Driver as drm::Driver>::Object, file: &drm::gem::DriverFile<Self>) {
         // fn close(obj: &Object, file: &DrmFile) {
