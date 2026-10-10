@@ -12,6 +12,8 @@
 #include <linux/irqchip/chained_irq.h>
 #include <linux/irqdomain.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeirq.h>
+#include <linux/pm_wakeup.h>
 #include <linux/soc/apple/dockchannel.h>
 #include <linux/unaligned.h>
 #include <linux/of.h>
@@ -263,6 +265,30 @@ struct dockchannel *dockchannel_init(struct platform_device *pdev)
 }
 EXPORT_SYMBOL(dockchannel_init);
 
+/**
+ * dockchannel_init_wakeup() - Let data from the remote side wake the system
+ * @dockchannel: FIFO returned by dockchannel_init()
+ *
+ * Make the FIFO's device a wakeup source, enabled by default, with the
+ * receive interrupt as its wake interrupt. While wakeup is enabled for the
+ * device, the PM core keeps that interrupt armed across system sleep, and
+ * data that arrives then wakes the system. The data itself is read after
+ * resume, as usual.
+ *
+ * Return: 0 on success, or a negative error code.
+ */
+int dockchannel_init_wakeup(struct dockchannel *dockchannel)
+{
+	int ret;
+
+	ret = devm_device_init_wakeup(dockchannel->dev);
+	if (ret)
+		return ret;
+
+	return devm_pm_set_wake_irq(dockchannel->dev, dockchannel->rx_irq);
+}
+EXPORT_SYMBOL(dockchannel_init_wakeup);
+
 
 /* Dockchannel IRQchip */
 
@@ -308,11 +334,18 @@ static void dockchannel_irq_unmask(struct irq_data *data)
 	writel_relaxed(val | BIT(hwirq), dcc->irq_base + IRQ_MASK);
 }
 
+/*
+ * The controller hangs off a single chained AIC interrupt, which the IRQ core
+ * never disables for system sleep and which keeps being delivered in
+ * suspend-to-idle. A FIFO interrupt left unmasked can therefore end a
+ * suspend-to-idle without configuring anything, here or in the AIC.
+ */
 static const struct irq_chip dockchannel_irqchip = {
 	.name = "dockchannel-irqc",
 	.irq_ack = dockchannel_irq_ack,
 	.irq_mask = dockchannel_irq_mask,
 	.irq_unmask = dockchannel_irq_unmask,
+	.flags = IRQCHIP_SKIP_SET_WAKE,
 };
 
 static int dockchannel_irq_domain_map(struct irq_domain *d, unsigned int virq,
