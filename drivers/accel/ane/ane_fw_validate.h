@@ -22,7 +22,7 @@
 #ifndef __ANE_FW_VALIDATE_H__
 #define __ANE_FW_VALIDATE_H__
 
-/* FWIM surface size = config+0x138 byte-count = 0x500000 (Main
+/* FWIM surface size = 0x500000 bytes (Main
  * 2026-09-20, audit 751caa4, T6021). Covers the selene vmsize 0x4fc000
  * and the bia vmsize 0x4ec000; NOT derivable from the blob length.
  */
@@ -269,10 +269,10 @@ ane_fw_validate_blob(const u8 *blob, size_t size,
  * whose key <= the chip revision: header {type 1, flags 3 (20-byte
  * records), capacity 0x24, count, u32 key}, then {u32 offset, u64 mask,
  * u64 value} per record (iBoot table offsets carry flag bit 30; the
- * block does not). Source: iBootStage2 macOS 26.6.2 (25G83), LZFSE, not
- * encrypted (receipts/2026-10-01-t8112-optin). The 13.5 iBoot2 that
- * preloads the 13.5 image is encrypted; on T6021 its block (the
- * captures) equals the 25G83 records exactly.
+ * block does not). Source: the 25G83 iBoot's records
+ * (receipts/2026-10-01-t8112-optin). On T6021 the block that the 13.5
+ * iBoot leaves in the preloaded image (the captures) equals the 25G83
+ * records exactly.
  */
 struct ane_asc_tunable {
 	u32 off;
@@ -395,7 +395,7 @@ static const struct ane_asc_tunables ane_t8112_asc_tunables = {
 };
 
 /* T8112 RTK_soc_revision from its two eFuse words at 0x23d2c8060, as
- * iBootStage2 25G83 j413 0x40270 (and j415/j473/j493) computes it:
+ * iBoot (25G83, on j413 and j415/j473/j493) computes it:
  * bits 2:0 = w0[29:27], bits 6:4 = {w1[0], w0[31:30]}.
  */
 static inline u32 ane_t8112_fuse_revision(u32 w0, u32 w1)

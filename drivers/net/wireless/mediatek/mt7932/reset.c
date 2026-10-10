@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* J700 MT7932 mapped preparation and function-scoped reset.
- * Clean-room contracts: NEO_MT7932_DEVICE_RESET_UNLOAD_CONTRACT.md and
- * NEO_MT7932_FLR_PREPARATION_RESOLVED.md. No secondary-bus reset fallback.
+ * Covers device reset, firmware unload and FLR preparation.
+ * No secondary-bus reset fallback.
  */
 #include "mt7932.h"
 

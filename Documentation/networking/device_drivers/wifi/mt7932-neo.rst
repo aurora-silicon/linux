@@ -7,10 +7,8 @@ J700 MT7932 Wi-Fi uses cfg80211 and NetworkManager with firmware-managed
 WPA2-CCMP authentication. Bluetooth uses a transport on the radio's second
 PCIe function.
 
-The Wi-Fi import is pinned to
-``aurora-silicon/linux-neo-cleanroom-eryk-with-wifi``, commit
-``610cb463c03f9bc68a5d020e7ca443af1fda4856``, with configuration, scan IE and
-WPA2 AKM compatibility fixes. Existing source notices are retained.
+The Wi-Fi driver carries configuration, scan IE and WPA2 AKM compatibility
+fixes on top of its original import. Existing source notices are retained.
 Co-authored by DJ (DjDeveloperr), Ace (Acelogic), and Ryan Murray.
 
 Platform and configuration

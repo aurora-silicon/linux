@@ -111,11 +111,11 @@ pub(crate) struct KeybagCreate {
 /// Which key-store protocol the enclave speaks. It follows the sepOS the
 /// firmware hands the SEP, not the SoC alone: the T8103 stub boots macOS 13.5
 /// (22G74)'s sepOS, whose request shapes are those of the 13.5
-/// `AppleSEPKeyStore`; the T6020 sepOS is newer.
+/// key store; the T6020 sepOS is newer.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyStore {
     /// macOS 13.5's key store. Before any other request the endpoint is
-    /// initialised as `AppleKeyStore::init_sep_endpoint` does it: `0x4d`, then
+    /// initialised with `0x4d`, then
     /// `set_env` carrying the ADT's `/defaults` `cpx-encryption-mode`.
     Sepos13 { cpx_encryption_mode: u32 },
     /// The hardware-verified T6020 encoding (variant-5 create).
@@ -169,7 +169,7 @@ const T8103: PlatformProfile = PlatformProfile {
     dart_range_required: false,
     wide_dma_mask: false,
     firmware_region: c"sepfw",
-    // macOS 13.5's AppleKeyStore::identity_create (0xfffffe000994b2d8):
+    // The 13.5 key store creates an identity bag with
     // version 2, type 0x400000, parent -1 (it accepts only -1 or <= -10).
     keybag_create: KeybagCreate {
         variant: 2,
@@ -276,7 +276,7 @@ const T8140: PlatformProfile = PlatformProfile {
     wide_dma_mask: true,
     firmware_region: c"sepfw",
     // J700 hardware refused the strict encoding and accepted this T6020 form
-    // (linux-aurora commit 18165cf1de, 2026-09-19).
+    // (first verified on hardware 2026-09-19).
     keybag_create: KeybagCreate {
         variant: 5,
         bag_type: 0,

@@ -179,7 +179,7 @@ static void apple_mbox_ascwrap_v6_stop_cpu_locked(struct apple_mbox *mbox)
 	cpu_control = (u8 __iomem *)mbox->wrapper_regs +
 		      APPLE_ASCWRAP_V6_CPU_CONTROL;
 
-	/* AppleASCWrapV6::_runCPU(false): clear RUN, reread, clear bit 5. */
+	/* Stop: clear RUN, reread, clear bit 5. */
 	val = readl(cpu_control);
 	writel(val & ~APPLE_ASCWRAP_V6_CPU_RUN, cpu_control);
 	val = readl(cpu_control);
@@ -239,7 +239,7 @@ int apple_mbox_ascwrap_v6_start_cpu(struct apple_mbox *mbox)
 	cpu_control = (u8 __iomem *)mbox->wrapper_regs +
 		      APPLE_ASCWRAP_V6_CPU_CONTROL;
 
-	/* AppleASCWrapV6::_runCPU(true): read, set RUN, write. */
+	/* Start: read, set RUN, write. */
 	val = readl(cpu_control);
 	writel(val | APPLE_ASCWRAP_V6_CPU_RUN, cpu_control);
 	mbox->ascwrap_v6_cpu_running = true;

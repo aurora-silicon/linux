@@ -103,8 +103,8 @@
 #include <drm/ane_accel.h>
 
 /* Doorbell (IPI) block, engine + 0x1844000: set +0, pending +0x8000,
- * ack +0xc000 (kext aneInterruptHandler reads +0x184c000 and writes
- * +0x1850000 with no SoC branch, receipts/2026-10-01-t8112-ane).
+ * ack +0xc000 (an interrupt is handled by reading +0x184c000 and writing
+ * +0x1850000, with no SoC difference, receipts/2026-10-01-t8112-ane).
  */
 #define ANE_IPI_OFF			0x1844000
 
@@ -155,7 +155,7 @@ MODULE_PARM_DESC(start_app_eps,
 static bool scratch3_ack = true;
 module_param(scratch3_ack, bool, 0444);
 MODULE_PARM_DESC(scratch3_ack,
-		 "After DONE, write SCRATCH3 = 0x08042006 (selene 0x7edc, kext 0x95eaee4). Default on; 0 withholds.");
+		 "After DONE, write SCRATCH3 = 0x08042006 (host ack). Default on; 0 withholds.");
 
 static bool legacy_only = true;
 module_param(legacy_only, bool, 0444);
@@ -479,7 +479,7 @@ static void ane_rtclient_validate_chman(struct ane_rtclient *ane)
 
 /* Legacy ChMan exchange (post-DONE 13.5 transport). Resends to the same
  * 64-byte IO slot would wedge the ring; cursor advances after each
- * completed command (selene fw decodes bit0 = host-owned).
+ * completed command (the fw treats bit0 as host-owned).
  */
 static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 					struct ane_legacy_buffer *command,
@@ -1672,9 +1672,9 @@ static int ane_t6021_prog_load_ioctl(struct drm_device *drm, void *data,
 }
 
 /* Firmware perf mode: CSNE_CMD_CH_PROPERTY_WRITE (0x1f), channel 0,
- * property 0x10aa, value 1. macOS sends it once during power-on (H13
- * kext evidence in the omarchy-ane perf-mode receipt); the selene 13.5
- * fw routes it to CAneEngineExeLoop::setPerfMode. It is a runtime
+ * property 0x10aa, value 1. macOS sends it once during power-on (see
+ * the omarchy-ane perf-mode receipt); the 13.5 firmware treats it as
+ * its engine perf-mode switch. It is a runtime
  * switch (write 1 to /sys/module/ane_t6021/parameters/fw_perf_mode) so
  * its effect on call time can be measured on one boot. Only 1 is
  * accepted: no other value is known to be safe.
@@ -2098,7 +2098,7 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 		pm_runtime_disable(dev);
 		return -EPROBE_DEFER;
 	}
-	/* T8112: the kext (type 0x70) opens PWGATE (bits 29:28 = 0) before
+	/* T8112: macOS (type 0x70) opens PWGATE (bits 29:28 = 0) before
 	 * the ps words. This driver only reads it: an engine read behind a
 	 * closed gate is untested, so it refuses first.
 	 */
