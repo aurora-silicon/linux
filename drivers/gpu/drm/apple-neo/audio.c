@@ -813,4 +813,3 @@ void __exit neo_dcp_audio_unregister(void)
 {
         platform_driver_unregister(&neo_dcpaud_driver);
 }
-

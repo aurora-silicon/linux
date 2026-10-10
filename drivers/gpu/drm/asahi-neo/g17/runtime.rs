@@ -1179,4 +1179,3 @@ impl super::Firmware {
         Ok(())
     }
 }
-
