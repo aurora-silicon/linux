@@ -4,6 +4,7 @@ config DRM_APPLE_NEO
 	depends on DRM && OF && ARM64
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on APPLE_RTKIT
+	depends on TYPEC
 	depends on OF_ADDRESS
 	select APPLE_PMP_REPORT
 	select DRM_CLIENT_SELECTION
