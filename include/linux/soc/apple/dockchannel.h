@@ -15,6 +15,7 @@
 struct dockchannel;
 
 struct dockchannel *dockchannel_init(struct platform_device *pdev);
+int dockchannel_init_wakeup(struct dockchannel *dockchannel);
 
 int dockchannel_send(struct dockchannel *dockchannel, const void *buf, size_t count);
 int dockchannel_recv(struct dockchannel *dockchannel, void *buf, size_t count);
