@@ -155,6 +155,7 @@ impl State {
 pub(super) trait Host: Memory + Queues {
     fn recovery(&self) -> &State;
     fn recovery_mut(&mut self) -> &mut State;
+    fn report_recovery(&self, _generation: u64, _blamed: Option<u8>, _sources: &Sources) {}
 }
 
 /// Performs one pending restart. The caller has closed preparation admission and joined all
@@ -196,6 +197,7 @@ pub(super) fn service<H: Host>(
         host.clear_timestamps()?;
     }
     let mut sources = host.fault_sources()?;
+    host.report_recovery(request.generation, request.blamed, &sources);
     let target_error = host.publish_recovery_targets();
     host.transition(1, 2)?;
     let mut recovered = false;

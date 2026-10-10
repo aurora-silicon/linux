@@ -925,24 +925,25 @@ impl Queue {
         self.retirement_proved = false;
         self.replay_retirement = false;
         self.spared_deferred = false;
-        if self.spared_quarantine {
-            self.spared_quarantine = false;
-            self.quarantine_error = None;
-            self.submitted = 0;
-            self.kick.clear_parent_after_recovery();
-            self.quarantined = false;
-            self.retire_pending = false;
-            self.retirement_ready = true;
-            if self
-                .previous
-                .as_ref()
-                .is_some_and(|p| p.publication.is_some())
-            {
-                drop(self.previous.take());
-            }
-            if self.released {
-                self.owner = None;
-            }
+        // The complete retirement witness also covers guilty work. Keep its
+        // VM status failed, but let logical close return the retained physical
+        // queue to service instead of consuming another QID for its successor.
+        self.spared_quarantine = false;
+        self.quarantine_error = None;
+        self.submitted = 0;
+        self.kick.clear_parent_after_recovery();
+        self.quarantined = false;
+        self.retire_pending = false;
+        self.retirement_ready = true;
+        if self
+            .previous
+            .as_ref()
+            .is_some_and(|p| p.publication.is_some())
+        {
+            drop(self.previous.take());
+        }
+        if self.released {
+            self.owner = None;
         }
         Ok(())
     }
@@ -1486,6 +1487,28 @@ pub(crate) trait Host {
 }
 
 impl Queue {
+    /// Snapshot only while publication is closed and firmware is halted.
+    pub(crate) fn recovery_diagnostics(&self) -> impl core::fmt::Debug + '_ {
+        let command = self.active.front().and_then(|active| {
+            if let crate::g17::command::Validated::Compute {
+                cdm_va, cdm_end_va, sampler_count, scratch, ..
+            } = &active.packet.command {
+                Some((*cdm_va, *cdm_end_va, *sampler_count, scratch.enabled()))
+            } else {
+                None
+            }
+        });
+        (
+            self.owner,
+            self.context().map(|context| (context.id(), context.generation())),
+            self.ordinal,
+            self.active.len,
+            self.graph.cursors(),
+            self.graph.stamp(),
+            command,
+        )
+    }
+
     pub(crate) fn spared_pending(&self) -> bool {
         self.quarantined && self.spared_quarantine && self.awaiting_witness
     }

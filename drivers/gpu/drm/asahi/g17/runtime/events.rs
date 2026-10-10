@@ -109,6 +109,42 @@ impl recovery::Host for Service<'_> {
     fn recovery_mut(&mut self) -> &mut recovery::State {
         &mut self.firmware.recovery
     }
+    fn report_recovery(&self, generation: u64, blamed: Option<u8>, sources: &recovery::Sources) {
+        dev_warn!(
+            self.firmware.primary.state.shared.dev.as_ref(),
+            "G17 firmware recovery: generation={} qid={:?} reason={:?} slots={:?}\n",
+            generation,
+            blamed,
+            sources.reason,
+            sources.diagnostics()
+        );
+        let Some(qid) = blamed else {
+            return;
+        };
+        for queue in self.firmware.queues.compute.iter().flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .filter(|queue| queue.qid() == qid)
+        {
+            dev_warn!(
+                self.firmware.primary.state.shared.dev.as_ref(),
+                "G17 recovery compute: qid={} (owner, context/generation, ordinal, active, cursors, stamp, CDM/samplers/scratch)={:?}\n",
+                qid,
+                queue.recovery_diagnostics()
+            );
+        }
+        if let Some((qids, owner, context, generation)) =
+            self.firmware.queues.render_recovery_diagnostics(qid)
+        {
+            dev_warn!(
+                self.firmware.primary.state.shared.dev.as_ref(),
+                "G17 recovery render: qids={:?} owner={:?} context={} generation={}\n",
+                qids,
+                owner,
+                context,
+                generation
+            );
+        }
+    }
 }
 
 impl recovery::Memory for Service<'_> {

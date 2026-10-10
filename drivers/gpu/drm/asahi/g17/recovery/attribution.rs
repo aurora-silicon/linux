@@ -6,7 +6,7 @@ pub(super) const SLOTS: usize = 16;
 const STAMP_MASK: u64 = (1 << 40) - 1;
 const PAGE_FAULT: u32 = 3;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Source {
     slot: u8,
     qid: Option<u8>,
@@ -30,6 +30,11 @@ pub(super) enum Attribution {
 }
 
 impl Sources {
+    /// Selected slot identities only; unused records carry no diagnostic evidence.
+    pub(crate) fn diagnostics(&self) -> impl core::fmt::Debug + '_ {
+        (self.mask, &self.records[..self.count])
+    }
+
     /// Firmware is halted for every selected key and progress-record read.
     /// Failed reads stay unknown; incomplete evidence cannot override firmware blame.
     pub(crate) fn sample(mask: u32, mut read: impl FnMut(usize) -> Option<(u64, u32)>) -> Self {
