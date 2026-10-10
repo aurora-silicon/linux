@@ -20,6 +20,21 @@
 #include <linux/platform_device.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/unaligned.h>
+#include <linux/debugfs.h>
+#include <linux/hex.h>
+#include <linux/seq_file.h>
+#include <linux/moduleparam.h>
+
+/* DIAG (test only, never for publication) */
+static bool smcdiag_quiet_events;
+module_param_named(quiet_events, smcdiag_quiet_events, bool, 0644);
+MODULE_PARM_DESC(quiet_events, "DIAG: log SMC notifications but do not deliver them to sub-drivers");
+static bool smcdiag_log_events = true;
+module_param_named(log_events, smcdiag_log_events, bool, 0644);
+MODULE_PARM_DESC(log_events, "DIAG: log every SMC notification");
+static bool smcdiag_log_cmds;
+module_param_named(log_cmds, smcdiag_log_cmds, bool, 0644);
+MODULE_PARM_DESC(log_cmds, "DIAG: log every AP->SMC command (cmd/key)");
 
 #define SMC_ENDPOINT			0x20
 
@@ -79,6 +94,12 @@ static int apple_smc_cmd_locked(struct apple_smc *smc, u64 cmd, u64 arg,
 	       FIELD_PREP(SMC_WSIZE, wsize) |
 	       FIELD_PREP(SMC_ID, smc->msg_id) |
 	       FIELD_PREP(SMC_DATA, arg));
+
+	if (smcdiag_log_cmds) {
+		__be32 be = cpu_to_be32((u32)arg);
+
+		dev_info(smc->dev, "smcdiag: cmd %#llx key %.4s size %llu\n", cmd, (char *)&be, size);
+	}
 
 	ret = apple_rtkit_send_message(smc->rtk, SMC_ENDPOINT, msg, NULL, false);
 	if (ret) {
@@ -384,8 +405,119 @@ static void apple_smc_rtkit_recv(void *cookie, u8 endpoint, u64 message)
 		return;
 	}
 
+	if (smcdiag_log_events)
+		dev_info(smc->dev, "smcdiag: event %#llx\n", (unsigned long long)FIELD_GET(SMC_DATA, message));
+	if (smcdiag_quiet_events)
+		return;
 	blocking_notifier_call_chain(&smc->event_handlers, FIELD_GET(SMC_DATA, message), NULL);
 }
+
+/*
+ * DIAG (test only): debugfs
+ *   smcdiag_key:  write "XXXX" to select a key; read returns info + value bytes.
+ *                 write "NTAP=0" / "NTAP=1" toggles notifications.
+ *                 write "W:XXXX:hexbytes" writes the key (result logged + returned).
+ *   smcdiag_keys: read enumerates every key: index name type size flags.
+ */
+static smc_key smcdiag_sel;
+static struct apple_smc *smcdiag_smc;
+
+static int smcdiag_hex(const char *s, u8 *out, int max)
+{
+	int n = 0;
+
+	while (s[0] && s[1] && n < max) {
+		int hi = hex_to_bin(s[0]), lo = hex_to_bin(s[1]);
+
+		if (hi < 0 || lo < 0)
+			return -EINVAL;
+		out[n++] = (hi << 4) | lo;
+		s += 2;
+	}
+	return n;
+}
+
+static ssize_t smcdiag_key_write(struct file *f, const char __user *ub, size_t cnt, loff_t *pos)
+{
+	char b[80] = {};
+	int ret;
+
+	if (cnt < 4 || cnt >= sizeof(b) || copy_from_user(b, ub, cnt))
+		return -EINVAL;
+	if (b[cnt - 1] == '\n')
+		b[cnt - 1] = 0;
+	if (!strncmp(b, "NTAP=", 5)) {
+		bool on = b[5] == '1';
+
+		ret = apple_smc_write_flag(smcdiag_smc, SMC_KEY(NTAP), on);
+		dev_info(smcdiag_smc->dev, "smcdiag: NTAP=%d ret=%d\n", on, ret);
+		return ret ? ret : cnt;
+	}
+	if (!strncmp(b, "W:", 2) && strlen(b) >= 8 && b[6] == ':') {
+		smc_key key = (b[2] << 24) | (b[3] << 16) | (b[4] << 8) | b[5];
+		u8 v[32];
+		int n = smcdiag_hex(b + 7, v, sizeof(v));
+
+		if (n <= 0)
+			return -EINVAL;
+		ret = apple_smc_write(smcdiag_smc, key, v, n);
+		dev_info(smcdiag_smc->dev, "smcdiag: write %.4s (%d bytes) ret=%d\n", b + 2, n, ret);
+		return ret < 0 ? ret : cnt;
+	}
+	smcdiag_sel = (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
+	return cnt;
+}
+
+static ssize_t smcdiag_key_read(struct file *f, char __user *ub, size_t cnt, loff_t *pos)
+{
+	struct apple_smc_key_info info;
+	u8 v[32] = {};
+	char out[160];
+	int ret, n, i;
+
+	ret = apple_smc_get_key_info(smcdiag_smc, smcdiag_sel, &info);
+	if (ret < 0) {
+		n = scnprintf(out, sizeof(out), "info err %d\n", ret);
+	} else {
+		ret = apple_smc_read(smcdiag_smc, smcdiag_sel, v, min_t(size_t, info.size, sizeof(v)));
+		n = scnprintf(out, sizeof(out), "type %.4s size %u flags %#x ret %d:", (char *)&info.type_code,
+			      info.size, info.flags, ret);
+		for (i = 0; i < min_t(int, info.size, sizeof(v)); i++)
+			n += scnprintf(out + n, sizeof(out) - n, " %02x", v[i]);
+		n += scnprintf(out + n, sizeof(out) - n, "\n");
+	}
+	return simple_read_from_buffer(ub, cnt, pos, out, n);
+}
+
+static const struct file_operations smcdiag_key_fops = {
+	.owner = THIS_MODULE, .open = simple_open, .read = smcdiag_key_read, .write = smcdiag_key_write,
+};
+
+static int smcdiag_keys_show(struct seq_file *s, void *data)
+{
+	struct apple_smc *smc = smcdiag_smc;
+	int i;
+
+	seq_printf(s, "#KEY %u\n", smc->key_count);
+	for (i = 0; i < smc->key_count; i++) {
+		struct apple_smc_key_info info = {};
+		smc_key key = 0;
+		__be32 be;
+		int ret;
+
+		ret = apple_smc_get_key_by_index(smc, i, &key);
+		if (ret < 0) {
+			seq_printf(s, "%d ERR %d\n", i, ret);
+			continue;
+		}
+		be = cpu_to_be32(key);
+		ret = apple_smc_get_key_info(smc, key, &info);
+		seq_printf(s, "%d %.4s %.4s %u %#x%s\n", i, (char *)&be, (char *)&info.type_code,
+			   info.size, info.flags, ret < 0 ? " INFOERR" : "");
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(smcdiag_keys);
 
 static const struct apple_rtkit_ops apple_smc_rtkit_ops = {
 	.crashed = apple_smc_rtkit_crashed,
@@ -475,6 +607,9 @@ static int apple_smc_probe(struct platform_device *pdev)
 
 	/* Enable notifications */
 	apple_smc_write_flag(smc, SMC_KEY(NTAP), true);
+	smcdiag_smc = smc;
+	debugfs_create_file("smcdiag_key", 0600, NULL, NULL, &smcdiag_key_fops);
+	debugfs_create_file("smcdiag_keys", 0400, NULL, NULL, &smcdiag_keys_fops);
 	ret = devm_add_action_or_reset(dev, apple_smc_disable_notifications, smc);
 	if (ret)
 		return ret;
