@@ -308,7 +308,7 @@ impl Queue {
         if self.id.engine != DataMaster::Compute {
             return Err(EINVAL);
         }
-        fence(Ordering::SeqCst);
+        mem::sync();
         for asid in 0..4 {
             mem::tlbi_range_or_asid(asid, self.low_va() as usize, KICK_RING_SIZE);
             mem::tlbi_range_or_asid(asid, self.firmware_va() as usize, KICK_RING_SIZE);
