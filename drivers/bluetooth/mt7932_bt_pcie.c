@@ -8,6 +8,7 @@
  * transport arena and uses the firmware quiesce/restore handshake. Unload
  * releases DMA only after the PCI function has stopped bus mastering.
  */
+#include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
@@ -112,6 +113,7 @@ struct bt7932 {
 	struct work_struct tx_work;
 	struct sk_buff_head tx_queue;
 	wait_queue_head_t wake_wait;
+	struct completion hci_idle;
 	struct bt7932_ring rings[BT7932_CHANNELS];
 	void *arena;
 	dma_addr_t arena_dma;
@@ -1089,6 +1091,7 @@ static int bt7932_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	bt->last_sleep = U32_MAX;
 	mutex_init(&bt->lock);
 	init_waitqueue_head(&bt->wake_wait);
+	init_completion(&bt->hci_idle);
 	skb_queue_head_init(&bt->tx_queue);
 	INIT_WORK(&bt->tx_work, bt7932_tx_work);
 	msleep(100);
@@ -1164,6 +1167,8 @@ static int bt7932_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	bt->hdev->hw_error = bt7932_hw_error;
 	hci_set_quirk(bt->hdev, HCI_QUIRK_RESET_ON_CLOSE);
 	hci_set_quirk(bt->hdev, HCI_QUIRK_NON_PERSISTENT_SETUP);
+	/* System sleep suspends HCI from bt7932_suspend(), after the freeze. */
+	hci_set_quirk(bt->hdev, HCI_QUIRK_NO_SUSPEND_NOTIFIER);
 	ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
 	if (ret < 0)
 		goto fail;
@@ -1269,6 +1274,38 @@ static int bt7932_restore_transport(struct bt7932 *bt)
 	return ret;
 }
 
+static int bt7932_hci_idle(struct hci_dev *hdev, void *data)
+{
+	return 0;
+}
+
+static void bt7932_hci_idle_done(struct hci_dev *hdev, void *data, int err)
+{
+	complete(data);
+}
+
+/*
+ * hci_suspend_dev() cancels a command that is still waiting for its
+ * completion. Userspace can queue HCI work right up to the freeze (sound
+ * servers unregister their profiles when the session goes inactive, which
+ * rewrites the class and EIR), so let that work finish first.
+ */
+static void bt7932_wait_hci_idle(struct bt7932 *bt)
+{
+	reinit_completion(&bt->hci_idle);
+	if (hci_cmd_sync_queue(bt->hdev, bt7932_hci_idle, &bt->hci_idle,
+			       bt7932_hci_idle_done))
+		return;
+	if (!wait_for_completion_timeout(&bt->hci_idle, HCI_CMD_TIMEOUT))
+		dev_warn(&bt->pdev->dev, "HCI work still pending at suspend\n");
+}
+
+/* Like the HCI PM notifier, leave a user channel device to userspace. */
+static bool bt7932_hci_pm(struct bt7932 *bt)
+{
+	return !hci_dev_test_flag(bt->hdev, HCI_USER_CHANNEL);
+}
+
 static int bt7932_suspend(struct device *dev)
 {
 	struct bt7932 *bt = pci_get_drvdata(to_pci_dev(dev));
@@ -1278,9 +1315,12 @@ static int bt7932_suspend(struct device *dev)
 		return -EIO;
 	if (!bt->registered)
 		return 0;
-	ret = hci_suspend_dev(bt->hdev);
-	if (ret)
-		return ret;
+	if (bt7932_hci_pm(bt)) {
+		bt7932_wait_hci_idle(bt);
+		ret = hci_suspend_dev(bt->hdev);
+		if (ret)
+			return ret;
+	}
 	ret = bt7932_quiesce(bt);
 	if (!ret) {
 		dev_dbg(dev, "system sleep quiesce acknowledged\n");
@@ -1290,7 +1330,8 @@ static int bt7932_suspend(struct device *dev)
 	/* Undo our request before the PM core rolls back the rest of the bus. */
 	if (!READ_ONCE(bt->fault))
 		bt7932_restore_transport(bt);
-	hci_resume_dev(bt->hdev);
+	if (bt7932_hci_pm(bt))
+		hci_resume_dev(bt->hdev);
 	return ret;
 }
 
@@ -1309,7 +1350,7 @@ static int bt7932_resume(struct device *dev)
 			return ret;
 	}
 	dev_dbg(dev, "transport restored after system sleep\n");
-	return hci_resume_dev(bt->hdev);
+	return bt7932_hci_pm(bt) ? hci_resume_dev(bt->hdev) : 0;
 }
 
 static int bt7932_freeze(struct device *dev)
