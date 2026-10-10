@@ -8,6 +8,12 @@ pub(crate) fn admit(j613: bool, t8122: bool, compat: &[u32], marker: u32, intent
     j613 && t8122 && compat == COMPAT && marker == 1 && intent == 1
 }
 
+/// A /chosen switch from m1n1.conf: m1n1 writes `chosen.<name>=1` as the
+/// string "1" (two bytes); a big-endian u32 1 is accepted as well.
+pub(crate) fn chosen_switch_on(value: Option<&[u8]>) -> bool {
+    matches!(value, Some(b"1\0") | Some([0, 0, 0, 1]))
+}
+
 #[cfg(not(test))]
 pub(crate) fn selected(pdev: &kernel::platform::Device<kernel::device::Core>) -> kernel::error::Result<bool> {
     use kernel::{bindings, c_str, prelude::*};
@@ -24,11 +30,12 @@ pub(crate) fn selected(pdev: &kernel::platform::Device<kernel::device::Core>) ->
     let mut length = 0;
     // SAFETY: the owned reference keeps the property alive through the read below.
     let raw = unsafe { bindings::of_get_property(chosen, c_str!("asahi,t8122-gpu").as_char_ptr(), &mut length) };
-    let intent = if !raw.is_null() && length == 4 {
-        // SAFETY: this property has exactly four bytes, checked above.
-        let bytes = unsafe { core::slice::from_raw_parts(raw.cast::<u8>(), 4) };
-        u32::from_be_bytes(bytes.try_into().map_err(|_| EINVAL)?)
-    } else { 0 };
+    // m1n1 sets chosen.asahi,t8122-gpu=1 from m1n1.conf as the string "1".
+    let value = if raw.is_null() || !(0..=4).contains(&length) { None } else {
+        // SAFETY: the property has `length` (at most four) bytes, checked above.
+        Some(unsafe { core::slice::from_raw_parts(raw.cast::<u8>(), length as usize) })
+    };
+    let intent = u32::from(chosen_switch_on(value));
     // SAFETY: releases the reference returned by the lookup.
     unsafe { bindings::of_node_put(chosen) };
     let marker = node.get_property::<u32>(c_str!("apple,j613-25g83-gpu-handoff")).unwrap_or(0);
@@ -154,6 +161,15 @@ mod tests {
         assert!(!admit(true,true,&COMPAT,0,1));
         assert!(!admit(true,true,&COMPAT,1,0));
         assert!(!admit(true,true,&COMPAT,2,1));
+    }
+    #[test]
+    fn chosen_switch_accepts_m1n1_string_and_u32() {
+        assert!(chosen_switch_on(Some(b"1\0")));
+        assert!(chosen_switch_on(Some(&[0,0,0,1])));
+        for v in [&b""[..], b"1", b"0\0", b"11\0", &[0,0,0,2], &[1,0,0,0]] {
+            assert!(!chosen_switch_on(Some(v)), "{v:?}");
+        }
+        assert!(!chosen_switch_on(None));
     }
     #[test]
     fn uses_this_macs_voltage_sram_frequency_and_power() {
