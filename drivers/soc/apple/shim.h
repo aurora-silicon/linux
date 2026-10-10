@@ -27,6 +27,7 @@ void sep_cancel_delayed_work_sync(void *work);
 
 int sep_pm_register(int (*event)(bool entering));
 void sep_pm_unregister(void);
+int sep_pm_keep_domains(void *dev);
 
 /* -- hwrng_shim.c ------------------------------------------------------- */
 

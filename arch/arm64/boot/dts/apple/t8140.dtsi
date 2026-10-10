@@ -645,7 +645,11 @@
 			mboxes = <&sep_mbox>;
 			mbox-names = "mbox";
 			iommus = <&sep_dart 0>;
-			power-domains = <&ps_sep>;
+			/*
+			 * The enclave stops reading its mailbox for good once
+			 * the GPIO power state is switched off under it.
+			 */
+			power-domains = <&ps_sep>, <&ps_gpio>;
 			status = "disabled";
 		};
 

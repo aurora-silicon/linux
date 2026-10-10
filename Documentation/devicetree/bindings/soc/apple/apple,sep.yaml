@@ -33,7 +33,13 @@ properties:
     maxItems: 1
 
   power-domains:
-    maxItems: 1
+    minItems: 1
+    items:
+      - description: The SEP's own power state.
+      - description:
+          A power state the SEP depends on while it runs. On T8140 this is
+          the GPIO power state; the SEP stops servicing its mailbox for good
+          once that is switched off.
 
   memory-region:
     maxItems: 1

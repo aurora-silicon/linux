@@ -23,6 +23,20 @@ static SEP: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 extern "C" {
     fn sep_pm_register(event: unsafe extern "C" fn(bool) -> c_int) -> c_int;
     fn sep_pm_unregister();
+    fn sep_pm_keep_domains(dev: *mut c_void) -> c_int;
+}
+
+/// Attaches every power domain of a multi-domain SEP node and keeps them on
+/// across system sleep; see `pm_shim.c`. Must run before the enclave is first
+/// spoken to.
+pub(crate) fn keep_domains(dev: &kernel::device::Device) -> Result<()> {
+    // SAFETY: `dev` is the bound SEP device; the shim ties what it attaches to
+    // that device's lifetime through devres.
+    let rc = unsafe { sep_pm_keep_domains(dev.as_raw().cast()) };
+    if rc != 0 {
+        return Err(Error::from_errno(rc));
+    }
+    Ok(())
 }
 
 /// # Safety
