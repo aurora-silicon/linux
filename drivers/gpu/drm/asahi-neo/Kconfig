@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0
+config DRM_ASAHI_NEO
+	tristate "Asahi Neo (Apple T8140 G17 GPU)"
+	depends on RUST && DRM=y
+	depends on ARM64 && ARCH_APPLE && MMU && IOMMU_SUPPORT
+	depends on PAGE_SIZE_16KB
+	select RUST_DRM_SCHED
+	select RUST_DRM_GEM_SHMEM_HELPER
+	select RUST_DRM_GPUVM
+	select RUST_APPLE_RTKIT
+	select WANT_DEV_COREDUMP
+	help
+	  Native graphics support for the T8140 G17P GPU in the MacBook Neo.
+	  Uses an independent command interface from the M1/M2/M3 driver.

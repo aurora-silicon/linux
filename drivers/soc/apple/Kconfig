@@ -174,3 +174,29 @@ config APPLE_T6030_DISPLAY_GATE
 endmenu
 
 endif
+
+config APPLE_MCC
+	tristate "Apple T8140 system level cache"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on OF
+	default ARCH_APPLE
+	help
+	  The boot firmware of the Apple T8140 SoC enables the system level
+	  cache without letting it allocate. This driver allows allocation
+	  once the devices that took over DMA from the bootloader are bound.
+
+	  Say 'y' or 'm' here if you have an Apple T8140 SoC.
+
+
+config APPLE_CLPC
+	tristate "Apple host performance controller floors"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on APPLE_PMC && CPU_FREQ
+	select MFD_SYSCON
+	default ARCH_APPLE
+	help
+	  Raises the DRAM controller and SoC fabric performance floors of the
+	  host's PMC voter agent while CPU clusters, and optionally the GPU,
+	  are busy, and releases them at idle.
+
+	  Say 'y' or 'm' here if you have an Apple SoC with a PMC.

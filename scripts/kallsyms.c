@@ -31,7 +31,7 @@
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof(arr[0]))
 
-#define KSYM_NAME_LEN		512
+#define KSYM_NAME_LEN		1024
 
 struct sym_entry {
 	unsigned long long addr;

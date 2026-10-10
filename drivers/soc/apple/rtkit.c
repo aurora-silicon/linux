@@ -100,6 +100,11 @@ bool apple_rtkit_is_crashed(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_is_crashed);
 
+static bool apple_rtkit_coproc_places_buffers(struct apple_rtkit *rtk)
+{
+	return rtk->ops->flags & APPLE_RTKIT_COPROC_PLACES_BUFFERS;
+}
+
 static int apple_rtkit_management_send(struct apple_rtkit *rtk, u8 type,
 					u64 msg)
 {
@@ -110,9 +115,7 @@ static int apple_rtkit_management_send(struct apple_rtkit *rtk, u8 type,
 	ret = apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_MGMT, msg, NULL, false);
 
 	if (ret)
-		dev_err(rtk->dev,
-			"RTKit: Failed to send management message type 0x%02x: %d\n",
-			type, ret);
+		dev_err(rtk->dev, "RTKit: Failed to send management message: %d\n", ret);
 
 	return ret;
 }
@@ -171,6 +174,14 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		set_bit(ep, rtk->endpoints);
 	}
 
+	/*
+	 * For co-processors that place their own buffers, the crashlog
+	 * endpoint is started before the map is acknowledged.
+	 */
+	if (apple_rtkit_coproc_places_buffers(rtk) && base == 0 &&
+	    test_bit(APPLE_RTKIT_EP_CRASHLOG, &bitmap))
+		apple_rtkit_start_ep(rtk, APPLE_RTKIT_EP_CRASHLOG);
+
 	reply = FIELD_PREP(APPLE_RTKIT_MGMT_EPMAP_BASE, base);
 	if (msg & APPLE_RTKIT_MGMT_EPMAP_LAST)
 		reply |= APPLE_RTKIT_MGMT_EPMAP_LAST;
@@ -195,6 +206,10 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		case APPLE_RTKIT_EP_IOREPORT:
 		case APPLE_RTKIT_EP_OSLOG:
 		case APPLE_RTKIT_EP_TRACEKIT:
+			/* already started while handling the map */
+			if (ep == APPLE_RTKIT_EP_CRASHLOG &&
+			    apple_rtkit_coproc_places_buffers(rtk))
+				break;
 			dev_dbg(rtk->dev,
 				"RTKit: Starting system endpoint 0x%02x\n", ep);
 			ret = apple_rtkit_start_ep(rtk, ep);
@@ -345,6 +360,9 @@ reply:
 					    buffer->iova);
 		}
 		apple_rtkit_send_message(rtk, ep, reply, NULL, false);
+	} else if (apple_rtkit_coproc_places_buffers(rtk)) {
+		/* acknowledge the co-processor's own buffer with its request */
+		apple_rtkit_send_message(rtk, ep, msg, NULL, false);
 	}
 
 	return 0;
@@ -397,6 +415,7 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 {
 	u8 type = FIELD_GET(APPLE_RTKIT_SYSLOG_TYPE, msg);
 	u8 *bfr __free(kfree) = NULL;
+	struct apple_rtkit_crashlog_header header;
 
 	if (type != APPLE_RTKIT_CRASHLOG_CRASH) {
 		dev_warn(rtk->dev, "RTKit: Unknown crashlog message: %llx\n",
@@ -422,9 +441,18 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	}
 
 	if (!rtk->crashlog_buffer.size) {
-		apple_rtkit_common_rx_get_buffer(rtk, &rtk->crashlog_buffer,
-						 APPLE_RTKIT_EP_CRASHLOG, msg);
-		return;
+		if (apple_rtkit_common_rx_get_buffer(rtk, &rtk->crashlog_buffer,
+						     APPLE_RTKIT_EP_CRASHLOG, msg))
+			goto unmapped;
+		if (rtk->crashlog_buffer.size < sizeof(header))
+			goto unmapped;
+
+		apple_rtkit_memcpy(rtk, &header, &rtk->crashlog_buffer, 0,
+				   sizeof(header));
+		if (header.fourcc != APPLE_RTKIT_CRASHLOG_HEADER_FOURCC ||
+		    header.size < sizeof(header) ||
+		    header.size > rtk->crashlog_buffer.size)
+			goto unmapped;
 	}
 
 	dev_err(rtk->dev, "RTKit: co-processor has crashed\n");
@@ -447,6 +475,16 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	rtk->crashed = true;
 	if (rtk->ops->crashed)
 		rtk->ops->crashed(rtk->cookie, bfr, bfr ? rtk->crashlog_buffer.size : 0);
+	return;
+
+unmapped:
+	/* An inherited session already negotiated its crash buffer. */
+	if (!rtk->crashlog_inherited)
+		return;
+	dev_err(rtk->dev, "RTKit: adopted co-processor crashed without a readable log\n");
+	rtk->crashed = true;
+	if (rtk->ops->crashed)
+		rtk->ops->crashed(rtk->cookie, NULL, 0);
 }
 
 static void apple_rtkit_ioreport_rx(struct apple_rtkit *rtk, u64 msg)
@@ -516,7 +554,7 @@ static void apple_rtkit_syslog_rx_log(struct apple_rtkit *rtk, u64 msg)
 	if (rtk->syslog_inherited)
 		goto done;
 
-	if (!rtk->syslog_msg_buffer) {
+	if (!rtk->syslog_msg_buffer || !rtk->syslog_msg_size) {
 		dev_warn_ratelimited(
 			rtk->dev,
 			"RTKit: received syslog message but no syslog_msg_buffer\n");
@@ -780,18 +818,21 @@ static void apple_rtkit_mark_running(struct apple_rtkit *rtk)
 	rtk->crashlog_inherited = true;
 }
 
-static void apple_rtkit_claim_rx(struct apple_rtkit *rtk)
+static int apple_rtkit_claim_rx(struct apple_rtkit *rtk)
 {
 	struct apple_mbox *mbox = rtk->mbox;
 	unsigned long flags;
 
 	spin_lock_irqsave(&mbox->rx_lock, flags);
-	if (mbox->rx || mbox->cookie)
-		dev_warn(rtk->dev,
-			 "RTKit: mailbox receiver already claimed, taking it over\n");
+	if (mbox->rx || mbox->cookie) {
+		spin_unlock_irqrestore(&mbox->rx_lock, flags);
+		return -EBUSY;
+	}
 	mbox->cookie = rtk;
 	mbox->rx = apple_rtkit_rx;
 	spin_unlock_irqrestore(&mbox->rx_lock, flags);
+
+	return 0;
 }
 
 static void apple_rtkit_detach_rx(struct apple_rtkit *rtk)
@@ -874,7 +915,9 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	if (adopted)
 		apple_rtkit_mark_running(rtk);
 
-	apple_rtkit_claim_rx(rtk);
+	ret = apple_rtkit_claim_rx(rtk);
+	if (ret)
+		goto destroy_wq;
 
 	ret = apple_mbox_start(rtk->mbox);
 	if (ret)
@@ -885,6 +928,9 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 stop_rx:
 	apple_rtkit_stop_rx(rtk);
 	apple_rtkit_release_rx(rtk);
+	goto free_rtk;
+destroy_wq:
+	destroy_workqueue(rtk->wq);
 free_rtk:
 	kfree(rtk);
 	return ERR_PTR(ret);
@@ -1013,7 +1059,7 @@ static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
 	return 0;
 }
 
-int apple_rtkit_boot(struct apple_rtkit *rtk)
+static int apple_rtkit_boot_common(struct apple_rtkit *rtk, bool early_ap_power)
 {
 	int ret;
 
@@ -1029,12 +1075,25 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 	if (rtk->boot_result)
 		return rtk->boot_result;
 
+	/* Some helpers need AP readiness before acknowledging IOP power. */
+	if (early_ap_power) {
+		ret = apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
+		if (ret)
+			return ret;
+	}
+
 	dev_dbg(rtk->dev, "RTKit: waiting for IOP power state ACK\n");
 	ret = apple_rtkit_wait_for_completion(&rtk->iop_pwr_ack_completion);
 	if (ret)
 		return ret;
 
-	return apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
+	return early_ap_power ? 0 :
+		apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
+}
+
+int apple_rtkit_boot(struct apple_rtkit *rtk)
+{
+	return apple_rtkit_boot_common(rtk, false);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_boot);
 
@@ -1126,7 +1185,7 @@ int apple_rtkit_quiesce(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_quiesce);
 
-int apple_rtkit_wake(struct apple_rtkit *rtk)
+static int apple_rtkit_wake_common(struct apple_rtkit *rtk, bool early_ap_power)
 {
 	u64 msg;
 	int ret;
@@ -1146,9 +1205,20 @@ int apple_rtkit_wake(struct apple_rtkit *rtk)
 	if (ret)
 		return ret;
 
-	return apple_rtkit_boot(rtk);
+	return apple_rtkit_boot_common(rtk, early_ap_power);
+}
+
+int apple_rtkit_wake(struct apple_rtkit *rtk)
+{
+	return apple_rtkit_wake_common(rtk, false);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_wake);
+
+int apple_rtkit_wake_early_ap(struct apple_rtkit *rtk)
+{
+	return apple_rtkit_wake_common(rtk, true);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_wake_early_ap);
 
 void apple_rtkit_free(struct apple_rtkit *rtk)
 {

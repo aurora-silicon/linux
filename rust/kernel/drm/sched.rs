@@ -380,6 +380,8 @@ impl<T: JobImpl> Scheduler<T> {
         timedout_job: Some(timedout_job_cb::<T>),
         free_job: Some(free_job_cb::<T>),
         cancel_job: Some(cancel_job_cb::<T>),
+        owner: core::ptr::null_mut(),
+        retain_job_on_enodev: false,
     };
     /// Creates a new DRM Scheduler object
     // TODO: Shared timeout workqueues & scores

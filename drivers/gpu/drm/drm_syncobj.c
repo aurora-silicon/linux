@@ -1032,14 +1032,52 @@ static void syncobj_wait_syncobj_func(struct drm_syncobj *syncobj,
 	list_del_init(&wait->node);
 }
 
+/**
+ * drm_syncobj_set_wait_hint - tag recent GPU-feeder work on an open DRM file
+ * @file: submitting client
+ * @util_min: scheduler capacity hint, bounded to 1024
+ * @duration_ms: validity for subsequent waits, bounded to one second
+ *
+ * This changes no scheduling attribute or affinity. A blocking syncobj wait
+ * may use the hint in a balanced kernel scope while this recent-work tag is
+ * valid. Sleeping tasks consume no CPU; the scope is removed before return.
+ */
+void drm_syncobj_set_wait_hint(struct drm_file *file, unsigned int util_min,
+			       unsigned int duration_ms)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&file->table_lock, flags);
+	file->syncobj_wait_util_min = min(util_min, 1024u);
+	file->syncobj_wait_hint_until = jiffies +
+		msecs_to_jiffies(min(duration_ms, 1000u));
+	spin_unlock_irqrestore(&file->table_lock, flags);
+}
+EXPORT_SYMBOL_GPL(drm_syncobj_set_wait_hint);
+
+static unsigned int drm_syncobj_wait_hint(struct drm_file *file)
+{
+	unsigned long flags;
+	unsigned int value = 0;
+
+	spin_lock_irqsave(&file->table_lock, flags);
+	if (time_before(jiffies, file->syncobj_wait_hint_until))
+		value = file->syncobj_wait_util_min;
+	spin_unlock_irqrestore(&file->table_lock, flags);
+	return value;
+}
+
 static signed long drm_syncobj_array_wait_timeout(struct drm_syncobj **syncobjs,
 						  void __user *user_points,
 						  uint32_t count,
 						  uint32_t flags,
 						  signed long timeout,
 						  uint32_t *idx,
-						  ktime_t *deadline)
+						  ktime_t *deadline,
+						  struct drm_file *file_private)
 {
+	unsigned int scope_previous = 0, util_min;
+	bool scope_active = false;
 	struct syncobj_wait_entry *entries;
 	struct dma_fence *fence;
 	uint64_t *points;
@@ -1132,6 +1170,16 @@ static signed long drm_syncobj_array_wait_timeout(struct drm_syncobj **syncobjs,
 		}
 	}
 
+	/* Polls, availability waits and already-complete fences need no boost. */
+	if (timeout > 0 && !(flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE)) {
+		/* Recheck expiry after allocations, user copies and deadline callbacks. */
+		util_min = drm_syncobj_wait_hint(file_private);
+		if (util_min) {
+			scope_previous = sched_util_min_scope_enter(util_min);
+			scope_active = true;
+		}
+	}
+
 	do {
 		set_current_state(TASK_INTERRUPTIBLE);
 
@@ -1176,6 +1224,8 @@ static signed long drm_syncobj_array_wait_timeout(struct drm_syncobj **syncobjs,
 
 done_waiting:
 	__set_current_state(TASK_RUNNING);
+	if (scope_active)
+		sched_util_min_scope_exit(scope_previous);
 
 cleanup_entries:
 	for (i = 0; i < count; ++i) {
@@ -1243,7 +1293,7 @@ static int drm_syncobj_array_wait(struct drm_device *dev,
 							 wait->count_handles,
 							 wait->flags,
 							 timeout, &first,
-							 deadline);
+							 deadline, file_private);
 		if (timeout < 0)
 			return timeout;
 		wait->first_signaled = first;
@@ -1254,7 +1304,7 @@ static int drm_syncobj_array_wait(struct drm_device *dev,
 							 timeline_wait->count_handles,
 							 timeline_wait->flags,
 							 timeout, &first,
-							 deadline);
+							 deadline, file_private);
 		if (timeout < 0)
 			return timeout;
 		timeline_wait->first_signaled = first;

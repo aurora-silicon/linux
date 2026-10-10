@@ -24,6 +24,7 @@
 #include <linux/export.h>
 #include <linux/slab.h>
 #include <linux/completion.h>
+#include <linux/module.h>
 
 #include <drm/drm_print.h>
 #include <drm/gpu_scheduler.h>
@@ -179,6 +180,7 @@ static void drm_sched_entity_kill_jobs_cb(struct dma_fence *f,
 static void drm_sched_entity_kill_jobs_work(struct work_struct *wrk)
 {
 	struct drm_sched_job *job = container_of(wrk, typeof(*job), work);
+	struct module *owner = job->sched->ops->owner;
 	struct dma_fence *f;
 	unsigned long index;
 
@@ -213,6 +215,8 @@ static void drm_sched_entity_kill_jobs_work(struct work_struct *wrk)
 	drm_sched_fence_finished(job->s_fence, -ESRCH);
 	WARN_ON(job->s_fence->parent);
 	job->sched->ops->free_job(job);
+	/* free_job may have freed both job and its scheduler allocation. */
+	module_put(owner);
 }
 
 /* Signal the scheduler finished fence when the entity in question is killed. */
@@ -251,6 +255,11 @@ static void drm_sched_entity_kill(struct drm_sched_entity *entity)
 	while ((job = drm_sched_entity_queue_pop(entity))) {
 		struct drm_sched_fence *s_fence = job->s_fence;
 
+		/* The caller still owns the backend module here. Keep it alive
+		 * across every dependency callback and through the driver callback's
+		 * return, even after the entity and scheduler have been finalized.
+		 */
+		__module_get(job->sched->ops->owner);
 		dma_fence_get(&s_fence->finished);
 		if (!prev ||
 		    dma_fence_add_callback(prev, &job->finish_cb,

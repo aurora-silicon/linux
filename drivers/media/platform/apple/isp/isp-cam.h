@@ -6,9 +6,12 @@
 
 #include "isp-drv.h"
 
-#define ISP_FRAME_RATE_NUM 256
-#define ISP_FRAME_RATE_DEN 7680
-#define ISP_FRAME_RATE_DEN2 3840
+/* The firmware takes frame rates in units of 1/256 frame per second. */
+#define ISP_FRAME_RATE_SCALE 256
+/* The slowest rate auto exposure may fall to, in frames per second */
+#define ISP_FRAME_RATE_MIN 15
+/* The nominal capture rate, in frames per second */
+#define ISP_FRAME_RATE_DEFAULT 30
 
 int apple_isp_detect_camera(struct apple_isp *isp);
 

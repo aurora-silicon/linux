@@ -28,8 +28,11 @@ static void apple_isp_detach_genpd(struct apple_isp *isp)
 	for (int i = isp->pd_count - 1; i >= 0; i--) {
 		if (isp->pd_link[i])
 			device_link_del(isp->pd_link[i]);
-		if (!IS_ERR_OR_NULL(isp->pd_dev[i]))
-			dev_pm_domain_detach(isp->pd_dev[i], true);
+		if (IS_ERR_OR_NULL(isp->pd_dev[i]))
+			continue;
+		if (isp->hw->resident_fw)
+			dev_pm_syscore_device(isp->pd_dev[i], false);
+		dev_pm_domain_detach(isp->pd_dev[i], true);
 	}
 
 	return;
@@ -74,6 +77,18 @@ static int apple_isp_attach_genpd(struct apple_isp *isp)
 			apple_isp_detach_genpd(isp);
 			return -EINVAL;
 		}
+
+		/*
+		 * The domains of resident firmware are switched by the
+		 * driver alone, through runtime PM: the firmware does not
+		 * start again once they have been off. System sleep would
+		 * otherwise also have genpd switch them off in the noirq
+		 * phase of suspend and back on in the noirq phase of resume,
+		 * where the CPU core domains of a stopped coprocessor fail
+		 * to reach the active state.
+		 */
+		if (isp->hw->resident_fw)
+			dev_pm_syscore_device(isp->pd_dev[i], true);
 	}
 
 	return 0;
@@ -786,14 +801,28 @@ static __maybe_unused int apple_isp_suspend(struct device *dev)
 	apple_isp_video_suspend(isp);
 
 	/*
-	 * The ISP's power domains go off during system sleep, and resident
-	 * firmware would not survive that. Stop it cleanly instead; resuming
-	 * a stream then fails with an error until the next system boot.
+	 * Resident firmware stays up, idle, across suspend-to-idle and
+	 * suspend-to-RAM: its domains stay on, see apple_isp_attach_genpd().
+	 */
+	return 0;
+}
+
+static __maybe_unused int apple_isp_freeze(struct device *dev)
+{
+	struct apple_isp *isp = dev_get_drvdata(dev);
+
+	apple_isp_video_suspend(isp);
+
+	/*
+	 * Hibernation hands the system from one kernel to another, and
+	 * firmware left running would go on using the memory of the kernel
+	 * that started it. Stop it cleanly instead; the camera is then
+	 * unavailable until the next system boot.
 	 */
 	if (isp->hw->resident_fw) {
 		mutex_lock(&isp->video_lock);
 		if (isp->fw_state == ISP_FW_RUNNING)
-			dev_warn(dev, "stopping the firmware for system sleep, the camera is unavailable until the next boot\n");
+			dev_warn(dev, "stopping the firmware for hibernation, the camera is unavailable until the next boot\n");
 		apple_isp_firmware_halt(isp);
 		mutex_unlock(&isp->video_lock);
 	}
@@ -811,7 +840,12 @@ static __maybe_unused int apple_isp_resume(struct device *dev)
 }
 
 static const struct dev_pm_ops apple_isp_pm_ops = {
-	SYSTEM_SLEEP_PM_OPS(apple_isp_suspend, apple_isp_resume)
+	.suspend	= pm_sleep_ptr(apple_isp_suspend),
+	.resume		= pm_sleep_ptr(apple_isp_resume),
+	.freeze		= pm_sleep_ptr(apple_isp_freeze),
+	.thaw		= pm_sleep_ptr(apple_isp_resume),
+	.poweroff	= pm_sleep_ptr(apple_isp_freeze),
+	.restore	= pm_sleep_ptr(apple_isp_resume),
 	RUNTIME_PM_OPS(apple_isp_runtime_suspend, apple_isp_runtime_resume, NULL)
 };
 

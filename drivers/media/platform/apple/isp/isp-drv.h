@@ -11,6 +11,7 @@
 #include <linux/spinlock.h>
 
 #include <drm/drm_mm.h>
+#include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/videobuf2-core.h>
 #include <media/videobuf2-v4l2.h>
@@ -273,10 +274,14 @@ struct apple_isp {
 	struct video_device vdev;
 	struct media_device mdev;
 	struct v4l2_device v4l2_dev;
+	struct v4l2_ctrl_handler ctrl_handler;
+	struct v4l2_ctrl *exposure_priority;
 	struct vb2_queue vbq;
 	struct mutex video_lock;
 	unsigned int sequence;
 	bool multiplanar;
+	/* capture rate in frames per second, changes under video_lock */
+	unsigned int frame_rate;
 
 	int pd_count;
 	struct device **pd_dev;

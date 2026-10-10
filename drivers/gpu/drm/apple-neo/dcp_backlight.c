@@ -1,0 +1,476 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/* Copyright (C) The Asahi Linux Contributors */
+
+#include <drm/drm_atomic.h>
+#include <drm/drm_crtc.h>
+#include <drm/drm_drv.h>
+#include <drm/drm_modeset_lock.h>
+
+#include <linux/backlight.h>
+#include <linux/completion.h>
+#include <linux/delay.h>
+#include "linux/jiffies.h"
+
+#include "dcp.h"
+#include "dcp-internal.h"
+
+#define MIN_BRIGHTNESS_PART1	2U
+#define MAX_BRIGHTNESS_PART1	99U
+#define MIN_BRIGHTNESS_PART2	103U
+#define MAX_BRIGHTNESS_PART2	510U
+
+/*
+ * lookup for display brightness 2 to 99 nits
+ * */
+static u32 brightness_part1[] = {
+	0x0000000, 0x0810038, 0x0f000bd, 0x143011c,
+	0x1850165, 0x1bc01a1, 0x1eb01d4, 0x2140200,
+	0x2380227, 0x2590249, 0x2770269, 0x2930285,
+	0x2ac02a0, 0x2c402b8, 0x2d902cf, 0x2ee02e4,
+	0x30102f8, 0x314030b, 0x325031c, 0x335032d,
+	0x345033d, 0x354034d, 0x362035b, 0x3700369,
+	0x37d0377, 0x38a0384, 0x3960390, 0x3a2039c,
+	0x3ad03a7, 0x3b803b3, 0x3c303bd, 0x3cd03c8,
+	0x3d703d2, 0x3e103dc, 0x3ea03e5, 0x3f303ef,
+	0x3fc03f8, 0x4050400, 0x40d0409, 0x4150411,
+	0x41d0419, 0x4250421, 0x42d0429, 0x4340431,
+	0x43c0438, 0x443043f, 0x44a0446, 0x451044d,
+	0x4570454, 0x45e045b, 0x4640461, 0x46b0468,
+	0x471046e, 0x4770474, 0x47d047a, 0x4830480,
+	0x4890486, 0x48e048b, 0x4940491, 0x4990497,
+	0x49f049c, 0x4a404a1, 0x4a904a7, 0x4ae04ac,
+	0x4b304b1, 0x4b804b6, 0x4bd04bb, 0x4c204c0,
+	0x4c704c5, 0x4cc04c9, 0x4d004ce, 0x4d504d3,
+	0x4d904d7, 0x4de04dc, 0x4e204e0, 0x4e704e4,
+	0x4eb04e9, 0x4ef04ed, 0x4f304f1, 0x4f704f5,
+	0x4fb04f9, 0x4ff04fd, 0x5030501, 0x5070505,
+	0x50b0509, 0x50f050d, 0x5130511, 0x5160515,
+	0x51a0518, 0x51e051c, 0x5210520, 0x5250523,
+	0x5290527, 0x52c052a, 0x52f052e, 0x5330531,
+	0x5360535, 0x53a0538, 0x53d053b, 0x540053f,
+	0x5440542, 0x5470545, 0x54a0548, 0x54d054c,
+	0x550054f, 0x5530552, 0x5560555, 0x5590558,
+	0x55c055b, 0x55f055e, 0x5620561, 0x5650564,
+	0x5680567, 0x56b056a, 0x56e056d, 0x571056f,
+	0x5740572, 0x5760575, 0x5790578, 0x57c057b,
+	0x57f057d, 0x5810580, 0x5840583, 0x5870585,
+	0x5890588, 0x58c058b, 0x58f058d
+};
+
+static u32 brightness_part12[] = { 0x58f058d, 0x59d058f };
+
+/*
+ * lookup table for display brightness 103.3 to 510 nits
+ * */
+static u32 brightness_part2[] = {
+	0x59d058f, 0x5b805ab, 0x5d105c5, 0x5e805dd,
+	0x5fe05f3, 0x6120608, 0x625061c, 0x637062e,
+	0x6480640, 0x6580650, 0x6680660, 0x677066f,
+	0x685067e, 0x693068c, 0x6a00699, 0x6ac06a6,
+	0x6b806b2, 0x6c406be, 0x6cf06ca, 0x6da06d5,
+	0x6e506df, 0x6ef06ea, 0x6f906f4, 0x70206fe,
+	0x70c0707, 0x7150710, 0x71e0719, 0x7260722,
+	0x72f072a, 0x7370733, 0x73f073b, 0x7470743,
+	0x74e074a, 0x7560752, 0x75d0759, 0x7640760,
+	0x76b0768, 0x772076e, 0x7780775, 0x77f077c,
+	0x7850782, 0x78c0789, 0x792078f, 0x7980795,
+	0x79e079b, 0x7a407a1, 0x7aa07a7, 0x7af07ac,
+	0x7b507b2, 0x7ba07b8, 0x7c007bd, 0x7c507c2,
+	0x7ca07c8, 0x7cf07cd, 0x7d407d2, 0x7d907d7,
+	0x7de07dc, 0x7e307e1, 0x7e807e5, 0x7ec07ea,
+	0x7f107ef, 0x7f607f3, 0x7fa07f8, 0x7fe07fc
+};
+
+
+bool neo_dcp_backlight_active(struct neo_apple_dcp *neo_dcp)
+{
+	return neo_dcp->fw_compat == DCP_FIRMWARE_H17P &&
+		neo_dcp->hw.neo_iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+		READ_ONCE(neo_dcp->backlight.state.ready);
+}
+
+int neo_dcp_backlight_takeover(struct neo_apple_dcp *neo_dcp, u32 millinits)
+{
+	u32 maximum, nits;
+	int ret;
+
+	if (neo_dcp_backlight_active(neo_dcp))
+		return 0;
+	/* H17P takes nits up to the panel ceiling, not the older DAC table's. */
+	maximum = neo_dcp->brightness.maximum;
+	ret = neo_dcp_bl_takeover_nits(maximum, millinits, &nits);
+	if (ret)
+		return ret;
+
+	/* Keep the first bounded hint. Later reports are not user requests. */
+	return neo_iomfb_configure_backlight_h17p(neo_dcp, maximum, true, nits, false, 0);
+}
+
+static int neo_dcp_get_brightness(struct backlight_device *bd)
+{
+	struct neo_apple_dcp *neo_dcp = bl_get_data(bd);
+	unsigned long flags;
+	u32 actual;
+
+	if (READ_ONCE(neo_dcp->quiescing))
+		return -ENODEV;
+
+	if (neo_dcp_backlight_active(neo_dcp)) {
+		spin_lock_irqsave(&neo_dcp->backlight.lock, flags);
+		actual = neo_dcp->backlight.state.actual;
+		spin_unlock_irqrestore(&neo_dcp->backlight.lock, flags);
+		return actual;
+	}
+
+	return neo_dcp->brightness.nits;
+}
+
+int neo_dcp_backlight_configure(struct neo_apple_dcp *neo_dcp, u32 maximum,
+			    bool inherited_valid, u32 inherited,
+			    bool default_valid, u32 default_nits,
+			    void (*kick)(struct neo_apple_dcp *neo_dcp))
+{
+	unsigned long flags;
+	int ret;
+
+	if (neo_dcp->fw_compat != DCP_FIRMWARE_H17P || !neo_dcp_has_panel(neo_dcp) ||
+	    !neo_dcp->crtc || !kick)
+		return -EINVAL;
+
+	mutex_lock(&neo_dcp->bl_register_mutex);
+	spin_lock_irqsave(&neo_dcp->backlight.lock, flags);
+	if (neo_dcp->backlight.state.ready || neo_dcp->brightness.bl_dev) {
+		ret = -EBUSY;
+	} else {
+		ret = neo_dcp_bl_init(&neo_dcp->backlight.state, maximum,
+				  inherited_valid, inherited,
+				  default_valid, default_nits);
+		if (!ret)
+			neo_dcp->backlight.kick = kick;
+	}
+	spin_unlock_irqrestore(&neo_dcp->backlight.lock, flags);
+	mutex_unlock(&neo_dcp->bl_register_mutex);
+	if (!ret)
+		schedule_work(&neo_dcp->bl_register_wq);
+	return ret;
+}
+
+bool neo_dcp_backlight_seed(struct neo_apple_dcp *neo_dcp, u32 nits)
+{
+	unsigned long flags;
+	bool seeded;
+
+	spin_lock_irqsave(&neo_dcp->backlight.lock, flags);
+	seeded = neo_dcp_bl_seed(&neo_dcp->backlight.state, nits);
+	spin_unlock_irqrestore(&neo_dcp->backlight.lock, flags);
+	return seeded;
+}
+
+static void neo_dcp_backlight_kick(struct neo_apple_dcp *neo_dcp)
+{
+	void (*kick)(struct neo_apple_dcp *neo_dcp) = READ_ONCE(neo_dcp->backlight.kick);
+
+	if (kick)
+		kick(neo_dcp);
+}
+
+int neo_dcp_backlight_dpms(struct neo_apple_dcp *neo_dcp, bool on)
+{
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&neo_dcp->backlight.lock, flags);
+	ret = neo_dcp_bl_dpms(&neo_dcp->backlight.state, on);
+	spin_unlock_irqrestore(&neo_dcp->backlight.lock, flags);
+	if (!ret)
+		neo_dcp_backlight_kick(neo_dcp);
+	return ret;
+}
+
+int neo_dcp_backlight_prepare(struct neo_apple_dcp *neo_dcp, bool have_surface,
+			  struct neo_dcp_backlight_present *present)
+{
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&neo_dcp->backlight.lock, flags);
+	ret = neo_dcp_bl_prepare(&neo_dcp->backlight.state, have_surface, present);
+	/* No reservation: carry the last completed level on an ordinary present. */
+	if (ret == -EALREADY)
+		present->nits = neo_dcp->backlight.state.actual;
+	spin_unlock_irqrestore(&neo_dcp->backlight.lock, flags);
+	return ret;
+}
+
+bool neo_dcp_backlight_complete(struct neo_apple_dcp *neo_dcp, u64 sequence, bool accepted)
+{
+	unsigned long flags;
+	bool completed;
+
+	spin_lock_irqsave(&neo_dcp->backlight.lock, flags);
+	completed = neo_dcp_bl_complete(&neo_dcp->backlight.state, sequence, accepted);
+	spin_unlock_irqrestore(&neo_dcp->backlight.lock, flags);
+	/* Queue retries after the central queue has finished this transaction. */
+	return completed;
+}
+
+bool neo_dcp_backlight_pending(struct neo_apple_dcp *neo_dcp)
+{
+	unsigned long flags;
+	bool pending;
+
+	spin_lock_irqsave(&neo_dcp->backlight.lock, flags);
+	pending = neo_dcp->backlight.state.dirty && !neo_dcp->backlight.state.in_flight;
+	spin_unlock_irqrestore(&neo_dcp->backlight.lock, flags);
+	return pending;
+}
+
+/*
+ * Called from the receive path, which must not queue a transaction itself;
+ * the caller schedules the update worker when this returns true.  Requests
+ * are honoured at most once per second, so a firmware that repeats the
+ * request after every brightness present cannot keep the queue busy.
+ */
+bool neo_dcp_backlight_resend(struct neo_apple_dcp *neo_dcp)
+{
+	unsigned long flags;
+	bool resend = false;
+
+	spin_lock_irqsave(&neo_dcp->backlight.lock, flags);
+	if (!neo_dcp->backlight.resent ||
+	    time_after(jiffies, neo_dcp->backlight.resent_at + HZ)) {
+		resend = neo_dcp_bl_resend(&neo_dcp->backlight.state);
+		if (resend) {
+			neo_dcp->backlight.resent = true;
+			neo_dcp->backlight.resent_at = jiffies;
+		}
+	}
+	spin_unlock_irqrestore(&neo_dcp->backlight.lock, flags);
+	return resend;
+}
+
+unsigned int neo_dcp_backlight_retry_delay(struct neo_apple_dcp *neo_dcp)
+{
+	unsigned long flags;
+	unsigned int delay;
+
+	spin_lock_irqsave(&neo_dcp->backlight.lock, flags);
+	delay = neo_dcp_bl_retry_delay(&neo_dcp->backlight.state);
+	spin_unlock_irqrestore(&neo_dcp->backlight.lock, flags);
+	return delay;
+}
+
+#define SCALE_FACTOR (1 << 10)
+
+static u32 interpolate(int val, int min, int max, u32 *tbl, size_t tbl_size)
+{
+	u32 frac;
+	u64 low, high;
+	u32 interpolated = (tbl_size - 1) * ((val - min) * SCALE_FACTOR) / (max - min);
+
+	size_t index = interpolated / SCALE_FACTOR;
+
+	if (WARN(index + 1 >= tbl_size, "invalid index %zu for brightness %u\n", index, val))
+		return tbl[tbl_size / 2];
+
+	frac = interpolated & (SCALE_FACTOR - 1);
+	low = tbl[index];
+	high = tbl[index + 1];
+
+	return ((frac * high) + ((SCALE_FACTOR - frac) * low)) / SCALE_FACTOR;
+}
+
+static u32 calculate_dac(struct neo_apple_dcp *neo_dcp, int val)
+{
+	u32 dac;
+
+	if (val <= MIN_BRIGHTNESS_PART1)
+		return 16 * brightness_part1[0];
+	else if (val == MAX_BRIGHTNESS_PART1)
+		return 16 * brightness_part1[ARRAY_SIZE(brightness_part1) - 1];
+	else if (val == MIN_BRIGHTNESS_PART2)
+		return 16 * brightness_part2[0];
+	else if (val >= MAX_BRIGHTNESS_PART2)
+		return brightness_part2[ARRAY_SIZE(brightness_part2) - 1];
+
+	if (val < MAX_BRIGHTNESS_PART1) {
+		dac = interpolate(val, MIN_BRIGHTNESS_PART1, MAX_BRIGHTNESS_PART1,
+				  brightness_part1, ARRAY_SIZE(brightness_part1));
+	} else if (val > MIN_BRIGHTNESS_PART2) {
+		dac = interpolate(val, MIN_BRIGHTNESS_PART2, MAX_BRIGHTNESS_PART2,
+				  brightness_part2, ARRAY_SIZE(brightness_part2));
+	} else {
+		dac = interpolate(val, MAX_BRIGHTNESS_PART1, MIN_BRIGHTNESS_PART2,
+				  brightness_part12, ARRAY_SIZE(brightness_part12));
+	}
+
+	return 16 * dac;
+}
+
+static int drm_crtc_set_brightness(struct neo_apple_dcp *neo_dcp)
+{
+	struct drm_atomic_state *state;
+	struct drm_crtc_state *crtc_state;
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_crtc *crtc = &neo_dcp->crtc->base;
+	int ret = 0;
+
+	state = drm_atomic_state_alloc(crtc->dev);
+	if (!state)
+		return -ENOMEM;
+
+	drm_modeset_acquire_init(&ctx, DRM_MODESET_ACQUIRE_INTERRUPTIBLE);
+	state->acquire_ctx = &ctx;
+
+retry:
+	crtc_state = drm_atomic_get_crtc_state(state, crtc);
+	if (IS_ERR(crtc_state)) {
+		ret = PTR_ERR(crtc_state);
+		goto out;
+	}
+
+	if (!neo_dcp->brightness.update)
+		goto out;
+
+	/* Re-present the current scanout when brightness is the only change. */
+	ret = drm_atomic_add_affected_planes(state, crtc);
+	if (ret)
+		goto out;
+
+	crtc_state->color_mgmt_changed |= true;
+
+	ret = drm_atomic_commit(state);
+
+out:
+	if (ret == -EDEADLK) {
+		drm_atomic_state_clear(state);
+		ret = drm_modeset_backoff(&ctx);
+		if (!ret)
+			goto retry;
+	}
+
+	drm_atomic_state_put(state);
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+
+	return ret;
+}
+
+int neo_dcp_backlight_update(struct neo_apple_dcp *neo_dcp)
+{
+	if (READ_ONCE(neo_dcp->quiescing))
+		return -ENODEV;
+	if (neo_dcp_backlight_active(neo_dcp)) {
+		neo_dcp_backlight_kick(neo_dcp);
+		return 0;
+	}
+	if (neo_dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	    neo_dcp->hw.neo_iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		return -ENODATA;
+
+	/*
+	 * Do not actively try to change brightness if no mode is set.
+	 * TODO: should this be reflected the in backlight's power property?
+	 *       defer this hopefully until it becomes irrelevant due to proper
+	 *       drm integrated backlight handling
+	 */
+	if (!READ_ONCE(neo_dcp->mode_state.valid))
+		return 0;
+
+	/* Wait 1 vblank cycle in the hope an atomic swap has already updated
+	 * the brightness */
+	msleep((1001 + 23) / 24); // 42ms for 23.976 fps
+
+	return drm_crtc_set_brightness(neo_dcp);
+}
+
+static int neo_dcp_set_brightness(struct backlight_device *bd)
+{
+	int ret = 0;
+	struct neo_apple_dcp *neo_dcp = bl_get_data(bd);
+	int brightness = backlight_get_brightness(bd);
+	unsigned long flags;
+
+	if (READ_ONCE(neo_dcp->quiescing))
+		return -ENODEV;
+
+	if (neo_dcp_backlight_active(neo_dcp)) {
+		/* Preserve the requested level even while the core forces zero. */
+		spin_lock_irqsave(&neo_dcp->backlight.lock, flags);
+		ret = neo_dcp_bl_request(&neo_dcp->backlight.state,
+				     bd->props.brightness,
+				     backlight_is_blank(bd),
+				     bd->props.state & BL_CORE_SUSPENDED);
+		spin_unlock_irqrestore(&neo_dcp->backlight.lock, flags);
+		if (!ret)
+			neo_dcp_backlight_kick(neo_dcp);
+		return ret;
+	}
+
+	ret = drm_modeset_lock_single_interruptible(&neo_dcp->crtc->base.mutex);
+	if (ret)
+		return ret;
+
+	neo_dcp->brightness.dac = calculate_dac(neo_dcp, brightness);
+	neo_dcp->brightness.update = true;
+
+	drm_modeset_unlock(&neo_dcp->crtc->base.mutex);
+
+	return neo_dcp_backlight_update(neo_dcp);
+}
+
+static bool neo_dcp_backlight_controls_device(struct backlight_device *bd,
+					  struct device *display_dev)
+{
+	struct neo_apple_dcp *neo_dcp = bl_get_data(bd);
+
+	return !display_dev || display_dev == neo_dcp->dev ||
+		(neo_dcp->crtc && display_dev == neo_dcp->crtc->base.dev->dev);
+}
+
+static const struct backlight_ops neo_dcp_backlight_ops = {
+	.options = BL_CORE_SUSPENDRESUME,
+	.get_brightness = neo_dcp_get_brightness,
+	.update_status = neo_dcp_set_brightness,
+	.controls_device = neo_dcp_backlight_controls_device,
+};
+
+int neo_dcp_backlight_register(struct neo_apple_dcp *neo_dcp)
+{
+	struct device *dev = neo_dcp->dev;
+	struct backlight_device *bl_dev;
+	unsigned long flags;
+	struct backlight_properties props = {
+		.type = BACKLIGHT_PLATFORM,
+		.brightness = neo_dcp->brightness.nits,
+		.scale = BACKLIGHT_SCALE_LINEAR,
+	};
+	props.max_brightness = min(neo_dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
+	if (neo_dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	    neo_dcp->hw.neo_iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+	    !neo_dcp_backlight_active(neo_dcp))
+		return -ENODATA;
+	if (neo_dcp_backlight_active(neo_dcp)) {
+		spin_lock_irqsave(&neo_dcp->backlight.lock, flags);
+		if (!neo_dcp->backlight.state.ready) {
+			spin_unlock_irqrestore(&neo_dcp->backlight.lock, flags);
+			return -ENODATA;
+		}
+		/* Freeze takeover before userspace can discover the device. */
+		neo_dcp->backlight.state.controlled = true;
+		props.brightness = neo_dcp->backlight.state.target;
+		props.max_brightness = neo_dcp->backlight.state.maximum;
+		spin_unlock_irqrestore(&neo_dcp->backlight.lock, flags);
+	}
+
+	bl_dev = devm_backlight_device_register(dev, "apple-panel-bl", dev, neo_dcp,
+						&neo_dcp_backlight_ops, &props);
+	if (IS_ERR(bl_dev))
+		return PTR_ERR(bl_dev);
+
+	neo_dcp->brightness.bl_dev = bl_dev;
+	if (!neo_dcp_backlight_active(neo_dcp))
+		neo_dcp->brightness.dac = calculate_dac(neo_dcp, neo_dcp->brightness.nits);
+
+	return 0;
+}

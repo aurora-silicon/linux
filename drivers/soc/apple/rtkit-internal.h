@@ -21,6 +21,17 @@
 
 #define APPLE_RTKIT_APP_ENDPOINT_START 0x20
 #define APPLE_RTKIT_MAX_ENDPOINTS 0x100
+#define APPLE_RTKIT_CRASHLOG_HEADER_FOURCC 0x434c4845
+
+struct apple_rtkit_crashlog_header {
+	u32 fourcc;
+	u32 version;
+	u32 size;
+	u32 flags;
+	u8 _unk[16];
+};
+
+static_assert(sizeof(struct apple_rtkit_crashlog_header) == 0x20);
 
 struct apple_rtkit {
 	void *cookie;

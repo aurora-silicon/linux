@@ -952,6 +952,9 @@ static int add_dcp_components(struct device *dev,
 
 static int apple_platform_probe(struct platform_device *pdev)
 {
+	if (of_machine_is_compatible("apple,t8140"))
+		return -ENODEV;
+
 	struct device *mdev = &pdev->dev;
 	struct component_match *match = NULL;
 	int num_dcp;

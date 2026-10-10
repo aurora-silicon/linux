@@ -1666,7 +1666,20 @@ uclamp_tg_restrict(struct task_struct *p, enum uclamp_id clamp_id)
 	struct uclamp_se uc_req = p->uclamp_req[clamp_id];
 #ifdef CONFIG_UCLAMP_TASK_GROUP
 	unsigned int tg_min, tg_max, value;
+#endif
 
+	/*
+	 * Kernel scopes never replace user attributes or exceed their cap.
+	 * The existing group and system restrictions are applied below.
+	 */
+	if (clamp_id == UCLAMP_MIN && p->uclamp_scope_min) {
+		unsigned int hint = min(p->uclamp_scope_min,
+					(unsigned int)p->uclamp_req[UCLAMP_MAX].value);
+
+		if (hint > uc_req.value)
+			uclamp_se_set(&uc_req, hint, false);
+	}
+#ifdef CONFIG_UCLAMP_TASK_GROUP
 	/*
 	 * Tasks in autogroups or root task group will be
 	 * restricted by system defaults.
@@ -1902,6 +1915,58 @@ static inline void uclamp_rq_reinc_id(struct rq *rq, struct task_struct *p,
 		rq->uclamp_flags &= ~UCLAMP_FLAG_IDLE;
 }
 
+/*
+ * Only the current task may enter/leave its own balanced, nestable scope.
+ * pi/rq locking serializes the effective clamp with wakeup, migration and
+ * concurrent userspace attribute changes; user requests remain untouched.
+ */
+static unsigned int uclamp_scope_set(unsigned int value, bool raise)
+{
+	struct task_struct *p = current;
+	struct rq_flags rf;
+	struct rq *rq;
+	unsigned int previous;
+
+	might_sleep();
+	value = min(value, (unsigned int)SCHED_CAPACITY_SCALE);
+	if (value)
+		sched_uclamp_enable();
+	rq = task_rq_lock(p, &rf);
+	previous = p->uclamp_scope_min;
+	if (raise)
+		value = max(value, previous);
+	if (value != previous) {
+		p->uclamp_scope_min = value;
+		uclamp_rq_reinc_id(rq, p, UCLAMP_MIN);
+	}
+	task_rq_unlock(rq, p, &rf);
+	return previous;
+}
+
+/**
+ * sched_util_min_scope_enter - request a temporary current-task capacity floor
+ * @value: capacity hint, 0..1024, subject to user, cgroup and system caps
+ *
+ * May sleep. The caller must balance this scope in LIFO order on the same
+ * task with sched_util_min_scope_exit(), including error and signal paths.
+ * Return: opaque previous scope value for the matching exit.
+ */
+unsigned int sched_util_min_scope_enter(unsigned int value)
+{
+	return uclamp_scope_set(value, true);
+}
+EXPORT_SYMBOL_GPL(sched_util_min_scope_enter);
+
+/**
+ * sched_util_min_scope_exit - restore a balanced current-task capacity scope
+ * @previous: value returned by the matching sched_util_min_scope_enter()
+ */
+void sched_util_min_scope_exit(unsigned int previous)
+{
+	uclamp_scope_set(previous, false);
+}
+EXPORT_SYMBOL_GPL(sched_util_min_scope_exit);
+
 static inline void
 uclamp_update_active(struct task_struct *p)
 {
@@ -2057,6 +2122,9 @@ undo:
 static void uclamp_fork(struct task_struct *p)
 {
 	enum uclamp_id clamp_id;
+
+	/* A child never inherits its parent's temporary kernel scope. */
+	p->uclamp_scope_min = 0;
 
 	/*
 	 * We don't need to hold task_rq_lock() when updating p->uclamp_* here

@@ -367,3 +367,7 @@ source "drivers/gpu/drm/apple/Kconfig.tests"
 # Separate option because drm_panel_orientation_quirks.c is shared with fbdev
 config DRM_PANEL_ORIENTATION_QUIRKS
 	tristate
+
+source "drivers/gpu/drm/asahi-neo/Kconfig"
+
+source "drivers/gpu/drm/apple-neo/Kconfig"

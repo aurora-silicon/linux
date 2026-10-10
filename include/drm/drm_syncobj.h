@@ -133,4 +133,7 @@ int drm_syncobj_get_handle(struct drm_file *file_private,
 			   struct drm_syncobj *syncobj, u32 *handle);
 int drm_syncobj_get_fd(struct drm_syncobj *syncobj, int *p_fd);
 
+void drm_syncobj_set_wait_hint(struct drm_file *file, unsigned int util_min,
+			       unsigned int duration_ms);
+
 #endif

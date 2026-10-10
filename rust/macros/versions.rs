@@ -89,6 +89,21 @@ struct VersionConfig {
     versions: &'static [&'static [&'static str]],
 }
 
+static AGX_NEO_VERSIONS: VersionConfig = VersionConfig {
+    fields: &["G", "V"],
+    enums: &[
+        &["G13", "G14", "G14X"],
+        &["V12_3", "V12_4", "V13_0B4", "V13_2", "V13_3", "V13_5"],
+    ],
+    versions: &[
+        &["G13", "V12_3"],
+        &["G14", "V12_4"],
+        &["G13", "V13_5"],
+        &["G14", "V13_5"],
+        &["G14X", "V13_5"],
+    ],
+};
+
 static AGX_VERSIONS: VersionConfig = VersionConfig {
     fields: &["G", "V"],
     enums: &[
@@ -282,6 +297,7 @@ fn filter_versions(
 pub(crate) fn versions(attr: TokenStream, item: TokenStream) -> TokenStream {
     let config = match attr.to_string().as_str() {
         "AGX" => &AGX_VERSIONS,
+        "AGX_NEO" => &AGX_NEO_VERSIONS,
         _ => panic!("Unknown version group {}", attr),
     };
 

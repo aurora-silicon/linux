@@ -2225,6 +2225,9 @@ static int dcp_native_routes_error(struct apple_dcp *dcp, int err)
 
 static int dcp_platform_probe(struct platform_device *pdev)
 {
+	if (of_machine_is_compatible("apple,t8140"))
+		return -ENODEV;
+
 	enum dcp_firmware_version fw_compat;
 	struct device *dev = &pdev->dev;
 	struct apple_dcp *dcp;
