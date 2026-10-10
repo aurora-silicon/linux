@@ -117,6 +117,7 @@ do {									\
 } while (0)
 
 extern int brcmf_msg_level;
+extern int brcmf_awdl_trace;
 
 struct brcmf_pub;
 #ifdef DEBUG
