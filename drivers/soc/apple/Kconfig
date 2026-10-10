@@ -150,6 +150,17 @@ config APPLE_PMP
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_J613_DISPLAY_GATE
+	bool "Apple J613 25G83 display boot gate"
+	depends on ARCH_APPLE && OF_DYNAMIC && OF_ADDRESS
+	select VIDEO
+	default ARCH_APPLE
+	help
+	  Enable the exact J613 26.6.2 display and PMP nodes before platform
+	  population after validating the boot loader's handoff and this Mac's
+	  clock and PMP values. This built-in gate also supports modular DRM.
+	  Missing or invalid handoffs keep the boot framebuffer available.
+
 config APPLE_T6030_DISPLAY_GATE
 	bool "Apple T6030 internal display enable gate"
 	depends on ARCH_APPLE && OF_DYNAMIC && OF_OVERLAY

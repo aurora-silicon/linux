@@ -63,6 +63,7 @@
 #include <linux/printk.h>
 #include <linux/slab.h>
 #include <linux/sizes.h>
+#include <linux/soc/apple/j613-display.h>
 #include <linux/string.h>
 #include <linux/types.h>
 
@@ -201,6 +202,11 @@ static bool __init gate_pmp_value_wanted(const struct property *prop)
 }
 
 static bool gate_requested __initdata = true;
+
+bool __init apple_t6030_display_gate_enabled(void)
+{
+	return gate_requested;
+}
 
 /* Kept after a successful apply: the live tree now holds its properties. */
 static struct of_changeset gate_cs;
@@ -1261,6 +1267,16 @@ static int __init apple_t6030_display_gate(void)
 			gate_soc = gate_socs[i];
 	if (!gate_soc)
 		return 0;
+
+	/* The exact 25G83 tree has its own firmware and PMP admission gate. */
+	if (of_machine_is_compatible("apple,j613")) {
+		struct device_node *dcp = of_find_node_by_path("/soc/dcp@28ec00000");
+		bool native = dcp && of_property_present(dcp, "apple,j613-25g83-profile");
+
+		of_node_put(dcp);
+		if (native)
+			return 0;
+	}
 
 	if (!gate_requested) {
 		gate_info("disabled on the command line, display stays on the boot framebuffer\n");

@@ -66,7 +66,7 @@
 #include "dcp-lifecycle.h"
 #include "iomfb_internal.h"
 #include "iomfb_v26_6.h"
-#include "j613-25g83.h"
+#include <linux/soc/apple/j613-display.h>
 #include "iomfb_v26_6_link.h"
 #include "iomfb_v26_6_swap.h"
 #include "parser.h"

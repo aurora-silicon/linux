@@ -1027,11 +1027,6 @@ static int __init appledrm_register(void)
 	if (drm_firmware_drivers_only())
 		return -ENODEV;
 
-	/* A refused experimental profile keeps the boot framebuffer available. */
-	ret = apple_j613_25g83_coldplug();
-	if (ret)
-		pr_info("J613/25G83 display handoff refused: %d; keeping boot framebuffer\n", ret);
-
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
 	ret = dcp_audio_register();
 	if (ret)

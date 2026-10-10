@@ -31,6 +31,7 @@ def main():
 #include <stdbool.h>
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 ''')
+        write(tmp, 'linux/kconfig.h', '#define IS_ENABLED(x) 0\n')
         write(tmp, 'linux/string.h', '#include <string.h>\n')
         write(tmp, 'linux/bitops.h', '#pragma once\n#define BIT(x) (1U << (x))\nstatic int fls(unsigned x){return x?32-__builtin_clz(x):0;}\n')
         write(tmp, 'linux/bits.h', '#include "bitops.h"\n#define GENMASK_ULL(h,l) ((~0ULL << (l)) & (~0ULL >> (63-(h))))\n')
@@ -44,7 +45,7 @@ static u64 get_unaligned_le64(const void*p){const u8*b=p;u64 v=0;for(int i=0;i<8
 ''')
         write(tmp, 'profile.c', '''#include <assert.h>
 #include <stdio.h>
-#include "drivers/gpu/drm/apple/j613-25g83.h"
+#include "include/linux/soc/apple/j613-display.h"
 #include "drivers/gpu/drm/apple/iomfb_v26_6_swap.h"
 int main(void) {
  u32 v[]={26,6,2},c[]={1,345,416,712000000,0},m[]={1,1,1};
