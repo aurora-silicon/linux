@@ -438,9 +438,13 @@ impl platform::Driver for AsahiDriver {
                 return Ok(Self { runtime: AsahiRuntime::M3(runtime) });
             }
             ProbeConfig::Agx3Diagnostic(soc) if soc.chip_id == 0x8122 => {
-                if crate::g16_profile::selected(pdev)? {
+                if crate::g16_profile::selected(pdev).inspect_err(|error| {
+                    dev_err!(pdev.as_ref(), "G16G: firmware/profile admission failed: {:?}\n", error);
+                })? {
                     if crate::m3_params::t8122_params().start != 1 { return Err(ENODEV); }
-                    crate::g16_board::initialize(pdev)?;
+                    crate::g16_board::initialize(pdev).inspect_err(|error| {
+                        dev_err!(pdev.as_ref(), "G16G: per-Mac calibration admission failed: {:?}\n", error);
+                    })?;
                     let runtime = crate::g16_drm::Registered::start(pdev)?;
                     return Ok(Self { runtime: AsahiRuntime::G16(runtime) });
                 }

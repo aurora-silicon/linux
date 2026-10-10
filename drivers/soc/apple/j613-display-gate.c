@@ -10,9 +10,11 @@
 #include <linux/unaligned.h>
 #include <linux/uuid.h>
 
-#include "dcp.h"
-#include "j613-25g83.h"
-#include "../../../pmdomain/apple/pmp-report-validation.h"
+#include <linux/init.h>
+#include <linux/soc/apple/j613-display.h>
+#include <video/nomodeset.h>
+
+#include "../../pmdomain/apple/pmp-report-validation.h"
 
 static unsigned int display_clock_hz;
 static struct of_changeset gate;
@@ -21,6 +23,7 @@ unsigned int apple_j613_25g83_clock_hz(void)
 {
 	return display_clock_hz;
 }
+EXPORT_SYMBOL_GPL(apple_j613_25g83_clock_hz);
 
 /* These are DT domain nodes, carrying the PMGR offsets, not copied registers. */
 static int j613_power_ready(void)
@@ -191,7 +194,7 @@ out:
 	return ret;
 }
 
-int __init apple_j613_25g83_coldplug(void)
+static int __init apple_j613_25g83_coldplug(void)
 {
 	static const char *const paths[] = {
 		"/soc/pmp-report@2d03c0000", "/soc/iommu@2d0300000",
@@ -283,3 +286,18 @@ out:
 		of_node_put(nodes[i]);
 	return ret;
 }
+
+/* Enable the admitted nodes before platform population, including modular DRM. */
+static int __init apple_j613_25g83_display_gate(void)
+{
+	int ret;
+
+	if (video_firmware_drivers_only() || !apple_t6030_display_gate_enabled())
+		return 0;
+	ret = apple_j613_25g83_coldplug();
+
+	if (ret)
+		pr_info("J613/25G83 display handoff refused: %d; keeping boot framebuffer\n", ret);
+	return 0;
+}
+arch_initcall(apple_j613_25g83_display_gate);

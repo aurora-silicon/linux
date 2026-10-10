@@ -46,9 +46,15 @@ pub(crate) struct Registered {
 
 impl Registered {
     pub(crate) fn start(pdev: &platform::Device<Core>) -> Result<Self> {
-        let resources = crate::g16_resources::from_device(pdev)?;
-        let firmware = crate::g16_firmware::identify_loaded(pdev, resources)?;
-        let device = crate::g16_device::Device::new(pdev, firmware)?;
+        let resources = crate::g16_resources::from_device(pdev).inspect_err(|error| {
+            dev_err!(pdev.as_ref(), "G16G: firmware/resource handoff admission failed: {:?}\n", error);
+        })?;
+        let firmware = crate::g16_firmware::identify_loaded(pdev, resources).inspect_err(|error| {
+            dev_err!(pdev.as_ref(), "G16G: loaded firmware admission failed: {:?}\n", error);
+        })?;
+        let device = crate::g16_device::Device::new(pdev, firmware).inspect_err(|error| {
+            dev_err!(pdev.as_ref(), "G16G: register/PMP supplier admission failed: {:?}\n", error);
+        })?;
         device.check_drm(pdev)?;
         device.check_mmu(pdev)?;
         device.check_tables(pdev)?;

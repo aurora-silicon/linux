@@ -6,6 +6,7 @@ config DRM_APPLE
 	depends on APPLE_RTKIT
 	depends on OF_ADDRESS
 	select APPLE_PMP_REPORT
+	select APPLE_J613_DISPLAY_GATE if ARCH_APPLE
 	select OF_DYNAMIC
 	select DRM_CLIENT_SELECTION
 	select DRM_KMS_HELPER
