@@ -968,14 +968,15 @@ brcmf_msgbuf_process_txstatus(struct brcmf_msgbuf *msgbuf, void *buf)
 	 */
 	ring_ifidx = msgbuf->flow->rings[flowid] ?
 		     brcmf_flowring_ifidx_get(msgbuf->flow, flowid) : 0;
-	if (ring_ifidx && __ratelimit(&brcmf_awdl_txs_rs))
-		brcmf_dbg(MSGBUF, "awdl txstatus ring_ifidx=%u msg_ifidx=%u awdl=%d flow=%u status=%d tx_status=0x%04x meta=%u dst=%pM\n",
-			  ring_ifidx, tx_status->msg.ifidx,
-			  ifp ? ifp->is_awdl : -1, flowid,
-			  (int)(s16)le16_to_cpu(tx_status->compl_hdr.status),
-			  le16_to_cpu(tx_status->tx_status),
-			  le16_to_cpu(tx_status->metadata_len),
-			  skb->len >= ETH_ALEN ? skb->data : (u8 *)"\0\0\0\0\0\0");
+	if (ring_ifidx && READ_ONCE(brcmf_awdl_trace) &&
+	    __ratelimit(&brcmf_awdl_txs_rs))
+		pr_info("brcmfmac: awdl txstatus ring_ifidx=%u msg_ifidx=%u awdl=%d flow=%u status=%d tx_status=0x%04x meta=%u dst=%pM\n",
+			ring_ifidx, tx_status->msg.ifidx,
+			ifp ? ifp->is_awdl : -1, flowid,
+			(int)(s16)le16_to_cpu(tx_status->compl_hdr.status),
+			le16_to_cpu(tx_status->tx_status),
+			le16_to_cpu(tx_status->metadata_len),
+			skb->len >= ETH_ALEN ? skb->data : (u8 *)"\0\0\0\0\0\0");
 
 	brcmf_txfinalize(ifp, skb, true);
 }

@@ -43,6 +43,15 @@ int brcmf_msg_level;
 module_param_named(debug, brcmf_msg_level, int, 0600);
 MODULE_PARM_DESC(debug, "Level of debug output");
 
+/* AWDL tx completions are logged per frame. Userspace counts them to tell a
+ * radio that is transmitting from one whose firmware has parked the AWDL data
+ * path: a parked radio completes nothing, and it looks healthy by every other
+ * measure. Off by default, writable at runtime so no reload is needed.
+ */
+int brcmf_awdl_trace;
+module_param_named(awdl_trace, brcmf_awdl_trace, int, 0644);
+MODULE_PARM_DESC(awdl_trace, "Log AWDL tx completions");
+
 static int brcmf_p2p_enable;
 module_param_named(p2pon, brcmf_p2p_enable, int, 0);
 MODULE_PARM_DESC(p2pon, "Enable legacy p2p management functionality");

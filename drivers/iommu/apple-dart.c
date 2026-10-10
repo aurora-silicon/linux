@@ -301,6 +301,12 @@ struct apple_dart {
 	u64 *locked_owned[DART_MAX_STREAMS][DART_MAX_TTBR];
 	/* Leaf tables behind the root slots firmware held when we attached. */
 	struct apple_dart_fw_root *locked_fw[DART_MAX_STREAMS][DART_MAX_TTBR];
+	/*
+	 * First DVA of the window of the domain using each locked stream.  The
+	 * window can be the client's own (apple,dma-range on the client node)
+	 * rather than the DART's.
+	 */
+	u64 locked_window[DART_MAX_STREAMS];
 };
 
 /*
@@ -982,22 +988,18 @@ static int apple_dart_fw_invalidate(struct apple_dart_stream_map *stream_map,
 	size_t entries = dart->pgsize / sizeof(u64);
 	u32 slot_shift = ilog2(dart->pgsize) + ilog2(entries);
 	u64 span = BIT_ULL(slot_shift + ilog2(entries));
-	u64 base = (dart->dma_min + dart->dma_offset) & ~(span - 1);
 	DECLARE_BITMAP(fw_slots, DART_MAX_ROOT_ENTRIES);
 	size_t first, last, i, end;
 	unsigned long flags;
 	int sid, ret = 0;
 
-	if (entries > DART_MAX_ROOT_ENTRIES || hi < base || lo > base + span - 1)
+	if (entries > DART_MAX_ROOT_ENTRIES)
 		return 0;
-	lo = max(lo, base);
-	hi = min(hi, base + span - 1);
-	first = (lo - base) >> slot_shift;
-	last = (hi - base) >> slot_shift;
 
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
 		const struct apple_dart_fw_root *fw;
 		const u64 *live;
+		u64 base, start_dva, end_dva;
 
 		__set_bit(sid, stream.sidmap);
 		if (apple_dart_readl(dart, DART_TCR(dart, sid)) &
@@ -1006,6 +1008,19 @@ static int apple_dart_fw_invalidate(struct apple_dart_stream_map *stream_map,
 								    false, 0, 0);
 			goto next;
 		}
+
+		/*
+		 * A three-level stream walks the low bits of the DVA; the TLB is
+		 * tagged with the whole DVA, inside the window of the stream's
+		 * domain.
+		 */
+		base = READ_ONCE(dart->locked_window[sid]) & ~(span - 1);
+		if (hi < base || lo > base + span - 1)
+			goto next;
+		start_dva = max(lo, base);
+		end_dva = min(hi, base + span - 1);
+		first = (start_dva - base) >> slot_shift;
+		last = (end_dva - base) >> slot_shift;
 
 		/* Nothing of Linux reaches the hardware without the root. */
 		bitmap_zero(fw_slots, entries);
@@ -1024,8 +1039,8 @@ static int apple_dart_fw_invalidate(struct apple_dart_stream_map *stream_map,
 			u64 start, stop;
 
 			end = find_next_bit(fw_slots, last + 1, i) - 1;
-			start = max(lo, base + ((u64)i << slot_shift));
-			stop = min(hi, base + ((u64)(end + 1) << slot_shift) - 1);
+			start = max(start_dva, base + ((u64)i << slot_shift));
+			stop = min(end_dva, base + ((u64)(end + 1) << slot_shift) - 1);
 			ret = apple_dart_t8110_hw_tlb_command_range(&stream, op, true,
 								    start, stop);
 			if (ret)
@@ -1481,6 +1496,18 @@ apple_dart_setup_translation(struct apple_dart_domain *domain,
 	stream_map->dart->hw->invalidate_tlb(stream_map);
 }
 
+/* Record the DVA window of @domain for invalidates of @stream_map's streams. */
+static void apple_dart_set_locked_window(struct apple_dart_domain *domain,
+					 struct apple_dart_stream_map *stream_map)
+{
+	struct apple_dart *dart = stream_map->dart;
+	u64 start = domain->domain.geometry.aperture_start + domain->dma_offset;
+	int sid;
+
+	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams)
+		WRITE_ONCE(dart->locked_window[sid], start);
+}
+
 static int
 apple_dart_setup_translation_locked(struct apple_dart_domain *domain,
 				    struct apple_dart_stream_map *stream_map)
@@ -1488,6 +1515,7 @@ apple_dart_setup_translation_locked(struct apple_dart_domain *domain,
 	struct io_pgtable_cfg *cfg = &io_pgtable_ops_to_pgtable(domain->pgtbl_ops)->cfg;
 	int i, ret;
 
+	apple_dart_set_locked_window(domain, stream_map);
 	for (i = 0; i < cfg->apple_dart_cfg.n_ttbrs; i++) {
 		ret = apple_dart_hw_map_locked_ttbr(stream_map, i);
 		if (ret)
@@ -1628,6 +1656,7 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 		for_each_stream_map(i, cfg, stream) {
 			if (!stream->dart->locked || !stream->dart->fw_mirror)
 				continue;
+			apple_dart_set_locked_window(dart_domain, stream);
 			for (index = 0; index < pgtbl_cfg.apple_dart_cfg.n_ttbrs; index++) {
 				ret = apple_dart_hw_map_locked_ttbr(stream, index);
 				if (ret) {
@@ -2414,7 +2443,7 @@ apple_dart_platform_ioremap_np_resource(struct platform_device *pdev,
 
 static int apple_dart_probe(struct platform_device *pdev)
 {
-	int ret;
+	int ret, sid;
 	u32 dart_params[4];
 	struct device_node *pd_np;
 	struct resource *res;
@@ -2643,6 +2672,9 @@ params_done:
 			 "using T602x PCIe-C bus DMA window %pad..%pad at DART offset %pad\n",
 			 &dart->dma_min, &dart->dma_max, &dart->dma_offset);
 	}
+
+	for (sid = 0; sid < DART_MAX_STREAMS; sid++)
+		dart->locked_window[sid] = dart->dma_min + dart->dma_offset;
 
 	if (dart->num_streams > DART_MAX_STREAMS) {
 		dev_err(&pdev->dev, "Too many streams (%d > %d)\n",

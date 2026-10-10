@@ -259,7 +259,6 @@ impl Compact {
 
 pub(super) struct Generation {
     deflake: mmu::KernelMapping,
-    auxiliary: mmu::KernelMapping,
     fragment_client: mmu::KernelMapping,
     state: KernelObject,
     fragment: KernelObject,
@@ -285,15 +284,6 @@ impl Generation {
             mmu::PROT_GPU_FW_SHARED_RW,
             mmu::UAT_PGSZ,
         )?;
-        let auxiliary_range = cfg::AUXILIARY;
-        let auxiliary = state.map_range(
-            vm,
-            storage::AUXILIARY..storage::AUXILIARY + storage::AUXILIARY_SIZE,
-            auxiliary_range,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_GPU_FW_SHARED_RW,
-            0,
-        )?;
         let fragment = alloc.kernel(
             mmu::UAT_PGSZ,
             mmu::UAT_PGSZ as u64,
@@ -311,7 +301,6 @@ impl Generation {
         KBox::new(
             Self {
                 deflake,
-                auxiliary,
                 fragment_client,
                 state,
                 fragment,
@@ -349,7 +338,10 @@ impl Generation {
             self.state.gpu_va() + storage::TA_STATUS as u64,
             self.fragment_client.iova(),
             self.fragment.gpu_va(),
-            self.auxiliary.iova(),
+            // The retained state already maps these pages into the client VM.
+            // The auxiliary framebuffer accepts a full GPU address; reusing this
+            // view avoids exhausting the fixed 4 MiB alias arena across pairs.
+            self.state.gpu_va() + storage::AUXILIARY as u64,
         ]
     }
 }
