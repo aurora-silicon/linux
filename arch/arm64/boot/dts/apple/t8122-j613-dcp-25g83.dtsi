@@ -94,7 +94,25 @@
 	status = "disabled";
 };
 
+/*
+ * G16G admission (g16_resources.rs) requires exactly six memory regions named
+ * ttbs, pagetables, handoff, shared-l2, fw-text and fw-data, in that order.
+ * The boot loader's 25G83 handoff replaces entries with those names and keeps
+ * any other entry ahead of them, so the generic "pagetables-l2" entry would
+ * leave seven regions and admission would fail with -EINVAL. List only the
+ * entries the boot loader replaces; it reserves uat-pagetables-l2 itself and
+ * links it as shared-l2.
+ *
+ * The ASC window is the 16 KiB ASC page that G16G maps exclusively. The
+ * generic 0x6c000 window also covers the GFX mailbox at +0x8000, which the
+ * mailbox driver has already claimed, so the exclusive mapping would fail
+ * with -EBUSY.
+ */
 &gpu {
+	reg = <0x2 0x92400000 0x0 0x4000>,
+	      <0x2 0x90000000 0x0 0x4000000>;
+	memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>;
+	memory-region-names = "ttbs", "pagetables", "handoff";
 	apple,pmp = <&pmp>;
 	status = "disabled";
 };
