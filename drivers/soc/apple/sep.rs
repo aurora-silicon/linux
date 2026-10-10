@@ -2274,6 +2274,11 @@ impl platform::Driver for SepDriver {
             return Err(EBUSY);
         }
 
+        if let Err(e) = pm::keep_domains(dev) {
+            dev_err!(dev, "could not keep the power domains on ({:?})\n", e);
+            return Err(e);
+        }
+
         let data = SepData::new(pdev)?;
 
         *data.mbox.lock() = Some(Mailbox::new_byname(dev, c"mbox", data.clone())?);
