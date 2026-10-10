@@ -971,13 +971,29 @@ apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 #define DART_MAX_ROOT_ENTRIES (SZ_16K / sizeof(u64))
 
 /*
+ * A slot of a four-level locked root that firmware holds: valid, and not an
+ * entry Linux published. The loader's four-level roots are not snapshotted,
+ * so this is the only firmware state Linux knows about them.
+ */
+static bool apple_dart_fw_slot_foreign(const u64 *live, const u64 *owned,
+				       size_t i)
+{
+	u64 pte = READ_ONCE(live[i]);
+
+	return (pte & APPLE_DART_PTE_VALID) && (!owned || pte != READ_ONCE(owned[i]));
+}
+
+/*
  * On DARTs that keep firmware roots (T8140 and T8142), the hardware keeps
  * using the translations behind the firmware-owned root slots, e.g. the
- * display controller scanning out the boot framebuffer while Linux attaches.
+ * display controller scanning out the boot framebuffer while Linux attaches,
+ * or the AOP firmware's own DMA on the AOP DART streams that Linux shares.
  * Invalidating those translations, for the whole stream or by DVA range, can
- * make the scanout fail a translation, and the display coprocessor panics on
- * the failed read. Linux never changes what those slots resolve to, so only
- * invalidate the parts of [lo, hi] reached through other root slots.
+ * break that DMA: the scanout fails a translation and the display
+ * coprocessor panics on the failed read, and a whole-stream invalidate on a
+ * busy AOP stream can stay busy for good. Linux never changes what those
+ * slots resolve to, so only invalidate the parts of [lo, hi] reached through
+ * other root slots, by DVA range, on three-level and four-level streams alike.
  */
 static int apple_dart_fw_invalidate(struct apple_dart_stream_map *stream_map,
 				    u64 lo, u64 hi)
@@ -986,8 +1002,7 @@ static int apple_dart_fw_invalidate(struct apple_dart_stream_map *stream_map,
 	struct apple_dart *dart = stream_map->dart;
 	struct apple_dart_stream_map stream = { .dart = dart };
 	size_t entries = dart->pgsize / sizeof(u64);
-	u32 slot_shift = ilog2(dart->pgsize) + ilog2(entries);
-	u64 span = BIT_ULL(slot_shift + ilog2(entries));
+	u32 table_bits = ilog2(entries);
 	DECLARE_BITMAP(fw_slots, DART_MAX_ROOT_ENTRIES);
 	size_t first, last, i, end;
 	unsigned long flags;
@@ -998,23 +1013,32 @@ static int apple_dart_fw_invalidate(struct apple_dart_stream_map *stream_map,
 
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
 		const struct apple_dart_fw_root *fw;
-		const u64 *live;
-		u64 base, start_dva, end_dva;
+		const u64 *live, *owned;
+		u64 base, span, start_dva, end_dva;
+		bool four_level;
+		u32 slot_shift;
 
 		__set_bit(sid, stream.sidmap);
-		if (apple_dart_readl(dart, DART_TCR(dart, sid)) &
-		    dart->hw->tcr_4level) {
-			ret = apple_dart_t8110_hw_tlb_command_range(&stream, op,
-								    false, 0, 0);
-			goto next;
+		four_level = apple_dart_readl(dart, DART_TCR(dart, sid)) &
+			     dart->hw->tcr_4level;
+		if (four_level) {
+			/*
+			 * A four-level stream walks the whole DVA: its root slots
+			 * cover the input address space from zero.
+			 */
+			slot_shift = ilog2(dart->pgsize) + 2 * table_bits;
+			span = BIT_ULL(min(slot_shift + table_bits, dart->ias));
+			base = 0;
+		} else {
+			/*
+			 * A three-level stream walks the low bits of the DVA; the
+			 * TLB is tagged with the whole DVA, inside the window of
+			 * the stream's domain.
+			 */
+			slot_shift = ilog2(dart->pgsize) + table_bits;
+			span = BIT_ULL(slot_shift + table_bits);
+			base = READ_ONCE(dart->locked_window[sid]) & ~(span - 1);
 		}
-
-		/*
-		 * A three-level stream walks the low bits of the DVA; the TLB is
-		 * tagged with the whole DVA, inside the window of the stream's
-		 * domain.
-		 */
-		base = READ_ONCE(dart->locked_window[sid]) & ~(span - 1);
 		if (hi < base || lo > base + span - 1)
 			goto next;
 		start_dva = max(lo, base);
@@ -1026,9 +1050,11 @@ static int apple_dart_fw_invalidate(struct apple_dart_stream_map *stream_map,
 		bitmap_zero(fw_slots, entries);
 		spin_lock_irqsave(&dart->lock, flags);
 		live = dart->locked_ttbr[sid][0];
+		owned = dart->locked_owned[sid][0];
 		fw = dart->locked_fw[sid][0];
 		for (i = first; live && i <= last; i++)
-			if (apple_dart_fw_slot_owned(fw, live, i))
+			if (four_level ? apple_dart_fw_slot_foreign(live, owned, i) :
+					 apple_dart_fw_slot_owned(fw, live, i))
 				__set_bit(i, fw_slots);
 		spin_unlock_irqrestore(&dart->lock, flags);
 		if (!live)
