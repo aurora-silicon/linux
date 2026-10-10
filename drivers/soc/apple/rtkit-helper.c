@@ -131,6 +131,8 @@ static void apple_rtkit_helper_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_rtkit_helper_of_match[] = {
+	/* J613 25G83 drops the generic compatible so U-Boot leaves the MTP alone. */
+	{ .compatible = "apple,t8122-rtk-helper-asc4" },
 	{ .compatible = "apple,rtk-helper-asc4" },
 	{},
 };

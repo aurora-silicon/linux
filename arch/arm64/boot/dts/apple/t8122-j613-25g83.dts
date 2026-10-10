@@ -4,6 +4,20 @@
 #include "t8122-j613-dcp-25g83.dtsi"
 #include "t8122-j613-25g83-qspi.dtsi"
 
+/*
+ * Keep U-Boot from starting the MTP. U-Boot's helper binds only the generic
+ * "apple,rtk-helper-asc4" compatible: it boots the MTP for its keyboard
+ * (which cannot drive the J613's AFE power sequencing) and quiesces it at
+ * ExitBootServices. The 25G83 MTP firmware (AppleMTPFirmwareMac-5340.61.4)
+ * then data-aborts when Linux wakes it (PC 0x103743c, ESR 0x96000004), so the
+ * internal keyboard and trackpad never start. Started fresh, as m1n1 hands it
+ * over without U-Boot, the same firmware runs. Linux binds the SoC-specific
+ * compatible instead.
+ */
+&mtp {
+	compatible = "apple,t8122-mtp", "apple,t8122-rtk-helper-asc4", "apple,mtp";
+};
+
 /* The 25G83 MTP_SYS uses GPIO-mediated AFE power sequencing. */
 &mtp_hid {
 	multi-touch {
