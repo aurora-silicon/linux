@@ -109,6 +109,15 @@ pub trait DriverObject: Sync + Send + Sized {
     ) -> Result<DmaBuf<<Self::Driver as drm::Driver>::Object>> {
         unimplemented!()
     }
+
+    /// Arguments for an object that the DRM core allocates on the driver's behalf, such as a
+    /// dma-buf imported from another device or a dumb buffer.
+    ///
+    /// The shmem helpers build the driver data of such an object from these arguments. If the
+    /// core then fails to initialize the object, it frees it without dropping the driver data.
+    fn core_object_args(_dev: &drm::Device<Self::Driver>, _size: usize) -> Result<Self::Args> {
+        build_error!(crate::error::VTABLE_DEFAULT_ERROR)
+    }
 }
 
 /// Trait that represents a GEM object subtype
