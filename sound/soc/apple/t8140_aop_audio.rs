@@ -52,6 +52,7 @@ use kernel::{
     },
     error::from_err_ptr,
     module_platform_driver,
+    new_mutex,
     new_spinlock,
     of,
     platform,
@@ -73,6 +74,7 @@ use kernel::{
         },
         Arc,
         ArcBorrow,
+        Mutex,
         SpinLock, //
     },
     types::{ForeignOwnable, Opaque},
@@ -432,6 +434,14 @@ struct StreamState {
 // sets it and close clears it under the same lock.
 unsafe impl Send for StreamState {}
 
+/// The holders of the low-power microphone's `runn` state: its own PCM
+/// while prepared, and every service startup that raises the fabric.
+struct LpaiRun {
+    users: u32,
+    /// `runn` is the last state the firmware confirmed.
+    running: bool,
+}
+
 #[pin_data]
 struct SndSocT8140AopData {
     dev: ARef<device::Device>,
@@ -440,7 +450,7 @@ struct SndSocT8140AopData {
     ring: Arc<SourceRing>,
     ring_bytes: Atomic<u32>,
     sequence: Atomic<u32>,
-    /// lpai is in `runn`.
+    /// The low-power microphone PCM holds a reference on `lpai_run`.
     powered: AtomicFlag,
     /// A low-power microphone report arrived since the last run request.
     reported: AtomicFlag,
@@ -478,6 +488,10 @@ struct SndSocT8140AopData {
     hpai_start_work: Work<Self, HPAI_START_WORK>,
     #[pin]
     stream: SpinLock<StreamState>,
+    /// Every lpai power request goes through here, see
+    /// [`SndSocT8140AopData::lpai_run_get`].
+    #[pin]
+    lpai_run: Mutex<LpaiRun>,
 }
 
 const SPKR_START_WORK: u64 = 0;
@@ -680,6 +694,39 @@ impl SndSocT8140AopData {
         Ok(())
     }
 
+    /// Takes a reference on the low-power microphone's `runn` state,
+    /// requesting it for the first holder.
+    ///
+    /// The PCM and the fabric raises share the stream, and every power
+    /// request is checked against the state the firmware reports back: a
+    /// raise that returns lpai to `idle` while another service starts up
+    /// makes that one read `idle` after requesting `runn`, and idles a
+    /// capture the PCM just started.  So they count their holds here and
+    /// only the first and last holder change the state.
+    fn lpai_run_get(&self) -> Result<()> {
+        let mut run = self.lpai_run.lock();
+        if !run.running {
+            self.reported.store(false, Relaxed);
+            self.set_power(POWER_STATE_RUN)?;
+            run.running = true;
+        }
+        run.users += 1;
+        Ok(())
+    }
+
+    /// Drops a reference taken by [`Self::lpai_run_get`], returning lpai to
+    /// `idle` after the last holder.  If that fails, the next holder finds
+    /// it still running.
+    fn lpai_run_put(&self) -> Result<()> {
+        let mut run = self.lpai_run.lock();
+        run.users -= 1;
+        if run.users == 0 && run.running {
+            self.set_power(POWER_STATE_IDLE)?;
+            run.running = false;
+        }
+        Ok(())
+    }
+
     // ---- the back-end services ----
 
     /// Property 202 with the service's sequence and a 24 MHz timestamp;
@@ -785,14 +832,10 @@ impl SndSocT8140AopData {
     /// does not do that (measured: `audio_p` stays gated for the whole leaf
     /// retry window), only a running stream does, after which a service in
     /// `pw0 ` keeps it up only while its stream runs. The low-power
-    /// microphone is attached for the firmware's lifetime, so run it briefly
-    /// around `f` when it is idle, once its first report has arrived.
+    /// microphone is attached for the firmware's lifetime, so hold it in
+    /// `runn` around `f`, once its first report has arrived.
     fn with_fabric_raised<R>(&self, f: impl FnOnce() -> Result<R>) -> Result<R> {
-        if self.powered.load(Relaxed) {
-            return f();
-        }
-        self.reported.store(false, Relaxed);
-        self.set_power(POWER_STATE_RUN)?;
+        self.lpai_run_get()?;
         let mut polls = 0;
         while !self.reported.load(Relaxed) && polls < FABRIC_RAISE_POLLS {
             kernel::time::delay::fsleep(kernel::time::Delta::from_millis(FABRIC_RAISE_POLL_MS));
@@ -802,7 +845,7 @@ impl SndSocT8140AopData {
             dev_warn!(self.dev, "lpai: no report while raising the fabric\n");
         }
         let ret = f();
-        if let Err(e) = self.set_power(POWER_STATE_IDLE) {
+        if let Err(e) = self.lpai_run_put() {
             dev_warn!(self.dev, "lpai: unable to idle after raising the fabric: {:?}\n", e);
         }
         ret
@@ -1192,12 +1235,11 @@ unsafe extern "C" fn lpai_pcm_close(substream: *mut bindings::snd_pcm_substream)
         let mut st = data.stream.lock();
         st.substream = ptr::null_mut();
     }
-    if data.powered.load(Relaxed) {
-        if let Err(e) = data.set_power(POWER_STATE_IDLE) {
+    if data.powered.xchg(false, Relaxed) {
+        if let Err(e) = data.lpai_run_put() {
             dev_err!(data.dev, "unable to return lpai to idle\n");
             return e.to_errno();
         }
-        data.powered.store(false, Relaxed);
     }
     0
 }
@@ -1221,7 +1263,7 @@ unsafe extern "C" fn lpai_pcm_prepare(substream: *mut bindings::snd_pcm_substrea
         data.hw_ptr_frames.store(0, Relaxed);
     }
     if !data.powered.load(Relaxed) {
-        if let Err(e) = data.set_power(POWER_STATE_RUN) {
+        if let Err(e) = data.lpai_run_get() {
             dev_err!(data.dev, "unable to run lpai\n");
             return e.to_errno();
         }
@@ -2620,8 +2662,10 @@ impl SndSocT8140AopDriver {
             // SAFETY: the card is freed once, while the binding remains live.
             unsafe { bindings::snd_card_free(self.card) };
         }
-        if self.data.powered.load(Relaxed) && self.data.set_power(POWER_STATE_IDLE).is_ok() {
-            self.data.powered.store(false, Relaxed);
+        // Every stream is closed now; retry an idle request that failed then.
+        let mut run = self.data.lpai_run.lock();
+        if run.running && self.data.set_power(POWER_STATE_IDLE).is_ok() {
+            run.running = false;
         }
     }
 }
@@ -2749,6 +2793,10 @@ impl platform::Driver for SndSocT8140AopDriver {
                     hw_ptr_bytes: 0,
                     period_acc: 0,
                     buffer_bytes: 0,
+                }),
+                lpai_run <- new_mutex!(LpaiRun {
+                    users: 0,
+                    running: false,
                 }),
             }),
             GFP_KERNEL,
