@@ -46,6 +46,51 @@ class Assembly(unittest.TestCase):
             self.manifest['legacy_gpu_boards']=bad
             with self.assertRaises(ValueError):self.assemble()
 
+    def neo_pair(self):
+        self.manifest['source_commits']['kernel']=mod.NEO_KERNEL
+        neo=dict(profile='j700-g17p-hal200', source_commits={'mesa':'c'*40,'m1n1':'d'*40}, packages={})
+        self.manifest['neo']=neo
+        for role,name in [('mesa','mesa-neo'),('m1n1','m1n1-neo')]:
+            files={'.PKGINFO':f'pkgname = {name}\narch = aarch64\n'.encode()}
+            if role=='m1n1':
+                files.update({'usr/lib/m1n1-neo/m1n1.bin':b'own Neo binary',
+                    'usr/share/m1n1-neo/source':('d'*40+'\n').encode(),
+                    'usr/share/m1n1-neo/profile':b'j700-g17p-hal200\n',
+                    'usr/share/m1n1-neo/build-config.h':b'#define RELEASE\n#define CHAINLOADING\n#define J700_ESP_STAGE2\n'})
+            else:
+                files.update({'opt/mesa-neo/share/mesa-neo/profile':b'j700-g17p-hal200\n',
+                    'opt/mesa-neo/share/mesa-neo/capabilities':b'opengl=native-experimental\nvulkan=honeykrisp-experimental\n',
+                    'usr/share/uwsm/env.d/51-mesa-neo':b'    . /opt/mesa-neo/libexec/mesa-neo-session-env\n',
+                    'opt/mesa-neo/libexec/mesa-neo-session-env':(ROOT/'neo/mesa-neo-session-env').read_bytes()})
+                for name2 in ('libexec/mesa-neo-abi-check','libexec/mesa-neo-loadcheck','bin/mesa-neo-probe','share/vulkan/icd.d/asahi_icd.aarch64.json'):
+                    files['opt/mesa-neo/'+name2]=b'fixture'
+            self.package('neo-'+role,name,files)
+            neo['packages'][role]=self.manifest['packages'].pop('neo-'+role)
+        neo['m1n1_bin_sha256']=hashlib.sha256(b'own Neo binary').hexdigest()
+        return neo
+    def test_neo_matched_pair_selects_separate_packages(self):
+        neo=self.neo_pair()
+        script,_=self.assemble()
+        for role in ('mesa','m1n1'):
+            self.assertIn('NEO_'+role.upper()+'_PACKAGE="'+neo['packages'][role]['file'],script)
+        self.assertIn('M1N1_PACKAGE="m1n1-aurora-',script)
+        self.assertIn('NEO_M1N1_BIN_SHA="'+neo['m1n1_bin_sha256']+'"',script)
+    def test_neo_pair_rejects_incomplete_or_mismatched_artifacts(self):
+        neo=self.neo_pair()
+        original=neo['packages']['mesa']['sha256']
+        neo['packages']['mesa']['sha256']='0'*64
+        with self.assertRaisesRegex(ValueError,'Neo package hash'): self.assemble()
+        neo['packages']['mesa']['sha256']=original
+        del neo['packages']['m1n1']
+        with self.assertRaisesRegex(ValueError,'both matched'): self.assemble()
+    def test_neo_pair_rejects_wrong_kernel_and_boot_binary(self):
+        neo=self.neo_pair()
+        self.manifest['source_commits']['kernel']='a'*40
+        with self.assertRaisesRegex(ValueError,'T8140 kernel'): self.assemble()
+        self.manifest['source_commits']['kernel']=mod.NEO_KERNEL
+        neo['m1n1_bin_sha256']='0'*64
+        with self.assertRaisesRegex(ValueError,'Neo bootloader hash'): self.assemble()
+
     def test_complete_artifact_manifest_pins_exact_stack(self):
         script,ident=self.assemble()
         self.assertIn(f'M3_STACK_ID="{ident}"',script)

@@ -1,0 +1,48 @@
+# Copyright 2026 Chris Kearney
+# SPDX-License-Identifier: MIT
+# Sourced at graphical-session startup. The profile is exclusive to T8140.
+mesa_neo_session_env() {
+    tr '\0' '\n' </proc/device-tree/compatible 2>/dev/null | grep -qx 'apple,t8140' || return 0
+    _neo_prefix=/opt/mesa-neo
+    _neo_intent=no
+    if [ -e /etc/mesa-neo/gpu-experiment ] &&
+       [ "$(cat /etc/mesa-neo/profile 2>/dev/null)" = j700-g17p-hal200 ] &&
+       [ ! -e /etc/mesa-neo/disable ] &&
+       [ ! -e "${XDG_CONFIG_HOME:-$HOME/.config}/mesa-neo/disable" ]; then _neo_intent=yes; fi
+    unset VK_DRIVER_FILES VK_ICD_FILENAMES MESA_LOADER_DRIVER_OVERRIDE GALLIUM_DRIVER
+    unset LIBGL_DRIVERS_PATH GBM_BACKENDS_PATH __EGL_VENDOR_LIBRARY_FILENAMES
+    # Remove stale M3 or Neo prefix entries before selecting this stack.
+    _neo_ld=
+    _neo_ifs=$IFS; IFS=:
+    for _neo_dir in ${LD_LIBRARY_PATH:-}; do
+        case "$_neo_dir" in /opt/mesa-m3/lib|/opt/mesa-m3/25g83/lib|/opt/mesa-neo/lib|'') continue;; esac
+        _neo_ld=${_neo_ld:+$_neo_ld:}$_neo_dir
+    done
+    IFS=$_neo_ifs
+    export LD_LIBRARY_PATH="$_neo_ld"
+    _neo_nodes=0; _neo_node=
+    for _neo_sys in /sys/class/drm/renderD*; do
+        [ -r "$_neo_sys/device/of_node/compatible" ] || continue
+        tr '\0' '\n' <"$_neo_sys/device/of_node/compatible" | grep -qx 'apple,agx-t8140' || continue
+        _neo_nodes=$((_neo_nodes+1)); _neo_node=/dev/dri/${_neo_sys##*/}
+    done
+    if [ "$_neo_intent" = yes ] && [ "$_neo_nodes" = 1 ] && [ -r "$_neo_node" ] && [ -w "$_neo_node" ] &&
+       [ "$(cat "$_neo_prefix/share/mesa-neo/profile" 2>/dev/null)" = j700-g17p-hal200 ] &&
+       "$_neo_prefix/libexec/mesa-neo-abi-check" j700-g17p-hal200 "$_neo_node" >/dev/null 2>&1 &&
+       LD_LIBRARY_PATH="$_neo_prefix/lib" "$_neo_prefix/libexec/mesa-neo-loadcheck" "$_neo_prefix" >/dev/null 2>&1; then
+        export LD_LIBRARY_PATH="$_neo_prefix/lib${_neo_ld:+:$_neo_ld}"
+        export LIBGL_DRIVERS_PATH="$_neo_prefix/lib/dri" GBM_BACKENDS_PATH="$_neo_prefix/lib/gbm"
+        export __EGL_VENDOR_LIBRARY_FILENAMES="$_neo_prefix/share/glvnd/egl_vendor.d/50_mesa.json"
+        export MESA_LOADER_DRIVER_OVERRIDE=asahi GALLIUM_DRIVER=asahi
+        export VK_DRIVER_FILES="$_neo_prefix/share/vulkan/icd.d/asahi_icd.aarch64.json"
+        export VK_ICD_FILENAMES="$VK_DRIVER_FILES" VK_LOADER_LAYERS_DISABLE='~implicit~'
+        export MESA_NEO_PROFILE=j700-g17p-hal200
+        unset LIBGL_ALWAYS_SOFTWARE MESA_NEO_FALLBACK
+    else
+        export LIBGL_ALWAYS_SOFTWARE=1 MESA_NEO_FALLBACK=software
+        unset MESA_NEO_PROFILE
+    fi
+}
+mesa_neo_session_env
+unset -f mesa_neo_session_env
+unset _neo_prefix _neo_intent _neo_nodes _neo_node _neo_sys _neo_ld _neo_ifs _neo_dir

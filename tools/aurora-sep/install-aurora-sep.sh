@@ -907,6 +907,7 @@ m1n1_for_this_mac() {
 m1n1_version() {
   local file=${M1N1_PACKAGE%% *}
   file=${file#m1n1-aurora-}
+  file=${file#m1n1-neo-}
   echo "${file%-aarch64.pkg.tar.zst}"
 }
 
@@ -992,7 +993,9 @@ m3_oslog_overlap_check() {
 
 # The sha256 of a downloaded m1n1-aurora package's m1n1.bin.
 m1n1_pkg_sha() {
-  { bsdtar -xOf "$1" usr/lib/asahi-boot/m1n1.bin | sha256sum | cut -d' ' -f1; } 2>/dev/null
+  local path=usr/lib/asahi-boot/m1n1.bin
+  if ((NEO_GPU)); then path=usr/lib/m1n1-neo/m1n1.bin; fi
+  { bsdtar -xOf "$1" "$path" | sha256sum | cut -d' ' -f1; } 2>/dev/null
 }
 
 # The sha256 of the first $2 bytes of boot.bin $1: the m1n1 at its start, when
@@ -3315,6 +3318,7 @@ m1n1_update() {
 # $(...), so the pipeline must succeed even when grep matches nothing.)
 DTBS=$(pacman -Qlq linux-aurora 2>/dev/null | grep '/dtbs/[^/]*\.dtb$' || true)
 EOF
+  if ((NEO_GPU)); then echo "M1N1=/usr/lib/m1n1-neo/m1n1.bin" >>"$tmp"; fi
   $sudo install -m 644 "$tmp" "$conf"
   rm -f "$tmp"
   if [[ ! -f $STATE/boot.bin.saved ]] && target=$(esp_bootbin); then
@@ -3594,6 +3598,7 @@ install_all() {
   local -a entries
   release_source
   require_supported_soc
+  neo_gpu_plan
   version_notice
   sep_write_notice
   ane_dkms_notice
@@ -3619,7 +3624,7 @@ install_all() {
   trap 'm3_install_cleanup' EXIT
   if is_neo && ! m1n1_for_this_mac; then say "Keeping this MacBook Neo's own m1n1 (m1n1-aurora has no T8140 support)"; fi
   if [[ $M3_MODE == kernel ]]; then say "Keeping this M3's own m1n1 and boot.bin"; fi
-  mapfile -t entries < <(packages_for_this_mac; m3_gpu_files; m3_pro_mesa_files)
+  mapfile -t entries < <(packages_for_this_mac; m3_gpu_files; m3_pro_mesa_files; neo_gpu_files)
   for entry in "${entries[@]}"; do
     read -r file sha <<<"$entry"
     say "Downloading $file"
@@ -3636,6 +3641,7 @@ install_all() {
     fi
     [[ $(sha256sum "$work/$file" | cut -d' ' -f1) == "$sha" ]] || die "$file does not match its published checksum"
   done
+  neo_gpu_package_check
   desktop_fixes_verify "$work"
   if ((M3_GPU_PERSISTENT)); then m3_persistent_package_check "$work/${M3_PRO_MESA_PACKAGE%% *}"; fi
   m3_pro_mesa_set_aside
@@ -3659,6 +3665,7 @@ install_all() {
   bootbin_backup
   $sudo install -d "$STATE"
   snapshot_boot_state
+  neo_gpu_transaction_begin
   if [[ ! -f $STATE/previous && $chain == grub ]]; then
     keep_grub_fallback "$kernel"
   fi
@@ -3758,6 +3765,7 @@ install_all() {
   m3_pro_mesa_install
   m3_pro_mesa_render
   m3_pro_mesa_record
+  neo_gpu_activate
   pacman -Q linux-aurora libfprint aurora-touchid
   if ((M3_GPU_PERSISTENT)); then m3_gpu_check_install; fi
   if ((M3_GPU_PERSISTENT)); then m3_persistent_transaction_commit; fi
@@ -3826,7 +3834,8 @@ install_all() {
 }
 
 uninstall_all() {
-  local previous=linux-asahi m3_mode=none
+  local previous=linux-asahi m3_mode=none neo_restore=0
+  if is_neo && [[ -f $STATE/neo-before.json ]]; then neo_restore=1; fi
   require_supported_soc "Uninstalling, which rebuilds boot.bin with the stock m1n1,"
   # Before anything changes: a boot left armed for the kernel being removed would fail Limine's
   # hash check at the next boot.
@@ -3877,7 +3886,7 @@ uninstall_all() {
   # rebuild below, so boot.bin goes back to the packaged m1n1 and DTBs.
   # A kernel-only M3's boot.bin and update-m1n1 configuration were never
   # changed; only this script's freeze comes off, at the end.
-  if [[ $(boot_chain) != grub && $m3_mode != kernel ]]; then
+  if [[ $(boot_chain) != grub && $m3_mode != kernel ]] && ((!neo_restore)); then
     if [[ -f $STATE/update-m1n1.default.saved ]]; then
       $sudo cp "$STATE/update-m1n1.default.saved" "$UPDATE_M1N1_CONF"
     else
@@ -3891,7 +3900,7 @@ uninstall_all() {
       $sudo mv "$STATE/linux-asahi.preset.saved" /etc/mkinitcpio.d/linux-asahi.preset
     [[ -f $STATE/grub.default.saved ]] && $sudo cp "$STATE/grub.default.saved" /etc/default/grub
     m3_persistent_remove
-    if [[ $m3_mode != kernel ]]; then
+    if [[ $m3_mode != kernel ]] && ((!neo_restore)); then
       if [[ -f $STATE/update-m1n1.default.saved ]]; then
         $sudo cp "$STATE/update-m1n1.default.saved" "$UPDATE_M1N1_CONF"
       else
@@ -3919,6 +3928,14 @@ uninstall_all() {
   m3_gpu_remove
   m3_pro_mesa_remove
   m3_gpu_check_remove
+  if ((neo_restore)); then
+    neo_gpu_restore "$STATE/neo-before.json"
+    $sudo update-m1n1 || {
+      neo_gpu_restore "$STATE/neo-before.json"
+      warn "stock boot.bin rebuild failed; this Neo's original boot.bin was restored"
+    }
+    say "Restored this Neo's original stage 2 and configuration; native Neo GPU selection removed"
+  fi
   # The m1n1 builds that failed on this Mac stay recorded, so a later install
   # never puts one of them back.
   local failed=""
@@ -6176,6 +6193,7 @@ m3_esp_space_check() {
 
 m3_install_cleanup() {
   local status=$?
+  if ((NEO_GPU_PREPARED && !NEO_GPU_COMMITTED)); then neo_gpu_restore "$STATE/neo-transaction.json" || warn "could not restore Neo boot state"; fi
   if ((M3_PERSISTENT_TRANSACTION_ACTIVE)); then
     m3_persistent_transaction_rollback || warn "could not restore experimental activation settings; use the retained GPU-off entry"
     if ((M3_PERSISTENT_MAIN_ARMED)); then
@@ -7367,6 +7385,144 @@ if __name__ == '__main__':
 AURORA_DESKTOP_FIXES_PY
 }
 
+# A separate T8140 profile keeps the G17 ABI and bootloader out of M3 sessions.
+NEO_GPU=0
+NEO_GPU_PREPARED=0
+NEO_GPU_COMMITTED=0
+NEO_GPU_CONFIG=/etc/mesa-neo
+NEO_MESA_PREFIX=/opt/mesa-neo
+NEO_GPU_PROFILE=j700-g17p-hal200
+NEO_MESA_PACKAGE=""
+NEO_M1N1_PACKAGE=""
+NEO_M1N1_BIN_SHA=""
+
+neo_gpu_plan() {
+  if is_neo && [[ -f $STATE/neo-gpu && -e $NEO_GPU_CONFIG/gpu-experiment ]] &&
+     [[ $(cat "$NEO_GPU_CONFIG/profile" 2>/dev/null) == "$NEO_GPU_PROFILE" ]]; then NEO_GPU=1; fi
+  ((NEO_GPU)) || return 0
+  is_neo && [[ $(this_board) == j700 ]] || die "--neo-gpu requires a MacBook Neo (J700/T8140); nothing was installed"
+  ((M3_GPU_PERSISTENT == 0 && M3_GPU_EXPERIMENT == 0 && M3_TRY == 0)) || die "Neo and M3 GPU options cannot be combined"
+  local pin
+  for pin in "$NEO_MESA_PACKAGE" "$NEO_M1N1_PACKAGE"; do
+    [[ $pin =~ ^[a-zA-Z0-9._+-]+\.pkg\.tar\.zst\ [0-9a-f]{64}$ ]] || die "this installer has no frozen Neo package pair; nothing was installed"
+  done
+  [[ $NEO_M1N1_BIN_SHA =~ ^[0-9a-f]{64}$ ]] || die "this installer has no frozen Neo bootloader; nothing was installed"
+  update_m1n1_frozen && die "update-m1n1 is disabled in $UPDATE_M1N1_CONF; keep that owner setting or remove it before --neo-gpu"
+  command -v update-m1n1 >/dev/null || die "update-m1n1 is required for the Neo profile"
+  esp_bootbin >/dev/null || die "the Neo's existing boot.bin must be mounted before installation"
+  M1N1_PACKAGE=$NEO_M1N1_PACKAGE
+  M1N1_BIN_SHA=$NEO_M1N1_BIN_SHA
+  M1N1_BIN=/usr/lib/m1n1-neo/m1n1.bin
+  NEO_AURORA_M1N1=1
+  PINNED="$PINNED mesa-neo m1n1-neo"
+  say "Installing the matched Neo native OpenGL/Honeykrisp Vulkan profile; preserving this Neo's U-Boot and firmware"
+}
+
+neo_gpu_files() {
+  ((NEO_GPU)) && printf '%s\n' "$NEO_MESA_PACKAGE"
+  return 0
+}
+
+neo_gpu_package_check() {
+  ((NEO_GPU)) || return 0
+  local mesa=$work/${NEO_MESA_PACKAGE%% *} boot=$work/${NEO_M1N1_PACKAGE%% *}
+  [[ $(bsdtar -xOf "$mesa" opt/mesa-neo/share/mesa-neo/profile) == "$NEO_GPU_PROFILE" ]] || die "Neo Mesa profile marker differs; nothing was installed"
+  [[ $(bsdtar -xOf "$boot" usr/share/m1n1-neo/profile) == "$NEO_GPU_PROFILE" ]] || die "Neo bootloader profile marker differs; nothing was installed"
+  bsdtar -xOf "$boot" usr/share/m1n1-neo/build-config.h | grep -qx '#define J700_ESP_STAGE2' || die "Neo bootloader is not an ESP stage 2; nothing was installed"
+  local path
+  for path in opt/mesa-neo/libexec/mesa-neo-abi-check opt/mesa-neo/libexec/mesa-neo-loadcheck \
+    opt/mesa-neo/share/vulkan/icd.d/asahi_icd.aarch64.json opt/mesa-neo/bin/mesa-neo-probe; do
+    bsdtar -tf "$mesa" | grep -qx "$path" || die "Neo Mesa lacks $path; nothing was installed"
+  done
+}
+
+neo_gpu_transaction_begin() {
+  ((NEO_GPU)) || return 0
+  local target original_m1n1
+  target=$(esp_bootbin) || die "the Neo's boot.bin disappeared"
+  # Keep the original binary as well as boot.bin: its package may be replaced.
+  original_m1n1=$($sudo bash -c 'M1N1=/usr/lib/asahi-boot/m1n1.bin; [[ ! -f $1 ]] || source "$1"; printf "%s" "$M1N1"' _ "$UPDATE_M1N1_CONF")
+  [[ $original_m1n1 == /* && -f $original_m1n1 && ! -L $original_m1n1 ]] || die "cannot preserve this Neo's original M1N1 binary: $original_m1n1"
+
+  $sudo install -d "$STATE"
+  $sudo python3 - "$STATE/neo-transaction.json" "$UPDATE_M1N1_CONF" "$target" \
+    "$NEO_GPU_CONFIG/profile" "$NEO_GPU_CONFIG/gpu-experiment" "$STATE/neo-gpu" "$original_m1n1" <<'NEO_SNAPSHOT'
+import base64,json,stat,sys
+from pathlib import Path
+rows=[]
+for name in sys.argv[2:]:
+ p=Path(name)
+ if p.exists() or p.is_symlink():
+  info=p.lstat()
+  if not stat.S_ISREG(info.st_mode): raise SystemExit('Neo transaction needs regular files: '+name)
+  rows.append({'path':name,'mode':stat.S_IMODE(info.st_mode),'data':base64.b64encode(p.read_bytes()).decode()})
+ else: rows.append({'path':name,'data':None})
+p=Path(sys.argv[1]);p.write_text(json.dumps(rows));p.chmod(0o600)
+NEO_SNAPSHOT
+  [[ -f $STATE/neo-before.json ]] || $sudo cp "$STATE/neo-transaction.json" "$STATE/neo-before.json"
+  NEO_GPU_PREPARED=1
+  neo_gpu_boot_config
+}
+
+neo_gpu_boot_config() {
+  local tmp
+  tmp=$(mktemp)
+  if [[ -f $UPDATE_M1N1_CONF ]]; then
+    $sudo sed '/^# >>> aurora-sep: Neo stage2$/,/^# <<< aurora-sep: Neo stage2$/d' "$UPDATE_M1N1_CONF" > "$tmp"
+  fi
+  cat >>"$tmp" <<'NEO_BOOT_CONFIG'
+# >>> aurora-sep: Neo stage2
+M1N1=/usr/lib/m1n1-neo/m1n1.bin
+DTBS=$(pacman -Qlq linux-aurora 2>/dev/null | grep '/dtbs/[^/]*\.dtb$' || true)
+# <<< aurora-sep: Neo stage2
+NEO_BOOT_CONFIG
+  $sudo install -Dm644 "$tmp" "$UPDATE_M1N1_CONF"
+  rm -f "$tmp"
+}
+
+neo_gpu_restore() {
+  local snapshot=$1
+  [[ -f $snapshot ]] || return 0
+  $sudo python3 - "$snapshot" <<'NEO_RESTORE'
+import base64,json,os,tempfile,sys
+from pathlib import Path
+for row in json.loads(Path(sys.argv[1]).read_text()):
+ p=Path(row['path'])
+ if row['data'] is None: p.unlink(missing_ok=True);continue
+ p.parent.mkdir(parents=True,exist_ok=True)
+ fd,name=tempfile.mkstemp(prefix='.'+p.name+'.neo-',dir=p.parent)
+ try:
+  with os.fdopen(fd,'wb') as f:
+   f.write(base64.b64decode(row['data']));f.flush();os.fsync(f.fileno())
+  os.chmod(name,row['mode']);os.replace(name,p)
+ finally:
+  if os.path.exists(name):os.unlink(name)
+NEO_RESTORE
+  sync
+}
+
+neo_gpu_activate() {
+  ((NEO_GPU)) || return 0
+  [[ $(cat "$NEO_MESA_PREFIX/share/mesa-neo/profile") == "$NEO_GPU_PROFILE" ]] || die "installed Neo Mesa marker differs"
+  update_m1n1_frozen && die "Neo boot.bin was not rebuilt: update-m1n1 is disabled"
+  m1n1_check_and_record
+  local name uid gid home shell password
+  getent group render >/dev/null || $sudo groupadd --system render
+  while IFS=: read -r name password uid gid password home shell; do
+    [[ $uid =~ ^[0-9]+$ ]] || continue
+    ((uid >= 1000 && uid < 60000)) || continue
+    [[ $shell != */nologin && $shell != */false ]] || continue
+    $sudo usermod -aG render "$name"
+  done < <(getent passwd)
+  $sudo install -d "$NEO_GPU_CONFIG"
+  printf '%s\n' "$NEO_GPU_PROFILE" | $sudo tee "$NEO_GPU_CONFIG/profile" >/dev/null
+  printf '# Experimental Neo GPU selected by the matched installer. Remove this file to use software rendering.\n' | $sudo tee "$NEO_GPU_CONFIG/gpu-experiment" >/dev/null
+  printf '%s\n' "$NEO_GPU_PROFILE" | $sudo tee "$STATE/neo-gpu" >/dev/null
+  NEO_GPU_COMMITTED=1
+  $sudo rm -f "$STATE/neo-transaction.json"
+  say "Neo GPU profile installed. Reboot, then run: /opt/mesa-neo/bin/mesa-neo-probe"
+}
+
 # Tests source this file for its functions only.
 if [[ ${AURORA_SEP_SOURCE_ONLY:-} == 1 ]]; then return 0; fi
 
@@ -7375,6 +7531,7 @@ if [[ ${AURORA_SEP_SOURCE_ONLY:-} == 1 ]]; then return 0; fi
 args=()
 for a in "$@"; do
   case $a in
+    --neo-gpu) NEO_GPU=1 ;;
     --m3-handoff) M3_TRY=1 ;;
     --m3-gpu-experiment) M3_GPU_EXPERIMENT=1 ;;
     --m3-gpu) M3_GPU_AUTO=1; M3_GPU_PERSISTENT=1; M3_TRY=1 ;;
@@ -7386,6 +7543,9 @@ for a in "$@"; do
   esac
 done
 set -- "${args[@]}"
+if ((NEO_GPU)) && [[ -n ${1:-} && $1 != --read-only ]]; then
+  die "--neo-gpu goes with an install, not with $1"
+fi
 if ((M3_GPU_AUTO && M3_GPU_EXPLICIT_PROFILE)); then
   die "use --m3-gpu by itself to detect the profile, or choose one explicit GPU profile"
 fi
@@ -7416,5 +7576,5 @@ case ${1:-} in
   --m3-power-survey) m3_power_survey ;;
   --m3-gpu-check) shift; m3_gpu_check_run "$@" ;;
   --agent-prompt) release_source >&2; prompt_notice; agent_prompt ;;
-  *) die "unknown option $1 (--read-only, --uninstall, --reset-touchid, --agent-prompt, --m3-report, --m3-power-survey, --m3-handoff, --m3-gpu, --m3-gpu-check, --m3-gpu-experiment, --m3-gpu-persistent, --m3-profile=j613-25g83, --no-m3-mesa or --desktop-fixes)" ;;
+  *) die "unknown option $1 (--read-only, --uninstall, --reset-touchid, --agent-prompt, --m3-report, --m3-power-survey, --neo-gpu, --m3-handoff, --m3-gpu, --m3-gpu-check, --m3-gpu-experiment, --m3-gpu-persistent, --m3-profile=j613-25g83, --no-m3-mesa or --desktop-fixes)" ;;
 esac

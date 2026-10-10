@@ -12,6 +12,7 @@ import subprocess
 ROLES = {'kernel':'linux-aurora', 'headers':'linux-aurora-headers', 'm1n1':'m1n1-aurora',
          'mesa':'mesa-m3', 'libfprint':'libfprint', 'touchid':'aurora-touchid'}
 HEX = re.compile(r'[0-9a-f]{64}')
+NEO_KERNEL = 'a5f101d4f303d68b773f869e0f0c242090181202'
 
 def member(path, name):
     return subprocess.check_output(['bsdtar', '-xOf', str(path), name])
@@ -38,6 +39,64 @@ def desktop_data(manifest, directory):
         raise ValueError('guarded runtime catalog differs from the paired package payload')
     return base64.b64encode(json.dumps(data, sort_keys=True, separators=(',', ':')).encode()).decode()
 
+def neo_data(manifest, directory):
+    neo = manifest.get('neo')
+    if neo is None:
+        return {}
+    if manifest['source_commits']['kernel'] != NEO_KERNEL:
+        raise ValueError('Neo requires the matched T8140 kernel')
+    if neo.get('profile') != 'j700-g17p-hal200':
+        raise ValueError('Neo profile differs')
+    sources = neo.get('source_commits', {})
+    if any(not re.fullmatch(r'[0-9a-f]{40}', sources.get(k, '')) for k in ('mesa', 'm1n1')):
+        raise ValueError('exact Neo Mesa and m1n1 source commits are required')
+    packages = neo.get('packages', {})
+    if set(packages) != {'mesa', 'm1n1'}:
+        raise ValueError('Neo needs both matched packages')
+    pins = {}; paths = {}
+    for role, name in (('mesa', 'mesa-neo'), ('m1n1', 'm1n1-neo')):
+        item = packages[role]; path = directory / item['file']
+        if path.name != item['file'] or not re.fullmatch(r'[A-Za-z0-9._+:-]+\.pkg\.tar\.zst', path.name):
+            raise ValueError('Neo package filename must be a local basename')
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if not HEX.fullmatch(item['sha256']) or digest != item['sha256']:
+            raise ValueError('Neo package hash differs')
+        info = member(path, '.PKGINFO').decode()
+        if re.findall(r'^pkgname = (.+)$', info, re.M) != [name] or re.findall(r'^arch = (.+)$', info, re.M) != ['aarch64']:
+            raise ValueError('Neo package identity differs')
+        pins['NEO_'+role.upper()+'_PACKAGE'] = path.name+' '+digest
+        paths[role] = path
+    boot = member(paths['m1n1'], 'usr/lib/m1n1-neo/m1n1.bin')
+    digest = hashlib.sha256(boot).hexdigest()
+    if digest != neo.get('m1n1_bin_sha256'):
+        raise ValueError('Neo bootloader hash differs')
+    pins['NEO_M1N1_BIN_SHA'] = digest
+    if member(paths['m1n1'], 'usr/share/m1n1-neo/source').strip().decode() != sources['m1n1']:
+        raise ValueError('Neo bootloader source differs')
+    cfg = member(paths['m1n1'], 'usr/share/m1n1-neo/build-config.h')
+    for flag in (b'RELEASE', b'CHAINLOADING', b'J700_ESP_STAGE2'):
+        if not re.search(rb'^#define '+flag+rb'$', cfg, re.M):
+            raise ValueError('Neo ESP configuration differs')
+    if b'#define T8140_KIS_PROXY' in cfg or b'#define J700_CDC_PROXY' in cfg:
+        raise ValueError('Neo ESP must not use a debug proxy')
+    for role, path in (('mesa', 'opt/mesa-neo/share/mesa-neo/profile'), ('m1n1', 'usr/share/m1n1-neo/profile')):
+        if member(paths[role], path) != b'j700-g17p-hal200\n':
+            raise ValueError('Neo installed profile marker differs')
+    capabilities = member(paths['mesa'], 'opt/mesa-neo/share/mesa-neo/capabilities')
+    if capabilities != b'opengl=native-experimental\nvulkan=honeykrisp-experimental\n':
+        raise ValueError('Neo graphics capabilities differ')
+    for path in ('libexec/mesa-neo-abi-check', 'libexec/mesa-neo-loadcheck', 'bin/mesa-neo-probe',
+                 'share/vulkan/icd.d/asahi_icd.aarch64.json'):
+        member(paths['mesa'], 'opt/mesa-neo/'+path)
+    hook = member(paths['mesa'], 'usr/share/uwsm/env.d/51-mesa-neo')
+    if not re.search(rb'(?m)^ *\. /opt/mesa-neo/libexec/mesa-neo-session-env$', hook):
+        raise ValueError('Neo session delegation differs')
+    session = member(paths['mesa'], 'opt/mesa-neo/libexec/mesa-neo-session-env')
+    canonical = Path(__file__).with_name('neo') / 'mesa-neo-session-env'
+    if session != canonical.read_bytes():
+        raise ValueError('Neo package session helper differs from installer')
+    return pins
+
 def assemble(template, manifest, directory):
     if manifest.get('schema') != 'aurora.m3-matched-stack/1': raise ValueError('manifest schema differs')
     for field in ('version','tag'):
@@ -49,7 +108,7 @@ def assemble(template, manifest, directory):
     if (not isinstance(boards, list) or not boards or len(set(boards)) != len(boards) or
             any(b not in ('j613', 'j615') for b in boards)):
         raise ValueError('legacy GPU boards must name supported Air boards once')
-    if 'j615' in boards and sources['kernel'] != 'a4d7ff4acdefcbce7daa7f57866413f21f05fb75':
+    if 'j615' in boards and sources['kernel'] not in ('a4d7ff4acdefcbce7daa7f57866413f21f05fb75', NEO_KERNEL):
         raise ValueError('J615 legacy GPU requires the matched J615 kernel consumer')
     if 'j615' in boards and sources['m1n1'] != '74ba6bea52d1f865d204bb3f8168705a148fd5c5':
         raise ValueError('J615 legacy GPU requires the matched J615 m1n1 producer')
@@ -92,12 +151,14 @@ def assemble(template, manifest, directory):
         versions = manifest.get(field,[])
         if not versions or any(not re.fullmatch(r'[A-Za-z0-9._+-]+',v) for v in versions):
             raise ValueError('qualified source-built stage1 versions required for 25 profile')
+    neo_pins = neo_data(manifest, directory)
     stack_id = hashlib.sha256(json.dumps(manifest,sort_keys=True,separators=(',',':')).encode()).hexdigest()
     s = template
     substitutions = dict(VERSION=manifest['version'],TAG=manifest['tag'],M1N1_BIN_SHA=binary_sha,
                          DESKTOP_FIXES_DATA=desktop_data(manifest, directory),
                          M3_STACK_ID=stack_id, M3_PERSISTENT_BOARDS=' '.join(boards), M3_STAGE1_25_VERSIONS=' '.join(manifest['stage1_25_versions']),
                          M1N1_PACKAGE=pins['m1n1'],M3_PRO_MESA_PACKAGE=pins['mesa'])
+    substitutions.update(neo_pins)
     for key,value in substitutions.items():
         replacement = key+'="'+value+'"' if key not in ('VERSION','TAG','M1N1_BIN_SHA') else key+'='+value
         s,n = re.subn(r'^'+key+r'=.*$',lambda _:replacement,s,count=1,flags=re.M)
