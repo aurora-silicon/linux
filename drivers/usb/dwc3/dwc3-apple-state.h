@@ -16,7 +16,6 @@ enum dwc3_apple_state {
 	DWC3_APPLE_NO_CABLE, /* No cable connected, dwc3 suspended after dwc3_core_exit */
 	DWC3_APPLE_HOST, /* Cable connected, dwc3 in host mode */
 	DWC3_APPLE_DEVICE, /* Cable connected, dwc3 in device mode */
-	DWC3_APPLE_SUSPENDED, /* Fixed-hub host asleep: core exited, xhci still registered */
 };
 
 /**

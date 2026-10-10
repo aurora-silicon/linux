@@ -26,7 +26,7 @@ static void dwc3_apple_device_selected_before_reset_test(struct kunit *test)
 static void dwc3_apple_non_role_test(struct kunit *test)
 {
 	static const enum dwc3_apple_state states[] = {
-		DWC3_APPLE_PROBE_PENDING, DWC3_APPLE_NO_CABLE, DWC3_APPLE_SUSPENDED,
+		DWC3_APPLE_PROBE_PENDING, DWC3_APPLE_NO_CABLE,
 	};
 	enum phy_mode mode;
 	int i;
