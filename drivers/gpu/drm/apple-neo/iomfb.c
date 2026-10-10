@@ -975,7 +975,7 @@ int neo_dcp_get_modes(struct drm_connector *connector)
 	if (neo_dcp->nr_modes && neo_dcp->fw_compat != DCP_FIRMWARE_H17P &&
 	    !neo_apple_connector->drm_edid) {
 		const struct drm_edid *edid;
-		edid = dcpavserv_copy_edid(neo_dcp);
+		edid = neo_dcpavserv_copy_edid(neo_dcp);
 		if (IS_ERR_OR_NULL(edid)) {
 			/*
 			 * An internal panel has no AV service and so no EDID;
@@ -1011,7 +1011,7 @@ int neo_dcp_get_modes(struct drm_connector *connector)
 }
 
 /* The user may own drm_display_mode, so we need to search for our copy */
-struct neo_dcp_display_mode *lookup_mode(struct neo_apple_dcp *neo_dcp,
+struct neo_dcp_display_mode *neo_lookup_mode(struct neo_apple_dcp *neo_dcp,
 					    const struct drm_display_mode *mode)
 {
 	int i;
@@ -1036,7 +1036,7 @@ struct neo_dcp_display_mode *lookup_mode(struct neo_apple_dcp *neo_dcp,
 static bool neo_dcp_mode_settable(struct neo_apple_dcp *neo_dcp,
 			      const struct drm_display_mode *mode)
 {
-	struct neo_dcp_display_mode *neo_dcp_mode = lookup_mode(neo_dcp, mode);
+	struct neo_dcp_display_mode *neo_dcp_mode = neo_lookup_mode(neo_dcp, mode);
 
 	if (!neo_dcp_mode)
 		return false;

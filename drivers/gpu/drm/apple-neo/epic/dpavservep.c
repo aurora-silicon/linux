@@ -14,44 +14,44 @@
 #include "../dcp-internal.h"
 #include "../trace.h"
 
-static void dcpavserv_init(struct neo_apple_epic_service *service, const char *name,
+static void neo_dcpavserv_init(struct neo_apple_epic_service *service, const char *name,
 			  const char *class, s64 unit)
 {
 	struct neo_apple_dcp *neo_dcp = service->ep->neo_dcp;
 	unsigned long flags;
 
-	trace_dcpavserv_init(neo_dcp, unit);
+	trace_neo_dcpavserv_init(neo_dcp, unit);
 
 	if (unit == 0 && name && !strcmp(name, "dcpav-service-epic")) {
-		spin_lock_irqsave(&neo_dcp->dcpavserv.lock, flags);
-		if (neo_dcp->dcpavserv.enabled) {
-			spin_unlock_irqrestore(&neo_dcp->dcpavserv.lock, flags);
+		spin_lock_irqsave(&neo_dcp->neo_dcpavserv.lock, flags);
+		if (neo_dcp->neo_dcpavserv.enabled) {
+			spin_unlock_irqrestore(&neo_dcp->neo_dcpavserv.lock, flags);
 			dev_err(neo_dcp->dev,
 				"DCPAVSERV: unit %lld already exists\n", unit);
 			return;
 		}
-		neo_dcp->dcpavserv.service = neo_afk_service_get(service);
-		neo_dcp->dcpavserv.enabled = true;
-		service->cookie = &neo_dcp->dcpavserv;
-		complete(&neo_dcp->dcpavserv.enable_completion);
-		spin_unlock_irqrestore(&neo_dcp->dcpavserv.lock, flags);
+		neo_dcp->neo_dcpavserv.service = neo_afk_service_get(service);
+		neo_dcp->neo_dcpavserv.enabled = true;
+		service->cookie = &neo_dcp->neo_dcpavserv;
+		complete(&neo_dcp->neo_dcpavserv.enable_completion);
+		spin_unlock_irqrestore(&neo_dcp->neo_dcpavserv.lock, flags);
 	}
 }
 
-static void dcpavserv_teardown(struct neo_apple_epic_service *service)
+static void neo_dcpavserv_teardown(struct neo_apple_epic_service *service)
 {
 	struct neo_apple_dcp *neo_dcp = service->ep->neo_dcp;
 	unsigned long flags;
 	bool owned = false;
 
-	spin_lock_irqsave(&neo_dcp->dcpavserv.lock, flags);
-	if (neo_dcp->dcpavserv.service == service) {
-		neo_dcp->dcpavserv.enabled = false;
-		neo_dcp->dcpavserv.service = NULL;
-		reinit_completion(&neo_dcp->dcpavserv.enable_completion);
+	spin_lock_irqsave(&neo_dcp->neo_dcpavserv.lock, flags);
+	if (neo_dcp->neo_dcpavserv.service == service) {
+		neo_dcp->neo_dcpavserv.enabled = false;
+		neo_dcp->neo_dcpavserv.service = NULL;
+		reinit_completion(&neo_dcp->neo_dcpavserv.enable_completion);
 		owned = true;
 	}
-	spin_unlock_irqrestore(&neo_dcp->dcpavserv.lock, flags);
+	spin_unlock_irqrestore(&neo_dcp->neo_dcpavserv.lock, flags);
 	if (owned)
 		neo_afk_service_put(service);
 }
@@ -61,11 +61,11 @@ void dpavservep_detach(struct neo_apple_dcp *neo_dcp)
 	struct neo_apple_epic_service *service;
 	unsigned long flags;
 
-	spin_lock_irqsave(&neo_dcp->dcpavserv.lock, flags);
-	service = neo_dcp->dcpavserv.service;
-	neo_dcp->dcpavserv.service = NULL;
-	neo_dcp->dcpavserv.enabled = false;
-	spin_unlock_irqrestore(&neo_dcp->dcpavserv.lock, flags);
+	spin_lock_irqsave(&neo_dcp->neo_dcpavserv.lock, flags);
+	service = neo_dcp->neo_dcpavserv.service;
+	neo_dcp->neo_dcpavserv.service = NULL;
+	neo_dcp->neo_dcpavserv.enabled = false;
+	spin_unlock_irqrestore(&neo_dcp->neo_dcpavserv.lock, flags);
 	if (service) {
 		neo_afk_service_disable(service);
 		neo_afk_service_put(service);
@@ -82,7 +82,7 @@ static void dcpdpserv_teardown(struct neo_apple_epic_service *service)
 	neo_afk_service_disable(service);
 }
 
-struct dcpavserv_status_report {
+struct neo_dcpavserv_status_report {
 	u32 unk00[4];
 	u8 flag0;
 	u8 flag1;
@@ -151,8 +151,8 @@ static int neo_parse_report(struct neo_apple_epic_service *service, enum neo_epi
 	payload = data + sizeof(*call);
 
 	if (le16_to_cpu(call->group) == 2 && le16_to_cpu(call->command) == 0) {
-		if (payload_size == sizeof(struct dcpavserv_status_report)) {
-			const struct dcpavserv_status_report *stat = payload;
+		if (payload_size == sizeof(struct neo_dcpavserv_status_report)) {
+			const struct neo_dcpavserv_status_report *stat = payload;
 			dev_info(neo_dcp->dev, "dcpavserv[ch:%u]: flags: 0x%02x,0x%02x,0x%02x,0x%02x status:%u\n",
 				service->channel, stat->flag0, stat->flag1,
 				stat->flag2, stat->flag3, stat->status);
@@ -168,7 +168,7 @@ static int neo_parse_report(struct neo_apple_epic_service *service, enum neo_epi
 	return 0;
 }
 
-static int dcpavserv_report(struct neo_apple_epic_service *service,
+static int neo_dcpavserv_report(struct neo_apple_epic_service *service,
 			    enum neo_epic_subtype type, const void *data,
 			    size_t data_size)
 {
@@ -182,7 +182,7 @@ static int dcpdpserv_report(struct neo_apple_epic_service *service,
 	return neo_parse_report(service, type, data, data_size);
 }
 
-static const struct drm_edid *dcpavserv_read_edid(struct neo_apple_epic_service *service)
+static const struct drm_edid *neo_dcpavserv_read_edid(struct neo_apple_epic_service *service)
 {
 	struct neo_dpavserv_copy_edid_cmd cmd;
 	struct neo_dpavserv_copy_edid_resp *resp __free(kfree) = NULL;
@@ -229,26 +229,26 @@ static const struct drm_edid *dcpavserv_read_edid(struct neo_apple_epic_service 
 			      data_size - EDID_LEADING_DATA_SIZE);
 }
 
-const struct drm_edid *dcpavserv_copy_edid(struct neo_apple_dcp *neo_dcp)
+const struct drm_edid *neo_dcpavserv_copy_edid(struct neo_apple_dcp *neo_dcp)
 {
 	struct neo_apple_epic_service *service;
 	const struct drm_edid *edid;
 	unsigned long flags;
 
-	spin_lock_irqsave(&neo_dcp->dcpavserv.lock, flags);
-	service = neo_afk_service_get(neo_dcp->dcpavserv.service);
-	spin_unlock_irqrestore(&neo_dcp->dcpavserv.lock, flags);
+	spin_lock_irqsave(&neo_dcp->neo_dcpavserv.lock, flags);
+	service = neo_afk_service_get(neo_dcp->neo_dcpavserv.service);
+	spin_unlock_irqrestore(&neo_dcp->neo_dcpavserv.lock, flags);
 	if (!service)
 		return ERR_PTR(-ENODEV);
 
-	edid = dcpavserv_read_edid(service);
-	spin_lock_irqsave(&neo_dcp->dcpavserv.lock, flags);
-	if (neo_dcp->dcpavserv.service != service) {
+	edid = neo_dcpavserv_read_edid(service);
+	spin_lock_irqsave(&neo_dcp->neo_dcpavserv.lock, flags);
+	if (neo_dcp->neo_dcpavserv.service != service) {
 		if (!IS_ERR(edid))
 			drm_edid_free(edid);
 		edid = ERR_PTR(-ENODEV);
 	}
-	spin_unlock_irqrestore(&neo_dcp->dcpavserv.lock, flags);
+	spin_unlock_irqrestore(&neo_dcp->neo_dcpavserv.lock, flags);
 	neo_afk_service_put(service);
 	return edid;
 }
@@ -257,9 +257,9 @@ static const struct neo_apple_epic_service_ops dpavservep_ops[] = {
 	{
 		.name = "dcpav-service-epic",
 		.reusable = true,
-		.init = dcpavserv_init,
-		.teardown = dcpavserv_teardown,
-		.report = dcpavserv_report,
+		.init = neo_dcpavserv_init,
+		.teardown = neo_dcpavserv_teardown,
+		.report = neo_dcpavserv_report,
 	},
 	{
 		.name = "dcpdp-service-epic",
@@ -276,7 +276,7 @@ int dpavservep_init(struct neo_apple_dcp *neo_dcp)
 	struct neo_apple_dcp_afkep *ep;
 	int ret;
 
-	init_completion(&neo_dcp->dcpavserv.enable_completion);
+	init_completion(&neo_dcp->neo_dcpavserv.enable_completion);
 
 	ep = neo_afk_init(neo_dcp, DPAVSERV_ENDPOINT, dpavservep_ops);
 	if (IS_ERR(ep))
@@ -293,7 +293,7 @@ int dpavservep_init(struct neo_apple_dcp *neo_dcp)
 		return ret;
 	}
 
-	ret = wait_for_completion_timeout(&neo_dcp->dcpavserv.enable_completion,
+	ret = wait_for_completion_timeout(&neo_dcp->neo_dcpavserv.enable_completion,
 					  msecs_to_jiffies(1000));
 	if (ret >= 0)
 		return 0;

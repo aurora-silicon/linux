@@ -27,42 +27,42 @@ struct dcpdptx_hotplug_cmd {
 	__le32 unk;
 } __attribute__((packed));
 
-struct dptxport_apcall_link_rate {
+struct neo_dptxport_apcall_link_rate {
 	__le32 retcode;
 	u8 _unk0[12];
 	__le32 link_rate;
 	u8 _unk1[12];
 } __attribute__((packed));
 
-struct dptxport_apcall_lane_count {
+struct neo_dptxport_apcall_lane_count {
 	__le32 retcode;
 	u8 _unk0[12];
 	__le64 lane_count;
 	u8 _unk1[8];
 } __attribute__((packed));
 
-struct dptxport_apcall_set_active_lane_count {
+struct neo_dptxport_apcall_set_active_lane_count {
 	__le32 retcode;
 	u8 _unk0[12];
 	__le64 lane_count;
 	u8 _unk1[8];
 } __packed;
 
-struct dptxport_apcall_get_support {
+struct neo_dptxport_apcall_get_support {
 	__le32 retcode;
 	u8 _unk0[12];
 	__le32 supported;
 	u8 _unk1[12];
 } __attribute__((packed));
 
-struct dptxport_apcall_max_drive_settings {
+struct neo_dptxport_apcall_max_drive_settings {
 	__le32 retcode;
 	u8 _unk0[12];
 	__le32 max_drive_settings[2];
 	u8 _unk1[8];
 };
 
-struct dptxport_apcall_drive_settings {
+struct neo_dptxport_apcall_drive_settings {
 	__le32 retcode;
 	u8 _unk0[12];
 	__le32 unk1;
@@ -74,7 +74,7 @@ struct dptxport_apcall_drive_settings {
 	__le32 unk7;
 };
 
-struct dptxport_apcall_set_tiled {
+struct neo_dptxport_apcall_set_tiled {
 	__le32 retcode;
 };
 
@@ -84,7 +84,7 @@ struct dptxport_apcall_set_tiled {
  * DFP port (0 = dpphy, 1/2 = dpin0/dpin1, dcp->dptx_dfp_port), ATC is the
  * route's own ATC index -- no separate DPIN field.
  */
-static u32 dptxport_remote_target(struct neo_apple_dcp *neo_dcp, u8 core, u8 atc,
+static u32 neo_dptxport_remote_target(struct neo_apple_dcp *neo_dcp, u8 core, u8 atc,
 				  u8 die)
 {
 	return FIELD_PREP(DCPDPTX_REMOTE_PORT_CORE, core) |
@@ -93,13 +93,13 @@ static u32 dptxport_remote_target(struct neo_apple_dcp *neo_dcp, u8 core, u8 atc
 	       DCPDPTX_REMOTE_PORT_CONNECTED;
 }
 
-int dptxport_validate_connection(struct neo_apple_epic_service *service, u8 core,
+int neo_dptxport_validate_connection(struct neo_apple_epic_service *service, u8 core,
 				 u8 atc, u8 die)
 {
 	struct neo_dptx_port *neo_dptx = service->cookie;
 	struct dcpdptx_connection_cmd cmd, resp;
 	int ret;
-	u32 target = dptxport_remote_target(service->ep->neo_dcp, core, atc, die);
+	u32 target = neo_dptxport_remote_target(service->ep->neo_dcp, core, atc, die);
 
 	/*
 	 * attributes: role (0 = direct PHY, 1 = Thunderbolt/USB4 DP IN) |
@@ -119,7 +119,7 @@ int dptxport_validate_connection(struct neo_apple_epic_service *service, u8 core
 	 */
 	u32 attrs = 0x100 | (neo_dcp_is_usb4_output(service->ep->neo_dcp) ? 1 : 0);
 
-	trace_dptxport_validate_connection(neo_dptx, core, atc, die);
+	trace_neo_dptxport_validate_connection(neo_dptx, core, atc, die);
 	neo_dptx->validate_calls++;
 	dev_dbg(service->ep->neo_dcp->dev,
 		 "DPTX validate: call #%u this boot target=0x%x core=%u atc=%u die=%u attrs=0x%x caller=%pS\n",
@@ -155,7 +155,7 @@ int dptxport_validate_connection(struct neo_apple_epic_service *service, u8 core
 	return 0;
 }
 
-int dptxport_connect(struct neo_apple_epic_service *service, u8 core, u8 atc,
+int neo_dptxport_connect(struct neo_apple_epic_service *service, u8 core, u8 atc,
 		     u8 die, bool supports_hpd)
 {
 	struct neo_dptx_port *neo_dptx = service->cookie;
@@ -164,9 +164,9 @@ int dptxport_connect(struct neo_apple_epic_service *service, u8 core, u8 atc,
 	u32 unk_field = (supports_hpd ? DCPDPTX_REMOTE_PORT_SUPPORTS_HPD : 0) |
 			(neo_dcp_is_usb4_output(service->ep->neo_dcp) ? 1 : 0);
 	int ret;
-	u32 target = dptxport_remote_target(service->ep->neo_dcp, core, atc, die);
+	u32 target = neo_dptxport_remote_target(service->ep->neo_dcp, core, atc, die);
 
-	trace_dptxport_connect(neo_dptx, core, atc, die);
+	trace_neo_dptxport_connect(neo_dptx, core, atc, die);
 	neo_dptx->connect_calls++;
 	dev_dbg(service->ep->neo_dcp->dev,
 		 "DPTX connect: call #%u this boot target=0x%x unk=0x%x caller=%pS\n",
@@ -193,7 +193,7 @@ int dptxport_connect(struct neo_apple_epic_service *service, u8 core, u8 atc,
 	return 0;
 }
 
-int dptxport_request_display(struct neo_apple_epic_service *service)
+int neo_dptxport_request_display(struct neo_apple_epic_service *service)
 {
 	struct neo_dptx_port *neo_dptx = service->cookie;
 	int ret;
@@ -209,7 +209,7 @@ int dptxport_request_display(struct neo_apple_epic_service *service)
 	return ret;
 }
 
-int dptxport_release_display(struct neo_apple_epic_service *service)
+int neo_dptxport_release_display(struct neo_apple_epic_service *service)
 {
 	struct neo_dptx_port *neo_dptx = service->cookie;
 	int ret;
@@ -225,7 +225,7 @@ int dptxport_release_display(struct neo_apple_epic_service *service)
 	return ret;
 }
 
-int dptxport_set_hpd_timeout(struct neo_apple_epic_service *service, bool hpd,
+int neo_dptxport_set_hpd_timeout(struct neo_apple_epic_service *service, bool hpd,
 			     unsigned int timeout_ms)
 {
 	struct dcpdptx_hotplug_cmd cmd, resp;
@@ -249,16 +249,16 @@ int dptxport_set_hpd_timeout(struct neo_apple_epic_service *service, bool hpd,
 	return 0;
 }
 
-int dptxport_set_hpd(struct neo_apple_epic_service *service, bool hpd)
+int neo_dptxport_set_hpd(struct neo_apple_epic_service *service, bool hpd)
 {
-	return dptxport_set_hpd_timeout(service, hpd, MSEC_PER_SEC);
+	return neo_dptxport_set_hpd_timeout(service, hpd, MSEC_PER_SEC);
 }
 
 static int
-dptxport_call_get_max_drive_settings(struct neo_apple_epic_service *service,
+neo_dptxport_call_get_max_drive_settings(struct neo_apple_epic_service *service,
 				     void *reply_, size_t reply_size)
 {
-	struct dptxport_apcall_max_drive_settings *reply = reply_;
+	struct neo_dptxport_apcall_max_drive_settings *reply = reply_;
 
 	if (reply_size < sizeof(*reply))
 		return -EINVAL;
@@ -271,13 +271,13 @@ dptxport_call_get_max_drive_settings(struct neo_apple_epic_service *service,
 }
 
 static int
-dptxport_call_get_drive_settings(struct neo_apple_epic_service *service,
+neo_dptxport_call_get_drive_settings(struct neo_apple_epic_service *service,
 				     const void *request_, size_t request_size,
 				     void *reply_, size_t reply_size)
 {
 	struct neo_dptx_port *neo_dptx = service->cookie;
-	const struct dptxport_apcall_drive_settings *request = request_;
-	struct dptxport_apcall_drive_settings *reply = reply_;
+	const struct neo_dptxport_apcall_drive_settings *request = request_;
+	struct neo_dptxport_apcall_drive_settings *reply = reply_;
 
 	if (reply_size < sizeof(*reply) || request_size < sizeof(*request))
 		return -EINVAL;
@@ -305,13 +305,13 @@ dptxport_call_get_drive_settings(struct neo_apple_epic_service *service,
 }
 
 static int
-dptxport_call_set_drive_settings(struct neo_apple_epic_service *service,
+neo_dptxport_call_set_drive_settings(struct neo_apple_epic_service *service,
 				     const void *request_, size_t request_size,
 				     void *reply_, size_t reply_size)
 {
 	struct neo_dptx_port *neo_dptx = service->cookie;
-	const struct dptxport_apcall_drive_settings *request = request_;
-	struct dptxport_apcall_drive_settings *reply = reply_;
+	const struct neo_dptxport_apcall_drive_settings *request = request_;
+	struct neo_dptxport_apcall_drive_settings *reply = reply_;
 
 	if (reply_size < sizeof(*reply) || request_size < sizeof(*request))
 		return -EINVAL;
@@ -329,10 +329,10 @@ dptxport_call_set_drive_settings(struct neo_apple_epic_service *service,
 	return 0;
 }
 
-static int dptxport_call_get_max_link_rate(struct neo_apple_epic_service *service,
+static int neo_dptxport_call_get_max_link_rate(struct neo_apple_epic_service *service,
 					   void *reply_, size_t reply_size)
 {
-	struct dptxport_apcall_link_rate *reply = reply_;
+	struct neo_dptxport_apcall_link_rate *reply = reply_;
 
 	if (reply_size < sizeof(*reply))
 		return -EINVAL;
@@ -343,10 +343,10 @@ static int dptxport_call_get_max_link_rate(struct neo_apple_epic_service *servic
 	return 0;
 }
 
-static int dptxport_call_get_max_lane_count(struct neo_apple_epic_service *service,
+static int neo_dptxport_call_get_max_lane_count(struct neo_apple_epic_service *service,
 					   void *reply_, size_t reply_size)
 {
-	struct dptxport_apcall_lane_count *reply = reply_;
+	struct neo_dptxport_apcall_lane_count *reply = reply_;
 	struct neo_dptx_port *neo_dptx = service->cookie;
 	struct neo_apple_dcp *neo_dcp = service->ep->neo_dcp;
 	union phy_configure_opts phy_ops;
@@ -387,14 +387,14 @@ static int dptxport_call_get_max_lane_count(struct neo_apple_epic_service *servi
 	return 0;
 }
 
-static int dptxport_call_set_active_lane_count(struct neo_apple_epic_service *service,
+static int neo_dptxport_call_set_active_lane_count(struct neo_apple_epic_service *service,
 					       const void *data, size_t data_size,
 					       void *reply_, size_t reply_size)
 {
 	struct neo_dptx_port *neo_dptx = service->cookie;
 	struct neo_apple_dcp *neo_dcp = service->ep->neo_dcp;
-	const struct dptxport_apcall_set_active_lane_count *request = data;
-	struct dptxport_apcall_set_active_lane_count *reply = reply_;
+	const struct neo_dptxport_apcall_set_active_lane_count *request = data;
+	struct neo_dptxport_apcall_set_active_lane_count *reply = reply_;
 	int ret = 0;
 	int retcode = 0;
 
@@ -465,11 +465,11 @@ static int dptxport_call_set_active_lane_count(struct neo_apple_epic_service *se
 	return ret;
 }
 
-static int dptxport_call_get_link_rate(struct neo_apple_epic_service *service,
+static int neo_dptxport_call_get_link_rate(struct neo_apple_epic_service *service,
 				       void *reply_, size_t reply_size)
 {
 	struct neo_dptx_port *neo_dptx = service->cookie;
-	struct dptxport_apcall_link_rate *reply = reply_;
+	struct neo_dptxport_apcall_link_rate *reply = reply_;
 
 	if (reply_size < sizeof(*reply))
 		return -EINVAL;
@@ -481,7 +481,7 @@ static int dptxport_call_get_link_rate(struct neo_apple_epic_service *service,
 }
 
 static int
-dptxport_call_will_change_link_config(struct neo_apple_epic_service *service)
+neo_dptxport_call_will_change_link_config(struct neo_apple_epic_service *service)
 {
 	struct neo_dptx_port *neo_dptx = service->cookie;
 
@@ -493,7 +493,7 @@ dptxport_call_will_change_link_config(struct neo_apple_epic_service *service)
 }
 
 static int
-dptxport_call_did_change_link_config(struct neo_apple_epic_service *service)
+neo_dptxport_call_did_change_link_config(struct neo_apple_epic_service *service)
 {
 	/*
 	 * Ported from aurora-silicon/linux#8: bringing the tunnel crossbar
@@ -509,13 +509,13 @@ dptxport_call_did_change_link_config(struct neo_apple_epic_service *service)
 	return 0;
 }
 
-static int dptxport_call_set_link_rate(struct neo_apple_epic_service *service,
+static int neo_dptxport_call_set_link_rate(struct neo_apple_epic_service *service,
 				       const void *data, size_t data_size,
 				       void *reply_, size_t reply_size)
 {
 	struct neo_dptx_port *neo_dptx = service->cookie;
-	const struct dptxport_apcall_link_rate *request = data;
-	struct dptxport_apcall_link_rate *reply = reply_;
+	const struct neo_dptxport_apcall_link_rate *request = data;
+	struct neo_dptxport_apcall_link_rate *reply = reply_;
 	u32 link_rate, phy_link_rate;
 	bool phy_set_rate = false;
 	int ret;
@@ -526,7 +526,7 @@ static int dptxport_call_set_link_rate(struct neo_apple_epic_service *service,
 		return -EINVAL;
 
 	link_rate = le32_to_cpu(request->link_rate);
-	trace_dptxport_call_set_link_rate(neo_dptx, link_rate);
+	trace_neo_dptxport_call_set_link_rate(neo_dptx, link_rate);
 	dev_info(service->ep->neo_dcp->dev, "DPTXPort: SET_LINK_RATE 0x%x\n",
 		 link_rate);
 
@@ -589,11 +589,11 @@ static int dptxport_call_set_link_rate(struct neo_apple_epic_service *service,
 	return 0;
 }
 
-static int dptxport_call_get_supports_hpd(struct neo_apple_epic_service *service,
+static int neo_dptxport_call_get_supports_hpd(struct neo_apple_epic_service *service,
 					  void *reply_, size_t reply_size)
 {
 	struct neo_apple_dcp *neo_dcp = service->ep->neo_dcp;
-	struct dptxport_apcall_get_support *reply = reply_;
+	struct neo_dptxport_apcall_get_support *reply = reply_;
 
 	if (reply_size < sizeof(*reply))
 		return -EINVAL;
@@ -612,10 +612,10 @@ static int dptxport_call_get_supports_hpd(struct neo_apple_epic_service *service
 }
 
 static int
-dptxport_call_get_supports_downspread(struct neo_apple_epic_service *service,
+neo_dptxport_call_get_supports_downspread(struct neo_apple_epic_service *service,
 				      void *reply_, size_t reply_size)
 {
-	struct dptxport_apcall_get_support *reply = reply_;
+	struct neo_dptxport_apcall_get_support *reply = reply_;
 
 	if (reply_size < sizeof(*reply))
 		return -EINVAL;
@@ -625,10 +625,10 @@ dptxport_call_get_supports_downspread(struct neo_apple_epic_service *service,
 	return 0;
 }
 
-static int dptxport_call_set_tiled_display_hint(void *reply_,
+static int neo_dptxport_call_set_tiled_display_hint(void *reply_,
 						 size_t reply_size)
 {
-	struct dptxport_apcall_set_tiled *reply = reply_;
+	struct neo_dptxport_apcall_set_tiled *reply = reply_;
 
 	if (reply_size < sizeof(*reply))
 		return -EINVAL;
@@ -638,7 +638,7 @@ static int dptxport_call_set_tiled_display_hint(void *reply_,
 }
 
 static int
-dptxport_call_activate(struct neo_apple_epic_service *service,
+neo_dptxport_call_activate(struct neo_apple_epic_service *service,
 		       const void *data, size_t data_size,
 		       void *reply, size_t reply_size)
 {
@@ -666,7 +666,7 @@ dptxport_call_activate(struct neo_apple_epic_service *service,
 }
 
 static int
-dptxport_call_deactivate(struct neo_apple_epic_service *service,
+neo_dptxport_call_deactivate(struct neo_apple_epic_service *service,
 		       const void *data, size_t data_size,
 		       void *reply, size_t reply_size)
 {
@@ -686,12 +686,12 @@ dptxport_call_deactivate(struct neo_apple_epic_service *service,
 	return 0;
 }
 
-static int dptxport_call(struct neo_apple_epic_service *service, u32 idx,
+static int neo_dptxport_call(struct neo_apple_epic_service *service, u32 idx,
 			 const void *data, size_t data_size, void *reply,
 			 size_t reply_size)
 {
 	struct neo_dptx_port *neo_dptx = service->cookie;
-	trace_dptxport_apcall(neo_dptx, idx, data_size);
+	trace_neo_dptxport_apcall(neo_dptx, idx, data_size);
 	dev_dbg(service->ep->neo_dcp->dev, "DPTXPort: APCALL %u (%zu bytes)\n",
 		 idx, data_size);
 	if (data_size)
@@ -708,26 +708,26 @@ static int dptxport_call(struct neo_apple_epic_service *service, u32 idx,
 		 */
 		if (service->ep->neo_dcp->neo_dptx_tunnel && neo_dptx->link_rate)
 			neo_dcp_tunnel_crossbar_down(service->ep->neo_dcp);
-		return dptxport_call_will_change_link_config(service);
+		return neo_dptxport_call_will_change_link_config(service);
 	case DPTX_APCALL_DID_CHANGE_LINK_CONFIG: {
-		int ret = dptxport_call_did_change_link_config(service);
+		int ret = neo_dptxport_call_did_change_link_config(service);
 
 		if (!ret && service->ep->neo_dcp->neo_dptx_tunnel && neo_dptx->link_rate)
 			neo_dcp_tunnel_crossbar_up(service->ep->neo_dcp);
 		return ret;
 	}
 	case DPTX_APCALL_GET_MAX_LINK_RATE:
-		return dptxport_call_get_max_link_rate(service, reply,
+		return neo_dptxport_call_get_max_link_rate(service, reply,
 						       reply_size);
 	case DPTX_APCALL_GET_LINK_RATE:
-		return dptxport_call_get_link_rate(service, reply, reply_size);
+		return neo_dptxport_call_get_link_rate(service, reply, reply_size);
 	case DPTX_APCALL_SET_LINK_RATE:
-		return dptxport_call_set_link_rate(service, data, data_size,
+		return neo_dptxport_call_set_link_rate(service, data, data_size,
 						   reply, reply_size);
 	case DPTX_APCALL_GET_MAX_LANE_COUNT:
-		return dptxport_call_get_max_lane_count(service, reply, reply_size);
+		return neo_dptxport_call_get_max_lane_count(service, reply, reply_size);
 	case DPTX_APCALL_GET_ACTIVE_LANE_COUNT: {
-		struct dptxport_apcall_lane_count *lc = reply;
+		struct neo_dptxport_apcall_lane_count *lc = reply;
 
 		if (reply_size < sizeof(*lc))
 			return -EINVAL;
@@ -736,16 +736,16 @@ static int dptxport_call(struct neo_apple_epic_service *service, u32 idx,
 		return 0;
 	}
         case DPTX_APCALL_SET_ACTIVE_LANE_COUNT:
-		return dptxport_call_set_active_lane_count(service, data, data_size,
+		return neo_dptxport_call_set_active_lane_count(service, data, data_size,
 							   reply, reply_size);
 	case DPTX_APCALL_GET_SUPPORTS_HPD:
-		return dptxport_call_get_supports_hpd(service, reply,
+		return neo_dptxport_call_get_supports_hpd(service, reply,
 						      reply_size);
 	case DPTX_APCALL_GET_SUPPORTS_DOWN_SPREAD:
-		return dptxport_call_get_supports_downspread(service, reply,
+		return neo_dptxport_call_get_supports_downspread(service, reply,
 							     reply_size);
 	case DPTX_APCALL_GET_MAX_DRIVE_SETTINGS:
-		return dptxport_call_get_max_drive_settings(service, reply,
+		return neo_dptxport_call_get_max_drive_settings(service, reply,
 							    reply_size);
 	case DPTX_APCALL_DEVICE_NOT_RESPONDING:
 	case DPTX_APCALL_DEVICE_BUSY_TIMEOUT:
@@ -758,18 +758,18 @@ static int dptxport_call(struct neo_apple_epic_service *service, u32 idx,
 		return 0;
 	case DPTX_APCALL_SET_TILED_DISPLAY_HINTS:
 		memcpy(reply, data, min(reply_size, data_size));
-		return dptxport_call_set_tiled_display_hint(reply, reply_size);
+		return neo_dptxport_call_set_tiled_display_hint(reply, reply_size);
 	case DPTX_APCALL_GET_DRIVE_SETTINGS:
-		return dptxport_call_get_drive_settings(service, data, data_size,
+		return neo_dptxport_call_get_drive_settings(service, data, data_size,
 							reply, reply_size);
 	case DPTX_APCALL_SET_DRIVE_SETTINGS:
-		return dptxport_call_set_drive_settings(service, data, data_size,
+		return neo_dptxport_call_set_drive_settings(service, data, data_size,
 							reply, reply_size);
         case DPTX_APCALL_ACTIVATE:
-		return dptxport_call_activate(service, data, data_size,
+		return neo_dptxport_call_activate(service, data, data_size,
 					      reply, reply_size);
 	case DPTX_APCALL_DEACTIVATE:
-		return dptxport_call_deactivate(service, data, data_size,
+		return neo_dptxport_call_deactivate(service, data, data_size,
 						reply, reply_size);
 	case DPTX_APCALL_FORCE_HOTPLUG_DETECT:
 		dev_info(service->ep->neo_dcp->dev,
@@ -805,7 +805,7 @@ static int dptxport_call(struct neo_apple_epic_service *service, u32 idx,
 	}
 }
 
-static void dptxport_init(struct neo_apple_epic_service *service, const char *name,
+static void neo_dptxport_init(struct neo_apple_epic_service *service, const char *name,
 			  const char *class, s64 unit)
 {
 
@@ -814,21 +814,21 @@ static void dptxport_init(struct neo_apple_epic_service *service, const char *na
 	if (strcmp(class, "AppleDCPDPTXRemotePort"))
 		return;
 
-	trace_dptxport_init(service->ep->neo_dcp, unit);
+	trace_neo_dptxport_init(service->ep->neo_dcp, unit);
 
 	switch (unit) {
 	case 0:
 	case 1:
-		if (service->ep->neo_dcp->dptxport[unit].enabled) {
+		if (service->ep->neo_dcp->neo_dptxport[unit].enabled) {
 			dev_err(service->ep->neo_dcp->dev,
 				"DPTXPort: unit %lld already exists\n", unit);
 			return;
 		}
-		service->ep->neo_dcp->dptxport[unit].unit = unit;
-		service->ep->neo_dcp->dptxport[unit].service = service;
-		service->ep->neo_dcp->dptxport[unit].enabled = true;
-		service->cookie = (void *)&service->ep->neo_dcp->dptxport[unit];
-		complete(&service->ep->neo_dcp->dptxport[unit].enable_completion);
+		service->ep->neo_dcp->neo_dptxport[unit].unit = unit;
+		service->ep->neo_dcp->neo_dptxport[unit].service = service;
+		service->ep->neo_dcp->neo_dptxport[unit].enabled = true;
+		service->cookie = (void *)&service->ep->neo_dcp->neo_dptxport[unit];
+		complete(&service->ep->neo_dcp->neo_dptxport[unit].enable_completion);
 		break;
 	default:
 		dev_err(service->ep->neo_dcp->dev, "DPTXPort: invalid unit %lld\n",
@@ -836,36 +836,36 @@ static void dptxport_init(struct neo_apple_epic_service *service, const char *na
 	}
 }
 
-static const struct neo_apple_epic_service_ops dptxep_ops[] = {
+static const struct neo_apple_epic_service_ops neo_dptxep_ops[] = {
 	{
 		.name = "AppleDCPDPTXRemotePort",
-		.init = dptxport_init,
-		.call = dptxport_call,
+		.init = neo_dptxport_init,
+		.call = neo_dptxport_call,
 	},
 	{}
 };
 
-int dptxep_init(struct neo_apple_dcp *neo_dcp)
+int neo_dptxep_init(struct neo_apple_dcp *neo_dcp)
 {
 	int ret;
 	u32 port;
 	unsigned long timeout = msecs_to_jiffies(1000);
 
-	init_completion(&neo_dcp->dptxport[0].enable_completion);
-	init_completion(&neo_dcp->dptxport[1].enable_completion);
-	init_completion(&neo_dcp->dptxport[0].linkcfg_completion);
-	init_completion(&neo_dcp->dptxport[1].linkcfg_completion);
+	init_completion(&neo_dcp->neo_dptxport[0].enable_completion);
+	init_completion(&neo_dcp->neo_dptxport[1].enable_completion);
+	init_completion(&neo_dcp->neo_dptxport[0].linkcfg_completion);
+	init_completion(&neo_dcp->neo_dptxport[1].linkcfg_completion);
 
-	neo_dcp->dptxep = neo_afk_init(neo_dcp, DPTX_ENDPOINT, dptxep_ops);
-	if (IS_ERR(neo_dcp->dptxep))
-		return PTR_ERR(neo_dcp->dptxep);
+	neo_dcp->neo_dptxep = neo_afk_init(neo_dcp, DPTX_ENDPOINT, neo_dptxep_ops);
+	if (IS_ERR(neo_dcp->neo_dptxep))
+		return PTR_ERR(neo_dcp->neo_dptxep);
 
-	ret = neo_afk_start(neo_dcp->dptxep);
+	ret = neo_afk_start(neo_dcp->neo_dptxep);
 	if (ret)
 		return ret;
 
 	for (port = 0; port < neo_dcp->hw.num_dptx_ports; port++) {
-		ret = wait_for_completion_timeout(&neo_dcp->dptxport[port].enable_completion,
+		ret = wait_for_completion_timeout(&neo_dcp->neo_dptxport[port].enable_completion,
 						timeout);
 		if (!ret)
 			return -ETIMEDOUT;

@@ -134,9 +134,9 @@ static bool show_notch;
 module_param(show_notch, bool, 0644);
 MODULE_PARM_DESC(show_notch, "Use the full display height and shows the notch");
 
-bool hdmi_audio;
-module_param(hdmi_audio, bool, 0644);
-MODULE_PARM_DESC(hdmi_audio, "Enable unstable HDMI audio support");
+bool neo_hdmi_audio;
+module_param(neo_hdmi_audio, bool, 0644);
+MODULE_PARM_DESC(neo_hdmi_audio, "Enable unstable HDMI audio support");
 
 static bool unstable_edid = true;
 module_param(unstable_edid, bool, 0644);
@@ -1866,7 +1866,7 @@ static struct neo_apple_dcp_afkep *neo_dcp_afkep(struct neo_apple_dcp *neo_dcp, 
 	case DPAVSERV_ENDPOINT:
 		return neo_dcp->dcpavservep;
 	case DPTX_ENDPOINT:
-		return neo_dcp->dptxep;
+		return neo_dcp->neo_dptxep;
 	default:
 		return NULL;
 	}
@@ -1948,7 +1948,7 @@ static void neo_dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 		ep = neo_dcp->dcpavservep;
 		break;
 	case DPTX_ENDPOINT:
-		ep = neo_dcp->dptxep;
+		ep = neo_dcp->neo_dptxep;
 		break;
 	default:
 		ep = NULL;
@@ -2155,21 +2155,21 @@ static int neo_dcp_dptx_connect(struct neo_apple_dcp *neo_dcp, u32 port)
 		 __func__, port, neo_dcp->neo_dptx_die, neo_dcp->neo_dptx_phy,
 		 neo_dcp_is_typec_output(neo_dcp),
 		 neo_dcp->active_typec_route ? "borrowed" : "fixed",
-		 neo_dcp->connector_type, neo_dcp->dptxport[port].connected);
+		 neo_dcp->connector_type, neo_dcp->neo_dptxport[port].connected);
 
 	mutex_lock(&neo_dcp->hpd_mutex);
-	if (!neo_dcp->dptxport[port].enabled) {
+	if (!neo_dcp->neo_dptxport[port].enabled) {
 		dev_warn(neo_dcp->dev, "dcp_dptx_connect: dptx service for port %d not enabled\n", port);
 		ret = -ENODEV;
 		goto out_unlock;
 	}
 
-	if (neo_dcp->dptxport[port].connected)
+	if (neo_dcp->neo_dptxport[port].connected)
 		goto out_unlock;
 
-	reinit_completion(&neo_dcp->dptxport[port].linkcfg_completion);
-	neo_dcp->dptxport[port].atcphy = neo_dcp->phy;
-	ret = dptxport_validate_connection(neo_dcp->dptxport[port].service,
+	reinit_completion(&neo_dcp->neo_dptxport[port].linkcfg_completion);
+	neo_dcp->neo_dptxport[port].atcphy = neo_dcp->phy;
+	ret = neo_dptxport_validate_connection(neo_dcp->neo_dptxport[port].service,
 					   neo_dcp->neo_dptx_dfp_port,
 					   neo_dcp->neo_dptx_phy, neo_dcp->neo_dptx_die);
 	if (ret) {
@@ -2179,7 +2179,7 @@ static int neo_dcp_dptx_connect(struct neo_apple_dcp *neo_dcp, u32 port)
 		goto out_unlock;
 	}
 
-	ret = dptxport_connect(neo_dcp->dptxport[port].service,
+	ret = neo_dptxport_connect(neo_dcp->neo_dptxport[port].service,
 			       neo_dcp->neo_dptx_dfp_port,
 			       neo_dcp->neo_dptx_phy, neo_dcp->neo_dptx_die,
 		       neo_dcp_is_typec_output(neo_dcp));
@@ -2190,25 +2190,25 @@ static int neo_dcp_dptx_connect(struct neo_apple_dcp *neo_dcp, u32 port)
 		goto out_unlock;
 	}
 
-	ret = dptxport_request_display(neo_dcp->dptxport[port].service);
+	ret = neo_dptxport_request_display(neo_dcp->neo_dptxport[port].service);
 	if (ret) {
 		dev_err(neo_dcp->dev,
 			"dcp_dptx_connect: failed to request display: %d\n",
 			ret);
 		goto out_release;
 	}
-	neo_dcp->dptxport[port].connected = true;
+	neo_dcp->neo_dptxport[port].connected = true;
 	if (neo_dcp_is_typec_output(neo_dcp)) {
 		if (neo_dcp_is_usb4_output(neo_dcp) && false)
-			ret = dptxport_set_hpd_timeout(neo_dcp->dptxport[port].service,
+			ret = neo_dptxport_set_hpd_timeout(neo_dcp->neo_dptxport[port].service,
 						       true, 8000);
 		else
-			ret = dptxport_set_hpd(neo_dcp->dptxport[port].service, true);
+			ret = neo_dptxport_set_hpd(neo_dcp->neo_dptxport[port].service, true);
 		if (ret) {
 			dev_err(neo_dcp->dev,
 				"dcp_dptx_connect: failed to assert Type-C HPD: %d\n",
 				ret);
-			neo_dcp->dptxport[port].connected = false;
+			neo_dcp->neo_dptxport[port].connected = false;
 			goto out_release;
 		}
 	}
@@ -2216,7 +2216,7 @@ static int neo_dcp_dptx_connect(struct neo_apple_dcp *neo_dcp, u32 port)
 	mutex_unlock(&neo_dcp->hpd_mutex);
 	timeout = neo_dcp_is_usb4_output(neo_dcp) && false ?
 		  DPTX_TUNNEL_CONNECT_TIMEOUT : DPTX_CONNECT_TIMEOUT;
-	ret = wait_for_completion_timeout(&neo_dcp->dptxport[port].linkcfg_completion,
+	ret = wait_for_completion_timeout(&neo_dcp->neo_dptxport[port].linkcfg_completion,
 					  timeout);
 	if (!ret) {
 		dev_err(neo_dcp->dev,
@@ -2232,7 +2232,7 @@ static int neo_dcp_dptx_connect(struct neo_apple_dcp *neo_dcp, u32 port)
 	usleep_range(5, 10);
 
 	if (neo_dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort)
-		dptxport_set_hpd(neo_dcp->dptxport[port].service, true);
+		neo_dptxport_set_hpd(neo_dcp->neo_dptxport[port].service, true);
 
 	if (neo_dcp->neo_avep)
 		neo_av_service_connect(neo_dcp);
@@ -2241,9 +2241,9 @@ static int neo_dcp_dptx_connect(struct neo_apple_dcp *neo_dcp, u32 port)
 
 out_disconnect:
 	mutex_lock(&neo_dcp->hpd_mutex);
-	neo_dcp->dptxport[port].connected = false;
+	neo_dcp->neo_dptxport[port].connected = false;
 out_release:
-	dptxport_release_display(neo_dcp->dptxport[port].service);
+	neo_dptxport_release_display(neo_dcp->neo_dptxport[port].service);
 
 out_unlock:
 	mutex_unlock(&neo_dcp->hpd_mutex);
@@ -2294,17 +2294,17 @@ static void neo_dcp_placeholder_edid_work(struct work_struct *work)
 
 	mutex_lock(&neo_dcp->hpd_mutex);
 	generation = neo_dcp->placeholder_generation;
-	if (!neo_dcp->typec_cable_connected || !neo_dcp->dptxport[0].connected ||
-	    !neo_dcp->dptxport[0].enabled || generation != neo_dcp->typec_generation)
+	if (!neo_dcp->typec_cable_connected || !neo_dcp->neo_dptxport[0].connected ||
+	    !neo_dcp->neo_dptxport[0].enabled || generation != neo_dcp->typec_generation)
 		goto out_unlock;
-	service = neo_dcp->dptxport[0].service;
+	service = neo_dcp->neo_dptxport[0].service;
 
 	/*
 	 * Some adapters answer the first connection with a 1024x768
 	 * placeholder and publish the panel EDID only after HPD drops
 	 * and returns. One pulse; a second placeholder is left alone.
 	 */
-	ret = dptxport_set_hpd(service, false);
+	ret = neo_dptxport_set_hpd(service, false);
 	if (ret) {
 		dev_info(neo_dcp->dev, "placeholder EDID: HPD drop failed: %d\n",
 			 ret);
@@ -2315,11 +2315,11 @@ static void neo_dcp_placeholder_edid_work(struct work_struct *work)
 	msleep(1000);
 
 	mutex_lock(&neo_dcp->hpd_mutex);
-	if (!neo_dcp->typec_cable_connected || !neo_dcp->dptxport[0].connected ||
+	if (!neo_dcp->typec_cable_connected || !neo_dcp->neo_dptxport[0].connected ||
 	    generation != neo_dcp->typec_generation)
 		goto out_unlock;
 
-	ret = dptxport_set_hpd(service, true);
+	ret = neo_dptxport_set_hpd(service, true);
 	if (ret)
 		dev_info(neo_dcp->dev, "placeholder EDID: HPD assert failed: %d\n",
 			 ret);
@@ -2370,9 +2370,9 @@ static int neo_dcp_dptx_disconnect(struct neo_apple_dcp *neo_dcp, u32 port)
 	dev_info(neo_dcp->dev, "%s(port=%d)\n", __func__, port);
 
 	mutex_lock(&neo_dcp->hpd_mutex);
-	if (neo_dcp->dptxport[port].enabled && neo_dcp->dptxport[port].connected) {
-		dptxport_release_display(neo_dcp->dptxport[port].service);
-		neo_dcp->dptxport[port].connected = false;
+	if (neo_dcp->neo_dptxport[port].enabled && neo_dcp->neo_dptxport[port].connected) {
+		neo_dptxport_release_display(neo_dcp->neo_dptxport[port].service);
+		neo_dcp->neo_dptxport[port].connected = false;
 	}
 	mutex_unlock(&neo_dcp->hpd_mutex);
 
@@ -2422,8 +2422,8 @@ int neo_dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 	if (neo_dcp->neo_avep)
 		neo_av_service_disconnect(neo_dcp);
 
-	if (neo_dcp->dptxport[port].enabled)
-		dptxport_set_hpd(neo_dcp->dptxport[port].service, false);
+	if (neo_dcp->neo_dptxport[port].enabled)
+		neo_dptxport_set_hpd(neo_dcp->neo_dptxport[port].service, false);
 
 	return neo_dcp_dptx_disconnect(neo_dcp, port);
 }
@@ -2548,7 +2548,7 @@ int neo_dcp_start(struct platform_device *pdev)
 			dev_warn(neo_dcp->dev, "Failed to start IBOOT endpoint: %d\n",
 				 ret);
 
-		ret = dptxep_init(neo_dcp);
+		ret = neo_dptxep_init(neo_dcp);
 		if (ret) {
 			dev_warn(neo_dcp->dev, "Failed to start DPTX endpoint: %d\n",
 				 ret);
@@ -2559,13 +2559,13 @@ int neo_dcp_start(struct platform_device *pdev)
 		 * Since dcp0 is not used at the moment let's avoid this
 		 * since it is possibly the cause for startup issues.
 		 */
-		} else if (neo_dcp->dptxport[0].enabled) {
+		} else if (neo_dcp->neo_dptxport[0].enabled) {
 			bool connected;
 			/* force disconnect on start - necessary if the display
 			 * is already up from m1n1
 			 */
-			dptxport_set_hpd(neo_dcp->dptxport[0].service, false);
-			dptxport_release_display(neo_dcp->dptxport[0].service);
+			neo_dptxport_set_hpd(neo_dcp->neo_dptxport[0].service, false);
+			neo_dptxport_release_display(neo_dcp->neo_dptxport[0].service);
 			usleep_range(10 * USEC_PER_MSEC, 25 * USEC_PER_MSEC);
 
 			connected = gpiod_get_value_cansleep(neo_dcp->hdmi_hpd);
@@ -2584,7 +2584,7 @@ int neo_dcp_start(struct platform_device *pdev)
 		dev_err(neo_dcp->dev, "Failed to start IOMFB endpoint: %d\n", ret);
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_NEO_AUDIO)
-	if (hdmi_audio) {
+	if (neo_hdmi_audio) {
 		ret = neo_avep_init(neo_dcp);
 		if (ret)
 			dev_warn(neo_dcp->dev, "Failed to start AV endpoint: %d", ret);
@@ -2808,8 +2808,8 @@ void neo_dcp_poweroff(struct platform_device *pdev)
 
 	if (neo_dcp_is_typec_output(neo_dcp)) {
 		/* DCP owns a synthetic HPD for Type-C. Release it with the CRTC. */
-		if (neo_dcp->dptxport[0].enabled && neo_dcp->dptxport[0].connected) {
-			ret = dptxport_set_hpd(neo_dcp->dptxport[0].service, false);
+		if (neo_dcp->neo_dptxport[0].enabled && neo_dcp->neo_dptxport[0].connected) {
+			ret = neo_dptxport_set_hpd(neo_dcp->neo_dptxport[0].service, false);
 			if (ret)
 				dev_warn(neo_dcp->dev,
 					 "failed to deassert Type-C DPTX HPD: %d\n", ret);
@@ -3497,7 +3497,7 @@ static void neo_dcp_comp_unbind(struct device *dev, struct device *main, void *d
 		}
 		neo_iomfb_queue_stop(neo_dcp);
 		neo_afk_quiesce(neo_dcp->neo_avep);
-		neo_afk_quiesce(neo_dcp->dptxep);
+		neo_afk_quiesce(neo_dcp->neo_dptxep);
 		neo_afk_quiesce(neo_dcp->neo_ibootep);
 		neo_afk_quiesce(neo_dcp->neo_systemep);
 		neo_afk_quiesce(neo_dcp->dcpavservep);
@@ -3529,9 +3529,9 @@ static void neo_dcp_comp_unbind(struct device *dev, struct device *main, void *d
 		neo_dcp->neo_avep = NULL;
 	}
 
-	if (neo_dcp->dptxep) {
-		neo_afk_shutdown(neo_dcp->dptxep);
-		neo_dcp->dptxep = NULL;
+	if (neo_dcp->neo_dptxep) {
+		neo_afk_shutdown(neo_dcp->neo_dptxep);
+		neo_dcp->neo_dptxep = NULL;
 	}
 
 	if (neo_dcp->neo_ibootep) {
@@ -3628,7 +3628,7 @@ static int neo_dcp_platform_probe(struct platform_device *pdev)
 	mutex_init(&neo_dcp->hpd_mutex);
 	mutex_init(&neo_dcp->tb_lock);
 	spin_lock_init(&neo_dcp->mode_state.lock);
-	spin_lock_init(&neo_dcp->dcpavserv.lock);
+	spin_lock_init(&neo_dcp->neo_dcpavserv.lock);
 	neo_dcp->hw = *(struct neo_apple_dcp_hw_data *)of_device_get_match_data(dev);
 
 	/* The domain use must survive driver-core DMA cleanup for a live session. */

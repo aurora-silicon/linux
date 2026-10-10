@@ -492,7 +492,7 @@ static const u32 neo_dcp_overlay_formats_12_x[] = {
 #endif
 };
 
-u64 apple_format_modifiers[] = {
+u64 neo_apple_format_modifiers[] = {
 	DRM_FORMAT_MOD_LINEAR,
 	DRM_FORMAT_MOD_INVALID
 };
@@ -522,7 +522,7 @@ struct drm_plane *neo_apple_plane_init(struct drm_device *dev,
 		}
 		plane = drmm_universal_plane_alloc(dev, struct neo_apple_plane, base, possible_crtcs,
 				       &neo_apple_plane_funcs, fmts, num_fmts,
-				       apple_format_modifiers, type, NULL);
+				       neo_apple_format_modifiers, type, NULL);
 		break;
 	case DRM_PLANE_TYPE_OVERLAY:
 	case DRM_PLANE_TYPE_CURSOR:
@@ -535,7 +535,7 @@ struct drm_plane *neo_apple_plane_init(struct drm_device *dev,
 		}
 		plane = drmm_universal_plane_alloc(dev, struct neo_apple_plane, base, possible_crtcs,
 				       &neo_apple_plane_funcs, fmts, num_fmts,
-				       apple_format_modifiers, type, NULL);
+				       neo_apple_format_modifiers, type, NULL);
 		break;
 	default:
 		return ERR_PTR(-EINVAL);

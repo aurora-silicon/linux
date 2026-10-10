@@ -110,5 +110,5 @@ int neo_dcp_parse_tag(char tag[4]);
 void neo_dcp_ack(struct neo_apple_dcp *neo_dcp, enum neo_dcp_context_id context);
 
 /* The user may own drm_display_mode, so we need to search for our copy */
-struct neo_dcp_display_mode *lookup_mode(struct neo_apple_dcp *neo_dcp,
+struct neo_dcp_display_mode *neo_lookup_mode(struct neo_apple_dcp *neo_dcp,
 					    const struct drm_display_mode *mode);

@@ -346,14 +346,14 @@ struct neo_apple_dcp {
 
 	struct neo_apple_dcp_afkep *neo_ibootep;
 	struct neo_apple_dcp_afkep *dcpavservep;
-	struct dcpavserv dcpavserv;
+	struct neo_dcpavserv neo_dcpavserv;
 
 	struct neo_apple_dcp_afkep *neo_avep;
 	struct audiosrv_data *audiosrv;
 
-	struct neo_apple_dcp_afkep *dptxep;
+	struct neo_apple_dcp_afkep *neo_dptxep;
 
-	struct neo_dptx_port dptxport[2];
+	struct neo_dptx_port neo_dptxport[2];
 
 	/* debugfs entries */
 	struct dentry *ep_debugfs[0x20];

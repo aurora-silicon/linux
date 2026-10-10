@@ -372,7 +372,7 @@ DEFINE_EVENT(neo_iomfb_parse_mode_template, neo_iomfb_parse_mode_fail,
 	    TP_PROTO(s64 id, struct dimension *horiz, struct dimension *vert, s64 best_color_mode, bool is_virtual, s64 score),
 	    TP_ARGS(id, horiz, vert, best_color_mode, is_virtual, score));
 
-TRACE_EVENT(dcpavserv_init, TP_PROTO(struct neo_apple_dcp *neo_dcp, u64 unit),
+TRACE_EVENT(neo_dcpavserv_init, TP_PROTO(struct neo_apple_dcp *neo_dcp, u64 unit),
 	    TP_ARGS(neo_dcp, unit),
 
 	    TP_STRUCT__entry(__string(devname, dev_name(neo_dcp->dev))
@@ -384,7 +384,7 @@ TRACE_EVENT(dcpavserv_init, TP_PROTO(struct neo_apple_dcp *neo_dcp, u64 unit),
 	    TP_printk("%s: dcpav-service unit %lld initialized", __get_str(devname),
 		      __entry->unit));
 
-TRACE_EVENT(dptxport_init, TP_PROTO(struct neo_apple_dcp *neo_dcp, u64 unit),
+TRACE_EVENT(neo_dptxport_init, TP_PROTO(struct neo_apple_dcp *neo_dcp, u64 unit),
 	    TP_ARGS(neo_dcp, unit),
 
 	    TP_STRUCT__entry(__string(devname, dev_name(neo_dcp->dev))
@@ -397,7 +397,7 @@ TRACE_EVENT(dptxport_init, TP_PROTO(struct neo_apple_dcp *neo_dcp, u64 unit),
 		      __entry->unit));
 
 TRACE_EVENT(
-	dptxport_apcall,
+	neo_dptxport_apcall,
 	TP_PROTO(struct neo_dptx_port *neo_dptx, int idx, size_t len),
 	TP_ARGS(neo_dptx, idx, len),
 
@@ -412,7 +412,7 @@ TRACE_EVENT(
 		  __entry->idx, show_dptxport_apcall(__entry->idx), __entry->len));
 
 TRACE_EVENT(
-	dptxport_validate_connection,
+	neo_dptxport_validate_connection,
 	TP_PROTO(struct neo_dptx_port *neo_dptx, u8 core, u8 atc, u8 die),
 	TP_ARGS(neo_dptx, core, atc, die),
 
@@ -426,7 +426,7 @@ TRACE_EVENT(
 		  __entry->unit, __entry->core, __entry->atc, __entry->die));
 
 TRACE_EVENT(
-	dptxport_connect,
+	neo_dptxport_connect,
 	TP_PROTO(struct neo_dptx_port *neo_dptx, u8 core, u8 atc, u8 die),
 	TP_ARGS(neo_dptx, core, atc, die),
 
@@ -440,7 +440,7 @@ TRACE_EVENT(
 		  __entry->unit, __entry->core, __entry->atc, __entry->die));
 
 TRACE_EVENT(
-	dptxport_call_set_link_rate,
+	neo_dptxport_call_set_link_rate,
 	TP_PROTO(struct neo_dptx_port *neo_dptx, u32 link_rate),
 	TP_ARGS(neo_dptx, link_rate),
 

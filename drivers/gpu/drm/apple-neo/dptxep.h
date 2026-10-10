@@ -68,14 +68,14 @@ struct neo_dptx_port {
 	u32 validate_calls, connect_calls, request_calls, release_calls;
 };
 
-int dptxport_validate_connection(struct neo_apple_epic_service *service, u8 core,
+int neo_dptxport_validate_connection(struct neo_apple_epic_service *service, u8 core,
 				 u8 atc, u8 die);
-int dptxport_connect(struct neo_apple_epic_service *service, u8 core, u8 atc,
+int neo_dptxport_connect(struct neo_apple_epic_service *service, u8 core, u8 atc,
 		     u8 die, bool supports_hpd);
-int dptxport_request_display(struct neo_apple_epic_service *service);
-int dptxport_release_display(struct neo_apple_epic_service *service);
-int dptxport_set_hpd(struct neo_apple_epic_service *service, bool hpd);
-int dptxport_set_hpd_timeout(struct neo_apple_epic_service *service, bool hpd,
+int neo_dptxport_request_display(struct neo_apple_epic_service *service);
+int neo_dptxport_release_display(struct neo_apple_epic_service *service);
+int neo_dptxport_set_hpd(struct neo_apple_epic_service *service, bool hpd);
+int neo_dptxport_set_hpd_timeout(struct neo_apple_epic_service *service, bool hpd,
 			     unsigned int timeout_ms);
 
 #endif

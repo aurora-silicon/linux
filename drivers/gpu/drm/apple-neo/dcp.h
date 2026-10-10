@@ -93,7 +93,7 @@ void neo_iomfb_shutdown(struct neo_apple_dcp *neo_dcp);
 void neo_iomfb_recv_msg(struct neo_apple_dcp *neo_dcp, u64 message);
 
 int neo_systemep_init(struct neo_apple_dcp *neo_dcp);
-int dptxep_init(struct neo_apple_dcp *neo_dcp);
+int neo_dptxep_init(struct neo_apple_dcp *neo_dcp);
 int neo_ibootep_init(struct neo_apple_dcp *neo_dcp);
 int dpavservep_init(struct neo_apple_dcp *neo_dcp);
 int neo_avep_init(struct neo_apple_dcp *neo_dcp);

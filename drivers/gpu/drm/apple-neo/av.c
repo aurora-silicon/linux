@@ -86,7 +86,7 @@ static void neo_av_interface_teardown(struct neo_apple_epic_service *service)
 
 	asrv->plugged = false;
 	if (asrv->neo_audio_dev)
-		dcpaud_disconnect(asrv->neo_audio_dev);
+		neo_dcpaud_disconnect(asrv->neo_audio_dev);
 
 	mutex_unlock(&asrv->plug_lock);
 }
@@ -121,7 +121,7 @@ static void neo_av_audiosrv_teardown(struct neo_apple_epic_service *service)
 
 	asrv->plugged = false;
 	if (asrv->neo_audio_dev)
-		dcpaud_disconnect(asrv->neo_audio_dev);
+		neo_dcpaud_disconnect(asrv->neo_audio_dev);
 
 	mutex_unlock(&asrv->plug_lock);
 }
@@ -318,7 +318,7 @@ void neo_av_service_connect(struct neo_apple_dcp *neo_dcp)
 	asrv->is_open = true;
 
 	if (asrv->neo_audio_dev)
-		dcpaud_connect(asrv->neo_audio_dev, asrv->plugged);
+		neo_dcpaud_connect(asrv->neo_audio_dev, asrv->plugged);
 	mutex_unlock(&asrv->plug_lock);
 }
 
@@ -342,7 +342,7 @@ void neo_av_service_disconnect(struct neo_apple_dcp *neo_dcp)
 	mutex_lock(&asrv->plug_lock);
 
 	if (asrv->neo_audio_dev)
-		dcpaud_disconnect(asrv->neo_audio_dev);
+		neo_dcpaud_disconnect(asrv->neo_audio_dev);
 
 	mutex_unlock(&asrv->plug_lock);
 

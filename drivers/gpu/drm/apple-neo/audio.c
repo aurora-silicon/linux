@@ -101,16 +101,16 @@ static const struct snd_pcm_hardware neo_dcp_pcm_hw_unplugged = {
 	.periods_max		= UINT_MAX,
 };
 
-static int dcpaud_read_remote_info(struct neo_dcp_audio *dcpaud)
+static int neo_dcpaud_read_remote_info(struct neo_dcp_audio *neo_dcpaud)
 {
 	int ret;
 
-	ret = neo_dcp_audiosrv_get_elements(dcpaud->neo_dcp_dev, dcpaud->elements,
+	ret = neo_dcp_audiosrv_get_elements(neo_dcpaud->neo_dcp_dev, neo_dcpaud->elements,
 					DCPAUD_ELEMENTS_MAXSIZE);
 	if (ret < 0)
 		return ret;
 
-	ret = neo_dcp_audiosrv_get_product_attrs(dcpaud->neo_dcp_dev, dcpaud->productattrs,
+	ret = neo_dcp_audiosrv_get_product_attrs(neo_dcpaud->neo_dcp_dev, neo_dcpaud->productattrs,
 					     DCPAUD_PRODUCTATTRS_MAXSIZE);
 	if (ret < 0)
 		return ret;
@@ -118,7 +118,7 @@ static int dcpaud_read_remote_info(struct neo_dcp_audio *dcpaud)
 	return 0;
 }
 
-static int dcpaud_interval_bitmask(struct snd_interval *i,
+static int neo_dcpaud_interval_bitmask(struct snd_interval *i,
 				   unsigned int mask)
 {
 	struct snd_interval range;
@@ -133,7 +133,7 @@ static int dcpaud_interval_bitmask(struct snd_interval *i,
 
 extern const struct snd_pcm_hw_constraint_list snd_pcm_known_rates;
 
-static void dcpaud_fill_fmt_sieve(struct snd_pcm_hw_params *params,
+static void neo_dcpaud_fill_fmt_sieve(struct snd_pcm_hw_params *params,
 				  struct neo_dcp_sound_format_mask *sieve)
 {
 	struct snd_interval *c = hw_param_interval(params,
@@ -155,54 +155,54 @@ static void dcpaud_fill_fmt_sieve(struct snd_pcm_hw_params *params,
 	}
 }
 
-static void dcpaud_consult_elements(struct neo_dcp_audio *dcpaud,
+static void neo_dcpaud_consult_elements(struct neo_dcp_audio *neo_dcpaud,
 				    struct snd_pcm_hw_params *params,
 				    struct neo_dcp_sound_format_mask *hits)
 {
 	struct neo_dcp_sound_format_mask sieve;
 	struct neo_dcp_parse_ctx elements = {
-		.neo_dcp = dev_get_drvdata(dcpaud->neo_dcp_dev),
-		.blob = dcpaud->elements + 4,
+		.neo_dcp = dev_get_drvdata(neo_dcpaud->neo_dcp_dev),
+		.blob = neo_dcpaud->elements + 4,
 		.len = DCPAUD_ELEMENTS_MAXSIZE - 4,
 		.pos = 0,
 	};
 
-	dcpaud_fill_fmt_sieve(params, &sieve);
-	dev_dbg(dcpaud->dev, "elements in: %llx %x %x\n", sieve.formats, sieve.nchans, sieve.rates);
+	neo_dcpaud_fill_fmt_sieve(params, &sieve);
+	dev_dbg(neo_dcpaud->dev, "elements in: %llx %x %x\n", sieve.formats, sieve.nchans, sieve.rates);
 	neo_parse_sound_constraints(&elements, &sieve, hits);
-	dev_dbg(dcpaud->dev, "elements out: %llx %x %x\n", hits->formats, hits->nchans, hits->rates);
+	dev_dbg(neo_dcpaud->dev, "elements out: %llx %x %x\n", hits->formats, hits->nchans, hits->rates);
 }
 
-static int dcpaud_select_cookie(struct neo_dcp_audio *dcpaud,
+static int neo_dcpaud_select_cookie(struct neo_dcp_audio *neo_dcpaud,
 				 struct snd_pcm_hw_params *params)
 {
 	struct neo_dcp_sound_format_mask sieve;
 	struct neo_dcp_parse_ctx elements = {
-		.neo_dcp = dev_get_drvdata(dcpaud->neo_dcp_dev),
-		.blob = dcpaud->elements + 4,
+		.neo_dcp = dev_get_drvdata(neo_dcpaud->neo_dcp_dev),
+		.blob = neo_dcpaud->elements + 4,
 		.len = DCPAUD_ELEMENTS_MAXSIZE - 4,
 		.pos = 0,
 	};
 
-	dcpaud_fill_fmt_sieve(params, &sieve);
-	return neo_parse_sound_mode(&elements, &sieve, &dcpaud->selected_chmap,
-				&dcpaud->selected_cookie);
+	neo_dcpaud_fill_fmt_sieve(params, &sieve);
+	return neo_parse_sound_mode(&elements, &sieve, &neo_dcpaud->selected_chmap,
+				&neo_dcpaud->selected_cookie);
 }
 
-static int dcpaud_rule_channels(struct snd_pcm_hw_params *params,
+static int neo_dcpaud_rule_channels(struct snd_pcm_hw_params *params,
                                 struct snd_pcm_hw_rule *rule)
 {
-	struct neo_dcp_audio *dcpaud = rule->private;
+	struct neo_dcp_audio *neo_dcpaud = rule->private;
 	struct snd_interval *c = hw_param_interval(params,
 				SNDRV_PCM_HW_PARAM_CHANNELS);
 	struct neo_dcp_sound_format_mask hits = {0, 0, 0};
 
-        dcpaud_consult_elements(dcpaud, params, &hits);
+        neo_dcpaud_consult_elements(neo_dcpaud, params, &hits);
 
-        return dcpaud_interval_bitmask(c, hits.nchans);
+        return neo_dcpaud_interval_bitmask(c, hits.nchans);
 }
 
-static int dcpaud_refine_fmt_mask(struct snd_mask *m, u64 mask)
+static int neo_dcpaud_refine_fmt_mask(struct snd_mask *m, u64 mask)
 {
 	struct snd_mask mask_mask;
 
@@ -214,54 +214,54 @@ static int dcpaud_refine_fmt_mask(struct snd_mask *m, u64 mask)
 	return snd_mask_refine(m, &mask_mask);
 }
 
-static int dcpaud_rule_format(struct snd_pcm_hw_params *params,
+static int neo_dcpaud_rule_format(struct snd_pcm_hw_params *params,
                                struct snd_pcm_hw_rule *rule)
 {
-	struct neo_dcp_audio *dcpaud = rule->private;
+	struct neo_dcp_audio *neo_dcpaud = rule->private;
 	struct snd_mask *f = hw_param_mask(params,
 				SNDRV_PCM_HW_PARAM_FORMAT);
 	struct neo_dcp_sound_format_mask hits;
 
-        dcpaud_consult_elements(dcpaud, params, &hits);
+        neo_dcpaud_consult_elements(neo_dcpaud, params, &hits);
 
-        return dcpaud_refine_fmt_mask(f, hits.formats);
+        return neo_dcpaud_refine_fmt_mask(f, hits.formats);
 }
 
-static int dcpaud_rule_rate(struct snd_pcm_hw_params *params,
+static int neo_dcpaud_rule_rate(struct snd_pcm_hw_params *params,
                              struct snd_pcm_hw_rule *rule)
 {
-	struct neo_dcp_audio *dcpaud = rule->private;
+	struct neo_dcp_audio *neo_dcpaud = rule->private;
 	struct snd_interval *r = hw_param_interval(params,
 				SNDRV_PCM_HW_PARAM_RATE);
 	struct neo_dcp_sound_format_mask hits;
 
-        dcpaud_consult_elements(dcpaud, params, &hits);
+        neo_dcpaud_consult_elements(neo_dcpaud, params, &hits);
 
         return snd_interval_rate_bits(r, hits.rates);
 }
 
-static int dcpaud_init_dma(struct neo_dcp_audio *dcpaud)
+static int neo_dcpaud_init_dma(struct neo_dcp_audio *neo_dcpaud)
 {
 	struct dma_chan *chan;
-	if (dcpaud->chan)
+	if (neo_dcpaud->chan)
 		return 0;
 
-	chan = of_dma_request_slave_channel(dcpaud->dev->of_node, "tx");
+	chan = of_dma_request_slave_channel(neo_dcpaud->dev->of_node, "tx");
 	/* squelch dma channel request errors, the driver will try again alter */
 	if (!chan) {
-		dev_warn(dcpaud->dev, "audio TX DMA channel request failed\n");
+		dev_warn(neo_dcpaud->dev, "audio TX DMA channel request failed\n");
 		return -ENXIO;
 	} else if (chan == ERR_PTR(-EPROBE_DEFER)) {
-		dev_info(dcpaud->dev, "audio TX DMA channel is not ready yet\n");
+		dev_info(neo_dcpaud->dev, "audio TX DMA channel is not ready yet\n");
 		return -ENXIO;
 	} else if (IS_ERR(chan)) {
-		dev_warn(dcpaud->dev, "audio TX DMA channel request failed: %ld\n", PTR_ERR(chan));
+		dev_warn(neo_dcpaud->dev, "audio TX DMA channel request failed: %ld\n", PTR_ERR(chan));
 		return PTR_ERR(chan);
 	}
-	dcpaud->chan = chan;
+	neo_dcpaud->chan = chan;
 
-	snd_pcm_set_managed_buffer(dcpaud->substream, SNDRV_DMA_TYPE_DEV_IRAM,
-				   dcpaud->chan->device->dev, 1024 * 1024,
+	snd_pcm_set_managed_buffer(neo_dcpaud->substream, SNDRV_DMA_TYPE_DEV_IRAM,
+				   neo_dcpaud->chan->device->dev, 1024 * 1024,
 				   SIZE_MAX);
 
 	return 0;
@@ -269,41 +269,41 @@ static int dcpaud_init_dma(struct neo_dcp_audio *dcpaud)
 
 static int neo_dcp_pcm_open(struct snd_pcm_substream *substream)
 {
-	struct neo_dcp_audio *dcpaud = substream->pcm->private_data;
+	struct neo_dcp_audio *neo_dcpaud = substream->pcm->private_data;
 	struct snd_dmaengine_dai_dma_data dma_data = {
 		.flags = SND_DMAENGINE_PCM_DAI_FLAG_PACK,
 	};
 	struct snd_pcm_hardware hw;
 	int ret;
 
-	mutex_lock(&dcpaud->data_lock);
-	ret = dcpaud_init_dma(dcpaud);
+	mutex_lock(&neo_dcpaud->data_lock);
+	ret = neo_dcpaud_init_dma(neo_dcpaud);
 	if (ret < 0) {
-		mutex_unlock(&dcpaud->data_lock);
+		mutex_unlock(&neo_dcpaud->data_lock);
 		return ret;
 	}
 
-	dcpaud->open_unplugged = !dcpaud->connected;
-	dcpaud->open_cookie = dcpaud->connection_cookie;
-	mutex_unlock(&dcpaud->data_lock);
+	neo_dcpaud->open_unplugged = !neo_dcpaud->connected;
+	neo_dcpaud->open_cookie = neo_dcpaud->connection_cookie;
+	mutex_unlock(&neo_dcpaud->data_lock);
 
-	if (dcpaud->open_unplugged) {
+	if (neo_dcpaud->open_unplugged) {
 		hw = neo_dcp_pcm_hw_unplugged;
 		goto refine;
 	}
 
-	ret = dcpaud_read_remote_info(dcpaud);
+	ret = neo_dcpaud_read_remote_info(neo_dcpaud);
 	if (ret < 0)
 		return ret;
 
 	snd_pcm_hw_rule_add(substream->runtime, 0, SNDRV_PCM_HW_PARAM_FORMAT,
-			    dcpaud_rule_format, dcpaud,
+			    neo_dcpaud_rule_format, neo_dcpaud,
 			    SNDRV_PCM_HW_PARAM_CHANNELS, SNDRV_PCM_HW_PARAM_RATE, -1);
 	snd_pcm_hw_rule_add(substream->runtime, 0, SNDRV_PCM_HW_PARAM_CHANNELS,
-			    dcpaud_rule_channels, dcpaud,
+			    neo_dcpaud_rule_channels, neo_dcpaud,
 			    SNDRV_PCM_HW_PARAM_FORMAT, SNDRV_PCM_HW_PARAM_RATE, -1);
 	snd_pcm_hw_rule_add(substream->runtime, 0, SNDRV_PCM_HW_PARAM_RATE,
-			    dcpaud_rule_rate, dcpaud,
+			    neo_dcpaud_rule_rate, neo_dcpaud,
 			    SNDRV_PCM_HW_PARAM_FORMAT, SNDRV_PCM_HW_PARAM_CHANNELS, -1);
 
 	hw = neo_dcp_pcm_hw;
@@ -317,48 +317,48 @@ refine:
 	hw.buffer_bytes_max = SIZE_MAX;
 	hw.fifo_size = 16;
 	ret = snd_dmaengine_pcm_refine_runtime_hwparams(substream, &dma_data,
-							&hw, dcpaud->chan);
+							&hw, neo_dcpaud->chan);
 	if (ret)
 		return ret;
 	substream->runtime->hw = hw;
 
-	return snd_dmaengine_pcm_open(substream, dcpaud->chan);
+	return snd_dmaengine_pcm_open(substream, neo_dcpaud->chan);
 }
 
 static int neo_dcp_pcm_close(struct snd_pcm_substream *substream)
 {
-	struct neo_dcp_audio *dcpaud = substream->pcm->private_data;
-	dcpaud->selected_chmap.channels = 0;
-	dcpaud->open_unplugged = false;
+	struct neo_dcp_audio *neo_dcpaud = substream->pcm->private_data;
+	neo_dcpaud->selected_chmap.channels = 0;
+	neo_dcpaud->open_unplugged = false;
 
 	return snd_dmaengine_pcm_close(substream);
 }
 
-static int dcpaud_connection_up(struct neo_dcp_audio *dcpaud)
+static int neo_dcpaud_connection_up(struct neo_dcp_audio *neo_dcpaud)
 {
 	bool ret;
-	mutex_lock(&dcpaud->data_lock);
-	ret = dcpaud->connected &&
-	      dcpaud->open_cookie == dcpaud->connection_cookie;
-	mutex_unlock(&dcpaud->data_lock);
+	mutex_lock(&neo_dcpaud->data_lock);
+	ret = neo_dcpaud->connected &&
+	      neo_dcpaud->open_cookie == neo_dcpaud->connection_cookie;
+	mutex_unlock(&neo_dcpaud->data_lock);
 	return ret;
 }
 
 static int neo_dcp_pcm_hw_params(struct snd_pcm_substream *substream,
 			     struct snd_pcm_hw_params *params)
 {
-	struct neo_dcp_audio *dcpaud = substream->pcm->private_data;
+	struct neo_dcp_audio *neo_dcpaud = substream->pcm->private_data;
 	struct dma_slave_config slave_config;
 	struct dma_chan *chan = snd_dmaengine_pcm_get_chan(substream);
 	int ret;
 
-	if (dcpaud->open_unplugged)
+	if (neo_dcpaud->open_unplugged)
 		return 0;
 
-	if (!dcpaud_connection_up(dcpaud))
+	if (!neo_dcpaud_connection_up(neo_dcpaud))
 		return -ENXIO;
 
-	ret = dcpaud_select_cookie(dcpaud, params);
+	ret = neo_dcpaud_select_cookie(neo_dcpaud, params);
 	if (ret < 0)
 		return ret;
 	if (!ret)
@@ -366,7 +366,7 @@ static int neo_dcp_pcm_hw_params(struct snd_pcm_substream *substream,
 
 	memset(&slave_config, 0, sizeof(slave_config));
 	ret = snd_hwparams_to_dma_slave_config(substream, params, &slave_config);
-	dev_info(dcpaud->dev, "snd_hwparams_to_dma_slave_config: %d\n", ret);
+	dev_info(neo_dcpaud->dev, "snd_hwparams_to_dma_slave_config: %d\n", ret);
 	if (ret < 0)
 		return ret;
 
@@ -378,49 +378,49 @@ static int neo_dcp_pcm_hw_params(struct snd_pcm_substream *substream,
 	slave_config.dst_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
 
 	ret = dmaengine_slave_config(chan, &slave_config);
-	dev_info(dcpaud->dev, "dmaengine_slave_config: %d\n", ret);
+	dev_info(neo_dcpaud->dev, "dmaengine_slave_config: %d\n", ret);
 	return ret;
 }
 
 static int neo_dcp_pcm_hw_free(struct snd_pcm_substream *substream)
 {
-	struct neo_dcp_audio *dcpaud = substream->pcm->private_data;
+	struct neo_dcp_audio *neo_dcpaud = substream->pcm->private_data;
 
-	if (!dcpaud_connection_up(dcpaud))
+	if (!neo_dcpaud_connection_up(neo_dcpaud))
 		return 0;
 
-	return neo_dcp_audiosrv_unprepare(dcpaud->neo_dcp_dev);
+	return neo_dcp_audiosrv_unprepare(neo_dcpaud->neo_dcp_dev);
 }
 
 static int neo_dcp_pcm_prepare(struct snd_pcm_substream *substream)
 {
-	struct neo_dcp_audio *dcpaud = substream->pcm->private_data;
+	struct neo_dcp_audio *neo_dcpaud = substream->pcm->private_data;
 
 	/* alsa-lib prepares right after hw_params; see dcp_pcm_hw_unplugged */
-	if (dcpaud->open_unplugged)
+	if (neo_dcpaud->open_unplugged)
 		return 0;
 
-	if (!dcpaud_connection_up(dcpaud))
+	if (!neo_dcpaud_connection_up(neo_dcpaud))
 		return -ENXIO;
 
-	return neo_dcp_audiosrv_prepare(dcpaud->neo_dcp_dev,
-				    &dcpaud->selected_cookie);
+	return neo_dcp_audiosrv_prepare(neo_dcpaud->neo_dcp_dev,
+				    &neo_dcpaud->selected_cookie);
 }
 
 static int neo_dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
-	struct neo_dcp_audio *dcpaud = substream->pcm->private_data;
+	struct neo_dcp_audio *neo_dcpaud = substream->pcm->private_data;
 	int ret;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
-		if (!dcpaud_connection_up(dcpaud))
+		if (!neo_dcpaud_connection_up(neo_dcpaud))
 			return -ENXIO;
 
-		WARN_ON(pm_runtime_get_sync(dcpaud->dev) < 0);
-		ret = neo_dcp_audiosrv_startlink(dcpaud->neo_dcp_dev,
-					     &dcpaud->selected_cookie);
+		WARN_ON(pm_runtime_get_sync(neo_dcpaud->dev) < 0);
+		ret = neo_dcp_audiosrv_startlink(neo_dcpaud->neo_dcp_dev,
+					     &neo_dcpaud->selected_cookie);
 		if (ret < 0)
 			return ret;
 		break;
@@ -444,9 +444,9 @@ static int neo_dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
-		ret = neo_dcp_audiosrv_stoplink(dcpaud->neo_dcp_dev);
-		pm_runtime_mark_last_busy(dcpaud->dev);
-		__pm_runtime_put_autosuspend(dcpaud->dev);
+		ret = neo_dcp_audiosrv_stoplink(neo_dcpaud->neo_dcp_dev);
+		pm_runtime_mark_last_busy(neo_dcpaud->dev);
+		__pm_runtime_put_autosuspend(neo_dcpaud->dev);
 		if (ret < 0)
 			return ret;
 		break;
@@ -469,25 +469,25 @@ struct snd_pcm_ops neo_dcp_playback_ops = {
 // copied from hdmi-codec.c
 #include "hdmi-codec-chmap.h"
 
-static int dcpaud_chmap_ctl_get(struct snd_kcontrol *kcontrol,
+static int neo_dcpaud_chmap_ctl_get(struct snd_kcontrol *kcontrol,
 			        struct snd_ctl_elem_value *ucontrol)
 {
 	struct snd_pcm_chmap *info = snd_kcontrol_chip(kcontrol);
-	struct neo_dcp_audio *dcpaud = info->private_data;
+	struct neo_dcp_audio *neo_dcpaud = info->private_data;
 	unsigned int i;
 
 	for (i = 0; i < info->max_channels; i++)
 		ucontrol->value.integer.value[i] = \
-				(i < dcpaud->selected_chmap.channels) ?
-				dcpaud->selected_chmap.map[i] : SNDRV_CHMAP_UNKNOWN;
+				(i < neo_dcpaud->selected_chmap.channels) ?
+				neo_dcpaud->selected_chmap.map[i] : SNDRV_CHMAP_UNKNOWN;
 
 	return 0;
 }
 
 
-static int dcpaud_create_chmap_ctl(struct neo_dcp_audio *dcpaud)
+static int neo_dcpaud_create_chmap_ctl(struct neo_dcp_audio *neo_dcpaud)
 {
-	struct snd_pcm *pcm = dcpaud->substream->pcm;
+	struct snd_pcm *pcm = neo_dcpaud->substream->pcm;
 	struct snd_pcm_chmap *chmap_info;
 	int ret;
 
@@ -496,16 +496,16 @@ static int dcpaud_create_chmap_ctl(struct neo_dcp_audio *dcpaud)
 	if (ret < 0)
 		return ret;
 
-	chmap_info->kctl->get = dcpaud_chmap_ctl_get;
+	chmap_info->kctl->get = neo_dcpaud_chmap_ctl_get;
 	chmap_info->chmap = hdmi_codec_8ch_chmaps;
-	chmap_info->private_data = dcpaud;
+	chmap_info->private_data = neo_dcpaud;
 
 	return 0;
 }
 
-static int dcpaud_create_pcm(struct neo_dcp_audio *dcpaud)
+static int neo_dcpaud_create_pcm(struct neo_dcp_audio *neo_dcpaud)
 {
-	struct snd_card *card = dcpaud->card;
+	struct snd_card *card = neo_dcpaud->card;
 	struct snd_pcm *pcm;
 	int ret;
 
@@ -517,30 +517,30 @@ static int dcpaud_create_pcm(struct neo_dcp_audio *dcpaud)
 		return ret;
 
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &neo_dcp_playback_ops);
-	dcpaud->substream = pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
+	neo_dcpaud->substream = pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
 	pcm->nonatomic = true;
-	pcm->private_data = dcpaud;
+	pcm->private_data = neo_dcpaud;
 	strscpy(pcm->name, card->shortname, sizeof(pcm->name));
 
 	return 0;
 }
 
 /* expects to be called with data_lock locked and unlocks it */
-static void dcpaud_report_hotplug(struct neo_dcp_audio *dcpaud, bool connected)
+static void neo_dcpaud_report_hotplug(struct neo_dcp_audio *neo_dcpaud, bool connected)
 {
-	struct snd_pcm_substream *substream = dcpaud->substream;
+	struct snd_pcm_substream *substream = neo_dcpaud->substream;
 
-	if (!dcpaud->card || dcpaud->connected == connected) {
-		mutex_unlock(&dcpaud->data_lock);
+	if (!neo_dcpaud->card || neo_dcpaud->connected == connected) {
+		mutex_unlock(&neo_dcpaud->data_lock);
 		return;
 	}
 
-	dcpaud->connected = connected;
+	neo_dcpaud->connected = connected;
 	if (connected)
-		dcpaud->connection_cookie++;
-	mutex_unlock(&dcpaud->data_lock);
+		neo_dcpaud->connection_cookie++;
+	mutex_unlock(&neo_dcpaud->data_lock);
 
-	snd_jack_report(dcpaud->jack, connected ? SND_JACK_AVOUT : 0);
+	snd_jack_report(neo_dcpaud->jack, connected ? SND_JACK_AVOUT : 0);
 
 	if (!connected) {
 		snd_pcm_stream_lock(substream);
@@ -550,17 +550,17 @@ static void dcpaud_report_hotplug(struct neo_dcp_audio *dcpaud, bool connected)
 	}
 }
 
-static int dcpaud_create_jack(struct neo_dcp_audio *dcpaud)
+static int neo_dcpaud_create_jack(struct neo_dcp_audio *neo_dcpaud)
 {
-	struct snd_card *card = dcpaud->card;
+	struct snd_card *card = neo_dcpaud->card;
 
 	return snd_jack_new(card, "HDMI/DP", SND_JACK_AVOUT,
-			    &dcpaud->jack, true, false);
+			    &neo_dcpaud->jack, true, false);
 }
 
-static void dcpaud_set_card_names(struct neo_dcp_audio *dcpaud)
+static void neo_dcpaud_set_card_names(struct neo_dcp_audio *neo_dcpaud)
 {
-	struct snd_card *card = dcpaud->card;
+	struct snd_card *card = neo_dcpaud->card;
 
 	strscpy(card->driver, "apple_dcp", sizeof(card->driver));
 	strscpy(card->longname, "Apple DisplayPort", sizeof(card->longname));
@@ -568,81 +568,81 @@ static void dcpaud_set_card_names(struct neo_dcp_audio *dcpaud)
 }
 
 #ifdef CONFIG_SND_DEBUG
-static void dcpaud_expose_debugfs_blob(struct neo_dcp_audio *dcpaud, const char *name, void *base, size_t size)
+static void neo_dcpaud_expose_debugfs_blob(struct neo_dcp_audio *neo_dcpaud, const char *name, void *base, size_t size)
 {
 	struct debugfs_blob_wrapper *wrapper;
-	wrapper = devm_kzalloc(dcpaud->dev, sizeof(*wrapper), GFP_KERNEL);
+	wrapper = devm_kzalloc(neo_dcpaud->dev, sizeof(*wrapper), GFP_KERNEL);
 	if (!wrapper)
 		return;
 	wrapper->data = base;
 	wrapper->size = size;
-	debugfs_create_blob(name, 0600, dcpaud->card->debugfs_root, wrapper);
+	debugfs_create_blob(name, 0600, neo_dcpaud->card->debugfs_root, wrapper);
 }
 #else
-static void dcpaud_expose_debugfs_blob(struct neo_dcp_audio *dcpaud, const char *name, void *base, size_t size) {}
+static void neo_dcpaud_expose_debugfs_blob(struct neo_dcp_audio *neo_dcpaud, const char *name, void *base, size_t size) {}
 #endif
 
-extern bool hdmi_audio;
+extern bool neo_hdmi_audio;
 
-static int dcpaud_init_snd_card(struct neo_dcp_audio *dcpaud)
+static int neo_dcpaud_init_snd_card(struct neo_dcp_audio *neo_dcpaud)
 {
 	int ret;
-	if (!hdmi_audio)
+	if (!neo_hdmi_audio)
 		return -ENODEV;
 
 
-	ret = snd_card_new(dcpaud->dev, SNDRV_DEFAULT_IDX1, SNDRV_DEFAULT_STR1,
-			   THIS_MODULE, 0, &dcpaud->card);
+	ret = snd_card_new(neo_dcpaud->dev, SNDRV_DEFAULT_IDX1, SNDRV_DEFAULT_STR1,
+			   THIS_MODULE, 0, &neo_dcpaud->card);
 	if (ret)
 		return ret;
 
-	dcpaud_set_card_names(dcpaud);
+	neo_dcpaud_set_card_names(neo_dcpaud);
 
-	ret = dcpaud_create_pcm(dcpaud);
+	ret = neo_dcpaud_create_pcm(neo_dcpaud);
 	if (ret)
 		goto err_free_card;
 
-	ret = dcpaud_create_chmap_ctl(dcpaud);
+	ret = neo_dcpaud_create_chmap_ctl(neo_dcpaud);
 	if (ret)
 		goto err_free_card;
 
-	ret = dcpaud_create_jack(dcpaud);
+	ret = neo_dcpaud_create_jack(neo_dcpaud);
 	if (ret)
 		goto err_free_card;
 
-	ret = snd_card_register(dcpaud->card);
+	ret = snd_card_register(neo_dcpaud->card);
 	if (ret)
 		goto err_free_card;
 
 	return 0;
 err_free_card:
-	dev_warn(dcpaud->dev, "Failed to initialize sound card: %d\n", ret);
-	snd_card_free(dcpaud->card);
-	dcpaud->card = NULL;
+	dev_warn(neo_dcpaud->dev, "Failed to initialize sound card: %d\n", ret);
+	snd_card_free(neo_dcpaud->card);
+	neo_dcpaud->card = NULL;
 	return ret;
 }
 
-void dcpaud_connect(struct platform_device *pdev, bool connected)
+void neo_dcpaud_connect(struct platform_device *pdev, bool connected)
 {
-	struct neo_dcp_audio *dcpaud = platform_get_drvdata(pdev);
+	struct neo_dcp_audio *neo_dcpaud = platform_get_drvdata(pdev);
 
-	mutex_lock(&dcpaud->data_lock);
+	mutex_lock(&neo_dcpaud->data_lock);
 
-	dcpaud_report_hotplug(dcpaud, connected);
+	neo_dcpaud_report_hotplug(neo_dcpaud, connected);
 }
 
-void dcpaud_disconnect(struct platform_device *pdev)
+void neo_dcpaud_disconnect(struct platform_device *pdev)
 {
-	struct neo_dcp_audio *dcpaud = platform_get_drvdata(pdev);
+	struct neo_dcp_audio *neo_dcpaud = platform_get_drvdata(pdev);
 
-	mutex_lock(&dcpaud->data_lock);
+	mutex_lock(&neo_dcpaud->data_lock);
 
-	dcpaud_report_hotplug(dcpaud, false);
+	neo_dcpaud_report_hotplug(neo_dcpaud, false);
 }
 
-static int dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
+static int neo_dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
 {
-	struct neo_dcp_audio *dcpaud = dev_get_drvdata(dev);
+	struct neo_dcp_audio *neo_dcpaud = dev_get_drvdata(dev);
 	struct device_node *endpoint, *neo_dcp_node = NULL;
 	struct platform_device *neo_dcp_pdev, *dma_pdev;
 	struct of_phandle_args dma_spec;
@@ -686,7 +686,7 @@ static int dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
 		dev_info(dev, "No DP/HDMI audio device, dcp not ready\n");
 		goto rpm_put;
 	}
-	dcpaud->neo_dcp_dev = &neo_dcp_pdev->dev;
+	neo_dcpaud->neo_dcp_dev = &neo_dcp_pdev->dev;
 
 	dma_pdev = of_find_device_by_node(dma_spec.np);
 	of_node_put(dma_spec.np);
@@ -694,22 +694,22 @@ static int dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
 		dev_info(dev, "No DMA device\n");
 		goto rpm_put;
 	}
-	dcpaud->dma_dev = &dma_pdev->dev;
+	neo_dcpaud->dma_dev = &dma_pdev->dev;
 
-	dcpaud->dma_link = device_link_add(dev, dcpaud->dma_dev,
+	neo_dcpaud->dma_link = device_link_add(dev, neo_dcpaud->dma_dev,
 					   DL_FLAG_PM_RUNTIME |
 					   DL_FLAG_RPM_ACTIVE |
 					   DL_FLAG_STATELESS);
 
 	/* ignore errors to prevent audio issues affecting the display side */
-	ret = dcpaud_init_snd_card(dcpaud);
+	ret = neo_dcpaud_init_snd_card(neo_dcpaud);
 
 	if (!ret) {
-		dcpaud_expose_debugfs_blob(dcpaud, "selected_cookie", &dcpaud->selected_cookie,
-					sizeof(dcpaud->selected_cookie));
-		dcpaud_expose_debugfs_blob(dcpaud, "elements", dcpaud->elements,
+		neo_dcpaud_expose_debugfs_blob(neo_dcpaud, "selected_cookie", &neo_dcpaud->selected_cookie,
+					sizeof(neo_dcpaud->selected_cookie));
+		neo_dcpaud_expose_debugfs_blob(neo_dcpaud, "elements", neo_dcpaud->elements,
 					DCPAUD_ELEMENTS_MAXSIZE);
-		dcpaud_expose_debugfs_blob(dcpaud, "product_attrs", dcpaud->productattrs,
+		neo_dcpaud_expose_debugfs_blob(neo_dcpaud, "product_attrs", neo_dcpaud->productattrs,
 					DCPAUD_PRODUCTATTRS_MAXSIZE);
 	}
 
@@ -719,59 +719,59 @@ rpm_put:
 	return 0;
 }
 
-static void dcpaud_comp_unbind(struct device *dev, struct device *main,
+static void neo_dcpaud_comp_unbind(struct device *dev, struct device *main,
 			       void *data)
 {
-	struct neo_dcp_audio *dcpaud = dev_get_drvdata(dev);
+	struct neo_dcp_audio *neo_dcpaud = dev_get_drvdata(dev);
 
 	/* snd_card_free_when_closed() checks for NULL */
-	snd_card_free_when_closed(dcpaud->card);
+	snd_card_free_when_closed(neo_dcpaud->card);
 
-	if (dcpaud->dma_link)
-		device_link_del(dcpaud->dma_link);
+	if (neo_dcpaud->dma_link)
+		device_link_del(neo_dcpaud->dma_link);
 }
 
-static const struct component_ops dcpaud_comp_ops = {
-	.bind	= dcpaud_comp_bind,
-	.unbind	= dcpaud_comp_unbind,
+static const struct component_ops neo_dcpaud_comp_ops = {
+	.bind	= neo_dcpaud_comp_bind,
+	.unbind	= neo_dcpaud_comp_unbind,
 };
 
-static int dcpaud_probe(struct platform_device *pdev)
+static int neo_dcpaud_probe(struct platform_device *pdev)
 {
-	struct neo_dcp_audio *dcpaud;
+	struct neo_dcp_audio *neo_dcpaud;
 
-	dcpaud = devm_kzalloc(&pdev->dev, sizeof(*dcpaud), GFP_KERNEL);
-	if (!dcpaud)
+	neo_dcpaud = devm_kzalloc(&pdev->dev, sizeof(*neo_dcpaud), GFP_KERNEL);
+	if (!neo_dcpaud)
 		return -ENOMEM;
 
-	dcpaud->elements = devm_kzalloc(&pdev->dev, DCPAUD_ELEMENTS_MAXSIZE,
+	neo_dcpaud->elements = devm_kzalloc(&pdev->dev, DCPAUD_ELEMENTS_MAXSIZE,
 					GFP_KERNEL);
-	if (!dcpaud->elements)
+	if (!neo_dcpaud->elements)
 		return -ENOMEM;
 
-	dcpaud->productattrs = devm_kzalloc(&pdev->dev, DCPAUD_PRODUCTATTRS_MAXSIZE,
+	neo_dcpaud->productattrs = devm_kzalloc(&pdev->dev, DCPAUD_PRODUCTATTRS_MAXSIZE,
 					    GFP_KERNEL);
-	if (!dcpaud->productattrs)
+	if (!neo_dcpaud->productattrs)
 		return -ENOMEM;
 
-	dcpaud->dev = &pdev->dev;
-	mutex_init(&dcpaud->data_lock);
-	platform_set_drvdata(pdev, dcpaud);
+	neo_dcpaud->dev = &pdev->dev;
+	mutex_init(&neo_dcpaud->data_lock);
+	platform_set_drvdata(pdev, neo_dcpaud);
 
-	return component_add(&pdev->dev, &dcpaud_comp_ops);
+	return component_add(&pdev->dev, &neo_dcpaud_comp_ops);
 }
 
-static void dcpaud_remove(struct platform_device *pdev)
+static void neo_dcpaud_remove(struct platform_device *pdev)
 {
-	component_del(&pdev->dev, &dcpaud_comp_ops);
+	component_del(&pdev->dev, &neo_dcpaud_comp_ops);
 }
 
-static void dcpaud_shutdown(struct platform_device *pdev)
+static void neo_dcpaud_shutdown(struct platform_device *pdev)
 {
-	component_del(&pdev->dev, &dcpaud_comp_ops);
+	component_del(&pdev->dev, &neo_dcpaud_comp_ops);
 }
 
-static __maybe_unused int dcpaud_suspend(struct device *dev)
+static __maybe_unused int neo_dcpaud_suspend(struct device *dev)
 {
 	/*
 	 * Using snd_power_change_state() does not work since the sound card
@@ -781,36 +781,36 @@ static __maybe_unused int dcpaud_suspend(struct device *dev)
 	return 0;
 }
 
-static __maybe_unused int dcpaud_resume(struct device *dev)
+static __maybe_unused int neo_dcpaud_resume(struct device *dev)
 {
 	return 0;
 }
 
-static DEFINE_RUNTIME_DEV_PM_OPS(dcpaud_pm_ops, dcpaud_suspend, dcpaud_resume, NULL);
+static DEFINE_RUNTIME_DEV_PM_OPS(neo_dcpaud_pm_ops, neo_dcpaud_suspend, neo_dcpaud_resume, NULL);
 
-static const struct of_device_id dcpaud_of_match[] = {
+static const struct of_device_id neo_dcpaud_of_match[] = {
 	{ .compatible = "apple,dpaudio" },
 	{}
 };
 
-static struct platform_driver dcpaud_driver = {
+static struct platform_driver neo_dcpaud_driver = {
 	.driver = {
 		.name = "dcp-dp-audio",
-		.of_match_table	= dcpaud_of_match,
-		.pm		= pm_ptr(&dcpaud_pm_ops),
+		.of_match_table	= neo_dcpaud_of_match,
+		.pm		= pm_ptr(&neo_dcpaud_pm_ops),
 	},
-	.probe		= dcpaud_probe,
-	.remove		= dcpaud_remove,
-	.shutdown	= dcpaud_shutdown,
+	.probe		= neo_dcpaud_probe,
+	.remove		= neo_dcpaud_remove,
+	.shutdown	= neo_dcpaud_shutdown,
 };
 
 void __init neo_dcp_audio_register(void)
 {
-        platform_driver_register(&dcpaud_driver);
+        platform_driver_register(&neo_dcpaud_driver);
 }
 
 void __exit neo_dcp_audio_unregister(void)
 {
-        platform_driver_unregister(&dcpaud_driver);
+        platform_driver_unregister(&neo_dcpaud_driver);
 }
 

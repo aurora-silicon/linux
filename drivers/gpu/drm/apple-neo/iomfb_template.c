@@ -2147,7 +2147,7 @@ int DCP_FW_NAME(neo_iomfb_modeset)(struct neo_apple_dcp *neo_dcp,
 	struct neo_dcp_color_mode *cmode = NULL;
 	int ret;
 
-	mode = lookup_mode(neo_dcp, &crtc_state->mode);
+	mode = neo_lookup_mode(neo_dcp, &crtc_state->mode);
 	if (!mode) {
 		dev_err(neo_dcp->dev, "no match for " DRM_MODE_FMT "\n",
 			DRM_MODE_ARG(&crtc_state->mode));

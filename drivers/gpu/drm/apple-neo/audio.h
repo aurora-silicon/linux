@@ -14,7 +14,7 @@ int neo_dcp_audiosrv_unprepare(struct device *dev);
 int neo_dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize);
 int neo_dcp_audiosrv_get_product_attrs(struct device *dev, void *attrs, size_t maxsize);
 
-void dcpaud_connect(struct platform_device *pdev, bool connected);
-void dcpaud_disconnect(struct platform_device *pdev);
+void neo_dcpaud_connect(struct platform_device *pdev, bool connected);
+void neo_dcpaud_disconnect(struct platform_device *pdev);
 
 #endif /* __AUDIO_H__ */

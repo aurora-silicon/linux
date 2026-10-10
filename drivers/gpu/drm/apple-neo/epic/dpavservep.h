@@ -12,7 +12,7 @@ struct drm_edid;
 struct neo_apple_epic_service;
 struct neo_apple_dcp;
 
-struct dcpavserv {
+struct neo_dcpavserv {
 	spinlock_t lock; /* Protects the service pointer and its owner pin. */
 	bool enabled;
 	struct completion enable_completion;
@@ -20,7 +20,7 @@ struct dcpavserv {
 	struct neo_apple_epic_service *service;
 };
 
-const struct drm_edid *dcpavserv_copy_edid(struct neo_apple_dcp *neo_dcp);
+const struct drm_edid *neo_dcpavserv_copy_edid(struct neo_apple_dcp *neo_dcp);
 void dpavservep_detach(struct neo_apple_dcp *neo_dcp);
 
 #endif /* _DRM_APPLE_EPIC_DPAVSERV_H */
