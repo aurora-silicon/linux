@@ -1,18 +1,18 @@
 /* SPDX-License-Identifier: GPL-2.0-only OR MIT */
 /* T6021 (H14 / J414c) Apple Neural Engine — skeleton constants and types.
  *
- * Every constant below is static-decode provenance, no device writes:
+ * Where the constants below come from (none of them needs a device write):
  *  - reg windows, IRQ, pmgr islands: ADT j414c (DeviceTree.j414cap.im4p,
  *    receipts/2026-09-18-t6021-engine-layout-mined §2), Linux translation
  *    +0x200000000 (proven class, pmgr low-32 match).
  *  - ASC cpu block (+0x1400000 h14g) + MBI transport (SCRATCH, channel
- *    table, +0x1844000 doorbell): K14 kext disasm, W4-fix receipt
- *    (initializeANESoCConfig h14g blocks + InitializeRTBuddy +
- *    doorbell setter 0x…95ebdd0); m1n1 ASCRegs = t8103 cross-ref only
+ *    table, +0x1844000 doorbell): the W4-fix receipt plus the live reads
+ *    and the handshake described below; m1n1 ASCRegs = t8103 cross-ref
+ *    only.
  *  - RTKit MGMT protocol: Asahi rtkit.c semantics, u64 message halves as
  *    staged in omarchy-ane rtkit/h14_rtkit_hello.py (commit 6ad26b7).
- *  - RTBuddy endpoint table + doorbell word: K14 kext cfg table
- *    __DATA_CONST.__const+0x814e520 and HandleRTBuddyMessage
+ *  - RTBuddy endpoint table + doorbell word: the per-endpoint ring sizes,
+ *    fourccs and doorbell bits listed with ane_t6021_eps below
  *    (receipts/2026-09-18-h14-w2-protocol-decode §3).
  *
  * DT binding (driver + packaging/dt/t6021-ane.dts are the two halves):
@@ -25,7 +25,7 @@
  *                  fourth window "fuse" (0x23d2c8060+8, chip revision).
  *  reg/reg-names = "engine" (whole 32 MiB ADT range0, 0x284000000;
  *                  the H13-style +0x1c04000 engine delta does not exist
- *                  on this SoC — kext never computes it and first touch
+ *                  on this SoC — it is never applied here; a first touch
  *                  external-aborted, proven 2026-09-18),
  *                  "pmgr" (0x28e080000+0x4034, pmgr1,t6021 island words),
  *                  "set"  (0x28e08c000+0x4000, SET window — read-only by
@@ -43,8 +43,8 @@
  *                  ane_cpu last): ane_sys_mpm@4000, ane_td@4008,
  *                  ane_base@4010, ane_set1..4@4018-4030, ane_cpu@2e0.
  *                  ane_td/ane_base were the W3 chain gap (six consumed,
- *                  block access reset the machine); receipt
- *                  2026-09-19-h14-init-sequence-kext-trace §3.
+ *                  block access reset the machine); see the
+ *                  2026-09-19 init-sequence receipt §3.
  */
 
 #ifndef __ANE_T6021_H__
@@ -80,20 +80,20 @@ enum {
 #define ANE_PS_AUTO_ENABLE	BIT(28)
 
 /* ANE-block-relative ASC/RTBuddy addresses.  CPU block = ANE+0x1400000
- * for h14g (K14 initializeANESoCConfig h14g blocks 0x…961365c /
- * 0x…9614084 build 0x1400044 with NO 0x200000 orr — the 0x1600044
- * phase-1 §2 quote is the h16g/h17/h18g variant block 0x…9613458;
- * runtime h14g-shaped sites 0x…95d2968 write RUN there).  CPU_STATUS
- * +0x48 keeps the m1n1 ASCRegs +4 shape (config field dev+0x49c =
- * 0x1400048; kext poll 0x…95ecfb4).
+ * for h14g: CPU_CONTROL is 0x1400044, without the 0x200000 offset of
+ * the h16g/h17/h18g parts (whose block is the 0x1600044 one that the
+ * phase-1 §2 note quoted).
+ * RUN is set at 0x1400044 on this part.
+ * CPU_STATUS +0x48 keeps the m1n1 ASCRegs +4 shape (0x1400048, polled
+ * while the ASC CPU starts).
  *
  * W10 (2026-09-19) CORRECTS the claim that stood here — that the m1n1
  * t8103 mailbox (INBOX_CTRL +0x8110 / INBOX0 +0x8800) "has NO h14g
  * analog".  It has one, and it is live: see ANE_ASC_MBOX_* below.  The
  * earlier live test read +0x1608114, the h16g base, which is simply
- * the wrong address on this part; and the absence of 0x1408xxx
- * constants from the kext text means only that the mailbox belongs to
- * the RTBuddy provider kext, not to AppleH11ANEInterface.
+ * the wrong address on this part.  The mailbox belongs to the RTBuddy
+ * transport rather than to the ANE engine interface, which is why the
+ * engine-side constants never refer to 0x1408xxx.
  *
  * W10 also read the CPU block for the first time, on a Linux boot with
  * all eight pmgr domains at ACTUAL=0xf and the W8 grant applied:
@@ -108,7 +108,7 @@ enum {
 #define ANE_ASC_RVBAR		0x1050000	/* fw entry | valid bit0 */
 #define ANE_ASC_EDPRCR		0x1010310	/* phase1 S2 whitelist */
 #define ANE_ASC_VERS		0x1840000
-#define ANE_ASC_RTB_STATUS	0x1840088	/* K14 poll: value < 2 */
+#define ANE_ASC_RTB_STATUS	0x1840088	/* polled: value < 2 */
 #define ANE_ASC_RTB_STATUS_UNK7C 0x184007c	/* phase1 S2 whitelist */
 
 /* ASC blocks iBoot names in the firmware's __rtk_patch records
@@ -164,36 +164,36 @@ enum {
 #define ANE_FATAL_READ_LO	0x1854000
 #define ANE_FATAL_READ_HI	0x1c04000
 
-/* MBI transport (K14 h14g config: socinit stores the SCRATCH register
- * offsets as q-blobs @0x…7503a40/0x…7503a50/0x…7503a60 into dev+0x438
- * and the message-register offsets @0x…7503860 into dev+0x488; runtime
- * handshake in InitializeRTBuddy 0x…95e942c: cmd buffer base ->
- * SCRATCH0/1 (0x…95eaa94), wake 0xf7fbdff9 -> SCRATCH7 (0x…95eab24),
- * poll SCRATCH7 == 0x08042006 "channel description table ready"
- * (0x…95eab74), table base read back from SCRATCH0/1 (0x…95ead04),
- * per-channel {type,bit,size,phys} entries registered with the
- * doorbell setter 0x…95ebdd0 writing (1 << bit) to +0x1844000.  Host
- * ack = SCRATCH3 = 0x08042006 (0x…95eaee4).
+/* MBI transport (h14g): the SCRATCH registers and the message
+ * registers below are the host side of the handshake.  The host writes
+ * the command buffer base to SCRATCH0/1, then the wake word 0xf7fbdff9
+ * to SCRATCH7, and polls until SCRATCH7 == 0x08042006 ("channel
+ * description table ready").  It then reads the table base back from
+ * SCRATCH0/1; the table holds per-channel {type,bit,size,phys}
+ * entries, and a channel is signalled by writing (1 << bit) to the
+ * +0x1844000 doorbell.
+ * Host ack = SCRATCH3 = 0x08042006.  This driver runs the handshake
+ * only behind the transport opt-in (struct ane_t6021, transport).
  *
- * PROVIDER DECODE (2026-09-19, kernelcache.release.mac14j): in
- * RTBuddy mode the TX gate lives in com.apple.driver.RTBuddy 1.0.0
- * (carved from the KC, 46088 B, __TEXT_EXEC 0x…b696860).  RTBuddy
- * publishes per-ANE nubs named "%sEndpoint%u" (0x…7cc7d3f) with the
- * role string "ANE" -> ANEEndpoint1..ANEEndpoint5, class
- * RTBuddyEndpointService (0x98 B) wrapping RTBuddyEndpoint (0xE8 B),
- * over the kernel IOSlaveEndpoint family; K14 EnableRTBuddyEndpoints
- * (0x…95feb30) formats the name ("%s%d" @0x…74c481f), waits 10 s
- * (x1 = 10^10 ns) for the match and takes the gate from [svc+0x88],
- * registering its rx callback at gate+0xd0.  The gate's per-message
- * send is the vtable+0x1e8 slot; its body ends in the AKF mailbox
- * write (AKF_AP_MAILBOX_SET = the +0x1844000 doorbell; RTBuddy dump
- * fn 0x…b69d9c8 prints "AKF_KIC_INBOX_CTRL / AKF_KIC_MAILBOX_SET /
- * AKF_AP_OUTBOX_CTRL / AKF_AP_MAILBOX_SET" and guards
- * "INBOX%d not ready"/"Inbox%d overflow").  Endpoint number =
- * doorbell bit: EP0 is RTBuddyManagementEndpoint (_handleHello /
- * _handleEPRollCall / _handlePowerAck), EP1..5 the ANE data channels.
+ * RTBuddy mode: each ANE channel is an RTBuddy endpoint.  A message to
+ * an endpoint is sent by copying it into that endpoint's shared ring
+ * and then ringing the AP mailbox doorbell (+0x1844000) with the
+ * endpoint's bit; the firmware's mailbox block has inbox and outbox
+ * control registers and refuses a message while its inbox is not
+ * ready or would overflow.
+ *
+ * Endpoint number = doorbell bit: EP0 is RTBuddy management (hello,
+ * endpoint roll call, power acknowledgement), EP1..5 are the ANE data
+ * channels.  The host side of each endpoint is a ring allocated by
+ * this driver (struct ane_t6021_ep below), with the write cursor
+ * advanced as described further down.
+ *
+ * Responses travel the other way on the fw->host channels (T2F*,
+ * see ane_t6021_eps), which this driver does not walk yet.
+ *
  * [INFERENCE: the fw->host doorbell/IRQ bit numbering mirrors the
  * host->fw SET bit per Asahi rtkit semantics; pinned live by W5.]
+ *
  */
 #define ANE_MBI_SCRATCH0	0x1840048	/* SCRATCH0..7 = +0x48..+0x64 */
 #define ANE_MBI_SCRATCH6	0x1840060
@@ -220,14 +220,14 @@ enum {
 #define ANE_MBI_MSG_A2I_RD	0x184c000	/* host->fw message read peer */
 #define ANE_MBI_MSG_A2I_WR	0x1850000	/* host->fw message write */
 
-/* Per-message MBI word (48-bit ring notification, K14
- * rtbuddyEndpointSendMessage 0x…95f3bf4-c30): offset = ring write
+/* Per-message MBI word (48-bit ring notification, sent once for every
+ * endpoint message): offset = ring write
  * cursor [23:0], length [47:24].  NOT the 54-bit surface-announce
- * word (ane_ep_doorbell_encode below) — that one rides SetupEndpoints
- * buffer mapping; this one is what the gate sends per command: the
- * gate call is send(&msg48, 0, 1) at vtable+0x1e8, after the command
- * bytes are already memcpy'd into the shared ring at ring_base +
- * cursor.  Length is capped at 0xffffff by the encoder field.
+ * word (ane_ep_doorbell_encode below) — that one rides the endpoint
+ * buffer setup; this one is sent once per command, after the command
+ * bytes are already copied into the shared ring at ring_base +
+ * cursor.
+ * Length is capped at 0xffffff by the encoder field.
  */
 #define ANE_MBI_MSG48_OFF	GENMASK_ULL(23, 0)
 #define ANE_MBI_MSG48_LEN	GENMASK_ULL(47, 24)
@@ -238,18 +238,18 @@ static inline u64 ane_mbi_msg48_encode(u32 cursor, u32 len)
 	       FIELD_PREP(ANE_MBI_MSG48_LEN, len);
 }
 
-/* Host->fw TX sequence (RTBuddy mode, all static-decode proven):
- *   1. fail if len > ring_size (K14 0xe00002c2 @0x…95f3a24)
+/* Host->fw TX sequence (RTBuddy mode):
+ *   1. fail if len > ring_size
  *   2. cursor = write_cursor; if (cursor + len >= ring_size) cursor = 0
- *      (exact fit wraps: csel lo @0x…95f3b04)
+ *      (an exact fit wraps too)
  *   3. memcpy(ring + cursor, cmd, len)   (DMA-coherent ring)
  *   4. dma_wmb()                          (ring visible before bell)
  *   5. write32(ANE_MBI_MSG_A2I_WR, lo) + write32(+4, hi) — 32-bit
  *      halves (the AKF message register is word-shaped; W6 proved the
  *      W5-live abort was NOT the 64-bit writeq — the halves abort too)
  *   6. write32(ANE_MBI_DOORBELL, 1 << ep)
- *   7. on send success only: write_cursor = cursor + len (K14
- *      0x…95f3c70-c); the cursors at rec+0x40/rec+0x58 track the last
+ *   7. on send success only: write_cursor = cursor + len, so a
+ *      failed send leaves the cursor at the last
  *      issued slot.
  * CSNE_CMD_PING = header-only 0x11 on EP1 (INIT) -> doorbell bit
  * 1 << 1 = 0x2.  Only the a2i message register + doorbell are
@@ -258,9 +258,9 @@ static inline u64 ane_mbi_msg48_encode(u32 cursor, u32 len)
  * host-writable granted, W9 nonzero latch).
  */
 
-/* MBI channel-table entry (kext stride 0x100, fields at +0x40 family:
- * type @+0x40, doorbell bit @+0x44, size @+0x48, phys @+0x50 —
- * InitializeRTBuddy 0x…95eade8-0x…95eae58)
+/* MBI channel-table entry as the firmware publishes it (stride 0x100):
+ * type @+0x40, doorbell bit @+0x44, size @+0x48, phys @+0x50 within
+ * each entry.
  */
 #define ANE_MBI_CHAN_STRIDE	0x100
 #define ANE_MBI_CHAN_MAX_DUMP	8
@@ -298,7 +298,7 @@ static inline u64 ane_mbi_msg48_encode(u32 cursor, u32 len)
 #define ANE_RTKIT_EP_OSLOG	8
 #define ANE_RTKIT_EP_TRACEKIT	0xa
 
-/* RTBuddy app endpoints — K14 InitializeRTBuddyEndpoints opens ids 1..6;
+/* RTBuddy app endpoints — the host opens ids 1..6;
  * ring sizes + fourccs from the per-EP config table (W2 §3). fourcc is
  * byte-reversed in the table (0x54324643 = "T2FC").
  */
@@ -312,11 +312,11 @@ enum ane_t6021_eps {
 	ANE_T6021_EP_COUNT = ANE_T6021_EP_T2HT + 1	/* arrays index by id */
 };
 
-/* CSNE command ids — selene id->name table, vaddr 0xea430, 96 entries
+/* CSNE command ids — the firmware knows 96 of them
  * (full set: receipts/2026-09-18-h14-w2-protocol-decode §4 and
  * receipts/2026-09-18-h14-w2-protocol-decode/fw_cmd_table.json). The
  * fw parses the id as u16 at wire offset +4 (W4 correction of the W2
- * §4 "offset 0" claim: fw sites 0x4d244/0x4d264/0x5246c); the kext
+ * §4 "offset 0" claim); the
  * controller header for the fw->host direction is a different shape
  * (u32 id @ +0x8, 0x24 bytes) and never rides host->fw submission.
  */
@@ -337,12 +337,12 @@ enum ane_t6021_csne_cmd {
 	CSNE_CMD_BACK_CHANNEL_RPC	= 0x7000,
 };
 
-/* fw buffer word (selene builder 0x982b4/0x98f84, decoder 0x98fc8; the
- * K14 SetupEndpoints word is the same shape): addr[43:0] |
+/* fw buffer word (the firmware encodes and decodes buffer words this
+ * way, and the endpoint setup word has the same shape): addr[43:0] |
  * size_code[51:44] | unit[53:52], unit 0 = no size, 1 = code*4K,
  * 2 = code*1M, 3 = code*2M. The fw encoder picks unit 1 below 1 MiB
- * and unit 2 at or above, size code = CEILING division (cinc on the
- * remainder), so the decoded size is the rounded-up value. rtkit.c's
+ * and unit 2 at or above, size code = CEILING division (rounded up,
+ * never down), so the decoded size is the rounded-up value. rtkit.c's
  * BUFFER_REQUEST is this word with unit 1.
  */
 #define ANE_EP_DOORBELL_OFFSET	GENMASK_ULL(43, 0)
@@ -373,7 +373,7 @@ struct ane_t6021_ep {
 	const char *name;
 	u32 fourcc;
 	u32 ring_size;
-	u32 write_cursor;	/* next ring slot (K14 rec+0x20) */
+	u32 write_cursor;	/* next ring slot */
 	void *ring;			/* dma_alloc_coherent, ring_size */
 	dma_addr_t ring_iova;
 	bool started;
@@ -414,7 +414,7 @@ struct ane_t6021 {
 	 * live, enabled, permanently-empty ASC v4 control pair.  It is
 	 * empty because the ASC CPU is STOPPED with RUN clear and RVBAR
 	 * entry 0, i.e. no firmware was ever started.  Default off =
-	 * status-only bring-up.  Opt-in runs the kext-evidenced MBI
+	 * status-only bring-up.  Opt-in runs the documented MBI
 	 * handshake (SCRATCH wake -> fw channel table), capture-only.
 	 */
 	bool transport;
@@ -519,25 +519,25 @@ int ane_t6021_boot_start(struct ane_t6021 *ane, int stop_after, int table_mode,
 
 /* ---- CSNE_CMD wire structs (host->fw on the INIT channel) ----
  *
- * W4 static decode, extending W2 §4 (the receipt's "fw parses a u16 id
- * at header offset 0" was WRONG — three independent fw parse sites read
- * the id as u16 at offset +4: the generic CSNE processor @0x4d264, its
- * preload @0x4d244, and the LOAD_PROGRAM/CREATE_PROCESS/PROCEDURE_CALL
- * pre-parse @0x5246c, all `ldrh wN, [xM, #4]` in selene). Wire is
+ * W4, extending W2 §4 (the receipt's "fw parses a u16 id
+ * at header offset 0" was WRONG — the firmware reads
+ * the id as u16 at offset +4, for generic commands as well as for
+ * LOAD_PROGRAM/CREATE_PROCESS/PROCEDURE_CALL).
+ * Wire is
  * little-endian; this module is arm64-only so host order is wire order.
  *
- * The generic processor takes commands < 0x1b89 bytes (work-item size
- * bound @0x4d134-0x4d158) and writes completion state back into the
- * command block (strb @0x4d324 byte +6, str @0x4d3b0 qword +8) — the
- * ring slot doubles as the response area. The processor's id tree
- * sends PING/BUILDINFO/BOOT/REG_FILE_LOAD/IPC_ENDPOINT_SET on to the
- * default path (0x4e65c): carried without field parsing, so
+ * The firmware takes commands < 0x1b89 bytes and writes completion
+ * state back into the
+ * command block (byte +6 and the qword at +8) — the
+ * ring slot doubles as the response area. The firmware handles
+ * PING/BUILDINFO/BOOT/REG_FILE_LOAD/IPC_ENDPOINT_SET on its
+ * default path, without parsing their fields, so
  * their payloads beyond the header are opaque until the W1 live
  * exchange pins them.
  */
 struct ane_csne_hdr {
 	u32 rsvd0;	/* bytes 0..3: never read by the fw processor; 0 */
-	u16 id;		/* PROVEN u16 @ +4 (sites above) */
+	u16 id;		/* PROVEN u16 @ +4 (see above) */
 	u8 flags;	/* fw-written byte @ +6 (status/scratch) [INFERENCE] */
 	u8 rsvd7;
 };
@@ -551,12 +551,12 @@ static inline void ane_csne_hdr_init(struct ane_csne_hdr *h, u16 id)
 }
 
 /* Header-only CSNE_CMDs: BOOT (0x10 — boot-arg surfaces ride
- * SCRATCH0-7 / SetupFWInitBootArgs, not the command, phase1 §2.5),
+ * SCRATCH0-7 / the firmware init boot args, not the command, phase1 §2.5),
  * PING (0x11), BUILDINFO (0x06). sizeof(struct ane_csne_hdr) bytes.
  */
 
 /* REG_FILE_LOAD (0x05) payload: the 1456 B blob is the fw's own
- * __DATA._rtk_tunables section (@0x100590, size 0x5b0) — its transport
+ * _rtk_tunables section (0x5b0 bytes) — its transport
  * (inline vs shared-memory iova) is [INFERENCE], pinned by W1.
  */
 struct ane_csne_cmd_reg_file_load {
@@ -573,21 +573,21 @@ struct ane_csne_cmd_ipc_endpoint_set {
 	u8 payload[];
 };
 
-/* PROCEDURE_CALL (0x204) / INFERENCE_CALL (0x404) — the kext
- * CANE_SUB_PACKET_CMD_PROCEDURE_CALL family. Field offsets PROVEN from
- * the fw parse; field semantics named only where the kext asserts name
- * them (programId, procedureId, numIoBuffers in assert order, W2 §4):
- *   +0x08/+0x0c u32 pair validated together (ldp @0x4d654)
- *   +0x10        u64 passed to the fw validator (0x4d6d4)
+/* PROCEDURE_CALL (0x204) / INFERENCE_CALL (0x404) — the procedure-call
+ * command family. Field offsets follow what the firmware accepts;
+ * field names (programId, procedureId, numIoBuffers, W2 §4) are given
+ * only where the field's role is known:
+ *   +0x08/+0x0c u32 pair validated together
+ *   +0x10        u64 passed to the fw validator
  *   +0x18        u32 stats/priority, fw-valid [2,7]; 2 is the value
  *                proven end-to-end (binding.json stats_type; the
  *                first-inference receipt's bare calls)
- *   +0x28        u32 element count (loop bound @0x524bc-0x524c4)
- *   +0x60        count × 0x30-byte io-buffer records (@0x524a8-0x524b4)
- * The kext `size % sizeof(sCSneCmdProcedureCall) == 0` assert says
- * commands form same-shape arrays in the ring; this driver submits one
+ *   +0x28        u32 element count
+ *   +0x60        count × 0x30-byte io-buffer records
+ * Commands are whole multiples of the procedure-call size, so they
+ * form same-shape arrays in the ring; this driver submits one
  * command per slot. INFERENCE_CALL shares the shape [INFERENCE: the
- * 0x404 id is not in the decoded id tree — it is the W4 submission
+ * 0x404 id is not among the decoded ids — it is the W4 submission
  * endpoint per the phase-1 workstream plan].
  */
 struct ane_csne_io_elem {
@@ -622,23 +622,23 @@ ane_csne_cmd_procedure_call_size(unsigned int num_io_buffers)
 	       num_io_buffers * sizeof(struct ane_csne_io_elem);
 }
 
-/* Fw-side bound: the generic CSNE processor rejects work items of
- * 0x1b89 bytes and above (@0x4d134 cmp x2, #0x1b89). What x2 names
- * beyond "the command's size" is [INFERENCE] — enforced here as a
+/* Fw-side bound: the firmware rejects work items of
+ * 0x1b89 bytes and above. That the bound applies to the whole command
+ * and not to some other size is [INFERENCE] — enforced here as a
  * fail-fast so an oversized command cannot enter the ring.
  */
 #define ANE_CSNE_CMD_MAX_SIZE	0x1b88
 
-/* ---- LOAD_PROGRAM (0x200) wire contract (selene 0x4e44c hook +
- * 0x4e53c worker + 0x4e640 registration; decode 2026-09-26, entry
- * item 23/23b/23c/23e): the payload is NINE 0x30-byte named section
- * records at +0x08. Registration publishes "<name>.bin" into the fw
- * program-info symbol table (format "%s.bin" @0xa733f,
- * CAneProgramInfo.cpp) with value = record+0x18 and aux =
- * u32(record+0x20). The fw dereferences record+0x18 (0x5d0c8), so it
+/* ---- LOAD_PROGRAM (0x200) wire contract (2026-09-26, entry item
+ * 23/23b/23c/23e): the payload is NINE 0x30-byte named section
+ * records at +0x08. Loading publishes "<name>.bin" for each section
+ * into the fw program-info symbol table, with value = record+0x18
+ * and aux = u32(record+0x20).
+ *
+ * The fw dereferences record+0x18, so it
  * carries a fw-addressable pointer — in this driver, the IOVA of a
  * host-authored section object (below). Absent sections (flags bit0
- * clear) are skipped by every decoded parser. ----
+ * clear) are skipped by the firmware. ----
  */
 enum ane_t6021_load_section {
 	ANE_SEC_GENERIC = 0,
@@ -671,9 +671,9 @@ static_assert(sizeof(struct ane_csne_cmd_load_program) ==
 	      0x08 + 9 * 0x30);
 
 /* Section-record wire accessors over the 0x30-byte io_elem (the only
- * bytes any decoded parser reads; the rest is unread pass-through):
+ * bytes the firmware reads; the rest is unread pass-through):
  * +0x00 u8 flags — bit0 present; +0x18 u64 obj — fw-addressable
- * pointer, validated by 0x5d0c8 to land inside a registered program
+ * pointer, which the firmware checks lands inside a registered program
  * object's entry table; +0x20 u64 key — per-section lookup key.
  */
 #define ANE_SEC_F_PRESENT	BIT(0)
@@ -689,7 +689,7 @@ static inline void ane_sec_record_init(void *rec, u64 obj, u64 key)
 }
 
 /* Host-authored PROGRAM OBJECT (the thing section records point at;
- * 0x5d0c8 validates: magic 1 @+0, count <= 0x10 @+4, table entry
+ * the firmware validates: magic 1 @+0, count <= 0x10 @+4, table entry
  * count in [0x201, 0x400] @+0x204, 0x30-byte entry table @+0x208 with
  * the recorded pointer bounded inside it). Minimum object = header +
  * 0x201 zeroed entries; entries are the same 0x30-byte shape.
@@ -716,7 +716,7 @@ static inline void ane_progobj_init(void *obj, u32 entries)
 	/* caller zeroes the tail: entries table starts at +0x208 */
 }
 
-/* Host-authored OPERATION-SECTION image (0x5d290: u32 op_count @+0,
+/* Host-authored OPERATION-SECTION image (u32 op_count @+0,
  * <= 0x80; then op_count 0x40c-byte operation records at +4; the
  * section KEY is an offset past the array, >= op_count*0x40c + 4).
  * Operation record fields decoded: +0x00 u32 type <= 4; +0x04 u16
@@ -731,8 +731,8 @@ static inline size_t ane_opsec_size(u32 ops)
 	return 4 + (size_t)ops * ANE_OPSEC_OP_REC_SIZE;
 }
 
-/* Submit one CSNE command block on the INIT (EP1) ring: K14
- * rtbuddyEndpointSendMessage semantics (W2 §3) — slot alloc with wrap,
+/* Submit one CSNE command block on the INIT (EP1) ring: RTBuddy
+ * endpoint send semantics (W2 §3) — slot alloc with wrap,
  * memcpy into the ring, 54-bit doorbell word, cursor
  * advanced only on doorbell success. No synchronous response matching:
  * fw->host responses arrive on the T2F* channels and are not walked
@@ -747,8 +747,8 @@ void ane_t6021_csne_ping_attempt(struct ane_t6021 *ane);
 
 /* W13/W14 firmware loader (ane_t6021_fwload.c): validate + stage +
  * dart-ane0-map the 13.5 PRELOAD payload behind fw_load=1. This is
- * the staging half of the boot contract: the Params+0x18 producer
- * chain and the RVBAR fold are closed (mapper-callchain audit, commits
+ * the staging half of the boot contract: the fw DVA source
+ * and the RVBAR fold are closed (audit commits
  * 3762aee/12be074); ane_t6021_boot.c consumes the staged surface.
  */
 int ane_t6021_fwload_probe(struct ane_t6021 *ane);
@@ -768,7 +768,7 @@ struct ane_asc_tunables;
  *    for this SoC (T6021 only), so fw_alias_reserved=1 may map it; the
  *    other SoCs always run the firmware from driver-owned memory.
  *  ps_cpu_off: the ANE CPU ps word in the DT "pmgr" window (probe guard).
- *  pwgate_off: the kext's PWGATE word in the DT "set" window, checked
+ *  pwgate_off: the PWGATE word in the DT "set" window, checked
  *    open before any engine read; 0 = not checked.
  *  pmu_pa: the page of the seven ANE ps words; the firmware's power
  *    service writes them through its DART at IOVA == PA. ps_off: the

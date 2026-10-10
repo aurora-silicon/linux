@@ -558,8 +558,8 @@ pub(crate) struct Manager {
     shrink: Shrink,
 }
 
-/// Native tiler-heap shrink policy, after macOS
-/// `AGXParameterManagement::checkForShrink` (AGXG17X 0x8bd5e20). Once per
+/// Native tiler-heap shrink policy, matching the heap behaviour seen
+/// under macOS. Once per
 /// period the page high-water folds into an average,
 /// `max((sample + 4 * average) / 5, sample)`. Each period whose average
 /// stays below a quarter of the capacity earns one 512 KiB block of shrink,

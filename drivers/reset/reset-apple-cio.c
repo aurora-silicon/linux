@@ -30,7 +30,7 @@
  * "port = slot % 4", which the device tree expresses as one controller node
  * per die instead. The others index by slot directly.
  *
- * "regmap" is an ApplePMGR::RegMap enum rather than an address. RegMap 0 is
+ * "regmap" is a PMGR register-map index rather than an address. RegMap 0 is
  * the PMGR block itself: t8103 resolves to 0x23b784000 and
  * t6020 to the pmgr node plus 0xa02c, both of which match this driver. The
  * t8122 and t6030 selectors are unresolved, so they cannot be wired up

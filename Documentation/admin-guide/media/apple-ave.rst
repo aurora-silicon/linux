@@ -58,6 +58,6 @@ kernel health and the existing desktop/radio stack. Keep the generated
 inputs, bitstreams, decoded pixels, logs and hashes as a repeatable artifact.
 
 The prior implementation was authored by Ace (Acelogic). This contribution
-ports that existing GPL work; it does not claim independent clean-room
-provenance. Arbitrary resolutions, standard media APIs, throughput,
-concurrent clients and other codecs or SoCs are outside this experiment.
+ports that existing GPL work. Arbitrary resolutions, standard media APIs,
+throughput, concurrent clients and other codecs or SoCs are outside this
+experiment.

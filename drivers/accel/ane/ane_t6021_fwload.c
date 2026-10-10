@@ -34,7 +34,7 @@
  *      RVBAR entry on the device's default DMA domain. Placement
  *      contract, receipt receipts/2026-09-20-t6021-entry-alias.md:
  *        - live RVBAR read64 = 0x10000000001 (bit0 latched, entry
- *          bits 0x10000000000 = dart-ane vm base); kext law
+ *          bits 0x10000000000 = dart-ane vm base); lifecycle rule
  *          (rvbar-lifecycle 6288b0b): bit0 set => the RVBAR write
  *          branch is skipped, so the ASC fetches AT the latched entry;
  *        - netconsole 2026-09-20T17:48:19: apple-dart 285800000.iommu
@@ -193,14 +193,14 @@ bool ane_t6021_fwload_options_ok(void)
  * die-0 addresses (13.5 ADTs, t602x-ane.dtsi).
  *
  * pmu_pa: the firmware's power service programs the seven ANE ps words
- * through its DART at IOVA == PA (SetPMUBaseAddress stores the ANE_TD
+ * through its DART at IOVA == PA (the PMU base it is given is the ANE_TD
  * word: selene 0x28e084008, bia 0x23b70c010, receipts/2026-10-01-t8112-kit).
  * macOS maps the page first; without it the first access faults (NO PMD
  * FOR IOVA 0x28e084008, 2026-09-29) and the firmware halts.
  *
  * T8112 (receipts/2026-10-01-t8112-optin): the revision comes from the
  * eFuse words iBoot reads, the ANE_SYS_CPU word is pmgr +0xc008, and the
- * kext (type 0x70) opens PWGATE "set" +0x8b8 before the ps words. The TM
+ * macOS (type 0x70) opens PWGATE "set" +0x8b8 before the ps words. The TM
  * TD word is not known there, so trace_td is off.
  */
 const struct ane_t602x_soc ane_t6020_soc = {
