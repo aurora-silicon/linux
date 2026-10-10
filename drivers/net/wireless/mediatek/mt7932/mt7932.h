@@ -107,6 +107,7 @@ struct mt7932 {
 	struct work_struct startup_work;
 	struct mutex command_mutex;
 	bool startup_started, rf_ready, reg_pending, policy_failed, reg_retryable;
+	bool ready;
 	bool interface_registered, interface_up;
 	u32 reg_generation, reg_attempted;
 	struct mt7932_reg_snapshot reg_desired;
