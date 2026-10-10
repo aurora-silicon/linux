@@ -331,8 +331,6 @@ pub(crate) struct TvbGrowth {
     extension: KernelObject,
 }
 
-/// Sparse 128-KiB data blocks at 160-KiB backing strides. Firmware owns their
-/// contents; CPU zeroing occurs only on fresh backing, never on pool reuse.
 /// Aliases and backing of growth extensions a shrink removed from an idle
 /// heap. Field order unmaps the aliases before freeing their backing.
 pub(crate) struct TvbRelease {
@@ -340,6 +338,8 @@ pub(crate) struct TvbRelease {
     _extensions: KVec<KernelObject>,
 }
 
+/// Packed 128-KiB data blocks mapped at guarded 160-KiB virtual strides.
+/// Firmware owns their contents; CPU zeroing occurs only on fresh backing.
 pub(crate) struct Tvb {
     addresses: KVec<u64>,
     // Retain sparse-block backing until the pool and its aliases retire.
@@ -593,11 +593,7 @@ struct Shrink {
     window: [u32; SHRINK_WINDOW],
     window_next: usize,
     busy_peak: u32,
-    reported: bool,
 }
-
-/// Bounds the one-line report of heaps that could not be rebuilt.
-static SHRINK_REPORTS: AtomicU32 = AtomicU32::new(0);
 
 pub(crate) struct Submitted<'a> {
     word: &'a AtomicU32,
@@ -1046,18 +1042,6 @@ impl Manager {
         let retained = (before.total as usize + cfg::TVB_BLOCK_SLOTS - before.read as usize)
             % cfg::TVB_BLOCK_SLOTS;
         if !before.valid() || before.total != before.committed || retained != blocks {
-            if !self.shrink.reported && SHRINK_REPORTS.fetch_add(1, Ordering::Relaxed) < 8 {
-                self.shrink.reported = true;
-                pr_info!(
-                    "G17: tiler heap {} kept {} blocks: inventory {}/{}/{} holds {}\n",
-                    self.buffer_id,
-                    blocks,
-                    before.total,
-                    before.committed,
-                    before.read,
-                    retained
-                );
-            }
             return Ok(None);
         }
         // Allocation failure only postpones the shrink to a later pass.
@@ -1121,7 +1105,6 @@ impl Manager {
             }
         }
         self.shrink.credit = self.shrink.credit.saturating_sub(blocks - kept);
-        self.shrink.reported = false;
         Ok(Some((
             fw::reload_descriptor(descriptor, self.page_list_client, pages),
             release,
