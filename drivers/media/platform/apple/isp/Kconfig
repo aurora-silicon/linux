@@ -10,6 +10,7 @@ config VIDEO_APPLE_ISP
 	depends on OF_ADDRESS
 	depends on V4L_PLATFORM_DRIVERS
 	depends on VIDEO_DEV
+	depends on DRM
 	help
 	  Driver for the image signal processor that runs the built-in
 	  camera of Apple silicon machines. The ISP firmware is loaded by
@@ -17,3 +18,13 @@ config VIDEO_APPLE_ISP
 	  calibration file for the detected camera module,
 	  apple/isp_<module>_<revision>XX.dat, from the firmware search
 	  path; if it is missing, the stream runs without calibration.
+
+config VIDEO_APPLE_ISP_KUNIT_TEST
+	tristate "Apple ISP IPC layout tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test firmware-selected IPC ring extents, including 64-bit addresses,
+	  overflow, alignment and overlap with the channel table or other rings.
+	  These tests run without starting or accessing the ISP and do not
+	  require a supported Apple device or the ISP driver itself.

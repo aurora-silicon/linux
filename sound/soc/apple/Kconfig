@@ -1,6 +1,17 @@
 # SPDX-License-Identifier: GPL-2.0-only
 menu "Apple"
 
+config SND_SOC_APPLE_J616S_AOP_JACK
+	tristate "J616s retained-profile AOP jack control probe"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on RUST
+	select APPLE_AOP
+	help
+	  Inspect the qualified J616s jack service and retained MCA profiles.
+	  Accept only the matching board, firmware and EPIC transport identity.
+	  This control probe does not power an audio path or expose a PCM.
+	  Streaming requires separate DMA and shared-clock lifecycle admission.
+
 config SND_SOC_APPLE_AOP_AUDIO
 	tristate "AOP audio driver"
 	depends on ARCH_APPLE || COMPILE_TEST

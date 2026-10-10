@@ -971,9 +971,12 @@ impl platform::Driver for SndSocAopDriver {
         let info = info.ok_or(ENODEV)?;
         let dev = ARef::<device::Device>::from(pdev.as_ref());
         let parent = pdev.as_ref().parent().unwrap();
-        // SAFETY: our parent is AOP, and AopDriver is repr(transparent) for Arc<dyn Aop>
-        let adata_ptr = unsafe { Pin::<KBox<Arc<dyn AOP>>>::borrow(parent.get_drvdata()) };
-        let adata = (&*adata_ptr).clone();
+        // SAFETY: This is a service child registered by the AOP provider.
+        // A retired child can remain registered after its parent unbinds;
+        // the checked lookup defers rather than borrowing null driver data.
+        let adata = unsafe {
+            <dyn AOP>::audio_from_child(dev.as_ref(), kernel::soc::apple::aop::ServiceABI::Legacy)?
+        };
         // SAFETY: AOP sets the platform data correctly
         let svc = unsafe { *((*dev.as_raw()).platform_data as *const EPICService) };
         let parent_fwnode = parent.fwnode().ok_or(ENOENT)?;

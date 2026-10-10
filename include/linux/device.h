@@ -801,6 +801,40 @@ struct device_link {
 int __device_set_driver_override(struct device *dev, const char *s, size_t len);
 
 /**
+ * __device_prepare_driver_override() - Reserve a driver override before exposure
+ * @s: NUL-terminated driver name, or an empty string to clear an override
+ * @len: Length limit, as for __device_set_driver_override()
+ *
+ * Returns an owned kstrndup allocation, NULL for an empty override, or an
+ * ERR_PTR. Install the prepared value with __device_install_driver_override()
+ * or release it with kfree(). This permits failure paths to retire DMA owners
+ * without depending on an allocation after the device has started DMA.
+ */
+const char *__device_prepare_driver_override(const char *s, size_t len);
+
+/**
+ * __device_install_driver_override() - Transfer a prepared override to a device
+ * @dev: Device whose override is replaced
+ * @name: Owned allocation from __device_prepare_driver_override(), or NULL
+ *
+ * Takes ownership of @name and frees the previous override. Installation uses
+ * the override lock and cannot fail or allocate. Do not pass an ERR_PTR.
+ */
+void __device_install_driver_override(struct device *dev, const char *name);
+
+/**
+ * __device_retire_driver() - Install a reserved barrier and unbind under one lock
+ * @dev: Registered device, with consumer lookup admission already closed
+ * @name: Owned allocation from __device_prepare_driver_override()
+ *
+ * Takes the locks used by driver attach, installs @name without allocation,
+ * and releases the current driver before unlocking. A previously matched
+ * attach can still enter probe after this helper; its lookup must reject
+ * closed admission rather than borrowing released provider driver data.
+ */
+void __device_retire_driver(struct device *dev, const char *name);
+
+/**
  * device_set_driver_override() - Helper to set or clear driver override.
  * @dev: Device to change
  * @s: NUL-terminated string, new driver name to force a match, pass empty

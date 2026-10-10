@@ -2680,7 +2680,9 @@ impl platform::Driver for SndSocT8140AopDriver {
         // SAFETY: this is a service device the AOP core registered, being
         // probed here; the lookup defers the probe until the core has
         // published its driver data.
-        let adata = unsafe { <dyn AOP>::from_child(pdev.as_ref()) }?;
+        let adata = unsafe {
+            <dyn AOP>::audio_from_child(pdev.as_ref(), kernel::soc::apple::aop::ServiceABI::T8140)
+        }?;
         // SAFETY: the AOP core sets this child's platform data to the EPIC
         // service it created the child for; it lives as long as the child.
         let service = unsafe { (*dev.as_raw()).platform_data as *const EPICService };

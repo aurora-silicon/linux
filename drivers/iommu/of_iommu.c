@@ -18,6 +18,7 @@
 #include <linux/fsl/mc.h>
 
 #include "iommu-priv.h"
+#include "of_iommu_firmware.h"
 
 static int of_iommu_xlate(struct device *dev,
 			  struct of_phandle_args *iommu_spec)
@@ -244,14 +245,11 @@ void of_iommu_get_resv_regions(struct device *dev, struct list_head *list)
 			np = of_find_node_by_phandle(phandle);
 
 			if (np == dev->of_node) {
-				int prot = IOMMU_READ | IOMMU_WRITE;
 				struct iommu_resv_region *region;
 				enum iommu_resv_type type;
 				phys_addr_t iova;
 				size_t length;
-
-				if (of_dma_is_coherent(dev->of_node))
-					prot |= IOMMU_CACHE;
+				bool read_only = of_iommu_firmware_read_only(it.node);
 
 				maps = of_translate_dma_region(np, maps, &iova, &length);
 				if (length == 0) {
@@ -260,12 +258,9 @@ void of_iommu_get_resv_regions(struct device *dev, struct list_head *list)
 				}
 				type = iommu_resv_region_get_type(dev, &phys, iova, length);
 
-				if (type == IOMMU_RESV_TRANSLATED)
-					region = iommu_alloc_resv_region_tr(phys.start, iova, length, prot, type,
-								    GFP_KERNEL);
-				else
-					region = iommu_alloc_resv_region(iova, length, prot, type,
-								 GFP_KERNEL);
+				region = of_iommu_alloc_firmware_region(
+					phys.start, iova, length, type,
+					of_dma_is_coherent(dev->of_node), read_only);
 
 				if (region)
 					list_add_tail(&region->list, list);
