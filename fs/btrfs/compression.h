@@ -20,6 +20,7 @@ struct address_space;
 struct inode;
 struct btrfs_inode;
 struct btrfs_ordered_extent;
+struct extent_map;
 
 /*
  * We want to make sure that amount of RAM required to uncompress an extent is
@@ -94,7 +95,7 @@ struct compressed_bio *btrfs_alloc_compressed_write(struct btrfs_inode *inode,
 						    u64 start, u64 len);
 void btrfs_submit_compressed_write(struct btrfs_ordered_extent *ordered,
 				   struct compressed_bio *cb);
-void btrfs_submit_compressed_read(struct btrfs_bio *bbio);
+void btrfs_submit_compressed_read(struct btrfs_bio *bbio, struct extent_map *em);
 
 int btrfs_compress_str2level(unsigned int type, const char *str, int *level_ret);
 

@@ -540,11 +540,10 @@ static noinline int add_ra_bio_pages(struct inode *inode,
  * After the compressed pages are read, we copy the bytes into the
  * bio we were passed and then call the bio end_io calls
  */
-void btrfs_submit_compressed_read(struct btrfs_bio *bbio)
+void btrfs_submit_compressed_read(struct btrfs_bio *bbio, struct extent_map *em)
 {
 	struct btrfs_inode *inode = bbio->inode;
 	struct btrfs_fs_info *fs_info = inode->root->fs_info;
-	struct extent_map_tree *em_tree = &inode->extent_tree;
 	struct compressed_bio *cb;
 	unsigned int compressed_len;
 	const u32 min_folio_size = btrfs_min_folio_size(fs_info);
@@ -552,7 +551,6 @@ void btrfs_submit_compressed_read(struct btrfs_bio *bbio)
 	gfp_t gfp;
 	u64 em_len;
 	u64 em_start;
-	struct extent_map *em;
 	unsigned long pflags;
 	int memstall = 0;
 	int ret;
@@ -568,16 +566,18 @@ void btrfs_submit_compressed_read(struct btrfs_bio *bbio)
 	else
 		gfp = GFP_NOFS;
 
-	/* we need the actual starting offset of this extent in the file */
-	read_lock(&em_tree->lock);
-	em = btrfs_lookup_extent_mapping(em_tree, file_offset, fs_info->sectorsize);
-	read_unlock(&em_tree->lock);
-	if (!em) {
+	/*
+	 * We need the actual starting offset of this extent in the file. The
+	 * caller holds a reference on the extent map the bio was built from;
+	 * it may no longer be in the inode's extent map tree.
+	 */
+	if (WARN_ON_ONCE(!em)) {
 		ret = -EIO;
 		goto out;
 	}
 
 	ASSERT(btrfs_extent_map_is_compressed(em));
+	ASSERT(em->start <= file_offset && file_offset < btrfs_extent_map_end(em));
 	compressed_len = em->disk_num_bytes;
 
 	cb = alloc_compressed_bio(inode, file_offset, REQ_OP_READ,
@@ -591,8 +591,6 @@ void btrfs_submit_compressed_read(struct btrfs_bio *bbio)
 	cb->compress_type = btrfs_extent_map_compression(em);
 	cb->orig_bbio = bbio;
 	cb->bbio.csum_search_commit_root = bbio->csum_search_commit_root;
-
-	btrfs_free_extent_map(em);
 
 	for (int i = 0; i * min_folio_size < compressed_len; i++) {
 		struct folio *folio;
