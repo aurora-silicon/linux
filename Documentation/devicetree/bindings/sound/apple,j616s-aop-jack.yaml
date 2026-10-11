@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/apple,j616s-aop-jack.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple J616s AOP retained-profile jack control
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description: |
+  Read-only control inspection of the J616s AOP audio service on EPIC v2
+  endpoint 0x22. This node is a service child of the AOP provider. The
+  bootloader copies the current firmware identity from the AOP firmware nub.
+  The driver accepts the qualified identity and exact retained coS/cin MCA
+  profiles. It does not upload configuration, power a path, expose a PCM or
+  enable speakers. DMA and shared-clock lifecycle require separate admission.
+
+properties:
+  compatible:
+    const: apple,j616s-aop-jack
+
+  apple,firmware-uuid:
+    $ref: /schemas/types.yaml#/definitions/string
+    pattern: '^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$'
+    description: Current firmware UUID copied from the AOP nub, not the SoC identity.
+
+  apple,firmware-name:
+    $ref: /schemas/types.yaml#/definitions/string
+    description: Current firmware name copied from the AOP nub.
+
+required:
+  - compatible
+  - apple,firmware-uuid
+  - apple,firmware-name
+
+additionalProperties: false

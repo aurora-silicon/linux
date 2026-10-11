@@ -94,6 +94,12 @@ bool apple_rtkit_is_running(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_is_running);
 
+unsigned int apple_rtkit_protocol_version(struct apple_rtkit *rtk)
+{
+	return READ_ONCE(rtk->version);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_protocol_version);
+
 bool apple_rtkit_is_crashed(struct apple_rtkit *rtk)
 {
 	return rtk->crashed;

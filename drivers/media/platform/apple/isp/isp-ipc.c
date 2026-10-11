@@ -66,7 +66,11 @@ static inline void chan_read_msg_index(struct apple_isp *isp,
 				       struct isp_channel *chan,
 				       struct isp_message *msg, u32 index)
 {
-	memcpy(msg, chan_msg_virt(chan, index), sizeof(*msg));
+	u64 *source = chan_msg_virt(chan, index);
+
+	msg->arg0 = READ_ONCE(*source);
+	dma_rmb();
+	memcpy(&msg->arg1, source + 1, sizeof(*msg) - sizeof(msg->arg0));
 }
 
 static inline void chan_read_msg(struct apple_isp *isp,
@@ -124,6 +128,8 @@ static int chan_handle_once(struct apple_isp *isp, struct isp_channel *chan)
 	isp_mbox2_write32(isp, ISP_MBOX2_IRQ_DOORBELL, chan->doorbell);
 
 	chan_update_cursor(chan);
+	if (chan->ops->acknowledged)
+		chan->ops->acknowledged(isp, chan);
 
 	return 0;
 }
@@ -176,6 +182,10 @@ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
 {
 	long t;
 
+	lockdep_assert_held(&chan->lock);
+	if (chan->tx_poisoned)
+		return -EIO;
+
 	chan_write_msg(isp, chan, &chan->req);
 	dma_wmb();
 
@@ -186,6 +196,10 @@ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
 
 	t = wait_event_timeout(isp->wait, chan_tx_done(isp, chan), timeout);
 	if (t == 0) {
+		chan->tx_poisoned = true;
+		WRITE_ONCE(isp->capture_failed, true);
+		if (isp->video_registered)
+			vb2_queue_error(&isp->vbq);
 		dev_err(isp->dev,
 			"%s: timed out on request [0x%llx, 0x%llx, 0x%llx]\n",
 			chan->name, chan->req.arg0, chan->req.arg1,

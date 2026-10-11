@@ -20,7 +20,7 @@
 #include "isp-v4l2.h"
 
 #define ISP_MIN_FRAMES 2
-#define ISP_MAX_PLANES 4
+#define ISP_MAX_PLANES ISP_BUFFER_PLANES
 #define ISP_MAX_PIX_FORMATS 2
 #define ISP_BUFFER_TIMEOUT msecs_to_jiffies(1500)
 #define ISP_STRIDE_ALIGNMENT 64
@@ -32,14 +32,6 @@ static bool multiplanar = false;
 module_param(multiplanar, bool, 0644);
 MODULE_PARM_DESC(multiplanar, "Enable multiplanar API");
 
-struct isp_buflist_buffer {
-	u64 iovas[ISP_MAX_PLANES];
-	u32 flags[ISP_MAX_PLANES];
-	u32 num_planes;
-	u32 pool_type;
-	u32 tag;
-	u32 pad;
-} __packed;
 static_assert(sizeof(struct isp_buflist_buffer) == ISP_BUFLIST_DESC_SIZE);
 
 struct isp_buflist {
@@ -47,6 +39,17 @@ struct isp_buflist {
 	u64 num_buffers;
 	struct isp_buflist_buffer buffers[];
 } __packed;
+
+static void isp_prepare_buffer_descriptor(struct apple_isp *isp,
+					  struct isp_buffer_lease *lease,
+					  struct isp_buflist_buffer *descriptor)
+{
+	u64 tag = isp->next_buffer_tag++;
+
+	descriptor->tag = tag;
+	descriptor->pad = isp->profile ? tag >> 32 : 0;
+	isp_buffer_submit_tag(lease, descriptor, !!isp->profile);
+}
 static_assert(sizeof(struct isp_buflist) == ISP_BUFLIST_HDR_SIZE);
 /* the firmware reads at least ISP_IPC_BUFEXC_STAT_SIZE bytes of a batch */
 static_assert(ISP_CMD_AREA_SIZE(0) >= ISP_IPC_BUFEXC_STAT_SIZE);
@@ -57,89 +60,138 @@ static_assert(ISP_CMD_AREA_SIZE(0) >= ISP_IPC_BUFEXC_STAT_SIZE);
  */
 #define ISP_BUFLIST_POOL_CAPTURE_META 2
 
+static void isp_capture_failed(struct apple_isp *isp)
+{
+	WRITE_ONCE(isp->capture_failed, true);
+	if (isp->video_registered)
+		vb2_queue_error(&isp->vbq);
+}
+
+/* buf_lock protects both the descriptor snapshot and its ownership phase. */
+static struct isp_buffer_lease *isp_find_returned_lease(struct apple_isp *isp,
+							const struct isp_buflist_buffer *report)
+{
+	struct isp_buffer_match match = {};
+	struct isp_buffer *buf;
+
+	for (unsigned int i = 0; i < isp_num_meta(isp); i++) {
+		struct isp_surf *surf = isp->meta_surfs[i];
+
+		if (surf)
+			isp_buffer_match_candidate(&match, &surf->lease, report);
+	}
+	for (unsigned int i = 0; i < isp_num_capmeta(isp); i++) {
+		struct isp_surf *surf = isp->capmeta_surfs[i];
+
+		if (surf)
+			isp_buffer_match_candidate(&match, &surf->lease, report);
+	}
+	list_for_each_entry(buf, &isp->bufs_submitted, link) {
+		isp_buffer_match_candidate(&match, &buf->lease, report);
+	}
+	return isp_buffer_unique_match(&match);
+}
+
 int ipc_bt_handle(struct apple_isp *isp, struct isp_channel *chan)
 {
 	struct isp_message *req = &chan->req, *rsp = &chan->rsp;
-	struct isp_buffer *tmp, *buf;
+	struct isp_buffer_lease **matches;
+	struct isp_buffer *buf, *tmp;
 	struct isp_buflist *bl;
+	unsigned long flags;
 	u64 count;
-	int err = 0;
-
-	/* printk("H2T: 0x%llx 0x%llx 0x%llx\n", (long long)req->arg0,
-	       (long long)req->arg1, (long long)req->arg2); */
+	int err = -EIO;
 
 	if (!isp->bt_surf || req->arg1 < sizeof(*bl) ||
-	    req->arg1 > isp->bt_surf->size) {
-		dev_err_ratelimited(isp->dev, "%s: Bad length 0x%llx\n",
-				    chan->name, req->arg1);
-		return -EIO;
-	}
+	    req->arg1 > isp->bt_surf->size)
+		goto invalid;
 
 	bl = apple_isp_translate(isp, isp->bt_surf, isp_fw_iova(isp, req->arg0),
 				 req->arg1);
 	if (!bl)
-		return -EIO;
-
+		goto invalid;
 	count = bl->num_buffers;
-	if (count > (req->arg1 - sizeof(*bl)) /
-			    sizeof(struct isp_buflist_buffer)) {
-		dev_err_ratelimited(isp->dev, "%s: Bad length 0x%llx\n",
-				    chan->name, req->arg1);
-		return -EIO;
-	}
+	if (count > (req->arg1 - sizeof(*bl)) / sizeof(*bl->buffers))
+		goto invalid;
 
-	spin_lock(&isp->buf_lock);
+	matches = kcalloc(count, sizeof(*matches), GFP_KERNEL);
+	if (count && !matches) {
+		err = -ENOMEM;
+		goto invalid;
+	}
+	spin_lock_irqsave(&isp->buf_lock, flags);
+	/* Validate the whole batch before changing any lease. A malformed or
+	 * duplicate record must not partially release an earlier buffer.
+	 */
 	for (u64 i = 0; i < count; i++) {
-		struct isp_buflist_buffer *bufd = &bl->buffers[i];
-
-		/* printk("Return: 0x%llx (%d)\n", bufd->iovas[0],
-		       bufd->pool_type); */
-
-		if (bufd->pool_type == 0) {
-			for (int j = 0; j < ARRAY_SIZE(isp->meta_surfs); j++) {
-				struct isp_surf *meta = isp->meta_surfs[j];
-				if ((u32)bufd->iovas[0] == (u32)meta->iova) {
-					WARN_ON(!meta->submitted);
-					meta->submitted = false;
-				}
-			}
-		} else if (bufd->pool_type == ISP_BUFLIST_POOL_CAPTURE_META &&
-			   isp_num_capmeta(isp)) {
-			for (int j = 0; j < isp_num_capmeta(isp); j++) {
-				struct isp_surf *meta = isp->capmeta_surfs[j];
-
-				if (meta && (u32)bufd->iovas[0] == (u32)meta->iova)
-					meta->submitted = false;
-			}
-		} else {
-			list_for_each_entry_safe_reverse(
-				buf, tmp, &isp->bufs_submitted, link) {
-				if ((u32)buf->surfs[0].iova ==
-				    (u32)bufd->iovas[0]) {
-					enum vb2_buffer_state state =
-						VB2_BUF_STATE_ERROR;
-
-					buf->vb.vb2_buf.timestamp =
-						ktime_get_ns();
-					buf->vb.sequence = isp->sequence++;
-					buf->vb.field = V4L2_FIELD_NONE;
-					if (req->arg2 ==
-					    ISP_IPC_BUFEXC_FLAG_RENDER)
-						state = VB2_BUF_STATE_DONE;
-					vb2_buffer_done(&buf->vb.vb2_buf,
-							state);
-					list_del(&buf->link);
-				}
-			}
-		}
+		matches[i] = isp_find_returned_lease(isp, &bl->buffers[i]);
+		if (!matches[i])
+			goto unlock_invalid;
+		for (u64 j = 0; j < i; j++)
+			if (matches[i] == matches[j])
+				goto unlock_invalid;
 	}
-	spin_unlock(&isp->buf_lock);
+	for (u64 i = 0; i < count; i++)
+		isp_buffer_return(matches[i], &bl->buffers[i]);
+	list_for_each_entry_safe(buf, tmp, &isp->bufs_submitted, link) {
+		if (buf->lease.owner != ISP_BUFFER_REPORT_PENDING)
+			continue;
+		buf->rendered = req->arg2 == ISP_IPC_BUFEXC_FLAG_RENDER &&
+				!READ_ONCE(isp->capture_failed);
+		list_move_tail(&buf->link, &isp->bufs_retiring);
+	}
+	spin_unlock_irqrestore(&isp->buf_lock, flags);
+	kfree(matches);
 
 	rsp->arg0 = req->arg0 | ISP_IPC_FLAG_ACK;
-	rsp->arg1 = 0x0;
+	rsp->arg1 = 0;
 	rsp->arg2 = ISP_IPC_BUFEXC_FLAG_ACK;
+	return 0;
 
+unlock_invalid:
+	spin_unlock_irqrestore(&isp->buf_lock, flags);
+	kfree(matches);
+invalid:
+	dev_err_ratelimited(isp->dev, "%s: invalid or unowned buffer return\n", chan->name);
+	isp_capture_failed(isp);
 	return err;
+}
+
+/* Called only after the reply validity word, doorbell and cursor publication. */
+void ipc_bt_acknowledged(struct apple_isp *isp, struct isp_channel *chan)
+{
+	struct isp_buffer *buf, *tmp;
+	unsigned long flags;
+
+	spin_lock_irqsave(&isp->buf_lock, flags);
+	for (unsigned int i = 0; i < isp_num_meta(isp); i++) {
+		struct isp_surf *surf = isp->meta_surfs[i];
+
+		if (surf)
+			isp_buffer_acknowledge(&surf->lease);
+	}
+	for (unsigned int i = 0; i < isp_num_capmeta(isp); i++) {
+		struct isp_surf *surf = isp->capmeta_surfs[i];
+
+		if (surf)
+			isp_buffer_acknowledge(&surf->lease);
+	}
+	list_for_each_entry_safe(buf, tmp, &isp->bufs_retiring, link) {
+		if (WARN_ON(!isp_buffer_acknowledge(&buf->lease)))
+			continue;
+		if (test_bit(ISP_STATE_SLEEPING, &isp->state)) {
+			list_move_tail(&buf->link, &isp->bufs_pending);
+			continue;
+		}
+		list_del_init(&buf->link);
+		buf->vb.vb2_buf.timestamp = ktime_get_ns();
+		buf->vb.sequence = isp->sequence++;
+		buf->vb.field = V4L2_FIELD_NONE;
+		vb2_buffer_done(&buf->vb.vb2_buf,
+				buf->rendered ? VB2_BUF_STATE_DONE : VB2_BUF_STATE_ERROR);
+	}
+	spin_unlock_irqrestore(&isp->buf_lock, flags);
+	wake_up_all(&isp->wait);
 }
 
 /*
@@ -152,134 +204,112 @@ static int isp_submit_buffers(struct apple_isp *isp, bool pre_start)
 	struct isp_format *fmt = isp_get_current_format(isp);
 	struct isp_channel *chan = isp->chan_bh;
 	struct isp_message *req = &chan->req;
-	struct isp_buffer *buf, *tmp;
-	unsigned int num_rendered = 0;
+	struct isp_buffer *buf;
+	struct isp_buflist *bl = isp->buflist_surf->virt;
+	struct isp_buflist_buffer *bufd;
+	unsigned int needed = 0, rendered = 0;
 	unsigned long flags;
 	size_t offset;
-	int err;
+	int err = 0;
 
-	struct isp_buflist *bl = isp->cmd_virt;
-	struct isp_buflist_buffer *bufd = &bl->buffers[0];
-
-	/* Clear what earlier commands and batches left in the reserved fields. */
-	memset(bl, 0, ISP_CMD_AREA_SIZE(isp_num_capmeta(isp)));
-	bl->type = 1;
-
+	mutex_lock(&chan->lock);
+	if (READ_ONCE(isp->capture_failed) || chan->tx_poisoned) {
+		err = -EIO;
+		goto unlock;
+	}
 	spin_lock_irqsave(&isp->buf_lock, flags);
-	for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++) {
-		struct isp_surf *meta = isp->meta_surfs[i];
+	for (unsigned int i = 0; i < isp_num_meta(isp); i++)
+		needed += isp->meta_surfs[i]->lease.owner == ISP_BUFFER_HOST;
+	if (!(isp_num_capmeta(isp) && pre_start)) {
+		for (unsigned int i = 0; i < isp_num_capmeta(isp); i++)
+			needed += isp->capmeta_surfs[i]->lease.owner == ISP_BUFFER_HOST;
+		list_for_each_entry(buf, &isp->bufs_pending, link) {
+			if (rendered++ == isp_max_capture_buffers(isp))
+				break;
+			needed++;
+		}
+	}
+	/* Leave the final value unused instead of wrapping into an older tag. */
+	if (needed > (isp->profile ? U64_MAX : U32_MAX) - isp->next_buffer_tag) {
+		err = -EOVERFLOW;
+		goto unlock_buffers;
+	}
+	if (!needed)
+		goto unlock_buffers;
 
-		if (meta->submitted)
+	/* A separate batch area is immutable until BUF_H2T acknowledges it.
+	 * Control commands must never overwrite an ambiguously submitted batch.
+	 */
+	memset(bl, 0, isp->buflist_surf->size);
+	bl->type = 1;
+	bufd = bl->buffers;
+	for (unsigned int i = 0; i < isp_num_meta(isp); i++) {
+		struct isp_surf *surf = isp->meta_surfs[i];
+
+		if (surf->lease.owner != ISP_BUFFER_HOST)
 			continue;
-
-		/* printk("Submit: 0x%llx .. 0x%llx (meta)\n", meta->iova,
-		       meta->iova + meta->size); */
-
 		bufd->num_planes = 1;
 		bufd->pool_type = 0;
-		bufd->iovas[0] = meta->iova;
+		bufd->iovas[0] = surf->iova;
 		bufd->flags[0] = 0x40000000;
-		bufd++;
+		isp_prepare_buffer_descriptor(isp, &surf->lease, bufd++);
 		bl->num_buffers++;
-
-		meta->submitted = true;
 	}
-
 	if (isp_num_capmeta(isp) && pre_start)
 		goto send;
 
-	for (int i = 0; i < isp_num_capmeta(isp); i++) {
-		struct isp_surf *meta = isp->capmeta_surfs[i];
+	for (unsigned int i = 0; i < isp_num_capmeta(isp); i++) {
+		struct isp_surf *surf = isp->capmeta_surfs[i];
 
-		if (meta->submitted)
+		if (surf->lease.owner != ISP_BUFFER_HOST)
 			continue;
-
 		bufd->num_planes = 1;
 		bufd->pool_type = ISP_BUFLIST_POOL_CAPTURE_META;
-		bufd->iovas[0] = meta->iova;
+		bufd->iovas[0] = surf->iova;
 		bufd->flags[0] = 0x40000000;
-		bufd++;
+		isp_prepare_buffer_descriptor(isp, &surf->lease, bufd++);
 		bl->num_buffers++;
-
-		meta->submitted = true;
 	}
-
-	/* One rendered pool per batch; the rest stays pending for the next. */
-	while (num_rendered < ISP_MAX_BUFFERS &&
-	       (buf = list_first_entry_or_null(&isp->bufs_pending,
-					       struct isp_buffer, link))) {
+	for (rendered = 0; rendered < isp_max_capture_buffers(isp); rendered++) {
+		buf = list_first_entry_or_null(&isp->bufs_pending,
+					       struct isp_buffer, link);
+		if (!buf)
+			break;
 		bufd->num_planes = fmt->num_planes;
-		bufd->pool_type = isp->hw->scl1 ? CISP_POOL_TYPE_RENDERED_SCL1 :
+		bufd->pool_type = (isp->profile || isp->hw->scl1) ? CISP_POOL_TYPE_RENDERED_SCL1 :
 						  CISP_POOL_TYPE_RENDERED;
 		offset = 0;
-		for (int j = 0; j < fmt->num_planes; j++) {
-			bufd->iovas[j] = buf->surfs[0].iova + offset;
-			bufd->flags[j] = 0x40000000;
-			offset += fmt->plane_size[j];
+		for (unsigned int i = 0; i < fmt->num_planes; i++) {
+			bufd->iovas[i] = buf->memory->surfs[0].iova + offset;
+			bufd->flags[i] = 0x40000000;
+			offset += fmt->plane_size[i];
 		}
-
-		/* printk("Submit: 0x%llx .. 0x%llx (render)\n",
-		       buf->surfs[0].iova,
-		       buf->surfs[0].iova + buf->surfs[0].size); */
-		bufd++;
+		isp_prepare_buffer_descriptor(isp, &buf->lease, bufd++);
 		bl->num_buffers++;
-		num_rendered++;
-
-		/*
-		 * Queue the buffer as submitted and release the lock for now.
-		 * We need to do this before actually submitting to avoid a
-		 * race with the buffer return codepath.
-		 */
+		/* Ownership is recorded before the first hardware publication. */
 		list_move_tail(&buf->link, &isp->bufs_submitted);
 	}
 
 send:
 	spin_unlock_irqrestore(&isp->buf_lock, flags);
-
-	req->arg0 = isp->cmd_iova;
+	req->arg0 = isp->buflist_surf->iova;
 	req->arg1 = max_t(u64, ISP_IPC_BUFEXC_STAT_SIZE,
-			  ((uintptr_t)bufd - (uintptr_t)bl));
+			  sizeof(*bl) + bl->num_buffers * sizeof(*bufd));
 	req->arg2 = ISP_IPC_BUFEXC_FLAG_COMMAND;
-
 	err = ipc_chan_send(isp, chan, ISP_BUFFER_TIMEOUT);
 	if (err) {
-		/* If we fail, consider the buffer not submitted. */
-		dev_err(isp->dev,
-			"%s: failed to send bufs: [0x%llx, 0x%llx, 0x%llx]\n",
-			chan->name, req->arg0, req->arg1, req->arg2);
-
-		/*
-		 * Try to find the buffer in the list, and if it's
-		 * still there, move it back to the pending list.
+		dev_err(isp->dev, "%s: buffer submission uncertain: %d\n", chan->name, err);
+		/* The descriptor area and all leases stay owned until their reports
+		 * retire or a qualified full firmware shutdown stops every DMA user.
 		 */
-		spin_lock_irqsave(&isp->buf_lock, flags);
-
-		bufd = &bl->buffers[0];
-		for (int i = 0; i < bl->num_buffers; i++, bufd++) {
-			list_for_each_entry_safe_reverse(
-				buf, tmp, &isp->bufs_submitted, link) {
-				if (bufd->iovas[0] == buf->surfs[0].iova) {
-					list_move_tail(&buf->link,
-						       &isp->bufs_pending);
-				}
-			}
-			for (int j = 0; j < ARRAY_SIZE(isp->meta_surfs); j++) {
-				struct isp_surf *meta = isp->meta_surfs[j];
-				if (bufd->iovas[0] == meta->iova) {
-					meta->submitted = false;
-				}
-			}
-			for (int j = 0; j < isp_num_capmeta(isp); j++) {
-				struct isp_surf *meta = isp->capmeta_surfs[j];
-
-				if (bufd->iovas[0] == meta->iova)
-					meta->submitted = false;
-			}
-		}
-
-		spin_unlock_irqrestore(&isp->buf_lock, flags);
+		isp_capture_failed(isp);
 	}
+	goto unlock;
 
+unlock_buffers:
+	spin_unlock_irqrestore(&isp->buf_lock, flags);
+unlock:
+	mutex_unlock(&chan->lock);
 	return err;
 }
 
@@ -298,7 +328,7 @@ static int isp_vb2_queue_setup(struct vb2_queue *vq, unsigned int *nbuffers,
 	 * times out if more buffers are submitted than set in the buffer pool
 	 * config before streaming is started.
 	 */
-	*nbuffers = min_t(unsigned int, *nbuffers, ISP_MAX_BUFFERS);
+	*nbuffers = min_t(unsigned int, *nbuffers, isp_max_capture_buffers(isp));
 
 	if (*num_planes) {
 		if (sizes[0] < fmt->total_size)
@@ -313,41 +343,91 @@ static int isp_vb2_queue_setup(struct vb2_queue *vq, unsigned int *nbuffers,
 	return 0;
 }
 
-static void __isp_vb2_buf_cleanup(struct vb2_buffer *vb, unsigned int i)
+static void isp_free_buffer_memory(struct apple_isp *isp,
+				   struct isp_buffer_memory *memory)
 {
-	struct apple_isp *isp = vb2_get_drv_priv(vb->vb2_queue);
-	struct isp_buffer *buf =
-		container_of(vb, struct isp_buffer, vb.vb2_buf);
+	for (unsigned int i = 0; i < memory->num_planes; i++) {
+		if (memory->surfs[i].mm)
+			apple_isp_iommu_unmap_sgt(isp, &memory->surfs[i]);
+		isp_unpin_buffer_pages(&memory->pins[i]);
+	}
+	kfree(memory);
+}
 
-	while (i--)
-		apple_isp_iommu_unmap_sgt(isp, &buf->surfs[i]);
+void apple_isp_release_retained_buffers(struct apple_isp *isp)
+{
+	struct isp_buffer_memory *memory, *tmp;
+	unsigned long flags;
+	LIST_HEAD(released);
+
+	if (!READ_ONCE(isp->firmware_quiescent))
+		return;
+	spin_lock_irqsave(&isp->buf_lock, flags);
+	list_splice_init(&isp->retained_buffers, &released);
+	spin_unlock_irqrestore(&isp->buf_lock, flags);
+	list_for_each_entry_safe(memory, tmp, &released, link) {
+		list_del(&memory->link);
+		isp_free_buffer_memory(isp, memory);
+	}
 }
 
 static void isp_vb2_buf_cleanup(struct vb2_buffer *vb)
 {
-	__isp_vb2_buf_cleanup(vb, vb->num_planes);
+	struct apple_isp *isp = vb2_get_drv_priv(vb->vb2_queue);
+	struct isp_buffer *buf = to_isp_buffer(to_vb2_v4l2_buffer(vb));
+	struct isp_buffer_memory *memory = buf->memory;
+	unsigned long flags;
+	bool reclaimable;
+
+	if (!memory)
+		return;
+	spin_lock_irqsave(&isp->buf_lock, flags);
+	list_del_init(&buf->link);
+	reclaimable = isp_buffer_reclaimable(&buf->lease,
+					     READ_ONCE(isp->firmware_quiescent));
+	if (!reclaimable)
+		list_add_tail(&memory->link, &isp->retained_buffers);
+	buf->memory = NULL;
+	spin_unlock_irqrestore(&isp->buf_lock, flags);
+	if (reclaimable)
+		isp_free_buffer_memory(isp, memory);
+	else
+		dev_warn(isp->dev, "retaining unretired capture backing and IOVA\n");
 }
 
 static int isp_vb2_buf_init(struct vb2_buffer *vb)
 {
 	struct apple_isp *isp = vb2_get_drv_priv(vb->vb2_queue);
-	struct isp_buffer *buf =
-		container_of(vb, struct isp_buffer, vb.vb2_buf);
-	unsigned int i;
+	struct isp_buffer *buf = to_isp_buffer(to_vb2_v4l2_buffer(vb));
+	struct isp_buffer_memory *memory;
 	int err;
 
-	for (i = 0; i < vb->num_planes; i++) {
+	memory = kzalloc_obj(*memory);
+	if (!memory)
+		return -ENOMEM;
+	INIT_LIST_HEAD(&memory->link);
+	INIT_LIST_HEAD(&buf->link);
+	buf->memory = memory;
+	for (unsigned int i = 0; i < vb->num_planes; i++) {
 		struct sg_table *sgt = vb2_dma_sg_plane_desc(vb, i);
-		err = apple_isp_iommu_map_sgt(isp, &buf->surfs[i], sgt,
+
+		/* Independent page references keep physical backing alive after
+		 * vb2 metadata cleanup without changing vb2's num_users count.
+		 */
+		err = isp_pin_buffer_pages(sgt, &memory->pins[i]);
+		if (err)
+			goto cleanup;
+		memory->num_planes = i + 1;
+		err = apple_isp_iommu_map_sgt(isp, &memory->surfs[i], sgt,
 					      vb2_plane_size(vb, i));
 		if (err)
 			goto cleanup;
 	}
-
 	return 0;
 
 cleanup:
-	__isp_vb2_buf_cleanup(vb, i);
+	buf->memory = NULL;
+	isp_free_buffer_memory(isp, memory);
 	return err;
 }
 
@@ -364,19 +444,31 @@ static int isp_vb2_buf_prepare(struct vb2_buffer *vb)
 	return 0;
 }
 
+static void isp_vb2_release_list(struct apple_isp *isp, struct list_head *head,
+				 enum vb2_buffer_state state)
+{
+	struct isp_buffer *buf, *tmp;
+
+	list_for_each_entry_safe(buf, tmp, head, link) {
+		list_del_init(&buf->link);
+		if (READ_ONCE(isp->firmware_quiescent))
+			buf->lease.owner = ISP_BUFFER_HOST;
+		/* A vb2 error return is not a DMA-release acknowledgment. An
+		 * unretired lease keeps its independent backing and map on cleanup.
+		 */
+		vb2_buffer_done(&buf->vb.vb2_buf, state);
+	}
+}
+
 static void isp_vb2_release_buffers(struct apple_isp *isp,
 				    enum vb2_buffer_state state)
 {
-	struct isp_buffer *buf;
 	unsigned long flags;
 
 	spin_lock_irqsave(&isp->buf_lock, flags);
-	list_for_each_entry(buf, &isp->bufs_submitted, link)
-		vb2_buffer_done(&buf->vb.vb2_buf, state);
-	INIT_LIST_HEAD(&isp->bufs_submitted);
-	list_for_each_entry(buf, &isp->bufs_pending, link)
-		vb2_buffer_done(&buf->vb.vb2_buf, state);
-	INIT_LIST_HEAD(&isp->bufs_pending);
+	isp_vb2_release_list(isp, &isp->bufs_submitted, state);
+	isp_vb2_release_list(isp, &isp->bufs_retiring, state);
+	isp_vb2_release_list(isp, &isp->bufs_pending, state);
 	spin_unlock_irqrestore(&isp->buf_lock, flags);
 }
 
@@ -387,6 +479,11 @@ static void isp_vb2_buf_queue(struct vb2_buffer *vb)
 		container_of(vb, struct isp_buffer, vb.vb2_buf);
 	unsigned long flags;
 	bool empty;
+
+	if (READ_ONCE(isp->capture_failed)) {
+		vb2_buffer_done(vb, VB2_BUF_STATE_ERROR);
+		return;
+	}
 
 	spin_lock_irqsave(&isp->buf_lock, flags);
 	empty = list_empty(&isp->bufs_pending) &&
@@ -403,6 +500,9 @@ static int apple_isp_start_streaming(struct apple_isp *isp)
 	unsigned long flags;
 	int err;
 
+	if (READ_ONCE(isp->capture_failed))
+		return -EIO;
+
 	err = apple_isp_start_camera(isp);
 	if (err) {
 		dev_err(isp->dev, "failed to start camera: %d\n", err);
@@ -415,12 +515,14 @@ static int apple_isp_start_streaming(struct apple_isp *isp)
 	 * as submitted to the previous pools would never reach the new ones.
 	 */
 	if (isp->hw->resident_fw) {
+		mutex_lock(&isp->chan_bt->lock);
 		spin_lock_irqsave(&isp->buf_lock, flags);
-		for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++)
-			isp->meta_surfs[i]->submitted = false;
+		for (int i = 0; i < isp_num_meta(isp); i++)
+			isp->meta_surfs[i]->lease.owner = ISP_BUFFER_HOST;
 		for (int i = 0; i < isp_num_capmeta(isp); i++)
-			isp->capmeta_surfs[i]->submitted = false;
+			isp->capmeta_surfs[i]->lease.owner = ISP_BUFFER_HOST;
 		spin_unlock_irqrestore(&isp->buf_lock, flags);
+		mutex_unlock(&isp->chan_bt->lock);
 	}
 
 	err = isp_submit_buffers(isp, true);
@@ -450,18 +552,50 @@ static int apple_isp_start_streaming(struct apple_isp *isp)
 	return 0;
 
 stop_camera:
-	apple_isp_stop_camera(isp);
+	if (READ_ONCE(isp->capture_failed))
+		apple_isp_firmware_halt(isp);
+	else
+		apple_isp_stop_camera(isp);
 	return err;
 }
 
-static void apple_isp_stop_streaming(struct apple_isp *isp)
+static bool isp_capture_buffers_retired(struct apple_isp *isp)
 {
-	/* Not running if restarting it after system sleep failed. */
-	if (!test_and_clear_bit(ISP_STATE_STREAMING, &isp->state))
-		return;
+	unsigned long flags;
+	bool retired;
 
-	apple_isp_stop_capture(isp);
+	spin_lock_irqsave(&isp->buf_lock, flags);
+	retired = list_empty(&isp->bufs_submitted) && list_empty(&isp->bufs_retiring);
+	spin_unlock_irqrestore(&isp->buf_lock, flags);
+	return retired;
+}
+
+static int apple_isp_stop_streaming(struct apple_isp *isp)
+{
+	int err;
+
+	if (!test_and_clear_bit(ISP_STATE_STREAMING, &isp->state))
+		return READ_ONCE(isp->capture_failed) ? -EIO : 0;
+
+	err = apple_isp_stop_capture(isp);
+	if (err)
+		isp_capture_failed(isp);
 	apple_isp_stop_camera(isp);
+	if (READ_ONCE(isp->capture_failed))
+		return apple_isp_firmware_halt(isp) ?: -EIO;
+	if (READ_ONCE(isp->firmware_quiescent))
+		return 0;
+
+	/* Resident firmware may stay alive, but a stop command ACK alone
+	 * does not retire user-buffer leases. Wait for their report ACKs.
+	 */
+	if (!wait_event_timeout(isp->wait, isp_capture_buffers_retired(isp),
+				ISP_BUFFER_TIMEOUT)) {
+		isp_capture_failed(isp);
+		apple_isp_firmware_halt(isp);
+		return -ETIME;
+	}
+	return 0;
 }
 
 static int isp_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
@@ -472,11 +606,13 @@ static int isp_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
 	isp->sequence = 0;
 
 	/* The exposure priority is applied when the stream starts. */
-	v4l2_ctrl_grab(isp->exposure_priority, true);
+	if (isp->exposure_priority)
+		v4l2_ctrl_grab(isp->exposure_priority, true);
 
 	err = apple_isp_start_streaming(isp);
 	if (err) {
-		v4l2_ctrl_grab(isp->exposure_priority, false);
+		if (isp->exposure_priority)
+			v4l2_ctrl_grab(isp->exposure_priority, false);
 		isp_vb2_release_buffers(isp, VB2_BUF_STATE_QUEUED);
 	}
 
@@ -489,34 +625,45 @@ static void isp_vb2_stop_streaming(struct vb2_queue *q)
 
 	apple_isp_stop_streaming(isp);
 	isp_vb2_release_buffers(isp, VB2_BUF_STATE_ERROR);
-	v4l2_ctrl_grab(isp->exposure_priority, false);
+	if (isp->exposure_priority)
+		v4l2_ctrl_grab(isp->exposure_priority, false);
 }
 
 int apple_isp_video_suspend(struct apple_isp *isp)
 {
+	struct isp_buffer *buf;
 	unsigned long flags;
+	int err = 0;
 
 	mutex_lock(&isp->video_lock);
 
 	/*
-	 * Stop the stream but keep its buffers queued to the driver. First
-	 * move the buffers given to the firmware to the pending list, so that
-	 * the buffer return for the stop does not complete them; they are
-	 * submitted again when the stream restarts on resume.
+	 * Keep returned buffers queued while sleeping, but only after their
+	 * reports have retired. Moving submitted buffers before the return
+	 * would hide firmware ownership and prevent completion validation.
 	 * isp_vb2_buf_queue() does not submit while the stream is stopped.
 	 */
 	if (test_bit(ISP_STATE_STREAMING, &isp->state)) {
-		spin_lock_irqsave(&isp->buf_lock, flags);
-		list_splice_init(&isp->bufs_submitted, &isp->bufs_pending);
-		spin_unlock_irqrestore(&isp->buf_lock, flags);
-
-		apple_isp_stop_streaming(isp);
 		set_bit(ISP_STATE_SLEEPING, &isp->state);
+		err = apple_isp_stop_streaming(isp);
+		/* Nonresident firmware can stop without returning every buffer.
+		 * Only a completed full shutdown permits requeuing those leases.
+		 */
+		if (!err && READ_ONCE(isp->firmware_quiescent)) {
+			spin_lock_irqsave(&isp->buf_lock, flags);
+			list_for_each_entry(buf, &isp->bufs_submitted, link)
+				buf->lease.owner = ISP_BUFFER_HOST;
+			list_for_each_entry(buf, &isp->bufs_retiring, link)
+				buf->lease.owner = ISP_BUFFER_HOST;
+			list_splice_tail_init(&isp->bufs_submitted, &isp->bufs_pending);
+			list_splice_tail_init(&isp->bufs_retiring, &isp->bufs_pending);
+			spin_unlock_irqrestore(&isp->buf_lock, flags);
+		}
 	}
 
 	mutex_unlock(&isp->video_lock);
 
-	return 0;
+	return err;
 }
 
 int apple_isp_video_resume(struct apple_isp *isp)
@@ -557,6 +704,22 @@ static int isp_set_preset(struct apple_isp *isp, struct isp_format *fmt,
 	int i;
 	size_t total_size;
 
+	if (isp->profile) {
+		struct isp_profile_geometry geometry;
+		int err = isp_profile_p010_geometry(preset->output_dim.x,
+						    preset->output_dim.y, &geometry);
+
+		if (err || preset->index != 5)
+			return -EINVAL;
+		fmt->preset = preset;
+		fmt->num_planes = 2;
+		fmt->strides[0] = geometry.stride;
+		fmt->strides[1] = geometry.stride;
+		fmt->plane_size[0] = geometry.luma_size;
+		fmt->plane_size[1] = geometry.chroma_size;
+		fmt->total_size = geometry.total_size;
+		return 0;
+	}
 	fmt->preset = preset;
 
 	/* I really fucking hope they all use NV12. */
@@ -615,6 +778,12 @@ static int isp_vidioc_enum_format(struct file *file, void *fh,
 {
 	struct apple_isp *isp = video_drvdata(file);
 
+	if (isp->profile) {
+		if (f->index)
+			return -EINVAL;
+		f->pixelformat = V4L2_PIX_FMT_P010;
+		return 0;
+	}
 	if (f->index >= ISP_MAX_PIX_FORMATS)
 		return -EINVAL;
 
@@ -642,8 +811,8 @@ static int isp_vidioc_enum_framesizes(struct file *file, void *fh,
 	if (f->index >= isp->num_presets)
 		return -EINVAL;
 
-	if ((f->pixel_format != V4L2_PIX_FMT_NV12) &&
-	    (f->pixel_format != V4L2_PIX_FMT_NV12M))
+	if (isp->profile ? f->pixel_format != V4L2_PIX_FMT_P010 :
+	    f->pixel_format != V4L2_PIX_FMT_NV12 && f->pixel_format != V4L2_PIX_FMT_NV12M)
 		return -EINVAL;
 
 	f->discrete.width = isp->presets[f->index].output_dim.x;
@@ -659,6 +828,9 @@ static int isp_vidioc_enum_frameintervals(struct file *file, void *fh,
 	struct apple_isp *isp = video_drvdata(file);
 	int i;
 
+	/* The recorded AE settings are not a measured frame-rate guarantee. */
+	if (isp->profile)
+		return -EINVAL;
 	if (interval->index >= ARRAY_SIZE(isp_frame_rates))
 		return -EINVAL;
 
@@ -713,7 +885,7 @@ static inline void isp_get_sp_pix_format(struct apple_isp *isp,
 	f->fmt.pix.sizeimage = fmt->total_size;
 
 	f->fmt.pix.field = V4L2_FIELD_NONE;
-	f->fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
+	f->fmt.pix.pixelformat = isp->profile ? V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_NV12;
 	f->fmt.pix.colorspace = V4L2_COLORSPACE_REC709;
 	f->fmt.pix.ycbcr_enc = V4L2_YCBCR_ENC_709;
 	f->fmt.pix.xfer_func = V4L2_XFER_FUNC_709;
@@ -879,6 +1051,9 @@ static int isp_vidioc_get_param(struct file *file, void *fh,
 {
 	struct apple_isp *isp = video_drvdata(file);
 
+	if (isp->profile)
+		return -EINVAL;
+
 	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE &&
 	    (!isp->multiplanar ||
 	     a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE))
@@ -897,6 +1072,9 @@ static int isp_vidioc_set_param(struct file *file, void *fh,
 {
 	struct apple_isp *isp = video_drvdata(file);
 	struct v4l2_fract *tpf = &a->parm.capture.timeperframe;
+
+	if (isp->profile)
+		return -EINVAL;
 
 	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE &&
 	    (!isp->multiplanar ||
@@ -969,19 +1147,29 @@ static const struct media_device_ops isp_media_device_ops = {
 	.link_notify = v4l2_pipeline_link_notify,
 };
 
+static void isp_free_meta_surface(struct apple_isp *isp, struct isp_surf **slot)
+{
+	struct isp_surf *surf;
+	unsigned long flags;
+
+	spin_lock_irqsave(&isp->buf_lock, flags);
+	surf = *slot;
+	if (surf && !isp_buffer_reclaimable(&surf->lease,
+					    READ_ONCE(isp->firmware_quiescent)))
+		surf = NULL;
+	else
+		*slot = NULL;
+	spin_unlock_irqrestore(&isp->buf_lock, flags);
+	if (surf)
+		isp_free_surface(isp, surf);
+}
+
 static void isp_free_meta_surfaces(struct apple_isp *isp)
 {
-	for (int i = 0; i < ARRAY_SIZE(isp->capmeta_surfs); i++) {
-		if (isp->capmeta_surfs[i])
-			isp_free_surface(isp, isp->capmeta_surfs[i]);
-		isp->capmeta_surfs[i] = NULL;
-	}
-
-	for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++) {
-		if (isp->meta_surfs[i])
-			isp_free_surface(isp, isp->meta_surfs[i]);
-		isp->meta_surfs[i] = NULL;
-	}
+	for (unsigned int i = 0; i < ARRAY_SIZE(isp->capmeta_surfs); i++)
+		isp_free_meta_surface(isp, &isp->capmeta_surfs[i]);
+	for (unsigned int i = 0; i < isp_num_meta(isp); i++)
+		isp_free_meta_surface(isp, &isp->meta_surfs[i]);
 }
 
 int apple_isp_setup_video(struct apple_isp *isp)
@@ -999,9 +1187,10 @@ int apple_isp_setup_video(struct apple_isp *isp)
 
 	isp->frame_rate = ISP_FRAME_RATE_DEFAULT;
 
-	for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++) {
+	for (int i = 0; i < isp_num_meta(isp); i++) {
 		isp->meta_surfs[i] =
-			isp_alloc_surface_vmap(isp, isp->hw->meta_size);
+			isp_alloc_surface_vmap(isp, isp->profile ?
+				isp->profile->meta_size : isp->hw->meta_size);
 		if (!isp->meta_surfs[i]) {
 			isp_err(isp, "failed to alloc meta surface\n");
 			err = -ENOMEM;
@@ -1033,16 +1222,17 @@ int apple_isp_setup_video(struct apple_isp *isp)
 		goto media_cleanup;
 	}
 
-	isp->multiplanar = multiplanar;
+	isp->multiplanar = multiplanar && !isp->profile;
 
 	/*
 	 * Auto exposure is always on. By default it holds the frame rate, as
 	 * V4L2 specifies; with exposure priority it may slow down in low light.
 	 */
 	v4l2_ctrl_handler_init(&isp->ctrl_handler, 1);
-	isp->exposure_priority =
-		v4l2_ctrl_new_std(&isp->ctrl_handler, NULL,
-				  V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0, 1, 1, 0);
+	if (!isp->profile)
+		isp->exposure_priority =
+			v4l2_ctrl_new_std(&isp->ctrl_handler, NULL,
+					  V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0, 1, 1, 0);
 	if (isp->ctrl_handler.error) {
 		err = isp->ctrl_handler.error;
 		dev_err(isp->dev, "failed to create controls: %d\n", err);
@@ -1065,6 +1255,7 @@ int apple_isp_setup_video(struct apple_isp *isp)
 	vbq->buf_struct_size = sizeof(struct isp_buffer);
 	vbq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
 	vbq->min_queued_buffers = ISP_MIN_FRAMES;
+	vbq->max_num_buffers = isp_max_capture_buffers(isp);
 	vbq->lock = &isp->video_lock;
 
 	err = vb2_queue_init(vbq);
@@ -1093,6 +1284,7 @@ int apple_isp_setup_video(struct apple_isp *isp)
 		goto v4l2_unregister;
 	}
 
+	isp->video_registered = true;
 	return 0;
 
 v4l2_unregister:
@@ -1110,6 +1302,7 @@ surf_cleanup:
 
 void apple_isp_remove_video(struct apple_isp *isp)
 {
+	isp->video_registered = false;
 	vb2_video_unregister_device(&isp->vdev);
 	v4l2_device_unregister(&isp->v4l2_dev);
 	v4l2_ctrl_handler_free(&isp->ctrl_handler);
@@ -1121,4 +1314,5 @@ void apple_isp_remove_video(struct apple_isp *isp)
 void apple_isp_free_video(struct apple_isp *isp)
 {
 	isp_free_meta_surfaces(isp);
+	apple_isp_release_retained_buffers(isp);
 }

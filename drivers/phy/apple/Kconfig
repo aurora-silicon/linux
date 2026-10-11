@@ -1,4 +1,14 @@
 # SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
+config PHY_APPLE_T6040_USB2_INHERITED
+	tristate "J616s inherited USB2 PHY for RAM experiments"
+	depends on ARCH_APPLE && OF
+	select GENERIC_PHY
+	help
+	  Verify bootloader-initialized USB2 device mode on J616s without
+	  programming its PHY or PIPE. The caller must transfer controller/DART
+	  ownership and retain PHY clocks and a physical recovery watchdog.
+	  Host mode, hotplug, suspend and SuperSpeed are unsupported.
+
 config PHY_APPLE_ATC
 	tristate "Apple Type-C PHY"
 	depends on (ARM64 && ARCH_APPLE) || (COMPILE_TEST && !GENERIC_ATOMIC64)

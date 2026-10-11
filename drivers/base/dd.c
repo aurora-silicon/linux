@@ -376,12 +376,12 @@ static void __exit deferred_probe_exit(void)
 }
 __exitcall(deferred_probe_exit);
 
-int __device_set_driver_override(struct device *dev, const char *s, size_t len)
+const char *__device_prepare_driver_override(const char *s, size_t len)
 {
-	const char *new = NULL, *old;
+	const char *new = NULL;
 
 	if (!s)
-		return -EINVAL;
+		return ERR_PTR(-EINVAL);
 
 	/*
 	 * The stored value will be used in sysfs show callback (sysfs_emit()),
@@ -390,7 +390,7 @@ int __device_set_driver_override(struct device *dev, const char *s, size_t len)
 	 * show.
 	 */
 	if (len >= (PAGE_SIZE - 1))
-		return -EINVAL;
+		return ERR_PTR(-EINVAL);
 
 	/*
 	 * Compute the real length of the string in case userspace sends us a
@@ -414,8 +414,15 @@ int __device_set_driver_override(struct device *dev, const char *s, size_t len)
 	if (len) {
 		new = kstrndup(s, len, GFP_KERNEL);
 		if (!new)
-			return -ENOMEM;
+			return ERR_PTR(-ENOMEM);
 	}
+	return new;
+}
+EXPORT_SYMBOL_GPL(__device_prepare_driver_override);
+
+void __device_install_driver_override(struct device *dev, const char *new)
+{
+	const char *old;
 
 	scoped_guard(spinlock, &dev->driver_override.lock) {
 		old = dev->driver_override.name;
@@ -423,7 +430,16 @@ int __device_set_driver_override(struct device *dev, const char *s, size_t len)
 	}
 
 	kfree(old);
+}
+EXPORT_SYMBOL_GPL(__device_install_driver_override);
 
+int __device_set_driver_override(struct device *dev, const char *s, size_t len)
+{
+	const char *new = __device_prepare_driver_override(s, len);
+
+	if (IS_ERR(new))
+		return PTR_ERR(new);
+	__device_install_driver_override(dev, new);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(__device_set_driver_override);
@@ -1397,6 +1413,20 @@ void device_release_driver(struct device *dev)
 	device_release_driver_internal(dev, NULL, NULL);
 }
 EXPORT_SYMBOL_GPL(device_release_driver);
+
+void __device_retire_driver(struct device *dev, const char *override)
+{
+	/*
+	 * Pair with attach's device lock. A match made before this lock can
+	 * still reach probe later; the consumer must close its lookup context
+	 * before calling this helper.
+	 */
+	__device_driver_lock(dev, dev->parent);
+	__device_install_driver_override(dev, override);
+	__device_release_driver(dev, dev->parent);
+	__device_driver_unlock(dev, dev->parent);
+}
+EXPORT_SYMBOL_GPL(__device_retire_driver);
 
 /**
  * device_driver_detach - detach driver from a specific device

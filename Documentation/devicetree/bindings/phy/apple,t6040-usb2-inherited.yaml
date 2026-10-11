@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/phy/apple,t6040-usb2-inherited.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: J616s inherited USB2 device PHY for RAM experiments
+
+maintainers:
+  - Sven Peter <sven@kernel.org>
+
+description: |
+  Admission for the USB2 device-mode state prepared by m1n1 on J616s.
+  The provider reads its USB2/PIPE state and performs no power, reset or
+  calibration writes. Its caller owns controller/DART handoff and must retain
+  the bootloader's PHY clocks and physical watchdog until cold recovery.
+
+  The USB0 DWC3 consumer references SID 0 of the DART at 0x382f00000 and
+  SID 1 of the DART at 0x382f80000. Both DART providers share fault interrupt
+  1623 and use the same DMA aperture. The native handoff uses the low 32-bit
+  aperture, from zero through 0xffffffff, for both providers. The caller must
+  transfer both banks before either ordinary DART driver probe; an idle state
+  snapshot does not establish exclusive ownership.
+
+  Notification-suppressed USB2 bulk device operation has been observed with
+  this two-bank model. Normal ACM notifications remain unqualified, and this
+  does not describe complete T6040 Type-C, host or SuperSpeed support.
+
+properties:
+  compatible:
+    const: apple,t6040-usb2-inherited
+
+  reg:
+    minItems: 2
+    maxItems: 2
+
+  reg-names:
+    items:
+      - const: usb2phy
+      - const: pipehandler
+
+  '#phy-cells':
+    const: 0
+
+  apple,inherited-handoff:
+    type: boolean
+    description: |
+      The bootloader has retired its DWC3 consumers, transferred DMA ownership
+      of both USB DART banks and retained initialized USB2 PHY clocks and a
+      physical watchdog. This assertion does not perform those operations.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - '#phy-cells'
+  - apple,inherited-handoff
+
+additionalProperties: false

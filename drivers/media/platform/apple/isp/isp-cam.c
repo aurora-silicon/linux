@@ -312,7 +312,7 @@ int apple_isp_detect_camera(struct apple_isp *isp)
 			"failed to boot firmware for initial sensor detection: %d\n",
 			err);
 		/* Resident firmware would fail a deferred retry the same way. */
-		return isp->hw->resident_fw ? err : -EPROBE_DEFER;
+		return isp->hw->resident_fw || !isp->firmware_quiescent ? err : -EPROBE_DEFER;
 	}
 
 	err = isp_detect_camera(isp);
@@ -423,11 +423,77 @@ static int isp_ch_configure_pools(struct apple_isp *isp, u32 ch)
 							  fmt->strides[1]);
 }
 
+static int isp_ch_configure_t6040_preview(struct apple_isp *isp, u32 ch)
+{
+	struct isp_format *fmt = isp_get_format(isp, ch);
+	struct isp_profile_geometry geometry;
+	int err;
+
+	if (ch || fmt->preset->index != 5 || fmt->preset->input_dim.x != 1920 ||
+	    fmt->preset->input_dim.y != 2160)
+		return -EINVAL;
+	err = isp_profile_p010_geometry(fmt->preset->output_dim.x,
+					fmt->preset->output_dim.y, &geometry);
+	if (err)
+		return err;
+	if (fmt->strides[0] != geometry.stride || fmt->strides[1] != geometry.stride)
+		return -EINVAL;
+	err = isp_cmd_flicker_sensor_set(isp, 0);
+	if (err)
+		return err;
+	err = isp_cmd_ch_sbs_enable(isp, 0, 1);
+	if (err)
+		return err;
+	err = isp_cmd_ch_camera_config_select(isp, 0, 5);
+	if (err)
+		return err;
+	err = isp_cmd_ch_buffer_recycle_mode_set(isp, 0, 1);
+	if (err)
+		return err;
+	err = isp_cmd_ch_buffer_recycle_start(isp, 0);
+	if (err)
+		return err;
+	err = isp_cmd_ch_crop_set(isp, 0, 0, 0, geometry.width, geometry.height);
+	if (err)
+		return err;
+	err = isp_cmd_ch_output_config_set(isp, 0, geometry.width, geometry.height,
+					   fmt->strides, 1, 0x12);
+	if (err)
+		return err;
+	err = isp_cmd_ch_ae_frame_rate_max_set(isp, 0, 7680);
+	if (err)
+		return err;
+	err = isp_cmd_ch_ae_frame_rate_min_set(isp, 0, 3840);
+	if (err)
+		return err;
+	err = isp_cmd_ch_buffer_pool_config_set(isp, 0, CISP_POOL_TYPE_META);
+	if (err)
+		return err;
+	err = isp_cmd_ch_buffer_pool_config_set_rendered(isp, 0,
+							 isp->profile->output_count,
+							 geometry.luma_size,
+							 geometry.stride,
+							 geometry.chroma_size,
+							 geometry.stride);
+	if (err)
+		return err;
+	err = isp_cmd_ch_local_raw_buffer_enable(isp, 0, 1);
+	if (err)
+		return err;
+	err = isp_cmd_ch_preview_stream_set(isp, 0, 1);
+	if (err)
+		return err;
+	return isp_cmd_ch_master_slave_sync_mode_set(isp, 0, 0);
+}
+
 static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
 {
 	struct isp_format *fmt = isp_get_format(isp, ch);
 	bool h17 = isp->hw->fw_abi == ISP_FW_ABI_H17;
 	int err;
+
+	if (isp->profile)
+		return isp_ch_configure_t6040_preview(isp, ch);
 
 	isp_cmd_flicker_sensor_set(isp, 0);
 
@@ -653,11 +719,15 @@ int apple_isp_start_capture(struct apple_isp *isp)
 	return err;
 }
 
-void apple_isp_stop_capture(struct apple_isp *isp)
+int apple_isp_stop_capture(struct apple_isp *isp)
 {
-	isp_cmd_ch_stop(isp, 0); // TODO channel mask
-	isp_cmd_ch_buffer_return(isp, isp->current_ch);
+	int err;
+
+	err = isp_cmd_ch_stop(isp, 0); // TODO channel mask
+	if (!err)
+		err = isp_cmd_ch_buffer_return(isp, isp->current_ch);
 
 	/* ... until its buffers are back. */
 	apple_isp_wdt_stop(isp);
+	return err;
 }

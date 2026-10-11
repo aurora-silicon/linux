@@ -31,6 +31,16 @@ properties:
 
   iommu-addresses: true
 
+  apple,firmware-read-only:
+    type: boolean
+    description: |
+      Map this reserved firmware region read-only in each device IOMMU
+      mapping described by iommu-addresses. Cache/coherency attributes
+      are unchanged. This describes immutable firmware text; it does not
+      restrict CPU access. If absent, existing read/write mappings remain
+      the default. The bootloader derives this from the firmware segment
+      permissions rather than a fixed physical address.
+
 required:
   - compatible
   - reg

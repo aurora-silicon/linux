@@ -282,6 +282,12 @@ impl<T: Operations> RtKit<T> {
         self.retain_shared_buffers = true;
     }
 
+    /// The accepted HELLO version, or zero before negotiation.
+    pub fn protocol_version(&self) -> u32 {
+        // SAFETY: The handle is valid and the C accessor uses READ_ONCE.
+        unsafe { bindings::apple_rtkit_protocol_version(self.rtk) }
+    }
+
     /// Boots (wakes up) the RTKit coprocessor.
     pub fn wake(self: Pin<&mut Self>) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.
