@@ -96,12 +96,22 @@ static void av_audiosrv_init(struct apple_epic_service *service, const char *nam
 {
 	struct apple_dcp *dcp = service->ep->dcp;
 	struct audiosrv_data *asrv = dcp->audiosrv;
+	struct apple_epic_service *old;
 
 	mutex_lock(&asrv->plug_lock);
 
+	/*
+	 * An owner pin keeps the slot from being reused while srv points to
+	 * it. DCP tears the service down before announcing it again.
+	 */
 	down_write(&asrv->srv_rwsem);
-	asrv->srv = service;
+	old = asrv->srv;
+	asrv->srv = afk_service_get(service);
 	up_write(&asrv->srv_rwsem);
+	if (old) {
+		dev_warn_once(dcp->dev, "audiosrv: announced again without a teardown\n");
+		afk_service_put(old);
+	}
 
 	asrv->plugged = true;
 	mutex_unlock(&asrv->plug_lock);
@@ -112,11 +122,20 @@ static void av_audiosrv_teardown(struct apple_epic_service *service)
 {
 	struct apple_dcp *dcp = service->ep->dcp;
 	struct audiosrv_data *asrv = dcp->audiosrv;
+	bool owned;
 
 	mutex_lock(&asrv->plug_lock);
 
 	down_write(&asrv->srv_rwsem);
-	asrv->srv = NULL;
+	owned = asrv->srv == service;
+	if (owned) {
+		asrv->srv = NULL;
+	} else if (asrv->srv) {
+		/* announced again without a teardown: the newer one is live */
+		up_write(&asrv->srv_rwsem);
+		mutex_unlock(&asrv->plug_lock);
+		return;
+	}
 	up_write(&asrv->srv_rwsem);
 
 	asrv->plugged = false;
@@ -124,6 +143,27 @@ static void av_audiosrv_teardown(struct apple_epic_service *service)
 		dcpaud_disconnect(asrv->audio_dev);
 
 	mutex_unlock(&asrv->plug_lock);
+
+	if (owned)
+		afk_service_put(service);
+}
+
+/* after afk_shutdown() on unbind: drop the owner pin */
+void av_service_detach(struct apple_dcp *dcp)
+{
+	struct audiosrv_data *asrv = dcp->audiosrv;
+	struct apple_epic_service *service;
+
+	if (!asrv)
+		return;
+	scoped_guard(rwsem_write, &asrv->srv_rwsem) {
+		service = asrv->srv;
+		asrv->srv = NULL;
+	}
+	if (service) {
+		afk_service_disable(service);
+		afk_service_put(service);
+	}
 }
 
 int dcp_audiosrv_prepare(struct device *dev, struct dcp_sound_cookie *cookie)
@@ -279,11 +319,15 @@ static int av_audiosrv_report(struct apple_epic_service *service, u32 idx,
 static const struct apple_epic_service_ops avep_ops[] = {
 	{
 		.name = "DCPAVSimpleVideoInterface",
+		/* keeps no pointer to the service */
+		.reusable = true,
 		.init = av_interface_init,
 		.teardown = av_interface_teardown,
 	},
 	{
 		.name = "DCPAVAudioInterface",
+		/* pinned by asrv->srv, and by each call made without srv_rwsem */
+		.reusable = true,
 		.init = av_audiosrv_init,
 		.report = av_audiosrv_report,
 		.teardown = av_audiosrv_teardown,
@@ -297,19 +341,23 @@ void av_service_connect(struct apple_dcp *dcp)
 	struct audiosrv_data *asrv = dcp->audiosrv;
 	int ret;
 
-	scoped_guard(rwsem_write, &asrv->srv_rwsem) {
-		if (!asrv->srv)
+	/* pinned for the open below, made without srv_rwsem */
+	scoped_guard(rwsem_read, &asrv->srv_rwsem) {
+		service = afk_service_get(asrv->srv);
+		if (!service)
 			return;
-		service = asrv->srv;
 	}
 
 	/* open AV audio service */
 	dev_info(dcp->dev, "%s: starting audio service, plugged:%d\n", __func__,  asrv->plugged);
-	if (asrv->is_open)
+	if (asrv->is_open) {
+		afk_service_put(service);
 		return;
+	}
 
 	ret = afk_service_call(service, 0, asrv->cmds.open, NULL, 0, 32,
 			       NULL, 0, 32);
+	afk_service_put(service);
 	if (ret) {
 		dev_err(dcp->dev, "error opening audio service: %d\n", ret);
 		return;
@@ -328,16 +376,19 @@ void av_service_disconnect(struct apple_dcp *dcp)
 	struct audiosrv_data *asrv = dcp->audiosrv;
 	int ret;
 
-	scoped_guard(rwsem_write, &asrv->srv_rwsem) {
-		if (!asrv->srv)
+	/* pinned for the close below, made without srv_rwsem */
+	scoped_guard(rwsem_read, &asrv->srv_rwsem) {
+		service = afk_service_get(asrv->srv);
+		if (!service)
 			return;
-		service = asrv->srv;
 	}
 
 	/* close AV audio service */
 	dev_info(dcp->dev, "%s: stopping audio service\n", __func__);
-	if (!asrv->is_open)
+	if (!asrv->is_open) {
+		afk_service_put(service);
 		return;
+	}
 
 	mutex_lock(&asrv->plug_lock);
 
@@ -351,8 +402,7 @@ void av_service_disconnect(struct apple_dcp *dcp)
 	if (ret) {
 		dev_err(dcp->dev, "error closing audio service: %d\n", ret);
 	}
-	if (service->torndown)
-		afk_service_disable(service);
+	afk_service_put(service);
 	asrv->is_open = false;
 }
 

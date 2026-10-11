@@ -9,9 +9,11 @@
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
 void av_service_connect(struct apple_dcp *dcp);
 void av_service_disconnect(struct apple_dcp *dcp);
+void av_service_detach(struct apple_dcp *dcp);
 #else
 static inline void av_service_connect(struct apple_dcp *dcp) { }
 static inline void av_service_disconnect(struct apple_dcp *dcp) { }
+static inline void av_service_detach(struct apple_dcp *dcp) { }
 #endif
 
 #endif /* __AV_H__ */

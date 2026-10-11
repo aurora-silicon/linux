@@ -4245,6 +4245,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	if (dcp->avep) {
 		av_service_disconnect(dcp);
 		afk_shutdown(dcp->avep);
+		av_service_detach(dcp);
 		dcp->avep = NULL;
 	}
 
