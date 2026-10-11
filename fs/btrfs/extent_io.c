@@ -150,6 +150,16 @@ struct btrfs_bio_ctrl {
 	 * inside the same inode.
 	 */
 	u64 last_em_start;
+
+	/*
+	 * For a compressed read, the extent map of the compressed extent that
+	 * @bbio reads, referenced until the bio is submitted.
+	 *
+	 * btrfs_submit_compressed_read() needs it, but must not look it up in
+	 * the inode's extent map tree again: by then the extent map shrinker
+	 * may have removed it from the tree.
+	 */
+	struct extent_map *compressed_em;
 };
 
 /*
@@ -176,8 +186,10 @@ static void submit_one_bio(struct btrfs_bio_ctrl *bio_ctrl)
 {
 	struct btrfs_bio *bbio = bio_ctrl->bbio;
 
-	if (!bbio)
+	if (!bbio) {
+		ASSERT(!bio_ctrl->compressed_em);
 		return;
+	}
 
 	/* Caller should ensure the bio has at least some range added */
 	ASSERT(bbio->bio.bi_iter.bi_size);
@@ -186,12 +198,14 @@ static void submit_one_bio(struct btrfs_bio_ctrl *bio_ctrl)
 
 	if (btrfs_op(&bbio->bio) == BTRFS_MAP_READ &&
 	    bio_ctrl->compress_type != BTRFS_COMPRESS_NONE)
-		btrfs_submit_compressed_read(bbio);
+		btrfs_submit_compressed_read(bbio, bio_ctrl->compressed_em);
 	else
 		btrfs_submit_bbio(bbio, 0);
 
 	/* The bbio is owned by the end_io handler now */
 	bio_ctrl->bbio = NULL;
+	btrfs_free_extent_map(bio_ctrl->compressed_em);
+	bio_ctrl->compressed_em = NULL;
 	/*
 	 * We used the generation to decide whether to lookup csums in the
 	 * commit_root or not when we called bio_set_csum_search_commit_root()
@@ -963,6 +977,26 @@ static struct extent_map *get_extent_map(struct btrfs_inode *inode,
 	return em;
 }
 
+/*
+ * A block of the compressed extent mapped by @em has just been added to
+ * @bio_ctrl->bbio, which only ever reads blocks of one compressed extent.
+ * Take over the caller's reference on @em: bio_ctrl keeps one reference on
+ * the extent map of its bio until submit_one_bio() passes it on.
+ */
+static void bio_ctrl_hold_compressed_em(struct btrfs_bio_ctrl *bio_ctrl,
+					struct extent_map *em)
+{
+	struct extent_map *old = bio_ctrl->compressed_em;
+
+	/*
+	 * Any reference held so far is for an earlier block of the same bio,
+	 * on the same extent map or on a copy of it loaded again after the
+	 * shrinker dropped it: one is enough.
+	 */
+	bio_ctrl->compressed_em = em;
+	btrfs_free_extent_map(old);
+}
+
 static void btrfs_readahead_expand(struct readahead_control *ractl,
 				   const struct extent_map *em)
 {
@@ -1121,17 +1155,17 @@ static int btrfs_do_readpage(struct folio *folio, struct extent_map **em_cached,
 		bio_ctrl->last_em_start = em->start;
 
 		em_gen = em->generation;
-		btrfs_free_extent_map(em);
-		em = NULL;
 
 		/* we've found a hole, just zero and go on */
 		if (block_start == EXTENT_MAP_HOLE) {
+			btrfs_free_extent_map(em);
 			folio_zero_range(folio, pg_offset, blocksize);
 			end_folio_read(vi, folio, true, cur, blocksize);
 			continue;
 		}
 		/* the get_extent function already copied into the folio */
 		if (block_start == EXTENT_MAP_INLINE) {
+			btrfs_free_extent_map(em);
 			end_folio_read(vi, folio, true, cur, blocksize);
 			continue;
 		}
@@ -1145,6 +1179,11 @@ static int btrfs_do_readpage(struct folio *folio, struct extent_map **em_cached,
 			submit_one_bio(bio_ctrl);
 		submit_extent_folio(bio_ctrl, disk_bytenr, folio, blocksize,
 				    pg_offset, em_gen);
+
+		if (compress_type != BTRFS_COMPRESS_NONE)
+			bio_ctrl_hold_compressed_em(bio_ctrl, em);
+		else
+			btrfs_free_extent_map(em);
 	}
 	return 0;
 }
