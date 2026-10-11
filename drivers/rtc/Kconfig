@@ -2111,6 +2111,15 @@ config RTC_DRV_APPLE_PMU
 
 	  This driver can be built as the module rtc-apple-pmu.
 
+config RTC_DRV_APPLE_SPMI_PMU
+	tristate "Apple Abbey SPMI PMU RTC"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on NVMEM && OF
+	help
+	  Access the Abbey PMU counter, signed wall-clock offset and wake alarm
+	  through named NVMEM cells. This uses a different register layout from
+	  the J700 Baku PMU RTC.
+
 config RTC_DRV_MACSMC
 	tristate "Apple Mac System Management Controller RTC"
 	depends on MFD_MACSMC

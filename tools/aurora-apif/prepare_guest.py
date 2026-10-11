@@ -214,6 +214,14 @@ def migrate(blob, pcie_layout=None, enable_pmp=False):
             put_strings(tree, path, "compatible", pci_layout(tree, path, pcie_layout))
         if LEGACY_PCIE not in c:
             put_cells(tree, path, "aurora,apif", [handle])
+    # Identify the legacy RTC layout only on matched T6050 guests.
+    if "apple,t6050" in compatible.get("/", []):
+        for path, c in compatible.items():
+            if "apple,pmu-rtc" in c:
+                names = strings(tree, path, "nvmem-cell-names")
+                if names != ["counter", "rtc_offset", "alarm", "alarm_ctrl", "irq_mask"]:
+                    raise ValueError(f"{path}: unknown PMU RTC cell layout")
+                put_strings(tree, path, "compatible", ["apple,abbey-pmu-rtc"])
     # The old driver applied a hidden guard to the matched PMP consumer.
     # Record that existing ABI rule explicitly on its provider instead.
     for path, c in compatible.items():

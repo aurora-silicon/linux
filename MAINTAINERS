@@ -4359,6 +4359,13 @@ F:	rust/helpers/auxiliary.c
 F:	rust/kernel/auxiliary.rs
 F:	samples/rust/rust_driver_auxiliary.rs
 
+AURORA APPLE SPMI PMU RTC
+M:	Dj <hey@djdev.me>
+L:	linux-rtc@vger.kernel.org
+S:	Maintained
+F:	Documentation/devicetree/bindings/rtc/apple,abbey-pmu-rtc.yaml
+F:	drivers/rtc/rtc-apple-spmi-pmu.c
+
 AURORA PLATFORM MMIO INTERFACE
 M:	Dj <hey@djdev.me>
 S:	Maintained
