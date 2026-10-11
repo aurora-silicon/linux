@@ -380,7 +380,11 @@ static int apple_isp_probe(struct platform_device *pdev)
 	if (err)
 		return err;
 
-	isp = devm_kzalloc(dev, sizeof(*isp), GFP_KERNEL);
+	/*
+	 * Not devres: an open video device file keeps this until it is
+	 * closed, also after unbind. See apple_isp_release().
+	 */
+	isp = kzalloc_obj(*isp);
 	if (!isp)
 		return -ENOMEM;
 
@@ -399,7 +403,7 @@ static int apple_isp_probe(struct platform_device *pdev)
 	if (err) {
 		dev_err(dev, "failed to get 'apple,platform-id' property: %d\n",
 			err);
-		return err;
+		goto free_isp;
 	}
 
 	err = of_property_read_u32(dev->of_node, "apple,temporal-filter",
@@ -410,13 +414,13 @@ static int apple_isp_probe(struct platform_device *pdev)
 	err = apple_isp_init_presets(isp);
 	if (err) {
 		dev_err(dev, "failed to initialize presets\n");
-		return err;
+		goto free_isp;
 	}
 
 	err = apple_isp_attach_genpd(isp);
 	if (err) {
 		dev_err(dev, "failed to attatch power domains\n");
-		return err;
+		goto free_isp;
 	}
 
 	isp->coproc = devm_platform_ioremap_resource_byname(pdev, "coproc");
@@ -529,6 +533,9 @@ destroy_wq:
 	destroy_workqueue(isp->wq);
 detach_genpd:
 	apple_isp_detach_genpd(isp);
+free_isp:
+	/* Nothing else can reach it before the video device is registered. */
+	kfree(isp);
 	return err;
 }
 
@@ -545,6 +552,8 @@ static void apple_isp_remove(struct platform_device *pdev)
 	apple_isp_free_iommu(isp);
 	destroy_workqueue(isp->wq);
 	apple_isp_detach_genpd(isp);
+	/* Freed now, or when the last open file is closed. */
+	v4l2_device_put(&isp->v4l2_dev);
 }
 
 static const struct apple_isp_hw apple_isp_hw_t8103 = {
