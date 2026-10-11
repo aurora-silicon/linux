@@ -106,6 +106,13 @@ static int macsmc_input_event(struct notifier_block *nb, unsigned long event, vo
 	}
 }
 
+static void macsmc_input_unregister_notifier(void *data)
+{
+	struct macsmc_input *smcin = data;
+
+	blocking_notifier_chain_unregister(&smcin->smc->event_handlers, &smcin->nb);
+}
+
 static int macsmc_input_probe(struct platform_device *pdev)
 {
 	struct apple_smc *smc = dev_get_drvdata(pdev->dev.parent);
@@ -168,7 +175,19 @@ static int macsmc_input_probe(struct platform_device *pdev)
 	input_sync(smcin->input);
 
 	smcin->nb.notifier_call = macsmc_input_event;
-	blocking_notifier_chain_register(&smc->event_handlers, &smcin->nb);
+	error = blocking_notifier_chain_register(&smc->event_handlers, &smcin->nb);
+	if (error)
+		return error;
+
+	/*
+	 * The notifier block lives in devm-allocated memory and the callback
+	 * reports to a devm-managed input device: take it off the SMC's chain
+	 * before either goes away on unbind.
+	 */
+	error = devm_add_action_or_reset(&pdev->dev,
+					 macsmc_input_unregister_notifier, smcin);
+	if (error)
+		return error;
 
 	device_init_wakeup(&pdev->dev, true);
 
