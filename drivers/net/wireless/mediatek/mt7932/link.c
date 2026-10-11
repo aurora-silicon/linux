@@ -471,6 +471,7 @@ report:
 		m->station_rx_rate_valid = false;
 		m->station_tx_rate_valid = false;
 		spin_unlock(&m->data_lock);
+		mt_cqm_reset(m);
 	}
 	m->connected = !ret;
 	m->disconnecting = false;

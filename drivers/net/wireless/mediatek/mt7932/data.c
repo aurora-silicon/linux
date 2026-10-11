@@ -217,6 +217,7 @@ void mt_data_receive(struct mt7932 *m, const struct mt7932_rx_frame *frame)
 	if (frame->signal_valid && signal > -128) {
 		m->station_signal = signal;
 		m->station_signal_valid = true;
+		mt_cqm_signal(m, signal);
 	}
 	if (frame->unicast && frame->rate_valid) {
 		struct rate_info *rate = &m->station_rx_rate;
