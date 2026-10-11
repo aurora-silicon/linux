@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) AND GPL-2.0-only
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/soc/apple/apple,pmp.yaml#
@@ -19,6 +19,7 @@ properties:
   compatible:
     oneOf:
       - const: apple,t6000-pmp-v2
+      - const: apple,t6050-pmp-v2
       - items:
           - const: apple,t8140-pmp-v2
           - const: apple,t6000-pmp-v2
@@ -62,6 +63,22 @@ properties:
     minItems: 2
     description: Host physical address and size pairs mapped into firmware PIO space.
 
+  apple,dram-channel-disable:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Firmware DRAM channel disable mask
+  apple,pmc:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Boot-producer PMC configuration
+  apple,pmc-msg-disabled:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Firmware PMC messaging configuration
+  apple,soc-chip-variant:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Firmware chip variant value
+  apple,pmc-pmgr:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Packed firmware PMC power-manager boot configuration
+
 patternProperties:
   '^apple,tunable-':
     $ref: /schemas/types.yaml#/definitions/uint8-array
@@ -74,6 +91,17 @@ required:
   - mboxes
   - mbox-names
   - iommus
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-pmp-v2
+    then:
+      required:
+        - apple,board-id
+        - apple,dram-vendor-id
 
 additionalProperties: false
 

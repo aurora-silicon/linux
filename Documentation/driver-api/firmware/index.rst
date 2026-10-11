@@ -7,6 +7,7 @@ Linux Firmware API
    aurora-apif
    aurora-apif-nvme
    aurora-apif-pcie
+   aurora-apif-pmp
    introduction
    core
    efi/index
