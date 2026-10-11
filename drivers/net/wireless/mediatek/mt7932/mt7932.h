@@ -3,6 +3,7 @@
 #define MT7932_H
 
 
+#include <linux/average.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
@@ -39,6 +40,8 @@
 #define DONE BIT(31)
 #define STRIDE 8192
 #define RX_STRIDE ALIGN(MT7932_RX_CAPACITY, 64)
+
+DECLARE_EWMA(mt7932_signal, 4, 4)
 
 struct mt7932;
 int mt_dma_stop(struct mt7932 *m);
@@ -156,6 +159,12 @@ struct mt7932 {
 	struct rate_info station_tx_rate;
 	unsigned long station_tx_rate_time, station_rate_query_time;
 	bool station_tx_rate_valid, station_rate_query_failed;
+	/* Connection quality monitor, protected by response_lock. */
+	struct ewma_mt7932_signal cqm_signal;
+	unsigned long cqm_sample_time;
+	s32 cqm_threshold, cqm_last_event;
+	u32 cqm_hysteresis;
+	u8 cqm_samples;
 	u8 *data_headers, *data_payloads;
 	dma_addr_t data_headers_dma, data_payloads_dma;
 	bool data_live[512], data_token[512], data_retired[512];
@@ -219,6 +228,10 @@ int mt_get_station(struct wiphy *wiphy, struct wireless_dev *wdev,
 		   const u8 *mac, struct station_info *sinfo);
 int mt_dump_station(struct wiphy *wiphy, struct wireless_dev *wdev,
 		    int idx, u8 *mac, struct station_info *sinfo);
+int mt_set_cqm_rssi_config(struct wiphy *wiphy, struct net_device *netdev,
+			   s32 rssi_thold, u32 rssi_hyst);
+void mt_cqm_reset(struct mt7932 *m);
+void mt_cqm_signal(struct mt7932 *m, int signal);
 int mt_set_power_mgmt(struct wiphy *wiphy, struct net_device *netdev,
 		      bool enabled, int timeout);
 void mt_power_work(struct work_struct *work);
