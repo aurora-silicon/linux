@@ -25,6 +25,7 @@ properties:
               - apple,t8122-pinctrl
               - apple,t8132-pinctrl
               - apple,t8140-pinctrl
+              - apple,t6050-pinctrl
           - const: apple,t8103-pinctrl
       - items:
           # Do not add additional SoC to this list.
@@ -65,6 +66,15 @@ properties:
       number in ascending order.
     minItems: 1
     maxItems: 7
+
+  apple,irq-group-base:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 6
+    default: 0
+    description: |
+      First interrupt group owned by this host. Interrupts lists consecutive
+      groups starting at this index. The loader must preserve any groups
+      owned by resident firmware. The range must end before group seven.
 
   interrupt-controller: true
 
