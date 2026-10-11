@@ -477,6 +477,7 @@ void centauri_free_ipc(struct centauri *c)
 		}
 	}
 	list_for_each_entry_safe(buffer, next, &ipc->buffers, list) {
+		memzero_explicit(buffer->cpu, buffer->size);
 		dma_free_coherent(buffer->owner, buffer->size, buffer->cpu, buffer->dma);
 		put_device(buffer->owner);
 		list_del(&buffer->list);
