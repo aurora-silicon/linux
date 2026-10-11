@@ -10,6 +10,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/device.h>
 #include <linux/init.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_dma.h>
@@ -42,6 +43,10 @@
 
 #define T603X_UNK_28_VAL	0x200000
 
+/*
+ * One bit per channel: a write to START sets the channel's enable bit, a write
+ * to STOP clears it, and START reads back the channels that are enabled.
+ */
 #define REG_TX_START		0x0000
 #define REG_TX_STOP		0x0004
 #define REG_RX_START		0x0008
@@ -474,6 +479,35 @@ static void admac_stop_chan(struct admac_chan *adchan)
 	dev_dbg(adchan->host->dev, "ch%d stop\n", adchan->no);
 }
 
+/*
+ * Generous bound for a channel to wind down after its enable bit was cleared:
+ * it only has to finish the burst in flight, a few frames at audio rates.
+ */
+#define ADMAC_STOP_TIMEOUT_US	100000
+
+static void admac_wait_stopped(struct admac_chan *adchan)
+{
+	struct admac_data *ad = adchan->host;
+	u32 bit = BIT(adchan->no / 2);
+	void __iomem *reg;
+	u32 val;
+
+	switch (admac_chan_direction(adchan->no)) {
+	case DMA_MEM_TO_DEV:
+		reg = ad->base + REG_TX_START;
+		break;
+	case DMA_DEV_TO_MEM:
+		reg = ad->base + REG_RX_START;
+		break;
+	default:
+		return;
+	}
+
+	if (readl_poll_timeout(reg, val, !(val & bit), 10, ADMAC_STOP_TIMEOUT_US))
+		dev_warn_ratelimited(ad->dev, "ch%d still enabled %d us after stop\n",
+				     adchan->no, ADMAC_STOP_TIMEOUT_US);
+}
+
 static void admac_reset_rings(struct admac_chan *adchan)
 {
 	struct admac_data *ad = adchan->host;
@@ -563,6 +597,13 @@ static void admac_synchronize(struct dma_chan *chan)
 	struct admac_tx *adtx, *_adtx;
 	unsigned long flags;
 	LIST_HEAD(head);
+
+	/*
+	 * terminate_all() only requests the stop: make sure the channel no
+	 * longer touches the memory of the terminated descriptors before the
+	 * client is allowed to reuse or free it.
+	 */
+	admac_wait_stopped(adchan);
 
 	spin_lock_irqsave(&adchan->lock, flags);
 	list_splice_tail_init(&adchan->to_free, &head);

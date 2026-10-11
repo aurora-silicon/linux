@@ -1298,6 +1298,24 @@ unsafe extern "C" fn lpai_pcm_trigger(
     }
 }
 
+/// Called after a stop, without the ALSA stream lock, before the buffer is
+/// reallocated or freed (hw_params, hw_free) or the counters are reset
+/// (prepare).  The trigger only clears the run flag, so a report that saw
+/// the stream running may still be copying into the buffer: it holds the
+/// stream lock for the whole copy, so taking that lock waits for it, and
+/// every report after it sees the flag clear.
+///
+/// # Safety
+///
+/// Called by ALSA with a live substream of this card's PCM, whose private
+/// data is the driver's `Arc`.
+unsafe extern "C" fn lpai_pcm_sync_stop(substream: *mut bindings::snd_pcm_substream) -> i32 {
+    // SAFETY: ALSA calls this op with a live substream of the LPAI PCM.
+    let data = unsafe { pcm_data(substream) };
+    drop(data.stream.lock());
+    0
+}
+
 /// # Safety
 ///
 /// Called by ALSA with a live substream of this card's PCM, whose private
@@ -1414,6 +1432,19 @@ unsafe extern "C" fn hpai_pcm_trigger(
         _ => data.hpai_want_run.store(false, Relaxed),
     }
     0
+}
+
+/// The trigger stops the DMA asynchronously: wait for the channel to stop
+/// and for its completion callbacks to finish before ALSA reuses or frees
+/// the buffer.
+///
+/// # Safety
+///
+/// Called by ALSA with a live substream of this card's PCM.
+unsafe extern "C" fn hpai_pcm_sync_stop(substream: *mut bindings::snd_pcm_substream) -> i32 {
+    // SAFETY: the substream is live and its dmaengine runtime was set up by
+    // `snd_dmaengine_pcm_open` in `hpai_pcm_open`.
+    unsafe { bindings::snd_dmaengine_pcm_sync_stop(substream) }
 }
 
 /// # Safety
@@ -1995,6 +2026,28 @@ unsafe extern "C" fn asoc_pcm_trigger(
     unsafe { bindings::snd_dmaengine_pcm_trigger(substream, cmd) }
 }
 
+/// Front-end stop synchronization, as for the microphone array: the trigger
+/// stops the DMA asynchronously, so wait for the channel to stop and for its
+/// completion callbacks to finish before ALSA reuses or frees the buffer.
+///
+/// # Safety
+///
+/// Called by ASoC on this driver's registered component, with live
+/// arguments belonging to one of its links.
+unsafe extern "C" fn asoc_pcm_sync_stop(
+    _component: *mut bindings::snd_soc_component,
+    substream: *mut bindings::snd_pcm_substream,
+) -> i32 {
+    // SAFETY: ASoC hands its ops a live substream whose private data is the
+    // `snd_soc_pcm_runtime` of one of this component's links.
+    if unsafe { rtd_is_be(substream_rtd(substream)) } {
+        return 0;
+    }
+    // SAFETY: the substream is live and its dmaengine runtime was set up by
+    // `snd_dmaengine_pcm_open` in `asoc_pcm_open`.
+    unsafe { bindings::snd_dmaengine_pcm_sync_stop(substream) }
+}
+
 /// # Safety
 ///
 /// Called by ASoC on this driver's registered component, with live
@@ -2431,6 +2484,7 @@ impl AsocContext {
             hw_params: Some(asoc_pcm_hw_params),
             prepare: Some(asoc_pcm_prepare),
             trigger: Some(asoc_pcm_trigger),
+            sync_stop: Some(asoc_pcm_sync_stop),
             pointer: Some(asoc_pcm_pointer),
             copy: Some(asoc_pcm_copy),
             ..Default::default()
@@ -2474,7 +2528,7 @@ impl SndSocT8140AopDriver {
         ioctl: None,
         hw_params: None,
         hw_free: None,
-        sync_stop: None,
+        sync_stop: Some(lpai_pcm_sync_stop),
         get_time_info: None,
         fill_silence: None,
         copy: None,
@@ -2492,7 +2546,7 @@ impl SndSocT8140AopDriver {
         ioctl: None,
         hw_params: Some(hpai_pcm_hw_params),
         hw_free: None,
-        sync_stop: None,
+        sync_stop: Some(hpai_pcm_sync_stop),
         get_time_info: None,
         fill_silence: None,
         copy: None,
