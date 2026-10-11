@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) AND GPL-2.0-only
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/mfd/apple,smc.yaml#
@@ -16,6 +16,7 @@ description:
 properties:
   compatible:
     oneOf:
+      - const: apple,t6050-smc
       - items:
           - enum:
               - apple,t6020-smc
@@ -45,7 +46,9 @@ properties:
     maxItems: 1
 
   gpio:
-    $ref: /schemas/gpio/apple,smc-gpio.yaml
+    oneOf:
+      - $ref: /schemas/gpio/apple,smc-gpio.yaml
+      - $ref: /schemas/gpio/apple,smc-pcio-gpio.yaml
 
   reboot:
     $ref: /schemas/power/reset/apple,smc-reboot.yaml

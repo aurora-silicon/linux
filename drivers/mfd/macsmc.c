@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT) AND GPL-2.0-only
 /*
  * Apple SMC (System Management Controller) MFD driver
  *
@@ -52,6 +52,15 @@ static const struct mfd_cell apple_smc_devs[] = {
 	MFD_CELL_OF("macsmc-reboot", NULL, NULL, 0, 0, "apple,smc-reboot"),
 	MFD_CELL_OF("macsmc-rtc", NULL, NULL, 0, 0, "apple,smc-rtc"),
 };
+
+/* This profile exposes notifications and the explicitly described outputs. */
+static const struct mfd_cell apple_smc_t6050_devs[] = {
+	MFD_CELL_NAME("macsmc-input"),
+	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
+};
+
+static const struct mfd_cell apple_smc_pcio_dev =
+	MFD_CELL_OF("macsmc-gpio", NULL, NULL, 0, 0, "apple,smc-pcio-gpio");
 
 /* The second GPIO bank ('gp' keys) only exists on some SMCs. */
 static const struct mfd_cell apple_smc_low_gpio_dev =
@@ -479,11 +488,25 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	ret = devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
-				   apple_smc_devs, ARRAY_SIZE(apple_smc_devs),
-				   NULL, 0, NULL);
+	if (of_device_is_compatible(dev->of_node, "apple,t6050-smc"))
+		ret = devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
+					 apple_smc_t6050_devs,
+					 ARRAY_SIZE(apple_smc_t6050_devs), NULL, 0, NULL);
+	else
+		ret = devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
+					 apple_smc_devs, ARRAY_SIZE(apple_smc_devs),
+					 NULL, 0, NULL);
 	if (ret)
 		return dev_err_probe(smc->dev, ret, "Failed to register sub-devices");
+
+	np = of_get_compatible_child(dev->of_node, "apple,smc-pcio-gpio");
+	if (np) {
+		of_node_put(np);
+		ret = devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
+					 &apple_smc_pcio_dev, 1, NULL, 0, NULL);
+		if (ret)
+			return dev_err_probe(dev, ret, "Failed to register pcIO outputs\n");
+	}
 
 	/*
 	 * Register the second GPIO bank only where the device tree describes
@@ -504,6 +527,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_smc_of_match[] = {
+	{ .compatible = "apple,t6050-smc" },
 	{ .compatible = "apple,t8103-smc" },
 	{ .compatible = "apple,smc" },
 	{},
