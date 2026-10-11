@@ -202,6 +202,48 @@ impl<T: DriverObject> Object<T> {
         let _ = unsafe { KBox::from_raw(this) };
     }
 
+    /// `gem_create_object` callback, for the objects the DRM core allocates on the driver's
+    /// behalf (dma-buf imports and dumb buffers) before it initializes their shmem part.
+    ///
+    /// Every GEM object of the driver is taken to be an `Object<T>`, these included, so build one
+    /// with the driver data from [`DriverObject::core_object_args`].
+    extern "C" fn create_object_callback(
+        raw_dev: *mut bindings::drm_device,
+        size: usize,
+    ) -> *mut bindings::drm_gem_object {
+        // SAFETY: The DRM core only calls this for a device of `T::Driver`, which outlives the
+        // call.
+        let dev = unsafe { device::Device::<T::Driver>::from_raw(raw_dev) };
+
+        let new = T::core_object_args(dev, size).and_then(|args| {
+            KBox::try_pin_init(
+                try_pin_init!(Self {
+                    obj <- Opaque::init_zeroed(),
+                    parent_resv_obj: None,
+                    sgt_access: AtomicUsize::new(0),
+                    inner <- T::new(dev, size, args),
+                }),
+                GFP_KERNEL,
+            )
+        });
+        let new = match new {
+            Ok(new) => new,
+            Err(e) => return e.to_ptr(),
+        };
+
+        // SAFETY: We never move out of `self`. The DRM core owns the object from here on and
+        // releases it through `free_callback()`. An object the core then fails to initialize is
+        // freed with `kfree()`, which the `KBox` allocator allows, without dropping `inner`.
+        let new = KBox::into_raw(unsafe { Pin::into_inner_unchecked(new) });
+
+        // SAFETY: `new` is a valid object that nothing else references yet.
+        unsafe {
+            let obj = (*new).obj.get();
+            (*obj).base.funcs = &Self::VTABLE;
+            &raw mut (*obj).base
+        }
+    }
+
     /// Creates (if necessary) and returns an immutable reference to a scatter-gather table of DMA
     /// pages for this object.
     ///
@@ -446,7 +488,11 @@ impl<T: DriverObject> driver::AllocImpl for Object<T> {
     type Driver = T::Driver;
 
     const ALLOC_OPS: driver::AllocOps = driver::AllocOps {
-        gem_create_object: None,
+        gem_create_object: if T::HAS_CORE_OBJECT_ARGS {
+            Some(Self::create_object_callback)
+        } else {
+            None
+        },
         prime_handle_to_fd: None,
         prime_fd_to_handle: None,
         gem_prime_import: None,
