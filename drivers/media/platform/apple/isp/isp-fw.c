@@ -95,7 +95,7 @@ static void apple_isp_power_down_domains(struct apple_isp *isp)
 		ret = pm_runtime_put_sync(isp->pd_dev[i]);
 		if (ret < 0)
 			dev_err(isp->dev,
-				"Failed to power up power domain %d: %d\n", i, ret);
+				"Failed to power down power domain %d: %d\n", i, ret);
 	}
 
 	isp->pds_active = false;
