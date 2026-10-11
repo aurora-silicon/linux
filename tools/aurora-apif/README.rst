@@ -49,3 +49,7 @@ thermal policy or hardware qualification. Old live-session m5 trees lacking
 queue reservations cannot be converted into a safe stopped handoff merely by
 setting a boolean. Update the producer first, retain its original DTB, and
 qualify boot, storage durability, MSI, USB DMA, PMP and teardown separately.
+
+The matched T6050 Abbey RTC is migrated to ``apple,abbey-pmu-rtc`` only
+when its five named cells describe the counter, offset, alarm, control
+and interrupt mask. This leaves the separate Baku RTC binding unchanged.
