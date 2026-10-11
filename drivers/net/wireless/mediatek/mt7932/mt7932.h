@@ -170,6 +170,8 @@ struct mt7932 {
 	bool data_live[512], data_token[512], data_retired[512];
 	struct mt7932_duplicate duplicates[17];
 	u64 tx_released, rx_ethernet;
+	/* TX0 descriptors published since the last doorbell; data_lock. */
+	unsigned int data_unkicked;
 	bool data_ready;
 	bool bss_absent;
 	u8 bss_quota;
@@ -195,6 +197,7 @@ int mt_cal_procedure(struct mt7932 *m, struct mt7932_cal_piece *pieces,
 				    unsigned int count, unsigned int logical, u8 context_version);
 int mt_calibration_gate(struct mt7932 *m);
 void mt_data_clean_locked(struct mt7932 *m);
+void mt_data_kick_locked(struct mt7932 *m);
 void mt_data_clean(struct mt7932 *m);
 void mt_bss_presence(struct mt7932 *m, const struct mt7932_event *event);
 void mt_data_complete(struct mt7932 *m, const u8 *packet, size_t length);
