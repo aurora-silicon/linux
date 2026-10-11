@@ -517,4 +517,3 @@ int centauri_alpha_resources(struct centauri *c, struct cen_alpha_resources *res
 	resources->mcr = ipc->alpha.mcr;
 	return 0;
 }
-
