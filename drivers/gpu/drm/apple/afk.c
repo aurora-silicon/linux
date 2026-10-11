@@ -52,6 +52,9 @@ enum rbep_msg_type {
 
 #define SEND_WPTR GENMASK(31, 0)
 
+/* retcode of a reply too short to carry a nonzero IOReturn */
+#define AFK_RETCODE_SHORT_REPLY 0xffffffff
+
 static void afk_service_worker(struct work_struct *work);
 static void afk_discard_pending_open(struct apple_epic_service *service);
 
@@ -605,6 +608,7 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 	struct apple_epic_service *service;
 	unsigned long flags;
 	u8 idx = tag & (ep->wire_v2 ? 0xf : 0xff);
+	u32 retcode;
 	void *rxbuf, *txbuf;
 	dma_addr_t rxbuf_dma, txbuf_dma;
 	size_t rxlen, txlen;
@@ -616,11 +620,21 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 		return;
 	}
 
+	/*
+	 * A reply shorter than the command header completes the command as
+	 * failed, so that its caller returns and a timed-out command's
+	 * buffers and cmd_map bit are freed. The 4-byte replies seen look
+	 * like an IOReturn: a nonzero one is passed on.
+	 */
 	if (payload_size < sizeof(*cmd)) {
 		dev_err(ep->dcp->dev,
 			"AFK[ep:%02x]: command reply on channel %d too small: %ld\n",
 			ep->endpoint, channel, payload_size);
-		return;
+		retcode = payload_size >= sizeof(cmd->retcode) ?
+			  le32_to_cpu(cmd->retcode) : 0;
+		retcode = retcode ?: AFK_RETCODE_SHORT_REPLY;
+	} else {
+		retcode = le32_to_cpu(cmd->retcode);
 	}
 
 	if (idx >= MAX_PENDING_CMDS) {
@@ -648,7 +662,7 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 	}
 
 	service->cmds[idx].done = true;
-	service->cmds[idx].retcode = le32_to_cpu(cmd->retcode);
+	service->cmds[idx].retcode = retcode;
 	if (service->cmds[idx].free_on_ack) {
 		/* defer freeing until we're no longer in atomic context */
 		rxbuf = service->cmds[idx].rxbuf;
