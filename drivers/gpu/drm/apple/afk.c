@@ -416,6 +416,7 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	struct apple_epic_service *service = NULL, *previous;
 	unsigned long flags;
 	bool retired = false;
+	bool reused = false;
 	u32 ch_idx;
 	const char *service_name = name;
 	const char *epic_name = NULL, *epic_class = NULL;
@@ -494,6 +495,8 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	for (ch_idx = 0; ch_idx < AFK_MAX_CHANNEL; ch_idx++) {
 		struct apple_epic_service *candidate = &ep->services[ch_idx];
 
+		/* only this rx worker sets ops: no lock needed for the log */
+		reused = !!candidate->ops;
 		if (afk_service_reinit(candidate, ep, ops, channel)) {
 			service = candidate;
 			break;
@@ -553,8 +556,9 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		afk_service_publish(service);
 	if (ops->init)
 		ops->init(service, epic_name, epic_class, epic_unit);
-	dev_info(ep->dcp->dev, "AFK[ep:%02x]: new service %s on channel %d\n",
-		 ep->endpoint, service_name, channel);
+	dev_info(ep->dcp->dev, "AFK[ep:%02x]: new service %s on channel %d, slot %u%s\n",
+		 ep->endpoint, service_name, channel, ch_idx,
+		 reused ? " (reused)" : "");
 
 	afk_populate_service_debugfs(service);
 
