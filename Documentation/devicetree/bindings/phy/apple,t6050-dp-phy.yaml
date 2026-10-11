@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: GPL-2.0-only
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/phy/apple,t6050-dp-phy.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T6050 fixed DisplayPort PHY
+
+maintainers:
+  - Dj <hey@djdev.me>
+
+description: |
+  Fixed four-lane DisplayPort PHY for the HDMI bridge path. It supports
+  RBR through HBR3 without spread-spectrum clocking. All register resources,
+  power domains and board tunables are supplied by the boot producer.
+
+properties:
+  compatible:
+    const: apple,t6050-dp-phy
+
+  reg:
+    minItems: 6
+    maxItems: 6
+
+  reg-names:
+    items:
+      - const: core
+      - const: reset
+      - const: fabric
+      - const: axi2af
+      - const: lioa
+      - const: common-cfg
+
+  '#phy-cells':
+    const: 0
+
+  power-domains:
+    minItems: 3
+    maxItems: 3
+
+  power-domain-names:
+    items:
+      - const: usb-aon
+      - const: common
+      - const: wrapper
+
+  apple,tunable-axi2af:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Offset, mask and value tuples within the named bank
+
+  apple,tunable-fabric:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Offset, mask and value tuples within the named bank
+
+  apple,tunable-common-cfg:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Offset, mask and value tuples within the named bank
+
+  apple,tunable-lioa:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Offset, mask and value tuples within the named bank
+
+  apple,tunable-lane0-rx-clock:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Offset, mask and value tuples within the named bank
+
+  apple,tunable-lane1-rx-clock:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Offset, mask and value tuples within the named bank
+
+  apple,tunable-lane0-rx-eq:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Offset, mask and value tuples within the named bank
+
+  apple,tunable-lane1-rx-eq:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Offset, mask and value tuples within the named bank
+
+  apple,tunable-auspll:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Offset, mask and value tuples within the named bank
+
+patternProperties:
+  '^apple,dp-training-table(-rbr|-hbr|-hbr2|-hbr3)?$':
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 16
+    maxItems: 16
+    description: Drive presets indexed by voltage swing times four plus pre-emphasis
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - '#phy-cells'
+  - power-domains
+  - power-domain-names
+  - apple,tunable-axi2af
+  - apple,tunable-fabric
+  - apple,tunable-common-cfg
+  - apple,tunable-lioa
+  - apple,tunable-lane0-rx-clock
+  - apple,tunable-lane1-rx-clock
+  - apple,tunable-lane0-rx-eq
+  - apple,tunable-lane1-rx-eq
+  - apple,tunable-auspll
+
+additionalProperties: false

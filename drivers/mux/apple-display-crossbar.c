@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT) AND GPL-2.0-only
 /*
  * Apple Silicon Display Crossbar multiplexer driver
  *
@@ -14,6 +14,9 @@
 #include <linux/io.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/iopoll.h>
+#include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
 #include <linux/mux/driver.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
@@ -89,7 +92,10 @@
 enum { MUX_DPPHY = 0, MUX_DPIN0 = 1, MUX_DPIN1 = 2, MUX_MAX = 3 };
 static const char *apple_dpxbar_names[MUX_MAX] = { "dpphy", "dpin0", "dpin1" };
 
+enum { T8142_MUX_MAX = 5 };
+
 struct apple_dpxbar_hw {
+	unsigned int n_mux;
 	unsigned int n_ufp;
 	u32 tunable;
 	const struct mux_control_ops *ops;
@@ -101,7 +107,11 @@ struct apple_dpxbar {
 	struct device *dev;
 	const struct apple_dpxbar_hw *hw;
 	void __iomem *regs;
-	int selected_dispext[MUX_MAX];
+	int selected_dispext[T8142_MUX_MAX];
+	u8 pclk[T8142_MUX_MAX];
+	bool uhbr[T8142_MUX_MAX];
+	bool enabled[T8142_MUX_MAX];
+	bool faulted;
 	spinlock_t lock;
 };
 
@@ -709,6 +719,225 @@ int apple_dpxbar_tunnel_select_source(struct mux_control *mux, int state)
 }
 EXPORT_SYMBOL_GPL(apple_dpxbar_tunnel_select_source);
 
+/*
+ * T8142 (also used by T6050) has four pixel clocks and five outputs.
+ * Keep selection separate from clock activation: the PHY/DP IN owner supplies
+ * its actual clock and coding before link_up(), after configuring that clock.
+ * Only the four two-port external display sources are described here; AUX
+ * sources use a different selector-to-clock-bit mapping.
+ */
+static const u8 t8142_dest_shift[T8142_MUX_MAX] = { 8, 0, 4, 12, 16 };
+static const u8 t8142_select_shift[T8142_MUX_MAX] = { 8, 0, 4, 24, 0 };
+static const u8 t8142_select_shift2[T8142_MUX_MAX] = { 20, 12, 16, 28, 4 };
+
+static int t8142_link_down(struct apple_dpxbar *xbar, unsigned int index)
+{
+	u32 src, dst, clock, value;
+	int ret;
+
+	if (!xbar->enabled[index])
+		return 0;
+	src = BIT(xbar->selected_dispext[index]);
+	dst = BIT(t8142_dest_shift[index]);
+	clock = xbar->pclk[index] - 1;
+
+	dpxbar_clear32(xbar, 0x3c, src);
+	dpxbar_clear32(xbar, 0x00, src);
+	dpxbar_clear32(xbar, 0x0c + 4 * clock, src);
+	dpxbar_clear32(xbar, 0x24 + 4 * clock, dst);
+	udelay(1);
+	ret = readl_poll_timeout_atomic(xbar->regs + 0x800, value,
+					!(value & src), 1, 1000);
+	if (ret) {
+		xbar->faulted = true;
+		return ret;
+	}
+	ret = readl_poll_timeout_atomic(xbar->regs + 0x808 + 4 * clock, value,
+					!(value & src), 1, 1000);
+	if (ret) {
+		xbar->faulted = true;
+		return ret;
+	}
+	ret = readl_poll_timeout_atomic(xbar->regs + 0x81c + 4 * clock, value,
+					!(value & dst), 1, 1000);
+	if (ret) {
+		xbar->faulted = true;
+		return ret;
+	}
+	dpxbar_clear32(xbar, 0x08, src);
+	dpxbar_clear32(xbar, 0x20, 7 << (3 * xbar->selected_dispext[index]));
+	dpxbar_clear32(xbar, 0x38, 7 << t8142_dest_shift[index]);
+	dpxbar_set32(xbar, 0x04, src);
+	dpxbar_set32(xbar, 0x1c, src);
+	dpxbar_set32(xbar, 0x34, dst);
+	xbar->enabled[index] = false;
+	return 0;
+}
+
+static int t8142_link_up(struct apple_dpxbar *xbar, unsigned int index)
+{
+	int state = xbar->selected_dispext[index];
+	u32 clock, select, src, dst, value;
+	int ret;
+
+	if (state < 0)
+		return -ENODEV;
+	if (!xbar->pclk[index])
+		return -EINVAL;
+	if (xbar->enabled[index])
+		return 0;
+
+	/* The coding bit is shared by every output using this pixel clock. */
+	for (unsigned int i = 0; i < T8142_MUX_MAX; i++)
+		if (i != index && xbar->enabled[i] &&
+		    xbar->pclk[i] == xbar->pclk[index] &&
+		    xbar->uhbr[i] != xbar->uhbr[index])
+			return -EBUSY;
+
+	clock = xbar->pclk[index] - 1;
+	select = 2 * clock + 1;
+	src = BIT(state);
+	dst = BIT(t8142_dest_shift[index]);
+	dpxbar_clear32(xbar, 0x04, src);
+	dpxbar_clear32(xbar, 0x1c, src);
+	dpxbar_clear32(xbar, 0x34, dst);
+	udelay(1);
+	ret = readl_poll_timeout_atomic(xbar->regs + 0x804, value,
+					!(value & src), 1, 1000);
+	if (ret) {
+		xbar->faulted = true;
+		return ret;
+	}
+	ret = readl_poll_timeout_atomic(xbar->regs + 0x818, value,
+					!(value & src), 1, 1000);
+	if (ret) {
+		xbar->faulted = true;
+		return ret;
+	}
+	ret = readl_poll_timeout_atomic(xbar->regs + 0x82c, value,
+					!(value & dst), 1, 1000);
+	if (ret) {
+		xbar->faulted = true;
+		return ret;
+	}
+	dpxbar_set32(xbar, 0x08, src);
+	dpxbar_mask32(xbar, 0x20, 7 << (3 * state), select << (3 * state));
+	dpxbar_mask32(xbar, 0x38, 7 << t8142_dest_shift[index],
+		      select << t8142_dest_shift[index]);
+	dpxbar_mask32(xbar, 0x48, BIT(clock), xbar->uhbr[index] ? BIT(clock) : 0);
+	dpxbar_set32(xbar, 0x00, src);
+	dpxbar_set32(xbar, 0x0c + 4 * clock, src);
+	dpxbar_set32(xbar, 0x24 + 4 * clock, dst);
+	dpxbar_set32(xbar, 0x4c, dst);
+	dpxbar_set32(xbar, 0x3c, src);
+	xbar->enabled[index] = true;
+	return 0;
+}
+
+static int apple_dpxbar_set_t8142(struct mux_control *mux, int state)
+{
+	struct apple_dpxbar *xbar = mux_chip_priv(mux->chip);
+	unsigned int index = mux_control_get_index(mux);
+	unsigned long flags;
+	u32 mask, value;
+	int ret = 0;
+
+	if (state != MUX_IDLE_DISCONNECT &&
+	    (state < 0 || state >= 8 || (index == MUX_DPPHY && (state & 1))))
+		return -EINVAL;
+
+	spin_lock_irqsave(&xbar->lock, flags);
+	if (xbar->faulted) {
+		ret = -EIO;
+		goto out;
+	}
+	if (state >= 0) {
+		for (unsigned int i = 0; i < T8142_MUX_MAX; i++) {
+			if (i != index && xbar->selected_dispext[i] == state) {
+				spin_unlock_irqrestore(&xbar->lock, flags);
+				return -EBUSY;
+			}
+		}
+	}
+
+	if (xbar->selected_dispext[index] == state)
+		goto out;
+	if (xbar->selected_dispext[index] >= 0) {
+		ret = t8142_link_down(xbar, index);
+		if (ret)
+			goto out;
+	}
+
+	/* No implicit clock choice or activation when selecting a new source. */
+	xbar->pclk[index] = 0;
+	xbar->selected_dispext[index] = state;
+	if (state >= 0) {
+		mask = (0xfU << t8142_select_shift[index]) |
+		       (0xfU << t8142_select_shift2[index]);
+		value = ((u32)state << t8142_select_shift[index]) |
+			((u32)state << t8142_select_shift2[index]);
+		dpxbar_mask32(xbar, index == 4 ? 0x40 : 0x44, mask, value);
+	}
+out:
+	spin_unlock_irqrestore(&xbar->lock, flags);
+	return ret;
+}
+
+static const struct mux_control_ops apple_dpxbar_t8142_ops = {
+	.set = apple_dpxbar_set_t8142,
+};
+
+/* Caller holds the mux selection throughout configuration and activation. */
+int apple_dpxbar_link_configure(struct mux_control *mux, unsigned int pclk, bool uhbr)
+{
+	struct apple_dpxbar *xbar;
+	unsigned int index;
+	unsigned long flags;
+	int ret = 0;
+
+	if (!mux || mux->chip->ops != &apple_dpxbar_t8142_ops)
+		return -EOPNOTSUPP;
+	if (pclk < 1 || pclk > 4)
+		return -EINVAL;
+	xbar = mux_chip_priv(mux->chip);
+	index = mux_control_get_index(mux);
+	spin_lock_irqsave(&xbar->lock, flags);
+	if (xbar->faulted)
+		ret = -EIO;
+	else if (xbar->selected_dispext[index] < 0)
+		ret = -ENODEV;
+	else if (xbar->enabled[index])
+		ret = -EBUSY;
+	else {
+		xbar->pclk[index] = pclk;
+		xbar->uhbr[index] = uhbr;
+	}
+	spin_unlock_irqrestore(&xbar->lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_dpxbar_link_configure);
+
+static int apple_dpxbar_t8142_link(struct mux_control *mux, bool up)
+{
+	struct apple_dpxbar *xbar = mux_chip_priv(mux->chip);
+	unsigned int index = mux_control_get_index(mux);
+	unsigned long flags;
+	int ret = 0;
+
+	spin_lock_irqsave(&xbar->lock, flags);
+	if (xbar->faulted)
+		ret = -EIO;
+	else if (xbar->selected_dispext[index] < 0)
+		ret = -ENODEV;
+	else if (up)
+		ret = t8142_link_up(xbar, index);
+	else
+		ret = t8142_link_down(xbar, index);
+	spin_unlock_irqrestore(&xbar->lock, flags);
+	return ret;
+}
+
+
 static int apple_dpxbar_t602x_link_up(struct mux_control *mux)
 {
 	struct apple_dpxbar *xbar;
@@ -771,6 +1000,9 @@ static int apple_dpxbar_t602x_link_up(struct mux_control *mux)
 
 int apple_dpxbar_link_up(struct mux_control *mux)
 {
+	if (mux && mux->chip->ops == &apple_dpxbar_t8142_ops)
+		return apple_dpxbar_t8142_link(mux, true);
+
 	if (!mux)
 		return -EINVAL;
 	if (mux->chip->ops == &apple_dpxbar_t602x_ops)
@@ -814,6 +1046,9 @@ static int apple_dpxbar_t602x_link_down(struct mux_control *mux)
 
 int apple_dpxbar_link_down(struct mux_control *mux)
 {
+	if (mux && mux->chip->ops == &apple_dpxbar_t8142_ops)
+		return apple_dpxbar_t8142_link(mux, false);
+
 	if (!mux)
 		return -EINVAL;
 	if (mux->chip->ops == &apple_dpxbar_t602x_ops)
@@ -821,6 +1056,39 @@ int apple_dpxbar_link_down(struct mux_control *mux)
 	return apple_dpxbar_t8103_link_down(mux);
 }
 EXPORT_SYMBOL_GPL(apple_dpxbar_link_down);
+
+static void apple_dpxbar_domain_release(void *data)
+{
+	struct device *pd = data;
+
+	pm_runtime_put_sync_suspend(pd);
+	dev_pm_domain_detach(pd, true);
+}
+
+static int apple_dpxbar_domains(struct device *dev)
+{
+	static const char * const names[] = { "usb-aon", "common" };
+	int ret;
+
+	/* Older handoff-only trees have no Linux-managed domains. */
+	if (!of_property_present(dev->of_node, "power-domain-names"))
+		return 0;
+	for (unsigned int i = 0; i < ARRAY_SIZE(names); i++) {
+		struct device *pd = dev_pm_domain_attach_by_name(dev, names[i]);
+
+		if (IS_ERR_OR_NULL(pd))
+			return pd ? PTR_ERR(pd) : -ENODEV;
+		ret = pm_runtime_resume_and_get(pd);
+		if (ret < 0) {
+			dev_pm_domain_detach(pd, true);
+			return ret;
+		}
+		ret = devm_add_action_or_reset(dev, apple_dpxbar_domain_release, pd);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
 
 static int apple_dpxbar_probe(struct platform_device *pdev)
 {
@@ -831,7 +1099,16 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 	int ret;
 
 	hw = of_device_get_match_data(dev);
-	mux_chip = devm_mux_chip_alloc(dev, MUX_MAX, sizeof(*dpxbar));
+	if (hw->ops == &apple_dpxbar_t8142_ops) {
+		struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+
+		if (!res || resource_size(res) < 0x830)
+			return -EINVAL;
+		ret = apple_dpxbar_domains(dev);
+		if (ret)
+			return dev_err_probe(dev, ret, "cannot power crossbar controls\n");
+	}
+	mux_chip = devm_mux_chip_alloc(dev, hw->n_mux, sizeof(*dpxbar));
 	if (IS_ERR(mux_chip))
 		return PTR_ERR(mux_chip);
 
@@ -845,13 +1122,13 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 	if (IS_ERR(dpxbar->regs))
 		return PTR_ERR(dpxbar->regs);
 
-	if (!of_device_is_compatible(dev->of_node, "apple,t6020-display-crossbar")) {
+	if (hw->ops == &apple_dpxbar_ops) {
 		readl(dpxbar->regs + UNK_TUNABLE);
 		writel(hw->tunable, dpxbar->regs + UNK_TUNABLE);
 		readl(dpxbar->regs + UNK_TUNABLE);
 	}
 
-	for (unsigned int i = 0; i < MUX_MAX; ++i) {
+	for (unsigned int i = 0; i < hw->n_mux; ++i) {
 		mux_chip->mux[i].states = hw->n_ufp;
 		mux_chip->mux[i].idle_state = MUX_IDLE_DISCONNECT;
 		dpxbar->selected_dispext[i] = -1;
@@ -865,18 +1142,21 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 }
 
 static const struct apple_dpxbar_hw apple_dpxbar_hw_t8103 = {
+	.n_mux = MUX_MAX,
 	.n_ufp = 2,
 	.tunable = 0,
 	.ops = &apple_dpxbar_ops,
 };
 
 static const struct apple_dpxbar_hw apple_dpxbar_hw_t8112 = {
+	.n_mux = MUX_MAX,
 	.n_ufp = 4,
 	.tunable = 4278196325,
 	.ops = &apple_dpxbar_ops,
 };
 
 static const struct apple_dpxbar_hw apple_dpxbar_hw_t6000 = {
+	.n_mux = MUX_MAX,
 	.n_ufp = 9,
 	.tunable = 5,
 	.ops = &apple_dpxbar_ops,
@@ -884,11 +1164,20 @@ static const struct apple_dpxbar_hw apple_dpxbar_hw_t6000 = {
 };
 
 static const struct apple_dpxbar_hw apple_dpxbar_hw_t6020 = {
+	.n_mux = MUX_MAX,
 	.n_ufp = 9,
 	.ops = &apple_dpxbar_t602x_ops,
 };
 
+static const struct apple_dpxbar_hw apple_dpxbar_hw_t8142 = {
+	.n_mux = T8142_MUX_MAX,
+	.n_ufp = 8,
+	.ops = &apple_dpxbar_t8142_ops,
+};
+
 static const struct of_device_id apple_dpxbar_ids[] = {
+	{ .compatible = "apple,t6050-display-crossbar", .data = &apple_dpxbar_hw_t8142 },
+	{ .compatible = "apple,t8142-display-crossbar", .data = &apple_dpxbar_hw_t8142 },
 	{
 		.compatible = "apple,t8103-display-crossbar",
 		.data = &apple_dpxbar_hw_t8103,
