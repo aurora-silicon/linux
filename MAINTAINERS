@@ -4359,6 +4359,21 @@ F:	rust/helpers/auxiliary.c
 F:	rust/kernel/auxiliary.rs
 F:	samples/rust/rust_driver_auxiliary.rs
 
+AURORA PLATFORM MMIO INTERFACE
+M:	Dj <43033058+DjDeveloperr@users.noreply.github.com>
+S:	Maintained
+F:	Documentation/devicetree/bindings/firmware/aurora,apif-mmio.yaml
+F:	Documentation/devicetree/bindings/iommu/apple,dart-apif.yaml
+F:	Documentation/devicetree/bindings/soc/apple/apple,sart-apif.yaml
+F:	Documentation/driver-api/firmware/aurora-apif.rst
+F:	drivers/firmware/aurora-apif-mmio.c
+F:	drivers/iommu/apple-dart-apif.c
+F:	drivers/soc/apple/apple-sart-apif.c
+F:	drivers/soc/apple/sart-backend.h
+F:	include/linux/apple-dart-apif.h
+F:	include/linux/soc/aurora/apif-mmio.h
+F:	tools/testing/selftests/aurora-apif/
+
 AUXILIARY DISPLAY DRIVERS
 M:	Andy Shevchenko <andy@kernel.org>
 R:	Geert Uytterhoeven <geert@linux-m68k.org>
