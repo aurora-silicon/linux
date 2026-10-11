@@ -3,6 +3,8 @@
 #define _LINUX_SOC_AURORA_APIF_MMIO_H
 
 #include <linux/types.h>
+#include <linux/err.h>
+#include <linux/kconfig.h>
 
 struct device;
 struct aurora_apif;
@@ -34,6 +36,7 @@ struct aurora_apif_boot_iommu {
 /* Each client owns a buffer. Submission is synchronous and atomic-context
  * safe. Unbind drains the client and subsequent calls return -ENODEV.
  */
+#if IS_REACHABLE(CONFIG_AURORA_APIF_MMIO)
 struct aurora_apif *aurora_apif_get(struct device *dev);
 void aurora_apif_put(struct aurora_apif *apif);
 /* @done counts executed operations. The transport does not interpret native
@@ -41,5 +44,23 @@ void aurora_apif_put(struct aurora_apif *apif);
  */
 int aurora_apif_submit(struct aurora_apif *apif, struct aurora_apif_op *ops,
 		       u32 count, u32 *done);
+
+#else
+static inline struct aurora_apif *aurora_apif_get(struct device *dev)
+{
+	return ERR_PTR(-ENODEV);
+}
+static inline void aurora_apif_put(struct aurora_apif *apif)
+{
+}
+static inline int aurora_apif_submit(struct aurora_apif *apif,
+				     struct aurora_apif_op *ops, u32 count,
+				     u32 *done)
+{
+	if (done)
+		*done = 0;
+	return -ENODEV;
+}
+#endif
 
 #endif
