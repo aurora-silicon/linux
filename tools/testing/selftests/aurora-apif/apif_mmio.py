@@ -37,6 +37,7 @@ HEADER = r'''
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+typedef uint16_t u16;
 typedef uint32_t u32;
 typedef int32_t s32;
 typedef uint64_t u64;
@@ -340,12 +341,61 @@ int main(void) {
 '''
 
 
+def pcie_test():
+    layout = (ROOT / "drivers/pci/controller/apple-apif/t6050_pcie_sequence.h").read_text()
+    gpio = (ROOT / "drivers/pci/controller/apple-apif/t6050_pcie_gpio.h").read_text()
+    layout = "\n".join(x for x in (layout + gpio).splitlines() if not x.startswith("#include"))
+    helpers = "\n".join(function("drivers/pci/controller/apple-apif/" + file, name) for file, name in
+                         [("t6050_pcie_msi.c", "t6050_pcie_configure_msi_port0"),
+                          ("t6050_pcie_gpio.c", "t6050_pcie_gpio_perst"),
+                          ("t6050_pcie_disable.c", "update"),
+                          ("t6050_pcie_disable.c", "t6050_pcie_disable_port0")])
+    return HEADER + layout + "\n" + helpers + r'''
+static u32 pad, address_lo, address_hi;
+static int writes, fail_write, power_calls, polls;
+static int fake_read(void *ctx,unsigned reg,unsigned off,u32 *v) {
+    (void)ctx;(void)reg;(void)off;*v=0;return 0;
+}
+static int fake_write(void *ctx,unsigned reg,unsigned off,u32 v) {
+    (void)ctx;assert(reg==T6050_PCIE_PORT0);writes++;
+    if(fail_write==writes) return -EIO;
+    if(off==0x16c) address_lo=v;
+    if(off==0x170) address_hi=v;
+    return 0;
+}
+static int fake_poll(void *ctx,unsigned reg,unsigned off,u32 mask,u32 value,unsigned timeout) {
+    (void)ctx;(void)reg;(void)off;(void)mask;(void)value;
+    assert(timeout>0 && timeout<=250000);polls++;return -ETIMEDOUT;
+}
+static void fake_delay(void *ctx,unsigned us) {(void)ctx;assert(us<=100000);}
+static int power(void *ctx,bool on) {(void)ctx;assert(!on);power_calls++;return -EBUSY;}
+static int pad_read(void *ctx,u32 *v) {(void)ctx;*v=pad;return 0;}
+static int pad_write(void *ctx,u32 v) {(void)ctx;pad=v;writes++;return 0;}
+int main(void) {
+    struct t6050_pcie_io io={.read=fake_read,.write=fake_write,.poll=fake_poll,.delay=fake_delay};
+    assert(!t6050_pcie_configure_msi_port0(&io,0x1fffff000ULL,64));
+    assert(writes==67 && address_hi==1 && address_lo==0xfffff000);
+    writes=0;fail_write=2;
+    assert(t6050_pcie_configure_msi_port0(&io,0xfffff000,32)==-EIO && writes==2);
+    writes=0;assert(t6050_pcie_configure_msi_port0(&io,1,32)==-EINVAL && !writes);
+    assert(t6050_pcie_configure_msi_port0(&io,0xfffff000,257)==-EINVAL);
+    assert(t6050_pcie_disable_port0(&io,power,250000)==-EBUSY);
+    assert(power_calls==1 && !writes && !polls);
+    struct t6050_gpio_pad_io g={.read=pad_read,.write=pad_write};
+    pad=1U<<21;assert(t6050_pcie_gpio_perst(&g,true)==-EIO && !writes);
+    pad=0;assert(!t6050_pcie_gpio_perst(&g,true) && (pad&0x27f)==0x202);
+    assert(!t6050_pcie_gpio_perst(&g,false) && (pad&0x27f)==0x203);
+    return 0;
+}
+'''
+
+
 def main():
     compiler = shlex.split(os.environ.get("HOSTCC", "cc"))
-    print("TAP version 13\n1..4", flush=True)
+    print("TAP version 13\n1..5", flush=True)
     with tempfile.TemporaryDirectory(prefix="apif-selftest-") as directory:
         for i, (name, test) in enumerate([( "transport", transport_test),
-                                        ("dart", dart_test), ("sart", sart_test), ("nvme", nvme_test)], 1):
+                                        ("dart", dart_test), ("sart", sart_test), ("nvme", nvme_test), ("pcie", pcie_test)], 1):
             path = Path(directory) / name
             path.with_suffix(".c").write_text(test())
             subprocess.run(compiler + ["-std=gnu11", "-Wall", "-Wextra", "-Werror",

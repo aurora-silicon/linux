@@ -3520,6 +3520,13 @@ void pci_lock_rescan_remove(void)
 }
 EXPORT_SYMBOL_GPL(pci_lock_rescan_remove);
 
+/* Work cancelled by removal must not wait on the remover's own lock. */
+bool pci_trylock_rescan_remove(void)
+{
+	return mutex_trylock(&pci_rescan_remove_lock);
+}
+EXPORT_SYMBOL_GPL(pci_trylock_rescan_remove);
+
 void pci_unlock_rescan_remove(void)
 {
 	mutex_unlock(&pci_rescan_remove_lock);

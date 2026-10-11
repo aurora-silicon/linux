@@ -1540,6 +1540,7 @@ void set_pcie_hotplug_bridge(struct pci_dev *pdev);
 /* Functions for PCI Hotplug drivers to use */
 unsigned int pci_rescan_bus(struct pci_bus *bus);
 void pci_lock_rescan_remove(void);
+bool pci_trylock_rescan_remove(void);
 void pci_unlock_rescan_remove(void);
 
 /* Vital Product Data routines */

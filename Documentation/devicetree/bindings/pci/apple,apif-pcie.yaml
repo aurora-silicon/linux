@@ -1,0 +1,119 @@
+# SPDX-License-Identifier: GPL-2.0-only
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/pci/apple,apif-pcie.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Preinitialized Apple PCIe host in an Aura guest
+maintainers:
+  - Dj <hey@djdev.me>
+
+description: |
+  The boot producer configures the controller, PHY, link, apertures and
+  RID-to-SID routing before guest entry. It disables endpoint bus mastering
+  and MSI before transferring ownership. Linux uses ECAM and allocates MSI
+  from the native AIC range; it does not run raw cold-init register sequences.
+
+allOf:
+  - $ref: /schemas/pci/pci-host-bridge.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-pcie-apif
+    then:
+      required:
+        - apple,rid-to-sid
+        - max-link-speed
+        - num-lanes
+      properties:
+        reg:
+          minItems: 5
+        reg-names:
+          minItems: 5
+    else:
+      properties:
+        reg:
+          maxItems: 1
+        reg-names:
+          maxItems: 1
+        apple,rid-to-sid: false
+
+properties:
+  compatible:
+    oneOf:
+      - const: apple,apif-pcie
+      - items:
+          - const: apple,t6050-pcie-apif
+          - const: apple,apif-pcie
+  reg:
+    minItems: 1
+    items:
+      - description: ECAM configuration window
+      - description: T6050 port-0 control registers, at least 32 KiB
+      - description: T6050 port-0 PHY registers, at least 16 KiB
+      - description: Active-low PERST pad register, at least four bytes
+      - description: T6050 interrupt-to-AXI registers, at least 16 KiB
+  reg-names:
+    minItems: 1
+    items:
+      - const: ecam
+      - const: port
+      - const: phy
+      - const: perst
+      - const: intr2axi
+  apple,preinitialized:
+    type: boolean
+    description: Controller is initialized and endpoint DMA/MSI is stopped
+  apple,msi-address:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    description: Native MSI doorbell; 4 KiB aligned for the T6050 layout
+  msi-ranges:
+    maxItems: 1
+    description: One four-cell native AIC edge interrupt range and vector count
+  apple,rid-to-sid:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    minItems: 1
+    maxItems: 15
+    items:
+      items:
+        - description: Hardware routing slot
+          minimum: 1
+          maximum: 15
+        - description: Requester ID
+          maximum: 65535
+        - description: Firmware-assigned DART stream ID
+          maximum: 255
+    description: Restore existing routing after the optional preboot port cycle
+  iommu-map: true
+  iommu-map-mask: true
+  max-link-speed:
+    const: 3
+  num-lanes:
+    const: 1
+  dma-coherent: true
+
+patternProperties:
+  '^apple,(apcie-config|pcie-rc|pcie-rc-gen[345]-shadow)-tunables$':
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    maxItems: 16
+    items:
+      items:
+        - description: Register offset
+        - const: 4
+        - description: Clear mask
+        - description: Set mask
+    description: Boot-producer register tuples for the matched layout
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - ranges
+  - bus-range
+  - apple,preinitialized
+  - apple,msi-address
+  - msi-ranges
+  - iommu-map
+
+unevaluatedProperties: false
