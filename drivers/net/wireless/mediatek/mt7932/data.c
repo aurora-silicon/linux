@@ -35,6 +35,25 @@ void mt_data_clean_locked(struct mt7932 *m)
 		netif_wake_queue(m->netdev);
 }
 
+/*
+ * The stack marks a packet that has another one right behind it with
+ * netdev_xmit_more(), so the TX0 doorbell is rung once per burst instead of
+ * once per packet, and at least every MT7932_TX_BATCH packets so that the
+ * device starts on a long burst early.
+ */
+#define MT7932_TX_BATCH 64
+
+/* data_lock held: hand every published TX0 descriptor to the device. */
+void mt_data_kick_locked(struct mt7932 *m)
+{
+	struct mt7932_ring *q = &m->tx[0];
+
+	if (!m->data_unkicked)
+		return;
+	m->data_unkicked = 0;
+	mt_write(m, q->reg + 8, q->head);
+}
+
 void mt_data_clean(struct mt7932 *m)
 {
 	unsigned long flags;
@@ -42,6 +61,10 @@ void mt_data_clean(struct mt7932 *m)
 	if (!READ_ONCE(m->data_ready))
 		return;
 	spin_lock_irqsave(&m->data_lock, flags);
+	/* The queue can be stopped from outside ndo_start_xmit() in the middle
+	 * of a burst; no descriptor waits longer than the next interrupt.
+	 */
+	mt_data_kick_locked(m);
 	mt_data_clean_locked(m);
 	spin_unlock_irqrestore(&m->data_lock, flags);
 }
@@ -59,10 +82,12 @@ void mt_bss_presence(struct mt7932 *m, const struct mt7932_event *event)
 	spin_lock_irqsave(&m->data_lock, flags);
 	m->bss_absent = !!body[1];
 	m->bss_quota = body[2];
-	if (!mt_bss_tx_allowed(m))
+	if (!mt_bss_tx_allowed(m)) {
 		netif_stop_queue(m->netdev);
-	else if (READ_ONCE(m->data_ready))
+		mt_data_kick_locked(m);
+	} else if (READ_ONCE(m->data_ready)) {
 		mt_data_clean_locked(m);
+	}
 	spin_unlock_irqrestore(&m->data_lock, flags);
 	dev_dbg_ratelimited(&m->pdev->dev, "BSS_PRESENCE: absent=%u quota=%u\n",
 			    !!body[1], body[2]);
@@ -122,6 +147,7 @@ netdev_tx_t mt_net_xmit(struct sk_buff *skb, struct net_device *netdev)
 	slot = q->head;
 	if (!mt_bss_tx_allowed(m) || m->data_live[slot] || q->queued >= q->count - 1) {
 		netif_stop_queue(netdev);
+		mt_data_kick_locked(m);
 		spin_unlock_irqrestore(&m->data_lock, flags);
 		return NETDEV_TX_BUSY;
 	}
@@ -147,18 +173,27 @@ netdev_tx_t mt_net_xmit(struct sk_buff *skb, struct net_device *netdev)
 	q->head = (slot + 1) % q->count;
 	q->queued++;
 	dma_wmb();
-	mt_write(m, q->reg + 8, q->head);
+	m->data_unkicked++;
 	mt_bss_tx_account(m);
 	m->station_tx_packets++;
 	m->station_tx_bytes += skb->len;
 	if (!mt_bss_tx_allowed(m) || m->data_live[q->head] || q->queued >= q->count - 1)
 		netif_stop_queue(netdev);
+	if (!netdev_xmit_more() || netif_queue_stopped(netdev) ||
+	    m->data_unkicked >= MT7932_TX_BATCH)
+		mt_data_kick_locked(m);
 	spin_unlock_irqrestore(&m->data_lock, flags);
 	netdev->stats.tx_packets++;
 	netdev->stats.tx_bytes += skb->len;
 	dev_kfree_skb_any(skb);
 	return NETDEV_TX_OK;
 drop:
+	/* The burst ends here: publish what earlier packets queued. */
+	if (!netdev_xmit_more() && READ_ONCE(m->data_ready)) {
+		spin_lock_irqsave(&m->data_lock, flags);
+		mt_data_kick_locked(m);
+		spin_unlock_irqrestore(&m->data_lock, flags);
+	}
 	netdev->stats.tx_dropped++;
 	dev_kfree_skb_any(skb);
 	return NETDEV_TX_OK;
