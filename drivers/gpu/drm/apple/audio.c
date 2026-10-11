@@ -73,6 +73,8 @@ struct dcp_audio {
 	ktime_t void_start;
 	u64 void_periods;
 	struct delayed_work void_work;
+	/* the stream holds a runtime PM reference */
+	bool pm_held;
 	void *elements;
 	void *productattrs;
 
@@ -532,7 +534,10 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		if (dcpaud->open_unplugged || !dcpaud_connection_up(dcpaud))
 			return dcpaud_void_start(substream);
 
-		WARN_ON(pm_runtime_get_sync(dcpaud->dev) < 0);
+		if (!dcpaud->pm_held) {
+			WARN_ON(pm_runtime_get_sync(dcpaud->dev) < 0);
+			dcpaud->pm_held = true;
+		}
 		ret = dcp_audiosrv_startlink(dcpaud->dcp_dev,
 					     &dcpaud->selected_cookie);
 		if (ret < 0)
@@ -564,8 +569,15 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 		ret = dcp_audiosrv_stoplink(dcpaud->dcp_dev);
-		pm_runtime_mark_last_busy(dcpaud->dev);
-		__pm_runtime_put_autosuspend(dcpaud->dev);
+		/*
+		 * A failed START is undone with a STOP, also when it refused
+		 * before taking the reference.
+		 */
+		if (dcpaud->pm_held) {
+			dcpaud->pm_held = false;
+			pm_runtime_mark_last_busy(dcpaud->dev);
+			__pm_runtime_put_autosuspend(dcpaud->dev);
+		}
 		if (ret < 0)
 			return ret;
 		break;
