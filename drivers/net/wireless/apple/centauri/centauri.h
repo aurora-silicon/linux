@@ -46,7 +46,7 @@ struct centauri {
 	struct mutex boot_lock;
 	struct delayed_work boot_work;
 	enum centauri_boot_phase boot_phase;
-	bool removing;
+	bool removing, ready;
 	void *firmware, *descriptor;
 	struct centauri_irqs irqs, alpha_irqs;
 	dma_addr_t firmware_dma, descriptor_dma;

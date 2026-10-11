@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <linux/delay.h>
+#include <linux/apple-centauri.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
 #include <linux/io.h>
@@ -15,6 +16,19 @@
 #include <linux/unaligned.h>
 
 #include "centauri.h"
+
+static struct pci_driver centauri_driver;
+
+bool apple_centauri_control_ready(struct pci_dev *pdev)
+{
+	struct centauri *c;
+
+	if (pdev->driver != &centauri_driver)
+		return false;
+	c = pci_get_drvdata(pdev);
+	return c && !READ_ONCE(c->removing) && smp_load_acquire(&c->ready);
+}
+EXPORT_SYMBOL_GPL(apple_centauri_control_ready);
 
 /* No DMA backing is released without verified bus-master shutdown. */
 bool centauri_stop_dma(struct pci_dev *pdev)

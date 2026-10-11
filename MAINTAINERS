@@ -4372,6 +4372,9 @@ L:	linux-wireless@vger.kernel.org
 S:	Maintained
 F:	Documentation/arch/arm64/aurora-apif-centauri.rst
 F:	Documentation/devicetree/bindings/net/wireless/apple,centauri.yaml
+F:	Documentation/devicetree/bindings/net/bluetooth/apple,centauri.yaml
+F:	drivers/bluetooth/btcentauri.c
+F:	include/linux/apple-centauri.h
 F:	drivers/net/wireless/apple/
 
 AURORA PLATFORM MMIO INTERFACE
