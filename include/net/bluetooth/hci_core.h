@@ -665,6 +665,8 @@ struct hci_dev {
 				     struct bt_codec *codec, __u8 *vnd_len,
 				     __u8 **vnd_data);
 	u8 (*classify_pkt_type)(struct hci_dev *hdev, struct sk_buff *skb);
+	/* Called in command-sync context before enabling duplicate-filtered scanning. */
+	int (*reset_dup_filter)(struct hci_dev *hdev);
 };
 
 #define hci_set_quirk(hdev, nr) set_bit((nr), (hdev)->quirk_flags)

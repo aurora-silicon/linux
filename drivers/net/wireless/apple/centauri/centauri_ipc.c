@@ -423,6 +423,8 @@ static int centauri_start_ipc_locked(struct centauri *c)
 	if (ret)
 		return ret;
 
+	/* Publish usable shared firmware before the Beta consumer probes. */
+	smp_store_release(&c->ready, true);
 	ret = device_attach(&ipc->function[2]->dev);
 	if (ret < 0)
 		dev_warn(&c->pdev->dev, "Beta driver attachment failed: %d\n", ret);

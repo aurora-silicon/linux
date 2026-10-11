@@ -533,3 +533,11 @@ config BT_INTEL_PCIE
 	  Say Y here to compiler support for Intel Bluetooth PCIe device into
 	  the kernel or say M to compile it as module (btintel_pcie)
 endmenu
+
+config BT_HCICENTAURI
+	tristate "Apple N1 Centauri Bluetooth"
+	depends on BT && PCI && APPLE_CENTAURI
+	help
+	  Protocol-27 Beta HCI and ACL transport using the shared N1 firmware.
+	  Requires the Control supplier and a DT-provided device address.
+	  SCO and ISO delivery are not implemented by this driver.

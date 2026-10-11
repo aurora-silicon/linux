@@ -2283,6 +2283,15 @@ static int hci_le_set_scan_enable_sync(struct hci_dev *hdev, u8 val,
 {
 	struct hci_cp_le_set_scan_enable cp;
 
+	/* Firmware duplicate caches may need an explicit reset between scans. */
+	if (val && filter_dup != LE_SCAN_FILTER_DUP_DISABLE &&
+	    !hci_dev_test_flag(hdev, HCI_MESH) && hdev->reset_dup_filter) {
+		int err = hdev->reset_dup_filter(hdev);
+
+		if (err)
+			return err;
+	}
+
 	if (use_ext_scan(hdev))
 		return hci_le_set_ext_scan_enable_sync(hdev, val, filter_dup);
 

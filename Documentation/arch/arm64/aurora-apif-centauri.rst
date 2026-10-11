@@ -50,3 +50,29 @@ stops new transmission. Its key payload is cleared only after the transfer-ring
 tail proves consumption; uncertain ownership keeps backing memory pinned.
 Safe IPC teardown scrubs buffers after verified DMA shutdown. The cleaned
 consumer still needs hardware traffic and suspend/resume qualification.
+
+Bluetooth consumer
+------------------
+
+``CONFIG_BT_HCICENTAURI`` adds the Beta HCI/ACL PCI driver. A managed device
+link requires the Control supplier to have established shared firmware and
+orders removal and suspend against it. The Beta DT node supplies the factory
+``local-mac-address`` in network byte order; no board-name or temporary-address
+fallback selects initialization behavior.
+
+Protocol-27 initialization provisions the address, completes firmware setup
+and supplies a fresh random seed. The connection-command adaptation is enabled
+only after the firmware's capability bit confirms support. Status and connection
+completion events are normalized to the standard HCI command being tracked.
+The firmware duplicate filter is reset in the HCI command-sync path before
+filtered scanning starts; other drivers without that callback keep their
+existing behavior. Standard report lengths are checked before applying the
+matched legacy scan-response fixup.
+
+The driver uses IRQ-triggered work and the original ring geometry. Diagnostic
+capture, unrelated auxiliary rings, manual mode switches and success logging
+are excluded. SCO and ISO delivery are not implemented. Coordinated firmware
+teardown remains unqualified: a published Beta arena stays pinned on detach,
+and rebinding requires a fresh shared-firmware boot. This is not a reset of the
+Wi-Fi function. The cleaned driver still needs hardware HCI/ACL, repeated-scan
+and suspend/resume qualification.
