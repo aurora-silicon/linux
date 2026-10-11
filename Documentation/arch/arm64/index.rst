@@ -15,6 +15,7 @@ ARM64 Architecture
     ../../driver-api/firmware/aurora-apif-pmp
     ../../driver-api/firmware/aurora-apif-display
     aurora-apif-centauri
+    aurora-apif-platform
     apple-j813
     arm-acpi
     arm-cca
