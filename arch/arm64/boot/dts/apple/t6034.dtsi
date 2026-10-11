@@ -11,6 +11,15 @@
 	compatible = "apple,t6034", "apple,arm-platform";
 };
 
+/*
+ * The 14-core M3 Max has its own GPU (30 cores), whose clusters and core masks
+ * the T6031 description does not give. Its own compatible keeps the T6031 GPU
+ * support from binding to it even if a boot loader enabled the node.
+ */
+&gpu {
+	compatible = "apple,agx-t6034";
+};
+
 // Memory channels not present on the 14-core variant
 &ps_amcc6 {
 	status = "disabled";

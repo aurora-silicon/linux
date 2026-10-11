@@ -47,6 +47,7 @@
 
 #include "t6031-gpio-pins.dtsi"
 #include "t6031-pmgr.dtsi"
+#include "t6031-gpu.dtsi"
 
 #undef DIE
 #undef DIE_NO
