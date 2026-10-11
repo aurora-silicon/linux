@@ -9,6 +9,11 @@ ARM64 Architecture
 
     acpi_object_usage
     amu
+    aurora-apif
+    aurora-apif-nvme
+    aurora-apif-pcie
+    aurora-apif-pmp
+    aurora-apif-centauri
     apple-j813
     arm-acpi
     arm-cca

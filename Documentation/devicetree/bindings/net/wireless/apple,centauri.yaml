@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: GPL-2.0-only
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/net/wireless/apple,centauri.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple N1 Centauri Control PCI function
+
+maintainers:
+  - Dj <hey@djdev.me>
+
+description: |
+  PCI function zero owns the shared N1 firmware bootstrap. The boot producer
+  supplies the personalized FTAB filename and packed firmware platform ID.
+  The endpoint must be left in its stopped ROM personality with DMA and MSI
+  quiesced. A supported APIF PCI host performs the isolated port reset after
+  ROM bootstrap. This binding does not authorize adopting an existing live
+  firmware session or releasing another owner's retained DART streams.
+
+properties:
+  compatible:
+    enum:
+      - pci106b,1900
+      - pci106b,1901
+
+  reg:
+    maxItems: 1
+    description: Standard five-cell PCI function address
+
+  firmware-name:
+    $ref: /schemas/types.yaml#/definitions/string
+    description: Personalized FTAB including the required per-device calibration
+
+  apple,centauri-platform-id:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Firmware chip ID in bits 15..0 and board ID in bits 30..16
+
+  apple,centauri-protocol:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    const: 27
+    description: Shared firmware wire protocol profile
+
+required:
+  - compatible
+  - reg
+  - firmware-name
+  - apple,centauri-platform-id
+  - apple,centauri-protocol
+
+additionalProperties: false

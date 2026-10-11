@@ -4366,6 +4366,14 @@ S:	Maintained
 F:	Documentation/devicetree/bindings/rtc/apple,abbey-pmu-rtc.yaml
 F:	drivers/rtc/rtc-apple-spmi-pmu.c
 
+AURORA N1 CENTAURI TRANSPORT
+M:	Dj <hey@djdev.me>
+L:	linux-wireless@vger.kernel.org
+S:	Maintained
+F:	Documentation/arch/arm64/aurora-apif-centauri.rst
+F:	Documentation/devicetree/bindings/net/wireless/apple,centauri.yaml
+F:	drivers/net/wireless/apple/
+
 AURORA PLATFORM MMIO INTERFACE
 M:	Dj <hey@djdev.me>
 S:	Maintained
