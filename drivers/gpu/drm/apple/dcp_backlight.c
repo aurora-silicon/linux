@@ -84,7 +84,7 @@ static u32 brightness_part2[] = {
 
 bool dcp_backlight_active(struct apple_dcp *dcp)
 {
-	return dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	return dcp->fw_compat >= DCP_FIRMWARE_H17P &&
 		dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 		READ_ONCE(dcp->backlight.state.ready);
 }
@@ -133,7 +133,7 @@ int dcp_backlight_configure(struct apple_dcp *dcp, u32 maximum,
 	unsigned long flags;
 	int ret;
 
-	if (dcp->fw_compat != DCP_FIRMWARE_H17P || !dcp_has_panel(dcp) ||
+	if (dcp->fw_compat < DCP_FIRMWARE_H17P || !dcp_has_panel(dcp) ||
 	    !dcp->crtc || !kick)
 		return -EINVAL;
 
@@ -364,7 +364,7 @@ int dcp_backlight_update(struct apple_dcp *dcp)
 		dcp_backlight_kick(dcp);
 		return 0;
 	}
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	if (dcp->fw_compat >= DCP_FIRMWARE_H17P &&
 	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 		return -ENODATA;
 
@@ -446,7 +446,7 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 		.scale = BACKLIGHT_SCALE_LINEAR,
 	};
 	props.max_brightness = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	if (dcp->fw_compat >= DCP_FIRMWARE_H17P &&
 	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 	    !dcp_backlight_active(dcp))
 		return -ENODATA;

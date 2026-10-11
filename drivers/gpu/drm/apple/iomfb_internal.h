@@ -112,3 +112,7 @@ void dcp_ack(struct apple_dcp *dcp, enum dcp_context_id context);
 /* The user may own drm_display_mode, so we need to search for our copy */
 struct dcp_display_mode *lookup_mode(struct apple_dcp *dcp,
 					    const struct drm_display_mode *mode);
+
+int dcp_push_nested(struct apple_dcp *dcp, enum dcp_context_id origin,
+		    const struct dcp_method_entry *call, u32 in_len, u32 out_len,
+		    void *data, dcp_callback_t cb, void *cookie);

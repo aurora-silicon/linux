@@ -9,10 +9,11 @@ ARM64 Architecture
 
     acpi_object_usage
     amu
-    aurora-apif
-    aurora-apif-nvme
-    aurora-apif-pcie
-    aurora-apif-pmp
+    ../../driver-api/firmware/aurora-apif
+    ../../driver-api/firmware/aurora-apif-nvme
+    ../../driver-api/firmware/aurora-apif-pcie
+    ../../driver-api/firmware/aurora-apif-pmp
+    ../../driver-api/firmware/aurora-apif-display
     aurora-apif-centauri
     apple-j813
     arm-acpi

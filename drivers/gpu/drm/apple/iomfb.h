@@ -15,6 +15,7 @@
 enum dcp_context_id {
 	/* Callback */
 	DCP_CONTEXT_CB = 0,
+	DCP_CONTEXT_ASYNC_CB = 1,
 
 	/* Command */
 	DCP_CONTEXT_CMD = 2,
@@ -24,6 +25,7 @@ enum dcp_context_id {
 
 	/* Out-of-band callback */
 	DCP_CONTEXT_OOBCB = 4,
+	DCP_CONTEXT_OOBASYNC_CB = 5,
 
 	/* Out-of-band command */
 	DCP_CONTEXT_OOBCMD = 6,
@@ -183,6 +185,8 @@ enum dcpep_method {
 	 * H17P pipe-configuration calls made before the first swap.  Most
 	 * names are unknown; they are identified by method number.
 	 */
+	dcpep_pipe_query_353,
+	dcpep_pipe_set_352,
 	dcpep_pipe_cfg_415,
 	dcpep_pipe_cfg_031,
 	dcpep_pipe_cfg_414,

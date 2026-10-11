@@ -735,6 +735,7 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 	int ret = 0;
 	struct iterator it;
 	bool parsed_unit = false;
+	bool explicit_unit = false;
 	bool parsed_name = false;
 	bool parsed_class = false;
 
@@ -782,10 +783,12 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 			else
 				parsed_class = true;
 		} else if (!strcmp(key, "EPICUnit") ||
-			   (h17p_keys && !strcmp(key, "interface-id"))) {
+			   (h17p_keys && !explicit_unit && !strcmp(key, "interface-id"))) {
 			ret = parse_int(it.handle, unit);
-			if (!ret)
+			if (!ret) {
 				parsed_unit = true;
+				explicit_unit |= !strcmp(key, "EPICUnit");
+			}
 		} else {
 			ret = skip(it.handle);
 		}

@@ -46,6 +46,10 @@ static int dcp_tx_offset(enum dcp_context_id id)
 	case DCP_CONTEXT_OOBCB:
 	case DCP_CONTEXT_OOBCMD:
 		return 0x08000;
+	case DCP_CONTEXT_ASYNC_CB:
+		return 0x20000;
+	case DCP_CONTEXT_OOBASYNC_CB:
+		return 0x28000;
 	default:
 		return -EINVAL;
 	}
@@ -54,8 +58,10 @@ static int dcp_tx_offset(enum dcp_context_id id)
 static int dcp_channel_offset(enum dcp_context_id id)
 {
 	switch (id) {
+	case DCP_CONTEXT_ASYNC_CB:
 	case DCP_CONTEXT_ASYNC:
 		return 0x40000;
+	case DCP_CONTEXT_OOBASYNC_CB:
 	case DCP_CONTEXT_OOBASYNC:
 		return 0x48000;
 	case DCP_CONTEXT_CB:
@@ -125,8 +131,10 @@ static struct dcp_channel *dcp_get_channel(struct apple_dcp *dcp,
 		return &dcp->ch_oobcb;
 	case DCP_CONTEXT_OOBCMD:
 		return &dcp->ch_oobcmd;
+	case DCP_CONTEXT_ASYNC_CB:
 	case DCP_CONTEXT_ASYNC:
 		return &dcp->ch_async;
+	case DCP_CONTEXT_OOBASYNC_CB:
 	case DCP_CONTEXT_OOBASYNC:
 		return &dcp->ch_oobasync;
 	default:
@@ -162,7 +170,7 @@ static u8 dcp_pop_depth(u8 *depth)
 /* Older firmware and the H17G method profile retain their existing transport. */
 static bool iomfb_uses_queue(struct apple_dcp *dcp)
 {
-	return dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	return dcp->fw_compat >= DCP_FIRMWARE_H17P &&
 	       dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G;
 }
 
@@ -193,7 +201,8 @@ static int iomfb_enqueue_opaque_x(struct apple_dcp *dcp)
 	struct iomfb_opaque_x_transaction *opaque;
 
 	lockdep_assert_held(&dcp->iomfb.lock);
-	if (atomic_read(&dcp->iomfb.opaque_x_state) != IOMFB_OPAQUE_X_NEEDED)
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 ||
+	    atomic_read(&dcp->iomfb.opaque_x_state) != IOMFB_OPAQUE_X_NEEDED)
 		return 0;
 	if (dcp->iomfb.queued >= 32)
 		return -EBUSY;
@@ -560,21 +569,14 @@ static int iomfb_queue_command(struct apple_dcp *dcp, bool oob,
 }
 
 /* Call a DCP function given by a tag */
-void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *call,
-		     u32 in_len, u32 out_len, void *data, dcp_callback_t cb,
-		     void *cookie)
+static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
+			     const struct dcp_method_entry *call, u32 in_len,
+			     u32 out_len, void *data, dcp_callback_t cb, void *cookie)
 {
 	struct dcp_method_entry resolved = *call;
 
-	/* Reply chains stay on the serialized receiver; callers enqueue copies. */
-	if (iomfb_uses_queue(dcp) && READ_ONCE(dcp->iomfb.owner) != current) {
-		if (iomfb_queue_command(dcp, oob, call, in_len, out_len,
-					data, cb, cookie))
-			WRITE_ONCE(dcp->crashed, true);
-		return;
-	}
 
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P && READ_ONCE(dcp->crashed))
+	if (dcp->fw_compat >= DCP_FIRMWARE_H17P && READ_ONCE(dcp->crashed))
 		return;
 
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G &&
@@ -582,7 +584,6 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 		memcpy(resolved.tag, call->tag_h17g, sizeof(resolved.tag));
 	call = &resolved;
 
-	enum dcp_context_id context = dcp_call_context(dcp, oob);
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 
 	struct dcp_packet_header header = {
@@ -634,6 +635,54 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 
 	dcp_send_message(dcp, IOMFB_ENDPOINT,
 			 dcpep_msg(context, data_len, offset));
+}
+
+void dcp_push(struct apple_dcp *dcp, bool oob,
+	      const struct dcp_method_entry *call, u32 in_len, u32 out_len,
+	      void *data, dcp_callback_t cb, void *cookie)
+{
+	/* Reply chains stay on the serialized receiver; callers enqueue copies. */
+	if (iomfb_uses_queue(dcp) && READ_ONCE(dcp->iomfb.owner) != current) {
+		if (iomfb_queue_command(dcp, oob, call, in_len, out_len,
+					data, cb, cookie))
+			WRITE_ONCE(dcp->crashed, true);
+		return;
+	}
+
+	dcp_push_context(dcp, dcp_call_context(dcp, oob), call,
+			 in_len, out_len, data, cb, cookie);
+}
+
+/* A nested query must return on the firmware-initiated stream it answers. */
+int dcp_push_nested(struct apple_dcp *dcp, enum dcp_context_id origin,
+		    const struct dcp_method_entry *call, u32 in_len, u32 out_len,
+		    void *data, dcp_callback_t cb, void *cookie)
+{
+	enum dcp_context_id context;
+	struct dcp_channel *ch;
+
+	if (READ_ONCE(dcp->iomfb.owner) != current || READ_ONCE(dcp->crashed))
+		return -ESHUTDOWN;
+	switch (origin) {
+	case DCP_CONTEXT_CB:
+	case DCP_CONTEXT_OOBCB:
+		context = origin;
+		break;
+	case DCP_CONTEXT_ASYNC:
+		context = DCP_CONTEXT_ASYNC_CB;
+		break;
+	case DCP_CONTEXT_OOBASYNC:
+		context = DCP_CONTEXT_OOBASYNC_CB;
+		break;
+	default:
+		return -EINVAL;
+	}
+	ch = dcp_get_channel(dcp, context);
+	if (!ch || !ch->depth || ch->depth >= DCP_MAX_CALL_DEPTH ||
+	    (u64)sizeof(struct dcp_packet_header) + in_len + out_len > 0x8000)
+		return -EINVAL;
+	dcp_push_context(dcp, context, call, in_len, out_len, data, cb, cookie);
+	return READ_ONCE(dcp->crashed) ? -EPROTO : 0;
 }
 
 /* Parse a callback tag "D123" into the ID 123. Returns -EINVAL on failure. */
@@ -781,7 +830,7 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	u8 depth;
 	bool handled;
 
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	if (dcp->fw_compat >= DCP_FIRMWARE_H17P &&
 	    (length < sizeof(*hdr) || !ch || ch->depth >= DCP_MAX_CALL_DEPTH ||
 	     offset >= 0x8000 || length > 0x8000 - offset)) {
 		dev_err(dev, "invalid IOMFB callback envelope\n");
@@ -792,12 +841,14 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	tag = dcp_parse_tag(hdr->tag);
 	handled = tag >= 0 && tag < IOMFB_MAX_CB && dcp->cb_handlers &&
 		  dcp->cb_handlers[tag];
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	if (dcp->fw_compat >= DCP_FIRMWARE_H17P &&
 	    (tag < 0 || tag >= IOMFB_MAX_CB ||
 	     (u64)sizeof(*hdr) + hdr->in_len + hdr->out_len != length ||
 	     (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 	      handled &&
-	      !iomfb_check_callback_h17p(dcp, tag, hdr->in_len, hdr->out_len)))) {
+	      !(dcp->fw_compat == DCP_FIRMWARE_V_27_0 ?
+		iomfb_v27_callback_size_valid(tag, hdr->in_len, hdr->out_len) :
+		iomfb_check_callback_h17p(dcp, tag, hdr->in_len, hdr->out_len))))) {
 		dev_err(dev, "unqualified IOMFB callback %d (%u, %u)\n",
 			tag, hdr->in_len, hdr->out_len);
 		dcp->crashed = true;
@@ -817,7 +868,7 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 		 * waits for the ack forever and the outer call never returns.
 		 * On H17P answer it with a zeroed output instead.
 		 */
-		if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+		if (dcp->fw_compat >= DCP_FIRMWARE_H17P) {
 			if (hdr->out_len)
 				memset(out, 0, hdr->out_len);
 			depth = dcp_push_depth(&ch->depth);
@@ -883,7 +934,7 @@ static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context)
 	 * its output cannot be trusted.  The tag is left out of the check: it
 	 * has only been seen preserved on 13.5 firmware.
 	 */
-	if (dcp->fw_compat != DCP_FIRMWARE_H17P) {
+	if (dcp->fw_compat < DCP_FIRMWARE_H17P) {
 		record = out - sent->in_len - sizeof(*record);
 		if (record->in_len != sent->in_len ||
 		    record->out_len != sent->out_len) {
@@ -1096,6 +1147,9 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	case DCP_FIRMWARE_H17P:
 		ret = iomfb_modeset_h17p(dcp, crtc_state);
 		break;
+	case DCP_FIRMWARE_V_27_0:
+		ret = iomfb_modeset_v27(dcp, crtc_state);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n",
 			  dcp->fw_compat);
@@ -1286,8 +1340,9 @@ bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
 		if (transaction->brightness_only)
 			return false;
 	}
-	atomic_cmpxchg(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_WAITING,
-		       IOMFB_OPAQUE_X_NEEDED);
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0)
+		atomic_cmpxchg(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_WAITING,
+			       IOMFB_OPAQUE_X_NEEDED);
 	iomfb_scanout_complete_h17p(dcp);
 	return true;
 }
@@ -1308,7 +1363,10 @@ static void iomfb_backlight_start(struct apple_dcp *dcp,
 		return;
 
 	dcp->swap.h17p = scanout->request;
-	iomfb_present_backlight_h17p(dcp);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+		iomfb_present_backlight_v27(dcp);
+	else
+		iomfb_present_backlight_h17p(dcp);
 }
 
 static void iomfb_backlight_release(struct iomfb_transaction *transaction)
@@ -1365,7 +1423,10 @@ static void iomfb_atomic_start(struct apple_dcp *dcp,
 		return;
 	}
 	dcp->iomfb.next_scanout = atomic->scanout;
-	iomfb_flush_h17p(dcp, atomic->crtc, atomic->state);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+		iomfb_flush_v27(dcp, atomic->crtc, atomic->state);
+	else
+		iomfb_flush_h17p(dcp, atomic->crtc, atomic->state);
 }
 
 static void iomfb_atomic_release(struct iomfb_transaction *transaction)
@@ -1453,6 +1514,9 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 	case DCP_FIRMWARE_H17P:
 		iomfb_flush_h17p(dcp, crtc, state);
 		break;
+	case DCP_FIRMWARE_V_27_0:
+		iomfb_flush_v27(dcp, crtc, state);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -1470,6 +1534,9 @@ static void iomfb_start(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_H17P:
 		iomfb_start_h17p(dcp);
+		break;
+	case DCP_FIRMWARE_V_27_0:
+		iomfb_start_v27(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -1546,7 +1613,7 @@ int iomfb_start_rtkit(struct apple_dcp *dcp)
 	 * has nothing answering it on the AP side, and without this one the
 	 * display DART faults.
 	 */
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+	if (dcp->fw_compat >= DCP_FIRMWARE_H17P) {
 		ret = apple_rtkit_start_ep(dcp->rtk, REMOTE_ALLOC_ENDPOINT);
 		if (ret)
 			return ret;
@@ -1580,6 +1647,9 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_H17P:
 		iomfb_shutdown_h17p(dcp);
+		break;
+	case DCP_FIRMWARE_V_27_0:
+		iomfb_shutdown_v27(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);

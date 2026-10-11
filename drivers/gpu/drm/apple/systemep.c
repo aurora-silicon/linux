@@ -100,7 +100,7 @@ static int powerlog_report(struct apple_epic_service *service, enum epic_subtype
 
 	dev_dbg(dcp->dev, "systemep: mNits event: Nits: %u.%03u, iDAC: %u\n",
 		mnits.millinits / 1000, mnits.millinits % 1000, mnits.idac);
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	if (dcp->fw_compat >= DCP_FIRMWARE_H17P &&
 	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
 		if (!dcp_has_panel(dcp))
 			return 0;
