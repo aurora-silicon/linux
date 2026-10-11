@@ -316,6 +316,19 @@ config APPLE_DART
 
 	  Say Y here if you are using an Apple SoC.
 
+
+config APPLE_DART_APIF
+	bool "Apple DART over the Aurora platform interface"
+	depends on ARM64_16K_PAGES && OF
+	depends on ARCH_APPLE || COMPILE_TEST
+	select AURORA_APIF_MMIO
+	select IOMMU_API
+	help
+	  Apple DART backend for a trusted Linux guest under Aura and SPTM.
+	  Native mapping and retyping policy lives in Linux; the monitor
+	  provides call transport, frame ownership and bootstrap metadata.
+	  Existing raw-MMIO DART drivers continue to serve other systems.
+
 config APPLE_DART_KUNIT_TEST
 	bool "KUnit tests for Apple DART locked domains" if !KUNIT_ALL_TESTS
 	depends on APPLE_DART=y && KUNIT=y
