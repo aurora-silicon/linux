@@ -8,6 +8,7 @@
  */
 
 #include <linux/delay.h>
+#include <asm/apple-idle.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -43,17 +44,9 @@ void __delay(unsigned long cycles)
 {
 	cycles_t start = __delay_cycles();
 
-	/*
-	 * T8142 can clear registers on WFIT just as it does on WFI. A delay
-	 * may run with live kernel SIMD state, so the idle task's save/flush
-	 * path is not applicable here. Keep the core awake for short delays.
-	 */
-	if (IS_ENABLED(CONFIG_ARCH_APPLE)) {
-		u32 midr = read_cpuid_id() & MIDR_CPU_MODEL_MASK;
-
-		if (midr == MIDR_APPLE_T8142_E || midr == MIDR_APPLE_T8142_P)
-			goto counter_delay;
-	}
+	/* The idle task's SIMD save path does not apply to arbitrary delay callers. */
+	if (apple_wfi_needs_save())
+		goto counter_delay;
 
 	if (alternative_has_cap_unlikely(ARM64_HAS_WFXT)) {
 		u64 end = start + cycles;
