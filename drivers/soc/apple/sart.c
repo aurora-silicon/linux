@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT) AND GPL-2.0-only
 /*
  * Apple SART device driver
  * Copyright (C) The Asahi Linux Contributors
@@ -430,6 +430,6 @@ static struct platform_driver apple_sart_driver = {
 };
 module_platform_driver(apple_sart_driver);
 
-MODULE_LICENSE("Dual MIT/GPL");
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Sven Peter <sven@svenpeter.dev>");
 MODULE_DESCRIPTION("Apple SART driver");
