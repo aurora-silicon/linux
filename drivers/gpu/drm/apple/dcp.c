@@ -3502,6 +3502,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		afk_quiesce(dcp->systemep);
 		afk_quiesce(dcp->dcpavservep);
 		cancel_delayed_work_sync(&dcp->bl_fallback_wq);
+		dcp_backlight_stop(dcp);
 		if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
 			cancel_work_sync(&dcp->bl_register_wq);
 			cancel_work_sync(&dcp->bl_update_wq);
@@ -3557,6 +3558,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	dcp_release_piodma_iommu_dev(dcp);
 
 	cancel_delayed_work_sync(&dcp->bl_fallback_wq);
+	dcp_backlight_stop(dcp);
 	if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
 		cancel_work_sync(&dcp->bl_register_wq);
 		cancel_work_sync(&dcp->bl_update_wq);
@@ -3616,7 +3618,9 @@ static int dcp_platform_probe(struct platform_device *pdev)
 
 	INIT_LIST_HEAD(&dcp->swapped_out_fbs);
 	mutex_init(&dcp->swapped_out_fbs_lock);
-	spin_lock_init(&dcp->backlight.lock);
+	ret = dcp_backlight_init(dcp, dev);
+	if (ret)
+		return ret;
 	iomfb_queue_init(dcp);
 
 	dcp->fw_compat = fw_compat;
@@ -3816,6 +3820,7 @@ static void dcp_platform_shutdown(struct platform_device *pdev)
 		 */
 		iomfb_queue_stop(dcp);
 		cancel_delayed_work_sync(&dcp->bl_fallback_wq);
+		dcp_backlight_stop(dcp);
 		cancel_work_sync(&dcp->bl_register_wq);
 		cancel_work_sync(&dcp->bl_update_wq);
 		return;
@@ -3841,8 +3846,11 @@ static void dcp_drain_for_sleep(struct apple_dcp *dcp)
 	 * A completed present can schedule one more brightness present, and a
 	 * rejected one a delayed retry; run a pending retry now instead of
 	 * letting it fire after the mailbox has suspended.  Four passes cover
-	 * the first attempt and the policy's three retries.
+	 * the first attempt and the policy's three retries.  A fade still
+	 * running ends at its target first.
 	 */
+	if (dcp_has_panel(dcp))
+		dcp_backlight_finish_fade(dcp);
 	for (pass = 0; pass < 4; pass++) {
 		flush_delayed_work(&dcp->iomfb.backlight_retry);
 		if (dcp_has_panel(dcp))
