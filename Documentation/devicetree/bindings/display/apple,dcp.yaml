@@ -25,6 +25,7 @@ properties:
               - apple,t6020-dcp
               - apple,t8140-dcp
               - apple,t8142-dcp
+              - apple,t6050-dcp
           - const: apple,dcp
       - items:
           - enum:
@@ -32,6 +33,7 @@ properties:
               - apple,t8112-dcpext
               - apple,t6000-dcpext
               - apple,t6020-dcpext
+              - apple,t6050-dcpext
           - const: apple,dcpext
       - items:
           - const: apple,t8140-dcpext
@@ -70,13 +72,32 @@ properties:
 
   clocks:
     minItems: 1
-    maxItems: 2
+    maxItems: 64
 
   clock-names:
     minItems: 1
-    items:
-      - const: clock-154
-      - const: clock-194
+    maxItems: 64
+
+  apple,clock-ids:
+    oneOf:
+      - type: boolean
+      - $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 1
+        maxItems: 64
+    description: |
+      Ordered firmware provider clock identifiers. Callback clock indices
+      select the corresponding entry in clocks. An explicitly empty table
+      is allowed when the provider has no clocks.
+
+  apple,firmware-physical-regs:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 1
+    maxItems: 10
+    description: |
+      Coprocessor physical base addresses in display register-table order,
+      including the bandwidth scratch and optional doorbell windows.
+      The number of entries must match the complete register table.
+      Omit on identity-mapped systems; reg supplies the physical view.
 
   memory-region:
     minItems: 1
@@ -316,11 +337,38 @@ required:
 
 allOf:
   - if:
+      properties:
+        compatible:
+          contains:
+            enum: ['apple,t6050-dcp', 'apple,t6050-dcpext']
+    then:
+      required:
+        - apple,clock-ids
+        - memory-region
+        - memory-region-names
+        - apple,firmware-compat
+      properties:
+        apple,firmware-compat:
+          items:
+            - const: 27
+            - const: 0
+            - const: 0
+    else:
+      properties:
+        clocks:
+          maxItems: 2
+        clock-names:
+          items:
+            - const: clock-154
+            - const: clock-194
+        apple,clock-ids: false
+        apple,firmware-physical-regs: false
+  - if:
       not:
         properties:
           compatible:
             contains:
-              const: apple,t8140-dcp
+              enum: ['apple,t8140-dcp', 'apple,t6050-dcp', 'apple,t6050-dcpext']
     then:
       properties:
         apple,power-lut-data-x: false
@@ -332,7 +380,8 @@ allOf:
       properties:
         compatible:
           contains:
-            enum: ['apple,t8140-dcp', 'apple,t8140-dcpext']
+            enum: ['apple,t8140-dcp', 'apple,t8140-dcpext',
+                   'apple,t6050-dcp', 'apple,t6050-dcpext']
     then:
       properties:
         resets: false
