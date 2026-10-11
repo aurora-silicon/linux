@@ -2719,6 +2719,7 @@ impl SepData {
             return Err(ENODEV);
         }
         let mut session = self.bio_session.lock();
+        self.wait_for_worker_exit(&mut session, true)?;
         bio::open(&mut session)?;
         drop(session);
         if let Err(e) = self.prepare_bio_open() {
@@ -2755,6 +2756,45 @@ impl SepData {
 
     pub(crate) fn capture_end(&self) {
         self.captures_running.fetch_sub(1, Relaxed);
+    }
+
+    /// The enrol or verify work item `epoch` has stopped.
+    pub(crate) fn capture_worker_stopped(&self, epoch: u64) {
+        bio::worker_stopped(&mut self.bio_session.lock(), epoch);
+        self.worker_gone.notify_all();
+    }
+
+    /// Holds an open or a capture start while the last enrol or verify work
+    /// item is still on its way out. It reports its result before it stops,
+    /// and after a cancel or a close it stops only once the capture notices,
+    /// so an open or a start straight after either would be refused with
+    /// EBUSY, which the caller cannot tell from a device in use. If it has
+    /// not stopped in time, the caller refuses as before.
+    fn wait_for_worker_exit(
+        &self,
+        session: &mut MutexGuard<'_, bio::Session>,
+        opening: bool,
+    ) -> Result<()> {
+        let mut remaining = time::msecs_to_jiffies(WORKER_EXIT_WAIT_MS);
+        while bio::waiting_on_worker(session, opening) {
+            if self.shutting_down.load(Relaxed) {
+                return Err(ENODEV);
+            }
+            if remaining == 0 {
+                dev_warn!(
+                    self.dev,
+                    "Touch ID: the last capture had not stopped after {} ms\n",
+                    WORKER_EXIT_WAIT_MS
+                );
+                return Ok(());
+            }
+            match self.worker_gone.wait_interruptible_timeout(session, remaining) {
+                CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Timeout => remaining = 0,
+                CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
+            }
+        }
+        Ok(())
     }
 
     /// The system is about to suspend. End any capture in progress, hold new
@@ -2821,7 +2861,7 @@ impl SepData {
             .is_err()
         {
             this.finish_enrolment(Err(ENROL_STATUS_SENSOR));
-            bio::worker_stopped(&mut this.bio_session.lock(), epoch);
+            this.capture_worker_stopped(epoch);
         }
     }
 
@@ -2838,7 +2878,7 @@ impl SepData {
                 bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR),
                 [0u8; bio::TOKEN_LEN],
             );
-            bio::worker_stopped(&mut this.bio_session.lock(), epoch);
+            this.capture_worker_stopped(epoch);
         }
     }
 
@@ -2904,6 +2944,9 @@ impl SepData {
         let sensor_present = sensor::is_bound();
         let handled = {
             let mut session = self.bio_session.lock();
+            if bio::starts_capture(cmd) {
+                self.wait_for_worker_exit(&mut session, false)?;
+            }
             let index = self.bio_index.lock();
             let mut ctx = bio::Context {
                 session: &mut session,

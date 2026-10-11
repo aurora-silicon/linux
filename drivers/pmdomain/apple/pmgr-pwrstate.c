@@ -48,6 +48,7 @@ struct apple_pmgr_ps {
 	bool force_disable;
 	bool force_reset;
 	bool externally_clocked;
+	bool system_sleep;
 };
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
@@ -143,14 +144,62 @@ static bool apple_pmgr_ps_is_active(struct apple_pmgr_ps *ps)
 		 reg & APPLE_PMGR_AUTO_ENABLE));
 }
 
+/*
+ * genpd keeps a domain off when ->power_on() fails and on when ->power_off()
+ * fails. Follow a failed transition with the opposite one, so the domain is
+ * not left requesting a state genpd does not know it is in.
+ *
+ * The exception is a failed power-on in the noirq and syscore phases of a
+ * system sleep transition: genpd ignores the error there and records the
+ * domain as on. The PM core runs those phases after the suspend_late callback
+ * of every device and before any resume_early callback, so keep requesting
+ * the domain on between this device's two callbacks.
+ */
 static int apple_pmgr_ps_power_on(struct generic_pm_domain *genpd)
 {
-	return apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_ACTIVE, true);
+	struct apple_pmgr_ps *ps = genpd_to_apple_pmgr_ps(genpd);
+	int ret;
+
+	ret = apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_ACTIVE, true);
+	if (ret && !ps->system_sleep)
+		apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_PWRGATE, false);
+
+	return ret;
 }
 
 static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
 {
-	return apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_PWRGATE, false);
+	int ret;
+
+	ret = apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_PWRGATE, false);
+	if (ret)
+		apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_ACTIVE, true);
+
+	return ret;
+}
+
+static void apple_pmgr_ps_set_system_sleep(struct device *dev, bool sleep)
+{
+	struct apple_pmgr_ps *ps = dev_get_drvdata(dev);
+	unsigned long flags;
+
+	spin_lock_irqsave(&ps->genpd.slock, flags);
+	ps->system_sleep = sleep;
+	spin_unlock_irqrestore(&ps->genpd.slock, flags);
+}
+
+static int apple_pmgr_ps_suspend_late(struct device *dev)
+{
+	apple_pmgr_ps_set_system_sleep(dev, true);
+
+	return 0;
+}
+
+static int apple_pmgr_ps_resume_early(struct device *dev)
+{
+	apple_pmgr_ps_set_system_sleep(dev, false);
+
+	return 0;
 }
 
 static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned long id)
@@ -253,6 +302,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 
 	ps->dev = dev;
 	ps->regmap = regmap;
+	platform_set_drvdata(pdev, ps);
 
 	ret = of_property_read_string(node, "label", &name);
 	if (ret < 0) {
@@ -290,8 +340,13 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
 		if (!active) {
 			dev_warn(dev, "always-on domain %s is not on at boot\n", name);
-			/* Turn it on so pm_genpd_init does not fail */
-			active = apple_pmgr_ps_power_on(&ps->genpd) == 0;
+			/*
+			 * Turn it on so pm_genpd_init does not fail. genpd never
+			 * powers an always-on domain, so keep requesting it on
+			 * even if it does not get there in time.
+			 */
+			active = apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_ACTIVE,
+						   true) == 0;
 		}
 	} else if (active) {
 		ps->genpd.flags |= GENPD_FLAG_DEFER_OFF | GENPD_FLAG_ACTIVE_WAKEUP;
@@ -366,11 +421,16 @@ static const struct of_device_id apple_pmgr_ps_of_match[] = {
 
 MODULE_DEVICE_TABLE(of, apple_pmgr_ps_of_match);
 
+static const struct dev_pm_ops apple_pmgr_ps_pm_ops = {
+	LATE_SYSTEM_SLEEP_PM_OPS(apple_pmgr_ps_suspend_late, apple_pmgr_ps_resume_early)
+};
+
 static struct platform_driver apple_pmgr_ps_driver = {
 	.probe = apple_pmgr_ps_probe,
 	.driver = {
 		.name = "apple-pmgr-pwrstate",
 		.of_match_table = apple_pmgr_ps_of_match,
+		.pm = pm_sleep_ptr(&apple_pmgr_ps_pm_ops),
 	},
 };
 

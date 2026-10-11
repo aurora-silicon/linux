@@ -1,0 +1,44 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Bring Touch ID up before anyone asks for a fingerprint. The first open of
+# /dev/sep-bio activates it: the driver restores the enrolled fingerprints
+# from the enclave and returns only when that is done. Opened here at boot,
+# ahead of fprintd, the restore no longer delays the first fingerprint
+# request. A failure is only logged.
+set -u
+
+dev=/dev/sep-bio
+
+log() {
+    echo "aurora-sep-ready: $*" >&2
+}
+
+uptime_s() {
+    read -r up _ </proc/uptime
+    echo "${up%%.*}"
+}
+
+if [ ! -c "$dev" ]; then
+    log "$dev is not there; Touch ID is not available this boot"
+    exit 0
+fi
+
+start=$(uptime_s)
+while :; do
+    # Read-only: the driver does not mind, and a redirection that may write
+    # would create a file if the device went away.
+    if err=$(LC_ALL=C sh -c 'exec 3<"$1"' sh "$dev" 2>&1); then
+        log "Touch ID is ready after $(($(uptime_s) - start)) s"
+        exit 0
+    fi
+    case "$err" in
+        # Another opener is activating it or using it; the unit's start
+        # timeout bounds this.
+        *[Bb]usy*) sleep 0.2 ;;
+        *)
+            log "could not open $dev: ${err##*: }"
+            exit 0
+            ;;
+    esac
+done

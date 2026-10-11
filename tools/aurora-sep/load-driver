@@ -4,6 +4,34 @@ set -eu
 keybag=/var/lib/aurora-sep-keybag.bin
 refkey=/var/lib/aurora-sep-refkey.bin
 
+# Seconds to wait for the enclave to seal and unseal a trusted key, then for
+# /dev/sep-bio. On J700 the key store arrives around 43 s after boot, and the
+# driver waits up to 90 s for it before it brings Touch ID up, so the first
+# wait has to outlast that. Set either in the environment, for example with a
+# drop-in for aurora-sep.service.
+ready_timeout=${AURORA_SEP_READY_TIMEOUT:-120}
+device_timeout=${AURORA_SEP_DEVICE_TIMEOUT:-60}
+
+log() {
+    echo "aurora-sep-load: $*" >&2
+}
+
+for budget in "$ready_timeout" "$device_timeout"; do
+    case "$budget" in
+        '' | *[!0-9]*)
+            log "timeouts must be whole seconds, not '$budget'"
+            exit 2
+            ;;
+    esac
+done
+
+# Seconds since boot. Unlike the wall clock it cannot jump when the time is
+# first synchronised during boot.
+uptime_s() {
+    read -r up _ </proc/uptime
+    echo "${up%%.*}"
+}
+
 # An SSH/sudo caller cannot change its parent's session keyring with
 # `keyctl new_session`. Run the whole probe in a child keyring instead; the
 # marker prevents re-exec recursion and the keyring dies with this process.
@@ -21,9 +49,10 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-attempts=300
+start=$(uptime_s)
+deadline=$((start + ready_timeout))
 verified=false
-while [ "$attempts" -gt 0 ]; do
+while :; do
     key_id=$(printf 'new 32' | keyctl padd trusted aurora-sep-check @s 2>/dev/null || true)
     if [ -n "$key_id" ]; then
         if keyctl pipe "$key_id" >"$work/sealed"; then
@@ -37,17 +66,27 @@ while [ "$attempts" -gt 0 ]; do
         keyctl revoke "$key_id" >/dev/null 2>&1 || true
     fi
     [ "$verified" = true ] && break
+    [ "$(uptime_s)" -lt "$deadline" ] || break
     sleep 0.1
-    attempts=$((attempts - 1))
 done
 
-[ "$verified" = true ] || exit 1
-[ -s "$keybag" ] || exit 1
-[ -s "$refkey" ] || exit 1
+if [ "$verified" != true ]; then
+    log "the enclave did not seal and unseal a trusted key within ${ready_timeout} s"
+    exit 1
+fi
+log "trusted keys work after $(($(uptime_s) - start)) s"
 
-attempts=300
-while [ "$attempts" -gt 0 ] && [ ! -c /dev/sep-bio ]; do
+if [ ! -s "$keybag" ] || [ ! -s "$refkey" ]; then
+    log "$keybag or $refkey is missing or empty"
+    exit 1
+fi
+
+deadline=$(($(uptime_s) + device_timeout))
+while [ ! -c /dev/sep-bio ] && [ "$(uptime_s)" -lt "$deadline" ]; do
     sleep 0.1
-    attempts=$((attempts - 1))
 done
-[ -c /dev/sep-bio ] || exit 1
+if [ ! -c /dev/sep-bio ]; then
+    log "/dev/sep-bio did not appear within ${device_timeout} s"
+    exit 1
+fi
+log "/dev/sep-bio is ready after $(($(uptime_s) - start)) s"

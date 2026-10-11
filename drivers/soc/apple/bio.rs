@@ -846,6 +846,13 @@ pub(crate) fn worker_stopped(session: &mut Session, epoch: u64) {
     }
 }
 
+/// Whether an open (`opening`) or a capture start by the current opener would
+/// be refused only because the last enrol or verify work item has not stopped
+/// yet, although its operation has ended or its opener has gone.
+pub(crate) fn waiting_on_worker(session: &Session, opening: bool) -> bool {
+    session.worker_epoch.is_some() && session.op.may_start() && session.open != opening
+}
+
 fn verify_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     let mut out = VerifyPoll::default();
     // Spend the token only after the copy to user succeeds; a fault must not lose a match.

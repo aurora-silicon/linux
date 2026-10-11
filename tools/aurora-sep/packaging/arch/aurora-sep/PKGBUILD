@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# The loader and desktop integration for the Apple SEP fingerprint driver.
+# The local sources are links into tools/aurora-sep; after changing any of
+# them, run updpkgsums here. libfprint with the aurora driver comes from
+# https://github.com/aurora-silicon/aurora-sep-userspace.
+
+pkgname=aurora-sep
+pkgver=1
+pkgrel=3
+pkgdesc="Loader and desktop integration for the Apple SEP (Touch ID) driver"
+url="https://github.com/aurora-silicon/linux/tree/aurora-wip/tools/aurora-sep"
+arch=(any)
+license=(GPL-2.0-only)
+depends=(
+  coreutils
+  fprintd
+  keyutils
+  kmod
+  sh
+)
+optdepends=('glib2-devel: fingerprint at the GNOME login screen')
+source=(load-driver
+        aurora-sep.service
+        fprintd-aurora.conf
+        aurora-sep-ready
+        aurora-sep-ready.service
+        fprintd-no-timeout.conf.in
+        logind-aurora-sep.conf
+        aurora-sep-greeter-fingerprint
+        aurora-sep-greeter-fingerprint.service
+        README.md
+        XART-SAFETY.md)
+sha256sums=('abea60bb264ced349f7cf671d8d26e1609a81a60ea4c34d66ec6f7f73b847dbb'
+            '447f99cc3c7e683134f31b993aa825fadde24e4854954a3035c96e6631d4d4d0'
+            'f8d0c4b9385e6716d5ac5dd9941a57459fbc551a8238383bcde36cd929d0523f'
+            '2db07d3a0191e8d14581a3056505a8c4225b2fc8e6ea4a1956ae5493abcbb0ae'
+            '5a5e5c7e93d1462d9d1023446fdb297926aeb93d8988867b515aca7adafe4487'
+            '8d8df0ba2a6861b2edb2110e606906d84ca4848617621ad3cb48493a1522971d'
+            '0695bd9ce4c207241db13c3ea07819a032d8213417021378f5015ab9317cde12'
+            '5936eb76db666496a8700dade7ac6bcb3785b517958dcea10685690f1822c86f'
+            'ffab97b20bfd5f0eb1ab641179a131843349cf16890fff0cf2d893f0b5681b37'
+            'd7a09f31367c181a2cbda63cd58104d6117136fb5db5b20f4a3996ea3af7025e'
+            '83ae33b34d4f4ff42be7ba22b6d5557c3c5776075753ea288bef986645687f23')
+
+# A unit and the helper it runs ($1, installed as $3), pointed at the
+# packaged helper.
+_unit() {
+  local unit="$pkgdir/usr/lib/systemd/system/$2"
+
+  install -Dm755 "$1" "$pkgdir/usr/lib/aurora-sep/$3"
+  install -Dm644 "$2" "$unit"
+  sed -i "s|^\(Exec[A-Za-z]*=\)/usr/local/sbin/$3|\1/usr/lib/aurora-sep/$3|" "$unit"
+  if grep -q /usr/local "$unit"; then
+    return 1
+  fi
+}
+
+package() {
+  _unit load-driver aurora-sep.service aurora-sep-load
+  _unit aurora-sep-ready aurora-sep-ready.service aurora-sep-ready
+  _unit aurora-sep-greeter-fingerprint aurora-sep-greeter-fingerprint.service \
+    aurora-sep-greeter-fingerprint
+
+  install -Dm644 fprintd-aurora.conf \
+    "$pkgdir/usr/lib/systemd/system/fprintd.service.d/aurora-sep.conf"
+  grep -qx 'ExecStart=/usr/lib/fprintd' /usr/lib/systemd/system/fprintd.service
+  sed 's|@FPRINTD@|/usr/lib/fprintd|' fprintd-no-timeout.conf.in \
+    >"$pkgdir/usr/lib/systemd/system/fprintd.service.d/50-aurora-sep-no-timeout.conf"
+  install -Dm644 logind-aurora-sep.conf \
+    "$pkgdir/usr/lib/systemd/logind.conf.d/50-aurora-sep.conf"
+  install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname" README.md XART-SAFETY.md
+}

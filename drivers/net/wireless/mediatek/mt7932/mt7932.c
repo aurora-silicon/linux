@@ -241,12 +241,17 @@ static void mt_rx_drain(struct mt7932 *m, struct mt7932_ring *q)
 		if (READ_ONCE(m->ram_config) && length >= 33 && length <= MT7932_RX_CAPACITY) {
 			u8 *packet = q->buffers + q->tail * RX_STRIDE;
 
-			/* Source-specific RAM-config acknowledgment before RX0 refill. */
+			/*
+			 * Source-specific RAM-config acknowledgment before RX0
+			 * refill. mt_service() has already acknowledged this
+			 * pass's causes, RX0 (bit 0) included, and restores the
+			 * mask once every ring is drained. Leave bit 0 alone, so
+			 * that an RX0 completion arriving now keeps its status,
+			 * and leave the mask alone while the rings are serviced.
+			 */
 			if (q == &m->rx[0] && packet[28] == 1 && packet[29] == m->waiting &&
 			    !packet[30] && packet[32] == 1) {
-				mt_write(m, W + 0x204, 0);
-				mt_write(m, W + 0x200, 0x0c000001);
-				mt_write(m, W + 0x204, poll_test ? 0 : IRQ_MASK);
+				mt_write(m, W + 0x200, 0x0c000000);
 				mt_write(m, W + 0x1f4, 0xffff);
 			}
 		}

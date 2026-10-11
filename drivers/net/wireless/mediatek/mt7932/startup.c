@@ -436,6 +436,14 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 	WRITE_ONCE(m->reg_pending, true);
 	if (m->netdev) {
 		netif_stop_queue(m->netdev);
+		/* The stop can land in the middle of a burst: hand the device the
+		 * TX0 descriptors already published behind the doorbell.
+		 */
+		if (READ_ONCE(m->data_ready)) {
+			spin_lock(&m->data_lock);
+			mt_data_kick_locked(m);
+			spin_unlock(&m->data_lock);
+		}
 		if (m->connecting) {
 			m->connect_error = -ECANCELED;
 			complete(&m->assoc_start);

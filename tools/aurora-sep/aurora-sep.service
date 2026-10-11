@@ -2,6 +2,8 @@
 Description=Aurora SEP services
 After=local-fs.target
 RequiresMountsFor=/var/lib
+# Activate Touch ID as soon as the driver is up.
+Wants=aurora-sep-ready.service
 
 [Service]
 Type=oneshot

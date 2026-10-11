@@ -224,8 +224,12 @@ static int mt_retire_connection(struct mt7932 *m)
 		return -ESHUTDOWN;
 	netif_carrier_off(m->netdev);
 	netif_tx_disable(m->netdev);
-	/* ndo_start_xmit rechecks the closed admission gate under data_lock. */
+	/* ndo_start_xmit rechecks the closed admission gate under data_lock.
+	 * The queue may have stopped in the middle of a burst; hand the device
+	 * what it already holds so that the drain below can complete.
+	 */
 	spin_lock_irqsave(&m->data_lock, flags);
+	mt_data_kick_locked(m);
 	spin_unlock_irqrestore(&m->data_lock, flags);
 	flush_work(&m->cal_work);
 	mutex_lock(&m->command_mutex);

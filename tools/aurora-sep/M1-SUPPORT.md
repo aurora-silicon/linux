@@ -75,8 +75,8 @@ capture-guidance fixes that the older J313 test checkout did not contain.
 Build/test results for this consolidation are not a new hardware regression
 test on Neo, M2, or every M1 board. The consolidated SEP module compiled against
 the prepared J313 kernel build. Its four identity-binding tests, ten extracted
-entropy-method tests, and eight calibration/xART tests passed. The bundled
-patch applied to clean libfprint 1.94.100 and built with `drivers=aurora`;
+entropy-method tests, and eight calibration/xART tests passed. The libfprint
+patch (now maintained in aurora-silicon/aurora-sep-userspace) applied to clean libfprint 1.94.100 and built with `drivers=aurora`;
 the three core unit-test suites passed. In that minimal build, 33 unrelated
 driver/hwdb tests were skipped and AppStream validation rejected the generated
 empty `<provides>` device list. No full-kernel rebuild or new hardware run of

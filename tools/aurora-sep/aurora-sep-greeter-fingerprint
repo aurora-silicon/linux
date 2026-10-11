@@ -1,0 +1,85 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Offer fingerprint at the GNOME login screen, or with "stop", stop offering
+# it from the next time the login screen starts.
+#
+# GNOME Shell 51 connects the fingerprint reader only when it re-authenticates
+# a session that is already running, which is the lock screen. The login
+# screen never offers fingerprint, whatever org.gnome.login-screen says: a
+# fingerprint cannot unlock the login keyring, so a session started with one
+# asks for the password the first time an application wants a stored secret.
+#
+# This takes the greeter source file that holds that check from the installed
+# GNOME Shell, drops the check, and serves the copy to the login screen's
+# shell alone through a GResource overlay. When the check is not exactly as
+# expected, for example after a GNOME update, it changes nothing and the login
+# screen stays as GNOME ships it. Run it before the display manager starts.
+set -eu
+
+res=/org/gnome/shell/gdm/authServicesLegacy.js
+out=/run/aurora-sep/greeter
+dropin=/run/systemd/user/org.gnome.Shell@gdm.service.d/aurora-sep-fingerprint.conf
+
+log() {
+    echo "aurora-sep-greeter-fingerprint: $*" >&2
+}
+
+rm -rf "$out" "$dropin"
+[ "${1:-}" != stop ] || exit 0
+
+if ! command -v gresource >/dev/null; then
+    log "gresource is not installed (it comes with glib2-devel); the login screen stays as it is"
+    exit 0
+fi
+
+lib=
+for f in /usr/lib64/gnome-shell/libshell-*.so /usr/lib/gnome-shell/libshell-*.so \
+         /usr/lib/*/gnome-shell/libshell-*.so; do
+    [ -f "$f" ] || continue
+    if gresource list "$f" 2>/dev/null | grep -qxF "$res"; then
+        lib=$f
+        break
+    fi
+done
+if [ -z "$lib" ]; then
+    log "no installed GNOME Shell carries $res; the login screen stays as it is"
+    exit 0
+fi
+
+install -d -m 0755 "$out"
+gresource extract "$lib" "$res" >"$out/stock.js"
+if ! awk '
+    state == 0 && $0 == "    _connectFingerprintManager() {" {
+        print
+        state = 1
+        next
+    }
+    state == 1 {
+        if ($0 == "        if (!this._reauthOnly)") {
+            state = 2
+            next
+        }
+        state = 9
+    }
+    state == 2 {
+        if ($0 == "            return;") {
+            state = 3
+            next
+        }
+        state = 9
+    }
+    { print }
+    END { exit state != 3 }
+' "$out/stock.js" >"$out/authServicesLegacy.js"; then
+    log "$lib does not have the expected check; the login screen stays as it is"
+    rm -rf "$out"
+    exit 0
+fi
+rm -f "$out/stock.js"
+chmod 0644 "$out/authServicesLegacy.js"
+
+install -d -m 0755 "${dropin%/*}"
+printf '[Service]\nEnvironment=G_RESOURCE_OVERLAYS=%s=%s\n' \
+    "$res" "$out/authServicesLegacy.js" >"$dropin"
+log "the login screen offers fingerprint ($res from $lib)"
