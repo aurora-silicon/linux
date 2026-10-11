@@ -5,6 +5,7 @@ Linux Firmware API
 .. toctree::
 
    aurora-apif
+   aurora-apif-nvme
    introduction
    core
    efi/index

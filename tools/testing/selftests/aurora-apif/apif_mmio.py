@@ -53,6 +53,7 @@ typedef uintptr_t phys_addr_t;
 #define IOMMU_NOEXEC 8
 #define IOMMU_MMIO 16
 #define GENMASK_ULL(h,l) ((~0ULL << (l)) & (~0ULL >> (63-(h))))
+#define IS_REACHABLE(x) 1
 #define GFP_ATOMIC 0
 #define kmalloc(n,flags) malloc(n)
 #define virt_to_phys(p) ((u64)(uintptr_t)(p))
@@ -268,12 +269,83 @@ int main(void)
 '''
 
 
+def nvme_test():
+    helpers = "\n".join(function("drivers/nvme/host/apple-apif.h", name) for name in
+                         ["apple_nvme_apif_translate", "apple_nvme_apif_request"])
+    return HEADER + r'''
+#define SZ_4K 4096UL
+#define APPLE_NVME_APIF_PAGES 257
+#define APPLE_NVME_APIF_LIST_SIZE SZ_4K
+#define DIV_ROUND_UP(n,d) (((n)+(d)-1)/(d))
+#define IS_ALIGNED(n,a) (!((n)&((a)-1)))
+#define lockdep_assert_held(p) ((void)(p))
+#define dma_wmb() ((void)0)
+#define cpu_to_le16(v) (v)
+#define le64_to_cpu(v) (v)
+typedef uint64_t __le64;
+struct command { struct { struct {u64 prp1, prp2;} dptr; u32 command_id; } common; };
+struct apple_nvmmu_tcb { u32 pad; unsigned short length; char rest[122]; };
+struct apple_nvme_iod { struct command cmd; bool apif_registered; __le64 *prps; };
+struct request { struct apple_nvme_iod iod; u32 bytes; };
+struct apple_nvme_hw { u32 max_queue_depth; };
+struct apple_nvme { void *dev; int lock; struct aurora_apif *apif; struct apple_nvme_hw *hw;
+    struct aurora_apif_op *apif_ops; void *apif_scratch; u64 apif_scratch_dma; bool apif_uncertain; };
+struct apple_nvme_queue { struct apple_nvme *anv; bool is_adminq; struct apple_nvmmu_tcb tcbs[64]; };
+static struct apple_nvme *queue_to_apple_nvme(struct apple_nvme_queue *q) {return q->anv;}
+static struct apple_nvme_iod *blk_mq_rq_to_pdu(struct request *r) {return &r->iod;}
+static u32 nvme_tag_from_cid(u32 tag) {return tag;}
+static u32 blk_rq_payload_bytes(struct request *r) {return r->bytes;}
+static void **apple_nvme_iod_list(struct request *r) {return (void **)&r->iod.prps;}
+static u64 dma_to_phys(void *dev, u64 p) {(void)dev; return p;}
+static int map_calls, translate_calls, mode;
+static struct aurora_apif_op mapped;
+int aurora_apif_submit(struct aurora_apif *apif, struct aurora_apif_op *ops, u32 n, u32 *done) {
+    (void)apif; if(done) *done=n;
+    for(u32 i=0;i<n;i++) {
+        if(ops[i].selector == AURORA_APIF_SELECTOR(AURORA_APIF_SERVICE,AURORA_APIF_TRANSLATE)) {
+            translate_calls++; ops[i].ret=ops[i].arg[0]+(mode==3?SZ_16K:0);
+        } else if(ops[i].selector == AURORA_APIF_SELECTOR(6,1)) {
+            mapped=ops[i]; map_calls++; ops[i].ret=U64_MAX;
+            if(mode==1) return -EIO;
+        } else { assert(ops[i].selector==AURORA_APIF_SELECTOR(6,2)); ops[i].ret=mode==2?0:1; }
+    }
+    return 0;
+}
+''' + helpers + r'''
+int main(void) {
+    struct apple_nvme_hw hw={64};
+    struct aurora_apif_op ops[257];
+    unsigned char scratch[SZ_16K];
+    struct apple_nvme anv={.hw=&hw,.apif_ops=ops,.apif_scratch=scratch,.apif_scratch_dma=0x800000};
+    struct apple_nvme_queue q={.anv=&anv,.is_adminq=true};
+    struct request r={.iod.cmd.common={.dptr={0x100000,0},.command_id=3}};
+    /* A no-payload Create SQ still admits its queue page. MAP is void. */
+    assert(!apple_nvme_apif_request(&q,&r,true));
+    assert(map_calls==1 && mapped.arg[4]==1 && mapped.arg[1]==3);
+    assert(mapped.arg[2]==0x801000 && mapped.arg[3]==0x800000 && r.iod.apif_registered);
+    mode=2; assert(apple_nvme_apif_request(&q,&r,false)==-EIO && r.iod.apif_registered);
+    mode=0; assert(!apple_nvme_apif_request(&q,&r,false) && !r.iod.apif_registered);
+    mode=1; assert(apple_nvme_apif_request(&q,&r,true)==-EIO);
+    assert(r.iod.apif_registered && anv.apif_uncertain);
+    int maps=map_calls; assert(apple_nvme_apif_request(&q,&r,true)==-EIO && map_calls==maps);
+    mode=0; assert(!apple_nvme_apif_request(&q,&r,false)); anv.apif_uncertain=false;
+    mode=3; assert(apple_nvme_apif_request(&q,&r,true)==-EINVAL && map_calls==maps);
+    mode=0; __le64 prps[256]; for(int i=0;i<256;i++) prps[i]=0x200000+(u64)i*SZ_4K;
+    r.bytes=1024*1024; r.iod.prps=prps; r.iod.cmd.common.dptr.prp1=0x100004;
+    assert(!apple_nvme_apif_request(&q,&r,true) && mapped.arg[4]==257);
+    assert(((struct apple_nvmmu_tcb *)(scratch+SZ_4K))->length==255);
+    assert(translate_calls>=257);
+    return 0;
+}
+'''
+
+
 def main():
     compiler = shlex.split(os.environ.get("HOSTCC", "cc"))
-    print("TAP version 13\n1..3", flush=True)
+    print("TAP version 13\n1..4", flush=True)
     with tempfile.TemporaryDirectory(prefix="apif-selftest-") as directory:
         for i, (name, test) in enumerate([( "transport", transport_test),
-                                        ("dart", dart_test), ("sart", sart_test)], 1):
+                                        ("dart", dart_test), ("sart", sart_test), ("nvme", nvme_test)], 1):
             path = Path(directory) / name
             path.with_suffix(".c").write_text(test())
             subprocess.run(compiler + ["-std=gnu11", "-Wall", "-Wextra", "-Werror",
