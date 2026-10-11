@@ -268,9 +268,16 @@ static int sn201202x_probe(struct spmi_device *device)
 		return ret;
 
 	ret = tipd_init(tps);
-	if (ret)
+	if (ret) {
 		spmi_command_sleep(device);
-	return ret;
+		return ret;
+	}
+
+	/* SPMI event messages can precede registration of the event IRQ.
+	 * Reconcile the latched state after the port and its work are ready.
+	 */
+	tps->data->irq_handler(tps->irq, tps);
+	return 0;
 }
 
 static void sn201202x_remove(struct spmi_device *device)
