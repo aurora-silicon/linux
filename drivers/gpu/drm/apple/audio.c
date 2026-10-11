@@ -103,6 +103,8 @@ struct dcp_audio {
 	ktime_t void_start;
 	u64 void_periods;
 	struct delayed_work void_work;
+	/* The stream holds a runtime PM reference, put in sync_stop; stream lock */
+	bool pm_held;
 	void *elements;
 	void *productattrs;
 
@@ -648,7 +650,11 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		if (dcpaud->open_unplugged || !dcpaud_connection_up(dcpaud))
 			return dcpaud_void_start(substream);
 
-		WARN_ON(pm_runtime_get_sync(dcpaud->dev) < 0);
+		/* A START can follow a failed one before sync_stop ran */
+		if (!dcpaud->pm_held) {
+			WARN_ON(pm_runtime_get_sync(dcpaud->dev) < 0);
+			dcpaud->pm_held = true;
+		}
 		ret = dcp_audiosrv_startlink(dcpaud->dcp_dev,
 					     &dcpaud->selected_cookie);
 		if (ret < 0)
@@ -681,9 +687,8 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
+		/* The runtime PM reference goes in sync_stop */
 		ret = dcp_audiosrv_stoplink(dcpaud->dcp_dev);
-		pm_runtime_mark_last_busy(dcpaud->dev);
-		__pm_runtime_put_autosuspend(dcpaud->dev);
 		if (ret < 0)
 			return ret;
 		break;
@@ -693,14 +698,32 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 }
 
 /*
- * ALSA calls this once a stream has stopped, outside the stream lock, before
- * the next hw_params, prepare or hw_free and at close.
+ * ALSA calls this once a stream has stopped (STOP, SUSPEND, or the STOP that
+ * undoes a failed START), outside the stream lock, before the next
+ * hw_params, prepare or hw_free, at close, at system suspend and at
+ * disconnect. The DMA terminate STOP started is asynchronous: putting the
+ * runtime PM reference in STOP powered the DPA's domain (ps_dpa*) down while
+ * SIO still ran DMA towards it, and SIO crashed ("Shim DMA unavailable", the
+ * TERMINATE timing out after it), taking DP audio down on every output until
+ * a reboot. Wait for the terminate first.
  */
 static int dcp_pcm_sync_stop(struct snd_pcm_substream *substream)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
+	bool held;
 
 	cancel_delayed_work_sync(&dcpaud->void_work);
+	snd_dmaengine_pcm_sync_stop(substream);
+
+	snd_pcm_stream_lock_irq(substream);
+	held = dcpaud->pm_held;
+	dcpaud->pm_held = false;
+	snd_pcm_stream_unlock_irq(substream);
+
+	if (held) {
+		pm_runtime_mark_last_busy(dcpaud->dev);
+		__pm_runtime_put_autosuspend(dcpaud->dev);
+	}
 
 	return 0;
 }
