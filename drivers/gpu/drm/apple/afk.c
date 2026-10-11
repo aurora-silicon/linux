@@ -342,7 +342,7 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 			return;
 		}
 		ret = parse_epic_service_init(&ctx, &epic_name, &epic_class, &epic_unit,
-					      ep->dcp->fw_compat == DCP_FIRMWARE_H17P);
+					      ep->dcp->fw_compat >= DCP_FIRMWARE_H17P);
 		if (ret) {
 			dev_err(ep->dcp->dev,
 				"AFK[ep:%02x]: failed to extract init props: %d\n",

@@ -20,6 +20,7 @@
 #include "dcp_backlight.h"
 #include "iomfb.h"
 #include "iomfb_h17p.h"
+#include "iomfb_v27.h"
 #include "iomfb-state.h"
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
@@ -69,6 +70,7 @@ struct apple_dcp_typec_route {
 };
 
 bool dcp_is_typec_output(struct apple_dcp *dcp);
+int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up);
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp);
 void dcp_swap_watchdog_complete(struct apple_dcp *dcp);
 bool dcp_is_usb4_output(struct apple_dcp *dcp);
@@ -93,6 +95,7 @@ enum {
 	DPAVSERV_ENDPOINT = 0x28,
 	AV_ENDPOINT = 0x29,
 	DPTX_ENDPOINT = 0x2a,
+	DPTX_ENDPOINT_V27 = 0x2c,
 	HDCP_ENDPOINT = 0x2b,
 	REMOTE_ALLOC_ENDPOINT = 0x2d,
 	IOMFB_ENDPOINT = 0x37,
@@ -178,6 +181,7 @@ enum dcp_iomfb_method_profile {
 };
 
 struct apple_dcp_hw_data {
+	u8 firmware_dma_bits;
 	u32 num_dptx_ports;
 	enum dcp_iomfb_method_profile iomfb_method_profile;
 	/*
@@ -229,6 +233,16 @@ struct apple_dcp {
 	/* clock rate request by dcp in */
 	struct clk *clk;
 	struct clk *clk_194;
+	struct clk_bulk_data *firmware_clocks;
+	unsigned int num_firmware_clocks;
+	u64 disp_firmware_base[MAX_DISP_REGISTERS];
+	u32 dfb_format, dfb_compression;
+	u64 dfb_region_size;
+	bool dfb_format_valid, dfb_compression_valid;
+	struct list_head iomfb_boolean_properties;
+	u32 iomfb_boolean_property_count;
+	u32 external_pipes_v27, external_displays_v27, external_suppression_v27;
+	struct dcp_swap_submit_req_v27 present_v27;
 
 	/* DCP shared memory */
 	void *shmem;

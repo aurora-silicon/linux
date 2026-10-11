@@ -29,6 +29,7 @@
 #include "dcp-internal.h"
 #include "iomfb.h"
 #include "iomfb_internal.h"
+#include "iomfb-dfb.h"
 #include "parser.h"
 #include "trace.h"
 #include "version_utils.h"
@@ -76,10 +77,24 @@ static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 				cb(dcp, NULL, cookie);
 			return;
 		}
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+		iomfb_serialize_present_v27(&dcp->present_v27, request);
+		dcp->present_v27.swap.brightness_update =
+			dcp->present_h17p.swap[0x354] & 1;
+		dcp->present_v27.swap.brightness_nits =
+			get_unaligned_le64(dcp->present_h17p.swap + 0x35e);
+		data = &dcp->present_v27;
+#else
 		data = &dcp->present_h17p;
+#endif
 	}
 
-	dcp_push(dcp, oob, &dcp_methods[dcpep_swap_submit], sizeof(*request),
+	dcp_push(dcp, oob, &dcp_methods[dcpep_swap_submit],
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+		 sizeof(struct dcp_swap_submit_req_v27),
+#else
+		 sizeof(*request),
+#endif
 		 sizeof(struct dcp_swap_submit_resp_h17p), (void *)data, cb, cookie);
 }
 #else
@@ -114,7 +129,7 @@ DCP_THUNK_INOUT(dcp_set_power_state, dcpep_set_power_state,
  * programmed, which is the panel's native mode, instead of requesting one.
  */
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-#define DCP_INHERIT_BOOT_MODE	true
+#define DCP_INHERIT_BOOT_MODE	(DCP_FW_VER < DCP_FW_VERSION(27, 0, 0))
 #else
 #define DCP_INHERIT_BOOT_MODE	false
 #endif
@@ -127,7 +142,7 @@ DCP_THUNK_INOUT(dcp_set_power_state, dcpep_set_power_state,
  * still sends its clear swap first.
  */
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-#define DCP_HAS_CLIENT_TEARDOWN	false
+#define DCP_HAS_CLIENT_TEARDOWN	(DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
 #else
 #define DCP_HAS_CLIENT_TEARDOWN	true
 #endif
@@ -330,7 +345,7 @@ static_assert(sizeof(struct dcp_h17p_dfb_surface_req) == 0x230);
 DCP_THUNK_INOUT(dcp_register_dfb_surface, dcpep_register_dfb_surface,
 		struct dcp_h17p_dfb_surface_req, u32);
 
-static void dcp_ack_dfb_surface(struct apple_dcp *dcp)
+static void __maybe_unused dcp_ack_dfb_surface(struct apple_dcp *dcp)
 {
 	struct dcp_channel *ch = &dcp->ch_cb;
 	u8 *succ = ch->output[ch->depth - 1];
@@ -345,7 +360,7 @@ static void dcp_ack_dfb_surface(struct apple_dcp *dcp)
  * default surface ID.  The bytes at +0x29..+0x2c are an opaque word whose
  * meaning is not known.
  */
-static void dcp_fill_dfb_surface(struct apple_dcp *dcp, u8 *s)
+static void __maybe_unused dcp_fill_dfb_surface(struct apple_dcp *dcp, u8 *s)
 {
 	s[0x002] = 0x01;
 	memcpy(s + 0x00b, "8a3b", 4);
@@ -373,7 +388,14 @@ static void dcp_fill_dfb_surface(struct apple_dcp *dcp, u8 *s)
  */
 static void complete_dfb_surface(struct apple_dcp *dcp, void *out, void *cookie)
 {
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	struct dcp_channel *ch = &dcp->ch_cb;
+
+	*(u8 *)ch->output[ch->depth - 1] = out && !get_unaligned_le32(out);
+	dcp_ack(dcp, DCP_CONTEXT_CB);
+#else
 	dcp_ack_dfb_surface(dcp);
+#endif
 }
 
 static bool iomfbep_cb_create_dfb_surface(struct apple_dcp *dcp, int tag,
@@ -393,12 +415,45 @@ static bool iomfbep_cb_create_dfb_surface(struct apple_dcp *dcp, int tag,
 	if (!req)
 		return true;
 
+
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	{
+		struct dcp_dfb_dimensions_h17p dim;
+		struct dcp_surface *surface = (void *)req->surface;
+		u32 format, allocation;
+		int ret = -EINVAL;
+
+		memcpy(&dim, in, sizeof(dim));
+		if (dcp->dfb_format_valid && dcp->dfb_compression_valid)
+			ret = apple_dcp_dfb_allocation(dim.width, dim.height,
+				dcp->dfb_format, dcp->dfb_compression,
+				dcp->dfb_region_size, &format, &allocation);
+		if (ret) {
+			dev_err(dcp->dev, "unsupported DFB layout %ux%u format=%#x compression=%u (%d)\n",
+				dim.width, dim.height, dcp->dfb_format,
+				dcp->dfb_compression, ret);
+			*(u8 *)out = false;
+			kfree(req);
+			return true;
+		}
+
+		surface->is_premultiplied = 1;
+		surface->format = format;
+		surface->pix_size = 1;
+		surface->pel_w = 1;
+		surface->pel_h = 1;
+		surface->buf_size = allocation;
+		surface->surface_id = 5;
+		surface->has_comp = 1;
+		surface->has_planes = 1;
+	}
+#else
 	dcp_fill_dfb_surface(dcp, req->surface);
+#endif
 
 	dcp_register_dfb_surface(dcp, false, req, complete_dfb_surface, NULL);
 	kfree(req);
 
-	/* deferred ACK: the A472 completion reports success for us */
 	return false;
 }
 #endif
@@ -455,7 +510,11 @@ static bool iomfbep_cb_match_backlight_service(struct apple_dcp *dcp, int tag, v
 static void iomfb_cb_pr_publish(struct apple_dcp *dcp, struct iomfb_property *prop)
 {
 	switch (prop->id) {
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	case 20:
+#else
 	case IOMFB_PROPERTY_NITS:
+#endif
 	{
 #if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
 		/* Measured H17P takeover comes from the powerlog hint interface. */
@@ -854,7 +913,12 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 		 * dma_map_resource() them instead fails and hands the firmware
 		 * DMA_MAPPING_ERROR as a device address.
 		 */
-		dma_addr_t dva = rsrc->start;
+		dma_addr_t dva =
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+			dcp->disp_firmware_base[req->index];
+#else
+			rsrc->start;
+#endif
 #elif DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 		dma_addr_t dva = dma_map_resource(dcp->dev, rsrc->start, resource_size(rsrc),
 						  DMA_BIDIRECTIONAL, 0);
@@ -862,7 +926,12 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 #endif
 
 		return (struct DCP_FW_NAME(dcp_map_reg_resp)){
-			.addr = rsrc->start,
+			.addr =
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+			dcp->disp_firmware_base[req->index],
+#else
+			rsrc->start,
+#endif
 			.length = resource_size(rsrc),
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 			.dva = dva,
@@ -1106,6 +1175,27 @@ static void boot_1_11(struct apple_dcp *dcp, void *out, void *cookie)
 
 static void boot_1_10(struct apple_dcp *dcp, void *out, void *cookie)
 {
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	struct dcp_dfb_dimensions_h17p dim;
+
+	if (!out)
+		return;
+	memcpy(&dim, out, sizeof(dim));
+
+	if (dim.width > 16384 || dim.height > 16384
+	   ) {
+		struct dcp_channel *ch = &dcp->ch_cb;
+
+		dev_err(dcp->dev, "invalid default framebuffer dimensions %ux%u\n",
+			dim.width, dim.height);
+		*(u8 *)ch->output[ch->depth - 1] = false;
+		dcp_ack(dcp, DCP_CONTEXT_CB);
+		return;
+	}
+
+	dcp_set_dfb_dimensions(dcp, false, &dim, boot_1_11, NULL);
+
+#else
 	struct dcp_dfb_dimensions_h17p dim;
 
 	/*
@@ -1126,12 +1216,25 @@ static void boot_1_10(struct apple_dcp *dcp, void *out, void *cookie)
 		dim.width, dim.height);
 
 	dcp_set_dfb_dimensions(dcp, false, &dim, boot_1_11, NULL);
+
+#endif
 }
 
 static void boot_1_9(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	u32 zero = 0;
 
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	struct dcp_dfb_dimensions_h17p dim;
+
+	if (!out)
+		return;
+	memcpy(&dim, out, sizeof(dim));
+	if (dim.width && dim.height) {
+		boot_2(dcp, out, cookie);
+		return;
+	}
+#endif
 	dcp_get_dfb_state(dcp, false, &zero, boot_1_10, NULL);
 }
 
@@ -1139,6 +1242,12 @@ static void boot_1_8(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct dcp_dfb_layout_req_h17p req = {};
 
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	if (!out)
+		return;
+	dcp->dfb_format_valid = *((u8 *)out + 0x28) & 1;
+	memcpy(&dcp->dfb_format, out, sizeof(dcp->dfb_format));
+#endif
 	dcp_get_dfb_layout(dcp, false, &req, boot_1_9, NULL);
 }
 
@@ -1146,6 +1255,12 @@ static void boot_1_7(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct dcp_dfb_info_h17p info = {};
 
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	if (!out)
+		return;
+	dcp->dfb_compression_valid = *((u8 *)out + 4) & 1;
+	memcpy(&dcp->dfb_compression, out, sizeof(dcp->dfb_compression));
+#endif
 	dcp_get_dfb_info(dcp, false, &info, boot_1_8, NULL);
 }
 
@@ -1153,6 +1268,16 @@ static void boot_1_6(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	u64 zero = 0;
 
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	if (!out)
+		return;
+	if (!(*(u8 *)out & 1)) {
+		struct dcp_dfb_layout_req_h17p req = {};
+
+		dcp_get_dfb_layout(dcp, false, &req, boot_1_9, NULL);
+		return;
+	}
+#endif
 	dcp_get_dfb_compression_info(dcp, false, &zero, boot_1_7, NULL);
 }
 #endif
@@ -1319,6 +1444,7 @@ static void release_swap_cookie(struct kref *ref)
  */
 static void dcp_h17p_prepare_swap(struct apple_dcp *dcp)
 {
+#if DCP_FW_VER < DCP_FW_VERSION(27, 0, 0)
 	struct DCP_FW_NAME(dcp_swap_submit_req) *req = &DCP_FW_UNION(dcp->swap);
 	unsigned int i;
 
@@ -1368,6 +1494,7 @@ static void dcp_h17p_prepare_swap(struct apple_dcp *dcp)
 		memmove(r + off - 2, r + off, n - off);
 		memset(r + n - 2, 0, 2);
 	}
+#endif
 }
 #else
 static void dcp_h17p_prepare_swap(struct apple_dcp *dcp) { }
@@ -1561,7 +1688,12 @@ static void dcp_on_set_power_state(struct apple_dcp *dcp, void *out, void *cooki
 static void dcp_on_set_parameter(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct dcp_set_parameter_dcp param = {
-		.param = IOMFBPARAM_ADAPTIVE_SYNC,
+		.param =
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+		15,
+#else
+		IOMFBPARAM_ADAPTIVE_SYNC,
+#endif
 		.value = { 0 },
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 		.count = 3,
@@ -2105,6 +2237,10 @@ static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data,
 	struct dcp_wait_cookie *wait = cookie;
 
 	if (wait) {
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+		if (!data || get_unaligned_le32(data))
+			wait->status = -EIO;
+#endif
 		complete(&wait->done);
 		kref_put(&wait->refcount, release_wait_cookie);
 	}
@@ -2114,6 +2250,16 @@ static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data,
 static void dcp_on_set_adaptive_sync(struct apple_dcp *dcp, void *out,
 				     void *cookie)
 {
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+	if (!out || get_unaligned_le32(out)) {
+		struct dcp_wait_cookie *wait = cookie;
+
+		wait->status = -EOPNOTSUPP;
+		complete(&wait->done);
+		kref_put(&wait->refcount, release_wait_cookie);
+		return;
+	}
+#endif
 	dcp_set_digital_out_mode(dcp, false, &dcp->mode,
 				 complete_set_digital_out_mode, cookie);
 }
@@ -2122,7 +2268,12 @@ static void dcp_set_adaptive_sync(struct apple_dcp *dcp, u32 min_vrr,
 				  void *cookie)
 {
 	struct dcp_set_parameter_dcp param = {
-		.param = IOMFBPARAM_ADAPTIVE_SYNC,
+		.param =
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+		15,
+#else
+		IOMFBPARAM_ADAPTIVE_SYNC,
+#endif
 		.value = {
 			min_vrr, /* minRR, 16.16 fixed-point Hz */
 			0,       /* mediaTargetRate */
