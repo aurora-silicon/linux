@@ -7,7 +7,7 @@ $schema: http://devicetree.org/meta-schemas/core.yaml#
 title: Aurora Platform Interface over Memory-Mapped I/O
 
 maintainers:
-  - Dj <43033058+DjDeveloperr@users.noreply.github.com>
+  - Dj <hey@djdev.me>
 
 description: |
   Synthetic MMIO transport supplied by Aura's EL2-resident monitor. Version 2
@@ -30,7 +30,7 @@ additionalProperties: false
 
 examples:
   - |
-    apif: firmware@61f20000 {
+    apif: firmware@61ff0000 {
         compatible = "aurora,apif-mmio";
-        reg = <0x61f20000 0x4000>;
+        reg = <0x61ff0000 0x4000>;
     };

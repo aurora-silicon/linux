@@ -13,7 +13,7 @@ interface does not isolate an untrusted kernel.
 Wire contract
 =============
 
-The version-2 synthetic register page occupies 16 KiB at guest IPA 0x61f20000.
+The version-2 synthetic register page occupies 16 KiB at guest IPA 0x61ff0000.
 Registers are little-endian 64-bit fields: magic at 0x000 is
 0x4f494d4d46495041 (APIFMMIO), version at 0x008 is 2, maximum operations at
 0x010, and feature flags at 0x018 (bit 0 native, bit 1 memory, bit 2 I/O).
