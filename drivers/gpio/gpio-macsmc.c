@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT) AND GPL-2.0-only
 /*
  * Apple SMC GPIO driver
  * Copyright The Asahi Linux Contributors
@@ -14,6 +14,7 @@
 #include <linux/mfd/core.h>
 #include <linux/mfd/macsmc.h>
 #include <linux/of.h>
+#include <linux/unaligned.h>
 
 #define MAX_GPIO 64
 
@@ -91,6 +92,7 @@ struct macsmc_gpio {
 	struct apple_smc *smc;
 	struct gpio_chip gc;
 
+	u64 *output_commands;
 	int first_index;
 	smc_key base_key;
 
@@ -296,6 +298,71 @@ static int macsmc_gpio_init_valid_mask(struct gpio_chip *gc,
 	return 0;
 }
 
+/* Each DT template identifies one output; its low 16 bits carry the value. */
+static int macsmc_pcio_set(struct gpio_chip *gc, unsigned int offset, int value)
+{
+	struct macsmc_gpio *smcgp = gpiochip_get_data(gc);
+	u8 command[8];
+	int ret;
+
+	put_unaligned_le64(smcgp->output_commands[offset] | !!value, command);
+	ret = apple_smc_write(smcgp->smc, SMC_KEY(pcIO), command, sizeof(command));
+	return ret < 0 ? ret : ret == sizeof(command) ? 0 : -EIO;
+}
+
+static int macsmc_pcio_get(struct gpio_chip *gc, unsigned int offset)
+{
+	/* The native output command has no established input/readback operation. */
+	return -EOPNOTSUPP;
+}
+
+static int macsmc_pcio_get_direction(struct gpio_chip *gc, unsigned int offset)
+{
+	return GPIO_LINE_DIRECTION_OUT;
+}
+
+static int macsmc_pcio_probe(struct macsmc_gpio *smcgp)
+{
+	struct device *dev = smcgp->dev;
+	struct apple_smc_key_info info;
+	int count, ret;
+
+	ret = apple_smc_get_key_info(smcgp->smc, SMC_KEY(pcIO), &info);
+	if (ret < 0)
+		return ret;
+	if (info.size != 8 || !(info.flags & APPLE_SMC_WRITABLE))
+		return dev_err_probe(dev, -EINVAL, "pcIO is not an eight-byte output key\n");
+	count = of_property_count_u64_elems(dev->of_node, "apple,output-commands");
+	if (count <= 0 || count > MAX_GPIO)
+		return -EINVAL;
+	smcgp->output_commands = devm_kcalloc(dev, count, sizeof(u64), GFP_KERNEL);
+	if (!smcgp->output_commands)
+		return -ENOMEM;
+	ret = of_property_read_u64_array(dev->of_node, "apple,output-commands",
+					smcgp->output_commands, count);
+	if (ret)
+		return ret;
+	for (int i = 0; i < count; i++) {
+		if (smcgp->output_commands[i] & 0xffff)
+			return -EINVAL;
+		for (int j = 0; j < i; j++)
+			if (smcgp->output_commands[i] == smcgp->output_commands[j])
+				return -EINVAL;
+	}
+
+	smcgp->gc.label = "macsmc-pcio-output";
+	smcgp->gc.owner = THIS_MODULE;
+	smcgp->gc.get = macsmc_pcio_get;
+	smcgp->gc.set = macsmc_pcio_set;
+	smcgp->gc.direction_output = macsmc_pcio_set;
+	smcgp->gc.get_direction = macsmc_pcio_get_direction;
+	smcgp->gc.can_sleep = true;
+	smcgp->gc.ngpio = count;
+	smcgp->gc.base = -1;
+	smcgp->gc.parent = dev;
+	return devm_gpiochip_add_data(dev, &smcgp->gc, smcgp);
+}
+
 struct macsmc_gpio_of_match_data {
 	smc_key base_key;
 };
@@ -314,6 +381,8 @@ static int macsmc_gpio_probe(struct platform_device *pdev)
 
 	smcgp->dev = &pdev->dev;
 	smcgp->smc = smc;
+	if (device_is_compatible(&pdev->dev, "apple,smc-pcio-gpio"))
+		return macsmc_pcio_probe(smcgp);
 	smcgp->base_key = data ? data->base_key : _SMC_KEY("gP\0\0");
 	smcgp->j700_pcio = of_machine_is_compatible("apple,j700") &&
 				device_is_compatible(&pdev->dev, "apple,smc-gpio");
@@ -357,6 +426,7 @@ static const struct macsmc_gpio_of_match_data macsmc_gpio_low_data = {
 };
 
 static const struct of_device_id macsmc_gpio_of_table[] = {
+	{ .compatible = "apple,smc-pcio-gpio" },
 	{
 		.compatible = "apple,smc-gpio",
 		.data = &macsmc_gpio_up_data,
