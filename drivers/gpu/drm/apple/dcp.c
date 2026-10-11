@@ -1073,7 +1073,8 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	 * without a word, so a nominated route might never be called at all --
 	 * and the port would then never be routed.
 	 */
-	if (port->applied_valid && port->applied_alt == state->alt &&
+	if (port->applied_valid && !(dp_status & DP_STATUS_IRQ_HPD) &&
+	    port->applied_alt == state->alt &&
 	    port->applied_mode == state->mode &&
 	    port->applied_status == dp_status && port->applied_conf == dp_conf)
 		return 0;
@@ -1197,7 +1198,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	} else if (hpd && dp_data && (dp_data->status & DP_STATUS_IRQ_HPD)) {
 		struct apple_dcp *dcp = port->owner->dcp;
 
-		if (dcp->typec_connector)
+		if (!dcp_typec_sink_relink(dcp) && dcp->typec_connector)
 			dcp_retrain_oob(dcp->typec_connector);
 	}
 	port->hpd = hpd;
@@ -2893,6 +2894,109 @@ out_unlock:
 	mutex_unlock(&dcp->hpd_mutex);
 }
 
+#define DPTX_RELINK_RETRIES 3
+#define DPTX_RELINK_UNPLUG_MS 1000
+/* a monitor pulses HPD up to about 4 s after it lost the link */
+#define DPTX_RELINK_SETTLE_MS 4000
+
+/*
+ * A USB-C monitor with a built-in hub can lose the DP link when the hub
+ * brings its SuperSpeed link up right around DCP's link training for the
+ * first modeset. DCP may then report the sink as unplugged two seconds
+ * later although it still asserts HPD, or keep driving the dead link
+ * without noticing while the monitor pulses HPD to be detected again.
+ * Neither is recovered by anything else: replay an unplug and replug of
+ * the sink, which retrains the link once the hub has settled, as a cable
+ * replug does.
+ *
+ * The retries cover one connection: the replay itself does not reset them.
+ */
+static bool dcp_typec_relink_start(struct apple_dcp *dcp, const char *why)
+{
+	u64 generation = READ_ONCE(dcp->typec_generation);
+
+	/* external H17P recovers through its own lifecycle, see dcp_external_hotplug() */
+	if (!dcp_is_typec_output(dcp) || dcp_is_usb4_output(dcp) ||
+	    dcp_is_external_h17p(dcp) ||
+	    !READ_ONCE(dcp->typec_cable_connected) ||
+	    READ_ONCE(dcp->typec_crtc_off) || !dcp->typec_connector)
+		return false;
+
+	if (dcp->relink_generation != generation) {
+		dcp->relink_generation = generation;
+		dcp->relink_tries = 0;
+		WRITE_ONCE(dcp->relink_active, false);
+	}
+	/* the unplug a running relink replays makes DCP report one too */
+	if (READ_ONCE(dcp->relink_active))
+		return true;
+	if (dcp->relink_tries >= DPTX_RELINK_RETRIES)
+		return false;
+
+	dcp->relink_tries++;
+	WRITE_ONCE(dcp->relink_active, true);
+	dev_info(dcp->dev, "%s, relinking the Type-C sink (%u/%u)\n", why,
+		 dcp->relink_tries, DPTX_RELINK_RETRIES);
+	mod_delayed_work(system_freezable_wq, &dcp->typec_relink_wq, 0);
+
+	return true;
+}
+
+/* DCP reported an unplug of a Type-C sink that still asserts HPD */
+bool dcp_typec_relink(struct apple_dcp *dcp)
+{
+	return dcp_typec_relink_start(dcp, "DCP dropped a sink that asserts HPD");
+}
+
+/*
+ * The sink asked for attention: IRQ_HPD or a coalesced HPD pulse. Right
+ * after a relink that is the sink's late reaction to the loss the relink
+ * already handled; another relink would only interrupt the new link.
+ */
+bool dcp_typec_sink_relink(struct apple_dcp *dcp)
+{
+	unsigned long done = READ_ONCE(dcp->relink_done);
+
+	if (done && time_before(jiffies, done + msecs_to_jiffies(DPTX_RELINK_SETTLE_MS)) &&
+	    READ_ONCE(dcp->relink_generation) == READ_ONCE(dcp->typec_generation)) {
+		dev_info(dcp->dev, "Type-C sink requested attention right after a relink, ignored\n");
+		return true;
+	}
+
+	return dcp_typec_relink_start(dcp, "Type-C sink requested attention");
+}
+
+static void dcp_typec_relink_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp =
+		container_of(to_delayed_work(work), struct apple_dcp,
+			     typec_relink_wq);
+	struct platform_device *pdev = to_platform_device(dcp->dev);
+	u64 generation;
+
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		generation = dcp->typec_generation;
+	if (generation != dcp->relink_generation ||
+	    !READ_ONCE(dcp->typec_cable_connected))
+		goto out;
+
+	dcp_dptx_disconnect_oob(pdev, 0);
+	msleep(DPTX_RELINK_UNPLUG_MS);
+
+	/* a real unplug or replug meanwhile takes over */
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		if (dcp->typec_generation != generation + 1)
+			goto out;
+	}
+	dcp_dptx_connect_oob(pdev, 0);
+
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		dcp->relink_generation = dcp->typec_generation;
+	WRITE_ONCE(dcp->relink_done, jiffies);
+out:
+	WRITE_ONCE(dcp->relink_active, false);
+}
+
 static void dcp_typec_reconnect_work(struct work_struct *work)
 {
 	struct apple_dcp *dcp =
@@ -3972,6 +4076,7 @@ static void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
 	/* Block new enqueues as well as draining users of the AFK endpoints. */
 	disable_delayed_work_sync(&dcp->typec_reconnect_wq);
 	disable_delayed_work_sync(&dcp->placeholder_edid_wq);
+	disable_delayed_work_sync(&dcp->typec_relink_wq);
 	cancel_work_sync(&dcp->external_stop_work);
 }
 
@@ -3979,6 +4084,7 @@ static void dcp_enable_typec_work(struct apple_dcp *dcp)
 {
 	enable_delayed_work(&dcp->typec_reconnect_wq);
 	enable_delayed_work(&dcp->placeholder_edid_wq);
+	enable_delayed_work(&dcp->typec_relink_wq);
 	/* A cable can be routed before the DRM component binds. */
 	if (READ_ONCE(dcp->typec_cable_connected))
 		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq, 0);
@@ -4393,10 +4499,12 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			  dcp_typec_reconnect_work);
 	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq,
 			  dcp_placeholder_edid_work);
+	INIT_DELAYED_WORK(&dcp->typec_relink_wq, dcp_typec_relink_work);
 	INIT_DELAYED_WORK(&dcp->bl_fallback_wq, dcp_work_backlight_fallback);
 	/* Balanced by enable at successful component bind. */
 	disable_delayed_work(&dcp->typec_reconnect_wq);
 	disable_delayed_work(&dcp->placeholder_edid_wq);
+	disable_delayed_work(&dcp->typec_relink_wq);
 
 	platform_set_drvdata(pdev, dcp);
 

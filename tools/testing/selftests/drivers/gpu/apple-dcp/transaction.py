@@ -72,6 +72,7 @@ static int mux_control_deselect(struct mux_control *m) { (void)m;event('C');xbar
     static int connect_calls;
     static int dcp_dptx_connect_oob(void *dev,unsigned n) { (void)dev;(void)n;connect_calls++;display.external_cable=true;display.dptxport[0].connected=true;display.typec_cable_connected=true;connector.connected=true;return 0; }
     static void dcp_retrain_oob(struct connector *c) { (void)c; }
+    static bool dcp_typec_sink_relink(struct apple_dcp *d) { (void)d;return false; }
     '''
     pos=actual.index('static int dcp_typec_route_deactivate(')
     actual=actual[:pos]+extra+actual[pos:]

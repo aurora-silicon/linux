@@ -936,6 +936,7 @@ static void complete_all(int *p) { (*p)++; }
 #define dcp_mode_invalidate(s) ((s)->valid=false)
 #define dcp_mode_hotplug(s,c,p) __extension__ ({ (void)(s);if(p)*(p)=(c);1u; })
 static void dcp_handle_hotplug_actions(struct apple_dcp *d,unsigned action) { (void)d;(void)action; }
+static bool dcp_typec_relink(struct apple_dcp *d) { (void)d;return false; }
 '''
     dcp = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
     template = (root / 'drivers/gpu/drm/apple/iomfb_template.c').read_text()

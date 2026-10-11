@@ -1950,6 +1950,12 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 		schedule_work(&dcp->vblank_wq);
 		return;
 	}
+	/* DCP lost a sink which is still attached, see dcp_typec_relink() */
+	if (!(*connected) && dcp_typec_relink(dcp)) {
+		dcp_mode_invalidate(&dcp->mode_state);
+		schedule_work(&dcp->vblank_wq);
+		return;
+	}
 	if (dcp_is_typec_output(dcp) && *connected && dcp->nr_modes)
 		complete_all(&dcp->typec_iomfb_hpd_ready);
 
