@@ -67,7 +67,11 @@ struct audiosrv_data {
 
 	bool warned_get_elements;
 	bool warned_get_product_attrs;
-	bool is_open;
+	/* generation of srv, and the one that was opened (0: none) */
+	u64 gen;
+	u64 open_gen;
+	/* serialises the open and the close; never taken on the AFK rx worker */
+	struct mutex open_lock;
 };
 
 static void av_interface_init(struct apple_epic_service *service, const char *name,
@@ -107,6 +111,7 @@ static void av_audiosrv_init(struct apple_epic_service *service, const char *nam
 	down_write(&asrv->srv_rwsem);
 	old = asrv->srv;
 	asrv->srv = afk_service_get(service);
+	asrv->gen++;
 	up_write(&asrv->srv_rwsem);
 	if (old) {
 		dev_warn_once(dcp->dev, "audiosrv: announced again without a teardown\n");
@@ -339,6 +344,7 @@ void av_service_connect(struct apple_dcp *dcp)
 {
 	struct apple_epic_service *service;
 	struct audiosrv_data *asrv = dcp->audiosrv;
+	u64 gen;
 	int ret;
 
 	/* pinned for the open below, made without srv_rwsem */
@@ -346,11 +352,14 @@ void av_service_connect(struct apple_dcp *dcp)
 		service = afk_service_get(asrv->srv);
 		if (!service)
 			return;
+		gen = asrv->gen;
 	}
 
 	/* open AV audio service */
 	dev_info(dcp->dev, "%s: starting audio service, plugged:%d\n", __func__,  asrv->plugged);
-	if (asrv->is_open) {
+	mutex_lock(&asrv->open_lock);
+	if (asrv->open_gen == gen) {
+		mutex_unlock(&asrv->open_lock);
 		afk_service_put(service);
 		return;
 	}
@@ -359,21 +368,26 @@ void av_service_connect(struct apple_dcp *dcp)
 			       NULL, 0, 32);
 	afk_service_put(service);
 	if (ret) {
+		mutex_unlock(&asrv->open_lock);
 		dev_err(dcp->dev, "error opening audio service: %d\n", ret);
 		return;
 	}
 	mutex_lock(&asrv->plug_lock);
-	asrv->is_open = true;
-
-	if (asrv->audio_dev)
-		dcpaud_connect(asrv->audio_dev, asrv->plugged);
+	/* torn down during the open: the next generation is opened afresh */
+	if (asrv->gen == gen) {
+		asrv->open_gen = gen;
+		if (asrv->audio_dev)
+			dcpaud_connect(asrv->audio_dev, asrv->plugged);
+	}
 	mutex_unlock(&asrv->plug_lock);
+	mutex_unlock(&asrv->open_lock);
 }
 
 void av_service_disconnect(struct apple_dcp *dcp)
 {
 	struct apple_epic_service *service;
 	struct audiosrv_data *asrv = dcp->audiosrv;
+	u64 gen;
 	int ret;
 
 	/* pinned for the close below, made without srv_rwsem */
@@ -381,14 +395,18 @@ void av_service_disconnect(struct apple_dcp *dcp)
 		service = afk_service_get(asrv->srv);
 		if (!service)
 			return;
+		gen = asrv->gen;
 	}
 
 	/* close AV audio service */
 	dev_info(dcp->dev, "%s: stopping audio service\n", __func__);
-	if (!asrv->is_open) {
+	mutex_lock(&asrv->open_lock);
+	if (asrv->open_gen != gen) {
+		mutex_unlock(&asrv->open_lock);
 		afk_service_put(service);
 		return;
 	}
+	asrv->open_gen = 0;
 
 	mutex_lock(&asrv->plug_lock);
 
@@ -403,7 +421,7 @@ void av_service_disconnect(struct apple_dcp *dcp)
 		dev_err(dcp->dev, "error closing audio service: %d\n", ret);
 	}
 	afk_service_put(service);
-	asrv->is_open = false;
+	mutex_unlock(&asrv->open_lock);
 }
 
 static void av_work_service_start(struct work_struct *work)
@@ -438,6 +456,7 @@ int avep_init(struct apple_dcp *dcp)
 		return -ENOMEM;
 	init_rwsem(&audiosrv_data->srv_rwsem);
 	mutex_init(&audiosrv_data->plug_lock);
+	mutex_init(&audiosrv_data->open_lock);
 
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:
