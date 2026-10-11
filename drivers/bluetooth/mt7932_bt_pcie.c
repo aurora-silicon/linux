@@ -104,6 +104,14 @@ enum bt7932_pm_state {
 	BT7932_RESTORING,
 };
 
+enum bt7932_recovery {
+	BT7932_RECOVERY_NONE,
+	/* A Hardware Error event was injected and not yet handled. */
+	BT7932_RECOVERY_REQUESTED,
+	/* The core is closing and reopening the device. */
+	BT7932_RECOVERY_REOPENING,
+};
+
 struct bt7932 {
 	struct pci_dev *pdev;
 	void __iomem *bar;
@@ -133,6 +141,7 @@ struct bt7932 {
 	bool enabled, regions, vectors, irq_requested, retained;
 	bool ipc_ready, opened, awake, waking, fault, registered;
 	bool stopping, runtime_forbidden;
+	enum bt7932_recovery recovery;
 	enum bt7932_pm_state pm_state;
 	u64 tx_packets, rx_packets, diagnostics;
 };
@@ -833,6 +842,9 @@ static int bt7932_open(struct hci_dev *hdev)
 		ret = -EHOSTDOWN;
 	else
 		WRITE_ONCE(bt->opened, true);
+	/* Closing the device drops an injected event that was still queued. */
+	if (bt->recovery == BT7932_RECOVERY_REQUESTED)
+		bt->recovery = BT7932_RECOVERY_NONE;
 	mutex_unlock(&bt->lock);
 	return ret;
 }
@@ -940,28 +952,71 @@ static int bt7932_setup(struct hci_dev *hdev)
 	if (ret)
 		goto fault;
 	dev_info(&bt->pdev->dev, "BT_HCI_SETUP_OK Reset/calibration/PTX/address completed in order\n");
+	mutex_lock(&bt->lock);
+	if (bt->recovery == BT7932_RECOVERY_REOPENING)
+		dev_info(&bt->pdev->dev, "controller recovered\n");
+	bt->recovery = BT7932_RECOVERY_NONE;
+	mutex_unlock(&bt->lock);
 	return 0;
 fault:
 	dev_err(&bt->pdev->dev, "BT_HCI_SETUP_FAILED stage=%s opcode=%04x status=%d\n",
 		stage, opcode, ret);
+	/*
+	 * The transport is intact, so a requested recovery or a later power-on
+	 * may try again. A controller that fails the setup of its recovery,
+	 * though, does not come back without a reset of the PCI function.
+	 */
 	mutex_lock(&bt->lock);
-	bt7932_fault_locked(bt, "HCI setup command failed; no retry");
+	if (bt->recovery == BT7932_RECOVERY_REOPENING)
+		bt7932_fault_locked(bt, "controller recovery failed");
 	mutex_unlock(&bt->lock);
 	return ret;
 }
 
+/*
+ * Called when a command times out, and through the "reset" sysfs attribute.
+ * While the transport rings are consistent, recover the controller the
+ * standard way: inject a Hardware Error event, so that the core closes the
+ * device, resetting the controller, and opens it again, repeating setup.
+ * Allow one attempt until a setup succeeds, so that a controller that no
+ * longer answers ends in a fault instead of a reset loop.
+ */
 static void bt7932_reset(struct hci_dev *hdev)
+{
+	struct bt7932 *bt = hci_get_drvdata(hdev);
+	bool recover;
+
+	mutex_lock(&bt->lock);
+	recover = !bt->fault && !bt->stopping &&
+		  bt->recovery == BT7932_RECOVERY_NONE &&
+		  bt->pm_state == BT7932_RUNNING;
+	if (recover)
+		bt->recovery = BT7932_RECOVERY_REQUESTED;
+	mutex_unlock(&bt->lock);
+	if (!recover)
+		return;
+	dev_warn(&bt->pdev->dev, "resetting the controller\n");
+	if (hci_reset_dev(hdev)) {
+		mutex_lock(&bt->lock);
+		if (bt->recovery == BT7932_RECOVERY_REQUESTED)
+			bt->recovery = BT7932_RECOVERY_NONE;
+		mutex_unlock(&bt->lock);
+	}
+}
+
+/*
+ * The core closes and reopens the device after this, for a Hardware Error
+ * event from the controller as for one injected above. That reopening is
+ * the recovery attempt.
+ */
+static void bt7932_hw_error(struct hci_dev *hdev, u8 code)
 {
 	struct bt7932 *bt = hci_get_drvdata(hdev);
 
 	mutex_lock(&bt->lock);
-	bt7932_fault_locked(bt, "HCI requested recovery; reset is not qualified");
+	bt->recovery = BT7932_RECOVERY_REOPENING;
 	mutex_unlock(&bt->lock);
-}
-
-static void bt7932_hw_error(struct hci_dev *hdev, u8 code)
-{
-	bt7932_reset(hdev);
+	bt_dev_err(hdev, "hardware error 0x%2.2x", code);
 }
 
 static int bt7932_iommu(struct bt7932 *bt)
