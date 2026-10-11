@@ -15,6 +15,7 @@ use kernel::{prelude::*, sync::Arc};
 struct Predecessor {
     packet: Arc<Packet>,
     word: u64,
+    ta_word: u64,
 }
 
 /// A loan of the graph cannot hide work already published on that pair. Fence
@@ -68,6 +69,21 @@ impl Dependencies {
         }
         Ok(())
     }
+    pub(crate) fn collect_tiling(
+        &self,
+        owner: u64,
+        status: &Arc<VmStatus>,
+        prefix: Option<u64>,
+        frontier: &mut Frontier,
+    ) -> Result {
+        if self.owner != Some(owner) {
+            return Ok(());
+        }
+        for entry in self.entries.iter().flatten() {
+            include(frontier, status, prefix, &entry.packet, entry.ta_word)?;
+        }
+        Ok(())
+    }
 }
 
 impl Pair {
@@ -81,6 +97,8 @@ impl Pair {
             entries: core::array::from_fn(|_| {
                 active.next().map(|entry| Predecessor {
                     packet: entry.packet.clone(),
+                    ta_word: KickDependency::new(self.qids()[0], entry.kicks[0])
+                        .map_or(u64::MAX, KickDependency::word),
                     word: KickDependency::new(qid, entry.kicks[1])
                         .map_or(u64::MAX, KickDependency::word),
                 })
@@ -102,6 +120,24 @@ impl Pair {
         for entry in self.active.iter() {
             let word =
                 KickDependency::new(qid, entry.kicks[1]).map_or(u64::MAX, KickDependency::word);
+            include(frontier, status, prefix, &entry.packet, word)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn collect_tiling_dependencies(
+        &self,
+        owner: u64,
+        status: &Arc<VmStatus>,
+        prefix: Option<u64>,
+        frontier: &mut Frontier,
+    ) -> Result {
+        if self.owner != Some(owner) {
+            return Ok(());
+        }
+        let qid = self.qids()[0];
+        for entry in self.active.iter() {
+            let word =
+                KickDependency::new(qid, entry.kicks[0]).map_or(u64::MAX, KickDependency::word);
             include(frontier, status, prefix, &entry.packet, word)?;
         }
         Ok(())

@@ -31,4 +31,29 @@ impl Registry {
         }
         Ok(frontier)
     }
+    pub(in crate::g17::runtime) fn tiling_prefix(
+        &self,
+        owner: u64,
+        packet: &Arc<Packet>,
+    ) -> Result<Frontier> {
+        let mut frontier = Frontier::new();
+        for entry in self.render.entries.iter().flatten() {
+            if let Some(pair) = entry.pair.as_ref() {
+                pair.collect_tiling_dependencies(
+                    owner,
+                    packet.completion.status(),
+                    packet.order.wait_through[0],
+                    &mut frontier,
+                )?;
+            } else if let Some(dependencies) = entry.borrowed_dependencies.as_ref() {
+                dependencies.collect_tiling(
+                    owner,
+                    packet.completion.status(),
+                    packet.order.wait_through[0],
+                    &mut frontier,
+                )?;
+            }
+        }
+        Ok(frontier)
+    }
 }

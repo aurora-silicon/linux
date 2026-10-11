@@ -43,6 +43,8 @@ use retirement::{Ticket, Tracker};
 pub(crate) struct RenderDependencies {
     pub(crate) render: [KickDependency; 2],
     pub(crate) render_count: usize,
+    pub(crate) tiling: [KickDependency; 2],
+    pub(crate) tiling_count: usize,
     pub(crate) compute: Option<KickDependency>,
 }
 
@@ -50,6 +52,8 @@ impl RenderDependencies {
     pub(crate) const EMPTY: Self = Self {
         render: [KickDependency::ZERO; 2],
         render_count: 0,
+        tiling: [KickDependency::ZERO; 2],
+        tiling_count: 0,
         compute: None,
     };
     pub(crate) fn render(&self) -> &[KickDependency] {
@@ -403,8 +407,8 @@ impl Pair {
 
 /// Kick barriers of one render. The fragment kick always waits for its own tiling kick;
 /// with the fragment-barriers flag the resolved prefix orders the fragment kick too and the
-/// tiling kick keeps only its implicit parent, otherwise the prefix orders the tiling kick.
-/// A compute dependency always orders the tiling kick.
+/// tiling kick preserves the TA prefix across physical pairs. Otherwise the render prefix
+/// orders the tiling kick. A compute dependency always orders the tiling kick.
 struct RenderBarriers {
     tiling: [KickDependency; 3],
     tiling_count: usize,
@@ -428,6 +432,17 @@ fn render_barriers(
         } else {
             tiling_barriers[tiling_count] = *dependency;
             tiling_count += 1;
+        }
+    }
+    if fragment_stage {
+        // The implicit parent covers only this physical ring. Preserve the logical
+        // TA prefix when a predecessor was published on another pair, without
+        // making this TA kick wait for that predecessor's fragment completion.
+        for dependency in &dependencies.tiling[..dependencies.tiling_count] {
+            if dependency.qid() != own_tiling.qid() {
+                tiling_barriers[tiling_count] = *dependency;
+                tiling_count += 1;
+            }
         }
     }
     if let Some(compute) = dependencies.compute {

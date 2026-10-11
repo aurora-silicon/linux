@@ -187,6 +187,19 @@ impl Registry {
                 .ok_or(EOVERFLOW)? = *dependency;
             dependencies.render_count += 1;
         }
+        if dependencies.render_count != 0
+            && matches!(&packet.command, crate::g17::command::Validated::Render { pass, .. }
+                if pass.fragment_barriers)
+        {
+            let tiling = self.tiling_prefix(owner, packet)?;
+            for dependency in tiling.as_slice() {
+                *dependencies
+                    .tiling
+                    .get_mut(dependencies.tiling_count)
+                    .ok_or(EOVERFLOW)? = *dependency;
+                dependencies.tiling_count += 1;
+            }
+        }
         if let Some(queue) = self.compute(owner) {
             dependencies.compute = queue.dependency(
                 owner,
