@@ -1,10 +1,11 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT) AND GPL-2.0-only
 /*
  * Apple RTKit IPC library
  * Copyright (C) The Asahi Linux Contributors
  */
 
 #include "rtkit-internal.h"
+#include <linux/of.h>
 
 enum {
 	APPLE_RTKIT_PWR_STATE_OFF = 0x00, /* power off, cannot be restarted */
@@ -21,6 +22,7 @@ enum {
 	APPLE_RTKIT_EP_SYSLOG = 2,
 	APPLE_RTKIT_EP_DEBUG = 3,
 	APPLE_RTKIT_EP_IOREPORT = 4,
+	APPLE_RTKIT_EP_PMP_AUX = 7,
 	APPLE_RTKIT_EP_OSLOG = 8,
 	APPLE_RTKIT_EP_TRACEKIT = 0xa,
 };
@@ -348,7 +350,9 @@ reply:
 					    buffer->iova >> 12);
 		} else {
 			reply = FIELD_PREP(APPLE_RTKIT_SYSLOG_TYPE,
-					   APPLE_RTKIT_BUFFER_REQUEST);
+					   ep == APPLE_RTKIT_EP_PMP_AUX ?
+						   5 :
+						   APPLE_RTKIT_BUFFER_REQUEST);
 			reply |= FIELD_PREP(APPLE_RTKIT_BUFFER_REQUEST_SIZE,
 					    buffer->size >> 12);
 			reply |= FIELD_PREP(APPLE_RTKIT_BUFFER_REQUEST_IOVA,
@@ -614,6 +618,22 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 	}
 }
 
+/* Registry-v2 firmware requests one 8 KiB auxiliary buffer at endpoint 7.
+ * Identical requests reuse the session buffer; changed geometry is refused.
+ */
+static void apple_rtkit_pmp_aux_rx(struct apple_rtkit *rtk, u64 msg)
+{
+	if (!rtk->pmp_registry_v2 ||
+	    msg != (FIELD_PREP(APPLE_RTKIT_SYSLOG_TYPE,
+			       APPLE_RTKIT_BUFFER_REQUEST) |
+		    FIELD_PREP(APPLE_RTKIT_BUFFER_REQUEST_SIZE, 2))) {
+		dev_err(rtk->dev, "RTKit: refused auxiliary buffer request\n");
+		return;
+	}
+	apple_rtkit_common_rx_get_buffer(rtk, &rtk->pmp_aux_buffer,
+					 APPLE_RTKIT_EP_PMP_AUX, msg);
+}
+
 static void apple_rtkit_rx_work(struct work_struct *work)
 {
 	struct apple_rtkit_rx_work *rtk_work =
@@ -635,6 +655,9 @@ static void apple_rtkit_rx_work(struct work_struct *work)
 		break;
 	case APPLE_RTKIT_EP_IOREPORT:
 		apple_rtkit_ioreport_rx(rtk, rtk_work->msg);
+		break;
+	case APPLE_RTKIT_EP_PMP_AUX:
+		apple_rtkit_pmp_aux_rx(rtk, rtk_work->msg);
 		break;
 	case APPLE_RTKIT_EP_OSLOG:
 		apple_rtkit_oslog_rx(rtk, rtk_work->msg);
@@ -850,6 +873,8 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	rtk->dev = dev;
 	rtk->cookie = cookie;
 	rtk->ops = ops;
+	rtk->pmp_registry_v2 =
+		of_device_is_compatible(dev->of_node, "apple,t6050-pmp-v2");
 
 	init_completion(&rtk->epmap_completion);
 	init_completion(&rtk->iop_pwr_ack_completion);
@@ -942,6 +967,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);
+	apple_rtkit_free_buffer(rtk, &rtk->pmp_aux_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->syslog_buffer);
 
 	kfree(rtk->syslog_msg_buffer);
@@ -1191,6 +1217,7 @@ void apple_rtkit_free(struct apple_rtkit *rtk)
 	apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);
+	apple_rtkit_free_buffer(rtk, &rtk->pmp_aux_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->syslog_buffer);
 
 	kfree(rtk->syslog_msg_buffer);

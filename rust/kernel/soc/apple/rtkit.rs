@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT) AND GPL-2.0-only
 
 //! Support for Apple RTKit coprocessors.
 //!
@@ -263,6 +263,10 @@ impl<T: Operations> RtKit<T> {
             _p: PhantomData,
         })
     }
+
+    /// Borrows the C handle without transferring ownership.
+    /// The owner must outlive each unsafe C operation and its callbacks.
+    pub fn as_raw(&self) -> *mut bindings::apple_rtkit { self.rtk }
 
     /// Requests acknowledged RTKit shutdown using the C core's bounded waits.
     ///
