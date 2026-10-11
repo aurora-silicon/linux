@@ -1,0 +1,131 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * T6031 internal display.
+ *
+ * The same description as t6030-dcp.dtsi: the DCP, its mailbox, the two
+ * display DARTs, the display subsystem and its PIODMA stream. The T6031
+ * display block is the T6030 block at 0x3_8400_0000 instead of
+ * 0x2_8c00_0000, with every offset inside it unchanged. Addresses,
+ * interrupts and DART windows are those of the J516C ADT.
+ *
+ * Every node stays status = "disabled". The display gate enables the DCP,
+ * its mailbox, the two DARTs and the display subsystem only when
+ * apple_t6031_display.enable=1 is on the kernel command line and the boot
+ * loader has set apple,t6031-handoff = <1>. Compatibles are t6031-specific,
+ * so a kernel that does not know them leaves the nodes unbound.
+ *
+ * Only the T6031 board files include this file: t6034.dtsi includes
+ * t6031.dtsi, and none of this is known to hold on T6034.
+ * The panel child is board-specific and is added by the board file.
+ */
+
+/ {
+	aliases {
+		/* The boot loader finds the display nodes through these. */
+		dcp = &dcp;
+		disp0 = &display;
+		disp0-piodma = &disp0_piodma;
+		disp0_piodma = &disp0_piodma;
+	};
+
+	/* The ADT gives no rate for it: this is the T6030 rate, unconfirmed here. */
+	clk_disp0: clock-disp0 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <712000000>;
+		clock-output-names = "clk_disp0";
+	};
+};
+
+&soc {
+	dcp_mbox: mailbox@386c08000 {
+		compatible = "apple,t6031-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x86c08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1029 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1030 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1031 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1032 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		power-domains = <&ps_disp_fe>;
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	dcp_dart: iommu@38530c000 {
+		compatible = "apple,t6031-dart", "apple,t8110-dart";
+		reg = <0x3 0x8530c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1008 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "disabled";
+	};
+
+	disp0_dart: iommu@385304000 {
+		compatible = "apple,t6031-dart", "apple,t8110-dart";
+		reg = <0x3 0x85304000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1008 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "disabled";
+	};
+
+	/*
+	 * The DCP's ADT clock gate depends on both DISP_CPU and DISP_FE, and
+	 * on T6031 DISP_FE is the child of DISP_CPU: DISP_FE keeps all three
+	 * display power states on.
+	 */
+	dcp: dcp@386c00000 {
+		compatible = "apple,t6031-dcp";
+		mboxes = <&dcp_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcp_dart 5>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3",
+			    "disp-4", "disp-5", "iop-vbar";
+		reg = <0x3 0x86c00000 0x0 0x4000>,
+		      <0x3 0x84000000 0x0 0x690000>,
+		      <0x3 0x84800000 0x0 0x690000>,
+		      <0x3 0x85320000 0x0 0x4000>,
+		      <0x3 0x85344000 0x0 0x4000>,
+		      <0x3 0x86800000 0x0 0x800000>,
+		      <0x2 0x903d0000 0x0 0x4000>,
+		      <0x3 0x86850000 0x0 0x4000>;
+		power-domains = <&ps_disp_fe>;
+		clocks = <&clk_disp0>;
+		#address-cells = <2>;
+		#size-cells = <2>;
+		status = "disabled";
+
+		disp0_piodma: piodma {
+			iommus = <&disp0_dart 4>;
+		};
+	};
+
+	display: display-subsystem {
+		compatible = "apple,t6031-display-subsystem";
+		iommus = <&disp0_dart 0>;
+		status = "disabled";
+	};
+};
+
+/*
+ * The display gate adds the PMP only on display power states the boot
+ * loader leaves on; the power state driver does not read this.
+ */
+&ps_disp_sys {
+	/* The bootloader leaves the internal display powered. */
+	apple,inherited-on;
+};
+
+&ps_disp_fe {
+	/* The bootloader leaves the internal display powered. */
+	apple,inherited-on;
+};
+
+&ps_disp_cpu {
+	/* The bootloader leaves the internal display powered. */
+	apple,inherited-on;
+};

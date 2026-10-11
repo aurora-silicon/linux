@@ -10,6 +10,7 @@
 /dts-v1/;
 
 #include "t6031.dtsi"
+#include "t6031-dcp.dtsi"
 #include "t603x-j514-j516.dtsi"
 
 / {
@@ -27,6 +28,20 @@
 
 &bluetooth0 {
 	brcm,board-type = "apple,jura";
+};
+
+/*
+ * The J516S values (t6030-j516s.dts): the same chassis and panel.
+ * Not yet read from a J516C.
+ */
+&dcp {
+	panel {
+		compatible = "apple,panel-j516", "apple,panel-mini-led", "apple,panel";
+		width-mm = <346>;
+		height-mm = <223>;
+		adj-height-mm = <216>;
+		apple,max-brightness = <500>;
+	};
 };
 
 &aop_audio {
