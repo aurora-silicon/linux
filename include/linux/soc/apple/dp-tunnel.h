@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
+/* SPDX-License-Identifier: (GPL-2.0-only OR MIT) AND GPL-2.0-only */
 /*
  * DisplayPort over Thunderbolt on Apple silicon: the pieces that bring up a
  * DP tunnel live in the Thunderbolt glue, appledrm, the ATC PHY and the
@@ -45,6 +45,11 @@ int apple_atc_dp_tunnel_open(struct phy *phy);
  * enable set and link_up() re-asserts it. The caller keeps the output
  * selected (holds the mux) around both. Supports t8103 and T602X crossbars.
  */
+/* Fixed DP PHY: obtain its live clock and coding; other PHYs return unsupported. */
+int apple_dp_phy_link_config(struct phy *phy, unsigned int *pclk, bool *uhbr);
+
+/* Configure a selected, inactive route on the four-clock crossbar layout. */
+int apple_dpxbar_link_configure(struct mux_control *mux, unsigned int pclk, bool uhbr);
 int apple_dpxbar_link_down(struct mux_control *mux);
 int apple_dpxbar_link_up(struct mux_control *mux);
 int apple_dpxbar_tunnel_select_source(struct mux_control *mux, int state);

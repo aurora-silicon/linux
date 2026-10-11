@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) AND GPL-2.0-only
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/mux/apple,display-crossbar.yaml#
@@ -11,8 +11,8 @@ maintainers:
 
 description:
   Routes display pipelines to the DisplayPort transmitters and inputs
-  of an Apple Type-C PHY. Each crossbar exposes three mux controls,
-  selected by the consumer's mux specifier.
+  of an Apple Type-C PHY. Older layouts expose three mux controls; the T8142/T6050 layout
+  exposes five. The consumer selects an output using the mux specifier.
 
 allOf:
   - $ref: mux-controller.yaml#
@@ -24,9 +24,20 @@ properties:
       - apple,t8112-display-crossbar
       - apple,t6000-display-crossbar
       - apple,t6020-display-crossbar
+      - apple,t8142-display-crossbar
+      - apple,t6050-display-crossbar
 
   reg:
     maxItems: 1
+
+  power-domains:
+    minItems: 2
+    maxItems: 2
+
+  power-domain-names:
+    items:
+      - const: usb-aon
+      - const: common
 
   '#mux-control-cells':
     const: 1

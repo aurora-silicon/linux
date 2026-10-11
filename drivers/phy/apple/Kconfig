@@ -21,3 +21,13 @@ config PHY_APPLE_DPTX
 	  such as the M2.
 	  This driver provides support for DisplayPort and is used on the
 	  Mac mini (M2 and M2 Pro, 2023).
+
+config PHY_APPLE_T6050_DP
+	tristate "Apple T6050 fixed DisplayPort PHY"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on PM
+	select GENERIC_PHY
+	select APPLE_TUNABLE
+	help
+	  Fixed four-lane DisplayPort PHY for the T6050 HDMI bridge path.
+	  Requires named register banks, power domains and firmware tunables.
