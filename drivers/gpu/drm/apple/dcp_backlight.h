@@ -6,13 +6,20 @@
 
 #include <linux/errno.h>
 #include <linux/limits.h>
+#include <linux/math64.h>
 #include <linux/minmax.h>
 #include <linux/types.h>
 
-/* Commanded nits, independent of firmware encoding. No fade policy. */
+/*
+ * Commanded nits, independent of firmware encoding.  target is the requested
+ * level and level the one presented while the panel is lit.  They differ only
+ * while a fade runs; the caller supplies the fade's clock.
+ */
 struct dcp_backlight_state {
 	u32 maximum;
 	u32 target;
+	u32 level;
+	u32 fade_from;
 	u32 actual;
 	u32 sent_nits;
 	u64 sequence;
@@ -24,6 +31,10 @@ struct dcp_backlight_state {
 	bool suspended;
 	bool dirty;
 	bool in_flight;
+	/* Fade between lit levels instead of jumping to them. */
+	bool fade;
+	/* A fade from fade_from to target is running. */
+	bool fading;
 	/*
 	 * The panel shows a level Linux knows: the loader's reported level, or
 	 * one a completed present carried.  A default used for registration
@@ -73,6 +84,7 @@ static inline int dcp_bl_init(struct dcp_backlight_state *state, u32 maximum,
 	*state = (struct dcp_backlight_state) {
 		.maximum = maximum,
 		.target = nits,
+		.level = nits,
 		.actual = nits,
 		.ready = true,
 		.level_known = inherited_valid,
@@ -89,21 +101,40 @@ static inline bool dcp_bl_seed(struct dcp_backlight_state *state, u32 nits)
 	if (!state->ready || state->controlled || nits > state->maximum)
 		return false;
 	state->target = nits;
+	state->level = nits;
 	state->actual = nits;
 	state->level_known = true;
 	return true;
 }
 
-static inline u32 dcp_bl_effective(const struct dcp_backlight_state *state)
+static inline bool dcp_bl_lit(const struct dcp_backlight_state *state)
 {
-	if (state->dpms_off || state->core_blank || state->suspended)
-		return 0;
-	return state->target;
+	return !state->dpms_off && !state->core_blank && !state->suspended;
 }
 
+static inline u32 dcp_bl_effective(const struct dcp_backlight_state *state)
+{
+	return dcp_bl_lit(state) ? state->level : 0;
+}
+
+/* Stop a running fade and present the target directly. */
+static inline void dcp_bl_jump(struct dcp_backlight_state *state)
+{
+	state->fading = false;
+	state->level = state->target;
+	state->dirty = true;
+}
+
+/*
+ * With fades enabled, a new level for a panel that stays lit at a known level
+ * starts a fade from the level presented last; dcp_bl_fade_step() moves it.
+ * Blanking, unblanking and a level the panel may not show still jump.
+ */
 static inline int dcp_bl_request(struct dcp_backlight_state *state, u32 nits,
 				 bool core_blank, bool suspended)
 {
+	bool was_lit = dcp_bl_lit(state);
+
 	if (!state->ready)
 		return -ENODATA;
 	if (nits > state->maximum)
@@ -119,9 +150,42 @@ static inline int dcp_bl_request(struct dcp_backlight_state *state, u32 nits,
 		state->target = nits;
 		state->core_blank = core_blank;
 		state->suspended = suspended;
-		state->dirty = true;
+		if (state->fade && state->level_known && was_lit &&
+		    dcp_bl_lit(state) && state->level != nits) {
+			state->fade_from = state->level;
+			state->fading = true;
+		} else {
+			dcp_bl_jump(state);
+		}
 	}
 	return 0;
+}
+
+/*
+ * Move a running fade to @elapsed of @duration, in any one unit.  The level
+ * follows a straight line from the level presented when the fade started,
+ * and the last step is the target itself.  Returns true while the fade runs.
+ */
+static inline bool dcp_bl_fade_step(struct dcp_backlight_state *state,
+				    u32 elapsed, u32 duration)
+{
+	u32 from = state->fade_from, to = state->target, level;
+
+	if (!state->fading)
+		return false;
+	if (elapsed >= duration) {
+		level = to;
+		state->fading = false;
+	} else if (to >= from) {
+		level = from + div_u64(mul_u32_u32(to - from, elapsed), duration);
+	} else {
+		level = from - div_u64(mul_u32_u32(from - to, elapsed), duration);
+	}
+	if (state->level != level) {
+		state->level = level;
+		state->dirty = true;
+	}
+	return state->fading;
 }
 
 static inline int dcp_bl_dpms(struct dcp_backlight_state *state, bool on)
@@ -132,7 +196,7 @@ static inline int dcp_bl_dpms(struct dcp_backlight_state *state, bool on)
 	state->retries = 0;
 	if (state->dpms_off != !on) {
 		state->dpms_off = !on;
-		state->dirty = true;
+		dcp_bl_jump(state);
 	}
 	return 0;
 }

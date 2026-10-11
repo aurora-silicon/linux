@@ -411,6 +411,9 @@ struct apple_dcp {
 		spinlock_t lock;
 		struct dcp_backlight_state state;
 		void (*kick)(struct apple_dcp *dcp);
+		/* Steps a running fade; fade_start is its start in jiffies. */
+		struct delayed_work fade_work;
+		unsigned long fade_start;
 		/* Rate limit for firmware re-send requests. */
 		unsigned long resent_at;
 		bool resent;
@@ -466,6 +469,9 @@ void iomfb_queue_crc_h17p(struct apple_dcp *dcp, u32 swap_id);
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
 void dcp_handle_hotplug_actions(struct apple_dcp *dcp, unsigned int action);
 
+int dcp_backlight_init(struct apple_dcp *dcp, struct device *dev);
+void dcp_backlight_stop(struct apple_dcp *dcp);
+void dcp_backlight_finish_fade(struct apple_dcp *dcp);
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);

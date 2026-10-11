@@ -352,6 +352,155 @@ static void backlight_seed_known_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, dcp_bl_resend(&state));
 }
 
+static void backlight_fade_test(struct kunit *test)
+{
+	struct dcp_backlight_state state;
+	struct dcp_backlight_present present;
+
+	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 600, true, 100, false, 0), 0);
+	state.fade = true;
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 400, false, false), 0);
+	KUNIT_EXPECT_TRUE(test, state.fading);
+	KUNIT_EXPECT_FALSE(test, state.dirty);
+	KUNIT_EXPECT_EQ(test, state.target, 400U);
+	KUNIT_EXPECT_EQ(test, dcp_bl_effective(&state), 100U);
+
+	/* The start of the fade is the level already shown. */
+	KUNIT_EXPECT_TRUE(test, dcp_bl_fade_step(&state, 0, 250));
+	KUNIT_EXPECT_FALSE(test, state.dirty);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_fade_step(&state, 125, 250));
+	KUNIT_EXPECT_TRUE(test, state.dirty);
+	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
+	KUNIT_EXPECT_EQ(test, present.nits, 250U);
+
+	/* Steps during a present merge into the next one. */
+	KUNIT_EXPECT_TRUE(test, dcp_bl_fade_step(&state, 150, 250));
+	KUNIT_EXPECT_TRUE(test, dcp_bl_fade_step(&state, 200, 250));
+	KUNIT_EXPECT_EQ(test, dcp_bl_prepare(&state, true, &present), -EBUSY);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_complete(&state, present.sequence, true));
+	KUNIT_EXPECT_EQ(test, state.actual, 250U);
+	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
+	KUNIT_EXPECT_EQ(test, present.nits, 340U);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_complete(&state, present.sequence, true));
+
+	/* The last step is exactly the target, however late it runs. */
+	KUNIT_EXPECT_FALSE(test, dcp_bl_fade_step(&state, 1000, 250));
+	KUNIT_EXPECT_FALSE(test, state.fading);
+	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
+	KUNIT_EXPECT_EQ(test, present.nits, 400U);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_complete(&state, present.sequence, true));
+	KUNIT_EXPECT_EQ(test, state.actual, 400U);
+	KUNIT_EXPECT_FALSE(test, dcp_bl_fade_step(&state, 250, 250));
+	KUNIT_EXPECT_FALSE(test, state.dirty);
+
+	/* Fading down reaches the target too, including zero. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 0, false, false), 0);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_fade_step(&state, 249, 250));
+	KUNIT_EXPECT_EQ(test, dcp_bl_effective(&state), 2U);
+	KUNIT_EXPECT_FALSE(test, dcp_bl_fade_step(&state, 250, 250));
+	KUNIT_EXPECT_EQ(test, dcp_bl_effective(&state), 0U);
+}
+
+static void backlight_fade_restart_test(struct kunit *test)
+{
+	struct dcp_backlight_state state;
+
+	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 600, true, 100, false, 0), 0);
+	state.fade = true;
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 500, false, false), 0);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_fade_step(&state, 100, 250));
+	KUNIT_EXPECT_EQ(test, state.level, 260U);
+
+	/* Repeating the target keeps the running fade. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 500, false, false), 0);
+	KUNIT_EXPECT_TRUE(test, state.fading);
+	KUNIT_EXPECT_EQ(test, state.fade_from, 100U);
+
+	/* A new level replaces it, starting from the level presented last. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 60, false, false), 0);
+	KUNIT_EXPECT_TRUE(test, state.fading);
+	KUNIT_EXPECT_EQ(test, state.fade_from, 260U);
+	KUNIT_EXPECT_EQ(test, state.level, 260U);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_fade_step(&state, 125, 250));
+	KUNIT_EXPECT_EQ(test, state.level, 160U);
+	KUNIT_EXPECT_FALSE(test, dcp_bl_fade_step(&state, 250, 250));
+	KUNIT_EXPECT_EQ(test, state.level, 60U);
+
+	/* A new level equal to the one presented ends the fade there. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 300, false, false), 0);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_fade_step(&state, 125, 250));
+	KUNIT_EXPECT_EQ(test, state.level, 180U);
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 180, false, false), 0);
+	KUNIT_EXPECT_FALSE(test, state.fading);
+	KUNIT_EXPECT_EQ(test, dcp_bl_effective(&state), 180U);
+
+	/* No overflow over the whole range a panel ceiling may have. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, INT_MAX, true, 0, false, 0), 0);
+	state.fade = true;
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, INT_MAX, false, false), 0);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_fade_step(&state, 249, 250));
+	KUNIT_EXPECT_EQ(test, state.level, (u32)div_u64((u64)INT_MAX * 249, 250));
+	KUNIT_EXPECT_FALSE(test, dcp_bl_fade_step(&state, 250, 250));
+	KUNIT_EXPECT_EQ(test, state.level, (u32)INT_MAX);
+}
+
+static void backlight_fade_blank_test(struct kunit *test)
+{
+	struct dcp_backlight_state state;
+	struct dcp_backlight_present present;
+
+	/* DPMS off and on during a fade jump, as without fades. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 600, true, 100, false, 0), 0);
+	state.fade = true;
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 400, false, false), 0);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_fade_step(&state, 125, 250));
+	KUNIT_ASSERT_EQ(test, dcp_bl_dpms(&state, false), 0);
+	KUNIT_EXPECT_FALSE(test, state.fading);
+	KUNIT_EXPECT_TRUE(test, state.dirty);
+	KUNIT_EXPECT_EQ(test, dcp_bl_effective(&state), 0U);
+	KUNIT_EXPECT_FALSE(test, dcp_bl_fade_step(&state, 200, 250));
+	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
+	KUNIT_EXPECT_EQ(test, present.nits, 0U);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_complete(&state, present.sequence, true));
+	KUNIT_ASSERT_EQ(test, dcp_bl_dpms(&state, true), 0);
+	KUNIT_EXPECT_FALSE(test, state.fading);
+	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
+	KUNIT_EXPECT_EQ(test, present.nits, 400U);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_complete(&state, present.sequence, true));
+
+	/* A level set while blanked is shown at once on unblank. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 400, true, false), 0);
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 200, true, false), 0);
+	KUNIT_EXPECT_FALSE(test, state.fading);
+	KUNIT_EXPECT_EQ(test, dcp_bl_effective(&state), 0U);
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 200, false, false), 0);
+	KUNIT_EXPECT_FALSE(test, state.fading);
+	KUNIT_EXPECT_EQ(test, dcp_bl_effective(&state), 200U);
+
+	/* Suspend during a fade blanks at once; resume shows the target. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 500, false, false), 0);
+	KUNIT_EXPECT_TRUE(test, dcp_bl_fade_step(&state, 50, 250));
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 500, true, true), 0);
+	KUNIT_EXPECT_FALSE(test, state.fading);
+	KUNIT_EXPECT_EQ(test, dcp_bl_effective(&state), 0U);
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 500, false, false), 0);
+	KUNIT_EXPECT_EQ(test, dcp_bl_effective(&state), 500U);
+
+	/* A level the panel may not show yet is presented directly. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 525, false, 0, true, 262), 0);
+	state.fade = true;
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 100, false, false), 0);
+	KUNIT_EXPECT_FALSE(test, state.fading);
+	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
+	KUNIT_EXPECT_EQ(test, present.nits, 100U);
+
+	/* Without fades a new level is presented directly. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 600, true, 100, false, 0), 0);
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 400, false, false), 0);
+	KUNIT_EXPECT_FALSE(test, state.fading);
+	KUNIT_EXPECT_EQ(test, dcp_bl_effective(&state), 400U);
+}
+
 static struct kunit_case backlight_cases[] = {
 	KUNIT_CASE(backlight_millinits_takeover_test),
 	KUNIT_CASE(backlight_takeover_test),
@@ -366,6 +515,9 @@ static struct kunit_case backlight_cases[] = {
 	KUNIT_CASE(backlight_fallback_test),
 	KUNIT_CASE(backlight_fallback_same_level_test),
 	KUNIT_CASE(backlight_seed_known_test),
+	KUNIT_CASE(backlight_fade_test),
+	KUNIT_CASE(backlight_fade_restart_test),
+	KUNIT_CASE(backlight_fade_blank_test),
 	{}
 };
 

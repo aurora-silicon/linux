@@ -82,6 +82,14 @@ static u32 brightness_part2[] = {
 };
 
 
+/*
+ * A new level fades in over DCP_BL_FADE_MS, one brightness-only present per
+ * step at most.  Steps that come faster than presents complete merge, so the
+ * step only bounds how smooth the fade can be.
+ */
+#define DCP_BL_FADE_MS		250U
+#define DCP_BL_FADE_STEP_MS	16U
+
 bool dcp_backlight_active(struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_H17P &&
@@ -145,8 +153,10 @@ int dcp_backlight_configure(struct apple_dcp *dcp, u32 maximum,
 		ret = dcp_bl_init(&dcp->backlight.state, maximum,
 				  inherited_valid, inherited,
 				  default_valid, default_nits);
-		if (!ret)
+		if (!ret) {
+			dcp->backlight.state.fade = true;
 			dcp->backlight.kick = kick;
+		}
 	}
 	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
 	mutex_unlock(&dcp->bl_register_mutex);
@@ -172,6 +182,71 @@ static void dcp_backlight_kick(struct apple_dcp *dcp)
 
 	if (kick)
 		kick(dcp);
+}
+
+static void dcp_backlight_fade_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work),
+					     struct apple_dcp,
+					     backlight.fade_work);
+	unsigned long flags;
+	bool running, kick;
+	u32 elapsed;
+
+	if (READ_ONCE(dcp->quiescing) || READ_ONCE(dcp->crashed) ||
+	    READ_ONCE(dcp->iomfb.stopped))
+		return;
+
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	elapsed = jiffies_to_msecs(jiffies - dcp->backlight.fade_start);
+	running = dcp_bl_fade_step(&dcp->backlight.state, elapsed,
+				   DCP_BL_FADE_MS);
+	/* A rejected present is retried with backoff, carrying the new level. */
+	kick = dcp->backlight.state.dirty && !dcp->backlight.state.retries;
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+
+	if (kick)
+		dcp_backlight_kick(dcp);
+	if (running)
+		queue_delayed_work(system_wq, &dcp->backlight.fade_work,
+				   msecs_to_jiffies(DCP_BL_FADE_STEP_MS));
+}
+
+void dcp_backlight_stop(struct apple_dcp *dcp)
+{
+	cancel_delayed_work_sync(&dcp->backlight.fade_work);
+}
+
+static void dcp_backlight_release(void *data)
+{
+	dcp_backlight_stop(data);
+}
+
+/*
+ * The backlight device is a devres of @dev, registered after probe, so it is
+ * unregistered before this action runs, and no request can start a fade
+ * afterwards.
+ */
+int dcp_backlight_init(struct apple_dcp *dcp, struct device *dev)
+{
+	spin_lock_init(&dcp->backlight.lock);
+	INIT_DELAYED_WORK(&dcp->backlight.fade_work, dcp_backlight_fade_work);
+	return devm_add_action_or_reset(dev, dcp_backlight_release, dcp);
+}
+
+/* Present the target of a running fade at once, e.g. before system sleep. */
+void dcp_backlight_finish_fade(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	bool kick;
+
+	cancel_delayed_work_sync(&dcp->backlight.fade_work);
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	dcp_bl_fade_step(&dcp->backlight.state, DCP_BL_FADE_MS, DCP_BL_FADE_MS);
+	kick = dcp->backlight.state.dirty;
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	if (kick)
+		dcp_backlight_kick(dcp);
 }
 
 int dcp_backlight_dpms(struct apple_dcp *dcp, bool on)
@@ -395,14 +470,25 @@ static int dcp_set_brightness(struct backlight_device *bd)
 		return -ENODEV;
 
 	if (dcp_backlight_active(dcp)) {
+		struct dcp_backlight_state *state = &dcp->backlight.state;
+		bool fade;
+		u32 old;
+
 		/* Preserve the requested level even while the core forces zero. */
 		spin_lock_irqsave(&dcp->backlight.lock, flags);
-		ret = dcp_bl_request(&dcp->backlight.state,
-				     bd->props.brightness,
+		old = state->target;
+		ret = dcp_bl_request(state, bd->props.brightness,
 				     backlight_is_blank(bd),
 				     bd->props.state & BL_CORE_SUSPENDED);
+		/* A new level restarts the fade from the level presented last. */
+		fade = !ret && state->fading && state->target != old;
+		if (fade)
+			dcp->backlight.fade_start = jiffies;
 		spin_unlock_irqrestore(&dcp->backlight.lock, flags);
-		if (!ret)
+		if (fade)
+			queue_delayed_work(system_wq, &dcp->backlight.fade_work,
+					   msecs_to_jiffies(DCP_BL_FADE_STEP_MS));
+		else if (!ret)
 			dcp_backlight_kick(dcp);
 		return ret;
 	}
