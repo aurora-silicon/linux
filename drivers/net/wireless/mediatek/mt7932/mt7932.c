@@ -277,16 +277,27 @@ static void mt_service(struct mt7932 *m)
 	u32 causes = mt_read(m, W + 0x200) & m->irq_mask;
 	unsigned int i;
 
-	mt_data_clean(m);
-	for (i = 0; i < ARRAY_SIZE(m->rx); i++)
-		if (m->rx[i].count)
-			mt_rx_drain(m, &m->rx[i]);
+	/*
+	 * Acknowledge before servicing the rings. A completion that lands
+	 * while they are being drained then sets its status bit again and
+	 * raises a new interrupt once the mask is restored, instead of being
+	 * cleared by a late acknowledgment and left waiting for an unrelated
+	 * interrupt. Read the status back so that the acknowledgment has
+	 * reached the device, and every descriptor it covers is visible,
+	 * before the rings are read.
+	 */
 	if (causes & BIT(29)) {
 		u32 sw = mt_read(m, W + 0x1f0);
 
 		mt_write(m, W + 0x1f0, sw);
 	}
 	mt_write(m, W + 0x200, causes);
+	mt_read(m, W + 0x200);
+
+	mt_data_clean(m);
+	for (i = 0; i < ARRAY_SIZE(m->rx); i++)
+		if (m->rx[i].count)
+			mt_rx_drain(m, &m->rx[i]);
 	if (READ_ONCE(m->running) && !poll_test)
 		mt_write(m, W + 0x204, m->irq_mask);
 }
