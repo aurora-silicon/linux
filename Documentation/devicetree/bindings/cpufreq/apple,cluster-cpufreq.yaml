@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) AND GPL-2.0-only
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/cpufreq/apple,cluster-cpufreq.yaml#
@@ -37,6 +37,7 @@ properties:
       - const: apple,s5l8960x-cluster-cpufreq
       - const: apple,t8140-cluster-cpufreq
       - const: apple,t8142-cluster-cpufreq
+      - const: apple,t6050-cluster-cpufreq
       - const: apple,t8152-cluster-cpufreq
       - items:
           - const: apple,t6020-cluster-cpufreq
@@ -57,6 +58,16 @@ properties:
           - description: Cluster lane (0 for E, 1 for P on T8140)
             enum: [0, 1]
 
+  apple,firmware-managed-thermal:
+    type: boolean
+    description: |
+      The boot producer has retained active firmware thermal control and
+      qualified it for every OPP published for this cluster. Firmware
+      throttling, voltage and PLL ownership must remain intact throughout
+      the guest lifetime, including after PMP reinitialization. This is
+      an ownership assertion, not a request to enable thermal control.
+      Without it the T6050 driver refuses DVFS registration.
+
   '#performance-domain-cells':
     const: 0
 
@@ -64,6 +75,16 @@ required:
   - compatible
   - reg
   - '#performance-domain-cells'
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-cluster-cpufreq
+    then:
+      required:
+        - apple,firmware-managed-thermal
 
 additionalProperties: false
 
