@@ -969,6 +969,22 @@ static const struct media_device_ops isp_media_device_ops = {
 	.link_notify = v4l2_pipeline_link_notify,
 };
 
+/*
+ * The video device's file operations can run until its last open file is
+ * closed, after the driver has been unbound, so the state they reach is freed
+ * only with the last reference to the v4l2_device: the one remove drops, or
+ * the one the video device holds while it is open.
+ */
+static void apple_isp_release(struct v4l2_device *v4l2_dev)
+{
+	struct apple_isp *isp = container_of(v4l2_dev, struct apple_isp,
+					     v4l2_dev);
+
+	v4l2_ctrl_handler_free(&isp->ctrl_handler);
+	media_device_cleanup(&isp->mdev);
+	kfree(isp);
+}
+
 static void isp_free_meta_surfaces(struct apple_isp *isp)
 {
 	for (int i = 0; i < ARRAY_SIZE(isp->capmeta_surfs); i++) {
@@ -1093,6 +1109,9 @@ int apple_isp_setup_video(struct apple_isp *isp)
 		goto v4l2_unregister;
 	}
 
+	/* From here on, the last v4l2_device reference frees the state. */
+	isp->v4l2_dev.release = apple_isp_release;
+
 	return 0;
 
 v4l2_unregister:
@@ -1108,13 +1127,15 @@ surf_cleanup:
 	return err;
 }
 
+/*
+ * Unregister the device nodes. An open file keeps the video device, and
+ * with it the driver state, until it is closed: see apple_isp_release().
+ */
 void apple_isp_remove_video(struct apple_isp *isp)
 {
 	vb2_video_unregister_device(&isp->vdev);
 	v4l2_device_unregister(&isp->v4l2_dev);
-	v4l2_ctrl_handler_free(&isp->ctrl_handler);
 	media_device_unregister(&isp->mdev);
-	media_device_cleanup(&isp->mdev);
 }
 
 /* After apple_isp_remove_video() and with the firmware stopped */
