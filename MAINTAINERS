@@ -4360,7 +4360,7 @@ F:	rust/kernel/auxiliary.rs
 F:	samples/rust/rust_driver_auxiliary.rs
 
 AURORA PLATFORM MMIO INTERFACE
-M:	Dj <43033058+DjDeveloperr@users.noreply.github.com>
+M:	Dj <hey@djdev.me>
 S:	Maintained
 F:	Documentation/devicetree/bindings/firmware/aurora,apif-mmio.yaml
 F:	Documentation/devicetree/bindings/iommu/apple,dart-apif.yaml

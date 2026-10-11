@@ -7,7 +7,7 @@ $schema: http://devicetree.org/meta-schemas/core.yaml#
 title: Apple DART mediated through Aura APIF
 
 maintainers:
-  - Dj <43033058+DjDeveloperr@users.noreply.github.com>
+  - Dj <hey@djdev.me>
 
 description: |
   A DART instance accessed through native SPTM calls rather than guest MMIO.
