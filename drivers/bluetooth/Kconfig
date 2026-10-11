@@ -37,7 +37,9 @@ config BT_MTK7932_PCIE
 	  is mounted and read their firmware when probed, so say M, like the
 	  Wi-Fi driver.
 	  System suspend uses the firmware sleep handshake and preserves DMA
-	  storage. Hibernation and automatic firmware recovery are unsupported.
+	  storage. Hibernation and firmware reloading are unsupported. A
+	  controller that stops answering commands is reset over HCI and set
+	  up again; if that setup fails, the transport stays faulted.
 	  Removal drains the PCI function before releasing device-visible memory;
 	  an unconfirmed drain retains it until a full hardware reset.
 

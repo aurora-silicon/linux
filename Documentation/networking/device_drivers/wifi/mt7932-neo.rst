@@ -121,8 +121,11 @@ Limitations
   Removal first quiesces firmware, then stops work and interrupts, disables
   bus mastering and drains pending
   PCI transactions before freeing DMA. An unconfirmed drain retains storage
-  until reset. Firmware recovery and warm reprobe are unsupported; use a fresh
-  cold boot after removing or faulting an active transport.
+  until reset. A controller that stops answering commands, or reports a
+  hardware error, is reset over HCI and set up again; if that setup fails,
+  the transport faults. Firmware reloading and warm reprobe are
+  unsupported; use a fresh cold boot after removing or faulting an active
+  transport.
 * The Bluetooth software queue limit does not provide HCI backpressure;
   saturation can drop an accounted frame.
 * Arbitrary scan IEs, WPA3/SAE, required MFP, AP/P2P, general country-package
