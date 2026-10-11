@@ -1743,10 +1743,16 @@ static const struct iommu_ops apple_dart_apif_ops = {
 /* Used only after the PCI host has stopped every endpoint on this DART.
  * Native POWERDOWN/POWERUP retains the SPTM-owned tables and live mappings.
  */
+static int apif_other_group_device(struct device *member, void *data)
+{
+	return member == data ? 0 : -EBUSY;
+}
+
 int apple_dart_apif_set_power(struct device *dev, bool on)
 {
 	struct apple_dart_apif_master *master;
 	struct apple_dart_apif *dart;
+	struct iommu_group *group;
 	unsigned long flags;
 	int ret;
 
@@ -1757,8 +1763,25 @@ int apple_dart_apif_set_power(struct device *dev, bool on)
 	if (!master || master->num_darts != 1)
 		return -ENODEV;
 	dart = master->streams[0].dart;
+	group = iommu_group_get(dev);
+	if (!group)
+		return -ENODEV;
+	ret = iommu_group_for_each_dev(group, dev, apif_other_group_device);
+	if (ret)
+		goto put_group;
+	mutex_lock(&apple_dart_apif_groups_lock);
+	/* Native DISABLE affects the entire unit. Retained firmware streams or
+	 * another Linux group must never be stopped by one endpoint's reset.
+	 */
+	for (unsigned int sid = 0; sid < dart->num_streams; sid++) {
+		if (dart->retained[sid] ||
+		    (dart->sid2group[sid] && dart->sid2group[sid] != group)) {
+			ret = -EBUSY;
+			goto unlock_groups;
+		}
+	}
 	mutex_lock(&dart->init_lock);
-	if (!dart->inited) {
+	if (!dart->inited || dart->ownership_uncertain) {
 		ret = -EINVAL;
 		goto out;
 	}
@@ -1769,6 +1792,10 @@ int apple_dart_apif_set_power(struct device *dev, bool on)
 	spin_unlock_irqrestore(&dart->batch_lock, flags);
 out:
 	mutex_unlock(&dart->init_lock);
+unlock_groups:
+	mutex_unlock(&apple_dart_apif_groups_lock);
+put_group:
+	iommu_group_put(group);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_dart_apif_set_power);

@@ -409,3 +409,14 @@ source "drivers/pci/controller/dwc/Kconfig"
 source "drivers/pci/controller/mobiveil/Kconfig"
 source "drivers/pci/controller/plda/Kconfig"
 endmenu
+
+config PCIE_APPLE_APIF
+	tristate "Preinitialized Apple PCIe host for Aura guests"
+	depends on ARM64 && OF && PCI_MSI
+	depends on APPLE_DART_APIF
+	select PCI_HOST_COMMON
+	help
+	  Admit an ECAM host initialized by the boot producer. Allocate MSI
+	  vectors from the native AIC range described in its guest device tree.
+	  A matching T6050 layout additionally supports a controlled preboot
+	  port transition; other layouts never enter that sequence.

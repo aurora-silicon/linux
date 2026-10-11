@@ -67,3 +67,4 @@ endif
 endif
 
 obj-$(CONFIG_PCIE_APPLE_PIODMA_DIAG) += pcie-apple-piodma-diag.o
+obj-$(CONFIG_PCIE_APPLE_APIF) += apple-apif/
