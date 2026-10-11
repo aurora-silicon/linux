@@ -6,6 +6,16 @@
 
 menu "Firmware Drivers"
 
+config AURORA_APIF_MMIO
+	tristate "Aurora platform MMIO interface"
+	depends on ARM64 && OF
+	help
+	  Submit synchronous, batched platform operations to an Aura monitor.
+	  The interface forwards native SPTM selectors, arguments and results
+	  without interpreting peripheral policy. Clients own their buffers.
+	  Submission is synchronous and supports atomic-context consumers.
+
+
 source "drivers/firmware/arm_scmi/Kconfig"
 
 config ARM_SCPI_PROTOCOL
