@@ -4365,7 +4365,14 @@ S:	Maintained
 F:	Documentation/devicetree/bindings/firmware/aurora,apif-mmio.yaml
 F:	Documentation/devicetree/bindings/iommu/apple,dart-apif.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,sart-apif.yaml
-F:	Documentation/driver-api/firmware/aurora-apif.rst
+F:	Documentation/driver-api/firmware/aurora-apif*.rst
+F:	Documentation/devicetree/bindings/nvme/apple,nvme-apif.yaml
+F:	Documentation/devicetree/bindings/pci/apple,apif-pcie.yaml
+F:	arch/arm64/configs/aurora-apif.config
+F:	drivers/nvme/host/apple-apif.h
+F:	drivers/pci/controller/apple-apif/
+F:	include/linux/pci-apple-apif.h
+F:	tools/aurora-apif/
 F:	drivers/firmware/aurora-apif-mmio.c
 F:	drivers/iommu/apple-dart-apif.c
 F:	drivers/soc/apple/apple-sart-apif.c
