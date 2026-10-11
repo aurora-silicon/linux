@@ -33,6 +33,13 @@
 #define DCPAUD_ELEMENTS_MAXSIZE		16384
 #define DCPAUD_PRODUCTATTRS_MAXSIZE	1024
 
+/*
+ * SIO takes one of its 64 descriptor slots per period, shared by all its
+ * channels, and up to three DP audio outputs use one SIO. A stream with
+ * more periods fails START with -ENOMEM.
+ */
+#define DCPAUD_PERIODS_MAX		16
+
 struct dcp_audio {
 	struct device *dev;
 	struct device *dcp_dev;
@@ -72,7 +79,7 @@ static const struct snd_pcm_hardware dcp_pcm_hw = {
 	.period_bytes_min	= 4096, /* TODO */
 	.period_bytes_max	= SIZE_MAX,
 	.periods_min		= 2,
-	.periods_max		= UINT_MAX,
+	.periods_max		= DCPAUD_PERIODS_MAX,
 };
 
 /*
@@ -98,7 +105,7 @@ static const struct snd_pcm_hardware dcp_pcm_hw_unplugged = {
 	.period_bytes_min	= 4096,
 	.period_bytes_max	= SIZE_MAX,
 	.periods_min		= 2,
-	.periods_max		= UINT_MAX,
+	.periods_max		= DCPAUD_PERIODS_MAX,
 };
 
 static int dcpaud_read_remote_info(struct dcp_audio *dcpaud)
@@ -311,7 +318,7 @@ refine:
 	hw.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
 			  SNDRV_PCM_INFO_INTERLEAVED;
 	hw.periods_min = 2;
-	hw.periods_max = UINT_MAX;
+	hw.periods_max = DCPAUD_PERIODS_MAX;
 	hw.period_bytes_min = 256;
 	hw.period_bytes_max = SIZE_MAX; // TODO dma_get_max_seg_size(dma_dev);
 	hw.buffer_bytes_max = SIZE_MAX;
