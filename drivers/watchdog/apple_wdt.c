@@ -187,8 +187,10 @@ static int apple_wdt_probe(struct platform_device *pdev)
 	if (wdt_ctrl & APPLE_WDT_CTRL_RESET_EN)
 		set_bit(WDOG_HW_RUNNING, &wdt->wdd.status);
 
+	wdt->wdd.parent = dev;
 	watchdog_init_timeout(&wdt->wdd, 0, dev);
 	apple_wdt_set_timeout(&wdt->wdd, wdt->wdd.timeout);
+	watchdog_set_nowayout(&wdt->wdd, WATCHDOG_NOWAYOUT);
 	watchdog_stop_on_unregister(&wdt->wdd);
 	watchdog_set_restart_priority(&wdt->wdd, 128);
 
