@@ -448,6 +448,8 @@ struct apple_dcp {
 	bool tb_clock_ok;
 	/* CRTC powered off while the Type-C cable stays attached */
 	bool typec_crtc_off;
+	/* dcp_poweron() reconnects DPTX; its own modeset follows the HPD */
+	bool typec_poweron_hpd;
 	/* IOMFB reports its video interface ready after DPTX link training. */
 	struct completion typec_iomfb_hpd_ready;
 	struct delayed_work typec_reconnect_wq;

@@ -3460,6 +3460,8 @@ void dcp_poweron(struct platform_device *pdev)
 		if (READ_ONCE(dcp->typec_cable_connected)) {
 			cancel_delayed_work(&dcp->typec_reconnect_wq);
 			dcp->typec_reconnect_tries = 0;
+			/* the modeset of this commit follows, see dcpep_cb_hotplug() */
+			WRITE_ONCE(dcp->typec_poweron_hpd, true);
 			ret = dcp_dptx_connect(dcp, 0);
 			if (ret)
 				mod_delayed_work(system_freezable_wq,
@@ -3473,6 +3475,7 @@ void dcp_poweron(struct platform_device *pdev)
 					dev_warn(dcp->dev,
 						 "Type-C IOMFB hotplug not ready on wake\n");
 			}
+			WRITE_ONCE(dcp->typec_poweron_hpd, false);
 		}
 	} else if (dcp->hdmi_hpd) {
 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);

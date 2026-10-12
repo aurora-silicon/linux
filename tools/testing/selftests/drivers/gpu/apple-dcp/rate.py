@@ -925,7 +925,7 @@ static void dcp_tunnel_set_rate(struct apple_dcp *d,void *phy,unsigned rate) {
     struct { bool valid,changing; } mode_state;
     struct work_struct external_stop_work,vblank_wq;
     bool external_physically_absent,main_display,typec_crtc_off,external_cable,external_error,external_power_attempted,external_stopped;
-    bool external_hotplug_pending,external_hotplug_connected;
+    bool external_hotplug_pending,external_hotplug_connected,typec_poweron_hpd;
     u64 external_stop_generation,external_rx_generation,external_crtc_generation;
     unsigned swap_watchdog_retrains;int typec_iomfb_hpd_ready;''')
     stubs = r'''
