@@ -88,7 +88,11 @@ def tick(widget, clock):
             presented = previous.get_presentation_time()
             if presented:
                 feedback.add(presented)
-    if args.pattern == "moving":
+    surface = window.get_surface()
+    monitor = display.get_monitor_at_surface(surface) if surface else None
+    if monitor:
+        stats["actual_connector"] = monitor.get_connector()
+    if args.pattern == "moving" or stats["actual_connector"] != args.connector:
         widget.queue_draw()
     return GLib.SOURCE_CONTINUE
 
