@@ -1415,8 +1415,7 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy)
 
 /*
  * Route the PIPE to the backend the current mode needs. The state is recorded
- * whether or not the sequence succeeded: the PIPE is configured once per mode,
- * and a failed attempt is not retried on the next set_mode call.
+ * only after the sequence succeeds, so a failed attempt remains retryable.
  */
 static int atcphy_configure_pipehandler(struct apple_atcphy *atcphy, bool host)
 {
@@ -1436,7 +1435,8 @@ static int atcphy_configure_pipehandler(struct apple_atcphy *atcphy, bool host)
 		ret = atcphy_configure_pipehandler_dummy(atcphy);
 		break;
 	}
-	atcphy->pipe_state = state;
+	if (!ret)
+		atcphy->pipe_state = state;
 
 	return ret;
 }
@@ -1452,8 +1452,10 @@ static void atcphy_park_pipehandler(struct apple_atcphy *atcphy)
 		return;
 
 	ret = atcphy_configure_pipehandler_dummy(atcphy);
-	if (ret)
+	if (ret) {
 		dev_warn(atcphy->dev, "Failed to switch PIPE to dummy: %d\n", ret);
+		return;
+	}
 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 }
 
@@ -3281,8 +3283,13 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 		target_mode = APPLE_ATCPHY_MODE_USB2;
 
 	dev_dbg(atcphy->dev, "mux target=%u\n", target_mode);
-	if (atcphy->mode == target_mode && !atcphy->mode_dirty)
+	if (atcphy->mode == target_mode && !atcphy->mode_dirty) {
+		/* Retry a failed PIPE setup without disturbing the configured lanes. */
+		if (atcphy->fixed_usb2 && atcphy->host_active &&
+		    atcphy->pipe_state != atcphy_modes[target_mode].pipehandler_state)
+			return atcphy_configure_pipehandler(atcphy, true);
 		return 0;
+	}
 
 	switch (target_mode) {
 	case APPLE_ATCPHY_MODE_TBT:
