@@ -654,7 +654,7 @@ struct atcphy_hw {
  * @ss_tunables: The complete SuperSpeed tunable set was supplied
  * @dp_tunables: The complete T8140 DisplayPort bundle was supplied
  * @aux_power_requested: AUX power-up began and needs matching shutdown
- * @mode_dirty: J700 mode transition needs cleanup before it can be retried
+ * @mode_dirty: Mode transition needs cleanup before it can be retried
  * @dp_idle_pmas: J700 PMAs with an incomplete routing idle sequence
  * @dp_owned_pmas: J700 PMAs requiring main-link cleanup
  * @dp_spread_spectrum: J700 main-link spread-spectrum state
@@ -1962,6 +1962,9 @@ static int atcphy_dp_configure(struct apple_atcphy *atcphy, enum atcphy_dp_link_
 	u32 reg;
 
 	guard(mutex)(&atcphy->lock);
+	/* A failed transition may have asserted the PHY resets already. */
+	if (atcphy->mode_dirty)
+		return -EBUSY;
 	/* the AUSPLL is in use as the Thunderbolt DP tunnel pixel clock */
 	if (atcphy->tunnel_clock_on || atcphy->tunnel_saved)
 		return -EBUSY;
@@ -2714,8 +2717,7 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 			return ret;
 	}
 	/* Keep failed transitions retryable even when the requested mode is unchanged. */
-	if (atcphy->hw->has_t8140_dp)
-		atcphy->mode_dirty = true;
+	atcphy->mode_dirty = true;
 	/* the mode change below may power the PHY down: stop the tunnel clock first */
 	atc_tunnel_stop_t8103(atcphy);
 	atc_tunnel_restore(atcphy);
@@ -2839,10 +2841,14 @@ static int atcphy_usb2_init(struct phy *phy)
 {
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
 
-	if (!atcphy->fixed_usb2)
-		return 0;
-
 	guard(mutex)(&atcphy->lock);
+
+	/* A delayed shutdown may have completed after the last Type-C event. */
+	if (!atcphy->fixed_usb2) {
+		if (atcphy->mode == APPLE_ATCPHY_MODE_OFF || atcphy->mode_dirty)
+			return atcphy_configure(atcphy, atcphy->typec_mode);
+		return 0;
+	}
 
 	/*
 	 * dwc3 initialises its PHYs after releasing its reset, and asserting that
@@ -2853,7 +2859,7 @@ static int atcphy_usb2_init(struct phy *phy)
 	 * the Type-C mux last asked for, USB2 until a cable event says otherwise.
 	 */
 	set32(atcphy->regs.usb2phy + USB2PHY_SIG, USB2PHY_SIG_HOST);
-	if (atcphy->mode == APPLE_ATCPHY_MODE_OFF)
+	if (atcphy->mode == APPLE_ATCPHY_MODE_OFF || atcphy->mode_dirty)
 		return atcphy_configure(atcphy, atcphy->typec_mode);
 
 	atcphy_usb2_power_on(atcphy);
@@ -2910,6 +2916,9 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
 	 * PIPE handler once. Nothing needs to be done either when the PIPE is already routed to
 	 * the backend the current mode uses, which includes the dummy backend of the USB2 modes.
 	 */
+	/* A failed lane/domain transition must be restored before routing PIPE. */
+	if (atcphy->mode_dirty)
+		return -EBUSY;
 	if (atcphy->pipe_state == atcphy_modes[atcphy->mode].pipehandler_state)
 		return 0;
 

@@ -109,6 +109,26 @@ int dwc3_core_init(struct dwc3 *dwc);
 void dwc3_core_exit(struct dwc3 *dwc);
 
 /**
+ * dwc3_core_exit_after_phy_power_off - Finish a glue-owned core shutdown
+ * @dwc: Pointer to DWC3 controller context
+ *
+ * The glue must first stop host/gadget operation, clean up event buffers,
+ * release every core-owned generic PHY power reference and suspend legacy
+ * USB PHYs. This finishes PHY exit, clock disable and reset exactly once.
+ */
+void dwc3_core_exit_after_phy_power_off(struct dwc3 *dwc);
+
+/**
+ * dwc3_core_remove_no_shutdown - Release resources without a second shutdown
+ * @dwc: Pointer to DWC3 controller context
+ *
+ * The glue owns host/gadget and core shutdown, including reporting any
+ * failure to finish it. This releases software resources without repeating
+ * those operations or discarding another generic PHY reference.
+ */
+void dwc3_core_remove_no_shutdown(struct dwc3 *dwc);
+
+/**
  * dwc3_host_init - Initialize host mode operation
  * @dwc: Pointer to DWC3 controller context
  *
