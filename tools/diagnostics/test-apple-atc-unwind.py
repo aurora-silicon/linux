@@ -92,8 +92,8 @@ static void atcphy_apply_tunables(struct apple_atcphy *p, enum atcphy_mode mode)
 { (void)p; (void)mode; }
 static void atc_tunnel_stop_t8103(struct apple_atcphy *p) { (void)p; }
 static void atc_tunnel_restore(struct apple_atcphy *p) { (void)p; }
-static void atcphy_park_pipehandler(struct apple_atcphy *p)
-{ p->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY; }
+static int atcphy_park_pipehandler(struct apple_atcphy *p)
+{ p->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY; return 0; }
 static int atcphy_configure_pipehandler(struct apple_atcphy *p, bool host)
 { (void)host; p->pipe_state = atcphy_modes[p->mode].pipehandler_state; return 0; }
 ''')

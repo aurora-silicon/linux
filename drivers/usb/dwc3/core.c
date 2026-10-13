@@ -995,13 +995,19 @@ static void dwc3_clk_disable(struct dwc3 *dwc)
 	clk_disable_unprepare(dwc->bus_clk);
 }
 
+void dwc3_core_exit_after_phy_power_off(struct dwc3 *dwc)
+{
+	dwc3_phy_exit(dwc);
+	dwc3_clk_disable(dwc);
+	reset_control_assert(dwc->reset);
+}
+EXPORT_SYMBOL_GPL(dwc3_core_exit_after_phy_power_off);
+
 void dwc3_core_exit(struct dwc3 *dwc)
 {
 	dwc3_event_buffers_cleanup(dwc);
 	dwc3_phy_power_off(dwc);
-	dwc3_phy_exit(dwc);
-	dwc3_clk_disable(dwc);
-	reset_control_assert(dwc->reset);
+	dwc3_core_exit_after_phy_power_off(dwc);
 }
 EXPORT_SYMBOL_GPL(dwc3_core_exit);
 
@@ -2410,14 +2416,16 @@ static int dwc3_probe(struct platform_device *pdev)
 	return dwc3_core_probe(&probe_data);
 }
 
-void dwc3_core_remove(struct dwc3 *dwc)
+static void dwc3_core_remove_common(struct dwc3 *dwc, bool core_exited)
 {
 	pm_runtime_get_sync(dwc->dev);
 
-	dwc3_core_exit_mode(dwc);
+	if (!core_exited)
+		dwc3_core_exit_mode(dwc);
 	dwc3_debugfs_exit(dwc);
 
-	dwc3_core_exit(dwc);
+	if (!core_exited)
+		dwc3_core_exit(dwc);
 	dwc3_ulpi_exit(dwc);
 
 	pm_runtime_allow(dwc->dev);
@@ -2438,7 +2446,18 @@ void dwc3_core_remove(struct dwc3 *dwc)
 		power_supply_put(dwc->usb_psy);
 	}
 }
+
+void dwc3_core_remove(struct dwc3 *dwc)
+{
+	dwc3_core_remove_common(dwc, false);
+}
 EXPORT_SYMBOL_GPL(dwc3_core_remove);
+
+void dwc3_core_remove_no_shutdown(struct dwc3 *dwc)
+{
+	dwc3_core_remove_common(dwc, true);
+}
+EXPORT_SYMBOL_GPL(dwc3_core_remove_no_shutdown);
 
 static void dwc3_remove(struct platform_device *pdev)
 {

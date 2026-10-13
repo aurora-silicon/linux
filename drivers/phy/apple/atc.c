@@ -654,7 +654,7 @@ struct atcphy_hw {
  * @ss_tunables: The complete SuperSpeed tunable set was supplied
  * @dp_tunables: The complete T8140 DisplayPort bundle was supplied
  * @aux_power_requested: AUX power-up began and needs matching shutdown
- * @mode_dirty: J700 mode transition needs cleanup before it can be retried
+ * @mode_dirty: Mode transition needs cleanup before it can be retried
  * @dp_idle_pmas: J700 PMAs with an incomplete routing idle sequence
  * @dp_owned_pmas: J700 PMAs requiring main-link cleanup
  * @dp_spread_spectrum: J700 main-link spread-spectrum state
@@ -1415,8 +1415,7 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy)
 
 /*
  * Route the PIPE to the backend the current mode needs. The state is recorded
- * whether or not the sequence succeeded: the PIPE is configured once per mode,
- * and a failed attempt is not retried on the next set_mode call.
+ * only after the sequence succeeds, so a failed attempt remains retryable.
  */
 static int atcphy_configure_pipehandler(struct apple_atcphy *atcphy, bool host)
 {
@@ -1436,25 +1435,29 @@ static int atcphy_configure_pipehandler(struct apple_atcphy *atcphy, bool host)
 		ret = atcphy_configure_pipehandler_dummy(atcphy);
 		break;
 	}
-	atcphy->pipe_state = state;
+	if (!ret)
+		atcphy->pipe_state = state;
 
 	return ret;
 }
 
 /* Route the PIPE back to the dummy backend unless it is there already */
-static void atcphy_park_pipehandler(struct apple_atcphy *atcphy)
+static int atcphy_park_pipehandler(struct apple_atcphy *atcphy)
 {
 	int ret;
 
 	lockdep_assert_held(&atcphy->lock);
 
 	if (atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY)
-		return;
+		return 0;
 
 	ret = atcphy_configure_pipehandler_dummy(atcphy);
-	if (ret)
+	if (ret) {
 		dev_warn(atcphy->dev, "Failed to switch PIPE to dummy: %d\n", ret);
+		return ret;
+	}
 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+	return 0;
 }
 
 static void atcphy_setup_pipehandler(struct apple_atcphy *atcphy)
@@ -1959,6 +1962,9 @@ static int atcphy_dp_configure(struct apple_atcphy *atcphy, enum atcphy_dp_link_
 	u32 reg;
 
 	guard(mutex)(&atcphy->lock);
+	/* A failed transition may have asserted the PHY resets already. */
+	if (atcphy->mode_dirty)
+		return -EBUSY;
 	/* the AUSPLL is in use as the Thunderbolt DP tunnel pixel clock */
 	if (atcphy->tunnel_clock_on || atcphy->tunnel_saved)
 		return -EBUSY;
@@ -2711,8 +2717,7 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 			return ret;
 	}
 	/* Keep failed transitions retryable even when the requested mode is unchanged. */
-	if (atcphy->hw->has_t8140_dp)
-		atcphy->mode_dirty = true;
+	atcphy->mode_dirty = true;
 	/* the mode change below may power the PHY down: stop the tunnel clock first */
 	atc_tunnel_stop_t8103(atcphy);
 	atc_tunnel_restore(atcphy);
@@ -2836,10 +2841,14 @@ static int atcphy_usb2_init(struct phy *phy)
 {
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
 
-	if (!atcphy->fixed_usb2)
-		return 0;
-
 	guard(mutex)(&atcphy->lock);
+
+	/* A delayed shutdown may have completed after the last Type-C event. */
+	if (!atcphy->fixed_usb2) {
+		if (atcphy->mode == APPLE_ATCPHY_MODE_OFF || atcphy->mode_dirty)
+			return atcphy_configure(atcphy, atcphy->typec_mode);
+		return 0;
+	}
 
 	/*
 	 * dwc3 initialises its PHYs after releasing its reset, and asserting that
@@ -2850,7 +2859,7 @@ static int atcphy_usb2_init(struct phy *phy)
 	 * the Type-C mux last asked for, USB2 until a cable event says otherwise.
 	 */
 	set32(atcphy->regs.usb2phy + USB2PHY_SIG, USB2PHY_SIG_HOST);
-	if (atcphy->mode == APPLE_ATCPHY_MODE_OFF)
+	if (atcphy->mode == APPLE_ATCPHY_MODE_OFF || atcphy->mode_dirty)
 		return atcphy_configure(atcphy, atcphy->typec_mode);
 
 	atcphy_usb2_power_on(atcphy);
@@ -2867,14 +2876,19 @@ static const struct phy_ops apple_atc_usb2_phy_ops = {
 static int atcphy_usb3_power_off(struct phy *phy)
 {
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
+	int ret;
 
 	guard(mutex)(&atcphy->lock);
 
-	atcphy_park_pipehandler(atcphy);
+	ret = atcphy_park_pipehandler(atcphy);
+	if (ret)
+		return ret;
+	if (atcphy->mode != APPLE_ATCPHY_MODE_OFF || atcphy->mode_dirty) {
+		ret = atcphy_configure(atcphy, APPLE_ATCPHY_MODE_OFF);
+		if (ret)
+			return ret;
+	}
 	atcphy->host_active = false;
-
-	if (atcphy->mode != APPLE_ATCPHY_MODE_OFF)
-		atcphy_configure(atcphy, APPLE_ATCPHY_MODE_OFF);
 
 	return 0;
 }
@@ -2902,6 +2916,9 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
 	 * PIPE handler once. Nothing needs to be done either when the PIPE is already routed to
 	 * the backend the current mode uses, which includes the dummy backend of the USB2 modes.
 	 */
+	/* A failed lane/domain transition must be restored before routing PIPE. */
+	if (atcphy->mode_dirty)
+		return -EBUSY;
 	if (atcphy->pipe_state == atcphy_modes[atcphy->mode].pipehandler_state)
 		return 0;
 
@@ -3122,11 +3139,16 @@ static void _atcphy_dwc3_reset_assert(struct apple_atcphy *atcphy)
 static int atcphy_dwc3_reset_assert(struct reset_controller_dev *rcdev, unsigned long id)
 {
 	struct apple_atcphy *atcphy = container_of(rcdev, struct apple_atcphy, rcdev);
+	int ret;
 
 	guard(mutex)(&atcphy->lock);
 
+	/* Do not reset the controller or USB2 PHY if PIPE parking fails. */
+	ret = atcphy_park_pipehandler(atcphy);
+	if (ret)
+		return ret;
+
 	_atcphy_dwc3_reset_assert(atcphy);
-	atcphy_park_pipehandler(atcphy);
 	atcphy->host_active = false;
 	atcphy_usb2_power_off(atcphy);
 
@@ -3281,8 +3303,13 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 		target_mode = APPLE_ATCPHY_MODE_USB2;
 
 	dev_dbg(atcphy->dev, "mux target=%u\n", target_mode);
-	if (atcphy->mode == target_mode && !atcphy->mode_dirty)
+	if (atcphy->mode == target_mode && !atcphy->mode_dirty) {
+		/* Retry a failed PIPE setup without disturbing the configured lanes. */
+		if (atcphy->fixed_usb2 && atcphy->host_active &&
+		    atcphy->pipe_state != atcphy_modes[target_mode].pipehandler_state)
+			return atcphy_configure_pipehandler(atcphy, true);
 		return 0;
+	}
 
 	switch (target_mode) {
 	case APPLE_ATCPHY_MODE_TBT:
@@ -3317,8 +3344,11 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 		 * mode without a USB3 backend, and route it to the new backend
 		 * afterwards while dwc3 is up in host mode.
 		 */
-		if (pipe_state != ATCPHY_PIPEHANDLER_STATE_USB3)
-			atcphy_park_pipehandler(atcphy);
+		if (pipe_state != ATCPHY_PIPEHANDLER_STATE_USB3) {
+			ret = atcphy_park_pipehandler(atcphy);
+			if (ret)
+				return ret;
+		}
 
 		ret = atcphy_configure(atcphy, target_mode);
 		if (ret)

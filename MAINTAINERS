@@ -2020,6 +2020,8 @@ F:	tools/diagnostics/apple-dptx-training-test.c
 F:	tools/diagnostics/apple-j700-dp-test.c
 F:	tools/diagnostics/display-attributes-fixture.json
 F:	tools/diagnostics/test-apple-afk-admission.py
+F:	tools/diagnostics/test-apple-atc-parking.py
+F:	tools/diagnostics/test-apple-atc-pipe.py
 F:	tools/diagnostics/test-apple-atc-unwind.py
 F:	tools/diagnostics/test-apple-dcp-readiness.py
 F:	tools/diagnostics/test-apple-dptx-readiness.py
