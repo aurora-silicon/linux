@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Fault-inject production PIPE parking, mux, power-off and reset callbacks."""
+"""Fault-inject production PIPE, orientation, mux, power-off and reset callbacks."""
 import hashlib
 import os
 from pathlib import Path
@@ -62,19 +62,28 @@ static u32 registers[0x30000 / 4];
 static u32 pipe_regs[0x1000 / 4], usb2_regs[0x1000 / 4];
 static unsigned int polls, fail_poll, writes, usb2_on, usb2_writes, reset_writes, mux_writes;
 static bool stuck_ack;
+static bool require_parked;
 static u32 readl(void *address) { return *(u32 *)address; }
 static void core_mask32(struct apple_atcphy *p, u32 offset, u32 mask, u32 value)
 {
     (void)p;
     assert(offset < sizeof(registers) && offset % 4 == 0);
+    if (require_parked) {
+        assert(p->pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY);
+        assert(FIELD_GET(p->hw->pipe_mux_data, pipe_regs[PIPEHANDLER_MUX_CTRL / 4]) ==
+               PIPEHANDLER_MUX_CTRL_DATA_DUMMY);
+        assert(FIELD_GET(p->hw->pipe_mux_clk, pipe_regs[PIPEHANDLER_MUX_CTRL / 4]) ==
+               PIPEHANDLER_MUX_CTRL_CLK_DUMMY);
+    }
     registers[offset / 4] = (registers[offset / 4] & ~mask) | value;
     writes++;
     if (offset == ATCPHY_POWER_CTRL)
         registers[ATCPHY_POWER_STAT / 4] = registers[offset / 4];
     if (offset == 0x2000) {
-        if (value == 0x10000001)
+        if (value == 0x10000001) {
             registers[offset / 4] |= BIT(1);
-        else {
+            registers[0x7034 / 4] |= BIT(3);
+        } else {
             registers[offset / 4] &= ~BIT(1);
             registers[0x7034 / 4] &= ~BIT(3);
         }
@@ -119,7 +128,8 @@ for name in ('atcphy_get_mode_config', 'j700_field_update', 'j700_pma_idle'):
 parts.append(dp)
 for name in ('atcphy_configure_lanes', 'j700_aux_enable', 'j700_aux_disable',
              'atcphy_enable_dp_aux', 'atcphy_disable_dp_aux', 'atcphy_power_off',
-             'atcphy_power_on', 'atcphy_configure', 'atcphy_mux_set', 'atcphy_usb3_power_off'):
+             'atcphy_power_on', 'atcphy_configure', 'atcphy_sw_set', 'atcphy_mux_set',
+             'atcphy_usb3_set_mode', 'atcphy_usb3_power_off'):
     parts.append(function(atc, name))
 production = '\n'.join(parts)
 print('Production parking/caller SHA256:', hashlib.sha256(production.encode()).hexdigest(), flush=True)
@@ -157,11 +167,16 @@ enum { TYPEC_STATE_SAFE, TYPEC_STATE_USB, TYPEC_MODE_USB4,
 enum { USB_TYPEC_TBT_SID = 0x8087, USB_TYPEC_DP_SID = 0xff01 };
 #define EUDO_USB_MODE_MASK 3U
 enum { EUDO_USB_MODE_USB2, EUDO_USB_MODE_USB3, EUDO_USB_MODE_USB4 };
+enum typec_orientation { TYPEC_ORIENTATION_NONE, TYPEC_ORIENTATION_NORMAL,
+                         TYPEC_ORIENTATION_REVERSE };
+enum phy_mode { PHY_MODE_USB_HOST, PHY_MODE_USB_DEVICE };
 struct enter_usb_data { u32 eudo; };
 struct typec_altmode { unsigned int svid; };
 struct typec_mux_state { unsigned long mode; struct typec_altmode *alt; void *data; };
 struct typec_mux_dev { struct apple_atcphy *data; };
+struct typec_switch_dev { struct apple_atcphy *data; };
 #define typec_mux_get_drvdata(mux) ((mux)->data)
+#define typec_switch_get_drvdata(sw) ((sw)->data)
 struct phy { struct apple_atcphy *data; };
 #define phy_get_drvdata(phy) ((phy)->data)
 struct reset_controller_dev { int unused; };
@@ -197,6 +212,7 @@ static void initial(struct apple_atcphy *p, bool fixed, bool dirty, bool swapped
     };
     polls = fail_poll = writes = usb2_on = usb2_writes = reset_writes = mux_writes = 0;
     stuck_ack = false;
+    require_parked = false;
 }
 static void inject_parking(unsigned int fault)
 {
@@ -409,6 +425,238 @@ static void power_cleanup(void)
     }
     printf("PASS: %u cleanup poll faults retain retry/ownership; dirty OFF retries cleanup\n", phases);
 }
+static int select_mode(struct apple_atcphy *p, enum atcphy_mode mode)
+{
+    struct typec_mux_dev mux = { p };
+    struct typec_altmode dp = { .svid = USB_TYPEC_DP_SID };
+    struct typec_mux_state state = { .mode = TYPEC_STATE_SAFE };
+
+    if (mode == APPLE_ATCPHY_MODE_USB3)
+        state.mode = TYPEC_STATE_USB;
+    else if (mode == APPLE_ATCPHY_MODE_USB3_DP || mode == APPLE_ATCPHY_MODE_DP) {
+        state.alt = &dp;
+        state.mode = mode == APPLE_ATCPHY_MODE_DP ? TYPEC_DP_STATE_C : TYPEC_DP_STATE_D;
+    }
+    return atcphy_mux_set(&mux, &state);
+}
+static void orient(struct apple_atcphy *p, bool reverse)
+{
+    struct typec_switch_dev sw = { p };
+    assert(atcphy_sw_set(&sw, reverse ? TYPEC_ORIENTATION_REVERSE :
+                                     TYPEC_ORIENTATION_NORMAL) == 0);
+}
+static void orientation_initial(struct apple_atcphy *p, bool fixed)
+{
+    initial(p, fixed, false, false);
+    p->mode = p->typec_mode = fixed ? APPLE_ATCPHY_MODE_USB2 : APPLE_ATCPHY_MODE_OFF;
+    p->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+    p->dp_owned_pmas = p->dp_idle_pmas = 0;
+    p->aux_power_requested = false;
+    p->dp_link_rate = -1;
+    p->host_active = fixed;
+    registers[ACIOPHY_TOP_PHY_STAT / 4] = ACIOPHY_TOP_PHY_STAT_LN0_UNK0;
+    registers[ATCPHY_MISC / 4] = BIT(7); /* Preserve unrelated boot state. */
+    pipe_regs[PIPEHANDLER_MUX_CTRL / 4] =
+        FIELD_PREP(hw.pipe_mux_data, PIPEHANDLER_MUX_CTRL_DATA_DUMMY) |
+        FIELD_PREP(hw.pipe_mux_clk, PIPEHANDLER_MUX_CTRL_CLK_DUMMY);
+}
+static void check_route(struct apple_atcphy *p, enum atcphy_mode mode, bool reverse)
+{
+    assert(p->mode == mode && p->swap_lanes == reverse && !p->mode_dirty);
+    assert(registers[ATCPHY_MISC / 4] & BIT(7));
+    if (hw.has_t8140_dp) {
+        u32 mask = mode == APPLE_ATCPHY_MODE_DP ? 0x3ffff : 0x1ffff;
+        assert((registers[0x60 / 4] & 0xfff) ==
+               (mode == APPLE_ATCPHY_MODE_DP ? 0x492 : (reverse ? 0x252 : 0x489)));
+        assert((registers[0x64 / 4] & mask) == (mode == APPLE_ATCPHY_MODE_DP ?
+               (reverse ? 0x114 : 0x22014) : (0x110 | reverse)));
+        /* J700's audited path preserves the miscellaneous swap control. */
+        assert(!(registers[ATCPHY_MISC / 4] & ATCPHY_MISC_LANE_SWAP));
+    } else {
+        const struct atcphy_mode_configuration *cfg = atcphy_get_mode_config(p, mode);
+        u32 lanes = FIELD_PREP(ACIOPHY_LANE_MODE_RX0, cfg->lane_mode[0]) |
+                    FIELD_PREP(ACIOPHY_LANE_MODE_TX0, cfg->lane_mode[0]) |
+                    FIELD_PREP(ACIOPHY_LANE_MODE_RX1, cfg->lane_mode[1]) |
+                    FIELD_PREP(ACIOPHY_LANE_MODE_TX1, cfg->lane_mode[1]);
+        assert((registers[hw.aciophy_lane_mode / 4] & 0xfff) == lanes);
+        assert(!!(registers[ATCPHY_MISC / 4] & ATCPHY_MISC_LANE_SWAP) == cfg->set_swap);
+        assert(FIELD_GET(ACIOPHY_CROSSBAR_PROTOCOL,
+                         registers[hw.aciophy_crossbar / 4]) == cfg->crossbar);
+    }
+    assert(p->pipe_state == (p->fixed_usb2 ? atcphy_modes[mode].pipehandler_state :
+                                                           ATCPHY_PIPEHANDLER_STATE_DUMMY));
+}
+static void orientation_roundtrip(void)
+{
+    struct apple_atcphy p;
+    const enum atcphy_mode modes[] = {
+        APPLE_ATCPHY_MODE_USB3, APPLE_ATCPHY_MODE_USB3_DP, APPLE_ATCPHY_MODE_DP,
+    };
+    unsigned int cases = 0;
+
+    for (unsigned int generation = 0; generation < 4; generation++) {
+        hw.gen = generation == 0 ? ATCPHY_GENERATION_T8103 : ATCPHY_GENERATION_T8122;
+        hw.has_t8140_dp = generation == 2;
+        hw.has_usb4 = !hw.has_t8140_dp;
+        hw.aciophy_lane_mode = generation == 0 ? ACIOPHY_LANE_MODE_T8103 :
+                                                ACIOPHY_LANE_MODE_T8122;
+        hw.aciophy_crossbar = generation == 0 ? ACIOPHY_CROSSBAR_T8103 :
+                                               ACIOPHY_CROSSBAR_T8122;
+        hw.pipe_mux_clk = generation == 3 ? PIPEHANDLER_MUX_CTRL_CLK_T8142 :
+                                           PIPEHANDLER_MUX_CTRL_CLK_T8103;
+        hw.pipe_mux_data = generation == 3 ? PIPEHANDLER_MUX_CTRL_DATA_T8142 :
+                                            PIPEHANDLER_MUX_CTRL_DATA_T8103;
+        for (unsigned int fixed = 0; fixed < 2; fixed++) {
+            for (unsigned int m = 0; m < ARRAY_SIZE(modes); m++) {
+                for (unsigned int first = 0; first < 2; first++) {
+                    orientation_initial(&p, fixed);
+                    for (unsigned int turn = 0; turn < 3; turn++) {
+                        bool reverse = first ^ (turn & 1);
+                        orient(&p, reverse);
+                        if (turn) {
+                            assert(p.mode_dirty);
+                            struct phy phy = { &p };
+                            unsigned int before = writes;
+                            assert(atcphy_usb3_set_mode(&phy, PHY_MODE_USB_HOST, 0) == -EBUSY);
+                            assert(writes == before);
+                        }
+                        require_parked = true;
+                        assert(select_mode(&p, modes[m]) == 0);
+                        require_parked = false;
+                        check_route(&p, modes[m], reverse);
+                        unsigned int before = writes, before_mux = mux_writes;
+                        orient(&p, reverse);
+                        assert(select_mode(&p, modes[m]) == 0);
+                        assert(writes == before && mux_writes == before_mux);
+                        struct typec_switch_dev sw = { &p };
+                        assert(atcphy_sw_set(&sw, TYPEC_ORIENTATION_NONE) == 0);
+                        assert(!p.mode_dirty && p.swap_lanes == reverse);
+                        cases++;
+                    }
+                    /* A USB3 protocol change also rebuilds the live backend. */
+                    if (m == 0) {
+                        require_parked = true;
+                        assert(select_mode(&p, APPLE_ATCPHY_MODE_USB3_DP) == 0);
+                        require_parked = false;
+                        check_route(&p, APPLE_ATCPHY_MODE_USB3_DP, first);
+                    }
+                    assert(select_mode(&p, APPLE_ATCPHY_MODE_OFF) == 0);
+                    assert(p.mode == (fixed ? APPLE_ATCPHY_MODE_USB2 : APPLE_ATCPHY_MODE_OFF));
+                    assert(!p.mode_dirty && !p.aux_power_requested && !p.dp_idle_pmas);
+                    assert(p.pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY);
+                }
+            }
+        }
+    }
+    printf("PASS: %u production orientation routes across T8103/T8122/T8140/T8142, fixed/ordinary ports, both flip roundtrips\n", cases);
+}
+static void orientation_faults(void)
+{
+    struct apple_atcphy p;
+    unsigned int cases = 0;
+
+    for (unsigned int fixed = 0; fixed < 2; fixed++) {
+        for (unsigned int first = 0; first < 2; first++) {
+            orientation_initial(&p, fixed);
+            orient(&p, first);
+            assert(select_mode(&p, APPLE_ATCPHY_MODE_USB3_DP) == 0);
+            struct phy_configure_opts_dp rate = {
+                .set_rate = true, .set_lanes = true, .link_rate = 8100, .lanes = 2,
+            };
+            assert(j700_dp_configure(&p, &rate) == 0);
+            assert(p.dp_owned_pmas == BIT(!first));
+            orient(&p, !first);
+            unsigned int before = writes;
+            struct phy_configure_opts_dp training = { .set_voltages = true, .lanes = 2 };
+            assert(j700_dp_configure(&p, &training) == -EBUSY && writes == before);
+            assert(j700_dp_configure(&p, &rate) == -EBUSY && writes == before);
+            /* Derive all actual poll phases, then inject each in a fresh transition. */
+            polls = 0;
+            assert(select_mode(&p, APPLE_ATCPHY_MODE_USB3_DP) == 0);
+            unsigned int total = polls;
+            for (unsigned int fault = 1; fault <= total; fault++) {
+                orientation_initial(&p, fixed);
+                orient(&p, first);
+                assert(select_mode(&p, APPLE_ATCPHY_MODE_USB3_DP) == 0);
+                assert(j700_dp_configure(&p, &rate) == 0);
+                unsigned int owned = p.dp_owned_pmas;
+                orient(&p, !first);
+                polls = 0;
+                fail_poll = fault;
+                int ret = select_mode(&p, APPLE_ATCPHY_MODE_USB3_DP);
+                /* The inherited BIST/park handshake has advisory poll phases. */
+                if (!ret) {
+                    check_route(&p, APPLE_ATCPHY_MODE_USB3_DP, !first);
+                    assert(!p.dp_owned_pmas && !p.dp_idle_pmas);
+                    cases++;
+                    continue;
+                }
+                assert(ret == -ETIMEDOUT);
+                if (p.mode_dirty) {
+                    before = writes;
+                    assert(j700_dp_configure(&p, &training) == -EBUSY && writes == before);
+                    assert(j700_dp_configure(&p, &rate) == -EBUSY && writes == before);
+                    if (fault == 1 && !fixed)
+                        assert(p.dp_owned_pmas == owned && p.aux_power_requested);
+                } else {
+                    assert(fixed && p.pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY);
+                }
+                recover();
+                assert(select_mode(&p, APPLE_ATCPHY_MODE_USB3_DP) == 0);
+                check_route(&p, APPLE_ATCPHY_MODE_USB3_DP, !first);
+                assert(!p.dp_owned_pmas && !p.dp_idle_pmas);
+                assert(j700_dp_configure(&p, &rate) == 0);
+                assert(p.dp_owned_pmas == BIT(first));
+                assert(j700_dp_configure(&p, &training) == 0);
+                cases++;
+            }
+            /* A fatal parking check preserves the old owner and all lane words. */
+            if (fixed) {
+                orientation_initial(&p, true);
+                assert(select_mode(&p, APPLE_ATCPHY_MODE_USB3_DP) == 0);
+                assert(j700_dp_configure(&p, &rate) == 0);
+                orient(&p, true);
+                before = writes;
+                inject_parking(0);
+                assert(select_mode(&p, APPLE_ATCPHY_MODE_USB3_DP) == -ETIMEDOUT);
+                assert(writes == before && p.dp_owned_pmas == 2 && p.mode_dirty);
+                assert(p.pipe_state == ATCPHY_PIPEHANDLER_STATE_USB3 && p.host_active);
+                recover();
+                assert(select_mode(&p, APPLE_ATCPHY_MODE_USB3_DP) == 0);
+                check_route(&p, APPLE_ATCPHY_MODE_USB3_DP, true);
+            }
+            /* Reversing a pending flip cannot erase cleanup obligations. */
+            orientation_initial(&p, fixed);
+            assert(select_mode(&p, APPLE_ATCPHY_MODE_USB3_DP) == 0);
+            assert(j700_dp_configure(&p, &rate) == 0);
+            orient(&p, true);
+            orient(&p, false);
+            assert(p.mode_dirty && p.dp_owned_pmas == 2);
+            p.ss_tunables = false;
+            before = writes;
+            assert(select_mode(&p, APPLE_ATCPHY_MODE_USB3_DP) == -EOPNOTSUPP);
+            assert(writes == before && p.mode_dirty && p.dp_owned_pmas == 2);
+            p.ss_tunables = true;
+            assert(select_mode(&p, APPLE_ATCPHY_MODE_USB3_DP) == 0);
+            check_route(&p, APPLE_ATCPHY_MODE_USB3_DP, false);
+            assert(!p.dp_owned_pmas && !p.dp_idle_pmas);
+        }
+    }
+    printf("PASS: %u orientation transition poll injections, dirty training guard, ownership and retry controls\n", cases);
+}
+static void backend_change(void)
+{
+    struct apple_atcphy p;
+
+    orientation_initial(&p, true);
+    assert(select_mode(&p, APPLE_ATCPHY_MODE_USB3) == 0);
+    assert(p.pipe_state == ATCPHY_PIPEHANDLER_STATE_USB3);
+    require_parked = true;
+    assert(select_mode(&p, APPLE_ATCPHY_MODE_USB3_DP) == 0);
+    require_parked = false;
+    check_route(&p, APPLE_ATCPHY_MODE_USB3_DP, false);
+    puts("PASS: a live fixed-hub USB3 backend parks before same-orientation protocol changes");
+}
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -416,6 +664,9 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "power")) power_parking();
     else if (!strcmp(argv[1], "reset")) reset_parking();
     else if (!strcmp(argv[1], "cleanup")) power_cleanup();
+    else if (!strcmp(argv[1], "orientation")) orientation_roundtrip();
+    else if (!strcmp(argv[1], "orientation-faults")) orientation_faults();
+    else if (!strcmp(argv[1], "backend-change")) backend_change();
     else assert(false);
     return 0;
 }
@@ -429,7 +680,8 @@ with tempfile.TemporaryDirectory(prefix='apple-atc-parking-') as directory:
                 '-fsanitize=address,undefined', '-fno-omit-frame-pointer']
     subprocess.run(command + [str(unit), '-o', str(path / 'test')], check=True)
     failed = False
-    for case in ('mux', 'power', 'reset', 'cleanup'):
+    for case in ('mux', 'power', 'reset', 'cleanup', 'orientation', 'orientation-faults',
+                 'backend-change'):
         result = subprocess.run([str(path / 'test'), case])
         if result.returncode:
             print('FAIL:', case, 'exit', result.returncode, flush=True)

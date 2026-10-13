@@ -3194,19 +3194,30 @@ static int atcphy_probe_rcdev(struct apple_atcphy *atcphy)
 static int atcphy_sw_set(struct typec_switch_dev *sw, enum typec_orientation orientation)
 {
 	struct apple_atcphy *atcphy = typec_switch_get_drvdata(sw);
+	bool swap_lanes;
 
 	guard(mutex)(&atcphy->lock);
 
 	switch (orientation) {
 	case TYPEC_ORIENTATION_NONE:
-		break;
+		return 0;
 	case TYPEC_ORIENTATION_NORMAL:
-		atcphy->swap_lanes = false;
+		swap_lanes = false;
 		break;
 	case TYPEC_ORIENTATION_REVERSE:
-		atcphy->swap_lanes = true;
+		swap_lanes = true;
 		break;
+	default:
+		return -EINVAL;
 	}
+	/* The mode alone cannot describe a route after its orientation changes. */
+	if (atcphy->swap_lanes != swap_lanes) {
+		atcphy->swap_lanes = swap_lanes;
+		atcphy->mode_dirty = true;
+	}
+	dev_dbg(atcphy->dev, "orientation=%u mode=%u dirty=%u pipe=%u host=%u\n",
+		orientation, atcphy->mode, atcphy->mode_dirty,
+		atcphy->pipe_state, atcphy->host_active);
 
 	return 0;
 }
@@ -3340,15 +3351,13 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 		/*
 		 * The controller of a port behind a fixed hub stays up across mode
 		 * changes, so the PIPE has to follow the mode from here rather than
-		 * from a later set_mode call: park it before the lanes change to a
-		 * mode without a USB3 backend, and route it to the new backend
-		 * afterwards while dwc3 is up in host mode.
+		 * from a later set_mode call. Even another USB3 mode can move the
+		 * backend to the other PMA when orientation changes. Park before
+		 * rebuilding the lanes, then reconnect while dwc3 is in host mode.
 		 */
-		if (pipe_state != ATCPHY_PIPEHANDLER_STATE_USB3) {
-			ret = atcphy_park_pipehandler(atcphy);
-			if (ret)
-				return ret;
-		}
+		ret = atcphy_park_pipehandler(atcphy);
+		if (ret)
+			return ret;
 
 		ret = atcphy_configure(atcphy, target_mode);
 		if (ret)
