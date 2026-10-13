@@ -2877,10 +2877,12 @@ static int atcphy_usb3_power_off(struct phy *phy)
 	ret = atcphy_park_pipehandler(atcphy);
 	if (ret)
 		return ret;
+	if (atcphy->mode != APPLE_ATCPHY_MODE_OFF || atcphy->mode_dirty) {
+		ret = atcphy_configure(atcphy, APPLE_ATCPHY_MODE_OFF);
+		if (ret)
+			return ret;
+	}
 	atcphy->host_active = false;
-
-	if (atcphy->mode != APPLE_ATCPHY_MODE_OFF)
-		atcphy_configure(atcphy, APPLE_ATCPHY_MODE_OFF);
 
 	return 0;
 }

@@ -336,12 +336,86 @@ static void reset_parking(void)
     }
     printf("PASS: %u actual reset parking/retry scenarios retain DP ownership\n", cases);
 }
+static void power_cleanup(void)
+{
+    struct apple_atcphy p;
+    unsigned int phases = 0;
+    for (unsigned int fixed = 0; fixed < 2; fixed++) {
+        initial(&p, fixed, false, false);
+        p.pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+        struct phy phy = { &p };
+        fail_poll = 1; /* The first DP stop ACK cannot complete. */
+        int ret = atcphy_usb3_power_off(&phy);
+        observed("power-off DP cleanup failure", ret);
+        assert(ret == -ETIMEDOUT && p.mode_dirty && p.host_active);
+        assert(p.mode == APPLE_ATCPHY_MODE_USB3_DP && p.dp_owned_pmas == 3);
+        assert(p.aux_power_requested && usb2_writes == 0 && reset_writes == 0);
+        struct phy_configure_opts_dp training = {
+            .set_rate = true, .set_lanes = true, .link_rate = 8100, .lanes = 2,
+        };
+        unsigned int before = writes;
+        assert(j700_dp_configure(&p, &training) == -EBUSY && writes == before);
+        recover();
+        assert(atcphy_usb3_power_off(&phy) == 0);
+        assert(!p.mode_dirty && !p.host_active && !p.dp_owned_pmas && !p.aux_power_requested);
+        /* A failed initial transition can leave OFF recorded with dirty resources. */
+        initial(&p, fixed, true, false);
+        p.mode = APPLE_ATCPHY_MODE_OFF;
+        p.pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+        fail_poll = 1;
+        assert(atcphy_usb3_power_off(&phy) == -ETIMEDOUT);
+        assert(p.mode_dirty && p.host_active && p.dp_owned_pmas == 3);
+        recover();
+        assert(atcphy_usb3_power_off(&phy) == 0);
+        assert(p.mode == APPLE_ATCPHY_MODE_OFF && !p.mode_dirty && !p.host_active);
+        assert(!p.dp_owned_pmas && !p.dp_idle_pmas && !p.aux_power_requested);
+        for (unsigned int fault = 1; fault <= 2; fault++) {
+            initial(&p, fixed, false, false);
+            p.mode = APPLE_ATCPHY_MODE_USB2;
+            p.pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+            p.dp_owned_pmas = p.dp_idle_pmas = 0;
+            p.aux_power_requested = false;
+            fail_poll = fault; /* BIG/SMALL sleep ACK. */
+            assert(atcphy_usb3_power_off(&phy) == -ETIMEDOUT);
+            assert(p.mode == APPLE_ATCPHY_MODE_USB2 && p.mode_dirty && p.host_active);
+            recover();
+            assert(atcphy_usb3_power_off(&phy) == 0 && !p.mode_dirty && !p.host_active);
+        }
+        /* Inject every poll in DP stop, pending PMA idle, AUX and domain sleep. */
+        initial(&p, fixed, true, false);
+        p.pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+        assert(atcphy_usb3_power_off(&phy) == 0);
+        unsigned int total = polls;
+        for (unsigned int fault = 1; fault <= total; fault++) {
+            initial(&p, fixed, true, false);
+            p.pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+            fail_poll = fault;
+            assert(atcphy_usb3_power_off(&phy) == -ETIMEDOUT);
+            assert(p.mode == APPLE_ATCPHY_MODE_USB3_DP && p.mode_dirty && p.host_active);
+            assert(p.pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY);
+            assert(usb2_writes == 0 && reset_writes == 0);
+            unsigned int owned = p.dp_owned_pmas, idle = p.dp_idle_pmas;
+            bool aux = p.aux_power_requested;
+            unsigned int before = writes;
+            assert(j700_dp_configure(&p, &training) == -EBUSY && writes == before);
+            assert(p.dp_owned_pmas == owned && p.dp_idle_pmas == idle);
+            assert(p.aux_power_requested == aux);
+            recover();
+            assert(atcphy_usb3_power_off(&phy) == 0);
+            assert(p.mode == APPLE_ATCPHY_MODE_OFF && !p.mode_dirty && !p.host_active);
+            assert(!p.dp_owned_pmas && !p.dp_idle_pmas && !p.aux_power_requested);
+            phases++;
+        }
+    }
+    printf("PASS: %u cleanup poll faults retain retry/ownership; dirty OFF retries cleanup\n", phases);
+}
 int main(int argc, char **argv)
 {
     assert(argc == 2);
     if (!strcmp(argv[1], "mux")) mux_parking();
     else if (!strcmp(argv[1], "power")) power_parking();
     else if (!strcmp(argv[1], "reset")) reset_parking();
+    else if (!strcmp(argv[1], "cleanup")) power_cleanup();
     else assert(false);
     return 0;
 }
@@ -355,7 +429,7 @@ with tempfile.TemporaryDirectory(prefix='apple-atc-parking-') as directory:
                 '-fsanitize=address,undefined', '-fno-omit-frame-pointer']
     subprocess.run(command + [str(unit), '-o', str(path / 'test')], check=True)
     failed = False
-    for case in ('mux', 'power', 'reset'):
+    for case in ('mux', 'power', 'reset', 'cleanup'):
         result = subprocess.run([str(path / 'test'), case])
         if result.returncode:
             print('FAIL:', case, 'exit', result.returncode, flush=True)
