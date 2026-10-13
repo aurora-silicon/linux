@@ -34,6 +34,13 @@
 #include "trace.h"
 #include "version_utils.h"
 
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+static bool experimental_h17p_external_srgb;
+module_param(experimental_h17p_external_srgb, bool, 0444);
+MODULE_PARM_DESC(experimental_h17p_external_srgb,
+		 "Label external H17P RGB sources as sRGB for diagnosis");
+#endif
+
 /* Register defines used in bandwidth setup structure */
 #define REG_DOORBELL_BIT(idx) (2 + (idx))
 
@@ -2353,6 +2360,15 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP &&
 		    req->surf[l].base.colorspace == DCP_COLORSPACE_BG_SRGB)
 			req->surf[l].base.colorspace = DCP_COLORSPACE_NATIVE;
+
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+		if (experimental_h17p_external_srgb &&
+		    dcp->hw.iomfb_method_profile ==
+			    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+		    !new_state->fb->format->is_yuv &&
+		    req->surf[l].base.colorspace == DCP_COLORSPACE_NATIVE)
+			req->surf[l].base.colorspace = DCP_COLORSPACE_BG_SRGB;
+#endif
 	}
 
 	if (!has_surface && !crtc_state->color_mgmt_changed) {
