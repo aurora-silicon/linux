@@ -281,6 +281,44 @@ static void parking_and_guards(void)
     assert(request(&p, APPLE_ATCPHY_MODE_USB4) == -EOPNOTSUPP && lane_calls == 0);
     puts("PASS: parking retry, SAFE fixed USB2, dirty-mode and capability guards");
 }
+static void requested_lock(void)
+{
+    struct apple_atcphy p;
+    initial(&p, APPLE_ATCPHY_MODE_USB3, ATCPHY_PIPEHANDLER_STATE_DUMMY);
+    pipe_regs[PIPEHANDLER_LOCK_REQ / 4] = PIPEHANDLER_LOCK_EN;
+    stuck_ack = true;
+    assert(atcphy_pipehandler_lock(&p) == -ETIMEDOUT && polls == 1);
+    assert(!(pipe_regs[PIPEHANDLER_LOCK_REQ / 4] & PIPEHANDLER_LOCK_EN));
+    pipe_regs[PIPEHANDLER_LOCK_REQ / 4] = PIPEHANDLER_LOCK_EN;
+    pipe_regs[PIPEHANDLER_LOCK_ACK / 4] = PIPEHANDLER_LOCK_EN;
+    assert(atcphy_pipehandler_lock(&p) == 0 && polls == 2);
+    puts("PASS: an existing LOCK request must still have actual ACK before success");
+}
+static void live_policy_scope(void)
+{
+    struct apple_atcphy p;
+    for (unsigned int t8140 = 0; t8140 < 2; t8140++) {
+        for (unsigned int fixed = 0; fixed < 2; fixed++) {
+            for (unsigned int active = 0; active < 2; active++) {
+                hw.has_t8140_dp = t8140;
+                initial(&p, APPLE_ATCPHY_MODE_USB3, ATCPHY_PIPEHANDLER_STATE_USB3);
+                p.fixed_usb2 = fixed;
+                p.host_active = active;
+                stuck_ack = true; /* Request exists, but ACK never asserts. */
+                int ret = atcphy_park_pipehandler(&p);
+                if (t8140 && fixed && active) {
+                    assert(ret == -ETIMEDOUT && p.mode_dirty && mux_writes == 0);
+                    assert(p.pipe_state == ATCPHY_PIPEHANDLER_STATE_USB3);
+                    assert(!pipe_regs[PIPEHANDLER_NONSELECTED_OVERRIDE / 4]);
+                } else {
+                    assert(ret == 0 && !p.mode_dirty && mux_writes == 3);
+                    assert(p.pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY);
+                }
+            }
+        }
+    }
+    puts("PASS: eight live/inactive, fixed/ordinary and T8140/legacy parking policy controls");
+}
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -289,6 +327,8 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "mux")) mux_retry();
     else if (!strcmp(argv[1], "same")) same_mode_pending();
     else if (!strcmp(argv[1], "park")) parking_and_guards();
+    else if (!strcmp(argv[1], "requested")) requested_lock();
+    else if (!strcmp(argv[1], "scope")) live_policy_scope();
     else assert(false);
     return 0;
 }
@@ -302,7 +342,7 @@ with tempfile.TemporaryDirectory(prefix='apple-atc-pipe-') as directory:
                 '-fsanitize=address,undefined', '-fno-omit-frame-pointer']
     subprocess.run(command + [str(unit), '-o', str(path / 'test')], check=True)
     failed = False
-    for case in ('backend', 'host', 'mux', 'same', 'park'):
+    for case in ('backend', 'host', 'mux', 'same', 'park', 'requested', 'scope'):
         result = subprocess.run([str(path / 'test'), case])
         if result.returncode:
             print('FAIL:', case, 'exit', result.returncode, flush=True)

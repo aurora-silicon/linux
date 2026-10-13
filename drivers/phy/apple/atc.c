@@ -1085,11 +1085,10 @@ static int atcphy_pipehandler_lock(struct apple_atcphy *atcphy)
 	u32 reg;
 
 	if (readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ) & PIPEHANDLER_LOCK_EN) {
-		dev_warn(atcphy->dev, "Pipehandler already locked\n");
-		return 0;
+		dev_warn(atcphy->dev, "Pipehandler lock already requested\n");
+	} else {
+		set32(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ, PIPEHANDLER_LOCK_EN);
 	}
-
-	set32(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ, PIPEHANDLER_LOCK_EN);
 
 	ret = readl_poll_timeout(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK, reg,
 				 reg & PIPEHANDLER_LOCK_EN, 10, PIPEHANDLER_LOCK_ACK_TIMEOUT_US);
@@ -1379,6 +1378,9 @@ static void atcphy_enable_dummy_phy(struct apple_atcphy *atcphy)
 
 static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy)
 {
+	bool live_usb3 = atcphy->hw->has_t8140_dp && atcphy->fixed_usb2 &&
+			 atcphy->host_active &&
+			 atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_USB3;
 	int ret;
 
 	ret = atcphy_pipehandler_check(atcphy);
@@ -1392,16 +1394,28 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy)
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXDETECT);
 
 	ret = atcphy_pipehandler_lock(atcphy);
-	if (ret)
+	if (ret) {
+		/* A live controller must acknowledge before its backend changes. */
+		if (live_usb3) {
+			atcphy->mode_dirty = true;
+			return ret;
+		}
 		dev_warn(atcphy->dev, "Failed to lock pipehandler");
+	}
 
 	/* Switch to dummy PHY */
 	atcphy_pipehandler_set_mux(atcphy, PIPEHANDLER_MUX_CTRL_DATA_DUMMY,
 				   PIPEHANDLER_MUX_CTRL_CLK_DUMMY);
 
 	ret = atcphy_pipehandler_unlock(atcphy);
-	if (ret)
+	if (ret) {
+		/* The mux changed, but the handoff has not completed. Retain ownership. */
+		if (live_usb3) {
+			atcphy->mode_dirty = true;
+			return ret;
+		}
 		dev_warn(atcphy->dev, "Failed to unlock pipehandler");
+	}
 
 	mask32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
 	       PIPEHANDLER_NATIVE_POWER_DOWN, FIELD_PREP(PIPEHANDLER_NATIVE_POWER_DOWN, 2));
