@@ -2334,6 +2334,12 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
 
 	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 
+	/* External H17P does not program adaptive sync. */
+	if (dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+	    crtc_state->vrr_enabled)
+		return -EINVAL;
+
 	needs_modeset = drm_atomic_crtc_needs_modeset(crtc_state) ||
 			!READ_ONCE(dcp->mode_state.valid);
 	if (!needs_modeset && (!dcp->connector || !dcp->connector->connected)) {

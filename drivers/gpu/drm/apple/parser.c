@@ -765,8 +765,12 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		out->vrr = true;
 	}
 
-	/* Refresh rates are reported by DCP as 16.16 fixed-point Hz. */
-	if (min_vrr && max_vrr > min_vrr) {
+	/*
+	 * Refresh rates are reported by DCP as 16.16 fixed-point Hz.
+	 * External H17P skips adaptive-sync programming: keep the fixed timing
+	 * available, but do not advertise its sink VRR range as driver support.
+	 */
+	if (!external_sdr && min_vrr && max_vrr > min_vrr) {
 		out->min_vrr = min_vrr;
 		out->max_vrr = max_vrr;
 		out->vrr = true;

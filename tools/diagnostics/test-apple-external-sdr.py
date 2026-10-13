@@ -74,10 +74,10 @@ def timing(colors, rate=60, identity=203, score=10):
 
 cases = []
 
-def case(name, timings, external=True, count=1, identity=9, depth=8, clock=148500):
+def case(name, timings, external=True, count=1, identity=9, depth=8, clock=148500, vrr=False):
     out = bytearray(struct.pack('<I', 0xd3))
     wire(timings, out)
-    cases.append((name, bytes(out), external, count, identity, depth, clock))
+    cases.append((name, bytes(out), external, count, identity, depth, clock, vrr))
 
 
 wide = color(84, 1000, Colorimetry=9, Depth=10)
@@ -91,7 +91,13 @@ case('firmware score among suitable gamuts', [timing([srgb, color(12, 11, Colori
 case('default fallback retains firmware ID', [timing([color(123456, 4, Colorimetry=16)])], identity=123456)
 case('ties preserve firmware order', [timing([srgb, color(12, 10, Colorimetry=1)])])
 case('360Hz is not filtered by color policy', [timing([wide, srgb], rate=360)], clock=891000)
-case('VRR-compatible high refresh color', [dict(timing([srgb], rate=240), MinimumVariableRefreshRate=48 << 16, MaximumVariableRefreshRate=240 << 16)], clock=594000)
+adaptive = dict(timing([srgb], rate=240), MinimumVariableRefreshRate=48 << 16,
+                MaximumVariableRefreshRate=240 << 16)
+case('external VRR sink retains fixed high refresh', [adaptive], clock=594000)
+case('legacy VRR remains available', [adaptive], False, clock=594000, vrr=True)
+case('internal VRR remains available', [adaptive], False, clock=594000, vrr=True)
+case('internal ProMotion fallback remains available', [timing([srgb], rate=120)],
+     False, clock=297000, vrr=True)
 for name, changes in [
     ('BT2020 RGB', dict(Colorimetry=9)), ('BT2020 YCC', dict(Colorimetry=7)),
     ('BT2020 cYCC', dict(Colorimetry=6)), ('P3 D65', dict(Colorimetry=14)),
@@ -220,7 +226,7 @@ suffix = r'''
 int main(void)
 {
 '''
-for i, (name, blob, external, count, identity, depth, clock) in enumerate(cases):
+for i, (name, blob, external, count, identity, depth, clock, vrr) in enumerate(cases):
     suffix += f'''
     {{
         struct dcp_parse_ctx ctx;
@@ -238,6 +244,7 @@ for i, (name, blob, external, count, identity, depth, clock) in enumerate(cases)
         assert(modes[0].color_mode_id == {identity});
         assert(modes[0].sdr_rgb.depth == {depth});
         assert(modes[0].mode.clock == {clock});
+        assert(modes[0].vrr == {str(vrr).lower()});
         assert(modes[0].mode.type & DRM_MODE_TYPE_PREFERRED);
 '''
     suffix += '        free(modes);\n    }\n'
