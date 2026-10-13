@@ -150,6 +150,8 @@
 #define TPS_SYSTEM_POWER_STATE_S3	0x03
 #define TPS_SYSTEM_POWER_STATE_S4	0x04
 #define TPS_SYSTEM_POWER_STATE_S5	0x05
+/* CD321x: what macOS sets on a port with nothing plugged in */
+#define CD321X_SYSTEM_POWER_STATE_UNPLUGGED	0x02
 
 /* TPS_REG_POWER_STATUS bits */
 #define TPS_POWER_STATUS_CONNECTION(x)  TPS_FIELD_GET(BIT(0), (x))
@@ -305,6 +307,11 @@ struct tipd_data {
 	int (*apply_patch)(struct tps6598x *tps);
 	int (*init)(struct tps6598x *tps);
 	int (*switch_power_state)(struct tps6598x *tps, u8 target_state);
+	/*
+	 * CD321x: sleep an empty port and wake it on connect, as macOS does
+	 * (traced on CD321x only)
+	 */
+	bool port_sleep;
 	bool (*read_data_status)(struct tps6598x *tps);
 	int (*reset)(struct tps6598x *tps);
 	int (*connect)(struct tps6598x *tps, u32 status);
@@ -381,8 +388,16 @@ struct cd321x_status {
 	struct tps6598x_usb4_status_reg usb4_status;
 };
 
+/* CD321x port power, as last set by the driver (UNKNOWN after probe) */
+enum cd321x_port_power {
+	CD321X_PORT_UNKNOWN,
+	CD321X_PORT_AWAKE,
+	CD321X_PORT_ASLEEP,
+};
+
 struct cd321x {
 	struct tps6598x tps;
+	enum cd321x_port_power port_power;
 
 	struct tps6598x_dp_sid_status_reg dp_sid_status;
 	struct tps6598x_intel_vid_status_reg intel_vid_status;
