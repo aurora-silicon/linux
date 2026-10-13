@@ -255,7 +255,8 @@ static int request(struct apple_atcphy *p, bool safe)
 }
 static void unchanged(struct apple_atcphy *p, bool dirty, bool host)
 {
-    assert(p->mode == APPLE_ATCPHY_MODE_USB3_DP && p->mode_dirty == dirty);
+    bool expected_dirty = dirty || (p->hw->has_t8140_dp && p->fixed_usb2 && host);
+    assert(p->mode == APPLE_ATCPHY_MODE_USB3_DP && p->mode_dirty == expected_dirty);
     assert(p->pipe_state == ATCPHY_PIPEHANDLER_STATE_USB3 && p->host_active == host);
     assert(p->dp_owned_pmas == 3 && p->dp_idle_pmas == (dirty ? 1U : 0U));
     assert(p->aux_power_requested);
@@ -263,7 +264,7 @@ static void unchanged(struct apple_atcphy *p, bool dirty, bool host)
     assert(mux_writes == 0);
     assert(pipe_regs[PIPEHANDLER_AON_GEN / 4] == PIPEHANDLER_AON_GEN_DWC3_RESET_N);
     assert(usb2_regs[USB2PHY_USBCTL / 4] == USB2PHY_USBCTL_RUN);
-    if (dirty) {
+    if (expected_dirty) {
         struct phy_configure_opts_dp training = {
             .set_rate = true, .set_lanes = true, .link_rate = 8100, .lanes = 2,
         };
@@ -361,7 +362,7 @@ static void reset_parking(void)
         recover();
         assert(atcphy_dwc3_reset_assert(&p.rcdev, 0) == 0);
         assert(p.pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY && !p.host_active);
-        assert(p.mode == APPLE_ATCPHY_MODE_USB3_DP && p.mode_dirty == dirty);
+        assert(p.mode == APPLE_ATCPHY_MODE_USB3_DP && p.mode_dirty == (dirty || fixed));
         assert(p.dp_owned_pmas == 3 && p.dp_idle_pmas == (dirty ? 1U : 0U));
         assert(p.aux_power_requested && writes == 0);
         assert(reset_writes == 2 && usb2_writes > 0);
@@ -831,7 +832,7 @@ static void live_parking_handshake(void)
     struct phy_configure_opts_dp training = { .set_voltages = true, .lanes = 2 };
     unsigned int cases = 0;
     for (unsigned int reverse = 0; reverse < 2; reverse++) {
-        for (unsigned int unlock = 0; unlock < 2; unlock++) {
+        for (unsigned int fault = 0; fault < 3; fault++) {
             orientation_initial(&p, true);
             orient(&p, reverse);
             assert(select_mode(&p, APPLE_ATCPHY_MODE_USB3_DP) == 0);
@@ -839,10 +840,15 @@ static void live_parking_handshake(void)
             u32 lanes = registers[0x60 / 4], route = registers[0x64 / 4];
             u32 native = pipe_regs[PIPEHANDLER_NONSELECTED_OVERRIDE / 4];
             unsigned int before = writes, owned = p.dp_owned_pmas;
-            if (unlock)
+            if (fault == 2) {
+                /* A previous host unlock left ACK asserted before parking. */
+                pipe_regs[PIPEHANDLER_LOCK_ACK / 4] = PIPEHANDLER_LOCK_EN;
                 hold_unlock_ack = true;
-            else
+            } else if (fault == 1) {
+                hold_unlock_ack = true;
+            } else {
                 stuck_ack = true;
+            }
             for (unsigned int retry = 0; retry < 3; retry++) {
                 unsigned int before_mux = mux_writes;
                 assert(select_mode(&p, APPLE_ATCPHY_MODE_OFF) == -ETIMEDOUT);
@@ -851,7 +857,9 @@ static void live_parking_handshake(void)
                 assert(p.dp_owned_pmas == owned && p.aux_power_requested);
                 assert(writes == before && registers[0x60 / 4] == lanes && registers[0x64 / 4] == route);
                 assert(pipe_regs[PIPEHANDLER_NONSELECTED_OVERRIDE / 4] == native);
-                if (!unlock) assert(mux_writes == before_mux);
+                if (fault != 1) assert(mux_writes == before_mux);
+                /* A failed SAFE cannot be forgotten by returning to the cached mode. */
+                assert(select_mode(&p, APPLE_ATCPHY_MODE_USB3_DP) == -ETIMEDOUT);
                 assert(j700_dp_configure(&p, &training) == -EBUSY && writes == before);
                 assert(!usb2_writes && !reset_writes);
             }
@@ -868,7 +876,7 @@ static void live_parking_handshake(void)
             cases++;
         }
     }
-    printf("PASS: %u live parking LOCK/UNLOCK failure, ownership, write ordering and retry roundtrips\n", cases);
+    printf("PASS: %u live parking entry-ACK/LOCK/UNLOCK failure, ownership, write ordering and retry roundtrips\n", cases);
 }
 
 int main(int argc, char **argv)

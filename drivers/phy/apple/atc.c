@@ -1384,8 +1384,11 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy)
 	int ret;
 
 	ret = atcphy_pipehandler_check(atcphy);
-	if (ret)
+	if (ret) {
+		if (live_usb3)
+			atcphy->mode_dirty = true;
 		return ret;
+	}
 
 	/* Force disable link detection */
 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE_VALUES,

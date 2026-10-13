@@ -314,10 +314,19 @@ static void live_policy_scope(void)
                     assert(ret == 0 && !p.mode_dirty && mux_writes == 3);
                     assert(p.pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY);
                 }
+                /* Entry ACK release is fatal everywhere, but dirties only live T8140 parking. */
+                initial(&p, APPLE_ATCPHY_MODE_USB3, ATCPHY_PIPEHANDLER_STATE_USB3);
+                p.fixed_usb2 = fixed;
+                p.host_active = active;
+                pipe_regs[PIPEHANDLER_LOCK_ACK / 4] = PIPEHANDLER_LOCK_EN;
+                stuck_ack = true;
+                assert(atcphy_park_pipehandler(&p) == -ETIMEDOUT);
+                assert(p.mode_dirty == (t8140 && fixed && active));
+                assert(p.pipe_state == ATCPHY_PIPEHANDLER_STATE_USB3 && mux_writes == 0);
             }
         }
     }
-    puts("PASS: eight live/inactive, fixed/ordinary and T8140/legacy parking policy controls");
+    puts("PASS: eight live/inactive, fixed/ordinary and T8140/legacy LOCK and entry-ACK policy controls");
 }
 int main(int argc, char **argv)
 {
