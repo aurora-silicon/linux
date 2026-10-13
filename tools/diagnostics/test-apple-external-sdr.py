@@ -74,10 +74,12 @@ def timing(colors, rate=60, identity=203, score=10):
 
 cases = []
 
-def case(name, timings, external=True, count=1, identity=9, depth=8, clock=148500):
+def case(name, timings, external=True, count=1, identity=9, depth=8, clock=148500,
+         diagnostic=False, diagnostic_selected=False, preferred_index=0):
     out = bytearray(struct.pack('<I', 0xd3))
     wire(timings, out)
-    cases.append((name, bytes(out), external, count, identity, depth, clock))
+    cases.append((name, bytes(out), external, count, identity, depth, clock,
+                  diagnostic, diagnostic_selected, preferred_index))
 
 
 wide = color(84, 1000, Colorimetry=9, Depth=10)
@@ -167,6 +169,89 @@ duplicate_colors = Pairs(list(restricted().items()) + [('ColorModes', [color80])
 case('duplicate ColorModes fail closed', [duplicate_colors], count=0)
 case('bad restriction skips only its timing', [restricted(180, [80, 85], []), restricted(60, [], [])], identity=85, depth=10)
 
+# Diagnostic-only retry: no private monitor identity or captured blob is embedded.
+# The binary dictionaries still go through the complete production parser.
+def trial_timing(colors=None, rate=180):
+    item = restricted(rate, [80, 85], [], colors)
+    item['IsInterlaced'] = False
+    item['HorizontalAttributes']['Total'] = 2080
+    item['VerticalAttributes'].update(Total=1106, PreciseSyncRate=11796583)
+    for axis in ('HorizontalAttributes', 'VerticalAttributes'):
+        item[axis].update(PixelRepetition=0, SyncPolarity=1)
+    return item
+
+
+def trial_case(name, item=None, **kwargs):
+    defaults = dict(identity=80, clock=414090, diagnostic=True,
+                    diagnostic_selected=True, preferred_index=-1)
+    defaults.update(kwargs)
+    case('diagnostic ' + name, [item if item is not None else trial_timing()], **defaults)
+
+trial_case('explicit enable exposes only RGB8')
+trial_case('default remains refused', diagnostic=False, count=0)
+trial_case('legacy keeps existing 10bit selection', external=False, identity=85,
+           depth=10, diagnostic_selected=False, preferred_index=0)
+case('internal diagnostic flag cannot admit unsafe timing', [trial_timing()],
+     diagnostic=True, count=0)
+item = trial_timing(); item['UnsafeColorElementIDs'] = [80]
+trial_case('existing safe candidate is not replaced', item, identity=85, depth=10,
+           diagnostic_selected=False, preferred_index=0)
+item = trial_timing(); item['DSCRequiredColorElementIDs'] = [80]
+trial_case('DSC remains forbidden', item, count=0)
+# No timing-local 8-bit entry: a global/sibling timing cannot provide one.
+trial_case('10bit-only timing remains refused', trial_timing([color85]), count=0)
+for label, changes in [
+    ('limited range', dict(DynamicRange=1)), ('HDR', dict(EOTF=2)),
+    ('YUV', dict(PixelEncoding=2)), ('wide gamut', dict(Colorimetry=9)),
+    ('12bit', dict(Depth=12)), ('virtual color', dict(IsVirtual=True)),
+    ('negative score', dict(Score=-1)), ('invalid ID', dict(ID=1 << 32)),
+]:
+    trial_case(label, trial_timing([color(80, 242999, **changes)]), count=0)
+for axis, key, value in [
+    ('HorizontalAttributes', 'Active', 1919),
+    ('VerticalAttributes', 'Active', 1079),
+    ('HorizontalAttributes', 'Total', 100),
+    ('VerticalAttributes', 'PreciseSyncRate', 11796582),
+    ('VerticalAttributes', 'PreciseSyncRate', 180 << 16),
+    ('HorizontalAttributes', 'Total', 2200),
+    ('VerticalAttributes', 'Total', 1125),
+    ('VerticalAttributes', 'PreciseSyncRate', 181 << 16),
+    ('HorizontalAttributes', 'PixelRepetition', 1),
+    ('VerticalAttributes', 'PixelRepetition', 1),
+    ('HorizontalAttributes', 'SyncPolarity', 2),
+]:
+    item = trial_timing(); item[axis][key] = value
+    trial_case(axis + key + str(value), item, count=0)
+for key in ('IsVirtual', 'IsInterlaced'):
+    item = trial_timing(); item.pop(key)
+    trial_case('missing ' + key, item, count=0)
+    item = trial_timing(); item[key] = True
+    trial_case('true ' + key, item, count=0)
+for axis in ('HorizontalAttributes', 'VerticalAttributes'):
+    for key in ('PixelRepetition', 'SyncPolarity'):
+        item = trial_timing(); item[axis].pop(key)
+        trial_case('missing ' + axis + key, item, count=0)
+for key in ('HorizontalAttributes', 'VerticalAttributes', 'IsVirtual'):
+    item = trial_timing()
+    duplicate = Pairs(list(item.items()) + [(key, item[key])])
+    trial_case('duplicate scope ' + key, duplicate, count=0)
+for key in ('UnsafeColorElementIDs', 'DSCRequiredColorElementIDs'):
+    item = trial_timing(); item[key] = [80, 80]
+    trial_case('duplicate restriction ' + key, item, count=0)
+# All key orders must preserve the same selection and non-preferred status.
+item = trial_timing()
+trial_case('reversed dictionary order', dict(reversed(list(item.items()))))
+item = trial_timing(); item['IsPreferred'] = True
+trial_case('firmware preferred does not promote trial', item)
+# A high firmware score must not make the trial the desktop default.
+item = trial_timing(); item['Score'] = 999999
+case('diagnostic trial cannot displace normal preferred mode', [item, restricted(60, [], [])],
+     count=2, identity=80, depth=8, clock=414090, diagnostic=True,
+     diagnostic_selected=True, preferred_index=1)
+# No shared candidate pool: successful sibling timing does not rescue an unsafe-only 10bit mode.
+case('diagnostic candidates remain timing-local', [trial_timing([color85]), restricted(60, [], [])],
+     identity=85, depth=10, diagnostic=True)
+
 prefix = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -220,12 +305,14 @@ suffix = r'''
 int main(void)
 {
 '''
-for i, (name, blob, external, count, identity, depth, clock) in enumerate(cases):
+for i, (name, blob, external, count, identity, depth, clock, diagnostic, diagnostic_selected, preferred_index) in enumerate(cases):
     suffix += f'''
     {{
-        struct dcp_parse_ctx ctx;
+        struct dcp_parse_ctx ctx = {{ .diagnostic_1080p180_rgb8 = true }};
         unsigned int count = 99;
         assert(parse(blob_{i}, sizeof(blob_{i}), &ctx) == 0);
+        assert(!ctx.diagnostic_1080p180_rgb8);
+        ctx.diagnostic_1080p180_rgb8 = {str(diagnostic).lower()};
         struct dcp_display_mode *modes = enumerate_modes(&ctx, &count, 600, 340, 0,
                                                         {str(name.startswith('internal')).lower()}, {str(external).lower()});
         if (IS_ERR(modes) || count != {count}) {{
@@ -238,7 +325,10 @@ for i, (name, blob, external, count, identity, depth, clock) in enumerate(cases)
         assert(modes[0].color_mode_id == {identity});
         assert(modes[0].sdr_rgb.depth == {depth});
         assert(modes[0].mode.clock == {clock});
-        assert(modes[0].mode.type & DRM_MODE_TYPE_PREFERRED);
+        assert(modes[0].unsafe_rgb8_diagnostic == {str(diagnostic_selected).lower()});
+        assert(!modes[0].unsafe_rgb8_diagnostic || !modes[0].metadata_timing_valid);
+        for (unsigned int mode = 0; mode < count; mode++)
+            assert(!!(modes[mode].mode.type & DRM_MODE_TYPE_PREFERRED) == ((int)mode == {preferred_index}));
 '''
     suffix += '        free(modes);\n    }\n'
 suffix += f'    puts("PASS: {len(cases)} production binary-parser SDR, malformed-input, legacy and high-refresh cases");\n    return 0;\n}}\n'

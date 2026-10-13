@@ -34,6 +34,13 @@
 #include "trace.h"
 #include "version_utils.h"
 
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+static bool experimental_h17p_1080p180_rgb8;
+module_param(experimental_h17p_1080p180_rgb8, bool, 0444);
+MODULE_PARM_DESC(experimental_h17p_1080p180_rgb8,
+		 "Diagnose advertised external 1080p180 SDR RGB8 timings marked unsafe");
+#endif
+
 /* Register defines used in bandwidth setup structure */
 #define REG_DOORBELL_BIT(idx) (2 + (idx))
 
@@ -1003,6 +1010,11 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 	}
 
 	if (!strcmp(req->key, "TimingElements")) {
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+		ctx.diagnostic_1080p180_rgb8 = experimental_h17p_1080p180_rgb8 &&
+			dcp->hw.iomfb_method_profile ==
+				DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
+#endif
 		dcp->modes = enumerate_modes(&ctx, &dcp->nr_modes,
 					     dcp->width_mm, dcp->height_mm,
 					     dcp->notch_height,

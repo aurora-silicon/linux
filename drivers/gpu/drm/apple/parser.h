@@ -15,6 +15,8 @@ struct dcp_parse_ctx {
 	struct apple_dcp *dcp;
 	const void *blob;
 	u32 pos, len;
+	/* Set only by the opt-in external H17P TimingElements caller. */
+	bool diagnostic_1080p180_rgb8;
 };
 
 enum dcp_color_eotf {
@@ -97,6 +99,7 @@ struct dcp_display_mode {
 	struct dcp_color_mode best;
 	bool vrr;
 	bool metadata_timing_valid;
+	bool unsafe_rgb8_diagnostic;
 };
 
 struct dimension {

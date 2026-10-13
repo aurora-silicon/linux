@@ -526,10 +526,11 @@ static int parse_timing_color_restrictions(struct dcp_parse_ctx *handle,
 
 static int parse_color_modes(struct dcp_parse_ctx *handle,
 			     struct dcp_display_mode *out, bool external_sdr,
-			     const struct timing_color_restrictions *limits)
+			     const struct timing_color_restrictions *limits,
+			     struct dcp_color_mode *unsafe_rgb8)
 {
 	struct iterator outer_it;
-	unsigned int best_sdr_rank = 0;
+	unsigned int best_sdr_rank = 0, best_unsafe_rank = 0;
 	int ret = 0;
 	out->sdr_444.score = -1;
 	out->sdr_rgb.score = -1;
@@ -601,10 +602,24 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 			unsigned int rank;
 
 			if (cmode.id <= U32_MAX &&
-			    (timing_color_contains(&limits->unsafe, cmode.id) ||
-			     timing_color_contains(&limits->dsc_required, cmode.id)))
+			    timing_color_contains(&limits->dsc_required, cmode.id))
 				continue;
 			rank = external_sdr_rank(&cmode);
+			if (cmode.id <= U32_MAX &&
+			    timing_color_contains(&limits->unsafe, cmode.id)) {
+				/*
+				 * Collect only a timing-local diagnostic candidate. Its
+				 * timing and opt-in scope are checked after the full parse.
+				 */
+				if (unsafe_rgb8 && cmode.depth == 8 && rank &&
+				    rank >= best_unsafe_rank) {
+					if (rank > best_unsafe_rank)
+						unsafe_rgb8->score = -1;
+					fill_color_mode(unsafe_rgb8, &cmode);
+					best_unsafe_rank = rank;
+				}
+				continue;
+			}
 			if (!rank || rank < best_sdr_rank)
 				continue;
 			if (rank > best_sdr_rank)
@@ -651,6 +666,9 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	struct iterator it;
 	struct dimension horiz = { .active = -1 }, vert = { .active = -1 };
 	struct timing_color_restrictions limits = {};
+	struct dcp_color_mode unsafe_rgb8 = { .score = -1 };
+	bool have_horiz = false, have_vert = false, have_virtual = false;
+	bool duplicate_scope = false;
 	s64 min_vrr = 0, max_vrr = 0;
 	u64 clock;
 	s64 id = -1;
@@ -687,21 +705,29 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 			ret = PTR_ERR(key);
 		else if (is_virtual)
 			ret = skip(it.handle);
-		else if (!strcmp(key, "HorizontalAttributes"))
+		else if (!strcmp(key, "HorizontalAttributes")) {
+			duplicate_scope |= have_horiz;
+			have_horiz = true;
 			ret = parse_dimension(it.handle, &horiz, external_sdr);
-		else if (!strcmp(key, "VerticalAttributes"))
+		} else if (!strcmp(key, "VerticalAttributes")) {
+			duplicate_scope |= have_vert;
+			have_vert = true;
 			ret = parse_dimension(it.handle, &vert, external_sdr);
-		else if (!strcmp(key, "MinimumVariableRefreshRate"))
+		} else if (!strcmp(key, "MinimumVariableRefreshRate"))
 			ret = parse_int_bound(it.handle, &min_vrr, 0, U32_MAX);
 		else if (!strcmp(key, "MaximumVariableRefreshRate"))
 			ret = parse_int_bound(it.handle, &max_vrr, 0, U32_MAX);
 		else if (!strcmp(key, "ColorModes"))
-			ret = parse_color_modes(it.handle, out, external_sdr, &limits);
+			ret = parse_color_modes(it.handle, out, external_sdr, &limits,
+					handle->diagnostic_1080p180_rgb8 ?
+					&unsafe_rgb8 : NULL);
 		else if (!strcmp(key, "ID"))
 			ret = parse_int_bound(it.handle, &id, 0, U32_MAX);
-		else if (!strcmp(key, "IsVirtual"))
+		else if (!strcmp(key, "IsVirtual")) {
+			duplicate_scope |= have_virtual;
+			have_virtual = true;
 			ret = parse_bool(it.handle, &is_virtual);
-		else if (external_sdr && !strcmp(key, "IsPreferred")) {
+		} else if (external_sdr && !strcmp(key, "IsPreferred")) {
 			if (have_preferred)
 				ret = -EINVAL;
 			else
@@ -725,6 +751,25 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 			trace_iomfb_parse_mode_fail(id, &horiz, &vert, best_color_mode, is_virtual, *score);
 			return ret;
 		}
+	}
+	/*
+	 * Never replace a normal candidate or create a timing/color pairing.
+	 * This diagnostic only exposes an otherwise rejected firmware timing;
+	 * it neither repairs link timing nor establishes that "unsafe" is safe.
+	 * The observed 2080x1106 total and 11796583/65536 Hz are deliberate:
+	 * do not widen this to arbitrary nominal-180 Hz blanking or rates.
+	 */
+	if (external_sdr && !internal && handle->diagnostic_1080p180_rgb8 &&
+	    out->sdr_rgb.score < 0 && unsafe_rgb8.score >= 0 &&
+	    !duplicate_scope && have_horiz && have_vert && have_virtual && !is_virtual &&
+	    have_interlaced && !interlaced && !notch_height &&
+	    horiz.active == 1920 && vert.active == 1080 &&
+	    horiz.total == 2080 && vert.total == 1106 &&
+	    vert.precise_sync_rate == 11796583 &&
+	    horiz.pixel_repetition == 0 && vert.pixel_repetition == 0 &&
+	    horiz.sync_polarity >= 0 && vert.sync_polarity >= 0) {
+		out->sdr_rgb = unsafe_rgb8;
+		out->unsafe_rgb8_diagnostic = true;
 	}
 	if (out->sdr_rgb.score >= 0)
 		best_color_mode = out->sdr_rgb.id;
@@ -802,7 +847,8 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	if (external_sdr && horiz.sync_polarity >= 0 && vert.sync_polarity >= 0)
 		mode->flags = (horiz.sync_polarity ? DRM_MODE_FLAG_PHSYNC : DRM_MODE_FLAG_NHSYNC) |
 			      (vert.sync_polarity ? DRM_MODE_FLAG_PVSYNC : DRM_MODE_FLAG_NVSYNC);
-	out->metadata_timing_valid = external_sdr && have_preferred && preferred &&
+	out->metadata_timing_valid = external_sdr && !out->unsafe_rgb8_diagnostic &&
+		have_preferred && preferred &&
 		have_interlaced && !interlaced && horiz.pixel_repetition == 0 &&
 		vert.pixel_repetition == 0 && horiz.sync_polarity >= 0 && vert.sync_polarity >= 0;
 	drm_mode_set_name(mode);
@@ -862,7 +908,7 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 		/* Process a successful mode */
 		(*count)++;
 
-		if (score > best_score) {
+		if (!mode->unsafe_rgb8_diagnostic && score > best_score) {
 			best_score = score;
 			best_mode = mode;
 		}
