@@ -2493,6 +2493,8 @@ static void dcp_external_report_disconnected(struct apple_dcp *dcp)
 	unsigned int action;
 
 	guard(mutex)(&dcp->iomfb.lock);
+	/* A paused callback from the old sink must not be replayed on wake. */
+	dcp->external_hotplug_pending = false;
 	action = dcp_mode_hotplug(&dcp->mode_state, false,
 				  dcp->connector ? &dcp->connector->connected : NULL);
 	if (dcp->connector) {
@@ -2666,7 +2668,7 @@ bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected)
 		return false;
 	/* No lifecycle or HPD mutex may be acquired from the RX callback. */
 	lockdep_assert_held(&dcp->iomfb.lock);
-	if (READ_ONCE(dcp->quiescing))
+	if (READ_ONCE(dcp->quiescing) || !READ_ONCE(dcp->external_cable))
 		return true;
 	if (dcp->iomfb.presentation_paused) {
 		dcp->external_hotplug_pending = true;

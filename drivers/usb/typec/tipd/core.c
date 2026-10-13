@@ -777,6 +777,23 @@ static void cd321x_update_work(struct work_struct *work)
 	was_disconnected |= partner_changed;
 
 	/*
+	 * Report sink absence before any fallible hardware transition. A failed
+	 * shutdown retains the route/PHY owner, but cannot keep the sink present.
+	 * Every Type-C port references the same external DCP connector.  Only the
+	 * port which successfully acquired the shared display route may report a
+	 * disconnect.  A second DP sink can negotiate Alt Mode even though its mux
+	 * request is rejected with -EBUSY; treating that sink as the connector
+	 * owner would tear down the display carried by the first port.
+	 */
+	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
+	    dp_route_was_active &&
+	    (!new_connected || was_disconnected || !dp_connected || !dp_hpd ||
+	     dp_hpd_changed || dp_mode_changed)) {
+		drm_connector_oob_hotplug_event(cd321x->connector_fwnode,
+					      connector_status_disconnected);
+	}
+
+	/*
 	 * ACIO carries the tunneled PCIe reset handshake over the still-live
 	 * Type-C data path. Close a disappearing USB4/TBT session before dropping
 	 * the USB role; otherwise the role transition tears down the ATC lanes and
@@ -796,20 +813,6 @@ static void cd321x_update_work(struct work_struct *work)
 		ret = usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
 		if (ret)
 			goto retry;
-	}
-
-	/*
-	 * Every Type-C port references the same external DCP connector.  Only the
-	 * port which successfully acquired the shared display route may report a
-	 * disconnect.  A second DP sink can negotiate Alt Mode even though its mux
-	 * request is rejected with -EBUSY; treating that sink as the connector
-	 * owner would tear down the display carried by the first port.
-	 */
-	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
-	    dp_route_was_active &&
-	    (!new_connected || was_disconnected || !dp_connected || !dp_hpd ||
-	     dp_hpd_changed || dp_mode_changed)) {
-		drm_connector_oob_hotplug_event(cd321x->connector_fwnode, connector_status_disconnected);
 	}
 
 	/* Process partner disconnection or change */
