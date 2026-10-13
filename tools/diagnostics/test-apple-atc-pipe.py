@@ -250,12 +250,12 @@ static void parking_and_guards(void)
     initial(&p, APPLE_ATCPHY_MODE_USB3, ATCPHY_PIPEHANDLER_STATE_USB3);
     pipe_regs[PIPEHANDLER_LOCK_ACK / 4] = PIPEHANDLER_LOCK_EN;
     stuck_ack = true;
-    atcphy_park_pipehandler(&p);
+    assert(atcphy_park_pipehandler(&p) == -ETIMEDOUT);
     assert(p.pipe_state == ATCPHY_PIPEHANDLER_STATE_USB3 && mux_writes == 0);
     stuck_ack = false;
-    atcphy_park_pipehandler(&p);
+    assert(atcphy_park_pipehandler(&p) == 0);
     assert(p.pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY && mux_writes == 3);
-    atcphy_park_pipehandler(&p);
+    assert(atcphy_park_pipehandler(&p) == 0);
     assert(mux_writes == 3);
     initial(&p, APPLE_ATCPHY_MODE_USB2, ATCPHY_PIPEHANDLER_STATE_DUMMY);
     p.fixed_usb2 = p.host_active = true;

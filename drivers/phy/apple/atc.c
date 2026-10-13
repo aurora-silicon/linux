@@ -1442,21 +1442,22 @@ static int atcphy_configure_pipehandler(struct apple_atcphy *atcphy, bool host)
 }
 
 /* Route the PIPE back to the dummy backend unless it is there already */
-static void atcphy_park_pipehandler(struct apple_atcphy *atcphy)
+static int atcphy_park_pipehandler(struct apple_atcphy *atcphy)
 {
 	int ret;
 
 	lockdep_assert_held(&atcphy->lock);
 
 	if (atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY)
-		return;
+		return 0;
 
 	ret = atcphy_configure_pipehandler_dummy(atcphy);
 	if (ret) {
 		dev_warn(atcphy->dev, "Failed to switch PIPE to dummy: %d\n", ret);
-		return;
+		return ret;
 	}
 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+	return 0;
 }
 
 static void atcphy_setup_pipehandler(struct apple_atcphy *atcphy)
@@ -2869,10 +2870,13 @@ static const struct phy_ops apple_atc_usb2_phy_ops = {
 static int atcphy_usb3_power_off(struct phy *phy)
 {
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
+	int ret;
 
 	guard(mutex)(&atcphy->lock);
 
-	atcphy_park_pipehandler(atcphy);
+	ret = atcphy_park_pipehandler(atcphy);
+	if (ret)
+		return ret;
 	atcphy->host_active = false;
 
 	if (atcphy->mode != APPLE_ATCPHY_MODE_OFF)
@@ -3124,11 +3128,16 @@ static void _atcphy_dwc3_reset_assert(struct apple_atcphy *atcphy)
 static int atcphy_dwc3_reset_assert(struct reset_controller_dev *rcdev, unsigned long id)
 {
 	struct apple_atcphy *atcphy = container_of(rcdev, struct apple_atcphy, rcdev);
+	int ret;
 
 	guard(mutex)(&atcphy->lock);
 
+	/* Do not reset the controller or USB2 PHY if PIPE parking fails. */
+	ret = atcphy_park_pipehandler(atcphy);
+	if (ret)
+		return ret;
+
 	_atcphy_dwc3_reset_assert(atcphy);
-	atcphy_park_pipehandler(atcphy);
 	atcphy->host_active = false;
 	atcphy_usb2_power_off(atcphy);
 
@@ -3324,8 +3333,11 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 		 * mode without a USB3 backend, and route it to the new backend
 		 * afterwards while dwc3 is up in host mode.
 		 */
-		if (pipe_state != ATCPHY_PIPEHANDLER_STATE_USB3)
-			atcphy_park_pipehandler(atcphy);
+		if (pipe_state != ATCPHY_PIPEHANDLER_STATE_USB3) {
+			ret = atcphy_park_pipehandler(atcphy);
+			if (ret)
+				return ret;
+		}
 
 		ret = atcphy_configure(atcphy, target_mode);
 		if (ret)
