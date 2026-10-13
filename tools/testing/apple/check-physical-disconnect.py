@@ -44,6 +44,8 @@ funcs = '\n'.join(function(f, n) for f, n in (
     (dcp, 'dcp_external_disconnect'),
     (dcp, 'dcp_external_stop_work'),
     (dcp, 'dcp_external_hotplug'),
+    (dcp, 'dcp_external_link_locked'),
+    (dcp, 'dcp_dptx_connect_oob'),
     (core, 'cd321x_retry_revalidation'),
     (core, 'cd321x_update_work')))
 prefix = r'''
@@ -95,7 +97,9 @@ struct work_struct { bool pending; };
 struct delayed_work { struct work_struct work; };
 static int system_freezable_wq;
 static int schedule_work(struct work_struct *w) { w->pending = true; return 1; }
+static void cancel_work_sync(struct work_struct *w) { w->pending = false; }
 static void cancel_delayed_work_sync(struct delayed_work *w) { w->work.pending = false; }
+#define cancel_delayed_work cancel_delayed_work_sync
 static void mod_delayed_work(int q, struct delayed_work *w, int t)
 { (void)q; (void)t; w->work.pending = true; }
 struct apple_connector { bool connected, edid_invalidation_pending; };
@@ -108,11 +112,23 @@ struct apple_dcp {
  struct work_struct external_stop_work;
  bool external_running, external_stopped, external_power_attempted;
  bool external_cable, typec_cable_connected, typec_crtc_off, pipe_enabled_h17p;
+ bool external_physically_absent, external_prepared, placeholder_retried;
+ int typec_reconnect_tries;
  bool external_hotplug_pending, external_hotplug_connected, quiescing;
  u64 external_generation, external_rx_generation, external_crtc_generation;
  u64 external_stop_generation, typec_generation;
  int external_error, mode_state; void *avep;
 };
+struct platform_device { struct apple_dcp *data; };
+static struct apple_dcp *platform_get_drvdata(struct platform_device *p) { return p->data; }
+static int raw_error, raw_links;
+static int dcp_dptx_connect_raw(struct apple_dcp *d, u32 port, bool *waiting)
+{ assert(port == 0); *waiting = false; raw_links++;
+ if (!raw_error) d->dptxport[0].connected = true;
+ return raw_error; }
+static bool dcp_is_typec_output(struct apple_dcp *d) { (void)d; return true; }
+static int dcp_dptx_connect(struct apple_dcp *d, u32 port) { (void)d; (void)port; return 0; }
+#define DPTX_RECONNECT_DELAY 500
 static int settle_error, power_error, hpd_error, release_error;
 static int settles, powers, releases, detaches, notices;
 static bool dcp_is_external_h17p(struct apple_dcp *d) { (void)d; return true; }
@@ -186,7 +202,8 @@ static struct cd321x port;
 static void init(void)
 {
  memset(&display,0,sizeof(display)); memset(&sink,0,sizeof(sink)); memset(&port,0,sizeof(port));
- sink.connected = true; display.connector = &sink;
+ sink.connected = true; display.connector = &sink; display.external_prepared = true;
+ raw_error = raw_links = 0;
  display.external_running = display.external_power_attempted = true;
  display.external_cable = display.typec_cable_connected = true;
  display.dptxport[0].connected = display.pipe_enabled_h17p = true;
@@ -308,6 +325,47 @@ int main(void)
  display.external_stopped = true; callback(true); CHECK(!sink.connected);
  init(); sink.connected = false; display.iomfb.presentation_paused = true;
  display.external_error = -EIO; callback(true); CHECK(!sink.connected);
+ /* Fresh firmware discovery precedes OOB: no second RX is required. */
+ init(); sink.connected = false;
+ display.external_cable = display.typec_cable_connected = false;
+ display.external_generation = display.external_rx_generation = 37;
+ display.external_power_attempted = false; display.external_stopped = true;
+ display.dptxport[0].connected = false;
+ callback(true); CHECK(sink.connected); CHECK(!display.external_physically_absent);
+ struct platform_device device = { .data = &display };
+ CHECK(dcp_dptx_connect_oob(&device,0) == 0);
+ CHECK(raw_links == 1 && sink.connected);
+ CHECK(display.external_generation == 38);
+ /* Initially paused discovery keeps the original pending-replay behavior. */
+ init(); sink.connected = false; display.external_cable = false;
+ display.external_power_attempted = false; display.iomfb.presentation_paused = true;
+ callback(true); CHECK(display.external_hotplug_pending); CHECK(!sink.connected);
+ CHECK(dcp_dptx_connect_oob(&device,0) == 0 && raw_links == 1);
+ iomfb_pause_presentation(&display,false); CHECK(sink.connected);
+ /* Physical absence consumes late RX and clears an already queued replay. */
+ init(); display.iomfb.presentation_paused = true; callback(true);
+ CHECK(display.external_hotplug_pending);
+ CHECK(dcp_external_disconnect(&display,true) == 0);
+ CHECK(display.external_physically_absent && !display.external_hotplug_pending);
+ callback(true); CHECK(!sink.connected && !display.external_hotplug_pending);
+ /* A real next OOB connect removes the tombstone and permits discovery. */
+ CHECK(dcp_dptx_connect_oob(&device,0) == 0);
+ CHECK(!display.external_physically_absent && display.external_cable);
+ CHECK(display.external_generation == 9 && raw_links == 1);
+ callback(true); CHECK(sink.connected);
+ /* Same-cable DPMS does not create a physical-absence tombstone. */
+ init(); CHECK(dcp_external_disconnect(&display,false) == 0);
+ CHECK(!display.external_physically_absent && display.external_cable);
+ sink.connected = false; callback(true); CHECK(!sink.connected);
+ CHECK(display.external_hotplug_pending);
+ iomfb_pause_presentation(&display,false); CHECK(sink.connected);
+ /* A failed hardware stop remains owned, even after a real OOB reconnect. */
+ init(); display.external_error = -EIO;
+ CHECK(dcp_external_disconnect(&display,true) == -EIO);
+ CHECK(display.external_physically_absent); callback(true); CHECK(!sink.connected);
+ CHECK(dcp_dptx_connect_oob(&device,0) == -EIO);
+ CHECK(!display.external_physically_absent && display.external_error == -EIO);
+ CHECK(raw_links == 0 && display.dptxport[0].connected && display.pipe_enabled_h17p);
  /* Successful physical teardown may release ownership normally. */
  init(); CHECK(dcp_external_disconnect(&display,true) == 0);
  CHECK(!sink.connected && !display.dptxport[0].connected);

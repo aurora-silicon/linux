@@ -2624,6 +2624,7 @@ static int dcp_external_disconnect(struct apple_dcp *dcp, bool physical)
 	guard(mutex)(&dcp->external_lock);
 	/* Invalidate physical EDID before waiting for firmware power/link teardown. */
 	if (physical) {
+		WRITE_ONCE(dcp->external_physically_absent, true);
 		scoped_guard(mutex, &dcp->hpd_mutex) {
 			WRITE_ONCE(dcp->typec_cable_connected, false);
 			dcp->typec_generation++;
@@ -2668,7 +2669,7 @@ bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected)
 		return false;
 	/* No lifecycle or HPD mutex may be acquired from the RX callback. */
 	lockdep_assert_held(&dcp->iomfb.lock);
-	if (READ_ONCE(dcp->quiescing) || !READ_ONCE(dcp->external_cable))
+	if (READ_ONCE(dcp->quiescing) || READ_ONCE(dcp->external_physically_absent))
 		return true;
 	if (dcp->iomfb.presentation_paused) {
 		dcp->external_hotplug_pending = true;
@@ -2846,6 +2847,7 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 		if (new_cable)
 			dcp->external_generation++;
 		dcp->external_cable = true;
+		WRITE_ONCE(dcp->external_physically_absent, false);
 		dcp_external_publish_generation(dcp);
 		scoped_guard(mutex, &dcp->hpd_mutex) {
 			WRITE_ONCE(dcp->typec_cable_connected, true);

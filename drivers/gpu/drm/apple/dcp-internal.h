@@ -229,6 +229,8 @@ struct apple_dcp {
 	u64 external_rx_generation;
 	u64 external_stop_generation;
 	bool external_cable;
+	/* RX tombstone: initially unknown; only physical OOB events change it. */
+	bool external_physically_absent;
 	bool external_running;
 	bool external_power_attempted;
 	/* iomfb.lock: replay the latest callback after activation succeeds. */
