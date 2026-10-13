@@ -48,6 +48,12 @@
 
 #define MAX_COPROCESSORS 8
 
+/* Controlled format-path comparison; leave the normal formats unchanged. */
+static bool experimental_h17p_external_rgb8;
+module_param(experimental_h17p_external_rgb8, bool, 0444);
+MODULE_PARM_DESC(experimental_h17p_external_rgb8,
+		 "Restrict external H17P RGB scanout to 8-bit formats for diagnosis");
+
 struct apple_drm_private {
 	struct drm_device drm;
 };
@@ -436,6 +442,11 @@ static int apple_probe_per_dcp(struct device *dev,
 	struct apple_dcp *dcp_data = platform_get_drvdata(dcp);
 	bool supports_xrgb2101010;
 	enum drm_plane_type plane_type;
+
+	if (experimental_h17p_external_rgb8 &&
+	    dcp_data->hw.iomfb_method_profile ==
+		    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+		supports_l10r = false;
 
 	supports_xrgb2101010 = dcp_data->fw_compat != DCP_FIRMWARE_H17P ||
 		dcp_data->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G;
