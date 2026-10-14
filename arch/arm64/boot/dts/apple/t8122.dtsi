@@ -74,6 +74,7 @@
 			operating-points-v2 = <&sawtooth_opp>;
 			capacity-dmips-mhz = <804>;
 			performance-domains = <&cpufreq_e>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e1: cpu@1 {
@@ -88,6 +89,7 @@
 			operating-points-v2 = <&sawtooth_opp>;
 			capacity-dmips-mhz = <804>;
 			performance-domains = <&cpufreq_e>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e2: cpu@2 {
@@ -102,6 +104,7 @@
 			operating-points-v2 = <&sawtooth_opp>;
 			capacity-dmips-mhz = <804>;
 			performance-domains = <&cpufreq_e>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e3: cpu@3 {
@@ -116,6 +119,7 @@
 			operating-points-v2 = <&sawtooth_opp>;
 			capacity-dmips-mhz = <804>;
 			performance-domains = <&cpufreq_e>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p0: cpu@10100 {
@@ -130,6 +134,7 @@
 			operating-points-v2 = <&everest_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p1: cpu@10101 {
@@ -144,6 +149,7 @@
 			operating-points-v2 = <&everest_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p2: cpu@10102 {
@@ -158,6 +164,7 @@
 			operating-points-v2 = <&everest_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p3: cpu@10103 {
@@ -172,6 +179,7 @@
 			operating-points-v2 = <&everest_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p>;
+			#cooling-cells = <2>;
 		};
 
 		l2_cache_0: l2-cache-0 {
@@ -1128,6 +1136,44 @@
 
 			smc_hwmon: hwmon {
 				compatible = "apple,smc-hwmon";
+				#thermal-sensor-cells = <1>;
+
+				/*
+				 * CPU die temperatures, one per E-cluster sensor
+				 * group and one per P core (the key that rose most
+				 * with only that core busy, on a J613). Board
+				 * thermal zones refer to these by channel index, so
+				 * keep them first and in this order.
+				 */
+				temperature-Te05 {
+					apple,key-id = "Te05";
+					label = "E-cluster Temperature 1";
+				};
+
+				temperature-Te0P {
+					apple,key-id = "Te0P";
+					label = "E-cluster Temperature 2";
+				};
+
+				temperature-Tp05 {
+					apple,key-id = "Tp05";
+					label = "P-core 0 Temperature";
+				};
+
+				temperature-Tp0L {
+					apple,key-id = "Tp0L";
+					label = "P-core 1 Temperature";
+				};
+
+				temperature-Tp0b {
+					apple,key-id = "Tp0b";
+					label = "P-core 2 Temperature";
+				};
+
+				temperature-Tp0r {
+					apple,key-id = "Tp0r";
+					label = "P-core 3 Temperature";
+				};
 			};
 
 			smc_reboot: reboot {
