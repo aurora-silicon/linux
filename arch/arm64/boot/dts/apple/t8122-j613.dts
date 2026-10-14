@@ -662,3 +662,16 @@
 		};
 	};
 };
+
+/*
+ * The base M3 has no Tf keys. With only the GPU busy, the six Tg keys below
+ * rose by about 50 C, the most of any key, and each has a twin about 4.5 C
+ * lower; they read 0 C or slightly below while the GPU is powered off. The
+ * others are the CPU die keys of the thermal zones above (the E-cluster
+ * groups and one per P core), so the zone also follows a hot CPU.
+ */
+&smc_hwmon {
+	apple,soc-die-keys = "Tg0D", "Tg0P", "Tg0X", "Tg0b", "Tg0j", "Tg0v",
+			     "Te05", "Te0P", "Tp05", "Tp0L", "Tp0b", "Tp0r";
+	apple,thermal-pressure-key = "mTPL";
+};
