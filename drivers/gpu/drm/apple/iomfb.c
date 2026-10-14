@@ -832,7 +832,15 @@ void dcp_hotplug(struct work_struct *work)
 	 * display modes from atomic_flush, so userspace needs to trigger a
 	 * flush, or the CRTC gets no signal.
 	 */
+	/*
+	 * Not for a Type-C CRTC powered off with the display attached: it has
+	 * no link, and dcp_poweron() retrains one on wake. DCP tears its AV
+	 * service down at power off, which lands here; a link reported bad
+	 * then makes wlroots replace the output on wake, which powers the
+	 * CRTC off and on again, and that wake does the same, forever.
+	 */
 	if (connector->base.state && !READ_ONCE(dcp->mode_state.valid) && connector->connected &&
+	    !READ_ONCE(dcp->typec_crtc_off) &&
 	    !(dcp_is_usb4_output(dcp) && apple_dp_tunnel_t602x())) {
 		drm_connector_set_link_status_property(&connector->base,
 						       DRM_MODE_LINK_STATUS_BAD);
