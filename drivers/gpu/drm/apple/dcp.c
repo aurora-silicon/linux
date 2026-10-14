@@ -2138,9 +2138,19 @@ void dcp_set_dimensions(struct apple_dcp *dcp)
 	 * This callback runs on the ordered RTKit RX worker. A mode probe
 	 * can hold mode_config.mutex while waiting for an AFK reply which
 	 * that same worker still has to dispatch. Defer the DRM update.
+	 *
+	 * Not through the hotplug worker except for external H17P: DCP sends
+	 * DisplayAttributes on every DPTX connect, which a Type-C DPMS wake
+	 * does before its modeset. dcp_hotplug() would then report the link
+	 * of the CRTC being enabled as bad, and wlroots replaces the output,
+	 * which powers it off and on again, forever.
 	 */
-	if (dcp->connector && !READ_ONCE(dcp->quiescing))
-		schedule_work(&dcp->connector->hotplug_wq);
+	if (dcp->connector && !READ_ONCE(dcp->quiescing)) {
+		if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
+			schedule_work(&dcp->connector->hotplug_wq);
+		else
+			schedule_work(&dcp->dimensions_wq);
+	}
 
 	/*
 	 * Fix up any probed modes. Modes are created when parsing
@@ -2151,6 +2161,19 @@ void dcp_set_dimensions(struct apple_dcp *dcp)
 		dcp->modes[i].mode.width_mm = width_mm;
 		dcp->modes[i].mode.height_mm = height_mm;
 	}
+}
+
+static void dcp_dimensions_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp,
+					     dimensions_wq);
+	struct apple_connector *connector = READ_ONCE(dcp->connector);
+
+	if (!connector)
+		return;
+	guard(mutex)(&connector->base.dev->mode_config.mutex);
+	if (READ_ONCE(connector->dcp) == to_platform_device(dcp->dev))
+		dcp_update_connector_dimensions(dcp, &connector->base);
 }
 
 void dcp_update_connector_dimensions(struct apple_dcp *dcp,
@@ -4248,6 +4271,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	set_bit(0, dcp->memdesc_map);
 
 	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
+	INIT_WORK(&dcp->dimensions_wq, dcp_dimensions_work);
 	INIT_DELAYED_WORK(&dcp->swap_watchdog_wq, dcp_swap_watchdog);
 
 	if (dcp->hw.iomfb_method_profile ==
@@ -4346,6 +4370,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		}
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 		cancel_work_sync(&dcp->vblank_wq);
+		cancel_work_sync(&dcp->dimensions_wq);
 		if (dcp->connector)
 			cancel_work_sync(&dcp->connector->hotplug_wq);
 		if (dcp->typec_connector && dcp->typec_connector != dcp->connector)
@@ -4406,6 +4431,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	}
 	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
 	cancel_work_sync(&dcp->vblank_wq);
+	cancel_work_sync(&dcp->dimensions_wq);
 
 	devm_clk_put(dev, dcp->clk);
 	dcp->clk = NULL;

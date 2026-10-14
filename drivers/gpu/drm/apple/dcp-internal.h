@@ -379,6 +379,8 @@ struct apple_dcp {
 
 	/* Workqueue for sending vblank events when a dcp swap is not possible */
 	struct work_struct vblank_wq;
+	/* connector physical dimensions, deferred from the RTKit RX worker */
+	struct work_struct dimensions_wq;
 
 	/* Completes a Type-C swap that DCP dropped, and recovers the pipe. */
 	struct delayed_work swap_watchdog_wq;
