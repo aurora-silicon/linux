@@ -45,6 +45,20 @@ static void xhci_plat_keep_running_other_quirks_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, xhci_plat_keep_running(~0ULL, PM_SUSPEND_TO_IDLE, true, true));
 }
 
+/* A running controller is left alone; a halted, failed or unpowered one is brought up again. */
+static void xhci_plat_stopped_test(struct kunit *test)
+{
+	/* Running, with an event pending and a port change */
+	KUNIT_EXPECT_FALSE(test, xhci_plat_stopped(0));
+	KUNIT_EXPECT_FALSE(test, xhci_plat_stopped(STS_EINT | STS_PORT));
+	/* Halted, Host System Error, Host Controller Error */
+	KUNIT_EXPECT_TRUE(test, xhci_plat_stopped(STS_HALT));
+	KUNIT_EXPECT_TRUE(test, xhci_plat_stopped(STS_FATAL | STS_HALT));
+	KUNIT_EXPECT_TRUE(test, xhci_plat_stopped(STS_HCE));
+	/* Register reads of a powered-off block */
+	KUNIT_EXPECT_TRUE(test, xhci_plat_stopped(~0U));
+}
+
 static u64 xhci_plat_test_quirks(struct kunit *test, const struct property_entry *props)
 {
 	struct device *dev;
@@ -99,6 +113,7 @@ static void xhci_plat_all_property_quirks_test(struct kunit *test)
 static struct kunit_case xhci_plat_test_cases[] = {
 	KUNIT_CASE(xhci_plat_keep_running_test),
 	KUNIT_CASE(xhci_plat_keep_running_other_quirks_test),
+	KUNIT_CASE(xhci_plat_stopped_test),
 	KUNIT_CASE(xhci_plat_no_property_quirks_test),
 	KUNIT_CASE(xhci_plat_run_in_s2idle_property_test),
 	KUNIT_CASE(xhci_plat_all_property_quirks_test),

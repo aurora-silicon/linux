@@ -525,6 +525,13 @@ VISIBLE_IF_KUNIT bool xhci_plat_keep_running(u64 quirks, suspend_state_t target,
 }
 EXPORT_SYMBOL_IF_KUNIT(xhci_plat_keep_running);
 
+/* Whether a controller that was left running reads back as stopped or failed */
+VISIBLE_IF_KUNIT bool xhci_plat_stopped(u32 usbsts)
+{
+	return usbsts == ~(u32)0 || (usbsts & (STS_HALT | STS_FATAL | STS_HCE));
+}
+EXPORT_SYMBOL_IF_KUNIT(xhci_plat_stopped);
+
 static bool xhci_plat_run_in_s2idle(struct device *dev)
 {
 	struct usb_hcd	*hcd = dev_get_drvdata(dev);
@@ -620,7 +627,19 @@ static int xhci_plat_resume(struct device *dev)
 	}
 
 	if (priv->running_in_s2idle) {
+		u32 status = readl(&hcd_to_xhci(hcd)->op_regs->status);
+
 		priv->running_in_s2idle = 0;
+		/*
+		 * The controller was left running on the platform's promise that it stays powered.
+		 * If it stopped all the same, because power was cut or it hit an error, it has to
+		 * be brought up from scratch, which xhci_resume() does when told power was lost.
+		 */
+		if (xhci_plat_stopped(status)) {
+			dev_warn(dev, "stopped in suspend-to-idle (USBSTS %#010x), reinitialising\n",
+				 status);
+			return xhci_plat_resume_common(dev, true);
+		}
 		dev_dbg(dev, "kept running in suspend-to-idle, skip resume.\n");
 		return 0;
 	}

@@ -40,6 +40,7 @@ extern const struct dev_pm_ops xhci_plat_pm_ops;
 u64 xhci_plat_property_quirks(struct device *dev);
 bool xhci_plat_keep_running(u64 quirks, suspend_state_t target, bool may_wakeup,
 			    bool wakeup_path);
+bool xhci_plat_stopped(u32 usbsts);
 #endif
 
 #endif	/* _XHCI_PLAT_H */
