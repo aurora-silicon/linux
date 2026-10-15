@@ -129,7 +129,7 @@ out:
 
 int dwc3_host_init(struct dwc3 *dwc)
 {
-	struct property_entry	props[6];
+	struct property_entry	props[8];
 	struct platform_device	*xhci;
 	int			ret, irq;
 	int			prop_idx = 0;
@@ -187,6 +187,9 @@ int dwc3_host_init(struct dwc3 *dwc)
 
 	props[prop_idx++] = PROPERTY_ENTRY_U16("num-hc-interrupters",
 					       dwc->num_hc_interrupters);
+
+	if (dwc->xhci_run_in_s2idle)
+		props[prop_idx++] = PROPERTY_ENTRY_BOOL("xhci-run-in-s2idle");
 
 	if (prop_idx) {
 		ret = device_create_managed_software_node(&xhci->dev, props, NULL);
