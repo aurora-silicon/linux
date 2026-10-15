@@ -20,6 +20,7 @@
 #include <linux/acpi.h>
 #include <linux/usb/of.h>
 #include <linux/reset.h>
+#include <linux/suspend.h>
 #include <linux/usb/xhci-sideband.h>
 
 #include "xhci.h"
@@ -277,6 +278,9 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
 		if (device_property_read_bool(tmpdev, "xhci-skip-phy-init-quirk"))
 			xhci->quirks |= XHCI_SKIP_PHY_INIT;
 
+		if (device_property_read_bool(tmpdev, "xhci-run-in-s2idle"))
+			xhci->quirks |= XHCI_RUN_IN_S2IDLE;
+
 		device_property_read_u32(tmpdev, "imod-interval-ns",
 					 &xhci->imod_interval);
 		device_property_read_u16(tmpdev, "num-hc-interrupters",
@@ -494,6 +498,24 @@ static int xhci_plat_suspend_common(struct device *dev)
 	return 0;
 }
 
+/*
+ * Some platforms have no wake signal for a halted xHC: a halted controller writes no events, so
+ * its interrupt cannot fire, and on PCI the remote wakeup or port change would be signalled as a
+ * PME instead. Where the platform keeps the controller powered and clocked in suspend-to-idle,
+ * leave it running instead, with the root hubs suspended and armed for wakeup as usual. A remote
+ * wakeup or port change then raises a Port Status Change Event, and the interrupt, armed for
+ * wakeup by the platform, ends suspend-to-idle.
+ */
+static bool xhci_plat_run_in_s2idle(struct device *dev)
+{
+	struct usb_hcd	*hcd = dev_get_drvdata(dev);
+	struct xhci_hcd	*xhci = hcd_to_xhci(hcd);
+
+	return (xhci->quirks & XHCI_RUN_IN_S2IDLE) &&
+	       pm_suspend_target_state == PM_SUSPEND_TO_IDLE &&
+	       device_may_wakeup(dev) && device_wakeup_path(dev);
+}
+
 static int xhci_plat_suspend(struct device *dev)
 {
 	struct usb_hcd	*hcd = dev_get_drvdata(dev);
@@ -502,6 +524,15 @@ static int xhci_plat_suspend(struct device *dev)
 	if (xhci_sideband_check(hcd)) {
 		priv->sideband_at_suspend = 1;
 		dev_dbg(dev, "sideband instance active, skip suspend.\n");
+		return 0;
+	}
+
+	if (xhci_plat_run_in_s2idle(dev)) {
+		/* A runtime suspended controller is halted, start it again. */
+		if (pm_runtime_suspended(dev))
+			pm_runtime_resume(dev);
+		priv->running_in_s2idle = 1;
+		dev_dbg(dev, "wakeup enabled, keep running in suspend-to-idle.\n");
 		return 0;
 	}
 
@@ -567,6 +598,12 @@ static int xhci_plat_resume(struct device *dev)
 	if (priv->sideband_at_suspend) {
 		priv->sideband_at_suspend = 0;
 		dev_dbg(dev, "sideband instance active, skip resume.\n");
+		return 0;
+	}
+
+	if (priv->running_in_s2idle) {
+		priv->running_in_s2idle = 0;
+		dev_dbg(dev, "kept running in suspend-to-idle, skip resume.\n");
 		return 0;
 	}
 
