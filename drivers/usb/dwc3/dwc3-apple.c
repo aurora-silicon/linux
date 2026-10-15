@@ -80,7 +80,8 @@
  * Type-C mux for the SuperSpeed lanes, and the PHY follows those mode changes on its own.
  *
  * Whenever the core is up, for either kind of port, it is kept running across system sleep, see
- * dwc3_apple_init(). In host mode its interrupt is then also armed as the wake interrupt.
+ * dwc3_apple_init(). In host mode its interrupt is then also armed as the wake interrupt, and
+ * xHCI keeps running in suspend-to-idle so that it can raise it.
  *
  * enum dwc3_apple_state is defined in dwc3-apple-state.h.
  */
@@ -212,6 +213,11 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
 	probe_data.ignore_clocks_and_resets = true;
 	probe_data.skip_core_init_mode = true;
 	probe_data.properties = DWC3_DEFAULT_PROPERTIES;
+	/*
+	 * There is no wake interrupt besides the core interrupt, and a halted xHC raises none,
+	 * see dwc3_apple_init().
+	 */
+	probe_data.properties.xhci_run_in_s2idle = true;
 
 	/*
 	 * This runs from the role switch callback, so a failure leaves the glue
@@ -443,9 +449,12 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 	}
 
 	/*
-	 * xHCI shares the core interrupt and is suspended with its root port wake bits set when
-	 * this device may wake the system (dwc3_host_init() passes that on). Arm the interrupt
-	 * for wakeup while in host mode, so that a port event during suspend-to-idle ends it.
+	 * xHCI shares the core interrupt and suspends its root hubs with their wake bits set when
+	 * this device may wake the system (dwc3_host_init() passes that on). The controller has no
+	 * separate wake signal, and a halted xHC writes no events and so raises no interrupt, so
+	 * xHCI is told to keep running in suspend-to-idle instead of halting (the core stays
+	 * powered, see below). Arm the interrupt for wakeup while in host mode, so that the Port
+	 * Status Change Event of a remote wakeup or port change ends suspend-to-idle.
 	 * Device mode has no wake source: a gadget is woken by its host.
 	 */
 	if (state == DWC3_APPLE_HOST) {
