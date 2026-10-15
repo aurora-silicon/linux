@@ -21,5 +21,6 @@ usbcore-y			+= ../misc/onboard_usb_dev_pdevs.o
 endif
 
 obj-$(CONFIG_USB)		+= usbcore.o
+obj-$(CONFIG_USB_QUIRKS_KUNIT_TEST)	+= usb-quirks-test.o
 
 obj-$(CONFIG_USB_LEDS_TRIGGER_USBPORT)	+= ledtrig-usbport.o

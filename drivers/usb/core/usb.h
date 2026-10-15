@@ -36,6 +36,9 @@ extern int usb_authorize_device(struct usb_device *);
 extern void usb_deauthorize_interface(struct usb_interface *);
 extern void usb_authorize_interface(struct usb_interface *);
 extern void usb_detect_quirks(struct usb_device *udev);
+#if IS_ENABLED(CONFIG_KUNIT)
+u32 usb_detect_device_list_quirks(struct usb_device *udev);
+#endif
 extern void usb_detect_interface_quirks(struct usb_device *udev);
 extern void usb_release_quirk_list(void);
 extern bool usb_endpoint_is_ignored(struct usb_device *udev,

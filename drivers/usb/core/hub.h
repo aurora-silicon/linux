@@ -17,6 +17,11 @@
 #include <linux/usb/typec.h>
 #include "usb.h"
 
+/* Quirks that hub_id_table assigns through driver_info */
+#define HUB_QUIRK_CHECK_PORT_AUTOSUSPEND	BIT(0)
+#define HUB_QUIRK_DISABLE_AUTOSUSPEND		BIT(1)
+#define HUB_QUIRK_REDUCE_FRAME_INTR_BINTERVAL	BIT(2)
+
 struct usb_hub {
 	struct device		*intfdev;	/* the "interface" device */
 	struct usb_device	*hdev;
@@ -183,3 +188,7 @@ static inline int hub_port_debounce_be_stable(struct usb_hub *hub,
 {
 	return hub_port_debounce(hub, port1, false);
 }
+
+#if IS_ENABLED(CONFIG_KUNIT)
+unsigned long usb_hub_id_quirks(struct usb_interface *intf);
+#endif

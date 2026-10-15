@@ -6,6 +6,7 @@
  * Copyright (c) 2007 Greg Kroah-Hartman <gregkh@suse.de>
  */
 
+#include <kunit/visibility.h>
 #include <linux/moduleparam.h>
 #include <linux/usb.h>
 #include <linux/usb/quirks.h>
@@ -767,9 +768,16 @@ static u32 usb_detect_dynamic_quirks(struct usb_device *udev)
 /*
  * Detect any quirks the device has, and do any housekeeping for it if needed.
  */
+/* The quirks that usb_quirk_list gives a device */
+VISIBLE_IF_KUNIT u32 usb_detect_device_list_quirks(struct usb_device *udev)
+{
+	return usb_detect_static_quirks(udev, usb_quirk_list);
+}
+EXPORT_SYMBOL_IF_KUNIT(usb_detect_device_list_quirks);
+
 void usb_detect_quirks(struct usb_device *udev)
 {
-	udev->quirks = usb_detect_static_quirks(udev, usb_quirk_list);
+	udev->quirks = usb_detect_device_list_quirks(udev);
 
 	/*
 	 * Pixart-based mice would trigger remote wakeup issue on AMD

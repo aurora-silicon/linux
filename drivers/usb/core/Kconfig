@@ -97,6 +97,17 @@ config USB_OTG_FSM
 	  Implements OTG Finite State Machine as specified in On-The-Go
 	  and Embedded Host Supplement to the USB Revision 2.0 Specification.
 
+config USB_QUIRKS_KUNIT_TEST
+	tristate "KUnit tests for USB device and hub quirk matching" if !KUNIT_ALL_TESTS
+	depends on USB && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test that the USB core matches devices and hubs against its quirk
+	  tables as intended for the entries these tests cover. The tests
+	  need no USB hardware.
+
+	  If unsure, say N.
+
 config USB_LEDS_TRIGGER_USBPORT
 	tristate "USB port LED trigger"
 	depends on USB && LEDS_TRIGGERS

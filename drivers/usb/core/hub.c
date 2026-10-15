@@ -10,6 +10,7 @@
  * Released under the GPLv2 only.
  */
 
+#include <kunit/visibility.h>
 #include <linux/kernel.h>
 #include <linux/errno.h>
 #include <linux/module.h>
@@ -57,9 +58,6 @@
 #define USB_PRODUCT_USB4913			0x4913
 #define USB_PRODUCT_USB4914			0x4914
 #define USB_PRODUCT_USB4915			0x4915
-#define HUB_QUIRK_CHECK_PORT_AUTOSUSPEND	BIT(0)
-#define HUB_QUIRK_DISABLE_AUTOSUSPEND		BIT(1)
-#define HUB_QUIRK_REDUCE_FRAME_INTR_BINTERVAL	BIT(2)
 
 #define USB_TP_TRANSMISSION_DELAY	40	/* ns */
 #define USB_TP_TRANSMISSION_DELAY_MAX	65535	/* ns */
@@ -6054,6 +6052,17 @@ static const struct usb_device_id hub_id_table[] = {
       .bInterfaceClass = USB_CLASS_HUB},
     { }						/* Terminating entry */
 };
+
+#if IS_ENABLED(CONFIG_KUNIT)
+/* The HUB_QUIRK_* flags that hub_id_table gives a hub interface */
+unsigned long usb_hub_id_quirks(struct usb_interface *intf)
+{
+	const struct usb_device_id *id = usb_match_id(intf, hub_id_table);
+
+	return id ? id->driver_info : 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(usb_hub_id_quirks);
+#endif
 
 MODULE_DEVICE_TABLE(usb, hub_id_table);
 
