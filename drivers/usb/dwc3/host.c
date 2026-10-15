@@ -7,6 +7,7 @@
  * Authors: Felipe Balbi <balbi@ti.com>,
  */
 
+#include <kunit/visibility.h>
 #include <linux/irq.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -127,9 +128,55 @@ out:
 	return irq;
 }
 
+/**
+ * dwc3_host_xhci_properties - Fill in the properties of the xHCI device
+ * @dwc: Pointer to our controller context structure
+ * @props: Array of DWC3_XHCI_MAX_PROPERTIES + 1 entries
+ *
+ * Return: the number of properties, which are followed by an empty entry.
+ */
+VISIBLE_IF_KUNIT unsigned int dwc3_host_xhci_properties(const struct dwc3 *dwc,
+							struct property_entry *props)
+{
+	unsigned int prop_idx = 0;
+
+	memset(props, 0, sizeof(*props) * (DWC3_XHCI_MAX_PROPERTIES + 1));
+
+	props[prop_idx++] = PROPERTY_ENTRY_BOOL("xhci-sg-trb-cache-size-quirk");
+
+	props[prop_idx++] = PROPERTY_ENTRY_BOOL("write-64-hi-lo-quirk");
+
+	if (dwc->usb3_lpm_capable)
+		props[prop_idx++] = PROPERTY_ENTRY_BOOL("usb3-lpm-capable");
+
+	if (dwc->usb2_lpm_disable)
+		props[prop_idx++] = PROPERTY_ENTRY_BOOL("usb2-lpm-disable");
+
+	/**
+	 * WORKAROUND: dwc3 revisions <=3.00a have a limitation
+	 * where Port Disable command doesn't work.
+	 *
+	 * The suggested workaround is that we avoid Port Disable
+	 * completely.
+	 *
+	 * This following flag tells XHCI to do just that.
+	 */
+	if (DWC3_VER_IS_WITHIN(DWC3, ANY, 300A))
+		props[prop_idx++] = PROPERTY_ENTRY_BOOL("quirk-broken-port-ped");
+
+	props[prop_idx++] = PROPERTY_ENTRY_U16("num-hc-interrupters",
+					       dwc->num_hc_interrupters);
+
+	if (dwc->xhci_run_in_s2idle)
+		props[prop_idx++] = PROPERTY_ENTRY_BOOL("xhci-run-in-s2idle");
+
+	return prop_idx;
+}
+EXPORT_SYMBOL_IF_KUNIT(dwc3_host_xhci_properties);
+
 int dwc3_host_init(struct dwc3 *dwc)
 {
-	struct property_entry	props[8];
+	struct property_entry	props[DWC3_XHCI_MAX_PROPERTIES + 1];
 	struct platform_device	*xhci;
 	int			ret, irq;
 	int			prop_idx = 0;
@@ -161,35 +208,7 @@ int dwc3_host_init(struct dwc3 *dwc)
 		goto err;
 	}
 
-	memset(props, 0, sizeof(struct property_entry) * ARRAY_SIZE(props));
-
-	props[prop_idx++] = PROPERTY_ENTRY_BOOL("xhci-sg-trb-cache-size-quirk");
-
-	props[prop_idx++] = PROPERTY_ENTRY_BOOL("write-64-hi-lo-quirk");
-
-	if (dwc->usb3_lpm_capable)
-		props[prop_idx++] = PROPERTY_ENTRY_BOOL("usb3-lpm-capable");
-
-	if (dwc->usb2_lpm_disable)
-		props[prop_idx++] = PROPERTY_ENTRY_BOOL("usb2-lpm-disable");
-
-	/**
-	 * WORKAROUND: dwc3 revisions <=3.00a have a limitation
-	 * where Port Disable command doesn't work.
-	 *
-	 * The suggested workaround is that we avoid Port Disable
-	 * completely.
-	 *
-	 * This following flag tells XHCI to do just that.
-	 */
-	if (DWC3_VER_IS_WITHIN(DWC3, ANY, 300A))
-		props[prop_idx++] = PROPERTY_ENTRY_BOOL("quirk-broken-port-ped");
-
-	props[prop_idx++] = PROPERTY_ENTRY_U16("num-hc-interrupters",
-					       dwc->num_hc_interrupters);
-
-	if (dwc->xhci_run_in_s2idle)
-		props[prop_idx++] = PROPERTY_ENTRY_BOOL("xhci-run-in-s2idle");
+	prop_idx = dwc3_host_xhci_properties(dwc, props);
 
 	if (prop_idx) {
 		ret = device_create_managed_software_node(&xhci->dev, props, NULL);
