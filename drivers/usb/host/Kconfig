@@ -70,6 +70,18 @@ config USB_XHCI_PLATFORM
 
 	  If unsure, say N.
 
+config USB_XHCI_PLATFORM_KUNIT_TEST
+	tristate "KUnit tests for the generic xHCI platform driver" if !KUNIT_ALL_TESTS
+	depends on USB_XHCI_PLATFORM && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test how the generic xHCI platform driver turns device properties
+	  into quirks, and when it keeps the controller running across
+	  suspend-to-idle instead of halting it. The tests need no xHCI
+	  hardware.
+
+	  If unsure, say N.
+
 config USB_XHCI_HISTB
 	tristate "xHCI support for HiSilicon STB SoCs"
 	depends on USB_XHCI_PLATFORM && (ARCH_HISI || COMPILE_TEST)
