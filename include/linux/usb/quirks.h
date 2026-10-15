@@ -84,4 +84,11 @@
 /* Use a 255 bytes config descriptor request mirroring windows behavior */
 #define USB_QUIRK_WINDOWS_CONFIG_REQ_SIZE	BIT(19)
 
+/*
+ * Hub does not pass a downstream remote wakeup upstream while it is suspended
+ * itself. Keep it awake in suspend-to-idle when a device below may wake the
+ * system and the host controller keeps running.
+ */
+#define USB_QUIRK_HUB_NO_SUSPENDED_WAKEUP	BIT(20)
+
 #endif /* __LINUX_USB_QUIRKS_H */

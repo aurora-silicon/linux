@@ -326,6 +326,9 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
 	if (priv && (priv->quirks & XHCI_SG_TRB_CACHE_SIZE_QUIRK))
 		xhci->quirks |= XHCI_SG_TRB_CACHE_SIZE_QUIRK;
 
+	/* Lets the USB core keep hubs awake that need it for wakeup, see XHCI_RUN_IN_S2IDLE */
+	hcd->runs_in_s2idle = !!(xhci->quirks & XHCI_RUN_IN_S2IDLE);
+
 	ret = usb_add_hcd(hcd, irq, IRQF_SHARED);
 	if (ret)
 		goto disable_usb_phy;
@@ -352,6 +355,7 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
 		}
 
 		xhci->shared_hcd->tpl_support = hcd->tpl_support;
+		xhci->shared_hcd->runs_in_s2idle = hcd->runs_in_s2idle;
 	}
 
 	usb3_hcd = xhci_get_usb3_hcd(xhci);

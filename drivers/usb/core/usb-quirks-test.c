@@ -38,15 +38,17 @@ static struct usb_quirks_test *usb_quirks_test_hub(struct kunit *test, u16 vid, 
 }
 
 /*
- * The VIA Labs VL122 hub on the Apple J700 misbehaves in runtime suspend. It stays
- * out of autosuspend, but keeps its wakeup setting for system sleep.
+ * The VIA Labs VL122 hub on the Apple J700 does not pass on remote wakeup while it
+ * is suspended. It stays out of autosuspend and keeps its wakeup setting, and is
+ * kept awake in suspend-to-idle instead.
  */
 static void usb_quirks_vl122_test(struct kunit *test)
 {
 	struct usb_quirks_test *t = usb_quirks_test_hub(test, 0x2109, 0x2122);
+	u32 quirks = usb_detect_device_list_quirks(&t->udev);
 
-	KUNIT_EXPECT_FALSE(test, usb_detect_device_list_quirks(&t->udev) &
-			   USB_QUIRK_IGNORE_REMOTE_WAKEUP);
+	KUNIT_EXPECT_FALSE(test, quirks & USB_QUIRK_IGNORE_REMOTE_WAKEUP);
+	KUNIT_EXPECT_TRUE(test, quirks & USB_QUIRK_HUB_NO_SUSPENDED_WAKEUP);
 	KUNIT_EXPECT_TRUE(test, usb_hub_id_quirks(&t->intf) & HUB_QUIRK_DISABLE_AUTOSUSPEND);
 }
 

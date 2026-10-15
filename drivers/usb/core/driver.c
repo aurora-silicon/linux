@@ -28,6 +28,7 @@
 #include <linux/device.h>
 #include <linux/slab.h>
 #include <linux/export.h>
+#include <linux/suspend.h>
 #include <linux/usb.h>
 #include <linux/usb/quirks.h>
 #include <linux/usb/hcd.h>
@@ -1410,6 +1411,37 @@ done:
  *
  * Return: 0 if the suspend succeeded.
  */
+/*
+ * Whether to keep a device awake in suspend-to-idle so that a remote wakeup
+ * from below can reach the host controller: a hub that does not pass one on
+ * while it is suspended itself, and every device between such a hub and the
+ * root hub, root hub included. This only works while the host controller keeps
+ * running, so its interrupt reports the hub's status change.
+ */
+static bool usb_stay_awake_for_wakeup(struct usb_device *udev, pm_message_t msg)
+{
+	struct usb_hcd *hcd = bus_to_hcd(udev->bus);
+	struct usb_device *child;
+	int port1;
+
+	if (msg.event != PM_EVENT_SUSPEND || !hcd->runs_in_s2idle ||
+	    pm_suspend_target_state != PM_SUSPEND_TO_IDLE ||
+	    !device_may_wakeup(hcd->self.controller))
+		return false;
+
+	if ((udev->quirks & USB_QUIRK_HUB_NO_SUSPENDED_WAKEUP) &&
+	    udev->do_remote_wakeup && device_wakeup_path(&udev->dev))
+		return true;
+
+	/* Children are done with their suspend before their parent starts */
+	usb_hub_for_each_child(udev, port1, child) {
+		if (child->awake_in_sleep)
+			return true;
+	}
+
+	return false;
+}
+
 static int usb_suspend_both(struct usb_device *udev, pm_message_t msg)
 {
 	int			status = 0;
@@ -1426,6 +1458,9 @@ static int usb_suspend_both(struct usb_device *udev, pm_message_t msg)
 		dev_dbg(&udev->dev, "device offloaded, skip suspend.\n");
 		offload_active = true;
 	}
+	udev->awake_in_sleep = usb_stay_awake_for_wakeup(udev, msg);
+	if (udev->awake_in_sleep)
+		dev_dbg(&udev->dev, "kept awake to pass on remote wakeup\n");
 
 	/* Suspend all the interfaces and then udev itself */
 	if (udev->actconfig) {
@@ -1438,9 +1473,9 @@ static int usb_suspend_both(struct usb_device *udev, pm_message_t msg)
 			 * interrupt urbs, allowing interrupt events to be
 			 * handled during system suspend.
 			 */
-			if (offload_active && intf->needs_remote_wakeup) {
-				dev_dbg(&intf->dev,
-					"device offloaded, skip suspend.\n");
+			if ((offload_active || udev->awake_in_sleep) &&
+			    intf->needs_remote_wakeup) {
+				dev_dbg(&intf->dev, "interface kept active, skip suspend.\n");
 				continue;
 			}
 			status = usb_suspend_interface(udev, intf, msg);
@@ -1453,7 +1488,7 @@ static int usb_suspend_both(struct usb_device *udev, pm_message_t msg)
 		}
 	}
 	if (status == 0) {
-		if (!offload_active)
+		if (!offload_active && !udev->awake_in_sleep)
 			status = usb_suspend_device(udev, msg);
 
 		/*
@@ -1497,7 +1532,7 @@ static int usb_suspend_both(struct usb_device *udev, pm_message_t msg)
 	/* If the suspend succeeded then prevent any more URB submissions
 	 * and flush any outstanding URBs.
 	 */
-	} else {
+	} else if (!udev->awake_in_sleep) {
 		udev->can_submit = 0;
 		if (!offload_active) {
 			for (i = 0; i < 16; ++i) {
@@ -1508,8 +1543,10 @@ static int usb_suspend_both(struct usb_device *udev, pm_message_t msg)
 	}
 
  done:
-	if (status != 0)
+	if (status != 0) {
+		udev->awake_in_sleep = 0;
 		usb_offload_set_pm_locked(udev, false);
+	}
 	dev_vdbg(&udev->dev, "%s: status %d\n", __func__, status);
 	return status;
 }
@@ -1540,7 +1577,9 @@ static int usb_resume_both(struct usb_device *udev, pm_message_t msg)
 	int			i;
 	struct usb_interface	*intf;
 	bool			offload_active = false;
+	bool			awake = udev->awake_in_sleep;
 
+	udev->awake_in_sleep = 0;
 	if (udev->state == USB_STATE_NOTATTACHED) {
 		status = -ENODEV;
 		goto done;
@@ -1568,9 +1607,8 @@ static int usb_resume_both(struct usb_device *udev, pm_message_t msg)
 			 * pending interrupt urbs, allowing interrupt events
 			 * to be handled during system suspend.
 			 */
-			if (offload_active && intf->needs_remote_wakeup) {
-				dev_dbg(&intf->dev,
-					"device offloaded, skip resume.\n");
+			if ((offload_active || awake) && intf->needs_remote_wakeup) {
+				dev_dbg(&intf->dev, "interface kept active, skip resume.\n");
 				continue;
 			}
 			usb_resume_interface(udev, intf, msg,

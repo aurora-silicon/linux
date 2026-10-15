@@ -708,6 +708,7 @@ struct usb_device {
 	unsigned usb2_hw_lpm_allowed:1;
 	unsigned usb3_lpm_u1_enabled:1;
 	unsigned usb3_lpm_u2_enabled:1;
+	unsigned awake_in_sleep:1;
 	int string_langid;
 
 	/* static strings from the device */
