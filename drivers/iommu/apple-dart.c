@@ -3015,6 +3015,58 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	return 0;
 }
 
+/*
+ * Whether the DART still holds the translation state that apple_dart_suspend()
+ * saved, because its power domain stayed on across system sleep. That is the
+ * case while a consumer that keeps running in suspend-to-idle, such as a DWC3
+ * controller in host mode, holds the domain on. Such a consumer may still be
+ * doing DMA, so the DART must not be reset under it.
+ */
+static bool apple_dart_state_retained(struct apple_dart *dart)
+{
+	bool translating = false;
+	unsigned int sid, idx;
+
+	for (sid = 0; sid < dart->num_streams; sid++) {
+		if (apple_dart_readl(dart, DART_TCR(dart, sid)) != dart->save_tcr[sid])
+			return false;
+
+		for (idx = 0; idx < dart->hw->ttbr_count; idx++) {
+			u32 ttbr = apple_dart_readl(dart, DART_TTBR(dart, sid, idx));
+
+			if (ttbr != dart->save_ttbr[sid][idx])
+				return false;
+			if (ttbr & dart->hw->ttbr_valid)
+				translating = true;
+		}
+	}
+
+	/* A DART that lost power reads back as reset, without valid page tables */
+	return translating;
+}
+
+/*
+ * Flush the TLBs of every stream with a command of its own. A stream map flush
+ * is not enough for the whole DART: where the streams of a map are remapped
+ * onto its first stream, it only reaches that first stream.
+ */
+static int apple_dart_invalidate_each_stream(struct apple_dart *dart)
+{
+	unsigned int sid;
+	int ret;
+
+	for (sid = 0; sid < dart->num_streams; sid++) {
+		struct apple_dart_stream_map stream_map = { .dart = dart };
+
+		__set_bit(sid, stream_map.sidmap);
+		ret = dart->hw->invalidate_tlb(&stream_map);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 static __maybe_unused int apple_dart_resume(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
@@ -3038,6 +3090,10 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	/* Locked DARTs can't be restored, and they should not need it */
 	if (dart->locked)
 		return 0;
+
+	/* Nothing was lost, only drop what the TLBs may still hold. */
+	if (apple_dart_state_retained(dart))
+		return apple_dart_invalidate_each_stream(dart);
 
 	ret = apple_dart_hw_reset(dart);
 	if (ret) {

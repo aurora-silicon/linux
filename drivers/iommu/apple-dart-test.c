@@ -374,6 +374,93 @@ static void apple_dart_test_gated_irq(struct kunit *test)
 	pm_runtime_disable(dart->dev);
 }
 
+static struct apple_dart *apple_dart_test_sleeping(struct kunit *test)
+{
+	struct apple_dart *dart = apple_dart_test_tunnel(test);
+	unsigned int sid;
+
+	dart->tunneled = false;
+	dart->hw = &apple_dart_hw_t8103;
+	dart->num_streams = 16;
+	for (sid = 0; sid < dart->num_streams; sid++)
+		writel(0x80 + sid, dart->regs + DART_TCR(dart, sid));
+	writel(dart->hw->ttbr_valid | 0x1000, dart->regs + DART_TTBR(dart, 2, 0));
+	KUNIT_ASSERT_EQ(test, apple_dart_suspend(dart->dev), 0);
+	return dart;
+}
+
+static void apple_dart_test_resume_retained(struct kunit *test)
+{
+	struct apple_dart *dart = apple_dart_test_sleeping(test);
+	u32 enable = dart->hw->enable_streams;
+
+	/* The domain stayed on and a consumer may still be doing DMA: no reset. */
+	writel(0, dart->regs + enable);
+	KUNIT_EXPECT_EQ(test, apple_dart_resume(dart->dev), 0);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + enable), 0U);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TCR(dart, 2)), 0x82U);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TTBR(dart, 2, 0)),
+			dart->hw->ttbr_valid | 0x1000);
+}
+
+static void apple_dart_test_resume_lost(struct kunit *test)
+{
+	struct apple_dart *dart = apple_dart_test_sleeping(test);
+
+	/* Power was cut: reset and restore the saved translations. */
+	memset_io(dart->regs, 0, SZ_16K);
+	KUNIT_EXPECT_EQ(test, apple_dart_resume(dart->dev), 0);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + dart->hw->enable_streams), U32_MAX);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TCR(dart, 2)), 0x82U);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TTBR(dart, 2, 0)),
+			dart->hw->ttbr_valid | 0x1000);
+}
+
+static void apple_dart_test_resume_unused(struct kunit *test)
+{
+	struct apple_dart *dart = apple_dart_test_tunnel(test);
+
+	/* Matching registers without any page table prove nothing: reset. */
+	dart->tunneled = false;
+	dart->hw = &apple_dart_hw_t8103;
+	dart->num_streams = 16;
+	KUNIT_ASSERT_EQ(test, apple_dart_suspend(dart->dev), 0);
+	KUNIT_EXPECT_EQ(test, apple_dart_resume(dart->dev), 0);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + dart->hw->enable_streams), U32_MAX);
+}
+
+/*
+ * A DART that kept its state is flushed stream by stream. Where the streams of
+ * a map are remapped onto its first stream, as on DARTs that program only that
+ * stream, a single flush of all streams would reach stream 0 and nothing else.
+ */
+static void apple_dart_test_resume_retained_each_stream(struct kunit *test)
+{
+	struct apple_dart *dart = apple_dart_test_tunnel(test);
+	unsigned int sid;
+	u32 cmd;
+
+	dart->tunneled = false;
+	dart->hw = &apple_dart_hw_t8110;
+	dart->num_streams = 16;
+	for (sid = 0; sid < dart->num_streams; sid++)
+		writel(dart->hw->tcr_enabled, dart->regs + DART_TCR(dart, sid));
+	writel(dart->hw->ttbr_valid | 0x1000, dart->regs + DART_TTBR(dart, 0, 0));
+	writel(dart->hw->ttbr_valid | 0x2000, dart->regs + DART_TTBR(dart, 5, 0));
+	KUNIT_ASSERT_EQ(test, apple_dart_suspend(dart->dev), 0);
+
+	writel(0, dart->regs + DART_T8110_TLB_CMD);
+	KUNIT_EXPECT_EQ(test, apple_dart_resume(dart->dev), 0);
+	/* Commands go out in stream order: the last one names the last stream. */
+	cmd = readl(dart->regs + DART_T8110_TLB_CMD);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(DART_T8110_TLB_CMD_STREAM, cmd), dart->num_streams - 1);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(DART_T8110_TLB_CMD_OP, cmd),
+			(u32)DART_T8110_TLB_CMD_OP_FLUSH_SID);
+	/* Nothing was reset. */
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TTBR(dart, 5, 0)),
+			dart->hw->ttbr_valid | 0x2000);
+}
+
 static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_before_attach),
 	KUNIT_CASE(apple_dart_test_locked_handoff),
@@ -385,6 +472,10 @@ static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_tunnel_reset_failure),
 	KUNIT_CASE(apple_dart_test_failed_host_pm),
 	KUNIT_CASE(apple_dart_test_gated_irq),
+	KUNIT_CASE(apple_dart_test_resume_retained),
+	KUNIT_CASE(apple_dart_test_resume_lost),
+	KUNIT_CASE(apple_dart_test_resume_unused),
+	KUNIT_CASE(apple_dart_test_resume_retained_each_stream),
 	{}
 };
 
