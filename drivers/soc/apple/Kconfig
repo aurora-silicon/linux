@@ -80,6 +80,16 @@ config APPLE_SART
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_SART_APIF
+	bool "Apple SART over the Aurora platform interface"
+	depends on ARM64 && OF && APPLE_SART=y
+	select AURORA_APIF_MMIO
+	help
+	  SART provider for a trusted Linux guest under Aura and SPTM.
+	  Consumers retain the existing Apple SART API. Native call selection,
+	  region tracking and completion interpretation stay in this backend.
+	  Existing raw-MMIO SART providers continue to serve other systems.
+
 config APPLE_TUNABLE
 	tristate
 	depends on ARCH_APPLE || COMPILE_TEST

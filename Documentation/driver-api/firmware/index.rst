@@ -4,6 +4,7 @@ Linux Firmware API
 
 .. toctree::
 
+   aurora-apif
    introduction
    core
    efi/index
