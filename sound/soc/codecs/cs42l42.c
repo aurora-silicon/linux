@@ -1110,6 +1110,17 @@ int cs42l42_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
 						      CS42L42_PLL_START_MASK, 0);
 		}
 	} else {
+		/*
+		 * The ASoC resume work unmutes DAIs that were active at
+		 * suspend while the card is still below D0. The PCM is
+		 * suspended then and the host may not be driving SCLK yet,
+		 * so moving the codec onto it would take the I2C bus down.
+		 * Stay on the oscillator; the unmute after the next prepare
+		 * does the switch.
+		 */
+		if (snd_power_get_state(component->card->snd_card) != SNDRV_CTL_POWER_D0)
+			return 0;
+
 		if (!cs42l42->stream_use) {
 			/* SCLK must be running before codec unmute.
 			 *
@@ -1139,8 +1150,17 @@ int cs42l42_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
 							       (regval & 1),
 							       CS42L42_PLL_LOCK_POLL_US,
 							       CS42L42_PLL_LOCK_TIMEOUT_US);
-				if (ret < 0)
+				if (ret < 0) {
+					/*
+					 * Without a locked PLL the codec has no clock
+					 * once it leaves the oscillator, and then the
+					 * I2C bus stops working. Stay on the oscillator.
+					 */
 					dev_warn(component->dev, "PLL failed to lock: %d\n", ret);
+					snd_soc_component_update_bits(component, CS42L42_PLL_CTL1,
+								      CS42L42_PLL_START_MASK, 0);
+					return ret;
+				}
 
 				/* PLL must be running to drive glitchless switch logic */
 				snd_soc_component_update_bits(component,
