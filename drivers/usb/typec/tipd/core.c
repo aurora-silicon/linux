@@ -681,7 +681,19 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		else
 			dp_data.status &= ~DP_STATUS_HPD_STATE;
 
+		/*
+		 * The sink dropped HPD and raised it again within the debounce
+		 * window, as a monitor does after losing the link. The coalesced
+		 * state looks unchanged, so the display side would never hear of
+		 * it: report the pulse as IRQ_HPD.
+		 */
+		if ((st->data_status_changed & CD321X_DATA_STATUS_HPD_LEVEL) &&
+		    (dp_data.status & DP_STATUS_HPD_STATE) &&
+		    (cd321x->dp_status & DP_STATUS_HPD_STATE))
+			dp_data.status |= DP_STATUS_IRQ_HPD;
+
 		if (cd321x->state_valid && cd321x->state.alt == cd321x->port_altmode_dp &&
+		    !(dp_data.status & DP_STATUS_IRQ_HPD) &&
 		    cd321x->state.mode == mode &&
 		    cd321x->dp_status == dp_data.status &&
 		    cd321x->dp_conf == dp_data.conf)

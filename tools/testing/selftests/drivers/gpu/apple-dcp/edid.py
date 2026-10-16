@@ -816,6 +816,7 @@ struct apple_dcp {
     u64 typec_generation; bool typec_cable_connected;
     struct { size_t length; void *data; u64 av_service_epoch, automatic_connection_sequence; bool automatic_service_pending; struct test_mode_ticket mode_ticket; } chunks;
     int width_mm,height_mm; struct { int width_mm,height_mm; } panel;
+    struct work_struct dimensions_wq;
     unsigned int nr_modes; struct { struct { int width_mm,height_mm; } mode; } modes[1];
     struct apple_connector *connector;
     struct apple_dcp_afkep *dcpavservep,*dptxep,*avep,*systemep,*ibootep,*dptx_controller_ep;

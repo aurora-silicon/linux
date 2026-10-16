@@ -1920,6 +1920,8 @@ void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp)
 static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 {
 	struct apple_connector *connector = dcp->connector;
+	/* sampled before complete_all() lets dcp_poweron() clear it */
+	bool poweron_hpd = READ_ONCE(dcp->typec_poweron_hpd);
 	unsigned int action;
 
 	/* DCP issues hotplug_gated callbacks after SetPowerState() calls on
@@ -1950,6 +1952,12 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 		schedule_work(&dcp->vblank_wq);
 		return;
 	}
+	/* DCP lost a sink which is still attached, see dcp_typec_relink() */
+	if (!(*connected) && dcp_typec_relink(dcp)) {
+		dcp_mode_invalidate(&dcp->mode_state);
+		schedule_work(&dcp->vblank_wq);
+		return;
+	}
 	if (dcp_is_typec_output(dcp) && *connected && dcp->nr_modes)
 		complete_all(&dcp->typec_iomfb_hpd_ready);
 
@@ -1963,8 +1971,13 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 	 * A Type-C sink can assert HPD only after a modeset has already failed,
 	 * as a TV behind a DP-to-HDMI converter does when it wakes from standby.
 	 * The connector state does not change then; re-apply the mode anyway.
+	 *
+	 * Not for the HPD dcp_poweron() waits for: the modeset of that commit
+	 * has not started yet, rather than failed. Reporting the link as bad
+	 * then makes wlroots replace the output, which powers the CRTC off and
+	 * on again, and the next wake does the same, forever.
 	 */
-	if (*connected && dcp_is_typec_output(dcp) &&
+	if (*connected && dcp_is_typec_output(dcp) && !poweron_hpd &&
 	    !READ_ONCE(dcp->mode_state.valid) &&
 	    !READ_ONCE(dcp->mode_state.changing)) {
 		dcp->swap_watchdog_retrains = 0;
