@@ -1044,6 +1044,36 @@ static void dcp_typec_route_commit(struct typec_mux_dev *mux,
 	dcp_typec_pipeline_freed();
 }
 
+static struct apple_dcp_typec_route *
+dcp_typec_take_over_without_hpd(struct apple_dcp_typec_port *port)
+{
+	struct apple_dcp_typec_route *candidate;
+
+	list_for_each_entry(candidate, &port->routes, port_link) {
+		struct apple_dcp_typec_route *held =
+			candidate->dcp->active_typec_route;
+		int ret;
+
+		if (!held || held->tunnel || held->port == port ||
+		    held->port->hpd || held->port->safe_pending ||
+		    dcp_typec_route_fixed_output_busy(candidate))
+			continue;
+
+		ret = dcp_typec_route_deactivate(held);
+		if (ret)
+			return ERR_PTR(ret);
+		held->port->owner = NULL;
+		/* let the port's next update try again */
+		held->port->applied_valid = false;
+		dev_info(candidate->dcp->dev,
+			 "released Type-C DPTX PHY %u held without HPD\n",
+			 held->dptx_phy);
+		return candidate;
+	}
+
+	return NULL;
+}
+
 static int dcp_typec_route_set(struct typec_mux_dev *mux,
 			       struct typec_mux_state *state)
 {
@@ -1175,6 +1205,17 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 		if (!best)
 			best = dcp_typec_lowest_free(port);
 
+		/*
+		 * PD controllers can report a DP state at probe for a port that
+		 * has no display behind it, and whichever port is routed first
+		 * wins the pipeline.  A port whose sink asserts HPD takes it over
+		 * from one whose sink never did.
+		 */
+		if (!best && hpd)
+			best = dcp_typec_take_over_without_hpd(port);
+
+		if (IS_ERR(best))
+			return PTR_ERR(best);
 		/* Every pipeline is driving another port's display. */
 		if (!best)
 			return -ENOSPC;
