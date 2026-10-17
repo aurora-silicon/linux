@@ -156,6 +156,25 @@ static inline void afk_service_put(struct apple_epic_service *service)
 	afk_service_retry(service->ep);
 }
 
+/*
+ * Take another pin on a service the caller already keeps pinned, e.g. an
+ * owner pointer read under the owner's lock. Unlike afk_service_get() this
+ * also succeeds after teardown, so a close can still be issued.
+ */
+static inline struct apple_epic_service *afk_service_pin(struct apple_epic_service *service)
+{
+	unsigned long flags;
+
+	if (!service)
+		return NULL;
+
+	spin_lock_irqsave(&service->lock, flags);
+	service->users++;
+	spin_unlock_irqrestore(&service->lock, flags);
+
+	return service;
+}
+
 static inline void afk_service_disable(struct apple_epic_service *service)
 {
 	unsigned long flags;
