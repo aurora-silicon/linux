@@ -1882,7 +1882,7 @@ int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
 	if (!service)
 		return -ENODEV;
 
-	bfr = kzalloc(bfr_len, GFP_KERNEL);
+	bfr = kvzalloc(bfr_len, GFP_KERNEL);
 	if (!bfr)
 		return -ENOMEM;
 
@@ -1952,7 +1952,7 @@ int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
 	}
 
 out:
-	kfree(bfr);
+	kvfree(bfr);
 	return ret;
 }
 

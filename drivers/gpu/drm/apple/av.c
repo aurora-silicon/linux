@@ -197,10 +197,10 @@ dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
 	} __attribute__((packed)) *hdr;
 	static_assert(sizeof(*hdr) == 48);
 	size_t bfr_len = output_maxsize + sizeof(*hdr);
-	void *bfr __free(kfree) = NULL;
+	void *bfr __free(kvfree) = NULL;
 	int ret;
 
-	bfr = kzalloc(bfr_len, GFP_KERNEL);
+	bfr = kvzalloc(bfr_len, GFP_KERNEL);
 	if (!bfr)
 		return -ENOMEM;
 
