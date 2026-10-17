@@ -221,6 +221,64 @@
 	};
 };
 
+/*
+ * dcpext0 can also drive any of the Type-C PHYs, which gives the laptops a
+ * second Type-C display when HDMI is not in use.  It is only enabled by the
+ * loader, and a route node does not inherit its parent's status, so the
+ * routes start out disabled and are enabled together with dcpext0.
+ */
+&dcpext0 {
+	phys = <&atcphy3 PHY_TYPE_DP>, <&atcphy0 PHY_TYPE_DP>,
+	       <&atcphy1 PHY_TYPE_DP>, <&atcphy2 PHY_TYPE_DP>;
+	phy-names = "dp-phy", "typec0", "typec1", "typec2";
+	mux-controls = <&atcphy3_xbar 0>, <&atcphy0_xbar 0>,
+		       <&atcphy1_xbar 0>, <&atcphy2_xbar 0>;
+	mux-control-names = "dp-xbar", "typec0", "typec1", "typec2";
+	apple,typec-mux-indices = <0 0 0>;
+	apple,typec-dptx-phys = <0 1 2>;
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext0_typec0: endpoint {
+					remote-endpoint = <&typec0_dcpext0>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext0_typec1: endpoint {
+					remote-endpoint = <&typec1_dcpext0>;
+				};
+			};
+		};
+
+		route@2 {
+			reg = <2>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext0_typec2: endpoint {
+					remote-endpoint = <&typec2_dcpext0>;
+				};
+			};
+		};
+	};
+};
+
 &dpaudio2 {
 	status = "okay";
 };
@@ -604,6 +662,11 @@
 				reg = <0>;
 				remote-endpoint = <&dcpext1_typec0>;
 			};
+
+			typec0_dcpext0: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext0_typec0>;
+			};
 		};
 	};
 };
@@ -619,6 +682,11 @@
 				reg = <0>;
 				remote-endpoint = <&dcpext1_typec1>;
 			};
+
+			typec1_dcpext0: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext0_typec1>;
+			};
 		};
 	};
 };
@@ -633,6 +701,11 @@
 			typec2_dcp: endpoint@0 {
 				reg = <0>;
 				remote-endpoint = <&dcpext1_typec2>;
+			};
+
+			typec2_dcpext0: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext0_typec2>;
 			};
 		};
 	};

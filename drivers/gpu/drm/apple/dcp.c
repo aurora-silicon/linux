@@ -1827,8 +1827,12 @@ static int dcp_register_typec_routes(struct apple_dcp *dcp)
 		dcp->nr_typec_routes++;
 	}
 
-	if (!dcp->nr_typec_routes)
+	if (!dcp->nr_typec_routes) {
+		/* The loader left every route disabled: fixed output only. */
+		if (of_get_child_count(routes))
+			return 0;
 		return dev_err_probe(dev, -EINVAL, "Type-C route container is empty\n");
+	}
 
 	dcp->phy_managed_by_typec = true;
 	return 0;
