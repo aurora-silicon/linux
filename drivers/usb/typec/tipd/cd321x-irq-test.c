@@ -314,7 +314,7 @@ static void cd321x_ack_retry_across_sleep_test(struct kunit *test)
 {
 	struct cd321x_test *t = cd321x_test_port(test);
 	struct device *dev = t->cd.tps.dev;
-	unsigned int i;
+	unsigned int i, left;
 
 	cd321x_test_raise(&t->ctrl, APPLE_CD_REG_INT_PLUG_EVENT);
 	t->ctrl.failing_event_reads = UINT_MAX;
@@ -324,7 +324,15 @@ static void cd321x_ack_retry_across_sleep_test(struct kunit *test)
 	/* Sleep cancels the retry, and the resume read takes it over. */
 	KUNIT_ASSERT_EQ(test, tipd_prepare(dev), 0);
 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->cd.resume_work));
+	left = t->ctrl.failing_event_reads;
 	tipd_complete(dev);
+	/*
+	 * The resume read is queued without delay, so on SMP a worker may be
+	 * running it already. Wait for it, without running the retry it
+	 * schedules early, and check that it tried to read the events.
+	 */
+	flush_work(&t->cd.resume_work.work);
+	KUNIT_EXPECT_EQ(test, t->ctrl.failing_event_reads, left - 1);
 	for (i = 0; i < 2 * CD321X_RESUME_ATTEMPTS; i++) {
 		KUNIT_ASSERT_TRUE(test, delayed_work_pending(&t->cd.resume_work));
 		flush_delayed_work(&t->cd.resume_work);
