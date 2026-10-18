@@ -429,6 +429,17 @@ static void avd_device_run(void *priv)
 		avd_job_finish(ctx, result);
 }
 
+/*
+ * Capture buffers are found by timestamp and handed to the hardware by DMA
+ * address, so nothing limits them to VB2_MAX_FRAME. A larger pool lets
+ * userspace decode ahead to ride out bitrate spikes the hardware can't
+ * decode in real time (e.g. 150+ Mbit/s 4K60 H.264).
+ */
+static unsigned int max_capture_buffers = 128;
+module_param(max_capture_buffers, uint, 0444);
+MODULE_PARM_DESC(max_capture_buffers,
+		 "Maximum number of capture buffers per context (default 128)");
+
 static int avd_queue_init(void *priv, struct vb2_queue *src_vq,
 			  struct vb2_queue *dst_vq)
 {
@@ -466,6 +477,7 @@ static int avd_queue_init(void *priv, struct vb2_queue *src_vq,
 	dst_vq->lock = &ctx->dev->vdev_lock;
 	dst_vq->dev = ctx->dev->v4l2_dev.dev;
 	dst_vq->allow_cache_hints = true;
+	dst_vq->max_num_buffers = max(max_capture_buffers, VB2_MAX_FRAME);
 
 	return vb2_queue_init(dst_vq);
 }
