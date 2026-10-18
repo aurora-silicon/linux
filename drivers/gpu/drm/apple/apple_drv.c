@@ -709,6 +709,9 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
 	{ .compatible = "apple,t6030-dcpext" },
 #endif
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6031)
+	{ .compatible = "apple,t6031-dcp" },
+#endif
 	{},
 };
 
@@ -997,6 +1000,9 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,display-subsystem" },
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030)
 	{ .compatible = "apple,t6030-display-diagnostics" },
+#endif
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6031)
+	{ .compatible = "apple,t6031-display-subsystem" },
 #endif
 	{}
 };

@@ -2458,7 +2458,9 @@ static bool dcp_v14_7_reserved(struct apple_dcp *dcp, u64 pa, size_t size,
 	for (i = 0; (node = of_parse_phandle(dcp->dev->of_node, "memory-region", i)); i++) {
 		struct reserved_mem *rmem = of_reserved_mem_lookup(node);
 
-		if (of_device_is_compatible(node, "apple,asc-mem") &&
+		/* The T6031 handoff marks the OS log carveout without the compatible. */
+		if ((of_device_is_compatible(node, "apple,asc-mem") ||
+		     (oslog && of_property_read_bool(node, "apple,dcp-os-log"))) &&
 		    of_property_read_bool(node, "no-map") &&
 		    oslog == of_property_read_bool(node, "apple,dcp-os-log") &&
 		    !of_address_to_resource(node, 0, &res) && rmem &&
@@ -3592,19 +3594,43 @@ static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
 #define DCP_V14_7_START_TIMEOUT	msecs_to_jiffies(10000)
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030)
+/*
+ * On a board whose PMP the display handoff may leave out (T6031 with
+ * apple_t6031_display.pmp=0) the DCP is adopted as the boot loader left it,
+ * with no PMP acknowledgement to wait for.
+ */
+static bool dcp_v14_7_without_pmp(struct apple_dcp *dcp)
+{
+	return dcp->v14_7 && dcp->v14_7->pmp_optional && !apple_pmp_display_present();
+}
+
 static int dcp_t6030_display_prepare(struct device *dev)
 {
-	return apple_pmp_j514s_display_prepare(dev);
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+
+	if (dcp_v14_7_without_pmp(dcp)) {
+		dev_warn(dev, "no PMP described: adopting the DCP without a PMP display hold\n");
+		return 0;
+	}
+	return apple_pmp_display_prepare(dev);
 }
 
 static int dcp_t6030_display_get(struct device *dev)
 {
-	return apple_pmp_j514s_display_get(dev);
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+
+	if (dcp_v14_7_without_pmp(dcp))
+		return 0;
+	return apple_pmp_display_get(dev);
 }
 
 static int dcp_t6030_display_check(struct device *dev)
 {
-	return apple_pmp_j514s_display_check(dev);
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+
+	if (dcp_v14_7_without_pmp(dcp))
+		return 0;
+	return apple_pmp_display_check(dev);
 }
 #else
 static int dcp_t6030_display_prepare(struct device *dev) { return -ENODEV; }
@@ -4808,18 +4834,103 @@ static const struct component_ops dcp_comp_ops = {
 	.unbind	= dcp_comp_unbind,
 };
 
-/* The J514S (T6030) handoff this driver adopts. */
-#define J514S_DCP_UUID		"DDF38191-93B3-324A-BC8F-643006F5AC82"
-#define J514S_DCP_COPROC	0x28ec00000ULL
-#define J514S_NOTCH_HEIGHT	74
-#define J514S_BOOT_STRIDE	12096
-#define J514S_INHERITED		"apple,j514s-inherited-mappings"
+/*
+ * The 14.7 panel handoffs this driver adopts: the J514S (T6030) and the
+ * J516C/J514C (T6031). Each names its board, the DCP image the boot loader
+ * leaves running, the coprocessor window, the panel and the boot framebuffer
+ * the boot loader draws on it, and the form of its handoff:
+ *  - the J514S boot loader enables the display nodes itself and marks the
+ *    inherited mappings on the display subsystem and the PIODMA child;
+ *  - the T6031 boot loader leaves every node disabled and marks the DCP, the
+ *    display subsystem and the PIODMA child with apple,t6031-handoff = <1>;
+ *    the T6031 display handoff (drivers/soc/apple) enables them on request.
+ */
+struct dcp_v14_7_board {
+	const char *name;
+	const char *soc;		/* root compatible */
+	const char *const *boards;	/* root compatibles, NULL-terminated */
+	const char *dcp_compat;
+	const char *display_compat;
+	const char *uuid;		/* the DCP image (apple,firmware-uuid) */
+	u64 coproc;
+	u32 panel_width, panel_height, notch_height;
+	u32 boot_stride;
+	const char *marker;		/* u32 1 on dcp, display and piodma */
+	const char *inherited;		/* boolean on display and piodma */
+	const char *native_scanout, *native_piodma, *chosen_note;
+	bool pmp_optional;		/* adopt without a PMP when none is described */
+};
+
+static const char *const j514s_boards[] = { "apple,j514s", NULL };
+static const char *const t6031_boards[] = { "apple,j516c", "apple,j514c", NULL };
+
+static const struct dcp_v14_7_board dcp_v14_7_j514s = {
+	.name = "J514S",
+	.soc = "apple,t6030",
+	.boards = j514s_boards,
+	.dcp_compat = "apple,t6030-dcp",
+	.display_compat = "apple,t6030-display-diagnostics",
+	.uuid = "DDF38191-93B3-324A-BC8F-643006F5AC82",
+	.coproc = 0x28ec00000ULL,
+	.panel_width = 3024,
+	.panel_height = 1964,
+	.notch_height = 74,
+	.boot_stride = 12096,
+	.inherited = "apple,j514s-inherited-mappings",
+	.native_scanout = "apple,j514s-native-scanout",
+	.native_piodma = "apple,j514s-native-piodma",
+	.chosen_note = "aurora,j514s-display-handoff",
+};
+
+/*
+ * MacBook Pro 16" M3 Max (J516C) and 14" M3 Max (J514C): the J516 panel,
+ * 3456x2234 with 74 notch rows above the 3456x2160 boot framebuffer at 4
+ * bytes per pixel. The image is the one this Mac's ADT and the boot
+ * loader's apple,firmware-uuid name.
+ */
+static const struct dcp_v14_7_board dcp_v14_7_t6031 = {
+	.name = "J516C",
+	.soc = "apple,t6031",
+	.boards = t6031_boards,
+	.dcp_compat = "apple,t6031-dcp",
+	.display_compat = "apple,t6031-display-subsystem",
+	.uuid = "F493F03E-CC40-3D89-9A08-5F259BA2B246",
+	.coproc = 0x386c00000ULL,
+	.panel_width = 3456,
+	.panel_height = 2234,
+	.notch_height = 74,
+	.boot_stride = 3456 * 4,
+	.marker = "apple,t6031-handoff",
+	.pmp_optional = true,
+};
+
+/* The board profile of a 14.7 panel DCP node, or NULL. */
+static const struct dcp_v14_7_board *dcp_v14_7_board(struct device_node *np)
+{
+	static const struct dcp_v14_7_board *const boards[] = {
+		&dcp_v14_7_j514s,
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6031)
+		&dcp_v14_7_t6031,
+#endif
+	};
+	int i, j;
+
+	for (i = 0; i < ARRAY_SIZE(boards); i++) {
+		if (!of_device_is_compatible(np, boards[i]->dcp_compat) ||
+		    !of_machine_is_compatible(boards[i]->soc))
+			continue;
+		for (j = 0; boards[i]->boards[j]; j++)
+			if (of_machine_is_compatible(boards[i]->boards[j]))
+				return boards[i];
+	}
+	return NULL;
+}
 
 /*
  * The boot loader leaves one simple framebuffer on the panel: the full panel
  * or the panel below the notch, at the stride D101 reports.
  */
-static int dcp_t6030_boot_framebuffer(struct device *dev, u32 *stride)
+static int dcp_v14_7_boot_framebuffer(struct device *dev, const struct dcp_v14_7_board *b)
 {
 	struct device_node *np;
 	u32 width, height, pitch;
@@ -4832,9 +4943,9 @@ static int dcp_t6030_boot_framebuffer(struct device *dev, u32 *stride)
 		    of_property_read_u32(np, "width", &width) ||
 		    of_property_read_u32(np, "height", &height) ||
 		    of_property_read_u32(np, "stride", &pitch) ||
-		    width != J514S_PANEL_WIDTH || pitch != J514S_BOOT_STRIDE ||
-		    (height != J514S_PANEL_HEIGHT &&
-		     height != J514S_PANEL_HEIGHT - J514S_NOTCH_HEIGHT)) {
+		    width != b->panel_width || pitch != b->boot_stride ||
+		    (height != b->panel_height &&
+		     height != b->panel_height - b->notch_height)) {
 			of_node_put(np);
 			dev_err(dev, "unexpected boot framebuffer %pOF\n", np);
 			return -EINVAL;
@@ -4844,17 +4955,31 @@ static int dcp_t6030_boot_framebuffer(struct device *dev, u32 *stride)
 		dev_err(dev, "no boot framebuffer\n");
 		return -ENODEV;
 	}
-	*stride = J514S_BOOT_STRIDE;
 	return 0;
 }
 
 /* An enabled handoff node at @path that carries the inherited-mapping marker. */
 static bool dcp_t6030_handoff_node(struct device_node *np, const char *path,
-				   const char *compatible)
+				   const char *compatible, const char *inherited)
 {
 	struct device_node *alias = of_find_node_by_path(path);
 	bool ok = np && alias == np && of_device_is_available(np) &&
-		  of_property_read_bool(np, J514S_INHERITED) &&
+		  of_property_read_bool(np, inherited) &&
+		  (!compatible || of_device_is_compatible(np, compatible));
+
+	of_node_put(alias);
+	return ok;
+}
+
+/* An enabled handoff node at @path marked with the SoC's handoff word. */
+static bool dcp_t6031_handoff_node(struct device_node *np, const char *path,
+				   const char *compatible, const char *marker)
+{
+	struct device_node *alias = of_find_node_by_path(path);
+	u32 val;
+	bool ok = np && alias == np && of_device_is_available(np) &&
+		  !of_property_read_u32(np, marker, &val) && val == 1 &&
+		  of_property_present(np, "memory-region") &&
 		  (!compatible || of_device_is_compatible(np, compatible));
 
 	of_node_put(alias);
@@ -4862,37 +4987,38 @@ static bool dcp_t6030_handoff_node(struct device_node *np, const char *path,
 }
 
 /*
- * J514S admission: board and firmware identity, the DCP's coprocessor
+ * 14.7 panel admission: board and firmware identity, the DCP's coprocessor
  * window and DMA domain, the boot loader's display handoff (scanout and
- * PIODMA markers, inherited mappings, the chosen handoff note) and the boot
- * framebuffer.  The DCP is only adopted from this exact handoff.
+ * PIODMA, in the board's form) and the boot framebuffer. The DCP is only
+ * adopted from this exact handoff.
  */
-static int dcp_t6030_admit(struct platform_device *pdev, u32 *stride)
+static int dcp_v14_7_admit(struct platform_device *pdev, const struct dcp_v14_7_board **board)
 {
 	struct device *dev = &pdev->dev;
 	struct device_node *np = dev->of_node;
 	struct device_node *piodma, *disp, *chosen;
+	const struct dcp_v14_7_board *b;
 	struct resource *res;
 	const char *uuid;
 	u32 compat[3];
 	bool handoff;
 	int ret;
 
-	if (!of_machine_is_compatible("apple,j514s") ||
-	    !of_machine_is_compatible("apple,t6030")) {
-		dev_info(dev, "not a J514S; not binding\n");
+	b = dcp_v14_7_board(np);
+	if (!b) {
+		dev_info(dev, "not a board with a known 14.7 panel handoff; not binding\n");
 		return -ENODEV;
 	}
 	if (of_property_count_u32_elems(np, "apple,firmware-compat") != 3 ||
 	    of_property_read_u32_array(np, "apple,firmware-compat", compat, 3) ||
 	    compat[0] != 14 || compat[1] != 7 || compat[2] != 0 ||
 	    of_property_read_string(np, "apple,firmware-uuid", &uuid) ||
-	    strcmp(uuid, J514S_DCP_UUID)) {
-		dev_info(dev, "DCP firmware is not the qualified 14.7.0 image; not binding\n");
+	    strcmp(uuid, b->uuid)) {
+		dev_info(dev, "DCP firmware is not the %s 14.7.0 image; not binding\n", b->name);
 		return -ENODEV;
 	}
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "coproc");
-	if (!res || res->start != J514S_DCP_COPROC || resource_size(res) != SZ_16K) {
+	if (!res || res->start != b->coproc || resource_size(res) != SZ_16K) {
 		dev_info(dev, "unexpected coprocessor window; not binding\n");
 		return -ENODEV;
 	}
@@ -4901,15 +5027,23 @@ static int dcp_t6030_admit(struct platform_device *pdev, u32 *stride)
 
 	piodma = of_get_child_by_name(np, "piodma");
 	disp = of_find_node_by_path("disp0");
-	chosen = of_find_node_by_path("/chosen");
-	handoff = of_property_read_bool(np, "apple,j514s-native-scanout") &&
-		  of_property_read_bool(np, "apple,j514s-native-piodma") &&
-		  dcp_t6030_handoff_node(piodma, "disp0_piodma", NULL) &&
-		  dcp_t6030_handoff_node(disp, "disp0",
-					 "apple,t6030-display-diagnostics") &&
-		  chosen &&
-		  of_property_present(chosen, "aurora,j514s-display-handoff");
-	of_node_put(chosen);
+	if (b->marker) {
+		u32 val;
+
+		handoff = !of_property_read_u32(np, b->marker, &val) && val == 1 &&
+			  of_property_present(np, "memory-region") &&
+			  dcp_t6031_handoff_node(piodma, "disp0_piodma", NULL, b->marker) &&
+			  dcp_t6031_handoff_node(disp, "disp0", b->display_compat, b->marker);
+	} else {
+		chosen = of_find_node_by_path("/chosen");
+		handoff = of_property_read_bool(np, b->native_scanout) &&
+			  of_property_read_bool(np, b->native_piodma) &&
+			  dcp_t6030_handoff_node(piodma, "disp0_piodma", NULL, b->inherited) &&
+			  dcp_t6030_handoff_node(disp, "disp0", b->display_compat,
+						 b->inherited) &&
+			  chosen && of_property_present(chosen, b->chosen_note);
+		of_node_put(chosen);
+	}
 	of_node_put(disp);
 	of_node_put(piodma);
 	if (!handoff) {
@@ -4917,11 +5051,12 @@ static int dcp_t6030_admit(struct platform_device *pdev, u32 *stride)
 		return -ENODEV;
 	}
 
-	ret = dcp_t6030_boot_framebuffer(dev, stride);
+	ret = dcp_v14_7_boot_framebuffer(dev, b);
 	if (ret)
 		return ret;
 
-	dev_info(dev, "J514S DCP firmware 14.7.0 handoff admitted\n");
+	dev_info(dev, "%s DCP firmware 14.7.0 handoff admitted\n", b->name);
+	*board = b;
 	return 0;
 }
 
@@ -4931,7 +5066,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	enum dcp_firmware_version fw_compat;
 	struct device *dev = &pdev->dev;
 	struct apple_dcp *dcp;
-	u32 boot_stride = 0;
+	const struct dcp_v14_7_board *board = NULL;
 	int ret, surf, num_surfs;
 	u32 surf_en;
 	u32 mux_index;
@@ -4953,7 +5088,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	/* J514S: the panel or a DCPEXT, each only from its qualified handoff. */
 	if (IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030) && fw_compat == DCP_FIRMWARE_V_14_7) {
 		ret = IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT) && hw->v14_7_external ?
-		      dcp_t6030_ext_admit(pdev) : dcp_t6030_admit(pdev, &boot_stride);
+		      dcp_t6030_ext_admit(pdev) : dcp_v14_7_admit(pdev, &board);
 		if (ret)
 			return ret;
 	}
@@ -5013,7 +5148,12 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		ret = iomfb_v14_7_session_init(dcp);
 		if (ret)
 			return ret;
-		dcp->v14_7->boot_stride = boot_stride;
+		if (board) {
+			dcp->v14_7->boot_stride = board->boot_stride;
+			dcp->v14_7->panel_width = board->panel_width;
+			dcp->v14_7->panel_height = board->panel_height;
+			dcp->v14_7->pmp_optional = board->pmp_optional;
+		}
 	}
 
 	/* The domain use must survive driver-core DMA cleanup for a live session. */
@@ -5465,6 +5605,26 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6030 = {
 };
 #endif
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6031)
+/*
+ * MacBook Pro M3 Max (J516C/J514C, T6031) internal panel: the J514S session
+ * at the T6031 addresses. The panel's size and brightness come from the
+ * panel child the T6031 device tree carries; the hardware data are the
+ * same mini-LED facts in case it is missing.
+ */
+static const struct apple_dcp_hw_data apple_dcp_hw_t6031 = {
+	.num_dptx_ports = 0,
+	.adopt_live_session = true,
+	.firmware_compat = DCP_FIRMWARE_V_14_7,
+	.primary_only = true,
+	.optional_clock = true,
+	.no_rt_bandwidth = true,
+	.panel_mini_led = true,
+	.panel_max_nits = 500,
+	.panel_default_nits = 140,
+};
+#endif
+
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
 /*
  * MacBook Pro M3 Pro (J514S) external display controllers (DCPEXT0/1): the
@@ -5500,6 +5660,9 @@ static const struct of_device_id of_match[] = {
 #endif
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
 	{ .compatible = "apple,t6030-dcpext", .data = &apple_dcp_hw_t6030_dcpext, },
+#endif
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6031)
+	{ .compatible = "apple,t6031-dcp", .data = &apple_dcp_hw_t6031,  },
 #endif
 	{ .compatible = "apple,dcp",       .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,dcpext",    .data = &apple_dcp_hw_dcpext, },
