@@ -141,5 +141,17 @@ pub(crate) const CONFIG: Config = Config {
         name: kernel::c_str!("asahi/t6031-j516c-board.bin"),
         sha256: BOARD_SHA256,
     },
-    compute: super::t6030::COMPUTE,
+    // Four clusters: the saved-state pointers at +0x2980 of the preemption buffer (0xd80 plus
+    // 0x700 per cluster), UMA PTC 0x6000400020, DUPM 0x3c000000140 (32 N | 96 N << 32 for
+    // N = 10 cores per cluster) and 0x1a0e9 = 0, with the saved-state pointers and the
+    // 0x12091/0x101d9 words zero in every command, as this machine's driver encodes a queue's
+    // first command. Read from 38 compute commands on a J516C; the two-cluster values fault
+    // the first job on this GPU.
+    compute: super::ComputeRegs {
+        tail: 0x2980,
+        ptc: 0x6000400020,
+        dupm: 0x3c000000140,
+        reg_1a0e9: 0,
+        fresh: true,
+    },
 };
