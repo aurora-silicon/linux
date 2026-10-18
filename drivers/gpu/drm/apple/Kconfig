@@ -42,6 +42,22 @@ config DRM_APPLE_DCP_T6030
 	  after the display, so userspace should load appledrm explicitly
 	  and blacklist its alias autoload.
 
+config DRM_APPLE_DCP_T6031
+	bool "MacBook Pro M3 Max (J516C) internal panel"
+	depends on DRM_APPLE_DCP_T6030
+	depends on OF_DYNAMIC
+	help
+	  Lets the common Apple display driver adopt the J516C and J514C
+	  (T6031) internal display coprocessor, which the boot loader hands
+	  over running DCP firmware 14.7.0, with the J514S session and
+	  presentation paths at the T6031 addresses.
+
+	  The boot loader describes the display with every node disabled.
+	  The T6031 display handoff enables them, and adds this Mac's PMP
+	  from the values the boot loader passes, only when
+	  apple_t6031_display.enable=1 is on the kernel command line; the
+	  boot framebuffer stays otherwise.
+
 config DRM_APPLE_DCP_T6030_EXT
 	bool "MacBook Pro M3 Pro (J514S) external displays"
 	depends on DRM_APPLE_DCP_T6030
