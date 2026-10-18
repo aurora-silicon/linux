@@ -17,6 +17,18 @@ static inline bool apple_pmp_t6030_board(void)
 		of_machine_is_compatible("apple,j516s"));
 }
 
+/*
+ * The T6031 (M3 Max) MacBook Pros, 14-inch J514C and 16-inch J516C. Their
+ * PMP values come from the boot loader (/chosen/asahi,t6031-pmp); the GPU
+ * needs no PMP vote on this SoC.
+ */
+static inline bool apple_pmp_t6031_board(void)
+{
+	return of_machine_is_compatible("apple,t6031") &&
+	       (of_machine_is_compatible("apple,j514c") ||
+		of_machine_is_compatible("apple,j516c"));
+}
+
 struct device;
 struct apple_pmp_display;
 
@@ -36,16 +48,19 @@ void apple_pmp_display_fail(struct apple_pmp_display *display, int error);
 struct apple_pmp_display *apple_pmp_display_bound_owner(struct device *dev);
 
 /*
- * J514S (T6030) power. pre_run holds the inherited display and seeds the PTD
- * DISP|ANS request before the PMP CPU runs (called by pmp-core.rs; a no-op on
- * other boards). display_prepare links the DCP to the bound PMP; get/check
- * require the PMP to have acknowledged the DISP request. The GPU variants
- * hold the AGX vote, retained until reboot; prepare is called during probe.
+ * T6030 and T6031 display power. pre_run holds the inherited display and
+ * seeds the PTD DISP|ANS request before the PMP CPU runs (called by
+ * pmp-core.rs; a no-op on other boards). display_prepare links the DCP to
+ * the bound PMP; get/check require the PMP to have acknowledged the DISP
+ * request. The J514S GPU variants hold the AGX vote, retained until reboot;
+ * prepare is called during probe.
  */
 int apple_pmp_display_pre_run(struct device *dev);
-int apple_pmp_j514s_display_prepare(struct device *consumer);
-int apple_pmp_j514s_display_get(struct device *consumer);
-int apple_pmp_j514s_display_check(struct device *consumer);
+/* True once the board's PMP node exists (added by the boot-time handoff). */
+bool apple_pmp_display_present(void);
+int apple_pmp_display_prepare(struct device *consumer);
+int apple_pmp_display_get(struct device *consumer);
+int apple_pmp_display_check(struct device *consumer);
 int apple_pmp_j514s_gpu_prepare(struct device *consumer);
 int apple_pmp_j514s_gpu_get(struct device *consumer);
 int apple_pmp_j514s_gpu_check(struct device *consumer);

@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * T6030 (M3 Pro: J514S, J516S) power votes through pmp-core.rs's RTKit session.
+ * T6030 (M3 Pro: J514S, J516S) and T6031 (M3 Max: J514C, J516C) power votes
+ * through pmp-core.rs's RTKit session.
  *
  * The display is inherited running from the boot loader. Before the PMP CPU
  * runs, its power chain is held and the PMP's DISP|ANS request is seeded in
  * the PTD, so the PMP keeps it on; the DCP driver then waits for the PMP to
- * acknowledge it. The GPU's AGX vote is an untagged RTKit request on the PMP
- * endpoint: exactly one is in flight, with a one-second deadline. Votes and
- * supplier links are retained until reboot. Malformed, unsolicited, late or
- * duplicate replies and firmware crashes latch a sticky error.
+ * acknowledge it. Where the table and the power chain sit differs per SoC
+ * (struct pmp_display_soc). The GPU's AGX vote, T6030 only, is an untagged
+ * RTKit request on the PMP endpoint: exactly one is in flight, with a
+ * one-second deadline. Votes and supplier links are retained until reboot.
+ * Malformed, unsolicited, late or duplicate replies and firmware crashes
+ * latch a sticky error.
  */
 #include <linux/bits.h>
 #include <linux/completion.h>
@@ -97,31 +100,153 @@ struct apple_pmp_display {
 static struct apple_pmp_display *pmp_display;
 static DEFINE_MUTEX(pmp_display_registration);
 
-bool apple_pmp_display_retained_board(void)
+/*
+ * J514S (T6030). PTD at 0x3503c0000: status +0x10; DISP request word +280*16
+ * and ACK +284*16 (PTD ranges 10/11); non-posted request-set aperture
+ * +0x10000 + 280*8. DISP is table index 7, ANS index 16.
+ */
+#define J514S_PTD		0x3503c0000ULL
+#define J514S_PTD_SIZE		0x14000
+#define J514S_PTD_STATUS	0x10
+#define J514S_PTD_REQ		(280 * 16)
+#define J514S_PTD_ACK		(284 * 16)
+#define J514S_PTD_SET		(0x10000 + 280 * 8)
+#define J514S_PTD_DISP		BIT_ULL(7)
+#define J514S_PTD_ANS		BIT_ULL(16)
+#define J514S_PMP_ASC		0x350c00000ULL
+#define J514S_PMGR		0x350700000ULL
+
+/* SYS, FE and CPU of the display power chain, parents first. */
+static const u32 j514s_display_ps[] = { 0x1c0, 0x258, 0x10000 };
+
+/*
+ * J516C/J514C (T6031). PTD at 0x2903c0000 (the PMP's ptd-update window less
+ * 0x10000): status +0x10; the SoC device request word at PTD index 0x200
+ * (+0x2000), its acknowledgement at index 0x208 (+0x2080), the request-set
+ * aperture at +0x10000 + 0x200*8. The internal display is SoC device 17,
+ * request bit 16; storage (ANS) is device 34, bit 33. The display chain
+ * sits in one PMGR block: DISP_SYS +0x200, DISP_FE +0x298, DISP_CPU +0x2a0.
+ */
+#define J516C_PTD		0x2903c0000ULL
+#define J516C_PTD_SIZE		0x14000
+#define J516C_PTD_REQ		(0x200 * 16)
+#define J516C_PTD_ACK		(0x208 * 16)
+#define J516C_PTD_SET		(0x10000 + 0x200 * 8)
+#define J516C_PTD_DISP		BIT_ULL(16)
+#define J516C_PTD_ANS		BIT_ULL(33)
+#define J516C_PMP_ASC		0x290c00000ULL
+#define J516C_PMGR		0x292280000ULL
+
+static const u32 j516c_display_ps[] = { 0x200, 0x298, 0x2a0 };
+
+/*
+ * One SoC's PMP as the display hold sees it: the node the boot-time handoff
+ * adds, its device-state table and the display power chain it must keep up.
+ */
+struct pmp_display_soc {
+	const char *name;
+	const char *pmp_path;
+	const char *pmp_compat;
+	u64 ptd;
+	u32 ptd_size;
+	u32 ptd_status;
+	u32 ptd_req, ptd_ack, ptd_set;
+	u64 ptd_disp, ptd_ans;
+	u64 asc;
+	u64 pmgr;
+	u32 pmgr_size;
+	const u32 *display_ps;
+	unsigned int nr_display_ps;
+	/* The CPU-client memory floor and the GPU vote are known on T6030 only. */
+	bool memory_floor;
+};
+
+static const struct pmp_display_soc pmp_display_t6030 = {
+	.name = "J514S",
+	.pmp_path = "/soc/pmp@350500000",
+	.pmp_compat = "apple,t6030-pmp-v2",
+	.ptd = J514S_PTD,
+	.ptd_size = J514S_PTD_SIZE,
+	.ptd_status = J514S_PTD_STATUS,
+	.ptd_req = J514S_PTD_REQ,
+	.ptd_ack = J514S_PTD_ACK,
+	.ptd_set = J514S_PTD_SET,
+	.ptd_disp = J514S_PTD_DISP,
+	.ptd_ans = J514S_PTD_ANS,
+	.asc = J514S_PMP_ASC,
+	.pmgr = J514S_PMGR,
+	.pmgr_size = 0x14000,
+	.display_ps = j514s_display_ps,
+	.nr_display_ps = ARRAY_SIZE(j514s_display_ps),
+	.memory_floor = true,
+};
+
+static const struct pmp_display_soc pmp_display_t6031 = {
+	.name = "J516C",
+	.pmp_path = "/soc/pmp@290700000",
+	.pmp_compat = "apple,t6031-pmp-v2",
+	.ptd = J516C_PTD,
+	.ptd_size = J516C_PTD_SIZE,
+	.ptd_status = J514S_PTD_STATUS,
+	.ptd_req = J516C_PTD_REQ,
+	.ptd_ack = J516C_PTD_ACK,
+	.ptd_set = J516C_PTD_SET,
+	.ptd_disp = J516C_PTD_DISP,
+	.ptd_ans = J516C_PTD_ANS,
+	.asc = J516C_PMP_ASC,
+	.pmgr = J516C_PMGR,
+	.pmgr_size = 0xc000,
+	.display_ps = j516c_display_ps,
+	.nr_display_ps = ARRAY_SIZE(j516c_display_ps),
+};
+
+/* The running board's PMP description, or NULL where no display is held. */
+static const struct pmp_display_soc *pmp_display_soc(void)
 {
-	return apple_pmp_t6030_board();
+	if (apple_pmp_t6030_board())
+		return &pmp_display_t6030;
+	if (apple_pmp_t6031_board())
+		return &pmp_display_t6031;
+	return NULL;
 }
 
-/* The board's PMP node, added by the T6030 PMP handoff (no alias). */
+bool apple_pmp_display_retained_board(void)
+{
+	return !!pmp_display_soc();
+}
+
+/* The board's PMP node, added by the boot-time PMP handoff (no alias). */
 static struct device_node *pmp_bridge_node(void)
 {
-	return of_find_node_by_path("/soc/pmp@350500000");
+	const struct pmp_display_soc *soc = pmp_display_soc();
+
+	return soc ? of_find_node_by_path(soc->pmp_path) : NULL;
 }
+
+bool apple_pmp_display_present(void)
+{
+	struct device_node *np = pmp_bridge_node();
+
+	of_node_put(np);
+	return !!np;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_display_present);
 
 struct apple_pmp_display *apple_pmp_display_register(struct device *dev,
 		const void *cookie, int (*send)(const void *, u64))
 {
+	const struct pmp_display_soc *soc = pmp_display_soc();
 	struct apple_pmp_display *p = NULL;
 	struct device_node *node;
 	bool match;
 
-	if (!apple_pmp_t6030_board() || !dev->of_node ||
-	    !of_device_is_compatible(dev->of_node, "apple,t6030-pmp-v2"))
+	if (!soc || !dev->of_node ||
+	    !of_device_is_compatible(dev->of_node, soc->pmp_compat))
 		return NULL;
 	node = pmp_bridge_node();
 	match = node == dev->of_node;
 	of_node_put(node);
-	/* The handoff copies the soc-device table from the ADT; require it. */
+	/* The handoff copies the soc-device table from the boot loader; require it. */
 	if (!match || !of_property_present(dev->of_node, "apple,tunable-soc-device") ||
 	    !cookie || !send)
 		return NULL;
@@ -142,7 +267,7 @@ struct apple_pmp_display *apple_pmp_display_register(struct device *dev,
 	__module_get(THIS_MODULE);
 	pm_runtime_get_noresume(dev);
 	smp_store_release(&pmp_display, p);
-	dev_info(dev, "J514S PMP vote bridge ready; retained existing PMP owner\n");
+	dev_info(dev, "%s PMP vote bridge ready; retained existing PMP owner\n", soc->name);
 out:
 	mutex_unlock(&pmp_display_registration);
 	return p;
@@ -327,62 +452,47 @@ int apple_pmp_j514s_gpu_check(struct device *consumer)
 EXPORT_SYMBOL_GPL(apple_pmp_j514s_gpu_check);
 
 /*
- * J514S (T6030). PTD at 0x3503c0000: status +0x10; DISP request word +280*16
- * and ACK +284*16 (PTD ranges 10/11); non-posted request-set aperture
- * +0x10000 + 280*8. DISP is table index 7, ANS index 16.
- */
-#define J514S_PTD		0x3503c0000ULL
-#define J514S_PTD_SIZE		0x14000
-#define J514S_PTD_STATUS	0x10
-#define J514S_PTD_REQ		(280 * 16)
-#define J514S_PTD_ACK		(284 * 16)
-#define J514S_PTD_SET		(0x10000 + 280 * 8)
-#define J514S_PTD_DISP		BIT_ULL(7)
-#define J514S_PTD_ANS		BIT_ULL(16)
-/*
- * Memory floor: CPU-client EACC0/PACC0 PTD indices 288/289 request DCS4 and
- * FAB2 (valid bit 61, DCS bits 51:48, FAB bits 35:32), other fields kept.
- * DVFS state entries 8 and 10 (PTD range 3) publish the firmware's response.
+ * Memory floor (T6030): CPU-client EACC0/PACC0 PTD indices 288/289 request
+ * DCS4 and FAB2 (valid bit 61, DCS bits 51:48, FAB bits 35:32), other fields
+ * kept. DVFS state entries 8 and 10 (PTD range 3) publish the firmware's
+ * response. The T6031 table's CPU-client entries have not been read, so no
+ * floor is requested there.
  */
 #define J514S_PTD_FLOOR_IDX0	288
 #define J514S_PTD_FLOOR_MASK	(BIT_ULL(61) | GENMASK_ULL(51, 48) | GENMASK_ULL(35, 32))
 #define J514S_PTD_FLOOR		(BIT_ULL(61) | (4ULL << 48) | (2ULL << 32))
 #define J514S_PTD_FLOOR_SET(i)	(0x10000 + (J514S_PTD_FLOOR_IDX0 + (i)) * 8)
 #define J514S_PTD_DVFS_STATE(i)	((8 + 2 * (i)) * 16)
-#define J514S_PMP_ASC		0x350c00000ULL
-#define J514S_PMGR		0x350700000ULL
-
-/* SYS, FE and CPU of the display power chain, parents first. */
-static const u32 j514s_display_ps[] = { 0x1c0, 0x258, 0x10000 };
 
 /*
  * Hold the inherited display epoch: minimum state 15 (bits 19:16), W1C history
  * bits 9:8 written as zero, other controls preserved. Must precede PMP RUN,
  * or the PMP powers the display down and the DCP CPU stops.
  */
-static int j514s_display_hold(struct device *dev)
+static int pmp_display_hold(struct device *dev, const struct pmp_display_soc *soc)
 {
-	void __iomem *pmgr = ioremap_np(J514S_PMGR, 0x14000);
+	void __iomem *pmgr = ioremap_np(soc->pmgr, soc->pmgr_size);
 	int ret = 0;
 	u32 val;
 
 	if (!pmgr)
 		return -ENOMEM;
-	for (unsigned int i = 0; i < ARRAY_SIZE(j514s_display_ps); i++) {
-		val = readl(pmgr + j514s_display_ps[i]);
+	for (unsigned int i = 0; i < soc->nr_display_ps; i++) {
+		val = readl(pmgr + soc->display_ps[i]);
 		if ((val & 0xff) != 0xff || (val & BIT(31))) {
-			dev_err(dev, "J514S display domain %#x not inherited on: %#x\n",
-				j514s_display_ps[i], val);
+			dev_err(dev, "%s display domain %#x not inherited on: %#x\n",
+				soc->name, soc->display_ps[i], val);
 			ret = -EIO;
 			break;
 		}
-		writel((val & ~0x000f0300) | 0x000f0000, pmgr + j514s_display_ps[i]);
-		val = readl(pmgr + j514s_display_ps[i]);
-		dev_info(dev, "J514S display domain %#x held: %#x\n", j514s_display_ps[i], val);
+		writel((val & ~0x000f0300) | 0x000f0000, pmgr + soc->display_ps[i]);
+		val = readl(pmgr + soc->display_ps[i]);
+		dev_info(dev, "%s display domain %#x held: %#x\n", soc->name,
+			 soc->display_ps[i], val);
 		/* Not every domain implements the minimum field (SYS reads 0). */
 		if ((val & 0x000f0000) != 0x000f0000)
-			dev_warn(dev, "J514S display domain %#x minimum not latched\n",
-				 j514s_display_ps[i]);
+			dev_warn(dev, "%s display domain %#x minimum not latched\n",
+				 soc->name, soc->display_ps[i]);
 	}
 	iounmap(pmgr);
 	return ret;
@@ -390,43 +500,45 @@ static int j514s_display_hold(struct device *dev)
 
 int apple_pmp_display_pre_run(struct device *dev)
 {
+	const struct pmp_display_soc *soc = pmp_display_soc();
 	void __iomem *asc = NULL, *ptd = NULL;
-	u64 status, req;
+	u64 status, req, seed;
 	u32 run;
 	int ret;
 
-	if (!apple_pmp_t6030_board() || !dev->of_node ||
-	    !of_device_is_compatible(dev->of_node, "apple,t6030-pmp-v2"))
+	if (!soc || !dev->of_node ||
+	    !of_device_is_compatible(dev->of_node, soc->pmp_compat))
 		return 0;
 	/* The display floor first: the DCP must survive PMP startup. */
-	ret = j514s_display_hold(dev);
+	ret = pmp_display_hold(dev, soc);
 	if (ret)
 		return ret;
-	asc = ioremap_np(J514S_PMP_ASC, 0x4000);
-	ptd = ioremap_np(J514S_PTD, J514S_PTD_SIZE);
+	asc = ioremap_np(soc->asc, 0x4000);
+	ptd = ioremap_np(soc->ptd, soc->ptd_size);
 	if (!asc || !ptd) {
 		ret = -ENOMEM;
 		goto out;
 	}
 	run = readl(asc + 0x44);
-	status = readq(ptd + J514S_PTD_STATUS);
-	req = readq(ptd + J514S_PTD_REQ);
+	status = readq(ptd + soc->ptd_status);
+	req = readq(ptd + soc->ptd_req);
 	/* Cold start only: no adoption of a running or pre-seeded PMP. */
 	if ((run & BIT(4)) || status || req) {
-		dev_err(dev, "J514S PMP not cold (run=%#x status=%#llx req=%#llx)\n",
-			run, status, req);
+		dev_err(dev, "%s PMP not cold (run=%#x status=%#llx req=%#llx)\n",
+			soc->name, run, status, req);
 		ret = -EBUSY;
 		goto out;
 	}
 	/* One 64-bit set transaction; the readback must be exactly DISP|ANS. */
-	writeq(J514S_PTD_DISP | J514S_PTD_ANS, ptd + J514S_PTD_SET);
-	req = readq(ptd + J514S_PTD_REQ);
-	if (req != (J514S_PTD_DISP | J514S_PTD_ANS)) {
-		dev_err(dev, "J514S PTD seed not accepted: req=%#llx\n", req);
+	seed = soc->ptd_disp | soc->ptd_ans;
+	writeq(seed, ptd + soc->ptd_set);
+	req = readq(ptd + soc->ptd_req);
+	if (req != seed) {
+		dev_err(dev, "%s PTD seed not accepted: req=%#llx\n", soc->name, req);
 		ret = -EIO;
 		goto out;
 	}
-	dev_info(dev, "J514S display held, PTD seeded DISP|ANS: req=%#llx\n", req);
+	dev_info(dev, "%s display held, PTD seeded DISP|ANS: req=%#llx\n", soc->name, req);
 out:
 	if (ptd)
 		iounmap(ptd);
@@ -505,36 +617,36 @@ static void j514s_memory_floor(void)
 	schedule_delayed_work(&j514s_floor_work, HZ);
 }
 
-static int j514s_display_acked(bool wait)
+static int pmp_display_acked(const struct pmp_display_soc *soc, bool wait)
 {
-	void __iomem *ptd = ioremap_np(J514S_PTD, J514S_PTD_SIZE);
+	void __iomem *ptd = ioremap_np(soc->ptd, soc->ptd_size);
 	u64 status;
 	int ret;
 
 	if (!ptd)
 		return -ENOMEM;
-	ret = readq_poll_timeout(ptd + J514S_PTD_STATUS, status, status == 1,
+	ret = readq_poll_timeout(ptd + soc->ptd_status, status, status == 1,
 				 1000, wait ? 2000000 : 1);
 	/*
 	 * DISP must be acknowledged (an ACK implies the request; ANS needs
 	 * none). The request entry is not read: that may consume the PMP's
 	 * change notification of an external controller's request.
 	 */
-	if (!ret && !(readq(ptd + J514S_PTD_ACK) & J514S_PTD_DISP))
+	if (!ret && !(readq(ptd + soc->ptd_ack) & soc->ptd_disp))
 		ret = -EIO;
 	iounmap(ptd);
-	if (!ret && wait)
+	if (!ret && wait && soc->memory_floor)
 		j514s_memory_floor();
 	return ret;
 }
 
-int apple_pmp_j514s_display_prepare(struct device *consumer)
+int apple_pmp_display_prepare(struct device *consumer)
 {
 	struct device_node *np;
 	struct platform_device *pmp;
 	bool bound;
 
-	if (!apple_pmp_t6030_board())
+	if (!pmp_display_soc())
 		return -ENODEV;
 	np = pmp_bridge_node();
 	pmp = np ? of_find_device_by_node(np) : NULL;
@@ -547,16 +659,20 @@ int apple_pmp_j514s_display_prepare(struct device *consumer)
 	put_device(&pmp->dev);
 	return bound ? 0 : -EPROBE_DEFER;
 }
-EXPORT_SYMBOL_GPL(apple_pmp_j514s_display_prepare);
+EXPORT_SYMBOL_GPL(apple_pmp_display_prepare);
 
-int apple_pmp_j514s_display_get(struct device *consumer)
+int apple_pmp_display_get(struct device *consumer)
 {
-	return apple_pmp_t6030_board() ? j514s_display_acked(true) : -ENODEV;
-}
-EXPORT_SYMBOL_GPL(apple_pmp_j514s_display_get);
+	const struct pmp_display_soc *soc = pmp_display_soc();
 
-int apple_pmp_j514s_display_check(struct device *consumer)
-{
-	return apple_pmp_t6030_board() ? j514s_display_acked(false) : -ENODEV;
+	return soc ? pmp_display_acked(soc, true) : -ENODEV;
 }
-EXPORT_SYMBOL_GPL(apple_pmp_j514s_display_check);
+EXPORT_SYMBOL_GPL(apple_pmp_display_get);
+
+int apple_pmp_display_check(struct device *consumer)
+{
+	const struct pmp_display_soc *soc = pmp_display_soc();
+
+	return soc ? pmp_display_acked(soc, false) : -ENODEV;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_display_check);
