@@ -30,11 +30,14 @@ config DRM_ASAHI_G15
 	depends on DRM_ASAHI && ARM64
 	depends on APPLE_PMP=y || APPLE_PMP=DRM_ASAHI
 	select CRYPTO_LIB_SHA256
+	select RUST_FW_LOADER_ABSTRACTIONS
 	help
 	  Support for the G15S GPU of the T6030 MacBook Pros (J514S, J516S)
 	  and the G15C GPU of the T6031 MacBook Pros (J514C, J516C), whose
 	  firmware (RTKit 2419) the boot loader leaves loaded. Only the
-	  qualified firmware builds are admitted.
+	  qualified firmware builds are admitted. The T6031 board images are
+	  a firmware file (asahi/t6031-j516c-board.bin), to be built in with
+	  CONFIG_EXTRA_FIRMWARE.
 
 	  The G15 platform driver has no module alias: it binds when the
 	  asahi module is loaded explicitly (modprobe asahi), after the

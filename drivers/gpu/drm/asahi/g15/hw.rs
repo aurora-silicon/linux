@@ -44,6 +44,11 @@ pub(crate) enum Platform {
 pub(crate) enum Board {
     /// The hash-checked T6030 templates ([`super::board`]).
     Templates,
+    /// The three images as one firmware file ([`super::board::blob`]), pinned by its SHA-256.
+    Blob {
+        name: &'static kernel::str::CStr,
+        sha256: [u8; 32],
+    },
     /// No board data: admission refuses the SoC before anything firmware-visible.
     None,
 }

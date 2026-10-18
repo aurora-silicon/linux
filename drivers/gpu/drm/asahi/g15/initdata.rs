@@ -114,6 +114,101 @@ fn put64(b: &mut [u8], offset: usize, value: u64) -> Result {
     Ok(())
 }
 
+
+/// The T6030 board images: the verified templates with DVFS from the ADT. Returns the images
+/// and the top DVFS frequency in kHz.
+fn templates(
+    dev: &device::Device,
+    adt: &GpuAdt,
+) -> Result<(KVVec<u8>, KVVec<u8>, KVVec<u8>, u32)> {
+    let mut hw_img = KVVec::from_elem(0u8, hwdata::SIZE, GFP_KERNEL)?;
+    let mut glob = KVVec::from_elem(0u8, globals::SIZE, GFP_KERNEL)?;
+    let mut pwr = KVVec::from_elem(0u8, power::SIZE, GFP_KERNEL)?;
+    if board::expand(&data::HARDWARE, &mut hw_img).is_err()
+        || board::expand(&data::GLOBALS, &mut glob).is_err()
+        || board::expand(&data::POWER, &mut pwr).is_err()
+    {
+        dev_err!(dev, "board data template hash mismatch\n");
+        return Err(EINVAL);
+    }
+    if get32(&hw_img, hwdata::CHECK_A38)? != 1
+        || get32(&hw_img, hwdata::DVFS_COUNT)? != board::DVFS_STATES as u32 - 1
+        || get32(&glob, globals::UNK_980)? != 10
+        || get32(&glob, globals::IDLE_STANDBY_US)? != 700
+        || get32(&glob, globals::IDLE_MIN_CONF)? != 0x3f333333
+    {
+        return Err(EINVAL);
+    }
+    let max_khz = board::from_adt(dev, adt, &mut hw_img)?;
+    let reference = glue::sha256(&hw_img) == data::HARDWARE.sha256;
+    dev_info!(
+        dev,
+        "board data: ADT performance states, {} MHz top{}\n",
+        max_khz / 1000,
+        if reference {
+            " (reference machine)"
+        } else {
+            " (differs from the reference machine)"
+        }
+    );
+    if !reference {
+        dev_info!(dev, "board data sha256 {}\n", Hex(&glue::sha256(&hw_img)));
+    }
+    Ok((hw_img, glob, pwr, max_khz))
+}
+
+/// HardwareDataA word holding the system counter at initdata creation.
+const HWDATA_A_INIT_TIMESTAMP: usize = 0x424c;
+
+/// Board images from the SoC's firmware file. The file is this machine's own: its DVFS tables
+/// are kept, and checked for the top frequency of the device tree's operating points; its
+/// IOMapping records must name the layout's physical addresses. Returns the images and the
+/// top operating-point frequency in kHz.
+fn blob(
+    dev: &device::Device,
+    cfg: &Config,
+    adt: &GpuAdt,
+    name: &CStr,
+    sha256: &[u8; 32],
+) -> Result<(KVVec<u8>, KVVec<u8>, KVVec<u8>, u32)> {
+    let layout = cfg.layout;
+    let images = board::blob::load(
+        dev,
+        name,
+        sha256,
+        [layout.hwdata_size, globals::SIZE, power::SIZE],
+    )?;
+    let mut hw_img = images.hardware;
+    for map in layout.iomaps.iter() {
+        let at = hwdata::IOMAPS + hwdata::IOMAP_STRIDE * map.slot as usize;
+        let pa = u64::from(get32(&hw_img, at)?) | u64::from(get32(&hw_img, at + 4)?) << 32;
+        if pa != map.pa + map.delta {
+            dev_err!(
+                dev,
+                "board images: IOMapping slot {} is at {:#x}, the layout maps {:#x}\n",
+                map.slot,
+                pa,
+                map.pa + map.delta
+            );
+            return Err(EINVAL);
+        }
+    }
+    let max_mhz = adt.perf_mhz.iter().copied().max().unwrap_or(0);
+    let now: u64;
+    // SAFETY: Reading the architectural counter has no side effects.
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) now, options(nomem, nostack, preserves_flags))
+    };
+    put64(&mut hw_img, hwdata::HWDATA_A + HWDATA_A_INIT_TIMESTAMP, now)?;
+    dev_info!(
+        dev,
+        "board data: {} images, {} MHz top operating point\n",
+        cfg.name,
+        max_mhz
+    );
+    Ok((hw_img, images.globals, images.power, max_mhz * 1000))
+}
+
 /// Builds the initdata graph. Returns it with its channels and the top DVFS frequency in kHz.
 /// Nothing is published here.
 pub(crate) fn build(
@@ -169,41 +264,13 @@ pub(crate) fn build(
     }
 
     // Board images, verified, then the owned replacements.
-    if cfg.board != hw::Board::Templates || layout.hwdata_size != hwdata::SIZE {
-        return Err(ENODEV);
-    }
-    let mut hw_img = KVVec::from_elem(0u8, hwdata::SIZE, GFP_KERNEL)?;
-    let mut glob = KVVec::from_elem(0u8, globals::SIZE, GFP_KERNEL)?;
-    let mut pwr = KVVec::from_elem(0u8, power::SIZE, GFP_KERNEL)?;
-    if board::expand(&data::HARDWARE, &mut hw_img).is_err()
-        || board::expand(&data::GLOBALS, &mut glob).is_err()
-        || board::expand(&data::POWER, &mut pwr).is_err()
-    {
-        dev_err!(dev, "board data template hash mismatch\n");
+    let (mut hw_img, mut glob, pwr, max_khz) = match cfg.board {
+        hw::Board::Templates => templates(dev, adt)?,
+        hw::Board::Blob { name, sha256 } => blob(dev, cfg, adt, name, &sha256)?,
+        hw::Board::None => return Err(ENODEV),
+    };
+    if hw_img.len() != layout.hwdata_size {
         return Err(EINVAL);
-    }
-    if get32(&hw_img, hwdata::CHECK_A38)? != 1
-        || get32(&hw_img, hwdata::DVFS_COUNT)? != board::DVFS_STATES as u32 - 1
-        || get32(&glob, globals::UNK_980)? != 10
-        || get32(&glob, globals::IDLE_STANDBY_US)? != 700
-        || get32(&glob, globals::IDLE_MIN_CONF)? != 0x3f333333
-    {
-        return Err(EINVAL);
-    }
-    let max_khz = board::from_adt(dev, adt, &mut hw_img)?;
-    let reference = glue::sha256(&hw_img) == data::HARDWARE.sha256;
-    dev_info!(
-        dev,
-        "board data: ADT performance states, {} MHz top{}\n",
-        max_khz / 1000,
-        if reference {
-            " (reference machine)"
-        } else {
-            " (differs from the reference machine)"
-        }
-    );
-    if !reference {
-        dev_info!(dev, "board data sha256 {}\n", Hex(&glue::sha256(&hw_img)));
     }
     put64(&mut hw_img, hwdata::TTBAT, adt.ttbs.start)?;
     for map in layout.iomaps.iter() {
@@ -230,16 +297,19 @@ pub(crate) fn build(
         globals::IDLE_PREDICTIVE,
         hw::tuning::IDLE_PREDICTIVE as u32,
     )?;
-    // HardwareDataA at +0x4580: maintained S8 request.
-    for (offset, value) in [
-        (0x2c, 8),
-        (0x30, 8),
-        (0x44, 800),
-        (0x7d8, 800),
-        (0x7e0, 800),
-        (0x81c, 800),
-    ] {
-        put32(&mut hw_img, hwdata::HWDATA_A + offset, value)?;
+    // HardwareDataA at +0x4580: maintained S8 request (the templates' machine; a board image
+    // from a file carries its own machine's words).
+    if cfg.board == hw::Board::Templates {
+        for (offset, value) in [
+            (0x2c, 8),
+            (0x30, 8),
+            (0x44, 800),
+            (0x7d8, 800),
+            (0x7e0, 800),
+            (0x81c, 800),
+        ] {
+            put32(&mut hw_img, hwdata::HWDATA_A + offset, value)?;
+        }
     }
     hwdata_obj.write(0, &hw_img)?;
     globals_obj.write(0, &glob)?;

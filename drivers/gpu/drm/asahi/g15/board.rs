@@ -9,6 +9,7 @@
 //! MHz +0x4dc4). The tables in [`data`] are generated, and every expanded image is checked
 //! against its hash at boot.
 
+pub(crate) mod blob;
 pub(crate) mod data;
 
 use kernel::{device, prelude::*};
