@@ -5,7 +5,8 @@
 //! The firmware's kernel root (the TABLES region, ADT `gpu-region`) and the shared L2 page are
 //! not System RAM, so the shared page-table code cannot walk them. The design:
 //!
-//! 1. Map handoff, TTBAT, kernel root page and shared L2 write-combined. PPL exchange: write the
+//! 1. Map handoff, TTBAT, kernel root page and shared L2 (write-combined carveouts, or the
+//!    kernel's mapping of reserved System RAM, [`Mapping::region`]). PPL exchange: write the
 //!    AP magic, `cur_slot = 0xffffffff`, zero the 65 flush entries and `+0x640`, then poll the
 //!    firmware magic (1 s).
 //! 2. `mmu::Uat::new_adopted` with `kernel_root = TABLES`: user VMs and the kernel lower VM get
@@ -197,13 +198,13 @@ pub(crate) struct Window {
 }
 
 impl Window {
-    /// Maps the UAT handoff regions write-combined.
+    /// Maps the UAT handoff regions ([`Mapping::region`]).
     pub(crate) fn new(adt: &super::adt::GpuAdt) -> Result<Self> {
         Ok(Self {
-            handoff: Mapping::write_combined(adt.handoff.start, hw::HANDOFF_SIZE as usize)?,
-            ttbs: Mapping::write_combined(adt.ttbs.start, hw::TTBS_SIZE as usize)?,
-            root: Mapping::write_combined(adt.tables.start, hw::PAGE as usize)?,
-            shared_l2: Mapping::write_combined(adt.shared_l2.start, hw::SHARED_L2_SIZE as usize)?,
+            handoff: Mapping::region(adt.handoff.start, hw::HANDOFF_SIZE as usize)?,
+            ttbs: Mapping::region(adt.ttbs.start, hw::TTBS_SIZE as usize)?,
+            root: Mapping::region(adt.tables.start, hw::PAGE as usize)?,
+            shared_l2: Mapping::region(adt.shared_l2.start, hw::SHARED_L2_SIZE as usize)?,
             image: KVec::from_elem(0u64, ENTRIES, GFP_KERNEL)?,
             snapshot: KVec::from_elem(0u64, ENTRIES, GFP_KERNEL)?,
         })

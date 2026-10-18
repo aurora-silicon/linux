@@ -63,6 +63,7 @@ pub(crate) mod glue {
         fn asahi_g15_module_get();
         fn asahi_g15_adt_phram(start: *mut u64, size: *mut u64) -> core::ffi::c_int;
         fn asahi_g15_ram_disjoint(start: u64, size: u64) -> bool;
+        fn asahi_g15_ram_within(start: u64, size: u64) -> bool;
         fn asahi_g15_ioremap_wc(start: u64, size: usize) -> *mut core::ffi::c_void;
         fn asahi_g15_dma_coherent(dev: *mut core::ffi::c_void) -> bool;
     }
@@ -120,6 +121,12 @@ pub(crate) mod glue {
     pub(crate) fn ram_disjoint(start: u64, size: u64) -> bool {
         // SAFETY: Only queries the resource tree.
         unsafe { asahi_g15_ram_disjoint(start, size) }
+    }
+
+    /// The physical range lies entirely in System RAM.
+    pub(crate) fn ram_within(start: u64, size: u64) -> bool {
+        // SAFETY: Only queries the resource tree.
+        unsafe { asahi_g15_ram_within(start, size) }
     }
 
     /// Whether the device's DMA mappings skip cache maintenance.

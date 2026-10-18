@@ -51,6 +51,8 @@ enum Kind {
     Device,
     /// `memremap(MEMREMAP_WC)`: normal non-cacheable memory.
     WriteCombined,
+    /// `memremap(MEMREMAP_WB)`: System RAM through the kernel's own mapping.
+    WriteBack,
 }
 
 /// A CPU mapping of a physical range that is not System RAM, accessed with the `readl`/`writel`
@@ -115,6 +117,30 @@ impl Mapping {
         })
     }
 
+    /// Maps a boot-loader region the firmware shares with the host: write-combined when it is
+    /// a carveout outside System RAM (the T6030 regions), through the kernel's cacheable
+    /// mapping when it is a reserved-memory region inside System RAM (the T6031 regions, which
+    /// the earlier driver of that SoC used the same way).
+    pub(crate) fn region(phys: u64, size: usize) -> Result<Self> {
+        if size == 0 {
+            return Err(EINVAL);
+        }
+        if !super::boot::glue::ram_within(phys, size as u64) {
+            return Self::write_combined(phys, size);
+        }
+        // SAFETY: memremap() of System RAM with MEMREMAP_WB returns its existing mapping; the
+        // range is a reserved-memory region of the GPU node that nothing else uses.
+        let addr = unsafe { bindings::memremap(phys, size, bindings::MEMREMAP_WB as _) };
+        if addr.is_null() {
+            return Err(ENOMEM);
+        }
+        Ok(Self {
+            raw: MmioRaw::new(addr as usize, size)?,
+            phys,
+            kind: Kind::WriteBack,
+        })
+    }
+
     /// The `readl`/`writel` accessors of this mapping.
     pub(crate) fn io(&self) -> &Mmio {
         // SAFETY: By the type invariant `raw` describes a live mapping of `maxsize` bytes.
@@ -133,7 +159,9 @@ impl Drop for Mapping {
         unsafe {
             match self.kind {
                 Kind::Device => bindings::iounmap(self.raw.addr() as *mut _),
-                Kind::WriteCombined => bindings::memunmap(self.raw.addr() as *mut _),
+                Kind::WriteCombined | Kind::WriteBack => {
+                    bindings::memunmap(self.raw.addr() as *mut _)
+                }
             }
         }
     }

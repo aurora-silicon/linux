@@ -2298,9 +2298,22 @@ impl Uat {
         // `raw` describes a valid memory range.
         let res: io::resource::Resource =
             unsafe { core::mem::transmute(kernel::types::Opaque::new(raw)) };
+        // A carveout outside System RAM is mapped write-combined; a reserved-memory region
+        // inside System RAM (mapped by the kernel) through the kernel's own mapping, as
+        // `map_region` does for the other generations.
+        extern "C" {
+            fn asahi_g15_ram_within(start: u64, size: u64) -> bool;
+        }
+        // SAFETY: Only queries the resource tree (`g15/glue.c`).
+        let ram = unsafe { asahi_g15_ram_within(range.start, size as u64) };
+        let flags = if ram {
+            io::mem::MemFlag::WB
+        } else {
+            io::mem::MemFlag::WC
+        };
         // SAFETY: The UAT regions are only accessed through this mapping by the CPU; the GPU
         // reaches them through its own translation.
-        let map = unsafe { io::mem::Mem::try_new(res, io::mem::MemFlag::WC.into()) }?;
+        let map = unsafe { io::mem::Mem::try_new(res, flags.into()) }?;
         Ok(UatRegion {
             base: range.start,
             map,

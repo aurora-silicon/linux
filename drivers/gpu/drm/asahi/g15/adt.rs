@@ -25,8 +25,9 @@
 //! `ttbs`, `pagetables`, `handoff` and `pagetables-l2` (the UAT regions), `fw-text` and
 //! `fw-data` (the loaded segments, no-map), `apple,firmware-segment-vas` (their two VAs) and
 //! the `operating-points-v2` table (one `opp-hz` per performance state, `opp-microvolt` with
-//! one cell per cluster). The same admission applies, without the DRAM bounds (the regions are
-//! reserved memory the kernel already knows).
+//! one cell per cluster). The same admission applies, without the DRAM bounds, and the four UAT
+//! regions may lie in System RAM: they are reserved-memory nodes without `no-map`, which the
+//! kernel maps, so the driver reaches them through its own mapping ([`super::regs::Mapping`]).
 
 use core::ops::Range;
 use kernel::{c_str, device, prelude::*};
@@ -294,7 +295,7 @@ fn parse(dev: &device::Device, adt: &Adt<'_>) -> Result<GpuAdt> {
         return Err(EINVAL);
     };
     // Structural admission: the ADT says where; this checks it is sane.
-    admit_regions(dev, &region, Some(dram_base..dram_base + dram_size))?;
+    admit_regions(dev, &region, Some(dram_base..dram_base + dram_size), false)?;
     let [ttbs, tables, handoff, shared_l2, text, data] = region;
     let mut out = GpuAdt {
         ttbs,
@@ -312,8 +313,16 @@ fn parse(dev: &device::Device, adt: &Adt<'_>) -> Result<GpuAdt> {
 }
 
 /// Structural admission of the six regions (same order as [`REGION_NAMES`]): page-aligned,
-/// addressable, the fixed UAT sizes, disjoint from System RAM and from each other.
-fn admit_regions(dev: &device::Device, region: &[Range<u64>; 6], dram: Option<Range<u64>>) -> Result {
+/// addressable, the fixed UAT sizes, disjoint from each other, and either outside System RAM
+/// (the T6030 carveouts) or, with `reserved_ram` and for the four UAT regions only, lying
+/// entirely in System RAM as reserved memory the GPU node names (the T6031 device tree). The
+/// firmware segments are always outside System RAM.
+fn admit_regions(
+    dev: &device::Device,
+    region: &[Range<u64>; 6],
+    dram: Option<Range<u64>>,
+    reserved_ram: bool,
+) -> Result {
     let fixed = [
         hw::TTBS_SIZE,
         hw::TABLES_SIZE,
@@ -328,12 +337,17 @@ fn admit_regions(dev: &device::Device, region: &[Range<u64>; 6], dram: Option<Ra
             Some(dram) => r.start < dram.start || end > dram.end - 1,
             None => false,
         };
+        let placed = if reserved_ram && i < 4 {
+            glue::ram_disjoint(r.start, size) || glue::ram_within(r.start, size)
+        } else {
+            glue::ram_disjoint(r.start, size)
+        };
         if size == 0
             || (r.start | size) & (hw::PAGE - 1) != 0
             || end > (hw::PA_MASK | (hw::PAGE - 1))
             || outside_dram
             || (i < 4 && size != fixed[i])
-            || !glue::ram_disjoint(r.start, size)
+            || !placed
         {
             dev_err!(
                 dev,
@@ -384,7 +398,7 @@ fn from_device_tree(dev: &device::Device) -> Result<GpuAdt> {
         dev_err!(dev, "GPU firmware segment VAs are not the firmware ABI's\n");
         return Err(EINVAL);
     }
-    admit_regions(dev, &region, None)?;
+    admit_regions(dev, &region, None, true)?;
     let [ttbs, tables, handoff, shared_l2, text, data] = region;
     let mut out = GpuAdt {
         ttbs,

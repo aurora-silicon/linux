@@ -22,6 +22,7 @@ void asahi_g15_hold_power(struct device *dev);
 void asahi_g15_module_get(void);
 int asahi_g15_adt_phram(u64 *start, u64 *size);
 bool asahi_g15_ram_disjoint(u64 start, u64 size);
+bool asahi_g15_ram_within(u64 start, u64 size);
 void __iomem *asahi_g15_ioremap_wc(u64 start, size_t size);
 bool asahi_g15_dma_coherent(struct device *dev);
 
@@ -105,6 +106,13 @@ bool asahi_g15_ram_disjoint(u64 start, u64 size)
 bool asahi_g15_dma_coherent(struct device *dev)
 {
 	return dev_is_dma_coherent(dev);
+}
+
+/* The range lies entirely in System RAM (a reserved-memory region the kernel maps). */
+bool asahi_g15_ram_within(u64 start, u64 size)
+{
+	return region_intersects(start, size, IORESOURCE_SYSTEM_RAM, IORES_DESC_NONE) ==
+	       REGION_INTERSECTS;
 }
 
 /* The inherited RTKit buffer inside firmware DATA. */
