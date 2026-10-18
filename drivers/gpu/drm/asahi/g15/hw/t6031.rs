@@ -120,20 +120,34 @@ pub(crate) const CONFIG: Config = Config {
         version: 0x07041100,
         counts: 0x0021040a,
     }],
-    // The stub the macOS 14.7 boot chain of this J516C leaves loaded (RTKit-2419.140.12). A
-    // J516C started through a macOS 14.8.x chain carries another stub, not pinned yet
-    // (`g15_accept_text_prefix` admits it for one boot and logs its digest).
-    firmware: &[FirmwareBuild {
-        name: "macOS 14.7 stub firmware (iBoot-10151.140.19.700.2), J516C",
-        text_size: 0x64000,
-        data_size: 0x140000,
-        marker: 0x5cf28,
-        text_sha256: [
-            0xc2, 0x6e, 0xc8, 0x9c, 0x11, 0x50, 0xeb, 0x65, 0x49, 0xcf, 0x60, 0x2e, 0x01, 0x2d,
-            0x0c, 0x5f, 0x49, 0xeb, 0x75, 0x6e, 0x89, 0x6d, 0x6b, 0xb8, 0x34, 0x2c, 0xb2, 0xc5,
-            0xd9, 0x8b, 0x33, 0x2c,
-        ],
-    }],
+    // The stubs the boot chains of this J516C leave loaded (RTKit-2419.140.12): the macOS 14.7
+    // chain's and the macOS 14.8 boot volume's. Same segment sizes and marker; the layout, board
+    // images and initdata below do not depend on which one is loaded. A further build can be
+    // admitted for one boot with `g15_accept_text_prefix`, which logs its digest.
+    firmware: &[
+        FirmwareBuild {
+            name: "macOS 14.7 stub firmware (iBoot-10151.140.19.700.2), J516C",
+            text_size: 0x64000,
+            data_size: 0x140000,
+            marker: 0x5cf28,
+            text_sha256: [
+                0xc2, 0x6e, 0xc8, 0x9c, 0x11, 0x50, 0xeb, 0x65, 0x49, 0xcf, 0x60, 0x2e, 0x01,
+                0x2d, 0x0c, 0x5f, 0x49, 0xeb, 0x75, 0x6e, 0x89, 0x6d, 0x6b, 0xb8, 0x34, 0x2c,
+                0xb2, 0xc5, 0xd9, 0x8b, 0x33, 0x2c,
+            ],
+        },
+        FirmwareBuild {
+            name: "macOS 14.8 stub firmware, J516C",
+            text_size: 0x64000,
+            data_size: 0x140000,
+            marker: 0x5cf28,
+            text_sha256: [
+                0x1b, 0xf2, 0xfd, 0x34, 0x76, 0xbe, 0xfe, 0x73, 0x6b, 0xc2, 0xc0, 0x70, 0xba,
+                0xd4, 0x5f, 0x8b, 0xe3, 0x6b, 0x68, 0xcd, 0x11, 0xbc, 0xff, 0x16, 0xc9, 0x02,
+                0x9d, 0x6b, 0xcd, 0xa0, 0x26, 0xcf,
+            ],
+        },
+    ],
     machine: kernel::c_str!("apple,t6031"),
     platform: super::Platform::DeviceTree,
     layout: &LAYOUT,
