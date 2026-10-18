@@ -638,6 +638,7 @@ impl Firmware {
         let r = &self.graph.render;
         let a = self.pools.allocator_refs();
         RenderRefs {
+            hwdata: self.cfg.layout.hwdata_va,
             notifier: r.notifier.va,
             legacy_empty: r.legacy_empty.va,
             qinfo: [r.qinfo[0].va, r.qinfo[1].va],
@@ -1085,6 +1086,7 @@ impl Firmware {
         let s = &scrub.compute[index];
         let g = &self.graph.compute;
         let refs = ComputeRefs {
+            hwdata: self.cfg.layout.hwdata_va,
             notifier: g.notifier.va,
             qinfo: g.qinfo.va,
             user_stamp: g.user_stamp.va,
@@ -1108,6 +1110,7 @@ impl Firmware {
         let (w, q) = (&mut scratch.cw, &mut scratch.cq);
         encode::encode_compute(
             &refs,
+            &self.cfg.compute,
             &cmd.cmd,
             &cmd.attachments,
             ts,

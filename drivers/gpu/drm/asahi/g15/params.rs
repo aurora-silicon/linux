@@ -79,7 +79,13 @@ pub(crate) fn fill(gpu: &Gpu, params: &mut uapi::drm_asahi_params_global) -> Res
     params.usc_generation = 3;
     params.gpu_hal_generation = uapi::drm_asahi_gpu_hal_generation_DRM_ASAHI_GPU_HAL_LEGACY;
     params.max_attachments = hw::sizes::MAX_ATTACHMENTS as u32;
-    for (i, mask) in gpu.id.core_masks.iter().enumerate() {
+    for (i, mask) in gpu
+        .id
+        .core_masks
+        .iter()
+        .enumerate()
+        .take(gpu.cfg.num_clusters as usize)
+    {
         *(params.core_masks.get_mut(i).ok_or(EIO)?) = (*mask).into();
     }
     Ok(())

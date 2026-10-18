@@ -57,7 +57,7 @@ use kernel::{
 use logic::{Failure, HangAction, HangInputs};
 
 use super::fw::channels::{devctl, DevCtl, RING_SLOTS};
-use super::fw::initdata::{control, globals, hwdata};
+use super::fw::initdata::{control, globals};
 use super::hw::{sizes, tuning};
 use super::job::{Completions, Job};
 use super::{params, Firmware};
@@ -530,7 +530,7 @@ impl Firmware {
             self.init
                 .hwdata
                 .as_ref()
-                .and_then(|hw| hw.r32(hwdata::FAULT_INFO + offset).ok())
+                .and_then(|hw| hw.r32(self.cfg.layout.hwdata_view + offset).ok())
                 .unwrap_or(0)
         };
         dev_info!(

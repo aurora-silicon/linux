@@ -27,6 +27,7 @@ use super::fw::initdata::{
 use super::hw::{self, va};
 use super::identity::Hex;
 use super::object::{Class, FwObject, Objects, Placement, Request};
+use super::Config;
 
 /// The built initdata graph.
 pub(crate) struct InitData {
@@ -117,36 +118,41 @@ fn put64(b: &mut [u8], offset: usize, value: u64) -> Result {
 /// Nothing is published here.
 pub(crate) fn build(
     dev: &device::Device,
+    cfg: &Config,
     adt: &GpuAdt,
     objects: &mut Objects,
 ) -> Result<(InitData, Channels, u32)> {
     let mut init = InitData::new();
     let fw = Class::Fw;
+    let layout = cfg.layout;
+    let hwdata_va = layout.hwdata_va;
 
     // Owned objects and channels.
     let root_obj = canonical(objects, va::ROOT, root::SIZE, fw)?;
     let region_a_obj = canonical(objects, va::REGION_A, region_a::SIZE, fw)?;
     let runtime_obj = canonical(objects, va::RUNTIME, runtime::SIZE, fw)?;
-    // Activity records cached; fault info and HardwareDataA timestamps not.
-    let hwdata_obj = objects.alloc_split(
-        Request {
-            size: hwdata::SIZE,
-            class: fw,
-            placement: Placement::At(va::HWDATA),
-            offset: 0,
-            client: None,
-            lower: None,
-            cpu: true,
-        },
-        Some((
-            (va::HWDATA as usize & (hw::PAGE as usize - 1)) + hwdata::CACHED,
-            if hw::tuning::HWDATA_CACHED {
-                Class::FwCached
-            } else {
-                fw
+    // Activity records cached; fault info and HardwareDataA timestamps not (T6030), or the
+    // whole record cached (a layout without a cached prefix).
+    let cached = if hw::tuning::HWDATA_CACHED {
+        Class::FwCached
+    } else {
+        fw
+    };
+    let hwdata_obj = match layout.hwdata_cached {
+        Some(prefix) => objects.alloc_split(
+            Request {
+                size: layout.hwdata_size,
+                class: fw,
+                placement: Placement::At(hwdata_va),
+                offset: 0,
+                client: None,
+                lower: None,
+                cpu: true,
             },
-        )),
-    )?;
+            Some(((hwdata_va as usize & (hw::PAGE as usize - 1)) + prefix, cached)),
+        )?,
+        None => canonical(objects, hwdata_va, layout.hwdata_size, cached)?,
+    };
     let pair_obj = canonical(objects, va::PAIR, pair::SIZE, fw)?;
     let small_obj = canonical(objects, va::SMALL, small::SIZE, fw)?;
     let c0 = canonical(objects, va::C0, cbuf::C0_SIZE, Class::Shared)?;
@@ -158,11 +164,14 @@ pub(crate) fn build(
     let flags_obj = canonical(objects, va::FLAGS, flags::SIZE, fw)?;
     let channels = Channels::alloc(objects)?;
     // Firmware Device RW aliases for the IOMapping table.
-    for map in hw::IOMAPS.iter() {
+    for map in layout.iomaps.iter() {
         objects.map_mmio(map.va, map.pa, map.map_bytes)?;
     }
 
     // Board images, verified, then the owned replacements.
+    if cfg.board != hw::Board::Templates || layout.hwdata_size != hwdata::SIZE {
+        return Err(ENODEV);
+    }
     let mut hw_img = KVVec::from_elem(0u8, hwdata::SIZE, GFP_KERNEL)?;
     let mut glob = KVVec::from_elem(0u8, globals::SIZE, GFP_KERNEL)?;
     let mut pwr = KVVec::from_elem(0u8, power::SIZE, GFP_KERNEL)?;
@@ -197,7 +206,7 @@ pub(crate) fn build(
         dev_info!(dev, "board data sha256 {}\n", Hex(&glue::sha256(&hw_img)));
     }
     put64(&mut hw_img, hwdata::TTBAT, adt.ttbs.start)?;
-    for map in hw::IOMAPS.iter() {
+    for map in layout.iomaps.iter() {
         put64(
             &mut hw_img,
             hwdata::IOMAPS + hwdata::IOMAP_STRIDE * map.slot as usize + hwdata::IOMAP_VA,
@@ -238,7 +247,7 @@ pub(crate) fn build(
 
     // Root.
     let r = &root_obj;
-    r.w64(0x00, root::MAGIC)?;
+    r.w64(0x00, layout.root_magic)?;
     r.w64(root::REGION_A, va::REGION_A)?;
     r.w64(root::RUNTIME, va::RUNTIME)?;
     r.w64(root::GLOBALS, va::GLOBALS)?;
@@ -260,7 +269,7 @@ pub(crate) fn build(
 
     // Runtime pointers.
     let rt = &runtime_obj;
-    rt.w64(runtime::HWDATA, va::HWDATA)?;
+    rt.w64(runtime::HWDATA, hwdata_va)?;
     rt.w64(runtime::PAIR, va::PAIR)?;
     rt.w64(runtime::PAIR2, va::PAIR)?;
     for i in 0..13u64 {
@@ -288,17 +297,17 @@ pub(crate) fn build(
     rt.w64(runtime::SMALL, va::SMALL)?;
     rt.w64(
         runtime::TA_ACTIVITY,
-        va::HWDATA + hwdata::TA_ACTIVITY as u64,
+        hwdata_va + hwdata::TA_ACTIVITY as u64,
     )?;
     rt.w64(
         runtime::FS_ACTIVITY,
-        va::HWDATA + hwdata::FS_ACTIVITY as u64,
+        hwdata_va + hwdata::FS_ACTIVITY as u64,
     )?;
     rt.w64(
         runtime::COMPUTE_ACTIVITY,
-        va::HWDATA + hwdata::COMPUTE_ACTIVITY as u64,
+        hwdata_va + hwdata::COMPUTE_ACTIVITY as u64,
     )?;
-    rt.w64(runtime::FAULT_INFO, va::HWDATA + hwdata::FAULT_INFO as u64)?;
+    rt.w64(runtime::FAULT_INFO, hwdata_va + layout.hwdata_view as u64)?;
     rt.w64(runtime::C0, va::C0)?;
     rt.w64(runtime::C1, va::C1)?;
     rt.w64(runtime::C1_2, va::C1)?;
@@ -306,7 +315,7 @@ pub(crate) fn build(
     rt.w64(runtime::C3_2, va::C3)?;
     rt.w32(runtime::UNK_2D0, 4)?;
     rt.w32(runtime::UNK_3B0, 0xff)?;
-    rt.w64(runtime::HWDATA_A, va::HWDATA + hwdata::HWDATA_A as u64)?;
+    rt.w64(runtime::HWDATA_A, hwdata_va + hwdata::HWDATA_A as u64)?;
 
     // Control and flags.
     let c = &control_obj;

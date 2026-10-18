@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * G15 (T6030, M3 Pro) helpers that have no Rust bindings: static inlines,
+ * G15 (T6030/T6031, M3 Pro/Max) helpers that have no Rust bindings: static inlines,
  * macros and THIS_MODULE. Built only with CONFIG_DRM_ASAHI_G15.
  */
 #include <crypto/sha2.h>
@@ -17,6 +17,7 @@
 
 void asahi_g15_sha256(const u8 *data, size_t len, u8 *out);
 bool asahi_g15_board(void);
+bool asahi_g15_machine(const char *compatible);
 void asahi_g15_hold_power(struct device *dev);
 void asahi_g15_module_get(void);
 int asahi_g15_adt_phram(u64 *start, u64 *size);
@@ -34,6 +35,12 @@ void asahi_g15_sha256(const u8 *data, size_t len, u8 *out)
 bool asahi_g15_board(void)
 {
 	return apple_pmp_t6030_board();
+}
+
+/* Whether the machine carries this compatible (of_machine_is_compatible()). */
+bool asahi_g15_machine(const char *compatible)
+{
+	return of_machine_is_compatible(compatible) > 0;
 }
 
 /*

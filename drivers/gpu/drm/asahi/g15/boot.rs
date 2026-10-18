@@ -2,14 +2,16 @@
 
 //! Admission and firmware start to READY.
 //!
-//! Admission (no firmware-visible writes): T6030 board check (`apple_pmp_t6030_board`), PMP
-//! supplier (`apple_pmp_j514s_gpu_prepare`, may return EPROBE_DEFER), ADT regions and segments
-//! ([`super::adt`]), exact firmware TEXT identity ([`super::identity`]), MMIO windows, runtime-PM
-//! hold of the GFX domain.
+//! Admission (no firmware-visible writes): machine check (the T6030 board check
+//! `apple_pmp_t6030_board`, or the SoC's machine compatible), the PMP supplier on a SoC with
+//! the PMP AGX vote (`apple_pmp_j514s_gpu_prepare`, may return EPROBE_DEFER), the GPU regions and
+//! segments ([`super::adt`]: the ADT export, or the GPU device tree node), exact firmware TEXT
+//! identity ([`super::identity`]), MMIO windows, runtime-PM hold of the GFX domain.
 //!
-//! Start: PMP AGX vote (`apple_pmp_j514s_gpu_get`), hardware identity and core masks, `sgx_open`
+//! Start: PMP AGX vote (`apple_pmp_j514s_gpu_get`) where the SoC takes one, hardware identity
+//! and core masks (one word, or two above 32 core slots), `sgx_open`
 //! 0x70001, cold-only check (ASC RUN clear, TTBAT all zero), UAT adoption and the PTE self-check
-//! (nothing firmware-visible yet), RTKit init (mailbox "mbox"), wake, endpoints 0x20/0x21,
+//! (nothing firmware-visible yet), RTKit init (the node's mailbox), wake, endpoints 0x20/0x21,
 //! PPL/UAT bootstrap ([`super::uat`]), initdata graph ([`super::initdata`]), EP 0x20
 //! `0x0081 << 48 | ROOT`, DEVCTL 0x13 then 9, readiness (`Runtime+0x314 == 0xabcdabcd` and
 //! `Flags+4 == 1`, 2 s, draining rings), DEVCTL 0x13 again.
@@ -56,6 +58,7 @@ pub(crate) mod glue {
     extern "C" {
         fn asahi_g15_sha256(data: *const u8, len: usize, out: *mut u8);
         fn asahi_g15_board() -> bool;
+        fn asahi_g15_machine(compatible: *const core::ffi::c_char) -> bool;
         fn asahi_g15_hold_power(dev: *mut core::ffi::c_void);
         fn asahi_g15_module_get();
         fn asahi_g15_adt_phram(start: *mut u64, size: *mut u64) -> core::ffi::c_int;
@@ -76,6 +79,12 @@ pub(crate) mod glue {
     pub(crate) fn board() -> bool {
         // SAFETY: Reads the machine compatible strings only.
         unsafe { asahi_g15_board() }
+    }
+
+    /// Whether the machine carries `compatible` (`of_machine_is_compatible()`).
+    pub(crate) fn machine(compatible: &CStr) -> bool {
+        // SAFETY: Reads the machine compatible strings only; the string is NUL-terminated.
+        unsafe { asahi_g15_machine(compatible.as_char_ptr()) }
     }
 
     /// Holds the GFX power domain for the retained session.
@@ -264,18 +273,20 @@ unsafe impl Send for Rtkit {}
 unsafe impl Sync for Rtkit {}
 
 impl Rtkit {
-    /// Initializes RTKit on mailbox "mbox" (not device-managed: retained).
-    fn new(dev: &device::Device, shared: &Arc<Shared>) -> Result<Self> {
+    /// Initializes RTKit on the GPU node's mailbox (not device-managed: retained): the one
+    /// named "mbox" where the node names its mailboxes (the synthesized T6030 node), else the
+    /// first.
+    fn new(dev: &device::Device, shared: &Arc<Shared>, named: bool) -> Result<Self> {
         let cookie = Arc::into_raw(shared.clone()) as *mut c_void;
-        // SAFETY: `dev` is valid, the name is a NUL-terminated string and the ops are static.
+        let name = if named {
+            c_str!("mbox").as_char_ptr()
+        } else {
+            core::ptr::null()
+        };
+        // SAFETY: `dev` is valid, the name is a NUL-terminated string or null and the ops are
+        // static.
         let rtk = from_err_ptr(unsafe {
-            bindings::apple_rtkit_init(
-                dev.as_raw(),
-                cookie,
-                c_str!("mbox").as_char_ptr(),
-                0,
-                &RTKIT_OPS,
-            )
+            bindings::apple_rtkit_init(dev.as_raw(), cookie, name, 0, &RTKIT_OPS)
         });
         match rtk {
             // INVARIANT: The cookie stays leaked from here on.
@@ -397,24 +408,38 @@ pub(crate) fn admit(
     res: shared_regs::Resources,
 ) -> Result<Admitted> {
     let dev = pdev.as_ref();
-    if !glue::board() {
+    let pmp = cfg.platform == hw::Platform::AdtWithPmp;
+    if pmp {
+        if !glue::board() {
+            return Err(ENODEV);
+        }
+        // Retain the PMP supplier (and its AGX bridge) before any vote.
+        // SAFETY: `dev` is the bound GPU device.
+        let ret = unsafe { bindings::apple_pmp_j514s_gpu_prepare(dev.as_raw()) };
+        if ret != 0 {
+            let err = Error::from_errno(ret);
+            if err != EPROBE_DEFER {
+                dev_err!(dev, "PMP supplier not ready: {:?}\n", err);
+            }
+            return Err(err);
+        }
+    } else if !glue::machine(cfg.machine) {
+        dev_err!(dev, "G15: not a {} machine\n", cfg.name);
         return Err(ENODEV);
     }
-    // Retain the PMP supplier (and its AGX bridge) before any vote.
-    // SAFETY: `dev` is the bound GPU device.
-    let ret = unsafe { bindings::apple_pmp_j514s_gpu_prepare(dev.as_raw()) };
-    if ret != 0 {
-        let err = Error::from_errno(ret);
-        if err != EPROBE_DEFER {
-            dev_err!(dev, "PMP supplier not ready: {:?}\n", err);
-        }
-        return Err(err);
-    }
-    let adt =
-        adt::read(dev).inspect_err(|e| dev_err!(dev, "ADT GPU regions not admitted: {:?}\n", e))?;
+    let adt = adt::read(dev, cfg)
+        .inspect_err(|e| dev_err!(dev, "GPU regions not admitted: {:?}\n", e))?;
     identity::firmware(dev, &adt, cfg.firmware)
         .inspect_err(|e| dev_err!(dev, "loaded GFX TEXT identity mismatch: {:?}\n", e))?;
     dev_info!(dev, "M3: firmware identity accepted\n");
+    if cfg.board == hw::Board::None {
+        dev_err!(
+            dev,
+            "G15: no board data for the {}; the firmware is left as the boot loader left it\n",
+            cfg.name
+        );
+        return Err(ENODEV);
+    }
     // Firmware objects are cleaned to the point of coherency by their DMA mapping: that needs
     // a device that is not DMA-coherent, as the synthesized node is.
     if glue::dma_coherent(dev) {
@@ -427,7 +452,7 @@ pub(crate) fn admit(
     let regs = regs::Regs::new(pdev, res)?;
     // Keep the GFX domain powered for the whole (retained) session.
     glue::hold_power(dev);
-    dev_info!(dev, "T6030 G15S admitted, ASC={:#x}\n", regs.asc_control()?);
+    dev_info!(dev, "{} admitted, ASC={:#x}\n", cfg.name, regs.asc_control()?);
     Ok(Admitted { regs, adt })
 }
 
@@ -445,6 +470,7 @@ fn devctl_op(
 /// From the wake to READY. On failure the caller keeps everything as an [`Orphan`].
 fn run(
     session: &mut Session,
+    cfg: &Config,
     objects: &mut Objects,
     events: &mut Events,
     built: &mut Option<(InitData, Channels, u32)>,
@@ -460,7 +486,7 @@ fn run(
     session.rtkit.start_endpoint(hw::ep::DOORBELL)?;
     let uat = session.uat.clone();
     objects.window.bootstrap(&dev, &uat)?;
-    let (init, channels, _) = built.insert(initdata::build(&dev, &session.adt, objects)?);
+    let (init, channels, _) = built.insert(initdata::build(&dev, cfg, &session.adt, objects)?);
     uat::tlbi_all();
     dev_info!(
         dev,
@@ -520,16 +546,19 @@ pub(crate) fn start(
 ) -> Result<Booted> {
     let Admitted { regs, adt } = admitted;
     let d: ARef<device::Device> = shared.dev.clone();
-    // SAFETY: `d` is the bound GPU device.
-    let ret = unsafe { bindings::apple_pmp_j514s_gpu_get(d.as_raw()) };
-    if ret != 0 {
-        dev_err!(d, "PMP AGX vote failed: {}\n", ret);
-        return Err(Error::from_errno(ret));
+    if cfg.platform == hw::Platform::AdtWithPmp {
+        // SAFETY: `d` is the bound GPU device.
+        let ret = unsafe { bindings::apple_pmp_j514s_gpu_get(d.as_raw()) };
+        if ret != 0 {
+            dev_err!(d, "PMP AGX vote failed: {}\n", ret);
+            return Err(Error::from_errno(ret));
+        }
     }
-    let id = regs.identity()?;
+    let id = regs.identity(cfg)?;
     dev_info!(
         d,
-        "M3 G15S: power acknowledged, version={:#x} counts={:#x} core-mask={:#x}\n",
+        "{}: power acknowledged, version={:#x} counts={:#x} core-mask={:#x}\n",
+        cfg.name,
         id.version,
         id.counts,
         id.cores
@@ -541,22 +570,32 @@ pub(crate) fn start(
     {
         dev_err!(
             d,
-            "unsupported G15S hardware: version {:#x} counts {:#x}\n",
+            "unsupported {} hardware: version {:#x} counts {:#x}\n",
+            cfg.name,
             id.version,
             id.counts
         );
         return Err(eproto());
     }
-    // Binning: any non-empty enabled set in each of the two clusters.
-    if id.core_masks[0] == 0 || id.core_masks[1] == 0 || id.cores >> (2 * hw::CLUSTER_BITS) != 0 {
-        dev_err!(d, "implausible G15S core mask {:#x}\n", id.cores);
+    // Binning: any non-empty enabled set in each cluster, nothing above the core slots.
+    let clusters = cfg.num_clusters as usize;
+    let slots = cfg.core_slots();
+    if clusters > regs::MAX_CLUSTERS
+        || id.core_masks[..clusters].iter().any(|m| *m == 0)
+        || (slots < 64 && id.cores >> slots != 0)
+    {
+        dev_err!(d, "implausible {} core mask {:#x}\n", cfg.name, id.cores);
         return Err(eproto());
+    }
+    let mut enabled = [0u32; regs::MAX_CLUSTERS];
+    for (count, mask) in enabled.iter_mut().zip(id.core_masks.iter()) {
+        *count = mask.count_ones();
     }
     dev_info!(
         d,
-        "M3 G15S: {} + {} cores enabled\n",
-        id.core_masks[0].count_ones(),
-        id.core_masks[1].count_ones()
+        "{}: cores enabled per cluster: {:?}\n",
+        cfg.name,
+        &enabled[..clusters]
     );
     regs.open()?;
     // Cold only: ASC RUN clear and an all-zero TTBAT before ownership.
@@ -580,7 +619,7 @@ pub(crate) fn start(
 
     // From here on the firmware is touched: nothing it can reach is freed.
     glue::retain_module();
-    let rtkit = match Rtkit::new(&d, shared) {
+    let rtkit = match Rtkit::new(&d, shared, cfg.platform == hw::Platform::AdtWithPmp) {
         Ok(rtkit) => rtkit,
         Err(e) => {
             core::mem::forget(objects);
@@ -601,7 +640,7 @@ pub(crate) fn start(
     let result = events
         .reserve()
         .and_then(|_| session.regs.set_asc_control(control | regs::ASC_RUN))
-        .and_then(|_| run(&mut session, &mut objects, &mut events, &mut built));
+        .and_then(|_| run(&mut session, cfg, &mut objects, &mut events, &mut built));
     if let Err(e) = result {
         dev_err!(
             d,

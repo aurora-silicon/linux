@@ -139,14 +139,19 @@ impl Drop for Mapping {
     }
 }
 
+/// Most clusters of a supported SoC.
+pub(crate) const MAX_CLUSTERS: usize = 4;
+
 /// Identification read at start.
 #[derive(Copy, Clone, Default)]
 pub(crate) struct Identity {
     pub(crate) version: u32,
     pub(crate) counts: u32,
-    /// Raw enabled-core mask and its per-cluster split (10 bits each).
-    pub(crate) cores: u32,
-    pub(crate) core_masks: [u32; 2],
+    /// Raw enabled-core mask (`+0xe01500`, and `+0xe01504` above 32 core slots) and its
+    /// per-cluster split ([`super::hw::CLUSTER_BITS`] each, cluster 0 lowest), one entry per
+    /// cluster of the SoC.
+    pub(crate) cores: u64,
+    pub(crate) core_masks: [u32; MAX_CLUSTERS],
 }
 
 /// Engine receipts: busy bit and the two fault banks.
@@ -197,17 +202,30 @@ impl Regs {
         })
     }
 
-    /// Reads the identification words and the enabled-core mask (after the AGX vote).
-    pub(crate) fn identity(&self) -> Result<Identity> {
+    /// Reads the identification words and the enabled-core mask (once the GPU is powered). A
+    /// SoC with more than 32 core slots carries the mask in two words.
+    pub(crate) fn identity(&self, cfg: &super::Config) -> Result<Identity> {
         let version = self.res.sgx_read32_at(SGX_ID)?;
         let counts = self.res.sgx_read32_at(SGX_ID + 0x10)?;
-        let cores = self.res.sgx_read32_at(SGX_CORE + 0x1500)?;
-        let mask = (1u32 << super::hw::CLUSTER_BITS) - 1;
+        let mut cores = u64::from(self.res.sgx_read32_at(SGX_CORE + 0x1500)?);
+        if cfg.core_slots() > 32 {
+            cores |= u64::from(self.res.sgx_read32_at(SGX_CORE + 0x1504)?) << 32;
+        }
+        let bits = super::hw::CLUSTER_BITS;
+        let mask = (1u64 << bits) - 1;
+        let mut core_masks = [0u32; MAX_CLUSTERS];
+        for (cluster, slot) in core_masks
+            .iter_mut()
+            .enumerate()
+            .take((cfg.num_clusters as usize).min(MAX_CLUSTERS))
+        {
+            *slot = ((cores >> (cluster as u32 * bits)) & mask) as u32;
+        }
         Ok(Identity {
             version,
             counts,
             cores,
-            core_masks: [cores & mask, (cores >> super::hw::CLUSTER_BITS) & mask],
+            core_masks,
         })
     }
 

@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! T6030 (G15S) hardware and firmware-ABI constants (layout values are shared by several
-//! modules; change one only together with its users). The tuned policy values are in
-//! [`tuning`].
+//! G15 hardware and firmware-ABI constants (layout values are shared by several modules; change
+//! one only together with its users). The qualified T6030 values are the module-level
+//! constants; what differs per SoC is a [`super::Config`] row ([`t6030`], [`t6031`]). The tuned
+//! policy values are in [`tuning`].
 
 use core::ops::Range;
+
+pub(crate) mod t6031;
 
 /// Identification register values of a qualified G15S.
 pub(crate) struct HwId {
@@ -24,12 +27,83 @@ pub(crate) struct FirmwareBuild {
     pub(crate) text_sha256: [u8; 32],
 }
 
+/// Where a SoC's GPU regions, firmware segments and performance states come from, and how its
+/// GPU is powered.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) enum Platform {
+    /// T6030: the boot loader's ADT export ([`super::adt`]), a GPU node synthesized by the PMP
+    /// handoff, and the PMP AGX vote through the J514S supplier.
+    AdtWithPmp,
+    /// The GPU node of the kernel device tree, filled by the boot loader (regions, firmware
+    /// segments and operating points); the GPU is powered by its power domain alone.
+    DeviceTree,
+}
+
+/// The source of the board images (HardwareData, Globals, Power) of a SoC.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) enum Board {
+    /// The hash-checked T6030 templates ([`super::board`]).
+    Templates,
+    /// No board data: admission refuses the SoC before anything firmware-visible.
+    None,
+}
+
+/// Per-SoC placement and size of the initdata objects that differ between G15 firmware
+/// builds; everything else keeps the canonical [`va`] values.
+pub(crate) struct Layout {
+    /// Root object version word.
+    pub(crate) root_magic: u64,
+    /// HardwareData VA, size, ASC-cached prefix (`None`: the whole object), and the offset of
+    /// the fourth HardwareDataB view (fault information).
+    pub(crate) hwdata_va: u64,
+    pub(crate) hwdata_size: usize,
+    pub(crate) hwdata_cached: Option<usize>,
+    pub(crate) hwdata_view: usize,
+    /// HardwareDataB IOMapping records.
+    pub(crate) iomaps: &'static [IoMap],
+}
+
+/// Compute command register values that scale with the cluster count.
+pub(crate) struct ComputeRegs {
+    /// Offset of the four saved-state pointers in the preemption buffer.
+    pub(crate) tail: u64,
+    /// UMA PTC (0xa599) and DUPM (0xd411).
+    pub(crate) ptc: u64,
+    pub(crate) dupm: u64,
+    /// The 0x1a0e9 word.
+    pub(crate) reg_1a0e9: u64,
+    /// Encode every command the way the first command of a fresh queue is encoded: zero
+    /// saved-state pointers and zero 0x12091/0x101d9.
+    pub(crate) fresh: bool,
+}
+
 /// The T6030 configuration.
 pub(crate) mod t6030 {
     use super::super::Config;
-    use super::{FirmwareBuild, HwId};
+    use super::{ComputeRegs, FirmwareBuild, HwId, Layout};
+
+    /// The qualified graph: the canonical VAs and sizes of [`super::va`] and
+    /// [`super::super::fw::initdata`].
+    pub(crate) const LAYOUT: Layout = Layout {
+        root_magic: super::super::fw::initdata::root::MAGIC,
+        hwdata_va: super::va::HWDATA,
+        hwdata_size: super::super::fw::initdata::hwdata::SIZE,
+        hwdata_cached: Some(super::super::fw::initdata::hwdata::CACHED),
+        hwdata_view: super::super::fw::initdata::hwdata::FAULT_INFO,
+        iomaps: &super::IOMAPS,
+    };
+
+    /// The two-cluster compute register values.
+    pub(crate) const COMPUTE: ComputeRegs = ComputeRegs {
+        tail: 0x1480,
+        ptc: 0x13200400020,
+        dupm: 0x200000001,
+        reg_1a0e9: 8,
+        fresh: false,
+    };
 
     pub(crate) const CONFIG: Config = Config {
+        name: "T6030 G15S",
         chip_id: 0x6030,
         gpu_variant: crate::hw::GpuVariant::S,
         gpu_revision: 0x11,
@@ -52,6 +126,11 @@ pub(crate) mod t6030 {
                 0x80, 0x02, 0x93, 0xd5,
             ],
         }],
+        machine: kernel::c_str!("apple,t6030"),
+        platform: super::Platform::AdtWithPmp,
+        layout: &LAYOUT,
+        board: super::Board::Templates,
+        compute: COMPUTE,
     };
 }
 
@@ -180,6 +259,7 @@ pub(crate) mod rings {
 }
 
 /// One HardwareDataB IOMapping record: firmware device alias of an MMIO range.
+#[derive(Copy, Clone)]
 pub(crate) struct IoMap {
     pub(crate) slot: u8,
     pub(crate) pa: u64,
