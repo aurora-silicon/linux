@@ -3,11 +3,15 @@
 //! Exact firmware and hardware identity.
 //!
 //! The firmware build is the SHA-256 of TEXT with the 8 entropy bytes after the single
-//! `GKTS\x08\0\0\0` marker zeroed, plus the segment sizes, looked up in
-//! [`super::hw::t6030::CONFIG`]`.firmware`; the hardware revision is checked against its
-//! `hw_ids` at start ([`super::boot`]). An unknown build or revision is refused with its measured
-//! identity. The canonical object VAs, the initdata graph, the board templates and the work
-//! layouts all belong to one build, so nothing is written before the build is identified.
+//! `GKTS\x08\0\0\0` marker zeroed, plus the segment sizes, looked up in the SoC
+//! configuration's `firmware` list; the hardware revision is checked against its `hw_ids` at
+//! start ([`super::boot`]). An unknown build or revision is refused with its measured identity.
+//! The canonical object VAs, the initdata graph, the board images and the work layouts all
+//! belong to one build, so nothing is written before the build is identified.
+//!
+//! Bring-up escape hatch: `g15_accept_text_prefix=<hex>` admits an unpinned build whose digest
+//! starts with those 8 bytes (the full digest and marker offset are logged, so that the build
+//! can be pinned by the next kernel).
 
 use kernel::{bindings, device, fmt, prelude::*};
 
@@ -49,12 +53,13 @@ pub(crate) fn copy_physical(phys: u64, size: usize) -> Result<KVVec<u8>> {
 /// The GKTS marker: the 8 bytes after it are per-boot entropy.
 const MARKER: [u8; 8] = [0x47, 0x4b, 0x54, 0x53, 0x08, 0, 0, 0];
 
-/// Identifies the loaded firmware build.
+/// Identifies the loaded firmware build: the pinned build, or `None` for a build admitted by
+/// its digest prefix (`g15_accept_text_prefix`).
 pub(crate) fn firmware(
     dev: &device::Device,
     adt: &super::adt::GpuAdt,
     builds: &'static [FirmwareBuild],
-) -> Result<&'static FirmwareBuild> {
+) -> Result<Option<&'static FirmwareBuild>> {
     let size = usize::try_from(adt.text.end - adt.text.start)?;
     let data_size = adt.data.end - adt.data.start;
     let mut copy = copy_physical(adt.text.start, size)?;
@@ -85,8 +90,21 @@ pub(crate) fn firmware(
             && build.text_sha256 == digest
         {
             dev_info!(dev, "GPU firmware build: {}\n", build.name);
-            return Ok(build);
+            return Ok(Some(build));
         }
+    }
+    let prefix = u64::from_be_bytes(digest[..8].try_into().map_err(|_| EINVAL)?);
+    let accepted = super::params::accept_text_prefix();
+    if accepted != 0 && accepted == prefix {
+        dev_warn!(
+            dev,
+            "GPU firmware build admitted by g15_accept_text_prefix: TEXT {:#x} DATA {:#x} GKTS {:#x} sha256 {}\n",
+            size,
+            data_size,
+            at,
+            Hex(&digest)
+        );
+        return Ok(None);
     }
     dev_err!(
         dev,

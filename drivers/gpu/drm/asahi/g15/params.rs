@@ -56,6 +56,11 @@ pub(crate) fn stream_gate() -> bool {
     *module_parameters::g15_stream_gate.value() != 0
 }
 
+/// The 8-byte TEXT digest prefix of an unpinned firmware build to admit (0: none).
+pub(crate) fn accept_text_prefix() -> u64 {
+    *module_parameters::g15_accept_text_prefix.value()
+}
+
 /// Whether FRAGMENT_BARRIERS is advertised and mapped to early tiling.
 pub(crate) fn early_tiling() -> bool {
     *module_parameters::g15_early_tiling.value() != 0
