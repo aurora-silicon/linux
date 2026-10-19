@@ -38,8 +38,8 @@ pub(crate) struct Ledger {
 pub(crate) const MAX_REFUSALS: u32 = 2;
 
 impl Ledger {
-    /// A fresh ledger. With growth, the initial size is clamped to 64..=2048 blocks and the
-    /// maximum to initial..=2048; without, both are the fixed 2048-block PB.
+    /// A fresh ledger. With growth, the initial size is clamped to 64..=4096 blocks and the
+    /// maximum to initial..=4096 (the caller passes 4095); without, both are the whole heap.
     pub(crate) const fn new(grow: bool, blocks: u32, max_blocks: u32) -> Self {
         let (initial, max) = if grow {
             let nb = clamp(blocks, MIN_BLOCKS, MAX_BLOCKS);
@@ -156,11 +156,11 @@ mod tests {
         assert_eq!(l.producer(), 1024);
         assert_eq!(Ledger::new(true, 10, 20).initial, 64);
         assert_eq!(Ledger::new(true, 10, 20).max, 64);
-        assert_eq!(Ledger::new(true, 4000, 100).initial, 2048);
+        assert_eq!(Ledger::new(true, 5000, 100).initial, 4096);
         assert_eq!(Ledger::new(true, 512, 1024).max, 1024);
         assert_eq!(Ledger::new(true, 512, 100).max, 512);
         let fixed = Ledger::new(false, 512, 1024);
-        assert_eq!((fixed.initial, fixed.max, fixed.posted), (2048, 2048, 2048));
+        assert_eq!((fixed.initial, fixed.max, fixed.posted), (4096, 4096, 4096));
     }
 
     #[test]

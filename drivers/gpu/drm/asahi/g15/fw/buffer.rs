@@ -2,7 +2,7 @@
 
 //! Parameter-buffer and UMA allocator records of the 2419 firmware.
 //!
-//! The PB is one 256 MiB heap of [`MAX_PAGES`] pages of 0x8000 bytes in [`MAX_BLOCKS`] blocks of
+//! The PB is one 512 MiB heap of [`MAX_PAGES`] pages of 0x8000 bytes in [`MAX_BLOCKS`] blocks of
 //! four pages. The firmware sees it through the page list (u32 records `G >> 15` of compact
 //! addresses `G = gva - 0x1000000000`, one per page), the block list (8-byte records, the low
 //! word `G >> 15` of the block's first page) and the PB manager P: P+0x28 = 4 * blocks pages,
@@ -21,8 +21,8 @@ pub(crate) const PAGE_BYTES: u64 = 0x8000;
 pub(crate) const PAGES_PER_BLOCK: u32 = 4;
 pub(crate) const BLOCK_BYTES: u64 = 0x20000;
 /// Blocks and pages of the mapped 256 MiB heap.
-pub(crate) const MAX_BLOCKS: u32 = 2048;
-pub(crate) const MAX_PAGES: u32 = 8192;
+pub(crate) const MAX_BLOCKS: u32 = 4096;
+pub(crate) const MAX_PAGES: u32 = 16384;
 /// Records of the 0x8000-byte block list: the truthful K.
 pub(crate) const BLOCK_LIST_RECORDS: u32 = 4096;
 /// Sizes of the page list and the block list.
@@ -275,7 +275,7 @@ mod tests {
         assert_eq!(block_record(HEAP, 1), 0xc18004);
         assert_eq!(block_record(HEAP, 2047), 0xc18000 + 4 * 2047);
         // The last page of the 256 MiB heap.
-        assert_eq!(page_record(HEAP, MAX_PAGES - 1), 0xc18000 + 8191);
+        assert_eq!(page_record(HEAP, MAX_PAGES - 1), 0xc18000 + 16383);
         assert_eq!(block_record_offset(0), 0);
         assert_eq!(block_record_offset(1023), 8 * 1023);
         assert_eq!(block_record_offset(4096), 0);
@@ -287,7 +287,7 @@ mod tests {
         );
         // The page list holds every page of the heap.
         assert!(MAX_PAGES as usize * 4 <= PAGE_LIST_SIZE);
-        assert_eq!(MAX_BLOCKS as u64 * BLOCK_BYTES, 0x10000000);
+        assert_eq!(MAX_BLOCKS as u64 * BLOCK_BYTES, 0x20000000);
     }
 
     #[test]

@@ -456,8 +456,8 @@ pub(crate) mod client {
     pub(crate) const CT_STRIDE: u64 = 0x1000000;
     pub(crate) const CT_SIZE: u64 = 0x400000;
     pub(crate) const PB_HEAP: u64 = 0x70c0000000;
-    pub(crate) const PB_HEAP_SIZE: u64 = 0x10000000;
-    pub(crate) const PB_BLOCK_LIST: u64 = 0x70e0000000;
+    pub(crate) const PB_HEAP_SIZE: u64 = 0x20000000;
+    pub(crate) const PB_BLOCK_LIST: u64 = 0x70f0000000;
     /// Compact-window objects (32-bit compact pointers: `gva - 0x1000000000`).
     pub(crate) const PRE0_PAGE: u64 = 0x1006080000;
     pub(crate) const PRE1_PAGE: u64 = 0x1006098000;
@@ -482,8 +482,8 @@ pub(crate) mod sizes {
     pub(crate) const CLUSTER_PB_PAGES: u32 = 0x3c;
     pub(crate) const MAX_ATTACHMENTS: usize = 16;
     pub(crate) const MAX_CLIENT: usize = 320;
-    pub(crate) const PB_PAGES: u32 = 8192;
-    pub(crate) const PB_BLOCKS: u32 = 2048;
+    pub(crate) const PB_PAGES: u32 = 16384;
+    pub(crate) const PB_BLOCKS: u32 = 4096;
     pub(crate) const PB_LIST_RECORDS: u32 = 4096;
     pub(crate) const PB_GROW_STEP: u32 = 10;
     /// Flights (published prefixes) in flight at most; the second must be of the same VM.
@@ -551,8 +551,10 @@ pub(crate) mod tuning {
     pub(crate) const MAX_INFLIGHT: u32 = 2;
     /// PB growth through event 7 / DEVCTL 7, initial and maximum blocks.
     pub(crate) const PB_GROW: bool = true;
-    pub(crate) const PB_BLOCKS: u32 = super::sizes::PB_BLOCKS / 2;
-    pub(crate) const PB_MAX_BLOCKS: u32 = super::sizes::PB_BLOCKS;
+    /// Initial PB blocks, and the most that may be posted: one below the mapped heap's block
+    /// count, so the block-list producer (modulo K = 4096) never returns to 0.
+    pub(crate) const PB_BLOCKS: u32 = 1024;
+    pub(crate) const PB_MAX_BLOCKS: u32 = super::sizes::PB_BLOCKS - 1;
     /// At the host deadline, arm the firmware kill.
     pub(crate) const HANG_PREEMPT: bool = true;
     /// Compute start-sequence MMU fault mask (unmapped stores absorbed).

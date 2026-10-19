@@ -606,7 +606,9 @@ impl Firmware {
         let ret = self.devctl(&reply, true);
         let ledger = self.pools.ledger;
         let soft = self.pools.soft_max();
-        let past_soft = n != 0 && ledger.posted > soft && ledger.posted - n <= soft;
+        // Every answer past the firmware's maximum is logged with its TA position: a scene
+        // that keeps asking at one position is a runaway, one that advances is large.
+        let past_soft = n != 0 && ledger.posted > soft;
         let info = self.pools.ledger.log_answer(request, n, ret.is_err()) || past_soft;
         let (counter, position) = (
             request[buffer::grow_request::COUNTER],

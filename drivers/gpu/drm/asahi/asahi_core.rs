@@ -148,8 +148,8 @@ module! {
             description: "G15: admit only known CDM/VDM stream records (0: bring-up only)",
         },
         g15_pb_max_blocks: u32 {
-            default: 1536,
-            description: "G15: parameter-buffer growth maximum given to the firmware, blocks of 128 KiB (64..2048; the mapped 2048 minus this answers partial renders)",
+            default: 3072,
+            description: "G15: parameter-buffer growth maximum given to the firmware, blocks of 128 KiB (64..4095; the mapped 4095 minus this answers partial renders)",
         },
         g15_early_tiling: u32 {
             default: 0,
