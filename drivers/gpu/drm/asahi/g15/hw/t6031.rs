@@ -8,8 +8,9 @@
 //! device tree node the boot loader fills, not an ADT export), the GPU power (its power domain;
 //! there is no PMP vote), the initdata root version, a longer HardwareData record (0xb480
 //! bytes, its fourth view at +0xb400) placed aligned and ASC-cached, the IOMapping table (17
-//! slots at the T6031 register blocks) and the board images: the hardware record from a
-//! firmware file, Globals and Power from the device tree, checked against that file. Every
+//! slots at the T6031 register blocks) and the board images, built from the device tree and
+//! checked against this machine's firmware file, which supplies the record's non-device-tree
+//! words. Every
 //! value was measured on a J516C: the SGX identification
 //! registers, the loaded firmware segment, the device tree the boot loader hands over and the
 //! initdata of that machine.
@@ -27,31 +28,47 @@ const IOMAP_BASE: u64 = 0xfffffc2068000000;
 const IOMAP_GAP: u64 = 0x4000;
 const PAGE: u64 = 0x4000;
 
-/// Mappings in slot order: slot, physical address, mapped bytes (rounded up to pages below).
-/// Slots 0 (Fender, 0x144000), 1 (AIC timer page), 2 (AIC software interrupts), 3 (RGX), 7,
-/// 9 (metrology sensors), 11 (memory cache, eight 0xd8000 instances), 12 (AIC banked
-/// registers), 18-20 (telemetry dashboard), 21, 24, 25 (ANE), 26 (PMS metrology), 28 and
-/// 29 (GPU clock generator at `sgx + 0xe1c000`). The board image carries each slot's
-/// physical address, sizes and access flag; the build checks them against this table.
-const SLOTS: [(u8, u64, u64); 17] = [
-    (0, SGX + 0xd0_0000, 0x14_4000),
-    (1, 0x2_0e10_0000, 0x4000),
-    (2, AIC + 0x1_4000, 0x4000),
-    (3, SGX, 0x2_0000),
-    (7, 0x2_9044_4000, 0x4000),
-    (9, SGX + 0xe0_8000, 0x8000),
-    (11, 0x2_2000_0000, 8 * 0xd_8000),
-    (12, AIC + 0x4_c000, 0x4000),
-    (18, 0x2_903d_0000, 0x4000),
-    (19, 0x2_903c_0000, 0x4000),
-    (20, 0x2_903d_8000, 0x4000),
-    (21, SGX + 0xeb_4000, 0x4000),
-    (24, SGX + 0x100_0000, 0x8000),
-    (25, 0x3_c945_c000, 0x4000),
-    (26, 0x2_9040_0000, 0x8000),
-    (28, 0x2_a4dc_0000, 0x2_4000),
-    (29, SGX + 0xe1_c000, 0x4000),
+/// Mappings in slot order: slot, physical address, mapped bytes (rounded up to pages below),
+/// element bytes, writable. Slots 0 (Fender, 0x144000), 1 (AIC timer page), 2 (AIC software
+/// interrupts), 3 (RGX), 7, 9 (metrology sensors), 11 (memory cache, eight 0xd8000
+/// instances), 12 (AIC banked registers), 18-20 (telemetry dashboard), 21, 24, 25 (ANE), 26
+/// (PMS metrology), 28 and 29 (GPU clock generator at `sgx + 0xe1c000`). The record carries
+/// each slot's physical address, sizes and access flag.
+const SLOTS: [(u8, u64, u64, u64, bool); 17] = [
+    (0, SGX + 0xd0_0000, 0x14_4000, 0x14_4000, true),
+    (1, 0x2_0e10_0000, 0x4000, 0x4000, false),
+    (2, AIC + 0x1_4000, 0x4000, 0x4000, true),
+    (3, SGX, 0x2_0000, 0x2_0000, true),
+    (7, 0x2_9044_4000, 0x4000, 0x4000, false),
+    (9, SGX + 0xe0_8000, 0x8000, 0x8000, true),
+    (11, 0x2_2000_0000, 8 * 0xd_8000, 0xd_8000, true),
+    (12, AIC + 0x4_c000, 0x4000, 0x4000, false),
+    (18, 0x2_903d_0000, 0x4000, 0x4000, true),
+    (19, 0x2_903c_0000, 0x4000, 0x4000, false),
+    (20, 0x2_903d_8000, 0x4000, 0x4000, true),
+    (21, SGX + 0xeb_4000, 0x4000, 0x4000, true),
+    (24, SGX + 0x100_0000, 0x8000, 0x8000, true),
+    (25, 0x3_c945_c000, 0x4000, 0x4000, true),
+    (26, 0x2_9040_0000, 0x8000, 0x8000, false),
+    (28, 0x2_a4dc_0000, 0x2_4000, 0x2_4000, false),
+    (29, SGX + 0xe1_c000, 0x4000, 0x4000, false),
 ];
+
+/// The record's per-slot sizes and access flags, in [`SLOTS`] order.
+const fn record_slots() -> [(u32, u32, bool); 17] {
+    let mut out = [(0, 0, false); 17];
+    let mut i = 0;
+    while i < SLOTS.len() {
+        let (_, _, total, element, writable) = SLOTS[i];
+        out[i] = (total as u32, element as u32, writable);
+        i += 1;
+    }
+    out
+}
+const RECORD_SLOTS: [(u32, u32, bool); 17] = record_slots();
+
+/// Unmapped slots whose IOMapping flag word the J516C record holds as 1.
+const RECORD_EMPTY_WRITABLE: [u8; 9] = [4, 6, 8, 10, 13, 14, 15, 16, 17];
 
 /// Packs the slots' firmware VAs: consecutive from [`IOMAP_BASE`], each mapping followed by one
 /// unmapped page.
@@ -66,7 +83,7 @@ const fn iomaps() -> [IoMap; 17] {
     let mut va = IOMAP_BASE;
     let mut i = 0;
     while i < SLOTS.len() {
-        let (slot, pa, bytes) = SLOTS[i];
+        let (slot, pa, bytes, _, _) = SLOTS[i];
         let delta = pa & (PAGE - 1);
         let map_bytes = (delta + bytes + PAGE - 1) & !(PAGE - 1);
         out[i] = IoMap {
@@ -96,13 +113,16 @@ pub(crate) const LAYOUT: Layout = Layout {
     hwdata_cached: None,
     hwdata_view: 0xb400,
     iomaps: &IOMAPS,
+    record_slots: &RECORD_SLOTS,
+    record_empty_writable: &RECORD_EMPTY_WRITABLE,
 };
 
 /// The J516C board file (`asahi/t6031-j516c-board.bin`, built into the kernel): the hardware
 /// record, Globals and the power block that this machine's firmware accepted, as the earlier
 /// J516C driver uploaded them (its device-tree-built records with the per-board words of this
-/// machine applied). Kept out of the tree; pinned by its SHA-256. The hardware record is taken
-/// from it; Globals and Power are built from the device tree and must match the file's.
+/// machine applied). Kept out of the tree; pinned by its SHA-256. The three images are built
+/// from the device tree and must match the file's; the file supplies the record's words the
+/// device tree does not carry (`board::record::FROM_FILE`).
 const BOARD_SHA256: [u8; 32] = [
     0x4e, 0x03, 0xf2, 0x9f, 0xa4, 0x47, 0xdc, 0xeb, 0xfd, 0x4d, 0x1c, 0x22, 0x5a, 0x64, 0x7b,
     0xfa, 0x31, 0xb3, 0x63, 0x45, 0x8f, 0x28, 0x33, 0x82, 0x3a, 0x5c, 0xa8, 0xa1, 0x0e, 0xdf,

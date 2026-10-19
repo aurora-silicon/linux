@@ -160,10 +160,10 @@ fn templates(
 /// HardwareDataA word holding the system counter at initdata creation.
 const HWDATA_A_INIT_TIMESTAMP: usize = 0x424c;
 
-/// Board images of a SoC with a firmware file. The hardware record is the file's, this
-/// machine's own: its IOMapping records must name the layout's physical addresses. Globals and
-/// Power are built from the device tree ([`board::device_tree`]); the file's copies are a
-/// cross-check: the start is refused at the first differing word. Returns the images and the
+/// Board images of a SoC with a firmware file. The hardware record ([`board::hardware_record`]),
+/// Globals and Power ([`board::device_tree`]) are built from the device tree; the file, this
+/// machine's own, supplies the record's words the device tree does not carry and is otherwise
+/// a cross-check: the start is refused at the first differing word. Returns the images and the
 /// top operating-point frequency in kHz.
 fn blob(
     dev: &device::Device,
@@ -179,23 +179,10 @@ fn blob(
         sha256,
         [layout.hwdata_size, globals::SIZE, power::SIZE],
     )?;
-    let mut hw_img = images.hardware;
-    for map in layout.iomaps.iter() {
-        let at = hwdata::IOMAPS + hwdata::IOMAP_STRIDE * map.slot as usize;
-        let pa = u64::from(get32(&hw_img, at)?) | u64::from(get32(&hw_img, at + 4)?) << 32;
-        if pa != map.pa + map.delta {
-            dev_err!(
-                dev,
-                "board images: IOMapping slot {} is at {:#x}, the layout maps {:#x}\n",
-                map.slot,
-                pa,
-                map.pa + map.delta
-            );
-            return Err(EINVAL);
-        }
-    }
+    let mut hw_img = board::hardware_record(dev, cfg, adt, &images.hardware)?;
     let (glob, pwr, max_power_mw) = board::device_tree(dev, &hw_img)?;
     for (what, built, file) in [
+        ("hardware record", &hw_img, &images.hardware),
         ("Globals", &glob, &images.globals),
         ("Power", &pwr, &images.power),
     ] {
@@ -221,9 +208,10 @@ fn blob(
     put64(&mut hw_img, hwdata::HWDATA_A + HWDATA_A_INIT_TIMESTAMP, now)?;
     dev_info!(
         dev,
-        "board data: {} hardware record from {}, Globals and Power from the device tree (match the file), {} mW maximum power, {} MHz top operating point\n",
+        "board data: {} images from the device tree match {} ({} record words from the file), {} mW maximum power, {} MHz top operating point\n",
         cfg.name,
         name,
+        board::record::FROM_FILE.len(),
         max_power_mw,
         max_mhz
     );

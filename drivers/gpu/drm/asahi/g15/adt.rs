@@ -55,7 +55,16 @@ pub(crate) struct GpuAdt {
     pub(crate) perf_mhz: [u32; PERF_STATES],
     pub(crate) perf_mv: [u32; PERF_STATES],
     pub(crate) sram_mv: [u32; PERF_STATES],
+    /// Per-cluster core mV of each state, rounded up from the device tree's microvolts, how
+    /// many voltage cells the node has (1 on the ADT path), and the state's power in mW (0 on
+    /// the ADT path).
+    pub(crate) cluster_mv: [[u32; CLUSTERS]; PERF_STATES],
+    pub(crate) cluster_cells: usize,
+    pub(crate) perf_mw: [u32; PERF_STATES],
 }
+
+/// Voltage cells the layout keeps per state.
+pub(crate) const CLUSTERS: usize = 4;
 
 /// A private copy of the ADT.
 struct Adt<'a> {
@@ -307,8 +316,14 @@ fn parse(dev: &device::Device, adt: &Adt<'_>) -> Result<GpuAdt> {
         perf_mhz: [0; PERF_STATES],
         perf_mv: [0; PERF_STATES],
         sram_mv: [0; PERF_STATES],
+        cluster_mv: [[0; CLUSTERS]; PERF_STATES],
+        cluster_cells: 1,
+        perf_mw: [0; PERF_STATES],
     };
     collect_perf(dev, adt, sgx, &mut out)?;
+    for i in 0..PERF_STATES {
+        out.cluster_mv[i][0] = out.perf_mv[i];
+    }
     Ok(out)
 }
 
@@ -410,9 +425,13 @@ fn from_device_tree(dev: &device::Device) -> Result<GpuAdt> {
         perf_mhz: [0; PERF_STATES],
         perf_mv: [0; PERF_STATES],
         sram_mv: [0; PERF_STATES],
+        cluster_mv: [[0; CLUSTERS]; PERF_STATES],
+        cluster_cells: 0,
+        perf_mw: [0; PERF_STATES],
     };
-    // Operating points: MHz and the highest cluster voltage of each; the SRAM voltage is not in
-    // the device tree. The firmware runs the board images' tables; these are informational.
+    // Operating points: MHz, the highest cluster voltage of each and the clusters' voltages
+    // (rounded up) and power for the hardware record; the SRAM voltage is not in the device
+    // tree.
     let opps = node
         .parse_phandle(c_str!("operating-points-v2"), 0)
         .ok_or(EINVAL)
@@ -421,11 +440,21 @@ fn from_device_tree(dev: &device::Device) -> Result<GpuAdt> {
     for opp in opps.children() {
         let hz: u64 = opp.get_property(c_str!("opp-hz"))?;
         let uv: KVec<u32> = opp.get_property(c_str!("opp-microvolt"))?;
+        let uw: Option<u32> = opp.get_opt_property(c_str!("opp-microwatt"))?;
         let mv = uv.iter().max().copied().unwrap_or(0) / 1000;
+        if uv.is_empty() || uv.len() > CLUSTERS || (count > 0 && uv.len() != out.cluster_cells) {
+            dev_err!(dev, "GPU operating point {} has {} voltage cells\n", count, uv.len());
+            return Err(EINVAL);
+        }
         if count < PERF_STATES {
             out.perf_mhz[count] = (hz / 1_000_000) as u32;
             out.perf_mv[count] = mv;
             out.sram_mv[count] = mv;
+            for (c, v) in uv.iter().enumerate() {
+                out.cluster_mv[count][c] = v.div_ceil(1000);
+            }
+            out.cluster_cells = uv.len();
+            out.perf_mw[count] = uw.unwrap_or(0) / 1000;
         }
         count += 1;
     }

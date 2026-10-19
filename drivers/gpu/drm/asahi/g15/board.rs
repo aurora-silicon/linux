@@ -10,19 +10,22 @@
 //! against its hash at boot.
 //!
 //! A SoC whose board data comes from its device tree ([`super::hw::Platform::DeviceTree`]) gets
-//! its Globals and Power from [`device_tree`]: the G15S templates with the GPU node's power
-//! words and the hardware record's maximum power ([`words`]).
+//! its hardware record from [`hardware_record`] ([`record`]) and its Globals and Power from
+//! [`device_tree`]: the G15S templates with the GPU node's power words and the hardware
+//! record's maximum power ([`words`]).
 
 pub(crate) mod blob;
 pub(crate) mod data;
+pub(crate) mod record;
 pub(crate) mod template;
 pub(crate) mod words;
 
-use kernel::{device, prelude::*};
+use kernel::{c_str, device, prelude::*};
 
-use super::adt::GpuAdt;
+use super::adt::{self, GpuAdt};
 use super::boot::glue;
 use super::fw::initdata::{globals, hwdata, power};
+use super::hw::{self, va};
 pub(crate) use template::{Line, Template};
 
 static_assert!(words::GLOBALS_SIZE == globals::SIZE);
@@ -30,6 +33,11 @@ static_assert!(words::POWER_SIZE == power::SIZE);
 static_assert!(words::HWDATA_A == hwdata::HWDATA_A);
 static_assert!(words::HWDATA_A_MAX_POWER == hwdata::MAX_POWER_A);
 static_assert!(words::TOP_STATE as usize == DVFS_STATES - 1);
+static_assert!(record::HWDATA_A == hwdata::HWDATA_A);
+static_assert!(record::MAX_POWER == hwdata::HWDATA_A + hwdata::MAX_POWER_A);
+static_assert!(record::IOMAPS == hwdata::IOMAPS);
+static_assert!(record::PERF_STATES == adt::PERF_STATES);
+static_assert!(record::CLUSTERS == adt::CLUSTERS);
 
 /// Expands a template into `out` and verifies its hash.
 pub(crate) fn expand(template: &Template, out: &mut [u8]) -> Result {
@@ -54,6 +62,127 @@ fn power_words(dev: &device::Device) -> Result<words::PowerWords> {
         dev_err!(dev, "GPU node power words: {}\n", why);
         EINVAL
     })
+}
+
+/// A CS or AFR operating-point table of the GPU node (`name`): MHz and one voltage cell per
+/// state, at most `max` states.
+fn aux_opps(
+    dev: &device::Device,
+    node: &kernel::of::Node,
+    name: &CStr,
+    out: &mut [record::Opp],
+) -> Result<usize> {
+    let table = node
+        .parse_phandle(name, 0)
+        .ok_or(EINVAL)
+        .inspect_err(|_| dev_err!(dev, "GPU node has no {}\n", name))?;
+    let mut n = 0;
+    for opp in table.children() {
+        let hz: u64 = opp.get_property(c_str!("opp-hz"))?;
+        let uv: KVec<u32> = opp.get_property(c_str!("opp-microvolt"))?;
+        if uv.len() != 1 || n >= out.len() {
+            dev_err!(
+                dev,
+                "GPU {} table: state {} has {} cells\n",
+                name,
+                n,
+                uv.len()
+            );
+            return Err(EINVAL);
+        }
+        out[n] = record::Opp {
+            mhz: (hz / 1_000_000) as u32,
+            mv: [uv[0].div_ceil(1000), 0, 0, 0],
+            cells: 1,
+            mw: 0,
+        };
+        n += 1;
+    }
+    if n == 0 {
+        dev_err!(dev, "GPU {} table is empty\n", name);
+        return Err(EINVAL);
+    }
+    Ok(n)
+}
+
+/// The hardware record of a device-tree SoC ([`record`]): built from the GPU node's properties
+/// and operating-point tables, the layout's IOMapping table and the ADT regions, with the
+/// words the device tree does not carry copied from `file`, the machine's own record.
+pub(crate) fn hardware_record(
+    dev: &device::Device,
+    cfg: &super::Config,
+    adt: &GpuAdt,
+    file: &[u8],
+) -> Result<KVVec<u8>> {
+    let layout = cfg.layout;
+    let node = dev.of_node().ok_or(ENODEV)?;
+    let mut props = [0u32; record::PROPS.len()];
+    for (value, (name, default)) in props.iter_mut().zip(record::PROPS.iter()) {
+        *value = match node.get_opt_property(name)? {
+            Some(v) => v,
+            None => default
+                .ok_or(EINVAL)
+                .inspect_err(|_| dev_err!(dev, "GPU node has no u32 {}\n", name))?,
+        };
+    }
+    let zones: KVec<u32> = node.get_opt_property(words::ZONES)?.unwrap_or_default();
+    let mut main = [record::Opp::default(); record::PERF_STATES];
+    for (i, o) in main.iter_mut().enumerate() {
+        *o = record::Opp {
+            mhz: adt.perf_mhz[i],
+            mv: adt.cluster_mv[i],
+            cells: adt.cluster_cells,
+            mw: adt.perf_mw[i],
+        };
+    }
+    let mut cs = [record::Opp::default(); 16];
+    let mut afr = [record::Opp::default(); 8];
+    let ncs = aux_opps(dev, &node, c_str!("apple,cs-opp"), &mut cs)?;
+    let nafr = aux_opps(dev, &node, c_str!("apple,afr-opp"), &mut afr)?;
+    if layout.record_slots.len() != layout.iomaps.len() {
+        return Err(EINVAL);
+    }
+    let mut slots = [record::IoSlot::default(); record::IOMAP_SLOTS];
+    for (k, (map, &(total, element, writable))) in
+        layout.iomaps.iter().zip(layout.record_slots).enumerate()
+    {
+        slots[k] = record::IoSlot {
+            slot: map.slot,
+            pa: map.pa + map.delta,
+            va: map.va + map.delta,
+            total,
+            element,
+            writable,
+        };
+    }
+    let max_power_mw = u32::from_le_bytes(
+        file.get(record::MAX_POWER..record::MAX_POWER + 4)
+            .ok_or(EINVAL)?
+            .try_into()
+            .map_err(|_| EINVAL)?,
+    );
+    let inputs = record::Inputs {
+        props,
+        zones: &zones,
+        main: &main,
+        cs: &cs[..ncs],
+        afr: &afr[..nafr],
+        slots: &slots[..layout.iomaps.len()],
+        empty_writable: layout.record_empty_writable,
+        ttbat: adt.ttbs.start,
+        usc_base: hw::client::COMPACT_WINDOW.start,
+        user_end: hw::USER_RANGE.end,
+        timestamps: va::TIMESTAMPS,
+        max_power_mw,
+    };
+    let mut out = KVVec::from_elem(0u8, record::SIZE, GFP_KERNEL)?;
+    record::from_file(&mut out, file)
+        .and_then(|()| record::build(&mut out, &inputs))
+        .map_err(|why| {
+            dev_err!(dev, "hardware record from the device tree: {}\n", why);
+            EINVAL
+        })?;
+    Ok(out)
 }
 
 /// Globals and Power of a device-tree SoC: the verified G15S templates with the GPU node's
