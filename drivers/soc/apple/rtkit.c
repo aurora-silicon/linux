@@ -720,6 +720,51 @@ static void apple_rtkit_memcpy(struct apple_rtkit *rtk, void *dst,
 						 len, DMA_FROM_DEVICE);
 }
 
+#define APPLE_RTKIT_CRASHLOG_LATE_POLL_MS 250
+#define APPLE_RTKIT_CRASHLOG_LATE_POLLS 20
+
+static bool apple_rtkit_crashlog_header_valid(struct apple_rtkit *rtk)
+{
+	struct apple_rtkit_crashlog_header header;
+
+	if (rtk->crashlog_buffer.size < sizeof(header))
+		return false;
+	apple_rtkit_memcpy(rtk, &header, &rtk->crashlog_buffer, 0,
+			   sizeof(header));
+	return header.fourcc == APPLE_RTKIT_CRASHLOG_HEADER_FOURCC &&
+	       header.size >= sizeof(header) &&
+	       header.size <= rtk->crashlog_buffer.size;
+}
+
+static void apple_rtkit_crashlog_late(struct work_struct *work)
+{
+	struct apple_rtkit *rtk = container_of(to_delayed_work(work),
+					       struct apple_rtkit,
+					       crashlog_late_work);
+	u8 *bfr __free(kfree) = NULL;
+
+	if (!apple_rtkit_crashlog_header_valid(rtk)) {
+		if (++rtk->crashlog_late_polls < APPLE_RTKIT_CRASHLOG_LATE_POLLS)
+			queue_delayed_work(rtk->wq, &rtk->crashlog_late_work,
+				msecs_to_jiffies(APPLE_RTKIT_CRASHLOG_LATE_POLL_MS));
+		else
+			dev_err(rtk->dev,
+				"RTKit: crash reported, but no crashlog was written in %u ms\n",
+				APPLE_RTKIT_CRASHLOG_LATE_POLLS *
+					APPLE_RTKIT_CRASHLOG_LATE_POLL_MS);
+		return;
+	}
+
+	dev_err(rtk->dev, "RTKit: co-processor crashed; crashlog written after %u ms\n",
+		(rtk->crashlog_late_polls + 1) * APPLE_RTKIT_CRASHLOG_LATE_POLL_MS);
+	bfr = kzalloc(rtk->crashlog_buffer.size, GFP_KERNEL);
+	if (!bfr)
+		return;
+	apple_rtkit_memcpy(rtk, bfr, &rtk->crashlog_buffer, 0,
+			   rtk->crashlog_buffer.size);
+	apple_rtkit_crashlog_dump(rtk, bfr, rtk->crashlog_buffer.size);
+}
+
 static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 {
 	u8 type = FIELD_GET(APPLE_RTKIT_SYSLOG_TYPE, msg);
@@ -753,8 +798,27 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 				   sizeof(header));
 		if (header.fourcc != APPLE_RTKIT_CRASHLOG_HEADER_FOURCC ||
 		    header.size < sizeof(header) ||
-		    header.size > rtk->crashlog_buffer.size)
+		    header.size > rtk->crashlog_buffer.size) {
+			/*
+			 * On a started crashlog endpoint the first message
+			 * without a buffer is the normal boot-time buffer
+			 * request. A co-processor whose crashlog endpoint was
+			 * never discovered or started (a DCP adopted from the
+			 * bootloader) sends it only when it crashes, and writes
+			 * the log after receiving the buffer. Say so and read
+			 * the log once it is there, rather than dropping the
+			 * report.
+			 */
+			if (!test_bit(APPLE_RTKIT_EP_CRASHLOG, rtk->endpoints)) {
+				dev_err(rtk->dev,
+					"RTKit: co-processor reported a crash before its crashlog buffer was mapped\n");
+				rtk->crashlog_late_polls = 0;
+				queue_delayed_work(rtk->wq, &rtk->crashlog_late_work,
+					msecs_to_jiffies(APPLE_RTKIT_CRASHLOG_LATE_POLL_MS));
+				return;
+			}
 			goto unmapped;
+		}
 	}
 
 	dev_err(rtk->dev, "RTKit: co-processor has crashed\n");
@@ -1316,6 +1380,7 @@ static void apple_rtkit_detach_rx(struct apple_rtkit *rtk)
 static void apple_rtkit_stop_rx(struct apple_rtkit *rtk)
 {
 	apple_rtkit_detach_rx(rtk);
+	cancel_delayed_work_sync(&rtk->crashlog_late_work);
 	destroy_workqueue(rtk->wq);
 }
 
@@ -1420,6 +1485,7 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	init_completion(&rtk->coreanalytics_completion);
 	init_completion(&rtk->iop_pwr_ack_completion);
 	init_completion(&rtk->ap_pwr_ack_completion);
+	INIT_DELAYED_WORK(&rtk->crashlog_late_work, apple_rtkit_crashlog_late);
 
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
@@ -1558,6 +1624,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 
 	/* make sure we don't handle any messages while reinitializing */
 	apple_rtkit_detach_rx(rtk);
+	cancel_delayed_work_sync(&rtk->crashlog_late_work);
 	flush_workqueue(rtk->wq);
 
 	apple_rtkit_free_buffer(rtk, &rtk->coreanalytics_buffer);
