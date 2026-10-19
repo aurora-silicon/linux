@@ -2,8 +2,8 @@
 
 //! The persistent compute and render graphs.
 //!
-//! The compute graph holds 22 x 4 MiB compute pools, the freelist (8192 seeds), the pool table,
-//! the manager, scheduling context, notifier, threshold, job list, queue info/state, ring,
+//! The compute graph holds 22 x 4 MiB compute pools, the freelist (every pool's pages), the pool
+//! table, the manager, scheduling context, notifier, threshold, job list, queue info/state, ring,
 //! queue scratch and the user and firmware stamps. The render graph holds the render queues,
 //! scheduling context, notifier, threshold, job list, the empty legacy record and InitBM. The
 //! compute slots and the render pass slots are [`super::slots`]; the render UMA/PB allocators
@@ -194,7 +194,7 @@ impl ComputeGraph {
     fn init(&self) -> Result {
         let mut entry = 0u64;
 
-        // Freelist: the first eight 4 MiB pools in 0x1000 units.
+        // Freelist: every 4 MiB pool in 0x1000 units.
         for pool in self.pools.iter().take(pools::SEEDED_POOLS) {
             let gva = pool.gva.ok_or(EINVAL)?;
             let mut off = 0;
@@ -215,8 +215,8 @@ impl ComputeGraph {
         m.w32(manager::ONE, 1)?;
         m.w64(manager::FREELIST, self.freelist.gva.ok_or(EINVAL)?)?;
         m.w32(manager::UNK_1C, manager::UNK_1C_VALUE)?;
-        m.w32(manager::SEEDS_A, sizes::FREELIST_SEED)?;
-        m.w32(manager::SEEDS_B, sizes::FREELIST_SEED)?;
+        m.w32(manager::SEEDS_A, pools::SEEDS)?;
+        m.w32(manager::SEEDS_B, pools::SEEDS)?;
         m.w64(manager::POOL_TABLE, self.pool_table.gva.ok_or(EINVAL)?)?;
         m.w32(manager::UNK_44, manager::UNK_44_VALUE)?;
         m.w64(manager::COUNTER, self.counter.va)?;
