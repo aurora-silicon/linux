@@ -17,8 +17,8 @@
 //!   by [`from_file`] and listed with its rule in the project notes: the maximum power
 //!   (HardwareDataA +0x6a4; every other maximum-power word derives from it), the MTR sensor
 //!   masks, the relative-power table (the device tree's operating-point powers are a boot-loader
-//!   stand-in), four groups in the HardwareDataB +0x38..+0x638 block, two all-ones words, and the
-//!   tail's six sensor rows and thirteen readings.
+//!   stand-in) and the tail's six sensor rows;
+//! - a word the file carries and the firmware was shown not to need ([`UNNEEDED`]): zero.
 //!
 //! HardwareDataA has the G15S shape of the T6030 templates with insertions ([`a`]): 8 bytes
 //! before the fast-die controller (+0x8bc), 16-wide instead of 8-wide coefficient rows (+0x200
@@ -207,58 +207,40 @@ pub(crate) const MAX_POWER: usize = HWDATA_A + 0x6a4;
 
 /// Words the device tree does not carry, copied from the board file. Record offsets.
 #[rustfmt::skip]
-pub(crate) const FROM_FILE: [usize; 74] = [
-    // HardwareDataB +0x38..+0x638: four groups whose meaning the firmware interface has not
-    // shown; the G15S templates have zero there.
-    0xe0, 0xe8, 0xf4, 0xf8, 0xfc, 0x100, 0x104, 0x108, 0x10c, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8,
-    0x2ec, 0x3e0, 0x3e8, 0x3f4, 0x3f8, 0x400, 0x40c, 0x5d8, 0x5dc, 0x5e0, 0x5e4, 0x5e8, 0x5ec,
+pub(crate) const FROM_FILE: [usize; 32] = [
     // The relative powers of states 1..7 (state 8 is 100): the device tree's operating-point
     // powers are a boot-loader stand-in.
     0x1060, 0x1064, 0x1068, 0x106c, 0x1070, 0x1074, 0x1078,
-    // Two all-ones words between HardwareDataB and HardwareDataA.
-    0x30d8, 0x30f0,
     // HardwareDataA: the maximum power, the MTR fast-die masks (+0x8ac, +0x1490) and the alarm
     // mask (+0x24a8); the device tree's apple,fast-die0-sensor-mask is another value.
     MAX_POWER,
-    HWDATA_A + 0x8ac,
-    HWDATA_A + 0x8b0,
-    HWDATA_A + 0x1490,
-    HWDATA_A + 0x1494,
-    HWDATA_A + 0x24a8,
-    HWDATA_A + 0x24ac,
-    // The tail's six sensor rows (key, id, kind; 12 bytes each, the boot loader does not export
-    // the aon-ptd table) and its thirteen readings (one word, twelve singles).
-    HWDATA_A + 0x6c58,
-    HWDATA_A + 0x6c5c,
-    HWDATA_A + 0x6c60,
-    HWDATA_A + 0x6c64,
-    HWDATA_A + 0x6c68,
-    HWDATA_A + 0x6c6c,
-    HWDATA_A + 0x6c70,
-    HWDATA_A + 0x6c74,
-    HWDATA_A + 0x6c78,
-    HWDATA_A + 0x6c7c,
-    HWDATA_A + 0x6c80,
-    HWDATA_A + 0x6c84,
-    HWDATA_A + 0x6c88,
-    HWDATA_A + 0x6c8c,
-    HWDATA_A + 0x6c90,
-    HWDATA_A + 0x6c94,
-    HWDATA_A + 0x6c98,
-    HWDATA_A + 0x6c9c,
+    HWDATA_A + 0x8ac, HWDATA_A + 0x8b0,
+    HWDATA_A + 0x1490, HWDATA_A + 0x1494,
+    HWDATA_A + 0x24a8, HWDATA_A + 0x24ac,
+    // The tail's six sensor rows (key, id, kind; 12 bytes each; the boot loader does not export
+    // the aon-ptd table).
+    HWDATA_A + 0x6c58, HWDATA_A + 0x6c5c, HWDATA_A + 0x6c60,
+    HWDATA_A + 0x6c64, HWDATA_A + 0x6c68, HWDATA_A + 0x6c6c,
+    HWDATA_A + 0x6c70, HWDATA_A + 0x6c74, HWDATA_A + 0x6c78,
+    HWDATA_A + 0x6c7c, HWDATA_A + 0x6c80, HWDATA_A + 0x6c84,
+    HWDATA_A + 0x6c88, HWDATA_A + 0x6c8c, HWDATA_A + 0x6c90,
+    HWDATA_A + 0x6c94, HWDATA_A + 0x6c98, HWDATA_A + 0x6c9c,
+];
+
+/// Words the board file carries that the record leaves zero: the firmware ran, passed every
+/// check and reached its top state without them (one boot each). The cross-check accepts the
+/// file's value there. 27 words in the HardwareDataB +0x38..+0x638 block and two all-ones words
+/// after it (zero in the G15S templates); the tail's thirteen readings (a single at
+/// HardwareDataA +0x6d34, twelve singles after +0x6d80).
+#[rustfmt::skip]
+pub(crate) const UNNEEDED: [usize; 42] = [
+    0xe0, 0xe8, 0xf4, 0xf8, 0xfc, 0x100, 0x104, 0x108, 0x10c, 0x2d8, 0x2dc, 0x2e0, 0x2e4,
+    0x2e8, 0x2ec, 0x3e0, 0x3e8, 0x3f4, 0x3f8, 0x400, 0x40c, 0x5d8, 0x5dc, 0x5e0, 0x5e4,
+    0x5e8, 0x5ec, 0x30d8, 0x30f0,
     HWDATA_A + 0x6d34,
-    HWDATA_A + 0x6d8c,
-    HWDATA_A + 0x6d90,
-    HWDATA_A + 0x6d94,
-    HWDATA_A + 0x6d98,
-    HWDATA_A + 0x6dcc,
-    HWDATA_A + 0x6dd0,
-    HWDATA_A + 0x6dd4,
-    HWDATA_A + 0x6dd8,
-    HWDATA_A + 0x6dec,
-    HWDATA_A + 0x6df4,
-    HWDATA_A + 0x6dfc,
-    HWDATA_A + 0x6e04,
+    HWDATA_A + 0x6d8c, HWDATA_A + 0x6d90, HWDATA_A + 0x6d94, HWDATA_A + 0x6d98,
+    HWDATA_A + 0x6dcc, HWDATA_A + 0x6dd0, HWDATA_A + 0x6dd4, HWDATA_A + 0x6dd8,
+    HWDATA_A + 0x6dec, HWDATA_A + 0x6df4, HWDATA_A + 0x6dfc, HWDATA_A + 0x6e04,
 ];
 
 /// The tail's sensor rows: six rows of {key, id, kind} from [`SENSOR_ROWS`]; the keys of the
@@ -792,6 +774,22 @@ pub(crate) fn from_file(out: &mut [u8], file: &[u8]) -> R<()> {
     Ok(())
 }
 
+/// The first word at which the built record differs from the file's, except the [`UNNEEDED`]
+/// words, where the file's value is accepted as long as the built word is zero.
+pub(crate) fn cross_check(built: &[u8], file: &[u8]) -> Option<(usize, u32, u32)> {
+    let word = |s: &[u8], at: usize| -> u32 {
+        let mut w = [0u8; 4];
+        for (i, out) in w.iter_mut().enumerate() {
+            *out = s.get(at + i).copied().unwrap_or(0);
+        }
+        u32::from_le_bytes(w)
+    };
+    (0..built.len().max(file.len()))
+        .step_by(4)
+        .map(|at| (at, word(built, at), word(file, at)))
+        .find(|&(at, b, f)| b != f && !(b == 0 && UNNEEDED.contains(&at)))
+}
+
 /// Builds the record into `out` (zeroed first) from the device-tree inputs; the [`FROM_FILE`]
 /// words must have been copied in first ([`from_file`]) or are left as they are.
 pub(crate) fn build(out: &mut [u8], i: &Inputs<'_>) -> R<()> {
@@ -919,6 +917,26 @@ mod tests {
     }
 
     #[test]
+    fn unneeded() {
+        // No UNNEEDED word is a FROM_FILE word; the cross-check accepts the file's value there
+        // only against a zero built word, and nothing else.
+        assert!(UNNEEDED.iter().all(|at| !FROM_FILE.contains(at)));
+        assert!(UNNEEDED.iter().all(|&at| at % 4 == 0 && at + 4 <= SIZE));
+        let mut file = vec![0u8; SIZE];
+        for (k, &at) in UNNEEDED.iter().enumerate() {
+            put32(&mut file, at, 0x2000 + k as u32).unwrap();
+        }
+        let built = vec![0u8; SIZE];
+        assert_eq!(cross_check(&built, &file), None);
+        let mut built = built;
+        put32(&mut built, UNNEEDED[0], 1).unwrap();
+        assert_eq!(cross_check(&built, &file), Some((UNNEEDED[0], 1, 0x2000)));
+        let mut built = vec![0u8; SIZE];
+        put32(&mut built, 0x10, 5).unwrap();
+        assert_eq!(cross_check(&built, &file), Some((0x10, 5, 0)));
+    }
+
+    #[test]
     fn layout() {
         assert_eq!(a(0x8b8), HWDATA_A + 0x8b8);
         assert_eq!(a(0x8bc), HWDATA_A + 0x8c4);
@@ -1002,8 +1020,8 @@ mod tests {
             put32(&mut r, SENSOR_ROWS + 12 * k, u32::from_le_bytes(**row)).unwrap();
         }
         build(&mut r, &i).unwrap();
-        assert_eq!(get(&r, 0xe0), 0x1000);
-        assert_eq!(get(&r, 0x30f0), 0x1000 + 35);
+        assert_eq!(get(&r, 0x1060), 0x1000);
+        assert_eq!(get(&r, 0x30f0), 0);
         // Identity, IOMapping records, flags.
         assert_eq!(get(&r, 0xa28), 0x6031);
         assert_eq!(get(&r, 0x640), 0x08d00000);
@@ -1279,10 +1297,9 @@ mod tests {
         let mut built = vec![0u8; SIZE];
         from_file(&mut built, file).unwrap();
         build(&mut built, &i).unwrap();
-        let diff = (0..SIZE)
-            .step_by(4)
-            .find(|&o| get(&built, o) != get(file, o))
-            .map(|o| (o, get(&built, o), get(file, o)));
-        assert_eq!(diff, None, "(offset, built, file)");
+        assert_eq!(cross_check(&built, file), None, "(offset, built, file)");
+        for &at in UNNEEDED.iter() {
+            assert_eq!(get(&built, at), 0);
+        }
     }
 }

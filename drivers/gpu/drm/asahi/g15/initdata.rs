@@ -186,7 +186,12 @@ fn blob(
         ("Globals", &glob, &images.globals),
         ("Power", &pwr, &images.power),
     ] {
-        if let Some((at, b, f)) = board::words::first_difference(built, file) {
+        let diff = if what == "hardware record" {
+            board::record::cross_check(built, file)
+        } else {
+            board::words::first_difference(built, file)
+        };
+        if let Some((at, b, f)) = diff {
             dev_err!(
                 dev,
                 "board data: device-tree {} differs from {} at +{:#x}: built {:#x}, file {:#x}\n",
@@ -208,10 +213,11 @@ fn blob(
     put64(&mut hw_img, hwdata::HWDATA_A + HWDATA_A_INIT_TIMESTAMP, now)?;
     dev_info!(
         dev,
-        "board data: {} images from the device tree match {} ({} record words from the file), {} mW maximum power, {} MHz top operating point\n",
+        "board data: {} images from the device tree match {} ({} record words from the file, {} file words left zero), {} mW maximum power, {} MHz top operating point\n",
         cfg.name,
         name,
         board::record::FROM_FILE.len(),
+        board::record::UNNEEDED.len(),
         max_power_mw,
         max_mhz
     );
