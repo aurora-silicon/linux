@@ -346,12 +346,19 @@ static bool trampoline_set_tiling_state_v27(struct apple_dcp *dcp, int tag,
 #include "iomfb-boolean-properties-v27.inc"
 
 #define DCP_ANALYTICS_EVENT_SIZE 0x1044
+#define DCP_ANALYTICS_NAME_SIZE 0x40
+#define DCP_ANALYTICS_DICT_SIZE (DCP_ANALYTICS_EVENT_SIZE - DCP_ANALYTICS_NAME_SIZE)
 #define DCP_ANALYTICS_FULL_DUMPS 16
 
 /*
- * D113 CoreAnalyticsSendEvent. The firmware reports an analytics event, its
- * name first ("com.apple.iomfb...."); both DCP firmware crashes seen on T6050
- * were announced by one. Log the name, and the payload of the first few.
+ * D113: the firmware reports an analytics event, its name in the first 0x40
+ * bytes and then the event's serialized payload dictionary. The dictionary is
+ * an in/out argument: the 0x1004-byte reply area is the dictionary the
+ * firmware reads back once the call returns. Hand it back unchanged.
+ *
+ * Replying with zeroes there made every DCP crash on its first analytics
+ * event, which the firmware sends about an hour after it starts; all DCPs
+ * start together at boot, so all of them went down within seconds.
  */
 static bool dcpep_cb_core_analytics_v27(struct apple_dcp *dcp, int tag,
 					void *out, void *in)
@@ -360,8 +367,11 @@ static bool dcpep_cb_core_analytics_v27(struct apple_dcp *dcp, int tag,
 	unsigned int len = DCP_ANALYTICS_EVENT_SIZE;
 	char name[128];
 
-	strscpy(name, event, sizeof(name));
-	dev_info_ratelimited(dcp->dev, "CoreAnalytics event %s\n", name);
+	static_assert(DCP_ANALYTICS_DICT_SIZE == 0x1004);
+
+	strscpy(name, event, min(sizeof(name), (size_t)DCP_ANALYTICS_NAME_SIZE));
+	dev_info_ratelimited(dcp->dev, "CoreAnalytics event %s, reply area %16ph\n",
+			     name, out);
 	if (dcp->analytics_dumps < DCP_ANALYTICS_FULL_DUMPS) {
 		dcp->analytics_dumps++;
 		while (len && !event[len - 1])
@@ -369,7 +379,7 @@ static bool dcpep_cb_core_analytics_v27(struct apple_dcp *dcp, int tag,
 		print_hex_dump(KERN_INFO, "dcp analytics: ", DUMP_PREFIX_OFFSET,
 			       32, 1, event, len, true);
 	}
-	*(__le32 *)out = 0;
+	memcpy(out, event + DCP_ANALYTICS_NAME_SIZE, DCP_ANALYTICS_DICT_SIZE);
 	return true;
 }
 
