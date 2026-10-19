@@ -4564,6 +4564,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 
 	if (panel_np) {
 		const char height_prop[2][16] = { "adj-height-mm", "height-mm" };
+		const char *compatible;
 
 		if (of_device_is_available(panel_np)) {
 			ret = of_property_read_u32(panel_np, "apple,max-brightness",
@@ -4576,6 +4577,10 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		/* use adjusted height as long as the notch is hidden */
 		of_property_read_u32(panel_np, height_prop[!dcp->notch_height],
 				     &dcp->panel.height_mm);
+		/* The most specific compatible names the panel for its EDID. */
+		if (!of_property_read_string_index(panel_np, "compatible", 0, &compatible) &&
+		    dcp_panel_id_from_compatible(&dcp->panel.id, compatible))
+			dev_dbg(dev, "no EDID make and product in '%s'\n", compatible);
 
 		of_node_put(panel_np);
 		dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;

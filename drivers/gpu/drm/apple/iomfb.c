@@ -1655,6 +1655,13 @@ int dcp_get_modes(struct drm_connector *connector)
 		} else {
 			apple_connector->drm_edid_firmware_derived = false;
 		}
+	} else if (nr_modes && iomfb_is_v14_7_panel(dcp) && dcp->panel.id.vendor[0]) {
+		/* No EDID comes for this panel: publish the base block of its node. */
+		int update = dcp_panel_edid_update(connector, &dcp->panel.id,
+						   dcp->panel.width_mm, dcp->panel.height_mm);
+
+		if (update)
+			dev_warn_once(dcp->dev, "panel EDID publication failed: %d\n", update);
 	} else {
 		u64 generation = 0;
 		const struct drm_edid *derived = nr_modes ?
