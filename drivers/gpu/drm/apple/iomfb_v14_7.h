@@ -111,6 +111,8 @@ struct dcp_v14_7_session {
 	u32 panel_width, panel_height;
 	/* The DCP may be adopted with no PMP described (T6031 experiment). */
 	bool pmp_optional;
+	/* The panel's swaps carry constant timestamps (T6031 only). */
+	bool swap_timestamps;
 
 	/* IOMFB READY word; startup progress. */
 	u64 ready_word;

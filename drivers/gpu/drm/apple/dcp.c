@@ -4864,6 +4864,7 @@ struct dcp_v14_7_board {
 	const char *inherited;		/* boolean on display and piodma */
 	const char *native_scanout, *native_piodma, *chosen_note;
 	bool pmp_optional;		/* adopt without a PMP when none is described */
+	bool swap_timestamps;		/* panel swaps carry constant timestamps */
 };
 
 static const char *const j514s_boards[] = { "apple,j514s", NULL };
@@ -4907,6 +4908,7 @@ static const struct dcp_v14_7_board dcp_v14_7_t6031 = {
 	.boot_stride = 3456 * 4,
 	.marker = "apple,t6031-handoff",
 	.pmp_optional = true,
+	.swap_timestamps = true,
 };
 
 /* The board profile of a 14.7 panel DCP node, or NULL. */
@@ -5158,6 +5160,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			dcp->v14_7->panel_width = board->panel_width;
 			dcp->v14_7->panel_height = board->panel_height;
 			dcp->v14_7->pmp_optional = board->pmp_optional;
+			dcp->v14_7->swap_timestamps = board->swap_timestamps;
 		}
 	}
 

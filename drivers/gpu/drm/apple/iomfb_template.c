@@ -3180,12 +3180,15 @@ void iomfb_present_backlight_v14_7(struct apple_dcp *dcp)
  * counter for its ProMotion panels; on this SoC the counter runs at 1 GHz and
  * such values hang the 14.7 firmware's swap.  Use the constant 120 in the
  * same three slots, a time that is never in the future.  Run after the
- * request is encoded, since the encoder zeroes the whole request.
+ * request is encoded, since the encoder zeroes the whole request.  Only the
+ * main display of a board profile that asks for them (T6031) gets them; the
+ * J514S panel, external DCPs and DCPs without a 14.7 board profile keep
+ * zero timestamps.
  */
 static void iomfb_swap_timestamps_v14_7(struct apple_dcp *dcp,
 					struct dcp_swap_submit_req_v14_7 *req)
 {
-	if (!dcp->main_display)
+	if (!dcp->main_display || !dcp->v14_7 || !dcp->v14_7->swap_timestamps)
 		return;
 
 	req->swap.timestamp[0] = 120;
