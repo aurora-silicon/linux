@@ -47,8 +47,8 @@ config DRM_APPLE_DCP_T6031
 	depends on DRM_APPLE_DCP_T6030
 	depends on OF_DYNAMIC
 	help
-	  Lets the common Apple display driver adopt the J516C and J514C
-	  (T6031) internal display coprocessor, which the boot loader hands
+	  Lets the common Apple display driver adopt the J516C (T6031)
+	  internal display coprocessor, which the boot loader hands
 	  over running DCP firmware 14.7.0, with the J514S session and
 	  presentation paths at the T6031 addresses.
 
