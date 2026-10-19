@@ -5,7 +5,9 @@
 //! The firmware build is the SHA-256 of TEXT with the 8 entropy bytes after the single
 //! `GKTS\x08\0\0\0` marker zeroed, plus the segment sizes, looked up in the SoC
 //! configuration's `firmware` list; the hardware revision is checked against its `hw_ids` at
-//! start ([`super::boot`]). An unknown build or revision is refused with its measured identity.
+//! start ([`super::boot`]). An unknown build or revision is refused with its measured identity;
+//! an unknown build's refusal also says what to report so that it can be pinned. The pure
+//! lookup is in [`lookup`] (host-tested).
 //! The canonical object VAs, the initdata graph, the board images and the work layouts all
 //! belong to one build, so nothing is written before the build is identified.
 //!
@@ -17,6 +19,10 @@ use kernel::{bindings, device, fmt, prelude::*};
 
 use super::boot::glue;
 use super::hw::FirmwareBuild;
+
+mod lookup;
+
+use lookup::{Measured, Verdict};
 
 /// Lowercase hex of a byte string, as `%*phN` prints it.
 pub(crate) struct Hex<'a>(pub(crate) &'a [u8]);
@@ -50,8 +56,16 @@ pub(crate) fn copy_physical(phys: u64, size: usize) -> Result<KVVec<u8>> {
     Ok(copy?)
 }
 
-/// The GKTS marker: the 8 bytes after it are per-boot entropy.
-const MARKER: [u8; 8] = [0x47, 0x4b, 0x54, 0x53, 0x08, 0, 0, 0];
+impl From<&FirmwareBuild> for Measured {
+    fn from(build: &FirmwareBuild) -> Self {
+        Measured {
+            text_size: build.text_size,
+            data_size: build.data_size,
+            marker: build.marker,
+            sha256: build.text_sha256,
+        }
+    }
+}
 
 /// Identifies the loaded firmware build: the pinned build, or `None` for a build admitted by
 /// its digest prefix (`g15_accept_text_prefix`).
@@ -63,56 +77,49 @@ pub(crate) fn firmware(
     let size = usize::try_from(adt.text.end - adt.text.start)?;
     let data_size = adt.data.end - adt.data.start;
     let mut copy = copy_physical(adt.text.start, size)?;
-    let mut at = 0usize;
-    let mut found = 0usize;
-    let mut off = 0usize;
-    while off + 16 <= size {
-        if copy[off..off + 8] == MARKER {
-            at = off;
-            found += 1;
-        }
-        off += 8;
-    }
-    if found != 1 {
+    let at = lookup::marker(&copy).map_err(|found| {
         dev_err!(
             dev,
             "GPU firmware TEXT has {} GKTS markers, need one\n",
             found
         );
-        return Err(EINVAL);
-    }
+        EINVAL
+    })?;
     copy[at + 8..at + 16].fill(0);
-    let digest = glue::sha256(&copy);
-    for build in builds {
-        if build.text_size == size as u64
-            && build.data_size == data_size
-            && build.marker as usize == at
-            && build.text_sha256 == digest
-        {
+    let m = Measured {
+        text_size: size as u64,
+        data_size,
+        marker: u32::try_from(at)?,
+        sha256: glue::sha256(&copy),
+    };
+    let qualified = builds.iter().map(Measured::from);
+    match lookup::verdict(&m, qualified, super::params::accept_text_prefix()) {
+        Verdict::Pinned(i) => {
+            let build = builds.get(i).ok_or(EINVAL)?;
             dev_info!(dev, "GPU firmware build: {}\n", build.name);
             return Ok(Some(build));
         }
-    }
-    let prefix = u64::from_be_bytes(digest[..8].try_into().map_err(|_| EINVAL)?);
-    let accepted = super::params::accept_text_prefix();
-    if accepted != 0 && accepted == prefix {
-        dev_warn!(
-            dev,
-            "GPU firmware build admitted by g15_accept_text_prefix: TEXT {:#x} DATA {:#x} GKTS {:#x} sha256 {}\n",
-            size,
-            data_size,
-            at,
-            Hex(&digest)
-        );
-        return Ok(None);
+        Verdict::Admitted => {
+            dev_warn!(
+                dev,
+                "GPU firmware build admitted by g15_accept_text_prefix: TEXT {:#x} DATA {:#x} GKTS {:#x} sha256 {}\n",
+                size,
+                data_size,
+                at,
+                Hex(&m.sha256)
+            );
+            return Ok(None);
+        }
+        Verdict::Refused => {}
     }
     dev_err!(
         dev,
-        "unsupported GPU firmware build: TEXT {:#x} DATA {:#x} GKTS {:#x} sha256 {}\n",
+        "unsupported GPU firmware build: TEXT {:#x} DATA {:#x} GKTS {:#x} sha256 {}; {}\n",
         size,
         data_size,
         at,
-        Hex(&digest)
+        Hex(&m.sha256),
+        lookup::REPORT_HINT
     );
     for build in builds {
         dev_err!(dev, "supported: {}\n", build.name);
