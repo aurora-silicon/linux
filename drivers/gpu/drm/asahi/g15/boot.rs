@@ -400,7 +400,7 @@ pub(crate) struct Orphan {
 impl Orphan {
     /// Drains the receive rings, if they exist.
     pub(crate) fn drain(&mut self) -> Result {
-        if let Some(channels) = &self.channels {
+        if let Some(channels) = &mut self.channels {
             channels.drain_rings(&self.session.dev, &mut self.events)?;
         }
         Ok(())

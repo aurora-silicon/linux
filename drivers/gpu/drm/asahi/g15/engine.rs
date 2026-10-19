@@ -393,6 +393,8 @@ pub(crate) struct Engine {
     pub(crate) prof: Prof,
     /// The `asahi-g15/stats` file.
     pub(crate) debugfs: Option<Pin<KBox<kernel::debugfs::File<Arc<Shared>>>>>,
+    /// The `asahi-g15/pstate` file.
+    pub(crate) debugfs_pstate: Option<Pin<KBox<kernel::debugfs::File<Arc<Shared>>>>>,
     scratch: Option<KBox<Scratch>>,
 }
 
@@ -427,6 +429,7 @@ impl Engine {
             stats: Stats::default(),
             prof: Prof::default(),
             debugfs: None,
+            debugfs_pstate: None,
             scratch: None,
         }
     }

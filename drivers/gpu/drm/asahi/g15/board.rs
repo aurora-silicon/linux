@@ -92,6 +92,12 @@ pub(crate) const DVFS_STATES: usize = 9;
 const DVFS_A: [usize; DVFS_STATES] = [0, 1, 2, 3, 5, 7, 9, 11, 13];
 const DVFS_B: [usize; DVFS_STATES] = [0, 1, 2, 3, 4, 6, 8, 10, 12];
 
+/// Table A's frequency of each firmware DVFS state, MHz: the ADT (or device-tree) operating
+/// points the firmware's state indices name.
+pub(crate) fn table_a_mhz(adt: &GpuAdt) -> [u32; DVFS_STATES] {
+    DVFS_A.map(|i| adt.perf_mhz[i])
+}
+
 fn put32(hw: &mut [u8], offset: usize, value: u32) -> Result {
     hw.get_mut(offset..offset + 4)
         .ok_or(EINVAL)?

@@ -63,6 +63,15 @@ fn stats_show(shared: &Arc<Shared>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     }
 }
 
+/// The `asahi-g15/pstate` file contents.
+fn pstate_show(shared: &Arc<Shared>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let state = shared.state.lock();
+    match state.as_deref() {
+        Some(firmware) => firmware.write_pstate(f),
+        None => Ok(()),
+    }
+}
+
 impl Shared {
     /// One poll pass (the poll work item).
     pub(crate) fn run_poll(self: Arc<Self>) {
@@ -151,17 +160,23 @@ impl Shared {
         self.mod_poll(1);
     }
 
-    /// Starts what the engine needs besides the firmware state: the `asahi-g15/stats` file.
+    /// Starts what the engine needs besides the firmware state: the `asahi-g15/stats` and
+    /// `asahi-g15/pstate` files.
     pub(crate) fn start_engine(self: &Arc<Self>) -> Result {
         let dir = debugfs::Dir::new(c_str!("asahi-g15"));
         let file = KBox::pin_init(
             dir.read_callback_file(c_str!("stats"), self.clone(), &stats_show),
             GFP_KERNEL,
         )?;
+        let pstate = KBox::pin_init(
+            dir.read_callback_file(c_str!("pstate"), self.clone(), &pstate_show),
+            GFP_KERNEL,
+        )?;
         let mut state = self.state.lock();
         let firmware = state.as_deref_mut().ok_or(ENODEV)?;
         firmware.engine.shared = Some(self.clone());
         firmware.engine.debugfs = Some(file);
+        firmware.engine.debugfs_pstate = Some(pstate);
         Ok(())
     }
 }
