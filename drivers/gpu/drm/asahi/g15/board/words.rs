@@ -209,8 +209,11 @@ pub(crate) fn power(
     for (i, zone) in w.zones.iter().enumerate() {
         let at = power::ZONES + power::ZONE_STRIDE * i;
         let (target, offset, filter) = (zone[0], zone[1], zone[2]);
+        let target_off = target
+            .checked_sub(offset)
+            .ok_or("a power zone's offset is larger than its target")?;
         put32(image, at, target)?;
-        put32(image, at + 4, target.wrapping_sub(offset))?;
+        put32(image, at + 4, target_off)?;
         put32(image, at + 8, filter)?;
     }
     put32(
@@ -508,6 +511,10 @@ mod tests {
         assert_eq!(get32(&img, 0x34), 8000);
         assert_eq!(get32(&img, 0x38), 3);
         assert_eq!(get32(&img, 0x3c), 0);
+        // An offset larger than its target has no target - offset word.
+        let under = PowerWords::new(w.values, &[100, 101, 1]).unwrap();
+        let mut img = vec![0u8; POWER_SIZE];
+        assert!(power(&mut img, 1, &under).is_err());
         // A filter time constant shorter than the sample period has no period count.
         let mut v = w.values;
         v[AVG_POWER_FILTER_TC_MS] = 4;
@@ -577,13 +584,13 @@ mod tests {
 
     /// Builder on the saved device tree == the private file's Globals and Power, byte for byte.
     /// Needs `G15_J516C_FIXTURES=<dir>` with `j516c.dtb` (`/sys/firmware/fdt` of the machine)
-    /// and `t6031-j516c-board.bin` (its board file); both stay off the tree. Skipped otherwise.
+    /// and `t6031-j516c-board.bin` (its board file); both stay off the tree, so the test is
+    /// ignored by default (`--ignored` runs it) and fails, rather than passes, without them.
     #[test]
+    #[ignore = "needs the off-tree J516C fixtures (G15_J516C_FIXTURES)"]
     fn j516c_fixture() {
-        let Some(dir) = std::env::var_os("G15_J516C_FIXTURES") else {
-            eprintln!("j516c_fixture: skipped, G15_J516C_FIXTURES is not set");
-            return;
-        };
+        let dir = std::env::var_os("G15_J516C_FIXTURES")
+            .expect("G15_J516C_FIXTURES names the directory with j516c.dtb and the board file");
         let dir = std::path::Path::new(&dir);
         let dtb = std::fs::read(dir.join("j516c.dtb")).unwrap();
         let blob = std::fs::read(dir.join("t6031-j516c-board.bin")).unwrap();
