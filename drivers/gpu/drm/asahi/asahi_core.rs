@@ -132,8 +132,8 @@ module! {
             description: "G15: completion repoll interval, us (25..1000)",
         },
         g15_idle_standby_us: u32 {
-            default: 2500,
-            description: "G15: firmware idle standby time, us (Globals +0x7a8, 100..100000)",
+            default: 0,
+            description: "G15: firmware idle standby time override, us (Globals +0x7a8, 100..100000; 0: the device tree's, else the tuned value)",
         },
         g15_idle_min_conf: u32 {
             default: 500,

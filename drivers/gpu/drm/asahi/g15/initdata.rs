@@ -297,11 +297,47 @@ pub(crate) fn build(
     }
     put64(&mut hw_img, hwdata::TIMESTAMPS, va::TIMESTAMPS)?;
     put32(&mut glob, globals::UNK_980, 100)?;
-    put32(
-        &mut glob,
-        globals::IDLE_STANDBY_US,
-        super::params::idle_standby_us(),
-    )?;
+    // The device tree's standby time (a machine with a firmware file; the templates' machine
+    // has none).
+    let dt_standby = match cfg.board {
+        hw::Board::Blob { .. } => {
+            let prop = board::words::PROPS[board::words::STANDBY_TIMER];
+            match dev
+                .of_node()
+                .ok_or(ENODEV)
+                .and_then(|n| n.get_property::<u32>(prop))
+            {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    dev_warn!(
+                        dev,
+                        "GPU node has no u32 {}, using the tuned idle standby\n",
+                        prop
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let (standby_us, standby_src, dt_rejected) = super::power::standby(
+        super::params::idle_standby_override_us(),
+        dt_standby,
+        hw::tuning::IDLE_STANDBY_US,
+    );
+    if dt_rejected {
+        dev_warn!(
+            dev,
+            "apple,idleoff-standby-timer is outside 100..100000 us, ignored\n"
+        );
+    }
+    dev_info!(
+        dev,
+        "idle standby {} us from {}\n",
+        standby_us,
+        standby_src.name()
+    );
+    put32(&mut glob, globals::IDLE_STANDBY_US, standby_us)?;
     put32(
         &mut glob,
         globals::IDLE_MIN_CONF,

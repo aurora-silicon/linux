@@ -514,6 +514,9 @@ pub(crate) mod engine {
 /// Tuned policy. Every value was chosen by measurement on hardware; only the ones in
 /// `params.rs` are tunable.
 pub(crate) mod tuning {
+    /// Firmware idle standby time, us, of a machine whose device tree does not provide one (the
+    /// T6030): with the template's 700 us the GPU powers down between works ~100 us apart.
+    pub(crate) const IDLE_STANDBY_US: u32 = 2500;
     /// Command objects (work images, microsequences, barriers, queue info, scheduling contexts,
     /// job lists, FW-only queue scratch) map ASC-cached (AttrIndex 0).
     pub(crate) const FW_CACHED: bool = true;

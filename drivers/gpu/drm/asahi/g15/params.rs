@@ -36,9 +36,9 @@ pub(crate) fn resnap_us() -> u32 {
     (*module_parameters::g15_resnap_us.value()).clamp(25, 1000)
 }
 
-/// Firmware idle standby time, us.
-pub(crate) fn idle_standby_us() -> u32 {
-    (*module_parameters::g15_idle_standby_us.value()).clamp(100, 100000)
+/// The explicit firmware idle standby time, us (0: not set).
+pub(crate) fn idle_standby_override_us() -> u32 {
+    *module_parameters::g15_idle_standby_us.value()
 }
 
 /// Firmware idle minimum confidence, permille.

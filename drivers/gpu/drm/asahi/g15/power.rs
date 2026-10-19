@@ -5,7 +5,8 @@
 //! The words and their rationale are in [`idle`]. Initdata writes them into the Globals image
 //! before the firmware first sees it:
 //!
-//! - +0x7a8 standby = `g15_idle_standby_us` (2500, clamped 100..100000);
+//! - +0x7a8 standby = `g15_idle_standby_us` when set (clamped 100..100000), else the GPU node's
+//!   `apple,idleoff-standby-timer`, else the tuned 2500 ([`idle::standby`]);
 //! - +0x7c4 minimum confidence = `g15_idle_min_conf` (500 permille as f32);
 //! - +0x30 predictive = 0 ([`super::hw::tuning::IDLE_PREDICTIVE`]): the finite delay, the GPU
 //!   powers down after the +0x9a0 delay (template 2, about 2 ms);
@@ -17,7 +18,7 @@
 
 mod idle;
 pub(crate) mod pstate;
-pub(crate) use idle::permille_f32;
+pub(crate) use idle::{permille_f32, standby};
 
 use kernel::{fmt, prelude::*};
 
