@@ -82,6 +82,11 @@ struct apple_rtkit {
 	bool crashlog_inherited;
 	bool oslog_inherited;
 
+	/* A crash reported before the crashlog buffer was mapped: the log is
+	 * read once the co-processor has written it. */
+	struct delayed_work crashlog_late_work;
+	unsigned int crashlog_late_polls;
+
 	struct workqueue_struct *wq;
 };
 
