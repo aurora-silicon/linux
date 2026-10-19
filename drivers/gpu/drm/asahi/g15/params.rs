@@ -61,7 +61,8 @@ pub(crate) fn accept_text_prefix() -> u64 {
     *module_parameters::g15_accept_text_prefix.value()
 }
 
-/// Maximum PB blocks with growth (64..=2048; the mapped heap holds 2048).
+/// The PB growth maximum the firmware is given, in blocks (64..=2048; the mapped heap holds
+/// 2048 and the blocks above this answer the synchronous requests of partial renders).
 pub(crate) fn pb_max_blocks() -> u32 {
     (*module_parameters::g15_pb_max_blocks.value()).clamp(64, super::hw::tuning::PB_MAX_BLOCKS)
 }

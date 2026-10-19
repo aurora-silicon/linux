@@ -324,7 +324,7 @@ impl Pools {
             pb_pages,
             pb_blocks,
             pb_heap,
-            ledger: Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, super::params::pb_max_blocks()),
+            ledger: Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS),
             c1_written: false,
             exhausted_logged: false,
             stats: PbStats::default(),
@@ -385,7 +385,7 @@ impl Pools {
         // PB: 8192 pages of 0x8000 in 2048 blocks of 0x20000; with growth the first initial
         // blocks of them and page limits at the maximum. In every profile the block list
         // declares its real 4096-record capacity.
-        self.ledger = Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, super::params::pb_max_blocks());
+        self.ledger = Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS);
         self.exhausted_logged = false;
         if tuning::PB_GROW {
             // C1 names the initial pages again.
@@ -415,9 +415,13 @@ impl Pools {
         })?;
         set.pb_manager.write(
             0,
+            // The maximum the firmware sees is the asynchronous growth limit, below the mapped
+            // heap: the blocks above it answer the synchronous requests a partial render makes
+            // (the firmware cannot finish a scene at its maximum without them; refused, its TA
+            // stalls and no kill ends it: ticket malik-na/linux-aurora#69).
             &buffer::pb_manager_image(
                 initial,
-                self.ledger.max,
+                self.soft_max(),
                 gva(&self.pb_pages)?,
                 gva(&self.pb_blocks)?,
                 set.block_ctl.va,
@@ -444,13 +448,20 @@ impl Pools {
         }
     }
 
-    /// The debugfs line `pb: blocks initial/posted/max requests grown refused bad`.
+    /// The firmware's growth maximum in blocks (`g15_pb_max_blocks`), at least the initial size
+    /// and at most the mapped heap.
+    pub(crate) fn soft_max(&self) -> u32 {
+        super::params::pb_max_blocks().clamp(self.ledger.initial, self.ledger.max)
+    }
+
+    /// The debugfs line `pb: blocks initial/posted/firmware-max/max requests grown refused bad`.
     pub(crate) fn write_stats(&self, f: &mut impl fmt::Write) -> fmt::Result {
         writeln!(
             f,
-            "pb: blocks {}/{}/{} requests {} grown {} refused {} bad {}",
+            "pb: blocks {}/{}/{}/{} requests {} grown {} refused {} bad {}",
             self.ledger.initial,
             self.ledger.posted,
+            self.soft_max(),
             self.ledger.max,
             self.stats.requests,
             self.stats.grown,
@@ -594,7 +605,9 @@ impl Firmware {
         };
         let ret = self.devctl(&reply, true);
         let ledger = self.pools.ledger;
-        let info = self.pools.ledger.log_answer(request, n, ret.is_err());
+        let soft = self.pools.soft_max();
+        let past_soft = n != 0 && ledger.posted > soft && ledger.posted - n <= soft;
+        let info = self.pools.ledger.log_answer(request, n, ret.is_err()) || past_soft;
         let (counter, position) = (
             request[buffer::grow_request::COUNTER],
             request[buffer::grow_request::POSITION],
