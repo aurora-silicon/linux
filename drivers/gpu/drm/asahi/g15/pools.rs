@@ -118,6 +118,8 @@ pub(crate) struct Pools {
     pub(crate) ledger: Ledger,
     /// C1 names the current initial pages.
     c1_written: bool,
+    /// The unanswered-at-the-maximum warning was given since the last initialization.
+    exhausted_logged: bool,
     pub(crate) stats: PbStats,
 }
 
@@ -322,8 +324,9 @@ impl Pools {
             pb_pages,
             pb_blocks,
             pb_heap,
-            ledger: Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS),
+            ledger: Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, super::params::pb_max_blocks()),
             c1_written: false,
+            exhausted_logged: false,
             stats: PbStats::default(),
         })
     }
@@ -382,7 +385,8 @@ impl Pools {
         // PB: 8192 pages of 0x8000 in 2048 blocks of 0x20000; with growth the first initial
         // blocks of them and page limits at the maximum. In every profile the block list
         // declares its real 4096-record capacity.
-        self.ledger = Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS);
+        self.ledger = Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, super::params::pb_max_blocks());
+        self.exhausted_logged = false;
         if tuning::PB_GROW {
             // C1 names the initial pages again.
             self.c1_written = false;
@@ -490,7 +494,11 @@ impl Firmware {
     /// firmware object access failed) is logged and left unanswered like an invalid one. Never
     /// fails: the poll pass continues.
     pub(crate) fn answer_growth(&mut self) -> Result {
-        while !self.events.grow.is_empty() {
+        // Only the requests queued before this pass: a reply's wait drains the rings and may
+        // queue the next request, which the next pass answers (the device lock is released in
+        // between).
+        let queued = self.events.grow.len();
+        for _ in 0..queued {
             let Ok(request) = self.events.grow.remove(0) else {
                 break;
             };
@@ -521,6 +529,23 @@ impl Firmware {
             .iter()
             .enumerate()
             .any(|(i, f)| self.receipts(i).renders != 0 && f.job.vm.slot == ctx);
+        // At the maximum, after the refusals, the request is left to the deadline: a scene the
+        // firmware cannot finish without more PB stalls its TA, and the host deadline recovers.
+        if self.pools.ledger.exhausted() {
+            self.pools.stats.bad += 1;
+            if !self.pools.exhausted_logged {
+                self.pools.exhausted_logged = true;
+                dev_warn!(
+                    self.dev(),
+                    "PB growth request {} ctx {} left unanswered: {} refusals at the maximum ({} blocks); the host deadline applies\n",
+                    request[buffer::grow_request::COUNTER],
+                    ctx,
+                    self.pools.ledger.refusals,
+                    self.pools.ledger.max
+                );
+            }
+            return Ok(());
+        }
         // A request from before a halt has no authority over the PB now.
         if !self
             .pools

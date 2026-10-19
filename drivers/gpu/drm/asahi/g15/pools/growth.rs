@@ -26,7 +26,16 @@ pub(crate) struct Ledger {
     pub(crate) next_request: u32,
     /// A refusal at the maximum was logged since the last initialization.
     pub(crate) refusal_logged: bool,
+    /// Refusals answered at the maximum since the last initialization. After
+    /// [`MAX_REFUSALS`] further requests are left unanswered: a firmware that keeps asking at
+    /// the maximum instead of finishing the scene with partial renders would otherwise be
+    /// answered forever, under the device lock (ticket malik-na/linux-aurora#69); unanswered,
+    /// its TA stalls and the host deadline recovers.
+    pub(crate) refusals: u32,
 }
+
+/// Refusals answered at the maximum before requests are left to the deadline.
+pub(crate) const MAX_REFUSALS: u32 = 2;
 
 impl Ledger {
     /// A fresh ledger. With growth, the initial size is clamped to 64..=2048 blocks and the
@@ -44,6 +53,7 @@ impl Ledger {
             posted: initial,
             next_request: 0,
             refusal_logged: false,
+            refusals: 0,
         }
     }
 
@@ -52,11 +62,18 @@ impl Ledger {
         self.posted % BLOCK_LIST_RECORDS
     }
 
+    /// Whether the refusals at the maximum are used up: further requests go unanswered.
+    pub(crate) const fn exhausted(&self) -> bool {
+        self.refusals >= MAX_REFUSALS
+    }
+
     /// Whether `request` may be answered: growth on, an event of type 7 for PB slot 0 from a
     /// context with a published render prefix (`live`), a counter not below the next expected
-    /// one and the current halt epoch.
+    /// one, the current halt epoch, and refusals at the maximum not used up.
     pub(crate) fn admits(&self, request: &[u32; 14], grow: bool, live: bool, epoch: u64) -> bool {
-        grow && request[grow_request::TYPE] == 7
+        !self.exhausted()
+            && grow
+            && request[grow_request::TYPE] == 7
             && request[grow_request::SLOT] == 0
             && live
             && request[grow_request::COUNTER] >= self.next_request
@@ -68,7 +85,11 @@ impl Ledger {
     /// refusal at the maximum.
     pub(crate) fn accept(&mut self, request: &[u32; 14]) -> (u32, u32) {
         self.next_request = request[grow_request::COUNTER].wrapping_add(1);
-        (self.posted, GROW_STEP.min(self.max - self.posted))
+        let count = GROW_STEP.min(self.max - self.posted);
+        if count == 0 {
+            self.refusals += 1;
+        }
+        (self.posted, count)
     }
 
     /// Records `count` blocks as posted after their records were written and returns the new
@@ -189,6 +210,15 @@ mod tests {
         // A stale (repeated) counter is refused, a later one accepted.
         assert!(!l.admits(&request(5, counter - 1, 1), true, true, 1));
         assert!(l.admits(&request(5, counter + 3, 1), true, true, 1));
+        // One refusal was answered above; one more is, then requests go unanswered.
+        assert_eq!(l.refusals, 1);
+        assert!(!l.exhausted());
+        let q = request(5, counter + 3, 1);
+        assert_eq!(l.accept(&q), (1024, 0));
+        assert!(l.exhausted());
+        assert!(!l.admits(&request(5, counter + 4, 1), true, true, 1));
+        // A fresh ledger starts over.
+        assert!(!Ledger::new(true, 512, 1024).exhausted());
     }
 
     #[test]
