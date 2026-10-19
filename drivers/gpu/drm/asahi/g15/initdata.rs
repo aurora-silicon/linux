@@ -160,9 +160,10 @@ fn templates(
 /// HardwareDataA word holding the system counter at initdata creation.
 const HWDATA_A_INIT_TIMESTAMP: usize = 0x424c;
 
-/// Board images from the SoC's firmware file. The file is this machine's own: its DVFS tables
-/// are kept, and checked for the top frequency of the device tree's operating points; its
-/// IOMapping records must name the layout's physical addresses. Returns the images and the
+/// Board images of a SoC with a firmware file. The hardware record is the file's, this
+/// machine's own: its IOMapping records must name the layout's physical addresses. Globals and
+/// Power are built from the device tree ([`board::device_tree`]); the file's copies are a
+/// cross-check: the start is refused at the first differing word. Returns the images and the
 /// top operating-point frequency in kHz.
 fn blob(
     dev: &device::Device,
@@ -193,6 +194,24 @@ fn blob(
             return Err(EINVAL);
         }
     }
+    let (glob, pwr, max_power_mw) = board::device_tree(dev, &hw_img)?;
+    for (what, built, file) in [
+        ("Globals", &glob, &images.globals),
+        ("Power", &pwr, &images.power),
+    ] {
+        if let Some((at, b, f)) = board::words::first_difference(built, file) {
+            dev_err!(
+                dev,
+                "board data: device-tree {} differs from {} at +{:#x}: built {:#x}, file {:#x}\n",
+                what,
+                name,
+                at,
+                b,
+                f
+            );
+            return Err(EINVAL);
+        }
+    }
     let max_mhz = adt.perf_mhz.iter().copied().max().unwrap_or(0);
     let now: u64;
     // SAFETY: Reading the architectural counter has no side effects.
@@ -202,11 +221,13 @@ fn blob(
     put64(&mut hw_img, hwdata::HWDATA_A + HWDATA_A_INIT_TIMESTAMP, now)?;
     dev_info!(
         dev,
-        "board data: {} images, {} MHz top operating point\n",
+        "board data: {} hardware record from {}, Globals and Power from the device tree (match the file), {} mW maximum power, {} MHz top operating point\n",
         cfg.name,
+        name,
+        max_power_mw,
         max_mhz
     );
-    Ok((hw_img, images.globals, images.power, max_mhz * 1000))
+    Ok((hw_img, glob, pwr, max_mhz * 1000))
 }
 
 /// Builds the initdata graph. Returns it with its channels and the top DVFS frequency in kHz.

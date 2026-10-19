@@ -8,16 +8,28 @@
 //! {0,1,2,3,4,6,8,10,12}; MHz at +0xb5c, +0xf9c, +0x1350, core mV +0xb9c, SRAM mV +0xd9c, top
 //! MHz +0x4dc4). The tables in [`data`] are generated, and every expanded image is checked
 //! against its hash at boot.
+//!
+//! A SoC whose board data comes from its device tree ([`super::hw::Platform::DeviceTree`]) gets
+//! its Globals and Power from [`device_tree`]: the G15S templates with the GPU node's power
+//! words and the hardware record's maximum power ([`words`]).
 
 pub(crate) mod blob;
 pub(crate) mod data;
 pub(crate) mod template;
+pub(crate) mod words;
 
 use kernel::{device, prelude::*};
 
 use super::adt::GpuAdt;
 use super::boot::glue;
+use super::fw::initdata::{globals, hwdata, power};
 pub(crate) use template::{Line, Template};
+
+static_assert!(words::GLOBALS_SIZE == globals::SIZE);
+static_assert!(words::POWER_SIZE == power::SIZE);
+static_assert!(words::HWDATA_A == hwdata::HWDATA_A);
+static_assert!(words::HWDATA_A_MAX_POWER == hwdata::MAX_POWER_A);
+static_assert!(words::TOP_STATE as usize == DVFS_STATES - 1);
 
 /// Expands a template into `out` and verifies its hash.
 pub(crate) fn expand(template: &Template, out: &mut [u8]) -> Result {
@@ -26,6 +38,53 @@ pub(crate) fn expand(template: &Template, out: &mut [u8]) -> Result {
         return Err(EINVAL);
     }
     Ok(())
+}
+
+/// The GPU node's power words ([`words::PROPS`] and [`words::ZONES`]).
+fn power_words(dev: &device::Device) -> Result<words::PowerWords> {
+    let node = dev.of_node().ok_or(ENODEV)?;
+    let mut values = [0u32; words::PROPS.len()];
+    for (value, name) in values.iter_mut().zip(words::PROPS.iter()) {
+        *value = node
+            .get_property(name)
+            .inspect_err(|_| dev_err!(dev, "GPU node has no u32 {}\n", name))?;
+    }
+    let zones: KVec<u32> = node.get_opt_property(words::ZONES)?.unwrap_or_default();
+    words::PowerWords::new(values, &zones).map_err(|why| {
+        dev_err!(dev, "GPU node power words: {}\n", why);
+        EINVAL
+    })
+}
+
+/// Globals and Power of a device-tree SoC: the verified G15S templates with the GPU node's
+/// power words and the maximum power of `hardware`, this machine's hardware record. Returns the
+/// two images and that maximum power in mW.
+pub(crate) fn device_tree(
+    dev: &device::Device,
+    hardware: &[u8],
+) -> Result<(KVVec<u8>, KVVec<u8>, u32)> {
+    let w = power_words(dev)?;
+    let at = hwdata::HWDATA_A + hwdata::MAX_POWER_A;
+    let max_power_mw = u32::from_le_bytes(
+        hardware
+            .get(at..at + 4)
+            .ok_or(EINVAL)?
+            .try_into()
+            .map_err(|_| EINVAL)?,
+    );
+    let mut glob = KVVec::from_elem(0u8, globals::SIZE, GFP_KERNEL)?;
+    let mut pwr = KVVec::from_elem(0u8, power::SIZE, GFP_KERNEL)?;
+    if expand(&data::GLOBALS, &mut glob).is_err() || expand(&data::POWER, &mut pwr).is_err() {
+        dev_err!(dev, "board data template hash mismatch\n");
+        return Err(EINVAL);
+    }
+    words::globals(&mut glob, max_power_mw, &w)
+        .and_then(|()| words::power(&mut pwr, max_power_mw, &w))
+        .map_err(|why| {
+            dev_err!(dev, "board data from the device tree: {}\n", why);
+            EINVAL
+        })?;
+    Ok((glob, pwr, max_power_mw))
 }
 
 /// DVFS states of the firmware tables.

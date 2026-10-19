@@ -135,6 +135,9 @@ pub(crate) mod hwdata {
     pub(crate) const COMPUTE_ACTIVITY: usize = 0x3740;
     /// HardwareDataA: the maintained S8 request words.
     pub(crate) const HWDATA_A: usize = 0x4580;
+    /// HardwareDataA word holding the machine's maximum GPU power in mW (Globals +0x78 and
+    /// Power +0xd0 repeat it).
+    pub(crate) const MAX_POWER_A: usize = 0x6a4;
     pub(crate) const FAULT_INFO: usize = 0x8900;
 }
 

@@ -8,8 +8,9 @@
 //! device tree node the boot loader fills, not an ADT export), the GPU power (its power domain;
 //! there is no PMP vote), the initdata root version, a longer HardwareData record (0xb480
 //! bytes, its fourth view at +0xb400) placed aligned and ASC-cached, the IOMapping table (17
-//! slots at the T6031 register blocks) and the board images, which come from a firmware file
-//! rather than built-in templates. Every value was measured on a J516C: the SGX identification
+//! slots at the T6031 register blocks) and the board images: the hardware record from a
+//! firmware file, Globals and Power from the device tree, checked against that file. Every
+//! value was measured on a J516C: the SGX identification
 //! registers, the loaded firmware segment, the device tree the boot loader hands over and the
 //! initdata of that machine.
 
@@ -97,10 +98,11 @@ pub(crate) const LAYOUT: Layout = Layout {
     iomaps: &IOMAPS,
 };
 
-/// The J516C board images (`asahi/t6031-j516c-board.bin`, built into the kernel): the
-/// hardware record, Globals and the power block that this machine's firmware accepted, as the
-/// earlier J516C driver uploaded them (its device-tree-built records with the per-board words
-/// of this machine applied). Kept out of the tree; pinned by its SHA-256.
+/// The J516C board file (`asahi/t6031-j516c-board.bin`, built into the kernel): the hardware
+/// record, Globals and the power block that this machine's firmware accepted, as the earlier
+/// J516C driver uploaded them (its device-tree-built records with the per-board words of this
+/// machine applied). Kept out of the tree; pinned by its SHA-256. The hardware record is taken
+/// from it; Globals and Power are built from the device tree and must match the file's.
 const BOARD_SHA256: [u8; 32] = [
     0x4e, 0x03, 0xf2, 0x9f, 0xa4, 0x47, 0xdc, 0xeb, 0xfd, 0x4d, 0x1c, 0x22, 0x5a, 0x64, 0x7b,
     0xfa, 0x31, 0xb3, 0x63, 0x45, 0x8f, 0x28, 0x33, 0x82, 0x3a, 0x5c, 0xa8, 0xa1, 0x0e, 0xdf,
