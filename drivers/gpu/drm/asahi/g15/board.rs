@@ -11,38 +11,18 @@
 
 pub(crate) mod blob;
 pub(crate) mod data;
+pub(crate) mod template;
 
 use kernel::{device, prelude::*};
 
 use super::adt::GpuAdt;
 use super::boot::glue;
-
-/// One template line: 16 bytes at `offset`.
-pub(crate) struct Line {
-    pub(crate) offset: u32,
-    pub(crate) data: [u8; 16],
-}
-
-/// A sparse template.
-pub(crate) struct Template {
-    pub(crate) size: usize,
-    pub(crate) lines: &'static [Line],
-    pub(crate) sha256: [u8; 32],
-}
+pub(crate) use template::{Line, Template};
 
 /// Expands a template into `out` and verifies its hash.
 pub(crate) fn expand(template: &Template, out: &mut [u8]) -> Result {
-    let out = out.get_mut(..template.size).ok_or(EINVAL)?;
-    out.fill(0);
-    for line in template.lines {
-        let offset = line.offset as usize;
-        if offset >= template.size {
-            return Err(EINVAL);
-        }
-        let n = 16.min(template.size - offset);
-        out[offset..offset + n].copy_from_slice(&line.data[..n]);
-    }
-    if glue::sha256(out) != template.sha256 {
+    template::fill(template, out).map_err(|_| EINVAL)?;
+    if glue::sha256(&out[..template.size]) != template.sha256 {
         return Err(EINVAL);
     }
     Ok(())
