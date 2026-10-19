@@ -345,6 +345,34 @@ static bool trampoline_set_tiling_state_v27(struct apple_dcp *dcp, int tag,
 #include "iomfb-external-counts-v27.inc"
 #include "iomfb-boolean-properties-v27.inc"
 
+#define DCP_ANALYTICS_EVENT_SIZE 0x1044
+#define DCP_ANALYTICS_FULL_DUMPS 16
+
+/*
+ * D113 CoreAnalyticsSendEvent. The firmware reports an analytics event, its
+ * name first ("com.apple.iomfb...."); both DCP firmware crashes seen on T6050
+ * were announced by one. Log the name, and the payload of the first few.
+ */
+static bool dcpep_cb_core_analytics_v27(struct apple_dcp *dcp, int tag,
+					void *out, void *in)
+{
+	const u8 *event = in;
+	unsigned int len = DCP_ANALYTICS_EVENT_SIZE;
+	char name[128];
+
+	strscpy(name, event, sizeof(name));
+	dev_info_ratelimited(dcp->dev, "CoreAnalytics event %s\n", name);
+	if (dcp->analytics_dumps < DCP_ANALYTICS_FULL_DUMPS) {
+		dcp->analytics_dumps++;
+		while (len && !event[len - 1])
+			len--;
+		print_hex_dump(KERN_INFO, "dcp analytics: ", DUMP_PREFIX_OFFSET,
+			       32, 1, event, len, true);
+	}
+	*(__le32 *)out = 0;
+	return true;
+}
+
 static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[0] = dcpep_cb_d000_h17p,
 	[1] = trampoline_true,
@@ -362,7 +390,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[110] = trampoline_true,
 	[111] = trampoline_create_backlight_service,
 	[112] = trampoline_true,
-	[113] = trampoline_zero,
+	[113] = dcpep_cb_core_analytics_v27,
 	[116] = trampoline_nop,
 	[117] = trampoline_zero,
 	[118] = trampoline_zero,
