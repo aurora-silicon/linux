@@ -27,6 +27,8 @@ struct dcp_v14_board {
 	u32 panel_width, panel_height;
 	/* The panel may have a 120 Hz timing besides 60 Hz. */
 	bool promotion;
+	/* A472 panel power and its resume callbacks are known on this board. */
+	bool panel_power;
 	/*
 	 * Log what the first boots of a new board are judged by, not only with
 	 * debugging on: every panel timing the firmware offers, and the display

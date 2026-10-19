@@ -89,6 +89,7 @@ static const struct dcp_v14_board dcp_v14_board_j613 = {
 	.panel_width = 2560,
 	.panel_height = 1664,
 	.promotion = false,
+	.panel_power = true,
 	.ctm_set = A(421),
 	.ctm_get = A(420),
 };
@@ -187,6 +188,8 @@ struct apple_dcp_v14 {
 	struct work_struct stopped_work;
 	bool failed;
 	bool started;
+	/* The panel acknowledged A472(0); no swaps until A472(1) succeeds. */
+	bool panel_off;
 
 	/*
 	 * An external processor: no panel. Its modes come from the
@@ -896,6 +899,15 @@ static int dcp_v14_callback(void *cookie, u32 tag, const void *input, u32 in_siz
 	}
 
 #define SHAPE(i, o) (in_size == (i) && out_size == (o))
+	/* Notifications sent by J613 panel power transitions, also on wake. */
+	if (v14->board && v14->board->panel_power) {
+		if ((tag == D(2) && SHAPE(0, 0)) ||
+		    (tag == D(591) && SHAPE(20, 0)) ||
+		    (tag == D(593) && SHAPE(4, 0)))
+			return 0;
+		if (tag == D(574) && SHAPE(4, 4))
+			return in[0] > 1 ? -EINVAL : 0;
+	}
 	/*
 	 * Backlight correction notification: one signed 32-bit factor, no
 	 * reply payload. The firmware applies it when the colour matrix
@@ -2519,6 +2531,11 @@ static int dcp_v14_swap(struct apple_dcp_v14 *v14, const u8 *surface, u64 iova,
 		return -ENOMEM;
 
 	mutex_lock(&v14->lock);
+	if (v14->panel_off) {
+		mutex_unlock(&v14->lock);
+		kfree(swap);
+		return -EAGAIN;
+	}
 	admission.generation = v14->description_generation;
 	/*
 	 * A colour matrix the firmware refuses costs night light, not the
@@ -2580,6 +2597,12 @@ static bool dcp_v14_present(struct apple_dcp_v14 *v14, struct drm_framebuffer *f
 	ret = dcp_v14_swap(v14, fb ? surface : NULL, iova, fb ? width : 0,
 			   fb ? height : 0, dst_y, ctm_state);
 	elapsed = ktime_get_ns() - start;
+	/* A powered-off panel took no frame: the old framebuffer stays pinned. */
+	if (ret == -EAGAIN && !v14->external && !READ_ONCE(v14->failed)) {
+		if (fb)
+			drm_framebuffer_put(fb);
+		return false;
+	}
 	if (ret && v14->external && !READ_ONCE(v14->failed)) {
 		/* Refused before it was taken: the old framebuffer stays on screen. */
 		if (fb)
@@ -2907,14 +2930,56 @@ void iomfb_v14_7_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		dcp_v14_cancel_event(dcp);
 }
 
+/*
+ * The boot loader leaves the panel on. Keep the old state on a refused
+ * transition, so a later enable can retry. A CRTC enable requests the internal
+ * panel: A475(1) must precede A472(1), otherwise the firmware's uninitialised
+ * lid state can select the external route instead. The coprocessor stays on.
+ * Called with the RPC lock held, after the final black frame on power-off.
+ */
+static int dcp_v14_panel_set_power(struct apple_dcp_v14 *v14, bool on)
+{
+	u8 power[12] = {}, reply[8] = {}, panel[4] = { 1 };
+	int ret;
+
+	if (v14->panel_off == !on)
+		return 0;
+	if (on) {
+		ret = dcp_v14_call(v14, A(475), panel, sizeof(panel), NULL, 0, 0);
+		if (ret)
+			return ret;
+	}
+	power[0] = on;
+	ret = dcp_v14_call(v14, A(472), power, sizeof(power), reply, sizeof(reply), 0);
+	if (ret)
+		return ret;
+	if (get_unaligned_le32(reply + 4))
+		return -EIO;
+	v14->panel_off = !on;
+	return 0;
+}
+
 void iomfb_v14_7_poweron(struct apple_dcp *dcp)
 {
-	/* The panel stays on; the next swap shows the plane again. */
+	struct apple_dcp_v14 *v14 = dcp->v14;
+	int ret;
+
+	if (!v14 || !v14->started || !v14->board || !v14->board->panel_power)
+		return;
+	mutex_lock(&v14->lock);
+	ret = v14->failed ? -EIO :
+		dcp_v14_panel_set_power(v14, true);
+	if (!ret)
+		v14->ctm_valid = false;
+	mutex_unlock(&v14->lock);
+	if (ret)
+		dev_warn(dcp->dev, "panel power-on failed: %d\n", ret);
 }
 
 void iomfb_v14_7_poweroff(struct apple_dcp *dcp)
 {
 	struct apple_dcp_v14 *v14 = dcp->v14;
+	int ret;
 
 	/* An external display is powered down; the next enable sets its mode again. */
 	if (dcp->external) {
@@ -2927,7 +2992,17 @@ void iomfb_v14_7_poweroff(struct apple_dcp *dcp)
 		dcp_mode_invalidate(&dcp->mode_state);
 		return;
 	}
-	/* Blank to black; the panel and the DCP stay powered. */
-	if (v14 && v14->started)
-		dcp_v14_present(v14, NULL, 0, 0, 0, NULL);
+	if (!v14 || !v14->started || READ_ONCE(v14->panel_off))
+		return;
+	/* Complete the black frame before powering off or releasing its surface. */
+	if (!dcp_v14_present(v14, NULL, 0, 0, 0, NULL))
+		return;
+	if (!v14->board || !v14->board->panel_power)
+		return;
+	mutex_lock(&v14->lock);
+	ret = v14->failed ? -EIO :
+		dcp_v14_panel_set_power(v14, false);
+	mutex_unlock(&v14->lock);
+	if (ret)
+		dev_warn(dcp->dev, "panel power-off failed: %d\n", ret);
 }
