@@ -510,6 +510,8 @@ struct apple_dcp {
 
 	/* DCP has crashed */
 	bool crashed;
+	/* CoreAnalytics events dumped in full (dcpep_cb_core_analytics_v27). */
+	u32 analytics_dumps;
 
 	DECLARE_BITMAP(iomfb_surfaces, DCP_MAX_PLANES);
 
