@@ -23,7 +23,10 @@
 //!   it), so an engine idle for `g15_pb_idle_ms` with more than `g15_pb_reclaim_blocks` posted
 //!   re-initializes the PB at its next render through the recovery re-init path (fresh lists
 //!   and manager, InitBM of the initial blocks, no halt) and frees the backing above the kept
-//!   chunks. The native driver does the equivalent by replacing a live queue's PB manager.
+//!   chunks (also with fewer posted, when more is backed than they need); an engine idle for
+//!   50 ms (a client boundary) with more than half the maximum posted re-initializes it the
+//!   same way but keeps the backing. The native driver does the equivalent by replacing a
+//!   live queue's PB manager.
 //! - Growth: the event drain queues type-7 requests; [`Firmware::answer_growth`] answers each
 //!   one in the poll pass: type 7, PB slot 0, the context of a live published render prefix,
 //!   counter >= next expected, epoch == current halt count; write records `(G - 0x1000000000)
@@ -725,10 +728,13 @@ impl Firmware {
     }
 
     /// Reclaims the PB when the engine has been idle for `g15_pb_idle_ms` with more than
-    /// `g15_pb_reclaim_blocks` posted: the next render prefix re-initializes the render
-    /// allocators and the PB (InitBM of the initial blocks; `recovery.reinit`, as after a
-    /// recovered abort but with no halt), and with `g15_pb_reclaim` 2 the backing chunks above
-    /// those of the initial posting and the reserve are freed now, unmapped from every open VM
+    /// `g15_pb_reclaim_blocks` posted or more backing than the posted blocks need, or for
+    /// [`growth::DRAIN_IDLE_NS`] with more than half the maximum posted
+    /// ([`growth::Ledger::drain_reinit_due`]; re-initialization only): the next render prefix
+    /// re-initializes the render allocators and the PB (InitBM of the initial blocks;
+    /// `recovery.reinit`, as after a recovered abort but with no halt), and with
+    /// `g15_pb_reclaim` 2 the backing chunks above those of the initial posting and the reserve
+    /// are freed now, unmapped from every open VM
     /// (a VM that publishes later drops its stale mappings at [`VmState::map_heap`]). Called
     /// under the device lock when a job arrives at an idle engine and in idle poll passes.
     pub(crate) fn reclaim_check(&mut self) {
@@ -745,18 +751,19 @@ impl Firmware {
         }
         let idle_ns = self.pools.idle.idle_ns(super::engine::now_ns());
         let floor = super::params::pb_reclaim_blocks();
-        if !self
-            .pools
-            .ledger
-            .reclaim_due(floor, idle_ns, super::params::pb_idle_ns())
-        {
+        let min_idle = super::params::pb_idle_ns();
+        let ledger = &self.pools.ledger;
+        let idle = ledger.reclaim_due(floor, idle_ns, min_idle)
+            || (level >= 2 && ledger.free_due(idle_ns, min_idle));
+        if !idle && !self.pools.ledger.drain_reinit_due(idle_ns) {
             return;
         }
         self.recovery.reinit = true;
         self.pools.stats.reclaims += 1;
         let posted = self.pools.ledger.posted;
         let mut freed = 0;
-        if level >= 2 {
+        // A short idle keeps the backing: the next scene would allocate it again.
+        if level >= 2 && idle {
             let keep = self.pools.ledger.keep_chunks() as usize;
             freed = self.pools.free_chunks(keep);
             self.pools.stats.freed += freed as u64;
