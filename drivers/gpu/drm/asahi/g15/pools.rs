@@ -46,6 +46,13 @@ use crate::driver::AsahiDevice;
 
 pub(crate) use growth::Ledger;
 
+/// The ledger of the heap, which is allocated whole.
+fn whole_ledger() -> Ledger {
+    let mut ledger = Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS);
+    ledger.unback_to(growth::MAX_CHUNKS);
+    ledger
+}
+
 static_assert!(buffer::MAX_BLOCKS == sizes::PB_BLOCKS);
 static_assert!(buffer::MAX_PAGES == sizes::PB_PAGES);
 static_assert!(buffer::BLOCK_LIST_RECORDS == sizes::PB_LIST_RECORDS);
@@ -324,7 +331,7 @@ impl Pools {
             pb_pages,
             pb_blocks,
             pb_heap,
-            ledger: Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS),
+            ledger: whole_ledger(),
             c1_written: false,
             exhausted_logged: false,
             stats: PbStats::default(),
@@ -385,7 +392,7 @@ impl Pools {
         // PB: 8192 pages of 0x8000 in 2048 blocks of 0x20000; with growth the first initial
         // blocks of them and page limits at the maximum. In every profile the block list
         // declares its real 4096-record capacity.
-        self.ledger = Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS);
+        self.ledger = whole_ledger();
         self.exhausted_logged = false;
         if tuning::PB_GROW {
             // C1 names the initial pages again.
@@ -578,7 +585,11 @@ impl Firmware {
             );
             return Ok(());
         }
-        let (first, n) = self.pools.ledger.accept(request);
+        let (first, n) = match self.pools.ledger.accept(request) {
+            growth::Answer::Grant { first, count } => (first, count),
+            // The heap is backed whole: no request waits.
+            growth::Answer::Refuse | growth::Answer::Wait => (0, 0),
+        };
         let heap = gva(&self.pools.pb_heap)?;
         for b in first..first + n {
             self.pools.pb_blocks.w64(
