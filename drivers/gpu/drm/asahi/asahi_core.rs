@@ -155,6 +155,18 @@ module! {
             default: 64,
             description: "G15: parameter-buffer blocks of 128 KiB posted at (re)initialization (64..4095; the heap is backed on demand in 16 MiB chunks)",
         },
+        g15_pb_reclaim: u32 {
+            default: 2,
+            description: "G15: parameter-buffer reclaim when the engine has been idle: 0 never, 1 re-initialize the PB at the next render, 2 also free the backing above the reserve",
+        },
+        g15_pb_idle_ms: u32 {
+            default: 1000,
+            description: "G15: idle time before the parameter buffer is reclaimed, ms (at least 100)",
+        },
+        g15_pb_reclaim_blocks: u32 {
+            default: 1024,
+            description: "G15: parameter-buffer blocks posted above which an idle engine reclaims (a desktop stays below 1024)",
+        },
         g15_early_tiling: u32 {
             default: 0,
             description: "G15: advertise FRAGMENT_BARRIERS, mapped to early tiling (slower on 2419)",

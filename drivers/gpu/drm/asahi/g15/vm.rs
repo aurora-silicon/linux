@@ -176,7 +176,9 @@ impl VmState {
     /// it.
     pub(crate) fn map_heap(&self, gems: impl Iterator<Item = ARef<gem::Object>>) -> Result {
         let mut heap = self.heap.list.lock();
+        let mut n = 0;
         for (i, gem) in gems.enumerate() {
+            n = i + 1;
             if let Some(have) = heap.get(i) {
                 if core::ptr::eq(&*have.gem, &*gem) {
                     continue;
@@ -185,7 +187,14 @@ impl VmState {
             }
             Self::map_one(&self.vm, &mut heap, i, gem)?;
         }
+        // Chunks freed since this VM last mapped the heap.
+        heap.truncate(n);
         Ok(())
+    }
+
+    /// Unmaps the heap chunks from index `keep` on (freed by a reclaim).
+    pub(crate) fn unmap_heap_above(&self, keep: usize) {
+        self.heap.list.lock().truncate(keep);
     }
 
     /// Maps the newly backed chunk `i` into this VM (a VM with a flight at a refill).
@@ -309,6 +318,17 @@ impl Registry {
             .find(|state| state.id == id)
             .cloned()
             .ok_or(ENOENT)
+    }
+
+    /// The VMs whose client handle is open (and the closed ones not pruned yet), for a walk
+    /// that takes VM locks: not under the registry lock.
+    pub(crate) fn open(&self) -> Result<KVec<Arc<VmState>>> {
+        let vms = self.vms.lock();
+        let mut out = KVec::with_capacity(vms.len(), GFP_KERNEL)?;
+        for state in vms.iter() {
+            out.push(state.clone(), GFP_KERNEL)?;
+        }
+        Ok(out)
     }
 
     /// Latches `error` on every VM whose client handle is open. The fail-stop path calls it under

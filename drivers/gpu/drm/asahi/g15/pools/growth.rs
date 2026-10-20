@@ -204,6 +204,37 @@ impl Ledger {
     }
 }
 
+/// The engine's idle clock for the reclaim policy: when nothing was published and nothing
+/// pending, from the pass that retired the last flight on. Noted at the end of every poll pass
+/// and publication (a pass that empties the flights is not re-armed, so a note only at the
+/// start of a pass with empty flights depends on a backup pass happening to run) and, busy,
+/// when a job is enqueued.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IdleClock {
+    /// When the idle began; 0 while busy.
+    since_ns: u64,
+}
+
+impl IdleClock {
+    /// Notes the engine idle or busy at `now_ns`; an idle already begun keeps its start.
+    pub(crate) fn note(&mut self, idle: bool, now_ns: u64) {
+        if !idle {
+            self.since_ns = 0;
+        } else if self.since_ns == 0 {
+            self.since_ns = now_ns.max(1);
+        }
+    }
+
+    /// The idle time at `now_ns`; 0 while busy.
+    pub(crate) fn idle_ns(&self, now_ns: u64) -> u64 {
+        if self.since_ns == 0 {
+            0
+        } else {
+            now_ns.wrapping_sub(self.since_ns)
+        }
+    }
+}
+
 /// The halt epoch a request names (u64 at words 5..6).
 pub(crate) const fn request_epoch(request: &[u32; 14]) -> u64 {
     request[grow_request::EPOCH] as u64 | (request[grow_request::EPOCH + 1] as u64) << 32
@@ -409,6 +440,67 @@ mod tests {
         l.posted = 1025;
         assert!(l.reclaim_due(1024, s, s));
         assert!(!l.reclaim_due(1024, s - 1, s));
+        // The clock: busy is 0, an idle keeps its start, busy ends it.
+        let mut c = IdleClock::default();
+        assert_eq!(c.idle_ns(10 * s), 0);
+        c.note(true, 10 * s);
+        c.note(true, 12 * s);
+        assert_eq!(c.idle_ns(15 * s), 5 * s);
+        c.note(false, 16 * s);
+        assert_eq!(c.idle_ns(20 * s), 0);
+        // A clock started at 0 ns still counts as idle.
+        c.note(true, 0);
+        assert_eq!(c.idle_ns(s), s - 1);
+    }
+
+    /// The r2 boot's sequence: a heavy scene, a reclaim that frees the backing, refills during
+    /// the next heavy scene, an idle gap with a small job in it, and the next render must
+    /// reclaim again.
+    #[test]
+    fn reclaim_after_free_then_refill() {
+        let s = 1_000_000_000;
+        let (floor, min_idle) = (1024, s);
+        let mut l = Ledger::new(true, 64, 4095);
+        l.unback_to(l.keep_chunks());
+        let mut clock = IdleClock::default();
+        // A heavy scene grows the PB to 1484 blocks, refilling as it goes.
+        let mut heavy = |l: &mut Ledger, clock: &mut IdleClock, t: u64| {
+            clock.note(false, t);
+            let mut counter = l.next_request;
+            while l.posted < 1484 {
+                while l.refill_due() {
+                    l.back_chunk();
+                }
+                match l.accept(&request(1, counter, 0)) {
+                    Answer::Grant { count, .. } => {
+                        l.post(count);
+                    }
+                    other => panic!("{other:?} at {}", l.posted),
+                }
+                counter += 1;
+            }
+            // The pass that retires the last flight notes the idle; no later pass may run.
+            clock.note(true, t + s);
+        };
+        heavy(&mut l, &mut clock, 100 * s);
+        assert_eq!((l.posted, l.backed), (1484, 13 * CHUNK_BLOCKS));
+        // 5 s later a small job arrives: the reclaim is due; it frees the backing above the
+        // kept chunks; the re-initialization happens at the next render.
+        let t = 106 * s;
+        assert!(l.reclaim_due(floor, clock.idle_ns(t), min_idle));
+        l.unback_to(l.keep_chunks());
+        clock.note(false, t);
+        assert_eq!(l.backed, 2 * CHUNK_BLOCKS);
+        clock.note(true, t + s / 2);
+        // The next render re-initializes, then the second heavy scene refills to 1484 again.
+        l.reinit();
+        assert_eq!((l.posted, l.backed), (64, 256));
+        heavy(&mut l, &mut clock, 110 * s);
+        assert_eq!((l.posted, l.backed), (1484, 13 * CHUNK_BLOCKS));
+        // The same gap again: the reclaim must be due at the small job's arrival.
+        let t = 116 * s;
+        assert_eq!(clock.idle_ns(t), 5 * s);
+        assert!(l.reclaim_due(floor, clock.idle_ns(t), min_idle));
     }
 
     #[test]

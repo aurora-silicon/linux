@@ -72,6 +72,21 @@ pub(crate) fn pb_blocks() -> u32 {
     (*module_parameters::g15_pb_blocks.value()).clamp(64, super::hw::tuning::PB_MAX_BLOCKS)
 }
 
+/// PB reclaim at idle: 0 never, 1 re-initialize, 2 re-initialize and free the backing.
+pub(crate) fn pb_reclaim() -> u32 {
+    (*module_parameters::g15_pb_reclaim.value()).min(2)
+}
+
+/// Idle time before a PB reclaim, ns.
+pub(crate) fn pb_idle_ns() -> u64 {
+    (*module_parameters::g15_pb_idle_ms.value()).max(100) as u64 * 1_000_000
+}
+
+/// Posted blocks above which an idle engine reclaims the PB.
+pub(crate) fn pb_reclaim_blocks() -> u32 {
+    *module_parameters::g15_pb_reclaim_blocks.value()
+}
+
 /// Whether FRAGMENT_BARRIERS is advertised and mapped to early tiling.
 pub(crate) fn early_tiling() -> bool {
     *module_parameters::g15_early_tiling.value() != 0
