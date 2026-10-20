@@ -5,10 +5,19 @@
 //! Record layouts: [`super::fw::buffer`]; the ledger and request checks: [`growth`]
 //! (host-tested).
 //!
-//! - One 256 MiB PB heap at [`super::hw::client::PB_HEAP`] (2048 blocks of 128 KiB); initial
-//!   [`super::hw::tuning::PB_BLOCKS`] (1024), maximum 2048; truthful K = 4096 in every profile
-//!   (PB reconstruction, also in recovery, synchronizes 8 * K bytes of the block list: K =
-//!   0x26cd overran the 0x8000-byte list and crashed the second recovery).
+//! - One PB heap range at [`super::hw::client::PB_HEAP`] (4096 blocks of 128 KiB of client VA,
+//!   GPU-only), **backed on demand** in chunks of [`growth::CHUNK_BLOCKS`] blocks (16 MiB): each
+//!   chunk is its own GEM object mapped at its fixed GVA in every user VM that can tile into it
+//!   (at VM creation; at refill into the VMs of the flights; at publication into the job's VM:
+//!   [`Firmware::map_heap`]) and nowhere in the firmware window (the firmware learns pages from
+//!   the page and block lists only). Initial [`super::hw::tuning::PB_BLOCKS`] blocks posted,
+//!   `Ledger::chunks_for` of them backed at boot (the posting and one reserve chunk); truthful
+//!   K = 4096 in every profile (PB reconstruction, also in recovery, synchronizes 8 * K bytes of
+//!   the block list: K = 0x26cd overran the 0x8000-byte list and crashed the second recovery).
+//! - Backing: a request is granted from the backed blocks above the posted count; after the
+//!   reply, when fewer than a reserve chunk remain, [`Firmware::refill_backing`] allocates the
+//!   next chunk (the TA runs on meanwhile). Only a reserve that ran dry makes a request wait: it
+//!   stays queued, the chunk is backed in the same pass and the next pass answers it.
 //! - Growth: the event drain queues type-7 requests; [`Firmware::answer_growth`] answers each
 //!   one in the poll pass: type 7, PB slot 0, the context of a live published render prefix,
 //!   counter >= next expected, epoch == current halt count; write records `(G - 0x1000000000)
@@ -39,19 +48,14 @@ use kernel::{
 use super::fw::buffer::{self, block_ctl, counter, misc, pb_manager, uma_manager, uma_pools};
 use super::fw::channels::DevCtl;
 use super::fw::initdata::control;
-use super::hw::{client, pte, sizes, tuning};
+use super::hw::{self, client, pte, sizes, tuning};
 use super::object::{Class, FwObject, Objects, Placement, Request};
+use super::vm::VmState;
 use super::Firmware;
 use crate::driver::AsahiDevice;
+use crate::gem;
 
-pub(crate) use growth::Ledger;
-
-/// The ledger of the heap, which is allocated whole.
-fn whole_ledger() -> Ledger {
-    let mut ledger = Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS);
-    ledger.unback_to(growth::MAX_CHUNKS);
-    ledger
-}
+pub(crate) use growth::{Answer, Ledger};
 
 static_assert!(buffer::MAX_BLOCKS == sizes::PB_BLOCKS);
 static_assert!(buffer::MAX_PAGES == sizes::PB_PAGES);
@@ -61,6 +65,46 @@ static_assert!(buffer::MAX_BLOCKS as u64 * buffer::BLOCK_BYTES == client::PB_HEA
 static_assert!(buffer::PAGE_LIST_SIZE as u64 == client::PB_PAGE_LIST_SIZE);
 static_assert!(uma_manager::SEEDS == sizes::FREELIST_SEED);
 static_assert!(uma_pools::POOL_SIZE == sizes::POOL_SIZE);
+static_assert!(growth::MAX_CHUNKS * growth::CHUNK_BLOCKS == buffer::MAX_BLOCKS);
+static_assert!(CHUNK_BYTES % hw::PAGE == 0);
+
+/// Bytes of one backing chunk.
+pub(crate) const CHUNK_BYTES: u64 = growth::CHUNK_BLOCKS as u64 * buffer::BLOCK_BYTES;
+
+/// Client GVA of backing chunk `i`.
+pub(crate) const fn chunk_gva(i: usize) -> u64 {
+    client::PB_HEAP + i as u64 * CHUNK_BYTES
+}
+
+/// One backing chunk of the heap: a GPU-only GEM object (never CPU-mapped, never in the
+/// firmware window), mapped into user VMs by [`VmState::map_heap`].
+pub(crate) struct Chunk {
+    backing: gem::ObjectRef,
+}
+
+impl Chunk {
+    /// Allocates a chunk: zeroed pages, pinned and DMA-mapped, each one the UAT can name.
+    fn new(dev: &AsahiDevice) -> Result<Self> {
+        let backing = gem::new_kernel_object_wc(dev, CHUNK_BYTES as usize)?;
+        let sgt = gem::held_sg_table(&backing.gem)?;
+        for range in sgt.iter() {
+            let pa = range.dma_address() as u64;
+            let len = range.dma_len() as u64;
+            if pa == 0
+                || (pa | len) & (hw::PAGE - 1) != 0
+                || (pa + len - 1) & !(hw::PA_MASK | (hw::PAGE - 1)) != 0
+            {
+                return Err(EPERM);
+            }
+        }
+        Ok(Self { backing })
+    }
+
+    /// The GEM object, for the VM mappings.
+    pub(crate) fn gem(&self) -> ARef<gem::Object> {
+        self.backing.gem.clone()
+    }
+}
 
 /// The allocator state a rebuild after an abort moves to the spare.
 struct AllocatorSet {
@@ -104,12 +148,20 @@ pub(crate) struct PbStats {
     pub(crate) grown: u64,
     pub(crate) refused: u64,
     pub(crate) bad: u64,
+    /// Requests that waited a pass for backing.
+    pub(crate) waits: u64,
+    /// Chunks backed after boot.
+    pub(crate) refills: u64,
 }
 
 /// Render allocator and PB state: the allocators, the PB ledger and the spare set.
 pub(crate) struct Pools {
     /// The GPU device, for logging (also used by recovery).
     pub(crate) dev: ARef<device::Device>,
+    /// The driver device, for chunk allocation.
+    adev: ARef<AsahiDevice>,
+    /// The heap's backing chunks, from the heap base.
+    heap: KVec<Chunk>,
     uma: [UmaEngine; 2],
     /// The allocator set in use.
     live: AllocatorSet,
@@ -120,7 +172,6 @@ pub(crate) struct Pools {
     spare_ready: bool,
     pb_pages: Arc<FwObject>,
     pb_blocks: Arc<FwObject>,
-    pb_heap: Arc<FwObject>,
     /// The PB growth ledger since the last (re)initialization.
     pub(crate) ledger: Ledger,
     /// C1 names the current initial pages.
@@ -252,7 +303,8 @@ fn gva(object: &FwObject) -> Result<u64> {
 impl Pools {
     /// Allocates the render allocator objects: per engine the UMA pools, freelist, pool table,
     /// manager and counter; block control, PB counter, misc, scene list and PB manager; the
-    /// uncached spare set; the PB page list, block list and heap. Contents are written by
+    /// uncached spare set; the PB page list and block list; the heap's first chunks (the
+    /// initial posting and one reserve chunk). Contents are written by
     /// [`Firmware::init_render_pools`].
     pub(crate) fn new(dev: &AsahiDevice, objects: &mut Objects) -> Result<Self> {
         let (uma0, manager0, counter0) = UmaEngine::alloc(objects, 0)?;
@@ -314,28 +366,60 @@ impl Pools {
             0,
             true,
         )?;
-        let pb_heap = alloc(
-            objects,
-            client::PB_HEAP_SIZE,
-            Class::Shared,
-            Some((client::PB_HEAP, pte::LEAF_CACHED)),
-            0,
-            false,
-        )?;
+        let mut ledger = Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS);
+        let chunks = Ledger::chunks_for(ledger.initial) as usize;
+        let mut heap = KVec::with_capacity(growth::MAX_CHUNKS as usize, GFP_KERNEL)?;
+        for _ in 0..chunks {
+            heap.push(Chunk::new(dev)?, GFP_KERNEL)?;
+            ledger.back_chunk();
+        }
+        dev_info!(
+            dev.as_ref(),
+            "G15: PB heap: {} blocks posted at start, {} chunks of {} MiB backed\n",
+            ledger.initial,
+            chunks,
+            CHUNK_BYTES >> 20
+        );
         Ok(Self {
             dev: dev.as_ref().into(),
+            adev: dev.into(),
+            heap,
             uma: [uma0, uma1],
             live,
             spare_ready: spare.is_some(),
             spare,
             pb_pages,
             pb_blocks,
-            pb_heap,
-            ledger: whole_ledger(),
+            ledger,
             c1_written: false,
             exhausted_logged: false,
             stats: PbStats::default(),
         })
+    }
+
+    /// The GEM objects of the backed chunks, in heap order (for a new VM's mappings).
+    pub(crate) fn heap_gems(&self) -> Result<KVec<ARef<gem::Object>>> {
+        let mut gems = KVec::with_capacity(self.heap.len(), GFP_KERNEL)?;
+        for chunk in self.heap.iter() {
+            gems.push(chunk.gem(), GFP_KERNEL)?;
+        }
+        Ok(gems)
+    }
+
+    /// Maps the backed chunks `vm` does not have yet.
+    pub(crate) fn map_heap(&self, vm: &VmState) -> Result {
+        vm.map_heap(self.heap.iter().map(Chunk::gem))
+    }
+
+    /// Backs one more chunk; the caller maps it where needed before posting from it.
+    fn back_chunk(&mut self) -> Result<ARef<gem::Object>> {
+        if self.heap.len() >= growth::MAX_CHUNKS as usize {
+            return Err(ENOSPC);
+        }
+        let chunk = Chunk::new(&self.adev)?;
+        let gem = chunk.gem();
+        self.heap.push(chunk, GFP_KERNEL)?;
+        Ok(gem)
     }
 
     /// First rebuild after an abort with cached managers: the cached set may still have dirty
@@ -389,10 +473,9 @@ impl Pools {
             count.w32(0, 1)?;
         }
 
-        // PB: 8192 pages of 0x8000 in 2048 blocks of 0x20000; with growth the first initial
-        // blocks of them and page limits at the maximum. In every profile the block list
-        // declares its real 4096-record capacity.
-        self.ledger = whole_ledger();
+        // PB: the initial blocks of the heap range posted, page limits at the maximum, the
+        // backing kept. In every profile the block list declares its real 4096-record capacity.
+        self.ledger.reinit();
         self.exhausted_logged = false;
         if tuning::PB_GROW {
             // C1 names the initial pages again.
@@ -408,7 +491,7 @@ impl Pools {
             self.pb_pages.fill(0, 0, buffer::PAGE_LIST_SIZE)?;
             self.pb_blocks.fill(0, 0, buffer::BLOCK_LIST_SIZE)?;
         }
-        let heap = gva(&self.pb_heap)?;
+        let heap = client::PB_HEAP;
         let initial = self.ledger.initial;
         write_records(
             &self.pb_pages,
@@ -461,11 +544,12 @@ impl Pools {
         super::params::pb_max_blocks().clamp(self.ledger.initial, self.ledger.max)
     }
 
-    /// The debugfs line `pb: blocks initial/posted/firmware-max/max requests grown refused bad`.
+    /// The debugfs line `pb: blocks initial/posted/firmware-max/max requests grown refused bad
+    /// backed chunks waits refills` (the first eight keys are stable; new ones are appended).
     pub(crate) fn write_stats(&self, f: &mut impl fmt::Write) -> fmt::Result {
         writeln!(
             f,
-            "pb: blocks {}/{}/{}/{} requests {} grown {} refused {} bad {}",
+            "pb: blocks {}/{}/{}/{} requests {} grown {} refused {} bad {} backed {} chunks {} waits {} refills {}",
             self.ledger.initial,
             self.ledger.posted,
             self.soft_max(),
@@ -473,7 +557,11 @@ impl Pools {
             self.stats.requests,
             self.stats.grown,
             self.stats.refused,
-            self.stats.bad
+            self.stats.bad,
+            self.ledger.backed,
+            self.heap.len(),
+            self.stats.waits,
+            self.stats.refills
         )
     }
 }
@@ -504,11 +592,13 @@ impl Firmware {
     /// Answers the firmware's PB-growth requests, outside the event drain.
     /// A request names PB slot 0, the context of a published render prefix and the next
     /// request counter; anything else is logged and left unanswered (its TA then stays stalled
-    /// and the deadline applies). With growth up to ten more blocks of the mapped heap are
+    /// and the deadline applies). With growth up to ten more backed blocks of the heap are
     /// written to unposted block-list records, then the live block_ctl+4 producer advances and
     /// DEVCTL 7 reports success; at the maximum the reply is the refusal (+4 = 0), which lets
     /// the firmware continue without new pages. The firmware imports the blocks itself: P is
-    /// never rewritten. A failed reply is logged; a request that cannot be processed at all (a
+    /// never rewritten. A request with no backed block left waits: it stays at the head of the
+    /// queue for the next pass while this one backs a chunk. After the answers, the reserve is
+    /// refilled. A failed reply is logged; a request that cannot be processed at all (a
     /// firmware object access failed) is logged and left unanswered like an invalid one. Never
     /// fails: the poll pass continues.
     pub(crate) fn answer_growth(&mut self) -> Result {
@@ -520,23 +610,82 @@ impl Firmware {
             let Ok(request) = self.events.grow.remove(0) else {
                 break;
             };
-            self.pools.stats.requests += 1;
-            if let Err(e) = self.answer_request(&request) {
-                self.pools.stats.bad += 1;
-                dev_err!(
-                    self.dev(),
-                    "PB growth request {} ctx {} not answered: {}\n",
-                    request[buffer::grow_request::COUNTER],
-                    request[buffer::grow_request::CONTEXT],
-                    e.to_errno()
-                );
+            match self.answer_request(&request) {
+                Ok(true) => self.pools.stats.requests += 1,
+                Ok(false) => {
+                    // Waits for backing: back at the head, counted once answered.
+                    self.pools.stats.waits += 1;
+                    // The queue has room: this request was just taken from it.
+                    if self.events.grow.insert_within_capacity(0, request).is_err() {
+                        self.pools.stats.bad += 1;
+                    }
+                    break;
+                }
+                Err(e) => {
+                    self.pools.stats.requests += 1;
+                    self.pools.stats.bad += 1;
+                    dev_err!(
+                        self.dev(),
+                        "PB growth request {} ctx {} not answered: {}\n",
+                        request[buffer::grow_request::COUNTER],
+                        request[buffer::grow_request::CONTEXT],
+                        e.to_errno()
+                    );
+                }
             }
         }
+        self.refill_backing();
         Ok(())
     }
 
-    /// Processes one growth request.
-    fn answer_request(&mut self, request: &[u32; 14]) -> Result {
+    /// Backs chunks until the reserve is whole, mapping each into the VMs of the flights before
+    /// the ledger may post from it (a job's VM is mapped at publication, a new VM at creation).
+    /// A failure is logged and leaves the reserve short: requests then wait and the next pass
+    /// tries again.
+    pub(crate) fn refill_backing(&mut self) {
+        while self.pools.ledger.refill_due() {
+            let result = (|| -> Result {
+                let gem = self.pools.back_chunk()?;
+                let i = self.pools.heap.len() - 1;
+                for flight in self.engine.flights.iter() {
+                    flight.job.vm.map_chunk(i, gem.clone())?;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    self.pools.ledger.back_chunk();
+                    self.pools.stats.refills += 1;
+                    dev_dbg!(
+                        self.dev(),
+                        "PB heap: chunk {} backed ({} of {} blocks posted)\n",
+                        self.pools.heap.len() - 1,
+                        self.pools.ledger.posted,
+                        self.pools.ledger.backed
+                    );
+                }
+                Err(e) => {
+                    dev_warn!(
+                        self.dev(),
+                        "PB heap: backing chunk {} failed: {} ({} of {} blocks posted)\n",
+                        self.pools.heap.len(),
+                        e.to_errno(),
+                        self.pools.ledger.posted,
+                        self.pools.ledger.backed
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Maps the backed heap chunks into a job's VM before its publication.
+    pub(crate) fn map_heap(&self, vm: &VmState) -> Result {
+        self.pools.map_heap(vm)
+    }
+
+    /// Processes one growth request: Ok(false) when it waits for backing.
+    fn answer_request(&mut self, request: &[u32; 14]) -> Result<bool> {
         let ctl = self.init.control.clone().ok_or(ENODEV)?;
         let epoch =
             ctl.r32(control::HALT_COUNT)? as u64 | (ctl.r32(control::HALT_COUNT + 4)? as u64) << 32;
@@ -562,7 +711,7 @@ impl Firmware {
                     self.pools.ledger.max
                 );
             }
-            return Ok(());
+            return Ok(true);
         }
         // A request from before a halt has no authority over the PB now.
         if !self
@@ -583,14 +732,14 @@ impl Firmware {
                 live as u32,
                 tuning::PB_GROW as u32
             );
-            return Ok(());
+            return Ok(true);
         }
         let (first, n) = match self.pools.ledger.accept(request) {
-            growth::Answer::Grant { first, count } => (first, count),
-            // The heap is backed whole: no request waits.
-            growth::Answer::Refuse | growth::Answer::Wait => (0, 0),
+            Answer::Grant { first, count } => (first, count),
+            Answer::Refuse => (self.pools.ledger.posted, 0),
+            Answer::Wait => return Ok(false),
         };
-        let heap = gva(&self.pools.pb_heap)?;
+        let heap = client::PB_HEAP;
         for b in first..first + n {
             self.pools.pb_blocks.w64(
                 buffer::block_record_offset(b),
@@ -654,6 +803,6 @@ impl Firmware {
                 ret
             );
         }
-        Ok(())
+        Ok(true)
     }
 }

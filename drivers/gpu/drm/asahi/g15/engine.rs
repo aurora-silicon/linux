@@ -685,6 +685,8 @@ impl Firmware {
     }
 
     fn publish_prefix_into(&mut self, job: &Arc<Job>, f: &mut Flight) -> Result {
+        // Every backed PB chunk is mapped in the job's VM before anything of it is visible.
+        self.map_heap(&job.vm)?;
         let overlap = !self.engine.flights.is_empty();
         let mut mixed = tuning::MIXED_PREFIX;
         let mut pf = Prefix {
