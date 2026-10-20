@@ -151,6 +151,10 @@ module! {
             default: 3072,
             description: "G15: parameter-buffer growth maximum given to the firmware, blocks of 128 KiB (64..4095; the mapped 4095 minus this answers partial renders)",
         },
+        g15_pb_blocks: u32 {
+            default: 64,
+            description: "G15: parameter-buffer blocks of 128 KiB posted at (re)initialization (64..4095; the heap is backed on demand in 16 MiB chunks)",
+        },
         g15_early_tiling: u32 {
             default: 0,
             description: "G15: advertise FRAGMENT_BARRIERS, mapped to early tiling (slower on 2419)",

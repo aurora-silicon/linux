@@ -10,7 +10,7 @@
 //!   chunk is its own GEM object mapped at its fixed GVA in every user VM that can tile into it
 //!   (at VM creation; at refill into the VMs of the flights; at publication into the job's VM:
 //!   [`Firmware::map_heap`]) and nowhere in the firmware window (the firmware learns pages from
-//!   the page and block lists only). Initial [`super::hw::tuning::PB_BLOCKS`] blocks posted,
+//!   the page and block lists only). Initial `g15_pb_blocks` (64) blocks posted,
 //!   `Ledger::chunks_for` of them backed at boot (the posting and one reserve chunk); truthful
 //!   K = 4096 in every profile (PB reconstruction, also in recovery, synchronizes 8 * K bytes of
 //!   the block list: K = 0x26cd overran the 0x8000-byte list and crashed the second recovery).
@@ -366,7 +366,11 @@ impl Pools {
             0,
             true,
         )?;
-        let mut ledger = Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS);
+        let mut ledger = Ledger::new(
+            tuning::PB_GROW,
+            super::params::pb_blocks(),
+            tuning::PB_MAX_BLOCKS,
+        );
         let chunks = Ledger::chunks_for(ledger.initial) as usize;
         let mut heap = KVec::with_capacity(growth::MAX_CHUNKS as usize, GFP_KERNEL)?;
         for _ in 0..chunks {

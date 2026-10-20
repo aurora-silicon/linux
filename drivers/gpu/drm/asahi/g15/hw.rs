@@ -549,11 +549,11 @@ pub(crate) mod tuning {
     pub(crate) const SLOT_ROTATE: bool = true;
     /// Flights per VM.
     pub(crate) const MAX_INFLIGHT: u32 = 2;
-    /// PB growth through event 7 / DEVCTL 7, initial and maximum blocks.
+    /// PB growth through event 7 / DEVCTL 7; the initial posting is `g15_pb_blocks` (64, the
+    /// native driver's initial PB on this machine).
     pub(crate) const PB_GROW: bool = true;
-    /// Initial PB blocks, and the most that may be posted: one below the mapped heap's block
-    /// count, so the block-list producer (modulo K = 4096) never returns to 0.
-    pub(crate) const PB_BLOCKS: u32 = 1024;
+    /// The most PB blocks that may be posted: one below the heap range's block count, so the
+    /// block-list producer (modulo K = 4096) never returns to 0.
     pub(crate) const PB_MAX_BLOCKS: u32 = super::sizes::PB_BLOCKS - 1;
     /// At the host deadline, arm the firmware kill.
     pub(crate) const HANG_PREEMPT: bool = true;
