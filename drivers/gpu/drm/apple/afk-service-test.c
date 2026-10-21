@@ -101,6 +101,23 @@ static void afk_service_completed_reader_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, afk_service_reinit(service, NULL, &reusable_ops, 2));
 }
 
+static void afk_service_close_pin_test(struct kunit *test)
+{
+	struct apple_epic_service *service = test->priv;
+
+	KUNIT_EXPECT_PTR_EQ(test, afk_service_pin(NULL), NULL);
+	KUNIT_ASSERT_TRUE(test, afk_service_reinit(service, NULL, &reusable_ops, 1));
+	KUNIT_ASSERT_PTR_EQ(test, afk_service_get(service), service); /* owner */
+	afk_test_retire(service);
+	/* A close issued after teardown still pins the owner's service. */
+	KUNIT_ASSERT_PTR_EQ(test, afk_service_pin(service), service);
+	afk_service_put(service); /* owner detaches */
+	KUNIT_EXPECT_FALSE(test, afk_service_reinit(service, NULL, &reusable_ops, 2));
+	KUNIT_EXPECT_EQ(test, service->channel, 1U);
+	afk_service_put(service);
+	KUNIT_EXPECT_TRUE(test, afk_service_reinit(service, NULL, &reusable_ops, 2));
+}
+
 static void afk_service_tag_sequence_test(struct kunit *test)
 {
 	struct apple_epic_service *service = test->priv;
@@ -257,6 +274,7 @@ static struct kunit_case afk_service_cases[] = {
 	KUNIT_CASE(afk_service_reader_pin_test),
 	KUNIT_CASE(afk_service_pending_reply_test),
 	KUNIT_CASE(afk_service_completed_reader_test),
+	KUNIT_CASE(afk_service_close_pin_test),
 	KUNIT_CASE(afk_service_tag_sequence_test),
 	KUNIT_CASE(afk_service_unconverted_owner_test),
 	KUNIT_CASE(afk_service_retired_channel_test),
