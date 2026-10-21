@@ -97,6 +97,8 @@ pub(crate) const GPU_GENERATION: u32 = 15;
 
 /// Static configuration of a SoC with a G15 GPU.
 pub(crate) struct Config {
+    /// SoC and GPU name, for the log.
+    pub(crate) name: &'static str,
     /// SoC identifier reported to userspace.
     pub(crate) chip_id: u32,
     /// GPU variant reported to userspace.
@@ -114,18 +116,42 @@ pub(crate) struct Config {
     pub(crate) hw_ids: &'static [hw::HwId],
     /// Qualified firmware builds.
     pub(crate) firmware: &'static [hw::FirmwareBuild],
+    /// Machine compatible this SoC's boards carry.
+    pub(crate) machine: &'static CStr,
+    /// Where regions, segments and performance states come from, and how the GPU is powered.
+    pub(crate) platform: hw::Platform,
+    /// Initdata placement and sizes that differ between firmware builds.
+    pub(crate) layout: &'static hw::Layout,
+    /// Board images.
+    pub(crate) board: hw::Board,
+    /// Compute register values that scale with the cluster count.
+    pub(crate) compute: hw::ComputeRegs,
+}
+
+/// Core slots of a SoC: the width of its enabled-core mask.
+impl Config {
+    pub(crate) const fn core_slots(&self) -> u32 {
+        self.num_clusters * self.num_cores_per_cluster
+    }
 }
 
 /// OF match table of the G15 platform driver.
 ///
 /// Deliberately not exported with `module_device_table!`: without a module alias, the asahi
 /// module is not loaded at boot for this GPU, and the firmware only starts when userspace loads
-/// the module after the native display is up (the J514S bring-up order).
-const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 1> =
-    kernel::device_id::IdArray::new([(
-        of::DeviceId::new(c_str!("apple,agx-t6030")),
-        &hw::t6030::CONFIG,
-    )]);
+/// the module after the native display is up (the J514S bring-up order). A built-in driver
+/// probes when the GPU node is populated.
+const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 2> =
+    kernel::device_id::IdArray::new([
+        (
+            of::DeviceId::new(c_str!("apple,agx-t6030")),
+            &hw::t6030::CONFIG,
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t6031")),
+            &hw::t6031::CONFIG,
+        ),
+    ]);
 
 /// The G15 platform driver: the shared [`AsahiDriver`] probed through
 /// [`AsahiDriver::probe_g15`].
@@ -149,7 +175,7 @@ impl platform::Driver for Driver {
         info: Option<&Self::IdInfo>,
     ) -> impl PinInit<Self, Error> {
         let cfg = *info.ok_or(ENODEV)?;
-        dev_info!(pdev.as_ref(), "G15: probing\n");
+        dev_info!(pdev.as_ref(), "G15: probing ({})\n", cfg.name);
         match AsahiDriver::probe_g15(pdev, cfg) {
             Ok(driver) => Ok(Driver(Some(driver))),
             Err(error) if boot::glue::retained() => {
@@ -290,6 +316,8 @@ impl Shared {
 /// be stopped, so dropping this structure leaks the firmware-visible parts on purpose
 /// ([`Gpu::retain`]).
 pub(crate) struct Firmware {
+    /// The SoC configuration.
+    pub(crate) cfg: &'static Config,
     /// RTKit, MMIO, regions, the adopted UAT and the host window.
     pub(crate) session: boot::Session,
     /// The initdata graph and its live words (Globals, Control, HardwareData, ...).
@@ -362,7 +390,7 @@ impl Gpu {
         let uat = booted.session.uat()?;
         let (id, max_frequency_khz) = (booted.id, booted.max_frequency_khz);
         // The backend: graphs, slots, pools, engine, recovery and VM registry.
-        let firmware = Firmware::start_backend(dev, booted, &shared)?;
+        let firmware = Firmware::start_backend(dev, cfg, booted, &shared)?;
         *shared.state.lock() = Some(firmware);
         // The engine's statistics file (a debugfs failure does not fail the probe).
         if let Err(error) = shared.start_engine() {
@@ -398,6 +426,7 @@ impl Firmware {
     /// retained as an orphan of `shared`.
     fn start_backend(
         dev: &AsahiDevice,
+        cfg: &'static Config,
         booted: boot::Booted,
         shared: &Arc<Shared>,
     ) -> Result<KBox<Firmware>> {
@@ -448,6 +477,7 @@ impl Firmware {
         let mut firmware = KBox::write(
             slot,
             Firmware {
+                cfg,
                 session,
                 init,
                 objects,

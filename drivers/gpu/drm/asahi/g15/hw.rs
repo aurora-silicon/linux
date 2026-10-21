@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! T6030 (G15S) hardware and firmware-ABI constants (layout values are shared by several
-//! modules; change one only together with its users). The tuned policy values are in
-//! [`tuning`].
+//! G15 hardware and firmware-ABI constants (layout values are shared by several modules; change
+//! one only together with its users). The qualified T6030 values are the module-level
+//! constants; what differs per SoC is a [`super::Config`] row ([`t6030`], [`t6031`]). The tuned
+//! policy values are in [`tuning`].
 
 use core::ops::Range;
+
+pub(crate) mod t6031;
 
 /// Identification register values of a qualified G15S.
 pub(crate) struct HwId {
@@ -24,12 +27,99 @@ pub(crate) struct FirmwareBuild {
     pub(crate) text_sha256: [u8; 32],
 }
 
+/// Where a SoC's GPU regions, firmware segments and performance states come from, and how its
+/// GPU is powered.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) enum Platform {
+    /// T6030: the boot loader's ADT export ([`super::adt`]), a GPU node synthesized by the PMP
+    /// handoff, and the PMP AGX vote through the J514S supplier.
+    AdtWithPmp,
+    /// The GPU node of the kernel device tree, filled by the boot loader (regions, firmware
+    /// segments and operating points); the GPU is powered by its power domain alone.
+    DeviceTree,
+}
+
+/// The source of the board images (HardwareData, Globals, Power) of a SoC.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) enum Board {
+    /// The hash-checked T6030 templates ([`super::board`]).
+    Templates,
+    /// The three images built from the device tree ([`super::board::record`],
+    /// [`super::board::device_tree`]) and cross-checked against a firmware file holding the
+    /// machine's own ([`super::board::blob`], pinned by its SHA-256), which also supplies the
+    /// record's words the device tree does not carry ([`super::board::record::FROM_FILE`]); a
+    /// difference refuses the start.
+    Blob {
+        name: &'static kernel::str::CStr,
+        sha256: [u8; 32],
+    },
+    /// No board data: admission refuses the SoC before anything firmware-visible.
+    None,
+}
+
+/// Per-SoC placement and size of the initdata objects that differ between G15 firmware
+/// builds; everything else keeps the canonical [`va`] values.
+pub(crate) struct Layout {
+    /// Root object version word.
+    pub(crate) root_magic: u64,
+    /// HardwareData VA, size, ASC-cached prefix (`None`: the whole object), and the offset of
+    /// the fourth HardwareDataB view (fault information).
+    pub(crate) hwdata_va: u64,
+    pub(crate) hwdata_size: usize,
+    pub(crate) hwdata_cached: Option<usize>,
+    pub(crate) hwdata_view: usize,
+    /// HardwareDataB IOMapping records.
+    pub(crate) iomaps: &'static [IoMap],
+    /// For a record built from the device tree ([`super::board::record`]): per IOMapping
+    /// record, in `iomaps` order, the mapped bytes, the element bytes and whether the firmware
+    /// may write the window; and the unmapped slots whose flag word is nevertheless 1.
+    pub(crate) record_slots: &'static [(u32, u32, bool)],
+    pub(crate) record_empty_writable: &'static [u8],
+}
+
+/// Compute command register values that scale with the cluster count.
+pub(crate) struct ComputeRegs {
+    /// Offset of the four saved-state pointers in the preemption buffer.
+    pub(crate) tail: u64,
+    /// UMA PTC (0xa599) and DUPM (0xd411).
+    pub(crate) ptc: u64,
+    pub(crate) dupm: u64,
+    /// The 0x1a0e9 word.
+    pub(crate) reg_1a0e9: u64,
+    /// Encode every command the way the first command of a fresh queue is encoded: zero
+    /// saved-state pointers and zero 0x12091/0x101d9.
+    pub(crate) fresh: bool,
+}
+
 /// The T6030 configuration.
 pub(crate) mod t6030 {
     use super::super::Config;
-    use super::{FirmwareBuild, HwId};
+    use super::{ComputeRegs, FirmwareBuild, HwId, Layout};
+
+    /// The qualified graph: the canonical VAs and sizes of [`super::va`] and
+    /// [`super::super::fw::initdata`].
+    pub(crate) const LAYOUT: Layout = Layout {
+        root_magic: super::super::fw::initdata::root::MAGIC,
+        hwdata_va: super::va::HWDATA,
+        hwdata_size: super::super::fw::initdata::hwdata::SIZE,
+        hwdata_cached: Some(super::super::fw::initdata::hwdata::CACHED),
+        hwdata_view: super::super::fw::initdata::hwdata::FAULT_INFO,
+        iomaps: &super::IOMAPS,
+        record_slots: &[],
+        record_empty_writable: &[],
+    };
+
+    /// The two-cluster compute register values.
+    pub(crate) const COMPUTE: ComputeRegs = ComputeRegs {
+        tail: 0x1480,
+        ptc: 0x13200400020,
+        dupm: 0x200000001,
+        reg_1a0e9: 8,
+        fresh: false,
+    };
 
     pub(crate) const CONFIG: Config = Config {
+        name: "T6030 G15S",
         chip_id: 0x6030,
         gpu_variant: crate::hw::GpuVariant::S,
         gpu_revision: 0x11,
@@ -52,6 +142,11 @@ pub(crate) mod t6030 {
                 0x80, 0x02, 0x93, 0xd5,
             ],
         }],
+        machine: kernel::c_str!("apple,t6030"),
+        platform: super::Platform::AdtWithPmp,
+        layout: &LAYOUT,
+        board: super::Board::Templates,
+        compute: COMPUTE,
     };
 }
 
@@ -180,6 +275,7 @@ pub(crate) mod rings {
 }
 
 /// One HardwareDataB IOMapping record: firmware device alias of an MMIO range.
+#[derive(Copy, Clone)]
 pub(crate) struct IoMap {
     pub(crate) slot: u8,
     pub(crate) pa: u64,
@@ -360,8 +456,8 @@ pub(crate) mod client {
     pub(crate) const CT_STRIDE: u64 = 0x1000000;
     pub(crate) const CT_SIZE: u64 = 0x400000;
     pub(crate) const PB_HEAP: u64 = 0x70c0000000;
-    pub(crate) const PB_HEAP_SIZE: u64 = 0x10000000;
-    pub(crate) const PB_BLOCK_LIST: u64 = 0x70e0000000;
+    pub(crate) const PB_HEAP_SIZE: u64 = 0x20000000;
+    pub(crate) const PB_BLOCK_LIST: u64 = 0x70f0000000;
     /// Compact-window objects (32-bit compact pointers: `gva - 0x1000000000`).
     pub(crate) const PRE0_PAGE: u64 = 0x1006080000;
     pub(crate) const PRE1_PAGE: u64 = 0x1006098000;
@@ -386,8 +482,8 @@ pub(crate) mod sizes {
     pub(crate) const CLUSTER_PB_PAGES: u32 = 0x3c;
     pub(crate) const MAX_ATTACHMENTS: usize = 16;
     pub(crate) const MAX_CLIENT: usize = 320;
-    pub(crate) const PB_PAGES: u32 = 8192;
-    pub(crate) const PB_BLOCKS: u32 = 2048;
+    pub(crate) const PB_PAGES: u32 = 16384;
+    pub(crate) const PB_BLOCKS: u32 = 4096;
     pub(crate) const PB_LIST_RECORDS: u32 = 4096;
     pub(crate) const PB_GROW_STEP: u32 = 10;
     /// Flights (published prefixes) in flight at most; the second must be of the same VM.
@@ -418,6 +514,9 @@ pub(crate) mod engine {
 /// Tuned policy. Every value was chosen by measurement on hardware; only the ones in
 /// `params.rs` are tunable.
 pub(crate) mod tuning {
+    /// Firmware idle standby time, us, of a machine whose device tree does not provide one (the
+    /// T6030): with the template's 700 us the GPU powers down between works ~100 us apart.
+    pub(crate) const IDLE_STANDBY_US: u32 = 2500;
     /// Command objects (work images, microsequences, barriers, queue info, scheduling contexts,
     /// job lists, FW-only queue scratch) map ASC-cached (AttrIndex 0).
     pub(crate) const FW_CACHED: bool = true;
@@ -450,10 +549,12 @@ pub(crate) mod tuning {
     pub(crate) const SLOT_ROTATE: bool = true;
     /// Flights per VM.
     pub(crate) const MAX_INFLIGHT: u32 = 2;
-    /// PB growth through event 7 / DEVCTL 7, initial and maximum blocks.
+    /// PB growth through event 7 / DEVCTL 7; the initial posting is `g15_pb_blocks` (64, the
+    /// native driver's initial PB on this machine).
     pub(crate) const PB_GROW: bool = true;
-    pub(crate) const PB_BLOCKS: u32 = super::sizes::PB_BLOCKS / 2;
-    pub(crate) const PB_MAX_BLOCKS: u32 = super::sizes::PB_BLOCKS;
+    /// The most PB blocks that may be posted: one below the heap range's block count, so the
+    /// block-list producer (modulo K = 4096) never returns to 0.
+    pub(crate) const PB_MAX_BLOCKS: u32 = super::sizes::PB_BLOCKS - 1;
     /// At the host deadline, arm the firmware kill.
     pub(crate) const HANG_PREEMPT: bool = true;
     /// Compute start-sequence MMU fault mask (unmapped stores absorbed).

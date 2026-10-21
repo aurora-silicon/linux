@@ -34,6 +34,8 @@ pmp-y := pmp-core.o pmp-display.o
 # Must run before devices are populated, so built in even when pmp is a module.
 # It adds device tree nodes, so it needs OF_DYNAMIC.
 obj-$(if $(CONFIG_APPLE_PMP),$(CONFIG_OF_DYNAMIC)) += j514s-pmp-handoff.o
+# The T6031 handoff enables the display nodes and adds the PMP the same way.
+obj-$(CONFIG_DRM_APPLE_DCP_T6031) += t6031-display-handoff.o
 
 obj-$(CONFIG_APPLE_MCC) += apple-mcc.o
 apple-mcc-y := mcc.o

@@ -36,9 +36,9 @@ pub(crate) fn resnap_us() -> u32 {
     (*module_parameters::g15_resnap_us.value()).clamp(25, 1000)
 }
 
-/// Firmware idle standby time, us.
-pub(crate) fn idle_standby_us() -> u32 {
-    (*module_parameters::g15_idle_standby_us.value()).clamp(100, 100000)
+/// The explicit firmware idle standby time, us (0: not set).
+pub(crate) fn idle_standby_override_us() -> u32 {
+    *module_parameters::g15_idle_standby_us.value()
 }
 
 /// Firmware idle minimum confidence, permille.
@@ -54,6 +54,37 @@ pub(crate) fn recovery() -> bool {
 /// Whether the CDM/VDM stream gates are on.
 pub(crate) fn stream_gate() -> bool {
     *module_parameters::g15_stream_gate.value() != 0
+}
+
+/// The 8-byte TEXT digest prefix of an unpinned firmware build to admit (0: none).
+pub(crate) fn accept_text_prefix() -> u64 {
+    *module_parameters::g15_accept_text_prefix.value()
+}
+
+/// The PB growth maximum the firmware is given, in blocks (64..=4095; the heap range holds
+/// 4095 and the blocks above this answer the synchronous requests of partial renders).
+pub(crate) fn pb_max_blocks() -> u32 {
+    (*module_parameters::g15_pb_max_blocks.value()).clamp(64, super::hw::tuning::PB_MAX_BLOCKS)
+}
+
+/// The initial PB posting, in blocks (64..=4095; the ledger clamps it again).
+pub(crate) fn pb_blocks() -> u32 {
+    (*module_parameters::g15_pb_blocks.value()).clamp(64, super::hw::tuning::PB_MAX_BLOCKS)
+}
+
+/// PB reclaim at idle: 0 never, 1 re-initialize, 2 re-initialize and free the backing.
+pub(crate) fn pb_reclaim() -> u32 {
+    (*module_parameters::g15_pb_reclaim.value()).min(2)
+}
+
+/// Idle time before a PB reclaim, ns.
+pub(crate) fn pb_idle_ns() -> u64 {
+    (*module_parameters::g15_pb_idle_ms.value()).max(100) as u64 * 1_000_000
+}
+
+/// Posted blocks above which an idle engine reclaims the PB.
+pub(crate) fn pb_reclaim_blocks() -> u32 {
+    *module_parameters::g15_pb_reclaim_blocks.value()
 }
 
 /// Whether FRAGMENT_BARRIERS is advertised and mapped to early tiling.
@@ -79,7 +110,13 @@ pub(crate) fn fill(gpu: &Gpu, params: &mut uapi::drm_asahi_params_global) -> Res
     params.usc_generation = 3;
     params.gpu_hal_generation = uapi::drm_asahi_gpu_hal_generation_DRM_ASAHI_GPU_HAL_LEGACY;
     params.max_attachments = hw::sizes::MAX_ATTACHMENTS as u32;
-    for (i, mask) in gpu.id.core_masks.iter().enumerate() {
+    for (i, mask) in gpu
+        .id
+        .core_masks
+        .iter()
+        .enumerate()
+        .take(gpu.cfg.num_clusters as usize)
+    {
         *(params.core_masks.get_mut(i).ok_or(EIO)?) = (*mask).into();
     }
     Ok(())

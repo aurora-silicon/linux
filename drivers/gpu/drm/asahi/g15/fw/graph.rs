@@ -93,10 +93,15 @@ pub(crate) mod manager {
 }
 
 /// Compute pool table rows (0x40 bytes each, `gva | 1 << 62`) and freelist seeds (u64 VAs of
-/// 0x1000-byte units of the first eight pools).
+/// 0x1000-byte units of every pool). Seeding only the first eight pools (8192 pages, 32 MiB) let
+/// ten compute workgroups of more than ~576 threads run at once and hung the eleventh (ticket
+/// malik-na/linux-aurora#69): such groups take their memory from this pool.
 pub(crate) mod pools {
     pub(crate) const TABLE_STRIDE: usize = 0x40;
     pub(crate) const TABLE_VALID: u64 = 1 << 62;
     pub(crate) const SEED_BYTES: u64 = 0x1000;
-    pub(crate) const SEEDED_POOLS: usize = 8;
+    pub(crate) const SEEDED_POOLS: usize = crate::g15::hw::sizes::POOLS;
+    /// Seeds in the freelist.
+    pub(crate) const SEEDS: u32 =
+        (SEEDED_POOLS as u64 * crate::g15::hw::sizes::POOL_SIZE / SEED_BYTES) as u32;
 }

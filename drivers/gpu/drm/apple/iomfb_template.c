@@ -3176,6 +3176,27 @@ void iomfb_present_backlight_v14_7(struct apple_dcp *dcp)
 }
 
 /*
+ * Swap timestamps for the built-in panel.  iomfb_flush() fills them from the
+ * counter for its ProMotion panels; on this SoC the counter runs at 1 GHz and
+ * such values hang the 14.7 firmware's swap.  Use the constant 120 in the
+ * same three slots, a time that is never in the future.  Run after the
+ * request is encoded, since the encoder zeroes the whole request.  Only the
+ * main display of a board profile that asks for them (T6031) gets them; the
+ * J514S panel, external DCPs and DCPs without a 14.7 board profile keep
+ * zero timestamps.
+ */
+static void iomfb_swap_timestamps_v14_7(struct apple_dcp *dcp,
+					struct dcp_swap_submit_req_v14_7 *req)
+{
+	if (!dcp->main_display || !dcp->v14_7 || !dcp->v14_7->swap_timestamps)
+		return;
+
+	req->swap.timestamp[0] = 120;
+	req->swap.timestamp[1] = 120;
+	req->swap.timestamp[6] = 120;
+}
+
+/*
  * Complete a request just before A407: the single-surface invariant and the
  * level the backlight policy has to present.  False fails the present
  * without sending it.
@@ -3196,6 +3217,7 @@ bool iomfb_swap_prepare_v14_7(struct apple_dcp *dcp,
 		dcp->iomfb_v14_7.refused++;
 		return false;
 	}
+	iomfb_swap_timestamps_v14_7(dcp, req);
 	if (!dcp_backlight_active(dcp))
 		return true;
 	if (!transaction)
@@ -3218,6 +3240,7 @@ bool iomfb_swap_prepare_v14_7(struct apple_dcp *dcp,
 		swap_id = req->swap.swap_id;
 		iomfb_v14_7_encode_present(req, NULL);
 		req->swap.swap_id = swap_id;
+		iomfb_swap_timestamps_v14_7(dcp, req);
 		dcp->iomfb_v14_7.blank = true;
 	}
 	if (iomfb_v14_7_encode_nits(req, true, present.nits))

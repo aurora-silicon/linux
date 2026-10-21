@@ -12,7 +12,8 @@
 //!   without it, it does not wait (the kill request). Both return EBUSY while Control+0x4590
 //!   says the firmware is halted, and wait for an earlier posted record's consumption first.
 //! - Receive rings (event, 6 log sub-rings, trace, stats): consumed by setting read = producer;
-//!   the event ring is decoded by [`super::event`].
+//!   the event ring is decoded by [`super::event`], the stats ring's tags and power-state
+//!   records are noted ([`super::power::pstate`]) before it is consumed.
 //! - FwCtl ring: 256 x 0x18 = 0x1800 bytes (the 2419 firmware uses a 0x18 stride). Never used
 //!   by the host: no firmware cache flush path exists.
 
@@ -30,7 +31,8 @@ use super::fw::channels::{
 use super::hw::{self, rings, va};
 use super::initdata::InitData;
 use super::object::{Class, FwObject, Objects, Placement, Request};
-use super::regs::wmb;
+use super::power::pstate::{self, StatsSeen};
+use super::regs::{rmb, wmb};
 use super::Firmware;
 
 /// A submit channel.
@@ -74,6 +76,8 @@ pub(crate) struct Channels {
     pub(crate) log: Ring,
     pub(crate) trace: Ring,
     pub(crate) stats: Ring,
+    /// What the stats ring carried, up to its consumer.
+    pub(crate) stats_seen: StatsSeen,
     /// Allocated for the firmware; the host never uses it.
     _fwctl: Ring,
     /// Host producers of channels 0 TA, 1 FS, 2 compute.
@@ -167,6 +171,7 @@ impl Channels {
                 va::FWCTL_RING,
                 rings::FWCTL_RING_SIZE,
             )?,
+            stats_seen: StatsSeen::default(),
             producer: [0; 3],
             devctl_producer: 0,
         })
@@ -241,14 +246,53 @@ impl Channels {
         Ok(())
     }
 
+    /// Notes the stats records from the consumer to the producer into `seen`; returns the
+    /// producer, or `None` when an index is out of the ring.
+    fn note_stats(ring: &Ring, seen: &mut StatsSeen) -> Result<Option<u32>> {
+        let producer = ring.state.r32(STATE_WRITE)?;
+        let read = ring.state.r32(STATE_READ)?;
+        let Some(slots) = pstate::pending(read, producer) else {
+            return Ok(None);
+        };
+        rmb();
+        for slot in slots {
+            let at = slot as usize * pstate::STATS_RECORD;
+            seen.note(
+                ring.ring.r32(at + pstate::STATS_TAG)?,
+                ring.ring.r32(at + pstate::POWER_STATE_INDEX)?,
+            );
+        }
+        Ok(Some(producer))
+    }
+
+    /// The stats ring noted up to its producer, without consuming it.
+    pub(crate) fn peek_stats(&self) -> Result<StatsSeen> {
+        let mut seen = self.stats_seen;
+        Self::note_stats(&self.stats, &mut seen)?;
+        Ok(seen)
+    }
+
     /// Drains every receive ring: events (decoded into `events`), the six log sub-rings, trace
-    /// and stats.
-    pub(crate) fn drain_rings(&self, dev: &kernel::device::Device, events: &mut Events) -> Result {
+    /// and stats (noted into [`Self::stats_seen`] first).
+    pub(crate) fn drain_rings(
+        &mut self,
+        dev: &kernel::device::Device,
+        events: &mut Events,
+    ) -> Result {
         events.drain(dev, &self.event)?;
         for i in 0..rings::LOG_RINGS {
             Self::drain_one(&self.log, i * 0x30)?;
         }
         Self::drain_one(&self.trace, 0)?;
+        let mut seen = self.stats_seen;
+        if let Some(producer) = Self::note_stats(&self.stats, &mut seen)? {
+            self.stats_seen = seen;
+            if self.stats.read()? != producer {
+                self.stats.state.w32(STATE_READ, producer)?;
+                wmb();
+            }
+            return Ok(());
+        }
         Self::drain_one(&self.stats, 0)
     }
 }

@@ -413,6 +413,101 @@ static void v14_7_policy_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, READ_ONCE(dcp->crashed));
 }
 
+/*
+ * Which DCPs stamp their swaps: the main display of a board profile that
+ * asks for it (T6031).  The J514S panel, the external role and a DCP with
+ * no 14.7 board profile send zero timestamps, byte for byte as before.
+ */
+struct v14_7_ts_case {
+	const char *name;
+	bool profile;		/* a 14.7 board profile was admitted */
+	bool swap_timestamps;	/* the profile asks for timestamps */
+	bool main_display;
+	bool stamped;
+};
+
+static const struct v14_7_ts_case v14_7_ts_cases[] = {
+	{ "T6031 main display", true, true, true, true },
+	{ "J514S main display", true, false, true, false },
+	{ "T6031 profile, external role", true, true, false, false },
+	{ "no 14.7 board profile", false, false, true, false },
+};
+
+static void v14_7_ts_case_desc(const struct v14_7_ts_case *c, char *desc)
+{
+	strscpy(desc, c->name, KUNIT_PARAM_DESC_SIZE);
+}
+
+KUNIT_ARRAY_PARAM(v14_7_ts_case, v14_7_ts_cases, v14_7_ts_case_desc);
+
+static void v14_7_expect_timestamps(struct kunit *test,
+				    const struct dcp_swap_submit_req_v14_7 *req,
+				    bool stamped, const char *present)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(req->swap.timestamp); i++) {
+		u64 want = stamped && (i == 0 || i == 1 || i == 6) ? 120 : 0;
+
+		KUNIT_EXPECT_EQ_MSG(test, req->swap.timestamp[i], want,
+				    "%s: slot %u", present, i);
+	}
+}
+
+static void v14_7_swap_timestamps_test(struct kunit *test)
+{
+	const struct v14_7_ts_case *c = test->param_value;
+	struct iomfb_transaction atomic = { .presentation = true };
+	struct iomfb_transaction brightness = {
+		.presentation = true, .brightness_only = true,
+	};
+	struct dcp_swap_submit_req_v14_7 *frame;
+	struct iomfb_scanout_v14_7 *scanout;
+	struct apple_dcp *dcp;
+
+	if (!IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030))
+		kunit_skip(test, "needs DRM_APPLE_DCP_T6030");
+
+	dcp = v14_7_dcp(test);
+	dcp->main_display = c->main_display;
+	if (c->profile) {
+		dcp->v14_7 = kunit_kzalloc(test, sizeof(*dcp->v14_7), GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, dcp->v14_7);
+		dcp->v14_7->swap_timestamps = c->swap_timestamps;
+	}
+	frame = kunit_kzalloc(test, SWAP_SIZE, GFP_KERNEL);
+	scanout = kunit_kzalloc(test, sizeof(*scanout), GFP_KERNEL);
+	KUNIT_ASSERT_TRUE(test, frame && scanout);
+	iomfb_v14_7_encode_present(frame, &v14_7_frames[1]);
+
+	/* An atomic present before the backlight is set up. */
+	KUNIT_ASSERT_TRUE(test, v14_7_prepare(dcp, &atomic, frame, 0x2a));
+	v14_7_expect_timestamps(test, &dcp->swap_v14_7, c->stamped, "atomic");
+	if (!c->stamped)
+		KUNIT_EXPECT_EQ(test, v14_7_crc(&dcp->swap_v14_7), 0xf38285f2U);
+
+	/* The first present with a level. */
+	iomfb_configure_backlight_v14_7(dcp);
+	flush_work(&dcp->bl_register_wq);
+	KUNIT_ASSERT_TRUE(test, dcp_backlight_active(dcp));
+	KUNIT_ASSERT_TRUE(test, v14_7_prepare(dcp, &atomic, frame, 7));
+	v14_7_expect_timestamps(test, &dcp->swap_v14_7, c->stamped, "level");
+	if (!c->stamped)
+		KUNIT_EXPECT_EQ(test, v14_7_crc(&dcp->swap_v14_7), 0xd05cf8c9U);
+	KUNIT_ASSERT_TRUE(test, atomic.backlight_reserved);
+	KUNIT_ASSERT_TRUE(test, dcp_backlight_complete(dcp, atomic.backlight.sequence, true));
+
+	/* The soft-DPMS blank, re-encoded from the completed frame. */
+	scanout->request = *frame;
+	dcp->iomfb_v14_7.scanout = scanout;
+	v14_7_bl(dcp, -1, 0);
+	KUNIT_ASSERT_TRUE(test, v14_7_prepare(dcp, &brightness, &scanout->request, 0x1001));
+	KUNIT_EXPECT_TRUE(test, dcp->iomfb_v14_7.blank);
+	v14_7_expect_timestamps(test, &dcp->swap_v14_7, c->stamped, "DPMS blank");
+	if (!c->stamped)
+		KUNIT_EXPECT_EQ(test, v14_7_crc(&dcp->swap_v14_7), 0xdb3c1a63U);
+}
+
 static struct kunit_case v14_7_present_cases[] = {
 	KUNIT_CASE_PARAM(v14_7_present_encoding_test, v14_7_case_gen_params),
 	KUNIT_CASE(v14_7_layout_test),
@@ -420,6 +515,7 @@ static struct kunit_case v14_7_present_cases[] = {
 	KUNIT_CASE(v14_7_frame_check_test),
 	KUNIT_CASE(v14_7_single_surface_test),
 	KUNIT_CASE(v14_7_policy_test),
+	KUNIT_CASE_PARAM(v14_7_swap_timestamps_test, v14_7_ts_case_gen_params),
 	{}
 };
 

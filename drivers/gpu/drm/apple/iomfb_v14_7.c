@@ -427,9 +427,11 @@ static int v14_7_preferred_timing(struct apple_dcp *dcp, const void *blob, u32 s
 			preferred = &modes[i];
 	}
 	refresh = preferred ? drm_mode_vrefresh(&preferred->mode) : 0;
-	if (!preferred || preferred->mode.hdisplay != J514S_PANEL_WIDTH ||
-	    preferred->mode.vdisplay != J514S_PANEL_HEIGHT ||
+	if (!preferred || preferred->mode.hdisplay != dcp->v14_7->panel_width ||
+	    preferred->mode.vdisplay != dcp->v14_7->panel_height ||
 	    refresh < 59 || refresh > 121) {
+		dev_err(dcp->dev, "preferred timing is not the %ux%u panel at 60-120 Hz\n",
+			dcp->v14_7->panel_width, dcp->v14_7->panel_height);
 		kfree(modes);
 		return -EINVAL;
 	}

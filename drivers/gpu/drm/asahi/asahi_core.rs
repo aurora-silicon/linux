@@ -132,8 +132,8 @@ module! {
             description: "G15: completion repoll interval, us (25..1000)",
         },
         g15_idle_standby_us: u32 {
-            default: 2500,
-            description: "G15: firmware idle standby time, us (Globals +0x7a8, 100..100000)",
+            default: 0,
+            description: "G15: firmware idle standby time override, us (Globals +0x7a8, 100..100000; 0: the device tree's, else the tuned value)",
         },
         g15_idle_min_conf: u32 {
             default: 500,
@@ -147,9 +147,33 @@ module! {
             default: 1,
             description: "G15: admit only known CDM/VDM stream records (0: bring-up only)",
         },
+        g15_pb_max_blocks: u32 {
+            default: 3072,
+            description: "G15: parameter-buffer growth maximum given to the firmware, blocks of 128 KiB (64..4095; the mapped 4095 minus this answers partial renders)",
+        },
+        g15_pb_blocks: u32 {
+            default: 64,
+            description: "G15: parameter-buffer blocks of 128 KiB posted at (re)initialization (64..4095; the heap is backed on demand in 16 MiB chunks)",
+        },
+        g15_pb_reclaim: u32 {
+            default: 2,
+            description: "G15: parameter-buffer reclaim when the engine has been idle: 0 never, 1 re-initialize the PB at the next render, 2 also free the backing above the reserve",
+        },
+        g15_pb_idle_ms: u32 {
+            default: 1000,
+            description: "G15: idle time before the parameter buffer is reclaimed, ms (at least 100)",
+        },
+        g15_pb_reclaim_blocks: u32 {
+            default: 1024,
+            description: "G15: parameter-buffer blocks posted above which an idle engine reclaims (a desktop stays below 1024)",
+        },
         g15_early_tiling: u32 {
             default: 0,
             description: "G15: advertise FRAGMENT_BARRIERS, mapped to early tiling (slower on 2419)",
+        },
+        g15_accept_text_prefix: u64 {
+            default: 0,
+            description: "G15: admit an unpinned GPU firmware build whose TEXT SHA-256 starts with these 8 bytes (bring-up only)",
         },
     },
 }

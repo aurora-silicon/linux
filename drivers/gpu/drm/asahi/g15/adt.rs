@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! The boot loader's ADT, read from its phram export.
+//! The GPU regions, firmware segments and performance states: from the boot loader's ADT
+//! export (T6030), or from the GPU device tree node the boot loader fills (T6031).
+//!
+//! # T6030: the ADT export
 //!
 //! The GPU node that the PMP/ADT handoff (`drivers/soc/apple/j514s-pmp-handoff.c`) synthesizes
 //! has only `compatible = "apple,agx-t6030"`, `reg`/`reg-names` (`asc`, `sgx`), `mboxes`/
@@ -15,9 +18,19 @@
 //! checked too) and `pre-loaded == 1`; `/chosen` `dram-base`/`dram-size`.
 //! Admission: every region page-aligned, inside DRAM, disjoint from System RAM and from each
 //! other; TEXT at [`super::hw::UPPER`], DATA right after it.
+//!
+//! # T6031: the device tree node
+//!
+//! The boot loader fills the kernel's GPU node from the machine's ADT: `memory-region` entries
+//! `ttbs`, `pagetables`, `handoff` and `pagetables-l2` (the UAT regions), `fw-text` and
+//! `fw-data` (the loaded segments, no-map), `apple,firmware-segment-vas` (their two VAs) and
+//! the `operating-points-v2` table (one `opp-hz` per performance state, `opp-microvolt` with
+//! one cell per cluster). The same admission applies, without the DRAM bounds, and the four UAT
+//! regions may lie in System RAM: they are reserved-memory nodes without `no-map`, which the
+//! kernel maps, so the driver reaches them through its own mapping ([`super::regs::Mapping`]).
 
 use core::ops::Range;
-use kernel::{device, prelude::*};
+use kernel::{c_str, device, prelude::*};
 
 use super::boot::glue;
 use super::hw;
@@ -42,7 +55,16 @@ pub(crate) struct GpuAdt {
     pub(crate) perf_mhz: [u32; PERF_STATES],
     pub(crate) perf_mv: [u32; PERF_STATES],
     pub(crate) sram_mv: [u32; PERF_STATES],
+    /// Per-cluster core mV of each state, rounded up from the device tree's microvolts, how
+    /// many voltage cells the node has (1 on the ADT path), and the state's power in mW (0 on
+    /// the ADT path).
+    pub(crate) cluster_mv: [[u32; CLUSTERS]; PERF_STATES],
+    pub(crate) cluster_cells: usize,
+    pub(crate) perf_mw: [u32; PERF_STATES],
 }
+
+/// Voltage cells the layout keeps per state.
+pub(crate) const CLUSTERS: usize = 4;
 
 /// A private copy of the ADT.
 struct Adt<'a> {
@@ -282,41 +304,7 @@ fn parse(dev: &device::Device, adt: &Adt<'_>) -> Result<GpuAdt> {
         return Err(EINVAL);
     };
     // Structural admission: the ADT says where; this checks it is sane.
-    let fixed = [
-        hw::TTBS_SIZE,
-        hw::TABLES_SIZE,
-        hw::HANDOFF_SIZE,
-        hw::SHARED_L2_SIZE,
-    ];
-    for i in 0..region.len() {
-        let r = &region[i];
-        let size = r.end - r.start;
-        let end = r.end.wrapping_sub(1);
-        if size == 0
-            || (r.start | size) & (hw::PAGE - 1) != 0
-            || end > (hw::PA_MASK | (hw::PAGE - 1))
-            || r.start < dram_base
-            || end > dram_base + dram_size - 1
-            || (i < 4 && size != fixed[i])
-            || !glue::ram_disjoint(r.start, size)
-        {
-            dev_err!(
-                dev,
-                "ADT GPU region {} ({}) [mem {:#x}-{:#x}] not admissible\n",
-                i,
-                REGION_NAMES[i],
-                r.start,
-                end
-            );
-            return Err(EINVAL);
-        }
-        for j in 0..i {
-            if r.start < region[j].end && region[j].start < r.end {
-                dev_err!(dev, "ADT GPU regions {} and {} overlap\n", j, i);
-                return Err(EINVAL);
-            }
-        }
-    }
+    admit_regions(dev, &region, Some(dram_base..dram_base + dram_size), false)?;
     let [ttbs, tables, handoff, shared_l2, text, data] = region;
     let mut out = GpuAdt {
         ttbs,
@@ -328,13 +316,166 @@ fn parse(dev: &device::Device, adt: &Adt<'_>) -> Result<GpuAdt> {
         perf_mhz: [0; PERF_STATES],
         perf_mv: [0; PERF_STATES],
         sram_mv: [0; PERF_STATES],
+        cluster_mv: [[0; CLUSTERS]; PERF_STATES],
+        cluster_cells: 1,
+        perf_mw: [0; PERF_STATES],
     };
     collect_perf(dev, adt, sgx, &mut out)?;
+    for i in 0..PERF_STATES {
+        out.cluster_mv[i][0] = out.perf_mv[i];
+    }
     Ok(out)
 }
 
-/// Reads and admits the GPU's ADT data (read-only).
-pub(crate) fn read(dev: &device::Device) -> Result<GpuAdt> {
+/// Structural admission of the six regions (same order as [`REGION_NAMES`]): page-aligned,
+/// addressable, the fixed UAT sizes, disjoint from each other, and either outside System RAM
+/// (the T6030 carveouts) or, with `reserved_ram` and for the four UAT regions only, lying
+/// entirely in System RAM as reserved memory the GPU node names (the T6031 device tree). The
+/// firmware segments are always outside System RAM.
+fn admit_regions(
+    dev: &device::Device,
+    region: &[Range<u64>; 6],
+    dram: Option<Range<u64>>,
+    reserved_ram: bool,
+) -> Result {
+    let fixed = [
+        hw::TTBS_SIZE,
+        hw::TABLES_SIZE,
+        hw::HANDOFF_SIZE,
+        hw::SHARED_L2_SIZE,
+    ];
+    for i in 0..region.len() {
+        let r = &region[i];
+        let size = r.end - r.start;
+        let end = r.end.wrapping_sub(1);
+        let outside_dram = match &dram {
+            Some(dram) => r.start < dram.start || end > dram.end - 1,
+            None => false,
+        };
+        let placed = if reserved_ram && i < 4 {
+            glue::ram_disjoint(r.start, size) || glue::ram_within(r.start, size)
+        } else {
+            glue::ram_disjoint(r.start, size)
+        };
+        if size == 0
+            || (r.start | size) & (hw::PAGE - 1) != 0
+            || end > (hw::PA_MASK | (hw::PAGE - 1))
+            || outside_dram
+            || (i < 4 && size != fixed[i])
+            || !placed
+        {
+            dev_err!(
+                dev,
+                "GPU region {} ({}) [mem {:#x}-{:#x}] not admissible\n",
+                i,
+                REGION_NAMES[i],
+                r.start,
+                end
+            );
+            return Err(EINVAL);
+        }
+        for j in 0..i {
+            if r.start < region[j].end && region[j].start < r.end {
+                dev_err!(dev, "GPU regions {} and {} overlap\n", j, i);
+                return Err(EINVAL);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The GPU node's regions, segments and operating points (T6031).
+fn from_device_tree(dev: &device::Device) -> Result<GpuAdt> {
+    const NAMES: [&CStr; 6] = [
+        c_str!("ttbs"),
+        c_str!("pagetables"),
+        c_str!("handoff"),
+        c_str!("pagetables-l2"),
+        c_str!("fw-text"),
+        c_str!("fw-data"),
+    ];
+    let node = dev.of_node().ok_or(ENODEV)?;
+    let mut region: [Range<u64>; 6] = Default::default();
+    for (i, name) in NAMES.iter().enumerate() {
+        let r = node
+            .reserved_mem_region_to_resource_byname(name)
+            .inspect_err(|_| dev_err!(dev, "GPU node has no {} memory region\n", REGION_NAMES[i]))?;
+        let start = r.start() as u64;
+        let size = r.size() as u64;
+        region[i] = start..start.checked_add(size).ok_or(EINVAL)?;
+    }
+    // Firmware ABI: TEXT at the base of the upper half, DATA right after it.
+    let vas: KVec<u64> = node
+        .get_property(c_str!("apple,firmware-segment-vas"))
+        .inspect_err(|_| dev_err!(dev, "GPU node has no apple,firmware-segment-vas\n"))?;
+    let text_size = region[4].end - region[4].start;
+    if vas.len() != 2 || vas[0] != hw::UPPER || vas[1] != vas[0] + text_size {
+        dev_err!(dev, "GPU firmware segment VAs are not the firmware ABI's\n");
+        return Err(EINVAL);
+    }
+    admit_regions(dev, &region, None, true)?;
+    let [ttbs, tables, handoff, shared_l2, text, data] = region;
+    let mut out = GpuAdt {
+        ttbs,
+        tables,
+        handoff,
+        shared_l2,
+        text,
+        data,
+        perf_mhz: [0; PERF_STATES],
+        perf_mv: [0; PERF_STATES],
+        sram_mv: [0; PERF_STATES],
+        cluster_mv: [[0; CLUSTERS]; PERF_STATES],
+        cluster_cells: 0,
+        perf_mw: [0; PERF_STATES],
+    };
+    // Operating points: MHz, the highest cluster voltage of each and the clusters' voltages
+    // (rounded up) and power for the hardware record; the SRAM voltage is not in the device
+    // tree.
+    let opps = node
+        .parse_phandle(c_str!("operating-points-v2"), 0)
+        .ok_or(EINVAL)
+        .inspect_err(|_| dev_err!(dev, "GPU node has no operating points\n"))?;
+    let mut count = 0;
+    for opp in opps.children() {
+        let hz: u64 = opp.get_property(c_str!("opp-hz"))?;
+        let uv: KVec<u32> = opp.get_property(c_str!("opp-microvolt"))?;
+        let uw: Option<u32> = opp.get_opt_property(c_str!("opp-microwatt"))?;
+        let mv = uv.iter().max().copied().unwrap_or(0) / 1000;
+        if uv.is_empty() || uv.len() > CLUSTERS || (count > 0 && uv.len() != out.cluster_cells) {
+            dev_err!(dev, "GPU operating point {} has {} voltage cells\n", count, uv.len());
+            return Err(EINVAL);
+        }
+        if count < PERF_STATES {
+            out.perf_mhz[count] = (hz / 1_000_000) as u32;
+            out.perf_mv[count] = mv;
+            out.sram_mv[count] = mv;
+            for (c, v) in uv.iter().enumerate() {
+                out.cluster_mv[count][c] = v.div_ceil(1000);
+            }
+            out.cluster_cells = uv.len();
+            out.perf_mw[count] = uw.unwrap_or(0) / 1000;
+        }
+        count += 1;
+    }
+    if count != PERF_STATES {
+        dev_err!(
+            dev,
+            "GPU node has {} operating points, not {}\n",
+            count,
+            PERF_STATES
+        );
+        return Err(EINVAL);
+    }
+    Ok(out)
+}
+
+/// Reads and admits the GPU's regions, segments and performance states (read-only), from the
+/// source the SoC configuration names.
+pub(crate) fn read(dev: &device::Device, cfg: &super::Config) -> Result<GpuAdt> {
+    if cfg.platform == hw::Platform::DeviceTree {
+        return from_device_tree(dev);
+    }
     let (start, size) = glue::adt_phram()?;
     if size == 0 || size > 0x200000 || start & 0x3fff != 0 {
         return Err(EINVAL);

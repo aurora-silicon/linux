@@ -83,6 +83,8 @@ pub(crate) const fn compact(gva: u64) -> u64 {
 /// Addresses the compute encoder names: compute graph and compute slot buffers.
 #[derive(Copy, Clone, Default)]
 pub(crate) struct ComputeRefs {
+    /// HardwareData (firmware VA): the activity records the sequence names.
+    pub(crate) hwdata: u64,
     /// Graph: notifier, queue info, user/firmware stamps, UMA manager (firmware VAs).
     pub(crate) notifier: u64,
     pub(crate) qinfo: u64,
@@ -105,6 +107,7 @@ pub(crate) struct ComputeRefs {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_compute(
     r: &ComputeRefs,
+    regs_cfg: &hw::ComputeRegs,
     c: &uapi::drm_asahi_cmd_compute,
     att: &[uapi::drm_asahi_attachment],
     ts_va: &[u64; 2],
@@ -114,20 +117,28 @@ pub(crate) fn encode_compute(
     w: &mut [u8; compute::WORK_SIZE],
     q: &mut [u8; compute::SEQ_SIZE],
 ) {
-    let (wv, qv, h, pre) = (r.work, r.qinfo, hw::va::HWDATA, r.preempt_gva);
+    let (wv, qv, h, pre) = (r.work, r.qinfo, r.hwdata, r.preempt_gva);
     let t = stamp(n);
     let att_count = att.len().min(hw::sizes::MAX_ATTACHMENTS);
+    // The saved-state pointers into the preemption buffer and the two 0x1c words; a SoC
+    // encoded "fresh" carries zero in all six, as a first command does.
+    let (saved, word) = if regs_cfg.fresh {
+        (0, 0)
+    } else {
+        (pre + regs_cfg.tail, 0x1c)
+    };
+    let step = |i: u64| if saved == 0 { 0 } else { saved + 8 * i };
     let val: [u64; 22] = [
         pre,
         c.cdm_ctrl_stream_base,
-        pre + 0x1480,
-        pre + 0x1488,
-        pre + 0x1490,
-        pre + 0x1498,
+        step(0),
+        step(1),
+        step(2),
+        step(3),
         0x154024201,
         0x10c08860,
-        0x1c,
-        0x1c,
+        word,
+        word,
         0,
         0,
         0,
@@ -136,10 +147,10 @@ pub(crate) fn encode_compute(
         0,
         0,
         0,
-        8,
+        regs_cfg.reg_1a0e9,
         0xff0000,
-        0x13200400020,
-        0x200000001,
+        regs_cfg.ptc,
+        regs_cfg.dupm,
     ];
 
     w.fill(0);
@@ -489,6 +500,8 @@ pub(crate) fn barrier(
 /// (the UMA/PB objects are in `Pools`).
 #[derive(Copy, Clone, Default)]
 pub(crate) struct RenderRefs {
+    /// HardwareData (firmware VA): the activity records the sequences name.
+    pub(crate) hwdata: u64,
     pub(crate) notifier: u64,
     pub(crate) legacy_empty: u64,
     /// Queue info, user and firmware stamps of the TA (0) and FS (1) queues.
@@ -542,7 +555,7 @@ pub(crate) fn encode_ta(
     w: &mut [u8; ta::WORK_SIZE],
     q: &mut [u8; ta::SEQ_SIZE],
 ) {
-    let (wv, uv, qv, h) = (p.ta_work, p.ta_seq, r.qinfo[0], hw::va::HWDATA);
+    let (wv, uv, qv, h) = (p.ta_work, p.ta_seq, r.qinfo[0], r.hwdata);
     let (heap, su) = (p.heap_gva, p.scene_user_gva);
     let ts = ts_va[0] != 0 || ts_va[1] != 0;
     let mut val: [u64; 72] = [
@@ -742,7 +755,7 @@ pub(crate) fn encode_fs(
     w: &mut [u8; fs::WORK_SIZE],
     q: &mut [u8; fs::SEQ_SIZE],
 ) {
-    let (wv, uv, qv, h) = (p.fs_work, p.fs_seq, r.qinfo[1], hw::va::HWDATA);
+    let (wv, uv, qv, h) = (p.fs_work, p.fs_seq, r.qinfo[1], r.hwdata);
     let (heap, su) = (p.heap_gva, p.scene_user_gva);
     let ts = ts_va[2] != 0 || ts_va[3] != 0;
     let (d, s) = (&u.depth, &u.stencil);

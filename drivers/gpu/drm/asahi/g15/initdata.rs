@@ -27,6 +27,7 @@ use super::fw::initdata::{
 use super::hw::{self, va};
 use super::identity::Hex;
 use super::object::{Class, FwObject, Objects, Placement, Request};
+use super::Config;
 
 /// The built initdata graph.
 pub(crate) struct InitData {
@@ -113,56 +114,13 @@ fn put64(b: &mut [u8], offset: usize, value: u64) -> Result {
     Ok(())
 }
 
-/// Builds the initdata graph. Returns it with its channels and the top DVFS frequency in kHz.
-/// Nothing is published here.
-pub(crate) fn build(
+
+/// The T6030 board images: the verified templates with DVFS from the ADT. Returns the images
+/// and the top DVFS frequency in kHz.
+fn templates(
     dev: &device::Device,
     adt: &GpuAdt,
-    objects: &mut Objects,
-) -> Result<(InitData, Channels, u32)> {
-    let mut init = InitData::new();
-    let fw = Class::Fw;
-
-    // Owned objects and channels.
-    let root_obj = canonical(objects, va::ROOT, root::SIZE, fw)?;
-    let region_a_obj = canonical(objects, va::REGION_A, region_a::SIZE, fw)?;
-    let runtime_obj = canonical(objects, va::RUNTIME, runtime::SIZE, fw)?;
-    // Activity records cached; fault info and HardwareDataA timestamps not.
-    let hwdata_obj = objects.alloc_split(
-        Request {
-            size: hwdata::SIZE,
-            class: fw,
-            placement: Placement::At(va::HWDATA),
-            offset: 0,
-            client: None,
-            lower: None,
-            cpu: true,
-        },
-        Some((
-            (va::HWDATA as usize & (hw::PAGE as usize - 1)) + hwdata::CACHED,
-            if hw::tuning::HWDATA_CACHED {
-                Class::FwCached
-            } else {
-                fw
-            },
-        )),
-    )?;
-    let pair_obj = canonical(objects, va::PAIR, pair::SIZE, fw)?;
-    let small_obj = canonical(objects, va::SMALL, small::SIZE, fw)?;
-    let c0 = canonical(objects, va::C0, cbuf::C0_SIZE, Class::Shared)?;
-    let c1 = canonical(objects, va::C1, cbuf::C1_SIZE, Class::Shared)?;
-    let c3 = canonical(objects, va::C3, cbuf::C3_SIZE, Class::Shared)?;
-    let globals_obj = canonical(objects, va::GLOBALS, globals::SIZE, fw)?;
-    let power_obj = canonical(objects, va::POWER, power::SIZE, fw)?;
-    let control_obj = canonical(objects, va::CONTROL, control::SIZE, fw)?;
-    let flags_obj = canonical(objects, va::FLAGS, flags::SIZE, fw)?;
-    let channels = Channels::alloc(objects)?;
-    // Firmware Device RW aliases for the IOMapping table.
-    for map in hw::IOMAPS.iter() {
-        objects.map_mmio(map.va, map.pa, map.map_bytes)?;
-    }
-
-    // Board images, verified, then the owned replacements.
+) -> Result<(KVVec<u8>, KVVec<u8>, KVVec<u8>, u32)> {
     let mut hw_img = KVVec::from_elem(0u8, hwdata::SIZE, GFP_KERNEL)?;
     let mut glob = KVVec::from_elem(0u8, globals::SIZE, GFP_KERNEL)?;
     let mut pwr = KVVec::from_elem(0u8, power::SIZE, GFP_KERNEL)?;
@@ -196,8 +154,141 @@ pub(crate) fn build(
     if !reference {
         dev_info!(dev, "board data sha256 {}\n", Hex(&glue::sha256(&hw_img)));
     }
+    Ok((hw_img, glob, pwr, max_khz))
+}
+
+/// HardwareDataA word holding the system counter at initdata creation.
+const HWDATA_A_INIT_TIMESTAMP: usize = 0x424c;
+
+/// Board images of a SoC with a firmware file. The hardware record ([`board::hardware_record`]),
+/// Globals and Power ([`board::device_tree`]) are built from the device tree; the file, this
+/// machine's own, supplies the record's words the device tree does not carry and is otherwise
+/// a cross-check: the start is refused at the first differing word. Returns the images and the
+/// top operating-point frequency in kHz.
+fn blob(
+    dev: &device::Device,
+    cfg: &Config,
+    adt: &GpuAdt,
+    name: &CStr,
+    sha256: &[u8; 32],
+) -> Result<(KVVec<u8>, KVVec<u8>, KVVec<u8>, u32)> {
+    let layout = cfg.layout;
+    let images = board::blob::load(
+        dev,
+        name,
+        sha256,
+        [layout.hwdata_size, globals::SIZE, power::SIZE],
+    )?;
+    let mut hw_img = board::hardware_record(dev, cfg, adt, &images.hardware)?;
+    let (glob, pwr, max_power_mw) = board::device_tree(dev, &hw_img)?;
+    for (what, built, file) in [
+        ("hardware record", &hw_img, &images.hardware),
+        ("Globals", &glob, &images.globals),
+        ("Power", &pwr, &images.power),
+    ] {
+        let diff = if what == "hardware record" {
+            board::record::cross_check(built, file)
+        } else {
+            board::words::first_difference(built, file)
+        };
+        if let Some((at, b, f)) = diff {
+            dev_err!(
+                dev,
+                "board data: device-tree {} differs from {} at +{:#x}: built {:#x}, file {:#x}\n",
+                what,
+                name,
+                at,
+                b,
+                f
+            );
+            return Err(EINVAL);
+        }
+    }
+    let max_mhz = adt.perf_mhz.iter().copied().max().unwrap_or(0);
+    let now: u64;
+    // SAFETY: Reading the architectural counter has no side effects.
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) now, options(nomem, nostack, preserves_flags))
+    };
+    put64(&mut hw_img, hwdata::HWDATA_A + HWDATA_A_INIT_TIMESTAMP, now)?;
+    dev_info!(
+        dev,
+        "board data: {} images from the device tree match {} ({} record words from the file, {} file words left zero), {} mW maximum power, {} MHz top operating point\n",
+        cfg.name,
+        name,
+        board::record::FROM_FILE.len(),
+        board::record::UNNEEDED.len(),
+        max_power_mw,
+        max_mhz
+    );
+    Ok((hw_img, glob, pwr, max_mhz * 1000))
+}
+
+/// Builds the initdata graph. Returns it with its channels and the top DVFS frequency in kHz.
+/// Nothing is published here.
+pub(crate) fn build(
+    dev: &device::Device,
+    cfg: &Config,
+    adt: &GpuAdt,
+    objects: &mut Objects,
+) -> Result<(InitData, Channels, u32)> {
+    let mut init = InitData::new();
+    let fw = Class::Fw;
+    let layout = cfg.layout;
+    let hwdata_va = layout.hwdata_va;
+
+    // Owned objects and channels.
+    let root_obj = canonical(objects, va::ROOT, root::SIZE, fw)?;
+    let region_a_obj = canonical(objects, va::REGION_A, region_a::SIZE, fw)?;
+    let runtime_obj = canonical(objects, va::RUNTIME, runtime::SIZE, fw)?;
+    // Activity records cached; fault info and HardwareDataA timestamps not (T6030), or the
+    // whole record cached (a layout without a cached prefix).
+    let cached = if hw::tuning::HWDATA_CACHED {
+        Class::FwCached
+    } else {
+        fw
+    };
+    let hwdata_obj = match layout.hwdata_cached {
+        Some(prefix) => objects.alloc_split(
+            Request {
+                size: layout.hwdata_size,
+                class: fw,
+                placement: Placement::At(hwdata_va),
+                offset: 0,
+                client: None,
+                lower: None,
+                cpu: true,
+            },
+            Some(((hwdata_va as usize & (hw::PAGE as usize - 1)) + prefix, cached)),
+        )?,
+        None => canonical(objects, hwdata_va, layout.hwdata_size, cached)?,
+    };
+    let pair_obj = canonical(objects, va::PAIR, pair::SIZE, fw)?;
+    let small_obj = canonical(objects, va::SMALL, small::SIZE, fw)?;
+    let c0 = canonical(objects, va::C0, cbuf::C0_SIZE, Class::Shared)?;
+    let c1 = canonical(objects, va::C1, cbuf::C1_SIZE, Class::Shared)?;
+    let c3 = canonical(objects, va::C3, cbuf::C3_SIZE, Class::Shared)?;
+    let globals_obj = canonical(objects, va::GLOBALS, globals::SIZE, fw)?;
+    let power_obj = canonical(objects, va::POWER, power::SIZE, fw)?;
+    let control_obj = canonical(objects, va::CONTROL, control::SIZE, fw)?;
+    let flags_obj = canonical(objects, va::FLAGS, flags::SIZE, fw)?;
+    let channels = Channels::alloc(objects)?;
+    // Firmware Device RW aliases for the IOMapping table.
+    for map in layout.iomaps.iter() {
+        objects.map_mmio(map.va, map.pa, map.map_bytes)?;
+    }
+
+    // Board images, verified, then the owned replacements.
+    let (mut hw_img, mut glob, pwr, max_khz) = match cfg.board {
+        hw::Board::Templates => templates(dev, adt)?,
+        hw::Board::Blob { name, sha256 } => blob(dev, cfg, adt, name, &sha256)?,
+        hw::Board::None => return Err(ENODEV),
+    };
+    if hw_img.len() != layout.hwdata_size {
+        return Err(EINVAL);
+    }
     put64(&mut hw_img, hwdata::TTBAT, adt.ttbs.start)?;
-    for map in hw::IOMAPS.iter() {
+    for map in layout.iomaps.iter() {
         put64(
             &mut hw_img,
             hwdata::IOMAPS + hwdata::IOMAP_STRIDE * map.slot as usize + hwdata::IOMAP_VA,
@@ -206,11 +297,47 @@ pub(crate) fn build(
     }
     put64(&mut hw_img, hwdata::TIMESTAMPS, va::TIMESTAMPS)?;
     put32(&mut glob, globals::UNK_980, 100)?;
-    put32(
-        &mut glob,
-        globals::IDLE_STANDBY_US,
-        super::params::idle_standby_us(),
-    )?;
+    // The device tree's standby time (a machine with a firmware file; the templates' machine
+    // has none).
+    let dt_standby = match cfg.board {
+        hw::Board::Blob { .. } => {
+            let prop = board::words::PROPS[board::words::STANDBY_TIMER];
+            match dev
+                .of_node()
+                .ok_or(ENODEV)
+                .and_then(|n| n.get_property::<u32>(prop))
+            {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    dev_warn!(
+                        dev,
+                        "GPU node has no u32 {}, using the tuned idle standby\n",
+                        prop
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let (standby_us, standby_src, dt_rejected) = super::power::standby(
+        super::params::idle_standby_override_us(),
+        dt_standby,
+        hw::tuning::IDLE_STANDBY_US,
+    );
+    if dt_rejected {
+        dev_warn!(
+            dev,
+            "apple,idleoff-standby-timer is outside 100..100000 us, ignored\n"
+        );
+    }
+    dev_info!(
+        dev,
+        "idle standby {} us from {}\n",
+        standby_us,
+        standby_src.name()
+    );
+    put32(&mut glob, globals::IDLE_STANDBY_US, standby_us)?;
     put32(
         &mut glob,
         globals::IDLE_MIN_CONF,
@@ -221,16 +348,19 @@ pub(crate) fn build(
         globals::IDLE_PREDICTIVE,
         hw::tuning::IDLE_PREDICTIVE as u32,
     )?;
-    // HardwareDataA at +0x4580: maintained S8 request.
-    for (offset, value) in [
-        (0x2c, 8),
-        (0x30, 8),
-        (0x44, 800),
-        (0x7d8, 800),
-        (0x7e0, 800),
-        (0x81c, 800),
-    ] {
-        put32(&mut hw_img, hwdata::HWDATA_A + offset, value)?;
+    // HardwareDataA at +0x4580: maintained S8 request (the templates' machine; a board image
+    // from a file carries its own machine's words).
+    if cfg.board == hw::Board::Templates {
+        for (offset, value) in [
+            (0x2c, 8),
+            (0x30, 8),
+            (0x44, 800),
+            (0x7d8, 800),
+            (0x7e0, 800),
+            (0x81c, 800),
+        ] {
+            put32(&mut hw_img, hwdata::HWDATA_A + offset, value)?;
+        }
     }
     hwdata_obj.write(0, &hw_img)?;
     globals_obj.write(0, &glob)?;
@@ -238,7 +368,7 @@ pub(crate) fn build(
 
     // Root.
     let r = &root_obj;
-    r.w64(0x00, root::MAGIC)?;
+    r.w64(0x00, layout.root_magic)?;
     r.w64(root::REGION_A, va::REGION_A)?;
     r.w64(root::RUNTIME, va::RUNTIME)?;
     r.w64(root::GLOBALS, va::GLOBALS)?;
@@ -260,7 +390,7 @@ pub(crate) fn build(
 
     // Runtime pointers.
     let rt = &runtime_obj;
-    rt.w64(runtime::HWDATA, va::HWDATA)?;
+    rt.w64(runtime::HWDATA, hwdata_va)?;
     rt.w64(runtime::PAIR, va::PAIR)?;
     rt.w64(runtime::PAIR2, va::PAIR)?;
     for i in 0..13u64 {
@@ -288,17 +418,17 @@ pub(crate) fn build(
     rt.w64(runtime::SMALL, va::SMALL)?;
     rt.w64(
         runtime::TA_ACTIVITY,
-        va::HWDATA + hwdata::TA_ACTIVITY as u64,
+        hwdata_va + hwdata::TA_ACTIVITY as u64,
     )?;
     rt.w64(
         runtime::FS_ACTIVITY,
-        va::HWDATA + hwdata::FS_ACTIVITY as u64,
+        hwdata_va + hwdata::FS_ACTIVITY as u64,
     )?;
     rt.w64(
         runtime::COMPUTE_ACTIVITY,
-        va::HWDATA + hwdata::COMPUTE_ACTIVITY as u64,
+        hwdata_va + hwdata::COMPUTE_ACTIVITY as u64,
     )?;
-    rt.w64(runtime::FAULT_INFO, va::HWDATA + hwdata::FAULT_INFO as u64)?;
+    rt.w64(runtime::FAULT_INFO, hwdata_va + layout.hwdata_view as u64)?;
     rt.w64(runtime::C0, va::C0)?;
     rt.w64(runtime::C1, va::C1)?;
     rt.w64(runtime::C1_2, va::C1)?;
@@ -306,7 +436,7 @@ pub(crate) fn build(
     rt.w64(runtime::C3_2, va::C3)?;
     rt.w32(runtime::UNK_2D0, 4)?;
     rt.w32(runtime::UNK_3B0, 0xff)?;
-    rt.w64(runtime::HWDATA_A, va::HWDATA + hwdata::HWDATA_A as u64)?;
+    rt.w64(runtime::HWDATA_A, hwdata_va + hwdata::HWDATA_A as u64)?;
 
     // Control and flags.
     let c = &control_obj;

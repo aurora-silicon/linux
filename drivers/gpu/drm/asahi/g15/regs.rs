@@ -51,6 +51,8 @@ enum Kind {
     Device,
     /// `memremap(MEMREMAP_WC)`: normal non-cacheable memory.
     WriteCombined,
+    /// `memremap(MEMREMAP_WB)`: System RAM through the kernel's own mapping.
+    WriteBack,
 }
 
 /// A CPU mapping of a physical range that is not System RAM, accessed with the `readl`/`writel`
@@ -115,6 +117,30 @@ impl Mapping {
         })
     }
 
+    /// Maps a boot-loader region the firmware shares with the host: write-combined when it is
+    /// a carveout outside System RAM (the T6030 regions), through the kernel's cacheable
+    /// mapping when it is a reserved-memory region inside System RAM (the T6031 regions, which
+    /// the earlier driver of that SoC used the same way).
+    pub(crate) fn region(phys: u64, size: usize) -> Result<Self> {
+        if size == 0 {
+            return Err(EINVAL);
+        }
+        if !super::boot::glue::ram_within(phys, size as u64) {
+            return Self::write_combined(phys, size);
+        }
+        // SAFETY: memremap() of System RAM with MEMREMAP_WB returns its existing mapping; the
+        // range is a reserved-memory region of the GPU node that nothing else uses.
+        let addr = unsafe { bindings::memremap(phys, size, bindings::MEMREMAP_WB as _) };
+        if addr.is_null() {
+            return Err(ENOMEM);
+        }
+        Ok(Self {
+            raw: MmioRaw::new(addr as usize, size)?,
+            phys,
+            kind: Kind::WriteBack,
+        })
+    }
+
     /// The `readl`/`writel` accessors of this mapping.
     pub(crate) fn io(&self) -> &Mmio {
         // SAFETY: By the type invariant `raw` describes a live mapping of `maxsize` bytes.
@@ -133,20 +159,27 @@ impl Drop for Mapping {
         unsafe {
             match self.kind {
                 Kind::Device => bindings::iounmap(self.raw.addr() as *mut _),
-                Kind::WriteCombined => bindings::memunmap(self.raw.addr() as *mut _),
+                Kind::WriteCombined | Kind::WriteBack => {
+                    bindings::memunmap(self.raw.addr() as *mut _)
+                }
             }
         }
     }
 }
+
+/// Most clusters of a supported SoC.
+pub(crate) const MAX_CLUSTERS: usize = 4;
 
 /// Identification read at start.
 #[derive(Copy, Clone, Default)]
 pub(crate) struct Identity {
     pub(crate) version: u32,
     pub(crate) counts: u32,
-    /// Raw enabled-core mask and its per-cluster split (10 bits each).
-    pub(crate) cores: u32,
-    pub(crate) core_masks: [u32; 2],
+    /// Raw enabled-core mask (`+0xe01500`, and `+0xe01504` above 32 core slots) and its
+    /// per-cluster split ([`super::hw::CLUSTER_BITS`] each, cluster 0 lowest), one entry per
+    /// cluster of the SoC.
+    pub(crate) cores: u64,
+    pub(crate) core_masks: [u32; MAX_CLUSTERS],
 }
 
 /// Engine receipts: busy bit and the two fault banks.
@@ -197,17 +230,30 @@ impl Regs {
         })
     }
 
-    /// Reads the identification words and the enabled-core mask (after the AGX vote).
-    pub(crate) fn identity(&self) -> Result<Identity> {
+    /// Reads the identification words and the enabled-core mask (once the GPU is powered). A
+    /// SoC with more than 32 core slots carries the mask in two words.
+    pub(crate) fn identity(&self, cfg: &super::Config) -> Result<Identity> {
         let version = self.res.sgx_read32_at(SGX_ID)?;
         let counts = self.res.sgx_read32_at(SGX_ID + 0x10)?;
-        let cores = self.res.sgx_read32_at(SGX_CORE + 0x1500)?;
-        let mask = (1u32 << super::hw::CLUSTER_BITS) - 1;
+        let mut cores = u64::from(self.res.sgx_read32_at(SGX_CORE + 0x1500)?);
+        if cfg.core_slots() > 32 {
+            cores |= u64::from(self.res.sgx_read32_at(SGX_CORE + 0x1504)?) << 32;
+        }
+        let bits = super::hw::CLUSTER_BITS;
+        let mask = (1u64 << bits) - 1;
+        let mut core_masks = [0u32; MAX_CLUSTERS];
+        for (cluster, slot) in core_masks
+            .iter_mut()
+            .enumerate()
+            .take((cfg.num_clusters as usize).min(MAX_CLUSTERS))
+        {
+            *slot = ((cores >> (cluster as u32 * bits)) & mask) as u32;
+        }
         Ok(Identity {
             version,
             counts,
             cores,
-            core_masks: [cores & mask, (cores >> super::hw::CLUSTER_BITS) & mask],
+            core_masks,
         })
     }
 

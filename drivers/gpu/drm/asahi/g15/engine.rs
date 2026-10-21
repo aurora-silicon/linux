@@ -393,6 +393,8 @@ pub(crate) struct Engine {
     pub(crate) prof: Prof,
     /// The `asahi-g15/stats` file.
     pub(crate) debugfs: Option<Pin<KBox<kernel::debugfs::File<Arc<Shared>>>>>,
+    /// The `asahi-g15/pstate` file.
+    pub(crate) debugfs_pstate: Option<Pin<KBox<kernel::debugfs::File<Arc<Shared>>>>>,
     scratch: Option<KBox<Scratch>>,
 }
 
@@ -427,6 +429,7 @@ impl Engine {
             stats: Stats::default(),
             prof: Prof::default(),
             debugfs: None,
+            debugfs_pstate: None,
             scratch: None,
         }
     }
@@ -512,8 +515,12 @@ impl Firmware {
         if self.engine.flights.capacity() < sizes::FLIGHTS {
             self.engine.flights.reserve(sizes::FLIGHTS, GFP_KERNEL)?;
         }
+        // A job arriving at an idle engine: the PB reclaim, if due, happens before its
+        // publication (idle polls are not re-armed, so this is where a long idle ends).
+        self.reclaim_check();
         self.engine.pending.push(job.clone(), GFP_KERNEL)?;
         job.progress.set_pending(true);
+        self.note_idle();
         let q = &job.queue;
         let owned = self.engine.queue_published(&job)
             + self
@@ -598,6 +605,9 @@ impl Firmware {
                 }
             }
         }
+        // A publication that left nothing published and nothing pending (jobs that failed
+        // before any visible record) starts the idle.
+        self.note_idle();
         result
     }
 
@@ -638,6 +648,7 @@ impl Firmware {
         let r = &self.graph.render;
         let a = self.pools.allocator_refs();
         RenderRefs {
+            hwdata: self.cfg.layout.hwdata_va,
             notifier: r.notifier.va,
             legacy_empty: r.legacy_empty.va,
             qinfo: [r.qinfo[0].va, r.qinfo[1].va],
@@ -681,6 +692,8 @@ impl Firmware {
     }
 
     fn publish_prefix_into(&mut self, job: &Arc<Job>, f: &mut Flight) -> Result {
+        // Every backed PB chunk is mapped in the job's VM before anything of it is visible.
+        self.map_heap(&job.vm)?;
         let overlap = !self.engine.flights.is_empty();
         let mut mixed = tuning::MIXED_PREFIX;
         let mut pf = Prefix {
@@ -1085,6 +1098,7 @@ impl Firmware {
         let s = &scrub.compute[index];
         let g = &self.graph.compute;
         let refs = ComputeRefs {
+            hwdata: self.cfg.layout.hwdata_va,
             notifier: g.notifier.va,
             qinfo: g.qinfo.va,
             user_stamp: g.user_stamp.va,
@@ -1108,6 +1122,7 @@ impl Firmware {
         let (w, q) = (&mut scratch.cw, &mut scratch.cq);
         encode::encode_compute(
             &refs,
+            &self.cfg.compute,
             &cmd.cmd,
             &cmd.attachments,
             ts,

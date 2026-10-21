@@ -14,6 +14,9 @@
 //!   of works under sustained low-duty submission pay a ~300 us power-up.
 //! - +0x2c enables the idle decision (template 1, unchanged).
 //!
+//! The standby time comes from [`standby`]: the explicit `g15_idle_standby_us` when set, else the
+//! device tree's `apple,idleoff-standby-timer` where the machine has one, else the tuned value.
+//!
 //! Core-only (no `kernel` imports), so that it can be tested on the host.
 
 /// Globals offsets (mirrors of `fw::initdata::globals`).
@@ -22,6 +25,50 @@ pub(crate) const PREDICTIVE: usize = 0x30;
 pub(crate) const STANDBY_US: usize = 0x7a8;
 pub(crate) const MIN_CONF: usize = 0x7c4;
 pub(crate) const DELAY: usize = 0x9a0;
+
+/// Where the standby time came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StandbySource {
+    /// The `g15_idle_standby_us` module parameter.
+    Parameter,
+    /// The GPU node's `apple,idleoff-standby-timer`.
+    DeviceTree,
+    /// The tuned value.
+    Tuning,
+}
+
+impl StandbySource {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Parameter => "the module parameter",
+            Self::DeviceTree => "the device tree",
+            Self::Tuning => "the tuning",
+        }
+    }
+}
+
+/// Bounds of an explicit or device-tree standby time, us.
+pub(crate) const STANDBY_MIN_US: u32 = 100;
+pub(crate) const STANDBY_MAX_US: u32 = 100000;
+
+/// Chooses the standby time, us: `param` (0: not set, else clamped to the bounds) wins, then
+/// `dt` (the device-tree value, if the machine has one and it is within the bounds), else
+/// `tuned`. Returns the value and its source; the flag tells a device-tree value outside the
+/// bounds was ignored.
+pub(crate) fn standby(param: u32, dt: Option<u32>, tuned: u32) -> (u32, StandbySource, bool) {
+    let rejected = matches!(dt, Some(v) if !(STANDBY_MIN_US..=STANDBY_MAX_US).contains(&v));
+    if param != 0 {
+        return (
+            param.clamp(STANDBY_MIN_US, STANDBY_MAX_US),
+            StandbySource::Parameter,
+            rejected,
+        );
+    }
+    match dt {
+        Some(v) if !rejected => (v, StandbySource::DeviceTree, false),
+        _ => (tuned, StandbySource::Tuning, rejected),
+    }
+}
 
 /// IEEE-754 single bits of `permille / 1000`, `permille` clamped to 1..=1000 (0 cannot be
 /// expressed: it reads 0.001).
@@ -51,6 +98,22 @@ mod tests {
 
     fn f32_bits(x: f32) -> u32 {
         x.to_bits()
+    }
+
+    #[test]
+    fn standby_choice() {
+        use StandbySource::*;
+        assert_eq!(standby(0, Some(1234), 2500), (1234, DeviceTree, false));
+        assert_eq!(standby(0, None, 2500), (2500, Tuning, false));
+        assert_eq!(standby(900, Some(1234), 2500), (900, Parameter, false));
+        assert_eq!(standby(900, None, 2500), (900, Parameter, false));
+        assert_eq!(standby(5, None, 2500), (100, Parameter, false));
+        assert_eq!(standby(10_000_000, None, 2500), (100000, Parameter, false));
+        assert_eq!(standby(0, Some(0), 2500), (2500, Tuning, true));
+        assert_eq!(standby(0, Some(100001), 2500), (2500, Tuning, true));
+        assert_eq!(standby(0, Some(100), 2500), (100, DeviceTree, false));
+        assert_eq!(standby(0, Some(100000), 2500), (100000, DeviceTree, false));
+        assert_eq!(standby(700, Some(0), 2500), (700, Parameter, true));
     }
 
     #[test]

@@ -76,9 +76,7 @@ bool iomfb_check_callback_v14_7(int tag, u32 in_len, u32 out_len);
 struct apple_dcp;
 struct dcp_property_store;
 
-/* The J514S panel and the DCP's DMA window (DART SID5, 64 GiB at 1 TiB). */
-#define J514S_PANEL_WIDTH	3024
-#define J514S_PANEL_HEIGHT	1964
+/* The DCP's DMA window (DART SID5, 64 GiB at 1 TiB). */
 #define DCP_V14_7_DVA_BASE	SZ_1T
 #define DCP_V14_7_DVA_SIZE	SZ_64G
 
@@ -108,8 +106,13 @@ struct dcp_v14_7_session {
 	/* RTKit system buffers (borrowed and allocated), bounded like D451. */
 	size_t rtkit_bytes;
 
-	/* Stride of the inherited boot framebuffer, checked at admission. */
+	/* The board's panel and boot framebuffer, set at admission. */
 	u32 boot_stride;
+	u32 panel_width, panel_height;
+	/* The DCP may be adopted with no PMP described (T6031 experiment). */
+	bool pmp_optional;
+	/* The panel's swaps carry constant timestamps (T6031 only). */
+	bool swap_timestamps;
 
 	/* IOMFB READY word; startup progress. */
 	u64 ready_word;

@@ -23,6 +23,7 @@
 #include "dcp-announce.h"
 #include "dcp-display-metadata.h"
 #include "dcp-metadata-epoch.h"
+#include "dcp-panel-edid.h"
 #include "dcp-180hz.h"
 #include "iomfb.h"
 #include "iomfb_h17p.h"
@@ -226,6 +227,8 @@ struct dcp_panel {
 	int height_mm;
 	/// panel has a mini-LED backlight
 	bool has_mini_led;
+	/// make and product for the base EDID, from the panel's compatible
+	struct dcp_panel_id id;
 };
 
 enum dcp_iomfb_method_profile {

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * G15 (T6030, M3 Pro) helpers that have no Rust bindings: static inlines,
+ * G15 (T6030/T6031, M3 Pro/Max) helpers that have no Rust bindings: static inlines,
  * macros and THIS_MODULE. Built only with CONFIG_DRM_ASAHI_G15.
  */
 #include <crypto/sha2.h>
@@ -17,10 +17,12 @@
 
 void asahi_g15_sha256(const u8 *data, size_t len, u8 *out);
 bool asahi_g15_board(void);
+bool asahi_g15_machine(const char *compatible);
 void asahi_g15_hold_power(struct device *dev);
 void asahi_g15_module_get(void);
 int asahi_g15_adt_phram(u64 *start, u64 *size);
 bool asahi_g15_ram_disjoint(u64 start, u64 size);
+bool asahi_g15_ram_within(u64 start, u64 size);
 void __iomem *asahi_g15_ioremap_wc(u64 start, size_t size);
 bool asahi_g15_dma_coherent(struct device *dev);
 
@@ -34,6 +36,12 @@ void asahi_g15_sha256(const u8 *data, size_t len, u8 *out)
 bool asahi_g15_board(void)
 {
 	return apple_pmp_t6030_board();
+}
+
+/* Whether the machine carries this compatible (of_machine_is_compatible()). */
+bool asahi_g15_machine(const char *compatible)
+{
+	return of_machine_is_compatible(compatible) > 0;
 }
 
 /*
@@ -98,6 +106,13 @@ bool asahi_g15_ram_disjoint(u64 start, u64 size)
 bool asahi_g15_dma_coherent(struct device *dev)
 {
 	return dev_is_dma_coherent(dev);
+}
+
+/* The range lies entirely in System RAM (a reserved-memory region the kernel maps). */
+bool asahi_g15_ram_within(u64 start, u64 size)
+{
+	return region_intersects(start, size, IORESOURCE_SYSTEM_RAM, IORES_DESC_NONE) ==
+	       REGION_INTERSECTS;
 }
 
 /* The inherited RTKit buffer inside firmware DATA. */

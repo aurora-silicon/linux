@@ -6,7 +6,7 @@ appledrm-y := apple_drv.o apple_resume.o
 appledrm-y += afk.o dcp.o dcp_backlight.o dptxep.o iomfb.o parser.o systemep.o
 appledrm-$(CONFIG_DRM_APPLE_AUDIO) += audio.o
 appledrm-$(CONFIG_DRM_APPLE_AUDIO) += av.o
-appledrm-y += connector.o dcp-display-metadata.o dcp-180hz.o
+appledrm-y += connector.o dcp-display-metadata.o dcp-180hz.o dcp-panel-edid.o
 appledrm-y += ibootep.o
 appledrm-y += iomfb_v12_3.o
 appledrm-y += iomfb_v13_3.o
@@ -24,6 +24,7 @@ appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_external_ready_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_external_announce_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_external_relink_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_dropped_swap_test.o
+appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-panel-edid-test.o
 appledrm-y += epic/dpavservep.o
 appledrm-y += plane.o
 
