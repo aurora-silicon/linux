@@ -199,6 +199,15 @@ struct mt7932 {
 	u64 rx_integrity, rx_malformed, rx_unsupported;
 	u64 rx_wrong_peer, rx_unprotected, rx_duplicate, rx_no_memory;
 	u64 rx_retry, rx_amsdu;
+	/* Lifetime transport observations for ethtool. The ring and cause
+	 * counters are written only by the interrupt thread; the BSS presence
+	 * counters are under response_lock, the data counters under data_lock.
+	 */
+	u64 irq_passes, irq_unmasked_passes, rx_ring_records[9];
+	u32 irq_unmasked;
+	u64 tx_free_events, bss_absent_events, bss_absent_ms;
+	unsigned long bss_absent_since;
+	u64 home_beacons, rx_band_records[3];
 	/* TX0 descriptors published since the last doorbell; data_lock. */
 	unsigned int data_unkicked;
 	bool data_ready;

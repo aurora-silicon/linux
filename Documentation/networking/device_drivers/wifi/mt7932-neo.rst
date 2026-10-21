@@ -623,6 +623,20 @@ over-air MPDU counts, BA-window sizes, TX retries or firmware ACK counters.
 Duplicate suppression records sequences only after the protection check,
 so a rejected unprotected frame cannot suppress a later decrypted retry.
 
+Transport counters describe how the host services the device:
+``irq_service_passes`` counts interrupt-thread passes and
+``rx_ring0_records`` to ``rx_ring8_records`` count descriptors consumed per
+receive ring. ``irq_unmasked_bits`` accumulates status bits that were
+pending outside the enabled interrupt mask, and ``irq_unmasked_passes``
+counts the passes that saw any. Work announced only by such a bit waits for
+an unrelated interrupt, which shows up as latency rather than loss.
+``tx_free_events`` counts TX completion reports. ``bss_absent_events`` and
+``bss_absent_ms`` count how often and for how long the firmware reported the
+BSS absent, during which TX is held. ``home_beacons`` counts beacons from
+the associated BSS that reached the host, and ``rx_2ghz_records``,
+``rx_5ghz_records`` and ``rx_6ghz_records`` split admitted Ethernet RX by
+band. Like the RX counters, they are lifetime values.
+
 Use the current RX bitrate from ``iw dev <interface> station dump`` while
 traffic is running. The driver expires that sample after one second; an
 idle or unsupported RX vector can leave it absent. TX bitrate is not
