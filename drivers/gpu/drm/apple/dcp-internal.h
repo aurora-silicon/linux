@@ -422,6 +422,8 @@ struct apple_dcp {
 	bool pipe_enabled_h17p;
 	/* Messages from the coprocessor are held in the mailbox for sleep. */
 	bool rx_held;
+	/* The 14.7 panel's display controller is off (A472 hardware power). */
+	bool panel_hw_off;
 
 	/* eDP display without DP-HDMI conversion */
 	bool main_display;

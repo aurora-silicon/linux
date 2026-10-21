@@ -189,6 +189,10 @@ static bool show_notch;
 module_param(show_notch, bool, 0644);
 MODULE_PARM_DESC(show_notch, "Use the full display height and shows the notch");
 
+static bool panel_hw_off = true;
+module_param(panel_hw_off, bool, 0644);
+MODULE_PARM_DESC(panel_hw_off, "J514S panel: stop the display controller (A472 hardware power) on DPMS off and system sleep instead of only blanking it [default: true]");
+
 bool hdmi_audio;
 module_param(hdmi_audio, bool, 0644);
 MODULE_PARM_DESC(hdmi_audio, "Enable unstable HDMI audio support");
@@ -3719,6 +3723,49 @@ static bool dcp_uses_soft_dpms(struct apple_dcp *dcp)
 		dcp->connector_type == DRM_MODE_CONNECTOR_eDP);
 }
 
+/*
+ * The 14.7 panel's display controller off: once the zero-nits blank has been
+ * presented, A472 with the hardware selector stops scanout and the panel. The
+ * session, its buffers and the DART mappings stay; dcp_panel_hw_on() restarts
+ * the controller before the backlight is restored.
+ */
+static void dcp_panel_hw_off(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (!panel_hw_off || !iomfb_is_v14_7(dcp) || iomfb_is_v14_7_external(dcp) ||
+	    !dcp_has_panel(dcp) || dcp->panel_hw_off || READ_ONCE(dcp->crashed))
+		return;
+
+	flush_work(&dcp->bl_update_wq);
+	if (!iomfb_queue_drain(dcp, msecs_to_jiffies(500))) {
+		dev_warn(dcp->dev, "blank still pending; display controller left on\n");
+		return;
+	}
+	ret = iomfb_v14_7_panel_power(dcp, false);
+	if (ret) {
+		dev_err(dcp->dev, "display controller off failed: %d\n", ret);
+		return;
+	}
+	dcp->panel_hw_off = true;
+	dev_dbg(dcp->dev, "display controller off\n");
+}
+
+static void dcp_panel_hw_on(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (!dcp->panel_hw_off)
+		return;
+	ret = iomfb_v14_7_panel_power(dcp, true);
+	if (ret) {
+		dev_err(dcp->dev, "display controller on failed: %d\n", ret);
+		return;
+	}
+	dcp->panel_hw_off = false;
+	dev_dbg(dcp->dev, "display controller on\n");
+}
+
 void dcp_poweron(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -3759,6 +3806,7 @@ void dcp_poweron(struct platform_device *pdev)
 						   &dcp->bl_fallback_wq,
 						   DCP_BL_FALLBACK_DELAY);
 		}
+		dcp_panel_hw_on(dcp);
 		ret = dcp_backlight_dpms(dcp, true);
 		if (ret)
 			dev_warn(dcp->dev, "backlight restore unavailable: %d\n", ret);
@@ -3851,11 +3899,16 @@ void dcp_poweroff(struct platform_device *pdev)
 
 	cancel_delayed_work(&dcp->swap_watchdog_wq);
 
-	/* Internal H17P DPMS is a brightness present, never a pipe stop. */
+	/*
+	 * Internal H17P DPMS is a brightness present, never a pipe stop. The
+	 * 14.7 panel then also stops its display controller.
+	 */
 	if (dcp_uses_soft_dpms(dcp)) {
 		ret = dcp_backlight_dpms(dcp, false);
 		if (ret)
 			dev_warn(dcp->dev, "backlight blank unavailable: %d\n", ret);
+		else
+			dcp_panel_hw_off(dcp);
 		return;
 	}
 

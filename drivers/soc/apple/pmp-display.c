@@ -25,6 +25,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/suspend.h>
 #include <linux/workqueue.h>
 #include <linux/soc/apple/pmp-display.h>
 
@@ -457,6 +458,50 @@ static atomic_t j514s_floor_started = ATOMIC_INIT(0);
 static unsigned int j514s_floor_try;
 static u64 j514s_floor_prior[2];
 
+/*
+ * The floor is for CPU and GPU memory throughput, but the PMP also keeps it
+ * when idle: with it the fabric and the DCS stay at FAB 5 / DCS 8, without it
+ * they settle at FAB 3 / DCS 4 as on macOS. Withdraw it for system sleep and
+ * request it again, as a fresh transition, on resume.
+ */
+static void j514s_memory_floor_set(bool on)
+{
+	void __iomem *ptd = ioremap_np(J514S_PTD, J514S_PTD_SIZE);
+
+	if (!ptd)
+		return;
+	if (readq(ptd + J514S_PTD_STATUS) == 1) {
+		for (u32 i = 0; i < 2; i++)
+			writeq(j514s_floor_prior[i], ptd + J514S_PTD_FLOOR_SET(i));
+		if (on) {
+			msleep(J514S_FLOOR_SETTLE_MS);
+			for (u32 i = 0; i < 2; i++)
+				writeq(j514s_floor_prior[i] | J514S_PTD_FLOOR,
+				       ptd + J514S_PTD_FLOOR_SET(i));
+		}
+	}
+	iounmap(ptd);
+}
+
+static int j514s_memory_floor_pm(struct notifier_block *nb, unsigned long action,
+				 void *data)
+{
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+		j514s_memory_floor_set(false);
+		return NOTIFY_OK;
+	case PM_POST_SUSPEND:
+		j514s_memory_floor_set(true);
+		return NOTIFY_OK;
+	default:
+		return NOTIFY_DONE;
+	}
+}
+
+static struct notifier_block j514s_floor_pm_nb = {
+	.notifier_call = j514s_memory_floor_pm,
+};
+
 static void j514s_memory_floor_work(struct work_struct *work)
 {
 	void __iomem *ptd = ioremap_np(J514S_PTD, J514S_PTD_SIZE);
@@ -493,6 +538,10 @@ retry:
 	}
 	if (!confirmed)
 		pr_warn("pmp-display: J514S memory floor not confirmed by the PMP\n");
+	else if (register_pm_notifier(&j514s_floor_pm_nb))
+		pr_warn("pmp-display: J514S memory floor stays on through system sleep\n");
+	else
+		return;	/* The notifier keeps the module. */
 	module_put(THIS_MODULE);
 }
 

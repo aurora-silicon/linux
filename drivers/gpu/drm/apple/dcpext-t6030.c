@@ -2010,8 +2010,15 @@ int dcp_ext_v14_7_suspend(struct apple_dcp *dcp)
 	disable_work_sync(&ext->irq_work);
 	disable_work_sync(&ext->av_work);
 	disable_work_sync(&ext->audio_work);
+	/*
+	 * A controller never started has no session to keep: its power chain
+	 * may go off for system sleep and come back cold. A started one keeps
+	 * its power, as the DCPEXT has no restartable sleep yet.
+	 */
+	if (!ext->started)
+		return 0;
 	device_set_wakeup_path(dcp->dev);
-	if (!ext->started || READ_ONCE(dcp->crashed))
+	if (READ_ONCE(dcp->crashed))
 		return 0;
 	dcp_ext_service_disarm(ext);
 	iomfb_pause_presentation(dcp, true);

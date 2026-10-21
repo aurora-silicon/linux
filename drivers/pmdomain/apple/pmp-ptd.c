@@ -51,6 +51,7 @@
 /* The specifier cell is the controller's request bit: 8 DISPEXT0, 9 DISPEXT1. */
 #define PTD_FIRST_EXT		8
 #define PTD_NR_EXT		2
+#define PTD_EXT_MASK		GENMASK_ULL(PTD_FIRST_EXT + PTD_NR_EXT - 1, PTD_FIRST_EXT)
 
 #define PTD_READY_TIMEOUT_US	2000000
 #define PTD_ACK_POLL_US		10
@@ -72,6 +73,8 @@ struct apple_pmp_ptd {
 	struct apple_pmp_ptd_domain ext[PTD_NR_EXT];
 	struct generic_pm_domain *domains[PTD_FIRST_EXT + PTD_NR_EXT];
 	struct genpd_onecell_data onecell;
+	/* The external requests withdrawn for system sleep. */
+	u64 sleep_ext;
 };
 
 #define genpd_to_ptd_domain(g) container_of(g, struct apple_pmp_ptd_domain, genpd)
@@ -83,7 +86,7 @@ static int apple_pmp_ptd_power_on(struct generic_pm_domain *genpd)
 	void __iomem *req_reg = ptd->base + PTD_ENTRY(PTD_DISPLAY_REQ);
 	void __iomem *ack_reg = ptd->base + PTD_ENTRY(PTD_DISPLAY_ACK);
 	u64 sel = PTD_DISP | d->device;
-	u64 req, ack, want = 0;
+	u64 req, ack = 0, want = 0;
 	unsigned long flags;
 	int ret = 0;
 
@@ -129,6 +132,68 @@ static int apple_pmp_ptd_power_off(struct generic_pm_domain *genpd)
 {
 	return 0;
 }
+
+/*
+ * System sleep. The external controllers' requests keep the PMP's external
+ * display state up while nothing is shown (DISP_EXT 3 with both requested, 0
+ * without), which costs about 0.25 W in suspend-to-idle. By the noirq phase
+ * every display controller has suspended and its displays are off: withdraw
+ * the acknowledged external requests with one replacement write, as macOS
+ * does when it releases a device, and request them again before the
+ * controllers resume. The request is read once before the write, never
+ * between the write and its acknowledgement. DISP and ANS, the PMGR chains
+ * and the coprocessors stay as they are.
+ */
+static int apple_pmp_ptd_update_ext(struct apple_pmp_ptd *ptd, u64 mask, bool on)
+{
+	void __iomem *ack_reg = ptd->base + PTD_ENTRY(PTD_DISPLAY_ACK);
+	unsigned long flags;
+	u64 req, want, ack;
+	int ret;
+
+	spin_lock_irqsave(&ptd->lock, flags);
+	req = readq(ptd->base + PTD_ENTRY(PTD_DISPLAY_REQ));
+	want = on ? req | mask : req & ~mask;
+	writeq(want, ptd->base + PTD_SET(PTD_DISPLAY_REQ));
+	ret = readq_poll_timeout_atomic(ack_reg, ack, !((ack ^ want) & mask),
+					PTD_ACK_POLL_US, PTD_ACK_TIMEOUT_US);
+	spin_unlock_irqrestore(&ptd->lock, flags);
+	if (ret)
+		dev_err(ptd->dev, "display request %#llx not acknowledged: ack %#llx\n",
+			want, ack);
+	return ret;
+}
+
+static int apple_pmp_ptd_suspend_noirq(struct device *dev)
+{
+	struct apple_pmp_ptd *ptd = dev_get_drvdata(dev);
+	u64 mask;
+
+	if (readq(ptd->base + PTD_STATUS) != PTD_STATUS_READY)
+		return 0;
+	mask = readq(ptd->base + PTD_ENTRY(PTD_DISPLAY_ACK)) & PTD_EXT_MASK;
+	if (!mask)
+		return 0;
+	/* A failed withdrawal is asserted again on resume all the same. */
+	apple_pmp_ptd_update_ext(ptd, mask, false);
+	ptd->sleep_ext = mask;
+	return 0;
+}
+
+static int apple_pmp_ptd_resume_noirq(struct device *dev)
+{
+	struct apple_pmp_ptd *ptd = dev_get_drvdata(dev);
+	u64 mask = ptd->sleep_ext;
+
+	if (!mask)
+		return 0;
+	ptd->sleep_ext = 0;
+	return apple_pmp_ptd_update_ext(ptd, mask, true);
+}
+
+static const struct dev_pm_ops apple_pmp_ptd_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_pmp_ptd_suspend_noirq, apple_pmp_ptd_resume_noirq)
+};
 
 /* The PMP serves the table once its firmware runs, started by the PMP driver. */
 static int apple_pmp_ptd_wait_ready(struct apple_pmp_ptd *ptd)
@@ -176,6 +241,7 @@ static int apple_pmp_ptd_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	ptd->dev = dev;
 	spin_lock_init(&ptd->lock);
+	platform_set_drvdata(pdev, ptd);
 
 	ptd->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(ptd->base))
@@ -232,6 +298,7 @@ static struct platform_driver apple_pmp_ptd_driver = {
 	.driver = {
 		.name = "apple-pmp-ptd",
 		.of_match_table = apple_pmp_ptd_of_match,
+		.pm = pm_sleep_ptr(&apple_pmp_ptd_pm_ops),
 		/* A provider of retained requests has no teardown. */
 		.suppress_bind_attrs = true,
 	},

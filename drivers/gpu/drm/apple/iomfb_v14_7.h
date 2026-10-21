@@ -136,6 +136,8 @@ void iomfb_v14_7_fail(struct apple_dcp *dcp, const char *what);
 /* Callbacks whose reply needs a nested AP call (a context-0 continuation). */
 bool iomfb_v14_7_needs_continuation(int tag);
 void iomfb_v14_7_try_activate(struct apple_dcp *dcp);
+/* A472 hardware power of the internal panel's display controller. */
+int iomfb_v14_7_panel_power(struct apple_dcp *dcp, bool on);
 
 /*
  * The external role (DRM_APPLE_DCP_T6030_EXT): the client opens after the
