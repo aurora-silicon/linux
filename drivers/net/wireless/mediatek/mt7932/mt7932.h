@@ -70,6 +70,8 @@ struct mt7932 {
 	/* Hardware-free calibration transport seam; production builds omit it. */
 	int (*cal_test_send)(struct mt7932 *m, const void *body, size_t length);
 	void *cal_test_context;
+	int (*power_test_send)(struct mt7932 *m, const void *body, size_t length);
+	void *power_test_context;
 #endif
 	u8 cal_requests[32][16];
 	u8 cal_request_seq[32];
