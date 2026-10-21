@@ -69,18 +69,22 @@ pub(crate) struct Ledger {
     pub(crate) refusals: u32,
 }
 
+/// The most blocks ever posted: one below the block list's records, as the producer is the
+/// posted count modulo the list and a whole list would read as an empty one (0).
+pub(crate) const POSTED_LIMIT: u32 = min(MAX_BLOCKS, BLOCK_LIST_RECORDS - 1);
+
 /// Refusals answered at the maximum before requests are left to the deadline.
 pub(crate) const MAX_REFUSALS: u32 = 2;
 
 impl Ledger {
-    /// A fresh ledger. With growth, the initial size is clamped to 64..=4096 blocks and the
-    /// maximum to initial..=4096 (the caller passes 4095); without, both are the whole heap.
+    /// A fresh ledger. With growth, the initial size is clamped to 64..=[`POSTED_LIMIT`] blocks
+    /// and the maximum to initial..=[`POSTED_LIMIT`]; without, both are [`POSTED_LIMIT`].
     pub(crate) const fn new(grow: bool, blocks: u32, max_blocks: u32) -> Self {
         let (initial, max) = if grow {
-            let nb = clamp(blocks, MIN_BLOCKS, MAX_BLOCKS);
-            (nb, clamp(max_blocks, nb, MAX_BLOCKS))
+            let nb = clamp(blocks, MIN_BLOCKS, POSTED_LIMIT);
+            (nb, clamp(max_blocks, nb, POSTED_LIMIT))
         } else {
-            (MAX_BLOCKS, MAX_BLOCKS)
+            (POSTED_LIMIT, POSTED_LIMIT)
         };
         Self {
             initial,
@@ -260,6 +264,14 @@ pub(crate) const fn request_epoch(request: &[u32; 14]) -> u64 {
     request[grow_request::EPOCH] as u64 | (request[grow_request::EPOCH + 1] as u64) << 32
 }
 
+const fn min(a: u32, b: u32) -> u32 {
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
+
 const fn clamp(v: u32, lo: u32, hi: u32) -> u32 {
     if v < lo {
         lo
@@ -303,11 +315,31 @@ mod tests {
         assert_eq!(l.producer(), 1024);
         assert_eq!(Ledger::new(true, 10, 20).initial, 64);
         assert_eq!(Ledger::new(true, 10, 20).max, 64);
-        assert_eq!(Ledger::new(true, 5000, 100).initial, 4096);
+        assert_eq!(Ledger::new(true, 5000, 100).initial, POSTED_LIMIT);
         assert_eq!(Ledger::new(true, 512, 1024).max, 1024);
         assert_eq!(Ledger::new(true, 512, 100).max, 512);
         let fixed = Ledger::new(false, 512, 1024);
-        assert_eq!((fixed.initial, fixed.max, fixed.posted), (4096, 4096, 4096));
+        assert_eq!(
+            (fixed.initial, fixed.max, fixed.posted),
+            (POSTED_LIMIT, POSTED_LIMIT, POSTED_LIMIT)
+        );
+    }
+
+    /// No construction posts a whole block list: the producer would wrap to 0, an empty list.
+    #[test]
+    fn producer_never_wraps() {
+        for (grow, blocks, max) in [
+            (true, 4096, 4096),
+            (true, 5000, 9000),
+            (true, 64, 4096),
+            (false, 0, 0),
+        ] {
+            let mut l = backed(grow, blocks, max);
+            assert_ne!(l.producer(), 0);
+            l.posted = l.max;
+            assert_eq!(l.producer(), l.max);
+            assert!(l.max < BLOCK_LIST_RECORDS);
+        }
     }
 
     #[test]
