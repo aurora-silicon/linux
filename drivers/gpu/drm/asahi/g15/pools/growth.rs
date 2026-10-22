@@ -12,6 +12,12 @@
 //! its recovery path then apply, without a guarantee that they end the stall. A request from
 //! before a halt (epoch) or not matching a published render prefix is left unanswered.
 //!
+//! The heap's VA range covers [`MAX_BLOCKS`] blocks; its RAM comes in chunks from the heap
+//! base, which the ledger counts as `backed`. A request is granted from the backed blocks above
+//! `posted`; a request that finds no backed block waits ([`Answer::Wait`]) and keeps its
+//! counter. A re-initialization ([`Ledger::reinit`]) returns the posted count to the initial
+//! size and keeps the backing.
+//!
 //! Core-only (no `kernel` imports): this file is compiled by the host test harness as well.
 
 use crate::g15::fw::buffer::{grow_request, BLOCK_LIST_RECORDS, GROW_STEP, MAX_BLOCKS, MIN_BLOCKS};
@@ -26,6 +32,8 @@ pub(crate) struct Ledger {
     pub(crate) max: u32,
     /// Blocks posted to the block list, cumulative (the block_ctl+4 producer is this modulo K).
     pub(crate) posted: u32,
+    /// Blocks with RAM behind them, from the heap base.
+    pub(crate) backed: u32,
     /// The next expected request counter.
     pub(crate) next_request: u32,
     /// A refusal at the maximum was logged since the last initialization.
@@ -41,9 +49,20 @@ pub(crate) struct Ledger {
 /// Refusals answered at the maximum before requests are left to the deadline.
 pub(crate) const MAX_REFUSALS: u32 = 2;
 
-/// Blocks of each PB backing chunk after the initial one (4 MiB): growth backs at most this
-/// much at a time while the firmware waits for its answer.
-pub(crate) const CHUNK_BLOCKS: u32 = 32;
+/// Blocks of each PB backing chunk (16 MiB).
+pub(crate) const CHUNK_BLOCKS: u32 = 128;
+
+/// The answer to an admitted growth request.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Answer {
+    /// Post blocks `[first, first + count)` (`count` at most [`GROW_STEP`]) and reply grown.
+    Grant { first: u32, count: u32 },
+    /// Reply refused: the maximum is posted.
+    Refuse,
+    /// No backed block above the posted count: leave the request queued until a chunk is
+    /// backed.
+    Wait,
+}
 
 /// The backing chunk that follows `backed` blocks of a ledger with maximum `max`: its first block
 /// and size, at most [`CHUNK_BLOCKS`] and never past `max`; none from `max` on.
@@ -85,15 +104,30 @@ impl Ledger {
             initial,
             max,
             posted: initial,
+            backed: 0,
             next_request: 0,
             refusal_logged: false,
             refusals: 0,
         }
     }
 
+    /// A re-initialization: the initial blocks are posted again, the request counter and the
+    /// refusals start over, the backing stays.
+    pub(crate) const fn reinit(&mut self) {
+        self.posted = self.initial;
+        self.next_request = 0;
+        self.refusal_logged = false;
+        self.refusals = 0;
+    }
+
     /// The live block_ctl+4 producer.
     pub(crate) const fn producer(&self) -> u32 {
         self.posted % BLOCK_LIST_RECORDS
+    }
+
+    /// Backed blocks above the posted count.
+    pub(crate) const fn spare(&self) -> u32 {
+        self.backed.saturating_sub(self.posted)
     }
 
     /// Whether the refusals at the maximum are used up: further requests go unanswered.
@@ -114,21 +148,30 @@ impl Ledger {
             && request_epoch(request) == epoch
     }
 
-    /// The blocks the next accepted request posts: at most [`GROW_STEP`], none at the maximum.
+    /// The blocks the next accepted request posts with the backing it needs: at most
+    /// [`GROW_STEP`], none at the maximum.
     pub(crate) fn next_count(&self) -> u32 {
         GROW_STEP.min(self.max - self.posted)
     }
 
-    /// Accepts an admitted request: the next expected counter follows it, and the returned
-    /// blocks `[first, first + count)` are to be written to the block list, `count` 0 meaning a
-    /// refusal at the maximum.
-    pub(crate) fn accept(&mut self, request: &[u32; 14]) -> (u32, u32) {
-        self.next_request = request[grow_request::COUNTER].wrapping_add(1);
-        let count = self.next_count();
-        if count == 0 {
-            self.refusals += 1;
+    /// Accepts an admitted request. Granted (at most [`GROW_STEP`] blocks, and no more than are
+    /// backed) or refused at the maximum, the next expected counter follows it. A request that
+    /// finds no backed block waits: its counter is not consumed, and it is accepted again once a
+    /// chunk is backed.
+    pub(crate) fn accept(&mut self, request: &[u32; 14]) -> Answer {
+        let room = self.max - self.posted;
+        if room != 0 && self.spare() == 0 {
+            return Answer::Wait;
         }
-        (self.posted, count)
+        self.next_request = request[grow_request::COUNTER].wrapping_add(1);
+        if room == 0 {
+            self.refusals += 1;
+            return Answer::Refuse;
+        }
+        Answer::Grant {
+            first: self.posted,
+            count: GROW_STEP.min(room).min(self.spare()),
+        }
     }
 
     /// Records `count` blocks as posted after their records were written and returns the new
@@ -185,12 +228,19 @@ mod tests {
         q
     }
 
+    /// A ledger with the heap backed whole.
+    fn backed(grow: bool, blocks: u32, max_blocks: u32) -> Ledger {
+        let mut l = Ledger::new(grow, blocks, max_blocks);
+        l.backed = MAX_BLOCKS;
+        l
+    }
+
     #[test]
     fn clamps() {
-        let l = Ledger::new(true, 1024, 2048);
+        let l = backed(true, 1024, 2048);
         assert_eq!(
-            (l.initial, l.max, l.posted, l.next_request),
-            (1024, 2048, 1024, 0)
+            (l.initial, l.max, l.posted, l.backed, l.next_request),
+            (1024, 2048, 1024, 4096, 0)
         );
         assert_eq!(l.producer(), 1024);
         assert_eq!(Ledger::new(true, 10, 20).initial, 64);
@@ -198,6 +248,7 @@ mod tests {
         assert_eq!(Ledger::new(true, 5000, 100).initial, 4095);
         assert_eq!(Ledger::new(true, 512, 1024).max, 1024);
         assert_eq!(Ledger::new(true, 512, 100).max, 512);
+        assert_eq!(Ledger::new(true, 512, 100).backed, 0);
         let fixed = Ledger::new(false, 512, 1024);
         assert_eq!((fixed.initial, fixed.max, fixed.posted), (4095, 4095, 4095));
         // The values the driver passes (tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS) are kept.
@@ -235,18 +286,19 @@ mod tests {
         for grow in [true, false] {
             for blocks in values {
                 for max_blocks in values {
-                    let mut l = Ledger::new(grow, blocks, max_blocks);
+                    let mut l = backed(grow, blocks, max_blocks);
                     assert!(MIN_BLOCKS <= l.initial && l.initial <= l.max && l.max <= MAX_POSTED);
                     assert_eq!(l.posted, l.initial);
                     assert!((1..=MAX_POSTED).contains(&l.producer()));
                     // Every producer of a growth to the maximum stays in 1..=4095.
                     let mut counter = 0;
                     loop {
-                        let (first, n) = l.accept(&request(5, counter, 1));
+                        let (first, n) = match l.accept(&request(5, counter, 1)) {
+                            Answer::Grant { first, count } => (first, count),
+                            Answer::Refuse => break,
+                            Answer::Wait => panic!("backed whole"),
+                        };
                         assert_eq!(first, l.posted);
-                        if n == 0 {
-                            break;
-                        }
                         let producer = l.post(n);
                         assert!((1..=MAX_POSTED).contains(&producer));
                         assert_eq!(producer, l.posted);
@@ -261,7 +313,7 @@ mod tests {
 
     #[test]
     fn admission() {
-        let l = Ledger::new(true, 1024, 2048);
+        let l = backed(true, 1024, 2048);
         let q = request(5, 0, 3);
         assert!(l.admits(&q, true, true, 3));
         assert!(!l.admits(&q, false, true, 3));
@@ -283,17 +335,20 @@ mod tests {
     #[test]
     fn growth_to_the_maximum() {
         // 512 initial and 1024 maximum blocks.
-        let mut l = Ledger::new(true, 512, 1024);
+        let mut l = backed(true, 512, 1024);
         let mut grown = 0;
         let mut counter = 0;
         loop {
             let q = request(5, counter, 1);
             assert!(l.admits(&q, true, true, 1));
-            let (first, n) = l.accept(&q);
-            assert_eq!(first, 512 + grown);
-            if n == 0 {
-                break;
-            }
+            let n = match l.accept(&q) {
+                Answer::Grant { first, count } => {
+                    assert_eq!(first, 512 + grown);
+                    count
+                }
+                Answer::Refuse => break,
+                Answer::Wait => panic!("backed whole"),
+            };
             assert!(n <= 10);
             assert_eq!(l.post(n), (512 + grown + n) % 4096);
             grown += n;
@@ -310,67 +365,55 @@ mod tests {
         assert_eq!(l.refusals, 1);
         assert!(!l.exhausted());
         let q = request(5, counter + 3, 1);
-        assert_eq!(l.accept(&q), (1024, 0));
+        assert_eq!(l.accept(&q), Answer::Refuse);
         assert!(l.exhausted());
         assert!(!l.admits(&request(5, counter + 4, 1), true, true, 1));
-        // A fresh ledger starts over.
+        // A fresh ledger starts over, and so does a re-initialized one (backing kept).
         assert!(!Ledger::new(true, 512, 1024).exhausted());
-    }
-
-    /// Backing for every ledger the constructor makes, the driver's included: the chunks from
-    /// the initial one are contiguous, at most [`CHUNK_BLOCKS`] each, end at the maximum and
-    /// number at most [`max_chunks`]; growth with the backing made first never posts a block
-    /// past it.
-    #[test]
-    fn backing_chunks() {
-        assert_eq!(max_chunks(1024, 4095), 1 + 96);
-        assert_eq!(max_chunks(MIN_BLOCKS, MAX_POSTED), 1 + 126);
-        assert_eq!(max_chunks(MAX_POSTED, MAX_POSTED), 1);
-        assert_eq!(next_chunk(1024, 4095), Some((1024, 32)));
-        assert_eq!(next_chunk(4064, 4095), Some((4064, 31)));
-        assert_eq!(next_chunk(4095, 4095), None);
-        assert_eq!(next_chunk(4096, 4095), None);
-        let values = [
-            0, 1, MIN_BLOCKS, 65, 1023, 1024, 1025, 3072, 4094, MAX_POSTED, 5000,
-        ];
-        for grow in [true, false] {
-            for blocks in values {
-                for max_blocks in values {
-                    let mut l = Ledger::new(grow, blocks, max_blocks);
-                    let (mut backed, mut chunks) = (l.initial, 1);
-                    let mut counter = 0;
-                    loop {
-                        let end = l.posted + l.next_count();
-                        while backed < end {
-                            let (first, n) = next_chunk(backed, l.max).unwrap();
-                            assert_eq!(first, backed);
-                            assert!(n >= 1 && n <= CHUNK_BLOCKS);
-                            backed += n;
-                            chunks += 1;
-                        }
-                        let (first, n) = l.accept(&request(5, counter, 1));
-                        assert!(first + n <= backed);
-                        if n == 0 {
-                            break;
-                        }
-                        l.post(n);
-                        counter += 1;
-                    }
-                    assert_eq!((l.posted, backed), (l.max, l.max));
-                    assert!(chunks <= max_chunks(l.initial, l.max));
-                    assert_eq!(next_chunk(backed, l.max), None);
-                }
-            }
-        }
+        l.reinit();
+        assert_eq!(
+            (l.posted, l.next_request, l.refusals, l.backed),
+            (512, 0, 0, 4096)
+        );
+        assert!(!l.exhausted() && !l.refusal_logged);
     }
 
     #[test]
     fn producer_wraps_at_k() {
-        let mut l = Ledger::new(true, 2048, 2048);
+        let mut l = backed(true, 2048, 2048);
         assert_eq!(l.producer(), 2048);
         l.posted = 4095;
         assert_eq!(l.post(1), 0);
         assert_eq!(l.post(10), 10);
+    }
+
+    #[test]
+    fn grants_only_backed_blocks() {
+        let mut l = Ledger::new(true, 64, 4095);
+        // Nothing backed above the initial posting: a request waits and keeps its counter.
+        l.backed = 64;
+        let q = request(3, 0, 1);
+        assert_eq!(l.accept(&q), Answer::Wait);
+        assert_eq!(l.next_request, 0);
+        // A grant is clipped to the backed blocks; the next request waits again.
+        l.backed = 70;
+        assert_eq!(
+            l.accept(&q),
+            Answer::Grant {
+                first: 64,
+                count: 6
+            }
+        );
+        l.post(6);
+        assert_eq!(l.next_request, 1);
+        assert_eq!(l.accept(&request(3, 1, 1)), Answer::Wait);
+        // At the maximum the refusal does not wait for backing.
+        l.posted = l.max;
+        l.backed = l.max;
+        assert_eq!(l.accept(&request(3, 1, 1)), Answer::Refuse);
+        // A re-initialization keeps the backing.
+        l.reinit();
+        assert_eq!((l.posted, l.backed, l.next_request), (64, 4095, 0));
     }
 
     #[test]

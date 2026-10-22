@@ -27,7 +27,7 @@ What it shows:
   exactly is not;
 - invalid requests (type, slot, stale counter, epoch, no live render) get no reply, and requests
   rejected so allocate nothing;
-- the backing: the initial blocks only when the GPU starts; chunks of at most 4 MiB, allocated
+- the backing: the initial blocks only when the GPU starts; chunks of at most 16 MiB, allocated
   and held by the running VM before any record or producer names their blocks, never past the
   maximum, at most growth::max_chunks(); a failed allocation, alias map or append posts and
   answers nothing, leaves the request counter and the VM's count alone and drops what is not
@@ -98,12 +98,12 @@ OLD_LEDGER_NEW = '''    pub(crate) const fn new(grow: bool, blocks: u32, max_blo
     }'''
 
 # Pools::new's PB backing, run verbatim by the model.
-POOLS_NEW_BACKING = ('        // Backing for the initial blocks; growth adds the rest.\n', '        chunks.push(')
+POOLS_NEW_BACKING = ('        // Backing for the initial blocks; growth adds the rest.\n', '        ledger.backed = ')
 # The compile-time proof that a PB alias drop is a plain unmap.
 PB_LEAF_ASSERT = 'static_assert!(!mmu::Prot::from_pte(pte::LEAF_CACHED).is_cached_noncoherent());'
 
 # The two statements of Pools::init() that start a new ledger.
-LEDGER_RESET = ['self.ledger = Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS);',
+LEDGER_RESET = ['self.ledger.reinit();',
                 'self.exhausted_logged = false;']
 
 MUTATIONS = {
@@ -140,12 +140,14 @@ MUTATIONS = {
                         'let nb = clamp(blocks, MIN_BLOCKS, MAX_BLOCKS);\n'
                         '            (nb, clamp(max_blocks, nb, MAX_BLOCKS))\n'
                         '        } else {\n            (MAX_BLOCKS, MAX_BLOCKS)'),
-    # Post blocks without backing them first.
-    'grant-without-backing': (POOLS, '        self.back_pb(end, ctx)?;\n        let (first, n) = self.pools.ledger.accept(request);',
-                              '        let (first, n) = self.pools.ledger.accept(request);'),
+    # Post blocks without backing them first (the ledger told the whole heap is backed).
+    'grant-without-backing': (POOLS, '        self.back_pb(end, ctx)?;\n        self.pools.ledger.backed = self.pools.backed();\n',
+                              '        self.pools.ledger.backed = buffer::MAX_BLOCKS;\n'),
     # Back the blocks only after the request is accepted.
-    'back-after-accept': (POOLS, '        self.back_pb(end, ctx)?;\n        let (first, n) = self.pools.ledger.accept(request);',
-                          '        let (first, n) = self.pools.ledger.accept(request);\n        self.back_pb(end, ctx)?;'),
+    'back-after-accept': [(POOLS, '        self.back_pb(end, ctx)?;\n        self.pools.ledger.backed = self.pools.backed();\n',
+                           '        self.pools.ledger.backed = buffer::MAX_BLOCKS;\n'),
+                          (POOLS, '            growth::Answer::Wait => return Err(ENOSPC),\n        };\n',
+                           '            growth::Answer::Wait => return Err(ENOSPC),\n        };\n        self.back_pb(end, ctx)?;\n')],
     # Count a catch-up alias before the VM holds it.
     'catch-up-cursor-before-append': (POOLS, '            vm.vm.append_driver_mappings(aliases)?;\n            mapped += 1;\n'
                                              '            vm.pb_chunks.store(mapped, Ordering::Relaxed);',
@@ -174,8 +176,8 @@ MUTATIONS = {
     # Back the whole heap when the GPU starts.
     'initial-backs-whole-heap': (POOLS, 'chunks.push(PbChunk::new(dev, 0, ledger.initial)?, GFP_KERNEL)?;',
                                  'chunks.push(PbChunk::new(dev, 0, buffer::MAX_BLOCKS)?, GFP_KERNEL)?;'),
-    # Growth chunks of 8 MiB.
-    'chunks-above-4mib': (GROWTH, 'pub(crate) const CHUNK_BLOCKS: u32 = 32;', 'pub(crate) const CHUNK_BLOCKS: u32 = 64;'),
+    # Growth chunks of 32 MiB.
+    'chunks-above-16mib': (GROWTH, 'pub(crate) const CHUNK_BLOCKS: u32 = 128;', 'pub(crate) const CHUNK_BLOCKS: u32 = 256;'),
     # A firmware-visible cached PB leaf (its drop would ask the firmware to flush).
     'pb-leaf-fw-visible': (HW, 'pub(crate) const LEAF_CACHED: u64 = 0x00c0000000000c83;',
                            'pub(crate) const LEAF_CACHED: u64 = 0x00c0000000000c03;'),
@@ -204,7 +206,7 @@ INTENDED = {
     'no-activation-guard': ('catch_up_refuses_flights_of_another_vm', 'catch-up with a flight of another VM'),
     'no-same-vm-checks': ('grant_refuses_flights_of_two_vms', 'grant with flights of two VMs'),
     'initial-backs-whole-heap': ('startup_backs_the_initial_blocks', 'startup allocation'),
-    'chunks-above-4mib': ('growth_backs_before_posting', 'a growth chunk above 4 MiB'),
+    'chunks-above-16mib': ('growth_backs_before_posting', 'a growth chunk above 16 MiB'),
     'pb-leaf-fw-visible': ('pb_leaf_is_gpu_only', 'PB leaf not GPU-only'),
 }
 assert set(INTENDED) == set(MUTATIONS)
@@ -980,7 +982,9 @@ mod pb_growth_tests {
         assert!(log.iter().all(|e| matches!(e, Ev::Log("warn", _))), "{log:?}");
         assert_eq!(log.len(), 4);
         assert_eq!(f.pools.stats.bad, 4);
-        assert_eq!(f.pools.ledger, Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS));
+        let mut fresh = Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS);
+        fresh.backed = fresh.initial;
+        assert_eq!(f.pools.ledger, fresh);
         // No render published: not live.
         f.renders[0] = 0;
         f.events.grow.0.push_back(good);
@@ -1074,7 +1078,7 @@ mod pb_growth_tests {
         assert_eq!(log, vec![Ev::Alloc(1, initial as usize * BLOCK_BYTES as usize)], "startup allocation");
         assert_eq!((f.pools.backed(), f.pools.chunk_count()), (initial, 1));
         assert_eq!(f.pools.chunk_capacity(), max_chunks(initial, max));
-        assert_eq!(max_chunks(initial, max), 97);
+        assert_eq!(max_chunks(initial, max), 25);
         // The first prefix of a VM maps the backing, nothing else.
         let vm = VmState::new(7);
         f.engine.flights.push(Flight { job: Job { vm: vm.clone() } });
@@ -1109,14 +1113,14 @@ mod pb_growth_tests {
         let log = take();
         let (initial, max) = (f.pools.ledger.initial, f.pools.ledger.max);
         assert_posted_backed(&log, 5, initial as u64);
-        // Chunks of at most 32 blocks, allocated only as needed: up to the maximum, no further.
+        // Chunks of at most 128 blocks, allocated only as needed: up to the maximum, no further.
         let allocs: Vec<usize> = log
             .iter()
             .filter_map(|e| if let Ev::Alloc(_, b) = e { Some(*b) } else { None })
             .collect();
         assert_eq!(allocs.len() + 1, max_chunks(initial, max));
-        assert!(allocs.iter().all(|b| *b <= 4 << 20), "a growth chunk above 4 MiB");
-        assert_eq!(CHUNK_BLOCKS as u64 * BLOCK_BYTES, 4 << 20);
+        assert!(allocs.iter().all(|b| *b <= 16 << 20), "a growth chunk above 16 MiB");
+        assert_eq!(CHUNK_BLOCKS as u64 * BLOCK_BYTES, 16 << 20);
         assert_eq!(f.pools.backed(), max);
         assert_eq!(count(&log, |e| matches!(e, Ev::Free(_) | Ev::Unmap(..))), 0);
         assert_cursor(&f.engine.flights[0].job.vm, f.pools.chunk_count());
@@ -1187,7 +1191,7 @@ mod pb_growth_tests {
         let a = f.engine.flights[0].job.vm.clone();
         grow_to(&mut f, 1100);
         take();
-        assert_eq!(f.pools.chunk_count(), 4);
+        assert_eq!(f.pools.chunk_count(), 2);
         // A's work retires; a new VM runs next: it maps every chunk first.
         f.engine.flights.clear();
         let b = VmState::new(6);
@@ -1195,13 +1199,13 @@ mod pb_growth_tests {
         f.fw.ctx = 6;
         f.map_pb(&b).unwrap();
         let log = take();
-        assert_eq!(count(&log, |e| matches!(e, Ev::Append(6, _))), 4);
+        assert_eq!(count(&log, |e| matches!(e, Ev::Append(6, _))), 2);
         assert_eq!(count(&log, |e| matches!(e, Ev::Alloc(..))), 0);
-        assert_cursor(&b, 4);
+        assert_cursor(&b, 2);
         // B grows the backing; A, behind, catches up when it runs again.
         grow_to(&mut f, 1200);
         let log = take();
-        assert_posted_backed(&log, 6, 1120);
+        assert_posted_backed(&log, 6, 1152);
         assert_eq!(count(&log, |e| matches!(e, Ev::Map(5, ..))), 0);
         f.engine.flights.clear();
         f.engine.flights.push(Flight { job: Job { vm: a.clone() } });
@@ -1236,7 +1240,7 @@ mod pb_growth_tests {
     #[test]
     fn partial_catch_up_counts_only_held_aliases() {
         let mut f = Firmware::new();
-        grow_to(&mut f, 1100);
+        grow_to(&mut f, 1450);
         f.engine.flights.clear();
         let b = VmState::new(6);
         f.engine.flights.push(Flight { job: Job { vm: b.clone() } });
@@ -1246,17 +1250,17 @@ mod pb_growth_tests {
         crate::MAP_OK_BEFORE_FAIL.with(|c| c.set(2));
         FAIL_MAP.with(|c| c.set(1));
         assert_eq!(f.map_pb(&b), Err(ENOMEM));
-        assert_cursor(&b, 4);
+        assert_cursor(&b, 5);
         assert_eq!(b.pb_chunks.load(Ordering::Relaxed), 2);
         // The third alias is made but cannot be held: dropped, still two.
         FAIL_APPEND.with(|c| c.set(1));
         assert_eq!(f.map_pb(&b), Err(ENOMEM));
         assert_eq!(b.pb_chunks.load(Ordering::Relaxed), 2, "count after a failed append");
         assert!(take().iter().any(|e| matches!(e, Ev::Unmap(6, _))));
-        assert_cursor(&b, 4);
+        assert_cursor(&b, 5);
         f.map_pb(&b).unwrap();
-        assert_eq!(b.pb_chunks.load(Ordering::Relaxed), 4);
-        assert_cursor(&b, 4);
+        assert_eq!(b.pb_chunks.load(Ordering::Relaxed), 5);
+        assert_cursor(&b, 5);
     }
 
     /// The ledger reset of Pools::init(), not a full recovery.

@@ -7,7 +7,7 @@
 //!
 //! - One 512 MiB PB heap at [`super::hw::client::PB_HEAP`] (4096 blocks of 128 KiB), backed on
 //!   demand: the initial blocks when the GPU starts, then chunks of at most
-//!   [`growth::CHUNK_BLOCKS`] (4 MiB) as growth needs them ([`Firmware::back_pb`]), never freed
+//!   [`growth::CHUNK_BLOCKS`] (16 MiB) as growth needs them ([`Firmware::back_pb`]), never freed
 //!   or shrunk. The backing ([`PbChunk`]) is mapped only into user VMs, at the fixed client GVA,
 //!   each VM's before its prefixes are published ([`Firmware::map_pb`]); nothing names its pages
 //!   through the host window or context 0 (the records hold client GVAs only). Initial
@@ -377,10 +377,11 @@ impl Pools {
             true,
         )?;
         // Backing for the initial blocks; growth adds the rest.
-        let ledger = Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS);
+        let mut ledger = Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS);
         let mut chunks =
             KVec::with_capacity(growth::max_chunks(ledger.initial, ledger.max), GFP_KERNEL)?;
         chunks.push(PbChunk::new(dev, 0, ledger.initial)?, GFP_KERNEL)?;
+        ledger.backed = ledger.initial;
         Ok(Self {
             dev: dev.as_ref().as_ref().into(),
             drm: dev.into(),
@@ -451,8 +452,9 @@ impl Pools {
 
         // PB: 16384 pages of 0x8000 in 4096 blocks of 0x20000; with growth the first initial
         // blocks of them, at most 4095 posted, and page limits at the firmware's growth maximum.
-        // In every profile the block list declares its real 4096-record capacity.
-        self.ledger = Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS);
+        // The backing is kept. In every profile the block list declares its real 4096-record
+        // capacity.
+        self.ledger.reinit();
         self.exhausted_logged = false;
         if tuning::PB_GROW {
             // C1 names the initial pages again.
@@ -766,7 +768,13 @@ impl Firmware {
         // made so far stays for the next request.
         let end = self.pools.ledger.posted + self.pools.ledger.next_count();
         self.back_pb(end, ctx)?;
-        let (first, n) = self.pools.ledger.accept(request);
+        self.pools.ledger.backed = self.pools.backed();
+        let (first, n) = match self.pools.ledger.accept(request) {
+            growth::Answer::Grant { first, count } => (first, count),
+            growth::Answer::Refuse => (self.pools.ledger.posted, 0),
+            // Backed above: no request waits here.
+            growth::Answer::Wait => return Err(ENOSPC),
+        };
         let heap = client::PB_HEAP;
         for b in first..first + n {
             self.pools.pb_blocks.w64(
