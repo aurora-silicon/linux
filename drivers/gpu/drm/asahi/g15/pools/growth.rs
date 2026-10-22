@@ -257,11 +257,11 @@ mod tests {
         assert_eq!(Ledger::new(true, 512, 100).backed, 0);
         let fixed = Ledger::new(false, 512, 1024);
         assert_eq!((fixed.initial, fixed.max, fixed.posted), (4095, 4095, 4095));
-        // The values the driver passes (tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS) are kept.
-        let l = Ledger::new(true, 1024, 4095);
+        // The values the driver passes (g15_pb_blocks 64, tuning::PB_MAX_BLOCKS) are kept.
+        let l = Ledger::new(true, 64, 4095);
         assert_eq!(
             (l.initial, l.max, l.posted, l.producer()),
-            (1024, 4095, 1024, 1024)
+            (64, 4095, 64, 64)
         );
     }
 

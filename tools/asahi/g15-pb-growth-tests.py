@@ -5,9 +5,9 @@
 The harness extracts from drivers/gpu/drm/asahi/g15/pools.rs Firmware::answer_growth(),
 answer_request(), map_pb() and refill_backing(), Pools::soft_max(), map_heap() and
 back_chunk(), PbChunk, chunk_gva(), CHUNK_BYTES and Pools::new's PB backing statements; from
-vm.rs VmState::map_one(), map_heap(), map_chunk() and unmap_heap_above(); pb_max_blocks() from
-params.rs; the PB sizes, tuning and PB leaf word from hw.rs; Prot::from_pte() and
-is_cached_noncoherent() from pgtable.rs; and the parameter's default from asahi_core.rs. It
+vm.rs VmState::map_one(), map_heap(), map_chunk() and unmap_heap_above(); pb_max_blocks() and
+pb_blocks() from params.rs; the PB sizes, tuning and PB leaf word from hw.rs; Prot::from_pte() and
+is_cached_noncoherent() from pgtable.rs; and the parameters' defaults from asahi_core.rs. It
 includes pools/growth.rs, fw/buffer.rs and fw/channels.rs whole. The bodies run against a model
 of the firmware objects, the GEM backing allocation, the shared layer's map_at() and the DEVCTL
 wait, which logs every allocation, alias map, unmap, free, block record, barrier, producer
@@ -186,7 +186,7 @@ INTENDED = {
     'three-refusals': ('default_growth_to_exhaustion', 'want Some(Log("warn"'),
     'never-exhausted': ('default_growth_to_exhaustion', 'growth did not end'),
     'warn-every-time': ('default_growth_to_exhaustion', 'later request after exhaustion'),
-    'no-record-barrier': ('default_growth_to_exhaustion', 'got Some(Producer(1034)), want Some(Sync)'),
+    'no-record-barrier': ('default_growth_to_exhaustion', 'got Some(Producer(74)), want Some(Sync)'),
     'no-reply-barrier': ('default_growth_to_exhaustion',
                          'got Some(Reply([7, 1, 0, 5, 0, 256, 3, 1, 0, 0, 0, 0, 0, 0])), want Some(Sync)'),
     'soft-boundary-inclusive': ('soft_max_boundaries', 'got Some(Log("info", "")), want Some(Log("dbg", ""))'),
@@ -336,6 +336,7 @@ pub enum Ev {
 thread_local! {
     pub static LOG: RefCell<Vec<Ev>> = RefCell::new(Vec::new());
     pub static PARAM: Cell<u32> = Cell::new(PARAM_DEFAULT);
+    pub static PARAM_BLOCKS: Cell<u32> = Cell::new(PB_BLOCKS_DEFAULT);
     /// Failures to inject: the next this many allocations or alias maps fail.
     pub static FAIL_ALLOC: Cell<u32> = Cell::new(0);
     pub static FAIL_MAP: Cell<u32> = Cell::new(0);
@@ -384,6 +385,13 @@ pub mod module_parameters {
         }
     }
     pub static g15_pb_max_blocks: Param = Param;
+    pub struct Blocks;
+    impl Blocks {
+        pub fn value(&self) -> u32 {
+            crate::PARAM_BLOCKS.with(|p| p.get())
+        }
+    }
+    pub static g15_pb_blocks: Blocks = Blocks;
 }
 
 pub mod driver {
@@ -877,9 +885,10 @@ mod pb_growth_tests {
 
     #[test]
     fn driver_values() {
-        let l = Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS);
+        let l = Ledger::new(tuning::PB_GROW, params::pb_blocks(), tuning::PB_MAX_BLOCKS);
         assert!(tuning::PB_GROW);
-        assert_eq!((l.initial, l.max, l.posted), (1024, 4095, 1024));
+        assert_eq!(crate::PB_BLOCKS_DEFAULT, 64);
+        assert_eq!((l.initial, l.max, l.posted), (64, 4095, 64));
         assert_eq!(PARAM_DEFAULT, 3072);
         PARAM.with(|p| p.set(PARAM_DEFAULT));
         assert_eq!(params::pb_max_blocks(), 3072);
@@ -892,8 +901,16 @@ mod pb_growth_tests {
         for param in [0, 1, 63, 64, 65, 1023, 1024, 1025, 3071, 3072, 3073, 4094, 4095, 4096, 8192, u32::MAX] {
             PARAM.with(|p| p.set(param));
             assert_eq!(params::pb_max_blocks(), clamp(param, 64, tuning::PB_MAX_BLOCKS), "pb_max_blocks, param {param}");
-            // Below the initial 1024 the firmware still gets 1024.
-            assert_eq!(f.pools.soft_max(), clamp(param, 1024, CAP), "soft_max, param {param}");
+            // Below the initial 64 the firmware still gets 64.
+            assert_eq!(f.pools.soft_max(), clamp(param, 64, CAP), "soft_max, param {param}");
+        }
+        // With a larger initial posting the firmware gets at least that.
+        crate::PARAM_BLOCKS.with(|b| b.set(1024));
+        let f = Firmware::new();
+        assert_eq!(f.pools.ledger.initial, 1024);
+        for param in [0, 64, 1023, 1024, 3072, 4095, u32::MAX] {
+            PARAM.with(|p| p.set(param));
+            assert_eq!(f.pools.soft_max(), clamp(param, 1024, CAP), "soft_max, param {param}, 1024 initial");
         }
     }
 
@@ -904,7 +921,7 @@ mod pb_growth_tests {
 
     #[test]
     fn soft_max_boundaries() {
-        // 3074 is reached exactly (1024 + 205 * 10): that answer is not past it.
+        // 3074 is reached exactly (64 + 301 * 10): that answer is not past it.
         for param in [0, 1024, 3072, 3074, 3075, 4094, 4095, u32::MAX] {
             run_to_exhaustion(param);
         }
@@ -961,7 +978,7 @@ mod pb_growth_tests {
         assert_eq!(f.pools.stats.requests, 2, "requests taken in the pass");
         assert_eq!(f.pools.stats.bad, 1);
         assert!(log.iter().any(|e| matches!(e, Ev::Log("err", m) if m.contains("not answered: -5"))));
-        assert!(log.contains(&Ev::Producer(1024 + GROW_STEP)));
+        assert!(log.contains(&Ev::Producer(64 + GROW_STEP)));
         assert!(f.events.grow.is_empty());
     }
 
@@ -975,7 +992,7 @@ mod pb_growth_tests {
         take();
         f.pass();
         let log = take();
-        assert_eq!(f.pools.ledger.posted, 1024 + 3 * GROW_STEP);
+        assert_eq!(f.pools.ledger.posted, 64 + 3 * GROW_STEP);
         assert_eq!((f.pools.stats.grown, f.pools.stats.bad), (3 * GROW_STEP as u64, 0));
         // Each failed reply is logged at info level.
         let info = log.iter().filter(|e| matches!(e, Ev::Log("info", m) if m.contains("DEVCTL 7: -5"))).count();
@@ -1008,7 +1025,7 @@ mod pb_growth_tests {
         assert!(log.iter().all(|e| matches!(e, Ev::Log("warn", _))), "{log:?}");
         assert_eq!(log.len(), 4);
         assert_eq!(f.pools.stats.bad, 4);
-        let mut fresh = Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS);
+        let mut fresh = Ledger::new(tuning::PB_GROW, params::pb_blocks(), tuning::PB_MAX_BLOCKS);
         fresh.backed = Ledger::chunks_for(fresh.initial) * CHUNK_BLOCKS;
         assert_eq!(f.pools.ledger, fresh);
         // No render published: not live.
@@ -1091,7 +1108,7 @@ mod pb_growth_tests {
         let log = take();
         let (initial, max) = (f.pools.ledger.initial, f.pools.ledger.max);
         let chunks = Ledger::chunks_for(initial) as usize;
-        assert_eq!(chunks, 9);
+        assert_eq!(chunks, 2);
         let want: Vec<Ev> = (1..=chunks as u32).map(|id| Ev::Alloc(id, CHUNK_BYTES)).collect();
         assert_eq!(log, want, "startup allocation");
         assert_eq!((f.pools.ledger.backed, f.pools.chunk_count()), (chunks as u32 * CHUNK_BLOCKS, chunks));
@@ -1301,10 +1318,9 @@ mod pb_growth_tests {
         f.queue();
         f.pass();
         let log = take();
-        assert!(log.contains(&Ev::Producer(1034)));
-        // The grant crossed the reserve line: one chunk backed after it.
-        assert_eq!((f.pools.ledger.posted, f.pools.chunk_count()), (1034, chunks + 1));
-        assert_cursor(&f, &f.engine.flights[0].job.vm, chunks + 1);
+        assert!(log.contains(&Ev::Producer(74)));
+        assert_eq!((f.pools.ledger.posted, f.pools.chunk_count()), (74, chunks));
+        assert_cursor(&f, &f.engine.flights[0].job.vm, chunks);
         assert_eq!(count(&log, |e| matches!(e, Ev::Free(_) | Ev::Unmap(..))), 0);
     }
 
@@ -1312,10 +1328,10 @@ mod pb_growth_tests {
     fn other_vms_catch_up_before_they_run() {
         let mut f = Firmware::new();
         let a = f.engine.flights[0].job.vm.clone();
-        grow_to(&mut f, 1100);
+        grow_to(&mut f, 200);
         take();
         let chunks = f.pools.chunk_count();
-        assert_eq!(chunks, 10);
+        assert_eq!(chunks, 3);
         // A's work retires; a new VM runs next: it maps every chunk first.
         f.engine.flights.clear();
         let b = VmState::new(6);
@@ -1327,7 +1343,7 @@ mod pb_growth_tests {
         assert_eq!(count(&log, |e| matches!(e, Ev::Alloc(..))), 0);
         assert_cursor(&f, &b, chunks);
         // B grows the backing; A, behind, catches up when it runs again.
-        grow_to(&mut f, 1200);
+        grow_to(&mut f, 300);
         let log = take();
         assert_posted_backed(&log, 6, chunks as u64 * CHUNK_BLOCKS as u64);
         assert_eq!(count(&log, |e| matches!(e, Ev::Map(5, ..))), 0);
@@ -1341,7 +1357,7 @@ mod pb_growth_tests {
     #[test]
     fn partial_catch_up_keeps_the_aliases_made() {
         let mut f = Firmware::new();
-        grow_to(&mut f, 1100);
+        grow_to(&mut f, 200);
         let chunks = f.pools.chunk_count();
         f.engine.flights.clear();
         let b = VmState::new(6);
@@ -1360,12 +1376,12 @@ mod pb_growth_tests {
     #[test]
     fn ledger_reset_reuses_the_backing() {
         let mut f = Firmware::new();
-        grow_to(&mut f, 1300);
+        grow_to(&mut f, 300);
         let chunks = f.pools.chunk_count();
         take();
         f.reset_ledger();
-        assert_eq!(f.pools.ledger.posted, 1024);
-        grow_to(&mut f, 1300);
+        assert_eq!(f.pools.ledger.posted, 64);
+        grow_to(&mut f, 300);
         let log = take();
         assert_eq!(count(&log, |e| matches!(e, Ev::Alloc(..) | Ev::Map(..))), 0);
         assert_eq!(f.pools.chunk_count(), chunks);
@@ -1423,7 +1439,7 @@ mod pb_growth_tests {
         // Only inputs the old constructor took to the whole 4096-block heap changed.
         assert!(changed > 0 && changed < cases);
         // The driver's values are below the cap, so its ledger is the old one.
-        let d = (tuning::PB_GROW, tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS);
+        let d = (tuning::PB_GROW, params::pb_blocks(), tuning::PB_MAX_BLOCKS);
         let (old, new) = (OldLedger::new(d.0, d.1, d.2), Ledger::new(d.0, d.1, d.2));
         if d.2 <= CAP {
             assert_eq!((old.initial, old.max, old.posted), (new.initial, new.max, new.posted));
@@ -1520,13 +1536,18 @@ def main():
             if init.count(line) != 1:
                 raise SystemExit('Pools::init() does not hold: ' + line)
         reset = '\n'.join('p.' + line[len('self.'):] for line in LEDGER_RESET)
-        pb_max_blocks = item(src[PARAMS], 'pub(crate) fn pb_max_blocks() -> u32 {')
+        pb_max_blocks = (item(src[PARAMS], 'pub(crate) fn pb_max_blocks() -> u32 {') + '\n' +
+                         item(src[PARAMS], 'pub(crate) fn pb_blocks() -> u32 {'))
         m = re.search(r'g15_pb_max_blocks: u32 \{\s*default: (\d+),', src[CORE])
         if not m:
             raise SystemExit('g15_pb_max_blocks default not found')
         param_default = int(m.group(1))
+        m = re.search(r'g15_pb_blocks: u32 \{\s*default: (\d+),', src[CORE])
+        if not m:
+            raise SystemExit('g15_pb_blocks default not found')
+        blocks_default = int(m.group(1))
         sizes = consts(item(hw, 'pub(crate) mod sizes {'), ['PB_BLOCKS'])
-        tuning = consts(item(hw, 'pub(crate) mod tuning {'), ['PB_GROW', 'PB_BLOCKS', 'PB_MAX_BLOCKS'])
+        tuning = consts(item(hw, 'pub(crate) mod tuning {'), ['PB_GROW', 'PB_MAX_BLOCKS'])
         client = consts(item(hw, 'pub(crate) mod client {'), ['PB_HEAP', 'PB_BLOCK_LIST'])
         pte = consts(item(hw, 'pub(crate) mod pte {'), ['LEAF_CACHED'])
         control = consts(item(src[INITDATA], 'pub(crate) mod control {'), ['HALT_COUNT'])
@@ -1540,6 +1561,7 @@ def main():
         for path in (GROWTH, BUFFER, CHANNELS):
             (dir / Path(path).name).write_text(src[path])
         code = (PREFIX + f'pub const PARAM_DEFAULT: u32 = {param_default};\n' +
+                f'pub const PB_BLOCKS_DEFAULT: u32 = {blocks_default};\n' +
                 'pub mod g15 {\n'
                 '    pub mod fw {\n'
                 f'        #[path = "{dir / "channels.rs"}"] pub mod channels;\n'

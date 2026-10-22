@@ -170,7 +170,11 @@ module! {
         },
         g15_pb_max_blocks: u32 {
             default: 3072,
-            description: "G15: parameter-buffer growth maximum given to the firmware, blocks of 128 KiB (1024..4095 in effect; the blocks above it, up to 4095, answer partial renders; the 512 MiB heap is allocated either way)",
+            description: "G15: PB growth maximum given to the firmware, 128 KiB blocks (64..4095)",
+        },
+        g15_pb_blocks: u32 {
+            default: 64,
+            description: "G15: PB blocks posted at (re)initialization, 128 KiB each (64..4095)",
         },
         g15_early_tiling: u32 {
             default: 0,

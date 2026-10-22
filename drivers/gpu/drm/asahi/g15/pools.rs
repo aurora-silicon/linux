@@ -12,9 +12,9 @@
 //!   the fixed client GVA: each VM's before its prefixes are published ([`Firmware::map_pb`]),
 //!   and a chunk backed later also into the VM of the flights; nothing names its pages through
 //!   the host window or context 0 (the records hold client GVAs only). Initial
-//!   [`super::hw::tuning::PB_BLOCKS`] (1024), at most [`super::hw::tuning::PB_MAX_BLOCKS`]
-//!   (4095) posted, so the producer never returns to 0; the firmware is given
-//!   [`Pools::soft_max`] (default 3072) as its growth maximum. Truthful K = 4096 in every
+//!   `g15_pb_blocks` (64), at most [`super::hw::tuning::PB_MAX_BLOCKS`] (4095) posted, so the
+//!   producer never returns to 0; the firmware is given [`Pools::soft_max`] (default 3072) as
+//!   its growth maximum. Truthful K = 4096 in every
 //!   profile (PB reconstruction, also in recovery, synchronizes 8 * K bytes of the block list:
 //!   K = 0x26cd overran the 0x8000-byte list and crashed the second recovery).
 //! - Backing: a request is granted from the backed blocks above the posted count; after the
@@ -72,10 +72,10 @@ static_assert!(buffer::MAX_BLOCKS as u64 * buffer::BLOCK_BYTES == client::PB_HEA
 static_assert!(buffer::PAGE_LIST_SIZE as u64 == client::PB_PAGE_LIST_SIZE);
 static_assert!(uma_manager::SEEDS == sizes::FREELIST_SEED);
 static_assert!(uma_pools::POOL_SIZE == sizes::POOL_SIZE);
-// The ledger keeps the driver's PB sizes: neither is capped by [`growth::MAX_POSTED`].
+// The ledger keeps the driver's PB maximum: it is not capped by [`growth::MAX_POSTED`]. The
+// initial posting (`g15_pb_blocks`) is clamped to MIN_BLOCKS..=PB_MAX_BLOCKS.
 static_assert!(tuning::PB_MAX_BLOCKS <= growth::MAX_POSTED);
-static_assert!(buffer::MIN_BLOCKS <= tuning::PB_BLOCKS);
-static_assert!(tuning::PB_BLOCKS <= tuning::PB_MAX_BLOCKS);
+static_assert!(buffer::MIN_BLOCKS <= tuning::PB_MAX_BLOCKS);
 // The PB alias is GPU-only (not cached and firmware-visible): dropping one is a plain unmap,
 // with no firmware cache flush (`KernelMapping::drop`).
 static_assert!(!mmu::Prot::from_pte(pte::LEAF_CACHED).is_cached_noncoherent());
@@ -373,7 +373,11 @@ impl Pools {
             true,
         )?;
         // Backing for the initial blocks and the reserve; growth adds the rest.
-        let mut ledger = Ledger::new(tuning::PB_GROW, tuning::PB_BLOCKS, tuning::PB_MAX_BLOCKS);
+        let mut ledger = Ledger::new(
+            tuning::PB_GROW,
+            super::params::pb_blocks(),
+            tuning::PB_MAX_BLOCKS,
+        );
         let mut chunks = KVec::with_capacity(growth::MAX_CHUNKS as usize, GFP_KERNEL)?;
         for _ in 0..Ledger::chunks_for(ledger.initial) {
             chunks.push(PbChunk::new(dev)?, GFP_KERNEL)?;

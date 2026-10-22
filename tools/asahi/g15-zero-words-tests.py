@@ -5,8 +5,10 @@
 Uses synthetic public data and temporary host copies of production Rust modules.
 No GPU, firmware file, private fixture, kernel build or hardware access. The
 golden T6030 inputs below are from SiliconForest 9f09c85f8d3b, except the full
-hw.rs file refreshed at 709f0f08316a for the reviewed shared PB allocator changes.
-Its T6030 configuration module is independently pinned to the original bytes.
+hw.rs file refreshed at 709f0f08316a for the reviewed shared PB allocator changes
+and again when the initial PB posting became a module parameter (the tuning
+constant PB_BLOCKS removed). Its T6030 configuration module is independently
+pinned to the original bytes.
 """
 
 import argparse
@@ -22,7 +24,7 @@ G15 = "drivers/gpu/drm/asahi/g15"
 GOLDEN_FILES = {
     "board/data.rs": "7c5ff1077ca3296cbfc9e7144294162b6dea78a3774c38eeed4b0f59a14d7a5c",
     "board/template.rs": "286872f5474a67534f214e83e659253299f85143f3dc59035fa80894022e2549",
-    "hw.rs": "e4619590e670ed88d2a9bb76b03853081c615d3d0ad1c6a68321ce8e615ef8a0",
+    "hw.rs": "658c58026553c098b899aeffa0b6ae5be2b14921aef19df9e4f14789b7b890c4",
     "power/idle.rs": "4928ecf7699b3ca85ff5143eb6e996efd40d47321e29a238a02c8873bc9f102c",
 }
 GOLDEN_FUNCTIONS = {
