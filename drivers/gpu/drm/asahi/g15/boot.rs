@@ -63,6 +63,7 @@ pub(crate) mod glue {
         fn asahi_g15_release_power(dev: *mut core::ffi::c_void);
         fn asahi_g15_module_get();
         pub(crate) fn asahi_g15_reprobe();
+        pub(crate) fn asahi_g15_report_loader_gpu();
         fn asahi_g15_adt_phram(start: *mut u64, size: *mut u64) -> core::ffi::c_int;
         fn asahi_g15_ram_disjoint(start: u64, size: u64) -> bool;
         fn asahi_g15_ram_within(start: u64, size: u64) -> bool;

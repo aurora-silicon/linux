@@ -226,6 +226,8 @@ static MODULE_READY: AtomicBool = AtomicBool::new(false);
 /// No fallible module initialization may follow this call.
 pub(crate) fn activate() {
     MODULE_READY.store(true, Ordering::Release);
+    // SAFETY: The helper only reads the device tree.
+    unsafe { boot::glue::asahi_g15_report_loader_gpu() };
     // SAFETY: Both pinned platform registrations are fully initialized and remain owned
     // by DriverModule. The C helper borrows their live driver pointer only for this call.
     unsafe { boot::glue::asahi_g15_reprobe() };

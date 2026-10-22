@@ -28,6 +28,7 @@ void asahi_g15_hold_power(struct device *dev);
 void asahi_g15_release_power(struct device *dev);
 void asahi_g15_module_get(void);
 void asahi_g15_reprobe(void);
+void asahi_g15_report_loader_gpu(void);
 int asahi_g15_adt_phram(u64 *start, u64 *size);
 bool asahi_g15_ram_disjoint(u64 start, u64 size);
 bool asahi_g15_ram_within(u64 start, u64 size);
@@ -38,6 +39,47 @@ int asahi_g15_pmp_prepare(struct device *dev);
 int asahi_g15_pmp_get(struct device *dev);
 void asahi_g15_pmp_put(struct device *dev);
 bool asahi_g15_reserved_uat(u32 index, u64 start, u64 size);
+
+/*
+ * The boot loader enables the T6030/T6031 GPU node only when its
+ * chosen.asahi,t603x-gpu setting is on; otherwise the node stays disabled,
+ * the adapter never probes and nothing says why native G15 is absent. Name
+ * the setting once, at module activation, on a machine whose /chosen has it
+ * and whose GPU node is disabled. Nothing else changes.
+ */
+void asahi_g15_report_loader_gpu(void)
+{
+	static const struct {
+		const char *prop;
+		const char *compatible;
+	} socs[] = {
+		{ "asahi,t6031-gpu", "apple,agx-t6031" },
+		{ "asahi,t6030-gpu", "apple,agx-t6030" },
+	};
+	struct device_node *chosen, *np;
+	const char *value;
+	unsigned int i;
+	u32 cell;
+
+	chosen = of_find_node_by_path("/chosen");
+	if (!chosen)
+		return;
+	for (i = 0; i < ARRAY_SIZE(socs); i++) {
+		if (!of_property_present(chosen, socs[i].prop))
+			continue;
+		np = of_find_compatible_node(NULL, NULL, socs[i].compatible);
+		if (np && !of_device_is_available(np)) {
+			if (!of_property_read_string(chosen, socs[i].prop, &value))
+				pr_info("asahi: G15: native G15 not started: the boot loader left the GPU node %pOF disabled (/chosen/%s = \"%s\")\n",
+					np, socs[i].prop, value);
+			else if (!of_property_read_u32(chosen, socs[i].prop, &cell))
+				pr_info("asahi: G15: native G15 not started: the boot loader left the GPU node %pOF disabled (/chosen/%s = %u)\n",
+					np, socs[i].prop, cell);
+		}
+		of_node_put(np);
+	}
+	of_node_put(chosen);
+}
 
 /*
  * The maintained m1n1 handoff keeps these four UAT regions in the linear map.
