@@ -10,8 +10,9 @@
 //!   ([`object::Objects::clients`]) as driver mappings at their fixed GVAs, and reserve
 //!   [`super::hw::client::CLIENT_APERTURE`], the pass-slot range and the PB page list
 //!   (`vm.install_driver_mappings`): user binds there fail (EINVAL). The aperture holds the
-//!   whole PB range, whose backing is mapped later, before the VM's first prefix is published
-//!   (`Firmware::map_pb`, counted in [`VmState::pb_chunks`]);
+//!   whole PB range, whose backing chunks are mapped later, before the VM's prefixes are
+//!   published (`Firmware::map_pb`) and, for the VM of the flights, when a chunk is backed
+//!   ([`VmState::map_heap`], [`VmState::map_chunk`]);
 //! - bind it to an exclusive TTBAT slot ([`mmu::Uat::bind`]) for as long as its [`VmState`]
 //!   lives; at most [`super::hw::sizes::MAX_VMS`] such VMs (ENOSPC beyond, checked before
 //!   binding so the slot allocator never blocks).
@@ -29,7 +30,7 @@
 //! alike.
 
 use core::ops::Range;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 use kernel::{
     drm::gem::BaseObject,
     new_mutex,
@@ -104,6 +105,20 @@ impl ClientAlias {
     }
 }
 
+/// A PB heap chunk mapped in a VM at its fixed GVA ([`super::pools::chunk_gva`]).
+struct HeapMapping {
+    gem: ARef<gem::Object>,
+    _mapping: mmu::KernelMapping,
+}
+
+/// The PB heap chunks mapped in a VM, in heap order (chunk `i` at `chunk_gva(i)`). Changed
+/// under the device lock (refill, publication).
+#[pin_data]
+struct HeapMappings {
+    #[pin]
+    list: Mutex<KVec<HeapMapping>>,
+}
+
 /// G15 state of one user VM, shared by the registry, its queues and its jobs.
 pub(crate) struct VmState {
     /// The `mmu::Vm` identifier (`Gpu::ids.vm`).
@@ -117,15 +132,70 @@ pub(crate) struct VmState {
     /// The exclusive slot binding, released before the live count drops.
     bind: Option<mmu::VmBind>,
     registry: Arc<Registry>,
-    /// PB backing chunks mapped into the VM, from the first (`Firmware::map_pb`); changed only
-    /// under the device lock.
-    pub(crate) pb_chunks: AtomicUsize,
+    /// The PB heap chunks mapped in this VM.
+    heap: Arc<HeapMappings>,
 }
 
 impl VmState {
     /// Drops the registry's references to closed VMs (the queues call this when destroyed).
     pub(crate) fn prune_registry(&self) {
         self.registry.prune();
+    }
+
+    /// Maps PB heap chunk `i`, the next one this VM lacks, at its GVA. The alias is held only
+    /// once it is in the list.
+    fn map_one(&self, heap: &mut KVec<HeapMapping>, i: usize, gem: ARef<gem::Object>) -> Result {
+        if i != heap.len() {
+            return Err(EINVAL);
+        }
+        heap.reserve(1, GFP_KERNEL)?;
+        let mapping = self.vm.map_at(
+            super::pools::chunk_gva(i),
+            super::pools::CHUNK_BYTES,
+            &gem,
+            mmu::Prot::from_pte(hw::pte::LEAF_CACHED),
+            false,
+        )?;
+        heap.push_within_capacity(HeapMapping {
+            gem,
+            _mapping: mapping,
+        })
+        .map_err(|_| ENOMEM)
+    }
+
+    /// Maps the backed chunks (`gems`, in heap order) this VM does not hold yet. A chunk whose
+    /// object changed since (freed and backed again) is unmapped first, with everything above
+    /// it, and so are chunks past the backing.
+    pub(crate) fn map_heap(&self, gems: impl Iterator<Item = ARef<gem::Object>>) -> Result {
+        let mut heap = self.heap.list.lock();
+        let mut n = 0;
+        for (i, gem) in gems.enumerate() {
+            n = i + 1;
+            if let Some(have) = heap.get(i) {
+                if core::ptr::eq(&*have.gem, &*gem) {
+                    continue;
+                }
+                heap.truncate(i);
+            }
+            self.map_one(&mut heap, i, gem)?;
+        }
+        heap.truncate(n);
+        Ok(())
+    }
+
+    /// Maps the newly backed chunk `i` into this VM (the VM of a flight, at a refill).
+    pub(crate) fn map_chunk(&self, i: usize, gem: ARef<gem::Object>) -> Result {
+        let mut heap = self.heap.list.lock();
+        if i < heap.len() {
+            // Already mapped (a flight of the same VM came first).
+            return Ok(());
+        }
+        self.map_one(&mut heap, i, gem)
+    }
+
+    /// Unmaps the heap chunks from index `keep` on.
+    pub(crate) fn unmap_heap_above(&self, keep: usize) {
+        self.heap.list.lock().truncate(keep);
     }
 }
 
@@ -292,6 +362,13 @@ pub(crate) fn new_vm(gpu: &Gpu, kernel_range: Range<u64>) -> Result<mmu::Vm> {
     let status = vm.status().ok_or(EINVAL)?.clone();
     let (mappings, reserved) = Registry::driver_mappings(&vm, aliases)?;
     vm.install_driver_mappings(mappings, reserved)?;
+    // No PB chunk yet: they are mapped before the VM's first prefix (`Firmware::map_pb`).
+    let heap = Arc::pin_init(
+        pin_init!(HeapMappings {
+            list <- new_mutex!(KVec::new(), "g15::HeapMappings::list"),
+        }),
+        GFP_KERNEL,
+    )?;
     // The context names the root only now: everything above is already visible to the walker.
     let bind = gpu.uat.bind(&vm)?;
     let slot = bind.slot();
@@ -305,7 +382,7 @@ pub(crate) fn new_vm(gpu: &Gpu, kernel_range: Range<u64>) -> Result<mmu::Vm> {
             vm: vm.clone(),
             bind: Some(bind),
             registry: registry.clone(),
-            pb_chunks: AtomicUsize::new(0),
+            heap,
         },
         GFP_KERNEL,
     )?;

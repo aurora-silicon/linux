@@ -12,11 +12,13 @@
 //! its recovery path then apply, without a guarantee that they end the stall. A request from
 //! before a halt (epoch) or not matching a published render prefix is left unanswered.
 //!
-//! The heap's VA range covers [`MAX_BLOCKS`] blocks; its RAM comes in chunks from the heap
-//! base, which the ledger counts as `backed`. A request is granted from the backed blocks above
-//! `posted`; a request that finds no backed block waits ([`Answer::Wait`]) and keeps its
-//! counter. A re-initialization ([`Ledger::reinit`]) returns the posted count to the initial
-//! size and keeps the backing.
+//! The heap's VA range covers [`MAX_BLOCKS`] blocks; its RAM comes in chunks of
+//! [`CHUNK_BLOCKS`] blocks from the heap base, which the ledger counts as `backed`. A request is
+//! granted from the backed blocks above `posted`. A chunk is due ([`Ledger::refill_due`])
+//! whenever fewer than [`RESERVE_BLOCKS`] backed blocks remain above the posted count, so that
+//! it can be backed after a reply; a request that finds no backed block waits
+//! ([`Answer::Wait`]) and keeps its counter. A re-initialization ([`Ledger::reinit`]) returns
+//! the posted count to the initial size and keeps the backing.
 //!
 //! Core-only (no `kernel` imports): this file is compiled by the host test harness as well.
 
@@ -52,6 +54,13 @@ pub(crate) const MAX_REFUSALS: u32 = 2;
 /// Blocks of each PB backing chunk (16 MiB).
 pub(crate) const CHUNK_BLOCKS: u32 = 128;
 
+/// Backed blocks kept above the posted count: at 1-2 ms per request of ten blocks, 13 requests
+/// of lead for the allocation of the next chunk.
+pub(crate) const RESERVE_BLOCKS: u32 = CHUNK_BLOCKS;
+
+/// Chunks of the whole heap.
+pub(crate) const MAX_CHUNKS: u32 = MAX_BLOCKS / CHUNK_BLOCKS;
+
 /// The answer to an admitted growth request.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Answer {
@@ -62,24 +71,6 @@ pub(crate) enum Answer {
     /// No backed block above the posted count: leave the request queued until a chunk is
     /// backed.
     Wait,
-}
-
-/// The backing chunk that follows `backed` blocks of a ledger with maximum `max`: its first block
-/// and size, at most [`CHUNK_BLOCKS`] and never past `max`; none from `max` on.
-pub(crate) const fn next_chunk(backed: u32, max: u32) -> Option<(u32, u32)> {
-    if backed >= max {
-        None
-    } else if max - backed < CHUNK_BLOCKS {
-        Some((backed, max - backed))
-    } else {
-        Some((backed, CHUNK_BLOCKS))
-    }
-}
-
-/// The chunks that back a ledger with `initial` and `max` blocks at most: the initial one and
-/// [`next_chunk`]'s from `initial` to `max`.
-pub(crate) const fn max_chunks(initial: u32, max: u32) -> usize {
-    1 + max.saturating_sub(initial).div_ceil(CHUNK_BLOCKS) as usize
 }
 
 /// The most blocks a ledger posts: the mapped heap, and below K, so that the block_ctl+4
@@ -125,9 +116,30 @@ impl Ledger {
         self.posted % BLOCK_LIST_RECORDS
     }
 
+    /// Records one more backed chunk.
+    pub(crate) const fn back_chunk(&mut self) {
+        self.backed += CHUNK_BLOCKS;
+    }
+
     /// Backed blocks above the posted count.
     pub(crate) const fn spare(&self) -> u32 {
         self.backed.saturating_sub(self.posted)
+    }
+
+    /// Whether another chunk is due: fewer than the reserve above the posted count and the heap
+    /// not yet backed whole.
+    pub(crate) const fn refill_due(&self) -> bool {
+        self.backed < MAX_BLOCKS && self.spare() < RESERVE_BLOCKS
+    }
+
+    /// Chunks that `blocks` posted blocks and the reserve need.
+    pub(crate) const fn chunks_for(blocks: u32) -> u32 {
+        let n = (blocks + RESERVE_BLOCKS).div_ceil(CHUNK_BLOCKS);
+        if n > MAX_CHUNKS {
+            MAX_CHUNKS
+        } else {
+            n
+        }
     }
 
     /// Whether the refusals at the maximum are used up: further requests go unanswered.
@@ -146,12 +158,6 @@ impl Ledger {
             && live
             && request[grow_request::COUNTER] >= self.next_request
             && request_epoch(request) == epoch
-    }
-
-    /// The blocks the next accepted request posts with the backing it needs: at most
-    /// [`GROW_STEP`], none at the maximum.
-    pub(crate) fn next_count(&self) -> u32 {
-        GROW_STEP.min(self.max - self.posted)
     }
 
     /// Accepts an admitted request. Granted (at most [`GROW_STEP`] blocks, and no more than are
@@ -385,6 +391,105 @@ mod tests {
         l.posted = 4095;
         assert_eq!(l.post(1), 0);
         assert_eq!(l.post(10), 10);
+    }
+
+    #[test]
+    fn backing() {
+        // 64 initial blocks: two chunks (the initial posting and the reserve).
+        assert_eq!(Ledger::chunks_for(64), 2);
+        assert_eq!(Ledger::chunks_for(1024), 9);
+        assert_eq!(Ledger::chunks_for(4095), MAX_CHUNKS);
+        assert_eq!(MAX_CHUNKS, 32);
+        let mut l = Ledger::new(true, 64, 4095);
+        assert_eq!(l.spare(), 0);
+        assert!(l.refill_due());
+        // Nothing backed: a request waits and the counter does not advance.
+        let q = request(3, 0, 1);
+        assert_eq!(l.accept(&q), Answer::Wait);
+        assert_eq!(l.next_request, 0);
+        l.back_chunk();
+        l.back_chunk();
+        assert_eq!((l.backed, l.spare()), (256, 192));
+        assert!(!l.refill_due());
+        // Granting until the reserve line, then a refill is due; at the end of the backing the
+        // grant is clipped and the next request waits.
+        assert_eq!(
+            l.accept(&q),
+            Answer::Grant {
+                first: 64,
+                count: 10
+            }
+        );
+        assert_eq!(l.post(10), 74);
+        assert_eq!(l.next_request, 1);
+        l.posted = 128;
+        assert!(!l.refill_due());
+        l.posted = 129;
+        assert!(l.refill_due());
+        l.posted = 250;
+        assert_eq!(
+            l.accept(&request(3, 1, 1)),
+            Answer::Grant {
+                first: 250,
+                count: 6
+            }
+        );
+        l.post(6);
+        assert_eq!(l.accept(&request(3, 2, 1)), Answer::Wait);
+        // The heap end: no refill past the whole heap, the maximum refuses.
+        l.backed = MAX_BLOCKS;
+        l.posted = 4090;
+        assert!(!l.refill_due());
+        assert_eq!(
+            l.accept(&request(3, 2, 1)),
+            Answer::Grant {
+                first: 4090,
+                count: 5
+            }
+        );
+        l.post(5);
+        assert_eq!(l.accept(&request(3, 3, 1)), Answer::Refuse);
+        // Re-initialization keeps the backing.
+        l.reinit();
+        assert_eq!((l.posted, l.backed), (64, 4096));
+    }
+
+    /// Every ledger the constructor makes, the driver's included, backed a chunk at a time
+    /// whenever the reserve is short: no grant posts a block past the backing, no request waits,
+    /// and the backing ends within the heap.
+    #[test]
+    fn backing_ahead_of_every_grant() {
+        let values = [
+            0, 1, MIN_BLOCKS, 65, 1023, 1024, 1025, 3072, 4094, MAX_POSTED, 5000,
+        ];
+        for grow in [true, false] {
+            for blocks in values {
+                for max_blocks in values {
+                    let mut l = Ledger::new(grow, blocks, max_blocks);
+                    for _ in 0..Ledger::chunks_for(l.initial) {
+                        l.back_chunk();
+                    }
+                    let mut counter = 0;
+                    loop {
+                        match l.accept(&request(5, counter, 1)) {
+                            Answer::Grant { first, count } => {
+                                assert_eq!(first, l.posted);
+                                assert!(count >= 1 && first + count <= l.backed);
+                                l.post(count);
+                            }
+                            Answer::Refuse => break,
+                            Answer::Wait => panic!("waited at {} of {}", l.posted, l.backed),
+                        }
+                        counter += 1;
+                        while l.refill_due() {
+                            l.back_chunk();
+                        }
+                    }
+                    assert_eq!(l.posted, l.max);
+                    assert!(l.max <= l.backed && l.backed <= MAX_BLOCKS);
+                }
+            }
+        }
     }
 
     #[test]
