@@ -18,7 +18,8 @@
 //! whenever fewer than [`RESERVE_BLOCKS`] backed blocks remain above the posted count, so that
 //! it can be backed after a reply; a request that finds no backed block waits
 //! ([`Answer::Wait`]) and keeps its counter. A re-initialization ([`Ledger::reinit`]) returns
-//! the posted count to the initial size and keeps the backing.
+//! the posted count to the initial size and keeps the backing; [`Ledger::keep_chunks`] gives the
+//! chunks that the initial posting and the reserve need.
 //!
 //! Core-only (no `kernel` imports): this file is compiled by the host test harness as well.
 
@@ -121,6 +122,11 @@ impl Ledger {
         self.backed += CHUNK_BLOCKS;
     }
 
+    /// Drops the backing to `chunks` chunks.
+    pub(crate) const fn unback_to(&mut self, chunks: u32) {
+        self.backed = chunks * CHUNK_BLOCKS;
+    }
+
     /// Backed blocks above the posted count.
     pub(crate) const fn spare(&self) -> u32 {
         self.backed.saturating_sub(self.posted)
@@ -140,6 +146,18 @@ impl Ledger {
         } else {
             n
         }
+    }
+
+    /// Chunks a re-initialized heap keeps: those of the initial posting and the reserve.
+    pub(crate) const fn keep_chunks(&self) -> u32 {
+        Self::chunks_for(self.initial)
+    }
+
+    /// Whether the heap is to be re-initialized: idle for `idle_ns` with more than `floor`
+    /// blocks posted, and grown since the initialization (with nothing grown a
+    /// re-initialization posts the same blocks again).
+    pub(crate) const fn reclaim_due(&self, floor: u32, idle_ns: u64, min_idle_ns: u64) -> bool {
+        self.posted > self.initial && self.posted > floor && idle_ns >= min_idle_ns
     }
 
     /// Whether the refusals at the maximum are used up: further requests go unanswered.
@@ -200,6 +218,37 @@ impl Ledger {
             || (count == 0 && self.posted == self.max && !self.refusal_logged);
         self.refusal_logged |= count == 0;
         info
+    }
+}
+
+/// The engine's idle clock for the reclaim policy: when nothing was published and nothing
+/// pending, from the pass that retired the last flight on. Noted at the end of every poll pass
+/// and publication (a pass that empties the flights is not re-armed, so a note only at the
+/// start of a pass with empty flights depends on a backup pass happening to run) and, busy,
+/// when a job is enqueued.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IdleClock {
+    /// When the idle began; 0 while busy.
+    since_ns: u64,
+}
+
+impl IdleClock {
+    /// Notes the engine idle or busy at `now_ns`; an idle already begun keeps its start.
+    pub(crate) fn note(&mut self, idle: bool, now_ns: u64) {
+        if !idle {
+            self.since_ns = 0;
+        } else if self.since_ns == 0 {
+            self.since_ns = now_ns.max(1);
+        }
+    }
+
+    /// The idle time at `now_ns`; 0 while busy.
+    pub(crate) fn idle_ns(&self, now_ns: u64) -> u64 {
+        if self.since_ns == 0 {
+            0
+        } else {
+            now_ns.wrapping_sub(self.since_ns)
+        }
     }
 }
 
@@ -401,6 +450,7 @@ mod tests {
         assert_eq!(Ledger::chunks_for(4095), MAX_CHUNKS);
         assert_eq!(MAX_CHUNKS, 32);
         let mut l = Ledger::new(true, 64, 4095);
+        assert_eq!(l.keep_chunks(), 2);
         assert_eq!(l.spare(), 0);
         assert!(l.refill_due());
         // Nothing backed: a request waits and the counter does not advance.
@@ -449,9 +499,11 @@ mod tests {
         );
         l.post(5);
         assert_eq!(l.accept(&request(3, 3, 1)), Answer::Refuse);
-        // Re-initialization keeps the backing.
+        // Re-initialization keeps the backing; dropping it to the kept chunks.
         l.reinit();
         assert_eq!((l.posted, l.backed), (64, 4096));
+        l.unback_to(l.keep_chunks());
+        assert_eq!(l.backed, 256);
     }
 
     /// Every ledger the constructor makes, the driver's included, backed a chunk at a time
@@ -490,6 +542,84 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn reclaim() {
+        let mut l = Ledger::new(true, 64, 4095);
+        let s = 1_000_000_000;
+        assert!(!l.reclaim_due(1024, 5 * s, s));
+        l.posted = 1024;
+        assert!(!l.reclaim_due(1024, 5 * s, s));
+        l.posted = 1025;
+        assert!(l.reclaim_due(1024, s, s));
+        assert!(!l.reclaim_due(1024, s - 1, s));
+        // The clock: busy is 0, an idle keeps its start, busy ends it.
+        let mut c = IdleClock::default();
+        assert_eq!(c.idle_ns(10 * s), 0);
+        c.note(true, 10 * s);
+        c.note(true, 12 * s);
+        assert_eq!(c.idle_ns(15 * s), 5 * s);
+        c.note(false, 16 * s);
+        assert_eq!(c.idle_ns(20 * s), 0);
+        // A clock started at 0 ns still counts as idle.
+        c.note(true, 0);
+        assert_eq!(c.idle_ns(s), s - 1);
+        // Nothing grown since the initialization: no re-initialization, whatever the floor.
+        let l = Ledger::new(true, 64, 4095);
+        assert!(
+            !l.reclaim_due(32, 5 * s, s),
+            "re-initialization with nothing grown"
+        );
+    }
+
+    /// A heavy scene, a reclaim that frees the backing, refills during the next heavy scene,
+    /// an idle gap with a small job in it, and the next render must reclaim again.
+    #[test]
+    fn reclaim_after_free_then_refill() {
+        let s = 1_000_000_000;
+        let (floor, min_idle) = (1024, s);
+        let mut l = Ledger::new(true, 64, 4095);
+        l.unback_to(l.keep_chunks());
+        let mut clock = IdleClock::default();
+        // A heavy scene grows the PB to 1484 blocks, refilling as it goes.
+        let heavy = |l: &mut Ledger, clock: &mut IdleClock, t: u64| {
+            clock.note(false, t);
+            let mut counter = l.next_request;
+            while l.posted < 1484 {
+                while l.refill_due() {
+                    l.back_chunk();
+                }
+                match l.accept(&request(1, counter, 0)) {
+                    Answer::Grant { count, .. } => {
+                        l.post(count);
+                    }
+                    other => panic!("{other:?} at {}", l.posted),
+                }
+                counter += 1;
+            }
+            // The pass that retires the last flight notes the idle; no later pass may run.
+            clock.note(true, t + s);
+        };
+        heavy(&mut l, &mut clock, 100 * s);
+        assert_eq!((l.posted, l.backed), (1484, 13 * CHUNK_BLOCKS));
+        // 5 s later a small job arrives: the reclaim is due; it frees the backing above the
+        // kept chunks; the re-initialization happens at the next render.
+        let t = 106 * s;
+        assert!(l.reclaim_due(floor, clock.idle_ns(t), min_idle));
+        l.unback_to(l.keep_chunks());
+        clock.note(false, t);
+        assert_eq!(l.backed, 2 * CHUNK_BLOCKS);
+        clock.note(true, t + s / 2);
+        // The next render re-initializes, then the second heavy scene refills to 1484 again.
+        l.reinit();
+        assert_eq!((l.posted, l.backed), (64, 256));
+        heavy(&mut l, &mut clock, 110 * s);
+        assert_eq!((l.posted, l.backed), (1484, 13 * CHUNK_BLOCKS));
+        // The same gap again: the reclaim must be due at the small job's arrival.
+        let t = 116 * s;
+        assert_eq!(clock.idle_ns(t), 5 * s);
+        assert!(l.reclaim_due(floor, clock.idle_ns(t), min_idle));
     }
 
     #[test]

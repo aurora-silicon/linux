@@ -37,7 +37,8 @@ What it shows:
   render is published, and still backs for a render published before it; a failed reply keeps
   everything;
 - a VM's aliases are the chunks, contiguous from the heap's start; a VM that runs after another
-  grew the backing maps it first (at publication); a partial catch-up keeps the aliases made;
+  grew the backing maps it first (at publication); a partial catch-up keeps the aliases made; a
+  chunk freed and backed again (an idle reclaim) is unmapped and mapped again at publication;
 - the one-VM rule: a catch-up with a flight of another VM is refused (EPROTO) before anything
   is mapped;
 - the ledger reset of Pools::init() re-posts from the backing without allocating;
@@ -166,6 +167,8 @@ MUTATIONS = {
     # Refill for any live flight, also compute-only ones that cannot ask for growth.
     'refill-for-any-flight': (POOLS, 'if self.recovery.reinit && !render {',
                               'if self.recovery.reinit && self.engine.flights.is_empty() {'),
+    # Keep a VM's alias of a chunk that was freed and backed again.
+    'map-without-identity': (VM, '                if core::ptr::eq(&*have.gem, &*gem) {', '                if true {'),
     # Catch up without the one-VM check.
     'no-activation-guard': (POOLS, '.filter(|f| !core::ptr::eq(&*f.job.vm, vm))', '.filter(|_| false)'),
     # Back the whole heap when the GPU starts.
@@ -200,6 +203,7 @@ INTENDED = {
     'refill-during-reinit': ('pending_reinit_without_flights_backs_nothing', 'backed during a pending re-initialization'),
     'refill-skip-with-live-render': ('pending_reinit_with_a_live_render_refills', 'growth request stranded'),
     'refill-for-any-flight': ('pending_reinit_with_compute_only_backs_nothing', 'backed for a compute-only flight'),
+    'map-without-identity': ('freed_chunks_are_mapped_again', 'alias of another object'),
     'no-activation-guard': ('catch_up_refuses_flights_of_another_vm', 'catch-up with a flight of another VM'),
     'initial-backs-whole-heap': ('startup_backs_the_initial_blocks', 'startup allocation'),
     'chunks-above-16mib': ('growth_backs_before_posting', 'a growth chunk above 16 MiB'),
@@ -577,6 +581,12 @@ MODEL = r'''
             }
             pub fn chunk_capacity(&self) -> usize {
                 self.chunks.capacity()
+            }
+            /// What a reclaim does to the backing (the PB re-initialization included).
+            pub fn drop_chunks(&mut self, keep: usize) {
+                self.chunks.truncate(keep);
+                self.ledger.reinit();
+                self.ledger.unback_to(keep as u32);
             }
             /// The backing objects' ids, in heap order.
             pub fn chunk_ids(&self) -> Vec<u32> {
@@ -1398,6 +1408,42 @@ mod pb_growth_tests {
         let log = take();
         assert_eq!(count(&log, is_backing), 0);
         assert_eq!(f.pools.stats.bad, 1);
+    }
+
+    /// What a reclaim leaves behind in a VM that was not walked (a closed VM not pruned yet, or
+    /// one created meanwhile): its aliases of freed chunks go, and chunks backed again at the
+    /// same GVA are mapped from their new objects at its next publication.
+    #[test]
+    fn freed_chunks_are_mapped_again() {
+        let mut f = Firmware::new();
+        let a = f.engine.flights[0].job.vm.clone();
+        grow_to(&mut f, 300);
+        let chunks = f.pools.chunk_count();
+        assert!(chunks > 2);
+        // The reclaim frees the chunks above the kept two; A is not walked.
+        f.engine.flights.clear();
+        f.pools.drop_chunks(2);
+        take();
+        // B runs and grows the backing again: new objects at the old GVAs.
+        let b = VmState::new(6);
+        f.engine.flights.push(Flight { job: Job { vm: b.clone() } });
+        f.fw.ctx = 6;
+        f.map_pb(&b).unwrap();
+        grow_to(&mut f, 300);
+        assert_eq!(f.pools.chunk_count(), chunks);
+        // A runs again: its stale aliases are replaced by the new objects'.
+        f.engine.flights.clear();
+        f.engine.flights.push(Flight { job: Job { vm: a.clone() } });
+        take();
+        f.map_pb(&a).unwrap();
+        let log = take();
+        assert_cursor(&f, &a, chunks);
+        assert_eq!(count(&log, |e| matches!(e, Ev::Unmap(5, _))), chunks - 2);
+        assert_eq!(count(&log, |e| matches!(e, Ev::Map(5, ..))), chunks - 2);
+        // With fewer chunks than A maps, the ones past the backing go too.
+        f.pools.drop_chunks(2);
+        f.map_pb(&a).unwrap();
+        assert_cursor(&f, &a, 2);
     }
 
     #[test]

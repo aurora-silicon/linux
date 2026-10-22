@@ -515,8 +515,12 @@ impl Firmware {
         if self.engine.flights.capacity() < sizes::FLIGHTS {
             self.engine.flights.reserve(sizes::FLIGHTS, GFP_KERNEL)?;
         }
+        // A job arriving at an idle engine: the PB reclaim, if due, happens before its
+        // publication (idle polls are not re-armed, so this is where a long idle ends).
+        self.reclaim_check();
         self.engine.pending.push(job.clone(), GFP_KERNEL)?;
         job.progress.set_pending(true);
+        self.note_idle();
         let q = &job.queue;
         let owned = self.engine.queue_published(&job)
             + self
@@ -601,6 +605,9 @@ impl Firmware {
                 }
             }
         }
+        // A publication that left nothing published and nothing pending (jobs that failed
+        // before any visible record) starts the idle.
+        self.note_idle();
         result
     }
 

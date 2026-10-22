@@ -321,6 +321,17 @@ impl Registry {
             .ok_or(ENOENT)
     }
 
+    /// The VMs whose client handle is open (and the closed ones not pruned yet), for a walk
+    /// that takes VM locks: not under the registry lock.
+    pub(crate) fn open(&self) -> Result<KVec<Arc<VmState>>> {
+        let vms = self.vms.lock();
+        let mut out = KVec::with_capacity(vms.len(), GFP_KERNEL)?;
+        for state in vms.iter() {
+            out.push(state.clone(), GFP_KERNEL)?;
+        }
+        Ok(out)
+    }
+
     /// Latches `error` on every VM whose client handle is open. The fail-stop path calls it under
     /// the device lock.
     pub(crate) fn fail_all(&self, error: Error) {

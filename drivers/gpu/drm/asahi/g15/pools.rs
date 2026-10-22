@@ -21,6 +21,12 @@
 //!   replies of a pass, while fewer than a reserve chunk remain, [`Firmware::refill_backing`]
 //!   backs the next chunk, so a reply never waits for the allocator. Only a reserve that ran dry
 //!   makes a request wait: it stays queued, the pass backs a chunk and the next pass answers it.
+//! - Reclaim ([`Firmware::reclaim_check`], `g15_pb_reclaim`): posted blocks never come back
+//!   while a PB lives (the firmware recycles pages inside its own pool; the host has no view of
+//!   it), so an engine idle for `g15_pb_idle_ms` with more than `g15_pb_reclaim_blocks` posted
+//!   re-initializes the PB at its next render through the re-initialization path of a recovered
+//!   abort (fresh lists and manager, InitBM of the initial blocks, no halt) and frees the backing
+//!   above the kept chunks.
 //! - Growth: the event drain queues type-7 requests; [`Firmware::answer_growth`] answers each
 //!   one in the poll pass: type 7, PB slot 0, the context of a live published render prefix,
 //!   counter >= next expected, epoch == current halt count; write records `(G - 0x1000000000)
@@ -62,7 +68,7 @@ use super::Firmware;
 use crate::driver::AsahiDrmDevice as AsahiDevice;
 use crate::{gem, mmu};
 
-pub(crate) use growth::{Answer, Ledger};
+pub(crate) use growth::{Answer, IdleClock, Ledger};
 
 static_assert!(buffer::MAX_BLOCKS == sizes::PB_BLOCKS);
 static_assert!(buffer::MAX_PAGES == sizes::PB_PAGES);
@@ -158,6 +164,9 @@ pub(crate) struct PbStats {
     pub(crate) waits: u64,
     /// Chunks backed after the GPU started.
     pub(crate) refills: u64,
+    /// Idle re-initializations, and the chunks they freed.
+    pub(crate) reclaims: u64,
+    pub(crate) freed: u64,
 }
 
 /// Render allocator and PB state: the allocators, the PB ledger and the spare set.
@@ -185,6 +194,8 @@ pub(crate) struct Pools {
     c1_written: bool,
     /// The unanswered-at-the-maximum warning was given since the last initialization.
     exhausted_logged: bool,
+    /// The engine's idle clock (nothing published, nothing pending), for the reclaim.
+    idle: IdleClock,
     pub(crate) stats: PbStats,
 }
 
@@ -403,6 +414,7 @@ impl Pools {
             ledger,
             c1_written: false,
             exhausted_logged: false,
+            idle: IdleClock::default(),
             stats: PbStats::default(),
         })
     }
@@ -539,6 +551,15 @@ impl Pools {
         vm.map_heap(self.chunks.iter().map(PbChunk::gem))
     }
 
+    /// Frees the backing chunks from index `keep` on (their VM mappings are dropped by the
+    /// caller); the RAM returns when the last mapping of a chunk is gone.
+    fn free_chunks(&mut self, keep: usize) -> usize {
+        let freed = self.chunks.len().saturating_sub(keep);
+        self.chunks.truncate(keep);
+        self.ledger.unback_to(self.chunks.len() as u32);
+        freed
+    }
+
     /// Backs one more chunk; the caller maps it where needed before the ledger posts from it.
     fn back_chunk(&mut self) -> Result<ARef<gem::Object>> {
         if self.chunks.len() >= growth::MAX_CHUNKS as usize {
@@ -551,11 +572,11 @@ impl Pools {
     }
 
     /// The debugfs line `pb: blocks initial/posted/firmware-max/max backed blocks/chunks
-    /// requests grown refused bad waits refills` (new keys are appended).
+    /// requests grown refused bad waits refills reclaims freed` (new keys are appended).
     pub(crate) fn write_stats(&self, f: &mut impl fmt::Write) -> fmt::Result {
         writeln!(
             f,
-            "pb: blocks {}/{}/{}/{} backed {}/{} requests {} grown {} refused {} bad {} waits {} refills {}",
+            "pb: blocks {}/{}/{}/{} backed {}/{} requests {} grown {} refused {} bad {} waits {} refills {} reclaims {} freed {}",
             self.ledger.initial,
             self.ledger.posted,
             self.soft_max(),
@@ -567,7 +588,9 @@ impl Pools {
             self.stats.refused,
             self.stats.bad,
             self.stats.waits,
-            self.stats.refills
+            self.stats.refills,
+            self.stats.reclaims,
+            self.stats.freed
         )
     }
 }
@@ -658,6 +681,91 @@ impl Firmware {
                 }
             }
         }
+    }
+
+    /// Notes the engine idle (nothing published, nothing pending) or busy; the idle time is
+    /// what [`Self::reclaim_check`] measures. Called at the end of every poll pass and
+    /// publication (the pass that retires the last flight is not re-armed) and at a job's
+    /// arrival.
+    pub(crate) fn note_idle(&mut self) {
+        let idle = self.engine.flights.is_empty() && self.engine.pending.is_empty();
+        self.pools.idle.note(idle, super::engine::now_ns());
+    }
+
+    /// Reclaims the PB when the engine has been idle for `g15_pb_idle_ms` with more than
+    /// `g15_pb_reclaim_blocks` posted: the next render prefix re-initializes the render
+    /// allocators and the PB (InitBM of the initial blocks; `recovery.reinit`, as after a
+    /// recovered abort but with no halt), and with `g15_pb_reclaim` 2 the backing chunks above
+    /// those of the initial posting and the reserve are freed now, unmapped from every VM of the
+    /// registry (a VM that publishes later drops its stale mappings at [`VmState::map_heap`]).
+    /// Called under the device lock when a job arrives at an idle engine and in idle poll
+    /// passes.
+    pub(crate) fn reclaim_check(&mut self) {
+        let level = super::params::pb_reclaim();
+        if level == 0
+            || !self.engine.flights.is_empty()
+            || !self.engine.pending.is_empty()
+            || self.recovery.reinit
+            || self.recovery.armed.is_some()
+            || self.engine.frozen
+            || self.recovery.failed().is_some()
+        {
+            return;
+        }
+        let idle_ns = self.pools.idle.idle_ns(super::engine::now_ns());
+        let floor = super::params::pb_reclaim_blocks();
+        if !self
+            .pools
+            .ledger
+            .reclaim_due(floor, idle_ns, super::params::pb_idle_ns())
+        {
+            return;
+        }
+        self.recovery.reinit = true;
+        self.pools.stats.reclaims += 1;
+        let posted = self.pools.ledger.posted;
+        let mut freed = 0;
+        if level >= 2 {
+            freed = self.free_backing();
+        }
+        dev_info!(
+            self.dev(),
+            "PB heap: idle {} ms with {} blocks posted: re-initialization to {} at the next render, {} chunks freed, {} backed\n",
+            idle_ns / 1_000_000,
+            posted,
+            self.pools.ledger.initial,
+            freed,
+            self.pools.chunks.len()
+        );
+    }
+
+    /// Frees the backing chunks above those a re-initialized heap keeps
+    /// ([`growth::Ledger::keep_chunks`]) and drops their mappings in every VM that could
+    /// publish; returns the chunks freed. If the VMs cannot be walked, their mappings keep the
+    /// pages until each VM drops its stale aliases ([`VmState::map_heap`]): nothing is counted
+    /// freed.
+    fn free_backing(&mut self) -> usize {
+        let keep = self.pools.ledger.keep_chunks() as usize;
+        let dropped = self.pools.free_chunks(keep);
+        // The mappings hold the chunks' pages: drop them in every VM that could publish.
+        let freed = match self.vms.open() {
+            Ok(states) => {
+                for state in states.iter() {
+                    state.unmap_heap_above(keep);
+                }
+                dropped
+            }
+            Err(e) => {
+                dev_warn!(
+                    self.dev(),
+                    "PB heap: reclaim could not walk the VMs: {}\n",
+                    e.to_errno()
+                );
+                0
+            }
+        };
+        self.pools.stats.freed += freed as u64;
+        freed
     }
 
     /// (Re)initializes the render UMA managers, PB lists and PB manager. `rebuild`: the priming

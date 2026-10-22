@@ -207,6 +207,9 @@ impl Firmware {
         // prefixes published the retirement loop below drains first.
         if self.engine.flights.is_empty() {
             self.drain_rings()?;
+            // Idle bookkeeping of the PB: when the idle began, and the reclaim once it is due.
+            self.note_idle();
+            self.reclaim_check();
             if self.recovery_idle() {
                 return Ok(false);
             }
@@ -228,6 +231,9 @@ impl Firmware {
             self.engine.prof.polls += 1;
             self.engine.prof.poll_ns += now_ns().wrapping_sub(start);
         }
+        // The pass that retired the last flight is not re-armed: note the idle here, not only
+        // at the start of a pass that finds the flights empty.
+        self.note_idle();
         published?;
         Ok(!self.engine.flights.is_empty() || self.recovery.needs_repoll() || self.engine.frozen)
     }
