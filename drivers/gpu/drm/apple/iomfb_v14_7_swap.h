@@ -11,6 +11,8 @@
 #define DCP_V14_SURFACE_SIZE		0x22c
 
 /* Offsets in the swap record. Rectangles are x, y, w, h (u32 each). */
+#define DCP_V14_SWAP_TIMESTAMP(n)	((n) * 8)	/* u64, slots 0 to 6 */
+#define DCP_V14_SWAP_TIMESTAMPS		7
 #define DCP_V14_SWAP_ID			0x98
 #define DCP_V14_SWAP_SURF_ID(p)		(0x9c + (p) * 4)
 #define DCP_V14_SWAP_SRC(p)		(0xac + (p) * 16)	/* in the surface */
@@ -113,6 +115,21 @@ static inline void dcp_v14_encode_swap(u8 *swap, u32 id, u32 background, const u
 		dcp_v14_put_rect(swap + DCP_V14_SWAP_DST(layer), 0, dst_y, width, height);
 		swap[DCP_V14_SWAP_SURF_NULL(layer)] = 0;
 	}
+}
+
+/*
+ * The swap timestamps of a board that asks for them: the constant 120 in
+ * slots 0, 1 and 6, a time that is never in the future. Counter values
+ * (1 GHz on T6031) make the firmware time out on the first swap. Call after
+ * dcp_v14_encode_swap(), which zeroes the record.
+ */
+#define DCP_V14_SWAP_TIMESTAMP_VALUE	120
+
+static inline void dcp_v14_swap_timestamps(u8 *swap)
+{
+	put_unaligned_le64(DCP_V14_SWAP_TIMESTAMP_VALUE, swap + DCP_V14_SWAP_TIMESTAMP(0));
+	put_unaligned_le64(DCP_V14_SWAP_TIMESTAMP_VALUE, swap + DCP_V14_SWAP_TIMESTAMP(1));
+	put_unaligned_le64(DCP_V14_SWAP_TIMESTAMP_VALUE, swap + DCP_V14_SWAP_TIMESTAMP(6));
 }
 
 #endif /* __APPLE_IOMFB_V14_7_SWAP_H__ */

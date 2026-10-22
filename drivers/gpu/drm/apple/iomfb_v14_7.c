@@ -159,6 +159,7 @@ static const struct dcp_v14_board dcp_v14_board_j516c = {
 	.panel_height = 2234,
 	.promotion = true,
 	.log_bringup = true,
+	.swap_timestamps = true,
 };
 
 /*
@@ -1541,6 +1542,11 @@ const char *iomfb_v14_7_board_name(const struct dcp_v14_board *board)
 	return board->name;
 }
 
+bool dcp_v14_board_stamps_swaps(const struct dcp_v14_board *board, bool external)
+{
+	return board && !external && board->swap_timestamps;
+}
+
 int iomfb_v14_7_probe(struct apple_dcp *dcp)
 {
 	struct device *dev = dcp->dev;
@@ -2609,6 +2615,8 @@ static int dcp_v14_swap(struct apple_dcp_v14 *v14, const u8 *surface, u64 iova,
 	if (!ret) {
 		dcp_v14_encode_swap(swap, id, DCP_V14_BLACK, surface, iova, width, height,
 				    dst_y, DCP_V14_LAYER);
+		if (dcp_v14_board_stamps_swaps(v14->board, v14->external))
+			dcp_v14_swap_timestamps(swap);
 		ret = dcp_v14_call_guarded(v14, A(407), swap, DCP_V14_SWAP_SIZE, result, sizeof(result),
 				   id, dcp_v14_swap_admit, &admission);
 		/* The swap status sits at byte 5 of the reply. */
