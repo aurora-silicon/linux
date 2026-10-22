@@ -148,7 +148,7 @@ static struct v14_bl_rpc *v14_bl_rpc_setup(struct kunit *test)
 	dev = drm_kunit_helper_alloc_device(test);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
 	c->drm = __drm_kunit_helper_alloc_drm_device(test, dev, sizeof(*c->drm), 0,
-						   DRIVER_MODESET | DRIVER_GEM);
+						     DRIVER_MODESET | DRIVER_GEM);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, c->drm);
 	init_completion(&c->rpc_entered);
 	init_completion(&c->rpc_release);
@@ -159,7 +159,8 @@ static struct v14_bl_rpc *v14_bl_rpc_setup(struct kunit *test)
 	for (i = 0; i < ARRAY_SIZE(c->fb); i++) {
 		c->fb[i].dev = c->drm;
 		c->fb[i].format = drm_format_info(DRM_FORMAT_XRGB8888);
-		c->fb[i].width = c->fb[i].height = 64;
+		c->fb[i].width = 64;
+		c->fb[i].height = 64;
 		c->fb[i].pitches[0] = 256;
 		drm_gem_private_object_init(c->drm, &c->gem[i].base, PAGE_SIZE);
 		c->gem[i].base.funcs = &v14_bl_gem_funcs;
@@ -169,7 +170,8 @@ static struct v14_bl_rpc *v14_bl_rpc_setup(struct kunit *test)
 		KUNIT_ASSERT_EQ(test, drm_framebuffer_init(c->drm, &c->fb[i], &v14_bl_fb_funcs), 0);
 		c->initialized++;
 	}
-	c->f.v14->panel_width = c->f.v14->panel_height = 64;
+	c->f.v14->panel_width = 64;
+	c->f.v14->panel_height = 64;
 	c->f.dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
 	c->f.dcp->connector_type = DRM_MODE_CONNECTOR_eDP;
 	c->f.dcp->panel.width_mm = 200;
@@ -182,8 +184,8 @@ static struct v14_bl_rpc *v14_bl_rpc_setup(struct kunit *test)
 }
 
 static struct v14_bl_actor *v14_bl_actor_start(struct kunit *test,
-					      struct v14_bl_rpc *c, unsigned int slot,
-					      unsigned int op)
+					       struct v14_bl_rpc *c, unsigned int slot,
+					       unsigned int op)
 {
 	struct v14_bl_actor *a = &c->actors[slot];
 
@@ -200,8 +202,9 @@ static struct v14_bl_actor *v14_bl_actor_start(struct kunit *test,
 }
 
 static struct drm_framebuffer *v14_bl_pause_publication(struct apple_dcp_v14 *v14,
-		struct drm_framebuffer *fb, const u8 *surface, u64 iova,
-		u32 width, u32 height, u32 dst_y)
+							struct drm_framebuffer *fb,
+							const u8 *surface, u64 iova,
+							u32 width, u32 height, u32 dst_y)
 {
 	struct v14_bl_rpc *c = v14_bl_rpc_current;
 
@@ -222,7 +225,8 @@ static void v14_bl_present_publication_serialized(struct kunit *test)
 	first = v14_bl_actor_start(test, c, 0, 0);
 	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&c->rpc_entered, HZ), 0UL);
 	second = v14_bl_actor_start(test, c, 1, 1);
-	KUNIT_EXPECT_EQ(test, wait_for_completion_timeout(&second->done, msecs_to_jiffies(20)), 0UL);
+	KUNIT_EXPECT_EQ(test,
+			wait_for_completion_timeout(&second->done, msecs_to_jiffies(20)), 0UL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&c->submits), 1);
 	complete_all(&c->rpc_release);
 	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&first->done, HZ), 0UL);
@@ -324,7 +328,7 @@ static void v14_bl_registration_unbind_race(struct kunit *test)
 
 	mutex_lock(&c->f.dcp->bl_register_mutex);
 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, v14_bl_mutex_unlock,
-						      &c->f.dcp->bl_register_mutex), 0);
+							&c->f.dcp->bl_register_mutex), 0);
 	KUNIT_EXPECT_TRUE(test, schedule_work(&c->f.dcp->bl_register_wq));
 	deadline = jiffies + HZ;
 	do {

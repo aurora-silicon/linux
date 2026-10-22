@@ -834,7 +834,8 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 
 	bl_dev = devm_backlight_device_register(dev, "apple-panel-bl", dev, dcp,
 						iomfb_v14_7_panel_nits(dcp) ?
-						&dcp_backlight_ops_v14 : &dcp_backlight_ops, &props);
+						&dcp_backlight_ops_v14 : &dcp_backlight_ops,
+						&props);
 	if (IS_ERR(bl_dev))
 		return PTR_ERR(bl_dev);
 

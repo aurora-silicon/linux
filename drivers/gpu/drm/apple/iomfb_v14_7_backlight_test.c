@@ -21,7 +21,6 @@ static void v14_bl_unused_work(struct work_struct *work)
 {
 }
 
-
 static void v14_bl_binary64(struct kunit *test)
 {
 	static const struct {
@@ -140,15 +139,17 @@ static void v14_bl_boards(struct kunit *test)
 	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, t6030_j516s, &known);
 	KUNIT_ASSERT_NOT_NULL(test, board);
 	KUNIT_EXPECT_TRUE(test, board->panel_nits);
-	KUNIT_EXPECT_TRUE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is, t6030_j516s));
+	KUNIT_EXPECT_TRUE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is,
+							 t6030_j516s));
 	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, t6030_j514s, &known);
 	KUNIT_ASSERT_NOT_NULL(test, board);
 	KUNIT_EXPECT_TRUE(test, board->panel_nits);
 	KUNIT_EXPECT_TRUE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is,
-						     t6030_j514s));
+							 t6030_j514s));
 	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, other_t6030, &known);
 	KUNIT_ASSERT_NOT_NULL(test, board);
-	KUNIT_EXPECT_FALSE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is, other_t6030));
+	KUNIT_EXPECT_FALSE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is,
+							  other_t6030));
 	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, j613, &known);
 	KUNIT_ASSERT_NOT_NULL(test, board);
 	KUNIT_EXPECT_FALSE(test, board->panel_nits);
@@ -379,7 +380,7 @@ static void v14_bl_other_boards_untouched(struct kunit *test)
 		iomfb_v14_7_backlight_suspend(f.dcp);
 		KUNIT_EXPECT_EQ(test, f.v14->bl_gate, DCP_V14_BL_OPEN);
 		dcp_v14_configure_backlight(f.dcp);
-		KUNIT_EXPECT_TRUE(test, f.dcp->backlight.kick == NULL);
+		KUNIT_EXPECT_FALSE(test, f.dcp->backlight.kick);
 	}
 }
 

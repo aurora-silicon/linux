@@ -298,6 +298,7 @@ struct apple_dcp_v14 {
 	u64 shown_iova;
 	u32 shown_width, shown_height, shown_dst_y;
 	struct delayed_work backlight_work;
+	/* Serializes gate transitions with queue admission. */
 	spinlock_t bl_gate_lock;
 	enum dcp_v14_bl_gate bl_gate;
 	u32 nits_sent;
@@ -428,6 +429,7 @@ void iomfb_v14_7_backlight_suspend(struct apple_dcp *dcp)
 		dcp_v14_bl_shut(dcp->v14, false);
 }
 
+/* Pending levels ride the next normal CRTC restore present after admission opens. */
 void iomfb_v14_7_backlight_resume(struct apple_dcp *dcp)
 {
 	struct apple_dcp_v14 *v14 = dcp->v14;
@@ -480,7 +482,7 @@ static int dcp_v14_call_guarded(struct apple_dcp_v14 *v14, u32 tag, const void *
 	int ret;
 
 	KUNIT_STATIC_STUB_REDIRECT(dcp_v14_call_guarded, v14, tag, in, in_size,
-				  out, out_size, completion, admit, admit_cookie);
+				   out, out_size, completion, admit, admit_cookie);
 	if (v14->failed)
 		return -EIO;
 	dev_dbg(v14->dev, "call %#x in %u out %u\n", tag, in_size, out_size);
@@ -1684,7 +1686,7 @@ const struct dcp_v14_board *iomfb_v14_7_board(struct device *dev)
 }
 
 static bool dcp_v14_panel_nits_admit(const struct dcp_v14_board *board,
-				    dcp_v14_compat_fn machine_is, const void *ctx)
+				     dcp_v14_compat_fn machine_is, const void *ctx)
 {
 	return board && board->panel_nits &&
 		(machine_is(ctx, "apple,j514s") || machine_is(ctx, "apple,j516s"));
@@ -2789,8 +2791,8 @@ static void dcp_v14_swap_nits_done(struct apple_dcp_v14 *v14,
  * @ctm_state, if set, carries the colour matrix to send first.
  */
 static int dcp_v14_swap_locked(struct apple_dcp_v14 *v14, const u8 *surface, u64 iova,
-			u32 width, u32 height, u32 dst_y,
-			const struct drm_crtc_state *ctm_state)
+			       u32 width, u32 height, u32 dst_y,
+			       const struct drm_crtc_state *ctm_state)
 {
 	struct dcp_v14_swap_admission admission = { .v14 = v14 };
 	__le32 start[4] = {}, started[2] = {}, result[3];
@@ -2849,13 +2851,14 @@ static int dcp_v14_swap_locked(struct apple_dcp_v14 *v14, const u8 *surface, u64
 
 /* Publish a successful swap while the RPC lock still pins both surfaces. */
 static struct drm_framebuffer *dcp_v14_publish_surface(struct apple_dcp_v14 *v14,
-		struct drm_framebuffer *fb, const u8 *surface, u64 iova,
-		u32 width, u32 height, u32 dst_y)
+						       struct drm_framebuffer *fb,
+						       const u8 *surface, u64 iova,
+						       u32 width, u32 height, u32 dst_y)
 {
 	struct drm_framebuffer *old;
 
 	KUNIT_STATIC_STUB_REDIRECT(dcp_v14_publish_surface, v14, fb, surface, iova,
-				  width, height, dst_y);
+				   width, height, dst_y);
 	lockdep_assert_held(&v14->lock);
 	old = v14->active_fb;
 	v14->active_fb = fb;
@@ -2875,9 +2878,9 @@ static struct drm_framebuffer *dcp_v14_publish_surface(struct apple_dcp_v14 *v14
  * and keeps @fb until the next swap.
  */
 static bool dcp_v14_present_locked(struct apple_dcp_v14 *v14, struct drm_framebuffer *fb,
-			    u32 width, u32 height, u32 dst_y,
-			    const struct drm_crtc_state *ctm_state,
-			    struct drm_framebuffer **retired)
+				   u32 width, u32 height, u32 dst_y,
+				   const struct drm_crtc_state *ctm_state,
+				   struct drm_framebuffer **retired)
 {
 	u8 surface[DCP_V14_SURFACE_SIZE];
 	struct drm_framebuffer *old;
@@ -2895,7 +2898,7 @@ static bool dcp_v14_present_locked(struct apple_dcp_v14 *v14, struct drm_framebu
 	}
 	start = ktime_get_ns();
 	ret = dcp_v14_swap_locked(v14, fb ? surface : NULL, iova, fb ? width : 0,
-			   fb ? height : 0, dst_y, ctm_state);
+				  fb ? height : 0, dst_y, ctm_state);
 	elapsed = ktime_get_ns() - start;
 	if (ret && v14->external && !READ_ONCE(v14->failed)) {
 		/* Refused before it was taken: the old framebuffer stays on screen. */
@@ -2966,8 +2969,8 @@ static void dcp_v14_backlight_work(struct work_struct *work)
 	};
 	if (dcp_v14_bl_plan(&facts) != DCP_V14_BL_REPRESENT)
 		return;
-	ret = dcp_v14_swap_locked(v14, v14->shown_surface, v14->shown_iova, v14->shown_width, v14->shown_height,
-			   v14->shown_dst_y, NULL);
+	ret = dcp_v14_swap_locked(v14, v14->shown_surface, v14->shown_iova,
+				  v14->shown_width, v14->shown_height, v14->shown_dst_y, NULL);
 	if (!ret)
 		v14->brightness_presents++;
 	else if (ret != -EAGAIN)
