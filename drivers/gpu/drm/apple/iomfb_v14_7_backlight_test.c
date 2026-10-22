@@ -144,6 +144,8 @@ static void v14_bl_boards(struct kunit *test)
 	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, t6030_j514s, &known);
 	KUNIT_ASSERT_NOT_NULL(test, board);
 	KUNIT_EXPECT_TRUE(test, board->panel_nits);
+	KUNIT_EXPECT_TRUE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is,
+						     t6030_j514s));
 	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, other_t6030, &known);
 	KUNIT_ASSERT_NOT_NULL(test, board);
 	KUNIT_EXPECT_FALSE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is, other_t6030));
@@ -293,6 +295,7 @@ static struct v14_bl_fixture v14_bl_fixture(struct kunit *test,
 	KUNIT_ASSERT_NOT_NULL(test, f.dcp);
 	KUNIT_ASSERT_NOT_NULL(test, f.v14);
 	f.dcp->dev = dev;
+	spin_lock_init(&f.dcp->mode_state.lock);
 	mutex_init(&f.dcp->bl_register_mutex);
 	INIT_WORK(&f.dcp->bl_register_wq, dcp_work_register_backlight);
 	INIT_WORK(&f.dcp->bl_update_wq, v14_bl_unused_work);

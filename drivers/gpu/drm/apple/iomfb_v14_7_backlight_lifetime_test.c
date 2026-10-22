@@ -27,7 +27,7 @@ struct v14_bl_rpc {
 	struct drm_device *drm;
 	struct drm_framebuffer fb[2];
 	struct drm_gem_dma_object gem[2];
-	unsigned int initialized;
+	unsigned int initialized, gems_initialized;
 	struct v14_bl_actor actors[2];
 	struct completion rpc_entered, rpc_release;
 	atomic_t submits;
@@ -113,6 +113,8 @@ static void v14_bl_rpc_cleanup(void *data)
 	}
 	for (i = 0; i < c->initialized; i++)
 		drm_framebuffer_put(&c->fb[i]);
+	for (i = 0; i < c->gems_initialized; i++)
+		drm_gem_object_put(&c->gem[i].base);
 	v14_bl_rpc_current = NULL;
 }
 
@@ -120,6 +122,15 @@ static void v14_bl_fb_destroy(struct drm_framebuffer *fb)
 {
 	drm_framebuffer_cleanup(fb);
 }
+
+static void v14_bl_gem_free(struct drm_gem_object *obj)
+{
+	drm_gem_object_release(obj);
+}
+
+static const struct drm_gem_object_funcs v14_bl_gem_funcs = {
+	.free = v14_bl_gem_free,
+};
 
 static const struct drm_framebuffer_funcs v14_bl_fb_funcs = {
 	.destroy = v14_bl_fb_destroy,
@@ -137,7 +148,7 @@ static struct v14_bl_rpc *v14_bl_rpc_setup(struct kunit *test)
 	dev = drm_kunit_helper_alloc_device(test);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
 	c->drm = __drm_kunit_helper_alloc_drm_device(test, dev, sizeof(*c->drm), 0,
-						   DRIVER_MODESET);
+						   DRIVER_MODESET | DRIVER_GEM);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, c->drm);
 	init_completion(&c->rpc_entered);
 	init_completion(&c->rpc_release);
@@ -150,6 +161,9 @@ static struct v14_bl_rpc *v14_bl_rpc_setup(struct kunit *test)
 		c->fb[i].format = drm_format_info(DRM_FORMAT_XRGB8888);
 		c->fb[i].width = c->fb[i].height = 64;
 		c->fb[i].pitches[0] = 256;
+		drm_gem_private_object_init(c->drm, &c->gem[i].base, PAGE_SIZE);
+		c->gem[i].base.funcs = &v14_bl_gem_funcs;
+		c->gems_initialized++;
 		c->gem[i].dma_addr = 0x100000 + i * 0x10000;
 		c->fb[i].obj[0] = &c->gem[i].base;
 		KUNIT_ASSERT_EQ(test, drm_framebuffer_init(c->drm, &c->fb[i], &v14_bl_fb_funcs), 0);
@@ -158,6 +172,7 @@ static struct v14_bl_rpc *v14_bl_rpc_setup(struct kunit *test)
 	c->f.v14->panel_width = c->f.v14->panel_height = 64;
 	c->f.dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
 	c->f.dcp->connector_type = DRM_MODE_CONNECTOR_eDP;
+	c->f.dcp->panel.width_mm = 200;
 	c->f.dcp->mode_state.valid = true;
 	c->f.dcp->crtc = devm_kzalloc(c->f.dcp->dev, sizeof(*c->f.dcp->crtc), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, c->f.dcp->crtc);
