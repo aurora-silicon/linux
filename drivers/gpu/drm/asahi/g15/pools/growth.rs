@@ -62,6 +62,10 @@ pub(crate) const RESERVE_BLOCKS: u32 = CHUNK_BLOCKS;
 /// Chunks of the whole heap.
 pub(crate) const MAX_CHUNKS: u32 = MAX_BLOCKS / CHUNK_BLOCKS;
 
+/// The idle time before a re-initialization past half the maximum (a client boundary, not a
+/// gap between one client's renders).
+pub(crate) const DRAIN_IDLE_NS: u64 = 50_000_000;
+
 /// The answer to an admitted growth request.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Answer {
@@ -158,6 +162,31 @@ impl Ledger {
     /// re-initialization posts the same blocks again).
     pub(crate) const fn reclaim_due(&self, floor: u32, idle_ns: u64, min_idle_ns: u64) -> bool {
         self.posted > self.initial && self.posted > floor && idle_ns >= min_idle_ns
+    }
+
+    /// Whether the backing is to be freed: idle for `idle_ns` with more chunks backed than the
+    /// posted blocks and the reserve need. A client-boundary re-initialization keeps the
+    /// backing of a heavy scene; if the next client posts below the reclaim floor, this frees it.
+    pub(crate) const fn free_due(&self, idle_ns: u64, min_idle_ns: u64) -> bool {
+        idle_ns >= min_idle_ns && self.backed > Self::chunks_for(self.posted) * CHUNK_BLOCKS
+    }
+
+    /// While a reclaim's re-initialization is pending (the posted count returns to the initial
+    /// size at the next render): whether the backing above [`Self::keep_chunks`] is to be
+    /// freed, idle for `min_idle_ns`. A client-boundary re-initialization keeps the backing;
+    /// with no render after it, this frees it.
+    pub(crate) const fn pending_free_due(&self, idle_ns: u64, min_idle_ns: u64) -> bool {
+        idle_ns >= min_idle_ns && self.backed > self.keep_chunks() * CHUNK_BLOCKS
+    }
+
+    /// Whether a short idle re-initializes the heap: more than half the maximum posted and
+    /// idle for [`DRAIN_IDLE_NS`]. Back-to-back heavy scenes (a new client every few hundred
+    /// ms) never reach `g15_pb_idle_ms`, and posted blocks never come back while a PB lives, so
+    /// without this they run the heap to the maximum. A re-initialization with no idle time
+    /// faulted at the heap base (at a client switch, the second in a row with no recovery
+    /// between); with 50 ms of idle none did, also between two renders of one client.
+    pub(crate) const fn drain_reinit_due(&self, idle_ns: u64) -> bool {
+        self.posted > self.initial && self.posted > self.max / 2 && idle_ns >= DRAIN_IDLE_NS
     }
 
     /// Whether the refusals at the maximum are used up: further requests go unanswered.
@@ -573,6 +602,77 @@ mod tests {
         );
     }
 
+    /// Heavy scenes of ~1420 blocks each, new clients back to
+    /// back. The engine re-initializes at a client boundary once past half the maximum, so the
+    /// heap never reaches it; the backing stays (no refill on the next scene).
+    #[test]
+    fn back_to_back_heavy_scenes() {
+        let mut l = Ledger::new(true, 64, 4095);
+        l.unback_to(l.keep_chunks());
+        assert!(!l.drain_reinit_due(DRAIN_IDLE_NS));
+        let mut counter = 0;
+        for _ in 0..10 {
+            if l.drain_reinit_due(DRAIN_IDLE_NS) {
+                l.reinit();
+                counter = l.next_request;
+            }
+            let start = l.posted;
+            while l.posted < start + 1420 {
+                while l.refill_due() {
+                    l.back_chunk();
+                }
+                match l.accept(&request(1, counter, 0)) {
+                    Answer::Grant { count, .. } => {
+                        l.post(count);
+                    }
+                    other => panic!("{other:?} at {}", l.posted),
+                }
+                counter += 1;
+            }
+            assert!(l.posted < l.max);
+        }
+        assert!(l.drain_reinit_due(DRAIN_IDLE_NS));
+        assert_eq!(l.backed, 24 * CHUNK_BLOCKS);
+        l.posted = 2047;
+        assert!(!l.drain_reinit_due(DRAIN_IDLE_NS));
+        l.posted = 2048;
+        assert!(l.drain_reinit_due(DRAIN_IDLE_NS));
+        // Not between two renders of one client.
+        assert!(!l.drain_reinit_due(DRAIN_IDLE_NS - 1));
+        assert!(!l.drain_reinit_due(0));
+        // An initial posting above half the maximum: nothing grew, nothing to drain.
+        let l = Ledger::new(true, 3000, 4095);
+        assert!(
+            !l.drain_reinit_due(DRAIN_IDLE_NS),
+            "drain with nothing grown"
+        );
+    }
+
+    /// A client-boundary re-initialization keeps the backing
+    /// of a heavy scene, the next client posts little; once idle, the backing above what the
+    /// posted blocks need is due to be freed although the posted count is below the floor.
+    #[test]
+    fn kept_backing_freed_at_idle() {
+        let s = 1_000_000_000;
+        let mut l = Ledger::new(true, 64, 4095);
+        l.unback_to(23);
+        l.posted = 2800;
+        assert!(!l.free_due(5 * s, s));
+        l.reinit();
+        l.posted = 264;
+        assert!(!l.reclaim_due(1024, 5 * s, s));
+        assert!(!l.free_due(s - 1, s));
+        assert!(l.free_due(s, s));
+        // After the re-initialization and the free, nothing more is due.
+        l.reinit();
+        l.unback_to(l.keep_chunks());
+        assert!(!l.free_due(5 * s, s));
+        // A heap backed for what it posts plus the reserve is not freed.
+        l.posted = 1000;
+        l.unback_to(Ledger::chunks_for(1000));
+        assert!(!l.free_due(5 * s, s));
+    }
+
     /// A heavy scene, a reclaim that frees the backing, refills during the next heavy scene,
     /// an idle gap with a small job in it, and the next render must reclaim again.
     #[test]
@@ -620,6 +720,21 @@ mod tests {
         let t = 116 * s;
         assert_eq!(clock.idle_ns(t), 5 * s);
         assert!(l.reclaim_due(floor, clock.idle_ns(t), min_idle));
+    }
+
+    /// A client-boundary re-initialization with 23 chunks backed and no render after it: the
+    /// kept backing is due to be freed after the long idle, and once freed nothing more is due.
+    #[test]
+    fn pending_reinit_frees_kept_backing() {
+        let s = 1_000_000_000;
+        let mut l = Ledger::new(true, 64, 4095);
+        l.unback_to(23);
+        l.posted = 2800;
+        assert!(l.drain_reinit_due(DRAIN_IDLE_NS));
+        assert!(!l.pending_free_due(s - 1, s));
+        assert!(l.pending_free_due(s, s));
+        l.unback_to(l.keep_chunks());
+        assert!(!l.pending_free_due(100 * s, s));
     }
 
     #[test]

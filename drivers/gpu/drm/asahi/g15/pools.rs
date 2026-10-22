@@ -26,7 +26,10 @@
 //!   it), so an engine idle for `g15_pb_idle_ms` with more than `g15_pb_reclaim_blocks` posted
 //!   re-initializes the PB at its next render through the re-initialization path of a recovered
 //!   abort (fresh lists and manager, InitBM of the initial blocks, no halt) and frees the backing
-//!   above the kept chunks.
+//!   above the kept chunks (also with fewer posted, when more is backed than they need); an
+//!   engine idle for 50 ms (a client boundary) with more than half the maximum posted
+//!   re-initializes it the same way but keeps the backing; if no render follows, with
+//!   `g15_pb_reclaim` 2 the backing above the kept chunks is freed after `g15_pb_idle_ms`.
 //! - Growth: the event drain queues type-7 requests; [`Firmware::answer_growth`] answers each
 //!   one in the poll pass: type 7, PB slot 0, the context of a live published render prefix,
 //!   counter >= next expected, epoch == current halt count; write records `(G - 0x1000000000)
@@ -196,6 +199,9 @@ pub(crate) struct Pools {
     exhausted_logged: bool,
     /// The engine's idle clock (nothing published, nothing pending), for the reclaim.
     idle: IdleClock,
+    /// The pending re-initialization was set by a reclaim ([`Firmware::reclaim_check`]), not by
+    /// a recovery; cleared by [`Self::init`].
+    reclaim_pending: bool,
     pub(crate) stats: PbStats,
 }
 
@@ -415,6 +421,7 @@ impl Pools {
             c1_written: false,
             exhausted_logged: false,
             idle: IdleClock::default(),
+            reclaim_pending: false,
             stats: PbStats::default(),
         })
     }
@@ -476,6 +483,7 @@ impl Pools {
         // capacity.
         self.ledger.reinit();
         self.exhausted_logged = false;
+        self.reclaim_pending = false;
         if tuning::PB_GROW {
             // C1 names the initial pages again.
             self.c1_written = false;
@@ -693,19 +701,24 @@ impl Firmware {
     }
 
     /// Reclaims the PB when the engine has been idle for `g15_pb_idle_ms` with more than
-    /// `g15_pb_reclaim_blocks` posted: the next render prefix re-initializes the render
-    /// allocators and the PB (InitBM of the initial blocks; `recovery.reinit`, as after a
-    /// recovered abort but with no halt), and with `g15_pb_reclaim` 2 the backing chunks above
-    /// those of the initial posting and the reserve are freed now, unmapped from every VM of the
-    /// registry (a VM that publishes later drops its stale mappings at [`VmState::map_heap`]).
-    /// Called under the device lock when a job arrives at an idle engine and in idle poll
-    /// passes.
+    /// `g15_pb_reclaim_blocks` posted or more backing than the posted blocks need, or for
+    /// [`growth::DRAIN_IDLE_NS`] with more than half the maximum posted
+    /// ([`growth::Ledger::drain_reinit_due`]; re-initialization only): the next render prefix
+    /// re-initializes the render allocators and the PB (InitBM of the initial blocks;
+    /// `recovery.reinit`, as after a recovered abort but with no halt), and with
+    /// `g15_pb_reclaim` 2 the backing chunks above those of the initial posting and the reserve
+    /// are freed now, unmapped from every VM of the registry (a VM that publishes later drops
+    /// its stale mappings at [`VmState::map_heap`]). While a reclaim's re-initialization is
+    /// pending (a client-boundary one kept the backing), `g15_pb_reclaim` 2 frees the backing
+    /// above those chunks once the engine has been idle for `g15_pb_idle_ms`
+    /// ([`growth::Ledger::pending_free_due`]). Called under the device lock when a job arrives
+    /// at an idle engine and in idle poll passes.
     pub(crate) fn reclaim_check(&mut self) {
         let level = super::params::pb_reclaim();
         if level == 0
             || !self.engine.flights.is_empty()
             || !self.engine.pending.is_empty()
-            || self.recovery.reinit
+            || (self.recovery.reinit && !self.pools.reclaim_pending)
             || self.recovery.armed.is_some()
             || self.engine.frozen
             || self.recovery.failed().is_some()
@@ -714,18 +727,35 @@ impl Firmware {
         }
         let idle_ns = self.pools.idle.idle_ns(super::engine::now_ns());
         let floor = super::params::pb_reclaim_blocks();
-        if !self
-            .pools
-            .ledger
-            .reclaim_due(floor, idle_ns, super::params::pb_idle_ns())
-        {
+        let min_idle = super::params::pb_idle_ns();
+        let ledger = &self.pools.ledger;
+        if self.recovery.reinit {
+            if level >= 2 && ledger.pending_free_due(idle_ns, min_idle) {
+                let posted = ledger.posted;
+                let freed = self.free_backing();
+                dev_info!(
+                    self.dev(),
+                    "PB heap: idle {} ms with {} blocks posted and the re-initialization pending: {} chunks freed, {} backed\n",
+                    idle_ns / 1_000_000,
+                    posted,
+                    freed,
+                    self.pools.chunks.len()
+                );
+            }
+            return;
+        }
+        let idle = ledger.reclaim_due(floor, idle_ns, min_idle)
+            || (level >= 2 && ledger.free_due(idle_ns, min_idle));
+        if !idle && !ledger.drain_reinit_due(idle_ns) {
             return;
         }
         self.recovery.reinit = true;
+        self.pools.reclaim_pending = true;
         self.pools.stats.reclaims += 1;
         let posted = self.pools.ledger.posted;
         let mut freed = 0;
-        if level >= 2 {
+        // A short idle keeps the backing: the next scene would allocate it again.
+        if level >= 2 && idle {
             freed = self.free_backing();
         }
         dev_info!(
