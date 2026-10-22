@@ -3,11 +3,13 @@
 //! Stream admission gates (safety nets for userspace encoders).
 //!
 //! VDM: the root stream's first word is 0x21000960. CDM walk from `cdm_ctrl_stream_base` through
-//! links until TERMINATE (0x40000000), at most 8192 records and 64 links (a longer or cyclic
-//! stream is rejected): barriers 0x60000160, 0x60001560, 0x600215fe, 0x600201fe;
+//! links until TERMINATE (0x40000000), at most 64 links and [`CDM_MAX_BYTES`] of records (a
+//! longer or cyclic stream is rejected): barriers 0x60000160, 0x60001560, 0x600215fe, 0x600201fe;
 //! link 0x2000XXXX; direct launch (40 B, the G15 layout), indirect launches 36 B
 //! (`w0 & 0xff7fffff == 0x08080000`) and 24 B (0x10080000); every program VA inside the queue's
-//! 4 GiB USC window, 64-aligned, first 64 bytes readable. Client memory is read through the VM's
+//! 4 GiB USC window, 64-aligned, first 64 bytes readable; an indirect launch's 12 argument bytes
+//! readable. A program or argument page found good is not checked again in the same walk, and a
+//! walk checks at most [`CDM_MAX_PAGE_CHECKS`] pages. Client memory is read through the VM's
 //! page tables with a point-of-coherency clean+invalidate of the lines ([`mmu::Vm::read_user`]:
 //! the GPU may have written it). `g15_stream_gate=0` disables both gates (encoder bring-up only).
 
@@ -24,8 +26,19 @@ const CDM_LINK: u32 = 0x20000000;
 const CDM_DIRECT: u32 = 0x00080000;
 const CDM_INDIRECT_SIZES: u32 = 0x08080000;
 const CDM_INDIRECT: u32 = 0x10080000;
-const CDM_MAX_RECORDS: u32 = 8192;
 const CDM_MAX_LINKS: u32 = 64;
+/// The stream block the encoder links to when one fills (Mesa's 64 KiB control-stream blocks).
+const CDM_BLOCK_BYTES: u64 = 0x10000;
+/// Stream bytes walked at most: the root block and one block per admitted link. A stream of
+/// that size holds every record the encoder can write before the link budget (a record count
+/// does not: the 1024 tessellated draws of one multi-draw write more than 8192).
+const CDM_MAX_BYTES: u64 = (CDM_MAX_LINKS as u64 + 1) * CDM_BLOCK_BYTES;
+/// Page checks (a program's or an indirect launch's arguments, each under the VM lock) a walk
+/// makes at most. The last page found good is not checked again, but the encoder's indirect
+/// arguments move to a new page every few launches: a stream at the link budget makes about
+/// 8100. Twice that leaves room; without a bound, a stream of distinct pages would make one per
+/// 24-byte launch, about 177000 in the byte budget.
+const CDM_MAX_PAGE_CHECKS: u32 = 16384;
 /// Rejections logged per boot.
 const MAX_REPORTS: u32 = 32;
 
@@ -86,19 +99,52 @@ impl Window {
     }
 }
 
+/// The pages a walk has found good and the page checks it has made.
+struct Checked {
+    program: Option<u64>,
+    args: Option<u64>,
+    count: u32,
+}
+
+/// One page check of `[start, end)` under the walk's page budget: ENOSPC once the budget is
+/// spent.
+fn check(vm: &mmu::Vm, start: u64, end: u64, count: &mut u32) -> Result {
+    if *count >= CDM_MAX_PAGE_CHECKS {
+        return Err(ENOSPC);
+    }
+    *count += 1;
+    cover(vm, start, end, true, false)
+}
+
 /// A launch's program: inside the queue's 4 GiB USC window, 64-aligned, first block readable.
-/// `checked` caches the last proven program page.
-fn program(vm: &mmu::Vm, usc: u64, address: u64, checked: &mut Option<u64>) -> Result {
+/// The last proven program page is not checked again.
+fn program(vm: &mmu::Vm, usc: u64, address: u64, checked: &mut Checked) -> Result {
     if address < usc || address - usc >= USC_WINDOW || address & 63 != 0 {
         return Err(EINVAL);
     }
     // 64-aligned: the block never crosses its page.
     let page = address & !(mmu::UAT_PGMSK as u64);
-    if *checked == Some(page) {
+    if checked.program == Some(page) {
         return Ok(());
     }
-    cover(vm, address, address + 64, true, false)?;
-    *checked = Some(page);
+    check(vm, address, address + 64, &mut checked.count)?;
+    checked.program = Some(page);
+    Ok(())
+}
+
+/// An indirect launch's 12 argument bytes: readable. The last proven argument page is not
+/// checked again; arguments that cross a page are checked each time.
+fn arguments(vm: &mmu::Vm, address: u64, checked: &mut Checked) -> Result {
+    let end = address.checked_add(12).ok_or(EINVAL)?;
+    let page = address & !(mmu::UAT_PGMSK as u64);
+    let within = (end - 1) & !(mmu::UAT_PGMSK as u64) == page;
+    if within && checked.args == Some(page) {
+        return Ok(());
+    }
+    check(vm, address, end, &mut checked.count)?;
+    if within {
+        checked.args = Some(page);
+    }
     Ok(())
 }
 
@@ -128,15 +174,19 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64) -> Result {
         len: 0,
         bytes: [0; 256],
     };
-    let mut checked = None;
+    let mut checked = Checked {
+        program: None,
+        args: None,
+        count: 0,
+    };
     let mut va = base;
     let mut links = 0;
-    let mut records = 0;
-    while records < CDM_MAX_RECORDS {
-        records += 1;
+    let mut walked = 0;
+    while walked < CDM_MAX_BYTES {
         let w = window.words(vm, va, 1)?;
         if CDM_BARRIERS.contains(&w[0]) {
             va += 4;
+            walked += 4;
             continue;
         }
         if w[0] == CDM_TERMINATE {
@@ -152,6 +202,7 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64) -> Result {
             if va & 3 != 0 {
                 return Err(reject("CDM link", va, &w));
             }
+            walked += 8;
             continue;
         }
         if w[0] == CDM_DIRECT {
@@ -162,9 +213,13 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64) -> Result {
             }
             match program(vm, usc, address, &mut checked) {
                 Err(error) if error == EINVAL => return Err(reject("CDM program", va, &w)),
+                Err(error) if error == ENOSPC => {
+                    return Err(reject("CDM page check budget", va, &w))
+                }
                 result => result?,
             }
             va += 40;
+            walked += 40;
             continue;
         }
         let kind = w[0] & 0xff7fffff;
@@ -182,15 +237,20 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64) -> Result {
                 return Err(reject("CDM indirect launch", va, &w));
             }
             let result = program(vm, usc, address, &mut checked)
-                .and_then(|()| cover(vm, indirect, indirect + 12, true, false));
+                .and_then(|()| arguments(vm, indirect, &mut checked));
             match result {
                 Err(error) if error == EINVAL => return Err(reject("CDM indirect", va, &w)),
+                Err(error) if error == ENOSPC => {
+                    return Err(reject("CDM page check budget", va, &w))
+                }
                 result => result?,
             }
-            va += if sizes { 36 } else { 24 };
+            let size = if sizes { 36 } else { 24 };
+            va += size;
+            walked += size;
             continue;
         }
         return Err(reject("CDM", va, &w));
     }
-    Err(reject("CDM record budget", va, &[]))
+    Err(reject("CDM byte budget", va, &[]))
 }
