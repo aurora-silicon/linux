@@ -23,7 +23,7 @@ use kernel::{
         hrtimer::{
             HrTimerCallback, HrTimerCallbackContext, HrTimerPointer, HrTimerRestart, RelativeMode,
         },
-        Delta, Jiffies, Monotonic,
+        msecs_to_jiffies, Delta, Jiffies, Monotonic,
     },
     workqueue::RawWorkItem,
 };
@@ -85,7 +85,15 @@ impl Shared {
                 let evented = self.evented.swap(false, Ordering::AcqRel);
                 match firmware.poll(evented, &mut done) {
                     Ok(true) => self.rearm(firmware.engine.chan_wait),
-                    Ok(false) => {}
+                    // Idle: nothing polls until new work arrives, so a PB reclaim that comes
+                    // due with more idle time gets one more pass then. A job's arrival brings
+                    // the poll work forward (`rearm`), which replaces this expiry.
+                    Ok(false) => {
+                        if let Some(ns) = firmware.reclaim_delay_ns() {
+                            let ms = ns.div_ceil(1_000_000).min(u32::MAX as u64) as u32;
+                            self.mod_poll(msecs_to_jiffies(ms) + 1);
+                        }
+                    }
                     Err(error) => self.fail_stop(error),
                 }
             }

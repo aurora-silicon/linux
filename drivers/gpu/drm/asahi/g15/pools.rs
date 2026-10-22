@@ -871,6 +871,37 @@ impl Firmware {
         Ok(())
     }
 
+    /// How long the idle engine must stay idle before [`Self::reclaim_check`] acts, if it can
+    /// act without new work ([`growth::Ledger::reclaim_delay`], or with a reclaim's
+    /// re-initialization pending [`growth::Ledger::pending_free_delay`]); `None` while busy,
+    /// while a recovery or its re-initialization is pending, or when nothing would become due.
+    /// An idle engine runs no poll pass by itself, so the poll work is armed for this delay.
+    pub(crate) fn reclaim_delay_ns(&self) -> Option<u64> {
+        if !self.engine.flights.is_empty()
+            || !self.engine.pending.is_empty()
+            || (self.recovery.reinit && !self.pools.reclaim_pending)
+            || self.recovery.armed.is_some()
+            || self.engine.frozen
+            || self.recovery.failed().is_some()
+        {
+            return None;
+        }
+        let idle_ns = self.pools.idle.idle_ns(super::engine::now_ns());
+        if self.recovery.reinit {
+            return self.pools.ledger.pending_free_delay(
+                super::params::pb_reclaim(),
+                idle_ns,
+                super::params::pb_idle_ns(),
+            );
+        }
+        self.pools.ledger.reclaim_delay(
+            super::params::pb_reclaim(),
+            super::params::pb_reclaim_blocks(),
+            idle_ns,
+            super::params::pb_idle_ns(),
+        )
+    }
+
     /// Processes one growth request: `Ok(false)` when it waits for backing.
     fn answer_request(&mut self, request: &[u32; 14]) -> Result<bool> {
         let ctl = self.init.control.clone().ok_or(ENODEV)?;

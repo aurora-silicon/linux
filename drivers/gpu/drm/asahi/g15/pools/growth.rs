@@ -179,6 +179,22 @@ impl Ledger {
         idle_ns >= min_idle_ns && self.backed > self.keep_chunks() * CHUNK_BLOCKS
     }
 
+    /// How much longer the engine must stay idle, from `idle_ns`, before
+    /// [`Self::pending_free_due`] with `level`; `None` when it cannot become due (level below
+    /// 2, or nothing above the kept chunks). 0 when it is due now.
+    pub(crate) const fn pending_free_delay(
+        &self,
+        level: u32,
+        idle_ns: u64,
+        min_idle_ns: u64,
+    ) -> Option<u64> {
+        if level >= 2 && self.backed > self.keep_chunks() * CHUNK_BLOCKS {
+            Some(min_idle_ns.saturating_sub(idle_ns))
+        } else {
+            None
+        }
+    }
+
     /// Whether a short idle re-initializes the heap: more than half the maximum posted and
     /// idle for [`DRAIN_IDLE_NS`]. Back-to-back heavy scenes (a new client every few hundred
     /// ms) never reach `g15_pb_idle_ms`, and posted blocks never come back while a PB lives, so
@@ -187,6 +203,36 @@ impl Ledger {
     /// between); with 50 ms of idle none did, also between two renders of one client.
     pub(crate) const fn drain_reinit_due(&self, idle_ns: u64) -> bool {
         self.posted > self.initial && self.posted > self.max / 2 && idle_ns >= DRAIN_IDLE_NS
+    }
+
+    /// How much longer the engine must stay idle, from `idle_ns`, before a reclaim with
+    /// `level` is due ([`Self::reclaim_due`] with `floor` and `min_idle_ns`, [`Self::free_due`]
+    /// at level 2, or [`Self::drain_reinit_due`]); `None` when none can become due while the
+    /// ledger stays as it is. 0 when one is due now.
+    pub(crate) const fn reclaim_delay(
+        &self,
+        level: u32,
+        floor: u32,
+        idle_ns: u64,
+        min_idle_ns: u64,
+    ) -> Option<u64> {
+        if level == 0 {
+            return None;
+        }
+        let grown = self.posted > self.initial;
+        let mut due = u64::MAX;
+        if grown && self.posted > self.max / 2 {
+            due = DRAIN_IDLE_NS;
+        }
+        let free = level >= 2 && self.backed > Self::chunks_for(self.posted) * CHUNK_BLOCKS;
+        if ((grown && self.posted > floor) || free) && min_idle_ns < due {
+            due = min_idle_ns;
+        }
+        if due == u64::MAX {
+            None
+        } else {
+            Some(due.saturating_sub(idle_ns))
+        }
     }
 
     /// Whether the refusals at the maximum are used up: further requests go unanswered.
@@ -722,8 +768,84 @@ mod tests {
         assert!(l.reclaim_due(floor, clock.idle_ns(t), min_idle));
     }
 
+    /// The delay names exactly the idle time at which the reclaim check first acts: nothing is
+    /// due one nanosecond before it, something is due at it, and nothing ever becomes due
+    /// when it is `None`.
+    #[test]
+    fn reclaim_delay_matches_the_checks() {
+        let s = 1_000_000_000;
+        let due = |l: &Ledger, level: u32, floor: u32, idle: u64, min_idle: u64| {
+            level != 0
+                && (l.reclaim_due(floor, idle, min_idle)
+                    || (level >= 2 && l.free_due(idle, min_idle))
+                    || l.drain_reinit_due(idle))
+        };
+        for level in 0..=2 {
+            for floor in [0, 64, 1024, 4095] {
+                for min_idle in [DRAIN_IDLE_NS / 2, 100_000_000, s] {
+                    for posted in [64, 200, 1024, 1025, 2047, 2048, 2900, 4095] {
+                        for chunks in [2, 3, 9, 23, MAX_CHUNKS] {
+                            let mut l = Ledger::new(true, 64, 4095);
+                            l.unback_to(chunks);
+                            l.posted = posted;
+                            match l.reclaim_delay(level, floor, 0, min_idle) {
+                                None => {
+                                    for idle in [0, DRAIN_IDLE_NS, min_idle, 100 * s] {
+                                        assert!(!due(&l, level, floor, idle, min_idle));
+                                    }
+                                }
+                                Some(d) => {
+                                    assert!(due(&l, level, floor, d, min_idle));
+                                    assert!(d == 0 || !due(&l, level, floor, d - 1, min_idle));
+                                    // Counted from an idle already begun.
+                                    assert_eq!(
+                                        l.reclaim_delay(level, floor, d / 2, min_idle),
+                                        Some(d - d / 2)
+                                    );
+                                    assert_eq!(
+                                        l.reclaim_delay(level, floor, d + s, min_idle),
+                                        Some(0)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // The case of the J516C run: a client-boundary re-initialization left 23 chunks for
+        // 264 posted blocks; the free is due after g15_pb_idle_ms of idle.
+        let mut l = Ledger::new(true, 64, 4095);
+        l.unback_to(23);
+        l.posted = 264;
+        assert_eq!(l.reclaim_delay(2, 1024, 0, s), Some(s));
+        assert_eq!(l.reclaim_delay(1, 1024, 0, s), None);
+        assert_eq!(l.reclaim_delay(0, 1024, 0, s), None);
+        // A desktop at the initial posting with the kept chunks: nothing to wait for.
+        l.unback_to(l.keep_chunks());
+        l.posted = 64;
+        assert_eq!(l.reclaim_delay(2, 1024, 0, s), None);
+        // Nothing grown, with an initial posting above half the maximum or above the floor:
+        // nothing armed.
+        let mut l = Ledger::new(true, 3000, 4095);
+        l.unback_to(Ledger::chunks_for(3000));
+        assert_eq!(
+            l.reclaim_delay(2, 1024, 0, s),
+            None,
+            "armed with nothing grown"
+        );
+        let mut l = Ledger::new(true, 64, 4095);
+        l.unback_to(l.keep_chunks());
+        assert_eq!(
+            l.reclaim_delay(2, 32, 0, s),
+            None,
+            "armed with nothing grown"
+        );
+    }
+
     /// A client-boundary re-initialization with 23 chunks backed and no render after it: the
-    /// kept backing is due to be freed after the long idle, and once freed nothing more is due.
+    /// kept backing is due to be freed after the long idle, measured from the start of the idle,
+    /// and once freed nothing more is due.
     #[test]
     fn pending_reinit_frees_kept_backing() {
         let s = 1_000_000_000;
@@ -731,10 +853,19 @@ mod tests {
         l.unback_to(23);
         l.posted = 2800;
         assert!(l.drain_reinit_due(DRAIN_IDLE_NS));
+        // The poll after the 50 ms re-initialization waits for the rest of the long idle.
+        assert_eq!(
+            l.pending_free_delay(2, DRAIN_IDLE_NS, s),
+            Some(s - DRAIN_IDLE_NS)
+        );
         assert!(!l.pending_free_due(s - 1, s));
         assert!(l.pending_free_due(s, s));
+        assert_eq!(l.pending_free_delay(2, s + 1, s), Some(0));
+        assert_eq!(l.pending_free_delay(1, 0, s), None);
+        assert_eq!(l.pending_free_delay(0, 0, s), None);
         l.unback_to(l.keep_chunks());
         assert!(!l.pending_free_due(100 * s, s));
+        assert_eq!(l.pending_free_delay(2, 0, s), None);
     }
 
     #[test]
