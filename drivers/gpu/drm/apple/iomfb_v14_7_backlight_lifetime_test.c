@@ -263,6 +263,9 @@ static void v14_bl_running_work_suspend(struct kunit *test)
 	v14_bl_request(test, c->f.dcp, 250);
 	dcp_v14_backlight_kick(c->f.dcp);
 	KUNIT_EXPECT_FALSE(test, work_busy(&c->f.v14->backlight_work.work));
+	/* A callback queued before the gate shut must also refuse the pending level. */
+	dcp_v14_backlight_work(&c->f.v14->backlight_work.work);
+	KUNIT_EXPECT_EQ(test, atomic_read(&c->submits), 1);
 }
 
 /* Actual dcp_poweroff/on must reach the 14.7 blank/restore hooks. */
