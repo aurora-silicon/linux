@@ -232,7 +232,14 @@ impl gpu::Gpu for Backend {
         value as u32
     }
     fn uat_geometry(&self) -> mmu::UatGeometry { mmu::UatGeometry { ias: 42, oas: 42 } }
-    fn user_range(&self) -> Range<u64> { mmu::UAT_PGSZ as u64..0x2ff_ffff_8000 }
+    fn user_range(&self) -> Range<u64> {
+        mmu::UAT_PGSZ as u64..crate::m3::initdata::RUNTIME_UNKNOWN_PAGE
+    }
+    /// The dummy page sits where InitData tells the firmware it is (unk_30), as on 7.1.12; the
+    /// 42-bit geometry's own unk_page() is a different address.
+    fn unknown_page(&self) -> u64 {
+        crate::m3::initdata::RUNTIME_UNKNOWN_PAGE
+    }
     fn tracked_submission(&self) -> bool { true }
     /// Only M3-aware userspace may create a VM (7.1.12's per-file client gate).
     fn admit_vm(&self, dev: &kernel::device::Device, params_size: u64, flags: u32) -> Result {

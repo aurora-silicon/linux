@@ -122,7 +122,7 @@ impl G15Options {
 /// Start of the USC (shader code) window in the runtime backend's GPU VA layout.
 const RUNTIME_USC_BASE: u64 = 0x10_0000_0000;
 /// The runtime backend's unknown-page address, the end of its 42-bit user VA range.
-const RUNTIME_UNKNOWN_PAGE: u64 = 0x2ff_ffff_8000;
+pub(crate) const RUNTIME_UNKNOWN_PAGE: u64 = 0x2ff_ffff_8000;
 
 /// Maximum number of entries of a firmware performance-state table, including the off state.
 const PSTATE_TABLE_ENTRIES: usize = 16;

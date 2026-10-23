@@ -549,7 +549,7 @@ impl File {
         }
         let dummy_mapping = dummy_obj.map_at(
             &vm,
-            gpu.uat_geometry().unk_page(),
+            gpu.unknown_page(),
             mmu::PROT_GPU_SHARED_RW,
             true,
         )?;
