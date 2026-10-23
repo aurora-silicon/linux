@@ -16,6 +16,7 @@
 
 struct cen_buffer {
 	struct list_head list;
+	struct device *dev;
 	void *cpu;
 	dma_addr_t dma;
 	size_t size;
@@ -34,22 +35,35 @@ struct centauri_ipc {
 	struct cen_context control, alpha;
 	struct cen_buffer *secondary, *window, *cchi_rx, *cchi_tx, *debug_rx;
 	struct cen_buffer *alpha_log;
+	struct cen_buffer *msi[3];
 	u16 cchi_head, cchi_tail;
 };
 
-static struct cen_buffer *buffer_alloc(struct centauri *c, size_t size)
+/* Each function has its own IOMMU stream on the J873 (RID2SID entries 1, 2, 3 and separate DART
+ * domains), so a buffer a function's firmware reads or writes has to be mapped through that
+ * function's own struct device. Function 0 is the Control firmware, 1 Alpha (Wi-Fi), 2 Beta.
+ */
+static struct cen_buffer *buffer_alloc(struct centauri *c, unsigned int function, size_t size)
 {
 	struct cen_buffer *buffer = kzalloc(sizeof(*buffer), GFP_KERNEL);
+	struct pci_dev *owner = function ? c->ipc->function[function] : c->pdev;
 
 	if (!buffer)
 		return NULL;
+	if (!owner) {
+		kfree(buffer);
+		return NULL;
+	}
+	buffer->dev = &owner->dev;
 	buffer->size = PAGE_ALIGN(size);
-	buffer->cpu = dma_alloc_coherent(&c->pdev->dev, buffer->size, &buffer->dma, GFP_KERNEL);
+	buffer->cpu = dma_alloc_coherent(buffer->dev, buffer->size, &buffer->dma, GFP_KERNEL);
 	if (!buffer->cpu) {
 		kfree(buffer);
 		return NULL;
 	}
 	memset(buffer->cpu, 0, buffer->size);
+	dev_dbg(&c->pdev->dev, "dma buffer fn%u %#llx..%#llx (%zu bytes)\n", function,
+		(u64)buffer->dma, (u64)buffer->dma + buffer->size, buffer->size);
 	list_add_tail(&buffer->list, &c->ipc->buffers);
 	return buffer;
 }
@@ -139,7 +153,7 @@ static int secondary_init(struct centauri *c)
 			return -EINVAL;
 		required = max_t(u32, required, end);
 	}
-	c->ipc->secondary = buffer_alloc(c, required);
+	c->ipc->secondary = buffer_alloc(c, 0, required);
 	if (!c->ipc->secondary)
 		return -ENOMEM;
 	memcpy(c->ipc->secondary->cpu, seed, length);
@@ -152,15 +166,15 @@ static int secondary_init(struct centauri *c)
 	return 0;
 }
 
-static int context_init(struct centauri *c, struct cen_context *ctx,
+static int context_init(struct centauri *c, unsigned int function, struct cen_context *ctx,
 			u16 tr, u16 cr, dma_addr_t scratch, size_t scratch_size)
 {
 	u8 *header;
 	dma_addr_t dma;
 	int i;
 
-	ctx->buffer = buffer_alloc(c, SZ_32K);
-	ctx->messages = buffer_alloc(c, SZ_16K);
+	ctx->buffer = buffer_alloc(c, function, SZ_32K);
+	ctx->messages = buffer_alloc(c, function, SZ_16K);
 	if (!ctx->buffer || !ctx->messages)
 		return -ENOMEM;
 	ctx->tr_count = tr;
@@ -256,9 +270,9 @@ static int cchi_init(struct centauri *c)
 	u16 tail;
 	int i, ret;
 
-	ipc->cchi_rx = buffer_alloc(c, SZ_32K);
-	ipc->cchi_tx = buffer_alloc(c, SZ_32K);
-	ipc->debug_rx = buffer_alloc(c, SZ_16K);
+	ipc->cchi_rx = buffer_alloc(c, 0, SZ_32K);
+	ipc->cchi_tx = buffer_alloc(c, 0, SZ_32K);
+	ipc->debug_rx = buffer_alloc(c, 0, SZ_16K);
 	if (!ipc->cchi_rx || !ipc->cchi_tx || !ipc->debug_rx)
 		return -ENOMEM;
 	ret = message(&ipc->control, c->bar + 0x9000, config, sizeof(config));
@@ -311,7 +325,7 @@ static int memswap_handoff(struct centauri *c, unsigned int function, const char
 	ret = ftab_entry(secondary->cpu, secondary->size, tag, &offset, &size, false);
 	if (ret)
 		return ret;
-	working = buffer_alloc(c, size);
+	working = buffer_alloc(c, function, size);
 	if (!working)
 		return -ENOMEM;
 	dma_rmb();
@@ -329,6 +343,7 @@ static int enumerate_functions(struct centauri *c)
 	struct centauri_ipc *ipc = c->ipc;
 	u16 control;
 	int i, cap;
+	dma_addr_t msi;
 
 	pci_lock_rescan_remove();
 	/* The ROM personality was single-function; boot exposes Alpha and Beta. */
@@ -352,10 +367,16 @@ static int enumerate_functions(struct centauri *c)
 		pci_read_config_word(ipc->function[i], cap + PCI_MSI_FLAGS, &control);
 		if (!(control & PCI_MSI_FLAGS_64BIT))
 			return -EOPNOTSUPP;
+		if (i) {
+			ipc->msi[i] = buffer_alloc(c, i, SZ_16K);
+			if (!ipc->msi[i])
+				return -ENOMEM;
+		}
+		msi = i ? ipc->msi[i]->dma : c->msi_dma;
 		pci_write_config_dword(ipc->function[i], cap + PCI_MSI_ADDRESS_LO,
-			lower_32_bits(c->msi_dma + 0x400 * i));
+				       lower_32_bits(msi));
 		pci_write_config_dword(ipc->function[i], cap + PCI_MSI_ADDRESS_HI,
-			upper_32_bits(c->msi_dma + 0x400 * i));
+				       upper_32_bits(msi));
 		pci_write_config_word(ipc->function[i], cap + PCI_MSI_DATA_64, 0xa5a0 + 0x100 * i);
 		pci_write_config_word(ipc->function[i], cap + PCI_MSI_FLAGS,
 			(control & ~PCI_MSI_FLAGS_QSIZE) | (5 << 4) | PCI_MSI_FLAGS_ENABLE);
@@ -383,7 +404,7 @@ int centauri_start_ipc(struct centauri *c)
 	ret = secondary_init(c);
 	if (ret)
 		goto failed;
-	ret = context_init(c, &ipc->control, 13, 1, 0, 0);
+	ret = context_init(c, 0, &ipc->control, 13, 1, 0, 0);
 	if (ret)
 		goto failed;
 	writel(lower_32_bits(c->descriptor_dma), c->bar + 0x8044);
@@ -417,13 +438,14 @@ int centauri_start_ipc(struct centauri *c)
 		ret = ret ?: -EIO;
 		goto failed;
 	}
-	ipc->window = buffer_alloc(c, SZ_16M);
+	ipc->window = buffer_alloc(c, 1, SZ_16M);
 	if (!ipc->window) {
 		ret = -ENOMEM;
 		goto failed;
 	}
-	ret = context_init(c, &ipc->alpha, 192, 234,
-		ipc->window->dma + CEN_ALPHA_SCRATCH_OFFSET, CEN_ALPHA_SCRATCH_SIZE);
+	ret = context_init(c, 1, &ipc->alpha, 192, 234,
+			   ipc->window->dma + CEN_ALPHA_SCRATCH_OFFSET,
+			   CEN_ALPHA_SCRATCH_SIZE);
 	if (ret)
 		goto failed;
 	writel(lower_32_bits(ipc->window->dma), ipc->bar[1] + 0x18);
@@ -463,7 +485,7 @@ void centauri_free_ipc(struct centauri *c)
 		pci_clear_master(ipc->function[i]);
 	}
 	list_for_each_entry_safe(buffer, next, &ipc->buffers, list) {
-		dma_free_coherent(&c->pdev->dev, buffer->size, buffer->cpu, buffer->dma);
+		dma_free_coherent(buffer->dev, buffer->size, buffer->cpu, buffer->dma);
 		list_del(&buffer->list);
 		kfree(buffer);
 	}
@@ -505,7 +527,7 @@ int centauri_alpha_log_buffer(struct centauri *c, void **cpu, dma_addr_t *dma, s
 	if (!ipc || !ipc->window)
 		return -ENODEV;
 	if (!ipc->alpha_log)
-		ipc->alpha_log = buffer_alloc(c, SZ_4M);
+		ipc->alpha_log = buffer_alloc(c, 1, SZ_4M);
 	if (!ipc->alpha_log)
 		return -ENOMEM;
 	*cpu = ipc->alpha_log->cpu;
