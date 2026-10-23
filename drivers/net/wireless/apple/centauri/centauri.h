@@ -48,6 +48,10 @@ struct centauri {
  * port+0x3800. On the J873 those are the RID2SID and MSIMAP tables that pcie-apple programmed
  * (PORT_T602X_RID2SID, PORT_T602X_MSIMAP); the cycle then drops function 0's stream entry and
  * its DMA arrives as SID 0 (DART "BPF reject"). Such a board gets both tables written back.
+ * link_tlv, scan_tlvs: the macOS 27.0 WLAN adapter differs from the 26.6.1 one the J813 recipe
+ * came from. startInterface carries the three link addresses in TLV 386 (was 385), and the scan
+ * request (command 0x1000f) carries a channel-list TLV 0x104 and an OCE TLV 0x165 after the fixed
+ * 14 bytes. A J873 scan without them crashed the UMAC in SCHED_Req_Add.
  */
 struct centauri_board {
 	const char *compatible;
@@ -57,15 +61,19 @@ struct centauri_board {
 	u32 tune_130;
 	u16 bridge_id;	/* root port device ID, 0 = any Apple root port */
 	bool keep_port_tables;
+	u16 link_tlv;
+	bool scan_tlvs;
 };
 
 static inline const struct centauri_board *centauri_board(void)
 {
 	static const struct centauri_board boards[] = {
 		{ "apple,j813", "apple/centauri/j813-ftab.bin", 0x00248142,
-		  0x488028000ULL, 0x48f010000ULL, 0x39a000300ULL, 0x03020000, 0x100c, false },
+		  0x488028000ULL, 0x48f010000ULL, 0x39a000300ULL, 0x03020000, 0x100c, false,
+		  385, false },
 		{ "apple,j873", "apple/centauri/j873-ftab.bin", 0x00248152,
-		  0x388028000ULL, 0x38f010000ULL, 0x31a00000cULL, 0x208, 0, true },
+		  0x388028000ULL, 0x38f010000ULL, 0x31a00000cULL, 0x208, 0, true,
+		  386, true },
 	};
 	int i;
 

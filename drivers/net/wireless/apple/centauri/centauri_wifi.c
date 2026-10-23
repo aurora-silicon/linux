@@ -759,13 +759,15 @@ static int radio_start(struct centauri_wifi *wifi)
 	unsigned int ring, slot;
 	int ret;
 
-	/* Stock 25G76 startInterface (0x1808e26ec) supplies TLV 385,
-	 * length 18. Firmware 0x5736c0 otherwise generates three unrelated
+	/* The stock 26.x startInterface supplies TLV 385, length 18; the macOS 27.0
+	 * adapter uses 386 (board table). Firmware 0x5736c0 otherwise generates three unrelated
 	 * random addresses. This diagnostic keeps the sole active link equal
 	 * to the netdev identity; it does not enable multi-link association.
 	 */
 	if (station_link_addresses) {
-		put_unaligned_le16(385, start + 5);
+		const struct centauri_board *board = centauri_board();
+
+		put_unaligned_le16(board ? board->link_tlv : 385, start + 5);
 		put_unaligned_le16(3 * ETH_ALEN, start + 7);
 		for (slot = 0; slot < 3; slot++)
 			ether_addr_copy(start + 9 + slot * ETH_ALEN, wifi->netdev->dev_addr);
@@ -799,12 +801,47 @@ static int radio_start(struct centauri_wifi *wifi)
 	return 0;
 }
 
+static void append_tlv(u8 *payload, size_t *size, u16 tag, const void *data, u16 length);
+
+/* Fixed scan request (command 0x1000f), 14 bytes, chunk number first. */
+static size_t build_scan(struct centauri_wifi *wifi, unsigned int chunk, u8 *buf)
+{
+	static const u8 fixed[14] = { 1, 0, 0, 0x80, 0, 2, 0, 0x10, 110, 0, 110, 0, 0, 0 };
+	const struct centauri_board *board = centauri_board();
+	u8 list[1 + 4 * 13], oce[5] = { 0, 0, 1, 0, 0 };
+	unsigned int first = chunk * 13, n, i;
+	size_t size = sizeof(fixed);
+
+	memcpy(buf, fixed, sizeof(fixed));
+	buf[0] = chunk + 1;
+	if (!board || !board->scan_tlvs)
+		return size;
+	/* The macOS 27.0 scan request appends TLV 0x104, a count and then
+	 * {channel, band (0 = 2.4 GHz, 1 = 5 GHz), 0, 0} per channel, and TLV 0x165, an OCE block
+	 * whose flags byte always has bit 0 set. One chunk covers 13 entries of the wiphy table.
+	 */
+	n = min_t(unsigned int, 13, 13 + ARRAY_SIZE(five_ghz) - first);
+	list[0] = n;
+	for (i = 0; i < n; i++) {
+		const struct ieee80211_channel *channel = &wifi->channels[first + i];
+
+		list[1 + 4 * i] = channel->hw_value;
+		list[2 + 4 * i] = channel->band == NL80211_BAND_5GHZ;
+		list[3 + 4 * i] = 0;
+		list[4 + 4 * i] = 0;
+	}
+	append_tlv(buf, &size, 0x104, list, 1 + 4 * n);
+	append_tlv(buf, &size, 0x165, oce, sizeof(oce));
+	return size;
+}
+
 static void scan_worker(struct work_struct *work)
 {
 	struct centauri_wifi *wifi = container_of(work, struct centauri_wifi, scan_work);
 	struct cfg80211_scan_info info = {};
 	struct cfg80211_scan_request *request;
-	u8 scan[14] = { 1, 0, 0, 0x80, 0, 2, 0, 0x10, 110, 0, 110, 0, 0, 0 };
+	u8 scan[14 + 4 + 1 + 4 * 13 + 4 + 5];
+	size_t scan_size;
 	unsigned int chunk;
 	int ret = 0;
 
@@ -814,8 +851,8 @@ static void scan_worker(struct work_struct *work)
 		bool stopped = false;
 		unsigned long deadline;
 
-		scan[0] = chunk + 1;
-		ret = command(wifi, 65551, scan, sizeof(scan));
+		scan_size = build_scan(wifi, chunk, scan);
+		ret = command(wifi, 65551, scan, scan_size);
 		if (ret)
 			break;
 		deadline = jiffies + msecs_to_jiffies(8000);
