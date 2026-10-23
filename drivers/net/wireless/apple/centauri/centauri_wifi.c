@@ -942,13 +942,15 @@ static void append_tlv(u8 *payload, size_t *size, u16 tag, const void *data, u16
 static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 			struct cfg80211_connect_params *params)
 {
-	/* Stock 25G76 ACIConnectionAdapter::connectAp (0x1808e94cc) emits a
-	 * 12-byte TLV 376. The newer SDK 27 adapter uses 14 bytes. Preserve the
-	 * unspecified-link masks; all-zero is not the non-MLO default.
+	/* The stock 26.x join emits a 12-byte TLV 376. The macOS 27.0.1
+	 * adapter writes tag 0x178 with length 14: the MLD configuration bytes
+	 * that its default initialisation fills with the defaults below, bytes
+	 * 12 and 13 being 0 and the flags byte (bits from the connection parameters, 0 by default).
+	 * Preserve the unspecified-link masks; all-zero is not the non-MLO default.
 	 */
-	static const u8 mld_defaults[12] = {
+	static const u8 mld_defaults[14] = {
 		1, 0, 1, 0xff, 0xff, 0xff, 0xff, 0xff,
-		0xff, 0xff, 0xff, 3,
+		0xff, 0xff, 0xff, 3, 0, 0,
 	};
 	/* Firmware connection-context defaults (aciw 0x511ee8). TLV 0xf913
 	 * replaces all five values. Sending zeros arms Supp_AddTimer with a
