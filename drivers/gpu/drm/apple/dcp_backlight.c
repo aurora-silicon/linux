@@ -769,10 +769,20 @@ static const struct backlight_ops dcp_backlight_ops = {
 	.controls_device = dcp_backlight_controls_device,
 };
 
+static bool dcp_backlight_controls_device_v14(struct backlight_device *bd,
+					      struct device *display_dev)
+{
+	struct apple_dcp *dcp = bl_get_data(bd);
+
+	/* An fbdev unblank must not present the unrequested default level. */
+	return dcp_backlight_level_known(dcp) &&
+		dcp_backlight_controls_device(bd, display_dev);
+}
+
 static const struct backlight_ops dcp_backlight_ops_v14 = {
 	.get_brightness = dcp_get_brightness,
 	.update_status = dcp_set_brightness,
-	.controls_device = dcp_backlight_controls_device,
+	.controls_device = dcp_backlight_controls_device_v14,
 };
 
 int dcp_backlight_register(struct apple_dcp *dcp)

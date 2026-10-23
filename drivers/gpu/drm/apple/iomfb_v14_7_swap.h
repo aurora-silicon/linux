@@ -35,8 +35,8 @@
  * The panel level block of the swap record (the 14.7 J514S/J516S panel): a
  * present byte at +0x354 and the level in nits as an unaligned IEEE 754
  * binary64 at +0x35c, both zero when the level does not change. The same
- * layout as drivers/gpu/drm/apple-m3/iomfb_v14_7.h (bl_nits_present,
- * bl_nits) and omacom/linux-aurora PR148.
+ * layout as SiliconForest commit 44fe00e5eb58d54baf1cc9ad607293e774bfed44
+ * and omacom/linux-aurora PR148 (02524534c6b8).
  */
 #define DCP_V14_SWAP_NITS_PRESENT	0x354
 #define DCP_V14_SWAP_NITS		0x35c

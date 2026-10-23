@@ -15,8 +15,6 @@
 #include <kunit/device.h>
 #include <kunit/test.h>
 
-void dcp_work_register_backlight(struct work_struct *work);
-
 static void v14_bl_unused_work(struct work_struct *work)
 {
 }
@@ -407,7 +405,7 @@ static void v14_bl_external_untouched(struct kunit *test)
 
 /*
  * The T6030 panel: no level until one is requested; the requested level is
- * encoded; a refusal keeps the actual level and is retried; an accepted one
+ * encoded; a refusal keeps the actual level without a retry; an accepted one
  * is the actual level, and only then does blanking follow DPMS.
  */
 static void v14_bl_t6030_swap_levels(struct kunit *test)
@@ -434,13 +432,12 @@ static void v14_bl_t6030_swap_levels(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, swap[DCP_V14_SWAP_NITS_PRESENT], 1);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le64(swap + DCP_V14_SWAP_NITS),
 			dcp_v14_nits_binary64(250));
-	/* Refused: no actual level, a retry queued. */
+	/* Refused: no actual level, and the panel must not queue a retry. */
 	dcp_v14_swap_nits_done(f.v14, &present, false);
 	mutex_unlock(&f.v14->lock);
 	KUNIT_EXPECT_FALSE(test, dcp_backlight_level_known(f.dcp));
 	KUNIT_EXPECT_EQ(test, f.v14->nits_refused, 1ULL);
-	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&f.v14->backlight_work));
-	cancel_delayed_work_sync(&f.v14->backlight_work);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&f.v14->backlight_work));
 
 	/* While a Type-C display has the pipe, no level either. */
 	f.dcp->fixed_connector_type = DRM_MODE_CONNECTOR_USB;

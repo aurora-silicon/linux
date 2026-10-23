@@ -9,9 +9,6 @@
 #include <linux/delay.h>
 #include <linux/kthread.h>
 
-/* The real shared registration worker, visible only with CONFIG_KUNIT. */
-void dcp_work_register_backlight(struct work_struct *work);
-
 struct v14_bl_rpc;
 struct v14_bl_actor {
 	struct v14_bl_rpc *ctx;
@@ -31,9 +28,9 @@ struct v14_bl_rpc {
 	struct v14_bl_actor actors[2];
 	struct completion rpc_entered, rpc_release;
 	atomic_t submits;
-	u64 iova[4], nits[4];
-	bool nits_present[4];
-	struct drm_framebuffer *owner[4];
+	u64 iova[5], nits[5];
+	bool nits_present[5];
+	struct drm_framebuffer *owner[5];
 	bool block_first, refuse;
 };
 
@@ -266,6 +263,11 @@ static void v14_bl_running_work_suspend(struct kunit *test)
 	/* A callback queued before the gate shut must also refuse the pending level. */
 	dcp_v14_backlight_work(&c->f.v14->backlight_work.work);
 	KUNIT_EXPECT_EQ(test, atomic_read(&c->submits), 1);
+	iomfb_v14_7_backlight_resume(c->f.dcp);
+	KUNIT_ASSERT_TRUE(test, dcp_v14_present(c->f.v14, &c->fb[0], 64, 64, 0, NULL));
+	KUNIT_EXPECT_EQ(test, atomic_read(&c->submits), 2);
+	KUNIT_EXPECT_TRUE(test, c->nits_present[1]);
+	KUNIT_EXPECT_EQ(test, c->nits[1], dcp_v14_nits_binary64(250));
 }
 
 /* Actual dcp_poweroff/on must reach the 14.7 blank/restore hooks. */
@@ -297,6 +299,11 @@ static void v14_bl_dpms_dispatch(struct kunit *test)
 	dcp_poweron(pdev);
 	KUNIT_EXPECT_TRUE(test, dcp_backlight_pending(c->f.dcp));
 	KUNIT_EXPECT_FALSE(test, c->f.dcp->backlight.state.dpms_off);
+	KUNIT_ASSERT_TRUE(test, dcp_v14_present(c->f.v14, &c->fb[0], 64, 64, 0, NULL));
+	KUNIT_EXPECT_EQ(test, atomic_read(&c->submits), 5);
+	KUNIT_EXPECT_TRUE(test, c->nits_present[4]);
+	KUNIT_EXPECT_EQ(test, c->nits[4], dcp_v14_nits_binary64(DCP_V14_NITS_DEFAULT));
+	KUNIT_EXPECT_FALSE(test, dcp_backlight_pending(c->f.dcp));
 }
 
 /* An actual failed submit must leave the loader's level unknown. */
@@ -306,13 +313,17 @@ static void v14_bl_failed_submit_unknown(struct kunit *test)
 
 	c->refuse = true;
 	v14_bl_request(test, c->f.dcp, 240);
-	dcp_v14_bl_shut(c->f.v14, true);
 	mutex_lock(&c->f.v14->lock);
 	KUNIT_EXPECT_EQ(test, dcp_v14_swap_locked(c->f.v14, NULL, 0, 0, 0, 0, NULL), -EIO);
 	mutex_unlock(&c->f.v14->lock);
 	KUNIT_EXPECT_FALSE(test, dcp_backlight_level_known(c->f.dcp));
 	KUNIT_EXPECT_EQ(test, c->f.v14->nits_presents, 0ULL);
 	KUNIT_EXPECT_TRUE(test, c->f.v14->failed);
+	KUNIT_EXPECT_FALSE(test, work_busy(&c->f.v14->backlight_work.work));
+	/* Neither a later kick nor a work callback may retry the failed panel. */
+	dcp_v14_backlight_kick(c->f.dcp);
+	dcp_v14_backlight_work(&c->f.v14->backlight_work.work);
+	KUNIT_EXPECT_EQ(test, atomic_read(&c->submits), 1);
 	KUNIT_EXPECT_FALSE(test, work_busy(&c->f.v14->backlight_work.work));
 }
 
@@ -369,6 +380,27 @@ static void v14_bl_class_unregistered(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, c->f.v14->bl_gate, DCP_V14_BL_CLOSED);
 }
 
+/* fbdev cannot turn the advertised default into the first brightness request. */
+static void v14_bl_fbdev_unknown_level(struct kunit *test)
+{
+	struct v14_bl_rpc *c = v14_bl_rpc_setup(test);
+	struct device unrelated = {};
+	struct backlight_device *bd;
+
+	schedule_work(&c->f.dcp->bl_register_wq);
+	flush_work(&c->f.dcp->bl_register_wq);
+	bd = c->f.dcp->brightness.bl_dev;
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, bd);
+	KUNIT_EXPECT_FALSE(test, bd->ops->controls_device(bd, NULL));
+	KUNIT_EXPECT_FALSE(test, dcp_backlight_pending(c->f.dcp));
+	KUNIT_EXPECT_EQ(test, atomic_read(&c->submits), 0);
+	v14_bl_request(test, c->f.dcp, 250);
+	KUNIT_ASSERT_TRUE(test, dcp_v14_present(c->f.v14, &c->fb[0], 64, 64, 0, NULL));
+	KUNIT_EXPECT_TRUE(test, bd->ops->controls_device(bd, NULL));
+	KUNIT_EXPECT_TRUE(test, bd->ops->controls_device(bd, c->f.dcp->dev));
+	KUNIT_EXPECT_FALSE(test, bd->ops->controls_device(bd, &unrelated));
+}
+
 static struct kunit_case v14_bl_lifetime_cases[] = {
 	KUNIT_CASE(v14_bl_present_publication_serialized),
 	KUNIT_CASE(v14_bl_running_work_suspend),
@@ -376,6 +408,7 @@ static struct kunit_case v14_bl_lifetime_cases[] = {
 	KUNIT_CASE(v14_bl_failed_submit_unknown),
 	KUNIT_CASE(v14_bl_registration_unbind_race),
 	KUNIT_CASE(v14_bl_class_unregistered),
+	KUNIT_CASE(v14_bl_fbdev_unknown_level),
 	{}
 };
 

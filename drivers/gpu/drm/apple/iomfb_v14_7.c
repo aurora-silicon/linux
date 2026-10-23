@@ -2769,7 +2769,6 @@ static void dcp_v14_swap_nits_done(struct apple_dcp_v14 *v14,
 				   const struct dcp_backlight_present *present, bool accepted)
 {
 	struct apple_dcp *dcp = READ_ONCE(v14->dcp);
-	unsigned int delay;
 
 	if (!dcp)
 		return;
@@ -2781,9 +2780,7 @@ static void dcp_v14_swap_nits_done(struct apple_dcp_v14 *v14,
 		return;
 	}
 	v14->nits_refused++;
-	delay = dcp_backlight_retry_delay(dcp);
-	if (delay && !READ_ONCE(v14->failed))
-		dcp_v14_bl_queue(v14, msecs_to_jiffies(delay));
+	/* The internal swap failure is final: swap_locked latches failed. */
 }
 
 /*
