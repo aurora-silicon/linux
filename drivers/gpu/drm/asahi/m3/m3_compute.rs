@@ -96,9 +96,12 @@ impl Compute {
             objects[storage::COMMAND].gpu_va()?,control.base,control.end,objects[storage::POOL].va());
         // The M3 compute stream uses absolute IOTO addresses and does not
         // include the USC_EXEC_BASE_CP register.
+        // Diagnostic only: read no further than the stream, and never fail the job over it.
         let mut stream=[0u8;48];
-        vm.read_bytes(control.base,&mut stream)?;
-        crate::cls_dev_dbg!(Compute,dev,"M3 client CDM bytes={:02x?}\n",stream);
+        let len=core::cmp::min(control.end.saturating_sub(control.base),stream.len() as u64) as usize;
+        if vm.read_bytes(control.base,&mut stream[..len]).is_ok() {
+            crate::cls_dev_dbg!(Compute,dev,"M3 client CDM bytes={:02x?}\n",&stream[..len]);
+        }
         agx_memory::publish();
         // Finish the write-combining page-table stores before broadcasting
         // the invalidation.
