@@ -29,6 +29,10 @@
 static_assert(DATA_TX_BUFFER >= CEN_ALPHA_SCRATCH_OFFSET + CEN_ALPHA_SCRATCH_SIZE);
 static_assert(DATA_TX_BUFFER + DATA_TX_SLOTS * BUFFER_SIZE <= DATA_RX_BUFFER);
 
+static bool host_setup = true;
+module_param(host_setup, bool, 0644);
+MODULE_PARM_DESC(host_setup, "Before a join, tell the firmware the host is awake (command 6) and apply the reference TX defaults (commands 43 and 52) when the tx_config files have not; 1 = on (default)");
+
 static bool verify_pmk;
 module_param(verify_pmk, bool, 0400);
 MODULE_PARM_DESC(verify_pmk, "Compare firmware PMK with the requested key without exposing either");
@@ -131,6 +135,7 @@ struct centauri_wifi {
 	size_t fwlog_size;
 	bool fwlog_attempted, fwlog_ready;
 	u8 tx_profile[10], tx_defaults_applied;
+	bool host_awake_sent;
 	bool tx_profile_valid;
 	u8 link_count, link_prime[3], link_channel[3], link_band[3], emlsr_mode;
 	bool link_status_valid, emlsr_valid;
@@ -1057,6 +1062,39 @@ out:
 	return ret;
 }
 
+/* Without the host power state the firmware treats the host as asleep, powers the PHYs down and traps about 15 s after the
+ * join. Same three commands as the host_wakeup and tx_config debugfs files; called with wifi->lock held.
+ */
+static void host_setup_commands(struct centauri_wifi *wifi)
+{
+	static const u8 awake[3] = {};
+	static const u8 control_profile[] = { 0x54, 1, 10, 0, 0, 8, 0, 0, 0xff, 0xff, 0xff, 0xff, 1, 1 };
+	u8 lifetime[20] = {};
+	int ret, i;
+
+	if (!host_setup)
+		return;
+	if (!wifi->host_awake_sent) {
+		ret = command(wifi, 6, awake, sizeof(awake));
+		dev_info(&wifi->control->pdev->dev, "host power state awake: rc=%d status=%u\n", ret, wifi->reply_status);
+		wifi->host_awake_sent = !ret;
+	}
+	if (!(wifi->tx_defaults_applied & BIT(0))) {
+		for (i = 0; i < 4; i++)
+			put_unaligned_le32(2000000, lifetime + 4 + 4 * i);
+		ret = command(wifi, 43, lifetime, sizeof(lifetime));
+		if (!ret)
+			wifi->tx_defaults_applied |= BIT(0);
+		dev_info(&wifi->control->pdev->dev, "TX packet lifetime defaults: rc=%d\n", ret);
+	}
+	if (!(wifi->tx_defaults_applied & BIT(1))) {
+		ret = command(wifi, 52, control_profile, sizeof(control_profile));
+		if (!ret)
+			wifi->tx_defaults_applied |= BIT(1);
+		dev_info(&wifi->control->pdev->dev, "TX control profile defaults: rc=%d\n", ret);
+	}
+}
+
 static void connect_worker(struct work_struct *work)
 {
 	struct centauri_wifi *wifi = container_of(work, struct centauri_wifi, connect_work);
@@ -1066,6 +1104,7 @@ static void connect_worker(struct work_struct *work)
 	int ret;
 
 	mutex_lock(&wifi->lock);
+	host_setup_commands(wifi);
 	slot = wifi->command_head;
 	ret = command(wifi, 131072, wifi->connect_payload, wifi->connect_size);
 	command_status = wifi->reply_status;
