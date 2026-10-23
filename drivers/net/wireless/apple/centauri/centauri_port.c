@@ -46,6 +46,8 @@ int centauri_port_cycle(struct pci_dev *pdev)
 	unsigned int lanes, i;
 	int ret = -ETIMEDOUT, pm;
 	bool ack, l2;
+	u32 rid2sid[16], msimap[256], valid = 0;
+	bool saved = false;
 
 	if (!board || !board->port || !bridge || bridge->vendor != PCI_VENDOR_ID_APPLE ||
 	    (board->bridge_id && bridge->device != board->bridge_id))
@@ -69,6 +71,13 @@ int centauri_port_cycle(struct pci_dev *pdev)
 	ret = pci_save_state(pdev);
 	if (ret)
 		goto out;
+	if (board->keep_port_tables) {
+		for (i = 0; i < ARRAY_SIZE(rid2sid); i++)
+			rid2sid[i] = readl(port + 0x3000 + 4 * i);
+		for (i = 0; i < ARRAY_SIZE(msimap); i++)
+			msimap[i] = readl(port + 0x3800 + 4 * i);
+		saved = true;
+	}
 	pcie_capability_read_word(bridge, PCI_EXP_LNKSTA, &link);
 	lanes = (link & PCI_EXP_LNKSTA_NLW) >> PCI_EXP_LNKSTA_NLW_SHIFT;
 	lanes = lanes >= 1 && lanes <= 16 ? BIT(lanes) - 1 : 1;
@@ -186,6 +195,16 @@ int centauri_port_cycle(struct pci_dev *pdev)
 timed_out:
 	ret = -ETIMEDOUT;
 out:
+	if (saved) {
+		for (i = 0; i < ARRAY_SIZE(rid2sid); i++) {
+			writel(rid2sid[i], port + 0x3000 + 4 * i);
+			valid += !!(rid2sid[i] & BIT(31));
+		}
+		for (i = 0; i < ARRAY_SIZE(msimap); i++)
+			writel(msimap[i], port + 0x3800 + 4 * i);
+		dev_info(&pdev->dev, "restored %u RID2SID entries and the MSI map (ret %d)\n",
+			 valid, ret);
+	}
 	if (pad)
 		iounmap(pad);
 	if (phy)
