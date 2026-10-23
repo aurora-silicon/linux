@@ -321,6 +321,10 @@ static const struct of_device_id aic_info_match[] = {
 		.data = &aic3_t8142_info,
 	},
 	{
+		.compatible = "apple,t6041-aic3",
+		.data = &aic3_t8142_info,
+	},
+	{
 		.compatible = "apple,t8103-aic",
 		.data = &aic1_local_fipi_info,
 	},
@@ -520,8 +524,9 @@ static unsigned long aic_fiq_get_idx(struct irq_data *d)
 }
 
 /*
- * T8142 traps writes to VM_TMR_FIQ_ENA_EL2. Mask the guest timers through
- * their architectural EL02 controls instead, leaving the older SoCs alone.
+ * T8142 traps and T6041 ignores writes to VM_TMR_FIQ_ENA_EL2. Mask the guest
+ * timers through their architectural EL02 controls instead, leaving the older
+ * SoCs alone.
  */
 static void aic_vm_timer_mask(u64 timers, bool mask)
 {
