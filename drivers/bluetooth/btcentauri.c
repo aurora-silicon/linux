@@ -469,6 +469,32 @@ static int cen_transmit(struct cen_bt *bt, struct sk_buff_head *queue,
 	return 0;
 }
 
+/* The N1 reports legacy scan responses in LE Extended Advertising Reports with an event type whose low
+ * byte is 0x18 (legacy PDU and scan response, neither connectable nor scannable) and other bits in the
+ * high byte (seen: 0x2518, 0x2618, 0x2718). Linux accepts only the Core values 0x1a and 0x1b for a
+ * legacy scan response and drops anything else as "Unknown advertising packet type", so report the
+ * low byte 0x18 as 0x1a and keep the high byte.
+ */
+static void cen_normalize_ext_adv(struct sk_buff *skb)
+{
+	unsigned int offset = HCI_EVENT_HDR_SIZE + 2, reports;
+
+	if (skb->len < offset + 1 || skb->data[0] != HCI_EV_LE_META ||
+	    skb->data[2] != HCI_EV_LE_EXT_ADV_REPORT)
+		return;
+	reports = skb->data[3];
+	while (reports--) {
+		struct hci_ev_le_ext_adv_info *info;
+
+		if (offset + sizeof(*info) > skb->len)
+			return;
+		info = (struct hci_ev_le_ext_adv_info *)(skb->data + offset);
+		if ((le16_to_cpu(info->type) & 0x00ff) == 0x0018)
+			info->type = cpu_to_le16((le16_to_cpu(info->type) & 0xff00) | 0x001a);
+		offset += sizeof(*info) + info->length;
+	}
+}
+
 static void cen_poll(struct work_struct *work)
 {
 	struct cen_bt *bt = container_of(to_delayed_work(work), struct cen_bt, poll);
@@ -552,6 +578,7 @@ static void cen_poll(struct work_struct *work)
 				skb->data[11] = ACL_LINK;
 				bt->hrb_connection_events++;
 			}
+			cen_normalize_ext_adv(skb);
 			hci_skb_pkt_type(skb) = HCI_EVENT_PKT;
 			hdev->stat.byte_rx += length;
 			hci_recv_frame(hdev, skb);
