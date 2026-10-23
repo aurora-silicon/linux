@@ -84,12 +84,19 @@ impl Packet {
         // Claim error/signal ownership once; this flag is NOT proof that the
         // fence is signaled or that hardware DMA has stopped.
         if self.finish_claimed.swap(true, Ordering::Relaxed) { return; }
-        if let Err(e)=result {if let Some(status) = self.vm.status() { status.record(e); }self.completion.set_error(e);}
+        if let Err(e)=result {
+            // A guard still held here belongs to work the firmware may still run: block
+            // mapping changes before the error fence is visible (as G15 does), so userspace
+            // can't unmap memory under it. It stays with the packet until the runtime drops
+            // the packet, after the firmware has provably stopped.
+            if let Some(guard)=self.vm_job.lock().as_ref() {guard.quarantine();}
+            if let Some(status) = self.vm.status() { status.record(e); }
+            self.completion.set_error(e);
+        }
         // A scheduler job/fence and the runtime's last packet can outlive
         // hardware retirement. They must not keep the VM's active-job count
         // nonzero: GEM closes otherwise accumulate across completed frames.
-        // On failure the runtime quarantines this guard with the packet until
-        // firmware has provably stopped; signalling an error is not retirement.
+        // Signalling an error is not retirement.
         crate::m3::agx_memory::publish();
         let profile=crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming);
         let before=if profile {crate::m3::m3_runtime::physical_counter()} else {0};
