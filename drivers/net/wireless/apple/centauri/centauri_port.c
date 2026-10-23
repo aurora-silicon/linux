@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* J813 preboot -> boot port cycle, transcribed from the measured proxy
+/* Preboot -> boot port cycle, transcribed from the J813 measured proxy
  * alpha_wifi_scan.py pcie_cycle/apple_teardown/apple_bringup sequence.
- * These apertures were verified from the live ADT before this Linux boot.
- * This temporary board helper belongs in the host-controller driver once
- * T8142 platform/clock/GPIO bindings are available.
+ * Apertures and the PERST pad come from the per-machine table in centauri.h; those were
+ * verified from the live ADT. The J873 row reuses the J813 sequence with T8152 addresses and
+ * config +0x130 = 0x208: the reset table and the lane window bits equal the T8152 bring-up that
+ * links port 0 in m1n1, but the cycle itself (link down, retrain with firmware running) has not
+ * been run on a J873. This temporary board helper belongs in the host-controller driver.
  */
 #include <linux/delay.h>
 #include <linux/io.h>
@@ -24,7 +26,7 @@ static bool wait_bits(void __iomem *address, u32 mask, u32 wanted, u32 us)
 	return !readl_poll_timeout(address, value, (value & mask) == wanted, 100, us);
 }
 
-int centauri_j813_port_cycle(struct pci_dev *pdev)
+int centauri_port_cycle(struct pci_dev *pdev)
 {
 	static const u32 reset[][2] = {
 		{0x88, 0x110}, {0x100, ~0U}, {0x148, ~0U}, {0x210, ~0U},
@@ -32,10 +34,11 @@ int centauri_j813_port_cycle(struct pci_dev *pdev)
 		{0x16c, 0}, {0x13c, 0}, {0x800, 0x00100100},
 		{0x808, 0x001001ff}, {0x82c, 0x00010000},
 	};
-	static const u32 tune[][2] = {
-		{0x130, 0x03020000}, {0x140, 0x10}, {0x144, 0x00253770},
+	u32 tune[][2] = {
+		{0x130, 0}, {0x140, 0x10}, {0x144, 0x00253770},
 		{0x21c, 0}, {0x834, 0}, {0x83c, 0},
 	};
+	const struct centauri_board *board = centauri_board();
 	struct pci_dev *bridge = pdev->bus->self;
 	void __iomem *port, *phy, *pad;
 	u32 value, gpio, identity;
@@ -44,12 +47,13 @@ int centauri_j813_port_cycle(struct pci_dev *pdev)
 	int ret = -ETIMEDOUT, pm;
 	bool ack, l2;
 
-	if (!of_machine_is_compatible("apple,j813") || !bridge ||
-	    bridge->vendor != PCI_VENDOR_ID_APPLE || bridge->device != 0x100c)
+	if (!board || !board->port || !bridge || bridge->vendor != PCI_VENDOR_ID_APPLE ||
+	    (board->bridge_id && bridge->device != board->bridge_id))
 		return -ENODEV;
-	port = ioremap(0x488028000ULL, 0x4000);
-	phy = ioremap(0x48f010000ULL, 0x1000);
-	pad = ioremap(0x39a000300ULL, sizeof(u32));
+	tune[0][1] = board->tune_130;
+	port = ioremap(board->port, 0x4000);
+	phy = ioremap(board->phy, 0x1000);
+	pad = ioremap(board->pad, sizeof(u32));
 	if (!port || !phy || !pad) {
 		ret = -ENOMEM;
 		goto out;

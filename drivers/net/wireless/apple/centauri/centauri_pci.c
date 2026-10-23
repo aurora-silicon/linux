@@ -20,6 +20,10 @@
 
 static struct dentry *centauri_debug;
 
+static unsigned int board_word;
+module_param(board_word, uint, 0644);
+MODULE_PARM_DESC(board_word, "Diagnostic: word written to BAR0+0x807c before the ROM boot, 0 = per-machine table value");
+
 static int centauri_status_show(struct seq_file *s, void *unused)
 {
 	struct centauri *c = s->private;
@@ -64,19 +68,19 @@ static void centauri_free_boot(struct centauri *c)
 static int centauri_rom_boot(struct centauri *c)
 {
 	const struct firmware *fw;
+	const struct centauri_board *board = centauri_board();
 	struct device *dev = &c->pdev->dev;
 	u32 stage;
 	int ret;
 
-	if ((c->pdev->device != 0x1900 && c->pdev->device != 0x1901) ||
-	    !of_machine_is_compatible("apple,j813"))
+	if ((c->pdev->device != 0x1900 && c->pdev->device != 0x1901) || !board)
 		return -ENODEV;
 	if (!c->link_ready || c->boot_attempted)
 		return -EBUSY;
 	stage = readl(c->bar + 0x8000);
 	if (stage != 0 && stage != 4 && stage != 1)
 		return -EBUSY;
-	ret = request_firmware(&fw, "apple/centauri/j813-ftab.bin", dev);
+	ret = request_firmware(&fw, board->firmware, dev);
 	if (ret)
 		return ret;
 	if (fw->size < 0x30 || fw->size > SZ_64M ||
@@ -116,7 +120,9 @@ static int centauri_rom_boot(struct centauri *c)
 	pci_write_config_word(c->pdev, c->msi_cap + PCI_MSI_FLAGS,
 		(c->msi_original & ~PCI_MSI_FLAGS_QSIZE) | PCI_MSI_FLAGS_ENABLE);
 	pci_set_master(c->pdev);
-	writel(0x00248142, c->bar + 0x807c); /* J813 board 0x24, T8142 chip. */
+	dev_info(dev, "ROM boot: %s, %zu bytes, board word %#x\n", board->firmware, fw->size,
+		 board_word ?: board->board_word);
+	writel(board_word ?: board->board_word, c->bar + 0x807c);
 	writel(0, c->bar + 0x803c);
 	writel(lower_32_bits(c->descriptor_dma), c->bar + 0x8044);
 	writel(upper_32_bits(c->descriptor_dma), c->bar + 0x8048);
@@ -168,7 +174,7 @@ static ssize_t centauri_boot_write(struct file *file, const char __user *buffer,
 		ret = -EBUSY;
 	} else {
 		c->link_ready = false;
-		ret = centauri_j813_port_cycle(c->pdev);
+		ret = centauri_port_cycle(c->pdev);
 		if (!ret) {
 			c->link_ready = true;
 			dev_info(&c->pdev->dev, "post-reset execution stage=%#x\n",
@@ -276,3 +282,4 @@ module_exit(centauri_exit);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Apple N1 Centauri native PCI and ACIPC bring-up backend");
 MODULE_FIRMWARE("apple/centauri/j813-ftab.bin");
+MODULE_FIRMWARE("apple/centauri/j873-ftab.bin");
