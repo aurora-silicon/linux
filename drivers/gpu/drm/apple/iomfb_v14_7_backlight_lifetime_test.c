@@ -322,6 +322,7 @@ static void v14_bl_failed_submit_unknown(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, work_busy(&c->f.v14->backlight_work.work));
 	/* Neither a later kick nor a work callback may retry the failed panel. */
 	dcp_v14_backlight_kick(c->f.dcp);
+	flush_delayed_work(&c->f.v14->backlight_work);
 	dcp_v14_backlight_work(&c->f.v14->backlight_work.work);
 	KUNIT_EXPECT_EQ(test, atomic_read(&c->submits), 1);
 	KUNIT_EXPECT_FALSE(test, work_busy(&c->f.v14->backlight_work.work));
