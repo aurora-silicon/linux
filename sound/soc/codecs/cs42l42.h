@@ -69,6 +69,8 @@ struct  cs42l42_private {
 	bool remote_active;
 	unsigned int remote_saved[CS42L83_REMOTE_NUM_SAVED_REGS];
 	bool hp_adc_up_pending;
+	/* Set once at probe for the base-M1 I2C resume workaround. */
+	bool resume_reprepare;
 	bool suspended;
 	bool sdw_waiting_first_unattach;
 	bool init_done;
@@ -86,6 +88,9 @@ int cs42l42_pll_config(struct snd_soc_component *component,
 		       unsigned int clk, unsigned int sample_rate);
 void cs42l42_src_config(struct snd_soc_component *component, unsigned int sample_rate);
 int cs42l42_mute_stream(struct snd_soc_dai *dai, int mute, int stream);
+int cs42l42_dai_prepare(struct snd_pcm_substream *substream, struct snd_soc_dai *dai);
+bool cs42l42_resume_workaround_required(const struct device_node *root,
+					const struct device_node *codec, bool soundwire);
 irqreturn_t cs42l42_irq_thread(int irq, void *data);
 int cs42l42_suspend(struct device *dev);
 int cs42l42_resume(struct device *dev);

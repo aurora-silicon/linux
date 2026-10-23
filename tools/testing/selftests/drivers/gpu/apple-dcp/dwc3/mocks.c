@@ -20,6 +20,7 @@ struct apple_atcphy {
 	u32 dp_usb_context[2][27];
 	bool pipe_pending, usb_off_pending, usb_off_drained;
 	bool usb3_port_off, park_owed;
+	bool t8103_dummy_pending, t8103_usb3_retry, t8103_usb3_workaround;
 	enum atcphy_mode mode, typec_mode;
 	enum atcphy_pipehandler_state pipe_state;
 };

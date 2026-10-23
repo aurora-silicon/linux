@@ -28,6 +28,8 @@ const struct apple_dpin_policy apple_dpin_m2 = {
 
 const struct apple_dpin_policy apple_dpin_m3 = {
 	.flow = APPLE_DPIN_CHANGED,
+	.capacity_retry = true,
+	.defer_new_bringup = true,
 	.host_policy = TB_HOST_DP_NOTIFY,
 };
 

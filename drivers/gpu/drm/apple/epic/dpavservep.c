@@ -7,10 +7,12 @@
 #define EDID_EXT_BLOCK_COUNT_OFFSET 0x7E
 
 #include <drm/drm_edid.h>
+#include <kunit/static_stub.h>
 
 #include <linux/completion.h>
 #include <linux/device.h>
 #include <linux/types.h>
+#include <linux/unaligned.h>
 
 #include "../afk.h"
 #include "../dcp.h"
@@ -121,6 +123,9 @@ static void dcpavserv_init(struct apple_epic_service *service, const char *name,
 		if (dcp->dcpavserv.service) {
 			dcp->dcpavserv.enabled = true;
 			dcp->dcpavserv.epoch++;
+			/* A new instance: the host is no client of it yet. */
+			dcp->dcpavserv.opened = NULL;
+			dcp->dcpavserv.opened_epoch = 0;
 			service->cookie = &dcp->dcpavserv;
 			complete(&dcp->dcpavserv.enable_completion);
 			published = true;
@@ -168,7 +173,9 @@ static void dcpavserv_teardown(struct apple_epic_service *service)
 		dcp->dcpavserv.enabled = false;
 		dcp->dcpavserv.service = NULL;
 		dcp->dcpavserv.epoch++;
+		/* A removed instance took its open with it. */
 		dcp->dcpavserv.opened = NULL;
+		dcp->dcpavserv.opened_epoch = 0;
 		dcpavserv_invalidate_edid(dcp);
 		reinit_completion(&dcp->dcpavserv.enable_completion);
 		owned = true;
@@ -189,12 +196,14 @@ void dpavservep_detach(struct apple_dcp *dcp)
 	/* Also reject an in-flight prepare/OPEN with no published owner yet. */
 	dcp->dcpavserv.epoch++;
 	dcp->dcpavserv.opened = NULL;
+	dcp->dcpavserv.opened_epoch = 0;
 	reinit_completion(&dcp->dcpavserv.enable_completion);
 	if (service) {
 		afk_service_retire(service);
 		dcpavserv_invalidate_edid(dcp);
 	}
 	mutex_unlock(&dcp->dcpavserv.lock);
+	cancel_work_sync(&dcp->dcpavserv.close_wq);
 	if (service)
 		afk_service_put(service);
 }
@@ -296,10 +305,180 @@ static int parse_report(struct apple_epic_service *service, enum epic_subtype ty
 	return 0;
 }
 
+/*
+ * The 14.7 external role: the host opens the published AV instance as a
+ * client (DCPAV Open, command 4, a zero 32-byte body; the reply carries a
+ * status at +0 and the opened Boolean at +16) to read the sink's EDID
+ * through it. An open client is one the firmware waits for, up to 10 s,
+ * before it removes the instance: it holds the reply to the sink's HPD low
+ * until the instance's device has closed, and with it the sink's release and
+ * the next sink. So the client is closed (DCPAV Close, command 5, a zero
+ * 16-byte body, status at +0) before every HPD low and when the firmware
+ * terminates the instance (report group 2, command 1). Close goes only to the
+ * instance that was opened; a removed instance took its open with it.
+ * Neither call is made under dcpavserv.lock, which never waits for firmware.
+ *
+ * Each instance is named by its epoch, which changes even when its slot is
+ * reused for the next one. A Close or a Terminate that comes while an Open
+ * is on its way cancels that Open's publication (close_gen): its opener
+ * then closes the client itself, if the instance is still the current one.
+ * Work queued for an instance acts on that instance only.
+ */
+static int dcpavserv_v14_call(struct apple_epic_service *service, u16 group, u32 command,
+			      void *reply, size_t size)
+{
+	KUNIT_STATIC_STUB_REDIRECT(dcpavserv_v14_call, service, group, command, reply, size);
+	return afk_service_call(service, group, command, NULL, 0, size, reply, size, 0);
+}
+
+/* Close the client of @service, pinned by the caller; drops that pin. */
+static void dcpavserv_v14_send_close(struct apple_dcp *dcp, struct apple_epic_service *service)
+{
+	u8 reply[16] = {};
+	int ret;
+
+	ret = dcpavserv_v14_call(service, 0, 5, reply, sizeof(reply));
+	afk_service_put(service);
+	/* Removed while the Close was on its way: nothing is left open. */
+	if (ret == -ENODEV)
+		return;
+	if (!ret && get_unaligned_le32(reply))
+		ret = -EIO;
+	if (ret)
+		dev_err(dcp->dev, "DCPAVSERV: AV client close failed: %d\n", ret);
+	else
+		dev_info(dcp->dev, "DCPAVSERV: AV client closed\n");
+}
+
+/*
+ * The open client of instance @epoch, pinned, if that instance is still the
+ * published one; the client is no longer recorded open either way.
+ */
+static struct apple_epic_service *dcpavserv_v14_take_opened(struct apple_dcp *dcp, u64 epoch)
+{
+	struct apple_epic_service *service = NULL;
+
+	lockdep_assert_held(&dcp->dcpavserv.lock);
+	if (!dcp->dcpavserv.opened || dcp->dcpavserv.opened_epoch != epoch)
+		return NULL;
+	if (dcp->dcpavserv.epoch == epoch && dcp->dcpavserv.opened == dcp->dcpavserv.service)
+		service = afk_service_get(dcp->dcpavserv.service);
+	dcp->dcpavserv.opened = NULL;
+	dcp->dcpavserv.opened_epoch = 0;
+	return service;
+}
+
+/*
+ * Open the client of @service, instance @epoch, pinned by the caller, for an
+ * Open admitted at close generation @gen. 0 once it is recorded open;
+ * -ECANCELED when a Close or a Terminate came meanwhile (the client opened
+ * is closed again here) or the instance went; otherwise the Open's error.
+ */
+static int dcpavserv_v14_open(struct apple_dcp *dcp, struct apple_epic_service *service,
+			      u64 epoch, u64 gen)
+{
+	struct apple_epic_service *close = NULL;
+	u8 reply[32] = {};
+	bool still;
+	int ret;
+
+	ret = dcpavserv_v14_call(service, 0, 4, reply, sizeof(reply));
+	if (!ret && (get_unaligned_le32(reply) || !get_unaligned_le64(reply + 16))) {
+		dev_err(dcp->dev, "DCPAVSERV: open answered %#x, opened %llu\n",
+			get_unaligned_le32(reply), get_unaligned_le64(reply + 16));
+		ret = -EIO;
+	}
+	mutex_lock(&dcp->dcpavserv.lock);
+	dcp->dcpavserv.opening = false;
+	still = dcp->dcpavserv.service == service && dcp->dcpavserv.epoch == epoch;
+	if (!ret && still && dcp->dcpavserv.close_gen == gen) {
+		dcp->dcpavserv.opened = service;
+		dcp->dcpavserv.opened_epoch = epoch;
+	} else if (!ret) {
+		/* An instance gone meanwhile took its open with it. */
+		if (still)
+			close = afk_service_get(service);
+		ret = -ECANCELED;
+	}
+	mutex_unlock(&dcp->dcpavserv.lock);
+	if (close)
+		dcpavserv_v14_send_close(dcp, close);
+	else if (!ret)
+		dev_info(dcp->dev, "DCPAVSERV: AV client open\n");
+	return ret;
+}
+
+void dcpavserv_v14_close(struct apple_dcp *dcp)
+{
+	struct apple_epic_service *service;
+
+	if (!dcp_is_v14_7_external(dcp))
+		return;
+	mutex_lock(&dcp->dcpavserv.lock);
+	/* An Open on its way is closed again by its opener. */
+	dcp->dcpavserv.close_gen++;
+	service = dcpavserv_v14_take_opened(dcp, dcp->dcpavserv.epoch);
+	/* Any older instance's open went with that instance. */
+	dcp->dcpavserv.opened = NULL;
+	dcp->dcpavserv.opened_epoch = 0;
+	mutex_unlock(&dcp->dcpavserv.lock);
+	if (service)
+		dcpavserv_v14_send_close(dcp, service);
+}
+
+/* The Close a Terminate queued: for that instance only, if it is still published. */
+void dcpavserv_close_work(struct work_struct *work)
+{
+	struct dcpavserv *av = container_of(work, struct dcpavserv, close_wq);
+	struct apple_dcp *dcp = container_of(av, struct apple_dcp, dcpavserv);
+	struct apple_epic_service *service;
+
+	mutex_lock(&av->lock);
+	service = dcpavserv_v14_take_opened(dcp, av->close_epoch);
+	mutex_unlock(&av->lock);
+	if (service)
+		dcpavserv_v14_send_close(dcp, service);
+}
+
+/*
+ * Terminate on the published instance: no new use of it, an Open on its way
+ * cancelled, and the open client's Close, queued for that instance.
+ */
+static void dcpavserv_v14_report(struct apple_epic_service *service, enum epic_subtype type,
+				 const void *data, size_t size)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+	const struct epic_service_call *call = data;
+	bool close = false;
+	u64 epoch;
+
+	if (type != EPIC_SUBTYPE_STD_SERVICE || size < sizeof(*call) ||
+	    le32_to_cpu(call->magic) != EPIC_SERVICE_CALL_MAGIC ||
+	    le16_to_cpu(call->group) != 2 || le32_to_cpu(call->command) != 1)
+		return;
+	mutex_lock(&dcp->dcpavserv.lock);
+	epoch = dcp->dcpavserv.epoch;
+	if (dcp->dcpavserv.service == service && dcp->dcpavserv.terminated_epoch != epoch) {
+		dcp->dcpavserv.terminated_epoch = epoch;
+		dcp->dcpavserv.close_gen++;
+		if (dcp->dcpavserv.opened == service && dcp->dcpavserv.opened_epoch == epoch) {
+			dcp->dcpavserv.close_epoch = epoch;
+			close = true;
+		}
+	}
+	mutex_unlock(&dcp->dcpavserv.lock);
+	if (!close)
+		return;
+	dev_info(dcp->dev, "DCPAVSERV: AV instance terminated: closing the client\n");
+	schedule_work(&dcp->dcpavserv.close_wq);
+}
+
 static int dcpavserv_report(struct apple_epic_service *service,
 			    enum epic_subtype type, const void *data,
 			    size_t data_size)
 {
+	if (dcp_is_v14_7_external(service->ep->dcp))
+		dcpavserv_v14_report(service, type, data, data_size);
 	return parse_report(service, type, data, data_size);
 }
 
@@ -320,6 +499,7 @@ static const struct drm_edid *dcpavserv_read_edid_legacy(struct apple_epic_servi
 	u64 data_size;
 	int ret;
 
+	KUNIT_STATIC_STUB_REDIRECT(dcpavserv_read_edid_legacy, service);
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.max_size = cpu_to_le64(EDID_BUF_SIZE);
 	resp = kzalloc(resp_size, GFP_KERNEL);
@@ -405,8 +585,11 @@ bool dcpavserv_edid_service_current(struct apple_dcp *dcp, u64 epoch)
 const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation,
 					u64 *epoch)
 {
+	bool v14_7_ext = dcp_is_v14_7_external(dcp);
 	struct apple_epic_service *service;
 	const struct drm_edid *edid;
+	bool open = false;
+	u64 gen = 0;
 
 	scoped_guard(mutex, &dcp->hpd_mutex) {
 		if (!dcpavserv_edid_current(dcp, generation))
@@ -415,13 +598,27 @@ const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation
 	mutex_lock(&dcp->dcpavserv.lock);
 	service = dcp->dcpavserv.enabled ? afk_service_get(dcp->dcpavserv.service) : NULL;
 	*epoch = dcp->dcpavserv.epoch;
+	if (service && v14_7_ext) {
+		/* A terminated instance gets no new use; its successor is published. */
+		if (dcp->dcpavserv.terminated_epoch == *epoch) {
+			afk_service_put(service);
+			service = NULL;
+		} else if (dcp->dcpavserv.opened_epoch != *epoch && !dcp->dcpavserv.opening) {
+			dcp->dcpavserv.opening = true;
+			gen = dcp->dcpavserv.close_gen;
+			open = true;
+		}
+	}
 	mutex_unlock(&dcp->dcpavserv.lock);
 	if (!service)
 		return ERR_PTR(-ENODEV);
 
 	/*
 	 * The 14.7 firmware of an external processor answers EDID requests
-	 * once its service has been opened; open each announced instance once.
+	 * through an instance its client has opened (DCPAV Open): open each
+	 * announced instance once, and close it again before the sink's
+	 * release (dcpavserv_v14_close()). An open the firmware refuses is
+	 * reported; the read that follows validates its own result.
 	 *
 	 * Only on Aurora's DCPLink session (T6030). The T8122 dcpext, which
 	 * Linux starts and drives through the IOMFB template, reads the EDID
@@ -429,19 +626,26 @@ const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation
 	 * open call and drops the display link instead, about 50 ms after it,
 	 * which brings the display back 4 s later: hotplug in a loop.
 	 */
-	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
-	    READ_ONCE(dcp->dcpavserv.opened) != service) {
-		int ret = afk_service_call(service, 4, 6, NULL, 0, 32, NULL, 0, 32);
+	if (open) {
+		int ret = dcpavserv_v14_open(dcp, service, *epoch, gen);
 
-		if (ret) {
+		/* Closed, terminated or gone meanwhile: no read through it. */
+		if (ret == -ECANCELED) {
 			afk_service_put(service);
-			return ERR_PTR(ret);
+			return ERR_PTR(-ENODEV);
 		}
-		WRITE_ONCE(dcp->dcpavserv.opened, service);
+		if (ret)
+			dev_warn(dcp->dev, "DCPAVSERV: AV client not opened: %d\n", ret);
 	}
 
 	edid = service->ep->wire_v2 ? dcpavserv_read_edid_inline(service) :
 		dcpavserv_read_edid_legacy(service);
+	/* The 14.7 external role: every block's header and checksum. */
+	if (v14_7_ext && !IS_ERR(edid) && !drm_edid_valid(edid)) {
+		dev_warn(dcp->dev, "DCPAVSERV: the sink's EDID is not valid\n");
+		drm_edid_free(edid);
+		edid = ERR_PTR(-EPROTO);
+	}
 	mutex_lock(&dcp->dcpavserv.lock);
 	if (dcp->dcpavserv.service != service ||
 	    !dcpavserv_edid_service_current(dcp, *epoch)) {
@@ -527,3 +731,7 @@ int dpavservep_init(struct apple_dcp *dcp)
 
 	return 0;
 }
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
+#include "dpavservep-v14-test.c"
+#endif

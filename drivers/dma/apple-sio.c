@@ -13,8 +13,10 @@
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
+#include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_dma.h>
+#include <linux/overflow.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/soc/apple/rtkit.h>
@@ -128,6 +130,9 @@ struct sio_data {
 	} tags;
 
 	int nchannels;
+#if IS_ENABLED(CONFIG_APPLE_SIO_T6030)
+	bool t6030;
+#endif
 	struct sio_chan channels[];
 };
 
@@ -149,6 +154,173 @@ static int sio_send_siomsg_atomic(struct sio_data *sio, u64 msg,
 				  sio_ack_callback ack_callback,
 				  void *cookie);
 static int sio_call(struct sio_data *sio, u64 msg);
+
+static inline bool sio_is_t6030(struct sio_data *sio)
+{
+#if IS_ENABLED(CONFIG_APPLE_SIO_T6030)
+	return sio->t6030;
+#else
+	return false;
+#endif
+}
+
+#if IS_ENABLED(CONFIG_APPLE_SIO_T6030)
+/*
+ * Boot tables of the T6030 SIO firmware, protocol 10. The boot loader builds them from the ADT
+ * and passes each one as two apple,sio-firmware-params: the table's IOVA page under its key and
+ * its size in bytes under key + 1. Protocol 10 takes six 36-byte DMA shim records and nine device
+ * types. A loader without protocol-10 support builds five 32-byte records and eight types, which
+ * this firmware cannot use, so the SIO is not started with them.
+ */
+#define SIO_T6030_PARAMS_MAX	64	/* key and value pairs */
+#define SIO_T6030_WINDOWS_MAX	8
+#define SIO_T6030_IOVA_LIMIT	BIT_ULL(42)
+/*
+ * A parameter goes to the firmware as an endpoint byte (key >> 8) and a
+ * parameter byte (key & 0xff), so a wider key would alias another one.
+ */
+#define SIO_T6030_KEY_MAX	0xffff
+
+struct sio_t6030_window {
+	u64 start;
+	u64 size;
+};
+
+static const struct {
+	u32 key;
+	u32 size;
+} sio_t6030_tables[] = {
+	{ 0x1a, 4 * 16 },	/* map ranges */
+	{ 0x1c, 9 * 8 },	/* device types */
+	{ 0x22, 6 * 36 },	/* DMA shims */
+};
+
+/*
+ * 0 when the parameters hold each protocol-10 table once, at its exact size, entirely inside one
+ * of the windows the boot loader mapped for the SIO; -EINVAL otherwise.
+ */
+static int sio_t6030_check_params(const u32 *params, unsigned int nparams,
+				  const struct sio_t6030_window *windows, unsigned int nwindows)
+{
+	unsigned int i, j, t;
+
+	if (!nparams || nparams % 2 || nparams > 2 * SIO_T6030_PARAMS_MAX)
+		return -EINVAL;
+	for (i = 0; i < nparams; i += 2)
+		if (params[i] > SIO_T6030_KEY_MAX)
+			return -EINVAL;
+	for (i = 0; i < nparams; i += 2)
+		for (j = i + 2; j < nparams; j += 2)
+			if (params[i] == params[j])
+				return -EINVAL;
+
+	for (t = 0; t < ARRAY_SIZE(sio_t6030_tables); t++) {
+		bool have_page = false, have_size = false, inside = false;
+		u64 start = 0, size = 0, end;
+
+		for (i = 0; i < nparams; i += 2) {
+			if (params[i] == sio_t6030_tables[t].key) {
+				start = (u64)params[i + 1] << 12;
+				have_page = true;
+			} else if (params[i] == sio_t6030_tables[t].key + 1) {
+				size = params[i + 1];
+				have_size = true;
+			}
+		}
+		if (!have_page || !have_size || size != sio_t6030_tables[t].size)
+			return -EINVAL;
+		if (check_add_overflow(start, size, &end) || end > SIO_T6030_IOVA_LIMIT)
+			return -EINVAL;
+		for (j = 0; j < nwindows && !inside; j++) {
+			u64 window_end;
+
+			if (check_add_overflow(windows[j].start, windows[j].size, &window_end))
+				continue;
+			inside = start >= windows[j].start && end <= window_end;
+		}
+		if (!inside)
+			return -EINVAL;
+	}
+	return 0;
+}
+
+/* The IOVA windows of this device's memory regions, from their iommu-addresses */
+static int sio_t6030_windows(struct device_node *np, struct sio_t6030_window *windows,
+			     unsigned int max)
+{
+	struct of_phandle_iterator it;
+	unsigned int n = 0;
+	int err;
+
+	of_for_each_phandle(&it, err, np, "memory-region", NULL, 0) {
+		const __be32 *maps, *end;
+		int size;
+
+		maps = of_get_property(it.node, "iommu-addresses", &size);
+		if (!maps)
+			continue;
+		if (size % sizeof(*maps)) {
+			of_node_put(it.node);
+			return -EINVAL;
+		}
+		end = maps + size / sizeof(*maps);
+		while (maps < end) {
+			struct device_node *owner __free(device_node) =
+				of_find_node_by_phandle(be32_to_cpup(maps++));
+			phys_addr_t iova;
+			size_t length;
+
+			/* An entry whose owner does not resolve is malformed, as a short one is */
+			if (!owner) {
+				of_node_put(it.node);
+				return -EINVAL;
+			}
+			maps = of_translate_dma_region_checked(owner, maps, end - maps, &iova,
+							       &length);
+			if (!maps) {
+				of_node_put(it.node);
+				return -EINVAL;
+			}
+			if (owner != np)
+				continue;
+			if (n == max) {
+				of_node_put(it.node);
+				return -EINVAL;
+			}
+			windows[n].start = iova;
+			windows[n].size = length;
+			n++;
+		}
+	}
+	return err == -ENOENT ? n : err;
+}
+
+/* 0 when the node's boot tables are protocol-10 tables inside its mapped windows */
+static int sio_t6030_check_node(struct device_node *np)
+{
+	struct sio_t6030_window windows[SIO_T6030_WINDOWS_MAX];
+	u32 params[2 * SIO_T6030_PARAMS_MAX];
+	int nparams, nwindows;
+
+	nparams = of_property_count_u32_elems(np, "apple,sio-firmware-params");
+	if (nparams <= 0 || nparams > ARRAY_SIZE(params) ||
+	    of_property_read_u32_array(np, "apple,sio-firmware-params", params, nparams))
+		return -EINVAL;
+	nwindows = sio_t6030_windows(np, windows, ARRAY_SIZE(windows));
+	if (nwindows < 0)
+		return nwindows;
+	return sio_t6030_check_params(params, nparams, windows, nwindows);
+}
+
+static int sio_t6030_check_boot_tables(struct device *dev)
+{
+	if (sio_t6030_check_node(dev->of_node)) {
+		dev_err(dev, "boot tables are not for SIO protocol 10; leaving the SIO stopped\n");
+		return -ENODEV;
+	}
+	return 0;
+}
+#endif
 
 static struct sio_chan *to_sio_chan(struct dma_chan *chan)
 {
@@ -283,6 +455,12 @@ static struct dma_async_tx_descriptor *sio_prep_dma_cyclic(
 			return NULL;
 		}
 
+		/*
+		 * T6030: publish the whole descriptor, its other fields zero;
+		 * a slot may come back from an earlier transfer.
+		 */
+		if (sio_is_t6030(siochan->host))
+			memset(d, 0, sizeof(*d));
 		d->flag = 1; /* not sure what's up with this */
 		d->iova = buf_addr + period_len * i;
 		d->size = period_len;
@@ -656,7 +834,12 @@ static int sio_device_config(struct dma_chan *chan,
 	cfg.timeout = 0;
 	cfg.fifo = 0x800;
 	cfg.limit = 0x800;
-	cfg.threshold = 0x800;
+	/*
+	 * The ADT records each client's channel configuration with it (the
+	 * dp-audioN dma-channels: channel, data shape, timeout, FIFO size,
+	 * threshold). T6030's DisplayPort audio channels refill at 0x600.
+	 */
+	cfg.threshold = sio_is_t6030(sio) ? 0x600 : 0x800;
 
 	/*
 	 * Dmaengine prescribes we ought to apply the new configuration only
@@ -789,6 +972,16 @@ static int sio_probe(struct platform_device *pdev)
 	int nchannels;
 	int err, i;
 
+	/*
+	 * Only APPLE_SIO_T6030 checks a T6030's boot tables and configures its
+	 * channels: without it, leave the SIO stopped rather than start it as
+	 * the generic one.
+	 */
+	if (!IS_ENABLED(CONFIG_APPLE_SIO_T6030) &&
+	    of_device_is_compatible(np, "apple,t6030-sio"))
+		return dev_err_probe(&pdev->dev, -ENODEV,
+				     "T6030 SIO support (APPLE_SIO_T6030) not built; leaving the SIO stopped\n");
+
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(42));
 	if (err)
 		return dev_err_probe(&pdev->dev, err, "Failed to set DMA mask\n");
@@ -805,6 +998,15 @@ static int sio_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, sio);
 	sio->dev = &pdev->dev;
 	sio->nchannels = nchannels;
+#if IS_ENABLED(CONFIG_APPLE_SIO_T6030)
+	sio->t6030 = of_device_is_compatible(np, "apple,t6030-sio");
+	/* Before any register, power or firmware access */
+	if (sio->t6030) {
+		err = sio_t6030_check_boot_tables(&pdev->dev);
+		if (err)
+			return err;
+	}
+#endif
 
 	sio->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(sio->base))
@@ -940,3 +1142,11 @@ module_platform_driver(apple_sio_driver);
 MODULE_AUTHOR("Martin Povišer <povik+lin@cutebit.org>");
 MODULE_DESCRIPTION("Driver for SIO coprocessor on Apple SoCs");
 MODULE_LICENSE("Dual MIT/GPL");
+
+#if IS_ENABLED(CONFIG_APPLE_SIO_T6030_KUNIT_TEST)
+#include "apple-sio-test.c"
+#endif
+
+#if IS_ENABLED(CONFIG_APPLE_SIO_KUNIT_TEST)
+#include "apple-sio-probe-test.c"
+#endif

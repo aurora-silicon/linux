@@ -1776,14 +1776,19 @@ static int parse_mode_in_avep_element(struct dcp_parse_ctx *handle,
 					return ret;
 			}
 		} else if (consume_string(it.handle, "ElementData")) {
+			size_t size = DCP_SOUND_COOKIE_SIZE;
 			const u8 *blob;
 
-			ret = parse_blob(it.handle, sizeof(*cookie), &blob);
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+			if (dcp_parse_v14_7_audio(handle))
+				size = DCP_SOUND_COOKIE_SIZE_V14_7;
+#endif
+			ret = parse_blob(it.handle, size, &blob);
 			if (ret)
 				return ret;
 
 			if (cookie)
-				memcpy(cookie, blob, sizeof(*cookie));
+				memcpy(cookie, blob, size);
 		} else {
 			ret = skip_pair(it.handle);
 			if (ret)

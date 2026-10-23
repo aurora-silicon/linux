@@ -4,7 +4,10 @@
 // #define DEBUG
 
 #include <linux/debugfs.h>
+#include <linux/err.h>
 #include <linux/kconfig.h>
+#include <linux/unaligned.h>
+#include <kunit/static_stub.h>
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
 #include <linux/rwsem.h>
@@ -53,7 +56,16 @@ static const struct dcp_av_audio_cmds dcp_av_audio_cmds_v13_5 = {
 	.get_product_attrs = 18,
 };
 
+struct audiosrv_data;
+
+struct av_audiosrv_cleanup {
+	struct apple_dcp *dcp;
+	struct audiosrv_data *owner;
+	struct apple_dcp_afkep *ep;
+};
+
 struct audiosrv_data {
+	struct av_audiosrv_cleanup cleanup;
 	struct platform_device *audio_dev;
 	bool plugged;
 	struct mutex plug_lock;
@@ -62,12 +74,41 @@ struct audiosrv_data {
 	struct rw_semaphore srv_rwsem;
 	/* Workqueue for starting the audio service */
 	struct work_struct start_av_service_wq;
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	/* The 14.7 external role: let a terminated audio interface go. */
+	struct work_struct terminate_wq;
+	/*
+	 * The instance generation, changed when an instance is published or
+	 * removed (srv_rwsem), so a slot reused for the next instance is not
+	 * taken for the old one; the Terminate work's instance.
+	 */
+	u64 gen;
+	u64 terminate_gen;
+	/*
+	 * The 14.7 external role: the instance the PCM opened and its
+	 * generation (open_lock); open_srv holds a pin, so its slot is not
+	 * reused while it is open.
+	 */
+	struct mutex open_lock;
+	struct apple_epic_service *open_srv;
+	u64 open_gen;
+	/* The instance the link was last prepared on (open_lock) */
+	u64 link_gen;
+#endif
 
 	struct dcp_av_audio_cmds cmds;
 
 	bool warned_get_elements;
 	bool warned_get_product_attrs;
 	bool is_open;
+	/* INIT_WORK has run for the embedded owner works. */
+	bool works_live;
+	/* Report and service-start admission. Writers hold srv_rwsem. */
+	bool reports_stopped;
+	/* One disable_work_sync is outstanding. Restart enables once. */
+	bool work_disabled;
+	/* afk_init/afk_start failed. Rebind must not enable these works. */
+	bool restart_blocked;
 };
 
 static void av_interface_init(struct apple_epic_service *service, const char *name,
@@ -97,6 +138,7 @@ static void av_audiosrv_init(struct apple_epic_service *service, const char *nam
 	struct apple_dcp *dcp = service->ep->dcp;
 	struct audiosrv_data *asrv = dcp->audiosrv;
 	struct apple_epic_service *old;
+	bool queue_start;
 
 	/* The owner pin keeps the slot from being recycled while published. */
 	service = afk_service_get(service);
@@ -108,13 +150,18 @@ static void av_audiosrv_init(struct apple_epic_service *service, const char *nam
 	down_write(&asrv->srv_rwsem);
 	old = asrv->srv;
 	asrv->srv = service;
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	asrv->gen++;
+#endif
+	queue_start = !asrv->reports_stopped;
 	up_write(&asrv->srv_rwsem);
 	if (old)
 		afk_service_put(old);
 
 	asrv->plugged = true;
 	mutex_unlock(&asrv->plug_lock);
-	schedule_work(&asrv->start_av_service_wq);
+	if (queue_start)
+		schedule_work(&asrv->start_av_service_wq);
 }
 
 static void av_audiosrv_teardown(struct apple_epic_service *service)
@@ -127,8 +174,12 @@ static void av_audiosrv_teardown(struct apple_epic_service *service)
 
 	down_write(&asrv->srv_rwsem);
 	owned = asrv->srv == service;
-	if (owned)
+	if (owned) {
 		asrv->srv = NULL;
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+		asrv->gen++;
+#endif
+	}
 	up_write(&asrv->srv_rwsem);
 
 	/* A stale generation must not unplug its successor. */
@@ -201,6 +252,190 @@ int dcp_audiosrv_unprepare(struct device *dev)
 
 	return ret;
 }
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+/* The audio service of the 14.7 external role, known before it starts. */
+bool dcp_audiosrv_native_link(struct device *dev)
+{
+	return dcp_is_v14_7_external(dev_get_drvdata(dev));
+}
+
+/* The 14.7 external role's audio service calls; KUnit stubs them. */
+static int av_audiosrv_call(struct apple_epic_service *srv, u32 command, const void *body,
+			    size_t body_len, size_t body_pad, void *reply, size_t reply_len)
+{
+	KUNIT_STATIC_STUB_REDIRECT(av_audiosrv_call, srv, command, body, body_len, body_pad,
+				   reply, reply_len);
+	return afk_service_call(srv, 0, command, body, body_len, body_pad, reply, reply_len, 0);
+}
+
+/*
+ * The 14.7 external role: the service is open while a PCM is (see
+ * av_service_connect()). The instance the PCM opened is kept under open_lock,
+ * which the endpoint's receive path never takes, and the calls are made
+ * without srv_rwsem: a teardown arriving meanwhile goes through, and so do
+ * the replies. The audio slots are reusable, so the open instance is kept
+ * pinned, with its generation: its slot cannot be reused while it is open,
+ * a successor is opened even in the same slot, and a removed instance is
+ * never closed (it took its open with it), so no Close goes to a successor.
+ */
+int dcp_audiosrv_open(struct device *dev)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	struct audiosrv_data *asrv = dcp->audiosrv;
+	struct apple_epic_service *srv;
+	u8 reply[32] = {};
+	u64 gen;
+	int ret;
+
+	if (!asrv)
+		return -ENODEV;
+
+	guard(mutex)(&asrv->open_lock);
+	scoped_guard(rwsem_read, &asrv->srv_rwsem) {
+		srv = afk_service_get(asrv->srv);
+		gen = asrv->gen;
+	}
+	if (!srv)
+		return -ENODEV;
+	if (asrv->open_srv) {
+		if (asrv->open_gen == gen) {
+			afk_service_put(srv);
+			return 0;
+		}
+		/* An earlier instance's open went with that instance. */
+		afk_service_put(asrv->open_srv);
+		asrv->open_srv = NULL;
+	}
+
+	/* Open: a zero body; status at +0, the opened Boolean at +16. */
+	ret = av_audiosrv_call(srv, asrv->cmds.open, NULL, 0, 32, reply, sizeof(reply));
+	if (!ret && (get_unaligned_le32(reply) || !get_unaligned_le64(reply + 16))) {
+		dev_err(dev, "audiosrv: open answered %#x, opened %llu\n",
+			get_unaligned_le32(reply), get_unaligned_le64(reply + 16));
+		ret = -EIO;
+	}
+	if (ret) {
+		afk_service_put(srv);
+		return ret;
+	}
+	asrv->open_srv = srv;
+	asrv->open_gen = gen;
+	return 0;
+}
+
+/* @gen: only the client of that instance (NULL: whichever is open) */
+static void av_audiosrv_close(struct apple_dcp *dcp, struct audiosrv_data *asrv,
+			      const u64 *gen)
+{
+	struct apple_epic_service *srv;
+	u8 reply[16] = {};
+	bool published;
+	int ret;
+
+	guard(mutex)(&asrv->open_lock);
+	/* Checked here, at the Close: a later instance may be open by now. */
+	if (gen && asrv->open_gen != *gen)
+		return;
+	srv = asrv->open_srv;
+	asrv->open_srv = NULL;
+	if (!srv)
+		return;
+	scoped_guard(rwsem_read, &asrv->srv_rwsem)
+		published = asrv->srv == srv && asrv->gen == asrv->open_gen;
+
+	/* Close: a zero body; status at +0. Only the instance still published. */
+	ret = published ? av_audiosrv_call(srv, asrv->cmds.close, NULL, 0, 16, reply,
+					   sizeof(reply)) : -ENODEV;
+	afk_service_put(srv);
+	if (ret == -ENODEV)
+		return;
+	if (ret || get_unaligned_le32(reply))
+		dev_err(dcp->dev, "audiosrv: close failed: %d, answered %#x\n", ret,
+			get_unaligned_le32(reply));
+}
+
+void dcp_audiosrv_close(struct device *dev)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+
+	if (dcp->audiosrv)
+		av_audiosrv_close(dcp, dcp->audiosrv, NULL);
+}
+
+bool dcp_audiosrv_link_on(struct device *dev, u64 gen)
+{
+	struct apple_dcp *dcp;
+	struct audiosrv_data *asrv;
+
+	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_link_on, dev, gen);
+	dcp = dev_get_drvdata(dev);
+	asrv = dcp->audiosrv;
+	if (!asrv)
+		return false;
+	guard(mutex)(&asrv->open_lock);
+	return asrv->open_srv && asrv->open_gen == gen && asrv->link_gen == gen;
+}
+
+/*
+ * The link commands of the 14.7 external role's audio service, the native
+ * audio driver's: prepare, start, stop and complete all take the selected
+ * element's 32-byte link data at body+0 and link source 0 at +32, and
+ * answer a status at body+48.
+ */
+int dcp_audiosrv_link(struct device *dev, enum dcp_audio_link op,
+		      const struct dcp_sound_cookie *cookie)
+{
+	struct apple_dcp *dcp;
+	struct audiosrv_data *asrv;
+	u8 body[64] = {}, reply[64];
+	u32 command, status;
+	int ret;
+
+	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_link, dev, op, cookie);
+	dcp = dev_get_drvdata(dev);
+	asrv = dcp->audiosrv;
+
+	switch (op) {
+	case DCP_AUDIO_LINK_PREPARE:
+		command = asrv->cmds.prepare;
+		break;
+	case DCP_AUDIO_LINK_START:
+		command = asrv->cmds.start_link;
+		break;
+	case DCP_AUDIO_LINK_STOP:
+		command = asrv->cmds.stop_link;
+		break;
+	case DCP_AUDIO_LINK_COMPLETE:
+		command = asrv->cmds.unprepare;
+		break;
+	default:
+		return -EINVAL;
+	}
+	static_assert(sizeof(*cookie) == DCP_SOUND_COOKIE_SIZE_V14_7);
+	memcpy(body, cookie, sizeof(*cookie));
+
+	scoped_guard(mutex, &asrv->open_lock) {
+		if (!asrv->open_srv)
+			return -ENODEV;
+		/* A link ends on the instance it was prepared on; one gone took it along. */
+		if (op != DCP_AUDIO_LINK_PREPARE && asrv->link_gen != asrv->open_gen)
+			return -ENODEV;
+		ret = av_audiosrv_call(asrv->open_srv, command, body, sizeof(body), 0,
+				       reply, sizeof(reply));
+		if (!ret && op == DCP_AUDIO_LINK_PREPARE)
+			asrv->link_gen = asrv->open_gen;
+	}
+	if (ret)
+		return ret;
+	status = get_unaligned_le32(reply + 48);
+	if (status) {
+		dev_err(dev, "audiosrv: link method %u answered %#x\n", command, status);
+		return -EIO;
+	}
+	return 0;
+}
+#endif
 
 static int
 dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
@@ -283,9 +518,46 @@ int dcp_audiosrv_get_product_attrs(struct device *dev, void *attrs, size_t maxsi
 	return ret;
 }
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+/* A DCPAV report (group 2) with command 1: Terminate. */
+static bool av_report_terminate(const void *data, size_t size)
+{
+	const struct epic_service_call *call = data;
+
+	return size >= sizeof(*call) && le32_to_cpu(call->magic) == EPIC_SERVICE_CALL_MAGIC &&
+	       le16_to_cpu(call->group) == 2 && le32_to_cpu(call->command) == 1;
+}
+#endif
+
 static int av_audiosrv_report(struct apple_epic_service *service, u32 idx,
 						  const void *data, size_t data_size)
 {
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	struct apple_dcp *dcp = service->ep->dcp;
+
+	/*
+	 * The 14.7 external role terminates an open audio interface when the
+	 * sink changes (after it reports the sink's physical address). Its
+	 * client must close it (Close, command 5): the firmware waits up to
+	 * 10 s for that before it removes the interface, and the sink's link
+	 * with it. A later publication brings the new instance.
+	 */
+	if (dcp_is_v14_7_external(dcp) && av_report_terminate(data, data_size)) {
+		struct audiosrv_data *asrv = dcp->audiosrv;
+		bool published;
+
+		/* The work acts on this instance only, not on a later one. */
+		scoped_guard(rwsem_read, &asrv->srv_rwsem) {
+			published = asrv->srv == service && !asrv->reports_stopped;
+			if (published)
+				WRITE_ONCE(asrv->terminate_gen, asrv->gen);
+		}
+		if (published) {
+			dev_info(dcp->dev, "audio interface terminated\n");
+			schedule_work(&asrv->terminate_wq);
+		}
+	}
+#endif
 	dev_dbg(service->ep->dcp->dev, "got audio report %d size %zx\n", idx, data_size);
 #ifdef DEBUG
 	print_hex_dump(KERN_DEBUG, "audio report: ", DUMP_PREFIX_NONE, 16, 1, data, data_size, true);
@@ -293,6 +565,30 @@ static int av_audiosrv_report(struct apple_epic_service *service, u32 idx,
 
 	return 0;
 }
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+/*
+ * The 14.7 external role behind a DP-to-HDMI converter (the J514S HDMI
+ * port) also publishes a CEC interface on this endpoint. The host makes no
+ * use of CEC; the interface's event reports (group 2: the sink's physical
+ * address, link training, link start and stop) are taken and dropped.
+ */
+static void av_cec_init(struct apple_epic_service *service, const char *name,
+			const char *class, s64 unit)
+{
+}
+
+static int av_cec_report(struct apple_epic_service *service, enum epic_subtype type,
+			 const void *data, size_t data_size)
+{
+	return 0;
+}
+
+static void av_cec_teardown(struct apple_epic_service *service)
+{
+	afk_service_disable(service);
+}
+#endif
 
 static const struct apple_epic_service_ops avep_ops[] = {
 	{
@@ -308,6 +604,14 @@ static const struct apple_epic_service_ops avep_ops[] = {
 		.report = av_audiosrv_report,
 		.teardown = av_audiosrv_teardown,
 	},
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	{
+		.name = "DCPDPCECInterface",
+		.init = av_cec_init,
+		.report = av_cec_report,
+		.teardown = av_cec_teardown,
+	},
+#endif
 	{}
 };
 
@@ -328,6 +632,26 @@ void av_service_connect(struct apple_dcp *dcp)
 	if (asrv->is_open)
 		goto out;
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	/*
+	 * The 14.7 external role opens its audio service only while a PCM is
+	 * (dcp_audiosrv_open()): an open audio interface is a client the
+	 * firmware must wait for whenever the sink changes (see
+	 * av_audiosrv_report()); an idle one need not be. The card follows
+	 * the display's power (A472 on): the CRTC enable connects before the
+	 * mode is set, and the modeset connects again once the display is on.
+	 */
+	if (dcp_is_v14_7_external(dcp)) {
+		if (!iomfb_v14_7_external_powered(dcp))
+			goto out;
+		scoped_guard(mutex, &asrv->plug_lock) {
+			if (asrv->audio_dev)
+				dcpaud_connect(asrv->audio_dev, asrv->plugged);
+		}
+		goto out;
+	}
+#endif
+
 	ret = afk_service_call(service, 0, asrv->cmds.open, NULL, 0, 32,
 			       NULL, 0, 32);
 	if (ret) {
@@ -344,13 +668,18 @@ out:
 	afk_service_put(service);
 }
 
-void av_service_disconnect(struct apple_dcp *dcp)
+/* @gen: only while that instance is published (NULL: whichever is) */
+static void __av_service_disconnect(struct apple_dcp *dcp, const u64 *gen)
 {
 	struct apple_epic_service *service;
 	struct audiosrv_data *asrv = dcp->audiosrv;
 	int ret;
 
 	scoped_guard(rwsem_write, &asrv->srv_rwsem) {
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+		if (gen && asrv->gen != *gen)
+			return;
+#endif
 		service = afk_service_pin(asrv->srv);
 		if (!service)
 			return;
@@ -358,6 +687,39 @@ void av_service_disconnect(struct apple_dcp *dcp)
 
 	/* close AV audio service */
 	dev_info(dcp->dev, "%s: stopping audio service\n", __func__);
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	/* The 14.7 external role's card goes with the display, and an open PCM's service. */
+	if (dcp_is_v14_7_external(dcp)) {
+		struct platform_device *audio_dev = NULL;
+		bool published = true;
+
+		/*
+		 * Each step acts on instance @gen only, checked as it is taken:
+		 * a successor may be published and opened in between.
+		 */
+		scoped_guard(mutex, &asrv->plug_lock) {
+			if (gen) {
+				scoped_guard(rwsem_read, &asrv->srv_rwsem)
+					published = asrv->gen == *gen;
+			}
+			if (published) {
+				audio_dev = asrv->audio_dev;
+				if (audio_dev)
+					dcpaud_disconnect(audio_dev);
+			}
+		}
+		if (!published)
+			goto out;
+		/*
+		 * The open PCM's link ends on the service, before its Close;
+		 * outside plug_lock, which the endpoint's receive path takes.
+		 */
+		if (audio_dev)
+			dcpaud_release_link(audio_dev, gen);
+		av_audiosrv_close(dcp, asrv, gen);
+		goto out;
+	}
+#endif
 	if (!asrv->is_open)
 		goto out;
 
@@ -380,6 +742,28 @@ out:
 	afk_service_put(service);
 }
 
+void av_service_disconnect(struct apple_dcp *dcp)
+{
+	__av_service_disconnect(dcp, NULL);
+}
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+/* The instance the Terminate came from, if it is still published. */
+static void av_work_service_terminate(struct work_struct *work)
+{
+	struct audiosrv_data *asrv = container_of(work, struct audiosrv_data, terminate_wq);
+	u64 gen = READ_ONCE(asrv->terminate_gen);
+	struct apple_dcp *dcp = NULL;
+
+	scoped_guard(rwsem_read, &asrv->srv_rwsem) {
+		if (asrv->srv && asrv->srv->ep && asrv->gen == gen)
+			dcp = asrv->srv->ep->dcp;
+	}
+	if (dcp)
+		__av_service_disconnect(dcp, &gen);
+}
+#endif
+
 static void av_work_service_start(struct work_struct *work)
 {
 	struct audiosrv_data *audiosrv_data;
@@ -400,12 +784,146 @@ static void av_work_service_start(struct work_struct *work)
 	av_service_connect(dcp);
 }
 
+static void av_audiosrv_flush_owner(struct audiosrv_data *asrv)
+{
+	flush_work(&asrv->start_av_service_wq);
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	flush_work(&asrv->terminate_wq);
+#endif
+}
+
+/* Drain the captured owner, without following a later dcp publication. */
+static bool av_audiosrv_drain_owner(struct audiosrv_data *asrv)
+{
+	bool first_stop;
+
+	if (!asrv || !asrv->works_live)
+		return false;
+
+	down_write(&asrv->srv_rwsem);
+	first_stop = !asrv->work_disabled;
+	asrv->reports_stopped = true;
+	asrv->work_disabled = true;
+	up_write(&asrv->srv_rwsem);
+
+	/*
+	 * Queue admission is already refused. disable_work_sync then raises
+	 * the work disable count and waits. No audio lock is held: the
+	 * callback takes srv_rwsem and may RPC. A later call only flushes,
+	 * so the disable count stays one for the rebind enable.
+	 */
+	if (first_stop) {
+		disable_work_sync(&asrv->start_av_service_wq);
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+		disable_work_sync(&asrv->terminate_wq);
+#endif
+	} else {
+		av_audiosrv_flush_owner(asrv);
+	}
+	return true;
+}
+
+static void av_audiosrv_block_owner_restart(struct audiosrv_data *asrv)
+{
+	if (!asrv)
+		return;
+	down_write(&asrv->srv_rwsem);
+	asrv->restart_blocked = true;
+	up_write(&asrv->srv_rwsem);
+}
+
+void av_audiosrv_quiesce(struct apple_dcp *dcp)
+{
+	struct audiosrv_data *asrv;
+	struct apple_dcp_afkep *ep;
+	struct workqueue_struct *wq;
+
+	if (!dcp)
+		return;
+	/* Lifecycle callers stop the native initializer before this snapshot. */
+	asrv = dcp->audiosrv;
+	ep = dcp->avep;
+	if (!av_audiosrv_drain_owner(asrv))
+		return;
+	if (IS_ERR_OR_NULL(ep))
+		return;
+	wq = ep->wq;
+	if (!wq)
+		return;
+	flush_workqueue(wq);
+	av_audiosrv_flush_owner(asrv);
+}
+
+static void av_audiosrv_cleanup(void *data)
+{
+	struct av_audiosrv_cleanup *cleanup = data;
+	struct audiosrv_data *asrv = cleanup->owner;
+	struct apple_dcp *dcp = cleanup->dcp;
+
+	/* Keep RX alive until any owner work that may make an RPC has left. */
+	if (asrv && asrv->works_live) {
+		av_audiosrv_block_owner_restart(asrv);
+		av_audiosrv_drain_owner(asrv);
+	}
+	afk_quiesce(cleanup->ep);
+	/* An old devres group must not unpublish a later session. */
+	if (dcp->audiosrv == asrv) {
+		if (dcp->avep == cleanup->ep)
+			dcp->avep = NULL;
+		dcp->audiosrv = NULL;
+	}
+}
+
+static int av_audiosrv_add_action(struct device *dev, void (*action)(void *),
+				  void *data)
+{
+	KUNIT_STATIC_STUB_REDIRECT(av_audiosrv_add_action, dev, action, data);
+	return devm_add_action_or_reset(dev, action, data);
+}
+
+static int av_audiosrv_register_cleanup(struct apple_dcp *dcp,
+					struct audiosrv_data *owner,
+					struct apple_dcp_afkep *ep)
+{
+	owner->cleanup = (struct av_audiosrv_cleanup) {
+		.dcp = dcp,
+		.owner = owner,
+		.ep = ep,
+	};
+	return av_audiosrv_add_action(dcp->dev, av_audiosrv_cleanup, &owner->cleanup);
+}
+
+void av_audiosrv_reports_restart(struct apple_dcp *dcp)
+{
+	struct audiosrv_data *asrv;
+
+	if (!dcp)
+		return;
+	asrv = dcp->audiosrv;
+	if (!asrv || !asrv->works_live || asrv->restart_blocked)
+		return;
+
+	down_write(&asrv->srv_rwsem);
+	if (!asrv->work_disabled || asrv->restart_blocked) {
+		up_write(&asrv->srv_rwsem);
+		return;
+	}
+	asrv->work_disabled = false;
+	enable_work(&asrv->start_av_service_wq);
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	enable_work(&asrv->terminate_wq);
+#endif
+	asrv->reports_stopped = false;
+	up_write(&asrv->srv_rwsem);
+}
+
 int avep_init(struct apple_dcp *dcp)
 {
 	struct audiosrv_data *audiosrv_data;
 	struct platform_device *audio_pdev;
 	struct device *dev = dcp->dev;
 	struct device_node *endpoint, *audio_node = NULL;
+	int ret;
 
 	audiosrv_data = devm_kzalloc(dcp->dev, sizeof(*audiosrv_data), GFP_KERNEL);
 	if (!audiosrv_data)
@@ -422,12 +940,28 @@ int avep_init(struct apple_dcp *dcp)
 		audiosrv_data->cmds = dcp_av_audio_cmds_v13_5;
 		break;
 	default:
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+		/*
+		 * The 14.7 external role (T6030 external processor) numbers its
+		 * methods as 13.5 does: open 4, close 5, prepare 6, start 7,
+		 * stop 10, complete 11, elements 1/16, product attributes 1/18.
+		 */
+		if (dcp_is_v14_7_external(dcp)) {
+			audiosrv_data->cmds = dcp_av_audio_cmds_v13_5;
+			break;
+		}
+#endif
 		dev_err(dcp->dev, "Audio not supported for firmware\n");
 		return -ENODEV;
 	}
 
-	dcp->audiosrv = audiosrv_data;
 	INIT_WORK(&audiosrv_data->start_av_service_wq, av_work_service_start);
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	INIT_WORK(&audiosrv_data->terminate_wq, av_work_service_terminate);
+	mutex_init(&audiosrv_data->open_lock);
+#endif
+	audiosrv_data->works_live = true;
+	dcp->audiosrv = audiosrv_data;
 
 	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, 0);
 	if (endpoint) {
@@ -437,14 +971,14 @@ int avep_init(struct apple_dcp *dcp)
 	if (!audio_node || !of_device_is_available(audio_node)) {
 		of_node_put(audio_node);
 		dev_info(dev, "No audio support\n");
-		return 0;
+		return av_audiosrv_register_cleanup(dcp, audiosrv_data, NULL);
 	}
 
 	audio_pdev = of_find_device_by_node(audio_node);
 	of_node_put(audio_node);
 	if (!audio_pdev) {
 		dev_info(dev, "No DP/HDMI audio device not ready\n");
-		return 0;
+		return av_audiosrv_register_cleanup(dcp, audiosrv_data, NULL);
 	}
 	dcp->audiosrv->audio_dev = audio_pdev;
 
@@ -452,8 +986,24 @@ int avep_init(struct apple_dcp *dcp)
 			DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME);
 
 	dcp->avep = afk_init(dcp, AV_ENDPOINT, avep_ops);
-	if (IS_ERR(dcp->avep))
-		return PTR_ERR(dcp->avep);
+	if (IS_ERR(dcp->avep)) {
+		ret = PTR_ERR(dcp->avep);
+		if (!av_audiosrv_register_cleanup(dcp, audiosrv_data, dcp->avep))
+			av_audiosrv_cleanup(&audiosrv_data->cleanup);
+		return ret;
+	}
+	/* Newer than afk_release_context, so owner work drains before RX dies. */
+	ret = av_audiosrv_register_cleanup(dcp, audiosrv_data, dcp->avep);
+	if (ret)
+		return ret;
 	dcp->avep->debugfs_entry = dcp->ep_debugfs[AV_ENDPOINT - 0x20];
-	return afk_start(dcp->avep);
+	ret = afk_start(dcp->avep);
+	if (ret)
+		av_audiosrv_cleanup(&audiosrv_data->cleanup);
+	return ret;
 }
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) && IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+#include "av-v14-test.c"
+#include "av-lifetime-test.c"
+#endif

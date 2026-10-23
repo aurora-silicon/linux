@@ -11,6 +11,7 @@
 //! are unified, so that the top level of the driver itself (in `driver`) does not have to concern
 //! itself with version dependence.
 
+use crate::module_parameters;
 use core::any::Any;
 use core::ops::Range;
 use core::slice;
@@ -292,6 +293,21 @@ pub(crate) trait Gpu: Send + Sync {
     fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
         None
     }
+    /// Shared GET_PARAMS additions, using this backend's feature-number assignments.
+    fn feature_flags(&self) -> u64 {
+        let mut flags = 0;
+        if self.supports_vm_status() {
+            flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS)
+                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS_MIRROR);
+        }
+        if self.queue_limits().is_some() {
+            flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES);
+        }
+        if self.soft_faults() && module_parameters::fault_control.value() == 0xb {
+            flags |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
+        }
+        flags
+    }
     /// Temporary capacity hint and validity in milliseconds for subsequent syncobj waits.
     fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
         None
@@ -300,6 +316,28 @@ pub(crate) trait Gpu: Send + Sync {
     fn base_clock_hz(&self) -> u32;
     /// Return the GPU address space geometry.
     fn uat_geometry(&self) -> mmu::UatGeometry;
+    /// Backend-specific user address aperture; other GPUs keep their geometry's range.
+    fn user_range(&self) -> Range<u64> {
+        self.uat_geometry().user_usable_range()
+    }
+    /// Use tracked command publication and sticky VM status on this backend.
+    fn tracked_submission(&self) -> bool {
+        false
+    }
+    /// Whether faults may be reported as recoverable to userspace.
+    fn soft_faults(&self) -> bool {
+        true
+    }
+    /// Populate and clean fresh object backing before any WC CPU mapping.
+    fn prepare_new_objects(&self) -> bool {
+        false
+    }
+    /// Optional backend-specific upper bound for a VM_BIND batch.
+    fn bind_batch_limit(&self) -> Option<u32> {
+        None
+    }
+    /// A userspace VM handle was closed; release backend-only registry references.
+    fn vm_closed(&self) {}
     /// Create a new `Vm` with the given range reserved for kernel-managed objects.
     fn new_vm(&self, kernel_range: Range<u64>) -> Result<mmu::Vm>;
     /// Create a new user command queue.

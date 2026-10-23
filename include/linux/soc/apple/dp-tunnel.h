@@ -44,6 +44,16 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
  */
 int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate);
 
+/* T6030's external DPTX port 0 sources feed DP IN0/1 through PCLK1/2. */
+static inline int apple_dp_tunnel_t6030_pclk(unsigned int source, unsigned int dpin)
+{
+	return dpin < 2 && (source == 0 || source == 2) ? (int)dpin : -EOPNOTSUPP;
+}
+
+/* T6030: keep the source owning the pixel clock across rate changes and stop. */
+int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
+				    unsigned int dpin, u8 rate);
+
 /*
  * ATC PHY: wake the DP clock path of a PHY in Thunderbolt/USB4 mode ahead of
  * apple_atc_dp_tunnel_rate(), before DCP is told about the display.
@@ -94,6 +104,40 @@ static inline bool apple_dp_tunnel_mux_matches(struct device_node *dcp,
 	return matches;
 }
 
+/* T6030 boot trees without DPIN names use the same three-output crossbar.
+ * Explicit DPIN/USB4 names remain authoritative, including invalid wiring. */
+static inline bool apple_dp_tunnel_t6030_legacy_mux(struct device_node *dcp,
+						 unsigned int port)
+{
+	struct of_phandle_args base;
+	char name[24];
+	u32 source;
+	bool matches;
+	int index, i;
+
+	if (!of_machine_is_compatible("apple,t6030") || port >= 4 ||
+	    of_property_read_u32_index(dcp, "apple,typec-mux-indices", port, &source) ||
+	    apple_dp_tunnel_t6030_pclk(source, 0) < 0)
+		return false;
+	for (i = 0; i < 2; i++) {
+		snprintf(name, sizeof(name), "typec%u-dpin%u", port, i);
+		if (of_property_match_string(dcp, "mux-control-names", name) >= 0)
+			return false;
+	}
+	snprintf(name, sizeof(name), "typec%u-usb4", port);
+	if (of_property_match_string(dcp, "mux-control-names", name) >= 0)
+		return false;
+	snprintf(name, sizeof(name), "typec%u", port);
+	index = of_property_match_string(dcp, "mux-control-names", name);
+	if (index < 0 || of_parse_phandle_with_args(dcp, "mux-controls",
+						"#mux-control-cells", index, &base))
+		return false;
+	matches = base.args_count == 1 && base.args[0] == 0 &&
+		  of_device_is_compatible(base.np, "apple,t6020-display-crossbar");
+	of_node_put(base.np);
+	return matches;
+}
+
 static inline bool apple_dp_tunnel_route_wired(struct device_node *route,
 					       unsigned int endpoints)
 {
@@ -122,16 +166,18 @@ static inline bool apple_dp_tunnel_route_wired(struct device_node *route,
 	}
 	if (!named[0] && !named[1]) {
 		snprintf(name, sizeof(name), "typec%u-usb4", index);
-		legacy = apple_dp_tunnel_mux_matches(dcp, name, base.np, 1);
+		legacy = apple_dp_tunnel_mux_matches(dcp, name, base.np, 1) ||
+			 apple_dp_tunnel_t6030_legacy_mux(dcp, index);
 	}
 	of_node_put(base.np);
 	return wired && apple_dp_tunnel_wiring_dual(endpoints, named[0], named[1], legacy);
 }
 
 /*
- * Physical DT wiring only: no DCP registration, firmware, status or board list.
+ * DT wiring only: no DCP registration, firmware or display status.
  * Two candidates alone (e.g. j314) are single-stream. Named DPIN0/1 controls,
  * or old-DTB typecN-usb4 cell 1, must share the DP-alt crossbar (cell 0).
+ * T6030 old trees may omit DPIN names on their three-output T602X crossbar.
  * Consumers qualify their SoC flow separately and never select these muxes.
  */
 static inline bool apple_dp_tunnel_dual_stream(struct device_node *connector_np)

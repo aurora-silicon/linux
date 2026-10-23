@@ -14,6 +14,7 @@
 #include <linux/moduleparam.h>
 #include <linux/types.h>
 #include <linux/init.h>
+#include <linux/of.h>
 #include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/regmap.h>
@@ -1110,6 +1111,18 @@ int cs42l42_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
 						      CS42L42_PLL_START_MASK, 0);
 		}
 	} else {
+		/*
+		 * On the admitted base-M1 I2C path, ASoC resume unmutes
+		 * playback while the card is still below D0. The PCM is
+		 * suspended then and the host may not be driving SCLK yet,
+		 * so moving the codec onto it would take the I2C bus down.
+		 * Stay on the oscillator; playback prepare disables PCM RESUME
+		 * so userspace must prepare and send another unmute at D0.
+		 */
+		if (cs42l42->resume_reprepare &&
+		    snd_power_get_state(component->card->snd_card) != SNDRV_CTL_POWER_D0)
+			return 0;
+
 		if (!cs42l42->stream_use) {
 			/* SCLK must be running before codec unmute.
 			 *
@@ -1139,8 +1152,17 @@ int cs42l42_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
 							       (regval & 1),
 							       CS42L42_PLL_LOCK_POLL_US,
 							       CS42L42_PLL_LOCK_TIMEOUT_US);
-				if (ret < 0)
+				if (ret < 0) {
+					/*
+					 * Without a locked PLL the codec has no clock
+					 * once it leaves the oscillator, and then the
+					 * I2C bus stops working. Stay on the oscillator.
+					 */
 					dev_warn(component->dev, "PLL failed to lock: %d\n", ret);
+					snd_soc_component_update_bits(component, CS42L42_PLL_CTL1,
+								      CS42L42_PLL_START_MASK, 0);
+					return ret;
+				}
 
 				/* PLL must be running to drive glitchless switch logic */
 				snd_soc_component_update_bits(component,
@@ -1168,6 +1190,23 @@ int cs42l42_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
 }
 EXPORT_SYMBOL_NS_GPL(cs42l42_mute_stream, "SND_SOC_CS42L42_CORE");
 
+int cs42l42_dai_prepare(struct snd_pcm_substream *substream, struct snd_soc_dai *dai)
+{
+	struct cs42l42_private *cs42l42 = snd_soc_component_get_drvdata(dai->component);
+
+	/*
+	 * Only the admitted base-M1 I2C workaround drops the D2 unmute and
+	 * needs another prepare. Its macaudio topology permits one FE per BE,
+	 * whose runtime is shared. This is not a generic shared-BE workaround:
+	 * generic and SoundWire users retain their existing resume capability.
+	 */
+	if (cs42l42->resume_reprepare && substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+		substream->runtime->info &= ~SNDRV_PCM_INFO_RESUME;
+
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(cs42l42_dai_prepare, "SND_SOC_CS42L42_CORE");
+
 #define CS42L42_FORMATS (SNDRV_PCM_FMTBIT_S16_LE |\
 			 SNDRV_PCM_FMTBIT_S24_LE |\
 			 SNDRV_PCM_FMTBIT_S32_LE)
@@ -1179,6 +1218,7 @@ static const struct snd_soc_dai_ops cs42l42_ops = {
 	.set_sysclk	= cs42l42_set_sysclk,
 	.set_bclk_ratio	= cs42l42_set_bclk_ratio,
 	.mute_stream	= cs42l42_mute_stream,
+	.prepare	= cs42l42_dai_prepare,
 };
 
 struct snd_soc_dai_driver cs42l42_dai = {
@@ -2651,12 +2691,29 @@ static int __maybe_unused cs42l42_i2c_resume(struct device *dev)
 	return 0;
 }
 
+/* No new policy for unqualified hosts, ACPI codecs or SoundWire devices. */
+bool cs42l42_resume_workaround_required(const struct device_node *root,
+					const struct device_node *codec, bool soundwire)
+{
+	if (soundwire || !root || !codec)
+		return false;
+
+	return of_device_is_compatible(root, "apple,t8103") &&
+		(of_device_is_compatible(codec, "cirrus,cs42l42") ||
+		 of_device_is_compatible(codec, "cirrus,cs42l83"));
+}
+
 int cs42l42_common_probe(struct cs42l42_private *cs42l42,
 			 const struct snd_soc_component_driver *component_drv,
 			 struct snd_soc_dai_driver *dai)
 {
+	struct device_node *root = of_find_node_by_path("/");
+	bool reprepare = cs42l42_resume_workaround_required(root, cs42l42->dev->of_node,
+							 !!cs42l42->sdw_peripheral);
 	int ret, i;
 
+	cs42l42->resume_reprepare = reprepare;
+	of_node_put(root);
 	dev_set_drvdata(cs42l42->dev, cs42l42);
 	mutex_init(&cs42l42->irq_lock);
 

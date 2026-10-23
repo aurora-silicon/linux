@@ -52,6 +52,7 @@ long sep_store_read(void *handle, long long off, void *buf, size_t len);
 long sep_store_write(void *handle, long long off, const void *buf,
 			    size_t len);
 int sep_store_sync(void *handle);
+int sep_store_sync_parent(void *handle);
 
 /* -- sha_shim.c --------------------------------------------------------- */
 

@@ -1482,6 +1482,8 @@ unsafe impl Send for UatShared {}
 #[pin_data]
 struct UatInner {
     firmware: UatFirmware,
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    clean_poc: bool,
     #[pin]
     shared: Mutex<UatShared>,
     #[pin]
@@ -1688,6 +1690,15 @@ impl Vm {
             UatPageTable::new(geometry.ias, geometry.oas)?
         };
 
+        #[cfg(CONFIG_DRM_ASAHI_G15)]
+        let page_table = {
+            let mut page_table = page_table;
+            if uat_inner.clean_poc {
+                page_table.enable_clean_poc()?;
+            }
+            page_table
+        };
+
         let (va_range, gpuvm_range) = if is_kernel {
             (geometry.kernel_range(), kernel_range.clone())
         } else {
@@ -1762,6 +1773,63 @@ impl Vm {
         self.context_bindings = Some(context::ContextBindings::new()?);
         self.shared_bindings = Some(shared::SharedBindings::new()?);
         Ok(self)
+    }
+
+    /// Attach a status and job lifetime tracking before sharing a newly created user VM with
+    /// queues, without the G17 canonical context views, shared-object footprints and idle
+    /// residency reclaim of [`Self::with_status`]. Used by G15, whose user objects stay pinned.
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    pub(crate) fn with_tracked_status(mut self) -> Result<Self> {
+        self.status = Some(Arc::pin_init(crate::g17::status::VmStatus::new(), GFP_KERNEL)?);
+        self.lifetime = Some(lifetime::VmLifetime::new()?);
+        Ok(self)
+    }
+
+    /// The identifier this VM was created with (G15 keeps per-VM state keyed by it).
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Copies `buf.len()` bytes of GPU-readable memory at `va` of this VM into `buf`, for admission
+    /// checks of streams the GPU will execute (G15 stream gates).
+    ///
+    /// Every page must be mapped GPU-readable and be RAM; otherwise EFAULT. The lines are cleaned
+    /// and invalidated to the point of coherency first (never only invalidated: CPU-written lines
+    /// may be dirty), so the copy sees what the GPU or a write-combined CPU view stored. The
+    /// mappings cannot change during the copy (GPUVM exec lock).
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    pub(crate) fn read_user(&self, va: u64, buf: &mut [u8]) -> Result {
+        let mut inner = lock_vm(&self.gpuvm, None, false)?;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let address = va.checked_add(done as u64).ok_or(EFAULT)?;
+            let page = address & !(UAT_PGMSK as u64);
+            let within = (address - page) as usize;
+            let count = (buf.len() - done).min(UAT_PGSZ - within);
+            if page < inner.va_range.start || page >= inner.va_range.end {
+                return Err(EFAULT);
+            }
+            let leaf = inner.page_table.leaf_entry(page).map_err(|_| EFAULT)?;
+            if !Prot::from_pte(leaf).allows_gpu(true, false) {
+                return Err(EFAULT);
+            }
+            let phys = inner.page_table.translate_iova(page).map_err(|_| EFAULT)?;
+            // SAFETY: `phys` is checked to be a RAM page; it stays mapped (and its backing pinned)
+            // while the exec lock is held, and is only read here.
+            let ram = unsafe { kernel::page::Page::borrow_phys(&phys) }.ok_or(EFAULT)?;
+            let target = &mut buf[done..done + count];
+            ram.with_pointer_into_page(within, count, |p| {
+                pgtable::clean_invalidate_poc(p, count);
+                pgtable::poc_barrier();
+                // SAFETY: with_pointer_into_page() checked that `count` bytes at `p` are inside the
+                // page, and `target` holds exactly `count` bytes.
+                unsafe { core::ptr::copy_nonoverlapping(p, target.as_mut_ptr(), count) };
+                Ok(())
+            })?;
+            done += count;
+        }
+        Ok(())
     }
 
     /// Status shared by every queue using this VM, if enabled by its GPU.
@@ -2379,7 +2447,149 @@ impl Drop for VmInner {
     }
 }
 
+/// Physical regions of a UAT whose handoff the generation has already established itself
+/// ([`Uat::new_adopted`]). None of them needs to be in the kernel linear map.
+#[cfg(CONFIG_DRM_ASAHI_G15)]
+pub(crate) struct AdoptedRegions {
+    /// The handoff region (PPL magic, lock and flush requests).
+    pub(crate) handoff: Range<PhysicalAddr>,
+    /// The TTBAT.
+    pub(crate) ttbs: Range<PhysicalAddr>,
+    /// The firmware kernel (upper) root, which every user context names as its upper half.
+    pub(crate) kernel_root: PhysicalAddr,
+}
+
 impl Uat {
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    /// Map a region given by its physical range, write-combined.
+    fn map_physical(range: &Range<PhysicalAddr>, min_size: usize) -> Result<UatRegion> {
+        let size: usize = (range.end.checked_sub(range.start).ok_or(EINVAL)?).try_into()?;
+        if size < min_size || (range.start | range.end) & (UAT_PGMSK as PhysicalAddr) != 0 {
+            return Err(EINVAL);
+        }
+        // SAFETY: All-zero is a valid `struct resource` (no name, parent or children).
+        let mut raw: kernel::bindings::resource = unsafe { core::mem::zeroed() };
+        raw.start = range.start;
+        raw.end = range.end - 1;
+        raw.flags = kernel::bindings::IORESOURCE_MEM as _;
+        // SAFETY: `Resource` is a transparent wrapper around `Opaque<bindings::resource>`, and
+        // `raw` describes a valid memory range.
+        let res: io::resource::Resource =
+            unsafe { core::mem::transmute(kernel::types::Opaque::new(raw)) };
+        // A carveout outside System RAM is mapped write-combined; a reserved-memory region
+        // inside System RAM (mapped by the kernel) through the kernel's own mapping, as
+        // `map_region` does for the other generations.
+        let mode = crate::g15::memory_mode(range.start, size as u64)?;
+        let ram = mode == kernel::bindings::MEMREMAP_WB as u32;
+        let flags = if ram {
+            io::mem::MemFlag::WB
+        } else {
+            io::mem::MemFlag::WC
+        };
+        // SAFETY: The UAT regions are only accessed through this mapping by the CPU; the GPU
+        // reaches them through its own translation.
+        let map = unsafe { io::mem::Mem::try_new(res, flags.into()) }?;
+        Ok(UatRegion {
+            base: range.start,
+            map,
+        })
+    }
+
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    /// Creates a `Uat` for a handoff that the caller establishes itself (G15).
+    ///
+    /// This only maps the handoff and the TTBAT (write-combined); neither is written here. The
+    /// caller performs the PPL magic exchange and installs TTBAT context 0 before any user `Vm` is
+    /// bound, naming [`Self::kernel_lower_vm`] as its lower half and `regions.kernel_root` as its
+    /// upper half. Bound user `Vm`s also name `regions.kernel_root` as their upper half.
+    ///
+    /// The firmware kernel root is not in the kernel linear map, so the driver cannot walk it.
+    /// [`Self::kernel_vm`] instead manages the driver window (the kernel range) below a
+    /// driver-owned shadow root that no context names: the caller links the window's second-level
+    /// entries ([`Self::kernel_window_root`]) into the firmware's own table for that window after
+    /// mapping and before the firmware uses the new addresses. Page tables are never freed on
+    /// unmap, so linked entries stay valid.
+    pub(crate) fn new_adopted(
+        dev: &driver::AsahiDrmDevice,
+        geometry: UatGeometry,
+        regions: &AdoptedRegions,
+    ) -> Result<Self> {
+        let handoff_rgn = Self::map_physical(&regions.handoff, HANDOFF_SIZE)?;
+        let ttbs_rgn = Self::map_physical(&regions.ttbs, SLOTS_SIZE)?;
+
+        // SAFETY: The Handoff struct layout matches the firmware's view of memory at this
+        // address, and the region is at least large enough per the check above.
+        let handoff = unsafe { &(handoff_rgn.map.ptr() as *mut Handoff).as_ref().unwrap() };
+
+        let inner = Arc::pin_init(
+            try_pin_init!(UatInner {
+                firmware: UatFirmware::Handoff,
+                // The G15 UAT walker does not snoop the CPU caches.
+                clean_poc: true,
+                handoff_flush <- pin_init::pin_init_array_from_fn(|i| {
+                    new_mutex!(HandoffFlush(&handoff.flush[i]), "handoff_flush")
+                }),
+                shared <- new_mutex!(
+                    UatShared {
+                        kernel_ttb1: regions.kernel_root,
+                        execution_contexts: !EXECUTION_CONTEXT_MASK,
+                        context_generations: [0; UAT_NUM_CTX],
+                        secondary_ttb1: None,
+                        map_kernel_to_user: true,
+                        handoff_rgn,
+                        ttbs_rgn,
+                    },
+                    "uat_shared"
+                ),
+            }),
+            GFP_KERNEL,
+        )?;
+
+        // The shadow root is retained for the lifetime of the driver window it describes.
+        let shadow = kernel::page::Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
+        let shadow_root = kernel::page::Page::into_phys(shadow);
+
+        let kernel_lower_vm =
+            Vm::new(dev.into(), inner.clone(), geometry.user_range(), geometry, None, 1)?;
+        let kernel_vm = Vm::new(
+            dev.into(),
+            inner.clone(),
+            geometry.kernel_range(),
+            geometry,
+            Some(shadow_root),
+            0,
+        )?;
+
+        Ok(Self {
+            dev: dev.into(),
+            geometry,
+            kernel_vm,
+            kernel_lower_vm,
+            inner,
+            slots: slotalloc::SlotAllocator::new(
+                UAT_USER_CTX as u32,
+                (),
+                |_inner, _slot| Some(SlotInner()),
+                c_str!("Uat::SlotAllocator"),
+                static_lock_class!(),
+                static_lock_class!(),
+            )?,
+        })
+    }
+
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    /// Root of the kernel lower `Vm`, for TTBAT context 0 of an adopted handoff.
+    pub(crate) fn kernel_lower_root(&self) -> PhysicalAddr {
+        self.kernel_lower_vm.ttb()
+    }
+
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    /// Root whose driver-window entry names the second-level table of [`Self::kernel_vm`]'s
+    /// driver window. With [`Self::new_adopted`] this is the shadow root that no context names.
+    pub(crate) fn kernel_window_root(&self) -> PhysicalAddr {
+        self.kernel_vm.ttb()
+    }
+
     /// Map a bootloader-preallocated memory region
     fn map_region(
         dev: &device::Device,
@@ -2719,6 +2929,8 @@ impl Uat {
         Arc::pin_init(
             try_pin_init!(UatInner {
                 firmware,
+                #[cfg(CONFIG_DRM_ASAHI_G15)]
+                clean_poc: false,
                 handoff_flush <- pin_init::pin_init_array_from_fn(|i| {
                     new_mutex!(HandoffFlush(&handoff.flush[i]), "handoff_flush")
                 }),

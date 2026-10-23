@@ -103,3 +103,16 @@ no port down and checks that none comes up. A failed USB3 power-off or reset
 leaves dwc3 out of host mode, and a fixed-hub host whose PIPE cannot be routed
 still starts. Each fixture detects these from the source, so the expectations
 for sources without the handover remain.
+
+The standalone plane-layout.py test executes the production atomic check and
+update, the DRM block-format descriptors, and the surface structs with synthetic
+GEM sizes. It checks RGB8/RGB10/FP16 and semiplanar YUV layouts, tile padding,
+metadata, offsets, GEM boundaries, arithmetic overflow and invisible planes.
+Packed P030/P230 remain supported for LINEAR; INTERCHANGE is refused and omitted
+from per-format modifier advertisement until its packed tile layout is known.
+DRM's three-pixel block descriptor establishes linear storage, not how those
+blocks cross the interchange tile and compression-subtile boundaries.
+Run `./plane-layout.py --mutations --ref <old-public-revision> --output <dir>`
+to retain the compiled before/after controls, baseline reproducer and runtime
+mutation results. A compile failure never counts as a mutation kill. DRM
+clipping, GEM/DMA allocation and firmware execution are outside this host test.

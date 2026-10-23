@@ -13,11 +13,13 @@
 #include <linux/dma-mapping.h>
 #include <linux/jiffies.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
 #include <linux/soc/apple/dp-tunnel.h>
+#include <linux/soc/apple/display.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -53,6 +55,55 @@
 struct apple_drm_private {
 	struct drm_device drm;
 };
+
+/* Component readiness is later than platform probe/bind. */
+static DEFINE_MUTEX(apple_t6030_display_lock);
+static struct device *apple_t6030_display;
+
+static int apple_t6030_display_publish(struct device *dev)
+{
+	if (!of_device_is_compatible(dev->of_node, "apple,t6030-display-subsystem"))
+		return 0;
+	guard(mutex)(&apple_t6030_display_lock);
+	if (apple_t6030_display)
+		return apple_t6030_display == dev ? 0 : -EBUSY;
+	apple_t6030_display = get_device(dev);
+	return 0;
+}
+
+static void apple_t6030_display_withdraw(struct device *dev)
+{
+	struct device *old = NULL;
+
+	scoped_guard(mutex, &apple_t6030_display_lock) {
+		if (apple_t6030_display == dev) {
+			old = apple_t6030_display;
+			apple_t6030_display = NULL;
+		}
+	}
+	put_device(old);
+}
+
+/* Initial G15 firmware startup must follow successful native display setup.
+ * The component's device lock does not serialize component bind/unbind, so
+ * publish separately. This lock protects only publication and a device link;
+ * no display calls or firmware RPC run while it is held.
+ */
+int apple_drm_t6030_link_device(struct device *consumer)
+{
+	struct device_link *link;
+
+	if (!of_machine_is_compatible("apple,t6030") || !consumer->of_node ||
+	    !of_device_is_compatible(consumer->of_node, "apple,agx-t6030"))
+		return -ENODEV;
+	guard(mutex)(&apple_t6030_display_lock);
+	if (!apple_t6030_display)
+		return -EPROBE_DEFER;
+	link = device_link_add(consumer, apple_t6030_display,
+			       DL_FLAG_AUTOREMOVE_CONSUMER);
+	return link ? 0 : -EINVAL;
+}
+EXPORT_SYMBOL_GPL(apple_drm_t6030_link_device);
 
 DEFINE_DRM_GEM_DMA_FOPS(apple_fops);
 
@@ -729,15 +780,13 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 			 * lowest-indexed Type-C-only pipeline (dcpext1). Fix the
 			 * connector to it: compositors read possible_crtcs once
 			 * and would otherwise pair it with a pipeline the stream
-			 * can never be routed to.
+			 * can never be routed to. T6030 instead narrows both
+			 * connectors to the native processor holding their route.
 			 */
-			if (secondary) {
-				if (dcp_is_typec_only(dcp[i]) &&
-				    (!mask || crtc_mask[i] < mask))
-					mask = crtc_mask[i];
-				continue;
-			}
-			mask |= crtc_mask[i];
+			mask = dcp_fabric_port_crtc_mask(secondary,
+						       dcp_typec_ordered_dual_stream(),
+						       dcp_is_typec_only(dcp[i]),
+						       mask, crtc_mask[i]);
 		}
 
 		if (!mask) {
@@ -1039,6 +1088,13 @@ static int apple_drm_init(struct device *dev)
 
 	drm_client_setup_with_fourcc(&apple->drm, DRM_FORMAT_XRGB8888);
 
+	/* A subsequent successful platform probe retries deferred GPU probes. */
+	ret = apple_t6030_display_publish(dev);
+	if (ret) {
+		drm_dev_unregister(&apple->drm);
+		goto err_unbind;
+	}
+
 	return 0;
 
 err_unbind:
@@ -1054,6 +1110,8 @@ err_components:
 static void apple_drm_uninit(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
+
+	apple_t6030_display_withdraw(dev);
 
 	apple_drm_quiesce_connectors(&apple->drm);
 	drm_dev_unplug(&apple->drm);

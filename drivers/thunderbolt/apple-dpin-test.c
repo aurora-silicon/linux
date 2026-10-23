@@ -192,7 +192,7 @@ static void run_trace(struct kunit *test, const struct apple_dpin_policy *profil
 	}
 }
 
-static void apple_dpin_m1_capacity_trace(struct kunit *test)
+static void apple_dpin_capacity_trace(struct kunit *test)
 {
 	const struct dpin_trace trace[] = {
 		{ APPLE_DPIN_UP, false, 0, APPLE_DPIN_QUEUE, APPLE_DPIN_ACTIVATING },
@@ -217,6 +217,7 @@ static void apple_dpin_m1_capacity_trace(struct kunit *test)
 	};
 
 	run_trace(test, &apple_dpin_m1, trace, ARRAY_SIZE(trace));
+	run_trace(test, &apple_dpin_m3, trace, ARRAY_SIZE(trace));
 }
 
 static void apple_dpin_t602x_rearm_trace(struct kunit *test)
@@ -388,10 +389,11 @@ static void apple_dpin_all_policy_fields(struct kunit *test)
 		  TB_HOST_DP_HPD_ON_ACTIVATE | TB_HOST_DP_ACTIVE_BEFORE_DPRX |
 		  TB_HOST_DP_KEEP_DPRX_TIMEOUT | TB_HOST_DP_ADAPTER_QUIRKS |
 		  TB_HOST_DP_INITIAL_BW_GRANT },
-		{ APPLE_DPIN_CHANGED, false, false, false, false, TB_HOST_DP_NOTIFY },
+		{ APPLE_DPIN_CHANGED, true, false, false, true, TB_HOST_DP_NOTIFY },
 	};
 	unsigned int i, queue, display;
 
+	KUNIT_ASSERT_EQ(test, ARRAY_SIZE(actual), ARRAY_SIZE(expected));
 	for (i = 0; i < ARRAY_SIZE(actual); i++) {
 		KUNIT_EXPECT_EQ(test, actual[i]->flow, expected[i].flow);
 		KUNIT_EXPECT_EQ(test, actual[i]->capacity_retry, expected[i].capacity_retry);
@@ -529,7 +531,7 @@ static void apple_dpin_sleep_handed_and_policy_scope(struct kunit *test)
 	struct apple_dpin_state s = { .alive = true, .handed = true,
 				      .phase = APPLE_DPIN_HANDED };
 	const struct apple_dpin_policy * const unaffected[] = {
-		&apple_dpin_m2, &apple_dpin_m3,
+		&apple_dpin_m2,
 	};
 	unsigned int i, actions;
 
@@ -602,7 +604,8 @@ static void apple_dpin_sleep_dprx_retention(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_dpin_awaits_display(&s, &apple_dpin_m1));
 	s.handed = false;
 	KUNIT_EXPECT_FALSE(test, apple_dpin_awaits_display(&s, &apple_dpin_m2));
-	KUNIT_EXPECT_FALSE(test, apple_dpin_awaits_display(&s, &apple_dpin_m3));
+	apple_dpin_step(&s, &apple_dpin_m3, APPLE_DPIN_UP, false, 0);
+	KUNIT_EXPECT_TRUE(test, apple_dpin_awaits_display(&s, &apple_dpin_m3));
 }
 
 static void apple_dpin_sleep_complete_before_work(struct kunit *test)
@@ -1086,7 +1089,75 @@ static void apple_dpin_provider_unavailable(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, fake.references, 0U);
 }
 
+static void apple_dpin_m3_capacity_suspend(struct kunit *test)
+{
+	struct apple_dpin_state s = {};
+	struct apple_dpin_tokens tokens = {};
+	const struct apple_dpin_policy *p = &apple_dpin_m3;
+
+	apple_dpin_step(&s, p, APPLE_DPIN_UP, false, 0);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_WORK, false, 0),
+			APPLE_DPIN_ATTACH);
+	apple_dpin_step(&s, p, APPLE_DPIN_ADMITTED, true, 0);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RESULT, true, -EBUSY),
+			APPLE_DPIN_FIRST_WAIT | APPLE_DPIN_ARM_RETRY);
+	KUNIT_EXPECT_TRUE(test, apple_dpin_awaits_display(&s, p));
+	apple_dpin_step(&s, p, APPLE_DPIN_PAUSE, true, 0);
+	KUNIT_EXPECT_TRUE(test, apple_dpin_admission_blocked(&s, p, false));
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RETRY, true, 0), 0U);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_WORK, true, 0), 0U);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RESUME, true, 0),
+			APPLE_DPIN_ARM_RETRY);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_admission_blocked(&s, p, false));
+	apple_dpin_step(&s, p, APPLE_DPIN_RETRY, true, 0);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_WORK, true, 0),
+			APPLE_DPIN_ATTACH);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RESULT, true, 0),
+			APPLE_DPIN_RECOVERED | APPLE_DPIN_LOG_CONNECTED | APPLE_DPIN_AGAIN);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_awaits_display(&s, p));
+	/* A handed callback remains valid while new admission is paused. */
+	apple_dpin_token_request(&tokens, 1, true);
+	apple_dpin_token_admit(&tokens, 1);
+	apple_dpin_token_complete(&tokens, 1);
+	apple_dpin_step(&s, p, APPLE_DPIN_PAUSE, true, 0);
+	KUNIT_EXPECT_TRUE(test, apple_dpin_token_access(&tokens, 1));
+	KUNIT_EXPECT_FALSE(test, apple_dpin_awaits_display(&s, p));
+	/* A replacement request revokes the old token during the same gate. */
+	apple_dpin_token_request(&tokens, 2, true);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_token_access(&tokens, 1));
+	KUNIT_EXPECT_FALSE(test, apple_dpin_token_complete(&tokens, 1));
+	apple_dpin_step(&s, p, APPLE_DPIN_DOWN, true, 0);
+	apple_dpin_step(&s, p, APPLE_DPIN_WORK, true, 0);
+	apple_dpin_step(&s, p, APPLE_DPIN_DROPPED, false, 0);
+	apple_dpin_step(&s, p, APPLE_DPIN_UP, false, 0);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_WORK, false, 0), 0U);
+	KUNIT_EXPECT_TRUE(test, apple_dpin_awaits_display(&s, p));
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RESUME, false, 0),
+			APPLE_DPIN_QUEUE);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_WORK, false, 0),
+			APPLE_DPIN_ATTACH);
+	apple_dpin_token_admit(&tokens, 2);
+	KUNIT_EXPECT_TRUE(test, apple_dpin_token_access(&tokens, 2));
+	/* Removal drains the request, then resets a gate with no complete(). */
+	apple_dpin_step(&s, p, APPLE_DPIN_PAUSE, true, 0);
+	apple_dpin_step(&s, p, APPLE_DPIN_DOWN, true, 0);
+	apple_dpin_step(&s, p, APPLE_DPIN_WORK, true, 0);
+	apple_dpin_step(&s, p, APPLE_DPIN_DROPPED, false, 0);
+	apple_dpin_token_revoke(&tokens, 2);
+	apple_dpin_step(&s, p, APPLE_DPIN_END_PM_GATE, false, 0);
+	KUNIT_EXPECT_FALSE(test, s.paused);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_token_access(&tokens, 2));
+	apple_dpin_step(&s, p, APPLE_DPIN_UP, false, 0);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_WORK, false, 0),
+			APPLE_DPIN_ATTACH);
+	/* An unsupported DP IN ends the wait instead of retaining DPRX forever. */
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RESULT, true, -EOPNOTSUPP),
+			APPLE_DPIN_CANCEL_RETRY | APPLE_DPIN_WARN);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_awaits_display(&s, p));
+}
+
 static struct kunit_case apple_dpin_cases[] = {
+	KUNIT_CASE(apple_dpin_m3_capacity_suspend),
 	KUNIT_CASE(apple_dpin_provider_handed_lifetime),
 	KUNIT_CASE(apple_dpin_provider_failed_retry),
 	KUNIT_CASE(apple_dpin_provider_unavailable),
@@ -1111,7 +1182,7 @@ static struct kunit_case apple_dpin_cases[] = {
 	KUNIT_CASE(apple_dpin_sleep_handed_and_policy_scope),
 	KUNIT_CASE(apple_dpin_sleep_complete_races_deferral),
 	KUNIT_CASE(apple_dpin_exhaustive_equivalence),
-	KUNIT_CASE(apple_dpin_m1_capacity_trace),
+	KUNIT_CASE(apple_dpin_capacity_trace),
 	KUNIT_CASE(apple_dpin_t602x_rearm_trace),
 	KUNIT_CASE(apple_dpin_preserve_paused_event),
 	KUNIT_CASE(apple_dpin_preserve_coalesced_replace),

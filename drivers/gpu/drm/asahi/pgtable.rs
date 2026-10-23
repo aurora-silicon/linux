@@ -53,6 +53,75 @@ const UAT_LEVELS: usize = 3;
 /// Number of address bits below the index of a top-level page table entry.
 pub(crate) const UAT_TOP_LEVEL_SHIFT: usize = UAT_PGBIT + (UAT_LEVELS - 1) * UAT_LVBIT;
 
+/// Size of the smallest CPU data cache line (`CTR_EL0.DminLine`).
+#[inline(always)]
+fn dcache_line_size() -> usize {
+    let ctr: u64;
+    // SAFETY: CTR_EL0 is readable at EL1 and reading it has no side effects.
+    unsafe {
+        core::arch::asm!(
+            "mrs {ctr}, ctr_el0",
+            ctr = out(reg) ctr,
+            options(nomem, nostack, preserves_flags)
+        )
+    };
+    4 << ((ctr >> 16) & 0xf)
+}
+
+/// Cleans the CPU data cache lines covering `len` bytes at `ptr` to the point of coherency, for an
+/// agent that does not snoop the CPU caches. [`poc_barrier`] completes the maintenance.
+pub(crate) fn clean_poc(ptr: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let line = dcache_line_size();
+    let end = ptr as usize + len;
+    let mut addr = ptr as usize & !(line - 1);
+    while addr < end {
+        // SAFETY: Cleaning a cache line of a mapped kernel address writes dirty data back without
+        // changing memory contents. The asm is a compiler barrier, so earlier stores are emitted
+        // first, and the architecture orders them with the clean of the same line.
+        unsafe {
+            core::arch::asm!(
+                "dc cvac, {addr}",
+                addr = in(reg) addr,
+                options(nostack, preserves_flags)
+            )
+        };
+        addr += line;
+    }
+}
+
+/// Cleans and invalidates the CPU data cache lines covering `len` bytes at `ptr` to the point of
+/// coherency, so that later CPU reads observe what a non-snooping agent wrote. Lines the CPU wrote
+/// are written back first. [`poc_barrier`] completes the maintenance.
+#[cfg(CONFIG_DRM_ASAHI_G15)]
+pub(crate) fn clean_invalidate_poc(ptr: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let line = dcache_line_size();
+    let end = ptr as usize + len;
+    let mut addr = ptr as usize & !(line - 1);
+    while addr < end {
+        // SAFETY: Clean+invalidate of a mapped kernel address never discards dirty data.
+        unsafe {
+            core::arch::asm!(
+                "dc civac, {addr}",
+                addr = in(reg) addr,
+                options(nostack, preserves_flags)
+            )
+        };
+        addr += line;
+    }
+}
+
+/// Completes earlier point-of-coherency maintenance for the outer shareable domain (`dsb osh`).
+pub(crate) fn poc_barrier() {
+    // SAFETY: Barriers are always safe.
+    unsafe { core::arch::asm!("dsb osh", options(nostack, preserves_flags)) };
+}
+
 /// Runs `f` on the first `count` top-level entries of the root page table at `ttb`.
 ///
 /// # Safety
@@ -184,6 +253,11 @@ impl Prot {
         Self { memattr, ..*self }
     }
 
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    pub(crate) const fn leaf_bits(&self) -> u64 {
+        self.as_pte()
+    }
+
     const fn as_pte(&self) -> u64 {
         (self.ap as u64) << UAT_AP_SHIFT
             | (self.high_bits as u64) << UAT_HIGH_BITS_SHIFT
@@ -229,6 +303,10 @@ pub(crate) struct UatPageTable {
     va_range: Range<u64>,
     ias_mask: u64,
     oas_mask: u64,
+    /// Clean new tables and changed entries to the point of coherency, for a UAT walker that does
+    /// not snoop the CPU caches ([`Self::enable_clean_poc`]).
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    clean_poc: bool,
 }
 
 impl UatPageTable {
@@ -243,7 +321,41 @@ impl UatPageTable {
             va_range: 0..(1u64 << ias),
             ias_mask: (1u64 << ias) - 1,
             oas_mask: (1u64 << oas) - 1,
+            #[cfg(CONFIG_DRM_ASAHI_G15)]
+            clean_poc: false,
         })
+    }
+
+    /// Makes every later change of this page table visible to a UAT walker that does not snoop the
+    /// CPU caches (G15), and cleans the root, which was zeroed through the cacheable linear map.
+    ///
+    /// From now on, a new table page is cleaned before its parent descriptor names it, a changed
+    /// table or leaf descriptor is cleaned after the store, and every mutating walk ends with a
+    /// `dsb osh`. Call it before anything is mapped and before any context names the root.
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    pub(crate) fn enable_clean_poc(&mut self) -> Result {
+        self.clean_poc = true;
+        // SAFETY: The root is a RAM page owned or borrowed by this page table for its lifetime.
+        let root = unsafe { Page::borrow_phys(&self.ttb) }.ok_or(EIO)?;
+        root.with_pointer_into_page(0, UAT_PGSZ, |p| {
+            clean_poc(p, UAT_PGSZ);
+            Ok(())
+        })?;
+        poc_barrier();
+        Ok(())
+    }
+
+    /// Whether changes are cleaned to the point of coherency (always false without G15 support).
+    #[inline(always)]
+    fn cleans_poc(&self) -> bool {
+        #[cfg(CONFIG_DRM_ASAHI_G15)]
+        {
+            self.clean_poc
+        }
+        #[cfg(not(CONFIG_DRM_ASAHI_G15))]
+        {
+            false
+        }
     }
 
     /// Borrow a root; track individual child ownership only when other agents
@@ -284,6 +396,8 @@ impl UatPageTable {
             va_range,
             ias_mask: (1u64 << ias) - 1,
             oas_mask: (1u64 << oas) - 1,
+            #[cfg(CONFIG_DRM_ASAHI_G15)]
+            clean_poc: false,
         })
     }
 
@@ -291,16 +405,48 @@ impl UatPageTable {
         self.ttb
     }
 
-    fn with_pages<F>(
+    /// Walks the leaves of `iova_range` without changing them.
+    fn with_pages<F>(&mut self, iova_range: Range<u64>, alloc: bool, free: bool, cb: F) -> Result
+    where
+        F: FnMut(u64, &[Pte]) -> Result,
+    {
+        self.walk(iova_range, alloc, free, false, cb)
+    }
+
+    /// Walks the leaves of `iova_range`, which `cb` may change (`mutate`).
+    ///
+    /// With point-of-coherency cleaning enabled, the changed leaves are cleaned after `cb`, and a
+    /// walk that may have changed any descriptor ends with a barrier, also on failure.
+    fn walk<F>(
         &mut self,
         iova_range: Range<u64>,
         alloc: bool,
         free: bool,
+        mutate: bool,
+        cb: F,
+    ) -> Result
+    where
+        F: FnMut(u64, &[Pte]) -> Result,
+    {
+        let result = self.walk_inner(iova_range, alloc, free, mutate, cb);
+        if self.cleans_poc() && (alloc || free || mutate) {
+            poc_barrier();
+        }
+        result
+    }
+
+    fn walk_inner<F>(
+        &mut self,
+        iova_range: Range<u64>,
+        alloc: bool,
+        free: bool,
+        mutate: bool,
         mut cb: F,
     ) -> Result
     where
         F: FnMut(u64, &[Pte]) -> Result,
     {
+        let clean = self.cleans_poc();
         mod_pr_debug!(
             "UATPageTable::with_pages: {:#x?} alloc={} free={}\n",
             iova_range,
@@ -382,6 +528,14 @@ impl UatPageTable {
                             if upte_val == 0 && alloc {
                                 let pt_page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
                                 mod_pr_debug!("UATPageTable::with_pages: alloc PT at {:#x}\n", pt_page.phys());
+                                if clean {
+                                    // A non-snooping walker must never follow a parent to a
+                                    // table whose zeroes are still in the CPU caches.
+                                    pt_page.with_pointer_into_page(0, UAT_PGSZ, |p| {
+                                        clean_poc(p, UAT_PGSZ);
+                                        Ok(())
+                                    })?;
+                                }
                                 if let Some(tables) = self.driver_tables.as_mut() {
                                     tables.push(pt_page.phys(), GFP_KERNEL)?;
                                 }
@@ -393,6 +547,9 @@ impl UatPageTable {
                                 // already-visible parent against earlier clears.
                                 crate::mem::sync();
                                 upte.store(upte_val, Ordering::Relaxed);
+                                if clean {
+                                    clean_poc(uptep.cast(), PTE_SIZE);
+                                }
                             }
                             if upte_val & PTE_TYPE_BITS == PTE_TYPE_LEAF_TABLE {
                                 Ok(Some(upte_val & self.oas_mask & (!UAT_PGMSK as u64)))
@@ -448,8 +605,12 @@ impl UatPageTable {
                 // SAFETY: We know this is a valid pointer to PTEs and the range is valid and
                 // checked by with_pointer_into_page().
                 let ptes = unsafe { core::slice::from_raw_parts(ptep, count) };
-                cb(iova, ptes)?;
-                Ok(())
+                let result = cb(iova, ptes);
+                if clean && mutate {
+                    // Also after a partial change: the callback may have stored some leaves.
+                    clean_poc(p, count * PTE_SIZE);
+                }
+                result
             })?;
 
             let block = 1 << (UAT_PGBIT + UAT_LVBIT);
@@ -505,6 +666,9 @@ impl UatPageTable {
                     return Err(EIO);
                 }
                 pte.store(0, Ordering::Release);
+                if self.cleans_poc() {
+                    clean_poc(p, PTE_SIZE);
+                }
                 Ok(())
             })?;
         }
@@ -625,7 +789,7 @@ impl UatPageTable {
 
         let pte_bits = self.pte_bits();
 
-        self.with_pages(iova_range, true, false, |iova, ptes| {
+        self.walk(iova_range, true, false, true, |iova, ptes| {
             for (idx, pte) in ptes.iter().enumerate() {
                 let ptev = pte.load(Ordering::Relaxed);
                 if ptev != 0 {
@@ -650,7 +814,7 @@ impl UatPageTable {
             iova_range,
             prot
         );
-        self.with_pages(iova_range, true, false, |iova, ptes| {
+        self.walk(iova_range, true, false, true, |iova, ptes| {
             for (idx, pte) in ptes.iter().enumerate() {
                 let ptev = pte.load(Ordering::Relaxed);
                 if ptev & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
@@ -669,7 +833,7 @@ impl UatPageTable {
 
     pub(crate) fn unmap_pages(&mut self, iova_range: Range<u64>) -> Result {
         mod_pr_debug!("UATPageTable::unmap_pages: {:#x?}\n", iova_range);
-        self.with_pages(iova_range, false, false, |iova, ptes| {
+        self.walk(iova_range, false, false, true, |iova, ptes| {
             for (idx, pte) in ptes.iter().enumerate() {
                 if pte.load(Ordering::Relaxed) & PTE_TYPE_LEAF_TABLE == 0 {
                     pr_err!(
@@ -686,7 +850,7 @@ impl UatPageTable {
     /// Discards an aligned map operation that failed before acquiring a GPUVA owner.
     /// Missing tables and leaves are expected; existing table storage stays allocated.
     pub(crate) fn discard_partial_map(&mut self, iova_range: Range<u64>) -> Result {
-        self.with_pages(iova_range, false, false, |_, ptes| {
+        self.walk(iova_range, false, false, true, |_, ptes| {
             for pte in ptes {
                 pte.store(0, Ordering::Relaxed);
             }

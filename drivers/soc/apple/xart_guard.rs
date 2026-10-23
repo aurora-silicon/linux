@@ -27,9 +27,12 @@
 //! a guard that blocks matching from one that has refused nothing yet.
 //!
 //! The list entry is made durable before the enclave's write reaches the
-//! gigalocker. A crash between the two leaves an entry for a record that was
-//! never written, which is harmless. It can never leave a Linux record that
-//! the next boot treats as another OS's.
+//! gigalocker, and the list's own directory entry is flushed before anything
+//! is adopted; the key is listed in memory only once its entry is written and
+//! flushed. A crash between the two durable points leaves an entry for a
+//! record that was never written, which is harmless, and a failed adoption is
+//! retried in the same slot rather than skipped. It can never leave a Linux
+//! record that the next boot treats as another OS's.
 
 use crate::shim::StoreFile;
 use crate::xart_store::{crc32_ieee, Key};
@@ -167,6 +170,8 @@ pub(crate) trait ListFile {
     fn read_exact(&self, off: u64, buf: &mut [u8]) -> Result<()>;
     fn write_all(&self, off: u64, buf: &[u8]) -> Result<()>;
     fn sync(&self) -> Result<()>;
+    /// Makes the file's directory entry durable.
+    fn sync_parent(&self) -> Result<()>;
 }
 
 impl ListFile for StoreFile {
@@ -184,6 +189,10 @@ impl ListFile for StoreFile {
 
     fn sync(&self) -> Result<()> {
         StoreFile::sync(self)
+    }
+
+    fn sync_parent(&self) -> Result<()> {
+        StoreFile::sync_parent(self)
     }
 }
 
@@ -223,6 +232,11 @@ impl<F: ListFile> Guard<F> {
             existed: existing,
             refused: 0,
         };
+        // A list created this boot (or by a crashed one) is only safe to adopt
+        // into once its name is durable: fsync() of the file alone does not
+        // guarantee that. If the directory cannot be flushed, the file is
+        // dropped and nothing is adopted, as without a list.
+        let file = file.and_then(|file| file.sync_parent().map(|()| file));
         match file {
             Ok(file) => {
                 if let Err(e) = guard.load(&file) {
@@ -302,10 +316,18 @@ impl<F: ListFile> Guard<F> {
         if usize::try_from(self.end).map_or(true, |end| end / ENTRY_SIZE >= MAX_ENTRIES) {
             return Err(ENOSPC);
         }
+        // Reserve room for the in-memory key before writing, so an entry made
+        // durable is always listed in memory as well: no allocation can fail
+        // after a record is written.
+        self.owned.reserve(1, GFP_KERNEL)?;
         file.write_all(self.end, &encode(key))?;
         file.sync()?;
+        // Only now that the entry is written and flushed: list it (into the
+        // reserved slot, which cannot fail) and then advance the end. A failed
+        // write or flush above leaves the end unchanged, so the next adoption
+        // overwrites this slot, which holds no record the enclave kept.
+        self.owned.push_within_capacity(*key).map_err(|_| ENOMEM)?;
         self.end += ENTRY_SIZE as u64;
-        self.owned.push(*key, GFP_KERNEL)?;
         Ok(())
     }
 
@@ -346,7 +368,7 @@ impl<F: ListFile> Guard<F> {
 #[kernel::macros::kunit_tests(apple_sep_xart_guard)]
 mod tests {
     use super::*;
-    use core::cell::RefCell;
+    use core::cell::{Cell, RefCell};
 
     fn session(byte: u8) -> Key {
         Key::new(4, [byte; 16])
@@ -442,8 +464,34 @@ mod tests {
         assert_eq!(decode(&encode(&key)[..31]), None);
     }
 
-    /// A list file in memory, kept across the guards of successive boots.
-    struct MemFile<'a>(&'a RefCell<KVec<u8>>);
+    /// Failures a [`MemFile`] reports, switchable while a guard holds it.
+    #[derive(Default)]
+    struct Faults {
+        /// The write fails and changes nothing.
+        write: Cell<bool>,
+        /// The write lands, but the flush after it fails.
+        sync: Cell<bool>,
+        /// The directory entry cannot be flushed.
+        parent: Cell<bool>,
+    }
+
+    /// A list file in memory, kept across the guards of successive boots, with
+    /// optional injected faults.
+    struct MemFile<'a>(&'a RefCell<KVec<u8>>, Option<&'a Faults>);
+
+    fn mem(bytes: &RefCell<KVec<u8>>) -> MemFile<'_> {
+        MemFile(bytes, None)
+    }
+
+    fn faulty<'a>(bytes: &'a RefCell<KVec<u8>>, faults: &'a Faults) -> MemFile<'a> {
+        MemFile(bytes, Some(faults))
+    }
+
+    impl MemFile<'_> {
+        fn fails(&self, fault: impl Fn(&Faults) -> &Cell<bool>) -> bool {
+            self.1.is_some_and(|faults| fault(faults).get())
+        }
+    }
 
     impl ListFile for MemFile<'_> {
         fn size(&self) -> Result<u64> {
@@ -459,6 +507,9 @@ mod tests {
         }
 
         fn write_all(&self, off: u64, buf: &[u8]) -> Result<()> {
+            if self.fails(|f| &f.write) {
+                return Err(EIO);
+            }
             let mut bytes = self.0.borrow_mut();
             let off = usize::try_from(off).map_err(|_| EINVAL)?;
             let end = off.checked_add(buf.len()).ok_or(EINVAL)?;
@@ -470,6 +521,16 @@ mod tests {
         }
 
         fn sync(&self) -> Result<()> {
+            if self.fails(|f| &f.sync) {
+                return Err(EIO);
+            }
+            Ok(())
+        }
+
+        fn sync_parent(&self) -> Result<()> {
+            if self.fails(|f| &f.parent) {
+                return Err(EIO);
+            }
             Ok(())
         }
     }
@@ -496,7 +557,7 @@ mod tests {
     fn a_guard_refuses_another_os_record() -> Result<()> {
         let bytes = RefCell::new(KVec::new());
         let foreign = session(1);
-        let mut guard = Guard::with_file(1, keys(&[foreign])?, Ok(MemFile(&bytes)));
+        let mut guard = Guard::with_file(1, keys(&[foreign])?, Ok(mem(&bytes)));
         assert_eq!(guard.effective_level(), 1);
         assert!(guard.list_loaded());
         assert_eq!(guard.check(&foreign, true), Err(EPERM));
@@ -512,7 +573,7 @@ mod tests {
         let mut list = KVec::new();
         list.extend_from_slice(&encode(&own), GFP_KERNEL)?;
         let bytes = RefCell::new(list);
-        let mut guard = Guard::with_file(1, keys(&[own])?, Ok(MemFile(&bytes)));
+        let mut guard = Guard::with_file(1, keys(&[own])?, Ok(mem(&bytes)));
         assert_eq!(guard.check(&own, true), Ok(()));
         assert_eq!(guard.check(&own, false), Ok(()));
         // An entry that is already listed is not written again.
@@ -527,13 +588,13 @@ mod tests {
         let created = session(3);
 
         // First boot: the enclave creates a record, which is listed first.
-        let mut guard = Guard::with_file(1, keys(&[foreign])?, Ok(MemFile(&bytes)));
+        let mut guard = Guard::with_file(1, keys(&[foreign])?, Ok(mem(&bytes)));
         assert_eq!(guard.check(&created, true), Ok(()));
         assert_eq!(listed(&bytes).as_slice(), &[Some(created)]);
         drop(guard);
 
         // Next boot: both records predate the guard; only Linux's is writable.
-        let mut guard = Guard::with_file(1, keys(&[foreign, created])?, Ok(MemFile(&bytes)));
+        let mut guard = Guard::with_file(1, keys(&[foreign, created])?, Ok(mem(&bytes)));
         assert_eq!(guard.check(&created, true), Ok(()));
         assert_eq!(guard.check(&created, false), Ok(()));
         assert_eq!(guard.check(&foreign, true), Err(EPERM));
@@ -551,7 +612,7 @@ mod tests {
         list.extend_from_slice(&encode(&second)[..10], GFP_KERNEL)?;
         let bytes = RefCell::new(list);
 
-        let mut guard = Guard::with_file(1, keys(&[first])?, Ok(MemFile(&bytes)));
+        let mut guard = Guard::with_file(1, keys(&[first])?, Ok(mem(&bytes)));
         assert_eq!(guard.check(&first, true), Ok(()));
         assert_eq!(guard.check(&second, true), Ok(()));
         assert_eq!(listed(&bytes).as_slice(), &[Some(first), Some(second)]);
@@ -580,14 +641,14 @@ mod tests {
             all.push(numbered(i), GFP_KERNEL)?;
         }
         let bytes = RefCell::new(list_of(&all)?);
-        let mut guard = Guard::with_file(1, KVec::new(), Ok(MemFile(&bytes)));
+        let mut guard = Guard::with_file(1, KVec::new(), Ok(mem(&bytes)));
         assert!(guard.file.is_some());
         assert_eq!(guard.check(&numbered(MAX_ENTRIES), true), Err(ENOSPC));
         assert_eq!(bytes.borrow().len(), MAX_ENTRIES * ENTRY_SIZE);
         drop(guard);
         // Reopened: still within what load() accepts, and Linux's records
         // are still Linux's.
-        let mut guard = Guard::with_file(1, keys(&[numbered(7)])?, Ok(MemFile(&bytes)));
+        let mut guard = Guard::with_file(1, keys(&[numbered(7)])?, Ok(mem(&bytes)));
         assert!(guard.file.is_some());
         assert_eq!(guard.check(&numbered(7), true), Ok(()));
         Ok(())
@@ -603,13 +664,13 @@ mod tests {
             all.push(numbered(i % distinct), GFP_KERNEL)?;
         }
         let bytes = RefCell::new(list_of(&all)?);
-        let mut guard = Guard::with_file(1, KVec::new(), Ok(MemFile(&bytes)));
+        let mut guard = Guard::with_file(1, KVec::new(), Ok(mem(&bytes)));
         assert_eq!(guard.owned.len(), distinct);
         // Appending would make a list the next boot refuses.
         assert_eq!(guard.check(&numbered(MAX_ENTRIES), true), Err(ENOSPC));
         assert_eq!(bytes.borrow().len(), MAX_ENTRIES * ENTRY_SIZE);
         drop(guard);
-        let guard = Guard::with_file(1, KVec::new(), Ok(MemFile(&bytes)));
+        let guard = Guard::with_file(1, KVec::new(), Ok(mem(&bytes)));
         assert!(guard.file.is_some());
         Ok(())
     }
@@ -624,13 +685,13 @@ mod tests {
         list.extend_from_slice(&encode(&numbered(MAX_ENTRIES))[..10], GFP_KERNEL)?;
         let bytes = RefCell::new(list);
 
-        let mut guard = Guard::with_file(1, KVec::new(), Ok(MemFile(&bytes)));
+        let mut guard = Guard::with_file(1, KVec::new(), Ok(mem(&bytes)));
         // The torn tail is overwritten by the one entry that still fits.
         assert_eq!(guard.check(&numbered(MAX_ENTRIES), true), Ok(()));
         assert_eq!(bytes.borrow().len(), MAX_ENTRIES * ENTRY_SIZE);
         assert_eq!(guard.check(&numbered(MAX_ENTRIES + 1), true), Err(ENOSPC));
         drop(guard);
-        let mut guard = Guard::with_file(1, KVec::new(), Ok(MemFile(&bytes)));
+        let mut guard = Guard::with_file(1, KVec::new(), Ok(mem(&bytes)));
         assert!(guard.file.is_some());
         assert_eq!(guard.check(&numbered(MAX_ENTRIES), true), Ok(()));
         Ok(())
@@ -646,6 +707,66 @@ mod tests {
         // Deleting a record that does not exist changes nothing.
         assert_eq!(guard.check(&session(6), false), Ok(()));
         assert_eq!(guard.check(&Key::root(1), true), Ok(()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_write_lists_nothing() -> Result<()> {
+        let bytes = RefCell::new(KVec::new());
+        let faults = Faults::default();
+        let created = session(3);
+        let mut guard = Guard::with_file(1, KVec::new(), Ok(faulty(&bytes, &faults)));
+        faults.write.set(true);
+        // The write fails: nothing is listed and the end did not advance.
+        assert_eq!(guard.check(&created, true), Err(EIO));
+        assert_eq!(bytes.borrow().len(), 0);
+        faults.write.set(false);
+        // The same slot takes the record once the write lands.
+        assert_eq!(guard.check(&created, true), Ok(()));
+        assert_eq!(listed(&bytes).as_slice(), &[Some(created)]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_flush_is_retried_in_the_same_slot() -> Result<()> {
+        let bytes = RefCell::new(KVec::new());
+        let faults = Faults::default();
+        let refused = session(3);
+        let created = session(4);
+        let mut guard = Guard::with_file(1, KVec::new(), Ok(faulty(&bytes, &faults)));
+        faults.sync.set(true);
+        // The write lands but the flush fails: the record is not listed, so it
+        // is not writable on a retry either.
+        assert_eq!(guard.check(&refused, true), Err(EIO));
+        assert_eq!(guard.check(&refused, true), Err(EIO));
+        faults.sync.set(false);
+        // The next adoption reuses the same slot the unflushed write took, so
+        // the list holds no duplicate.
+        assert_eq!(guard.check(&created, true), Ok(()));
+        assert_eq!(guard.check(&refused, true), Ok(()));
+        assert_eq!(listed(&bytes).as_slice(), &[Some(created), Some(refused)]);
+        drop(guard);
+
+        // The next boot reads exactly those two, in order.
+        let mut guard = Guard::with_file(1, keys(&[created, refused])?, Ok(mem(&bytes)));
+        assert_eq!(guard.check(&created, true), Ok(()));
+        assert_eq!(guard.check(&refused, true), Ok(()));
+        Ok(())
+    }
+
+    #[test]
+    fn without_a_durable_directory_entry_nothing_is_adopted() -> Result<()> {
+        let own = session(2);
+        let bytes = RefCell::new(list_of(&[own])?);
+        let faults = Faults::default();
+        faults.parent.set(true);
+        let mut guard = Guard::with_file(1, keys(&[own])?, Ok(faulty(&bytes, &faults)));
+        // The directory flush fails, so the file is dropped: as without a
+        // list, every existing record is protected and nothing is listed.
+        assert!(!guard.list_loaded());
+        assert_eq!(guard.check(&own, true), Err(EPERM));
+        assert!(guard.check(&session(3), true).is_err());
+        assert_eq!(bytes.borrow().len(), ENTRY_SIZE);
         Ok(())
     }
 

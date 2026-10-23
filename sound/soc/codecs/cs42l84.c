@@ -618,6 +618,12 @@ static int cs42l84_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
 							CS42L84_CCM_CTL4_REFCLK_EN, 0);
 		}
 	} else {
+		/*
+		 * ASoC also unmutes here at D2 during card resume. A PCM
+		 * advertising RESUME can restart without another prepare, so
+		 * do not discard that unmute based on the card power state.
+		 * The PLL path below still requires lock before switching.
+		 */
 		if (!cs42l84->stream_use) {
 			/* SCLK must be running before codec unmute.
 			 *
@@ -646,8 +652,24 @@ static int cs42l84_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
 							       (regval & CS42L84_PLL_LOCK_STATUS_LOCKED),
 							       CS42L84_PLL_LOCK_POLL_US,
 							       CS42L84_PLL_LOCK_TIMEOUT_US);
-				if (ret < 0)
+				if (ret < 0) {
+					/*
+					 * Without a locked PLL the codec has no clock
+					 * once it leaves the oscillator, and then the
+					 * I2C bus stops working. Stay on the oscillator
+					 * and undo what was enabled above, in the same
+					 * order as the mute path.
+					 */
 					dev_warn(component->dev, "PLL failed to lock: %d\n", ret);
+					snd_soc_component_update_bits(component,
+								      CS42L84_PLL_CTL1,
+								      CS42L84_PLL_CTL1_EN, 0);
+					snd_soc_component_update_bits(component,
+								      CS42L84_CCM_CTL4,
+								      CS42L84_CCM_CTL4_REFCLK_EN,
+								      0);
+					return ret;
+				}
 
 				if (regval & CS42L84_PLL_LOCK_STATUS_ERROR)
 					dev_warn(component->dev, "PLL lock error\n");
@@ -1230,3 +1252,7 @@ MODULE_AUTHOR("Martin Povišer <povik+lin@cutebit.org>");
 MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
 MODULE_AUTHOR("James Calligeros <jcalligeros99@gmail.com>");
 MODULE_LICENSE("GPL");
+
+#if IS_ENABLED(CONFIG_SND_SOC_CS42L84_TEST)
+#include "cs42l84-test.c"
+#endif

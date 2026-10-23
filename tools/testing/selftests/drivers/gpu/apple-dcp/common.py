@@ -93,6 +93,12 @@ ATC_POST_TUNABLE = ('atcphy_configure_post_tunable_t8103', 'atcphy_wake_common_t
 ATC_SPLIT = ('atcphy_pipe_live', 'atcphy_usb3_route')
 
 
+# The retryable T8103-generation USB3 handoff: the bounded live lock and the
+# park of a live legacy PIPE, which the extracted PIPE, mux, reset and route
+# functions call. Older sources have neither; atc_function() then yields ''.
+ATC_T8103_LIVE = ('atcphy_pipehandler_lock_live', 'atcphy_park_live_t8103_pipehandler')
+
+
 def atc_function(source, name):
     """The actual ATC function @name, or nothing for a source that does not have it.
 

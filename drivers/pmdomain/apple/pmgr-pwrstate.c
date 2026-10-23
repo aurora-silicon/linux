@@ -50,6 +50,8 @@ struct apple_pmgr_ps {
 	bool externally_clocked;
 	bool system_sleep;
 	bool firmware_owned;
+	/* Never enable automatic power management (apple,no-auto-pm). */
+	bool no_auto_pm;
 };
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
@@ -167,7 +169,7 @@ static int apple_pmgr_ps_power_on(struct generic_pm_domain *genpd)
 	if (ps->firmware_owned)
 		return 0;
 
-	ret = apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_ACTIVE, true);
+	ret = apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_ACTIVE, !ps->no_auto_pm);
 	if (ret && !ps->system_sleep)
 		apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_PWRGATE, false);
 
@@ -176,14 +178,15 @@ static int apple_pmgr_ps_power_on(struct generic_pm_domain *genpd)
 
 static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
 {
+	struct apple_pmgr_ps *ps = genpd_to_apple_pmgr_ps(genpd);
 	int ret;
 
-	if (genpd_to_apple_pmgr_ps(genpd)->firmware_owned)
+	if (ps->firmware_owned)
 		return 0;
 
 	ret = apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_PWRGATE, false);
 	if (ret)
-		apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_ACTIVE, true);
+		apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_ACTIVE, !ps->no_auto_pm);
 
 	return ret;
 }
@@ -360,6 +363,12 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	if (of_property_read_bool(node, "apple,externally-clocked"))
 		ps->externally_clocked = true;
 
+	/*
+	 * A coprocessor CPU domain whose firmware Linux starts cold must not be
+	 * gated automatically behind its back: keep it at the requested state.
+	 */
+	ps->no_auto_pm = of_property_read_bool(node, "apple,no-auto-pm");
+
 	active = apple_pmgr_ps_is_active(ps);
 	if (ps->firmware_owned) {
 		/* Consumers (the boot framebuffer) need it; never try to turn it on. */
@@ -383,16 +392,16 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 			 * even if it does not get there in time.
 			 */
 			active = apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_ACTIVE,
-						   true) == 0;
+						   !ps->no_auto_pm) == 0;
 		}
 	} else if (active) {
 		ps->genpd.flags |= GENPD_FLAG_DEFER_OFF | GENPD_FLAG_ACTIVE_WAKEUP;
 	}
 
-	/* Turn on auto-PM if the domain is already on */
+	/* Turn on auto-PM if the domain is already on, unless it must stay off */
 	if (active && !ps->firmware_owned)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
-				   APPLE_PMGR_AUTO_ENABLE);
+				   ps->no_auto_pm ? 0 : APPLE_PMGR_AUTO_ENABLE);
 
 	ret = pm_genpd_init(&ps->genpd, NULL, !active);
 	if (ret < 0) {
@@ -475,3 +484,7 @@ MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
 MODULE_DESCRIPTION("PMGR power state driver for Apple SoCs");
 
 module_platform_driver(apple_pmgr_ps_driver);
+
+#if IS_ENABLED(CONFIG_APPLE_PMGR_PWRSTATE_KUNIT_TEST)
+#include "pmgr-pwrstate-test.c"
+#endif

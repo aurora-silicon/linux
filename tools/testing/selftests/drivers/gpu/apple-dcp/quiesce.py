@@ -133,12 +133,15 @@ enum atcphy_mode { APPLE_ATCPHY_MODE_OFF, APPLE_ATCPHY_MODE_USB2,
  APPLE_ATCPHY_MODE_USB3, APPLE_ATCPHY_MODE_USB3_DP, APPLE_ATCPHY_MODE_DP,
  APPLE_ATCPHY_MODE_TBT, APPLE_ATCPHY_MODE_USB4 };
 enum atcphy_pipehandler_state { ATCPHY_PIPEHANDLER_STATE_DUMMY, ATCPHY_PIPEHANDLER_STATE_USB3 };
+GENERATION_ENUM
+struct atcphy_hw { GENERATION_FIELD bool has_usb4,has_t8140_dp,dp_t8122; };
 struct apple_atcphy {
  void *dev; int lock;
- const struct { bool has_usb4,has_t8140_dp,dp_t8122; } *hw;
+ const struct atcphy_hw *hw;
  struct { void *usb2phy; } regs;
  bool fixed_usb2,host_active,mode_dirty,pipe_pending,usb_off_pending,ss_tunables,dp_tunables;
  bool usb3_port_off,park_owed,dp_only,pd_was_off;
+ bool t8103_dummy_pending,t8103_usb3_retry,t8103_usb3_workaround;
  enum atcphy_mode mode,typec_mode;
  enum atcphy_pipehandler_state pipe_state;
 };
@@ -153,6 +156,9 @@ static unsigned phy_warns,configure_calls,lane_requests;
 static void atcphy_restore_after_pd_off(struct apple_atcphy *p) { assert(!p->pd_was_off); }
 static int atcphy_park_pipehandler(struct apple_atcphy *p, bool keep_dp) { (void)keep_dp;p->pipe_state=ATCPHY_PIPEHANDLER_STATE_DUMMY;return 0; }
 static int atcphy_configure_pipehandler(struct apple_atcphy *p,bool on) { (void)p;(void)on;assert(false);return -EINVAL; }
+/* Role exit parks the ordinary PIPE first; a live legacy park is never owed here. */
+static int __attribute__((unused)) atcphy_park_live_t8103_pipehandler(struct apple_atcphy *p) { (void)p;assert(false);return -EINVAL; }
+static struct atcphy_hw ordinary_hw GENERATION_INIT;
 static int atcphy_configure(struct apple_atcphy *p,enum atcphy_mode mode) { configure_calls++;lane_requests+=mode!=APPLE_ATCPHY_MODE_OFF;p->mode=mode;p->mode_dirty=false;return 0; }
 static void set32(void *p,unsigned v) { (void)p;(void)v;assert(false); }
 static void atcphy_usb2_power_on(struct apple_atcphy *p) { (void)p;assert(false); }
@@ -161,7 +167,7 @@ static void atcphy_usb2_power_on(struct apple_atcphy *p) { (void)p;assert(false)
   'static int atcphy_usb2_init(')) + r'''
 static int ordinary_power_off(void) { return atcphy_usb3_power_off(&usb_phy); }
 static void ordinary_initial(void) {
- ordinary_phy=(struct apple_atcphy){.mode=APPLE_ATCPHY_MODE_USB3,.typec_mode=APPLE_ATCPHY_MODE_USB3,.pipe_state=ATCPHY_PIPEHANDLER_STATE_USB3};
+ ordinary_phy=(struct apple_atcphy){.hw=&ordinary_hw,.mode=APPLE_ATCPHY_MODE_USB3,.typec_mode=APPLE_ATCPHY_MODE_USB3,.pipe_state=ATCPHY_PIPEHANDLER_STATE_USB3};
  phy_warns=configure_calls=lane_requests=0;
 }
 static int ordinary_safe(void) {
@@ -177,6 +183,12 @@ static void ordinary_usb2_check(void) {
  assert(ordinary_phy.typec_mode==APPLE_ATCPHY_MODE_OFF&&lane_requests==before);
 }
 '''
+ # The ordinary port is the T8122 profile unless a case selects the T8103
+ # generation, whose live legacy PIPE park the mux switch now consults.
+ generation='enum atcphy_generation {' in atc
+ ordinary_phy=ordinary_phy.replace('GENERATION_ENUM\n',block(atc,'enum atcphy_generation {')+';\n' if generation else '',1)
+ ordinary_phy=ordinary_phy.replace('GENERATION_FIELD ','enum atcphy_generation gen; ' if generation else '',1)
+ ordinary_phy=ordinary_phy.replace(' GENERATION_INIT',' ={.gen=ATCPHY_GENERATION_T8122}' if generation else '',1)
  if split[-1]:
   # An ordinary port takes no SuperSpeed port down, so none may come up.
   ordinary_phy=ordinary_phy.replace(' int ret=atcphy_mux_set_locked(&ordinary_phy,APPLE_ATCPHY_MODE_OFF);',

@@ -733,7 +733,7 @@ static void apple_dpin_retry_fn(struct work_struct *work)
 
 /*
  * Only where both the display allocator and the connection manager can hold
- * a tunnel for a pipeline (M1-family hosts, see
+ * a tunnel for a pipeline (capacity-retry hosts, see
  * apple_nhi_dp_tunnel_awaits_display()) does a refused tunnel wait for one.
  */
 static void apple_dpin_work_fn(struct work_struct *work)
@@ -2218,8 +2218,8 @@ static void apple_nhi_remove(struct platform_device *pdev)
  * seconds.  Not while devices suspend and resume: stop asking before any of
  * them suspends, let an attempt in flight finish (a wait for appledrm to
  * load gives way, see apple_dpin_connect()), and ask again once all of them
- * have resumed. The tunnel keeps waiting meanwhile. New M1-family handoffs are
- * deferred until complete, including after an aborted suspend. Established
+ * have resumed. The tunnel keeps waiting meanwhile. Suspend-gated handoffs
+ * are deferred until complete, including after an aborted suspend. Established
  * handed callbacks and synchronous tunnel teardown remain permitted.
  */
 static void apple_dpin_pause_retries(struct apple_cio *acio)

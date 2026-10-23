@@ -1865,6 +1865,8 @@ int dcp_get_modes(struct drm_connector *connector)
 			apple_connector->drm_edid = edid;
 			apple_connector->drm_edid_generation = edid_generation;
 			apple_connector->drm_edid_service_epoch = service_epoch;
+			/* A native T6030 pipe: its audio, after the first EDID. */
+			dcp_external_audio_start(dcp);
 		}
 	}
 	if (nr_modes && apple_connector->drm_edid) {

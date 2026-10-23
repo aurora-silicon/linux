@@ -351,7 +351,8 @@ config MFD_MACSMC_KUNIT_TEST
 	  Build tests for SMC key/value readers, request limits and metadata
 	  decoding. Static stubs replace mailbox commands and SRAM access,
 	  allowing malformed replies and output buffer limits to be checked
-	  without a running SMC.
+	  without a running SMC. Client driver tests can also replace
+	  apple_smc_read() and apple_smc_write() with a model of their keys.
 
 config MFD_MADERA
 	tristate "Cirrus Logic Madera codecs"

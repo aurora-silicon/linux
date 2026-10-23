@@ -1077,7 +1077,9 @@ static void parser_optional_flag_extent(struct kunit *test)
 static void parser_attribute_deferred(struct kunit *test)
 {
 	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
-	struct apple_connector *connector = kunit_kzalloc(test, sizeof(*connector), GFP_KERNEL);
+	struct parser_catalog_observer *observer =
+		kunit_kzalloc(test, sizeof(*observer), GFP_KERNEL);
+	struct apple_connector *connector = observer ? &observer->connector : NULL;
 	struct drm_device *dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
 	struct parser_blob *blob = kunit_kzalloc(test, sizeof(*blob), GFP_KERNEL);
 	struct dcp_parse_ctx ctx;
@@ -1088,6 +1090,8 @@ static void parser_attribute_deferred(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, dev);
 	KUNIT_ASSERT_NOT_NULL(test, blob);
 	dcp_modes_init(dcp);
+	observer->dcp = dcp;
+	INIT_WORK(&connector->hotplug_wq, parser_catalog_ready);
 	mutex_init(&dev->mode_config.mutex);
 	connector->base.dev = dev;
 	dcp->connector = connector;
@@ -1109,6 +1113,8 @@ static void parser_attribute_deferred(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dcp->modes[0].mode.width_mm, 520);
 	mutex_unlock(&dev->mode_config.mutex);
 	flush_work(&dcp->dimensions_wq);
+	flush_work(&connector->hotplug_wq);
+	KUNIT_EXPECT_EQ(test, observer->notifications, 1U);
 	KUNIT_EXPECT_EQ(test, connector->base.display_info.width_mm, 520U);
 	KUNIT_EXPECT_EQ(test, connector->base.display_info.height_mm, 290U);
 	dcp_modes_release(dcp);

@@ -1394,8 +1394,10 @@ static void dontunmap_complete(struct vma_remap_struct *vrm,
 		 * vma->vm_start >> PAGE_SHIFT.
 		 */
 		vma_set_anon_pgoff(vma, pgoff_unfaulted);
-		if (vma_is_anonymous(vma) && !vma->vm_file)
+		if (vma_is_anonymous(vma) && !vma->vm_file) {
 			vma_set_pgoff(vma, pgoff_unfaulted);
+			vma_set_subpage_offset(vma, vma->vm_start & ~PAGE_MASK);
+		}
 	}
 }
 

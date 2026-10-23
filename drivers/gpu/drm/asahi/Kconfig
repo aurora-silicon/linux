@@ -35,3 +35,18 @@ config DRM_ASAHI_DEBUG_ALLOCATOR
 
 	  Say N unless you are debugging firmware structures or porting to a
 	  new firmware version.
+
+config DRM_ASAHI_G15
+	bool "Native G15 firmware backend (M3 Pro/Max)"
+	depends on DRM_ASAHI
+	depends on DRM_APPLE=y || (DRM_APPLE=m && DRM_ASAHI=m)
+	select APPLE_T6030_GPU_PMP_LINK
+	select CRYPTO_LIB_SHA256
+	default n
+	help
+	  Enable the native G15 backend for explicitly admitted M3 Pro/Max
+	  firmware and boards. Other GPUs keep the maintained backend.
+	  The firmware session is retained until reboot once started.
+	  The native display driver must be built in, or both drivers must
+	  be modules, so a modular display provider finishes initialization
+	  before the GPU module can probe through its direct helper import.

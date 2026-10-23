@@ -11,6 +11,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 FUNCTIONS = {
+    'include/linux/soc/apple/dp-tunnel.h': ['apple_dp_tunnel_t6030_pclk'],
     'drivers/gpu/drm/apple/dcp-fabric-core.c': ['dcp_fabric_tunnel_clock_blocked'],
     'drivers/gpu/drm/apple/dcp-fabric.c': [
         'dcp_fabric_snapshot_port', 'dcp_typec_tunnel_ctl'],

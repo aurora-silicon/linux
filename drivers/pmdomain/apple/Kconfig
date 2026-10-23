@@ -14,6 +14,17 @@ config APPLE_PMGR_PWRSTATE
 	  controls for SoC devices. This driver manages them through the
 	  generic power domain framework, and also provides reset support.
 
+config APPLE_PMGR_PWRSTATE_KUNIT_TEST
+	bool "KUnit tests for the Apple PMGR power state driver" if !KUNIT_ALL_TESTS
+	depends on APPLE_PMGR_PWRSTATE && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Check that a domain marked apple,no-auto-pm never gets automatic
+	  power management when it is powered on or when a failed power-off
+	  is undone, and that other domains still do. The tests run the
+	  driver's power callbacks against an emulated power state register
+	  and need no Apple hardware.
+
 config APPLE_PMP_REPORT
 	bool "Apple PMP report control"
 	depends on OF
@@ -26,7 +37,8 @@ config APPLE_PMP_REPORT
 	  report region it shares with the system, and the PMP's report of
 	  its own state.
 
-	  On T8122 (M3) and T6031 (M3 Max) Macs whose boot loader hands the
+	  On T8122 (M3), T6031 (M3 Max), and opted-in T6030 (M3 Pro) Macs
+	  whose boot loader hands the
 	  internal display over (see APPLE_T6030_DISPLAY_GATE), iBoot leaves
 	  the PMP halted, and this driver starts it when the display driver
 	  first asks for it. Once its nodes are enabled the PMP may run until

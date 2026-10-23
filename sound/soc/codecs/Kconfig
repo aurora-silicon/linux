@@ -998,6 +998,21 @@ config SND_SOC_CS42L42_SDW
 	help
 	  Enable support for Cirrus Logic CS42L42 codec with Soundwire control
 
+config SND_SOC_CS42L42_TEST
+	bool "KUnit test for Cirrus Logic cs42l42 driver" if !KUNIT_ALL_TESTS
+	depends on SND_SOC_CS42L42_CORE=y && SND_SOC=y && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  This builds KUnit tests for the clock switching that the
+	  Cirrus Logic cs42l42 codec driver does when a stream is
+	  muted or unmuted, including PCM resume refusal and prepare recovery.
+	  These tests use built-in ALSA/ASoC entry points.
+
+	  For more information on KUnit and unit tests in general,
+	  please refer to the KUnit documentation in
+	  Documentation/dev-tools/kunit/.
+	  If in doubt, say "N".
+
 config SND_SOC_CS42L43
 	tristate "Cirrus Logic CS42L43 CODEC"
 	depends on MFD_CS42L43
@@ -1044,6 +1059,21 @@ config SND_SOC_CS42L84
 	depends on I2C
 	select REGMAP
 	select REGMAP_I2C
+
+config SND_SOC_CS42L84_TEST
+	bool "KUnit test for Cirrus Logic cs42l84 driver" if !KUNIT_ALL_TESTS
+	depends on SND_SOC_CS42L84 && (KUNIT=y || KUNIT=SND_SOC_CS42L84)
+	default KUNIT_ALL_TESTS
+	help
+	  This builds KUnit tests for the clock switching that the
+	  Cirrus Logic cs42l84 codec driver does when a stream is
+	  muted or unmuted. The tests are built into the cs42l84
+	  driver and run when it is loaded.
+
+	  For more information on KUnit and unit tests in general,
+	  please refer to the KUnit documentation in
+	  Documentation/dev-tools/kunit/.
+	  If in doubt, say "N".
 
 config SND_SOC_CS4234
 	tristate "Cirrus Logic CS4234 CODEC"

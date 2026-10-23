@@ -18,7 +18,6 @@ use crate::{
     gem,
     memacct,
     mmu,
-    module_parameters,
     queue,
     util::{
         align,
@@ -255,7 +254,7 @@ impl drm::file::DriverFile for File {
         device.registration_data_with(|reg_data| {
             let gpu = &reg_data.gpu;
             let id = gpu.ids().file.next();
-            let user_range = gpu.uat_geometry().user_usable_range();
+            let user_range = gpu.user_range();
             let mem = memacct::Client::new()?;
 
             mod_dev_dbg!(device, "[File {}]: DRM device opened\n", id);
@@ -402,18 +401,7 @@ impl File {
 
         gpu.get_params(&mut params)?;
 
-        if gpu.supports_vm_status() {
-            params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS)
-                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS_MIRROR);
-        }
-        if gpu.queue_limits().is_some() {
-            params.features |=
-                u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES);
-        }
-
-        if module_parameters::fault_control.value() == 0xb {
-            params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
-        }
+        params.features |= gpu.feature_flags();
 
         let size = core::mem::size_of::<uapi::drm_asahi_params_global>().min(data.size.try_into()?);
 
@@ -606,7 +594,7 @@ impl File {
     /// IOCTL: vm_destroy: Destroy a `Vm`.
     pub(crate) fn vm_destroy(
         _device: &AsahiDrmDevice<drm::Registered>,
-        _reg_data: &driver::AsahiDrmRegistrationData<'_>,
+        reg_data: &driver::AsahiDrmRegistrationData<'_>,
         data: &mut uapi::drm_asahi_vm_destroy,
         file: &DrmFile,
     ) -> Result<u32> {
@@ -614,6 +602,8 @@ impl File {
         if vm.is_none() {
             Err(ENOENT)
         } else {
+            drop(vm);
+            reg_data.gpu.vm_closed();
             Ok(0)
         }
     }
@@ -621,7 +611,7 @@ impl File {
     /// IOCTL: gem_create: Create a new GEM object.
     pub(crate) fn gem_create(
         device: &AsahiDrmDevice,
-        _reg_data: &driver::AsahiDrmRegistrationData<'_>,
+        reg_data: &driver::AsahiDrmRegistrationData<'_>,
         data: &mut uapi::drm_asahi_gem_create,
         file: &DrmFile,
     ) -> Result<u32> {
@@ -669,12 +659,15 @@ impl File {
         // count. Userspace can evict its BO cache and retry after ENOMEM.
         let pages_no_reclaim = gem::user_pages_no_reclaim(
             size,
-            _reg_data.gpu.as_any().is::<crate::g17::Gpu>(),
+            reg_data.gpu.as_any().is::<crate::g17::Gpu>(),
         );
         let gem = gem::new_object(
             device, size, data.flags, resv_obj, reclaim_cpu, pages_no_reclaim, commit,
         )?;
 
+        if reg_data.gpu.prepare_new_objects() {
+            gem::prepare_new_object(&gem)?;
+        }
         let handle = gem.create_handle(file)?;
         data.handle = handle;
 
@@ -750,7 +743,13 @@ impl File {
             return Err(EINVAL);
         }
 
-        if reg_data.gpu.as_any().is::<crate::g17::Gpu>() {
+        if let Some(limit) = reg_data.gpu.bind_batch_limit() {
+            if data.num_binds == 0 || data.num_binds > limit || data.userptr == 0
+                || data.stride % 8 != 0 || data.stride as usize > kernel::page::PAGE_SIZE {
+                return Err(EINVAL);
+            }
+        }
+        if reg_data.gpu.as_any().is::<crate::g17::Gpu>() || reg_data.gpu.tracked_submission() {
             return Self::vm_bind_g17(data, file);
         }
 
@@ -1330,7 +1329,7 @@ impl File {
             .reader()
             .read_all(bytes, GFP_KERNEL)
         };
-        let guarded = gpu.as_any().is::<crate::g17::Gpu>();
+        let guarded = gpu.as_any().is::<crate::g17::Gpu>() || gpu.tracked_submission();
         // Once G17 output syncobjs are resolved, its queue must install a fence
         // on every failure. Take the fallible userspace snapshot before that point.
         if guarded {

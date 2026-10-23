@@ -31,6 +31,7 @@
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_print.h>
 #include <drm/drm_vblank.h>
+#include <kunit/static_stub.h>
 
 #include "afk.h"
 #include "dcp.h"
@@ -42,6 +43,7 @@
 #include "iomfb_v14_7_board.h"
 #include "iomfb_v14_7_link.h"
 #include "iomfb_v14_7_swap.h"
+#include "av.h"
 #include "parser.h"
 
 #define A(n) DCP_V14_TAG('A', n)
@@ -76,7 +78,16 @@ static int dcp_v14_pmp_wait_ready(struct device_node *entry,
 #define DCP_V14_RTKIT_RETRIES	4
 #define DCP_V14_MAX_PROPERTIES	256
 #define DCP_V14_MAX_RAW		32
+/*
+ * The size of one raw property and of all of them. An external processor
+ * publishes an HDMI 2.1 (FRL) sink's TimingElements as one chunked transfer
+ * of more than 1 MiB (1.38 MB for a 4K120 TV), so it keeps up to 8 MiB per
+ * property and 24 MiB in all; the panel's properties stay small.
+ */
+#define DCP_V14_MAX_RAW_SIZE	SZ_1M
 #define DCP_V14_MAX_RAW_BYTES	SZ_8M
+#define DCP_V14_EXT_MAX_RAW_SIZE	SZ_8M
+#define DCP_V14_EXT_MAX_RAW_BYTES	(24 * SZ_1M)
 #define DCP_V14_MAX_BUFFERS	64
 #define DCP_V14_MAX_BUFFER	SZ_16M
 #define DCP_V14_MAX_BUFFER_BYTES SZ_64M
@@ -150,11 +161,30 @@ static const struct dcp_v14_board dcp_v14_board_j516c = {
 	.log_bringup = true,
 };
 
+/*
+ * J514C (MacBook Pro 14", M3 Max): the T6031 DCP running the J516C image
+ * (the DCP image is the SoC's; its UUID is checked at probe), in the J514S
+ * chassis, so the J514 panel: the board file names the J514S panel values,
+ * not yet read from a J514C, and the panel size comes from the boot
+ * framebuffer. Every panel timing and the display clock are logged.
+ */
+static const struct dcp_v14_board dcp_v14_board_j514c = {
+	.name = "J514C",
+	.debugfs = "dcp-j514c",
+	.dcp_compatible = "apple,t6031-dcp",
+	.machine = "apple,j514c",
+	.firmware_uuid = DCP_V14_J516C_FIRMWARE_UUID,
+	.handoff = "apple,t6031-handoff",
+	.promotion = true,
+	.log_bringup = true,
+};
+
 static const struct dcp_v14_board *const dcp_v14_boards[] = {
 	&dcp_v14_board_t6030,
 	&dcp_v14_board_j613,
 	&dcp_v14_board_j615,
 	&dcp_v14_board_j516c,
+	&dcp_v14_board_j514c,
 };
 
 struct dcp_v14_property {
@@ -364,13 +394,23 @@ static struct dcp_v14_property *dcp_v14_property(struct apple_dcp_v14 *v14, u32 
 	return p;
 }
 
+static u32 dcp_v14_raw_limit(const struct apple_dcp_v14 *v14)
+{
+	return v14->external ? DCP_V14_EXT_MAX_RAW_SIZE : DCP_V14_MAX_RAW_SIZE;
+}
+
+static u32 dcp_v14_raw_total(const struct apple_dcp_v14 *v14)
+{
+	return v14->external ? DCP_V14_EXT_MAX_RAW_BYTES : DCP_V14_MAX_RAW_BYTES;
+}
+
 static int dcp_v14_raw_property(struct apple_dcp_v14 *v14, u32 service, const u8 *key,
 				const void *data, u32 size)
 {
 	u32 i, old_size = 0;
 	void *copy;
 
-	if (!memchr(key, 0, 64) || size > SZ_1M)
+	if (!memchr(key, 0, 64) || size > dcp_v14_raw_limit(v14))
 		return -EINVAL;
 	for (i = 0; i < v14->raw_count; i++)
 		if (v14->raw[i].service == service && !strcmp(v14->raw[i].key, key))
@@ -379,7 +419,7 @@ static int dcp_v14_raw_property(struct apple_dcp_v14 *v14, u32 service, const u8
 		return -ENOSPC;
 	if (i < v14->raw_count)
 		old_size = v14->raw[i].size;
-	if (v14->raw_bytes - old_size + size > DCP_V14_MAX_RAW_BYTES)
+	if (v14->raw_bytes - old_size + size > dcp_v14_raw_total(v14))
 		return -ENOSPC;
 	copy = kvmemdup(data, size ?: 1, GFP_KERNEL);
 	if (!copy)
@@ -817,7 +857,8 @@ static int dcp_v14_external_callback(struct apple_dcp_v14 *v14, u32 tag, const u
 	if (tag == D(127) && SHAPE(4, 4)) {
 		count = get_unaligned_le32(in);
 		ret = -EINVAL;
-		if (!v14->chunk && count && count <= 0x100001) {
+		/* The announced count includes one byte that is never sent. */
+		if (!v14->chunk && count && count <= dcp_v14_raw_limit(v14) + 1) {
 			v14->chunk_size = count - 1;
 			v14->chunk_offset = 0;
 			v14->chunk = kvzalloc(max_t(u32, 1, v14->chunk_size), GFP_KERNEL);
@@ -983,7 +1024,7 @@ static int dcp_v14_callback(void *cookie, u32 tag, const void *input, u32 in_siz
 	/* Chunked property transfer: start, chunk, end. */
 	if (tag == D(127) && SHAPE(4, 4)) {
 		count = get_unaligned_le32(in);
-		if (v14->chunk || !count || count > 0x100001)
+		if (v14->chunk || !count || count > dcp_v14_raw_limit(v14) + 1)
 			return -EINVAL;
 		v14->chunk_size = count - 1;
 		v14->chunk_offset = 0;
@@ -1617,25 +1658,17 @@ enum {
 static void dcpext_bringup(struct work_struct *work);
 
 /*
- * The bounded translator (900-config-tooling) is optional at link time;
- * without it, refuse a tuple that does not fit before using the unbounded one.
+ * Translate one iommu-addresses tuple, refusing a truncated one.
+ * of_translate_dma_region_checked() is an ordinary exported symbol and
+ * DRM_APPLE depends on OF_ADDRESS, so it is always linked: call it directly.
+ * The former symbol_get() could never resolve it -- symbol_get() takes only
+ * GPL-only symbols -- so the bounded check was silently skipped.
  */
 static const __be32 *dcpext_translate_region(struct device_node *np,
 					     const __be32 *maps, size_t cells,
 					     phys_addr_t *iova, size_t *length)
 {
-	typeof(&of_translate_dma_region_checked) checked;
-	const __be32 *next;
-
-	checked = symbol_get(of_translate_dma_region_checked);
-	if (checked) {
-		next = checked(np, maps, cells, iova, length);
-		symbol_put(of_translate_dma_region_checked);
-		return next;
-	}
-	if (cells < (size_t)(of_n_addr_cells(np) + of_n_size_cells(np)))
-		return NULL;
-	return of_translate_dma_region(np, maps, iova, length);
+	return of_translate_dma_region_checked(np, maps, cells, iova, length);
 }
 
 /*
@@ -2843,15 +2876,45 @@ bool iomfb_v14_7_external_showing(struct apple_dcp *dcp,
 	return live;
 }
 
+bool iomfb_v14_7_external_powered(struct apple_dcp *dcp)
+{
+	struct apple_dcp_v14 *v14 = dcp->v14;
+
+	return dcp->external && v14 && READ_ONCE(v14->powered) && !READ_ONCE(v14->failed);
+}
+
+/* The sink's audio around an external mode set. */
+static void dcp_v14_audio_off(struct apple_dcp *dcp)
+{
+	KUNIT_STATIC_STUB_REDIRECT(dcp_v14_audio_off, dcp);
+	av_service_disconnect(dcp);
+}
+
+static void dcp_v14_audio_on(struct apple_dcp *dcp)
+{
+	KUNIT_STATIC_STUB_REDIRECT(dcp_v14_audio_on, dcp);
+	av_service_connect(dcp);
+}
+
 /* An external display: power down, set the new mode, power up. */
 static int dcp_v14_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state)
 {
 	struct apple_dcp_v14 *v14 = dcp->v14;
 	struct dcp_display_mode mode = {};
+	bool audio_off = false;
 	int ret = 0;
 
 	if (!v14 || READ_ONCE(v14->failed) || !v14->opened)
 		return -EIO;
+	/*
+	 * The sink's audio stops before the display is powered down for the
+	 * mode change (as dcp_poweroff() has it), outside the RPC lock; it is
+	 * connected again once the display is on, below.
+	 */
+	if (READ_ONCE(v14->powered) && dcp->avep) {
+		dcp_v14_audio_off(dcp);
+		audio_off = true;
+	}
 	ret = dcp_v14_external_settle(dcp, v14);
 	if (ret)
 		goto out;
@@ -2872,6 +2935,8 @@ static int dcp_v14_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state
 			 DRM_MODE_ARG(&crtc_state->mode), mode.timing_mode_id, mode.color_mode_id);
 		atomic_set(&dcp->external_retries, 0);
 		dcp_mode_set_valid(&dcp->mode_state, true);
+		if (dcp->avep)
+			dcp_v14_audio_on(dcp);
 		return 0;
 	}
 	if (v14->powered && dcp_v14_set_power(v14, false))
@@ -2895,13 +2960,23 @@ out:
 	dev_info(dcp->dev, "display mode " DRM_MODE_FMT " (timing %u, color %u): %d\n",
 		 DRM_MODE_ARG(&crtc_state->mode), mode.timing_mode_id, mode.color_mode_id, ret);
 	if (ret) {
-		/* A mode that is gone, or a description that never settled. */
+		/*
+		 * A mode that is gone, or a description that never settled:
+		 * nothing was powered down, and the display goes on in its old
+		 * mode. So does its audio; no plug event would bring it back
+		 * if the retries fail too.
+		 */
+		if (audio_off && iomfb_v14_7_external_powered(dcp))
+			dcp_v14_audio_on(dcp);
 		dcp_external_retry(dcp, "display mode not set", ret, 500);
 		return ret;
 	}
 	atomic_set(&dcp->external_retries, 0);
 	scoped_guard(spinlock_irqsave, &dcp->mode_state.lock)
 		dcp->mode_state.valid = true;
+	/* A472 on: the sink's audio again. */
+	if (dcp->avep)
+		dcp_v14_audio_on(dcp);
 	return 0;
 }
 
@@ -2961,6 +3036,9 @@ void iomfb_v14_7_poweroff(struct apple_dcp *dcp)
 
 	/* An external display is powered down; the next enable sets its mode again. */
 	if (dcp->external) {
+		/* Audio stops with the display, as dcp_poweroff() has it. */
+		if (dcp->avep)
+			av_service_disconnect(dcp);
 		if (v14 && v14->opened && !READ_ONCE(v14->failed)) {
 			mutex_lock(&v14->lock);
 			if (v14->powered && dcp_v14_set_power(v14, false))
@@ -2974,3 +3052,7 @@ void iomfb_v14_7_poweroff(struct apple_dcp *dcp)
 	if (v14 && v14->started)
 		dcp_v14_present(v14, NULL, 0, 0, 0, NULL);
 }
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
+#include "iomfb_v14_7_external_audio_test.c"
+#endif

@@ -16,6 +16,7 @@ extern "C" {
     fn sep_store_read(handle: *mut c_void, off: i64, buf: *mut c_void, len: usize) -> c_long;
     fn sep_store_write(handle: *mut c_void, off: i64, buf: *const c_void, len: usize) -> c_long;
     fn sep_store_sync(handle: *mut c_void) -> c_int;
+    fn sep_store_sync_parent(handle: *mut c_void) -> c_int;
     fn sep_random_bytes(buf: *mut c_void, len: usize) -> c_int;
 }
 
@@ -183,6 +184,13 @@ impl StoreFile {
     pub(crate) fn sync(&self) -> Result<()> {
         // SAFETY: `handle` is live per the type invariant.
         kernel::error::to_result(unsafe { sep_store_sync(self.handle) })
+    }
+
+    /// Flushes the directory entry of this file, which [`StoreFile::sync`]
+    /// alone does not make durable for a newly created file.
+    pub(crate) fn sync_parent(&self) -> Result<()> {
+        // SAFETY: `handle` is live per the type invariant.
+        kernel::error::to_result(unsafe { sep_store_sync_parent(self.handle) })
     }
 }
 

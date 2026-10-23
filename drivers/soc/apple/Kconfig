@@ -236,6 +236,15 @@ config APPLE_T6030_DISPLAY_GATE
 
 	  Say 'y' if you want the native display on M3 Pro MacBook Pros.
 
+config APPLE_T6030_GPU_PMP_LINK
+	bool
+	depends on APPLE_T6030_DISPLAY_GATE
+	default n
+	help
+	  Link an opted-in T6030 GPU to the PMP admitted by the display gate.
+	  GPU power commands wait for that supplier's acknowledged display
+	  request through the existing PMP report startup and removal rules.
+
 config APPLE_DISPLAY_GATE_KUNIT_TEST
 	bool "KUnit tests for the Apple display gate" if !KUNIT_ALL_TESTS
 	depends on KUNIT=y && APPLE_T6030_DISPLAY_GATE

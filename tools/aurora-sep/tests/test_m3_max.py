@@ -163,7 +163,11 @@ keys=$M3T/debug/macsmc-hwmon/keys
 if [[ -n ${FAKE_HOT:-} ]]; then sed -i 's/ Tp0a flt    4 80 45000$/ Tp0a flt    4 80 101000/' "$keys"; fi
 if mkdir "$FAKE/first-load" 2>/dev/null; then
   if [[ -n ${FAKE_KILL_SAMPLER:-} ]]; then pkill -KILL -f -- "$keys"; fi
-  if [[ -n ${FAKE_KEYS_HANG:-} ]]; then rm -f "$keys"; mkfifo "$keys"; fi
+  if [[ -n ${FAKE_KEYS_HANG:-} ]]; then
+    # Publish the blocked reader atomically: an unlink/create gap can instead
+    # make the sampler report a missing key list, which is a different test.
+    mkfifo "$keys.hang" && mv -f "$keys.hang" "$keys"
+  fi
   if [[ -n ${FAKE_KEYS_GONE:-} ]]; then rm -f "$keys"; fi
 fi
 exec sleep 60

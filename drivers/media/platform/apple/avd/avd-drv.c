@@ -920,8 +920,9 @@ static int avd_probe(struct platform_device *pdev)
 	}
 
 	/* Determine firmware and HW variant capabilities */
-	codec_info = avd->fw->data + avd->fw->size - AVD_CODEC_INFO_MAX_SIZE;
-	if (strncmp(codec_info, "CODECS:", 7) == 0) {
+	if (avd->fw->size >= AVD_CODEC_INFO_MAX_SIZE)
+		codec_info = avd->fw->data + avd->fw->size - AVD_CODEC_INFO_MAX_SIZE;
+	if (codec_info && strncmp(codec_info, "CODECS:", 7) == 0) {
 		unsigned int caps = 0;
 		unsigned int variant_caps = avd->variant->capabilities;
 

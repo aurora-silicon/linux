@@ -76,6 +76,8 @@ static void reinit_completion(int *p) { *p=0; }
 static void schedule_work(unsigned int *p) { (*p)++; }
 struct work_struct { bool pending; };
 static bool queue_work(void *wq,struct work_struct *w) { assert(wq);bool fresh=!w->pending;w->pending=true;return fresh; }
+/* Only the 14.7 external role queues the AV client close; these providers never do. */
+static bool __attribute__((unused)) cancel_work_sync(struct work_struct *w) { bool queued=w->pending;assert(!queued);return queued; }
 struct apple_dcp;struct apple_dcp_afkep;struct apple_epic_service;
 void afk_service_retry(struct apple_dcp_afkep *ep);
 struct apple_epic_service_ops { char name[32];bool reusable,optional;void (*init)(struct apple_epic_service *,const char *,const char *,s64);int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*teardown)(struct apple_epic_service *); };
@@ -92,14 +94,16 @@ struct apple_connector { void *dcp;bool connected,edid_invalidation_pending;stru
 struct apple_dcp {
     void *dev;int fw_compat;struct apple_dcp_afkep *dcpavservep;struct apple_connector *connector;
     bool external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;u64 typec_generation;unsigned int nr_modes;
-    struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw; bool ext_dead;
-    struct { bool lock,enabled;u64 epoch;int enable_completion;struct apple_epic_service *service,*opened; } dcpavserv;
+    struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw; bool ext_dead,external_native;
+    struct { bool lock,enabled;u64 epoch;int enable_completion;struct apple_epic_service *service,*opened;
+             u64 opened_epoch,close_gen,terminated_epoch,close_epoch;bool opening;struct work_struct close_wq; } dcpavserv;
 };
-'''+internal_inline(root,'dcp_fw_is_14_7')+r'''struct epic_cmd { u32 retcode;u64 rxbuf,txbuf;u32 rxlen,txlen; };
+'''+internal_inline(root,'dcp_fw_is_14_7')+internal_inline(root,'dcp_is_v14_7_external')+r'''struct epic_cmd { u32 retcode;u64 rxbuf,txbuf;u32 rxlen,txlen; };
 static unsigned int dma_frees,opens;
 
 static int open_error,open_action;
 void dpavservep_detach(struct apple_dcp *dcp);
+static void afk_recv_handle_teardown(struct apple_dcp_afkep *ep, u32 channel);
 static void inject_owner(struct apple_dcp_afkep *ep,u32 pending_channel);
 static void dma_free_coherent(void *dev,size_t size,void *p,dma_addr_t address)
 { (void)dev;assert(size && (uintptr_t)p==address);free(p);dma_frees++; }
@@ -582,6 +586,7 @@ static void mutex_unlock(bool *p) { (void)once(p); }
 #define dev_dbg(...) ((void)0)
 #define dev_info(...) ((void)0)
 #define dev_err(...) ((void)0)
+#define dev_warn(...) ((void)0)
 #define trace_dcpavserv_init(...) ((void)0)
 #define DRM_CONNECTOR_REGISTERED 1
 #define to_platform_device(x) (x)
@@ -610,16 +615,17 @@ struct apple_dcp_afkep { struct apple_dcp *dcp; u8 endpoint; bool wire_v2; };
 struct apple_epic_service { struct apple_dcp_afkep *ep; unsigned int users; bool enabled,torndown; struct { u64 generation,epoch; } admission; void *cookie; unsigned int channel; };
 struct apple_dcp {
     struct apple_dcp_afkep *dcpavservep, *dptxep, *avep, *systemep, *ibootep, *dptx_controller_ep;
-    struct { bool lock, enabled; u64 epoch; int enable_completion; struct apple_epic_service *service, *opened; } dcpavserv;
+    struct { bool lock, enabled; u64 epoch; int enable_completion; struct apple_epic_service *service, *opened;
+             u64 opened_epoch, close_gen, terminated_epoch; bool opening; } dcpavserv;
     struct apple_connector *connector; unsigned int nr_modes;
-    struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw; bool ext_dead;
+    struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw; bool ext_dead,external_native;
     bool external_physically_absent,hpd_mutex, typec_cable_connected, quiescing;
     u64 typec_generation;
     int fw_compat;
     void *dev;
 };
 struct drm_edid { int identity; };
-static unsigned int reads, allocations, legacy_reads, receives;
+'''+internal_inline(root,'dcp_is_v14_7_external')+r'''static unsigned int reads, allocations, legacy_reads, receives;
 static unsigned int event;
 static struct apple_dcp_afkep *received_ep;
 static struct apple_epic_service *afk_service_get(struct apple_epic_service *s)
@@ -643,6 +649,10 @@ static const struct drm_edid *dcpavserv_read_edid_legacy(struct apple_epic_servi
 { legacy_reads++; return dcpavserv_read_edid_inline(s); }
 static int __attribute__((unused)) afk_service_call(struct apple_epic_service *s,unsigned short group,unsigned command,const void *data,size_t data_len,size_t data_pad,void *output,size_t output_len,size_t output_pad)
 { (void)s;(void)group;(void)command;(void)data;(void)data_len;(void)data_pad;(void)output;(void)output_len;(void)output_pad;assert(!"14.7 open-before-EDID on H17P");return -ENODEV; }
+/* Only the 14.7 external role opens the AV client and validates every EDID block. */
+static int __attribute__((unused)) dcpavserv_v14_open(struct apple_dcp *d,struct apple_epic_service *s,u64 epoch,u64 gen)
+{ (void)d;(void)s;(void)epoch;(void)gen;assert(!"14.7 AV client open on H17P");return -ENODEV; }
+static bool __attribute__((unused)) drm_edid_valid(const struct drm_edid *e) { (void)e;assert(!"14.7 EDID validation on H17P");return false; }
 static void iomfb_recv_msg(struct apple_dcp *d, u64 message) { (void)d; (void)message; }
 static void afk_receive_message(struct apple_dcp_afkep *ep, u64 message)
 { (void)message; received_ep=ep; receives++; }
@@ -824,7 +834,7 @@ struct apple_dcp_afkep { struct apple_dcp *dcp; u8 endpoint; struct mutex lock; 
 struct test_mode_ticket { u64 generation; bool associated; };
 struct apple_dcp {
     bool quiescing; int fw_compat; void *dev;
-    struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw; bool ext_dead;
+    struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw; bool ext_dead,external_native;
     struct { struct mutex lock; u64 epoch; bool enabled; void *service; } dcpavserv;
     struct test_mode_ticket dummy_ticket;
     struct { u64 connection_sequence; } rate_proof;
@@ -1021,7 +1031,7 @@ struct apple_dcp_afkep {
 };
 struct apple_dcp {
     void *dev;
-    struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw; bool ext_dead;
+    struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw; bool ext_dead,external_native;
     struct { unsigned enable_completion; bool enabled; } dcpavserv;
     struct apple_dcp_afkep *dcpavservep;
 };

@@ -191,6 +191,9 @@ static int apple_smc_rw_locked(struct apple_smc *smc, smc_key key,
 
 int apple_smc_read(struct apple_smc *smc, smc_key key, void *buf, size_t size)
 {
+	if (IS_ENABLED(CONFIG_MFD_MACSMC_KUNIT_TEST))
+		KUNIT_STATIC_STUB_REDIRECT(apple_smc_read, smc, key, buf, size);
+
 	guard(mutex)(&smc->mutex);
 
 	return apple_smc_rw_locked(smc, key, NULL, 0, buf, size);
@@ -199,6 +202,9 @@ EXPORT_SYMBOL(apple_smc_read);
 
 int apple_smc_write(struct apple_smc *smc, smc_key key, const void *buf, size_t size)
 {
+	if (IS_ENABLED(CONFIG_MFD_MACSMC_KUNIT_TEST))
+		KUNIT_STATIC_STUB_REDIRECT(apple_smc_write, smc, key, buf, size);
+
 	guard(mutex)(&smc->mutex);
 
 	return apple_smc_rw_locked(smc, key, buf, size, NULL, 0);

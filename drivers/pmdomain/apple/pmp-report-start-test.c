@@ -343,7 +343,50 @@ static void pmp_start_entry_teardown_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apple_pmp_report_entry_power_on(&ent->genpd), -ENODEV);
 }
 
+/* T6030's real overlay: DISP (7), deferred external requests (8/9),
+ * and storage (16), which has no acknowledgement. Only DISP gates startup.
+ */
+static struct pst *pst_t6030(struct kunit *test)
+{
+	struct pst *t = pst_new(test);
+
+	t->st.seed = BIT_ULL(7) | BIT_ULL(8) | BIT_ULL(9) | BIT_ULL(16);
+	t->st.ack = BIT_ULL(7) | BIT_ULL(8) | BIT_ULL(9);
+	t->st.startup_ack = BIT_ULL(7);
+	t->pmp.ack = BIT_ULL(7);
+	pst_write(t, pst_offsets.tgt_read, t->st.seed);
+	return t;
+}
+
+static void pmp_start_t6030_deferred_external_test(struct kunit *test)
+{
+	struct pst *t = pst_t6030(test);
+
+	KUNIT_ASSERT_EQ(test, pst_wait(t, 7, 5000), 0);
+	KUNIT_EXPECT_EQ(test, t->pmp.enables, 1U);
+	KUNIT_EXPECT_EQ(test, pst_wait(t, 8, 1), -EIO);
+	KUNIT_EXPECT_EQ(test, pst_wait(t, 9, 1), -EIO);
+	KUNIT_EXPECT_EQ(test, pst_wait(t, 16, 1), -EINVAL);
+	pst_write(t, pst_offsets.actual, BIT_ULL(7) | BIT_ULL(8));
+	KUNIT_EXPECT_EQ(test, pst_wait(t, 8, 1), 0);
+	KUNIT_EXPECT_EQ(test, t->pmp.enables, 1U);
+	pst_drain(t);
+}
+
+/* An external consumer must not bypass the internal startup admission. */
+static void pmp_start_t6030_external_first_test(struct kunit *test)
+{
+	struct pst *t = pst_t6030(test);
+
+	t->pmp.ack = BIT_ULL(8);
+	KUNIT_EXPECT_EQ(test, pst_wait(t, 8, 5000), -EIO);
+	KUNIT_EXPECT_EQ(test, pst_wait(t, 7, 1), -EIO);
+	pst_drain(t);
+}
+
 static struct kunit_case pmp_start_cases[] = {
+	KUNIT_CASE(pmp_start_t6030_deferred_external_test),
+	KUNIT_CASE(pmp_start_t6030_external_first_test),
 	KUNIT_CASE(pmp_start_ok_test),
 	KUNIT_CASE(pmp_start_check_fails_test),
 	KUNIT_CASE(pmp_start_busy_ptd_test),

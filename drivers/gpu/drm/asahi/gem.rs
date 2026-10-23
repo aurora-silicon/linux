@@ -428,3 +428,57 @@ mod allocation_policy_tests {
         assert!(!user_pages_no_reclaim(3_257_113_344, false));
     }
 }
+
+/// Populates and pins a new user object through its DMA mapping, before any CPU view exists.
+///
+/// On a device that is not DMA-coherent, the DMA mapping cleans the cacheable kernel alias of the
+/// freshly zeroed pages to the point of coherency, so that no dirty line can later overwrite data
+/// written through a write-combined view. The pin keeps reclaim from creating a new cacheable
+/// alias. Only used when the GPU asks for it ([`crate::gpu::Gpu::prepare_new_objects`]).
+///
+/// The DMA mapping only cleans if the device is not marked DMA-coherent (G15's synthesized node
+/// has no `dma-coherent`). Should it ever be marked so, the pages are cleaned here instead.
+#[cfg(CONFIG_DRM_ASAHI_G15)]
+pub(crate) fn prepare_new_object(gem: &Object) -> Result {
+    // SAFETY: G15 objects belong to the retained bound platform device; user object
+    // creation occurs only after registration and before a file can outlive its device.
+    let dev: &kernel::device::Device = gem.dev().as_ref().as_ref();
+    let sgt = held_sg_table(gem, unsafe { dev.as_bound() })?;
+    // SAFETY: The device outlives its GEM objects; the flag is fixed when the device is probed.
+    if !unsafe { asahi_g15_dma_coherent(dev.as_raw().cast()) } {
+        return Ok(());
+    }
+    static WARNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        dev_warn!(
+            dev,
+            "GPU marked DMA-coherent: cleaning new objects to the point of coherency explicitly\n"
+        );
+    }
+    let page_size = kernel::page::PAGE_SIZE;
+    for segment in sgt.iter() {
+        // Without an IOMMU in front of the GPU, its DMA addresses are physical addresses.
+        let start = segment.dma_address() as kernel::addr::PhysicalAddr;
+        let len = segment.dma_len() as usize;
+        let mut offset = 0;
+        while offset < len {
+            let phys = start + offset as kernel::addr::PhysicalAddr;
+            // SAFETY: The pinned SG table keeps these shmem pages allocated.
+            let page = unsafe { kernel::page::Page::borrow_phys(&phys) }.ok_or(EIO)?;
+            page.with_pointer_into_page(0, page_size, |p| {
+                crate::pgtable::clean_poc(p, page_size);
+                Ok(())
+            })?;
+            offset += page_size;
+        }
+    }
+    crate::pgtable::poc_barrier();
+    Ok(())
+}
+
+
+#[cfg(CONFIG_DRM_ASAHI_G15)]
+extern "C" { fn asahi_g15_dma_coherent(dev: *mut core::ffi::c_void) -> bool; }
+
+#[cfg(not(CONFIG_DRM_ASAHI_G15))]
+pub(crate) fn prepare_new_object(_gem: &Object) -> Result { Err(EINVAL) }

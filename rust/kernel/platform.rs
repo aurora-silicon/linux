@@ -79,6 +79,7 @@ unsafe impl<T: Driver> driver::RegistrationOps for Adapter<T> {
             (*pdrv.get()).remove = Some(Self::remove_callback);
             (*pdrv.get()).driver.of_match_table = of_table;
             (*pdrv.get()).driver.acpi_match_table = acpi_table;
+            (*pdrv.get()).driver.suppress_bind_attrs = T::suppress_bind_attrs();
         }
 
         // SAFETY: `pdrv` is guaranteed to be a valid `DriverType`.
@@ -222,6 +223,12 @@ pub trait Driver {
 
     /// The table of ACPI device ids supported by the driver.
     const ACPI_ID_TABLE: Option<acpi::IdTable<Self::IdInfo>> = None;
+
+    /// Suppress manual bind/unbind for hardware without a safe teardown path.
+    /// Evaluated before registration, including before a deferred probe.
+    fn suppress_bind_attrs() -> bool {
+        false
+    }
 
     /// Platform driver probe.
     ///

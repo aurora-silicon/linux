@@ -811,18 +811,27 @@ static int __init gate_pmp_copy_values(struct of_changeset *cs, struct device_no
 	return n;
 }
 
-static int __init gate_t8122_gpu_pmp_link(struct of_changeset *cs, struct device_node *pmp)
+static int __init gate_gpu_pmp_link(struct of_changeset *cs, struct device_node *pmp)
 {
 	struct device_node *gpu, *linked;
+	bool t6030 = IS_ENABLED(CONFIG_APPLE_T6030_GPU_PMP_LINK) && gate_soc == &gate_t6030;
 	int ret = 0;
 
-	if (gate_soc != &gate_t8122)
+	if (gate_soc != &gate_t8122 && !t6030)
 		return 0;
-	gpu = of_find_compatible_node(NULL, NULL, "apple,agx-t8122");
+	gpu = t6030 ? gate_find_one("apple,agx-t6030") :
+		of_find_compatible_node(NULL, NULL, "apple,agx-t8122");
 	if (!gpu || !of_device_is_available(gpu))
 		goto out;
+	/* Do not replace a malformed or unresolved pre-existing GPU supplier. */
+	if (t6030 && of_property_present(gpu, "apple,pmp") &&
+	    of_property_count_u32_elems(gpu, "apple,pmp") != 1) {
+		ret = -EINVAL;
+		goto out;
+	}
 	linked = of_parse_phandle(gpu, "apple,pmp", 0);
-	if (!pmp || !pmp->phandle || (linked && linked != pmp))
+	if (!pmp || !pmp->phandle || (linked && linked != pmp) ||
+	    (t6030 && of_property_present(gpu, "apple,pmp") && !linked))
 		ret = -EINVAL;
 	else if (!linked)
 		ret = of_changeset_add_prop_u32(cs, gpu, "apple,pmp", pmp->phandle);
@@ -868,7 +877,7 @@ static int __init gate_reuse_apply(struct device_node **ps)
 		ret = gate_add_bool(&gate_pmp_cs, r->ans, "apple,no-ack");
 	/* The current14 T8122 GPU needs an inner AGX vote from this Mac's PMP. */
 	if (!ret)
-		ret = gate_t8122_gpu_pmp_link(&gate_pmp_cs, r->pmp);
+		ret = gate_gpu_pmp_link(&gate_pmp_cs, r->pmp);
 	/* The display domains' floor, applied by the PMGR driver when it probes. */
 	for (i = PMP_PS_DISP_SYS; i <= PMP_PS_DISP_CPU && !ret; i++)
 		ret = gate_set_u32(&gate_pmp_cs, ps[i], "apple,min-state", PMGR_PS_ACTIVE);
@@ -941,9 +950,9 @@ static int __init gate_pmp_apply(struct device_node *dcp, struct device_node **p
 	if (!ret)
 		ret = of_changeset_add_prop_u32(&gate_pmp_cs, dcp, "apple,pmp-report",
 						disp->phandle);
-	/* The current14 T8122 GPU needs an inner AGX vote from this Mac's PMP. */
+	/* T8122 and an opted-in T6030 GPU need this Mac's PMP AGX vote. */
 	if (!ret)
-		ret = gate_t8122_gpu_pmp_link(&gate_pmp_cs, pmp);
+		ret = gate_gpu_pmp_link(&gate_pmp_cs, pmp);
 	/* The DART and mailbox interrupt parent lives in the base tree. */
 	if (!ret)
 		ret = of_changeset_add_prop_u32(&gate_pmp_cs, dart, "interrupt-parent",

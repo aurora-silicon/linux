@@ -2540,6 +2540,56 @@ int dcp_start(struct platform_device *pdev)
 	return ret;
 }
 
+/*
+ * A native T6030 external processor: its DP/HDMI audio endpoint (EP 0x29)
+ * on the driver's opt-in (hdmi_audio), as the other DCPs start it, for a
+ * processor whose port@0 links an audio device; once per session, and after
+ * the first display's EDID was read: with the endpoint's interfaces
+ * published, an EDID copy (dcpavserv_copy_edid()) has the firmware rebuild
+ * them and re-plug the sink, so the endpoint starts only once the first
+ * EDID is cached.
+ */
+static void dcp_external_audio_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp, external_audio_work);
+
+	/* Queued after an EDID came through the running session: RTKit is up. */
+	if (!IS_ENABLED(CONFIG_DRM_APPLE_AUDIO) || !hdmi_audio || !dcp->external_native ||
+	    dcp->external_audio_started || READ_ONCE(dcp->crashed) || !dcp->rtk)
+		return;
+	dcp->external_audio_started = true;
+	if (!apple_rtkit_has_endpoint(dcp->rtk, AV_ENDPOINT)) {
+		dev_info(dcp->dev, "no AV audio endpoint\n");
+		return;
+	}
+#if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
+	{
+		int ret = avep_init(dcp);
+
+		if (ret)
+			dev_warn(dcp->dev, "AV audio endpoint not started: %d\n", ret);
+	}
+#endif
+}
+
+void dcp_external_audio_start(struct apple_dcp *dcp)
+{
+	if (!dcp->external_native || dcp->external_audio_started)
+		return;
+	queue_work(system_freezable_wq, &dcp->external_audio_work);
+}
+
+/* Probe: the audio work, disabled until a native external pipe's bind. */
+static void dcp_external_audio_init(struct apple_dcp *dcp)
+{
+	INIT_WORK(&dcp->external_audio_work, dcp_external_audio_work);
+	/*
+	 * A native external pipe's bind enables it (its first EDID queues
+	 * it, through the connector); unbind and suspend disable it again.
+	 */
+	disable_work(&dcp->external_audio_work);
+}
+
 static void _dcp_poweroff(struct apple_dcp *dcp)
 {
 	switch (dcp->fw_compat) {
@@ -3657,8 +3707,10 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		dcp->vblank_works_disabled = false;
 	}
 
-	if (dcp->external_prepared)
+	if (dcp->external_prepared) {
+		av_audiosrv_reports_restart(dcp);
 		return 0;
+	}
 
 	/* A timed-out prior session may still scan these mappings. */
 	mutex_lock(&dcp->swapped_out_fbs_lock);
@@ -3743,8 +3795,10 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6) {
 		ret = iomfb_v26_6_bind(dcp);
-		if (!ret)
+		if (!ret) {
 			enable_work(&dcp->dimensions_wq);
+			av_audiosrv_reports_restart(dcp);
+		}
 		return ret;
 	}
 
@@ -3753,19 +3807,24 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		if (dcp->external_native) {
 			WRITE_ONCE(dcp->external_detached, false);
 			enable_work(&dcp->vblank_wq);
+			enable_work(&dcp->external_audio_work);
 			enable_delayed_work(&dcp->swap_watchdog_wq);
 			enable_delayed_work(&dcp->external_retry_wq);
 			enable_work(&dcp->dimensions_wq);
 			dcp_enable_typec_work(dcp);
+			av_audiosrv_reports_restart(dcp);
 			return 0;
 		}
-		if (dcp->external)
+		if (dcp->external) {
+			av_audiosrv_reports_restart(dcp);
 			return 0;
+		}
 		ret = iomfb_v14_7_bind(dcp);
 		/* Balances the disable at probe, as below. */
 		if (!ret) {
 			enable_work(&dcp->dimensions_wq);
 			dcp_enable_typec_work(dcp);
+			av_audiosrv_reports_restart(dcp);
 		}
 		return ret;
 	}
@@ -3872,6 +3931,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	enable_work(&dcp->dimensions_wq);
 	schedule_work(&dcp->dimensions_wq);
 	dcp_enable_typec_work(dcp);
+	av_audiosrv_reports_restart(dcp);
 	return 0;
 
 err_piodma:
@@ -3908,7 +3968,17 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
-	if (!dcp || READ_ONCE(dcp->ext_dead))
+	if (!dcp)
+		return;
+	/*
+	 * Stop the native initializer before looking up its owner, including
+	 * the dead-session path. Owner allocation may have landed in an open
+	 * bind devres group; finish its RPC work while endpoint RX is alive.
+	 */
+	if (dcp->external_native)
+		disable_work_sync(&dcp->external_audio_work);
+	av_audiosrv_quiesce(dcp);
+	if (READ_ONCE(dcp->ext_dead))
 		return;
 
 	disable_work_sync(&dcp->dimensions_wq);
@@ -4004,7 +4074,7 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		}
 	}
 
-	if (dcp->avep) {
+	if (!IS_ERR_OR_NULL(dcp->avep)) {
 		av_service_disconnect(dcp);
 		afk_shutdown(dcp->avep);
 		dcp->avep = NULL;
@@ -4169,6 +4239,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	dcp->ext_failsafe = of_device_is_compatible(dev->of_node, "apple,t8122-dcpext");
 	dcp->external = of_device_is_compatible(dev->of_node, "apple,t6030-dcpext");
 	dcp->external_native = dcp->external && dcp_t6030_ext_native(dev->of_node);
+	dcp_external_audio_init(dcp);
 	dcp->dev = dev;
 	/*
 	 * Type-C and Thunderbolt routes can be activated as soon as they are
@@ -4188,6 +4259,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	spin_lock_init(&dcp->mode_state.lock);
 	spin_lock_init(&dcp->metadata.lock);
 	mutex_init(&dcp->dcpavserv.lock);
+	INIT_WORK(&dcp->dcpavserv.close_wq, dcpavserv_close_work);
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
 	if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
@@ -4464,14 +4536,18 @@ fixed_done:
 		ret = dcp_comp_bind(dev, NULL, NULL);
 		if (ret) {
 			dcp_disable_typec_work(dcp, true);
+			av_audiosrv_quiesce(dcp);
 			return ret;
 		}
 		WRITE_ONCE(dcp->external_prepared, true);
 	}
 	if (dcp->external_native) {
 		ret = iomfb_v14_7_external_prepare(dcp);
-		if (ret)
+		if (ret) {
+			disable_work_sync(&dcp->external_audio_work);
+			av_audiosrv_quiesce(dcp);
 			return ret;
+		}
 		if (routes_failed)
 			iomfb_v14_7_external_refuse(dcp, "its Type-C display routes did not register");
 	}
@@ -4479,6 +4555,12 @@ fixed_done:
 	ret = component_add(&pdev->dev, &dcp_comp_ops);
 	if (ret && dcp->external_prepared) {
 		dcp_disable_typec_work(dcp, true);
+	}
+	/* component_add failure does not unbind. Stop owner work first. */
+	if (ret) {
+		if (dcp->external_native)
+			disable_work_sync(&dcp->external_audio_work);
+		av_audiosrv_quiesce(dcp);
 	}
 	if (ret && dcp->fw_compat == DCP_FIRMWARE_V_26_6)
 		iomfb_v26_6_unbind(dcp);
@@ -4601,11 +4683,21 @@ static void dcp_platform_remove(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
 	if (dcp && dcp->external && !dcp->external_native) {
-		/* Enabled for the external start at probe. */
+		/* Enabled for the external start at probe. No component unbind. */
 		disable_delayed_work_sync(&dcp->typec_reconnect_wq);
+		av_audiosrv_quiesce(dcp);
 		iomfb_v14_7_remove(dcp);
 		return;
 	}
+	if (dcp && dcp->external_native)
+		disable_work_sync(&dcp->external_audio_work);
+	/*
+	 * Finish audio RPCs before component_del's unbind flushes RX, and
+	 * before iomfb_v14_7_remove() clears v14->dcp. Unbind repeats the
+	 * helper; the second call does not disable the works again.
+	 */
+	if (dcp)
+		av_audiosrv_quiesce(dcp);
 	component_del(&pdev->dev, &dcp_comp_ops);
 	if (dcp && dcp->fw_compat == DCP_FIRMWARE_V_26_6)
 		iomfb_v26_6_unbind(dcp);
@@ -4852,6 +4944,8 @@ static int dcp_platform_suspend(struct device *dev)
 	 */
 	dcp_disable_typec_work(dcp, false);
 	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
+	if (dcp->external_native)
+		disable_work_sync(&dcp->external_audio_work);
 
 	if (dcp->avep)
 		av_service_disconnect(dcp);
@@ -4890,6 +4984,8 @@ static int dcp_platform_resume(struct device *dev)
 	/* Observe future edges before sampling any edges lost in sleep. */
 	if (dcp->hdmi_hpd_irq)
 		dcp_fabric_run_resume(&dcp_resume_ops, dcp);
+	if (dcp->external_native)
+		enable_work(&dcp->external_audio_work);
 
 	if (dcp->avep)
 		av_service_connect(dcp);
@@ -5024,3 +5120,7 @@ void dcp_unregister(void)
 {
 	platform_driver_unregister(&apple_platform_driver);
 }
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
+#include "dcp_external_audio_test.c"
+#endif

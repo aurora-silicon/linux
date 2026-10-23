@@ -98,6 +98,7 @@ static int cs42l42_sdw_dai_prepare(struct snd_pcm_substream *substream,
 				   struct snd_soc_dai *dai)
 {
 	struct cs42l42_private *cs42l42 = snd_soc_component_get_drvdata(dai->component);
+	int ret;
 
 	dev_dbg(dai->dev, "dai_prepare: sclk=%u rate=%u\n", cs42l42->sclk, cs42l42->sample_rate);
 
@@ -110,7 +111,11 @@ static int cs42l42_sdw_dai_prepare(struct snd_pcm_substream *substream,
 	 * an unsupported SWIRE_CLK and sample_rate combination.
 	 */
 
-	return cs42l42_pll_config(dai->component, cs42l42->sclk, cs42l42->sample_rate);
+	ret = cs42l42_pll_config(dai->component, cs42l42->sclk, cs42l42->sample_rate);
+	if (ret)
+		return ret;
+
+	return cs42l42_dai_prepare(substream, dai);
 }
 
 static int cs42l42_sdw_dai_hw_free(struct snd_pcm_substream *substream,

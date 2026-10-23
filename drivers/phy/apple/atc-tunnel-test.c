@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
 #include <kunit/test.h>
+#include <linux/soc/apple/dp-tunnel.h>
 
 #include "atc-tunnel.h"
 
@@ -90,7 +91,21 @@ static void atc_tunnel_wiring_gate(struct kunit *test)
 				cases[i].expected);
 }
 
+static void atc_tunnel_t6030_clock_sources(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t6030_pclk(0, 0), 0);
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t6030_pclk(2, 0), 0);
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t6030_pclk(0, 1), 1);
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t6030_pclk(2, 1), 1);
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t6030_pclk(1, 0), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t6030_pclk(4, 0), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t6030_pclk(0, 2), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t6030_pclk(~0U, 0), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t6030_pclk(0, ~0U), -EOPNOTSUPP);
+}
+
 static struct kunit_case atc_tunnel_cases[] = {
+	KUNIT_CASE(atc_tunnel_t6030_clock_sources),
 	KUNIT_CASE(atc_tunnel_soc_qualification),
 	KUNIT_CASE(atc_tunnel_core_qualification),
 	KUNIT_CASE(atc_tunnel_wiring_gate),

@@ -1910,12 +1910,80 @@ static void fabric_t6030_init(struct fabric_fixture *f)
 {
 	unsigned int p;
 
-	fabric_init(f, false);
+	fabric_init(f, dcp_fabric_ordered_dual_stream(true, true));
 	for (p = 0; p < 3; p++) {
+		f->port[p].candidate_crtcs[1] = BIT(1) | BIT(2);
 		f->route[p][0].tunnel_clock_blocked =
 			dcp_fabric_tunnel_clock_blocked(true, 0);
 		f->route[p][1].tunnel_clock_blocked =
 			dcp_fabric_tunnel_clock_blocked(true, 2);
+	}
+}
+
+static void fabric_t6030_dual_policy_test(struct kunit *test)
+{
+	struct fabric_fake f;
+	u32 mask;
+
+	fabric_fake_init(&f, test, dcp_fabric_ordered_dual_stream(true, true));
+	KUNIT_EXPECT_FALSE(test, f.f.policy.dual_stream);
+	KUNIT_EXPECT_TRUE(test, dcp_fabric_ordered_dual_stream(true, false));
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_ordered_dual_stream(false, true));
+	/* A primary dock stream leaves the fixed processor free for HDMI. */
+	KUNIT_ASSERT_EQ(test, fabric_tunnel(&f.f, 0, 0), 0);
+	KUNIT_EXPECT_PTR_EQ(test, f.f.port[0].owner[0], &f.f.route[0][1]);
+	f.borrowed = f.f.pipeline[0].owned;
+	f.frozen = true;
+	f.levels[0] = f.levels[1] = 1;
+	dcp_fabric_run_hdmi(&fabric_fake_hdmi_ops, &f);
+	KUNIT_ASSERT_EQ(test, f.count, 4U);
+	KUNIT_EXPECT_EQ(test, f.trace[3], FX_CONNECT_FIXED);
+	/* HDMI owns one processor; the other still takes the first tunnel. */
+	fabric_release(&f.f, 0, 0);
+	f.f.pipeline[0].fixed_busy = true;
+	KUNIT_ASSERT_EQ(test, fabric_tunnel(&f.f, 0, 0), 0);
+	KUNIT_EXPECT_PTR_EQ(test, f.f.port[0].owner[0], &f.f.route[0][1]);
+	f.f.pipeline[0].fixed_busy = false;
+	f.f.port[0].candidate_crtcs[1] = BIT(1) | BIT(2);
+	KUNIT_ASSERT_EQ(test, fabric_tunnel(&f.f, 0, 1), 0);
+	KUNIT_EXPECT_PTR_EQ(test, f.f.port[0].owner[1], &f.f.route[0][0]);
+	/* Both encoders expose candidates, then narrow to the actual owner. */
+	mask = dcp_fabric_port_crtc_mask(true, false, false, 0, BIT(1));
+	mask = dcp_fabric_port_crtc_mask(true, false, true, mask, BIT(2));
+	KUNIT_EXPECT_EQ(test, mask, (u32)(BIT(1) | BIT(2)));
+	KUNIT_EXPECT_EQ(test, dcp_fabric_connector_mask(false, true, true, 1, mask), (u32)BIT(1));
+	KUNIT_EXPECT_EQ(test, dcp_fabric_connector_mask(false, true, true, 2, mask), (u32)BIT(2));
+	/* Ordered M2 secondary connectors retain the Type-C-only processor. */
+	mask = dcp_fabric_port_crtc_mask(true, true, false, 0, BIT(1));
+	mask = dcp_fabric_port_crtc_mask(true, true, true, mask, BIT(2));
+	KUNIT_EXPECT_EQ(test, mask, (u32)BIT(2));
+	mask = dcp_fabric_port_crtc_mask(false, true, false, mask, BIT(1));
+	KUNIT_EXPECT_EQ(test, mask, (u32)(BIT(1) | BIT(2)));
+}
+
+static void fabric_t6030_clock_header_parity_test(struct kunit *test)
+{
+	static const struct {
+		unsigned int source;
+		unsigned int dpin;
+		int pclk;
+	} cases[] = {
+		{ 0, 0, 0 }, { 0, 1, 1 }, { 2, 0, 0 }, { 2, 1, 1 },
+		{ 1, 0, -EOPNOTSUPP }, { 1, 1, -EOPNOTSUPP },
+		{ 3, 0, -EOPNOTSUPP }, { 4, 0, -EOPNOTSUPP },
+		{ UINT_MAX, 0, -EOPNOTSUPP },
+		{ 0, 2, -EOPNOTSUPP }, { 2, 2, -EOPNOTSUPP },
+		{ 0, UINT_MAX, -EOPNOTSUPP },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		KUNIT_EXPECT_EQ(test,
+			apple_dp_tunnel_t6030_pclk(cases[i].source, cases[i].dpin),
+			cases[i].pclk);
+		KUNIT_EXPECT_EQ(test,
+			dcp_fabric_t6030_pclk(cases[i].source, cases[i].dpin),
+			cases[i].pclk);
 	}
 }
 
@@ -1959,9 +2027,16 @@ static void fabric_t6030_clock_routes_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, fabric_tunnel(&f, 0, 0), 0);
 	KUNIT_EXPECT_PTR_EQ(test, f.port[0].owner[0], &f.route[0][1]);
 	fabric_release(&f, 0, 0);
-	/* A second stream on the same dock is still unsupported on T6030. */
-	KUNIT_EXPECT_EQ(test, fabric_tunnel(&f, 0, 1), -EOPNOTSUPP);
-	KUNIT_EXPECT_PTR_EQ(test, f.port[0].owner[1], NULL);
+	/* Separate dock monitors hold separate processors and pixel clocks. */
+	f.pipeline[0].services_ready = true;
+	f.pipeline[1].services_ready = true;
+	KUNIT_ASSERT_EQ(test, fabric_tunnel(&f, 0, 0), 0);
+	KUNIT_ASSERT_EQ(test, fabric_tunnel(&f, 0, 1), 0);
+	KUNIT_EXPECT_PTR_EQ(test, f.port[0].owner[0], &f.route[0][1]);
+	KUNIT_EXPECT_PTR_EQ(test, f.port[0].owner[1], &f.route[0][0]);
+	fabric_release(&f, 0, 0);
+	KUNIT_EXPECT_PTR_EQ(test, f.port[0].owner[1], &f.route[0][0]);
+	fabric_release(&f, 0, 1);
 	KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_clock_blocked(true, 1), (u8)3);
 	KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_clock_blocked(true, 4), (u8)3);
 	KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_clock_blocked(false, 0), (u8)0);
@@ -1998,7 +2073,7 @@ static void fabric_t6030_follow_test(struct kunit *test)
 					      NULL, NULL, false, &f.policy), DCP_FABRIC_FOLLOW_MOVE);
 	f.route[0][0].dpin = 1;
 	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(&f.route[0][0], &f.route[0][1],
-					      NULL, NULL, false, &f.policy), DCP_FABRIC_FOLLOW_REFUSE);
+					      NULL, NULL, false, &f.policy), DCP_FABRIC_FOLLOW_MOVE);
 	f.route[0][0].tunnel = false;
 	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(&f.route[0][0], &f.route[0][1],
 					      NULL, NULL, false, &f.policy), DCP_FABRIC_FOLLOW_MOVE);
@@ -2275,7 +2350,9 @@ static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE(relink_budget_test),
 	KUNIT_CASE(relink_disabled_test),
 	KUNIT_CASE(relink_stamp_test),
+	KUNIT_CASE(fabric_t6030_dual_policy_test),
 	KUNIT_CASE(fabric_t6030_clock_routes_test),
+	KUNIT_CASE(fabric_t6030_clock_header_parity_test),
 	KUNIT_CASE(fabric_t6030_plan_test),
 	KUNIT_CASE(fabric_t6030_follow_test),
 	KUNIT_CASE(fabric_reclaim_transaction_test),

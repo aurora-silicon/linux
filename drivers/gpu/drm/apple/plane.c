@@ -20,45 +20,195 @@
 #include <drm/drm_plane.h>
 
 #include <linux/math.h>
+#include <linux/overflow.h>
 #include <linux/types.h>
 
 #define APPLE_GPU_CACHELINE	16
 #define FRAC_16_16(mult, div)    (((mult) << 16) / (div))
 
-static struct dcp_image_layout
-apple_get_ix_layout(u32 width, u32 height, u32 bpp, u32 plane,  bool yuv)
+struct apple_plane_layout {
+	struct dcp_image_layout image;
+	u32 width;
+	u32 height;
+	u32 offset;
+	u32 stride;
+	u32 size;
+	u32 tile_size;
+};
+
+static int apple_plane_ix_bpp(const struct drm_format_info *fmt, u32 plane,
+			      u32 *bpp)
 {
-	u32 meta_tile_w, meta_tile_h;
-	struct dcp_image_layout layout;
+	u32 bw = drm_format_info_block_width(fmt, plane);
+	u32 bh = drm_format_info_block_height(fmt, plane);
+	u32 bits = fmt->char_per_block[plane] * 8;
+	u32 block_pixels;
+
+	/*
+	 * P030/P230 pack three pixels per block. Neither an integer bpp
+	 * (which would be zero) nor a truncated bpp describes their tiles.
+	 * Keep these formats linear until their interchange packing is known.
+	 */
+	if (!bw || !bh || check_mul_overflow(bw, bh, &block_pixels) || !bits ||
+	    bits % block_pixels)
+		return -EINVAL;
+	*bpp = bits / block_pixels;
+
+	return 0;
+}
+
+static bool apple_plane_format_mod_supported(struct drm_plane *plane,
+					     u32 format, u64 modifier)
+{
+	const struct drm_format_info *fmt = drm_format_info(format);
+	u32 bpp;
+	unsigned int i;
+
+	if (!fmt)
+		return false;
+
+	/* The callback replaces DRM's generic modifier-list validation. */
+	for (i = 0; i < plane->modifier_count; i++)
+		if (modifier == plane->modifiers[i])
+			break;
+	if (i == plane->modifier_count)
+		return false;
+
+	switch (modifier) {
+	case DRM_FORMAT_MOD_LINEAR:
+	case DRM_FORMAT_MOD_INVALID:
+		return true;
+	case DRM_FORMAT_MOD_APPLE_INTERCHANGE:
+		for (u32 i = 0; i < fmt->num_planes; i++)
+			if (apple_plane_ix_bpp(fmt, i, &bpp))
+				return false;
+		return true;
+	default:
+		return false;
+	}
+}
+
+static int apple_get_ix_layout(u32 width, u32 height,
+			       const struct drm_format_info *fmt, u32 plane,
+			       struct apple_plane_layout *out)
+{
+	struct dcp_image_layout *layout = &out->image;
+	u32 bpp, meta_tile_w, meta_tile_h, tiles, bytes;
+	int ret;
+
+	ret = apple_plane_ix_bpp(fmt, plane, &bpp);
+	if (ret)
+		return ret;
 
 	/*
 	 * Compression subtiles are always 16x16 with 8 bytes of metadata,
-	 * but IOMFB requires its structs to be populated with values
-	 * relative to the image tile dimensions.
+	 * but IOMFB requires values relative to the image tile dimensions.
 	 */
-	if (yuv && plane == 0) {
-		/* Luma image tiles are 32x32... */
-		layout.tile_w = layout.tile_h = 32;
-		/* ...and therefore have 4x 8-byte compression subtiles */
-		layout.meta_tile_bytes = 32;
+	if (fmt->is_yuv && plane == 0) {
+		layout->tile_w = 32;
+		layout->tile_h = 32;
+		layout->meta_tile_bytes = 32;
 	} else {
-		layout.tile_w = layout.tile_h = 16;
-		layout.meta_tile_bytes = 8;
+		layout->tile_w = 16;
+		layout->tile_h = 16;
+		layout->meta_tile_bytes = 8;
 	}
 
-	layout.width_tiles = DIV_ROUND_UP(width, layout.tile_w);
-	layout.height_tiles = DIV_ROUND_UP(height, layout.tile_h);
-	layout.tile_bytes = DIV_ROUND_UP(layout.tile_w * layout.tile_h * bpp, 8);
-	layout.meta_offset = ALIGN(layout.width_tiles * layout.height_tiles * layout.tile_bytes,
-				   APPLE_GPU_CACHELINE);
+	layout->width_tiles = (width - 1) / layout->tile_w + 1;
+	layout->height_tiles = (height - 1) / layout->tile_h + 1;
+	layout->tile_bytes = layout->tile_w * layout->tile_h * bpp / 8;
+	if (layout->tile_bytes > U16_MAX ||
+	    check_mul_overflow(layout->width_tiles, layout->tile_bytes,
+			       &out->stride) ||
+	    check_mul_overflow(out->stride, layout->height_tiles, &bytes) ||
+	    check_add_overflow(bytes, APPLE_GPU_CACHELINE - 1, &bytes))
+		return -EINVAL;
+	layout->meta_offset = bytes & ~(APPLE_GPU_CACHELINE - 1);
 
-	meta_tile_w = DIV_ROUND_UP(roundup_pow_of_two(width), layout.tile_w);
-	meta_tile_h = DIV_ROUND_UP(roundup_pow_of_two(height), layout.tile_h);
+	/* The rounded dimensions and all wire-format sizes must fit u32. */
+	if (width > BIT(31) || height > BIT(31))
+		return -EINVAL;
+	meta_tile_w = DIV_ROUND_UP(roundup_pow_of_two(width), layout->tile_w);
+	meta_tile_h = DIV_ROUND_UP(roundup_pow_of_two(height), layout->tile_h);
+	if (check_mul_overflow(meta_tile_w, meta_tile_h, &tiles) ||
+	    check_mul_overflow(tiles, layout->meta_tile_bytes, &bytes) ||
+	    check_add_overflow(bytes, APPLE_GPU_CACHELINE - 1, &bytes))
+		return -EINVAL;
+	layout->meta_size = bytes & ~(APPLE_GPU_CACHELINE - 1);
+	if (check_add_overflow(layout->meta_offset, layout->meta_size,
+			       &out->size))
+		return -EINVAL;
+	out->tile_size = layout->tile_bytes;
 
-	layout.meta_size = ALIGN(meta_tile_w * meta_tile_h * layout.meta_tile_bytes,
-				  APPLE_GPU_CACHELINE);
+	return 0;
+}
 
-	return layout;
+/* Use exactly the same geometry for admission and surface construction. */
+static int apple_plane_get_fb_layout(struct drm_framebuffer *fb,
+				     struct apple_plane_layout *planes,
+				     u32 *buf_size)
+{
+	const struct drm_format_info *fmt = fb->format;
+	struct drm_gem_dma_object *first;
+	u32 end;
+	int ret;
+
+	if (!fb->width || !fb->height || !fmt->hsub || !fmt->vsub ||
+	    !fmt->num_planes || fmt->num_planes > DCP_SURF_MAX_PLANES)
+		return -EINVAL;
+	first = drm_fb_dma_get_gem_obj(fb, 0);
+	if (!first)
+		return -EINVAL;
+
+	*buf_size = 0;
+	for (u32 i = 0; i < fmt->num_planes; i++) {
+		struct apple_plane_layout *p = &planes[i];
+		struct drm_gem_dma_object *obj = drm_fb_dma_get_gem_obj(fb, i);
+
+		/* DCP currently uses one GEM object for the whole surface. */
+		if (obj != first || fb->offsets[i] < fb->offsets[0])
+			return -EINVAL;
+		*p = (struct apple_plane_layout){
+			.width = i ? DIV_ROUND_UP_ULL(fb->width, fmt->hsub) :
+				     fb->width,
+			.height = i ? DIV_ROUND_UP_ULL(fb->height, fmt->vsub) :
+				      fb->height,
+			.offset = fb->offsets[i] - fb->offsets[0],
+		};
+		if (!p->width || !p->height)
+			return -EINVAL;
+
+		switch (fb->modifier) {
+		case DRM_FORMAT_MOD_APPLE_INTERCHANGE:
+			ret = apple_get_ix_layout(p->width, p->height, fmt, i,
+						  p);
+			if (ret)
+				return ret;
+			break;
+		case DRM_FORMAT_MOD_INVALID:
+		case DRM_FORMAT_MOD_LINEAR:
+			if (!fb->pitches[i] || fb->pitches[i] & 63 ||
+			    check_mul_overflow(p->height, fb->pitches[i],
+					       &p->size))
+				return -EINVAL;
+			p->image.tile_w = drm_format_info_block_width(fmt, i);
+			p->image.tile_h = drm_format_info_block_height(fmt, i);
+			p->tile_size = p->image.tile_w * p->image.tile_h;
+			p->stride = fb->pitches[i];
+			break;
+		default:
+			return -EINVAL;
+		}
+
+		if (check_add_overflow(p->offset, p->size, &end) ||
+		    (u64)fb->offsets[i] + p->size > obj->base.size ||
+		    check_add_overflow(*buf_size, p->size, buf_size))
+			return -EINVAL;
+	}
+	if ((u64)fb->offsets[0] + *buf_size > first->base.size)
+		return -EINVAL;
+
+	return 0;
 }
 
 static int apple_plane_atomic_check(struct drm_plane *plane,
@@ -67,7 +217,8 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 	struct drm_plane_state *new_plane_state;
 	struct drm_crtc_state *crtc_state;
 	struct drm_rect *dst;
-	struct drm_framebuffer *fb;
+	struct apple_plane_layout layouts[DCP_SURF_MAX_PLANES];
+	u32 buf_size;
 	int ret;
 
 	new_plane_state = drm_atomic_get_new_plane_state(commit, plane);
@@ -98,6 +249,10 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 	if (ret < 0)
 		return ret;
 
+	ret = apple_plane_get_fb_layout(new_plane_state->fb, layouts, &buf_size);
+	if (ret)
+		return ret;
+
 	if (!new_plane_state->visible)
 		return 0;
 
@@ -123,64 +278,6 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 			throw this error again until you next reboot.\n",
 			dst->x1, dst->y1, dst->x2, dst->y2,
 			crtc_state->mode.hdisplay, crtc_state->mode.vdisplay);
-		return -EINVAL;
-	}
-
-	/*
-	 * FIXME: dcp can currently only use multi-planar buffers using the same
-	 *        object for all planes. It has a mandatory iommu so it should
-	 *        be no problem to map multiple objects "linearly" into DCP
-	 *        virtual address space and calculate the offsets accordingly.
-	 *        Or maybe it can accept multiple BOs via the per plane field
-	 *        `base`.
-	 */
-	if (new_plane_state->fb->format->num_planes > 1) {
-		const struct drm_gem_object *first = new_plane_state->fb->obj[0];
-		for (u32 i = 1; i < new_plane_state->fb->format->num_planes; i++)
-			if (new_plane_state->fb->obj[i] != NULL &&
-			    new_plane_state->fb->obj[i] != first)
-				return -EINVAL;
-	}
-
-	fb = new_plane_state->fb;
-	switch (fb->modifier) {
-	case DRM_FORMAT_MOD_APPLE_INTERCHANGE:
-		/*
-		 * The GEM object must be big enough for the framebuffer and metadata
-		 */
-		for (u32 i = 0; i < fb->format->num_planes; i++) {
-			struct dcp_image_layout layout;
-			struct drm_gem_dma_object *obj;
-			u32 req_size;
-
-			u32 width = drm_format_info_plane_width(fb->format, fb->width, i);
-			u32 height = drm_format_info_plane_height(fb->format, fb->height, i);
-			u32 bpp = drm_format_info_bpp(fb->format, i);
-
-			layout = apple_get_ix_layout(width, height, bpp, i,
-						     fb->format->is_yuv);
-			obj = drm_fb_dma_get_gem_obj(fb, i);
-
-			req_size = fb->offsets[i] + layout.meta_offset + layout.meta_size;
-
-			if (req_size > obj->base.size) {
-				dev_err_ratelimited(commit->dev->dev,
-						    "plane_atomic_check: required size of %u > %zu\n",
-						    req_size, obj->base.size);
-				return -EINVAL;
-			}
-		}
-		break;
-	case DRM_FORMAT_MOD_INVALID:
-	case DRM_FORMAT_MOD_LINEAR:
-		/*
-		 * Pitches have to be 64-byte aligned for linear images.
-		 */
-		for (u32 i = 0; i < fb->format->num_planes; i++)
-			if (fb->pitches[i] & 63)
-				return -EINVAL;
-		break;
-	default:
 		return -EINVAL;
 	}
 
@@ -302,6 +399,8 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 	struct drm_plane_state *base = drm_atomic_get_new_plane_state(commit, plane);
 	struct apple_plane_state *new_state;
 	struct drm_gem_dma_object *obj;
+	struct apple_plane_layout layouts[DCP_SURF_MAX_PLANES];
+	u32 buf_size;
 	bool is_premultiplied = false;
 
 	if (!base)
@@ -316,6 +415,12 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 
 	struct drm_framebuffer *fb = base->fb;
 	const struct drm_format_info *fmt = fb->format;
+
+	if (WARN_ON_ONCE(apple_plane_get_fb_layout(fb, layouts, &buf_size))) {
+		memset(&new_state->surf, 0, sizeof(new_state->surf));
+		return;
+	}
+
 	/*
 	 * DCP doesn't support XBGR8 / XRGB8 / XBGR2101010 natively. Blending as
 	 * pre-multiplied alpha with a black background can be used as
@@ -340,6 +445,7 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 		.width = fb->width,
 		.height = fb->height,
 		.surface_id = plane->base.id,
+		.buf_size = buf_size,
 
 		/* Only used for compressed or multiplanar surfaces */
 		.pix_size = 1,
@@ -353,61 +459,45 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 	/* Populate plane information for planar formats */
 	struct dcp_surface *surf = &new_state->surf;
 	for (int i = 0; fb->format->num_planes && i < fb->format->num_planes; i++) {
-		u32 width = drm_format_info_plane_width(fb->format, fb->width, i);
-		u32 height = drm_format_info_plane_height(fb->format, fb->height, i);
-		u32 bw = drm_format_info_block_width(fb->format, i);
-		u32 bh = drm_format_info_block_height(fb->format, i);
-		u32 bpp;
-
+		const struct apple_plane_layout *p = &layouts[i];
+		const struct dcp_image_layout *layout = &p->image;
 
 		surf->planes[i] = (struct dcp_plane_info){
-			.width = width,
-			.height = height,
-			.base = fb->offsets[i] - fb->offsets[0],
-			.offset = fb->offsets[i] - fb->offsets[0],
+			.width = p->width,
+			.height = p->height,
+			.base = p->offset,
+			.offset = p->offset,
+			.tile_w = layout->tile_w,
+			.tile_h = layout->tile_h,
+			.stride = p->stride,
+			.size = p->size,
+			.tile_size = p->tile_size,
 		};
 
 		switch (fb->modifier) {
 		case DRM_FORMAT_MOD_APPLE_INTERCHANGE:
-			struct dcp_image_layout layout;
-
-			bpp = fmt->char_per_block[i] * 8 / (bw * bh);
-			layout = apple_get_ix_layout(width, height, bpp, i, fmt->is_yuv);
-
-			surf->planes[i].tile_w = layout.tile_w;
-			surf->planes[i].tile_h = layout.tile_h;
-			surf->planes[i].stride = layout.width_tiles * layout.tile_bytes;
-			surf->planes[i].size = layout.meta_offset + layout.meta_size;
-			surf->planes[i].tile_size = layout.tile_bytes;
 			surf->planes[i].address_fmt = DCP_ADDR_FMT_INTERCHANGE_TILED;
 
 			surf->compression_info[i] = (struct dcp_compression_info) {
-				.tile_w = layout.tile_w,
-				.tile_h = layout.tile_h,
+				.tile_w = layout->tile_w,
+				.tile_h = layout->tile_h,
 				.data_offset = surf->planes[i].offset,
-				.metadata_offset = surf->planes[i].offset + layout.meta_offset,
-				.meta_bytes = layout.meta_tile_bytes,
-				.tiles_w = layout.width_tiles,
-				.tiles_h = layout.height_tiles,
-				.tile_bytes = layout.tile_bytes,
-				.row_stride = layout.width_tiles * layout.tile_bytes,
+				.metadata_offset = surf->planes[i].offset + layout->meta_offset,
+				.meta_bytes = layout->meta_tile_bytes,
+				.tiles_w = layout->width_tiles,
+				.tiles_h = layout->height_tiles,
+				.tile_bytes = layout->tile_bytes,
+				.row_stride = p->stride,
 				.compression_type = DCP_COMPRESSION_INTERCHANGE,
 			};
 			break;
 		case DRM_FORMAT_MOD_INVALID:
 		case DRM_FORMAT_MOD_LINEAR:
-			surf->planes[i].tile_w = bw;
-			surf->planes[i].tile_h = bh;
-			surf->planes[i].stride = fb->pitches[i];
-			surf->planes[i].size = height * fb->pitches[i];
-			surf->planes[i].tile_size = bw * bh;
 			surf->planes[i].address_fmt = DCP_ADDR_FMT_LINEAR;
 			break;
 		default:
 			break;
 		}
-
-		surf->buf_size += surf->planes[i].size;
 	}
 
 	/* the obvious helper call drm_fb_dma_get_gem_addr() adjusts
@@ -525,6 +615,7 @@ static const struct drm_plane_funcs apple_plane_funcs = {
 	.reset			= apple_plane_reset,
 	.atomic_duplicate_state = apple_plane_duplicate_state,
 	.atomic_destroy_state	= apple_plane_destroy_state,
+	.format_mod_supported = apple_plane_format_mod_supported,
 };
 
 /*

@@ -722,13 +722,17 @@ struct atcphy_hw {
  * @tunnel_rate: DP link rate code the t8103 tunnel pixel clock is set up for
  * @tunnel_users: DP IN adapters (BIT(dpin)) whose tunnel pixel clock runs; on
  *	t8103 and t600x both share the one clock
- * @tunnel_dpin_rate: DP link rate code each T602X DP IN adapter's clock runs at
+ * @tunnel_dpin_rate: DP link rate code each T602X/T6030 DP IN clock runs at
+ * @tunnel_source: T6030 display source owning each DP IN clock
  * @dp_t8122: DisplayPort state of a T8122 generation PHY
  * @dp_t8122.aux: The AUX channel block is powered
  * @dp_t8122.pll: The AUSPLL runs for the DisplayPort main link
  * @dp_t8122.pairs: Lane pairs (bit mask) whose DisplayPort transmitters run
  * @dp_t8122.rate: Main link rate in Mb/s per lane, 0 while stopped
  * @pipe_state: Backend the PIPE mux ("pipehandler") is routed to
+ * @t8103_dummy_pending: A live T8103-generation handoff still needs its unlock ACK
+ * @t8103_usb3_retry: USB3 routing owed after a deferred role or parked lane change
+ * @t8103_usb3_workaround: Base M1 admission for the USB3 handoff workaround
  * @pd_nb: Power domain notifier, registered with restore_after_pd_off
  * @pd_was_off: The power domain was switched off since the state was last
  *              brought back; set from the notifier, cleared under @lock
@@ -794,6 +798,9 @@ struct apple_atcphy {
 	int dp_link_rate;
 	bool swap_lanes;
 	enum atcphy_pipehandler_state pipe_state;
+	bool t8103_dummy_pending;
+	bool t8103_usb3_retry;
+	bool t8103_usb3_workaround;
 
 	struct notifier_block pd_nb;
 	bool pd_was_off;
@@ -806,6 +813,7 @@ struct apple_atcphy {
 	u8 tunnel_rate;
 	u8 tunnel_users;
 	u8 tunnel_dpin_rate[2];
+	unsigned int tunnel_source[2]; /* T6030 source owning each DP IN clock */
 
 	struct {
 		bool aux;
@@ -1189,6 +1197,22 @@ static int atcphy_pipehandler_lock(struct apple_atcphy *atcphy)
 		dev_warn(atcphy->dev, "Pipehandler lock not acked.\n");
 	}
 
+	return ret;
+}
+
+/* Retry only a live legacy PIPE: USB4 and stopped parking cannot clock the ACK. */
+static int atcphy_pipehandler_lock_live(struct apple_atcphy *atcphy)
+{
+	unsigned int attempts = atcphy->t8103_usb3_workaround ? 10 : 1;
+	int ret;
+
+	for (unsigned int attempt = 0; attempt < attempts; attempt++) {
+		ret = atcphy_pipehandler_lock(atcphy);
+		if (!ret)
+			return 0;
+		if (attempt + 1 < attempts)
+			usleep_range(5000, 10000);
+	}
 	return ret;
 }
 
@@ -1621,14 +1645,18 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy, bool 
 static int atcphy_configure_pipehandler(struct apple_atcphy *atcphy, bool host)
 {
 	enum atcphy_pipehandler_state state = atcphy_modes[atcphy->mode].pipehandler_state;
+	bool host_bist = host && !atcphy->t8103_usb3_workaround;
 	int ret = -EINVAL;
 
 	lockdep_assert_held(&atcphy->lock);
+	if (atcphy->t8103_dummy_pending)
+		return -EBUSY;
 
 	switch (state) {
 	case ATCPHY_PIPEHANDLER_STATE_USB3:
 		atcphy->pipe_pending = true;
-		ret = atcphy_configure_pipehandler_usb3(atcphy, host);
+		/* Legacy host BIST can hide the first xHCI link-detection scan. */
+		ret = atcphy_configure_pipehandler_usb3(atcphy, host_bist);
 		break;
 	case ATCPHY_PIPEHANDLER_STATE_USB4:
 		ret = atcphy_configure_pipehandler_usb4(atcphy);
@@ -1640,9 +1668,71 @@ static int atcphy_configure_pipehandler(struct apple_atcphy *atcphy, bool host)
 	if (!ret) {
 		atcphy->pipe_state = state;
 		atcphy->pipe_pending = false;
+		if (state == ATCPHY_PIPEHANDLER_STATE_USB3)
+			atcphy->t8103_usb3_retry = false;
 	}
 
 	return ret;
+}
+
+/*
+ * Park a live T8103 USB3 backend before a Type-C lane change. Unlike legacy
+ * shutdown, an unacknowledged handoff must not let the lane change continue.
+ */
+static int atcphy_park_live_t8103_pipehandler(struct apple_atcphy *atcphy)
+{
+	const u32 override_mask = PIPEHANDLER_OVERRIDE_RXVALID |
+				  PIPEHANDLER_OVERRIDE_RXDETECT;
+	const u32 value_mask = PIPEHANDLER_OVERRIDE_VAL_RXDETECT0 |
+			      PIPEHANDLER_OVERRIDE_VAL_RXDETECT1;
+	void __iomem *pipe = atcphy->regs.pipehandler;
+	u32 overrides, values;
+	int ret;
+
+	lockdep_assert_held(&atcphy->lock);
+	if (!atcphy->t8103_usb3_workaround)
+		return -EOPNOTSUPP;
+
+	if (!atcphy->t8103_dummy_pending) {
+		if (atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY)
+			return 0;
+		if (atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_USB3)
+			return -EBUSY;
+		ret = atcphy_pipehandler_check(atcphy);
+		if (ret)
+			return ret;
+		overrides = readl(pipe + PIPEHANDLER_OVERRIDE);
+		values = readl(pipe + PIPEHANDLER_OVERRIDE_VALUES);
+		clear32(pipe + PIPEHANDLER_OVERRIDE_VALUES, value_mask);
+		set32(pipe + PIPEHANDLER_OVERRIDE, override_mask);
+
+		ret = atcphy_pipehandler_lock_live(atcphy);
+		if (ret) {
+			/* The mux did not move: restore only the fields we touched. */
+			mask32(pipe + PIPEHANDLER_OVERRIDE_VALUES, value_mask,
+			       values & value_mask);
+			mask32(pipe + PIPEHANDLER_OVERRIDE, override_mask,
+			       overrides & override_mask);
+			return ret;
+		}
+		atcphy_pipehandler_set_mux(atcphy, PIPEHANDLER_MUX_CTRL_DATA_DUMMY,
+					   PIPEHANDLER_MUX_CTRL_CLK_DUMMY);
+		/* The physical mux moved even if completion now fails. */
+		atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+		atcphy->t8103_dummy_pending = true;
+		atcphy->t8103_usb3_retry = true;
+	}
+
+	/* Retry completion without requesting another lock on the dummy clock. */
+	ret = atcphy_pipehandler_unlock(atcphy);
+	if (ret)
+		return ret;
+	mask32(pipe + PIPEHANDLER_NONSELECTED_OVERRIDE,
+	       PIPEHANDLER_NATIVE_POWER_DOWN, FIELD_PREP(PIPEHANDLER_NATIVE_POWER_DOWN, 2));
+	set32(pipe + PIPEHANDLER_NONSELECTED_OVERRIDE, PIPEHANDLER_NATIVE_RESET);
+	atcphy->t8103_dummy_pending = false;
+	atcphy->pipe_pending = false;
+	return 0;
 }
 
 /* Route the PIPE back to the dummy backend unless it is there already */
@@ -1656,6 +1746,10 @@ static int atcphy_park_pipehandler(struct apple_atcphy *atcphy, bool stopped)
 	dev_dbg(atcphy->dev, "PIPE park: mode=%u pipe=%u host=%u dirty=%u owned=%u idle=%u\n",
 		atcphy->mode, atcphy->pipe_state, atcphy->host_active, atcphy->mode_dirty,
 		atcphy->dp_owned_pmas, atcphy->dp_idle_pmas);
+	if (atcphy->t8103_dummy_pending ||
+	    (!stopped && atcphy->t8103_usb3_workaround &&
+	     atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_USB3))
+		return atcphy_park_live_t8103_pipehandler(atcphy);
 	if (atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY && !atcphy->pipe_pending)
 		return 0;
 
@@ -1677,6 +1771,8 @@ static void atcphy_setup_pipehandler(struct apple_atcphy *atcphy)
 				   PIPEHANDLER_MUX_CTRL_CLK_DUMMY);
 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 	atcphy->pipe_pending = false;
+	atcphy->t8103_dummy_pending = false;
+	atcphy->t8103_usb3_retry = false;
 	if (atcphy_needs_dummy_phy(atcphy))
 		atcphy_enable_dummy_phy(atcphy);
 }
@@ -2534,10 +2630,40 @@ static int atc_t8122_tunnel_stop(struct apple_atcphy *atcphy)
 	}
 	atcphy->tunnel_clock_on = false;
 	atcphy->tunnel_rate = 0;
+	atcphy->tunnel_users = 0;
+	atcphy->tunnel_dpin_rate[0] = 0;
+	atcphy->tunnel_dpin_rate[1] = 0;
 	return 0;
 }
 
-static int atc_t8122_tunnel_start(struct apple_atcphy *atcphy, u8 rate)
+static void atc_t8122_tunnel_pclk(struct apple_atcphy *atcphy,
+				 unsigned int pclk, u32 selector)
+{
+	u32 enable = pclk ? DPTX_PCLK2_ENABLE : DPTX_PCLK1_ENABLE;
+	u32 select = pclk ? DPTX_PCLK2_SELECT : DPTX_PCLK1_SELECT;
+	u32 value = pclk ? FIELD_PREP(DPTX_PCLK2_SELECT, selector) :
+			   FIELD_PREP(DPTX_PCLK1_SELECT, selector);
+
+	lockdep_assert_held(&atcphy->lock);
+	/* PCLK1 is also DPIN1's prerequisite: retuning DPIN0 must not gate it. */
+	if (!pclk && (atcphy->tunnel_users & BIT(1)))
+		value |= DPTX_PCLK1_ENABLE;
+	core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+		    enable | select, value);
+	/* Enable the prerequisite before the second stream's pixel clock. */
+	if (pclk) {
+		if (!(atcphy->tunnel_users & BIT(0)))
+			core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+				    DPTX_PCLK1_SELECT,
+				    FIELD_PREP(DPTX_PCLK1_SELECT, selector));
+		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+			   DPTX_PCLK1_ENABLE);
+	}
+	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, enable);
+}
+
+static int atc_t8122_tunnel_start(struct apple_atcphy *atcphy,
+				unsigned int pclk, u8 rate)
 {
 	u32 selector, value, saved_tx;
 	int ret, cleanup;
@@ -2563,13 +2689,7 @@ static int atc_t8122_tunnel_start(struct apple_atcphy *atcphy, u8 rate)
 		/* A failed shutdown retains ownership, but is not a running clock. */
 		if (!atcphy->tunnel_rate)
 			return -EBUSY;
-		if (atcphy->tunnel_rate == rate)
-			return 0;
-		core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
-			    DPTX_PCLK1_ENABLE | DPTX_PCLK1_SELECT,
-			    FIELD_PREP(DPTX_PCLK1_SELECT, selector));
-		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
-			   DPTX_PCLK1_ENABLE);
+		atc_t8122_tunnel_pclk(atcphy, pclk, selector);
 		atcphy->tunnel_rate = rate;
 		return 0;
 	}
@@ -2582,7 +2702,8 @@ static int atc_t8122_tunnel_start(struct apple_atcphy *atcphy, u8 rate)
 
 	/* Inactive slots use selector zero; all gates stay off during PLL setup. */
 	core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, GENMASK(15, 4),
-		    FIELD_PREP(DPTX_PCLK1_SELECT, selector));
+		    FIELD_PREP(DPTX_PCLK1_SELECT, selector) |
+		    (pclk ? FIELD_PREP(DPTX_PCLK2_SELECT, selector) : 0));
 	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_SMALL);
 	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_SMALL_OV);
 	udelay(1);
@@ -2624,7 +2745,7 @@ static int atc_t8122_tunnel_start(struct apple_atcphy *atcphy, u8 rate)
 		goto fail;
 	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
 		   DPTXPHY_PMA_LANE_RESET_N | DPTXPHY_PMA_LANE_RESET_N_OV);
-	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_ENABLE);
+	atc_t8122_tunnel_pclk(atcphy, pclk, selector);
 	atcphy->tunnel_rate = rate;
 	return 0;
 
@@ -3098,7 +3219,7 @@ static int atc_tunnel_set_t602x(struct apple_atcphy *atcphy, unsigned int dpin,
 	return 0;
 }
 
-/* T6030 (M3 Pro): T8122-generation PHYs, only the DP IN0 route so far. */
+/* T6030 (M3 Pro) uses T8122-generation PHYs for both DP IN clock outputs. */
 static bool apple_atc_tunnel_is_t6030(struct apple_atcphy *atcphy)
 {
 	return of_machine_is_compatible("apple,t6030") &&
@@ -3331,6 +3452,8 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 		KUNIT_STATIC_STUB_REDIRECT(atcphy_configure, atcphy, mode);
 
 	lockdep_assert_held(&atcphy->lock);
+	if (atcphy->t8103_dummy_pending)
+		return -EBUSY;
 	if (atcphy->pipe_pending)
 		return -EBUSY;
 	if (atcphy->usb_off_pending && mode != APPLE_ATCPHY_MODE_OFF)
@@ -3636,6 +3759,7 @@ static int atcphy_usb3_power_off(struct phy *phy)
 	ret = atcphy_park_pipehandler(atcphy, true);
 	if (ret)
 		return ret;
+	atcphy->t8103_usb3_retry = false;
 	/*
 	 * dwc3 can tear its host down while a DisplayPort alt mode link is up,
 	 * e.g. when a monitor's built-in hub re-enumerates after a hot-plug.
@@ -3661,6 +3785,12 @@ static int atcphy_usb3_route(struct apple_atcphy *atcphy, bool host)
 	int ret;
 
 	lockdep_assert_held(&atcphy->lock);
+	if (atcphy->t8103_dummy_pending) {
+		ret = atcphy_park_live_t8103_pipehandler(atcphy);
+		if (ret)
+			return ret;
+	}
+
 
 	/*
 	 * We may get multiple calls to set_mode (for host mode e.g. at least one from the dwc3 glue
@@ -3671,6 +3801,19 @@ static int atcphy_usb3_route(struct apple_atcphy *atcphy, bool host)
 	/* A failed lane/domain transition must be restored before routing PIPE. */
 	if (atcphy->mode_dirty)
 		return -EBUSY;
+	/* dwc3 can select its role before the debounced Type-C mux update. */
+	if (atcphy->t8103_usb3_workaround &&
+	    atcphy->mode == APPLE_ATCPHY_MODE_OFF) {
+		/* Keep the valid role's route owed across a late mux update or failure. */
+		atcphy->t8103_usb3_retry = true;
+		if (atcphy->typec_mode != APPLE_ATCPHY_MODE_USB3)
+			return 0;
+		if (atcphy->dp_only || !atcphy->ss_tunables)
+			return -EOPNOTSUPP;
+		ret = atcphy_configure(atcphy, APPLE_ATCPHY_MODE_USB3);
+		if (ret)
+			return ret;
+	}
 	if (atcphy->pipe_pending) {
 		ret = atcphy_park_pipehandler(atcphy, false);
 		if (ret)
@@ -3849,6 +3992,62 @@ static bool apple_atc_tunnel_is_t8103_style(void)
 	       of_machine_is_compatible("apple,t8112") || apple_atc_tunnel_is_t600x();
 }
 
+int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
+				    unsigned int dpin, u8 rate)
+{
+	struct apple_atcphy *atcphy;
+	int pclk, ret;
+
+	if (!phy || phy->ops != &apple_atc_dp_phy_ops || dpin > 1)
+		return -EINVAL;
+	atcphy = phy_get_drvdata(phy);
+	pclk = apple_dp_tunnel_t6030_pclk(source, dpin);
+	if (!apple_atc_tunnel_is_t6030(atcphy) || pclk < 0)
+		return -EOPNOTSUPP;
+	guard(mutex)(&atcphy->lock);
+	atcphy_restore_after_pd_off(atcphy);
+	/* A stale source must not retune or stop another source's clock. */
+	if ((atcphy->tunnel_users & BIT(dpin)) &&
+	    atcphy->tunnel_source[dpin] != source)
+		return -ESTALE;
+	if (!rate) {
+		if (!(atcphy->tunnel_users & BIT(dpin)))
+			return 0;
+		if (!(atcphy->tunnel_users & ~BIT(dpin)))
+			return atc_t8122_tunnel_stop(atcphy);
+		/* Release only this stream; the other stream keeps its PLL and gates. */
+		if (pclk)
+			core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+				     DPTX_PCLK2_ENABLE);
+		atcphy->tunnel_users &= ~BIT(dpin);
+		atcphy->tunnel_dpin_rate[dpin] = 0;
+		return 0;
+	}
+	if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 &&
+	    atcphy->mode != APPLE_ATCPHY_MODE_TBT)
+		return -EBUSY;
+	if (atcphy->tunnel_clock_on && !atcphy->tunnel_rate)
+		return -EBUSY;
+	/* Keep this owner if a failed start cannot shut the PLL down. */
+	if ((atcphy->tunnel_users & BIT(1 - dpin)) &&
+	    atcphy->tunnel_source[1 - dpin] == source)
+		return -EBUSY;
+	if ((atcphy->tunnel_users & BIT(dpin)) &&
+	    atcphy->tunnel_dpin_rate[dpin] == rate && atcphy->tunnel_rate)
+		return 0;
+	atcphy->tunnel_source[dpin] = source;
+	ret = atc_t8122_tunnel_start(atcphy, pclk, rate);
+	if (!ret || (atcphy->tunnel_clock_on && !atcphy->tunnel_rate)) {
+		atcphy->tunnel_users |= BIT(dpin);
+		atcphy->tunnel_dpin_rate[dpin] = ret ? 0 : rate;
+	}
+	dev_dbg(atcphy->dev, "DP tunnel source %u rate 0x%x: %d (TX_DP_CTRL0=%08x PCLK_STAT=%08x)\n",
+		source, rate, ret,
+		readl(atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0),
+		readl(atcphy->regs.core + T8122_DP_PCLK_STATUS));
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_atc_dp_tunnel_rate_source);
 
 int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 {
@@ -3859,23 +4058,8 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 		return -EINVAL;
 	atcphy = phy_get_drvdata(phy);
 	/* Keep each supported SoC on its qualified clock sequence. */
-	if (apple_atc_tunnel_is_t6030(atcphy)) {
-		if (dpin)
-			return -EOPNOTSUPP;
-		guard(mutex)(&atcphy->lock);
-		atcphy_restore_after_pd_off(atcphy);
-		if (!rate)
-			return atc_t8122_tunnel_stop(atcphy);
-		if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 &&
-		    atcphy->mode != APPLE_ATCPHY_MODE_TBT)
-			return -EBUSY;
-		ret = atc_t8122_tunnel_start(atcphy, rate);
-		dev_dbg(atcphy->dev, "DP tunnel clock rate 0x%x: %d (TX_DP_CTRL0=%08x PCLK_STAT=%08x)\n",
-			rate, ret,
-			readl(atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0),
-			readl(atcphy->regs.core + T8122_DP_PCLK_STATUS));
-		return ret;
-	}
+	if (apple_atc_tunnel_is_t6030(atcphy))
+		return apple_atc_dp_tunnel_rate_source(phy, 0, dpin, rate);
 	if (!apple_atc_tunnel_is_t8103_style()) {
 		bool valid_core = apple_atc_t602x_core_valid(atcphy->np, atcphy->res.core->start,
 							     resource_size(atcphy->res.core));
@@ -4013,6 +4197,7 @@ static int atcphy_dwc3_reset_assert(struct reset_controller_dev *rcdev, unsigned
 	if (ret)
 		return ret;
 
+	atcphy->t8103_usb3_retry = false;
 	_atcphy_dwc3_reset_assert(atcphy);
 	atcphy_usb2_power_off(atcphy);
 
@@ -4025,6 +4210,12 @@ static int atcphy_dwc3_reset_deassert(struct reset_controller_dev *rcdev, unsign
 
 	guard(mutex)(&atcphy->lock);
 	atcphy_restore_after_pd_off(atcphy);
+	if (atcphy->t8103_dummy_pending) {
+		int ret = atcphy_park_live_t8103_pipehandler(atcphy);
+
+		if (ret)
+			return ret;
+	}
 
 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN,
 		PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
@@ -4467,7 +4658,8 @@ static enum atcphy_mode atcphy_typec_target_mode(struct apple_atcphy *atcphy,
  */
 static bool atcphy_mux_in_mode(const struct apple_atcphy *atcphy, enum atcphy_mode target_mode)
 {
-	if (atcphy->mode != target_mode || atcphy->mode_dirty)
+	if (atcphy->mode != target_mode || atcphy->mode_dirty ||
+	    atcphy->t8103_dummy_pending || atcphy->t8103_usb3_retry)
 		return false;
 
 	return !(atcphy->fixed_usb2 && atcphy->host_active &&
@@ -4528,8 +4720,20 @@ static int atcphy_mux_switch(struct apple_atcphy *atcphy, enum atcphy_mode targe
 	int ret;
 
 	lockdep_assert_held(&atcphy->lock);
+	if (atcphy->t8103_dummy_pending) {
+		ret = atcphy_park_live_t8103_pipehandler(atcphy);
+		if (ret)
+			return ret;
+	}
+
 	if (atcphy->mode == target_mode && !atcphy->mode_dirty) {
 		atcphy->typec_mode = target_mode;
+		/* A canceled lane change owes the old USB3 backend its reconnect. */
+		if (atcphy->t8103_usb3_retry) {
+			if (atcphy_modes[target_mode].pipehandler_state == ATCPHY_PIPEHANDLER_STATE_USB3)
+				return atcphy_configure_pipehandler(atcphy, false);
+			atcphy->t8103_usb3_retry = false;
+		}
 		/* Retry a failed PIPE setup without disturbing the configured lanes. */
 		if (atcphy->fixed_usb2 && atcphy->host_active &&
 		    (atcphy->pipe_state != atcphy_modes[target_mode].pipehandler_state ||
@@ -4578,6 +4782,8 @@ static int atcphy_mux_switch(struct apple_atcphy *atcphy, enum atcphy_mode targe
 
 		if (atcphy->host_active && atcphy->pipe_state != pipe_state)
 			ret = atcphy_configure_pipehandler(atcphy, true);
+		if (!ret && pipe_state != ATCPHY_PIPEHANDLER_STATE_USB3)
+			atcphy->t8103_usb3_retry = false;
 
 		return ret;
 	}
@@ -4594,8 +4800,28 @@ static int atcphy_mux_switch(struct apple_atcphy *atcphy, enum atcphy_mode targe
 	 * complain loudly. We can still try to switch modes and hope for the best though,
 	 * in the worst case the hardware will fall back to USB2-only.
 	 */
-	WARN_ON_ONCE(atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY);
-	return atcphy_configure(atcphy, target_mode);
+	if (atcphy->t8103_usb3_workaround) {
+		if (atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_USB3 &&
+		    atcphy_modes[target_mode].pipehandler_state == ATCPHY_PIPEHANDLER_STATE_DUMMY) {
+			ret = atcphy_park_live_t8103_pipehandler(atcphy);
+			if (ret)
+				return ret;
+		}
+		WARN_ON_ONCE(atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY &&
+			     atcphy_modes[target_mode].pipehandler_state ==
+				ATCPHY_PIPEHANDLER_STATE_DUMMY);
+	} else {
+		WARN_ON_ONCE(atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY);
+	}
+	ret = atcphy_configure(atcphy, target_mode);
+	if (ret)
+		return ret;
+	if (atcphy->t8103_usb3_retry) {
+		if (atcphy_modes[target_mode].pipehandler_state == ATCPHY_PIPEHANDLER_STATE_USB3)
+			return atcphy_configure_pipehandler(atcphy, false);
+		atcphy->t8103_usb3_retry = false;
+	}
+	return 0;
 }
 
 /*
@@ -5140,6 +5366,14 @@ static void atcphy_probe_pd_notifier(struct apple_atcphy *atcphy)
 			 ret);
 }
 
+/* The T8103 PHY compatible is also a fallback on unqualified M1/M2 variants. */
+static bool atcphy_has_t8103_usb3_workaround(const struct atcphy_hw *hw,
+					   const struct device_node *root)
+{
+	return hw->gen == ATCPHY_GENERATION_T8103 &&
+	       of_device_is_compatible(root, "apple,t8103");
+}
+
 static int atcphy_probe(struct platform_device *pdev)
 {
 	struct apple_atcphy *atcphy;
@@ -5153,6 +5387,7 @@ static int atcphy_probe(struct platform_device *pdev)
 	atcphy->hw = of_device_get_match_data(&pdev->dev);
 	if (!atcphy->hw)
 		return -EINVAL;
+	atcphy->t8103_usb3_workaround = atcphy_has_t8103_usb3_workaround(atcphy->hw, of_root);
 
 	atcphy->dev = dev;
 	atcphy->np = dev->of_node;

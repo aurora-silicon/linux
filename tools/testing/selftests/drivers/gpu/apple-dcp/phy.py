@@ -4,7 +4,7 @@
 from pathlib import Path
 import re
 from common import (block, source_defines, atc_mux_without_pm, ATC_POST_TUNABLE,
-                    atc_function, ATC_SPLIT)
+                    atc_function, ATC_SPLIT, ATC_T8103_LIVE)
 
 def parking(root):
 
@@ -15,7 +15,7 @@ def parking(root):
     def function(source, name):
         if name == 'atcphy_mux_set' and 'static int atcphy_mux_set_locked(' in source:
             return atc_mux_without_pm(source)
-        if name in ATC_SPLIT:
+        if name in ATC_SPLIT + ATC_T8103_LIVE:
             return atc_function(source, name)
         return block(source, re.search(r'^static [^\n;]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M).group())
 
@@ -45,6 +45,7 @@ struct apple_atcphy {
     u32 dp_usb_context[2][27];
     bool pipe_pending, usb_off_pending, usb_off_drained;
     bool usb3_port_off, park_owed;
+    bool t8103_dummy_pending, t8103_usb3_retry, t8103_usb3_workaround;
     bool dp_only, pd_was_off, tunnel_clock_on;
     unsigned int tunnel_rate, tunnel_users;
     struct { bool aux, pll; unsigned int pairs, rate; } dp_t8122;
@@ -150,14 +151,16 @@ static int atcphy_configure(struct apple_atcphy *, enum atcphy_mode);
         parts.append(block(t8122, match.start()).replace('static inline ', 'static inline __attribute__((unused)) ', 1))
     for name in ('atcphy_dp_aux_on_t8122', 'atcphy_dp_stop_t8122'):
         parts.append(function(atc, name))
-    for name in ('atcphy_pipehandler_lock', 'atcphy_pipehandler_unlock', 'atcphy_pipehandler_check',
+    for name in ('atcphy_pipehandler_lock', 'atcphy_pipehandler_lock_live',
+                 'atcphy_pipehandler_unlock', 'atcphy_pipehandler_check',
                  'atcphy_pipehandler_set_mux', 'atcphy_clear_nonselected_phy_reset',
                  'atcphy_configure_pipehandler_usb3_host_t8122',
                  'atcphy_configure_pipehandler_usb3_host_t8103',
                  'atcphy_configure_pipehandler_usb3', 'atcphy_configure_pipehandler_usb4',
                  'atcphy_enable_dummy_phy', 'atcphy_pipe_live', 'atcphy_needs_dummy_phy',
                  'atcphy_configure_pipehandler_dummy',
-                 'atcphy_configure_pipehandler', 'atcphy_park_pipehandler',
+                 'atcphy_configure_pipehandler', 'atcphy_park_live_t8103_pipehandler',
+                 'atcphy_park_pipehandler',
                  'atcphy_usb2_power_off', '_atcphy_dwc3_reset_assert', 'atcphy_dwc3_reset_assert'):
         parts.append(function(atc, name))
     for name in ('core_read32', 'atcphy_get_mode_config', 'j700_field_update', 'j700_pma_idle'):
@@ -249,6 +252,7 @@ static void cold_initial(struct apple_atcphy *p, bool fixed, bool swapped)
     pipe_regs[PIPEHANDLER_AON_GEN / 4] = PIPEHANDLER_AON_GEN_DWC3_RESET_N;
     usb2_regs[USB2PHY_USBCTL / 4] = USB2PHY_USBCTL_RUN;
     *p = (struct apple_atcphy) {
+        .t8103_usb3_workaround = hw.gen == ATCPHY_GENERATION_T8103,
         .hw = &hw, .regs.core = (unsigned char *)registers,
         .regs.lpdptx = (unsigned char *)registers,
         .regs.pipehandler = (unsigned char *)pipe_regs,
@@ -985,6 +989,11 @@ def adverse(root):
     # continued PLL clock macro exercised by the legacy rate helper here.
     ns = parking(root)
     production = ns['production'] + '\n' + ns['function'](ns['atc'], 'atcphy_usb2_init')
+    # An admitted base-M1 host start may skip the native BIST, and the lock it holds.
+    dispatch = ns['function'](ns['atc'], 'atcphy_configure_pipehandler')
+    production = ('#define T8103_HOST_BIST ' + str(int('ATCPHY_GENERATION_T8103' not in dispatch and
+                  't8103_usb3_workaround' not in dispatch)) +
+                  '\n' + production)
     production = production.replace('bool pipe_pending, usb_off_pending, usb_off_drained;',
                                     'bool pipe_pending, usb_off_pending, usb_off_drained, tunnel_saved;', 1)
     production += '\n' + ns['block'](ns['atc'], 'enum atcphy_lane {') + ';'
@@ -1048,6 +1057,81 @@ static void shared_bist(void)
     }
     puts("PASS: every T8103/T8122 BIST poll propagates first error through full cleanup");
 }
+#if !T8103_HOST_BIST
+static bool bist_polled(unsigned int from)
+{
+    for (unsigned int i=from; i<polls; i++)
+        if (!strcmp(poll_caller[i],"atcphy_configure_pipehandler_usb3_host_t8103") ||
+            !strcmp(poll_caller[i],"atcphy_configure_pipehandler_usb3_host_t8122"))
+            return true;
+    return false;
+}
+static bool only_released(unsigned int from)
+{
+    for (unsigned int i=from; i<polls; i++)
+        if (strcmp(poll_caller[i],"atcphy_pipehandler_unlock"))
+            return false;
+    return true;
+}
+/*
+ * A T8103-generation host start runs no native BIST and holds no lock. Its
+ * remaining PIPE handshake is the release of a stale lock in
+ * atcphy_pipehandler_check(), so that release is where the fault goes: not
+ * acknowledged (unlock) or a failed poll. The start fails at that first poll,
+ * before the PIPE moves and with the lanes untouched. A lock that stays held
+ * fails the next start the same way. Once it lets go, the next start parks
+ * the PIPE and routes USB3, and no BIST poll runs in the whole sequence.
+ */
+static void t8103_release_fault(struct apple_atcphy *p, struct phy *phy, bool fixed,
+                                bool unlock, bool mux)
+{
+    const bool starts = FIXED_HOST_STARTS && fixed;
+    unsigned int before=writes;
+
+    pipe_regs[PIPEHANDLER_LOCK_ACK/4]=PIPEHANDLER_LOCK_EN;
+    if (unlock) hold_unlock_ack=true;
+    else poll_errors[1]=-EIO;
+    int ret=atcphy_usb3_set_mode(phy,PHY_MODE_USB_HOST,0);
+    printf("t8103 fixed=%u unlock=%u mux=%u ret=%d polls=%u first=%s\n",
+           fixed,unlock,mux,ret,polls,polls ? poll_caller[0] : "none");fflush(stdout);
+    assert(polls>=1 && !strcmp(poll_caller[0],"atcphy_pipehandler_unlock"));
+    if (starts) {
+        /* The fixed-hub host starts anyway; its park repeats the release. */
+        assert(ret==0);
+        if (unlock) {
+            assert(polls==2 && only_released(0) && p->pipe_pending && mux_writes==0);
+        } else {
+            assert(polls==3 && !strcmp(poll_caller[1],"atcphy_pipehandler_lock") &&
+                   !strcmp(poll_caller[2],"atcphy_pipehandler_unlock"));
+            assert(!p->pipe_pending && mux_writes==3);
+        }
+    } else {
+        assert(ret==(unlock ? -ETIMEDOUT : -EIO) && polls==1);
+        assert(p->pipe_pending && mux_writes==0);
+    }
+    assert(p->pipe_state==ATCPHY_PIPEHANDLER_STATE_DUMMY && !p->mode_dirty && writes==before);
+
+    /* A lock that stays held fails the next start at the same release. */
+    hold_unlock_ack=false;
+    memset(poll_errors,0,sizeof(poll_errors));
+    pipe_regs[PIPEHANDLER_LOCK_ACK/4]=PIPEHANDLER_LOCK_EN;
+    stuck_ack=true;
+    unsigned int first=polls, moved=mux_writes;
+    ret=atcphy_usb3_set_mode(phy,PHY_MODE_USB_HOST,0);
+    assert(ret==(starts ? 0 : -ETIMEDOUT) && polls>first && only_released(first));
+    assert(mux_writes==moved && p->pipe_pending);
+    assert(p->pipe_state==ATCPHY_PIPEHANDLER_STATE_DUMMY && !p->mode_dirty);
+
+    /* The lanes were never touched: the callback rebuilds nothing. */
+    stuck_ack=false;
+    ret=mux ? select_mode(p,APPLE_ATCPHY_MODE_USB3) : atcphy_usb2_init(phy);
+    assert(ret==0 && writes==before && !p->mode_dirty);
+    assert(atcphy_usb3_set_mode(phy,PHY_MODE_USB_HOST,0)==0);
+    assert(p->pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3 && !p->pipe_pending);
+    assert(!p->mode_dirty && writes==before);
+    assert(!(pipe_regs[PIPEHANDLER_LOCK_REQ/4] & PIPEHANDLER_LOCK_EN) && !bist_polled(0));
+}
+#endif
 static void retry_callbacks(bool mux)
 {
     for (unsigned int gen=0; gen<4; gen++)
@@ -1056,6 +1140,12 @@ static void retry_callbacks(bool mux)
         struct apple_atcphy p;
         legacy_setup(&p,gen,fixed);
         struct phy phy={&p};
+#if !T8103_HOST_BIST
+        if (gen==0) {
+            t8103_release_fault(&p,&phy,fixed,unlock,mux);
+            continue;
+        }
+#endif
         if (unlock) hold_unlock_ack=true;
         else poll_errors[2]=-EIO;
 #if FIXED_HOST_STARTS
@@ -1147,8 +1237,17 @@ static void pending_gate(void)
         struct apple_atcphy p;
         legacy_setup(&p,gen,false);
         struct phy phy={&p};
+        const char *fault="atcphy_pipehandler_lock";
+#if !T8103_HOST_BIST
+        /* T8103 host start takes no lock: fail the release of a stale one instead. */
+        if (gen==0) {
+            pipe_regs[PIPEHANDLER_LOCK_ACK/4]=PIPEHANDLER_LOCK_EN;
+            fault="atcphy_pipehandler_unlock";
+        }
+#endif
         stuck_ack=true;
         assert(atcphy_usb3_set_mode(&phy,PHY_MODE_USB_HOST,0)==-ETIMEDOUT);
+        assert(polls==1 && !strcmp(poll_caller[0],fault));
         assert(p.pipe_pending && !p.mode_dirty);
         unsigned int w=writes,r=mmio_reads;
         int ret=atcphy_configure(&p,APPLE_ATCPHY_MODE_USB3);
@@ -1212,8 +1311,17 @@ static void dp_cache_gate(void)
         struct apple_atcphy p;
         legacy_setup(&p,gen,false);
         struct phy phy={&p};
+        const char *fault="atcphy_pipehandler_lock";
+#if !T8103_HOST_BIST
+        /* T8103 host start takes no lock: fail the release of a stale one instead. */
+        if (gen==0) {
+            pipe_regs[PIPEHANDLER_LOCK_ACK/4]=PIPEHANDLER_LOCK_EN;
+            fault="atcphy_pipehandler_unlock";
+        }
+#endif
         stuck_ack=true;
         assert(atcphy_usb3_set_mode(&phy,PHY_MODE_USB_HOST,0)==-ETIMEDOUT);
+        assert(polls==1 && !strcmp(poll_caller[0],fault));
         assert(p.pipe_pending && !p.mode_dirty);
         p.dp_link_rate=ATCPHY_DP_LINK_RATE_HBR3;
         unsigned int w=writes,r=mmio_reads;
@@ -1789,7 +1897,7 @@ def pipe(root):
     def function(name):
         if name == 'atcphy_mux_set' and 'static int atcphy_mux_set_locked(' in source:
             return atc_mux_without_pm(source)
-        if name in ATC_SPLIT:
+        if name in ATC_SPLIT + ATC_T8103_LIVE:
             return atc_function(source, name)
         return block(re.search(r'^static [^\n;]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M).group())
 
@@ -1814,6 +1922,7 @@ struct apple_atcphy {
     u32 dp_usb_context[2][27];
     bool pipe_pending, usb_off_pending, usb_off_drained;
     bool usb3_port_off, park_owed;
+    bool t8103_dummy_pending, t8103_usb3_retry, t8103_usb3_workaround;
     bool swap_lanes;
     enum atcphy_mode mode, typec_mode;
     enum atcphy_pipehandler_state pipe_state;
@@ -1824,6 +1933,7 @@ struct apple_atcphy {
     parts.append(r'''
 static u32 pipe_regs[0x1000 / 4], core_regs[0x30000 / 4];
 static unsigned int polls, fail_poll, mux_writes, lane_calls;
+static const char *last_poll;
 static bool stuck_ack;
 static u32 readl(void *address) { return *(u32 *)address; }
 static void mask32(void *address, u32 mask, u32 value)
@@ -1843,7 +1953,7 @@ static void core_set32(struct apple_atcphy *p, u32 o, u32 v) { core_mask32(p, o,
 static void core_clear32(struct apple_atcphy *p, u32 o, u32 v) { core_mask32(p, o, v, 0); }
 #define readl_poll_timeout_atomic readl_poll_timeout
 #define readl_poll_timeout(address, value, condition, interval, timeout) \
-    ({ (value) = readl(address); polls++; \
+    ({ (value) = readl(address); polls++; last_poll = __func__; \
        polls == fail_poll || !(condition) ? -ETIMEDOUT : 0; })
 /* Lane configuration is outside this test: count calls and commit its result. */
 /* Observation is read-only and separately tested; retain production caller control flow. */
@@ -1865,17 +1975,23 @@ static int atcphy_configure(struct apple_atcphy *p, enum atcphy_mode mode)
     p->mode = mode; p->mode_dirty = false; return 0;
 }
 ''')
-    for name in ('atcphy_pipehandler_lock', 'atcphy_pipehandler_unlock', 'atcphy_pipehandler_check',
+    for name in ('atcphy_pipehandler_lock', 'atcphy_pipehandler_lock_live',
+                 'atcphy_pipehandler_unlock', 'atcphy_pipehandler_check',
                  'atcphy_pipehandler_set_mux', 'atcphy_clear_nonselected_phy_reset',
                  'atcphy_configure_pipehandler_usb3_host_t8122',
                  'atcphy_configure_pipehandler_usb3_host_t8103',
                  'atcphy_configure_pipehandler_usb3', 'atcphy_configure_pipehandler_usb4',
                  'atcphy_enable_dummy_phy', 'atcphy_pipe_live', 'atcphy_needs_dummy_phy',
                  'atcphy_configure_pipehandler_dummy',
-                 'atcphy_configure_pipehandler', 'atcphy_park_pipehandler',
+                 'atcphy_configure_pipehandler', 'atcphy_park_live_t8103_pipehandler',
+                 'atcphy_park_pipehandler',
                  'atcphy_usb3_route', 'atcphy_usb3_set_mode', 'atcphy_mux_set'):
         parts.append(function(name))
     production = '\n'.join(parts)
+    # An admitted base-M1 host start may skip the native BIST, and the lock it holds.
+    production = ('#define T8103_HOST_BIST ' + str(int('ATCPHY_GENERATION_T8103' not in
+                  function('atcphy_configure_pipehandler') and 't8103_usb3_workaround' not in
+                  function('atcphy_configure_pipehandler'))) + '\n' + production)
     prefix = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -1903,6 +2019,7 @@ typedef uint16_t u16;
 #define fallthrough __attribute__((fallthrough))
 #define usleep_range(...) ((void)0)
 #define udelay(n) ((void)(n))
+#define __iomem
 enum { TYPEC_STATE_SAFE, TYPEC_STATE_USB, TYPEC_MODE_USB4,
        TYPEC_DP_STATE_C, TYPEC_DP_STATE_D, TYPEC_DP_STATE_E };
 enum { USB_TYPEC_TBT_SID = 0x8087, USB_TYPEC_DP_SID = 0xff01 };
@@ -1930,6 +2047,7 @@ static void initial(struct apple_atcphy *p, enum atcphy_mode mode,
     memset(core_regs, 0, sizeof(core_regs));
     core_regs[ACIOPHY_TOP_PHY_STAT / 4] = ACIOPHY_TOP_PHY_STAT_LN0_UNK0;
     *p = (struct apple_atcphy) {
+        .t8103_usb3_workaround = hw.gen == ATCPHY_GENERATION_T8103,
         .hw = &hw, .regs.core = (unsigned char *)core_regs,
         .regs.pipehandler = (unsigned char *)pipe_regs,
         .mode = mode, .typec_mode = mode, .pipe_state = backend,
@@ -1992,8 +2110,17 @@ static void host_lock_failure(void)
         hw.gen = gen ? ATCPHY_GENERATION_T8122 : ATCPHY_GENERATION_T8103;
         initial(&p, APPLE_ATCPHY_MODE_USB3, ATCPHY_PIPEHANDLER_STATE_DUMMY);
         struct phy phy = { &p };
+        const char *fault = "atcphy_pipehandler_lock";
+#if !T8103_HOST_BIST
+        /* T8103 host start takes no lock: fail the release of a stale one instead. */
+        if (!gen) {
+            pipe_regs[PIPEHANDLER_LOCK_ACK / 4] = PIPEHANDLER_LOCK_EN;
+            fault = "atcphy_pipehandler_unlock";
+        }
+#endif
         stuck_ack = true;
         assert(atcphy_usb3_set_mode(&phy, PHY_MODE_USB_HOST, 0) == -ETIMEDOUT);
+        assert(polls == 1 && !strcmp(last_poll, fault));
         assert(p.pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY && mux_writes == 0);
         assert(!(pipe_regs[PIPEHANDLER_LOCK_REQ / 4] & PIPEHANDLER_LOCK_EN));
         stuck_ack = false;
@@ -2003,7 +2130,11 @@ static void host_lock_failure(void)
         assert(atcphy_usb3_set_mode(&phy, PHY_MODE_USB_HOST, 0) == 0);
         assert(polls == before && mux_writes == 6);
     }
+#if T8103_HOST_BIST
     puts("PASS: both USB3 host BIST generations retain fatal lock ACK and retry");
+#else
+    puts("PASS: T8122 host lock and T8103 stale-lock release faults stay fatal; both retry once acknowledged");
+#endif
 }
 static void mux_retry(void)
 {
@@ -2150,7 +2281,7 @@ def unwind(root):
     def function(source, name):
         if name == 'atcphy_mux_set' and 'static int atcphy_mux_set_locked(' in source:
             return atc_mux_without_pm(source)
-        if name in ATC_SPLIT:
+        if name in ATC_SPLIT + ATC_T8103_LIVE:
             return atc_function(source, name)
         return block(source, re.search(r'^static [^\n;]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M).group())
 
@@ -2180,6 +2311,7 @@ struct apple_atcphy {
     u32 dp_usb_context[2][27];
     bool pipe_pending, usb_off_pending, usb_off_drained;
     bool usb3_port_off, park_owed;
+    bool t8103_dummy_pending, t8103_usb3_retry, t8103_usb3_workaround;
     enum atcphy_mode mode, typec_mode;
     enum atcphy_pipehandler_state pipe_state;
 };
@@ -2245,6 +2377,9 @@ static int atcphy_configure(struct apple_atcphy *, enum atcphy_mode);
 
 static int atcphy_park_pipehandler(struct apple_atcphy *p, bool keep_dp)
 { (void)keep_dp; p->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY; return 0; }
+/* The T8140 profile never owes a T8103-generation live PIPE park. */
+static int __attribute__((unused)) atcphy_park_live_t8103_pipehandler(struct apple_atcphy *p)
+{ (void)p; assert(!"T8103 live PIPE park"); return -EINVAL; }
 /* Observation is read-only and separately tested; retain production caller control flow. */
 static int atcphy_configure_pipehandler(struct apple_atcphy *p, bool host)
 { (void)host; p->pipe_state = atcphy_modes[p->mode].pipehandler_state; return 0; }
@@ -2311,6 +2446,7 @@ static void initial(struct apple_atcphy *p, bool fixed, bool swapped)
     memset(registers, 0, sizeof(registers));
     registers[AUS_COMMON_DIG_RCAL1 / 4] = AUS_COMMON_DIG_RCAL1_ALL_CODES_DONE;
     *p = (struct apple_atcphy) {
+        .t8103_usb3_workaround = hw.gen == ATCPHY_GENERATION_T8103,
         .hw = &hw, .regs.core = (unsigned char *)registers,
         .regs.lpdptx = (unsigned char *)registers,
         .fixed_usb2 = fixed, .swap_lanes = swapped,

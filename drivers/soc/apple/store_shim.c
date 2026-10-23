@@ -14,6 +14,7 @@
 #include <linux/cred.h>
 #include <linux/blkdev.h>
 #include <linux/err.h>
+#include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/fs_struct.h>
 #include <linux/sched.h>
@@ -144,4 +145,36 @@ long sep_store_write(void *handle, long long off, const void *buf,
 int sep_store_sync(void *handle)
 {
 	return vfs_fsync((struct file *)handle, 0);
+}
+
+/*
+ * Flushes the directory that holds an open store file. fsync() of the file
+ * itself is not guaranteed to make its name in that directory durable, so a
+ * file created this boot could be missing after a crash. Opened under kernel
+ * credentials, as the file was.
+ */
+int sep_store_sync_parent(void *handle)
+{
+	struct file *f = handle;
+	struct cred *kern;
+	struct file *dir;
+	struct path parent;
+	int ret;
+
+	kern = prepare_kernel_cred(&init_task);
+	if (!kern)
+		return -ENOMEM;
+
+	/* The file holds its mount; the parent dentry is pinned until dput(). */
+	parent.mnt = f->f_path.mnt;
+	parent.dentry = dget_parent(f->f_path.dentry);
+	dir = dentry_open(&parent, O_RDONLY | O_DIRECTORY, kern);
+	dput(parent.dentry);
+	put_cred(kern);
+	if (IS_ERR(dir))
+		return PTR_ERR(dir);
+
+	ret = vfs_fsync(dir, 0);
+	fput(dir);
+	return ret;
 }

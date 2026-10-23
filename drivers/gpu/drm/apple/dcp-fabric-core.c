@@ -28,8 +28,9 @@ EXPORT_SYMBOL_GPL(dcp_fabric_t6020_flow);
 
 u8 dcp_fabric_tunnel_clock_blocked(bool t6030, unsigned int source)
 {
-	return t6030 ? BIT(1) |
-		(dcp_fabric_t6030_pclk(source, 0) < 0 ? BIT(0) : 0) : 0;
+	return t6030 ?
+		(dcp_fabric_t6030_pclk(source, 0) < 0 ? BIT(0) : 0) |
+		(dcp_fabric_t6030_pclk(source, 1) < 0 ? BIT(1) : 0) : 0;
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_tunnel_clock_blocked);
 
@@ -154,6 +155,13 @@ bool dcp_fabric_keep_order(bool dual_stream, bool ready, bool frozen)
 	return dual_stream && ready && !frozen;
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_keep_order);
+
+/* T6030 native pipelines retain their route; the encoder follows that owner. */
+bool dcp_fabric_ordered_dual_stream(bool wired, bool t6030)
+{
+	return wired && !t6030;
+}
+EXPORT_SYMBOL_GPL(dcp_fabric_ordered_dual_stream);
 
 bool dcp_fabric_waiting(const struct dcp_fabric_port *port)
 {
@@ -500,6 +508,15 @@ u32 dcp_fabric_connector_mask(bool dual_stream, bool bound, bool routed,
 	return !dual_stream && bound && routed ? BIT(index) : candidates;
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_connector_mask);
+
+u32 dcp_fabric_port_crtc_mask(bool secondary, bool ordered_dual, bool typec_only,
+			    u32 mask, u32 candidate)
+{
+	if (secondary && ordered_dual)
+		return typec_only && (!mask || candidate < mask) ? candidate : mask;
+	return mask | candidate;
+}
+EXPORT_SYMBOL_GPL(dcp_fabric_port_crtc_mask);
 
 enum dcp_fabric_attach_action dcp_fabric_attach_action(bool external)
 {

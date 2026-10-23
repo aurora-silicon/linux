@@ -48,6 +48,8 @@ def parser_fixture(root):
     metadata = block(metadata, 'struct dcp_display_metadata {') + ';\n'
     header = (base / 'parser.h').read_text()
     header = header[header.index('struct apple_dcp;'):header.index('int parse(')]
+    # Header helpers stay header-like: unused here, as in any includer.
+    header = header.replace('static inline ', 'static inline __attribute__((unused)) ')
     edid_header = (root / 'include/drm/drm_edid.h').read_text()
     edid_header = edid_header[edid_header.index('#define EDID_LENGTH'):edid_header.index('/* EDID matching */')]
     builder = (base / 'dcp-display-metadata.c').read_text()
@@ -559,13 +561,13 @@ struct apple_connector {''')
     state = state.replace('struct apple_epic_service { struct apple_epic *ep; void *cookie; bool enabled; };', '''struct apple_epic_service { struct apple_epic *ep; void *cookie; bool enabled,torndown;
     unsigned users,channel; struct { u64 generation,epoch; } admission;
 };''')
-    state = state.replace('struct { bool lock, enabled; void *service; u64 epoch; } dcpavserv;', 'struct { bool lock, enabled; void *service, *opened; u64 epoch; int enable_completion; } dcpavserv;')
+    state = state.replace('struct { bool lock, enabled; void *service; u64 epoch; } dcpavserv;', 'struct { bool lock, enabled; void *service, *opened; u64 epoch,opened_epoch; int enable_completion; struct work_struct close_wq; } dcpavserv;')
     # Catalogue/EDID ownership: modes are admitted per attachment under modes_lock.
     state = state.replace('    struct work_struct hotplug_wq, bl_sync_wq;\n};', '    struct work_struct hotplug_wq, bl_sync_wq;\n    bool edid_live; unsigned hotplug_reasons;\n};', 1)
     state = state.replace('u64 typec_generation; unsigned int nr_modes;', '''u64 typec_generation; unsigned int nr_modes;
     struct apple_epic *dcpavservep;
     int fw_compat,width_mm,height_mm,fixed_connector_type; unsigned notch_height;
-    bool modes_lock,modes_admitted,modes_provisional,placeholder_retried; int external_held;
+    bool modes_lock,modes_admitted,modes_provisional,placeholder_retried,external_native; int external_held;
     u64 modes_generation,dimensions_generation; struct work_struct dimensions_wq;
     struct { int width_mm,height_mm; } panel;
     struct { size_t length,received; void *data; bool contiguous,payload_complete; u64 modes_generation;
@@ -606,6 +608,10 @@ static void reinit_completion(int *p) { *p=0; }
 static struct apple_epic_service *afk_service_get(struct apple_epic_service *s) { if(!s->enabled) return NULL; s->users++; return s; }
 static void afk_service_put(struct apple_epic_service *s) { assert(s->users); s->users--; }
 static void afk_service_retire(struct apple_epic_service *s) { assert(!*hpd_lock); s->enabled=false; s->torndown=true; }
+/* These H17P scenarios never queue the native 14.7 Close worker. */
+static bool cancel_work_sync(struct work_struct *w) { assert(!w->scheduled); return false; }
+/* Native audio is out of scope: reject entry instead of silently queueing it. */
+static void dcp_external_audio_start(struct apple_dcp *d) { assert(!d->external_native); }
 static void dpavservep_detach(struct apple_dcp *d);
 static struct apple_dcp *probing;
 static struct drm_edid transport_edid;

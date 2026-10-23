@@ -1001,14 +1001,16 @@ def teardown(root):
     decls.append(files['atc'][start:end])
 
     names = {
-        'atc': ('atcphy_pipehandler_lock', 'atcphy_pipehandler_unlock',
+        'atc': ('atcphy_pipehandler_lock', 'atcphy_pipehandler_lock_live',
+                'atcphy_pipehandler_unlock',
                 'atcphy_pipehandler_check', 'atcphy_pipehandler_set_mux',
                 'atcphy_clear_nonselected_phy_reset',
                 'atcphy_configure_pipehandler_usb3_host_t8103',
                 'atcphy_configure_pipehandler_usb3_host_t8122',
                 'atcphy_configure_pipehandler_usb3', 'atcphy_configure_pipehandler_usb4',
                 'atcphy_enable_dummy_phy', 'atcphy_pipe_live', 'atcphy_needs_dummy_phy', 'atcphy_configure_pipehandler_dummy',
-                'atcphy_configure_pipehandler', 'atcphy_park_pipehandler',
+                'atcphy_configure_pipehandler', 'atcphy_park_live_t8103_pipehandler',
+                'atcphy_park_pipehandler',
                 'atcphy_get_mode_config', 'atcphy_dp_configure',
                 'j700_field_update', 'j700_aux_disable', 'atcphy_disable_dp_aux',
                 'atcphy_power_off', 'atcphy_power_on', *ATC_POST_TUNABLE, 'atcphy_configure', 'atcphy_restore_after_pd_off',
@@ -1371,11 +1373,18 @@ struct device { struct device_node *of_node; void *data; };
 struct platform_device { struct device dev; bool bound, registered; };
 /* The native T6030 14.7 backend is never selected in these scenarios. */
 enum dcp_firmware_version { DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_14_7_TEMPLATE, DCP_FIRMWARE_V_26_6 };
+struct work_struct { int unused; };
 struct apple_dcp {
     bool external_prepared, quiescing, crashed, external_native, ext_dead;
     enum dcp_firmware_version fw_compat;
     struct { int iomfb_method_profile; } hw;
+    struct work_struct external_audio_work;
 };
+/* This readiness fixture has no AV owner or native audio initializer. */
+static void av_audiosrv_quiesce(struct apple_dcp *d)
+{ assert(!d->external_native); }
+static void disable_work_sync(struct work_struct *work)
+{ (void)work; assert(!"native audio work in a J700 readiness scenario"); }
 static void __attribute__((unused)) iomfb_v14_7_remove(struct apple_dcp *d)
 { (void)d; assert(!"14.7 backend on a non-14.7 DCP"); }
 /* Nor the J613 26.6 backend. */

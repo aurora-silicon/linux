@@ -99,9 +99,44 @@ config APPLE_SIO
 	depends on APPLE_RTKIT
 	depends on OF_ADDRESS
 	select DMA_ENGINE
+	select DMA_VIRTUAL_CHANNELS
 	help
 	  Enable support for the SIO coprocessor found on Apple Silicon SoCs
 	  where it provides DMA services.
+
+config APPLE_SIO_KUNIT_TEST
+	bool "KUnit tests for the Apple SIO probe" if !KUNIT_ALL_TESTS
+	depends on APPLE_SIO=y && KUNIT=y
+	depends on OF_OVERLAY
+	default KUNIT_ALL_TESTS
+	help
+	  Check which SIO device-tree nodes the probe goes on with: the
+	  generic SIO of the M1 and M2 in every configuration, and a T6030
+	  SIO only with APPLE_SIO_T6030 and protocol-10 boot tables. Run it
+	  both with and without APPLE_SIO_T6030.
+
+config APPLE_SIO_T6030
+	bool "Apple SIO on the M3 Pro (T6030)"
+	depends on APPLE_SIO
+	help
+	  Configure the SIO channels of the T6030 (apple,t6030-sio) the way
+	  its firmware expects them: the DisplayPort audio channels refill
+	  their FIFO at the threshold the system's device tree records for
+	  them (0x600 bytes, not 0x800), and every period descriptor is
+	  published whole. The firmware's boot tables come from the boot
+	  loader, as on the other SoCs; the SIO is only started when they
+	  are protocol-10 tables, which a boot loader without T6030 support
+	  does not build. Without this option a T6030 SIO is left stopped.
+
+config APPLE_SIO_T6030_KUNIT_TEST
+	bool "KUnit tests for the T6030 SIO boot-table check" if !KUNIT_ALL_TESTS
+	depends on APPLE_SIO=y && APPLE_SIO_T6030 && KUNIT=y
+	depends on OF_OVERLAY
+	default KUNIT_ALL_TESTS
+	help
+	  Check the protocol-10 boot-table admission of the T6030 SIO
+	  against tables a T6030-aware boot loader builds, an earlier
+	  loader's tables, and malformed, truncated and out-of-window ones.
 
 config ARM_DMA350
 	tristate "Arm DMA-350 support"

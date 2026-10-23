@@ -76,6 +76,8 @@ static void initial(struct fixture *f, unsigned int gen, bool fixed, bool pm)
 	};
 	hardware.configure_post_tunable = post_tunable[gen];
 	f->atc = (struct apple_atcphy){
+		/* Generation zero models an admitted base M1. */
+		.t8103_usb3_workaround = gen == 0,
 		.hw = &hardware,
 		.regs.core = (unsigned char *)core_regs,
 		.regs.lpdptx = (unsigned char *)core_regs,
