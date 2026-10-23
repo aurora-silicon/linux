@@ -70,6 +70,7 @@
 			d-cache-size = <0x10000>;
 			operating-points-v2 = <&donan_e_opp>;
 			performance-domains = <&cpufreq_e>;
+			capacity-dmips-mhz = <754>;
 		};
 
 		cpu_e1: cpu@1 {
@@ -83,6 +84,7 @@
 			d-cache-size = <0x10000>;
 			operating-points-v2 = <&donan_e_opp>;
 			performance-domains = <&cpufreq_e>;
+			capacity-dmips-mhz = <754>;
 		};
 
 		cpu_e2: cpu@2 {
@@ -96,6 +98,7 @@
 			d-cache-size = <0x10000>;
 			operating-points-v2 = <&donan_e_opp>;
 			performance-domains = <&cpufreq_e>;
+			capacity-dmips-mhz = <754>;
 		};
 
 		cpu_e3: cpu@3 {
@@ -109,6 +112,7 @@
 			d-cache-size = <0x10000>;
 			operating-points-v2 = <&donan_e_opp>;
 			performance-domains = <&cpufreq_e>;
+			capacity-dmips-mhz = <754>;
 		};
 
 		cpu_e4: cpu@4 {
@@ -122,6 +126,7 @@
 			d-cache-size = <0x10000>;
 			operating-points-v2 = <&donan_e_opp>;
 			performance-domains = <&cpufreq_e>;
+			capacity-dmips-mhz = <754>;
 		};
 
 		cpu_e5: cpu@5 {
@@ -135,6 +140,7 @@
 			d-cache-size = <0x10000>;
 			operating-points-v2 = <&donan_e_opp>;
 			performance-domains = <&cpufreq_e>;
+			capacity-dmips-mhz = <754>;
 		};
 
 		cpu_p0: cpu@10100 {
@@ -148,6 +154,7 @@
 			d-cache-size = <0x20000>;
 			operating-points-v2 = <&donan_p_opp>;
 			performance-domains = <&cpufreq_p>;
+			capacity-dmips-mhz = <1024>;
 		};
 
 		cpu_p1: cpu@10101 {
@@ -161,6 +168,7 @@
 			d-cache-size = <0x20000>;
 			operating-points-v2 = <&donan_p_opp>;
 			performance-domains = <&cpufreq_p>;
+			capacity-dmips-mhz = <1024>;
 		};
 
 		cpu_p2: cpu@10102 {
@@ -174,6 +182,7 @@
 			d-cache-size = <0x20000>;
 			operating-points-v2 = <&donan_p_opp>;
 			performance-domains = <&cpufreq_p>;
+			capacity-dmips-mhz = <1024>;
 		};
 
 		cpu_p3: cpu@10103 {
@@ -187,6 +196,7 @@
 			d-cache-size = <0x20000>;
 			operating-points-v2 = <&donan_p_opp>;
 			performance-domains = <&cpufreq_p>;
+			capacity-dmips-mhz = <1024>;
 		};
 
 		l2_cache_0: l2-cache-0 {
