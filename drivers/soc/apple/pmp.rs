@@ -654,34 +654,43 @@ struct PmpHwConfig {
     /// Check the firmware's `uuid` header before trusting the boot argument
     /// block it points to.
     check_bootargs_uuid: bool,
-    coreanalytics: bool,
+    coreanalytics: CoreAnalytics,
+}
+
+/// Whether the firmware's RTKit boot waits for the CoreAnalytics system endpoint (7).
+#[derive(Clone, Copy)]
+enum CoreAnalytics {
+    No,
+    Always,
+    /// Only on the board whose PMP session is retained (J713).
+    RetainedBoard,
 }
 
 const HW_CFG_DEFAULT: PmpHwConfig = PmpHwConfig {
     dma_mask: None,
     check_bootargs_uuid: false,
-    coreanalytics: false,
+    coreanalytics: CoreAnalytics::No,
 };
 
 /// T8140: the DART translates 42 bits and its DMA window starts at 1 TiB.
 const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
     dma_mask: Some(DmaMask::new::<42>()),
     check_bootargs_uuid: false,
-    coreanalytics: false,
+    coreanalytics: CoreAnalytics::No,
 };
 
 /// T6041: the DART window starts at 1 TiB; the boot argument header is
-/// version 5.
+/// version 5; the RTKit boot waits for CoreAnalytics.
 const HW_CFG_T6041: PmpHwConfig = PmpHwConfig {
     dma_mask: Some(DmaMask::new::<42>()),
     check_bootargs_uuid: true,
-    coreanalytics: false,
+    coreanalytics: CoreAnalytics::Always,
 };
 
 const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
     dma_mask: None,
     check_bootargs_uuid: false,
-    coreanalytics: true,
+    coreanalytics: CoreAnalytics::RetainedBoard,
 };
 
 impl Drop for PmpDriver {
@@ -747,10 +756,14 @@ impl platform::Driver for PmpDriver {
             patches.push((from_fourcc(b"PMCB"), (v >> 3) & 1), GFP_KERNEL)?;
         }
         data.patch_bootargs(&pmp_mmio, &patches, cfg.check_bootargs_uuid)?;
-        // EP7 is a qualified startup dependency only on the retained J713 PMP.
-        // SAFETY: the predicate only reads machine compatibility.
-        let needs_coreanalytics =
-            cfg.coreanalytics && unsafe { bindings::apple_pmp_telemetry_retained_board() };
+        let needs_coreanalytics = match cfg.coreanalytics {
+            CoreAnalytics::No => false,
+            CoreAnalytics::Always => true,
+            // SAFETY: the predicate only reads machine compatibility.
+            CoreAnalytics::RetainedBoard => unsafe {
+                bindings::apple_pmp_telemetry_retained_board()
+            },
+        };
         let rtkit = if needs_coreanalytics {
             rtkit::RtKit::<PmpData>::new_with_coreanalytics(&dev, None, 0, data.clone())?
         } else {
