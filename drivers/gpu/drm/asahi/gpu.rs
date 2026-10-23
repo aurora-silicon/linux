@@ -338,6 +338,12 @@ pub(crate) trait Gpu: Send + Sync {
     }
     /// A userspace VM handle was closed; release backend-only registry references.
     fn vm_closed(&self) {}
+    /// Whether a file may create a VM: `params_size` is the largest size it asked GET_PARAMS
+    /// for the global parameters with, `flags` its VM_CREATE flags. Every GPU but the M3
+    /// T8122 runtime admits any client.
+    fn admit_vm(&self, _dev: &kernel::device::Device, _params_size: u64, _flags: u32) -> Result {
+        Ok(())
+    }
     /// Create a new `Vm` with the given range reserved for kernel-managed objects.
     fn new_vm(&self, kernel_range: Range<u64>) -> Result<mmu::Vm>;
     /// Create a new user command queue.

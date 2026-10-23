@@ -12,21 +12,16 @@
 //! derived from observing the InitData structures that macOS generates.
 
 use crate::f32;
-use crate::fw::initdata::*;
+use crate::m3::g15_raw::*;
 use crate::fw::types::*;
-use crate::module_parameters;
 use crate::{
-    driver::AsahiDevice,
-    gem,
-    gpu,
-    hw,
+    m3::hw,
     mmu, //
 };
 use kernel::error::{
     Error,
     Result, //
 };
-use kernel::macros::versions;
 use kernel::prelude::*;
 use kernel::try_init;
 
@@ -34,6 +29,10 @@ use ::pin_init;
 use ::pin_init::Init;
 
 /// Builder helper for the global GPU InitData.
+
+/// The "unknown page" of the 39-bit user layout (7.1.12 `mmu::IOVA_UNK_PAGE`): two pages below
+/// the top of the user range.
+const IOVA_UNK_PAGE: u64 = (1 << 39) - 2 * 0x4000;
 
 /// G15 idle-off delay (ms, Globals +0x9a0/+0x9a4) used as "never idle off" while the rings live
 /// in Fender scratch SRAM without a backup/restore path.
@@ -104,24 +103,6 @@ pub(crate) struct G15RuntimeHwDataB {
 }
 
 impl G15Options {
-    /// The options of the G15 manager backend: its validated defaults, the performance-state
-    /// cap (`asahi.m3_max_pstate`) and the `asahi.g15_debug` A/B switches.
-    fn manager(cfg: &'static hw::HwConfig) -> G15Options {
-        let g15 = cfg.gpu_gen == hw::GpuGen::G15;
-        G15Options {
-            layout: G15Layout::Manager,
-            split_pstates: g15
-                && crate::m3_params::g15_debug(crate::m3_params::G15Debug::ManagerSplitPstates),
-            cap: g15.then(|| {
-                crate::m3_params::max_pstate_param().unwrap_or(crate::m3_params::MAX_PSTATE_DEFAULT)
-            }),
-            timestamp_base: None,
-            reference_ppm: g15
-                && crate::m3_params::g15_debug(crate::m3_params::G15Debug::ManagerReferencePpm),
-            runtime_hwdata_b: None,
-            per_cluster_voltages: false,
-        }
-    }
 
     /// The published performance-state tables for `pwr`.
     pub(crate) fn tables(&self, pwr: &hw::PwrConfig) -> Result<PStateTables> {
@@ -318,43 +299,12 @@ impl PStateTables {
     }
 }
 
-/// The highest GPU frequency the G15 manager backend lets the firmware use, in kHz (its
-/// performance cap), or None when the GPU is not G15 or the cap cannot be applied.
-pub(crate) fn g15_manager_max_frequency_khz(
-    cfg: &'static hw::HwConfig,
-    pwr: &hw::PwrConfig,
-) -> Option<u32> {
-    if cfg.gpu_gen != hw::GpuGen::G15 {
-        return None;
-    }
-    let tables = G15Options::manager(cfg).tables(pwr).ok()?;
-    Some(tables.max_frequency_khz(pwr))
-}
 
-pub(crate) struct InitDataBuilderG15V14_8_3<'a> {
-    dev: &'a AsahiDevice,
-    alloc: &'a mut gpu::KernelAllocators,
-    cfg: &'static hw::HwConfig,
-    dyncfg: &'a hw::DynConfig,
-    g15: G15Options,
-}
+/// The G15 InitData builders. The M3 runtime places the firmware objects itself, so only the
+/// builders into plain memory are kept ([`Self::g15_contents`]).
+pub(crate) struct InitDataBuilderG15V14_8_3<'a>(core::marker::PhantomData<&'a ()>);
 
 impl<'a> InitDataBuilderG15V14_8_3<'a> {
-    /// Create a new InitData builder
-    pub(crate) fn new(
-        dev: &'a AsahiDevice,
-        alloc: &'a mut gpu::KernelAllocators,
-        cfg: &'static hw::HwConfig,
-        dyncfg: &'a hw::DynConfig,
-    ) -> InitDataBuilderG15V14_8_3<'a> {
-        InitDataBuilderG15V14_8_3 {
-            dev,
-            alloc,
-            cfg,
-            dyncfg,
-            g15: G15Options::manager(cfg),
-        }
-    }
 
     /// Create an unknown T81xx-specific data structure.
     fn t81xx_data(
@@ -591,47 +541,6 @@ impl<'a> InitDataBuilderG15V14_8_3<'a> {
                 }))
     }
 
-    /// Create the HwDataA structure. This mostly contains power-related configuration.
-    fn hwdata_a(&mut self) -> Result<GpuObject<HwDataAG15V14_8_3>> {
-        let init = Self::hwdata_a_init(self.cfg, self.dyncfg, &self.g15)?;
-        let dev = self.dev;
-        let dyncfg = self.dyncfg;
-        self.alloc
-            .private
-            .new_init(pin_init::init_zeroed(), move |_inner, _ptr| {
-                init.chain(move |raw| {
-                    if !dyncfg.hw_data_b.is_empty() {
-                        unsafe {
-                            let mut matches: bool = true;
-                            let sla = core::slice::from_raw_parts(
-                                raw as *const raw::HwDataAG15V14_8_3 as *const u8,
-                                core::mem::size_of::<raw::HwDataAG15V14_8_3>(),
-                            );
-                            if sla.len() != dyncfg.hw_data_a.len() {
-                                matches = false;
-                                dev_err!(
-                                    dev.as_ref(),
-                                    "!!! Hwdata A size mismatch: {} {}",
-                                    sla.len(),
-                                    dyncfg.hw_data_a.len(),
-                                );
-                            }
-                            for i in 0..core::cmp::min(sla.len(), dyncfg.hw_data_a.len()) {
-                                if sla[i] != dyncfg.hw_data_a[i] {
-                                    matches = false;
-                                    dev_err!(dev.as_ref(), "!!! Hwdata A first mismatch: {i}");
-                                    break;
-                                }
-                            }
-                            if matches {
-                                dev_info!(dev.as_ref(), "!!! Hwdata A match");
-                            }
-                        }
-                    }
-                    Ok(())
-                })
-            })
-    }
 
     /// The runtime backend's HwDataA words that the manager layout leaves at their defaults: the
     /// shader-engine controller block at +0x10b4 in its G15 order (all inputs from the device
@@ -698,30 +607,6 @@ impl<'a> InitDataBuilderG15V14_8_3<'a> {
         raw.unk_429c[0] = 1;
     }
 
-    // Compare a structure against the copy m1n1 left in the reserved-memory blob, if any
-    // (debug aid, same as the G13/G14 builders do inline).
-    fn compare_blob<T>(dev: &AsahiDevice, what: &str, raw: &T, blob: &[u8]) {
-        if blob.is_empty() {
-            return;
-        }
-        // SAFETY: `raw` is a fully initialized firmware structure; viewing it as bytes is fine.
-        let sla = unsafe {
-            core::slice::from_raw_parts(raw as *const T as *const u8, core::mem::size_of::<T>())
-        };
-        if sla.len() != blob.len() {
-            dev_err!(
-                dev.as_ref(),
-                "!!! {} size mismatch: {} {}",
-                what,
-                sla.len(),
-                blob.len()
-            );
-        }
-        match sla.iter().zip(blob.iter()).position(|(a, b)| a != b) {
-            Some(i) => dev_err!(dev.as_ref(), "!!! {} first mismatch: {i}", what),
-            None => dev_info!(dev.as_ref(), "!!! {} match", what),
-        }
-    }
 
     // Build the G15 (14.8.3) HwDataB contents without allocating the object. Board values whose
     // source is not known yet are left 0 and marked TODO.
@@ -737,7 +622,8 @@ impl<'a> InitDataBuilderG15V14_8_3<'a> {
         let runtime_hwdata_b = g15.runtime_hwdata_b;
         let timestamp_base = match g15.timestamp_base {
             Some(base) => base,
-            None => mmu::kern_iova(cfg, gpu::IOVA_KERN_TIMESTAMP_RANGE.start),
+            // The runtime always names its timestamp arena.
+            None => return Err(EINVAL),
         };
         Ok(try_init!(raw::HwDataBG15V14_8_3 {
             // VA-layout words, +0x0/+0x8
@@ -750,7 +636,7 @@ impl<'a> InitDataBuilderG15V14_8_3<'a> {
             // "Unknown page": the G15 firmware layout uses 0x2ff_ffff8000 (+0x20) in its
             // 42-bit user layout; the manager keeps a 39-bit user range and maps the page
             // at IOVA_UNK_PAGE, so it passes that.
-            unk_30: U64(mmu::IOVA_UNK_PAGE),
+            unk_30: U64(IOVA_UNK_PAGE),
             // FW VA of the timestamp area, +0x28
             timestamp_area_base: U64(timestamp_base),
             // TODO: CSC matrices (+0x38) and border-colour pointer (+0x638)
@@ -960,20 +846,6 @@ impl<'a> InitDataBuilderG15V14_8_3<'a> {
         raw.unk_1818 = words.unk_1818;
     }
 
-    // Create the G15 (14.8.3) HwDataB structure.
-    fn hwdata_b(&mut self) -> Result<GpuObject<HwDataBG15V14_8_3>> {
-        let init = Self::hwdata_b_init(self.cfg, self.dyncfg, &self.g15)?;
-        let dev = self.dev;
-        let dyncfg = self.dyncfg;
-        self.alloc
-            .private
-            .new_init(pin_init::init_zeroed(), move |_inner, _ptr| {
-                init.chain(move |raw| {
-                    Self::compare_blob(dev, "Hwdata B", &*raw, &dyncfg.hw_data_b);
-                    Ok(())
-                })
-            })
-    }
 
     // Build the G15 (14.8.3) Globals contents without allocating the object. Only the fields
     // with a known init value are set; the rest start at 0.
@@ -1102,123 +974,7 @@ impl<'a> InitDataBuilderG15V14_8_3<'a> {
         Ok(())
     }
 
-    // Create the G15 (14.8.3) Globals structure.
-    fn globals(&mut self) -> Result<GpuObject<GlobalsG15V14_8_3>> {
-        let init = Self::globals_init(self.cfg, self.dyncfg, &self.g15)?;
-        let dev = self.dev;
-        let dyncfg = self.dyncfg;
-        self.alloc
-            .private
-            .new_init(pin_init::init_zeroed(), move |_inner, _ptr| {
-                init.chain(move |raw| {
-                    Self::compare_blob(dev, "Globals", &*raw, &dyncfg.hw_globals);
-                    Ok(())
-                })
-            })
-    }
 
-    // Create the G15 (14.8.3) RuntimePointers structure. The ring descriptors are filled in by
-    // the GPU manager.
-    fn runtime_pointers(&mut self) -> Result<GpuObject<RuntimePointersG15V14_8_3>> {
-        let hwa = self.hwdata_a()?;
-        let hwb = self.hwdata_b()?;
-        let bufmgr_fw_addr = mmu::kern_iova(self.cfg, gpu::IOVA_KERN_GPU_BUFMGR_HIGH);
-        let rp_2d0 = self.g15.runtime_pointers_2d0();
-
-        let mut buffer_mgr_ctl = gem::new_kernel_object(self.dev, 0x4000)?;
-        buffer_mgr_ctl.vmap()?.memset(0);
-
-        GpuObject::new_init_prealloc(
-            self.alloc.private.alloc_object()?,
-            |_ptr| {
-                let alloc = &mut *self.alloc;
-                try_init!(RuntimePointersG15V14_8_3 {
-                    // G15 E1/E2/E3 are 0xc10/0x1248/0xe10 bytes; the G13
-                    // GpuGlobalStatsVtx/GpuStatsComp buffers are larger, which is harmless.
-                    stats <- {
-                        let alloc = &mut *alloc;
-                        try_init!(StatsG15V14_8_3 {
-                            vtx: alloc.private.new_default::<GpuGlobalStatsVtx>()?,
-                            frag: alloc.private.new_init(
-                                pin_init::init_zeroed::<GpuGlobalStatsFragG15V14_8_3>(),
-                                |_inner, _ptr| {
-                                    try_init!(raw::GpuGlobalStatsFragG15V14_8_3 {
-                                        total_cmds: 0,
-                                        unk_4: 0,
-                                        stats: Default::default(),
-                                    })
-                                }
-                            )?,
-                            comp: alloc.private.new_default::<GpuStatsComp>()?,
-                        })
-                    },
-
-                    hwdata_a: hwa,
-                    hwdata_b: hwb,
-
-                    // BRN (erratum) table.
-                    // TODO: size and contents unknown; one zeroed page (no errata).
-                    brn_table: alloc.private.array_empty_tagged(0x4000, b"IBRN")?,
-                    // E7: 0x88 bytes, zeroed
-                    unkptr_e7: alloc.private.array_empty_tagged(0x88, b"IE7_")?,
-                    // E5: 0x60 bytes, zeroed
-                    unkptr_e5: alloc.private.array_empty_tagged(0x60, b"IE5_")?,
-                    // UMA page-pool descriptor table (RuntimePointers +0x2c0/+0x2c8).
-                    // TODO: size/format unknown; one zeroed page. The firmware takes a
-                    // GPU VA and a FW VA; both point at this kernel mapping for now.
-                    uma_pool_desc: alloc.shared.array_empty_tagged(0x4000, b"IUMA")?,
-
-                    buffer_mgr_ctl,
-                    buffer_mgr_ctl_low_mapping: None,
-                    buffer_mgr_ctl_high_mapping: None,
-                })
-            },
-            |inner, _ptr| {
-                try_init!(raw::RuntimePointersG15V14_8_3 {
-                    hwdata_b: inner.hwdata_b.gpu_pointer(),
-                    brn_table: inner.brn_table.gpu_pointer(),
-                    unkptr_e7: inner.unkptr_e7.gpu_pointer(),
-
-                    pipes: Default::default(),
-                    device_control: Default::default(),
-                    event: Default::default(),
-                    fw_log: Default::default(),
-                    ktrace: Default::default(),
-                    stats: Default::default(),
-                    fwlog_buf: None,
-                    __pad_200: Default::default(),
-                    // FWLog enable: the firmware writes no log records while this is 0.
-                    // Opt-in via asahi.g15_debug bit 43.
-                    unk_230: crate::m3_params::g15_debug(crate::m3_params::G15Debug::FwLog) as u32,
-
-                    stats_vtx: inner.stats.vtx.gpu_pointer(),
-                    stats_frag: inner.stats.frag.gpu_pointer(),
-                    stats_comp: inner.stats.comp.gpu_pointer(),
-                    unkptr_e5: inner.unkptr_e5.gpu_pointer(),
-                    __pad_254: Default::default(),
-                    // Optional pointer, left 0
-                    unkptr_2a8: U64(0),
-                    buffer_mgr_ctl_gpu_addr: U64(gpu::IOVA_KERN_GPU_BUFMGR_LOW),
-                    buffer_mgr_ctl_fw_addr: U64(bufmgr_fw_addr),
-                    uma_pool_desc_gpu_addr: U64(inner.uma_pool_desc.gpu_va().get()),
-                    uma_pool_desc_fw_addr: U64(inner.uma_pool_desc.gpu_va().get()),
-                    // TODO: board configuration words; +0x2d4 left 0.
-                    unk_2d0: rp_2d0,
-                    unk_2d4: 0,
-                    __pad_2d8: Default::default(),
-                    // +0x3b0: 0xff, then 0x90 zero bytes
-                    cswitch_hist_ctl: 0xff,
-                    unk_3b1: Default::default(),
-                    hwdata_a: inner.hwdata_a.gpu_pointer(),
-                    // TODO: 16 board configuration bytes; left 0.
-                    unk_449: Default::default(),
-                    __pad_459: Default::default(),
-                    unk_46d: Default::default(),
-                    __pad_48d: Default::default(),
-                })
-            },
-        )
-    }
 
     // Fill the G15 P0 status block. Host-initialised words are 0 except +0x45c4, which arms the
     // firmware work-scheduler callbacks, and in the runtime layout the noise-suppression idle
@@ -1230,13 +986,6 @@ impl<'a> InitDataBuilderG15V14_8_3<'a> {
         }
     }
 
-    // Create the G15 P0 status block.
-    fn status_block(&mut self) -> Result<GpuObject<StatusBlock>> {
-        let g15 = self.g15;
-        let mut block = self.alloc.shared.new_default::<StatusBlock>()?;
-        block.with_mut(|raw, _inner| Self::status_block_fill(raw, &g15));
-        Ok(block)
-    }
 
     // Build the G15 P1 power-controller block without allocating it. The fields keep the order
     // and the formulas of the G13 13.5 Globals power fields (inferred).
@@ -1306,18 +1055,7 @@ impl<'a> InitDataBuilderG15V14_8_3<'a> {
         })
     }
 
-    // Create the G15 P1 power-controller block.
-    fn power_ctl_block(&mut self) -> Result<GpuObject<PowerCtlBlock>> {
-        let init = Self::power_ctl_block_init(self.cfg, self.dyncfg, &self.g15);
-        self.alloc
-            .shared
-            .new_init(pin_init::init_zeroed(), move |_inner, _ptr| init)
-    }
 
-    // Create the G15 P2 debug block. ktrace stays disabled, as on G13.
-    fn debug_block(&mut self) -> Result<GpuObject<DebugBlock>> {
-        self.alloc.shared.new_default::<DebugBlock>()
-    }
 
     /// Create one UatLevelInfo structure, which describes one level of translation for the UAT MMU.
     fn uat_level_info(
@@ -1349,66 +1087,6 @@ impl<'a> InitDataBuilderG15V14_8_3<'a> {
         ]
     }
 
-    /// Build the top-level InitData object.
-    #[inline(never)]
-    pub(crate) fn build(&mut self) -> Result<KBox<GpuObject<InitDataG15V14_8_3>>> {
-        {
-            let pwr = &self.dyncfg.pwr;
-            let tables = self.g15.tables(pwr)?;
-            dev_info!(
-                self.dev.as_ref(),
-                "G15: performance cap {} -> {} state {} of 1..={} ({} MHz)\n",
-                self.g15.cap.unwrap_or(0),
-                if tables.secondary.is_some() { "voltage-sorted" } else { "device-tree" },
-                tables.max,
-                tables.len - 1,
-                tables.max_frequency_khz(pwr) / 1000
-            );
-        }
-        let runtime_pointers = self.runtime_pointers()?;
-        let globals = self.globals()?;
-        // 14.x: FwStatus lives inside the P0 status block
-        let fw_status = self.status_block()?;
-        let power_ctl_block = self.power_ctl_block()?;
-        let debug_block = self.debug_block()?;
-        let shared_ro = &mut self.alloc.shared_ro;
-
-        let obj = self.alloc.private.new_init(
-            try_init!(InitDataG15V14_8_3 {
-                unk_buf: shared_ro.array_empty_tagged(0x4000, b"IDTA")?,
-                runtime_pointers,
-                globals,
-                fw_status,
-                power_ctl_block,
-                debug_block,
-            }),
-            |inner, _ptr| {
-                let cfg = &self.cfg;
-                try_init!(raw::InitDataG15V14_8_3 {
-                    ver_info: Array::new([0x0490, 0x8380, 0xe21e, 0x0c08]),
-                    unk_buf: inner.unk_buf.gpu_pointer(),
-                    unk_8: 0,
-                    unk_c: 0,
-                    runtime_pointers: inner.runtime_pointers.gpu_pointer(),
-                    globals: inner.globals.gpu_pointer(),
-                    // InitData +0x28/+0x2c: u32 0, u32 1
-                    unk_28: 0,
-                    unk_2c: 1,
-                    uat_page_size: 0x4000,
-                    uat_page_bits: 14,
-                    uat_num_levels: 3,
-                    uat_level_info: Array::new(Self::uat_levels(cfg)),
-                    // TODO: pmap descriptor +0x7c, meaning unknown; left 0.
-                    unk_94: 0,
-                    __pad_98: Default::default(),
-                    debug_block: inner.debug_block.gpu_pointer(),
-                    status_block: inner.fw_status.gpu_pointer(),
-                    power_ctl_block: inner.power_ctl_block.gpu_pointer(),
-                })
-            },
-        )?;
-        Ok(KBox::new(obj, GFP_KERNEL)?)
-    }
 }
 
 /// G15 InitData contents built into plain memory, for a backend that places the firmware objects

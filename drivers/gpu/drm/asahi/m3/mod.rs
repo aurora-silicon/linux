@@ -43,6 +43,96 @@ pub(crate) fn refuse_probe(pdev: &platform::Device<Core<'_>>, chip: Chip) -> Err
     ENODEV
 }
 
+/// Whether the M3 runtime may start on this T8122 (M3, G15G), whose GPU the boot loader handed
+/// over: its identity gate passes (only DT properties are read) and the backend selection allows
+/// the board. The runtime then admits the boot loader's description, and refuses the SoC unless
+/// `asahi.t8122_start=1` arms the start ([`t8122_start`]).
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+pub(crate) fn t8122_admitted(pdev: &platform::Device<Core<'_>>) -> Result<&'static m3_soc::Soc> {
+    let identity = t8122_admission::read_identity(pdev).map_err(|error| {
+        dev_info!(
+            pdev.as_ref(),
+            "G15G: T8122 identity or ABI rejected ({:?}); startup refused\n",
+            error
+        );
+        ENODEV
+    })?;
+    dev_info!(
+        pdev.as_ref(),
+        "G15G: T8122 revision 2.0 identity admitted ({} active / {} slots)\n",
+        identity.active_cores,
+        identity.core_slots
+    );
+    if !m3_params::t8122_backend(pdev) {
+        return Err(ENODEV);
+    }
+    Ok(&m3_soc::T8122)
+}
+
+// The T8122 runtime, ported from the 7.1.12 release-20 kernel (c46d7dcdb871).
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod agx_attachments;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod agx_compute;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod agx_memory;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod agx_resources;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod agx_status;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod agx_uapi;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod g15_raw;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod hw;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod identity;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod initdata;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod m3_adt_config;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod m3_board;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod m3_client;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod m3_completion;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod m3_compute;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod m3_config;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod m3_device;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+pub(crate) mod m3_drm;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod m3_firmware;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod m3_memory;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod m3_params;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod m3_pass;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod m3_pool;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod m3_render;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod m3_resources;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod m3_rtkit;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod m3_runtime;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod m3_submit;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod m3_thermal;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod t8122_knobs;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod t8122_start;
+
 mod m3_compute_layout;
 
 mod m3_compute_sequence;
@@ -103,6 +193,8 @@ mod m3_fragment_command;
 
 mod t8122_admission;
 
-mod m3_soc;
+// The runtime's SoC tables; they name the runtime's own modules.
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+pub(crate) mod m3_soc;
 
 mod t8122_hwdata;

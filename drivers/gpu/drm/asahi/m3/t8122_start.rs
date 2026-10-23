@@ -27,13 +27,13 @@ use core::mem::offset_of;
 use kernel::{device, prelude::*};
 
 use crate::{
-    fw::initdata::raw,
-    initdata::G15RuntimeHwDataB,
-    m3_adt_config::T8122_IO_MAPPINGS,
-    m3_init_storage::{self as storage, IoMap},
-    m3_soc::{IoMapping, Soc, T8122_HWDATA_B},
+    m3::g15_raw::raw,
+    m3::initdata::G15RuntimeHwDataB,
+    m3::m3_adt_config::T8122_IO_MAPPINGS,
+    m3::m3_init_storage::{self as storage, IoMap},
+    m3::m3_soc::{IoMapping, Soc, T8122_HWDATA_B},
     pgtable::{prot, Prot},
-    t8122_knobs::{
+    m3::t8122_knobs::{
         self as knobs, ClockGen, Start, Values, CLOCK_GEN_E1C, CLOCK_GEN_E5C, FENDER_ADT,
         FENDER_RULE,
     },
@@ -140,7 +140,7 @@ const _: () = {
     assert!(offset_of!(raw::HwDataBG15V14_8_3, unit_mask_b) == 0x17c8);
     // An armed start skips `require_complete`. The only `unported` item of the T8122 table is the
     // opt-in itself; if another is added, this fails the build until the start accounts for it.
-    assert!(crate::m3_soc::T8122.unported.len() == 1);
+    assert!(crate::m3::m3_soc::T8122.unported.len() == 1);
 };
 
 /// The values of one armed boot.
@@ -149,7 +149,7 @@ pub(crate) struct Experiment(Values);
 
 /// Whether `soc` is the T8122 table.
 pub(crate) fn is_t8122(soc: &Soc) -> bool {
-    core::ptr::eq(soc, &crate::m3_soc::T8122)
+    core::ptr::eq(soc, &crate::m3::m3_soc::T8122)
 }
 
 impl Experiment {
@@ -182,7 +182,7 @@ impl Experiment {
     /// they are the T8122 table's own IO maps.
     pub(crate) fn iomaps(&self) -> &'static [IoMap] {
         if self.0.fender == FENDER_RULE && self.0.clock_gen == ClockGen::At(CLOCK_GEN_E1C) {
-            return &crate::m3_adt_config::T8122_IOMAPS;
+            return &crate::m3::m3_adt_config::T8122_IOMAPS;
         }
         &IOMAPS[self.variant()][..self.mapping_count()]
     }
@@ -245,7 +245,7 @@ pub(crate) fn arm(dev: &device::Device, soc: &Soc) -> Result<Option<Experiment>>
     if !is_t8122(soc) {
         return Ok(None);
     }
-    let raw = crate::m3_params::t8122_params();
+    let raw = crate::m3::m3_params::t8122_params();
     match knobs::start(&raw) {
         Start::On => {}
         Start::Off => {
@@ -354,7 +354,7 @@ pub(crate) fn refused(dev: &device::Device, experiment: Option<&Experiment>, sta
 
 /// Log, on a T8122 armed with `asahi.t8122_start=1`, that resource admission refused it.
 pub(crate) fn not_admitted(dev: &device::Device, soc: &Soc) {
-    if is_t8122(soc) && knobs::start(&crate::m3_params::t8122_params()) == Start::On {
+    if is_t8122(soc) && knobs::start(&crate::m3::m3_params::t8122_params()) == Start::On {
         dev_err!(
             dev,
             "M3 G15G start: not armed: resource admission refused the GPU (see the lines above); the boot loader did not hand it over completely\n"

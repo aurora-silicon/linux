@@ -2,19 +2,19 @@
 use core::{mem::ManuallyDrop, sync::atomic::Ordering};
 use kernel::{device::Core, platform, prelude::*, soc::apple::rtkit, sync::Arc,
     time::{Instant, Monotonic, Delta, delay::fsleep}};
-use crate::{driver, mmu, m3_device::Device, m3_config::Config, m3_rtkit};
+use crate::{driver, mmu, m3::m3_device::Device, m3::m3_config::Config, m3::m3_rtkit};
 
 #[path = "m3_batch_policy.rs"]
 pub(crate) mod policy;
-const _: () = assert!(policy::SLOTS == crate::m3_pass_layout::SLOTS);
+const _: () = assert!(policy::SLOTS == crate::m3::m3_pass_layout::SLOTS);
 
-enum NativeJob {Compute(crate::m3_compute::Compute),Render(crate::m3_render::Render)}
+enum NativeJob {Compute(crate::m3::m3_compute::Compute),Render(crate::m3::m3_render::Render)}
 /// Completion-worker outcome.
 pub(crate) enum Service {Idle,Progress,Waiting(u64)}
 /// The published batch: its commands in order, as (packet, command index).
 struct Batch {
-    entries: KVec<(Arc<crate::m3_submit::Packet>,usize)>,
-    index: usize, kind: usize, first: crate::m3_submit::Command,
+    entries: KVec<(Arc<crate::m3::m3_submit::Packet>,usize)>,
+    index: usize, kind: usize, first: crate::m3::m3_submit::Command,
     preparation_ns: i64, previous_events: u64, expected_events: u64,
     start: Instant<Monotonic>, measure: bool, doorbell_counter_ns: i64,
     /// Render: first pass slot and the batch's last draw number.
@@ -40,16 +40,16 @@ struct GeometryTiming {
 }
 impl NativeJob {
     fn complete(&mut self)->Result<bool> {match self {Self::Compute(j)=>j.complete(),Self::Render(j)=>j.complete()}}
-    fn log(&mut self,dev:&driver::AsahiDevice)->Result {match self {Self::Compute(j)=>j.log(dev),Self::Render(j)=>j.log(dev)}}
+    fn log(&mut self,dev:&driver::AsahiDrmDevice)->Result {match self {Self::Compute(j)=>j.log(dev),Self::Render(j)=>j.log(dev)}}
     fn batch_gpu_span(&mut self)->Result<[u64;2]> {match self {Self::Compute(j)=>j.batch_gpu_span(),Self::Render(j)=>j.batch_gpu_span()}}
 }
 struct Inner {
     transport: rtkit::RtKit<m3_rtkit::Operations>,
     state: Arc<m3_rtkit::State>,
     jobs: KVec<NativeJob>,
-    packets: KVec<Arc<crate::m3_submit::Packet>>,
+    packets: KVec<Arc<crate::m3::m3_submit::Packet>>,
     /// Packets not yet (fully) published: (packet, next command index), most urgent first.
-    pending: KVec<(Arc<crate::m3_submit::Packet>,usize)>,
+    pending: KVec<(Arc<crate::m3::m3_submit::Packet>,usize)>,
     /// Published batches, oldest first. More than one only with asahi.m3_pipeline_depth > 1.
     active: KVec<Batch>,
     gpu_pending: bool,
@@ -57,14 +57,14 @@ struct Inner {
     active_power_samples: u32,
     fault_captured: bool,
     timing: [[i64;7];2],
-    render_batches: [u64;crate::m3_pass_layout::SLOTS],
+    render_batches: [u64;crate::m3::m3_pass_layout::SLOTS],
     geometry: [GeometryTiming; 32],
     geometry_overflow: u64,
     /// Whether a T8122 job verdict line was already emitted for the current job, so the
     /// execute-path fallback does not add a second one. T8122 only.
     t8122_verdict: bool,
     /// The step the firmware boot sequence has reached, for the T8122 boot verdict. T8122 only.
-    boot_step: crate::t8122_start::BootStep,
+    boot_step: crate::m3::t8122_start::BootStep,
     /// Packets that joined a batch started by an earlier packet (debug summary).
     coalesced_packets: u64,
     coalesced_render_stamps: u64,
@@ -76,6 +76,9 @@ struct Inner {
     render_initialized: bool,
     config: Config,
     uat: mmu::Uat,
+    /// The firmware's view of the host window (the shared L2 the firmware walks), kept in step
+    /// with the kernel VM's shadow window before the firmware is given new kernel addresses.
+    window: crate::g15::uat::Window,
     drm: driver::AsahiDevRef,
     device: Device,
 }
@@ -86,10 +89,10 @@ impl Inner {
         self.state.health.mark_failed();
         if self.fault_captured { return; }
         self.fault_captured = true;
-        #[cfg(CONFIG_DEV_COREDUMP)]
-        if let Err(error) = self.config.fault_snapshot(&self.drm, primary, self.gpu_pending) {
-            dev_err!(self.drm.as_ref(), "M3 fault snapshot failed: {:?}\n", error);
-        }
+        // 7.1.12 also published a devcoredump of the firmware objects here; 7.2's kernel crate
+        // has no devcoredump binding, so the first error is only logged.
+        dev_err!(self.drm.as_ref(), "M3: first GPU failure: {:?} (GPU work pending: {})\n",
+            primary, self.gpu_pending);
     }
 
     /// Record a batch that failed or never retired. Mark the GPU failed first,
@@ -97,15 +100,12 @@ impl Inner {
     /// behind a device that still reports itself healthy.
     fn fail(&mut self, index: usize, vm: &mmu::Vm, primary: Error) {
         self.capture_fault(primary);
-        if crate::t8122_start::is_t8122(self.device.soc()) {
+        if crate::m3::t8122_start::is_t8122(self.device.soc()) {
             let pstate=self.device.pstate_register().ok();
             // The job's first GPU start timestamp: nonzero means the firmware dispatched it,
             // whatever the power state reads at the timeout.
             let start_stamp=self.jobs[index].batch_gpu_span().ok().map(|span| span[0]);
-            crate::t8122_start::job_failed_verdict(self.drm.as_ref(),primary,start_stamp,pstate,self.state.health.crashed());
-            self.t8122_verdict=true;
-        } else if crate::t6031_start::is_t6031(self.device.soc()) {
-            crate::t6031_start::job_failed_verdict(self.drm.as_ref(), primary, self.state.health.crashed());
+            crate::m3::t8122_start::job_failed_verdict(self.drm.as_ref().as_ref(),primary,start_stamp,pstate,self.state.health.crashed());
             self.t8122_verdict=true;
         }
         let events=self.state.event_messages.load(Ordering::Acquire);
@@ -116,7 +116,7 @@ impl Inner {
             dev_err!(self.drm.as_ref(), "M3 engine diagnostics failed: {:?}\n", e);
         }
         let _=self.config.log_recovery_state(&self.drm,events);
-        if crate::m3_params::g15_debug(crate::m3_params::G15Debug::M3ResumeAfterFault) {
+        if crate::m3::m3_params::g15_debug(crate::m3::m3_params::G15Debug::M3ResumeAfterFault) {
             if let Err(e)=self.resume_experiment(index, vm) {
                 dev_err!(self.drm.as_ref(),"M3: resume-after-fault: stopped by {:?}\n",e);
             }
@@ -203,10 +203,10 @@ impl Inner {
     }
     /// Hardware completion is separate from fence signaling: cancellation can win the
     /// signal race while the DMA guard must survive until its final published batch retires.
-    fn packet_active(&self, packet:&Arc<crate::m3_submit::Packet>)->bool {
+    fn packet_active(&self, packet:&Arc<crate::m3::m3_submit::Packet>)->bool {
         self.active.iter().any(|b|b.entries.iter().any(|(p,_)|Arc::ptr_eq(p,packet)))
     }
-    fn retire_packets(&mut self,entries:&[(Arc<crate::m3_submit::Packet>,usize)]) {
+    fn retire_packets(&mut self,entries:&[(Arc<crate::m3::m3_submit::Packet>,usize)]) {
         for (packet,_) in entries {
             let pending=self.pending.iter().any(|(p,_)|Arc::ptr_eq(p,packet));
             if policy::packet_retired(pending,self.packet_active(packet)) {packet.retired();}
@@ -221,37 +221,37 @@ impl Inner {
         }
     }
     /// Signal every packet of `entries` (packets that continue past the batch included).
-    fn finish_all(entries:&[(Arc<crate::m3_submit::Packet>,usize)],result:Result) {
+    fn finish_all(entries:&[(Arc<crate::m3::m3_submit::Packet>,usize)],result:Result) {
         for (packet,_) in entries {packet.finish(result);}
     }
     /// Choose the next batch from the front of `pending`: the front packet's next commands of
     /// one engine, and for render also the leading render commands of following packets of the
     /// same VM, up to the ordered-batch limit.
-    fn next_batch(&self,max:usize)->Result<KVec<(Arc<crate::m3_submit::Packet>,usize)>> {
+    fn next_batch(&self,max:usize)->Result<KVec<(Arc<crate::m3::m3_submit::Packet>,usize)>> {
         let mut entries=KVec::new();
         let Some((packet,next))=self.pending.first() else {return Ok(entries);};
-        let mixed=policy::mixed_prefix(crate::m3_params::mixed_batch(),
+        let mixed=policy::mixed_prefix(crate::m3::m3_params::mixed_batch(),
             self.device.soc().chip_id,self.render_initialized,self.active.is_empty(),
-            packet.commands[*next..].iter().map(|c|matches!(c,crate::m3_submit::Command::Render{..})));
+            packet.commands[*next..].iter().map(|c|matches!(c,crate::m3::m3_submit::Command::Render{..})));
         if mixed>0 {
             for index in *next..*next+mixed {entries.push((packet.clone(),index),GFP_KERNEL)?;}
             return Ok(entries);
         }
-        let render=matches!(packet.commands[*next],crate::m3_submit::Command::Render{..});
+        let render=matches!(packet.commands[*next],crate::m3::m3_submit::Command::Render{..});
         let limit=if render {
             // The first render draw initializes the shared buffer manager (InitBM) and opens
             // both queues. Publish it alone: appending later draws first advances the shared
             // manager and event counters it starts from, and on J613 the second pass's
             // fragment then fails with firmware error event 4 (draw=2 batch=2).
             let started=self.jobs.iter().any(|job| matches!(job,NativeJob::Render(j) if j.started()));
-            if started {crate::m3_params::render_batch_size().min(max).max(1)} else {1}
+            if started {crate::m3::m3_params::render_batch_size().min(max).max(1)} else {1}
         } else {
-            crate::m3_params::compute_batch_size()
-                .clamp(1,crate::m3_compute_storage::SLOTS)
+            crate::m3::m3_params::compute_batch_size()
+                .clamp(1,crate::m3::m3_compute_storage::SLOTS)
         };
-        let same_engine=|c:&crate::m3_submit::Command| render==matches!(c,crate::m3_submit::Command::Render{..});
+        let same_engine=|c:&crate::m3::m3_submit::Command| render==matches!(c,crate::m3::m3_submit::Command::Render{..});
         let per_pass=self.pass_cost.get(packet.vm.id());
-        let budget=crate::m3_params::render_batch_budget_ns(self.device.soc());
+        let budget=crate::m3::m3_params::render_batch_budget_ns(self.device.soc());
         let in_flight:usize=self.active.iter().map(|b|b.entries.len()).sum();
         for (position,(candidate,start)) in self.pending.iter().enumerate() {
             // Later packets join only render batches, only from their first command, and only
@@ -272,19 +272,19 @@ impl Inner {
     /// Whether the front pending work may be published behind the in-flight batches, and if so
     /// in which pass slot it starts and how many passes it may use.
     fn pipeline_slot(&mut self)->Result<Option<(usize,usize)>> {
-        let Some(last)=self.active.last() else {return Ok(Some((0,crate::m3_pass_layout::SLOTS)));};
+        let Some(last)=self.active.last() else {return Ok(Some((0,crate::m3::m3_pass_layout::SLOTS)));};
         if !self.render_initialized {return Ok(None);}
         let Some((packet,next))=self.pending.first() else {return Ok(None);};
-        if !matches!(packet.commands[*next],crate::m3_submit::Command::Render{..})
+        if !matches!(packet.commands[*next],crate::m3::m3_submit::Command::Render{..})
             || self.active.iter().any(|b| b.kind!=0) || !packet.vm.same(&last.entries[0].0.vm) {return Ok(None);}
         let in_flight:usize=self.active.iter().map(|b|b.entries.len()).sum();
-        let Some(room)=policy::pipeline_room(crate::m3_params::pipeline_depth(self.device.soc()),
+        let Some(room)=policy::pipeline_room(crate::m3::m3_params::pipeline_depth(self.device.soc()),
             self.active.len(),in_flight,last.base,last.entries.len()) else {return Ok(None);};
         // Yield at the next retirement when more urgent work is already waiting.
         if policy::urgent_waiting(self.pending.iter().map(|(p,_)|p.urgency),
             last.entries[0].0.urgency) {return Ok(None);}
         if !policy::within_budget(self.pass_cost.get(packet.vm.id()),
-            crate::m3_params::render_batch_budget_ns(self.device.soc()),in_flight) {return Ok(None);}
+            crate::m3::m3_params::render_batch_budget_ns(self.device.soc()),in_flight) {return Ok(None);}
         if !policy::overlap_ready(self.render_initialized,true,true,true,
             self.config.pipe_free(0)? && self.config.pipe_free(1)?) {return Ok(None);}
         Ok(Some(room))
@@ -325,11 +325,8 @@ impl Inner {
                 }
                 Err((error,published))=>{
                     if published {
-                        if crate::t8122_start::is_t8122(self.device.soc()) && !self.t8122_verdict {
-                            crate::t8122_start::job_setup_failed_verdict(self.drm.as_ref(),error);
-                            self.t8122_verdict=true;
-                        } else if crate::t6031_start::is_t6031(self.device.soc()) && !self.t8122_verdict {
-                            crate::t6031_start::job_setup_failed_verdict(self.drm.as_ref(), error);
+                        if crate::m3::t8122_start::is_t8122(self.device.soc()) && !self.t8122_verdict {
+                            crate::m3::t8122_start::job_setup_failed_verdict(self.drm.as_ref().as_ref(),error);
                             self.t8122_verdict=true;
                         }
                         // A live ring WRITE or doorbell may have been published: keep packets
@@ -355,9 +352,9 @@ impl Inner {
         progress
     }
     /// Prepare and publish one batch. On error, reports whether firmware may see its writes.
-    fn publish(&mut self,entries:&[(Arc<crate::m3_submit::Packet>,usize)],base:usize,overlap:bool)->core::result::Result<Batch,(Error,bool)> {
-        let render=entries.iter().any(|(p,i)|matches!(p.commands[*i],crate::m3_submit::Command::Render{..}));
-        let compute=entries.iter().any(|(p,i)|matches!(p.commands[*i],crate::m3_submit::Command::Compute(_)));
+    fn publish(&mut self,entries:&[(Arc<crate::m3::m3_submit::Packet>,usize)],base:usize,overlap:bool)->core::result::Result<Batch,(Error,bool)> {
+        let render=entries.iter().any(|(p,i)|matches!(p.commands[*i],crate::m3::m3_submit::Command::Render{..}));
+        let compute=entries.iter().any(|(p,i)|matches!(p.commands[*i],crate::m3::m3_submit::Command::Compute(_)));
         if render && compute {return self.publish_mixed(entries,base,overlap);}
         let early=|e:Error|(e,false);
         let (packet,first_index)=(&entries[0].0,entries[0].1);
@@ -378,19 +375,19 @@ impl Inner {
             if !self.packets.iter().any(|q| Arc::ptr_eq(q,p)) {self.packets.push(p.clone(),GFP_KERNEL).map_err(|_|early(ENOMEM))?;}
         }
         let found=self.jobs.iter().position(|job| matches!((job,control),
-            (NativeJob::Compute(_),crate::m3_submit::Command::Compute(_)) |
-            (NativeJob::Render(_),crate::m3_submit::Command::Render{..})));
+            (NativeJob::Compute(_),crate::m3::m3_submit::Command::Compute(_)) |
+            (NativeJob::Render(_),crate::m3::m3_submit::Command::Render{..})));
         let index=found.unwrap_or(self.jobs.len());
         if found.is_none() {
             let job=match control {
-                crate::m3_submit::Command::Compute(c)=>NativeJob::Compute(crate::m3_compute::Compute::new(&self.drm,&self.uat,&packet.vm,self.config.stats_region().map_err(early)?,c,self.device.soc().registers).map_err(early)?),
-                crate::m3_submit::Command::Render{..}=>NativeJob::Render(crate::m3_render::Render::new(&self.drm,&self.uat,&packet.vm,self.config.stats_region().map_err(early)?,self.device.soc().clusters,self.device.soc().registers).map_err(early)?),
+                crate::m3::m3_submit::Command::Compute(c)=>NativeJob::Compute(crate::m3::m3_compute::Compute::new(&self.drm,&self.uat,&packet.vm,self.config.stats_region().map_err(early)?,c,self.device.soc().registers).map_err(early)?),
+                crate::m3::m3_submit::Command::Render{..}=>NativeJob::Render(crate::m3::m3_render::Render::new(&self.drm,&self.uat,&packet.vm,self.config.stats_region().map_err(early)?,self.device.soc().clusters,self.device.soc().registers).map_err(early)?),
             };
             self.jobs.push(job,GFP_KERNEL).map_err(|_|early(ENOMEM))?;
         } else {
             match (&mut self.jobs[index],control) {
-                (NativeJob::Render(_),crate::m3_submit::Command::Render{..})=>{},
-                (NativeJob::Compute(j),crate::m3_submit::Command::Compute(c))=>j.replay(&self.uat,&packet.vm,c).map_err(early)?,
+                (NativeJob::Render(_),crate::m3::m3_submit::Command::Render{..})=>{},
+                (NativeJob::Compute(j),crate::m3::m3_submit::Command::Compute(c))=>j.replay(&self.uat,&packet.vm,c).map_err(early)?,
                 _=>return Err(early(ENOTSUPP)),
             }
         }
@@ -398,11 +395,11 @@ impl Inner {
             let prepared=(||->Result {
                 for (slot,(p,next)) in entries.iter().enumerate() {
                     if slot!=0 {
-                        let crate::m3_submit::Command::Compute(c)=p.commands[*next] else {return Err(EINVAL);};
+                        let crate::m3::m3_submit::Command::Compute(c)=p.commands[*next] else {return Err(EINVAL);};
                         j.append(c)?;
                     }
                     let timestamps=p.timestamp_addresses(*next);
-                    let coalesce=crate::m3_compute_storage::coalesce_stamp_flush(
+                    let coalesce=crate::m3::m3_compute_storage::coalesce_stamp_flush(
                         p.wide_visibility[*next],timestamps,slot+1==batch_count);
                     j.prepare_completion(coalesce)?;
                     j.set_user_timestamps(timestamps)?;
@@ -417,8 +414,8 @@ impl Inner {
             }
         }
         let mut coalesced_stamps=0;
-        let coalesce_render=crate::m3_params::render_stamp_coalesce();
-        let internal_timestamps=crate::m3_params::render_internal_timestamps();
+        let coalesce_render=crate::m3::m3_params::render_stamp_coalesce();
+        let internal_timestamps=crate::m3::m3_params::render_internal_timestamps();
         let chip=self.device.soc().chip_id;
         if let NativeJob::Render(j)=&mut self.jobs[index] {
             let mut commands=KVec::with_capacity(batch_count,GFP_KERNEL).map_err(|_|early(ENOMEM))?;
@@ -426,7 +423,7 @@ impl Inner {
             j.begin_batch(&self.drm,&self.uat,&packet.vm,&commands,base,overlap).map_err(early)?;
             let prepared=(||->Result {
                 for (slot,(p,next)) in entries.iter().enumerate() {
-                    let crate::m3_submit::Command::Render{command,usc}=p.commands[*next] else {return Err(EINVAL);};
+                    let crate::m3::m3_submit::Command::Render{command,usc}=p.commands[*next] else {return Err(EINVAL);};
                     let timestamps=p.render_timestamp_addresses(*next);
                     let coalesce=policy::coalesce_render_stamps(coalesce_render,chip,
                         overlap,slot,batch_count,timestamps);
@@ -448,6 +445,19 @@ impl Inner {
             }
         }
         let preparation_ns=prepare.elapsed().as_nanos();
+        // The batch's kernel objects may have created leaf tables in the host window: link
+        // them into the firmware's shared L2 before it is told about the batch. A failure
+        // means the window no longer matches what the firmware may walk: stop scheduling and
+        // retain the batch, as for a published error.
+        if let Err(error)=self.window.sync_all(&self.uat) {
+            return Err((error,true));
+        }
+        // The command aliases live in the context-0 lower tree, which has no bind slot on the
+        // adopted UAT (7.1.12 gave it the fixed slot 0), so remapping one invalidates nothing:
+        // drop context 0's non-global entries before the firmware fetches the new ones.
+        crate::mem::sync();
+        crate::mem::tlbi_asid(0);
+        crate::mem::sync();
         self.t8122_verdict=false;
         let previous_events=self.config.completed_events;
         let publication_tick=if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {physical_counter()} else {0};
@@ -470,7 +480,7 @@ impl Inner {
         };
         let measure=crate::debug::debug_enabled(crate::debug::DebugFlags::M3SubmitSummary);
         let (base,last_draw)=match &self.jobs[index] {NativeJob::Render(j)=>{let (b,_,d)=j.batch();(b,d)},_=>(0,0)};
-        Ok(Batch { entries:owned, index, kind:usize::from(matches!(control,crate::m3_submit::Command::Compute(_))),
+        Ok(Batch { entries:owned, index, kind:usize::from(matches!(control,crate::m3::m3_submit::Command::Compute(_))),
             first:control, preparation_ns, previous_events, expected_events,
             start:Instant::<Monotonic>::now(), measure, doorbell_counter_ns:if measure {physical_counter() as i64 * 1000 / 24} else {0},
             polling_ns:0, polls:0, stamp_ns:-1, first_event_ns:-1, events_ns:-1, completion_ns:[-1;4],fragment_host_tick:0,fragment_fw_tick:0,fragment_host_pending_tick:0,fragment_fw_pending_tick:0,pipes_idle_tick:0, coalesced_stamps, base, last_draw, publication_tick, mixed:None })
@@ -478,7 +488,7 @@ impl Inner {
     /// Prepare both idle queues from one packet. Cross-engine changes wait on
     /// the preceding command's firmware stamp; all commands remain GPU ordered.
     /// Producer storage and DMA guards survive every partial publication error.
-    fn publish_mixed(&mut self,entries:&[(Arc<crate::m3_submit::Packet>,usize)],
+    fn publish_mixed(&mut self,entries:&[(Arc<crate::m3::m3_submit::Packet>,usize)],
         base:usize,overlap:bool)->core::result::Result<Batch,(Error,bool)> {
         let early=|e:Error|(e,false);
         if overlap || base!=0 || self.device.soc().chip_id!=0x6030
@@ -486,7 +496,7 @@ impl Inner {
         let packet=&entries[0].0;
         if entries.iter().any(|(p,_)|!Arc::ptr_eq(packet,p)) {return Err(early(EINVAL));}
         let prepare=Instant::<Monotonic>::now();
-        let internal_timestamps=crate::m3_params::render_internal_timestamps();
+        let internal_timestamps=crate::m3::m3_params::render_internal_timestamps();
         self.active.reserve(1,GFP_KERNEL).map_err(|_|early(ENOMEM))?;
         self.jobs.reserve(1,GFP_KERNEL).map_err(|_|early(ENOMEM))?;
         self.packets.reserve(1,GFP_KERNEL).map_err(|_|early(ENOMEM))?;
@@ -497,8 +507,8 @@ impl Inner {
         for (p,i) in entries {
             owned.push((p.clone(),*i),GFP_KERNEL).map_err(|_|early(ENOMEM))?;
             match p.commands[*i] {
-                c@crate::m3_submit::Command::Render{..}=>render_commands.push(c,GFP_KERNEL).map_err(|_|early(ENOMEM))?,
-                crate::m3_submit::Command::Compute(c)=>{computes+=1;first_compute.get_or_insert(c);},
+                c@crate::m3::m3_submit::Command::Render{..}=>render_commands.push(c,GFP_KERNEL).map_err(|_|early(ENOMEM))?,
+                crate::m3::m3_submit::Command::Compute(c)=>{computes+=1;first_compute.get_or_insert(c);},
             }
         }
         let renders=render_commands.len();
@@ -514,7 +524,7 @@ impl Inner {
         let prepared=(||->Result<usize> {
             let control=first_compute.ok_or(EINVAL)?;
             if existing.is_none() {
-                let job=crate::m3_compute::Compute::new(&self.drm,&self.uat,&packet.vm,
+                let job=crate::m3::m3_compute::Compute::new(&self.drm,&self.uat,&packet.vm,
                     self.config.stats_region()?,control,self.device.soc().registers)?;
                 self.jobs.push(NativeJob::Compute(job),GFP_KERNEL)?;
             } else {
@@ -528,12 +538,12 @@ impl Inner {
             let NativeJob::Render(j)=&mut self.jobs[index] else {return Err(EINVAL);};
             j.begin_batch(&self.drm,&self.uat,&packet.vm,&render_commands,0,false)?;
             render_prepared=true;
-            let mut previous:Option<(bool,crate::m3_sync_layout::CompletionDependency)>=None;
+            let mut previous:Option<(bool,crate::m3::m3_sync_layout::CompletionDependency)>=None;
             let mut compute_slot=0;
             let mut dependencies=0;
             for (p,i) in entries {
                 match p.commands[*i] {
-                    crate::m3_submit::Command::Render{command,usc}=>{
+                    crate::m3::m3_submit::Command::Render{command,usc}=>{
                         let predecessor=previous.filter(|(render,_)|!*render).map(|(_,d)|d);
                         let NativeJob::Render(j)=&mut self.jobs[index] else {return Err(EINVAL);};
                         let timestamps=p.render_timestamp_addresses(*i);
@@ -543,7 +553,7 @@ impl Inner {
                         dependencies+=usize::from(predecessor.is_some());
                         previous=Some((true,j.completion_dependency()?));
                     },
-                    crate::m3_submit::Command::Compute(c)=>{
+                    crate::m3::m3_submit::Command::Compute(c)=>{
                         let NativeJob::Compute(j)=&mut self.jobs[compute_index] else {return Err(EINVAL);};
                         if compute_slot!=0 {j.append(c)?;}
                         if let Some((true,dependency))=previous {
@@ -628,14 +638,14 @@ impl Inner {
             let mut compute_slot=0;
             for (packet,next) in batch.entries.iter() {
                 match packet.commands[*next] {
-                    crate::m3_submit::Command::Render{command:r,..}=>{
+                    crate::m3::m3_submit::Command::Render{command:r,..}=>{
                         let NativeJob::Render(j)=&mut self.jobs[batch.index] else {return Err(EINVAL);};
                         let s=j.slot_stage_ns(0,mixed.renders,render_slot)?;
                         dev_info!(self.drm.as_ref(),"M3_PASS_SLOT vm={} mixed=1 slot={} batch={} vdm={:#x} width={} height={} samples={} ta_ns={} fragment_ns={} gap_ns={}\n",
                             vm,render_slot,mixed.renders,r.vdm_base,r.width,r.height,r.samples,s[0],s[1],s[2]);
                         render_slot+=1;
                     },
-                    crate::m3_submit::Command::Compute(c)=>{
+                    crate::m3::m3_submit::Command::Compute(c)=>{
                         let NativeJob::Compute(j)=&mut self.jobs[mixed.compute_index] else {return Err(EINVAL);};
                         let ns=j.slot_gpu_ns(compute_slot)?;
                         dev_info!(self.drm.as_ref(),"M3_COMPUTE_SLOT vm={} mixed=1 slot={} batch={} cdm={:#x} end={:#x} usc={:#x} gpu_ns={}\n",
@@ -718,10 +728,10 @@ impl Inner {
                 }
             }
         }
-        let power_enabled=crate::m3_params::active_power();
+        let power_enabled=crate::m3::m3_params::active_power();
         if power_enabled {
             let since_last=self.active_power_last.map(|last|last.elapsed().as_nanos());
-            if crate::m3_active_power::due(power_enabled,self.device.soc().chip_id,
+            if crate::m3::m3_active_power::due(power_enabled,self.device.soc().chip_id,
                                           stamped,self.active_power_samples,since_last) {
                 self.active_power_last=Some(Instant::<Monotonic>::now());
                 self.active_power_samples+=1;
@@ -760,23 +770,20 @@ impl Inner {
             (evented,batch.start.elapsed()>=Delta::from_secs(2),batch.previous_events)
         };
         if stamped && evented {
-            let retire_mmio=crate::m3_params::retire_mmio(self.device.soc());
+            let retire_mmio=crate::m3::m3_params::retire_mmio(self.device.soc());
             match self.device.check_idle_parts(
-                retire_mmio&crate::m3_params::RETIRE_MMIO_BUSY!=0,
-                retire_mmio&crate::m3_params::RETIRE_MMIO_FAULTS!=0) {
+                retire_mmio&crate::m3::m3_params::RETIRE_MMIO_BUSY!=0,
+                retire_mmio&crate::m3::m3_params::RETIRE_MMIO_FAULTS!=0) {
                 Ok(())=>match self.config.pipes_idle() {
                     Ok(true)=>{
                         if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {
                             let tick=physical_counter();
                             if let Some(batch)=self.active.first_mut() {batch.pipes_idle_tick=tick;}
                         }
-                        if retire_mmio&crate::m3_params::RETIRE_MMIO_PSTATE!=0 {
+                        if retire_mmio&crate::m3::m3_params::RETIRE_MMIO_PSTATE!=0 {
                             if let Err(e)=self.config.check_pstate(&self.drm,&self.device,"after a job") {
-                                if crate::t8122_start::is_t8122(self.device.soc()) {
-                                    crate::t8122_start::cap_violated_verdict(self.drm.as_ref(),e);
-                                    self.t8122_verdict=true;
-                                } else if crate::t6031_start::is_t6031(self.device.soc()) {
-                                    crate::t6031_start::cap_violated_verdict(self.drm.as_ref(), e);
+                                if crate::m3::t8122_start::is_t8122(self.device.soc()) {
+                                    crate::m3::t8122_start::cap_violated_verdict(self.drm.as_ref().as_ref(),e);
                                     self.t8122_verdict=true;
                                 }
                                 self.fail_active(e);return Err(e);
@@ -862,8 +869,8 @@ impl Inner {
         if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {
             let observed_tick=physical_counter();
             let (cs,span)=match (&mut self.jobs[index],control) {
-                (NativeJob::Compute(j),crate::m3_submit::Command::Compute(c))=>(c.base,j.batch_gpu_span()?),
-                (NativeJob::Render(j),crate::m3_submit::Command::Render{command:r,..})=>{let (a,b)=j.gpu_ticks(batch.base,batch_count)?;(r.vdm_base,[a,b])},
+                (NativeJob::Compute(j),crate::m3::m3_submit::Command::Compute(c))=>(c.base,j.batch_gpu_span()?),
+                (NativeJob::Render(j),crate::m3::m3_submit::Command::Render{command:r,..})=>{let (a,b)=j.gpu_ticks(batch.base,batch_count)?;(r.vdm_base,[a,b])},
                 _=>return Err(EINVAL),
             };
             let valid=batch.publication_tick!=0 && span[0]>=batch.publication_tick && span[1]>=span[0] && observed_tick>=span[1];
@@ -874,14 +881,14 @@ impl Inner {
                 if kind==0 {gpu_ns} else {0},stages[1]);
             if let NativeJob::Compute(j)=&mut self.jobs[index] {
                 for (slot,(p,next)) in batch.entries.iter().enumerate() {
-                    let crate::m3_submit::Command::Compute(c)=p.commands[*next] else {return Err(EINVAL);};
+                    let crate::m3::m3_submit::Command::Compute(c)=p.commands[*next] else {return Err(EINVAL);};
                     let ns=j.slot_gpu_ns(slot)?;
                     dev_info!(self.drm.as_ref(),"M3_COMPUTE_SLOT vm={} slot={} batch={} cdm={:#x} end={:#x} usc={:#x} gpu_ns={}\n",p.vm.id(),slot,batch_count,c.base,c.end,c.usc_base,ns);
                 }
             }
             if let NativeJob::Render(j)=&mut self.jobs[index] {
                 for (slot,(p,next)) in batch.entries.iter().enumerate() {
-                    let crate::m3_submit::Command::Render{command:r,..}=p.commands[*next] else {return Err(EINVAL);};
+                    let crate::m3::m3_submit::Command::Render{command:r,..}=p.commands[*next] else {return Err(EINVAL);};
                     let s=j.slot_stage_ns(batch.base,batch_count,slot)?;
                     dev_info!(self.drm.as_ref(),"M3_PASS_SLOT vm={} slot={} batch={} vdm={:#x} width={} height={} samples={} ta_ns={} fragment_ns={} gap_ns={}\n",p.vm.id(),slot,batch_count,r.vdm_base,r.width,r.height,r.samples,s[0],s[1],s[2]);
                 }
@@ -893,7 +900,7 @@ impl Inner {
             preparation_ns, active_ns, gpu_ns, stages);
         let retirement_ns=retire_start.map_or(0,|t|t.elapsed().as_nanos());
         if batch.measure {
-            if let crate::m3_submit::Command::Render {command:r,..}=control {
+            if let crate::m3::m3_submit::Command::Render {command:r,..}=control {
                 if batch_count>1 {self.geometry_overflow+=1;} else {
                 if let Some(g)=self.geometry.iter_mut().find(|g|
                     g.count==0 || (g.width==r.width && g.height==r.height && g.samples==r.samples)) {
@@ -917,9 +924,9 @@ impl Inner {
         }
         if crate::debug::debug_enabled(crate::debug::DebugFlags::SubmitTiming) {
             match control {
-                crate::m3_submit::Command::Render {command:r,..}=>
+                crate::m3::m3_submit::Command::Render {command:r,..}=>
                     dev_info!(self.drm.as_ref(),"M3_PASS kind=render batch={} vdm={:#x} width={} height={} samples={} prepare_ns={} active_ns={} gpu_ns={} ta_ns={} fragment_ns={} gap_ns={}\n",batch_count,r.vdm_base,r.width,r.height,r.samples,preparation_ns,active_ns,gpu_ns,stages[0],stages[1],stages[2]),
-                crate::m3_submit::Command::Compute(_)=>
+                crate::m3::m3_submit::Command::Compute(_)=>
                     dev_info!(self.drm.as_ref(),"M3_PASS kind=compute prepare_ns={} active_ns={} gpu_ns={}\n",preparation_ns,active_ns,gpu_ns),
             }
         }
@@ -927,14 +934,12 @@ impl Inner {
         t[0]+=1;t[1]+=preparation_ns;t[2]+=active_ns;t[3]+=gpu_ns as i64;
         for i in 0..3 {t[4+i]+=stages[i] as i64;}
         // Running totals are in debugfs `timing`; the periodic line is a SubmitTiming diagnostic.
-        if t[0]==1 && crate::t8122_start::is_t8122(self.device.soc()) {
+        if t[0]==1 && crate::m3::t8122_start::is_t8122(self.device.soc()) {
             let span=match &mut self.jobs[index] {
                 NativeJob::Compute(j)=>j.batch_gpu_span().ok(),
                 NativeJob::Render(j)=>j.gpu_ticks(batch.base,batch_count).ok().map(|(a,b)|[a,b]),
             };
-            crate::t8122_start::job_completed_verdict(self.drm.as_ref(),kind,gpu_ns,span);
-        } else if t[0]==1 && crate::t6031_start::is_t6031(self.device.soc()) {
-            crate::t6031_start::job_completed_verdict(self.drm.as_ref(), kind, gpu_ns);
+            crate::m3::t8122_start::job_completed_verdict(self.drm.as_ref().as_ref(),kind,gpu_ns,span);
         }
         if t[0]%128==0 && crate::debug::debug_enabled(crate::debug::DebugFlags::SubmitTiming) {
             dev_info!(self.drm.as_ref(),"M3_TIMING kind={} count={} prepare_ns={} active_ns={} gpu_ns={} ta_ns={} fragment_ns={} gap_ns={} ordinal={}\n",kind,t[0],t[1],t[2],t[3],t[4],t[5],t[6],
@@ -971,26 +976,23 @@ impl Inner {
 pub(crate) struct Runtime { inner: ManuallyDrop<KBox<Inner>> }
 impl Runtime {
     #[inline(never)]
-    pub(crate) fn new(pdev: &platform::Device<Core>, device: Device, contents: crate::m3_adt_config::Contents) -> Result<Self> {
+    pub(crate) fn new(pdev: &platform::Device<Core<'_>>, drm: &driver::AsahiDrmDevice, device: Device, contents: crate::m3::m3_adt_config::Contents) -> Result<Self> {
         // On an armed T8122, name a setup failure before the GPU coprocessor is started (RTKit
         // state, mailbox transport, the DRM device). Captured as a Copy bool so the closure does
         // not borrow `device`, which is moved into Inner below.
-        let t8122 = crate::t8122_start::is_t8122(device.soc());
-        let t6031 = crate::t6031_start::is_t6031(device.soc());
+        let t8122 = crate::m3::t8122_start::is_t8122(device.soc());
         let coproc_refused = |e: &Error| {
-            if t8122 { crate::t8122_start::coproc_setup_refused(pdev.as_ref(), *e); }
-            if t6031 { crate::t6031_start::coproc_setup_refused(pdev.as_ref(), *e); }
+            if t8122 { crate::m3::t8122_start::coproc_setup_refused(pdev.as_ref(), *e); }
         };
         device.require_stopped(pdev).inspect_err(coproc_refused)?;
         // Reserve before starting ASC. ENOMEM must not drop firmware owners
         // while the coprocessor may still access them. Writing the completed
         // graph into this allocation is infallible.
         let owner = KBox::<Inner>::new_uninit(GFP_KERNEL)?;
-        let drm: driver::AsahiDevRef = kernel::drm::Device::new(pdev.as_ref(), driver::AsahiData::new(pdev, None, true)).inspect_err(coproc_refused)?;
+        let drm: driver::AsahiDevRef = drm.into();
         let state = m3_rtkit::State::new(pdev, drm.clone(), device.firmware().resources.regions[5]).inspect_err(coproc_refused)?;
         let mut transport = rtkit::RtKit::new(pdev.as_ref(), None, 0, state.clone()).inspect_err(coproc_refused)?;
-        if crate::m3_adt_config::stop_before_asc(pdev.as_ref()) {
-            if t6031 { crate::t6031_start::coproc_setup_refused(pdev.as_ref(), ENODEV); }
+        if crate::m3::m3_adt_config::stop_before_asc(pdev.as_ref()) {
             return Err(ENODEV);
         }
         // Whether the coprocessor runs and offers its endpoints, for the T8122 verdict.
@@ -1004,18 +1006,22 @@ impl Runtime {
                 Pin::new(&mut transport).start_endpoint(ep)?;
             }
             started=true;
-            // The UAT geometry of the admitted SoC (complete: `Soc::require_complete`).
-            // SAFETY: the admitted RTKit (J514S on T6030) is awake; no initdata or GPU
-            // job has been published. Its running PPL handoff owns the peer lock.
-            let uat=unsafe {mmu::Uat::new_m3_running(&drm,device.soc())}?;
+            // The firmware's UAT, adopted as the G15 backend adopts it on 7.2: the handoff and
+            // TTBAT of the admitted reservations, the firmware kernel root (`pagetables`) as
+            // every context's upper half, and the host window (root entry 2) through the
+            // shared L2. The RTKit is awake and no initdata or GPU job has been published.
+            let (uat,mut window)=adopt_uat(&drm,device.soc(),&device.firmware().resources)?;
             let config=Config::new(&drm,&uat,device.firmware(),&contents)?;
-            Ok((uat,config))
+            // Link every kernel table the configuration created before the firmware sees an
+            // address in it, then drop any translation cached before they existed.
+            window.sync_all(&uat)?;
+            crate::mem::sync();crate::mem::tlbi_all();crate::mem::sync();
+            Ok((uat,window,config))
         })();
-        let (uat,config)=match prepared {
+        let (uat,window,config)=match prepared {
             Ok(v)=>v,
             Err(e)=>{
-                crate::t8122_start::prepare_verdict(pdev.as_ref(),device.soc(),started,e);
-                if t6031 { crate::t6031_start::prepare_verdict(pdev.as_ref(), started, e); }
+                crate::m3::t8122_start::prepare_verdict(pdev.as_ref(),device.soc(),started,e);
                 state.health.mark_failed();
                 if device.stop_asc().is_err() {
                     unsafe {kernel::bindings::__module_get(crate::THIS_MODULE.as_ptr())};
@@ -1025,34 +1031,43 @@ impl Runtime {
                 return Err(e);
             }
         };
-        Ok(Self { inner: ManuallyDrop::new(owner.write(Inner { transport, state, config, uat, drm, device,
-            jobs:KVec::new(),packets:KVec::new(),pending:KVec::new(),active:KVec::new(),gpu_pending:false,active_power_last:None,active_power_samples:0,fault_captured:false,timing:[[0;7];2],render_batches:[0;crate::m3_pass_layout::SLOTS],
+        Ok(Self { inner: ManuallyDrop::new(owner.write(Inner { transport, state, config, uat, window, drm, device,
+            jobs:KVec::new(),packets:KVec::new(),pending:KVec::new(),active:KVec::new(),gpu_pending:false,active_power_last:None,active_power_samples:0,fault_captured:false,timing:[[0;7];2],render_batches:[0;crate::m3::m3_pass_layout::SLOTS],
             geometry:[GeometryTiming::default();32],geometry_overflow:0,coalesced_packets:0,coalesced_render_stamps:0,mixed_batches:0,pass_cost:policy::PassCosts::default(),render_initialized:false,t8122_verdict:false,
-            boot_step:crate::t8122_start::BootStep::Publish })) })
+            boot_step:crate::m3::t8122_start::BootStep::Publish })) })
     }
     pub(crate) fn drm(&self) -> driver::AsahiDevRef { self.inner.drm.clone() }
     pub(crate) fn health(&self) -> Arc<m3_rtkit::Health> { self.inner.state.health.clone() }
+    /// The RTKit callbacks' state, which owns the completion worker.
+    pub(crate) fn rtkit_state(&self) -> Arc<m3_rtkit::State> { self.inner.state.clone() }
     pub(crate) fn new_vm(&mut self, id: u64, range: core::ops::Range<u64>) -> Result<mmu::Vm> {
         use crate::util::RangeExt;
         let reserved_range=0x70_0000_0000..0x80_0000_0000;
         if range.overlaps(reserved_range.clone()) {return Err(EINVAL);}
         if self.inner.gpu_pending { self.inner.state.events.record_cpu_preparation(); }
-        let vm=self.inner.uat.new_vm(id, range)?;
+        // Status and job lifetime tracking: deferred unmaps while accepted work runs
+        // (7.1.12's M3 VM job lifetime, the shared `mmu::lifetime` on 7.2).
+        let vm=self.inner.uat.new_vm(id, range)?.with_tracked_status()?;
         let mut reserved=KVec::new();reserved.push(reserved_range,GFP_KERNEL)?;reserved.push(0x100_8000_0000..0x101_0000_0000,GFP_KERNEL)?;reserved.push(0x10_0000_0000..0x10_0800_0000,GFP_KERNEL)?;reserved.push(0x10_7400_0000..0x10_7402_8000,GFP_KERNEL)?;
         vm.install_driver_mappings(KVec::new(),reserved)?;
         Ok(vm)
     }
-    pub(crate) fn map_timestamp(&self,mut bo:crate::gem::ObjectRef,range:core::ops::Range<usize>)->Result<mmu::KernelMapping> {
+    pub(crate) fn map_timestamp(&mut self,mut bo:crate::gem::ObjectRef,range:core::ops::Range<usize>)->Result<mmu::KernelMapping> {
         if self.inner.gpu_pending { self.inner.state.events.record_cpu_preparation(); }
-        bo.map_range_into_range(self.inner.uat.kernel_vm(),range,crate::agx_memory::TIMESTAMP_RANGE,
-            mmu::UAT_PGSZ as u64,mmu::PROT_FW_SHARED_RW,false)
+        let mapping=bo.map_range_into_range(self.inner.uat.kernel_vm(),range,crate::m3::agx_memory::TIMESTAMP_RANGE,
+            mmu::UAT_PGSZ as u64,mmu::PROT_FW_SHARED_RW,false)?;
+        // A job of an overlapping batch can reach the firmware without a new publication:
+        // link a new leaf table now, not only at the next batch.
+        let inner: &mut Inner=&mut self.inner;
+        inner.window.sync_all(&inner.uat)?;
+        Ok(mapping)
     }
     /// Queue a packet and return its fence at once. The scheduler can hand over further
     /// ready jobs up to its credit limit while the GPU runs. Only the completion worker
     /// publishes: it coalesces render commands of one VM and urgency, and may keep bounded
     /// same-VM batches in flight after InitBM retirement. VM/engine changes wait for full
     /// retirement. A burst can therefore share a firmware round trip across packets.
-    pub(crate) fn submit(shared:&crate::m3_drm::Shared,packet:Arc<crate::m3_submit::Packet>)->Result {
+    pub(crate) fn submit(shared:&crate::m3::m3_drm::Shared,packet:Arc<crate::m3::m3_submit::Packet>)->Result {
         crate::debug::update_debug_flags();
         let mut guard=shared.lock();
         let inner=&mut *Option::as_mut(&mut *guard).ok_or(ENODEV)?.inner;
@@ -1069,14 +1084,14 @@ impl Runtime {
         if inner.pending.len()>=policy::MAX_PACKETS {return Err(EBUSY);}
         inner.pending.reserve(1,GFP_KERNEL)?;
         inner.pending.insert_within_capacity(at,(packet,0)).map_err(|_|ENOMEM)?;
-        let drm=inner.drm.clone();
+        let state=inner.state.clone();
         drop(guard);
-        crate::m3_completion::queue(&drm);
+        crate::m3::m3_completion::queue(&state);
         Ok(())
     }
     /// Withdraw a packet's unpublished remainder on cancellation or timeout. Its active
     /// commands remain owned until retirement; error signaling cannot release a DMA guard.
-    pub(crate) fn withdraw(shared:&crate::m3_drm::Shared,packet:&Arc<crate::m3_submit::Packet>)->bool {
+    pub(crate) fn withdraw(shared:&crate::m3::m3_drm::Shared,packet:&Arc<crate::m3::m3_submit::Packet>)->bool {
         let mut guard=shared.lock();
         let Some(runtime)=Option::as_mut(&mut *guard) else {return false;};
         let inner: &mut Inner=&mut runtime.inner;
@@ -1120,18 +1135,17 @@ impl Runtime {
             Err(_)=>{inner.fail_pending(EIO);Service::Idle},
         }
     }
-    pub(crate) fn boot(&mut self, pdev: &platform::Device<Core>) -> Result {
-        let is_t8122 = crate::t8122_start::is_t8122(self.inner.device.soc());
-        let is_t6031 = crate::t6031_start::is_t6031(self.inner.device.soc());
-        self.inner.boot_step = crate::t8122_start::BootStep::Publish;
+    pub(crate) fn boot(&mut self, pdev: &platform::Device<Core<'_>>) -> Result {
+        let is_t8122 = crate::m3::t8122_start::is_t8122(self.inner.device.soc());
+        self.inner.boot_step = crate::m3::t8122_start::BootStep::Publish;
         let result = self.boot_inner(pdev);
         if let Err(error) = result {
             // On T8122, log the firmware readiness words on every boot failure, so the verdict's
             // "see M3 firmware readiness" always has a line to point at. The ready-wait timeout in
             // boot_inner already logs them (on every SoC, as in 12.0), so skip that case here.
-            let logged = self.inner.boot_step == crate::t8122_start::BootStep::AwaitReady
+            let logged = self.inner.boot_step == crate::m3::t8122_start::BootStep::AwaitReady
                 && error == ETIMEDOUT;
-            if (is_t8122 || is_t6031) && !logged {
+            if is_t8122 && !logged {
                 let inner: &mut Inner = &mut *self.inner;
                 let _ = inner.config.log_ready(&inner.drm);
             }
@@ -1139,18 +1153,13 @@ impl Runtime {
         }
         if is_t8122 {
             let accepted = result.is_ok() || self.inner.config.ready().unwrap_or(false);
-            crate::t8122_start::boot_verdict(pdev.as_ref(), self.inner.device.firmware().initdata_magic,
-                self.inner.boot_step, accepted, self.inner.state.health.crashed(), result);
-        }
-        if is_t6031 {
-            let accepted = result.is_ok() || self.inner.config.ready().unwrap_or(false);
-            crate::t6031_start::boot_verdict(pdev.as_ref(), self.inner.device.firmware().initdata_magic,
+            crate::m3::t8122_start::boot_verdict(pdev.as_ref(), self.inner.device.firmware().initdata_magic,
                 self.inner.boot_step, accepted, self.inner.state.health.crashed(), result);
         }
         result
     }
-    fn boot_inner(&mut self, pdev: &platform::Device<Core>) -> Result {
-        use crate::t8122_start::BootStep;
+    fn boot_inner(&mut self, pdev: &platform::Device<Core<'_>>) -> Result {
+        use crate::m3::t8122_start::BootStep;
         let root = self.inner.config.root();
         dev_info!(pdev.as_ref(), "M3: publishing owned initdata {:#x}\n", root);
         self.inner.boot_step = BootStep::Publish;
@@ -1174,7 +1183,7 @@ impl Runtime {
         inner.config.drain(&inner.drm)?;
         inner.config.log_ready(&inner.drm)?;
         if inner.device.soc().chip_id==0x6030 &&
-            (crate::m3_params::active_power() || crate::m3_params::globals_debug_off()) {
+            (crate::m3::m3_params::active_power() || crate::m3::m3_params::globals_debug_off()) {
             inner.config.log_globals_debug(&inner.drm)?;
         }
         inner.config.check_pstate(&inner.drm, &inner.device, "after boot")?;
@@ -1243,4 +1252,23 @@ pub(crate) fn physical_counter() -> u64 {
     let frequency = frequency & 0xffff_ffff;
     if frequency == 0 { return 0; }
     (tick / frequency) * 24_000_000 + (tick % frequency) * 24_000_000 / frequency
+}
+
+/// Adopts the running firmware's UAT on `soc`: the `mmu::Uat` of the admitted reserved regions
+/// (ttbs, pagetables, handoff, shared-l2) and the PPL exchange with its startup epoch, as the
+/// G15 backend does it on 7.2 (`g15::uat`).
+fn adopt_uat(drm: &driver::AsahiDrmDevice, soc: &'static crate::m3::m3_soc::Soc,
+    resources: &crate::m3::agx_resources::Resources) -> Result<(mmu::Uat, crate::g15::uat::Window)> {
+    let cfg = soc.hwcfg.ok_or(ENODEV)?;
+    let [ttbs, tables, handoff, shared_l2, ..] = resources.regions;
+    let range = |r: crate::m3::agx_resources::Region| r.base..r.base + r.size;
+    let geometry = mmu::UatGeometry { ias: cfg.uat_ias.into(), oas: cfg.uat_oas };
+    let regions = mmu::AdoptedRegions { handoff: range(handoff), ttbs: range(ttbs), kernel_root: tables.base };
+    let uat = mmu::Uat::new_adopted(drm, geometry, &regions)?;
+    let mut window = crate::g15::uat::Window::from_regions(handoff.base, ttbs.base, tables.base, shared_l2.base)?;
+    window.bootstrap(drm.as_ref().as_ref(), &uat)?;
+    // 7.1.12 cleaned every reserved-table write to the point of coherency; these regions may be
+    // reserved System RAM mapped cacheable.
+    window.clean_tables();
+    Ok((uat, window))
 }

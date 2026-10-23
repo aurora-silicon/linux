@@ -47,7 +47,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use kernel::{
-    bindings, c_str, device,
+    c_str, device,
     error::to_result,
     new_spinlock,
     prelude::*,
@@ -58,9 +58,9 @@ use kernel::{
 };
 
 use crate::{
-    m3_adt_config::PstatePolicy,
-    m3_params::{self, ThermalMode},
-    m3_thermal_policy::{Change, Policy, Reading, Source, Why, S},
+    m3::m3_adt_config::PstatePolicy,
+    m3::m3_params::{self, ThermalMode},
+    m3::m3_thermal_policy::{Change, Policy, Reading, Source, Why, S},
 };
 
 /// The thermal zones read, each the hottest of a set of SoC die sensors: the SMC's die sensors
@@ -78,7 +78,7 @@ fn required_zones() -> u32 {
     let Ok(compatible) = root.get_property::<KVec<u8>>(c_str!("compatible")) else {
         return J516_REQUIRED_ZONES;
     };
-    crate::m3_thermal_policy::required_zones(&compatible)
+    crate::m3::m3_thermal_policy::required_zones(&compatible)
 }
 
 /// Sensor polling period while the GPU is busy and while it is idle, in ms.
@@ -122,13 +122,18 @@ impl_has_delayed_work! {
     impl HasDelayedWork<Self> for Sensor { self.work }
 }
 
+extern "C" {
+    // include/linux/thermal.h; not in 7.2's generated bindings.
+    fn thermal_zone_get_temp_by_name(name: *const core::ffi::c_char, temp: *mut i32) -> core::ffi::c_int;
+}
+
 /// One reading of the zone `name`, in millidegrees Celsius; ENODEV if there is no such zone.
 fn read_zone(name: &CStr) -> Result<i32> {
     let mut temp: i32 = 0;
     // SAFETY: name is NUL-terminated and temp is a valid output pointer. The
     // thermal core acquires a device reference under its registry lock and
     // keeps it through sampling, so zone unregistration cannot free it here.
-    to_result(unsafe { bindings::thermal_zone_get_temp_by_name(name.as_char_ptr(), &mut temp) })?;
+    to_result(unsafe { thermal_zone_get_temp_by_name(name.as_char_ptr(), &mut temp) })?;
     Ok(temp)
 }
 

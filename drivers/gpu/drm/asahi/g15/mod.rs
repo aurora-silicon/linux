@@ -68,10 +68,10 @@ mod pools;
 mod power;
 mod queue;
 mod recovery;
-mod regs;
+pub(crate) mod regs;
 mod slots;
 mod timestamp;
-mod uat;
+pub(crate) mod uat;
 mod vm;
 mod wire;
 

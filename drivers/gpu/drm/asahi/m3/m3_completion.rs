@@ -3,7 +3,7 @@
 //! Completion work owned only by the M3 runtime.
 
 use kernel::{prelude::*, sync::Arc, workqueue::{self, impl_has_work, new_work, Work, WorkItem}};
-use crate::{driver, m3_drm::Shared};
+use crate::m3::{m3_drm::Shared, m3_rtkit::State};
 
 #[pin_data]
 pub(crate) struct Completion {
@@ -23,7 +23,7 @@ impl_has_work! { impl HasWork<Completion> for Completion { self.work } }
 impl WorkItem for Completion {
     type Pointer = Arc<Self>;
     fn run(owner: Arc<Self>) {
-        use crate::m3_runtime::Service;
+        use crate::m3::m3_runtime::Service;
         // Snapshots after a notification before sleeping for the next one: the completion
         // stamps can trail the firmware's event message.
         const TRAILING_POLLS: u32 = 4;
@@ -59,8 +59,8 @@ impl WorkItem for Completion {
         }
     }
 }
-pub(crate) fn queue(dev: &driver::AsahiDevice) {
-    if let Some(work) = dev.completion.as_ref() {
+pub(crate) fn queue(state: &State) {
+    if let Some(work) = state.completion.as_ref() {
         let _ = workqueue::system_highpri().enqueue(work.clone());
     }
 }

@@ -5,21 +5,18 @@
 //! This module contains the definitions used to store per-GPU and per-SoC configuration data.
 
 use crate::fw::types::*;
-pub(crate) use crate::identity::{GpuGen, GpuHalGeneration, GpuVariant};
+pub(crate) use crate::m3::identity::{GpuGen, GpuHalGeneration, GpuVariant};
 use kernel::c_str;
 use kernel::prelude::*;
 
 const MAX_POWERZONES: usize = 5;
 
+/// G15 SRAM rail floor for a device tree without `apple,min-sram-microvolt`, in microvolts: the
+/// J516S runtime ADT perf-states-sram table floors SRAM at 810 mV (7.1.12 `hw::t6030`).
+const G15_MIN_SRAM_MICROVOLT: u32 = 810_000;
+
 pub(crate) mod agx3;
-pub(crate) mod t600x;
-pub(crate) mod t602x;
-pub(crate) mod t6030;
-pub(crate) mod t6031;
-pub(crate) mod t8103;
-pub(crate) mod t8112;
 pub(crate) mod t8122;
-pub(crate) mod t8140;
 
 /// GPU revision enumeration. Note: Part of the UABI.
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -559,6 +556,9 @@ impl PwrConfig {
             return Err(EINVAL);
         }
 
+        // Kept as on the 7.1.12 kernel this runtime was qualified with: it steps by 3 over the
+        // zone count, which reads the same zones as one zone per triple for up to one zone and
+        // fewer beyond. (7.2's shared copy reads one zone per triple.)
         let pz_count = pz_data.len() / 3;
         let mut power_zones = KVec::new();
         for i in (0..pz_count).step_by(3) {
@@ -610,7 +610,7 @@ impl PwrConfig {
             min_sram_microvolt: if cfg.gpu_gen == GpuGen::G15 {
                 // SRAM rail floor: 810 mV from the J516S runtime ADT perf-states-sram table.
                 // Tolerate a DT without the property on G15 only.
-                prop!("apple,min-sram-microvolt", t6030::MIN_SRAM_MICROVOLT)
+                prop!("apple,min-sram-microvolt", G15_MIN_SRAM_MICROVOLT)
             } else {
                 prop!("apple,min-sram-microvolt")
             },

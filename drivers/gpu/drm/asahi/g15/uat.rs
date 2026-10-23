@@ -200,14 +200,39 @@ pub(crate) struct Window {
 impl Window {
     /// Maps the UAT handoff regions ([`Mapping::region`]).
     pub(crate) fn new(adt: &super::adt::GpuAdt) -> Result<Self> {
+        Self::from_regions(adt.handoff.start, adt.ttbs.start, adt.tables.start, adt.shared_l2.start)
+    }
+
+    /// Maps the UAT handoff regions at the given physical addresses: the handoff page, the
+    /// TTBAT, the firmware kernel root and the shared L2 page. The M3 T8122 runtime takes them
+    /// from its admitted reserved-memory regions.
+    pub(crate) fn from_regions(handoff: u64, ttbs: u64, root: u64, shared_l2: u64) -> Result<Self> {
         Ok(Self {
-            handoff: Mapping::region(adt.handoff.start, hw::HANDOFF_SIZE as usize)?,
-            ttbs: Mapping::region(adt.ttbs.start, hw::TTBS_SIZE as usize)?,
-            root: Mapping::region(adt.tables.start, hw::PAGE as usize)?,
-            shared_l2: Mapping::region(adt.shared_l2.start, hw::SHARED_L2_SIZE as usize)?,
+            handoff: Mapping::region(handoff, hw::HANDOFF_SIZE as usize)?,
+            ttbs: Mapping::region(ttbs, hw::TTBS_SIZE as usize)?,
+            root: Mapping::region(root, hw::PAGE as usize)?,
+            shared_l2: Mapping::region(shared_l2, hw::SHARED_L2_SIZE as usize)?,
             image: KVec::from_elem(0u64, ENTRIES, GFP_KERNEL)?,
             snapshot: KVec::from_elem(0u64, ENTRIES, GFP_KERNEL)?,
         })
+    }
+
+    /// [`Self::sync_range`] over the whole host window, then [`Self::clean_tables`].
+    pub(crate) fn sync_all(&mut self, uat: &mmu::Uat) -> Result {
+        self.sync_inner(uat, None)?;
+        self.clean_tables();
+        Ok(())
+    }
+
+    /// Cleans the firmware-walked pages this window writes (the kernel root, the shared L2,
+    /// the TTBAT and the handoff page) to the point of coherency. Only a region that is
+    /// reserved System RAM, mapped cacheable, has anything to clean: the UAT walker does not
+    /// snoop the CPU caches. The M3 T8122 runtime calls it after [`Self::bootstrap`].
+    pub(crate) fn clean_tables(&self) {
+        for map in [&self.root, &self.shared_l2, &self.ttbs, &self.handoff] {
+            map.clean_poc();
+        }
+        mb();
     }
 
     /// Cold-start check: all 128 TTBAT words are zero.

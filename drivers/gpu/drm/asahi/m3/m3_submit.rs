@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! Bounded M3 compute and graphics submissions through the common DRM scheduler/syncobjs.
 use kernel::{c_str,dma_fence::*,drm::sched,prelude::*,sync::{Arc,Mutex},new_mutex,xarray};
-use crate::{file,agx_uapi,mmu,queue,m3_drm::Shared};
+use crate::{file,m3::agx_uapi,mmu,queue,m3::m3_drm::Shared};
 use core::sync::atomic::{AtomicBool, Ordering};
 #[derive(Default)]
 pub(crate) struct Completion;
@@ -32,14 +32,14 @@ impl Destination {
 
 #[derive(Copy,Clone)]
 pub(crate) enum Command {
-    Compute(crate::agx_compute::Control),
+    Compute(crate::m3::agx_compute::Control),
     Render{command:agx_uapi::UapiRenderCommand,usc:u64},
 }
 pub(crate) struct Packet {
     pub(crate) vm:mmu::Vm,
     pub(crate) commands:KVec<Command>,
     timestamps:KVec<[Option<Destination>;4]>,
-    pub(crate) attachments:KVec<crate::agx_attachments::Attachments>,
+    pub(crate) attachments:KVec<crate::m3::agx_attachments::Attachments>,
     pub(crate) wide_visibility:KVec<bool>,
     completion:UserFence<Completion>,
     finish_claimed: AtomicBool,
@@ -47,7 +47,7 @@ pub(crate) struct Packet {
     pub(crate) urgency:u8,
     /// Who submitted the packet, for the failure log only.
     pub(crate) owner:Owner,
-    vm_job:Pin<KBox<Mutex<Option<mmu::M3VmJobGuard>>>>,
+    vm_job:Pin<KBox<Mutex<Option<mmu::VmJobGuard>>>>,
 }
 /// The process and thread that submitted a packet, recorded in the submit ioctl. Only logged:
 /// a renamed task leaves a stale name, which is harmless.
@@ -57,8 +57,8 @@ impl Owner {
     fn current()->Self {
         let task=kernel::current!();
         let leader=task.group_leader();
-        Self {pid:leader.pid(),process:crate::m3_client::task_comm(leader),
-            thread:crate::m3_client::task_comm(task)}
+        Self {pid:leader.pid(),process:crate::m3::m3_client::task_comm(leader),
+            thread:crate::m3::m3_client::task_comm(task)}
     }
     fn name(comm:&[u8;16])->&str {
         let len=comm.iter().position(|&b|b==0).unwrap_or(comm.len());
@@ -84,18 +84,18 @@ impl Packet {
         // Claim error/signal ownership once; this flag is NOT proof that the
         // fence is signaled or that hardware DMA has stopped.
         if self.finish_claimed.swap(true, Ordering::Relaxed) { return; }
-        if let Err(e)=result {if let Ok(status) = self.vm.agx_status() { status.record(e.to_errno()); }self.completion.set_error(e);}
+        if let Err(e)=result {if let Some(status) = self.vm.status() { status.record(e); }self.completion.set_error(e);}
         // A scheduler job/fence and the runtime's last packet can outlive
         // hardware retirement. They must not keep the VM's active-job count
         // nonzero: GEM closes otherwise accumulate across completed frames.
         // On failure the runtime quarantines this guard with the packet until
         // firmware has provably stopped; signalling an error is not retirement.
-        crate::agx_memory::publish();
+        crate::m3::agx_memory::publish();
         let profile=crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming);
-        let before=if profile {crate::m3_runtime::physical_counter()} else {0};
+        let before=if profile {crate::m3::m3_runtime::physical_counter()} else {0};
         self.completion.signal();
         if profile {
-            let after=crate::m3_runtime::physical_counter();
+            let after=crate::m3::m3_runtime::physical_counter();
             let status=match result {Ok(())=>0,Err(e)=>e.to_errno()};
             pr_info!("M3_PACKET_FENCE vm={} packet={:#x} commands={} signal_before_tick={} signal_after_tick={} status={} counter_hz=24000000\n",
                 self.vm.id(),self.profile_id(),self.commands.len(),before,after,status);
@@ -113,7 +113,7 @@ impl sched::JobImpl for Job {
     fn run(job:&mut Self)->Result<Option<Fence>> {
         // Queue the packet and return its fence; the completion worker publishes and retires
         // it, so the scheduler can hand over further ready jobs meanwhile.
-        if let Err(e)=crate::m3_runtime::Runtime::submit(&job.shared,job.packet.clone()) {
+        if let Err(e)=crate::m3::m3_runtime::Runtime::submit(&job.shared,job.packet.clone()) {
             pr_err!("M3 scheduler: submission failed {:?}\n",e);
             // submit() failed before this packet could be published.
             job.packet.release_guard();job.packet.finish(Err(e));
@@ -122,9 +122,9 @@ impl sched::JobImpl for Job {
     }
     fn timed_out(job:&mut JobTimeout,_finished:bool)->sched::Status {
         // Retain the publishing branch's explicit diagnostic override.
-        if !crate::m3_params::timeout_nohang() {
+        if !crate::m3::m3_params::timeout_nohang() {
             if let Some(r)=Option::as_mut(&mut *job.shared.lock()) {r.health().mark_failed();}
-            crate::m3_runtime::Runtime::withdraw(&job.shared,&job.packet);
+            crate::m3::m3_runtime::Runtime::withdraw(&job.shared,&job.packet);
             job.packet.finish(Err(ETIMEDOUT));return sched::Status::NoDevice;
         }
         let guard=job.shared.lock();
@@ -138,12 +138,12 @@ impl sched::JobImpl for Job {
         // device loss or corrupting an already signaled fence.
         if runtime.health().healthy() { return sched::Status::NoHang; }
         drop(guard);
-        crate::m3_runtime::Runtime::withdraw(&job.shared,&job.packet);
+        crate::m3::m3_runtime::Runtime::withdraw(&job.shared,&job.packet);
         job.packet.finish(Err(EIO));
         sched::Status::NoDevice
     }
     fn cancel(job:&mut Self) {
-        crate::m3_runtime::Runtime::withdraw(&job.shared,&job.packet);
+        crate::m3::m3_runtime::Runtime::withdraw(&job.shared,&job.packet);
         job.packet.finish(Err(ECANCELED));
     }
 }
@@ -178,9 +178,9 @@ impl Queue {
     }
 }
 impl queue::Queue for Queue {
-    fn submit(&mut self,_id:u64,mut syncs:KVec<file::SyncItem>,in_sync_count:usize,
+    fn submit(&mut self,_reg_data:&crate::driver::AsahiRegData<'_>,_id:u64,mut syncs:KVec<file::SyncItem>,in_sync_count:usize,
         raw:&[u8],objects:Pin<&xarray::XArray<KBox<file::Object>>>)->Result {
-        let vm_job=self.vm.retain_m3_job()?;
+        let vm_job=self.vm.retain_job()?;
         let mut parser=agx_uapi::UapiCommandParser::new(raw);let mut commands=KVec::new();let mut timestamps=KVec::new();let mut flushes=KVec::new();let mut visibility=KVec::new();
         while let Some(command)=parser.next_hardware().map_err(|_|EINVAL)? {
             if let agx_uapi::ParsedHardwareCommand::Render{payload,vertex_attachments,fragment_attachments,..}=command {
@@ -195,7 +195,7 @@ impl queue::Queue for Queue {
                     Destination::resolve(objects,payload.vertex_timestamps.end)?,
                     Destination::resolve(objects,payload.fragment_timestamps.start)?,
                     Destination::resolve(objects,payload.fragment_timestamps.end)?],GFP_KERNEL)?;
-                flushes.push(crate::agx_attachments::Attachments::EMPTY,GFP_KERNEL)?;
+                flushes.push(crate::m3::agx_attachments::Attachments::EMPTY,GFP_KERNEL)?;
                 visibility.push(false,GFP_KERNEL)?;
                 continue;
             }
@@ -217,10 +217,10 @@ impl queue::Queue for Queue {
                     pr_err!("M3 compute translation rejected {:?}: stream={:#x}..{:#x} helper={:?}\n",e,payload.control_stream_base,payload.control_stream_end,payload.helper);
                     EINVAL
                 })?;
-            crate::m3_client::check_compute_launches(&self.vm,&AddressSpace(&self.vm),c.control_stream_base,c.control_stream_end)?;
+            crate::m3::m3_client::check_compute_launches(&self.vm,&AddressSpace(&self.vm),c.control_stream_base,c.control_stream_end)?;
             timestamps.push([Destination::resolve(objects,payload.timestamps.start)?,
                 Destination::resolve(objects,payload.timestamps.end)?,None,None],GFP_KERNEL)?;
-            commands.push(Command::Compute(crate::agx_compute::Control{base:c.control_stream_base,end:c.control_stream_end,usc_base:self.usc}),GFP_KERNEL)?;
+            commands.push(Command::Compute(crate::m3::agx_compute::Control{base:c.control_stream_base,end:c.control_stream_end,usc_base:self.usc}),GFP_KERNEL)?;
         }
         parser.finish().map_err(|_|EINVAL)?;
         let packet=Arc::new(Packet{vm:self.vm.clone(),commands,timestamps,attachments:flushes,wide_visibility:visibility,
@@ -238,8 +238,8 @@ impl queue::Queue for Queue {
 }
 
 fn encode_attachments(vm: &mmu::Vm, list: &agx_uapi::UapiAttachmentList)
-    -> Result<crate::agx_attachments::Attachments> {
-    use crate::agx_attachments::{Attachments, CAPACITY};
+    -> Result<crate::m3::agx_attachments::Attachments> {
+    use crate::m3::agx_attachments::{Attachments, CAPACITY};
     use agx_uapi::{GpuAddressSpace, GpuAccess};
     if list.as_slice().len()>CAPACITY {return Err(E2BIG);}
     let mut ranges = [(0, 0); CAPACITY];
@@ -262,7 +262,7 @@ fn validate_render(r: agx_uapi::UapiRenderCommand, usc: u64, space: &AddressSpac
     if r.sample_size % 8 != 0 {return Err(ENOTSUPP);}
     let empty = agx_uapi::UapiHelperProgram { binary:0, config:0, data:0 };
     // Early tiling (render flag bit 5) only where it is advertised.
-    let stage_scope=if early_tiling && *crate::module_parameters::m3_early_tiling.value()!=0 {1<<5} else {0};
+    let stage_scope=if early_tiling && crate::m3::m3_params::early_tiling() {1<<5} else {0};
     if r.flags & !(2|16|(1<<18)|stage_scope) != 0 || !matches!(r.samples, 1 | 2 | 4)
         || r.sampler_count != 0 || r.sampler_heap != 0
         || r.vertex_helper != empty || r.fragment_helper != empty
@@ -279,7 +279,7 @@ fn validate_render(r: agx_uapi::UapiRenderCommand, usc: u64, space: &AddressSpac
         || u32::from(r.sample_size)*u32::from(r.utile_width)*u32::from(r.utile_height)*u32::from(r.samples)>32768 {
         return Err(EINVAL);
     }
-    crate::agx_render_state::compact(r.vdm_base).map_err(|_| EINVAL)?;
+    crate::m3::agx_render_state::compact(r.vdm_base).map_err(|_| EINVAL)?;
     if r.vdm_base & 3 != 0 || !space.covers(r.vdm_base,4,GpuAccess::Read)
         || r.scissor_base == 0 || r.scissor_base & 7 != 0 || !space.covers(r.scissor_base,8,GpuAccess::Read) {
         return Err(EINVAL);

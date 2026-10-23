@@ -13,7 +13,6 @@
 
 use core::sync::atomic::{
     AtomicU32,
-    AtomicU64,
     Ordering, //
 };
 
@@ -23,8 +22,7 @@ use kernel::{
 };
 
 use crate::{
-    driver::AsahiDevice,
-    agx_uapi::{
+    m3::agx_uapi::{
         GpuAccess,
         GpuAddressSpace, //
     },
@@ -38,28 +36,14 @@ const AGX3_PARAMS_SIZE: u64 = core::mem::size_of::<uapi::drm_asahi_params_global
 const REFUSALS_LOGGED: u32 = 16;
 static REFUSALS: AtomicU32 = AtomicU32::new(0);
 
-/// Per-file admission state.
-pub(crate) struct ClientGate {
-    /// Largest size this file has asked GET_PARAMS for the global parameters with.
-    params_size: AtomicU64,
-}
-
-impl ClientGate {
-    pub(crate) const fn new() -> Self {
-        Self {
-            params_size: AtomicU64::new(0),
-        }
-    }
-
-    /// Record a successful GET_PARAMS for the global parameters.
-    pub(crate) fn note_params(&self, size: u64) {
-        self.params_size.fetch_max(size, Ordering::Relaxed);
-    }
-
-    /// Whether this file may create a VM. Only G15 devices are gated.
-    pub(crate) fn admit_vm(&self, device: &AsahiDevice, flags: u32) -> Result {
-        let size = self.params_size.load(Ordering::Relaxed);
-        if crate::g16_profile::client_admitted(device.gpu()?.params()?.gpu_hal_generation, flags, size >= AGX3_PARAMS_SIZE) {
+/// Whether a file may create a VM on the M3 runtime: it must have asked GET_PARAMS for the
+/// whole global parameter structure (so it knows this GPU runs AGX3 command streams), and pass
+/// VM_CREATE flags 0 (legacy HAL). `size` is the largest GET_PARAMS size the file asked for.
+pub(crate) fn admit_vm(device: &kernel::device::Device, size: u64, flags: u32) -> Result {
+    {
+        // The positive acknowledgement of the command ABI (7.1.12 `g16_profile::client_admitted`):
+        // GET_PARAMS coverage, and VM_CREATE flags 0 on the legacy-HAL M3 runtime.
+        if size >= AGX3_PARAMS_SIZE && flags == 0 {
             return Ok(());
         }
         let refusals = REFUSALS.fetch_add(1, Ordering::Relaxed).saturating_add(1);
@@ -74,7 +58,7 @@ impl ClientGate {
                 ""
             };
             dev_info!(
-                device.as_ref(),
+                device,
                 "M3: refusing a VM for {}[{}]: it asked GET_PARAMS for {} of the {} parameter bytes, so it cannot know this GPU runs AGX3 command streams; M3-aware userspace is needed{}\n",
                 name,
                 task.group_leader().pid(),
@@ -200,7 +184,9 @@ pub(crate) fn check_compute_launches<A: GpuAddressSpace>(
 /// `Vm::read_mapped_bytes` holds the VM execution lock from translation until the copy, so the
 /// pages cannot be unmapped and freed while they are cleaned and read.
 fn read_through_cache(vm: &mmu::Vm, iova: u64, out: &mut [u8]) -> Result {
-    vm.read_mapped_bytes(iova, out, |src, len| clean_invalidate(src as usize, len))
+    // 7.2's `Vm::read_user` cleans and invalidates each line to the point of coherency before
+    // the copy, under the VM execution lock.
+    vm.read_user(iova, out)
 }
 
 /// Clean and invalidate the data cache lines covering `start..start + len` to the point of

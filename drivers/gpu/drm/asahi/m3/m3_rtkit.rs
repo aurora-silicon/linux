@@ -3,18 +3,17 @@
 //! RTKit callbacks for the identified J514S firmware. The firmware advertises
 //! its crash storage by physical address inside the reserved data segment.
 
-use crate::agx_resources::Region;
+use crate::m3::agx_resources::Region;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel::{
     c_str, impl_has_hr_timer,
     device::Core,
     sync::Completion,
-    io::mem::{Mem, MemFlag},
-    iosys_map::IoSysMapRef,
+    io::{mem::{Mem, MemFlag}, IoSysMap, Region as IoRegion, SysMem},
     platform,
     prelude::*,
     soc::apple::rtkit,
-    sync::{aref::ARef, Arc, ArcBorrow},
+    sync::{aref::ARef, Arc, ArcBorrow, SetOnce},
     time::{Delta, Monotonic, hrtimer::{HrTimer, HrTimerCallback,
         HrTimerCallbackContext, HrTimerPointer, HrTimerRestart, RelativeMode}},
 };
@@ -40,7 +39,7 @@ impl EventWait {
             pin_init!(EventWait {
                 count: AtomicU64::new(0),
                 wait_us: AtomicU64::new(100),
-                overlap_cpu: AtomicBool::new(crate::m3_params::unlocked_wait()),
+                overlap_cpu: AtomicBool::new(crate::m3::m3_params::unlocked_wait()),
                 cpu_preparations: AtomicU64::new(0),
                 sleeps: AtomicU64::new(0),
                 timer_wakes: AtomicU64::new(0),
@@ -139,6 +138,9 @@ pub(crate) struct State {
     /// The firmware sends one after a command's completion processing.
     pub(crate) event_messages: AtomicU64,
     pub(crate) events: Arc<EventWait>,
+    /// The completion worker, published once the runtime it services exists. The DRM device
+    /// carries no driver data for it on 7.2, so the runtime's own state owns it.
+    pub(crate) completion: SetOnce<Arc<crate::m3::m3_completion::Completion>>,
 }
 
 /// Shared status contains no device references, so DRM files may retain it
@@ -147,8 +149,8 @@ pub(crate) struct Health {
     crashed: AtomicBool,
     mapped: AtomicBool,
     failed: AtomicBool,
-    progress: crate::agx_host_progress::Progress,
-    pub(crate) timing: crate::agx_timing_stats::Stats,
+    progress: crate::m3::agx_host_progress::Progress,
+    pub(crate) timing: crate::m3::agx_timing_stats::Stats,
 }
 
 impl Health {
@@ -181,7 +183,7 @@ impl Health {
 }
 
 impl State {
-    pub(crate) fn new(dev: &platform::Device<Core>, drm: crate::driver::AsahiDevRef, data: Region) -> Result<Arc<Self>> {
+    pub(crate) fn new(dev: &platform::Device<Core<'_>>, drm: crate::driver::AsahiDevRef, data: Region) -> Result<Arc<Self>> {
         Ok(Arc::new(
             Self {
                 dev: dev.into(),
@@ -191,12 +193,13 @@ impl State {
                     crashed: AtomicBool::new(false),
                     mapped: AtomicBool::new(false),
                     failed: AtomicBool::new(false),
-                    progress: crate::agx_host_progress::Progress::new(),
-                    timing: crate::agx_timing_stats::Stats::new(),
+                    progress: crate::m3::agx_host_progress::Progress::new(),
+                    timing: crate::m3::agx_timing_stats::Stats::new(),
                 }, GFP_KERNEL)?,
                 claimed: AtomicBool::new(false),
                 event_messages: AtomicU64::new(0),
                 events: EventWait::new()?,
+                completion: SetOnce::new(),
             },
             GFP_KERNEL,
         )?)
@@ -227,8 +230,18 @@ impl rtkit::Buffer for FirmwareBuffer {
     fn iova(&self) -> Result<usize> {
         Ok(self.physical)
     }
-    fn buf(&mut self) -> Result<IoSysMapRef<'_, u8>> {
-        self.mapping.iosys_map(self.offset, self.size)
+    fn buf(&mut self) -> Result<IoSysMap<'_, IoRegion>> {
+        // The view of 7.1.12's `Mem::iosys_map`: the bounded span inside the retained WB
+        // mapping, as normal memory.
+        if self.offset.checked_add(self.size).ok_or(EOVERFLOW)? > self.mapping.size() {
+            return Err(EINVAL);
+        }
+        // SAFETY: The span lies entirely inside the retained mapping (checked above).
+        let base = unsafe { self.mapping.ptr().add(self.offset) };
+        let region = IoRegion::ptr_try_from_raw_parts_mut(base, self.size)?;
+        // SAFETY: The span is mapped kernel memory for as long as `self.mapping`, which the
+        // returned view borrows through `&mut self`.
+        Ok(IoSysMap::Sys(unsafe { SysMem::new(region) }))
     }
 }
 
@@ -244,15 +257,12 @@ impl rtkit::Operations for Operations {
         // Wake the serialized worker even if the firmware can no longer send
         // its usual completion notification. Never take the runtime lock here.
         state.events.record();
-        crate::m3_completion::queue(&state.drm);
+        crate::m3::m3_completion::queue(&state);
         dev_err!(
             state.dev.as_ref(),
             "M3 G15S: firmware crashed, retained crashlog bytes={}\n",
             crashlog.map_or(0, |b| b.len())
         );
-        if let Some(bytes) = crashlog {
-            crate::t6031_start::capture_crashlog(state.dev.as_ref(), bytes);
-        }
     }
 
     fn shmem_map(
@@ -275,7 +285,7 @@ impl rtkit::Operations for Operations {
             return Err(EBUSY);
         }
         let node = state.dev.as_ref().of_node().ok_or(ENODEV)?;
-        let resource = crate::m3_resources::reserved_resource(&node,c_str!("fw-data"))?;
+        let resource = crate::m3::m3_resources::reserved_resource(&node,c_str!("fw-data"))?;
         if resource.start() != state.data.base || resource.size() != state.data.size {
             return Err(EINVAL);
         }
@@ -314,7 +324,7 @@ impl rtkit::Operations for Operations {
                     <kernel::time::Monotonic as kernel::time::ClockSource>::ktime_get(),
                     state.event_messages.load(Ordering::Acquire));
             }
-            crate::m3_completion::queue(&state.drm);
+            crate::m3::m3_completion::queue(&state);
             return;
         }
         dev_warn!(

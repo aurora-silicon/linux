@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! M3 GPU resources admitted against the measured boot contract (J514S on T6030).
-pub(crate) use crate::agx_resources::{Region, Resources};
+pub(crate) use crate::m3::agx_resources::{Region, Resources};
 
 use kernel::{bindings, c_str, io::resource::Resource, of, prelude::*};
 
@@ -11,13 +11,13 @@ pub(crate) fn reserved_resource(node: &of::Node, name: &CStr) -> Result<Resource
     if let Ok(r) = node.reserved_mem_region_to_resource_byname(name) {
         return Ok(r);
     }
-    if let Some(found) = crate::m3_board::static_region(node, name) {
+    if let Some(found) = crate::m3::m3_board::static_region(node, name) {
         return found.map(|(r, _)| r);
     }
     // Only for a GPU node whose compatible is exactly that of an M3 SoC table.
     let compatible: KVec<u8> = node.get_property(c_str!("compatible"))?;
     let compatible = compatible.strip_suffix(b"\0").ok_or(EINVAL)?;
-    if !crate::m3_soc::SOCS.iter().any(|soc| compatible == soc.gpu.as_bytes()) {
+    if !crate::m3::m3_soc::SOCS.iter().any(|soc| compatible == soc.gpu.as_bytes()) {
         return Err(EINVAL);
     }
     let names: KVec<u8> = node.get_property(c_str!("memory-region-names"))?;
@@ -44,8 +44,8 @@ pub(crate) fn reserved_resource(node: &of::Node, name: &CStr) -> Result<Resource
 }
 
 pub(crate) fn from_device(
-    pdev: &kernel::platform::Device<kernel::device::Core>,
-    soc: &crate::m3_soc::Soc,
+    pdev: &kernel::platform::Device<kernel::device::Core<'_>>,
+    soc: &crate::m3::m3_soc::Soc,
 ) -> kernel::error::Result<Resources> {
-    crate::m3_board::admit(pdev, soc)
+    crate::m3::m3_board::admit(pdev, soc)
 }

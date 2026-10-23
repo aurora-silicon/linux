@@ -172,7 +172,7 @@ fn given(param: u64, default: u64) -> Option<u64> {
 /// Resolve the parameters. The first parameter with a value it does not accept is the refusal.
 pub(crate) fn resolve(raw: &Raw) -> Result<Values, Refusal> {
     let refuse = |name, accepts| Refusal { name, accepts };
-    let initdata_version = given(raw.initdata_version, crate::m3_firmware::G15_V14_8_3_INITDATA)
+    let initdata_version = given(raw.initdata_version, crate::m3::m3_firmware::G15_V14_8_3_INITDATA)
         .filter(|v| *v != 0)
         .ok_or(refuse("t8122_initdata_version", "a nonzero number, at most 0xfffffffffffffffd"))?;
     let fender = match given(raw.fender, FENDER_RULE as u64) {

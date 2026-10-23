@@ -2,12 +2,12 @@
 //! Private storage for one retired/unpublished G15 render pass. A Pass retains
 //! all its buffers and mappings until Render retires the shared queues.
 use kernel::prelude::*;
-use crate::{driver,mmu,pgtable::prot,m3_memory::Buffer,m3_pass_layout as layout};
+use crate::{driver,mmu,pgtable::prot,m3::m3_memory::Buffer,m3::m3_pass_layout as layout};
 use layout::{Field,Space};
 
 pub(crate) struct Pass {buffers:KVec<Buffer>}
 impl Pass {
-    pub(crate) fn new(dev:&driver::AsahiDevice,uat:&mmu::Uat,vm:&mmu::Vm,
+    pub(crate) fn new(dev:&driver::AsahiDrmDevice,uat:&mmu::Uat,vm:&mmu::Vm,
         slot:usize,clusters:u32,aliases:&mut KVec<mmu::KernelMapping>)->Result<Self> {
         let mut buffers=KVec::with_capacity(layout::COUNT,GFP_KERNEL)?;
         for field in layout::FIELDS {
@@ -28,7 +28,7 @@ impl Pass {
     pub(crate) fn get_mut(&mut self,field:Field)->&mut Buffer {&mut self.buffers[field as usize]}
     /// Caller must prove retirement, and must not clear a prepared sibling.
     /// Dependency commands are rewritten completely by the sync encoder.
-    pub(crate) fn reset(&mut self,geometry:&crate::agx_render::Geometry)->Result {
+    pub(crate) fn reset(&mut self,geometry:&crate::m3::agx_render::Geometry)->Result {
         // Tiler arenas grow to retain the largest prior target. The firmware
         // descriptors use the current geometry's strides and layer count, so
         // only that prefix is addressable by this pass. Clear it on every use,

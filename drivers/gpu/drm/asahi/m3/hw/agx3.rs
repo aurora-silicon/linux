@@ -2,7 +2,7 @@
 
 
 #[cfg(not(test))]
-use crate::identity::{GpuGen, GpuVariant};
+use crate::m3::identity::{GpuGen, GpuVariant};
 #[cfg(test)]
 #[path = "../identity.rs"]
 mod identity;

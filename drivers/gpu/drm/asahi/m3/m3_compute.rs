@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! Owned RTKit 2419 M3 compute graph, populated with a validated user CDM.
 use kernel::prelude::*;
-use crate::m3_queue_layout as queue;
-use crate::m3_state_layout as state;
-use crate::{m3_compute_layout as command, m3_compute_sequence as microsequence,
-    m3_pool_layout::GpuRegion, m3_init_layout::Region};
-use crate::{driver,mmu,agx_memory::{self},m3_memory::Buffer,m3_compute_storage as storage};
-use crate::m3_timeline as timeline;
+use crate::m3::m3_queue_layout as queue;
+use crate::m3::m3_state_layout as state;
+use crate::{m3::m3_compute_layout as command, m3::m3_compute_sequence as microsequence,
+    m3::m3_pool_layout::GpuRegion, m3::m3_init_layout::Region};
+use crate::{driver,mmu,m3::agx_memory::{self},m3::m3_memory::Buffer,m3::m3_compute_storage as storage};
+use crate::m3::m3_timeline as timeline;
 use storage::{NOTIFIER,PREEMPTION,GPU_CONTEXT,JOB_LIST,QUEUE_SCRATCH,TIMESTAMPS,
     TAIL_SCRATCH,MICROSEQUENCE_SCRATCH,Mapping};
-const UMA_POOL:crate::m3_pool::Owners=crate::m3_pool::Owners {
+const UMA_POOL:crate::m3::m3_pool::Owners=crate::m3::m3_pool::Owners {
     backing:storage::POOL_BACKING,pages:storage::POOL_PAGES,table:storage::POOL_TABLE,
     manager:storage::POOL,counter:storage::COUNTER,table_index:2,
 };
@@ -40,11 +40,14 @@ pub(crate) struct Compute {
     barriers: Option<Buffer>,
     /// The register lists of the SoC's GPU (`m3_soc::Soc::registers`).
     registers: command::RegisterSet,
+    /// Last: drops after the command aliases.
+    _lower_tlbi: crate::m3::m3_memory::LowerTlbi,
 }
 impl Compute {
-    pub(crate) fn new(dev: &driver::AsahiDevice, uat: &mmu::Uat, vm: &mmu::Vm,
-        stats: Region, control: crate::agx_compute::Control,
+    pub(crate) fn new(dev: &driver::AsahiDrmDevice, uat: &mmu::Uat, vm: &mmu::Vm,
+        stats: Region, control: crate::m3::agx_compute::Control,
         registers: command::RegisterSet) -> Result<Self> {
+        let lower_tlbi=crate::m3::m3_memory::LowerTlbi;
         let binding=uat.bind(vm)?;
         let mut objects=KVec::new();
         let mut client_command=None;
@@ -101,10 +104,10 @@ impl Compute {
         // the invalidation.
         crate::mem::sync();crate::mem::tlbi_all();crate::mem::sync();
         unsafe {core::arch::asm!("isb",options(nostack,preserves_flags))};
-        Ok(Self {_client_command:client_command.ok_or(EINVAL)?,objects,command_bytes,sequence_bytes,_binding:binding,stats,last_progress_ns:0,sequence:1,head:1,cached_views:KVec::new(),slot:0,batch_count:1,checkpoint:(0,0,0),barriers:None,registers})
+        Ok(Self {_client_command:client_command.ok_or(EINVAL)?,objects,command_bytes,sequence_bytes,_binding:binding,stats,last_progress_ns:0,sequence:1,head:1,cached_views:KVec::new(),slot:0,batch_count:1,checkpoint:(0,0,0),barriers:None,registers,_lower_tlbi:lower_tlbi})
     }
     fn encode_command(objects: &mut [Buffer], bytes: &mut [u8], context: u32,
-        control: crate::agx_compute::Control, sequence: u64, slot: usize,
+        control: crate::m3::agx_compute::Control, sequence: u64, slot: usize,
         register_set: command::RegisterSet) -> Result {
         let offset = |owner:usize| storage::slot_offset(owner,slot).map_err(|_|EINVAL);
         let fw = |owner: usize| queue::FirmwareVa::new(objects[owner].va()+offset(owner)? as u64).map_err(|_| EINVAL);
@@ -164,7 +167,7 @@ impl Compute {
         objects[PREEMPTION].fill(0xcc)
     }
     pub(crate) fn replay(&mut self, uat: &mmu::Uat, vm: &mmu::Vm,
-        control: crate::agx_compute::Control) -> Result {
+        control: crate::m3::agx_compute::Control) -> Result {
         if !self.complete()? { return Err(EBUSY); }
         // All prior flushed stamps/events and engine idle were checked by
         // Runtime before entry. Keep pool/queue ownership, remap only client
@@ -211,7 +214,7 @@ impl Compute {
     /// Append only while the previous batch is fully retired and this one
     /// remains unpublished. Firmware serializes each command, including its
     /// original completion flush, in this one compute queue.
-    pub(crate) fn append(&mut self,control:crate::agx_compute::Control)->Result {
+    pub(crate) fn append(&mut self,control:crate::m3::agx_compute::Control)->Result {
         if self.batch_count>=storage::SLOTS {return Err(E2BIG);}
         self.slot=self.batch_count;
         for i in storage::RESET {
@@ -268,20 +271,20 @@ impl Compute {
         }
         agx_memory::publish();Ok(())
     }
-    pub(crate) fn set_attachments(&mut self,attachments:&crate::agx_attachments::Attachments)->Result {
+    pub(crate) fn set_attachments(&mut self,attachments:&crate::m3::agx_attachments::Attachments)->Result {
         let sequence=self.offset(storage::MICROSEQUENCE)?;
         self.objects[storage::MICROSEQUENCE].write(sequence+microsequence::ATTACHMENTS,&attachments.0)?;
         self.objects[storage::MICROSEQUENCE].write(sequence+microsequence::HAS_ATTACHMENTS,&[u8::from(attachments.count()!=0)])?;
         agx_memory::publish();Ok(())
     }
     fn stamp(&self) -> u32 { timeline::stamp(0xc1000000,self.sequence) }
-    pub(crate) fn completion_dependency(&self)->Result<crate::m3_sync_layout::CompletionDependency> {
-        Ok(crate::m3_sync_layout::CompletionDependency {
+    pub(crate) fn completion_dependency(&self)->Result<crate::m3::m3_sync_layout::CompletionDependency> {
+        Ok(crate::m3::m3_sync_layout::CompletionDependency {
             stamp:queue::FirmwareVa::new(self.objects[storage::FW_STAMP].va()).map_err(|_|EINVAL)?,
             value:self.stamp(),event:2,
         })
     }
-    pub(crate) fn reserve_barriers(&mut self,dev:&driver::AsahiDevice,uat:&mmu::Uat)->Result {
+    pub(crate) fn reserve_barriers(&mut self,dev:&driver::AsahiDrmDevice,uat:&mmu::Uat)->Result {
         if self.barriers.is_none() {
             self.barriers=Some(Buffer::at(dev,uat.kernel_vm(),None,None,storage::SLOTS*64,false)?);
         }
@@ -290,17 +293,17 @@ impl Compute {
     /// Insert a dependency before the last appended, still unpublished CDM.
     /// Its command ordinal and timestamp slot are unchanged; only the ring
     /// gains an entry. The whole batch must retire before this storage is reused.
-    pub(crate) fn insert_dependency(&mut self,dependency:crate::m3_sync_layout::CompletionDependency)->Result {
+    pub(crate) fn insert_dependency(&mut self,dependency:crate::m3::m3_sync_layout::CompletionDependency)->Result {
         if self.batch_count==0 || self.slot>=storage::SLOTS || dependency.event!=1 {
             return Err(EINVAL);
         }
         let value=self.stamp();
         let barriers=self.barriers.as_mut().ok_or(EINVAL)?;
         let offset=self.slot*64;
-        let mut bytes=[0;crate::m3_sync_layout::BARRIER_SIZE];
-        crate::m3_sync_layout::Barrier {
+        let mut bytes=[0;crate::m3::m3_sync_layout::BARRIER_SIZE];
+        crate::m3::m3_sync_layout::Barrier {
             stamp:dependency.stamp,wait_value:dependency.value,event:dependency.event,
-            self_value:value,uuid:0xc10000,dependency:crate::m3_sync_layout::Dependency::PreviousPass,
+            self_value:value,uuid:0xc10000,dependency:crate::m3::m3_sync_layout::Dependency::PreviousPass,
         }.encode(&mut bytes).map_err(|_|EINVAL)?;
         barriers.write(offset,&bytes)?;
         let address=barriers.va()+offset as u64;
@@ -333,7 +336,7 @@ impl Compute {
     pub(crate) fn head(&self) -> u16 { self.head }
     pub(crate) fn ordinal(&self)->u64 {self.sequence}
     pub(crate) fn first(&self) -> bool { self.sequence == self.batch_count as u64 }
-    pub(crate) fn progress(&mut self, dev: &driver::AsahiDevice) -> Result {
+    pub(crate) fn progress(&mut self, dev: &driver::AsahiDrmDevice) -> Result {
         // Report real completions by elapsed time as well as sequence count;
         // batches need not land on a multiple of 128.
         if !crate::debug::debug_enabled(crate::debug::DebugFlags::SubmitTiming) {
@@ -360,7 +363,7 @@ impl Compute {
             && self.objects[storage::QUEUE_STATE].read_u32(queue::DONE)?==u32::from(self.head)
             && self.objects[storage::QUEUE_STATE].read_u32(queue::READ)?==u32::from(self.head))
     }
-    pub(crate) fn log(&mut self,dev:&driver::AsahiDevice)->Result {
+    pub(crate) fn log(&mut self,dev:&driver::AsahiDrmDevice)->Result {
         for off in (0..512).step_by(128) {
             let mut raw=[0u8;128]; self.objects[storage::COMMAND].read(off,&mut raw)?;
             dev_info!(dev.as_ref(),"M3 post-command {:#x} {:02x?}\n",off,raw);

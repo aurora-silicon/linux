@@ -318,6 +318,18 @@ impl<T: Operations> RtKit<T> {
         })
     }
 
+    /// Returns whether the coprocessor is running (not crashed, IOP and AP power states on).
+    pub fn is_running(&self) -> bool {
+        // SAFETY: `rtk` is valid per the type invariant. The call only reads state.
+        unsafe { bindings::apple_rtkit_is_running(self.rtk) }
+    }
+
+    /// Returns whether the coprocessor has reported a crash.
+    pub fn is_crashed(&self) -> bool {
+        // SAFETY: `rtk` is valid per the type invariant. The call only reads state.
+        unsafe { bindings::apple_rtkit_is_crashed(self.rtk) }
+    }
+
     /// Checks if an endpoint is present
     pub fn has_endpoint(self: Pin<&mut Self>, endpoint: u8) -> bool {
         unsafe { bindings::apple_rtkit_has_endpoint(self.rtk, endpoint) }

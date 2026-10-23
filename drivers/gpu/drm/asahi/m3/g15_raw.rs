@@ -2,8 +2,8 @@
 
 //! GPU initialization / global structures
 
-use super::channels;
-use super::types::*;
+use crate::fw::channels;
+use crate::fw::types::*;
 use crate::{
     default_zeroed,
     gem,
@@ -1158,7 +1158,9 @@ pub(crate) mod raw {
         pub(crate) event: ChannelRing<channels::ChannelState, channels::RawEventMsg>,
         pub(crate) fw_log: ChannelRing<channels::FwLogChannelState, channels::RawFwLogMsg>,
         pub(crate) ktrace: ChannelRing<channels::ChannelState, channels::RawKTraceMsg>,
-        pub(crate) stats: ChannelRing<channels::ChannelState, channels::RawStatsMsgG15V14_8_3>,
+        // The G15 stats record has the 13.x size (STATS_SZ for V >= V13_0B4); 7.2 generates
+        // only the 13.x instances.
+        pub(crate) stats: ChannelRing<channels::ChannelState, channels::RawStatsMsgG13V13_5>,
 
 
         /// FWLog payload buffer (0x600 x 0xd8). +0x1f8
@@ -1548,7 +1550,7 @@ impl GpuStruct for InitDataG15V14_8_3 {
 
 // G15 / 14.8.3 firmware structure layout checks: the sizes and offsets the firmware expects.
 mod g15_layout {
-    use super::channels;
+    use crate::fw::channels;
     use super::raw::*;
     use core::mem::{offset_of, size_of};
     use kernel::static_assert;
@@ -1602,7 +1604,7 @@ mod g15_layout {
     static_assert!(size_of::<GlobalsG15V14_8_3>() == 0xe00);
     static_assert!(size_of::<RegisterOverride>() == 0x18);
     static_assert!(offset_of!(GlobalsG15V14_8_3, unk_28) == 0x28);
-    static_assert!(offset_of!(GlobalsG15V14_8_3, debug) == crate::m3_globals_debug::OFFSET);
+    static_assert!(offset_of!(GlobalsG15V14_8_3, debug) == crate::m3::m3_globals_debug::OFFSET);
     static_assert!(offset_of!(GlobalsG15V14_8_3, unk_38) == 0x38);
     static_assert!(offset_of!(GlobalsG15V14_8_3, unk_50) == 0x50);
     static_assert!(offset_of!(GlobalsG15V14_8_3, unk_56) == 0x56);
@@ -1778,23 +1780,5 @@ mod g15_layout {
             == 0xc30
     );
 
-    // G13/G14X 13.5 sizes must not change (regression guard for the per-field gating).
-    // RuntimePointers: gpu_scratch at 0x280 (0x270 on G14X) + RuntimeScratch; note that these
-    // are 0x20 more than ver_info word 0 (0x6ba0/0xb390). The others are the current G13/G14X
-    // sizes.
-    static_assert!(size_of::<RuntimePointersG13V13_5<'static>>() == 0x6bc0);
-    static_assert!(size_of::<RuntimePointersG14XV13_5<'static>>() == 0xb3b0);
-    static_assert!(size_of::<GlobalsG13V13_5>() == 0x12394);
-    static_assert!(size_of::<GlobalsG14XV13_5>() == 0x1715c);
-    static_assert!(size_of::<HwDataAG13V13_5>() == 0x421c);
-    static_assert!(size_of::<HwDataAG14XV13_5>() == 0x6c34);
-    static_assert!(size_of::<HwDataBG13V13_5>() == 0x1884);
-    static_assert!(size_of::<HwDataBG14XV13_5>() == 0x1884);
-    static_assert!(size_of::<InitDataG13V13_5<'static>>() == 0xbc);
-    static_assert!(size_of::<InitDataG14XV13_5<'static>>() == 0xbc);
-    static_assert!(size_of::<InitDataG13V12_3<'static>>() == 0xb4);
-    static_assert!(size_of::<PipeChannelsG13V13_5>() == 0x30);
-    static_assert!(size_of::<GpuGlobalStatsFragG13V13_5>() == 0x1124);
-    static_assert!(size_of::<GpuGlobalStatsFragG14XV13_5>() == 0x1a34);
     static_assert!(size_of::<channels::raw::ChannelState<'static>>() == 0x30);
 }

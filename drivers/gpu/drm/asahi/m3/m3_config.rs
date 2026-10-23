@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! Owned RTKit 2419.140.12 configuration with named initialization references.
 use kernel::prelude::*;
-use crate::m3_init_layout as init;
-use crate::m3_init_storage as storage;
+use crate::m3::m3_init_layout as init;
+use crate::m3::m3_init_storage as storage;
 use storage::{REGION_A,RUNTIME_POINTERS,HARDWARE_DATA,UNKNOWN_PAIR,FWLOG_PAYLOAD,
     UNKNOWN_C0,UNKNOWN_C1,UNKNOWN_C3,GLOBALS,GLOBALS_POWER,CONTROL_REGION,RUNTIME_FLAGS,
     FW_CONTROL_STATE,FW_CONTROL_RING};
-use crate::{driver,agx_memory::{self},m3_memory::Buffer,mmu,pgtable::prot};
+use crate::{driver,m3::agx_memory::{self},m3::m3_memory::Buffer,mmu,pgtable::prot};
 kernel::static_assert!(core::mem::size_of::<crate::fw::channels::RawFwLogMsg>() == init::fwlog::ENTRY_SIZE);
 kernel::static_assert!(core::mem::size_of::<crate::fw::channels::RawFwLogPayloadMsg>() == init::fwlog::PAYLOAD_SIZE);
 kernel::static_assert!(<crate::fw::channels::FwLogChannelState as crate::fw::channels::RxChannelState>::SUB_CHANNELS == init::fwlog::CHANNELS);
@@ -49,12 +49,10 @@ impl Records {
 
 pub(crate) struct Config {
     objects: KVec<Buffer>,
-    #[cfg(CONFIG_DEV_COREDUMP)]
-    fault_reserve: Option<crate::agx_fault::Dump>,
     _iomaps: KVec<mmu::KernelMapping>,
     pub(crate) completed_events: u64,
-    pstates: crate::m3_adt_config::PstateWatch,
-    thermal: crate::m3_thermal::Governor,
+    pstates: crate::m3::m3_adt_config::PstateWatch,
+    thermal: crate::m3::m3_thermal::Governor,
     request_top: u32,
     request_value: u32,
     request_checked: bool,
@@ -63,47 +61,9 @@ pub(crate) struct Config {
     request_observed: u32,
 }
 impl Config {
-    /// Snapshot owned RAM only. Firmware can still update these buffers;
-    /// per-record time intervals explicitly describe sequential observations.
-    #[cfg(CONFIG_DEV_COREDUMP)]
-    pub(crate) fn fault_snapshot(&mut self, dev: &driver::AsahiDevice, primary: Error, gpu_pending: bool) -> Result {
-        let mut dump = self.fault_reserve.take().ok_or(ENOMEM)?;
-        dump.begin(0);
-        let mut cause = [0u8; 16];
-        cause[..4].copy_from_slice(&1u32.to_le_bytes());
-        cause[4..8].copy_from_slice(&primary.to_errno().to_le_bytes());
-        cause[8..16].copy_from_slice(&u64::from(gpu_pending).to_le_bytes());
-        dump.record("host-first-error", 0, cause.len(), |out| {
-            out.copy_from_slice(&cause); Ok(())
-        })?;
-        for (name, index) in [
-            ("root", storage::ROOT), ("runtime", RUNTIME_POINTERS),
-            ("hardware", HARDWARE_DATA), ("globals", GLOBALS),
-            ("control", CONTROL_REGION), ("flags", RUNTIME_FLAGS),
-            // The power-controller block, and the host-to-firmware device-control and
-            // firmware-control queues: their state words show whether the firmware read a
-            // queued control (read index) and what it was sent.
-            ("power", GLOBALS_POWER),
-            ("devctl-state", storage::DEVICE_CONTROL * 2),
-            ("devctl-ring", storage::DEVICE_CONTROL * 2 + 1),
-            ("fwctl-state", storage::FW_CONTROL_STATE),
-            ("fwctl-ring", storage::FW_CONTROL_RING),
-            ("event-state", storage::EVENT * 2),
-            ("event-ring", storage::EVENT * 2 + 1),
-            ("fwlog-state", storage::FIRMWARE_LOG * 2),
-            ("fwlog-ring", storage::FIRMWARE_LOG * 2 + 1),
-            ("fwlog-payload", FWLOG_PAYLOAD),
-            ("trace-state", storage::TRACE * 2),
-            ("trace-ring", storage::TRACE * 2 + 1),
-        ] {
-            let buffer = &mut self.objects[index];
-            dump.record(name, buffer.va(), buffer.size(), |out| buffer.read(0, out))?;
-        }
-        dump.publish(dev.as_ref())
-    }
 
-    pub(crate) fn new(dev: &driver::AsahiDevice, uat: &mmu::Uat, firmware: &crate::m3_firmware::Firmware,
-        contents: &crate::m3_adt_config::Contents) -> Result<Self> {
+    pub(crate) fn new(dev: &driver::AsahiDrmDevice, uat: &mmu::Uat, firmware: &crate::m3::m3_firmware::Firmware,
+        contents: &crate::m3::m3_adt_config::Contents) -> Result<Self> {
         contents.check_for_upload()?;
         let mut objects = KVec::new();
         let mut iomaps = KVec::new();
@@ -125,8 +85,8 @@ impl Config {
         for io in contents.iomaps {
             // Read-write unless the contents say otherwise (only the T8122 start experiment).
             let protection=if contents.read_only_slots==0 {prot::PROT_FW_MMIO_RW}
-                else {crate::t8122_start::mmio_prot(contents.read_only_slots,io.slot)};
-            let map=uat.kernel_vm().map_io(io.address,io.physical.try_into()?,io.size,protection)?;
+                else {crate::m3::t8122_start::mmio_prot(contents.read_only_slots,io.slot)};
+            let map=uat.kernel_vm().map_io_m3(io.address,io.physical.try_into()?,io.size,protection)?;
             let owned=init::Region::new(map.iova(),io.size).map_err(|_|EINVAL)?;
             let field=io.pointer_field().map_err(|_|EINVAL)?;
             objects[HARDWARE_DATA].u64(field,io.pointer(owned).map_err(|_|EINVAL)?)?;
@@ -139,7 +99,7 @@ impl Config {
         // The root record carries the G15 14.8.3 InitData version, which is every T6030
         // image's. Only the T8122 start experiment gives the firmware another one
         // (`asahi.t8122_initdata_version`).
-        if firmware.initdata_magic!=crate::m3_firmware::G15_V14_8_3_INITDATA {
+        if firmware.initdata_magic!=crate::m3::m3_firmware::G15_V14_8_3_INITDATA {
             objects[storage::ROOT].u64(0,firmware.initdata_magic)?;
         }
         // Vertex/tessellation loops need not retire a primitive at every
@@ -171,26 +131,17 @@ impl Config {
             return Err(EINVAL);
         }
         let (hwdata, globals) = objects.split_at_mut(GLOBALS);
-        crate::m3_adt_config::publish_pstates(dev.as_ref(), &mut hwdata[HARDWARE_DATA], &mut globals[0], &contents.pstates)?;
+        crate::m3::m3_adt_config::publish_pstates(dev.as_ref().as_ref(), &mut hwdata[HARDWARE_DATA], &mut globals[0], &contents.pstates)?;
         // Firmware ktrace is for explicit detailed diagnostics. Normal games
         // still drain error/events, but need not generate trace records for
         // every firmware operation on the command-processing core.
         objects[RUNTIME_FLAGS].u32(0,u32::from(crate::debug::debug_enabled(
             crate::debug::DebugFlags::SubmitTiming)))?;
-        crate::m3_adt_config::check_upload(dev.as_ref(), firmware, contents.iomaps, &mut objects)?;
+        crate::m3::m3_adt_config::check_upload(dev.as_ref().as_ref(), firmware, contents.iomaps, &mut objects)?;
         agx_memory::publish();
-        let thermal = crate::m3_thermal::Governor::new(dev.as_ref(), &contents.pstates)?;
-        #[cfg(CONFIG_DEV_COREDUMP)]
-        let fault_reserve = match crate::agx_fault::Dump::new_m3() {
-            Ok(dump) => Some(dump),
-            Err(error) => {
-                dev_warn!(dev.as_ref(), "M3: fault snapshot reserve unavailable: {:?}\n", error);
-                None
-            }
-        };
+        let thermal = crate::m3::m3_thermal::Governor::new(dev.as_ref().as_ref(), &contents.pstates)?;
         Ok(Self { objects, _iomaps: iomaps, completed_events: 0,
-            #[cfg(CONFIG_DEV_COREDUMP)] fault_reserve,
-            pstates: crate::m3_adt_config::PstateWatch::new(contents.pstates), thermal,
+            pstates: crate::m3::m3_adt_config::PstateWatch::new(contents.pstates), thermal,
             request_top:contents.table.0,request_value:0,request_checked:false,
             request_check_at:None,request_writes:0,request_observed:0 })
     }
@@ -203,22 +154,22 @@ impl Config {
         objects[CONTROL_REGION].write(0, &records.control)
     }
     pub(crate) fn root(&self) -> u64 { self.objects[storage::ROOT].va() }
-    pub(crate) fn log_globals_debug(&mut self,dev:&driver::AsahiDevice)->Result {
-        let value=self.objects[GLOBALS].read_u32(crate::m3_globals_debug::OFFSET)?;
+    pub(crate) fn log_globals_debug(&mut self,dev:&driver::AsahiDrmDevice)->Result {
+        let value=self.objects[GLOBALS].read_u32(crate::m3::m3_globals_debug::OFFSET)?;
         dev_info!(dev.as_ref(),"M3_GLOBALS_DEBUG off={} value={} request_level={}\n",
-            u8::from(crate::m3_params::globals_debug_off()),value,crate::m3_params::consistent_perf());
+            u8::from(crate::m3::m3_params::globals_debug_off()),value,crate::m3::m3_params::consistent_perf());
         Ok(())
     }
     pub(crate) fn performance_request(&mut self,chip:u32,busy:bool)->Result {
-        let Some(value)=crate::m3_consistent_perf::request(chip,
-            crate::m3_params::consistent_perf(),busy,self.request_top) else {return Ok(());};
+        let Some(value)=crate::m3::m3_consistent_perf::request(chip,
+            crate::m3::m3_params::consistent_perf(),busy,self.request_top) else {return Ok(());};
         if value==0 && self.request_value==0 {return Ok(());}
         let now=kernel::time::Instant::<kernel::time::Monotonic>::now();
         let elapsed=self.request_check_at.map(|last|(now-last).as_nanos());
-        if !crate::m3_consistent_perf::refresh_due(value,self.request_value,elapsed) {
+        if !crate::m3::m3_consistent_perf::refresh_due(value,self.request_value,elapsed) {
             return Ok(());
         }
-        type P=crate::fw::initdata::raw::PowerCtlBlock;
+        type P=crate::m3::g15_raw::raw::PowerCtlBlock;
         let at=core::mem::offset_of!(P,consistent_perf_state);
         if !self.request_checked {
             let mut flag=[0];
@@ -240,14 +191,14 @@ impl Config {
     /// Move the runtime cap by temperature (the thermal limit), then check the performance
     /// state the firmware reports against the ceiling and the runtime cap. Called after boot and
     /// after every job, by the job thread.
-    pub(crate) fn check_pstate(&mut self, dev: &driver::AsahiDevice, device: &crate::m3_device::Device, what: &str) -> Result {
+    pub(crate) fn check_pstate(&mut self, dev: &driver::AsahiDrmDevice, device: &crate::m3::m3_device::Device, what: &str) -> Result {
         let now = kernel::time::Instant::<kernel::time::Monotonic>::now();
-        if let Some(cap) = self.thermal.update(dev.as_ref(), now) {
-            crate::m3_adt_config::publish_runtime_cap(&mut self.objects[GLOBALS], cap)?;
+        if let Some(cap) = self.thermal.update(dev.as_ref().as_ref(), now) {
+            crate::m3::m3_adt_config::publish_runtime_cap(&mut self.objects[GLOBALS], cap)?;
         }
         let allowed = self.thermal.allowed(now);
-        let (over, peak) = self.pstates.check(dev.as_ref(), &mut self.objects[HARDWARE_DATA], || device.pstate_register(), what, allowed)?;
-        self.thermal.note_check(dev.as_ref(), now, over, peak)?;
+        let (over, peak) = self.pstates.check(dev.as_ref().as_ref(), &mut self.objects[HARDWARE_DATA], || device.pstate_register(), what, allowed)?;
+        self.thermal.note_check(dev.as_ref().as_ref(), now, over, peak)?;
         self.thermal.busy(now);
         Ok(())
     }
@@ -256,14 +207,14 @@ impl Config {
         init::Region::new(owner.va(), owner.size()).map_err(|_| EINVAL)
     }
 
-    pub(crate) fn log_active_power(&mut self, dev: &driver::AsahiDevice,
-                                  device: &crate::m3_device::Device,
+    pub(crate) fn log_active_power(&mut self, dev: &driver::AsahiDrmDevice,
+                                  device: &crate::m3::m3_device::Device,
                                   sequence: u32) -> Result {
         let cap = self.thermal.allowed(kernel::time::Instant::<kernel::time::Monotonic>::now());
-        self.pstates.log_active(dev.as_ref(), &mut self.objects[HARDWARE_DATA],
+        self.pstates.log_active(dev.as_ref().as_ref(), &mut self.objects[HARDWARE_DATA],
                                device.pstate_register()?, cap, sequence)?;
-        type P=crate::fw::initdata::raw::PowerCtlBlock;
-        type G=crate::fw::initdata::raw::GlobalsG15V14_8_3;
+        type P=crate::m3::g15_raw::raw::PowerCtlBlock;
+        type G=crate::m3::g15_raw::raw::GlobalsG15V14_8_3;
         let request=self.objects[GLOBALS_POWER].read_u32(core::mem::offset_of!(P,consistent_perf_state))?;
         let cap_word=self.objects[GLOBALS].read_u32(core::mem::offset_of!(G,perf_state_cap))?;
         let power_if=core::mem::offset_of!(G,power_if_target);
@@ -272,13 +223,13 @@ impl Config {
         let mut override_active=[0];
         self.objects[GLOBALS_POWER].read(core::mem::offset_of!(P,perf_ctrl_override_active),&mut override_active)?;
         dev_info!(dev.as_ref(),"M3_PERF_REQUEST sample={} level={} request={} cap_word={} target1={} target2={} writes={} observed={} override_active={}\n",
-            sequence,crate::m3_params::consistent_perf(),request,cap_word,target1,target2,
+            sequence,crate::m3::m3_params::consistent_perf(),request,cap_word,target1,target2,
             self.request_writes,self.request_observed,override_active[0]);
         Ok(())
     }
 
     pub(crate) fn render_pb(&mut self) -> Result {
-        self.objects[UNKNOWN_C1].write(0,&storage::parameter_buffer(crate::m3_render::PB_PAGES).map_err(|_|EINVAL)?)
+        self.objects[UNKNOWN_C1].write(0,&storage::parameter_buffer(crate::m3::m3_render::PB_PAGES).map_err(|_|EINVAL)?)
     }
     pub(crate) fn submit_queue(&mut self, kind:usize, queue:u64, head:u16,event:u8,new:bool)->Result {
         if kind>2 {return Err(EINVAL);}
@@ -316,7 +267,7 @@ impl Config {
         Ok(self.objects[RUNTIME_POINTERS].read_u32(0x314)? == 0xabcdabcd
             && self.objects[RUNTIME_FLAGS].read_u32(4)? == 1)
     }
-    pub(crate) fn log_ready(&mut self, dev: &driver::AsahiDevice) -> Result {
+    pub(crate) fn log_ready(&mut self, dev: &driver::AsahiDrmDevice) -> Result {
         let magic=self.objects[RUNTIME_POINTERS].read_u32(0x314)?;
         let state=self.objects[RUNTIME_POINTERS].read_u32(0x2fc)?;
         let a=self.objects[RUNTIME_FLAGS].read_u32(4)?;
@@ -345,7 +296,7 @@ impl Config {
     /// at +0x4580/+0x4590/+0x45a0, the firmware's own recovery information
     /// at +0x40a0, and the details it leaves for a recovery event at +0x44a0.
     /// Nothing is acknowledged, cleared or resumed here.
-    pub(crate) fn log_recovery_state(&mut self, dev: &driver::AsahiDevice, events: u64) -> Result {
+    pub(crate) fn log_recovery_state(&mut self, dev: &driver::AsahiDrmDevice, events: u64) -> Result {
         let control=&mut self.objects[CONTROL_REGION];
         let halt_count=control.read_u64(0x4580)?;
         let halted=control.read_u32(0x4590)?;
@@ -360,7 +311,7 @@ impl Config {
     /// Read-only: log the event ring entries from the host's read index to the firmware's write
     /// index (at most 16), as `drain` reads them. Nothing is consumed or acknowledged, and the
     /// completion count is not changed.
-    pub(crate) fn log_event_ring(&mut self, dev: &driver::AsahiDevice) -> Result {
+    pub(crate) fn log_event_ring(&mut self, dev: &driver::AsahiDrmDevice) -> Result {
         const SIZE: usize = 0x38;
         const COUNT: usize = 256;
         let r = self.objects[storage::EVENT*2].read_u32(0)? as usize;
@@ -395,7 +346,7 @@ impl Config {
     pub(crate) fn control_done(&mut self, next: u32) -> Result<bool> {
         Ok(self.objects[storage::DEVICE_CONTROL*2].read_u32(0)? == next && self.objects[storage::DEVICE_CONTROL*2].read_u32(0x10)? == next)
     }
-    pub(crate) fn drain(&mut self, dev: &driver::AsahiDevice) -> Result {
+    pub(crate) fn drain(&mut self, dev: &driver::AsahiDrmDevice) -> Result {
         // Event, trace, stats and six independent firmware log rings.
         for (state, ring, size, count, channels) in [(storage::EVENT*2,storage::EVENT*2+1,0x38,256,1),
             (storage::TRACE*2,storage::TRACE*2+1,0x38,512,1),

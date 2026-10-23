@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 use kernel::prelude::*;
-use crate::m3_queue_layout as queue;
-use crate::m3_sync_layout as sync;
-use crate::m3_state_layout as state;
-use crate::m3_scene_layout as scene;
-use crate::{m3_pass::{Pass,ViewOwner},m3_pass_layout::{self as pass_layout,Field as P,Space}};
-use crate::{m3_fragment_command as fragment, m3_tiler_command as tiler, m3_render_sequence as sequence, m3_init_layout::Region};
-use crate::{m3_parameter_layout as parameter, m3_pool_layout::GpuRegion};
-use crate::{driver,mmu,pgtable::prot,m3_memory::Buffer,m3_shared_layout as s,agx_uapi};
-use crate::m3_timeline as timeline;
+use crate::m3::m3_queue_layout as queue;
+use crate::m3::m3_sync_layout as sync;
+use crate::m3::m3_state_layout as state;
+use crate::m3::m3_scene_layout as scene;
+use crate::{m3::m3_pass::{Pass,ViewOwner},m3::m3_pass_layout::{self as pass_layout,Field as P,Space}};
+use crate::{m3::m3_fragment_command as fragment, m3::m3_tiler_command as tiler, m3::m3_render_sequence as sequence, m3::m3_init_layout::Region};
+use crate::{m3::m3_parameter_layout as parameter, m3::m3_pool_layout::GpuRegion};
+use crate::{driver,mmu,pgtable::prot,m3::m3_memory::Buffer,m3::m3_shared_layout as s,m3::agx_uapi};
+use crate::m3::m3_timeline as timeline;
 use s::{PB_FIRST,PB_GROUPS,PB_BLOCKS_PER_GROUP,PB_BLOCK_SIZE};
 const PB_BLOCKS:u32=(PB_GROUPS*PB_BLOCKS_PER_GROUP) as u32;
 pub(crate) const PB_PAGES:u32=PB_BLOCKS*4;
@@ -38,7 +38,9 @@ pub(crate) struct Render {
     /// GPU clusters of the board: tiler accelerators (TPC storage) and preemption buffers.
     clusters:u32,
     /// The register lists of the SoC's GPU (`m3_soc::Soc::registers`).
-    registers:crate::m3_compute_layout::RegisterSet,
+    registers:crate::m3::m3_compute_layout::RegisterSet,
+    /// Last: drops after the pass aliases.
+    _lower_tlbi:crate::m3::m3_memory::LowerTlbi,
 }
 // Queue allocations belong to Render, not to a pass. Keep their fixed arenas
 // and firmware/shared mapping permissions from the qualified allocation map.
@@ -51,9 +53,9 @@ use s::{GPU_CONTEXT,JOB_LIST,BUFFER_MANAGER,PARAMETER_PAGE_LIST,
     PARAMETER_BLOCK_LIST,NOTIFIER,BLOCK_CONTROL,MANAGER_MISC};
 const MANAGER_SCENE_COUNT: u32 = 48;
 const TA_POOL_COUNTER: usize = 11;
-const UMA_POOLS: [crate::m3_pool::Owners; 2] = [
-    crate::m3_pool::Owners { backing: 0..8, pages: 8, table: 9, manager: 10, counter: 11, table_index: 0 },
-    crate::m3_pool::Owners { backing: 12..20, pages: 20, table: 21, manager: 22, counter: 23, table_index: 1 },
+const UMA_POOLS: [crate::m3::m3_pool::Owners; 2] = [
+    crate::m3::m3_pool::Owners { backing: 0..8, pages: 8, table: 9, manager: 10, counter: 11, table_index: 0 },
+    crate::m3::m3_pool::Owners { backing: 12..20, pages: 20, table: 21, manager: 22, counter: 23, table_index: 1 },
 ];
 const FRAGMENT_POOL_COUNTER: usize = 23;
 // Retained producer identifier for cross-pass dependencies, G15 / V14_8_3.
@@ -65,8 +67,9 @@ const RENDER_QUEUES: [QueueObjects; 2] = [
         scratch: s::FRAGMENT_SCRATCH, tiler: false, uuid: 0x3d0000 },
 ];
 impl Render {
-    pub(crate) fn new(dev:&driver::AsahiDevice,uat:&mmu::Uat,vm:&mmu::Vm,stats:Region,clusters:u32,
-        registers:crate::m3_compute_layout::RegisterSet)->Result<Self> {
+    pub(crate) fn new(dev:&driver::AsahiDrmDevice,uat:&mmu::Uat,vm:&mmu::Vm,stats:Region,clusters:u32,
+        registers:crate::m3::m3_compute_layout::RegisterSet)->Result<Self> {
+        let lower_tlbi=crate::m3::m3_memory::LowerTlbi;
         let binding=uat.bind(vm)?;
         let mut objects=KVec::new();let mut aliases=KVec::new();
         for index in 0..s::COUNT {
@@ -91,14 +94,14 @@ impl Render {
         tiler_bytes.resize(tiler::SIZE,0u8,GFP_KERNEL)?;
         let mut fragment_bytes=KVec::new();
         fragment_bytes.resize(fragment::SIZE,0u8,GFP_KERNEL)?;
-        let mut job=Self{passes,init_bm,stats,sequence_bytes,tiler_bytes,fragment_bytes,objects,_aliases:aliases,_binding:binding,last_progress_ns:0,draw:0,heads:[0;2],cached_views:KVec::new(),slot:0,batch_count:0,early_count:0,stage_timestamps:[true;2],base:0,checkpoint:(0,[0;2],0,0,0,0),clusters,registers};
+        let mut job=Self{passes,init_bm,stats,sequence_bytes,tiler_bytes,fragment_bytes,objects,_aliases:aliases,_binding:binding,last_progress_ns:0,draw:0,heads:[0;2],cached_views:KVec::new(),slot:0,batch_count:0,early_count:0,stage_timestamps:[true;2],base:0,checkpoint:(0,[0;2],0,0,0,0),clusters,registers,_lower_tlbi:lower_tlbi};
         // Lists and the matching manager are built before InitBM publication.
         job.initialize_parameter_buffer()?;
         for pool in &UMA_POOLS { pool.initialize(&mut job.objects)?; }
         job.initialize_state()?;
         job.initialize_queues()?;
         dev_info!(dev.as_ref(),"M3 native render storage initialized, PB={} MiB\n",PB_BLOCKS as usize*PB_BLOCK_SIZE/(1024*1024));
-        crate::agx_memory::publish();crate::mem::sync();crate::mem::tlbi_all();crate::mem::sync();
+        crate::m3::agx_memory::publish();crate::mem::sync();crate::mem::tlbi_all();crate::mem::sync();
         unsafe {core::arch::asm!("isb",options(nostack,preserves_flags))};
         Ok(job)
     }
@@ -223,7 +226,7 @@ impl Render {
     // Prepare each private command after its retired slot is reset. The
     // reusable host staging allocation is copied before the next slot is built.
     fn prepare_tiler(&mut self,r:agx_uapi::UapiRenderCommand,draw:u64)->Result {
-        use crate::m3_compute_layout::GpuVa;
+        use crate::m3::m3_compute_layout::GpuVa;
         let pass=&self.passes[self.slot];
         let shared=|index:usize| queue::FirmwareVa::new(self.objects[index].va()).map_err(|_|EINVAL);
         let fw=|field:P| queue::FirmwareVa::new(pass.get(field).va()).map_err(|_|EINVAL);
@@ -247,7 +250,7 @@ impl Render {
             user_timestamps:[fw(P::TilerUserStart)?,fw(P::TilerUserEnd)?],preemption:[gpu(P::Preemption0)?,gpu(P::Preemption1)?,gpu(P::Preemption2)?],
             tilemap:gpu(P::Tilemap)?,tpc:gpu(P::Tpc)?,tpc_bytes:g.tpc_bytes,heap:gpu(P::HeapMetadata)?,
             scene_user:gpu(P::SceneUser)?,initial_scene_entry,geometry:g,page_count:PB_PAGES,
-            vdm:crate::agx_render_state::compact(r.vdm_base).map_err(|_|EINVAL)?,
+            vdm:crate::m3::agx_render_state::compact(r.vdm_base).map_err(|_|EINVAL)?,
             multisample:r.multisample_control,ppp:r.ppp_control,process_empty_tiles:r.flags&2!=0,
         };
         value.encode(&mut self.tiler_bytes).map_err(|_|EINVAL)?;
@@ -290,8 +293,8 @@ impl Render {
         Ok(())
     }
     /// Pass geometry; TPC storage is per tiler accelerator, one per GPU cluster.
-    fn geometry(r:agx_uapi::UapiRenderCommand,clusters:u32)->Result<crate::agx_render::Geometry> {
-        use crate::agx_render::{Geometry,Utile};
+    fn geometry(r:agx_uapi::UapiRenderCommand,clusters:u32)->Result<crate::m3::agx_render::Geometry> {
+        use crate::m3::agx_render::{Geometry,Utile};
         let x=if r.utile_width==16 {Utile::Pixels16} else {Utile::Pixels32};
         let y=if r.utile_height==16 {Utile::Pixels16} else {Utile::Pixels32};
         let mut g=Geometry::new_layered(u32::from(r.width),u32::from(r.height),x,y,clusters,r.layers).map_err(|_|EINVAL)?;
@@ -299,7 +302,7 @@ impl Render {
         Ok(g)
     }
     fn prepare_fragment(&mut self,r:agx_uapi::UapiRenderCommand,usc:u64,draw:u64)->Result {
-        use crate::{m3_compute_layout::GpuVa,agx_render_state::{Program,DepthStencil}};
+        use crate::{m3::m3_compute_layout::GpuVa,m3::agx_render_state::{Program,DepthStencil}};
         let pass=&self.passes[self.slot];
         let shared=|index:usize| queue::FirmwareVa::new(self.objects[index].va()).map_err(|_|EINVAL);
         let fw=|field:P| queue::FirmwareVa::new(pass.get(field).va()).map_err(|_|EINVAL);
@@ -355,7 +358,7 @@ impl Render {
             self.passes[self.slot].get_mut(sequence).u64(start+sequence::USER_TIMESTAMP_POINTER,pointer)?;
             self.passes[self.slot].get_mut(sequence).u64(end+sequence::USER_TIMESTAMP_POINTER,pointer)?;
         }
-        crate::agx_memory::publish();Ok(())
+        crate::m3::agx_memory::publish();Ok(())
     }
     fn at(base:usize,index:usize)->usize {(base+index)%pass_layout::SLOTS}
     /// GPU time of the batch of `count` passes starting at pass slot `base`.
@@ -416,13 +419,13 @@ impl Render {
     /// Start a batch in pass slots `base..`. With `overlap`, earlier batches may still run: then
     /// the VM must already be bound, no storage may grow and the slots must not be in flight
     /// (the caller keeps the in-flight passes plus this batch within SLOTS).
-    pub(crate) fn begin_batch(&mut self,dev:&driver::AsahiDevice,uat:&mmu::Uat,vm:&mmu::Vm,
-        commands:&[crate::m3_submit::Command],base:usize,overlap:bool)->Result {
+    pub(crate) fn begin_batch(&mut self,dev:&driver::AsahiDrmDevice,uat:&mmu::Uat,vm:&mmu::Vm,
+        commands:&[crate::m3::m3_submit::Command],base:usize,overlap:bool)->Result {
         if base>=pass_layout::SLOTS || (!overlap && !self.complete()?) {return Err(EBUSY);}
         if overlap {
             if !self._binding.matches(vm) {return Err(EBUSY);}
             for (index,&command) in commands.iter().enumerate() {
-                let crate::m3_submit::Command::Render{command:r,..}=command else {return Err(EINVAL);};
+                let crate::m3::m3_submit::Command::Render{command:r,..}=command else {return Err(EINVAL);};
                 let g=Self::geometry(r,self.clusters)?;
                 let slot=Self::at(base,index);
                 if g.tpc_bytes>self.passes[slot].get(P::Tpc).size() as u64
@@ -433,9 +436,9 @@ impl Render {
         self.draw.checked_add(commands.len() as u64).ok_or(EOVERFLOW)?;
         // Validate every pass before changing any queue or completion state.
         for &command in commands {
-            let crate::m3_submit::Command::Render{command:r,..}=command else {return Err(EINVAL);};
+            let crate::m3::m3_submit::Command::Render{command:r,..}=command else {return Err(EINVAL);};
             Self::geometry(r,self.clusters)?;
-            crate::agx_render_state::compact(r.vdm_base).map_err(|_|EINVAL)?;
+            crate::m3::agx_render_state::compact(r.vdm_base).map_err(|_|EINVAL)?;
         }
         if !self._binding.matches(vm) {
             let next=if let Some(index)=self.cached_views.iter().position(|v|v.binding.matches(vm)) {
@@ -477,7 +480,7 @@ impl Render {
         // already-grown buffers are reusable on the next submission.
         for (index,&command) in commands.iter().enumerate() {
             let slot=Self::at(base,index);
-            let crate::m3_submit::Command::Render{command:r,..}=command else {return Err(EINVAL);};
+            let crate::m3::m3_submit::Command::Render{command:r,..}=command else {return Err(EINVAL);};
             let g=Self::geometry(r,self.clusters)?;
             for (field,base,bytes) in [(P::Tpc,s::TPC_LABEL,g.tpc_bytes),(P::Tilemap,s::TILEMAP_LABEL,g.tilemap_bytes)] {
                 let size=usize::try_from(bytes).map_err(|_|EOVERFLOW)?;
@@ -504,7 +507,7 @@ impl Render {
         for (stage,pointers) in [s::TA_POINTERS,s::FRAGMENT_POINTERS].into_iter().enumerate() {
             self.objects[pointers].u32(queue::WRITE,u32::from(self.heads[stage]))?;
         }
-        crate::agx_memory::publish();
+        crate::m3::agx_memory::publish();
         Ok(())
     }
     /// Append only into caller-reserved free pass slots. With overlap, WRITE updates
@@ -533,7 +536,7 @@ impl Render {
         // Retain the conservative stage-scope permission. Only a pass after the
         // first of its batch may overlap its predecessor's stages. Explicit
         // start timestamps keep the original full-order execution boundary.
-        let early=predecessor.is_none() && self.batch_count>0 && *crate::module_parameters::m3_early_tiling.value()!=0
+        let early=predecessor.is_none() && self.batch_count>0 && crate::m3::m3_params::early_tiling()
             && r.flags&(1<<5)!=0 && r.vertex_timestamps.start.handle==0
             && r.fragment_timestamps.start.handle==0;
         if early {self.early_count+=1;}
@@ -585,15 +588,15 @@ impl Render {
                 self.objects[ring].u64(usize::from(self.heads[stage])*8,address)?;
                 self.heads[stage]=(self.heads[stage]+1)%0x500;
             }
-            crate::agx_memory::publish();
+            crate::m3::agx_memory::publish();
             self.objects[pointers].u32(queue::WRITE,u32::from(self.heads[stage]))?;
         }
-        crate::agx_memory::publish();crate::mem::sync();crate::mem::tlbi_all();crate::mem::sync();Ok(())
+        crate::m3::agx_memory::publish();crate::mem::sync();crate::mem::tlbi_all();crate::mem::sync();Ok(())
     }
     /// Emitted only after both events, stamp/queue checks, clear faults,
     /// idle engines and consumed firmware pipes have been checked by Runtime.
     /// The existing TA/fragment descriptors request completion stamp flushes.
-    pub(crate) fn progress(&mut self,dev:&driver::AsahiDevice)->Result {
+    pub(crate) fn progress(&mut self,dev:&driver::AsahiDrmDevice)->Result {
         // Keep summaries sparse at high throughput, but emit at least once a
         // second while completed batches advance. Batched draw counts can skip
         // multiples of 128; a count-only gate can starve the watchdog observer.
@@ -654,7 +657,7 @@ impl Render {
                 || self.objects[pointers].read_u32(queue::READ)?!=u32::from(head) {return Ok(false);}
         } Ok(true)
     }
-    pub(crate) fn log(&mut self,dev:&driver::AsahiDevice)->Result {
+    pub(crate) fn log(&mut self,dev:&driver::AsahiDrmDevice)->Result {
         // Retain allocator state as well as payloads: an exhausted parameter
         // pool can stall TA without producing an MMU fault.
         for (index,bytes) in [(BLOCK_CONTROL,64),(s::BM_COUNTER,64),(MANAGER_MISC,64),(BUFFER_MANAGER,172)] {

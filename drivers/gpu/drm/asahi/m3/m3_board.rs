@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Board facts for the M3 runtime, read from the hardware and the device tree instead of being
-//! fixed to one board. The per-SoC facts are in [`crate::m3_soc`].
+//! fixed to one board. The per-SoC facts are in [`crate::m3::m3_soc`].
 
 use kernel::{bindings, c_str, device, device::Core, io::resource::Resource, of, platform, prelude::*, uapi};
 
-use crate::m3_resources::{
+use crate::m3::m3_resources::{
     reserved_resource,
     Region,
     Resources, //
 };
-use crate::m3_soc::Soc;
+use crate::m3::m3_soc::Soc;
 
 /// Whether the root node's compatible list contains `compatible`.
 fn board_is(compatible: &[u8]) -> bool {
@@ -60,7 +60,7 @@ pub(crate) fn core_masks(soc: &Soc, mask: u64) -> [u32; uapi::DRM_ASAHI_MAX_CLUS
 
 /// The highest GPU frequency in the device tree OPP table, in kHz, or None when the GPU node
 /// has no populated OPP table.
-pub(crate) fn max_frequency_khz(pdev: &platform::Device<Core>) -> Option<u32> {
+pub(crate) fn max_frequency_khz(pdev: &platform::Device<Core<'_>>) -> Option<u32> {
     let node = pdev.as_ref().of_node()?;
     let opps = node.parse_phandle(c_str!("operating-points-v2"), 0)?;
     let mut max_hz: u64 = 0;
@@ -77,7 +77,7 @@ pub(crate) fn max_frequency_khz(pdev: &platform::Device<Core>) -> Option<u32> {
 /// Every cluster of a point must have the same voltage, except on a SoC with per-cluster
 /// voltages, where the highest `opp-microvolt` cell orders the point. None without a readable
 /// OPP table.
-pub(crate) fn opp_table_shape(pdev: &platform::Device<Core>, soc: &Soc) -> Option<(u32, u32)> {
+pub(crate) fn opp_table_shape(pdev: &platform::Device<Core<'_>>, soc: &Soc) -> Option<(u32, u32)> {
     let node = pdev.as_ref().of_node()?;
     let opps = node.parse_phandle(c_str!("operating-points-v2"), 0)?;
     let mut points = KVec::new();
@@ -99,7 +99,7 @@ pub(crate) fn opp_table_shape(pdev: &platform::Device<Core>, soc: &Soc) -> Optio
         };
         points.push((hz, uv), GFP_KERNEL).ok()?;
     }
-    crate::t8122_admission::opp_table_shape(points)
+    crate::m3::t8122_admission::opp_table_shape(points)
 }
 
 /// Register windows the runtime maps on `soc`: name, base, minimum size. The runtime uses the
@@ -340,7 +340,7 @@ pub(crate) fn static_region(node: &of::Node, name: &CStr) -> Option<Result<(Reso
 /// (at least as large as the runtime maps), the GPU coprocessor mailbox, the six handoff regions
 /// by name (from the reserved-memory registry or no-map overlay nodes), and the firmware segment
 /// description. Every refusal is logged.
-pub(crate) fn admit(pdev: &platform::Device<Core>, soc: &Soc) -> Result<Resources> {
+pub(crate) fn admit(pdev: &platform::Device<Core<'_>>, soc: &Soc) -> Result<Resources> {
     let dev = pdev.as_ref();
     let refuse = |what: &str, err: Error| {
         dev_info!(dev, "M3: not admitted: {}\n", what);
@@ -460,14 +460,14 @@ pub(crate) fn admit(pdev: &platform::Device<Core>, soc: &Soc) -> Result<Resource
 
 /// Whether the GPU node links to a PMP instance (`apple,pmp`) through which the GPU power vote
 /// is cast. Without one, GPU power is left to the power domain.
-pub(crate) fn has_pmp_link(pdev: &platform::Device<Core>) -> bool {
+pub(crate) fn has_pmp_link(pdev: &platform::Device<Core<'_>>) -> bool {
     pdev.as_ref()
         .of_node()
         .is_some_and(|node| node.get_property::<u32>(c_str!("apple,pmp")).is_ok())
 }
 
-pub(crate) use crate::m3_firmware::{KnownImage, KNOWN_IMAGES, KNOWN_IMAGES_T8122};
-use crate::m3_firmware::image_info;
+pub(crate) use crate::m3::m3_firmware::{KnownImage, KNOWN_IMAGES_T8122};
+use crate::m3::m3_firmware::image_info;
 
 fn sha256(data: &[u8]) -> [u8; 32] {
     let mut digest = [0u8; 32];
@@ -551,9 +551,8 @@ pub(crate) fn region_is_nomap(node: &of::Node, name: &CStr) -> bool {
 /// board, a render node there would let a stock userspace driver submit work the board may not
 /// run correctly. `auto` (-1) registers it only on the boards the runtime was validated on.
 pub(crate) fn expose_render_node(soc: &Soc) -> bool {
-    match *crate::module_parameters::m3_expose.value() {
-        0 => false,
-        v if v > 0 => true,
-        _ => runtime_validated_board(soc),
+    match crate::m3::m3_params::expose() {
+        Some(expose) => expose,
+        None => runtime_validated_board(soc),
     }
 }

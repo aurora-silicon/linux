@@ -139,7 +139,7 @@ unsafe extern "C" fn get_atomic_param(
 }
 
 fn parse_render_batch_override(text: &str) -> Option<u64> {
-    parse_u64(text).filter(|value| *value <= crate::m3_pass_layout::SLOTS as u64)
+    parse_u64(text).filter(|value| *value <= crate::m3::m3_pass_layout::SLOTS as u64)
 }
 
 /// Runtime tuning is opt-in: zero keeps the existing boot parameter and its
@@ -202,20 +202,58 @@ pub(crate) fn render_internal_timestamps()->bool {
     M3_RENDER_INTERNAL_TIMESTAMPS.load(Ordering::Relaxed)!=0
 }
 
+// The runtime's boot-time module parameters. On 7.1.12 they were `module!` parameters; they
+// keep their names, and exist only with the T8122 runtime built in.
+
+/// `asahi.m3_render_batch_size`: bounded ordered render batch size (1..16).
+static M3_RENDER_BATCH_SIZE: AtomicU64 = AtomicU64::new(1);
+m3_param!("m3_render_batch_size", M3_RENDER_BATCH_SIZE, parse_u64);
+/// `asahi.m3_compute_batch_size`: bounded ordered compute batch size (1..16).
+static M3_COMPUTE_BATCH_SIZE: AtomicU64 = AtomicU64::new(1);
+m3_param!("m3_compute_batch_size", M3_COMPUTE_BATCH_SIZE, parse_u64);
+/// `asahi.m3_early_tiling`: opt-in fragment-only stage dependencies.
+static M3_EARLY_TILING: AtomicU64 = AtomicU64::new(0);
+m3_param!("m3_early_tiling", M3_EARLY_TILING, parse_u64);
+
+/// `asahi.m3_early_tiling` is set.
+pub(crate) fn early_tiling() -> bool {
+    M3_EARLY_TILING.load(Ordering::Relaxed) != 0
+}
+
+fn parse_expose(text: &str) -> Option<u64> {
+    match text.trim() {
+        "-1" => Some(EXPOSE_AUTO),
+        other => parse_u64(other).filter(|v| *v <= 1),
+    }
+}
+const EXPOSE_AUTO: u64 = u64::MAX;
+/// `asahi.m3_expose`: M3 render node registration: -1 = auto (on the boards where the runtime
+/// is validated), 0 = never, 1 = always.
+static M3_EXPOSE: AtomicU64 = AtomicU64::new(EXPOSE_AUTO);
+m3_param!("m3_expose", M3_EXPOSE, parse_expose);
+
+/// `asahi.m3_expose`: `None` for auto, else whether to register the render node.
+pub(crate) fn expose() -> Option<bool> {
+    match M3_EXPOSE.load(Ordering::Relaxed) {
+        EXPOSE_AUTO => None,
+        v => Some(v != 0),
+    }
+}
+
 /// Snapshot once per batch. A live change affects later publications, never the
 /// storage, ordering or retirement checks of work already on the firmware queues.
 pub(crate) fn render_batch_size() -> usize {
     let override_size = M3_RENDER_BATCH_OVERRIDE.load(Ordering::Relaxed);
     let size = if override_size == 0 {
-        *crate::module_parameters::m3_render_batch_size.value() as usize
+        M3_RENDER_BATCH_SIZE.load(Ordering::Relaxed) as usize
     } else {
         override_size as usize
     };
-    size.clamp(1, crate::m3_pass_layout::SLOTS)
+    size.clamp(1, crate::m3::m3_pass_layout::SLOTS)
 }
 
 fn parse_compute_batch_override(text: &str) -> Option<u64> {
-    parse_u64(text).filter(|value| *value <= crate::m3_compute_storage::SLOTS as u64)
+    parse_u64(text).filter(|value| *value <= crate::m3::m3_compute_storage::SLOTS as u64)
 }
 
 /// Independently tune the existing adjacent-compute path. Zero preserves the
@@ -229,11 +267,11 @@ m3_param!("m3_compute_batch_override", M3_COMPUTE_BATCH_OVERRIDE,
 pub(crate) fn compute_batch_size() -> usize {
     let override_size = M3_COMPUTE_BATCH_OVERRIDE.load(Ordering::Relaxed);
     let size = if override_size == 0 {
-        *crate::module_parameters::m3_compute_batch_size.value() as usize
+        M3_COMPUTE_BATCH_SIZE.load(Ordering::Relaxed) as usize
     } else {
         override_size as usize
     };
-    size.clamp(1, crate::m3_compute_storage::SLOTS)
+    size.clamp(1, crate::m3::m3_compute_storage::SLOTS)
 }
 
 /// `asahi.g15_debug`: G15 bring-up bits, see [`G15Debug`].
@@ -320,15 +358,6 @@ fn parse_backend(text: &str) -> Option<u64> {
 static M3_BACKEND: AtomicU64 = AtomicU64::new(BACKEND_AUTO);
 m3_param!("m3_backend", M3_BACKEND, parse_backend);
 
-/// The T6030 GPU backend to start.
-pub(crate) enum T6030Backend {
-    /// The serialized M3 runtime (m3_drm / m3_runtime).
-    Runtime,
-    /// The G15 GpuManager backend (g15_probe).
-    Manager,
-    /// No backend: the probe stops without touching the GPU.
-    Off,
-}
 
 /// `asahi.m3_initdata` values.
 const INITDATA_AUTO: u64 = 0;
@@ -418,7 +447,7 @@ pub(crate) fn unlocked_wait() -> bool {
 }
 
 /// `asahi.m3_ut_engagement=0|1`: Globals +0x7d0, the gate of the firmware's frequency-feedback
-/// cap. Unset: the SoC's default ([`crate::m3_soc::Soc::ut_engagement`]).
+/// cap. Unset: the SoC's default ([`crate::m3::m3_soc::Soc::ut_engagement`]).
 static M3_UT_ENGAGEMENT: AtomicU64 = AtomicU64::new(UT_ENGAGEMENT_UNSET);
 const UT_ENGAGEMENT_UNSET: u64 = u64::MAX;
 fn parse_ut_engagement(text: &str) -> Option<u64> {
@@ -427,7 +456,7 @@ fn parse_ut_engagement(text: &str) -> Option<u64> {
 m3_param!("m3_ut_engagement", M3_UT_ENGAGEMENT, parse_ut_engagement);
 
 /// The frequency-feedback gate for `soc`, and whether `asahi.m3_ut_engagement` set it.
-pub(crate) fn ut_engagement(soc: &crate::m3_soc::Soc) -> (u32, bool) {
+pub(crate) fn ut_engagement(soc: &crate::m3::m3_soc::Soc) -> (u32, bool) {
     match M3_UT_ENGAGEMENT.load(Ordering::Relaxed) {
         UT_ENGAGEMENT_UNSET => (soc.ut_engagement, false),
         v => (v as u32, true),
@@ -443,14 +472,14 @@ static M3_PIPELINE_DEPTH: AtomicU64 = AtomicU64::new(0);
 m3_param!("m3_pipeline_depth", M3_PIPELINE_DEPTH, parse_pipeline_depth, 0o644, Some(get_atomic_param));
 
 fn parse_pipeline_depth(text: &str) -> Option<u64> {
-    parse_u64(text).filter(|v| *v<=crate::m3_pass_layout::SLOTS as u64)
+    parse_u64(text).filter(|v| *v<=crate::m3::m3_pass_layout::SLOTS as u64)
 }
 
 /// Effective depth; changing it never releases already published pass slots.
-pub(crate) fn pipeline_depth(soc: &crate::m3_soc::Soc) -> usize {
+pub(crate) fn pipeline_depth(soc: &crate::m3::m3_soc::Soc) -> usize {
     match M3_PIPELINE_DEPTH.load(Ordering::Relaxed) {
-        0 => crate::m3_runtime::policy::default_depth(crate::t8122_start::is_t8122(soc)),
-        v => v.clamp(1,crate::m3_pass_layout::SLOTS as u64) as usize,
+        0 => crate::m3::m3_runtime::policy::default_depth(crate::m3::t8122_start::is_t8122(soc)),
+        v => v.clamp(1,crate::m3::m3_pass_layout::SLOTS as u64) as usize,
     }
 }
 
@@ -464,9 +493,9 @@ static M3_RENDER_BATCH_BUDGET_US: AtomicU64 = AtomicU64::new(u64::MAX);
 m3_param!("m3_render_batch_budget_us", M3_RENDER_BATCH_BUDGET_US, parse_u64, 0o644, Some(get_atomic_param));
 
 /// The render batch GPU-time budget in ns, or `None` without one.
-pub(crate) fn render_batch_budget_ns(soc: &crate::m3_soc::Soc) -> Option<u64> {
+pub(crate) fn render_batch_budget_ns(soc: &crate::m3::m3_soc::Soc) -> Option<u64> {
     let value=M3_RENDER_BATCH_BUDGET_US.load(Ordering::Relaxed);
-    let us=if value==u64::MAX {crate::m3_runtime::policy::default_budget_us(crate::t8122_start::is_t8122(soc))} else {value};
+    let us=if value==u64::MAX {crate::m3::m3_runtime::policy::default_budget_us(crate::m3::t8122_start::is_t8122(soc))} else {value};
     match us {
         0 => None,
         us => Some(us.saturating_mul(1000)),
@@ -486,12 +515,12 @@ fn parse_retire_mmio(text: &str) -> Option<u64> {
 /// `asahi.m3_retire_mmio`, writable at runtime: the GPU registers the host reads after every
 /// job before retiring it. Bit 0 reads the engine-busy registers (SGX+0xc020/0xc120), bit 1
 /// selects and reads each cluster's fault bank (0xd800/0xd8c0), bit 2 reads the performance
-/// state (0xe01000). Unset: the SoC's default ([`crate::m3_soc::Soc::retire_mmio`]).
+/// state (0xe01000). Unset: the SoC's default ([`crate::m3::m3_soc::Soc::retire_mmio`]).
 static M3_RETIRE_MMIO: AtomicU64 = AtomicU64::new(RETIRE_MMIO_UNSET);
 m3_param!("m3_retire_mmio", M3_RETIRE_MMIO, parse_retire_mmio, 0o644, Some(get_atomic_param));
 
 /// The `asahi.m3_retire_mmio` mask for `soc`.
-pub(crate) fn retire_mmio(soc: &crate::m3_soc::Soc) -> u64 {
+pub(crate) fn retire_mmio(soc: &crate::m3::m3_soc::Soc) -> u64 {
     match M3_RETIRE_MMIO.load(Ordering::Relaxed) {
         RETIRE_MMIO_UNSET => soc.retire_mmio,
         mask => mask,
@@ -563,7 +592,7 @@ pub(crate) fn thermal_hot_param() -> (u64, bool) {
 /// The runtime starts only on the boards the T8122 table allows (the M3 MacBook Airs), with
 /// `auto` and `runtime` alike: it has not run on any T8122, so nothing forces it onto another
 /// board. The G15 manager backend is T6030-only.
-pub(crate) fn t8122_backend(pdev: &platform::Device<Core>) -> bool {
+pub(crate) fn t8122_backend(pdev: &platform::Device<Core<'_>>) -> bool {
     let dev = pdev.as_ref();
     match M3_BACKEND.load(Ordering::Relaxed) {
         BACKEND_OFF => {
@@ -577,7 +606,7 @@ pub(crate) fn t8122_backend(pdev: &platform::Device<Core>) -> bool {
             );
             false
         }
-        _ if crate::m3_board::runtime_validated_board(&crate::m3_soc::T8122) => true,
+        _ if crate::m3::m3_board::runtime_validated_board(&crate::m3::m3_soc::T8122) => true,
         _ => {
             dev_info!(
                 dev,
@@ -588,57 +617,27 @@ pub(crate) fn t8122_backend(pdev: &platform::Device<Core>) -> bool {
     }
 }
 
-/// Select the T6030 GPU backend from `asahi.m3_backend`, and say which one and why.
-///
-/// `auto` starts the runtime backend on the boards it is validated on (the M3 Pro MacBook
-/// Pros). On other T6030 boards it starts nothing until the runtime is validated there;
-/// `asahi.m3_backend=runtime` starts it anyway.
-pub(crate) fn t6030_backend(pdev: &platform::Device<Core>) -> T6030Backend {
-    let dev = pdev.as_ref();
-    match M3_BACKEND.load(Ordering::Relaxed) {
-        BACKEND_RUNTIME => {
-            dev_info!(dev, "M3: asahi.m3_backend=runtime\n");
-            T6030Backend::Runtime
-        }
-        BACKEND_MANAGER => {
-            dev_info!(dev, "M3: asahi.m3_backend=manager: starting the G15 manager backend\n");
-            T6030Backend::Manager
-        }
-        BACKEND_OFF => {
-            dev_info!(dev, "M3: asahi.m3_backend=off: no GPU backend started\n");
-            T6030Backend::Off
-        }
-        _ if crate::m3_board::runtime_validated_board(&crate::m3_soc::T6030) => T6030Backend::Runtime,
-        _ => {
-            dev_info!(
-                dev,
-                "M3: asahi.m3_backend=auto: no GPU backend on this board: the runtime backend is not validated here yet (asahi.m3_backend=runtime starts it, asahi.m3_backend=manager starts the G15 manager backend)\n"
-            );
-            T6030Backend::Off
-        }
-    }
-}
 
 fn parse_t8122_number(text: &str) -> Option<u64> {
-    Some(crate::t8122_knobs::parse_number(text))
+    Some(crate::m3::t8122_knobs::parse_number(text))
 }
 
 fn parse_t8122_fender(text: &str) -> Option<u64> {
-    Some(crate::t8122_knobs::parse_fender(text))
+    Some(crate::m3::t8122_knobs::parse_fender(text))
 }
 
 fn parse_t8122_clkgen(text: &str) -> Option<u64> {
-    Some(crate::t8122_knobs::parse_clkgen(text))
+    Some(crate::m3::t8122_knobs::parse_clkgen(text))
 }
 
 fn parse_t8122_sgx_setup(text: &str) -> Option<u64> {
-    Some(crate::t8122_knobs::parse_sgx_setup(text))
+    Some(crate::m3::t8122_knobs::parse_sgx_setup(text))
 }
 
 // The T8122 start experiment (`t8122_start`). Each parameter is stored as given, unset or with a
 // value its parser does not accept (`t8122_knobs`), so that the experiment can refuse rather
 // than fall back to a default.
-use crate::t8122_knobs::UNSET as T8122_UNSET;
+use crate::m3::t8122_knobs::UNSET as T8122_UNSET;
 
 /// `asahi.t8122_start=1`: start the M3 runtime on a T8122 with the start experiment's values.
 /// Only with a boot loader that handed the GPU over.
@@ -667,21 +666,21 @@ static T8122_PSTATE_CAP: AtomicU64 = AtomicU64::new(T8122_UNSET);
 m3_param!("t8122_pstate_cap", T8122_PSTATE_CAP, parse_t8122_number);
 
 /// `asahi.t8122_hwdata_418c=0|1`: on a T8122 with the G15 14.8.3 firmware, 1 (the default)
-/// writes the 20 words at HwDataA +0x418c ([`crate::t8122_hwdata`]); 0 leaves the
+/// writes the 20 words at HwDataA +0x418c ([`crate::m3::t8122_hwdata`]); 0 leaves the
 /// range zero, for an A/B test. Readable in sysfs.
-static T8122_HWDATA_418C: AtomicU64 = AtomicU64::new(crate::t8122_hwdata::DEFAULT);
-m3_param!("t8122_hwdata_418c", T8122_HWDATA_418C, crate::t8122_hwdata::parse, 0o444,
+static T8122_HWDATA_418C: AtomicU64 = AtomicU64::new(crate::m3::t8122_hwdata::DEFAULT);
+m3_param!("t8122_hwdata_418c", T8122_HWDATA_418C, crate::m3::t8122_hwdata::parse, 0o444,
     Some(get_atomic_param));
 
 /// Whether `asahi.t8122_hwdata_418c` asks for the HwDataA +0x418c words (the default).
 pub(crate) fn t8122_hwdata_418c() -> bool {
-    crate::t8122_hwdata::enabled(T8122_HWDATA_418C.load(Ordering::Relaxed))
+    crate::m3::t8122_hwdata::enabled(T8122_HWDATA_418C.load(Ordering::Relaxed))
 }
 
 /// The T8122 start-experiment parameters of this boot, as given.
-pub(crate) fn t8122_params() -> crate::t8122_knobs::Raw {
+pub(crate) fn t8122_params() -> crate::m3::t8122_knobs::Raw {
     let get = |p: &AtomicU64| p.load(Ordering::Relaxed);
-    crate::t8122_knobs::Raw {
+    crate::m3::t8122_knobs::Raw {
         start: get(&T8122_START),
         initdata_version: get(&T8122_INITDATA_VERSION),
         fender: get(&T8122_FENDER),
@@ -690,211 +689,5 @@ pub(crate) fn t8122_params() -> crate::t8122_knobs::Raw {
         unit_mask_a: get(&T8122_UNIT_MASK_A),
         unit_mask_b: get(&T8122_UNIT_MASK_B),
         pstate_cap: get(&T8122_PSTATE_CAP),
-    }
-}
-
-fn parse_t6031_number(text: &str) -> Option<u64> {
-    Some(crate::t6031_knobs::parse_number(text))
-}
-
-fn parse_t6031_fender(text: &str) -> Option<u64> {
-    Some(crate::t6031_knobs::parse_fender(text))
-}
-
-fn parse_t6031_clkgen(text: &str) -> Option<u64> {
-    Some(crate::t6031_knobs::parse_clkgen(text))
-}
-
-fn parse_t6031_sgx_setup(text: &str) -> Option<u64> {
-    Some(crate::t6031_knobs::parse_sgx_setup(text))
-}
-
-fn parse_t6031_mcache(text: &str) -> Option<u64> {
-    Some(crate::t6031_knobs::parse_mcache(text))
-}
-
-fn parse_t6031_aic_swint(text: &str) -> Option<u64> {
-    Some(crate::t6031_knobs::parse_aic_swint(text))
-}
-
-fn parse_t6031_slot7(text: &str) -> Option<u64> {
-    Some(crate::t6031_knobs::parse_slot7(text))
-}
-
-fn parse_t6031_gifaf(text: &str) -> Option<u64> {
-    Some(crate::t6031_knobs::parse_gifaf(text))
-}
-
-fn parse_t6031_slot(text: &str) -> Option<u64> {
-    Some(crate::t6031_knobs::parse_slot(text))
-}
-
-fn parse_t6031_ane(text: &str) -> Option<u64> {
-    Some(crate::t6031_knobs::parse_ane(text))
-}
-
-fn parse_t6031_mtr(text: &str) -> Option<u64> {
-    Some(crate::t6031_knobs::parse_mtr(text))
-}
-
-fn parse_t6031_fw_words(text: &str) -> Option<u64> {
-    Some(crate::t6031_knobs::parse_fw_words(text))
-}
-
-fn parse_t6031_hwdata_object(text: &str) -> Option<u64> {
-    Some(crate::t6031_knobs::parse_hwdata_object(text))
-}
-
-fn parse_t6031_rev_id(text: &str) -> Option<u64> {
-    Some(crate::t6031_knobs::parse_rev_id(text))
-}
-
-fn parse_t6031_tristate(text: &str) -> Option<u64> {
-    Some(crate::t6031_knobs::parse_tristate(text))
-}
-
-fn parse_t6031_tag(text: &str) -> Option<u64> {
-    Some(crate::t6031_knobs::parse_tag(text))
-}
-
-// The T6031 start (`t6031_start`). Each parameter is stored as given, unset or with a value its
-// parser does not accept (`t6031_knobs`), so the start can refuse rather than fall back.
-use crate::t6031_knobs::UNSET as T6031_UNSET;
-
-/// `asahi.t6031_start=1`: one attempt to start the M3 runtime on a T6031. Without it the probe
-/// is the same refusal as before.
-static T6031_START: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_start", T6031_START, parse_t6031_number);
-/// `asahi.t6031_image_hash`: the first 8 bytes of the loaded text SHA-256, big-endian.
-static T6031_IMAGE_HASH: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_image_hash", T6031_IMAGE_HASH, parse_t6031_number);
-/// `asahi.t6031_tag=search` or a text offset of the boot-entropy tag.
-static T6031_TAG: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_tag", T6031_TAG, parse_t6031_tag);
-/// `asahi.t6031_initdata_version=<u64>`: the InitData version given to the T6031 firmware.
-static T6031_INITDATA_VERSION: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_initdata_version", T6031_INITDATA_VERSION, parse_t6031_number);
-/// `asahi.t6031_pstate_cap=N`: the highest performance state the T6031 firmware may use.
-static T6031_PSTATE_CAP: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_pstate_cap", T6031_PSTATE_CAP, parse_t6031_number);
-/// `asahi.t6031_fender=rule|adt`: the Fender window size.
-static T6031_FENDER: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_fender", T6031_FENDER, parse_t6031_fender);
-/// `asahi.t6031_clkgen=e5c|e1c|none`: the GPU clock-generator IO mapping.
-static T6031_CLKGEN: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_clkgen", T6031_CLKGEN, parse_t6031_clkgen);
-/// `asahi.t6031_sgx_setup=t6030|none`: the SGX write made before the firmware starts.
-static T6031_SGX_SETUP: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_sgx_setup", T6031_SGX_SETUP, parse_t6031_sgx_setup);
-/// `asahi.t6031_mcache=none|x2|x4|x8`.
-static T6031_MCACHE: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_mcache", T6031_MCACHE, parse_t6031_mcache);
-/// `asahi.t6031_aic_swint=page|reg`.
-static T6031_AIC_SWINT: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_aic_swint", T6031_AIC_SWINT, parse_t6031_aic_swint);
-/// `asahi.t6031_slot7=none|rule`.
-static T6031_SLOT7: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_slot7", T6031_SLOT7, parse_t6031_slot7);
-/// `asahi.t6031_gifaf=none|fender`.
-static T6031_GIFAF: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_gifaf", T6031_GIFAF, parse_t6031_gifaf);
-/// `asahi.t6031_slot21=none` or a physical address.
-static T6031_SLOT21: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_slot21", T6031_SLOT21, parse_t6031_slot);
-/// `asahi.t6031_slot24=none` or a physical address.
-static T6031_SLOT24: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_slot24", T6031_SLOT24, parse_t6031_slot);
-/// `asahi.t6031_slot28=none` or a physical address.
-static T6031_SLOT28: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_slot28", T6031_SLOT28, parse_t6031_slot);
-/// `asahi.t6031_ane=none|t6030|t8122` or a physical address.
-static T6031_ANE: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_ane", T6031_ANE, parse_t6031_ane);
-/// `asahi.t6031_io_drop`: a mask of default slots to leave out.
-static T6031_IO_DROP: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_io_drop", T6031_IO_DROP, parse_t6031_number);
-/// `asahi.t6031_mtr=t6030|t8122|adt|none`.
-static T6031_MTR: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_mtr", T6031_MTR, parse_t6031_mtr);
-/// `asahi.t6031_mtr_fast_die`: overrides the fast-die MTR mask.
-static T6031_MTR_FAST_DIE: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_mtr_fast_die", T6031_MTR_FAST_DIE, parse_t6031_number);
-/// `asahi.t6031_mtr_alarm`: overrides the alarm MTR mask.
-static T6031_MTR_ALARM: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_mtr_alarm", T6031_MTR_ALARM, parse_t6031_number);
-/// `asahi.t6031_unit_mask_a=<u64>`: HwDataB unit mask A (+0x17c0).
-static T6031_UNIT_MASK_A: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_unit_mask_a", T6031_UNIT_MASK_A, parse_t6031_number);
-/// `asahi.t6031_unit_mask_b=<u32>`: HwDataB unit mask B (+0x17c8).
-static T6031_UNIT_MASK_B: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_unit_mask_b", T6031_UNIT_MASK_B, parse_t6031_number);
-/// `asahi.t6031_hwb_454`: HwDataB +0xa2c.
-static T6031_HWB_454: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_hwb_454", T6031_HWB_454, parse_t6031_number);
-/// `asahi.t6031_hwb_b20`: HwDataB +0xb20, the core slots.
-static T6031_HWB_B20: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_hwb_b20", T6031_HWB_B20, parse_t6031_number);
-/// `asahi.t6031_hwb_17b8`: HwDataB +0x17b8.
-static T6031_HWB_17B8: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_hwb_17b8", T6031_HWB_17B8, parse_t6031_number);
-/// `asahi.t6031_hwb_1818`: HwDataB +0x1818.
-static T6031_HWB_1818: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_hwb_1818", T6031_HWB_1818, parse_t6031_number);
-/// `asahi.t6031_fw_words=none|t8122`.
-static T6031_FW_WORDS: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_fw_words", T6031_FW_WORDS, parse_t6031_fw_words);
-/// `asahi.t6031_hwdata_object=aligned|fixed`.
-static T6031_HWDATA_OBJECT: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_hwdata_object", T6031_HWDATA_OBJECT, parse_t6031_hwdata_object);
-/// `asahi.t6031_gpu_core`: must be the table's G15C core type, 24.
-static T6031_GPU_CORE: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_gpu_core", T6031_GPU_CORE, parse_t6031_number);
-/// `asahi.t6031_rev_id=auto` or 1 to 6.
-static T6031_REV_ID: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_rev_id", T6031_REV_ID, parse_t6031_rev_id);
-/// `asahi.t6031_csafr=auto|on|off`.
-static T6031_CSAFR: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_csafr", T6031_CSAFR, parse_t6031_tristate);
-/// `asahi.t6031_power_cap_mw`: the power target while the boot loader's model is a stand-in.
-static T6031_POWER_CAP_MW: AtomicU64 = AtomicU64::new(T6031_UNSET);
-m3_param!("t6031_power_cap_mw", T6031_POWER_CAP_MW, parse_t6031_number);
-
-/// The T6031 start parameters of this boot, as given. The image UUID has no module parameter.
-pub(crate) fn t6031_params() -> crate::t6031_knobs::Raw {
-    let get = |p: &AtomicU64| p.load(Ordering::Relaxed);
-    crate::t6031_knobs::Raw {
-        start: get(&T6031_START),
-        image_uuid: crate::t6031_knobs::UuidParam::Unset,
-        image_hash: get(&T6031_IMAGE_HASH),
-        tag: get(&T6031_TAG),
-        initdata_version: get(&T6031_INITDATA_VERSION),
-        pstate_cap: get(&T6031_PSTATE_CAP),
-        fender: get(&T6031_FENDER),
-        clkgen: get(&T6031_CLKGEN),
-        sgx_setup: get(&T6031_SGX_SETUP),
-        mcache: get(&T6031_MCACHE),
-        aic_swint: get(&T6031_AIC_SWINT),
-        slot7: get(&T6031_SLOT7),
-        gifaf: get(&T6031_GIFAF),
-        slot21: get(&T6031_SLOT21),
-        slot24: get(&T6031_SLOT24),
-        slot28: get(&T6031_SLOT28),
-        ane: get(&T6031_ANE),
-        io_drop: get(&T6031_IO_DROP),
-        mtr: get(&T6031_MTR),
-        mtr_fast_die: get(&T6031_MTR_FAST_DIE),
-        mtr_alarm: get(&T6031_MTR_ALARM),
-        unit_mask_a: get(&T6031_UNIT_MASK_A),
-        unit_mask_b: get(&T6031_UNIT_MASK_B),
-        hwb_454: get(&T6031_HWB_454),
-        hwb_b20: get(&T6031_HWB_B20),
-        hwb_17b8: get(&T6031_HWB_17B8),
-        hwb_1818: get(&T6031_HWB_1818),
-        fw_words: get(&T6031_FW_WORDS),
-        hwdata_object: get(&T6031_HWDATA_OBJECT),
-        gpu_core: get(&T6031_GPU_CORE),
-        rev_id: get(&T6031_REV_ID),
-        csafr: get(&T6031_CSAFR),
-        power_cap_mw: get(&T6031_POWER_CAP_MW),
     }
 }

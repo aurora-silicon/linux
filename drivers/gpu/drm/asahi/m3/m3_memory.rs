@@ -8,6 +8,20 @@ enum Backing {
     Paged(gem::ObjectRef),
 }
 
+/// Invalidates context 0's non-global translations when dropped. A job's command aliases live in
+/// the context-0 lower tree, which has no bind slot on the adopted UAT (7.1.12 gave it the fixed
+/// slot 0), so unmapping them invalidates nothing by itself. Declared first in a constructor and
+/// last in the job, it drops after every alias.
+pub(crate) struct LowerTlbi;
+
+impl Drop for LowerTlbi {
+    fn drop(&mut self) {
+        crate::mem::sync();
+        crate::mem::tlbi_asid(0);
+        crate::mem::sync();
+    }
+}
+
 pub(crate) struct Buffer {
     mapping: mmu::KernelMapping,
     gpu_mapping: Option<mmu::KernelMapping>,
@@ -17,18 +31,31 @@ pub(crate) struct Buffer {
     object: Backing,
     offset: usize,
     size: usize,
-    _coherent_allocation: Option<crate::agx_memory_stats::Allocation>,
+    _coherent_allocation: Option<crate::m3::agx_memory_stats::Allocation>,
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        // A GPU view may be a command alias in the context-0 lower tree, which has no bind slot
+        // to invalidate on unmap: drop it and invalidate context 0 before the backing below is
+        // freed (7.1.12 invalidated inside the unmap).
+        if self.gpu_mapping.take().is_some() {
+            crate::mem::sync();
+            crate::mem::tlbi_asid(0);
+            crate::mem::sync();
+        }
+    }
 }
 
 impl Buffer {
-    pub(crate) fn at(dev: &driver::AsahiDevice, fw: &mmu::Vm,
+    pub(crate) fn at(dev: &driver::AsahiDrmDevice, fw: &mmu::Vm,
         gpu: Option<(&mmu::Vm,u64)>, address: Option<u64>, size: usize,
         gpu_shared: bool) -> Result<Self> {
         Self::at_prot(dev,fw,gpu,address,size,
             if gpu_shared {prot::PROT_GPU_FW_SHARED_RW} else {prot::PROT_FW_SHARED_RW},
             prot::PROT_GPU_SHARED_RW)
     }
-    pub(crate) fn at_prot(dev: &driver::AsahiDevice, fw: &mmu::Vm,
+    pub(crate) fn at_prot(dev: &driver::AsahiDrmDevice, fw: &mmu::Vm,
         gpu: Option<(&mmu::Vm,u64)>, address: Option<u64>, size: usize,
         protection: prot::Prot, gpu_protection: prot::Prot) -> Result<Self> {
         let offset=(address.or(gpu.map(|(_,a)|a)).unwrap_or(0)&0x3fff) as usize;
@@ -39,18 +66,18 @@ impl Buffer {
         // normal case here and is not reported; only a failed fallback is.
         // SAFETY: M3 runtime owns the bound platform device for the entire
         // diagnostic; all mappings retire before normal DMA allocation Drop.
-        let object=kernel::dma::Coherent::zeroed_slice_with_attrs(unsafe {dev.as_ref().as_bound()},allocated,GFP_KERNEL,
+        let object=kernel::dma::Coherent::zeroed_slice_with_attrs(unsafe {dev.as_ref().as_ref().as_bound()},allocated,GFP_KERNEL,
             kernel::dma::attrs::DMA_ATTR_NO_WARN).inspect_err(|_| dev_err!(dev.as_ref(),"M3: cannot allocate {} KiB of GPU memory\n",allocated/1024))?;
         let pa:usize=object.dma_handle().try_into()?;
-        let mapping=if let Some(a)=address {fw.map_io(a&!0x3fff,pa,allocated,protection)?}
+        let mapping=if let Some(a)=address {fw.map_io_m3(a&!0x3fff,pa,allocated,protection)?}
             else {fw.map_io_in_range(0xffff_fc2d_0000_0000..0xffff_fc2e_0000_0000,pa,allocated,protection)?};
-        let gpu_mapping=if let Some((vm,a))=gpu {Some(vm.map_io(a&!0x3fff,pa,allocated,gpu_protection)?)} else {None};
+        let gpu_mapping=if let Some((vm,a))=gpu {Some(vm.map_io_m3(a&!0x3fff,pa,allocated,gpu_protection)?)} else {None};
         Ok(Self {mapping,gpu_mapping,gpu_protection,object:Backing::Coherent(object),offset,size,
-            _coherent_allocation:Some(crate::agx_memory_stats::Allocation::coherent(allocated)?)})
+            _coherent_allocation:Some(crate::m3::agx_memory_stats::Allocation::coherent(allocated)?)})
     }
     /// Allocate owned tiler storage in the driver-reserved GPU range. Keep the
     /// old allocation mapped until the replacement has been fully allocated.
-    pub(crate) fn tiler(dev:&driver::AsahiDevice,fw:&mmu::Vm,vm:&mmu::Vm,size:usize)->Result<Self> {
+    pub(crate) fn tiler(dev:&driver::AsahiDrmDevice,fw:&mmu::Vm,vm:&mmu::Vm,size:usize)->Result<Self> {
         if size==0 || size.checked_add(mmu::UAT_PGMSK).is_none() {return Err(EINVAL);}
         // Large render targets can require 128 MiB of tiler storage. Engines
         // and firmware address it through UAT, so physically contiguous DMA
@@ -62,7 +89,7 @@ impl Buffer {
             mmu::UAT_PGSZ as u64,prot::PROT_GPU_FW_SHARED_RW,true)?;
         // Growth retains the cached GPU-only policy of the original TPC and
         // tilemap allocations; the firmware alias remains shared/uncached.
-        let gpu_protection=prot::Prot::from_pte(crate::m3_pass_layout::Access::GpuCachedRw.pte());
+        let gpu_protection=prot::Prot::from_pte(crate::m3::m3_pass_layout::Access::GpuCachedRw.pte());
         let gpu_mapping=Some(object.map_into_range(vm,0x74_0000_0000..0x78_0000_0000,
             mmu::UAT_PGSZ as u64,gpu_protection,true)?);
         Ok(Self {mapping,gpu_mapping,gpu_protection,object:Backing::Paged(object),offset:0,size,_coherent_allocation:None})
@@ -73,7 +100,7 @@ impl Buffer {
     pub(crate) fn map_gpu_view(&mut self,vm:&mmu::Vm)->Result<mmu::KernelMapping> {
         let address=self.gpu_va()?&!0x3fff;
         match &mut self.object {
-            Backing::Coherent(object)=>vm.map_io(address,object.dma_handle().try_into()?,object.size(),self.gpu_protection),
+            Backing::Coherent(object)=>vm.map_io_m3(address,object.dma_handle().try_into()?,object.size(),self.gpu_protection),
             Backing::Paged(object)=>object.map_at(vm,address,self.gpu_protection,true),
         }
     }
@@ -82,7 +109,10 @@ impl Buffer {
     fn cpu_ptr(&mut self)->Result<*mut u8> {
         match &mut self.object {
             Backing::Coherent(object)=>Ok(object.as_mut_ptr().cast::<u8>()),
-            Backing::Paged(object)=>Ok(object.cached_vmap()?.as_mut_ptr()),
+            Backing::Paged(object)=>{
+                use kernel::io::IoBase;
+                Ok(object.vmap()?.as_view().as_ptr().cast::<u8>())
+            }
         }
     }
 
@@ -124,7 +154,7 @@ impl Buffer {
         if offset.checked_add(4).ok_or(EOVERFLOW)?>self.size {return Err(ERANGE);}
         let ptr=self.cpu_ptr()?;
         // SAFETY: checked span in retained CPU storage; no aligned access is required.
-        unsafe {crate::m3_consistent_perf::store_packed(ptr.add(self.offset+offset),value)};
+        unsafe {crate::m3::m3_consistent_perf::store_packed(ptr.add(self.offset+offset),value)};
         Ok(())
     }
     pub(crate) fn read(&mut self,offset:usize,data:&mut[u8])->Result {

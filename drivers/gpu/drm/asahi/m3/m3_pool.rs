@@ -3,7 +3,7 @@
 //! GPU mappings and counters outlive this initialization and remain owned by
 //! Render/Compute. Callers must never invoke this on a live or replayed pool.
 use kernel::prelude::*;
-use crate::{m3_memory::Buffer, m3_pool_layout as wire, m3_queue_layout::FirmwareVa};
+use crate::{m3::m3_memory::Buffer, m3::m3_pool_layout as wire, m3::m3_queue_layout::FirmwareVa};
 pub(crate) struct Owners {
     pub(crate) backing: core::ops::Range<usize>,
     pub(crate) pages: usize,

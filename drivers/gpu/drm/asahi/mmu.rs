@@ -117,6 +117,8 @@ mod bind;
 mod context;
 mod shared;
 mod lifetime;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod m3;
 mod residency;
 pub(crate) use residency::{Gate as ResidencyGate, VmShrinker};
 pub(crate) use bind::PreparedUserBindBatch;
