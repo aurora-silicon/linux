@@ -997,6 +997,9 @@ impl Runtime {
         }
         // Whether the coprocessor runs and offers its endpoints, for the T8122 verdict.
         let mut started=false;
+        // The adopted UAT and its window live outside the closure: once TTBAT context 0 names
+        // the kernel-owned lower root, a failure must not free those tables before ASC stops.
+        let mut adopted=None;
         let prepared=(|| -> Result<_> {
             device.start_asc(pdev)?;
             Pin::new(&mut transport).wake()?;
@@ -1010,23 +1013,28 @@ impl Runtime {
             // TTBAT of the admitted reservations, the firmware kernel root (`pagetables`) as
             // every context's upper half, and the host window (root entry 2) through the
             // shared L2. The RTKit is awake and no initdata or GPU job has been published.
-            let (uat,mut window)=adopt_uat(&drm,device.soc(),&device.firmware().resources)?;
-            let config=Config::new(&drm,&uat,device.firmware(),&contents)?;
+            let (uat,window)=adopted.insert(adopt_uat(&drm,device.soc(),&device.firmware().resources)?);
+            let config=Config::new(&drm,uat,device.firmware(),&contents)?;
             // Link every kernel table the configuration created before the firmware sees an
             // address in it, then drop any translation cached before they existed.
-            window.sync_all(&uat)?;
+            window.sync_all(uat)?;
             crate::mem::sync();crate::mem::tlbi_all();crate::mem::sync();
-            Ok((uat,window,config))
+            Ok(config)
         })();
-        let (uat,window,config)=match prepared {
-            Ok(v)=>v,
-            Err(e)=>{
+        let (uat,window,config)=match (prepared,adopted.take()) {
+            (Ok(config),Some((uat,window)))=>(uat,window,config),
+            (prepared,adopted)=>{
+                let e=prepared.err().unwrap_or(EINVAL);
                 crate::m3::t8122_start::prepare_verdict(pdev.as_ref(),device.soc(),started,e);
                 state.health.mark_failed();
                 if device.stop_asc().is_err() {
                     unsafe {kernel::bindings::__module_get(crate::THIS_MODULE.as_ptr())};
                     core::mem::forget(transport);core::mem::forget(state);
+                    core::mem::forget(adopted);
                     core::mem::forget(drm);core::mem::forget(device);
+                } else {
+                    // ASC has stopped: the firmware no longer walks the adopted tables.
+                    drop(adopted);
                 }
                 return Err(e);
             }
