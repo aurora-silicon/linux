@@ -803,15 +803,26 @@ static int radio_start(struct centauri_wifi *wifi)
 
 static void append_tlv(u8 *payload, size_t *size, u16 tag, const void *data, u16 length);
 
+/* Dwell times in ms for the scan request. The macOS 27 scan adapter copies
+ * the first request dwell field into frame +0x20 and +0x22 and the second into +0x24 and logs
+ * "dwelltime active[%d, %d] passive %d". A zero passive dwell makes the J873 scan state machine
+ * assert in SCHED_Req_Add (the dwell it selects must not be zero) and the whole firmware traps.
+ */
+#define SCAN_ACTIVE_DWELL_MS	110
+#define SCAN_PASSIVE_DWELL_MS	110
+
 /* Fixed scan request (command 0x1000f), 14 bytes, chunk number first. */
 static size_t build_scan(struct centauri_wifi *wifi, unsigned int chunk, u8 *buf)
 {
-	static const u8 fixed[14] = { 1, 0, 0, 0x80, 0, 2, 0, 0x10, 110, 0, 110, 0, 0, 0 };
+	u8 fixed[14] = { 1, 0, 0, 0x80, 0, 2, 0, 0x10 };
 	const struct centauri_board *board = centauri_board();
 	u8 list[1 + 4 * 13], oce[5] = { 0, 0, 1, 0, 0 };
 	unsigned int first = chunk * 13, n, i;
 	size_t size = sizeof(fixed);
 
+	put_unaligned_le16(SCAN_ACTIVE_DWELL_MS, fixed + 8);
+	put_unaligned_le16(SCAN_ACTIVE_DWELL_MS, fixed + 10);
+	put_unaligned_le16(SCAN_PASSIVE_DWELL_MS, fixed + 12);
 	memcpy(buf, fixed, sizeof(fixed));
 	buf[0] = chunk + 1;
 	if (!board || !board->scan_tlvs)
