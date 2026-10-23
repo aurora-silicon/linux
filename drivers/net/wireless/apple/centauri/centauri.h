@@ -51,7 +51,8 @@ struct centauri {
  * link_tlv, scan_tlvs: the macOS 27.0 WLAN adapter differs from the 26.6.1 one the J813 recipe
  * came from. startInterface carries the three link addresses in TLV 386 (was 385), and the scan
  * request (command 0x1000f) carries a channel-list TLV 0x104 and an OCE TLV 0x165 after the fixed
- * 14 bytes. A J873 scan without them crashed the UMAC in SCHED_Req_Add.
+ * 14 bytes. The J873 scan crash in SCHED_Req_Add came from a zero passive dwell in those 14 bytes
+ * (see build_scan), not from the missing TLVs; whether the TLVs are required is untested.
  */
 struct centauri_board {
 	const char *compatible;
