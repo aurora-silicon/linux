@@ -44,6 +44,10 @@ struct centauri {
  * J873 (Mac mini M6): board 0x24, chip 0x8152 from its ADT, the composition taken from the J813
  * word; port 0 config 0x388028000, lane 0x38f010000 and PERST# gpio0 pin 3 (0x31a000000 + 4 * 3)
  * from its ADT; config +0x130 is 0x208 as in the m1n1 T8152 bring-up that links the port.
+ * keep_port_tables: the J813 sequence zeroes the 16 words at port+0x3000 and the 256 words at
+ * port+0x3800. On the J873 those are the RID2SID and MSIMAP tables that pcie-apple programmed
+ * (PORT_T602X_RID2SID, PORT_T602X_MSIMAP); the cycle then drops function 0's stream entry and
+ * its DMA arrives as SID 0 (DART "BPF reject"). Such a board gets both tables written back.
  */
 struct centauri_board {
 	const char *compatible;
@@ -52,15 +56,16 @@ struct centauri_board {
 	u64 port, phy, pad;
 	u32 tune_130;
 	u16 bridge_id;	/* root port device ID, 0 = any Apple root port */
+	bool keep_port_tables;
 };
 
 static inline const struct centauri_board *centauri_board(void)
 {
 	static const struct centauri_board boards[] = {
 		{ "apple,j813", "apple/centauri/j813-ftab.bin", 0x00248142,
-		  0x488028000ULL, 0x48f010000ULL, 0x39a000300ULL, 0x03020000, 0x100c },
+		  0x488028000ULL, 0x48f010000ULL, 0x39a000300ULL, 0x03020000, 0x100c, false },
 		{ "apple,j873", "apple/centauri/j873-ftab.bin", 0x00248152,
-		  0x388028000ULL, 0x38f010000ULL, 0x31a00000cULL, 0x208, 0 },
+		  0x388028000ULL, 0x38f010000ULL, 0x31a00000cULL, 0x208, 0, true },
 	};
 	int i;
 
