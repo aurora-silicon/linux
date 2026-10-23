@@ -245,11 +245,14 @@ static void centauri_remove(struct pci_dev *pdev)
 	centauri_free_boot(c);
 }
 
+/* 0x1903 is the Beta (Bluetooth) function: btcentauri claims it. This driver needs functions
+ * 0 and 1 (1 is enabled here, its BAR is used by the Wi-Fi code) and reaches function 2 only
+ * through config space and its struct device for DMA.
+ */
 static const struct pci_device_id centauri_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x1900), .driver_data = 0x8000 },
 	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x1901), .driver_data = 0x8000 },
 	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x1902), .driver_data = 0x0008 },
-	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x1903), .driver_data = 0x0018 },
 	{ }
 };
 MODULE_DEVICE_TABLE(pci, centauri_ids);
