@@ -410,6 +410,13 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	ps->reset_time_us = t8132 ? APPLE_PMGR_T8132_RESET_TIME : APPLE_PMGR_RESET_TIME;
 	ps->needs_reset_idle_wait = t8132;
 	ps->no_auto_enable = t8132 && !strict_state;
+	/*
+	 * A coprocessor CPU domain whose firmware must not be clock or power
+	 * gated behind its back (the external display controllers) never gets
+	 * automatic power management, as apple,no-auto-pm in aurora-silicon/linux#358.
+	 */
+	if (of_property_read_bool(node, "apple,no-auto-pm"))
+		ps->no_auto_enable = true;
 	ps->strict_state = strict_state;
 
 	ret = of_property_read_string(node, "label", &name);
