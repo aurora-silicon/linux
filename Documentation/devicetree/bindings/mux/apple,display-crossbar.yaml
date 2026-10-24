@@ -24,6 +24,7 @@ properties:
       - apple,t8112-display-crossbar
       - apple,t6000-display-crossbar
       - apple,t6020-display-crossbar
+      - apple,t6041-display-crossbar
 
   reg:
     maxItems: 1
