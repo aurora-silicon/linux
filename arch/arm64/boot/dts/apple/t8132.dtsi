@@ -853,6 +853,84 @@
 
 /* Shared controller resources; board files select the qualified devices. */
 &soc {
+	/*
+	 * AOP (always-on processor). iBoot loads its RTKit firmware and leaves
+	 * it halted; Linux starts it.
+	 */
+	aop: aop@390600000 {
+		compatible = "apple,t8132-aop";
+		reg = <0x3 0x90c00000 0x0 0x1e0000>,
+		      <0x3 0x90600000 0x0 0x88000>,
+		      <0x3 0x90050000 0x0 0x4000>,
+		      <0x3 0x882a8000 0x0 0x8>;
+		reg-names = "firmware", "asc", "asc-aux", "config";
+		mboxes = <&aop_mbox>;
+		mbox-names = "mbox";
+		iommus = <&aop_dart 0>;
+		status = "disabled";
+
+		/*
+		 * "dma" is the microphones' LEAP ADMAC channel (ADT audio-hp);
+		 * the speaker and jack channels follow the T6041 map.
+		 */
+		aop_audio: audio {
+			compatible = "apple,t8132-aop-audio", "apple,t6041-aop-audio",
+				     "apple,t6030-aop-audio";
+			dmas = <&admac0 1>;
+			dma-names = "dma";
+			#sound-dai-cells = <1>;
+		};
+	};
+
+	/* ADT lists the interrupts as 1, 0, 3, 2 of the block: send-empty is the lowest. */
+	aop_mbox: mailbox@390608000 {
+		compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x90608000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 433 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 434 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 435 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 436 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	aop_dart: iommu@390f00000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x3 0x90f00000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 457 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	/* The audio fabric's ADMACs: admac-leap-ns (DART stream 10) and admac-base-ns (stream 8) */
+	admac0: dma-controller@393300000 {
+		compatible = "apple,t8132-admac";
+		reg = <0x3 0x93300000 0x0 0x34000>;
+		#dma-cells = <1>;
+		dma-channels = <9>;
+		/* the ADT gives the first of the four outputs */
+		interrupts-extended = <&aic AIC_IRQ 478 IRQ_TYPE_LEVEL_HIGH>,
+				      <0>, <0>, <0>;
+		iommus = <&aop_dart 10>;
+		status = "disabled";
+	};
+
+	admac1: dma-controller@393800000 {
+		compatible = "apple,t8132-admac";
+		reg = <0x3 0x93800000 0x0 0x34000>;
+		#dma-cells = <1>;
+		dma-channels = <13>;
+		/* the ADT gives the first of the four outputs */
+		interrupts-extended = <&aic AIC_IRQ 475 IRQ_TYPE_LEVEL_HIGH>,
+				      <0>, <0>, <0>;
+		iommus = <&aop_dart 8>;
+		status = "disabled";
+	};
+
 	nub_spmi_a0: spmi@388908000 {
 		status = "disabled";
 		compatible = "apple,t8132-spmi", "apple,t8103-spmi";
