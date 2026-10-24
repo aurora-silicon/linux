@@ -11,6 +11,18 @@
 #include "sync_scope.h"
 #include "sync_input.h"
 
+int asahi_g17_completion_fence_status(struct dma_fence *fence)
+{
+	/* These private fences have no signaled callback. A pending flag is
+	 * sufficient to keep the frontier member; a concurrent signal can only
+	 * defer pruning until the next submission. Read terminal errors through
+	 * the normal locked API after observing the signalled flag.
+	 */
+	if (!dma_fence_test_signaled_flag(fence))
+		return 0;
+	return dma_fence_get_status(fence);
+}
+
 struct asahi_g17_scope;
 struct asahi_g17_scope_callback {
 	struct dma_fence_cb callback;

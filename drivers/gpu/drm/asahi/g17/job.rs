@@ -385,6 +385,18 @@ pub(crate) struct Fences {
     pub(crate) publication: Option<Arc<super::completion::Publication>>,
 }
 
+impl Fences {
+    /// Scheduler::enqueue always supplies our explicit completion fence here.
+    /// It has no polling callback, so pending frontier checks need no lock.
+    pub(crate) fn status(&self) -> i32 {
+        unsafe extern "C" {
+            fn asahi_g17_completion_fence_status(fence: *mut bindings::dma_fence) -> i32;
+        }
+        // SAFETY: completed owns the live private fence throughout this read.
+        unsafe { asahi_g17_completion_fence_status(self.completed.raw()) }
+    }
+}
+
 impl<B: Backend> Scheduler<B> {
     pub(crate) fn new(dev: &AsahiDrmDevice, backend: Arc<B>, engine: Engine) -> Result<Self> {
         let (credits, name) = match engine {

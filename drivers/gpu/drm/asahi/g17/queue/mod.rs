@@ -155,7 +155,7 @@ impl<B: Backend> Queue<B> {
     fn prune_frontier(&mut self, index: usize) {
         let failure = &mut self.failures[index];
         self.frontiers[index].retain(|(sequence, fences)| {
-            let status = job::fence_status(&fences.completed);
+            let status = fences.status();
             if status == 0 {
                 return true;
             }
@@ -203,11 +203,11 @@ impl<B: Backend> Queue<B> {
             && !destinations.has_outputs()
             && self.frontiers[0].iter().all(|(sequence, fences)|
                 !Order::contains(order.wait_through[0], *sequence)
-                    || job::fence_status(&fences.completed) > 0)
+                    || fences.status() > 0)
             && self.frontiers[1].iter().all(|(sequence, fences)|
                 !Order::contains(order.wait_through[1], *sequence)
                     || fences.ready.raw() != fences.completed.raw()
-                    || job::fence_status(&fences.completed) > 0)
+                    || fences.status() > 0)
             && self.failures.iter().enumerate().all(|(index, failure)|
                 failure.as_ref().is_none_or(|(sequence, _)|
                     !Order::contains(order.wait_through[index], *sequence)))
@@ -293,7 +293,7 @@ impl<B: Backend> Queue<B> {
             // Successful completion includes host timestamp publication. Its
             // ready fence adds no ordering and would prevent shallow inline
             // publication. Failed and pending producers still need checking.
-            if job::fence_status(&fences.completed) > 0 {
+            if fences.status() > 0 {
                 continue;
             }
             dependencies.push(fences.ready.clone(), GFP_KERNEL)?;

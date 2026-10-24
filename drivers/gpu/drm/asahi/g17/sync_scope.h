@@ -4,6 +4,8 @@
 #include <linux/types.h>
 struct dma_fence;
 void asahi_g17_signal_fence(struct dma_fence *fence);
+/* Only for explicitly signalled driver completion fences, with no poll op. */
+int asahi_g17_completion_fence_status(struct dma_fence *fence);
 
 struct dma_fence *asahi_g17_scope_create(struct dma_fence *previous,
 				      struct dma_fence *submitted, u64 point);
