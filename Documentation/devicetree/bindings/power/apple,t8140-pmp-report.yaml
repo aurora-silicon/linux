@@ -93,6 +93,13 @@ patternProperties:
           holds this entry's device ID, instead of by reg. Only valid on a
           report whose PMP the host starts.
 
+      apple,irq-safe:
+        type: boolean
+        description:
+          The entry is the parent of IRQ-safe PMGR power states and is
+          switched with interrupts disabled. Setting the state takes a
+          spinlock and polls the acknowledgment atomically.
+
     required:
       - compatible
       - reg
