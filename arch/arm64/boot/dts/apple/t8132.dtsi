@@ -17,6 +17,11 @@
 	#address-cells = <2>;
 	#size-cells = <2>;
 
+	cpuidle: cpuidle {
+		compatible = "apple,t8132-cpuidle";
+		status = "disabled";
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
