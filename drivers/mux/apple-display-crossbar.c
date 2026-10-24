@@ -95,6 +95,10 @@ struct apple_dpxbar_hw {
 	const struct mux_control_ops *ops;
 	/* DP IN runs without the FIFO_RD_PCLK1 cycle-slip toggle (t600x) */
 	bool dpin_no_cycle_slip;
+	/* T6030 flow (route on select, clocks on link up) regardless of the machine */
+	bool t6030_flow;
+	/* no UNK_TUNABLE write at probe */
+	bool no_tunable;
 };
 
 struct apple_dpxbar {
@@ -1003,12 +1007,13 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 	spin_lock_init(&dpxbar->lock);
 
 	dpxbar->dev = dev;
-	dpxbar->t6030_dpin = of_machine_is_compatible("apple,t6030");
+	dpxbar->t6030_dpin = hw->t6030_flow || of_machine_is_compatible("apple,t6030");
 	dpxbar->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(dpxbar->regs))
 		return PTR_ERR(dpxbar->regs);
 
-	if (!of_device_is_compatible(dev->of_node, "apple,t6020-display-crossbar")) {
+	if (!hw->no_tunable &&
+	    !of_device_is_compatible(dev->of_node, "apple,t6020-display-crossbar")) {
 		readl(dpxbar->regs + UNK_TUNABLE);
 		writel(hw->tunable, dpxbar->regs + UNK_TUNABLE);
 		readl(dpxbar->regs + UNK_TUNABLE);
@@ -1102,6 +1107,20 @@ static const struct apple_dpxbar_hw apple_dpxbar_hw_t6020 = {
 	.ops = &apple_dpxbar_t602x_ops,
 };
 
+/*
+ * T6040/T6041 (M4 Pro/Max): one crossbar per ATC (ADT atcN-dpxbar,
+ * "atc-dpxbar,t604x"), 0x4000 bytes, no tunable. The block uses the T6030
+ * compact register map and flow: the status mirrors at 0x804/0x810/0x81c
+ * follow 0x004/0x014/0x024 and 0x808/0x818 follow 0x00c/0x020, as on T6030.
+ * The ADT lists nine UFP endpoints (dispext0-3, scodec0 and the DP IN ports).
+ */
+static const struct apple_dpxbar_hw apple_dpxbar_hw_t6041 = {
+	.n_ufp = 9,
+	.ops = &apple_dpxbar_t602x_ops,
+	.t6030_flow = true,
+	.no_tunable = true,
+};
+
 static const struct of_device_id apple_dpxbar_ids[] = {
 	{
 		.compatible = "apple,t8103-display-crossbar",
@@ -1118,6 +1137,10 @@ static const struct of_device_id apple_dpxbar_ids[] = {
 	{
 		.compatible = "apple,t6020-display-crossbar",
 		.data = &apple_dpxbar_hw_t6020,
+	},
+	{
+		.compatible = "apple,t6041-display-crossbar",
+		.data = &apple_dpxbar_hw_t6041,
 	},
 	{}
 };
