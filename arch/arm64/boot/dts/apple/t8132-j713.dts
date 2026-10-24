@@ -56,6 +56,36 @@
 	};
 };
 
+/*
+ * m1n1 programs the AOP DART's DAPF and reserves the firmware segments and
+ * the DAPF windows in memory-region when /chosen asks for the AOP's handoff,
+ * or disables the AOP.
+ */
+&aop {
+	status = "okay";
+};
+
+&aop_audio {
+	apple,chassis-name = "J713";
+	apple,machine-kind = "MacBook Air";
+};
+
+&aop_dart {
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+&admac0 {
+	status = "okay";
+};
+
+&admac1 {
+	status = "okay";
+};
+
 /* Enable DVFS only with the J713 board thermal owner. */
 &cpufreq_e {
 	status = "okay";
