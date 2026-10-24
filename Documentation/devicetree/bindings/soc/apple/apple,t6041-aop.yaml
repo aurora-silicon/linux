@@ -4,7 +4,7 @@
 $id: http://devicetree.org/schemas/soc/apple/apple,t6041-aop.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple T604x Always-On Processor
+title: Apple T604x and T8132 Always-On Processor
 
 maintainers:
   - Jonathan Goyvaerts <jonathan.goyvaerts@gmail.com>
@@ -16,9 +16,17 @@ description:
   reaches its services through the RTKit endpoints. The firmware's external
   code and log segments live in DRAM, and the bootloader reserves them.
 
+  On T8132 the bootloader leaves the AOP DART's address filter (DAPF) empty
+  and iBoot moves the log segment at every boot. The host programs the DAPF
+  from the Apple device tree and maps its windows and the log segment inside
+  IOVA-only reservations listed in memory-region; the DAPF block is a fifth
+  register range.
+
 properties:
   compatible:
-    const: apple,t6041-aop
+    enum:
+      - apple,t6041-aop
+      - apple,t8132-aop
 
   reg:
     minItems: 2
@@ -27,6 +35,7 @@ properties:
       - description: ASC wrapper and processor control registers
       - description: Second ASC register window
       - description: AOP configuration registers
+      - description: The AOP DART's address filter (DAPF) block
 
   reg-names:
     minItems: 2
@@ -35,6 +44,7 @@ properties:
       - const: asc
       - const: asc-aux
       - const: config
+      - const: dapf
 
   mboxes:
     maxItems: 1
@@ -51,7 +61,8 @@ properties:
     description:
       The firmware segments in DRAM (its external code and its log), filled in
       by the bootloader from the ADT. The iommu-addresses property of each
-      region gives the address the firmware uses for it.
+      region gives the address the firmware uses for it. A region without reg
+      only reserves IOVA space, for windows the host maps from the ADT.
 
   audio:
     type: object
@@ -92,6 +103,24 @@ required:
   - mboxes
   - mbox-names
   - iommus
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          const: apple,t8132-aop
+    then:
+      properties:
+        reg:
+          minItems: 5
+        reg-names:
+          minItems: 5
+    else:
+      properties:
+        reg:
+          maxItems: 4
+        reg-names:
+          maxItems: 4
 
 additionalProperties: false
 
