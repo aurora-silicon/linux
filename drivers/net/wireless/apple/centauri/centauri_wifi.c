@@ -29,6 +29,10 @@
 static_assert(DATA_TX_BUFFER >= CEN_ALPHA_SCRATCH_OFFSET + CEN_ALPHA_SCRATCH_SIZE);
 static_assert(DATA_TX_BUFFER + DATA_TX_SLOTS * BUFFER_SIZE <= DATA_RX_BUFFER);
 
+static bool roam_scan;
+module_param(roam_scan, bool, 0644);
+MODULE_PARM_DESC(roam_scan, "Let the firmware run its own roam and background scans after a join; 0 = off (default). The scans take the radio off channel for seconds (72 percent ping loss measured) until the host programs a roam profile");
+
 static bool host_setup = true;
 module_param(host_setup, bool, 0644);
 MODULE_PARM_DESC(host_setup, "Before a join, tell the firmware the host is awake (command 6) and apply the reference TX defaults (commands 43 and 52) when the tx_config files have not; 1 = on (default)");
@@ -1166,6 +1170,11 @@ static void connect_worker(struct work_struct *work)
 	status = !ret && wifi->connect_status == 0 ? WLAN_STATUS_SUCCESS : WLAN_STATUS_UNSPECIFIED_FAILURE;
 	wifi->connecting = false;
 	wifi->connected = status == WLAN_STATUS_SUCCESS;
+	if (wifi->connected && !roam_scan) {
+		int roam_ret = command(wifi, 0x20016, NULL, 0);
+
+		dev_info(&wifi->control->pdev->dev, "roam scan off: rc=%d status=%u\n", roam_ret, wifi->reply_status);
+	}
 	memzero_explicit(wifi->expected_pmk, sizeof(wifi->expected_pmk));
 	/* The command and connection completion have consumed the PMK buffer. */
 	if (slot < ring_size[1])
