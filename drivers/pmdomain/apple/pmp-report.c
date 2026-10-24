@@ -1473,6 +1473,13 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 
 	ent->genpd.power_on = apple_pmp_report_entry_power_on;
 	ent->genpd.power_off = apple_pmp_report_entry_power_off;
+	/*
+	 * An entry that is the parent of PMGR power states (which are IRQ safe)
+	 * must be IRQ safe too. Setting the state takes a spinlock and polls
+	 * the acknowledgment atomically, so it may be called with IRQs off.
+	 */
+	if (of_property_read_bool(node, "apple,irq-safe"))
+		ent->genpd.flags |= GENPD_FLAG_IRQ_SAFE;
 
 	ret = pm_genpd_init(&ent->genpd, NULL, true);
 	if (ret) {
