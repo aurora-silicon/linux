@@ -134,8 +134,9 @@
 	status = "disabled";
 };
 
+/* The SN012776 speaker amps. */
 &ps_i2c3 {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_i2c4 {
