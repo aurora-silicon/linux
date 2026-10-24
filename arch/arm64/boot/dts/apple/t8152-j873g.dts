@@ -288,3 +288,4 @@
 #include "t8152-j873-qspi.dtsi"
 #include "t8152-j873-nvme.dtsi"
 #include "t8152-j873-usb.dtsi"
+#include "t8152-j873-ethernet.dtsi"
