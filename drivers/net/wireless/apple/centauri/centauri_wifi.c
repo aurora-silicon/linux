@@ -29,6 +29,12 @@
 static_assert(DATA_TX_BUFFER >= CEN_ALPHA_SCRATCH_OFFSET + CEN_ALPHA_SCRATCH_SIZE);
 static_assert(DATA_TX_BUFFER + DATA_TX_SLOTS * BUFFER_SIZE <= DATA_RX_BUFFER);
 
+static bool auto_rings = true;
+module_param(auto_rings, bool, 0644);
+MODULE_PARM_DESC(auto_rings, "Open the data rings (data_probe ids 76, 24, 15, 12 before the join, 25 after it) from the connect path; 1 = on (default). The data_probe debugfs files still work and are skipped for rings already open");
+
+static int data_probe_locked(struct centauri_wifi *wifi, unsigned int id, bool internal);
+
 static bool roam_scan;
 module_param(roam_scan, bool, 0644);
 MODULE_PARM_DESC(roam_scan, "Let the firmware run its own roam and background scans after a join; 0 = off (default). The scans take the radio off channel for seconds (72 percent ping loss measured) until the host programs a roam profile");
@@ -114,9 +120,6 @@ struct centauri_wifi {
 	u16 connect_status;
 	u8 bssid[ETH_ALEN], connect_payload[1024], request_ie[256];
 	size_t connect_size, request_ie_size;
-	u8 passphrase[64];
-	size_t passphrase_size;
-	struct dentry *passphrase_file;
 	struct dentry *data_probe_file;
 	struct dentry *data_status_file;
 	struct dentry *data_rx_snapshot_file;
@@ -973,7 +976,7 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	struct cfg80211_bss *bss;
 	const struct cfg80211_bss_ies *ies;
 	const u8 *rsn, *ap_rsn;
-	u8 rsn_body[255], ssid[35], key[66], zero[20] = {}, pmf;
+	u8 rsn_body[255], ssid[35], zero[20] = {}, pmf;
 	u8 *payload = wifi->connect_payload;
 	size_t size = 130, rsn_size;
 	u16 caps = 0;
@@ -990,10 +993,6 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	mutex_lock(&wifi->lock);
 	if (!wifi->configured || wifi->connecting || wifi->connected || wifi->scan_request) {
 		ret = -EBUSY;
-		goto out;
-	}
-	if (!wifi->passphrase_size) {
-		ret = -ENOKEY;
 		goto out;
 	}
 	bss = cfg80211_get_bss(wiphy, params->channel, params->bssid,
@@ -1045,11 +1044,9 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	memcpy(ssid + 3, params->ssid, params->ssid_len);
 	append_tlv(payload, &size, 342, ssid, 3 + params->ssid_len);
 	append_tlv(payload, &size, WLAN_EID_RSN, rsn_body, rsn_size);
-	/* The fixed field carries the PMK; TLV 313 carries the passphrase. */
-	put_unaligned_le16(wifi->passphrase_size, key);
-	memcpy(key + 2, wifi->passphrase, wifi->passphrase_size);
-	append_tlv(payload, &size, 313, key, 2 + wifi->passphrase_size);
-	memzero_explicit(key, sizeof(key));
+	/* The fixed field carries the PMK. The firmware accepts a join with the PMK alone (measured); the macOS TLV 313 carries the
+	 * passphrase and is not sent.
+	 */
 	append_tlv(payload, &size, 316, &pmf, 1);
 	append_tlv(payload, &size, 376, mld_defaults, sizeof(mld_defaults));
 	wifi->connect_size = size;
@@ -1108,6 +1105,17 @@ static void connect_worker(struct work_struct *work)
 	int ret;
 
 	mutex_lock(&wifi->lock);
+	if (auto_rings) {
+		static const unsigned int ring_ids[] = { 76, 24, 15, 12 };
+		unsigned int n;
+
+		for (n = 0; n < ARRAY_SIZE(ring_ids); n++) {
+			int ring_ret = data_probe_locked(wifi, ring_ids[n], true);
+
+			if (ring_ret && ring_ret != -EBUSY)
+				dev_warn(&wifi->control->pdev->dev, "data ring %u setup failed: %d\n", ring_ids[n], ring_ret);
+		}
+	}
 	host_setup_commands(wifi);
 	slot = wifi->command_head;
 	ret = command(wifi, 131072, wifi->connect_payload, wifi->connect_size);
@@ -1185,6 +1193,18 @@ static void connect_worker(struct work_struct *work)
 		 ret, command_status, wifi->connect_status, wifi->connect_event);
 	cfg80211_connect_result(wifi->netdev, wifi->bssid,
 		wifi->request_ie, wifi->request_ie_size, NULL, 0, status, GFP_KERNEL);
+	if (status == WLAN_STATUS_SUCCESS && auto_rings && !READ_ONCE(wifi->stopping)) {
+		/* The normal TX ring is opened after the connection result, as in the manual recipe (data_probe 25 after wpa completed);
+		 * doing it after cfg80211_connect_result keeps the join inside the supplicant's timeout.
+		 */
+		int ring_ret;
+
+		mutex_lock(&wifi->lock);
+		ring_ret = data_probe_locked(wifi, 25, true);
+		mutex_unlock(&wifi->lock);
+		if (ring_ret && ring_ret != -EBUSY)
+			dev_warn(&wifi->control->pdev->dev, "data ring 25 setup failed: %d\n", ring_ret);
+	}
 	if (status == WLAN_STATUS_SUCCESS && !READ_ONCE(wifi->stopping)) {
 		netif_carrier_on(wifi->netdev);
 		if (wifi->data_probe_done & BIT(5))
@@ -1326,46 +1346,6 @@ static const struct net_device_ops net_ops = {
 	.ndo_stop = net_stop,
 	.ndo_start_xmit = net_transmit,
 	.ndo_validate_addr = eth_validate_addr,
-};
-
-static ssize_t passphrase_write(struct file *file, const char __user *input,
-			       size_t count, loff_t *position)
-{
-	struct centauri_wifi *wifi = file->private_data;
-	u8 value[64];
-	size_t length = count;
-	int ret = 0;
-
-	if (count < 8 || count > sizeof(value))
-		return -EINVAL;
-	if (copy_from_user(value, input, count)) {
-		ret = -EFAULT;
-		goto out;
-	}
-	if (value[length - 1] == '\n')
-		length--;
-	if (length < 8 || length > 63) {
-		ret = -EINVAL;
-		goto out;
-	}
-	mutex_lock(&wifi->lock);
-	if (wifi->connecting) {
-		ret = -EBUSY;
-	} else {
-		memzero_explicit(wifi->passphrase, sizeof(wifi->passphrase));
-		memcpy(wifi->passphrase, value, length);
-		wifi->passphrase_size = length;
-	}
-	mutex_unlock(&wifi->lock);
-out:
-	memzero_explicit(value, sizeof(value));
-	return ret ?: count;
-}
-
-static const struct file_operations passphrase_ops = {
-	.owner = THIS_MODULE,
-	.open = simple_open,
-	.write = passphrase_write,
 };
 
 /* Airship direct_memregion::map (0x1802864e0) sends opcode 8, a region ID,
@@ -1552,18 +1532,14 @@ static const struct file_operations fwlog_buffer_ops = {
  * 0x11760e. Keep these empty-ring probes explicit until packet DMA is proven.
  * The reserved regions below do not overlap control rings or scan buffers.
  */
-static ssize_t data_probe_write(struct file *file, const char __user *input,
-			       size_t count, loff_t *position)
+/* Called with wifi->lock held. From the connect path (internal) the "connecting" flag is expected to be set. */
+static int data_probe_locked(struct centauri_wifi *wifi, unsigned int id, bool internal)
 {
-	struct centauri_wifi *wifi = file->private_data;
 	u8 message[0x34 + 10] = { 0 };
-	unsigned int id, vector, offset, size, bit, doorbell, irq;
+	unsigned int vector, offset, size, bit, doorbell, irq;
 	bool transfer = false;
 	int ret;
 
-	ret = kstrtouint_from_user(input, count, 0, &id);
-	if (ret)
-		return ret;
 	if (id == 76) {
 		vector = 192;
 		offset = 0x200000;
@@ -1596,15 +1572,14 @@ static ssize_t data_probe_write(struct file *file, const char __user *input,
 	} else {
 		return -EINVAL;
 	}
-	mutex_lock(&wifi->lock);
 	if (readl(wifi->a.bar + 8) != 2) {
 		ret = -EIO;
-		goto out;
+		return ret;
 	}
-	if (wifi->connecting || wifi->scan_request ||
+	if ((!internal && wifi->connecting) || wifi->scan_request ||
 	    (wifi->data_probe_done & BIT(bit))) {
 		ret = -EBUSY;
-		goto out;
+		return ret;
 	}
 	wifi->data_probe_done |= BIT(bit);
 	memset(wifi->a.window + offset, 0, size * 32);
@@ -1673,7 +1648,21 @@ static ssize_t data_probe_write(struct file *file, const char __user *input,
 			 size - 1, readl(wifi->a.bar + 8), index_read(wifi, 1, 12),
 			 index_read(wifi, 0, 207));
 	}
-out:
+	return ret;
+}
+
+static ssize_t data_probe_write(struct file *file, const char __user *input,
+			       size_t count, loff_t *position)
+{
+	struct centauri_wifi *wifi = file->private_data;
+	unsigned int id;
+	int ret;
+
+	ret = kstrtouint_from_user(input, count, 0, &id);
+	if (ret)
+		return ret;
+	mutex_lock(&wifi->lock);
+	ret = data_probe_locked(wifi, id, false);
 	mutex_unlock(&wifi->lock);
 	return ret ?: count;
 }
@@ -2333,7 +2322,6 @@ int centauri_wifi_register(struct centauri *c)
 	}
 	dev_info(&c->pdev->dev, "cfg80211 interface %s ready for scan tests; packet data unavailable\n",
 		 wifi->netdev->name);
-	wifi->passphrase_file = debugfs_create_file("passphrase", 0200, c->debug, wifi, &passphrase_ops);
 	wifi->data_probe_file = debugfs_create_file("data_probe", 0200, c->debug, wifi, &data_probe_ops);
 	wifi->data_status_file = debugfs_create_file("data_status", 0400, c->debug, wifi, &data_status_ops);
 	wifi->data_rx_snapshot_file = debugfs_create_file("data_rx_snapshot", 0400,
@@ -2369,7 +2357,6 @@ void centauri_wifi_unregister(struct centauri *c)
 	WRITE_ONCE(wifi->stopping, true);
 	if (wifi->netdev && wifi->netdev->reg_state == NETREG_REGISTERED)
 		netif_tx_disable(wifi->netdev);
-	debugfs_remove(wifi->passphrase_file);
 	debugfs_remove(wifi->data_probe_file);
 	debugfs_remove(wifi->data_status_file);
 	debugfs_remove(wifi->data_rx_snapshot_file);
