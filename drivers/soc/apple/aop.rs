@@ -93,6 +93,13 @@ const BOOTARGS_OFFSET: usize = 0x22c;
 const BOOTARGS_SIZE: usize = 0x230;
 /// The largest firmware segment the bootloader reserves in DRAM (T6040).
 const FW_REGION_MAX_SIZE: u64 = 0x10_0000;
+/// The AOP DART's DAPF block.
+const DAPF_MMIO_SIZE: usize = 0x4000;
+/// The DAPF block has 16 slices on T8132.
+const DAPF_MAX_SLICES: usize = 16;
+/// ASC CPU control, and its run bit.
+const ASC_CPU_CONTROL_OFFSET: usize = 0x44;
+const ASC_CPU_RUN: u32 = 1 << 4;
 /// The DART page size the firmware segments are mapped with.
 const FW_REGION_PAGE: u64 = 0x4000;
 const AFK_ENDPOINT_START: u8 = 0x20;
@@ -1579,6 +1586,18 @@ impl AopData {
         let phys = res.start as u64;
         let size = (res.end - res.start) as u64 + 1;
 
+        let (iova, length) = Self::iommu_tuple(region, np)?;
+        if length != size {
+            return Err(EINVAL);
+        }
+        Ok((phys, iova, size))
+    }
+
+    /// The IOVA and size `region`'s `iommu-addresses` gives for `np`.
+    fn iommu_tuple(
+        region: *mut bindings::device_node,
+        np: *mut bindings::device_node,
+    ) -> Result<(u64, u64)> {
         let mut len: c_int = 0;
         // SAFETY: `region` is a valid node and the name is NUL-terminated.
         let prop = unsafe {
@@ -1639,10 +1658,28 @@ impl AopData {
             }
         }
         let (iova, length) = found.ok_or(ENOENT)?;
-        if length != size {
+        Ok((iova, length))
+    }
+
+    /// The IOVA range of the `idx`-th `memory-region` of `np` when that
+    /// region has no `reg`: it only reserves IOVA space for the device.
+    fn iova_reservation(np: *mut bindings::device_node, idx: c_int) -> Result<Option<(u64, u64)>> {
+        // SAFETY: `np` is a valid node and the name is NUL-terminated.
+        let region =
+            unsafe { bindings::of_parse_phandle(np, c_str!("memory-region").as_char_ptr(), idx) };
+        if region.is_null() {
             return Err(EINVAL);
         }
-        Ok((phys, iova, size))
+        // SAFETY: of_parse_phandle() returned a reference on `region`.
+        let _put = ScopeGuard::new(|| unsafe { bindings::of_node_put(region) });
+        // SAFETY: `region` is a valid node and the name is NUL-terminated.
+        let reg = unsafe {
+            bindings::of_find_property(region, c_str!("reg").as_char_ptr(), ptr::null_mut())
+        };
+        if !reg.is_null() {
+            return Ok(None);
+        }
+        Self::iommu_tuple(region, np).map(Some)
     }
 
     /// Checks the firmware segments the AOP runs from DRAM (T6040). The
@@ -1679,6 +1716,9 @@ impl AopData {
         }
         let mut etext = false;
         for idx in 0..count {
+            if Self::iova_reservation(np, idx)?.is_some() {
+                continue;
+            }
             let (phys, iova, size) = Self::fw_region(np, idx).inspect_err(|e| {
                 dev_err!(dev, "Invalid firmware memory-region {} ({:?})", idx, e);
             })?;
@@ -1731,6 +1771,317 @@ impl AopData {
             return Err(ENOENT);
         }
         Ok(())
+    }
+
+    /// Maps `[lo, hi)` at its physical address in the device's DMA domain. The
+    /// range must not be RAM Linux owns and must lie in one of the device's
+    /// IOVA-only `memory-region` reservations, so that the DMA API never
+    /// hands it out. A range an earlier probe mapped the same way is kept.
+    fn map_identity(dev: &device::Device, lo: u64, hi: u64) -> Result<()> {
+        // SAFETY: `dev` is a live device being probed.
+        let np = unsafe { (*dev.as_raw()).of_node };
+        if np.is_null() {
+            return Err(ENODEV);
+        }
+        if lo % FW_REGION_PAGE != 0 || hi % FW_REGION_PAGE != 0 || hi <= lo {
+            return Err(EINVAL);
+        }
+        let len = hi - lo;
+        // SAFETY: A query of the resource tree.
+        let ram = unsafe {
+            bindings::region_intersects(
+                lo as _,
+                len as usize,
+                bindings::IORESOURCE_SYSTEM_RAM as _,
+                bindings::IORES_DESC_NONE as _,
+            )
+        };
+        if ram != bindings::REGION_DISJOINT as c_int {
+            dev_err!(dev, "{:#x}..{:#x} overlaps RAM", lo, hi);
+            return Err(EBUSY);
+        }
+        // SAFETY: `np` is the device's node, valid while it is bound.
+        let count = unsafe { bindings::of_reserved_mem_region_count(np) };
+        let mut inside = false;
+        for idx in 0..count.max(0) {
+            if let Some((iova, length)) = Self::iova_reservation(np, idx)? {
+                if iova <= lo && iova.checked_add(length).is_some_and(|end| hi <= end) {
+                    inside = true;
+                }
+            }
+        }
+        if !inside {
+            dev_err!(dev, "{:#x}..{:#x} is outside the reserved IOVA", lo, hi);
+            return Err(ENOENT);
+        }
+        // SAFETY: `dev` is a live device being probed.
+        let domain = unsafe { bindings::iommu_get_domain_for_dev(dev.as_raw()) };
+        if domain.is_null() {
+            return Err(ENODEV);
+        }
+        let mut mapped = 0;
+        let mut off = 0;
+        while off < len {
+            // SAFETY: `domain` is the device's domain, live while it is bound.
+            let back = unsafe { bindings::iommu_iova_to_phys(domain, (lo + off) as _) } as u64;
+            if back == lo + off {
+                mapped += 1;
+            } else if back != 0 {
+                dev_err!(dev, "IOVA {:#x} is in use", lo + off);
+                return Err(EBUSY);
+            }
+            off += FW_REGION_PAGE;
+        }
+        if mapped == len / FW_REGION_PAGE {
+            return Ok(());
+        }
+        if mapped != 0 {
+            return Err(EBUSY);
+        }
+        // SAFETY: `domain` is the device's domain; the range is unmapped,
+        // page aligned and inside an IOVA range the DMA API never uses.
+        let err = unsafe {
+            bindings::iommu_map(
+                domain,
+                lo as usize,
+                lo as _,
+                len as usize,
+                (bindings::IOMMU_READ | bindings::IOMMU_WRITE | bindings::IOMMU_MMIO) as i32,
+                bindings::GFP_KERNEL,
+            )
+        };
+        if err != 0 {
+            return Err(Error::from_errno(err));
+        }
+        Ok(())
+    }
+
+    /// T8132: what the firmware reaches outside its own reserved code comes
+    /// from the ADT, at the addresses iBoot chose for this boot:
+    /// - the DT's region at EC0p must be the ADT's `__ETEXT`;
+    /// - the windows of the DART's DAPF, which the firmware reaches at their
+    ///   physical addresses, are mapped there;
+    /// - the log segment (`__OS_LOG`), which iBoot places anew at every boot,
+    ///   is mapped at its physical address, where the firmware writes it.
+    fn map_adt_firmware(dev: &device::Device, ec0p: u64, dapf: &[DapfSlice]) -> Result<()> {
+        // SAFETY: `dev` is a live device being probed.
+        let np = unsafe { (*dev.as_raw()).of_node };
+        if np.is_null() {
+            return Err(ENODEV);
+        }
+        let page = |a: u64| a & !(FW_REGION_PAGE - 1);
+        let page_up = |a: u64| a.checked_add(FW_REGION_PAGE - 1).map(page).ok_or(EINVAL);
+
+        let (phys, remap, size) = Self::adt_segment(b"__ETEXT").inspect_err(|e| {
+            dev_err!(dev, "No __ETEXT segment in the ADT ({:?})", e);
+        })?;
+        // SAFETY: `np` is the device's node, valid while it is bound.
+        let count = unsafe { bindings::of_reserved_mem_region_count(np) };
+        let mut etext = false;
+        for idx in 0..count.max(0) {
+            if Self::iova_reservation(np, idx)?.is_some() {
+                continue;
+            }
+            let (rphys, riova, rsize) = Self::fw_region(np, idx)?;
+            if riova != ec0p {
+                continue;
+            }
+            let end = phys.checked_add(size).ok_or(EINVAL)?;
+            etext = remap == ec0p && rphys == page(phys) && rphys + rsize >= end;
+        }
+        if !etext {
+            dev_err!(
+                dev,
+                "The DT's EC0p region is not the ADT's __ETEXT ({:#x}+{:#x} at {:#x})",
+                phys,
+                size,
+                remap
+            );
+            return Err(EINVAL);
+        }
+
+        let mut windows = KVec::with_capacity(dapf.len(), GFP_KERNEL)?;
+        for slice in dapf {
+            // The DAPF end is inclusive.
+            let end = slice.end.checked_add(1).ok_or(EINVAL)?;
+            windows.push((page(slice.start), page_up(end)?), GFP_KERNEL)?;
+        }
+        windows.sort_unstable_by_key(|w| w.0);
+        let mut merged: KVec<(u64, u64)> = KVec::with_capacity(windows.len(), GFP_KERNEL)?;
+        for &(lo, hi) in windows.iter() {
+            match merged.last_mut() {
+                Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+                _ => merged.push((lo, hi), GFP_KERNEL)?,
+            }
+        }
+        for &(lo, hi) in merged.iter() {
+            Self::map_identity(dev, lo, hi).inspect_err(|e| {
+                dev_err!(dev, "Cannot map DAPF window {:#x}..{:#x} ({:?})", lo, hi, e);
+            })?;
+        }
+
+        let (phys, remap, size) = Self::adt_segment(b"__OS_LOG").inspect_err(|e| {
+            dev_err!(dev, "No __OS_LOG segment in the ADT ({:?})", e);
+        })?;
+        let lo = page(phys);
+        let hi = page_up(phys.checked_add(size).ok_or(EINVAL)?)?;
+        if remap != phys || size == 0 || hi - lo > FW_REGION_MAX_SIZE {
+            dev_err!(
+                dev,
+                "Invalid ADT __OS_LOG segment {:#x}+{:#x} at {:#x}",
+                phys,
+                size,
+                remap
+            );
+            return Err(EINVAL);
+        }
+        Self::map_identity(dev, lo, hi).inspect_err(|e| {
+            dev_err!(dev, "Cannot map __OS_LOG {:#x}..{:#x} ({:?})", lo, hi, e);
+        })?;
+        dev_info!(
+            dev,
+            "Mapped {} DAPF windows and __OS_LOG at {:#x} from the ADT",
+            merged.len(),
+            lo
+        );
+        Ok(())
+    }
+
+    /// Runs `f` on the ADT in the bootloader's `phram` "adt" reservation.
+    fn with_adt<R>(f: impl FnOnce(&Adt<'_>) -> Result<R>) -> Result<R> {
+        let mut found: *mut bindings::device_node = ptr::null_mut();
+        let mut node: *mut bindings::device_node = ptr::null_mut();
+        loop {
+            // SAFETY: of_find_compatible_node() drops the reference on `node`
+            // and returns the next match with a reference, or NULL.
+            node = unsafe {
+                bindings::of_find_compatible_node(node, ptr::null(), c_str!("phram").as_char_ptr())
+            };
+            if node.is_null() {
+                break;
+            }
+            let mut len: c_int = 0;
+            // SAFETY: `node` is a valid node and the name is NUL-terminated.
+            let label =
+                unsafe { bindings::of_get_property(node, c_str!("label").as_char_ptr(), &mut len) }
+                    .cast::<u8>();
+            // SAFETY: of_get_property() returned `len` bytes at `label`.
+            if !label.is_null()
+                && len == 4
+                && unsafe { core::slice::from_raw_parts(label, 4) } == b"adt\0"
+            {
+                if !found.is_null() {
+                    // SAFETY: Both references were taken above.
+                    unsafe {
+                        bindings::of_node_put(found);
+                        bindings::of_node_put(node);
+                    }
+                    return Err(EINVAL);
+                }
+                // SAFETY: `node` is valid; keep a reference past the loop.
+                found = unsafe { bindings::of_node_get(node) };
+            }
+        }
+        if found.is_null() {
+            return Err(ENODEV);
+        }
+        let mut res = mem::MaybeUninit::<bindings::resource>::zeroed();
+        // SAFETY: `found` is a valid node and `res` is writable storage.
+        let ret = unsafe { bindings::of_address_to_resource(found, 0, res.as_mut_ptr()) };
+        // SAFETY: The reference taken above.
+        unsafe { bindings::of_node_put(found) };
+        if ret != 0 {
+            return Err(EINVAL);
+        }
+        // SAFETY: of_address_to_resource() succeeded and filled it in.
+        let res = unsafe { res.assume_init() };
+        if res.end < res.start || res.end - res.start >= 0x20_0000 {
+            return Err(EINVAL);
+        }
+        let size = (res.end - res.start) as usize + 1;
+        // SAFETY: The range is the bootloader's ADT reservation, outside the
+        // linear map's ownership; it is mapped write-back for reading.
+        let data = unsafe { bindings::memremap(res.start, size, bindings::MEMREMAP_WB as _) };
+        if data.is_null() {
+            return Err(ENOMEM);
+        }
+        // SAFETY: Unmaps what memremap() mapped, after the last use below.
+        let _unmap = ScopeGuard::new(|| unsafe { bindings::memunmap(data) });
+        // SAFETY: memremap() mapped `size` readable bytes at `data`, which
+        // nothing writes while it is mapped here.
+        let adt = Adt(unsafe { core::slice::from_raw_parts(data.cast::<u8>(), size) });
+        f(&adt)
+    }
+
+    /// The physical address, DART address and size of the AOP firmware's
+    /// segment `want`, from the ADT (`/arm-io/aop/iop-aop-nub`
+    /// `segment-ranges`: 32-byte records, the physical address, the
+    /// firmware's address, the DART address, then a u32 size).
+    fn adt_segment(want: &[u8]) -> Result<(u64, u64, u64)> {
+        Self::with_adt(|adt| {
+            let mut node = 0;
+            for name in [&b"arm-io"[..], b"aop", b"iop-aop-nub"] {
+                node = adt.child(node, name)?.ok_or(ENOENT)?;
+            }
+            let names = adt.prop(node, b"segment-names")?.ok_or(ENOENT)?;
+            let ranges = adt.prop(node, b"segment-ranges")?.ok_or(ENOENT)?;
+            if ranges.len() % 32 != 0 {
+                return Err(EINVAL);
+            }
+            let names = names.split(|&c| c == 0).next().unwrap_or(&[]);
+            for (i, name) in names.split(|&c| c == b';').enumerate() {
+                if name != want {
+                    continue;
+                }
+                let entry = ranges.get(i * 32..i * 32 + 32).ok_or(EINVAL)?;
+                let phys = u64::from_le_bytes(entry[0..8].try_into().map_err(|_| EINVAL)?);
+                let remap = u64::from_le_bytes(entry[16..24].try_into().map_err(|_| EINVAL)?);
+                let size = u32::from_le_bytes(entry[24..28].try_into().map_err(|_| EINVAL)?);
+                return Ok((phys, remap, size as u64));
+            }
+            Err(ENOENT)
+        })
+    }
+
+    /// The AOP DART's DAPF slices from the ADT (`/arm-io/dart-aop`
+    /// `dapf-instance-0`: 52-byte records, start and end, then r20, r4 and
+    /// the r0 nibbles at bytes 49 and 50, as m1n1 reads them).
+    fn adt_dapf() -> Result<KVec<DapfSlice>> {
+        Self::with_adt(|adt| {
+            let mut node = 0;
+            for name in [&b"arm-io"[..], b"dart-aop"] {
+                node = adt.child(node, name)?.ok_or(ENOENT)?;
+            }
+            let table = adt.prop(node, b"dapf-instance-0")?.ok_or(ENOENT)?;
+            if table.is_empty() || table.len() % 52 != 0 || table.len() / 52 > DAPF_MAX_SLICES {
+                return Err(EINVAL);
+            }
+            let mut slices = KVec::with_capacity(table.len() / 52, GFP_KERNEL)?;
+            for r in table.chunks_exact(52) {
+                let u64_at = |o: usize| -> Result<u64> {
+                    Ok(u64::from_le_bytes(
+                        r[o..o + 8].try_into().map_err(|_| EINVAL)?,
+                    ))
+                };
+                let u32_at = |o: usize| -> Result<u32> {
+                    Ok(u32::from_le_bytes(
+                        r[o..o + 4].try_into().map_err(|_| EINVAL)?,
+                    ))
+                };
+                let slice = DapfSlice {
+                    start: u64_at(0)?,
+                    end: u64_at(8)?,
+                    r20: u32_at(16)?,
+                    r4: u32_at(24)?,
+                    r0: ((r[49] as u32) << 4) | r[50] as u32,
+                };
+                if slice.end < slice.start {
+                    return Err(EINVAL);
+                }
+                slices.push(slice, GFP_KERNEL)?;
+            }
+            Ok(slices)
+        })
     }
 
     /// Leaks every allocation the firmware may still access. Called when the
@@ -2426,6 +2777,94 @@ impl rtkit::Operations for AopData {
     }
 }
 
+/// A bounded reader of an Apple device tree (ADT) blob: a node is two u32
+/// counts (properties, children), its properties (a 32-byte name, a u32 size
+/// whose top bit is a flag, the data padded to four bytes), then its
+/// children.
+struct Adt<'a>(&'a [u8]);
+
+/// One slice of an Apple DART's DAPF (address filter), at 0x40 per slice:
+/// r0 at +0x00, r4 at +0x04, start at +0x08, end at +0x10, r20 at +0x20.
+#[derive(Clone, Copy)]
+struct DapfSlice {
+    start: u64,
+    end: u64,
+    r0: u32,
+    r4: u32,
+    r20: u32,
+}
+
+impl<'a> Adt<'a> {
+    const MAX_DEPTH: u32 = 32;
+
+    fn u32_at(&self, off: usize) -> Result<u32> {
+        let bytes = self
+            .0
+            .get(off..off.checked_add(4).ok_or(EINVAL)?)
+            .ok_or(EINVAL)?;
+        Ok(u32::from_le_bytes(bytes.try_into().map_err(|_| EINVAL)?))
+    }
+
+    /// Calls `f` with each property of the node at `off`; returns the offset
+    /// of its first child and its child count.
+    fn props(&self, off: usize, mut f: impl FnMut(&'a [u8], &'a [u8])) -> Result<(usize, u32)> {
+        let nprops = self.u32_at(off)?;
+        let nchild = self.u32_at(off + 4)?;
+        let mut pos = off + 8;
+        for _ in 0..nprops {
+            let name = self
+                .0
+                .get(pos..pos.checked_add(32).ok_or(EINVAL)?)
+                .ok_or(EINVAL)?;
+            let size = (self.u32_at(pos + 32)? & 0x7fff_ffff) as usize;
+            let start = pos + 36;
+            let data = self
+                .0
+                .get(start..start.checked_add(size).ok_or(EINVAL)?)
+                .ok_or(EINVAL)?;
+            let name = name.split(|&c| c == 0).next().unwrap_or(&[]);
+            f(name, data);
+            pos = start.checked_add((size + 3) & !3).ok_or(EINVAL)?;
+        }
+        Ok((pos, nchild))
+    }
+
+    fn prop(&self, off: usize, want: &[u8]) -> Result<Option<&'a [u8]>> {
+        let mut found = None;
+        self.props(off, |name, data| {
+            if name == want {
+                found = Some(data);
+            }
+        })?;
+        Ok(found)
+    }
+
+    /// The offset just past the node at `off` and all of its children.
+    fn skip(&self, off: usize, depth: u32) -> Result<usize> {
+        if depth > Self::MAX_DEPTH {
+            return Err(EINVAL);
+        }
+        let (mut pos, nchild) = self.props(off, |_, _| {})?;
+        for _ in 0..nchild {
+            pos = self.skip(pos, depth + 1)?;
+        }
+        Ok(pos)
+    }
+
+    /// The offset of the child of the node at `off` named `want`.
+    fn child(&self, off: usize, want: &[u8]) -> Result<Option<usize>> {
+        let (mut pos, nchild) = self.props(off, |_, _| {})?;
+        for _ in 0..nchild {
+            let name = self.prop(pos, b"name")?.unwrap_or(&[]);
+            if name.split(|&c| c == 0).next() == Some(want) {
+                return Ok(Some(pos));
+            }
+            pos = self.skip(pos, 1)?;
+        }
+        Ok(None)
+    }
+}
+
 /// The driver data of the AOP. Children reach the `Arc` through
 /// `AOP::from_child()`, which relies on this being `repr(transparent)` over
 /// it.
@@ -2453,6 +2892,10 @@ struct AopHwConfig {
     fw_regions: bool,
     /// Halt the co-processor again when its start fails (T6040).
     halt_on_failed_start: bool,
+    /// Program the DART's DAPF and map its windows, check `__ETEXT` and map
+    /// `__OS_LOG`, all from the ADT, before the start; the fifth `reg` is the
+    /// DAPF block (T8132, where the bootloader does neither).
+    adt_firmware: bool,
 }
 
 const HW_CFG_T8103: AopHwConfig = AopHwConfig {
@@ -2466,6 +2909,7 @@ const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     required_endpoints: &[],
     fw_regions: false,
     halt_on_failed_start: false,
+    adt_firmware: false,
 };
 const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
@@ -2478,6 +2922,7 @@ const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     required_endpoints: &[],
     fw_regions: false,
     halt_on_failed_start: false,
+    adt_firmware: false,
 };
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
@@ -2490,6 +2935,7 @@ const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     required_endpoints: &[],
     fw_regions: false,
     halt_on_failed_start: false,
+    adt_firmware: false,
 };
 const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
@@ -2502,6 +2948,7 @@ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     required_endpoints: &[],
     fw_regions: false,
     halt_on_failed_start: false,
+    adt_firmware: false,
 };
 /// T6040 (J616s): macOS writes the same four boot arguments as for the
 /// T6020. The firmware's external code and log live in DRAM, mapped through
@@ -2518,6 +2965,14 @@ const HW_CFG_T6040: AopHwConfig = AopHwConfig {
     required_endpoints: &[],
     fw_regions: true,
     halt_on_failed_start: true,
+    adt_firmware: false,
+};
+/// T8132 (J713): as T6040, but the bootloader neither programs the DART's
+/// DAPF nor reserves the log segment, which iBoot moves at every boot; both
+/// come from the ADT.
+const HW_CFG_T8132: AopHwConfig = AopHwConfig {
+    adt_firmware: true,
+    ..HW_CFG_T6040
 };
 /// T8140: the firmware is started with the boot arguments the bootloader
 /// left, boots through the setup port and speaks EPIC version 4. Of the
@@ -2535,6 +2990,7 @@ const HW_CFG_T8140: AopHwConfig = AopHwConfig {
     required_endpoints: &[0x20, 0x21, 0x22, 0x23, 0x2b],
     fw_regions: false,
     halt_on_failed_start: false,
+    adt_firmware: false,
 };
 
 kernel::of_device_table!(
@@ -2547,6 +3003,7 @@ kernel::of_device_table!(
         (of::DeviceId::new(c_str!("apple,t6020-aop")), &HW_CFG_T6020),
         (of::DeviceId::new(c_str!("apple,t8140-aop")), &HW_CFG_T8140),
         (of::DeviceId::new(c_str!("apple,t6041-aop")), &HW_CFG_T6040),
+        (of::DeviceId::new(c_str!("apple,t8132-aop")), &HW_CFG_T8132),
     ]
 );
 
@@ -2574,10 +3031,81 @@ impl platform::Driver for AopDriver {
         let aop_mmio = aop_req.iomap_sized::<AOP_MMIO_SIZE>()?;
         let asc_req = pdev.io_request_by_index(1).ok_or(EINVAL)?;
         let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?;
+        let dapf = if cfg.adt_firmware {
+            // As the J616s loader does: only while the AOP CPU is stopped,
+            // each slice in m1n1's order and read back; on any mismatch every
+            // slice gets its previous values back.
+            let dev = pdev.as_ref();
+            let slices = AopData::adt_dapf().inspect_err(|e| {
+                dev_err!(dev, "No AOP DAPF table in the ADT ({:?})", e);
+            })?;
+            let dapf_req = pdev.io_request_by_index(4).ok_or(EINVAL)?;
+            let dapf_map = dapf_req.iomap_sized::<DAPF_MMIO_SIZE>()?;
+            let dapf = dapf_map.as_view();
+            if asc_mmio.as_view().try_read32(ASC_CPU_CONTROL_OFFSET)? & ASC_CPU_RUN != 0 {
+                dev_err!(dev, "AOP CPU running; not touching its DAPF");
+                return Err(EBUSY);
+            }
+            let mut had = KVec::with_capacity(slices.len(), GFP_KERNEL)?;
+            for i in 0..slices.len() {
+                let a = 0x40 * i;
+                had.push(
+                    DapfSlice {
+                        start: dapf.try_read64(a + 0x08)?,
+                        end: dapf.try_read64(a + 0x10)?,
+                        r0: dapf.try_read32(a)?,
+                        r4: dapf.try_read32(a + 0x04)?,
+                        r20: dapf.try_read32(a + 0x20)?,
+                    },
+                    GFP_KERNEL,
+                )?;
+            }
+            let put = |a: usize, s: &DapfSlice| -> Result {
+                dapf.try_write32(s.r4, a + 0x04)?;
+                dapf.try_write64(s.start, a + 0x08)?;
+                dapf.try_write64(s.end, a + 0x10)?;
+                dapf.try_write32(s.r0, a)?;
+                dapf.try_write32(s.r20, a + 0x20)
+            };
+            for (i, s) in slices.iter().enumerate() {
+                put(0x40 * i, s)?;
+            }
+            let mut bad = None;
+            for (i, s) in slices.iter().enumerate() {
+                let a = 0x40 * i;
+                if dapf.try_read32(a + 0x04)? != s.r4
+                    || dapf.try_read64(a + 0x08)? != s.start
+                    || dapf.try_read64(a + 0x10)? & !3 != s.end & !3
+                    || dapf.try_read32(a)? & 0xff != s.r0
+                    || dapf.try_read32(a + 0x20)? != s.r20
+                {
+                    bad = Some(i);
+                    break;
+                }
+            }
+            if let Some(i) = bad {
+                for (k, s) in had.iter().enumerate() {
+                    put(0x40 * k, s)?;
+                }
+                dev_err!(dev, "AOP DAPF slice {} did not read back; restored", i);
+                return Err(EIO);
+            }
+            dev_info!(
+                dev,
+                "Programmed {} AOP DAPF slices from the ADT",
+                slices.len()
+            );
+            Some(slices)
+        } else {
+            None
+        };
         let asc_mmio = asc_mmio.as_view().relaxed();
         if cfg.fw_regions {
             // Before anything is written to the AOP: no mapping, no start.
             AopData::check_fw_regions(pdev.as_ref(), cfg.ec0p)?;
+        }
+        if let Some(dapf) = &dapf {
+            AopData::map_adt_firmware(pdev.as_ref(), cfg.ec0p, dapf)?;
         }
         let data = AopData::new(pdev, cfg)?;
         // Whatever fails below leaves the AOP running and its children
