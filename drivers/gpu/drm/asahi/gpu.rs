@@ -260,9 +260,8 @@ pub(crate) struct GpuManager {
     stats: Arc<stats::StatsSnapshot>,
     buffer_mgr: buffer::BufferManager::ver,
     ids: SequenceIDs,
-    #[allow(clippy::vec_box)]
     #[pin]
-    garbage_contexts: Mutex<KVec<KBox<fw::types::GpuObject<fw::workqueue::GpuContextData>>>>,
+    garbage_contexts: Mutex<KVec<workqueue::RetiredContext>>,
 }
 
 /// Operations the DRM driver performs on a GPU, independent of its firmware interface.
@@ -416,8 +415,8 @@ pub(crate) trait GpuManager: Send + Sync {
     fn get_cfg(&self) -> &'static hw::HwConfig;
     /// Get the dynamic GPU configuration for this SoC.
     fn get_dyncfg(&self) -> &hw::DynConfig;
-    /// Register an unused context as garbage
-    fn free_context(&self, data: KBox<fw::types::GpuObject<fw::workqueue::GpuContextData>>);
+    /// Register an unused context, with the objects it retains, for invalidation.
+    fn free_context(&self, ctx: workqueue::RetiredContext);
 }
 
 /// Private generic trait for functions that don't need to escape this module.
@@ -1471,7 +1470,7 @@ impl GpuManager for GpuManager::ver {
         core::mem::swap(&mut *self.garbage_contexts.lock(), &mut garbage_ctx);
 
         for ctx in garbage_ctx {
-            if self.invalidate_context(&ctx).is_err() {
+            if self.invalidate_context(&ctx.data).is_err() {
                 dev_err!(
                     self.dev.as_ref(),
                     "GpuContext: Failed to invalidate GPU context!\n"
@@ -1480,6 +1479,9 @@ impl GpuManager for GpuManager::ver {
                     panic!("GPU firmware timed out");
                 }
             }
+            // The firmware no longer knows the context's queues, so their structures may go now,
+            // ahead of the context data they point to.
+            core::mem::drop(ctx.retained);
         }
 
         let mut guard = self.alloc.lock();
@@ -1748,7 +1750,7 @@ impl GpuManager for GpuManager::ver {
         &self.dyncfg
     }
 
-    fn free_context(&self, ctx: KBox<fw::types::GpuObject<fw::workqueue::GpuContextData>>) {
+    fn free_context(&self, ctx: workqueue::RetiredContext) {
         let mut garbage = self.garbage_contexts.lock();
 
         if garbage.push(ctx, GFP_KERNEL).is_err() {
