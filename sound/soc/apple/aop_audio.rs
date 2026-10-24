@@ -1166,12 +1166,14 @@ impl SndSocAopDriver {
                 dev_warn!(data.dev, "decimator config refused, continuing\n");
             }
             let mut this = Self::new(data.clone())?;
-            // The speaker stream, where the node has its DMA channel.
-            if data
-                .fwnode
-                .property_match_string(c_str!("dma-names"), c_str!("spkr"))
-                .is_ok()
-            {
+            // The speaker and jack streams, where the node has their DMA
+            // channels: a machine may have the jack before its speakers.
+            let listed = |name: &CStr| {
+                data.fwnode
+                    .property_match_string(c_str!("dma-names"), name)
+                    .is_ok()
+            };
+            if listed(c_str!("spkr")) || (listed(c_str!("cout")) && listed(c_str!("cin"))) {
                 this.spkr = Some(aop_spkr::SpeakerComponent::register(data)?);
             }
             return Ok(this);
