@@ -162,6 +162,12 @@ static const struct dcp_v14_board dcp_v14_board_j516c = {
 	.promotion = true,
 	.log_bringup = true,
 	.swap_timestamps = true,
+	/*
+	 * The J516S panel and this image's swap carry the level block the
+	 * T6030 record uses (present byte +0x354, binary64 nits +0x35c, 500 nits
+	 * at most), as the e272b67 path on this J516C presented it.
+	 */
+	.panel_nits = true,
 };
 
 /*
@@ -291,7 +297,7 @@ struct apple_dcp_v14 {
 	u64 swaps;
 	u64 swap_ns_max;
 
-	/* Immutable probe admission: only the J514S/J516S internal panel. */
+	/* Immutable probe admission: only the J514S/J516S/J516C internal panel. */
 	bool panel_nits;
 	/* Copy of the last accepted surface; active_fb pins its DMA under lock. */
 	u8 shown_surface[DCP_V14_SURFACE_SIZE];
@@ -1689,7 +1695,8 @@ static bool dcp_v14_panel_nits_admit(const struct dcp_v14_board *board,
 				     dcp_v14_compat_fn machine_is, const void *ctx)
 {
 	return board && board->panel_nits &&
-		(machine_is(ctx, "apple,j514s") || machine_is(ctx, "apple,j516s"));
+		(machine_is(ctx, "apple,j514s") || machine_is(ctx, "apple,j516s") ||
+		 machine_is(ctx, "apple,j516c"));
 }
 
 const char *iomfb_v14_7_board_name(const struct dcp_v14_board *board)

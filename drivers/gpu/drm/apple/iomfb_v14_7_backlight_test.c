@@ -8,7 +8,7 @@
  * a refused level never becomes the actual one).
  *
  * The objects are built here, with no DCP: nothing in a case may reach an
- * RPC. A J613, J615 or J516C panel never initialises the backlight policy;
+ * RPC. A J613, J615 or J514C panel never initialises the backlight policy;
  * its state is set to answer "yes" so that a case fails if anything on
  * those boards looks at it.
  */
@@ -122,7 +122,7 @@ static bool v14_bl_ctx_machine_is(const void *ctx, const char *compat)
 	return !strcmp(((const char *const *)ctx)[1], compat);
 }
 
-/* Only the T6030 record (J514S, J516S) carries levels. */
+/* Only the T6030 record (J514S, J516S) and the J516C record carry levels. */
 static void v14_bl_boards(struct kunit *test)
 {
 	static const char *const t6030_j516s[] = { "apple,t6030-dcp", "apple,j516s" };
@@ -156,7 +156,8 @@ static void v14_bl_boards(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, board->panel_nits);
 	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, j516c, &known);
 	KUNIT_ASSERT_NOT_NULL(test, board);
-	KUNIT_EXPECT_FALSE(test, board->panel_nits);
+	KUNIT_EXPECT_TRUE(test, board->panel_nits);
+	KUNIT_EXPECT_TRUE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is, j516c));
 }
 
 static void v14_bl_gate_transitions(struct kunit *test)
@@ -342,14 +343,13 @@ static bool v14_bl_queued(struct apple_dcp_v14 *v14)
 }
 
 /*
- * The production paths on J613, J615 and J516C: no policy is consulted, no
+ * The production paths on J613, J615 and J514C: no policy is consulted, no
  * level is encoded, the work does nothing, sleep leaves the gate alone.
  */
 static void v14_bl_other_boards_untouched(struct kunit *test)
 {
 	const struct dcp_v14_board *boards[] = {
-		&dcp_v14_board_j613, &dcp_v14_board_j615, &dcp_v14_board_j516c,
-		&dcp_v14_board_j514c,
+		&dcp_v14_board_j613, &dcp_v14_board_j615, &dcp_v14_board_j514c,
 	};
 	struct dcp_backlight_present present;
 	unsigned int i;
