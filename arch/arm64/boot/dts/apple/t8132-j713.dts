@@ -36,6 +36,29 @@
 		wifi0 = &wifi0;
 	};
 
+	/*
+	 * The AOP firmware's external code (__ETEXT), which it reaches at EC0p
+	 * (DART address 0x100_0000_0000), sits in an iBoot carve-out at the same
+	 * address on every boot; the driver checks it against the ADT. Its log
+	 * (__OS_LOG) moves at every boot, and its DAPF windows are MMIO: the
+	 * driver maps both from the ADT inside the two IOVA reservations.
+	 */
+	reserved-memory {
+		aop_etext: aop-etext@10000ab0000 {
+			reg = <0x100 0x00ab0000 0x0 0x18000>;
+			no-map;
+			iommu-addresses = <&aop 0x100 0x0 0x0 0x18000>;
+		};
+
+		aop_oslog_iova: aop-oslog-iova {
+			iommu-addresses = <&aop 0x100 0x04000000 0x0 0x04000000>;
+		};
+
+		aop_mmio_iova: aop-mmio-iova {
+			iommu-addresses = <&aop 0x3 0x0 0x2 0x0>;
+		};
+	};
+
 	chosen {
 		linux-enablement-mac,disk-boot;
 		linux-enablement-mac,dapf-handoff = "/arm-io/aop", "/arm-io/mtp",
@@ -57,6 +80,32 @@
 };
 
 /* Enable DVFS only with the J713 board thermal owner. */
+&aop {
+	memory-region = <&aop_etext>, <&aop_oslog_iova>, <&aop_mmio_iova>;
+	status = "okay";
+};
+
+&aop_audio {
+	apple,chassis-name = "J713";
+	apple,machine-kind = "MacBook Air";
+};
+
+&aop_dart {
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+&admac0 {
+	status = "okay";
+};
+
+&admac1 {
+	status = "okay";
+};
+
 &cpufreq_e {
 	status = "okay";
 };
