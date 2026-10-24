@@ -217,6 +217,7 @@ static void apple_dpin_capacity_trace(struct kunit *test)
 	};
 
 	run_trace(test, &apple_dpin_m1, trace, ARRAY_SIZE(trace));
+	run_trace(test, &apple_dpin_m2, trace, ARRAY_SIZE(trace));
 	run_trace(test, &apple_dpin_m3, trace, ARRAY_SIZE(trace));
 }
 
@@ -233,8 +234,12 @@ static void apple_dpin_t602x_rearm_trace(struct kunit *test)
 		{ APPLE_DPIN_DROPPED, false, 0, 0, APPLE_DPIN_ACTIVATING },
 		{ APPLE_DPIN_WORK, false, 0, APPLE_DPIN_ATTACH, APPLE_DPIN_ACTIVATING },
 		{ APPLE_DPIN_RESULT, true, -EBUSY,
-		  APPLE_DPIN_CANCEL_RETRY | APPLE_DPIN_WARN, APPLE_DPIN_FAILED },
-		{ APPLE_DPIN_RETRY, true, 0, 0, APPLE_DPIN_FAILED },
+		  APPLE_DPIN_FIRST_WAIT | APPLE_DPIN_ARM_RETRY, APPLE_DPIN_WAITING_PIPELINE },
+		{ APPLE_DPIN_RETRY, true, 0, APPLE_DPIN_QUEUE, APPLE_DPIN_WAITING_PIPELINE },
+		{ APPLE_DPIN_WORK, true, 0, APPLE_DPIN_ATTACH, APPLE_DPIN_ACTIVATING },
+		{ APPLE_DPIN_RESULT, true, 0,
+		  APPLE_DPIN_RECOVERED | APPLE_DPIN_LOG_CONNECTED | APPLE_DPIN_AGAIN,
+		  APPLE_DPIN_HANDED },
 	};
 
 	run_trace(test, &apple_dpin_m2, trace, ARRAY_SIZE(trace));
@@ -297,18 +302,24 @@ static void apple_dpin_unplug_during_attach(struct kunit *test)
 static void apple_dpin_terminal_ends_wait(struct kunit *test)
 {
 	const int errors[] = { -ENODEV, -EADDRINUSE, -EOPNOTSUPP, -ESHUTDOWN, -ENOMEM };
-	unsigned int i, actions;
+	const struct apple_dpin_policy * const policies[] = {
+		&apple_dpin_m1, &apple_dpin_m2, &apple_dpin_m3,
+	};
+	unsigned int i, j, actions;
 
-	for (i = 0; i < ARRAY_SIZE(errors); i++) {
-		struct apple_dpin_state s = { .alive = true, .waiting = true };
+	for (j = 0; j < ARRAY_SIZE(policies); j++) {
+		for (i = 0; i < ARRAY_SIZE(errors); i++) {
+			struct apple_dpin_state s = { .alive = true, .waiting = true };
 
-		actions = apple_dpin_step(&s, &apple_dpin_m1, APPLE_DPIN_RESULT,
-					  true, errors[i]);
-		KUNIT_EXPECT_EQ(test, actions, APPLE_DPIN_CANCEL_RETRY | APPLE_DPIN_WARN);
-		KUNIT_EXPECT_FALSE(test, s.waiting);
-		KUNIT_EXPECT_EQ(test, s.phase, APPLE_DPIN_FAILED);
-		KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, &apple_dpin_m1,
-						      APPLE_DPIN_RETRY, true, 0), 0U);
+			actions = apple_dpin_step(&s, policies[j], APPLE_DPIN_RESULT,
+						  true, errors[i]);
+			KUNIT_EXPECT_EQ(test, actions,
+					APPLE_DPIN_CANCEL_RETRY | APPLE_DPIN_WARN);
+			KUNIT_EXPECT_FALSE(test, s.waiting);
+			KUNIT_EXPECT_EQ(test, s.phase, APPLE_DPIN_FAILED);
+			KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, policies[j],
+							      APPLE_DPIN_RETRY, true, 0), 0U);
+		}
 	}
 }
 
@@ -385,7 +396,7 @@ static void apple_dpin_all_policy_fields(struct kunit *test)
 	const struct apple_dpin_policy expected[] = {
 		{},
 		{ APPLE_DPIN_CHANGED, true, true, false, true, TB_HOST_DP_NOTIFY },
-		{ APPLE_DPIN_PRE_POST, false, false, true, false,
+		{ APPLE_DPIN_PRE_POST, true, false, true, false,
 		  TB_HOST_DP_HPD_ON_ACTIVATE | TB_HOST_DP_ACTIVE_BEFORE_DPRX |
 		  TB_HOST_DP_KEEP_DPRX_TIMEOUT | TB_HOST_DP_ADAPTER_QUIRKS |
 		  TB_HOST_DP_INITIAL_BW_GRANT },
@@ -603,6 +614,7 @@ static void apple_dpin_sleep_dprx_retention(struct kunit *test)
 	s = (struct apple_dpin_state){ .alive = true, .handed = true, .paused = true };
 	KUNIT_EXPECT_FALSE(test, apple_dpin_awaits_display(&s, &apple_dpin_m1));
 	s.handed = false;
+	/* M2 never installs the hook: KEEP_DPRX_TIMEOUT holds its tunnels. */
 	KUNIT_EXPECT_FALSE(test, apple_dpin_awaits_display(&s, &apple_dpin_m2));
 	apple_dpin_step(&s, &apple_dpin_m3, APPLE_DPIN_UP, false, 0);
 	KUNIT_EXPECT_TRUE(test, apple_dpin_awaits_display(&s, &apple_dpin_m3));
@@ -1156,7 +1168,81 @@ static void apple_dpin_m3_capacity_suspend(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_dpin_awaits_display(&s, p));
 }
 
+/* M2 pauses retries over sleep without deferring new handoffs. */
+static void apple_dpin_m2_capacity_suspend(struct kunit *test)
+{
+	struct apple_dpin_state s = {};
+	const struct apple_dpin_policy *p = &apple_dpin_m2;
+
+	KUNIT_EXPECT_FALSE(test, apple_dpin_pm_gated(&apple_dpin_disabled));
+	KUNIT_EXPECT_TRUE(test, apple_dpin_pm_gated(&apple_dpin_m1));
+	KUNIT_EXPECT_TRUE(test, apple_dpin_pm_gated(p));
+
+	apple_dpin_step(&s, p, APPLE_DPIN_UP, false, 0);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_WORK, false, 0),
+			APPLE_DPIN_ATTACH);
+	apple_dpin_step(&s, p, APPLE_DPIN_ADMITTED, true, 0);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RESULT, true, -EBUSY),
+			APPLE_DPIN_FIRST_WAIT | APPLE_DPIN_ARM_RETRY);
+	apple_dpin_step(&s, p, APPLE_DPIN_PAUSE, true, 0);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_admission_blocked(&s, p, false));
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RETRY, true, 0), 0U);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RESUME, true, 0),
+			APPLE_DPIN_ARM_RETRY);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RETRY, true, 0),
+			APPLE_DPIN_QUEUE);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_WORK, true, 0),
+			APPLE_DPIN_ATTACH);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RESULT, true, 0),
+			APPLE_DPIN_RECOVERED | APPLE_DPIN_LOG_CONNECTED | APPLE_DPIN_AGAIN);
+
+	/* A tunnel refused after an early RESUME arms its own retry. */
+	s = (struct apple_dpin_state){};
+	apple_dpin_step(&s, p, APPLE_DPIN_PAUSE, false, 0);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RESUME, false, 0), 0U);
+	apple_dpin_step(&s, p, APPLE_DPIN_UP, false, 0);
+	apple_dpin_step(&s, p, APPLE_DPIN_WORK, false, 0);
+	apple_dpin_step(&s, p, APPLE_DPIN_ADMITTED, true, 0);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RESULT, true, -EBUSY),
+			APPLE_DPIN_FIRST_WAIT | APPLE_DPIN_ARM_RETRY);
+
+	/* RESUME with no PAUSE before it only rearms a wait. */
+	s = (struct apple_dpin_state){ .alive = true };
+	apple_dpin_step(&s, p, APPLE_DPIN_RESULT, true, -EBUSY);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RESUME, true, 0),
+			APPLE_DPIN_ARM_RETRY);
+	KUNIT_EXPECT_TRUE(test, s.waiting);
+	KUNIT_EXPECT_FALSE(test, s.paused);
+	KUNIT_EXPECT_EQ(test, s.phase, APPLE_DPIN_WAITING_PIPELINE);
+
+	/* A readiness wait cut short by prepare waits, and asks after complete. */
+	s = (struct apple_dpin_state){};
+	apple_dpin_step(&s, p, APPLE_DPIN_UP, false, 0);
+	apple_dpin_step(&s, p, APPLE_DPIN_WORK, false, 0);
+	apple_dpin_step(&s, p, APPLE_DPIN_ADMITTED, true, 0);
+	apple_dpin_step(&s, p, APPLE_DPIN_PAUSE, true, 0);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RESULT, true, -EAGAIN),
+			APPLE_DPIN_FIRST_WAIT);
+	KUNIT_EXPECT_EQ(test, s.phase, APPLE_DPIN_WAITING_PIPELINE);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RESUME, true, 0),
+			APPLE_DPIN_ARM_RETRY);
+
+	/* Unplug while waiting cancels the retry; NHI removal ends the gate. */
+	apple_dpin_step(&s, p, APPLE_DPIN_PAUSE, true, 0);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_DOWN, true, 0),
+			APPLE_DPIN_QUEUE);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_WORK, true, 0),
+			APPLE_DPIN_CANCEL_RETRY | APPLE_DPIN_DROP);
+	KUNIT_EXPECT_FALSE(test, s.waiting);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RETRY, true, 0), 0U);
+	apple_dpin_step(&s, p, APPLE_DPIN_DROPPED, false, 0);
+	apple_dpin_step(&s, p, APPLE_DPIN_END_PM_GATE, false, 0);
+	KUNIT_EXPECT_FALSE(test, s.paused);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RESUME, false, 0), 0U);
+}
+
 static struct kunit_case apple_dpin_cases[] = {
+	KUNIT_CASE(apple_dpin_m2_capacity_suspend),
 	KUNIT_CASE(apple_dpin_m3_capacity_suspend),
 	KUNIT_CASE(apple_dpin_provider_handed_lifetime),
 	KUNIT_CASE(apple_dpin_provider_failed_retry),
