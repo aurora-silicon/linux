@@ -1,0 +1,37 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J873g USB1 (usb-drd1, back-left port) USB2 host bring-up.
+ * The loader powers the controller and initialises the eUSB2 PHY in host
+ * mode before Linux starts (no PMGR, PHY or Type-C driver yet), so the
+ * controller is described as a plain DWC3 host behind its two DARTs.
+ * Resources are from the 26A434 ADT: dart-usb1, usb-drd1.
+ */
+
+/ {
+	soc {
+		usb1_dart0: iommu@40b020000 {
+			compatible = "apple,t8152-dart", "apple,t8110-dart";
+			reg = <0x4 0x0b020000 0x0 0xc000>;
+			interrupts = <AIC_IRQ 1679 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+		};
+
+		usb1_dart1: iommu@40b040000 {
+			compatible = "apple,t8152-dart", "apple,t8110-dart";
+			reg = <0x4 0x0b040000 0x0 0xc000>;
+			interrupts = <AIC_IRQ 1679 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+		};
+
+		usb1: usb@40a430000 {
+			compatible = "snps,dwc3";
+			reg = <0x4 0x0a430000 0x0 0xcd00>;
+			interrupts = <AIC_IRQ 1692 IRQ_TYPE_LEVEL_HIGH>;
+			dr_mode = "host";
+			maximum-speed = "high-speed";
+			iommus = <&usb1_dart0 0>, <&usb1_dart1 1>;
+			snps,dis_u2_susphy_quirk;
+			snps,dis_u3_susphy_quirk;
+		};
+	};
+};
