@@ -1663,8 +1663,10 @@ impl Queue {
         else {
             return Ok(None);
         };
+        // Spared work dropped by another VM's recovery, like a failed producer below, is
+        // nothing to wait for and does not cancel its consumer (Packet::check_dependencies).
         if self.quarantined && self.spared_quarantine {
-            return Err(ECANCELED);
+            return Ok(None);
         }
         if !Arc::ptr_eq(active.packet.completion.status(), status)
             || self.quarantined
@@ -1674,12 +1676,7 @@ impl Queue {
         }
         let ticket = active.ticket.ok_or(EIO)?;
         let state = crate::g17::job::fence_status(&active.packet.completion.fence());
-        if state < 0 {
-            return Err(crate::g17::dependency::inherited_error(Error::from_errno(
-                state,
-            )));
-        }
-        if state > 0 {
+        if state != 0 {
             return Ok(None);
         }
         active.packet.completion.note_firmware_consumer();

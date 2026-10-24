@@ -8,14 +8,13 @@
 //! nor waits for another command; the last prerequisite publishes a ready result.
 
 use super::Output;
-use crate::g17::{dependency::inherited_error, status::VmStatus};
+use crate::g17::status::VmStatus;
 use kernel::{new_mutex, prelude::*, sync::{Arc, Mutex}};
 
 type Links = Option<KBox<Link>>;
 
 struct Link {
     target: Arc<Publication>,
-    result: Result,
     next: Links,
     // Reuse an already-consumed link as a traversal frame instead of recursing
     // or allocating when publication unlocks a long chain of ready successors.
@@ -25,9 +24,8 @@ struct Link {
 struct State {
     remaining: usize,
     result: Option<Result<[u64; 4]>>,
-    predecessor_error: Option<Error>,
     claimed: bool,
-    published: Option<Result>,
+    published: bool,
     successors: Links,
 }
 
@@ -38,10 +36,9 @@ impl State {
         }
         let result = self.result.take()?;
         self.claimed = true;
-        Some(match (result, self.predecessor_error) {
-            (Ok(_), Some(error)) => Err(error),
-            (result, _) => result,
-        })
+        // A predecessor's failure orders this publication but does not fail it: the
+        // command ran (Packet::check_dependencies), and a guilty VM's status is sticky.
+        Some(result)
     }
 }
 
@@ -63,9 +60,8 @@ impl Publication {
                     // Acceptance installs all links before releasing this sentinel.
                     remaining: 1,
                     result: None,
-                    predecessor_error: None,
                     claimed: false,
-                    published: None,
+                    published: false,
                     successors: None,
                 }, "G17 host timestamp publication"),
             }),
@@ -94,36 +90,23 @@ impl Publication {
 
     fn publish(&self, result: Result<[u64; 4]>) -> Links {
         if let Err(error) = result {
-            // Inherited failure is visible to the client without inventing a
-            // permanent admission failure in this command's VM.
-            self.status.report_failure(error);
+            // As in Completion::complete(): a cancellation is not this client's device loss.
+            if error != ECANCELED {
+                self.status.report_failure(error);
+            }
         }
         self.output.publish(result);
-        let result = result.map(|_| ());
-        let mut links = {
-            let mut state = self.state.lock();
-            // A late link is acknowledged only after timestamp writes, the public
-            // fence and aggregate membership have all been published off this lock.
-            state.published = Some(result);
-            state.successors.take()
-        };
-        let mut next = links.as_mut();
-        while let Some(link) = next {
-            link.result = result;
-            next = link.next.as_mut();
-        }
-        links
+        let mut state = self.state.lock();
+        // A late link is acknowledged only after timestamp writes, the public
+        // fence and aggregate membership have all been published off this lock.
+        state.published = true;
+        state.successors.take()
     }
 
-    fn predecessor_done(&self, result: Result) -> Links {
+    fn predecessor_done(&self) -> Links {
         let ready = {
             let mut state = self.state.lock();
             debug_assert!(state.remaining != 0);
-            if let Err(error) = result {
-                if state.predecessor_error.is_none() {
-                    state.predecessor_error = Some(inherited_error(error));
-                }
-            }
             state.remaining -= 1;
             state.claim()
         };
@@ -131,18 +114,15 @@ impl Publication {
     }
 
     fn add_successor(&self, mut link: KBox<Link>) {
-        let published = {
+        {
             let mut state = self.state.lock();
-            match state.published {
-                Some(result) => result,
-                None => {
-                    link.next = state.successors.take();
-                    state.successors = Some(link);
-                    return;
-                }
+            if !state.published {
+                link.next = state.successors.take();
+                state.successors = Some(link);
+                return;
             }
-        };
-        Self::drain(link.target.predecessor_done(published));
+        }
+        Self::drain(link.target.predecessor_done());
     }
 
     /// Iterative depth-first notification, O(nodes + links), with no stack growth.
@@ -151,7 +131,7 @@ impl Publication {
         loop {
             if let Some(mut link) = pending.take() {
                 pending = link.next.take();
-                let children = link.target.predecessor_done(link.result);
+                let children = link.target.predecessor_done();
                 if children.is_some() {
                     link.resume = pending.take();
                     link.next = frames.take();
@@ -184,7 +164,6 @@ impl Prepared {
         for predecessor in predecessors {
             let link = KBox::new(Link {
                 target: target.clone(),
-                result: Ok(()),
                 next: None,
                 resume: None,
             }, GFP_KERNEL)?;
@@ -204,6 +183,6 @@ impl Prepared {
         for (predecessor, link) in self.links {
             predecessor.add_successor(link);
         }
-        Publication::drain(self.target.predecessor_done(Ok(())));
+        Publication::drain(self.target.predecessor_done());
     }
 }

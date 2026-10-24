@@ -59,10 +59,18 @@ impl Backend {
             (*state).as_deref().ok_or(ENODEV)?.queues.admission.clone()
         };
         let started = super::super::now_ns();
-        let deadline_ns = started.saturating_add(u64::from(crate::g17::job::TIMEOUT_MS) * 1_000_000);
+        let mut deadline_ns = started.saturating_add(u64::from(crate::g17::job::TIMEOUT_MS) * 1_000_000);
+        let recovery_deadline_ns = started.saturating_add(recovery_wait_ns());
+        let mut capacity = WaitClock::default();
         loop {
             self.admission_open()?;
-            if super::super::now_ns() >= deadline_ns { return Err(EBUSY); }
+            if super::super::now_ns() >= deadline_ns {
+                if deadline_ns < recovery_deadline_ns && self.waiting_for_recovery()? {
+                    deadline_ns = recovery_deadline_ns;
+                } else {
+                    return Err(EBUSY);
+                }
+            }
             if packet.cancel_requested() {
                 return Err(ECANCELED);
             }
@@ -97,11 +105,13 @@ impl Backend {
                                 .reclaim_unused_render_spare(Some(self.owner), false)?
                         };
                         if reclaimed.is_none() {
-                            self.wait_render_capacity(started, sleep)?;
+                            self.wait_render_capacity(&mut capacity, sleep)?;
                         }
                         drop(reclaimed);
                         continue;
                     }
+                    // The deadline check above decides whether a recovery extends the wait.
+                    Err(error) if error == EBUSY => continue,
                     Err(error) => return Err(error),
                 }
             };
@@ -131,7 +141,7 @@ impl Backend {
                     let ready = firmware.queues.has_render_ids(self.owner);
                     drop(state);
                     if reclaimed.is_none() && !ready {
-                        self.wait_render_capacity(started, sleep)?;
+                        self.wait_render_capacity(&mut capacity, sleep)?;
                     }
                     drop(reclaimed);
                 }
@@ -140,31 +150,62 @@ impl Backend {
         }
     }
 
+    /// A recovery is pending, or this owner's pair is spared and draining after one: an
+    /// innocent publication waits up to RECOVERY_WAIT_MS for it instead of failing.
+    fn waiting_for_recovery(&self) -> Result<bool> {
+        let state = self.shared.state.lock();
+        let firmware = (*state).as_deref().ok_or(ENODEV)?;
+        Ok(firmware.recovery.pending()
+            || crate::g17::recovery::Memory::recovery_state(&firmware.init)? != 0
+            || firmware.queues.admission.spared_quarantined(self.owner))
+    }
+
+    /// Whether the wait `clock` measures gives up: after `bound_ns` counted from the later of
+    /// its first poll and the last poll that saw a recovery pending or this owner's spared pair
+    /// draining (so the usual bound applies afresh once a recovery ends), and after
+    /// RECOVERY_WAIT_MS from its first poll in any case.
+    fn wait_expired(&self, clock: &mut WaitClock, bound_ns: u64) -> Result<bool> {
+        let now = super::super::now_ns();
+        let first = *clock.first.get_or_insert(now);
+        clock.calm = clock.calm.max(first);
+        if self.waiting_for_recovery()? {
+            clock.calm = now;
+        }
+        Ok(now.saturating_sub(first) >= recovery_wait_ns()
+            || now.saturating_sub(clock.calm) >= bound_ns)
+    }
+
     /// A pair is borrowed, still settling, or waiting for the release of the
     /// scheduler it last ran for to be consumed and the pair parked. The event
     /// worker observes both, so kick it on every poll; time out only after the
     /// same bound as a capacity wait.
-    fn wait_render_busy(&self, since: &mut Option<u64>, sleep: bool) -> Result {
+    fn wait_render_busy(&self, clock: &mut WaitClock, sleep: bool) -> Result {
         if !sleep {
             return Err(FALLBACK);
         }
-        let now = super::super::now_ns();
-        if now.saturating_sub(*since.get_or_insert(now)) >= super::super::WORK_RING_WAIT_NS {
+        if self.wait_expired(clock, super::super::WORK_RING_WAIT_NS)? {
             return Err(ETIMEDOUT);
         }
         self.shared.queue_events();
-        fsleep(Delta::from_micros(200));
+        // Past the usual bound this waits for a recovery: poll gently.
+        let first = clock.first.unwrap_or(0);
+        let long = super::super::now_ns().saturating_sub(first) >= super::super::WORK_RING_WAIT_NS;
+        fsleep(if long { Delta::from_millis(1) } else { Delta::from_micros(200) });
         Ok(())
     }
 
     /// A closing owner may still hold its pair until exact retirement. Wait
     /// outside both the device mutex and preparation gate so the event worker
     /// and recovery can return capacity. No packet is firmware-visible here.
-    fn wait_render_capacity(&self, started: u64, sleep: bool) -> Result {
+    fn wait_render_capacity(&self, clock: &mut WaitClock, sleep: bool) -> Result {
         if !sleep {
             return Err(FALLBACK);
         }
-        self.wait_capacity(started)
+        if self.wait_expired(clock, super::super::WORK_RING_WAIT_NS)? {
+            return Err(EBUSY);
+        }
+        // One reclaim-and-sleep pass; the clock above bounds the wait.
+        self.wait_capacity(super::super::now_ns().saturating_add(super::super::WORK_RING_WAIT_NS))
     }
 
     fn render_with_lease(
@@ -188,11 +229,11 @@ impl Backend {
         let admission = self.acquire_render_with_ids(packet, early, sleep)?;
         let slot = admission.slot();
         packet.completion.attach_render_lease(admission)?;
-        let mut state_polls = 0;
+        let mut state_clock = WaitClock::default();
         let mut state_delay = 20i64;
-        let mut busy_since = None;
-        let mut recovery_polls = 0;
-        let capacity_started = super::super::now_ns();
+        let mut busy = WaitClock::default();
+        let mut recovery_since = None;
+        let mut capacity = WaitClock::default();
         loop {
             if packet.cancel_requested() {
                 return Err(ECANCELED);
@@ -223,10 +264,10 @@ impl Backend {
                     if !sleep {
                         return Err(FALLBACK);
                     }
-                    if state_polls == 1000 {
+                    // Work states free as earlier, possibly spared, work retires.
+                    if self.wait_expired(&mut state_clock, 1_000_000_000)? {
                         return Err(ETIMEDOUT);
                     }
-                    state_polls += 1;
                     fsleep(Delta::from_micros(state_delay));
                     state_delay = (state_delay * 2).min(1000);
                     continue;
@@ -237,40 +278,34 @@ impl Backend {
             }
             match self.ensure_render(packet, slot, sleep) {
                 Err(error) if error == ENOSPC => {
-                    self.wait_render_capacity(capacity_started, sleep)?;
+                    self.wait_render_capacity(&mut capacity, sleep)?;
                     continue;
                 }
                 Err(error) if error == EAGAIN => continue,
                 Err(error) if error == EBUSY => {
-                    self.wait_render_busy(&mut busy_since, sleep)?;
+                    self.wait_render_busy(&mut busy, sleep)?;
                     continue;
                 }
                 result => result?,
             }
             match self.prepare_render(slot, packet, deferred, sleep) {
                 Err(error) if !packet.is_published() && error == ENOSPC => {
-                    self.wait_render_capacity(capacity_started, sleep)?;
+                    self.wait_render_capacity(&mut capacity, sleep)?;
                     continue;
                 }
                 Err(error) if !packet.is_published() && [EAGAIN, EBUSY].contains(&error) => {
-                    let recovering = {
-                        let state = self.shared.state.lock();
-                        let firmware = (*state).as_deref().ok_or(ENODEV)?;
-                        firmware.recovery.pending()
-                            || crate::g17::recovery::Memory::recovery_state(&firmware.init)? != 0
-                    };
-                    if recovering {
+                    if self.waiting_for_recovery()? {
                         if !sleep {
                             return Err(FALLBACK);
                         }
-                        if recovery_polls == super::super::RECOVERY_SETTLE_POLLS {
+                        let since = *recovery_since.get_or_insert(super::super::now_ns());
+                        if super::super::now_ns().saturating_sub(since) >= recovery_wait_ns() {
                             return Err(ETIMEDOUT);
                         }
-                        recovery_polls += 1;
                         self.shared.queue_events();
                         fsleep(Delta::from_millis(1));
                     } else if error == EBUSY {
-                        self.wait_render_busy(&mut busy_since, sleep)?;
+                        self.wait_render_busy(&mut busy, sleep)?;
                     } else if !sleep {
                         return Err(FALLBACK);
                     }
@@ -504,4 +539,15 @@ impl crate::g17::Firmware {
         }
         result
     }
+}
+
+fn recovery_wait_ns() -> u64 {
+    u64::from(crate::g17::timeout::RECOVERY_WAIT_MS) * 1_000_000
+}
+
+/// One bounded wait (Backend::wait_expired).
+#[derive(Default)]
+struct WaitClock {
+    first: Option<u64>,
+    calm: u64,
 }

@@ -96,7 +96,6 @@ pub(crate) struct Queue<B: Backend> {
     proof: Proof,
     sequence: [u64; 2],
     frontiers: [KVec<(u64, Fences)>; 2],
-    failures: [Option<(u64, Fence)>; 2],
     // Closing the userspace queue releases admission even if firmware still
     // retains one of its execution contexts or installed physical graphs.
     _slot: admission::QueueSlot,
@@ -134,7 +133,6 @@ impl<B: Backend> Queue<B> {
             proof: Proof::new(),
             sequence: [0; 2],
             frontiers: core::array::from_fn(|_| KVec::new()),
-            failures: [None, None],
             _slot: slot,
         })
     }
@@ -153,20 +151,10 @@ impl<B: Backend> Queue<B> {
         Ok(())
     }
 
+    /// Drop every producer that has signalled. A failed one does not fail later
+    /// commands (Packet::check_dependencies), so nothing of it is retained.
     fn prune_frontier(&mut self, index: usize) {
-        let failure = &mut self.failures[index];
-        self.frontiers[index].retain(|(sequence, fences)| {
-            let status = job::fence_status(&fences.completed);
-            if status == 0 {
-                return true;
-            }
-            // One earliest failed ordinal covers every later prefix without
-            // retaining its packet, mappings, or every failed fence.
-            if status < 0 && failure.as_ref().is_none_or(|(first, _)| *sequence < *first) {
-                *failure = Some((*sequence, fences.completed.clone()));
-            }
-            false
-        });
+        self.frontiers[index].retain(|(_, fences)| job::fence_status(&fences.completed) == 0);
     }
 
     #[expect(
@@ -249,21 +237,10 @@ impl<B: Backend> Queue<B> {
             .iter()
             .filter(|(_, fences)| fences.ready.raw() == fences.completed.raw())
             .count();
-        let failures: [Option<&Fence>; 2] = core::array::from_fn(|index| {
-            self.failures[index].as_ref().and_then(|(sequence, fence)| {
-                Order::contains(order.wait_through[index], *sequence).then_some(fence)
-            })
-        });
-        let failure_count = failures.iter().flatten().count();
         let mut dependencies =
-            KVec::with_capacity(inputs.len() + count + timestamp_count + failure_count, GFP_KERNEL)?;
-        let mut checked_inputs =
-            KVec::with_capacity(inputs.len() + timestamp_count + failure_count, GFP_KERNEL)?;
+            KVec::with_capacity(inputs.len() + count + timestamp_count, GFP_KERNEL)?;
+        let mut checked_inputs = KVec::with_capacity(inputs.len() + timestamp_count, GFP_KERNEL)?;
         let mut firmware = KVec::with_capacity(count, GFP_KERNEL)?;
-        for fence in failures.into_iter().flatten() {
-            checked_inputs.push(fence.clone(), GFP_KERNEL)?;
-            dependencies.push(fence.clone(), GFP_KERNEL)?;
-        }
         // Same-engine parents order GPU execution, not the host's timestamp
         // writes. Only timestamp publishers need these completion waits and
         // status checks; ordinary compute keeps its existing queue ordering.
@@ -274,24 +251,23 @@ impl<B: Backend> Queue<B> {
             }
         }
         for (_, fences) in frontier {
-            // Successful completion includes host timestamp publication. Its
-            // ready fence adds no ordering and would prevent shallow inline
-            // publication. Failed and pending producers still need checking.
-            if job::fence_status(&fences.completed) > 0 {
+            // Completion includes host timestamp publication. A signalled producer's
+            // ready fence adds no ordering and would prevent shallow inline publication;
+            // a failed one does not fail this command. Pending producers order it.
+            if job::fence_status(&fences.completed) != 0 {
                 continue;
             }
             dependencies.push(fences.ready.clone(), GFP_KERNEL)?;
             firmware.push(fences.completed.clone(), GFP_KERNEL)?;
         }
-        // Each command owns every input fence; independent engines may publish in
-        // either order and must each consume an input's error status before running.
+        // Each command owns every input fence it still has to wait for.
         for sync in inputs {
             if let Some(fence) = &sync.fence {
-                // An input that already signalled without error orders nothing and has no status
-                // left to consume (like a completed frontier producer above). Keeping it would
-                // send the render through the scheduler thread instead of inline publication:
-                // most compositor and client renders carry such already-signalled buffer fences.
-                if job::fence_status(fence) > 0 {
+                // An input that already signalled orders nothing, and a failed one does not fail
+                // this command (like a signalled frontier producer above). Keeping it would send
+                // the render through the scheduler thread instead of inline publication: most
+                // compositor and client renders carry such already-signalled buffer fences.
+                if job::fence_status(fence) != 0 {
                     continue;
                 }
                 dependencies.push(fence.clone(), GFP_KERNEL)?;

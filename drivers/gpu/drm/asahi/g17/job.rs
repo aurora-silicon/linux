@@ -149,12 +149,14 @@ impl Packet {
         for fence in &self.inputs {
             super::dependency::replay_status(fence_status(fence))?;
         }
-        for fence in &self.firmware { check_status(fence)?; }
         Ok(())
     }
 
-    /// Scheduler dependency readiness includes failed fences. Consume the actual
-    /// status before publication, and retain the references through that check.
+    /// Wait until every input has signalled, retaining the references through the wait.
+    /// A failed input does not fail this command: as in drm_sched, only its own state
+    /// decides (`cancel_requested`, its VM status). The producer's client already sees its
+    /// own error, and an innocent producer whose work another VM's recovery cancelled must
+    /// not take its consumers (a compositor, say) down with it.
     pub(crate) fn check_dependencies(&self) -> Result {
         let polls = if self.command.long_job() { 5 } else { 1 };
         let deadline = super::now_ns().saturating_add(u64::from(TIMEOUT_MS) * polls * 1_000_000);
@@ -178,10 +180,6 @@ impl Packet {
                 }
                 if waited > 0 { break; }
             }
-            check_status(fence)?;
-        }
-        for fence in &self.firmware {
-            check_status(fence)?;
         }
         Ok(())
     }
@@ -247,15 +245,6 @@ impl Packet {
 pub(crate) fn fence_status(fence: &Fence) -> i32 {
     // SAFETY: The owned fence keeps the raw DMA fence alive for this read.
     unsafe { bindings::dma_fence_get_status(fence.raw()) }
-}
-
-fn check_status(fence: &Fence) -> Result {
-    let status = fence_status(fence);
-    if status < 0 {
-        Err(super::dependency::inherited_error(Error::from_errno(status)))
-    } else {
-        Ok(())
-    }
 }
 
 /// The backend retains visible packets through exact retirement or processor stop.

@@ -31,7 +31,6 @@ use kernel::{prelude::*, sync::Arc};
 
 const QIDS: usize = 128;
 const FIRST_COMPUTE_QID: u8 = 4;
-const RECOVERY_SETTLE_POLLS: usize = 200;
 const WORK_RING_WAIT_NS: u64 = super::job::TIMEOUT_MS as u64 * 1_000_000;
 
 /// A reservation remains identifiable while its backing is built without the
@@ -1287,9 +1286,8 @@ impl Backend {
         admission.check()?;
         let required = super::fw::compute_pool::required_blocks(self.shared.active_cores, scs_pages)?;
         use kernel::time::{delay::fsleep, Delta};
-        const SPARED_WAIT_MS: usize = 200;
         let mut deferred = DeferredBatch::publication()?;
-        for _ in 0..SPARED_WAIT_MS {
+        loop {
             admission.check()?;
             let pending = (|| {
                 let mut state = self.shared.state.lock();
@@ -1303,18 +1301,20 @@ impl Backend {
             let pending = pending?;
             if !pending {
                 match self.build_compute(required, admission) {
-                    Err(error) if error == EAGAIN => continue,
+                    Err(error) if error == EAGAIN => {
+                        fsleep(Delta::from_millis(1));
+                        continue;
+                    }
                     result => return result,
                 }
             }
-            // Other owners continue submitting while this owner gives its
-            // queue-local drain witness time to arrive.
+            // Other owners continue submitting while this owner gives its queue-local drain
+            // witness time to arrive. No new command has been accepted; if the admission
+            // deadline passes, the spared queue and its retained work stay intact until a later
+            // admission observes its witness.
+            admission.extend_for_recovery();
             fsleep(Delta::from_millis(1));
         }
-        // No new command has been accepted. Keep the spared queue and its
-        // retained work intact until a later admission observes its witness.
-        admission.check()?;
-        Err(EBUSY)
     }
 
     /// Called after taking this packet's publication claim. All waits and work
@@ -1326,7 +1326,6 @@ impl Backend {
     ) -> Result {
         packet.check_dependencies()?;
         let super::command::Validated::Compute { scratch, .. } = &packet.command else { return Err(EINVAL); };
-        let mut recovery_polls = 0;
         let mut state_delay = 20i64;
         let deadline = now_ns().saturating_add(WORK_RING_WAIT_NS);
         let check = || {
@@ -1376,10 +1375,7 @@ impl Backend {
             }
             let recovery_state = super::recovery::Memory::recovery_state(&firmware.init)?;
             if firmware.recovery.pending() || recovery_state != 0 {
-                if recovery_polls == RECOVERY_SETTLE_POLLS {
-                    return Err(EBUSY);
-                }
-                recovery_polls += 1;
+                admission.extend_for_recovery();
                 drop(state);
                 drop(lease);
                 self.shared.queue_events();
@@ -1405,10 +1401,7 @@ impl Backend {
                 && (firmware.recovery.pending()
                     || super::recovery::Memory::recovery_state(&firmware.init)? != 0)
             {
-                if recovery_polls == RECOVERY_SETTLE_POLLS {
-                    return Err(EBUSY);
-                }
-                recovery_polls += 1;
+                admission.extend_for_recovery();
                 drop(state);
                 drop(lease);
                 self.shared.queue_events();
@@ -1609,9 +1602,9 @@ impl Registry {
 }
 
 impl Backend {
-    pub(super) fn wait_capacity(&self, started: u64) -> Result {
+    pub(super) fn wait_capacity(&self, deadline_ns: u64) -> Result {
         let check = || self.admission_open();
-        let admission = Admission::new(started.saturating_add(WORK_RING_WAIT_NS), &check);
+        let admission = Admission::new(deadline_ns, &check);
         self.wait_compute_capacity(&admission)
     }
 

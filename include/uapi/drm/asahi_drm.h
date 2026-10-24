@@ -318,11 +318,12 @@ enum drm_asahi_feature {
 
 	/**
 	 * @DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS: Every hardware command of
-	 * a submission waits for all of the submission's input syncs, including
-	 * their errors, so independent commands need no extra dependency on the
-	 * first command. Userspace that splits a batch across several
-	 * submissions and relies on this must pass its input syncs to each of
-	 * them.
+	 * a submission waits for all of the submission's input syncs, so
+	 * independent commands need no extra dependency on the first command.
+	 * An input that signalled with an error is waited for, not inherited: as
+	 * with drm_sched, the command still runs, and its inputs' contents are
+	 * undefined. Userspace that splits a batch across several submissions
+	 * and relies on this must pass its input syncs to each of them.
 	 */
 	DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS = (1UL) << 10,
 
@@ -391,7 +392,10 @@ enum drm_asahi_feature {
  * The driver publishes an accepted job's failure before signaling its fence.
  * Thus userspace must query after a successful DRM syncobj wait/poll before
  * treating that fence as successful execution. Syncobj signal alone is not
- * an execution-success indication.
+ * an execution-success indication. A job cancelled (ECANCELED) because
+ * another VM's recovery discarded it, an input did not signal in time, or
+ * its queue was closed, is not a failure of this VM: its fence carries the
+ * error, error stays 0, and its output is undefined.
  * The feature bit is the availability contract; older kernels leave it zero.
  * Kernel errors for invalid requests: EINVAL flags/pad/size, ENOENT foreign or
  * missing vm_id, EFAULT inaccessible pointer. No output on invalid request.

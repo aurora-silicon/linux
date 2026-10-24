@@ -78,7 +78,7 @@ mod tests {
         use crate::g17::dependency::replay_status;
         assert_eq!(replay_status(0), Err(EBUSY));
         assert_eq!(replay_status(1), Ok(()));
-        assert_eq!(replay_status(EIO.to_errno()), Err(ECANCELED));
-        assert_eq!(replay_status(ETIMEDOUT.to_errno()), Err(ECANCELED));
+        assert_eq!(replay_status(EIO.to_errno()), Ok(()));
+        assert_eq!(replay_status(ETIMEDOUT.to_errno()), Ok(()));
     }
 }
