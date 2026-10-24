@@ -836,6 +836,8 @@
 			#clock-cells = <1>;
 		};
 
+		/* The display handoff gate installs PMP unless explicitly static. */
+		#ifdef APPLE_USE_PMP
 		pmp_dart: iommu@350300000 {
 			compatible = "apple,t6030-dart", "apple,t8110-dart";
 			reg = <0x3 0x50300000 0x0 0x4000>;
@@ -984,6 +986,8 @@
 			#mbox-cells = <0>;
 			power-domains = <&ps_pmp>, <&ps_pms_sram>;
 		};
+
+		#endif /* APPLE_USE_PMP */
 
 		aic: interrupt-controller@351000000 {
 			compatible = "apple,t6030-aic3", "apple,t8122-aic3";
