@@ -36,6 +36,30 @@
 		wifi0 = &wifi0;
 	};
 
+	/*
+	 * The headphone jack: the AOP audio component's jack back-end (DAI 4)
+	 * to the CS42L84, as a card of its own.
+	 */
+	sound_jack: sound-jack {
+		compatible = "apple,j713-macaudio-jack", "apple,macaudio";
+		model = "MacBook Air J713 Jack";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&aop_audio 4>;
+			};
+
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+	};
+
 	chosen {
 		linux-enablement-mac,disk-boot;
 		linux-enablement-mac,dapf-handoff = "/arm-io/aop", "/arm-io/mtp",
@@ -66,8 +90,29 @@
 };
 
 &aop_audio {
+	/* The microphones on LEAP, the jack on base-ns TX2 and RX2. */
+	dmas = <&admac0 1>, <&admac1 4>, <&admac1 5>;
+	dma-names = "dma", "cout", "cin";
 	apple,chassis-name = "J713";
 	apple,machine-kind = "MacBook Air";
+};
+
+/*
+ * The CS42L84 headphone codec (ADT /arm-io/i2c1/audio-codec-output at 0x4b).
+ * Its reset line is nub GPIO 17, driven high to run the codec; its interrupt
+ * is AP GPIO 98, level low. The AOP firmware runs the jack's stream.
+ */
+&i2c1 {
+	status = "okay";
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		reset-gpios = <&pinctrl_nub 17 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		interrupts-extended = <&pinctrl_ap 98 IRQ_TYPE_LEVEL_LOW>;
+		sound-name-prefix = "Jack";
+	};
 };
 
 &aop_dart {
