@@ -88,20 +88,31 @@ void asahi_g15_report_loader_gpu(void)
  */
 bool asahi_g15_reserved_uat(u32 index, u64 start, u64 size)
 {
-	static const char *const paths[] = {
-		"/reserved-memory/uat-ttbs",
-		"/reserved-memory/uat-pagetables",
-		"/reserved-memory/uat-handoff",
-		"/reserved-memory/uat-pagetables-l2",
+	static const char *const names[] = {
+		"uat-ttbs",
+		"uat-pagetables",
+		"uat-handoff",
+		"uat-pagetables-l2",
 	};
-	struct device_node *np;
+	struct device_node *rmem, *child, *np = NULL;
 	struct resource res;
+	unsigned int count = 0;
 	bool match;
 
-	if (index >= ARRAY_SIZE(paths))
+	if (index >= ARRAY_SIZE(names))
 		return false;
-	np = of_find_node_by_path(paths[index]);
-	match = np && of_device_is_available(np) &&
+
+	/* Unit addresses belong to the DT layout, not the reservation name. */
+	rmem = of_find_node_by_path("/reserved-memory");
+	for_each_child_of_node(rmem, child) {
+		if (!of_node_name_eq(child, names[index]))
+			continue;
+		count++;
+		if (!np)
+			np = of_node_get(child);
+	}
+	of_node_put(rmem);
+	match = count == 1 && np && of_device_is_available(np) &&
 		!of_property_read_bool(np, "reusable") &&
 		!of_get_address(np, 1, NULL, NULL) &&
 		!of_address_to_resource(np, 0, &res) &&
