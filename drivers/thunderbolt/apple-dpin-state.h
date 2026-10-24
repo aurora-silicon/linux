@@ -110,5 +110,6 @@ bool apple_dpin_admission_blocked(const struct apple_dpin_state *state,
 				  const struct apple_dpin_policy *policy, bool admitted);
 bool apple_dpin_awaits_display(const struct apple_dpin_state *state,
 			       const struct apple_dpin_policy *policy);
+bool apple_dpin_pm_gated(const struct apple_dpin_policy *policy);
 
 #endif
