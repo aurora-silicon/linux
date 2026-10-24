@@ -583,6 +583,12 @@ struct apple_dcp {
 		unsigned int queued;
 		bool stopped;
 		bool presentation_paused;
+		/*
+		 * The 14.7 panel's display controller is off, or its A472 off
+		 * is queued: presents are held until it is back on.  Separate
+		 * from presentation_paused, which system sleep also releases.
+		 */
+		bool panel_held;
 		bool backlight_queued;
 		atomic_t opaque_x_state;
 		struct iomfb_scanout_h17p *scanout;
@@ -684,6 +690,7 @@ void iomfb_queue_stop(struct apple_dcp *dcp);
 bool iomfb_queue_drain(struct apple_dcp *dcp, unsigned long timeout);
 int iomfb_queue_settle(struct apple_dcp *dcp, unsigned long timeout);
 void iomfb_pause_presentation(struct apple_dcp *dcp, bool pause);
+void iomfb_hold_panel_presents(struct apple_dcp *dcp, bool hold);
 int iomfb_external_power_h17p(struct apple_dcp *dcp, bool on);
 int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction);
 void iomfb_queue_crc_h17p(struct apple_dcp *dcp, u32 swap_id);

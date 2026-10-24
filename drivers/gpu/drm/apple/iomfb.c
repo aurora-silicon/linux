@@ -462,6 +462,23 @@ void iomfb_pause_presentation(struct apple_dcp *dcp, bool pause)
 	}
 }
 
+/*
+ * Hold the 14.7 panel's presents across its display controller's A472 off and
+ * on.  The controller accepts a present while it is off but never completes
+ * it, and the queue then waits for it: the A472 that would turn the controller
+ * back on queues behind it until the queue timeout declares the coprocessor
+ * crashed.  Holding before the A472 off is queued keeps the queue order: a
+ * present admitted earlier still goes out first, to a running controller.
+ * Admission refuses a held present as a paused one: an atomic commit completes
+ * with a synthetic vblank, and a brightness level stays pending for the
+ * backlight restore at power-on.
+ */
+void iomfb_hold_panel_presents(struct apple_dcp *dcp, bool hold)
+{
+	guard(mutex)(&dcp->iomfb.lock);
+	dcp->iomfb.panel_held = hold;
+}
+
 /* A dead transport is not proof that DMA or a pending present has stopped. */
 int iomfb_queue_settle(struct apple_dcp *dcp, unsigned long timeout)
 {
@@ -493,7 +510,8 @@ int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction)
 	mutex_lock(&dcp->iomfb.lock);
 	if (READ_ONCE(dcp->crashed) || dcp->iomfb.stopped) {
 		ret = -EIO;
-	} else if (transaction->presentation && dcp->iomfb.presentation_paused) {
+	} else if (transaction->presentation &&
+		   (dcp->iomfb.presentation_paused || dcp->iomfb.panel_held)) {
 		ret = -EAGAIN;
 	} else if (transaction->brightness_only && dcp->iomfb.backlight_queued) {
 		ret = -EALREADY;
@@ -2240,7 +2258,8 @@ static void iomfb_queue_atomic(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	struct iomfb_atomic_transaction *atomic;
 	int ret;
 
-	if (READ_ONCE(dcp->iomfb.presentation_paused)) {
+	if (READ_ONCE(dcp->iomfb.presentation_paused) ||
+	    READ_ONCE(dcp->iomfb.panel_held)) {
 		schedule_work(&dcp->vblank_wq);
 		return;
 	}

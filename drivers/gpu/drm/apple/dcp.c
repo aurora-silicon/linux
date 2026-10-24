@@ -3742,9 +3742,15 @@ static void dcp_panel_hw_off(struct apple_dcp *dcp)
 		dev_warn(dcp->dev, "blank still pending; display controller left on\n");
 		return;
 	}
+	/*
+	 * Nothing may present to the stopped controller, e.g. the backlight
+	 * core's level at system sleep, or a brightness retry.
+	 */
+	iomfb_hold_panel_presents(dcp, true);
 	ret = iomfb_v14_7_panel_power(dcp, false);
 	if (ret) {
 		dev_err(dcp->dev, "display controller off failed: %d\n", ret);
+		iomfb_hold_panel_presents(dcp, false);
 		return;
 	}
 	dcp->panel_hw_off = true;
@@ -3759,10 +3765,12 @@ static void dcp_panel_hw_on(struct apple_dcp *dcp)
 		return;
 	ret = iomfb_v14_7_panel_power(dcp, true);
 	if (ret) {
+		/* Presents stay held; the next power-on tries again. */
 		dev_err(dcp->dev, "display controller on failed: %d\n", ret);
 		return;
 	}
 	dcp->panel_hw_off = false;
+	iomfb_hold_panel_presents(dcp, false);
 	dev_dbg(dcp->dev, "display controller on\n");
 }
 
@@ -5339,6 +5347,12 @@ static void dcp_drain_for_sleep(struct apple_dcp *dcp)
 		 * DCP, also covers a crash during the pass.
 		 */
 		if (READ_ONCE(dcp->crashed) || READ_ONCE(dcp->iomfb.stopped))
+			return;
+		/*
+		 * Nor does a panel whose display controller is off: the
+		 * backlight restore at power-on presents the pending level.
+		 */
+		if (dcp->panel_hw_off)
 			return;
 		if (!dcp_backlight_active(dcp) || !dcp_backlight_pending(dcp))
 			return;

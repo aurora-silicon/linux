@@ -24,6 +24,7 @@ appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_external_ready_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_external_announce_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_external_relink_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_dropped_swap_test.o
+appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_panel_hold_test.o
 appledrm-y += epic/dpavservep.o
 appledrm-y += plane.o
 
