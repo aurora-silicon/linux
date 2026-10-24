@@ -10,7 +10,7 @@ use super::{
     command::{Parser, UscWindow, Validated},
     completion::{Completion, Destinations, PreparedPublication},
     context::Context,
-    fence::{Outputs, Submission},
+    fence::Outputs,
     job::{self, Backend, Engine, Fences, Order, Packet, Scheduler},
     validation::Proof,
 };
@@ -27,7 +27,6 @@ use kernel::{
     xarray,
 };
 
-const EARLY_DEPTH: usize = 2;
 static FENCE_KEY: Pin<&LockClassKey> = kernel::static_lock_class!();
 
 pub(crate) mod admission;
@@ -156,7 +155,7 @@ impl<B: Backend> Queue<B> {
     fn prune_frontier(&mut self, index: usize) {
         let failure = &mut self.failures[index];
         self.frontiers[index].retain(|(sequence, fences)| {
-            let status = job::fence_status(&fences.completed);
+            let status = fences.status();
             if status == 0 {
                 return true;
             }
@@ -179,7 +178,7 @@ impl<B: Backend> Queue<B> {
         command: Validated,
         order: Order,
         guard: mmu::VmJobGuard,
-        aggregate: &Arc<Submission>,
+        aggregate: &super::fence::Aggregate,
         inputs: &[file::SyncItem],
         destinations: Destinations,
     ) -> Result {
@@ -198,6 +197,22 @@ impl<B: Backend> Queue<B> {
             let Validated::Compute { scratch, .. } = &command else { return Err(EINVAL); };
             self.ensure_compute(scratch.pages())?;
         }
+        // Only convert inputs when no independent host-prefix wait could keep
+        // the retained source bookkeeping queued behind an external signal.
+        let sources = if engine == Engine::Compute && !inputs.is_empty()
+            && !destinations.has_outputs()
+            && self.frontiers[0].iter().all(|(sequence, fences)|
+                !Order::contains(order.wait_through[0], *sequence)
+                    || fences.status() > 0)
+            && self.frontiers[1].iter().all(|(sequence, fences)|
+                !Order::contains(order.wait_through[1], *sequence)
+                    || fences.ready.raw() != fences.completed.raw()
+                    || fences.status() > 0)
+            && self.failures.iter().enumerate().all(|(index, failure)|
+                failure.as_ref().is_none_or(|(sequence, _)|
+                    !Order::contains(order.wait_through[index], *sequence)))
+        { self.backend.input_sources(inputs) } else { None };
+
         // Only earlier render ordinals covered by the explicit logical prefix
         // can delay host publication. These links never become GPU dependencies.
         let host_predecessors = self.frontiers[index]
@@ -216,7 +231,8 @@ impl<B: Backend> Queue<B> {
             destinations,
             engine == Engine::Compute,
             host_predecessors.clone().next().is_some(),
-            if engine == Engine::Render { self.backend.feed() } else { None },
+            self.backend.feed(),
+            sources.clone(),
         )?;
         let publication = completion.publication()
             .map(|target| PreparedPublication::new(target, host_predecessors))
@@ -277,7 +293,7 @@ impl<B: Backend> Queue<B> {
             // Successful completion includes host timestamp publication. Its
             // ready fence adds no ordering and would prevent shallow inline
             // publication. Failed and pending producers still need checking.
-            if job::fence_status(&fences.completed) > 0 {
+            if fences.status() > 0 {
                 continue;
             }
             dependencies.push(fences.ready.clone(), GFP_KERNEL)?;
@@ -294,13 +310,23 @@ impl<B: Backend> Queue<B> {
                 if job::fence_status(fence) > 0 {
                     continue;
                 }
+                if sources.as_ref().is_some_and(|sources| sources.contains_input(fence)) {
+                    continue;
+                }
                 dependencies.push(fence.clone(), GFP_KERNEL)?;
                 checked_inputs.push(fence.clone(), GFP_KERNEL)?;
             }
         }
-        let early = engine == Engine::Render
-            && dependencies.is_empty()
-            && self.frontiers[index].len() < EARLY_DEPTH;
+        if let Some(sources) = &sources {
+            for ready in sources.publication_waits() {
+                dependencies.push(ready.clone(), GFP_KERNEL)?;
+                checked_inputs.push(ready.clone(), GFP_KERNEL)?;
+            }
+        }
+        // Publish from the ioctl whenever nothing has to wait, at any depth.
+        // The backend falls back to the scheduler behind any backlog or on any
+        // capacity miss, so submission order is preserved.
+        let early = dependencies.is_empty();
         let packet = Packet::new(
             id,
             self.context.clone(),
@@ -410,11 +436,17 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                 return Err(EIO);
             }
             let (mut pending, guards) = self.prepare_submission(bytes, objects)?;
+            if pending.iter().any(|(command, _, _)| matches!(command, Validated::Render { .. })) {
+                self.context.note_render();
+            }
             if super::timeout::select_submission(pending.iter().map(|(cmd, _, _)| cmd.long_job())) {
                 for (command, _, _) in pending.iter_mut() { command.allow_long_job(); }
             }
             let mut guards = guards.into_iter();
-            let aggregate = outputs.publish(self.context.clone())?;
+            let firmware_source = pending.len() == 1
+                && matches!(&pending[0].0, Validated::Compute { .. })
+                && !pending[0].2.has_outputs();
+            let aggregate = outputs.publish(self.context.clone(), firmware_source)?;
             for (command, order, destinations) in pending {
                 let guard = guards.next().ok_or(EIO)?;
                 self.enqueue(

@@ -166,28 +166,51 @@ struct Request {
     descriptor: u64,
     kick: u64,
     observed: Option<Observation>,
+    next: u16,
+}
+
+const NO_REQUEST: u16 = u16::MAX;
+const _: () = assert!(QIDS * IN_FLIGHT < NO_REQUEST as usize);
+
+fn request_bucket(qid: usize, kick: u64) -> usize {
+    qid * IN_FLIGHT + kick as usize % IN_FLIGHT
 }
 
 /// Reusable heap scratch for one shared-ring scan. QID requests are contiguous and bounded;
 /// staging and folding never allocate under the device mutex.
 pub(crate) struct Batch {
     requests: KVVec<Request>,
+    /// Per-QID kick buckets; collisions retain the complete identity check.
+    heads: KVVec<u16>,
     slots: [(usize, usize); QIDS],
     open: Option<u8>,
+    /// Requests with no observation yet; the scan stops when this reaches zero.
+    unobserved: usize,
 }
 
 impl Batch {
     pub(crate) fn new() -> Result<Self> {
+        let mut heads = KVVec::with_capacity(QIDS * IN_FLIGHT, GFP_KERNEL)?;
+        for _ in 0..QIDS * IN_FLIGHT {
+            heads.push_within_capacity(NO_REQUEST).map_err(|_| ENOSPC)?;
+        }
         Ok(Self {
             requests: KVVec::with_capacity(QIDS * IN_FLIGHT, GFP_KERNEL)?,
+            heads,
             slots: [(0, 0); QIDS],
             open: None,
+            unobserved: 0,
         })
     }
     pub(crate) fn clear(&mut self) {
         self.requests.clear();
         self.slots.fill((0, 0));
         self.open = None;
+        self.unobserved = 0;
+    }
+    /// True once every requested identity has an observation.
+    pub(crate) fn complete(&self) -> bool {
+        self.unobserved == 0
     }
     pub(crate) fn request(&mut self, ticket: &Ticket) -> Result {
         if ticket.descriptor == 0 || ticket.kick == 0 {
@@ -201,44 +224,74 @@ impl Batch {
             return Err(ENOSPC);
         }
         let start = if slot.1 == 0 {
+            let begin = ticket.qid as usize * IN_FLIGHT;
+            self.heads.get_mut(begin..begin + IN_FLIGHT).ok_or(EIO)?.fill(NO_REQUEST);
             self.requests.len()
         } else {
             slot.0
         };
+        let bucket = request_bucket(ticket.qid as usize, ticket.kick);
+        let next = *self.heads.get(bucket).ok_or(EIO)?;
+        let index = u16::try_from(self.requests.len()).map_err(|_| ENOSPC)?;
         self.requests
             .push_within_capacity(Request {
                 descriptor: ticket.descriptor,
                 kick: ticket.kick,
                 observed: None,
+                next,
             })
             .map_err(|_| ENOSPC)?;
+        *self.heads.get_mut(bucket).ok_or(EIO)? = index;
         *slot = (start, slot.1 + 1);
         self.open = Some(ticket.qid);
+        self.unobserved += 1;
         Ok(())
     }
-    /// Capture the control word once, then read only a requested identity's payload.
-    /// Records can be overwritten during a scan: incomplete or older identities are skipped.
+    /// Capture the control word once. Most slots belong to an older kick of a
+    /// selected QID; reject those before reading any additional shared words.
     pub(crate) fn fold(&mut self, record: ComputeCompletion<'_>) -> Result {
-        let control = record.read(0)?;
+        self.fold_reader(|word| record.read(word))
+    }
+
+    fn fold_reader(&mut self, mut read: impl FnMut(usize) -> Result<u64>) -> Result {
+        let control = read(0)?;
         let qid = ((control >> 9) & 0x7f) as usize;
-        let (start, count) = self.slots[qid];
+        let (_, count) = self.slots[qid];
         if count == 0 {
-            return Ok(());
-        }
-        let descriptor = record.read(6)? & !1;
-        if descriptor == 0 || record.read(7)? == 0 {
             return Ok(());
         }
         let kick =
             (((control >> 8) & 0x00ff_ffff_ff00) | ((control >> 48) & 0xff)) & 0xff_ffff_ffff;
-        let requests = self.requests.get_mut(start..start + count).ok_or(EIO)?;
-        let Some(request) = requests
-            .iter_mut()
-            .find(|r| r.descriptor == descriptor && r.kick == kick)
-        else {
-            return Ok(());
-        };
-        let timestamps = [record.read(2)? & TIME_MASK, record.read(5)? & TIME_MASK];
+        let mut index = *self.heads.get(request_bucket(qid, kick)).ok_or(EIO)?;
+        let mut descriptor = None;
+        let mut found = None;
+        for _ in 0..count {
+            if index == NO_REQUEST {
+                break;
+            }
+            let request = self.requests.get(usize::from(index)).ok_or(EIO)?;
+            if request.kick == kick {
+                let value = if let Some(value) = descriptor {
+                    value
+                } else {
+                    let value = read(6)? & !1;
+                    if value == 0 || read(7)? == 0 {
+                        return Ok(());
+                    }
+                    descriptor = Some(value);
+                    value
+                };
+                if request.descriptor == value {
+                    // Chains run newest first. Retain the original first-match
+                    // rule even if a caller stages the same identity twice.
+                    found = Some(usize::from(index));
+                }
+            }
+            index = request.next;
+        }
+        let Some(index) = found else { return Ok(()); };
+        let request = self.requests.get_mut(index).ok_or(EIO)?;
+        let timestamps = [read(2)? & TIME_MASK, read(5)? & TIME_MASK];
         if timestamps[0] == 0
             || timestamps[1] == 0
             || request
@@ -247,19 +300,23 @@ impl Batch {
         {
             return Ok(());
         }
+        if request.observed.is_none() {
+            self.unobserved -= 1;
+        }
         request.observed = Some(Observation { timestamps });
         Ok(())
     }
+    /// A command published after this batch staged its queue's requests was not part of the
+    /// ring snapshot: it stays unobserved until a later batch.
     pub(crate) fn take(&mut self, ticket: &Ticket) -> Result<Option<Observation>> {
         let &(start, count) = self.slots.get(ticket.qid as usize).ok_or(EINVAL)?;
-        let request = self
+        Ok(self
             .requests
             .get_mut(start..start + count)
             .ok_or(EIO)?
             .iter_mut()
             .find(|r| r.descriptor == ticket.descriptor && r.kick == ticket.kick)
-            .ok_or(EIO)?;
-        Ok(request.observed.take())
+            .and_then(|request| request.observed.take()))
     }
 }
 
@@ -400,5 +457,85 @@ mod tests {
             true,
         );
         assert_eq!(result, Err(ENODATA));
+    }
+}
+
+
+#[kunit_tests(asahi_g17_completion_index)]
+mod index_tests {
+    use super::*;
+
+    fn ticket(qid: u8, kick: u64, descriptor: u64) -> Ticket {
+        Ticket { owner: 1, submission: 1, context_id: 1, qid, descriptor,
+            work_node: 0x2000, kick, ordinal: 1, item_producer: 4, item_count: 64, epoch: 1 }
+    }
+    fn record(ticket: &Ticket, timestamps: [u64; 2]) -> [u64; 8] {
+        let mut words = [0; 8];
+        words[0] = ((ticket.kick & !0xff) << 8) | ((ticket.kick & 0xff) << 48)
+            | (u64::from(ticket.qid) << 9);
+        words[2] = timestamps[0]; words[5] = timestamps[1];
+        words[6] = ticket.descriptor | 1; words[7] = 1;
+        words
+    }
+    #[test]
+    fn stale_kick_reads_only_the_control_even_on_a_bucket_collision() {
+        let mut batch = Batch::new().unwrap();
+        batch.request(&ticket(7, 33, 0x1000)).unwrap();
+        let words = record(&ticket(7, 17, 0x1000), [10, 20]);
+        batch.fold_reader(|word| {
+            assert_eq!(word, 0);
+            Ok(words[word])
+        }).unwrap();
+        assert!(!batch.complete());
+    }
+    #[test]
+    fn collisions_and_reused_descriptors_keep_full_kick_identity() {
+        let mut batch = Batch::new().unwrap();
+        let first = ticket(7, 33, 0x1000);
+        let second = ticket(7, 49, 0x1000);
+        batch.request(&first).unwrap(); batch.request(&second).unwrap();
+        let words = record(&first, [10, 20]);
+        batch.fold_reader(|word| Ok(words[word])).unwrap();
+        assert!(!batch.complete());
+        let words = record(&second, [30, 40]);
+        batch.fold_reader(|word| Ok(words[word])).unwrap();
+        assert!(batch.complete());
+        assert_eq!(batch.take(&first).unwrap().unwrap().timestamps, [10, 20]);
+        assert_eq!(batch.take(&second).unwrap().unwrap().timestamps, [30, 40]);
+    }
+    #[test]
+    fn same_kick_still_checks_descriptor_and_zero_duration_is_retained() {
+        let mut batch = Batch::new().unwrap();
+        let first = ticket(7, 33, 0x1000);
+        let second = ticket(7, 33, 0x2000);
+        batch.request(&first).unwrap(); batch.request(&second).unwrap();
+        let words = record(&first, [20, 20]);
+        batch.fold_reader(|word| Ok(words[word])).unwrap();
+        assert_eq!(batch.take(&first).unwrap().unwrap().timestamps, [20, 20]);
+        assert!(batch.take(&second).unwrap().is_none());
+    }
+    #[test]
+    fn duplicate_identity_keeps_the_first_staged_request() {
+        let mut batch = Batch::new().unwrap();
+        let current = ticket(7, 33, 0x1000);
+        batch.request(&current).unwrap(); batch.request(&current).unwrap();
+        let words = record(&current, [10, 20]);
+        batch.fold_reader(|word| Ok(words[word])).unwrap();
+        assert_eq!(batch.take(&current).unwrap().unwrap().timestamps, [10, 20]);
+        assert_eq!(batch.unobserved, 1);
+    }
+    #[test]
+    fn clear_restarts_buckets_and_later_publication_stays_unobserved() {
+        let mut batch = Batch::new().unwrap();
+        batch.request(&ticket(7, 33, 0x1000)).unwrap(); batch.clear();
+        let current = ticket(7, 49, 0x1000);
+        batch.request(&current).unwrap();
+        let stale = record(&ticket(7, 33, 0x1000), [10, 20]);
+        batch.fold_reader(|word| Ok(stale[word])).unwrap();
+        assert!(!batch.complete());
+        assert!(batch.take(&ticket(7, 50, 0x2000)).unwrap().is_none());
+        let words = record(&current, [30, 40]);
+        batch.fold_reader(|word| Ok(words[word])).unwrap();
+        assert!(batch.complete());
     }
 }

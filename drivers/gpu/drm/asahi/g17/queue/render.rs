@@ -7,7 +7,7 @@ pub(crate) use observation::Observed;
 mod dependencies;
 mod memory;
 pub(crate) mod parked;
-mod publication;
+pub(super) mod publication;
 pub(crate) mod retirement;
 mod warm;
 
@@ -46,6 +46,9 @@ pub(crate) struct RenderDependencies {
     pub(crate) tiling: [KickDependency; 2],
     pub(crate) tiling_count: usize,
     pub(crate) compute: Option<KickDependency>,
+    /// Fragment kicks of other pairs' overlapping same-VM renders.
+    pub(crate) hazards: [KickDependency; crate::g17::hazard::PUBLICATION_BARRIERS],
+    pub(crate) hazard_count: usize,
 }
 
 impl RenderDependencies {
@@ -55,6 +58,8 @@ impl RenderDependencies {
         tiling: [KickDependency::ZERO; 2],
         tiling_count: 0,
         compute: None,
+        hazards: [KickDependency::ZERO; crate::g17::hazard::PUBLICATION_BARRIERS],
+        hazard_count: 0,
     };
     pub(crate) fn render(&self) -> &[KickDependency] {
         &self.render[..self.render_count]
@@ -484,7 +489,7 @@ impl Pair {
 struct RenderBarriers {
     tiling: [KickDependency; 3],
     tiling_count: usize,
-    fragment: [KickDependency; 3],
+    fragment: [KickDependency; 3 + crate::g17::hazard::PUBLICATION_BARRIERS],
     fragment_count: usize,
 }
 
@@ -495,7 +500,7 @@ fn render_barriers(
 ) -> RenderBarriers {
     let mut tiling_barriers = [KickDependency::ZERO; 3];
     let mut tiling_count = 0;
-    let mut fragment_barriers = [own_tiling; 3];
+    let mut fragment_barriers = [own_tiling; 3 + crate::g17::hazard::PUBLICATION_BARRIERS];
     let mut fragment_count = 1;
     for dependency in dependencies.render() {
         if fragment_stage {
@@ -520,6 +525,11 @@ fn render_barriers(
     if let Some(compute) = dependencies.compute {
         tiling_barriers[tiling_count] = compute;
         tiling_count += 1;
+    }
+    // Only tile stores overlap: the tiling kick stays concurrent.
+    for hazard in &dependencies.hazards[..dependencies.hazard_count] {
+        fragment_barriers[fragment_count] = *hazard;
+        fragment_count += 1;
     }
     RenderBarriers {
         tiling: tiling_barriers,
@@ -840,6 +850,9 @@ impl Pair {
             }
         };
         self.ordinal = next_ordinal;
+        if let Some(fragment) = KickDependency::new(qids[1], kicks[1]) {
+            packet.completion.note_render_publication(fragment);
+        }
         self.cursors = windows.map(|window| window.target());
         for stage in 0..2 {
             if present[stage] {
@@ -941,6 +954,8 @@ impl Pair {
             host.publish_retained_pair(priority, fragment_slot, tiling_slot, outer_next)?;
             self.active.back_mut().ok_or(EIO)?.outer_published = true;
             host.notify_render(priority)?;
+            crate::g17::trace::publish(crate::g17::trace::RENDER, self.qids()[1], self.ordinal as u32,
+                packet);
             host.note_submission()
         })();
         if let Err(error) = publish {
@@ -1223,6 +1238,8 @@ impl Pair {
             front.qos_completed = true;
             front.flist_completed = true;
         }
+        crate::g17::trace::complete(crate::g17::trace::RENDER, qids[1], ordinal as u32,
+            &front.packet, [timestamps[0], timestamps[3]]);
         defer(Deferred::Retired(
             front.packet.completion.clone(),
             Ok(timestamps),
@@ -1770,6 +1787,55 @@ impl Pair {
     }
     /// The scheduler page these queues last ran a command for, when the next
     /// publication for `context` changes the queues' owner.
+    /// The steady state in which a command may publish without the device
+    /// mutex: the graph is installed and registered at `priority`, it last ran
+    /// `context`'s scheduler, and nothing is replayed, settled, aliased or
+    /// switched on it.
+    pub(crate) fn direct_ready(&self, context: &Context, priority: u8) -> bool {
+        self.graph_started
+            && self.installed == [true; 2]
+            && self.registered == Some(priority)
+            && priority < 8
+            && self.outer_started & (1u8 << priority) != 0
+            && self.executed == context.scheduler_va()
+            && self.switch.is_none()
+            && self.owner.is_some()
+            && !self.quarantined
+            && self.terminal.is_none()
+            && self.pending_aliases.is_none()
+            && self.kick_aliases.is_none()
+            && self.prepared.is_none()
+            && self.replay.len() == 0
+            && self.displaced.is_none()
+            && self.active.room()
+    }
+    /// The render prefix of `packet` on this pair, as the registry collects it
+    /// for an owner whose only pair this is.
+    pub(crate) fn own_dependencies(&self, owner: u64, packet: &Arc<Packet>) -> Result<RenderDependencies> {
+        let mut dependencies = RenderDependencies::EMPTY;
+        let mut frontier = crate::g17::dependency::Frontier::new();
+        self.collect_dependencies(owner, packet.completion.status(), packet.order.wait_through[0], &mut frontier)?;
+        for dependency in frontier.as_slice() {
+            *dependencies.render.get_mut(dependencies.render_count).ok_or(EOVERFLOW)? = *dependency;
+            dependencies.render_count += 1;
+        }
+        if dependencies.render_count != 0
+            && matches!(&packet.command, Validated::Render { pass, .. } if pass.fragment_barriers)
+        {
+            let mut tiling = crate::g17::dependency::Frontier::new();
+            self.collect_tiling_dependencies(
+                owner,
+                packet.completion.status(),
+                packet.order.wait_through[0],
+                &mut tiling,
+            )?;
+            for dependency in tiling.as_slice() {
+                *dependencies.tiling.get_mut(dependencies.tiling_count).ok_or(EOVERFLOW)? = *dependency;
+                dependencies.tiling_count += 1;
+            }
+        }
+        Ok(dependencies)
+    }
     pub(crate) fn owner_switch_from(&self, context: &Context) -> Option<u64> {
         (self.executed != 0 && self.executed != context.scheduler_va()).then_some(self.executed)
     }

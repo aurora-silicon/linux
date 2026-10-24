@@ -15,7 +15,7 @@ use crate::g17::{
         queue::*,
         variant::PointerLayout,
     },
-    object::{Allocator, CpuMap, KernelObject},
+    object::{Allocator, CpuMap, Family, KernelObject, Pool, PooledObject},
 };
 use crate::{hw::t8140::dynamic, mmu};
 use core::sync::atomic::{fence, Ordering};
@@ -30,10 +30,20 @@ const DESCRIPTORS: usize = 32;
 const GRAPH_SIZE: usize = 0x8000;
 const CONTEXT_SIZE: usize = 0x20000;
 const RECORD_STRIDE: usize = 0x1000;
+const NATIVE_WAIT_OFFSET: usize = 0x900;
+const NATIVE_WAIT_STRIDE: usize = 0x60;
+// A submission can name every physical compute channel. Keep the complete
+// wait list inside its own cached slot, including the last retained slot.
+const CACHED_RECORD_STRIDE: usize = (NATIVE_WAIT_OFFSET
+    + crate::g17::kick::COMPUTE_CHANNELS * NATIVE_WAIT_STRIDE).next_power_of_two();
 const CONFIG: usize = 0;
 const ANNOUNCE: usize = 0x800;
 const PREDECESSOR: usize = 0x400;
 const POINTERS: usize = 0x100;
+/// Producer/consumer words live on their own uncached page after the graph,
+/// which the firmware reads through a cached mapping (queue record, job-list
+/// head and item ring), as native does.
+const CURSORS: usize = GRAPH_SIZE;
 const ITEMS: usize = 0x4000;
 const STAMP: usize = 0x300;
 
@@ -83,24 +93,32 @@ pub(crate) struct Binding {
 /// Descriptor ring of one compute QID with its kernel-VM alias. Built without
 /// the device mutex; installed into a vacant graph before an owner binds.
 pub(crate) struct DescriptorRing {
-    object: KernelObject,
-    high: mmu::KernelMapping,
+    // Drop the GPU alias before the retained storage returns to its pool.
+    low: mmu::KernelMapping,
+    object: PooledObject,
 }
 
 impl DescriptorRing {
-    pub(crate) fn new(alloc: &Allocator<'_>) -> Result<Self> {
-        let page = mmu::UAT_PGSZ as u64;
-        let prot = mmu::PROT_GPU_FW_SHARED_RW;
-        let object = alloc.lower(
-            DESCRIPTORS * COMPUTE_DESCRIPTOR_SIZE,
-            page,
-            prot,
+    /// Firmware reads every descriptor through a cached kernel mapping, as it
+    /// does for render. The pool keeps that mapping until processor stop; the
+    /// hardware reads the same pages through an uncached canonical low alias.
+    pub(crate) fn new(alloc: &Allocator<'_>, objects: &Arc<Pool>) -> Result<Self> {
+        let size = DESCRIPTORS * COMPUTE_DESCRIPTOR_SIZE;
+        let object = objects.allocate(
+            alloc,
+            Family::Descriptor,
+            size,
+            size,
+            mmu::PROT_GPU_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
-        let mut high = alloc.uat.geometry().kernel_range();
-        high.start += dynamic::KERNEL_OFFSET;
-        let high = object.alias_in(alloc.uat.kernel_vm(), high, page, prot)?;
-        Ok(Self { object, high })
+        let low = object.alias_in(
+            alloc.uat.kernel_lower_vm(),
+            dynamic::LOWER,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_SHARED_RW,
+        )?;
+        Ok(Self { low, object })
     }
 }
 
@@ -112,10 +130,14 @@ struct Graph {
     usage: KernelObject,
     operand: KernelObject,
     support: KernelObject,
-    graph: KernelObject,
+    graph: PooledObject,
     context_low: KernelObject,
     context_high: KernelObject,
+    /// Announcements, which stay uncached for the firmware.
     records: KernelObject,
+    /// Configuration, predecessor and completion-wait records at the same
+    /// offsets, which the firmware reads through a cached mapping.
+    cached_records: PooledObject,
     record_ends: [Option<u32>; RECORD_SLOTS],
     reclaimed: u32,
     /// Host words of the pointer block in this firmware build.
@@ -127,6 +149,7 @@ struct Graph {
 impl Graph {
     fn new(
         alloc: &Allocator<'_>,
+        objects: &Arc<Pool>,
         context: &Context,
         pointers: PointerLayout,
         operand_state: &'static OperandState,
@@ -134,7 +157,7 @@ impl Graph {
         let page = mmu::UAT_PGSZ as u64;
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
         let cpu = CpuMap::WriteCombined;
-        let ring = DescriptorRing::new(alloc)?;
+        let ring = DescriptorRing::new(alloc, objects)?;
         let preempt = alloc.kernel(0x4000, page, prot, cpu)?;
         let usage = alloc.kernel(mmu::UAT_PGSZ, page, prot, cpu)?;
         let operand = alloc.lower(operand_state.size, page, prot, cpu)?;
@@ -144,11 +167,18 @@ impl Graph {
         support.write(0x100, support_va + page + 4)?;
         support.write(0x110, 0x50u32)?;
         support.write(mmu::UAT_PGSZ + 4, 1u32)?;
-        let mut graph = alloc.kernel(GRAPH_SIZE, page, prot, cpu)?;
+        let mut graph = objects.allocate(
+            alloc,
+            Family::QueueState,
+            GRAPH_SIZE + mmu::UAT_PGSZ,
+            GRAPH_SIZE,
+            prot,
+            cpu,
+        )?;
         let graph_va = graph.gpu_va();
         graph.initialize::<GraphLayout>(0, |view| {
             view.queue = QueueRecord::new(&QueueRecordArgs {
-                pointers_va: graph_va + POINTERS as u64,
+                pointers_va: graph_va + CURSORS as u64,
                 items_va: graph_va + ITEMS as u64,
                 job_list_va: context.work_head_va(),
                 scheduler_va: context.scheduler_va(),
@@ -159,9 +189,21 @@ impl Graph {
             view.jobs = JobListHead::new(graph_va + 0x200);
             Ok(())
         })?;
+        graph.initialize::<PointerBlock>(CURSORS, |view| {
+            *view = PointerBlock::new(&pointers)?;
+            Ok(())
+        })?;
         let context_low = alloc.lower(CONTEXT_SIZE, page, prot, cpu)?;
         let context_high = alloc.kernel(CONTEXT_SIZE, page, prot, cpu)?;
         let records = alloc.kernel(RECORD_SLOTS * RECORD_STRIDE, page, prot, cpu)?;
+        let cached_records = objects.allocate(
+            alloc,
+            Family::QueueConfig,
+            RECORD_SLOTS * CACHED_RECORD_STRIDE,
+            RECORD_SLOTS * CACHED_RECORD_STRIDE,
+            prot,
+            cpu,
+        )?;
         Ok(Self {
             ring: Some(ring),
             preempt,
@@ -172,6 +214,7 @@ impl Graph {
             context_low,
             context_high,
             records,
+            cached_records,
             record_ends: [None; RECORD_SLOTS],
             reclaimed: 0,
             pointers,
@@ -237,9 +280,9 @@ impl Graph {
 
     fn cursors(&self) -> Result<Cursors> {
         Ok(Cursors {
-            producer: self.graph.word(POINTERS + self.pointers.producer)?.load(Ordering::Relaxed),
-            consumer: self.graph.word(POINTERS)?.load(Ordering::Relaxed),
-            count: self.graph.word(POINTERS + 0x60)?.load(Ordering::Relaxed),
+            producer: self.graph.word(CURSORS + self.pointers.producer)?.load(Ordering::Relaxed),
+            consumer: self.graph.word(CURSORS)?.load(Ordering::Relaxed),
+            count: self.graph.word(CURSORS + 0x60)?.load(Ordering::Relaxed),
         })
     }
     fn stamp(&self) -> Result<u32> {
@@ -250,12 +293,12 @@ impl Graph {
     fn descriptor_vas(&self, slot: u8) -> Result<(u64, u64)> {
         let ring = self.ring.as_ref().ok_or(EAGAIN)?;
         let offset = (usize::from(slot) % DESCRIPTORS * COMPUTE_DESCRIPTOR_SIZE) as u64;
-        Ok((ring.high.iova() + offset, ring.object.gpu_va() + offset))
+        Ok((ring.object.gpu_va() + offset, ring.low.iova() + offset))
     }
     fn descriptor_alias(&self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
         let ring = self.ring.as_ref().ok_or(EAGAIN)?;
         ring.object
-            .map_alias(vm, ring.object.gpu_va(), mmu::PROT_GPU_SHARED_RO)
+            .map_alias(vm, ring.low.iova(), mmu::PROT_GPU_SHARED_RO)
     }
     /// Detaches the descriptor ring of an idle vacant queue; the caller frees it
     /// off-lock. The job list and the context item only name consumed
@@ -293,7 +336,7 @@ impl Graph {
         }
         fence(Ordering::SeqCst);
         self.graph
-            .word(POINTERS + self.pointers.producer)?
+            .word(CURSORS + self.pointers.producer)?
             .store(cursors.consumer, Ordering::Relaxed);
         self.reclaimed = cursors.consumer;
         fence(Ordering::SeqCst);
@@ -523,8 +566,14 @@ pub(crate) struct Queue {
     /// Bit `p` set once a work slot of priority class `p` named this queue.
     outer_started: u8,
     published_config: Option<ConfigIdentity>,
+    /// Last configuration record the firmware consumed, and its recovery
+    /// epoch. A command repeats the record only when it differs.
+    config_cache: Option<(QueueConfig, u64)>,
     ordinal: u32,
     submitted: u32,
+    /// Prepared packets of the bound owner about to publish (see [`Self::claim`]).
+    claims: u32,
+    last_published: u64,
     last_end: u64,
     released: bool,
     retirement_ready: bool,
@@ -538,6 +587,8 @@ pub(crate) struct Queue {
     quarantine_error: Option<Error>,
     failure_status_pending: bool,
     retirement_proved: bool,
+    source_readers: Arc<core::sync::atomic::AtomicU32>,
+    source_hint: crate::g17::sync_input::ReaderHint,
 }
 
 impl Queue {
@@ -545,6 +596,7 @@ impl Queue {
     /// successfully installed queue until processor stop. Shared VM apertures precede this call.
     pub(crate) fn new(
         alloc: &Allocator<'_>,
+        objects: &Arc<Pool>,
         backing: Backing,
         owner: u64,
         context: Arc<Context>,
@@ -552,11 +604,13 @@ impl Queue {
         operand_state: &'static OperandState,
     ) -> Result<Self> {
         let Backing { mut pool, mut kick } = backing;
-        let mut graph = Graph::new(alloc, &context, pointers, operand_state)?;
+        let mut graph = Graph::new(alloc, objects, &context, pointers, operand_state)?;
         let kick_alias = kick.map_client(context.vm())?;
         let pool_alias = pool.map_client(context.vm())?;
         let binding = graph.bind(context.clone(), kick_alias, pool_alias)?;
         context.mark_published();
+        context.note_compute_binding(true);
+        crate::g17::trace::bind(crate::g17::trace::COMPUTE, kick.id().qid(), context.id(), 0);
         Ok(Self {
             owner: Some(owner),
             retained_owner: None,
@@ -582,8 +636,11 @@ impl Queue {
             installed: false,
             outer_started: 0,
             published_config: None,
+            config_cache: None,
             ordinal: 0,
             submitted: 0,
+            claims: 0,
+            last_published: 0,
             last_end: 0,
             released: false,
             retirement_ready: false,
@@ -597,6 +654,8 @@ impl Queue {
             quarantine_error: None,
             failure_status_pending: false,
             retirement_proved: false,
+            source_readers: Arc::new(core::sync::atomic::AtomicU32::new(0), GFP_KERNEL)?,
+            source_hint: crate::g17::sync_input::ReaderHint::new(),
         })
     }
     pub(crate) fn qid(&self) -> u8 {
@@ -887,6 +946,10 @@ impl Queue {
                         self.active.iter_mut().next().ok_or(EIO)?.qos_pending = false;
                     }
                     let front = self.active.front().ok_or(EIO)?;
+                    if let Some(ticket) = front.ticket {
+                        crate::g17::trace::complete(crate::g17::trace::COMPUTE, ticket.qid,
+                            ticket.ordinal, &front.packet, [timestamps[0], timestamps[1]]);
+                    }
                     self.retire_pending = true;
                     defer(Deferred::Retired(
                         front.packet.completion.clone(),
@@ -1140,6 +1203,32 @@ mod admission_tests {
     use super::*;
 
     #[test]
+    fn complete_native_wait_list_fits_every_cached_slot() {
+        let waits = crate::g17::kick::COMPUTE_CHANNELS;
+        for slot in 0..RECORD_SLOTS {
+            for index in 0..waits {
+                let start = record_start(slot, NATIVE_WAIT_OFFSET + index * NATIVE_WAIT_STRIDE,
+                    NATIVE_WAIT_STRIDE, CACHED_RECORD_STRIDE).unwrap();
+                assert!(start >= slot * CACHED_RECORD_STRIDE);
+                assert!(start + NATIVE_WAIT_STRIDE <= (slot + 1) * CACHED_RECORD_STRIDE);
+            }
+        }
+    }
+
+    #[test]
+    fn record_window_cannot_overwrite_the_next_slot() {
+        // The nineteenth wait used to cross the old slot boundary silently.
+        let offset = NATIVE_WAIT_OFFSET + 18 * NATIVE_WAIT_STRIDE;
+        assert_eq!(record_start(0, offset, NATIVE_WAIT_STRIDE, RECORD_STRIDE), Err(EINVAL));
+        assert!(record_start(0, offset, NATIVE_WAIT_STRIDE, CACHED_RECORD_STRIDE).is_ok());
+        assert_eq!(record_start(RECORD_SLOTS, 0, 1, CACHED_RECORD_STRIDE), Err(EINVAL));
+        assert_eq!(record_start(0, usize::MAX, 1, CACHED_RECORD_STRIDE), Err(EINVAL));
+        assert_eq!(record_start(0, CACHED_RECORD_STRIDE, 1, CACHED_RECORD_STRIDE), Err(EINVAL));
+        assert_eq!(record_start(0, CACHED_RECORD_STRIDE - 1, 1, CACHED_RECORD_STRIDE),
+            Ok(CACHED_RECORD_STRIDE - 1));
+    }
+
+    #[test]
     fn retained_ring_pressure_waits_without_discarding_work() {
         let mut active = Fifo::new();
         for sequence in 0..IN_FLIGHT {
@@ -1230,11 +1319,15 @@ impl Queue {
             && self.active.len == 0
             && self.replays.len == 0
             && self.previous.is_none()
+            // Borrow acquisition is serialized by the device mutex. Avoid
+            // touching the separate loan counter for an otherwise busy queue.
+            && !self.source_hint.has_readers(&self.source_readers)
     }
     pub(crate) fn bind_owner(&mut self, owner: u64, context: Arc<Context>) -> Result {
         if !self.reusable() {
             return Err(EBUSY);
         }
+        self.source_hint.reset_for_owner(&self.source_readers)?;
         if !context.is_current() {
             return Err(EFAULT);
         }
@@ -1274,6 +1367,9 @@ impl Queue {
             self.retained_owner = None;
         }
         context.mark_published();
+        context.note_compute_binding(true);
+        crate::g17::trace::bind(crate::g17::trace::COMPUTE, self.qid(), context.id(),
+            if same_vm { 2 } else { 1 });
         self.owner = Some(owner);
         self.unpublished_binding = true;
         self.released = false;
@@ -1284,6 +1380,9 @@ impl Queue {
     /// True allows the registry to cancel the never-published QID and drop this graph. An
     /// installed graph remains retained even after the logical owner exits without work.
     pub(crate) fn release_owner(&mut self) -> Result<bool> {
+        if let Some(binding) = &self.binding {
+            binding.context.note_compute_binding(false);
+        }
         if !self.installed && self.active.len == 0 && !self.quarantined && self.previous.is_none() {
             return Ok(true);
         }
@@ -1338,7 +1437,9 @@ impl Queue {
     }
     /// An idle retained queue whose USC backing may be given back.
     pub(crate) fn vacate_candidate(&self) -> bool {
-        (self.reusable() || self.recycled_pending()) && self.pool_phase == PoolPhase::Populated && self.pool.populated()
+        self.pool_phase == PoolPhase::Populated && self.pool.populated()
+            && (self.reusable() || self.recycled_pending())
+            && !self.source_hint.has_readers(&self.source_readers)
     }
     /// A recycled killed queue still holding the backing its killed work used.
     pub(crate) fn recycled_pending(&self) -> bool {
@@ -1396,6 +1497,7 @@ impl Queue {
     }
     fn recycle_settled(&mut self) -> Result {
         self.graph.reset_items()?;
+        self.config_cache = None;
         self.exit = None;
         self.quarantined = false;
         self.quarantine_error = None;
@@ -1634,11 +1736,11 @@ impl Queue {
         let producer = self
             .graph
             .graph
-            .word(POINTERS + self.graph.pointers.producer)?
+            .word(CURSORS + self.graph.pointers.producer)?
             .load(Ordering::Relaxed);
         self.graph
             .graph
-            .word(POINTERS + target)?
+            .word(CURSORS + target)?
             .store(producer, Ordering::Relaxed);
         Ok(())
     }
@@ -1690,6 +1792,15 @@ impl Queue {
     }
 }
 
+/// Validate the individual slot before deriving an offset into its allocation.
+/// Allocation-wide checks cannot detect a write into the following live slot.
+fn record_start(slot: usize, offset: usize, window: usize, stride: usize) -> Result<usize> {
+    if slot >= RECORD_SLOTS || offset > stride || window > stride - offset {
+        return Err(EINVAL);
+    }
+    slot.checked_mul(stride).and_then(|start| start.checked_add(offset)).ok_or(EINVAL)
+}
+
 impl Graph {
     fn record<T: Copy>(
         &mut self,
@@ -1699,12 +1810,15 @@ impl Graph {
         value: T,
     ) -> Result<u64> {
         let (object, start) = if let Some(slot) = slot {
-            if slot >= RECORD_SLOTS {
-                return Err(EINVAL);
-            }
-            (&mut self.records, slot * RECORD_STRIDE + offset)
+            let (object, stride): (&mut KernelObject, usize) = if offset == ANNOUNCE {
+                (&mut self.records, RECORD_STRIDE)
+            } else {
+                (&mut self.cached_records, CACHED_RECORD_STRIDE)
+            };
+            (object, record_start(slot, offset, window, stride)?)
         } else {
-            (&mut self.graph, 0x6800 + offset)
+            let start = record_start(0, offset, window, GRAPH_SIZE - 0x6800)?;
+            (&mut *self.graph, 0x6800 + start)
         };
         if core::mem::size_of::<T>() > window {
             return Err(EINVAL);
@@ -1730,7 +1844,7 @@ impl Graph {
             return Err(EBUSY);
         }
         let slot = self.graph.dword(ITEMS + expected as usize * 8)?;
-        let producer = self.graph.word(POINTERS + self.pointers.producer)?;
+        let producer = self.graph.word(CURSORS + self.pointers.producer)?;
         if slot.load(Ordering::Relaxed) != 0 {
             return Err(EBUSY);
         }
@@ -1776,6 +1890,17 @@ impl Queue {
         host: &mut impl Host,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
+        self.publish_with_native_waits(packet, dependencies, &[], host, defer)
+    }
+
+    pub(in crate::g17) fn publish_with_native_waits(
+        &mut self,
+        packet: Arc<Packet>,
+        dependencies: &[crate::g17::fw::kick::KickDependency],
+        native: &[crate::g17::sync_input::NativeWait],
+        host: &mut impl Host,
+        defer: &mut impl FnMut(Deferred) -> Result,
+    ) -> Result {
         use crate::g17::fw::{
             channels::WorkSlot,
             compute::{ComputeArgs, ComputeDescriptor, COMPUTE_KICK_EVENT_MASK, COMPUTE_QOS_CLASS},
@@ -1809,11 +1934,22 @@ impl Queue {
         let (descriptor_high, descriptor_low) =
             self.graph.descriptor_vas(kick_timestamp.slot() as u8)?;
         let first = !self.installed && self.ordinal == 0;
+        // The first prototype only waits on an installed consumer channel.
+        // A retry without a published source falls back to completion on CPU.
+        if first && !native.is_empty() { return Err(EAGAIN); }
+        if native.len() > crate::g17::kick::COMPUTE_CHANNELS { return Err(EINVAL); }
         let entry_signal = first
             || dependencies
                 .iter()
                 .any(|dependency| dependency.qid() != qid);
         item_capacity(self.graph.cursors()?, entry_signal)?;
+        if !native.is_empty() {
+            let cursors = self.graph.cursors()?;
+            let free = (cursors.consumer + cursors.count - cursors.producer - 1) % cursors.count;
+            if free < (if entry_signal { 4 } else { 3 }) + native.len() as u32 {
+                return Err(EAGAIN);
+            }
+        }
         let record_slot = (!first).then_some(self.ordinal as usize % RECORD_SLOTS);
         if let Some(slot) = record_slot {
             self.graph.ensure_record_slot(slot)?;
@@ -1858,6 +1994,8 @@ impl Queue {
         let policy = packet.context.policy();
         let ring = 1u8 << policy.priority();
         let config = self.queue_config(&identity, first, args.context_id, policy, &packet)?;
+        let cached = self.config_cache.and_then(|(config, at)| (at == epoch).then_some(config));
+        let send_config = first || super::render::publication::required(cached, config);
         let announce =
             KickAnnounce::new(qid, DataMaster::Compute, kick_timestamp, policy.priority())?;
         let predecessor = KickPredecessor::new(qid, kick_parent)?;
@@ -1879,6 +2017,7 @@ impl Queue {
             priority: policy.priority(),
         };
         let published = host.next_compute_publication()?;
+        self.last_published = published;
         self.active
             .push(Active {
                 packet: packet.clone(),
@@ -1904,7 +2043,7 @@ impl Queue {
                 .object
                 .initialize::<ComputeDescriptor>(
                     kick_timestamp.slot() % DESCRIPTORS * COMPUTE_DESCRIPTOR_SIZE,
-                    |descriptor| descriptor.write(&args),
+                    |descriptor| descriptor.write_zeroed(&args),
                 )?;
             if first {
                 self.graph.context_high.write(
@@ -1921,8 +2060,20 @@ impl Queue {
                 let cursors = self.graph.cursors()?;
                 let _ = self.graph.recycle(cursors);
             }
-            let config_va = self.graph.record(record_slot, CONFIG, 0xc0, config)?;
+            let config_va = if send_config {
+                Some(self.graph.record(record_slot, CONFIG, 0xc0, config)?)
+            } else {
+                None
+            };
             let cursors = self.graph.cursors()?;
+            let mut wait_vas = KVec::with_capacity(native.len(), GFP_KERNEL)?;
+            for (index, wait) in native.iter().enumerate() {
+                let record = wait.bytes(crate::g17::fw::stamp_value(kick_timestamp.get() as u32),
+                    packet.order.sequence);
+                let address = self.graph.record(record_slot, NATIVE_WAIT_OFFSET + index * NATIVE_WAIT_STRIDE,
+                    NATIVE_WAIT_STRIDE, record)?;
+                wait_vas.push(address, GFP_KERNEL)?;
+            }
             let prepared_kick = self.kick.prepare_entry(&kick_args)?;
             let mut producer;
             if first {
@@ -1948,7 +2099,7 @@ impl Queue {
                 })?;
                 producer = self
                     .graph
-                    .append(producer, config_va, || {})
+                    .append(producer, config_va.ok_or(EINVAL)?, || {})
                     .or_else(|error| {
                         self.pool.cancel_unpublished(target)?;
                         host.qos_cancel(qos)?;
@@ -1957,15 +2108,22 @@ impl Queue {
                     })?;
             } else {
                 let target = self.pool.reserve_submission()?;
-                producer = self
-                    .graph
-                    .append(cursors.producer, descriptor_high, || {
-                        packet.mark_published()
+                producer = (|| -> Result<u32> {
+                    let mut before_descriptor = cursors.producer;
+                    for &wait in &wait_vas {
+                        before_descriptor = self.graph.append(before_descriptor, wait, || {
+                            packet.mark_published();
+                            visible = true;
+                        })?;
+                    }
+                    self.graph.append(before_descriptor, descriptor_high, || {
+                        packet.mark_published();
+                        visible = true;
                     })
-                    .or_else(|error| {
-                        self.pool.cancel_unpublished(target)?;
-                        Err(error)
-                    })?;
+                })().or_else(|error| {
+                    if !visible { self.pool.cancel_unpublished(target)?; }
+                    Err(error)
+                })?;
                 visible = true;
                 self.unpublished_binding = false;
                 let qos = host.qos_publish(
@@ -1978,14 +2136,16 @@ impl Queue {
                     policy,
                 )?;
                 self.active.back_mut().ok_or(EIO)?.qos_pending = true;
-                producer = self
-                    .graph
-                    .append(producer, config_va, || {})
-                    .or_else(|error| {
-                        host.qos_cancel(qos)?;
-                        self.active.back_mut().ok_or(EIO)?.qos_pending = false;
-                        Err(error)
-                    })?;
+                if let Some(config_va) = config_va {
+                    producer = self
+                        .graph
+                        .append(producer, config_va, || {})
+                        .or_else(|error| {
+                            host.qos_cancel(qos)?;
+                            self.active.back_mut().ok_or(EIO)?.qos_pending = false;
+                            Err(error)
+                        })?;
+                }
             }
             if first {
                 prepared_kick.prepare_compute_install()?;
@@ -2015,10 +2175,12 @@ impl Queue {
                     self.outer_started & ring == 0,
                 )?,
             )?;
-            let notify_activation = self.outer_started & ring == 0;
             self.outer_started |= ring;
             self.installed = true;
             self.published_config = Some(identity);
+            if send_config {
+                self.config_cache = Some((config, epoch));
+            }
             self.ordinal = ordinal;
             let (accepted, state) = host.epoch()?;
             if state != 0 || accepted != epoch {
@@ -2043,13 +2205,13 @@ impl Queue {
                     previous.publication = Some((packet.order.sequence, epoch));
                 }
             }
-            if notify_activation {
-                fence(Ordering::SeqCst);
-                // Pipe 2 (compute) in bits 1:0, priority class in bits 3:2.
-                host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
-            }
+            // Every publication rings its own pipe and priority class, as render
+            // publication does: pipe 2 (compute) in bits 1:0, priority class in
+            // bits 3:2. The generic work doorbell left the firmware to find the
+            // ring itself and delayed dispatch.
             fence(Ordering::SeqCst);
-            host.notify((0x83 << 48) | 0x10)?;
+            host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
+            crate::g17::trace::publish(crate::g17::trace::COMPUTE, qid, ordinal, &packet);
             host.note_submission()
         })();
         if let Err(error) = result {
@@ -2155,7 +2317,7 @@ impl Graph {
         let first = self.graph.dword(ITEMS)?;
         let second = self.graph.dword(ITEMS + 8)?;
         let third = self.graph.dword(ITEMS + 16)?;
-        let producer = self.graph.word(POINTERS + self.pointers.producer)?;
+        let producer = self.graph.word(CURSORS + self.pointers.producer)?;
         first.store(address, Ordering::Relaxed);
         second.store(0, Ordering::Relaxed);
         third.store(0, Ordering::Relaxed);
@@ -2262,21 +2424,57 @@ impl Queue {
     /// Logical queue/context ownership is unchanged. The existing binding is
     /// retained through the successor's exact replacement witness.
     pub(crate) fn share_idle(&mut self) -> Result<bool> {
-        if !self.installed || self.owner.is_none() || !self.retirement_ready
-            || self.growing || self.quarantined || self.awaiting_witness
-            || self.exit.is_some() || self.active.len != 0 || self.replays.len != 0
-            || self.previous.is_some() || self.pool_phase != PoolPhase::Populated
-        {
+        if !self.shareable() {
             return Ok(false);
         }
         self.release_owner()?;
         Ok(self.reusable())
+    }
+
+    /// Another owner could take this channel now: idle and released, shareable, or vacant.
+    pub(crate) fn channel_free(&self) -> bool {
+        self.reusable() || self.shareable() || self.can_rearm()
+    }
+
+    /// A pool replacement is in flight for this queue.
+    pub(crate) fn growing(&self) -> bool {
+        self.growing
+    }
+
+    /// The queue's first command has been published: its identity and configuration exist.
+    pub(crate) fn installed(&self) -> bool {
+        self.installed
+    }
+
+    /// A packet of the bound owner passed prepare_job and will publish here.
+    pub(crate) fn claim(&mut self) {
+        self.claims = self.claims.saturating_add(1);
+    }
+
+    pub(crate) fn release_claim(&mut self) {
+        self.claims = self.claims.saturating_sub(1);
+    }
+
+    /// An open client's idle channel that [`Self::share_idle`] can hand over.
+    pub(crate) fn shareable(&self) -> bool {
+        self.claims == 0 && self.installed && self.owner.is_some() && self.retirement_ready
+            && !self.growing && !self.quarantined && !self.awaiting_witness
+            && self.exit.is_none() && self.active.len == 0 && self.replays.len == 0
+            && self.previous.is_none() && self.pool_phase == PoolPhase::Populated
+            && !self.source_hint.has_readers(&self.source_readers)
+    }
+
+    /// Device publication order of this channel's newest command: lower is
+    /// idle longer.
+    pub(crate) fn last_published(&self) -> u64 {
+        self.last_published
     }
 }
 
 impl Queue {
     pub(crate) fn can_rearm(&self) -> bool {
         self.pool_phase == PoolPhase::Vacant && (self.reusable() || self.recycled_pending())
+            && !self.source_hint.has_readers(&self.source_readers)
     }
 }
 
@@ -2316,5 +2514,52 @@ impl Queue {
         self.owner = None;
         self.released_at = now_ns();
         Ok((false, retired))
+    }
+}
+
+
+impl Queue {
+    /// Same immutable singleton identity and current physical epoch.
+    pub(crate) fn has_input_source(&self, source: &Arc<crate::g17::fence::Submission>,
+        status: &Arc<VmStatus>, epoch: u64) -> bool
+    {
+        !self.quarantined && self.replays.len == 0 && self.active.iter().any(|active|
+            active.ticket.is_some_and(|ticket| ticket.epoch == epoch)
+                && Arc::ptr_eq(active.packet.completion.status(), status)
+                && active.packet.completion.is_input_source(source))
+    }
+
+    pub(crate) fn source_dependency(&mut self, source: &crate::g17::sync_input::Source,
+        status: &Arc<VmStatus>, epoch: u64) -> Result<Option<(u64,
+            crate::g17::fw::kick::KickDependency, u64, u32, crate::g17::sync_input::Hold)>>
+    {
+        for active in self.active.iter() {
+            if !active.packet.completion.is_input_source(&source.submission) { continue; }
+            if !Arc::ptr_eq(active.packet.completion.status(), status) { return Err(EINVAL); }
+            if self.quarantined || self.replays.len != 0 { return Err(EAGAIN); }
+            let ticket = active.ticket.ok_or(EAGAIN)?;
+            if ticket.epoch != epoch { return Err(EAGAIN); }
+            self.valid_ticket(active, &ticket)?;
+            if active.packet.cancel_requested() { return Err(ECANCELED); }
+            source.submission.source_status()?;
+            let dependency = crate::g17::fw::kick::KickDependency::new(self.qid(),
+                crate::g17::fw::kick::KickTimestamp::new(ticket.kick).ok_or(EIO)?).ok_or(EIO)?;
+            let hold = self.source_hint.hold(&self.source_readers)?;
+            return Ok(Some((active.published, dependency,
+                self.graph.support.gpu_va() + STAMP as u64,
+                u32::from(self.qid()), hold)));
+        }
+        Ok(None)
+    }
+
+    /// Preparing a possible wait does not create a firmware consumer. Mark it
+    /// only once the consumer's first item is visible, under the device mutex.
+    pub(crate) fn note_input_consumer(&self, source: &crate::g17::sync_input::Source) {
+        for active in self.active.iter() {
+            if active.packet.completion.is_input_source(&source.submission) {
+                active.packet.completion.note_firmware_consumer();
+                break;
+            }
+        }
     }
 }

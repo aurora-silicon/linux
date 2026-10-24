@@ -19,7 +19,7 @@ impl super::Registry {
     /// batch cannot overflow a separate cache. No allocation or wait is needed.
     pub(super) fn acknowledge_compute_exit(&mut self, cookie: u64) {
         for entry in self.compute.iter_mut().flatten() {
-            if let Some(queue) = entry.queue.as_deref_mut() {
+            if let Some(mut queue) = entry.queue.as_deref_mut() {
                 if queue.acknowledge_exit(cookie) {
                     return;
                 }
@@ -31,12 +31,12 @@ impl super::Registry {
 impl Firmware {
     pub(in crate::g17) fn service_compute_exit(&mut self, deferred: &mut DeferredBatch) -> Result {
         let recovery_closed = self.init.recovery_state()? == 0;
-        let view = crate::g17::qos::View::new(self.init.qos()?)?;
+        let port = &self.port;
         for entry in self.queues.compute.iter_mut().flatten() {
-            if let Some(queue) = entry.queue.as_deref_mut() {
+            if let Some(mut queue) = entry.queue.as_deref_mut() {
                 queue.settle_exit(
                     recovery_closed,
-                    &mut |owner| self.queues.accounting.complete(&view, &[owner]),
+                    &mut |owner| port.qos_complete(&[owner]),
                     &mut |event| deferred.push(event),
                 )?;
             }
@@ -48,7 +48,7 @@ impl Firmware {
         // Publication has already retained each kill. Retry only the doorbell;
         // failed attempts do not extend its bounded polling window.
         for entry in self.queues.compute.iter_mut().flatten() {
-            if let Some(queue) = entry.queue.as_deref_mut() {
+            if let Some(mut queue) = entry.queue.as_deref_mut() {
                 let _ = queue.announce_exit(now, || self.primary.notify(MSG_CONTROL_NOTIFY));
             }
         }
@@ -85,14 +85,16 @@ impl Firmware {
         if self.render_control_backpressured() {
             return Ok(());
         }
-        let queue = self.queues.compute[index]
-            .as_ref()
-            .and_then(|entry| entry.queue.as_deref())
-            .ok_or(EIO)?;
-        let Some(owner) = queue.exit_owner(context) else {
-            return Ok(());
+        let (owner, target) = {
+            let queue = self.queues.compute[index]
+                .as_ref()
+                .and_then(|entry| entry.queue.as_deref())
+                .ok_or(EIO)?;
+            let Some(owner) = queue.exit_owner(context) else {
+                return Ok(());
+            };
+            (owner, queue.qid())
         };
-        let target = queue.qid();
         let (mut own, mut foreign, slots) = self.queues.render.exit_scope(context);
         for entry in self.queues.compute.iter().flatten() {
             if let Some(queue) = entry.queue.as_deref() {
@@ -130,7 +132,7 @@ impl Firmware {
         }
         // Publication is irrevocable even if its doorbell fails. Keep both
         // the killed graph and the held render identities until processor stop.
-        let queue = self.queues.compute[index]
+        let mut queue = self.queues.compute[index]
             .as_mut()
             .and_then(|entry| entry.queue.as_deref_mut())
             .ok_or(EIO)?;

@@ -12,7 +12,7 @@ use kernel::prelude::*;
 use super::kick::{KickTimestamp, RegisterArray, RegisterArrayBinding, RegisterWrite};
 use super::queue::CommandTag;
 use super::{
-    clear, offset_va, sampler_max, stamp_value, timestamp_end_va, work_key, ObjectIds, UNK_0A599,
+    offset_va, sampler_max, stamp_value, timestamp_end_va, work_key, ObjectIds, UNK_0A599,
     UNK_0D411, UNK_101D9, UNK_10791, UNK_1A0E9, UNK_1C8F8,
 };
 
@@ -507,8 +507,9 @@ impl ComputeDescriptor {
     const UNK_FBA: u32 = 0xe0a0_0001;
     const UNK_FC5: u8 = 0x9f;
 
-    /// Writes the complete descriptor.
-    pub(crate) fn write(&mut self, args: &ComputeArgs) -> Result {
+    /// Fills a descriptor cleared by `Object::initialize`. The unused firmware
+    /// fields and padding retain that zero initialization.
+    pub(crate) fn write_zeroed(&mut self, args: &ComputeArgs) -> Result {
         if args.cdm_end_va < args.cdm_va
             || (args.sampler_heap_va == 0) != (args.sampler_count == 0)
             || args.sampler_heap_va & 7 != 0
@@ -522,7 +523,6 @@ impl ComputeDescriptor {
         let timestamp_end_va = timestamp_end_va(args.timestamp_va)?;
         let sampler_max = sampler_max(args.sampler_count)?;
 
-        clear(self);
         self.tag = CommandTag::Compute as u32;
         self.context_id = args.context_id.into();
         self.work_state_va = args.work_state_va;

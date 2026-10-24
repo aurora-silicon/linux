@@ -129,14 +129,6 @@ impl WorkPublication<'_> {
             );
         }
     }
-
-    fn commit(self) -> u32 {
-        self.copy_record();
-        fence(Ordering::SeqCst);
-        self.producer.store(self.next, Ordering::Relaxed);
-        fence(Ordering::SeqCst);
-        self.next
-    }
 }
 
 /// Session-long storage and mappings. Aliases are released before their backing objects.
@@ -394,6 +386,12 @@ impl InitData {
         Ok(())
     }
 
+    pub(super) fn compute_vm_cached(&self, vm: &mmu::Vm) -> bool {
+        self.compute_shared
+            .as_ref()
+            .is_some_and(|shared| vm.compute_pool_mappings_match(shared.id))
+    }
+
     pub(super) fn cache_compute_vm(&self, vm: &mmu::Vm) -> Result {
         let shared = self.compute_shared.as_ref().ok_or(EIO)?;
         if vm.compute_pool_mappings_match(shared.id) {
@@ -510,7 +508,7 @@ impl InitData {
         let engine = match record.data_master {
             0 => DataMaster::Tiling,
             1 => DataMaster::Fragment,
-            2 => DataMaster::Compute,
+            // Compute publications reserve their slots through the port.
             _ => return Err(EINVAL),
         };
         let channel = channels::work_ring_index(priority, engine).ok_or(EINVAL)?;
@@ -561,16 +559,6 @@ impl InitData {
             return Err(EINVAL);
         }
         Ok(values)
-    }
-
-    /// Inner queue records must be visible before this outer publication. The returned
-    /// producer is the retained consumer witness for this slot.
-    pub(super) fn publish_work(
-        &self,
-        priority: u8,
-        record: &super::fw::channels::WorkSlot,
-    ) -> Result<u32> {
-        Ok(self.work_publication(priority, record)?.commit())
     }
 
     /// Validate both destinations before exposing fragment, then tiling. The accounting token
@@ -671,21 +659,80 @@ impl InitData {
         Ok(())
     }
 
+    /// Raw views of the memory publishers share without the device mutex: every work ring,
+    /// the completion stamps, the QoS table and the recovery state word. They stay valid for
+    /// this session.
+    pub(super) fn port_views(
+        &self,
+        mailbox: *const super::Mailbox,
+    ) -> Result<super::port::Views> {
+        use super::fw::{channels, queue::{DataMaster, Policy}};
+        let ring_of = |priority: u8, engine: DataMaster| -> Result<super::port::RingView> {
+            let channel = channels::work_ring_index(priority, engine).ok_or(EINVAL)?;
+            let base = self.state_offset(Role::Primary) + abi::work_state_offset(channel);
+            let state = self.object(self.cluster)?;
+            let word = |offset: usize| -> Result<*const AtomicU32> {
+                Ok(state.word(base + offset)?)
+            };
+            Ok(super::port::RingView {
+                slots: self.object(self.bundle)?.pointer(
+                    abi::work_ring_offset(channel),
+                    channels::WORK_RING_SLOTS as usize
+                        * core::mem::size_of::<channels::WorkSlot>(),
+                )?,
+                consumers: [
+                    word(abi::ChannelState::CONSUMER)?,
+                    word(abi::ChannelState::UNK_10)?,
+                ],
+                producer: word(abi::ChannelState::PRODUCER)?,
+            })
+        };
+        let rings = |engine: DataMaster| -> Result<[super::port::RingView; Policy::PRIORITIES as usize]> {
+            let mut views = [ring_of(0, engine)?; Policy::PRIORITIES as usize];
+            for (priority, view) in views.iter_mut().enumerate().skip(1) {
+                *view = ring_of(priority as u8, engine)?;
+            }
+            Ok(views)
+        };
+        Ok(super::port::Views {
+            compute: rings(DataMaster::Compute)?,
+            tiling: rings(DataMaster::Tiling)?,
+            fragment: rings(DataMaster::Fragment)?,
+            stamps: self.object(self.stamps[0])?.word(0)?,
+            qos: self
+                .qos()?
+                .pointer(0, core::mem::size_of::<super::fw::qos::Qos>())?,
+            recovery: self
+                .object(self.cluster)?
+                .word(abi::private::STATUS_B + abi::PrimaryStatusB::RECOVERY_STATE)?,
+            mailbox,
+        })
+    }
+
     /// Snapshot the shared compute completion ring once per service transaction. The queue
     /// scanner latches exact identities; firmware retains sole ownership of these slots.
+    /// Visits ring slots from `start`, wrapping once, until `record` reports
+    /// that nothing more is wanted. Returns the slot after the last one visited
+    /// when the scan stopped early, or `start` after a complete wrap.
     pub(super) fn scan_compute_completions(
         &self,
-        mut record: impl FnMut(ComputeCompletion<'_>) -> Result,
-    ) -> Result {
+        start: usize,
+        mut record: impl FnMut(ComputeCompletion<'_>) -> Result<bool>,
+    ) -> Result<usize> {
         let object = self.object(self.completion_rings[0])?;
+        let slots = (abi::COMPLETION_RING_SIZE / 0x40).min(0x800);
+        let start = start % slots;
         fence(Ordering::Acquire);
-        for slot in 0..(abi::COMPLETION_RING_SIZE / 0x40).min(0x800) {
-            record(ComputeCompletion {
+        for step in 0..slots {
+            let slot = (start + step) % slots;
+            if record(ComputeCompletion {
                 object,
                 offset: slot * 0x40,
-            })?;
+            })? {
+                return Ok((slot + 1) % slots);
+            }
         }
-        Ok(())
+        Ok(start)
     }
 
     fn object(&self, index: usize) -> Result<&KernelObject> {

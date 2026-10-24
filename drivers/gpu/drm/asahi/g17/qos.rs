@@ -2,17 +2,14 @@
 
 //! Shared QoS publication and exact-completion accounting for every engine.
 //!
-//! The device publication lock serializes this host state. Publishing identity
+//! The port's QoS lock serializes this host state. Publishing identity
 //! precedes submitted counters; retiring a final owner clears only its two row
 //! bytes. Cancellation balances host references without rewinding shared counts.
 
-use super::{
-    fw::{qos as fw, queue::Policy},
-    object::KernelObject,
-};
+use super::fw::{qos as fw, queue::Policy};
 use crate::hw::t8140::qos as cfg;
 use core::{
-    mem::{offset_of, size_of},
+    mem::offset_of,
     sync::atomic::{fence, AtomicU32, AtomicU64, AtomicU8, Ordering},
 };
 use kernel::prelude::*;
@@ -30,15 +27,17 @@ pub(crate) struct View<'a> {
     times_and_counts: &'a [AtomicU64; 7],
 }
 impl<'a> View<'a> {
-    pub(crate) fn new(object: &'a KernelObject) -> Result<Self> {
-        let ptr = object.pointer(0, size_of::<fw::Qos>())?;
+    /// # Safety
+    ///
+    /// `ptr` must span a complete QoS table that stays mapped for `'a`.
+    pub(crate) unsafe fn from_raw(ptr: *mut u8) -> Result<Self> {
         if ptr as usize & 7 != 0 {
             return Err(EINVAL);
         }
         // SAFETY: pointer spans the complete layout, whose asserted offsets
         // and size bound every array below. Integer atomics have their integer
-        // representation and alignment. The retained object borrow keeps every
-        // shared reference alive; accesses use each field's fixed width.
+        // representation and alignment. The caller keeps every shared
+        // reference alive; accesses use each field's fixed width.
         Ok(unsafe {
             Self {
                 rows: &*ptr.add(offset_of!(fw::Qos, rows)).cast(),

@@ -20,11 +20,10 @@ impl Backend {
                 return Ok(Decision::Own);
             };
             firmware.scan_compute(None, &mut deferred)?;
-            let Some(queue) = firmware.queues.compute(self.owner)
-                .filter(|queue| queue.can_classify_timeout(packet)) else {
-                return Ok(Decision::Own);
-            };
-            let Some(own) = queue.timeout_head() else {
+            // Each queue is locked on its own: release this one before visiting the others.
+            let Some(own) = firmware.queues.compute(self.owner)
+                .filter(|queue| queue.can_classify_timeout(packet))
+                .and_then(|queue| queue.timeout_head()) else {
                 return Ok(Decision::Own);
             };
             let computes = firmware.queues.compute.iter().flatten()
@@ -64,7 +63,7 @@ impl Backend {
                 return Ok(None);
             };
             firmware.scan_compute(None, &mut deferred)?;
-            let Some(queue) = firmware.queues.compute_mut(self.owner) else {
+            let Some(mut queue) = firmware.queues.compute_mut(self.owner) else {
                 return Ok(None);
             };
             if !queue.owns_packet(packet) {
@@ -91,7 +90,7 @@ impl Backend {
                 return Ok(());
             };
             firmware.scan_compute(None, &mut deferred)?;
-            if let Some(queue) = firmware.queues.compute_mut(self.owner) {
+            if let Some(mut queue) = firmware.queues.compute_mut(self.owner) {
                 queue.cancel(packet, &mut |event| deferred.push(event))?;
             }
             Ok(())

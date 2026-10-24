@@ -368,6 +368,13 @@ enum drm_asahi_feature {
 	 * DRM_ASAHI_COMPUTE_AS_BUILD for a bounded long execution allowance.
 	 */
 	DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD = (1UL) << 16,
+
+	/**
+	 * @DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS: SUBMIT accepts one
+	 * DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ_CUMULATIVE output. All outputs
+	 * include the earlier points of that timeline without adding GPU waits.
+	 */
+	DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS = (1UL) << 17,
 };
 
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
@@ -901,6 +908,16 @@ enum drm_asahi_sync_type {
 
 	/** @DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ: Timeline sync object */
 	DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ = 1,
+
+	/**
+	 * @DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ_CUMULATIVE: Output-only queue
+	 * timeline anchor, requiring CUMULATIVE_SIGNALS and a nonzero point.
+	 * At most one is allowed. All outputs receive completion of this submit
+	 * and the earlier anchor points.
+	 * Other outputs must not alias the anchor. No execution dependency is
+	 * added. Calls updating this private anchor must be externally serialized.
+	 */
+	DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ_CUMULATIVE = 2,
 };
 
 /**

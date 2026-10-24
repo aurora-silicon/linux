@@ -127,10 +127,18 @@ pub(crate) struct SyncItem {
     pub(crate) fence: Option<dma_fence::Fence>,
     pub(crate) chain_fence: Option<dma_fence::FenceChain>,
     pub(crate) timeline_value: u64,
+    pub(crate) cumulative: Option<crate::g17::sync_output::SignalBundle>,
+    pub(crate) timeline: bool,
 }
 
 impl SyncItem {
-    fn parse_one(file: &DrmFile, data: uapi::drm_asahi_sync, out: bool) -> Result<SyncItem> {
+    fn parse_one(file: &DrmFile, mut data: uapi::drm_asahi_sync, out: bool,
+        bundled: bool) -> Result<SyncItem>
+    {
+        if data.sync_type == crate::g17::sync_output::SYNC_CUMULATIVE {
+            if !out || !bundled || data.timeline_value == 0 { return Err(EINVAL); }
+            data.sync_type = uapi::drm_asahi_sync_type_DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ;
+        }
         match data.sync_type {
             uapi::drm_asahi_sync_type_DRM_ASAHI_SYNC_SYNCOBJ => {
                 if data.timeline_value != 0 {
@@ -151,6 +159,8 @@ impl SyncItem {
                     syncobj,
                     chain_fence: None,
                     timeline_value: data.timeline_value,
+                    cumulative: None,
+                    timeline: false,
                 })
             }
             uapi::drm_asahi_sync_type_DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ => {
@@ -173,12 +183,10 @@ impl SyncItem {
                 Ok(SyncItem {
                     fence,
                     syncobj,
-                    chain_fence: if out {
-                        Some(dma_fence::FenceChain::new()?)
-                    } else {
-                        None
-                    },
+                    chain_fence: None,
                     timeline_value: data.timeline_value,
+                    cumulative: None,
+                    timeline: true,
                 })
             }
             _ => {
@@ -193,12 +201,14 @@ impl SyncItem {
         ptr: u64,
         in_count: u32,
         out_count: u32,
+        allow_cumulative: bool,
     ) -> Result<KVec<SyncItem>> {
         let count = in_count.checked_add(out_count).ok_or(EOVERFLOW)?;
 
         const STRIDE: usize = core::mem::size_of::<uapi::drm_asahi_sync>();
         let size = STRIDE.checked_mul(count as usize).ok_or(EOVERFLOW)?;
         let mut vec = KVec::with_capacity(count as usize, GFP_KERNEL)?;
+        let mut anchor = None;
 
         // SAFETY: We only read this once, so there are no TOCTOU issues.
         let mut reader = UserSlice::new(UserPtr::from_addr(ptr as _), size).reader();
@@ -214,7 +224,25 @@ impl SyncItem {
             // SAFETY: All bit patterns in the struct are valid
             let sync = unsafe { sync.assume_init() };
 
-            vec.push(SyncItem::parse_one(file, sync, i >= in_count)?, GFP_KERNEL)?;
+            if sync.sync_type == crate::g17::sync_output::SYNC_CUMULATIVE {
+                if !allow_cumulative || i < in_count || anchor.is_some() {
+                    return Err(EINVAL);
+                }
+                anchor = Some(i as usize);
+            }
+            vec.push(Self::parse_one(file, sync, i >= in_count,
+                allow_cumulative)?, GFP_KERNEL)?;
+        }
+        if let Some(anchor) = anchor {
+            let bundle = crate::g17::sync_output::SignalBundle::new(
+                &vec[in_count as usize..], anchor - in_count as usize)?;
+            vec[anchor].cumulative = Some(bundle);
+        } else {
+            for sync in &mut vec[in_count as usize..] {
+                if sync.timeline {
+                    sync.chain_fence = Some(dma_fence::FenceChain::new()?);
+                }
+            }
         }
 
         Ok(vec)
@@ -1396,7 +1424,8 @@ impl File {
             copy_commands(&mut vec)?;
         }
         let syncs =
-            SyncItem::parse_array(file, data.syncs, data.in_sync_count, data.out_sync_count)?;
+            SyncItem::parse_array(file, data.syncs, data.in_sync_count, data.out_sync_count,
+                gpu.as_any().is::<crate::g17::Gpu>())?;
 
         mod_dev_dbg!(
             device,

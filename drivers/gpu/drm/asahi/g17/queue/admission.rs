@@ -9,6 +9,7 @@
 //! a graph or waiting for GPU work. Capacity waiters sleep on the release event.
 
 use crate::g17::{
+    fw::kick::KickDependency,
     hazard::{self, Footprint, Plan},
     job::Packet,
 };
@@ -43,6 +44,9 @@ struct InFlight {
     slot: Option<u8>,
     ticket: u64,
     footprint: Arc<Footprint>,
+    /// Fragment kick of the published render; a later same-VM overlap of
+    /// another pair waits for it in firmware.
+    fragment: Option<KickDependency>,
 }
 
 const QUARANTINE_WAIT_MS: u32 = 1000;
@@ -294,6 +298,28 @@ impl State {
         )
     }
 
+    /// Whether `pick` would return a slot, without taking it.
+    fn can_pick(&self, owner: u64, plan: Plan) -> bool {
+        let usable = |slot: usize| {
+            self.owners[slot] == owner
+                && (self.quarantined | self.kill_hold) & (1u64 << slot) == 0
+                && self.refs[slot] < cfg::RENDER_DEPTH
+        };
+        match plan {
+            Plan::Wait => false,
+            Plan::Pair(slot) => usize::from(slot) < cfg::RENDER_SLOTS && usable(usize::from(slot)),
+            Plan::Any if owner == 0 => false,
+            Plan::Any if self.owners.contains(&owner) => (0..cfg::RENDER_SLOTS).any(usable),
+            Plan::Any => {
+                let free = !self.active & Self::MASK & !self.quarantined & !self.kill_hold;
+                (0..cfg::RENDER_SLOTS).any(|slot| {
+                    free & (1u64 << slot) != 0
+                        && (self.released & (1u64 << slot) != 0 || self.owners[slot] == 0)
+                })
+            }
+        }
+    }
+
     fn pick(&mut self, owner: u64, plan: Plan) -> Option<u8> {
         match plan {
             Plan::Any => self.acquire(owner),
@@ -332,11 +358,18 @@ impl State {
                     slot,
                     ticket,
                     footprint: request.footprint.clone(),
+                    fragment: None,
                 },
                 GFP_KERNEL,
             )
             .ok()?;
         Some((owner, request.sequence))
+    }
+
+    fn position(&self, slot: u8, (owner, sequence): (u64, u64)) -> Option<usize> {
+        self.footprints.iter().position(|entry| {
+            entry.slot == Some(slot) && entry.owner == owner && entry.sequence == sequence
+        })
     }
 
     fn forget_waiter(&mut self, ticket: Option<u64>) {
@@ -366,9 +399,22 @@ pub(crate) struct Pool {
     queues: AtomicU32,
     /// Logical queues admitted at most: each must be able to hold a render pair.
     max_queues: u32,
+    /// Logical-queue creation waiting for a returned slot.
+    waiters: Option<Arc<crate::g17::availability::Availability>>,
+    /// Render publication waiting for render capacity: woken with every
+    /// release event above.
+    renders: Option<Arc<crate::g17::availability::Availability>>,
 }
 impl Pool {
+    #[cfg(CONFIG_KUNIT)]
     pub(crate) fn new(max_queues: u32) -> Result<Arc<Self>> {
+        Self::with_waiters(max_queues, None, None)
+    }
+    pub(crate) fn with_waiters(
+        max_queues: u32,
+        waiters: Option<Arc<crate::g17::availability::Availability>>,
+        renders: Option<Arc<crate::g17::availability::Availability>>,
+    ) -> Result<Arc<Self>> {
         if max_queues > MAX_EXECUTION_CONTEXTS {
             return Err(EINVAL);
         }
@@ -378,9 +424,18 @@ impl Pool {
                 released <- new_condvar!("G17 render pair release"),
                 queues: AtomicU32::new(0),
                 max_queues,
+                waiters,
+                renders,
             }),
             GFP_KERNEL,
         )
+    }
+    /// Every pair or lease return, owner close and quarantine change.
+    fn returned(&self) {
+        self.released.notify_all();
+        if let Some(renders) = &self.renders {
+            renders.notify();
+        }
     }
     /// Logical queues currently counted, including one being created.
     pub(crate) fn queues(&self) -> u32 {
@@ -522,6 +577,24 @@ impl Pool {
             record,
         }))
     }
+    /// Whether `acquire_render` would admit this request now, without
+    /// admitting it: the scheduler's prepare step waits for this.
+    pub(crate) fn admits_render(&self, owner: u64, request: Option<Request<'_>>) -> bool {
+        let state = self.state.lock();
+        if owner == 0 || state.refusal(owner).is_err() {
+            return false;
+        }
+        if state
+            .owners
+            .iter()
+            .position(|id| *id == owner)
+            .is_some_and(|slot| state.quarantined & (1u64 << slot) != 0)
+        {
+            return false;
+        }
+        let plan = state.plan(owner, request, None);
+        state.can_pick(owner, plan)
+    }
     pub(crate) fn warmable_sibling(
         self: &Arc<Self>,
         owner: u64,
@@ -558,7 +631,7 @@ impl Pool {
             }
         }
         drop(state);
-        self.released.notify_all();
+        self.returned();
     }
     /// Active leases survive this transition. Their later drop is still the
     /// event which releases capacity, so a stopped owner is never double-freed.
@@ -576,7 +649,7 @@ impl Pool {
         state.spared &= !released;
         state.kill_hold = 0;
         drop(state);
-        self.released.notify_all();
+        self.returned();
     }
 }
 
@@ -653,9 +726,18 @@ mod accounting_tests {
 pub(crate) struct QueueSlot {
     pool: Arc<Pool>,
 }
+impl QueueSlot {
+    /// The device's admission pool, which lives as long as the firmware session.
+    pub(crate) fn pool(&self) -> &Arc<Pool> {
+        &self.pool
+    }
+}
 impl Drop for QueueSlot {
     fn drop(&mut self) {
         self.pool.queues.fetch_sub(1, Ordering::AcqRel);
+        if let Some(waiters) = &self.pool.waiters {
+            waiters.notify();
+        }
     }
 }
 
@@ -691,7 +773,7 @@ impl RenderLease {
         }
         state.quarantined |= bit;
         drop(state);
-        self.pool.released.notify_all();
+        self.pool.returned();
     }
     /// The VM pin must be retired first. Keep this lease until after clearing
     /// quarantine; its drop is what permits waiting publications to proceed.
@@ -705,19 +787,78 @@ impl RenderLease {
         self.rehabilitate_after_processor_stop();
     }
 }
+impl RenderLease {
+    /// Called under the device mutex once the render's kicks are committed,
+    /// including a replay, which supersedes the earlier kick.
+    pub(crate) fn note_publication(&self, fragment: KickDependency) {
+        let Some(record) = self.record else {
+            return;
+        };
+        let mut state = self.pool.state.lock();
+        if let Some(index) = state.position(self.slot, record) {
+            state.footprints[index].fragment = Some(fragment);
+        }
+    }
+}
+
+impl Pool {
+    /// Under the device mutex, which orders every publication: the newest
+    /// published fragment kick of each other pair whose live same-VM render
+    /// overlaps `footprint`. Quarantined pairs are skipped as in admission.
+    pub(crate) fn publication_barriers(
+        &self,
+        owner: u64,
+        slot: u8,
+        footprint: &Footprint,
+        barriers: &mut [KickDependency; hazard::PUBLICATION_BARRIERS],
+    ) -> Result<usize> {
+        let state = self.state.lock();
+        let mut slots = [0u8; hazard::PUBLICATION_BARRIERS];
+        let mut count = 0;
+        for entry in state.footprints.iter() {
+            let (Some(other), Some(fragment)) = (entry.slot, entry.fragment) else {
+                continue;
+            };
+            if other == slot
+                || entry.owner == owner
+                || state.quarantined & (1u64 << other) != 0
+                || !footprint.same_vm(&entry.footprint)
+                || !footprint.overlaps(&entry.footprint)
+            {
+                continue;
+            }
+            match slots[..count].iter().position(|known| *known == other) {
+                // One fragment ring completes in kick order; same QID, so the
+                // word orders by timestamp.
+                Some(index) => {
+                    if fragment.word() > barriers[index].word() {
+                        barriers[index] = fragment;
+                    }
+                }
+                // Admission bounds the pairs; see hazard::plan.
+                None if count == hazard::PUBLICATION_BARRIERS => return Err(EBUSY),
+                None => {
+                    slots[count] = other;
+                    barriers[count] = fragment;
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+}
+
 impl Drop for RenderLease {
     fn drop(&mut self) {
         let mut state = self.pool.state.lock();
-        if let Some((owner, sequence)) = self.record {
-            if let Some(index) = state.footprints.iter().position(|entry| {
-                entry.slot == Some(self.slot) && entry.owner == owner && entry.sequence == sequence
-            }) {
+        if let Some(record) = self.record {
+            if let Some(index) = state.position(self.slot, record) {
                 state.footprints.swap_remove(index);
             }
         }
         state.release(self.slot);
         drop(state);
-        self.pool.released.notify_all();
+        self.pool.returned();
     }
 }
 
@@ -756,7 +897,7 @@ impl Pool {
             return;
         }
         self.state.lock().kill_hold &= !slots;
-        self.released.notify_all();
+        self.returned();
     }
 }
 
