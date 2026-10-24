@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * J873g USB1 (usb-drd1, back-left port) USB2 host bring-up.
- * The loader powers the controller and initialises the eUSB2 PHY in host
+ * J873g USB2 host bring-up: usb-drd1 (back-left port) and usb-drd2
+ * (front ports via the on-board hub).
+ * The loader powers the controllers and initialises the eUSB2 PHYs in host
  * mode before Linux starts (no PMGR, PHY or Type-C driver yet), so the
- * controller is described as a plain DWC3 host behind its two DARTs.
- * Resources are from the 26A434 ADT: dart-usb1, usb-drd1.
+ * controllers are described as plain DWC3 hosts behind their two DARTs.
+ * Resources are from the 26A434 ADT: dart-usb1/2, usb-drd1/2.
  */
 
 / {
@@ -30,6 +31,32 @@
 			dr_mode = "host";
 			maximum-speed = "high-speed";
 			iommus = <&usb1_dart0 0>, <&usb1_dart1 1>;
+			snps,dis_u2_susphy_quirk;
+			snps,dis_u3_susphy_quirk;
+		};
+
+		usb2_dart0: iommu@383020000 {
+			compatible = "apple,t8152-dart", "apple,t8110-dart";
+			reg = <0x3 0x83020000 0x0 0xc000>;
+			interrupts = <AIC_IRQ 1750 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+		};
+
+		usb2_dart1: iommu@383040000 {
+			compatible = "apple,t8152-dart", "apple,t8110-dart";
+			reg = <0x3 0x83040000 0x0 0xc000>;
+			interrupts = <AIC_IRQ 1750 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+		};
+
+		/* usb-drd2: on-board VL822 hub behind the two front USB-C ports. */
+		usb2: usb@382430000 {
+			compatible = "snps,dwc3";
+			reg = <0x3 0x82430000 0x0 0xcd00>;
+			interrupts = <AIC_IRQ 1763 IRQ_TYPE_LEVEL_HIGH>;
+			dr_mode = "host";
+			maximum-speed = "high-speed";
+			iommus = <&usb2_dart0 0>, <&usb2_dart1 1>;
 			snps,dis_u2_susphy_quirk;
 			snps,dis_u3_susphy_quirk;
 		};
