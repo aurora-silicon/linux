@@ -286,3 +286,4 @@
 
 #include "t8152-j873-pmc.dtsi"
 #include "t8152-j873-qspi.dtsi"
+#include "t8152-j873-nvme.dtsi"
