@@ -125,6 +125,12 @@ struct macaudio_platform_cfg {
 	 * (CS42L84_DAC_DB()), 0 for the codec's own maximum.
 	 */
 	int jack_max_vol;
+	/*
+	 * The speaker front-end's channel count where the CPU component's
+	 * stream has more slots than amps (0: one channel per amp). The amps
+	 * keep the first slots in codec order; the others carry silence.
+	 */
+	unsigned int speaker_fe_channels;
 };
 
 static const char *volume_control_names[] = {
@@ -951,6 +957,8 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 		/* Save the max number of channels on the platform */
 		if (nchannels > ma->max_channels)
 			ma->max_channels = nchannels;
+		if (speakers && ma->cfg->speaker_fe_channels > ma->max_channels)
+			ma->max_channels = ma->cfg->speaker_fe_channels;
 
 		/*
 		 * If there is a single speaker, assign two channels to it, because
@@ -2120,6 +2128,28 @@ struct macaudio_platform_cfg macaudio_j616_cfg = {
 };
 
 /*
+ * J713 (T8132, MacBook Air 13" M4): the J616s stream, six 32-bit playback
+ * and twelve 16-bit sense slots in the same 250-bit frame, with four
+ * SN012776 amps, a woofer and a tweeter per side, on the first four and the
+ * first eight. The front-end carries all six channels; the last two are
+ * silent.
+ */
+struct macaudio_platform_cfg macaudio_j713_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_1W1T,
+	.stereo = true,
+	.amp_gain = 15,
+	.safe_vol = -20,
+	.fe_dai_names = { "j616-pcm-0", "j616-pcm-1", "j616-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
+		   SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
+	.secondary_bclk_ratio = 250,
+	.fe_cpu_is_platform = true,
+	.speaker_fe_channels = 6,
+};
+
+/*
  * The J616s headphone jack, a card of its own: a CS42L84 on the AOP's
  * "jack" back-end, which the firmware runs on MCA cluster 2 as a 64-SCLK
  * frame at 48 kHz (3.072 MHz, the primary front-end's ratio) with a
@@ -2207,6 +2237,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j616-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j700    AID44   max98360a   -       2x 1W    (AOP-fed, software gain) */
 	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
+	/* j713    -       sn012776    15      2x 1W+1T (AOP-fed, one serializer) */
+	{ .compatible = "apple,j713-macaudio", .data = &macaudio_j713_cfg },
 	/* The J713 jack runs on the AOP like the J616s one, with the same cap. */
 	{ .compatible = "apple,j713-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* Fallback, jack only */
