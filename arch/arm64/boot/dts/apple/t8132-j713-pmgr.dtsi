@@ -125,16 +125,18 @@
 	status = "disabled";
 };
 
+/* The CS42L84 headphone codec. */
 &ps_i2c1 {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_i2c2 {
 	status = "disabled";
 };
 
+/* The SN012776 speaker amps. */
 &ps_i2c3 {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_i2c4 {
