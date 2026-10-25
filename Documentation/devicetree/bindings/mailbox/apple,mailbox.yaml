@@ -76,6 +76,11 @@ properties:
         const: apple,t8140-aop-setup-mailbox
 
       - description:
+          T8152 ANS post-office mailbox, a 0x80 window in the post-office
+          bank. No interrupts are described for it; the host polls it.
+        const: apple,t8152-ans-mailbox
+
+      - description:
           An older ASC mailbox interface found on T2 and A11 that is also
           used for the NVMe coprocessor and the system management
           controller.
@@ -152,6 +157,20 @@ allOf:
       properties:
         compatible:
           contains:
+            const: apple,t8152-ans-mailbox
+    then:
+      properties:
+        interrupts: false
+        interrupt-names: false
+    else:
+      required:
+        - interrupts
+        - interrupt-names
+
+  - if:
+      properties:
+        compatible:
+          contains:
             const: apple,t8140-aop-setup-mailbox
     then:
       properties:
@@ -211,8 +230,6 @@ allOf:
 required:
   - compatible
   - reg
-  - interrupts
-  - interrupt-names
   - "#mbox-cells"
 
 additionalProperties: false
