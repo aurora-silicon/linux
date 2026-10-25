@@ -616,7 +616,7 @@
 		      <0x2 0x88000000 0x0 0x3758000>;
 		reg-names = "asc", "sgx";
 		mboxes = <&gfx_mbox>;
-		power-domains = <&ps_gfx>;
+		power-domains = <&pmp_gfx>;
 		status = "disabled";
 	};
 
@@ -909,8 +909,8 @@
 		 * the GPU as off and holds it at its lowest state, but claiming
 		 * it while nothing powers the GPU crashes the PMP firmware
 		 * (SError) right after it starts. It sits on the GPU's own
-		 * power state, and a board that powers the GPU (ps_gfx stays on
-		 * while the GPU firmware runs) claims it always-on.
+		 * power state. The GPU consumer takes this domain, so the request
+		 * follows the GFX domain's power lifetime.
 		 */
 		pmp_gfx: report@d {
 			compatible = "apple,t6041-pmp-v2-report-entry",
