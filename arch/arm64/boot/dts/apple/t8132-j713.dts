@@ -22,6 +22,7 @@
 	model = "Apple MacBook Air (13-inch, M4, 2025)";
 
 	aliases {
+		sep = &sep;
 		ans = &nvme;
 		ans-mbox = &ans_mbox;
 		atcphy0 = &atcphy0;
@@ -477,6 +478,32 @@
  * own the T8132 display power sequence, and the GPIO block must remain live
  * for inherited firmware and input state.
  */
+/*
+ * Mesa fingerprint sensor on spi2 (J713 ADT /arm-io/spi2/mesa): power on
+ * NUB GPIO 28, active high; data-ready on AP GPIO 199. Native chip select only.
+ */
+&sep_mbox {
+	status = "okay";
+};
+
+&spi2 {
+	status = "okay";
+};
+
+&mesa {
+	status = "okay";
+	enable-gpios = <&pinctrl_nub 28 GPIO_ACTIVE_HIGH>;
+	interrupt-parent = <&pinctrl_ap>;
+	interrupts = <199 IRQ_TYPE_EDGE_RISING>;
+	spi-cs-setup-delay-ns = <20>;
+	spi-cs-hold-delay-ns = <20>;
+	/*
+	 * Per-device factory data from this Mac's own iBoot system container:
+	 * the calibration, and the signed root key the nonce session loads.
+	 */
+	firmware-name = "apple/mesacal-j713.bin", "apple/msrk-j713.bin";
+};
+
 &framebuffer0 {
 	/delete-property/ power-domains;
 	panel = <&fb_panel>;
