@@ -13,6 +13,21 @@
 #define DCP_FW_VERSION(x, y, z) ( ((x) << 16) | ((y) << 8) | (z) )
 
 /*
+ * 26.x firmware exists in two unrelated wire lineages.  The H17-generation
+ * firmware (A18 Pro, M5) is a new protocol; the M4-generation desktop
+ * firmware (T6041, the M4 Pro/Max) continues the 14.7 IOMFB.  A desktop
+ * 26.x template instance marks its version with DCP_FW_DESKTOP, so that the
+ * plain ordering against older versions still holds.
+ */
+#define DCP_FW_DESKTOP (1 << 24)
+#define DCP_FW_VERSION_DESKTOP(x, y, z) (DCP_FW_VERSION(x, y, z) | DCP_FW_DESKTOP)
+#define DCP_FW_H17(ver) \
+	((ver) >= DCP_FW_VERSION(26, 0, 0) && !((ver) & DCP_FW_DESKTOP))
+#define DCP_FW_DESKTOP_26(ver) \
+	(((ver) & DCP_FW_DESKTOP) && \
+	 ((ver) & ~DCP_FW_DESKTOP) >= DCP_FW_VERSION(26, 0, 0))
+
+/*
  * The swap record layout introduced with the 14.7 firmware.  The
  * H17-generation firmware (26.0 and later) keeps the earlier layout and
  * extends it with its own fields.

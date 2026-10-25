@@ -65,7 +65,7 @@ IOMFB_THUNK_INOUT(get_color_remap_mode);
 IOMFB_THUNK_INOUT(last_client_close);
 IOMFB_THUNK_INOUT(abort_swaps_dcp);
 
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 			    struct dcp_swap_submit_req_h17p *request,
 			    dcp_callback_t cb, void *cookie)
@@ -103,7 +103,7 @@ DCP_THUNK_INOUT(dcp_set_power_state, dcpep_set_power_state,
  * channel.  Sent on the ordinary command channel it is never answered, which
  * strands the power transition and every later call behind it.
  */
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 #define DCP_POWER_OOB	true
 #else
 #define DCP_POWER_OOB	false
@@ -116,7 +116,7 @@ DCP_THUNK_INOUT(dcp_set_power_state, dcpep_set_power_state,
  * is no vblank and no swap completion.  Keep the mode the bootloader
  * programmed, which is the panel's native mode, instead of requesting one.
  */
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 #define DCP_INHERIT_BOOT_MODE	true
 #else
 #define DCP_INHERIT_BOOT_MODE	false
@@ -129,7 +129,7 @@ DCP_THUNK_INOUT(dcp_set_power_state, dcpep_set_power_state,
  * straight to set_power_state, whose number and sizes are known.  Power-off
  * still sends its clear swap first.
  */
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 #define DCP_HAS_CLIENT_TEARDOWN	false
 #else
 #define DCP_HAS_CLIENT_TEARDOWN	true
@@ -154,7 +154,7 @@ DCP_THUNK_OUT(dcp_start_signal, dcpep_start_signal, u32);
 DCP_THUNK_VOID(dcp_setup_video_limits, dcpep_setup_video_limits);
 DCP_THUNK_VOID(dcp_set_create_dfb, dcpep_set_create_dfb);
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 /*
  * Default-framebuffer queries issued from inside start_hardware_boot (D121).
  * The getters take a zeroed input of the expected size; the firmware only
@@ -252,7 +252,7 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 	ktime_t now = ktime_get();
 	bool retire = true;
 
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 	    !dcp_present_complete_h17p(&dcp->present_state_h17p, resp->swap_id)) {
 		/*
@@ -294,7 +294,7 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 		dcp_drm_crtc_page_flip(dcp, now);
 	}
 	if (READ_ONCE(dcp->crc_enabled)) {
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 		if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
 			iomfb_queue_crc_h17p(dcp, resp->swap_id);
 			return;
@@ -323,7 +323,7 @@ static bool iomfbep_cb_match_pmu_service(struct apple_dcp *dcp, int tag, void *o
 	return false;
 }
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 /*
  * H17P asks the AP to make the default framebuffer surface (D582).  The
  * firmware expects the AP to register a surface from inside that callback,
@@ -480,7 +480,7 @@ static void iomfb_cb_pr_publish(struct apple_dcp *dcp, struct iomfb_property *pr
 	case IOMFB_PROPERTY_NITS_V14_7:
 #endif
 	{
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 		/* The H17P takeover level comes from the powerlog hint interface. */
 		if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 			break;
@@ -577,7 +577,7 @@ static bool dcpep_map_piodma(struct apple_dcp *dcp,
 		goto reject;
 	}
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 	memdesc->piodma_mapped = true;
 
 	/* the H17P reply echoes the buffer index */
@@ -604,7 +604,7 @@ static struct DCP_FW_NAME(dcp_map_buf_resp) dcpep_cb_map_piodma(struct apple_dcp
 	if (dcpep_map_piodma(dcp, req, &resp))
 		return resp;
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 	resp.buffer = req->buffer;
 #else
 	resp.ret = EINVAL;
@@ -629,7 +629,7 @@ static bool dcpep_unmap_piodma(struct apple_dcp *dcp,
 	if (!test_bit(request->buffer, dcp->memdesc_map) || !memdesc->buf ||
 	    !dcp->iommu_dom)
 		goto not_mapped;
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 	if (!memdesc->piodma_mapped)
 		goto not_mapped;
 #endif
@@ -716,7 +716,7 @@ dcpep_cb_allocate_buffer(struct apple_dcp *dcp,
 	resp.dva_size = allocated.size;
 	resp.dva = allocated.dva;
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 	/*
 	 * Linux allocation traces correlate the first H17P reply address with
 	 * the first SG page. The remaining pages need not be contiguous.
@@ -860,7 +860,7 @@ static u64 dcpep_cb_get_frequency(struct apple_dcp *dcp)
 	return clk_get_rate(dcp->clk);
 }
 
-#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0) && DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0) && !DCP_FW_H17(DCP_FW_VER)
 /* The DVA that map_reg hands out for display register range @index. */
 static dma_addr_t dcpep_map_reg_dva(struct apple_dcp *dcp, u32 index,
 				    struct resource *rsrc)
@@ -898,7 +898,7 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 		return (struct DCP_FW_NAME(dcp_map_reg_resp)){ .ret = 1 };
 	} else {
 		struct resource *rsrc = dcp->disp_registers[req->index];
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 		/*
 		 * H17P reaches these apertures physically, not through its
 		 * DART, and expects dva == addr in the reply.  Trying to
@@ -940,7 +940,7 @@ dcpep_cb_read_edt_data(struct apple_dcp *dcp, struct dcp_read_edt_data_req *req)
 static void iomfbep_cb_enable_backlight_message_ap_gated(struct apple_dcp *dcp,
 							 u8 *enabled)
 {
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 	/* H17P carries the level only in presents; ask for one more. */
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
 		if (dcp_has_panel(dcp) && dcp_backlight_active(dcp) &&
@@ -967,7 +967,7 @@ static u8 dcpep_cb_prop_start(struct apple_dcp *dcp, u32 *length)
 		return false;
 	}
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 	/*
 	 * This length comes straight off the wire.  A bogus value would turn
 	 * the allocation below into a multi-gigabyte GFP_KERNEL request.
@@ -1168,7 +1168,7 @@ static void boot_5b(struct apple_dcp *dcp, void *out, void *cookie)
 
 static void boot_5(struct apple_dcp *dcp, void *out, void *cookie)
 {
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 	/* H17P expects A380 right before set_display_refresh_properties */
 	dcp_dfb_ready_query(dcp, false, boot_5b, NULL);
 #else
@@ -1179,7 +1179,7 @@ static void boot_5(struct apple_dcp *dcp, void *out, void *cookie)
 static void boot_4b(struct apple_dcp *dcp, void *out, void *cookie)
 {
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 	u32 value = dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G;
 #else
 	u32 value = 1;
@@ -1192,7 +1192,7 @@ static void boot_4b(struct apple_dcp *dcp, void *out, void *cookie)
 
 static void boot_4(struct apple_dcp *dcp, void *out, void *cookie)
 {
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 	/* H17P expects A033 between flush_supports_power and late_init_signal */
 	dcp_dfb_query(dcp, false, boot_4b, NULL);
 #else
@@ -1212,7 +1212,7 @@ static void boot_2(struct apple_dcp *dcp, void *out, void *cookie)
 	dcp_setup_video_limits(dcp, false, boot_3, NULL);
 }
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 /*
  * H17P expects the default framebuffer to be described between
  * create_default_fb and setup_video_limits:
@@ -1280,14 +1280,14 @@ static void boot_1_6(struct apple_dcp *dcp, void *out, void *cookie)
 
 static void boot_1_5(struct apple_dcp *dcp, void *out, void *cookie)
 {
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 	dcp_create_default_fb(dcp, false, boot_1_6, NULL);
 #else
 	dcp_create_default_fb(dcp, false, boot_2, NULL);
 #endif
 }
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 static void d000_done(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct dcp_channel *ch = &dcp->ch_cb;
@@ -1356,7 +1356,7 @@ static struct dcp_rt_bandwidth dcpep_cb_rt_bandwidth(struct apple_dcp *dcp)
 	return rt_bw;
 }
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 /*
  * H17P's D006 is 0x54 in / 0x50 out, far wider than the 28-byte
  * frame_sync_props of older firmware, so the fields that matter sit past
@@ -1424,7 +1424,7 @@ static void release_swap_cookie(struct kref *ref)
         kfree(cookie);
 }
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 #define DCP_SWAP_FLAGS1 0x34865202ULL
 #define DCP_SWAP_FLAGS2 0x4ULL
 
@@ -1496,7 +1496,7 @@ static void dcp_h17p_prepare_swap(struct apple_dcp *dcp) { }
 
 static bool dcp_present_retires(struct apple_dcp *dcp)
 {
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 		return !iomfb_present_brightness_only_h17p(dcp);
 #endif
@@ -1505,7 +1505,7 @@ static bool dcp_present_retires(struct apple_dcp *dcp)
 
 static void dcp_present_failed(struct apple_dcp *dcp)
 {
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 		iomfb_present_failed_h17p(dcp);
 #endif
@@ -1513,7 +1513,7 @@ static void dcp_present_failed(struct apple_dcp *dcp)
 
 static bool dcp_present_begin(struct apple_dcp *dcp, u32 swap_id)
 {
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 	    !dcp_present_begin_h17p(&dcp->present_state_h17p, swap_id)) {
 		dev_err(dcp->dev, "overlapping present %u\n", swap_id);
@@ -1531,7 +1531,7 @@ static bool dcp_present_begin(struct apple_dcp *dcp, u32 swap_id)
  */
 static int dcp_present_submit(struct apple_dcp *dcp, u32 swap_id, bool accepted)
 {
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 	    !dcp_present_submit_h17p(&dcp->present_state_h17p, swap_id, accepted)) {
 		dev_err(dcp->dev, "unexpected present submission %u\n", swap_id);
@@ -1581,7 +1581,7 @@ static void dcp_prepare_clear_swap(struct apple_dcp *dcp, void *request)
 	for (int l = 0; l < SWAP_SURFACES; l++)
 		swap->surf_null[l] = true;
 #if DCP_FW_VERSION(13, 2, 0) <= DCP_FW_VER
-#if DCP_FW_VERSION(26, 0, 0) > DCP_FW_VER
+#if !DCP_FW_H17(DCP_FW_VER)
 	for (int l = 0; l < 5; l++)
 		swap->surf2_null[l] = true;
 #endif
@@ -1643,7 +1643,7 @@ static void dcp_swap_clear_started(struct apple_dcp *dcp, void *data,
 		dcp_drm_crtc_vblank(dcp->crtc);
 		return;
 	}
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 		dcp_prepare_clear_swap(dcp, &DCP_FW_UNION(dcp->swap));
 #endif
@@ -1662,7 +1662,7 @@ static void dcp_on_final(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct dcp_wait_cookie *wait = cookie;
 
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 	    out && get_unaligned_le64(out) == 1)
 		WRITE_ONCE(dcp->pipe_enabled_h17p, true);
@@ -1705,7 +1705,7 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 	u32 handle;
 	dev_info(dcp->dev, "dcp_poweron() starting\n");
 
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 		iomfb_opaque_x_reset_h17p(dcp);
 #endif
@@ -1721,7 +1721,7 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 	kref_get(&cookie->refcount);
 
 	if (dcp->main_display) {
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 		/*
 		 * H17P takes set_display_device (A411) once, in the
 		 * client-open sequence.  Repeating it after the client is open
@@ -1777,7 +1777,7 @@ static void complete_set_powerstate(struct apple_dcp *dcp, void *out,
 static bool dcp_power_stop_confirmed(struct dcp_wait_cookie *cookie)
 {
 	/* H17P does not confirm that scanout has stopped. */
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 	return false;
 #else
 	return READ_ONCE(cookie->status) == 0;
@@ -1818,7 +1818,7 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	struct DCP_FW_NAME(dcp_swap_start_req) swap_req = { 0 };
 	typeof(DCP_FW_UNION(dcp->swap)) *swap = &DCP_FW_UNION(dcp->swap);
 
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 	/* H17P has no known safe pipe-off or surface-free transition. */
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 		return;
@@ -1833,7 +1833,7 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	/* increase refcount to ensure the receiver has a reference */
 	kref_get(&cookie->refcount);
 
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
 		dcp_prepare_clear_swap(dcp, swap);
 #else
@@ -1922,7 +1922,7 @@ void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp)
 
 	struct dcp_wait_cookie *cookie;
 
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 		return;
 #endif
@@ -2039,7 +2039,7 @@ dcpep_cb_swap_complete_intent_gated(struct apple_dcp *dcp,
 		info->width, info->height);
 }
 
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 /*
  * An aborted H17P present never completes.  Finish it like a rejected one:
  * keep the displaced framebuffers for the next completed present and signal
@@ -2072,7 +2072,7 @@ static void
 dcpep_cb_abort_swap_ap_gated(struct apple_dcp *dcp, u32 *swap_id)
 {
 	trace_iomfb_abort_swap_ap_gated(dcp, *swap_id);
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 		dcp_present_aborted(dcp, *swap_id);
 #endif
@@ -2090,7 +2090,7 @@ dcpep_cb_get_tiling_state(struct apple_dcp *dcp,
 
 static u8 dcpep_cb_create_backlight_service(struct apple_dcp *dcp)
 {
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 	/*
 	 * H17P asks during start_ios_gated, before any mode is known, but
 	 * dcp_has_panel() only becomes true once the panel dimensions have been
@@ -2145,7 +2145,7 @@ TRAMPOLINE_OUT(trampoline_rt_bandwidth, dcpep_cb_rt_bandwidth,
 TRAMPOLINE_INOUT(trampoline_set_frame_sync_props, dcpep_cb_set_frame_sync_props,
 	       struct dcp_set_frame_sync_props_req,
 	       struct dcp_set_frame_sync_props_resp);
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 TRAMPOLINE_INOUT(trampoline_set_frame_sync_props_h17p,
 	       dcpep_cb_set_frame_sync_props_h17p,
 	       struct dcp_set_frame_sync_props_req_h17p,
@@ -2253,12 +2253,12 @@ static void do_swap(struct apple_dcp *dcp, void *data, void *cookie)
 	}
 }
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 /*
  * H17P expects A428 between set_matrix and swap_start, with 0x10000 (1.0 in
  * 16.16 fixed point), the same identity value the D006 reply carries.
  */
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 void iomfb_present_backlight_h17p(struct apple_dcp *dcp)
 {
 	do_swap(dcp, NULL, NULL);
@@ -2455,7 +2455,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	for (l = 0; l < SWAP_SURFACES; l++)
 		req->surf_null[l] = true;
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-#if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
+#if !DCP_FW_H17(DCP_FW_VER)
 	for (l = 0; l < 5; l++)
 		req->surf2_null[l] = true;
 #endif
@@ -2493,7 +2493,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->swap.src_rect[l] = apple_state->src_rect;
 		req->swap.dst_rect[l] = apple_state->dst_rect;
 
-#if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
+#if !DCP_FW_H17(DCP_FW_VER)
 		req->swap.surf_ids[apl_plane->iomfb_surf] = plane->base.id;
 #endif
 
@@ -2502,7 +2502,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 		req->surf_iova[l] = apple_state->iova;
 		req->surf[l].base = apple_state->surf;
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 		req->surf[l].base.surface_id = 0;
 #endif
 
@@ -2515,7 +2515,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		    req->surf[l].base.colorspace == DCP_COLORSPACE_BG_SRGB)
 			req->surf[l].base.colorspace = DCP_COLORSPACE_NATIVE;
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 		/* H17P external SDR RGB needs an sRGB source tag. Native
 		 * tagging washes out the same pixel values on this profile.
 		 * Keep YUV, other source spaces and other profiles unchanged.
@@ -2568,7 +2568,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 	/* update brightness if changed */
 	update_brightness = dcp_has_panel(dcp) && dcp->brightness.update;
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 	update_brightness = update_brightness &&
 			    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G;
 #endif
@@ -2595,7 +2595,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 			mat.matrix[0] = mat.matrix[4] = mat.matrix[8] = 1LLU << 32;
 		}
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 		iomfb_set_matrix(dcp, false, &mat, dcp_pre_swap_a428, NULL);
 #else
 		iomfb_set_matrix(dcp, false, &mat, do_swap, NULL);
@@ -2640,7 +2640,7 @@ static void init_3(struct apple_dcp *dcp, void *out, void *cookie)
 	dcp_is_main_display(dcp, false, res_is_main_display, NULL);
 }
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 /*
  * The client-open sequence H17P firmware expects before the first swap, in
  * H17P method numbers (dcp_push() applies the H17G aliases):
@@ -2807,7 +2807,7 @@ void DCP_FW_NAME(iomfb_shutdown)(struct apple_dcp *dcp)
 	struct dcp_wait_cookie *cookie;
 	int ret;
 
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_H17(DCP_FW_VER)
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
 		iomfb_queue_stop(dcp);
 		return;

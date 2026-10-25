@@ -28,7 +28,7 @@ struct DCP_FW_NAME(dcp_swap) {
 	u8 unk_v14_7[0x48];
 #endif
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 	/*
 	 * H17P inserts 0x48 bytes between flags2 and the swap ID, which moves
 	 * to +0x98.  Every following field shifts with it: surf_ids +0x9c,
@@ -86,7 +86,7 @@ struct DCP_FW_NAME(dcp_swap) {
 	u32 unk_flags;
 	u32 unk_flags2;
 #endif
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 	/*
 	 * The H17P A408 request is 0xe9c bytes; with a 0x22c-byte surface,
 	 * SWAP_SURFACES = 4 and no surf2 block, that leaves this tail.
@@ -117,7 +117,7 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 	 * H17P carries no surf2 block: its trailing u8 null-flag run is 8 bytes
 	 * (swap_null + surf_null[4] + three tail bools).
 	 */
-#if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
+#if !DCP_FW_H17(DCP_FW_VER)
 	struct DCP_FW_NAME(dcp_surface) surf2[5];
 	u64 surf2_iova[5];
 #endif
@@ -138,7 +138,7 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 	u8 swap_null;
 	u8 surf_null[SWAP_SURFACES];
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-#if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
+#if !DCP_FW_H17(DCP_FW_VER)
 	u8 surf2_null[5];
 #endif
 #endif
@@ -147,7 +147,7 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 	u8 unknown_pointer_null;
 	u8 unknown_output_null;
 #endif
-#if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
+#if !DCP_FW_H17(DCP_FW_VER)
 	u8 padding[1];
 #endif
 } __packed;
@@ -167,7 +167,7 @@ struct DCP_FW_NAME(dcp_swap_submit_resp) {
  * swap_start response no longer echoes it.  swap_start is 0x10 in / 0x8 out,
  * set_power_state 0x10 in.
  */
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 struct DCP_FW_NAME(dcp_swap_start_req) {
 	u32 swap_id;
 	u64 client;			/* IOUserClient kernel VA */
@@ -219,7 +219,7 @@ struct DCP_FW_NAME(dcp_set_power_state_req) {
  * u32 ret }.  With the old layout the DVA lands four bytes late and the
  * display engine DMAs to a bogus address.
  */
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 struct DCP_FW_NAME(dcp_map_buf_resp) {
 	u32 buffer;
 	u64 dva;
@@ -237,7 +237,7 @@ struct DCP_FW_NAME(dcp_map_buf_resp) {
 struct DCP_FW_NAME(dc_swap_complete_resp) {
 	u32 swap_id;			/* +0x000 */
 	u8 unkbool;			/* +0x004 */
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 	/*
 	 * H17P: swap_complete_ap_gated(u32, bool, SwapCompleteData const *,
 	 * SwapInfoBlob const *, u32, bool) is 0x730 bytes on the wire, 89 more
