@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,t8152-aop.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8152 Always-On Processor
+
+maintainers:
+  - Thomas Glanzmann <thomas@glanzmann.de>
+
+description:
+  The Always-On Processor provides audio services through firmware loaded by
+  the bootloader. Unlike on T8140, its setup port is not reachable from the
+  application processor, so only the primary mailbox is described.
+
+properties:
+  compatible:
+    const: apple,t8152-aop
+
+  reg:
+    items:
+      - description: AOP register and boot-argument window
+      - description: ASC wrapper and processor control registers
+
+  reg-names:
+    items:
+      - const: mmio
+      - const: asc
+
+  mboxes:
+    maxItems: 1
+
+  mbox-names:
+    items:
+      - const: mbox
+
+  iommus:
+    maxItems: 1
+
+  apple,dma-range:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 2
+    maxItems: 2
+    description:
+      Host DMA allocation window as a base and nonzero size. The window must
+      occupy root slots available to the host on this AOP DART stream.
+
+  audio:
+    type: object
+    $ref: /schemas/sound/apple,t8152-aop-audio.yaml#
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - mboxes
+  - mbox-names
+  - iommus
+  - apple,dma-range
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+      #address-cells = <2>;
+      #size-cells = <2>;
+
+      aop@310c00000 {
+        compatible = "apple,t8152-aop";
+        reg = <0x3 0x10c00000 0x0 0x1e0000>,
+              <0x3 0x10600000 0x0 0x4000>;
+        reg-names = "mmio", "asc";
+        mboxes = <&aop_mbox>;
+        mbox-names = "mbox";
+        iommus = <&sbr_dart 0>;
+        apple,dma-range = <0x110 0x0 0x10 0x0>;
+      };
+    };
