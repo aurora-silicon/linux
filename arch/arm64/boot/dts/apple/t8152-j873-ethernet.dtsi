@@ -13,6 +13,10 @@
 #include <dt-bindings/gpio/gpio.h>
 
 / {
+	aliases {
+		ethernet0 = &ethernet0;
+	};
+
 	soc {
 		pcie2_dart: iommu@38a000000 {
 			compatible = "apple,t8152-dart", "apple,t8110-dart";
